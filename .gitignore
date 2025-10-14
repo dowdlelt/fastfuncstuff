@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# Results and outputs
+monte_carlo_comprehensive_results/
+monte_carlo_fir_results/
+monte_carlo_results/
+simulation_results_isi_sweep/
+examples/monte_carlo_comprehensive_results/
+examples/monte_carlo_fir_results/
+examples/monte_carlo_results/
+examples/simulation_results_isi_sweep/
+design_optimization_results/
+
+# Plots
+*.png
+*.pdf
+*.svg
+
+# AFNI files
+*.BRIK
+*.HEAD
+*.1D
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Dropbox
+.dropbox
+.dropbox.attr
+
+# Temporary files
+*.tmp
+*.temp
+*.log

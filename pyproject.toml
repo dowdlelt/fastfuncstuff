@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastfuncsim"
+version = "0.1.0"
+description = "Fast GPU-accelerated functional MRI simulation and GLM fitting"
+authors = [{name = "FastFuncSim Developers"}]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23",
+    "torch>=2.0",
+    "nibabel>=5.1",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastfuncsim*"]
+exclude = ["tests*", "examples*"]

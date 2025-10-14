@@ -1,0 +1,15 @@
+Simulation Label: example_test
+TR: 2.0 sec
+Number of runs: 3
+Voxel size: 2.0 x 2.0 x 2.0 mm
+Data shape per run: torch.Size([20, 20, 5, 200])
+Number of timepoints: 200
+Matrix size: 20 x 20 x 5
+
+Additional Parameters:
+  betas: [3.0, 4.0]
+  n_conditions: 2
+  noise_level: 1.0
+  hrf_duration: 32.0
+  scanner_drift: True
+  isi_mean: 6

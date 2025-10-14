@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/logan/**)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:brainiak.org)",
+      "Bash(python:*)",
+      "Bash(conda activate:*)",
+      "Bash(~/miniconda3/envs/py312_movies_mac/bin/python:*)",
+      "Bash(open:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
