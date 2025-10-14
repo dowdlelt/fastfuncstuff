@@ -51,11 +51,12 @@ from .arma_glm import (
     batch_reml_grid_search,
     build_arma11_covariance,
     compare_ols_vs_arma11,
+    compute_arma_lambda,
     fit_glm_arma11,
     load_arma_params,
     prewhiten_with_arma11,
     reml_grid_search,
-    save_arma_params,
+    save_arma_rvar,
 )
 
 # Design matrix construction
@@ -233,7 +234,8 @@ __all__ = [
     "reml_grid_search",
     "batch_reml_grid_search",
     "prewhiten_with_arma11",
-    "save_arma_params",
+    "compute_arma_lambda",
+    "save_arma_rvar",
     "load_arma_params",
     "ARMA11Results",
     # AFNI File I/O
