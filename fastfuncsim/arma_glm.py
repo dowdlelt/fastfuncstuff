@@ -337,7 +337,7 @@ def get_adaptive_batch_size(
             # Use 50% of VRAM for batch sizing (assumes dedicated GPU)
             # Leave 13% for PyTorch overhead, CUDA context, fragmentation, and grid memory
             # (fit_glm_arma11 will further refine this to account for actual grid size)
-            available_mem = total_mem * 0.80
+            available_mem = total_mem * 0.75
             batch_size = int(available_mem / mem_per_voxel)
 
             # Safety clamps based on GPU size
@@ -1880,7 +1880,7 @@ def fit_glm_arma11(
                 total_mem = torch.cuda.get_device_properties(device).total_memory
                 # Use 50% of GPU memory (assumes dedicated GPU for this task)
                 # Leave 10% for PyTorch overhead, CUDA context, and fragmentation
-                available_mem = total_mem * 0.8
+                available_mem = total_mem * 0.75
             else:  # CPU
                 try:
                     import psutil
