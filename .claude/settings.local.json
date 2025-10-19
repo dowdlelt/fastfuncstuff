@@ -8,7 +8,13 @@
       "Bash(python:*)",
       "Bash(conda activate:*)",
       "Bash(~/miniconda3/envs/py312_movies_mac/bin/python:*)",
-      "Bash(open:*)"
+      "Bash(open:*)",
+      "Bash(pyright --pythonpath ~/miniconda3/envs/py312_movies_mac/bin/python fastfuncsim/analysis.py fastfuncsim/arma_glm.py bin/3dREMLfast.py)",
+      "Bash(pyright --pythonpath ~/miniconda3/envs/py312_movies_mac/bin/python fastfuncsim/analysis.py fastfuncsim/arma_glm.py)",
+      "Bash(pyright --pythonpath ~/miniconda3/envs/py312_movies_mac/bin/python fastfuncsim/arma_glm.py)",
+      "Bash(ty check fastfuncsim/arma_glm.py)",
+      "Bash(ty check bin/3dREMLfast.py)",
+      "Bash(tee debug_output.txt)"
     ],
     "deny": [],
     "ask": []

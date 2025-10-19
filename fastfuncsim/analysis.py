@@ -4,7 +4,7 @@ Complete pipelines from AFNI files to GLM results
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import nibabel as nib
 import numpy as np
@@ -256,10 +256,15 @@ def analyze_from_design_matrix(
     arma_a_grid: Optional[torch.Tensor] = None,
     arma_b_grid: Optional[torch.Tensor] = None,
     precomputed_arma_params: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    want_ols: bool = False,
+    ols_output_path: Optional[Union[str, Path]] = None,
+    ols_output_format: str = "nii.gz",
     device: Optional[torch.device] = None,
     mask_file: Optional[Union[str, Path]] = None,
     mask_threshold: float = 0.0,
     voxel_chunk_size: Optional[int] = None,
+    use_double: bool = False,
+    debug_memory: bool = False,
 ) -> Tuple[Union[GLMResults, ARMA11Results], Dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -298,6 +303,10 @@ def analyze_from_design_matrix(
         Precomputed ARMA(1,1) parameters [a, b] for each voxel (only used if method='arma11')
         If provided, skips REML estimation (saves ~80% of compute time)
         Useful for re-running analysis with different contrasts or validating against AFNI
+    want_ols : bool, default=False
+        Also compute OLS baseline for comparison (only used if method='arma11')
+        When True, adds `ols_results` attribute to returned ARMA11Results object
+        Useful for validating ARMA improvement over OLS
     device : torch.device, optional
         Device for computation
     mask_file : str or Path, optional
@@ -306,6 +315,9 @@ def analyze_from_design_matrix(
         Threshold applied to mask values; voxels greater than this are included
     voxel_chunk_size : int, optional
         Number of voxels to process per chunk. Overrides automatic heuristic
+    use_double : bool, default=False
+        If True, use float64 precision (matches AFNI exactly, ~2x memory, ~1.5x slower).
+        If False, use float32 precision (faster, tiny differences from AFNI).
 
     Returns
     -------
@@ -461,6 +473,7 @@ def analyze_from_design_matrix(
             chunk_size=voxel_chunk_size,
             max_poly_degree=glm_poly,
             preload_data_to_device=False,
+            use_double=use_double,
         )
 
     elif method == "arma11":
@@ -473,6 +486,42 @@ def analyze_from_design_matrix(
             if arma_b_grid is None:
                 _, arma_b_grid = get_default_arma_grids(device)
 
+        # Create simple OLS write callback if output path provided
+        ols_write_callback = None
+        if ols_output_path is not None:
+            from .glm_outputs import slice_glm_results, write_afni_bucket
+            # Capture volume_shape and affine from outer scope for the callback
+            callback_volume_shape = volume_shape
+            callback_affine = affine
+            # Get stimulus regressor indices (exclude nuisance regressors)
+            stim_indices = design_info.get("stim_bots")
+            stim_labels = design_info.get("stim_labels")
+
+            def write_ols(ols_results, original_shape, affine):
+                # Slice to only include stimulus regressors (not nuisance)
+                if stim_indices is not None:
+                    ols_stim_only = slice_glm_results(ols_results, stim_indices)
+                else:
+                    # Fallback: use all regressors if stim_indices not available
+                    ols_stim_only = ols_results
+
+                # Use captured volume_shape from closure - original_shape from arma may be None
+                # if data was already 2D when passed to fit_glm_arma11
+                shape_to_use = original_shape if original_shape is not None else callback_volume_shape
+                affine_to_use = affine if affine is not None else callback_affine
+
+                ols_stim_only.original_shape = shape_to_use
+                ols_stim_only.affine = affine_to_use
+                write_afni_bucket(
+                    ols_stim_only,
+                    ols_output_path,
+                    condition_names=stim_labels,  # Use stimulus labels, not all column labels
+                    volume_shape=shape_to_use,
+                    affine=affine_to_use,
+                    output_format=ols_output_format
+                )
+            ols_write_callback = write_ols
+
         results = fit_glm_arma11(
             data,
             design,
@@ -480,7 +529,12 @@ def analyze_from_design_matrix(
             a_grid=arma_a_grid,
             b_grid=arma_b_grid,
             precomputed_arma_params=precomputed_arma_params,
+            want_ols=want_ols,
+            ols_write_callback=ols_write_callback,
+            batch_size=voxel_chunk_size,  # Pass through manual override
             device=device,
+            use_double=use_double,
+            debug_memory=debug_memory,
         )
 
     else:
@@ -489,15 +543,25 @@ def analyze_from_design_matrix(
     if volume_shape is not None:
         results.original_shape = volume_shape
         results.full_shape = volume_shape  # type: ignore[attr-defined]
+        # Also set on OLS results if present
+        if hasattr(results, "ols_results") and results.ols_results is not None:
+            results.ols_results.original_shape = volume_shape
+            results.ols_results.full_shape = volume_shape  # type: ignore[attr-defined]
 
     if mask_tensor is not None:
         results.voxel_mask = mask_tensor  # type: ignore[attr-defined]
         design_info["mask_file"] = str(mask_file)
         design_info["mask_threshold"] = mask_threshold
         design_info["mask_voxels"] = int(mask_tensor.sum().item())
+        # Also set on OLS results if present
+        if hasattr(results, "ols_results") and results.ols_results is not None:
+            results.ols_results.voxel_mask = mask_tensor  # type: ignore[attr-defined]
 
     if affine is not None:
         results.affine = affine  # type: ignore[attr-defined]
+        # Also set on OLS results if present
+        if hasattr(results, "ols_results") and results.ols_results is not None:
+            results.ols_results.affine = affine  # type: ignore[attr-defined]
 
     return results, design_info
 
@@ -605,7 +669,9 @@ def compute_contrasts(
     # Compute contrast variance
     if hasattr(results, "xtx_inv"):
         # OLS results: Var(c'β) = c' (X'X)^-1 c * σ²
-        xtx_inv = results.xtx_inv  # (n_regressors, n_regressors)
+        xtx_inv = to_tensor(
+            results.xtx_inv, device=device, dtype=torch.float32
+        )  # (n_regressors, n_regressors)
 
         # c' (X'X)^-1 c for each contrast
         # (n_contrasts, n_regressors) @ (n_regressors, n_regressors) @ (n_regressors, n_contrasts)
@@ -664,3 +730,100 @@ def compute_contrasts(
         "contrast_tstats": contrast_tstats.cpu(),
         "contrast_stderr": contrast_stderr.cpu(),
     }
+
+
+def compute_contrasts_from_design(
+    results: Union[GLMResults, ARMA11Results],
+    design_info: dict,
+    device: Optional[torch.device] = None,
+    auto_cpu_fallback: bool = True,
+    memory_threshold_timepoints: int = 1000,
+) -> Optional[dict]:
+    """
+    Compute contrasts from AFNI design matrix metadata with automatic CPU fallback.
+
+    Extracts GLT (General Linear Test) contrast definitions from design_info
+    and computes contrast statistics. For large datasets (many timepoints),
+    automatically falls back to CPU computation to avoid GPU OOM errors.
+
+    Parameters
+    ----------
+    results : GLMResults or ARMA11Results
+        GLM results from fit_glm() or fit_glm_arma11()
+    design_info : dict
+        Output from read_afni_design_matrix() containing:
+        - 'glt_labels': list of str (contrast names)
+        - 'glt_matrices': list of arrays (contrast weight vectors)
+        - 'n_regressors': int (total number of regressors)
+        - 'n_timepoints': int (optional, for auto fallback detection)
+    device : torch.device, optional
+        Device for computation. Overridden if auto_cpu_fallback triggers.
+    auto_cpu_fallback : bool, default=True
+        Automatically use CPU for large datasets to avoid OOM
+    memory_threshold_timepoints : int, default=1000
+        Threshold for auto CPU fallback (timepoints > threshold → CPU)
+
+    Returns
+    -------
+    contrast_results : dict or None
+        Dictionary with keys 'contrast_betas', 'contrast_tstats', 'contrast_stderr',
+        or None if no contrasts are defined in design_info
+
+    Examples
+    --------
+    >>> # Load design and compute contrasts automatically
+    >>> design_info = ffs.read_afni_design_matrix('X.xmat.1D')
+    >>> results = ffs.fit_glm_arma11(data, design_info['matrix'], tr=2.0)
+    >>> contrast_results = ffs.compute_contrasts_from_design(results, design_info)
+    >>> if contrast_results:
+    ...     print(f"Computed {len(design_info['glt_labels'])} contrasts")
+    ...     for name, tstat in zip(design_info['glt_labels'],
+    ...                            contrast_results['contrast_tstats'].T):
+    ...         print(f"  {name}: mean t = {tstat.mean():.3f}")
+
+    Notes
+    -----
+    - Returns None if design_info contains no GLT definitions
+    - For ARMA results with >1000 timepoints, automatically uses CPU to avoid
+      GPU OOM (var_betas matrix can be 20+ GB)
+    - Contrasts are extracted directly from X.xmat.1D metadata, no manual
+      specification needed
+    - Works with both OLS (xtx_inv) and ARMA (var_betas) results
+    """
+    if device is None:
+        device = get_device()
+
+    # Check if any contrasts are defined
+    if not design_info.get("glt_labels") or not design_info.get("glt_matrices"):
+        return None
+
+    # Auto CPU fallback for large datasets
+    if auto_cpu_fallback:
+        n_timepoints = design_info.get("n_timepoints", 0)
+        if n_timepoints > memory_threshold_timepoints:
+            print(
+                f"  ⚠ Large dataset ({n_timepoints} timepoints): "
+                "computing contrasts on CPU (var_betas too large for GPU)"
+            )
+            device = torch.device("cpu")
+
+    # Stack all GLT matrices into a single tensor
+    n_regressors = design_info["n_regressors"]
+    n_contrasts = len(design_info["glt_matrices"])
+
+    contrasts = torch.zeros(
+        (n_contrasts, n_regressors), device=device, dtype=torch.float32
+    )
+
+    for i, glt_matrix in enumerate(design_info["glt_matrices"]):
+        # Convert numpy array to torch tensor if needed
+        glt_tensor = torch.as_tensor(glt_matrix, device=device, dtype=torch.float32)
+        # GLT matrices are typically 1D (one row per contrast)
+        if glt_tensor.ndim == 1:
+            contrasts[i, :] = glt_tensor
+        else:
+            # If 2D, take the first row (single contrast per GLT)
+            contrasts[i, :] = glt_tensor[0, :]
+
+    # Compute contrasts
+    return compute_contrasts(results, contrasts, device=device)

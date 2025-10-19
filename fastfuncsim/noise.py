@@ -554,6 +554,11 @@ def generate_arma_noise(ar_coeffs: Union[torch.Tensor, np.ndarray, list],
     else:
         ma_coeffs = ma_coeffs.to(device)
 
+    # Validate AR coefficients for stationarity
+    if len(ar_coeffs) > 0:
+        if torch.any(torch.abs(ar_coeffs) >= 1):
+            raise ValueError("AR coefficients must be in (-1, 1) for stationarity.")
+
     p = len(ar_coeffs)
     q = len(ma_coeffs)
     max_order = max(p, q)
@@ -578,7 +583,7 @@ def generate_arma_noise(ar_coeffs: Union[torch.Tensor, np.ndarray, list],
         else:
             ma_part = 0
 
-        # Combine: y_t = AR_part + MA_part + ε_t
+        # Combine: y_t = AR_part + MA_part + b5_t
         y[t] = ar_part + ma_part + epsilon[t]
 
     # Initialize first max_order timepoints
@@ -588,11 +593,8 @@ def generate_arma_noise(ar_coeffs: Union[torch.Tensor, np.ndarray, list],
     if normalize:
         y = (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-10)
 
-    # Return shape
-    if n_voxels == 1:
-        return y.squeeze(1)
-    else:
-        return y
+    # Always return shape (n_timepoints, n_voxels)
+    return y
 
 
 def estimate_noise_parameters_from_data(

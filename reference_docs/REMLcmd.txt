@@ -1,0 +1,95 @@
+# EXAMPLE COMMAND
+3dREMLfit -matrix X.xmat.1D \
+ -input "pb04.preproc_sub-pilot01_ses-03_movietask.r01.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r02.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r03.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r04.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r05.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r06.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r07.scale+orig.HEAD" \
+ -fout -tout -Rbuck stats.preproc_sub-pilot01_ses-03_movietask_REML -Rvar stats.preproc_sub-pilot01_ses-03_movietask_REMLvar \
+ -Rfitts fitts.preproc_sub-pilot01_ses-03_movietask_REML \
+ -Rerrts errts.preproc_sub-pilot01_ses-03_movietask_REML -verb $*
+ 
+ # NOTES
+ input is string of space seperated datasets. 
+see below for information on the flags. 
+
+Effectively its a flag and then either a prefix for output, or the file name. So if for example -Rerrts isn't there, then the residuals are not saved out. 
+Othewise this should be straightforward - see the extra commands below. One key one is the -Obuck and -Oglt - that is what enables the OLS output that we made possible. 
+We will also have an extra flag, versus these options, for double precision -use_double
+It doesn't need a TRUE or whatever, if its not there, we use single precision (with note on CLI), but if present, continue with it set to true. 
+
+There are a few other small differences - like -Rbuck should become -Rnuisance since we have Betas and Tstats for the nuisance parameters. 
+If you want, you can create an -Rbuck that contains the betas for all stimuli in the design, no stats, and no contrasts. it can be a useful file. Lets do the same for -Obuck (add -Onuisance to get our current output)
+
+We also need to add our own version of the option to set the a,b range. It should take a comma seperated list of start, stop, steps (same as what we use in the code
+so -a_grid 0.1,0.9,11 would just pass those values along to the grid generation code). 
+
+# Strings from 3dremlfit help (3dREMLfit -help to get this).
+ -input ddd  = Read time series dataset 'ddd'.
+            * This is the dataset without censoring!
+
+-matrix mmm = Read the matrix 'mmm', which should have been
+                output from 3dDeconvolve via the '-x1D' option.
+
+-mask MMM   = Read dataset 'MMM' as a mask for the input; voxels outside
+                 the mask will not be fit by the regression model.
+
+-Rvar  ppp  = dataset for saving REML variance parameters
+    * See the 'What is ARMA(1,1)' section, far below.
+    * This dataset has 6 volumes:
+    [0] = 'a'       = ARMA parameter
+                = decay rate of correlations with lag
+    [1] = 'b'       = ARMA parameter
+    [2] = 'lam'     = (b+a)(1+a*b)/(1+2*a*b+b*b)
+                = correlation at lag=1
+                    correlation at lag=k is lam * a^(k-1) (k>0)
+    [3] = 'StDev'   = standard deviation of prewhitened
+                    residuals (used in computing statistics
+                    in '-Rbuck' and in GLTs)
+    [4] = '-LogLik' = negative of the REML log-likelihood
+                    function (see the math notes)
+    [5] = 'LjungBox'= Ljung-Box statistic of the pre-whitened
+                    residuals, an indication of how much
+                    temporal correlation is left-over.
+                + See the 'Other Commentary' section far below
+                    for a little more information on the LB
+                    statistic.
+
+                    -Rbeta ppp  = dataset for beta weights from the REML estimation
+                 [similar to the -cbucket output from 3dDeconvolve]
+               * This dataset will contain all the beta weights, for
+                   baseline and stimulus regressors alike, unless the
+                   '-nobout' option is given -- in that case, this
+                   dataset will only get the betas for the stimulus
+                   regressors.
+ -Rbuck ppp  = dataset for beta + statistics from the REML estimation;
+                 also contains the results of any GLT analysis requested
+                 in the 3dDeconvolve setup.
+                 [similar to the -bucket output from 3dDeconvolve]
+               * This dataset does NOT get the betas (or statistics) of
+                   those regressors marked as 'baseline' in the matrix file.
+
+                   -fout       = put F-statistics into the bucket dataset
+ -rout       = put R^2 statistics into the bucket dataset
+ -tout       = put t-statistics into the bucket dataset
+                 [if you use -Rbuck and do not give any of -fout, -tout,]
+                 [or -rout, then the program assumes -fout is activated.]
+
+                 -Rfitts ppp = dataset for REML fitted model
+                 [like 3dDeconvolve, a censored time point gets]
+                 [the actual data values from that time index!!]
+
+ -Rerrts ppp = dataset for REML residuals = data - fitted model
+                 [like 3dDeconvolve,  a censored time]
+                 [point gets its residual set to zero]
+ -Rwherr ppp = dataset for REML residual, whitened using the
+                 estimated ARMA(1,1) correlation matrix of the noise
+                 [Note that the whitening matrix used is the inverse  ]
+                 [of the Choleski factor of the correlation matrix C; ]
+                 [however, the whitening matrix isn't uniquely defined]
+                 [(any matrix W with C=inv(W'W) will work), so other  ]
+                 [whitening schemes could be used and these would give]
+                 [different whitened residual time series datasets.   ]
+-Obuck  ppp = dataset for beta + statistics from the OLSQ estimation
+ -Oglt   ppp = dataset for beta + statistics from '-gltsym' options
+
+
+ python /home/logan/Dropbox/Resources/code/fastfuncsim/bin/3dREMLfast.py  -matrix X.xmat.1D \
+ -input "pb04.preproc_sub-pilot01_ses-03_movietask.r01.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r02.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r03.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r04.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r05.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r06.scale+orig.HEAD pb04.preproc_sub-pilot01_ses-03_movietask.r07.scale+orig.HEAD" \
+ -fout -tout -Rbuck faststats.preproc_sub-pilot01_ses-03_movietask_REML -Rvar faststats.preproc_sub-pilot01_ses-03_movietask_REMLvar

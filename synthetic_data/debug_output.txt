@@ -1,0 +1,197 @@
+======================================================================
+3dREMLfast - GPU-Accelerated ARMA(1,1) GLM
+======================================================================
+
+⚙️  Precision: DOUBLE (float64) - matches AFNI exactly
+
+📁 Input files: 1 file(s)
+   • smaller_dset+orig.HEAD
+
+⏱️  TR: 1.000 seconds
+
+💾 Output format: afni
+
+🖥️  Device: cuda
+
+🔢 Custom a_grid: [0.1, 0.8] with 8 points
+🔢 Custom b_grid: [-0.8, 0.8] with 16 points
+
+🚀 Starting GLM analysis...
+
+
+======================================================================
+DEBUG MEMORY: START (after data/design load)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  data                          : (12000, 360)         float64    cpu            33.0 MiB
+  design                        : (360, 14)            float64    cuda:0          0.0 MiB
+  TOTAL                         :                                                33.0 MiB
+
+======================================================================
+
+Grid memory: 120.4 MiB (117 pairs)
+Adjusted batch size: 5,000 voxels (grid + batches fit in GPU)
+ARMA(1,1) GLM Fit
+  Voxels: 12,000
+  Timepoints: 360
+  Regressors: 14
+  Per-voxel estimation: True
+  Batch size: 5,000
+Processing 3 batches of 5,000 voxels...
+Pre-computing REML grid (Cholesky factorizations)...
+  Building ALL covariance matrices (vectorized)...
+    Initial grid: 9 a × 17 b = 153 combinations
+  ✓ Built 117 covariance matrices (filtered 36 with λ ≤ 0)
+  Computing ALL Cholesky factorizations (batched on CPU (recommended))...
+  ✓ Computed 117 Cholesky factorizations at once!
+  Prewhitening design matrix for all parameters...
+
+======================================================================
+DEBUG MEMORY: Grid: After Cholesky (before R_batch delete)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  L_batch                       : (117, 360, 360)      float64    cpu           115.7 MiB
+  L_inv_batch                   : (117, 360, 360)      float64    cpu           115.7 MiB
+  TOTAL                         :                                               231.4 MiB
+
+======================================================================
+
+
+======================================================================
+DEBUG MEMORY: Grid: After R_batch deleted
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  L_batch                       : (117, 360, 360)      float64    cpu           115.7 MiB
+  L_inv_batch                   : (117, 360, 360)      float64    cpu           115.7 MiB
+  TOTAL                         :                                               231.4 MiB
+
+======================================================================
+
+  ✓ Precomputed all matrices!
+  Storing 117 parameter sets...
+
+======================================================================
+DEBUG MEMORY: Grid: Before deleting batch tensors
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  L_inv_batch                   : (117, 360, 360)      float64    cpu           115.7 MiB
+  X_w_batch                     : (117, 360, 14)       float64    cpu             4.5 MiB
+  XwTXw_reg_batch               : (117, 14, 14)        float64    cpu             0.2 MiB
+  TOTAL                         :                                               120.4 MiB
+
+======================================================================
+
+
+======================================================================
+DEBUG MEMORY: Grid: After deleting batch tensors (grid in dict only)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+======================================================================
+
+✓ Precomputed 117 valid (a,b) pairs
+  Grid: 8 a values × 16 b values
+  These matrices will be reused for ALL voxels (massive speedup!)
+
+======================================================================
+DEBUG MEMORY: AFTER grid precomputation (on CPU)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  sample_L_inv                  : (360, 360)           float64    cpu             1.0 MiB
+  sample_X_w                    : (360, 14)            float64    cpu             0.0 MiB
+  sample_XwTXw_reg              : (14, 14)             float64    cpu             0.0 MiB
+  TOTAL                         :                                                 1.0 MiB
+
+======================================================================
+
+  Loading grid to GPU (one-time cost)...
+  ✓ Grid loaded to GPU (will be reused for all 3 batches)
+
+
+======================================================================
+DEBUG MEMORY: AFTER grid loaded to GPU
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.118 GiB
+  Reserved:         0.119 GiB
+  Max Allocated:    0.118 GiB
+  Total:           15.460 GiB
+  Free:            15.341 GiB
+
+Tensor Sizes:
+  sample_L_inv                  : (360, 360)           float64    cuda:0          1.0 MiB
+  sample_X_w                    : (360, 14)            float64    cuda:0          0.0 MiB
+  sample_XwTXw_reg              : (14, 14)             float64    cuda:0          0.0 MiB
+  TOTAL                         :                                                 1.0 MiB
+
+======================================================================
+
+ARMA(1,1) batches:   0%|          | 0/3 [00:00<?, ?batch/s]ARMA(1,1) batches:  33%|███▎      | 1/3 [00:00<00:01,  1.10batch/s]ARMA(1,1) batches:  67%|██████▋   | 2/3 [00:01<00:00,  1.25batch/s]ARMA(1,1) batches: 100%|██████████| 3/3 [00:01<00:00,  1.79batch/s]ARMA(1,1) batches: 100%|██████████| 3/3 [00:01<00:00,  1.58batch/s]
+
+Complete!
+  Mean (a, b): (0.051, 0.307)
+  Mean λ: 0.303
+  Mean R²: 0.301
+  Mean |t|: 22.310
+✅ Analysis complete!
+
+💾 Writing outputs...
+
+  • Writing REML betas + stats (bucket): teststats
+  • Writing REML variance parameters: testvar
+Traceback (most recent call last):
+  File "/home/logan/Dropbox/Resources/code/fastfuncsim/synthetic_data/../bin/3dREMLfast.py", line 627, in <module>
+    main()
+  File "/home/logan/Dropbox/Resources/code/fastfuncsim/synthetic_data/../bin/3dREMLfast.py", line 549, in main
+    nib.save(var_img, str(Path(args.Rvar).with_suffix('.BRIK')))
+  File "/home/logan/miniconda3/envs/py312_movie_tasks/lib/python3.12/site-packages/nibabel/loadsave.py", line 203, in save
+    raise err
+  File "/home/logan/miniconda3/envs/py312_movie_tasks/lib/python3.12/site-packages/nibabel/loadsave.py", line 198, in save
+    converted = klass.from_image(img)
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/logan/miniconda3/envs/py312_movie_tasks/lib/python3.12/site-packages/nibabel/spatialimages.py", line 607, in from_image
+    klass.header_class.from_header(img.header),
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/logan/miniconda3/envs/py312_movie_tasks/lib/python3.12/site-packages/nibabel/brikhead.py", line 301, in from_header
+    raise AFNIHeaderError('Cannot create AFNIHeader from non-AFNIHeader.')
+nibabel.brikhead.AFNIHeaderError: Cannot create AFNIHeader from non-AFNIHeader.

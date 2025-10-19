@@ -32,6 +32,7 @@ class GLMResults:
         self.sigma2 = None  # (n_voxels,)
         self.fstats = None  # (n_voxels,)
         self.dof = None  # Degrees of freedom used for contrasts
+        self.xtx_inv = None  # (n_regressors, n_regressors) - needed for contrasts
         self.original_shape = None  # Original spatial dimensions
         self.tr = None  # Repetition time (seconds)
         self.voxel_mask = None  # Optional boolean mask for sparse analyses
@@ -69,7 +70,10 @@ class GLMResults:
 
 
 def construct_polynomial_matrix(
-    n_timepoints: int, max_degree: int, device: torch.device
+    n_timepoints: int,
+    max_degree: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
     Construct polynomial nuisance regressor matrix (for detrending)
@@ -82,6 +86,8 @@ def construct_polynomial_matrix(
         Maximum polynomial degree (0=constant, 1=linear, etc.)
     device : torch.device
         Device to create tensor on
+    dtype : torch.dtype, default=torch.float32
+        Data type for the polynomial matrix
 
     Returns
     -------
@@ -89,13 +95,13 @@ def construct_polynomial_matrix(
         (n_timepoints, max_degree+1) polynomial matrix
     """
     if max_degree < 0:
-        return torch.empty(n_timepoints, 0, device=device)
+        return torch.empty(n_timepoints, 0, device=device, dtype=dtype)
 
     # Create time vector normalized to [-1, 1]
-    t = torch.linspace(-1, 1, n_timepoints, device=device)
+    t = torch.linspace(-1, 1, n_timepoints, device=device, dtype=dtype)
 
     # Create polynomial terms
-    poly_matrix = torch.zeros(n_timepoints, max_degree + 1, device=device)
+    poly_matrix = torch.zeros(n_timepoints, max_degree + 1, device=device, dtype=dtype)
     for degree in range(max_degree + 1):
         poly_matrix[:, degree] = t**degree
 
@@ -184,21 +190,27 @@ def fit_glm_chunk(
         betas = torch.linalg.solve_triangular(R, Q.T @ data.T, upper=True)
         betas = betas.T
 
-    # Compute predictions
-    predicted_vals = data @ design @ betas.T if want_predicted else design @ betas.T
+    # Compute predictions and residuals
+    # NOTE: design @ betas.T gives (n_timepoints, n_regressors) @ (n_regressors, n_voxels) = (n_timepoints, n_voxels)
+    # This can be huge! For 332k voxels × 2880 timepoints × 4 bytes = 3.5 GB!
+    # Only compute if needed, otherwise compute residuals directly
 
-    # Compute R²: R² = 1 - SSE/SST
+    if want_predicted or want_residuals:
+        # Need full predictions
+        predicted_vals = (design @ betas.T).T  # (n_voxels, n_timepoints)
+        residuals_vals = data - predicted_vals
+    else:
+        # Just compute residuals for R² (more memory efficient)
+        predicted_vals = None
+        residuals_vals = data - (design @ betas.T).T  # (n_voxels, n_timepoints)
+
+    ss_residual = (residuals_vals**2).sum(dim=1)
+
     # SST = sum((Y - mean(Y))²)
-    # SSE = sum((Y - Y_pred)²)
     data_mean = data.mean(dim=1, keepdim=True)
     ss_total = ((data - data_mean) ** 2).sum(dim=1)
 
-    residuals_vals = data - predicted_vals.T
-    ss_residual = (residuals_vals**2).sum(dim=1)
-
-    r2 = 1 - ss_residual / (
-        ss_total + 1e-10
-    )  # Add small epsilon to avoid division by zero
+    r2 = 1 - ss_residual / (ss_total + 1e-10)  # Add epsilon to avoid division by zero
     r2 = torch.clamp(r2, 0, 1)  # Clamp to [0, 1]
 
     return (
@@ -206,7 +218,7 @@ def fit_glm_chunk(
         r2,
         ss_residual,
         residuals_vals if want_residuals else None,
-        predicted_vals.T if want_predicted else None,
+        predicted_vals if want_predicted else None,
     )
 
 
@@ -223,6 +235,7 @@ def fit_glm(
     chunk_size: Optional[int] = None,
     verbose: bool = True,
     preload_data_to_device: bool = True,
+    use_double: bool = False,
 ) -> GLMResults:
     """
     Fast GPU-accelerated GLM fitting
@@ -265,12 +278,18 @@ def fit_glm(
     preload_data_to_device : bool
         If True (default), loads all voxel data onto the compute device up front (legacy behavior).
         If False, keeps data on CPU and streams chunks to the device to reduce memory usage.
+    use_double : bool, default=False
+        If True, use float64 precision (matches AFNI exactly, ~2x memory, ~1.5x slower).
+        If False, use float32 precision (faster, tiny differences from AFNI).
 
     Returns
     -------
     results : GLMResults
         Object containing betas, R², etc.
     """
+    # Setup precision
+    dtype = torch.float64 if use_double else torch.float32
+
     # Setup device
     if device is None:
         device = get_device()
@@ -291,7 +310,7 @@ def fit_glm(
     storage_device = device if preload_data_to_device else torch.device("cpu")
     for i, d in enumerate(data):
         d_tensor = to_tensor(d, device=storage_device)
-        d_tensor = d_tensor.to(torch.float32)
+        d_tensor = d_tensor.to(dtype)
         if not preload_data_to_device and d_tensor.device.type != "cpu":
             d_tensor = d_tensor.cpu()
 
@@ -311,8 +330,8 @@ def fit_glm(
 
     n_voxels = data_2d[0].shape[0]
 
-    # Convert design matrices
-    design_2d = [to_tensor(d, device=device) for d in design]
+    # Convert design matrices to correct dtype
+    design_2d = [to_tensor(d, device=device).to(dtype) for d in design]
 
     # Handle polynomial detrending
     if max_poly_degree is None:
@@ -329,11 +348,13 @@ def fit_glm(
         full_design = design_2d[run_idx]
 
         # Add polynomial regressors
-        poly = construct_polynomial_matrix(n_tp, max_poly_degree[run_idx], device)
+        poly = construct_polynomial_matrix(
+            n_tp, max_poly_degree[run_idx], device, dtype
+        )
 
         # Add extra regressors if provided
         if extra_regressors is not None and extra_regressors[run_idx] is not None:
-            extra = to_tensor(extra_regressors[run_idx], device=device)
+            extra = to_tensor(extra_regressors[run_idx], device=device).to(dtype)
             nuisance = torch.cat([poly, extra], dim=1)
         else:
             nuisance = poly
@@ -380,9 +401,8 @@ def fit_glm(
 
     # Pre-compute matrices for statistics
     xtx = design_concat.T @ design_concat
-    ridge = 1e-6 * torch.eye(xtx.shape[0], device=device)
-    xtx_reg = xtx + ridge
-    xtx_inv = torch.linalg.inv(xtx_reg)
+    # No ridge regularization - match AFNI behavior (will fail if matrix is singular)
+    xtx_inv = torch.linalg.inv(xtx)
 
     task_beta_indices = []
     reg_offset = 0
@@ -406,11 +426,8 @@ def fit_glm(
         )
         dof = max(1, dof)
 
-    # Precompute inverse for F-stat (avoid instability by adding ridge)
-    xtx_inv_task_reg = xtx_inv_task + 1e-6 * torch.eye(
-        xtx_inv_task.shape[0], device=device
-    )
-    xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task_reg)
+    # Precompute inverse for F-stat (no ridge - match AFNI behavior)
+    xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task)
     n_task_params = xtx_inv_task.shape[0]
 
     all_sigma2: list[torch.Tensor] = []
@@ -554,6 +571,8 @@ def fit_glm(
     results.fstats = torch.cat(all_fstats, dim=0).to(concat_device)
     results.dof = dof
     results.tr = tr
+    # Store (X'X)^-1 for contrast computation (task regressors only, matching betas)
+    results.xtx_inv = xtx_inv_task.to(concat_device)
 
     if want_r2_run:
         results.r2_run = torch.cat(all_r2_run, dim=0).to(concat_device)

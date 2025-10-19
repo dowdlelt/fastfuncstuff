@@ -23,11 +23,70 @@ References:
 
 import warnings
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+
+
+def _debug_memory_snapshot(
+    label: str, device: torch.device, tensors: Dict[str, torch.Tensor] = None
+) -> None:
+    """Print detailed memory snapshot for debugging.
+
+    Parameters
+    ----------
+    label : str
+        Description of current step
+    device : torch.device
+        Device to check memory for
+    tensors : dict, optional
+        Dictionary of tensor_name -> tensor to report sizes for
+    """
+    print(f"\n{'=' * 70}")
+    print(f"DEBUG MEMORY: {label}")
+    print(f"{'=' * 70}")
+
+    if device.type == "cuda":
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
+        total = torch.cuda.get_device_properties(device).total_memory / 1024**3
+        free = total - reserved
+
+        print(f"GPU Memory ({device}):")
+        print(f"  Allocated:     {allocated:>8.3f} GiB")
+        print(f"  Reserved:      {reserved:>8.3f} GiB")
+        print(f"  Max Allocated: {max_allocated:>8.3f} GiB")
+        print(f"  Total:         {total:>8.3f} GiB")
+        print(f"  Free:          {free:>8.3f} GiB")
+        print()
+
+    if tensors:
+        print("Tensor Sizes:")
+        total_bytes = 0
+        for name, tensor in tensors.items():
+            if tensor is None:
+                print(f"  {name:30s}: None")
+                continue
+
+            size_mb = tensor.element_size() * tensor.nelement() / 1024**2
+            total_bytes += tensor.element_size() * tensor.nelement()
+            dtype_str = str(tensor.dtype).replace("torch.", "")
+            device_str = str(tensor.device)
+
+            print(
+                f"  {name:30s}: {str(tuple(tensor.shape)):20s} {dtype_str:10s} {device_str:10s} {size_mb:>8.1f} MiB"
+            )
+
+        print(
+            f"  {'TOTAL':30s}: {'':<20s} {'':<10s} {'':<10s} {total_bytes / 1024**2:>8.1f} MiB"
+        )
+        print()
+
+    print(f"{'=' * 70}\n")
+
 
 from .utils import get_device, to_tensor
 
@@ -37,8 +96,178 @@ DEFAULT_ARMA_A_GRID = (0.0, 0.9, 9)  # (start, end, num_points)
 DEFAULT_ARMA_B_GRID = (-0.8, 0.8, 9)  # (start, end, num_points)
 
 
+def check_cuda_memory_before_batch(
+    batch_voxels: int,
+    n_timepoints: int,
+    n_regressors: int,
+    device: torch.device,
+    verbose: bool = False,
+) -> int:
+    """
+    Check available CUDA memory and adjust batch size if needed.
+
+    This is the forward-looking logic to prevent OOM before it happens!
+
+    Parameters
+    ----------
+    batch_voxels : int
+        Desired batch size
+    n_timepoints : int
+        Number of timepoints
+    n_regressors : int
+        Number of regressors
+    device : torch.device
+        Device to check
+    verbose : bool
+        Print warnings if adjustment needed
+
+    Returns
+    -------
+    int
+        Adjusted batch size that will fit in available memory
+    """
+    if device.type != "cuda":
+        return batch_voxels
+
+    # Clear cache first to get accurate reading
+    torch.cuda.empty_cache()
+
+    # Calculate required memory for GLS solve (the bottleneck!)
+    required_bytes = (
+        batch_voxels * n_timepoints * n_regressors * 4  # X_w_batch
+        + batch_voxels * n_timepoints * 4  # y_w_batch
+        + batch_voxels * n_regressors * n_regressors * 4  # XtX
+        + batch_voxels * n_regressors * 4  # betas
+        + batch_voxels * n_timepoints * 4  # residuals
+    )
+
+    # Get available memory (free + reserved-but-unallocated)
+    free_mem = torch.cuda.mem_get_info(device)[0]
+    reserved_mem = torch.cuda.memory_reserved(device)
+    allocated_mem = torch.cuda.memory_allocated(device)
+    available_mem = free_mem + (reserved_mem - allocated_mem)
+
+    # Use only 80% of available (leave headroom)
+    usable_mem = available_mem * 0.8
+
+    if required_bytes > usable_mem:
+        # Need to reduce batch size
+        reduction_factor = usable_mem / required_bytes
+        new_batch = int(batch_voxels * reduction_factor * 0.95)  # Extra 5% safety
+        new_batch = max(new_batch, 500)  # Minimum batch
+
+        if verbose:
+            print(
+                f"\n⚠ Memory check: batch would need {required_bytes / 1e9:.2f} GB "
+                f"but only {usable_mem / 1e9:.2f} GB available"
+            )
+            print(f"  Reducing batch: {batch_voxels:,} → {new_batch:,} voxels\n")
+
+        return new_batch
+
+    return batch_voxels
+
+
+def estimate_valid_grid_pairs(
+    a_grid: torch.Tensor,
+    b_grid: torch.Tensor,
+) -> int:
+    """
+    Estimate number of valid (a,b) pairs that will pass filtering.
+
+    This applies the same filtering logic as build_arma11_covariance_batch
+    but without building the expensive covariance matrices.
+
+    Parameters
+    ----------
+    a_grid : torch.Tensor
+        AR parameter grid
+    b_grid : torch.Tensor
+        MA parameter grid
+
+    Returns
+    -------
+    n_valid : int
+        Estimated number of valid (a,b) pairs
+    """
+    # Create all (a,b) combinations
+    a_mesh, b_mesh = torch.meshgrid(a_grid, b_grid, indexing="ij")
+    a_flat = a_mesh.reshape(-1)
+    b_flat = b_mesh.reshape(-1)
+
+    # Apply same filtering as build_arma11_covariance_batch
+    valid_mask = (torch.abs(a_flat) < 1.0) & (torch.abs(b_flat) < 1.0)
+
+    denom = 1 - a_flat**2
+    valid_mask &= torch.abs(denom) >= 1e-6
+
+    gamma0 = (1 + b_flat**2 + 2 * a_flat * b_flat) / (denom + 1e-10)
+    valid_mask &= gamma0 > 0
+
+    a_valid = a_flat[valid_mask]
+    b_valid = b_flat[valid_mask]
+
+    # Apply lambda filtering (only allow lambda >= 0)
+    rho1_valid = _compute_arma11_lambda(a_valid, b_valid)
+    if isinstance(rho1_valid, torch.Tensor):
+        lambda_mask = rho1_valid >= 0
+        n_valid = int(lambda_mask.sum().item())
+    else:
+        n_valid = 0
+
+    return n_valid
+
+
+def calculate_grid_memory_footprint(
+    n_valid_ab_pairs: int,
+    n_timepoints: int,
+    n_regressors: int,
+    use_double: bool = False,
+) -> int:
+    """
+    Calculate exact memory footprint of REML grid precomputation.
+
+    The grid precomputation stores these tensors for each (a,b) pair:
+    - L_inv: inverse Cholesky factor (n_timepoints, n_timepoints)
+    - X_w: prewhitened design (n_timepoints, n_regressors)
+    - XwTXw_reg: X'X matrix (n_regressors, n_regressors)
+    - logdet_R: scalar
+    - logdet_XwTXw: scalar
+
+    Parameters
+    ----------
+    n_valid_ab_pairs : int
+        Number of valid (a,b) parameter pairs in grid
+    n_timepoints : int
+        Number of timepoints (autocorrelation matrices are n×n)
+    n_regressors : int
+        Number of regressors in design matrix
+    use_double : bool, default=False
+        If True, use float64 precision (8 bytes per element)
+
+    Returns
+    -------
+    memory_bytes : int
+        Total memory required in bytes
+    """
+    bytes_per_element = 8 if use_double else 4
+
+    # Memory per (a,b) pair
+    L_inv_size = n_timepoints * n_timepoints * bytes_per_element
+    X_w_size = n_timepoints * n_regressors * bytes_per_element
+    XwTXw_size = n_regressors * n_regressors * bytes_per_element
+    scalars_size = 2 * bytes_per_element  # logdet_R + logdet_XwTXw
+
+    per_pair_bytes = L_inv_size + X_w_size + XwTXw_size + scalars_size
+
+    # Total for all pairs
+    total_bytes = n_valid_ab_pairs * per_pair_bytes
+
+    return int(total_bytes)
+
+
 def get_adaptive_batch_size(
-    device: torch.device, n_timepoints: int, n_regressors: int
+    device: torch.device, n_timepoints: int, n_regressors: int, use_double: bool = False
 ) -> int:
     """
     Intelligently determine optimal batch size based on GPU memory
@@ -54,6 +283,9 @@ def get_adaptive_batch_size(
         Number of timepoints in data
     n_regressors : int
         Number of regressors in design
+    use_double : bool, default=False
+        If True, use float64 precision (8 bytes per element).
+        If False, use float32 precision (4 bytes per element).
 
     Returns
     -------
@@ -63,14 +295,15 @@ def get_adaptive_batch_size(
     Notes
     -----
     Memory scaling:
-    - Each voxel needs ~(n_timepoints × n_regressors × 4 bytes) for whitened design
+    - Each voxel needs ~(n_timepoints × n_regressors × bytes_per_element) for whitened design
     - Additional workspace for residuals, betas, etc.
     - Conservative estimates to ensure stability
+    - Float64 uses 2x memory, so batch size is automatically halved
 
     Device-specific tuning:
-    - MPS (Mac M-series): 36GB unified memory → aggressive batching (50k+ voxels)
-    - CUDA (NVIDIA): Depends on VRAM (8GB=10k, 16GB=25k, 24GB=40k, 40GB=60k)
-    - CPU: Conservative (5k voxels) due to slower computation
+    - MPS (Mac M-series): 36GB unified memory → aggressive batching (50k+ voxels float32, 25k float64)
+    - CUDA (NVIDIA): Depends on VRAM (8GB=10k, 16GB=25k, 24GB=40k, 40GB=60k float32)
+    - CPU: Conservative (5k voxels float32, 2.5k float64) due to slower computation
 
     Example
     -------
@@ -79,62 +312,63 @@ def get_adaptive_batch_size(
     >>> print(f"Optimal batch: {batch_size:,} voxels")
     Optimal batch: 50,000 voxels
     """
-    # Estimate memory per voxel (bytes)
-    # CRITICAL: During REML grid search, memory usage is MUCH higher!
-    # - batch_reml_grid_search creates (n_grid × n_voxels × n_timepoints) tensors
-    # - With 63 grid points, that's 63x the base memory!
-    # - After REML, memory drops significantly for GLS fitting
-    #
-    # Base memory per voxel:
-    # - Whitened design: n_timepoints × n_regressors × 4
-    # - Whitened data: n_timepoints × 4
-    # - Betas: n_regressors × 4
-    # - Residuals: n_timepoints × 4
-    # - Workspace (conservative): 2x the above
+    # ACCURATE memory per voxel calculation for GLS solve (the real bottleneck!)
+    # The critical allocation is X_w_batch = (batch_voxels, n_timepoints, n_regressors)
+    bytes_per_element = 8 if use_double else 4
     mem_per_voxel = (
-        n_timepoints * n_regressors * 4  # X_w
-        + n_timepoints * 4  # y_w
-        + n_regressors * 4  # betas
-        + n_timepoints * 4  # residuals
-        + n_regressors * n_regressors * 4  # covariance
-    ) * 2  # Safety factor
-
-    # IMPORTANT: The REML grid search phase needs ~63x more memory!
-    # We size batches conservatively to handle the REML peak
+        n_timepoints * n_regressors * bytes_per_element  # X_w_batch: THE BOTTLENECK!
+        + n_timepoints * bytes_per_element  # y_w_batch
+        + n_regressors * n_regressors * bytes_per_element  # XtX workspace
+        + n_regressors * bytes_per_element  # betas
+        + n_regressors * bytes_per_element  # tstats
+        + 3 * bytes_per_element  # params (a, b, lambda)
+    )
 
     if device.type == "mps":
         # Mac M-series with unified memory (typically 16-64GB)
-        # Conservative: use ~20% of assumed 36GB = 7.2GB for batch
-        # Can be more aggressive since no PCIe transfers
-        available_gb = 7.0
+        available_gb = 8.0
         batch_size = int((available_gb * 1e9) / mem_per_voxel)
-        # Clamp to reasonable range
-        batch_size = max(20000, min(batch_size, 100000))
+        batch_size = max(5000, min(batch_size, 50000))
 
     elif device.type == "cuda":
-        # NVIDIA GPU - query actual VRAM if possible
+        # NVIDIA GPU - query actual VRAM
         try:
             total_mem = torch.cuda.get_device_properties(device).total_memory
-            # Use 40% of total VRAM for batch (rest for model, precomputed grid, etc.)
-            available_mem = total_mem * 0.3
+            # Use 50% of VRAM for batch sizing (assumes dedicated GPU)
+            # Leave 13% for PyTorch overhead, CUDA context, fragmentation, and grid memory
+            # (fit_glm_arma11 will further refine this to account for actual grid size)
+            available_mem = total_mem * 0.80
             batch_size = int(available_mem / mem_per_voxel)
-            # Clamp based on typical VRAM sizes
+
+            # Safety clamps based on GPU size
+            # NOTE: These are conservative estimates. The actual batch size will be
+            # further adjusted in fit_glm_arma11() to account for grid memory.
             if total_mem < 10e9:  # < 10GB
-                batch_size = min(batch_size, 10000)
-            elif total_mem < 20e9:  # 10-20GB
-                batch_size = min(batch_size, 25000)
-            else:  # > 20GB
-                batch_size = min(batch_size, 60000)
-        except:
-            # Fallback if CUDA query fails
-            batch_size = 15000
-
+                batch_size = min(batch_size, 5000)
+            elif total_mem < 20e9:  # 10-20GB (e.g., RTX 4070, 15-16GB GPUs)
+                batch_size = min(batch_size, 20000)
+            else:  # > 20GB (e.g., RTX 4090, A100)
+                batch_size = min(batch_size, 30000)
+        except Exception:
+            batch_size = 3000
     else:
-        # CPU or unknown device - be conservative
-        batch_size = 5000
+        # CPU or unknown device
+        # For CPU, we can use much larger batches since we have more RAM
+        # and can parallelize across cores
+        try:
+            import psutil
 
-    # Ensure minimum batch size for efficiency
-    batch_size = max(batch_size, 5000)
+            # Use 50% of available RAM (conservative, leaves room for OS and other processes)
+            available_ram = psutil.virtual_memory().available * 0.5
+            batch_size = int(available_ram / mem_per_voxel)
+            # Reasonable limits for CPU (parallelizes well with larger batches)
+            batch_size = max(5000, min(batch_size, 50000))
+        except ImportError:
+            # psutil not available, use conservative default
+            batch_size = 5000
+
+    # Ensure reasonable minimum
+    batch_size = max(batch_size, 1000)
 
     return batch_size
 
@@ -194,30 +428,119 @@ def get_default_arma_grids(device: torch.device) -> tuple[torch.Tensor, torch.Te
     return a_grid, b_grid
 
 
+def ensure_zero_in_grid(
+    a_grid: torch.Tensor, b_grid: torch.Tensor, tolerance: float = 1e-9
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Ensure that both grids contain 0.0, adding it if necessary.
+
+    This guarantees that the special case (a=0, b=0) is always tested,
+    even if the user provides a grid that starts at 0.1 or has spacing
+    that would skip zero.
+
+    Parameters
+    ----------
+    a_grid : torch.Tensor
+        AR parameter grid
+    b_grid : torch.Tensor
+        MA parameter grid
+    tolerance : float, default=1e-9
+        Tolerance for checking if zero is already in the grid
+
+    Returns
+    -------
+    a_grid : torch.Tensor
+        AR parameter grid with 0.0 included
+    b_grid : torch.Tensor
+        MA parameter grid with 0.0 included
+
+    Notes
+    -----
+    The (a=0, b=0) case represents white noise (no autocorrelation),
+    which is an important baseline for comparison. This function ensures
+    it's always tested regardless of user grid specification.
+
+    Examples
+    --------
+    >>> a_grid = torch.tensor([0.1, 0.2, 0.3])
+    >>> b_grid = torch.tensor([0.1, 0.2, 0.3])
+    >>> a_new, b_new = ensure_zero_in_grid(a_grid, b_grid)
+    >>> print(a_new)  # [0.0, 0.1, 0.2, 0.3]
+    >>> print(b_new)  # [0.0, 0.1, 0.2, 0.3]
+    """
+    device = a_grid.device
+    dtype = a_grid.dtype
+
+    # Check if 0.0 is already in a_grid (within tolerance)
+    if not torch.any(torch.abs(a_grid) < tolerance):
+        # Add 0.0 to a_grid and sort
+        zero_tensor = torch.tensor([0.0], device=device, dtype=dtype)
+        a_grid = torch.cat([zero_tensor, a_grid])
+        a_grid = torch.sort(a_grid)[0]
+
+    # Check if 0.0 is already in b_grid (within tolerance)
+    if not torch.any(torch.abs(b_grid) < tolerance):
+        # Add 0.0 to b_grid and sort
+        zero_tensor = torch.tensor([0.0], device=device, dtype=dtype)
+        b_grid = torch.cat([zero_tensor, b_grid])
+        b_grid = torch.sort(b_grid)[0]
+
+    return a_grid, b_grid
+
+
 class ARMA11Results:
     """Container for ARMA(1,1) GLM results"""
 
     def __init__(self):
-        self.betas = None  # (n_voxels, n_regressors) GLS parameter estimates
-        self.tstats = None  # (n_voxels, n_regressors) t-statistics (corrected)
-        self.r2 = None  # (n_voxels,) R² values
-        self.arma_params = None  # (n_voxels, 2) - (a, b) per voxel
-        self.arma_lambda = None  # (n_voxels,) - lag-1 correlation
-        self.reml_likelihood = None  # (n_voxels,) - optimized REML log-likelihood
-        self.residuals = None  # (n_voxels, n_timepoints) - residuals in original space
-        self.predicted = None  # (n_voxels, n_timepoints) - predictions (original space)
-        self.residuals_whitened = (
+        self.betas: Optional[torch.Tensor] = (
+            None  # (n_voxels, n_regressors) GLS parameter estimates
+        )
+        self.tstats: Optional[torch.Tensor] = (
+            None  # (n_voxels, n_regressors) t-statistics (corrected)
+        )
+        self.r2: Optional[torch.Tensor] = None  # (n_voxels,) R² values
+        self.arma_params: Optional[torch.Tensor] = (
+            None  # (n_voxels, 2) - (a, b) per voxel
+        )
+        self.arma_lambda: Optional[torch.Tensor] = (
+            None  # (n_voxels,) - lag-1 correlation
+        )
+        self.reml_likelihood: Optional[torch.Tensor] = (
+            None  # (n_voxels,) - optimized REML log-likelihood
+        )
+        self.residuals: Optional[torch.Tensor] = (
+            None  # (n_voxels, n_timepoints) - residuals in original space
+        )
+        self.predicted: Optional[torch.Tensor] = (
+            None  # (n_voxels, n_timepoints) - predictions (original space)
+        )
+        self.residuals_whitened: Optional[torch.Tensor] = (
             None  # (n_voxels, n_timepoints) - residuals after whitening
         )
-        self.sigma2 = None  # (n_voxels,) - noise variance estimates
-        self.var_betas = None  # (n_voxels, n_regressors, n_regressors) - covariance
-        self.original_shape = None  # Original spatial dimensions
-        self.fstats = None  # (n_voxels,) - omnibus F-statistic across regressors
-        self.dof = None  # Degrees of freedom (n_timepoints - n_regressors)
-        self.tr = None  # Repetition time
-        self.voxel_mask = None  # Optional boolean mask for sparse analyses
-        self.full_shape = None  # Original spatial shape before masking
-        self.affine = None  # Spatial affine if available
+        self.sigma2: Optional[torch.Tensor] = (
+            None  # (n_voxels,) - noise variance estimates
+        )
+        self.var_betas: Optional[torch.Tensor] = (
+            None  # (n_voxels, n_regressors, n_regressors) - covariance
+        )
+        self.original_shape: Optional[Tuple[int, int, int]] = (
+            None  # Original spatial dimensions
+        )
+        self.fstats: Optional[torch.Tensor] = (
+            None  # (n_voxels,) - omnibus F-statistic across regressors
+        )
+        self.dof: Optional[int] = (
+            None  # Degrees of freedom (n_timepoints - n_regressors)
+        )
+        self.tr: Optional[float] = None  # Repetition time
+        self.voxel_mask: Optional[torch.Tensor] = (
+            None  # Optional boolean mask for sparse analyses
+        )
+        self.full_shape: Optional[Tuple[int, int, int]] = (
+            None  # Original spatial shape before masking
+        )
+        self.affine: Optional[np.ndarray] = None  # Spatial affine if available
+        self.ols_results: Optional[Any] = None  # Optional GLMResults for OLS comparison
 
 
 def _compute_arma11_lambda(
@@ -258,7 +581,7 @@ def _compute_arma11_lambda(
 
 
 def build_arma11_covariance(
-    a: float, b: float, n: int, device: torch.device
+    a: float, b: float, n: int, device: torch.device, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """
     Build ARMA(1,1) covariance matrix (Toeplitz structure)
@@ -277,6 +600,8 @@ def build_arma11_covariance(
         Number of timepoints
     device : torch.device
         Computing device
+    dtype : torch.dtype, default=torch.float32
+        Data type for the covariance matrix (float32 or float64)
 
     Returns
     -------
@@ -307,14 +632,14 @@ def build_arma11_covariance(
         return None
 
     # Build correlation vector: [1, λ, λ*a, λ*a², λ*a³, ...]
-    corr = torch.zeros(n, device=device, dtype=torch.float32)
+    corr = torch.zeros(n, device=device, dtype=dtype)
     corr[0] = 1.0
 
     if n > 1:
         corr[1] = rho1
 
         if n > 2:
-            powers = torch.full((n - 2,), a, device=device, dtype=torch.float32)
+            powers = torch.full((n - 2,), a, device=device, dtype=dtype)
             powers = torch.cumprod(powers, dim=0)
             corr[2:] = rho1 * powers
 
@@ -334,6 +659,7 @@ def build_arma11_covariance_batch(
     b_grid: torch.Tensor,
     n: int,
     device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor, list]:
     """
     Build ALL ARMA(1,1) covariance matrices at once (VECTORIZED!)
@@ -354,6 +680,8 @@ def build_arma11_covariance_batch(
         Number of timepoints
     device : torch.device
         Computing device
+    dtype : torch.dtype, default=torch.float32
+        Data type for the covariance matrices (float32 or float64)
 
     Returns
     -------
@@ -409,7 +737,11 @@ def build_arma11_covariance_batch(
 
     # Compute lambda using SINGLE SOURCE OF TRUTH function
     # This ensures batch and scalar versions use identical math
-    rho1_valid = _compute_arma11_lambda(a_valid, b_valid)  # (n_valid,)
+    rho1_valid_raw = _compute_arma11_lambda(a_valid, b_valid)  # (n_valid,)
+    # Type narrowing: ensure it's a Tensor (it will be since inputs are Tensors)
+    if not isinstance(rho1_valid_raw, torch.Tensor):
+        raise TypeError("Expected rho1_valid to be a Tensor")
+    rho1_valid = cast(torch.Tensor, rho1_valid_raw)  # Explicit cast for pyright
 
     # AFNI constraint: Only allow lambda >= 0 (unless -NEGcor is used)
     # Lambda=0 is valid (uncorrelated noise case)
@@ -429,7 +761,7 @@ def build_arma11_covariance_batch(
 
     # Build correlation vectors for ALL parameters: [1, λ, λ*a, λ*a², λ*a³, ...]
     # This must match the scalar version exactly!
-    corr = torch.zeros(n_valid, n, device=device, dtype=torch.float32)
+    corr = torch.zeros(n_valid, n, device=device, dtype=dtype)
     corr[:, 0] = 1.0  # lag-0 correlation is always 1
 
     if n > 1:
@@ -440,7 +772,7 @@ def build_arma11_covariance_batch(
             # k=2 → a^1, k=3 → a^2, ..., k=n-1 → a^(n-2)
             # So we need powers [a^1, a^2, a^3, ..., a^(n-2)]
             exponents = torch.arange(
-                1, n - 1, device=device, dtype=torch.float32
+                1, n - 1, device=device, dtype=dtype
             )  # [1, 2, 3, ..., n-2]
             powers = a_valid.unsqueeze(1) ** exponents.unsqueeze(0)  # (n_valid, n-2)
             corr[:, 2:] = rho1_valid.unsqueeze(1) * powers  # (n_valid, n-2)
@@ -638,6 +970,9 @@ def reml_grid_search(
     best_a = 0.5
     best_b = 0.0
 
+    # Type assertion: grids are guaranteed to be set by now
+    assert a_grid is not None and b_grid is not None
+
     for a in a_grid:
         for b in b_grid:
             a_val = a.item()
@@ -669,6 +1004,8 @@ def precompute_reml_grid(
     device: torch.device,
     verbose: bool = False,
     cholesky_on_cpu: bool = True,
+    dtype: torch.dtype = torch.float32,
+    debug_memory: bool = False,
 ) -> dict:
     """
     Pre-compute Cholesky factorizations for entire REML grid (BATCHED!)
@@ -696,6 +1033,8 @@ def precompute_reml_grid(
     cholesky_on_cpu : bool, default=True
         Compute Cholesky decompositions on CPU to save GPU memory.
         Recommended for large grids (>200 combinations). Still very fast!
+    dtype : torch.dtype, default=torch.float32
+        Data type for covariance matrices (float32 or float64)
 
     Returns
     -------
@@ -707,8 +1046,23 @@ def precompute_reml_grid(
         - 'logdet_R': log(det(R))
         - 'logdet_XwTXw': log(det(X'R^-1 X))
     """
+    # Ensure X has the correct dtype for all operations
+    X = X.to(dtype=dtype)
     n_regressors = X.shape[1]
     precomputed = {}
+
+    # PHASE 1: Build ALL covariance matrices at once (VECTORIZED!)
+    # Build on CPU if we're going to do Cholesky on CPU anyway (saves GPU memory!)
+    build_device = (
+        torch.device("cpu") if (cholesky_on_cpu or device.type == "mps") else device
+    )
+
+    # Move grids to build_device BEFORE ensure_zero_in_grid
+    a_grid = a_grid.to(build_device)
+    b_grid = b_grid.to(build_device)
+
+    # Ensure (a=0, b=0) is always in the grid (white noise baseline)
+    a_grid, b_grid = ensure_zero_in_grid(a_grid, b_grid)
 
     if verbose:
         print("  Building ALL covariance matrices (vectorized)...")
@@ -717,9 +1071,8 @@ def precompute_reml_grid(
             f"    Initial grid: {len(a_grid)} a × {len(b_grid)} b = {n_total_grid} combinations"
         )
 
-    # PHASE 1: Build ALL covariance matrices at once (VECTORIZED!)
     R_batch, params_tensor, param_list = build_arma11_covariance_batch(
-        a_grid, b_grid, n_timepoints, device
+        a_grid, b_grid, n_timepoints, build_device, dtype
     )
     n_valid = len(param_list)
 
@@ -744,33 +1097,58 @@ def precompute_reml_grid(
         # Compute on CPU (default) or GPU
         # CPU is recommended for large grids to avoid OOM, and is still very fast
         if cholesky_on_cpu or device.type == "mps":
-            R_batch_cpu = R_batch.cpu()
-            L_batch_cpu = torch.linalg.cholesky(R_batch_cpu)  # (n_valid, n, n)
-            L_inv_batch_cpu = torch.linalg.inv(L_batch_cpu)  # (n_valid, n, n)
-            L_batch = L_batch_cpu.to(device)
-            L_inv_batch = L_inv_batch_cpu.to(device)
-            del R_batch_cpu, L_batch_cpu, L_inv_batch_cpu
-        else:
-            # Direct GPU Cholesky (faster but uses more VRAM)
+            # R_batch already on CPU from build_device logic above
             L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
             L_inv_batch = torch.linalg.inv(L_batch)  # (n_valid, n, n)
+            # KEEP ON CPU - will be moved to GPU ONCE after precomputation
+            # This avoids OOM during grid construction (6+ GiB for large grids)
+        else:
+            # Direct GPU Cholesky (faster but uses more VRAM)
+            # R_batch already on GPU from build_device logic above
+            L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
+            L_inv_batch = torch.linalg.inv(L_batch)  # (n_valid, n, n)
+            # Move to CPU for storage (will be loaded to GPU ONCE after grid complete)
+            L_batch = L_batch.cpu()
+            L_inv_batch = L_inv_batch.cpu()
 
         if verbose:
             print(f"  ✓ Computed {n_valid} Cholesky factorizations at once!")
             print(f"  Prewhitening design matrix for all parameters...")
 
+        if debug_memory:
+            _debug_memory_snapshot(
+                "Grid: After Cholesky (before R_batch delete)",
+                device,
+                {
+                    "L_batch": L_batch,
+                    "L_inv_batch": L_inv_batch,
+                },
+            )
+
         # Free R_batch immediately - don't need it anymore
         del R_batch
+
+        if debug_memory:
+            _debug_memory_snapshot(
+                "Grid: After R_batch deleted",
+                device,
+                {
+                    "L_batch": L_batch,
+                    "L_inv_batch": L_inv_batch,
+                },
+            )
 
         # PHASE 3: Batch prewhitening of design matrix
         # X_w[i] = L_inv[i] @ X for all i
         # Use batch matrix multiplication: (n_valid, n, n) @ (n, m) -> (n_valid, n, m)
+        # Move X to same device as L_inv_batch (CPU if cholesky_on_cpu=True)
+        X_build = X.to(L_inv_batch.device)
         # expand() creates a VIEW (no memory copy!)
-        X_expanded = X.unsqueeze(0).expand(n_valid, -1, -1)  # VIEW - no VRAM!
+        X_expanded = X_build.unsqueeze(0).expand(n_valid, -1, -1)  # VIEW!
         X_w_batch = torch.bmm(
             L_inv_batch, X_expanded
         )  # (n_valid, n_timepoints, n_regressors)
-        del X_expanded  # Free view
+        del X_expanded, X_build  # Free view and temp tensor
 
         # PHASE 4: Batch X'X computation
         X_w_batch_T = X_w_batch.transpose(1, 2)  # Cache transpose
@@ -779,11 +1157,8 @@ def precompute_reml_grid(
         )  # (n_valid, n_regressors, n_regressors)
         del X_w_batch_T  # Free transpose cache
 
-        ridge = 1e-6 * torch.eye(n_regressors, device=device).unsqueeze(
-            0
-        )  # (1, n_reg, n_reg)
-        XwTXw_reg_batch = XwTXw_batch + ridge  # (n_valid, n_regressors, n_regressors)
-        del ridge  # Small but good practice
+        # No ridge regularization - match AFNI behavior
+        XwTXw_reg_batch = XwTXw_batch  # (n_valid, n_regressors, n_regressors)
 
         # PHASE 5: Batch likelihood terms (that don't depend on voxel data)
         # logdet_R = 2 * sum(log(diag(L)))
@@ -794,9 +1169,11 @@ def precompute_reml_grid(
 
         # logdet(X'R^-1 X)
         sign_batch, logdet_XwTXw_batch = torch.linalg.slogdet(XwTXw_reg_batch)
-        # Handle non-positive determinants
+        # Handle non-positive determinants (use same device as the tensor!)
         logdet_XwTXw_batch = torch.where(
-            sign_batch > 0, logdet_XwTXw_batch, torch.tensor(1e10, device=device)
+            sign_batch > 0,
+            logdet_XwTXw_batch,
+            torch.tensor(1e10, device=logdet_XwTXw_batch.device, dtype=dtype),
         )  # (n_valid,)
         del sign_batch  # Free immediately
 
@@ -804,14 +1181,18 @@ def precompute_reml_grid(
             print(f"  ✓ Precomputed all matrices!")
             print(f"  Storing {n_valid} parameter sets...")
 
-        # PHASE 6: Store everything in dictionary
+        # PHASE 6: Store everything in dictionary ON CPU
+        # Tensors are already on CPU from Phase 2 - store as-is
+        # They will be moved to GPU on-demand during REML search
         for i, (a_val, b_val) in enumerate(param_list):
             precomputed[(a_val, b_val)] = {
-                "L_inv": L_inv_batch[i],  # (n, n)
-                "X_w": X_w_batch[i],  # (n, n_regressors)
-                "XwTXw_reg": XwTXw_reg_batch[i],  # (n_regressors, n_regressors)
-                "logdet_R": logdet_R_batch[i],  # scalar tensor
-                "logdet_XwTXw": logdet_XwTXw_batch[i],  # scalar tensor
+                "L_inv": L_inv_batch[i],  # (n, n) - CPU tensor
+                "X_w": X_w_batch[i],  # (n, n_regressors) - CPU tensor
+                "XwTXw_reg": XwTXw_reg_batch[
+                    i
+                ],  # (n_regressors, n_regressors) - CPU tensor
+                "logdet_R": logdet_R_batch[i],  # scalar tensor - CPU
+                "logdet_XwTXw": logdet_XwTXw_batch[i],  # scalar tensor - CPU
                 "a": a_val,
                 "b": b_val,
             }
@@ -821,6 +1202,27 @@ def precompute_reml_grid(
         if verbose:
             warnings.warn(f"Batch Cholesky failed ({e}), falling back to sequential...")
 
+        # CRITICAL: Clean up GPU memory from failed batch attempt!
+        # Delete any partially-allocated batch tensors
+        if "R_batch" in locals():
+            del R_batch
+        if "L_batch" in locals():
+            del L_batch
+        if "L_inv_batch" in locals():
+            del L_inv_batch
+        if "X_w_batch" in locals():
+            del X_w_batch
+        if "XwTXw_batch" in locals():
+            del XwTXw_batch
+
+        # Force GPU memory release
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        if verbose:
+            print("  ✓ Cleared GPU memory from failed batch attempt")
+
         # Fall back to old sequential method
         grid_pairs = (
             tqdm(param_list, desc="Precomputing REML grid (sequential)", unit="pair")
@@ -829,37 +1231,45 @@ def precompute_reml_grid(
         )
 
         for a_val, b_val in grid_pairs:
-            R = build_arma11_covariance(a_val, b_val, n_timepoints, device)
+            R = build_arma11_covariance(a_val, b_val, n_timepoints, device, dtype)
             if R is None:
                 continue
 
             try:
-                if device.type == "mps":
+                # Compute on CPU and store on CPU (moved to GPU on-demand later)
+                if cholesky_on_cpu or device.type == "mps":
                     R_cpu = R.cpu()
-                    L_cpu = torch.linalg.cholesky(R_cpu)
-                    L_inv_cpu = torch.linalg.inv(L_cpu)
-                    L = L_cpu.to(device)
-                    L_inv = L_inv_cpu.to(device)
+                    L = torch.linalg.cholesky(R_cpu)
+                    L_inv = torch.linalg.inv(L)
+                    del R_cpu
                 else:
-                    L = torch.linalg.cholesky(R)
+                    # Even if cholesky_on_cpu=False, move to CPU for storage
+                    L = torch.linalg.cholesky(R).cpu()
                     L_inv = torch.linalg.inv(L)
 
-                X_w = L_inv @ X
+                # Prewhiten design on CPU
+                X_cpu = X.cpu() if X.device.type != "cpu" else X
+                X_w = L_inv @ X_cpu
                 XwTXw = X_w.T @ X_w
-                XwTXw_reg = XwTXw + 1e-6 * torch.eye(n_regressors, device=device)
+                XwTXw_reg = XwTXw + 1e-6 * torch.eye(
+                    n_regressors, device=torch.device("cpu"), dtype=dtype
+                )
 
                 logdet_R = 2 * torch.sum(torch.log(torch.diag(L) + 1e-10))
                 sign, logdet_XwTXw = torch.linalg.slogdet(XwTXw_reg)
                 logdet_XwTXw = (
-                    logdet_XwTXw if sign > 0 else torch.tensor(1e10, device=device)
+                    logdet_XwTXw
+                    if sign > 0
+                    else torch.tensor(1e10, device=torch.device("cpu"), dtype=dtype)
                 )
 
+                # Store on CPU - will be moved to GPU on-demand during REML search
                 precomputed[(a_val, b_val)] = {
-                    "L_inv": L_inv,
-                    "X_w": X_w,
-                    "XwTXw_reg": XwTXw_reg,
-                    "logdet_R": logdet_R,
-                    "logdet_XwTXw": logdet_XwTXw,
+                    "L_inv": L_inv,  # CPU tensor
+                    "X_w": X_w,  # CPU tensor
+                    "XwTXw_reg": XwTXw_reg,  # CPU tensor
+                    "logdet_R": logdet_R,  # CPU tensor
+                    "logdet_XwTXw": logdet_XwTXw,  # CPU tensor
                     "a": a_val,
                     "b": b_val,
                 }
@@ -869,6 +1279,68 @@ def precompute_reml_grid(
                         f"Cholesky failed for (a={a_val:.3f}, b={b_val:.3f}): {e2}"
                     )
                 continue
+
+    # CRITICAL: Delete batch tensors to free memory before GPU transfer
+    # Each precomputed[(a,b)] entry holds a VIEW into these batches
+    # If we don't delete them, moving views to GPU keeps batch tensors alive
+    if debug_memory:
+        _debug_memory_snapshot(
+            "Grid: Before deleting batch tensors",
+            device,
+            {
+                "L_inv_batch": locals().get("L_inv_batch"),
+                "X_w_batch": locals().get("X_w_batch"),
+                "XwTXw_reg_batch": locals().get("XwTXw_reg_batch"),
+            },
+        )
+
+        # Calculate expected grid size
+        if "L_inv_batch" in locals():
+            n_pairs = len(param_list)
+            n_regs = X.shape[1]
+            bytes_per_elem = L_inv_batch.element_size()
+
+            expected_L_inv = n_pairs * n_timepoints * n_timepoints * bytes_per_elem
+            expected_X_w = n_pairs * n_timepoints * n_regs * bytes_per_elem
+            expected_XwTXw = n_pairs * n_regs * n_regs * bytes_per_elem
+            expected_scalars = n_pairs * 2 * bytes_per_elem
+            expected_total = (
+                expected_L_inv + expected_X_w + expected_XwTXw + expected_scalars
+            )
+
+            actual_L_inv = L_inv_batch.element_size() * L_inv_batch.nelement()
+            actual_X_w = X_w_batch.element_size() * X_w_batch.nelement()
+            actual_XwTXw = XwTXw_reg_batch.element_size() * XwTXw_reg_batch.nelement()
+            actual_total = actual_L_inv + actual_X_w + actual_XwTXw
+
+            print(f"\nGRID SIZE VERIFICATION:")
+            print(
+                f"  n_pairs={n_pairs}, n_timepoints={n_timepoints}, n_regressors={n_regs}, dtype={dtype}"
+            )
+            print(f"  Expected grid size: {expected_total / 1024**3:.3f} GiB")
+            print(f"    - L_inv:  {expected_L_inv / 1024**3:.3f} GiB")
+            print(f"    - X_w:    {expected_X_w / 1024**3:.3f} GiB")
+            print(f"    - XwTXw:  {expected_XwTXw / 1024**3:.3f} GiB")
+            print(f"  Actual batch tensors: {actual_total / 1024**3:.3f} GiB")
+            print(
+                f"  Match: {'✅ YES' if abs(actual_total - expected_total) < 1024**2 else '❌ NO'}"
+            )
+
+    if "L_inv_batch" in locals():
+        del L_inv_batch
+    if "X_w_batch" in locals():
+        del X_w_batch
+    if "XwTXw_reg_batch" in locals():
+        del XwTXw_reg_batch
+    if "logdet_R_batch" in locals():
+        del logdet_R_batch
+    if "logdet_XwTXw_batch" in locals():
+        del logdet_XwTXw_batch
+
+    if debug_memory:
+        _debug_memory_snapshot(
+            "Grid: After deleting batch tensors (grid in dict only)", device, {}
+        )
 
     return precomputed
 
@@ -880,6 +1352,7 @@ def batch_reml_grid_search(
     b_grid: Optional[torch.Tensor] = None,
     device: Optional[torch.device] = None,
     precomputed: Optional[dict] = None,
+    dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     ULTRA-PARALLEL REML grid search with adaptive memory management
@@ -950,24 +1423,31 @@ def batch_reml_grid_search(
         else:
             b_grid = to_tensor(b_grid, device=device)
 
+    # Ensure (a=0, b=0) is always in the grid (white noise baseline)
+    a_grid, b_grid = ensure_zero_in_grid(a_grid, b_grid)
+
     # Pre-compute grid if not provided
     if precomputed is None:
-        precomputed = precompute_reml_grid(X, n_timepoints, a_grid, b_grid, device)
+        precomputed = precompute_reml_grid(
+            X, n_timepoints, a_grid, b_grid, device, dtype=dtype
+        )
 
     n_grid = len(precomputed)
     if n_grid == 0:
         # No valid grid points - return defaults
-        best_params = torch.zeros(n_voxels_batch, 2, device=device)
+        best_params = torch.zeros(n_voxels_batch, 2, device=device, dtype=dtype)
         best_params[:, 0] = 0.5
         best_params[:, 1] = 0.0
-        best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device)
+        best_likelihoods = torch.full(
+            (n_voxels_batch,), float("inf"), device=device, dtype=dtype
+        )
         return best_params, best_likelihoods
 
     # MEMORY-ADAPTIVE CHUNKING:
     # For large grids (>70 params) or many voxels, process grid in chunks
-    # Memory usage: (n_grid_chunk × n_timepoints × n_voxels) × 4 bytes × 3 tensors
+    # Memory usage: (n_grid_chunk × n_timepoints × n_voxels) × bytes_per_element × 3 tensors
     # Target: Keep each chunk under ~2GB
-    bytes_per_element = 4  # float32
+    bytes_per_element = 8 if dtype == torch.float64 else 4
     target_chunk_gb = 1.5  # Conservative target per chunk
 
     # Estimate memory for one grid point across all voxels
@@ -988,13 +1468,16 @@ def batch_reml_grid_search(
         ]
 
     # Process grid in chunks and track best per voxel
-    best_params = torch.zeros(n_voxels_batch, 2, device=device)
-    best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device)
+    best_params = torch.zeros(n_voxels_batch, 2, device=device, dtype=dtype)
+    best_likelihoods = torch.full(
+        (n_voxels_batch,), float("inf"), device=device, dtype=dtype
+    )
 
     param_list = list(precomputed.keys())
 
     for chunk_indices in grid_chunks:
         # PHASE 1: Stack precomputed matrices for THIS CHUNK only
+        # Tensors already on GPU (moved once after precomputation)
         chunk_keys = [param_list[i] for i in chunk_indices]
 
         L_inv_stack = torch.stack(
@@ -1155,10 +1638,14 @@ def fit_glm_arma11(
     batch_size: Optional[int] = None,
     want_residuals: bool = False,
     want_predicted: bool = False,
+    want_ols: bool = False,
+    ols_write_callback: Optional[Callable] = None,
     precomputed_arma_params: Optional[Union[torch.Tensor, np.ndarray]] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
     cholesky_on_cpu: bool = True,
+    use_double: bool = False,
+    debug_memory: bool = False,
 ) -> ARMA11Results:
     """
     Fit GLM with ARMA(1,1) prewhitening (AFNI 3dREMLfit style)
@@ -1196,6 +1683,14 @@ def fit_glm_arma11(
         Return prewhitened residuals
     want_predicted : bool, default=False
         Return predicted timecourses
+    want_ols : bool, default=False
+        Also compute OLS fit for comparison (stored in results.ols_results)
+    ols_write_callback : callable, optional
+        Function to call immediately after OLS completes to write results to disk.
+        Signature: callback(ols_results: GLMResults, original_shape: tuple, affine: ndarray) -> None
+        Receives OLS results plus spatial metadata for writing.
+        This frees OLS memory before starting ARMA loop (critical for large datasets).
+        If provided, results.ols_results will be set to None after callback.
     precomputed_arma_params : array-like, shape (n_voxels, 2), optional
         Precomputed ARMA(1,1) parameters [a, b] for each voxel.
         If provided, skips REML estimation (saves ~80% of compute time).
@@ -1212,6 +1707,9 @@ def fit_glm_arma11(
         - True (default): Uses system RAM, avoids GPU OOM, still very fast
         - False: Uses GPU VRAM, faster but may OOM with large grids (>200 params)
         Set to False only if you have abundant GPU memory and small grids.
+    use_double : bool, default=False
+        If True, use float64 precision (matches AFNI exactly, ~2x memory, ~1.5x slower).
+        If False, use float32 precision (faster, tiny differences from AFNI).
 
     Returns
     -------
@@ -1270,15 +1768,33 @@ def fit_glm_arma11(
     - Woolrich et al. (2001): Temporal autocorrelation in univariate linear modeling
     - Worsley & Friston (1995): Analysis of fMRI time-series revisited—again
     """
+    # Setup precision
+    dtype = torch.float64 if use_double else torch.float32
+
     if device is None:
         device = get_device()
     storage_device = torch.device("cpu")
 
+    # Clear GPU cache at start to ensure maximum free memory
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     # Convert to tensors
-    data = to_tensor(data, device=None, dtype=torch.float32)
+    data = to_tensor(data, device=None, dtype=dtype)
     if data.device.type != "cpu":
         data = data.to(storage_device)
-    design = to_tensor(design, device=device)
+    design = to_tensor(design, device=device).to(dtype)
+
+    if debug_memory:
+        _debug_memory_snapshot(
+            "START (after data/design load)",
+            device,
+            {
+                "data": data,
+                "design": design,
+            },
+        )
 
     # Handle spatial dimensions
     original_shape = None
@@ -1297,11 +1813,114 @@ def fit_glm_arma11(
 
     # Adaptive batch sizing based on GPU memory
     if batch_size is None:
-        batch_size = get_adaptive_batch_size(device, n_timepoints, n_regressors)
-        if verbose:
-            print(
-                f"Auto-detected batch size: {batch_size:,} voxels (device={device.type})"
+        base_batch_size = get_adaptive_batch_size(
+            device, n_timepoints, n_regressors, use_double
+        )
+
+        # Account for grid memory (AFNI strategy)
+        # Grid is loaded ONCE and reused for all batches - much faster than streaming!
+        if (device.type == "cuda" or device.type == "cpu") and estimate_per_voxel:
+            # Estimate grid memory footprint
+            if a_grid is None and b_grid is None:
+                temp_a_grid, temp_b_grid = get_default_arma_grids(device)
+            else:
+                temp_a_grid = (
+                    a_grid if a_grid is not None else get_default_arma_grids(device)[0]
+                )
+                temp_b_grid = (
+                    b_grid if b_grid is not None else get_default_arma_grids(device)[1]
+                )
+
+            if not isinstance(temp_a_grid, torch.Tensor):
+                temp_a_grid = to_tensor(temp_a_grid, device=device)
+            if not isinstance(temp_b_grid, torch.Tensor):
+                temp_b_grid = to_tensor(temp_b_grid, device=device)
+
+            # Estimate valid pairs
+            temp_a_grid, temp_b_grid = ensure_zero_in_grid(temp_a_grid, temp_b_grid)
+            n_valid_pairs = estimate_valid_grid_pairs(temp_a_grid, temp_b_grid)
+
+            # Calculate grid memory
+            grid_memory_bytes = calculate_grid_memory_footprint(
+                n_valid_pairs, n_timepoints, n_regressors, use_double
             )
+
+            if debug_memory:
+                print(f"\n{'=' * 70}")
+                print(f"EXPECTED GRID SIZE CALCULATION")
+                print(f"{'=' * 70}")
+                print(f"  n_valid_pairs: {n_valid_pairs}")
+                print(f"  n_timepoints:  {n_timepoints}")
+                print(f"  n_regressors:  {n_regressors}")
+                print(f"  dtype:         {'float64' if use_double else 'float32'}")
+                print(f"  bytes_per_element: {8 if use_double else 4}")
+                bytes_elem = 8 if use_double else 4
+                L_inv_bytes = n_valid_pairs * n_timepoints * n_timepoints * bytes_elem
+                X_w_bytes = n_valid_pairs * n_timepoints * n_regressors * bytes_elem
+                XwTXw_bytes = n_valid_pairs * n_regressors * n_regressors * bytes_elem
+                scalars_bytes = n_valid_pairs * 2 * bytes_elem
+                print(f"  Expected grid memory:")
+                print(
+                    f"    L_inv:   {L_inv_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} × {n_timepoints} × {n_timepoints})"
+                )
+                print(
+                    f"    X_w:     {X_w_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} × {n_timepoints} × {n_regressors})"
+                )
+                print(
+                    f"    XwTXw:   {XwTXw_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} × {n_regressors} × {n_regressors})"
+                )
+                print(
+                    f"    scalars: {scalars_bytes / 1024**2:.1f} MiB  ({n_valid_pairs} × 2)"
+                )
+                print(f"  TOTAL EXPECTED: {grid_memory_bytes / 1024**3:.3f} GiB")
+                print(f"{'=' * 70}\n")
+
+            # Reduce batch size to leave room for grid
+            if device.type == "cuda":
+                total_mem = torch.cuda.get_device_properties(device).total_memory
+                # Use 50% of GPU memory (assumes dedicated GPU for this task)
+                # Leave 10% for PyTorch overhead, CUDA context, and fragmentation
+                available_mem = total_mem * 0.8
+            else:  # CPU
+                try:
+                    import psutil
+
+                    # Use 50% of available RAM for CPU
+                    available_mem = psutil.virtual_memory().available * 0.5
+                except ImportError:
+                    # Fallback if psutil not available
+                    available_mem = 16 * 1024**3  # Assume 16GB available
+
+            memory_for_batches = available_mem - grid_memory_bytes
+
+            if memory_for_batches > 0:
+                bytes_per_element = 8 if use_double else 4
+                mem_per_voxel = (
+                    n_timepoints * n_regressors * bytes_per_element  # X_w_batch
+                    + n_timepoints * bytes_per_element  # y_w_batch
+                    + n_regressors * n_regressors * bytes_per_element  # XtX workspace
+                    + n_regressors * bytes_per_element  # betas
+                    + n_regressors * bytes_per_element  # tstats
+                    + 3 * bytes_per_element  # params (a, b, lambda)
+                )
+                batch_size = int(memory_for_batches / mem_per_voxel)
+                batch_size = max(500, min(batch_size, base_batch_size))
+            else:
+                # Grid too large, fall back to base (will OOM, but let it try)
+                batch_size = base_batch_size
+
+            if verbose:
+                grid_mb = grid_memory_bytes / (1024**2)
+                print(f"Grid memory: {grid_mb:.1f} MiB ({n_valid_pairs} pairs)")
+                print(
+                    f"Adjusted batch size: {batch_size:,} voxels (grid + batches fit in GPU)"
+                )
+        else:
+            batch_size = base_batch_size
+            if verbose:
+                print(
+                    f"Auto-detected batch size: {batch_size:,} voxels (device={device.type})"
+                )
 
     if verbose:
         print("ARMA(1,1) GLM Fit")
@@ -1342,6 +1961,81 @@ def fit_glm_arma11(
         )
     if want_predicted:
         results.predicted = torch.zeros(n_voxels, n_timepoints, device=storage_device)
+
+    # OLS baseline fit (if requested)
+    if want_ols:
+        if verbose:
+            print("\nComputing OLS baseline for comparison...")
+        from .glm_core import fit_glm
+
+        # OLS needs MUCH less memory than ARMA (no X_w prewhitened matrices)
+        # ARMA bottleneck: X_w_batch = (batch_size, n_timepoints, n_regressors)
+        # OLS bottleneck: data_chunk = (chunk_size, n_timepoints)
+        # So OLS can use ~n_regressors times larger batches!
+        # Use 3-4x the ARMA batch size as a safe multiplier
+        ols_chunk_size = min(batch_size * 4, n_voxels)
+
+        # Set preload_data_to_device=False to stream chunks from CPU
+        # CRITICAL: Pass max_poly_degree=-1 to prevent adding ANY polynomials (including constant)
+        # The design matrix from AFNI already includes all polynomials and intercept!
+        results.ols_results = fit_glm(
+            data,
+            design,
+            tr=tr,
+            device=device,
+            chunk_size=ols_chunk_size,
+            verbose=False,
+            preload_data_to_device=False,
+            use_double=use_double,
+            max_poly_degree=-1,  # Design matrix is complete - don't add ANYTHING!
+        )
+        if verbose:
+            print("✓ OLS fit complete")
+
+        # Write OLS results immediately if callback provided (frees memory!)
+        if ols_write_callback is not None:
+            if verbose:
+                print("  Writing OLS results to disk...")
+            # Pass OLS results plus spatial metadata to callback
+            ols_write_callback(
+                results.ols_results,
+                original_shape=original_shape,
+                affine=getattr(results, "affine", None),
+            )
+            # Clear OLS results from memory to free RAM/GPU
+            results.ols_results = None
+
+            if verbose:
+                print("  ✓ OLS results written and cleared from memory")
+
+        # CRITICAL: Move OLS results to CPU storage before grid precomputation
+        # Grid precomputation needs GPU memory, and OLS results can be huge!
+        elif results.ols_results is not None:
+            if verbose:
+                print("  Moving OLS results to CPU to free GPU memory...")
+            # Move all OLS result tensors from GPU to CPU
+            ols_cpu = type(
+                results.ols_results
+            )()  # Create new results object of same type
+            for attr in dir(results.ols_results):
+                if not attr.startswith("_"):
+                    val = getattr(results.ols_results, attr)
+                    if isinstance(val, torch.Tensor) and val.device.type != "cpu":
+                        setattr(ols_cpu, attr, val.cpu())
+                    else:
+                        setattr(ols_cpu, attr, val)
+            results.ols_results = ols_cpu
+
+            if verbose:
+                print("  ✓ OLS results moved to CPU")
+
+        # Explicitly free GPU memory (critical before ARMA grid precomputation!)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        if verbose:
+            print()
 
     if estimate_per_voxel:
         # Per-voxel ARMA estimation (most accurate)
@@ -1410,6 +2104,11 @@ def fit_glm_arma11(
             if verbose:
                 print("Pre-computing REML grid (Cholesky factorizations)...")
 
+            # Clear GPU cache before grid precomputation (critical for memory!)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
             # Use provided grids or defaults
             if a_grid is None and b_grid is None:
                 a_grid, b_grid = get_default_arma_grids(device)
@@ -1432,14 +2131,79 @@ def fit_glm_arma11(
                 device,
                 verbose=verbose,
                 cholesky_on_cpu=cholesky_on_cpu,
+                dtype=dtype,
+                debug_memory=debug_memory,
             )
+
+            # Type assertion: grids are guaranteed to be set by now
+            assert a_grid is not None and b_grid is not None
 
             if verbose:
                 print(f"✓ Precomputed {len(precomputed_grid)} valid (a,b) pairs")
                 print(f"  Grid: {len(a_grid)} a values × {len(b_grid)} b values")
                 print(
-                    "  These matrices will be reused for ALL voxels (massive speedup!)\n"
+                    "  These matrices will be reused for ALL voxels (massive speedup!)"
                 )
+
+            if debug_memory:
+                # Sample one grid entry to check size
+                sample_key = list(precomputed_grid.keys())[0]
+                _debug_memory_snapshot(
+                    "AFTER grid precomputation (on CPU)",
+                    device,
+                    {
+                        "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
+                        "sample_X_w": precomputed_grid[sample_key]["X_w"],
+                        "sample_XwTXw_reg": precomputed_grid[sample_key]["XwTXw_reg"],
+                    },
+                )
+
+            # CRITICAL: Move entire grid to GPU ONCE (not per-batch!)
+            # This is the AFNI strategy: precompute once, reuse for all voxels
+            if device.type == "cuda":
+                if verbose:
+                    print(f"  Loading grid to GPU (one-time cost)...")
+                for key in precomputed_grid:
+                    precomputed_grid[key]["L_inv"] = precomputed_grid[key]["L_inv"].to(
+                        device
+                    )
+                    precomputed_grid[key]["X_w"] = precomputed_grid[key]["X_w"].to(
+                        device
+                    )
+                    precomputed_grid[key]["XwTXw_reg"] = precomputed_grid[key][
+                        "XwTXw_reg"
+                    ].to(device)
+                    precomputed_grid[key]["logdet_R"] = precomputed_grid[key][
+                        "logdet_R"
+                    ].to(device)
+                    precomputed_grid[key]["logdet_XwTXw"] = precomputed_grid[key][
+                        "logdet_XwTXw"
+                    ].to(device)
+
+                # Clear any fragmentation from grid loading
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+                if verbose:
+                    print(
+                        f"  ✓ Grid loaded to GPU (will be reused for all {n_batches} batches)\n"
+                    )
+
+                if debug_memory:
+                    sample_key = list(precomputed_grid.keys())[0]
+                    _debug_memory_snapshot(
+                        "AFTER grid loaded to GPU",
+                        device,
+                        {
+                            "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
+                            "sample_X_w": precomputed_grid[sample_key]["X_w"],
+                            "sample_XwTXw_reg": precomputed_grid[sample_key][
+                                "XwTXw_reg"
+                            ],
+                        },
+                    )
+            elif verbose:
+                print()
 
         # Progress bar for batches
         batch_iterator = range(n_batches)
@@ -1452,6 +2216,20 @@ def fit_glm_arma11(
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, n_voxels)
             batch_voxels = end_idx - start_idx
+
+            # SMART MEMORY CHECK: Adjust batch size if needed before allocating
+            batch_voxels = check_cuda_memory_before_batch(
+                batch_voxels,
+                n_timepoints,
+                n_regressors,
+                device,
+                verbose=(verbose and batch_idx == 0),  # Only warn on first batch
+            )
+            end_idx = start_idx + batch_voxels
+
+            # Update batch_size for future iterations if we had to reduce
+            if batch_voxels < batch_size:
+                batch_size = batch_voxels
 
             # Get data batch (CPU) and GPU copy
             Y_batch = data[start_idx:end_idx].T  # (n_timepoints, batch_voxels)
@@ -1469,6 +2247,7 @@ def fit_glm_arma11(
                     b_grid,
                     device,
                     precomputed=precomputed_grid,  # ← KEY: reuse pre-computed matrices!
+                    dtype=dtype,
                 )
 
                 results.arma_params[start_idx:end_idx] = batch_params.cpu()
@@ -1489,9 +2268,11 @@ def fit_glm_arma11(
 
             # Preallocate arrays for whitened data/design
             X_w_batch = torch.zeros(
-                batch_voxels, n_timepoints, n_regressors, device=device
+                batch_voxels, n_timepoints, n_regressors, device=device, dtype=dtype
             )
-            y_w_batch = torch.zeros(batch_voxels, n_timepoints, device=device)
+            y_w_batch = torch.zeros(
+                batch_voxels, n_timepoints, device=device, dtype=dtype
+            )
 
             # VECTORIZED voxel grouping (NO Python loops, NO .item() calls!)
             # Use torch.unique to find unique (a,b) pairs and group indices
@@ -1513,7 +2294,7 @@ def fit_glm_arma11(
                     continue
 
                 if (a_opt, b_opt) in precomputed_grid:
-                    # Reuse precomputed matrices!
+                    # Fetch from grid (already on GPU - loaded once after precomputation)
                     cached = precomputed_grid[(a_opt, b_opt)]
                     X_w = cached["X_w"]
                     L_inv = cached["L_inv"]
@@ -1549,8 +2330,8 @@ def fit_glm_arma11(
             # Compute X'X for each voxel: (batch_voxels, n_regressors, n_regressors)
             X_w_batch_transposed = X_w_batch.transpose(1, 2)  # Reuse this!
             XwTXw_batch = torch.bmm(X_w_batch_transposed, X_w_batch)
-            ridge = 1e-6 * torch.eye(n_regressors, device=device).unsqueeze(0)
-            XwTXw_reg_batch = XwTXw_batch + ridge
+            # No ridge regularization - match AFNI behavior
+            XwTXw_reg_batch = XwTXw_batch
 
             # Compute X'y for each voxel: (batch_voxels, n_regressors)
             XwTy_batch = torch.bmm(
@@ -2001,13 +2782,18 @@ def save_arma_rvar(
         )
     else:
         # No residuals saved - set to zero
+        assert arma_params is not None, "arma_params should not be None"
         ljung_box = np.zeros(len(arma_params), dtype=np.float32)
 
     # Reshape to volume if shape provided
     if volume_shape is not None:
         if voxel_mask is not None:
             # Masked data: expand back to full volume
-            mask_flat = voxel_mask.reshape(-1)
+            # Convert voxel_mask to numpy if it's a tensor
+            if isinstance(voxel_mask, torch.Tensor):
+                mask_flat = voxel_mask.detach().cpu().numpy().reshape(-1)
+            else:
+                mask_flat = voxel_mask.reshape(-1)
             full_size = np.prod(volume_shape)
 
             # Create full volumes with zeros
@@ -2053,7 +2839,10 @@ def save_arma_rvar(
     # Stack into 4D: (nx, ny, nz, 6) - AFNI order
     rvar_4d = np.stack([a_vol, b_vol, lam_vol, stdev_vol, loglik_vol, lb_vol], axis=-1)
 
-    # Create affine if not provided
+    # Get affine from results if not provided
+    if affine is None and hasattr(results, "affine") and results.affine is not None:
+        affine = results.affine
+    # Create default affine if still None
     if affine is None:
         affine = np.eye(4, dtype=np.float32)
 
@@ -2145,7 +2934,11 @@ def load_arma_params(
 
     # Apply mask if provided
     if voxel_mask is not None:
-        mask_flat = voxel_mask.reshape(-1)
+        # Convert voxel_mask to numpy if it's a tensor
+        if isinstance(voxel_mask, torch.Tensor):
+            mask_flat = voxel_mask.detach().cpu().numpy().reshape(-1)
+        else:
+            mask_flat = voxel_mask.reshape(-1)
         a_flat = a_vol.reshape(-1)
         b_flat = b_vol.reshape(-1)
 

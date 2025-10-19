@@ -5,9 +5,13 @@ Device management and helper functions
 
 import platform
 import warnings
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 def get_device(prefer_device: Optional[str] = None) -> torch.device:
@@ -96,7 +100,7 @@ def print_device_info(device: torch.device):
 
 
 def to_tensor(
-    x: Union[torch.Tensor, list, tuple],
+    x: Union[torch.Tensor, np.ndarray, list, tuple],
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
@@ -106,7 +110,7 @@ def to_tensor(
     Parameters
     ----------
     x : array-like or torch.Tensor
-        Input data
+        Input data (numpy array, list, tuple, or torch.Tensor)
     dtype : torch.dtype
         Target dtype
     device : torch.device, optional

@@ -517,7 +517,9 @@ def load_and_concatenate_runs(
     Parameters
     ----------
     run_files : list of str or Path
-        Paths to NIfTI files, one per run
+        Paths to neuroimaging files, one per run
+        Supports: NIfTI (.nii, .nii.gz) and AFNI (.HEAD, .BRIK, .BRIK.gz)
+        For AFNI files, provide either .HEAD or .BRIK path
     device : torch.device, optional
         Device for output tensor
 
@@ -603,7 +605,7 @@ def load_afni_mask(
     Parameters
     ----------
     mask_file : str or Path
-        Path to the mask NIfTI file.
+        Path to the mask file (NIfTI or AFNI BRIK/HEAD format).
     threshold : float, optional
         Values strictly greater than this threshold are treated as inside the mask.
 
@@ -611,6 +613,11 @@ def load_afni_mask(
     -------
     mask : np.ndarray
         Boolean mask array with shape matching the NIfTI volume (nx, ny, nz).
+
+    Notes
+    -----
+    Handles singleton dimensions automatically. For example, AFNI masks with
+    shape (64, 64, 35, 1) are automatically squeezed to (64, 64, 35).
     """
 
     mask_path = Path(mask_file)
@@ -620,9 +627,15 @@ def load_afni_mask(
     img = nib.load(str(mask_path))
     data = img.get_fdata(dtype=np.float32)
 
+    # Squeeze out singleton dimensions (common in AFNI masks)
+    # e.g., (64, 64, 35, 1) → (64, 64, 35)
+    data = np.squeeze(data)
+
     if data.ndim != 3:
         raise ValueError(
-            f"Mask file must be 3D (received shape {data.shape}); ensure a volumetric mask is provided"
+            f"Mask file must be 3D after squeezing singleton dimensions "
+            f"(received shape {data.shape} after squeeze). "
+            f"Ensure a volumetric mask is provided."
         )
 
     mask = data > float(threshold)

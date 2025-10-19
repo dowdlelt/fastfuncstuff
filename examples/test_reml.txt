@@ -1,0 +1,3 @@
+python /home/logan/Dropbox/Resources/code/fastfuncsim/bin/3dREMLfast.py  -matrix small_X.xmat.1D \
+ -input "smaller_dset+orig.HEAD" \
+ -fout -tout -Rbuck teststats -Rvar testvar -use_double -a_grid "0.1,0.8,8" -b_grid "-0.8, 0.8,16"

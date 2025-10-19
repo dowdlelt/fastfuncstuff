@@ -1,0 +1,29 @@
+{
+  "include": [
+    "fastfuncsim",
+    "examples"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    ".git"
+  ],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": false,
+  "reportMissingTypeStubs": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownParameterType": false,
+  "reportPrivateImportUsage": false,
+  "reportAttributeAccessIssue": "warning",
+  "reportCallIssue": "error",
+  "reportArgumentType": "error",
+  "reportAssignmentType": "warning",
+  "reportReturnType": "warning",
+  "reportOptionalSubscript": "warning",
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalCall": "warning",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "All"
+}

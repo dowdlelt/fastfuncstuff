@@ -7,7 +7,6 @@ through the single source of truth: _compute_arma11_lambda()
 """
 
 import torch
-import numpy as np
 from fastfuncsim.arma_glm import (
     build_arma11_covariance,
     build_arma11_covariance_batch,
@@ -79,7 +78,7 @@ def test_lambda_consistency():
         print("✗ SOME TESTS FAILED - Check implementation!")
     print("=" * 70)
 
-    return all_passed
+    assert all_passed, "Lambda consistency check failed"
 
 
 def test_matrix_consistency():
@@ -135,21 +134,17 @@ def test_matrix_consistency():
         print("✗ MATRICES DIFFER - Check implementation!")
     print("=" * 70)
 
-    return all_passed
+    assert all_passed, "Matrix consistency check failed"
 
 
 if __name__ == "__main__":
-    passed1 = test_lambda_consistency()
-    passed2 = test_matrix_consistency()
+    test_lambda_consistency()
+    test_matrix_consistency()
 
     print("\n" + "=" * 70)
     print("FINAL RESULT")
     print("=" * 70)
-    if passed1 and passed2:
-        print("✓✓✓ ALL CONSISTENCY CHECKS PASSED ✓✓✓")
-        print("\nBoth scalar and batch implementations use the same math!")
-        print("Single source of truth: _compute_arma11_lambda()")
-    else:
-        print("✗✗✗ CONSISTENCY CHECKS FAILED ✗✗✗")
-        print("\nImplementations are producing different results!")
+    print("✓✓✓ ALL CONSISTENCY CHECKS PASSED ✓✓✓")
+    print("\nBoth scalar and batch implementations use the same math!")
+    print("Single source of truth: _compute_arma11_lambda()")
     print("=" * 70)

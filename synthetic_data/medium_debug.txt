@@ -1,0 +1,211 @@
+======================================================================
+3dREMLfast - GPU-Accelerated ARMA(1,1) GLM
+======================================================================
+
+⚙️  Precision: DOUBLE (float64) - matches AFNI exactly
+
+📁 Input files: 1 file(s)
+   • medium_dset+orig.HEAD
+
+⏱️  TR: 1.000 seconds
+
+💾 Output format: afni
+
+🖥️  Device: cuda
+
+🔢 Custom a_grid: [0.1, 0.8] with 8 points
+🔢 Custom b_grid: [-0.8, 0.8] with 16 points
+
+🚀 Starting GLM analysis...
+
+
+======================================================================
+DEBUG MEMORY: START (after data/design load)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  data                          : (48000, 360)         float64    cpu           131.8 MiB
+  design                        : (360, 21)            float64    cuda:0          0.1 MiB
+  TOTAL                         :                                               131.9 MiB
+
+======================================================================
+
+
+======================================================================
+EXPECTED GRID SIZE CALCULATION
+======================================================================
+  n_valid_pairs: 117
+  n_timepoints:  360
+  n_regressors:  21
+  dtype:         float64
+  bytes_per_element: 8
+  Expected grid memory:
+    L_inv:   0.113 GiB  (117 × 360 × 360)
+    X_w:     0.007 GiB  (117 × 360 × 21)
+    XwTXw:   0.000 GiB  (117 × 21 × 21)
+    scalars: 0.0 MiB  (117 × 2)
+  TOTAL EXPECTED: 0.120 GiB
+======================================================================
+
+Grid memory: 122.8 MiB (117 pairs)
+Adjusted batch size: 5,000 voxels (grid + batches fit in GPU)
+ARMA(1,1) GLM Fit
+  Voxels: 48,000
+  Timepoints: 360
+  Regressors: 21
+  Per-voxel estimation: True
+  Batch size: 5,000
+Processing 10 batches of 5,000 voxels...
+Pre-computing REML grid (Cholesky factorizations)...
+  Building ALL covariance matrices (vectorized)...
+    Initial grid: 9 a × 17 b = 153 combinations
+  ✓ Built 117 covariance matrices (filtered 36 with λ ≤ 0)
+  Computing ALL Cholesky factorizations (batched on CPU (recommended))...
+  ✓ Computed 117 Cholesky factorizations at once!
+  Prewhitening design matrix for all parameters...
+
+======================================================================
+DEBUG MEMORY: Grid: After Cholesky (before R_batch delete)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  L_batch                       : (117, 360, 360)      float64    cpu           115.7 MiB
+  L_inv_batch                   : (117, 360, 360)      float64    cpu           115.7 MiB
+  TOTAL                         :                                               231.4 MiB
+
+======================================================================
+
+
+======================================================================
+DEBUG MEMORY: Grid: After R_batch deleted
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  L_batch                       : (117, 360, 360)      float64    cpu           115.7 MiB
+  L_inv_batch                   : (117, 360, 360)      float64    cpu           115.7 MiB
+  TOTAL                         :                                               231.4 MiB
+
+======================================================================
+
+  ✓ Precomputed all matrices!
+  Storing 117 parameter sets...
+
+======================================================================
+DEBUG MEMORY: Grid: Before deleting batch tensors
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  L_inv_batch                   : (117, 360, 360)      float64    cpu           115.7 MiB
+  X_w_batch                     : (117, 360, 21)       float64    cpu             6.7 MiB
+  XwTXw_reg_batch               : (117, 21, 21)        float64    cpu             0.4 MiB
+  TOTAL                         :                                               122.8 MiB
+
+======================================================================
+
+
+GRID SIZE VERIFICATION:
+  n_pairs=117, n_timepoints=360, n_regressors=21, dtype=torch.float64
+  Expected grid size: 0.120 GiB
+    - L_inv:  0.113 GiB
+    - X_w:    0.007 GiB
+    - XwTXw:  0.000 GiB
+  Actual batch tensors: 0.120 GiB
+  Match: ✅ YES
+
+======================================================================
+DEBUG MEMORY: Grid: After deleting batch tensors (grid in dict only)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+======================================================================
+
+✓ Precomputed 117 valid (a,b) pairs
+  Grid: 8 a values × 16 b values
+  These matrices will be reused for ALL voxels (massive speedup!)
+
+======================================================================
+DEBUG MEMORY: AFTER grid precomputation (on CPU)
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.000 GiB
+  Reserved:         0.002 GiB
+  Max Allocated:    0.000 GiB
+  Total:           15.460 GiB
+  Free:            15.458 GiB
+
+Tensor Sizes:
+  sample_L_inv                  : (360, 360)           float64    cpu             1.0 MiB
+  sample_X_w                    : (360, 21)            float64    cpu             0.1 MiB
+  sample_XwTXw_reg              : (21, 21)             float64    cpu             0.0 MiB
+  TOTAL                         :                                                 1.0 MiB
+
+======================================================================
+
+  Loading grid to GPU (one-time cost)...
+  ✓ Grid loaded to GPU (will be reused for all 10 batches)
+
+
+======================================================================
+DEBUG MEMORY: AFTER grid loaded to GPU
+======================================================================
+GPU Memory (cuda):
+  Allocated:        0.120 GiB
+  Reserved:         0.121 GiB
+  Max Allocated:    0.120 GiB
+  Total:           15.460 GiB
+  Free:            15.339 GiB
+
+Tensor Sizes:
+  sample_L_inv                  : (360, 360)           float64    cuda:0          1.0 MiB
+  sample_X_w                    : (360, 21)            float64    cuda:0          0.1 MiB
+  sample_XwTXw_reg              : (21, 21)             float64    cuda:0          0.0 MiB
+  TOTAL                         :                                                 1.0 MiB
+
+======================================================================
+
+ARMA(1,1) batches:   0%|          | 0/10 [00:00<?, ?batch/s]ARMA(1,1) batches:  10%|█         | 1/10 [00:01<00:09,  1.02s/batch]ARMA(1,1) batches:  20%|██        | 2/10 [00:01<00:07,  1.14batch/s]ARMA(1,1) batches:  30%|███       | 3/10 [00:02<00:05,  1.23batch/s]ARMA(1,1) batches:  40%|████      | 4/10 [00:03<00:04,  1.26batch/s]ARMA(1,1) batches:  50%|█████     | 5/10 [00:04<00:03,  1.30batch/s]ARMA(1,1) batches:  60%|██████    | 6/10 [00:04<00:03,  1.31batch/s]ARMA(1,1) batches:  70%|███████   | 7/10 [00:05<00:02,  1.33batch/s]ARMA(1,1) batches:  80%|████████  | 8/10 [00:06<00:01,  1.34batch/s]ARMA(1,1) batches:  90%|█████████ | 9/10 [00:06<00:00,  1.35batch/s]ARMA(1,1) batches: 100%|██████████| 10/10 [00:07<00:00,  1.55batch/s]ARMA(1,1) batches: 100%|██████████| 10/10 [00:07<00:00,  1.35batch/s]
+
+Complete!
+  Mean (a, b): (0.061, 0.271)
+  Mean λ: 0.284
+  Mean R²: 0.311
+  Mean |t|: 17.029
+✅ Analysis complete!
+
+💾 Writing outputs...
+
+  • Writing REML betas + stats (bucket): medium_stats
+  • Writing REML variance parameters: medium_var
+
+======================================================================
+✅ 3dREMLfast completed successfully!
+======================================================================

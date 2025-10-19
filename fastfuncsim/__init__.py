@@ -43,6 +43,7 @@ from .analysis import (
     analyze_from_design_matrix,
     analyze_from_onsets,
     compute_contrasts,
+    compute_contrasts_from_design,
 )
 
 # ARMA(1,1) prewhitening for GLM analysis
@@ -91,8 +92,10 @@ from .glm_core import GLMResults, fit_glm, fit_glm_hrf_library, percent_bold_cha
 
 # GLM output utilities
 from .glm_outputs import (
+    slice_glm_results,
     write_afni_bucket,
     write_glm_results_nifti,
+    write_ols_arma_comparison,
 )
 
 # HRF generation
@@ -164,6 +167,7 @@ __all__ = [
     "GLMResults",
     "write_glm_results_nifti",
     "write_afni_bucket",
+    "write_ols_arma_comparison",
     # Design
     "build_glm_design",
     "convolve_hrf",

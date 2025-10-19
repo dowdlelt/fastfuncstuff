@@ -13,7 +13,6 @@ Convert from MATLAB (`simulate_movietasks.m` and GLMsingle) to Python with GPU a
 - **📊 Realistic Noise**: 1/f spectrum with physiological components (cardiac, respiratory)
 - **📈 Comprehensive Visualization**: Single-case deep dives and batch summaries with parametric exploration
 - **🎨 Complete Pipeline**: From simulation to GLM fitting to visualization
-- **🧠 Publication-Ready Outputs**: Export betas, t-stats, omnibus F-stats, R², and mean volumes directly to NIfTI
 
 ## Installation
 
