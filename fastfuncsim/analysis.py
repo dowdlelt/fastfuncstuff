@@ -235,7 +235,8 @@ def analyze_from_onsets(
 
         # ARMA(1,1) prewhitened GLS
         results = fit_glm_arma11(
-            data, design, tr=tr, a_grid=arma_a_grid, b_grid=arma_b_grid, device=device
+            data, design, tr=tr, a_grid=arma_a_grid, b_grid=arma_b_grid, device=device,
+            enable_quick_estimate=enable_quick_estimate
         )
 
     else:
@@ -265,6 +266,12 @@ def analyze_from_design_matrix(
     voxel_chunk_size: Optional[int] = None,
     use_double: bool = False,
     debug_memory: bool = False,
+    enable_quick_estimate: bool = False,
+    use_grid_batching: Optional[bool] = None,
+    want_r2_partial: bool = False,
+    r2_partial_mode: str = "full",  # "full" or "task" - how to compute partial R²
+    want_r2_semipartial: bool = False,
+    r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
 ) -> Tuple[Union[GLMResults, ARMA11Results], Dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -438,10 +445,16 @@ def analyze_from_design_matrix(
 
         mask_tensor = torch.from_numpy(mask_flat.astype(np.bool_))
         kept_voxels = int(mask_tensor.sum().item())
+        excluded_voxels = n_voxels - kept_voxels
         if kept_voxels == 0:
             raise ValueError(
                 f"Mask '{mask_file}' excluded all voxels (threshold={mask_threshold})."
             )
+
+        print(f"📊 Mask applied:")
+        print(f"  Total voxels: {n_voxels:,}")
+        print(f"  Kept (in mask): {kept_voxels:,} ({100*kept_voxels/n_voxels:.1f}%)")
+        print(f"  Excluded: {excluded_voxels:,} ({100*excluded_voxels/n_voxels:.1f}%)")
 
         data = data[mask_tensor, :]
         n_voxels = kept_voxels
@@ -474,6 +487,13 @@ def analyze_from_design_matrix(
             max_poly_degree=glm_poly,
             preload_data_to_device=False,
             use_double=use_double,
+            glt_labels=design_info.get("glt_labels", None),
+            glt_matrices=design_info.get("glt_matrices", None),
+            task_indices=stim_indices if stim_indices else None,
+            want_r2_partial=want_r2_partial,
+            r2_partial_mode=r2_partial_mode,
+            want_r2_semipartial=want_r2_semipartial,
+            r2_semipartial_mode=r2_semipartial_mode,
         )
 
     elif method == "arma11":
@@ -486,41 +506,179 @@ def analyze_from_design_matrix(
             if arma_b_grid is None:
                 _, arma_b_grid = get_default_arma_grids(device)
 
+        # Extract stimulus metadata using helper function (clean naming!)
+        from .afni_io import extract_design_metadata
+        full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
+
         # Create simple OLS write callback if output path provided
         ols_write_callback = None
         if ols_output_path is not None:
-            from .glm_outputs import slice_glm_results, write_afni_bucket
+            from .glm_outputs import write_afni_bucket
             # Capture volume_shape and affine from outer scope for the callback
             callback_volume_shape = volume_shape
             callback_affine = affine
-            # Get stimulus regressor indices (exclude nuisance regressors)
-            stim_indices = design_info.get("stim_bots")
-            stim_labels = design_info.get("stim_labels")
+            callback_stim_labels = stim_labels  # Capture labels
+            callback_stim_indices = stim_indices if stim_indices else None  # Capture indices
+            callback_design_matrix = design_info["matrix"]  # Capture design matrix for single trials
 
             def write_ols(ols_results, original_shape, affine):
-                # Slice to only include stimulus regressors (not nuisance)
-                if stim_indices is not None:
-                    ols_stim_only = slice_glm_results(ols_results, stim_indices)
-                else:
-                    # Fallback: use all regressors if stim_indices not available
-                    ols_stim_only = ols_results
+                # IMPORTANT: When task_indices is passed to fit_glm(), the results
+                # already contain ONLY the task regressors. No slicing needed!
+                # The betas/tstats/fstats already correspond to the stimulus columns.
 
                 # Use captured volume_shape from closure - original_shape from arma may be None
                 # if data was already 2D when passed to fit_glm_arma11
                 shape_to_use = original_shape if original_shape is not None else callback_volume_shape
                 affine_to_use = affine if affine is not None else callback_affine
 
-                ols_stim_only.original_shape = shape_to_use
-                ols_stim_only.affine = affine_to_use
+                ols_results.original_shape = shape_to_use
+                ols_results.affine = affine_to_use
+
+                # Extract contrast information if available (GLT contrasts)
+                contrast_names = getattr(ols_results, "contrast_labels", None)
+                ols_contrast_results = None
+                if (
+                    hasattr(ols_results, "contrast_betas")
+                    and ols_results.contrast_betas is not None
+                ):
+                    ols_contrast_results = {
+                        "contrast_betas": ols_results.contrast_betas,
+                        "contrast_tstats": ols_results.contrast_tstats,
+                    }
+                    # Add partial R² if available
+                    if (
+                        hasattr(ols_results, "contrast_r2_partial")
+                        and ols_results.contrast_r2_partial is not None
+                    ):
+                        ols_contrast_results["contrast_r2_partial"] = (
+                            ols_results.contrast_r2_partial
+                        )
+                    # Add semi-partial R² if available
+                    if (
+                        hasattr(ols_results, "contrast_r2_semipartial")
+                        and ols_results.contrast_r2_semipartial is not None
+                    ):
+                        ols_contrast_results["contrast_r2_semipartial"] = (
+                            ols_results.contrast_r2_semipartial
+                        )
+
                 write_afni_bucket(
-                    ols_stim_only,
+                    ols_results,
                     ols_output_path,
-                    condition_names=stim_labels,  # Use stimulus labels, not all column labels
+                    condition_names=callback_stim_labels,  # Use stimulus labels
+                    contrast_names=contrast_names,
+                    contrast_results=ols_contrast_results,
                     volume_shape=shape_to_use,
                     affine=affine_to_use,
                     output_format=ols_output_format
                 )
+
+                # Write single-trials output if requested (check for env var set by 3dREMLfast.py)
+                import os
+                single_trials_label = os.environ.get("FASTFUNCSIM_SINGLE_TRIALS")
+                if single_trials_label and callback_stim_indices:
+                    output_filename = f"ols_{single_trials_label}_single.nii.gz"
+                    print(f"  • Writing OLS single-trial betas (onset order): {output_filename}")
+                    from .glm_outputs import write_single_trials_output
+                    write_single_trials_output(
+                        ols_results,
+                        output_filename,
+                        callback_design_matrix,
+                        callback_stim_indices,
+                        callback_stim_labels,
+                    )
+
+                # Write partial R² if requested (check for env var set by 3dREMLfast.py)
+                r2_partial_mode_env = os.environ.get("FASTFUNCSIM_R2_PARTIAL_MODE")
+                if r2_partial_mode_env and hasattr(ols_results, "r2_partial") and ols_results.r2_partial is not None:
+                    # Generate output path
+                    if ols_output_path:
+                        if str(ols_output_path).endswith(".nii.gz"):
+                            partial_r2_path = str(ols_output_path).replace(".nii.gz", "_partialR2.nii.gz")
+                        elif str(ols_output_path).endswith(".nii"):
+                            partial_r2_path = str(ols_output_path).replace(".nii", "_partialR2.nii.gz")
+                        else:
+                            partial_r2_path = str(ols_output_path) + "_partialR2.nii.gz"
+                    else:
+                        partial_r2_path = "OLS_partialR2.nii.gz"
+
+                    print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
+
+                    from .glm_outputs import write_partial_r2_with_labels, _resolve_shape, _get_voxel_mask
+
+                    # Get design info from outer scope
+                    n_timepoints_ols = design_info.get("n_timepoints")
+                    n_regressors_ols = design_info.get("n_regressors")
+
+                    write_partial_r2_with_labels(
+                        ols_results.r2_partial,
+                        partial_r2_path,
+                        condition_labels=callback_stim_labels,
+                        volume_shape=_resolve_shape(ols_results, shape_to_use),
+                        voxel_mask=_get_voxel_mask(ols_results),
+                        affine=affine_to_use,
+                        n_timepoints=n_timepoints_ols,
+                        n_regressors=n_regressors_ols,
+                        apply_afni_metadata=True,
+                        mode=r2_partial_mode_env,  # "full" or "task"
+                    )
+
+                    suffix = "_partialR2_task" if r2_partial_mode_env == "task" else "_partialR2"
+                    print(f"     Sub-bricks (partial R² with AFNI stat params):")
+                    for idx, label in enumerate(callback_stim_labels):
+                        print(f"       [{idx}] {label}{suffix}")
+
+                # Write semi-partial R² if requested (check for env var set by 3dREMLfast.py)
+                r2_semipartial_mode_env = os.environ.get("FASTFUNCSIM_R2_SEMIPARTIAL_MODE")
+                if r2_semipartial_mode_env and hasattr(ols_results, "r2_semipartial") and ols_results.r2_semipartial is not None:
+                    # Generate output path
+                    if ols_output_path:
+                        if str(ols_output_path).endswith(".nii.gz"):
+                            semipartial_r2_path = str(ols_output_path).replace(".nii.gz", "_semipartialR2.nii.gz")
+                        elif str(ols_output_path).endswith(".nii"):
+                            semipartial_r2_path = str(ols_output_path).replace(".nii", "_semipartialR2.nii.gz")
+                        else:
+                            semipartial_r2_path = str(ols_output_path) + "_semipartialR2.nii.gz"
+                    else:
+                        semipartial_r2_path = "OLS_semipartialR2.nii.gz"
+
+                    print(f"  • Writing OLS semi-partial R² per condition: {semipartial_r2_path}")
+
+                    from .glm_outputs import write_partial_r2_with_labels, _resolve_shape, _get_voxel_mask
+
+                    # Get design info from outer scope
+                    n_timepoints_ols = design_info.get("n_timepoints")
+                    n_regressors_ols = design_info.get("n_regressors")
+
+                    write_partial_r2_with_labels(
+                        ols_results.r2_semipartial,
+                        semipartial_r2_path,
+                        condition_labels=callback_stim_labels,
+                        volume_shape=_resolve_shape(ols_results, shape_to_use),
+                        voxel_mask=_get_voxel_mask(ols_results),
+                        affine=affine_to_use,
+                        n_timepoints=n_timepoints_ols,
+                        n_regressors=n_regressors_ols,
+                        apply_afni_metadata=True,
+                        mode=r2_semipartial_mode_env,  # "full" or "task"
+                    )
+
+                    suffix = "_semipartialR2_task" if r2_semipartial_mode_env == "task" else "_semipartialR2"
+                    print(f"     Sub-bricks (semi-partial R² with AFNI stat params):")
+                    for idx, label in enumerate(callback_stim_labels):
+                        print(f"       [{idx}] {label}{suffix}")
+
             ols_write_callback = write_ols
+
+        # Prepare spatial metadata dict for fit_glm_arma11
+        # This ensures OLS results have mask/shape/affine BEFORE the write callback
+        spatial_metadata = {}
+        if volume_shape is not None:
+            spatial_metadata["volume_shape"] = volume_shape
+        if mask_tensor is not None:
+            spatial_metadata["voxel_mask"] = mask_tensor
+        if affine is not None:
+            spatial_metadata["affine"] = affine
 
         results = fit_glm_arma11(
             data,
@@ -530,11 +688,21 @@ def analyze_from_design_matrix(
             b_grid=arma_b_grid,
             precomputed_arma_params=precomputed_arma_params,
             want_ols=want_ols,
+            want_r2_partial=want_r2_partial,
+            r2_partial_mode=r2_partial_mode,  # "full" or "task"
+            want_r2_semipartial=want_r2_semipartial,
+            r2_semipartial_mode=r2_semipartial_mode,  # "full" or "task"
             ols_write_callback=ols_write_callback,
             batch_size=voxel_chunk_size,  # Pass through manual override
             device=device,
             use_double=use_double,
             debug_memory=debug_memory,
+            enable_quick_estimate=enable_quick_estimate,
+            use_grid_batching=use_grid_batching,
+            glt_labels=design_info.get("glt_labels", None),
+            glt_matrices=design_info.get("glt_matrices", None),
+            task_indices=stim_indices if stim_indices else None,
+            spatial_metadata=spatial_metadata if spatial_metadata else None,
         )
 
     else:
@@ -683,7 +851,7 @@ def compute_contrasts(
         # (n_voxels, 1) * (1, n_contrasts) = (n_voxels, n_contrasts)
         contrast_var = sigma2.unsqueeze(1) * contrast_var_factor.unsqueeze(0)
 
-    elif hasattr(results, "var_betas"):
+    elif hasattr(results, "var_betas") and results.var_betas is not None:
         # ARMA(1,1) results: Var(c'β) = c' Cov(β) c
         # var_betas is (n_voxels, n_regressors, n_regressors)
         var_betas = to_tensor(results.var_betas, device=device, dtype=torch.float32)
@@ -711,7 +879,9 @@ def compute_contrasts(
 
     else:
         raise ValueError(
-            "Results must have either 'xtx_inv' (OLS) or 'var_betas' (ARMA) for contrast computation"
+            "Results must have either 'xtx_inv' (OLS) or 'var_betas' (ARMA) for contrast computation. "
+            "For ARMA results, var_betas was not computed (disabled by default to save memory). "
+            "To enable GLT contrasts with many regressors, var_betas computation needs to be implemented on-demand."
         )
 
     contrast_stderr = torch.sqrt(torch.clamp(contrast_var, min=0.0))

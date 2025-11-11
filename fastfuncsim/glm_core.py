@@ -22,7 +22,11 @@ class GLMResults:
 
     def __init__(self):
         self.betas = None  # (n_voxels, n_regressors) or (n_x, n_y, n_z, n_regressors)
-        self.r2 = None  # (n_voxels,) or (n_x, n_y, n_z)
+        self.r2 = None  # (n_voxels,) or (n_x, n_y, n_z) - total model R²
+        self.r2_partial = None  # (n_voxels, n_task_regressors) - partial R² per TASK regressor
+        self.r2_partial_nuisance = None  # (n_voxels, n_nuisance_regressors) - partial R² per NUISANCE regressor
+        self.r2_semipartial = None  # (n_voxels, n_task_regressors) - semi-partial R² per TASK regressor
+        self.r2_semipartial_nuisance = None  # (n_voxels, n_nuisance_regressors) - semi-partial R² per NUISANCE regressor
         self.r2_run = None  # (n_voxels, n_runs) if provided
         self.residuals = None  # (n_voxels, n_timepoints) - optional
         self.predicted = None  # (n_voxels, n_timepoints) - optional
@@ -38,6 +42,12 @@ class GLMResults:
         self.voxel_mask = None  # Optional boolean mask for sparse analyses
         self.full_shape = None  # Original spatial shape before masking
         self.affine = None  # Spatial affine if available
+
+        # GLT contrast results (computed in-loop, not post-hoc)
+        self.contrast_labels = None  # List of contrast names
+        self.contrast_betas = None  # (n_voxels, n_contrasts) - c'β estimates
+        self.contrast_tstats = None  # (n_voxels, n_contrasts) - t-statistics
+        self.contrast_fstats = None  # (n_voxels, n_contrasts) - F-statistics (for multi-row GLTs)
 
     def to_spatial(self):
         """Reshape results back to spatial dimensions if available"""
@@ -231,11 +241,18 @@ def fit_glm(
     want_residuals: bool = False,
     want_predicted: bool = False,
     want_r2_run: bool = True,
+    want_r2_partial: bool = False,
+    r2_partial_mode: str = "full",  # "full" or "task" - how to compute partial R²
+    want_r2_semipartial: bool = False,
+    r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
     device: Optional[torch.device] = None,
     chunk_size: Optional[int] = None,
     verbose: bool = True,
     preload_data_to_device: bool = True,
     use_double: bool = False,
+    glt_labels: Optional[list] = None,
+    glt_matrices: Optional[list] = None,
+    task_indices: Optional[list] = None,
 ) -> GLMResults:
     """
     Fast GPU-accelerated GLM fitting
@@ -393,6 +410,10 @@ def fit_glm(
     # Fit in chunks
     all_betas = []
     all_r2 = []
+    all_r2_partial = [] if want_r2_partial else None
+    all_r2_partial_nuisance = [] if want_r2_partial else None  # Store nuisance partial R² too
+    all_r2_semipartial = [] if want_r2_semipartial else None
+    all_r2_semipartial_nuisance = [] if want_r2_semipartial else None  # Store nuisance semi-partial R² too
     all_r2_run = [] if want_r2_run else None
     all_residuals = [] if want_residuals else None
     all_predicted = [] if want_predicted else None
@@ -404,12 +425,22 @@ def fit_glm(
     # No ridge regularization - match AFNI behavior (will fail if matrix is singular)
     xtx_inv = torch.linalg.inv(xtx)
 
-    task_beta_indices = []
-    reg_offset = 0
-    for run_idx in range(n_runs):
-        run_n_regressors = full_designs[run_idx].shape[1]
-        task_beta_indices.extend(range(reg_offset, reg_offset + n_task_regressors))
-        reg_offset += run_n_regressors
+    # Determine which columns are "task" vs "nuisance"
+    # If task_indices provided (from AFNI StimBots/StimTops), use those
+    # Otherwise use the old logic (first n_task_regressors columns)
+    if task_indices is not None:
+        # User explicitly specified which columns are task regressors
+        task_beta_indices = task_indices
+        if verbose:
+            print(f"Using {len(task_indices)} explicitly specified task regressors (from StimBots/StimTops)")
+    else:
+        # Default: assume first n_task_regressors are task, rest are nuisance
+        task_beta_indices = []
+        reg_offset = 0
+        for run_idx in range(n_runs):
+            run_n_regressors = full_designs[run_idx].shape[1]
+            task_beta_indices.extend(range(reg_offset, reg_offset + n_task_regressors))
+            reg_offset += run_n_regressors
 
     if len(task_beta_indices) == 0:
         raise ValueError("No task regressors detected; cannot compute GLM statistics")
@@ -419,6 +450,10 @@ def fit_glm(
         1, task_idx_tensor
     )
     xtx_inv_task_diag = torch.diagonal(xtx_inv_task, dim1=0, dim2=1)
+
+    # For partial R² and semi-partial R² computation: need diagonal of FULL (X'X)^-1 (all regressors)
+    xtx_inv_full_diag = torch.diagonal(xtx_inv, dim1=0, dim2=1) if (want_r2_partial or want_r2_semipartial) else None
+
     dof = design_concat.shape[0] - design_concat.shape[1]
     if dof <= 0:
         warnings.warn(
@@ -429,6 +464,43 @@ def fit_glm(
     # Precompute inverse for F-stat (no ridge - match AFNI behavior)
     xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task)
     n_task_params = xtx_inv_task.shape[0]
+
+    # Setup GLT contrasts (if present) - compute in-loop like ARMA
+    glt_contrasts_tensor = None
+    n_contrasts = 0
+    all_contrast_betas: list[torch.Tensor] = []
+    all_contrast_tstats: list[torch.Tensor] = []
+
+    if glt_labels and glt_matrices:
+        n_contrasts = len(glt_labels)
+        if verbose:
+            old_mem_gb = (n_voxels * n_task_params * n_task_params * 8) / (1024**3) / 2
+            new_mem_mb = (n_voxels * n_contrasts * 8) / (1024**2)
+            print(f"📊 {n_contrasts} GLT contrasts will be computed in-loop (OLS)")
+            print(f"   Memory: {new_mem_mb:.1f} MB (vs {old_mem_gb:.1f} GB if storing full covariance)")
+
+        # Convert GLT matrices to tensors on device
+        glt_contrasts_list = []
+        for glt_mat in glt_matrices:
+            glt_tensor = torch.as_tensor(glt_mat, dtype=dtype, device=device)
+            # Check if this is a single-row contrast (t-test) or multi-row (F-test)
+            if glt_tensor.ndim == 1:
+                # Already 1D - single-row contrast (t-test)
+                glt_contrasts_list.append(glt_tensor)
+            elif glt_tensor.ndim == 2 and glt_tensor.shape[0] == 1:
+                # Shape (1, n_regressors) - squeeze to 1D for single-row contrast
+                glt_contrasts_list.append(glt_tensor.squeeze(0))
+            else:
+                # Multi-row contrast (F-test) - not yet supported
+                raise NotImplementedError(
+                    f"Multi-row GLT contrasts (F-tests) not yet supported in OLS. "
+                    f"Got shape {glt_tensor.shape}, expected (n_regressors,) or (1, n_regressors)"
+                )
+        glt_contrasts_tensor = torch.stack(glt_contrasts_list)  # (n_contrasts, n_regressors_full)
+
+        # NOTE: GLT contrasts use the FULL design (all columns)
+        # We fit the full design, so contrasts can involve any regressor (task or nuisance)
+        # No filtering needed here!
 
     all_sigma2: list[torch.Tensor] = []
     all_tstats: list[torch.Tensor] = []
@@ -461,12 +533,90 @@ def fit_glm(
 
         sigma2_dev = torch.clamp(ss_residual_dev / dof, min=0.0)
 
-        # Standard errors and t-stats
+        # Standard errors and t-stats FOR TASK REGRESSORS (for main output)
         stderr_dev = torch.sqrt(
             torch.clamp(sigma2_dev.unsqueeze(1), min=0.0)
             * xtx_inv_task_diag.unsqueeze(0)
         )
         tstats_dev = betas_task_dev / (stderr_dev + 1e-10)
+
+        # Partial R² per regressor: r²_partial_i = t²_i / (t²_i + df)
+        # Compute for ALL regressors if requested, then split
+        if want_r2_partial:
+            # Compute t-stats for ALL betas (task + nuisance)
+            stderr_full_dev = torch.sqrt(
+                torch.clamp(sigma2_dev.unsqueeze(1), min=0.0)
+                * xtx_inv_full_diag.unsqueeze(0)
+            )
+            tstats_full_dev = betas_dev / (stderr_full_dev + 1e-10)
+            t_squared_full_dev = tstats_full_dev ** 2
+            r2_partial_full_dev = t_squared_full_dev / (t_squared_full_dev + dof)
+
+            # Split into task vs nuisance
+            r2_partial_task_dev = r2_partial_full_dev[:, task_beta_indices]
+
+            # Get nuisance indices (all columns NOT in task_beta_indices)
+            all_indices = set(range(betas_dev.shape[1]))
+            nuisance_indices = sorted(list(all_indices - set(task_beta_indices)))
+
+            # Always extract nuisance partial R² (for -bout output)
+            r2_partial_nuisance_dev = r2_partial_full_dev[:, nuisance_indices] if len(nuisance_indices) > 0 else None
+
+            if r2_partial_mode == "task" and len(nuisance_indices) > 0:
+                # Rescale task partial R² by variance remaining after nuisance
+                # Sum nuisance partial R² (total variance explained by nuisance)
+                r2_nuisance_total = r2_partial_nuisance_dev.sum(dim=1, keepdim=True)
+                # Rescale: r²_task_adjusted = r²_task / (1 - R²_nuisance)
+                # Clamp to avoid division by zero if nuisance explains ~100%
+                denominator = torch.clamp(1.0 - r2_nuisance_total, min=0.01)
+                r2_partial_dev = r2_partial_task_dev / denominator
+            else:
+                # Full mode: use raw partial R² values
+                r2_partial_dev = r2_partial_task_dev
+
+        # Semi-partial R² per regressor: r²_semi_i = partial_r²_i * (1 - R²_full)
+        # This gives the unique variance contribution (sums to total R²)
+        if want_r2_semipartial:
+            # Need to compute semi-partial R² for ALL regressors first, then split
+            # If we didn't compute partial R² above, we need to do it now
+            if not want_r2_partial:
+                # Compute partial R² for all regressors (needed for semi-partial)
+                stderr_full_dev = torch.sqrt(
+                    torch.clamp(sigma2_dev.unsqueeze(1), min=0.0)
+                    * xtx_inv_full_diag.unsqueeze(0)
+                )
+                tstats_full_dev = betas_dev / (stderr_full_dev + 1e-10)
+                t_squared_full_dev = tstats_full_dev ** 2
+                r2_partial_full_dev = t_squared_full_dev / (t_squared_full_dev + dof)
+
+                # Split into task vs nuisance
+                r2_partial_task_dev = r2_partial_full_dev[:, task_beta_indices]
+
+                # Get nuisance indices
+                all_indices = set(range(betas_dev.shape[1]))
+                nuisance_indices = sorted(list(all_indices - set(task_beta_indices)))
+                r2_partial_nuisance_dev = r2_partial_full_dev[:, nuisance_indices] if len(nuisance_indices) > 0 else None
+
+            # Compute semi-partial R² from partial R²
+            # Formula: r²_semi = partial_r² * (1 - R²_full)
+            variance_remaining = torch.clamp(1.0 - r2_dev.unsqueeze(1), min=0.0)
+
+            # Task semi-partial R²
+            r2_semipartial_task_dev = r2_partial_task_dev * variance_remaining
+
+            # Nuisance semi-partial R²
+            r2_semipartial_nuisance_dev = r2_partial_nuisance_dev * variance_remaining if r2_partial_nuisance_dev is not None else None
+
+            # Apply rescaling mode for task regressors
+            if r2_semipartial_mode == "task" and r2_semipartial_nuisance_dev is not None:
+                # Rescale by variance remaining after nuisance
+                # First sum nuisance semi-partial R²
+                r2_semi_nuisance_total = r2_semipartial_nuisance_dev.sum(dim=1, keepdim=True)
+                denominator = torch.clamp(1.0 - r2_semi_nuisance_total, min=0.01)
+                r2_semipartial_dev = r2_semipartial_task_dev / denominator
+            else:
+                # Full mode: use raw semi-partial R² values
+                r2_semipartial_dev = r2_semipartial_task_dev
 
         # F-statistics (default to t^2 when single regressor)
         if n_task_params == 1:
@@ -477,6 +627,37 @@ def fit_glm(
             )
             fstats_dev = quad_dev / (n_task_params * sigma2_dev + 1e-10)
 
+        # GLT CONTRASTS (OLS): Compute in-loop using FULL betas
+        # For each contrast c: compute c'β and Var(c'β) = c' (σ² (X'X)^-1) c
+        if glt_contrasts_tensor is not None:
+            chunk_size_actual = betas_dev.shape[0]
+
+            # Compute c'β for all contrasts at once
+            # glt_contrasts_tensor: (n_contrasts, n_regressors_full)
+            # betas_dev: (chunk_size, n_regressors_full) - FULL betas including nuisance
+            # Result: (chunk_size, n_contrasts)
+            contrast_betas_dev = torch.mm(betas_dev, glt_contrasts_tensor.T)
+
+            # Compute Var(c'β) = c' Var(β) c for each contrast
+            # Var(β) = σ² (X'X)^-1, we have xtx_inv: (n_reg_full, n_reg_full)
+            # For each voxel: Var(β_voxel) = sigma2[voxel] * xtx_inv
+            contrast_vars_dev = torch.zeros(chunk_size_actual, n_contrasts, device=device, dtype=dtype)
+
+            for c_idx in range(n_contrasts):
+                c = glt_contrasts_tensor[c_idx]  # (n_reg_full,)
+                # c' (X'X)^-1 c - compute once, same for all voxels
+                c_xtx_inv_c = torch.dot(c, torch.mv(xtx_inv, c))
+                # Var(c'β) = σ² * c' (X'X)^-1 c
+                contrast_vars_dev[:, c_idx] = sigma2_dev * c_xtx_inv_c
+
+            # Compute t-statistics for contrasts
+            contrast_se_dev = torch.sqrt(torch.clamp(contrast_vars_dev, min=0.0))
+            contrast_tstats_dev = contrast_betas_dev / (contrast_se_dev + 1e-10)
+
+            # Store (will be moved to CPU below)
+            contrast_betas_chunk = contrast_betas_dev
+            contrast_tstats_chunk = contrast_tstats_dev
+
         # Move outputs back to CPU for aggregation
         if preload_data_to_device:
             betas_cpu = betas_task_dev
@@ -485,6 +666,10 @@ def fit_glm(
             stderr_cpu = stderr_dev
             tstats_cpu = tstats_dev
             fstats_cpu = fstats_dev
+            r2_partial_cpu = r2_partial_dev if want_r2_partial else None
+            r2_partial_nuisance_cpu = r2_partial_nuisance_dev if (want_r2_partial and r2_partial_nuisance_dev is not None) else None
+            r2_semipartial_cpu = r2_semipartial_dev if want_r2_semipartial else None
+            r2_semipartial_nuisance_cpu = r2_semipartial_nuisance_dev if (want_r2_semipartial and r2_semipartial_nuisance_dev is not None) else None
             residuals_cpu = residuals_dev if residuals_dev is not None else None
             predicted_cpu = predicted_dev if predicted_dev is not None else None
         else:
@@ -494,11 +679,25 @@ def fit_glm(
             stderr_cpu = stderr_dev.cpu()
             tstats_cpu = tstats_dev.cpu()
             fstats_cpu = fstats_dev.cpu()
+            r2_partial_cpu = r2_partial_dev.cpu() if want_r2_partial else None
+            r2_partial_nuisance_cpu = r2_partial_nuisance_dev.cpu() if (want_r2_partial and r2_partial_nuisance_dev is not None) else None
+            r2_semipartial_cpu = r2_semipartial_dev.cpu() if want_r2_semipartial else None
+            r2_semipartial_nuisance_cpu = r2_semipartial_nuisance_dev.cpu() if (want_r2_semipartial and r2_semipartial_nuisance_dev is not None) else None
             residuals_cpu = residuals_dev.cpu() if residuals_dev is not None else None
             predicted_cpu = predicted_dev.cpu() if predicted_dev is not None else None
 
         all_betas.append(betas_cpu)
         all_r2.append(r2_cpu)
+
+        if want_r2_partial and r2_partial_cpu is not None:
+            all_r2_partial.append(r2_partial_cpu)
+        if want_r2_partial and r2_partial_nuisance_cpu is not None:
+            all_r2_partial_nuisance.append(r2_partial_nuisance_cpu)
+
+        if want_r2_semipartial and r2_semipartial_cpu is not None:
+            all_r2_semipartial.append(r2_semipartial_cpu)
+        if want_r2_semipartial and r2_semipartial_nuisance_cpu is not None:
+            all_r2_semipartial_nuisance.append(r2_semipartial_nuisance_cpu)
 
         if want_residuals and residuals_cpu is not None:
             all_residuals.append(residuals_cpu)
@@ -509,6 +708,15 @@ def fit_glm(
         all_tstats.append(tstats_cpu)
         all_stderr.append(stderr_cpu)
         all_fstats.append(fstats_cpu)
+
+        # Store contrast results
+        if glt_contrasts_tensor is not None:
+            if preload_data_to_device:
+                all_contrast_betas.append(contrast_betas_chunk)
+                all_contrast_tstats.append(contrast_tstats_chunk)
+            else:
+                all_contrast_betas.append(contrast_betas_chunk.cpu())
+                all_contrast_tstats.append(contrast_tstats_chunk.cpu())
 
         # Compute per-run R² if requested
         if want_r2_run:
@@ -521,13 +729,33 @@ def fit_glm(
                     run_pred_cpu = predicted_cpu[:, run_start:run_end]
                 else:
                     run_design = full_designs[run_idx]
-                    run_betas_dev = betas_task_dev[
-                        :,
-                        run_idx * n_task_regressors : (run_idx + 1) * n_task_regressors,
-                    ]
-                    run_pred_dev = (
-                        run_design[:, :n_task_regressors] @ run_betas_dev.T
-                    ).T
+
+                    # Extract the appropriate design columns and betas
+                    if task_indices is not None:
+                        # When task_indices is provided, extract those specific columns
+                        # task_indices are global indices, so use them directly for single run
+                        # or compute per-run indices for multi-run
+                        if n_runs == 1:
+                            # Single run: use task_indices directly
+                            run_design_task = run_design[:, task_beta_indices]
+                            run_betas_dev = betas_task_dev  # All task betas
+                        else:
+                            # Multi-run: need to figure out which task_indices belong to this run
+                            # This is complex - for now, use all betas (will need refinement)
+                            run_design_task = run_design[:, :n_task_regressors]
+                            run_betas_dev = betas_task_dev[
+                                :,
+                                run_idx * n_task_regressors : (run_idx + 1) * n_task_regressors,
+                            ]
+                    else:
+                        # Original behavior: first n_task_regressors columns
+                        run_design_task = run_design[:, :n_task_regressors]
+                        run_betas_dev = betas_task_dev[
+                            :,
+                            run_idx * n_task_regressors : (run_idx + 1) * n_task_regressors,
+                        ]
+
+                    run_pred_dev = (run_design_task @ run_betas_dev.T).T
                     run_pred_cpu = (
                         run_pred_dev if preload_data_to_device else run_pred_dev.cpu()
                     )
@@ -576,13 +804,31 @@ def fit_glm(
 
     if want_r2_run:
         results.r2_run = torch.cat(all_r2_run, dim=0).to(concat_device)
+    if want_r2_partial:
+        results.r2_partial = torch.cat(all_r2_partial, dim=0).to(concat_device)
+        # Also store nuisance partial R² if we have any
+        if all_r2_partial_nuisance and len(all_r2_partial_nuisance) > 0:
+            results.r2_partial_nuisance = torch.cat(all_r2_partial_nuisance, dim=0).to(concat_device)
+    if want_r2_semipartial:
+        results.r2_semipartial = torch.cat(all_r2_semipartial, dim=0).to(concat_device)
+        # Also store nuisance semi-partial R² if we have any
+        if all_r2_semipartial_nuisance and len(all_r2_semipartial_nuisance) > 0:
+            results.r2_semipartial_nuisance = torch.cat(all_r2_semipartial_nuisance, dim=0).to(concat_device)
     if want_residuals:
         results.residuals = torch.cat(all_residuals, dim=0).to(concat_device)
     if want_predicted:
         results.predicted = torch.cat(all_predicted, dim=0).to(concat_device)
 
+    # Concatenate GLT contrast results
+    if glt_contrasts_tensor is not None:
+        results.contrast_labels = glt_labels
+        results.contrast_betas = torch.cat(all_contrast_betas, dim=0).to(concat_device)
+        results.contrast_tstats = torch.cat(all_contrast_tstats, dim=0).to(concat_device)
+
     if verbose:
         print(f"GLM complete. Mean R² = {results.r2.mean().item():.3f}")
+        if glt_contrasts_tensor is not None:
+            print(f"  Computed {n_contrasts} GLT contrasts")
 
     return results
 

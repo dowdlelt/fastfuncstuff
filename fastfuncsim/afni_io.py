@@ -245,6 +245,7 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
         - 'stim_labels': list of str - stimulus/condition names
         - 'stim_bots': list of int - bottom indices for stimulus columns
         - 'stim_tops': list of int - top indices for stimulus columns
+        - 'n_glt': int - number of GLT contrasts (0 if none)
         - 'glt_labels': list of str - contrast names
         - 'glt_matrices': list of np.ndarray - contrast matrices
         - 'basis_info': dict - HRF basis function information per stimulus
@@ -272,6 +273,7 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
         "stim_labels": None,
         "stim_bots": None,
         "stim_tops": None,
+        "n_glt": 0,  # Number of GLT contrasts (0 if none)
         "glt_labels": None,
         "glt_matrices": [],
         "basis_info": {},
@@ -345,6 +347,10 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
                             metadata["stim_tops"] = list(range(start, end + 1))
                         else:
                             metadata["stim_tops"] = [int(x) for x in value.split(",")]
+
+                    elif key == "Nglt":
+                        # Number of GLT contrasts - used to determine if var_betas needed
+                        metadata["n_glt"] = int(value)
 
                     elif key == "GltLabels":
                         metadata["glt_labels"] = [x.strip() for x in value.split(";")]
@@ -718,3 +724,61 @@ def get_contrast_matrix(
     contrast = design_info["glt_matrices"][contrast_index]
 
     return to_tensor(contrast, device=device, dtype=torch.float32)
+
+
+def extract_design_metadata(design_info: Dict) -> Tuple[List[str], List[str], List[int]]:
+    """
+    Extract metadata from design_info dictionary with clear, unambiguous names.
+
+    This helper consolidates the common pattern of extracting stimulus indices
+    and labels from AFNI design matrices. Use this instead of duplicating the
+    extraction logic across multiple files.
+
+    Parameters
+    ----------
+    design_info : dict
+        Dictionary returned by read_afni_design_matrix()
+
+    Returns
+    -------
+    full_labels : list of str
+        All column labels from the design matrix (length = n_regressors_full)
+    stim_labels : list of str
+        Labels for stimulus columns only (length = n_stim)
+    stim_column_indices : list of int
+        Column indices for stimulus regressors in the full design matrix
+
+    Examples
+    --------
+    >>> design_info = read_afni_design_matrix('X.xmat.1D')
+    >>> full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
+    >>> print(f"Full design: {len(full_labels)} columns")
+    >>> print(f"Stimulus only: {len(stim_labels)} columns")
+    >>> print(f"Stimulus indices: {stim_indices[0]}..{stim_indices[-1]}")
+
+    Notes
+    -----
+    This function implements the clean naming convention:
+    - `full_labels`: ALL labels from design matrix
+    - `stim_labels`: ONLY stimulus labels (filtered subset)
+    - `stim_column_indices`: Indices to extract stim columns from full design
+    """
+    # Extract full labels (all columns)
+    full_labels = design_info.get("column_labels", [])
+
+    # Extract stimulus indices from StimBots/StimTops
+    stim_bots = design_info.get("stim_bots", [])
+    stim_tops = design_info.get("stim_tops", [])
+    stim_column_indices = []
+
+    if stim_bots and stim_tops:
+        for bot, top in zip(stim_bots, stim_tops):
+            stim_column_indices.extend(range(bot, top + 1))
+
+    # Extract stimulus labels (subset of full labels)
+    if stim_column_indices and full_labels:
+        stim_labels = [full_labels[i] for i in stim_column_indices]
+    else:
+        stim_labels = []
+
+    return full_labels, stim_labels, stim_column_indices

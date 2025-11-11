@@ -24,6 +24,123 @@ from .glm_core import GLMResults
 ResultsLike = Union[GLMResults, ARMA11Results]
 
 
+def extract_onset_times_from_design(design_matrix: np.ndarray, column_indices: List[int]) -> List[int]:
+    """
+    Extract onset times for stimulus columns from design matrix.
+
+    For each stimulus column, finds the first timepoint where the column becomes non-zero.
+    This represents the onset time of that stimulus.
+
+    Parameters
+    ----------
+    design_matrix : np.ndarray
+        Design matrix (n_timepoints, n_regressors)
+    column_indices : list of int
+        Column indices to extract onset times for
+
+    Returns
+    -------
+    onset_times : list of int
+        Onset timepoint for each column (same length as column_indices)
+    """
+    onset_times = []
+
+    for col_idx in column_indices:
+        column = design_matrix[:, col_idx]
+
+        # Find first non-zero timepoint
+        nonzero_indices = np.nonzero(column)[0]
+
+        if len(nonzero_indices) > 0:
+            onset_time = int(nonzero_indices[0])
+        else:
+            # Column is all zeros - use large value to sort to end
+            onset_time = len(column) + col_idx  # Add col_idx to maintain stable sort
+
+        onset_times.append(onset_time)
+
+    return onset_times
+
+
+def write_single_trials_output(
+    results: ResultsLike,
+    output_path: Union[str, Path],
+    design_matrix: np.ndarray,
+    stim_indices: List[int],
+    stim_labels: Optional[List[str]],
+) -> Path:
+    """
+    Write single-trial betas reordered by presentation time.
+
+    Parameters
+    ----------
+    results : GLMResults or ARMA11Results
+        Results object with betas attribute
+    output_path : str or Path
+        Output file path (e.g., "ols_single.nii.gz")
+    design_matrix : np.ndarray
+        Full design matrix (n_timepoints, n_regressors)
+    stim_indices : list of int
+        Column indices for stimulus regressors
+    stim_labels : list of str, optional
+        Labels for stimulus regressors
+
+    Returns
+    -------
+    output_path : Path
+        Path to written file
+    """
+    # Extract onset times for each stimulus column
+    onset_times = extract_onset_times_from_design(design_matrix, stim_indices)
+
+    # Create sort order (sorts by onset time, maintaining stable order for ties)
+    sort_indices = sorted(range(len(onset_times)), key=lambda i: (onset_times[i], i))
+
+    # Reorder betas by onset time
+    betas_np = _ensure_numpy(results.betas)
+    betas_reordered = betas_np[:, sort_indices]  # (n_voxels, n_stimuli)
+
+    # Reorder labels
+    labels_reordered = [stim_labels[i] for i in sort_indices] if stim_labels else None
+
+    # Reshape to volume
+    affine = getattr(results, "affine", np.eye(4))
+    volume_shape = _resolve_shape(results, None)
+    voxel_mask = _get_voxel_mask(results)
+    betas_vol = _reshape_parameter_map(betas_reordered, volume_shape, voxel_mask)
+
+    # Write NIfTI file
+    img = nib.Nifti1Image(betas_vol, affine)
+    output_path = Path(output_path)
+    # Ensure .nii.gz extension
+    if not str(output_path).endswith('.nii.gz'):
+        if str(output_path).endswith('.nii'):
+            output_path = Path(str(output_path) + '.gz')
+        else:
+            output_path = Path(str(output_path) + '.nii.gz')
+    nib.save(img, str(output_path))
+
+    # Write labels as JSON sidecar
+    if labels_reordered:
+        # Strip image extensions (.nii.gz or .nii) to get basename, then add .json
+        path_str = str(output_path)
+        if path_str.endswith('.nii.gz'):
+            json_path = Path(path_str[:-7] + '.json')  # Remove .nii.gz
+        elif path_str.endswith('.nii'):
+            json_path = Path(path_str[:-4] + '.json')  # Remove .nii
+        else:
+            json_path = output_path.with_suffix('.json')  # Fallback
+        with json_path.open('w') as f:
+            json.dump({
+                "Description": "Single-trial betas reordered by presentation time (onset order)",
+                "Labels": labels_reordered,
+                "OnsetTimes": [onset_times[i] for i in sort_indices],
+                "OriginalColumnIndices": [stim_indices[i] for i in sort_indices],
+            }, f, indent=2)
+
+    return output_path
+
+
 def _ensure_numpy(array: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
     """Convert torch tensors to numpy arrays (float32)."""
     if isinstance(array, torch.Tensor):
@@ -224,9 +341,38 @@ def _reshape_parameter_map(
     raise ValueError("Data must be 1D or 2D when using a voxel mask")
 
 
+def _strip_imaging_extension(filepath: str) -> str:
+    """
+    Strip AFNI/NIfTI extension from filepath, preserving periods in base name.
+
+    Examples
+    --------
+    >>> _strip_imaging_extension("stats.blur.2mm+tlrc.HEAD")
+    'stats.blur.2mm'
+    >>> _strip_imaging_extension("errts.sub-01.nii.gz")
+    'errts.sub-01'
+    """
+    EXTENSIONS = [
+        '+orig.BRIK.gz', '+tlrc.BRIK.gz',
+        '+orig.BRIK', '+tlrc.BRIK',
+        '+orig.HEAD', '+tlrc.HEAD',
+        '.nii.gz',
+        '.nii',
+    ]
+
+    for ext in EXTENSIONS:
+        if filepath.endswith(ext):
+            return filepath[:-len(ext)]
+
+    return filepath
+
+
 def _normalize_output_path(output_path: Union[str, Path]) -> tuple[Path, str]:
     """
     Normalize output path and detect format from extension.
+
+    IMPORTANT: Preserves periods in filenames (e.g., "stats.blur.2mm")
+    Uses _strip_imaging_extension() instead of Path.with_suffix()
 
     Returns
     -------
@@ -236,26 +382,22 @@ def _normalize_output_path(output_path: Union[str, Path]) -> tuple[Path, str]:
         File format: 'nifti', 'nifti_gz', or 'afni'
     """
     output_path = Path(output_path)
+    path_str = str(output_path)
 
     # Detect format from extension
-    suffixes = "".join(output_path.suffixes).lower()
-
-    if suffixes.endswith(".head"):
-        # AFNI HEAD file specified
-        return output_path.with_suffix(""), "afni"
-    elif suffixes.endswith(".brik") or suffixes.endswith(".brik.gz"):
-        # AFNI BRIK file specified - remove extension, keep prefix
-        if suffixes.endswith(".brik.gz"):
-            return output_path.with_suffix("").with_suffix(""), "afni"
-        else:
-            return output_path.with_suffix(""), "afni"
-    elif suffixes.endswith(".nii.gz"):
+    if path_str.endswith(('.HEAD', '.head')):
+        base = _strip_imaging_extension(path_str)
+        return Path(base), "afni"
+    elif path_str.endswith(('.BRIK.gz', '.brik.gz', '.BRIK', '.brik')):
+        base = _strip_imaging_extension(path_str)
+        return Path(base), "afni"
+    elif path_str.endswith(('.nii.gz', '.NII.GZ')):
         return output_path, "nifti_gz"
-    elif suffixes.endswith(".nii"):
+    elif path_str.endswith(('.nii', '.NII')):
         return output_path, "nifti"
     else:
-        # Default to NIfTI compressed
-        return output_path.with_suffix(".nii.gz"), "nifti_gz"
+        # Default to NIfTI compressed - ADD extension, don't replace
+        return Path(path_str + ".nii.gz"), "nifti_gz"
 
 
 def _save_nifti_with_format(
@@ -674,11 +816,21 @@ def write_afni_bucket(
     if contrast_results is not None:
         contrast_betas = _ensure_numpy(contrast_results["contrast_betas"])
         contrast_tstats = _ensure_numpy(contrast_results["contrast_tstats"])
+        contrast_r2_partial = contrast_results.get("contrast_r2_partial", None)
+        if contrast_r2_partial is not None:
+            contrast_r2_partial = _ensure_numpy(contrast_r2_partial)
+        contrast_r2_semipartial = contrast_results.get("contrast_r2_semipartial", None)
+        if contrast_r2_semipartial is not None:
+            contrast_r2_semipartial = _ensure_numpy(contrast_r2_semipartial)
 
         # Handle single contrast case
         if contrast_betas.ndim == 1:
             contrast_betas = contrast_betas[:, np.newaxis]
             contrast_tstats = contrast_tstats[:, np.newaxis]
+            if contrast_r2_partial is not None and contrast_r2_partial.ndim == 1:
+                contrast_r2_partial = contrast_r2_partial[:, np.newaxis]
+            if contrast_r2_semipartial is not None and contrast_r2_semipartial.ndim == 1:
+                contrast_r2_semipartial = contrast_r2_semipartial[:, np.newaxis]
 
         n_contrasts = contrast_betas.shape[1]
 
@@ -707,6 +859,22 @@ def write_afni_bucket(
             subbricks.append(ct_vol.astype(dtype, copy=False))
             labels.append(f"{name}#0_Tstat")
 
+            # Partial R² (if available)
+            if contrast_r2_partial is not None:
+                cr2_vol = _reshape_parameter_map(
+                    contrast_r2_partial[:, idx], volume_shape, voxel_mask
+                )
+                subbricks.append(cr2_vol.astype(dtype, copy=False))
+                labels.append(f"{name}#0_R2")
+
+            # Semi-partial R² (if available)
+            if contrast_r2_semipartial is not None:
+                cr2semi_vol = _reshape_parameter_map(
+                    contrast_r2_semipartial[:, idx], volume_shape, voxel_mask
+                )
+                subbricks.append(cr2semi_vol.astype(dtype, copy=False))
+                labels.append(f"{name}#0_R2semi")
+
     # Stack all sub-bricks
     bucket_data = np.stack(subbricks, axis=-1)
 
@@ -726,8 +894,9 @@ def write_afni_bucket(
     # 3drefit works fine with NIfTI files, so always use NIfTI for buckets
     if detected_format == "afni":
         detected_format = "nifti_gz"  # Default to compressed NIfTI
-        # Update base_path to have .nii.gz extension
-        base_path = base_path.with_suffix(".nii.gz")
+        # Strip AFNI extension and add .nii.gz (don't use with_suffix - it breaks on periods!)
+        base_name = _strip_imaging_extension(str(base_path))
+        base_path = Path(base_name + ".nii.gz")
 
     # For 3drefit, we need uncompressed file first
     # Write uncompressed NIfTI first (for 3drefit)
@@ -770,15 +939,37 @@ def write_afni_bucket(
                         "  ⚠ Warning: No DoF found in results, skipping stat parameters"
                     )
                 else:
-                    # Build combined 3drefit command for labels AND stats
-                    label_str = " ".join(labels)
-                    cmd = ["3drefit", "-relabel_all_str", label_str]
+                    # Split into two 3drefit commands to avoid buffer overflow
+                    # Command 1: Set labels (write to file to avoid buffer overflow)
+                    labels_file = temp_path.parent / f"{temp_path.stem}_labels.txt"
+                    with labels_file.open('w') as f:
+                        # Write space-separated labels (AFNI format for -relabel_all)
+                        f.write(" ".join(labels))
 
-                    # Add statistical parameters
+                    cmd_relabel = ["3drefit", "-relabel_all", str(labels_file), str(temp_path)]
+
+                    # Write relabel command to file for debugging
+                    cmd_file_relabel = temp_path.parent / f"{temp_path.stem}_relabel_3drefit_cmd.txt"
+                    with cmd_file_relabel.open('w') as f:
+                        f.write("# 3drefit command for setting sub-brick labels\n")
+                        f.write("# This file is created automatically and can be deleted\n\n")
+                        f.write(f"Labels written to: {labels_file}\n\n")
+                        f.write("Command as list:\n")
+                        f.write(f"{cmd_relabel}\n\n")
+                        f.write("Command as shell string:\n")
+                        import shlex
+                        shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_relabel)
+                        f.write(f"{shell_cmd}\n")
+
+                    # Run relabel command
+                    subprocess.run(cmd_relabel, check=True, capture_output=True, text=True)
+
+                    # Command 2: Set statistical parameters
+                    cmd_statpar = ["3drefit"]
                     brick_idx = 0
 
                     # F-statistic (sub-brick 0)
-                    cmd.extend(
+                    cmd_statpar.extend(
                         [
                             "-substatpar",
                             str(brick_idx),
@@ -792,7 +983,7 @@ def write_afni_bucket(
                     # Regressor t-statistics
                     for _ in condition_names:
                         # Skip beta (brick_idx), add t-stat (brick_idx + 1)
-                        cmd.extend(
+                        cmd_statpar.extend(
                             ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
                         )
                         brick_idx += 2
@@ -800,16 +991,27 @@ def write_afni_bucket(
                     # Contrast t-statistics (if any)
                     if contrast_names:
                         for _ in contrast_names:
-                            cmd.extend(
+                            cmd_statpar.extend(
                                 ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
                             )
                             brick_idx += 2
 
                     # Add file path
-                    cmd.append(str(temp_path))
+                    cmd_statpar.append(str(temp_path))
 
-                    # Run 3drefit
-                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    # Write statpar command to file for debugging
+                    cmd_file_statpar = temp_path.parent / f"{temp_path.stem}_statpar_3drefit_cmd.txt"
+                    with cmd_file_statpar.open('w') as f:
+                        f.write("# 3drefit command for setting statistical parameters\n")
+                        f.write("# This file is created automatically and can be deleted\n\n")
+                        f.write("Command as list:\n")
+                        f.write(f"{cmd_statpar}\n\n")
+                        f.write("Command as shell string:\n")
+                        shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_statpar)
+                        f.write(f"{shell_cmd}\n")
+
+                    # Run statpar command
+                    subprocess.run(cmd_statpar, check=True, capture_output=True, text=True)
 
             except subprocess.CalledProcessError as e:
                 print(f"  ⚠ Warning: 3drefit failed: {e.stderr}")
@@ -828,8 +1030,9 @@ def write_afni_bucket(
         # Note: detected_format is always 'nifti' or 'nifti_gz' for bucket files
         # (we force it above), so we always compress as NIfTI
         # Compress NIfTI: .nii → .nii.gz
-        # Use parent/stem + .nii.gz to avoid double .nii.nii.gz
-        compressed_path = temp_path.parent / (temp_path.stem + ".nii.gz")
+        # IMPORTANT: Strip .nii extension properly, preserving periods in filename
+        base_name = _strip_imaging_extension(str(temp_path))
+        compressed_path = Path(base_name + ".nii.gz")
         with open(temp_path, "rb") as f_in:
             with gzip.open(compressed_path, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
@@ -1062,3 +1265,165 @@ def write_ols_arma_comparison(
         "arma": arma_file,
         "comparison_summary": summary_path,
     }
+
+
+def write_partial_r2_with_labels(
+    r2_partial_data: Union[torch.Tensor, np.ndarray],
+    output_path: Union[str, Path],
+    condition_labels: Sequence[str],
+    volume_shape: Sequence[int],
+    voxel_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    affine: Optional[np.ndarray] = None,
+    n_timepoints: Optional[int] = None,
+    n_regressors: Optional[int] = None,
+    apply_afni_metadata: bool = True,
+    mode: str = "full",  # "full" or "task" - affects label suffix
+) -> Path:
+    """
+    Write partial R² per condition with proper AFNI labels and stat parameters.
+
+    Partial R² represents the variance uniquely explained by each regressor.
+    In AFNI terms, this is a correlation coefficient (fico type).
+
+    Parameters
+    ----------
+    r2_partial_data : tensor or array, shape (n_voxels, n_conditions)
+        Partial R² values for each condition
+    output_path : str or Path
+        Output file path (will be .nii.gz)
+    condition_labels : sequence of str
+        Labels for each condition
+    volume_shape : tuple of int
+        Spatial dimensions (nx, ny, nz)
+    voxel_mask : tensor or array, optional
+        Boolean mask for sparse data
+    affine : np.ndarray, optional
+        4x4 affine transformation matrix
+    n_timepoints : int, optional
+        Number of timepoints (for AFNI stat params)
+    n_regressors : int, optional
+        Total number of regressors (for AFNI stat params)
+    apply_afni_metadata : bool, default=True
+        Apply AFNI labels and stat parameters using 3drefit
+
+    Returns
+    -------
+    Path
+        Path to written file
+    """
+    import shutil
+    import subprocess
+
+    # Convert to numpy
+    r2_partial_np = _ensure_numpy(r2_partial_data)
+    n_conditions = r2_partial_np.shape[1]
+
+    if len(condition_labels) != n_conditions:
+        raise ValueError(f"Expected {n_conditions} labels, got {len(condition_labels)}")
+
+    # Reshape to 4D volume
+    if voxel_mask is not None:
+        voxel_mask_np = _ensure_numpy(voxel_mask)
+        voxel_mask_flat = voxel_mask_np.reshape(-1)
+        r2_partial_vol = np.zeros((*volume_shape, n_conditions), dtype=np.float32)
+        for cond_idx in range(n_conditions):
+            vol_flat = np.zeros(int(np.prod(volume_shape)), dtype=np.float32)
+            vol_flat[voxel_mask_flat] = r2_partial_np[:, cond_idx]
+            r2_partial_vol[..., cond_idx] = vol_flat.reshape(volume_shape)
+    else:
+        r2_partial_vol = r2_partial_np.reshape(*volume_shape, n_conditions)
+
+    # Create NIfTI
+    if affine is None:
+        affine = np.eye(4)
+    r2_img = nib.Nifti1Image(r2_partial_vol.astype(np.float32), affine)
+
+    # Ensure output path is .nii (uncompressed for 3drefit)
+    output_path = Path(output_path)
+    if str(output_path).endswith(".nii.gz"):
+        temp_path = output_path.parent / (output_path.name[:-7] + ".nii")
+    else:
+        temp_path = output_path.parent / (output_path.stem + ".nii")
+
+    # Save uncompressed first
+    nib.save(r2_img, temp_path)
+
+    # Apply AFNI metadata if requested
+    if apply_afni_metadata and shutil.which("3drefit"):
+        try:
+            # Build labels: include mode suffix
+            # "full" mode: "cond1_partialR2" (proportion of total variance)
+            # "task" mode: "cond1_partialR2_task" (proportion of variance after nuisance)
+            suffix = "_partialR2_task" if mode == "task" else "_partialR2"
+            labels = [f"{label}{suffix}" for label in condition_labels]
+
+            # Split into two 3drefit commands to avoid buffer overflow
+            # Command 1: Set labels (write to file to avoid buffer overflow)
+            labels_file = temp_path.parent / f"{temp_path.stem}_labels.txt"
+            with labels_file.open('w') as f:
+                # Write space-separated labels (AFNI format for -relabel_all)
+                f.write(" ".join(labels))
+
+            cmd_relabel = ["3drefit", "-relabel_all", str(labels_file), str(temp_path)]
+
+            # Write relabel command to file for debugging
+            cmd_file_relabel = temp_path.parent / f"{temp_path.stem}_relabel_3drefit_cmd.txt"
+            with cmd_file_relabel.open('w') as f:
+                f.write("# 3drefit command for setting sub-brick labels (partial R²)\n")
+                f.write("# This file is created automatically and can be deleted\n\n")
+                f.write(f"Labels written to: {labels_file}\n\n")
+                f.write("Command as list:\n")
+                f.write(f"{cmd_relabel}\n\n")
+                f.write("Command as shell string:\n")
+                import shlex
+                shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_relabel)
+                f.write(f"{shell_cmd}\n")
+
+            # Run relabel command
+            subprocess.run(cmd_relabel, check=True, capture_output=True, text=True)
+
+            # Command 2: Set stat parameters (if available)
+            # Type: fico (Correlation)
+            # Params: SAMPLES FIT-PARAMETERS ORT-PARAMETERS
+            if n_timepoints and n_regressors:
+                cmd_statpar = ["3drefit"]
+                for brick_idx in range(n_conditions):
+                    # Partial R² tests one regressor against all others
+                    # SAMPLES = n_timepoints
+                    # FIT-PARAMETERS = 1 (testing 1 regressor)
+                    # ORT-PARAMETERS = n_regressors - 1 (orthogonalized against others)
+                    cmd_statpar.extend([
+                        "-substatpar", str(brick_idx), "fico",
+                        str(n_timepoints), "1", str(n_regressors - 1)
+                    ])
+
+                cmd_statpar.append(str(temp_path))
+
+                # Write statpar command to file for debugging
+                cmd_file_statpar = temp_path.parent / f"{temp_path.stem}_statpar_3drefit_cmd.txt"
+                with cmd_file_statpar.open('w') as f:
+                    f.write("# 3drefit command for setting statistical parameters (partial R²)\n")
+                    f.write("# This file is created automatically and can be deleted\n\n")
+                    f.write("Command as list:\n")
+                    f.write(f"{cmd_statpar}\n\n")
+                    f.write("Command as shell string:\n")
+                    shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_statpar)
+                    f.write(f"{shell_cmd}\n")
+
+                # Run statpar command
+                subprocess.run(cmd_statpar, check=True, capture_output=True, text=True)
+
+        except subprocess.CalledProcessError as e:
+            print(f"  ⚠ Warning: 3drefit failed: {e.stderr}")
+        except Exception as e:
+            print(f"  ⚠ Warning: 3drefit error: {e}")
+
+    # Compress to .nii.gz if requested
+    if str(output_path).endswith(".nii.gz"):
+        _save_nifti_with_format(nib.load(temp_path), output_path, "nifti_gz")
+        temp_path.unlink()  # Remove uncompressed
+        final_path = output_path
+    else:
+        final_path = temp_path
+
+    return final_path
