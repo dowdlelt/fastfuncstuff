@@ -3554,6 +3554,8 @@ def fit_glm_arma11(
                 Y_batch_dev = Y_batch.to(device)
 
                 # Compute λ for this (a,b) pair (same for all voxels in group)
+                a_val = torch.tensor(a_opt, device=device, dtype=dtype)
+                b_val = torch.tensor(b_opt, device=device, dtype=dtype)
                 lambda_val = (
                     (b_val + a_val)
                     * (1 + a_val * b_val)
