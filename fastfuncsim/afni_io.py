@@ -334,19 +334,26 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
                         metadata["stim_labels"] = [x.strip() for x in value.split(";")]
 
                     elif key == "StimBots":
-                        # Parse "20..23" format
-                        if ".." in value:
-                            start, end = map(int, value.split(".."))
-                            metadata["stim_bots"] = list(range(start, end + 1))
-                        else:
-                            metadata["stim_bots"] = [int(x) for x in value.split(",")]
+                        # Parse formats: "20..23", "20,21,22", or mixed "20..23,25,26"
+                        indices = []
+                        for part in value.split(","):
+                            if ".." in part:
+                                start, end = map(int, part.split(".."))
+                                indices.extend(range(start, end + 1))
+                            else:
+                                indices.append(int(part))
+                        metadata["stim_bots"] = indices
 
                     elif key == "StimTops":
-                        if ".." in value:
-                            start, end = map(int, value.split(".."))
-                            metadata["stim_tops"] = list(range(start, end + 1))
-                        else:
-                            metadata["stim_tops"] = [int(x) for x in value.split(",")]
+                        # Parse formats: "20..23", "20,21,22", or mixed "20..23,25,26"
+                        indices = []
+                        for part in value.split(","):
+                            if ".." in part:
+                                start, end = map(int, part.split(".."))
+                                indices.extend(range(start, end + 1))
+                            else:
+                                indices.append(int(part))
+                        metadata["stim_tops"] = indices
 
                     elif key == "Nglt":
                         # Number of GLT contrasts - used to determine if var_betas needed

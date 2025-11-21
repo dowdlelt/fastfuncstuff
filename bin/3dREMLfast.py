@@ -466,6 +466,17 @@ Examples:
     )
     proc_opts.add_argument("-mask", help="Mask file to restrict analysis")
     proc_opts.add_argument(
+        "-cache",
+        metavar="FILE.h5",
+        help="HDF5 cache file for fast data loading. If exists, loads from cache. If not, creates cache from input files.",
+    )
+    proc_opts.add_argument(
+        "-test",
+        type=int,
+        metavar="N_VOXELS",
+        help="Test mode: extract ~N voxels from center of volume (fast iteration for debugging)",
+    )
+    proc_opts.add_argument(
         "-batch_size",
         type=int,
         help="Number of voxels per batch for ARMA grid search (default: auto-detect). OLS will use 4x this value.",
@@ -487,6 +498,11 @@ Examples:
     )
     proc_opts.add_argument(
         "-verbose", action="store_true", help="Print detailed progress information"
+    )
+    proc_opts.add_argument(
+        "-legacy_contrasts",
+        action="store_true",
+        help="Use legacy loop-based GLT contrast computation (slower, for validation only)",
     )
     proc_opts.add_argument(
         "-debug_memory",
@@ -996,6 +1012,31 @@ def main():
     print("🚀 Starting GLM analysis...")
     print()
 
+    # Handle HDF5 caching for fast data loading
+    fmri_data_to_use = None
+    cache_metadata = None
+
+    if args.cache:
+        from fastfuncsim.data_cache import check_cache_valid, load_cache, save_cache
+
+        cache_valid = check_cache_valid(args.cache, input_files)
+
+        if cache_valid:
+            # Load from cache
+            cached_data, cache_metadata = load_cache(args.cache, input_files, validate=True)
+
+            # Reshape to 4D if volume_shape available (needed for test mode and output writing)
+            if 'volume_shape' in cache_metadata:
+                vol_shape = cache_metadata['volume_shape']
+                n_timepoints = cached_data.shape[1]
+                # Reshape from (n_voxels, n_timepoints) to (x, y, z, n_timepoints)
+                cached_data = cached_data.reshape(*vol_shape, n_timepoints)
+
+            fmri_data_to_use = cached_data  # Pass numpy array instead of file list
+        else:
+            # Will create cache after loading data
+            print(f"📝 Cache not found or invalid - will create: {args.cache}")
+
     # Run analysis
     try:
         # Determine grid batching strategy
@@ -1005,17 +1046,75 @@ def main():
         elif args.no_grid_batching:
             use_grid_batching = False
 
+        # Use cached data if available, otherwise load from files
+        if fmri_data_to_use is None:
+            fmri_data_to_use = input_files if len(input_files) > 1 else input_files[0]
+
+        # Check if Rvar file exists - if so, load precomputed ARMA params to skip grid search
+        precomputed_arma = None
+        rvar_path = None
+        if args.Rvar:
+            # Try to find Rvar file with automatic extension detection
+            rvar_base = Path(args.Rvar)
+            if rvar_base.exists():
+                rvar_path = rvar_base
+            elif Path(str(rvar_base) + '.nii.gz').exists():
+                rvar_path = Path(str(rvar_base) + '.nii.gz')
+            elif Path(str(rvar_base) + '.nii').exists():
+                rvar_path = Path(str(rvar_base) + '.nii')
+
+        if rvar_path is not None:
+            print(f"\n📂 Loading precomputed ARMA parameters from: {rvar_path}")
+            print(f"   (Skipping grid search - saves ~80% compute time)")
+
+            try:
+                import nibabel as nib
+
+                rvar_img = nib.load(str(rvar_path))
+                rvar_data = rvar_img.get_fdata()  # (x, y, z, n_params)
+
+                # Validate dimensions
+                if rvar_data.ndim != 4:
+                    raise ValueError(f"Expected 4D Rvar file, got {rvar_data.ndim}D")
+
+                n_params = rvar_data.shape[3]
+                if n_params < 2:
+                    raise ValueError(f"Rvar file must have at least 2 sub-briks (a, b), found {n_params}")
+
+                # Keep as 4D (x, y, z, 2) for consistent masking/test mode with data
+                # Extract only a and b parameters (first 2 sub-briks)
+                precomputed_arma = rvar_data[..., :2]  # (x, y, z, 2)
+
+                # Compute stats for logging
+                n_voxels_total = np.prod(precomputed_arma.shape[:3])
+                a_range = (precomputed_arma[..., 0].min(), precomputed_arma[..., 0].max())
+                b_range = (precomputed_arma[..., 1].min(), precomputed_arma[..., 1].max())
+
+                print(f"   ✓ Loaded ARMA params: {n_voxels_total:,} voxels × 2 params (a, b)")
+                print(f"   • Shape: {precomputed_arma.shape} (4D - will be masked consistently with data)")
+                print(f"   • a range: [{a_range[0]:.3f}, {a_range[1]:.3f}]")
+                print(f"   • b range: [{b_range[0]:.3f}, {b_range[1]:.3f}]")
+
+            except Exception as e:
+                print(f"   ⚠️  Failed to load Rvar file: {e}")
+                print(f"   Proceeding with grid search instead")
+                precomputed_arma = None
+
         results, design_info = analyze_from_design_matrix(
-            fmri_data=input_files if len(input_files) > 1 else input_files[0],
+            fmri_data=fmri_data_to_use,
             design_matrix_file=args.matrix,
             method="arma11",  # Always use ARMA for 3dREMLfast
             arma_a_grid=a_grid,
             arma_b_grid=b_grid,
+            precomputed_arma_params=precomputed_arma,
             want_ols=want_ols,
             ols_output_path=ols_output_path,
             ols_output_format=output_format,
             device=device,
             mask_file=args.mask,
+            cache_file=args.cache if (args.cache and cache_metadata is None) else None,
+            cached_metadata=cache_metadata,  # Pass cached header/affine/volume_shape
+            test_n_voxels=args.test,
             voxel_chunk_size=args.batch_size,
             use_double=args.use_double,
             debug_memory=args.debug_memory,
@@ -1031,6 +1130,7 @@ def main():
             r2_semipartial_mode=args.r2semipartial
             if args.r2semipartial
             else "full",  # "full" or "task"
+            legacy_contrasts=args.legacy_contrasts,
         )
     except Exception as e:
         print(f"\n❌ ERROR during analysis: {e}")
@@ -1170,7 +1270,12 @@ def main():
         )
 
     if args.Rvar:
-        print(f"  • Writing REML variance parameters: {args.Rvar}")
+        # Ensure Rvar output path has .nii.gz extension
+        rvar_output_path = Path(args.Rvar)
+        if not (str(rvar_output_path).endswith('.nii.gz') or str(rvar_output_path).endswith('.nii')):
+            rvar_output_path = Path(str(rvar_output_path) + '.nii.gz')
+
+        print(f"  • Writing REML variance parameters: {rvar_output_path}")
         # Stack variance parameters: a, b, lambda, StDev, -LogLik, LjungBox (placeholder)
         var_stack = []
         var_labels = []
@@ -1232,9 +1337,60 @@ def main():
         # IMPORTANT: nibabel cannot convert NIfTI headers to AFNI headers
         # So we always save variance files as NIfTI (even if user requested AFNI)
         from fastfuncsim.glm_outputs import _save_nifti_with_format
+        import subprocess
+        import shutil
 
-        # Always write NIfTI .nii.gz regardless of input format
-        _save_nifti_with_format(var_img, Path(args.Rvar), "nifti_gz")
+        # OPTIMIZATION: Write uncompressed first, then 3drefit, then compress
+        # This avoids 3drefit having to decompress/recompress huge files!
+        # For 870k voxels, this saves significant time
+
+        # Write uncompressed .nii first
+        temp_nii_path = rvar_output_path.with_suffix('.nii') if str(rvar_output_path).endswith('.nii.gz') else rvar_output_path
+        _save_nifti_with_format(var_img, temp_nii_path, "nifti")
+
+        # Label sub-briks using AFNI's 3drefit (fast on uncompressed file)
+        print(f"  • Labeling Rvar sub-briks with 3drefit...")
+
+        # Build 3drefit command with all sub-brik labels
+        refit_cmd = ["3drefit"]
+        for idx, label in enumerate(var_labels):
+            refit_cmd.extend(["-sublabel", str(idx), label])
+        refit_cmd.append(str(temp_nii_path.absolute()))
+
+        try:
+            subprocess.run(refit_cmd, check=True, capture_output=True, text=True)
+            print(f"    ✓ Labeled {len(var_labels)} sub-briks: {', '.join(var_labels)}")
+        except subprocess.CalledProcessError as e:
+            print(f"    ⚠️  3drefit labeling failed: {e.stderr}")
+            print(f"    (File was written successfully, but lacks sub-brik labels)")
+        except FileNotFoundError:
+            print(f"    ⚠️  3drefit not found in PATH (AFNI not installed?)")
+            print(f"    (File was written successfully, but lacks sub-brik labels)")
+
+        # Compress with pigz if available (4-8× faster than gzip)
+        if str(rvar_output_path).endswith('.nii.gz'):
+            print(f"  • Compressing with {'pigz' if shutil.which('pigz') else 'gzip'}...")
+            if shutil.which("pigz"):
+                try:
+                    subprocess.run(["pigz", "-f", str(temp_nii_path)], check=True, capture_output=True)
+                    # pigz creates .nii.gz, rename if needed
+                    pigz_output = Path(str(temp_nii_path) + ".gz")
+                    if pigz_output != rvar_output_path:
+                        pigz_output.rename(rvar_output_path)
+                except subprocess.CalledProcessError:
+                    # Fall back to gzip
+                    import gzip
+                    with open(temp_nii_path, "rb") as f_in:
+                        with gzip.open(rvar_output_path, "wb") as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                    temp_nii_path.unlink()
+            else:
+                # Use standard gzip
+                import gzip
+                with open(temp_nii_path, "rb") as f_in:
+                    with gzip.open(rvar_output_path, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                temp_nii_path.unlink()
 
     # Write partial R² if requested and available
     if (

@@ -2201,6 +2201,123 @@ def batch_reml_grid_search(
     return best_params, best_likelihoods
 
 
+def search_voxels_precomputed_grid(
+    X: torch.Tensor,
+    Y_batch: torch.Tensor,
+    precomputed_grid: Dict,
+    device: torch.device,
+    verbose: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Search for optimal ARMA parameters using a precomputed grid.
+
+    This function evaluates each voxel's likelihood against all precomputed
+    (a, b) parameter combinations and selects the best one.
+
+    Parameters
+    ----------
+    X : torch.Tensor, shape (n_timepoints, n_regressors)
+        Design matrix
+    Y_batch : torch.Tensor, shape (n_voxels_batch, n_timepoints)
+        Voxel timeseries data
+    precomputed_grid : dict
+        Dictionary mapping (a, b) tuples to precomputed matrices:
+        - 'L_inv': Cholesky factor inverse
+        - 'X_w': Prewhitened design matrix
+        - 'R_qr': QR decomposition of X_w
+        - 'logdet_Rcorr': log determinant of correlation matrix
+        - 'logdet_XwTXw': log determinant of X'X
+    device : torch.device
+        Device for computation
+    verbose : bool
+        Print progress information
+
+    Returns
+    -------
+    best_params : torch.Tensor, shape (n_voxels_batch, 2)
+        Optimal (a, b) for each voxel
+    best_likelihoods : torch.Tensor, shape (n_voxels_batch,)
+        Minimum REML likelihood for each voxel
+    """
+    n_voxels_batch = Y_batch.shape[0]
+    n_timepoints, n_regressors = X.shape
+    n_grid = len(precomputed_grid)
+
+    # Initialize results
+    best_params = torch.zeros(n_voxels_batch, 2, device=device)
+    best_likelihoods = torch.full((n_voxels_batch,), float('inf'), device=device)
+
+    # Extract grid keys and precomputed values
+    param_list = list(precomputed_grid.keys())
+
+    # Move Y_batch to device if needed
+    if Y_batch.device != device:
+        Y_batch = Y_batch.to(device)
+
+    # Check which approach was used (all grid entries should have same use_qr)
+    use_qr = precomputed_grid[param_list[0]]["use_qr"]
+
+    # Evaluate each grid point
+    for grid_idx, (a, b) in enumerate(param_list):
+        grid_data = precomputed_grid[(a, b)]
+
+        # Get precomputed matrices (already on GPU)
+        L_inv = grid_data['L_inv']
+        X_w = grid_data['X_w']
+        R_qr = grid_data['R_qr']
+        logdet_Rcorr = grid_data['logdet_Rcorr']
+        logdet_XwTXw = grid_data['logdet_XwTXw']
+
+        # Prewhiten data: Y_w = L_inv @ Y for all voxels
+        # Y_batch: (n_voxels, n_timepoints)
+        # L_inv: (n_timepoints, n_timepoints)
+        # Result: (n_voxels, n_timepoints)
+        Y_w_batch = (Y_batch @ L_inv.T)  # More efficient than L_inv @ Y_batch.T
+
+        # Solve X_w @ beta = Y_w for each voxel
+        # Compute X_w' Y_w
+        XwT_Yw = X_w.T @ Y_w_batch.T  # (n_regressors, n_voxels)
+
+        # Solve for beta using appropriate method
+        if use_qr:
+            # QR approach: R' R beta = X_w' Y_w (triangular solves)
+            # R_qr is upper triangular R factor from QR decomposition
+            beta_temp = torch.linalg.solve_triangular(
+                R_qr.T, XwT_Yw, upper=False
+            )
+            beta_batch = torch.linalg.solve_triangular(
+                R_qr, beta_temp, upper=True
+            )
+        else:
+            # X'X approach: (X_w' X_w) beta = X_w' Y_w (general solve)
+            # R_qr is actually X_w' X_w (symmetric positive definite)
+            beta_batch = torch.linalg.solve(
+                R_qr, XwT_Yw
+            )
+        beta_batch = beta_batch.T  # (n_voxels, n_regressors)
+
+        # Compute prewhitened residuals
+        pred_w = (X_w @ beta_batch.T).T  # (n_voxels, n_timepoints)
+        resid_w = Y_w_batch - pred_w
+        rss_batch = torch.sum(resid_w ** 2, dim=1)  # (n_voxels,)
+
+        # Compute REML likelihood for this (a, b)
+        # L = log(det(R)) + log(det(X'R^-1 X)) + (n-m) log(RSS)
+        term1 = logdet_Rcorr  # Scalar, same for all voxels
+        term2 = logdet_XwTXw  # Scalar, same for all voxels
+        term3 = (n_timepoints - n_regressors) * torch.log(rss_batch + 1e-10)  # (n_voxels,)
+
+        likelihoods = term1 + term2 + term3  # (n_voxels,)
+
+        # Update best parameters where this (a, b) is better
+        improve_mask = likelihoods < best_likelihoods
+        best_likelihoods[improve_mask] = likelihoods[improve_mask]
+        best_params[improve_mask, 0] = a
+        best_params[improve_mask, 1] = b
+
+    return best_params, best_likelihoods
+
+
 def prewhiten_with_arma11(
     X: torch.Tensor, Y: torch.Tensor, a: float, b: float
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3539,6 +3656,52 @@ def fit_glm_arma11(
                                 "sample_R_qr": precomputed_grid[sample_key]["R_qr"],
                             },
                         )
+
+                # CRITICAL FIX: Search each voxel against precomputed grid
+                # This was missing, causing all voxels to stay at initialization (0,0)
+                if verbose:
+                    print("\n🔍 Searching for optimal (a,b) for each voxel...")
+
+                # Process voxels in batches to find optimal parameters
+                for batch_idx in range(n_batches):
+                    batch_start = batch_idx * batch_size
+                    batch_end = min(batch_start + batch_size, n_voxels)
+                    batch_voxels = batch_end - batch_start
+
+                    # Get voxel data for this batch
+                    Y_batch = data[batch_start:batch_end]  # (batch_voxels, n_timepoints)
+
+                    # Search against precomputed grid
+                    best_params_batch, best_lik_batch = search_voxels_precomputed_grid(
+                        design,
+                        Y_batch,
+                        precomputed_grid,
+                        device,
+                        verbose=False,
+                    )
+
+                    # Store results
+                    results.arma_params[batch_start:batch_end] = best_params_batch.cpu()
+                    results.reml_likelihood[batch_start:batch_end] = best_lik_batch.cpu()
+
+                    if verbose and (batch_idx + 1) % max(1, n_batches // 10) == 0:
+                        progress_pct = 100 * (batch_idx + 1) / n_batches
+                        print(f"  Progress: {progress_pct:.0f}% ({batch_idx + 1}/{n_batches} batches)")
+
+                # Compute lambda from (a, b)
+                a_vals = results.arma_params[:, 0]
+                b_vals = results.arma_params[:, 1]
+                lam = (
+                    (b_vals + a_vals)
+                    * (1 + a_vals * b_vals)
+                    / (1 + 2 * a_vals * b_vals + b_vals**2 + 1e-10)
+                )
+                results.arma_lambda = lam
+
+                if verbose:
+                    print(f"\n✓ Grid search complete!")
+                    print(f"  Mean (a, b): ({a_vals.mean():.3f}, {b_vals.mean():.3f})")
+                    print(f"  Mean λ: {lam.mean():.3f}\n")
 
         # NEW OPTIMIZED APPROACH: Group voxels by (a,b), process each group together
         # Eliminates CPU<->GPU transfers of L_inv (saves ~87 minutes on large datasets!)

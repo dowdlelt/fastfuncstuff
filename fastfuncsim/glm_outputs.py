@@ -109,8 +109,9 @@ def write_single_trials_output(
     voxel_mask = _get_voxel_mask(results)
     betas_vol = _reshape_parameter_map(betas_reordered, volume_shape, voxel_mask)
 
-    # Write NIfTI file
-    img = nib.Nifti1Image(betas_vol, affine)
+    # Write NIfTI file with complete header preservation
+    tr = getattr(results, "tr", None)
+    img = _create_nifti_with_header(betas_vol, affine, results, tr)
     output_path = Path(output_path)
     # Ensure .nii.gz extension
     if not str(output_path).endswith('.nii.gz'):
@@ -400,6 +401,50 @@ def _normalize_output_path(output_path: Union[str, Path]) -> tuple[Path, str]:
         return Path(path_str + ".nii.gz"), "nifti_gz"
 
 
+def _create_nifti_with_header(
+    data: np.ndarray,
+    affine: np.ndarray,
+    results: Optional[ResultsLike] = None,
+    tr: Optional[float] = None,
+) -> nib.Nifti1Image:
+    """
+    Create NIfTI image preserving complete header from original data.
+
+    Parameters
+    ----------
+    data : ndarray
+        Image data (3D or 4D)
+    affine : ndarray
+        4x4 affine matrix
+    results : GLMResults or ARMA11Results, optional
+        If provided and has nifti_header attribute, uses complete header
+    tr : float, optional
+        TR to set in header if creating new header
+
+    Returns
+    -------
+    img : Nifti1Image
+        NIfTI image with complete header metadata preserved
+    """
+    nifti_header = getattr(results, "nifti_header", None) if results is not None else None
+
+    if nifti_header is not None:
+        # Copy the complete header from original data
+        import copy
+        new_header = copy.deepcopy(nifti_header)
+        # Update shape to match new data
+        new_header.set_data_shape(data.shape)
+        img = nib.Nifti1Image(data, affine, header=new_header)
+    else:
+        # Fallback: Create basic header
+        img = nib.Nifti1Image(data, affine)
+        img.header.set_xyzt_units(xyz="mm", t="sec")
+        if tr is not None:
+            img.header["pixdim"][4] = float(tr)
+
+    return img
+
+
 def _save_nifti_with_format(
     img: nib.Nifti1Image,
     output_path: Path,
@@ -551,10 +596,7 @@ def write_glm_results_nifti(
 
     if stats_stack:
         stats_data = np.stack(stats_stack, axis=-1)
-        stats_img = nib.Nifti1Image(stats_data.astype(dtype, copy=False), affine_mat)
-        stats_img.header.set_xyzt_units(xyz="mm", t="sec")
-        if tr is not None:
-            stats_img.header["pixdim"][4] = float(tr)
+        stats_img = _create_nifti_with_header(stats_data.astype(dtype, copy=False), affine_mat, results, tr)
         stats_path = output_dir / f"{prefix}_stats.nii.gz"
         nib.save(stats_img, stats_path)
         outputs["stats"] = stats_path
@@ -567,10 +609,7 @@ def write_glm_results_nifti(
     if include_fstat and getattr(results, "fstats", None) is not None:
         fstat_np = _ensure_numpy(results.fstats)
         fstat_vol = _reshape_parameter_map(fstat_np, volume_shape, voxel_mask)
-        fstat_img = nib.Nifti1Image(fstat_vol.astype(dtype, copy=False), affine_mat)
-        fstat_img.header.set_xyzt_units(xyz="mm", t="sec")
-        if tr is not None:
-            fstat_img.header["pixdim"][4] = float(tr)
+        fstat_img = _create_nifti_with_header(fstat_vol.astype(dtype, copy=False), affine_mat, results, tr)
         fstat_path = output_dir / f"{prefix}_fstat.nii.gz"
         nib.save(fstat_img, fstat_path)
         outputs["fstat"] = fstat_path
@@ -578,10 +617,7 @@ def write_glm_results_nifti(
     if include_r2 and getattr(results, "r2", None) is not None:
         r2_np = _ensure_numpy(results.r2)
         r2_vol = _reshape_parameter_map(r2_np, volume_shape, voxel_mask)
-        r2_img = nib.Nifti1Image(r2_vol.astype(dtype, copy=False), affine_mat)
-        r2_img.header.set_xyzt_units(xyz="mm", t="sec")
-        if tr is not None:
-            r2_img.header["pixdim"][4] = float(tr)
+        r2_img = _create_nifti_with_header(r2_vol.astype(dtype, copy=False), affine_mat, results, tr)
         r2_path = output_dir / f"{prefix}_r2.nii.gz"
         nib.save(r2_img, r2_path)
         outputs["r2"] = r2_path
@@ -589,10 +625,7 @@ def write_glm_results_nifti(
     if include_mean and getattr(results, "meanvol", None) is not None:
         mean_np = _ensure_numpy(results.meanvol)
         mean_vol = _reshape_parameter_map(mean_np, volume_shape, voxel_mask)
-        mean_img = nib.Nifti1Image(mean_vol.astype(dtype, copy=False), affine_mat)
-        mean_img.header.set_xyzt_units(xyz="mm", t="sec")
-        if tr is not None:
-            mean_img.header["pixdim"][4] = float(tr)
+        mean_img = _create_nifti_with_header(mean_vol.astype(dtype, copy=False), affine_mat, results, tr)
         mean_path = output_dir / f"{prefix}_mean.nii.gz"
         nib.save(mean_img, mean_path)
         outputs["mean"] = mean_path
@@ -600,10 +633,7 @@ def write_glm_results_nifti(
     if include_sigma and getattr(results, "sigma2", None) is not None:
         sigma_np = np.sqrt(np.maximum(_ensure_numpy(results.sigma2), 0.0))
         sigma_vol = _reshape_parameter_map(sigma_np, volume_shape, voxel_mask)
-        sigma_img = nib.Nifti1Image(sigma_vol.astype(dtype, copy=False), affine_mat)
-        sigma_img.header.set_xyzt_units(xyz="mm", t="sec")
-        if tr is not None:
-            sigma_img.header["pixdim"][4] = float(tr)
+        sigma_img = _create_nifti_with_header(sigma_vol.astype(dtype, copy=False), affine_mat, results, tr)
         sigma_path = output_dir / f"{prefix}_sigma.nii.gz"
         nib.save(sigma_img, sigma_path)
         outputs["sigma"] = sigma_path
@@ -615,10 +645,7 @@ def write_glm_results_nifti(
             )
         resid_np = _ensure_numpy(results.residuals)
         resid_vol = _reshape_parameter_map(resid_np, volume_shape, voxel_mask)
-        resid_img = nib.Nifti1Image(resid_vol.astype(dtype, copy=False), affine_mat)
-        resid_img.header.set_xyzt_units(xyz="mm", t="sec")
-        if tr is not None:
-            resid_img.header["pixdim"][4] = float(tr)
+        resid_img = _create_nifti_with_header(resid_vol.astype(dtype, copy=False), affine_mat, results, tr)
         resid_path = output_dir / f"{prefix}_residuals.nii.gz"
         nib.save(resid_img, resid_path)
         outputs["residuals"] = resid_path
@@ -630,10 +657,7 @@ def write_glm_results_nifti(
             )
         pred_np = _ensure_numpy(results.predicted)
         pred_vol = _reshape_parameter_map(pred_np, volume_shape, voxel_mask)
-        pred_img = nib.Nifti1Image(pred_vol.astype(dtype, copy=False), affine_mat)
-        pred_img.header.set_xyzt_units(xyz="mm", t="sec")
-        if tr is not None:
-            pred_img.header["pixdim"][4] = float(tr)
+        pred_img = _create_nifti_with_header(pred_vol.astype(dtype, copy=False), affine_mat, results, tr)
         pred_path = output_dir / f"{prefix}_predicted.nii.gz"
         nib.save(pred_img, pred_path)
         outputs["predicted"] = pred_path
@@ -878,11 +902,8 @@ def write_afni_bucket(
     # Stack all sub-bricks
     bucket_data = np.stack(subbricks, axis=-1)
 
-    # Create NIfTI image
-    bucket_img = nib.Nifti1Image(bucket_data, affine_mat)
-    bucket_img.header.set_xyzt_units(xyz="mm", t="sec")
-    if tr is not None:
-        bucket_img.header["pixdim"][4] = float(tr)
+    # Create NIfTI image with complete header preservation
+    bucket_img = _create_nifti_with_header(bucket_data, affine_mat, results, tr)
 
     # Normalize output path and detect format
     base_path, detected_format = _normalize_output_path(output_path)
@@ -1024,8 +1045,8 @@ def write_afni_bucket(
     # Compress output if requested
     final_path = temp_path
     if compress_output:
-        import gzip
         import shutil
+        import subprocess
 
         # Note: detected_format is always 'nifti' or 'nifti_gz' for bucket files
         # (we force it above), so we always compress as NIfTI
@@ -1033,14 +1054,39 @@ def write_afni_bucket(
         # IMPORTANT: Strip .nii extension properly, preserving periods in filename
         base_name = _strip_imaging_extension(str(temp_path))
         compressed_path = Path(base_name + ".nii.gz")
-        with open(temp_path, "rb") as f_in:
-            with gzip.open(compressed_path, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
 
-        # Remove uncompressed file
-        temp_path.unlink()
-
-        final_path = compressed_path
+        # OPTIMIZATION: Use pigz (parallel gzip) if available - much faster!
+        # For large files (e.g., 870k voxels), pigz can be 4-8× faster than gzip
+        if shutil.which("pigz"):
+            try:
+                # pigz: parallel gzip, uses all CPU cores
+                subprocess.run(
+                    ["pigz", "-f", str(temp_path)],  # -f: force overwrite
+                    check=True,
+                    capture_output=True
+                )
+                # pigz creates .nii.gz automatically
+                # Rename if needed (pigz adds .gz to existing name)
+                pigz_output = Path(str(temp_path) + ".gz")
+                if pigz_output != compressed_path:
+                    pigz_output.rename(compressed_path)
+                final_path = compressed_path
+            except subprocess.CalledProcessError:
+                # pigz failed, fall back to gzip
+                import gzip
+                with open(temp_path, "rb") as f_in:
+                    with gzip.open(compressed_path, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                temp_path.unlink()
+                final_path = compressed_path
+        else:
+            # pigz not available, use standard gzip (slower but universal)
+            import gzip
+            with open(temp_path, "rb") as f_in:
+                with gzip.open(compressed_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            temp_path.unlink()
+            final_path = compressed_path
     else:
         # No compression requested
         # Note: detected_format is always 'nifti' or 'nifti_gz' for bucket files

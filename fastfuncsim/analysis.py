@@ -263,6 +263,9 @@ def analyze_from_design_matrix(
     device: Optional[torch.device] = None,
     mask_file: Optional[Union[str, Path]] = None,
     mask_threshold: float = 0.0,
+    cache_file: Optional[Union[str, Path]] = None,
+    cached_metadata: Optional[Dict] = None,
+    test_n_voxels: Optional[int] = None,
     voxel_chunk_size: Optional[int] = None,
     use_double: bool = False,
     debug_memory: bool = False,
@@ -272,6 +275,7 @@ def analyze_from_design_matrix(
     r2_partial_mode: str = "full",  # "full" or "task" - how to compute partial R²
     want_r2_semipartial: bool = False,
     r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
+    legacy_contrasts: bool = False,
 ) -> Tuple[Union[GLMResults, ARMA11Results], Dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -306,8 +310,9 @@ def analyze_from_design_matrix(
     arma_b_grid : torch.Tensor, optional
         Grid of 'b' parameter values for ARMA(1,1) (only used if method='arma11')
         If None, uses AFNI -Grid 3 defaults: linspace(-0.3, 0.3, 7) = 7 points, 63 total combos
-    precomputed_arma_params : array-like, shape (n_voxels, 2), optional
+    precomputed_arma_params : array-like, shape (n_voxels, 2) or (x, y, z, 2), optional
         Precomputed ARMA(1,1) parameters [a, b] for each voxel (only used if method='arma11')
+        Can be 2D (n_voxels, 2) or 4D (x, y, z, 2) - will be reshaped/masked consistently with data
         If provided, skips REML estimation (saves ~80% of compute time)
         Useful for re-running analysis with different contrasts or validating against AFNI
     want_ols : bool, default=False
@@ -366,6 +371,16 @@ def analyze_from_design_matrix(
     mask_tensor: Optional[torch.Tensor] = None
     volume_shape: Optional[Tuple[int, int, int]] = None
     affine = None
+    nifti_header = None  # Store full NIfTI header for cache
+
+    # CRITICAL: If using cached data, extract header/affine from cache metadata
+    if cached_metadata is not None:
+        if 'nifti_header' in cached_metadata:
+            nifti_header = cached_metadata['nifti_header']
+        if 'affine' in cached_metadata:
+            affine = cached_metadata['affine']
+        if 'volume_shape' in cached_metadata:
+            volume_shape = cached_metadata['volume_shape']
 
     if isinstance(fmri_data, list):
         if len(fmri_data) == 0:
@@ -383,6 +398,7 @@ def analyze_from_design_matrix(
 
         volume_shape = tuple(int(dim) for dim in first_img.shape[:3])
         affine = first_img.affine
+        nifti_header = first_img.header  # Capture full header for cache
 
         data, actual_run_starts = load_and_concatenate_runs(fmri_data, storage_device)
 
@@ -415,6 +431,7 @@ def analyze_from_design_matrix(
             if len(img.shape) >= 3:
                 volume_shape = tuple(int(dim) for dim in img.shape[:3])
             affine = img.affine
+            nifti_header = img.header  # Capture full header for cache
 
     # data should be (n_voxels, n_timepoints)
     if data.ndim == 4:
@@ -428,7 +445,146 @@ def analyze_from_design_matrix(
 
     n_voxels, n_timepoints = data.shape
 
-    if mask_file is not None:
+    # PARALLEL TRANSFORM: Reshape precomputed_arma_params same as data (4D → 2D)
+    # This ensures consistent masking/test mode transformations
+    if precomputed_arma_params is not None:
+        # Convert to tensor if needed
+        if isinstance(precomputed_arma_params, np.ndarray):
+            precomputed_arma_params = torch.from_numpy(precomputed_arma_params)
+
+        if precomputed_arma_params.ndim == 4:
+            # Reshape (x, y, z, 2) -> (n_voxels, 2)
+            arma_volume_shape = tuple(int(dim) for dim in precomputed_arma_params.shape[:3])
+
+            # Validate spatial dimensions match data
+            if volume_shape is not None and arma_volume_shape != volume_shape:
+                raise ValueError(
+                    f"Precomputed ARMA params volume shape {arma_volume_shape} "
+                    f"does not match data volume shape {volume_shape}"
+                )
+
+            precomputed_arma_params = precomputed_arma_params.reshape(-1, precomputed_arma_params.shape[3])
+            print(f"📊 Reshaped precomputed ARMA params: {arma_volume_shape} → ({precomputed_arma_params.shape[0]:,}, {precomputed_arma_params.shape[1]})")
+
+        elif precomputed_arma_params.ndim == 2:
+            # Already 2D - validate voxel count matches
+            if precomputed_arma_params.shape[0] != n_voxels:
+                raise ValueError(
+                    f"Precomputed ARMA params has {precomputed_arma_params.shape[0]:,} voxels, "
+                    f"but data has {n_voxels:,} voxels"
+                )
+        else:
+            raise ValueError(
+                f"Precomputed ARMA params must be 2D (n_voxels, 2) or 4D (x, y, z, 2), "
+                f"got shape {precomputed_arma_params.shape}"
+            )
+
+        # Validate parameter dimension
+        if precomputed_arma_params.shape[1] != 2:
+            raise ValueError(
+                f"Precomputed ARMA params must have 2 parameters (a, b), "
+                f"got {precomputed_arma_params.shape[1]}"
+            )
+
+        # Initial validation: voxel counts match
+        assert precomputed_arma_params.shape[0] == n_voxels, (
+            f"After reshape: precomputed ARMA params has {precomputed_arma_params.shape[0]:,} voxels, "
+            f"but data has {n_voxels:,} voxels"
+        )
+
+    # AUTO-SCALING: Check if data needs scaling to mean=100
+    # This is standard for AFNI percent signal change convention
+    global_mean = float(data.mean())
+    was_scaled = False
+    original_mean = global_mean
+
+    if not (90 <= global_mean <= 110):
+        print(f"\n⚠️  Data mean: {global_mean:.1f} (expected ~100)")
+        print(f"   Auto-scaling to mean=100 (AFNI convention)")
+
+        # Scale each voxel's timeseries to have mean=100
+        # This preserves relative signal changes while standardizing baseline
+        voxel_means = data.mean(axis=1, keepdims=True)
+        # Avoid division by zero
+        voxel_means = np.where(voxel_means == 0, 1.0, voxel_means)
+        data = (data / voxel_means) * 100.0
+
+        was_scaled = True
+        new_mean = float(data.mean())
+        print(f"   ✓ Scaled: {original_mean:.1f} → {new_mean:.1f}\n")
+
+    # Save to HDF5 cache if requested (BEFORE masking/test mode)
+    # This allows fast loading on subsequent runs
+    if cache_file is not None and isinstance(fmri_data, list):
+        from .data_cache import save_cache
+
+        # Get run starts - need to extract from design_info or actual_run_starts
+        run_starts_for_cache = None
+        if 'actual_run_starts' in locals():
+            run_starts_for_cache = actual_run_starts
+
+        # Convert data to numpy for saving
+        data_np = data.cpu().numpy() if isinstance(data, torch.Tensor) else data
+
+        save_cache(
+            cache_file=cache_file,
+            data=data_np,
+            input_files=fmri_data,
+            run_starts=run_starts_for_cache,
+            affine=affine,
+            volume_shape=volume_shape,
+            was_scaled=was_scaled,
+            original_mean=original_mean,
+            nifti_header=nifti_header,
+        )
+
+    # TEST MODE: Create test mask to extract ~N voxels from center
+    if test_n_voxels is not None:
+        if volume_shape is None:
+            raise ValueError("Test mode requires 4D input data to determine volume shape")
+
+        # Calculate cube size to get approximately test_n_voxels
+        cube_side = int(np.ceil(test_n_voxels ** (1/3)))
+
+        # Find center of volume
+        center = np.array(volume_shape) // 2
+        half_cube = cube_side // 2
+
+        # Create 3D mask cube around center
+        test_mask_3d = np.zeros(volume_shape, dtype=bool)
+        x_start = max(0, center[0] - half_cube)
+        x_end = min(volume_shape[0], center[0] + half_cube)
+        y_start = max(0, center[1] - half_cube)
+        y_end = min(volume_shape[1], center[1] + half_cube)
+        z_start = max(0, center[2] - half_cube)
+        z_end = min(volume_shape[2], center[2] + half_cube)
+
+        test_mask_3d[x_start:x_end, y_start:y_end, z_start:z_end] = True
+
+        # Flatten and apply
+        test_mask_flat = test_mask_3d.reshape(-1)
+        mask_tensor = torch.from_numpy(test_mask_flat.astype(np.bool_))
+        kept_voxels = int(mask_tensor.sum().item())
+
+        print(f"🧪 Test mode: extracting {kept_voxels:,} voxels from center")
+        print(f"   Cube: {cube_side}³ at center {tuple(center)}")
+        print(f"   Bounds: x=[{x_start}:{x_end}], y=[{y_start}:{y_end}], z=[{z_start}:{z_end}]")
+
+        data = data[mask_tensor, :]
+        n_voxels = kept_voxels
+
+        # PARALLEL TRANSFORM: Apply same test mask to precomputed_arma_params
+        if precomputed_arma_params is not None:
+            precomputed_arma_params = precomputed_arma_params[mask_tensor, :]
+            print(f"   • Also masked precomputed ARMA params: {precomputed_arma_params.shape[0]:,} voxels")
+
+            # Validate dimensions still match after masking
+            assert precomputed_arma_params.shape[0] == n_voxels, (
+                f"After test mask: precomputed ARMA params has {precomputed_arma_params.shape[0]:,} voxels, "
+                f"but data has {n_voxels:,} voxels"
+            )
+
+    elif mask_file is not None:
         mask_array = load_afni_mask(mask_file, threshold=mask_threshold)
         if volume_shape is None:
             volume_shape = mask_array.shape
@@ -459,6 +615,17 @@ def analyze_from_design_matrix(
         data = data[mask_tensor, :]
         n_voxels = kept_voxels
 
+        # PARALLEL TRANSFORM: Apply same mask to precomputed_arma_params
+        if precomputed_arma_params is not None:
+            precomputed_arma_params = precomputed_arma_params[mask_tensor, :]
+            print(f"  • Also masked precomputed ARMA params: {precomputed_arma_params.shape[0]:,} voxels")
+
+            # Validate dimensions still match after masking
+            assert precomputed_arma_params.shape[0] == n_voxels, (
+                f"After mask: precomputed ARMA params has {precomputed_arma_params.shape[0]:,} voxels, "
+                f"but data has {n_voxels:,} voxels"
+            )
+
     # 3. Extract design matrix (already read above)
     if use_stimulus_only:
         # Extract only stimulus columns
@@ -473,6 +640,10 @@ def analyze_from_design_matrix(
 
     # 4. Get TR from design info
     tr = design_info["tr"]
+
+    # Extract stimulus metadata (needed for both OLS and ARMA)
+    from .afni_io import extract_design_metadata
+    full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
 
     # 5. Fit GLM
     glm_poly = None if use_stimulus_only else -1
@@ -505,10 +676,6 @@ def analyze_from_design_matrix(
                 arma_a_grid, _ = get_default_arma_grids(device)
             if arma_b_grid is None:
                 _, arma_b_grid = get_default_arma_grids(device)
-
-        # Extract stimulus metadata using helper function (clean naming!)
-        from .afni_io import extract_design_metadata
-        full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
 
         # Create simple OLS write callback if output path provided
         ols_write_callback = None
@@ -703,6 +870,7 @@ def analyze_from_design_matrix(
             glt_matrices=design_info.get("glt_matrices", None),
             task_indices=stim_indices if stim_indices else None,
             spatial_metadata=spatial_metadata if spatial_metadata else None,
+            legacy_contrasts=legacy_contrasts,
         )
 
     else:
@@ -730,6 +898,17 @@ def analyze_from_design_matrix(
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
             results.ols_results.affine = affine  # type: ignore[attr-defined]
+
+    # CRITICAL: Attach NIfTI header for perfect output reconstruction
+    if nifti_header is not None:
+        results.nifti_header = nifti_header  # type: ignore[attr-defined]
+        # Also set on OLS results if present
+        if hasattr(results, "ols_results") and results.ols_results is not None:
+            results.ols_results.nifti_header = nifti_header  # type: ignore[attr-defined]
+
+    # Add scaling info to design_info for cache saving
+    design_info["was_scaled"] = was_scaled
+    design_info["original_mean"] = original_mean
 
     return results, design_info
 
