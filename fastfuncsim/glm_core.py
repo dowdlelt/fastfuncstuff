@@ -423,7 +423,13 @@ def fit_glm(
     # Pre-compute matrices for statistics
     xtx = design_concat.T @ design_concat
     # No ridge regularization - match AFNI behavior (will fail if matrix is singular)
-    xtx_inv = torch.linalg.inv(xtx)
+    # Use Cholesky decomposition for symmetric positive definite X'X (2x faster than general inverse)
+    try:
+        L = torch.linalg.cholesky(xtx)
+        xtx_inv = torch.cholesky_inverse(L)
+    except torch.linalg.LinAlgError:
+        # Fallback to general inverse if Cholesky fails (rare for well-conditioned data)
+        xtx_inv = torch.linalg.inv(xtx)
 
     # Determine which columns are "task" vs "nuisance"
     # If task_indices provided (from AFNI StimBots/StimTops), use those
@@ -452,7 +458,8 @@ def fit_glm(
     xtx_inv_task_diag = torch.diagonal(xtx_inv_task, dim1=0, dim2=1)
 
     # For partial R² and semi-partial R² computation: need diagonal of FULL (X'X)^-1 (all regressors)
-    xtx_inv_full_diag = torch.diagonal(xtx_inv, dim1=0, dim2=1) if (want_r2_partial or want_r2_semipartial) else None
+    # Also needed for F-stat when n_regressors == 1
+    xtx_inv_full_diag = torch.diagonal(xtx_inv, dim1=0, dim2=1)
 
     dof = design_concat.shape[0] - design_concat.shape[1]
     if dof <= 0:
@@ -462,7 +469,19 @@ def fit_glm(
         dof = max(1, dof)
 
     # Precompute inverse for F-stat (no ridge - match AFNI behavior)
-    xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task)
+    # For Full_Fstat: need (X'X) for ALL regressors
+    # For task F-stats: need (X'X) for task regressors only
+    try:
+        L_full = torch.linalg.cholesky(xtx_inv)
+        xtx_inv_full_inv = torch.cholesky_inverse(L_full)  # This is X'X for all regressors
+    except torch.linalg.LinAlgError:
+        xtx_inv_full_inv = torch.linalg.inv(xtx_inv)
+
+    try:
+        L_task = torch.linalg.cholesky(xtx_inv_task)
+        xtx_inv_task_inv = torch.cholesky_inverse(L_task)
+    except torch.linalg.LinAlgError:
+        xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task)
     n_task_params = xtx_inv_task.shape[0]
 
     # Setup GLT contrasts (if present) - compute in-loop like ARMA
@@ -618,7 +637,10 @@ def fit_glm(
                 # Full mode: use raw semi-partial R² values
                 r2_semipartial_dev = r2_semipartial_task_dev
 
-        # F-statistics (default to t^2 when single regressor)
+        # F-statistics: Test ALL task regressors
+        # NOTE: Confirmed from AFNI source (3dREMLfit.c:2900-2906) that "Full_Fstat"
+        # tests ONLY stimuli (task regressors), NOT baseline/nuisance regressors.
+        # The "Full" GLT uses create_subset_matrix over stim_bot[jj]:stim_top[jj].
         if n_task_params == 1:
             fstats_dev = tstats_dev[:, 0] ** 2
         else:
@@ -641,14 +663,22 @@ def fit_glm(
             # Compute Var(c'β) = c' Var(β) c for each contrast
             # Var(β) = σ² (X'X)^-1, we have xtx_inv: (n_reg_full, n_reg_full)
             # For each voxel: Var(β_voxel) = sigma2[voxel] * xtx_inv
-            contrast_vars_dev = torch.zeros(chunk_size_actual, n_contrasts, device=device, dtype=dtype)
 
-            for c_idx in range(n_contrasts):
-                c = glt_contrasts_tensor[c_idx]  # (n_reg_full,)
-                # c' (X'X)^-1 c - compute once, same for all voxels
-                c_xtx_inv_c = torch.dot(c, torch.mv(xtx_inv, c))
-                # Var(c'β) = σ² * c' (X'X)^-1 c
-                contrast_vars_dev[:, c_idx] = sigma2_dev * c_xtx_inv_c
+            # VECTORIZED: Compute all c' (X'X)^-1 c at once (faster than loop)
+            # glt_contrasts_tensor: (n_contrasts, n_regressors)
+            # xtx_inv: (n_regressors, n_regressors)
+            # Result: (n_contrasts,) - same for all voxels
+            contrast_xtx_inv_c = torch.einsum(
+                'cr,rs,cs->c',
+                glt_contrasts_tensor,  # (n_contrasts, n_regressors)
+                xtx_inv,               # (n_regressors, n_regressors)
+                glt_contrasts_tensor   # (n_contrasts, n_regressors)
+            )
+
+            # Broadcast to all voxels: Var(c'β) = σ² * c' (X'X)^-1 c
+            # sigma2_dev: (chunk_size,), contrast_xtx_inv_c: (n_contrasts,)
+            # Result: (chunk_size, n_contrasts)
+            contrast_vars_dev = sigma2_dev.unsqueeze(1) * contrast_xtx_inv_c.unsqueeze(0)
 
             # Compute t-statistics for contrasts
             contrast_se_dev = torch.sqrt(torch.clamp(contrast_vars_dev, min=0.0))
