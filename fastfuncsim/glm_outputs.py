@@ -837,6 +837,17 @@ def write_afni_bucket(
         labels.append(f"{name}#0_Tstat")
 
     # 3. Beta and T-stat for each contrast
+    # Check if contrasts are in results object first (from in-loop GLT computation)
+    if contrast_results is None and hasattr(results, "contrast_betas"):
+        # Build contrast_results dict from results attributes
+        contrast_results = {
+            "contrast_betas": results.contrast_betas,
+            "contrast_tstats": results.contrast_tstats,
+        }
+        # Use contrast_labels from results if available and contrast_names not provided
+        if contrast_names is None and hasattr(results, "contrast_labels"):
+            contrast_names = results.contrast_labels
+
     if contrast_results is not None:
         contrast_betas = _ensure_numpy(contrast_results["contrast_betas"])
         contrast_tstats = _ensure_numpy(contrast_results["contrast_tstats"])
