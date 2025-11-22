@@ -38,6 +38,7 @@ def analyze_from_onsets(
     arma_b_grid: Optional[torch.Tensor] = None,
     run_starts: Optional[List[int]] = None,
     device: Optional[torch.device] = None,
+    enable_quick_estimate: bool = False,
     **hrf_kwargs,
 ) -> Union[GLMResults, ARMA11Results]:
     """
@@ -215,6 +216,7 @@ def analyze_from_onsets(
 
         else:
             # Standard OLS
+            assert design is not None, "design should not be None for non-library modes"
             results = fit_glm(data, design, tr=tr, device=device)
 
     elif method == "arma11":
@@ -234,6 +236,7 @@ def analyze_from_onsets(
                 _, arma_b_grid = get_default_arma_grids(device)
 
         # ARMA(1,1) prewhitened GLS
+        assert design is not None, "design should not be None for ARMA (library mode blocked above)"
         results = fit_glm_arma11(
             data, design, tr=tr, a_grid=arma_a_grid, b_grid=arma_b_grid, device=device,
             enable_quick_estimate=enable_quick_estimate

@@ -10,11 +10,11 @@ import h5py
 import numpy as np
 import torch
 from pathlib import Path
-from typing import List, Union, Tuple, Optional
+from typing import List, Union, Tuple, Optional, Sequence
 import time
 
 
-def _compute_file_hash(files: List[Union[str, Path]]) -> str:
+def _compute_file_hash(files: Sequence[Union[str, Path]]) -> str:
     """Compute hash of file paths and modification times for cache validation."""
     hash_obj = hashlib.md5()
     for f in sorted(files):
@@ -116,7 +116,7 @@ def save_cache(
 
 def load_cache(
     cache_file: Union[str, Path],
-    input_files: Optional[List[Union[str, Path]]] = None,
+    input_files: Optional[Sequence[Union[str, Path]]] = None,
     validate: bool = True,
 ) -> Tuple[np.ndarray, dict]:
     """
@@ -207,7 +207,7 @@ def load_cache(
 
 def check_cache_valid(
     cache_file: Union[str, Path],
-    input_files: List[Union[str, Path]],
+    input_files: Sequence[Union[str, Path]],
 ) -> bool:
     """
     Check if cache file exists and is valid for given input files.

@@ -34,7 +34,11 @@ try:
         write_glm_results_nifti,
         slice_glm_results,
     )
-    from fastfuncsim.afni_io import read_afni_design_matrix
+    from fastfuncsim.afni_io import (
+        read_afni_design_matrix,
+        replace_afni_extension,
+        get_tr_from_file,
+    )
     from fastfuncsim.utils import get_device
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -111,57 +115,6 @@ def detect_format(filepath: str) -> str:
     else:
         # Default to nifti
         return "nii.gz"
-
-
-def replace_afni_extension(filepath: str, new_extension: str) -> str:
-    """
-    Ensure filepath ends with .nii.gz, stripping any existing imaging extension.
-
-    Preserves periods in base filename (e.g., "stats.blur.2mm" stays intact).
-    Always outputs .nii.gz format (we only write NIfTI now).
-
-    Examples:
-        ensure_nifti_gz_extension("stats")              → "stats.nii.gz"
-        ensure_nifti_gz_extension("stats.nii")          → "stats.nii.gz"
-        ensure_nifti_gz_extension("stats.nii.gz")       → "stats.nii.gz"
-        ensure_nifti_gz_extension("stats+orig.HEAD")    → "stats.nii.gz"
-        ensure_nifti_gz_extension("stats.blur.2mm")     → "stats.blur.2mm.nii.gz"
-    """
-    # Define known extensions (order matters - check longest first!)
-    EXTENSIONS = [
-        "+orig.BRIK.gz",
-        "+tlrc.BRIK.gz",  # AFNI compressed
-        "+orig.BRIK",
-        "+tlrc.BRIK",  # AFNI uncompressed
-        "+orig.HEAD",
-        "+tlrc.HEAD",  # AFNI headers
-        ".nii.gz",  # NIfTI compressed
-        ".nii",  # NIfTI uncompressed
-    ]
-
-    # Strip any existing extension
-    for ext in EXTENSIONS:
-        if filepath.endswith(ext):
-            filepath = filepath[: -len(ext)]
-            break
-
-    # Always add .nii.gz
-    return filepath + ".nii.gz"
-
-
-def get_tr_from_file(filepath: str) -> float:
-    """Extract TR from NIfTI header"""
-    try:
-        img = nib.load(filepath)
-        tr = img.header.get_zooms()[-1]  # Last dimension is time
-        if tr == 0 or tr is None:
-            print(f"WARNING: TR not found in {filepath} header, using 1.0")
-            return 1.0
-        return float(tr)
-    except Exception as e:
-        print(f"WARNING: Could not read TR from {filepath}: {e}")
-        print("Using TR=1.0 as fallback")
-        return 1.0
 
 
 def extract_onset_times_from_design(

@@ -789,3 +789,87 @@ def extract_design_metadata(design_info: Dict) -> Tuple[List[str], List[str], Li
         stim_labels = []
 
     return full_labels, stim_labels, stim_column_indices
+
+
+def replace_afni_extension(filepath: str, new_extension: str = ".nii.gz") -> str:
+    """
+    Replace any AFNI or NIfTI extension with a new extension.
+
+    Preserves periods in base filename (e.g., "stats.blur.2mm" stays intact).
+    By default outputs .nii.gz format (we only write NIfTI now).
+
+    Parameters
+    ----------
+    filepath : str
+        Input file path
+    new_extension : str, default=".nii.gz"
+        New extension to add (should start with ".")
+
+    Returns
+    -------
+    str
+        Filepath with new extension
+
+    Examples
+    --------
+    >>> replace_afni_extension("stats", ".nii.gz")
+    'stats.nii.gz'
+    >>> replace_afni_extension("stats.nii", ".nii.gz")
+    'stats.nii.gz'
+    >>> replace_afni_extension("stats+orig.HEAD", ".nii.gz")
+    'stats.nii.gz'
+    >>> replace_afni_extension("stats.blur.2mm", ".nii.gz")
+    'stats.blur.2mm.nii.gz'
+    """
+    # Define known extensions (order matters - check longest first!)
+    EXTENSIONS = [
+        "+orig.BRIK.gz",
+        "+tlrc.BRIK.gz",  # AFNI compressed
+        "+orig.BRIK",
+        "+tlrc.BRIK",  # AFNI uncompressed
+        "+orig.HEAD",
+        "+tlrc.HEAD",  # AFNI headers
+        ".nii.gz",  # NIfTI compressed
+        ".nii",  # NIfTI uncompressed
+    ]
+
+    # Strip any existing extension
+    for ext in EXTENSIONS:
+        if filepath.endswith(ext):
+            filepath = filepath[: -len(ext)]
+            break
+
+    # Add new extension
+    return filepath + new_extension
+
+
+def get_tr_from_file(filepath: Union[str, Path]) -> float:
+    """
+    Extract TR (repetition time) from NIfTI header.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to NIfTI file
+
+    Returns
+    -------
+    float
+        TR in seconds, or 1.0 if not found
+
+    Examples
+    --------
+    >>> tr = get_tr_from_file("func.nii.gz")
+    >>> print(f"TR = {tr}s")
+    """
+    try:
+        img = nib.load(filepath)
+        tr = img.header.get_zooms()[-1]  # Last dimension is time  # type: ignore[attr-defined]
+        if tr == 0 or tr is None:
+            print(f"WARNING: TR not found in {filepath} header, using 1.0")
+            return 1.0
+        return float(tr)
+    except Exception as e:
+        print(f"WARNING: Could not read TR from {filepath}: {e}")
+        print("Using TR=1.0 as fallback")
+        return 1.0
