@@ -2207,6 +2207,7 @@ def search_voxels_precomputed_grid(
     precomputed_grid: Dict,
     device: torch.device,
     verbose: bool = False,
+    enable_timing: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Search for optimal ARMA parameters using a precomputed grid.
@@ -2231,6 +2232,8 @@ def search_voxels_precomputed_grid(
         Device for computation
     verbose : bool
         Print progress information
+    enable_timing : bool
+        Enable detailed timing profiling
 
     Returns
     -------
@@ -2239,6 +2242,8 @@ def search_voxels_precomputed_grid(
     best_likelihoods : torch.Tensor, shape (n_voxels_batch,)
         Minimum REML likelihood for each voxel
     """
+    from .timing_utils import profile_section
+
     n_voxels_batch = Y_batch.shape[0]
     n_timepoints, n_regressors = X.shape
     n_grid = len(precomputed_grid)
@@ -2259,61 +2264,68 @@ def search_voxels_precomputed_grid(
 
     # Evaluate each grid point
     for grid_idx, (a, b) in enumerate(param_list):
-        grid_data = precomputed_grid[(a, b)]
+        with profile_section(f"1_get_grid_data", enabled=enable_timing):
+            grid_data = precomputed_grid[(a, b)]
 
-        # Get precomputed matrices (already on GPU)
-        L_inv = grid_data['L_inv']
-        X_w = grid_data['X_w']
-        R_qr = grid_data['R_qr']
-        logdet_Rcorr = grid_data['logdet_Rcorr']
-        logdet_XwTXw = grid_data['logdet_XwTXw']
+            # Get precomputed matrices (already on GPU)
+            L_inv = grid_data['L_inv']
+            X_w = grid_data['X_w']
+            R_qr = grid_data['R_qr']
+            logdet_Rcorr = grid_data['logdet_Rcorr']
+            logdet_XwTXw = grid_data['logdet_XwTXw']
 
         # Prewhiten data: Y_w = L_inv @ Y for all voxels
-        # Y_batch: (n_voxels, n_timepoints)
-        # L_inv: (n_timepoints, n_timepoints)
-        # Result: (n_voxels, n_timepoints)
-        Y_w_batch = (Y_batch @ L_inv.T)  # More efficient than L_inv @ Y_batch.T
+        with profile_section(f"2_prewhiten_data", enabled=enable_timing):
+            # Y_batch: (n_voxels, n_timepoints)
+            # L_inv: (n_timepoints, n_timepoints)
+            # Result: (n_voxels, n_timepoints)
+            Y_w_batch = (Y_batch @ L_inv.T)  # More efficient than L_inv @ Y_batch.T
 
         # Solve X_w @ beta = Y_w for each voxel
-        # Compute X_w' Y_w
-        XwT_Yw = X_w.T @ Y_w_batch.T  # (n_regressors, n_voxels)
+        with profile_section(f"3_compute_XwTYw", enabled=enable_timing):
+            # Compute X_w' Y_w
+            XwT_Yw = X_w.T @ Y_w_batch.T  # (n_regressors, n_voxels)
 
         # Solve for beta using appropriate method
-        if use_qr:
-            # QR approach: R' R beta = X_w' Y_w (triangular solves)
-            # R_qr is upper triangular R factor from QR decomposition
-            beta_temp = torch.linalg.solve_triangular(
-                R_qr.T, XwT_Yw, upper=False
-            )
-            beta_batch = torch.linalg.solve_triangular(
-                R_qr, beta_temp, upper=True
-            )
-        else:
-            # X'X approach: (X_w' X_w) beta = X_w' Y_w (general solve)
-            # R_qr is actually X_w' X_w (symmetric positive definite)
-            beta_batch = torch.linalg.solve(
-                R_qr, XwT_Yw
-            )
-        beta_batch = beta_batch.T  # (n_voxels, n_regressors)
+        with profile_section(f"4_solve_beta", enabled=enable_timing):
+            if use_qr:
+                # QR approach: R' R beta = X_w' Y_w (triangular solves)
+                # R_qr is upper triangular R factor from QR decomposition
+                beta_temp = torch.linalg.solve_triangular(
+                    R_qr.T, XwT_Yw, upper=False
+                )
+                beta_batch = torch.linalg.solve_triangular(
+                    R_qr, beta_temp, upper=True
+                )
+            else:
+                # X'X approach: (X_w' X_w) beta = X_w' Y_w (general solve)
+                # R_qr is actually X_w' X_w (symmetric positive definite)
+                beta_batch = torch.linalg.solve(
+                    R_qr, XwT_Yw
+                )
+            beta_batch = beta_batch.T  # (n_voxels, n_regressors)
 
         # Compute prewhitened residuals
-        pred_w = (X_w @ beta_batch.T).T  # (n_voxels, n_timepoints)
-        resid_w = Y_w_batch - pred_w
-        rss_batch = torch.sum(resid_w ** 2, dim=1)  # (n_voxels,)
+        with profile_section(f"5_compute_residuals", enabled=enable_timing):
+            pred_w = (X_w @ beta_batch.T).T  # (n_voxels, n_timepoints)
+            resid_w = Y_w_batch - pred_w
+            rss_batch = torch.sum(resid_w ** 2, dim=1)  # (n_voxels,)
 
         # Compute REML likelihood for this (a, b)
-        # L = log(det(R)) + log(det(X'R^-1 X)) + (n-m) log(RSS)
-        term1 = logdet_Rcorr  # Scalar, same for all voxels
-        term2 = logdet_XwTXw  # Scalar, same for all voxels
-        term3 = (n_timepoints - n_regressors) * torch.log(rss_batch + 1e-10)  # (n_voxels,)
+        with profile_section(f"6_compute_likelihood", enabled=enable_timing):
+            # L = log(det(R)) + log(det(X'R^-1 X)) + (n-m) log(RSS)
+            term1 = logdet_Rcorr  # Scalar, same for all voxels
+            term2 = logdet_XwTXw  # Scalar, same for all voxels
+            term3 = (n_timepoints - n_regressors) * torch.log(rss_batch + 1e-10)  # (n_voxels,)
 
-        likelihoods = term1 + term2 + term3  # (n_voxels,)
+            likelihoods = term1 + term2 + term3  # (n_voxels,)
 
         # Update best parameters where this (a, b) is better
-        improve_mask = likelihoods < best_likelihoods
-        best_likelihoods[improve_mask] = likelihoods[improve_mask]
-        best_params[improve_mask, 0] = a
-        best_params[improve_mask, 1] = b
+        with profile_section(f"7_update_best", enabled=enable_timing):
+            improve_mask = likelihoods < best_likelihoods
+            best_likelihoods[improve_mask] = likelihoods[improve_mask]
+            best_params[improve_mask, 0] = a
+            best_params[improve_mask, 1] = b
 
     return best_params, best_likelihoods
 
