@@ -1,7 +1,7 @@
 """
 Real data tests for cross-validation functionality.
 
-Uses the small validation dataset at ~/Dropbox/Data/small_validation_afni_data/
+Uses the small validation dataset in test_data/small_validation_afni_data/
 to test cross-validation on real fMRI data.
 """
 
@@ -14,8 +14,8 @@ import torch
 from fastfuncsim.analysis import analyze_with_cross_validation
 
 
-# Path to validation data
-VALIDATION_DATA_DIR = Path.home() / "Dropbox" / "Data" / "small_validation_afni_data"
+# Path to validation data (relative to project root)
+VALIDATION_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
 
 # Input files - using vis_ files which should have better signal
 INPUT_FILES = [

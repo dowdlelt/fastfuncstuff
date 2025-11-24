@@ -1,7 +1,7 @@
 """
 Regression tests comparing fastfuncsim outputs against AFNI reference outputs.
 
-Uses small validation dataset in ~/Dropbox/Data/small_validation_afni_data/
+Uses small validation dataset in test_data/small_validation_afni_data/
 """
 import pytest
 import numpy as np
@@ -13,8 +13,8 @@ from fastfuncsim.analysis import analyze_from_design_matrix
 from fastfuncsim.glm_outputs import write_afni_bucket
 
 
-# AFNI reference data paths
-AFNI_DATA_DIR = Path.home() / "Dropbox/Data/small_validation_afni_data"
+# AFNI reference data paths (relative to project root)
+AFNI_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
 DESIGN_MATRIX = AFNI_DATA_DIR / "X.xmat.1D"
 INPUT_FILES = [
     AFNI_DATA_DIR / "small_test_r01.nii.gz",

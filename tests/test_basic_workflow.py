@@ -18,7 +18,7 @@ from fastfuncsim.data_cache import save_cache, load_cache, check_cache_valid
 
 
 # Test data paths
-DATA_DIR = Path("/home/logan/Dropbox/Data")
+DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
 DESIGN_MATRIX = DATA_DIR / "X.xmat.1D"
 INPUT_FILES = [
     DATA_DIR / "small_test_r01.nii.gz",
