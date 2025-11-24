@@ -144,6 +144,17 @@ Notes:
             "'corr' = Pearson correlation, 'corr2' = Pearson r². Default: cod"
         ),
     )
+    cv_opts.add_argument(
+        "-zero_event",
+        type=str,
+        default="zero",
+        choices=["zero", "nuisance"],
+        help=(
+            "How to handle missing stimulus events in train/test: "
+            "'zero' (default) = use zero beta for missing events, "
+            "'nuisance' = move unpredictable events to test nuisance"
+        ),
+    )
 
     # Output options
     out_opts = parser.add_argument_group("Output Options")
@@ -335,6 +346,7 @@ def main():
         nuisance_indices=nuisance_indices,
         cv_splits=cv_splits,
         metric=args.metric,
+        zero_event_strategy=args.zero_event,
         device=device,
         batch_size=args.batch_size,
         data_chunk_size=args.data_chunk_size,

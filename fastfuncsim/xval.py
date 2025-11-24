@@ -377,6 +377,7 @@ def compute_xval_r2(
     nuisance_indices: List[int],
     cv_splits: List[Tuple[List[int], List[int]]],
     metric: str = "cod",
+    zero_event_strategy: str = "zero",
     device: Optional[torch.device] = None,
     batch_size: Optional[int] = None,
     data_chunk_size: Optional[int] = None,
@@ -414,6 +415,13 @@ def compute_xval_r2(
         Cross-validation splits from generate_cv_splits()
     metric : str, default='cod'
         R² metric: 'cod', 'corr', or 'corr2'
+    zero_event_strategy : str, default='zero'
+        How to handle events (stimulus columns) that are missing in train or test:
+        - 'zero': Insert zero betas for missing events. Predictions only use present
+          events. This reduces R² but keeps predictions valid.
+        - 'nuisance': Move unpredictable events (missing in train) to nuisance in test.
+          This removes variance from those events before prediction, allowing prediction
+          of the remainder. More sophisticated but assumes missing events are noise.
     device : torch.device, optional
         Compute device (auto-detected if None)
     batch_size : int, optional
@@ -540,7 +548,7 @@ def compute_xval_r2(
             train_stim_design = train_design_clean[:, stim_indices]
             test_stim_design = test_design_clean[:, stim_indices]
 
-            # 4b. Detect zero columns in stimulus indices (run-specific regressors)
+            # 4b. Detect zero columns in stimulus indices (missing events across runs)
             # These are stimulus columns that are zero in this particular split
             train_stim_norms = train_stim_design.abs().sum(dim=0)
             test_stim_norms = test_stim_design.abs().sum(dim=0)
@@ -548,56 +556,73 @@ def compute_xval_r2(
             train_zero_mask = train_stim_norms < 1e-10
             test_zero_mask = test_stim_norms < 1e-10
 
+            # Track which events are present in each set
+            train_present_mask = ~train_zero_mask  # Events in train
+            test_present_mask = ~test_zero_mask    # Events in test
+
+            # Events that are ONLY in train (not in test) - we CAN'T predict them
+            unpredictable_mask = train_present_mask & test_zero_mask
+
+            # Events that are in BOTH train and test - we CAN predict them
+            predictable_mask = train_present_mask & test_present_mask
+
+            # Handle missing events based on strategy
             if train_zero_mask.any() or test_zero_mask.any():
-                # We have zero columns in stimulus - this is problematic!
                 zero_cols_train = [i for i, is_zero in enumerate(train_zero_mask) if is_zero]
                 zero_cols_test = [i for i, is_zero in enumerate(test_zero_mask) if is_zero]
+                unpredictable_cols = [i for i, unpred in enumerate(unpredictable_mask) if unpred]
 
-                # Only warn once (on first split, first chunk)
-                if split_idx == 0 and chunk_idx == 0:
-                    import warnings
-                    msg = (
-                        f"\n{'='*80}\n"
-                        f"WARNING: Zero columns detected in STIMULUS indices!\n"
-                        f"{'='*80}\n"
-                        f"Train split has {len(zero_cols_train)} zero stimulus columns: {zero_cols_train}\n"
-                        f"Test split has {len(zero_cols_test)} zero stimulus columns: {zero_cols_test}\n"
-                        f"\n"
-                        f"This means you have RUN-SPECIFIC stimulus regressors (e.g., different\n"
-                        f"stimuli in different runs) that are zero when not in that run.\n"
-                        f"\n"
-                        f"These columns will be REMOVED from the design before fitting to avoid\n"
-                        f"singular matrices. However, this may not be the intended behavior.\n"
-                        f"\n"
-                        f"Recommendations:\n"
-                        f"  1. If these are truly nuisance (e.g., run-specific polynomials),\n"
-                        f"     they should be in nuisance_indices, not stim_indices\n"
-                        f"  2. If these are legitimate stimuli that vary by run, you may need\n"
-                        f"     special handling (future feature)\n"
-                        f"{'='*80}\n"
+                # Only warn/report once (on first split, first chunk)
+                if split_idx == 0 and chunk_idx == 0 and verbose:
+                    print(f"\n{'='*80}")
+                    print(f"INFO: Handling missing events across train/test splits")
+                    print(f"{'='*80}")
+                    print(f"Train-only events (zero in test): {len(zero_cols_test)} - {zero_cols_test}")
+                    print(f"Test-only events (zero in train): {len(zero_cols_train)} - {zero_cols_train}")
+                    print(f"Unpredictable events (can't predict): {len(unpredictable_cols)} - {unpredictable_cols}")
+                    print(f"Strategy: '{zero_event_strategy}'")
+                    print(f"{'='*80}\n")
+
+                # Check we have at least some predictable events
+                if not predictable_mask.any():
+                    raise ValueError(
+                        f"No overlapping events between train {train_runs} and test {test_runs}! "
+                        f"Cannot perform cross-validation."
                     )
-                    warnings.warn(msg, UserWarning, stacklevel=2)
 
-                # Remove zero columns from stimulus design to avoid singular matrices
-                # Keep track of which columns are valid
-                train_nonzero_mask = ~train_zero_mask
-                test_nonzero_mask = ~test_zero_mask
+                # Apply strategy
+                if zero_event_strategy == "zero":
+                    # Strategy 1: Remove unpredictable events, use zero betas for train-missing events
+                    # Only fit on events present in train (regardless of test)
+                    train_stim_design_fit = train_stim_design[:, train_present_mask]
 
-                if train_nonzero_mask.any():
-                    train_stim_design = train_stim_design[:, train_nonzero_mask]
+                    # For test predictions, we'll reconstruct full design later with zeros
+
+                elif zero_event_strategy == "nuisance":
+                    # Strategy 2: Move unpredictable events to test nuisance
+                    # Only fit on predictable events (present in both)
+                    train_stim_design_fit = train_stim_design[:, predictable_mask]
+
+                    # Move unpredictable events to test nuisance (project them out)
+                    if unpredictable_mask.any():
+                        # Extract unpredictable columns from test
+                        test_unpredictable = test_stim_design[:, unpredictable_mask]
+
+                        # Project out unpredictable variance from test data
+                        # This will happen in the batch loop
+
                 else:
                     raise ValueError(
-                        f"All stimulus columns are zero in train split {train_runs}! "
-                        f"Cannot fit model."
+                        f"Unknown zero_event_strategy: '{zero_event_strategy}'. "
+                        f"Must be 'zero' or 'nuisance'."
                     )
-
-                if test_nonzero_mask.any():
-                    test_stim_design = test_stim_design[:, test_nonzero_mask]
-                else:
-                    raise ValueError(
-                        f"All stimulus columns are zero in test split {test_runs}! "
-                        f"Cannot compute predictions."
-                    )
+            else:
+                # No missing events - simple case
+                train_stim_design_fit = train_stim_design
+                train_present_mask = torch.ones(train_stim_design.shape[1], dtype=torch.bool, device=device)
+                test_present_mask = torch.ones(test_stim_design.shape[1], dtype=torch.bool, device=device)
+                predictable_mask = train_present_mask
+                unpredictable_mask = torch.zeros(train_stim_design.shape[1], dtype=torch.bool, device=device)
 
             # 5. Fit OLS in batches (to avoid OOM when projecting ALL voxels at once)
             r2_split_chunk = torch.zeros(n_voxels_chunk, dtype=torch.float32, device='cpu')
@@ -617,14 +642,45 @@ def compute_xval_r2(
                 if test_P is not None:
                     test_data_batch = test_data_batch - (test_P @ test_data_batch.T).T
 
-                # OLS: beta = (X.T @ X)^-1 @ X.T @ Y (fast on GPU!)
-                # X: (n_train_timepoints, n_stim), Y: (n_train_timepoints, batch_size)
-                XtX = train_stim_design.T @ train_stim_design
-                XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
-                betas_batch = XtX_inv @ train_stim_design.T @ train_data_batch.T  # (n_stim, batch_size)
+                # Additional projection for 'nuisance' strategy: project out unpredictable events
+                if zero_event_strategy == "nuisance" and unpredictable_mask.any():
+                    test_unpredictable = test_stim_design[:, unpredictable_mask]
+                    # Compute projection matrix for unpredictable events
+                    XuXu = test_unpredictable.T @ test_unpredictable
+                    XuXu_inv = torch.linalg.inv(XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device))
+                    P_unpred = test_unpredictable @ XuXu_inv @ test_unpredictable.T
+                    # Project out
+                    test_data_batch = test_data_batch - (P_unpred @ test_data_batch.T).T
 
-                # 6. Predict test data (fast on GPU!)
-                predictions_batch = test_stim_design @ betas_batch
+                # OLS: beta = (X.T @ X)^-1 @ X.T @ Y (fast on GPU!)
+                # Fit only on present events (train_stim_design_fit)
+                XtX = train_stim_design_fit.T @ train_stim_design_fit
+                XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
+                betas_fit = XtX_inv @ train_stim_design_fit.T @ train_data_batch.T  # (n_fit_events, batch_size)
+
+                # 6. Predict test data (strategy-dependent!)
+                if zero_event_strategy == "zero":
+                    # Reconstruct full beta vector with zeros for missing events
+                    # betas_fit corresponds to train_present_mask events
+                    n_stim = len(stim_indices)
+                    betas_full = torch.zeros(n_stim, betas_fit.shape[1], device=device)
+                    betas_full[train_present_mask, :] = betas_fit
+
+                    # Predict using only test-present events (others contribute zero anyway)
+                    test_stim_present = test_stim_design[:, test_present_mask]
+                    betas_test_present = betas_full[test_present_mask, :]
+                    predictions_batch = test_stim_present @ betas_test_present
+
+                elif zero_event_strategy == "nuisance":
+                    # betas_fit corresponds to predictable_mask events
+                    # Use only predictable columns for prediction
+                    test_stim_predictable = test_stim_design[:, predictable_mask]
+                    predictions_batch = test_stim_predictable @ betas_fit
+
+                else:
+                    # Shouldn't reach here (validated above)
+                    raise ValueError(f"Invalid strategy: {zero_event_strategy}")
+
                 predictions_batch = predictions_batch.T  # (batch_size, n_test_timepoints)
 
                 # 7. Compute R² (fast on GPU!)

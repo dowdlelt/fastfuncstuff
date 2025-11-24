@@ -922,6 +922,7 @@ def analyze_with_cross_validation(
     cv_strategy: Union[float, int] = 0.5,
     n_perms: int = 100,
     metric: str = "cod",
+    zero_event_strategy: str = "zero",
     use_stimulus_only: bool = False,
     device: Optional[torch.device] = None,
     mask_file: Optional[Union[str, Path]] = None,
@@ -963,6 +964,12 @@ def analyze_with_cross_validation(
         Number of permutations for random split strategies (ignored for leave-N-out)
     metric : str, default='cod'
         R² metric to use: 'cod', 'corr', or 'corr2'
+    zero_event_strategy : str, default='zero'
+        How to handle STIMULUS events that are missing across train/test runs:
+        - 'zero': Use zero betas for missing events. Conservative approach.
+        - 'nuisance': Treat unpredictable events as nuisance in test set.
+        NOTE: This ONLY applies to stimulus events. Nuisance regressors are
+        ALWAYS projected out regardless of this setting.
     use_stimulus_only : bool, default=False
         If True, only include stimulus columns (exclude nuisance regressors)
         in the design matrix for fitting. Nuisance is still projected out.
@@ -1159,6 +1166,7 @@ def analyze_with_cross_validation(
         nuisance_indices=nuisance_indices,
         cv_splits=cv_splits,
         metric=metric,
+        zero_event_strategy=zero_event_strategy,
         device=device,
         batch_size=batch_size,
         data_chunk_size=data_chunk_size,
