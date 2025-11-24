@@ -371,7 +371,7 @@ def _compute_projection_matrix(
 
 def compute_xval_r2(
     data: torch.Tensor,
-    design_matrix: np.ndarray,
+    design_matrix: Union[np.ndarray, torch.Tensor],
     run_starts: List[int],
     stim_indices: List[int],
     nuisance_indices: List[int],
@@ -402,7 +402,7 @@ def compute_xval_r2(
     ----------
     data : torch.Tensor
         fMRI data (n_voxels, n_timepoints)
-    design_matrix : np.ndarray
+    design_matrix : np.ndarray or torch.Tensor
         Full design matrix (n_timepoints, n_regressors)
     run_starts : list of int
         Starting timepoint for each run
@@ -539,6 +539,65 @@ def compute_xval_r2(
             # 4. Extract stimulus design (already on device!)
             train_stim_design = train_design_clean[:, stim_indices]
             test_stim_design = test_design_clean[:, stim_indices]
+
+            # 4b. Detect zero columns in stimulus indices (run-specific regressors)
+            # These are stimulus columns that are zero in this particular split
+            train_stim_norms = train_stim_design.abs().sum(dim=0)
+            test_stim_norms = test_stim_design.abs().sum(dim=0)
+
+            train_zero_mask = train_stim_norms < 1e-10
+            test_zero_mask = test_stim_norms < 1e-10
+
+            if train_zero_mask.any() or test_zero_mask.any():
+                # We have zero columns in stimulus - this is problematic!
+                zero_cols_train = [i for i, is_zero in enumerate(train_zero_mask) if is_zero]
+                zero_cols_test = [i for i, is_zero in enumerate(test_zero_mask) if is_zero]
+
+                # Only warn once (on first split, first chunk)
+                if split_idx == 0 and chunk_idx == 0:
+                    import warnings
+                    msg = (
+                        f"\n{'='*80}\n"
+                        f"WARNING: Zero columns detected in STIMULUS indices!\n"
+                        f"{'='*80}\n"
+                        f"Train split has {len(zero_cols_train)} zero stimulus columns: {zero_cols_train}\n"
+                        f"Test split has {len(zero_cols_test)} zero stimulus columns: {zero_cols_test}\n"
+                        f"\n"
+                        f"This means you have RUN-SPECIFIC stimulus regressors (e.g., different\n"
+                        f"stimuli in different runs) that are zero when not in that run.\n"
+                        f"\n"
+                        f"These columns will be REMOVED from the design before fitting to avoid\n"
+                        f"singular matrices. However, this may not be the intended behavior.\n"
+                        f"\n"
+                        f"Recommendations:\n"
+                        f"  1. If these are truly nuisance (e.g., run-specific polynomials),\n"
+                        f"     they should be in nuisance_indices, not stim_indices\n"
+                        f"  2. If these are legitimate stimuli that vary by run, you may need\n"
+                        f"     special handling (future feature)\n"
+                        f"{'='*80}\n"
+                    )
+                    warnings.warn(msg, UserWarning, stacklevel=2)
+
+                # Remove zero columns from stimulus design to avoid singular matrices
+                # Keep track of which columns are valid
+                train_nonzero_mask = ~train_zero_mask
+                test_nonzero_mask = ~test_zero_mask
+
+                if train_nonzero_mask.any():
+                    train_stim_design = train_stim_design[:, train_nonzero_mask]
+                else:
+                    raise ValueError(
+                        f"All stimulus columns are zero in train split {train_runs}! "
+                        f"Cannot fit model."
+                    )
+
+                if test_nonzero_mask.any():
+                    test_stim_design = test_stim_design[:, test_nonzero_mask]
+                else:
+                    raise ValueError(
+                        f"All stimulus columns are zero in test split {test_runs}! "
+                        f"Cannot compute predictions."
+                    )
 
             # 5. Fit OLS in batches (to avoid OOM when projecting ALL voxels at once)
             r2_split_chunk = torch.zeros(n_voxels_chunk, dtype=torch.float32, device='cpu')

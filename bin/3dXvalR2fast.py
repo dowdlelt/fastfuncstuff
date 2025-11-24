@@ -279,9 +279,9 @@ def main():
         import nibabel as nib
 
         img = nib.load(input_files[0])
-        data_np = img.get_fdata()
+        data_np = img.get_fdata()  # type: ignore[attr-defined]
         volume_shape = data_np.shape[:3]
-        affine = img.affine
+        affine = img.affine  # type: ignore[attr-defined]
 
         # Reshape to (n_voxels, n_timepoints)
         data_np = data_np.reshape(-1, data_np.shape[-1])
@@ -289,15 +289,15 @@ def main():
     else:
         # Multiple runs - use existing loader
         data, actual_run_starts = load_and_concatenate_runs(
-            input_files, torch.device("cpu")
+            input_files, torch.device("cpu")  # type: ignore[arg-type]
         )
 
         # Get spatial info from first file
         import nibabel as nib
 
         img = nib.load(input_files[0])
-        volume_shape = img.shape[:3]
-        affine = img.affine
+        volume_shape = img.shape[:3]  # type: ignore[attr-defined]
+        affine = img.affine  # type: ignore[attr-defined]
 
     print(f"  • Shape: {data.shape} (voxels × timepoints)")
     print(f"  • Volume: {volume_shape}")

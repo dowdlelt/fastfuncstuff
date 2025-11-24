@@ -916,6 +916,276 @@ def analyze_from_design_matrix(
     return results, design_info
 
 
+def analyze_with_cross_validation(
+    fmri_data: Union[str, Path, List[Union[str, Path]], np.ndarray, torch.Tensor],
+    design_matrix_file: Union[str, Path],
+    cv_strategy: Union[float, int] = 0.5,
+    n_perms: int = 100,
+    metric: str = "cod",
+    use_stimulus_only: bool = False,
+    device: Optional[torch.device] = None,
+    mask_file: Optional[Union[str, Path]] = None,
+    mask_threshold: float = 0.0,
+    batch_size: Optional[int] = None,
+    data_chunk_size: Optional[int] = None,
+    test_n_voxels: Optional[int] = None,
+    verbose: bool = True,
+) -> Tuple[Dict[str, Union[torch.Tensor, int]], Dict]:
+    """
+    Cross-validated analysis pipeline: compute out-of-sample R²
+
+    This function provides a high-level interface for cross-validation,
+    following the same patterns as analyze_from_design_matrix(). It computes
+    cross-validated R² which provides a more reliable measure of model
+    generalization than in-sample R².
+
+    Main use cases:
+    - Testing denoising methods
+    - Model selection (e.g., comparing HRF choices)
+    - Evaluating preprocessing pipelines
+    - Detecting overfitting
+
+    Parameters
+    ----------
+    fmri_data : str, Path, list of str/Path, np.ndarray, or torch.Tensor
+        fMRI data as:
+        - Path to single concatenated NIfTI file (all runs in one file)
+        - List of paths to NIfTI files (one per run) - will be concatenated
+        - np.ndarray with shape (n_voxels, n_timepoints) or (x, y, z, n_timepoints)
+        - torch.Tensor with shape (n_voxels, n_timepoints) or (x, y, z, n_timepoints)
+    design_matrix_file : str or Path
+        Path to AFNI design matrix file (X.xmat.1D)
+    cv_strategy : float or int, default=0.5
+        Cross-validation strategy:
+        - float (0.0-1.0): Fraction for training (e.g., 0.5 = split halves)
+        - int: Number of runs to leave out (e.g., 1 = leave-one-run-out)
+    n_perms : int, default=100
+        Number of permutations for random split strategies (ignored for leave-N-out)
+    metric : str, default='cod'
+        R² metric to use: 'cod', 'corr', or 'corr2'
+    use_stimulus_only : bool, default=False
+        If True, only include stimulus columns (exclude nuisance regressors)
+        in the design matrix for fitting. Nuisance is still projected out.
+    device : torch.device, optional
+        Compute device (auto-detected if None)
+    mask_file : str or Path, optional
+        Path to mask file (NIfTI or AFNI)
+    mask_threshold : float, default=0.0
+        Threshold for mask (voxels > threshold are included)
+    batch_size : int, optional
+        Voxels per batch for projection (auto-detected if None)
+    data_chunk_size : int, optional
+        Number of voxels to load to GPU at once (auto-detected if None)
+    test_n_voxels : int, optional
+        If provided, only process first N voxels (for testing)
+    verbose : bool, default=True
+        Print progress information
+
+    Returns
+    -------
+    results : dict
+        Cross-validation results:
+        - 'r2_median': (n_voxels,) median R² across CV splits
+        - 'r2_std': (n_voxels,) standard deviation across splits
+        - 'r2_min': (n_voxels,) minimum R² across splits
+        - 'r2_max': (n_voxels,) maximum R² across splits
+        - 'r2_splits': (n_splits, n_voxels) R² for each split
+        - 'n_splits': int, number of CV splits performed
+    design_info : dict
+        Design matrix metadata (from extract_design_metadata)
+
+    Examples
+    --------
+    >>> # Single file with 4 runs
+    >>> results, design_info = analyze_with_cross_validation(
+    ...     fmri_data='all_runs.nii.gz',
+    ...     design_matrix_file='X.xmat.1D',
+    ...     cv_strategy=0.5,  # Split halves
+    ...     n_perms=10
+    ... )
+    >>> print(f"Mean xval R²: {results['r2_median'].mean():.3f}")
+
+    >>> # Multiple run files with leave-one-run-out
+    >>> results, design_info = analyze_with_cross_validation(
+    ...     fmri_data=['run01.nii.gz', 'run02.nii.gz', 'run03.nii.gz', 'run04.nii.gz'],
+    ...     design_matrix_file='X.xmat.1D',
+    ...     cv_strategy=1,  # Leave-one-run-out
+    ... )
+    >>> print(f"LORO R²: {results['r2_median'].mean():.3f}")
+
+    Notes
+    -----
+    - Requires at least 2 runs (checked automatically)
+    - Uses run-based splits (respects temporal structure)
+    - Nuisance regressors are projected out before computing R²
+    - Results are CPU tensors for easy saving/analysis
+    """
+    from .afni_io import extract_design_metadata, read_afni_design_matrix
+    from .xval import compute_xval_r2, generate_cv_splits
+
+    # Auto-detect device
+    if device is None:
+        device = get_device()
+
+    if verbose:
+        print("=" * 80)
+        print("CROSS-VALIDATED GLM ANALYSIS")
+        print("=" * 80)
+        print()
+
+    # 1. Load design matrix
+    if verbose:
+        print(f"📋 Loading design matrix: {design_matrix_file}")
+    design_matrix_path = Path(design_matrix_file)
+    if not design_matrix_path.exists():
+        raise FileNotFoundError(f"Design matrix not found: {design_matrix_path}")
+
+    design_info = read_afni_design_matrix(design_matrix_path)
+    design_matrix = design_info["matrix"]
+
+    # Extract metadata
+    run_starts = design_info["run_starts"]
+    n_runs = len(run_starts)
+
+    if n_runs < 2:
+        raise ValueError(
+            f"Cross-validation requires at least 2 runs, found {n_runs}. "
+            "Check the RunStart parameter in your design matrix."
+        )
+
+    if verbose:
+        print(f"  • Runs: {n_runs}")
+        print(f"  • Timepoints: {design_matrix.shape[0]}")
+        print(f"  • Regressors: {design_matrix.shape[1]}")
+        print()
+
+    # Get regressor indices
+    # For cross-validation, we ALWAYS separate stimulus from nuisance
+    # (nuisance = run-specific regressors like polynomials that are zero in other runs)
+    full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
+    nuisance_indices = [i for i in range(len(full_labels)) if i not in stim_indices]
+
+    if not stim_indices:
+        raise ValueError("No stimulus indices found in design matrix. Cannot perform cross-validation without stimulus regressors.")
+
+    # use_stimulus_only now controls which columns are used for fitting/prediction
+    # (but nuisance is ALWAYS projected out first)
+    if not use_stimulus_only:
+        # Include all regressors in the fit (both stimulus and nuisance columns)
+        # Nuisance will still be projected out first, then all columns used for prediction
+        stim_indices = list(range(design_matrix.shape[1]))
+
+    # 2. Generate CV splits
+    if verbose:
+        print(f"🔀 Generating CV splits (strategy={cv_strategy})...")
+    cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
+    if verbose:
+        print(f"  • Generated {len(cv_splits)} splits")
+        print()
+
+    # 3. Load fMRI data
+    if verbose:
+        print("📂 Loading fMRI data...")
+
+    # Handle different input types
+    if isinstance(fmri_data, list):
+        # Multiple run files
+        data, actual_run_starts = load_and_concatenate_runs(fmri_data, device=torch.device("cpu"))  # type: ignore[arg-type]
+        if verbose:
+            print(f"  • Loaded {len(fmri_data)} run files")
+    elif isinstance(fmri_data, (str, Path)):
+        # Single file
+        img = nib.load(str(fmri_data))
+        data_np = img.get_fdata()  # type: ignore[attr-defined]
+        data_np = data_np.reshape(-1, data_np.shape[-1])
+        data = torch.from_numpy(data_np).float()
+        if verbose:
+            print(f"  • Loaded single file: {fmri_data}")
+    elif isinstance(fmri_data, np.ndarray):
+        # NumPy array
+        if fmri_data.ndim == 4:
+            fmri_data = fmri_data.reshape(-1, fmri_data.shape[-1])
+        data = torch.from_numpy(fmri_data).float()
+    elif isinstance(fmri_data, torch.Tensor):
+        # Already a tensor
+        if fmri_data.ndim == 4:
+            fmri_data = fmri_data.reshape(-1, fmri_data.shape[-1])
+        data = fmri_data
+    else:
+        raise TypeError(f"Unsupported fmri_data type: {type(fmri_data)}")
+
+    if verbose:
+        print(f"  • Shape: {data.shape} (voxels × timepoints)")
+        print()
+
+    # Validate timepoints match design matrix
+    if data.shape[1] != design_matrix.shape[0]:
+        raise ValueError(
+            f"Timepoint mismatch: fMRI data has {data.shape[1]} timepoints, "
+            f"design matrix has {design_matrix.shape[0]}"
+        )
+
+    # 4. Apply mask if provided
+    mask_indices = None
+    if mask_file is not None:
+        if verbose:
+            print(f"🎭 Applying mask: {mask_file}")
+        mask_img = nib.load(str(mask_file))
+        mask_data = mask_img.get_fdata()  # type: ignore[attr-defined]
+        mask_bool = mask_data.flatten() > mask_threshold
+        mask_indices = np.where(mask_bool)[0]
+        data = data[mask_indices]
+        if verbose:
+            print(f"  • Masked voxels: {data.shape[0]:,} / {mask_bool.size:,}")
+            print()
+
+    # 5. Test mode: limit voxels
+    if test_n_voxels is not None:
+        data = data[:test_n_voxels]
+        if verbose:
+            print(f"⚠️  TEST MODE: Using first {test_n_voxels:,} voxels only")
+            print()
+
+    # 6. Compute cross-validated R²
+    if verbose:
+        print("🔬 Computing cross-validated R²...")
+        print()
+
+    xval_results = compute_xval_r2(
+        data=data,
+        design_matrix=design_matrix,
+        run_starts=run_starts,
+        stim_indices=stim_indices,
+        nuisance_indices=nuisance_indices,
+        cv_splits=cv_splits,
+        metric=metric,
+        device=device,
+        batch_size=batch_size,
+        data_chunk_size=data_chunk_size,
+        verbose=verbose,
+    )
+
+    # 7. Add metadata to results
+    xval_results["mask_indices"] = mask_indices
+    xval_results["cv_strategy"] = cv_strategy
+    xval_results["metric"] = metric
+
+    # Add to design_info for consistency with analyze_from_design_matrix
+    design_info["cv_strategy"] = cv_strategy
+    design_info["n_splits"] = xval_results["n_splits"]
+
+    if verbose:
+        print()
+        print("=" * 80)
+        print("✅ CROSS-VALIDATION COMPLETE")
+        print("=" * 80)
+        print(f"Mean xval R² ({metric}): {xval_results['r2_median'].mean():.4f}")
+        print(f"Std xval R² ({metric}): {xval_results['r2_std'].mean():.4f}")
+        print()
+
+    return xval_results, design_info
+
+
 def _load_fmri_data(
     fmri_data: Union[str, Path, np.ndarray, torch.Tensor], device: torch.device
 ) -> torch.Tensor:
