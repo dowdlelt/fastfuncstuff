@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Union, List, Optional, Tuple, Dict
 from scipy import special
 from scipy.stats import gamma as scipy_gamma
+import re
 
 
 def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
@@ -149,7 +150,9 @@ def parse_afni_timing_file(filepath: Union[str, Path]) -> List[np.ndarray]:
     Parse AFNI timing file format
 
     AFNI timing files have one row per run, with onset times in seconds
-    separated by spaces. Empty rows indicate no events in that run.
+    separated by spaces. Special cases:
+    - Empty row: no events in that run
+    - '* *' (two asterisks): condition not present in that run (AFNI convention)
 
     Parameters
     ----------
@@ -160,7 +163,7 @@ def parse_afni_timing_file(filepath: Union[str, Path]) -> List[np.ndarray]:
     -------
     onsets_by_run : list of np.ndarray
         List with one array per run, containing onset times in seconds
-        Empty runs return empty array
+        Empty runs (no events or '* *') return empty array
 
     Examples
     --------
@@ -173,6 +176,13 @@ def parse_afni_timing_file(filepath: Union[str, Path]) -> List[np.ndarray]:
     File with empty run:
         12 30 46
 
+        14 32 49
+
+    Returns: [array([12, 30, 46]), array([]), array([14, 32, 49])]
+
+    File with missing condition marker (* *):
+        12 30 46
+        * *
         14 32 49
 
     Returns: [array([12, 30, 46]), array([]), array([14, 32, 49])]
@@ -192,12 +202,18 @@ def parse_afni_timing_file(filepath: Union[str, Path]) -> List[np.ndarray]:
                 # Empty line = no events in this run
                 onsets_by_run.append(np.array([]))
             else:
-                # Parse onset times
-                try:
-                    onsets = np.array([float(x) for x in line.split()])
-                    onsets_by_run.append(onsets)
-                except ValueError as e:
-                    raise ValueError(f"Could not parse line '{line}' in {filepath}: {e}")
+                # Check for '* *' marker (condition not present)
+                tokens = line.split()
+                if len(tokens) == 2 and tokens[0] == '*' and tokens[1] == '*':
+                    # Condition not present in this run
+                    onsets_by_run.append(np.array([]))
+                else:
+                    # Parse onset times
+                    try:
+                        onsets = np.array([float(x) for x in tokens])
+                        onsets_by_run.append(onsets)
+                    except ValueError as e:
+                        raise ValueError(f"Could not parse line '{line}' in {filepath}: {e}")
 
     return onsets_by_run
 
@@ -264,15 +280,149 @@ def create_onset_regressors(
     return regressor
 
 
+def parse_hrf_model(hrf_string: str) -> Tuple[str, float]:
+    """
+    Parse AFNI HRF model string
+
+    Extracts model name and duration from strings like 'SPMG1(5)', 'BLOCK(10)', etc.
+
+    Parameters
+    ----------
+    hrf_string : str
+        AFNI HRF model specification, e.g.:
+        - 'SPMG1(5)': SPM canonical with 5s stimulus duration
+        - 'SPMG1(30)': SPM canonical with 30s stimulus duration
+        - 'BLOCK(10)': Boxcar with 10s duration
+        - 'TENT(0,15,6)': Tent function (not yet implemented)
+
+    Returns
+    -------
+    model_name : str
+        HRF model name (e.g., 'SPMG1', 'BLOCK')
+    duration : float
+        Stimulus duration in seconds
+
+    Raises
+    ------
+    ValueError
+        If HRF string format is invalid
+
+    Examples
+    --------
+    >>> parse_hrf_model('SPMG1(5)')
+    ('SPMG1', 5.0)
+    >>> parse_hrf_model('BLOCK(30)')
+    ('BLOCK', 30.0)
+    """
+    # Match pattern: MODEL(duration) or MODEL(p1,p2,p3)
+    match = re.match(r'^([A-Z]+)\(([^)]+)\)$', hrf_string)
+
+    if not match:
+        raise ValueError(f"Invalid HRF model string: '{hrf_string}'. Expected format like 'SPMG1(5)'")
+
+    model_name = match.group(1)
+    params_str = match.group(2)
+
+    # For now, we only support single-parameter models (SPMG1, BLOCK)
+    # TENT and others with multiple parameters will come later
+    try:
+        duration = float(params_str)
+    except ValueError:
+        raise ValueError(
+            f"Invalid duration in HRF model '{hrf_string}'. "
+            f"For now, only single-parameter models are supported (e.g., 'SPMG1(5)')"
+        )
+
+    return model_name, duration
+
+
+def load_and_pad_ortvec(
+    filepath: Union[str, Path],
+    run_number: int,
+    n_timepoints_per_run: List[int],
+) -> np.ndarray:
+    """
+    Load nuisance regressor file and zero-pad for specific run
+
+    This implements -padortvec functionality: loads a file containing
+    nuisance regressors for one run and pads with zeros for other runs.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to nuisance regressor file (e.g., motion parameters)
+        File should have n_timepoints rows and n_regressors columns
+    run_number : int
+        Which run this file belongs to (1-indexed, like AFNI)
+    n_timepoints_per_run : list of int
+        Number of timepoints in each run
+
+    Returns
+    -------
+    padded_regressors : np.ndarray
+        Zero-padded regressors, shape (total_timepoints, n_regressors)
+        Non-zero only for the specified run
+
+    Examples
+    --------
+    >>> # 3 runs: 100, 100, 100 TRs
+    >>> # Motion file has 100 rows (for run 2)
+    >>> padded = load_and_pad_ortvec('motion_r02.1D', run_number=2,
+    ...                                n_timepoints_per_run=[100, 100, 100])
+    >>> padded.shape
+    (300, 6)  # 6 motion parameters
+    >>> # Rows 0-99 are zero, rows 100-199 are from file, rows 200-299 are zero
+    """
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        raise FileNotFoundError(f"Ortvec file not found: {filepath}")
+
+    # Load regressor file
+    data = np.loadtxt(filepath)
+
+    # Ensure 2D
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+
+    n_rows, n_cols = data.shape
+
+    # Validate run number
+    if run_number < 1 or run_number > len(n_timepoints_per_run):
+        raise ValueError(
+            f"Invalid run_number={run_number}. "
+            f"Must be between 1 and {len(n_timepoints_per_run)}"
+        )
+
+    # Validate file length matches run length
+    expected_rows = n_timepoints_per_run[run_number - 1]  # Convert to 0-indexed
+    if n_rows != expected_rows:
+        raise ValueError(
+            f"Ortvec file {filepath} has {n_rows} rows, "
+            f"but run {run_number} has {expected_rows} timepoints"
+        )
+
+    # Create zero-padded array
+    total_timepoints = sum(n_timepoints_per_run)
+    padded = np.zeros((total_timepoints, n_cols))
+
+    # Insert data at correct position
+    run_start = sum(n_timepoints_per_run[:run_number - 1])
+    run_end = run_start + expected_rows
+    padded[run_start:run_end, :] = data
+
+    return padded
+
+
 def build_design_matrix(
     timing_files: List[Union[str, Path]],
     stim_labels: List[str],
     n_timepoints_per_run: List[int],
     tr: float,
     polort: int = 3,
-    hrf_model: str = 'SPMG1',
-    stim_durations: Optional[List[float]] = None,
-    motion_files: Optional[List[Union[str, Path]]] = None,
+    hrf_models: Optional[Union[str, List[str]]] = None,
+    padortvec_files: Optional[List[Tuple[Union[str, Path], str, int]]] = None,
+    ortvec_files: Optional[List[Tuple[Union[str, Path], str]]] = None,
     extra_regressors: Optional[List[np.ndarray]] = None,
     extra_regressor_labels: Optional[List[str]] = None,
 ) -> Tuple[np.ndarray, List[str], List[int], Dict]:
