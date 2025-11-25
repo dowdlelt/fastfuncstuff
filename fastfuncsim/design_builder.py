@@ -819,7 +819,7 @@ def build_design_matrix(
             for p in range(polort + 1):
                 design_matrix[run_start:run_end, col_idx] = polys[:, p]
                 polort_indices.append(col_idx)
-                regressor_labels.append(f'Run{run_idx+1}_Poly{p}')
+                regressor_labels.append(f'Run#{run_idx+1}Pol#{p}')
                 col_idx += 1
     else:
         # No polynomials, still need run_starts
@@ -1021,14 +1021,30 @@ def write_afni_xmat(
     tr = metadata['tr']
     stim_indices = metadata['stim_indices']
 
-    # Determine stim range
+    # Extract unique stimulus labels and their column ranges
+    stim_labels_list = []
+    stim_bots = []
+    stim_tops = []
+    seen_stim = set()
+
     if len(stim_indices) > 0:
-        stim_bot = min(stim_indices)
-        stim_top = max(stim_indices)
-        n_stim = len(set([regressor_labels[i].split('_')[0] for i in stim_indices]))
+        for idx in stim_indices:
+            label = regressor_labels[idx]
+            # Remove #N suffix to get base label (e.g., movie#0 -> movie)
+            base_label = label.split('#')[0] if '#' in label else label
+            if base_label not in seen_stim:
+                stim_labels_list.append(base_label)
+                seen_stim.add(base_label)
+
+        # For each unique stimulus, find its bottom and top column indices
+        for base_label in stim_labels_list:
+            cols = [i for i in stim_indices
+                   if regressor_labels[i].split('#')[0] == base_label]
+            stim_bots.append(min(cols))
+            stim_tops.append(max(cols))
+
+        n_stim = len(stim_labels_list)
     else:
-        stim_bot = 0
-        stim_top = 0
         n_stim = 0
 
     # Build column groups
@@ -1067,19 +1083,11 @@ def write_afni_xmat(
         # Stimulus info
         f.write(f'#  Nstim = "{n_stim}"\n')
         if n_stim > 0:
-            f.write(f'#  StimBots = "{stim_bot}"\n')
-            f.write(f'#  StimTops = "{stim_top}"\n')
-
-            # Extract unique stimulus labels
-            stim_labels_list = []
-            seen_stim = set()
-            for idx in stim_indices:
-                label = regressor_labels[idx]
-                # Remove #N suffix to get base label (e.g., movie#0 -> movie)
-                base_label = label.split('#')[0] if '#' in label else label
-                if base_label not in seen_stim:
-                    stim_labels_list.append(base_label)
-                    seen_stim.add(base_label)
+            # StimBots and StimTops are comma-separated lists of bottom/top columns for each stimulus
+            stim_bots_str = ",".join(map(str, stim_bots))
+            stim_tops_str = ",".join(map(str, stim_tops))
+            f.write(f'#  StimBots = "{stim_bots_str}"\n')
+            f.write(f'#  StimTops = "{stim_tops_str}"\n')
 
             stim_labels_str = " ; ".join(stim_labels_list)
             f.write(f'#  StimLabels = "{stim_labels_str}"\n')

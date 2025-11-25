@@ -189,8 +189,8 @@ def test_build_design_matrix_basic():
 
     # Check labels - polynomials come first in AFNI
     assert len(labels) == expected_cols
-    assert labels[0] == 'Run1_Poly0'
-    assert labels[7] == 'Run2_Poly3'
+    assert labels[0] == 'Run#1Pol#0'
+    assert labels[7] == 'Run#2Pol#3'
     assert labels[8] == 'movie#0'  # Standard mode: label#0
     assert labels[9] == 'prompt#0'  # Standard mode: label#0
 
@@ -330,7 +330,7 @@ def test_write_afni_xmat():
         assert 'ni_type = "10*double"' in content, "Wrong ni_type"
         assert 'ni_dimen = "720"' in content, "Wrong ni_dimen"
         assert 'ColumnLabels' in content, "Missing ColumnLabels"
-        assert 'Run#1Pol#0' in content or 'Run1_Poly0' in content, "Missing polynomial labels"
+        assert 'Run#1Pol#0' in content, "Missing polynomial labels"
         assert 'movie' in content, "Missing movie label"
         assert 'prompt' in content, "Missing prompt label"
         assert 'RunStart = "0,360"' in content, "Wrong RunStart"
@@ -390,8 +390,8 @@ def test_im_mode():
         assert design.shape == (100, 9), f"Expected (100, 9), got {design.shape}"
 
         # Check labels
-        assert labels[0] == 'Run1_Poly0'
-        assert labels[3] == 'Run2_Poly1'
+        assert labels[0] == 'Run#1Pol#0'
+        assert labels[3] == 'Run#2Pol#1'
         assert labels[4] == 'condition#0'  # IM mode: label#0, label#1, ...
         assert labels[5] == 'condition#1'
         assert labels[6] == 'condition#2'
