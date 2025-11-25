@@ -563,6 +563,9 @@ def compute_xval_r2(
             # Events that are ONLY in train (not in test) - we CAN'T predict them
             unpredictable_mask = train_present_mask & test_zero_mask
 
+            # Events that are ONLY in test (not in train) - we DIDN'T learn them
+            test_only_mask = train_zero_mask & test_present_mask
+
             # Events that are in BOTH train and test - we CAN predict them
             predictable_mask = train_present_mask & test_present_mask
 
@@ -571,16 +574,20 @@ def compute_xval_r2(
                 zero_cols_train = [i for i, is_zero in enumerate(train_zero_mask) if is_zero]
                 zero_cols_test = [i for i, is_zero in enumerate(test_zero_mask) if is_zero]
                 unpredictable_cols = [i for i, unpred in enumerate(unpredictable_mask) if unpred]
+                test_only_cols = [i for i, test_only in enumerate(test_only_mask) if test_only]
 
                 # Only warn/report once (on first split, first chunk)
                 if split_idx == 0 and chunk_idx == 0 and verbose:
                     print(f"\n{'='*80}")
                     print(f"INFO: Handling missing events across train/test splits")
                     print(f"{'='*80}")
-                    print(f"Train-only events (zero in test): {len(zero_cols_test)} - {zero_cols_test}")
-                    print(f"Test-only events (zero in train): {len(zero_cols_train)} - {zero_cols_train}")
-                    print(f"Unpredictable events (can't predict): {len(unpredictable_cols)} - {unpredictable_cols}")
+                    print(f"Train-only events (in train, zero in test): {len(unpredictable_cols)} - {unpredictable_cols}")
+                    print(f"Test-only events (zero in train, in test): {len(test_only_cols)} - {test_only_cols}")
+                    print(f"Predictable events (in both): {predictable_mask.sum().item()}")
                     print(f"Strategy: '{zero_event_strategy}'")
+                    if zero_event_strategy == "nuisance":
+                        events_to_proj = unpredictable_cols + test_only_cols
+                        print(f"  → Will project out {len(events_to_proj)} events from test: {events_to_proj}")
                     print(f"{'='*80}\n")
 
                 # Check we have at least some predictable events
@@ -643,14 +650,19 @@ def compute_xval_r2(
                     test_data_batch = test_data_batch - (test_P @ test_data_batch.T).T
 
                 # Additional projection for 'nuisance' strategy: project out unpredictable events
-                if zero_event_strategy == "nuisance" and unpredictable_mask.any():
-                    test_unpredictable = test_stim_design[:, unpredictable_mask]
-                    # Compute projection matrix for unpredictable events
-                    XuXu = test_unpredictable.T @ test_unpredictable
-                    XuXu_inv = torch.linalg.inv(XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device))
-                    P_unpred = test_unpredictable @ XuXu_inv @ test_unpredictable.T
-                    # Project out
-                    test_data_batch = test_data_batch - (P_unpred @ test_data_batch.T).T
+                if zero_event_strategy == "nuisance":
+                    # Project out events we learned but that aren't in test (unpredictable_mask)
+                    # AND events in test that we didn't learn (test_only_mask)
+                    events_to_project = unpredictable_mask | test_only_mask
+
+                    if events_to_project.any():
+                        test_to_project = test_stim_design[:, events_to_project]
+                        # Compute projection matrix
+                        XuXu = test_to_project.T @ test_to_project
+                        XuXu_inv = torch.linalg.inv(XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device))
+                        P_unpred = test_to_project @ XuXu_inv @ test_to_project.T
+                        # Project out
+                        test_data_batch = test_data_batch - (P_unpred @ test_data_batch.T).T
 
                 # OLS: beta = (X.T @ X)^-1 @ X.T @ Y (fast on GPU!)
                 # Fit only on present events (train_stim_design_fit)
