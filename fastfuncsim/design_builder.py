@@ -397,14 +397,27 @@ def glt_weights_to_vector(
     contrast_vector = np.zeros(n_regressors)
 
     for label, weight in weights.items():
-        try:
+        # Try exact match first
+        if label in regressor_labels:
             idx = regressor_labels.index(label)
             contrast_vector[idx] = weight
-        except ValueError:
-            raise ValueError(
-                f"GLT label '{label}' not found in regressor labels. "
-                f"Available labels: {regressor_labels}"
-            )
+        else:
+            # Try matching base label (e.g., 'movie' matches 'movie#0')
+            # For standard mode, this finds the single column
+            # For IM mode, this would sum across all events (movie#0, movie#1, ...)
+            matches = [i for i, l in enumerate(regressor_labels)
+                      if l.split('#')[0] == label and '#' in l]
+
+            if matches:
+                # Standard mode: single match (movie#0)
+                # IM mode: multiple matches (movie#0, movie#1, ...) - weight each equally
+                for idx in matches:
+                    contrast_vector[idx] = weight
+            else:
+                raise ValueError(
+                    f"GLT label '{label}' not found in regressor labels. "
+                    f"Available labels: {regressor_labels}"
+                )
 
     return contrast_vector
 
@@ -874,7 +887,8 @@ def build_design_matrix(
                     # Add to design matrix
                     design_matrix[:, col_idx] = full_regressor
                     stim_indices.append(col_idx)
-                    regressor_labels.append(f'{stim_labels[stim_idx]}_{event_idx}')
+                    # IM mode: label#0, label#1, label#2, etc.
+                    regressor_labels.append(f'{stim_labels[stim_idx]}#{event_idx}')
                     col_idx += 1
                     event_idx += 1
 
@@ -903,7 +917,8 @@ def build_design_matrix(
             # Add to design matrix
             design_matrix[:, col_idx] = stim_regressor
             stim_indices.append(col_idx)
-            regressor_labels.append(stim_labels[stim_idx])
+            # Standard mode: label#0 (only one column per stimulus)
+            regressor_labels.append(f'{stim_labels[stim_idx]}#0')
             col_idx += 1
 
     # 4. Add extra regressors (if any)
@@ -1060,8 +1075,8 @@ def write_afni_xmat(
             seen_stim = set()
             for idx in stim_indices:
                 label = regressor_labels[idx]
-                # Remove _N suffix for IM mode
-                base_label = label.split('_')[0] if '_' in label and label.split('_')[-1].isdigit() else label
+                # Remove #N suffix to get base label (e.g., movie#0 -> movie)
+                base_label = label.split('#')[0] if '#' in label else label
                 if base_label not in seen_stim:
                     stim_labels_list.append(base_label)
                     seen_stim.add(base_label)
@@ -1121,7 +1136,8 @@ def write_afni_xmat(
             stim_info = {}
             for idx in stim_indices:
                 label = regressor_labels[idx]
-                base_label = label.split('_')[0] if '_' in label and label.split('_')[-1].isdigit() else label
+                # Remove #N suffix to get base label (e.g., movie#0 -> movie)
+                base_label = label.split('#')[0] if '#' in label else label
 
                 if base_label not in stim_info:
                     # Find which stimulus this is
@@ -1137,8 +1153,9 @@ def write_afni_xmat(
                         duration = metadata.get('stim_durations', [])[stim_idx_in_list] if stim_idx_in_list < len(metadata.get('stim_durations', [])) else 0.0
 
                         # Find column range for this stimulus
+                        # Match labels that are exactly base_label#N
                         cols_for_stim = [i for i, l in enumerate(regressor_labels)
-                                        if l == base_label or l.startswith(f"{base_label}_")]
+                                        if l.split('#')[0] == base_label and '#' in l]
 
                         stim_info[base_label] = {
                             'idx': stim_idx_in_list + 1,
@@ -1154,9 +1171,9 @@ def write_afni_xmat(
                     idx = info['idx']
 
                     # Determine stim option (IM vs regular)
-                    is_im = len(info['cols']) > 1 and all(
-                        regressor_labels[c].split('_')[-1].isdigit() for c in info['cols']
-                    )
+                    # IM mode: multiple columns (label#0, label#1, ...)
+                    # Standard mode: single column (label#0)
+                    is_im = len(info['cols']) > 1
                     option = "-stim_times_IM" if is_im else "-stim_times"
 
                     f.write(f'#  BasisOption_{idx:06d} = "{option}"\n')

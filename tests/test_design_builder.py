@@ -191,8 +191,8 @@ def test_build_design_matrix_basic():
     assert len(labels) == expected_cols
     assert labels[0] == 'Run1_Poly0'
     assert labels[7] == 'Run2_Poly3'
-    assert labels[8] == 'movie'
-    assert labels[9] == 'prompt'
+    assert labels[8] == 'movie#0'  # Standard mode: label#0
+    assert labels[9] == 'prompt#0'  # Standard mode: label#0
 
     # Check run starts
     assert run_starts == [0, 360]
@@ -392,11 +392,11 @@ def test_im_mode():
         # Check labels
         assert labels[0] == 'Run1_Poly0'
         assert labels[3] == 'Run2_Poly1'
-        assert labels[4] == 'condition_0'
-        assert labels[5] == 'condition_1'
-        assert labels[6] == 'condition_2'
-        assert labels[7] == 'condition_3'
-        assert labels[8] == 'condition_4'
+        assert labels[4] == 'condition#0'  # IM mode: label#0, label#1, ...
+        assert labels[5] == 'condition#1'
+        assert labels[6] == 'condition#2'
+        assert labels[7] == 'condition#3'
+        assert labels[8] == 'condition#4'
 
         # Check metadata
         assert len(metadata['stim_indices']) == 5, "Should have 5 IM columns"

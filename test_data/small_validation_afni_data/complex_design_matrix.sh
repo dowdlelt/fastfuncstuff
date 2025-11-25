@@ -1,0 +1,120 @@
+
+   3dDeconvolve -overwrite \
+   -input pb*scale*HEAD                        \
+   -polort 3 -float                                                       \
+   -noFDR                                                                 \
+   -jobs 6                                                               \
+   -ortvec mot_demean.r01.1D motion_demean_r01  \
+   -ortvec mot_demean.r02.1D motion_demean_r02  \
+    -ortvec mot_demean.r03.1D motion_demean_r03  \
+    -ortvec mot_demean.r04.1D motion_demean_r04  \
+    -ortvec mot_demean.r05.1D motion_demean_r05  \
+    -ortvec mot_demean.r06.1D motion_demean_r06  \
+    -ortvec mot_demean.r07.1D motion_demean_r07  \
+    -ortvec mot_demean.r08.1D motion_demean_r08  \
+    -ortvec mot_demean.r09.1D motion_demean_r09  \
+    -ortvec mot_demean.r10.1D motion_demean_r10  \
+    -ortvec mot_demean.r11.1D motion_demean_r11  \
+    -ortvec mot_demean.r12.1D motion_demean_r12  \
+   -num_stimts 48                                                          \
+    -stim_times 1 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.acva-acvk_instruct.txt 'SPMG1(5)'  \
+    -stim_label 1 acva-acvk_instruct \
+    -stim_times 2 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.affect_instruct.txt 'SPMG1(5)'  \
+    -stim_label 2 affect_instruct \
+    -stim_times 3 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.audnarr_instruct.txt 'SPMG1(5)'  \
+    -stim_label 3 audnarr_instruct \
+    -stim_times 4 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.degpass_instruct.txt 'SPMG1(5)'  \
+    -stim_label 4 degpass_instruct \
+    -stim_times 5 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.dmgrd_instruct.txt 'SPMG1(5)'  \
+    -stim_label 5 dmgrd_instruct \
+    -stim_times 6 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.faux_pas_instruct.txt 'SPMG1(5)'  \
+    -stim_label 6 faux_pas_instruct \
+    -stim_times 7 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.fingseq_instruct.txt 'SPMG1(5)'  \
+    -stim_label 7 fingseq_instruct \
+    -stim_times 8 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.flexexten_instruct.txt 'SPMG1(5)'  \
+    -stim_label 8 flexexten_instruct \
+    -stim_times 9 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.intpass_instruct.txt 'SPMG1(5)'  \
+    -stim_label 9 intpass_instruct \
+    -stim_times 10 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.mov_instruct.txt 'SPMG1(5)'  \
+    -stim_label 10 mov_instruct \
+    -stim_times 11 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.nbko_instruct.txt 'SPMG1(5)'  \
+    -stim_label 11 nbko_instruct \
+    -stim_times 12 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.nwdread_instruct.txt 'SPMG1(5)'  \
+    -stim_label 12 nwdread_instruct \
+    -stim_times 13 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.odbal_instruct.txt 'SPMG1(5)'  \
+    -stim_label 13 odbal_instruct \
+    -stim_times 14 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.picture_sequence_instruct.txt 'SPMG1(5)'  \
+    -stim_label 14 picture_sequence_instruct \
+    -stim_times 15 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.pomg_instruct.txt 'SPMG1(5)'  \
+    -stim_label 15 pomg_instruct \
+    -stim_times 16 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.rmet_instruct.txt 'SPMG1(5)'  \
+    -stim_label 16 rmet_instruct \
+    -stim_times 17 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.sempred_instruct.txt 'SPMG1(5)'  \
+    -stim_label 17 sempred_instruct \
+    -stim_times 18 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.senread_instruct.txt 'SPMG1(5)'  \
+    -stim_label 18 senread_instruct \
+    -stim_times 19 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.spatialnav_instruct.txt 'SPMG1(5)'  \
+    -stim_label 19 spatialnav_instruct \
+    -stim_times 20 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.story_sequence_instruct.txt 'SPMG1(5)'  \
+    -stim_label 20 story_sequence_instruct \
+    -stim_times 21 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.tom_instruct.txt 'SPMG1(5)'  \
+    -stim_label 21 tom_instruct \
+    -stim_times 22 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.tongue_instruct.txt 'SPMG1(5)'  \
+    -stim_label 22 tongue_instruct \
+    -stim_times 23 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.visrchsml_instruct.txt 'SPMG1(5)'  \
+    -stim_label 23 visrchsml_instruct \
+    -stim_times 24 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.vrbgn-wrdrd_instruct.txt 'SPMG1(5)' \
+    -stim_label 24 vrbgn-wrdrd_instruct \
+    -stim_times 25 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.acva-acvk.txt 'SPMG1(30)' \
+    -stim_label 25 acva-acvk \
+    -stim_times 26 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.affect.txt 'SPMG1(30)' \
+    -stim_label 26 affect \
+    -stim_times 27 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.audnarr.txt 'SPMG1(30)' \
+    -stim_label 27 audnarr \
+    -stim_times 28 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.degpass.txt 'SPMG1(30)' \
+    -stim_label 28 degpass \
+    -stim_times 29 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.dmgrd.txt 'SPMG1(30)' \
+    -stim_label 29 dmgrd \
+    -stim_times 30 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.faux_pas.txt 'SPMG1(30)' \
+    -stim_label 30 faux_pas \
+    -stim_times 31 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.fingseq.txt 'SPMG1(30)' \
+    -stim_label 31 fingseq \
+    -stim_times 32 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.flexexten.txt 'SPMG1(30)' \
+    -stim_label 32 flexexten \
+    -stim_times 33 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.intpass.txt 'SPMG1(30)' \
+    -stim_label 33 intpass \
+    -stim_times 34 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.mov.txt 'SPMG1(30)' \
+    -stim_label 34 mov \
+    -stim_times 35 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.nbko.txt 'SPMG1(30)' \
+    -stim_label 35 nbko \
+    -stim_times 36 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.nwdread.txt 'SPMG1(30)' \
+    -stim_label 36 nwdread \
+    -stim_times 37 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.odbal.txt 'SPMG1(30)' \
+    -stim_label 37 odbal \
+    -stim_times 38 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.picture_sequence.txt 'SPMG1(30)' \
+    -stim_label 38 picture_sequence \
+    -stim_times 39 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.pomg.txt 'SPMG1(30)' \
+    -stim_label 39 pomg \
+    -stim_times 40 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.rmet.txt 'SPMG1(30)' \
+    -stim_label 40 rmet \
+    -stim_times 41 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.sempred.txt 'SPMG1(30)' \
+    -stim_label 41 sempred \
+    -stim_times 42 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.senread.txt 'SPMG1(30)' \
+    -stim_label 42 senread \
+    -stim_times 43 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.spatialnav.txt 'SPMG1(30)' \
+    -stim_label 43 spatialnav \
+    -stim_times 44 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.story_sequence.txt 'SPMG1(30)' \
+    -stim_label 44 story_sequence \
+    -stim_times 45 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.tom.txt 'SPMG1(30)' \
+    -stim_label 45 tom \
+    -stim_times 46 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.tongue.txt 'SPMG1(30)' \
+    -stim_label 46 tongue \
+    -stim_times 47 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.visrchsml.txt 'SPMG1(30)' \
+    -stim_label 47 visrchsml \
+    -stim_times 48 ~/Dropbox/Tasks/MultiTaskBattery/experiments/test_experiment/data/subject-00/ses-02_bids_events_simple/times.vrbgn-wrdrd.txt 'SPMG1(30)' \
+    -stim_label 48 vrbgn-wrdrd \
+   -tout -fout -x1D simple_X.xmat.1D -xjpeg simple_X.jpg                                \
+   -jobs 6 \
+   -bucket simple_stats.sub-pilot01_mdtb 
+
+
