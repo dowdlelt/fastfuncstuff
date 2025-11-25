@@ -1,6 +1,45 @@
 """
-AFNI file I/O utilities
-Read AFNI onset timing files and design matrices (X.xmat.1D format)
+AFNI file I/O utilities for reading and processing AFNI design matrices
+
+This module provides utilities for:
+- Reading AFNI onset timing files
+- Reading AFNI design matrices (X.xmat.1D format)
+- Working with design matrix metadata (ColumnGroups, RunStart, GoodList)
+- Selecting regressors by type (stimulus, baseline, polynomial)
+- Handling censored timepoints
+
+Key Functions
+-------------
+read_afni_design_matrix:
+    Read AFNI design matrix with full metadata parsing
+
+get_regressor_groups:
+    Organize regressors by ColumnGroups (polort, baseline, stimuli)
+
+select_regressors_by_group:
+    Extract specific regressor types from design matrix
+
+get_censored_mask:
+    Get boolean mask of censored timepoints from GoodList
+
+select_uncensored_timepoints:
+    Filter design matrix and data to uncensored timepoints
+
+Examples
+--------
+# Read design matrix and inspect metadata
+>>> design = read_afni_design_matrix('X.xmat.1D')
+>>> print(f"TR: {design['tr']}s")
+>>> print(f"Runs: {len(design['run_starts'])} runs")
+>>> print(f"Stimuli: {design['stim_labels']}")
+
+# Select only stimulus regressors
+>>> groups = get_regressor_groups(design)
+>>> X_stim = design['matrix'][:, groups['all_stimuli']]
+
+# Handle censored data
+>>> censored = get_censored_mask(design)
+>>> X_clean, Y_clean = select_uncensored_timepoints(design, fmri_data)
 """
 
 from pathlib import Path
@@ -241,7 +280,8 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
         - 'n_regressors': int - number of regressors
         - 'column_labels': list of str - regressor names
         - 'column_groups': list of int - group assignments for regressors
-        - 'run_starts': list of int - starting indices for each run
+        - 'run_starts': list of int - starting indices for each run (for ARMA modeling)
+        - 'good_list': list of int - uncensored TR indices (for REML with censoring)
         - 'stim_labels': list of str - stimulus/condition names
         - 'stim_bots': list of int - bottom indices for stimulus columns
         - 'stim_tops': list of int - top indices for stimulus columns
@@ -270,6 +310,7 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
         "column_groups": None,
         "tr": None,
         "run_starts": None,
+        "good_list": None,  # List of uncensored TR indices (for REML with censoring)
         "stim_labels": None,
         "stim_bots": None,
         "stim_tops": None,
@@ -329,6 +370,18 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
 
                     elif key == "RunStart":
                         metadata["run_starts"] = [int(x) for x in value.split(",")]
+
+                    elif key == "GoodList":
+                        # Parse formats: "0..719", "0..100,102..719", etc.
+                        # This lists TR indices that were NOT censored
+                        indices = []
+                        for part in value.split(","):
+                            if ".." in part:
+                                start, end = map(int, part.split(".."))
+                                indices.extend(range(start, end + 1))
+                            else:
+                                indices.append(int(part))
+                        metadata["good_list"] = indices
 
                     elif key == "StimLabels":
                         metadata["stim_labels"] = [x.strip() for x in value.split(";")]
@@ -916,6 +969,101 @@ def select_regressors_by_group(
         selected_cols = [c for c in selected_cols if c not in exclude_cols]
 
     return matrix[:, selected_cols]
+
+
+def get_censored_mask(design_info: Dict) -> np.ndarray:
+    """
+    Get boolean mask indicating which timepoints were censored
+
+    Uses the GoodList attribute to determine which TRs were kept vs. censored.
+
+    Parameters
+    ----------
+    design_info : dict
+        Design matrix info from read_afni_design_matrix()
+
+    Returns
+    -------
+    censored_mask : np.ndarray of bool, shape (n_timepoints,)
+        True for censored timepoints, False for uncensored (good) timepoints
+
+    Notes
+    -----
+    AFNI's GoodList contains indices of timepoints that were NOT censored.
+    This is used by 3dREMLfit to properly handle temporal autocorrelation
+    when some timepoints have been removed due to motion or other artifacts.
+
+    Examples
+    --------
+    >>> design = read_afni_design_matrix('X.xmat.1D')
+    >>> censored = get_censored_mask(design)
+    >>> n_censored = censored.sum()
+    >>> print(f"Censored {n_censored} of {len(censored)} timepoints")
+
+    >>> # Extract only uncensored data
+    >>> data_uncensored = data[~censored]
+    >>> design_uncensored = design['matrix'][~censored]
+    """
+    good_list = design_info.get('good_list')
+    n_timepoints = design_info.get('n_timepoints')
+
+    if good_list is None:
+        raise ValueError("Design matrix does not have GoodList information")
+
+    if n_timepoints is None:
+        raise ValueError("Design matrix does not have n_timepoints information")
+
+    # Create mask: True = censored, False = good
+    censored_mask = np.ones(n_timepoints, dtype=bool)
+    censored_mask[good_list] = False
+
+    return censored_mask
+
+
+def select_uncensored_timepoints(
+    design_info: Dict,
+    data: Optional[np.ndarray] = None,
+) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    """
+    Select only uncensored timepoints from design matrix and/or data
+
+    Parameters
+    ----------
+    design_info : dict
+        Design matrix info from read_afni_design_matrix()
+    data : np.ndarray, optional
+        fMRI data array with time as first dimension
+        If provided, will also filter data to uncensored timepoints
+
+    Returns
+    -------
+    design_uncensored : np.ndarray
+        Design matrix with only uncensored timepoints
+    data_uncensored : np.ndarray (only if data provided)
+        Data array with only uncensored timepoints
+
+    Examples
+    --------
+    >>> design = read_afni_design_matrix('X.xmat.1D')
+    >>> # Filter design matrix only
+    >>> X_uncensored = select_uncensored_timepoints(design)
+    >>>
+    >>> # Filter both design and data
+    >>> X_uncensored, Y_uncensored = select_uncensored_timepoints(design, fmri_data)
+    """
+    good_list = design_info.get('good_list')
+
+    if good_list is None:
+        raise ValueError("Design matrix does not have GoodList information")
+
+    matrix = design_info['matrix']
+    design_uncensored = matrix[good_list, :]
+
+    if data is not None:
+        data_uncensored = data[good_list]
+        return design_uncensored, data_uncensored
+
+    return design_uncensored
 
 
 def replace_afni_extension(filepath: str, new_extension: str = ".nii.gz") -> str:

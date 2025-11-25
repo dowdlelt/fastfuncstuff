@@ -461,6 +461,57 @@ def test_glt_parsing():
     print("\n✓ GLT parsing tests passed!")
 
 
+def test_goodlist_utilities():
+    """Test GoodList parsing and censoring utilities"""
+    from fastfuncsim.afni_io import (
+        read_afni_design_matrix,
+        get_censored_mask,
+        select_uncensored_timepoints,
+    )
+
+    print("\n=== Testing GoodList utilities ===")
+
+    # Load AFNI design matrix
+    xmat_path = TEST_DATA_DIR / "X.xmat.1D"
+    design = read_afni_design_matrix(xmat_path)
+
+    # Check that GoodList was parsed
+    assert design['good_list'] is not None, "GoodList should be parsed"
+    assert len(design['good_list']) == 720, "Should have 720 uncensored timepoints"
+
+    # Test censored mask (no censoring in this dataset)
+    censored = get_censored_mask(design)
+    assert censored.shape == (720,), "Censored mask wrong shape"
+    assert censored.sum() == 0, "Should have no censored timepoints"
+
+    # Test selecting uncensored timepoints
+    X_unc = select_uncensored_timepoints(design)
+    assert X_unc.shape == design['matrix'].shape, "No censoring, shapes should match"
+
+    # Test with data
+    fake_data = np.random.randn(720, 100)
+    X_unc, Y_unc = select_uncensored_timepoints(design, fake_data)
+    assert X_unc.shape == (720, 10), "Design matrix shape wrong"
+    assert Y_unc.shape == (720, 100), "Data shape wrong"
+
+    # Simulate censored data
+    design_censored = design.copy()
+    design_censored['good_list'] = list(range(0, 100)) + list(range(102, 720))  # Remove TRs 100-101
+    design_censored['n_timepoints'] = 720
+
+    censored = get_censored_mask(design_censored)
+    assert censored.sum() == 2, "Should have 2 censored timepoints"
+    assert list(np.where(censored)[0]) == [100, 101], "Wrong censored indices"
+
+    X_unc = select_uncensored_timepoints(design_censored)
+    assert X_unc.shape == (718, 10), "Should have 718 uncensored timepoints"
+
+    print("  ✓ GoodList parsed correctly")
+    print("  ✓ Censored mask works")
+    print("  ✓ Uncensored selection works")
+    print("\n✓ GoodList utilities tests passed!")
+
+
 if __name__ == "__main__":
     # Run tests
     test_spm_canonical_hrf()
@@ -472,5 +523,6 @@ if __name__ == "__main__":
     test_write_afni_xmat()
     test_glt_parsing()
     test_im_mode()
+    test_goodlist_utilities()
 
     print("\n✓ All tests passed!")
