@@ -437,6 +437,8 @@ def build_design_matrix(
     ----------
     timing_files : list of str/Path
         Paths to AFNI timing files, one per stimulus condition
+        Each file has one row per run with onset times in seconds
+        Use '* *' to indicate condition not present in a run
     stim_labels : list of str
         Labels for each stimulus condition (must match timing_files length)
     n_timepoints_per_run : list of int
@@ -446,53 +448,75 @@ def build_design_matrix(
     polort : int, default=3
         Polynomial order for drift modeling (AFNI -polort)
         Set to -1 for no polynomials
-    hrf_model : str, default='SPMG1'
-        HRF model to use:
-        - 'SPMG1': SPM canonical HRF (default)
-        - 'BLOCK': Boxcar (no HRF convolution)
-        - 'TENT': Tent function (not yet implemented)
-    stim_durations : list of float, optional
-        Duration in seconds for each stimulus type
-        If None, uses impulse (duration=0) for all
-    motion_files : list of str/Path, optional
-        Motion parameter files, one per run (AFNI format: 6 columns)
+    hrf_models : str or list of str, optional
+        HRF model(s) with duration, e.g., 'SPMG1(5)', 'BLOCK(30)'
+        Can be single string (applied to all) or list (one per stimulus)
+        Supported models: SPMG1 (SPM canonical), BLOCK (boxcar)
+        Default: 'SPMG1(0)' (impulse with HRF)
+    padortvec_files : list of tuple, optional
+        List of (filepath, label, run_number) for per-run nuisance regressors
+        Files are zero-padded to span all runs
+        Example: [('motion_r01.1D', 'motion_r01', 1), ...]
+    ortvec_files : list of tuple, optional
+        List of (filepath, label) for full-length nuisance regressors
+        Files must have total_timepoints rows
+        Example: [('physio.1D', 'physio')]
     extra_regressors : list of np.ndarray, optional
-        Additional regressors to include (e.g., physio, custom nuisance)
-        Each array should be shape (total_timepoints,) or (total_timepoints, n_cols)
+        Additional regressors to include
+        Each array: (total_timepoints,) or (total_timepoints, n_cols)
     extra_regressor_labels : list of str, optional
-        Labels for extra regressors (must match extra_regressors length)
+        Labels for extra regressors
 
     Returns
     -------
     design_matrix : np.ndarray
         Complete design matrix, shape (total_timepoints, n_regressors)
-        Concatenated across runs
+        Column order: polynomials, padortvec, ortvec, stimuli, extra
     regressor_labels : list of str
         Labels for each column in design matrix
     run_starts : list of int
         Starting indices for each run (for run-based CV)
     metadata : dict
-        Additional metadata about the design:
-        - 'stim_indices': Indices of stimulus columns
-        - 'nuisance_indices': Indices of nuisance columns
-        - 'polort_indices': Indices of polynomial columns
-        - 'motion_indices': Indices of motion columns (if provided)
+        Metadata about the design:
+        - 'stim_indices': Stimulus column indices
+        - 'nuisance_indices': All nuisance column indices
+        - 'polort_indices': Polynomial column indices
+        - 'padortvec_indices': Padded ortvec column indices
+        - 'ortvec_indices': Standard ortvec column indices
+        - 'extra_indices': Extra regressor column indices
         - 'n_runs': Number of runs
         - 'n_timepoints_per_run': Timepoints per run
         - 'tr': TR in seconds
+        - 'hrf_models': HRF model strings used
+        - 'hrf_types': HRF types extracted
+        - 'stim_durations': Stimulus durations in seconds
 
     Examples
     --------
-    >>> # Simple 2-run, 2-condition design
+    >>> # Simple design with per-stimulus HRF models
     >>> design, labels, run_starts, meta = build_design_matrix(
-    ...     timing_files=['movie.txt', 'prompt.txt'],
-    ...     stim_labels=['movie', 'prompt'],
-    ...     n_timepoints_per_run=[180, 180],
-    ...     tr=2.0,
-    ...     polort=3
+    ...     timing_files=['instruct.txt', 'task.txt'],
+    ...     stim_labels=['instruct', 'task'],
+    ...     n_timepoints_per_run=[360, 360],
+    ...     tr=1.0,
+    ...     polort=3,
+    ...     hrf_models=['SPMG1(5)', 'SPMG1(30)']
     ... )
-    >>> design.shape
-    (360, 10)  # 2 stim + 8 polort (4 per run)
+
+    >>> # Complex design with motion parameters
+    >>> design, labels, run_starts, meta = build_design_matrix(
+    ...     timing_files=['cond1.txt', 'cond2.txt'],
+    ...     stim_labels=['cond1', 'cond2'],
+    ...     n_timepoints_per_run=[200, 200, 200],
+    ...     tr=2.0,
+    ...     polort=3,
+    ...     hrf_models='SPMG1(10)',
+    ...     padortvec_files=[
+    ...         ('motion_r01.1D', 'motion_r01', 1),
+    ...         ('motion_r02.1D', 'motion_r02', 2),
+    ...         ('motion_r03.1D', 'motion_r03', 3),
+    ...     ]
+    ... )
     """
     n_runs = len(n_timepoints_per_run)
     n_stim = len(timing_files)
@@ -501,10 +525,13 @@ def build_design_matrix(
     if len(stim_labels) != n_stim:
         raise ValueError(f"stim_labels length ({len(stim_labels)}) must match timing_files ({n_stim})")
 
-    if stim_durations is None:
-        stim_durations = [0.0] * n_stim
-    elif len(stim_durations) != n_stim:
-        raise ValueError(f"stim_durations length ({len(stim_durations)}) must match n_stim ({n_stim})")
+    # Handle HRF models - can be single string or list
+    if hrf_models is None:
+        hrf_models = ['SPMG1(0)'] * n_stim  # Default: impulse with SPM HRF
+    elif isinstance(hrf_models, str):
+        hrf_models = [hrf_models] * n_stim  # Broadcast to all stimuli
+    elif len(hrf_models) != n_stim:
+        raise ValueError(f"hrf_models length ({len(hrf_models)}) must match n_stim ({n_stim})")
 
     # Parse timing files
     all_onsets = []
@@ -517,30 +544,89 @@ def build_design_matrix(
             )
         all_onsets.append(onsets_by_run)
 
-    # Create HRF
-    if hrf_model == 'SPMG1':
-        hrf = spm_canonical_hrf(tr=tr, duration=32.0)
-    elif hrf_model == 'BLOCK':
-        hrf = None  # No HRF convolution
-    else:
-        raise ValueError(f"Unknown HRF model: {hrf_model}")
+    # Parse HRF models and create stimulus durations
+    stim_durations = []
+    hrf_types = []
+    for hrf_spec in hrf_models:
+        model_name, duration = parse_hrf_model(hrf_spec)
+        stim_durations.append(duration)
+        hrf_types.append(model_name)
 
     # Build design matrix in AFNI column order:
-    # 1. Polynomial regressors (per-run, in run order)
-    # 2. Stimulus regressors (spanning all runs)
+    # 1. Polynomial regressors (per-run)
+    # 2. Ortvec regressors (padortvec, then ortvec)
+    # 3. Stimulus regressors (spanning all runs)
+    # 4. Extra regressors (if any)
 
     total_timepoints = sum(n_timepoints_per_run)
     run_starts = []
-    current_timepoint = 0
 
-    # Pre-allocate full design matrix
+    # Count columns
     n_polort_cols = (polort + 1) * n_runs if polort >= 0 else 0
-    n_total_cols = n_polort_cols + n_stim
+    n_padortvec_cols = 0
+    n_ortvec_cols = 0
+    n_extra_cols = 0
+
+    # Load and count padortvec files
+    padortvec_data = []
+    padortvec_labels_list = []
+    if padortvec_files:
+        for filepath, label, run_num in padortvec_files:
+            padded = load_and_pad_ortvec(filepath, run_num, n_timepoints_per_run)
+            padortvec_data.append(padded)
+            # Create labels for each column
+            n_cols = padded.shape[1]
+            n_padortvec_cols += n_cols
+            for col_idx_local in range(n_cols):
+                if n_cols == 1:
+                    padortvec_labels_list.append(label)
+                else:
+                    padortvec_labels_list.append(f'{label}[{col_idx_local}]')
+
+    # Load and count ortvec files
+    ortvec_data = []
+    ortvec_labels_list = []
+    if ortvec_files:
+        for filepath, label in ortvec_files:
+            data = np.loadtxt(filepath)
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+
+            # Validate length
+            if data.shape[0] != total_timepoints:
+                raise ValueError(
+                    f"Ortvec file {filepath} has {data.shape[0]} rows, "
+                    f"but total timepoints is {total_timepoints}"
+                )
+
+            ortvec_data.append(data)
+            n_cols = data.shape[1]
+            n_ortvec_cols += n_cols
+            for col_idx_local in range(n_cols):
+                if n_cols == 1:
+                    ortvec_labels_list.append(label)
+                else:
+                    ortvec_labels_list.append(f'{label}[{col_idx_local}]')
+
+    # Count extra regressors
+    if extra_regressors:
+        for reg in extra_regressors:
+            if reg.ndim == 1:
+                n_extra_cols += 1
+            else:
+                n_extra_cols += reg.shape[1]
+
+    # Total columns
+    n_total_cols = n_polort_cols + n_padortvec_cols + n_ortvec_cols + n_stim + n_extra_cols
     design_matrix = np.zeros((total_timepoints, n_total_cols))
 
     # Track column indices
     col_idx = 0
     polort_indices = []
+    padortvec_indices = []
+    ortvec_indices = []
+    stim_indices = []
+    extra_indices = []
     regressor_labels = []
 
     # 1. Add polynomial regressors (per-run)
@@ -565,9 +651,38 @@ def build_design_matrix(
         for run_idx in range(n_runs):
             run_starts.append(sum(n_timepoints_per_run[:run_idx]))
 
-    # 2. Add stimulus regressors (spanning all runs)
-    stim_indices = []
+    # 2a. Add padortvec regressors
+    for padded in padortvec_data:
+        for c in range(padded.shape[1]):
+            design_matrix[:, col_idx] = padded[:, c]
+            padortvec_indices.append(col_idx)
+            col_idx += 1
+
+    # Add padortvec labels
+    regressor_labels.extend(padortvec_labels_list)
+
+    # 2b. Add ortvec regressors
+    for ort_data in ortvec_data:
+        for c in range(ort_data.shape[1]):
+            design_matrix[:, col_idx] = ort_data[:, c]
+            ortvec_indices.append(col_idx)
+            col_idx += 1
+
+    # Add ortvec labels
+    regressor_labels.extend(ortvec_labels_list)
+
+    # 3. Add stimulus regressors (spanning all runs)
     for stim_idx in range(n_stim):
+        # Get HRF for this stimulus
+        hrf_type = hrf_types[stim_idx]
+
+        if hrf_type == 'SPMG1':
+            hrf = spm_canonical_hrf(tr=tr, duration=32.0)
+        elif hrf_type == 'BLOCK':
+            hrf = None  # No HRF convolution
+        else:
+            raise ValueError(f"Unknown HRF type: {hrf_type}. Supported: SPMG1, BLOCK")
+
         # Combine all runs for this stimulus
         stim_regressor = np.zeros(total_timepoints)
 
@@ -595,15 +710,48 @@ def build_design_matrix(
         regressor_labels.append(stim_labels[stim_idx])
         col_idx += 1
 
+    # 4. Add extra regressors (if any)
+    if extra_regressors:
+        for idx, reg in enumerate(extra_regressors):
+            if reg.ndim == 1:
+                design_matrix[:, col_idx] = reg
+                extra_indices.append(col_idx)
+                col_idx += 1
+            else:
+                for c in range(reg.shape[1]):
+                    design_matrix[:, col_idx] = reg[:, c]
+                    extra_indices.append(col_idx)
+                    col_idx += 1
+
+        # Add extra labels
+        if extra_regressor_labels:
+            if len(extra_regressor_labels) != len(extra_regressors):
+                raise ValueError(
+                    f"extra_regressor_labels length ({len(extra_regressor_labels)}) "
+                    f"must match extra_regressors ({len(extra_regressors)})"
+                )
+            regressor_labels.extend(extra_regressor_labels)
+        else:
+            # Generate default labels
+            for idx in range(len(extra_indices)):
+                regressor_labels.append(f'extra_{idx}')
+
     # Create metadata
+    nuisance_indices = polort_indices + padortvec_indices + ortvec_indices + extra_indices
+
     metadata = {
         'stim_indices': stim_indices,
-        'nuisance_indices': polort_indices,
+        'nuisance_indices': nuisance_indices,
         'polort_indices': polort_indices,
+        'padortvec_indices': padortvec_indices,
+        'ortvec_indices': ortvec_indices,
+        'extra_indices': extra_indices,
         'n_runs': n_runs,
         'n_timepoints_per_run': n_timepoints_per_run,
         'tr': tr,
-        'hrf_model': hrf_model,
+        'hrf_models': hrf_models,
+        'hrf_types': hrf_types,
+        'stim_durations': stim_durations,
         'polort': polort,
     }
 
