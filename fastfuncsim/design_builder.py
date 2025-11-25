@@ -277,6 +277,21 @@ def create_onset_regressors(
         # Use 'full' mode and truncate to match input length
         regressor = np.convolve(regressor, hrf, mode='full')[:n_timepoints]
 
+        # Normalize by max to maintain percent signal change scaling
+        # This ensures that a single boxcar+HRF response has amplitude 1.0
+        # (matching AFNI's behavior for proper PSC interpretation)
+        if duration > 0:
+            # For boxcar stimuli, need to normalize by the response to a single boxcar
+            # Create reference boxcar and convolve
+            ref_boxcar = np.zeros(len(hrf) * 2)
+            duration_tr = int(np.round(duration / tr))
+            ref_boxcar[:duration_tr] = 1.0
+            ref_response = np.convolve(ref_boxcar, hrf, mode='full')
+            max_response = ref_response.max()
+
+            if max_response > 0:
+                regressor = regressor / max_response
+
     return regressor
 
 
