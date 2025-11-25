@@ -1049,11 +1049,12 @@ def write_afni_xmat(
 
     # Build column groups
     # Format: "N@-1,M,K" means N columns in group -1 (nuisance), then groups M, K for stim
+    # Group numbering: -1=polort, 0=motion/baseline, 1,2,3,...=stimuli of interest
     n_nuisance = len(metadata.get('nuisance_indices', []))
     if n_stim > 0:
         col_groups = f"{n_nuisance}@-1"
         for stim_idx in range(n_stim):
-            col_groups += f",{stim_idx}"
+            col_groups += f",{stim_idx + 1}"  # Stimuli start at 1, not 0
     else:
         col_groups = f"{n_nuisance}@-1"
 
