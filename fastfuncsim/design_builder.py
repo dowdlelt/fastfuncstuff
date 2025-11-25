@@ -280,6 +280,120 @@ def create_onset_regressors(
     return regressor
 
 
+def parse_glt_string(glt_string: str) -> Tuple[Dict[str, float], bool]:
+    """
+    Parse AFNI GLT (General Linear Test) contrast string
+
+    Extracts weights for each regressor label from symbolic contrast strings.
+    Also validates that weights sum to 0 (difference) or 1 (average).
+
+    Parameters
+    ----------
+    glt_string : str
+        GLT contrast in AFNI SYM format, e.g.:
+        - 'SYM: +1*labelA -1*labelB' (difference)
+        - 'SYM: +0.5*labelA +0.5*labelB' (average)
+        - 'SYM: +1*cond1 +2*cond2 -3*cond3'
+
+    Returns
+    -------
+    weights : dict
+        Dictionary mapping label to weight, e.g., {'labelA': 1.0, 'labelB': -1.0}
+    is_valid : bool
+        True if weights sum to 0 or 1, False otherwise (with warning)
+
+    Examples
+    --------
+    >>> parse_glt_string('SYM: +1*movie -1*prompt')
+    ({'movie': 1.0, 'prompt': -1.0}, True)
+
+    >>> parse_glt_string('SYM: +0.5*cond1 +0.5*cond2')
+    ({'cond1': 0.5, 'cond2': 0.5}, True)
+    """
+    # Remove 'SYM:' prefix if present
+    glt_string = glt_string.strip()
+    if glt_string.upper().startswith('SYM:'):
+        glt_string = glt_string[4:].strip()
+
+    # Parse weights and labels: pattern is [+/-]weight*label
+    # Match: optional sign, number (int or float), *, label
+    pattern = r'([+-]?\s*\d+\.?\d*)\s*\*\s*([A-Za-z_][\w\-]*)'
+    matches = re.findall(pattern, glt_string)
+
+    if not matches:
+        raise ValueError(f"Could not parse GLT string: '{glt_string}'. Expected format: 'SYM: +1*label1 -1*label2'")
+
+    weights = {}
+    for weight_str, label in matches:
+        # Remove spaces and convert to float
+        weight_str = weight_str.replace(' ', '')
+        weight = float(weight_str)
+        weights[label] = weight
+
+    # Validate sum
+    weight_sum = sum(weights.values())
+    is_valid = abs(weight_sum) < 1e-6 or abs(weight_sum - 1.0) < 1e-6
+
+    if not is_valid:
+        import warnings
+        warnings.warn(
+            f"GLT weights sum to {weight_sum:.6f}, expected 0 (difference) or 1 (average). "
+            f"GLT: '{glt_string}'"
+        )
+
+    return weights, is_valid
+
+
+def glt_weights_to_vector(
+    weights: Dict[str, float],
+    regressor_labels: List[str],
+) -> np.ndarray:
+    """
+    Convert GLT weights dict to contrast vector
+
+    Maps label weights to column indices in design matrix.
+
+    Parameters
+    ----------
+    weights : dict
+        Dictionary mapping label to weight, e.g., {'movie': 1.0, 'prompt': -1.0}
+    regressor_labels : list of str
+        Labels for all regressors in design matrix (in column order)
+
+    Returns
+    -------
+    contrast_vector : np.ndarray
+        Vector of weights, shape (n_regressors,)
+        Zero for regressors not in weights dict
+
+    Raises
+    ------
+    ValueError
+        If a label in weights is not found in regressor_labels
+
+    Examples
+    --------
+    >>> weights = {'movie': 1.0, 'prompt': -1.0}
+    >>> labels = ['Run1_Poly0', 'Run1_Poly1', 'movie', 'prompt']
+    >>> glt_weights_to_vector(weights, labels)
+    array([0., 0., 1., -1.])
+    """
+    n_regressors = len(regressor_labels)
+    contrast_vector = np.zeros(n_regressors)
+
+    for label, weight in weights.items():
+        try:
+            idx = regressor_labels.index(label)
+            contrast_vector[idx] = weight
+        except ValueError:
+            raise ValueError(
+                f"GLT label '{label}' not found in regressor labels. "
+                f"Available labels: {regressor_labels}"
+            )
+
+    return contrast_vector
+
+
 def parse_hrf_model(hrf_string: str) -> Tuple[str, float]:
     """
     Parse AFNI HRF model string
@@ -421,6 +535,7 @@ def build_design_matrix(
     tr: float,
     polort: int = 3,
     hrf_models: Optional[Union[str, List[str]]] = None,
+    im_mode: Optional[Union[bool, List[bool]]] = None,
     padortvec_files: Optional[List[Tuple[Union[str, Path], str, int]]] = None,
     ortvec_files: Optional[List[Tuple[Union[str, Path], str]]] = None,
     extra_regressors: Optional[List[np.ndarray]] = None,
@@ -453,6 +568,12 @@ def build_design_matrix(
         Can be single string (applied to all) or list (one per stimulus)
         Supported models: SPMG1 (SPM canonical), BLOCK (boxcar)
         Default: 'SPMG1(0)' (impulse with HRF)
+    im_mode : bool or list of bool, optional
+        Individual modulation mode (AFNI's -stim_times_IM)
+        If True: each event gets its own column (for amplitude modulation)
+        If False: all events for condition share one column (default)
+        Can be single bool (all stimuli) or list (per stimulus)
+        Example: im_mode=[False, False, True] - only 3rd stimulus uses IM
     padortvec_files : list of tuple, optional
         List of (filepath, label, run_number) for per-run nuisance regressors
         Files are zero-padded to span all runs
@@ -552,10 +673,35 @@ def build_design_matrix(
         stim_durations.append(duration)
         hrf_types.append(model_name)
 
+    # Handle IM mode - can be single bool or list
+    if im_mode is None:
+        im_mode = [False] * n_stim  # Default: no IM
+    elif isinstance(im_mode, bool):
+        im_mode = [im_mode] * n_stim  # Broadcast to all stimuli
+    elif len(im_mode) != n_stim:
+        raise ValueError(f"im_mode length ({len(im_mode)}) must match n_stim ({n_stim})")
+
+    # Count total stimulus columns (depends on IM mode)
+    # Non-IM: 1 column per stimulus
+    # IM: 1 column per event (summed across runs)
+    n_stim_cols = 0
+    stim_n_events = []  # Number of events for each stimulus (for IM mode)
+    for stim_idx in range(n_stim):
+        if im_mode[stim_idx]:
+            # Count total events across all runs
+            n_events = sum(len(all_onsets[stim_idx][run_idx]) for run_idx in range(n_runs))
+            stim_n_events.append(n_events)
+            n_stim_cols += n_events
+        else:
+            stim_n_events.append(1)  # One column for all events
+            n_stim_cols += 1
+
     # Build design matrix in AFNI column order:
     # 1. Polynomial regressors (per-run)
     # 2. Ortvec regressors (padortvec, then ortvec)
     # 3. Stimulus regressors (spanning all runs)
+    #    - Non-IM: one column per condition
+    #    - IM: one column per event
     # 4. Extra regressors (if any)
 
     total_timepoints = sum(n_timepoints_per_run)
@@ -616,8 +762,8 @@ def build_design_matrix(
             else:
                 n_extra_cols += reg.shape[1]
 
-    # Total columns
-    n_total_cols = n_polort_cols + n_padortvec_cols + n_ortvec_cols + n_stim + n_extra_cols
+    # Total columns (use n_stim_cols which accounts for IM mode)
+    n_total_cols = n_polort_cols + n_padortvec_cols + n_ortvec_cols + n_stim_cols + n_extra_cols
     design_matrix = np.zeros((total_timepoints, n_total_cols))
 
     # Track column indices
@@ -683,32 +829,66 @@ def build_design_matrix(
         else:
             raise ValueError(f"Unknown HRF type: {hrf_type}. Supported: SPMG1, BLOCK")
 
-        # Combine all runs for this stimulus
-        stim_regressor = np.zeros(total_timepoints)
+        if im_mode[stim_idx]:
+            # Individual modulation mode: one column per event
+            # Collect all onsets across all runs and create one regressor per event
+            event_idx = 0
+            for run_idx in range(n_runs):
+                n_tp = n_timepoints_per_run[run_idx]
+                run_start = sum(n_timepoints_per_run[:run_idx])
+                run_end = run_start + n_tp
 
-        for run_idx in range(n_runs):
-            n_tp = n_timepoints_per_run[run_idx]
-            run_start = sum(n_timepoints_per_run[:run_idx])
-            run_end = run_start + n_tp
+                onsets = all_onsets[stim_idx][run_idx]
+                duration = stim_durations[stim_idx]
 
-            onsets = all_onsets[stim_idx][run_idx]
-            duration = stim_durations[stim_idx]
+                # Create one column per event in this run
+                for onset in onsets:
+                    event_regressor = create_onset_regressors(
+                        onset_times=np.array([onset]),  # Single onset
+                        n_timepoints=n_tp,
+                        tr=tr,
+                        duration=duration,
+                        hrf=hrf,
+                    )
 
-            regressor = create_onset_regressors(
-                onset_times=onsets,
-                n_timepoints=n_tp,
-                tr=tr,
-                duration=duration,
-                hrf=hrf,
-            )
+                    # Place in full time series
+                    full_regressor = np.zeros(total_timepoints)
+                    full_regressor[run_start:run_end] = event_regressor
 
-            stim_regressor[run_start:run_end] = regressor
+                    # Add to design matrix
+                    design_matrix[:, col_idx] = full_regressor
+                    stim_indices.append(col_idx)
+                    regressor_labels.append(f'{stim_labels[stim_idx]}_{event_idx}')
+                    col_idx += 1
+                    event_idx += 1
 
-        # Add to design matrix
-        design_matrix[:, col_idx] = stim_regressor
-        stim_indices.append(col_idx)
-        regressor_labels.append(stim_labels[stim_idx])
-        col_idx += 1
+        else:
+            # Standard mode: one column for all events
+            stim_regressor = np.zeros(total_timepoints)
+
+            for run_idx in range(n_runs):
+                n_tp = n_timepoints_per_run[run_idx]
+                run_start = sum(n_timepoints_per_run[:run_idx])
+                run_end = run_start + n_tp
+
+                onsets = all_onsets[stim_idx][run_idx]
+                duration = stim_durations[stim_idx]
+
+                regressor = create_onset_regressors(
+                    onset_times=onsets,
+                    n_timepoints=n_tp,
+                    tr=tr,
+                    duration=duration,
+                    hrf=hrf,
+                )
+
+                stim_regressor[run_start:run_end] = regressor
+
+            # Add to design matrix
+            design_matrix[:, col_idx] = stim_regressor
+            stim_indices.append(col_idx)
+            regressor_labels.append(stim_labels[stim_idx])
+            col_idx += 1
 
     # 4. Add extra regressors (if any)
     if extra_regressors:
