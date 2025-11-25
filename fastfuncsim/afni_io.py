@@ -791,6 +791,133 @@ def extract_design_metadata(design_info: Dict) -> Tuple[List[str], List[str], Li
     return full_labels, stim_labels, stim_column_indices
 
 
+def get_regressor_groups(design_info: Dict) -> Dict[str, List[int]]:
+    """
+    Get regressor indices organized by ColumnGroups
+
+    AFNI ColumnGroups convention:
+      -1 = polynomial drift regressors
+       0 = motion and other baseline regressors (non-polort)
+       1,2,3,... = stimuli of interest (experimental conditions)
+
+    Parameters
+    ----------
+    design_info : dict
+        Output from read_afni_design_matrix()
+
+    Returns
+    -------
+    groups : dict
+        Dictionary mapping group names to column indices:
+        - 'polort': list of polynomial regressor indices
+        - 'baseline': list of motion/baseline regressor indices (group 0)
+        - 'stimulus_1', 'stimulus_2', ...: lists of stimulus regressor indices
+        - 'all_stimuli': combined list of all stimulus indices
+        - 'all_nuisance': combined list of all nuisance indices (polort + baseline)
+
+    Examples
+    --------
+    >>> design = read_afni_design_matrix('X.xmat.1D')
+    >>> groups = get_regressor_groups(design)
+    >>> print(f"Polynomial regressors: {groups['polort']}")
+    >>> print(f"Stimulus 1 regressors: {groups['stimulus_1']}")
+    >>> print(f"All stimuli: {groups['all_stimuli']}")
+    """
+    column_groups = design_info.get('column_groups')
+    if column_groups is None:
+        raise ValueError("Design matrix does not have ColumnGroups information")
+
+    groups = {
+        'polort': [],
+        'baseline': [],
+        'all_stimuli': [],
+        'all_nuisance': [],
+    }
+
+    # Organize columns by group
+    for col_idx, group_id in enumerate(column_groups):
+        if group_id == -1:
+            groups['polort'].append(col_idx)
+            groups['all_nuisance'].append(col_idx)
+        elif group_id == 0:
+            groups['baseline'].append(col_idx)
+            groups['all_nuisance'].append(col_idx)
+        elif group_id > 0:
+            # Stimulus group
+            stim_key = f'stimulus_{group_id}'
+            if stim_key not in groups:
+                groups[stim_key] = []
+            groups[stim_key].append(col_idx)
+            groups['all_stimuli'].append(col_idx)
+
+    return groups
+
+
+def select_regressors_by_group(
+    design_info: Dict,
+    include_groups: Optional[List[str]] = None,
+    exclude_groups: Optional[List[str]] = None,
+) -> np.ndarray:
+    """
+    Select regressor columns by group type
+
+    Parameters
+    ----------
+    design_info : dict
+        Output from read_afni_design_matrix()
+    include_groups : list of str, optional
+        Groups to include. Options:
+        - 'polort': polynomial drift
+        - 'baseline': motion/baseline (group 0)
+        - 'stimulus_1', 'stimulus_2', ...: specific stimuli
+        - 'all_stimuli': all stimulus regressors
+        - 'all_nuisance': all nuisance regressors
+        If None, includes all regressors
+    exclude_groups : list of str, optional
+        Groups to exclude (applied after include)
+
+    Returns
+    -------
+    design_matrix : np.ndarray
+        Subset of design matrix (n_timepoints, n_selected)
+
+    Examples
+    --------
+    >>> design = read_afni_design_matrix('X.xmat.1D')
+    >>> # Get only stimulus regressors
+    >>> stim_design = select_regressors_by_group(design, include_groups=['all_stimuli'])
+    >>> # Get design without polynomials
+    >>> X = select_regressors_by_group(design, exclude_groups=['polort'])
+    """
+    groups = get_regressor_groups(design_info)
+    matrix = design_info['matrix']
+
+    # Start with all columns if no include specified
+    if include_groups is None:
+        selected_cols = list(range(matrix.shape[1]))
+    else:
+        selected_cols = []
+        for group_name in include_groups:
+            if group_name in groups:
+                selected_cols.extend(groups[group_name])
+            else:
+                available = [k for k in groups.keys() if groups[k]]
+                raise ValueError(
+                    f"Unknown group '{group_name}'. Available groups: {available}"
+                )
+        selected_cols = sorted(set(selected_cols))
+
+    # Apply exclusions
+    if exclude_groups is not None:
+        exclude_cols = []
+        for group_name in exclude_groups:
+            if group_name in groups:
+                exclude_cols.extend(groups[group_name])
+        selected_cols = [c for c in selected_cols if c not in exclude_cols]
+
+    return matrix[:, selected_cols]
+
+
 def replace_afni_extension(filepath: str, new_extension: str = ".nii.gz") -> str:
     """
     Replace any AFNI or NIfTI extension with a new extension.
