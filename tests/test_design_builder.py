@@ -359,6 +359,73 @@ def test_write_afni_xmat():
             os.remove(output_path)
 
 
+def test_im_mode():
+    """Test Individual Modulation (IM) mode"""
+    import tempfile
+
+    # Create simple timing file with known events
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        timing_file = Path(f.name)
+        # Run 1: 3 events at 10s, 20s, 30s
+        # Run 2: 2 events at 5s, 15s
+        f.write("10 20 30\n")
+        f.write("5 15\n")
+
+    try:
+        # Build with IM mode
+        design, labels, run_starts, metadata = build_design_matrix(
+            timing_files=[timing_file],
+            stim_labels=['condition'],
+            n_timepoints_per_run=[50, 50],  # 100s total at TR=2s
+            tr=2.0,
+            polort=1,  # Keep simple
+            hrf_models='SPMG1(0)',  # Delta function (no duration)
+            im_mode=True,
+        )
+
+        # Should have:
+        # - 2 runs * 2 polynomials = 4 poly columns
+        # - 5 events (3 + 2) = 5 IM columns
+        # Total: 9 columns
+        assert design.shape == (100, 9), f"Expected (100, 9), got {design.shape}"
+
+        # Check labels
+        assert labels[0] == 'Run1_Poly0'
+        assert labels[3] == 'Run2_Poly1'
+        assert labels[4] == 'condition_0'
+        assert labels[5] == 'condition_1'
+        assert labels[6] == 'condition_2'
+        assert labels[7] == 'condition_3'
+        assert labels[8] == 'condition_4'
+
+        # Check metadata
+        assert len(metadata['stim_indices']) == 5, "Should have 5 IM columns"
+        assert metadata['stim_indices'] == [4, 5, 6, 7, 8]
+
+        # Each IM column should be independent (non-zero at different times)
+        # Run 1 events: TR 5, 10, 15 (at 10s, 20s, 30s with TR=2s)
+        # Run 2 events: TR 52, 57 (at 5s, 15s in run 2, offset by 50 TRs)
+        stim_cols = design[:, metadata['stim_indices']]
+
+        # Count non-zero timepoints per column
+        nonzero_counts = np.sum(stim_cols > 0, axis=0)
+        print(f"\nIM mode test:")
+        print(f"  Design shape: {design.shape}")
+        print(f"  IM column labels: {labels[4:]}")
+        print(f"  Non-zero timepoints per IM column: {nonzero_counts}")
+
+        # Each column should have some non-zero values (after HRF convolution)
+        assert all(nonzero_counts > 0), "Each IM column should have non-zero values"
+
+        print("✓ IM mode test passed!")
+
+    finally:
+        # Clean up
+        import os
+        if timing_file.exists():
+            os.remove(timing_file)
+
+
 def test_glt_parsing():
     """Test GLT contrast parsing and validation"""
     from fastfuncsim.design_builder import parse_glt_string, glt_weights_to_vector
@@ -404,5 +471,6 @@ if __name__ == "__main__":
     test_compare_with_afni()
     test_write_afni_xmat()
     test_glt_parsing()
+    test_im_mode()
 
     print("\n✓ All tests passed!")
