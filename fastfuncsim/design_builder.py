@@ -429,7 +429,8 @@ def parse_hrf_model(hrf_string: str) -> Tuple[str, float]:
     ('BLOCK', 30.0)
     """
     # Match pattern: MODEL(duration) or MODEL(p1,p2,p3)
-    match = re.match(r'^([A-Z]+)\(([^)]+)\)$', hrf_string)
+    # Model name can contain letters and digits (e.g., SPMG1, BLOCK, TENT)
+    match = re.match(r'^([A-Z][A-Z0-9]*)\(([^)]+)\)$', hrf_string)
 
     if not match:
         raise ValueError(f"Invalid HRF model string: '{hrf_string}'. Expected format like 'SPMG1(5)'")
@@ -936,3 +937,230 @@ def build_design_matrix(
     }
 
     return design_matrix, regressor_labels, run_starts, metadata
+
+
+def write_afni_xmat(
+    filepath: Union[str, Path],
+    design_matrix: np.ndarray,
+    regressor_labels: List[str],
+    run_starts: List[int],
+    metadata: Dict,
+    glt_contrasts: Optional[List[Tuple[str, str]]] = None,
+    command_line: Optional[str] = None,
+) -> None:
+    """
+    Write design matrix in AFNI .xmat.1D format
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Output file path
+    design_matrix : np.ndarray
+        Design matrix (n_timepoints, n_regressors)
+    regressor_labels : list of str
+        Column labels
+    run_starts : list of int
+        Starting timepoint index for each run
+    metadata : dict
+        Metadata dictionary from build_design_matrix()
+        Must contain: 'n_runs', 'tr', 'stim_indices', 'hrf_models',
+                      'hrf_types', 'stim_durations'
+    glt_contrasts : list of (contrast_string, label) tuples, optional
+        GLT contrasts in format [('SYM: +1*A -1*B', 'AvsB'), ...]
+    command_line : str, optional
+        Command line string to include in header
+
+    Notes
+    -----
+    AFNI .xmat.1D format includes:
+    - Header with matrix metadata (ni_type, ni_dimen, etc.)
+    - Column labels, groups, and stimulus info
+    - Run starts and TR information
+    - GLT contrast matrices
+    - Basis function formulas
+    - Data matrix (space-delimited, one row per timepoint)
+
+    Examples
+    --------
+    >>> design, labels, runs, meta = build_design_matrix(...)
+    >>> glt = [('SYM: +1*movie -1*prompt', 'movieVprompt')]
+    >>> write_afni_xmat('X.xmat.1D', design, labels, runs, meta, glt)
+    """
+    n_timepoints, n_regressors = design_matrix.shape
+    n_runs = metadata['n_runs']
+    tr = metadata['tr']
+    stim_indices = metadata['stim_indices']
+
+    # Determine stim range
+    if len(stim_indices) > 0:
+        stim_bot = min(stim_indices)
+        stim_top = max(stim_indices)
+        n_stim = len(set([regressor_labels[i].split('_')[0] for i in stim_indices]))
+    else:
+        stim_bot = 0
+        stim_top = 0
+        n_stim = 0
+
+    # Build column groups
+    # Format: "N@-1,M,K" means N columns in group -1 (nuisance), then groups M, K for stim
+    n_nuisance = len(metadata.get('nuisance_indices', []))
+    if n_stim > 0:
+        col_groups = f"{n_nuisance}@-1"
+        for stim_idx in range(n_stim):
+            col_groups += f",{stim_idx}"
+    else:
+        col_groups = f"{n_nuisance}@-1"
+
+    # Create header
+    with open(filepath, 'w') as f:
+        # Matrix metadata
+        f.write("# <matrix\n")
+        f.write(f'#  ni_type = "{n_regressors}*double"\n')
+        f.write(f'#  ni_dimen = "{n_timepoints}"\n')
+
+        # Column labels
+        labels_str = " ; ".join(regressor_labels)
+        f.write(f'#  ColumnLabels = "{labels_str}"\n')
+
+        # Column groups
+        f.write(f'#  ColumnGroups = "{col_groups}"\n')
+
+        # TR and timepoint info
+        f.write(f'#  RowTR = "{tr}"\n')
+        f.write(f'#  GoodList = "0..{n_timepoints-1}"\n')
+        f.write(f'#  NRowFull = "{n_timepoints}"\n')
+
+        # Run starts
+        run_starts_str = ",".join(map(str, run_starts))
+        f.write(f'#  RunStart = "{run_starts_str}"\n')
+
+        # Stimulus info
+        f.write(f'#  Nstim = "{n_stim}"\n')
+        if n_stim > 0:
+            f.write(f'#  StimBots = "{stim_bot}"\n')
+            f.write(f'#  StimTops = "{stim_top}"\n')
+
+            # Extract unique stimulus labels
+            stim_labels_list = []
+            seen_stim = set()
+            for idx in stim_indices:
+                label = regressor_labels[idx]
+                # Remove _N suffix for IM mode
+                base_label = label.split('_')[0] if '_' in label and label.split('_')[-1].isdigit() else label
+                if base_label not in seen_stim:
+                    stim_labels_list.append(base_label)
+                    seen_stim.add(base_label)
+
+            stim_labels_str = " ; ".join(stim_labels_list)
+            f.write(f'#  StimLabels = "{stim_labels_str}"\n')
+
+        # GLT contrasts
+        if glt_contrasts:
+            f.write(f'#  Nglt = "{len(glt_contrasts)}"\n')
+            glt_labels = [label for _, label in glt_contrasts]
+            f.write(f'#  GltLabels = "{" ; ".join(glt_labels)}"\n')
+
+            for glt_idx, (contrast_str, label) in enumerate(glt_contrasts):
+                # Parse contrast and create matrix representation
+                weights, _ = parse_glt_string(contrast_str)
+                contrast_vec = glt_weights_to_vector(weights, regressor_labels)
+
+                # Format: "1,n_regressors,values"
+                # Only include non-zero weights
+                nonzero_indices = np.where(contrast_vec != 0)[0]
+                matrix_str = f"1,{n_regressors},"
+
+                # Build compact representation
+                parts = []
+                for i, val in enumerate(contrast_vec):
+                    if i == 0:
+                        if val == 0:
+                            # Count leading zeros
+                            next_nonzero = nonzero_indices[0] if len(nonzero_indices) > 0 else n_regressors
+                            if next_nonzero > 0:
+                                parts.append(f"{next_nonzero}@0")
+                    else:
+                        if val != 0:
+                            parts.append(str(val))
+                        else:
+                            # Check if we have contiguous zeros
+                            pass  # Handle in the simplest way
+
+                # Simple format: just list all values with compression for leading zeros
+                if len(nonzero_indices) > 0 and nonzero_indices[0] > 0:
+                    matrix_str += f"{nonzero_indices[0]}@0"
+                    for i in range(nonzero_indices[0], n_regressors):
+                        if contrast_vec[i] != 0:
+                            matrix_str += f",{contrast_vec[i]:.0f}"
+                else:
+                    # No leading zeros, just list values
+                    matrix_str += ",".join([str(int(v)) if v != 0 else "0" for v in contrast_vec])
+
+                f.write(f'#  GltMatrix_{glt_idx:06d} = "{matrix_str}"\n')
+
+        # Basis function info
+        if n_stim > 0:
+            f.write(f'#  BasisNstim = "{n_stim}"\n')
+
+            # Get unique stimuli
+            stim_info = {}
+            for idx in stim_indices:
+                label = regressor_labels[idx]
+                base_label = label.split('_')[0] if '_' in label and label.split('_')[-1].isdigit() else label
+
+                if base_label not in stim_info:
+                    # Find which stimulus this is
+                    stim_idx_in_list = None
+                    for i, sl in enumerate(stim_labels_list):
+                        if sl == base_label:
+                            stim_idx_in_list = i
+                            break
+
+                    if stim_idx_in_list is not None:
+                        # Get HRF model and duration
+                        hrf_type = metadata.get('hrf_types', [])[stim_idx_in_list] if stim_idx_in_list < len(metadata.get('hrf_types', [])) else 'SPMG1'
+                        duration = metadata.get('stim_durations', [])[stim_idx_in_list] if stim_idx_in_list < len(metadata.get('stim_durations', [])) else 0.0
+
+                        # Find column range for this stimulus
+                        cols_for_stim = [i for i, l in enumerate(regressor_labels)
+                                        if l == base_label or l.startswith(f"{base_label}_")]
+
+                        stim_info[base_label] = {
+                            'idx': stim_idx_in_list + 1,
+                            'hrf': hrf_type,
+                            'duration': duration,
+                            'cols': cols_for_stim,
+                        }
+
+            # Write basis info for each stimulus
+            for stim_label in stim_labels_list:
+                if stim_label in stim_info:
+                    info = stim_info[stim_label]
+                    idx = info['idx']
+
+                    # Determine stim option (IM vs regular)
+                    is_im = len(info['cols']) > 1 and all(
+                        regressor_labels[c].split('_')[-1].isdigit() for c in info['cols']
+                    )
+                    option = "-stim_times_IM" if is_im else "-stim_times"
+
+                    f.write(f'#  BasisOption_{idx:06d} = "{option}"\n')
+                    f.write(f'#  BasisName_{idx:06d} = "{stim_label}"\n')
+                    f.write(f'#  BasisFormula_{idx:06d} = "{info["hrf"]}({info["duration"]:.0f})"\n')
+
+                    # Column range
+                    col_start = min(info['cols'])
+                    col_end = max(info['cols'])
+                    f.write(f'#  BasisColumns_{idx:06d} = "{col_start}:{col_end}"\n')
+
+        # Command line (optional)
+        if command_line:
+            f.write(f'#  CommandLine = "{command_line}"\n')
+
+        # End header
+        f.write("# >\n")
+
+        # Write data matrix
+        for row_idx in range(n_timepoints):
+            row_str = " ".join([f"{val:.17g}" for val in design_matrix[row_idx, :]])
+            f.write(f" {row_str}\n")

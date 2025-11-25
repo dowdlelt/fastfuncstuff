@@ -174,7 +174,7 @@ def test_build_design_matrix_basic():
         n_timepoints_per_run=n_timepoints_per_run,
         tr=tr,
         polort=polort,
-        hrf_model='SPMG1',
+        hrf_models='SPMG1(5)',
     )
 
     # Check shape
@@ -251,7 +251,7 @@ def test_compare_with_afni():
         n_timepoints_per_run=n_timepoints_per_run,
         tr=1.0,  # TR from AFNI design
         polort=3,
-        hrf_model='SPMG1',
+        hrf_models='SPMG1(5)',
     )
 
     print(f"Our design matrix shape: {design.shape}")
@@ -287,6 +287,113 @@ def test_compare_with_afni():
         print("  ✓ Excellent match with AFNI!")
 
 
+def test_write_afni_xmat():
+    """Test writing .xmat.1D format"""
+    from fastfuncsim.design_builder import write_afni_xmat
+    import tempfile
+
+    # Build a simple design matrix
+    movie_file = TEST_DATA_DIR / "ses01_times.movie.txt"
+    prompt_file = TEST_DATA_DIR / "ses01_times.prompt.txt"
+
+    design, labels, run_starts, metadata = build_design_matrix(
+        timing_files=[movie_file, prompt_file],
+        stim_labels=['movie', 'prompt'],
+        n_timepoints_per_run=[360, 360],
+        tr=1.0,
+        polort=3,
+        hrf_models='SPMG1(5)',
+    )
+
+    # Write to temporary file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
+        output_path = f.name
+
+    try:
+        # Write with GLT contrast
+        glt_contrasts = [('SYM: +1*movie -1*prompt', 'movieVprompt')]
+        write_afni_xmat(
+            output_path,
+            design,
+            labels,
+            run_starts,
+            metadata,
+            glt_contrasts=glt_contrasts,
+        )
+
+        # Read back and validate
+        with open(output_path, 'r') as f:
+            content = f.read()
+
+        # Check header elements
+        assert '# <matrix' in content, "Missing matrix header"
+        assert 'ni_type = "10*double"' in content, "Wrong ni_type"
+        assert 'ni_dimen = "720"' in content, "Wrong ni_dimen"
+        assert 'ColumnLabels' in content, "Missing ColumnLabels"
+        assert 'Run#1Pol#0' in content or 'Run1_Poly0' in content, "Missing polynomial labels"
+        assert 'movie' in content, "Missing movie label"
+        assert 'prompt' in content, "Missing prompt label"
+        assert 'RunStart = "0,360"' in content, "Wrong RunStart"
+        assert 'Nstim = "2"' in content, "Wrong Nstim"
+        assert 'Nglt = "1"' in content, "Wrong Nglt"
+        assert 'movieVprompt' in content, "Missing GLT label"
+        assert 'SPMG1' in content, "Missing HRF model"
+        assert '# >' in content, "Missing header end"
+
+        # Check data rows
+        lines = content.split('\n')
+        data_lines = [l for l in lines if l and not l.startswith('#')]
+        assert len(data_lines) == 720, f"Expected 720 data rows, got {len(data_lines)}"
+
+        # Check first data row has correct number of columns
+        first_row = data_lines[0].strip().split()
+        assert len(first_row) == 10, f"Expected 10 columns, got {len(first_row)}"
+
+        print(f"\n✓ .xmat.1D writer test passed!")
+        print(f"  Wrote {len(data_lines)} rows x {len(first_row)} columns")
+
+    finally:
+        # Clean up
+        import os
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+def test_glt_parsing():
+    """Test GLT contrast parsing and validation"""
+    from fastfuncsim.design_builder import parse_glt_string, glt_weights_to_vector
+
+    # Test valid contrast (difference)
+    weights, valid = parse_glt_string('SYM: +1*A -1*B')
+    assert valid, "Difference contrast should be valid"
+    assert weights == {'A': 1.0, 'B': -1.0}, f"Wrong weights: {weights}"
+    assert abs(sum(weights.values())) < 1e-6, "Weights should sum to 0"
+
+    # Test valid contrast (average)
+    weights, valid = parse_glt_string('SYM: +0.5*A +0.5*B')
+    assert valid, "Average contrast should be valid"
+    assert weights == {'A': 0.5, 'B': 0.5}, f"Wrong weights: {weights}"
+    assert abs(sum(weights.values()) - 1.0) < 1e-6, "Weights should sum to 1"
+
+    # Test invalid contrast (warning should be raised)
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        weights, valid = parse_glt_string('SYM: +1*A +1*B')
+        assert len(w) == 1, "Should raise warning for invalid sum"
+        assert not valid, "Should be marked invalid"
+        assert "sum to" in str(w[0].message).lower(), "Warning should mention sum"
+
+    # Test vector conversion
+    labels = ['Poly0', 'Poly1', 'A', 'B', 'C']
+    weights = {'A': 1.0, 'B': -1.0}
+    vec = glt_weights_to_vector(weights, labels)
+    expected = np.array([0, 0, 1, -1, 0])
+    np.testing.assert_array_equal(vec, expected, err_msg="Wrong contrast vector")
+
+    print("\n✓ GLT parsing tests passed!")
+
+
 if __name__ == "__main__":
     # Run tests
     test_spm_canonical_hrf()
@@ -295,5 +402,7 @@ if __name__ == "__main__":
     test_create_onset_regressors()
     test_build_design_matrix_basic()
     test_compare_with_afni()
+    test_write_afni_xmat()
+    test_glt_parsing()
 
     print("\n✓ All tests passed!")
