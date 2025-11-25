@@ -1148,3 +1148,63 @@ def get_tr_from_file(filepath: Union[str, Path]) -> float:
         print(f"WARNING: Could not read TR from {filepath}: {e}")
         print("Using TR=1.0 as fallback")
         return 1.0
+
+
+def load_fmri_data(
+    fmri_file: Union[str, Path],
+    mask_file: Union[str, Path],
+    dtype: np.dtype = np.float32,
+) -> np.ndarray:
+    """
+    Load fMRI data and mask to 2D array format (timepoints × voxels)
+
+    Parameters
+    ----------
+    fmri_file : str or Path
+        Path to 4D fMRI file
+    mask_file : str or Path
+        Path to 3D mask file (values > 0 define brain voxels)
+    dtype : np.dtype, default=np.float32
+        Data type for output array
+
+    Returns
+    -------
+    data : np.ndarray, shape (n_timepoints, n_voxels)
+        fMRI data in 2D format
+
+    Examples
+    --------
+    >>> data = load_fmri_data('func.nii.gz', 'mask.nii.gz')
+    >>> print(f"Shape: {data.shape}")  # (n_timepoints, n_voxels)
+    """
+    # Load fMRI data
+    fmri_img = nib.load(str(fmri_file))
+    fmri_data = fmri_img.get_fdata()
+
+    if fmri_data.ndim != 4:
+        raise ValueError(f"fMRI data must be 4D, got {fmri_data.ndim}D")
+
+    # Load mask
+    mask_img = nib.load(str(mask_file))
+    mask_data = mask_img.get_fdata()
+
+    if mask_data.ndim != 3:
+        raise ValueError(f"Mask must be 3D, got {mask_data.ndim}D")
+
+    # Check spatial dimensions match
+    if fmri_data.shape[:3] != mask_data.shape:
+        raise ValueError(
+            f"Spatial dimensions mismatch: fMRI {fmri_data.shape[:3]} vs mask {mask_data.shape}"
+        )
+
+    # Create boolean mask
+    mask_bool = mask_data > 0
+    n_voxels = mask_bool.sum()
+    n_timepoints = fmri_data.shape[3]
+
+    # Extract masked data
+    data = np.zeros((n_timepoints, n_voxels), dtype=dtype)
+    for t in range(n_timepoints):
+        data[t] = fmri_data[..., t][mask_bool]
+
+    return data
