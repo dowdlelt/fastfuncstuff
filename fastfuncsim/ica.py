@@ -363,6 +363,56 @@ class FastICA:
 
         return g, g_prime
 
+    def compute_variance_explained(
+        self,
+        X: Union[np.ndarray, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute variance explained by each ICA component
+
+        ICA components are not ordered by variance, but it's useful to know
+        how much variance each component explains for interpretation.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Original data (same as used for fit)
+
+        Returns
+        -------
+        variance_explained : torch.Tensor, shape (n_components,)
+            Variance explained by each component
+        variance_ratio : torch.Tensor, shape (n_components,)
+            Fraction of total variance explained by each component
+        """
+        if self.components_ is None:
+            raise RuntimeError("ICA must be fitted first")
+
+        # Convert to tensor
+        X = to_tensor(X, device=self.device)
+
+        # Mean-center data
+        X_centered = X - X.mean(dim=0)
+
+        # Total variance
+        total_var = (X_centered ** 2).sum()
+
+        # Reconstruct each component separately
+        variance_explained = torch.zeros(self.components_.shape[0], device=self.device)
+
+        for i in range(self.components_.shape[0]):
+            # Reconstruct using only this component
+            reconstruction = self.mixing_[:, i:i+1] @ self.components_[i:i+1, :]
+
+            # Variance explained = variance of reconstruction
+            var_i = (reconstruction ** 2).sum()
+            variance_explained[i] = var_i
+
+        # Compute ratios
+        variance_ratio = variance_explained / total_var
+
+        return variance_explained, variance_ratio
+
     def to_dict(self) -> Dict:
         """Export ICA parameters to dictionary"""
         if self.components_ is None:
