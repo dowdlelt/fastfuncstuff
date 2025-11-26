@@ -118,7 +118,13 @@ def cluster_components(
     similarity = compute_similarity_matrix(components_list)
 
     # Convert similarity to distance (dissimilarity)
+    # Clip similarity to [0, 1] to avoid numerical issues
+    similarity = np.clip(similarity, 0.0, 1.0)
     distance = 1 - similarity
+
+    # Ensure distance matrix is valid (symmetric, non-negative)
+    distance = np.maximum(distance, 0.0)  # Ensure non-negative
+    distance = (distance + distance.T) / 2  # Ensure symmetric
 
     # Hierarchical clustering
     # Convert distance matrix to condensed form for scipy
