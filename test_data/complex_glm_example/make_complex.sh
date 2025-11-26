@@ -1,0 +1,99 @@
+3dDeconvolve -overwrite \
+    -nodata 17140 1 \
+    -polort 4 -float                                                                         \
+    -noFDR                                                                                      \
+    -jobs 6                                                                                    \
+    -ortvec mvps-all.motion.demean.r01.1D mot-demean_r01 \
+	-ortvec mvps-all.motion.demean.r02.1D mot-demean_r02 \
+	-concat '1D:0 360 720 1080 1440 1800 2160 2520 2880 3240 3600 3960 4320 4680 5040 5400 5760 6120 6480 6840 7200 7560 7920 8280 8640 9108 9576 9967 10358 10749 11140 11531 11922 12358 12794 13185 13576 13967 14358 14749 15140 15531 15967 16403 16794' \
+    -num_stimts 41                                                                             \
+     -stim_times_AM1 1 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove.txt 'dmBLOCK' \
+	-stim_label 1 ControlEyeMove \
+	-stim_times_AM1 2 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.CountPeople.txt 'dmBLOCK' \
+	-stim_label 2 CountPeople \
+	-stim_times_AM1 3 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.DominantColor.txt 'dmBLOCK' \
+	-stim_label 3 DominantColor \
+	-stim_times_AM1 4 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.DominantTexture.txt 'dmBLOCK' \
+	-stim_label 4 DominantTexture \
+	-stim_times_AM1 5 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.Fixate.txt 'dmBLOCK' \
+	-stim_label 5 Fixate \
+	-stim_times_AM1 6 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.Freeview.txt 'dmBLOCK' \
+	-stim_label 6 Freeview \
+	-stim_times_AM1 7 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.HowFeels.txt 'dmBLOCK' \
+	-stim_label 7 HowFeels \
+	-stim_times_AM1 8 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.IndoorOutdoor.txt 'dmBLOCK' \
+	-stim_label 8 IndoorOutdoor \
+	-stim_times_AM1 9 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.NaturalUn.txt 'dmBLOCK' \
+	-stim_label 9 NaturalUn \
+	-stim_times_AM1 10 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ObjectManipulate.txt 'dmBLOCK' \
+	-stim_label 10 ObjectManipulate \
+	-stim_times_AM1 11 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.PrimaryActivity.txt 'dmBLOCK' \
+	-stim_label 11 PrimaryActivity \
+	-stim_times_AM1 12 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.PrivatePublic.txt 'dmBLOCK' \
+	-stim_label 12 PrivatePublic \
+	-stim_times_AM1 13 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.Relationship.txt 'dmBLOCK' \
+	-stim_label 13 Relationship \
+	-stim_times_AM1 14 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.SeasonFilmed.txt 'dmBLOCK' \
+	-stim_label 14 SeasonFilmed \
+	-stim_times_AM1 15 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.TasteSmell.txt 'dmBLOCK' \
+	-stim_label 15 TasteSmell \
+	-stim_times_AM1 16 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.TimeOfDay.txt 'dmBLOCK' \
+	-stim_label 16 TimeOfDay \
+	-stim_times_AM1 17 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.Valence.txt 'dmBLOCK' \
+	-stim_label 17 Valence \
+	-stim_times_AM1 18 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.WhatSounds.txt 'dmBLOCK' \
+	-stim_label 18 WhatSounds \
+	-stim_times_AM1 19 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.WhatThinking.txt 'dmBLOCK' \
+	-stim_label 19 WhatThinking \
+	-stim_times_AM1 20 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.Words.txt 'dmBLOCK' \
+	-stim_label 20 Words \
+	-stim_times_AM1 21 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.WorldLocation.txt 'dmBLOCK' \
+	-stim_label 21 WorldLocation \
+	-stim_times 22 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_BraidingOldHair.txt 'SPMG1(5)' \
+	-stim_label 22 ControlEyeMove_BraidingOldHair \
+	-stim_times 23 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_DinnerWithBaby.txt 'SPMG1(5)' \
+	-stim_label 23 ControlEyeMove_DinnerWithBaby \
+	-stim_times 24 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_DogIceCream.txt 'SPMG1(5)' \
+	-stim_label 24 ControlEyeMove_DogIceCream \
+	-stim_times 25 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_EatingWithFriends.txt 'SPMG1(5)' \
+	-stim_label 25 ControlEyeMove_EatingWithFriends \
+	-stim_times 26 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_IndoorSofaSitting.txt 'SPMG1(5)' \
+	-stim_label 26 ControlEyeMove_IndoorSofaSitting \
+	-stim_times 27 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_JunkBoxOrganize.txt 'SPMG1(5)' \
+	-stim_label 27 ControlEyeMove_JunkBoxOrganize \
+	-stim_times 28 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_LookingIntoGarden.txt 'SPMG1(5)' \
+	-stim_label 28 ControlEyeMove_LookingIntoGarden \
+	-stim_times 29 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_MakingSpinachTortilla.txt 'SPMG1(5)' \
+	-stim_label 29 ControlEyeMove_MakingSpinachTortilla \
+	-stim_times 30 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_PlayingBigIstrument.txt 'SPMG1(5)' \
+	-stim_label 30 ControlEyeMove_PlayingBigIstrument \
+	-stim_times 31 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_PuppyGoldBlue.txt 'SPMG1(5)' \
+	-stim_label 31 ControlEyeMove_PuppyGoldBlue \
+	-stim_times 32 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_ReadingBookCozy.txt 'SPMG1(5)' \
+	-stim_label 32 ControlEyeMove_ReadingBookCozy \
+	-stim_times 33 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_ReceiptAtStore.txt 'SPMG1(5)' \
+	-stim_label 33 ControlEyeMove_ReceiptAtStore \
+	-stim_times 34 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_RidingMowerGarage.txt 'SPMG1(5)' \
+	-stim_label 34 ControlEyeMove_RidingMowerGarage \
+	-stim_times 35 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_RiverTubeBeer.txt 'SPMG1(5)' \
+	-stim_label 35 ControlEyeMove_RiverTubeBeer \
+	-stim_times 36 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_RugbyBallField.txt 'SPMG1(5)' \
+	-stim_label 36 ControlEyeMove_RugbyBallField \
+	-stim_times 37 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_SmokeInCar.txt 'SPMG1(5)' \
+	-stim_label 37 ControlEyeMove_SmokeInCar \
+	-stim_times 38 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_SprayPaintWork.txt 'SPMG1(5)' \
+	-stim_label 38 ControlEyeMove_SprayPaintWork \
+	-stim_times 39 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_TableCardGame.txt 'SPMG1(5)' \
+	-stim_label 39 ControlEyeMove_TableCardGame \
+	-stim_times 40 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_TrimmingYardBushes.txt 'SPMG1(5)' \
+	-stim_label 40 ControlEyeMove_TrimmingYardBushes \
+	-stim_times 41 ~/Dropbox/Projects/MovieTasks/code_movietasks/data_pilot/preproc/sub-pilot01/mvps-all_timing/onset_files/mvps-all.times.ControlEyeMove_YardFamilyBall.txt 'SPMG1(5)' \
+	-stim_label 41 ControlEyeMove_YardFamilyBall \
+    -tout -fout -x1D testQuestion_X.xmat.1D                                         \
+    -num_glt 1                                                                                    \
+    -jobs 9                                                                                         \
+    -gltsym 'SYM: +0.05*ControlEyeMove_BraidingOldHair +0.05*ControlEyeMove_DinnerWithBaby +0.05*ControlEyeMove_DogIceCream +0.05*ControlEyeMove_EatingWithFriends +0.05*ControlEyeMove_IndoorSofaSitting +0.05*ControlEyeMove_JunkBoxOrganize +0.05*ControlEyeMove_LookingIntoGarden +0.05*ControlEyeMove_MakingSpinachTortilla +0.05*ControlEyeMove_PlayingBigIstrument +0.05*ControlEyeMove_PuppyGoldBlue +0.05*ControlEyeMove_ReadingBookCozy +0.05*ControlEyeMove_ReceiptAtStore +0.05*ControlEyeMove_RidingMowerGarage +0.05*ControlEyeMove_RiverTubeBeer +0.05*ControlEyeMove_RugbyBallField +0.05*ControlEyeMove_SmokeInCar +0.05*ControlEyeMove_SprayPaintWork +0.05*ControlEyeMove_TableCardGame +0.05*ControlEyeMove_TrimmingYardBushes +0.05*ControlEyeMove_YardFamilyBall' \
+	-glt_label 1 ControlEyeMove_mov \
+	-x1D_stop
+
+	
