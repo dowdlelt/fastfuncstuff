@@ -51,6 +51,7 @@ def compute_component_similarity(
 
 def compute_similarity_matrix(
     components_list: List[np.ndarray],
+    batch_size: Optional[int] = None,
 ) -> np.ndarray:
     """
     Compute pairwise similarity matrix across all components from all runs
@@ -60,6 +61,9 @@ def compute_similarity_matrix(
     components_list : list of np.ndarray
         List of component matrices from different ICA runs
         Each array has shape (n_components, n_features)
+    batch_size : int, optional
+        If provided, compute similarity in batches to save memory.
+        Recommended for large datasets (e.g., batch_size=500)
 
     Returns
     -------
@@ -75,13 +79,26 @@ def compute_similarity_matrix(
     all_components = np.concatenate(components_list, axis=0)  # (n_runs * n_components, n_features)
     n_total = all_components.shape[0]
 
-    # Compute pairwise correlations
     # Normalize each component (row)
     norms = np.linalg.norm(all_components, axis=1, keepdims=True)
     all_components_norm = all_components / (norms + 1e-10)
 
-    # Correlation matrix = normalized dot product
-    similarity = np.abs(all_components_norm @ all_components_norm.T)
+    # Compute correlation matrix
+    if batch_size is None or n_total <= batch_size:
+        # Compute all at once (fast but memory-intensive)
+        similarity = np.abs(all_components_norm @ all_components_norm.T)
+    else:
+        # Compute in batches (slower but memory-efficient)
+        similarity = np.zeros((n_total, n_total), dtype=np.float32)
+        n_batches = (n_total + batch_size - 1) // batch_size
+
+        for i in range(n_batches):
+            start_i = i * batch_size
+            end_i = min((i + 1) * batch_size, n_total)
+            batch_i = all_components_norm[start_i:end_i]
+
+            # Compute this batch against all components
+            similarity[start_i:end_i, :] = np.abs(batch_i @ all_components_norm.T)
 
     return similarity
 
@@ -91,6 +108,7 @@ def cluster_components(
     method: str = 'average',
     criterion: str = 'maxclust',
     n_clusters: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Cluster components across ICA runs using hierarchical clustering
@@ -106,6 +124,9 @@ def cluster_components(
         Criterion for forming clusters ('maxclust' or 'distance')
     n_clusters : int, optional
         Number of clusters (if None, uses n_components from runs)
+    batch_size : int, optional
+        Batch size for memory-efficient similarity computation.
+        Use for large datasets (e.g., batch_size=500)
 
     Returns
     -------
@@ -114,8 +135,8 @@ def cluster_components(
     similarity : np.ndarray, shape (n_total_components, n_total_components)
         Similarity matrix used for clustering
     """
-    # Compute similarity matrix
-    similarity = compute_similarity_matrix(components_list)
+    # Compute similarity matrix (with optional batching)
+    similarity = compute_similarity_matrix(components_list, batch_size=batch_size)
 
     # Convert similarity to distance (dissimilarity)
     # Clip similarity to [0, 1] to avoid numerical issues
@@ -277,6 +298,7 @@ def icasso(
     min_stability: float = 0.7,
     device: Optional[torch.device] = None,
     verbose: bool = True,
+    batch_size: Optional[int] = None,
 ) -> Dict:
     """
     Run ICASSO: ICA with component clustering for reliability assessment
@@ -300,6 +322,12 @@ def icasso(
         Computation device
     verbose : bool, default=True
         Show progress
+    batch_size : int, optional
+        Batch size for memory-efficient similarity computation.
+        If None, auto-selects based on total components:
+        - < 1000: no batching
+        - >= 1000: batch_size = 500
+        Use smaller values if running out of memory.
 
     Returns
     -------
@@ -323,16 +351,33 @@ def icasso(
     device = device if device is not None else get_device()
     X = to_tensor(X, device=device)
 
+    # Auto-select batch size based on memory estimate
+    n_total_components = n_runs * n_components
+    if batch_size is None:
+        # Estimate memory needed for similarity matrix (float64)
+        # Matrix size: n_total × n_total × 8 bytes
+        matrix_gb = (n_total_components ** 2 * 8) / (1024**3)
+
+        # Use batching if matrix > 1 GB (conservative threshold for CPU RAM)
+        if matrix_gb > 1.0:
+            # Aim for ~500 MB chunks
+            batch_size = max(100, int(np.sqrt(500 * 1024**3 / 8)))
+            if verbose:
+                print(f"Estimated similarity matrix: {matrix_gb:.2f} GB")
+                print(f"Auto-selected batch_size={batch_size} for memory efficiency")
+
     if verbose:
-        print(f"Running ICASSO: {n_runs} ICA runs with {n_components} components")
+        print(f"Running ICASSO: {n_runs} ICA runs × {n_components} components = {n_total_components} total")
+        print(f"Memory mode: {'batched' if batch_size else 'standard'}")
 
     # Step 1: Run ICA multiple times
     components_list = []
     mixing_list = []
+    pca_variance_explained = None  # Track PCA variance from first run
 
     iterator = range(n_runs)
     if verbose:
-        iterator = tqdm(iterator, desc="Running ICA")
+        iterator = tqdm(iterator, desc=f"ICA runs ({n_components} components each)")
 
     for i in iterator:
         ica = FastICA(
@@ -343,17 +388,29 @@ def icasso(
         )
         ica.fit(X)
 
+        # Save PCA variance from first run (same for all runs with same pca_components)
+        if i == 0:
+            pca_variance_explained = ica.pca_.explained_variance_ratio_.cpu().numpy()
+
+        # Move to CPU immediately and convert to numpy to free GPU memory
         components_list.append(ica.components_.cpu().numpy())
         mixing_list.append(ica.mixing_.cpu().numpy())
 
+        # Clear GPU cache periodically to prevent memory accumulation
+        if device.type == 'cuda' and i % 10 == 9:
+            torch.cuda.empty_cache()
+
     # Step 2: Cluster components
     if verbose:
-        print("Clustering components across runs...")
+        print(f"Clustering {n_total_components} components across runs...")
+        if batch_size:
+            print(f"  Using batched computation (batch_size={batch_size}) to save memory")
 
     cluster_labels, similarity = cluster_components(
         components_list,
         method='average',
         n_clusters=n_components,
+        batch_size=batch_size,
     )
 
     # Step 3: Compute cluster quality
@@ -387,16 +444,30 @@ def icasso(
         stable_components
     )
 
+    # Match ALL centroids to best run components (for saving all components)
+    all_mixing = match_components_to_centroids(
+        best_components,
+        best_mixing,
+        centroids  # ALL centroids, not just stable
+    )
+
     return {
         'components': stable_components,
         'mixing': stable_mixing,
         'stability': quality['stability'][stable_mask],
+        'all_centroids': centroids,  # ALL component centroids (not just stable)
+        'all_mixing': all_mixing,  # Mixing for ALL centroids
+        'all_stability': quality['stability'],  # Stability for ALL components
         'cluster_quality': quality,
         'n_stable': n_stable,
+        'n_components': n_components,
         'cluster_labels': cluster_labels,
         'best_run_idx': best_run_idx,
         'all_components': components_list,
+        'all_mixing_list': mixing_list,  # All mixing matrices from all runs
         'similarity': similarity,
+        'pca_variance_explained': pca_variance_explained,  # Variance explained by PCA
+        'pca_variance_cumsum': pca_variance_explained.cumsum() if pca_variance_explained is not None else None,
     }
 
 
@@ -496,6 +567,7 @@ def icasso_auto_select(
     min_stability: float = 0.7,
     device: Optional[torch.device] = None,
     verbose: bool = True,
+    batch_size: Optional[int] = None,
 ) -> Dict:
     """
     Automatically select optimal number of ICA components using ICASSO
@@ -519,6 +591,8 @@ def icasso_auto_select(
         Computation device
     verbose : bool, default=True
         Show progress
+    batch_size : int, optional
+        Batch size for memory-efficient similarity computation
 
     Returns
     -------
@@ -547,11 +621,32 @@ def icasso_auto_select(
         print(f"Range: {list(n_components_range)}")
         print()
 
+    # Run PCA once to get variance explained curve
+    # This allows us to show variance BEFORE each ICA test
+    if verbose:
+        print("\nRunning PCA for variance analysis...")
+    from .ica import FastICA
+    temp_ica = FastICA(n_components=1, pca_components=pca_components, device=device)
+    temp_ica.fit(X)
+    pca_variance_curve = temp_ica.pca_.explained_variance_ratio_.cpu().numpy()
+    pca_cumsum_curve = pca_variance_curve.cumsum()
+
+    if verbose:
+        n_pca_total = len(pca_variance_curve)
+        print(f"  PCA extracted {n_pca_total} components")
+        print(f"  Total variance explained: {pca_cumsum_curve[-1]:.1%}")
+        print()
+
     for n_comp in n_components_range:
         if verbose:
             print(f"{'='*60}")
             print(f"Testing n_components = {n_comp}")
             print(f"{'='*60}")
+
+            # Show PCA variance BEFORE running ICA
+            if n_comp <= len(pca_cumsum_curve):
+                pca_var = pca_cumsum_curve[n_comp - 1]
+                print(f"PCA: First {n_comp} components explain {pca_var:.1%} of variance")
 
         # Run ICASSO
         icasso_results = icasso(
@@ -562,6 +657,7 @@ def icasso_auto_select(
             min_stability=min_stability,
             device=device,
             verbose=verbose,
+            batch_size=batch_size,
         )
 
         all_results[n_comp] = icasso_results
@@ -579,12 +675,19 @@ def icasso_auto_select(
         print(f"\n{'='*60}")
         print("ICASSO Automatic Selection Results")
         print(f"{'='*60}")
-        print("\nn_components | n_stable | ratio")
-        print("-" * 35)
+        print("\nn_components | n_stable | ratio | pca_var")
+        print("-" * 47)
         for n in sorted(n_stable_by_n.keys()):
             ratio = stability_ratios[n]
             marker = " <-- OPTIMAL" if n == optimal_n else ""
-            print(f"{n:12d} | {n_stable_by_n[n]:8d} | {ratio:5.2f}{marker}")
+
+            # Get PCA variance for this n_components
+            pca_var_cumsum = all_results[n].get('pca_variance_cumsum')
+            if pca_var_cumsum is not None and len(pca_var_cumsum) >= n:
+                pca_var = pca_var_cumsum[n-1]
+                print(f"{n:12d} | {n_stable_by_n[n]:8d} | {ratio:5.2f} | {pca_var:6.1%}{marker}")
+            else:
+                print(f"{n:12d} | {n_stable_by_n[n]:8d} | {ratio:5.2f} | N/A{marker}")
         print()
         print(f"Selected n_components = {optimal_n}")
         print(f"Found {n_stable_by_n[optimal_n]} stable components")

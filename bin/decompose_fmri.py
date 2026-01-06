@@ -115,7 +115,7 @@ def parse_args():
         '-pca',
         metavar='N',
         help='Perform PCA. N can be: '
-             'float (0-1) for variance % (e.g., 0.85 = 85%%), '
+             'float (0-1) for variance percentage (e.g., 0.85 = 85 percent), '
              'int for number of components, '
              'or "all" for all components',
     )
@@ -293,6 +293,30 @@ def main():
         print("Warning: -stability specified but -ica not requested. Ignoring stability analysis.",
               file=sys.stderr)
         args.stability = None
+
+    # Validate PCA/ICA compatibility
+    if pca_n_components is not None and isinstance(pca_n_components, int):
+        # Check against ICA
+        if ica_n_components is not None and isinstance(ica_n_components, int):
+            if pca_n_components < ica_n_components:
+                print(f"Error: PCA components ({pca_n_components}) < ICA components ({ica_n_components})",
+                      file=sys.stderr)
+                print(f"       ICA cannot extract more components than available from PCA!",
+                      file=sys.stderr)
+                print(f"       Either increase -pca or decrease -ica",
+                      file=sys.stderr)
+                return 1
+
+        # Check against ICASSO
+        if icasso_n_components is not None and isinstance(icasso_n_components, int):
+            if pca_n_components < icasso_n_components:
+                print(f"Error: PCA components ({pca_n_components}) < ICASSO components ({icasso_n_components})",
+                      file=sys.stderr)
+                print(f"       ICASSO cannot extract more components than available from PCA!",
+                      file=sys.stderr)
+                print(f"       Either increase -pca or decrease -icasso",
+                      file=sys.stderr)
+                return 1
 
     # Load data
     if args.verbose:
@@ -507,14 +531,29 @@ def main():
             print("Running ICASSO...")
 
         # Determine PCA preprocessing
+        # CRITICAL: PCA components must be >= ICA components!
         if pca_n_components is not None:
             pca_for_icasso = pca_n_components
             if args.verbose:
-                print(f"  Using PCA reduction: {pca_for_icasso}")
+                print(f"  User-specified PCA: {pca_for_icasso}")
         else:
-            pca_for_icasso = 0.85
+            # Auto-set PCA to extract all possible components
+            # PCA should always decompose the data entirely up to min(n_timepoints, n_voxels)
+            # Then we select the TOP N for ICA
             if args.verbose:
-                print(f"  Using default PCA reduction: 85% variance")
+                n_timepoints, n_voxels = data.shape
+                max_pca = min(n_timepoints, n_voxels)
+                print(f"  Auto-set PCA components: {max_pca} (full decomposition)")
+                print(f"    Data shape: ({n_timepoints} timepoints, {n_voxels} voxels)")
+                print(f"    Will select top N components for each ICA run")
+            pca_for_icasso = None  # Let PCA extract all components
+
+        # Validate ica_range is only used with auto mode
+        if icasso_n_components != 'auto' and args.ica_range is not None:
+            print(f"\nWARNING: -ica_range is ignored when -icasso specifies a fixed number")
+            print(f"         -ica_range only works with '-icasso auto'")
+            print(f"         Current: Running {args.n_runs} iterations with {icasso_n_components} components")
+            print()
 
         # Auto component selection
         if icasso_n_components == 'auto':
@@ -534,33 +573,102 @@ def main():
                     min_stability=args.min_stability,
                     device=device,
                     verbose=args.verbose,
+                    batch_size=None,  # Auto-select based on size
                 )
 
-                # Extract stable components
-                stable_components = icasso_results['optimal_results']['components']
-                stable_mixing = icasso_results['optimal_results']['mixing']
-                stability_scores = icasso_results['optimal_results']['stability']
-                n_stable = icasso_results['optimal_results']['n_stable']
+                # Extract results from optimal run
+                optimal_results = icasso_results['optimal_results']
+                stable_components = optimal_results['components']
+                stable_mixing = optimal_results['mixing']
+                stability_scores = optimal_results['stability']
+                n_stable = optimal_results['n_stable']
+                all_stability = optimal_results['all_stability']
+                n_components_total = optimal_results['n_components']
+                cluster_quality = optimal_results['cluster_quality']
 
                 if args.verbose:
                     print(f"\nOptimal configuration:")
                     print(f"  Requested: {icasso_results['optimal_n_components']} components")
                     print(f"  Stable: {n_stable} components")
+                    print(f"  Stability range: {all_stability.min():.3f} - {all_stability.max():.3f}")
+                    print(f"\nCluster quality:")
+                    print(f"  Mean compactness: {cluster_quality['compactness'].mean():.3f}")
+                    print(f"  Mean cluster size: {cluster_quality['size'].mean():.1f} (expected: {args.n_runs})")
+                    print(f"  Size range: {cluster_quality['size'].min()}-{cluster_quality['size'].max()}")
 
-                # Save component selection summary
+                    # Report PCA variance
+                    pca_var = optimal_results.get('pca_variance_cumsum')
+                    if pca_var is not None:
+                        print(f"\nPCA preprocessing:")
+                        print(f"  {n_components_total} components explain {pca_var[n_components_total-1]:.1%} variance")
+
+                # Always save ALL components from the optimal n_components choice
+                # User wants to see all components from the most stable configuration
+                print(f"\nSaving ALL {n_components_total} components from optimal n_components = {icasso_results['optimal_n_components']}")
+                if n_stable == 0:
+                    print(f"  NOTE: None met stability threshold {args.min_stability}")
+                    print(f"        Best stability: {all_stability.max():.3f}")
+                print(f"  Full stability report saved for component selection")
+
+                # Get ALL centroids from optimal run
+                all_centroids = optimal_results['all_centroids']
+                stable_components = all_centroids  # ALL components
+
+                # Get mixing for ALL components (matched to centroids)
+                stable_mixing = optimal_results['all_mixing']
+
+                stability_scores = all_stability  # All stability scores
+                n_stable = n_components_total  # Save all
+
+                # Save component selection summary with QC metrics
                 summary_file = output_path.parent / f"{output_path.name}_icasso_selection.txt"
                 with open(summary_file, 'w') as f:
-                    f.write("# ICASSO Automatic Component Selection\n")
+                    f.write("# ICASSO Automatic Component Selection Results\n")
                     f.write(f"# Optimal n_components: {icasso_results['optimal_n_components']}\n")
-                    f.write(f"# Stable components found: {n_stable}\n")
-                    f.write("# n_components n_stable ratio\n")
+                    f.write(f"# Components meeting threshold: {n_stable}\n")
+                    f.write(f"# Runs per n_components: {args.n_runs}\n")
+                    f.write(f"# Min stability threshold: {args.min_stability}\n")
+                    f.write("#\n")
+                    f.write("# n_comp | n_stable | ratio | mean_stab | mean_size | pca_var_exp\n")
+                    f.write("# -------|----------|-------|-----------|-----------|------------\n")
                     for n in sorted(icasso_results['n_stable_by_n_components'].keys()):
+                        result_n = icasso_results['all_results'][n]
                         n_s = icasso_results['n_stable_by_n_components'][n]
                         ratio = icasso_results['stability_ratios'][n]
-                        f.write(f"{n:12d} {n_s:8d} {ratio:5.2f}\n")
+                        mean_stab = result_n['all_stability'].mean()
+                        mean_size = result_n['cluster_quality']['size'].mean()
+
+                        # Get PCA variance for top n components
+                        pca_var_cumsum = result_n.get('pca_variance_cumsum')
+                        if pca_var_cumsum is not None and len(pca_var_cumsum) >= n:
+                            pca_var = pca_var_cumsum[n-1]  # Variance for first n components
+                            f.write(f"{n:7d} | {n_s:8d} | {ratio:5.2f} | {mean_stab:9.3f} | {mean_size:9.1f} | {pca_var:11.1%}\n")
+                        else:
+                            f.write(f"{n:7d} | {n_s:8d} | {ratio:5.2f} | {mean_stab:9.3f} | {mean_size:9.1f} | N/A\n")
+
+                    # Add cluster size distribution for optimal configuration
+                    f.write("\n# Cluster Size Distribution (optimal n_components):\n")
+                    f.write(f"# Expected cluster size: {args.n_runs} (one component per ICA run)\n")
+                    cluster_sizes = cluster_quality['size']
+                    unique_sizes = sorted(np.unique(cluster_sizes))
+                    f.write("# Size | Count | Percent\n")
+                    f.write("# -----|-------|--------\n")
+                    for size in unique_sizes:
+                        count = (cluster_sizes == size).sum()
+                        percent = 100.0 * count / len(cluster_sizes)
+                        f.write(f"# {size:4.0f} | {count:5d} | {percent:6.1f}%\n")
 
                 if args.verbose:
                     print(f"  Saved selection summary: {summary_file}")
+
+                # Save similarity matrix for visualization
+                similarity_file = output_path.parent / f"{output_path.name}_icasso_similarity.npy"
+                np.save(similarity_file, optimal_results['similarity'])
+                if args.verbose:
+                    print(f"  Saved similarity matrix: {similarity_file}")
+                    print(f"    Shape: {optimal_results['similarity'].shape}")
+                    print(f"    This matrix shows pairwise similarity between all component instances")
+                    print(f"    Can be used to create GIFT-style component matching visualizations")
 
             except Exception as e:
                 print(f"Error in ICASSO automatic selection: {e}", file=sys.stderr)
@@ -584,15 +692,55 @@ def main():
                     min_stability=args.min_stability,
                     device=device,
                     verbose=args.verbose,
+                    batch_size=None,  # Auto-select based on size
                 )
 
                 stable_components = icasso_results['components']
                 stable_mixing = icasso_results['mixing']
                 stability_scores = icasso_results['stability']
                 n_stable = icasso_results['n_stable']
+                all_stability = icasso_results['all_stability']
+                n_components_total = icasso_results['n_components']
+                cluster_quality = icasso_results['cluster_quality']
 
                 if args.verbose:
-                    print(f"\nStable components: {n_stable}/{icasso_n_components}")
+                    print(f"\nStable components: {n_stable}/{n_components_total}")
+                    print(f"  Stability range: {all_stability.min():.3f} - {all_stability.max():.3f}")
+                    print(f"  Threshold: {args.min_stability}")
+                    print(f"\nCluster quality:")
+                    print(f"  Mean compactness: {cluster_quality['compactness'].mean():.3f}")
+                    print(f"  Mean cluster size: {cluster_quality['size'].mean():.1f} (expected: {args.n_runs})")
+                    print(f"  Size range: {cluster_quality['size'].min()}-{cluster_quality['size'].max()}")
+
+                    # Report PCA variance
+                    pca_var = icasso_results.get('pca_variance_cumsum')
+                    if pca_var is not None:
+                        print(f"\nPCA preprocessing:")
+                        print(f"  {n_components_total} components explain {pca_var[n_components_total-1]:.1%} variance")
+
+                # Always save ALL components - user wants to see all from this run
+                print(f"\nSaving ALL {n_components_total} components")
+                if n_stable == 0:
+                    print(f"  NOTE: None met stability threshold {args.min_stability}")
+                    print(f"         Mean stability: {all_stability.mean():.3f}")
+                    print(f"         Best stability: {all_stability.max():.3f}")
+                    print(f"         Consider:")
+                    print(f"           - Lowering -min_stability threshold")
+                    print(f"           - Increasing -n_runs (currently {args.n_runs})")
+                    print(f"           - Using fewer ICA components")
+                else:
+                    print(f"  {n_stable}/{n_components_total} met stability threshold")
+                print(f"  Full stability report saved for component selection")
+
+                # Get ALL components
+                all_centroids = icasso_results['all_centroids']
+                stable_components = all_centroids  # ALL components
+
+                # Get mixing for ALL components (matched to centroids)
+                stable_mixing = icasso_results['all_mixing']
+
+                stability_scores = all_stability  # All stability scores
+                n_stable = n_components_total  # Save all
 
             except Exception as e:
                 print(f"Error running ICASSO: {e}", file=sys.stderr)
@@ -600,22 +748,16 @@ def main():
                 traceback.print_exc()
                 return 1
 
-        # Compute variance explained for stable components
+        # Note: Variance explained computation not meaningful for ICASSO centroids
+        # ICASSO components are cluster centroids (averaged spatial patterns), not
+        # the original ICA components that can reconstruct data. Use PCA variance instead.
         if args.verbose:
-            print("\n  Computing variance explained...")
+            print("\n  Skipping variance explained computation for ICASSO")
+            print("    (ICASSO centroids don't reconstruct original data)")
+            print(f"    Use PCA variance above: {n_stable} components explain X% of variance")
 
-        # Create temporary ICA object to use variance computation
-        temp_ica = FastICA(device=device)
-        temp_ica.components_ = torch.tensor(stable_components, device=device)
-        temp_ica.mixing_ = torch.tensor(stable_mixing, device=device)
-        _, var_ratio = temp_ica.compute_variance_explained(data)
-
-        var_ratio_np = var_ratio.cpu().numpy()
-
-        if args.verbose:
-            total_var = var_ratio_np.sum()
-            print(f"    Total variance explained: {total_var:.1%}")
-            print(f"    Per component: {var_ratio_np.mean():.2%} ± {var_ratio_np.std():.2%}")
+        # Create empty variance array for saving
+        var_ratio_np = np.zeros(n_stable)
 
         # Save ICASSO results
         if args.verbose:
@@ -634,28 +776,90 @@ def main():
                 method='ICASSO',
             )
 
-            # Save stability scores
+            # Determine how many actually met threshold
+            n_met_threshold = (all_stability >= args.min_stability).sum()
+
+            # Save stability scores (for saved components only)
             stability_file = output_path.parent / f"{output_path.name}_icasso_stability.1D"
             np.savetxt(
                 stability_file,
                 stability_scores,
                 fmt='%.4f',
-                header=f'ICASSO stability scores (0-1, higher = more stable)\n{n_stable} stable components selected',
+                header=f'ICASSO stability scores (0-1, higher = more stable)\n{n_stable} components saved (top by stability)',
             )
+
+            # Save comprehensive stability report (ALL components, sorted)
+            stability_report = output_path.parent / f"{output_path.name}_icasso_stability_full.txt"
+            with open(stability_report, 'w') as f:
+                f.write("# ICASSO Stability Report - ALL Components\n")
+                f.write(f"# Total components tested: {n_components_total}\n")
+                f.write(f"# Components saved: {n_stable}\n")
+                f.write(f"# Components meeting threshold ({args.min_stability}): {n_met_threshold}\n")
+                f.write(f"# Runs: {args.n_runs}\n")
+                f.write(f"# PCA: {pca_for_icasso}\n")
+                f.write("#\n")
+                if n_met_threshold == 0:
+                    f.write(f"# Saved components are top {n_stable} by stability (none met threshold)\n")
+                else:
+                    f.write("# Saved components met stability threshold\n")
+                f.write("#\n")
+                f.write("# Component  Stability  Status\n")
+                f.write("# ---------  ---------  ------\n")
+
+                # Sort by stability (descending)
+                sorted_idx = np.argsort(all_stability)[::-1]
+                for idx in sorted_idx:
+                    status = "STABLE" if all_stability[idx] >= args.min_stability else "unstable"
+                    f.write(f"{idx:10d}  {all_stability[idx]:9.4f}  {status}\n")
+
+                # Add cluster size distribution
+                f.write("\n# Cluster Size Distribution:\n")
+                f.write(f"# Expected cluster size: {args.n_runs} (one component per ICA run)\n")
+                cluster_sizes = cluster_quality['size']
+                unique_sizes = sorted(np.unique(cluster_sizes))
+                f.write("# Size | Count | Percent\n")
+                f.write("# -----|-------|--------\n")
+                for size in unique_sizes:
+                    count = (cluster_sizes == size).sum()
+                    percent = 100.0 * count / len(cluster_sizes)
+                    f.write(f"# {size:4.0f} | {count:5d} | {percent:6.1f}%\n")
+
+                # Add PCA variance information
+                pca_var = icasso_results.get('pca_variance_cumsum')
+                if pca_var is not None:
+                    f.write(f"\n# PCA Preprocessing:\n")
+                    f.write(f"# {n_components_total} components explain {pca_var[n_components_total-1]:.1%} variance\n")
 
             # Save variance explained
             variance_file = output_path.parent / f"{output_path.name}_icasso_variance.1D"
-            np.savetxt(
-                variance_file,
-                var_ratio_np,
-                fmt='%.6f',
-                header=f'Variance explained by each ICASSO component\nTotal: {var_ratio_np.sum():.4f}',
-            )
+            if len(var_ratio_np) > 0:
+                np.savetxt(
+                    variance_file,
+                    var_ratio_np,
+                    fmt='%.6f',
+                    header=f'Variance explained by each ICASSO component\nTotal: {var_ratio_np.sum():.4f}',
+                )
+            else:
+                # Empty file with explanation
+                with open(variance_file, 'w') as f:
+                    f.write("# No components saved - all had stability < threshold\n")
+
+            # Save similarity matrix for visualization (fixed mode only - auto mode already saved it)
+            if 'similarity' in icasso_results:
+                similarity_file = output_path.parent / f"{output_path.name}_icasso_similarity.npy"
+                np.save(similarity_file, icasso_results['similarity'])
+
+                if args.verbose:
+                    print(f"    Similarity matrix: {similarity_file}")
+                    print(f"      Shape: {icasso_results['similarity'].shape}")
+                    print(f"      This matrix shows pairwise similarity between all component instances")
+                    print(f"      Can be used to create GIFT-style component matching visualizations")
 
             if args.verbose:
                 print(f"    Maps: {icasso_files['maps']}")
                 print(f"    Timeseries: {icasso_files['timeseries_1D']}")
-                print(f"    Stability: {stability_file}")
+                print(f"    Stability (saved components): {stability_file}")
+                print(f"    Stability (all components): {stability_report}")
                 print(f"    Variance: {variance_file}")
 
         except Exception as e:

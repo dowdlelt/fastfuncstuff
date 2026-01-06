@@ -140,16 +140,36 @@ class FastICA:
         else:
             n_components = min(self.n_components, self.pca_.n_components_)
 
-        # Step 2: Run FastICA on PCA-reduced data
-        W, n_iter = self._fastica(X_pca.T, n_components)  # Transpose for FastICA
+        # Step 2: Run FastICA on TOP PCA spatial components (spatial ICA)
+        # PCA components are ordered by variance explained (highest first)
+        # Select only the TOP n_components for ICA
+        # Example: 100 PCA components → take first 50 for 50 ICA components
+        pca_components_all = self.pca_.components_  # (n_pca_components, n_voxels)
+        pca_components = pca_components_all[:n_components]  # Take TOP n_components only!
 
+        # For SPATIAL ICA: pass components with voxels as "samples"
+        # Our _fastica expects (n_features, n_samples), so pass (n_ica, n_voxels)
+        # This makes: n_features=n_ica, n_samples=n_voxels
+        # FastICA finds independent rows = independent PC patterns = SPATIAL ICA
+        # Following nilearn's CanICA approach
+        W, n_iter = self._fastica(pca_components, n_components)  # Input: (n_ica, n_voxels)
         self.n_iter_ = n_iter
 
-        # Step 3: Compute spatial components (in original space)
-        # mixing_ = X_pca @ W.T  (timeseries)
-        # components_ = W @ pca.components_  (spatial maps)
-        self.mixing_ = X_pca @ W.T
-        self.components_ = W @ self.pca_.components_
+        # Step 3: Extract ICA spatial maps
+        # W has shape (n_ica, n_ica) - unmixing matrix in TOP PC space
+        # Spatial ICA maps: W @ pca_components (top PCs)
+        # = (n_ica, n_ica) @ (n_ica, n_voxels) = (n_ica, n_voxels)
+        self.components_ = W @ pca_components  # (n_components, n_voxels)
+
+        # Step 4: Compute mixing matrix (ICA timecourses)
+        # We have: X_pca with (n_timepoints, n_pca_total)
+        # But ICA only used the FIRST n_components PCs
+        # So use: X_pca[:, :n_components]
+        X_pca_top = X_pca[:, :n_components]  # (n_timepoints, n_ica)
+        # Model: X_pca_top ≈ mixing @ W
+        # Solving for mixing: mixing = X_pca_top @ pinv(W)
+        # Shapes: (n_timepoints, n_ica) @ (n_ica, n_ica) = (n_timepoints, n_ica)
+        self.mixing_ = X_pca_top @ torch.linalg.pinv(W)
 
         return self
 

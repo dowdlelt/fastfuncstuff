@@ -359,7 +359,6 @@ def save_decomposition_results(
         Dictionary with paths to created files:
         - 'maps': path to spatial maps (4D NIfTI)
         - 'timeseries_1D': path to timeseries (.1D)
-        - 'timeseries_nii': path to timeseries (NIfTI)
 
     Examples
     --------
@@ -386,15 +385,11 @@ def save_decomposition_results(
     maps_file = output_dir / f"{output_prefix.name}_maps.nii.gz"
     save_component_maps(components, mask_file, maps_file, labels=labels)
 
-    # Save timeseries (both formats)
+    # Save timeseries (.1D format only)
     ts_1d_file = output_dir / f"{output_prefix.name}_timeseries.1D"
     save_timeseries(timeseries, ts_1d_file, labels=labels)
-
-    ts_nii_file = output_dir / f"{output_prefix.name}_timeseries.nii.gz"
-    save_timeseries(timeseries, ts_nii_file, tr=tr, reference_file=reference_file)
 
     return {
         'maps': maps_file,
         'timeseries_1D': ts_1d_file,
-        'timeseries_nii': ts_nii_file,
     }
