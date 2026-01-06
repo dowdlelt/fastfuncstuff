@@ -64,6 +64,13 @@ design_optimization_results/
 *.HEAD
 *.1D
 
+# Test outputs (generated)
+test_data/**/test_*.nii.gz
+test_data/**/icasso_*.nii.gz
+test_data/**/vis_*.nii.gz
+test_data/**/ltd_*.nii.gz
+test_data/**/afni_*.nii.gz
+
 # macOS
 .DS_Store
 .AppleDouble
