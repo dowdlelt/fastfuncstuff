@@ -15,7 +15,7 @@ Key Features
 - Support for both spatial and temporal PCA
 """
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
 import numpy as np
 import torch

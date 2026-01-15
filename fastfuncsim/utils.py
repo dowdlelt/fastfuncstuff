@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray
+    pass
 
 
 def get_device(prefer_device: Optional[str] = None) -> torch.device:

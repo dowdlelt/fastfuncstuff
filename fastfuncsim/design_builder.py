@@ -11,7 +11,6 @@ while being easier to use and integrate with our fast GLM fitting.
 """
 
 import numpy as np
-import torch
 from pathlib import Path
 from typing import Union, List, Optional, Tuple, Dict
 from scipy import special

@@ -8,7 +8,6 @@ instead of loading multiple compressed NIfTI files on each run.
 import hashlib
 import h5py
 import numpy as np
-import torch
 from pathlib import Path
 from typing import List, Union, Tuple, Optional, Sequence
 import time
@@ -200,7 +199,7 @@ def load_cache(
 
     print(f"   ✓ Loaded: {metadata['n_voxels']:,} voxels × {metadata['n_timepoints']:,} TPs in {elapsed:.1f}s")
     if metadata['was_scaled']:
-        print(f"   ℹ️  Data was pre-scaled to mean=100")
+        print("   ℹ️  Data was pre-scaled to mean=100")
 
     return data, metadata
 

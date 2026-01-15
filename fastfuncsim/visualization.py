@@ -19,7 +19,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from typing import List, Dict, Optional, Union, Tuple
-import warnings
 
 
 def plot_simulation_deep_dive(
@@ -203,7 +202,7 @@ def plot_simulation_deep_dive(
     summary_text = "Summary Statistics\n" + "="*30 + "\n\n"
     summary_text += f"Data Shape: {data.shape}\n"
     summary_text += f"Design: {design.shape[0]} TRs × {design.shape[1]} regressors\n\n"
-    summary_text += f"R² Statistics:\n"
+    summary_text += "R² Statistics:\n"
     summary_text += f"  Mean:   {np.mean(r2):.4f}\n"
     summary_text += f"  Median: {np.median(r2):.4f}\n"
     summary_text += f"  Std:    {np.std(r2):.4f}\n"
@@ -215,7 +214,7 @@ def plot_simulation_deep_dive(
             beta_error = np.abs(betas[:, :len(betas_true_np)] - betas_true_np[np.newaxis, :])
         else:
             beta_error = np.abs(betas - betas_true_np)
-        summary_text += f"Beta Estimation Error:\n"
+        summary_text += "Beta Estimation Error:\n"
         summary_text += f"  MAE:  {np.mean(beta_error):.4f}\n"
         summary_text += f"  RMSE: {np.sqrt(np.mean(beta_error**2)):.4f}\n"
 
@@ -680,7 +679,7 @@ def plot_hrf_recovery(
     peak_errors = peak_times - true_peak_time
 
     stats_text = "HRF Recovery Statistics\n" + "="*35 + "\n\n"
-    stats_text += f"Correlation:\n"
+    stats_text += "Correlation:\n"
     stats_text += f"  Mean:   {np.mean(correlations):.4f}\n"
     stats_text += f"  Median: {np.median(correlations):.4f}\n"
     stats_text += f"  Std:    {np.std(correlations):.4f}\n"
@@ -689,11 +688,11 @@ def plot_hrf_recovery(
 
     rmses = np.array([np.sqrt(np.mean((hrf_true_norm - hrf_est_norm[i, :])**2))
                      for i in range(n_voxels_total)])
-    stats_text += f"RMSE:\n"
+    stats_text += "RMSE:\n"
     stats_text += f"  Mean:   {np.mean(rmses):.4f}\n"
     stats_text += f"  Median: {np.median(rmses):.4f}\n\n"
 
-    stats_text += f"Peak Timing Error (s):\n"
+    stats_text += "Peak Timing Error (s):\n"
     stats_text += f"  True peak: {true_peak_time:.2f}s\n"
     stats_text += f"  Mean error: {np.mean(peak_errors):.2f}s\n"
     stats_text += f"  Std error:  {np.std(peak_errors):.2f}s\n"

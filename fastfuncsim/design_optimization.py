@@ -19,14 +19,11 @@ import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional, Union, Literal
 from dataclasses import dataclass
-import itertools
 from scipy.stats import poisson, expon, truncexpon
 import warnings
 
 # Import our metrics
 from .metrics_empirical import (
-    compute_detection_power_empirical,
-    compute_estimation_efficiency_empirical,
     evaluate_design_empirical
 )
 from .design import convolve_hrf
@@ -767,7 +764,6 @@ def plot_fitness_landscape(
         save_path: Path to save figure (optional)
     """
     import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
 
     # Extract metrics
     powers = []
@@ -1029,7 +1025,6 @@ def plot_isi_range_optimization(
         ... )
     """
     import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
 
     if device is None:
         device = torch.device('mps' if torch.backends.mps.is_available() else
@@ -1198,7 +1193,7 @@ def plot_isi_range_optimization(
         opt_min = min_isis[max_idx[0]]
         opt_max = max_isis[max_idx[1]]
         opt_power = power_grid[max_idx]
-        print(f"Detection Power Optimum:")
+        print("Detection Power Optimum:")
         print(f"  ISI range: [{opt_min:.2f}, {opt_max:.2f}] s")
         print(f"  Detection Power: {opt_power:.4f}")
         print()
@@ -1208,7 +1203,7 @@ def plot_isi_range_optimization(
         opt_min = min_isis[max_idx[0]]
         opt_max = max_isis[max_idx[1]]
         opt_eff = efficiency_grid[max_idx]
-        print(f"Estimation Efficiency Optimum:")
+        print("Estimation Efficiency Optimum:")
         print(f"  ISI range: [{opt_min:.2f}, {opt_max:.2f}] s")
         print(f"  Estimation Efficiency: {opt_eff:.4f}")
         print("=" * 80)

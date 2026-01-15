@@ -18,8 +18,7 @@ NeuroImage, 21(1), 387-400.
 
 import torch
 import numpy as np
-from typing import Optional, Union, Dict, List, Tuple
-from scipy import stats
+from typing import Optional, Union, Dict, Tuple
 
 
 def compute_design_matrix_for_condition(

@@ -25,9 +25,8 @@ Both computed with AR(1) correction for realistic fMRI temporal autocorrelation.
 
 import torch
 import numpy as np
-from typing import Optional, Union, Dict, Tuple
+from typing import Optional, Union, Dict
 from scipy.linalg import toeplitz
-import warnings
 
 
 def estimate_ar1_coefficient(

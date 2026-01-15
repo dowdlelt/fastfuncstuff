@@ -9,9 +9,8 @@ import nibabel as nib
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Dict, Any
 from .utils import get_device, print_device_info, to_tensor
-from .hrf import get_hrf_library, get_canonical_hrf
 from .noise import generate_fmri_noise, add_drift
-from .design import build_glm_design, generate_random_onsets, convolve_design_hrf
+from .design import build_glm_design
 
 
 def simulate_fmri_run(onsets: torch.Tensor,
@@ -575,8 +574,8 @@ def save_simulation_outputs(data_list: List[torch.Tensor],
     if verbose:
         print(f"  ✓ {len(onset_files)} onset files")
         print(f"  ✓ {len(nifti_files)} nifti files")
-        print(f"  ✓ metadata file")
-        print(f"\nSimulation outputs saved successfully!")
+        print("  ✓ metadata file")
+        print("\nSimulation outputs saved successfully!")
 
     return {
         'output_dir': sim_dir,

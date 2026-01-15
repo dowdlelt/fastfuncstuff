@@ -17,8 +17,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
-from scipy.spatial.distance import pdist, squareform
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
 from tqdm.auto import tqdm
 
 from .ica import FastICA

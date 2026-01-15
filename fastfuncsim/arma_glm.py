@@ -223,7 +223,7 @@ def check_cuda_memory_before_batch(
             )
             print(f"  GPU: {allocated_mem / 1e9:.2f} GB allocated, {free_mem / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total")
             print(f"  📉 Reducing batch: {batch_voxels:,} → {new_batch:,} voxels")
-            print(f"  ℹ️  Conservative: Accounts for peak memory during Cholesky/solve operations\n")
+            print("  ℹ️  Conservative: Accounts for peak memory during Cholesky/solve operations\n")
 
         return new_batch
     elif verbose:
@@ -1190,7 +1190,7 @@ def precompute_reml_grid(
         if num_threads < 4:
             print(f"  WARNING: PyTorch using only {num_threads} CPU threads!")
             print(
-                f"  Set OMP_NUM_THREADS or torch.set_num_threads() for better performance"
+                "  Set OMP_NUM_THREADS or torch.set_num_threads() for better performance"
             )
 
     # Move grids to build_device BEFORE ensure_zero_in_grid
@@ -1244,7 +1244,7 @@ def precompute_reml_grid(
         chol_start = time.time()
 
         if verbose:
-            print(f"    [DEBUG] Entering Cholesky computation...")
+            print("    [DEBUG] Entering Cholesky computation...")
 
         if cholesky_on_cpu or device.type == "mps":
             # CPU Cholesky: For pure CPU mode with large matrices, chunk the batch
@@ -1253,7 +1253,7 @@ def precompute_reml_grid(
             # In pure CPU mode, it may use slower backends, so we chunk
 
             if verbose:
-                print(f"    [DEBUG] In cholesky_on_cpu branch")
+                print("    [DEBUG] In cholesky_on_cpu branch")
                 print(
                     f"    [DEBUG] Checking chunking: device={device.type}, n_tp={n_timepoints}, n_valid={n_valid}"
                 )
@@ -1262,98 +1262,44 @@ def precompute_reml_grid(
                 )
                 print(f"    [DEBUG] Will use chunking: {will_chunk}")
 
-            # DISABLE CHUNKING - it's causing hangs!
-            # Both GPU and CPU modes should use the same batch Cholesky path
-            if False and device.type == "cpu" and n_timepoints > 1000 and n_valid > 50:
-                # CHUNKED CPU CHOLESKY - DISABLED FOR NOW
-                chunk_size = 1
-                n_chunks = n_valid
+            # Standard batch Cholesky for GPU-available mode or small grids
+            if verbose:
+                print("    [DEBUG] Using STANDARD batch Cholesky (non-chunked)")
+                print(
+                    f"    [DEBUG] About to call torch.linalg.cholesky on shape {R_batch.shape}..."
+                )
 
+            L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
+
+            if verbose:
+                print("    [DEBUG] Cholesky done, computing batch inverse...")
+                print(
+                    f"    [DEBUG] L_batch device: {L_batch.device}, dtype: {L_batch.dtype}"
+                )
+
+            # WORKAROUND: In pure CPU mode, batch inverse hangs!
+            # Do sequential inverse instead when device=cpu
+            if device.type == "cpu":
                 if verbose:
                     print(
-                        f"    [DEBUG] Using CHUNKED Cholesky: {n_chunks} chunks of ~{chunk_size}"
+                        "    [DEBUG] Using SEQUENTIAL inverse for pure CPU mode (batch inv hangs)"
                     )
+                L_inv_list = []
+                from tqdm.auto import tqdm
 
-                L_batch_list = []
-                L_inv_batch_list = []
-
-                chunk_iter = range(n_chunks)
-                if verbose:
-                    from tqdm.auto import tqdm
-
-                    chunk_iter = tqdm(
-                        chunk_iter, desc="  Cholesky chunks", unit="chunk"
-                    )
-
-                for i in chunk_iter:
-                    start_idx = i * chunk_size
-                    end_idx = min(start_idx + chunk_size, n_valid)
-                    R_chunk = R_batch[start_idx:end_idx]
-
-                    if verbose and i == 0:
-                        print(f"    [DEBUG] First chunk shape: {R_chunk.shape}")
-                        print(f"    [DEBUG] Starting first Cholesky decomposition...")
-
-                    L_chunk = torch.linalg.cholesky(R_chunk)
-
-                    if verbose and i == 0:
-                        print(f"    [DEBUG] First Cholesky done, computing inverse...")
-
-                    L_inv_chunk = torch.linalg.inv(L_chunk)
-
-                    if verbose and i == 0:
-                        print(f"    [DEBUG] First inverse done")
-
-                    L_batch_list.append(L_chunk)
-                    L_inv_batch_list.append(L_inv_chunk)
-
-                if verbose:
-                    print(f"    [DEBUG] Concatenating {len(L_batch_list)} chunks...")
-
-                L_batch = torch.cat(L_batch_list, dim=0)
-                L_inv_batch = torch.cat(L_inv_batch_list, dim=0)
-
-                if verbose:
-                    print(f"    [DEBUG] Concatenation done")
+                for i in tqdm(
+                    range(n_valid),
+                    desc="  Inverting matrices",
+                    unit="matrix",
+                    disable=not verbose,
+                ):
+                    L_inv_list.append(torch.linalg.inv(L_batch[i]))
+                L_inv_batch = torch.stack(L_inv_list, dim=0)
             else:
-                # Standard batch Cholesky for GPU-available mode or small grids
-                if verbose:
-                    print(f"    [DEBUG] Using STANDARD batch Cholesky (non-chunked)")
-                    print(
-                        f"    [DEBUG] About to call torch.linalg.cholesky on shape {R_batch.shape}..."
-                    )
+                L_inv_batch = torch.linalg.inv(L_batch)  # (n_valid, n, n)
 
-                L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
-
-                if verbose:
-                    print(f"    [DEBUG] Cholesky done, computing batch inverse...")
-                    print(
-                        f"    [DEBUG] L_batch device: {L_batch.device}, dtype: {L_batch.dtype}"
-                    )
-
-                # WORKAROUND: In pure CPU mode, batch inverse hangs!
-                # Do sequential inverse instead when device=cpu
-                if device.type == "cpu":
-                    if verbose:
-                        print(
-                            f"    [DEBUG] Using SEQUENTIAL inverse for pure CPU mode (batch inv hangs)"
-                        )
-                    L_inv_list = []
-                    from tqdm.auto import tqdm
-
-                    for i in tqdm(
-                        range(n_valid),
-                        desc="  Inverting matrices",
-                        unit="matrix",
-                        disable=not verbose,
-                    ):
-                        L_inv_list.append(torch.linalg.inv(L_batch[i]))
-                    L_inv_batch = torch.stack(L_inv_list, dim=0)
-                else:
-                    L_inv_batch = torch.linalg.inv(L_batch)  # (n_valid, n, n)
-
-                if verbose:
-                    print(f"    [DEBUG] Batch inverse done")
+            if verbose:
+                print("    [DEBUG] Batch inverse done")
 
             # KEEP ON CPU - will be moved to GPU ONCE after precomputation
             # This avoids OOM during grid construction (6+ GiB for large grids)
@@ -1370,7 +1316,7 @@ def precompute_reml_grid(
 
         if verbose:
             print(f"  ✓ Computed {n_valid} Cholesky factorizations! ({chol_time:.1f}s)")
-            print(f"  Prewhitening design matrix for all parameters...")
+            print("  Prewhitening design matrix for all parameters...")
 
         if debug_memory:
             _debug_memory_snapshot(
@@ -1454,7 +1400,7 @@ def precompute_reml_grid(
             del sign_batch
 
         if verbose:
-            print(f"  ✓ Precomputed all matrices!")
+            print("  ✓ Precomputed all matrices!")
             print(f"  Storing {n_valid} parameter sets...")
 
         # PHASE 6: Store everything in dictionary ON CPU
@@ -1492,9 +1438,9 @@ def precompute_reml_grid(
         if "R_batch" in locals():
             del R_batch
         if "L_batch" in locals():
-            del L_batch
+            del L_batch  # noqa: F821
         if "L_inv_batch" in locals():
-            del L_inv_batch
+            del L_inv_batch  # noqa: F821
         if "X_w_batch" in locals():
             del X_w_batch
         if "Q_batch" in locals():
@@ -1606,7 +1552,7 @@ def precompute_reml_grid(
             actual_R_qr = R_batch.element_size() * R_batch.nelement()
             actual_total = actual_L_inv + actual_X_w + actual_R_qr
 
-            print(f"\nGRID SIZE VERIFICATION:")
+            print("\nGRID SIZE VERIFICATION:")
             print(
                 f"  n_pairs={n_pairs}, n_timepoints={n_timepoints}, n_regressors={n_regs}, dtype={dtype}"
             )
@@ -2264,7 +2210,7 @@ def search_voxels_precomputed_grid(
 
     # Evaluate each grid point
     for grid_idx, (a, b) in enumerate(param_list):
-        with profile_section(f"1_get_grid_data", enabled=enable_timing):
+        with profile_section("1_get_grid_data", enabled=enable_timing):
             grid_data = precomputed_grid[(a, b)]
 
             # Get precomputed matrices (already on GPU)
@@ -2275,19 +2221,19 @@ def search_voxels_precomputed_grid(
             logdet_XwTXw = grid_data['logdet_XwTXw']
 
         # Prewhiten data: Y_w = L_inv @ Y for all voxels
-        with profile_section(f"2_prewhiten_data", enabled=enable_timing):
+        with profile_section("2_prewhiten_data", enabled=enable_timing):
             # Y_batch: (n_voxels, n_timepoints)
             # L_inv: (n_timepoints, n_timepoints)
             # Result: (n_voxels, n_timepoints)
             Y_w_batch = (Y_batch @ L_inv.T)  # More efficient than L_inv @ Y_batch.T
 
         # Solve X_w @ beta = Y_w for each voxel
-        with profile_section(f"3_compute_XwTYw", enabled=enable_timing):
+        with profile_section("3_compute_XwTYw", enabled=enable_timing):
             # Compute X_w' Y_w
             XwT_Yw = X_w.T @ Y_w_batch.T  # (n_regressors, n_voxels)
 
         # Solve for beta using appropriate method
-        with profile_section(f"4_solve_beta", enabled=enable_timing):
+        with profile_section("4_solve_beta", enabled=enable_timing):
             if use_qr:
                 # QR approach: R' R beta = X_w' Y_w (triangular solves)
                 # R_qr is upper triangular R factor from QR decomposition
@@ -2306,13 +2252,13 @@ def search_voxels_precomputed_grid(
             beta_batch = beta_batch.T  # (n_voxels, n_regressors)
 
         # Compute prewhitened residuals
-        with profile_section(f"5_compute_residuals", enabled=enable_timing):
+        with profile_section("5_compute_residuals", enabled=enable_timing):
             pred_w = (X_w @ beta_batch.T).T  # (n_voxels, n_timepoints)
             resid_w = Y_w_batch - pred_w
             rss_batch = torch.sum(resid_w ** 2, dim=1)  # (n_voxels,)
 
         # Compute REML likelihood for this (a, b)
-        with profile_section(f"6_compute_likelihood", enabled=enable_timing):
+        with profile_section("6_compute_likelihood", enabled=enable_timing):
             # L = log(det(R)) + log(det(X'R^-1 X)) + (n-m) log(RSS)
             term1 = logdet_Rcorr  # Scalar, same for all voxels
             term2 = logdet_XwTXw  # Scalar, same for all voxels
@@ -2321,7 +2267,7 @@ def search_voxels_precomputed_grid(
             likelihoods = term1 + term2 + term3  # (n_voxels,)
 
         # Update best parameters where this (a, b) is better
-        with profile_section(f"7_update_best", enabled=enable_timing):
+        with profile_section("7_update_best", enabled=enable_timing):
             improve_mask = likelihoods < best_likelihoods
             best_likelihoods[improve_mask] = likelihoods[improve_mask]
             best_params[improve_mask, 0] = a
@@ -2423,7 +2369,8 @@ def prewhiten_with_arma11(
             torch.cuda.empty_cache()
 
         # Cholesky on CPU
-        L_cpu = torch.linalg.cholesky(R)
+        # R exists here from line 2382 (only deleted if try succeeds at line 2405)
+        L_cpu = torch.linalg.cholesky(R)  # noqa: F821
 
         # Compute L_inv on CPU
         identity_cpu = torch.eye(n_timepoints, dtype=L_cpu.dtype, device=torch.device("cpu"))
@@ -2432,7 +2379,7 @@ def prewhiten_with_arma11(
 
         # Move only L_inv to GPU (smaller than R)
         L_inv = L_inv_cpu.to(device)
-        del L_inv_cpu, R  # Cleanup both
+        del L_inv_cpu, R  # Cleanup both  # noqa: F821
 
     if Y.ndim == 1:
         Y = Y.unsqueeze(1)
@@ -2520,7 +2467,7 @@ def determine_adaptive_batching_strategy(
 
     if verbose:
         print(f"\n{'='*70}")
-        print(f"ADAPTIVE BATCHING STRATEGY")
+        print("ADAPTIVE BATCHING STRATEGY")
         print(f"{'='*70}")
         print(f"  Grid: {n_grid_points} points × {grid_mem_per_point/1024**2:.1f} MB = {grid_mem_total/1024**3:.2f} GB")
         print(f"  Data: {n_voxels} voxels × {n_timepoints} TPs = {data_mem/1024**3:.2f} GB")
@@ -3115,7 +3062,7 @@ def fit_glm_arma11(
 
             if debug_memory:
                 print(f"\n{'=' * 70}")
-                print(f"EXPECTED GRID SIZE CALCULATION")
+                print("EXPECTED GRID SIZE CALCULATION")
                 print(f"{'=' * 70}")
                 print(f"  n_valid_pairs: {n_valid_pairs}")
                 print(f"  n_timepoints:  {n_timepoints}")
@@ -3127,7 +3074,7 @@ def fit_glm_arma11(
                 X_w_bytes = n_valid_pairs * n_timepoints * n_regressors * bytes_elem
                 XwTXw_bytes = n_valid_pairs * n_regressors * n_regressors * bytes_elem
                 scalars_bytes = n_valid_pairs * 2 * bytes_elem
-                print(f"  Expected grid memory:")
+                print("  Expected grid memory:")
                 print(
                     f"    L_inv:   {L_inv_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} × {n_timepoints} × {n_timepoints})"
                 )
@@ -3209,12 +3156,12 @@ def fit_glm_arma11(
                 grid_mb = grid_memory_bytes / (1024**2)
                 if use_grid_batching:
                     print(f"Grid size: {n_valid_pairs} (a,b) pairs")
-                    print(f"Strategy: Grid batching (low memory, process all voxels per grid point)")
+                    print("Strategy: Grid batching (low memory, process all voxels per grid point)")
                     print(f"  Memory per grid point: ~{grid_memory_bytes/n_valid_pairs/1024**2:.1f} MiB")
                     print(f"  Batch size: {batch_size:,} voxels")
                 else:
                     print(f"Grid memory: {grid_mb:.1f} MiB ({n_valid_pairs} pairs)")
-                    print(f"Strategy: Full grid precomputation (AFNI approach)")
+                    print("Strategy: Full grid precomputation (AFNI approach)")
                     print(
                         f"Adjusted batch size: {batch_size:,} voxels (grid + batches fit in GPU)"
                     )
@@ -3573,7 +3520,7 @@ def fit_glm_arma11(
                 results.arma_lambda[:] = lam
 
                 if verbose:
-                    print(f"\n✓ Grid search complete!")
+                    print("\n✓ Grid search complete!")
                     print(f"  Mean (a, b): ({a_vals.mean():.3f}, {b_vals.mean():.3f})")
                     print(f"  Mean λ: {lam.mean():.3f}\n")
 
@@ -3611,7 +3558,7 @@ def fit_glm_arma11(
                         use_gpu_cholesky = True
                         if verbose:
                             print(f"  🚀 Using GPU Cholesky (grid: {estimated_gb:.1f}GB < {available_gb:.1f}GB available)")
-                            print(f"     Expected 10-20× speedup over CPU!")
+                            print("     Expected 10-20× speedup over CPU!")
                     else:
                         if verbose:
                             print(f"  Using CPU Cholesky (grid: {estimated_gb:.1f}GB > {available_gb:.1f}GB available)")
@@ -3659,7 +3606,7 @@ def fit_glm_arma11(
                 # This is the AFNI strategy: precompute once, reuse for all voxels
                 if device.type == "cuda":
                     if verbose:
-                        print(f"  Loading grid to GPU (one-time cost)...")
+                        print("  Loading grid to GPU (one-time cost)...")
                     for key in precomputed_grid:
                         precomputed_grid[key]["L_inv"] = precomputed_grid[key]["L_inv"].to(
                             device
@@ -3740,7 +3687,7 @@ def fit_glm_arma11(
                 results.arma_lambda = lam
 
                 if verbose:
-                    print(f"\n✓ Grid search complete!")
+                    print("\n✓ Grid search complete!")
                     print(f"  Mean (a, b): ({a_vals.mean():.3f}, {b_vals.mean():.3f})")
                     print(f"  Mean λ: {lam.mean():.3f}\n")
 
@@ -3989,7 +3936,7 @@ def fit_glm_arma11(
                     # Semi-partial R² per regressor: r²_semi_i = partial_r²_i * (1 - R²_full)
                     if want_r2_semipartial:
                         # Need to get R² for each voxel in the batch
-                        r2_batch = r2[start_idx:end_idx].to(device)
+                        r2_batch = results.r2[sub_voxel_indices].to(device)
                         variance_remaining = torch.clamp(1.0 - r2_batch.unsqueeze(1), min=0.0)
     
                         # If we didn't compute partial R² above, compute it now for semi-partial
@@ -4065,8 +4012,6 @@ def fit_glm_arma11(
                         fstats_batch = quad_batch / n_regressors
                         del quad_batch, betas_batch_col, var_inv_batch
 
-                    del XwTXw_batch
-    
                     y_mean_batch = Y_batch_dev.mean(dim=0)
                     ss_total_batch = torch.sum(
                         (Y_batch_dev - y_mean_batch.unsqueeze(0)) ** 2, dim=0
@@ -4395,7 +4340,7 @@ def fit_glm_arma11(
                         # Use the r2_batch that was fetched earlier in semi-partial computation
                         # If we didn't compute semi-partial above (e.g., no task regressors), get it now
                         if 'r2_batch' not in locals():
-                            r2_batch = r2[start_idx:end_idx].to(device)
+                            r2_batch = results.r2[sub_voxel_indices].to(device)
                         variance_remaining_contrasts = torch.clamp(1.0 - r2_batch.unsqueeze(1), min=0.0)
                         contrast_r2_semipartial_batch = contrast_r2_partial_batch_temp * variance_remaining_contrasts
     

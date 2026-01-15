@@ -12,7 +12,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from .afni_io import get_tr_from_file, replace_afni_extension
+from .afni_io import get_tr_from_file
 
 
 def save_component_maps(

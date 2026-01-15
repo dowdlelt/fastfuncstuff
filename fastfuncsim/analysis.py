@@ -4,7 +4,7 @@ Complete pipelines from AFNI files to GLM results
 """
 
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import nibabel as nib
 import numpy as np
@@ -503,7 +503,7 @@ def analyze_from_design_matrix(
 
     if not (90 <= global_mean <= 110):
         print(f"\n⚠️  Data mean: {global_mean:.1f} (expected ~100)")
-        print(f"   Auto-scaling to mean=100 (AFNI convention)")
+        print("   Auto-scaling to mean=100 (AFNI convention)")
 
         # Scale each voxel's timeseries to have mean=100
         # This preserves relative signal changes while standardizing baseline
@@ -610,7 +610,7 @@ def analyze_from_design_matrix(
                 f"Mask '{mask_file}' excluded all voxels (threshold={mask_threshold})."
             )
 
-        print(f"📊 Mask applied:")
+        print("📊 Mask applied:")
         print(f"  Total voxels: {n_voxels:,}")
         print(f"  Kept (in mask): {kept_voxels:,} ({100*kept_voxels/n_voxels:.1f}%)")
         print(f"  Excluded: {excluded_voxels:,} ({100*excluded_voxels/n_voxels:.1f}%)")
@@ -794,7 +794,7 @@ def analyze_from_design_matrix(
                     )
 
                     suffix = "_partialR2_task" if r2_partial_mode_env == "task" else "_partialR2"
-                    print(f"     Sub-bricks (partial R² with AFNI stat params):")
+                    print("     Sub-bricks (partial R² with AFNI stat params):")
                     for idx, label in enumerate(callback_stim_labels):
                         print(f"       [{idx}] {label}{suffix}")
 
@@ -834,7 +834,7 @@ def analyze_from_design_matrix(
                     )
 
                     suffix = "_semipartialR2_task" if r2_semipartial_mode_env == "task" else "_semipartialR2"
-                    print(f"     Sub-bricks (semi-partial R² with AFNI stat params):")
+                    print("     Sub-bricks (semi-partial R² with AFNI stat params):")
                     for idx, label in enumerate(callback_stim_labels):
                         print(f"       [{idx}] {label}{suffix}")
 

@@ -490,7 +490,7 @@ def compute_xval_r2(
     r2_all_splits = torch.zeros(n_splits, n_voxels, dtype=torch.float32, device='cpu')
 
     if verbose:
-        print(f"Cross-validation R² computation")
+        print("Cross-validation R² computation")
         print(f"  Voxels: {n_voxels:,}")
         print(f"  Splits: {n_splits}")
         print(f"  Metric: {metric}")
@@ -579,7 +579,7 @@ def compute_xval_r2(
                 # Only warn/report once (on first split, first chunk)
                 if split_idx == 0 and chunk_idx == 0 and verbose:
                     print(f"\n{'='*80}")
-                    print(f"INFO: Handling missing events across train/test splits")
+                    print("INFO: Handling missing events across train/test splits")
                     print(f"{'='*80}")
                     print(f"Train-only events (in train, zero in test): {len(unpredictable_cols)} - {unpredictable_cols}")
                     print(f"Test-only events (zero in train, in test): {len(test_only_cols)} - {test_only_cols}")
