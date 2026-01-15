@@ -404,5 +404,335 @@ class TestGLMBatchProcessing:
         assert torch.allclose(results_batch.betas, betas_seq, atol=1e-5)
 
 
+class TestGLMResultsToSpatial:
+    """Test GLMResults.to_spatial() spatial reshaping."""
+
+    @pytest.fixture
+    def device(self):
+        return get_device()
+
+    def test_to_spatial_3d(self, device):
+        """Test reshaping results back to 3D spatial format."""
+        from fastfuncsim.glm_core import GLMResults
+        
+        torch.manual_seed(42)
+        nx, ny, nz = 5, 6, 4
+        n_voxels = nx * ny * nz
+        n_timepoints = 100
+        n_regressors = 2
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        true_betas = torch.randn(n_voxels, n_regressors, device=device)
+        signal = X @ true_betas.T
+        data = signal.T
+
+        results = fit_glm(data, X, tr=1.0, verbose=False, device=device)
+        
+        # Store original shape and call to_spatial
+        results.original_shape = (nx, ny, nz)
+        results = results.to_spatial()
+
+        # Check shapes are now spatial
+        assert results.betas.shape == (nx, ny, nz, n_regressors)
+        assert results.r2.shape == (nx, ny, nz)
+        assert results.tstats.shape == (nx, ny, nz, n_regressors)
+        assert results.fstats.shape == (nx, ny, nz)
+
+    def test_to_spatial_no_original_shape_warns(self, device):
+        """Test that to_spatial warns when original_shape is None."""
+        from fastfuncsim.glm_core import GLMResults
+        import warnings
+        
+        results = GLMResults()
+        results.betas = torch.randn(100, 3)
+        results.r2 = torch.randn(100)
+        
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            results.to_spatial()
+            assert len(w) == 1
+            assert "Original shape not stored" in str(w[0].message)
+
+
+class TestGLM4DInput:
+    """Test GLM with 4D spatial data input."""
+
+    @pytest.fixture
+    def device(self):
+        return get_device()
+
+    def test_4d_data_input(self, device):
+        """Test GLM with 4D (nx, ny, nz, nt) data input."""
+        torch.manual_seed(42)
+
+        nx, ny, nz, n_timepoints = 5, 5, 3, 80
+        n_regressors = 2
+
+        # 4D data
+        data_4d = torch.randn(nx, ny, nz, n_timepoints, device=device)
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+
+        results = fit_glm(data_4d, X, tr=1.0, verbose=False, device=device)
+
+        # Should be flattened
+        n_voxels = nx * ny * nz
+        assert results.betas.shape == (n_voxels, n_regressors)
+        assert results.original_shape == (nx, ny, nz)
+
+    def test_invalid_data_dimension(self, device):
+        """Test that invalid data dimensions raise error."""
+        X = torch.randn(100, 2, device=device)
+        data_3d = torch.randn(10, 10, 100, device=device)  # Wrong 3D
+
+        with pytest.raises(ValueError, match="must be 2D.*or 4D"):
+            fit_glm(data_3d, X, tr=1.0, verbose=False, device=device)
+
+
+class TestGLMMultiRun:
+    """Test GLM with multiple runs."""
+
+    @pytest.fixture
+    def device(self):
+        return get_device()
+
+    def test_multi_run_fit(self, device):
+        """Test GLM with list of runs."""
+        torch.manual_seed(42)
+
+        n_voxels = 50
+        n_timepoints_per_run = 100
+        n_regressors = 3
+        n_runs = 2
+
+        # Create data and design for each run
+        data_list = [torch.randn(n_voxels, n_timepoints_per_run, device=device)
+                     for _ in range(n_runs)]
+        design_list = [torch.randn(n_timepoints_per_run, n_regressors, device=device)
+                       for _ in range(n_runs)]
+
+        results = fit_glm(
+            data_list, design_list, tr=1.0,
+            verbose=False, device=device
+        )
+
+        # Betas should have task regressors from all runs
+        # Default behavior: n_runs * n_regressors task betas
+        assert results.betas.shape[0] == n_voxels
+        assert torch.all(torch.isfinite(results.betas))
+
+    def test_multi_run_with_extra_regressors(self, device):
+        """Test multi-run GLM with extra nuisance regressors."""
+        torch.manual_seed(42)
+
+        n_voxels = 30
+        n_timepoints = 80
+        n_task = 2
+        n_extra = 3
+        n_runs = 2
+
+        data_list = [torch.randn(n_voxels, n_timepoints, device=device)
+                     for _ in range(n_runs)]
+        design_list = [torch.randn(n_timepoints, n_task, device=device)
+                       for _ in range(n_runs)]
+        extra_list = [torch.randn(n_timepoints, n_extra, device=device)
+                      for _ in range(n_runs)]
+
+        results = fit_glm(
+            data_list, design_list, tr=1.0,
+            extra_regressors=extra_list,
+            verbose=False, device=device
+        )
+
+        assert results.betas.shape[0] == n_voxels
+        assert torch.all(torch.isfinite(results.r2))
+
+
+class TestGLMAdvancedFeatures:
+    """Test advanced GLM features."""
+
+    @pytest.fixture
+    def device(self):
+        return get_device()
+
+    def test_use_double_precision(self, device):
+        """Test GLM with double precision."""
+        torch.manual_seed(42)
+
+        n_timepoints = 100
+        n_voxels = 10
+        n_regressors = 2
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        data = torch.randn(n_voxels, n_timepoints, device=device)
+
+        results = fit_glm(
+            data, X, tr=1.0,
+            use_double=True,
+            verbose=False, device=device
+        )
+
+        # Results should be in float64
+        assert results.betas.dtype == torch.float64
+
+    def test_streaming_mode(self, device):
+        """Test GLM with preload_data_to_device=False (streaming)."""
+        torch.manual_seed(42)
+
+        n_timepoints = 100
+        n_voxels = 100
+        n_regressors = 2
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        data = torch.randn(n_voxels, n_timepoints, device=device)
+
+        # Force data to CPU for streaming test
+        data_cpu = data.cpu()
+
+        results = fit_glm(
+            data_cpu, X, tr=1.0,
+            preload_data_to_device=False,
+            verbose=False, device=device
+        )
+
+        assert results.betas.shape == (n_voxels, n_regressors)
+        assert torch.all(torch.isfinite(results.betas))
+
+    def test_want_residuals_and_predicted(self, device):
+        """Test GLM returning residuals and predicted values."""
+        torch.manual_seed(42)
+
+        n_timepoints = 80
+        n_voxels = 20
+        n_regressors = 2
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        true_betas = torch.randn(n_voxels, n_regressors, device=device)
+        signal = X @ true_betas.T
+        data = signal.T + 0.1 * torch.randn(n_voxels, n_timepoints, device=device)
+
+        results = fit_glm(
+            data, X, tr=1.0,
+            want_residuals=True,
+            want_predicted=True,
+            verbose=False, device=device
+        )
+
+        # Should have residuals and predicted
+        assert results.residuals is not None
+        assert results.predicted is not None
+        assert results.residuals.shape == (n_voxels, n_timepoints)
+        assert results.predicted.shape == (n_voxels, n_timepoints)
+
+    def test_partial_r2_computation(self, device):
+        """Test partial R² computation."""
+        torch.manual_seed(42)
+
+        n_timepoints = 100
+        n_voxels = 30
+        n_regressors = 3
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        data = torch.randn(n_voxels, n_timepoints, device=device)
+
+        results = fit_glm(
+            data, X, tr=1.0,
+            want_r2_partial=True,
+            verbose=False, device=device
+        )
+
+        # Should have partial R²
+        assert results.r2_partial is not None
+        # Partial R² should be in [0, 1]
+        assert torch.all(results.r2_partial >= 0)
+        assert torch.all(results.r2_partial <= 1)
+
+    def test_semipartial_r2_computation(self, device):
+        """Test semi-partial R² computation."""
+        torch.manual_seed(42)
+
+        n_timepoints = 100
+        n_voxels = 30
+        n_regressors = 3
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        data = torch.randn(n_voxels, n_timepoints, device=device)
+
+        results = fit_glm(
+            data, X, tr=1.0,
+            want_r2_semipartial=True,
+            verbose=False, device=device
+        )
+
+        # Should have semi-partial R²
+        assert results.r2_semipartial is not None
+        assert torch.all(results.r2_semipartial >= 0)
+
+
+class TestGLMContrasts:
+    """Test GLT contrast computation."""
+
+    @pytest.fixture
+    def device(self):
+        return get_device()
+
+    def test_basic_contrast(self, device):
+        """Test basic single-row contrast (t-test)."""
+        torch.manual_seed(42)
+
+        n_timepoints = 100
+        n_voxels = 20
+        n_regressors = 3
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        data = torch.randn(n_voxels, n_timepoints, device=device)
+
+        # Simple contrast: first regressor vs zero
+        glt_labels = ["reg1_vs_zero"]
+        glt_matrices = [np.array([1.0, 0.0, 0.0])]
+
+        results = fit_glm(
+            data, X, tr=1.0,
+            max_poly_degree=-1,  # No polynomial to keep regressor count simple
+            glt_labels=glt_labels,
+            glt_matrices=glt_matrices,
+            verbose=False, device=device
+        )
+
+        assert results.contrast_labels == glt_labels
+        assert results.contrast_betas is not None
+        assert results.contrast_tstats is not None
+        assert results.contrast_betas.shape == (n_voxels, 1)
+
+    def test_difference_contrast(self, device):
+        """Test difference contrast between two regressors."""
+        torch.manual_seed(42)
+
+        n_timepoints = 100
+        n_voxels = 20
+        n_regressors = 2
+
+        X = torch.randn(n_timepoints, n_regressors, device=device)
+        true_betas = torch.tensor([[5.0, 1.0]] * n_voxels, device=device)
+        signal = X @ true_betas.T
+        data = signal.T + 0.1 * torch.randn(n_voxels, n_timepoints, device=device)
+
+        # Contrast: regressor 1 - regressor 2
+        glt_labels = ["reg1_minus_reg2"]
+        glt_matrices = [np.array([1.0, -1.0])]
+
+        results = fit_glm(
+            data, X, tr=1.0,
+            max_poly_degree=-1,
+            glt_labels=glt_labels,
+            glt_matrices=glt_matrices,
+            verbose=False, device=device
+        )
+
+        # Contrast beta should be approximately 5 - 1 = 4
+        mean_contrast_beta = results.contrast_betas.mean().item()
+        assert abs(mean_contrast_beta - 4.0) < 0.5
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

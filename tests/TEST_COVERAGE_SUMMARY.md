@@ -8,7 +8,7 @@ The competitor AI said these had "ZERO tests" and your script would likely crash
 
 | Function | Test Count | Status |
 |----------|------------|--------|
-| `write_afni_bucket()` | 8 tests | ✅ **PASSING** |
+| `write_glm_bucket_as_nifti()` | 8 tests | ✅ **PASSING** |
 | `write_ols_arma_comparison()` | 6 tests | ✅ **PASSING** |
 | `save_arma_rvar()` | 6 tests | ✅ **PASSING** (5/6) |
 | `slice_glm_results()` | 9 tests | ✅ **ALL PASSING** |
@@ -30,7 +30,7 @@ Tests GPU-accelerated slicing of GLM results by regressor indices.
 - ✅ Creates independent copies (no memory aliasing)
 - ✅ Handles empty indices
 
-### ✅ `write_afni_bucket()` - 7/8 PASSING
+### ✅ `write_glm_bucket_as_nifti()` - 7/8 PASSING
 Tests writing GLM results to AFNI-style NIfTI files.
 
 - ✅ Basic NIfTI writing with compression

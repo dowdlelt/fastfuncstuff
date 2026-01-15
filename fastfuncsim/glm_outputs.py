@@ -472,16 +472,18 @@ def _save_nifti_with_format(
         Actual path to saved file (with proper extension)
     """
     if format == "afni":
-        # Save as AFNI BRIK/HEAD
-        # nibabel automatically creates .HEAD and .BRIK files
-        brik_path = output_path.with_suffix(
-            ".BRIK" if not compress_brik else ".BRIK.gz"
+        # Redirect AFNI requests to NIfTI with warning
+        import warnings
+        warnings.warn(
+            "Direct writing of AFNI HEAD/BRIK format is not supported (cannot preserve metadata). "
+            "Writing as compressed NIfTI (.nii.gz) instead. AFNI programs read NIfTI files natively.",
+            UserWarning,
+            stacklevel=2
         )
-        nib.save(img, str(brik_path))
-        # Return the HEAD file path (convention)
-        return output_path.with_suffix(".HEAD")
-
-    elif format == "nifti_gz":
+        # Use nifti_gz logic
+        format = "nifti_gz"
+        
+    if format == "nifti_gz":
         # Save as compressed NIfTI
         nifti_path = (
             output_path.with_suffix(".nii.gz")
@@ -680,21 +682,61 @@ def write_afni_bucket(
     output_format: Optional[str] = None,
 ) -> Path:
     """
-    Write GLM results as an AFNI-style bucket file
+    write_afni_bucket(results, output_path, ...)
+
+    .. deprecated:: 1.0
+        Use `write_glm_bucket_as_nifti` instead.
+
+    See `write_glm_bucket_as_nifti` for documentation.
+    """
+    import warnings
+    warnings.warn(
+        "`write_afni_bucket` is deprecated and renamed to `write_glm_bucket_as_nifti`. "
+        "It writes NIfTI files (.nii.gz) which AFNI supports. "
+        "Please update your code.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    return write_glm_bucket_as_nifti(
+        results, output_path, condition_names, contrast_names, contrast_results,
+        volume_shape, affine, voxel_size, dtype, apply_afni_metadata,
+        compress_output, output_format
+    )
+
+
+def write_glm_bucket_as_nifti(
+    results: ResultsLike,
+    output_path: Union[str, Path],
+    condition_names: Optional[Sequence[str]] = None,
+    contrast_names: Optional[Sequence[str]] = None,
+    contrast_results: Optional[dict] = None,
+    volume_shape: Optional[Sequence[int]] = None,
+    affine: Optional[np.ndarray] = None,
+    voxel_size: Sequence[float] = (2.0, 2.0, 2.0),
+    dtype: Union[np.dtype, str] = np.float32,
+    apply_afni_metadata: bool = True,
+    compress_output: bool = True,
+    output_format: Optional[str] = None,
+) -> Path:
+    """
+    Write GLM results as a 4D output file (NIfTI) with AFNI-style sub-bricks.
 
     Creates a single 4D NIfTI file with sub-bricks in AFNI order:
     1. Overall F-statistic
     2. For each condition: Beta coefficient, then T-statistic
     3. For each contrast: Beta coefficient, then T-statistic
 
-    This matches AFNI's 3dDeconvolve output format.
+    This matches AFNI's 3dDeconvolve output format. The output is always NIfTI
+    (.nii or .nii.gz), as AFNI reads NIfTI files natively and this preserves
+    metadata better than writing .BRIK files from Python.
 
     Parameters
     ----------
     results : GLMResults or ARMA11Results
         GLM fitting results
     output_path : str or Path
-        Output file path (.nii or .nii.gz)
+        Output file path. If an AFNI extension (.HEAD, .BRIK) is provided,
+        it will be replaced with .nii.gz and a warning will be issued.
     condition_names : sequence of str, optional
         Names for each condition/regressor
     contrast_names : sequence of str, optional
@@ -717,66 +759,14 @@ def write_afni_bucket(
         - Statistical parameters (-substatpar) for F-stats and t-stats
         Requires AFNI to be installed. Gracefully skips if not available.
     compress_output : bool, default=True
-        If True, compress final output.
-        - For NIfTI: creates .nii.gz
-        - For AFNI: creates .BRIK.gz (compressed)
-        If False:
-        - For NIfTI: creates .nii
-        - For AFNI: creates .BRIK (uncompressed)
+        If True, compress final output (.nii.gz).
     output_format : str, optional
-        Output format: 'nifti', 'nifti_gz', or 'afni'
-        If None (default), auto-detect from output_path extension:
-        - .nii → NIfTI uncompressed
-        - .nii.gz → NIfTI compressed
-        - .HEAD / .BRIK / .BRIK.gz → AFNI format
-        - Default: NIfTI compressed (.nii.gz)
+        Ignored (always NIfTI). Retained for compatibility.
 
     Returns
     -------
     output_path : Path
-        Path to written bucket file (with .nii.gz if compressed)
-
-    Examples
-    --------
-    >>> # Fit GLM
-    >>> results = ffs.fit_glm_arma11(data, design, tr=2.0)
-    >>>
-    >>> # Compute contrasts
-    >>> contrasts = [[1, -1, 0, 0]]  # Condition 1 vs 2
-    >>> contrast_results = ffs.compute_contrasts(results, contrasts)
-    >>>
-    >>> # Write as NIfTI (compressed) - default
-    >>> ffs.write_afni_bucket(
-    ...     results,
-    ...     'glm_bucket.nii.gz',
-    ...     condition_names=['faces', 'places', 'poly0', 'poly1'],
-    ...     contrast_names=['faces_vs_places'],
-    ...     contrast_results=contrast_results,
-    ...     apply_afni_metadata=True  # Automatic 3drefit!
-    ... )
-    >>>
-    >>> # Write as AFNI BRIK/HEAD format (auto-detected from extension)
-    >>> ffs.write_afni_bucket(
-    ...     results,
-    ...     'glm_bucket+tlrc.HEAD',  # AFNI format auto-detected
-    ...     condition_names=['faces', 'places', 'poly0', 'poly1'],
-    ...     contrast_names=['faces_vs_places'],
-    ...     contrast_results=contrast_results,
-    ... )
-    >>> # Creates: glm_bucket+tlrc.HEAD and glm_bucket+tlrc.BRIK.gz
-
-    Notes
-    -----
-    Sub-brick order matches AFNI 3dDeconvolve:
-    - [0]: Full_Fstat (overall model F-statistic)
-    - [1]: cond1#0_Coef (beta for condition 1)
-    - [2]: cond1#0_Tstat (t-stat for condition 1)
-    - [3]: cond2#0_Coef (beta for condition 2)
-    - [4]: cond2#0_Tstat (t-stat for condition 2)
-    - ...
-    - [N]: contrast1#0_Coef (beta for contrast 1)
-    - [N+1]: contrast1#0_Tstat (t-stat for contrast 1)
-    - ...
+        Path to written file (usually .nii.gz)
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -930,7 +920,17 @@ def write_afni_bucket(
     # 3drefit works fine with NIfTI files, so always use NIfTI for buckets
     if detected_format == "afni":
         detected_format = "nifti_gz"  # Default to compressed NIfTI
-        # Strip AFNI extension and add .nii.gz (don't use with_suffix - it breaks on periods!)
+        
+        # Warn user
+        import warnings
+        warnings.warn(
+            f"Requested AFNI format output '{output_path}' but direct writing of .HEAD/.BRIK is not supported. "
+            f"Writing as compressed NIfTI (.nii.gz) instead, which AFNI reads natively.",
+            UserWarning,
+            stacklevel=2
+        )
+        
+        # Strip AFNI extension and add .nii.gz
         base_name = _strip_imaging_extension(str(base_path))
         base_path = Path(base_name + ".nii.gz")
 

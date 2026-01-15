@@ -172,7 +172,7 @@ def test_contrasts_glt(test_data_dir, temp_output_dir):
 
 def test_bucket_output(test_data_dir, temp_output_dir):
     """Test bucket file output with header preservation."""
-    from fastfuncsim.glm_outputs import write_afni_bucket
+    from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
 
     results, design_info = analyze_from_design_matrix(
         fmri_data=INPUT_FILES,
@@ -187,7 +187,7 @@ def test_bucket_output(test_data_dir, temp_output_dir):
     stim_labels = design_info.get("stim_labels", ["movie", "prompt"])
 
     # Write bucket file
-    write_afni_bucket(
+    write_glm_bucket_as_nifti(
         results,
         output_file,
         condition_names=stim_labels,  # Only task regressors

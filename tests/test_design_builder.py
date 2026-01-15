@@ -512,6 +512,201 @@ def test_goodlist_utilities():
     print("\n✓ GoodList utilities tests passed!")
 
 
+class TestDesignBuilderEdgeCases:
+    """Test edge cases and error handling for design builder."""
+
+    def test_load_and_pad_ortvec_errors(self):
+        """Test error handling in load_and_pad_ortvec."""
+        from fastfuncsim.design_builder import load_and_pad_ortvec
+        import tempfile
+        import os
+
+        # Create dummy ortvec file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
+            f.write("1.0 2.0\n3.0 4.0\n")
+            filepath = f.name
+
+        try:
+            # Test file not found
+            with pytest.raises(FileNotFoundError):
+                load_and_pad_ortvec("nonexistent_file.1D", 1, [100])
+
+            # Test invalid run number
+            with pytest.raises(ValueError, match="Invalid run_number"):
+                load_and_pad_ortvec(filepath, 0, [2, 2])
+            
+            with pytest.raises(ValueError, match="Invalid run_number"):
+                load_and_pad_ortvec(filepath, 3, [2, 2])
+
+            # Test length mismatch (file has 2 rows, run has 10)
+            with pytest.raises(ValueError, match="has 2 rows"):
+                load_and_pad_ortvec(filepath, 1, [10, 2]) # Run 1 has 10 timepoints
+
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+    def test_load_and_pad_ortvec_success(self):
+        """Test successful loading and padding."""
+        from fastfuncsim.design_builder import load_and_pad_ortvec
+        import tempfile
+        import os
+
+        # Create dummy ortvec file (5 timepoints, 2 regressors)
+        data = np.random.randn(5, 2)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
+            for row in data:
+                f.write(f"{row[0]} {row[1]}\n")
+            filepath = f.name
+
+        try:
+            # 3 runs: 5, 5, 5 timepoints
+            n_timepoints_per_run = [5, 5, 5]
+            
+            # Load for run 2
+            padded = load_and_pad_ortvec(filepath, 2, n_timepoints_per_run)
+            
+            # Check shape: total timepoints x regressors
+            assert padded.shape == (15, 2)
+            
+            # Check run 1 is zero
+            assert np.allclose(padded[:5], 0)
+            
+            # Check run 2 matches data
+            assert np.allclose(padded[5:10], data)
+            
+            # Check run 3 is zero
+            assert np.allclose(padded[10:], 0)
+
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+    def test_parse_hrf_model_errors(self):
+        """Test error handling in parse_hrf_model."""
+        from fastfuncsim.design_builder import parse_hrf_model
+
+        # Valid cases
+        name, dur = parse_hrf_model("SPMG1(5)")
+        assert name == "SPMG1" and dur == 5.0
+        
+        name, dur = parse_hrf_model("BLOCK(20.5)")
+        assert name == "BLOCK" and dur == 20.5
+
+        # Invalid format
+        with pytest.raises(ValueError, match="Invalid HRF model string"):
+            parse_hrf_model("InvalidFormat")
+            
+        with pytest.raises(ValueError, match="Invalid HRF model string"):
+            parse_hrf_model("SPMG1[5]")
+
+        # Invalid duration
+        with pytest.raises(ValueError, match="Invalid duration"):
+            parse_hrf_model("SPMG1(abc)")
+
+    def test_glt_weights_to_vector_errors(self):
+        """Test error handling in glt_weights_to_vector."""
+        from fastfuncsim.design_builder import glt_weights_to_vector
+
+        labels = ["A", "B", "C"]
+        weights = {"A": 1, "D": -1}  # D doesn't exist
+
+        with pytest.raises(ValueError, match="GLT label 'D' not found"):
+            glt_weights_to_vector(weights, labels)
+
+    def test_build_design_matrix_errors(self):
+        """Test error handling in build_design_matrix."""
+        from fastfuncsim.design_builder import build_design_matrix
+        import tempfile
+        import os
+        
+        # Create dummy timing file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write("10 20\n")
+            timing_file = f.name
+
+        try:
+            # Mismatched labels
+            with pytest.raises(ValueError, match="stim_labels length"):
+                build_design_matrix(
+                    timing_files=[timing_file],
+                    stim_labels=["A", "B"], # 2 labels
+                    n_timepoints_per_run=[100],
+                    tr=1.0
+                )
+
+            # Mismatched HRF models
+            with pytest.raises(ValueError, match="hrf_models length"):
+                build_design_matrix(
+                    timing_files=[timing_file],
+                    stim_labels=["A"],
+                    n_timepoints_per_run=[100],
+                    tr=1.0,
+                    hrf_models=["SPMG1(5)", "BLOCK(10)"] # 2 models
+                )
+
+            # Mismatched IM mode
+            with pytest.raises(ValueError, match="im_mode length"):
+                build_design_matrix(
+                    timing_files=[timing_file],
+                    stim_labels=["A"],
+                    n_timepoints_per_run=[100],
+                    tr=1.0,
+                    im_mode=[True, False] # 2 modes
+                )
+                
+            # Mismatched runs in timing file
+            with pytest.raises(ValueError, match="has 1 runs, but expected 2"):
+                build_design_matrix(
+                    timing_files=[timing_file], # Has 1 line (1 run)
+                    stim_labels=["A"],
+                    n_timepoints_per_run=[100, 100], # Expects 2 runs
+                    tr=1.0
+                )
+
+        finally:
+            if os.path.exists(timing_file):
+                os.remove(timing_file)
+
+    def test_build_design_matrix_with_extra_regressors(self):
+        """Test building design matrix with extra regressors."""
+        from fastfuncsim.design_builder import build_design_matrix
+        import tempfile
+        import os
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write("10 20\n")
+            timing_file = f.name
+            
+        try:
+            n_tps = 100
+            extra = np.random.randn(n_tps, 2)
+            
+            design, labels, _, metadata = build_design_matrix(
+                timing_files=[timing_file],
+                stim_labels=["stim"],
+                n_timepoints_per_run=[n_tps],
+                tr=1.0,
+                hrf_models="SPMG1(0)",
+                polort=0,
+                extra_regressors=[extra]
+            )
+            
+            # Expected columns: 1 polort + 1 stim + 2 extra = 4
+            assert design.shape == (n_tps, 4)
+            assert design.shape[1] == 4
+            
+            # Check last 2 columns are extra
+            assert np.allclose(design[:, -2:], extra)
+            
+            # Check metadata
+            assert len(metadata['extra_indices']) == 2
+            
+        finally:
+            if os.path.exists(timing_file):
+                os.remove(timing_file)
+
+
 if __name__ == "__main__":
     # Run tests
     test_spm_canonical_hrf()
@@ -524,5 +719,7 @@ if __name__ == "__main__":
     test_glt_parsing()
     test_im_mode()
     test_goodlist_utilities()
+    
+    # Run new tests
+    pytest.main([__file__, "-v"])
 
-    print("\n✓ All tests passed!")

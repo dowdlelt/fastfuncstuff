@@ -10,7 +10,7 @@ import torch
 from pathlib import Path
 
 from fastfuncsim.analysis import analyze_from_design_matrix
-from fastfuncsim.glm_outputs import write_afni_bucket
+from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
 
 
 # AFNI reference data paths (relative to project root)
@@ -58,7 +58,7 @@ def test_ols_matches_afni(afni_reference_data, tmp_path):
 
     # Write our bucket file
     our_bucket_path = tmp_path / "our_OLS.nii.gz"
-    write_afni_bucket(
+    write_glm_bucket_as_nifti(
         results,
         our_bucket_path,
         condition_names=stim_labels,
@@ -136,7 +136,7 @@ def test_reml_matches_afni(afni_reference_data, tmp_path):
 
     # Write our bucket file
     our_bucket_path = tmp_path / "our_REML.nii.gz"
-    write_afni_bucket(
+    write_glm_bucket_as_nifti(
         results,
         our_bucket_path,
         condition_names=stim_labels,

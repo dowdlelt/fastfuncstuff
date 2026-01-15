@@ -15,7 +15,7 @@ results, design_info = analyze_from_design_matrix(...)
 assert results.betas.shape[1] == 252
 
 # But we used full labels (322 columns)
-write_afni_bucket(results, "output",
+write_glm_bucket_as_nifti(results, "output",
                   condition_names=design_info["column_labels"])  # 322 labels! ❌
 
 # ERROR: ValueError: condition_names has length 322 but results have 252 regressors
@@ -35,7 +35,7 @@ if fitted_indices is not None:
 else:
     fitted_labels = full_labels
 
-write_afni_bucket(results, "output", condition_names=fitted_labels)  # ✅
+write_glm_bucket_as_nifti(results, "output", condition_names=fitted_labels)  # ✅
 ```
 
 ---
@@ -138,7 +138,7 @@ else:
     fitted_labels = full_labels
 
 # Now write outputs with correct labels
-write_afni_bucket(results, output_path, condition_names=fitted_labels)
+write_glm_bucket_as_nifti(results, output_path, condition_names=fitted_labels)
 ```
 
 ### Pattern 2: In `analysis.py` (OLS callback)
@@ -150,7 +150,7 @@ full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
 # OLS callback already receives filtered results
 # (task_indices was passed to fit_glm())
 def write_ols(ols_results, original_shape, affine):
-    write_afni_bucket(
+    write_glm_bucket_as_nifti(
         ols_results,
         output_path,
         condition_names=stim_labels,  # Use stim_labels (already filtered)
@@ -264,7 +264,7 @@ full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
 **Before:**
 ```python
 # RISKY - might use wrong labels
-write_afni_bucket(results, path, condition_names=design_info["column_labels"])
+write_glm_bucket_as_nifti(results, path, condition_names=design_info["column_labels"])
 ```
 
 **After:**
@@ -273,7 +273,7 @@ write_afni_bucket(results, path, condition_names=design_info["column_labels"])
 full_labels, _, _ = extract_design_metadata(design_info)
 fitted_indices = getattr(results, "fitted_column_indices", None)
 fitted_labels = [full_labels[i] for i in fitted_indices] if fitted_indices else full_labels
-write_afni_bucket(results, path, condition_names=fitted_labels)
+write_glm_bucket_as_nifti(results, path, condition_names=fitted_labels)
 ```
 
 ---
@@ -288,7 +288,7 @@ write_afni_bucket(results, path, condition_names=fitted_labels)
 ### Medium Term:
 - Add `results.get_fitted_labels(design_info)` method
 - Create `DesignMetadata` dataclass
-- Add validation in `write_afni_bucket()` to catch mismatches early
+- Add validation in `write_glm_bucket_as_nifti()` to catch mismatches early
 
 ### Long Term:
 - Refactor `design_info` dict → typed dataclass

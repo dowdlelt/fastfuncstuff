@@ -131,7 +131,7 @@ print("=" * 70)
 condition_names = ['faces', 'places', 'objects', 'scrambled']
 contrast_names = ['faces_vs_places', 'objects_vs_scrambled', 'category_vs_control']
 
-output_path = ffs.write_afni_bucket(
+output_path = ffs.write_glm_bucket_as_nifti(
     results,
     'glm_bucket.nii.gz',
     condition_names=condition_names,

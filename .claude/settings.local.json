@@ -39,7 +39,10 @@
       "Bash(3dmaskdump:*)",
       "Bash(git reset:*)",
       "Bash(cat:*)",
-      "Bash(/home/logan/miniconda3/envs/py312_movie_tasks/bin/python:*)"
+      "Bash(/home/logan/miniconda3/envs/py312_movie_tasks/bin/python:*)",
+      "Bash(~/miniconda3/envs/py312_movie_tasks/bin/ruff check fastfuncsim/arma_glm.py --select F821)",
+      "Bash(~/miniconda3/envs/py312_movie_tasks/bin/ruff check:*)",
+      "Bash(~/miniconda3/envs/py312_movie_tasks/bin/pytest:*)"
     ],
     "deny": [],
     "ask": []

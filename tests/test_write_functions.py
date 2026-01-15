@@ -2,7 +2,7 @@
 Comprehensive tests for file writing functions used in analyze_taskforce_ses02_clean.py
 
 Tests coverage for:
-- write_afni_bucket() - Writing GLM results to AFNI-style bucket files
+- write_glm_bucket_as_nifti() - Writing GLM results to AFNI-style bucket files
 - write_ols_arma_comparison() - Side-by-side OLS vs ARMA comparison
 - save_arma_rvar() - Saving ARMA parameters for reuse
 - slice_glm_results() - Slicing results by regressor indices
@@ -25,7 +25,7 @@ from fastfuncsim.glm_core import fit_glm
 from fastfuncsim.arma_glm import fit_glm_arma11
 from fastfuncsim.glm_outputs import (
     slice_glm_results,
-    write_afni_bucket,
+    write_glm_bucket_as_nifti,
     write_ols_arma_comparison,
 )
 from fastfuncsim.arma_glm import save_arma_rvar, load_arma_params
@@ -220,7 +220,7 @@ class TestSliceGLMResults:
 
 
 # =============================================================================
-# Tests for write_afni_bucket()
+# Tests for write_glm_bucket_as_nifti()
 # =============================================================================
 
 
@@ -232,7 +232,7 @@ class TestWriteAFNIBucket:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "test_bucket.nii.gz"
 
-            result_path = write_afni_bucket(
+            result_path = write_glm_bucket_as_nifti(
                 simple_glm_results,
                 output_path,
                 condition_names=["Task1", "Task2", "Baseline", "Motion"],
@@ -259,7 +259,7 @@ class TestWriteAFNIBucket:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "test_contrasts.nii.gz"
 
-            result_path = write_afni_bucket(
+            result_path = write_glm_bucket_as_nifti(
                 simple_glm_results,
                 output_path,
                 condition_names=["Task1", "Task2", "Baseline", "Motion"],
@@ -284,7 +284,7 @@ class TestWriteAFNIBucket:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "test_uncompressed.nii"
 
-            result_path = write_afni_bucket(
+            result_path = write_glm_bucket_as_nifti(
                 simple_glm_results,
                 output_path,
                 condition_names=[
@@ -322,7 +322,7 @@ class TestWriteAFNIBucket:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "test_shape.nii.gz"
 
-            result_path = write_afni_bucket(
+            result_path = write_glm_bucket_as_nifti(
                 results,
                 output_path,
                 condition_names=["Task1", "Task2", "Task3", "Task4"],
@@ -341,7 +341,7 @@ class TestWriteAFNIBucket:
             affine = np.eye(4)
             affine[:3, :3] *= 2.0
 
-            result_path = write_afni_bucket(
+            result_path = write_glm_bucket_as_nifti(
                 simple_glm_results,
                 output_path,
                 condition_names=[
@@ -369,7 +369,7 @@ class TestWriteAFNIBucket:
             output_path = Path(tmpdir) / "test_no_fstat.nii.gz"
 
             with pytest.raises(ValueError, match="F-statistics required"):
-                write_afni_bucket(
+                write_glm_bucket_as_nifti(
                     simple_glm_results,
                     output_path,
                     condition_names=[
@@ -386,7 +386,7 @@ class TestWriteAFNIBucket:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "nested" / "dir" / "test.nii.gz"
 
-            result_path = write_afni_bucket(
+            result_path = write_glm_bucket_as_nifti(
                 simple_glm_results,
                 output_path,
                 condition_names=[
@@ -405,7 +405,7 @@ class TestWriteAFNIBucket:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "test_roundtrip.nii.gz"
 
-            result_path = write_afni_bucket(
+            result_path = write_glm_bucket_as_nifti(
                 simple_glm_results,
                 output_path,
                 condition_names=[
@@ -858,7 +858,7 @@ class TestFullWorkflow:
             assert outputs["comparison_summary"].exists()
 
             # [B] Nuisance regressors
-            nuisance_file = write_afni_bucket(
+            nuisance_file = write_glm_bucket_as_nifti(
                 results_nuisance,
                 tmpdir / "glm_nuisance.nii.gz",
                 condition_names=["Motion", "Baseline"],
@@ -937,7 +937,7 @@ class TestFullWorkflow:
         ARMA and OLS results. This catches the bug where OLS results didn't
         get full_shape/voxel_mask/affine, causing write functions to fail.
 
-        Regression test for: write_afni_bucket() failing after slice_glm_results()
+        Regression test for: write_glm_bucket_as_nifti() failing after slice_glm_results()
         because OLS results had no spatial metadata.
         """
         torch.manual_seed(42)

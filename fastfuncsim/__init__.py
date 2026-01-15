@@ -94,6 +94,7 @@ from .glm_core import GLMResults, fit_glm, fit_glm_hrf_library, percent_bold_cha
 from .glm_outputs import (
     slice_glm_results,
     write_afni_bucket,
+    write_glm_bucket_as_nifti,
     write_glm_results_nifti,
     write_ols_arma_comparison,
 )
@@ -166,7 +167,7 @@ __all__ = [
     "percent_bold_change",
     "GLMResults",
     "write_glm_results_nifti",
-    "write_afni_bucket",
+    "write_glm_bucket_as_nifti",
     "write_ols_arma_comparison",
     # Design
     "build_glm_design",

@@ -11,7 +11,7 @@ You were right to be nervous. Let me be completely honest about what we found.
 ### Core Write Functions: **SOLID** ✅
 All three main write functions work correctly with your real workflow:
 
-1. **`write_afni_bucket()`** - 7/8 tests passing
+1. **`write_glm_bucket_as_nifti()`** - 7/8 tests passing
    - Writes NIfTI files correctly
    - Handles GPU→CPU conversion automatically
    - Works with contrasts, custom shapes, affines
@@ -108,7 +108,7 @@ ValueError: F-statistics required for AFNI bucket.
    - **If this passes, your script will work**
 
 2. **All core write functions pass their main tests** ✅
-   - `write_afni_bucket`: 7/8 passing
+   - `write_glm_bucket_as_nifti`: 7/8 passing
    - `write_ols_arma_comparison`: 5/6 passing
    - `save_arma_rvar`: 6/6 passing
 
@@ -157,7 +157,7 @@ Failing:     3  (9.7% - all test issues, not function bugs)
 By Function:
   slice_glm_results():        9/9  (100%) ✅
   save_arma_rvar():           6/6  (100%) ✅
-  write_afni_bucket():        7/8  (87.5%) ⚠️ 1 test design issue
+  write_glm_bucket_as_nifti():        7/8  (87.5%) ⚠️ 1 test design issue
   write_ols_arma_comparison() 5/6  (83.3%) ⚠️ 1 test expectation issue
   Integration:                2/2  (100%) ✅
 ```

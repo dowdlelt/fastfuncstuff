@@ -683,7 +683,7 @@ def analyze_from_design_matrix(
         # Create simple OLS write callback if output path provided
         ols_write_callback = None
         if ols_output_path is not None:
-            from .glm_outputs import write_afni_bucket
+            from .glm_outputs import write_glm_bucket_as_nifti
             # Capture volume_shape and affine from outer scope for the callback
             callback_volume_shape = volume_shape
             callback_affine = affine
@@ -732,7 +732,7 @@ def analyze_from_design_matrix(
                             ols_results.contrast_r2_semipartial
                         )
 
-                write_afni_bucket(
+                write_glm_bucket_as_nifti(
                     ols_results,
                     ols_output_path,
                     condition_names=callback_stim_labels,  # Use stimulus labels

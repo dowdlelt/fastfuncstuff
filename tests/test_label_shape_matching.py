@@ -202,8 +202,8 @@ class TestDesignMetadata:
 
         # Wrong: using full labels
         # (This would cause the ValueError we fixed)
-        # write_afni_bucket(results, "output", condition_names=full_labels)  # BUG!
-        # write_afni_bucket(results, "output", condition_names=fitted_labels)  # CORRECT!
+        # write_glm_bucket_as_nifti(results, "output", condition_names=full_labels)  # BUG!
+        # write_glm_bucket_as_nifti(results, "output", condition_names=fitted_labels)  # CORRECT!
 
 
 def test_regression_ValueError_322_vs_252():

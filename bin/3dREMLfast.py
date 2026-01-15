@@ -30,7 +30,7 @@ except ImportError:
 try:
     from fastfuncsim.analysis import analyze_from_design_matrix
     from fastfuncsim.glm_outputs import (
-        write_afni_bucket,
+        write_glm_bucket_as_nifti,
         write_glm_results_nifti,
         slice_glm_results,
     )
@@ -815,7 +815,7 @@ def main():
                             ols_results.contrast_r2_semipartial
                         )
 
-                write_afni_bucket(
+                write_glm_bucket_as_nifti(
                     ols_results,
                     args.Obuck,
                     condition_names=stim_labels,  # Use stimulus labels, not all labels
@@ -861,7 +861,7 @@ def main():
                 else:
                     # No filtering - all regressors are present
                     print(f"  • Writing OLS nuisance betas + stats: {args.Onuisance}")
-                    write_afni_bucket(
+                    write_glm_bucket_as_nifti(
                         ols_results,
                         args.Onuisance,
                         condition_names=stim_labels,
@@ -1157,7 +1157,7 @@ def main():
                     results.contrast_r2_semipartial
                 )
 
-        write_afni_bucket(
+        write_glm_bucket_as_nifti(
             results,
             args.Rbuck,
             condition_names=fitted_labels,
@@ -1215,7 +1215,7 @@ def main():
             nuisance_names = design_info.get("column_labels")
 
         # Always write NIfTI .nii.gz regardless of input format
-        write_afni_bucket(
+        write_glm_bucket_as_nifti(
             nuisance_results,
             args.Rnuisance,
             condition_names=nuisance_names,

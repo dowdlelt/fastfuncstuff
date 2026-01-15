@@ -343,5 +343,187 @@ def test_end_to_end_workflow():
     assert (results["r2_std"] >= 0).all()
 
 
+class TestGenerateCVSplitsEdgeCases:
+    """Test edge cases and error conditions for generate_cv_splits"""
+
+    def test_invalid_float_strategy_zero(self):
+        """Test that strategy=0.0 raises ValueError"""
+        with pytest.raises(ValueError, match="Float strategy must be in"):
+            generate_cv_splits(n_runs=4, strategy=0.0)
+
+    def test_invalid_float_strategy_one(self):
+        """Test that strategy=1.0 raises ValueError"""
+        with pytest.raises(ValueError, match="Float strategy must be in"):
+            generate_cv_splits(n_runs=4, strategy=1.0)
+
+    def test_invalid_float_strategy_negative(self):
+        """Test that negative float strategy raises ValueError"""
+        with pytest.raises(ValueError, match="Float strategy must be in"):
+            generate_cv_splits(n_runs=4, strategy=-0.5)
+
+    def test_invalid_float_strategy_greater_than_one(self):
+        """Test that strategy > 1.0 raises ValueError"""
+        with pytest.raises(ValueError, match="Float strategy must be in"):
+            generate_cv_splits(n_runs=4, strategy=1.5)
+
+    def test_fraction_gives_zero_train(self):
+        """Test fraction that results in n_train=0 raises ValueError"""
+        # With n_runs=3 and strategy=0.1, n_train = int(3 * 0.1) = 0
+        with pytest.raises(ValueError, match="results in n_train=0"):
+            generate_cv_splits(n_runs=3, strategy=0.1)
+
+    def test_invalid_int_strategy_zero(self):
+        """Test that strategy=0 raises ValueError"""
+        with pytest.raises(ValueError, match="must be > 0"):
+            generate_cv_splits(n_runs=4, strategy=0)
+
+    def test_invalid_int_strategy_negative(self):
+        """Test that negative int strategy raises ValueError"""
+        with pytest.raises(ValueError, match="must be > 0"):
+            generate_cv_splits(n_runs=4, strategy=-1)
+
+    def test_invalid_int_strategy_equals_n_runs(self):
+        """Test that strategy >= n_runs raises ValueError"""
+        with pytest.raises(ValueError, match="must be > 0 and < n_runs"):
+            generate_cv_splits(n_runs=4, strategy=4)
+
+    def test_invalid_strategy_type(self):
+        """Test that non-int/float strategy raises ValueError"""
+        with pytest.raises(ValueError, match="must be float or int"):
+            generate_cv_splits(n_runs=4, strategy="half")
+
+    def test_sampling_float_many_combinations(self):
+        """Test that having more combinations than n_perms triggers sampling"""
+        # 10 runs with 0.5 split = C(10,5) = 252 combinations
+        # But n_perms=5 should sample only 5
+        splits = generate_cv_splits(n_runs=10, strategy=0.5, n_perms=5)
+        assert len(splits) == 5
+        
+        # Each split should still be valid
+        for train, test in splits:
+            assert len(train) == 5
+            assert len(test) == 5
+            assert set(train + test) == set(range(10))
+
+    def test_sampling_int_many_combinations(self):
+        """Test leave-N-out with more combinations than n_perms triggers sampling"""
+        # 10 runs with L2O = C(10,2) = 45 combinations
+        # But n_perms=5 should sample only 5
+        splits = generate_cv_splits(n_runs=10, strategy=2, n_perms=5)
+        assert len(splits) == 5
+        
+        # Each split should be valid
+        for train, test in splits:
+            assert len(train) == 8
+            assert len(test) == 2
+            assert set(train + test) == set(range(10))
+
+
+class TestComputeR2MetricEdgeCases:
+    """Test edge cases for R² metric computation"""
+
+    def test_shape_mismatch(self):
+        """Test that shape mismatch raises ValueError"""
+        y_true = torch.randn(100, 200)
+        y_pred = torch.randn(100, 150)  # Different timepoints
+        
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            compute_r2_metric(y_true, y_pred)
+
+    def test_unknown_metric(self):
+        """Test that unknown metric raises ValueError"""
+        y_true = torch.randn(100, 200)
+        y_pred = torch.randn(100, 200)
+        
+        with pytest.raises(ValueError, match="Unknown metric"):
+            compute_r2_metric(y_true, y_pred, metric="unknown")
+
+
+class TestProjectOutNuisanceEdgeCases:
+    """Test edge cases for nuisance projection"""
+
+    def test_all_nuisance_columns_zero(self):
+        """Test when ALL nuisance columns are zero (returns original)"""
+        data = torch.randn(100, 200)
+        design = torch.randn(200, 50)
+        
+        # Make all nuisance columns zero
+        design[:, 40:] = 0
+        nuisance_indices = list(range(40, 50))
+        
+        data_clean, design_clean = project_out_nuisance(data, design, nuisance_indices)
+        
+        # Should return original since nothing to project
+        torch.testing.assert_close(data_clean, data)
+        torch.testing.assert_close(design_clean, design)
+
+
+class TestComputeXvalR2EdgeCases:
+    """Test edge cases for cross-validated R² computation"""
+
+    def test_no_nuisance_regressors(self):
+        """Test xval R² with empty nuisance_indices"""
+        n_voxels, n_timepoints = 50, 400
+        data = torch.randn(n_voxels, n_timepoints)
+        design = torch.randn(n_timepoints, 20)  # All stimulus, no nuisance
+
+        run_starts = [0, 100, 200, 300]
+        stim_indices = list(range(20))
+        nuisance_indices = []  # Empty!
+        cv_splits = generate_cv_splits(n_runs=4, strategy=1)
+
+        results = compute_xval_r2(
+            data, design.numpy(), run_starts, stim_indices, nuisance_indices,
+            cv_splits, verbose=False
+        )
+
+        assert "r2_median" in results
+        assert results["r2_median"].shape == (n_voxels,)
+
+    def test_invalid_zero_event_strategy(self):
+        """Test that invalid zero_event_strategy raises ValueError"""
+        n_voxels, n_timepoints = 50, 200
+        data = torch.randn(n_voxels, n_timepoints)
+        design = torch.randn(n_timepoints, 30)
+        
+        # Make some events missing to trigger the strategy code
+        design[:100, 5] = 0  # Event 5 missing in first half
+        
+        run_starts = [0, 100]
+        stim_indices = list(range(20))
+        nuisance_indices = list(range(20, 30))
+        cv_splits = generate_cv_splits(n_runs=2, strategy=1)
+
+        with pytest.raises(ValueError, match="Unknown zero_event_strategy"):
+            compute_xval_r2(
+                data, design.numpy(), run_starts, stim_indices, nuisance_indices,
+                cv_splits, zero_event_strategy="invalid", verbose=False
+            )
+
+    def test_no_overlapping_events_error(self):
+        """Test that having no overlapping events raises ValueError"""
+        n_voxels, n_timepoints = 50, 200
+        data = torch.randn(n_voxels, n_timepoints)
+        design = torch.randn(n_timepoints, 30)
+        
+        # Zero out ALL stim events in run 1
+        design[:100, :20] = 0
+        # Zero out ALL stim events in run 2 (different columns would cause no overlap)
+        # Actually, zero them all in both runs to ensure no overlap
+        design[100:, :20] = 0
+        
+        run_starts = [0, 100]
+        stim_indices = list(range(20))
+        nuisance_indices = list(range(20, 30))
+        cv_splits = generate_cv_splits(n_runs=2, strategy=1)
+
+        with pytest.raises(ValueError, match="No overlapping events"):
+            compute_xval_r2(
+                data, design.numpy(), run_starts, stim_indices, nuisance_indices,
+                cv_splits, verbose=False
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
