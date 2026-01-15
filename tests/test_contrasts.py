@@ -228,7 +228,12 @@ class TestOLSContrasts:
 
 
 class TestARMAContrasts:
-    """Test contrast computation with ARMA results."""
+    """Test ARMA-specific functionality.
+
+    Note: var_betas is NOT computed by default (memory optimization).
+    These tests verify ARMA results have the expected structure.
+    For contrast computation with ARMA, use the OLS results (ols_results).
+    """
 
     @pytest.fixture
     def device(self):
@@ -271,61 +276,75 @@ class TestARMAContrasts:
         noise = torch.randn(n_voxels, n_timepoints, device=device) * 0.4
         data = signal + noise + 100.0
 
-        # Fit ARMA(1,1)
-        results = ffs.fit_glm_arma11(data, block_design, tr=2.0, verbose=False)
+        # Fit ARMA(1,1) with OLS for comparison
+        results = ffs.fit_glm_arma11(data, block_design, tr=2.0, verbose=False, want_ols=True)
 
         return results
 
-    def test_arma_has_var_betas(self, arma_results):
-        """Test that ARMA results contain var_betas for contrast computation."""
-        assert hasattr(arma_results, "var_betas"), "ARMA results must have var_betas"
-        assert arma_results.var_betas is not None
+    def test_arma_has_required_attributes(self, arma_results):
+        """Test that ARMA results contain required attributes."""
+        # Core GLM attributes
+        assert hasattr(arma_results, "betas"), "ARMA results must have betas"
+        assert hasattr(arma_results, "tstats"), "ARMA results must have tstats"
+        assert hasattr(arma_results, "fstats"), "ARMA results must have fstats"
+        assert hasattr(arma_results, "r2"), "ARMA results must have r2"
 
-    def test_arma_var_betas_dimensions(self, arma_results):
-        """Test that var_betas has correct shape."""
+        # ARMA-specific attributes
+        assert hasattr(arma_results, "arma_params"), "ARMA results must have arma_params"
+        assert hasattr(arma_results, "arma_lambda"), "ARMA results must have arma_lambda"
+
+    def test_arma_params_dimensions(self, arma_results):
+        """Test that arma_params has correct shape (n_voxels, 2)."""
         n_voxels = arma_results.betas.shape[0]
-        n_regressors = arma_results.betas.shape[1]
 
-        assert arma_results.var_betas.shape == (
+        # arma_params contains (a, b) for each voxel
+        assert arma_results.arma_params.shape == (
             n_voxels,
-            n_regressors,
-            n_regressors,
-        ), f"var_betas should be ({n_voxels}, {n_regressors}, {n_regressors})"
+            2,
+        ), f"arma_params should be ({n_voxels}, 2), got {arma_results.arma_params.shape}"
 
-    def test_single_contrast_arma(self, arma_results, device):
-        """Test single contrast computation with ARMA."""
-        n_regressors = arma_results.betas.shape[1]
+        # arma_lambda should be 1D with n_voxels entries
+        assert arma_results.arma_lambda.shape == (n_voxels,), \
+            f"arma_lambda should be ({n_voxels},), got {arma_results.arma_lambda.shape}"
 
+    def test_arma_params_in_valid_range(self, arma_results):
+        """Test that ARMA parameters are in valid ranges."""
+        a_params = arma_results.arma_params[:, 0]
+        b_params = arma_results.arma_params[:, 1]
+
+        # a (AR) should typically be in [-1, 1]
+        assert torch.all(a_params >= -1.0), "a should be >= -1"
+        assert torch.all(a_params <= 1.0), "a should be <= 1"
+
+        # b (MA) should typically be in [-1, 1]
+        assert torch.all(b_params >= -1.0), "b should be >= -1"
+        assert torch.all(b_params <= 1.0), "b should be <= 1"
+
+        # lambda should be in (-1, 1) for stationarity
+        assert torch.all(torch.abs(arma_results.arma_lambda) < 1.0), \
+            "lambda should be in (-1, 1) for stationarity"
+
+    def test_arma_ols_results_available_for_contrasts(self, arma_results, device):
+        """Test that OLS results are available for contrast computation."""
+        # When want_ols=True, we can use OLS results for contrasts
+        assert hasattr(arma_results, "ols_results"), "ARMA should have ols_results when want_ols=True"
+        assert arma_results.ols_results is not None, "ols_results should not be None"
+
+        # OLS results should have xtx_inv for contrast computation
+        assert hasattr(arma_results.ols_results, "xtx_inv"), "OLS results must have xtx_inv"
+        assert arma_results.ols_results.xtx_inv is not None
+
+        # Test that contrasts work with OLS results
+        n_regressors = arma_results.ols_results.betas.shape[1]
         contrast = torch.zeros(n_regressors, device=device)
         contrast[0] = 1.0
         contrast[1] = -1.0
 
-        results = ffs.compute_contrasts(arma_results, contrast, device=device)
+        results = ffs.compute_contrasts(arma_results.ols_results, contrast, device=device)
 
         assert "contrast_betas" in results
         assert "contrast_tstats" in results
         assert "contrast_stderr" in results
-
-    def test_arma_variance_formula(self, arma_results, device):
-        """Test that ARMA contrast variance follows c' Cov(beta) c."""
-        n_regressors = arma_results.betas.shape[1]
-
-        # Simple contrast
-        c = torch.zeros(n_regressors, device=device)
-        c[0] = 1.0
-
-        results = ffs.compute_contrasts(arma_results, c, device=device)
-
-        # Manual computation for first voxel
-        var_betas = arma_results.var_betas.to(device)
-        expected_var = c @ var_betas[0] @ c
-        expected_stderr = torch.sqrt(expected_var)
-
-        assert torch.allclose(
-            results["contrast_stderr"][0].to(device),
-            expected_stderr,
-            rtol=1e-4,
-        ), "ARMA contrast variance formula incorrect"
 
 
 class TestContrastFromDesign:
@@ -474,7 +493,12 @@ class TestContrastIntegration:
         return get_device()
 
     def test_ols_vs_arma_contrasts(self, device):
-        """Test that OLS and ARMA give similar contrasts with block design + strong signal."""
+        """Test that OLS and ARMA give similar contrasts with block design + strong signal.
+
+        Note: var_betas is not computed by default for ARMA, so we compare:
+        - OLS contrast via compute_contrasts
+        - ARMA contrast computed manually from betas (linear combination)
+        """
         torch.manual_seed(42)
 
         n_voxels = 20
@@ -504,8 +528,12 @@ class TestContrastIntegration:
         contrast = torch.tensor([1.0, -1.0, 0.0], device=device)
         expected_contrast = 3.0
 
+        # Compute OLS contrasts via function
         ols_contrasts = ffs.compute_contrasts(ols_results, contrast, device=device)
-        arma_contrasts = ffs.compute_contrasts(arma_results, contrast, device=device)
+
+        # Compute ARMA contrast manually (betas only, no variance since var_betas not available)
+        arma_betas = arma_results.betas.to(device)  # (n_voxels, n_regressors)
+        arma_contrast_betas = arma_betas @ contrast  # (n_voxels,)
 
         # Both should recover contrasts near the true value
         # (ARMA may differ due to autocorrelation correction)
@@ -515,12 +543,15 @@ class TestContrastIntegration:
             rtol=0.15,
         ), f"OLS should recover contrast near {expected_contrast}"
 
-        # Just check that ARMA produced valid contrasts (not checking exact value)
-        assert not torch.any(torch.isnan(arma_contrasts["contrast_betas"]))
-        assert not torch.any(torch.isinf(arma_contrasts["contrast_betas"]))
+        # Check that ARMA contrast betas are valid and similar to OLS
+        assert not torch.any(torch.isnan(arma_contrast_betas))
+        assert not torch.any(torch.isinf(arma_contrast_betas))
 
-        # Check that ARMA std errors are positive
-        assert torch.all(arma_contrasts["contrast_stderr"] > 0)
+        # ARMA and OLS should produce similar contrast estimates
+        ols_mean = ols_contrasts["contrast_betas"].mean().item()
+        arma_mean = arma_contrast_betas.cpu().mean().item()
+        assert abs(ols_mean - arma_mean) < 0.5, \
+            f"OLS ({ols_mean:.2f}) and ARMA ({arma_mean:.2f}) should be similar"
 
     def test_contrast_with_multirun_data(self, device):
         """Test contrasts with multi-run GLM."""

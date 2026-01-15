@@ -2025,24 +2025,25 @@ def batch_reml_grid_search(
     n_chunks_evaluated = 0
     for chunk_idx, chunk_indices in enumerate(grid_chunks):
         # PHASE 1: Stack precomputed matrices for THIS CHUNK only
-        # Tensors already on GPU (moved once after precomputation)
+        # Note: precomputed tensors may be on CPU (when cholesky_on_cpu=True)
+        # We move them to the target device after stacking
         chunk_keys = [param_list[i] for i in chunk_indices]
 
         L_inv_stack = torch.stack(
             [precomputed[k]["L_inv"] for k in chunk_keys]
-        )  # (n_chunk, n_time, n_time)
+        ).to(device)  # (n_chunk, n_time, n_time)
         X_w_stack = torch.stack(
             [precomputed[k]["X_w"] for k in chunk_keys]
-        )  # (n_chunk, n_time, n_regressors)
+        ).to(device)  # (n_chunk, n_time, n_regressors)
         R_qr_stack = torch.stack(
             [precomputed[k]["R_qr"] for k in chunk_keys]
-        )  # (n_chunk, n_reg, n_reg) - upper triangular from QR
+        ).to(device)  # (n_chunk, n_reg, n_reg) - upper triangular from QR
         logdet_Rcorr_stack = torch.stack(
             [precomputed[k]["logdet_Rcorr"] for k in chunk_keys]
-        )  # (n_chunk,)
+        ).to(device)  # (n_chunk,)
         logdet_XwTXw_stack = torch.stack(
             [precomputed[k]["logdet_XwTXw"] for k in chunk_keys]
-        )  # (n_chunk,)
+        ).to(device)  # (n_chunk,)
 
         # PHASE 2: Prewhiten data for THIS CHUNK
         # Broadcast: (n_chunk, n_time, n_time) @ (n_time, n_voxels) -> (n_chunk, n_time, n_voxels)

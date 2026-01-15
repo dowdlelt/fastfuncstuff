@@ -838,7 +838,11 @@ def write_afni_bucket(
 
     # 3. Beta and T-stat for each contrast
     # Check if contrasts are in results object first (from in-loop GLT computation)
-    if contrast_results is None and hasattr(results, "contrast_betas"):
+    if (
+        contrast_results is None
+        and hasattr(results, "contrast_betas")
+        and results.contrast_betas is not None
+    ):
         # Build contrast_results dict from results attributes
         contrast_results = {
             "contrast_betas": results.contrast_betas,
