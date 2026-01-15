@@ -149,10 +149,15 @@ class FastICA:
 
         # For SPATIAL ICA: pass components with voxels as "samples"
         # Our _fastica expects (n_features, n_samples), so pass (n_ica, n_voxels)
-        # This makes: n_features=n_ica, n_samples=n_voxels
+        # This makes: n_features=n_ica, n_samples=n_voxels (features=components, samples=voxels)
         # FastICA finds independent rows = independent PC patterns = SPATIAL ICA
-        # Following nilearn's CanICA approach
-        W, n_iter = self._fastica(pca_components, n_components)  # Input: (n_ica, n_voxels)
+        #
+        # CRITICAL: pca_components (Vt) rows are unit norm, so Cov = I/n_voxels.
+        # FastICA expects Cov = I. We must scale by sqrt(n_voxels).
+        n_voxels = pca_components.shape[1]
+        X_white = pca_components * np.sqrt(n_voxels)
+        
+        W, n_iter = self._fastica(X_white, n_components)  # Input: (n_ica, n_voxels)
         self.n_iter_ = n_iter
 
         # Step 3: Extract ICA spatial maps
@@ -249,9 +254,10 @@ class FastICA:
         self,
         X: torch.Tensor,
         n_components: int,
+        w_init: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, int]:
         """
-        Core FastICA algorithm
+        Core FastICA algorithm (Symmectric / Parallel implementation)
 
         Parameters
         ----------
@@ -259,6 +265,8 @@ class FastICA:
             Whitened data (transposed)
         n_components : int
             Number of components to extract
+        w_init : torch.Tensor, optional
+            Initial unmixing matrix (n_components, n_features)
 
         Returns
         -------
@@ -273,44 +281,58 @@ class FastICA:
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
 
-        # Initialize unmixing matrix randomly
-        W = torch.randn(n_components, n_features, device=self.device, dtype=X.dtype)
-
-        # Orthogonalize rows
+        # Initialize unmixing matrix
+        if w_init is not None:
+            W = w_init.to(self.device).type(X.dtype)
+        else:
+            W = torch.randn(n_components, n_features, device=self.device, dtype=X.dtype)
+        
+        # Initial symmetric decorrelation
         W = self._symmetric_decorrelation(W)
 
         # Get nonlinearity functions
         g, g_prime = self._get_nonlinearity(self.fun)
+        
+        # Optimization: pre-compute float n_samples for division
+        scale = 1.0 / n_samples
 
         # FastICA iterations
         for n_iter in range(self.max_iter):
             W_old = W.clone()
 
-            # Update each component
-            for i in range(n_components):
-                w = W[i, :].unsqueeze(0)  # (1, n_features)
-
-                # Compute projection
-                w_X = w @ X  # (1, n_samples)
-
-                # Apply nonlinearity
-                g_wx = g(w_X)  # (1, n_samples)
-                g_prime_wx = g_prime(w_X)  # (1, n_samples)
-
-                # Update rule
-                w_new = (X * g_wx).mean(dim=1, keepdim=True).T - g_prime_wx.mean() * w
-
-                # Decorrelate with previous components
-                w_new = w_new - (W[:i] @ w_new.T).T @ W[:i]
-
-                # Normalize
-                w_new = w_new / torch.norm(w_new)
-
-                W[i, :] = w_new.squeeze()
-
-            # Check convergence
-            delta = torch.max(torch.abs(torch.abs(torch.diag(W @ W_old.T)) - 1))
-
+            # 1. Linear projection
+            # W: (n_comp, n_feat), X: (n_feat, n_samp) -> wx: (n_comp, n_samp)
+            wx = W @ X
+            
+            # 2. Apply nonlinearity
+            # g_wx: (n_comp, n_samp)
+            # g_prime_wx: (n_comp, n_samp)
+            g_wx = g(wx)
+            g_prime_wx = g_prime(wx)
+            
+            # 3. Update rule (Symmetric)
+            # Term 1: E[x g(w^T x)] -> X * g(wx)^T / N -> No, dimensions match better as:
+            # (g_wx @ X.T) / N -> (n_comp, n_samp) @ (n_samp, n_feat) -> (n_comp, n_feat)
+            term1 = (g_wx @ X.T) * scale
+            
+            # Term 2: E[g'(w^T x)] w -> mean(g_prime_wx, dim=1) * W
+            # g_prime_mean: (n_comp, 1) broadcasted to (n_comp, n_feat)
+            g_prime_mean = g_prime_wx.mean(dim=1, keepdim=True)
+            term2 = g_prime_mean * W
+            
+            W = term1 - term2
+            
+            # 4. Symmetric Decorrelation
+            W = self._symmetric_decorrelation(W)
+            
+            # 5. Check convergence
+            # Distance between subspaces: 1 - min(abs(diag(W @ W_old.T)))
+            # Ideally W @ W_old.T should be Identity (or Permutation/Sign matrix)
+            # Since we track trajectory of W, we check correlation of rows
+            # abs(diag(W @ W_old.T)) is correlation of w_new_i with w_old_i
+            lim = torch.abs(torch.diag(W @ W_old.T))
+            delta = torch.max(1 - torch.abs(lim))
+            
             if delta < self.tol:
                 break
 
@@ -528,15 +550,9 @@ def ica_stability_analysis(
     # For each component, find best match across runs and compute correlation
     stability_scores = _compute_component_stability(components_array)
 
-    # Compute mean and std components
-    mean_components = components_array.mean(axis=0)
-    std_components = components_array.std(axis=0)
-
     return {
         'components_list': components_list,
         'stability_scores': stability_scores,
-        'mean_components': mean_components,
-        'std_components': std_components,
         'n_runs': n_runs,
     }
 

@@ -3015,6 +3015,14 @@ def fit_glm_arma11(
         raise ValueError(f"Data must be 2D or 4D, got {data.ndim}D")
 
     n_voxels, n_timepoints = data.shape
+    
+    # Validate design matrix
+    if design.shape[0] != n_timepoints:
+        raise ValueError(
+            f"Timepoints mismatch: Data has {n_timepoints}, "
+            f"Design has {design.shape[0]}"
+        )
+
     n_regressors = design.shape[1]
 
     # Adaptive batch sizing based on GPU memory
