@@ -4180,10 +4180,16 @@ def fit_glm_arma11(
                         # Need to get R² for each voxel in the batch (computed later, so use a placeholder)
                         # We'll compute it after R² calculation below
                         pass  # Mark for later computation
-    
+
                     # F-stat: Test only TASK regressors (not nuisance)
                     # Use CORRECT formula: F = β_task' Var(β_task)^{-1} β_task / p_task
                     # where Var(β_task) is task block of σ² (X'X)^{-1} from FULL model
+                    # If var_beta_batch was not computed (no GLTs optimization), compute it now
+                    if var_beta_batch is None:
+                        XwTXw_inv_batch = XwTXw_inv_group.unsqueeze(0).expand(batch_voxels, -1, -1)
+                        var_beta_batch = (
+                            sigma2_batch.unsqueeze(1).unsqueeze(2) * XwTXw_inv_batch
+                        )
                     if fitted_column_indices is not None:
                         # Extract task columns only
                         betas_task_batch = betas_batch[:, fitted_column_indices]
