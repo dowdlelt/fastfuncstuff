@@ -75,6 +75,7 @@ def generate_cv_splits(
         # If we have more combinations than requested, sample randomly
         if len(all_splits) > n_perms:
             import random
+
             random.seed(42)  # Reproducible
             all_splits = random.sample(all_splits, n_perms)
 
@@ -84,9 +85,7 @@ def generate_cv_splits(
         # Leave-N-out
         n_test = strategy
         if n_test <= 0 or n_test >= n_runs:
-            raise ValueError(
-                f"strategy={strategy} must be > 0 and < n_runs={n_runs}"
-            )
+            raise ValueError(f"strategy={strategy} must be > 0 and < n_runs={n_runs}")
 
         # Generate all possible test sets
         all_splits = []
@@ -98,6 +97,7 @@ def generate_cv_splits(
         # If we have more combinations than requested, sample randomly
         if len(all_splits) > n_perms:
             import random
+
             random.seed(42)  # Reproducible
             all_splits = random.sample(all_splits, n_perms)
 
@@ -306,6 +306,9 @@ def compute_r2_metric(
         y_mean = y_true.mean(dim=1, keepdim=True)
         ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
         r2 = 1.0 - (ss_res / (ss_tot + 1e-10))
+        # Clamp max to 1.0 (values > 1 indicate numerical issues, e.g. zero variance)
+        # Note: R² CAN be negative (model worse than mean) - that's valid information
+        r2 = torch.clamp(r2, max=1.0)
 
     elif metric == "corr":
         # Pearson correlation coefficient
@@ -313,8 +316,8 @@ def compute_r2_metric(
         y_pred_centered = y_pred - y_pred.mean(dim=1, keepdim=True)
 
         numerator = (y_true_centered * y_pred_centered).sum(dim=1)
-        denom_true = torch.sqrt((y_true_centered ** 2).sum(dim=1))
-        denom_pred = torch.sqrt((y_pred_centered ** 2).sum(dim=1))
+        denom_true = torch.sqrt((y_true_centered**2).sum(dim=1))
+        denom_pred = torch.sqrt((y_pred_centered**2).sum(dim=1))
         denominator = denom_true * denom_pred
 
         r2 = numerator / (denominator + 1e-10)
@@ -322,7 +325,7 @@ def compute_r2_metric(
     elif metric == "corr2":
         # Pearson correlation squared
         r = compute_r2_metric(y_true, y_pred, metric="corr")
-        r2 = r ** 2
+        r2 = r**2
 
     else:
         raise ValueError(
@@ -487,7 +490,7 @@ def compute_xval_r2(
         data_chunk_size = min(100_000, n_voxels)
 
     # Storage for R² across splits (float32 to save memory)
-    r2_all_splits = torch.zeros(n_splits, n_voxels, dtype=torch.float32, device='cpu')
+    r2_all_splits = torch.zeros(n_splits, n_voxels, dtype=torch.float32, device="cpu")
 
     if verbose:
         print("Cross-validation R² computation")
@@ -508,7 +511,9 @@ def compute_xval_r2(
         n_voxels_chunk = chunk_end - chunk_start
 
         if verbose and n_chunks > 1:
-            print(f"\n📦 Data chunk {chunk_idx + 1}/{n_chunks}: voxels {chunk_start:,}-{chunk_end:,}")
+            print(
+                f"\n📦 Data chunk {chunk_idx + 1}/{n_chunks}: voxels {chunk_start:,}-{chunk_end:,}"
+            )
 
         # Load this chunk to GPU
         data_chunk = data[chunk_slice]
@@ -519,7 +524,9 @@ def compute_xval_r2(
         for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
             if verbose:
                 prefix = "  " if n_chunks > 1 else ""
-                print(f"{prefix}Split {split_idx+1}/{n_splits}: Train {train_runs} | Test {test_runs}")
+                print(
+                    f"{prefix}Split {split_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}"
+                )
 
             # 1. Slice data and design by runs (on GPU - free indexing!)
             train_data, train_design, _ = slice_by_runs(
@@ -558,7 +565,7 @@ def compute_xval_r2(
 
             # Track which events are present in each set
             train_present_mask = ~train_zero_mask  # Events in train
-            test_present_mask = ~test_zero_mask    # Events in test
+            test_present_mask = ~test_zero_mask  # Events in test
 
             # Events that are ONLY in train (not in test) - we CAN'T predict them
             unpredictable_mask = train_present_mask & test_zero_mask
@@ -571,24 +578,40 @@ def compute_xval_r2(
 
             # Handle missing events based on strategy
             if train_zero_mask.any() or test_zero_mask.any():
-                zero_cols_train = [i for i, is_zero in enumerate(train_zero_mask) if is_zero]
-                zero_cols_test = [i for i, is_zero in enumerate(test_zero_mask) if is_zero]
-                unpredictable_cols = [i for i, unpred in enumerate(unpredictable_mask) if unpred]
-                test_only_cols = [i for i, test_only in enumerate(test_only_mask) if test_only]
+                zero_cols_train = [
+                    i for i, is_zero in enumerate(train_zero_mask) if is_zero
+                ]
+                zero_cols_test = [
+                    i for i, is_zero in enumerate(test_zero_mask) if is_zero
+                ]
+                unpredictable_cols = [
+                    i for i, unpred in enumerate(unpredictable_mask) if unpred
+                ]
+                test_only_cols = [
+                    i for i, test_only in enumerate(test_only_mask) if test_only
+                ]
 
                 # Only warn/report once (on first split, first chunk)
                 if split_idx == 0 and chunk_idx == 0 and verbose:
-                    print(f"\n{'='*80}")
+                    print(f"\n{'=' * 80}")
                     print("INFO: Handling missing events across train/test splits")
-                    print(f"{'='*80}")
-                    print(f"Train-only events (in train, zero in test): {len(unpredictable_cols)} - {unpredictable_cols}")
-                    print(f"Test-only events (zero in train, in test): {len(test_only_cols)} - {test_only_cols}")
-                    print(f"Predictable events (in both): {predictable_mask.sum().item()}")
+                    print(f"{'=' * 80}")
+                    print(
+                        f"Train-only events (in train, zero in test): {len(unpredictable_cols)} - {unpredictable_cols}"
+                    )
+                    print(
+                        f"Test-only events (zero in train, in test): {len(test_only_cols)} - {test_only_cols}"
+                    )
+                    print(
+                        f"Predictable events (in both): {predictable_mask.sum().item()}"
+                    )
                     print(f"Strategy: '{zero_event_strategy}'")
                     if zero_event_strategy == "nuisance":
                         events_to_proj = unpredictable_cols + test_only_cols
-                        print(f"  → Will project out {len(events_to_proj)} events from test: {events_to_proj}")
-                    print(f"{'='*80}\n")
+                        print(
+                            f"  → Will project out {len(events_to_proj)} events from test: {events_to_proj}"
+                        )
+                    print(f"{'=' * 80}\n")
 
                 # Check we have at least some predictable events
                 if not predictable_mask.any():
@@ -626,25 +649,39 @@ def compute_xval_r2(
             else:
                 # No missing events - simple case
                 train_stim_design_fit = train_stim_design
-                train_present_mask = torch.ones(train_stim_design.shape[1], dtype=torch.bool, device=device)
-                test_present_mask = torch.ones(test_stim_design.shape[1], dtype=torch.bool, device=device)
+                train_present_mask = torch.ones(
+                    train_stim_design.shape[1], dtype=torch.bool, device=device
+                )
+                test_present_mask = torch.ones(
+                    test_stim_design.shape[1], dtype=torch.bool, device=device
+                )
                 predictable_mask = train_present_mask
-                unpredictable_mask = torch.zeros(train_stim_design.shape[1], dtype=torch.bool, device=device)
+                unpredictable_mask = torch.zeros(
+                    train_stim_design.shape[1], dtype=torch.bool, device=device
+                )
 
             # 5. Fit OLS in batches (to avoid OOM when projecting ALL voxels at once)
-            r2_split_chunk = torch.zeros(n_voxels_chunk, dtype=torch.float32, device='cpu')
+            r2_split_chunk = torch.zeros(
+                n_voxels_chunk, dtype=torch.float32, device="cpu"
+            )
 
             for batch_start in range(0, n_voxels_chunk, batch_size):
                 batch_end = min(batch_start + batch_size, n_voxels_chunk)
                 batch_slice = slice(batch_start, batch_end)
 
                 # Slice batches (free on GPU - just indexing!)
-                train_data_batch = train_data[batch_slice]  # (batch_size, n_train_timepoints)
-                test_data_batch = test_data[batch_slice]    # (batch_size, n_test_timepoints)
+                train_data_batch = train_data[
+                    batch_slice
+                ]  # (batch_size, n_train_timepoints)
+                test_data_batch = test_data[
+                    batch_slice
+                ]  # (batch_size, n_test_timepoints)
 
                 # Project out nuisance from data batches (fast on GPU!)
                 if train_P is not None:
-                    train_data_batch = train_data_batch - (train_P @ train_data_batch.T).T
+                    train_data_batch = (
+                        train_data_batch - (train_P @ train_data_batch.T).T
+                    )
 
                 if test_P is not None:
                     test_data_batch = test_data_batch - (test_P @ test_data_batch.T).T
@@ -659,16 +696,24 @@ def compute_xval_r2(
                         test_to_project = test_stim_design[:, events_to_project]
                         # Compute projection matrix
                         XuXu = test_to_project.T @ test_to_project
-                        XuXu_inv = torch.linalg.inv(XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device))
+                        XuXu_inv = torch.linalg.inv(
+                            XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device)
+                        )
                         P_unpred = test_to_project @ XuXu_inv @ test_to_project.T
                         # Project out
-                        test_data_batch = test_data_batch - (P_unpred @ test_data_batch.T).T
+                        test_data_batch = (
+                            test_data_batch - (P_unpred @ test_data_batch.T).T
+                        )
 
                 # OLS: beta = (X.T @ X)^-1 @ X.T @ Y (fast on GPU!)
                 # Fit only on present events (train_stim_design_fit)
                 XtX = train_stim_design_fit.T @ train_stim_design_fit
-                XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
-                betas_fit = XtX_inv @ train_stim_design_fit.T @ train_data_batch.T  # (n_fit_events, batch_size)
+                XtX_inv = torch.linalg.inv(
+                    XtX + 1e-6 * torch.eye(XtX.shape[0], device=device)
+                )
+                betas_fit = (
+                    XtX_inv @ train_stim_design_fit.T @ train_data_batch.T
+                )  # (n_fit_events, batch_size)
 
                 # 6. Predict test data (strategy-dependent!)
                 if zero_event_strategy == "zero":
@@ -693,10 +738,14 @@ def compute_xval_r2(
                     # Shouldn't reach here (validated above)
                     raise ValueError(f"Invalid strategy: {zero_event_strategy}")
 
-                predictions_batch = predictions_batch.T  # (batch_size, n_test_timepoints)
+                predictions_batch = (
+                    predictions_batch.T
+                )  # (batch_size, n_test_timepoints)
 
                 # 7. Compute R² (fast on GPU!)
-                r2_batch = compute_r2_metric(test_data_batch, predictions_batch, metric=metric)
+                r2_batch = compute_r2_metric(
+                    test_data_batch, predictions_batch, metric=metric
+                )
                 r2_split_chunk[batch_slice] = r2_batch.cpu()
 
             # Store results for this chunk
@@ -704,7 +753,9 @@ def compute_xval_r2(
 
             if verbose:
                 prefix = "    " if n_chunks > 1 else "  "
-                print(f"{prefix}Mean R²: {r2_split_chunk.mean():.4f}, Std: {r2_split_chunk.std():.4f}")
+                print(
+                    f"{prefix}Mean R²: {r2_split_chunk.mean():.4f}, Std: {r2_split_chunk.std():.4f}"
+                )
 
     if verbose:
         print()

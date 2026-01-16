@@ -6,8 +6,8 @@ This tool selects the optimal HRF for each voxel using cross-validation across r
 then fits a final GLM with the voxel-wise optimal HRFs.
 
 Two HRF library modes:
-- canonical: Double-gamma HRFs with varying time-to-peak and undershoot parameters
-- flobs: FSL's FLOBS half-cosine basis with Latin Hypercube parameter sampling
+- library: Double-gamma HRFs with varying time-to-peak and undershoot parameters
+- pighs: PIGHS (Parametric Individually Generated HRFs) half-cosine basis with Latin Hypercube sampling
 
 The CV-based HRF selection prevents overfitting that occurs with in-sample selection.
 
@@ -116,6 +116,11 @@ def create_onset_matrix_microtime(
         duration = stim_durations[cond_idx]
         duration_bins = max(1, int(np.round(duration / microtime_dt)))
 
+        # Boxcar value is 1.0 (AFNI convention)
+        # The convolution function scales by dt, so the integral is properly computed.
+        # Result: A 3s event produces ~3x larger response than a 1s event (block scaling)
+        boxcar_value = 1.0
+
         for run_idx in range(n_runs):
             onsets = all_onsets[cond_idx][run_idx]
             run_start_tr = run_starts[run_idx]
@@ -127,9 +132,9 @@ def create_onset_matrix_microtime(
                 microtime_bin = int(np.round(global_time / microtime_dt))
 
                 if 0 <= microtime_bin < n_microtime:
-                    # Place boxcar (1s for duration)
+                    # Place boxcar
                     end_bin = min(microtime_bin + duration_bins, n_microtime)
-                    onset_matrix[microtime_bin:end_bin, cond_idx] = 1.0
+                    onset_matrix[microtime_bin:end_bin, cond_idx] = boxcar_value
 
     return onset_matrix
 
@@ -211,21 +216,21 @@ def create_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic HRF optimization with canonical library
+  # Basic HRF optimization with library of HRF variants
   3dHRFoptfast -input run1.nii.gz run2.nii.gz run3.nii.gz \\
                -onsets cond1.txt cond2.txt \\
                -durations 2.0 \\
                -tr 2.0 \\
                -prefix subject01_hrf
 
-  # Using FLOBS library with different durations per condition
+  # Using PIGHS library with different durations per condition
   3dHRFoptfast -input run*.nii.gz \\
                -onsets face.txt house.txt object.txt \\
                -durations 0.5 2.0 2.0 \\
                -tr 1.5 \\
-               -hrf_mode flobs \\
+               -hrf_mode pighs \\
                -n_hrfs 30 \\
-               -prefix sub01_flobs
+               -prefix sub01_pighs
 
   # Leave-one-run-out CV (default) with verbose output
   3dHRFoptfast -input run*.nii.gz \\
@@ -246,11 +251,12 @@ Examples:
                -prefix masked_output
 
 Outputs:
-  {prefix}_hrf_index.nii.gz  - Which HRF (0-N) was selected per voxel
-  {prefix}_xval_r2.nii.gz    - Cross-validated R² for selected HRF
-  {prefix}_stats.nii.gz      - Final GLM betas and t-stats (AFNI bucket format)
-  {prefix}_hrf_library.pt    - HRF library + voxel assignments for ARMA reuse
-  {prefix}_metadata.json     - Full metadata for reproducibility
+  {prefix}_hrf_index.nii.gz       - Which HRF (1-N) was selected per voxel
+  {prefix}_xval_r2.nii.gz         - Cross-validated R² for selected HRF
+  {prefix}_xval_r2_all_hrfs.nii.gz - 4D: CV R² for each HRF (volume per HRF)
+  {prefix}_stats.nii.gz           - Final GLM betas and t-stats (AFNI bucket format)
+  {prefix}_hrf_library.pt         - HRF library + voxel assignments for ARMA reuse
+  {prefix}_metadata.json          - Full metadata for reproducibility
 
 Notes:
   - Durations can be specified as single value (applies to all) or one per condition
@@ -295,15 +301,60 @@ Notes:
     hrf_opts = parser.add_argument_group("HRF Library Options")
     hrf_opts.add_argument(
         "-hrf_mode",
-        choices=["canonical", "flobs"],
-        default="canonical",
-        help="HRF library type: 'canonical' (double-gamma variations) or 'flobs' (half-cosine basis). Default: canonical",
+        choices=["library", "pighs"],
+        default="library",
+        help="HRF library type: 'library' (double-gamma variations) or 'pighs' (half-cosine basis). Default: library",
     )
     hrf_opts.add_argument(
         "-n_hrfs",
         type=int,
         default=20,
-        help="Number of HRFs in library (default: 20)",
+        help="Number of HRFs in library (default: 20, only affects pighs mode)",
+    )
+
+    # PIGHS-specific options
+    pighs_opts = parser.add_argument_group(
+        "PIGHS Options (only used with -hrf_mode pighs)"
+    )
+    pighs_opts.add_argument(
+        "-pighs_peak_time_range",
+        type=float,
+        nargs=2,
+        default=[3, 10],
+        metavar=("MIN", "MAX"),
+        help="Range for time-to-peak in seconds. Default: 3 10",
+    )
+    pighs_opts.add_argument(
+        "-pighs_rise_fraction_range",
+        type=float,
+        nargs=2,
+        default=[0.3, 0.9],
+        metavar=("MIN", "MAX"),
+        help="Range for rise_fraction (fraction of peak_time that is rise vs delay). Default: 0.3 0.9",
+    )
+    pighs_opts.add_argument(
+        "-pighs_fall_range",
+        type=float,
+        nargs=2,
+        default=[3, 10],
+        metavar=("MIN", "MAX"),
+        help="Range for peak-to-undershoot time (m3) in seconds. Default: 3 10",
+    )
+    pighs_opts.add_argument(
+        "-pighs_recovery_range",
+        type=float,
+        nargs=2,
+        default=[3, 12],
+        metavar=("MIN", "MAX"),
+        help="Range for undershoot recovery time (m4) in seconds. Default: 3 12",
+    )
+    pighs_opts.add_argument(
+        "-pighs_undershoot_range",
+        type=float,
+        nargs=2,
+        default=[0, 0.35],
+        metavar=("MIN", "MAX"),
+        help="Range for undershoot magnitude (c2). Default: 0 0.35",
     )
 
     # Cross-validation options
@@ -347,8 +398,8 @@ Notes:
     proc_opts.add_argument(
         "-microtime_resolution",
         type=int,
-        default=16,
-        help="Sub-TR resolution for onset timing (default: 16)",
+        default=20,
+        help="Sub-TR resolution for onset timing (default: 20)",
     )
     proc_opts.add_argument(
         "-device",
@@ -383,6 +434,18 @@ Notes:
         "-rout",
         action="store_true",
         help="Include R² in stats bucket",
+    )
+    out_opts.add_argument(
+        "-save_hrf_designs",
+        action="store_true",
+        help="Save individual design matrices for each HRF in the library. "
+        "Creates a directory {prefix}_hrf_designs/ with xmat files that "
+        "can be used for external GLM fitting (e.g., AFNI's 3dREMLfit).",
+    )
+    out_opts.add_argument(
+        "-save_plots",
+        action="store_true",
+        help="Save design matrix and HRF library plots as PNG images.",
     )
 
     # Help
@@ -588,16 +651,27 @@ def main():
     print()
     print(f"Generating {args.hrf_mode} HRF library ({args.n_hrfs} candidates)...")
 
-    # For the library, we use the mean duration (or could use max)
-    # The actual duration is handled in the onset matrix via boxcar convolution
-    mean_duration = float(np.mean(durations))
+    # Build PIGHS kwargs if using pighs mode
+    pighs_kwargs = {}
+    if args.hrf_mode == "pighs":
+        pighs_kwargs = {
+            "peak_time_range": tuple(args.pighs_peak_time_range),
+            "rise_fraction_range": tuple(args.pighs_rise_fraction_range),
+            "fall_time_range": tuple(args.pighs_fall_range),
+            "recovery_time_range": tuple(args.pighs_recovery_range),
+            "undershoot_range": tuple(args.pighs_undershoot_range),
+        }
 
+    # Generate HRF library as IMPULSE RESPONSES (stim_duration=0)
+    # Duration-based convolution is handled separately in the design matrix construction
+    # This ensures the HRF library represents the actual HRF shapes, not duration-convolved versions
     hrf_library = get_hrf_library(
         mode=args.hrf_mode,
-        stim_duration=mean_duration,
+        stim_duration=0.0,  # Impulse response - duration handled in design matrix
         tr=args.tr,
         n_hrfs=args.n_hrfs,
         device=device,
+        **pighs_kwargs,
     )
 
     print(f"  HRF library shape: {hrf_library.shape}")
@@ -661,6 +735,10 @@ def main():
         affine=affine,
         voxel_mask=voxel_mask,
         condition_labels=condition_labels,
+        run_starts=run_starts,
+        save_all_hrf_designs=args.save_hrf_designs,
+        onsets=onset_matrix if args.save_hrf_designs else None,
+        save_plots=args.save_plots,
     )
 
     # Print output summary
@@ -678,6 +756,11 @@ def main():
     print("✅ 3dHRFoptfast Complete!")
     print("=" * 70)
     print(f"  Mean xval R²: {results.xval_r2_best.mean().item():.4f}")
+    if results.xval_r2_canonical is not None:
+        canonical_r2 = results.xval_r2_canonical.mean().item()
+        best_r2 = results.xval_r2_best.mean().item()
+        print(f"  Canonical HRF baseline R²: {canonical_r2:.4f}")
+        print(f"  Improvement over canonical: {best_r2 - canonical_r2:+.4f}")
     if results.final_results is not None:
         print(f"  Final R² (full data): {results.final_results.r2.mean().item():.4f}")
     print()

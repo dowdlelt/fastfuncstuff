@@ -13,7 +13,7 @@ Core Philosophy:
 Main Components:
 - glm_core: Ultra-fast GLM fitting engine
 - design: Design matrix construction (FIR, HRF convolution, etc.)
-- hrf: HRF generation (canonical, FLOBS, libraries)
+- hrf: HRF generation (canonical, PIGHS, libraries)
 - noise: Realistic fMRI noise generation
 - simulation: Simulation pipeline (single and batch)
 - utils: Device management and helpers
@@ -101,8 +101,10 @@ from .glm_outputs import (
 
 # HRF generation
 from .hrf import (
-    create_flobs_library,
-    flobs_halfcos,
+    create_pighs_library,
+    create_flobs_library,  # Backwards compatibility alias
+    pighs_halfcos,
+    flobs_halfcos,  # Backwards compatibility alias
     get_canonical_hrf,
     get_canonical_hrf_library,
     get_hrf_library,
@@ -187,8 +189,10 @@ __all__ = [
     "get_canonical_hrf",
     "get_canonical_hrf_library",
     "get_hrf_library",
-    "flobs_halfcos",
-    "create_flobs_library",
+    "pighs_halfcos",
+    "create_pighs_library",
+    "flobs_halfcos",  # Backwards compatibility
+    "create_flobs_library",  # Backwards compatibility
     # Noise
     "generate_fmri_noise",
     "generate_fmri_noise_batch",

@@ -785,13 +785,12 @@ def write_glm_bucket_as_nifti(
     betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
     n_regressors = betas_vol.shape[-1] if betas_vol.ndim == 4 else 1
 
-    if getattr(results, "tstats", None) is None:
-        raise ValueError(
-            "T-statistics required for AFNI bucket. Ensure GLM was fit with t-stats enabled."
-        )
-
-    tstats_np = _ensure_numpy(results.tstats)
-    tstats_vol = _reshape_parameter_map(tstats_np, volume_shape, voxel_mask)
+    # T-stats are optional - if not present, we only output betas
+    has_tstats = getattr(results, "tstats", None) is not None
+    tstats_vol = None
+    if has_tstats:
+        tstats_np = _ensure_numpy(results.tstats)
+        tstats_vol = _reshape_parameter_map(tstats_np, volume_shape, voxel_mask)
 
     # Generate condition names if not provided
     if condition_names is None:
@@ -805,16 +804,12 @@ def write_glm_bucket_as_nifti(
     subbricks = []
     labels = []
 
-    # 1. Overall F-statistic (first sub-brick, AFNI style)
+    # 1. Overall F-statistic (first sub-brick, AFNI style) - optional
     if getattr(results, "fstats", None) is not None:
         fstat_np = _ensure_numpy(results.fstats)
         fstat_vol = _reshape_parameter_map(fstat_np, volume_shape, voxel_mask)
         subbricks.append(fstat_vol.astype(dtype, copy=False))
         labels.append("Full_Fstat")
-    else:
-        raise ValueError(
-            "F-statistics required for AFNI bucket. Ensure GLM was fit with f-stats enabled."
-        )
 
     # 2. Beta and T-stat for each condition
     for idx, name in enumerate(condition_names):
@@ -822,9 +817,10 @@ def write_glm_bucket_as_nifti(
         subbricks.append(betas_vol[..., idx].astype(dtype, copy=False))
         labels.append(f"{name}#0_Coef")
 
-        # T-statistic
-        subbricks.append(tstats_vol[..., idx].astype(dtype, copy=False))
-        labels.append(f"{name}#0_Tstat")
+        # T-statistic (if available)
+        if has_tstats and tstats_vol is not None:
+            subbricks.append(tstats_vol[..., idx].astype(dtype, copy=False))
+            labels.append(f"{name}#0_Tstat")
 
     # 3. Beta and T-stat for each contrast
     # Check if contrasts are in results object first (from in-loop GLT computation)

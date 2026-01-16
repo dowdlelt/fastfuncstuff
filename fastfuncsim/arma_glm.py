@@ -4028,6 +4028,7 @@ def fit_glm_arma11(
                     del y_mean_batch
                     ss_residual_batch = torch.sum(resid_orig_batch**2, dim=1)
                     r2_batch = 1 - ss_residual_batch / (ss_total_batch + 1e-10)
+                    r2_batch = torch.clamp(r2_batch, 0, 1)  # Clamp to valid range
                     del ss_total_batch, ss_residual_batch
     
                     # GLT CONTRASTS (QR path): Compute in-loop
@@ -4244,6 +4245,7 @@ def fit_glm_arma11(
                     del y_mean_batch
                     ss_residual_batch = torch.sum(resid_orig_batch**2, dim=1)
                     r2_batch = 1 - ss_residual_batch / (ss_total_batch + 1e-10)
+                    r2_batch = torch.clamp(r2_batch, 0, 1)  # Clamp to valid range
                     del ss_total_batch, ss_residual_batch
     
                     # Now compute semi-partial R² (non-QR path)
@@ -4599,7 +4601,8 @@ def fit_glm_arma11(
             y_mean_val = y_v_cpu.mean()
             ss_total = torch.sum((y_v_cpu - y_mean_val) ** 2)
             ss_residual = torch.sum(resid_orig_cpu**2)
-            results.r2[v] = (1 - ss_residual / (ss_total + 1e-10)).cpu()
+            r2_val = (1 - ss_residual / (ss_total + 1e-10)).cpu()
+            results.r2[v] = torch.clamp(r2_val, 0, 1)  # Clamp to valid range
 
             # Optional outputs
             if want_residuals:

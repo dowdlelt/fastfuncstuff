@@ -9,9 +9,12 @@ from typing import Union, List, Optional
 from .utils import to_tensor, get_device
 
 
-def convolve_hrf(onsets: torch.Tensor, hrf: torch.Tensor,
-                 n_timepoints: int,
-                 device: Optional[torch.device] = None) -> torch.Tensor:
+def convolve_hrf(
+    onsets: torch.Tensor,
+    hrf: torch.Tensor,
+    n_timepoints: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     """
     Convolve onset vector with HRF using fast FFT convolution
 
@@ -41,8 +44,9 @@ def convolve_hrf(onsets: torch.Tensor, hrf: torch.Tensor,
     if onsets.ndim == 1:
         onsets = onsets.unsqueeze(1)
 
-    # Normalize HRF to unit peak
-    hrf = hrf / hrf.max()
+    # Note: We do NOT normalize the HRF here. The HRF should already be
+    # normalized at source resolution so that a single event peaks at 1.0.
+    # Multiple events will sum to >1.0, which is correct (linear superposition).
 
     # Convolve each condition with HRF
     design = torch.zeros(n_timepoints, n_conditions, device=device)
@@ -53,8 +57,10 @@ def convolve_hrf(onsets: torch.Tensor, hrf: torch.Tensor,
         onset_vec = onsets[:, cond_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, T)
         hrf_kernel = hrf.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, H)
 
-        # Convolve with 'same' padding
-        convolved = F.conv1d(onset_vec, hrf_kernel, padding=len(hrf) // 2)
+        # Causal convolution: response follows stimulus
+        # padding=len(hrf)-1 ensures output[t] only depends on input[<=t]
+        convolved = F.conv1d(onset_vec, hrf_kernel, padding=len(hrf) - 1)
+        # Take first n_timepoints (trim the right side padding)
         design[:, cond_idx] = convolved.squeeze()[:n_timepoints]
 
     return design
@@ -65,49 +71,64 @@ def convolve_hrf_microtime(
     hrf: torch.Tensor,
     n_timepoints: int,
     microtime_resolution: int,
+    tr: float = 1.0,
     microtime_onset: int = 1,
+    hrf_is_microtime: bool = False,
     device: Optional[torch.device] = None,
-) -> torch.Tensor:
+    return_single_trials: bool = False,
+) -> Union[torch.Tensor, tuple]:
     """
-    Convolve onset matrix with HRF using microtime (sub-TR) resolution
+    Convolve onset matrix with HRF using microtime (sub-TR) resolution.
 
-    This function handles the case where onsets occur at sub-TR precision.
-    It upsamples the HRF to match the microtime resolution, performs
-    convolution at high resolution, then downsamples to TR resolution.
+    Uses single-trial convolution approach: each event is convolved separately,
+    scaled to peak=1.0, then summed within condition. This guarantees:
+    - Each event peaks at 1.0 regardless of stimulus duration
+    - Overlapping events sum linearly (peak > 1.0 if they overlap)
+    - Duration affects response *shape* (wider) but not *height*
 
     Parameters
     ----------
     onsets_microtime : torch.Tensor
-        (n_microtime_points, n_conditions) binary onset matrix at microtime resolution
-        where n_microtime_points = n_timepoints * microtime_resolution
+        (n_microtime_points, n_conditions) onset matrix at microtime resolution.
+        Values can be binary (0/1) or boxcar (constant value during stimulus).
+        Each contiguous non-zero region is treated as a separate event.
     hrf : torch.Tensor
-        (n_hrf_timepoints,) hemodynamic response function at TR resolution
+        Hemodynamic response function. Shape depends on hrf_is_microtime:
+        - If hrf_is_microtime=False: (n_hrf_tr_timepoints,) at TR resolution
+        - If hrf_is_microtime=True: (n_hrf_microtime_timepoints,) at microtime resolution
     n_timepoints : int
         Number of TR timepoints in output
     microtime_resolution : int
-        Number of microtime bins per TR (e.g., 16 for SPM default)
+        Number of microtime bins per TR (e.g., 20 for 50ms resolution at TR=1s)
+    tr : float, default=1.0
+        Repetition time in seconds.
     microtime_onset : int, default=1
         Which microtime bin corresponds to TR onset (1-indexed, 1 = start of TR)
-        SPM uses middle of TR as reference; set to microtime_resolution//2 + 1 for that
+    hrf_is_microtime : bool, default=False
+        If True, the HRF is already at microtime resolution and won't be upsampled.
     device : torch.device, optional
         Device for computation
+    return_single_trials : bool, default=False
+        If True, also return the single-trial design matrices (useful for LSS/LSA).
 
     Returns
     -------
     design : torch.Tensor
         (n_timepoints, n_conditions) convolved design matrix at TR resolution
+    single_trial_designs : list of torch.Tensor, optional
+        If return_single_trials=True, returns list of (n_timepoints, n_trials)
+        tensors, one per condition, with each column being a single trial regressor.
 
     Notes
     -----
-    The algorithm:
-    1. Upsample HRF to microtime resolution using linear interpolation
-    2. Convolve high-res onsets with high-res HRF
-    3. Downsample by selecting every microtime_resolution-th sample,
-       offset by (microtime_onset - 1) to align with TR acquisition
-
-    This approach correctly models stimuli that occur between TRs,
-    accounting for the fact that the BOLD response to a mid-TR stimulus
-    will be sampled at a different phase than a TR-aligned stimulus.
+    Algorithm:
+    1. Upsample HRF to microtime resolution (if needed)
+    2. For each condition:
+       a. Identify individual events (contiguous non-zero regions)
+       b. Convolve each event separately with HRF
+       c. Scale each convolved event to peak=1.0
+       d. Sum all scaled events to get condition regressor
+    3. Downsample to TR resolution
     """
     if device is None:
         device = get_device()
@@ -129,60 +150,114 @@ def convolve_hrf_microtime(
             f"microtime_resolution={microtime_resolution})"
         )
 
-    # 1. Upsample HRF to microtime resolution
-    n_hrf_tr = len(hrf)
-    n_hrf_microtime = n_hrf_tr * microtime_resolution
+    # 1. Upsample HRF to microtime resolution (or use directly if already microtime)
+    if hrf_is_microtime:
+        hrf_microtime = hrf.clone()
+    else:
+        # Upsample HRF from TR resolution to microtime resolution
+        n_hrf_tr = len(hrf)
+        n_hrf_microtime = n_hrf_tr * microtime_resolution
 
-    # Use linear interpolation to upsample HRF
-    hrf_microtime_indices = torch.linspace(0, n_hrf_tr - 1, n_hrf_microtime, device=device)
+        # Use linear interpolation to upsample HRF
+        hrf_microtime_indices = torch.linspace(
+            0, n_hrf_tr - 1, n_hrf_microtime, device=device
+        )
 
-    # Linear interpolation
-    hrf_microtime = torch.zeros(n_hrf_microtime, device=device)
-    for i, idx in enumerate(hrf_microtime_indices):
-        idx_low = int(idx.floor().item())
-        idx_high = min(idx_low + 1, n_hrf_tr - 1)
-        frac = idx - idx_low
-        hrf_microtime[i] = hrf[idx_low] * (1 - frac) + hrf[idx_high] * frac
+        # Linear interpolation
+        hrf_microtime = torch.zeros(n_hrf_microtime, device=device)
+        for i, idx in enumerate(hrf_microtime_indices):
+            idx_low = int(idx.floor().item())
+            idx_high = min(idx_low + 1, n_hrf_tr - 1)
+            frac = idx - idx_low
+            hrf_microtime[i] = hrf[idx_low] * (1 - frac) + hrf[idx_high] * frac
 
-    # Normalize HRF to unit peak (preserves amplitude interpretation)
-    if hrf_microtime.max() > 0:
-        hrf_microtime = hrf_microtime / hrf_microtime.max()
+    # Prepare HRF kernel for conv1d (flipped for causal convolution)
+    hrf_kernel = hrf_microtime.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, H)
+    hrf_len = len(hrf_microtime)
 
-    # 2. Convolve at microtime resolution
-    design_microtime = torch.zeros(n_microtime_points, n_conditions, device=device)
-
-    for cond_idx in range(n_conditions):
-        # Use torch.nn.functional.conv1d for GPU acceleration
-        onset_vec = onsets_microtime[:, cond_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, T)
-        hrf_kernel = hrf_microtime.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, H)
-
-        # Convolve with 'same' padding
-        convolved = F.conv1d(onset_vec, hrf_kernel, padding=len(hrf_microtime) // 2)
-        design_microtime[:, cond_idx] = convolved.squeeze()[:n_microtime_points]
-
-    # 3. Downsample to TR resolution
-    # Select samples at TR boundaries, offset by microtime_onset
-    # microtime_onset is 1-indexed: 1 = first bin of TR, microtime_resolution = last bin
+    # Downsampling indices
     sample_offset = microtime_onset - 1  # Convert to 0-indexed
-    sample_indices = torch.arange(sample_offset, n_microtime_points, microtime_resolution, device=device)
-
-    # Ensure we get exactly n_timepoints samples
+    sample_indices = torch.arange(
+        sample_offset, n_microtime_points, microtime_resolution, device=device
+    )
     if len(sample_indices) > n_timepoints:
         sample_indices = sample_indices[:n_timepoints]
     elif len(sample_indices) < n_timepoints:
-        # This shouldn't happen with correct inputs, but handle gracefully
         raise ValueError(
             f"Downsampling produced {len(sample_indices)} samples, expected {n_timepoints}"
         )
 
-    design = design_microtime[sample_indices, :]
+    # 2. Process each condition using single-trial approach
+    design = torch.zeros(n_timepoints, n_conditions, device=device)
+    single_trial_designs = [] if return_single_trials else None
 
+    for cond_idx in range(n_conditions):
+        cond_onsets = onsets_microtime[:, cond_idx]
+
+        # Find individual events (contiguous non-zero regions)
+        # An event starts when we go from 0 to non-zero, ends when we go back to 0
+        is_active = (cond_onsets != 0).float()
+
+        # Detect event boundaries
+        padded = torch.cat(
+            [torch.zeros(1, device=device), is_active, torch.zeros(1, device=device)]
+        )
+        diff = padded[1:] - padded[:-1]
+        event_starts = torch.where(diff == 1)[0]
+        event_ends = torch.where(diff == -1)[0]
+
+        n_events = len(event_starts)
+
+        if n_events == 0:
+            # No events for this condition
+            if return_single_trials:
+                single_trial_designs.append(torch.zeros(n_timepoints, 0, device=device))
+            continue
+
+        # Storage for single-trial regressors (at microtime resolution)
+        trial_regressors_micro = torch.zeros(
+            n_microtime_points, n_events, device=device
+        )
+
+        for event_idx, (start, end) in enumerate(zip(event_starts, event_ends)):
+            # Create single-event onset vector
+            single_event = torch.zeros(n_microtime_points, device=device)
+            single_event[start:end] = cond_onsets[start:end]
+
+            # Convolve with HRF
+            event_vec = single_event.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+            convolved = F.conv1d(event_vec, hrf_kernel, padding=hrf_len - 1)
+            convolved = convolved.squeeze()[:n_microtime_points]
+
+            # Scale to peak = 1.0
+            peak_val = convolved.abs().max()
+            if peak_val > 0:
+                convolved = convolved / peak_val
+
+            trial_regressors_micro[:, event_idx] = convolved
+
+        # Sum across trials to get condition regressor (at microtime resolution)
+        cond_regressor_micro = trial_regressors_micro.sum(dim=1)
+
+        # Downsample to TR resolution
+        design[:, cond_idx] = cond_regressor_micro[sample_indices]
+
+        if return_single_trials:
+            # Downsample single-trial regressors too
+            trial_regressors_tr = trial_regressors_micro[sample_indices, :]
+            single_trial_designs.append(trial_regressors_tr)
+
+    if return_single_trials:
+        return design, single_trial_designs
     return design
 
 
-def make_fir_design(onsets: torch.Tensor, n_lags: int,
-                    n_timepoints: int,
-                    device: Optional[torch.device] = None) -> torch.Tensor:
+def make_fir_design(
+    onsets: torch.Tensor,
+    n_lags: int,
+    n_timepoints: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     """
     Create FIR (Finite Impulse Response) design matrix
 
@@ -228,14 +303,15 @@ def make_fir_design(onsets: torch.Tensor, n_lags: int,
             else:
                 # Shift onset vector by lag
                 shifted = torch.zeros(n_timepoints, device=device)
-                shifted[lag:] = onsets[:n_timepoints-lag, cond_idx]
+                shifted[lag:] = onsets[: n_timepoints - lag, cond_idx]
                 design[:, col_idx] = shifted
 
     return design
 
 
-def make_singletrialdesign(onsets: torch.Tensor,
-                           device: Optional[torch.device] = None) -> torch.Tensor:
+def make_singletrialdesign(
+    onsets: torch.Tensor, device: Optional[torch.device] = None
+) -> torch.Tensor:
     """
     Create single-trial design matrix (one regressor per trial)
 
@@ -294,8 +370,9 @@ def make_singletrialdesign(onsets: torch.Tensor,
     return design_single, trial_conditions
 
 
-def convolve_design_hrf(design: torch.Tensor, hrf: torch.Tensor,
-                       device: Optional[torch.device] = None) -> torch.Tensor:
+def convolve_design_hrf(
+    design: torch.Tensor, hrf: torch.Tensor, device: Optional[torch.device] = None
+) -> torch.Tensor:
     """
     Convolve an existing design matrix with HRF
 
@@ -342,13 +419,15 @@ def convolve_design_hrf(design: torch.Tensor, hrf: torch.Tensor,
     return convolved
 
 
-def build_glm_design(onsets: Union[torch.Tensor, List[torch.Tensor]],
-                    hrf: Optional[torch.Tensor] = None,
-                    n_timepoints: Optional[Union[int, List[int]]] = None,
-                    mode: str = 'assumed',
-                    n_fir_lags: int = 30,
-                    single_trial: bool = False,
-                    device: Optional[torch.device] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
+def build_glm_design(
+    onsets: Union[torch.Tensor, List[torch.Tensor]],
+    hrf: Optional[torch.Tensor] = None,
+    n_timepoints: Optional[Union[int, List[int]]] = None,
+    mode: str = "assumed",
+    n_fir_lags: int = 30,
+    single_trial: bool = False,
+    device: Optional[torch.device] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
     """
     Build design matrix for GLM fitting
 
@@ -403,24 +482,28 @@ def build_glm_design(onsets: Union[torch.Tensor, List[torch.Tensor]],
         if single_trial:
             # Create single-trial design
             design, _ = make_singletrialdesign(onset, device=device)
-            if mode == 'assumed' and hrf is not None:
+            if mode == "assumed" and hrf is not None:
                 design = convolve_design_hrf(design, hrf, device=device)
-            elif mode == 'fir':
+            elif mode == "fir":
                 # For FIR with single trial, need to expand each trial
                 raise NotImplementedError("FIR single-trial design not yet implemented")
         else:
-            if mode == 'onoff':
+            if mode == "onoff":
                 # Simple boxcar - just sum across conditions
-                design = onset.sum(dim=1, keepdim=True) if onset.ndim > 1 else onset.unsqueeze(1)
+                design = (
+                    onset.sum(dim=1, keepdim=True)
+                    if onset.ndim > 1
+                    else onset.unsqueeze(1)
+                )
                 if hrf is not None:
                     design = convolve_hrf(design, hrf, n_tp, device=device)
 
-            elif mode == 'assumed':
+            elif mode == "assumed":
                 if hrf is None:
                     raise ValueError("HRF must be provided for 'assumed' mode")
                 design = convolve_hrf(onset, hrf, n_tp, device=device)
 
-            elif mode == 'fir':
+            elif mode == "fir":
                 design = make_fir_design(onset, n_fir_lags, n_tp, device=device)
 
             else:
@@ -434,13 +517,15 @@ def build_glm_design(onsets: Union[torch.Tensor, List[torch.Tensor]],
         return designs
 
 
-def generate_random_onsets(n_timepoints: int,
-                           n_conditions: int,
-                           isi_mean: float,
-                           isi_range: tuple = (2, 8),
-                           tr: float = 1.0,
-                           alternate_conditions: bool = True,
-                           device: Optional[torch.device] = None) -> torch.Tensor:
+def generate_random_onsets(
+    n_timepoints: int,
+    n_conditions: int,
+    isi_mean: float,
+    isi_range: tuple = (2, 8),
+    tr: float = 1.0,
+    alternate_conditions: bool = True,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     """
     Generate random onset times with truncated Poisson ISI distribution
 
@@ -500,6 +585,7 @@ def generate_random_onsets(n_timepoints: int,
 
     # Shuffle ISIs
     import random
+
     random.shuffle(isis)
     isis = isis[:n_trials_total]
 
@@ -512,7 +598,9 @@ def generate_random_onsets(n_timepoints: int,
     if alternate_conditions:
         conditions = [i % n_conditions for i in range(n_trials_total)]
     else:
-        conditions = [random.randint(0, n_conditions-1) for _ in range(n_trials_total)]
+        conditions = [
+            random.randint(0, n_conditions - 1) for _ in range(n_trials_total)
+        ]
 
     # Build onset matrix
     onsets = torch.zeros(n_timepoints, n_conditions, device=device)

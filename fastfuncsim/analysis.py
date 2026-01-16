@@ -44,7 +44,7 @@ def analyze_from_onsets(
     stim_labels: Optional[List[str]] = None,
     polort: Optional[int] = None,
     verbose: bool = True,
-    microtime_resolution: int = 16,
+    microtime_resolution: int = 20,
     microtime_onset: Optional[int] = None,
     **hrf_kwargs,
 ) -> Union[GLMResults, ARMA11Results]:
@@ -70,15 +70,15 @@ def analyze_from_onsets(
     tr : float
         Repetition time in seconds
     hrf_mode : str
-        HRF mode: 'canonical', 'flobs', 'library', or 'fir'
+        HRF mode: 'canonical', 'pighs', 'library', or 'fir'
         - 'canonical': Single SPM canonical HRF (assumed HRF)
         - 'library': Fit library of HRF variants, pick best per voxel
-        - 'flobs': Use FLOBS HRF library
+        - 'pighs': Use PIGHS (Parametric Individually Generated HRFs) library
         - 'fir': Finite impulse response (no HRF assumption)
     stim_duration : float
         Stimulus duration in seconds (for HRF convolution)
     n_hrfs : int
-        Number of HRFs in library (for 'library' or 'flobs' modes)
+        Number of HRFs in library (for 'library' or 'pighs' modes)
     method : str
         GLM method: 'ols' or 'arma11'
         - 'ols': Ordinary least squares
@@ -107,14 +107,15 @@ def analyze_from_onsets(
         Equivalent to AFNI's -polort option.
     verbose : bool
         Print progress information (default: True)
-    microtime_resolution : int, default=16
+    microtime_resolution : int, default=20
         Number of time bins per TR for sub-TR precision in onset timing.
-        Default is 16 (SPM convention), which correctly models stimuli that
-        occur between TR boundaries. Set to 1 for legacy TR-locked behavior.
+        Default is 20 which correctly models stimuli that occur between TR
+        boundaries. Set to 1 for legacy TR-locked behavior.
     microtime_onset : int, optional
         Which microtime bin to sample for each TR (1-indexed).
-        If None (default), uses middle of TR: microtime_resolution // 2 + 1.
-        Set to 1 to sample at TR onset.
+        If None (default), uses first bin (no shift). Events are placed at
+        their actual onset times without assuming they occur mid-TR.
+        Set to microtime_resolution // 2 + 1 for SPM-style mid-TR sampling.
     **hrf_kwargs : dict
         Additional arguments passed to HRF generation functions
 
@@ -191,10 +192,10 @@ def analyze_from_onsets(
             data = data[:test_n_voxels, :]
         else:
             # If 4D, extract from center (matches analyze_from_design_matrix)
-            cube_side = int(np.ceil(test_n_voxels ** (1/3)))
+            cube_side = int(np.ceil(test_n_voxels ** (1 / 3)))
             center = np.array(original_shape) // 2
             half_cube = cube_side // 2
-            
+
             test_mask_3d = np.zeros(original_shape, dtype=bool)
             x_start = max(0, center[0] - half_cube)
             x_end = min(original_shape[0], center[0] + half_cube)
@@ -202,30 +203,36 @@ def analyze_from_onsets(
             y_end = min(original_shape[1], center[1] + half_cube)
             z_start = max(0, center[2] - half_cube)
             z_end = min(original_shape[2], center[2] + half_cube)
-            
+
             test_mask_3d[x_start:x_end, y_start:y_end, z_start:z_end] = True
             test_mask_flat = test_mask_3d.reshape(-1)
             mask_tensor = torch.from_numpy(test_mask_flat.astype(np.bool_))
             data = data[mask_tensor, :]
-            
+
         n_voxels = data.shape[0]
         print(f"🧪 Test mode: using {n_voxels:,} voxels")
 
     # 2. Set microtime defaults
     if microtime_onset is None:
-        # Default to middle of TR (SPM convention)
-        microtime_onset = microtime_resolution // 2 + 1
+        # Default to first bin (no shift) - events at actual onset times
+        microtime_onset = 1
 
     # 3. Read onset files and convert to binary matrix
     onset_data = read_afni_onset_files(onset_files)
     onsets = onsets_to_binary_matrix(
-        onset_data, n_timepoints, tr, run_starts=run_starts, device=device,
-        microtime_resolution=microtime_resolution
+        onset_data,
+        n_timepoints,
+        tr,
+        run_starts=run_starts,
+        device=device,
+        microtime_resolution=microtime_resolution,
     )
 
     if verbose and microtime_resolution > 1:
-        print(f"📐 Sub-TR timing: {microtime_resolution}x resolution, "
-              f"sampling at bin {microtime_onset}/{microtime_resolution}")
+        print(
+            f"📐 Sub-TR timing: {microtime_resolution}x resolution, "
+            f"sampling at bin {microtime_onset}/{microtime_resolution}"
+        )
 
     # 4. Build design matrix based on HRF mode
     if hrf_mode == "fir":
@@ -233,7 +240,7 @@ def analyze_from_onsets(
         if microtime_resolution > 1:
             # For FIR, downsample onsets back to TR resolution
             # FIR doesn't benefit from microtime since it estimates the full response
-            onsets_tr = onsets[microtime_onset - 1::microtime_resolution, :]
+            onsets_tr = onsets[microtime_onset - 1 :: microtime_resolution, :]
         else:
             onsets_tr = onsets
         design = build_glm_design(
@@ -251,19 +258,29 @@ def analyze_from_onsets(
         if microtime_resolution > 1:
             # Use high-resolution convolution and downsample
             design = convolve_hrf_microtime(
-                onsets, hrf, n_timepoints, microtime_resolution,
-                microtime_onset=microtime_onset, device=device
+                onsets,
+                hrf,
+                n_timepoints,
+                microtime_resolution,
+                tr=tr,
+                microtime_onset=microtime_onset,
+                device=device,
             )
         else:
             # Legacy TR-locked behavior
             design = build_glm_design(
-                onsets, hrf=hrf, n_timepoints=n_timepoints, mode="assumed", device=device
+                onsets,
+                hrf=hrf,
+                n_timepoints=n_timepoints,
+                mode="assumed",
+                device=device,
             )
 
-    elif hrf_mode in ["library", "flobs"]:
+    elif hrf_mode in ["library", "pighs", "flobs"]:
         # HRF library - will fit with library below
+        # Note: 'flobs' is kept for backwards compatibility but 'pighs' is preferred
         hrf_library = get_hrf_library(
-            mode="canonical" if hrf_mode == "library" else "flobs",
+            mode="library" if hrf_mode == "library" else "pighs",
             stim_duration=stim_duration,
             tr=tr,
             n_hrfs=n_hrfs,
@@ -277,12 +294,12 @@ def analyze_from_onsets(
     else:
         raise ValueError(
             f"Unknown hrf_mode: {hrf_mode}. "
-            f"Choose 'canonical', 'library', 'flobs', or 'fir'"
+            f"Choose 'canonical', 'library', 'pighs', or 'fir'"
         )
 
     # 5. Fit GLM
     if method == "ols":
-        if hrf_mode in ["library", "flobs"]:
+        if hrf_mode in ["library", "pighs", "flobs"]:
             # Use HRF library fitting
             # Filter kwargs to only pass valid fit_glm parameters
             fit_glm_params = set(inspect.signature(fit_glm).parameters.keys())
@@ -292,11 +309,15 @@ def analyze_from_onsets(
             glm_kwargs["verbose"] = verbose
 
             results, hrf_idx, r2_all = fit_glm_hrf_library(
-                data, onsets, hrf_library, tr=tr, device=device,
+                data,
+                onsets,
+                hrf_library,
+                tr=tr,
+                device=device,
                 microtime_resolution=microtime_resolution,
                 microtime_onset=microtime_onset,
                 n_timepoints=n_timepoints,
-                **glm_kwargs
+                **glm_kwargs,
             )
             # Store HRF indices in results
             results.hrf_idx = hrf_idx
@@ -306,12 +327,16 @@ def analyze_from_onsets(
             # Standard OLS
             assert design is not None, "design should not be None for non-library modes"
             results = fit_glm(
-                data, design, tr=tr, device=device,
-                max_poly_degree=polort, verbose=verbose
+                data,
+                design,
+                tr=tr,
+                device=device,
+                max_poly_degree=polort,
+                verbose=verbose,
             )
 
     elif method == "arma11":
-        if hrf_mode in ["library", "flobs"]:
+        if hrf_mode in ["library", "pighs", "flobs"]:
             raise NotImplementedError(
                 "ARMA(1,1) with HRF library not yet implemented. "
                 "Use method='ols' or hrf_mode='canonical'/'fir'"
@@ -327,10 +352,17 @@ def analyze_from_onsets(
                 _, arma_b_grid = get_default_arma_grids(device)
 
         # ARMA(1,1) prewhitened GLS
-        assert design is not None, "design should not be None for ARMA (library mode blocked above)"
+        assert design is not None, (
+            "design should not be None for ARMA (library mode blocked above)"
+        )
         results = fit_glm_arma11(
-            data, design, tr=tr, a_grid=arma_a_grid, b_grid=arma_b_grid, device=device,
-            enable_quick_estimate=enable_quick_estimate
+            data,
+            design,
+            tr=tr,
+            a_grid=arma_a_grid,
+            b_grid=arma_b_grid,
+            device=device,
+            enable_quick_estimate=enable_quick_estimate,
         )
 
     else:
@@ -469,12 +501,12 @@ def analyze_from_design_matrix(
 
     # CRITICAL: If using cached data, extract header/affine from cache metadata
     if cached_metadata is not None:
-        if 'nifti_header' in cached_metadata:
-            nifti_header = cached_metadata['nifti_header']
-        if 'affine' in cached_metadata:
-            affine = cached_metadata['affine']
-        if 'volume_shape' in cached_metadata:
-            volume_shape = cached_metadata['volume_shape']
+        if "nifti_header" in cached_metadata:
+            nifti_header = cached_metadata["nifti_header"]
+        if "affine" in cached_metadata:
+            affine = cached_metadata["affine"]
+        if "volume_shape" in cached_metadata:
+            volume_shape = cached_metadata["volume_shape"]
 
     if isinstance(fmri_data, list):
         if len(fmri_data) == 0:
@@ -548,7 +580,9 @@ def analyze_from_design_matrix(
 
         if precomputed_arma_params.ndim == 4:
             # Reshape (x, y, z, 2) -> (n_voxels, 2)
-            arma_volume_shape = tuple(int(dim) for dim in precomputed_arma_params.shape[:3])
+            arma_volume_shape = tuple(
+                int(dim) for dim in precomputed_arma_params.shape[:3]
+            )
 
             # Validate spatial dimensions match data
             if volume_shape is not None and arma_volume_shape != volume_shape:
@@ -557,8 +591,12 @@ def analyze_from_design_matrix(
                     f"does not match data volume shape {volume_shape}"
                 )
 
-            precomputed_arma_params = precomputed_arma_params.reshape(-1, precomputed_arma_params.shape[3])
-            print(f"📊 Reshaped precomputed ARMA params: {arma_volume_shape} → ({precomputed_arma_params.shape[0]:,}, {precomputed_arma_params.shape[1]})")
+            precomputed_arma_params = precomputed_arma_params.reshape(
+                -1, precomputed_arma_params.shape[3]
+            )
+            print(
+                f"📊 Reshaped precomputed ARMA params: {arma_volume_shape} → ({precomputed_arma_params.shape[0]:,}, {precomputed_arma_params.shape[1]})"
+            )
 
         elif precomputed_arma_params.ndim == 2:
             # Already 2D - validate voxel count matches
@@ -614,7 +652,7 @@ def analyze_from_design_matrix(
 
         # Get run starts - need to extract from design_info or actual_run_starts
         run_starts_for_cache = None
-        if 'actual_run_starts' in locals():
+        if "actual_run_starts" in locals():
             run_starts_for_cache = actual_run_starts
 
         # Convert data to numpy for saving
@@ -635,10 +673,12 @@ def analyze_from_design_matrix(
     # TEST MODE: Create test mask to extract ~N voxels from center
     if test_n_voxels is not None:
         if volume_shape is None:
-            raise ValueError("Test mode requires 4D input data to determine volume shape")
+            raise ValueError(
+                "Test mode requires 4D input data to determine volume shape"
+            )
 
         # Calculate cube size to get approximately test_n_voxels
-        cube_side = int(np.ceil(test_n_voxels ** (1/3)))
+        cube_side = int(np.ceil(test_n_voxels ** (1 / 3)))
 
         # Find center of volume
         center = np.array(volume_shape) // 2
@@ -662,7 +702,9 @@ def analyze_from_design_matrix(
 
         print(f"🧪 Test mode: extracting {kept_voxels:,} voxels from center")
         print(f"   Cube: {cube_side}³ at center {tuple(center)}")
-        print(f"   Bounds: x=[{x_start}:{x_end}], y=[{y_start}:{y_end}], z=[{z_start}:{z_end}]")
+        print(
+            f"   Bounds: x=[{x_start}:{x_end}], y=[{y_start}:{y_end}], z=[{z_start}:{z_end}]"
+        )
 
         data = data[mask_tensor, :]
         n_voxels = kept_voxels
@@ -670,7 +712,9 @@ def analyze_from_design_matrix(
         # PARALLEL TRANSFORM: Apply same test mask to precomputed_arma_params
         if precomputed_arma_params is not None:
             precomputed_arma_params = precomputed_arma_params[mask_tensor, :]
-            print(f"   • Also masked precomputed ARMA params: {precomputed_arma_params.shape[0]:,} voxels")
+            print(
+                f"   • Also masked precomputed ARMA params: {precomputed_arma_params.shape[0]:,} voxels"
+            )
 
             # Validate dimensions still match after masking
             assert precomputed_arma_params.shape[0] == n_voxels, (
@@ -703,8 +747,12 @@ def analyze_from_design_matrix(
 
         print("📊 Mask applied:")
         print(f"  Total voxels: {n_voxels:,}")
-        print(f"  Kept (in mask): {kept_voxels:,} ({100*kept_voxels/n_voxels:.1f}%)")
-        print(f"  Excluded: {excluded_voxels:,} ({100*excluded_voxels/n_voxels:.1f}%)")
+        print(
+            f"  Kept (in mask): {kept_voxels:,} ({100 * kept_voxels / n_voxels:.1f}%)"
+        )
+        print(
+            f"  Excluded: {excluded_voxels:,} ({100 * excluded_voxels / n_voxels:.1f}%)"
+        )
 
         data = data[mask_tensor, :]
         n_voxels = kept_voxels
@@ -712,7 +760,9 @@ def analyze_from_design_matrix(
         # PARALLEL TRANSFORM: Apply same mask to precomputed_arma_params
         if precomputed_arma_params is not None:
             precomputed_arma_params = precomputed_arma_params[mask_tensor, :]
-            print(f"  • Also masked precomputed ARMA params: {precomputed_arma_params.shape[0]:,} voxels")
+            print(
+                f"  • Also masked precomputed ARMA params: {precomputed_arma_params.shape[0]:,} voxels"
+            )
 
             # Validate dimensions still match after masking
             assert precomputed_arma_params.shape[0] == n_voxels, (
@@ -737,6 +787,7 @@ def analyze_from_design_matrix(
 
     # Extract stimulus metadata (needed for both OLS and ARMA)
     from .afni_io import extract_design_metadata
+
     full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
 
     # 5. Fit GLM
@@ -775,12 +826,17 @@ def analyze_from_design_matrix(
         ols_write_callback = None
         if ols_output_path is not None:
             from .glm_outputs import write_glm_bucket_as_nifti
+
             # Capture volume_shape and affine from outer scope for the callback
             callback_volume_shape = volume_shape
             callback_affine = affine
             callback_stim_labels = stim_labels  # Capture labels
-            callback_stim_indices = stim_indices if stim_indices else None  # Capture indices
-            callback_design_matrix = design_info["matrix"]  # Capture design matrix for single trials
+            callback_stim_indices = (
+                stim_indices if stim_indices else None
+            )  # Capture indices
+            callback_design_matrix = design_info[
+                "matrix"
+            ]  # Capture design matrix for single trials
 
             def write_ols(ols_results, original_shape, affine):
                 # IMPORTANT: When task_indices is passed to fit_glm(), the results
@@ -789,7 +845,11 @@ def analyze_from_design_matrix(
 
                 # Use captured volume_shape from closure - original_shape from arma may be None
                 # if data was already 2D when passed to fit_glm_arma11
-                shape_to_use = original_shape if original_shape is not None else callback_volume_shape
+                shape_to_use = (
+                    original_shape
+                    if original_shape is not None
+                    else callback_volume_shape
+                )
                 affine_to_use = affine if affine is not None else callback_affine
 
                 ols_results.original_shape = shape_to_use
@@ -831,16 +891,20 @@ def analyze_from_design_matrix(
                     contrast_results=ols_contrast_results,
                     volume_shape=shape_to_use,
                     affine=affine_to_use,
-                    output_format=ols_output_format
+                    output_format=ols_output_format,
                 )
 
                 # Write single-trials output if requested (check for env var set by 3dREMLfast.py)
                 import os
+
                 single_trials_label = os.environ.get("FASTFUNCSIM_SINGLE_TRIALS")
                 if single_trials_label and callback_stim_indices:
                     output_filename = f"ols_{single_trials_label}_single.nii.gz"
-                    print(f"  • Writing OLS single-trial betas (onset order): {output_filename}")
+                    print(
+                        f"  • Writing OLS single-trial betas (onset order): {output_filename}"
+                    )
                     from .glm_outputs import write_single_trials_output
+
                     write_single_trials_output(
                         ols_results,
                         output_filename,
@@ -851,21 +915,35 @@ def analyze_from_design_matrix(
 
                 # Write partial R² if requested (check for env var set by 3dREMLfast.py)
                 r2_partial_mode_env = os.environ.get("FASTFUNCSIM_R2_PARTIAL_MODE")
-                if r2_partial_mode_env and hasattr(ols_results, "r2_partial") and ols_results.r2_partial is not None:
+                if (
+                    r2_partial_mode_env
+                    and hasattr(ols_results, "r2_partial")
+                    and ols_results.r2_partial is not None
+                ):
                     # Generate output path
                     if ols_output_path:
                         if str(ols_output_path).endswith(".nii.gz"):
-                            partial_r2_path = str(ols_output_path).replace(".nii.gz", "_partialR2.nii.gz")
+                            partial_r2_path = str(ols_output_path).replace(
+                                ".nii.gz", "_partialR2.nii.gz"
+                            )
                         elif str(ols_output_path).endswith(".nii"):
-                            partial_r2_path = str(ols_output_path).replace(".nii", "_partialR2.nii.gz")
+                            partial_r2_path = str(ols_output_path).replace(
+                                ".nii", "_partialR2.nii.gz"
+                            )
                         else:
                             partial_r2_path = str(ols_output_path) + "_partialR2.nii.gz"
                     else:
                         partial_r2_path = "OLS_partialR2.nii.gz"
 
-                    print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
+                    print(
+                        f"  • Writing OLS partial R² per condition: {partial_r2_path}"
+                    )
 
-                    from .glm_outputs import write_partial_r2_with_labels, _resolve_shape, _get_voxel_mask
+                    from .glm_outputs import (
+                        write_partial_r2_with_labels,
+                        _resolve_shape,
+                        _get_voxel_mask,
+                    )
 
                     # Get design info from outer scope
                     n_timepoints_ols = design_info.get("n_timepoints")
@@ -884,28 +962,50 @@ def analyze_from_design_matrix(
                         mode=r2_partial_mode_env,  # "full" or "task"
                     )
 
-                    suffix = "_partialR2_task" if r2_partial_mode_env == "task" else "_partialR2"
+                    suffix = (
+                        "_partialR2_task"
+                        if r2_partial_mode_env == "task"
+                        else "_partialR2"
+                    )
                     print("     Sub-bricks (partial R² with AFNI stat params):")
                     for idx, label in enumerate(callback_stim_labels):
                         print(f"       [{idx}] {label}{suffix}")
 
                 # Write semi-partial R² if requested (check for env var set by 3dREMLfast.py)
-                r2_semipartial_mode_env = os.environ.get("FASTFUNCSIM_R2_SEMIPARTIAL_MODE")
-                if r2_semipartial_mode_env and hasattr(ols_results, "r2_semipartial") and ols_results.r2_semipartial is not None:
+                r2_semipartial_mode_env = os.environ.get(
+                    "FASTFUNCSIM_R2_SEMIPARTIAL_MODE"
+                )
+                if (
+                    r2_semipartial_mode_env
+                    and hasattr(ols_results, "r2_semipartial")
+                    and ols_results.r2_semipartial is not None
+                ):
                     # Generate output path
                     if ols_output_path:
                         if str(ols_output_path).endswith(".nii.gz"):
-                            semipartial_r2_path = str(ols_output_path).replace(".nii.gz", "_semipartialR2.nii.gz")
+                            semipartial_r2_path = str(ols_output_path).replace(
+                                ".nii.gz", "_semipartialR2.nii.gz"
+                            )
                         elif str(ols_output_path).endswith(".nii"):
-                            semipartial_r2_path = str(ols_output_path).replace(".nii", "_semipartialR2.nii.gz")
+                            semipartial_r2_path = str(ols_output_path).replace(
+                                ".nii", "_semipartialR2.nii.gz"
+                            )
                         else:
-                            semipartial_r2_path = str(ols_output_path) + "_semipartialR2.nii.gz"
+                            semipartial_r2_path = (
+                                str(ols_output_path) + "_semipartialR2.nii.gz"
+                            )
                     else:
                         semipartial_r2_path = "OLS_semipartialR2.nii.gz"
 
-                    print(f"  • Writing OLS semi-partial R² per condition: {semipartial_r2_path}")
+                    print(
+                        f"  • Writing OLS semi-partial R² per condition: {semipartial_r2_path}"
+                    )
 
-                    from .glm_outputs import write_partial_r2_with_labels, _resolve_shape, _get_voxel_mask
+                    from .glm_outputs import (
+                        write_partial_r2_with_labels,
+                        _resolve_shape,
+                        _get_voxel_mask,
+                    )
 
                     # Get design info from outer scope
                     n_timepoints_ols = design_info.get("n_timepoints")
@@ -924,7 +1024,11 @@ def analyze_from_design_matrix(
                         mode=r2_semipartial_mode_env,  # "full" or "task"
                     )
 
-                    suffix = "_semipartialR2_task" if r2_semipartial_mode_env == "task" else "_semipartialR2"
+                    suffix = (
+                        "_semipartialR2_task"
+                        if r2_semipartial_mode_env == "task"
+                        else "_semipartialR2"
+                    )
                     print("     Sub-bricks (semi-partial R² with AFNI stat params):")
                     for idx, label in enumerate(callback_stim_labels):
                         print(f"       [{idx}] {label}{suffix}")
@@ -1164,7 +1268,9 @@ def analyze_with_cross_validation(
     nuisance_indices = [i for i in range(len(full_labels)) if i not in stim_indices]
 
     if not stim_indices:
-        raise ValueError("No stimulus indices found in design matrix. Cannot perform cross-validation without stimulus regressors.")
+        raise ValueError(
+            "No stimulus indices found in design matrix. Cannot perform cross-validation without stimulus regressors."
+        )
 
     # use_stimulus_only now controls which columns are used for fitting/prediction
     # (but nuisance is ALWAYS projected out first)
@@ -1188,7 +1294,9 @@ def analyze_with_cross_validation(
     # Handle different input types
     if isinstance(fmri_data, list):
         # Multiple run files
-        data, actual_run_starts = load_and_concatenate_runs(fmri_data, device=torch.device("cpu"))  # type: ignore[arg-type]
+        data, actual_run_starts = load_and_concatenate_runs(
+            fmri_data, device=torch.device("cpu")
+        )  # type: ignore[arg-type]
         if verbose:
             print(f"  • Loaded {len(fmri_data)} run files")
     elif isinstance(fmri_data, (str, Path)):

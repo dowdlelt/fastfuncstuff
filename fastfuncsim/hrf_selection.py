@@ -17,10 +17,10 @@ import torch
 from tqdm.auto import tqdm
 
 from .design import convolve_hrf, convolve_hrf_microtime
-from .glm_core import GLMResults, fit_glm
+from .glm_core import GLMResults, construct_polynomial_matrix, fit_glm
 from .hrf import get_hrf_library
 from .utils import get_device, to_tensor
-from .xval import generate_cv_splits, slice_by_runs
+from .xval import compute_xval_r2, generate_cv_splits
 
 
 @dataclass
@@ -37,8 +37,13 @@ class HRFSelectionResults:
         (n_voxels,) Std of cross-validated R² across CV splits for selected HRF
     xval_r2_all_hrfs : torch.Tensor
         (n_voxels, n_hrfs) Median CV R² for each HRF (for diagnostics)
+    xval_r2_canonical : torch.Tensor
+        (n_voxels,) Median CV R² using single canonical HRF (baseline comparison)
     final_results : GLMResults
         Results from final full-data fit with voxel-wise optimal HRFs
+    canonical_results : GLMResults
+        Results from full-data fit with single canonical HRF (baseline comparison)
+        Contains betas, t-stats, etc. for the "what if we hadn't optimized" case.
     hrf_library : torch.Tensor
         (n_hrfs, n_hrf_timepoints) The HRF library used (stored for ARMA reuse)
     hrf_metadata : dict
@@ -49,13 +54,21 @@ class HRFSelectionResults:
     xval_r2_best: torch.Tensor = None
     xval_r2_std: torch.Tensor = None
     xval_r2_all_hrfs: torch.Tensor = None
+    xval_r2_canonical: torch.Tensor = None  # Baseline with single canonical HRF
     final_results: GLMResults = None
+    canonical_results: GLMResults = None  # Full GLM with canonical HRF for comparison
     hrf_library: torch.Tensor = None
     hrf_metadata: Dict = field(default_factory=dict)
 
     # For ARMA integration: store the convolved design per HRF group
     # This allows reloading without reconvolving
     hrf_group_indices: Dict[int, torch.Tensor] = field(default_factory=dict)
+
+    # Store design matrix (convolved with middle HRF) for debugging
+    design_matrix: Optional[torch.Tensor] = None
+
+    # Store canonical HRF design matrix for comparison/saving
+    canonical_design_matrix: Optional[torch.Tensor] = None
 
 
 def fit_glm_hrf_library_with_xval(
@@ -68,7 +81,7 @@ def fit_glm_hrf_library_with_xval(
     cv_strategy: Union[float, int] = 1,
     n_perms: int = 100,
     metric: str = "cod",
-    microtime_resolution: int = 16,
+    microtime_resolution: int = 20,
     microtime_onset: Optional[int] = None,
     polort: Optional[int] = None,
     device: Optional[torch.device] = None,
@@ -108,10 +121,10 @@ def fit_glm_hrf_library_with_xval(
         Number of permutations for random split strategies
     metric : str, default='cod'
         R² metric: 'cod' (coefficient of determination), 'corr', or 'corr2'
-    microtime_resolution : int, default=16
+    microtime_resolution : int, default=20
         Sub-TR resolution for onset timing
     microtime_onset : int, optional
-        Which microtime bin to sample (default: middle of TR)
+        Which microtime bin to sample (default: 1, no shift)
     polort : int, optional
         Polynomial order for detrending (None = auto)
     device : torch.device, optional
@@ -141,9 +154,9 @@ def fit_glm_hrf_library_with_xval(
     if device is None:
         device = get_device()
 
-    # Set microtime_onset default
+    # Set microtime_onset default: first bin (no shift, events at actual times)
     if microtime_onset is None:
-        microtime_onset = microtime_resolution // 2 + 1
+        microtime_onset = 1
 
     # Move data to device
     data = to_tensor(data, device=device)
@@ -189,73 +202,201 @@ def fit_glm_hrf_library_with_xval(
         print(f"  CV splits: {n_splits}")
         print()
 
-    # Storage for CV results: (n_voxels, n_hrfs, n_splits)
-    xval_r2_all = torch.zeros(n_voxels, n_hrfs, n_splits, device=device)
+    # =========================================================================
+    # Build polynomial (nuisance) design matrix - same for all HRFs
+    # Uses block-diagonal structure: each run gets its own polynomials
+    # This is the SAME approach as fit_glm and compute_xval_r2 expect
+    # =========================================================================
 
-    # Main loop: evaluate each HRF via cross-validation
+    # Auto-compute polort if not specified (AFNI convention: duration_minutes / 2)
+    if polort is None:
+        run_lengths = []
+        for i in range(n_runs):
+            if i < n_runs - 1:
+                run_lengths.append(run_starts[i + 1] - run_starts[i])
+            else:
+                run_lengths.append(n_timepoints - run_starts[i])
+        avg_run_duration_min = (sum(run_lengths) / n_runs * tr) / 60.0
+        polort = max(1, round(avg_run_duration_min / 2))
+        if verbose:
+            print(
+                f"  Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)"
+            )
+
+    # Build block-diagonal polynomial matrix for all runs
+    poly_blocks = []
+    run_lengths = []
+    for i in range(n_runs):
+        if i < n_runs - 1:
+            run_len = run_starts[i + 1] - run_starts[i]
+        else:
+            run_len = n_timepoints - run_starts[i]
+        run_lengths.append(run_len)
+        poly_block = construct_polynomial_matrix(run_len, polort, device)
+        poly_blocks.append(poly_block)
+
+    # Create block-diagonal polynomial design
+    poly_design = torch.block_diag(*poly_blocks)  # (n_timepoints, n_runs * (polort+1))
+    n_poly_cols = poly_design.shape[1]
+
+    if verbose:
+        print(
+            f"  Polynomial design: {poly_design.shape} ({n_poly_cols} nuisance columns)"
+        )
+        print()
+
+    # Storage for CV results: (n_voxels, n_hrfs)
+    xval_r2_median_all = torch.zeros(n_voxels, n_hrfs, device=device)
+    xval_r2_std_all = torch.zeros(n_voxels, n_hrfs, device=device)
+
+    # Store design matrix for debugging (using middle HRF as reference)
+    reference_hrf_idx = n_hrfs // 2
+    design_matrix_ref = None
+
+    # =========================================================================
+    # Main loop: evaluate each HRF via cross-validation using compute_xval_r2
+    # This reuses the SOLID xval code from 3dXvalR2fast
+    # =========================================================================
     hrf_iterator = tqdm(range(n_hrfs), desc="HRF candidates", disable=not verbose)
 
     for hrf_idx in hrf_iterator:
         hrf = hrf_library[hrf_idx]
 
-        # Convolve onsets with this HRF
+        # Convolve onsets with this HRF to get stimulus design
         if microtime_resolution > 1:
-            design_convolved = convolve_hrf_microtime(
+            stim_design = convolve_hrf_microtime(
                 onsets,
                 hrf,
                 n_timepoints,
                 microtime_resolution,
+                tr=tr,
                 microtime_onset=microtime_onset,
                 device=device,
             )
         else:
-            design_convolved = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+            stim_design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
 
-        # Cross-validation loop
-        for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
-            # Slice data and design for train/test
-            # slice_by_runs expects (n_voxels, n_timepoints) and returns same shape
-            data_train, design_train, _ = slice_by_runs(
-                data, design_convolved, run_starts, train_runs
-            )
-            data_test, design_test, _ = slice_by_runs(
-                data, design_convolved, run_starts, test_runs
-            )
+        n_stim_cols = stim_design.shape[1]
 
-            # data_train: (n_voxels, n_timepoints_train)
-            # design_train: (n_timepoints_train, n_regressors)
+        # Build full design: [stimulus | polynomials]
+        # Stimulus columns come first (stim_indices = 0:n_stim)
+        # Polynomial columns come after (nuisance_indices = n_stim:n_stim+n_poly)
+        full_design = torch.cat([stim_design, poly_design], dim=1)
 
-            # Fit OLS on training data
-            # Simple least squares: beta = (X'X)^-1 X'Y
-            XtX = design_train.T @ design_train  # (n_regressors, n_regressors)
-            XtY = design_train.T @ data_train.T  # (n_regressors, n_voxels)
+        stim_indices = list(range(n_stim_cols))
+        nuisance_indices = list(range(n_stim_cols, n_stim_cols + n_poly_cols))
 
-            # Solve for betas
-            try:
-                betas = torch.linalg.solve(XtX, XtY)  # (n_regressors, n_voxels)
-            except torch.linalg.LinAlgError:
-                # Singular matrix - use pseudoinverse
-                betas = torch.linalg.lstsq(XtX, XtY).solution
+        # Store reference design matrix for debugging
+        if hrf_idx == reference_hrf_idx:
+            design_matrix_ref = full_design.cpu().clone()
 
-            # Predict test data
-            predictions = design_test @ betas  # (n_test_timepoints, n_voxels)
+        # Use the SOLID xval code that already handles all edge cases
+        xval_results = compute_xval_r2(
+            data=data,
+            design_matrix=full_design,
+            run_starts=run_starts,
+            stim_indices=stim_indices,
+            nuisance_indices=nuisance_indices,
+            cv_splits=cv_splits,
+            metric=metric,
+            zero_event_strategy="zero",
+            device=device,
+            batch_size=chunk_size,
+            verbose=False,  # Don't spam per-HRF output
+        )
 
-            # Compute R² metric
-            r2 = _compute_r2_metric(
-                data_test.T, predictions, metric=metric, device=device
-            )
+        # Store results for this HRF
+        xval_r2_median_all[:, hrf_idx] = xval_results["r2_median"].to(device)
+        xval_r2_std_all[:, hrf_idx] = xval_results["r2_std"].to(device)
 
-            xval_r2_all[:, hrf_idx, split_idx] = r2
+    # =========================================================================
+    # Compute canonical HRF baseline for comparison
+    # This uses a single SPM-style canonical HRF as baseline
+    # =========================================================================
+    if verbose:
+        print()
+        print("Computing canonical HRF baseline for comparison...")
 
-    # Aggregate across CV splits (median)
-    xval_r2_median = xval_r2_all.median(dim=2)[0]  # (n_voxels, n_hrfs)
-    xval_r2_std_all = xval_r2_all.std(dim=2)  # (n_voxels, n_hrfs)
+    # Get single canonical HRF
+    mean_duration = float(np.mean(stim_durations)) if stim_durations else 0.0
+    canonical_hrf = get_hrf_library(
+        mode="single",
+        stim_duration=mean_duration,
+        tr=tr,
+        device=device,
+    )
 
-    # Select best HRF per voxel
-    hrf_index = xval_r2_median.argmax(dim=1)  # (n_voxels,)
+    # Convolve with canonical HRF
+    if microtime_resolution > 1:
+        canonical_design = convolve_hrf_microtime(
+            onsets,
+            canonical_hrf,
+            n_timepoints,
+            microtime_resolution,
+            tr=tr,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
+    else:
+        canonical_design = convolve_hrf(
+            onsets, canonical_hrf, n_timepoints, device=device
+        )
+
+    # Build full design with polynomials
+    full_design_canonical = torch.cat([canonical_design, poly_design], dim=1)
+    stim_indices_canonical = list(range(canonical_design.shape[1]))
+    nuisance_indices_canonical = list(
+        range(canonical_design.shape[1], full_design_canonical.shape[1])
+    )
+
+    # Compute xval R² for canonical HRF
+    canonical_xval_results = compute_xval_r2(
+        data=data,
+        design_matrix=full_design_canonical,
+        run_starts=run_starts,
+        stim_indices=stim_indices_canonical,
+        nuisance_indices=nuisance_indices_canonical,
+        cv_splits=cv_splits,
+        metric=metric,
+        zero_event_strategy="zero",
+        device=device,
+        batch_size=chunk_size,
+        verbose=False,
+    )
+    xval_r2_canonical = canonical_xval_results["r2_median"].to(device)
+
+    if verbose:
+        print(f"  Canonical HRF mean xval R²: {xval_r2_canonical.mean().item():.4f}")
+
+    # Fit full dataset with canonical HRF to get betas/tstats for comparison
+    if verbose:
+        print("  Fitting full dataset with canonical HRF...")
+
+    # Use fit_glm with the proper signature: (data, design, tr, ...)
+    # full_design_canonical already has poly columns, so set max_poly_degree=0 (no extra polys)
+    canonical_glm_results = fit_glm(
+        data=data,
+        design=full_design_canonical,  # Already includes stimulus + polynomial columns
+        tr=tr,
+        max_poly_degree=0,  # No additional polynomials - already in design
+        device=device,
+        verbose=False,
+        task_indices=stim_indices_canonical,  # Mark which are task regressors
+    )
+
+    # Store the canonical design matrix for saving
+    canonical_design_matrix = full_design_canonical
+
+    if verbose:
+        print(
+            f"  Canonical HRF full-data R²: {canonical_glm_results.r2.mean().item():.4f}"
+        )
+
+    # Select best HRF per voxel based on median CV R²
+    hrf_index = xval_r2_median_all.argmax(dim=1)  # (n_voxels,)
 
     # Extract R² for selected HRF
-    xval_r2_best = xval_r2_median[torch.arange(n_voxels, device=device), hrf_index]
+    xval_r2_best = xval_r2_median_all[torch.arange(n_voxels, device=device), hrf_index]
     xval_r2_std = xval_r2_std_all[torch.arange(n_voxels, device=device), hrf_index]
 
     if verbose:
@@ -265,6 +406,8 @@ def fit_glm_hrf_library_with_xval(
         print(f"  HRF usage distribution: {hrf_counts.cpu().tolist()}")
         print(f"  Mean xval R²: {xval_r2_best.mean().item():.4f}")
         print(f"  Median xval R²: {xval_r2_best.median().item():.4f}")
+        r2_improvement = xval_r2_best.mean().item() - xval_r2_canonical.mean().item()
+        print(f"  Improvement over canonical: {r2_improvement:+.4f}")
         print()
 
     # Final fit: refit entire dataset with voxel-wise optimal HRFs
@@ -315,11 +458,15 @@ def fit_glm_hrf_library_with_xval(
         hrf_index=hrf_index.cpu(),
         xval_r2_best=xval_r2_best.cpu(),
         xval_r2_std=xval_r2_std.cpu(),
-        xval_r2_all_hrfs=xval_r2_median.cpu(),
+        xval_r2_all_hrfs=xval_r2_median_all.cpu(),
+        xval_r2_canonical=xval_r2_canonical.cpu(),
         final_results=final_results,
+        canonical_results=canonical_glm_results,
         hrf_library=hrf_library.cpu(),
         hrf_metadata=hrf_metadata,
         hrf_group_indices={k: v.cpu() for k, v in hrf_group_indices.items()},
+        design_matrix=design_matrix_ref,
+        canonical_design_matrix=canonical_design_matrix.cpu(),
     )
 
     if verbose:
@@ -327,7 +474,7 @@ def fit_glm_hrf_library_with_xval(
         print("=" * 70)
         print("HRF SELECTION COMPLETE")
         print("=" * 70)
-        print(f"  Best HRF per voxel stored in hrf_index")
+        print("  Best HRF per voxel stored in hrf_index")
         print(f"  Final betas shape: {final_results.betas.shape}")
         print(f"  Final R² mean: {final_results.r2.mean().item():.4f}")
         print()
@@ -382,6 +529,9 @@ def _fit_voxelwise_hrf(
 
     hrf_iterator = tqdm(unique_hrfs, desc="HRF groups", disable=not verbose)
 
+    # Store dof from any group (should be same for all as design has same structure)
+    stored_dof = None
+
     for hrf_idx in hrf_iterator:
         hrf_idx_int = hrf_idx.item()
 
@@ -405,6 +555,7 @@ def _fit_voxelwise_hrf(
                 hrf,
                 n_timepoints,
                 microtime_resolution,
+                tr=tr,
                 microtime_onset=microtime_onset,
                 device=device,
             )
@@ -420,6 +571,10 @@ def _fit_voxelwise_hrf(
             device=device,
             verbose=False,
         )
+
+        # Store dof from first group (same for all groups with same design structure)
+        if stored_dof is None and group_results.dof is not None:
+            stored_dof = group_results.dof
 
         # Store results (with None checks for type safety)
         if group_results.betas is not None:
@@ -439,75 +594,73 @@ def _fit_voxelwise_hrf(
     results.tstats = all_tstats.cpu()
     results.sigma2 = all_sigma2.cpu()
     results.meanvol = data.mean(dim=1).cpu()
+    results.dof = stored_dof  # Propagate dof from fit_glm for 3drefit labeling
 
     return results
 
 
-def _compute_r2_metric(
-    y_true: torch.Tensor,
-    y_pred: torch.Tensor,
-    metric: str,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Compute R² metric for cross-validation.
+def _write_afni_xmat(
+    design_matrix: np.ndarray,
+    output_file: str,
+    n_stim_cols: int,
+    condition_labels: Optional[List[str]],
+    run_starts: List[int],
+    tr: float,
+) -> None:
+    """Write design matrix in AFNI xmat.1D format.
 
     Parameters
     ----------
-    y_true : torch.Tensor
-        (n_timepoints, n_voxels) true values
-    y_pred : torch.Tensor
-        (n_timepoints, n_voxels) predicted values
-    metric : str
-        'cod' (coefficient of determination), 'corr', or 'corr2'
-
-    Returns
-    -------
-    r2 : torch.Tensor
-        (n_voxels,) R² values
+    design_matrix : np.ndarray
+        (n_timepoints, n_columns) design matrix
+    output_file : str
+        Path to output file
+    n_stim_cols : int
+        Number of stimulus columns (rest are nuisance)
+    condition_labels : list of str, optional
+        Labels for stimulus conditions
+    run_starts : list of int
+        Starting timepoint for each run
+    tr : float
+        Repetition time in seconds
     """
-    if metric == "cod":
-        # Coefficient of determination: 1 - SS_res / SS_tot
-        ss_res = ((y_true - y_pred) ** 2).sum(dim=0)
-        ss_tot = ((y_true - y_true.mean(dim=0, keepdim=True)) ** 2).sum(dim=0)
+    n_timepoints, n_cols = design_matrix.shape
 
-        # Avoid division by zero
-        ss_tot = torch.clamp(ss_tot, min=1e-10)
-        r2 = 1 - ss_res / ss_tot
-
-        # Clamp to reasonable range (can be negative for bad predictions)
-        r2 = torch.clamp(r2, min=-1.0, max=1.0)
-
-    elif metric == "corr":
-        # Pearson correlation
-        y_true_centered = y_true - y_true.mean(dim=0, keepdim=True)
-        y_pred_centered = y_pred - y_pred.mean(dim=0, keepdim=True)
-
-        numerator = (y_true_centered * y_pred_centered).sum(dim=0)
-        denominator = torch.sqrt(
-            (y_true_centered**2).sum(dim=0) * (y_pred_centered**2).sum(dim=0)
-        )
-        denominator = torch.clamp(denominator, min=1e-10)
-
-        r2 = numerator / denominator
-
-    elif metric == "corr2":
-        # Squared Pearson correlation
-        y_true_centered = y_true - y_true.mean(dim=0, keepdim=True)
-        y_pred_centered = y_pred - y_pred.mean(dim=0, keepdim=True)
-
-        numerator = (y_true_centered * y_pred_centered).sum(dim=0)
-        denominator = torch.sqrt(
-            (y_true_centered**2).sum(dim=0) * (y_pred_centered**2).sum(dim=0)
-        )
-        denominator = torch.clamp(denominator, min=1e-10)
-
-        r2 = (numerator / denominator) ** 2
-
+    # Build column labels
+    if condition_labels is not None and len(condition_labels) == n_stim_cols:
+        stim_labels = condition_labels
     else:
-        raise ValueError(f"Unknown metric: {metric}. Choose 'cod', 'corr', or 'corr2'")
+        stim_labels = [f"stim{i:02d}" for i in range(n_stim_cols)]
 
-    return r2
+    # Label polynomial/nuisance columns
+    n_nuisance = n_cols - n_stim_cols
+    nuisance_labels = [f"poly{i:02d}" for i in range(n_nuisance)]
+    all_labels = stim_labels + nuisance_labels
+
+    # Write simplified AFNI xmat format
+    with open(output_file, "w") as f:
+        # Header
+        f.write("# <matrix\n")
+        f.write(f'#  ni_type = "{n_cols}*double"\n')
+        f.write(f'#  ni_dimen = "{n_timepoints}"\n')
+        f.write(f'#  ColumnLabels = "{" ; ".join(all_labels)}"\n')
+        f.write(f'#  RowTR = "{tr}"\n')
+        f.write(f'#  GoodList = "0..{n_timepoints - 1}"\n')
+        f.write(f'#  NRowFull = "{n_timepoints}"\n')
+        run_starts_str = ",".join(map(str, run_starts))
+        f.write(f'#  RunStart = "{run_starts_str}"\n')
+        f.write(f'#  Nstim = "{n_stim_cols}"\n')
+        if n_stim_cols > 0:
+            stim_bots = ",".join(map(str, range(n_stim_cols)))
+            stim_tops = ",".join(map(str, range(n_stim_cols)))
+            f.write(f'#  StimBots = "{stim_bots}"\n')
+            f.write(f'#  StimTops = "{stim_tops}"\n')
+            f.write(f'#  StimLabels = "{" ; ".join(stim_labels)}"\n')
+        f.write("# >\n")
+
+        # Data matrix
+        for row in design_matrix:
+            f.write(" ".join(f"{v:.6f}" for v in row) + "\n")
 
 
 def save_hrf_selection_results(
@@ -517,6 +670,10 @@ def save_hrf_selection_results(
     affine: Optional[np.ndarray] = None,
     voxel_mask: Optional[torch.Tensor] = None,
     condition_labels: Optional[List[str]] = None,
+    run_starts: Optional[List[int]] = None,
+    save_all_hrf_designs: bool = False,
+    onsets: Optional[torch.Tensor] = None,
+    save_plots: bool = False,
 ) -> Dict[str, str]:
     """
     Save HRF selection results to disk.
@@ -535,6 +692,17 @@ def save_hrf_selection_results(
         Boolean mask for voxels (if data was masked)
     condition_labels : list of str, optional
         Labels for each condition
+    run_starts : list of int, optional
+        Starting timepoint for each run (for AFNI xmat format)
+    save_all_hrf_designs : bool, default=False
+        If True, save individual design matrices for each HRF in the library.
+        Each file is named {prefix}_design_hrf{idx:02d}.xmat.1D and can be
+        used to run the GLM externally (e.g., with AFNI's 3dREMLfit).
+    onsets : torch.Tensor, optional
+        Required if save_all_hrf_designs=True. The onset matrix used for
+        design matrix construction (at microtime resolution if applicable).
+    save_plots : bool, default=False
+        If True, save design matrix plots as PNG images.
 
     Returns
     -------
@@ -552,11 +720,14 @@ def save_hrf_selection_results(
 
     output_files = {}
 
-    # 1. Save HRF index map
+    # Get TR for plotting
+    tr = results.hrf_metadata.get("tr", 1.0)
+
+    # 1. Save HRF index map (1-based: 1 to N, not 0 to N-1, since 0 = background)
     hrf_index_file = f"{output_prefix}_hrf_index.nii.gz"
-    _save_volume(
-        results.hrf_index.float(), hrf_index_file, volume_shape, affine, voxel_mask
-    )
+    # Add 1 to convert from 0-indexed to 1-indexed for AFNI compatibility
+    hrf_index_1based = results.hrf_index.float() + 1.0
+    _save_volume(hrf_index_1based, hrf_index_file, volume_shape, affine, voxel_mask)
     output_files["hrf_index"] = hrf_index_file
 
     # 2. Save CV R² for best HRF
@@ -568,6 +739,30 @@ def save_hrf_selection_results(
     xval_std_file = f"{output_prefix}_xval_r2_std.nii.gz"
     _save_volume(results.xval_r2_std, xval_std_file, volume_shape, affine, voxel_mask)
     output_files["xval_r2_std"] = xval_std_file
+
+    # 3b. Save canonical HRF baseline R² for comparison
+    if results.xval_r2_canonical is not None:
+        canonical_r2_file = f"{output_prefix}_xval_r2_canonical.nii.gz"
+        _save_volume(
+            results.xval_r2_canonical,
+            canonical_r2_file,
+            volume_shape,
+            affine,
+            voxel_mask,
+        )
+        output_files["xval_r2_canonical"] = canonical_r2_file
+
+    # 3c. Save CV R² for ALL HRFs as 4D volume (n_voxels, n_hrfs)
+    if results.xval_r2_all_hrfs is not None:
+        xval_r2_all_file = f"{output_prefix}_xval_r2_all_hrfs.nii.gz"
+        _save_volume_4d(
+            results.xval_r2_all_hrfs,
+            xval_r2_all_file,
+            volume_shape,
+            affine,
+            voxel_mask,
+        )
+        output_files["xval_r2_all_hrfs"] = xval_r2_all_file
 
     # 4. Save final betas
     if results.final_results is not None:
@@ -586,6 +781,23 @@ def save_hrf_selection_results(
         )
         output_files["stats"] = betas_file
 
+    # 4b. Save canonical HRF stats (betas, t-stats) for comparison
+    if results.canonical_results is not None:
+        results.canonical_results.original_shape = volume_shape
+        results.canonical_results.affine = affine
+        if voxel_mask is not None:
+            results.canonical_results.voxel_mask = voxel_mask
+
+        canonical_stats_file = f"{output_prefix}_canonical_stats.nii.gz"
+        write_glm_bucket_as_nifti(
+            results.canonical_results,
+            canonical_stats_file,
+            condition_names=condition_labels,
+            volume_shape=volume_shape,
+            affine=affine,
+        )
+        output_files["canonical_stats"] = canonical_stats_file
+
     # 5. Save HRF library for ARMA reuse
     hrf_lib_file = f"{output_prefix}_hrf_library.pt"
     torch.save(
@@ -599,11 +811,268 @@ def save_hrf_selection_results(
     )
     output_files["hrf_library"] = hrf_lib_file
 
-    # 6. Save metadata JSON
+    # 6. Save design matrix in AFNI xmat.1D format
+    if results.design_matrix is not None:
+        design_np = results.design_matrix.cpu().numpy()
+        n_timepoints = design_np.shape[0]
+
+        # Determine column structure: stimulus columns + nuisance columns
+        n_conditions = results.hrf_metadata.get("stim_durations")
+        if n_conditions is not None:
+            n_stim_cols = len(n_conditions) if isinstance(n_conditions, list) else 1
+        else:
+            # Estimate from final_results if available
+            if (
+                results.final_results is not None
+                and results.final_results.betas is not None
+            ):
+                n_stim_cols = results.final_results.betas.shape[1]
+            else:
+                n_stim_cols = design_np.shape[1]  # Assume all are stimulus
+
+        # Get run_starts from metadata or parameter
+        if run_starts is None:
+            n_runs = results.hrf_metadata.get("n_runs", 1)
+            run_length = n_timepoints // n_runs
+            run_starts = [i * run_length for i in range(n_runs)]
+
+        # Get TR from metadata
+        tr = results.hrf_metadata.get("tr", 2.0)
+
+        # Write optimized HRF design matrix
+        design_file = f"{output_prefix}_design.xmat.1D"
+        _write_afni_xmat(
+            design_np, design_file, n_stim_cols, condition_labels, run_starts, tr
+        )
+        output_files["design"] = design_file
+
+    # 6b. Save canonical HRF design matrix in AFNI xmat.1D format
+    if results.canonical_design_matrix is not None:
+        canonical_design_np = results.canonical_design_matrix.cpu().numpy()
+        n_timepoints = canonical_design_np.shape[0]
+
+        # Determine column structure
+        n_conditions = results.hrf_metadata.get("stim_durations")
+        if n_conditions is not None:
+            n_stim_cols = len(n_conditions) if isinstance(n_conditions, list) else 1
+        else:
+            if (
+                results.canonical_results is not None
+                and results.canonical_results.betas is not None
+            ):
+                n_stim_cols = results.canonical_results.betas.shape[1]
+            else:
+                n_stim_cols = canonical_design_np.shape[1]
+
+        # Get run_starts/TR from metadata or parameter
+        if run_starts is None:
+            n_runs = results.hrf_metadata.get("n_runs", 1)
+            run_length = n_timepoints // n_runs
+            run_starts = [i * run_length for i in range(n_runs)]
+        tr = results.hrf_metadata.get("tr", 2.0)
+
+        # Write canonical HRF design matrix
+        canonical_design_file = f"{output_prefix}_canonical_design.xmat.1D"
+        _write_afni_xmat(
+            canonical_design_np,
+            canonical_design_file,
+            n_stim_cols,
+            condition_labels,
+            run_starts,
+            tr,
+        )
+        output_files["canonical_design"] = canonical_design_file
+
+    # 6c. Save individual design matrices for each HRF in the library
+    # These can be used to run external GLMs (e.g., with AFNI's 3dREMLfit)
+    if save_all_hrf_designs:
+        if onsets is None:
+            import warnings
+
+            warnings.warn(
+                "save_all_hrf_designs=True but onsets not provided. "
+                "Cannot generate individual HRF design matrices."
+            )
+        else:
+            # Get parameters from metadata
+            tr = results.hrf_metadata.get("tr", 2.0)
+            microtime_resolution = results.hrf_metadata.get("microtime_resolution", 1)
+            microtime_onset = results.hrf_metadata.get("microtime_onset", 1)
+            n_hrfs = results.hrf_library.shape[0]
+            hrf_mode = results.hrf_metadata.get("hrf_mode", "library")
+
+            # Determine n_timepoints from design matrix or onsets
+            if results.design_matrix is not None:
+                n_timepoints = results.design_matrix.shape[0]
+            else:
+                n_timepoints = (
+                    onsets.shape[0] // microtime_resolution
+                    if microtime_resolution > 1
+                    else onsets.shape[0]
+                )
+
+            # Get run_starts/condition labels
+            if run_starts is None:
+                n_runs = results.hrf_metadata.get("n_runs", 1)
+                run_length = n_timepoints // n_runs
+                run_starts_local = [i * run_length for i in range(n_runs)]
+            else:
+                run_starts_local = run_starts
+
+            # Build polynomial design for nuisance columns (block-diagonal for runs)
+            polort_val = results.hrf_metadata.get("polort")
+            if polort_val is None or not isinstance(polort_val, int):
+                polort_val = min(1 + int(n_timepoints * tr / 150), 3)
+
+            # Build block-diagonal polynomial matrix
+            n_runs = len(run_starts_local)
+            poly_blocks = []
+            for i in range(n_runs):
+                if i < n_runs - 1:
+                    run_len = run_starts_local[i + 1] - run_starts_local[i]
+                else:
+                    run_len = n_timepoints - run_starts_local[i]
+                poly_block = construct_polynomial_matrix(
+                    run_len, polort_val, onsets.device
+                )
+                poly_blocks.append(poly_block)
+            poly_design = torch.block_diag(*poly_blocks)
+
+            # Create output directory for HRF designs
+            hrf_designs_dir = Path(f"{output_prefix}_hrf_designs")
+            hrf_designs_dir.mkdir(parents=True, exist_ok=True)
+
+            hrf_design_files = []
+            for hrf_idx in range(n_hrfs):
+                hrf = results.hrf_library[hrf_idx]
+
+                # Convolve onsets with this HRF
+                if microtime_resolution > 1:
+                    stim_design = convolve_hrf_microtime(
+                        onsets,
+                        hrf,
+                        n_timepoints,
+                        microtime_resolution,
+                        tr=tr,
+                        microtime_onset=microtime_onset,
+                    )
+                else:
+                    stim_design = convolve_hrf(onsets, hrf, n_timepoints)
+
+                # Build full design: [stimulus | polynomials]
+                full_design = torch.cat([stim_design, poly_design], dim=1)
+                design_np = full_design.cpu().numpy()
+                n_stim_cols = stim_design.shape[1]
+
+                # Create descriptive filename (1-based: hrf01, hrf02, ..., hrf20)
+                # Use hrf_idx + 1 for 1-based naming (0 = background in AFNI)
+                hrf_num = hrf_idx + 1
+                hrf_design_file = (
+                    hrf_designs_dir / f"hrf{hrf_num:02d}_{hrf_mode}.xmat.1D"
+                )
+                _write_afni_xmat(
+                    design_np,
+                    str(hrf_design_file),
+                    n_stim_cols,
+                    condition_labels,
+                    run_starts_local,
+                    tr,
+                )
+                hrf_design_files.append(str(hrf_design_file))
+
+            output_files["hrf_designs_dir"] = str(hrf_designs_dir)
+            output_files["hrf_design_files"] = hrf_design_files
+
+    # 6d. Save design matrix plots if requested
+    if save_plots:
+        tr = results.hrf_metadata.get("tr", 1.0)
+
+        # Determine n_stim_cols for labeling
+        n_conditions_meta = results.hrf_metadata.get("stim_durations")
+        if n_conditions_meta is not None:
+            n_stim_cols = (
+                len(n_conditions_meta) if isinstance(n_conditions_meta, list) else 1
+            )
+        elif (
+            results.final_results is not None
+            and results.final_results.betas is not None
+        ):
+            n_stim_cols = results.final_results.betas.shape[1]
+        else:
+            n_stim_cols = 0
+
+        # Build column labels
+        if condition_labels is not None and len(condition_labels) >= n_stim_cols:
+            stim_labels = list(condition_labels[:n_stim_cols])
+        else:
+            stim_labels = [f"stim{i:02d}" for i in range(n_stim_cols)]
+
+        # Plot optimized design matrix
+        if results.design_matrix is not None:
+            n_timepoints = results.design_matrix.shape[0]
+            n_cols = results.design_matrix.shape[1]
+            n_nuisance = n_cols - n_stim_cols
+            nuisance_labels = [f"poly{i:02d}" for i in range(n_nuisance)]
+            all_labels = stim_labels + nuisance_labels
+
+            design_plot_file = f"{output_prefix}_design.png"
+            plot_design_matrix(
+                results.design_matrix,
+                output_file=design_plot_file,
+                column_labels=all_labels,
+                tr=tr,
+                title="Optimized HRF Design Matrix",
+                run_starts=run_starts,
+            )
+            output_files["design_plot"] = design_plot_file
+
+        # Plot canonical design matrix
+        if results.canonical_design_matrix is not None:
+            n_cols = results.canonical_design_matrix.shape[1]
+            n_nuisance = n_cols - n_stim_cols
+            nuisance_labels = [f"poly{i:02d}" for i in range(n_nuisance)]
+            all_labels = stim_labels + nuisance_labels
+
+            canonical_plot_file = f"{output_prefix}_canonical_design.png"
+            plot_design_matrix(
+                results.canonical_design_matrix,
+                output_file=canonical_plot_file,
+                column_labels=all_labels,
+                tr=tr,
+                title="Canonical HRF Design Matrix",
+                run_starts=run_starts,
+            )
+            output_files["canonical_design_plot"] = canonical_plot_file
+
+        # Plot HRF library
+        if results.hrf_library is not None:
+            hrf_plot_file = f"{output_prefix}_hrf_library.png"
+            plot_hrf_library(
+                results.hrf_library,
+                output_file=hrf_plot_file,
+                tr=tr,
+                title="HRF Library",
+            )
+            output_files["hrf_library_plot"] = hrf_plot_file
+
+    # 7. Save metadata JSON
     metadata_file = f"{output_prefix}_metadata.json"
     metadata = results.hrf_metadata.copy()
     metadata["output_files"] = {k: str(v) for k, v in output_files.items()}
     metadata["hrf_library_shape"] = list(results.hrf_library.shape)
+    if results.design_matrix is not None:
+        metadata["design_matrix_shape"] = list(results.design_matrix.shape)
+        metadata["reference_hrf_idx"] = results.hrf_metadata.get("n_hrfs", 0) // 2
+
+    # Add canonical baseline comparison statistics
+    if results.xval_r2_canonical is not None:
+        metadata["xval_r2_canonical_mean"] = float(
+            results.xval_r2_canonical.mean().item()
+        )
+        metadata["xval_r2_best_mean"] = float(results.xval_r2_best.mean().item())
+        metadata["r2_improvement_over_canonical"] = float(
+            results.xval_r2_best.mean().item() - results.xval_r2_canonical.mean().item()
+        )
 
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -665,3 +1134,213 @@ def _save_volume(
 
     img = nib.Nifti1Image(volume_data.astype(np.float32), affine)
     nib.save(img, filepath)
+
+
+def _save_volume_4d(
+    data: torch.Tensor,
+    filepath: str,
+    volume_shape: Optional[Tuple[int, int, int]],
+    affine: Optional[np.ndarray],
+    voxel_mask: Optional[torch.Tensor],
+):
+    """Helper to save a 2D tensor (n_voxels, n_volumes) as a 4D NIfTI volume."""
+    import nibabel as nib
+
+    data_np = data.cpu().numpy()  # (n_voxels, n_volumes)
+    n_volumes = data_np.shape[1]
+
+    if volume_shape is not None:
+        if voxel_mask is not None:
+            # Unmask data: create (x, y, z, n_volumes) array
+            mask_np = voxel_mask.cpu().numpy()
+            full_volume = np.zeros((np.prod(volume_shape), n_volumes), dtype=np.float32)
+            full_volume[mask_np, :] = data_np
+            volume_data = full_volume.reshape((*volume_shape, n_volumes))
+        else:
+            volume_data = data_np.reshape((*volume_shape, n_volumes))
+    else:
+        # Save as 2D (voxels x volumes)
+        volume_data = data_np
+
+    if affine is None:
+        affine = np.eye(4)
+
+    img = nib.Nifti1Image(volume_data.astype(np.float32), affine)
+    nib.save(img, filepath)
+
+
+def plot_design_matrix(
+    design_matrix: Union[torch.Tensor, np.ndarray],
+    output_file: Optional[str] = None,
+    column_labels: Optional[List[str]] = None,
+    tr: float = 1.0,
+    title: str = "Design Matrix",
+    figsize: Tuple[float, float] = (10, 8),
+    cmap: str = "RdBu_r",
+    show_colorbar: bool = True,
+    run_starts: Optional[List[int]] = None,
+) -> None:
+    """
+    Plot a design matrix in imagesc style.
+
+    Parameters
+    ----------
+    design_matrix : torch.Tensor or np.ndarray
+        (n_timepoints, n_columns) design matrix
+    output_file : str, optional
+        Path to save the figure. If None, displays interactively.
+    column_labels : list of str, optional
+        Labels for each column
+    tr : float, default=1.0
+        TR in seconds (for y-axis time labels)
+    title : str, default="Design Matrix"
+        Plot title
+    figsize : tuple, default=(10, 8)
+        Figure size in inches
+    cmap : str, default="RdBu_r"
+        Colormap name
+    show_colorbar : bool, default=True
+        Whether to show colorbar
+    run_starts : list of int, optional
+        Starting timepoint for each run (draws horizontal lines)
+    """
+    import matplotlib.pyplot as plt
+
+    # Convert to numpy
+    if isinstance(design_matrix, torch.Tensor):
+        design_np = design_matrix.cpu().numpy()
+    else:
+        design_np = np.asarray(design_matrix)
+
+    n_timepoints, n_cols = design_np.shape
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Determine symmetric color limits for diverging colormap
+    vmax = np.abs(design_np).max()
+    vmin = -vmax
+
+    # Plot
+    im = ax.imshow(
+        design_np,
+        aspect="auto",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+    )
+
+    # Add colorbar
+    if show_colorbar:
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label("Regressor Value")
+
+    # Set labels
+    ax.set_xlabel("Regressor")
+    ax.set_ylabel("Time (s)")
+    ax.set_title(title)
+
+    # X-axis: column labels
+    if column_labels is not None and len(column_labels) == n_cols:
+        ax.set_xticks(range(n_cols))
+        ax.set_xticklabels(column_labels, rotation=45, ha="right", fontsize=8)
+    else:
+        # Just show column indices
+        if n_cols <= 20:
+            ax.set_xticks(range(n_cols))
+        else:
+            ax.set_xticks(np.linspace(0, n_cols - 1, min(10, n_cols)).astype(int))
+
+    # Y-axis: time in seconds
+    n_yticks = min(10, n_timepoints)
+    ytick_indices = np.linspace(0, n_timepoints - 1, n_yticks).astype(int)
+    ytick_labels = [f"{idx * tr:.0f}" for idx in ytick_indices]
+    ax.set_yticks(ytick_indices)
+    ax.set_yticklabels(ytick_labels)
+
+    # Draw horizontal lines at run boundaries
+    if run_starts is not None and len(run_starts) > 1:
+        for run_start in run_starts[1:]:  # Skip first (0)
+            ax.axhline(y=run_start - 0.5, color="black", linewidth=1.5, linestyle="--")
+
+    plt.tight_layout()
+
+    if output_file is not None:
+        plt.savefig(output_file, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_hrf_library(
+    hrf_library: Union[torch.Tensor, np.ndarray],
+    output_file: Optional[str] = None,
+    tr: float = 1.0,
+    title: str = "HRF Library",
+    figsize: Tuple[float, float] = (10, 6),
+    highlight_idx: Optional[int] = None,
+) -> None:
+    """
+    Plot all HRFs in a library as overlaid curves.
+
+    Parameters
+    ----------
+    hrf_library : torch.Tensor or np.ndarray
+        (n_hrfs, n_timepoints) HRF library
+    output_file : str, optional
+        Path to save the figure. If None, displays interactively.
+    tr : float, default=1.0
+        TR in seconds (for x-axis time labels)
+    title : str, default="HRF Library"
+        Plot title
+    figsize : tuple, default=(10, 6)
+        Figure size in inches
+    highlight_idx : int, optional
+        Index of HRF to highlight (thicker line)
+    """
+    import matplotlib.pyplot as plt
+
+    # Convert to numpy
+    if isinstance(hrf_library, torch.Tensor):
+        hrf_np = hrf_library.cpu().numpy()
+    else:
+        hrf_np = np.asarray(hrf_library)
+
+    n_hrfs, n_timepoints = hrf_np.shape
+    time = np.arange(n_timepoints) * tr
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Plot each HRF (labels use 1-based indexing for AFNI compatibility)
+    cmap = plt.cm.viridis
+    for i in range(n_hrfs):
+        color = cmap(i / (n_hrfs - 1)) if n_hrfs > 1 else cmap(0.5)
+        linewidth = 2.5 if i == highlight_idx else 1.0
+        alpha = 1.0 if i == highlight_idx else 0.6
+        ax.plot(
+            time,
+            hrf_np[i],
+            color=color,
+            linewidth=linewidth,
+            alpha=alpha,
+            label=f"HRF {i + 1}",
+        )
+
+    ax.axhline(y=0, color="gray", linewidth=0.5, linestyle="--")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Response")
+    ax.set_title(title)
+
+    # Add legend if not too many HRFs
+    if n_hrfs <= 10:
+        ax.legend(loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+
+    if output_file is not None:
+        plt.savefig(output_file, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()

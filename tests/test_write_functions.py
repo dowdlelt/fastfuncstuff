@@ -330,7 +330,9 @@ class TestWriteAFNIBucket:
             )
 
             img = nib.load(result_path)
-            assert img.shape[:3] == (5, 5, 4), f"Should have correct shape, got {img.shape[:3]}"
+            assert img.shape[:3] == (5, 5, 4), (
+                f"Should have correct shape, got {img.shape[:3]}"
+            )
 
     def test_write_with_custom_affine(self, simple_glm_results):
         """Test writing with custom affine matrix."""
@@ -357,10 +359,10 @@ class TestWriteAFNIBucket:
             img = nib.load(result_path)
             assert np.allclose(img.affine, affine), "Should use custom affine"
 
-    def test_write_without_fstat_raises_error(self, simple_glm_results):
-        """Test that writing raises error when F-stat is not available.
+    def test_write_without_fstat_succeeds(self, simple_glm_results):
+        """Test that writing succeeds when F-stat is not available.
 
-        F-statistics are now required for AFNI bucket files.
+        F-statistics are optional for AFNI bucket files.
         """
         # Remove F-stat
         simple_glm_results.fstats = None
@@ -368,18 +370,24 @@ class TestWriteAFNIBucket:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "test_no_fstat.nii.gz"
 
-            with pytest.raises(ValueError, match="F-statistics required"):
-                write_glm_bucket_as_nifti(
-                    simple_glm_results,
-                    output_path,
-                    condition_names=[
-                        "Task1",
-                        "Task2",
-                        "Task3",
-                        "Task4",
-                    ],  # Match 4 regressors
-                    apply_afni_metadata=False,
-                )
+            # Should succeed - F-stats are optional
+            result_path = write_glm_bucket_as_nifti(
+                simple_glm_results,
+                output_path,
+                condition_names=[
+                    "Task1",
+                    "Task2",
+                    "Task3",
+                    "Task4",
+                ],  # Match 4 regressors
+                apply_afni_metadata=False,
+            )
+
+            # Verify the file was created
+            assert result_path.exists()
+            img = nib.load(result_path)
+            # Without F-stat, we should only have beta/tstat pairs (8 sub-bricks)
+            assert img.shape[-1] == 8  # 4 conditions * 2 (beta + tstat)
 
     def test_write_creates_parent_directory(self, simple_glm_results):
         """Test that parent directories are created if needed."""
@@ -539,8 +547,10 @@ class TestWriteOLSARMAComparison:
             assert "comparison" in summary, "Summary should have 'comparison' section"
 
             # Check comparison section has key metrics
-            assert "r2_improvement" in summary["comparison"] or "beta_correlation" in summary["comparison"], \
-                "Comparison should have metrics"
+            assert (
+                "r2_improvement" in summary["comparison"]
+                or "beta_correlation" in summary["comparison"]
+            ), "Comparison should have metrics"
 
     def test_comparison_requires_ols_results(self):
         """Test that comparison fails if ols_results is missing."""
