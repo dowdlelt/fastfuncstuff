@@ -3,6 +3,7 @@ High-level analysis workflows for fMRI data
 Complete pipelines from AFNI files to GLM results
 """
 
+import inspect
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -20,7 +21,7 @@ from .afni_io import (
     read_afni_onset_files,
 )
 from .arma_glm import ARMA11Results, fit_glm_arma11, get_default_arma_grids
-from .design import build_glm_design
+from .design import build_glm_design, convolve_hrf_microtime
 from .glm_core import GLMResults, fit_glm, fit_glm_hrf_library
 from .hrf import get_canonical_hrf, get_hrf_library
 from .utils import get_device, to_tensor
@@ -38,7 +39,13 @@ def analyze_from_onsets(
     arma_b_grid: Optional[torch.Tensor] = None,
     run_starts: Optional[List[int]] = None,
     device: Optional[torch.device] = None,
+    test_n_voxels: Optional[int] = None,
     enable_quick_estimate: bool = False,
+    stim_labels: Optional[List[str]] = None,
+    polort: Optional[int] = None,
+    verbose: bool = True,
+    microtime_resolution: int = 16,
+    microtime_onset: Optional[int] = None,
     **hrf_kwargs,
 ) -> Union[GLMResults, ARMA11Results]:
     """
@@ -89,6 +96,25 @@ def analyze_from_onsets(
         Example: [0, 300, 600, 900] for 4 runs starting at TRs 0, 300, 600, 900
     device : torch.device, optional
         Device for computation
+    test_n_voxels : int, optional
+        If provided, only analyze a subset of voxels for testing (extracts cube from center)
+    enable_quick_estimate : bool
+        Enable quick ARMA parameter estimation (only used with method='arma11')
+    stim_labels : list of str, optional
+        Labels for each stimulus condition (for metadata/output organization)
+    polort : int, optional
+        Polynomial order for detrending. If None, auto-computed based on run duration.
+        Equivalent to AFNI's -polort option.
+    verbose : bool
+        Print progress information (default: True)
+    microtime_resolution : int, default=16
+        Number of time bins per TR for sub-TR precision in onset timing.
+        Default is 16 (SPM convention), which correctly models stimuli that
+        occur between TR boundaries. Set to 1 for legacy TR-locked behavior.
+    microtime_onset : int, optional
+        Which microtime bin to sample for each TR (1-indexed).
+        If None (default), uses middle of TR: microtime_resolution // 2 + 1.
+        Set to 1 to sample at TR onset.
     **hrf_kwargs : dict
         Additional arguments passed to HRF generation functions
 
@@ -158,17 +184,60 @@ def analyze_from_onsets(
 
     n_voxels, n_timepoints = data.shape
 
-    # 2. Read onset files and convert to binary matrix
+    # 1.5 subset data if test_n_voxels provided
+    if test_n_voxels is not None:
+        if original_shape is None:
+            # If not 4D, just take the first N voxels
+            data = data[:test_n_voxels, :]
+        else:
+            # If 4D, extract from center (matches analyze_from_design_matrix)
+            cube_side = int(np.ceil(test_n_voxels ** (1/3)))
+            center = np.array(original_shape) // 2
+            half_cube = cube_side // 2
+            
+            test_mask_3d = np.zeros(original_shape, dtype=bool)
+            x_start = max(0, center[0] - half_cube)
+            x_end = min(original_shape[0], center[0] + half_cube)
+            y_start = max(0, center[1] - half_cube)
+            y_end = min(original_shape[1], center[1] + half_cube)
+            z_start = max(0, center[2] - half_cube)
+            z_end = min(original_shape[2], center[2] + half_cube)
+            
+            test_mask_3d[x_start:x_end, y_start:y_end, z_start:z_end] = True
+            test_mask_flat = test_mask_3d.reshape(-1)
+            mask_tensor = torch.from_numpy(test_mask_flat.astype(np.bool_))
+            data = data[mask_tensor, :]
+            
+        n_voxels = data.shape[0]
+        print(f"🧪 Test mode: using {n_voxels:,} voxels")
+
+    # 2. Set microtime defaults
+    if microtime_onset is None:
+        # Default to middle of TR (SPM convention)
+        microtime_onset = microtime_resolution // 2 + 1
+
+    # 3. Read onset files and convert to binary matrix
     onset_data = read_afni_onset_files(onset_files)
     onsets = onsets_to_binary_matrix(
-        onset_data, n_timepoints, tr, run_starts=run_starts, device=device
+        onset_data, n_timepoints, tr, run_starts=run_starts, device=device,
+        microtime_resolution=microtime_resolution
     )
 
-    # 3. Build design matrix based on HRF mode
+    if verbose and microtime_resolution > 1:
+        print(f"📐 Sub-TR timing: {microtime_resolution}x resolution, "
+              f"sampling at bin {microtime_onset}/{microtime_resolution}")
+
+    # 4. Build design matrix based on HRF mode
     if hrf_mode == "fir":
-        # FIR: no HRF assumption
+        # FIR: no HRF assumption (microtime not applicable - FIR estimates full response)
+        if microtime_resolution > 1:
+            # For FIR, downsample onsets back to TR resolution
+            # FIR doesn't benefit from microtime since it estimates the full response
+            onsets_tr = onsets[microtime_onset - 1::microtime_resolution, :]
+        else:
+            onsets_tr = onsets
         design = build_glm_design(
-            onsets,
+            onsets_tr,
             hrf=None,
             n_timepoints=n_timepoints,
             mode="fir",
@@ -177,11 +246,19 @@ def analyze_from_onsets(
         )
 
     elif hrf_mode == "canonical":
-        # Single canonical HRF
+        # Single canonical HRF with microtime convolution
         hrf = get_canonical_hrf(stim_duration=stim_duration, tr=tr, device=device)
-        design = build_glm_design(
-            onsets, hrf=hrf, n_timepoints=n_timepoints, mode="assumed", device=device
-        )
+        if microtime_resolution > 1:
+            # Use high-resolution convolution and downsample
+            design = convolve_hrf_microtime(
+                onsets, hrf, n_timepoints, microtime_resolution,
+                microtime_onset=microtime_onset, device=device
+            )
+        else:
+            # Legacy TR-locked behavior
+            design = build_glm_design(
+                onsets, hrf=hrf, n_timepoints=n_timepoints, mode="assumed", device=device
+            )
 
     elif hrf_mode in ["library", "flobs"]:
         # HRF library - will fit with library below
@@ -203,12 +280,23 @@ def analyze_from_onsets(
             f"Choose 'canonical', 'library', 'flobs', or 'fir'"
         )
 
-    # 4. Fit GLM
+    # 5. Fit GLM
     if method == "ols":
         if hrf_mode in ["library", "flobs"]:
             # Use HRF library fitting
+            # Filter kwargs to only pass valid fit_glm parameters
+            fit_glm_params = set(inspect.signature(fit_glm).parameters.keys())
+            glm_kwargs = {k: v for k, v in hrf_kwargs.items() if k in fit_glm_params}
+            # Add explicit parameters
+            glm_kwargs["max_poly_degree"] = polort
+            glm_kwargs["verbose"] = verbose
+
             results, hrf_idx, r2_all = fit_glm_hrf_library(
-                data, onsets, hrf_library, tr=tr, device=device
+                data, onsets, hrf_library, tr=tr, device=device,
+                microtime_resolution=microtime_resolution,
+                microtime_onset=microtime_onset,
+                n_timepoints=n_timepoints,
+                **glm_kwargs
             )
             # Store HRF indices in results
             results.hrf_idx = hrf_idx
@@ -217,7 +305,10 @@ def analyze_from_onsets(
         else:
             # Standard OLS
             assert design is not None, "design should not be None for non-library modes"
-            results = fit_glm(data, design, tr=tr, device=device)
+            results = fit_glm(
+                data, design, tr=tr, device=device,
+                max_poly_degree=polort, verbose=verbose
+            )
 
     elif method == "arma11":
         if hrf_mode in ["library", "flobs"]:

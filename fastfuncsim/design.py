@@ -60,6 +60,126 @@ def convolve_hrf(onsets: torch.Tensor, hrf: torch.Tensor,
     return design
 
 
+def convolve_hrf_microtime(
+    onsets_microtime: torch.Tensor,
+    hrf: torch.Tensor,
+    n_timepoints: int,
+    microtime_resolution: int,
+    microtime_onset: int = 1,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Convolve onset matrix with HRF using microtime (sub-TR) resolution
+
+    This function handles the case where onsets occur at sub-TR precision.
+    It upsamples the HRF to match the microtime resolution, performs
+    convolution at high resolution, then downsamples to TR resolution.
+
+    Parameters
+    ----------
+    onsets_microtime : torch.Tensor
+        (n_microtime_points, n_conditions) binary onset matrix at microtime resolution
+        where n_microtime_points = n_timepoints * microtime_resolution
+    hrf : torch.Tensor
+        (n_hrf_timepoints,) hemodynamic response function at TR resolution
+    n_timepoints : int
+        Number of TR timepoints in output
+    microtime_resolution : int
+        Number of microtime bins per TR (e.g., 16 for SPM default)
+    microtime_onset : int, default=1
+        Which microtime bin corresponds to TR onset (1-indexed, 1 = start of TR)
+        SPM uses middle of TR as reference; set to microtime_resolution//2 + 1 for that
+    device : torch.device, optional
+        Device for computation
+
+    Returns
+    -------
+    design : torch.Tensor
+        (n_timepoints, n_conditions) convolved design matrix at TR resolution
+
+    Notes
+    -----
+    The algorithm:
+    1. Upsample HRF to microtime resolution using linear interpolation
+    2. Convolve high-res onsets with high-res HRF
+    3. Downsample by selecting every microtime_resolution-th sample,
+       offset by (microtime_onset - 1) to align with TR acquisition
+
+    This approach correctly models stimuli that occur between TRs,
+    accounting for the fact that the BOLD response to a mid-TR stimulus
+    will be sampled at a different phase than a TR-aligned stimulus.
+    """
+    if device is None:
+        device = get_device()
+
+    onsets_microtime = to_tensor(onsets_microtime, device=device)
+    hrf = to_tensor(hrf, device=device)
+
+    n_microtime_points = onsets_microtime.shape[0]
+    n_conditions = onsets_microtime.shape[1] if onsets_microtime.ndim > 1 else 1
+    if onsets_microtime.ndim == 1:
+        onsets_microtime = onsets_microtime.unsqueeze(1)
+
+    # Validate dimensions
+    expected_microtime = n_timepoints * microtime_resolution
+    if n_microtime_points != expected_microtime:
+        raise ValueError(
+            f"onsets_microtime has {n_microtime_points} points, "
+            f"expected {expected_microtime} (n_timepoints={n_timepoints} * "
+            f"microtime_resolution={microtime_resolution})"
+        )
+
+    # 1. Upsample HRF to microtime resolution
+    n_hrf_tr = len(hrf)
+    n_hrf_microtime = n_hrf_tr * microtime_resolution
+
+    # Use linear interpolation to upsample HRF
+    hrf_microtime_indices = torch.linspace(0, n_hrf_tr - 1, n_hrf_microtime, device=device)
+
+    # Linear interpolation
+    hrf_microtime = torch.zeros(n_hrf_microtime, device=device)
+    for i, idx in enumerate(hrf_microtime_indices):
+        idx_low = int(idx.floor().item())
+        idx_high = min(idx_low + 1, n_hrf_tr - 1)
+        frac = idx - idx_low
+        hrf_microtime[i] = hrf[idx_low] * (1 - frac) + hrf[idx_high] * frac
+
+    # Normalize HRF to unit peak (preserves amplitude interpretation)
+    if hrf_microtime.max() > 0:
+        hrf_microtime = hrf_microtime / hrf_microtime.max()
+
+    # 2. Convolve at microtime resolution
+    design_microtime = torch.zeros(n_microtime_points, n_conditions, device=device)
+
+    for cond_idx in range(n_conditions):
+        # Use torch.nn.functional.conv1d for GPU acceleration
+        onset_vec = onsets_microtime[:, cond_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+        hrf_kernel = hrf_microtime.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, H)
+
+        # Convolve with 'same' padding
+        convolved = F.conv1d(onset_vec, hrf_kernel, padding=len(hrf_microtime) // 2)
+        design_microtime[:, cond_idx] = convolved.squeeze()[:n_microtime_points]
+
+    # 3. Downsample to TR resolution
+    # Select samples at TR boundaries, offset by microtime_onset
+    # microtime_onset is 1-indexed: 1 = first bin of TR, microtime_resolution = last bin
+    sample_offset = microtime_onset - 1  # Convert to 0-indexed
+    sample_indices = torch.arange(sample_offset, n_microtime_points, microtime_resolution, device=device)
+
+    # Ensure we get exactly n_timepoints samples
+    if len(sample_indices) > n_timepoints:
+        sample_indices = sample_indices[:n_timepoints]
+    elif len(sample_indices) < n_timepoints:
+        # This shouldn't happen with correct inputs, but handle gracefully
+        raise ValueError(
+            f"Downsampling produced {len(sample_indices)} samples, expected {n_timepoints}"
+        )
+
+    design = design_microtime[sample_indices, :]
+
+    return design
+
+
 def make_fir_design(onsets: torch.Tensor, n_lags: int,
                     n_timepoints: int,
                     device: Optional[torch.device] = None) -> torch.Tensor:

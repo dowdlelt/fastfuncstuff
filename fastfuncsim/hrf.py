@@ -322,7 +322,7 @@ def create_flobs_library(n_hrfs: int = 20,
 
 
 def get_hrf_library(mode: str = 'canonical',
-                   stim_duration: float = 5.0,
+                   stim_duration: float = 0.0,
                    tr: float = 1.0,
                    n_hrfs: int = 20,
                    device: Optional[torch.device] = None,

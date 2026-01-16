@@ -108,6 +108,14 @@ from .hrf import (
     get_hrf_library,
 )
 
+# HRF selection with cross-validation
+from .hrf_selection import (
+    HRFSelectionResults,
+    fit_glm_hrf_library_with_xval,
+    load_hrf_selection_for_arma,
+    save_hrf_selection_results,
+)
+
 # Empirical metrics (GLS with AR(1) correction)
 from .metrics_empirical import (
     build_ar1_covariance_matrix,
@@ -259,6 +267,11 @@ __all__ = [
     "analyze_from_onsets",
     "analyze_from_design_matrix",
     "compute_contrasts",
+    # HRF Selection with Cross-Validation
+    "fit_glm_hrf_library_with_xval",
+    "HRFSelectionResults",
+    "save_hrf_selection_results",
+    "load_hrf_selection_for_arma",
 ]
 
 

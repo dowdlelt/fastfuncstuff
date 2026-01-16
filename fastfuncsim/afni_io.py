@@ -136,6 +136,7 @@ def onsets_to_binary_matrix(
     tr: float,
     run_starts: Optional[List[int]] = None,
     device: Optional[torch.device] = None,
+    microtime_resolution: int = 1,
 ) -> torch.Tensor:
     """
     Convert AFNI onset times to binary onset matrix
@@ -145,7 +146,7 @@ def onsets_to_binary_matrix(
     onsets_per_condition : list of list of np.ndarray
         onsets_per_condition[cond][run] = onset times in seconds
     n_timepoints : int
-        Total number of timepoints across all runs
+        Total number of timepoints across all runs (at TR resolution)
     tr : float
         TR in seconds
     run_starts : list of int, optional
@@ -154,24 +155,36 @@ def onsets_to_binary_matrix(
         Example: [0, 300, 600, 900] for 4 runs of 300 TRs each
     device : torch.device, optional
         Device for output tensor
+    microtime_resolution : int, default=1
+        Number of time bins per TR for sub-TR precision.
+        - 1 (default): TR-locked onsets (traditional behavior)
+        - 16: SPM default, 16 bins per TR for precise onset timing
+        - Higher values give more temporal precision at cost of memory
+        When > 1, output matrix has shape (n_timepoints * microtime_resolution, n_conditions)
 
     Returns
     -------
     onset_matrix : torch.Tensor
-        Binary onset matrix (n_timepoints, n_conditions)
+        Binary onset matrix. Shape depends on microtime_resolution:
+        - If microtime_resolution=1: (n_timepoints, n_conditions)
+        - If microtime_resolution>1: (n_timepoints * microtime_resolution, n_conditions)
 
     Examples
     --------
     >>> files = ['onsets_cond1.txt', 'onsets_cond2.txt']
     >>> onsets = read_afni_onset_files(files)
-    >>> # Equal-length runs
+    >>> # TR-locked onsets (traditional)
     >>> onset_mat = onsets_to_binary_matrix(onsets, n_timepoints=200, tr=2.0)
-    >>> # Unequal runs (from AFNI RunStart)
-    >>> onset_mat = onsets_to_binary_matrix(onsets, n_timepoints=1200, tr=1.5,
-    ...                                     run_starts=[0, 300, 600, 900])
+    >>> # Sub-TR precision with 16x resolution
+    >>> onset_mat = onsets_to_binary_matrix(onsets, n_timepoints=200, tr=2.0,
+    ...                                     microtime_resolution=16)
+    >>> onset_mat.shape  # (3200, n_conditions)
     """
     if device is None:
         device = get_device()
+
+    if microtime_resolution < 1:
+        raise ValueError(f"microtime_resolution must be >= 1, got {microtime_resolution}")
 
     n_conditions = len(onsets_per_condition)
     n_runs = len(onsets_per_condition[0])
@@ -183,33 +196,38 @@ def onsets_to_binary_matrix(
                 f"Condition {cond_idx} has {len(cond_onsets)} runs, expected {n_runs}"
             )
 
-    # Create binary onset matrix
-    onset_matrix = np.zeros((n_timepoints, n_conditions))
+    # Calculate effective temporal resolution
+    effective_tr = tr / microtime_resolution
+    n_microtime_points = n_timepoints * microtime_resolution
 
-    # Determine run boundaries
+    # Create binary onset matrix at microtime resolution
+    onset_matrix = np.zeros((n_microtime_points, n_conditions))
+
+    # Determine run boundaries (scale to microtime resolution)
     if run_starts is not None:
-        # Use provided run starts
+        # Use provided run starts (in TR units, scale to microtime)
         if len(run_starts) != n_runs:
             raise ValueError(
                 f"run_starts has {len(run_starts)} entries, but data has {n_runs} runs"
             )
-        timepoint_offsets = run_starts
+        timepoint_offsets = [rs * microtime_resolution for rs in run_starts]
     else:
         # Assume equal-length runs
-        timepoints_per_run = n_timepoints // n_runs
-        timepoint_offsets = [run_idx * timepoints_per_run for run_idx in range(n_runs)]
+        microtime_per_run = n_microtime_points // n_runs
+        timepoint_offsets = [run_idx * microtime_per_run for run_idx in range(n_runs)]
 
     for cond_idx, cond_onsets in enumerate(onsets_per_condition):
         for run_idx, run_onsets in enumerate(cond_onsets):
-            # Convert onset times to timepoint indices
+            # Convert onset times to microtime indices
             timepoint_offset = timepoint_offsets[run_idx]
 
             for onset_time in run_onsets:
-                timepoint = int(np.round(onset_time / tr))
-                global_timepoint = timepoint_offset + timepoint
+                # Convert onset time to microtime bin (precise placement)
+                microtime_bin = int(np.round(onset_time / effective_tr))
+                global_microtime = timepoint_offset + microtime_bin
 
-                if 0 <= global_timepoint < n_timepoints:
-                    onset_matrix[global_timepoint, cond_idx] = 1
+                if 0 <= global_microtime < n_microtime_points:
+                    onset_matrix[global_microtime, cond_idx] = 1
 
     return to_tensor(onset_matrix, device=device, dtype=torch.float32)
 

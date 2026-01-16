@@ -13,7 +13,7 @@ Key Features
 - Memory-efficient processing for large fMRI datasets
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -134,16 +134,26 @@ class FastICA:
         )
         X_pca = self.pca_.fit_transform(X)
 
+        # Validate PCA n_components
+        if not hasattr(self.pca_, 'n_components_') or self.pca_.n_components_ is None:
+             raise RuntimeError("PCA n_components_ not found")
+        
+        pca_n_components = cast(int, self.pca_.n_components_)
+
         # Determine number of ICA components
-        if self.n_components is None:
-            n_components = self.pca_.n_components_
+        n_comp_req = self.n_components
+        if n_comp_req is None:
+            n_components = pca_n_components
         else:
-            n_components = min(self.n_components, self.pca_.n_components_)
+            n_components = min(int(cast(int, n_comp_req)), pca_n_components)
 
         # Step 2: Run FastICA on TOP PCA spatial components (spatial ICA)
         # PCA components are ordered by variance explained (highest first)
         # Select only the TOP n_components for ICA
         # Example: 100 PCA components → take first 50 for 50 ICA components
+        if self.pca_.components_ is None:
+             raise RuntimeError("PCA results not found (components_ is None)")
+             
         pca_components_all = self.pca_.components_  # (n_pca_components, n_voxels)
         pca_components = pca_components_all[:n_components]  # Take TOP n_components only!
 
@@ -378,32 +388,36 @@ class FastICA:
         if fun == 'logcosh':
             alpha = 1.0
 
-            def g(x):
+            def g_logcosh(x):
                 return torch.tanh(alpha * x)
 
-            def g_prime(x):
+            def g_prime_logcosh(x):
                 return alpha * (1 - torch.tanh(alpha * x) ** 2)
+            
+            return g_logcosh, g_prime_logcosh
 
         elif fun == 'exp':
-            def g(x):
+            def g_exp(x):
                 exp_x = torch.exp(-x ** 2 / 2)
                 return x * exp_x
 
-            def g_prime(x):
+            def g_prime_exp(x):
                 exp_x = torch.exp(-x ** 2 / 2)
                 return (1 - x ** 2) * exp_x
+            
+            return g_exp, g_prime_exp
 
         elif fun == 'cube':
-            def g(x):
+            def g_cube(x):
                 return x ** 3
 
-            def g_prime(x):
+            def g_prime_cube(x):
                 return 3 * x ** 2
+            
+            return g_cube, g_prime_cube
 
         else:
             raise ValueError(f"Unknown nonlinearity: '{fun}'. Use 'logcosh', 'exp', or 'cube'")
-
-        return g, g_prime
 
     def compute_variance_explained(
         self,
@@ -685,7 +699,7 @@ def select_n_components_by_stability(
             print(f"  Components with stability > {min_stability}: {n_stable}/{n_comp}")
 
     # Select optimal n_components (highest mean stability)
-    optimal_n_components = max(stability_by_n_components, key=stability_by_n_components.get)
+    optimal_n_components = max(stability_by_n_components, key=lambda k: stability_by_n_components[k])
 
     if verbose:
         print(f"\n{'='*60}")
