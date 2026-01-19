@@ -72,14 +72,14 @@ def load_nuisance_file(
         raise FileNotFoundError(f"Nuisance file not found: {filepath}")
 
     # Read file content
-    with open(filepath, 'r') as f:
+    with open(filepath, "r") as f:
         lines = f.readlines()
 
     # Filter out comment lines (AFNI 1D format uses # for comments/headers)
     data_lines = []
     for line in lines:
         line = line.strip()
-        if not line or line.startswith('#'):
+        if not line or line.startswith("#"):
             continue
         data_lines.append(line)
 
@@ -88,25 +88,21 @@ def load_nuisance_file(
 
     # Detect delimiter: try comma first, then whitespace
     first_line = data_lines[0]
-    if ',' in first_line:
-        delimiter = ','
-    elif '\t' in first_line:
+    if "," in first_line:
+        delimiter = ","
+    elif "\t" in first_line:
         delimiter = None  # np.loadtxt handles tabs with default
     else:
         delimiter = None  # whitespace
 
     # Parse data
     try:
-        if delimiter == ',':
-            data = np.array([
-                [float(x.strip()) for x in line.split(',')]
-                for line in data_lines
-            ])
+        if delimiter == ",":
+            data = np.array(
+                [[float(x.strip()) for x in line.split(",")] for line in data_lines]
+            )
         else:
-            data = np.array([
-                [float(x) for x in line.split()]
-                for line in data_lines
-            ])
+            data = np.array([[float(x) for x in line.split()] for line in data_lines])
     except ValueError as e:
         raise ValueError(f"Error parsing nuisance file {filepath}: {e}")
 
@@ -273,10 +269,24 @@ def fit_glm_hrf_library_with_xval(
     if microtime_onset is None:
         microtime_onset = 1
 
-    # Move data to device
-    data = to_tensor(data, device=device)
-    onsets = to_tensor(onsets, device=device)
-    hrf_library = to_tensor(hrf_library, device=device)
+    # Convert data to tensor but decide whether to keep on CPU based on size
+    # For large datasets, keep data on CPU and stream chunks to GPU
+    # This prevents OOM when data exceeds GPU memory
+    data = to_tensor(data, device="cpu")  # Always start on CPU
+    onsets = to_tensor(onsets, device=device)  # Small - can go to GPU
+    hrf_library = to_tensor(hrf_library, device=device)  # Small - can go to GPU
+
+    # Estimate memory requirement for data
+    n_voxels_check, n_timepoints_check = data.shape
+    data_size_gb = (n_voxels_check * n_timepoints_check * 4) / (1024**3)
+    
+    # GPU memory threshold - keep on CPU if data exceeds this
+    gpu_memory_threshold_gb = 4.0
+    keep_data_on_cpu = device.type == "cuda" and data_size_gb > gpu_memory_threshold_gb
+    
+    if not keep_data_on_cpu:
+        # Small enough to fit on GPU - move it there
+        data = data.to(device)
 
     n_voxels, n_timepoints_data = data.shape
     n_hrfs = hrf_library.shape[0]
@@ -307,6 +317,8 @@ def fit_glm_hrf_library_with_xval(
             f"  CV strategy: {cv_strategy} ({'LORO' if cv_strategy == 1 else 'split-halves' if cv_strategy == 0.5 else cv_strategy})"
         )
         print(f"  Microtime: {microtime_resolution}x (onset bin {microtime_onset})")
+        if keep_data_on_cpu:
+            print(f"  Memory mode: CPU streaming (data {data_size_gb:.1f}GB > {gpu_memory_threshold_gb}GB threshold)")
         print()
 
     # Generate CV splits
@@ -371,16 +383,22 @@ def fit_glm_hrf_library_with_xval(
             extra_nuisance_labels.extend([f"{label}_{i}" for i in range(n_cols_loaded)])
 
             # Convert to tensor and concatenate
-            nuisance_tensor = torch.tensor(nuisance_data, dtype=torch.float32, device=device)
+            nuisance_tensor = torch.tensor(
+                nuisance_data, dtype=torch.float32, device=device
+            )
             nuisance_design = torch.cat([nuisance_design, nuisance_tensor], dim=1)
 
             if verbose:
-                print(f"  Loaded nuisance: {filepath} ({n_cols_loaded} columns, label={label})")
+                print(
+                    f"  Loaded nuisance: {filepath} ({n_cols_loaded} columns, label={label})"
+                )
 
     # Add extra_regressors if provided directly as array
     if extra_regressors is not None:
         if isinstance(extra_regressors, np.ndarray):
-            extra_tensor = torch.tensor(extra_regressors, dtype=torch.float32, device=device)
+            extra_tensor = torch.tensor(
+                extra_regressors, dtype=torch.float32, device=device
+            )
         else:
             extra_tensor = extra_regressors.to(device=device, dtype=torch.float32)
 
@@ -482,6 +500,10 @@ def fit_glm_hrf_library_with_xval(
         xval_r2_median_all[:, hrf_idx] = xval_results["r2_median"].to(device)
         xval_r2_std_all[:, hrf_idx] = xval_results["r2_std"].to(device)
 
+    # Clear GPU cache after HRF evaluation to free fragmented memory
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     # =========================================================================
     # Compute canonical HRF baseline for comparison
     # This uses a single SPM-style canonical HRF as baseline
@@ -547,6 +569,7 @@ def fit_glm_hrf_library_with_xval(
 
     # Use fit_glm with the proper signature: (data, design, tr, ...)
     # full_design_canonical already has poly columns, so set max_poly_degree=0 (no extra polys)
+    # If data is on CPU, use chunk-based streaming to avoid OOM
     canonical_glm_results = fit_glm(
         data=data,
         design=full_design_canonical,  # Already includes stimulus + polynomial columns
@@ -555,6 +578,7 @@ def fit_glm_hrf_library_with_xval(
         device=device,
         verbose=False,
         task_indices=stim_indices_canonical,  # Mark which are task regressors
+        preload_data_to_device=(data.device == device),  # Stream chunks if data on CPU
     )
 
     # Store the canonical design matrix for saving
@@ -582,6 +606,10 @@ def fit_glm_hrf_library_with_xval(
         r2_improvement = xval_r2_best.mean().item() - xval_r2_canonical.mean().item()
         print(f"  Improvement over canonical: {r2_improvement:+.4f}")
         print()
+
+    # Clear GPU cache before final fit to free fragmented memory
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # Final fit: refit entire dataset with voxel-wise optimal HRFs
     if verbose:
@@ -724,7 +752,15 @@ def _fit_voxelwise_hrf(
             continue
 
         # Get data for this group
-        group_data = data[voxel_indices, :]  # (n_group_voxels, n_timepoints)
+        # If data is on CPU, keep indices on CPU to avoid implicit device transfer during indexing
+        # But keep the original GPU indices for storing results back to GPU output tensors
+        if data.device.type == "cpu" and voxel_indices.device.type != "cpu":
+            voxel_indices_for_data = voxel_indices.cpu()
+            group_data = data[
+                voxel_indices_for_data, :
+            ]  # (n_group_voxels, n_timepoints)
+        else:
+            group_data = data[voxel_indices, :]  # (n_group_voxels, n_timepoints)
 
         # Convolve with this HRF
         hrf = hrf_library[hrf_idx_int]
@@ -747,6 +783,7 @@ def _fit_voxelwise_hrf(
         stim_indices = list(range(n_conditions))
 
         # Fit GLM for this group (no additional polys - already in nuisance_design)
+        # If data is on CPU, use chunk-based streaming to avoid OOM
         group_results = fit_glm(
             group_data,
             full_design,
@@ -755,6 +792,9 @@ def _fit_voxelwise_hrf(
             device=device,
             verbose=False,
             task_indices=stim_indices,
+            preload_data_to_device=(
+                group_data.device == device
+            ),  # Stream chunks if data on CPU
         )
 
         # Store dof from first group (same for all groups with same design structure)
@@ -762,15 +802,31 @@ def _fit_voxelwise_hrf(
             stored_dof = group_results.dof
 
         # Store results (with None checks for type safety)
+        # If results are on different device than output tensors (e.g., CPU results when
+        # streaming from CPU), move them to the output device
         if group_results.betas is not None:
-            all_betas[voxel_indices, :] = group_results.betas
+            betas_to_store = group_results.betas
+            if betas_to_store.device != all_betas.device:
+                betas_to_store = betas_to_store.to(all_betas.device)
+            all_betas[voxel_indices, :] = betas_to_store
+
         if group_results.r2 is not None:
-            all_r2[voxel_indices] = group_results.r2
+            r2_to_store = group_results.r2
+            if r2_to_store.device != all_r2.device:
+                r2_to_store = r2_to_store.to(all_r2.device)
+            all_r2[voxel_indices] = r2_to_store
 
         if group_results.tstats is not None:
-            all_tstats[voxel_indices, :] = group_results.tstats
+            tstats_to_store = group_results.tstats
+            if tstats_to_store.device != all_tstats.device:
+                tstats_to_store = tstats_to_store.to(all_tstats.device)
+            all_tstats[voxel_indices, :] = tstats_to_store
+
         if group_results.sigma2 is not None:
-            all_sigma2[voxel_indices] = group_results.sigma2
+            sigma2_to_store = group_results.sigma2
+            if sigma2_to_store.device != all_sigma2.device:
+                sigma2_to_store = sigma2_to_store.to(all_sigma2.device)
+            all_sigma2[voxel_indices] = sigma2_to_store
 
     # Build GLMResults
     results = GLMResults()
@@ -837,7 +893,9 @@ def _write_afni_xmat(
                 nuisance_labels.append(f"r{r + 1:02d}_poly{p}")
     else:
         # Fall back to auto-detecting poly columns
-        n_poly_total = n_nuisance - (len(extra_nuisance_labels) if extra_nuisance_labels else 0)
+        n_poly_total = n_nuisance - (
+            len(extra_nuisance_labels) if extra_nuisance_labels else 0
+        )
         for i in range(n_poly_total):
             nuisance_labels.append(f"poly{i:02d}")
 
@@ -1198,7 +1256,9 @@ def save_hrf_selection_results(
                     hrf_designs_dir / f"hrf{hrf_num:02d}_{hrf_mode}.xmat.1D"
                 )
                 # Get extra nuisance labels from metadata
-                extra_nuisance_labels = results.hrf_metadata.get("extra_nuisance_labels", [])
+                extra_nuisance_labels = results.hrf_metadata.get(
+                    "extra_nuisance_labels", []
+                )
                 _write_afni_xmat(
                     design_np,
                     str(hrf_design_file),

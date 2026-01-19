@@ -51,7 +51,7 @@ try:
         fit_glm_hrf_library_with_xval,
         save_hrf_selection_results,
     )
-    from fastfuncsim.utils import get_device
+    from fastfuncsim.utils import get_device, scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -428,9 +428,22 @@ Notes:
         help="Sub-TR resolution for onset timing (default: 20)",
     )
     proc_opts.add_argument(
+        "-do_scale",
+        action="store_true",
+        help="Scale each voxel per run to mean=100 (percent signal change units). "
+        "Values are clipped to max 200 (100%% increase from mean). "
+        "Violation locations are saved to {prefix}_scale_violations.nii.gz",
+    )
+    proc_opts.add_argument(
         "-device",
         type=str,
         help="Force device: 'cpu' or 'cuda' (default: auto-detect GPU)",
+    )
+    proc_opts.add_argument(
+        "-keep_on_cpu",
+        action="store_true",
+        help="Load data to CPU and process voxels in GPU chunks (for large datasets). "
+        "Default: auto-detect based on dataset size (>4GB uses CPU chunking).",
     )
     proc_opts.add_argument(
         "-batch_size",
@@ -607,13 +620,58 @@ def main():
     from typing import cast
 
     run_paths: list[Union[str, PathLib]] = [PathLib(f) for f in input_files]
+
+    # Estimate dataset size for GPU memory management
+    # Load first file to estimate size
+    first_img = nib.load(input_files[0])
+    if hasattr(first_img, "shape"):
+        n_voxels_per_run = first_img.shape[0] * first_img.shape[1] * first_img.shape[2]
+        n_timepoints_per_run = (
+            first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[-1]
+        )
+    else:
+        # Fallback - load small dataset to GPU
+        n_voxels_per_run = 10000
+        n_timepoints_per_run = 200
+
+    total_timepoints = n_timepoints_per_run * n_runs
+
+    # If mask provided, only count in-mask voxels (dramatically reduces size)
+    if mask is not None:
+        n_voxels_per_run = int(mask.sum())
+
+    # Estimate memory requirement (in GB)
+    # 4 bytes per float32 value
+    data_size_gb = (n_voxels_per_run * total_timepoints * 4) / (1024**3)
+
+    # GPU memory threshold (conservative: 4GB for data + headroom for computation)
+    gpu_memory_threshold_gb = 4.0
+
+    # Decide whether to keep on CPU
+    # Respect explicit user flag, or auto-detect based on size
+    if args.keep_on_cpu:
+        keep_on_cpu = True
+        if args.verbose:
+            print()
+            print("  Loading to CPU (user-specified)")
+            print()
+    elif device.type == "cuda" and data_size_gb > gpu_memory_threshold_gb:
+        keep_on_cpu = True
+        if args.verbose:
+            print()
+            print(f"⚠️  Large dataset detected ({data_size_gb:.2f} GB)")
+            print("   Loading to CPU and processing voxels in GPU chunks")
+            print()
+    else:
+        keep_on_cpu = False
+
     data, run_starts = load_and_concatenate_runs(
         cast(list[Union[str, PathLib]], run_paths),
         device=device,
+        keep_on_cpu=keep_on_cpu,
     )
 
     # Get affine and TR from first input
-    first_img = nib.load(input_files[0])
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
     volume_shape = (
         tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
@@ -639,6 +697,20 @@ def main():
         data = data[mask_flat, :]
 
     n_voxels, n_timepoints = data.shape
+
+    # ==========================================================================
+    # 2b. Optional: Scale to percent signal change (mean=100 per run)
+    # ==========================================================================
+    scale_info = None
+    violations_mask = None
+    if args.do_scale:
+        print()
+        data, violations_mask, scale_info = scale_to_percent_signal(
+            data=data,
+            run_starts=run_starts,
+            max_scale=200.0,
+            verbose=True,
+        )
 
     print(
         f"  Data shape: {data.shape} ({n_voxels:,} voxels × {n_timepoints} timepoints)"
@@ -759,7 +831,9 @@ def main():
     results.hrf_metadata["onset_files"] = onset_files
     results.hrf_metadata["durations"] = durations
     if ortvec_files:
-        results.hrf_metadata["ortvec_files"] = [(str(f), label) for f, label in ortvec_files]
+        results.hrf_metadata["ortvec_files"] = [
+            (str(f), label) for f, label in ortvec_files
+        ]
 
     # ==========================================================================
     # 6. Save outputs
@@ -792,6 +866,34 @@ def main():
         onsets=onset_matrix if args.save_hrf_designs else None,
         save_plots=args.save_plots,
     )
+
+    # Save scaling violation mask if scaling was performed
+    if args.do_scale and violations_mask is not None and scale_info is not None:
+        # Sum violations across time to get count per voxel
+        violation_counts = violations_mask.sum(dim=1).cpu().numpy()  # (n_voxels,)
+
+        # Reshape back to volume
+        if mask is not None:
+            violation_vol = np.zeros(np.prod(volume_shape), dtype=np.float32)
+            violation_vol[mask_flat] = violation_counts
+        else:
+            violation_vol = violation_counts
+        violation_vol = violation_vol.reshape(volume_shape)
+
+        # Save as NIfTI
+        violation_path = f"{args.prefix}_scale_violations.nii.gz"
+        violation_img = nib.Nifti1Image(violation_vol, affine)
+        nib.save(violation_img, violation_path)
+        output_files["scale_violations"] = violation_path
+
+        if scale_info['n_violations'] > 0:
+            print(f"  ⚠️  Scale violations saved: {violation_path}")
+
+        # Add scaling info to metadata
+        results.hrf_metadata["do_scale"] = True
+        results.hrf_metadata["scale_max"] = 200.0
+        results.hrf_metadata["scale_n_violations"] = scale_info['n_violations']
+        results.hrf_metadata["scale_n_voxels_with_violations"] = scale_info['n_voxels_with_violations']
 
     # Print output summary
     print()

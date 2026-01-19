@@ -393,21 +393,34 @@ def fit_glm(
 
     n_task_regressors = design_2d[0].shape[1]
 
+    # Concatenate all runs
+    data_concat = torch.cat(data_2d, dim=1)  # (n_voxels, total_timepoints)
+    design_concat = torch.block_diag(*full_designs)  # Block diagonal for runs
+
+    total_timepoints = data_concat.shape[1]
+
     # Determine chunk size
     if chunk_size is None:
         chunk_size = optimal_chunk_size(
-            n_voxels, data_2d[0].shape[1], full_designs[0].shape[1], device
+            n_voxels, total_timepoints, design_concat.shape[1], device
         )
+
+        # When streaming from CPU, additional overhead from:
+        # 1. Copying data chunk to GPU (temporary during transfer)
+        # 2. The design_concat is already on GPU and is block-diagonal (can be large)
+        # Be more conservative to avoid OOM on the canonical fit
+        if not preload_data_to_device and device.type == "cuda":
+            # Reduce by 8x to account for all intermediates + design matrix
+            chunk_size = chunk_size // 8
+            chunk_size = max(500, chunk_size)  # At least 500 voxels per chunk
 
     if verbose:
         print(
             f"Fitting GLM: {n_voxels} voxels, {n_runs} runs, {n_task_regressors} task regressors"
         )
         print(f"Processing in chunks of {chunk_size} voxels")
-
-    # Concatenate all runs
-    data_concat = torch.cat(data_2d, dim=1)  # (n_voxels, total_timepoints)
-    design_concat = torch.block_diag(*full_designs)  # Block diagonal for runs
+        if not preload_data_to_device:
+            print(f"Streaming from CPU (reduced chunk size for memory safety)")
 
     # Also track per-run data for R² calculation
     run_boundaries = [0]
@@ -858,7 +871,7 @@ def fit_glm(
 
             all_r2_run.append(torch.stack(r2_run, dim=1))  # (chunk_voxels, n_runs)
 
-        # Release GPU tensors for this chunk
+        # Release GPU tensors for this chunk and clear cache periodically
         del (
             chunk_data,
             betas_dev,
@@ -872,6 +885,10 @@ def fit_glm(
             tstats_dev,
             fstats_dev,
         )
+        
+        # Clear GPU cache every 10 chunks to prevent fragmentation
+        if not preload_data_to_device and device.type == "cuda" and chunk_idx % 10 == 0:
+            torch.cuda.empty_cache()
 
     # Concatenate results
     results = GLMResults()

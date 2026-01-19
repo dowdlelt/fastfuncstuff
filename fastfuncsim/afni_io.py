@@ -184,7 +184,9 @@ def onsets_to_binary_matrix(
         device = get_device()
 
     if microtime_resolution < 1:
-        raise ValueError(f"microtime_resolution must be >= 1, got {microtime_resolution}")
+        raise ValueError(
+            f"microtime_resolution must be >= 1, got {microtime_resolution}"
+        )
 
     n_conditions = len(onsets_per_condition)
     n_runs = len(onsets_per_condition[0])
@@ -593,7 +595,9 @@ def extract_nuisance_columns(
 
 
 def load_and_concatenate_runs(
-    run_files: List[Union[str, Path]], device: Optional[torch.device] = None
+    run_files: List[Union[str, Path]],
+    device: Optional[torch.device] = None,
+    keep_on_cpu: bool = False,
 ) -> Tuple[torch.Tensor, List[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
@@ -605,31 +609,47 @@ def load_and_concatenate_runs(
         Supports: NIfTI (.nii, .nii.gz) and AFNI (.HEAD, .BRIK, .BRIK.gz)
         For AFNI files, provide either .HEAD or .BRIK path
     device : torch.device, optional
-        Device for output tensor
+        Device for output tensor (ignored if keep_on_cpu=True)
+    keep_on_cpu : bool, default=False
+        If True, load data to CPU regardless of device.
+        Use this for large datasets where GPU memory is limited,
+        and you'll process data in chunks.
 
     Returns
     -------
     concatenated_data : torch.Tensor
         Concatenated data (n_voxels, total_timepoints)
+        On CPU if keep_on_cpu=True, else on specified device
     run_starts : list of int
         Starting timepoint index for each run
 
     Examples
     --------
+    >>> # Standard GPU loading (for smaller datasets)
     >>> run_files = ['run01.nii.gz', 'run02.nii.gz', 'run03.nii.gz']
     >>> data, run_starts = load_and_concatenate_runs(run_files)
     >>> print(f"Total timepoints: {data.shape[1]}")
-    >>> print(f"Run starts: {run_starts}")
+
+    >>> # CPU loading for large datasets
+    >>> data_cpu, run_starts = load_and_concatenate_runs(run_files, keep_on_cpu=True)
+    >>> print(f"Data device: {data_cpu.device}")  # cpu
 
     Notes
     -----
     Memory-efficient implementation that converts each run to torch immediately
-    and concatenates on-device to avoid holding multiple copies in memory.
+    and concatenates to avoid holding multiple copies in memory.
+
+    For large datasets with GPU acceleration, use keep_on_cpu=True and process
+    voxel chunks on GPU in your analysis code.
     """
     import gc
 
-    if device is None:
+    if device is None and not keep_on_cpu:
         device = get_device()
+
+    # Force CPU if requested
+    if keep_on_cpu:
+        device = torch.device("cpu")
 
     run_starts = [0]
     current_start = 0
@@ -804,7 +824,9 @@ def get_contrast_matrix(
     return to_tensor(contrast, device=device, dtype=torch.float32)
 
 
-def extract_design_metadata(design_info: Dict) -> Tuple[List[str], List[str], List[int]]:
+def extract_design_metadata(
+    design_info: Dict,
+) -> Tuple[List[str], List[str], List[int]]:
     """
     Extract metadata from design_info dictionary with clear, unambiguous names.
 
@@ -894,32 +916,32 @@ def get_regressor_groups(design_info: Dict) -> Dict[str, List[int]]:
     >>> print(f"Stimulus 1 regressors: {groups['stimulus_1']}")
     >>> print(f"All stimuli: {groups['all_stimuli']}")
     """
-    column_groups = design_info.get('column_groups')
+    column_groups = design_info.get("column_groups")
     if column_groups is None:
         raise ValueError("Design matrix does not have ColumnGroups information")
 
     groups = {
-        'polort': [],
-        'baseline': [],
-        'all_stimuli': [],
-        'all_nuisance': [],
+        "polort": [],
+        "baseline": [],
+        "all_stimuli": [],
+        "all_nuisance": [],
     }
 
     # Organize columns by group
     for col_idx, group_id in enumerate(column_groups):
         if group_id == -1:
-            groups['polort'].append(col_idx)
-            groups['all_nuisance'].append(col_idx)
+            groups["polort"].append(col_idx)
+            groups["all_nuisance"].append(col_idx)
         elif group_id == 0:
-            groups['baseline'].append(col_idx)
-            groups['all_nuisance'].append(col_idx)
+            groups["baseline"].append(col_idx)
+            groups["all_nuisance"].append(col_idx)
         elif group_id > 0:
             # Stimulus group
-            stim_key = f'stimulus_{group_id}'
+            stim_key = f"stimulus_{group_id}"
             if stim_key not in groups:
                 groups[stim_key] = []
             groups[stim_key].append(col_idx)
-            groups['all_stimuli'].append(col_idx)
+            groups["all_stimuli"].append(col_idx)
 
     return groups
 
@@ -961,7 +983,7 @@ def select_regressors_by_group(
     >>> X = select_regressors_by_group(design, exclude_groups=['polort'])
     """
     groups = get_regressor_groups(design_info)
-    matrix = design_info['matrix']
+    matrix = design_info["matrix"]
 
     # Start with all columns if no include specified
     if include_groups is None:
@@ -1022,8 +1044,8 @@ def get_censored_mask(design_info: Dict) -> np.ndarray:
     >>> data_uncensored = data[~censored]
     >>> design_uncensored = design['matrix'][~censored]
     """
-    good_list = design_info.get('good_list')
-    n_timepoints = design_info.get('n_timepoints')
+    good_list = design_info.get("good_list")
+    n_timepoints = design_info.get("n_timepoints")
 
     if good_list is None:
         raise ValueError("Design matrix does not have GoodList information")
@@ -1069,12 +1091,12 @@ def select_uncensored_timepoints(
     >>> # Filter both design and data
     >>> X_uncensored, Y_uncensored = select_uncensored_timepoints(design, fmri_data)
     """
-    good_list = design_info.get('good_list')
+    good_list = design_info.get("good_list")
 
     if good_list is None:
         raise ValueError("Design matrix does not have GoodList information")
 
-    matrix = design_info['matrix']
+    matrix = design_info["matrix"]
     design_uncensored = matrix[good_list, :]
 
     if data is not None:
@@ -1157,7 +1179,9 @@ def get_tr_from_file(filepath: Union[str, Path]) -> float:
     """
     try:
         img = nib.load(filepath)
-        tr = img.header.get_zooms()[-1]  # Last dimension is time  # type: ignore[attr-defined]
+        tr = img.header.get_zooms()[
+            -1
+        ]  # Last dimension is time  # type: ignore[attr-defined]
         if tr == 0 or tr is None:
             print(f"WARNING: TR not found in {filepath} header, using 1.0")
             return 1.0

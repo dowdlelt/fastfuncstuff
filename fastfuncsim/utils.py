@@ -194,11 +194,18 @@ def optimal_chunk_size(
     else:
         available_mem = 8.0 * safety_factor  # Conservative CPU estimate
 
-    # Memory per voxel (data + betas + residuals + working space)
-    mem_per_voxel = calc_memory_usage((n_timepoints + n_regressors * 2,))
+    # Memory per voxel in GLM fitting (float32 = 4 bytes):
+    # - data: n_timepoints
+    # - betas: n_regressors
+    # - residuals: n_timepoints
+    # - predicted/temps: n_timepoints (design @ betas.T creates big intermediate)
+    # - ss_total temp: n_timepoints (data - data_mean)
+    # Conservative: 5x timepoints + regressors for all intermediates
+    bytes_per_voxel = (5 * n_timepoints + n_regressors) * 4  # 4 bytes per float32
+    mem_per_voxel_gb = bytes_per_voxel / 1e9
 
     # Calculate chunk size
-    chunk_size = int(available_mem / mem_per_voxel)
+    chunk_size = int(available_mem / mem_per_voxel_gb)
 
     # Set sensible bounds: at least 1000, at most all voxels
     # For large datasets, we want to process tens of thousands at once
@@ -206,3 +213,145 @@ def optimal_chunk_size(
     chunk_size = max(min_chunk, min(chunk_size, n_voxels))
 
     return chunk_size
+
+
+def scale_to_percent_signal(
+    data: torch.Tensor,
+    run_starts: list[int],
+    max_scale: float = 200.0,
+    verbose: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """
+    Scale voxel timeseries to mean=100 per run (percent signal change units).
+
+    This is equivalent to AFNI's scaling: min(max_scale, a/b*100) where
+    a is the timeseries and b is the mean of that timeseries.
+
+    The max_scale (default 200) prevents extreme values - a voxel should
+    never more than double its mean signal in physiologically plausible data.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        fMRI data (n_voxels, n_timepoints) - will be modified in-place
+    run_starts : list of int
+        Starting timepoint for each run
+    max_scale : float, default=200.0
+        Maximum allowed scaled value (clips to this)
+    verbose : bool, default=True
+        Print scaling statistics
+
+    Returns
+    -------
+    data_scaled : torch.Tensor
+        Scaled data (n_voxels, n_timepoints) with mean~100 per run
+    violations_mask : torch.Tensor
+        Boolean mask (n_voxels, n_timepoints) where values hit max_scale ceiling
+    scale_info : dict
+        Statistics about the scaling:
+        - 'n_violations': total number of timepoints that hit ceiling
+        - 'n_voxels_with_violations': number of voxels with any violations
+        - 'violation_voxel_indices': 1D tensor of voxel indices with violations
+        - 'mean_per_run': (n_voxels, n_runs) mean before scaling
+        - 'scale_factors': (n_voxels, n_runs) scale factors used (100/mean)
+
+    Notes
+    -----
+    The scaling is: scaled = min(max_scale, raw / mean * 100)
+
+    This converts raw signal to percent signal change units where:
+    - Mean = 100 (by construction)
+    - A value of 101 = 1% signal increase
+    - A value of 99 = 1% signal decrease
+
+    Violations (hitting max_scale) indicate potentially problematic voxels
+    that may have:
+    - Very low mean signal (near noise floor)
+    - Motion spikes or other artifacts
+    - Edge voxels with partial volume effects
+    """
+    n_voxels, n_timepoints_total = data.shape
+    n_runs = len(run_starts)
+    device = data.device
+
+    # Compute run boundaries
+    run_ends = run_starts[1:] + [n_timepoints_total]
+    run_lengths = [end - start for start, end in zip(run_starts, run_ends)]
+
+    # Storage for per-run statistics
+    mean_per_run = torch.zeros(n_voxels, n_runs, device=device)
+    scale_factors = torch.zeros(n_voxels, n_runs, device=device)
+
+    # Track violations
+    violations_mask = torch.zeros(n_voxels, n_timepoints_total, dtype=torch.bool, device=device)
+
+    if verbose:
+        print("Scaling to percent signal change (mean=100 per run)...")
+
+    for run_idx in range(n_runs):
+        start = run_starts[run_idx]
+        end = run_ends[run_idx]
+
+        # Get this run's data
+        run_data = data[:, start:end]  # (n_voxels, run_length)
+
+        # Compute mean per voxel for this run
+        run_mean = run_data.mean(dim=1, keepdim=True)  # (n_voxels, 1)
+        mean_per_run[:, run_idx] = run_mean.squeeze()
+
+        # Avoid division by zero (set scale factor to 0 for zero-mean voxels)
+        # These voxels will become all zeros after scaling
+        safe_mean = run_mean.clone()
+        zero_mask = run_mean.abs() < 1e-10
+        safe_mean[zero_mask] = 1.0  # Prevent div by zero
+
+        # Compute scale factor: 100 / mean
+        scale_factor = 100.0 / safe_mean  # (n_voxels, 1)
+        scale_factors[:, run_idx] = scale_factor.squeeze()
+
+        # Scale: a / b * 100 = a * scale_factor
+        scaled_run = run_data * scale_factor  # (n_voxels, run_length)
+
+        # Apply ceiling and track violations
+        # Values above max_scale (e.g., 200) indicate >100% signal increase
+        run_violations = scaled_run > max_scale
+        violations_mask[:, start:end] = run_violations
+
+        # Clip to max_scale (only upper bound - lower values are fine)
+        # AFNI uses min(max_scale, scaled_value) - we preserve negative values
+        # since fMRI can have signal decreases
+        scaled_run = torch.clamp(scaled_run, max=max_scale)
+
+        # Handle zero-mean voxels (set to 100 to avoid weird values)
+        # Actually, set them to 0 since they're essentially dead voxels
+        zero_voxels = zero_mask.squeeze()
+        if zero_voxels.any():
+            scaled_run[zero_voxels, :] = 0.0
+
+        # Store back
+        data[:, start:end] = scaled_run
+
+    # Compute violation statistics
+    n_violations = violations_mask.sum().item()
+    voxels_with_violations = violations_mask.any(dim=1)
+    n_voxels_with_violations = voxels_with_violations.sum().item()
+    violation_voxel_indices = torch.where(voxels_with_violations)[0]
+
+    scale_info = {
+        'n_violations': int(n_violations),
+        'n_voxels_with_violations': int(n_voxels_with_violations),
+        'violation_voxel_indices': violation_voxel_indices,
+        'mean_per_run': mean_per_run,
+        'scale_factors': scale_factors,
+    }
+
+    if verbose:
+        print(f"  Scaled {n_voxels:,} voxels × {n_runs} runs")
+        if n_violations > 0:
+            pct_violations = 100 * n_violations / (n_voxels * n_timepoints_total)
+            print(f"  ⚠️  Ceiling violations (>{max_scale}): {n_violations:,} timepoints ({pct_violations:.4f}%)")
+            print(f"      Affecting {n_voxels_with_violations:,} voxels ({100*n_voxels_with_violations/n_voxels:.2f}%)")
+        else:
+            print(f"  ✓ No ceiling violations (all values ≤ {max_scale})")
+
+    return data, violations_mask, scale_info
