@@ -214,6 +214,7 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="3dHRFoptfast - Fast GPU-accelerated cross-validated HRF optimization",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,  # We handle -help ourselves to avoid required arg check
         epilog="""
 Examples:
   # Basic HRF optimization with library of HRF variants
@@ -250,6 +251,15 @@ Examples:
                -mask brain_mask.nii.gz \\
                -prefix masked_output
 
+  # With motion and physio nuisance regressors
+  3dHRFoptfast -input run*.nii.gz \\
+               -onsets face.txt house.txt \\
+               -durations 2.0 \\
+               -tr 2.0 \\
+               -ortvec motion_all.1D motion \\
+               -ortvec physio_all.txt physio \\
+               -prefix sub01_with_nuisance
+
 Outputs:
   {prefix}_hrf_index.nii.gz       - Which HRF (1-N) was selected per voxel
   {prefix}_xval_r2.nii.gz         - Cross-validated R² for selected HRF
@@ -260,6 +270,8 @@ Outputs:
 
 Notes:
   - Durations can be specified as single value (applies to all) or one per condition
+  - Nuisance files (-ortvec) must be pre-concatenated across runs (matching total timepoints)
+  - Common nuisance files: motion parameters (6 columns), physiological regressors, etc.
   - Future: onset files with 'married' durations (e.g., "1:2 4:5") will be supported
   - HRF library is saved for later ARMA/REML analysis with 3dREMLfast
         """,
@@ -288,8 +300,9 @@ Notes:
     required.add_argument(
         "-tr",
         type=float,
-        required=True,
-        help="Repetition time (TR) in seconds.",
+        required=False,
+        default=None,
+        help="Repetition time (TR) in seconds. If not specified, read from NIfTI header.",
     )
     required.add_argument(
         "-prefix",
@@ -394,6 +407,19 @@ Notes:
         type=int,
         default=None,
         help="Polynomial order for drift modeling (default: auto based on run length)",
+    )
+    proc_opts.add_argument(
+        "-ortvec",
+        action="append",
+        nargs=2,
+        metavar=("FILE", "LABEL"),
+        help=(
+            "Additional nuisance regressors to project out (can be repeated). "
+            "FILE is a text file with nuisance columns (AFNI 1D, CSV, or whitespace-separated). "
+            "LABEL is a prefix for the column names. "
+            "Files must span all runs concatenated (same length as total timepoints). "
+            "Example: -ortvec motion_all.1D motion -ortvec physio.txt physio"
+        ),
     )
     proc_opts.add_argument(
         "-microtime_resolution",
@@ -512,12 +538,13 @@ def print_summary(
 
 def main():
     parser = create_parser()
-    args = parser.parse_args()
 
-    # Show help if requested
-    if args.help or len(sys.argv) == 1:
+    # Check for help BEFORE parse_args to avoid required argument errors
+    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
         parser.print_help()
         sys.exit(0)
+
+    args = parser.parse_args()
 
     print_header(args)
 
@@ -585,12 +612,26 @@ def main():
         device=device,
     )
 
-    # Get affine from first input (use Nifti1Image for type safety)
+    # Get affine and TR from first input
     first_img = nib.load(input_files[0])
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
     volume_shape = (
         tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
     )
+
+    # Get TR from header if not provided
+    if args.tr is None:
+        # TR is in zooms[3] for 4D NIfTI (pixdim[4] in raw header)
+        zooms = first_img.header.get_zooms()
+        if len(zooms) > 3 and zooms[3] > 0:
+            args.tr = float(zooms[3])
+            print(f"  TR from header: {args.tr}s")
+        else:
+            print("ERROR: Could not determine TR from NIfTI header.")
+            print("       Please specify TR with -tr option.")
+            sys.exit(1)
+    else:
+        print(f"  TR (specified): {args.tr}s")
 
     # Apply mask if provided
     if mask is not None:
@@ -685,6 +726,14 @@ def main():
 
     print_summary(args, n_runs, n_conditions, n_voxels, condition_labels)
 
+    # Convert ortvec argument to list of tuples if provided
+    ortvec_files = None
+    if args.ortvec:
+        ortvec_files = [(f, label) for f, label in args.ortvec]
+        if args.verbose:
+            for f, label in ortvec_files:
+                print(f"  Nuisance: {f} (label={label})")
+
     results = fit_glm_hrf_library_with_xval(
         data=data,
         onsets=onset_matrix,
@@ -697,6 +746,7 @@ def main():
         metric=args.metric,
         microtime_resolution=args.microtime_resolution,
         polort=args.polort,
+        ortvec_files=ortvec_files,
         device=device,
         verbose=args.verbose,
         chunk_size=args.batch_size,
@@ -708,6 +758,8 @@ def main():
     results.hrf_metadata["input_files"] = input_files
     results.hrf_metadata["onset_files"] = onset_files
     results.hrf_metadata["durations"] = durations
+    if ortvec_files:
+        results.hrf_metadata["ortvec_files"] = [(str(f), label) for f, label in ortvec_files]
 
     # ==========================================================================
     # 6. Save outputs

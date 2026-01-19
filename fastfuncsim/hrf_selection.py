@@ -10,6 +10,7 @@ Key function: fit_glm_hrf_library_with_xval()
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -21,6 +22,106 @@ from .glm_core import GLMResults, construct_polynomial_matrix, fit_glm
 from .hrf import get_hrf_library
 from .utils import get_device, to_tensor
 from .xval import compute_xval_r2, generate_cv_splits
+
+
+def load_nuisance_file(
+    filepath: Union[str, Path],
+    expected_rows: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Load a nuisance regressor file (motion parameters, physio, etc.)
+
+    Handles various text formats:
+    - AFNI 1D files (whitespace-separated, may have # comment headers)
+    - CSV files
+    - Tab-separated files
+    - Space-separated files
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the nuisance file
+    expected_rows : int, optional
+        Expected number of rows (timepoints). If provided, validates length.
+
+    Returns
+    -------
+    data : np.ndarray
+        (n_timepoints, n_columns) nuisance regressors
+        Single-column files are reshaped to (n_timepoints, 1)
+
+    Raises
+    ------
+    FileNotFoundError
+        If file doesn't exist
+    ValueError
+        If file is empty or has wrong number of rows
+
+    Examples
+    --------
+    >>> # Load 6 motion parameters
+    >>> motion = load_nuisance_file('motion.1D')
+    >>> motion.shape
+    (200, 6)
+
+    >>> # Load with validation
+    >>> motion = load_nuisance_file('motion.1D', expected_rows=200)
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"Nuisance file not found: {filepath}")
+
+    # Read file content
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    # Filter out comment lines (AFNI 1D format uses # for comments/headers)
+    data_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        data_lines.append(line)
+
+    if not data_lines:
+        raise ValueError(f"Nuisance file {filepath} is empty or contains only comments")
+
+    # Detect delimiter: try comma first, then whitespace
+    first_line = data_lines[0]
+    if ',' in first_line:
+        delimiter = ','
+    elif '\t' in first_line:
+        delimiter = None  # np.loadtxt handles tabs with default
+    else:
+        delimiter = None  # whitespace
+
+    # Parse data
+    try:
+        if delimiter == ',':
+            data = np.array([
+                [float(x.strip()) for x in line.split(',')]
+                for line in data_lines
+            ])
+        else:
+            data = np.array([
+                [float(x) for x in line.split()]
+                for line in data_lines
+            ])
+    except ValueError as e:
+        raise ValueError(f"Error parsing nuisance file {filepath}: {e}")
+
+    # Ensure 2D
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+
+    # Validate row count if expected
+    if expected_rows is not None and data.shape[0] != expected_rows:
+        raise ValueError(
+            f"Nuisance file {filepath} has {data.shape[0]} rows, "
+            f"expected {expected_rows} (total timepoints)"
+        )
+
+    return data.astype(np.float32)
 
 
 @dataclass
@@ -84,6 +185,8 @@ def fit_glm_hrf_library_with_xval(
     microtime_resolution: int = 20,
     microtime_onset: Optional[int] = None,
     polort: Optional[int] = None,
+    ortvec_files: Optional[List[Tuple[Union[str, Path], str]]] = None,
+    extra_regressors: Optional[Union[np.ndarray, torch.Tensor]] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
     chunk_size: Optional[int] = None,
@@ -127,6 +230,18 @@ def fit_glm_hrf_library_with_xval(
         Which microtime bin to sample (default: 1, no shift)
     polort : int, optional
         Polynomial order for detrending (None = auto)
+    ortvec_files : list of (filepath, label) tuples, optional
+        Additional nuisance regressors to project out (like AFNI's -ortvec).
+        Each file should contain already-concatenated regressors spanning
+        all runs (same length as total timepoints). Files can be:
+        - AFNI 1D format (whitespace-separated, # comments allowed)
+        - CSV files
+        - Tab or space-separated text files
+        Example: [('motion_all.1D', 'motion'), ('physio.txt', 'physio')]
+    extra_regressors : np.ndarray or torch.Tensor, optional
+        Additional nuisance regressors as a matrix (n_timepoints, n_columns).
+        Alternative to ortvec_files for passing already-loaded data.
+        Must span all runs (already concatenated).
     device : torch.device, optional
         Compute device (auto-detected if None)
     verbose : bool, default=True
@@ -239,10 +354,68 @@ def fit_glm_hrf_library_with_xval(
     poly_design = torch.block_diag(*poly_blocks)  # (n_timepoints, n_runs * (polort+1))
     n_poly_cols = poly_design.shape[1]
 
+    # =========================================================================
+    # Load and concatenate additional nuisance regressors (motion, physio, etc.)
+    # These are passed via ortvec_files (file paths) or extra_regressors (arrays)
+    # =========================================================================
+    nuisance_design = poly_design  # Start with polynomials
+    n_extra_nuisance = 0
+    extra_nuisance_labels = []
+
+    # Load ortvec files (AFNI-style nuisance regressors)
+    if ortvec_files is not None:
+        for filepath, label in ortvec_files:
+            nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
+            n_cols_loaded = nuisance_data.shape[1]
+            n_extra_nuisance += n_cols_loaded
+            extra_nuisance_labels.extend([f"{label}_{i}" for i in range(n_cols_loaded)])
+
+            # Convert to tensor and concatenate
+            nuisance_tensor = torch.tensor(nuisance_data, dtype=torch.float32, device=device)
+            nuisance_design = torch.cat([nuisance_design, nuisance_tensor], dim=1)
+
+            if verbose:
+                print(f"  Loaded nuisance: {filepath} ({n_cols_loaded} columns, label={label})")
+
+    # Add extra_regressors if provided directly as array
+    if extra_regressors is not None:
+        if isinstance(extra_regressors, np.ndarray):
+            extra_tensor = torch.tensor(extra_regressors, dtype=torch.float32, device=device)
+        else:
+            extra_tensor = extra_regressors.to(device=device, dtype=torch.float32)
+
+        # Validate shape
+        if extra_tensor.shape[0] != n_timepoints:
+            raise ValueError(
+                f"extra_regressors has {extra_tensor.shape[0]} rows, "
+                f"expected {n_timepoints} (total timepoints)"
+            )
+
+        # Ensure 2D
+        if extra_tensor.ndim == 1:
+            extra_tensor = extra_tensor.unsqueeze(1)
+
+        n_cols_extra = extra_tensor.shape[1]
+        n_extra_nuisance += n_cols_extra
+        extra_nuisance_labels.extend([f"extra_{i}" for i in range(n_cols_extra)])
+
+        nuisance_design = torch.cat([nuisance_design, extra_tensor], dim=1)
+
+        if verbose:
+            print(f"  Added extra_regressors: {n_cols_extra} columns")
+
+    n_nuisance_cols = nuisance_design.shape[1]
+
     if verbose:
-        print(
-            f"  Polynomial design: {poly_design.shape} ({n_poly_cols} nuisance columns)"
-        )
+        if n_extra_nuisance > 0:
+            print(
+                f"  Total nuisance design: {nuisance_design.shape} "
+                f"({n_poly_cols} polort + {n_extra_nuisance} extra)"
+            )
+        else:
+            print(
+                f"  Polynomial design: {nuisance_design.shape} ({n_poly_cols} nuisance columns)"
+            )
         print()
 
     # Storage for CV results: (n_voxels, n_hrfs)
@@ -278,13 +451,13 @@ def fit_glm_hrf_library_with_xval(
 
         n_stim_cols = stim_design.shape[1]
 
-        # Build full design: [stimulus | polynomials]
+        # Build full design: [stimulus | nuisance (polort + extra)]
         # Stimulus columns come first (stim_indices = 0:n_stim)
-        # Polynomial columns come after (nuisance_indices = n_stim:n_stim+n_poly)
-        full_design = torch.cat([stim_design, poly_design], dim=1)
+        # Nuisance columns come after (nuisance_indices = n_stim:end)
+        full_design = torch.cat([stim_design, nuisance_design], dim=1)
 
         stim_indices = list(range(n_stim_cols))
-        nuisance_indices = list(range(n_stim_cols, n_stim_cols + n_poly_cols))
+        nuisance_indices = list(range(n_stim_cols, n_stim_cols + n_nuisance_cols))
 
         # Store reference design matrix for debugging
         if hrf_idx == reference_hrf_idx:
@@ -342,8 +515,8 @@ def fit_glm_hrf_library_with_xval(
             onsets, canonical_hrf, n_timepoints, device=device
         )
 
-    # Build full design with polynomials
-    full_design_canonical = torch.cat([canonical_design, poly_design], dim=1)
+    # Build full design with nuisance (polort + extra)
+    full_design_canonical = torch.cat([canonical_design, nuisance_design], dim=1)
     stim_indices_canonical = list(range(canonical_design.shape[1]))
     nuisance_indices_canonical = list(
         range(canonical_design.shape[1], full_design_canonical.shape[1])
@@ -419,10 +592,10 @@ def fit_glm_hrf_library_with_xval(
         onsets=onsets,
         hrf_library=hrf_library,
         hrf_index=hrf_index,
+        nuisance_design=nuisance_design,
         tr=tr,
         microtime_resolution=microtime_resolution,
         microtime_onset=microtime_onset,
-        polort=polort,
         device=device,
         verbose=verbose,
         chunk_size=chunk_size,
@@ -440,6 +613,10 @@ def fit_glm_hrf_library_with_xval(
         "microtime_resolution": microtime_resolution,
         "microtime_onset": microtime_onset,
         "polort": polort,
+        "n_poly_cols": n_poly_cols,
+        "n_extra_nuisance": n_extra_nuisance,
+        "n_nuisance_total": n_nuisance_cols,
+        "extra_nuisance_labels": extra_nuisance_labels,
         "n_voxels": n_voxels,
         "n_timepoints": n_timepoints,
         "n_runs": n_runs,
@@ -487,10 +664,10 @@ def _fit_voxelwise_hrf(
     onsets: torch.Tensor,
     hrf_library: torch.Tensor,
     hrf_index: torch.Tensor,
+    nuisance_design: torch.Tensor,
     tr: float,
     microtime_resolution: int,
     microtime_onset: int,
-    polort: Optional[int],
     device: torch.device,
     verbose: bool,
     chunk_size: Optional[int],
@@ -501,9 +678,14 @@ def _fit_voxelwise_hrf(
     This is the key efficiency trick: instead of fitting each voxel separately,
     we group voxels by their selected HRF and fit each group together.
     Similar to how 3dREMLfast handles voxel-wise ARMA parameters.
+
+    Parameters
+    ----------
+    nuisance_design : torch.Tensor
+        (n_timepoints, n_nuisance_cols) Pre-built nuisance design matrix
+        containing polynomials and any extra nuisance regressors.
     """
     n_voxels = data.shape[0]
-    n_hrfs = hrf_library.shape[0]
 
     if microtime_resolution > 1:
         n_timepoints = onsets.shape[0] // microtime_resolution
@@ -511,9 +693,7 @@ def _fit_voxelwise_hrf(
         n_timepoints = onsets.shape[0]
 
     n_conditions = onsets.shape[1]
-
-    # Determine number of betas (conditions + polynomials if any)
-    # For now, just conditions - polynomials handled by fit_glm
+    n_nuisance_cols = nuisance_design.shape[1]
 
     # Initialize output tensors
     all_betas = torch.zeros(n_voxels, n_conditions, device=device)
@@ -550,7 +730,7 @@ def _fit_voxelwise_hrf(
         hrf = hrf_library[hrf_idx_int]
 
         if microtime_resolution > 1:
-            design_convolved = convolve_hrf_microtime(
+            stim_design = convolve_hrf_microtime(
                 onsets,
                 hrf,
                 n_timepoints,
@@ -560,16 +740,21 @@ def _fit_voxelwise_hrf(
                 device=device,
             )
         else:
-            design_convolved = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+            stim_design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
 
-        # Fit GLM for this group
+        # Build full design: [stimulus | nuisance]
+        full_design = torch.cat([stim_design, nuisance_design], dim=1)
+        stim_indices = list(range(n_conditions))
+
+        # Fit GLM for this group (no additional polys - already in nuisance_design)
         group_results = fit_glm(
             group_data,
-            design_convolved,
+            full_design,
             tr=tr,
-            max_poly_degree=polort,
+            max_poly_degree=0,  # Nuisance already included
             device=device,
             verbose=False,
+            task_indices=stim_indices,
         )
 
         # Store dof from first group (same for all groups with same design structure)
@@ -606,6 +791,8 @@ def _write_afni_xmat(
     condition_labels: Optional[List[str]],
     run_starts: List[int],
     tr: float,
+    polort: Optional[int] = None,
+    extra_nuisance_labels: Optional[List[str]] = None,
 ) -> None:
     """Write design matrix in AFNI xmat.1D format.
 
@@ -623,19 +810,46 @@ def _write_afni_xmat(
         Starting timepoint for each run
     tr : float
         Repetition time in seconds
+    polort : int, optional
+        Polynomial order (for generating meaningful poly labels per run)
+    extra_nuisance_labels : list of str, optional
+        Labels for extra nuisance regressors (e.g., ['motion_0', 'motion_1', ...])
     """
     n_timepoints, n_cols = design_matrix.shape
+    n_runs = len(run_starts)
 
     # Build column labels
     if condition_labels is not None and len(condition_labels) == n_stim_cols:
-        stim_labels = condition_labels
+        stim_labels = list(condition_labels)
     else:
         stim_labels = [f"stim{i:02d}" for i in range(n_stim_cols)]
 
-    # Label polynomial/nuisance columns
+    # Build nuisance labels with meaningful names
     n_nuisance = n_cols - n_stim_cols
-    nuisance_labels = [f"poly{i:02d}" for i in range(n_nuisance)]
-    all_labels = stim_labels + nuisance_labels
+    nuisance_labels = []
+
+    # If polort is known, build per-run polynomial labels
+    if polort is not None:
+        n_poly_per_run = polort + 1
+        n_poly_total = n_runs * n_poly_per_run
+        for r in range(n_runs):
+            for p in range(n_poly_per_run):
+                nuisance_labels.append(f"r{r + 1:02d}_poly{p}")
+    else:
+        # Fall back to auto-detecting poly columns
+        n_poly_total = n_nuisance - (len(extra_nuisance_labels) if extra_nuisance_labels else 0)
+        for i in range(n_poly_total):
+            nuisance_labels.append(f"poly{i:02d}")
+
+    # Add extra nuisance labels (motion, physio, etc.)
+    if extra_nuisance_labels:
+        nuisance_labels.extend(extra_nuisance_labels)
+
+    # Pad if we don't have enough labels
+    while len(nuisance_labels) < n_nuisance:
+        nuisance_labels.append(f"nuisance{len(nuisance_labels):02d}")
+
+    all_labels = stim_labels + nuisance_labels[:n_nuisance]
 
     # Write simplified AFNI xmat format
     with open(output_file, "w") as f:
@@ -836,13 +1050,22 @@ def save_hrf_selection_results(
             run_length = n_timepoints // n_runs
             run_starts = [i * run_length for i in range(n_runs)]
 
-        # Get TR from metadata
+        # Get TR and nuisance info from metadata
         tr = results.hrf_metadata.get("tr", 2.0)
+        polort = results.hrf_metadata.get("polort")
+        extra_nuisance_labels = results.hrf_metadata.get("extra_nuisance_labels", [])
 
         # Write optimized HRF design matrix
         design_file = f"{output_prefix}_design.xmat.1D"
         _write_afni_xmat(
-            design_np, design_file, n_stim_cols, condition_labels, run_starts, tr
+            design_np,
+            design_file,
+            n_stim_cols,
+            condition_labels,
+            run_starts,
+            tr,
+            polort=polort,
+            extra_nuisance_labels=extra_nuisance_labels,
         )
         output_files["design"] = design_file
 
@@ -864,12 +1087,14 @@ def save_hrf_selection_results(
             else:
                 n_stim_cols = canonical_design_np.shape[1]
 
-        # Get run_starts/TR from metadata or parameter
+        # Get run_starts/TR/nuisance info from metadata or parameter
         if run_starts is None:
             n_runs = results.hrf_metadata.get("n_runs", 1)
             run_length = n_timepoints // n_runs
             run_starts = [i * run_length for i in range(n_runs)]
         tr = results.hrf_metadata.get("tr", 2.0)
+        polort = results.hrf_metadata.get("polort")
+        extra_nuisance_labels = results.hrf_metadata.get("extra_nuisance_labels", [])
 
         # Write canonical HRF design matrix
         canonical_design_file = f"{output_prefix}_canonical_design.xmat.1D"
@@ -880,6 +1105,8 @@ def save_hrf_selection_results(
             condition_labels,
             run_starts,
             tr,
+            polort=polort,
+            extra_nuisance_labels=extra_nuisance_labels,
         )
         output_files["canonical_design"] = canonical_design_file
 
@@ -970,6 +1197,8 @@ def save_hrf_selection_results(
                 hrf_design_file = (
                     hrf_designs_dir / f"hrf{hrf_num:02d}_{hrf_mode}.xmat.1D"
                 )
+                # Get extra nuisance labels from metadata
+                extra_nuisance_labels = results.hrf_metadata.get("extra_nuisance_labels", [])
                 _write_afni_xmat(
                     design_np,
                     str(hrf_design_file),
@@ -977,6 +1206,8 @@ def save_hrf_selection_results(
                     condition_labels,
                     run_starts_local,
                     tr,
+                    polort=polort_val,
+                    extra_nuisance_labels=extra_nuisance_labels,
                 )
                 hrf_design_files.append(str(hrf_design_file))
 

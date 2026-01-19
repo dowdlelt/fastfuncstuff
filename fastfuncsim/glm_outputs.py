@@ -1000,25 +1000,32 @@ def write_glm_bucket_as_nifti(
                     cmd_statpar = ["3drefit"]
                     brick_idx = 0
 
-                    # F-statistic (sub-brick 0)
-                    cmd_statpar.extend(
-                        [
-                            "-substatpar",
-                            str(brick_idx),
-                            "fift",
-                            str(n_regressors),
-                            str(dof),
-                        ]
-                    )
-                    brick_idx += 1
-
-                    # Regressor t-statistics
-                    for _ in condition_names:
-                        # Skip beta (brick_idx), add t-stat (brick_idx + 1)
+                    # F-statistic (sub-brick 0) - only if we have fstats
+                    has_fstats = getattr(results, "fstats", None) is not None
+                    if has_fstats:
                         cmd_statpar.extend(
-                            ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
+                            [
+                                "-substatpar",
+                                str(brick_idx),
+                                "fift",
+                                str(n_regressors),
+                                str(dof),
+                            ]
                         )
-                        brick_idx += 2
+                        brick_idx += 1
+
+                    # Regressor t-statistics (only if we have tstats)
+                    has_tstats = getattr(results, "tstats", None) is not None
+                    if has_tstats:
+                        for _ in condition_names:
+                            # Skip beta (brick_idx), add t-stat (brick_idx + 1)
+                            cmd_statpar.extend(
+                                ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
+                            )
+                            brick_idx += 2
+                    else:
+                        # No t-stats, just skip over betas
+                        brick_idx += len(condition_names)
 
                     # Contrast t-statistics (if any)
                     if contrast_names:
