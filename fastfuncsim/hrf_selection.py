@@ -430,7 +430,7 @@ def fit_glm_hrf_library_with_xval(
     # Main loop: evaluate each HRF via cross-validation using compute_xval_r2
     # This reuses the SOLID xval code from 3dXvalR2fast
     # =========================================================================
-    hrf_iterator = tqdm(range(n_hrfs), desc="HRF candidates", disable=not verbose)
+    hrf_iterator = tqdm(range(n_hrfs), desc="Evaluating HRF candidates")
 
     for hrf_idx in hrf_iterator:
         hrf = hrf_library[hrf_idx]
@@ -707,7 +707,7 @@ def _fit_voxelwise_hrf(
     if verbose:
         print(f"  Fitting {len(unique_hrfs)} HRF groups...")
 
-    hrf_iterator = tqdm(unique_hrfs, desc="HRF groups", disable=not verbose)
+    hrf_iterator = tqdm(unique_hrfs, desc="Fitting HRF groups")
 
     # Store dof from any group (should be same for all as design has same structure)
     stored_dof = None
