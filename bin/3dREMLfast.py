@@ -39,7 +39,7 @@ try:
         replace_afni_extension,
         get_tr_from_file,
     )
-    from fastfuncsim.utils import get_device
+    from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -418,6 +418,21 @@ Examples:
         help="Use double precision (float64) - matches AFNI exactly, ~2x memory, ~1.5x slower",
     )
     proc_opts.add_argument("-mask", help="Mask file to restrict analysis")
+    proc_opts.add_argument(
+        "-do_scale",
+        action="store_true",
+        help="Scale each voxel per run to mean=100 (percent signal change units). "
+        "Values are clipped to max 200 (100%% increase from mean).",
+    )
+    proc_opts.add_argument(
+        "-do_blur",
+        type=float,
+        metavar="FWHM",
+        default=None,
+        help="Apply 3D Gaussian spatial smoothing with FWHM in mm. "
+        "Smoothing is applied BEFORE masking to avoid edge effects. "
+        "Typical values: 4-8 mm.",
+    )
     proc_opts.add_argument(
         "-cache",
         metavar="FILE.h5",
@@ -962,6 +977,95 @@ def main():
 
         os.environ["FASTFUNCSIM_R2_SEMIPARTIAL_MODE"] = args.r2semipartial
 
+    # ==========================================================================
+    # Preprocessing: Blur and/or Scale if requested
+    # ==========================================================================
+    preprocessing_applied = args.do_blur is not None or args.do_scale
+
+    if preprocessing_applied:
+        print()
+        print("📦 Preprocessing data...")
+
+        # Need to load data manually for preprocessing
+        from tqdm import tqdm
+
+        # Get header info from first file
+        first_img = nib.load(input_files[0])
+        affine = first_img.affine
+        volume_shape = first_img.shape[:3]
+        voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
+
+        # Parse design matrix to get run information
+        design_info_pre = read_afni_design_matrix(args.matrix)
+        run_trs = design_info_pre.get("run_trs", None)
+
+        # Compute run_starts from run_trs
+        if run_trs is not None:
+            run_starts = [0]
+            cumsum = 0
+            for rt in run_trs[:-1]:
+                cumsum += rt
+                run_starts.append(cumsum)
+        else:
+            # Assume single run
+            run_starts = [0]
+
+        # Load and optionally blur each run
+        run_data_list = []
+
+        if args.do_blur is not None:
+            print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
+
+        for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading runs", unit="run")):
+            img = nib.load(run_file)
+            data_4d = img.get_fdata(dtype=np.float32)
+
+            if data_4d.ndim != 4:
+                raise ValueError(f"Expected 4D data, got shape {data_4d.shape}")
+
+            # Apply blur if requested (on 4D data)
+            if args.do_blur is not None:
+                data_4d = gaussian_blur_3d(
+                    data_4d,
+                    fwhm_mm=args.do_blur,
+                    voxel_sizes=voxel_sizes,
+                    device=device,
+                    verbose=(run_idx == 0),  # Only print details for first run
+                )
+
+            # Flatten to 2D (n_voxels, n_timepoints)
+            n_tps = data_4d.shape[3]
+            data_2d = data_4d.reshape(-1, n_tps)
+
+            run_data_list.append(data_2d)
+
+        # Concatenate all runs
+        fmri_data_preprocessed = np.concatenate(run_data_list, axis=1)
+        del run_data_list
+
+        # Apply scaling if requested (on concatenated 2D data)
+        if args.do_scale:
+            print(f"  Applying scaling (mean=100 per run)...")
+            # Convert to torch for scale_to_percent_signal
+            data_tensor = torch.from_numpy(fmri_data_preprocessed)
+            data_tensor, violations_mask, scale_info = scale_to_percent_signal(
+                data=data_tensor,
+                run_starts=run_starts,
+                max_scale=200.0,
+                verbose=True,
+            )
+            fmri_data_preprocessed = data_tensor.numpy()
+
+            if scale_info["n_violations"] > 0:
+                print(f"  ⚠️  {scale_info['n_violations']:,} ceiling violations")
+
+        # Reshape back to 4D for analyze_from_design_matrix
+        total_tps = fmri_data_preprocessed.shape[1]
+        fmri_data_preprocessed = fmri_data_preprocessed.reshape(*volume_shape, total_tps)
+
+        print(f"  ✓ Preprocessing complete: {volume_shape} × {total_tps} timepoints")
+        print()
+
     print("🚀 Starting GLM analysis...")
     print()
 
@@ -969,7 +1073,11 @@ def main():
     fmri_data_to_use = None
     cache_metadata = None
 
-    if args.cache:
+    # If preprocessing was applied, use that data
+    if preprocessing_applied:
+        fmri_data_to_use = fmri_data_preprocessed
+
+    if args.cache and not preprocessing_applied:
         from fastfuncsim.data_cache import check_cache_valid, load_cache, save_cache
 
         cache_valid = check_cache_valid(args.cache, input_files)

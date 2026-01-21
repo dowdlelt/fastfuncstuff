@@ -51,7 +51,7 @@ try:
         fit_glm_hrf_library_with_xval,
         save_hrf_selection_results,
     )
-    from fastfuncsim.utils import get_device, scale_to_percent_signal
+    from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -435,6 +435,15 @@ Notes:
         "Violation locations are saved to {prefix}_scale_violations.nii.gz",
     )
     proc_opts.add_argument(
+        "-do_blur",
+        type=float,
+        metavar="FWHM",
+        default=None,
+        help="Apply 3D Gaussian spatial smoothing with FWHM in mm. "
+        "Smoothing is applied BEFORE masking to avoid edge effects. "
+        "Typical values: 4-8 mm. Uses separable convolutions for speed.",
+    )
+    proc_opts.add_argument(
         "-device",
         type=str,
         help="Force device: 'cpu' or 'cuda' (default: auto-detect GPU)",
@@ -665,17 +674,77 @@ def main():
     else:
         keep_on_cpu = False
 
-    data, run_starts = load_and_concatenate_runs(
-        cast(list[Union[str, PathLib]], run_paths),
-        device=device,
-        keep_on_cpu=keep_on_cpu,
-    )
-
-    # Get affine and TR from first input
+    # Get affine and volume shape from first input
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
     volume_shape = (
         tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
     )
+
+    # Get voxel sizes from affine for blur kernel
+    voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
+
+    # ==========================================================================
+    # 2a. Optional: Apply Gaussian blur (must be done on 4D data before flattening)
+    # ==========================================================================
+    if args.do_blur is not None:
+        print()
+        print(f"Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
+
+        # Load runs individually, blur, then concatenate
+        from tqdm import tqdm
+
+        run_data_list = []
+        run_starts = [0]
+        current_timepoint = 0
+
+        for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading & blurring", unit="run")):
+            # Load as 4D numpy array
+            img = nib.load(run_file)
+            data_4d = img.get_fdata(dtype=np.float32)
+
+            if data_4d.ndim != 4:
+                raise ValueError(f"Expected 4D data, got shape {data_4d.shape}")
+
+            # Apply Gaussian blur (works on 4D data)
+            data_4d_blurred = gaussian_blur_3d(
+                data_4d,
+                fwhm_mm=args.do_blur,
+                voxel_sizes=voxel_sizes,
+                device=device,
+                verbose=(run_idx == 0),  # Only print kernel info for first run
+            )
+
+            # Flatten to 2D (n_voxels, n_timepoints)
+            n_tps = data_4d_blurred.shape[3]
+            data_2d = data_4d_blurred.reshape(-1, n_tps)
+
+            # Convert to torch
+            data_tensor = torch.from_numpy(data_2d)
+            if not keep_on_cpu:
+                data_tensor = data_tensor.to(device)
+
+            run_data_list.append(data_tensor)
+
+            # Update run starts
+            current_timepoint += n_tps
+            if run_idx < len(input_files) - 1:
+                run_starts.append(current_timepoint)
+
+            # Clean up
+            del data_4d, data_4d_blurred, data_2d
+
+        # Concatenate all runs
+        data = torch.cat(run_data_list, dim=1)
+        del run_data_list
+
+        print(f"  ✓ Blurred and concatenated {n_runs} runs")
+    else:
+        # Standard loading without blur
+        data, run_starts = load_and_concatenate_runs(
+            cast(list[Union[str, PathLib]], run_paths),
+            device=device,
+            keep_on_cpu=keep_on_cpu,
+        )
 
     # Get TR from header if not provided
     if args.tr is None:
