@@ -34,6 +34,7 @@ ENV/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+*.html
 
 # Data files
 *.pkl
