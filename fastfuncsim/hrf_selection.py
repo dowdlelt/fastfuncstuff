@@ -279,11 +279,11 @@ def fit_glm_hrf_library_with_xval(
     # Estimate memory requirement for data
     n_voxels_check, n_timepoints_check = data.shape
     data_size_gb = (n_voxels_check * n_timepoints_check * 4) / (1024**3)
-    
+
     # GPU memory threshold - keep on CPU if data exceeds this
     gpu_memory_threshold_gb = 4.0
     keep_data_on_cpu = device.type == "cuda" and data_size_gb > gpu_memory_threshold_gb
-    
+
     if not keep_data_on_cpu:
         # Small enough to fit on GPU - move it there
         data = data.to(device)
@@ -318,7 +318,9 @@ def fit_glm_hrf_library_with_xval(
         )
         print(f"  Microtime: {microtime_resolution}x (onset bin {microtime_onset})")
         if keep_data_on_cpu:
-            print(f"  Memory mode: CPU streaming (data {data_size_gb:.1f}GB > {gpu_memory_threshold_gb}GB threshold)")
+            print(
+                f"  Memory mode: CPU streaming (data {data_size_gb:.1f}GB > {gpu_memory_threshold_gb}GB threshold)"
+            )
         print()
 
     # Generate CV splits
@@ -512,11 +514,13 @@ def fit_glm_hrf_library_with_xval(
         print()
         print("Computing canonical HRF baseline for comparison...")
 
-    # Get single canonical HRF
-    mean_duration = float(np.mean(stim_durations)) if stim_durations else 0.0
+    # Get single canonical HRF as impulse response (stim_duration=0)
+    # The onset matrix already encodes stimulus duration via boxcars at microtime
+    # resolution, so the HRF should be an impulse response to avoid double-counting
+    # the duration (convolving duration-encoded onsets with duration-encoded HRF)
     canonical_hrf = get_hrf_library(
         mode="single",
-        stim_duration=mean_duration,
+        stim_duration=0.0,  # Impulse response - duration is in onset matrix
         tr=tr,
         device=device,
     )

@@ -127,6 +127,7 @@ def load_canonical_hrf_library(
     tr: float,
     microtime_resolution: int = 1,
     hrf_duration: float = 32.0,
+    stim_duration: float = 0.0,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
@@ -146,6 +147,10 @@ def load_canonical_hrf_library(
         the design matrix construction (typically 16).
     hrf_duration : float, default=32.0
         Duration of HRF in seconds (truncates or zero-pads as needed)
+    stim_duration : float, default=0.0
+        Stimulus duration in seconds. If > 0, HRFs are convolved with a boxcar
+        of this duration before resampling. This creates HRFs appropriate for
+        block designs.
     device : torch.device, optional
         Device for output tensor
 
@@ -160,9 +165,10 @@ def load_canonical_hrf_library(
     -----
     The HRF library file is at 0.1s resolution (501 timepoints = 50.1s).
     Each HRF is:
-    1. Normalized to peak amplitude = 1.0 at source resolution (0.1s)
-    2. Resampled to the target temporal resolution
-    3. Truncated to hrf_duration
+    1. Optionally convolved with stimulus duration boxcar (at source resolution)
+    2. Normalized to peak amplitude = 1.0
+    3. Resampled to the target temporal resolution
+    4. Truncated to hrf_duration
 
     The normalization happens at source resolution so that the high-resolution
     version peaks at exactly 1.0. TR-sampled versions may not hit exactly 1.0
@@ -178,12 +184,25 @@ def load_canonical_hrf_library(
     # Target temporal resolution
     target_dt = tr / microtime_resolution
 
+    # Time vector at source resolution (for convolution)
+    t_source = np.arange(n_file_timepoints) * _HRF_FILE_RESOLUTION
+
     # Process each HRF
     hrfs_resampled = []
     for i in range(n_hrfs):
         hrf_raw = raw_library[:, i]
 
-        # Normalize at source resolution (0.1s) first
+        # Convolve with stimulus duration if specified
+        if stim_duration > 0:
+            # Create boxcar at source resolution
+            boxcar = np.zeros_like(t_source)
+            stim_samples = int(stim_duration / _HRF_FILE_RESOLUTION)
+            boxcar[:stim_samples] = 1
+            # Convolve and truncate to original length
+            hrf_convolved = np.convolve(hrf_raw, boxcar, mode="full")[: len(t_source)]
+            hrf_raw = hrf_convolved
+
+        # Normalize at source resolution (0.1s)
         # This ensures microtime versions hit 1.0 at peak
         hrf_normalized = _normalize_hrf_to_unit_peak(hrf_raw)
 
@@ -207,6 +226,7 @@ def load_canonical_hrf_basic(
     tr: float,
     microtime_resolution: int = 1,
     hrf_duration: float = 32.0,
+    stim_duration: float = 0.0,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
@@ -223,6 +243,9 @@ def load_canonical_hrf_basic(
         Sub-TR resolution. If > 1, HRF is sampled at TR/microtime_resolution.
     hrf_duration : float, default=32.0
         Duration of HRF in seconds
+    stim_duration : float, default=0.0
+        Stimulus duration in seconds. If > 0, HRF is convolved with a boxcar
+        of this duration before resampling.
     device : torch.device, optional
         Device for output tensor
 
@@ -242,6 +265,15 @@ def load_canonical_hrf_basic(
 
     # Load raw HRF (490 timepoints at 0.1s = 49s)
     hrf_raw = _load_hrf_from_file(_HRF_BASIC_FILE)
+    n_file_timepoints = len(hrf_raw)
+
+    # Convolve with stimulus duration if specified
+    if stim_duration > 0:
+        t_source = np.arange(n_file_timepoints) * _HRF_FILE_RESOLUTION
+        boxcar = np.zeros_like(t_source)
+        stim_samples = int(stim_duration / _HRF_FILE_RESOLUTION)
+        boxcar[:stim_samples] = 1
+        hrf_raw = np.convolve(hrf_raw, boxcar, mode="full")[:n_file_timepoints]
 
     # Normalize at source resolution (0.1s) first
     hrf_normalized = _normalize_hrf_to_unit_peak(hrf_raw)
@@ -749,6 +781,7 @@ def get_hrf_library(
             tr=tr,
             microtime_resolution=microtime_resolution,
             hrf_duration=hrf_duration,
+            stim_duration=stim_duration,
             device=device,
         )
 
@@ -759,6 +792,7 @@ def get_hrf_library(
             tr=tr,
             microtime_resolution=microtime_resolution,
             hrf_duration=hrf_duration,
+            stim_duration=stim_duration,
             device=device,
         )
 

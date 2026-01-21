@@ -885,7 +885,7 @@ def fit_glm(
             tstats_dev,
             fstats_dev,
         )
-        
+
         # Clear GPU cache every 10 chunks to prevent fragmentation
         if not preload_data_to_device and device.type == "cuda" and chunk_idx % 10 == 0:
             torch.cuda.empty_cache()

@@ -886,14 +886,16 @@ def main():
         nib.save(violation_img, violation_path)
         output_files["scale_violations"] = violation_path
 
-        if scale_info['n_violations'] > 0:
+        if scale_info["n_violations"] > 0:
             print(f"  ⚠️  Scale violations saved: {violation_path}")
 
         # Add scaling info to metadata
         results.hrf_metadata["do_scale"] = True
         results.hrf_metadata["scale_max"] = 200.0
-        results.hrf_metadata["scale_n_violations"] = scale_info['n_violations']
-        results.hrf_metadata["scale_n_voxels_with_violations"] = scale_info['n_voxels_with_violations']
+        results.hrf_metadata["scale_n_violations"] = scale_info["n_violations"]
+        results.hrf_metadata["scale_n_voxels_with_violations"] = scale_info[
+            "n_voxels_with_violations"
+        ]
 
     # Print output summary
     print()

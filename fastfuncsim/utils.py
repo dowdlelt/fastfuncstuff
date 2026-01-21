@@ -283,7 +283,9 @@ def scale_to_percent_signal(
     scale_factors = torch.zeros(n_voxels, n_runs, device=device)
 
     # Track violations
-    violations_mask = torch.zeros(n_voxels, n_timepoints_total, dtype=torch.bool, device=device)
+    violations_mask = torch.zeros(
+        n_voxels, n_timepoints_total, dtype=torch.bool, device=device
+    )
 
     if verbose:
         print("Scaling to percent signal change (mean=100 per run)...")
@@ -338,19 +340,23 @@ def scale_to_percent_signal(
     violation_voxel_indices = torch.where(voxels_with_violations)[0]
 
     scale_info = {
-        'n_violations': int(n_violations),
-        'n_voxels_with_violations': int(n_voxels_with_violations),
-        'violation_voxel_indices': violation_voxel_indices,
-        'mean_per_run': mean_per_run,
-        'scale_factors': scale_factors,
+        "n_violations": int(n_violations),
+        "n_voxels_with_violations": int(n_voxels_with_violations),
+        "violation_voxel_indices": violation_voxel_indices,
+        "mean_per_run": mean_per_run,
+        "scale_factors": scale_factors,
     }
 
     if verbose:
         print(f"  Scaled {n_voxels:,} voxels × {n_runs} runs")
         if n_violations > 0:
             pct_violations = 100 * n_violations / (n_voxels * n_timepoints_total)
-            print(f"  ⚠️  Ceiling violations (>{max_scale}): {n_violations:,} timepoints ({pct_violations:.4f}%)")
-            print(f"      Affecting {n_voxels_with_violations:,} voxels ({100*n_voxels_with_violations/n_voxels:.2f}%)")
+            print(
+                f"  ⚠️  Ceiling violations (>{max_scale}): {n_violations:,} timepoints ({pct_violations:.4f}%)"
+            )
+            print(
+                f"      Affecting {n_voxels_with_violations:,} voxels ({100 * n_voxels_with_violations / n_voxels:.2f}%)"
+            )
         else:
             print(f"  ✓ No ceiling violations (all values ≤ {max_scale})")
 
