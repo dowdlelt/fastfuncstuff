@@ -70,10 +70,9 @@ def convolve_hrf_microtime(
     onsets_microtime: torch.Tensor,
     hrf: torch.Tensor,
     n_timepoints: int,
-    microtime_resolution: int,
     tr: float = 1.0,
-    microtime_onset: int = 1,
-    hrf_is_microtime: bool = False,
+    microtime_dt: float = 0.1,
+    microtime_onset: int = 0,
     device: Optional[torch.device] = None,
     return_single_trials: bool = False,
 ) -> Union[torch.Tensor, tuple]:
@@ -89,23 +88,23 @@ def convolve_hrf_microtime(
     Parameters
     ----------
     onsets_microtime : torch.Tensor
-        (n_microtime_points, n_conditions) onset matrix at microtime resolution.
+        (n_microtime_points, n_conditions) onset matrix at microtime_dt resolution.
         Values can be binary (0/1) or boxcar (constant value during stimulus).
         Each contiguous non-zero region is treated as a separate event.
+        n_microtime_points should equal n_timepoints * (tr / microtime_dt).
     hrf : torch.Tensor
-        Hemodynamic response function. Shape depends on hrf_is_microtime:
-        - If hrf_is_microtime=False: (n_hrf_tr_timepoints,) at TR resolution
-        - If hrf_is_microtime=True: (n_hrf_microtime_timepoints,) at microtime resolution
+        (n_hrf_microtime_timepoints,) hemodynamic response function at microtime_dt
+        resolution. Should be pre-generated at the same microtime_dt as onsets.
     n_timepoints : int
         Number of TR timepoints in output
-    microtime_resolution : int
-        Number of microtime bins per TR (e.g., 20 for 50ms resolution at TR=1s)
     tr : float, default=1.0
         Repetition time in seconds.
-    microtime_onset : int, default=1
-        Which microtime bin corresponds to TR onset (1-indexed, 1 = start of TR)
-    hrf_is_microtime : bool, default=False
-        If True, the HRF is already at microtime resolution and won't be upsampled.
+    microtime_dt : float, default=0.1
+        Microtime resolution in seconds. Default 0.1s is the standard throughout
+        the pipeline. Both onsets and HRF should be at this resolution.
+    microtime_onset : int, default=0
+        Which microtime bin within each TR to sample (0-indexed).
+        0 = start of TR, bins_per_tr/2 = middle of TR.
     device : torch.device, optional
         Device for computation
     return_single_trials : bool, default=False
@@ -122,13 +121,12 @@ def convolve_hrf_microtime(
     Notes
     -----
     Algorithm:
-    1. Upsample HRF to microtime resolution (if needed)
-    2. For each condition:
+    1. For each condition:
        a. Identify individual events (contiguous non-zero regions)
-       b. Convolve each event separately with HRF
+       b. Convolve each event separately with HRF (both at microtime_dt)
        c. Scale each convolved event to peak=1.0
        d. Sum all scaled events to get condition regressor
-    3. Downsample to TR resolution
+    2. Downsample to TR resolution by sampling every tr/microtime_dt bins
     """
     if device is None:
         device = get_device()
@@ -141,44 +139,28 @@ def convolve_hrf_microtime(
     if onsets_microtime.ndim == 1:
         onsets_microtime = onsets_microtime.unsqueeze(1)
 
+    # Calculate bins per TR
+    bins_per_tr = int(round(tr / microtime_dt))
+
     # Validate dimensions
-    expected_microtime = n_timepoints * microtime_resolution
+    expected_microtime = n_timepoints * bins_per_tr
     if n_microtime_points != expected_microtime:
         raise ValueError(
             f"onsets_microtime has {n_microtime_points} points, "
             f"expected {expected_microtime} (n_timepoints={n_timepoints} * "
-            f"microtime_resolution={microtime_resolution})"
+            f"bins_per_tr={bins_per_tr} where tr={tr}, microtime_dt={microtime_dt})"
         )
 
-    # 1. Upsample HRF to microtime resolution (or use directly if already microtime)
-    if hrf_is_microtime:
-        hrf_microtime = hrf.clone()
-    else:
-        # Upsample HRF from TR resolution to microtime resolution
-        n_hrf_tr = len(hrf)
-        n_hrf_microtime = n_hrf_tr * microtime_resolution
-
-        # Use linear interpolation to upsample HRF
-        hrf_microtime_indices = torch.linspace(
-            0, n_hrf_tr - 1, n_hrf_microtime, device=device
-        )
-
-        # Linear interpolation
-        hrf_microtime = torch.zeros(n_hrf_microtime, device=device)
-        for i, idx in enumerate(hrf_microtime_indices):
-            idx_low = int(idx.floor().item())
-            idx_high = min(idx_low + 1, n_hrf_tr - 1)
-            frac = idx - idx_low
-            hrf_microtime[i] = hrf[idx_low] * (1 - frac) + hrf[idx_high] * frac
+    # HRF is already at microtime_dt resolution - use directly
+    hrf_microtime = hrf
 
     # Prepare HRF kernel for conv1d (flipped for causal convolution)
     hrf_kernel = hrf_microtime.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, H)
     hrf_len = len(hrf_microtime)
 
-    # Downsampling indices
-    sample_offset = microtime_onset - 1  # Convert to 0-indexed
+    # Downsampling indices: sample every bins_per_tr, starting at microtime_onset
     sample_indices = torch.arange(
-        sample_offset, n_microtime_points, microtime_resolution, device=device
+        microtime_onset, n_microtime_points, bins_per_tr, device=device
     )
     if len(sample_indices) > n_timepoints:
         sample_indices = sample_indices[:n_timepoints]

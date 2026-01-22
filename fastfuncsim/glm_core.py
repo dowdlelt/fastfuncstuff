@@ -968,8 +968,8 @@ def fit_glm_hrf_library(
     design: Union[torch.Tensor, list],
     hrf_library: torch.Tensor,
     tr: float,
-    microtime_resolution: int = 1,
-    microtime_onset: int = 1,
+    microtime_dt: float = 0.1,
+    microtime_onset: int = 0,
     n_timepoints: Optional[int] = None,
     **kwargs,
 ) -> Tuple[GLMResults, torch.Tensor, torch.Tensor]:
@@ -981,20 +981,20 @@ def fit_glm_hrf_library(
     data : torch.Tensor or list
         fMRI data
     design : torch.Tensor or list
-        Design matrix (NOT yet convolved with HRF). Can be:
-        - TR-resolution: (n_timepoints, n_conditions) if microtime_resolution=1
-        - Microtime-resolution: (n_timepoints * microtime_resolution, n_conditions)
+        Design matrix (NOT yet convolved with HRF) at microtime_dt resolution.
+        Shape: (n_microtime_points, n_conditions) where
+        n_microtime_points = n_timepoints * (tr / microtime_dt)
     hrf_library : torch.Tensor
-        (n_hrfs, n_timepoints) library of HRF candidates at TR resolution
+        (n_hrfs, n_hrf_timepoints) library of HRF candidates at microtime_dt resolution
     tr : float
-        Repetition time
-    microtime_resolution : int, default=1
-        Number of time bins per TR. If > 1, design is assumed to be at microtime
-        resolution and convolution will use high-res then downsample.
-    microtime_onset : int, default=1
-        Which microtime bin to sample for each TR (1-indexed).
+        Repetition time in seconds
+    microtime_dt : float, default=0.1
+        Microtime resolution in seconds. Both design and hrf_library should be
+        at this resolution.
+    microtime_onset : int, default=0
+        Which microtime bin within each TR to sample (0-indexed).
     n_timepoints : int, optional
-        Number of TR timepoints. Required if microtime_resolution > 1.
+        Number of TR timepoints. If None, inferred from design shape.
     **kwargs : dict
         Additional arguments passed to fit_glm
 
@@ -1015,15 +1015,15 @@ def fit_glm_hrf_library(
     if verbose:
         print(f"Fitting HRF library: {n_hrfs} candidates")
 
+    # Calculate bins per TR
+    bins_per_tr = int(round(tr / microtime_dt))
+
     # Determine n_timepoints for output
-    if microtime_resolution > 1:
-        if n_timepoints is None:
-            # Infer from design shape
-            n_timepoints = design.shape[0] // microtime_resolution
-        if verbose:
-            print(f"  Using microtime resolution: {microtime_resolution}x")
-    else:
-        n_timepoints = design.shape[0]
+    if n_timepoints is None:
+        # Infer from design shape
+        n_timepoints = design.shape[0] // bins_per_tr
+    if verbose:
+        print(f"  Using microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR)")
 
     # Fit GLM for each HRF
     all_r2 = []
@@ -1036,20 +1036,16 @@ def fit_glm_hrf_library(
         # Convolve design with this HRF
         hrf = hrf_library[hrf_idx]
 
-        if microtime_resolution > 1:
-            # Use high-resolution convolution and downsample
-            convolved_design = convolve_hrf_microtime(
-                design,
-                hrf,
-                n_timepoints,
-                microtime_resolution,
-                tr=tr,
-                microtime_onset=microtime_onset,
-                device=device,
-            )
-        else:
-            # Legacy TR-locked convolution
-            convolved_design = convolve_hrf(design, hrf, n_timepoints, device=device)
+        # Convolve at microtime resolution and downsample to TR
+        convolved_design = convolve_hrf_microtime(
+            design,
+            hrf,
+            n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
 
         # Fit GLM for each HRF
         fit_kwargs = kwargs.copy()

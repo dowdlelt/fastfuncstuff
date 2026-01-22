@@ -178,11 +178,12 @@ def fit_glm_hrf_library_with_xval(
     cv_strategy: Union[float, int] = 1,
     n_perms: int = 100,
     metric: str = "cod",
-    microtime_resolution: int = 20,
-    microtime_onset: Optional[int] = None,
+    microtime_dt: float = 0.1,
+    microtime_onset: int = 0,
     polort: Optional[int] = None,
     ortvec_files: Optional[List[Tuple[Union[str, Path], str]]] = None,
     extra_regressors: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    canonical_mode: str = "spmg1",
     device: Optional[torch.device] = None,
     verbose: bool = True,
     chunk_size: Optional[int] = None,
@@ -201,8 +202,8 @@ def fit_glm_hrf_library_with_xval(
     data : torch.Tensor
         (n_voxels, n_timepoints) fMRI data
     onsets : torch.Tensor
-        (n_timepoints, n_conditions) or (n_microtime, n_conditions) binary onset matrix
-        If microtime_resolution > 1, should be at microtime resolution
+        (n_microtime_points, n_conditions) binary onset matrix at microtime_dt resolution.
+        n_microtime_points = n_timepoints * (tr / microtime_dt)
     hrf_library : torch.Tensor
         (n_hrfs, n_hrf_timepoints) Library of HRF candidates at TR resolution
     tr : float
@@ -220,10 +221,12 @@ def fit_glm_hrf_library_with_xval(
         Number of permutations for random split strategies
     metric : str, default='cod'
         R² metric: 'cod' (coefficient of determination), 'corr', or 'corr2'
-    microtime_resolution : int, default=20
-        Sub-TR resolution for onset timing
-    microtime_onset : int, optional
-        Which microtime bin to sample (default: 1, no shift)
+    microtime_dt : float, default=0.1
+        Microtime resolution in seconds. Default 0.1s is the standard throughout
+        the pipeline. Both onsets and HRF library should be at this resolution.
+    microtime_onset : int, default=0
+        Which microtime bin within each TR to sample (0-indexed).
+        0 = start of TR, bins_per_tr/2 = middle of TR.
     polort : int, optional
         Polynomial order for detrending (None = auto)
     ortvec_files : list of (filepath, label) tuples, optional
@@ -238,6 +241,12 @@ def fit_glm_hrf_library_with_xval(
         Additional nuisance regressors as a matrix (n_timepoints, n_columns).
         Alternative to ortvec_files for passing already-loaded data.
         Must span all runs (already concatenated).
+    canonical_mode : str, default='spmg1'
+        Which canonical HRF to use for baseline comparison:
+        - 'spmg1' or 'SPMG1': AFNI's SPMG1 formula (recommended default)
+        - 'glmsingle': GLMsingle/nilearn-style double-gamma (scipy.stats.gamma)
+        The baseline comparison shows how much HRF optimization improves over
+        using a single canonical HRF for all voxels.
     device : torch.device, optional
         Compute device (auto-detected if None)
     verbose : bool, default=True
@@ -265,10 +274,6 @@ def fit_glm_hrf_library_with_xval(
     if device is None:
         device = get_device()
 
-    # Set microtime_onset default: first bin (no shift, events at actual times)
-    if microtime_onset is None:
-        microtime_onset = 1
-
     # Convert data to tensor but decide whether to keep on CPU based on size
     # For large datasets, keep data on CPU and stream chunks to GPU
     # This prevents OOM when data exceeds GPU memory
@@ -292,17 +297,17 @@ def fit_glm_hrf_library_with_xval(
     n_hrfs = hrf_library.shape[0]
     n_runs = len(run_starts)
 
+    # Calculate bins per TR for microtime
+    bins_per_tr = int(round(tr / microtime_dt))
+
     # Determine n_timepoints at TR resolution
-    if microtime_resolution > 1:
-        n_timepoints = onsets.shape[0] // microtime_resolution
-    else:
-        n_timepoints = onsets.shape[0]
+    n_timepoints = onsets.shape[0] // bins_per_tr
 
     # Validate data/design alignment
     if n_timepoints_data != n_timepoints:
         raise ValueError(
             f"Data has {n_timepoints_data} timepoints but design implies {n_timepoints}. "
-            f"Check microtime_resolution setting."
+            f"Check microtime_dt and tr settings (bins_per_tr={bins_per_tr})."
         )
 
     if verbose:
@@ -316,7 +321,7 @@ def fit_glm_hrf_library_with_xval(
         print(
             f"  CV strategy: {cv_strategy} ({'LORO' if cv_strategy == 1 else 'split-halves' if cv_strategy == 0.5 else cv_strategy})"
         )
-        print(f"  Microtime: {microtime_resolution}x (onset bin {microtime_onset})")
+        print(f"  Microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR, onset bin {microtime_onset})")
         if keep_data_on_cpu:
             print(
                 f"  Memory mode: CPU streaming (data {data_size_gb:.1f}GB > {gpu_memory_threshold_gb}GB threshold)"
@@ -456,18 +461,16 @@ def fit_glm_hrf_library_with_xval(
         hrf = hrf_library[hrf_idx]
 
         # Convolve onsets with this HRF to get stimulus design
-        if microtime_resolution > 1:
-            stim_design = convolve_hrf_microtime(
-                onsets,
-                hrf,
-                n_timepoints,
-                microtime_resolution,
-                tr=tr,
-                microtime_onset=microtime_onset,
-                device=device,
-            )
-        else:
-            stim_design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+        # HRF library and onsets are both at microtime_dt resolution
+        stim_design = convolve_hrf_microtime(
+            onsets,
+            hrf,
+            n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
 
         n_stim_cols = stim_design.shape[1]
 
@@ -518,28 +521,46 @@ def fit_glm_hrf_library_with_xval(
     # The onset matrix already encodes stimulus duration via boxcars at microtime
     # resolution, so the HRF should be an impulse response to avoid double-counting
     # the duration (convolving duration-encoded onsets with duration-encoded HRF)
-    canonical_hrf = get_hrf_library(
-        mode="single",
-        stim_duration=0.0,  # Impulse response - duration is in onset matrix
-        tr=tr,
-        device=device,
-    )
+    from .hrf import get_spmg1_hrf
 
-    # Convolve with canonical HRF
-    if microtime_resolution > 1:
-        canonical_design = convolve_hrf_microtime(
-            onsets,
-            canonical_hrf,
-            n_timepoints,
-            microtime_resolution,
-            tr=tr,
-            microtime_onset=microtime_onset,
+    canonical_mode_lower = canonical_mode.lower()
+    if canonical_mode_lower == "spmg1":
+        # AFNI's SPMG1 canonical HRF (recommended default)
+        canonical_hrf = get_spmg1_hrf(
+            microtime_dt=microtime_dt,
+            stim_duration=0.0,  # Impulse response - duration is in onset matrix
+            normalize_peak=True,
             device=device,
         )
-    else:
-        canonical_design = convolve_hrf(
-            onsets, canonical_hrf, n_timepoints, device=device
+        canonical_label = "SPMG1"
+    elif canonical_mode_lower in ("glmsingle", "single"):
+        # GLMsingle/nilearn-style double-gamma
+        canonical_hrf = get_hrf_library(
+            mode="single",
+            stim_duration=0.0,  # Impulse response - duration is in onset matrix
+            microtime_dt=microtime_dt,
+            device=device,
         )
+        canonical_label = "GLMsingle"
+    else:
+        raise ValueError(
+            f"Unknown canonical_mode: {canonical_mode}. "
+            f"Choose 'spmg1' (AFNI) or 'glmsingle' (scipy/nilearn)."
+        )
+
+    if verbose:
+        print(f"  Using {canonical_label} canonical HRF for baseline comparison")
+
+    # Convolve with canonical HRF
+    canonical_design = convolve_hrf_microtime(
+        onsets,
+        canonical_hrf,
+        n_timepoints,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        microtime_onset=microtime_onset,
+        device=device,
+    )
 
     # Build full design with nuisance (polort + extra)
     full_design_canonical = torch.cat([canonical_design, nuisance_design], dim=1)
@@ -626,7 +647,7 @@ def fit_glm_hrf_library_with_xval(
         hrf_index=hrf_index,
         nuisance_design=nuisance_design,
         tr=tr,
-        microtime_resolution=microtime_resolution,
+        microtime_dt=microtime_dt,
         microtime_onset=microtime_onset,
         device=device,
         verbose=verbose,
@@ -642,7 +663,7 @@ def fit_glm_hrf_library_with_xval(
         "cv_strategy": cv_strategy,
         "n_splits": n_splits,
         "metric": metric,
-        "microtime_resolution": microtime_resolution,
+        "microtime_dt": microtime_dt,
         "microtime_onset": microtime_onset,
         "polort": polort,
         "n_poly_cols": n_poly_cols,
@@ -698,7 +719,7 @@ def _fit_voxelwise_hrf(
     hrf_index: torch.Tensor,
     nuisance_design: torch.Tensor,
     tr: float,
-    microtime_resolution: int,
+    microtime_dt: float,
     microtime_onset: int,
     device: torch.device,
     verbose: bool,
@@ -719,10 +740,9 @@ def _fit_voxelwise_hrf(
     """
     n_voxels = data.shape[0]
 
-    if microtime_resolution > 1:
-        n_timepoints = onsets.shape[0] // microtime_resolution
-    else:
-        n_timepoints = onsets.shape[0]
+    # Calculate bins per TR for microtime
+    bins_per_tr = int(round(tr / microtime_dt))
+    n_timepoints = onsets.shape[0] // bins_per_tr
 
     n_conditions = onsets.shape[1]
     n_nuisance_cols = nuisance_design.shape[1]
@@ -769,18 +789,15 @@ def _fit_voxelwise_hrf(
         # Convolve with this HRF
         hrf = hrf_library[hrf_idx_int]
 
-        if microtime_resolution > 1:
-            stim_design = convolve_hrf_microtime(
-                onsets,
-                hrf,
-                n_timepoints,
-                microtime_resolution,
-                tr=tr,
-                microtime_onset=microtime_onset,
-                device=device,
-            )
-        else:
-            stim_design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+        stim_design = convolve_hrf_microtime(
+            onsets,
+            hrf,
+            n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
 
         # Build full design: [stimulus | nuisance]
         full_design = torch.cat([stim_design, nuisance_design], dim=1)
@@ -1185,20 +1202,19 @@ def save_hrf_selection_results(
         else:
             # Get parameters from metadata
             tr = results.hrf_metadata.get("tr", 2.0)
-            microtime_resolution = results.hrf_metadata.get("microtime_resolution", 1)
-            microtime_onset = results.hrf_metadata.get("microtime_onset", 1)
+            microtime_dt = results.hrf_metadata.get("microtime_dt", 0.1)
+            microtime_onset = results.hrf_metadata.get("microtime_onset", 0)
             n_hrfs = results.hrf_library.shape[0]
             hrf_mode = results.hrf_metadata.get("hrf_mode", "library")
+
+            # Calculate bins per TR
+            bins_per_tr = int(round(tr / microtime_dt))
 
             # Determine n_timepoints from design matrix or onsets
             if results.design_matrix is not None:
                 n_timepoints = results.design_matrix.shape[0]
             else:
-                n_timepoints = (
-                    onsets.shape[0] // microtime_resolution
-                    if microtime_resolution > 1
-                    else onsets.shape[0]
-                )
+                n_timepoints = onsets.shape[0] // bins_per_tr
 
             # Get run_starts/condition labels
             if run_starts is None:
@@ -1236,17 +1252,14 @@ def save_hrf_selection_results(
                 hrf = results.hrf_library[hrf_idx]
 
                 # Convolve onsets with this HRF
-                if microtime_resolution > 1:
-                    stim_design = convolve_hrf_microtime(
-                        onsets,
-                        hrf,
-                        n_timepoints,
-                        microtime_resolution,
-                        tr=tr,
-                        microtime_onset=microtime_onset,
-                    )
-                else:
-                    stim_design = convolve_hrf(onsets, hrf, n_timepoints)
+                stim_design = convolve_hrf_microtime(
+                    onsets,
+                    hrf,
+                    n_timepoints,
+                    tr=tr,
+                    microtime_dt=microtime_dt,
+                    microtime_onset=microtime_onset,
+                )
 
                 # Build full design: [stimulus | polynomials]
                 full_design = torch.cat([stim_design, poly_design], dim=1)

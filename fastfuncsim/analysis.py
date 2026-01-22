@@ -44,8 +44,8 @@ def analyze_from_onsets(
     stim_labels: Optional[List[str]] = None,
     polort: Optional[int] = None,
     verbose: bool = True,
-    microtime_resolution: int = 20,
-    microtime_onset: Optional[int] = None,
+    microtime_dt: float = 0.1,
+    microtime_onset: int = 0,
     **hrf_kwargs,
 ) -> Union[GLMResults, ARMA11Results]:
     """
@@ -107,15 +107,12 @@ def analyze_from_onsets(
         Equivalent to AFNI's -polort option.
     verbose : bool
         Print progress information (default: True)
-    microtime_resolution : int, default=20
-        Number of time bins per TR for sub-TR precision in onset timing.
-        Default is 20 which correctly models stimuli that occur between TR
-        boundaries. Set to 1 for legacy TR-locked behavior.
-    microtime_onset : int, optional
-        Which microtime bin to sample for each TR (1-indexed).
-        If None (default), uses first bin (no shift). Events are placed at
-        their actual onset times without assuming they occur mid-TR.
-        Set to microtime_resolution // 2 + 1 for SPM-style mid-TR sampling.
+    microtime_dt : float, default=0.1
+        Microtime resolution in seconds. Default 0.1s is the standard throughout
+        the pipeline. Onsets and HRFs are at this resolution.
+    microtime_onset : int, default=0
+        Which microtime bin within each TR to sample (0-indexed).
+        0 = start of TR, bins_per_tr/2 = middle of TR.
     **hrf_kwargs : dict
         Additional arguments passed to HRF generation functions
 
@@ -225,24 +222,22 @@ def analyze_from_onsets(
         tr,
         run_starts=run_starts,
         device=device,
-        microtime_resolution=microtime_resolution,
+        microtime_dt=microtime_dt,
     )
 
-    if verbose and microtime_resolution > 1:
+    bins_per_tr = int(round(tr / microtime_dt))
+    if verbose:
         print(
-            f"📐 Sub-TR timing: {microtime_resolution}x resolution, "
-            f"sampling at bin {microtime_onset}/{microtime_resolution}"
+            f"📐 Microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR), "
+            f"sampling at bin {microtime_onset}"
         )
 
     # 4. Build design matrix based on HRF mode
     if hrf_mode == "fir":
         # FIR: no HRF assumption (microtime not applicable - FIR estimates full response)
-        if microtime_resolution > 1:
-            # For FIR, downsample onsets back to TR resolution
-            # FIR doesn't benefit from microtime since it estimates the full response
-            onsets_tr = onsets[microtime_onset - 1 :: microtime_resolution, :]
-        else:
-            onsets_tr = onsets
+        # For FIR, downsample onsets back to TR resolution
+        # FIR doesn't benefit from microtime since it estimates the full response
+        onsets_tr = onsets[microtime_onset::bins_per_tr, :]
         design = build_glm_design(
             onsets_tr,
             hrf=None,
@@ -254,27 +249,23 @@ def analyze_from_onsets(
 
     elif hrf_mode == "canonical":
         # Single canonical HRF with microtime convolution
-        hrf = get_canonical_hrf(stim_duration=stim_duration, tr=tr, device=device)
-        if microtime_resolution > 1:
-            # Use high-resolution convolution and downsample
-            design = convolve_hrf_microtime(
-                onsets,
-                hrf,
-                n_timepoints,
-                microtime_resolution,
-                tr=tr,
-                microtime_onset=microtime_onset,
-                device=device,
-            )
-        else:
-            # Legacy TR-locked behavior
-            design = build_glm_design(
-                onsets,
-                hrf=hrf,
-                n_timepoints=n_timepoints,
-                mode="assumed",
-                device=device,
-            )
+        # Get HRF at microtime resolution
+        hrf = get_hrf_library(
+            mode="single",
+            stim_duration=stim_duration,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+        # Use microtime convolution and downsample
+        design = convolve_hrf_microtime(
+            onsets,
+            hrf,
+            n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
 
     elif hrf_mode in ["library", "pighs", "flobs"]:
         # HRF library - will fit with library below
@@ -282,7 +273,7 @@ def analyze_from_onsets(
         hrf_library = get_hrf_library(
             mode="library" if hrf_mode == "library" else "pighs",
             stim_duration=stim_duration,
-            tr=tr,
+            microtime_dt=microtime_dt,
             n_hrfs=n_hrfs,
             device=device,
             **hrf_kwargs,
@@ -314,7 +305,7 @@ def analyze_from_onsets(
                 hrf_library,
                 tr=tr,
                 device=device,
-                microtime_resolution=microtime_resolution,
+                microtime_dt=microtime_dt,
                 microtime_onset=microtime_onset,
                 n_timepoints=n_timepoints,
                 **glm_kwargs,

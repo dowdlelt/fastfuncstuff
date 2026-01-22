@@ -124,8 +124,7 @@ def _normalize_hrf_to_unit_peak(hrf: np.ndarray) -> np.ndarray:
 
 
 def load_canonical_hrf_library(
-    tr: float,
-    microtime_resolution: int = 1,
+    microtime_dt: float = 0.1,
     hrf_duration: float = 32.0,
     stim_duration: float = 0.0,
     device: Optional[torch.device] = None,
@@ -134,45 +133,39 @@ def load_canonical_hrf_library(
     Load the pre-computed canonical HRF library from file.
 
     The library contains 20 HRFs with varying timing parameters (peak times
-    ranging from ~2.7s to ~5.7s). Each HRF is normalized to peak=1.0 at the
-    source resolution (0.1s), then resampled to the target resolution.
+    ranging from ~2.7s to ~5.7s). Each HRF is normalized to peak=1.0.
 
     Parameters
     ----------
-    tr : float
-        Repetition time in seconds
-    microtime_resolution : int, default=1
-        Sub-TR resolution. If > 1, HRFs are sampled at TR/microtime_resolution.
-        For convolution at microtime resolution, use the same value as in
-        the design matrix construction (typically 16).
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds. The native file resolution is 0.1s.
+        If microtime_dt == 0.1, no resampling is needed (preserves precision).
+        If different, HRFs are resampled via linear interpolation.
     hrf_duration : float, default=32.0
         Duration of HRF in seconds (truncates or zero-pads as needed)
     stim_duration : float, default=0.0
         Stimulus duration in seconds. If > 0, HRFs are convolved with a boxcar
-        of this duration before resampling. This creates HRFs appropriate for
-        block designs.
+        of this duration. This creates HRFs appropriate for block designs.
+        NOTE: Typically you want stim_duration=0 (impulse response) and handle
+        duration in the onset matrix instead.
     device : torch.device, optional
         Device for output tensor
 
     Returns
     -------
     hrf_library : torch.Tensor
-        Shape (n_hrfs, n_timepoints) where n_timepoints depends on resolution:
-        - microtime_resolution=1: n_timepoints = ceil(hrf_duration / tr)
-        - microtime_resolution>1: n_timepoints = ceil(hrf_duration / (tr/microtime_resolution))
+        Shape (n_hrfs, n_timepoints) where n_timepoints = ceil(hrf_duration / microtime_dt)
 
     Notes
     -----
     The HRF library file is at 0.1s resolution (501 timepoints = 50.1s).
     Each HRF is:
-    1. Optionally convolved with stimulus duration boxcar (at source resolution)
+    1. Optionally convolved with stimulus duration boxcar (at 0.1s resolution)
     2. Normalized to peak amplitude = 1.0
-    3. Resampled to the target temporal resolution
+    3. Resampled to microtime_dt if different from 0.1s
     4. Truncated to hrf_duration
 
-    The normalization happens at source resolution so that the high-resolution
-    version peaks at exactly 1.0. TR-sampled versions may not hit exactly 1.0
-    if the peak falls between TR samples, which is expected behavior.
+    For maximum precision, use microtime_dt=0.1 (the native resolution).
     """
     if device is None:
         device = get_device()
@@ -181,14 +174,11 @@ def load_canonical_hrf_library(
     raw_library = _load_hrf_from_file(_HRF_LIBRARY_FILE)
     n_file_timepoints, n_hrfs = raw_library.shape
 
-    # Target temporal resolution
-    target_dt = tr / microtime_resolution
-
     # Time vector at source resolution (for convolution)
     t_source = np.arange(n_file_timepoints) * _HRF_FILE_RESOLUTION
 
     # Process each HRF
-    hrfs_resampled = []
+    hrfs_processed = []
     for i in range(n_hrfs):
         hrf_raw = raw_library[:, i]
 
@@ -203,28 +193,31 @@ def load_canonical_hrf_library(
             hrf_raw = hrf_convolved
 
         # Normalize at source resolution (0.1s)
-        # This ensures microtime versions hit 1.0 at peak
         hrf_normalized = _normalize_hrf_to_unit_peak(hrf_raw)
 
-        # Then resample to target resolution
-        hrf_resampled = _resample_hrf(
-            hrf_normalized,
-            source_dt=_HRF_FILE_RESOLUTION,
-            target_dt=target_dt,
-            target_duration=hrf_duration,
-        )
+        # Resample only if target resolution differs from native 0.1s
+        if abs(microtime_dt - _HRF_FILE_RESOLUTION) > 1e-6:
+            hrf_final = _resample_hrf(
+                hrf_normalized,
+                source_dt=_HRF_FILE_RESOLUTION,
+                target_dt=microtime_dt,
+                target_duration=hrf_duration,
+            )
+        else:
+            # Native resolution - just truncate to duration
+            n_samples = int(np.ceil(hrf_duration / _HRF_FILE_RESOLUTION))
+            hrf_final = hrf_normalized[:n_samples]
 
-        hrfs_resampled.append(hrf_resampled)
+        hrfs_processed.append(hrf_final)
 
     # Stack into library (n_hrfs, n_timepoints)
-    hrf_library = np.stack(hrfs_resampled, axis=0)
+    hrf_library = np.stack(hrfs_processed, axis=0)
 
     return to_tensor(hrf_library, device=device, dtype=torch.float32)
 
 
 def load_canonical_hrf_basic(
-    tr: float,
-    microtime_resolution: int = 1,
+    microtime_dt: float = 0.1,
     hrf_duration: float = 32.0,
     stim_duration: float = 0.0,
     device: Optional[torch.device] = None,
@@ -232,33 +225,32 @@ def load_canonical_hrf_basic(
     """
     Load the single canonical (basic) HRF from file.
 
-    This is the standard SPM-style double-gamma HRF, used as a baseline
-    for comparison against the HRF library optimization.
+    This is the standard SPM-style double-gamma HRF (GLMsingle/nilearn style),
+    used as a baseline for comparison against HRF library optimization.
 
     Parameters
     ----------
-    tr : float
-        Repetition time in seconds
-    microtime_resolution : int, default=1
-        Sub-TR resolution. If > 1, HRF is sampled at TR/microtime_resolution.
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds. The native file resolution is 0.1s.
+        If microtime_dt == 0.1, no resampling is needed (preserves precision).
     hrf_duration : float, default=32.0
         Duration of HRF in seconds
     stim_duration : float, default=0.0
         Stimulus duration in seconds. If > 0, HRF is convolved with a boxcar
-        of this duration before resampling.
+        of this duration. NOTE: Typically use stim_duration=0 and handle
+        duration in the onset matrix instead.
     device : torch.device, optional
         Device for output tensor
 
     Returns
     -------
     hrf : torch.Tensor
-        Shape (n_timepoints,) normalized so peak=1.0 at source resolution.
+        Shape (n_timepoints,) where n_timepoints = ceil(hrf_duration / microtime_dt)
+        Normalized so peak=1.0.
 
     Notes
     -----
-    The normalization happens at source resolution (0.1s) so that the
-    high-resolution (microtime) version peaks at exactly 1.0. TR-sampled
-    versions may not hit exactly 1.0 if the peak falls between TR samples.
+    For maximum precision, use microtime_dt=0.1 (the native resolution).
     """
     if device is None:
         device = get_device()
@@ -275,21 +267,23 @@ def load_canonical_hrf_basic(
         boxcar[:stim_samples] = 1
         hrf_raw = np.convolve(hrf_raw, boxcar, mode="full")[:n_file_timepoints]
 
-    # Normalize at source resolution (0.1s) first
+    # Normalize at source resolution (0.1s)
     hrf_normalized = _normalize_hrf_to_unit_peak(hrf_raw)
 
-    # Target temporal resolution
-    target_dt = tr / microtime_resolution
+    # Resample only if target resolution differs from native 0.1s
+    if abs(microtime_dt - _HRF_FILE_RESOLUTION) > 1e-6:
+        hrf_final = _resample_hrf(
+            hrf_normalized,
+            source_dt=_HRF_FILE_RESOLUTION,
+            target_dt=microtime_dt,
+            target_duration=hrf_duration,
+        )
+    else:
+        # Native resolution - just truncate to duration
+        n_samples = int(np.ceil(hrf_duration / _HRF_FILE_RESOLUTION))
+        hrf_final = hrf_normalized[:n_samples]
 
-    # Resample to target resolution
-    hrf_resampled = _resample_hrf(
-        hrf_normalized,
-        source_dt=_HRF_FILE_RESOLUTION,
-        target_dt=target_dt,
-        target_duration=hrf_duration,
-    )
-
-    return to_tensor(hrf_resampled, device=device, dtype=torch.float32)
+    return to_tensor(hrf_final, device=device, dtype=torch.float32)
 
 
 def get_canonical_hrf(
@@ -356,6 +350,108 @@ def get_canonical_hrf(
     hrf_downsampled = hrf[sample_indices]
 
     return to_tensor(hrf_downsampled, device=device, dtype=torch.float32)
+
+
+def get_spmg1_hrf(
+    microtime_dt: float = 0.1,
+    stim_duration: float = 0.0,
+    hrf_duration: float = 32.0,
+    normalize_peak: bool = True,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Generate AFNI's SPMG1 canonical HRF.
+
+    This exactly matches AFNI's SPMG1 basis function:
+        h(t) = exp(-t) * (A1*t^P1 - A2*t^P2)
+    where:
+        A1 = 0.0083333333, P1 = 5  (main positive lobe, peak ~5s)
+        A2 = 1.274527e-13, P2 = 15 (undershoot, peak ~15s)
+
+    Parameters
+    ----------
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds. Default 0.1s matches the standard
+        microtime resolution used throughout the pipeline.
+    stim_duration : float, default=0.0
+        Stimulus duration in seconds. If > 0, HRF is convolved with a boxcar
+        of this duration (like AFNI's SPMG1(duration)). If 0, returns the
+        impulse response HRF. NOTE: Typically use stim_duration=0 and handle
+        duration in the onset matrix instead.
+    hrf_duration : float, default=32.0
+        Total duration of HRF in seconds
+    normalize_peak : bool, default=True
+        If True, normalize so peak absolute value = 1.0 (like AFNI's SPMG1(0)).
+        If False, return raw unnormalized HRF (AFNI's default SPMG1 without duration).
+    device : torch.device, optional
+        Device for output tensor
+
+    Returns
+    -------
+    hrf : torch.Tensor
+        Shape (n_timepoints,) where n_timepoints = ceil(hrf_duration / microtime_dt)
+
+    Notes
+    -----
+    AFNI documentation:
+    - SPMG1 = exp(-t)*(A1*t^P1-A2*t^P2) where
+      A1 = 0.0083333333  P1 = 5  (main positive lobe)
+      A2 = 1.274527e-13  P2 = 15 (undershoot part)
+    - SPMG1(duration) convolves with square wave and normalizes to peak=1
+    - SPMG1(0) produces usual shape but normalized to peak=1
+
+    The function starts at t=0 with h(0)=0 and rises to peak around t=5s.
+    This ensures causal convolution: the response begins at stimulus onset.
+    """
+    if device is None:
+        device = get_device()
+
+    # AFNI SPMG1 parameters (exact values from AFNI source)
+    A1 = 0.0083333333  # = 1/120
+    P1 = 5
+    A2 = 1.274527e-13
+    P2 = 15
+
+    # Generate at high resolution (0.01s) for accurate computation, then resample
+    # This ensures precision even if microtime_dt is coarser
+    compute_dt = min(0.01, microtime_dt)  # At least as fine as target
+    t_highres = np.arange(0, hrf_duration + compute_dt, compute_dt)
+
+    # AFNI SPMG1 formula: exp(-t) * (A1*t^P1 - A2*t^P2)
+    # Note: t=0 gives 0, which is correct (HRF starts at 0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        hrf_highres = np.exp(-t_highres) * (A1 * np.power(t_highres, P1) - A2 * np.power(t_highres, P2))
+    hrf_highres[0] = 0  # Ensure h(0) = 0
+
+    # Convolve with stimulus duration if specified
+    if stim_duration > 0:
+        # Create boxcar at compute resolution
+        stim_samples = max(1, int(stim_duration / compute_dt))
+        boxcar = np.ones(stim_samples)
+        # Convolve (this extends the signal, then truncate)
+        hrf_convolved = np.convolve(hrf_highres, boxcar, mode='full')
+        # Scale by dt to get proper integral (like AFNI does)
+        hrf_convolved = hrf_convolved * compute_dt
+        # Truncate to original duration
+        hrf_highres = hrf_convolved[:len(t_highres)]
+
+    # Normalize to peak = 1.0 if requested
+    if normalize_peak:
+        peak_val = np.max(np.abs(hrf_highres))
+        if peak_val > 0:
+            hrf_highres = hrf_highres / peak_val
+
+    # Resample to target microtime_dt if different from compute resolution
+    if abs(microtime_dt - compute_dt) > 1e-6:
+        n_target = int(np.ceil(hrf_duration / microtime_dt))
+        target_times = np.arange(n_target) * microtime_dt
+        target_times_clipped = np.clip(target_times, 0, t_highres[-1])
+        interpolator = interp1d(t_highres, hrf_highres, kind='linear', fill_value=0, bounds_error=False)
+        hrf_final = interpolator(target_times_clipped)
+    else:
+        hrf_final = hrf_highres
+
+    return to_tensor(hrf_final, device=device, dtype=torch.float32)
 
 
 def get_canonical_hrf_library(
@@ -535,9 +631,7 @@ def create_pighs_library(
     recovery_time_range: Tuple[float, float] = (3, 12),
     undershoot_range: Tuple[float, float] = (0, 0.35),
     duration: float = 32.0,
-    sample_rate: float = 0.05,
-    tr: float = 1.0,
-    microtime_resolution: int = 1,
+    microtime_dt: float = 0.1,
     stim_duration: float = 0.0,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, Dict]:
@@ -565,14 +659,9 @@ def create_pighs_library(
         (min, max) for undershoot magnitude as fraction of peak
     duration : float
         HRF duration in seconds
-    sample_rate : float
-        High-resolution sampling rate for generation
-    tr : float
-        TR for downsampling
-    microtime_resolution : int, default=1
-        Sub-TR resolution for output:
-        - 1: HRFs sampled at TR
-        - >1: HRFs sampled at TR/microtime_resolution
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds. Default 0.1s matches the native resolution
+        used throughout the pipeline for maximum precision.
     stim_duration : float
         Stimulus duration to convolve with (0 = impulse response)
     device : torch.device, optional
@@ -581,12 +670,15 @@ def create_pighs_library(
     Returns
     -------
     hrf_library : torch.Tensor
-        (n_hrfs, n_timepoints) library of HRFs at target resolution
+        (n_hrfs, n_timepoints) library of HRFs at microtime_dt resolution
     params : dict
         Dictionary of parameters used for each HRF
     """
     if device is None:
         device = get_device()
+
+    # High-resolution generation (0.01s for smooth half-cosines)
+    gen_dt = 0.01
 
     # Stratified sampling strategy:
     # 1. Grid sampling for peak_time (most important - guarantees coverage)
@@ -629,7 +721,7 @@ def create_pighs_library(
     )
 
     # Generate HRFs at high resolution
-    t_highres = np.arange(0, duration, sample_rate)
+    t_highres = np.arange(0, duration, gen_dt)
     hrfs_highres = []
 
     for i in range(n_hrfs):
@@ -640,7 +732,7 @@ def create_pighs_library(
             m4_vals[i],
             c2_vals[i],
             duration,
-            sample_rate,
+            gen_dt,
             device="cpu",
         )
         hrfs_highres.append(hrf.numpy())
@@ -649,8 +741,8 @@ def create_pighs_library(
 
     # Convolve with stimulus if needed
     if stim_duration > 0:
-        boxcar = np.zeros(int(30 / sample_rate))  # 30s window
-        boxcar[: int(stim_duration / sample_rate)] = 1
+        boxcar = np.zeros(int(30 / gen_dt))  # 30s window
+        boxcar[: int(stim_duration / gen_dt)] = 1
 
         hrfs_convolved = np.zeros_like(hrfs_highres)
         for i in range(n_hrfs):
@@ -662,23 +754,23 @@ def create_pighs_library(
 
         hrfs_highres = hrfs_convolved
 
-    # Normalize at high resolution before downsampling
+    # Normalize at high resolution before resampling
     for i in range(n_hrfs):
         peak = np.max(hrfs_highres[i])
         if peak > 0:
             hrfs_highres[i] = hrfs_highres[i] / peak
 
-    # Downsample to target resolution (TR / microtime_resolution)
-    target_dt = tr / microtime_resolution
-    downsample_factor = int(target_dt / sample_rate)
-    if downsample_factor < 1:
-        downsample_factor = 1
-    hrfs_resampled = hrfs_highres[:, ::downsample_factor]
+    # Resample to target microtime_dt resolution
+    n_target = int(np.ceil(duration / microtime_dt))
+    target_times = np.arange(n_target) * microtime_dt
+    source_times = np.arange(len(t_highres)) * gen_dt
 
-    # Truncate to match expected length: ceil(duration / target_dt)
-    expected_len = int(np.ceil(duration / target_dt))
-    if hrfs_resampled.shape[1] > expected_len:
-        hrfs_resampled = hrfs_resampled[:, :expected_len]
+    hrfs_resampled = np.zeros((n_hrfs, n_target))
+    for i in range(n_hrfs):
+        interpolator = interp1d(
+            source_times, hrfs_highres[i], kind="linear", fill_value=0, bounds_error=False
+        )
+        hrfs_resampled[i] = interpolator(np.clip(target_times, 0, source_times[-1]))
 
     hrf_library = to_tensor(hrfs_resampled, device=device, dtype=torch.float32)
 
@@ -720,9 +812,8 @@ def create_flobs_library(
 def get_hrf_library(
     mode: str = "library",
     stim_duration: float = 0.0,
-    tr: float = 1.0,
+    microtime_dt: float = 0.1,
     n_hrfs: int = 20,
-    microtime_resolution: int = 1,
     hrf_duration: float = 32.0,
     device: Optional[torch.device] = None,
     **kwargs,
@@ -731,24 +822,26 @@ def get_hrf_library(
     Get HRF library for GLM fitting.
 
     For 'library' and 'single' modes, HRFs are loaded from pre-computed
-    TSV files, normalized to peak=1.0, and resampled to the target resolution.
+    TSV files, normalized to peak=1.0. For 'spmg1', the AFNI SPMG1 formula
+    is used. All HRFs are returned at the specified microtime resolution.
 
     Parameters
     ----------
     mode : str
-        'library' - Load 20-HRF library from file (recommended for HRF optimization)
-        'pighs' - Generate PIGHS (Parametric Individually Generated HRFs) programmatically
-        'single' - Load single canonical HRF from file (baseline comparison)
-    stim_duration : float
-        Stimulus duration in seconds (used for PIGHS mode only)
-    tr : float
-        TR in seconds
-    n_hrfs : int
+        HRF source selection:
+        - 'library' - Load 20-HRF library from file (recommended for HRF optimization)
+        - 'pighs' - Generate PIGHS (Parametric Individually Generated HRFs)
+        - 'single' or 'glmsingle' - Load single canonical HRF from file (GLMsingle-style)
+        - 'spmg1' - Generate AFNI's SPMG1 canonical HRF
+    stim_duration : float, default=0.0
+        Stimulus duration in seconds. If > 0, HRF is convolved with a boxcar.
+        NOTE: Typically use stim_duration=0 (impulse response) and encode
+        duration in the onset matrix instead.
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds. Default 0.1s is the native resolution
+        of the HRF library files, avoiding any resampling for maximum precision.
+    n_hrfs : int, default=20
         Number of HRFs (only used for 'pighs' mode; library always returns 20)
-    microtime_resolution : int, default=1
-        Sub-TR resolution for HRF sampling:
-        - 1: HRFs sampled at TR (for TR-resolution convolution)
-        - >1: HRFs sampled at TR/microtime_resolution (for microtime convolution)
     hrf_duration : float, default=32.0
         Duration of HRF in seconds
     device : torch.device, optional
@@ -762,47 +855,58 @@ def get_hrf_library(
         Shape depends on mode:
         - 'library': (20, n_timepoints)
         - 'pighs': (n_hrfs, n_timepoints)
-        - 'single': (n_timepoints,)
+        - 'single', 'glmsingle', 'spmg1': (n_timepoints,)
 
-        Where n_timepoints = ceil(hrf_duration / (tr / microtime_resolution))
+        Where n_timepoints = ceil(hrf_duration / microtime_dt)
 
     Notes
     -----
     HRFs are normalized so that a single standalone event produces a response
     with peak amplitude = 1.0. When multiple events are convolved and summed,
     the response can exceed 1.0.
+
+    For maximum precision, use microtime_dt=0.1 (the native resolution of the
+    library files). This avoids any resampling.
     """
     if device is None:
         device = get_device()
 
-    if mode == "single":
-        # Load basic canonical HRF from file
+    mode_lower = mode.lower()
+
+    if mode_lower in ("single", "glmsingle"):
+        # Load basic canonical HRF from file (GLMsingle/nilearn-style)
         return load_canonical_hrf_basic(
-            tr=tr,
-            microtime_resolution=microtime_resolution,
+            microtime_dt=microtime_dt,
             hrf_duration=hrf_duration,
             stim_duration=stim_duration,
             device=device,
         )
 
-    elif mode in ("library", "canonical"):
+    elif mode_lower == "spmg1":
+        # Generate AFNI's SPMG1 canonical HRF
+        return get_spmg1_hrf(
+            microtime_dt=microtime_dt,
+            hrf_duration=hrf_duration,
+            stim_duration=stim_duration,
+            normalize_peak=True,
+            device=device,
+        )
+
+    elif mode_lower in ("library", "canonical"):
         # Load 20-HRF library from file
-        # Note: 'canonical' is kept for backwards compatibility but 'library' is preferred
         return load_canonical_hrf_library(
-            tr=tr,
-            microtime_resolution=microtime_resolution,
+            microtime_dt=microtime_dt,
             hrf_duration=hrf_duration,
             stim_duration=stim_duration,
             device=device,
         )
 
-    elif mode in ("pighs", "flobs"):
+    elif mode_lower in ("pighs", "flobs"):
         # Generate PIGHS HRFs programmatically
-        # Note: 'flobs' is kept for backwards compatibility but 'pighs' is preferred
+        # Note: PIGHS needs to be updated to use microtime_dt
         library, _ = create_pighs_library(
             n_hrfs=n_hrfs,
-            tr=tr,
-            microtime_resolution=microtime_resolution,
+            microtime_dt=microtime_dt,
             stim_duration=stim_duration,
             duration=hrf_duration,
             device=device,
@@ -812,5 +916,5 @@ def get_hrf_library(
 
     else:
         raise ValueError(
-            f"Unknown mode: {mode}. Choose 'library', 'pighs', or 'single'"
+            f"Unknown mode: {mode}. Choose 'library', 'pighs', 'single', 'glmsingle', or 'spmg1'"
         )

@@ -92,28 +92,27 @@ def test_hrf_library_creation():
     # Use lenient check - all should have reasonable positive values
     assert torch.all(lib_library.max(dim=1)[0] > 0.5), "HRFs should have positive peaks"
 
-    # Test at microtime resolution - peaks should be closer to 1.0
+    # Test at microtime resolution (native 0.1s) - peaks should be close to 1.0
     lib_microtime = get_hrf_library(
         mode="library",
         stim_duration=stim_duration,
-        tr=tr,
+        microtime_dt=0.1,  # Native resolution
         n_hrfs=n_hrfs,
-        microtime_resolution=16,
     )
-    # At higher resolution, peaks should be very close to 1.0
+    # At native resolution, peaks should be very close to 1.0
     assert torch.all(lib_microtime.max(dim=1)[0] > 0.95), (
         "Microtime HRFs should peak near 1.0"
     )
 
     # Test PIGHS library - respects n_hrfs (tests backwards compatibility with 'flobs' mode too)
     lib_pighs = get_hrf_library(
-        mode="pighs", stim_duration=stim_duration, tr=tr, n_hrfs=n_hrfs
+        mode="pighs", stim_duration=stim_duration, microtime_dt=0.1, n_hrfs=n_hrfs
     )
     assert lib_pighs.shape[0] == n_hrfs
 
     # Also test that 'flobs' mode still works for backwards compatibility
     lib_flobs = get_hrf_library(
-        mode="flobs", stim_duration=stim_duration, tr=tr, n_hrfs=n_hrfs
+        mode="flobs", stim_duration=stim_duration, microtime_dt=0.1, n_hrfs=n_hrfs
     )
     assert lib_flobs.shape[0] == n_hrfs
 

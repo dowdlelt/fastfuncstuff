@@ -63,7 +63,7 @@ def create_onset_matrix_microtime(
     run_starts: List[int],
     tr: float,
     n_timepoints: int,
-    microtime_resolution: int,
+    microtime_dt: float,
     stim_durations: List[float],
     device: torch.device,
 ) -> torch.Tensor:
@@ -75,13 +75,13 @@ def create_onset_matrix_microtime(
     all_onsets : list of list of np.ndarray
         Onsets organized as [condition][run] -> np.ndarray of onset times
     run_starts : list of int
-        Starting timepoint for each run
+        Starting timepoint for each run (in TRs)
     tr : float
         Repetition time in seconds
     n_timepoints : int
         Total number of TR timepoints
-    microtime_resolution : int
-        Sub-TR resolution (e.g., 16 = 16 bins per TR)
+    microtime_dt : float
+        Microtime resolution in seconds (e.g., 0.1 = 100ms resolution)
     stim_durations : list of float
         Duration in seconds for each condition
     device : torch.device
@@ -90,9 +90,10 @@ def create_onset_matrix_microtime(
     Returns
     -------
     onset_matrix : torch.Tensor
-        (n_microtime, n_conditions) binary matrix
+        (n_microtime, n_conditions) matrix with boxcar values
     """
-    n_microtime = n_timepoints * microtime_resolution
+    bins_per_tr = int(round(tr / microtime_dt))
+    n_microtime = n_timepoints * bins_per_tr
     n_conditions = len(all_onsets)
     n_runs = len(run_starts)
 
@@ -108,9 +109,6 @@ def create_onset_matrix_microtime(
     onset_matrix = torch.zeros(
         (n_microtime, n_conditions), dtype=torch.float32, device=device
     )
-
-    # Microtime bin size
-    microtime_dt = tr / microtime_resolution
 
     for cond_idx in range(n_conditions):
         duration = stim_durations[cond_idx]
@@ -422,10 +420,11 @@ Notes:
         ),
     )
     proc_opts.add_argument(
-        "-microtime_resolution",
-        type=int,
-        default=20,
-        help="Sub-TR resolution for onset timing (default: 20)",
+        "-microtime_dt",
+        type=float,
+        default=0.1,
+        help="Microtime resolution in seconds (default: 0.1). "
+        "Onsets and HRFs are represented at this resolution for precise timing.",
     )
     proc_opts.add_argument(
         "-do_scale",
@@ -442,6 +441,16 @@ Notes:
         help="Apply 3D Gaussian spatial smoothing with FWHM in mm. "
         "Smoothing is applied BEFORE masking to avoid edge effects. "
         "Typical values: 4-8 mm. Uses separable convolutions for speed.",
+    )
+    proc_opts.add_argument(
+        "-canonical",
+        type=str,
+        default="spmg1",
+        metavar="MODE",
+        help="Canonical HRF for baseline comparison. Options: "
+        "'spmg1' or 'SPMG1' (AFNI's SPMG1, default), "
+        "'glmsingle' (GLMsingle/nilearn-style double-gamma). "
+        "The baseline comparison shows improvement from HRF optimization.",
     )
     proc_opts.add_argument(
         "-device",
@@ -551,7 +560,8 @@ def print_summary(
     print(f"  HRF mode: {args.hrf_mode}")
     print(f"  HRF candidates: {args.n_hrfs}")
     print(f"  CV strategy: {args.cv_strategy}")
-    print(f"  Microtime resolution: {args.microtime_resolution}x")
+    bins_per_tr = int(round(args.tr / args.microtime_dt))
+    print(f"  Microtime: dt={args.microtime_dt}s ({bins_per_tr} bins/TR)")
     print()
     print(f"  Output prefix: {args.prefix}")
     print("=" * 70)
@@ -813,13 +823,13 @@ def main():
             print(f"  {condition_labels[i]}: {n_events} events across {n_runs} runs")
 
     # Build microtime onset matrix
-    # This creates a (n_microtime, n_conditions) binary matrix
+    # This creates a (n_microtime, n_conditions) matrix with boxcar values
     onset_matrix = create_onset_matrix_microtime(
         all_onsets,
         run_starts,
         args.tr,
         n_timepoints,
-        args.microtime_resolution,
+        args.microtime_dt,
         stim_durations=durations,
         device=device,
     )
@@ -850,7 +860,7 @@ def main():
     hrf_library = get_hrf_library(
         mode=args.hrf_mode,
         stim_duration=0.0,  # Impulse response - duration handled in design matrix
-        tr=args.tr,
+        microtime_dt=args.microtime_dt,
         n_hrfs=args.n_hrfs,
         device=device,
         **pighs_kwargs,
@@ -858,7 +868,7 @@ def main():
 
     print(f"  HRF library shape: {hrf_library.shape}")
     print(
-        f"  HRF length: {hrf_library.shape[1]} TRs ({hrf_library.shape[1] * args.tr}s)"
+        f"  HRF length: {hrf_library.shape[1]} samples ({hrf_library.shape[1] * args.microtime_dt}s)"
     )
 
     # ==========================================================================
@@ -885,9 +895,10 @@ def main():
         cv_strategy=cv_strategy,
         n_perms=args.n_perms,
         metric=args.metric,
-        microtime_resolution=args.microtime_resolution,
+        microtime_dt=args.microtime_dt,
         polort=args.polort,
         ortvec_files=ortvec_files,
+        canonical_mode=args.canonical,
         device=device,
         verbose=args.verbose,
         chunk_size=args.batch_size,
@@ -895,6 +906,7 @@ def main():
 
     # Update metadata with CLI parameters
     results.hrf_metadata["hrf_mode"] = args.hrf_mode
+    results.hrf_metadata["canonical_mode"] = args.canonical
     results.hrf_metadata["condition_labels"] = condition_labels
     results.hrf_metadata["input_files"] = input_files
     results.hrf_metadata["onset_files"] = onset_files

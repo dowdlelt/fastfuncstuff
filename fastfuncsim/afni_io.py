@@ -136,10 +136,10 @@ def onsets_to_binary_matrix(
     tr: float,
     run_starts: Optional[List[int]] = None,
     device: Optional[torch.device] = None,
-    microtime_resolution: int = 1,
+    microtime_dt: float = 0.1,
 ) -> torch.Tensor:
     """
-    Convert AFNI onset times to binary onset matrix
+    Convert AFNI onset times to binary onset matrix at microtime resolution.
 
     Parameters
     ----------
@@ -155,38 +155,30 @@ def onsets_to_binary_matrix(
         Example: [0, 300, 600, 900] for 4 runs of 300 TRs each
     device : torch.device, optional
         Device for output tensor
-    microtime_resolution : int, default=1
-        Number of time bins per TR for sub-TR precision.
-        - 1 (default): TR-locked onsets (traditional behavior)
-        - 16: SPM default, 16 bins per TR for precise onset timing
-        - Higher values give more temporal precision at cost of memory
-        When > 1, output matrix has shape (n_timepoints * microtime_resolution, n_conditions)
+    microtime_dt : float, default=0.1
+        Microtime resolution in seconds. Default 0.1s is the standard throughout
+        the pipeline. Output matrix has shape (n_microtime_points, n_conditions)
+        where n_microtime_points = n_timepoints * (tr / microtime_dt).
 
     Returns
     -------
     onset_matrix : torch.Tensor
-        Binary onset matrix. Shape depends on microtime_resolution:
-        - If microtime_resolution=1: (n_timepoints, n_conditions)
-        - If microtime_resolution>1: (n_timepoints * microtime_resolution, n_conditions)
+        Binary onset matrix at microtime_dt resolution.
+        Shape: (n_microtime_points, n_conditions)
 
     Examples
     --------
     >>> files = ['onsets_cond1.txt', 'onsets_cond2.txt']
     >>> onsets = read_afni_onset_files(files)
-    >>> # TR-locked onsets (traditional)
+    >>> # Standard 0.1s microtime resolution
     >>> onset_mat = onsets_to_binary_matrix(onsets, n_timepoints=200, tr=2.0)
-    >>> # Sub-TR precision with 16x resolution
-    >>> onset_mat = onsets_to_binary_matrix(onsets, n_timepoints=200, tr=2.0,
-    ...                                     microtime_resolution=16)
-    >>> onset_mat.shape  # (3200, n_conditions)
+    >>> onset_mat.shape  # (4000, n_conditions) for TR=2s, dt=0.1s
     """
     if device is None:
         device = get_device()
 
-    if microtime_resolution < 1:
-        raise ValueError(
-            f"microtime_resolution must be >= 1, got {microtime_resolution}"
-        )
+    if microtime_dt <= 0:
+        raise ValueError(f"microtime_dt must be > 0, got {microtime_dt}")
 
     n_conditions = len(onsets_per_condition)
     n_runs = len(onsets_per_condition[0])
@@ -198,9 +190,9 @@ def onsets_to_binary_matrix(
                 f"Condition {cond_idx} has {len(cond_onsets)} runs, expected {n_runs}"
             )
 
-    # Calculate effective temporal resolution
-    effective_tr = tr / microtime_resolution
-    n_microtime_points = n_timepoints * microtime_resolution
+    # Calculate bins per TR and total microtime points
+    bins_per_tr = int(round(tr / microtime_dt))
+    n_microtime_points = n_timepoints * bins_per_tr
 
     # Create binary onset matrix at microtime resolution
     onset_matrix = np.zeros((n_microtime_points, n_conditions))
@@ -212,7 +204,7 @@ def onsets_to_binary_matrix(
             raise ValueError(
                 f"run_starts has {len(run_starts)} entries, but data has {n_runs} runs"
             )
-        timepoint_offsets = [rs * microtime_resolution for rs in run_starts]
+        timepoint_offsets = [rs * bins_per_tr for rs in run_starts]
     else:
         # Assume equal-length runs
         microtime_per_run = n_microtime_points // n_runs
@@ -225,7 +217,7 @@ def onsets_to_binary_matrix(
 
             for onset_time in run_onsets:
                 # Convert onset time to microtime bin (precise placement)
-                microtime_bin = int(np.round(onset_time / effective_tr))
+                microtime_bin = int(np.round(onset_time / microtime_dt))
                 global_microtime = timepoint_offset + microtime_bin
 
                 if 0 <= global_microtime < n_microtime_points:
