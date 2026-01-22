@@ -307,7 +307,7 @@ def fit_glm_with_noise_pcs(
         combined_nuisance = torch.cat([combined_nuisance, pc_nuisance], dim=1)
     
     # Fit GLM
-    results = fit_glm_torch(
+    results = fit_glm(
         data=data,
         design=design_matrix,
         nuisance=combined_nuisance if combined_nuisance.shape[1] > 0 else None,
@@ -436,7 +436,7 @@ def cross_validate_noise_pcs(
             # Train on denoised data
             if n_pcs == 0:
                 # No denoising - just fit GLM
-                train_results = fit_glm_torch(
+                train_results = fit_glm(
                     data=data_train,
                     design=design_train,
                     nuisance=nuisance_train,

@@ -45,15 +45,15 @@ try:
         load_afni_mask,
         load_and_concatenate_runs,
     )
-    from fastfuncsim.design_builder import (
-        parse_afni_timing_file,
-        create_design_matrix_from_onsets,
-    )
+    from fastfuncsim.design_builder import parse_afni_timing_file
     from fastfuncsim.denoise import (
         fit_denoising_model,
         DenoiseResults,
     )
-    from fastfuncsim.glm_core import fit_glm
+    from fastfuncsim.glm_core import fit_glm, make_polynomial_regressors
+    from fastfuncsim.design import convolve_hrf_microtime
+    from fastfuncsim.hrf import get_canonical_hrf
+    from fastfuncsim.afni_io import read_ortvec_file
     from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -599,11 +599,11 @@ def main():
 
     if args.keep_on_cpu:
         keep_on_cpu = True
-        print(f"\n  Loading to CPU (user-specified)")
+        print("\n  Loading to CPU (user-specified)")
     elif device.type == "cuda" and data_size_gb > gpu_memory_threshold_gb:
         keep_on_cpu = True
         print(f"\n  ⚠️  Large dataset ({data_size_gb:.2f} GB)")
-        print(f"     Loading to CPU and processing in GPU chunks")
+        print("     Loading to CPU and processing in GPU chunks")
     else:
         keep_on_cpu = False
 
@@ -708,22 +708,67 @@ def main():
             sys.exit(1)
         all_onsets.append(onsets_by_run)
 
-    # Build design matrix
-    design_result = create_design_matrix_from_onsets(
-        onsets=all_onsets,
-        stim_durations=durations,
-        tr=args.tr,
-        n_timepoints=n_timepoints,
-        run_starts=run_starts,
-        polort=args.polort,
-        ortvec_files=[(f, label) for f, label in args.ortvec] if args.ortvec else None,
-        canonical_mode=args.canonical,
-        microtime_dt=args.microtime_dt,
-        device=device,
+    # Build onset matrix at microtime resolution
+    bins_per_tr = int(np.round(args.tr / args.microtime_dt))
+    n_microtime = n_timepoints * bins_per_tr
+    onset_matrix_micro = torch.zeros((n_microtime, n_conditions), device=device)
+    
+    for cond_idx in range(n_conditions):
+        duration_bins = max(1, int(np.round(durations[cond_idx] / args.microtime_dt)))
+        
+        for run_idx in range(n_runs):
+            onsets = all_onsets[cond_idx][run_idx]
+            run_start_tr = run_starts[run_idx]
+            run_start_micro = run_start_tr * bins_per_tr
+            
+            for onset_time in onsets:
+                onset_bin = run_start_micro + int(np.round(onset_time / args.microtime_dt))
+                if onset_bin < n_microtime:
+                    onset_matrix_micro[onset_bin:min(onset_bin + duration_bins, n_microtime), cond_idx] = 1.0
+    
+    # Get canonical HRF
+    hrf = get_canonical_hrf(mode=args.canonical, tr=args.tr, microtime_dt=args.microtime_dt, device=device)
+    
+    # Convolve and downsample to TR resolution
+    task_design = convolve_hrf_microtime(
+        onset_matrix_micro, hrf, bins_per_tr=bins_per_tr, device=device
     )
-
-    task_design = design_result['stimulus']
-    nuisance = design_result['nuisance']
+    
+    # Build polynomial nuisance regressors
+    poly_list = []
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_length = end_tp - start_tp
+        
+        # Auto-determine polort if not specified
+        if args.polort is None:
+            run_duration = run_length * args.tr
+            polort = int(np.floor(1 + run_duration / 150.0))
+        else:
+            polort = args.polort
+        
+        if polort >= 0:
+            poly = make_polynomial_regressors(run_length, polort, device=device)
+            # Pad with zeros for other runs
+            poly_padded = torch.zeros((n_timepoints, poly.shape[1]), device=device)
+            poly_padded[start_tp:end_tp, :] = poly
+            poly_list.append(poly_padded)
+    
+    # Concatenate polynomial regressors
+    if poly_list:
+        nuisance = torch.cat(poly_list, dim=1)
+    else:
+        nuisance = torch.zeros((n_timepoints, 0), device=device)
+    
+    # Add ortvec files if provided
+    if args.ortvec:
+        for ortvec_file, label in args.ortvec:
+            ortvec_data = read_ortvec_file(ortvec_file, device=device)
+            if ortvec_data.shape[0] != n_timepoints:
+                print(f"ERROR: ortvec file {ortvec_file} has {ortvec_data.shape[0]} rows, expected {n_timepoints}")
+                sys.exit(1)
+            nuisance = torch.cat([nuisance, ortvec_data], dim=1)
 
     print(f"  Task predictors: {task_design.shape[1]}")
     print(f"  Nuisance predictors: {nuisance.shape[1]}")
