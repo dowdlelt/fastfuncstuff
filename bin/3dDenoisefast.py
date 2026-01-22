@@ -53,7 +53,7 @@ try:
     from fastfuncsim.glm_core import fit_glm, construct_polynomial_matrix
     from fastfuncsim.design import convolve_hrf_microtime
     from fastfuncsim.hrf import get_canonical_hrf
-    from fastfuncsim.afni_io import read_ortvec_file
+    from fastfuncsim.hrf_selection import load_nuisance_file
     from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -764,9 +764,12 @@ def main():
                         cond_idx,
                     ] = 1.0
 
-    # Get canonical HRF
+    # Get canonical HRF at microtime resolution
     hrf = get_canonical_hrf(
-        mode=args.canonical, tr=args.tr, microtime_dt=args.microtime_dt, device=device
+        stim_duration=0.0,  # Impulse response (duration handled in onset matrix)
+        tr=args.microtime_dt,  # Sample at microtime resolution
+        duration=32.0,
+        device=device,
     )
 
     # Convolve and downsample to TR resolution
@@ -804,7 +807,7 @@ def main():
     # Add ortvec files if provided
     if args.ortvec:
         for ortvec_file, label in args.ortvec:
-            ortvec_data = read_ortvec_file(ortvec_file, device=device)
+            ortvec_data = load_nuisance_file(ortvec_file)
             if ortvec_data.shape[0] != n_timepoints:
                 print(
                     f"ERROR: ortvec file {ortvec_file} has {ortvec_data.shape[0]} rows, expected {n_timepoints}"
