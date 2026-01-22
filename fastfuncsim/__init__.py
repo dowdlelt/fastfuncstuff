@@ -60,6 +60,15 @@ from .arma_glm import (
     save_arma_rvar,
 )
 
+# Cross-validated denoising
+from .denoise import (
+    DenoiseResults,
+    cross_validate_noise_pcs,
+    extract_noise_pcs_per_run,
+    fit_denoising_model,
+    select_noise_pool_voxels,
+)
+
 # Design matrix construction
 from .design import (
     build_glm_design,
