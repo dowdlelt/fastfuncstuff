@@ -718,6 +718,18 @@ def main():
     # ==========================================================================
     # Build design matrix
     # ==========================================================================
+    
+    # Design matrix structure:
+    # - TASK regressors: Shared across all runs (e.g., ring_01, ring_02, ...)
+    #   Shape: (n_total_timepoints, n_task_predictors)
+    #   No padding needed - same columns used by all runs
+    #
+    # - NUISANCE regressors: Run-specific (polynomial drift per run)
+    #   Stored as list: nuisance_per_run[i] = (n_timepoints_run_i, n_nuisance_cols)
+    #   Column padding needed: All runs padded to max # of nuisance columns
+    #   
+    # Total model: Y = X_task @ beta_task + X_nuisance @ beta_nuisance + error
+    # Columns: n_task (shared) + n_nuisance_padded (run-specific, column-padded)
 
     print()
     print("Building design matrix...")
@@ -773,9 +785,12 @@ def main():
     )    
     # Type assertion for pyright (return_single_trials=False returns Tensor, not tuple)
     assert isinstance(task_design, torch.Tensor), "task_design should be Tensor when return_single_trials=False"
-    # Build polynomial nuisance regressors PER RUN (cleaner for CV)
-    # Each run may have different polort (different duration) → different # of columns
-    # For CV to work, we need all runs to have SAME # of columns
+    # Build polynomial nuisance regressors PER RUN
+    # -------------------------------------------
+    # CRITICAL: Nuisance regressors are RUN-SPECIFIC (each run has its own drift)
+    # Different runs can have different # of columns (different polort based on duration)
+    # We'll pad all to max # columns so they can be concatenated during CV
+    
     nuisance_per_run = []
     max_nuisance_cols = 0  # Track max columns across all runs
     
@@ -823,17 +838,25 @@ def main():
                 ortvec_run = ortvec_concat[start_tp:end_tp, :]
                 nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], ortvec_run], dim=1)
             
-            max_nuisance_cols = nuisance_per_run[0].shape[1]  # All now have same # after ortvec
-
-    # Pad all runs to have same number of columns (for CV concatenation compatibility)
-    # Some runs may have fewer polynomial columns than others
+      -------------------------------------------
+    # PADDING STRUCTURE:
+    # - Task columns: NO padding (shared across runs)
+    # - Nuisance columns: YES padding (run-specific, must match for concatenation)
+    # 
+    # Example: Run 0 has 3 poly cols, Run 1 has 4 poly cols → pad Run 0 to 4
+    # This allows clean concatenation during CV: concat([run1_nuisance, run2_nuisance])
+    
     for run_idx in range(n_runs):
         n_cols = nuisance_per_run[run_idx].shape[1]
         if n_cols < max_nuisance_cols:
-            # Pad with zeros on the right
+            # Pad with zeros on the right (extra polynomial terms this run doesn't need)
             padding = torch.zeros((nuisance_per_run[run_idx].shape[0], max_nuisance_cols - n_cols), device=device)
             nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], padding], dim=1)
 
+    # Summary
+    print(f"  Task predictors: {task_design.shape[1]} (shared across all runs)")
+    print(f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]} (run-specific, column-padded)")
+    print(f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}
     # Count total predictors for display
     print(f"  Task predictors: {task_design.shape[1]}")
     print(f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]} (column-padded for CV)")

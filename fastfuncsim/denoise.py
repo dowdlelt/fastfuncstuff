@@ -391,12 +391,27 @@ def cross_validate_noise_pcs(
     - Testing: Predict held-out run WITHOUT denoising (raw data)
     - This ensures we're improving signal recovery, not just fitting denoising
 
+    Design Matrix Structure:
+    ------------------------
+    Task regressors (design_matrix): 
+      - Shared across all runs (e.g., condition onsets)
+      - Shape: (n_total_timepoints, n_task_predictors)
+      - No padding needed
+      
+    Nuisance regressors (nuisance):
+      - Run-specific (e.g., polynomial drift per run)
+      - Provided as list: nuisance[i] = (n_timepoints_run_i, n_nuisance_cols)
+      - All runs must have SAME # of columns (column-padded by caller)
+      - During CV: concatenate only training runs along timepoint dimension
+      
+    Total model columns: n_task + n_nuisance_padded
+
     Parameters
     ----------
     data : torch.Tensor, shape (n_voxels, n_timepoints)
         Raw fMRI data (never denoised for testing)
     design_matrix : torch.Tensor, shape (n_timepoints, n_predictors)
-        Task design matrix
+        Task design matrix (shared across runs)
     noise_pcs : list of torch.Tensor
         PC timecourses per run from noise pool
     run_starts : list of int
