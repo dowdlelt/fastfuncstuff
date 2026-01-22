@@ -19,18 +19,18 @@ The implementation is carefully designed to handle large datasets efficiently:
    - But noise pool is typically 10-50% of brain voxels (subset of full data)
    - Extracts lightweight PC timecourses (n_timepoints x n_components)
    - PCs are cached and reused throughout cross-validation
-   
+
 2. **GLM Fitting** (fit_glm):
    - Supports automatic voxel chunking via chunk_size parameter
    - Passes chunk_size through entire stack: fit_denoising_model → cross_validate_noise_pcs → fit_glm_with_noise_pcs → fit_glm
    - For 16GB GPU: chunk_size=None (auto-detect) works for most datasets
    - For larger datasets: explicit chunk_size or keep_on_cpu=True
-   
+
 3. **Cross-Validation**:
    - Splits data into train/test per fold (temporal split, not voxel)
    - Each GLM fit respects chunking strategy
    - PCs are pre-cached, so no redundant extraction
-   
+
 4. **Recommended Usage**:
    - 16GB GPU: Default settings (chunk_size=None) handle most datasets
    - Larger data: Use --keep-on-cpu flag in 3dDenoisefast.py
@@ -393,17 +393,17 @@ def cross_validate_noise_pcs(
 
     Design Matrix Structure:
     ------------------------
-    Task regressors (design_matrix): 
+    Task regressors (design_matrix):
       - Shared across all runs (e.g., condition onsets)
       - Shape: (n_total_timepoints, n_task_predictors)
       - No padding needed
-      
+
     Nuisance regressors (nuisance):
       - Run-specific (e.g., polynomial drift per run)
       - Provided as list: nuisance[i] = (n_timepoints_run_i, n_nuisance_cols)
       - All runs must have SAME # of columns (column-padded by caller)
       - During CV: concatenate only training runs along timepoint dimension
-      
+
     Total model columns: n_task + n_nuisance_padded
 
     Parameters
@@ -470,7 +470,9 @@ def cross_validate_noise_pcs(
     # Leave-one-run-out cross-validation
     for held_out_run in range(n_runs):
         if verbose:
-            print(f"\nCV Fold {held_out_run + 1}/{n_runs}: Testing on run {held_out_run + 1}, training on {n_runs - 1} other runs")
+            print(
+                f"\nCV Fold {held_out_run + 1}/{n_runs}: Testing on run {held_out_run + 1}, training on {n_runs - 1} other runs"
+            )
 
         # Split data into train and test
         train_runs = [i for i in range(n_runs) if i != held_out_run]
@@ -708,19 +710,19 @@ def fit_denoising_model(
                 # Build zero-padded version: each run's columns are non-zero only for that run
                 n_total_timepoints = data.shape[1]
                 nuisance_padded_list = []
-                
+
                 current_tp = 0
                 for run_idx, nuisance_run in enumerate(nuisance):
                     run_length = nuisance_run.shape[0]
                     n_cols = nuisance_run.shape[1]
-                    
+
                     # Create zero-padded version of this run's nuisance
                     padded = torch.zeros((n_total_timepoints, n_cols), device=device)
-                    padded[current_tp:current_tp + run_length, :] = nuisance_run
+                    padded[current_tp : current_tp + run_length, :] = nuisance_run
                     nuisance_padded_list.append(padded)
-                    
+
                     current_tp += run_length
-                
+
                 # Concatenate along columns (each run gets separate columns)
                 nuisance_concat = torch.cat(nuisance_padded_list, dim=1)
             else:
@@ -752,7 +754,7 @@ def fit_denoising_model(
 
     # At this point initial_r2 is guaranteed to be set (either provided or computed)
     assert initial_r2 is not None, "initial_r2 should be set by this point"
-    
+
     noise_pool_mask, criteria_mask = select_noise_pool_voxels(
         r2=initial_r2,
         threshold=r2_threshold,

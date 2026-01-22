@@ -838,7 +838,10 @@ def main():
                 ortvec_run = ortvec_concat[start_tp:end_tp, :]
                 nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], ortvec_run], dim=1)
             
-      -------------------------------------------
+            max_nuisance_cols = nuisance_per_run[0].shape[1]  # All now have same # after ortvec
+
+    # Pad all runs to have same number of columns (for CV concatenation compatibility)
+    # -------------------------------------------
     # PADDING STRUCTURE:
     # - Task columns: NO padding (shared across runs)
     # - Nuisance columns: YES padding (run-specific, must match for concatenation)
@@ -856,8 +859,8 @@ def main():
     # Summary
     print(f"  Task predictors: {task_design.shape[1]} (shared across all runs)")
     print(f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]} (run-specific, column-padded)")
-    print(f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}
-    # Count total predictors for display
+    print(f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}")
+    print(f"  Condition labels: {condition_labels}")
     print(f"  Task predictors: {task_design.shape[1]}")
     print(f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]} (column-padded for CV)")
     print(f"  Condition labels: {condition_labels}")
