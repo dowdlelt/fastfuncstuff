@@ -773,8 +773,9 @@ def main():
     )    
     # Type assertion for pyright (return_single_trials=False returns Tensor, not tuple)
     assert isinstance(task_design, torch.Tensor), "task_design should be Tensor when return_single_trials=False"
-    # Build polynomial nuisance regressors
-    poly_list = []
+    # Build polynomial nuisance regressors PER RUN (cleaner for CV)
+    # No zero-padding needed - just store per run
+    nuisance_per_run = []
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
@@ -789,19 +790,15 @@ def main():
 
         if polort >= 0:
             poly = construct_polynomial_matrix(run_length, polort, device=device)
-            # Pad with zeros for other runs
-            poly_padded = torch.zeros((n_timepoints, poly.shape[1]), device=device)
-            poly_padded[start_tp:end_tp, :] = poly
-            poly_list.append(poly_padded)
+        else:
+            poly = torch.zeros((run_length, 0), device=device)
+        
+        nuisance_per_run.append(poly)
 
-    # Concatenate polynomial regressors
-    if poly_list:
-        nuisance = torch.cat(poly_list, dim=1)
-    else:
-        nuisance = torch.zeros((n_timepoints, 0), device=device)
-
-    # Add ortvec files if provided
+    # Add ortvec files if provided (split by run)
     if args.ortvec:
+        # Load and concatenate all ortvec files
+        ortvec_all = []
         for ortvec_file, label in args.ortvec:
             ortvec_data = load_nuisance_file(ortvec_file)
             ortvec_data = to_tensor(ortvec_data, device=device)
@@ -810,10 +807,22 @@ def main():
                     f"ERROR: ortvec file {ortvec_file} has {ortvec_data.shape[0]} rows, expected {n_timepoints}"
                 )
                 sys.exit(1)
-            nuisance = torch.cat([nuisance, ortvec_data], dim=1)
+            ortvec_all.append(ortvec_data)
+        
+        ortvec_concat = torch.cat(ortvec_all, dim=1) if ortvec_all else None
+        
+        # Split ortvec by run and concatenate with polynomials
+        if ortvec_concat is not None:
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                ortvec_run = ortvec_concat[start_tp:end_tp, :]
+                nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], ortvec_run], dim=1)
 
+    # Count total predictors for display
+    total_nuisance = sum(n.shape[1] for n in nuisance_per_run)
     print(f"  Task predictors: {task_design.shape[1]}")
-    print(f"  Nuisance predictors: {nuisance.shape[1]}")
+    print(f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]}")
     print(f"  Condition labels: {condition_labels}")
 
     # ==========================================================================
@@ -839,7 +848,7 @@ def main():
         r2_threshold=args.r2_threshold,
         max_components=args.max_pcs,
         variance_threshold=args.variance_threshold,
-        nuisance=nuisance,
+        nuisance=nuisance_per_run,  # Pass as list per run (cleaner bookkeeping!)
         tr=args.tr,
         metric=args.cv_metric,
         min_noise_voxels=args.min_noise_voxels,

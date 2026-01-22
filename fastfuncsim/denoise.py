@@ -376,7 +376,7 @@ def cross_validate_noise_pcs(
     criteria_mask: torch.Tensor,
     tr: float,
     max_components: int = 20,
-    nuisance: Optional[torch.Tensor] = None,
+    nuisance: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
     metric: Literal["mean", "median"] = "median",
     chunk_size: Optional[int] = None,
     preload_data_to_device: bool = True,
@@ -405,8 +405,9 @@ def cross_validate_noise_pcs(
         Boolean mask for criteria voxels (where we evaluate)
     max_components : int, default=20
         Maximum number of PCs to test
-    nuisance : torch.Tensor, optional, shape (n_timepoints, n_nuisance)
+    nuisance : torch.Tensor or list of torch.Tensor, optional
         Other nuisance regressors (polort, motion, etc.)
+        Can be single concatenated tensor OR list of tensors per run (cleaner for CV)
     metric : {'mean', 'median'}, default='median'
         Aggregation metric across CV folds
     device : torch.device, optional
@@ -426,6 +427,20 @@ def cross_validate_noise_pcs(
     device = device or get_device()
     n_runs = len(run_starts)
     n_voxels = data.shape[0]
+
+    # Convert nuisance to list format if provided as concatenated tensor
+    # List format is cleaner for CV - no zero-padding issues
+    nuisance_per_run: Optional[List[torch.Tensor]] = None
+    if nuisance is not None:
+        if isinstance(nuisance, list):
+            nuisance_per_run = nuisance
+        else:
+            # Split concatenated nuisance by run
+            nuisance_per_run = []
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
+                nuisance_per_run.append(nuisance[start_tp:end_tp, :])
 
     # Storage for CV results
     # Rows = folds (runs), Cols = n_components (0 to max_components)
@@ -467,8 +482,15 @@ def cross_validate_noise_pcs(
         design_train = design_matrix[train_tps, :]
         design_test = design_matrix[test_tps, :]
 
-        nuisance_train = nuisance[train_tps, :] if nuisance is not None else None
-        nuisance_test = nuisance[test_tps, :] if nuisance is not None else None
+        # Build nuisance matrices cleanly from per-run lists (no zero-padding!)
+        if nuisance_per_run is not None:
+            # Train: concatenate only training runs
+            nuisance_train = torch.cat([nuisance_per_run[i] for i in train_runs], dim=0)
+            # Test: just the held-out run
+            nuisance_test = nuisance_per_run[held_out_run]
+        else:
+            nuisance_train = None
+            nuisance_test = None
 
         # Train noise PCs (only from training runs)
         train_noise_pcs = [noise_pcs[i] for i in train_runs]
@@ -575,7 +597,7 @@ def fit_denoising_model(
     r2_threshold: float = 0.1,
     max_components: int = 20,
     variance_threshold: float = 0.95,
-    nuisance: Optional[torch.Tensor] = None,
+    nuisance: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
     metric: Literal["mean", "median"] = "median",
     min_noise_voxels: int = 100,
     max_noise_fraction: float = 0.5,
@@ -662,11 +684,12 @@ def fit_denoising_model(
             print("\nStep 1: Computing initial R² for noise pool selection...")
             print("  (fitting concatenated data across all runs)")
 
+        # fit_glm accepts list format, so we can pass nuisance directly
         results_init = fit_glm(
             data=data,
             design=design_matrix,
             tr=tr,
-            extra_regressors=nuisance,
+            extra_regressors=nuisance,  # Can be list or tensor - fit_glm handles both
             want_residuals=False,
             chunk_size=chunk_size,
             preload_data_to_device=preload_data_to_device,
