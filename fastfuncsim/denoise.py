@@ -684,12 +684,20 @@ def fit_denoising_model(
             print("\nStep 1: Computing initial R² for noise pool selection...")
             print("  (fitting concatenated data across all runs)")
 
-        # fit_glm accepts list format, so we can pass nuisance directly
+        # For initial fit, concatenate nuisance if provided as list
+        # (fit_glm expects single tensor when data is concatenated)
+        nuisance_concat = None
+        if nuisance is not None:
+            if isinstance(nuisance, list):
+                nuisance_concat = torch.cat(nuisance, dim=0)
+            else:
+                nuisance_concat = nuisance
+
         results_init = fit_glm(
             data=data,
             design=design_matrix,
             tr=tr,
-            extra_regressors=nuisance,  # Can be list or tensor - fit_glm handles both
+            extra_regressors=nuisance_concat,  # Single tensor for concatenated data
             want_residuals=False,
             chunk_size=chunk_size,
             preload_data_to_device=preload_data_to_device,
