@@ -499,11 +499,32 @@ def cross_validate_noise_pcs(
         design_train = design_matrix[train_tps, :]
         design_test = design_matrix[test_tps, :]
 
-        # Build nuisance matrices cleanly from per-run lists (no zero-padding!)
+        # Build nuisance matrices for train/test
+        # CRITICAL: Polynomial drift is RUN-SPECIFIC - each run needs its own columns!
+        # Simply concatenating rows would share columns across runs → rank deficient
+        # Instead: Build zero-padded structure where each run has its own column set
         if nuisance_per_run is not None:
-            # Train: concatenate only training runs
-            nuisance_train = torch.cat([nuisance_per_run[i] for i in train_runs], dim=0)
-            # Test: just the held-out run
+            n_nuisance_cols_per_run = nuisance_per_run[0].shape[1]
+            n_train_runs = len(train_runs)
+            
+            # Build train nuisance: each training run gets its own columns (zero elsewhere)
+            # Total columns = n_train_runs * n_nuisance_cols_per_run
+            train_nuisance_blocks = []
+            for block_idx, run_idx in enumerate(train_runs):
+                run_nuisance = nuisance_per_run[run_idx]  # (run_length, n_cols)
+                run_length = run_nuisance.shape[0]
+                
+                # Build zero-padded row: [zeros | this_run_nuisance | zeros]
+                padded = torch.zeros((run_length, n_train_runs * n_nuisance_cols_per_run), device=device)
+                start_col = block_idx * n_nuisance_cols_per_run
+                end_col = start_col + n_nuisance_cols_per_run
+                padded[:, start_col:end_col] = run_nuisance
+                
+                train_nuisance_blocks.append(padded)
+            
+            nuisance_train = torch.cat(train_nuisance_blocks, dim=0)
+            
+            # Test: just the held-out run's nuisance (no need for zero-padding, single run)
             nuisance_test = nuisance_per_run[held_out_run]
         else:
             nuisance_train = None
