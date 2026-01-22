@@ -684,12 +684,30 @@ def fit_denoising_model(
             print("\nStep 1: Computing initial R² for noise pool selection...")
             print("  (fitting concatenated data across all runs)")
 
-        # For initial fit, concatenate nuisance if provided as list
-        # (fit_glm expects single tensor when data is concatenated)
+        # For initial fit on concatenated data, we need zero-padded nuisance
+        # Each run's polynomials must be in SEPARATE columns (run-specific drift)
+        # Can't just concatenate - that would share polynomial columns across runs!
         nuisance_concat = None
         if nuisance is not None:
             if isinstance(nuisance, list):
-                nuisance_concat = torch.cat(nuisance, dim=0)
+                # Build zero-padded version: each run's columns are non-zero only for that run
+                n_total_timepoints = data.shape[1]
+                nuisance_padded_list = []
+                
+                current_tp = 0
+                for run_idx, nuisance_run in enumerate(nuisance):
+                    run_length = nuisance_run.shape[0]
+                    n_cols = nuisance_run.shape[1]
+                    
+                    # Create zero-padded version of this run's nuisance
+                    padded = torch.zeros((n_total_timepoints, n_cols), device=device)
+                    padded[current_tp:current_tp + run_length, :] = nuisance_run
+                    nuisance_padded_list.append(padded)
+                    
+                    current_tp += run_length
+                
+                # Concatenate along columns (each run gets separate columns)
+                nuisance_concat = torch.cat(nuisance_padded_list, dim=1)
             else:
                 nuisance_concat = nuisance
 
@@ -697,7 +715,7 @@ def fit_denoising_model(
             data=data,
             design=design_matrix,
             tr=tr,
-            extra_regressors=nuisance_concat,  # Single tensor for concatenated data
+            extra_regressors=nuisance_concat,  # Zero-padded: run-specific columns
             want_residuals=False,
             chunk_size=chunk_size,
             preload_data_to_device=preload_data_to_device,

@@ -774,8 +774,11 @@ def main():
     # Type assertion for pyright (return_single_trials=False returns Tensor, not tuple)
     assert isinstance(task_design, torch.Tensor), "task_design should be Tensor when return_single_trials=False"
     # Build polynomial nuisance regressors PER RUN (cleaner for CV)
-    # No zero-padding needed - just store per run
+    # Each run may have different polort (different duration) → different # of columns
+    # For CV to work, we need all runs to have SAME # of columns
     nuisance_per_run = []
+    max_nuisance_cols = 0  # Track max columns across all runs
+    
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
@@ -794,6 +797,7 @@ def main():
             poly = torch.zeros((run_length, 0), device=device)
         
         nuisance_per_run.append(poly)
+        max_nuisance_cols = max(max_nuisance_cols, poly.shape[1])
 
     # Add ortvec files if provided (split by run)
     if args.ortvec:
@@ -818,11 +822,21 @@ def main():
                 end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
                 ortvec_run = ortvec_concat[start_tp:end_tp, :]
                 nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], ortvec_run], dim=1)
+            
+            max_nuisance_cols = nuisance_per_run[0].shape[1]  # All now have same # after ortvec
+
+    # Pad all runs to have same number of columns (for CV concatenation compatibility)
+    # Some runs may have fewer polynomial columns than others
+    for run_idx in range(n_runs):
+        n_cols = nuisance_per_run[run_idx].shape[1]
+        if n_cols < max_nuisance_cols:
+            # Pad with zeros on the right
+            padding = torch.zeros((nuisance_per_run[run_idx].shape[0], max_nuisance_cols - n_cols), device=device)
+            nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], padding], dim=1)
 
     # Count total predictors for display
-    total_nuisance = sum(n.shape[1] for n in nuisance_per_run)
     print(f"  Task predictors: {task_design.shape[1]}")
-    print(f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]}")
+    print(f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]} (column-padded for CV)")
     print(f"  Condition labels: {condition_labels}")
 
     # ==========================================================================
