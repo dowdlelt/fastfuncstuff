@@ -707,7 +707,9 @@ def main():
         run_starts = [0]
         current_timepoint = 0
 
-        for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading & blurring", unit="run")):
+        for run_idx, run_file in enumerate(
+            tqdm(input_files, desc="  Loading & blurring", unit="run")
+        ):
             # Load as 4D numpy array
             img = nib.load(run_file)
             data_4d = img.get_fdata(dtype=np.float32)

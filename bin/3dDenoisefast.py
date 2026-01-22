@@ -50,7 +50,7 @@ try:
         fit_denoising_model,
         DenoiseResults,
     )
-    from fastfuncsim.glm_core import fit_glm, make_polynomial_regressors
+    from fastfuncsim.glm_core import fit_glm, construct_polynomial_matrix
     from fastfuncsim.design import convolve_hrf_microtime
     from fastfuncsim.hrf import get_canonical_hrf
     from fastfuncsim.afni_io import read_ortvec_file
@@ -359,7 +359,7 @@ def save_denoising_results(
 ):
     """
     Save denoising results to disk
-    
+
     Parameters
     ----------
     results : DenoiseResults
@@ -376,14 +376,14 @@ def save_denoising_results(
         Save visualization plots
     save_pcs : bool
         Save noise PCs
-    
+
     Returns
     -------
     output_files : dict
         Dictionary of output file paths
     """
     output_files = {}
-    
+
     # Helper to reshape flat data to volume
     def to_volume(flat_data):
         if voxel_mask is not None:
@@ -392,116 +392,130 @@ def save_denoising_results(
         else:
             vol = flat_data
         return vol.reshape(volume_shape)
-    
+
     # 1. Noise pool mask
     noise_pool_vol = to_volume(results.noise_pool_mask.cpu().numpy().astype(np.float32))
     noise_pool_img = nib.Nifti1Image(noise_pool_vol, affine)
     noise_pool_path = f"{output_prefix}_noise_pool_mask.nii.gz"
     nib.save(noise_pool_img, noise_pool_path)
-    output_files['noise_pool_mask'] = noise_pool_path
-    
+    output_files["noise_pool_mask"] = noise_pool_path
+
     # 2. Criteria mask
     criteria_vol = to_volume(results.criteria_mask.cpu().numpy().astype(np.float32))
     criteria_img = nib.Nifti1Image(criteria_vol, affine)
     criteria_path = f"{output_prefix}_criteria_mask.nii.gz"
     nib.save(criteria_img, criteria_path)
-    output_files['criteria_mask'] = criteria_path
-    
+    output_files["criteria_mask"] = criteria_path
+
     # 3. Initial R²
     initial_r2_vol = to_volume(results.noise_pool_r2.cpu().numpy().astype(np.float32))
     initial_r2_img = nib.Nifti1Image(initial_r2_vol, affine)
     initial_r2_path = f"{output_prefix}_initial_r2.nii.gz"
     nib.save(initial_r2_img, initial_r2_path)
-    output_files['initial_r2'] = initial_r2_path
-    
+    output_files["initial_r2"] = initial_r2_path
+
     # 4. CV R² by number of PCs
     xval_r2_path = f"{output_prefix}_xval_r2_by_npcs.npy"
     np.save(xval_r2_path, results.xval_r2_by_n_components)
-    output_files['xval_r2_by_npcs'] = xval_r2_path
-    
+    output_files["xval_r2_by_npcs"] = xval_r2_path
+
     # 5. CV R² per fold
     xval_r2_folds_path = f"{output_prefix}_xval_r2_per_fold.npy"
     np.save(xval_r2_folds_path, results.xval_r2_per_fold)
-    output_files['xval_r2_per_fold'] = xval_r2_folds_path
-    
+    output_files["xval_r2_per_fold"] = xval_r2_folds_path
+
     # 6. Noise PCs (optional - can be large)
     if save_pcs:
         pcs_path = f"{output_prefix}_noise_pcs.pt"
-        torch.save({
-            'noise_pcs_per_run': results.noise_pcs_per_run,
-            'optimal_n_components': results.optimal_n_components,
-        }, pcs_path)
-        output_files['noise_pcs'] = pcs_path
-    
+        torch.save(
+            {
+                "noise_pcs_per_run": results.noise_pcs_per_run,
+                "optimal_n_components": results.optimal_n_components,
+            },
+            pcs_path,
+        )
+        output_files["noise_pcs"] = pcs_path
+
     # 7. Metadata
     metadata = {
         **results.metadata,
-        'optimal_n_components': results.optimal_n_components,
-        'baseline_r2': results.baseline_r2,
-        'optimal_r2': results.optimal_r2,
-        'improvement': results.improvement,
-        'volume_shape': volume_shape,
+        "optimal_n_components": results.optimal_n_components,
+        "baseline_r2": results.baseline_r2,
+        "optimal_r2": results.optimal_r2,
+        "improvement": results.improvement,
+        "volume_shape": volume_shape,
     }
-    
+
     metadata_path = f"{output_prefix}_metadata.json"
-    with open(metadata_path, 'w') as f:
+    with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
-    output_files['metadata'] = metadata_path
-    
+    output_files["metadata"] = metadata_path
+
     # 8. Plots (optional)
     if save_plots:
         import matplotlib.pyplot as plt
-        
+
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        
+
         # CV R² by number of PCs
         ax = axes[0, 0]
-        ax.plot(results.xval_r2_by_n_components, 'o-', label='Mean')
-        ax.plot(results.xval_r2_median_by_n_components, 's--', alpha=0.7, label='Median')
-        ax.axvline(results.optimal_n_components, color='r', linestyle='--', alpha=0.5,
-                   label=f'Optimal ({results.optimal_n_components} PCs)')
-        ax.set_xlabel('Number of PCs')
-        ax.set_ylabel('Cross-validated R²')
-        ax.set_title('Denoising Performance')
+        ax.plot(results.xval_r2_by_n_components, "o-", label="Mean")
+        ax.plot(
+            results.xval_r2_median_by_n_components, "s--", alpha=0.7, label="Median"
+        )
+        ax.axvline(
+            results.optimal_n_components,
+            color="r",
+            linestyle="--",
+            alpha=0.5,
+            label=f"Optimal ({results.optimal_n_components} PCs)",
+        )
+        ax.set_xlabel("Number of PCs")
+        ax.set_ylabel("Cross-validated R²")
+        ax.set_title("Denoising Performance")
         ax.legend()
         ax.grid(True, alpha=0.3)
-        
+
         # R² per fold heatmap
         ax = axes[0, 1]
-        im = ax.imshow(results.xval_r2_per_fold, aspect='auto', cmap='viridis')
-        ax.set_xlabel('Number of PCs')
-        ax.set_ylabel('CV Fold (run)')
-        ax.set_title('R² per CV Fold')
-        plt.colorbar(im, ax=ax, label='R²')
-        
+        im = ax.imshow(results.xval_r2_per_fold, aspect="auto", cmap="viridis")
+        ax.set_xlabel("Number of PCs")
+        ax.set_ylabel("CV Fold (run)")
+        ax.set_title("R² per CV Fold")
+        plt.colorbar(im, ax=ax, label="R²")
+
         # Initial R² distribution
         ax = axes[1, 0]
         r2_cpu = results.noise_pool_r2.cpu().numpy()
-        ax.hist(r2_cpu, bins=50, alpha=0.7, edgecolor='black')
-        ax.axvline(results.metadata['r2_threshold'], color='r', linestyle='--',
-                   label=f"Threshold = {results.metadata['r2_threshold']:.2f}")
-        ax.set_xlabel('Initial R²')
-        ax.set_ylabel('Number of voxels')
-        ax.set_title('R² Distribution (Noise Pool Selection)')
+        ax.hist(r2_cpu, bins=50, alpha=0.7, edgecolor="black")
+        ax.axvline(
+            results.metadata["r2_threshold"],
+            color="r",
+            linestyle="--",
+            label=f"Threshold = {results.metadata['r2_threshold']:.2f}",
+        )
+        ax.set_xlabel("Initial R²")
+        ax.set_ylabel("Number of voxels")
+        ax.set_title("R² Distribution (Noise Pool Selection)")
         ax.legend()
         ax.grid(True, alpha=0.3)
-        
+
         # Summary text
         ax = axes[1, 1]
-        ax.axis('off')
+        ax.axis("off")
         summary_text = f"""
 Denoising Results
-{'='*40}
+{"=" * 40}
 
 Voxel Selection:
-  Noise pool: {results.metadata['n_noise_voxels']:,} voxels
-  Criteria: {results.metadata['n_criteria_voxels']:,} voxels
-  Threshold: R² < {results.metadata['r2_threshold']:.2f}
+  Noise pool: {results.metadata["n_noise_voxels"]:,} voxels
+  Criteria: {results.metadata["n_criteria_voxels"]:,} voxels
+  Threshold: R² < {results.metadata["r2_threshold"]:.2f}
 
 Cross-Validation:
   Strategy: Leave-one-run-out
-  Runs: {results.metadata['n_runs']}
-  Max PCs: {results.metadata['max_components']}
+  Runs: {results.metadata["n_runs"]}
+  Max PCs: {results.metadata["max_components"]}
 
 Performance:
   Baseline R²: {results.baseline_r2:.4f}
@@ -509,15 +523,21 @@ Performance:
   Improvement: {results.improvement:+.4f}
   Optimal PCs: {results.optimal_n_components}
         """
-        ax.text(0.05, 0.5, summary_text, fontsize=9, family='monospace',
-                verticalalignment='center')
-        
+        ax.text(
+            0.05,
+            0.5,
+            summary_text,
+            fontsize=9,
+            family="monospace",
+            verticalalignment="center",
+        )
+
         plt.tight_layout()
         plot_path = f"{output_prefix}_denoising_report.png"
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
         plt.close()
-        output_files['denoising_report'] = plot_path
-    
+        output_files["denoising_report"] = plot_path
+
     return output_files
 
 
@@ -579,13 +599,17 @@ def main():
     # Load first file for metadata
     first_img = nib.load(input_files[0])
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
-    volume_shape = tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
+    volume_shape = (
+        tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
+    )
     voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
 
     # Determine memory strategy
-    if hasattr(first_img, 'shape'):
+    if hasattr(first_img, "shape"):
         n_voxels_per_run = first_img.shape[0] * first_img.shape[1] * first_img.shape[2]
-        n_timepoints_per_run = first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[-1]
+        n_timepoints_per_run = (
+            first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[-1]
+        )
     else:
         n_voxels_per_run = 10000
         n_timepoints_per_run = 200
@@ -610,13 +634,16 @@ def main():
     # Load and optionally blur data
     if args.do_blur is not None:
         print(f"\nApplying Gaussian blur (FWHM = {args.do_blur} mm)...")
-        
+
         from tqdm import tqdm
+
         run_data_list = []
         run_starts = [0]
         current_timepoint = 0
 
-        for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading & blurring", unit="run")):
+        for run_idx, run_file in enumerate(
+            tqdm(input_files, desc="  Loading & blurring", unit="run")
+        ):
             img = nib.load(run_file)
             data_4d = img.get_fdata(dtype=np.float32)
 
@@ -642,7 +669,9 @@ def main():
             if keep_on_cpu:
                 data_2d = torch.from_numpy(data_2d).to(torch.float32)
             else:
-                data_2d = torch.from_numpy(data_2d).to(device=device, dtype=torch.float32)
+                data_2d = torch.from_numpy(data_2d).to(
+                    device=device, dtype=torch.float32
+                )
 
             run_data_list.append(data_2d)
             current_timepoint += n_tps
@@ -688,7 +717,9 @@ def main():
             verbose=True,
         )
 
-    print(f"  Data shape: {data.shape} ({n_voxels:,} voxels × {n_timepoints} timepoints)")
+    print(
+        f"  Data shape: {data.shape} ({n_voxels:,} voxels × {n_timepoints} timepoints)"
+    )
     print(f"  Volume shape: {volume_shape}")
     print(f"  Runs: {n_runs} starting at {run_starts}")
 
@@ -704,7 +735,9 @@ def main():
     for onset_file in onset_files:
         onsets_by_run = parse_afni_timing_file(onset_file)
         if len(onsets_by_run) != n_runs:
-            print(f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}")
+            print(
+                f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}"
+            )
             sys.exit(1)
         all_onsets.append(onsets_by_run)
 
@@ -712,61 +745,70 @@ def main():
     bins_per_tr = int(np.round(args.tr / args.microtime_dt))
     n_microtime = n_timepoints * bins_per_tr
     onset_matrix_micro = torch.zeros((n_microtime, n_conditions), device=device)
-    
+
     for cond_idx in range(n_conditions):
         duration_bins = max(1, int(np.round(durations[cond_idx] / args.microtime_dt)))
-        
+
         for run_idx in range(n_runs):
             onsets = all_onsets[cond_idx][run_idx]
             run_start_tr = run_starts[run_idx]
             run_start_micro = run_start_tr * bins_per_tr
-            
+
             for onset_time in onsets:
-                onset_bin = run_start_micro + int(np.round(onset_time / args.microtime_dt))
+                onset_bin = run_start_micro + int(
+                    np.round(onset_time / args.microtime_dt)
+                )
                 if onset_bin < n_microtime:
-                    onset_matrix_micro[onset_bin:min(onset_bin + duration_bins, n_microtime), cond_idx] = 1.0
-    
+                    onset_matrix_micro[
+                        onset_bin : min(onset_bin + duration_bins, n_microtime),
+                        cond_idx,
+                    ] = 1.0
+
     # Get canonical HRF
-    hrf = get_canonical_hrf(mode=args.canonical, tr=args.tr, microtime_dt=args.microtime_dt, device=device)
-    
+    hrf = get_canonical_hrf(
+        mode=args.canonical, tr=args.tr, microtime_dt=args.microtime_dt, device=device
+    )
+
     # Convolve and downsample to TR resolution
     task_design = convolve_hrf_microtime(
         onset_matrix_micro, hrf, bins_per_tr=bins_per_tr, device=device
     )
-    
+
     # Build polynomial nuisance regressors
     poly_list = []
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
         run_length = end_tp - start_tp
-        
+
         # Auto-determine polort if not specified
         if args.polort is None:
             run_duration = run_length * args.tr
             polort = int(np.floor(1 + run_duration / 150.0))
         else:
             polort = args.polort
-        
+
         if polort >= 0:
-            poly = make_polynomial_regressors(run_length, polort, device=device)
+            poly = construct_polynomial_matrix(run_length, polort, device=device)
             # Pad with zeros for other runs
             poly_padded = torch.zeros((n_timepoints, poly.shape[1]), device=device)
             poly_padded[start_tp:end_tp, :] = poly
             poly_list.append(poly_padded)
-    
+
     # Concatenate polynomial regressors
     if poly_list:
         nuisance = torch.cat(poly_list, dim=1)
     else:
         nuisance = torch.zeros((n_timepoints, 0), device=device)
-    
+
     # Add ortvec files if provided
     if args.ortvec:
         for ortvec_file, label in args.ortvec:
             ortvec_data = read_ortvec_file(ortvec_file, device=device)
             if ortvec_data.shape[0] != n_timepoints:
-                print(f"ERROR: ortvec file {ortvec_file} has {ortvec_data.shape[0]} rows, expected {n_timepoints}")
+                print(
+                    f"ERROR: ortvec file {ortvec_file} has {ortvec_data.shape[0]} rows, expected {n_timepoints}"
+                )
                 sys.exit(1)
             nuisance = torch.cat([nuisance, ortvec_data], dim=1)
 
