@@ -54,7 +54,7 @@ try:
     from fastfuncsim.design import convolve_hrf_microtime
     from fastfuncsim.hrf import get_canonical_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
-    from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
+    from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -764,7 +764,12 @@ def main():
 
     # Convolve and downsample to TR resolution
     task_design = convolve_hrf_microtime(
-        onset_matrix_micro, hrf, bins_per_tr=bins_per_tr, device=device
+        onsets_microtime=onset_matrix_micro,
+        hrf=hrf,
+        n_timepoints=n_timepoints,
+        tr=args.tr,
+        microtime_dt=args.microtime_dt,
+        device=device,
     )
 
     # Build polynomial nuisance regressors
@@ -798,6 +803,7 @@ def main():
     if args.ortvec:
         for ortvec_file, label in args.ortvec:
             ortvec_data = load_nuisance_file(ortvec_file)
+            ortvec_data = to_tensor(ortvec_data, device=device)
             if ortvec_data.shape[0] != n_timepoints:
                 print(
                     f"ERROR: ortvec file {ortvec_file} has {ortvec_data.shape[0]} rows, expected {n_timepoints}"
