@@ -460,9 +460,7 @@ def save_denoising_results(
         # CV R² by number of PCs
         ax = axes[0, 0]
         ax.plot(results.xval_r2_by_n_components, "o-", label="Mean")
-        ax.plot(
-            results.xval_r2_median_by_n_components, "s--", alpha=0.7, label="Median"
-        )
+        ax.plot(results.xval_r2_median_by_n_components, "s--", alpha=0.7, label="Median")
         ax.axvline(
             results.optimal_n_components,
             color="r",
@@ -599,9 +597,7 @@ def main():
     # Load first file for metadata
     first_img = nib.load(input_files[0])
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
-    volume_shape = (
-        tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
-    )
+    volume_shape = tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
     voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
 
     # Determine memory strategy
@@ -669,9 +665,7 @@ def main():
             if keep_on_cpu:
                 data_2d = torch.from_numpy(data_2d).to(torch.float32)
             else:
-                data_2d = torch.from_numpy(data_2d).to(
-                    device=device, dtype=torch.float32
-                )
+                data_2d = torch.from_numpy(data_2d).to(device=device, dtype=torch.float32)
 
             run_data_list.append(data_2d)
             current_timepoint += n_tps
@@ -717,9 +711,7 @@ def main():
             verbose=True,
         )
 
-    print(
-        f"  Data shape: {data.shape} ({n_voxels:,} voxels × {n_timepoints} timepoints)"
-    )
+    print(f"  Data shape: {data.shape} ({n_voxels:,} voxels × {n_timepoints} timepoints)")
     print(f"  Volume shape: {volume_shape}")
     print(f"  Runs: {n_runs} starting at {run_starts}")
 
@@ -755,9 +747,7 @@ def main():
             run_start_micro = run_start_tr * bins_per_tr
 
             for onset_time in onsets:
-                onset_bin = run_start_micro + int(
-                    np.round(onset_time / args.microtime_dt)
-                )
+                onset_bin = run_start_micro + int(np.round(onset_time / args.microtime_dt))
                 if onset_bin < n_microtime:
                     onset_matrix_micro[
                         onset_bin : min(onset_bin + duration_bins, n_microtime),

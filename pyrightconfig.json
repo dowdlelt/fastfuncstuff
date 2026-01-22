@@ -1,15 +1,17 @@
 {
   "include": [
     "fastfuncsim",
+    "bin",
     "examples"
   ],
   "exclude": [
     "**/node_modules",
     "**/__pycache__",
-    ".git"
+    ".git",
+    "htmlcov"
   ],
   "typeCheckingMode": "basic",
-  "reportMissingImports": false,
+  "reportMissingImports": "error",
   "reportMissingTypeStubs": false,
   "reportUnknownMemberType": false,
   "reportUnknownVariableType": false,
@@ -24,6 +26,8 @@
   "reportOptionalSubscript": "warning",
   "reportOptionalMemberAccess": "warning",
   "reportOptionalCall": "warning",
+  "reportGeneralTypeIssues": "warning",
+  "reportUndefinedVariable": "error",
   "pythonVersion": "3.12",
   "pythonPlatform": "All"
 }

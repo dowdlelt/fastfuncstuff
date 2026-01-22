@@ -45,3 +45,27 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
 strict_optional = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# Enable important error detection
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes (undefined names, imports, etc)
+    "I",    # isort (import ordering)
+    "N",    # pep8-naming
+    "UP",   # pyupgrade (modernize python code)
+    "B",    # flake8-bugbear (likely bugs)
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "E731",  # lambda assignment (sometimes useful)
+    "B008",  # function calls in argument defaults (common in ML)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__
+"examples/*.py" = ["B007"]  # Allow unused loop variables in examples
