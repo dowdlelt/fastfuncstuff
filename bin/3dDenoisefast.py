@@ -53,7 +53,7 @@ try:
         fit_denoising_model,
         DenoiseResults,
     )
-    from fastfuncsim.glm_core import fit_glm_torch
+    from fastfuncsim.glm_core import fit_glm
     from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")

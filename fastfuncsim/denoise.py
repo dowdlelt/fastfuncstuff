@@ -26,7 +26,7 @@ from typing import List, Optional, Tuple, Union, Literal, Callable
 import numpy as np
 import torch
 
-from .glm_core import fit_glm_torch, project_out_nuisance
+from .glm_core import fit_glm, orthogonalize_design
 from .pca import PCA
 from .utils import get_device, to_tensor
 
@@ -462,9 +462,9 @@ def cross_validate_noise_pcs(
             
             # Project out nuisance from test data (if any)
             if nuisance_test is not None and nuisance_test.shape[1] > 0:
-                data_test_clean = project_out_nuisance(
-                    data_test, nuisance_test, device=device
-                )
+                # Project out nuisance: Y_clean = Y - Z * (Z'Z)^-1 * Z'Y
+                Q, _ = torch.linalg.qr(nuisance_test)
+                data_test_clean = data_test - (Q @ (Q.T @ data_test.T)).T
             else:
                 data_test_clean = data_test
             
@@ -601,7 +601,7 @@ def fit_denoising_model(
         if verbose:
             print("\nStep 1: Computing initial R² for noise pool selection...")
         
-        results_init = fit_glm_torch(
+        results_init = fit_glm(
             data=data,
             design=design_matrix,
             nuisance=nuisance,
