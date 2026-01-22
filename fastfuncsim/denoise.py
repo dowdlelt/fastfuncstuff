@@ -10,6 +10,32 @@ This module implements a sophisticated approach to data-driven denoising:
 The key innovation: we denoise training data but predict non-denoised test data,
 ensuring we're improving signal recovery rather than just fitting the denoising.
 
+Memory Strategy (for 16GB GPU)
+------------------------------
+The implementation is carefully designed to handle large datasets efficiently:
+
+1. **PCA Extraction** (extract_noise_pcs_per_run):
+   - Requires full noise pool voxels in memory (can't chunk PCA across voxels)
+   - But noise pool is typically 10-50% of brain voxels (subset of full data)
+   - Extracts lightweight PC timecourses (n_timepoints x n_components)
+   - PCs are cached and reused throughout cross-validation
+   
+2. **GLM Fitting** (fit_glm):
+   - Supports automatic voxel chunking via chunk_size parameter
+   - Passes chunk_size through entire stack: fit_denoising_model → cross_validate_noise_pcs → fit_glm_with_noise_pcs → fit_glm
+   - For 16GB GPU: chunk_size=None (auto-detect) works for most datasets
+   - For larger datasets: explicit chunk_size or keep_on_cpu=True
+   
+3. **Cross-Validation**:
+   - Splits data into train/test per fold (temporal split, not voxel)
+   - Each GLM fit respects chunking strategy
+   - PCs are pre-cached, so no redundant extraction
+   
+4. **Recommended Usage**:
+   - 16GB GPU: Default settings (chunk_size=None) handle most datasets
+   - Larger data: Use --keep-on-cpu flag in 3dDenoisefast.py
+   - Memory bottleneck is typically in GLM fitting, not PCA extraction
+
 Key Features
 ------------
 - Voxel-based noise pool selection via R² threshold
@@ -147,8 +173,7 @@ def select_noise_pool_voxels(
     # Validate criteria pool exists
     if n_criteria == 0:
         raise ValueError(
-            f"No criteria voxels (R² >= {threshold}). "
-            f"Model fit may be too poor. Check your design."
+            f"No criteria voxels (R² >= {threshold}). Model fit may be too poor. Check your design."
         )
 
     return noise_pool_mask, criteria_mask
@@ -220,17 +245,13 @@ def extract_noise_pcs_per_run(
         n_comp = min(n_comp, max_components)
 
         # Transform to get PC timecourses
-        pc_timecourses = pca.transform(run_data_T)[
-            :, :n_comp
-        ]  # (n_timepoints_run, n_comp)
+        pc_timecourses = pca.transform(run_data_T)[:, :n_comp]  # (n_timepoints_run, n_comp)
 
         noise_pcs_per_run.append(pc_timecourses)
 
         if verbose:
             var_explained = cumvar[n_comp - 1].item()
-            print(
-                f"  Run {run_idx + 1}: {n_comp} PCs ({var_explained * 100:.1f}% variance)"
-            )
+            print(f"  Run {run_idx + 1}: {n_comp} PCs ({var_explained * 100:.1f}% variance)")
 
     return noise_pcs_per_run
 
@@ -241,29 +262,45 @@ def fit_glm_with_noise_pcs(
     noise_pcs: List[torch.Tensor],
     run_starts: List[int],
     n_pcs_to_use: int,
+    tr: float,
     nuisance: Optional[torch.Tensor] = None,
     eval_mask: Optional[torch.Tensor] = None,
+    chunk_size: Optional[int] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fit GLM with noise PCs projected out, compute R² in eval voxels
 
+    Memory Strategy:
+    ----------------
+    - PCs are lightweight timecourses (already extracted)
+    - GLM fitting can chunk voxels via chunk_size parameter
+    - For 16GB GPU: chunk_size=None (auto) works for most datasets
+    - For larger datasets: fit_glm will auto-chunk or use explicit chunk_size
+
     Parameters
     ----------
     data : torch.Tensor, shape (n_voxels, n_timepoints)
         fMRI data (can be raw or already partially denoised)
+        Can be on CPU or GPU - fit_glm handles device transfer
     design_matrix : torch.Tensor, shape (n_timepoints, n_predictors)
         Task design matrix
     noise_pcs : list of torch.Tensor
         PC timecourses per run (from extract_noise_pcs_per_run)
+        Lightweight - already cached in memory
     run_starts : list of int
         Starting timepoint for each run
     n_pcs_to_use : int
         Number of PCs to use from each run (0 = no denoising)
+    tr : float
+        Repetition time in seconds
     nuisance : torch.Tensor, optional, shape (n_timepoints, n_nuisance)
         Other nuisance regressors (e.g., polynomial drift, motion)
     eval_mask : torch.Tensor, optional, shape (n_voxels,)
         Boolean mask for voxels to evaluate R² (default: all voxels)
+    chunk_size : int, optional
+        Number of voxels to process per GPU batch
+        If None, fit_glm auto-detects based on available memory
     device : torch.device, optional
         Device for computation
 
@@ -311,12 +348,14 @@ def fit_glm_with_noise_pcs(
         # Combine with other nuisance
         combined_nuisance = torch.cat([combined_nuisance, pc_nuisance], dim=1)
 
-    # Fit GLM
+    # Fit GLM (with memory-aware chunking)
     results = fit_glm(
         data=data,
         design=design_matrix,
-        nuisance=combined_nuisance if combined_nuisance.shape[1] > 0 else None,
-        return_residuals=False,
+        tr=tr,
+        extra_regressors=combined_nuisance if combined_nuisance.shape[1] > 0 else None,
+        want_residuals=False,
+        chunk_size=chunk_size,
         device=device,
     )
 
@@ -333,9 +372,11 @@ def cross_validate_noise_pcs(
     noise_pcs: List[torch.Tensor],
     run_starts: List[int],
     criteria_mask: torch.Tensor,
+    tr: float,
     max_components: int = 20,
     nuisance: Optional[torch.Tensor] = None,
     metric: Literal["mean", "median"] = "median",
+    chunk_size: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -395,9 +436,7 @@ def cross_validate_noise_pcs(
     # Leave-one-run-out cross-validation
     for held_out_run in range(n_runs):
         if verbose:
-            print(
-                f"\nFold {held_out_run + 1}/{n_runs}: Held-out run {held_out_run + 1}"
-            )
+            print(f"\nFold {held_out_run + 1}/{n_runs}: Held-out run {held_out_run + 1}")
 
         # Split data into train and test
         train_runs = [i for i in range(n_runs) if i != held_out_run]
@@ -410,9 +449,7 @@ def cross_validate_noise_pcs(
             train_tps.extend(range(start_tp, end_tp))
 
         test_start = run_starts[held_out_run]
-        test_end = (
-            run_starts[held_out_run + 1] if held_out_run < n_runs - 1 else data.shape[1]
-        )
+        test_end = run_starts[held_out_run + 1] if held_out_run < n_runs - 1 else data.shape[1]
         test_tps = list(range(test_start, test_end))
 
         train_tps = torch.tensor(train_tps, device=device)
@@ -448,8 +485,10 @@ def cross_validate_noise_pcs(
                 train_results = fit_glm(
                     data=data_train,
                     design=design_train,
-                    nuisance=nuisance_train,
-                    return_residuals=False,
+                    tr=tr,
+                    extra_regressors=nuisance_train,
+                    want_residuals=False,
+                    chunk_size=chunk_size,
                     device=device,
                 )
                 betas_train = train_results.betas
@@ -459,9 +498,11 @@ def cross_validate_noise_pcs(
                     data=data_train,
                     design_matrix=design_train,
                     noise_pcs=train_noise_pcs,
+                    tr=tr,
                     run_starts=train_run_starts,
                     n_pcs_to_use=n_pcs,
                     nuisance=nuisance_train,
+                    chunk_size=chunk_size,
                     device=device,
                 )
 
@@ -513,9 +554,7 @@ def cross_validate_noise_pcs(
         print(f"Baseline (0 PCs): R² = {r2_by_n_components[0]:.4f}")
         best_idx = np.argmax(r2_by_n_components)
         print(f"Best ({best_idx} PCs): R² = {r2_by_n_components[best_idx]:.4f}")
-        print(
-            f"Improvement: {r2_by_n_components[best_idx] - r2_by_n_components[0]:+.4f}"
-        )
+        print(f"Improvement: {r2_by_n_components[best_idx] - r2_by_n_components[0]:+.4f}")
 
     return r2_by_n_components, r2_median_by_n_components, r2_per_fold
 
@@ -524,6 +563,7 @@ def fit_denoising_model(
     data: torch.Tensor,
     design_matrix: torch.Tensor,
     run_starts: List[int],
+    tr: float,
     initial_r2: Optional[torch.Tensor] = None,
     r2_threshold: float = 0.1,
     max_components: int = 20,
@@ -532,6 +572,7 @@ def fit_denoising_model(
     metric: Literal["mean", "median"] = "median",
     min_noise_voxels: int = 100,
     max_noise_fraction: float = 0.5,
+    chunk_size: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> DenoiseResults:
@@ -615,8 +656,10 @@ def fit_denoising_model(
         results_init = fit_glm(
             data=data,
             design=design_matrix,
-            nuisance=nuisance,
-            return_residuals=False,
+            tr=tr,
+            extra_regressors=nuisance,
+            want_residuals=False,
+            chunk_size=chunk_size,
             device=device,
         )
         initial_r2 = results_init.r2
@@ -630,10 +673,11 @@ def fit_denoising_model(
 
     # Step 2: Select noise pool and criteria voxels
     if verbose:
-        print(
-            f"\nStep 2: Selecting noise pool (R² < {r2_threshold}) and criteria voxels..."
-        )
+        print(f"\nStep 2: Selecting noise pool (R² < {r2_threshold}) and criteria voxels...")
 
+    # At this point initial_r2 is guaranteed to be set (either provided or computed)
+    assert initial_r2 is not None, "initial_r2 should be set by this point"
+    
     noise_pool_mask, criteria_mask = select_noise_pool_voxels(
         r2=initial_r2,
         threshold=r2_threshold,
@@ -645,12 +689,8 @@ def fit_denoising_model(
     n_criteria = criteria_mask.sum().item()
 
     if verbose:
-        print(
-            f"  Noise pool: {n_noise:,} voxels ({n_noise / data.shape[0] * 100:.1f}%)"
-        )
-        print(
-            f"  Criteria: {n_criteria:,} voxels ({n_criteria / data.shape[0] * 100:.1f}%)"
-        )
+        print(f"  Noise pool: {n_noise:,} voxels ({n_noise / data.shape[0] * 100:.1f}%)")
+        print(f"  Criteria: {n_criteria:,} voxels ({n_criteria / data.shape[0] * 100:.1f}%)")
 
     # Step 3: Extract noise PCs per run
     if verbose:
@@ -670,19 +710,19 @@ def fit_denoising_model(
     if verbose:
         print(f"\nStep 4: Cross-validating PC selection...")
 
-    r2_by_n_components, r2_median_by_n_components, r2_per_fold = (
-        cross_validate_noise_pcs(
-            data=data,
-            design_matrix=design_matrix,
-            noise_pcs=noise_pcs,
-            run_starts=run_starts,
-            criteria_mask=criteria_mask,
-            max_components=max_components,
-            nuisance=nuisance,
-            metric=metric,
-            device=device,
-            verbose=verbose,
-        )
+    r2_by_n_components, r2_median_by_n_components, r2_per_fold = cross_validate_noise_pcs(
+        data=data,
+        design_matrix=design_matrix,
+        noise_pcs=noise_pcs,
+        run_starts=run_starts,
+        criteria_mask=criteria_mask,
+        max_components=max_components,
+        tr=tr,
+        nuisance=nuisance,
+        metric=metric,
+        chunk_size=chunk_size,
+        device=device,
+        verbose=verbose,
     )
 
     # Select optimal number of components

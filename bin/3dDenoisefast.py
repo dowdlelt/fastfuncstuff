@@ -770,8 +770,9 @@ def main():
         tr=args.tr,
         microtime_dt=args.microtime_dt,
         device=device,
-    )
-
+    )    
+    # Type assertion for pyright (return_single_trials=False returns Tensor, not tuple)
+    assert isinstance(task_design, torch.Tensor), "task_design should be Tensor when return_single_trials=False"
     # Build polynomial nuisance regressors
     poly_list = []
     for run_idx in range(n_runs):
@@ -823,6 +824,12 @@ def main():
     print("=" * 70)
     print("Fitting cross-validated denoising model...")
     print("=" * 70)
+    
+    # Memory strategy:
+    # - PCA needs noise pool voxels loaded (subset of data - can't chunk)
+    # - GLM fitting chunks voxels automatically via chunk_size
+    # - PCs are cached timecourses (tiny memory footprint)
+    # - For 16GB GPU: chunk_size=None (auto) works for most datasets
 
     results = fit_denoising_model(
         data=data,
@@ -832,9 +839,11 @@ def main():
         max_components=args.max_pcs,
         variance_threshold=args.variance_threshold,
         nuisance=nuisance,
+        tr=args.tr,
         metric=args.cv_metric,
         min_noise_voxels=args.min_noise_voxels,
         max_noise_fraction=args.max_noise_fraction,
+        chunk_size=args.batch_size,  # Pass through for memory-aware GLM fitting
         device=device,
         verbose=args.verbose,
     )
