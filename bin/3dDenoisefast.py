@@ -830,6 +830,7 @@ def main():
     # - GLM fitting chunks voxels automatically via chunk_size
     # - PCs are cached timecourses (tiny memory footprint)
     # - For 16GB GPU: chunk_size=None (auto) works for most datasets
+    # - When keep_on_cpu=True: set preload_data_to_device=False to avoid GPU OOM
 
     results = fit_denoising_model(
         data=data,
@@ -843,7 +844,8 @@ def main():
         metric=args.cv_metric,
         min_noise_voxels=args.min_noise_voxels,
         max_noise_fraction=args.max_noise_fraction,
-        chunk_size=args.batch_size,  # Pass through for memory-aware GLM fitting
+        chunk_size=None,  # Auto-detect based on available memory
+        preload_data_to_device=not keep_on_cpu,  # Don't preload if using CPU chunking
         device=device,
         verbose=args.verbose,
     )

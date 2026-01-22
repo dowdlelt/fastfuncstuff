@@ -266,6 +266,7 @@ def fit_glm_with_noise_pcs(
     nuisance: Optional[torch.Tensor] = None,
     eval_mask: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
+    preload_data_to_device: bool = True,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -356,6 +357,7 @@ def fit_glm_with_noise_pcs(
         extra_regressors=combined_nuisance if combined_nuisance.shape[1] > 0 else None,
         want_residuals=False,
         chunk_size=chunk_size,
+        preload_data_to_device=preload_data_to_device,
         device=device,
     )
 
@@ -377,6 +379,7 @@ def cross_validate_noise_pcs(
     nuisance: Optional[torch.Tensor] = None,
     metric: Literal["mean", "median"] = "median",
     chunk_size: Optional[int] = None,
+    preload_data_to_device: bool = True,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -489,6 +492,7 @@ def cross_validate_noise_pcs(
                     extra_regressors=nuisance_train,
                     want_residuals=False,
                     chunk_size=chunk_size,
+                    preload_data_to_device=preload_data_to_device,
                     device=device,
                 )
                 betas_train = train_results.betas
@@ -503,6 +507,7 @@ def cross_validate_noise_pcs(
                     n_pcs_to_use=n_pcs,
                     nuisance=nuisance_train,
                     chunk_size=chunk_size,
+                    preload_data_to_device=preload_data_to_device,
                     device=device,
                 )
 
@@ -573,6 +578,7 @@ def fit_denoising_model(
     min_noise_voxels: int = 100,
     max_noise_fraction: float = 0.5,
     chunk_size: Optional[int] = None,
+    preload_data_to_device: bool = True,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> DenoiseResults:
@@ -660,6 +666,7 @@ def fit_denoising_model(
             extra_regressors=nuisance,
             want_residuals=False,
             chunk_size=chunk_size,
+            preload_data_to_device=preload_data_to_device,
             device=device,
         )
         initial_r2 = results_init.r2
@@ -721,6 +728,7 @@ def fit_denoising_model(
         nuisance=nuisance,
         metric=metric,
         chunk_size=chunk_size,
+        preload_data_to_device=preload_data_to_device,
         device=device,
         verbose=verbose,
     )
