@@ -434,12 +434,13 @@ def cross_validate_noise_pcs(
     if verbose:
         print(f"\n{'=' * 70}")
         print(f"Cross-validating noise PC denoising (0 to {max_components} PCs)")
+        print(f"Strategy: Leave-one-run-out ({n_runs} folds, each fold holds out 1 run)")
         print(f"{'=' * 70}")
 
     # Leave-one-run-out cross-validation
     for held_out_run in range(n_runs):
         if verbose:
-            print(f"\nFold {held_out_run + 1}/{n_runs}: Held-out run {held_out_run + 1}")
+            print(f"\nCV Fold {held_out_run + 1}/{n_runs}: Testing on run {held_out_run + 1}, training on {n_runs - 1} other runs")
 
         # Split data into train and test
         train_runs = [i for i in range(n_runs) if i != held_out_run]
@@ -455,8 +456,9 @@ def cross_validate_noise_pcs(
         test_end = run_starts[held_out_run + 1] if held_out_run < n_runs - 1 else data.shape[1]
         test_tps = list(range(test_start, test_end))
 
-        train_tps = torch.tensor(train_tps, device=device)
-        test_tps = torch.tensor(test_tps, device=device)
+        # Indices must be on same device as data for indexing (CPU when keep_on_cpu=True)
+        train_tps = torch.tensor(train_tps, device=data.device)
+        test_tps = torch.tensor(test_tps, device=data.device)
 
         # Extract train/test data
         data_train = data[:, train_tps]
@@ -658,6 +660,7 @@ def fit_denoising_model(
     if initial_r2 is None:
         if verbose:
             print("\nStep 1: Computing initial R² for noise pool selection...")
+            print("  (fitting concatenated data across all runs)")
 
         results_init = fit_glm(
             data=data,
@@ -668,6 +671,7 @@ def fit_denoising_model(
             chunk_size=chunk_size,
             preload_data_to_device=preload_data_to_device,
             device=device,
+            verbose=False,  # Suppress verbose to avoid "1 runs" confusion
         )
         initial_r2 = results_init.r2
 
