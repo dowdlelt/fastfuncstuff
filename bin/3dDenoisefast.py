@@ -28,7 +28,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -45,23 +45,23 @@ try:
         load_afni_mask,
         load_and_concatenate_runs,
     )
-    from fastfuncsim.design_builder import parse_afni_timing_file
     from fastfuncsim.denoise import (
-        fit_denoising_model,
         DenoiseResults,
+        fit_denoising_model,
     )
-    from fastfuncsim.glm_core import fit_glm, construct_polynomial_matrix
     from fastfuncsim.design import convolve_hrf_microtime
-    from fastfuncsim.hrf import get_canonical_hrf
+    from fastfuncsim.design_builder import parse_afni_timing_file
+    from fastfuncsim.glm_core import construct_polynomial_matrix
+    from fastfuncsim.hrf import get_spmg1_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
-    from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d, to_tensor
+    from fastfuncsim.utils import gaussian_blur_3d, get_device, scale_to_percent_signal, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
     sys.exit(1)
 
 
-def parse_input_files(input_arg: Union[str, List[str]]) -> List[str]:
+def parse_input_files(input_arg: Union[str, list[str]]) -> list[str]:
     """Parse input files (can be list from nargs='+' or single string)"""
     if isinstance(input_arg, str):
         input_arg = input_arg.strip().strip('"').strip("'")
@@ -88,10 +88,10 @@ def parse_input_files(input_arg: Union[str, List[str]]) -> List[str]:
 
 
 def parse_durations(
-    durations_arg: List[str],
+    durations_arg: list[str],
     n_conditions: int,
-    condition_labels: List[str],
-) -> List[float]:
+    condition_labels: list[str],
+) -> list[float]:
     """Parse durations argument."""
     if len(durations_arg) == 1:
         # Single duration for all conditions
@@ -132,21 +132,23 @@ Examples:
                 -tr 2.0 \\
                 -prefix subject01_denoised
 
-  # Custom R² threshold for noise pool selection
+  # With full diagnostic plots and model fit outputs
   3dDenoisefast -input run*.nii.gz \\
                 -onsets face.txt house.txt \\
                 -durations 2.0 \\
-                -tr 1.5 \\
-                -r2_threshold 0.15 \\
-                -prefix sub01_r2_015
+                -tr 2.0 \\
+                -plots full \\
+                -save_model_fit \\
+                -prefix sub01_full_diagnostics
 
-  # With mask and more PCs
+  # With mask and spatial PC weight maps
   3dDenoisefast -input run*.nii.gz \\
                 -onsets stim.txt \\
                 -durations 1.0 \\
                 -tr 2.0 \\
                 -mask brain_mask.nii.gz \\
                 -max_pcs 30 \\
+                -save_pcs both \\
                 -prefix masked_denoised
 
   # With motion nuisance regressors
@@ -158,13 +160,29 @@ Examples:
                 -prefix sub01_motion_denoised
 
 Outputs:
-  {prefix}_noise_pool_mask.nii.gz    - Noise pool voxels (low task R²)
-  {prefix}_criteria_mask.nii.gz      - Criteria voxels (high task R²)
-  {prefix}_initial_r2.nii.gz         - Initial R² before denoising
-  {prefix}_xval_r2_by_npcs.npy       - CV R² for each number of PCs
-  {prefix}_noise_pcs.pt              - Noise PCs for optimal denoising
-  {prefix}_metadata.json             - Full metadata for reproducibility
-  {prefix}_denoising_report.png      - Visualization of results
+    Core outputs (always saved):
+        {prefix}_noise_pool_mask.nii.gz       - Noise pool voxels (low task R²)
+        {prefix}_criteria_mask.nii.gz         - Criteria voxels (high task R²)
+        {prefix}_initial_r2.nii.gz            - Initial xval R² (task-only)
+        {prefix}_xval_r2_optimal.nii.gz       - Xval R² at optimal PC count (criteria voxels)
+        {prefix}_xval_r2_optimal_full.nii.gz  - Xval R² at optimal PC count (all voxels)
+        {prefix}_xval_r2_optimal_per_fold.nii.gz - Per-fold xval R² at optimal PCs (4D)
+        {prefix}_xval_r2_by_npcs.npy          - CV R² for each number of PCs
+        {prefix}_metadata.json                - Full metadata for reproducibility
+
+  With -save_pcs timecourse/both:
+    {prefix}_noise_pcs.pt              - PC timecourses (.pt PyTorch file)
+
+  With -save_pcs spatial/both:
+    {prefix}_run01_pc_weights.nii.gz   - Spatial PC weights per run (4D NIfTI)
+
+  With -plots yes/full:
+    {prefix}_denoising_summary.png     - CV performance summary
+    {prefix}_pc_diagnostics_PC01.png   - Per-PC timecourse plots (full mode)
+
+    With -save_model_fit:
+        {prefix}_initial_betas.nii.gz      - Initial model betas (4D)
+        {prefix}_denoised_betas.nii.gz     - Denoised model betas (4D)
 
 Workflow:
   1. Fit initial GLM to compute R² for each voxel
@@ -220,8 +238,8 @@ Notes:
     denoise_opts.add_argument(
         "-r2_threshold",
         type=float,
-        default=0.1,
-        help="R² threshold for noise pool selection (default: 0.1). "
+        default=0.05,
+        help="R² threshold for noise pool selection (default: 0.05). "
         "Voxels with R² < threshold are noise pool, >= threshold are criteria.",
     )
     denoise_opts.add_argument(
@@ -229,6 +247,35 @@ Notes:
         type=int,
         default=20,
         help="Maximum number of PCs to test (default: 20)",
+    )
+    denoise_opts.add_argument(
+        "-pcstop",
+        type=float,
+        default=1.05,
+        help="PC selection stopping threshold (default: 1.05, GLMdenoise-style). "
+        ">=1: Stop when R² is within (pcstop-1)*100%% of max (e.g., 1.05 = 5%%). "
+        "<0: Use exactly abs(pcstop) PCs (user override). "
+        "=1: Pure argmax (pick maximum R²).",
+    )
+    denoise_opts.add_argument(
+        "-pcR2cutoff",
+        type=float,
+        default=None,
+        help="R² cutoff for PC selection (GLMdenoise default: 0.05). "
+        "If set, only voxels with max R² > cutoff across any PC count are used "
+        "to compute the selection curve. More robust to noisy voxels.",
+    )
+    denoise_opts.add_argument(
+        "-brainthresh",
+        nargs=2,
+        type=float,
+        metavar=("PERCENTILE", "FRACTION"),
+        default=None,
+        help="Signal intensity threshold for noise pool selection (GLMdenoise-style). "
+        "PERCENTILE: percentile of mean intensity (e.g., 99). "
+        "FRACTION: fraction of that percentile (e.g., 0.5). "
+        "Voxels with mean intensity < PERCENTILE * FRACTION are excluded from noise pool. "
+        "Applied BEFORE scaling. Example: -brainthresh 99 0.5",
     )
     denoise_opts.add_argument(
         "-min_noise_voxels",
@@ -239,7 +286,7 @@ Notes:
     denoise_opts.add_argument(
         "-max_noise_fraction",
         type=float,
-        default=0.5,
+        default=0.95,
         help="Maximum fraction of voxels in noise pool (default: 0.5)",
     )
     denoise_opts.add_argument(
@@ -247,6 +294,23 @@ Notes:
         type=float,
         default=0.95,
         help="Cumulative variance threshold for PC extraction (default: 0.95)",
+    )
+    denoise_opts.add_argument(
+        "-cv_strategy",
+        default="loro",
+        help=(
+            "Cross-validation strategy. Options: "
+            "'loro' or '1' for leave-one-run-out (default), "
+            "'0.5' for split-halves, "
+            "any float (0-1) for that train fraction, "
+            "any int > 1 for leave-N-out"
+        ),
+    )
+    denoise_opts.add_argument(
+        "-n_perms",
+        type=int,
+        default=100,
+        help="Max number of CV permutations for random splits (default: 100)",
     )
     denoise_opts.add_argument(
         "-cv_metric",
@@ -323,20 +387,75 @@ Notes:
     # Output options
     out_opts = parser.add_argument_group("Output Options")
     out_opts.add_argument(
-        "-save_plots",
-        action="store_true",
-        help="Save denoising performance plots as PNG",
+        "-plots",
+        type=str,
+        choices=["no", "yes", "full"],
+        default="no",
+        help="Save diagnostic plots: 'no' (none), 'yes' (summary), 'full' (summary + per-PC plots)",
     )
     out_opts.add_argument(
-        "-no_save_pcs",
+        "-plot_ax",
+        type=str,
+        choices=["x", "y", "z"],
+        default="x",
+        help="Slice axis for PC spatial maps: 'x' (sagittal), 'y' (coronal), 'z' (axial)",
+    )
+    out_opts.add_argument(
+        "-save_pcs",
+        type=str,
+        choices=["no", "timecourse", "spatial", "both"],
+        default="timecourse",
+        help="Save noise PCs: 'no', 'timecourse' (default: .pt file), 'spatial' (NIfTI weight maps), 'both'",
+    )
+    out_opts.add_argument(
+        "-save_model_fit",
         action="store_true",
-        help="Don't save noise PCs (reduces output file size)",
+        help="Save initial and final (denoised) model fit outputs (betas, tstats) as NIfTI",
+    )
+    out_opts.add_argument(
+        "-snr",
+        action="store_true",
+        help="Compute and save SNR (signal-to-noise ratio) outputs. "
+        "Creates SNR volumes before/after denoising and scatter plot comparison. "
+        "Computes both residual-based SNR and bootstrap-based SNR (if -numboots > 0).",
+    )
+    out_opts.add_argument(
+        "-numboots",
+        type=int,
+        default=0,
+        help="Number of bootstrap iterations for SE estimation (default: 0 = no bootstrapping). "
+        "Recommended: 100-1000 for robust SE. Enables bootstrap-based SNR if -snr is also set.",
     )
 
     # Help
     parser.add_argument("-help", action="store_true", help="Show this help message")
 
     return parser
+
+
+def parse_cv_strategy(cv_str: str) -> Union[int, float]:
+    """Parse CV strategy string into int or float."""
+    cv_str = cv_str.lower().strip()
+
+    if cv_str in ["loro", "loo"]:
+        return 1  # Leave-one-run-out
+
+    try:
+        # Try parsing as float first
+        val = float(cv_str)
+        if val == int(val) and val > 1:
+            return int(val)  # Leave-N-out
+        elif 0 < val < 1:
+            return val  # Split fraction
+        elif val == 1:
+            return 1  # LORO
+        else:
+            print(f"ERROR: Invalid cv_strategy value: {cv_str}")
+            print("  Must be 'loro', int > 0, or float in (0, 1)")
+            sys.exit(1)
+    except ValueError:
+        print(f"ERROR: Could not parse cv_strategy: {cv_str}")
+        sys.exit(1)
 
 
 def print_header(args):
@@ -353,9 +472,13 @@ def save_denoising_results(
     output_prefix: str,
     volume_shape: tuple,
     affine: np.ndarray,
+    run_starts: list[int],
+    tr: float,
     voxel_mask: Optional[torch.Tensor] = None,
-    save_plots: bool = False,
-    save_pcs: bool = True,
+    plots_mode: str = "no",
+    slice_axis: str = "x",
+    save_pcs_mode: str = "timecourse",
+    condition_labels: Optional[list[str]] = None,
 ):
     """
     Save denoising results to disk
@@ -370,12 +493,18 @@ def save_denoising_results(
         Shape of 3D volume
     affine : np.ndarray
         Affine matrix for NIfTI files
+    run_starts : list of int
+        Starting timepoint for each run
+    tr : float
+        Repetition time in seconds
     voxel_mask : torch.Tensor, optional
         Voxel mask (if brain mask was used)
-    save_plots : bool
-        Save visualization plots
-    save_pcs : bool
-        Save noise PCs
+    plots_mode : str
+        'no', 'yes' (summary only), or 'full' (summary + per-PC)
+    save_pcs_mode : str
+        'no', 'timecourse', 'spatial', or 'both'
+    condition_labels : list of str, optional
+        Labels for task conditions
 
     Returns
     -------
@@ -383,12 +512,17 @@ def save_denoising_results(
         Dictionary of output file paths
     """
     output_files = {}
+    voxel_mask_np = voxel_mask.cpu().numpy() if voxel_mask is not None else None
+
+    # Note: Results already have extreme R² voxels excluded via valid_voxel_mask
+    # All results tensors are in the same space as the input data (no reallocation was done)
+    # So we can use voxel_mask directly without modification
 
     # Helper to reshape flat data to volume
     def to_volume(flat_data):
-        if voxel_mask is not None:
-            vol = np.zeros(voxel_mask.shape[0], dtype=flat_data.dtype)
-            vol[voxel_mask.cpu().numpy()] = flat_data
+        if voxel_mask_np is not None:
+            vol = np.zeros(voxel_mask_np.shape[0], dtype=flat_data.dtype)
+            vol[voxel_mask_np] = flat_data
         else:
             vol = flat_data
         return vol.reshape(volume_shape)
@@ -414,127 +548,611 @@ def save_denoising_results(
     nib.save(initial_r2_img, initial_r2_path)
     output_files["initial_r2"] = initial_r2_path
 
-    # 4. CV R² by number of PCs
+    # 3b. Xval R² at optimal PC count (criteria voxels only)
+    if results.xval_r2_optimal is not None:
+        xval_opt_vol = to_volume(results.xval_r2_optimal.cpu().numpy().astype(np.float32))
+        xval_opt_img = nib.Nifti1Image(xval_opt_vol, affine)
+        xval_opt_path = f"{output_prefix}_xval_r2_optimal.nii.gz"
+        nib.save(xval_opt_img, xval_opt_path)
+        output_files["xval_r2_optimal"] = xval_opt_path
+
+    # 3c. Xval R² at optimal PC count (all voxels)
+    if results.xval_r2_optimal_full is not None:
+        xval_opt_full_vol = to_volume(results.xval_r2_optimal_full.cpu().numpy().astype(np.float32))
+        xval_opt_full_img = nib.Nifti1Image(xval_opt_full_vol, affine)
+        xval_opt_full_path = f"{output_prefix}_xval_r2_optimal_full.nii.gz"
+        nib.save(xval_opt_full_img, xval_opt_full_path)
+        output_files["xval_r2_optimal_full"] = xval_opt_full_path
+
+    # 3d. Per-fold xval R² at optimal PCs (4D)
+    if results.xval_r2_optimal_per_fold is not None:
+        fold_vols = []
+        for fold_idx in range(results.xval_r2_optimal_per_fold.shape[0]):
+            fold_vol = to_volume(results.xval_r2_optimal_per_fold[fold_idx].astype(np.float32))
+            fold_vols.append(fold_vol)
+
+        fold_4d = np.stack(fold_vols, axis=-1)
+        fold_img = nib.Nifti1Image(fold_4d, affine)
+        fold_path = f"{output_prefix}_xval_r2_optimal_per_fold.nii.gz"
+        nib.save(fold_img, fold_path)
+        output_files["xval_r2_optimal_per_fold"] = fold_path
+
+    # 4. CV R² arrays
     xval_r2_path = f"{output_prefix}_xval_r2_by_npcs.npy"
     np.save(xval_r2_path, results.xval_r2_by_n_components)
     output_files["xval_r2_by_npcs"] = xval_r2_path
 
-    # 5. CV R² per fold
     xval_r2_folds_path = f"{output_prefix}_xval_r2_per_fold.npy"
     np.save(xval_r2_folds_path, results.xval_r2_per_fold)
     output_files["xval_r2_per_fold"] = xval_r2_folds_path
 
-    # 6. Noise PCs (optional - can be large)
-    if save_pcs:
-        pcs_path = f"{output_prefix}_noise_pcs.pt"
-        torch.save(
-            {
-                "noise_pcs_per_run": results.noise_pcs_per_run,
-                "optimal_n_components": results.optimal_n_components,
-            },
-            pcs_path,
-        )
-        output_files["noise_pcs"] = pcs_path
-
-    # 7. Metadata
+    # 5. Metadata
     metadata = {
         **results.metadata,
         "optimal_n_components": results.optimal_n_components,
         "baseline_r2": results.baseline_r2,
         "optimal_r2": results.optimal_r2,
         "improvement": results.improvement,
-        "volume_shape": volume_shape,
+        "volume_shape": list(volume_shape),
+        "tr": tr,
+        "run_starts": run_starts,
     }
+    if condition_labels:
+        metadata["condition_labels"] = condition_labels
 
     metadata_path = f"{output_prefix}_metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     output_files["metadata"] = metadata_path
 
-    # 8. Plots (optional)
-    if save_plots:
-        import matplotlib.pyplot as plt
-
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-
-        # CV R² by number of PCs
-        ax = axes[0, 0]
-        ax.plot(results.xval_r2_by_n_components, "o-", label="Mean")
-        ax.plot(results.xval_r2_median_by_n_components, "s--", alpha=0.7, label="Median")
-        ax.axvline(
-            results.optimal_n_components,
-            color="r",
-            linestyle="--",
-            alpha=0.5,
-            label=f"Optimal ({results.optimal_n_components} PCs)",
+    # 6. Noise PCs (based on save_pcs_mode)
+    if save_pcs_mode in ["timecourse", "both"]:
+        pcs_path = f"{output_prefix}_noise_pcs.pt"
+        torch.save(
+            {
+                "noise_pcs_per_run": results.noise_pcs_per_run,
+                "optimal_n_components": results.optimal_n_components,
+                "run_starts": run_starts,
+            },
+            pcs_path,
         )
-        ax.set_xlabel("Number of PCs")
-        ax.set_ylabel("Cross-validated R²")
-        ax.set_title("Denoising Performance")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        output_files["noise_pcs_timecourse"] = pcs_path
 
-        # R² per fold heatmap
-        ax = axes[0, 1]
-        im = ax.imshow(results.xval_r2_per_fold, aspect="auto", cmap="viridis")
-        ax.set_xlabel("Number of PCs")
-        ax.set_ylabel("CV Fold (run)")
-        ax.set_title("R² per CV Fold")
-        plt.colorbar(im, ax=ax, label="R²")
+    if save_pcs_mode in ["spatial", "both"]:
+        # Save PC spatial weights as NIfTI files (per run, per PC)
+        if results.pc_loadings_per_run is not None:
+            # Helper to reshape noise pool loadings to full volume
+            noise_pool_np = results.noise_pool_mask.cpu().numpy()
 
-        # Initial R² distribution
-        ax = axes[1, 0]
-        r2_cpu = results.noise_pool_r2.cpu().numpy()
-        ax.hist(r2_cpu, bins=50, alpha=0.7, edgecolor="black")
-        ax.axvline(
-            results.metadata["r2_threshold"],
-            color="r",
-            linestyle="--",
-            label=f"Threshold = {results.metadata['r2_threshold']:.2f}",
+            def loadings_to_volume(loadings_flat):
+                """Map noise pool loadings back to full volume (zeros outside noise pool)"""
+                if voxel_mask_np is not None:
+                    # Two-level mask: voxel_mask (full volume) and noise_pool (within masked voxels)
+                    # Map noise_pool indices into full-volume indices via voxel_mask
+                    brain_indices = np.where(voxel_mask_np)[0]
+                    noise_pool_indices = brain_indices[noise_pool_np]
+                    vol = np.zeros(np.prod(volume_shape), dtype=loadings_flat.dtype)
+                    vol[noise_pool_indices] = loadings_flat
+                else:
+                    # No brain mask, noise_pool is directly in volume space
+                    vol = np.zeros(np.prod(volume_shape), dtype=loadings_flat.dtype)
+                    vol[noise_pool_np] = loadings_flat
+                return vol.reshape(volume_shape)
+
+            n_runs = len(results.pc_loadings_per_run)
+            for run_idx, loadings in enumerate(results.pc_loadings_per_run):
+                loadings_np = loadings.cpu().numpy() if torch.is_tensor(loadings) else loadings
+                n_pcs = loadings_np.shape[1]
+
+                # Save each PC as a separate volume (or combine into 4D)
+                pc_vols = []
+                for pc_idx in range(
+                    min(n_pcs, results.optimal_n_components + 3)
+                ):  # Save optimal + a few more
+                    pc_vol = loadings_to_volume(loadings_np[:, pc_idx])
+                    pc_vols.append(pc_vol)
+
+                # Stack into 4D and save
+                pc_4d = np.stack(pc_vols, axis=-1)
+                pc_img = nib.Nifti1Image(pc_4d, affine)
+                pc_path = f"{output_prefix}_run{run_idx + 1:02d}_pc_weights.nii.gz"
+                nib.save(pc_img, pc_path)
+                output_files[f"run{run_idx + 1}_pc_weights"] = pc_path
+
+            print(f"  Saved PC spatial weights for {n_runs} runs")
+        else:
+            print("  Warning: PC loadings not available (run with return_loadings=True)")
+
+    # 6b. Save selected PCs as text files (one per run)
+    # These are the PC timecourses for the optimal number of components
+    n_runs = len(results.noise_pcs_per_run)
+    for run_idx, pcs in enumerate(results.noise_pcs_per_run):
+        pcs_np = pcs.cpu().numpy() if torch.is_tensor(pcs) else pcs
+        # Take only the selected (optimal) number of PCs
+        n_selected = min(results.optimal_n_components, pcs_np.shape[1])
+        selected_pcs = pcs_np[:, :n_selected]
+
+        pc_txt_path = f"{output_prefix}_run{run_idx + 1:02d}_selected_PCs.txt"
+        # Save with header
+        with open(pc_txt_path, "w") as f:
+            f.write(f"# Selected noise PCs for run {run_idx + 1}\n")
+            f.write(f"# n_components: {n_selected}\n")
+            f.write(f"# Shape: {selected_pcs.shape[0]} timepoints x {selected_pcs.shape[1]} PCs\n")
+            f.write(f"# Columns: PC1, PC2, ..., PC{n_selected}\n")
+            np.savetxt(f, selected_pcs, fmt="%.6f", delimiter="\t")
+        output_files[f"run{run_idx + 1}_selected_pcs_txt"] = pc_txt_path
+
+    print(
+        f"  Saved selected PCs ({results.optimal_n_components} PCs) as text files for {n_runs} runs"
+    )
+
+    # 7. Plots (based on plots_mode)
+    if plots_mode in ["yes", "full"]:
+        try:
+            from fastfuncsim.visualization import plot_denoising_summary, plot_denoising_pcs
+
+            # Summary plot
+            r2_cpu = results.noise_pool_r2.cpu().numpy()
+            summary_fig = plot_denoising_summary(
+                xval_r2_by_n_components=results.xval_r2_by_n_components,
+                xval_r2_per_fold=results.xval_r2_per_fold,
+                optimal_n_components=results.optimal_n_components,
+                initial_r2_distribution=r2_cpu,
+                r2_threshold=results.metadata["r2_threshold"],
+                n_noise_voxels=results.metadata["n_noise_voxels"],
+                n_criteria_voxels=results.metadata["n_criteria_voxels"],
+                output_path=f"{output_prefix}_denoising_summary.png",
+            )
+            output_files["denoising_summary_plot"] = f"{output_prefix}_denoising_summary.png"
+            import matplotlib.pyplot as plt
+
+            plt.close(summary_fig)
+
+            # Per-PC plots (only for "full" mode)
+            if plots_mode == "full":
+                # Convert PC tensors to CPU for plotting
+                pcs_cpu = (
+                    [pc.cpu() for pc in results.noise_pcs_per_run]
+                    if results.noise_pcs_per_run
+                    else None
+                )
+                loadings_cpu = (
+                    [ld.cpu() for ld in results.pc_loadings_per_run]
+                    if results.pc_loadings_per_run
+                    else None
+                )
+
+                # Create combined mask: voxel_mask (brain) AND noise_pool_mask (low R²)
+                # This maps noise pool indices to full volume space
+                noise_pool_mask_np = results.noise_pool_mask.cpu().numpy()
+
+                pc_figs = plot_denoising_pcs(
+                    noise_pcs_per_run=pcs_cpu,
+                    run_starts=run_starts,
+                    pc_weights_per_run=loadings_cpu,
+                    volume_shape=volume_shape,
+                    voxel_mask=voxel_mask_np,
+                    noise_pool_mask=noise_pool_mask_np,
+                    n_pcs_to_show=results.metadata.get("max_components", 0),
+                    n_slices=5,
+                    slice_axis=slice_axis,
+                    tr=tr,
+                    optimal_n_pcs=results.optimal_n_components,
+                    output_prefix=f"{output_prefix}_pc_diagnostics",
+                )
+                output_files["pc_diagnostic_plots"] = f"{output_prefix}_pc_diagnostics_PC*.png"
+                for fig in pc_figs:
+                    plt.close(fig)
+
+        except ImportError as e:
+            print(f"  Warning: Could not import visualization module: {e}")
+        except Exception as e:
+            print(f"  Warning: Error creating plots: {e}")
+
+    return output_files
+
+
+def compute_bootstrap_se(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    n_task: int,
+    n_boots: int = 100,
+    chunk_size: int = 5000,
+    device: Optional[torch.device] = None,
+    verbose: bool = True,
+) -> np.ndarray:
+    """
+    Compute bootstrap standard errors for beta coefficients.
+
+    Uses residual bootstrap: resample residuals, add to fitted values, refit.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        (n_voxels, n_timepoints) fMRI data
+    design : torch.Tensor
+        (n_timepoints, n_regressors) full design matrix
+    n_task : int
+        Number of task regressors (first n columns)
+    n_boots : int
+        Number of bootstrap iterations
+    chunk_size : int
+        Voxels per batch
+    device : torch.device
+        Compute device
+    verbose : bool
+        Print progress
+
+    Returns
+    -------
+    bootstrap_se : np.ndarray
+        (n_voxels, n_task) standard error for each task beta
+    """
+    if device is None:
+        device = get_device()
+
+    n_voxels, n_timepoints = data.shape
+    n_regressors = design.shape[1]
+
+    # Storage for bootstrap betas
+    boot_betas = np.zeros((n_boots, n_voxels, n_task), dtype=np.float32)
+
+    # Compute original fit once
+    design_gpu = design.to(device)
+    XtX_inv = torch.linalg.inv(
+        design_gpu.T @ design_gpu + 1e-6 * torch.eye(n_regressors, device=device)
+    )
+
+    if verbose:
+        from tqdm import tqdm
+
+        boot_iter = tqdm(range(n_boots), desc="  Bootstrap iterations")
+    else:
+        boot_iter = range(n_boots)
+
+    for boot_idx in boot_iter:
+        # Resample timepoints with replacement
+        resample_idx = torch.randint(0, n_timepoints, (n_timepoints,), device=device)
+
+        design_boot = design_gpu[resample_idx, :]
+        XtX_inv_boot = torch.linalg.inv(
+            design_boot.T @ design_boot + 1e-6 * torch.eye(n_regressors, device=device)
         )
-        ax.set_xlabel("Initial R²")
-        ax.set_ylabel("Number of voxels")
-        ax.set_title("R² Distribution (Noise Pool Selection)")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
 
-        # Summary text
-        ax = axes[1, 1]
-        ax.axis("off")
-        summary_text = f"""
-Denoising Results
-{"=" * 40}
+        # Process in chunks
+        for chunk_start in range(0, n_voxels, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_voxels)
 
-Voxel Selection:
-  Noise pool: {results.metadata["n_noise_voxels"]:,} voxels
-  Criteria: {results.metadata["n_criteria_voxels"]:,} voxels
-  Threshold: R² < {results.metadata["r2_threshold"]:.2f}
+            data_chunk = data[chunk_start:chunk_end, :].to(device)
+            data_boot = data_chunk[:, resample_idx]
 
-Cross-Validation:
-  Strategy: Leave-one-run-out
-  Runs: {results.metadata["n_runs"]}
-  Max PCs: {results.metadata["max_components"]}
+            # OLS fit
+            betas_boot = (XtX_inv_boot @ design_boot.T @ data_boot.T).T  # (chunk, n_regressors)
+            boot_betas[boot_idx, chunk_start:chunk_end, :] = betas_boot[:, :n_task].cpu().numpy()
 
-Performance:
-  Baseline R²: {results.baseline_r2:.4f}
-  Optimal R²: {results.optimal_r2:.4f}
-  Improvement: {results.improvement:+.4f}
-  Optimal PCs: {results.optimal_n_components}
-        """
-        ax.text(
-            0.05,
-            0.5,
-            summary_text,
-            fontsize=9,
-            family="monospace",
-            verticalalignment="center",
-        )
+    # Compute SE as std across bootstrap samples
+    bootstrap_se = np.std(boot_betas, axis=0)  # (n_voxels, n_task)
 
-        plt.tight_layout()
-        plot_path = f"{output_prefix}_denoising_report.png"
-        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        output_files["denoising_report"] = plot_path
+    return bootstrap_se
+
+
+def compute_snr(
+    betas: np.ndarray,
+    residual_std: Optional[np.ndarray] = None,
+    bootstrap_se: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Compute SNR metrics from betas and noise estimates.
+
+    Parameters
+    ----------
+    betas : np.ndarray
+        (n_voxels, n_task) beta coefficients
+    residual_std : np.ndarray, optional
+        (n_voxels,) residual standard deviation
+    bootstrap_se : np.ndarray, optional
+        (n_voxels, n_task) bootstrap standard errors
+
+    Returns
+    -------
+    snr_dict : dict
+        'snr_residual': (n_voxels,) max|beta| / residual_std
+        'snr_bootstrap': (n_voxels,) max(|beta| / bootstrap_se)
+    """
+    result = {}
+
+    # Max absolute beta across conditions (the "signal")
+    max_abs_beta = np.max(np.abs(betas), axis=1)  # (n_voxels,)
+
+    # Residual-based SNR: signal / noise_floor
+    if residual_std is not None:
+        snr_residual = max_abs_beta / (residual_std + 1e-10)
+        result["snr_residual"] = snr_residual
+
+    # Bootstrap-based SNR: max of per-condition SNR
+    if bootstrap_se is not None:
+        # Per-condition SNR
+        per_cond_snr = np.abs(betas) / (bootstrap_se + 1e-10)  # (n_voxels, n_task)
+        snr_bootstrap = np.max(per_cond_snr, axis=1)  # (n_voxels,)
+        result["snr_bootstrap"] = snr_bootstrap
+
+    return result
+
+
+def save_snr_outputs(
+    snr_initial: dict,
+    snr_denoised: dict,
+    output_prefix: str,
+    volume_shape: tuple,
+    affine: np.ndarray,
+    voxel_mask: Optional[torch.Tensor] = None,
+    create_plots: bool = True,
+) -> dict:
+    """
+    Save SNR volumes and create before/after comparison plots.
+    """
+    output_files = {}
+    voxel_mask_np = voxel_mask.cpu().numpy() if voxel_mask is not None else None
+
+    def to_volume(flat_data):
+        if voxel_mask_np is not None:
+            vol = np.zeros(voxel_mask_np.shape[0], dtype=flat_data.dtype)
+            vol[voxel_mask_np] = flat_data
+        else:
+            vol = flat_data
+        return vol.reshape(volume_shape)
+
+    # Save residual-based SNR volumes
+    if "snr_residual" in snr_initial:
+        snr_vol = to_volume(snr_initial["snr_residual"].astype(np.float32))
+        snr_img = nib.Nifti1Image(snr_vol, affine)
+        snr_path = f"{output_prefix}_snr_residual_initial.nii.gz"
+        nib.save(snr_img, snr_path)
+        output_files["snr_residual_initial"] = snr_path
+
+    if "snr_residual" in snr_denoised:
+        snr_vol = to_volume(snr_denoised["snr_residual"].astype(np.float32))
+        snr_img = nib.Nifti1Image(snr_vol, affine)
+        snr_path = f"{output_prefix}_snr_residual_denoised.nii.gz"
+        nib.save(snr_img, snr_path)
+        output_files["snr_residual_denoised"] = snr_path
+
+    # Save bootstrap-based SNR volumes
+    if "snr_bootstrap" in snr_initial:
+        snr_vol = to_volume(snr_initial["snr_bootstrap"].astype(np.float32))
+        snr_img = nib.Nifti1Image(snr_vol, affine)
+        snr_path = f"{output_prefix}_snr_bootstrap_initial.nii.gz"
+        nib.save(snr_img, snr_path)
+        output_files["snr_bootstrap_initial"] = snr_path
+
+    if "snr_bootstrap" in snr_denoised:
+        snr_vol = to_volume(snr_denoised["snr_bootstrap"].astype(np.float32))
+        snr_img = nib.Nifti1Image(snr_vol, affine)
+        snr_path = f"{output_prefix}_snr_bootstrap_denoised.nii.gz"
+        nib.save(snr_img, snr_path)
+        output_files["snr_bootstrap_denoised"] = snr_path
+
+    # Create scatter plots
+    if create_plots:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+            # Residual-based SNR scatter
+            if "snr_residual" in snr_initial and "snr_residual" in snr_denoised:
+                ax = axes[0]
+                x = snr_initial["snr_residual"]
+                y = snr_denoised["snr_residual"]
+
+                # Subsample for plotting if too many points
+                if len(x) > 10000:
+                    idx = np.random.choice(len(x), 10000, replace=False)
+                    x_plot, y_plot = x[idx], y[idx]
+                else:
+                    x_plot, y_plot = x, y
+
+                ax.scatter(x_plot, y_plot, alpha=0.3, s=1, c="steelblue")
+                max_val = max(np.percentile(x, 99), np.percentile(y, 99))
+                ax.plot([0, max_val], [0, max_val], "k--", alpha=0.5, label="unity")
+                ax.set_xlabel("SNR (initial)")
+                ax.set_ylabel("SNR (denoised)")
+                ax.set_title(f"Residual-based SNR\nMean: {x.mean():.2f} → {y.mean():.2f}")
+                ax.set_xlim(0, max_val)
+                ax.set_ylim(0, max_val)
+                ax.legend()
+
+            # Bootstrap-based SNR scatter
+            if "snr_bootstrap" in snr_initial and "snr_bootstrap" in snr_denoised:
+                ax = axes[1]
+                x = snr_initial["snr_bootstrap"]
+                y = snr_denoised["snr_bootstrap"]
+
+                if len(x) > 10000:
+                    idx = np.random.choice(len(x), 10000, replace=False)
+                    x_plot, y_plot = x[idx], y[idx]
+                else:
+                    x_plot, y_plot = x, y
+
+                ax.scatter(x_plot, y_plot, alpha=0.3, s=1, c="darkorange")
+                max_val = max(np.percentile(x, 99), np.percentile(y, 99))
+                ax.plot([0, max_val], [0, max_val], "k--", alpha=0.5, label="unity")
+                ax.set_xlabel("SNR (initial)")
+                ax.set_ylabel("SNR (denoised)")
+                ax.set_title(f"Bootstrap-based SNR\nMean: {x.mean():.2f} → {y.mean():.2f}")
+                ax.set_xlim(0, max_val)
+                ax.set_ylim(0, max_val)
+                ax.legend()
+            else:
+                axes[1].text(
+                    0.5,
+                    0.5,
+                    "Bootstrap SNR\nnot computed\n(use -numboots)",
+                    ha="center",
+                    va="center",
+                    transform=axes[1].transAxes,
+                )
+                axes[1].set_title("Bootstrap-based SNR")
+
+            plt.tight_layout()
+            plot_path = f"{output_prefix}_snr_comparison.png"
+            fig.savefig(plot_path, dpi=150)
+            plt.close(fig)
+            output_files["snr_plot"] = plot_path
+
+        except Exception as e:
+            print(f"  Warning: Could not create SNR plots: {e}")
+
+    return output_files
+
+
+def save_model_fit_outputs(
+    results,  # GLMResults
+    output_prefix: str,
+    volume_shape: tuple,
+    affine: np.ndarray,
+    model_type: str,  # "initial" or "denoised"
+    condition_labels: Optional[list[str]] = None,
+    voxel_mask: Optional[torch.Tensor] = None,
+    n_timepoints: Optional[int] = None,
+    n_regressors: Optional[int] = None,
+    bootstrap_se: Optional[np.ndarray] = None,
+):
+    """
+    Save GLM model fit outputs (betas, tstats) as NIfTI files with AFNI labeling
+
+    AFNI-style output: betas and tstats are interleaved in a single 4D file
+    with sub-bricks ordered as: [beta1, tstat1, beta2, tstat2, ...]
+
+    Uses 3drefit to add proper AFNI sub-brick labels and DOF.
+
+    Parameters
+    ----------
+    results : GLMResults
+        GLM results from fit_glm
+    output_prefix : str
+        Output file prefix
+    volume_shape : tuple
+        Shape of 3D volume
+    affine : np.ndarray
+        Affine matrix for NIfTI files
+    model_type : str
+        "initial" or "denoised"
+    condition_labels : list of str, optional
+        Labels for task conditions
+    voxel_mask : torch.Tensor, optional
+        Voxel mask (if brain mask was used)
+    n_timepoints : int, optional
+        Number of timepoints (for DOF calculation)
+    n_regressors : int, optional
+        Total number of regressors in model (for DOF calculation)
+    bootstrap_se : np.ndarray, optional
+        Bootstrap standard errors (n_voxels, n_task) if available
+
+    Returns
+    -------
+    output_files : dict
+        Dictionary of output file paths
+    """
+    import subprocess
+    import shutil
+
+    output_files = {}
+    voxel_mask_np = voxel_mask.cpu().numpy() if voxel_mask is not None else None
+
+    def to_volume(flat_data):
+        if voxel_mask_np is not None:
+            vol = np.zeros(voxel_mask_np.shape[0], dtype=flat_data.dtype)
+            vol[voxel_mask_np] = flat_data
+        else:
+            vol = flat_data
+        return vol.reshape(volume_shape)
+
+    # Get number of task regressors (first n columns, rest are nuisance)
+    betas = results.betas.cpu().numpy() if torch.is_tensor(results.betas) else results.betas
+    n_total_regs = betas.shape[1]
+    n_task = len(condition_labels) if condition_labels else n_total_regs
+
+    # Get tstats if available
+    has_tstats = results.tstats is not None
+    if has_tstats:
+        tstats = results.tstats.cpu().numpy() if torch.is_tensor(results.tstats) else results.tstats
+
+    # Calculate DOF for t-statistics
+    dof = None
+    if n_timepoints is not None and n_regressors is not None:
+        dof = n_timepoints - n_regressors
+
+    # Build AFNI-style bucket file: interleaved betas and tstats
+    # Sub-brick order: [beta1, tstat1, beta2, tstat2, ...]
+    bucket_vols = []
+    sub_brick_labels = []
+    sub_brick_types = []  # 'coef' or 'tstat' for 3drefit
+
+    for reg_idx in range(n_task):
+        label = condition_labels[reg_idx] if condition_labels else f"reg{reg_idx}"
+
+        # Add beta
+        beta_vol = to_volume(betas[:, reg_idx].astype(np.float32))
+        bucket_vols.append(beta_vol)
+        sub_brick_labels.append(f"{label}#0_Coef")
+        sub_brick_types.append("coef")
+
+        # Add tstat (if available)
+        if has_tstats:
+            tstat_vol = to_volume(tstats[:, reg_idx].astype(np.float32))
+            bucket_vols.append(tstat_vol)
+            sub_brick_labels.append(f"{label}#0_Tstat")
+            sub_brick_types.append("tstat")
+
+    # Add bootstrap SE sub-bricks if available
+    if bootstrap_se is not None:
+        for reg_idx in range(n_task):
+            label = condition_labels[reg_idx] if condition_labels else f"reg{reg_idx}"
+            se_vol = to_volume(bootstrap_se[:, reg_idx].astype(np.float32))
+            bucket_vols.append(se_vol)
+            sub_brick_labels.append(f"{label}#0_SE")
+            sub_brick_types.append("se")
+
+    # Stack into 4D
+    bucket_4d = np.stack(bucket_vols, axis=-1)
+    bucket_img = nib.Nifti1Image(bucket_4d, affine)
+    bucket_path = f"{output_prefix}_{model_type}_bucket.nii.gz"
+    nib.save(bucket_img, bucket_path)
+    output_files[f"{model_type}_bucket"] = bucket_path
+
+    # Use 3drefit to add proper AFNI labels and DOF
+    has_3drefit = shutil.which("3drefit") is not None
+    if has_3drefit:
+        try:
+            refit_cmd = ["3drefit"]
+
+            # Add sub-brick labels
+            for i, label in enumerate(sub_brick_labels):
+                refit_cmd.extend(["-sublabel", str(i), label])
+
+            # Add DOF for t-stat sub-bricks
+            if dof is not None:
+                for i, sbtype in enumerate(sub_brick_types):
+                    if sbtype == "tstat":
+                        refit_cmd.extend(["-substatpar", str(i), "fitt", str(dof)])
+
+            refit_cmd.append(bucket_path)
+
+            subprocess.run(refit_cmd, check=True, capture_output=True)
+            print(f"  ✓ Applied AFNI labels to {bucket_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"  Warning: 3drefit failed: {e}")
+    else:
+        # Save sub-brick labels as text file fallback
+        labels_path = f"{output_prefix}_{model_type}_labels.txt"
+        with open(labels_path, "w") as f:
+            for i, label in enumerate(sub_brick_labels):
+                f.write(f"{i}\t{label}\n")
+        output_files[f"{model_type}_labels"] = labels_path
 
     return output_files
 
@@ -573,6 +1191,11 @@ def main():
     # Parse durations
     durations = parse_durations(args.durations, n_conditions, condition_labels)
     print(f"  Durations: {durations}s")
+
+    # Parse CV strategy
+    cv_strategy = parse_cv_strategy(args.cv_strategy)
+    if args.verbose:
+        print(f"  CV strategy: {cv_strategy}")
 
     # Setup device
     if args.device:
@@ -677,15 +1300,13 @@ def main():
         print(f"  ✓ Blurred and concatenated {n_runs} runs")
     else:
         # Standard loading
+        mask_flat = mask.flatten().astype(bool) if mask is not None else None
         data, run_starts = load_and_concatenate_runs(
             [Path(f) for f in input_files],
             device=device,
             keep_on_cpu=keep_on_cpu,
+            mask_flat=mask_flat,
         )
-
-        if mask is not None:
-            mask_flat = mask.flatten().astype(bool)
-            data = data[mask_flat, :]
 
     # Get TR
     if args.tr is None:
@@ -700,6 +1321,61 @@ def main():
         print(f"  TR (specified): {args.tr}s")
 
     n_voxels, n_timepoints = data.shape
+
+    # Compute brainthresh intensity mask BEFORE scaling
+    # This excludes low-intensity voxels from the noise pool
+    brainthresh_mask = None
+    if args.brainthresh is not None:
+        percentile, fraction = args.brainthresh
+        print()
+        print(f"Computing intensity threshold (brainthresh={percentile}, {fraction})...")
+
+        # Compute mean intensity per voxel (across time)
+        mean_intensity = data.mean(dim=1)  # Shape: (n_voxels,)
+
+        # Get the percentile value
+        percentile_value = torch.quantile(mean_intensity, percentile / 100.0)
+        threshold = percentile_value * fraction
+
+        # Create mask: True for voxels ABOVE threshold (valid voxels)
+        brainthresh_mask = mean_intensity > threshold
+        n_above = brainthresh_mask.sum().item()
+
+        print(f"  {percentile:.0f}th percentile intensity: {percentile_value:.2f}")
+        print(f"  Threshold ({fraction:.2f} × {percentile_value:.2f}): {threshold:.2f}")
+        print(
+            f"  Voxels above threshold: {n_above:,} of {n_voxels:,} ({n_above / n_voxels * 100:.1f}%)"
+        )
+
+    # Filter out voxels with zero/low variance in ANY run (edge artifacts)
+    # This prevents extreme negative R² values from runs with all-zero data
+    print()
+    print("Filtering voxels with invalid data in any run...")
+    valid_per_run_mask = torch.ones(n_voxels, dtype=torch.bool, device=data.device)
+
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_data = data[:, start_tp:end_tp]
+
+        # Check for runs with zero variance (constant or all-zero)
+        run_std = run_data.std(dim=1)
+        run_valid = run_std > 1e-6  # Require non-zero variance
+
+        valid_per_run_mask &= run_valid
+
+    n_valid = valid_per_run_mask.sum().item()
+    n_invalid = n_voxels - n_valid
+
+    if n_invalid > 0:
+        print(f"  Removed {n_invalid:,} voxels with zero/constant values in any run")
+        print(f"  Valid voxels: {n_valid:,} ({n_valid / n_voxels * 100:.1f}%)")
+
+        # Combine with brainthresh mask if it exists
+        if brainthresh_mask is not None:
+            brainthresh_mask = brainthresh_mask & valid_per_run_mask
+        else:
+            brainthresh_mask = valid_per_run_mask
 
     # Optional scaling
     if args.do_scale:
@@ -766,11 +1442,12 @@ def main():
                         cond_idx,
                     ] = 1.0
 
-    # Get canonical HRF at microtime resolution
-    hrf = get_canonical_hrf(
+    # Get canonical HRF at microtime resolution (SPMG1 - matches 3dHRFoptfast)
+    hrf = get_spmg1_hrf(
+        microtime_dt=args.microtime_dt,  # Sample at microtime resolution
         stim_duration=0.0,  # Impulse response (duration handled in onset matrix)
-        tr=args.microtime_dt,  # Sample at microtime resolution
-        duration=32.0,
+        hrf_duration=32.0,
+        normalize_peak=True,
         device=device,
     )
 
@@ -863,19 +1540,11 @@ def main():
             nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], padding], dim=1)
 
     # Summary
-    print(f"  Task predictors: {task_design.shape[1]} (shared across all runs)")
-    print(
-        f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]} (run-specific, column-padded)"
-    )
+    print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
+    print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
     print(
         f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}"
     )
-    print(f"  Condition labels: {condition_labels}")
-    print(f"  Task predictors: {task_design.shape[1]}")
-    print(
-        f"  Nuisance predictors per run: {[n.shape[1] for n in nuisance_per_run]} (column-padded for CV)"
-    )
-    print(f"  Condition labels: {condition_labels}")
 
     # ==========================================================================
     # Fit denoising model
@@ -893,20 +1562,39 @@ def main():
     # - For 16GB GPU: chunk_size=None (auto) works for most datasets
     # - When keep_on_cpu=True: set preload_data_to_device=False to avoid GPU OOM
 
+    # Determine chunk_size based on device:
+    # - CPU: process all voxels at once (no GPU memory limit)
+    # - GPU: auto-detect based on available memory
+    if device.type == "cpu":
+        chunk_size = n_voxels  # Process all voxels at once on CPU
+        if args.verbose:
+            print(f"  CPU mode: chunk_size = {n_voxels:,} (all voxels)")
+    else:
+        chunk_size = None  # Auto-detect for GPU
+
     results = fit_denoising_model(
         data=data,
         design_matrix=task_design,
         run_starts=run_starts,
         r2_threshold=args.r2_threshold,
+        intensity_mask=brainthresh_mask,  # Intensity threshold for noise pool
         max_components=args.max_pcs,
         variance_threshold=args.variance_threshold,
         nuisance=nuisance_per_run,  # Pass as list per run (cleaner bookkeeping!)
         tr=args.tr,
+        polort=args.polort,
         metric=args.cv_metric,
         min_noise_voxels=args.min_noise_voxels,
         max_noise_fraction=args.max_noise_fraction,
-        chunk_size=None,  # Auto-detect based on available memory
+        pcstop=args.pcstop,  # GLMdenoise-style early stopping
+        pcR2cutoff=args.pcR2cutoff,  # R² cutoff for PC selection voxels
+        cv_strategy=cv_strategy,  # CV split strategy (1=LORO, float=split fraction, int>1=leave-N-out)
+        n_perms=args.n_perms,  # Max CV permutations for random splits
+        chunk_size=chunk_size,  # CPU: all voxels, GPU: auto-detect
         preload_data_to_device=not keep_on_cpu,  # Don't preload if using CPU chunking
+        return_loadings=(
+            args.save_pcs in ["spatial", "both"] or args.plots == "full"
+        ),  # Get loadings for spatial output/plots
         device=device,
         verbose=args.verbose,
     )
@@ -931,10 +1619,253 @@ def main():
         output_prefix=args.prefix,
         volume_shape=volume_shape,
         affine=affine,
+        run_starts=run_starts,
+        tr=args.tr,
         voxel_mask=voxel_mask,
-        save_plots=args.save_plots,
-        save_pcs=not args.no_save_pcs,
+        plots_mode=args.plots,
+        slice_axis=args.plot_ax,
+        save_pcs_mode=args.save_pcs,
+        condition_labels=condition_labels,
     )
+
+    # ==========================================================================
+    # Save initial and final model fits (if requested or needed for SNR)
+    # ==========================================================================
+
+    # We need model fits if either save_model_fit or snr is requested
+    need_model_fits = args.save_model_fit or args.snr
+
+    # Clear GPU memory after saving denoising results
+    # The results object and plotting may have left tensors on GPU
+    if device.type == "cuda":
+        # Move results tensors to CPU to free GPU memory
+        if hasattr(results, "noise_pcs_per_run") and results.noise_pcs_per_run is not None:
+            results.noise_pcs_per_run = [
+                pc.cpu() if torch.is_tensor(pc) else pc for pc in results.noise_pcs_per_run
+            ]
+        if hasattr(results, "pc_loadings_per_run") and results.pc_loadings_per_run is not None:
+            results.pc_loadings_per_run = [
+                ld.cpu() if torch.is_tensor(ld) else ld for ld in results.pc_loadings_per_run
+            ]
+
+        # CRITICAL: Move main data tensor to CPU if it's on GPU
+        # This frees up the largest allocation before model fitting
+        if torch.is_tensor(data) and data.device.type == "cuda":
+            data = data.cpu()
+            if args.verbose:
+                print("  Moved data tensor to CPU to free GPU memory")
+
+        torch.cuda.empty_cache()
+        if args.verbose:
+            print("  Cleared GPU cache before model fitting")
+
+    initial_results = None
+    final_results = None
+    initial_bootstrap_se = None
+    final_bootstrap_se = None
+
+    if need_model_fits:
+        print()
+        print("Fitting initial model (no denoising)...")
+
+        from fastfuncsim.glm_core import fit_glm
+
+        # Build zero-padded nuisance for concatenated fit
+        n_total_timepoints = data.shape[1]
+        nuisance_padded_list = []
+        current_tp = 0
+        for run_nuisance in nuisance_per_run:
+            run_length = run_nuisance.shape[0]
+            n_cols = run_nuisance.shape[1]
+            padded = torch.zeros((n_total_timepoints, n_cols), device=device)
+            padded[current_tp : current_tp + run_length, :] = run_nuisance
+            nuisance_padded_list.append(padded)
+            current_tp += run_length
+        nuisance_concat = torch.cat(nuisance_padded_list, dim=1)
+
+        # Full design for initial fit
+        full_design_initial = torch.cat([task_design, nuisance_concat], dim=1)
+        n_task_cols = task_design.shape[1]
+        n_total_regs_initial = full_design_initial.shape[1]
+
+        initial_results = fit_glm(
+            data=data,
+            design=task_design,
+            tr=args.tr,
+            extra_regressors=nuisance_concat,
+            want_residuals=True,  # Need residuals for SNR
+            chunk_size=chunk_size,  # CPU: all voxels, GPU: auto-detect
+            preload_data_to_device=False,  # ALWAYS stream from CPU for model fits (safer)
+            device=device,
+            verbose=False,
+        )
+
+        # Bootstrap SE for initial model
+        if args.numboots > 0:
+            print(f"  Computing bootstrap SE ({args.numboots} iterations)...")
+            initial_bootstrap_se = compute_bootstrap_se(
+                data=data,
+                design=full_design_initial,
+                n_task=n_task_cols,
+                n_boots=args.numboots,
+                device=device,
+                verbose=args.verbose,
+            )
+
+        if args.save_model_fit:
+            initial_files = save_model_fit_outputs(
+                results=initial_results,
+                output_prefix=args.prefix,
+                volume_shape=volume_shape,
+                affine=affine,
+                model_type="initial",
+                condition_labels=condition_labels,
+                voxel_mask=voxel_mask,
+                n_timepoints=n_timepoints,
+                n_regressors=n_total_regs_initial,
+                bootstrap_se=initial_bootstrap_se,
+            )
+            output_files.update(initial_files)
+
+        # Final fit (with optimal denoising)
+        print(f"Fitting final model (with {results.optimal_n_components} noise PCs)...")
+
+        # Build combined nuisance with noise PCs for final fit
+        n_pcs_optimal = results.optimal_n_components
+        if n_pcs_optimal > 0:
+            pc_padded_blocks = []
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                run_length = end_tp - start_tp
+                pcs_run = results.noise_pcs_per_run[run_idx][:, :n_pcs_optimal]
+
+                padded = torch.zeros((n_timepoints, n_runs * n_pcs_optimal), device=device)
+                start_col = run_idx * n_pcs_optimal
+                end_col = start_col + n_pcs_optimal
+                padded[start_tp:end_tp, start_col:end_col] = pcs_run
+
+                pc_padded_blocks.append(padded)
+
+            pc_concat = sum(pc_padded_blocks)
+
+            if nuisance_concat is not None:
+                nuisance_with_pcs = torch.cat([nuisance_concat, pc_concat], dim=1)
+            else:
+                nuisance_with_pcs = pc_concat
+        else:
+            nuisance_with_pcs = nuisance_concat
+
+        full_design_final = torch.cat([task_design, nuisance_with_pcs], dim=1)
+        n_total_regs_final = full_design_final.shape[1]
+
+        final_results = fit_glm(
+            data=data,
+            design=task_design,
+            tr=args.tr,
+            extra_regressors=nuisance_with_pcs,
+            want_residuals=True,  # Need residuals for SNR
+            chunk_size=chunk_size,  # CPU: all voxels, GPU: auto-detect
+            preload_data_to_device=False,  # ALWAYS stream from CPU for model fits (safer)
+            device=device,
+            verbose=False,
+        )
+
+        # Bootstrap SE for final model
+        if args.numboots > 0:
+            print(f"  Computing bootstrap SE for denoised model ({args.numboots} iterations)...")
+            final_bootstrap_se = compute_bootstrap_se(
+                data=data,
+                design=full_design_final,
+                n_task=n_task_cols,
+                n_boots=args.numboots,
+                device=device,
+                verbose=args.verbose,
+            )
+
+        if args.save_model_fit:
+            final_files = save_model_fit_outputs(
+                results=final_results,
+                output_prefix=args.prefix,
+                volume_shape=volume_shape,
+                affine=affine,
+                model_type="denoised",
+                condition_labels=condition_labels,
+                voxel_mask=voxel_mask,
+                n_timepoints=n_timepoints,
+                n_regressors=n_total_regs_final,
+                bootstrap_se=final_bootstrap_se,
+            )
+            output_files.update(final_files)
+
+    # ==========================================================================
+    # Compute and save SNR (if requested)
+    # ==========================================================================
+
+    if args.snr and initial_results is not None and final_results is not None:
+        print()
+        print("Computing SNR metrics...")
+
+        # Get betas and residuals
+        initial_betas = initial_results.betas[:, :n_conditions].cpu().numpy()
+        final_betas = final_results.betas[:, :n_conditions].cpu().numpy()
+
+        # Residual std from MSE
+        initial_residual_std = (
+            torch.sqrt(initial_results.mse).cpu().numpy()
+            if hasattr(initial_results, "mse") and initial_results.mse is not None
+            else None
+        )
+        final_residual_std = (
+            torch.sqrt(final_results.mse).cpu().numpy()
+            if hasattr(final_results, "mse") and final_results.mse is not None
+            else None
+        )
+
+        # If MSE not available, compute from residuals
+        if initial_residual_std is None and initial_results.residuals is not None:
+            initial_residual_std = initial_results.residuals.std(dim=1).cpu().numpy()
+        if final_residual_std is None and final_results.residuals is not None:
+            final_residual_std = final_results.residuals.std(dim=1).cpu().numpy()
+
+        # Compute SNR
+        snr_initial = compute_snr(
+            betas=initial_betas,
+            residual_std=initial_residual_std,
+            bootstrap_se=initial_bootstrap_se,
+        )
+        snr_denoised = compute_snr(
+            betas=final_betas,
+            residual_std=final_residual_std,
+            bootstrap_se=final_bootstrap_se,
+        )
+
+        # Report improvement
+        if "snr_residual" in snr_initial and "snr_residual" in snr_denoised:
+            mean_initial = snr_initial["snr_residual"].mean()
+            mean_denoised = snr_denoised["snr_residual"].mean()
+            print(
+                f"  Residual-based SNR: {mean_initial:.2f} → {mean_denoised:.2f} ({(mean_denoised / mean_initial - 1) * 100:+.1f}%)"
+            )
+
+        if "snr_bootstrap" in snr_initial and "snr_bootstrap" in snr_denoised:
+            mean_initial = snr_initial["snr_bootstrap"].mean()
+            mean_denoised = snr_denoised["snr_bootstrap"].mean()
+            print(
+                f"  Bootstrap-based SNR: {mean_initial:.2f} → {mean_denoised:.2f} ({(mean_denoised / mean_initial - 1) * 100:+.1f}%)"
+            )
+
+        # Save SNR outputs
+        snr_files = save_snr_outputs(
+            snr_initial=snr_initial,
+            snr_denoised=snr_denoised,
+            output_prefix=args.prefix,
+            volume_shape=volume_shape,
+            affine=affine,
+            voxel_mask=voxel_mask,
+            create_plots=True,
+        )
+        output_files.update(snr_files)
 
     print()
     print("=" * 70)
