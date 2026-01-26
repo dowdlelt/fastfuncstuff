@@ -599,15 +599,18 @@ def cross_validate_noise_pcs(
     is_loro = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits)
 
     # Determine chunk size for voxel processing
-    # Streaming stats use ~1200x less memory, so we can use much larger chunks
+    # Streaming stats use ~30x less memory for accumulators, but we still need
+    # memory for chunk_data, projections, and GPU operations
     if chunk_size is not None:
         voxel_chunk_size = chunk_size
     elif is_loro:
-        # Streaming stats: only 3 float64 values per voxel per PC (~24 bytes/voxel/PC)
-        # Can process all voxels at once unless dataset is huge
-        voxel_chunk_size = min(n_voxels, 100000)  # Up to 100k voxels at once
+        # Streaming stats: smaller accumulators mean we can use larger chunks
+        # Still need memory for: chunk_data (voxels × timepoints),
+        # projected data, design matrices, and GPU operations
+        voxel_chunk_size = min(n_voxels, 30000)  # 3x larger than full accumulator
     else:
         # Full accumulator: n_timepoints float32 per voxel per PC (~14KB/voxel/PC for 3600 TPs)
+        # Need to store full prediction timeseries for all PC counts
         voxel_chunk_size = 10000  # Conservative for full timeseries
 
     # Move data to CPU for memory efficiency
