@@ -658,7 +658,7 @@ def cross_validate_noise_pcs(
             )
 
         # Cross-validation loop: accumulate predictions or stats for this chunk
-        for fold_idx, (train_runs, test_runs) in enumerate(cv_splits):
+        for _, (train_runs, test_runs) in enumerate(cv_splits):
 
             # Build train/test timepoint indices
             train_tps = []
@@ -846,8 +846,6 @@ def cross_validate_noise_pcs(
                 test_actual_projected = data_test_projected
             else:
                 test_actual_projected = chunk_data_test
-
-            n_test_tps = len(test_tps)
 
             for n_pcs in range(max_components + 1):
                 pinv_task = pinv_task_list[n_pcs]
