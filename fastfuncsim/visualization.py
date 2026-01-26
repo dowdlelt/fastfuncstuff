@@ -1163,6 +1163,8 @@ def plot_denoising_pcs(
                 run_weights = weights[:, pc_idx]
                 vol = np.zeros(np.prod(volume_shape))
 
+                # TODO - fit PCs to whole brain mask - so we can see how they fit in all areas and
+                # plot all voxels, not just noise pool. We would also want to save those nii (4d, per run, of pcs)
                 if voxel_mask is not None and noise_pool_mask is not None:
                     # Create intermediate brain volume
                     brain_vol = np.zeros(voxel_mask.sum())

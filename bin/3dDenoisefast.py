@@ -383,6 +383,15 @@ Notes:
         action="store_true",
         help="Print detailed progress information",
     )
+    proc_opts.add_argument(
+        "-R2method",
+        type=str,
+        choices=["auto", "fast", "slow"],
+        default="auto",
+        help="R² computation method. 'fast' uses streaming stats (~3MB vs ~8GB memory), "
+        "requires LORO CV. 'slow' stores full timeseries (for non-LORO CV). "
+        "'auto' selects based on CV strategy (default: auto).",
+    )
 
     # Output options
     out_opts = parser.add_argument_group("Output Options")
@@ -1590,6 +1599,7 @@ def main():
         pcR2cutoff=args.pcR2cutoff,  # R² cutoff for PC selection voxels
         cv_strategy=cv_strategy,  # CV split strategy (1=LORO, float=split fraction, int>1=leave-N-out)
         n_perms=args.n_perms,  # Max CV permutations for random splits
+        r2_method=args.R2method,  # R² computation method (auto/fast/slow)
         chunk_size=chunk_size,  # CPU: all voxels, GPU: auto-detect
         preload_data_to_device=not keep_on_cpu,  # Don't preload if using CPU chunking
         return_loadings=(

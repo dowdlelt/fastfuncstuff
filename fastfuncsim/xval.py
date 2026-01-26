@@ -12,12 +12,93 @@ import torch
 from itertools import combinations
 
 
+def estimate_memory_aware_chunk_size(
+    n_voxels: int,
+    n_timepoints: int,
+    n_regressors: int,
+    device: torch.device,
+    safety_factor: float = 0.25,
+) -> int:
+    """
+    Estimate optimal chunk size considering full pipeline memory requirements.
+
+    This accounts for memory needed by:
+    1. Projection operations: data chunk + intermediate + result
+    2. GLM fitting: data chunk + betas + predictions + residuals
+    3. Design matrix (shared, but needs to fit alongside data)
+    4. PyTorch memory fragmentation and reservation overhead
+
+    Parameters
+    ----------
+    n_voxels : int
+        Total number of voxels
+    n_timepoints : int
+        Total timepoints (all runs concatenated)
+    n_regressors : int
+        Number of regressors in design matrix (for GLM memory estimation)
+    device : torch.device
+        Compute device
+    safety_factor : float
+        Fraction of available memory to use (default: 0.25, very conservative
+        because we have projection + GLM + xval operations plus PyTorch
+        memory fragmentation overhead)
+
+    Returns
+    -------
+    chunk_size : int
+        Recommended number of voxels per chunk
+    """
+    # Estimate available memory
+    if device.type == "cuda":
+        total_mem = torch.cuda.get_device_properties(device).total_memory
+        # Use memory_reserved instead of memory_allocated to account for
+        # PyTorch's memory pool fragmentation
+        reserved_mem = torch.cuda.memory_reserved(device)
+        allocated_mem = torch.cuda.memory_allocated(device)
+        # Available is total minus reserved (not just allocated)
+        # PyTorch reserves memory in pools that may not be fully utilized
+        available_mem = (total_mem - reserved_mem) * safety_factor
+        # Also account for any memory that's allocated but might be freed
+        # Use a more conservative estimate
+        available_mem = min(available_mem, (total_mem - allocated_mem) * safety_factor * 0.8)
+    elif device.type == "mps":
+        available_mem = 4.0 * 1e9 * safety_factor
+    else:
+        available_mem = 8.0 * 1e9 * safety_factor
+
+    # Reserve memory for design matrix (stays on GPU throughout)
+    design_mem = n_timepoints * max(n_regressors, 10) * 4  # float32
+    available_mem -= design_mem
+
+    # Memory per voxel for GLM operations (the bottleneck):
+    # - data: n_timepoints × 4 bytes
+    # - predictions: n_timepoints × 4 bytes
+    # - residuals: n_timepoints × 4 bytes (temporary)
+    # - betas: n_regressors × 4 bytes
+    # - various intermediates: ~2 × n_timepoints × 4 bytes
+    # Conservative: 6 × n_timepoints + n_regressors per voxel
+    bytes_per_voxel = (6 * n_timepoints + max(n_regressors, 10)) * 4
+
+    # Calculate chunk size
+    chunk_size = int(max(available_mem, 1e6) / bytes_per_voxel)
+
+    # Set sensible bounds
+    # For very large datasets, cap at 30k to be extra safe
+    min_chunk = min(1000, n_voxels)  # At least 1000 for efficiency
+    max_chunk = min(30_000, n_voxels)  # Cap at 30k for large datasets
+    chunk_size = max(min_chunk, min(chunk_size, max_chunk))
+
+    return chunk_size
+
+
 def project_out_nuisance_per_run(
     data: torch.Tensor,
     design: torch.Tensor,
     nuisance_per_run: List[torch.Tensor],
     run_starts: List[int],
     device: Optional[torch.device] = None,
+    chunk_size: Optional[int] = None,
+    verbose: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Project out nuisance regressors from data and design matrix, per run.
@@ -42,6 +123,11 @@ def project_out_nuisance_per_run(
         Starting timepoint for each run
     device : torch.device, optional
         Compute device
+    chunk_size : int, optional
+        Number of voxels to process at once. If None, auto-estimated based on
+        available memory and data size.
+    verbose : bool, default=False
+        Print memory strategy information
 
     Returns
     -------
@@ -50,33 +136,53 @@ def project_out_nuisance_per_run(
     projected_design : torch.Tensor
         (n_timepoints, n_task_cols) Design with nuisance projected out per run
     """
-    if device is None or device != data.device:
+    if device is None:
         device = data.device
 
+    n_voxels, n_timepoints = data.shape
     n_runs = len(run_starts)
-    n_timepoints = data.shape[1]
+    n_design_cols = design.shape[1]
 
-    # CRITICAL: Keep data on its original device (may be CPU for memory efficiency)
-    # Only the projection computation happens on the compute device
-    data_device = data.device
-
-    projected_data_runs = []
-    projected_design_runs = []
-
+    # Calculate run lengths
+    run_lengths = []
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_lengths.append(end_tp - start_tp)
 
-        # Get this run's data and design (keep on original device)
-        run_data = data[:, start_tp:end_tp]  # (n_voxels, run_length)
-        run_design = design[start_tp:end_tp, :]  # (run_length, n_task)
-        run_length = end_tp - start_tp
+    # Auto-estimate chunk size if not provided
+    # Use memory-aware estimation that considers downstream GLM operations
+    effective_chunk_size: int
+    if chunk_size is None:
+        effective_chunk_size = estimate_memory_aware_chunk_size(
+            n_voxels, n_timepoints, n_design_cols, device
+        )
+    else:
+        effective_chunk_size = chunk_size
 
-        # Get this run's nuisance (on original device)
-        run_nuisance = nuisance_per_run[run_idx].to(data_device)  # (run_length, n_nuisance)
+    # Determine if we need chunking
+    # Threshold: if data would exceed ~1GB OR we have lots of voxels, use chunking
+    data_size_bytes = n_voxels * n_timepoints * 4
+    needs_chunking = data_size_bytes > 1e9 or n_voxels > effective_chunk_size
+
+    if verbose:
+        data_size_gb = data_size_bytes / 1e9
+        print(f"  Data size: {data_size_gb:.2f} GB ({n_voxels:,} voxels × {n_timepoints} timepoints)")
+        print(f"  Chunking: {'Yes' if needs_chunking else 'No'} (chunk_size={effective_chunk_size:,})")
+
+    # CRITICAL: Keep data on its original device (may be CPU for memory efficiency)
+    # Projection matrices are computed on compute device, then applied
+    data_device = data.device
+
+    # Pre-compute all projection matrices (small, one per run)
+    projections = []
+    for run_idx in range(n_runs):
+        run_length = run_lengths[run_idx]
+
+        # Get this run's nuisance
+        run_nuisance = nuisance_per_run[run_idx].to(device)  # (run_length, n_nuisance)
 
         # CRITICAL: Remove zero columns from nuisance before projection
-        # Zero columns (from padding) can cause numerical issues with ridge regularization
         col_norms = run_nuisance.abs().sum(dim=0)
         nonzero_mask = col_norms > 1e-10
         run_nuisance_clean = run_nuisance[:, nonzero_mask]
@@ -84,30 +190,83 @@ def project_out_nuisance_per_run(
         if run_nuisance_clean.shape[1] > 0:
             # Compute projection matrix: P_perp = I - X(X'X)^-1 X'
             XtX = run_nuisance_clean.T @ run_nuisance_clean
-            XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=data_device))
-            P_nuisance = (
-                run_nuisance_clean @ XtX_inv @ run_nuisance_clean.T
-            )  # Projects ONTO nuisance
-            projection = (
-                torch.eye(run_length, device=data_device) - P_nuisance
-            )  # Projects OUT nuisance
-
-            # Project data: (n_voxels, run_length)
-            run_data_proj = (projection @ run_data.T).T
-
-            # Project design: (run_length, n_task)
-            run_design_proj = projection @ run_design
+            XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
+            P_nuisance = run_nuisance_clean @ XtX_inv @ run_nuisance_clean.T
+            projection = torch.eye(run_length, device=device) - P_nuisance
+            projections.append(projection)
         else:
-            # No nuisance to project
-            run_data_proj = run_data
+            projections.append(None)  # No projection needed
+
+    # Project design matrix (small, no chunking needed)
+    projected_design_runs = []
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_design = design[start_tp:end_tp, :].to(device)  # (run_length, n_task)
+
+        if projections[run_idx] is not None:
+            run_design_proj = projections[run_idx] @ run_design
+        else:
             run_design_proj = run_design
 
-        projected_data_runs.append(run_data_proj)
-        projected_design_runs.append(run_design_proj)
+        projected_design_runs.append(run_design_proj.to(design.device))
 
-    # Concatenate back
-    projected_data = torch.cat(projected_data_runs, dim=1)  # (n_voxels, n_timepoints)
-    projected_design = torch.cat(projected_design_runs, dim=0)  # (n_timepoints, n_task)
+    projected_design = torch.cat(projected_design_runs, dim=0)
+
+    # Project data - use chunking for memory efficiency
+    if not needs_chunking:
+        # Small enough to process all at once
+        projected_data_runs = []
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_data = data[:, start_tp:end_tp]  # (n_voxels, run_length)
+
+            if projections[run_idx] is not None:
+                # Move to compute device, project, move back
+                run_data_dev = run_data.to(device)
+                run_data_proj = (projections[run_idx] @ run_data_dev.T).T
+                projected_data_runs.append(run_data_proj.to(data_device))
+            else:
+                projected_data_runs.append(run_data)
+
+        projected_data = torch.cat(projected_data_runs, dim=1)
+    else:
+        # Large data: process voxels in chunks
+        # Allocate output on CPU to avoid GPU memory pressure
+        projected_data = torch.zeros(n_voxels, n_timepoints, dtype=data.dtype, device="cpu")
+
+        n_chunks = (n_voxels + effective_chunk_size - 1) // effective_chunk_size
+        for chunk_idx in range(n_chunks):
+            chunk_start = chunk_idx * effective_chunk_size
+            chunk_end = min(chunk_start + effective_chunk_size, n_voxels)
+
+            # Process each run for this voxel chunk
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+
+                # Get chunk data for this run
+                run_chunk_data = data[chunk_start:chunk_end, start_tp:end_tp]
+
+                if projections[run_idx] is not None:
+                    # Move chunk to compute device, project, store result
+                    run_chunk_dev = run_chunk_data.to(device)
+                    run_chunk_proj = (projections[run_idx] @ run_chunk_dev.T).T
+                    projected_data[chunk_start:chunk_end, start_tp:end_tp] = run_chunk_proj.cpu()
+
+                    # Free GPU memory
+                    del run_chunk_dev, run_chunk_proj
+                else:
+                    projected_data[chunk_start:chunk_end, start_tp:end_tp] = run_chunk_data.cpu()
+
+            # Clear GPU cache periodically
+            if device.type == "cuda" and chunk_idx % 5 == 0:
+                torch.cuda.empty_cache()
+
+        # Move to original data device if needed
+        if data_device.type != "cpu":
+            projected_data = projected_data.to(data_device)
 
     return projected_data, projected_design
 
@@ -480,6 +639,7 @@ def compute_xval_r2(
     device: Optional[torch.device] = None,
     batch_size: Optional[int] = None,
     data_chunk_size: Optional[int] = None,
+    r2_method: str = "auto",
     verbose: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -542,6 +702,13 @@ def compute_xval_r2(
         Number of voxels to load to GPU at once (auto-detected if None).
         If data is too large to fit on GPU, it will be processed in chunks.
         Each chunk runs all CV splits before moving to the next chunk.
+    r2_method : str, default='auto'
+        Method for computing R²:
+        - 'auto': Use 'fast' for LORO (each timepoint tested once), 'slow' otherwise
+        - 'fast': Streaming stats - accumulates SS_res, sum, sum_sq instead of full
+          timeseries. Uses ~3MB instead of ~8GB for accumulators. Requires LORO.
+        - 'slow': Full accumulator - stores complete predicted/actual timeseries.
+          Required when timepoints appear in multiple test sets (split-half CV).
     verbose : bool, default=True
         Print progress
 
@@ -595,42 +762,117 @@ def compute_xval_r2(
         # Be conservative: 100k voxels
         data_chunk_size = min(100_000, n_voxels)
 
-    # GLMdenoise-style: We accumulate predictions for each run
-    # Each run's test data is predicted exactly once across all CV folds
-    # We need to track which runs have been predicted
-    # For LORO (leave-one-run-out), each run is test exactly once
-    # For other strategies, we need to handle overlapping test sets
+    # =========================================================================
+    # Determine R² computation method: 'fast' (streaming) or 'slow' (full accumulator)
+    # =========================================================================
+    # Fast method: Only works for LORO where each timepoint is tested exactly once
+    # - Accumulates SS_res, sum, sum_sq instead of full timeseries
+    # - Memory: ~3MB instead of ~8GB for 271k voxels × 3609 timepoints
+    # Slow method: Works for any CV strategy (overlapping test sets)
+    # - Stores full predicted and actual timeseries
+    # - Required when we need to average predictions before computing R²
+
+    # Check if this is LORO (each timepoint tested exactly once)
+    # by verifying test sets are disjoint and cover all timepoints
+    all_test_tps = set()
+    is_loro = True
+    for _, test_runs in cv_splits:
+        for run_idx in test_runs:
+            start = run_starts[run_idx]
+            end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            test_tps_run = set(range(start, end))
+            if all_test_tps & test_tps_run:  # Overlap detected
+                is_loro = False
+                break
+            all_test_tps |= test_tps_run
+        if not is_loro:
+            break
+
+    # Determine effective r2_method
+    if r2_method == "auto":
+        use_fast_r2 = is_loro
+    elif r2_method == "fast":
+        if not is_loro:
+            raise ValueError("r2_method='fast' requires LORO (each timepoint tested exactly once)")
+        use_fast_r2 = True
+    elif r2_method == "slow":
+        use_fast_r2 = False
+    else:
+        raise ValueError(f"r2_method must be 'auto', 'fast', or 'slow', got '{r2_method}'")
 
     if verbose:
-        print("Cross-validation R² computation (GLMdenoise-style concatenation)")
+        print("Cross-validation R² computation (GLMdenoise-style)")
         print(f"  Voxels: {n_voxels:,}")
         print(f"  Timepoints: {n_timepoints}")
         print(f"  Runs: {n_runs}")
         print(f"  Splits: {n_splits}")
         print(f"  Metric: {metric}")
-        print(f"  Data chunk size: {data_chunk_size:,}")
-        print(f"  Batch size: {batch_size:,}")
+        print(f"  R² method: {'fast (streaming stats)' if use_fast_r2 else 'slow (full accumulator)'}")
+        if use_fast_r2:
+            fast_mem_mb = n_voxels * 3 * 8 / 1e6  # 3 stats × float64
+            slow_mem_gb = n_voxels * n_timepoints * 2 * 4 / 1e9  # 2 accumulators × float32
+            print(f"  Memory savings: {fast_mem_mb:.1f}MB vs {slow_mem_gb:.2f}GB ({slow_mem_gb*1000/fast_mem_mb:.0f}x)")
         print()
 
     # =========================================================================
-    # GLMdenoise-style accumulation: Store predictions/actuals per run
+    # Setup based on R² method
     # =========================================================================
-    # MEMORY STRATEGY:
-    # - Keep data on CPU, stream voxel batches to GPU
-    # - Accumulate predictions/actuals on CPU
-    # - Design matrices are small - keep on GPU
-    # - Only small batch of voxels on GPU at any time
+    data_size_bytes = n_voxels * n_timepoints * 4  # float32
+    data_on_gpu = data.device.type == device.type and device.type != "cpu"
 
-    # Initialize storage on CPU
-    pred_accumulator = torch.zeros(n_voxels, n_timepoints, dtype=torch.float32, device="cpu")
-    actual_accumulator = torch.zeros(n_voxels, n_timepoints, dtype=torch.float32, device="cpu")
-    count_per_timepoint = torch.zeros(n_timepoints, dtype=torch.float32, device="cpu")
+    if use_fast_r2:
+        # FAST MODE: Streaming stats - tiny accumulators that fit easily on GPU
+        # Use float64 for precision (summing many values)
+        accumulator_device = device if data_on_gpu else torch.device("cpu")
+        effective_batch_size = min(batch_size * 4, n_voxels) if data_on_gpu else batch_size
 
-    # Ensure data is on CPU for streaming
-    if data.device.type != "cpu":
+        # Streaming stats accumulators (tiny: ~24 bytes per voxel)
+        ss_res_accumulator = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
+        sum_actual = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
+        sum_sq_actual = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
+        count_timepoints = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
+
         if verbose:
-            print("  Moving data to CPU for memory-efficient streaming...")
-        data = data.cpu()
+            if data_on_gpu:
+                print(f"  Data on GPU - streaming stats on GPU (fast path)")
+            else:
+                print(f"  Data on CPU - streaming to GPU for compute")
+    else:
+        # SLOW MODE: Full accumulators - need to check memory carefully
+        # Check if we can fit accumulators on GPU
+        use_gpu_accumulators = False
+        if data_on_gpu and device.type == "cuda":
+            free_mem = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+            # Need 2x for accumulators + 1x for R² temps + 30% headroom
+            needed_mem = data_size_bytes * 3.3
+            use_gpu_accumulators = free_mem > needed_mem
+            if verbose:
+                free_gb = free_mem / 1e9
+                needed_gb = needed_mem / 1e9
+                if use_gpu_accumulators:
+                    print(f"  Data on GPU, {free_gb:.1f}GB free (need {needed_gb:.1f}GB) - GPU accumulators")
+                else:
+                    print(f"  Data on GPU but only {free_gb:.1f}GB free (need {needed_gb:.1f}GB)")
+                    print(f"  Using CPU accumulators with GPU compute (hybrid mode)")
+
+        if use_gpu_accumulators:
+            accumulator_device = device
+            effective_batch_size = min(batch_size * 4, n_voxels)
+        else:
+            accumulator_device = torch.device("cpu")
+            effective_batch_size = batch_size
+            if not data_on_gpu:
+                if data.device.type != "cpu":
+                    if verbose:
+                        print("  Moving data to CPU for memory-efficient streaming...")
+                    data = data.cpu()
+                elif verbose:
+                    print("  Data on CPU - streaming batches to GPU")
+
+        # Full timeseries accumulators
+        pred_accumulator = torch.zeros(n_voxels, n_timepoints, dtype=torch.float32, device=accumulator_device)
+        actual_accumulator = torch.zeros(n_voxels, n_timepoints, dtype=torch.float32, device=accumulator_device)
+        count_per_timepoint = torch.zeros(n_timepoints, dtype=torch.float32, device=accumulator_device)
 
     # Pre-compute timepoint indices for each split (cheap, do once)
     split_info = []
@@ -736,14 +978,20 @@ def compute_xval_r2(
                 train_stim_design.shape[1], dtype=torch.bool, device=device
             )
 
-        # 5. Fit OLS and predict in VOXEL BATCHES (stream from CPU)
-        for batch_start in range(0, n_voxels, batch_size):
-            batch_end = min(batch_start + batch_size, n_voxels)
+        # 5. Fit OLS and predict in VOXEL BATCHES
+        for batch_start in range(0, n_voxels, effective_batch_size):
+            batch_end = min(batch_start + effective_batch_size, n_voxels)
             batch_slice = slice(batch_start, batch_end)
 
-            # Stream this batch's data to GPU (only train and test timepoints!)
-            train_data_batch = data[batch_slice][:, train_tps].to(device)
-            test_data_batch = data[batch_slice][:, test_tps].to(device)
+            # Get batch data - either slice directly (GPU) or stream (CPU)
+            if data_on_gpu:
+                # Data on GPU: slice directly (creates view, no copy)
+                train_data_batch = data[batch_slice][:, train_tps]
+                test_data_batch = data[batch_slice][:, test_tps]
+            else:
+                # Data on CPU: stream to GPU
+                train_data_batch = data[batch_slice][:, train_tps].to(device)
+                test_data_batch = data[batch_slice][:, test_tps].to(device)
 
             # Project out nuisance from data
             if train_P is not None:
@@ -783,51 +1031,118 @@ def compute_xval_r2(
                 raise ValueError(f"Invalid strategy: {zero_event_strategy}")
 
             # ============================================================
-            # ACCUMULATE predictions and actuals for test timepoints (on CPU)
+            # ACCUMULATE: Fast mode (streaming stats) vs Slow mode (full timeseries)
             # ============================================================
-            pred_accumulator[batch_slice, test_tps] += predictions_batch.cpu()
-            actual_accumulator[batch_slice, test_tps] += test_data_batch.cpu()
+            if use_fast_r2:
+                # FAST MODE: Accumulate streaming stats (SS_res, sum, sum_sq)
+                # Compute residuals and stats on GPU, accumulate to accumulators
+                n_test_tps = len(test_tps)
 
-            # Free GPU memory for this batch
+                # Compute stats in float64 for precision
+                test_data_f64 = test_data_batch.double()
+                pred_f64 = predictions_batch.double()
+
+                # SS_res = Σ(actual - pred)²
+                residuals = test_data_f64 - pred_f64
+                ss_res_batch = (residuals ** 2).sum(dim=1)
+
+                # For SS_tot later: need Σ actual and Σ actual²
+                sum_actual_batch = test_data_f64.sum(dim=1)
+                sum_sq_actual_batch = (test_data_f64 ** 2).sum(dim=1)
+
+                # Accumulate (may need to move to CPU if accumulators are there)
+                if accumulator_device.type == "cpu":
+                    ss_res_accumulator[batch_slice] += ss_res_batch.cpu()
+                    sum_actual[batch_slice] += sum_actual_batch.cpu()
+                    sum_sq_actual[batch_slice] += sum_sq_actual_batch.cpu()
+                    count_timepoints[batch_slice] += n_test_tps
+                else:
+                    ss_res_accumulator[batch_slice] += ss_res_batch
+                    sum_actual[batch_slice] += sum_actual_batch
+                    sum_sq_actual[batch_slice] += sum_sq_actual_batch
+                    count_timepoints[batch_slice] += n_test_tps
+
+                del test_data_f64, pred_f64, residuals, ss_res_batch, sum_actual_batch, sum_sq_actual_batch
+            else:
+                # SLOW MODE: Accumulate full timeseries
+                if accumulator_device.type != "cpu":
+                    # Full GPU path: accumulate directly on GPU
+                    pred_accumulator[batch_slice, test_tps] += predictions_batch
+                    actual_accumulator[batch_slice, test_tps] += test_data_batch
+                else:
+                    # Hybrid/CPU path: move results to CPU for accumulation
+                    pred_accumulator[batch_slice, test_tps] += predictions_batch.cpu()
+                    actual_accumulator[batch_slice, test_tps] += test_data_batch.cpu()
+
+            # Free intermediate tensors
             del train_data_batch, test_data_batch, predictions_batch, betas_fit
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
-        # Update count for these test timepoints (once per split)
-        count_per_timepoint[test_tps] += 1.0
+        # Clear GPU cache once per split when streaming from CPU
+        if not data_on_gpu and device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    # =========================================================================
-    # Average accumulated predictions where timepoints appeared in multiple folds
-    # =========================================================================
-    # For LORO, each timepoint appears exactly once (count=1)
-    # For split-halves with permutations, timepoints may appear multiple times
-    count_per_timepoint = count_per_timepoint.clamp(min=1)  # Avoid division by zero
-    pred_accumulator = pred_accumulator / count_per_timepoint.unsqueeze(0)
-    actual_accumulator = actual_accumulator / count_per_timepoint.unsqueeze(0)
+        # Update count for these test timepoints (slow mode only)
+        if not use_fast_r2:
+            count_per_timepoint[test_tps] += 1.0
 
     # =========================================================================
-    # Compute single R² from concatenated predictions vs actuals
+    # Compute final R²
     # =========================================================================
     if verbose:
         print()
-        print("Computing R² from concatenated predictions...")
+        print("Computing R² from accumulated stats..." if use_fast_r2 else "Computing R² from concatenated predictions...")
 
-    # Compute R² in voxel batches (stream to GPU)
-    r2_final = torch.zeros(n_voxels, dtype=torch.float32, device="cpu")
+    if use_fast_r2:
+        # FAST MODE: Compute R² from streaming stats
+        # R² = 1 - SS_res / SS_tot
+        # SS_tot = Σ(actual - mean)² = Σ actual² - n * mean²
+        #        = sum_sq_actual - (sum_actual)² / n
 
-    for r2_batch_start in range(0, n_voxels, batch_size):
-        r2_batch_end = min(r2_batch_start + batch_size, n_voxels)
-        r2_batch_slice = slice(r2_batch_start, r2_batch_end)
+        # Move to CPU for final computation (tiny tensors)
+        ss_res = ss_res_accumulator.cpu() if accumulator_device.type != "cpu" else ss_res_accumulator
+        sum_act = sum_actual.cpu() if accumulator_device.type != "cpu" else sum_actual
+        sum_sq_act = sum_sq_actual.cpu() if accumulator_device.type != "cpu" else sum_sq_actual
+        n_pts = count_timepoints.cpu() if accumulator_device.type != "cpu" else count_timepoints
 
-        pred_batch = pred_accumulator[r2_batch_slice].to(device)
-        actual_batch = actual_accumulator[r2_batch_slice].to(device)
+        # Compute SS_tot using the variance formula: Var = E[X²] - E[X]²
+        # SS_tot = n * Var = sum_sq - sum² / n
+        mean_actual = sum_act / n_pts
+        ss_tot = sum_sq_act - n_pts * (mean_actual ** 2)
 
-        r2_batch = compute_r2_metric(actual_batch, pred_batch, metric=metric)
-        r2_final[r2_batch_slice] = r2_batch.cpu()
+        # R² = 1 - SS_res / SS_tot
+        r2_final = (1.0 - ss_res / (ss_tot + 1e-10)).float()
 
-        del pred_batch, actual_batch
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        # Free accumulators
+        del ss_res_accumulator, sum_actual, sum_sq_actual, count_timepoints
+
+    else:
+        # SLOW MODE: Average predictions if needed, then compute R²
+        count_per_timepoint = count_per_timepoint.clamp(min=1)  # Avoid division by zero
+        pred_accumulator = pred_accumulator / count_per_timepoint.unsqueeze(0)
+        actual_accumulator = actual_accumulator / count_per_timepoint.unsqueeze(0)
+
+        if accumulator_device.type != "cpu":
+            # Full GPU path: accumulators on GPU, compute R² directly
+            r2_final = compute_r2_metric(actual_accumulator, pred_accumulator, metric=metric)
+            r2_final = r2_final.cpu()
+        else:
+            # Hybrid/CPU path: compute R² in voxel batches
+            r2_final = torch.zeros(n_voxels, dtype=torch.float32, device="cpu")
+
+            for r2_batch_start in range(0, n_voxels, effective_batch_size):
+                r2_batch_end = min(r2_batch_start + effective_batch_size, n_voxels)
+                r2_batch_slice = slice(r2_batch_start, r2_batch_end)
+
+                pred_batch = pred_accumulator[r2_batch_slice].to(device)
+                actual_batch = actual_accumulator[r2_batch_slice].to(device)
+
+                r2_batch = compute_r2_metric(actual_batch, pred_batch, metric=metric)
+                r2_final[r2_batch_slice] = r2_batch.cpu()
+
+                del pred_batch, actual_batch
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     if verbose:
         print(f"  Mean R²: {r2_final.mean():.4f}, Std: {r2_final.std():.4f}")

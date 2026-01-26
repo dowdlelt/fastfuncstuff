@@ -1266,6 +1266,7 @@ def fit_denoising_model(
     pcR2cutoff: Optional[float] = None,
     cv_strategy: Union[int, float] = 1,
     n_perms: int = 100,
+    r2_method: str = "auto",
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> DenoiseResults:
@@ -1438,6 +1439,7 @@ def fit_denoising_model(
             zero_event_strategy="zero",
             device=device,
             batch_size=chunk_size,
+            r2_method=r2_method,
             verbose=False,
         )
 

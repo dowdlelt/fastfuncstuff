@@ -185,6 +185,7 @@ def fit_glm_hrf_library_with_xval(
     device: Optional[torch.device] = None,
     verbose: bool = True,
     chunk_size: Optional[int] = None,
+    r2_method: str = "auto",
 ) -> HRFSelectionResults:
     """
     Select best HRF per voxel using cross-validated R².
@@ -449,6 +450,10 @@ def fit_glm_hrf_library_with_xval(
     # Project out nuisance from DATA once (same for all HRFs)
     # This is the GLMdenoise PROJECT-FIRST approach
     # =========================================================================
+    # Clear GPU cache before major allocation to reduce fragmentation
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     if verbose:
         print("Projecting out nuisance from data (once for all HRFs)...")
 
@@ -461,6 +466,8 @@ def fit_glm_hrf_library_with_xval(
         nuisance_per_run=nuisance_blocks_per_run,
         run_starts=run_starts,
         device=device,
+        chunk_size=chunk_size,
+        verbose=verbose,
     )
 
     if verbose:
@@ -524,6 +531,7 @@ def fit_glm_hrf_library_with_xval(
             zero_event_strategy="zero",
             device=device,
             batch_size=chunk_size,
+            r2_method=r2_method,
             verbose=False,  # Don't spam per-HRF output
         )
 
@@ -608,6 +616,7 @@ def fit_glm_hrf_library_with_xval(
         zero_event_strategy="zero",
         device=device,
         batch_size=chunk_size,
+        r2_method=r2_method,
         verbose=False,
     )
     xval_r2_canonical = canonical_xval_results["r2"].to(device)

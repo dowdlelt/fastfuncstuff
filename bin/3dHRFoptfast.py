@@ -466,6 +466,15 @@ Notes:
         help="Number of voxels per batch (default: auto)",
     )
     proc_opts.add_argument(
+        "-R2method",
+        type=str,
+        choices=["auto", "fast", "slow"],
+        default="auto",
+        help="R² computation method. 'fast' uses streaming stats (~3MB vs ~8GB memory), "
+        "requires LORO CV. 'slow' stores full timeseries (for non-LORO CV). "
+        "'auto' selects based on CV strategy (default: auto).",
+    )
+    proc_opts.add_argument(
         "-verbose",
         action="store_true",
         help="Print detailed progress information",
@@ -896,6 +905,7 @@ def main():
         device=device,
         verbose=args.verbose,
         chunk_size=args.batch_size,
+        r2_method=args.R2method,
     )
 
     # Update metadata with CLI parameters
