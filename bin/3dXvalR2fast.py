@@ -21,7 +21,6 @@ import numpy as np
 import torch
 
 try:
-    from fastfuncsim.analysis import load_and_concatenate_runs
     from fastfuncsim.afni_io import extract_design_metadata, read_afni_design_matrix
     from fastfuncsim.utils import get_device
     from fastfuncsim.xval import compute_xval_r2, generate_cv_splits
@@ -201,6 +200,15 @@ Notes:
         choices=["cpu", "cuda", "mps"],
         help="Compute device (auto-detected if not specified)",
     )
+    comp_opts.add_argument(
+        "-R2method",
+        type=str,
+        choices=["auto", "fast", "slow"],
+        default="auto",
+        help="R² computation method. 'fast' uses streaming stats (~3MB vs ~8GB memory), "
+        "requires LORO CV. 'slow' stores full timeseries (for non-LORO CV). "
+        "'auto' selects based on CV strategy (default: auto).",
+    )
 
     return parser
 
@@ -286,27 +294,27 @@ def main():
 
     # Load data
     print("📂 Loading data...")
-    if len(input_files) == 1:
-        import nibabel as nib
+    import nibabel as nib
 
-        img = nib.load(input_files[0])
-        data_np = img.get_fdata()  # type: ignore[attr-defined]
-        volume_shape = data_np.shape[:3]
-        affine = img.affine  # type: ignore[attr-defined]
+    # Get volume shape and affine from first file
+    first_img = nib.load(input_files[0])
+    volume_shape = first_img.shape[:3]  # type: ignore[attr-defined]
+    affine = first_img.affine  # type: ignore[attr-defined]
+
+    if len(input_files) == 1:
+        data_np = first_img.get_fdata()  # type: ignore[attr-defined]
 
         # Reshape to (n_voxels, n_timepoints)
         data_np = data_np.reshape(-1, data_np.shape[-1])
         data = torch.from_numpy(data_np).float()
     else:
         # Multiple runs - use existing loader
-        data, actual_run_starts = load_and_concatenate_runs(
-            input_files, torch.device("cpu")  # type: ignore[arg-type]
-        mask_flat = mask.flatten().astype(bool) if mask is not None else None
-        data, actual_run_starts = load_and_concatenate_runs(
+        from fastfuncsim.afni_io import load_and_concatenate_runs as load_runs
+
+        data, actual_run_starts = load_runs(
             [Path(f) for f in input_files],
-            device=device,
-            keep_on_cpu=keep_on_cpu,
-            mask_flat=mask_flat,
+            device=torch.device("cpu"),  # Load to CPU first
+            keep_on_cpu=True,
         )
     print(f"  • Shape: {data.shape} (voxels × timepoints)")
     print(f"  • Volume: {volume_shape}")
@@ -327,7 +335,9 @@ def main():
         mask = mask_volume.flatten()
         n_total_voxels = mask.size
         data = data[mask]
-        print(f"  • Masked voxels: {data.shape[0]:,} / {n_total_voxels:,} ({100*data.shape[0]/n_total_voxels:.1f}%)")
+        print(
+            f"  • Masked voxels: {data.shape[0]:,} / {n_total_voxels:,} ({100 * data.shape[0] / n_total_voxels:.1f}%)"
+        )
         print()
     else:
         mask = None
@@ -356,7 +366,7 @@ def main():
 
     # Print summary statistics (GLMdenoise-style: single R² from concatenated predictions)
     print("📊 Results Summary (GLMdenoise-style concatenation):")
-    r2_result = xval_results['r2']
+    r2_result = xval_results["r2"]
     print(f"  • Mean R²: {r2_result.mean():.4f} ± {r2_result.std():.4f}")
     print(f"  • Median R²: {r2_result.median().item():.4f}")
     print(f"  • Min R²: {r2_result.min():.4f}")
