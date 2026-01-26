@@ -301,15 +301,13 @@ def main():
         # Multiple runs - use existing loader
         data, actual_run_starts = load_and_concatenate_runs(
             input_files, torch.device("cpu")  # type: ignore[arg-type]
+        mask_flat = mask.flatten().astype(bool) if mask is not None else None
+        data, actual_run_starts = load_and_concatenate_runs(
+            [Path(f) for f in input_files],
+            device=device,
+            keep_on_cpu=keep_on_cpu,
+            mask_flat=mask_flat,
         )
-
-        # Get spatial info from first file
-        import nibabel as nib
-
-        img = nib.load(input_files[0])
-        volume_shape = img.shape[:3]  # type: ignore[attr-defined]
-        affine = img.affine  # type: ignore[attr-defined]
-
     print(f"  • Shape: {data.shape} (voxels × timepoints)")
     print(f"  • Volume: {volume_shape}")
     print()
@@ -356,12 +354,13 @@ def main():
     print("✅ Cross-validation complete!")
     print()
 
-    # Print summary statistics
-    print("📊 Results Summary:")
-    print(f"  • Median R²: {xval_results['r2_median'].mean():.4f} ± {xval_results['r2_median'].std():.4f}")
-    print(f"  • Mean std across voxels: {xval_results['r2_std'].mean():.4f}")
-    print(f"  • Min R²: {xval_results['r2_min'].min():.4f}")
-    print(f"  • Max R²: {xval_results['r2_max'].max():.4f}")
+    # Print summary statistics (GLMdenoise-style: single R² from concatenated predictions)
+    print("📊 Results Summary (GLMdenoise-style concatenation):")
+    r2_result = xval_results['r2']
+    print(f"  • Mean R²: {r2_result.mean():.4f} ± {r2_result.std():.4f}")
+    print(f"  • Median R²: {r2_result.median().item():.4f}")
+    print(f"  • Min R²: {r2_result.min():.4f}")
+    print(f"  • Max R²: {r2_result.max():.4f}")
     print()
 
     # Write outputs
@@ -384,31 +383,14 @@ def main():
         nib.save(img, filename)
         print(f"  • {description}: {filename}")
 
-    # Save median, std, min, max
-    save_volume(xval_results["r2_median"], f"{args.output}_median.nii.gz", "Median R²")
-    save_volume(xval_results["r2_std"], f"{args.output}_std.nii.gz", "Std R²")
-    save_volume(xval_results["r2_min"], f"{args.output}_min.nii.gz", "Min R²")
-    save_volume(xval_results["r2_max"], f"{args.output}_max.nii.gz", "Max R²")
+    # Save single R² map (GLMdenoise-style: from concatenated predictions)
+    save_volume(xval_results["r2"], f"{args.output}_r2.nii.gz", "Cross-validated R²")
 
-    # Optionally save all splits
+    # Note: --save-splits is no longer applicable with GLMdenoise-style concatenation
     if args.save_splits:
         print()
-        print("  Saving all splits (this may take a moment)...")
-        r2_splits = xval_results["r2_splits"]  # (n_splits, n_voxels)
-
-        if mask is not None:
-            # Unmask each split
-            r2_splits_full = np.zeros((len(cv_splits), *volume_shape), dtype=np.float32)
-            for split_idx in range(len(cv_splits)):
-                data_full = np.zeros(mask.shape, dtype=np.float32)
-                data_full[mask] = r2_splits[split_idx].cpu().numpy()
-                r2_splits_full[split_idx] = data_full.reshape(volume_shape)
-        else:
-            r2_splits_full = r2_splits.cpu().numpy().reshape(len(cv_splits), *volume_shape)
-
-        # Save as 4D volume (splits as 4th dimension)
-        img = nib.Nifti1Image(r2_splits_full.transpose(1, 2, 3, 0), affine)
-        nib.save(img, f"{args.output}_splits.nii.gz")
+        print("  Note: --save-splits is deprecated with GLMdenoise-style concatenation.")
+        print("        The new approach computes a single R² from concatenated predictions,")
         print(f"  • All splits: {args.output}_splits.nii.gz")
 
     print()

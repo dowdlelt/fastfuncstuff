@@ -26,7 +26,7 @@ import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Union
+from typing import Union
 
 import numpy as np
 import torch
@@ -51,7 +51,7 @@ try:
         fit_glm_hrf_library_with_xval,
         save_hrf_selection_results,
     )
-    from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
+    from fastfuncsim.utils import gaussian_blur_3d, get_device, scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -59,12 +59,12 @@ except ImportError as e:
 
 
 def create_onset_matrix_microtime(
-    all_onsets: List[List[np.ndarray]],
-    run_starts: List[int],
+    all_onsets: list[list[np.ndarray]],
+    run_starts: list[int],
     tr: float,
     n_timepoints: int,
     microtime_dt: float,
-    stim_durations: List[float],
+    stim_durations: list[float],
     device: torch.device,
 ) -> torch.Tensor:
     """
@@ -106,9 +106,7 @@ def create_onset_matrix_microtime(
             run_lengths.append(n_timepoints - run_starts[i])
 
     # Initialize onset matrix
-    onset_matrix = torch.zeros(
-        (n_microtime, n_conditions), dtype=torch.float32, device=device
-    )
+    onset_matrix = torch.zeros((n_microtime, n_conditions), dtype=torch.float32, device=device)
 
     for cond_idx in range(n_conditions):
         duration = stim_durations[cond_idx]
@@ -137,7 +135,7 @@ def create_onset_matrix_microtime(
     return onset_matrix
 
 
-def parse_input_files(input_arg: Union[str, List[str]]) -> List[str]:
+def parse_input_files(input_arg: Union[str, list[str]]) -> list[str]:
     """Parse input files (can be list from nargs='+' or single string)
 
     Supports:
@@ -173,10 +171,10 @@ def parse_input_files(input_arg: Union[str, List[str]]) -> List[str]:
 
 
 def parse_durations(
-    durations_arg: List[str],
+    durations_arg: list[str],
     n_conditions: int,
-    condition_labels: List[str],
-) -> List[float]:
+    condition_labels: list[str],
+) -> list[float]:
     """Parse durations argument.
 
     Supports:
@@ -324,9 +322,7 @@ Notes:
     )
 
     # PIGHS-specific options
-    pighs_opts = parser.add_argument_group(
-        "PIGHS Options (only used with -hrf_mode pighs)"
-    )
+    pighs_opts = parser.add_argument_group("PIGHS Options (only used with -hrf_mode pighs)")
     pighs_opts.add_argument(
         "-pighs_peak_time_range",
         type=float,
@@ -545,9 +541,7 @@ def print_header(args):
     print()
 
 
-def print_summary(
-    args, n_runs: int, n_conditions: int, n_voxels: int, condition_labels: List[str]
-):
+def print_summary(args, n_runs: int, n_conditions: int, n_voxels: int, condition_labels: list[str]):
     """Print analysis summary"""
     print("=" * 70)
     print("📋 Analysis Summary")
@@ -686,9 +680,7 @@ def main():
 
     # Get affine and volume shape from first input
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
-    volume_shape = (
-        tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
-    )
+    volume_shape = tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
 
     # Get voxel sizes from affine for blur kernel
     voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
@@ -749,13 +741,20 @@ def main():
         data = torch.cat(run_data_list, dim=1)
         del run_data_list
 
+        # Apply mask AFTER blur (preserve blur-before-mask behavior)
+        if mask is not None:
+            mask_flat = mask.flatten().astype(bool)
+            data = data[mask_flat, :]
+
         print(f"  ✓ Blurred and concatenated {n_runs} runs")
     else:
         # Standard loading without blur
+        mask_flat = mask.flatten().astype(bool) if mask is not None else None
         data, run_starts = load_and_concatenate_runs(
             cast(list[Union[str, PathLib]], run_paths),
             device=device,
             keep_on_cpu=keep_on_cpu,
+            mask_flat=mask_flat,
         )
 
     # Get TR from header if not provided
@@ -771,11 +770,6 @@ def main():
             sys.exit(1)
     else:
         print(f"  TR (specified): {args.tr}s")
-
-    # Apply mask if provided
-    if mask is not None:
-        mask_flat = mask.flatten().astype(bool)
-        data = data[mask_flat, :]
 
     n_voxels, n_timepoints = data.shape
 
@@ -793,9 +787,7 @@ def main():
             verbose=True,
         )
 
-    print(
-        f"  Data shape: {data.shape} ({n_voxels:,} voxels × {n_timepoints} timepoints)"
-    )
+    print(f"  Data shape: {data.shape} ({n_voxels:,} voxels x {n_timepoints} timepoints)")
     print(f"  Volume shape: {volume_shape}")
     print(f"  Runs: {n_runs} starting at {run_starts}")
 
@@ -914,9 +906,7 @@ def main():
     results.hrf_metadata["onset_files"] = onset_files
     results.hrf_metadata["durations"] = durations
     if ortvec_files:
-        results.hrf_metadata["ortvec_files"] = [
-            (str(f), label) for f, label in ortvec_files
-        ]
+        results.hrf_metadata["ortvec_files"] = [(str(f), label) for f, label in ortvec_files]
 
     # ==========================================================================
     # 6. Save outputs
