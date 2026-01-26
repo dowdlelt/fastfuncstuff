@@ -595,8 +595,20 @@ def cross_validate_noise_pcs(
     # 3. Accumulate predictions across all folds
     # 4. Compute single R² from concatenated predictions vs actual data
 
+    # Detect if we can use streaming stats (LORO CV)
+    is_loro = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits)
+
     # Determine chunk size for voxel processing
-    voxel_chunk_size = chunk_size or 10000
+    # Streaming stats use ~1200x less memory, so we can use much larger chunks
+    if chunk_size is not None:
+        voxel_chunk_size = chunk_size
+    elif is_loro:
+        # Streaming stats: only 3 float64 values per voxel per PC (~24 bytes/voxel/PC)
+        # Can process all voxels at once unless dataset is huge
+        voxel_chunk_size = min(n_voxels, 100000)  # Up to 100k voxels at once
+    else:
+        # Full accumulator: n_timepoints float32 per voxel per PC (~14KB/voxel/PC for 3600 TPs)
+        voxel_chunk_size = 10000  # Conservative for full timeseries
 
     # Move data to CPU for memory efficiency
     data_cpu = data.to(proj_device)
@@ -604,9 +616,6 @@ def cross_validate_noise_pcs(
 
     # Output: R² maps for all voxels and all PC counts
     r2_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32)
-
-    # Detect if we can use streaming stats (LORO CV)
-    is_loro = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits)
 
     if is_loro:
         print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
@@ -859,13 +868,14 @@ def cross_validate_noise_pcs(
 
                 if is_loro:
                     # Streaming stats: accumulate ss_res, sum_actual, sum_sq_actual
-                    test_actual_f64 = test_actual_projected.double()
-                    y_pred_f64 = y_pred.double()
+                    # Move to CPU for streaming accumulation (accumulators are on CPU)
+                    test_actual_f64 = test_actual_projected.cpu().double()
+                    y_pred_f64 = y_pred.cpu().double()
 
                     residuals = test_actual_f64 - y_pred_f64
-                    ss_res_fold = (residuals ** 2).sum(dim=1).cpu()
-                    sum_fold = test_actual_f64.sum(dim=1).cpu()
-                    sum_sq_fold = (test_actual_f64 ** 2).sum(dim=1).cpu()
+                    ss_res_fold = (residuals ** 2).sum(dim=1)
+                    sum_fold = test_actual_f64.sum(dim=1)
+                    sum_sq_fold = (test_actual_f64 ** 2).sum(dim=1)
 
                     ss_res_by_pc[n_pcs] += ss_res_fold
                     sum_actual_by_pc[n_pcs] += sum_fold
