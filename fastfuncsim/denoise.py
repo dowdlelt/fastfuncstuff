@@ -506,6 +506,11 @@ def cross_validate_noise_pcs(
     - Predict held-out run using task betas only
     - Concatenate predictions across folds, compute single R² per voxel
 
+    Memory optimization:
+    - LORO (leave-one-run-out): Uses streaming stats (ss_res, sum, sum_sq)
+      instead of full prediction accumulators. Saves ~1000x memory.
+    - Other CV strategies: Uses full prediction accumulators per chunk
+
     PCs are assumed to already have nuisance projected out during extraction.
 
     Parameters
@@ -600,39 +605,60 @@ def cross_validate_noise_pcs(
     # Output: R² maps for all voxels and all PC counts
     r2_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32)
 
-    print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
-    print(f"Memory strategy: accumulate predictions per chunk, compute R², discard")
+    # Detect if we can use streaming stats (LORO CV)
+    is_loro = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits)
+
+    if is_loro:
+        print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
+        print(f"Memory strategy: LORO streaming stats (minimal memory)")
+    else:
+        print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
+        print(f"Memory strategy: accumulate predictions per chunk, compute R², discard")
 
     n_chunks = (n_voxels + voxel_chunk_size - 1) // voxel_chunk_size
 
+    # Progress bar for chunks
+    try:
+        from tqdm import tqdm
+        chunk_iter = tqdm(range(n_chunks), desc="Denoising CV", unit="chunk")
+    except ImportError:
+        chunk_iter = range(n_chunks)
+
     # Process voxels in chunks to manage memory
-    # For each chunk: accumulate predictions across ALL folds, then compute R²
-    for chunk_idx in range(n_chunks):
+    for chunk_idx in chunk_iter:
         chunk_start = chunk_idx * voxel_chunk_size
         chunk_end = min(chunk_start + voxel_chunk_size, n_voxels)
         chunk_size_actual = chunk_end - chunk_start
 
-        print(f"\n--- Chunk {chunk_idx + 1}/{n_chunks}: voxels {chunk_start:,}-{chunk_end:,} ---")
-
-        # Allocate prediction accumulators for this chunk only
-        pred_by_pc_chunk = [
-            torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu")
-            for _ in range(max_components + 1)
-        ]
-
-        # Accumulator for projected actual data (same nuisance projection as predictions)
-        # This is CRITICAL: predictions are in nuisance-projected space, so actuals must be too
-        actual_projected_chunk = torch.zeros(
-            chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu"
-        )
-
         # Get actual data for this chunk
         chunk_data_cpu = data_cpu[chunk_start:chunk_end, :]
 
-        # Cross-validation loop: accumulate predictions for this chunk
+        if is_loro:
+            # Streaming stats: accumulate ss_res, sum, sum_sq for each PC count
+            ss_res_by_pc = [
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device="cpu")
+                for _ in range(max_components + 1)
+            ]
+            sum_actual_by_pc = [
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device="cpu")
+                for _ in range(max_components + 1)
+            ]
+            sum_sq_actual_by_pc = [
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device="cpu")
+                for _ in range(max_components + 1)
+            ]
+        else:
+            # Full accumulator mode for non-LORO CV
+            pred_by_pc_chunk = [
+                torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu")
+                for _ in range(max_components + 1)
+            ]
+            actual_projected_chunk = torch.zeros(
+                chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu"
+            )
+
+        # Cross-validation loop: accumulate predictions or stats for this chunk
         for fold_idx, (train_runs, test_runs) in enumerate(cv_splits):
-            if verbose or fold_idx == 0:
-                print(f"  Fold {fold_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}")
 
             # Build train/test timepoint indices
             train_tps = []
@@ -813,18 +839,16 @@ def cross_validate_noise_pcs(
             design_test_gpu = design_test_projected.to(device)
 
             # ================================================================
-            # CRITICAL: Store projected test data for R² computation
-            # Predictions are in nuisance-projected space, so actuals must be too
-            # ================================================================
-            if nuisance_per_run is not None:
-                # data_test_projected is already computed above (concatenated projected test data)
-                actual_projected_chunk[:, test_tps] = data_test_projected.cpu()
-            else:
-                actual_projected_chunk[:, test_tps] = chunk_data_test.cpu()
-
-            # ================================================================
             # Fit and predict for ALL PC counts
             # ================================================================
+            # Get projected test data for R² computation (predictions are in projected space)
+            if nuisance_per_run is not None:
+                test_actual_projected = data_test_projected
+            else:
+                test_actual_projected = chunk_data_test
+
+            n_test_tps = len(test_tps)
+
             for n_pcs in range(max_components + 1):
                 pinv_task = pinv_task_list[n_pcs]
 
@@ -835,32 +859,71 @@ def cross_validate_noise_pcs(
                 # Predict: y_pred = X @ betas
                 y_pred = (design_test_gpu @ betas.T).T  # (chunk, n_test_tps)
 
-                # Accumulate predictions into chunk array (on CPU)
-                pred_by_pc_chunk[n_pcs][:, test_tps] = y_pred.cpu()
+                if is_loro:
+                    # Streaming stats: accumulate ss_res, sum_actual, sum_sq_actual
+                    test_actual_f64 = test_actual_projected.double()
+                    y_pred_f64 = y_pred.double()
+
+                    residuals = test_actual_f64 - y_pred_f64
+                    ss_res_fold = (residuals ** 2).sum(dim=1).cpu()
+                    sum_fold = test_actual_f64.sum(dim=1).cpu()
+                    sum_sq_fold = (test_actual_f64 ** 2).sum(dim=1).cpu()
+
+                    ss_res_by_pc[n_pcs] += ss_res_fold
+                    sum_actual_by_pc[n_pcs] += sum_fold
+                    sum_sq_actual_by_pc[n_pcs] += sum_sq_fold
+                else:
+                    # Full accumulator mode: store predictions
+                    pred_by_pc_chunk[n_pcs][:, test_tps] = y_pred.cpu()
+
+            # For non-LORO mode, store projected actuals
+            if not is_loro:
+                if nuisance_per_run is not None:
+                    actual_projected_chunk[:, test_tps] = data_test_projected.cpu()
+                else:
+                    actual_projected_chunk[:, test_tps] = chunk_data_test.cpu()
 
             # Free GPU memory for this fold
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         # ================================================================
-        # Compute R² for this chunk from accumulated predictions
-        # CRITICAL: Use projected actuals, not raw data!
-        # Predictions are in nuisance-projected space, so R² must compare
-        # against nuisance-projected actuals.
+        # Compute R² for this chunk
         # ================================================================
-        for n_pcs in range(max_components + 1):
-            pred = pred_by_pc_chunk[n_pcs]  # (chunk_size, n_timepoints)
-            actual = actual_projected_chunk  # (chunk_size, n_timepoints) - PROJECTED data
+        if is_loro:
+            # Streaming stats: compute R² from accumulated stats
+            # In LORO, each voxel sees all timepoints exactly once
+            for n_pcs in range(max_components + 1):
+                ss_res = ss_res_by_pc[n_pcs]
+                sum_act = sum_actual_by_pc[n_pcs]
+                sum_sq_act = sum_sq_actual_by_pc[n_pcs]
 
-            # Compute R² per voxel
-            ss_res = ((actual - pred) ** 2).sum(dim=1)
-            ss_tot = ((actual - actual.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
-            r2 = 1 - (ss_res / (ss_tot + 1e-10))
+                # Compute ss_tot from streaming stats: ss_tot = sum_sq - sum^2 / n
+                mean_actual = sum_act / n_timepoints
+                ss_tot = sum_sq_act - n_timepoints * (mean_actual ** 2)
 
-            r2_maps[chunk_start:chunk_end, n_pcs] = r2.numpy()
+                # R² = 1 - ss_res / ss_tot
+                r2 = (1.0 - ss_res / (ss_tot + 1e-10)).float()
+                r2_maps[chunk_start:chunk_end, n_pcs] = r2.numpy()
 
-        # Free chunk memory
-        del pred_by_pc_chunk, chunk_data_cpu, actual_projected_chunk
+            # Free chunk memory
+            del ss_res_by_pc, sum_actual_by_pc, sum_sq_actual_by_pc, chunk_data_cpu
+        else:
+            # Full accumulator mode: compute R² from full predictions
+            for n_pcs in range(max_components + 1):
+                pred = pred_by_pc_chunk[n_pcs]  # (chunk_size, n_timepoints)
+                actual = actual_projected_chunk  # (chunk_size, n_timepoints) - PROJECTED data
+
+                # Compute R² per voxel
+                ss_res = ((actual - pred) ** 2).sum(dim=1)
+                ss_tot = ((actual - actual.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
+                r2 = 1 - (ss_res / (ss_tot + 1e-10))
+
+                r2_maps[chunk_start:chunk_end, n_pcs] = r2.numpy()
+
+            # Free chunk memory
+            del pred_by_pc_chunk, chunk_data_cpu, actual_projected_chunk
+
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
