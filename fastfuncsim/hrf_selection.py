@@ -21,7 +21,7 @@ from .design import convolve_hrf, convolve_hrf_microtime
 from .glm_core import GLMResults, construct_polynomial_matrix, fit_glm
 from .hrf import get_hrf_library
 from .utils import get_device, to_tensor
-from .xval import compute_xval_r2, generate_cv_splits
+from .xval import compute_xval_r2, generate_cv_splits, compute_r2_metric, project_out_nuisance_per_run
 
 
 def load_nuisance_file(
@@ -98,9 +98,7 @@ def load_nuisance_file(
     # Parse data
     try:
         if delimiter == ",":
-            data = np.array(
-                [[float(x.strip()) for x in line.split(",")] for line in data_lines]
-            )
+            data = np.array([[float(x.strip()) for x in line.split(",")] for line in data_lines])
         else:
             data = np.array([[float(x) for x in line.split()] for line in data_lines])
     except ValueError as e:
@@ -321,7 +319,9 @@ def fit_glm_hrf_library_with_xval(
         print(
             f"  CV strategy: {cv_strategy} ({'LORO' if cv_strategy == 1 else 'split-halves' if cv_strategy == 0.5 else cv_strategy})"
         )
-        print(f"  Microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR, onset bin {microtime_onset})")
+        print(
+            f"  Microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR, onset bin {microtime_onset})"
+        )
         if keep_data_on_cpu:
             print(
                 f"  Memory mode: CPU streaming (data {data_size_gb:.1f}GB > {gpu_memory_threshold_gb}GB threshold)"
@@ -337,9 +337,8 @@ def fit_glm_hrf_library_with_xval(
         print()
 
     # =========================================================================
-    # Build polynomial (nuisance) design matrix - same for all HRFs
-    # Uses block-diagonal structure: each run gets its own polynomials
-    # This is the SAME approach as fit_glm and compute_xval_r2 expect
+    # Build per-run nuisance blocks (polynomials + extra regressors)
+    # Using PROJECT-FIRST approach (GLMdenoise-style)
     # =========================================================================
 
     # Auto-compute polort if not specified (AFNI convention: duration_minutes / 2)
@@ -353,12 +352,10 @@ def fit_glm_hrf_library_with_xval(
         avg_run_duration_min = (sum(run_lengths) / n_runs * tr) / 60.0
         polort = max(1, round(avg_run_duration_min / 2))
         if verbose:
-            print(
-                f"  Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)"
-            )
+            print(f"  Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)")
 
-    # Build block-diagonal polynomial matrix for all runs
-    poly_blocks = []
+    # Build nuisance blocks per run (for project-first approach)
+    nuisance_blocks_per_run = []
     run_lengths = []
     for i in range(n_runs):
         if i < n_runs - 1:
@@ -366,22 +363,21 @@ def fit_glm_hrf_library_with_xval(
         else:
             run_len = n_timepoints - run_starts[i]
         run_lengths.append(run_len)
+
+        # Start with polynomials
         poly_block = construct_polynomial_matrix(run_len, polort, device)
-        poly_blocks.append(poly_block)
+        nuisance_blocks_per_run.append(poly_block)
 
-    # Create block-diagonal polynomial design
-    poly_design = torch.block_diag(*poly_blocks)  # (n_timepoints, n_runs * (polort+1))
-    n_poly_cols = poly_design.shape[1]
+    n_poly_cols = nuisance_blocks_per_run[0].shape[1]
 
     # =========================================================================
-    # Load and concatenate additional nuisance regressors (motion, physio, etc.)
-    # These are passed via ortvec_files (file paths) or extra_regressors (arrays)
+    # Load and add additional nuisance regressors (motion, physio, etc.)
+    # Split by run and concatenate with polynomial blocks
     # =========================================================================
-    nuisance_design = poly_design  # Start with polynomials
     n_extra_nuisance = 0
     extra_nuisance_labels = []
 
-    # Load ortvec files (AFNI-style nuisance regressors)
+    # Load ortvec files and split by run
     if ortvec_files is not None:
         for filepath, label in ortvec_files:
             nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
@@ -389,23 +385,24 @@ def fit_glm_hrf_library_with_xval(
             n_extra_nuisance += n_cols_loaded
             extra_nuisance_labels.extend([f"{label}_{i}" for i in range(n_cols_loaded)])
 
-            # Convert to tensor and concatenate
-            nuisance_tensor = torch.tensor(
-                nuisance_data, dtype=torch.float32, device=device
-            )
-            nuisance_design = torch.cat([nuisance_design, nuisance_tensor], dim=1)
-
             if verbose:
-                print(
-                    f"  Loaded nuisance: {filepath} ({n_cols_loaded} columns, label={label})"
+                print(f"  Loaded nuisance: {filepath} ({n_cols_loaded} columns, label={label})")
+
+            # Split by run and add to nuisance blocks
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                run_nuisance = torch.tensor(
+                    nuisance_data[start_tp:end_tp, :], dtype=torch.float32, device=device
+                )
+                nuisance_blocks_per_run[run_idx] = torch.cat(
+                    [nuisance_blocks_per_run[run_idx], run_nuisance], dim=1
                 )
 
     # Add extra_regressors if provided directly as array
     if extra_regressors is not None:
         if isinstance(extra_regressors, np.ndarray):
-            extra_tensor = torch.tensor(
-                extra_regressors, dtype=torch.float32, device=device
-            )
+            extra_tensor = torch.tensor(extra_regressors, dtype=torch.float32, device=device)
         else:
             extra_tensor = extra_regressors.to(device=device, dtype=torch.float32)
 
@@ -424,23 +421,50 @@ def fit_glm_hrf_library_with_xval(
         n_extra_nuisance += n_cols_extra
         extra_nuisance_labels.extend([f"extra_{i}" for i in range(n_cols_extra)])
 
-        nuisance_design = torch.cat([nuisance_design, extra_tensor], dim=1)
-
         if verbose:
             print(f"  Added extra_regressors: {n_cols_extra} columns")
 
-    n_nuisance_cols = nuisance_design.shape[1]
+        # Split by run and add to nuisance blocks
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_extra = extra_tensor[start_tp:end_tp, :]
+            nuisance_blocks_per_run[run_idx] = torch.cat(
+                [nuisance_blocks_per_run[run_idx], run_extra], dim=1
+            )
+
+    n_nuisance_cols_per_run = nuisance_blocks_per_run[0].shape[1]
 
     if verbose:
         if n_extra_nuisance > 0:
             print(
-                f"  Total nuisance design: {nuisance_design.shape} "
+                f"  Nuisance per run: {n_nuisance_cols_per_run} columns "
                 f"({n_poly_cols} polort + {n_extra_nuisance} extra)"
             )
         else:
-            print(
-                f"  Polynomial design: {nuisance_design.shape} ({n_poly_cols} nuisance columns)"
-            )
+            print(f"  Polynomial nuisance per run: {n_nuisance_cols_per_run} columns")
+        print()
+
+    # =========================================================================
+    # Project out nuisance from DATA once (same for all HRFs)
+    # This is the GLMdenoise PROJECT-FIRST approach
+    # =========================================================================
+    if verbose:
+        print("Projecting out nuisance from data (once for all HRFs)...")
+
+    # Create a dummy design (we'll project actual stim designs per-HRF)
+    # For now just project data
+    dummy_design = torch.zeros((n_timepoints, 1), device=device)
+    projected_data, _ = project_out_nuisance_per_run(
+        data=data,
+        design=dummy_design,
+        nuisance_per_run=nuisance_blocks_per_run,
+        run_starts=run_starts,
+        device=device,
+    )
+
+    if verbose:
+        print(f"  Projected data shape: {projected_data.shape}")
         print()
 
     # Storage for CV results: (n_voxels, n_hrfs)
@@ -452,8 +476,8 @@ def fit_glm_hrf_library_with_xval(
     design_matrix_ref = None
 
     # =========================================================================
-    # Main loop: evaluate each HRF via cross-validation using compute_xval_r2
-    # This reuses the SOLID xval code from 3dXvalR2fast
+    # Main loop: evaluate each HRF via cross-validation
+    # Using PROJECT-FIRST approach: project stim design, then run CV
     # =========================================================================
     hrf_iterator = tqdm(range(n_hrfs), desc="Evaluating HRF candidates")
 
@@ -474,25 +498,27 @@ def fit_glm_hrf_library_with_xval(
 
         n_stim_cols = stim_design.shape[1]
 
-        # Build full design: [stimulus | nuisance (polort + extra)]
-        # Stimulus columns come first (stim_indices = 0:n_stim)
-        # Nuisance columns come after (nuisance_indices = n_stim:end)
-        full_design = torch.cat([stim_design, nuisance_design], dim=1)
-
-        stim_indices = list(range(n_stim_cols))
-        nuisance_indices = list(range(n_stim_cols, n_stim_cols + n_nuisance_cols))
+        # Project out nuisance from stim design (per run)
+        _, projected_stim_design = project_out_nuisance_per_run(
+            data=torch.zeros((1, n_timepoints), device=device),  # Dummy data
+            design=stim_design,
+            nuisance_per_run=nuisance_blocks_per_run,
+            run_starts=run_starts,
+            device=device,
+        )
 
         # Store reference design matrix for debugging
         if hrf_idx == reference_hrf_idx:
-            design_matrix_ref = full_design.cpu().clone()
+            design_matrix_ref = projected_stim_design.cpu().clone()
 
-        # Use the SOLID xval code that already handles all edge cases
+        # Run CV on PROJECTED data with PROJECTED stim design
+        # No nuisance columns - already projected out!
         xval_results = compute_xval_r2(
-            data=data,
-            design_matrix=full_design,
+            data=projected_data,
+            design_matrix=projected_stim_design,
             run_starts=run_starts,
-            stim_indices=stim_indices,
-            nuisance_indices=nuisance_indices,
+            stim_indices=list(range(n_stim_cols)),  # All columns are stim
+            nuisance_indices=[],  # No nuisance - already projected out!
             cv_splits=cv_splits,
             metric=metric,
             zero_event_strategy="zero",
@@ -501,9 +527,8 @@ def fit_glm_hrf_library_with_xval(
             verbose=False,  # Don't spam per-HRF output
         )
 
-        # Store results for this HRF
-        xval_r2_median_all[:, hrf_idx] = xval_results["r2_median"].to(device)
-        xval_r2_std_all[:, hrf_idx] = xval_results["r2_std"].to(device)
+        # Store results for this HRF (GLMdenoise-style: single R² per voxel)
+        xval_r2_median_all[:, hrf_idx] = xval_results["r2"].to(device)
 
     # Clear GPU cache after HRF evaluation to free fragmented memory
     if device.type == "cuda":
@@ -562,20 +587,22 @@ def fit_glm_hrf_library_with_xval(
         device=device,
     )
 
-    # Build full design with nuisance (polort + extra)
-    full_design_canonical = torch.cat([canonical_design, nuisance_design], dim=1)
-    stim_indices_canonical = list(range(canonical_design.shape[1]))
-    nuisance_indices_canonical = list(
-        range(canonical_design.shape[1], full_design_canonical.shape[1])
+    # Project out nuisance from canonical design (same as HRF library)
+    _, projected_canonical_design = project_out_nuisance_per_run(
+        data=torch.zeros((1, n_timepoints), device=device),  # Dummy data
+        design=canonical_design,
+        nuisance_per_run=nuisance_blocks_per_run,
+        run_starts=run_starts,
+        device=device,
     )
 
-    # Compute xval R² for canonical HRF
+    # Compute xval R² for canonical HRF (on projected data/design)
     canonical_xval_results = compute_xval_r2(
-        data=data,
-        design_matrix=full_design_canonical,
+        data=projected_data,
+        design_matrix=projected_canonical_design,
         run_starts=run_starts,
-        stim_indices=stim_indices_canonical,
-        nuisance_indices=nuisance_indices_canonical,
+        stim_indices=list(range(canonical_design.shape[1])),  # All columns are stim
+        nuisance_indices=[],  # No nuisance - already projected out!
         cv_splits=cv_splits,
         metric=metric,
         zero_event_strategy="zero",
@@ -583,18 +610,24 @@ def fit_glm_hrf_library_with_xval(
         batch_size=chunk_size,
         verbose=False,
     )
-    xval_r2_canonical = canonical_xval_results["r2_median"].to(device)
+    xval_r2_canonical = canonical_xval_results["r2"].to(device)
 
     if verbose:
         print(f"  Canonical HRF mean xval R²: {xval_r2_canonical.mean().item():.4f}")
 
     # Fit full dataset with canonical HRF to get betas/tstats for comparison
+    # NOTE: For final fit, we need the full (unprojected) data and design with nuisance
     if verbose:
         print("  Fitting full dataset with canonical HRF...")
+
+    # Build block-diagonal nuisance for final fit
+    nuisance_design = torch.block_diag(*nuisance_blocks_per_run)
+    full_design_canonical = torch.cat([canonical_design, nuisance_design], dim=1)
 
     # Use fit_glm with the proper signature: (data, design, tr, ...)
     # full_design_canonical already has poly columns, so set max_poly_degree=0 (no extra polys)
     # If data is on CPU, use chunk-based streaming to avoid OOM
+    n_stim_cols_canonical = canonical_design.shape[1]
     canonical_glm_results = fit_glm(
         data=data,
         design=full_design_canonical,  # Already includes stimulus + polynomial columns
@@ -602,7 +635,7 @@ def fit_glm_hrf_library_with_xval(
         max_poly_degree=0,  # No additional polynomials - already in design
         device=device,
         verbose=False,
-        task_indices=stim_indices_canonical,  # Mark which are task regressors
+        task_indices=list(range(n_stim_cols_canonical)),  # Mark which are task regressors
         preload_data_to_device=(data.device == device),  # Stream chunks if data on CPU
     )
 
@@ -610,9 +643,7 @@ def fit_glm_hrf_library_with_xval(
     canonical_design_matrix = full_design_canonical
 
     if verbose:
-        print(
-            f"  Canonical HRF full-data R²: {canonical_glm_results.r2.mean().item():.4f}"
-        )
+        print(f"  Canonical HRF full-data R²: {canonical_glm_results.r2.mean().item():.4f}")
 
     # Select best HRF per voxel based on median CV R²
     hrf_index = xval_r2_median_all.argmax(dim=1)  # (n_voxels,)
@@ -668,7 +699,7 @@ def fit_glm_hrf_library_with_xval(
         "polort": polort,
         "n_poly_cols": n_poly_cols,
         "n_extra_nuisance": n_extra_nuisance,
-        "n_nuisance_total": n_nuisance_cols,
+        "n_nuisance_total": nuisance_design.shape[1],
         "extra_nuisance_labels": extra_nuisance_labels,
         "n_voxels": n_voxels,
         "n_timepoints": n_timepoints,
@@ -780,9 +811,7 @@ def _fit_voxelwise_hrf(
         # But keep the original GPU indices for storing results back to GPU output tensors
         if data.device.type == "cpu" and voxel_indices.device.type != "cpu":
             voxel_indices_for_data = voxel_indices.cpu()
-            group_data = data[
-                voxel_indices_for_data, :
-            ]  # (n_group_voxels, n_timepoints)
+            group_data = data[voxel_indices_for_data, :]  # (n_group_voxels, n_timepoints)
         else:
             group_data = data[voxel_indices, :]  # (n_group_voxels, n_timepoints)
 
@@ -813,9 +842,7 @@ def _fit_voxelwise_hrf(
             device=device,
             verbose=False,
             task_indices=stim_indices,
-            preload_data_to_device=(
-                group_data.device == device
-            ),  # Stream chunks if data on CPU
+            preload_data_to_device=(group_data.device == device),  # Stream chunks if data on CPU
         )
 
         # Store dof from first group (same for all groups with same design structure)
@@ -914,9 +941,7 @@ def _write_afni_xmat(
                 nuisance_labels.append(f"r{r + 1:02d}_poly{p}")
     else:
         # Fall back to auto-detecting poly columns
-        n_poly_total = n_nuisance - (
-            len(extra_nuisance_labels) if extra_nuisance_labels else 0
-        )
+        n_poly_total = n_nuisance - (len(extra_nuisance_labels) if extra_nuisance_labels else 0)
         for i in range(n_poly_total):
             nuisance_labels.append(f"poly{i:02d}")
 
@@ -1115,10 +1140,7 @@ def save_hrf_selection_results(
             n_stim_cols = len(n_conditions) if isinstance(n_conditions, list) else 1
         else:
             # Estimate from final_results if available
-            if (
-                results.final_results is not None
-                and results.final_results.betas is not None
-            ):
+            if results.final_results is not None and results.final_results.betas is not None:
                 n_stim_cols = results.final_results.betas.shape[1]
             else:
                 n_stim_cols = design_np.shape[1]  # Assume all are stimulus
@@ -1237,9 +1259,7 @@ def save_hrf_selection_results(
                     run_len = run_starts_local[i + 1] - run_starts_local[i]
                 else:
                     run_len = n_timepoints - run_starts_local[i]
-                poly_block = construct_polynomial_matrix(
-                    run_len, polort_val, onsets.device
-                )
+                poly_block = construct_polynomial_matrix(run_len, polort_val, onsets.device)
                 poly_blocks.append(poly_block)
             poly_design = torch.block_diag(*poly_blocks)
 
@@ -1269,13 +1289,9 @@ def save_hrf_selection_results(
                 # Create descriptive filename (1-based: hrf01, hrf02, ..., hrf20)
                 # Use hrf_idx + 1 for 1-based naming (0 = background in AFNI)
                 hrf_num = hrf_idx + 1
-                hrf_design_file = (
-                    hrf_designs_dir / f"hrf{hrf_num:02d}_{hrf_mode}.xmat.1D"
-                )
+                hrf_design_file = hrf_designs_dir / f"hrf{hrf_num:02d}_{hrf_mode}.xmat.1D"
                 # Get extra nuisance labels from metadata
-                extra_nuisance_labels = results.hrf_metadata.get(
-                    "extra_nuisance_labels", []
-                )
+                extra_nuisance_labels = results.hrf_metadata.get("extra_nuisance_labels", [])
                 _write_afni_xmat(
                     design_np,
                     str(hrf_design_file),
@@ -1298,13 +1314,8 @@ def save_hrf_selection_results(
         # Determine n_stim_cols for labeling
         n_conditions_meta = results.hrf_metadata.get("stim_durations")
         if n_conditions_meta is not None:
-            n_stim_cols = (
-                len(n_conditions_meta) if isinstance(n_conditions_meta, list) else 1
-            )
-        elif (
-            results.final_results is not None
-            and results.final_results.betas is not None
-        ):
+            n_stim_cols = len(n_conditions_meta) if isinstance(n_conditions_meta, list) else 1
+        elif results.final_results is not None and results.final_results.betas is not None:
             n_stim_cols = results.final_results.betas.shape[1]
         else:
             n_stim_cols = 0
@@ -1374,9 +1385,7 @@ def save_hrf_selection_results(
 
     # Add canonical baseline comparison statistics
     if results.xval_r2_canonical is not None:
-        metadata["xval_r2_canonical_mean"] = float(
-            results.xval_r2_canonical.mean().item()
-        )
+        metadata["xval_r2_canonical_mean"] = float(results.xval_r2_canonical.mean().item())
         metadata["xval_r2_best_mean"] = float(results.xval_r2_best.mean().item())
         metadata["r2_improvement_over_canonical"] = float(
             results.xval_r2_best.mean().item() - results.xval_r2_canonical.mean().item()

@@ -51,9 +51,7 @@ from tqdm.auto import tqdm
 
 try:
     import nibabel as nib
-except (
-    ImportError
-) as exc:  # pragma: no cover - nibabel is required for AFNI interoperability
+except ImportError as exc:  # pragma: no cover - nibabel is required for AFNI interoperability
     raise ImportError(
         "nibabel is required for AFNI mask and imaging utilities. Install it with `pip install nibabel`."
     ) from exc
@@ -186,9 +184,7 @@ def onsets_to_binary_matrix(
     # Validate all conditions have same number of runs
     for cond_idx, cond_onsets in enumerate(onsets_per_condition):
         if len(cond_onsets) != n_runs:
-            raise ValueError(
-                f"Condition {cond_idx} has {len(cond_onsets)} runs, expected {n_runs}"
-            )
+            raise ValueError(f"Condition {cond_idx} has {len(cond_onsets)} runs, expected {n_runs}")
 
     # Calculate bins per TR and total microtime points
     bins_per_tr = int(round(tr / microtime_dt))
@@ -356,9 +352,7 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
 
                     # Parse specific fields
                     if key == "ColumnLabels":
-                        metadata["column_labels"] = [
-                            x.strip() for x in value.split(";")
-                        ]
+                        metadata["column_labels"] = [x.strip() for x in value.split(";")]
 
                     elif key == "ColumnGroups":
                         # Parse format like "20@-1,1..4,24@0"
@@ -590,6 +584,7 @@ def load_and_concatenate_runs(
     run_files: List[Union[str, Path]],
     device: Optional[torch.device] = None,
     keep_on_cpu: bool = False,
+    mask_flat: Optional[np.ndarray] = None,
 ) -> Tuple[torch.Tensor, List[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
@@ -664,6 +659,15 @@ def load_and_concatenate_runs(
             data_np = data_np.reshape(n_voxels, n_timepoints)
         elif data_np.ndim != 2:
             raise ValueError(f"Data must be 2D or 4D, got shape {data_np.shape}")
+
+        # Apply mask before moving to device (saves GPU memory)
+        if mask_flat is not None:
+            if mask_flat.shape[0] != data_np.shape[0]:
+                raise ValueError(
+                    f"mask_flat length {mask_flat.shape[0]} does not match "
+                    f"n_voxels {data_np.shape[0]} for run {i}"
+                )
+            data_np = data_np[mask_flat, :]
 
         # Convert to torch immediately and move to device
         # This avoids keeping numpy copy around
@@ -987,9 +991,7 @@ def select_regressors_by_group(
                 selected_cols.extend(groups[group_name])
             else:
                 available = [k for k in groups.keys() if groups[k]]
-                raise ValueError(
-                    f"Unknown group '{group_name}'. Available groups: {available}"
-                )
+                raise ValueError(f"Unknown group '{group_name}'. Available groups: {available}")
         selected_cols = sorted(set(selected_cols))
 
     # Apply exclusions
@@ -1171,9 +1173,7 @@ def get_tr_from_file(filepath: Union[str, Path]) -> float:
     """
     try:
         img = nib.load(filepath)
-        tr = img.header.get_zooms()[
-            -1
-        ]  # Last dimension is time  # type: ignore[attr-defined]
+        tr = img.header.get_zooms()[-1]  # Last dimension is time  # type: ignore[attr-defined]
         if tr == 0 or tr is None:
             print(f"WARNING: TR not found in {filepath} header, using 1.0")
             return 1.0

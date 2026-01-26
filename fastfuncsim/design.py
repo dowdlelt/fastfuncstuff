@@ -3,10 +3,12 @@ Design matrix construction for GLM
 Handles FIR, assumed HRF, and convolution operations
 """
 
+from typing import Optional, Union
+
 import torch
 import torch.nn.functional as F
-from typing import Union, List, Optional
-from .utils import to_tensor, get_device
+
+from .utils import get_device, to_tensor
 
 
 def convolve_hrf(
@@ -159,9 +161,7 @@ def convolve_hrf_microtime(
     hrf_len = len(hrf_microtime)
 
     # Downsampling indices: sample every bins_per_tr, starting at microtime_onset
-    sample_indices = torch.arange(
-        microtime_onset, n_microtime_points, bins_per_tr, device=device
-    )
+    sample_indices = torch.arange(microtime_onset, n_microtime_points, bins_per_tr, device=device)
     if len(sample_indices) > n_timepoints:
         sample_indices = sample_indices[:n_timepoints]
     elif len(sample_indices) < n_timepoints:
@@ -197,9 +197,7 @@ def convolve_hrf_microtime(
             continue
 
         # Storage for single-trial regressors (at microtime resolution)
-        trial_regressors_micro = torch.zeros(
-            n_microtime_points, n_events, device=device
-        )
+        trial_regressors_micro = torch.zeros(n_microtime_points, n_events, device=device)
 
         for event_idx, (start, end) in enumerate(zip(event_starts, event_ends)):
             # Create single-event onset vector
@@ -402,14 +400,14 @@ def convolve_design_hrf(
 
 
 def build_glm_design(
-    onsets: Union[torch.Tensor, List[torch.Tensor]],
+    onsets: Union[torch.Tensor, list[torch.Tensor]],
     hrf: Optional[torch.Tensor] = None,
-    n_timepoints: Optional[Union[int, List[int]]] = None,
+    n_timepoints: Optional[Union[int, list[int]]] = None,
     mode: str = "assumed",
     n_fir_lags: int = 30,
     single_trial: bool = False,
     device: Optional[torch.device] = None,
-) -> Union[torch.Tensor, List[torch.Tensor]]:
+) -> Union[torch.Tensor, list[torch.Tensor]]:
     """
     Build design matrix for GLM fitting
 
@@ -472,11 +470,7 @@ def build_glm_design(
         else:
             if mode == "onoff":
                 # Simple boxcar - just sum across conditions
-                design = (
-                    onset.sum(dim=1, keepdim=True)
-                    if onset.ndim > 1
-                    else onset.unsqueeze(1)
-                )
+                design = onset.sum(dim=1, keepdim=True) if onset.ndim > 1 else onset.unsqueeze(1)
                 if hrf is not None:
                     design = convolve_hrf(design, hrf, n_tp, device=device)
 
@@ -580,9 +574,7 @@ def generate_random_onsets(
     if alternate_conditions:
         conditions = [i % n_conditions for i in range(n_trials_total)]
     else:
-        conditions = [
-            random.randint(0, n_conditions - 1) for _ in range(n_trials_total)
-        ]
+        conditions = [random.randint(0, n_conditions - 1) for _ in range(n_trials_total)]
 
     # Build onset matrix
     onsets = torch.zeros(n_timepoints, n_conditions, device=device)

@@ -105,7 +105,7 @@ class PCA:
         self.n_samples_ = None
         self.n_features_ = None
 
-    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> 'PCA':
+    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> "PCA":
         """
         Fit PCA on data
 
@@ -130,26 +130,55 @@ class PCA:
         self.mean_ = X.mean(dim=0)
         X_centered = X - self.mean_
 
-        # Compute SVD
-        # X = U @ S @ V^T
-        # Components are rows of V^T (columns of V)
-        # Scores are U @ S
-        U, S, Vt = torch.linalg.svd(X_centered, full_matrices=False)
+        # Compute SVD using memory-efficient covariance approach when n_features >> n_samples
+        # This is the GLMdenoise/GLMsingle approach: svd(X @ X^T) instead of svd(X)
+        # For fMRI noise pools: (400 timepoints, 260k voxels) → (400, 400) covariance
+        # Memory: O(n_samples^2) instead of O(n_samples * n_features)
+        #
+        # Math: X X^T = U S^2 U^T, so we get same U (PC timecourses) from covariance SVD
+        # Then compute loadings V from V = X^T U S^-1 if needed
+        if n_features > 10 * n_samples:  # n_features >> n_samples (typical for fMRI)
+            # Covariance approach: SVD on (n_samples, n_samples) instead of (n_samples, n_features)
+            cov = X_centered @ X_centered.T  # (n_samples, n_samples)
+            U, S_squared, _ = torch.linalg.svd(cov, full_matrices=False)
+            S = torch.sqrt(torch.clamp(S_squared, min=0))  # Eigenvalues → singular values
 
-        # Explained variance: S^2 / (n_samples - 1)
-        explained_variance = (S ** 2) / (n_samples - 1)
-        total_variance = explained_variance.sum()
-        explained_variance_ratio = explained_variance / total_variance
+            # Explained variance: S^2 / (n_samples - 1)
+            explained_variance = (S**2) / (n_samples - 1)
+            total_variance = explained_variance.sum()
+            explained_variance_ratio = explained_variance / total_variance
 
-        # Determine number of components to keep
-        n_components = self._select_n_components(
-            explained_variance_ratio,
-            n_samples,
-            n_features
-        )
+            # Determine number of components to keep BEFORE computing loadings
+            n_components = self._select_n_components(
+                explained_variance_ratio, n_samples, n_features
+            )
 
-        # Keep selected components
-        self.components_ = Vt[:n_components]
+            # Compute loadings (V^T) ONLY for selected components to save memory
+            # V = X^T U S^-1, so Vt = S^-1 * U^T @ X
+            S_inv = 1.0 / torch.clamp(S[:n_components], min=1e-10)
+            Vt = S_inv[:, None] * (U[:, :n_components].T @ X_centered)  # (n_components, n_features)
+        else:
+            # Standard approach for moderate-sized data
+            # X = U @ S @ V^T
+            # Components are rows of V^T (columns of V)
+            # Scores are U @ S
+            U, S, Vt = torch.linalg.svd(X_centered, full_matrices=False)
+
+            # Explained variance: S^2 / (n_samples - 1)
+            explained_variance = (S**2) / (n_samples - 1)
+            total_variance = explained_variance.sum()
+            explained_variance_ratio = explained_variance / total_variance
+
+            # Determine number of components to keep
+            n_components = self._select_n_components(
+                explained_variance_ratio, n_samples, n_features
+            )
+
+            # Keep selected components
+            Vt = Vt[:n_components]
+
+        # Store selected components
+        self.components_ = Vt
         self.explained_variance_ = explained_variance[:n_components]
         self.explained_variance_ratio_ = explained_variance_ratio[:n_components]
         self.n_components_ = n_components
@@ -231,10 +260,7 @@ class PCA:
         return X_reconstructed
 
     def _select_n_components(
-        self,
-        explained_variance_ratio: torch.Tensor,
-        n_samples: int,
-        n_features: int
+        self, explained_variance_ratio: torch.Tensor, n_samples: int, n_features: int
     ) -> int:
         """
         Determine number of components to keep
@@ -284,14 +310,13 @@ class PCA:
 
         elif isinstance(self.n_components, str):
             # Advanced selection methods
-            if self.n_components == 'mle':
+            if self.n_components == "mle":
                 return self._select_mle(explained_variance_ratio, n_samples, n_features)
-            elif self.n_components == 'knee':
+            elif self.n_components == "knee":
                 return self._select_knee(explained_variance_ratio)
             else:
                 raise ValueError(
-                    f"Unknown n_components string: '{self.n_components}'. "
-                    f"Supported: 'mle', 'knee'"
+                    f"Unknown n_components string: '{self.n_components}'. Supported: 'mle', 'knee'"
                 )
 
         else:
@@ -300,10 +325,7 @@ class PCA:
             )
 
     def _select_mle(
-        self,
-        explained_variance_ratio: torch.Tensor,
-        n_samples: int,
-        n_features: int
+        self, explained_variance_ratio: torch.Tensor, n_samples: int, n_features: int
     ) -> int:
         """
         Select number of components using Minka's MLE method
@@ -362,18 +384,18 @@ class PCA:
             raise RuntimeError("PCA must be fitted first")
 
         return {
-            'components': self.components_.cpu().numpy(),
-            'explained_variance': self.explained_variance_.cpu().numpy(),
-            'explained_variance_ratio': self.explained_variance_ratio_.cpu().numpy(),
-            'mean': self.mean_.cpu().numpy(),
-            'n_components': self.n_components_,
-            'n_samples': self.n_samples_,
-            'n_features': self.n_features_,
-            'whiten': self.whiten,
+            "components": self.components_.cpu().numpy(),
+            "explained_variance": self.explained_variance_.cpu().numpy(),
+            "explained_variance_ratio": self.explained_variance_ratio_.cpu().numpy(),
+            "mean": self.mean_.cpu().numpy(),
+            "n_components": self.n_components_,
+            "n_samples": self.n_samples_,
+            "n_features": self.n_features_,
+            "whiten": self.whiten,
         }
 
     @classmethod
-    def from_dict(cls, params: Dict, device: Optional[torch.device] = None) -> 'PCA':
+    def from_dict(cls, params: Dict, device: Optional[torch.device] = None) -> "PCA":
         """
         Create PCA object from dictionary
 
@@ -391,19 +413,15 @@ class PCA:
         """
         device = device if device is not None else get_device()
 
-        pca = cls(
-            n_components=params['n_components'],
-            whiten=params['whiten'],
-            device=device
-        )
+        pca = cls(n_components=params["n_components"], whiten=params["whiten"], device=device)
 
-        pca.components_ = to_tensor(params['components'], device=device)
-        pca.explained_variance_ = to_tensor(params['explained_variance'], device=device)
-        pca.explained_variance_ratio_ = to_tensor(params['explained_variance_ratio'], device=device)
-        pca.mean_ = to_tensor(params['mean'], device=device)
-        pca.n_components_ = params['n_components']
-        pca.n_samples_ = params['n_samples']
-        pca.n_features_ = params['n_features']
+        pca.components_ = to_tensor(params["components"], device=device)
+        pca.explained_variance_ = to_tensor(params["explained_variance"], device=device)
+        pca.explained_variance_ratio_ = to_tensor(params["explained_variance_ratio"], device=device)
+        pca.mean_ = to_tensor(params["mean"], device=device)
+        pca.n_components_ = params["n_components"]
+        pca.n_samples_ = params["n_samples"]
+        pca.n_features_ = params["n_features"]
 
         return pca
 
@@ -472,12 +490,12 @@ def explained_variance_analysis(
     for threshold in thresholds:
         n_comp = int(np.searchsorted(cumsum_var, threshold) + 1)
         n_comp = min(n_comp, max_components)
-        key = f'n_components_{int(threshold*100)}'
+        key = f"n_components_{int(threshold * 100)}"
         n_components_for_threshold[key] = n_comp
 
     return {
-        'explained_variance': explained_var,
-        'explained_variance_ratio': explained_var_ratio,
-        'cumulative_variance': cumsum_var,
+        "explained_variance": explained_var,
+        "explained_variance_ratio": explained_var_ratio,
+        "cumulative_variance": cumsum_var,
         **n_components_for_threshold,
     }
