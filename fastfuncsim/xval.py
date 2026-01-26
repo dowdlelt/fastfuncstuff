@@ -12,6 +12,106 @@ import torch
 from itertools import combinations
 
 
+def project_out_nuisance_per_run(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    nuisance_per_run: List[torch.Tensor],
+    run_starts: List[int],
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Project out nuisance regressors from data and design matrix, per run.
+
+    This is the GLMdenoise/GLMsingle approach:
+    1. For each run, compute projection matrix from that run's nuisance
+    2. Apply projection to both data and design
+    3. Concatenate projected runs
+
+    This avoids numerical issues with block-diagonal nuisance matrices
+    during cross-validation (zero-padded columns cause singular matrices).
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        (n_voxels, n_timepoints) fMRI data
+    design : torch.Tensor
+        (n_timepoints, n_task_cols) Task design matrix (NO nuisance columns)
+    nuisance_per_run : List[torch.Tensor]
+        List of (run_length, n_nuisance_cols) nuisance matrices per run
+    run_starts : List[int]
+        Starting timepoint for each run
+    device : torch.device, optional
+        Compute device
+
+    Returns
+    -------
+    projected_data : torch.Tensor
+        (n_voxels, n_timepoints) Data with nuisance projected out per run
+    projected_design : torch.Tensor
+        (n_timepoints, n_task_cols) Design with nuisance projected out per run
+    """
+    if device is None or device != data.device:
+        device = data.device
+
+    n_runs = len(run_starts)
+    n_timepoints = data.shape[1]
+
+    # CRITICAL: Keep data on its original device (may be CPU for memory efficiency)
+    # Only the projection computation happens on the compute device
+    data_device = data.device
+
+    projected_data_runs = []
+    projected_design_runs = []
+
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+
+        # Get this run's data and design (keep on original device)
+        run_data = data[:, start_tp:end_tp]  # (n_voxels, run_length)
+        run_design = design[start_tp:end_tp, :]  # (run_length, n_task)
+        run_length = end_tp - start_tp
+
+        # Get this run's nuisance (on original device)
+        run_nuisance = nuisance_per_run[run_idx].to(data_device)  # (run_length, n_nuisance)
+
+        # CRITICAL: Remove zero columns from nuisance before projection
+        # Zero columns (from padding) can cause numerical issues with ridge regularization
+        col_norms = run_nuisance.abs().sum(dim=0)
+        nonzero_mask = col_norms > 1e-10
+        run_nuisance_clean = run_nuisance[:, nonzero_mask]
+
+        if run_nuisance_clean.shape[1] > 0:
+            # Compute projection matrix: P_perp = I - X(X'X)^-1 X'
+            XtX = run_nuisance_clean.T @ run_nuisance_clean
+            XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=data_device))
+            P_nuisance = (
+                run_nuisance_clean @ XtX_inv @ run_nuisance_clean.T
+            )  # Projects ONTO nuisance
+            projection = (
+                torch.eye(run_length, device=data_device) - P_nuisance
+            )  # Projects OUT nuisance
+
+            # Project data: (n_voxels, run_length)
+            run_data_proj = (projection @ run_data.T).T
+
+            # Project design: (run_length, n_task)
+            run_design_proj = projection @ run_design
+        else:
+            # No nuisance to project
+            run_data_proj = run_data
+            run_design_proj = run_design
+
+        projected_data_runs.append(run_data_proj)
+        projected_design_runs.append(run_design_proj)
+
+    # Concatenate back
+    projected_data = torch.cat(projected_data_runs, dim=1)  # (n_voxels, n_timepoints)
+    projected_design = torch.cat(projected_design_runs, dim=0)  # (n_timepoints, n_task)
+
+    return projected_data, projected_design
+
+
 def generate_cv_splits(
     n_runs: int,
     strategy: Union[float, int],
@@ -296,9 +396,7 @@ def compute_r2_metric(
     >>> # Both should be high (~0.99) and similar
     """
     if y_true.shape != y_pred.shape:
-        raise ValueError(
-            f"Shape mismatch: y_true {y_true.shape} vs y_pred {y_pred.shape}"
-        )
+        raise ValueError(f"Shape mismatch: y_true {y_true.shape} vs y_pred {y_pred.shape}")
 
     if metric == "cod":
         # Coefficient of determination: R² = 1 - SS_res/SS_tot
@@ -328,9 +426,7 @@ def compute_r2_metric(
         r2 = r**2
 
     else:
-        raise ValueError(
-            f"Unknown metric '{metric}'. Choose from: 'cod', 'corr', 'corr2'"
-        )
+        raise ValueError(f"Unknown metric '{metric}'. Choose from: 'cod', 'corr', 'corr2'")
 
     return r2.float()  # Cast to float32 to save space
 
@@ -387,10 +483,20 @@ def compute_xval_r2(
     verbose: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
-    Compute cross-validated R² using run-based train/test splits.
+    Compute cross-validated R² using run-based train/test splits (GLMdenoise-style).
 
-    Strategy:
-    ---------
+    Strategy (GLMdenoise/GLMsingle approach):
+    -----------------------------------------
+    Instead of computing R² per fold and averaging, we:
+    1. For each CV split, predict the held-out test data
+    2. Concatenate ALL predictions across all folds (rebuilding full timeseries)
+    3. Concatenate ALL actual data across all folds
+    4. Compute ONE R² from the concatenated prediction vs actual
+
+    This gives a single R² per voxel (not one per fold that gets aggregated).
+    The concatenated prediction covers the entire timeseries exactly once
+    (each timepoint appears in exactly one test fold).
+
     For each CV split (train_runs, test_runs):
         1. Slice data and design by runs
         2. Project out nuisance from train data & design
@@ -398,9 +504,11 @@ def compute_xval_r2(
         4. Extract stimulus design (after projection)
         5. Fit OLS on cleaned train data with cleaned train stim design
         6. Predict cleaned test data using train betas and cleaned test stim design
-        7. Compute R² between cleaned test data and predictions
+        7. Store predictions (don't compute R² yet)
 
-    Then aggregate across splits: median, std, min, max
+    After all splits:
+        - Concatenate predictions in original timepoint order
+        - Compute single R² between full concatenated prediction and actual
 
     Parameters
     ----------
@@ -440,11 +548,7 @@ def compute_xval_r2(
     Returns
     -------
     results : dict
-        'r2_median': (n_voxels,) median R² across splits
-        'r2_std': (n_voxels,) standard deviation across splits
-        'r2_min': (n_voxels,) minimum R² across splits
-        'r2_max': (n_voxels,) maximum R² across splits
-        'r2_splits': (n_splits, n_voxels) R² for each split
+        'r2': (n_voxels,) single R² computed from concatenated predictions
         'n_splits': int, number of CV splits performed
 
     Examples
@@ -463,7 +567,7 @@ def compute_xval_r2(
     >>> results = compute_xval_r2(
     ...     data, design, run_starts, stim_indices, nuisance_indices, cv_splits
     ... )
-    >>> print(f"Median xval R²: {results['r2_median'].mean():.3f}")
+    >>> print(f"Xval R²: {results['r2'].mean():.3f}")
     """
     from .utils import get_device, to_tensor
 
@@ -474,7 +578,9 @@ def compute_xval_r2(
     design_matrix = to_tensor(design_matrix, device=device, dtype=torch.float32)
 
     n_voxels = data.shape[0]
+    n_timepoints = data.shape[1]
     n_splits = len(cv_splits)
+    n_runs = len(run_starts)
 
     # Auto-detect batch size if not provided
     if batch_size is None:
@@ -489,286 +595,249 @@ def compute_xval_r2(
         # Be conservative: 100k voxels
         data_chunk_size = min(100_000, n_voxels)
 
-    # Storage for R² across splits (float32 to save memory)
-    r2_all_splits = torch.zeros(n_splits, n_voxels, dtype=torch.float32, device="cpu")
+    # GLMdenoise-style: We accumulate predictions for each run
+    # Each run's test data is predicted exactly once across all CV folds
+    # We need to track which runs have been predicted
+    # For LORO (leave-one-run-out), each run is test exactly once
+    # For other strategies, we need to handle overlapping test sets
 
     if verbose:
-        print("Cross-validation R² computation")
+        print("Cross-validation R² computation (GLMdenoise-style concatenation)")
         print(f"  Voxels: {n_voxels:,}")
+        print(f"  Timepoints: {n_timepoints}")
+        print(f"  Runs: {n_runs}")
         print(f"  Splits: {n_splits}")
         print(f"  Metric: {metric}")
         print(f"  Data chunk size: {data_chunk_size:,}")
         print(f"  Batch size: {batch_size:,}")
         print()
 
-    # Process data in chunks (for very large datasets that don't fit on GPU)
-    n_chunks = (n_voxels + data_chunk_size - 1) // data_chunk_size
+    # =========================================================================
+    # GLMdenoise-style accumulation: Store predictions/actuals per run
+    # =========================================================================
+    # MEMORY STRATEGY:
+    # - Keep data on CPU, stream voxel batches to GPU
+    # - Accumulate predictions/actuals on CPU
+    # - Design matrices are small - keep on GPU
+    # - Only small batch of voxels on GPU at any time
 
-    for chunk_idx in range(n_chunks):
-        chunk_start = chunk_idx * data_chunk_size
-        chunk_end = min(chunk_start + data_chunk_size, n_voxels)
-        chunk_slice = slice(chunk_start, chunk_end)
-        n_voxels_chunk = chunk_end - chunk_start
+    # Initialize storage on CPU
+    pred_accumulator = torch.zeros(n_voxels, n_timepoints, dtype=torch.float32, device="cpu")
+    actual_accumulator = torch.zeros(n_voxels, n_timepoints, dtype=torch.float32, device="cpu")
+    count_per_timepoint = torch.zeros(n_timepoints, dtype=torch.float32, device="cpu")
 
-        if verbose and n_chunks > 1:
-            print(
-                f"\n📦 Data chunk {chunk_idx + 1}/{n_chunks}: voxels {chunk_start:,}-{chunk_end:,}"
-            )
+    # Ensure data is on CPU for streaming
+    if data.device.type != "cpu":
+        if verbose:
+            print("  Moving data to CPU for memory-efficient streaming...")
+        data = data.cpu()
 
-        # Load this chunk to GPU
-        data_chunk = data[chunk_slice]
-        if data_chunk.device != device:
-            data_chunk = data_chunk.to(device)
+    # Pre-compute timepoint indices for each split (cheap, do once)
+    split_info = []
+    for train_runs, test_runs in cv_splits:
+        # Train timepoints
+        train_tps = []
+        for run_idx in train_runs:
+            start = run_starts[run_idx]
+            end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            train_tps.extend(range(start, end))
 
-        # Run all CV splits on this chunk
-        for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
-            if verbose:
-                prefix = "  " if n_chunks > 1 else ""
-                print(
-                    f"{prefix}Split {split_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}"
+        # Test timepoints
+        test_tps = []
+        for run_idx in test_runs:
+            start = run_starts[run_idx]
+            end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            test_tps.extend(range(start, end))
+
+        split_info.append((train_tps, test_tps))
+
+    # Process CV splits
+    for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
+        if verbose:
+            print(f"  Split {split_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}")
+
+        train_tps, test_tps = split_info[split_idx]
+
+        # Slice DESIGN only (small - fits on GPU)
+        train_design = design_matrix[train_tps, :]
+        test_design = design_matrix[test_tps, :]
+
+        # 2. Precompute projection matrix P (tiny - stays on GPU)
+        train_P = _compute_projection_matrix(train_design, nuisance_indices)
+        test_P = _compute_projection_matrix(test_design, nuisance_indices)
+
+        # 3. Project design matrices (small - do once per split)
+        if train_P is not None:
+            train_design_clean = train_design - train_P @ train_design
+        else:
+            train_design_clean = train_design
+
+        if test_P is not None:
+            test_design_clean = test_design - test_P @ test_design
+        else:
+            test_design_clean = test_design
+
+        # 4. Extract stimulus design (already on device!)
+        train_stim_design = train_design_clean[:, stim_indices]
+        test_stim_design = test_design_clean[:, stim_indices]
+
+        # 4b. Detect zero columns in stimulus indices (missing events across runs)
+        train_stim_norms = train_stim_design.abs().sum(dim=0)
+        test_stim_norms = test_stim_design.abs().sum(dim=0)
+
+        train_zero_mask = train_stim_norms < 1e-10
+        test_zero_mask = test_stim_norms < 1e-10
+
+        train_present_mask = ~train_zero_mask
+        test_present_mask = ~test_zero_mask
+        unpredictable_mask = train_present_mask & test_zero_mask
+        test_only_mask = train_zero_mask & test_present_mask
+        predictable_mask = train_present_mask & test_present_mask
+
+        # Handle missing events
+        if train_zero_mask.any() or test_zero_mask.any():
+            unpredictable_cols = [i for i, unpred in enumerate(unpredictable_mask) if unpred]
+            test_only_cols = [i for i, test_only in enumerate(test_only_mask) if test_only]
+
+            if split_idx == 0 and verbose:
+                print(f"\n{'=' * 80}")
+                print("INFO: Handling missing events across train/test splits")
+                print(f"{'=' * 80}")
+                print(f"Train-only events: {len(unpredictable_cols)} - {unpredictable_cols}")
+                print(f"Test-only events: {len(test_only_cols)} - {test_only_cols}")
+                print(f"Predictable events: {predictable_mask.sum().item()}")
+                print(f"Strategy: '{zero_event_strategy}'")
+                print(f"{'=' * 80}\n")
+
+            if not predictable_mask.any():
+                raise ValueError(
+                    f"No overlapping events between train {train_runs} and test {test_runs}!"
                 )
 
-            # 1. Slice data and design by runs (on GPU - free indexing!)
-            train_data, train_design, _ = slice_by_runs(
-                data_chunk, design_matrix, run_starts, train_runs
+            if zero_event_strategy == "zero":
+                train_stim_design_fit = train_stim_design[:, train_present_mask]
+            elif zero_event_strategy == "nuisance":
+                train_stim_design_fit = train_stim_design[:, predictable_mask]
+            else:
+                raise ValueError(f"Unknown zero_event_strategy: '{zero_event_strategy}'")
+        else:
+            train_stim_design_fit = train_stim_design
+            train_present_mask = torch.ones(
+                train_stim_design.shape[1], dtype=torch.bool, device=device
             )
-            test_data, test_design, _ = slice_by_runs(
-                data_chunk, design_matrix, run_starts, test_runs
+            test_present_mask = torch.ones(
+                test_stim_design.shape[1], dtype=torch.bool, device=device
+            )
+            predictable_mask = train_present_mask
+            unpredictable_mask = torch.zeros(
+                train_stim_design.shape[1], dtype=torch.bool, device=device
+            )
+            test_only_mask = torch.zeros(
+                train_stim_design.shape[1], dtype=torch.bool, device=device
             )
 
-            # 2. Precompute projection matrix P (tiny - stays on GPU)
-            train_P = _compute_projection_matrix(train_design, nuisance_indices)
-            test_P = _compute_projection_matrix(test_design, nuisance_indices)
+        # 5. Fit OLS and predict in VOXEL BATCHES (stream from CPU)
+        for batch_start in range(0, n_voxels, batch_size):
+            batch_end = min(batch_start + batch_size, n_voxels)
+            batch_slice = slice(batch_start, batch_end)
 
-            # 3. Project design matrices (small - do once per split)
+            # Stream this batch's data to GPU (only train and test timepoints!)
+            train_data_batch = data[batch_slice][:, train_tps].to(device)
+            test_data_batch = data[batch_slice][:, test_tps].to(device)
+
+            # Project out nuisance from data
             if train_P is not None:
-                train_design_clean = train_design - train_P @ train_design
-            else:
-                train_design_clean = train_design
-
+                train_data_batch = train_data_batch - (train_P @ train_data_batch.T).T
             if test_P is not None:
-                test_design_clean = test_design - test_P @ test_design
+                test_data_batch = test_data_batch - (test_P @ test_data_batch.T).T
+
+            # Additional projection for 'nuisance' strategy
+            if zero_event_strategy == "nuisance":
+                events_to_project = unpredictable_mask | test_only_mask
+                if events_to_project.any():
+                    test_to_project = test_stim_design[:, events_to_project]
+                    XuXu = test_to_project.T @ test_to_project
+                    XuXu_inv = torch.linalg.inv(
+                        XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device)
+                    )
+                    P_unpred = test_to_project @ XuXu_inv @ test_to_project.T
+                    test_data_batch = test_data_batch - (P_unpred @ test_data_batch.T).T
+
+            # OLS fit
+            XtX = train_stim_design_fit.T @ train_stim_design_fit
+            XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
+            betas_fit = XtX_inv @ train_stim_design_fit.T @ train_data_batch.T
+
+            # Predict test data
+            if zero_event_strategy == "zero":
+                n_stim = len(stim_indices)
+                betas_full = torch.zeros(n_stim, betas_fit.shape[1], device=device)
+                betas_full[train_present_mask, :] = betas_fit
+                test_stim_present = test_stim_design[:, test_present_mask]
+                betas_test_present = betas_full[test_present_mask, :]
+                predictions_batch = (test_stim_present @ betas_test_present).T
+            elif zero_event_strategy == "nuisance":
+                test_stim_predictable = test_stim_design[:, predictable_mask]
+                predictions_batch = (test_stim_predictable @ betas_fit).T
             else:
-                test_design_clean = test_design
+                raise ValueError(f"Invalid strategy: {zero_event_strategy}")
 
-            # 4. Extract stimulus design (already on device!)
-            train_stim_design = train_design_clean[:, stim_indices]
-            test_stim_design = test_design_clean[:, stim_indices]
+            # ============================================================
+            # ACCUMULATE predictions and actuals for test timepoints (on CPU)
+            # ============================================================
+            pred_accumulator[batch_slice, test_tps] += predictions_batch.cpu()
+            actual_accumulator[batch_slice, test_tps] += test_data_batch.cpu()
 
-            # 4b. Detect zero columns in stimulus indices (missing events across runs)
-            # These are stimulus columns that are zero in this particular split
-            train_stim_norms = train_stim_design.abs().sum(dim=0)
-            test_stim_norms = test_stim_design.abs().sum(dim=0)
+            # Free GPU memory for this batch
+            del train_data_batch, test_data_batch, predictions_batch, betas_fit
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-            train_zero_mask = train_stim_norms < 1e-10
-            test_zero_mask = test_stim_norms < 1e-10
+        # Update count for these test timepoints (once per split)
+        count_per_timepoint[test_tps] += 1.0
 
-            # Track which events are present in each set
-            train_present_mask = ~train_zero_mask  # Events in train
-            test_present_mask = ~test_zero_mask  # Events in test
+    # =========================================================================
+    # Average accumulated predictions where timepoints appeared in multiple folds
+    # =========================================================================
+    # For LORO, each timepoint appears exactly once (count=1)
+    # For split-halves with permutations, timepoints may appear multiple times
+    count_per_timepoint = count_per_timepoint.clamp(min=1)  # Avoid division by zero
+    pred_accumulator = pred_accumulator / count_per_timepoint.unsqueeze(0)
+    actual_accumulator = actual_accumulator / count_per_timepoint.unsqueeze(0)
 
-            # Events that are ONLY in train (not in test) - we CAN'T predict them
-            unpredictable_mask = train_present_mask & test_zero_mask
-
-            # Events that are ONLY in test (not in train) - we DIDN'T learn them
-            test_only_mask = train_zero_mask & test_present_mask
-
-            # Events that are in BOTH train and test - we CAN predict them
-            predictable_mask = train_present_mask & test_present_mask
-
-            # Handle missing events based on strategy
-            if train_zero_mask.any() or test_zero_mask.any():
-                zero_cols_train = [
-                    i for i, is_zero in enumerate(train_zero_mask) if is_zero
-                ]
-                zero_cols_test = [
-                    i for i, is_zero in enumerate(test_zero_mask) if is_zero
-                ]
-                unpredictable_cols = [
-                    i for i, unpred in enumerate(unpredictable_mask) if unpred
-                ]
-                test_only_cols = [
-                    i for i, test_only in enumerate(test_only_mask) if test_only
-                ]
-
-                # Only warn/report once (on first split, first chunk)
-                if split_idx == 0 and chunk_idx == 0 and verbose:
-                    print(f"\n{'=' * 80}")
-                    print("INFO: Handling missing events across train/test splits")
-                    print(f"{'=' * 80}")
-                    print(
-                        f"Train-only events (in train, zero in test): {len(unpredictable_cols)} - {unpredictable_cols}"
-                    )
-                    print(
-                        f"Test-only events (zero in train, in test): {len(test_only_cols)} - {test_only_cols}"
-                    )
-                    print(
-                        f"Predictable events (in both): {predictable_mask.sum().item()}"
-                    )
-                    print(f"Strategy: '{zero_event_strategy}'")
-                    if zero_event_strategy == "nuisance":
-                        events_to_proj = unpredictable_cols + test_only_cols
-                        print(
-                            f"  → Will project out {len(events_to_proj)} events from test: {events_to_proj}"
-                        )
-                    print(f"{'=' * 80}\n")
-
-                # Check we have at least some predictable events
-                if not predictable_mask.any():
-                    raise ValueError(
-                        f"No overlapping events between train {train_runs} and test {test_runs}! "
-                        f"Cannot perform cross-validation."
-                    )
-
-                # Apply strategy
-                if zero_event_strategy == "zero":
-                    # Strategy 1: Remove unpredictable events, use zero betas for train-missing events
-                    # Only fit on events present in train (regardless of test)
-                    train_stim_design_fit = train_stim_design[:, train_present_mask]
-
-                    # For test predictions, we'll reconstruct full design later with zeros
-
-                elif zero_event_strategy == "nuisance":
-                    # Strategy 2: Move unpredictable events to test nuisance
-                    # Only fit on predictable events (present in both)
-                    train_stim_design_fit = train_stim_design[:, predictable_mask]
-
-                    # Move unpredictable events to test nuisance (project them out)
-                    if unpredictable_mask.any():
-                        # Extract unpredictable columns from test
-                        test_unpredictable = test_stim_design[:, unpredictable_mask]
-
-                        # Project out unpredictable variance from test data
-                        # This will happen in the batch loop
-
-                else:
-                    raise ValueError(
-                        f"Unknown zero_event_strategy: '{zero_event_strategy}'. "
-                        f"Must be 'zero' or 'nuisance'."
-                    )
-            else:
-                # No missing events - simple case
-                train_stim_design_fit = train_stim_design
-                train_present_mask = torch.ones(
-                    train_stim_design.shape[1], dtype=torch.bool, device=device
-                )
-                test_present_mask = torch.ones(
-                    test_stim_design.shape[1], dtype=torch.bool, device=device
-                )
-                predictable_mask = train_present_mask
-                unpredictable_mask = torch.zeros(
-                    train_stim_design.shape[1], dtype=torch.bool, device=device
-                )
-
-            # 5. Fit OLS in batches (to avoid OOM when projecting ALL voxels at once)
-            r2_split_chunk = torch.zeros(
-                n_voxels_chunk, dtype=torch.float32, device="cpu"
-            )
-
-            for batch_start in range(0, n_voxels_chunk, batch_size):
-                batch_end = min(batch_start + batch_size, n_voxels_chunk)
-                batch_slice = slice(batch_start, batch_end)
-
-                # Slice batches (free on GPU - just indexing!)
-                train_data_batch = train_data[
-                    batch_slice
-                ]  # (batch_size, n_train_timepoints)
-                test_data_batch = test_data[
-                    batch_slice
-                ]  # (batch_size, n_test_timepoints)
-
-                # Project out nuisance from data batches (fast on GPU!)
-                if train_P is not None:
-                    train_data_batch = (
-                        train_data_batch - (train_P @ train_data_batch.T).T
-                    )
-
-                if test_P is not None:
-                    test_data_batch = test_data_batch - (test_P @ test_data_batch.T).T
-
-                # Additional projection for 'nuisance' strategy: project out unpredictable events
-                if zero_event_strategy == "nuisance":
-                    # Project out events we learned but that aren't in test (unpredictable_mask)
-                    # AND events in test that we didn't learn (test_only_mask)
-                    events_to_project = unpredictable_mask | test_only_mask
-
-                    if events_to_project.any():
-                        test_to_project = test_stim_design[:, events_to_project]
-                        # Compute projection matrix
-                        XuXu = test_to_project.T @ test_to_project
-                        XuXu_inv = torch.linalg.inv(
-                            XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device)
-                        )
-                        P_unpred = test_to_project @ XuXu_inv @ test_to_project.T
-                        # Project out
-                        test_data_batch = (
-                            test_data_batch - (P_unpred @ test_data_batch.T).T
-                        )
-
-                # OLS: beta = (X.T @ X)^-1 @ X.T @ Y (fast on GPU!)
-                # Fit only on present events (train_stim_design_fit)
-                XtX = train_stim_design_fit.T @ train_stim_design_fit
-                XtX_inv = torch.linalg.inv(
-                    XtX + 1e-6 * torch.eye(XtX.shape[0], device=device)
-                )
-                betas_fit = (
-                    XtX_inv @ train_stim_design_fit.T @ train_data_batch.T
-                )  # (n_fit_events, batch_size)
-
-                # 6. Predict test data (strategy-dependent!)
-                if zero_event_strategy == "zero":
-                    # Reconstruct full beta vector with zeros for missing events
-                    # betas_fit corresponds to train_present_mask events
-                    n_stim = len(stim_indices)
-                    betas_full = torch.zeros(n_stim, betas_fit.shape[1], device=device)
-                    betas_full[train_present_mask, :] = betas_fit
-
-                    # Predict using only test-present events (others contribute zero anyway)
-                    test_stim_present = test_stim_design[:, test_present_mask]
-                    betas_test_present = betas_full[test_present_mask, :]
-                    predictions_batch = test_stim_present @ betas_test_present
-
-                elif zero_event_strategy == "nuisance":
-                    # betas_fit corresponds to predictable_mask events
-                    # Use only predictable columns for prediction
-                    test_stim_predictable = test_stim_design[:, predictable_mask]
-                    predictions_batch = test_stim_predictable @ betas_fit
-
-                else:
-                    # Shouldn't reach here (validated above)
-                    raise ValueError(f"Invalid strategy: {zero_event_strategy}")
-
-                predictions_batch = (
-                    predictions_batch.T
-                )  # (batch_size, n_test_timepoints)
-
-                # 7. Compute R² (fast on GPU!)
-                r2_batch = compute_r2_metric(
-                    test_data_batch, predictions_batch, metric=metric
-                )
-                r2_split_chunk[batch_slice] = r2_batch.cpu()
-
-            # Store results for this chunk
-            r2_all_splits[split_idx, chunk_slice] = r2_split_chunk
-
-            if verbose:
-                prefix = "    " if n_chunks > 1 else "  "
-                print(
-                    f"{prefix}Mean R²: {r2_split_chunk.mean():.4f}, Std: {r2_split_chunk.std():.4f}"
-                )
-
+    # =========================================================================
+    # Compute single R² from concatenated predictions vs actuals
+    # =========================================================================
     if verbose:
         print()
-        print("✓ Cross-validation complete")
+        print("Computing R² from concatenated predictions...")
+
+    # Compute R² in voxel batches (stream to GPU)
+    r2_final = torch.zeros(n_voxels, dtype=torch.float32, device="cpu")
+
+    for r2_batch_start in range(0, n_voxels, batch_size):
+        r2_batch_end = min(r2_batch_start + batch_size, n_voxels)
+        r2_batch_slice = slice(r2_batch_start, r2_batch_end)
+
+        pred_batch = pred_accumulator[r2_batch_slice].to(device)
+        actual_batch = actual_accumulator[r2_batch_slice].to(device)
+
+        r2_batch = compute_r2_metric(actual_batch, pred_batch, metric=metric)
+        r2_final[r2_batch_slice] = r2_batch.cpu()
+
+        del pred_batch, actual_batch
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if verbose:
+        print(f"  Mean R²: {r2_final.mean():.4f}, Std: {r2_final.std():.4f}")
+        print()
+        print("✓ Cross-validation complete (GLMdenoise-style)")
         print()
 
-    # 8. Aggregate across splits
+    # Return single R² (not per-fold statistics)
     results = {
-        "r2_median": torch.median(r2_all_splits, dim=0).values,
-        "r2_std": torch.std(r2_all_splits, dim=0),
-        "r2_min": torch.min(r2_all_splits, dim=0).values,
-        "r2_max": torch.max(r2_all_splits, dim=0).values,
-        "r2_splits": r2_all_splits,
+        "r2": r2_final,
         "n_splits": n_splits,
     }
 
