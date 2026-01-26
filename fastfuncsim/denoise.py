@@ -616,12 +616,13 @@ def cross_validate_noise_pcs(
         voxel_chunk_size = chunk_size
     elif is_loro:
         # Streaming stats: smaller accumulators + GPU projections = can use larger chunks
-        # Memory: chunk_data (voxels × timepoints × 4 bytes) + streaming stats (voxels × 3 × 8 bytes × n_PCs)
-        # Target: ~1GB per chunk for chunk_data
-        target_chunk_memory_gb = 1.0
+        # Memory: chunk_data + projected train/test data (held during projection before concat)
+        # During projection we hold multiple copies, so be conservative
+        # Target: 0.6GB for chunk_data to leave ~1-2GB headroom for projection operations
+        target_chunk_memory_gb = 0.6
         bytes_per_voxel = n_timepoints * 4  # float32
         max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
-        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 100000)
+        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 50000)
     else:
         # Full accumulator: much more memory for storing full predictions per PC
         # Memory: chunk_data + (voxels × timepoints × 4 bytes × n_PCs)
@@ -770,6 +771,11 @@ def cross_validate_noise_pcs(
                 data_train_projected = torch.cat(train_data_projected_runs, dim=1)
                 design_train_projected = torch.cat(train_design_projected_runs, dim=0)
 
+                # Free intermediate projection results to reduce fragmentation
+                del train_data_projected_runs, train_design_projected_runs
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
                 # Project out nuisance from TEST data and design
                 test_data_projected_runs = []
                 test_design_projected_runs = []
@@ -819,6 +825,11 @@ def cross_validate_noise_pcs(
                 # Concatenate projected test data/design
                 data_test_projected = torch.cat(test_data_projected_runs, dim=1)
                 design_test_projected = torch.cat(test_design_projected_runs, dim=0)
+
+                # Free intermediate projection results
+                del test_data_projected_runs, test_design_projected_runs
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             else:
                 # No nuisance - no projection needed
                 data_train_projected = chunk_data_train
