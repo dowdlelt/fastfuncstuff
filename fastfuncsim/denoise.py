@@ -549,7 +549,18 @@ def cross_validate_noise_pcs(
     if isinstance(device, str):
         device = torch.device(device)
     device = device or get_device()
-    proj_device = torch.device("cpu")  # Use CPU for large arrays to avoid OOM
+
+    # Detect if we can use streaming stats (LORO CV)
+    # Need to check this early to determine projection device
+    cv_splits_temp = generate_cv_splits(n_runs=len(run_starts), strategy=cv_strategy, n_perms=n_perms)
+    is_loro_temp = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits_temp)
+
+    # Projection device: use GPU for LORO (streaming stats save memory), CPU otherwise
+    if is_loro_temp:
+        proj_device = device  # GPU - we have memory for projections with streaming stats
+    else:
+        proj_device = torch.device("cpu")  # CPU - full accumulators use more memory
+
     n_runs = len(run_starts)
     n_voxels = data.shape[0]
     n_timepoints = data.shape[1]
@@ -599,19 +610,25 @@ def cross_validate_noise_pcs(
     is_loro = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits)
 
     # Determine chunk size for voxel processing
-    # Streaming stats use ~30x less memory for accumulators, but we still need
-    # memory for chunk_data, projections, and GPU operations
+    # Account for both n_voxels AND n_timepoints to avoid OOM
+    # Main memory consumers: chunk_data (voxels × timepoints), projections, accumulators
     if chunk_size is not None:
         voxel_chunk_size = chunk_size
     elif is_loro:
-        # Streaming stats: smaller accumulators mean we can use larger chunks
-        # Still need memory for: chunk_data (voxels × timepoints),
-        # projected data, design matrices, and GPU operations
-        voxel_chunk_size = min(n_voxels, 30000)  # 3x larger than full accumulator
+        # Streaming stats: smaller accumulators + GPU projections = can use larger chunks
+        # Memory: chunk_data (voxels × timepoints × 4 bytes) + streaming stats (voxels × 3 × 8 bytes × n_PCs)
+        # Target: ~1GB per chunk for chunk_data
+        target_chunk_memory_gb = 1.0
+        bytes_per_voxel = n_timepoints * 4  # float32
+        max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
+        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 100000)
     else:
-        # Full accumulator: n_timepoints float32 per voxel per PC (~14KB/voxel/PC for 3600 TPs)
-        # Need to store full prediction timeseries for all PC counts
-        voxel_chunk_size = 10000  # Conservative for full timeseries
+        # Full accumulator: much more memory for storing full predictions per PC
+        # Memory: chunk_data + (voxels × timepoints × 4 bytes × n_PCs)
+        target_chunk_memory_gb = 0.5
+        bytes_per_voxel = n_timepoints * 4
+        max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
+        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 5000), 20000)
 
     # Move data to CPU for memory efficiency
     data_cpu = data.to(proj_device)
@@ -623,9 +640,11 @@ def cross_validate_noise_pcs(
     if is_loro:
         print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
         print(f"Memory strategy: LORO streaming stats (minimal memory)")
+        print(f"Projection device: {proj_device} (GPU acceleration enabled)")
     else:
         print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
         print(f"Memory strategy: accumulate predictions per chunk, compute R², discard")
+        print(f"Projection device: {proj_device} (CPU to save GPU memory)")
 
     n_chunks = (n_voxels + voxel_chunk_size - 1) // voxel_chunk_size
 
