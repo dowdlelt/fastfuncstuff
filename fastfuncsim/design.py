@@ -5,6 +5,7 @@ Handles FIR, assumed HRF, and convolution operations
 
 from typing import Optional, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -289,6 +290,265 @@ def make_fir_design(
     return design
 
 
+def basis_tent(x: torch.Tensor, bot: float, mid: float, top: float) -> torch.Tensor:
+    """
+    Tent basis function: piecewise linear interpolation
+
+    Returns a tent function that:
+    - equals 0 for x outside [bot, top]
+    - equals 1 at x = mid
+    - linear interpolation between bot-mid and mid-top
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Time points to evaluate (in seconds or TRs)
+    bot : float
+        Bottom/start of tent (left edge)
+    mid : float
+        Peak of tent (value = 1.0)
+    top : float
+        Top/end of tent (right edge)
+
+    Returns
+    -------
+    values : torch.Tensor
+        Tent function values at each x
+
+    Notes
+    -----
+    This replicates AFNI's basis_tent function from 3dDeconvolve.c
+    """
+    val = torch.zeros_like(x)
+
+    # Left ramp: bot to mid
+    left_mask = (x > bot) & (x <= mid)
+    val[left_mask] = (x[left_mask] - bot) / (mid - bot)
+
+    # Right ramp: mid to top
+    right_mask = (x > mid) & (x < top)
+    val[right_mask] = (top - x[right_mask]) / (top - mid)
+
+    return val
+
+
+def make_tent_design(
+    onsets: torch.Tensor,
+    bot: float,
+    top: float,
+    tr: float,
+    n_timepoints: int,
+    n_basis: Optional[int] = None,
+    zero_edges: bool = False,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Create TENT basis function design matrix for non-TR-locked onsets
+
+    TENT uses piecewise linear splines (tent functions) to model the HRF.
+    Unlike FIR which assumes TR-locked onsets, TENT can handle arbitrary
+    onset times by creating tent basis functions on a microtime grid.
+
+    Parameters
+    ----------
+    onsets : torch.Tensor
+        (n_timepoints, n_conditions) onset matrix (can be fractional for sub-TR onsets)
+        OR list of onset times in seconds for each condition
+    bot : float
+        Start time of HRF window (seconds after stimulus)
+    top : float
+        End time of HRF window (seconds after stimulus)
+    tr : float
+        Repetition time in seconds
+    n_timepoints : int
+        Total number of timepoints (TRs)
+    n_basis : int, optional
+        Number of tent basis functions (knots)
+        If None, automatically calculated to give one knot per TR:
+            n_basis = round((top - bot) / tr) + 1
+        For TENT: n_basis determines resolution
+        For TENTzero: actual basis functions = n_basis - 2
+    zero_edges : bool
+        If True, use TENTzero (force HRF to start and end at zero)
+        If False, use TENT (standard tent functions)
+    device : torch.device, optional
+        Device for computation
+
+    Returns
+    -------
+    design : torch.Tensor
+        (n_timepoints, n_conditions * n_actual_basis) TENT design matrix
+        where n_actual_basis = n_basis for TENT, n_basis-2 for TENTzero
+
+    Notes
+    -----
+    TENT basis functions are 'cardinal interpolation' functions - their
+    parameters are the HRF values at the knot points:
+        bot, bot+dt, bot+2*dt, ..., top
+    where dt = (top - bot) / (n_basis - 1)
+
+    TENTzero eliminates the first and last basis functions to force the
+    HRF to be zero at t=bot and t=top (continuous start/end at zero).
+
+    This replicates AFNI's TENT and TENTzero basis functions.
+
+    Examples
+    --------
+    Auto-calculate n_basis for TR spacing:
+    >>> design = make_tent_design(onsets, bot=0, top=20, tr=1.0, n_timepoints=300)
+    >>> # Creates 21 knots at 0, 1, 2, ..., 20 seconds
+
+    Explicit n_basis:
+    >>> design = make_tent_design(onsets, bot=0, top=15, tr=1.0, n_basis=6, n_timepoints=300)
+    >>> # Creates 6 knots with dt = 15/5 = 3 seconds spacing
+
+    References
+    ----------
+    AFNI 3dDeconvolve documentation
+    https://afni.nimh.nih.gov/pub/dist/doc/program_help/3dDeconvolve.html
+    """
+    if device is None:
+        device = get_device()
+
+    onsets = to_tensor(onsets, device=device)
+
+    if bot >= top:
+        raise ValueError(f"bot ({bot}) must be < top ({top})")
+
+    # Auto-calculate n_basis if not provided
+    if n_basis is None:
+        # Default: one knot per TR
+        n_basis = round((top - bot) / tr) + 1
+
+    if n_basis < 3 if zero_edges else n_basis < 2:
+        raise ValueError(f"n_basis must be >= {3 if zero_edges else 2}, got {n_basis}")
+
+    n_conditions = onsets.shape[1] if onsets.ndim > 1 else 1
+    if onsets.ndim == 1:
+        onsets = onsets.unsqueeze(1)
+
+    # Calculate knot spacing
+    dt = (top - bot) / (n_basis - 1)
+
+    # Determine actual number of basis functions
+    if zero_edges:
+        n_actual_basis = n_basis - 2
+        first_basis_idx = 1  # Skip first tent
+        last_basis_idx = n_basis - 1  # Skip last tent
+    else:
+        n_actual_basis = n_basis
+        first_basis_idx = 0
+        last_basis_idx = n_basis
+
+    # Pre-allocate design matrix
+    design = torch.zeros(
+        n_timepoints, n_conditions * n_actual_basis, device=device
+    )
+
+    # Create time vector for each TR (in seconds)
+    tr_times = torch.arange(n_timepoints, device=device) * tr
+
+    # For each condition
+    for cond_idx in range(n_conditions):
+        # Get onset times for this condition (non-zero entries)
+        onset_trs = torch.where(onsets[:, cond_idx] != 0)[0]
+
+        if len(onset_trs) == 0:
+            continue
+
+        # Convert onset TRs to onset times in seconds
+        onset_times = onset_trs.float() * tr
+
+        # For each basis function
+        basis_col_idx = 0
+        for basis_idx in range(first_basis_idx, last_basis_idx):
+            # Knot position
+            knot_time = bot + basis_idx * dt
+
+            # Tent edges
+            if basis_idx == 0:
+                # First tent: slightly before bot to bot+dt
+                tent_bot = bot - 0.00111 * dt
+                tent_mid = bot
+                tent_top = bot + dt
+            elif basis_idx == n_basis - 1:
+                # Last tent: (top-dt) to slightly after top
+                tent_bot = top - dt
+                tent_mid = top
+                tent_top = top + 0.00111 * dt
+            else:
+                # Middle tents: standard spacing
+                tent_bot = bot + (basis_idx - 1) * dt
+                tent_mid = bot + basis_idx * dt
+                tent_top = bot + (basis_idx + 1) * dt
+
+            # For each TR, sum contributions from all onsets
+            for onset_t in onset_times:
+                # Time relative to this onset
+                rel_times = tr_times - onset_t
+
+                # Evaluate tent basis at these relative times
+                tent_vals = basis_tent(rel_times, tent_bot, tent_mid, tent_top)
+
+                # Add to design matrix column
+                col_idx = cond_idx * n_actual_basis + basis_col_idx
+                design[:, col_idx] += tent_vals
+
+            basis_col_idx += 1
+
+    return design
+
+
+def is_tr_locked(
+    onset_times: Union[list, np.ndarray],
+    tr: float,
+    threshold: float = 0.1,
+) -> bool:
+    """
+    Check if onset times are approximately TR-locked
+
+    Determines if onsets align with TR boundaries within a tolerance.
+    If onsets are TR-locked, standard FIR can be used efficiently.
+    If not, TENT/TENTzero should be used for sub-TR accuracy.
+
+    Parameters
+    ----------
+    onset_times : list or array
+        Onset times in seconds
+    tr : float
+        Repetition time in seconds
+    threshold : float
+        Maximum remainder as fraction of TR (default: 0.1 = 10%)
+
+    Returns
+    -------
+    is_locked : bool
+        True if all onsets are within threshold of a TR boundary
+
+    Examples
+    --------
+    >>> is_tr_locked([0, 2.0, 4.0], tr=2.0)  # Perfect TR locking
+    True
+    >>> is_tr_locked([0, 2.1, 4.0], tr=2.0, threshold=0.1)  # Within 10%
+    True
+    >>> is_tr_locked([0.5, 2.5, 4.5], tr=2.0)  # 0.5s offset (25% of 2s TR)
+    False
+    """
+    if isinstance(onset_times, list):
+        onset_times = np.array(onset_times)
+
+    # Calculate remainder when dividing by TR
+    remainders = np.mod(onset_times, tr)
+
+    # Normalize remainders (could be close to 0 or close to TR)
+    normalized_remainders = np.minimum(remainders, tr - remainders)
+
+    # Check if all remainders are within threshold
+    max_remainder_fraction = np.max(normalized_remainders) / tr
+
+    return max_remainder_fraction < threshold
+
+
 def make_singletrialdesign(
     onsets: torch.Tensor, device: Optional[torch.device] = None
 ) -> torch.Tensor:
@@ -405,6 +665,10 @@ def build_glm_design(
     n_timepoints: Optional[Union[int, list[int]]] = None,
     mode: str = "assumed",
     n_fir_lags: int = 30,
+    tr: float = 1.0,
+    tent_bot: float = 0.0,
+    tent_top: float = 15.0,
+    tent_n_basis: Optional[int] = None,
     single_trial: bool = False,
     device: Optional[torch.device] = None,
 ) -> Union[torch.Tensor, list[torch.Tensor]]:
@@ -427,10 +691,20 @@ def build_glm_design(
     mode : str
         Design mode:
         - 'assumed': Convolve with assumed HRF
-        - 'fir': FIR design (no HRF assumption)
+        - 'fir': FIR design (no HRF assumption, TR-locked onsets)
+        - 'tent': TENT basis (piecewise linear, for non-TR-locked onsets)
+        - 'tentzero': TENTzero basis (forces HRF to start/end at zero)
         - 'onoff': Simple boxcar (summed onsets)
     n_fir_lags : int
         Number of lags for FIR design (default: 30)
+    tr : float
+        Repetition time in seconds (default: 1.0, required for tent/tentzero)
+    tent_bot : float
+        TENT start time in seconds after stimulus (default: 0.0)
+    tent_top : float
+        TENT end time in seconds after stimulus (default: 15.0)
+    tent_n_basis : int, optional
+        Number of TENT basis functions (default: None, auto-calculated for TR spacing)
     single_trial : bool
         If True, create single-trial design (one regressor per trial)
     device : torch.device, optional
@@ -482,8 +756,20 @@ def build_glm_design(
             elif mode == "fir":
                 design = make_fir_design(onset, n_fir_lags, n_tp, device=device)
 
+            elif mode == "tent":
+                design = make_tent_design(
+                    onset, tent_bot, tent_top, tr, n_tp,
+                    n_basis=tent_n_basis, zero_edges=False, device=device
+                )
+
+            elif mode == "tentzero":
+                design = make_tent_design(
+                    onset, tent_bot, tent_top, tr, n_tp,
+                    n_basis=tent_n_basis, zero_edges=True, device=device
+                )
+
             else:
-                raise ValueError(f"Unknown mode: {mode}")
+                raise ValueError(f"Unknown mode: {mode}. Valid modes: assumed, fir, tent, tentzero, onoff")
 
         designs.append(design)
 
@@ -583,3 +869,207 @@ def generate_random_onsets(
             onsets[onset_time, condition] = 1
 
     return onsets
+
+
+def extract_hrf_estimates(
+    betas: Union[torch.Tensor, np.ndarray],
+    n_conditions: int,
+    n_lags: int,
+    brain_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    output_shape: Optional[tuple] = None,
+) -> np.ndarray:
+    """
+    Extract HRF estimates from GLM betas for FIR/TENT models
+
+    Reshapes flat beta coefficients into condition-specific HRF estimates.
+    This creates the impulse response (iresp) volumes used in AFNI.
+
+    Parameters
+    ----------
+    betas : torch.Tensor or np.ndarray
+        Beta coefficients from GLM fit
+        Shape: (n_voxels, n_conditions * n_lags) or (nx, ny, nz, n_conditions * n_lags)
+    n_conditions : int
+        Number of conditions/regressors
+    n_lags : int
+        Number of time lags (FIR) or basis functions (TENT)
+    brain_mask : torch.Tensor or np.ndarray, optional
+        3D brain mask to reshape from 1D voxel array to 3D volume
+        Shape: (nx, ny, nz)
+    output_shape : tuple, optional
+        Alternative to brain_mask: explicit output shape (nx, ny, nz)
+        If both are None, assumes betas are already 4D
+
+    Returns
+    -------
+    iresp : np.ndarray
+        Impulse response estimates
+        Shape: (nx, ny, nz, n_conditions, n_lags)
+        - First 3 dims: brain space
+        - 4th dim: conditions
+        - 5th dim: time lags (HRF time course)
+
+    Examples
+    --------
+    >>> # After GLM fit with FIR design
+    >>> results = fit_glm(data, fir_design, tr=1.0)
+    >>> iresp = extract_hrf_estimates(results.betas, n_conditions=2, n_lags=30, brain_mask=mask)
+    >>> # iresp.shape = (64, 64, 30, 2, 30)  # spatial + conditions + time
+    """
+    # Convert to numpy if needed
+    if isinstance(betas, torch.Tensor):
+        betas = betas.cpu().numpy()
+
+    # Handle 1D voxel array vs 4D volume
+    if betas.ndim == 2:
+        # Shape: (n_voxels, n_conditions * n_lags)
+        n_voxels = betas.shape[0]
+
+        # Need mask or output_shape to reconstruct 3D
+        if brain_mask is not None:
+            if isinstance(brain_mask, torch.Tensor):
+                brain_mask = brain_mask.cpu().numpy()
+            output_shape = brain_mask.shape
+            mask_flat = brain_mask.ravel() > 0
+        elif output_shape is not None:
+            n_voxels_expected = np.prod(output_shape)
+            if n_voxels != n_voxels_expected:
+                raise ValueError(
+                    f"output_shape {output_shape} implies {n_voxels_expected} voxels, "
+                    f"but betas has {n_voxels} voxels"
+                )
+            mask_flat = None
+        else:
+            raise ValueError("Either brain_mask or output_shape must be provided for 2D betas")
+
+        # Reshape to (nx, ny, nz, n_conditions * n_lags)
+        betas_4d = np.zeros((*output_shape, n_conditions * n_lags))
+        if mask_flat is not None and brain_mask is not None:
+            betas_4d[brain_mask > 0, :] = betas
+        else:
+            betas_4d = betas.reshape(*output_shape, n_conditions * n_lags)
+
+    elif betas.ndim == 4:
+        # Already 4D: (nx, ny, nz, n_conditions * n_lags)
+        betas_4d = betas
+        output_shape = betas.shape[:3]
+    else:
+        raise ValueError(f"betas must be 2D or 4D, got shape {betas.shape}")
+
+    # Reshape to (nx, ny, nz, n_conditions, n_lags)
+    nx, ny, nz = output_shape
+    iresp = betas_4d.reshape(nx, ny, nz, n_conditions, n_lags)
+
+    return iresp
+
+
+def save_iresp(
+    iresp: np.ndarray,
+    output_prefix: str,
+    condition_labels: Optional[list[str]] = None,
+    tr: float = 1.0,
+    bot: float = 0.0,
+    top: Optional[float] = None,
+    affine: Optional[np.ndarray] = None,
+    reference_img: Optional[str] = None,
+):
+    """
+    Save HRF estimates as 4D NIfTI files (AFNI-style iresp)
+
+    Creates one 4D file per condition showing the estimated HRF time course.
+
+    Parameters
+    ----------
+    iresp : np.ndarray
+        Impulse response estimates from extract_hrf_estimates()
+        Shape: (nx, ny, nz, n_conditions, n_lags)
+    output_prefix : str
+        Output file prefix (e.g., 'output_dir/GLM')
+        Files will be named: {prefix}_iresp_{label}.nii.gz
+    condition_labels : list of str, optional
+        Labels for each condition (default: ['cond1', 'cond2', ...])
+    tr : float
+        Repetition time in seconds (for metadata)
+    bot : float
+        HRF window start time in seconds (for metadata)
+    top : float, optional
+        HRF window end time in seconds (for metadata)
+        If None, calculated from n_lags and tr
+    affine : np.ndarray, optional
+        4x4 affine transformation matrix
+        If None, uses identity (or from reference_img)
+    reference_img : str, optional
+        Path to reference NIfTI to copy affine/header from
+
+    Returns
+    -------
+    output_files : list of str
+        Paths to created NIfTI files
+
+    Examples
+    --------
+    >>> iresp = extract_hrf_estimates(betas, n_conditions=2, n_lags=20, brain_mask=mask)
+    >>> files = save_iresp(
+    ...     iresp,
+    ...     output_prefix='results/GLM',
+    ...     condition_labels=['faces', 'scenes'],
+    ...     tr=2.0,
+    ...     bot=0,
+    ...     top=30,
+    ...     reference_img='data/func.nii.gz'
+    ... )
+    >>> # Creates: results/GLM_iresp_faces.nii.gz, results/GLM_iresp_scenes.nii.gz
+    """
+    try:
+        import nibabel as nib
+    except ImportError:
+        raise ImportError("nibabel is required to save NIfTI files. Install with: pip install nibabel")
+
+    if iresp.ndim != 5:
+        raise ValueError(f"iresp must be 5D (nx, ny, nz, n_conditions, n_lags), got shape {iresp.shape}")
+
+    nx, ny, nz, n_conditions, n_lags = iresp.shape
+
+    # Get affine matrix
+    if reference_img is not None:
+        ref_img = nib.load(reference_img)
+        affine = ref_img.affine
+    elif affine is None:
+        # Default identity affine
+        affine = np.eye(4)
+
+    # Calculate top if not provided
+    if top is None:
+        top = bot + (n_lags - 1) * tr
+
+    # Default condition labels
+    if condition_labels is None:
+        condition_labels = [f"cond{i+1}" for i in range(n_conditions)]
+
+    if len(condition_labels) != n_conditions:
+        raise ValueError(
+            f"Number of condition_labels ({len(condition_labels)}) must match "
+            f"n_conditions ({n_conditions})"
+        )
+
+    # Save one file per condition
+    output_files = []
+    for cond_idx, label in enumerate(condition_labels):
+        # Extract this condition's HRF: (nx, ny, nz, n_lags)
+        cond_hrf = iresp[:, :, :, cond_idx, :]
+
+        # Create NIfTI image with TR in header
+        img = nib.Nifti1Image(cond_hrf, affine)
+        img.header.set_xyzt_units(xyz='mm', t='sec')
+        img.header['pixdim'][4] = tr  # Set TR
+
+        # Add description
+        description = f"HRF estimate: {label} (bot={bot}s, top={top}s, n={n_lags})"
+        img.header['descrip'] = description[:80]  # Max 80 chars
+
+        # Save file
+        output_file = f"{output_prefix}_iresp_{label}.nii.gz"
+        nib.save(img, output_file)
+        output_files.append(output_file)
+
+    return output_files

@@ -421,11 +421,11 @@ def glt_weights_to_vector(
     return contrast_vector
 
 
-def parse_hrf_model(hrf_string: str) -> Tuple[str, float]:
+def parse_hrf_model(hrf_string: str) -> Tuple[str, Union[float, Dict]]:
     """
     Parse AFNI HRF model string
 
-    Extracts model name and duration from strings like 'SPMG1(5)', 'BLOCK(10)', etc.
+    Extracts model name and parameters from strings like 'SPMG1(5)', 'BLOCK(10)', 'TENT(0,15,6)', etc.
 
     Parameters
     ----------
@@ -434,14 +434,16 @@ def parse_hrf_model(hrf_string: str) -> Tuple[str, float]:
         - 'SPMG1(5)': SPM canonical with 5s stimulus duration
         - 'SPMG1(30)': SPM canonical with 30s stimulus duration
         - 'BLOCK(10)': Boxcar with 10s duration
-        - 'TENT(0,15,6)': Tent function (not yet implemented)
+        - 'TENT(0,15,6)': Tent function from 0-15s with 6 basis functions
+        - 'TENTzero(0,20,8)': TENTzero from 0-20s with 8 basis functions
 
     Returns
     -------
     model_name : str
-        HRF model name (e.g., 'SPMG1', 'BLOCK')
-    duration : float
-        Stimulus duration in seconds
+        HRF model name (e.g., 'SPMG1', 'BLOCK', 'TENT', 'TENTzero')
+    params : float or dict
+        For simple models (SPMG1, BLOCK): stimulus duration in seconds
+        For TENT/TENTzero: dict with keys 'bot', 'top', 'n_basis'
 
     Raises
     ------
@@ -454,28 +456,59 @@ def parse_hrf_model(hrf_string: str) -> Tuple[str, float]:
     ('SPMG1', 5.0)
     >>> parse_hrf_model('BLOCK(30)')
     ('BLOCK', 30.0)
+    >>> parse_hrf_model('TENT(0,15,6)')
+    ('TENT', {'bot': 0.0, 'top': 15.0, 'n_basis': 6})
+    >>> parse_hrf_model('TENTzero(0,20,8)')
+    ('TENTzero', {'bot': 0.0, 'top': 20.0, 'n_basis': 8})
     """
     # Match pattern: MODEL(duration) or MODEL(p1,p2,p3)
     # Model name can contain letters and digits (e.g., SPMG1, BLOCK, TENT)
-    match = re.match(r'^([A-Z][A-Z0-9]*)\(([^)]+)\)$', hrf_string)
+    match = re.match(r'^([A-Z][A-Z0-9]*)\(([^)]+)\)$', hrf_string, re.IGNORECASE)
 
     if not match:
-        raise ValueError(f"Invalid HRF model string: '{hrf_string}'. Expected format like 'SPMG1(5)'")
+        raise ValueError(f"Invalid HRF model string: '{hrf_string}'. Expected format like 'SPMG1(5)' or 'TENT(0,15,6)'")
 
-    model_name = match.group(1)
+    model_name = match.group(1).upper()  # Normalize to uppercase
     params_str = match.group(2)
 
-    # For now, we only support single-parameter models (SPMG1, BLOCK)
-    # TENT and others with multiple parameters will come later
-    try:
-        duration = float(params_str)
-    except ValueError:
-        raise ValueError(
-            f"Invalid duration in HRF model '{hrf_string}'. "
-            f"For now, only single-parameter models are supported (e.g., 'SPMG1(5)')"
-        )
+    # Handle TENT/TENTzero models with 3 parameters: TENT(bot,top,n)
+    if model_name in ('TENT', 'TENTZERO'):
+        params_parts = params_str.split(',')
+        if len(params_parts) != 3:
+            raise ValueError(
+                f"Invalid {model_name} model '{hrf_string}'. "
+                f"Expected format: '{model_name}(bot,top,n)' with 3 parameters"
+            )
+        try:
+            bot = float(params_parts[0].strip())
+            top = float(params_parts[1].strip())
+            n_basis = int(params_parts[2].strip())
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid parameters in '{hrf_string}'. "
+                f"Expected numeric values: {e}"
+            )
 
-    return model_name, duration
+        if bot >= top:
+            raise ValueError(f"In '{hrf_string}': bot ({bot}) must be < top ({top})")
+
+        min_n = 3 if model_name == 'TENTZERO' else 2
+        if n_basis < min_n:
+            raise ValueError(f"In '{hrf_string}': n_basis must be >= {min_n}, got {n_basis}")
+
+        return model_name, {'bot': bot, 'top': top, 'n_basis': n_basis}
+
+    # Handle simple single-parameter models (SPMG1, BLOCK, etc.)
+    else:
+        try:
+            duration = float(params_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid duration in HRF model '{hrf_string}'. "
+                f"Expected numeric value or use TENT(bot,top,n) for multi-parameter models"
+            )
+
+        return model_name, duration
 
 
 def load_and_pad_ortvec(

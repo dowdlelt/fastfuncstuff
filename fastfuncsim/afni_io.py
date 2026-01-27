@@ -210,6 +210,64 @@ def read_afni_onset_files(filepaths: List[Union[str, Path]]) -> List[List[np.nda
     return [read_afni_onset_file(fp) for fp in filepaths]
 
 
+def onsets_to_tr_matrix(
+    onsets_per_condition: List[List[np.ndarray]],
+    n_timepoints: int,
+    tr: float,
+) -> np.ndarray:
+    """
+    Convert AFNI onset times to binary onset matrix at TR resolution.
+
+    This is a simpler version of onsets_to_binary_matrix for use with
+    FIR/TENT models that work at TR resolution (no convolution).
+
+    Parameters
+    ----------
+    onsets_per_condition : list of list of np.ndarray
+        onsets_per_condition[cond][run] = onset times in seconds
+        For single run: [[cond1_onsets, cond2_onsets, ...]]
+    n_timepoints : int
+        Total number of timepoints (TRs)
+    tr : float
+        TR in seconds
+
+    Returns
+    -------
+    onset_matrix : np.ndarray
+        Binary onset matrix at TR resolution
+        Shape: (n_timepoints, n_conditions)
+        Values are 1.0 at onset TRs, 0.0 elsewhere
+
+    Examples
+    --------
+    >>> onsets = [[np.array([2.0, 6.0, 10.0]), np.array([4.0, 8.0])]]
+    >>> matrix = onsets_to_tr_matrix(onsets, n_timepoints=20, tr=1.0)
+    >>> matrix.shape
+    (20, 2)
+    >>> matrix[2, 0]  # Onset at 2.0s for condition 0
+    1.0
+    """
+    n_conditions = len(onsets_per_condition)
+    n_runs = len(onsets_per_condition[0])
+
+    # Initialize matrix
+    onset_matrix = np.zeros((n_timepoints, n_conditions), dtype=np.float32)
+
+    # Convert onset times to TR indices
+    for cond_idx in range(n_conditions):
+        for run_idx in range(n_runs):
+            onset_times = onsets_per_condition[cond_idx][run_idx]
+
+            for onset_time in onset_times:
+                # Convert time to TR index (round to nearest TR)
+                tr_idx = int(np.round(onset_time / tr))
+
+                if 0 <= tr_idx < n_timepoints:
+                    onset_matrix[tr_idx, cond_idx] = 1.0
+
+    return onset_matrix
+
+
 def onsets_to_binary_matrix(
     onsets_per_condition: List[List[np.ndarray]],
     n_timepoints: int,
@@ -1328,3 +1386,57 @@ def load_fmri_data(
         data[t] = fmri_data[..., t][mask_bool]
 
     return data
+
+
+def save_nifti(
+    data: np.ndarray,
+    output_path: Union[str, Path],
+    reference_img: Optional[Union[str, Path]] = None,
+    affine: Optional[np.ndarray] = None,
+    tr: Optional[float] = None,
+):
+    """
+    Save data as NIfTI file
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Data to save (3D or 4D array)
+    output_path : str or Path
+        Output file path
+    reference_img : str or Path, optional
+        Reference NIfTI file to copy affine/header from
+    affine : np.ndarray, optional
+        4x4 affine transformation matrix
+        If None and no reference_img, uses identity
+    tr : float, optional
+        Repetition time in seconds (for 4D data)
+        If None, attempts to get from reference_img
+    """
+    try:
+        import nibabel as nib
+    except ImportError:
+        raise ImportError("nibabel is required to save NIfTI files. Install with: pip install nibabel")
+
+    # Get affine and header info
+    if reference_img is not None:
+        ref_img = load_nifti(reference_img)
+        affine = ref_img.affine
+        header = ref_img.header.copy()
+    elif affine is None:
+        # Default identity affine
+        affine = np.eye(4)
+        header = nib.Nifti1Header()
+    else:
+        header = nib.Nifti1Header()
+
+    # Create NIfTI image
+    img = nib.Nifti1Image(data, affine, header=header)
+
+    # Set TR if provided
+    if tr is not None:
+        img.header.set_xyzt_units(xyz='mm', t='sec')
+        img.header['pixdim'][4] = tr
+
+    # Save
+    nib.save(img, str(output_path))
