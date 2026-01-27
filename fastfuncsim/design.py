@@ -1274,3 +1274,428 @@ def save_iresp(
         output_files.append(output_file)
 
     return output_files
+
+
+# ============================================================================
+# Thin Plate Splines (TPS) / Penalized Splines
+# ============================================================================
+
+def make_penalty_matrix(n_basis: int, order: int = 2) -> np.ndarray:
+    """
+    Create difference penalty matrix for penalized splines
+
+    Penalizes roughness by computing discrete differences of coefficients.
+    For order=2 (default), penalizes 2nd differences: sum((Δ²β)²)
+
+    Parameters
+    ----------
+    n_basis : int
+        Number of basis functions
+    order : int, optional
+        Order of differences (2 = second derivative penalty), default=2
+
+    Returns
+    -------
+    D : np.ndarray
+        (n_basis-order, n_basis) difference matrix
+        Penalty is λ·β'D'Dβ in penalized least squares
+
+    Examples
+    --------
+    >>> D = make_penalty_matrix(10, order=2)
+    >>> D.shape
+    (8, 10)
+    >>> # Second differences: D[i,:] computes β[i] - 2*β[i+1] + β[i+2]
+    """
+    if n_basis <= order:
+        raise ValueError(f"n_basis ({n_basis}) must be > order ({order})")
+
+    # Start with identity matrix
+    D = np.eye(n_basis)
+
+    # Apply differencing operator 'order' times
+    for _ in range(order):
+        # Compute first differences: D[i] = β[i+1] - β[i]
+        D = np.diff(D, axis=0)
+
+    return D
+
+
+def make_tps_design(
+    onset_times_list: list[np.ndarray],
+    bot: float,
+    top: float,
+    n_knots: int,
+    tr: float,
+    n_timepoints: int,
+    force_zero_edges: bool = False,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Create penalized spline (P-spline/TPS) design matrix from onset times
+
+    Uses cubic B-splines as basis functions, same as CSPLIN.
+    The difference from CSPLIN is that TPS includes a roughness penalty
+    during fitting (not in design construction).
+
+    This function creates the design matrix X. Fitting uses penalized LS:
+        β = (X'X + λD'D)^-1 X'y
+    where D is the penalty matrix from make_penalty_matrix().
+
+    Parameters
+    ----------
+    onset_times_list : list of np.ndarray
+        List of onset time arrays (in seconds), one per run
+        Each array contains onset times for a single condition
+    bot : float
+        Start of estimation window (seconds after onset)
+    top : float
+        End of estimation window (seconds after onset)
+    n_knots : int
+        Number of knots (basis functions) spanning [bot, top]
+    tr : float
+        Repetition time in seconds
+    n_timepoints : int
+        Total number of timepoints across all runs
+    force_zero_edges : bool, optional
+        If True, force HRF to be zero at bot and top (continuous response)
+    device : torch.device, optional
+        Device for computation
+
+    Returns
+    -------
+    design : torch.Tensor
+        (n_timepoints, n_knots) design matrix
+        If force_zero_edges=True, returns (n_timepoints, n_knots-2)
+
+    Notes
+    -----
+    - Uses cubic B-splines (same as CSPLIN)
+    - Knots are evenly spaced in [bot, top]
+    - Evaluates basis at exact onset times for fractional weights
+    - Cardinal interpolation: β[i] ≈ HRF value at knot i
+    - The penalty λ is applied during fitting, not here
+
+    Examples
+    --------
+    >>> onset_times = [np.array([2.5, 8.3, 15.7])]
+    >>> design = make_tps_design(onset_times, bot=0, top=20, n_knots=15, tr=2.0, n_timepoints=100)
+    >>> design.shape
+    torch.Size([100, 15])
+    """
+    if device is None:
+        device = get_device()
+
+    # Create evenly spaced knots
+    knots = np.linspace(bot, top, n_knots)
+
+    # Use CSPLIN basis function (cubic B-splines)
+    # We'll reuse the same basis construction as CSPLIN
+    design = torch.zeros((n_timepoints, n_knots), dtype=torch.float32, device=device)
+
+    # For each TR, evaluate basis functions at (TR_time - onset_time) for all onsets
+    for tr_idx in range(n_timepoints):
+        tr_time = tr_idx * tr
+
+        # Sum contributions from all onsets across all runs
+        for onset_times in onset_times_list:
+            onset_times_tensor = to_tensor(onset_times, device=device, dtype=torch.float32)
+
+            for onset_t in onset_times_tensor:
+                # Time relative to this onset
+                rel_time = tr_time - onset_t.item()
+
+                # Only contribute if within window
+                if bot <= rel_time <= top:
+                    # Evaluate each basis function
+                    for basis_idx in range(n_knots):
+                        basis_val = basis_csplin(
+                            torch.tensor([rel_time], device=device, dtype=torch.float32),
+                            knots.tolist(),
+                            basis_idx
+                        )
+                        design[tr_idx, basis_idx] += basis_val.item()
+
+    # Force zero edges if requested
+    if force_zero_edges:
+        # Remove first and last basis functions
+        design = design[:, 1:-1]
+
+    return design
+
+
+def fit_penalized_glm_cv(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    penalty_matrix: np.ndarray,
+    lambda_values: list[float],
+    run_boundaries: list[tuple[int, int]],
+    device: Optional[torch.device] = None,
+    verbose: bool = False,
+) -> tuple[float, np.ndarray]:
+    """
+    Cross-validate smoothness parameter λ using LORO (leave-one-run-out)
+
+    For each λ value:
+    1. For each run, fit model on all other runs
+    2. Predict left-out run and compute MSE
+    3. Average MSE across runs
+
+    Select λ with minimum average prediction error.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        (n_voxels, n_timepoints) or (n_timepoints,) data matrix
+    design : torch.Tensor
+        (n_timepoints, n_basis) design matrix (no penalty applied yet)
+    penalty_matrix : np.ndarray
+        (n_basis-order, n_basis) difference penalty matrix from make_penalty_matrix()
+    lambda_values : list of float
+        Grid of λ values to search over
+    run_boundaries : list of tuple
+        [(start_tr, end_tr), ...] for each run
+    device : torch.device, optional
+        Device for computation
+    verbose : bool, optional
+        Print progress
+
+    Returns
+    -------
+    best_lambda : float
+        Optimal λ value minimizing CV error
+    cv_errors : np.ndarray
+        (n_lambda,) array of mean CV errors for each λ
+
+    Notes
+    -----
+    Uses ridge regression formulation:
+        β = (X'X + λD'D)^-1 X'y
+
+    where X is the design matrix and D is the penalty matrix.
+    """
+    if device is None:
+        device = get_device()
+
+    # Move data to device if needed
+    if isinstance(data, np.ndarray):
+        data = torch.from_numpy(data).to(device)
+    else:
+        data = data.to(device)
+
+    design = design.to(device)
+
+    # Handle 1D data
+    if data.ndim == 1:
+        data = data.unsqueeze(0)  # (1, n_timepoints)
+
+    n_voxels, n_timepoints = data.shape
+    n_basis = design.shape[1]
+    n_runs = len(run_boundaries)
+
+    # Precompute D'D penalty term
+    D = torch.from_numpy(penalty_matrix).to(device).float()
+    DTD = D.T @ D  # (n_basis, n_basis)
+
+    # Storage for CV errors
+    cv_errors = np.zeros(len(lambda_values))
+
+    if verbose:
+        print(f"\n  Cross-validating {len(lambda_values)} λ values (LORO with {n_runs} runs)...")
+
+    # Grid search over λ
+    for lambda_idx, lam in enumerate(lambda_values):
+        run_errors = []
+
+        # LORO: leave each run out
+        for test_run_idx in range(n_runs):
+            # Get train and test indices
+            train_mask = torch.ones(n_timepoints, dtype=torch.bool, device=device)
+            test_start, test_end = run_boundaries[test_run_idx]
+            train_mask[test_start:test_end] = False
+
+            # Split data and design
+            X_train = design[train_mask, :]  # (n_train, n_basis)
+            y_train = data[:, train_mask]    # (n_voxels, n_train)
+
+            X_test = design[~train_mask, :]  # (n_test, n_basis)
+            y_test = data[:, ~train_mask]    # (n_voxels, n_test)
+
+            # Fit penalized model: β = (X'X + λD'D)^-1 X'y
+            XTX = X_train.T @ X_train  # (n_basis, n_basis)
+            XTy = X_train.T @ y_train.T  # (n_basis, n_voxels)
+
+            # Add penalty
+            penalized_XTX = XTX + lam * DTD
+
+            # Solve for betas (one per voxel)
+            try:
+                betas = torch.linalg.solve(penalized_XTX, XTy)  # (n_basis, n_voxels)
+            except:
+                # Fallback to lstsq if singular
+                betas = torch.linalg.lstsq(penalized_XTX, XTy).solution
+
+            # Predict test run
+            y_pred = (X_test @ betas).T  # (n_voxels, n_test)
+
+            # Compute MSE for this run
+            mse = torch.mean((y_test - y_pred) ** 2).item()
+            run_errors.append(mse)
+
+        # Average error across runs
+        cv_errors[lambda_idx] = np.mean(run_errors)
+
+        if verbose and lambda_idx % max(1, len(lambda_values) // 5) == 0:
+            print(f"    λ={lam:.3e}: CV error = {cv_errors[lambda_idx]:.6f}")
+
+    # Select best lambda
+    best_idx = np.argmin(cv_errors)
+    best_lambda = lambda_values[best_idx]
+
+    if verbose:
+        print(f"  ✓ Optimal λ = {best_lambda:.3e} (CV error = {cv_errors[best_idx]:.6f})")
+
+    return best_lambda, cv_errors
+
+
+def fit_penalized_glm(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    penalty_matrix: np.ndarray,
+    lambda_values: Union[float, np.ndarray],
+    device: Optional[torch.device] = None,
+    chunk_size: int = 60000,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """
+    Fit penalized GLM with smoothness parameter λ
+
+    Solves: β = (X'X + λD'D)^-1 X'y
+
+    Supports per-voxel λ values for adaptive smoothing.
+    Processes data in chunks for GPU memory efficiency.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        (n_voxels, n_timepoints) data matrix
+    design : torch.Tensor
+        (n_timepoints, n_basis) design matrix (stimulus regressors only, no polynomials)
+    penalty_matrix : np.ndarray
+        (n_basis-order, n_basis) difference penalty matrix
+    lambda_values : float or np.ndarray
+        Smoothness parameter(s)
+        - float: same λ for all voxels (global)
+        - array: (n_voxels,) per-voxel λ values
+    device : torch.device, optional
+        Device for computation
+    chunk_size : int, optional
+        Number of voxels to process at once
+    verbose : bool, optional
+        Print progress
+
+    Returns
+    -------
+    betas : torch.Tensor
+        (n_voxels, n_basis) estimated coefficients
+
+    Notes
+    -----
+    This function only fits the penalized portion (stimulus regressors).
+    To include nuisance regressors (polynomials), fit them separately
+    or extend this function.
+    """
+    if device is None:
+        device = get_device()
+
+    # Move to device
+    data = data.to(device)
+    design = design.to(device)
+
+    n_voxels, n_timepoints = data.shape
+    n_basis = design.shape[1]
+
+    # Convert penalty matrix
+    D = torch.from_numpy(penalty_matrix).to(device).float()
+    DTD = D.T @ D  # (n_basis, n_basis)
+
+    # Check if global or per-voxel λ
+    if isinstance(lambda_values, (int, float)):
+        # Global λ
+        global_lambda = True
+        lam = float(lambda_values)
+        if verbose:
+            print(f"\nFitting penalized GLM (global λ = {lam:.3e})...")
+    else:
+        # Per-voxel λ
+        global_lambda = False
+        lambda_array = lambda_values
+        if len(lambda_array) != n_voxels:
+            raise ValueError(f"lambda_values length ({len(lambda_array)}) must match n_voxels ({n_voxels})")
+        if verbose:
+            print(f"\nFitting penalized GLM (per-voxel λ)...")
+            print(f"  λ range: [{lambda_array.min():.3e}, {lambda_array.max():.3e}]")
+
+    # Precompute X'X (same for all voxels)
+    XTX = design.T @ design  # (n_basis, n_basis)
+
+    # Storage for betas
+    betas = torch.zeros((n_voxels, n_basis), dtype=torch.float32, device='cpu')
+
+    # Process in chunks
+    n_chunks = int(np.ceil(n_voxels / chunk_size))
+
+    if verbose:
+        print(f"  Processing {n_voxels:,} voxels in {n_chunks} chunks...")
+
+    for chunk_idx in range(n_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min(start_idx + chunk_size, n_voxels)
+        chunk_voxels = end_idx - start_idx
+
+        # Get chunk data
+        y_chunk = data[start_idx:end_idx, :]  # (chunk_voxels, n_timepoints)
+
+        if global_lambda:
+            # Same λ for all voxels in chunk
+            penalized_XTX = XTX + lam * DTD
+
+            # Compute X'y for all voxels
+            XTy = design.T @ y_chunk.T  # (n_basis, chunk_voxels)
+
+            # Solve for betas
+            try:
+                betas_chunk = torch.linalg.solve(penalized_XTX, XTy)  # (n_basis, chunk_voxels)
+            except:
+                betas_chunk = torch.linalg.lstsq(penalized_XTX, XTy).solution
+
+            betas_chunk = betas_chunk.T  # (chunk_voxels, n_basis)
+
+        else:
+            # Per-voxel λ - need to solve separately for each voxel
+            betas_chunk = torch.zeros((chunk_voxels, n_basis), dtype=torch.float32, device=device)
+
+            for voxel_idx in range(chunk_voxels):
+                lam_voxel = lambda_array[start_idx + voxel_idx]
+                penalized_XTX = XTX + lam_voxel * DTD
+
+                y_voxel = y_chunk[voxel_idx, :]  # (n_timepoints,)
+                XTy_voxel = design.T @ y_voxel  # (n_basis,)
+
+                try:
+                    beta_voxel = torch.linalg.solve(penalized_XTX, XTy_voxel)
+                except:
+                    beta_voxel = torch.linalg.lstsq(penalized_XTX, XTy_voxel).solution
+
+                betas_chunk[voxel_idx, :] = beta_voxel
+
+        # Store results (move to CPU to save GPU memory)
+        betas[start_idx:end_idx, :] = betas_chunk.cpu()
+
+        if verbose and (chunk_idx % max(1, n_chunks // 5) == 0):
+            print(f"    Chunk {chunk_idx+1}/{n_chunks}: voxels {start_idx:,}-{end_idx:,}")
+
+    if verbose:
+        print(f"  ✓ Penalized GLM complete")
+
+    return betas
