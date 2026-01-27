@@ -621,7 +621,7 @@ def cross_validate_noise_pcs(
         # Memory: chunk_data + projected train/test data (held during projection before concat)
         # During projection we hold multiple copies, so be conservative
         # Target: 0.6GB for chunk_data to leave ~1-2GB headroom for projection operations
-        target_chunk_memory_gb = 0.4
+        target_chunk_memory_gb = 0.3
         bytes_per_voxel = n_timepoints * 4  # float32
         max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
         voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 42000)
