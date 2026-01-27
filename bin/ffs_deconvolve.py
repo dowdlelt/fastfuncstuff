@@ -119,9 +119,10 @@ def parse_args():
     model_opts = parser.add_argument_group("Deconvolution Model Options")
     model_opts.add_argument(
         "-model",
-        choices=["AUTO", "FIR", "TENT", "TENTzero"],
+        choices=["AUTO", "FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero"],
         default="AUTO",
-        help="Deconvolution model: AUTO (auto-detect TR-locking), FIR, TENT, or TENTzero (default: AUTO)",
+        help="Deconvolution model: AUTO (auto-detect TR-locking), FIR, TENT, TENTzero, "
+             "CSPLIN (cubic spline - smoother than TENT), CSPLINzero (default: AUTO)",
     )
 
     model_opts.add_argument(
@@ -497,8 +498,8 @@ def main():
         if args.verbose:
             print(f"  Duration: {args.duration}s ({n_lags} TRs)")
 
-    elif model in ("TENT", "TENTzero"):
-        # Parse tent windows
+    elif model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
+        # Parse windows for TENT/CSPLIN models
         try:
             if args.tent_window is not None:
                 tent_windows = parse_tent_windows(args.tent_window, n_conditions)
@@ -507,7 +508,7 @@ def main():
                 tent_windows = [(0.0, args.duration)] * n_conditions
             else:
                 print(
-                    "ERROR: Either -tent_window or -duration required for TENT model",
+                    f"ERROR: Either -tent_window or -duration required for {model} model",
                     file=sys.stderr,
                 )
                 return 1
@@ -524,21 +525,23 @@ def main():
                     n_basis_calc = round((top - bot) / tr) + 1
                 else:
                     n_basis_calc = args.tent_n_basis
-                n_actual = n_basis_calc - 2 if model == "TENTzero" else n_basis_calc
+                n_actual = n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
                 print(f"  Window: {bot}s to {top}s (all conditions)")
+                basis_type = "cubic spline" if "CSPLIN" in model else "tent"
                 print(
-                    f"  Basis functions: {n_basis_calc} knots → {n_actual} regressors per condition"
+                    f"  Basis functions: {n_basis_calc} {basis_type} knots → {n_actual} regressors per condition"
                 )
             else:
                 print(f"  Windows (per condition):")
+                basis_type = "cubic spline" if "CSPLIN" in model else "tent"
                 for i, (bot, top) in enumerate(tent_windows):
                     if args.tent_n_basis is None:
                         n_basis_calc = round((top - bot) / tr) + 1
                     else:
                         n_basis_calc = args.tent_n_basis
-                    n_actual = n_basis_calc - 2 if model == "TENTzero" else n_basis_calc
+                    n_actual = n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
                     print(
-                        f"    {condition_labels[i]}: {bot}s to {top}s ({n_basis_calc} knots → {n_actual} regressors)"
+                        f"    {condition_labels[i]}: {bot}s to {top}s ({n_basis_calc} {basis_type} knots → {n_actual} regressors)"
                     )
 
     # Build design matrices
@@ -577,11 +580,11 @@ def main():
             if run_idx == 0:
                 n_basis_per_condition_list = [n_lags] * n_conditions
 
-        elif model in ("TENT", "TENTzero"):
-            # TENT: use exact onset times (not binary matrix)
+        elif model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
+            # TENT/CSPLIN: use exact onset times (not binary matrix)
             # This produces fractional weights for non-TR-locked onsets
             if tent_windows is None:
-                raise RuntimeError("tent_windows should not be None for TENT/TENTzero model")
+                raise RuntimeError(f"tent_windows should not be None for {model} model")
 
             cond_designs = []
             for cond_idx in range(n_conditions):
@@ -597,18 +600,31 @@ def main():
                 # Get window for this condition
                 bot, top = tent_windows[cond_idx]
 
-                # Build TENT design for this condition using exact onset times
-                from fastfuncsim.design import make_tent_design
-                design_cond = make_tent_design(
-                    onset_times_list=[onset_times],  # Single condition
-                    bot=bot,
-                    top=top,
-                    tr=tr,
-                    n_timepoints=n_tp,
-                    n_basis=args.tent_n_basis,
-                    zero_edges=(model == "TENTzero"),
-                    device=device,
-                )
+                # Build design for this condition using exact onset times
+                if model in ("TENT", "TENTzero"):
+                    from fastfuncsim.design import make_tent_design
+                    design_cond = make_tent_design(
+                        onset_times_list=[onset_times],
+                        bot=bot,
+                        top=top,
+                        tr=tr,
+                        n_timepoints=n_tp,
+                        n_basis=args.tent_n_basis,
+                        zero_edges=(model == "TENTzero"),
+                        device=device,
+                    )
+                else:  # CSPLIN or CSPLINzero
+                    from fastfuncsim.design import make_csplin_design
+                    design_cond = make_csplin_design(
+                        onset_times_list=[onset_times],
+                        bot=bot,
+                        top=top,
+                        tr=tr,
+                        n_timepoints=n_tp,
+                        n_basis=args.tent_n_basis,
+                        zero_edges=(model == "CSPLINzero"),
+                        device=device,
+                    )
 
                 cond_designs.append(design_cond)
 
@@ -703,8 +719,9 @@ def main():
             f.write(f"# Timepoints: {design_np.shape[0]} ({', '.join(map(str, n_timepoints_per_run))})\n")
             f.write(f"# Regressors: {design_np.shape[1]} ({n_stimulus_regressors} stimulus + {design_np.shape[1] - n_stimulus_regressors} nuisance)\n")
 
-            if model in ("TENT", "TENTzero"):
-                f.write(f"# TENT windows:\n")
+            if model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
+                basis_type = "Cubic spline" if "CSPLIN" in model else "TENT"
+                f.write(f"# {basis_type} windows:\n")
                 for cond_idx in range(n_conditions):
                     if tent_windows is not None:
                         bot, top = tent_windows[cond_idx]

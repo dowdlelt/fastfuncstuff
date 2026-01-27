@@ -332,6 +332,83 @@ def basis_tent(x: torch.Tensor, bot: float, mid: float, top: float) -> torch.Ten
     return val
 
 
+def basis_csplin(x: torch.Tensor, knots: list[float], idx: int) -> torch.Tensor:
+    """
+    Cubic spline basis function (cardinal B-spline)
+
+    Evaluates a cubic B-spline basis centered at knots[idx].
+    This is a piecewise cubic polynomial with C² continuity.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Time points to evaluate (in seconds)
+    knots : list of float
+        All knot positions (must be equally spaced)
+    idx : int
+        Index of center knot for this basis function
+
+    Returns
+    -------
+    values : torch.Tensor
+        Cubic spline basis values at each x
+
+    Notes
+    -----
+    Cubic B-spline basis has support over 4 intervals:
+    - Non-zero from knots[idx-2] to knots[idx+2]
+    - Value = 1 at knots[idx]
+    - C² continuous everywhere
+
+    This provides smoother interpolation than TENT (piecewise linear).
+    Parameters still represent HRF values at knots (cardinal interpolation).
+
+    References
+    ----------
+    AFNI 3dDeconvolve CSPLIN implementation
+    de Boor, "A Practical Guide to Splines" (2001)
+    """
+    n_knots = len(knots)
+
+    # Handle edge cases
+    if idx < 0 or idx >= n_knots:
+        return torch.zeros_like(x)
+
+    # Get knot spacing (assume uniform)
+    if n_knots > 1:
+        dx = knots[1] - knots[0]
+    else:
+        return torch.zeros_like(x)
+
+    # Center position
+    x_center = knots[idx]
+
+    # Normalized distance from center: t = (x - x_center) / dx
+    t = (x - x_center) / dx
+
+    # Cubic B-spline is non-zero for |t| < 2
+    val = torch.zeros_like(x)
+
+    # Use standard cubic B-spline formula (normalized)
+    # Split into 4 regions based on |t|
+
+    # Region 1: 0 <= |t| < 1 (central peak)
+    mask1 = torch.abs(t) < 1.0
+    t1 = torch.abs(t[mask1])
+    val[mask1] = (2.0/3.0) - t1**2 + 0.5 * t1**3
+
+    # Region 2: 1 <= |t| < 2 (tails)
+    mask2 = (torch.abs(t) >= 1.0) & (torch.abs(t) < 2.0)
+    t2 = torch.abs(t[mask2])
+    val[mask2] = (2.0 - t2)**3 / 6.0
+
+    # Normalize so peak value = 1.0 (for cardinal interpolation)
+    # Peak of cubic B-spline is 2/3, so multiply by 3/2
+    val = val * 1.5
+
+    return val
+
+
 def make_tent_design(
     onset_times_list: list[np.ndarray],
     bot: float,
@@ -488,6 +565,135 @@ def make_tent_design(
 
                 # Add contribution to design matrix
                 design[tr_idx, basis_col_idx] += tent_val
+
+        basis_col_idx += 1
+
+    return design
+
+
+def make_csplin_design(
+    onset_times_list: list[np.ndarray],
+    bot: float,
+    top: float,
+    tr: float,
+    n_timepoints: int,
+    n_basis: Optional[int] = None,
+    zero_edges: bool = False,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Create CSPLIN basis function design matrix for non-TR-locked onsets
+
+    CSPLIN uses cubic splines for smooth HRF interpolation.
+    This is AFNI's recommended upgrade from TENT: "CSPLIN is a drop-in
+    upgrade of TENT to a differentiable set of functions."
+
+    Parameters
+    ----------
+    onset_times_list : list of np.ndarray
+        List of onset time arrays (in seconds), one per condition
+    bot : float
+        Start time of HRF window (seconds after stimulus)
+    top : float
+        End time of HRF window (seconds after stimulus)
+    tr : float
+        Repetition time in seconds
+    n_timepoints : int
+        Total number of timepoints (TRs)
+    n_basis : int, optional
+        Number of cubic spline basis functions (knots)
+        If None, auto-calculated to give one knot per TR
+    zero_edges : bool
+        If True, use CSPLINzero (force HRF to start and end at zero)
+    device : torch.device, optional
+        Device for computation
+
+    Returns
+    -------
+    design : torch.Tensor
+        (n_timepoints, n_actual_basis) CSPLIN design matrix
+
+    Notes
+    -----
+    CSPLIN provides:
+    - Smooth interpolation (C² continuity vs C⁰ for TENT)
+    - More stable than TENT (smoothness constraints)
+    - Cardinal interpolation: parameters = HRF values at knots
+    - Same output as TENT but smoother and less noisy
+
+    Key advantages over TENT:
+    1. Differentiable everywhere (no kinks)
+    2. Reduced sensitivity to noise
+    3. Better conditioning (less collinearity)
+
+    References
+    ----------
+    AFNI 3dDeconvolve documentation
+    https://afni.nimh.nih.gov/pub/dist/doc/program_help/3dDeconvolve.html
+    """
+    if device is None:
+        device = get_device()
+
+    if bot >= top:
+        raise ValueError(f"bot ({bot}) must be < top ({top})")
+
+    # Auto-calculate n_basis if not provided
+    if n_basis is None:
+        n_basis = round((top - bot) / tr) + 1
+
+    if n_basis < 4 if zero_edges else n_basis < 4:
+        raise ValueError(f"n_basis must be >= 4 for cubic splines, got {n_basis}")
+
+    # Calculate knot spacing
+    dx = (top - bot) / (n_basis - 1)
+
+    # Create knot positions
+    knots = [bot + i * dx for i in range(n_basis)]
+
+    # Determine actual number of basis functions
+    if zero_edges:
+        n_actual_basis = n_basis - 2
+        first_basis_idx = 1
+        last_basis_idx = n_basis - 1
+    else:
+        n_actual_basis = n_basis
+        first_basis_idx = 0
+        last_basis_idx = n_basis
+
+    # Pre-allocate design matrix
+    design = torch.zeros(n_timepoints, n_actual_basis, device=device)
+
+    # Combine all onset times
+    all_onset_times = []
+    for onset_array in onset_times_list:
+        all_onset_times.extend(onset_array.tolist())
+
+    if len(all_onset_times) == 0:
+        return design
+
+    onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
+
+    # For each basis function
+    basis_col_idx = 0
+    for basis_idx in range(first_basis_idx, last_basis_idx):
+        # For each TR, sum contributions from all onsets
+        for tr_idx in range(n_timepoints):
+            tr_time = tr_idx * tr
+
+            # For each onset, calculate relative time and evaluate cubic spline
+            for onset_t in onset_times_tensor:
+                # Time relative to onset
+                rel_time = tr_time - onset_t.item()
+
+                # Evaluate cubic spline basis at this relative time
+                csplin_val = basis_csplin(
+                    torch.tensor([rel_time], device=device),
+                    knots,
+                    basis_idx
+                )[0].item()
+
+                # Add contribution
+                design[tr_idx, basis_col_idx] += csplin_val
 
         basis_col_idx += 1
 
