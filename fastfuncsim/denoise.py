@@ -214,15 +214,16 @@ def extract_noise_pcs_per_run(
     max_components: int = 20,
     variance_threshold: float = 0.95,
     return_loadings: bool = False,
-    polort: int = 2,
+    nuisance_per_run: Optional[List[torch.Tensor]] = None,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[torch.Tensor]]]:
     """
     Extract principal components from noise pool for each run independently
 
-    CRITICAL: Projects out polynomial drift from noise pool data BEFORE PCA.
-    This is essential to prevent drift from dominating the extracted components.
+    CRITICAL: Projects out nuisance regressors from noise pool data BEFORE PCA.
+    This is essential to prevent drift/nuisance from dominating the extracted components.
+    Uses the EXACT SAME nuisance regressors that will be used in the GLM model.
 
     Parameters
     ----------
@@ -238,9 +239,11 @@ def extract_noise_pcs_per_run(
         Extract PCs up to this cumulative variance (within max_components)
     return_loadings : bool, default=False
         If True, also return PC loadings (spatial weights for noise pool voxels)
-    polort : int, default=2
-        Polynomial order for drift removal before PCA.
-        Set to -1 to skip polynomial projection.
+    nuisance_per_run : list of torch.Tensor, optional
+        Nuisance regressors per run (e.g., polynomials, motion parameters).
+        Each tensor has shape (n_timepoints_run, n_nuisance_cols).
+        These will be projected out before PCA.
+        CRITICAL: Must be the SAME nuisance used in the GLM model.
     device : torch.device, optional
         Device for computation
     verbose : bool, default=False
@@ -256,8 +259,6 @@ def extract_noise_pcs_per_run(
         PC loadings (spatial weights) for each run
         Each tensor has shape (n_noise_voxels, n_components_run)
     """
-    from .glm_core import construct_polynomial_matrix
-
     device = device or get_device()
     pca_device = device
     n_runs = len(run_starts)
@@ -278,19 +279,17 @@ def extract_noise_pcs_per_run(
         run_data_full = data[:, start_tp:end_tp]
         run_data = run_data_full[noise_pool_mask, :]
 
-        # CRITICAL: Project out polynomial drift BEFORE PCA
-        # This prevents slow drift from dominating the extracted components
-        if polort >= 0:
-            # Build polynomial matrix for this run
-            poly = construct_polynomial_matrix(
-                run_length, polort, device=run_data.device, dtype=run_data.dtype
-            )
-            # Project out: Y_clean = Y - poly @ (poly'poly)^-1 @ poly' @ Y
+        # CRITICAL: Project out nuisance regressors BEFORE PCA
+        # This prevents drift/nuisance from dominating the extracted components
+        # Uses the EXACT SAME nuisance matrices that will be used in the GLM
+        if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
+            nuisance = nuisance_per_run[run_idx].to(run_data.device)
+            # Project out: Y_clean = Y - nuisance @ (nuisance'nuisance)^-1 @ nuisance' @ Y
             # Using QR for numerical stability
-            q_poly, _ = torch.linalg.qr(poly)
-            # run_data is (n_voxels, n_timepoints), q_poly is (n_timepoints, n_poly)
-            # Project out: run_data_clean = run_data - run_data @ q_poly @ q_poly'
-            run_data = run_data - (run_data @ q_poly) @ q_poly.T
+            q_nuisance, _ = torch.linalg.qr(nuisance)
+            # run_data is (n_voxels, n_timepoints), q_nuisance is (n_timepoints, n_nuisance)
+            # Project out: run_data_clean = run_data - run_data @ q_nuisance @ q_nuisance'
+            run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
 
         # CRITICAL: Unit-length normalize each voxel time-series BEFORE PCA
         # GLMdenoise does this to ensure PCA identifies noise structure patterns,
@@ -354,9 +353,14 @@ def extract_noise_pcs_per_run(
                 if max_components <= len(cumvar)
                 else cumvar[-1].item()
             )
-            polort_msg = f", polort={polort} projected" if polort >= 0 else ""
+            n_nuisance = (
+                nuisance_per_run[run_idx].shape[1]
+                if nuisance_per_run is not None
+                else 0
+            )
+            nuisance_msg = f", {n_nuisance} nuisance projected" if n_nuisance > 0 else ""
             print(
-                f"  Run {run_idx + 1}: {max_components} PCs ({var_explained * 100:.1f}% var{polort_msg})"
+                f"  Run {run_idx + 1}: {max_components} PCs ({var_explained * 100:.1f}% var{nuisance_msg})"
             )
 
     if return_loadings:
@@ -557,11 +561,27 @@ def cross_validate_noise_pcs(
     )
     is_loro_temp = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits_temp)
 
-    # Projection device: use GPU for LORO (streaming stats save memory), CPU otherwise
-    if is_loro_temp:
-        proj_device = device  # GPU - we have memory for projections with streaming stats
-    else:
-        proj_device = torch.device("cpu")  # CPU - full accumulators use more memory
+    # Projection device: use GPU when available, fall back to CPU if OOM risk
+    # For split-half: check if GPU has enough free memory for projections
+    use_gpu_for_projections = False
+    if device.type == "cuda":
+        # Check available GPU memory
+        gpu_free_gb = torch.cuda.mem_get_info(device)[0] / (1024**3)
+
+        if is_loro_temp:
+            # LORO: streaming stats are tiny, always use GPU
+            use_gpu_for_projections = True
+        else:
+            # Split-half: use GPU if we have >6GB free (conservative threshold)
+            # This leaves room for projection matrices + accumulators
+            use_gpu_for_projections = gpu_free_gb > 6.0
+            if verbose:
+                if use_gpu_for_projections:
+                    print(f"  GPU has {gpu_free_gb:.1f} GB free → using GPU for projections")
+                else:
+                    print(f"  GPU has {gpu_free_gb:.1f} GB free → using CPU for projections (need >6GB)")
+
+    proj_device = device if use_gpu_for_projections else torch.device("cpu")
 
     n_runs = len(run_starts)
     n_voxels = data.shape[0]
@@ -628,10 +648,24 @@ def cross_validate_noise_pcs(
     else:
         # Full accumulator: much more memory for storing full predictions per PC
         # Memory: chunk_data + (voxels × timepoints × 4 bytes × n_PCs)
-        target_chunk_memory_gb = 0.5
-        bytes_per_voxel = n_timepoints * 4
-        max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
-        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 5000), 20000)
+        # CRITICAL: Full accumulators for split-half are HUGE (voxels × timepoints × n_PCs)
+        # Must keep on CPU and use conservative chunk sizes
+        if use_gpu_for_projections:
+            # GPU projections but CPU accumulators: moderate chunks
+            # Accumulators: voxels × timepoints × (max_components+1) × 4 bytes
+            # For 1.9M voxels × 1065 TPs × 21 PCs = 169 GB (must chunk!)
+            # Target: 50k voxels = ~4.5GB accumulators (fits in RAM)
+            target_chunk_memory_gb = 0.8
+            bytes_per_voxel = n_timepoints * 4
+            max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
+            # Cap at 50k for split-half to keep accumulator size reasonable
+            voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 50000)
+        else:
+            # CPU projections: smaller chunks to avoid memory issues
+            target_chunk_memory_gb = 0.5
+            bytes_per_voxel = n_timepoints * 4
+            max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
+            voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 5000), 20000)
 
     # Move data to CPU for memory efficiency
     data_cpu = data.to(proj_device)
@@ -685,12 +719,16 @@ def cross_validate_noise_pcs(
             ]
         else:
             # Full accumulator mode for non-LORO CV
+            # CRITICAL: Full accumulators are HUGE (chunk_voxels × timepoints × n_PCs)
+            # For 50k voxels × 1065 TPs × 21 PCs = 4.5GB
+            # Must use CPU to avoid GPU OOM
+            accumulator_device = torch.device("cpu")
             pred_by_pc_chunk = [
-                torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu")
+                torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device=accumulator_device)
                 for _ in range(max_components + 1)
             ]
             actual_projected_chunk = torch.zeros(
-                chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu"
+                chunk_size_actual, n_timepoints, dtype=torch.float32, device=accumulator_device
             )
 
         # Cross-validation loop: accumulate predictions or stats for this chunk
@@ -918,14 +956,15 @@ def cross_validate_noise_pcs(
                     sum_sq_actual_by_pc[n_pcs] += sum_sq_fold
                 else:
                     # Full accumulator mode: store predictions
-                    pred_by_pc_chunk[n_pcs][:, test_tps] = y_pred.cpu()
+                    # Move to accumulator device (GPU if doing GPU projections, otherwise CPU)
+                    pred_by_pc_chunk[n_pcs][:, test_tps] = y_pred.to(pred_by_pc_chunk[n_pcs].device)
 
             # For non-LORO mode, store projected actuals
             if not is_loro:
                 if nuisance_per_run is not None:
-                    actual_projected_chunk[:, test_tps] = data_test_projected.cpu()
+                    actual_projected_chunk[:, test_tps] = data_test_projected.to(actual_projected_chunk.device)
                 else:
-                    actual_projected_chunk[:, test_tps] = chunk_data_test.cpu()
+                    actual_projected_chunk[:, test_tps] = chunk_data_test.to(actual_projected_chunk.device)
 
             # Free GPU memory for this fold
             if device.type == "cuda":
@@ -958,12 +997,13 @@ def cross_validate_noise_pcs(
                 pred = pred_by_pc_chunk[n_pcs]  # (chunk_size, n_timepoints)
                 actual = actual_projected_chunk  # (chunk_size, n_timepoints) - PROJECTED data
 
-                # Compute R² per voxel
+                # Compute R² per voxel (works on both CPU and GPU)
                 ss_res = ((actual - pred) ** 2).sum(dim=1)
                 ss_tot = ((actual - actual.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
                 r2 = 1 - (ss_res / (ss_tot + 1e-10))
 
-                r2_maps[chunk_start:chunk_end, n_pcs] = r2.numpy()
+                # Move to CPU if on GPU before converting to numpy
+                r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy() if r2.is_cuda else r2.numpy()
 
             # Free chunk memory
             del pred_by_pc_chunk, chunk_data_cpu, actual_projected_chunk
@@ -1368,7 +1408,7 @@ def fit_denoising_model(
     chunk_size: Optional[int] = None,
     preload_data_to_device: bool = True,
     return_loadings: bool = False,
-    polort: int = 2,
+    polort: Optional[int] = 2,
     pcstop: float = 1.05,
     pcR2cutoff: Optional[float] = None,
     cv_strategy: Union[int, float] = 1,
@@ -1472,6 +1512,41 @@ def fit_denoising_model(
     """
     device = device or get_device()
 
+    n_runs = len(run_starts)
+    n_timepoints = data.shape[1]
+
+    # Auto-determine polort based on run length if not specified
+    # Uses AFNI formula: 1 + floor(run_duration / 150)
+    if polort is None:
+        # Calculate median run length (in case runs have different lengths)
+        run_lengths = []
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_lengths.append(end_tp - start_tp)
+
+        median_run_length = int(np.median(run_lengths))
+        run_duration = median_run_length * tr
+        polort = int(np.floor(1 + run_duration / 150.0))
+
+        if verbose:
+            print(f"\nAuto-determined polort={polort} (median run: {median_run_length} TRs = {run_duration:.1f}s)")
+
+    # Convert nuisance to list format for consistent handling
+    # This ensures extract_noise_pcs_per_run gets the exact same nuisance
+    # matrices that will be used in the GLM model
+    nuisance_per_run: Optional[List[torch.Tensor]] = None
+    if nuisance is not None:
+        if isinstance(nuisance, list):
+            nuisance_per_run = nuisance
+        else:
+            # Single matrix - need to split by runs
+            nuisance_per_run = []
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                nuisance_per_run.append(nuisance[start_tp:end_tp, :])
+
     if verbose:
         print(f"\n{'=' * 70}")
         print("Cross-Validated Denoising Pipeline")
@@ -1495,23 +1570,11 @@ def fit_denoising_model(
             print("\nStep 1: Computing cross-validated task-only R² for noise pool selection...")
             print("  (project-first nuisance removal, per run)")
 
-        n_runs = len(run_starts)
-        n_timepoints = data.shape[1]
-        n_voxels = data.shape[0]
         n_task_cols = design_matrix.shape[1]
 
-        # Build nuisance list if not already a list
-        if nuisance is not None:
-            if isinstance(nuisance, list):
-                nuisance_per_run_local = nuisance
-            else:
-                # Single matrix - need to split by runs
-                nuisance_per_run_local = []
-                for run_idx in range(n_runs):
-                    start_tp = run_starts[run_idx]
-                    end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                    nuisance_per_run_local.append(nuisance[start_tp:end_tp, :])
-        else:
+        # Use the already-converted nuisance_per_run (or create empty if None)
+        nuisance_per_run_local = nuisance_per_run
+        if nuisance_per_run_local is None:
             # No nuisance - create empty tensors per run
             nuisance_per_run_local = []
             for run_idx in range(n_runs):
@@ -1569,7 +1632,8 @@ def fit_denoising_model(
     n_extreme = (~valid_r2_mask).sum().item()
 
     # Track the valid voxel mask for output (all voxels are initially valid)
-    valid_voxel_mask = torch.ones(data.shape[0], dtype=torch.bool, device=data.device)
+    # Use computation device (not data device) to match initial_r2
+    valid_voxel_mask = torch.ones(data.shape[0], dtype=torch.bool, device=initial_r2.device)
 
     if n_extreme > 0:
         if verbose:
@@ -1623,8 +1687,11 @@ def fit_denoising_model(
     # Apply intensity mask (brainthresh) to noise pool
     # This excludes low-intensity voxels from the noise pool
     if intensity_mask is not None:
+        # Ensure intensity_mask is on the same device as noise_pool_mask
+        # (noise_pool_mask is on computation device, intensity_mask may be on data device)
+        intensity_mask_device = intensity_mask.to(noise_pool_mask.device)
         n_noise_before = noise_pool_mask.sum().item()
-        noise_pool_mask = noise_pool_mask & intensity_mask
+        noise_pool_mask = noise_pool_mask & intensity_mask_device
         n_noise_after = noise_pool_mask.sum().item()
         if verbose:
             print(
@@ -1641,8 +1708,13 @@ def fit_denoising_model(
 
     # Step 3: Extract noise PCs per run (and optionally loadings)
     if verbose:
-        polort_msg = f", projecting polort={polort}" if polort >= 0 else ""
-        print(f"\nStep 3: Extracting PCs from noise pool (max={max_components}{polort_msg})...")
+        n_nuisance = (
+            sum(n.shape[1] for n in nuisance_per_run) // n_runs
+            if nuisance_per_run is not None
+            else 0
+        )
+        nuisance_msg = f", projecting {n_nuisance} nuisance" if n_nuisance > 0 else ""
+        print(f"\nStep 3: Extracting PCs from noise pool (max={max_components}{nuisance_msg})...")
 
     pc_loadings = None
     if return_loadings:
@@ -1653,7 +1725,7 @@ def fit_denoising_model(
             max_components=max_components,
             variance_threshold=variance_threshold,
             return_loadings=True,
-            polort=polort,
+            nuisance_per_run=nuisance_per_run,
             device=device,
             verbose=verbose,
         )
@@ -1665,7 +1737,7 @@ def fit_denoising_model(
             max_components=max_components,
             variance_threshold=variance_threshold,
             return_loadings=False,
-            polort=polort,
+            nuisance_per_run=nuisance_per_run,
             device=device,
             verbose=verbose,
         )

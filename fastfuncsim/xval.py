@@ -823,8 +823,20 @@ def compute_xval_r2(
     if use_fast_r2:
         # FAST MODE: Streaming stats - tiny accumulators that fit easily on GPU
         # Use float64 for precision (summing many values)
-        accumulator_device = device if data_on_gpu else torch.device("cpu")
-        effective_batch_size = min(batch_size * 4, n_voxels) if data_on_gpu else batch_size
+        # CRITICAL: For LORO, accumulators are tiny (~24 bytes/voxel = 45MB for 1.9M voxels)
+        # Keep on GPU even when data is on CPU to avoid constant CPU<->GPU transfers
+        use_gpu_accumulators = device.type == "cuda"
+        accumulator_device = device if use_gpu_accumulators else torch.device("cpu")
+
+        # Larger batches for CPU→GPU streaming (amortize transfer overhead)
+        if data_on_gpu:
+            effective_batch_size = min(batch_size * 4, n_voxels)
+        elif use_gpu_accumulators:
+            # Data on CPU but accumulators on GPU: use much larger batches
+            # Target: 100k-200k voxels (amortize kernel launch overhead)
+            effective_batch_size = min(batch_size * 20, n_voxels, 200_000)
+        else:
+            effective_batch_size = batch_size
 
         # Streaming stats accumulators (tiny: ~24 bytes per voxel)
         ss_res_accumulator = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
@@ -835,8 +847,12 @@ def compute_xval_r2(
         if verbose:
             if data_on_gpu:
                 print(f"  Data on GPU - streaming stats on GPU (fast path)")
+            elif use_gpu_accumulators:
+                accum_mem_mb = n_voxels * 24 / 1e6
+                print(f"  Data on CPU - streaming {effective_batch_size:,} voxel batches to GPU")
+                print(f"  GPU accumulators: {accum_mem_mb:.1f}MB (tiny - avoids transfers)")
             else:
-                print(f"  Data on CPU - streaming to GPU for compute")
+                print(f"  Data on CPU - CPU accumulators")
     else:
         # SLOW MODE: Full accumulators - need to check memory carefully
         # Check if we can fit accumulators on GPU
