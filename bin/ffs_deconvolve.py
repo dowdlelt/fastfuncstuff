@@ -572,34 +572,35 @@ def main():
                 n_basis_per_condition_list = [n_lags] * n_conditions
 
         elif model in ("TENT", "TENTzero"):
-            # TENT: potentially different windows per condition
-            # Build each condition separately and concatenate
+            # TENT: use exact onset times (not binary matrix)
+            # This produces fractional weights for non-TR-locked onsets
             if tent_windows is None:
                 raise RuntimeError("tent_windows should not be None for TENT/TENTzero model")
 
             cond_designs = []
             for cond_idx in range(n_conditions):
-                # Get onset binary for this condition only
-                onset_cond = onsets_binary[:, cond_idx : cond_idx + 1]
+                # Get onset times (in seconds) for this condition in this run
+                onset_times = run_onsets_all_conds[cond_idx]
 
                 # Debug: check if this condition has any onsets
                 if args.verbose and run_idx == 0:
-                    n_onsets = int(onset_cond.sum().item())
                     print(
-                        f"    Condition {cond_idx + 1} ({condition_labels[cond_idx]}): {n_onsets} onsets in run 1"
+                        f"    Condition {cond_idx + 1} ({condition_labels[cond_idx]}): {len(onset_times)} onsets in run 1"
                     )
 
                 # Get window for this condition
                 bot, top = tent_windows[cond_idx]
 
-                # Build design for this condition
-                design_cond = build_glm_design(
-                    onsets=onset_cond,
-                    mode=model.lower(),  # 'tent' or 'tentzero'
+                # Build TENT design for this condition using exact onset times
+                from fastfuncsim.design import make_tent_design
+                design_cond = make_tent_design(
+                    onset_times_list=[onset_times],  # Single condition
+                    bot=bot,
+                    top=top,
                     tr=tr,
-                    tent_bot=bot,
-                    tent_top=top,
-                    tent_n_basis=args.tent_n_basis,
+                    n_timepoints=n_tp,
+                    n_basis=args.tent_n_basis,
+                    zero_edges=(model == "TENTzero"),
                     device=device,
                 )
 

@@ -333,7 +333,7 @@ def basis_tent(x: torch.Tensor, bot: float, mid: float, top: float) -> torch.Ten
 
 
 def make_tent_design(
-    onsets: torch.Tensor,
+    onset_times_list: list[np.ndarray],
     bot: float,
     top: float,
     tr: float,
@@ -346,14 +346,15 @@ def make_tent_design(
     Create TENT basis function design matrix for non-TR-locked onsets
 
     TENT uses piecewise linear splines (tent functions) to model the HRF.
-    Unlike FIR which assumes TR-locked onsets, TENT can handle arbitrary
-    onset times by creating tent basis functions on a microtime grid.
+    Unlike FIR which assumes TR-locked onsets, TENT evaluates basis functions
+    at exact onset times (e.g., 2.3s), producing fractional weights at TRs.
 
     Parameters
     ----------
-    onsets : torch.Tensor
-        (n_timepoints, n_conditions) onset matrix (can be fractional for sub-TR onsets)
-        OR list of onset times in seconds for each condition
+    onset_times_list : list of np.ndarray
+        List of onset time arrays (in seconds), one per condition
+        Each array contains the onset times for that condition
+        Example: [array([2.3, 5.7, 9.1]), array([3.4, 7.2])]
     bot : float
         Start time of HRF window (seconds after stimulus)
     top : float
@@ -377,7 +378,7 @@ def make_tent_design(
     Returns
     -------
     design : torch.Tensor
-        (n_timepoints, n_conditions * n_actual_basis) TENT design matrix
+        (n_timepoints, n_actual_basis) TENT design matrix
         where n_actual_basis = n_basis for TENT, n_basis-2 for TENTzero
 
     Notes
@@ -390,27 +391,24 @@ def make_tent_design(
     TENTzero eliminates the first and last basis functions to force the
     HRF to be zero at t=bot and t=top (continuous start/end at zero).
 
+    Key difference from FIR: TENT evaluates basis functions at **exact**
+    onset times (e.g., 2.3s), not just at TR boundaries. This produces
+    fractional weights when onsets fall between TRs.
+
+    Example: onset at 2.3s, tent centered at 1.0s post-stimulus
+    - At TR 3 (3.0s): relative time = 3.0 - 2.3 = 0.7s
+    - basis_tent(0.7, 0, 1, 2) = 0.7/1.0 = 0.7 (fractional!)
+
     This replicates AFNI's TENT and TENTzero basis functions.
-
-    Examples
-    --------
-    Auto-calculate n_basis for TR spacing:
-    >>> design = make_tent_design(onsets, bot=0, top=20, tr=1.0, n_timepoints=300)
-    >>> # Creates 21 knots at 0, 1, 2, ..., 20 seconds
-
-    Explicit n_basis:
-    >>> design = make_tent_design(onsets, bot=0, top=15, tr=1.0, n_basis=6, n_timepoints=300)
-    >>> # Creates 6 knots with dt = 15/5 = 3 seconds spacing
 
     References
     ----------
     AFNI 3dDeconvolve documentation
     https://afni.nimh.nih.gov/pub/dist/doc/program_help/3dDeconvolve.html
+    AFNI source: https://github.com/afni/afni/blob/master/src/3dDeconvolve.c
     """
     if device is None:
         device = get_device()
-
-    onsets = to_tensor(onsets, device=device)
 
     if bot >= top:
         raise ValueError(f"bot ({bot}) must be < top ({top})")
@@ -422,10 +420,6 @@ def make_tent_design(
 
     if n_basis < 3 if zero_edges else n_basis < 2:
         raise ValueError(f"n_basis must be >= {3 if zero_edges else 2}, got {n_basis}")
-
-    n_conditions = onsets.shape[1] if onsets.ndim > 1 else 1
-    if onsets.ndim == 1:
-        onsets = onsets.unsqueeze(1)
 
     # Calculate knot spacing
     dt = (top - bot) / (n_basis - 1)
@@ -441,60 +435,61 @@ def make_tent_design(
         last_basis_idx = n_basis
 
     # Pre-allocate design matrix
-    design = torch.zeros(
-        n_timepoints, n_conditions * n_actual_basis, device=device
-    )
+    design = torch.zeros(n_timepoints, n_actual_basis, device=device)
 
     # Create time vector for each TR (in seconds)
-    tr_times = torch.arange(n_timepoints, device=device) * tr
+    tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
 
-    # For each condition
-    for cond_idx in range(n_conditions):
-        # Get onset times for this condition (non-zero entries)
-        onset_trs = torch.where(onsets[:, cond_idx] != 0)[0]
+    # Combine all onset times from all conditions
+    all_onset_times = []
+    for onset_array in onset_times_list:
+        all_onset_times.extend(onset_array.tolist())
 
-        if len(onset_trs) == 0:
-            continue
+    if len(all_onset_times) == 0:
+        return design
 
-        # Convert onset TRs to onset times in seconds
-        onset_times = onset_trs.float() * tr
+    # Convert to tensor
+    onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
 
-        # For each basis function
-        basis_col_idx = 0
-        for basis_idx in range(first_basis_idx, last_basis_idx):
-            # Knot position
-            knot_time = bot + basis_idx * dt
+    # For each basis function
+    basis_col_idx = 0
+    for basis_idx in range(first_basis_idx, last_basis_idx):
+        # Tent edges (matching AFNI exactly)
+        if basis_idx == 0:
+            # First tent: slightly before bot to bot+dt
+            tent_bot = bot - 0.00111 * dt
+            tent_mid = bot
+            tent_top = bot + dt
+        elif basis_idx == n_basis - 1:
+            # Last tent: (top-dt) to slightly after top
+            tent_bot = top - dt
+            tent_mid = top
+            tent_top = top + 0.00111 * dt
+        else:
+            # Middle tents: standard spacing
+            tent_bot = bot + (basis_idx - 1) * dt
+            tent_mid = bot + basis_idx * dt
+            tent_top = bot + (basis_idx + 1) * dt
 
-            # Tent edges
-            if basis_idx == 0:
-                # First tent: slightly before bot to bot+dt
-                tent_bot = bot - 0.00111 * dt
-                tent_mid = bot
-                tent_top = bot + dt
-            elif basis_idx == n_basis - 1:
-                # Last tent: (top-dt) to slightly after top
-                tent_bot = top - dt
-                tent_mid = top
-                tent_top = top + 0.00111 * dt
-            else:
-                # Middle tents: standard spacing
-                tent_bot = bot + (basis_idx - 1) * dt
-                tent_mid = bot + basis_idx * dt
-                tent_top = bot + (basis_idx + 1) * dt
+        # For each TR, sum contributions from all onsets
+        for tr_idx in range(n_timepoints):
+            tr_time = tr_idx * tr
 
-            # For each TR, sum contributions from all onsets
-            for onset_t in onset_times:
-                # Time relative to this onset
-                rel_times = tr_times - onset_t
+            # For each onset, calculate relative time and evaluate tent
+            for onset_t in onset_times_tensor:
+                # Time relative to onset (how long after stimulus)
+                rel_time = tr_time - onset_t.item()
 
-                # Evaluate tent basis at these relative times
-                tent_vals = basis_tent(rel_times, tent_bot, tent_mid, tent_top)
+                # Evaluate tent basis at this relative time
+                tent_val = basis_tent(
+                    torch.tensor(rel_time, device=device),
+                    tent_bot, tent_mid, tent_top
+                ).item()
 
-                # Add to design matrix column
-                col_idx = cond_idx * n_actual_basis + basis_col_idx
-                design[:, col_idx] += tent_vals
+                # Add contribution to design matrix
+                design[tr_idx, basis_col_idx] += tent_val
 
-            basis_col_idx += 1
+        basis_col_idx += 1
 
     return design
 
