@@ -552,7 +552,9 @@ def cross_validate_noise_pcs(
 
     # Detect if we can use streaming stats (LORO CV)
     # Need to check this early to determine projection device
-    cv_splits_temp = generate_cv_splits(n_runs=len(run_starts), strategy=cv_strategy, n_perms=n_perms)
+    cv_splits_temp = generate_cv_splits(
+        n_runs=len(run_starts), strategy=cv_strategy, n_perms=n_perms
+    )
     is_loro_temp = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits_temp)
 
     # Projection device: use GPU for LORO (streaming stats save memory), CPU otherwise
@@ -619,10 +621,10 @@ def cross_validate_noise_pcs(
         # Memory: chunk_data + projected train/test data (held during projection before concat)
         # During projection we hold multiple copies, so be conservative
         # Target: 0.6GB for chunk_data to leave ~1-2GB headroom for projection operations
-        target_chunk_memory_gb = 0.6
+        target_chunk_memory_gb = 0.4
         bytes_per_voxel = n_timepoints * 4  # float32
         max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
-        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 50000)
+        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 42000)
     else:
         # Full accumulator: much more memory for storing full predictions per PC
         # Memory: chunk_data + (voxels × timepoints × 4 bytes × n_PCs)
@@ -652,6 +654,7 @@ def cross_validate_noise_pcs(
     # Progress bar for chunks
     try:
         from tqdm import tqdm
+
         chunk_iter = tqdm(range(n_chunks), desc="Denoising CV", unit="chunk")
     except ImportError:
         chunk_iter = range(n_chunks)
@@ -667,16 +670,17 @@ def cross_validate_noise_pcs(
 
         if is_loro:
             # Streaming stats: accumulate ss_res, sum, sum_sq for each PC count
+            # Keep on GPU - they're tiny (~24 bytes/voxel) and avoid 1000s of transfers
             ss_res_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device="cpu")
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device=device)
                 for _ in range(max_components + 1)
             ]
             sum_actual_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device="cpu")
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device=device)
                 for _ in range(max_components + 1)
             ]
             sum_sq_actual_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device="cpu")
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device=device)
                 for _ in range(max_components + 1)
             ]
         else:
@@ -691,7 +695,6 @@ def cross_validate_noise_pcs(
 
         # Cross-validation loop: accumulate predictions or stats for this chunk
         for _, (train_runs, test_runs) in enumerate(cv_splits):
-
             # Build train/test timepoint indices
             train_tps = []
             for run_idx in train_runs:
@@ -901,14 +904,14 @@ def cross_validate_noise_pcs(
 
                 if is_loro:
                     # Streaming stats: accumulate ss_res, sum_actual, sum_sq_actual
-                    # Move to CPU for streaming accumulation (accumulators are on CPU)
-                    test_actual_f64 = test_actual_projected.cpu().double()
-                    y_pred_f64 = y_pred.cpu().double()
+                    # Keep on GPU - accumulators are on GPU, avoid thousands of transfers
+                    test_actual_f64 = test_actual_projected.double()
+                    y_pred_f64 = y_pred.double()
 
                     residuals = test_actual_f64 - y_pred_f64
-                    ss_res_fold = (residuals ** 2).sum(dim=1)
+                    ss_res_fold = (residuals**2).sum(dim=1)
                     sum_fold = test_actual_f64.sum(dim=1)
-                    sum_sq_fold = (test_actual_f64 ** 2).sum(dim=1)
+                    sum_sq_fold = (test_actual_f64**2).sum(dim=1)
 
                     ss_res_by_pc[n_pcs] += ss_res_fold
                     sum_actual_by_pc[n_pcs] += sum_fold
@@ -932,7 +935,7 @@ def cross_validate_noise_pcs(
         # Compute R² for this chunk
         # ================================================================
         if is_loro:
-            # Streaming stats: compute R² from accumulated stats
+            # Streaming stats: compute R² from accumulated stats (on GPU)
             # In LORO, each voxel sees all timepoints exactly once
             for n_pcs in range(max_components + 1):
                 ss_res = ss_res_by_pc[n_pcs]
@@ -941,11 +944,11 @@ def cross_validate_noise_pcs(
 
                 # Compute ss_tot from streaming stats: ss_tot = sum_sq - sum^2 / n
                 mean_actual = sum_act / n_timepoints
-                ss_tot = sum_sq_act - n_timepoints * (mean_actual ** 2)
+                ss_tot = sum_sq_act - n_timepoints * (mean_actual**2)
 
-                # R² = 1 - ss_res / ss_tot
+                # R² = 1 - ss_res / ss_tot (all on GPU, transfer only final result)
                 r2 = (1.0 - ss_res / (ss_tot + 1e-10)).float()
-                r2_maps[chunk_start:chunk_end, n_pcs] = r2.numpy()
+                r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy()
 
             # Free chunk memory
             del ss_res_by_pc, sum_actual_by_pc, sum_sq_actual_by_pc, chunk_data_cpu
