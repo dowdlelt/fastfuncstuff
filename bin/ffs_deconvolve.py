@@ -564,6 +564,11 @@ def main():
                 # Get onset binary for this condition only
                 onset_cond = onsets_binary[:, cond_idx:cond_idx+1]
 
+                # Debug: check if this condition has any onsets
+                if args.verbose and run_idx == 0:
+                    n_onsets = int(onset_cond.sum().item())
+                    print(f"    Condition {cond_idx+1} ({condition_labels[cond_idx]}): {n_onsets} onsets in run 1")
+
                 # Get window for this condition
                 bot, top = tent_windows[cond_idx]
 
@@ -635,12 +640,13 @@ def main():
     data_full = np.concatenate([d for d in data_list], axis=3)
 
     # Apply mask if provided
+    # fit_glm expects (n_voxels, n_timepoints)
     if mask is not None:
-        data_masked = data_full[mask, :].T  # Shape: (n_timepoints, n_voxels)
+        data_masked = data_full[mask, :]  # Shape: (n_voxels, n_timepoints)
         if args.verbose:
             print(f"  Data shape: {data_masked.shape}")
     else:
-        data_masked = data_full.reshape(-1, sum(n_timepoints_per_run)).T
+        data_masked = data_full.reshape(-1, sum(n_timepoints_per_run))  # Shape: (n_voxels, n_timepoints)
         if args.verbose:
             print(f"  Data shape: {data_masked.shape} (all voxels)")
 
