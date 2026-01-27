@@ -652,25 +652,37 @@ def main():
         for basis_idx in range(n_basis):
             column_labels.append(f"{condition_labels[cond_idx]}#{basis_idx}")
 
-    # Add polynomial drift regressors
+    # Add polynomial drift regressors (zero-padded per run)
     if args.polort >= 0:
-        poly_list = []
-        for n_tp in n_timepoints_per_run:
-            poly = legendre_polynomials(n_tp, args.polort)
-            poly_list.append(poly)
+        n_poly_per_run = args.polort + 1
+        total_poly_cols = len(n_timepoints_per_run) * n_poly_per_run
 
-        poly_full = np.vstack(poly_list)
+        # Create zero-padded polynomial matrix
+        poly_full = np.zeros((sum(n_timepoints_per_run), total_poly_cols))
+
+        tr_start = 0
+        col_start = 0
+        for run_idx, n_tp in enumerate(n_timepoints_per_run):
+            # Generate polynomials for this run
+            poly_run = legendre_polynomials(n_tp, args.polort)
+
+            # Place in correct position (zero-padded)
+            poly_full[tr_start:tr_start + n_tp, col_start:col_start + n_poly_per_run] = poly_run
+
+            # Add column labels
+            for poly_idx in range(n_poly_per_run):
+                column_labels.append(f"run{run_idx+1}_poly{poly_idx}")
+
+            tr_start += n_tp
+            col_start += n_poly_per_run
+
         poly_tensor = torch.tensor(poly_full, dtype=torch.float32, device=device)
 
         # Append polynomials to design
         design_full = torch.cat([design_full, poly_tensor], dim=1)
 
-        # Add polynomial column labels
-        for poly_idx in range(poly_full.shape[1]):
-            column_labels.append(f"poly{poly_idx}")
-
         if args.verbose:
-            print(f"  Polynomial drift: {poly_full.shape[1]} regressors (order {args.polort})")
+            print(f"  Polynomial drift: {total_poly_cols} regressors ({n_poly_per_run} per run x {len(n_timepoints_per_run)} runs)")
 
     # Save design matrix if requested
     if args.save_design:
@@ -687,7 +699,8 @@ def main():
             f.write(f"# Design matrix for ffs_deconvolve.py\n")
             f.write(f"# Model: {model}\n")
             f.write(f"# TR: {tr}s\n")
-            f.write(f"# Timepoints: {design_np.shape[0]}\n")
+            f.write(f"# Runs: {len(n_timepoints_per_run)}\n")
+            f.write(f"# Timepoints: {design_np.shape[0]} ({', '.join(map(str, n_timepoints_per_run))})\n")
             f.write(f"# Regressors: {design_np.shape[1]} ({n_stimulus_regressors} stimulus + {design_np.shape[1] - n_stimulus_regressors} nuisance)\n")
 
             if model in ("TENT", "TENTzero"):
@@ -698,6 +711,13 @@ def main():
                         f.write(f"#   {condition_labels[cond_idx]}: {bot}s to {top}s ({n_basis_per_condition_list[cond_idx]} basis)\n")
             elif model == "FIR":
                 f.write(f"# FIR lags: {n_basis_per_condition_list[0]} (duration: {(n_basis_per_condition_list[0]-1)*tr}s)\n")
+
+            if args.polort >= 0:
+                f.write(f"#\n")
+                f.write(f"# Polynomial drift (zero-padded per run):\n")
+                f.write(f"#   Order: {args.polort}\n")
+                f.write(f"#   Regressors per run: {args.polort + 1}\n")
+                f.write(f"#   Total polynomial regressors: {len(n_timepoints_per_run) * (args.polort + 1)}\n")
 
             f.write("#\n")
             f.write("# Column labels:\n")
@@ -724,56 +744,57 @@ def main():
             matplotlib.use('Agg')  # Non-interactive backend
             import matplotlib.pyplot as plt
 
-            # Create figure
-            fig, ax = plt.subplots(figsize=(12, 8))
+            # Create figure (time on vertical axis)
+            fig, ax = plt.subplots(figsize=(10, 12))
 
             # Plot design matrix (no interpolation!)
-            im = ax.imshow(design_np.T, aspect='auto', interpolation='none', cmap='RdBu_r')
+            # Rows = time, Columns = regressors
+            im = ax.imshow(design_np, aspect='auto', interpolation='none', cmap='RdBu_r')
 
             # Add colorbar
             plt.colorbar(im, ax=ax, label='Design value')
 
             # Labels
-            ax.set_xlabel('Time (TRs)', fontsize=12)
-            ax.set_ylabel('Regressor', fontsize=12)
+            ax.set_ylabel('Time (TRs)', fontsize=12)
+            ax.set_xlabel('Regressor', fontsize=12)
             ax.set_title(f'Design Matrix: {model} model ({design_np.shape[0]} TRs x {design_np.shape[1]} regressors)', fontsize=14)
 
-            # Add grid lines between conditions
+            # Add grid lines between stimulus and nuisance
             if n_stimulus_regressors < design_np.shape[1]:
-                # Line between stimulus and nuisance
-                ax.axhline(n_stimulus_regressors - 0.5, color='black', linewidth=2, linestyle='--', alpha=0.7)
+                # Vertical line between stimulus and nuisance
+                ax.axvline(n_stimulus_regressors - 0.5, color='black', linewidth=2, linestyle='--', alpha=0.7)
 
-            # Add vertical lines for run boundaries
+            # Add horizontal lines for run boundaries
             tr_idx = 0
             for run_idx, n_tp in enumerate(n_timepoints_per_run[:-1]):
                 tr_idx += n_tp
-                ax.axvline(tr_idx - 0.5, color='yellow', linewidth=1, linestyle='-', alpha=0.5)
+                ax.axhline(tr_idx - 0.5, color='yellow', linewidth=1, linestyle='-', alpha=0.5)
 
-            # Add horizontal lines between conditions (for TENT with different n_basis)
+            # Add vertical lines between conditions (for TENT with different n_basis)
             if len(set(n_basis_per_condition_list)) > 1:
                 basis_idx = 0
                 for cond_idx, n_basis in enumerate(n_basis_per_condition_list[:-1]):
                     basis_idx += n_basis
-                    ax.axhline(basis_idx - 0.5, color='green', linewidth=1, linestyle='-', alpha=0.5)
+                    ax.axvline(basis_idx - 0.5, color='green', linewidth=1, linestyle='-', alpha=0.5)
 
-            # Set y-tick labels to show condition names
+            # Set x-tick labels to show condition names
             # Show labels at the center of each condition's regressors
-            y_tick_positions = []
-            y_tick_labels = []
+            x_tick_positions = []
+            x_tick_labels = []
             basis_idx = 0
             for cond_idx, n_basis in enumerate(n_basis_per_condition_list):
-                y_tick_positions.append(basis_idx + n_basis / 2)
-                y_tick_labels.append(condition_labels[cond_idx])
+                x_tick_positions.append(basis_idx + n_basis / 2)
+                x_tick_labels.append(condition_labels[cond_idx])
                 basis_idx += n_basis
 
             if args.polort >= 0:
                 # Add label for polynomials
                 poly_n = design_np.shape[1] - n_stimulus_regressors
-                y_tick_positions.append(n_stimulus_regressors + poly_n / 2)
-                y_tick_labels.append('polort')
+                x_tick_positions.append(n_stimulus_regressors + poly_n / 2)
+                x_tick_labels.append('polort')
 
-            ax.set_yticks(y_tick_positions)
-            ax.set_yticklabels(y_tick_labels)
+            ax.set_xticks(x_tick_positions)
+            ax.set_xticklabels(x_tick_labels)
 
             # Tight layout
             plt.tight_layout()
