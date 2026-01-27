@@ -136,8 +136,8 @@ def parse_args():
         nargs="+",
         metavar="WINDOW",
         help="TENT window(s) in seconds after stimulus onset. "
-             "Formats: '0 15' (all conditions), '0,15' (all conditions), "
-             "or '0,15 0,20 0,25' (per-condition). For TENT/TENTzero models.",
+        "Formats: '0 15' (all conditions), '0,15' (all conditions), "
+        "or '0,15 0,20 0,25' (per-condition). For TENT/TENTzero models.",
     )
 
     model_opts.add_argument(
@@ -194,6 +194,12 @@ def parse_args():
     )
 
     out_opts.add_argument(
+        "-save_design",
+        action="store_true",
+        help="Save design matrix as .1D file (AFNI format)",
+    )
+
+    out_opts.add_argument(
         "-verbose",
         action="store_true",
         help="Print detailed progress information",
@@ -247,11 +253,11 @@ def parse_tent_windows(tent_window_args, n_conditions):
         return None
 
     # Check if we have comma-separated pairs
-    if all(',' in arg for arg in tent_window_args):
+    if all("," in arg for arg in tent_window_args):
         # Format: ['0,15', '0,20', ...] (per-condition)
         windows = []
         for arg in tent_window_args:
-            parts = arg.split(',')
+            parts = arg.split(",")
             if len(parts) != 2:
                 raise ValueError(f"Invalid tent_window format: '{arg}'. Expected 'bot,top'")
             try:
@@ -306,7 +312,7 @@ def main():
     parser = parse_args()
 
     # Check for help flag before parsing (to bypass required argument checks)
-    if '-help' in sys.argv or '--help' in sys.argv:
+    if "-help" in sys.argv or "--help" in sys.argv:
         print_help(parser)
         return 0
 
@@ -346,7 +352,7 @@ def main():
             return 1
         condition_labels = args.labels
     else:
-        condition_labels = [f"cond{i+1}" for i in range(n_conditions)]
+        condition_labels = [f"cond{i + 1}" for i in range(n_conditions)]
 
     if args.verbose:
         print(f"  Condition labels: {', '.join(condition_labels)}")
@@ -361,7 +367,7 @@ def main():
 
     for i, input_file in enumerate(args.input):
         if args.verbose:
-            print(f"  Run {i+1}: {input_file}")
+            print(f"  Run {i + 1}: {input_file}")
 
         if not Path(input_file).exists():
             print(f"ERROR: Input file not found: {input_file}", file=sys.stderr)
@@ -421,7 +427,9 @@ def main():
 
         n_voxels = np.sum(mask)
         if args.verbose:
-            print(f"  Mask: {n_voxels} / {nx*ny*nz} voxels ({100*n_voxels/(nx*ny*nz):.1f}%)")
+            print(
+                f"  Mask: {n_voxels} / {nx * ny * nz} voxels ({100 * n_voxels / (nx * ny * nz):.1f}%)"
+            )
 
     # Load onsets
     if args.verbose:
@@ -457,12 +465,14 @@ def main():
         if is_locked:
             model = "FIR"
             if args.verbose:
-                print(f"\n✓ Onsets are TR-locked (threshold: {args.tr_lock_threshold*100:.0f}%)")
+                print(f"\n✓ Onsets are TR-locked (threshold: {args.tr_lock_threshold * 100:.0f}%)")
                 print("  Using FIR model")
         else:
             model = "TENT"
             if args.verbose:
-                print(f"\n✗ Onsets are NOT TR-locked (threshold: {args.tr_lock_threshold*100:.0f}%)")
+                print(
+                    f"\n✗ Onsets are NOT TR-locked (threshold: {args.tr_lock_threshold * 100:.0f}%)"
+                )
                 print("  Using TENT model")
     else:
         model = args.model
@@ -490,7 +500,10 @@ def main():
                 # Use duration for all conditions
                 tent_windows = [(0.0, args.duration)] * n_conditions
             else:
-                print("ERROR: Either -tent_window or -duration required for TENT model", file=sys.stderr)
+                print(
+                    "ERROR: Either -tent_window or -duration required for TENT model",
+                    file=sys.stderr,
+                )
                 return 1
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -507,7 +520,9 @@ def main():
                     n_basis_calc = args.tent_n_basis
                 n_actual = n_basis_calc - 2 if model == "TENTzero" else n_basis_calc
                 print(f"  Window: {bot}s to {top}s (all conditions)")
-                print(f"  Basis functions: {n_basis_calc} knots → {n_actual} regressors per condition")
+                print(
+                    f"  Basis functions: {n_basis_calc} knots → {n_actual} regressors per condition"
+                )
             else:
                 print(f"  Windows (per condition):")
                 for i, (bot, top) in enumerate(tent_windows):
@@ -516,8 +531,9 @@ def main():
                     else:
                         n_basis_calc = args.tent_n_basis
                     n_actual = n_basis_calc - 2 if model == "TENTzero" else n_basis_calc
-                    print(f"    {condition_labels[i]}: {bot}s to {top}s ({n_basis_calc} knots → {n_actual} regressors)")
-
+                    print(
+                        f"    {condition_labels[i]}: {bot}s to {top}s ({n_basis_calc} knots → {n_actual} regressors)"
+                    )
 
     # Build design matrices
     if args.verbose:
@@ -531,8 +547,10 @@ def main():
         run_onsets_all_conds = [onsets_per_condition[cond][run_idx] for cond in range(n_conditions)]
 
         # Convert to TR-resolution binary matrix (for FIR/TENT, no convolution)
+        # onsets_to_tr_matrix expects [condition][run] format, so convert:
+        # from [cond1_run0, cond2_run0] to [[cond1_run0], [cond2_run0]]
         onsets_binary = onsets_to_tr_matrix(
-            [run_onsets_all_conds],  # Wrap for single-run format
+            [[onset] for onset in run_onsets_all_conds],  # Convert to [condition][run] format
             n_timepoints=n_tp,
             tr=tr,
         )
@@ -562,12 +580,14 @@ def main():
             cond_designs = []
             for cond_idx in range(n_conditions):
                 # Get onset binary for this condition only
-                onset_cond = onsets_binary[:, cond_idx:cond_idx+1]
+                onset_cond = onsets_binary[:, cond_idx : cond_idx + 1]
 
                 # Debug: check if this condition has any onsets
                 if args.verbose and run_idx == 0:
                     n_onsets = int(onset_cond.sum().item())
-                    print(f"    Condition {cond_idx+1} ({condition_labels[cond_idx]}): {n_onsets} onsets in run 1")
+                    print(
+                        f"    Condition {cond_idx + 1} ({condition_labels[cond_idx]}): {n_onsets} onsets in run 1"
+                    )
 
                 # Get window for this condition
                 bot, top = tent_windows[cond_idx]
@@ -591,14 +611,14 @@ def main():
 
             # Concatenate conditions horizontally
             if args.verbose and run_idx == 0:
-                print(f"  DEBUG: Per-condition designs for run {run_idx+1}:")
+                print(f"  DEBUG: Per-condition designs for run {run_idx + 1}:")
                 for i, d in enumerate(cond_designs):
-                    print(f"    Condition {i+1}: {d.shape}")
+                    print(f"    Condition {i + 1}: {d.shape}")
 
             design = torch.cat(cond_designs, dim=1)
 
             if args.verbose and run_idx == 0:
-                print(f"  DEBUG: Concatenated design for run {run_idx+1}: {design.shape}")
+                print(f"  DEBUG: Concatenated design for run {run_idx + 1}: {design.shape}")
 
         design_list.append(design)
 
@@ -610,11 +630,20 @@ def main():
     if args.verbose:
         print(f"  Design matrix shape: {design_full.shape}")
         if len(set(n_basis_per_condition_list)) == 1:
-            print(f"  Stimulus regressors: {n_stimulus_regressors} ({n_basis_per_condition_list[0]} per condition)")
+            print(
+                f"  Stimulus regressors: {n_stimulus_regressors} ({n_basis_per_condition_list[0]} per condition)"
+            )
         else:
             print(f"  Stimulus regressors: {n_stimulus_regressors}")
             for i, n_basis in enumerate(n_basis_per_condition_list):
                 print(f"    {condition_labels[i]}: {n_basis} regressors")
+
+    # Create column labels for design matrix
+    column_labels = []
+    for cond_idx in range(n_conditions):
+        n_basis = n_basis_per_condition_list[cond_idx]
+        for basis_idx in range(n_basis):
+            column_labels.append(f"{condition_labels[cond_idx]}#{basis_idx}")
 
     # Add polynomial drift regressors
     if args.polort >= 0:
@@ -629,8 +658,50 @@ def main():
         # Append polynomials to design
         design_full = torch.cat([design_full, poly_tensor], dim=1)
 
+        # Add polynomial column labels
+        for poly_idx in range(poly_full.shape[1]):
+            column_labels.append(f"poly{poly_idx}")
+
         if args.verbose:
             print(f"  Polynomial drift: {poly_full.shape[1]} regressors (order {args.polort})")
+
+    # Save design matrix if requested
+    if args.save_design:
+        design_file = f"{args.prefix}_design.1D"
+        design_np = design_full.cpu().numpy()
+
+        if args.verbose:
+            print(f"\nSaving design matrix...")
+            print(f"  {design_file}")
+
+        # Save as AFNI .1D format with header
+        with open(design_file, 'w') as f:
+            # Write metadata header
+            f.write(f"# Design matrix for ffs_deconvolve.py\n")
+            f.write(f"# Model: {model}\n")
+            f.write(f"# TR: {tr}s\n")
+            f.write(f"# Timepoints: {design_np.shape[0]}\n")
+            f.write(f"# Regressors: {design_np.shape[1]} ({n_stimulus_regressors} stimulus + {design_np.shape[1] - n_stimulus_regressors} nuisance)\n")
+
+            if model in ("TENT", "TENTzero"):
+                f.write(f"# TENT windows:\n")
+                for cond_idx in range(n_conditions):
+                    if tent_windows is not None:
+                        bot, top = tent_windows[cond_idx]
+                        f.write(f"#   {condition_labels[cond_idx]}: {bot}s to {top}s ({n_basis_per_condition_list[cond_idx]} basis)\n")
+            elif model == "FIR":
+                f.write(f"# FIR lags: {n_basis_per_condition_list[0]} (duration: {(n_basis_per_condition_list[0]-1)*tr}s)\n")
+
+            f.write("#\n")
+            f.write("# Column labels:\n")
+            f.write("# " + " ".join(column_labels) + "\n")
+
+            # Write data
+            for row in design_np:
+                f.write(" ".join(f"{val:.6f}" for val in row) + "\n")
+
+        if args.verbose:
+            print(f"  ✓ Design matrix saved ({design_np.shape[0]} rows x {design_np.shape[1]} cols)")
 
     # Prepare data
     if args.verbose:
@@ -646,12 +717,14 @@ def main():
         if args.verbose:
             print(f"  Data shape: {data_masked.shape}")
     else:
-        data_masked = data_full.reshape(-1, sum(n_timepoints_per_run))  # Shape: (n_voxels, n_timepoints)
+        data_masked = data_full.reshape(
+            -1, sum(n_timepoints_per_run)
+        )  # Shape: (n_voxels, n_timepoints)
         if args.verbose:
             print(f"  Data shape: {data_masked.shape} (all voxels)")
 
     # Convert to CPU tensor (will be chunked to GPU during fitting)
-    data_tensor = torch.tensor(data_masked, dtype=torch.float32, device='cpu')
+    data_tensor = torch.tensor(data_masked, dtype=torch.float32, device="cpu")
 
     # Fit GLM with chunking
     if args.verbose:
@@ -659,13 +732,15 @@ def main():
         print(f"  Design: {design_full.shape}")
         print(f"  Data: {data_tensor.shape}")
 
+    # TODO estimate chunk size based on GPU memroy, n_voxels * timepoints * 4 bytes, and design matrix size
+
     results = fit_glm(
         data=data_tensor,
         design=design_full,
         tr=tr,
         device=device,
         preload_data_to_device=False,  # Stream chunks to GPU
-        chunk_size=10000,  # Voxels per chunk
+        chunk_size=60000,  # Voxels per chunk
         verbose=args.verbose,
     )
 
@@ -689,7 +764,7 @@ def main():
         n_basis = n_basis_per_condition_list[cond_idx]
 
         # Extract betas for this condition
-        betas_cond = betas_stimulus[:, beta_col_idx:beta_col_idx + n_basis]
+        betas_cond = betas_stimulus[:, beta_col_idx : beta_col_idx + n_basis]
         beta_col_idx += n_basis
 
         # Reshape to 4D (nx, ny, nz, n_basis)
