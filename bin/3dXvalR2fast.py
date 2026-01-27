@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 try:
-    from fastfuncsim.afni_io import extract_design_metadata, read_afni_design_matrix
+    from fastfuncsim.afni_io import extract_design_metadata, read_afni_design_matrix, load_nifti
     from fastfuncsim.utils import get_device
     from fastfuncsim.xval import compute_xval_r2, generate_cv_splits
 except ImportError as e:
@@ -294,10 +294,9 @@ def main():
 
     # Load data
     print("📂 Loading data...")
-    import nibabel as nib
 
     # Get volume shape and affine from first file
-    first_img = nib.load(input_files[0])
+    first_img = load_nifti(input_files[0])
     volume_shape = first_img.shape[:3]  # type: ignore[attr-defined]
     affine = first_img.affine  # type: ignore[attr-defined]
 

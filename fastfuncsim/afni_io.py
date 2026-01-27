@@ -44,6 +44,8 @@ Examples
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+import subprocess
+import tempfile
 
 import numpy as np
 import torch
@@ -57,6 +59,86 @@ except ImportError as exc:  # pragma: no cover - nibabel is required for AFNI in
     ) from exc
 
 from .utils import get_device, to_tensor
+
+
+def load_nifti(filepath: Union[str, Path]) -> nib.Nifti1Image:
+    """
+    Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to NIfTI file. Supports:
+        - .nii (uncompressed)
+        - .nii.gz (gzip compressed)
+        - .nii.zst (zstandard compressed)
+
+    Returns
+    -------
+    nib.Nifti1Image
+        Loaded NIfTI image
+
+    Examples
+    --------
+    >>> img = load_nifti('func.nii.gz')
+    >>> img = load_nifti('func.nii.zst')
+    >>> data = img.get_fdata()
+
+    Notes
+    -----
+    For .nii.zst files, requires zstd to be installed and available in PATH.
+    The file is decompressed to a temporary file before loading with nibabel.
+    """
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    # Handle .nii.zst files by decompressing through zstd
+    if str(filepath).endswith('.nii.zst'):
+        # Check if zstd is available
+        try:
+            subprocess.run(['zstd', '--version'], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise RuntimeError(
+                "zstd is not installed or not available in PATH. "
+                "Install zstd to load .nii.zst files."
+            )
+
+        # Decompress to temporary file
+        with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Decompress: zstd -dc input.nii.zst > output.nii
+            with open(tmp_path, 'wb') as out_file:
+                subprocess.run(
+                    ['zstd', '-dc', str(filepath)],
+                    stdout=out_file,
+                    check=True,
+                    stderr=subprocess.PIPE
+                )
+
+            # Load the decompressed file
+            img = nib.load(tmp_path)
+
+            # Load data into memory and create new image to avoid lazy loading issues
+            # This ensures the temp file can be safely deleted
+            data = img.get_fdata()
+            affine = img.affine
+            header = img.header.copy()
+
+            # Create new image from in-memory data
+            img_inmem = nib.Nifti1Image(data, affine, header)
+
+        finally:
+            # Clean up temporary file
+            Path(tmp_path).unlink(missing_ok=True)
+
+        return img_inmem
+
+    # Standard nibabel loading for .nii and .nii.gz
+    return nib.load(str(filepath))
 
 
 def read_afni_onset_file(filepath: Union[str, Path]) -> List[np.ndarray]:
@@ -593,8 +675,9 @@ def load_and_concatenate_runs(
     ----------
     run_files : list of str or Path
         Paths to neuroimaging files, one per run
-        Supports: NIfTI (.nii, .nii.gz) and AFNI (.HEAD, .BRIK, .BRIK.gz)
+        Supports: NIfTI (.nii, .nii.gz, .nii.zst) and AFNI (.HEAD, .BRIK, .BRIK.gz)
         For AFNI files, provide either .HEAD or .BRIK path
+        Note: .nii.zst requires zstd to be installed
     device : torch.device, optional
         Device for output tensor (ignored if keep_on_cpu=True)
     keep_on_cpu : bool, default=False
@@ -649,7 +732,7 @@ def load_and_concatenate_runs(
 
     for i, run_file in run_iterator:
         # Load run
-        img = nib.load(str(run_file))
+        img = load_nifti(run_file)
         data_np = img.get_fdata(dtype=np.float32)
 
         # Reshape to (n_voxels, n_timepoints)
@@ -705,7 +788,7 @@ def load_afni_mask(
     Parameters
     ----------
     mask_file : str or Path
-        Path to the mask file (NIfTI or AFNI BRIK/HEAD format).
+        Path to the mask file (NIfTI .nii/.nii.gz/.nii.zst or AFNI BRIK/HEAD format).
     threshold : float, optional
         Values strictly greater than this threshold are treated as inside the mask.
 
@@ -724,7 +807,7 @@ def load_afni_mask(
     if not mask_path.exists():
         raise FileNotFoundError(f"Mask file not found: {mask_path}")
 
-    img = nib.load(str(mask_path))
+    img = load_nifti(mask_path)
     data = img.get_fdata(dtype=np.float32)
 
     # Squeeze out singleton dimensions (common in AFNI masks)
@@ -1129,6 +1212,8 @@ def replace_afni_extension(filepath: str, new_extension: str = ".nii.gz") -> str
     'stats.nii.gz'
     >>> replace_afni_extension("stats.blur.2mm", ".nii.gz")
     'stats.blur.2mm.nii.gz'
+    >>> replace_afni_extension("stats.nii.zst", ".nii.gz")
+    'stats.nii.gz'
     """
     # Define known extensions (order matters - check longest first!)
     EXTENSIONS = [
@@ -1138,7 +1223,8 @@ def replace_afni_extension(filepath: str, new_extension: str = ".nii.gz") -> str
         "+tlrc.BRIK",  # AFNI uncompressed
         "+orig.HEAD",
         "+tlrc.HEAD",  # AFNI headers
-        ".nii.gz",  # NIfTI compressed
+        ".nii.zst",  # NIfTI zstandard compressed
+        ".nii.gz",  # NIfTI gzip compressed
         ".nii",  # NIfTI uncompressed
     ]
 
@@ -1172,7 +1258,7 @@ def get_tr_from_file(filepath: Union[str, Path]) -> float:
     >>> print(f"TR = {tr}s")
     """
     try:
-        img = nib.load(filepath)
+        img = load_nifti(filepath)
         tr = img.header.get_zooms()[-1]  # Last dimension is time  # type: ignore[attr-defined]
         if tr == 0 or tr is None:
             print(f"WARNING: TR not found in {filepath} header, using 1.0")
@@ -1195,9 +1281,9 @@ def load_fmri_data(
     Parameters
     ----------
     fmri_file : str or Path
-        Path to 4D fMRI file
+        Path to 4D fMRI file (supports .nii, .nii.gz, .nii.zst)
     mask_file : str or Path
-        Path to 3D mask file (values > 0 define brain voxels)
+        Path to 3D mask file (values > 0 define brain voxels, supports .nii, .nii.gz, .nii.zst)
     dtype : np.dtype, default=np.float32
         Data type for output array
 
@@ -1212,14 +1298,14 @@ def load_fmri_data(
     >>> print(f"Shape: {data.shape}")  # (n_timepoints, n_voxels)
     """
     # Load fMRI data
-    fmri_img = nib.load(str(fmri_file))
+    fmri_img = load_nifti(fmri_file)
     fmri_data = fmri_img.get_fdata()
 
     if fmri_data.ndim != 4:
         raise ValueError(f"fMRI data must be 4D, got {fmri_data.ndim}D")
 
     # Load mask
-    mask_img = nib.load(str(mask_file))
+    mask_img = load_nifti(mask_file)
     mask_data = mask_img.get_fdata()
 
     if mask_data.ndim != 3:

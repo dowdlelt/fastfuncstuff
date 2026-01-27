@@ -46,7 +46,7 @@ from fastfuncsim.design_builder import (
     write_afni_xmat,
     parse_glt_string,
 )
-from fastfuncsim.afni_io import get_tr_from_file
+from fastfuncsim.afni_io import get_tr_from_file, load_nifti
 
 try:
     import nibabel as nib
@@ -187,7 +187,7 @@ def get_input_metadata(input_files: List[str], tr_override: Optional[float] = No
             raise FileNotFoundError(f"Input file not found: {input_file}")
 
         # Load image
-        img = nib.load(str(path))
+        img = load_nifti(path)
 
         # Get number of timepoints (4th dimension)
         n_timepoints = img.shape[3] if len(img.shape) > 3 else 1

@@ -42,6 +42,7 @@ try:
     from fastfuncsim.afni_io import (
         load_afni_mask,
         load_and_concatenate_runs,
+        load_nifti,
     )
     from fastfuncsim.design_builder import (
         parse_afni_timing_file,
@@ -645,7 +646,7 @@ def main():
 
     # Estimate dataset size for GPU memory management
     # Load first file to estimate size
-    first_img = nib.load(input_files[0])
+    first_img = load_nifti(input_files[0])
     if hasattr(first_img, "shape"):
         n_voxels_per_run = first_img.shape[0] * first_img.shape[1] * first_img.shape[2]
         n_timepoints_per_run = (
@@ -712,7 +713,7 @@ def main():
             tqdm(input_files, desc="  Loading & blurring", unit="run")
         ):
             # Load as 4D numpy array
-            img = nib.load(run_file)
+            img = load_nifti(run_file)
             data_4d = img.get_fdata(dtype=np.float32)
 
             if data_4d.ndim != 4:

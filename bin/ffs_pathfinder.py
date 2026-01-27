@@ -58,6 +58,7 @@ try:
     from fastfuncsim.afni_io import (
         load_afni_mask,
         load_and_concatenate_runs,
+        load_nifti,
     )
     from fastfuncsim.denoise import (
         extract_noise_pcs_per_run,
@@ -1406,7 +1407,7 @@ def main():
         mask = load_afni_mask(args.mask)
         print(f"  Mask: {args.mask} ({mask.sum():,} voxels)")
 
-    first_img = nib.load(input_files[0])
+    first_img = load_nifti(input_files[0])
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
     volume_shape = tuple(first_img.shape[:3])
     voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
@@ -1443,7 +1444,7 @@ def main():
         current_timepoint = 0
 
         for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading & blurring")):
-            img = nib.load(run_file)
+            img = load_nifti(run_file)
             data_4d = img.get_fdata(dtype=np.float32)
             data_4d_blurred = gaussian_blur_3d(
                 data_4d, fwhm_mm=args.do_blur, voxel_sizes=voxel_sizes, device=device, verbose=False

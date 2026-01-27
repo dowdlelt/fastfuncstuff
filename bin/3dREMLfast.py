@@ -38,6 +38,7 @@ try:
         read_afni_design_matrix,
         replace_afni_extension,
         get_tr_from_file,
+        load_nifti,
     )
     from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
 except ImportError as e:
@@ -990,7 +991,7 @@ def main():
         from tqdm import tqdm
 
         # Get header info from first file
-        first_img = nib.load(input_files[0])
+        first_img = load_nifti(input_files[0])
         affine = first_img.affine
         volume_shape = first_img.shape[:3]
         voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
@@ -1017,7 +1018,7 @@ def main():
             print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
 
         for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading runs", unit="run")):
-            img = nib.load(run_file)
+            img = load_nifti(run_file)
             data_4d = img.get_fdata(dtype=np.float32)
 
             if data_4d.ndim != 4:
@@ -1129,9 +1130,7 @@ def main():
             print(f"   (Skipping grid search - saves ~80% compute time)")
 
             try:
-                import nibabel as nib
-
-                rvar_img = nib.load(str(rvar_path))
+                rvar_img = load_nifti(rvar_path)
                 rvar_data = rvar_img.get_fdata()  # (x, y, z, n_params)
 
                 # Validate dimensions
