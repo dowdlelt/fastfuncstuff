@@ -585,7 +585,15 @@ def main():
                     n_basis_per_condition_list.append(design_cond.shape[1])
 
             # Concatenate conditions horizontally
+            if args.verbose and run_idx == 0:
+                print(f"  DEBUG: Per-condition designs for run {run_idx+1}:")
+                for i, d in enumerate(cond_designs):
+                    print(f"    Condition {i+1}: {d.shape}")
+
             design = torch.cat(cond_designs, dim=1)
+
+            if args.verbose and run_idx == 0:
+                print(f"  DEBUG: Concatenated design for run {run_idx+1}: {design.shape}")
 
         design_list.append(design)
 
@@ -636,11 +644,12 @@ def main():
         if args.verbose:
             print(f"  Data shape: {data_masked.shape} (all voxels)")
 
-    data_tensor = torch.tensor(data_masked, dtype=torch.float32, device=device)
+    # Convert to CPU tensor (will be chunked to GPU during fitting)
+    data_tensor = torch.tensor(data_masked, dtype=torch.float32, device='cpu')
 
-    # Fit GLM
+    # Fit GLM with chunking
     if args.verbose:
-        print(f"\nFitting GLM...")
+        print(f"\nFitting GLM (chunked for GPU memory)...")
         print(f"  Design: {design_full.shape}")
         print(f"  Data: {data_tensor.shape}")
 
@@ -649,6 +658,9 @@ def main():
         design=design_full,
         tr=tr,
         device=device,
+        preload_data_to_device=False,  # Stream chunks to GPU
+        chunk_size=10000,  # Voxels per chunk
+        verbose=args.verbose,
     )
 
     if args.verbose:
