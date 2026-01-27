@@ -200,6 +200,12 @@ def parse_args():
     )
 
     out_opts.add_argument(
+        "-save_design_plot",
+        action="store_true",
+        help="Save design matrix visualization (PNG image)",
+    )
+
+    out_opts.add_argument(
         "-verbose",
         action="store_true",
         help="Print detailed progress information",
@@ -703,6 +709,84 @@ def main():
 
         if args.verbose:
             print(f"  ✓ Design matrix saved ({design_np.shape[0]} rows x {design_np.shape[1]} cols)")
+
+    # Save design matrix plot if requested
+    if args.save_design_plot:
+        design_plot_file = f"{args.prefix}_design.png"
+        design_np = design_full.cpu().numpy()
+
+        if args.verbose:
+            print(f"\nSaving design matrix plot...")
+            print(f"  {design_plot_file}")
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+
+            # Create figure
+            fig, ax = plt.subplots(figsize=(12, 8))
+
+            # Plot design matrix (no interpolation!)
+            im = ax.imshow(design_np.T, aspect='auto', interpolation='none', cmap='RdBu_r')
+
+            # Add colorbar
+            plt.colorbar(im, ax=ax, label='Design value')
+
+            # Labels
+            ax.set_xlabel('Time (TRs)', fontsize=12)
+            ax.set_ylabel('Regressor', fontsize=12)
+            ax.set_title(f'Design Matrix: {model} model ({design_np.shape[0]} TRs x {design_np.shape[1]} regressors)', fontsize=14)
+
+            # Add grid lines between conditions
+            if n_stimulus_regressors < design_np.shape[1]:
+                # Line between stimulus and nuisance
+                ax.axhline(n_stimulus_regressors - 0.5, color='black', linewidth=2, linestyle='--', alpha=0.7)
+
+            # Add vertical lines for run boundaries
+            tr_idx = 0
+            for run_idx, n_tp in enumerate(n_timepoints_per_run[:-1]):
+                tr_idx += n_tp
+                ax.axvline(tr_idx - 0.5, color='yellow', linewidth=1, linestyle='-', alpha=0.5)
+
+            # Add horizontal lines between conditions (for TENT with different n_basis)
+            if len(set(n_basis_per_condition_list)) > 1:
+                basis_idx = 0
+                for cond_idx, n_basis in enumerate(n_basis_per_condition_list[:-1]):
+                    basis_idx += n_basis
+                    ax.axhline(basis_idx - 0.5, color='green', linewidth=1, linestyle='-', alpha=0.5)
+
+            # Set y-tick labels to show condition names
+            # Show labels at the center of each condition's regressors
+            y_tick_positions = []
+            y_tick_labels = []
+            basis_idx = 0
+            for cond_idx, n_basis in enumerate(n_basis_per_condition_list):
+                y_tick_positions.append(basis_idx + n_basis / 2)
+                y_tick_labels.append(condition_labels[cond_idx])
+                basis_idx += n_basis
+
+            if args.polort >= 0:
+                # Add label for polynomials
+                poly_n = design_np.shape[1] - n_stimulus_regressors
+                y_tick_positions.append(n_stimulus_regressors + poly_n / 2)
+                y_tick_labels.append('polort')
+
+            ax.set_yticks(y_tick_positions)
+            ax.set_yticklabels(y_tick_labels)
+
+            # Tight layout
+            plt.tight_layout()
+
+            # Save
+            plt.savefig(design_plot_file, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            if args.verbose:
+                print(f"  ✓ Design matrix plot saved")
+
+        except ImportError:
+            print("WARNING: matplotlib not available, skipping design plot", file=sys.stderr)
 
     # Prepare data
     if args.verbose:
