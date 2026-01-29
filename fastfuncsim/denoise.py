@@ -1668,8 +1668,8 @@ def fit_denoising_model(
                 verbose=False,
             )
 
-            # Store R² values for this group
-            initial_r2[voxel_mask] = xval_results['r2']  # Task-only R²
+            # Store R² values for this group (ensure same device)
+            initial_r2[voxel_mask] = xval_results['r2'].to(initial_r2.device)  # Task-only R²
 
         if verbose:
             print(f"\n  Unified noise pool created from {n_voxels:,} voxels across all HRFs")
