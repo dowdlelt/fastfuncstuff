@@ -1647,12 +1647,15 @@ def main():
             f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}"
         )
     else:
+        # Per-HRF mode: get shape from first design matrix
+        first_hrf_idx = list(designs_by_hrf.keys())[0]
+        n_task_cols = designs_by_hrf[first_hrf_idx].shape[1]
         print(
-            f"  Task predictors: {task_design_per_voxel.shape[1]} ({', '.join(condition_labels)})"
+            f"  Task predictors: {n_task_cols} ({', '.join(condition_labels)})"
         )
         print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
         print(
-            f"  Total columns per run: {task_design_per_voxel.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design_per_voxel.shape[1] + nuisance_per_run[0].shape[1]}"
+            f"  Total columns per run: {n_task_cols} task + {nuisance_per_run[0].shape[1]} nuisance = {n_task_cols + nuisance_per_run[0].shape[1]}"
         )
 
     # ==========================================================================
