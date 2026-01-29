@@ -487,10 +487,10 @@ def fit_glm_with_noise_pcs(
 
 def cross_validate_noise_pcs(
     data: torch.Tensor,
-    design_matrix: torch.Tensor,
-    noise_pcs: List[torch.Tensor],
-    run_starts: List[int],
-    tr: float,
+    design_matrix: Optional[torch.Tensor] = None,
+    noise_pcs: List[torch.Tensor] = None,
+    run_starts: List[int] = None,
+    tr: float = None,
     max_components: int = 20,
     nuisance: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
     metric: Literal["mean", "median"] = "median",
@@ -500,6 +500,8 @@ def cross_validate_noise_pcs(
     preload_data_to_device: bool = True,
     device: Optional[torch.device] = None,
     verbose: bool = False,
+    designs_by_hrf: Optional[dict] = None,
+    hrf_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for ALL voxels.
@@ -509,6 +511,10 @@ def cross_validate_noise_pcs(
     - Train on N-1 runs WITH k PCs in model
     - Predict held-out run using task betas only
     - Concatenate predictions across folds, compute single R² per voxel
+
+    Supports two modes:
+    - Standard: Single design_matrix for all voxels
+    - Per-HRF: designs_by_hrf + hrf_indices for voxel-specific HRFs
 
     Memory optimization:
     - LORO (leave-one-run-out): Uses streaming stats (ss_res, sum, sum_sq)
@@ -521,8 +527,14 @@ def cross_validate_noise_pcs(
     ----------
     data : torch.Tensor, shape (n_voxels, n_timepoints)
         Raw fMRI data
-    design_matrix : torch.Tensor, shape (n_timepoints, n_predictors)
-        Task design matrix (shared across runs)
+    design_matrix : torch.Tensor, optional, shape (n_timepoints, n_predictors)
+        Task design matrix (shared across runs). Used in standard mode.
+        Mutually exclusive with designs_by_hrf.
+    designs_by_hrf : dict, optional
+        Dictionary mapping HRF indices to design matrices. Used in per-HRF mode.
+        Mutually exclusive with design_matrix.
+    hrf_indices : torch.Tensor, optional, shape (n_voxels,)
+        Integer tensor mapping voxels to HRF indices. Required with designs_by_hrf.
     noise_pcs : list of torch.Tensor
         PC timecourses per run from noise pool (already nuisance-projected)
     run_starts : list of int
@@ -553,6 +565,17 @@ def cross_validate_noise_pcs(
     if isinstance(device, str):
         device = torch.device(device)
     device = device or get_device()
+
+    # Validate inputs
+    if design_matrix is None and designs_by_hrf is None:
+        raise ValueError("Either design_matrix or designs_by_hrf must be provided")
+    if design_matrix is not None and designs_by_hrf is not None:
+        raise ValueError("Cannot provide both design_matrix and designs_by_hrf")
+    if designs_by_hrf is not None and hrf_indices is None:
+        raise ValueError("hrf_indices required when designs_by_hrf is provided")
+
+    # Determine mode
+    per_hrf_mode = designs_by_hrf is not None
 
     # Detect if we can use streaming stats (LORO CV)
     # Need to check this early to determine projection device
@@ -1393,9 +1416,9 @@ def compute_xval_r2_optimal_full(
 
 def fit_denoising_model(
     data: torch.Tensor,
-    design_matrix: torch.Tensor,
-    run_starts: List[int],
-    tr: float,
+    design_matrix: Optional[torch.Tensor] = None,
+    run_starts: List[int] = None,
+    tr: float = None,
     initial_r2: Optional[torch.Tensor] = None,
     r2_threshold: float = 0.05,
     intensity_mask: Optional[torch.Tensor] = None,
@@ -1416,24 +1439,41 @@ def fit_denoising_model(
     r2_method: str = "auto",
     device: Optional[torch.device] = None,
     verbose: bool = False,
+    designs_by_hrf: Optional[dict] = None,
+    hrf_indices: Optional[torch.Tensor] = None,
 ) -> DenoiseResults:
     """
     Fit cross-validated denoising model
 
     Complete pipeline:
     1. Compute initial R² (if not provided) to select noise/criteria voxels
-    2. Extract PCs from noise pool voxels per run (after projecting out polynomial drift)
+       - Standard mode: Use single design_matrix for all voxels
+       - Per-HRF mode: Use designs_by_hrf + hrf_indices for per-voxel HRFs
+    2. Extract PCs from unified noise pool (after projecting out polynomial drift)
     3. Cross-validate to select optimal number of PCs
+       - Standard mode: Single design matrix
+       - Per-HRF mode: Each voxel uses its HRF-specific design + shared PCs
     4. Return results with optimal denoising parameters
 
     Parameters
     ----------
     data : torch.Tensor, shape (n_voxels, n_timepoints)
         Raw fMRI data
-    design_matrix : torch.Tensor, shape (n_timepoints, n_predictors)
-        Task design matrix
+    design_matrix : torch.Tensor, optional, shape (n_timepoints, n_predictors)
+        Task design matrix (for standard single-HRF mode).
+        Mutually exclusive with designs_by_hrf.
+    designs_by_hrf : dict, optional
+        Dictionary mapping HRF indices to design matrices.
+        Format: {hrf_idx: design_matrix}, where each design_matrix has
+        shape (n_timepoints, n_predictors). Used for per-voxel HRF mode.
+        Mutually exclusive with design_matrix.
+    hrf_indices : torch.Tensor, optional, shape (n_voxels,)
+        Integer tensor mapping each voxel to its HRF index.
+        Required when designs_by_hrf is provided.
     run_starts : list of int
         Starting timepoint for each run
+    tr : float
+        Repetition time in seconds
     initial_r2 : torch.Tensor, optional, shape (n_voxels,)
         Pre-computed R² for noise pool selection. If None, computed from data.
     r2_threshold : float, default=0.05
@@ -1512,8 +1552,20 @@ def fit_denoising_model(
     """
     device = device or get_device()
 
+    # Validate inputs
+    if design_matrix is None and designs_by_hrf is None:
+        raise ValueError("Either design_matrix or designs_by_hrf must be provided")
+    if design_matrix is not None and designs_by_hrf is not None:
+        raise ValueError("Cannot provide both design_matrix and designs_by_hrf")
+    if designs_by_hrf is not None and hrf_indices is None:
+        raise ValueError("hrf_indices required when designs_by_hrf is provided")
+
+    # Determine mode
+    per_hrf_mode = designs_by_hrf is not None
+
     n_runs = len(run_starts)
     n_timepoints = data.shape[1]
+    n_voxels = data.shape[0]
 
     # Auto-determine polort based on run length if not specified
     # Uses AFNI formula: 1 + floor(run_duration / 150)
@@ -1549,10 +1601,81 @@ def fit_denoising_model(
 
     if verbose:
         print(f"\n{'=' * 70}")
-        print("Cross-Validated Denoising Pipeline")
+        if per_hrf_mode:
+            print("Cross-Validated Denoising Pipeline (Per-Voxel HRF Mode)")
+        else:
+            print("Cross-Validated Denoising Pipeline")
         print(f"{'=' * 70}")
 
-    # Step 1: Compute initial R² if not provided
+    # Per-HRF mode: Compute initial R² for each HRF group to build unified noise pool
+    if per_hrf_mode and initial_r2 is None:
+        if verbose:
+            print("\nStep 1a: Computing baseline R² per HRF group for unified noise pool...")
+            unique_hrf_indices = torch.unique(hrf_indices).tolist()
+            print(f"  Processing {len(unique_hrf_indices)} HRF groups")
+
+        # Allocate unified R² array
+        initial_r2 = torch.zeros(n_voxels, device=device)
+
+        # Create empty nuisance per run if needed
+        nuisance_per_run_local = nuisance_per_run
+        if nuisance_per_run_local is None:
+            nuisance_per_run_local = []
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                run_length = end_tp - start_tp
+                nuisance_per_run_local.append(torch.zeros((run_length, 0), device=device))
+
+        # Generate CV splits once (same for all HRF groups)
+        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
+
+        # Process each HRF group to compute baseline R²
+        for hrf_idx in unique_hrf_indices:
+            voxel_mask = hrf_indices == hrf_idx
+            n_voxels_group = voxel_mask.sum().item()
+
+            if verbose:
+                print(f"    HRF {hrf_idx}: {n_voxels_group:,} voxels")
+
+            # Extract data and design for this group
+            group_data = data[voxel_mask, :]
+            group_design = designs_by_hrf[hrf_idx]
+            n_task_cols = group_design.shape[1]
+
+            # Project out nuisance from data/design
+            projected_data, projected_design = project_out_nuisance_per_run(
+                data=group_data,
+                design=group_design,
+                nuisance_per_run=nuisance_per_run_local,
+                run_starts=run_starts,
+                device=group_data.device,
+            )
+
+            # Compute cross-validated R² for this group
+            xval_results = compute_xval_r2(
+                data=projected_data,
+                design_matrix=projected_design,
+                run_starts=run_starts,
+                stim_indices=list(range(n_task_cols)),
+                nuisance_indices=[],
+                cv_splits=cv_splits,
+                metric="cod",
+                zero_event_strategy="zero",
+                device=device,
+                batch_size=chunk_size,
+                r2_method=r2_method,
+                verbose=False,
+            )
+
+            # Store R² values for this group
+            initial_r2[voxel_mask] = xval_results.r2_matrix[:, 0]  # Task-only R²
+
+        if verbose:
+            print(f"\n  Unified noise pool created from {n_voxels:,} voxels across all HRFs")
+            print(f"  Median baseline R²: {initial_r2.median().item():.6f}")
+
+    # Step 1: Compute initial R² if not provided (standard single-HRF mode)
     # CRITICAL: Use cross-validated TASK-ONLY R² (not full-model R²)
     # Full-model R² includes variance explained by polynomials (drift) which
     # inflates R² by 20-50%! This would incorrectly classify many noise voxels
@@ -1565,7 +1688,7 @@ def fit_denoising_model(
     #
     # This avoids numerical issues with block-diagonal nuisance during CV
     # (zero-padded columns would cause singular projection matrices)
-    if initial_r2 is None:
+    if initial_r2 is None and not per_hrf_mode:
         if verbose:
             print("\nStep 1: Computing cross-validated task-only R² for noise pool selection...")
             print("  (project-first nuisance removal, per run)")
@@ -1778,22 +1901,67 @@ def fit_denoising_model(
     if verbose:
         print("\nStep 4: Cross-validating PC selection (ALL voxels)...")
 
-    r2_maps, r2_summary = cross_validate_noise_pcs(
-        data=data,
-        design_matrix=design_matrix,
-        noise_pcs=noise_pcs,
-        run_starts=run_starts,
-        max_components=max_components,
-        tr=tr,
-        nuisance=nuisance,
-        metric=metric,
-        cv_strategy=cv_strategy,
-        n_perms=n_perms,
-        chunk_size=chunk_size,
-        preload_data_to_device=preload_data_to_device,
-        device=device,
-        verbose=verbose,
-    )
+    if per_hrf_mode:
+        # Per-HRF mode: Process each HRF group separately, then aggregate
+        unique_hrf_indices = torch.unique(hrf_indices).tolist()
+        r2_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32)
+
+        if verbose:
+            print(f"  Processing {len(unique_hrf_indices)} HRF groups with shared PCs")
+
+        for hrf_idx in unique_hrf_indices:
+            voxel_mask = hrf_indices == hrf_idx
+            n_voxels_group = voxel_mask.sum().item()
+
+            if verbose:
+                print(f"    HRF {hrf_idx}: {n_voxels_group:,} voxels")
+
+            # Extract data and design for this group
+            group_data = data[voxel_mask, :]
+            group_design = designs_by_hrf[hrf_idx]
+
+            # Cross-validate with this HRF's design + shared PCs
+            group_r2_maps, _ = cross_validate_noise_pcs(
+                data=group_data,
+                design_matrix=group_design,
+                noise_pcs=noise_pcs,
+                run_starts=run_starts,
+                max_components=max_components,
+                tr=tr,
+                nuisance=nuisance,
+                metric=metric,
+                cv_strategy=cv_strategy,
+                n_perms=n_perms,
+                chunk_size=chunk_size,
+                preload_data_to_device=preload_data_to_device,
+                device=device,
+                verbose=False,  # Suppress per-group verbosity
+            )
+
+            # Scatter results back to full array
+            r2_maps[voxel_mask.cpu().numpy(), :] = group_r2_maps
+
+        # Compute summary statistics across all voxels
+        r2_summary = np.median(r2_maps, axis=0) if metric == "median" else np.mean(r2_maps, axis=0)
+
+    else:
+        # Standard single-HRF mode
+        r2_maps, r2_summary = cross_validate_noise_pcs(
+            data=data,
+            design_matrix=design_matrix,
+            noise_pcs=noise_pcs,
+            run_starts=run_starts,
+            max_components=max_components,
+            tr=tr,
+            nuisance=nuisance,
+            metric=metric,
+            cv_strategy=cv_strategy,
+            n_perms=n_perms,
+            chunk_size=chunk_size,
+            preload_data_to_device=preload_data_to_device,
+            device=device,
+            verbose=verbose,
+        )
 
     # Determine criteria voxels: R² > threshold in ANY PC count (GLMdenoise Step 7)
     threshold = pcR2cutoff if pcR2cutoff is not None else 0.0

@@ -21,7 +21,12 @@ from .design import convolve_hrf, convolve_hrf_microtime
 from .glm_core import GLMResults, construct_polynomial_matrix, fit_glm
 from .hrf import get_hrf_library
 from .utils import get_device, to_tensor
-from .xval import compute_xval_r2, generate_cv_splits, compute_r2_metric, project_out_nuisance_per_run
+from .xval import (
+    compute_xval_r2,
+    generate_cv_splits,
+    compute_r2_metric,
+    project_out_nuisance_per_run,
+)
 
 
 def load_nuisance_file(
@@ -815,16 +820,7 @@ def _fit_voxelwise_hrf(
         if n_group_voxels == 0:
             continue
 
-        # Get data for this group
-        # If data is on CPU, keep indices on CPU to avoid implicit device transfer during indexing
-        # But keep the original GPU indices for storing results back to GPU output tensors
-        if data.device.type == "cpu" and voxel_indices.device.type != "cpu":
-            voxel_indices_for_data = voxel_indices.cpu()
-            group_data = data[voxel_indices_for_data, :]  # (n_group_voxels, n_timepoints)
-        else:
-            group_data = data[voxel_indices, :]  # (n_group_voxels, n_timepoints)
-
-        # Convolve with this HRF
+        # Convolve with this HRF (do this once for the group)
         hrf = hrf_library[hrf_idx_int]
 
         stim_design = convolve_hrf_microtime(
@@ -841,49 +837,115 @@ def _fit_voxelwise_hrf(
         full_design = torch.cat([stim_design, nuisance_design], dim=1)
         stim_indices = list(range(n_conditions))
 
-        # Fit GLM for this group (no additional polys - already in nuisance_design)
-        # If data is on CPU, use chunk-based streaming to avoid OOM
-        group_results = fit_glm(
-            group_data,
-            full_design,
-            tr=tr,
-            max_poly_degree=0,  # Nuisance already included
-            device=device,
-            verbose=False,
-            task_indices=stim_indices,
-            preload_data_to_device=(group_data.device == device),  # Stream chunks if data on CPU
-        )
+        # Chunk within HRF group if too large (to avoid OOM)
+        # Use smaller chunks for GPU to prevent memory issues
+        max_voxels_per_chunk = 50000 if device.type == "cuda" else 100000
+        n_chunks = (n_group_voxels + max_voxels_per_chunk - 1) // max_voxels_per_chunk
 
-        # Store dof from first group (same for all groups with same design structure)
-        if stored_dof is None and group_results.dof is not None:
-            stored_dof = group_results.dof
+        if n_chunks > 1:
+            # Update progress bar with chunking info
+            hrf_iterator.set_postfix_str(f"{n_group_voxels:,} voxels in {n_chunks} chunks")
 
-        # Store results (with None checks for type safety)
-        # If results are on different device than output tensors (e.g., CPU results when
-        # streaming from CPU), move them to the output device
-        if group_results.betas is not None:
-            betas_to_store = group_results.betas
-            if betas_to_store.device != all_betas.device:
-                betas_to_store = betas_to_store.to(all_betas.device)
-            all_betas[voxel_indices, :] = betas_to_store
+            # Process HRF group in chunks
+            for chunk_idx in range(n_chunks):
+                chunk_start = chunk_idx * max_voxels_per_chunk
+                chunk_end = min(chunk_start + max_voxels_per_chunk, n_group_voxels)
 
-        if group_results.r2 is not None:
-            r2_to_store = group_results.r2
-            if r2_to_store.device != all_r2.device:
-                r2_to_store = r2_to_store.to(all_r2.device)
-            all_r2[voxel_indices] = r2_to_store
+                # Get voxel indices for this chunk
+                chunk_voxel_indices = voxel_indices[chunk_start:chunk_end]
 
-        if group_results.tstats is not None:
-            tstats_to_store = group_results.tstats
-            if tstats_to_store.device != all_tstats.device:
-                tstats_to_store = tstats_to_store.to(all_tstats.device)
-            all_tstats[voxel_indices, :] = tstats_to_store
+                # Get data for this chunk
+                if data.device.type == "cpu" and chunk_voxel_indices.device.type != "cpu":
+                    chunk_voxel_indices_for_data = chunk_voxel_indices.cpu()
+                    chunk_data = data[chunk_voxel_indices_for_data, :]
+                else:
+                    chunk_data = data[chunk_voxel_indices, :]
 
-        if group_results.sigma2 is not None:
-            sigma2_to_store = group_results.sigma2
-            if sigma2_to_store.device != all_sigma2.device:
-                sigma2_to_store = sigma2_to_store.to(all_sigma2.device)
-            all_sigma2[voxel_indices] = sigma2_to_store
+                # Fit GLM for this chunk
+                chunk_results = fit_glm(
+                    chunk_data,
+                    full_design,
+                    tr=tr,
+                    max_poly_degree=0,  # Nuisance already included
+                    device=device,
+                    verbose=False,
+                    task_indices=stim_indices,
+                    preload_data_to_device=(chunk_data.device == device),
+                )
+
+                # Store dof from first chunk
+                if stored_dof is None and chunk_results.dof is not None:
+                    stored_dof = chunk_results.dof
+
+                # Store results
+                if chunk_results.betas is not None:
+                    betas_to_store = chunk_results.betas
+                    if betas_to_store.device != all_betas.device:
+                        betas_to_store = betas_to_store.to(all_betas.device)
+                    all_betas[chunk_voxel_indices, :] = betas_to_store
+
+                if chunk_results.r2 is not None:
+                    r2_to_store = chunk_results.r2
+                    if r2_to_store.device != all_r2.device:
+                        r2_to_store = r2_to_store.to(all_r2.device)
+                    all_r2[chunk_voxel_indices] = r2_to_store
+
+                # Clean up chunk data
+                del chunk_data, chunk_results
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        else:
+            # Small group - process all at once
+            hrf_iterator.set_postfix_str(f"{n_group_voxels:,} voxels")
+
+            # Get data for this group
+            if data.device.type == "cpu" and voxel_indices.device.type != "cpu":
+                voxel_indices_for_data = voxel_indices.cpu()
+                group_data = data[voxel_indices_for_data, :]
+            else:
+                group_data = data[voxel_indices, :]
+
+            # Fit GLM for this group
+            group_results = fit_glm(
+                group_data,
+                full_design,
+                tr=tr,
+                max_poly_degree=0,  # Nuisance already included
+                device=device,
+                verbose=False,
+                task_indices=stim_indices,
+                preload_data_to_device=(group_data.device == device),
+            )
+
+            # Store dof from first group
+            if stored_dof is None and group_results.dof is not None:
+                stored_dof = group_results.dof
+
+            # Store results
+            if group_results.betas is not None:
+                betas_to_store = group_results.betas
+                if betas_to_store.device != all_betas.device:
+                    betas_to_store = betas_to_store.to(all_betas.device)
+                all_betas[voxel_indices, :] = betas_to_store
+
+            if group_results.r2 is not None:
+                r2_to_store = group_results.r2
+                if r2_to_store.device != all_r2.device:
+                    r2_to_store = r2_to_store.to(all_r2.device)
+                all_r2[voxel_indices] = r2_to_store
+
+            if group_results.tstats is not None:
+                tstats_to_store = group_results.tstats
+                if tstats_to_store.device != all_tstats.device:
+                    tstats_to_store = tstats_to_store.to(all_tstats.device)
+                all_tstats[voxel_indices, :] = tstats_to_store
+
+            if group_results.sigma2 is not None:
+                sigma2_to_store = group_results.sigma2
+                if sigma2_to_store.device != all_sigma2.device:
+                    sigma2_to_store = sigma2_to_store.to(all_sigma2.device)
+                all_sigma2[voxel_indices] = sigma2_to_store
 
     # Build GLMResults
     results = GLMResults()

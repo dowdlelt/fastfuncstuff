@@ -176,30 +176,47 @@ def parse_durations(
     n_conditions: int,
     condition_labels: list[str],
 ) -> list[float]:
-    """Parse durations argument.
+    """
+    Parse durations argument.
 
-    Supports:
+    Supports formats:
+    - "2.0" -> single value
+    - "3,20" -> 20 repeats of 3.0 (value,count)
     - Single value: applies to all conditions
     - Multiple values: one per condition (in same order as onsets)
     """
-    if len(durations_arg) == 1:
+    durations_parsed = []
+
+    # Parse each duration spec (can be "value" or "value,count")
+    for d in durations_arg:
+        if ',' in d:
+            # Parse "value,count" format (e.g., "3,20" -> [3, 3, 3, ...])
+            try:
+                value_str, count_str = d.split(',')
+                value = float(value_str)
+                count = int(count_str)
+                durations_parsed.extend([value] * count)
+            except (ValueError, IndexError):
+                print(f"ERROR: Invalid duration format '{d}'. Use 'value' or 'value,count' (e.g., '3,20')")
+                sys.exit(1)
+        else:
+            # Single value
+            try:
+                durations_parsed.append(float(d))
+            except ValueError:
+                print(f"ERROR: Could not parse duration '{d}' as float")
+                sys.exit(1)
+
+    # Check if parsed durations match conditions
+    if len(durations_parsed) == 1:
         # Single duration for all conditions
-        try:
-            dur = float(durations_arg[0])
-            return [dur] * n_conditions
-        except ValueError:
-            print(f"ERROR: Could not parse duration '{durations_arg[0]}' as float")
-            sys.exit(1)
-    elif len(durations_arg) == n_conditions:
+        return durations_parsed * n_conditions
+    elif len(durations_parsed) == n_conditions:
         # One duration per condition
-        try:
-            return [float(d) for d in durations_arg]
-        except ValueError as e:
-            print(f"ERROR: Could not parse durations: {e}")
-            sys.exit(1)
+        return durations_parsed
     else:
         print(
-            f"ERROR: Number of durations ({len(durations_arg)}) must be 1 or match "
+            f"ERROR: Number of durations ({len(durations_parsed)}) must be 1 or match "
             f"number of conditions ({n_conditions})"
         )
         print(f"  Conditions: {condition_labels}")

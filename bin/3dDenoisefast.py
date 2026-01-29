@@ -53,8 +53,9 @@ try:
     from fastfuncsim.design import convolve_hrf_microtime
     from fastfuncsim.design_builder import parse_afni_timing_file
     from fastfuncsim.glm_core import construct_polynomial_matrix
-    from fastfuncsim.hrf import get_spmg1_hrf
+    from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
+    from fastfuncsim.ridge import load_hrf_indices
     from fastfuncsim.utils import gaussian_blur_3d, get_device, scale_to_percent_signal, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -93,25 +94,47 @@ def parse_durations(
     n_conditions: int,
     condition_labels: list[str],
 ) -> list[float]:
-    """Parse durations argument."""
-    if len(durations_arg) == 1:
+    """
+    Parse durations argument.
+
+    Supports formats:
+    - "2.0" -> single value
+    - "3,20" -> 20 repeats of 3.0 (value,count)
+    """
+    durations_parsed = []
+
+    # Parse each duration spec (can be "value" or "value,count")
+    for d in durations_arg:
+        if "," in d:
+            # Parse "value,count" format (e.g., "3,20" -> [3, 3, 3, ...])
+            try:
+                value_str, count_str = d.split(",")
+                value = float(value_str)
+                count = int(count_str)
+                durations_parsed.extend([value] * count)
+            except (ValueError, IndexError):
+                print(
+                    f"ERROR: Invalid duration format '{d}'. Use 'value' or 'value,count' (e.g., '3,20')"
+                )
+                sys.exit(1)
+        else:
+            # Single value
+            try:
+                durations_parsed.append(float(d))
+            except ValueError:
+                print(f"ERROR: Could not parse duration '{d}' as float")
+                sys.exit(1)
+
+    # Check if parsed durations match conditions
+    if len(durations_parsed) == 1:
         # Single duration for all conditions
-        try:
-            dur = float(durations_arg[0])
-            return [dur] * n_conditions
-        except ValueError:
-            print(f"ERROR: Could not parse duration '{durations_arg[0]}' as float")
-            sys.exit(1)
-    elif len(durations_arg) == n_conditions:
+        return durations_parsed * n_conditions
+    elif len(durations_parsed) == n_conditions:
         # One duration per condition
-        try:
-            return [float(d) for d in durations_arg]
-        except ValueError as e:
-            print(f"ERROR: Could not parse durations: {e}")
-            sys.exit(1)
+        return durations_parsed
     else:
         print(
-            f"ERROR: Number of durations ({len(durations_arg)}) must be 1 or match "
+            f"ERROR: Number of durations ({len(durations_parsed)}) must be 1 or match "
             f"number of conditions ({n_conditions})"
         )
         print(f"  Conditions: {condition_labels}")
@@ -325,6 +348,12 @@ Notes:
     proc_opts.add_argument(
         "-mask",
         help="Mask file to restrict analysis to brain voxels",
+    )
+    proc_opts.add_argument(
+        "-hrf_opt",
+        type=str,
+        default=None,
+        help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz for per-voxel HRFs.",
     )
     proc_opts.add_argument(
         "-polort",
@@ -1402,6 +1431,34 @@ def main():
     print(f"  Runs: {n_runs} starting at {run_starts}")
 
     # ==========================================================================
+    # Load per-voxel HRFs if provided
+    # ==========================================================================
+    hrf_library = None
+    hrf_indices = None
+
+    if args.hrf_opt:
+        print()
+        print(f"Loading HRF optimization results from {args.hrf_opt}...")
+        hrf_index_file = f"{args.hrf_opt}_hrf_index.nii.gz"
+
+        # Load HRF indices (applies mask if data was masked)
+        hrf_indices = load_hrf_indices(hrf_index_file, mask=mask)
+        print(f"  Loaded HRF indices: {hrf_indices.shape}")
+
+        # Load HRF library (reconstruct from metadata or use default)
+        # For now, use default library matching 3dHRFoptfast
+        hrf_library = get_hrf_library(mode="library", tr=args.tr, n_hrfs=20)
+        print(f"  Using HRF library with {len(hrf_library)} HRFs")
+
+        # Show HRF distribution
+        unique_hrfs, counts = torch.unique(hrf_indices, return_counts=True)
+        print(f"  HRF distribution across {len(unique_hrfs)} unique HRFs:")
+        for hrf_idx, count in zip(unique_hrfs[:5].tolist(), counts[:5].tolist()):
+            print(f"    HRF {hrf_idx}: {count:,} voxels ({count / n_voxels * 100:.1f}%)")
+        if len(unique_hrfs) > 5:
+            print(f"    ... and {len(unique_hrfs) - 5} more HRFs")
+
+    # ==========================================================================
     # Build design matrix
     # ==========================================================================
 
@@ -1452,28 +1509,61 @@ def main():
                         cond_idx,
                     ] = 1.0
 
-    # Get canonical HRF at microtime resolution (SPMG1 - matches 3dHRFoptfast)
-    hrf = get_spmg1_hrf(
-        microtime_dt=args.microtime_dt,  # Sample at microtime resolution
-        stim_duration=0.0,  # Impulse response (duration handled in onset matrix)
-        hrf_duration=32.0,
-        normalize_peak=True,
-        device=device,
-    )
+    # Convolve design with HRF(s)
+    if hrf_library is None:
+        # Single canonical HRF for all voxels
+        print("  Using canonical SPMG1 HRF for all voxels")
+        hrf = get_spmg1_hrf(
+            microtime_dt=args.microtime_dt,
+            stim_duration=0.0,
+            hrf_duration=32.0,
+            normalize_peak=True,
+            device=device,
+        )
 
-    # Convolve and downsample to TR resolution
-    task_design = convolve_hrf_microtime(
-        onsets_microtime=onset_matrix_micro,
-        hrf=hrf,
-        n_timepoints=n_timepoints,
-        tr=args.tr,
-        microtime_dt=args.microtime_dt,
-        device=device,
-    )
-    # Type assertion for pyright (return_single_trials=False returns Tensor, not tuple)
-    assert isinstance(task_design, torch.Tensor), (
-        "task_design should be Tensor when return_single_trials=False"
-    )
+        task_design = convolve_hrf_microtime(
+            onsets_microtime=onset_matrix_micro,
+            hrf=hrf,
+            n_timepoints=n_timepoints,
+            tr=args.tr,
+            microtime_dt=args.microtime_dt,
+            device=device,
+        )
+        # Type assertion for pyright
+        assert isinstance(task_design, torch.Tensor), "Expected Tensor for single HRF"
+        task_design_per_voxel = None  # Will use single design for all voxels
+
+    else:
+        # Per-voxel HRFs: convolve with each unique HRF
+        print(f"  Convolving design with {len(hrf_library)} HRFs from library...")
+
+        # Find unique HRF indices
+        unique_hrf_indices = torch.unique(hrf_indices).tolist()
+        n_unique = len(unique_hrf_indices)
+        print(f"  Processing {n_unique} unique HRFs across {n_voxels:,} voxels")
+
+        # Pre-convolve design for each unique HRF
+        designs_by_hrf = {}
+        for hrf_idx in unique_hrf_indices:
+            hrf = hrf_library[hrf_idx]  # Shape: (hrf_length,)
+
+            # Convolve this HRF with onset matrix
+            design_for_hrf = convolve_hrf_microtime(
+                onsets_microtime=onset_matrix_micro,
+                hrf=hrf,
+                n_timepoints=n_timepoints,
+                tr=args.tr,
+                microtime_dt=args.microtime_dt,
+                device=device,
+            )
+            assert isinstance(design_for_hrf, torch.Tensor)
+            designs_by_hrf[hrf_idx] = design_for_hrf  # (n_timepoints, n_conditions)
+
+        # designs_by_hrf will be passed to fit_denoising_model
+        task_design = None  # No single design in per-HRF mode
+
+        print(f"  Created {n_unique} HRF-specific designs (memory efficient)")
+
     # Build polynomial nuisance regressors PER RUN
     # -------------------------------------------
     # CRITICAL: Nuisance regressors are RUN-SPECIFIC (each run has its own drift)
@@ -1550,11 +1640,20 @@ def main():
             nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], padding], dim=1)
 
     # Summary
-    print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
-    print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
-    print(
-        f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}"
-    )
+    if task_design is not None:
+        print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
+        print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
+        print(
+            f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}"
+        )
+    else:
+        print(
+            f"  Task predictors: {task_design_per_voxel.shape[1]} ({', '.join(condition_labels)})"
+        )
+        print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
+        print(
+            f"  Total columns per run: {task_design_per_voxel.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design_per_voxel.shape[1] + nuisance_per_run[0].shape[1]}"
+        )
 
     # ==========================================================================
     # Fit denoising model
@@ -1582,33 +1681,67 @@ def main():
     else:
         chunk_size = None  # Auto-detect for GPU
 
-    results = fit_denoising_model(
-        data=data,
-        design_matrix=task_design,
-        run_starts=run_starts,
-        r2_threshold=args.r2_threshold,
-        intensity_mask=brainthresh_mask,  # Intensity threshold for noise pool
-        max_components=args.max_pcs,
-        variance_threshold=args.variance_threshold,
-        nuisance=nuisance_per_run,  # Pass as list per run (cleaner bookkeeping!)
-        tr=args.tr,
-        polort=args.polort,
-        metric=args.cv_metric,
-        min_noise_voxels=args.min_noise_voxels,
-        max_noise_fraction=args.max_noise_fraction,
-        pcstop=args.pcstop,  # GLMdenoise-style early stopping
-        pcR2cutoff=args.pcR2cutoff,  # R² cutoff for PC selection voxels
-        cv_strategy=cv_strategy,  # CV split strategy (1=LORO, float=split fraction, int>1=leave-N-out)
-        n_perms=args.n_perms,  # Max CV permutations for random splits
-        r2_method=args.R2method,  # R² computation method (auto/fast/slow)
-        chunk_size=chunk_size,  # CPU: all voxels, GPU: auto-detect
-        preload_data_to_device=not keep_on_cpu,  # Don't preload if using CPU chunking
-        return_loadings=(
-            args.save_pcs in ["spatial", "both"] or args.plots == "full"
-        ),  # Get loadings for spatial output/plots
-        device=device,
-        verbose=args.verbose,
-    )
+    # Fit denoising model (with per-voxel HRF support)
+    if designs_by_hrf is not None:
+        # Per-voxel HRF mode: pass designs_by_hrf + hrf_indices
+        # fit_denoising_model handles the per-HRF logic internally
+        print()
+        print(f"Fitting denoising model with per-voxel HRFs ({len(designs_by_hrf)} unique HRFs)...")
+
+        results = fit_denoising_model(
+            data=data,
+            designs_by_hrf=designs_by_hrf,
+            hrf_indices=hrf_indices,
+            run_starts=run_starts,
+            tr=args.tr,
+            r2_threshold=args.r2_threshold,
+            intensity_mask=brainthresh_mask,
+            max_components=args.max_pcs,
+            variance_threshold=args.variance_threshold,
+            nuisance=nuisance_per_run,
+            polort=args.polort,
+            metric=args.cv_metric,
+            min_noise_voxels=args.min_noise_voxels,
+            max_noise_fraction=args.max_noise_fraction,
+            pcstop=args.pcstop,
+            pcR2cutoff=args.pcR2cutoff,
+            cv_strategy=cv_strategy,
+            n_perms=args.n_perms,
+            r2_method=args.R2method,
+            chunk_size=chunk_size,
+            preload_data_to_device=not keep_on_cpu,
+            return_loadings=(args.save_pcs in ["spatial", "both"] or args.plots == "full"),
+            device=device,
+            verbose=args.verbose,
+        )
+
+    else:
+        # Single HRF for all voxels (standard pipeline)
+        results = fit_denoising_model(
+            data=data,
+            design_matrix=task_design,
+            run_starts=run_starts,
+            tr=args.tr,
+            r2_threshold=args.r2_threshold,
+            intensity_mask=brainthresh_mask,
+            max_components=args.max_pcs,
+            variance_threshold=args.variance_threshold,
+            nuisance=nuisance_per_run,
+            polort=args.polort,
+            metric=args.cv_metric,
+            min_noise_voxels=args.min_noise_voxels,
+            max_noise_fraction=args.max_noise_fraction,
+            pcstop=args.pcstop,
+            pcR2cutoff=args.pcR2cutoff,
+            cv_strategy=cv_strategy,
+            n_perms=args.n_perms,
+            r2_method=args.R2method,
+            chunk_size=chunk_size,
+            preload_data_to_device=not keep_on_cpu,
+            return_loadings=(args.save_pcs in ["spatial", "both"] or args.plots == "full"),
+            device=device,
+            verbose=args.verbose,
+        )
 
     # ==========================================================================
     # Save outputs
