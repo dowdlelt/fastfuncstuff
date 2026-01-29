@@ -1875,7 +1875,13 @@ def fit_denoising_model(
             print(f"  Moving data to CPU for cross-validation (will stream chunks to GPU)")
 
         data = data.to("cpu")
-        design_matrix = design_matrix.to("cpu")
+
+        # Move design matrix/matrices to CPU
+        if per_hrf_mode:
+            # Move all HRF-specific designs to CPU
+            designs_by_hrf = {hrf_idx: design.to("cpu") for hrf_idx, design in designs_by_hrf.items()}
+        else:
+            design_matrix = design_matrix.to("cpu")
 
         # Also move nuisance regressors to CPU
         if nuisance is not None:
