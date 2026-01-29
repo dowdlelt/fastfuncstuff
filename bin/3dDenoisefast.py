@@ -1811,6 +1811,13 @@ def main():
     initial_bootstrap_se = None
     final_bootstrap_se = None
 
+    # Per-HRF mode: Skip model fitting for now (requires per-HRF GLM fitting)
+    if designs_by_hrf is not None:
+        print()
+        print("⚠️  Skipping model fitting in per-HRF mode (not yet implemented)")
+        print("   Denoising outputs (PCs, masks, R² maps) have been saved.")
+        need_model_fits = False
+
     if need_model_fits:
         print()
         print("Fitting initial model (no denoising)...")
