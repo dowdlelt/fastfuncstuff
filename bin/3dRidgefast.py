@@ -53,7 +53,7 @@ except ImportError:
 # Import fastfuncsim modules
 try:
     from fastfuncsim.afni_io import load_and_concatenate_runs, load_afni_mask, load_nifti
-    from fastfuncsim.design_builder import parse_afni_timing_file
+    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
     from fastfuncsim.hrf import get_hrf_library
     from fastfuncsim.ridge import (
         create_single_trial_design,
@@ -189,6 +189,14 @@ Notes:
         dest="autoscale",
         help="Disable autoscaling (keep ridge-regularized betas as-is).",
     )
+    ridge_opts.add_argument(
+        "-single_trials",
+        action="store_true",
+        help="Use beta-space cross-validation (GLMsingle-style). "
+             "Fits single-trial model once on all data, evaluates R² on "
+             "condition-averaged vs individual trial betas across folds. "
+             "Replaces timeseries CV with beta-space CV.",
+    )
 
     # Integration options
     integ_opts = parser.add_argument_group("Integration Options")
@@ -297,36 +305,13 @@ def main():
     # Parse durations (supports formats: "2.0", "3,20" for 20 copies of 3)
     print()
     print("Parsing durations...")
-    durations_parsed = []
-    for d in args.durations:
-        if ',' in d:
-            # Parse "value,count" format (e.g., "3,20" -> [3, 3, 3, ...])
-            try:
-                value_str, count_str = d.split(',')
-                value = float(value_str)
-                count = int(count_str)
-                durations_parsed.extend([value] * count)
-            except (ValueError, IndexError):
-                print(f"ERROR: Invalid duration format '{d}'. Use 'value' or 'value,count' (e.g., '3,20')")
-                sys.exit(1)
-        else:
-            # Single value
-            durations_parsed.append(float(d))
+    durations = parse_durations(args.durations, len(all_onsets), condition_labels)
 
-    # Check if parsed durations match conditions
-    if len(durations_parsed) == 1:
-        durations = durations_parsed * len(all_onsets)
-        print(f"  Using {durations_parsed[0]}s for all {len(all_onsets)} conditions")
-    elif len(durations_parsed) == len(all_onsets):
-        durations = durations_parsed
-        print(f"  Matched {len(durations)} durations to {len(all_onsets)} conditions")
+    # Print summary based on input
+    if len(args.durations) == 1 and ',' not in args.durations[0]:
+        print(f"  Using {durations[0]}s for all {len(all_onsets)} conditions")
     else:
-        print()
-        print(f"ERROR: Number of durations ({len(durations_parsed)}) must be 1 or match number of conditions ({len(all_onsets)})")
-        print(f"  Got: {len(durations_parsed)} durations for {len(all_onsets)} conditions")
-        print(f"  Onset files: {len(args.onsets)}")
-        print(f"  Duration spec: {args.durations}")
-        sys.exit(1)
+        print(f"  Matched {len(durations)} durations to {len(all_onsets)} conditions")
 
     print()
     print("=" * 70)
@@ -429,7 +414,7 @@ def main():
     # Create single-trial design matrix
     print()
     print("Creating single-trial design matrix...")
-    design_matrix, trial_labels, trial_condition_ids, condition_design = create_single_trial_design(
+    design_matrix, trial_labels, trial_condition_ids, trial_run_ids, condition_design = create_single_trial_design(
         onsets_by_condition=all_onsets,
         durations=durations,
         run_starts=run_starts,
@@ -458,23 +443,115 @@ def main():
     print("=" * 70)
     print()
 
-    # Fit ridge regression
-    results = fit_ridge_single_trial(
-        data=data,
-        design_matrix=design_matrix,
-        run_starts=run_starts,
-        tr=args.tr,
-        trial_condition_ids=trial_condition_ids,
-        condition_design=condition_design,
-        fracs=fracs,
-        nuisance=noise_pcs,
-        polort=args.polort,
-        trial_labels=trial_labels,
-        autoscale=args.autoscale,
-        chunk_size=args.chunk_size,
-        device=device,
-        verbose=args.verbose,
-    )
+    if args.single_trials:
+        # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
+        from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
+        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.glm_outputs import save_single_trial_results
+        from fastfuncsim.ridge import _fit_ridge_multiple_fracs
+        from fastfuncsim.xval import project_out_nuisance_per_run
+
+        print("Using beta-space cross-validation (GLMsingle-style)")
+        print()
+
+        # Build nuisance design (polynomials + noise PCs)
+        # Auto-determine polort if not specified
+        if args.polort is None:
+            avg_run_duration_min = (n_timepoints / n_runs) * args.tr / 60.0
+            polort = max(1, round(avg_run_duration_min / 2))
+            print(f"Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)")
+        else:
+            polort = args.polort
+
+        # Polynomials per run (block-diagonal)
+        poly_blocks = []
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_len = end_tp - start_tp
+            poly_blocks.append(construct_polynomial_matrix(run_len, polort, device))
+
+        # Build nuisance per run (polys + PCs if provided)
+        nuisance_per_run = []
+        for run_idx in range(n_runs):
+            run_nuisance = poly_blocks[run_idx]
+            if noise_pcs is not None:
+                # noise_pcs is list of (run_len, n_pcs) per run
+                pcs = noise_pcs[run_idx].to(device)
+                run_nuisance = torch.cat([run_nuisance, pcs], dim=1)
+            nuisance_per_run.append(run_nuisance)
+
+        # Project nuisance from data and design
+        print("Projecting nuisance from data and design...")
+        data_clean, design_clean = project_out_nuisance_per_run(
+            data, design_matrix, nuisance_per_run, run_starts, device=device)
+
+        # Fit ridge for all fractions on cleaned data
+        print(f"Fitting ridge for {len(fracs)} fractions on full data...")
+        coefs = _fit_ridge_multiple_fracs(design_clean, data_clean.T, fracs, device)
+        # coefs: (n_trials, n_fracs, n_voxels)
+
+        # Generate CV splits
+        cv_splits = generate_cv_splits(n_runs, strategy=1)  # strategy=1 is LORO
+
+        # For each fraction: compute beta-space R²
+        print("Computing beta-space CV R² for each fraction...")
+        r2_by_frac = torch.zeros(n_voxels, len(fracs), device=device)
+        for frac_idx in range(len(fracs)):
+            frac_betas = coefs[:, frac_idx, :].T  # (n_voxels, n_trials)
+            xval = compute_xval_r2_single_trials(
+                frac_betas, trial_condition_ids, trial_run_ids, cv_splits,
+                device=device, verbose=False)
+            r2_by_frac[:, frac_idx] = xval['r2']
+
+        # Select optimal fraction per voxel
+        xval_r2, best_frac_idx = r2_by_frac.max(dim=1)
+        optimal_fracs = torch.from_numpy(fracs[best_frac_idx.cpu().numpy()]).to(device)
+
+        # Extract final betas at optimal fraction
+        voxel_indices = torch.arange(n_voxels, device=device)
+        final_betas = coefs[:, best_frac_idx, voxel_indices].T  # (n_voxels, n_trials)
+
+        # Apply autoscale if requested
+        if args.autoscale:
+            print("Applying GLMsingle-style autoscaling...")
+            # Autoscale: fit OLS on cleaned data for each voxel's selected betas
+            # This undoes the ridge shrinkage bias
+            for v in range(n_voxels):
+                # Get this voxel's data and betas
+                voxel_data = data_clean[v, :]
+                voxel_betas = final_betas[v, :]
+
+                # Compute predicted signal
+                predicted = design_clean @ voxel_betas
+
+                # Compute scaling factor (OLS fit of predicted to actual)
+                scale_factor = (voxel_data @ predicted) / (predicted @ predicted + 1e-10)
+
+                # Apply scaling
+                final_betas[v, :] *= scale_factor
+
+        print()
+        print(f"Beta-space CV R²: mean={xval_r2.mean():.4f}, median={xval_r2.median():.4f}")
+
+    else:
+        # ========== EXISTING TIMESERIES CV PATH (unchanged) ==========
+        results = fit_ridge_single_trial(
+            data=data,
+            design_matrix=design_matrix,
+            run_starts=run_starts,
+            tr=args.tr,
+            trial_condition_ids=trial_condition_ids,
+            condition_design=condition_design,
+            fracs=fracs,
+            nuisance=noise_pcs,
+            polort=args.polort,
+            trial_labels=trial_labels,
+            autoscale=args.autoscale,
+            chunk_size=args.chunk_size,
+            device=device,
+            verbose=args.verbose,
+        )
 
     # Save outputs
     print()
@@ -487,49 +564,96 @@ def main():
     vol_shape = first_img.shape[:3]
     affine = first_img.affine
 
-    # Helper to reshape and save 3D volumes
-    def save_result_volume(data_tensor, filename):
-        if mask is not None:
-            # Unmask to full volume
-            full_data = np.zeros(mask.size, dtype=np.float32)
-            full_data[mask_flat] = data_tensor.cpu().numpy()
-            data_3d = full_data.reshape(vol_shape)
-        else:
-            # No mask - reshape to original volume
-            data_3d = data_tensor.cpu().numpy().reshape(vol_shape)
+    if args.single_trials:
+        # ========== SINGLE-TRIAL OUTPUT MODE ==========
+        # Use save_single_trial_results for single-trial mode
+        voxel_mask_tensor = torch.from_numpy(mask_flat) if mask is not None else None
 
-        img = nib.Nifti1Image(data_3d, affine=affine)
-        nib.save(img, filename)
-        print(f"  {filename}")
+        save_single_trial_results(
+            betas=final_betas,
+            xval_r2=xval_r2,
+            trial_labels=trial_labels,
+            trial_condition_ids=trial_condition_ids,
+            trial_run_ids=trial_run_ids,
+            condition_labels=condition_labels,
+            output_prefix=str(args.prefix),
+            volume_shape=vol_shape,
+            affine=affine,
+            voxel_mask=voxel_mask_tensor,
+        )
 
-    # Helper to reshape and save 4D volumes (e.g., betas, R² per frac)
-    def save_result_4d(data_tensor, filename):
-        """Save 4D volume: data_tensor shape (n_voxels, n_volumes)"""
-        n_vols = data_tensor.shape[1]
-        if mask is not None:
-            # Unmask to full volume: (n_voxels, n_volumes) -> (x, y, z, n_volumes)
-            full_data = np.zeros((mask.size, n_vols), dtype=np.float32)
-            full_data[mask_flat, :] = data_tensor.cpu().numpy()
-            data_4d = full_data.reshape((*vol_shape, n_vols))
-        else:
-            # No mask
-            data_4d = data_tensor.cpu().numpy().reshape((*vol_shape, n_vols))
+        # Also save ridge-specific outputs
+        def save_result_volume(data_tensor, filename):
+            if mask is not None:
+                full_data = np.zeros(mask.size, dtype=np.float32)
+                full_data[mask_flat] = data_tensor.cpu().numpy()
+                data_3d = full_data.reshape(vol_shape)
+            else:
+                data_3d = data_tensor.cpu().numpy().reshape(vol_shape)
+            img = nib.Nifti1Image(data_3d, affine=affine)
+            nib.save(img, filename)
+            print(f"  {filename}")
 
-        img = nib.Nifti1Image(data_4d, affine=affine)
-        nib.save(img, filename)
-        print(f"  {filename}")
+        def save_result_4d(data_tensor, filename):
+            n_vols = data_tensor.shape[1]
+            if mask is not None:
+                full_data = np.zeros((mask.size, n_vols), dtype=np.float32)
+                full_data[mask_flat, :] = data_tensor.cpu().numpy()
+                data_4d = full_data.reshape((*vol_shape, n_vols))
+            else:
+                data_4d = data_tensor.cpu().numpy().reshape((*vol_shape, n_vols))
+            img = nib.Nifti1Image(data_4d, affine=affine)
+            nib.save(img, filename)
+            print(f"  {filename}")
 
-    # Save R² maps and optimal fractions
-    save_result_volume(results.r2_initial, f"{args.prefix}_r2_initial.nii.gz")
-    save_result_volume(results.r2, f"{args.prefix}_r2.nii.gz")
-    save_result_volume(results.xval_r2, f"{args.prefix}_xval_r2.nii.gz")
-    save_result_volume(results.optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz")
+        save_result_volume(optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz")
+        save_result_4d(r2_by_frac, f"{args.prefix}_r2_by_frac.nii.gz")
 
-    # Save single-trial betas (4D file)
-    save_result_4d(results.betas_single_trial, f"{args.prefix}_betas_single_trial.nii.gz")
+    else:
+        # ========== EXISTING OUTPUT MODE (unchanged) ==========
+        # Helper to reshape and save 3D volumes
+        def save_result_volume(data_tensor, filename):
+            if mask is not None:
+                # Unmask to full volume
+                full_data = np.zeros(mask.size, dtype=np.float32)
+                full_data[mask_flat] = data_tensor.cpu().numpy()
+                data_3d = full_data.reshape(vol_shape)
+            else:
+                # No mask - reshape to original volume
+                data_3d = data_tensor.cpu().numpy().reshape(vol_shape)
 
-    # Save trial labels text file
-    trial_labels_file = f"{args.prefix}_trial_labels.txt"
+            img = nib.Nifti1Image(data_3d, affine=affine)
+            nib.save(img, filename)
+            print(f"  {filename}")
+
+        # Helper to reshape and save 4D volumes (e.g., betas, R² per frac)
+        def save_result_4d(data_tensor, filename):
+            """Save 4D volume: data_tensor shape (n_voxels, n_volumes)"""
+            n_vols = data_tensor.shape[1]
+            if mask is not None:
+                # Unmask to full volume: (n_voxels, n_volumes) -> (x, y, z, n_volumes)
+                full_data = np.zeros((mask.size, n_vols), dtype=np.float32)
+                full_data[mask_flat, :] = data_tensor.cpu().numpy()
+                data_4d = full_data.reshape((*vol_shape, n_vols))
+            else:
+                # No mask
+                data_4d = data_tensor.cpu().numpy().reshape((*vol_shape, n_vols))
+
+            img = nib.Nifti1Image(data_4d, affine=affine)
+            nib.save(img, filename)
+            print(f"  {filename}")
+
+        # Save R² maps and optimal fractions
+        save_result_volume(results.r2_initial, f"{args.prefix}_r2_initial.nii.gz")
+        save_result_volume(results.r2, f"{args.prefix}_r2.nii.gz")
+        save_result_volume(results.xval_r2, f"{args.prefix}_xval_r2.nii.gz")
+        save_result_volume(results.optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz")
+
+        # Save single-trial betas (4D file)
+        save_result_4d(results.betas_single_trial, f"{args.prefix}_betas_single_trial.nii.gz")
+
+        # Save trial labels text file
+        trial_labels_file = f"{args.prefix}_trial_labels.txt"
     with open(trial_labels_file, "w") as f:
         for label in results.trial_labels:
             f.write(f"{label}\n")

@@ -1491,3 +1491,130 @@ def write_partial_r2_with_labels(
         final_path = temp_path
 
     return final_path
+
+
+def save_single_trial_results(
+    betas: torch.Tensor,
+    xval_r2: torch.Tensor,
+    trial_labels: List[str],
+    trial_condition_ids: torch.Tensor,
+    trial_run_ids: torch.Tensor,
+    condition_labels: List[str],
+    output_prefix: str,
+    volume_shape: tuple[int, int, int],
+    affine: np.ndarray,
+    voxel_mask: Optional[torch.Tensor] = None,
+) -> dict[str, str]:
+    """
+    Save single-trial output files for GLMsingle-style analysis.
+
+    Creates four output files:
+      {prefix}_single_trial_betas.nii.gz          4D (x,y,z, n_trials)
+      {prefix}_single_trial_xval_r2.nii.gz        3D beta-space CV R²
+      {prefix}_single_trial_condition_betas.nii.gz 4D (x,y,z, n_conditions)
+      {prefix}_single_trial_labels.json            trial metadata sidecar
+
+    Parameters
+    ----------
+    betas : torch.Tensor, shape (n_voxels, n_trials)
+        Single-trial beta estimates from full-data fit
+    xval_r2 : torch.Tensor, shape (n_voxels,)
+        Beta-space cross-validated R² values
+    trial_labels : list of str
+        Label for each trial (e.g., "face_001", "house_023")
+    trial_condition_ids : torch.Tensor, shape (n_trials,)
+        Condition index (0-indexed) for each trial
+    trial_run_ids : torch.Tensor, shape (n_trials,)
+        Run index (0-indexed) for each trial
+    condition_labels : list of str
+        Labels for each condition
+    output_prefix : str
+        Output file prefix (e.g., "subject01")
+    volume_shape : tuple of int
+        3D volume shape (x, y, z)
+    affine : np.ndarray, shape (4, 4)
+        Affine transformation matrix for NIfTI header
+    voxel_mask : torch.Tensor, optional
+        Boolean mask indicating which voxels were analyzed.
+        If provided, results are expanded to full volume.
+
+    Returns
+    -------
+    output_files : dict
+        Dictionary mapping output type to file path:
+        - "single_trial_betas": path to single-trial betas
+        - "single_trial_xval_r2": path to CV R²
+        - "single_trial_condition_betas": path to condition-average betas
+        - "single_trial_labels": path to metadata JSON
+    """
+    output_files = {}
+    n_voxels, n_trials = betas.shape
+    n_conditions = int(trial_condition_ids.max().item()) + 1
+
+    # Helper: reshape flat voxels to 3D volume
+    def to_volume_3d(data_1d: torch.Tensor) -> np.ndarray:
+        """Reshape 1D data to 3D volume, applying mask if present."""
+        data_np = data_1d.cpu().numpy().astype(np.float32)
+        if voxel_mask is not None:
+            full = np.zeros(np.prod(volume_shape), dtype=np.float32)
+            mask_np = voxel_mask.cpu().numpy()
+            full[mask_np] = data_np
+        else:
+            full = data_np
+        return full.reshape(volume_shape)
+
+    def to_volume_4d(data_2d: torch.Tensor) -> np.ndarray:
+        """Reshape 2D data to 4D volume, applying mask if present."""
+        data_np = data_2d.cpu().numpy().astype(np.float32)
+        n_vols = data_np.shape[1]
+        if voxel_mask is not None:
+            full = np.zeros((np.prod(volume_shape), n_vols), dtype=np.float32)
+            mask_np = voxel_mask.cpu().numpy()
+            full[mask_np, :] = data_np
+        else:
+            full = data_np
+        return full.reshape((*volume_shape, n_vols))
+
+    # 1. Single-trial betas (4D)
+    betas_path = f"{output_prefix}_single_trial_betas.nii.gz"
+    img = nib.Nifti1Image(to_volume_4d(betas), affine)
+    nib.save(img, betas_path)
+    output_files["single_trial_betas"] = betas_path
+    print(f"  Saved: {betas_path} ({n_trials} trials)")
+
+    # 2. Beta-space CV R² (3D)
+    r2_path = f"{output_prefix}_single_trial_xval_r2.nii.gz"
+    img = nib.Nifti1Image(to_volume_3d(xval_r2), affine)
+    nib.save(img, r2_path)
+    output_files["single_trial_xval_r2"] = r2_path
+    print(f"  Saved: {r2_path}")
+
+    # 3. Condition-average betas (4D)
+    condition_betas = torch.zeros(n_voxels, n_conditions, dtype=torch.float32, device=betas.device)
+    for c in range(n_conditions):
+        mask = trial_condition_ids == c
+        if mask.sum() > 0:
+            condition_betas[:, c] = betas[:, mask].mean(dim=1)
+
+    cond_path = f"{output_prefix}_single_trial_condition_betas.nii.gz"
+    img = nib.Nifti1Image(to_volume_4d(condition_betas), affine)
+    nib.save(img, cond_path)
+    output_files["single_trial_condition_betas"] = cond_path
+    print(f"  Saved: {cond_path} ({n_conditions} conditions)")
+
+    # 4. Trial metadata JSON sidecar
+    labels_path = f"{output_prefix}_single_trial_labels.json"
+    metadata = {
+        "trial_labels": trial_labels,
+        "trial_condition_ids": trial_condition_ids.cpu().tolist(),
+        "trial_run_ids": trial_run_ids.cpu().tolist(),
+        "condition_labels": condition_labels,
+        "n_trials": n_trials,
+        "n_conditions": n_conditions,
+    }
+    with open(labels_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    output_files["single_trial_labels"] = labels_path
+    print(f"  Saved: {labels_path}")
+
+    return output_files

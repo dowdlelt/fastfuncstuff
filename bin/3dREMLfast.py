@@ -40,6 +40,15 @@ try:
         get_tr_from_file,
         load_nifti,
     )
+    from fastfuncsim.design_builder import (
+        create_onset_matrix_microtime,
+        parse_afni_timing_file,
+        parse_durations,
+    )
+    from fastfuncsim.design import convolve_hrf_microtime
+    from fastfuncsim.hrf import get_spmg1_hrf
+    from fastfuncsim.glm_core import construct_polynomial_matrix
+    from fastfuncsim.hrf_selection import load_nuisance_file
     from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -288,8 +297,8 @@ Examples:
     )
     required.add_argument(
         "-matrix",
-        required=True,
-        help="Design matrix file (X.xmat.1D from 3dDeconvolve)",
+        required=False,
+        help="Design matrix file (X.xmat.1D from 3dDeconvolve). Mutually exclusive with -onsets.",
     )
 
     # Output arguments - REML
@@ -367,6 +376,15 @@ Examples:
         "'task': semi-partial R² as proportion of variance remaining after nuisance regressors. "
         "Semi-partial R² shows unique variance contribution and DOES sum to total R² (additive contributions). "
         "Formula: r²_semi = (R²_full - R²_without_regressor)",
+    )
+    stats_opts.add_argument(
+        "-beta_cv",
+        action="store_true",
+        help="Use beta-space cross-validation (GLMsingle-style). "
+        "Fits single-trial model once on all data with ARMA(1,1) prewhitening, "
+        "evaluates R² on condition-averaged vs individual trial betas across folds. "
+        "Requires -onsets (not -matrix). "
+        "NOTE: This is different from -single_trials (which reorders output by onset time).",
     )
 
     # ARMA grid options
@@ -477,6 +495,44 @@ Examples:
         "-debug_memory",
         action="store_true",
         help="Print detailed memory profiling at every step (for debugging)",
+    )
+
+    # Onset-based design (alternative to -matrix)
+    onset_group = parser.add_argument_group("Onset-Based Design (alternative to -matrix)")
+    onset_group.add_argument(
+        "-onsets",
+        nargs="+",
+        help="Onset timing files (AFNI format). One per condition. Mutually exclusive with -matrix.",
+    )
+    onset_group.add_argument(
+        "-durations",
+        nargs="+",
+        help="Stimulus durations. Single value, per-condition, or 'value,count'.",
+    )
+    onset_group.add_argument(
+        "-microtime_dt",
+        type=float,
+        default=0.1,
+        help="Microtime resolution (seconds, default: 0.1)",
+    )
+    onset_group.add_argument(
+        "-polort",
+        type=int,
+        default=None,
+        help="Polynomial order (default: auto based on run length)",
+    )
+    onset_group.add_argument(
+        "-ortvec",
+        action="append",
+        nargs=2,
+        metavar=("FILE", "LABEL"),
+        help="Nuisance regressors (can repeat). FILE LABEL",
+    )
+    onset_group.add_argument(
+        "-canonical",
+        type=str,
+        default="spmg1",
+        help="Canonical HRF: 'spmg1' (default) or 'glmsingle'",
     )
 
     # Help
@@ -591,6 +647,14 @@ def main():
     if args.help or len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
+
+    # Validate design input: must have either -matrix or -onsets (but not both)
+    if args.matrix and args.onsets:
+        print("ERROR: Specify either -matrix or -onsets, not both")
+        sys.exit(1)
+    if not args.matrix and not args.onsets:
+        print("ERROR: Must specify either -matrix or -onsets")
+        sys.exit(1)
 
     # Check that at least one output is requested
     outputs = [
@@ -752,14 +816,324 @@ def main():
     )
     ols_output_path = args.Obuck if args.Obuck else None
 
-    # Load design matrix early so we can pass it to callback
+    # Load or build design matrix
     from fastfuncsim.afni_io import read_afni_design_matrix
 
-    design_info = read_afni_design_matrix(args.matrix)
+    if args.matrix:
+        # Load design matrix from file
+        design_info = read_afni_design_matrix(args.matrix)
+    else:
+        # Build design matrix from onsets
+        print()
+        print("=" * 70)
+        print("Building design matrix from onsets")
+        print("=" * 70)
+        print()
 
-    # Set environment variable if single_trials requested (for analysis.py callback)
-    if args.single_trials:
-        os.environ["FASTFUNCSIM_SINGLE_TRIALS"] = args.single_trials
+        # Parse onset files
+        print("Parsing onset files...")
+        all_onsets = []
+        condition_labels = []
+        for onset_file in args.onsets:
+            condition_label = Path(onset_file).stem
+            runs_onsets = parse_afni_timing_file(onset_file)
+            all_onsets.append(runs_onsets)
+            condition_labels.append(condition_label)
+            n_events = sum(len(run_onsets) for run_onsets in runs_onsets)
+            print(f"  {condition_label}: {n_events} events across {len(runs_onsets)} runs")
+
+        n_conditions = len(all_onsets)
+        n_runs = len(all_onsets[0])  # All conditions must have same number of runs
+
+        # Parse durations
+        print()
+        print("Parsing durations...")
+        durations = parse_durations(args.durations, n_conditions, condition_labels)
+        if len(args.durations) == 1 and ',' not in args.durations[0]:
+            print(f"  Using {durations[0]}s for all {n_conditions} conditions")
+        else:
+            print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
+
+        # Compute run starts from input files
+        print()
+        print("Computing run structure...")
+        run_starts = [0]
+        total_tps = 0
+        for f in input_files:
+            img_shape = load_nifti(f)[0].shape
+            run_len = img_shape[3] if len(img_shape) > 3 else img_shape[0]
+            total_tps += run_len
+            if f != input_files[-1]:  # Don't add start for after last run
+                run_starts.append(total_tps)
+        n_timepoints = total_tps
+
+        print(f"  Runs: {n_runs}")
+        print(f"  Total timepoints: {n_timepoints}")
+        print(f"  Run starts (TRs): {run_starts}")
+
+        # Auto-determine polort if not specified
+        if args.polort is None:
+            avg_run_duration_min = (n_timepoints / n_runs) * tr / 60.0
+            polort = max(1, round(avg_run_duration_min / 2))
+            print(f"  Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)")
+        else:
+            polort = args.polort
+            print(f"  Polort: {polort}")
+
+        # Build microtime onset matrix
+        print()
+        print("Building onset matrix at microtime resolution...")
+        onset_matrix_micro = create_onset_matrix_microtime(
+            all_onsets, run_starts, tr, n_timepoints,
+            args.microtime_dt, durations, device)
+        print(f"  Onset matrix shape: {onset_matrix_micro.shape}")
+
+        # Get canonical HRF
+        print()
+        print(f"Convolving with canonical HRF ({args.canonical})...")
+        if args.canonical.lower() == "spmg1":
+            hrf = get_spmg1_hrf(
+                microtime_dt=args.microtime_dt,
+                stim_duration=0.0,
+                normalize_peak=True,
+                device=device)
+        else:
+            print(f"ERROR: Unsupported canonical HRF: {args.canonical}")
+            print("  Supported: 'spmg1'")
+            sys.exit(1)
+
+        # Convolve to get task design
+        task_design = convolve_hrf_microtime(
+            onset_matrix_micro, hrf, n_timepoints,
+            tr=tr, microtime_dt=args.microtime_dt, device=device)
+        print(f"  Task design shape: {task_design.shape}")
+
+        # Build nuisance design (polynomials + ortvec)
+        print()
+        print("Building nuisance regressors...")
+
+        # Polynomials per run (block-diagonal)
+        run_lengths = []
+        for i in range(n_runs):
+            if i < n_runs - 1:
+                run_lengths.append(run_starts[i + 1] - run_starts[i])
+            else:
+                run_lengths.append(n_timepoints - run_starts[i])
+
+        poly_blocks = []
+        for run_len in run_lengths:
+            poly_blocks.append(construct_polynomial_matrix(run_len, polort, device))
+        nuisance_design = torch.block_diag(*poly_blocks)
+        print(f"  Polynomial design shape: {nuisance_design.shape}")
+
+        # Add ortvec if provided
+        if args.ortvec:
+            print(f"  Loading {len(args.ortvec)} ortvec file(s)...")
+            for filepath, label in args.ortvec:
+                nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
+                ortvec_tensor = torch.tensor(nuisance_data, dtype=torch.float32, device=device)
+                nuisance_design = torch.cat([nuisance_design, ortvec_tensor], dim=1)
+                print(f"    {label}: {ortvec_tensor.shape[1]} regressor(s)")
+
+        # Build full design: [task | nuisance]
+        full_design = torch.cat([task_design, nuisance_design], dim=1)
+        print()
+        print(f"Full design matrix shape: {full_design.shape}")
+        print(f"  Task columns: {task_design.shape[1]}")
+        print(f"  Nuisance columns: {nuisance_design.shape[1]}")
+
+        # Create design_info dict to match format from read_afni_design_matrix
+        task_indices = list(range(task_design.shape[1]))
+        nuisance_indices = list(range(task_design.shape[1], full_design.shape[1]))
+
+        # Build column labels
+        column_labels = []
+        for cond_label in condition_labels:
+            column_labels.append(f"{cond_label}#0")
+
+        # Add nuisance labels
+        nuisance_label_offset = len(column_labels)
+        for run_idx in range(n_runs):
+            for p in range(polort + 1):
+                column_labels.append(f"Run#{run_idx+1}Pol#{p}")
+
+        if args.ortvec:
+            for _, label in args.ortvec:
+                column_labels.append(label)
+
+        design_info = {
+            "design_matrix": full_design.cpu().numpy(),
+            "column_labels": column_labels,
+            "stim_indices": task_indices,
+            "nuisance_indices": nuisance_indices,
+            "stim_bots": [0],
+            "stim_tops": [len(task_indices) - 1],
+            "stim_labels": condition_labels,
+            "run_starts": run_starts,
+            "n_runs": n_runs,
+        }
+
+        print()
+        print("=" * 70)
+        print()
+
+
+    # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
+    if args.beta_cv:
+        from fastfuncsim.ridge import create_single_trial_design
+        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.glm_outputs import save_single_trial_results
+        from fastfuncsim.analysis import analyze_from_design_matrix
+
+        print()
+        print("=" * 70)
+        print("Using beta-space cross-validation with ARMA(1,1) prewhitening")
+        print("=" * 70)
+        print()
+
+        # Validate that we're in onset-based mode
+        if not args.onsets:
+            print("ERROR: -beta_cv requires -onsets (not -matrix)")
+            sys.exit(1)
+
+        # 1. Build single-trial design
+        print("Building single-trial design...")
+        st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = create_single_trial_design(
+            onsets_by_condition=all_onsets,
+            durations=durations,
+            run_starts=run_starts,
+            tr=args.tr,
+            n_timepoints=n_timepoints,
+            microtime_dt=args.microtime_dt,
+            condition_labels=condition_labels,
+            device=device,
+        )
+        print(f"  Single-trial design: {st_design.shape}")
+        n_trials = st_design.shape[1]
+
+        # 2. Build wide design: [single_trial | nuisance]
+        # Note: design_info was already created with condition-level design
+        # We need to rebuild it with single-trial design
+        nuisance_blocks = []
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_len = end_tp - start_tp
+            poly_block = construct_polynomial_matrix(run_len, polort, device)
+            nuisance_blocks.append(poly_block)
+
+        # Add ortvec if provided
+        if args.ortvec:
+            # ortvec_tensor already added to nuisance_design in design building section
+            # We need to get it from the existing design_info
+            pass  # nuisance already includes ortvec from earlier
+
+        nuisance_design_st = torch.block_diag(*nuisance_blocks)
+
+        # Add ortvec if it was provided
+        if args.ortvec:
+            ortvec_combined = []
+            for filepath, label in args.ortvec:
+                nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
+                ortvec_combined.append(torch.tensor(nuisance_data, dtype=torch.float32, device=device))
+            if ortvec_combined:
+                ortvec_design = torch.cat(ortvec_combined, dim=1)
+                nuisance_design_st = torch.cat([nuisance_design_st, ortvec_design], dim=1)
+
+        full_design_st = torch.cat([st_design, nuisance_design_st], dim=1)
+        task_indices_st = list(range(n_trials))
+        nuisance_indices_st = list(range(n_trials, full_design_st.shape[1]))
+
+        print(f"  Full design (wide): {full_design_st.shape}")
+        print(f"    Task columns (single-trial): {n_trials}")
+        print(f"    Nuisance columns: {len(nuisance_indices_st)}")
+
+        # 3. Run ARMA(1,1) analysis on wide design
+        print()
+        print("Running ARMA(1,1) analysis on single-trial design...")
+
+        # Create a temporary design_info for single-trial mode
+        design_info_st = {
+            "design_matrix": full_design_st.cpu().numpy(),
+            "column_labels": trial_labels + [f"nuisance_{i}" for i in range(len(nuisance_indices_st))],
+            "stim_indices": task_indices_st,
+            "nuisance_indices": nuisance_indices_st,
+            "run_starts": run_starts,
+            "n_runs": n_runs,
+        }
+
+        # Load and prepare fMRI data (reuse existing preprocessing if done)
+        if preprocessing_applied:
+            fmri_data_st = fmri_data_preprocessed
+        elif args.cache and cache_metadata is not None:
+            fmri_data_st = input_files  # Will load from cache
+        else:
+            fmri_data_st = input_files
+
+        # Call analyze_from_design_matrix with single-trial design
+        # This will fit ARMA(1,1), prewhiten, and return single-trial betas
+        results_st, _ = analyze_from_design_matrix(
+            fmri_data=fmri_data_st,
+            design_matrix=design_info_st["design_matrix"],
+            stim_column_indices=task_indices_st,
+            nuisance_column_indices=nuisance_indices_st,
+            method="arma11",
+            arma_a_grid=a_grid,
+            arma_b_grid=b_grid,
+            device=device,
+            mask_file=args.mask,
+            voxel_chunk_size=args.batch_size,
+            use_double=args.use_double,
+            verbose=args.verbose,
+        )
+
+        # 4. Extract single-trial betas
+        st_betas = results_st.betas  # (n_voxels, n_trials)
+        print(f"  Single-trial betas: {st_betas.shape}")
+
+        # 5. Beta-space CV
+        print()
+        print("Computing beta-space cross-validated R²...")
+        cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
+        xval = compute_xval_r2_single_trials(
+            st_betas, trial_cond_ids, trial_run_ids, cv_splits,
+            metric="cod", device=device, verbose=True)
+
+        # 6. Save outputs
+        print()
+        print("Saving single-trial outputs...")
+
+        # Get spatial metadata
+        volume_shape = results_st.original_shape
+        affine = results_st.affine
+        voxel_mask = getattr(results_st, 'voxel_mask', None)
+
+        output_files = save_single_trial_results(
+            betas=st_betas,
+            xval_r2=xval['r2'],
+            trial_labels=trial_labels,
+            trial_condition_ids=trial_cond_ids,
+            trial_run_ids=trial_run_ids,
+            condition_labels=condition_labels,
+            output_prefix=args.prefix,
+            volume_shape=volume_shape,
+            affine=affine,
+            voxel_mask=voxel_mask,
+        )
+
+        print()
+        print("=" * 70)
+        print("✅ 3dREMLfast (single-trial mode) Complete!")
+        print("=" * 70)
+        print(f"  Median beta-space R²: {xval['r2'].median():.4f}")
+        print(f"  {xval['n_test_trials_total']} test trials across {xval['n_splits']} folds")
+        print()
+        for key, path in output_files.items():
+            print(f"  {key}: {path}")
+        print("=" * 70)
+
+        # Early exit - don't run standard pipeline
+        return
 
     # Setup OLS write callback if any OLS output is requested
     ols_write_callback = None

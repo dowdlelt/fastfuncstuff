@@ -51,7 +51,7 @@ try:
         fit_denoising_model,
     )
     from fastfuncsim.design import convolve_hrf_microtime
-    from fastfuncsim.design_builder import parse_afni_timing_file
+    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
     from fastfuncsim.glm_core import construct_polynomial_matrix
     from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
@@ -87,58 +87,6 @@ def parse_input_files(input_arg: Union[str, list[str]]) -> list[str]:
             sys.exit(1)
 
     return files
-
-
-def parse_durations(
-    durations_arg: list[str],
-    n_conditions: int,
-    condition_labels: list[str],
-) -> list[float]:
-    """
-    Parse durations argument.
-
-    Supports formats:
-    - "2.0" -> single value
-    - "3,20" -> 20 repeats of 3.0 (value,count)
-    """
-    durations_parsed = []
-
-    # Parse each duration spec (can be "value" or "value,count")
-    for d in durations_arg:
-        if "," in d:
-            # Parse "value,count" format (e.g., "3,20" -> [3, 3, 3, ...])
-            try:
-                value_str, count_str = d.split(",")
-                value = float(value_str)
-                count = int(count_str)
-                durations_parsed.extend([value] * count)
-            except (ValueError, IndexError):
-                print(
-                    f"ERROR: Invalid duration format '{d}'. Use 'value' or 'value,count' (e.g., '3,20')"
-                )
-                sys.exit(1)
-        else:
-            # Single value
-            try:
-                durations_parsed.append(float(d))
-            except ValueError:
-                print(f"ERROR: Could not parse duration '{d}' as float")
-                sys.exit(1)
-
-    # Check if parsed durations match conditions
-    if len(durations_parsed) == 1:
-        # Single duration for all conditions
-        return durations_parsed * n_conditions
-    elif len(durations_parsed) == n_conditions:
-        # One duration per condition
-        return durations_parsed
-    else:
-        print(
-            f"ERROR: Number of durations ({len(durations_parsed)}) must be 1 or match "
-            f"number of conditions ({n_conditions})"
-        )
-        print(f"  Conditions: {condition_labels}")
-        sys.exit(1)
 
 
 def create_parser():
@@ -341,6 +289,13 @@ Notes:
         choices=["mean", "median"],
         default="median",
         help="Aggregation metric across CV folds (default: median)",
+    )
+    denoise_opts.add_argument(
+        "-single_trials",
+        action="store_true",
+        help="Use beta-space cross-validation (GLMsingle-style). "
+        "Fits single-trial model once on all data, evaluates R² on "
+        "condition-averaged vs individual trial betas across folds.",
     )
 
     # Processing options
@@ -1646,13 +1601,12 @@ def main():
         print(
             f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}"
         )
+        designs_by_hrf = None
     else:
         # Per-HRF mode: get shape from first design matrix
         first_hrf_idx = list(designs_by_hrf.keys())[0]
         n_task_cols = designs_by_hrf[first_hrf_idx].shape[1]
-        print(
-            f"  Task predictors: {n_task_cols} ({', '.join(condition_labels)})"
-        )
+        print(f"  Task predictors: {n_task_cols} ({', '.join(condition_labels)})")
         print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
         print(
             f"  Total columns per run: {n_task_cols} task + {nuisance_per_run[0].shape[1]} nuisance = {n_task_cols + nuisance_per_run[0].shape[1]}"
@@ -1684,8 +1638,242 @@ def main():
     else:
         chunk_size = None  # Auto-detect for GPU
 
-    # Fit denoising model (with per-voxel HRF support)
-    if designs_by_hrf is not None:
+    # Fit denoising model
+    if args.single_trials:
+        # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
+        from fastfuncsim.ridge import create_single_trial_design
+        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.glm_core import fit_glm
+        from fastfuncsim.glm_outputs import save_single_trial_results
+        from fastfuncsim.denoise import extract_noise_pcs_per_run
+
+        print()
+        print("=" * 70)
+        print("Using beta-space cross-validation for PC selection")
+        print("=" * 70)
+        print()
+
+        # Check that we're in single-HRF mode
+        if designs_by_hrf is not None:
+            print("ERROR: -single_trials is not yet supported with per-voxel HRFs")
+            sys.exit(1)
+
+        # 1. Build single-trial design with canonical HRF
+        print("Building single-trial design...")
+        st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = create_single_trial_design(
+            onsets_by_condition=all_onsets,
+            durations=durations,
+            run_starts=run_starts,
+            tr=args.tr,
+            n_timepoints=n_timepoints,
+            microtime_dt=args.microtime_dt,
+            condition_labels=condition_labels,
+            device=device,
+        )
+        print(f"  Single-trial design: {st_design.shape}")
+        print(f"  Condition design: {cond_design.shape}")
+
+        # 2. Compute initial R² using CONDITION-level design (for noise pool selection)
+        # The noise pool should reflect task signal strength, not trial reliability
+        print()
+        print("Computing initial R² with condition-level design for noise pool selection...")
+        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=args.n_perms)
+
+        # Build wide design: [condition | nuisance]
+        nuisance_design_init = torch.block_diag(*nuisance_per_run)
+        full_design_init = torch.cat([cond_design, nuisance_design_init], dim=1)
+        task_indices_init = list(range(cond_design.shape[1]))
+
+        # Fit OLS on full data for initial R²
+        glm_init = fit_glm(
+            data, full_design_init, tr=args.tr, max_poly_degree=0,
+            device=device, verbose=False, task_indices=task_indices_init)
+
+        initial_r2 = glm_init.r2  # (n_voxels,)
+        print(f"  Initial R²: mean={initial_r2.mean():.4f}, median={initial_r2.median():.4f}")
+
+        # 3. Select noise pool (R² < threshold)
+        print()
+        print(f"Selecting noise pool (R² < {args.r2_threshold})...")
+        noise_pool_mask = initial_r2 < args.r2_threshold
+
+        # Apply intensity threshold if provided
+        if brainthresh_mask is not None:
+            noise_pool_mask = noise_pool_mask & torch.from_numpy(brainthresh_mask).to(device)
+
+        n_noise = noise_pool_mask.sum().item()
+        n_total = noise_pool_mask.numel()
+        noise_fraction = n_noise / n_total
+
+        print(f"  Noise pool: {n_noise:,} voxels ({100*noise_fraction:.1f}%)")
+
+        if n_noise < args.min_noise_voxels:
+            print(f"ERROR: Insufficient noise voxels ({n_noise} < {args.min_noise_voxels})")
+            sys.exit(1)
+
+        if noise_fraction > args.max_noise_fraction:
+            print(f"WARNING: Noise fraction ({noise_fraction:.2f}) exceeds max ({args.max_noise_fraction})")
+            print(f"  Consider increasing -r2_threshold or using -mask")
+
+        # 4. Extract noise PCs from noise pool
+        print()
+        print(f"Extracting noise PCs (up to {args.max_pcs})...")
+        noise_pcs_per_run = extract_noise_pcs_per_run(
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_pool_mask,
+            max_components=args.max_pcs,
+            variance_threshold=args.variance_threshold,
+            nuisance_per_run=nuisance_per_run,
+            device=device,
+            verbose=args.verbose,
+        )
+
+        # noise_pcs_per_run is list of (run_len, n_pcs) tensors
+        for run_idx, pcs in enumerate(noise_pcs_per_run):
+            print(f"  Run {run_idx}: {pcs.shape[1]} PCs extracted")
+
+        # 5. For each PC count: fit single-trial model with wide design, beta-space CV
+        print()
+        print(f"Optimizing PC count (0 to {args.max_pcs})...")
+        r2_by_pc = torch.zeros(args.max_pcs + 1)
+
+        for n_pcs in range(args.max_pcs + 1):
+            # Build nuisance: polynomials + first n_pcs per run
+            nuisance_blocks = []
+            for run_idx in range(n_runs):
+                run_nuisance = nuisance_per_run[run_idx]
+                if n_pcs > 0:
+                    pcs = noise_pcs_per_run[run_idx][:, :n_pcs]
+                    run_nuisance = torch.cat([run_nuisance, pcs], dim=1)
+                nuisance_blocks.append(run_nuisance)
+            nuisance_design = torch.block_diag(*nuisance_blocks)
+
+            # Build wide design: [single_trial | nuisance]
+            full_design = torch.cat([st_design, nuisance_design], dim=1)
+            task_indices = list(range(st_design.shape[1]))
+
+            # Fit on full data
+            glm_results = fit_glm(
+                data, full_design, tr=args.tr, max_poly_degree=0,
+                device=device, verbose=False, task_indices=task_indices)
+
+            # Beta-space CV
+            st_betas = glm_results.betas  # (n_voxels, n_trials)
+            xval = compute_xval_r2_single_trials(
+                st_betas, trial_cond_ids, trial_run_ids, cv_splits,
+                metric=args.cv_metric, device=device, verbose=False)
+
+            # Aggregate across voxels (criteria voxels only for robustness)
+            criteria_mask = initial_r2 >= args.r2_threshold
+            if criteria_mask.sum() > 0:
+                r2_by_pc[n_pcs] = xval['r2'][criteria_mask].median()
+            else:
+                r2_by_pc[n_pcs] = xval['r2'].median()
+
+            print(f"  {n_pcs:2d} PCs: R² = {r2_by_pc[n_pcs].item():.4f}")
+
+        # 6. Select optimal PC count using pcstop criterion
+        print()
+        if args.pcstop < 0:
+            # User override: use exactly abs(pcstop) PCs
+            optimal_pcs = int(abs(args.pcstop))
+            print(f"User-specified PC count: {optimal_pcs}")
+        elif args.pcstop == 1.0:
+            # Pure argmax
+            optimal_pcs = int(r2_by_pc.argmax().item())
+            print(f"Optimal PC count (argmax): {optimal_pcs}")
+        else:
+            # GLMdenoise-style: stop when within (pcstop-1)*100% of max
+            max_r2 = r2_by_pc.max().item()
+            threshold = max_r2 / args.pcstop
+            for n_pcs in range(len(r2_by_pc)):
+                if r2_by_pc[n_pcs].item() >= threshold:
+                    optimal_pcs = n_pcs
+                    break
+            else:
+                optimal_pcs = len(r2_by_pc) - 1
+            print(f"Optimal PC count (pcstop={args.pcstop}): {optimal_pcs}")
+
+        # 7. Refit with optimal PC count and save
+        print()
+        print("Refitting with optimal PC count...")
+        nuisance_blocks = []
+        for run_idx in range(n_runs):
+            run_nuisance = nuisance_per_run[run_idx]
+            if optimal_pcs > 0:
+                pcs = noise_pcs_per_run[run_idx][:, :optimal_pcs]
+                run_nuisance = torch.cat([run_nuisance, pcs], dim=1)
+            nuisance_blocks.append(run_nuisance)
+        nuisance_design_final = torch.block_diag(*nuisance_blocks)
+
+        full_design_final = torch.cat([st_design, nuisance_design_final], dim=1)
+        task_indices_final = list(range(st_design.shape[1]))
+
+        glm_results_final = fit_glm(
+            data, full_design_final, tr=args.tr, max_poly_degree=0,
+            device=device, verbose=args.verbose, task_indices=task_indices_final)
+
+        final_betas = glm_results_final.betas
+
+        # Compute final beta-space R²
+        final_xval = compute_xval_r2_single_trials(
+            final_betas, trial_cond_ids, trial_run_ids, cv_splits,
+            metric=args.cv_metric, device=device, verbose=True)
+
+        # 8. Save outputs
+        print()
+        print("Saving single-trial outputs...")
+
+        # Prepare voxel_mask for saving
+        voxel_mask = None
+        if mask is not None:
+            voxel_mask = torch.from_numpy(mask.flatten().astype(bool))
+
+        output_files = save_single_trial_results(
+            betas=final_betas,
+            xval_r2=final_xval['r2'],
+            trial_labels=trial_labels,
+            trial_condition_ids=trial_cond_ids,
+            trial_run_ids=trial_run_ids,
+            condition_labels=condition_labels,
+            output_prefix=args.prefix,
+            volume_shape=volume_shape,
+            affine=affine,
+            voxel_mask=voxel_mask,
+        )
+
+        # Also save PC selection curve
+        np.save(f"{args.prefix}_pc_selection_curve.npy", r2_by_pc.cpu().numpy())
+        output_files["pc_selection_curve"] = f"{args.prefix}_pc_selection_curve.npy"
+
+        # Save metadata
+        metadata = {
+            "optimal_pcs": int(optimal_pcs),
+            "r2_threshold": args.r2_threshold,
+            "n_noise_voxels": int(n_noise),
+            "noise_fraction": float(noise_fraction),
+            "pc_selection_curve": r2_by_pc.cpu().tolist(),
+            "final_median_r2": float(final_xval['r2'].median()),
+        }
+        with open(f"{args.prefix}_denoise_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        output_files["denoise_metadata"] = f"{args.prefix}_denoise_metadata.json"
+
+        print()
+        print("=" * 70)
+        print("✅ 3dDenoisefast (single-trial mode) Complete!")
+        print("=" * 70)
+        print(f"  Optimal PCs: {optimal_pcs}")
+        print(f"  Final median beta-space R²: {final_xval['r2'].median():.4f}")
+        print()
+        for key, path in output_files.items():
+            print(f"  {key}: {path}")
+        print("=" * 70)
+
+        return  # Exit early - don't run standard pipeline
+
+    elif designs_by_hrf is not None:
         # Per-voxel HRF mode: pass designs_by_hrf + hrf_indices
         # fit_denoising_model handles the per-HRF logic internally
         print()

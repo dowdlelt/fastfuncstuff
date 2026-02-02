@@ -890,6 +890,18 @@ def _fit_voxelwise_hrf(
                         r2_to_store = r2_to_store.to(all_r2.device)
                     all_r2[chunk_voxel_indices] = r2_to_store
 
+                if chunk_results.tstats is not None:
+                    tstats_to_store = chunk_results.tstats
+                    if tstats_to_store.device != all_tstats.device:
+                        tstats_to_store = tstats_to_store.to(all_tstats.device)
+                    all_tstats[chunk_voxel_indices, :] = tstats_to_store
+
+                if chunk_results.sigma2 is not None:
+                    sigma2_to_store = chunk_results.sigma2
+                    if sigma2_to_store.device != all_sigma2.device:
+                        sigma2_to_store = sigma2_to_store.to(all_sigma2.device)
+                    all_sigma2[chunk_voxel_indices] = sigma2_to_store
+
                 # Clean up chunk data
                 del chunk_data, chunk_results
                 if device.type == "cuda":

@@ -229,7 +229,7 @@ def create_single_trial_design(
     microtime_dt: float = 0.1,
     condition_labels: Optional[List[str]] = None,
     device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, List[str], torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, List[str], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create single-trial design matrix with optional per-voxel HRFs
 
@@ -270,6 +270,8 @@ def create_single_trial_design(
         Label for each trial (e.g., "face_001", "house_023")
     trial_condition_ids : torch.Tensor, shape (n_trials,)
         Condition index (0-indexed) for each trial
+    trial_run_ids : torch.Tensor, shape (n_trials,)
+        Run index (0-indexed) for each trial
     condition_design : torch.Tensor, shape (n_timepoints, n_conditions)
         Condition-level design (sum of trials per condition)
     """
@@ -309,6 +311,12 @@ def create_single_trial_design(
         trial_labels.append(label)
         trial_condition_ids.append(cond_idx)
     trial_condition_ids = torch.tensor(trial_condition_ids, dtype=torch.long, device=device)
+
+    # Extract run IDs for each trial
+    trial_run_ids = torch.tensor(
+        [run_idx for _, run_idx, _, _ in trial_info],
+        dtype=torch.long, device=device,
+    )
 
     # Create onset matrix at microtime resolution
     bins_per_tr = int(round(tr / microtime_dt))
@@ -364,7 +372,7 @@ def create_single_trial_design(
             if cond_mask.sum() > 0:
                 condition_design[:, cond_idx] = design_matrix[:, cond_mask].sum(dim=1)
 
-        return design_matrix, trial_labels, trial_condition_ids, condition_design
+        return design_matrix, trial_labels, trial_condition_ids, trial_run_ids, condition_design
 
     else:
         # Per-voxel design matrices
@@ -406,7 +414,7 @@ def create_single_trial_design(
             if cond_mask.sum() > 0:
                 condition_design[:, cond_idx] = first_design[:, cond_mask].sum(dim=1)
 
-        return design_per_voxel, trial_labels, trial_condition_ids, condition_design
+        return design_per_voxel, trial_labels, trial_condition_ids, trial_run_ids, condition_design
 
 
 def _fit_ridge_chunk(

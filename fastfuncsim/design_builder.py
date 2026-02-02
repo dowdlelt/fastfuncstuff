@@ -16,6 +16,7 @@ from typing import Union, List, Optional, Tuple, Dict
 from scipy import special
 from scipy.stats import gamma as scipy_gamma
 import re
+import torch
 
 
 def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
@@ -1237,3 +1238,134 @@ def write_afni_xmat(
         for row_idx in range(n_timepoints):
             row_str = " ".join([f"{val:.17g}" for val in design_matrix[row_idx, :]])
             f.write(f" {row_str}\n")
+
+
+def create_onset_matrix_microtime(
+    all_onsets: list[list[np.ndarray]],
+    run_starts: list[int],
+    tr: float,
+    n_timepoints: int,
+    microtime_dt: float,
+    stim_durations: list[float],
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Create binary onset matrix at microtime resolution.
+
+    Parameters
+    ----------
+    all_onsets : list of list of np.ndarray
+        Onsets organized as [condition][run] -> np.ndarray of onset times
+    run_starts : list of int
+        Starting timepoint for each run (in TRs)
+    tr : float
+        Repetition time in seconds
+    n_timepoints : int
+        Total number of TR timepoints
+    microtime_dt : float
+        Microtime resolution in seconds (e.g., 0.1 = 100ms resolution)
+    stim_durations : list of float
+        Duration in seconds for each condition
+    device : torch.device
+        Device for output tensor
+
+    Returns
+    -------
+    onset_matrix : torch.Tensor
+        (n_microtime, n_conditions) matrix with boxcar values
+    """
+    bins_per_tr = int(round(tr / microtime_dt))
+    n_microtime = n_timepoints * bins_per_tr
+    n_conditions = len(all_onsets)
+    n_runs = len(run_starts)
+
+    # Compute run lengths in TRs
+    run_lengths = []
+    for i in range(n_runs):
+        if i < n_runs - 1:
+            run_lengths.append(run_starts[i + 1] - run_starts[i])
+        else:
+            run_lengths.append(n_timepoints - run_starts[i])
+
+    # Initialize onset matrix
+    onset_matrix = torch.zeros((n_microtime, n_conditions), dtype=torch.float32, device=device)
+
+    for cond_idx in range(n_conditions):
+        duration = stim_durations[cond_idx]
+        duration_bins = max(1, int(np.round(duration / microtime_dt)))
+
+        # Boxcar value is 1.0 (AFNI convention)
+        # The convolution function scales by dt, so the integral is properly computed.
+        # Result: A 3s event produces ~3x larger response than a 1s event (block scaling)
+        boxcar_value = 1.0
+
+        for run_idx in range(n_runs):
+            onsets = all_onsets[cond_idx][run_idx]
+            run_start_tr = run_starts[run_idx]
+
+            for onset_time in onsets:
+                # Convert onset time (seconds) to microtime bin
+                # onset_time is relative to run start
+                global_time = run_start_tr * tr + onset_time
+                microtime_bin = int(np.round(global_time / microtime_dt))
+
+                if 0 <= microtime_bin < n_microtime:
+                    # Place boxcar
+                    end_bin = min(microtime_bin + duration_bins, n_microtime)
+                    onset_matrix[microtime_bin:end_bin, cond_idx] = boxcar_value
+
+    return onset_matrix
+
+
+def parse_durations(
+    durations_arg: list[str],
+    n_conditions: int,
+    condition_labels: list[str],
+) -> list[float]:
+    """
+    Parse durations argument.
+
+    Supports formats:
+    - "2.0" -> single value
+    - "3,20" -> 20 repeats of 3.0 (value,count)
+    - Single value: applies to all conditions
+    - Multiple values: one per condition (in same order as onsets)
+    """
+    import sys
+
+    durations_parsed = []
+
+    # Parse each duration spec (can be "value" or "value,count")
+    for d in durations_arg:
+        if ',' in d:
+            # Parse "value,count" format (e.g., "3,20" -> [3, 3, 3, ...])
+            try:
+                value_str, count_str = d.split(',')
+                value = float(value_str)
+                count = int(count_str)
+                durations_parsed.extend([value] * count)
+            except (ValueError, IndexError):
+                print(f"ERROR: Invalid duration format '{d}'. Use 'value' or 'value,count' (e.g., '3,20')")
+                sys.exit(1)
+        else:
+            # Single value
+            try:
+                durations_parsed.append(float(d))
+            except ValueError:
+                print(f"ERROR: Could not parse duration '{d}' as float")
+                sys.exit(1)
+
+    # Check if parsed durations match conditions
+    if len(durations_parsed) == 1:
+        # Single duration for all conditions
+        return durations_parsed * n_conditions
+    elif len(durations_parsed) == n_conditions:
+        # One duration per condition
+        return durations_parsed
+    else:
+        print(
+            f"ERROR: Number of durations ({len(durations_parsed)}) must be 1 or match "
+            f"number of conditions ({n_conditions})"
+        )
+        print(f"  Conditions: {condition_labels}")
+        sys.exit(1)

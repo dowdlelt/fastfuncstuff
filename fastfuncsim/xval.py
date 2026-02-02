@@ -1173,3 +1173,133 @@ def compute_xval_r2(
     }
 
     return results
+
+
+def compute_xval_r2_single_trials(
+    single_trial_betas: torch.Tensor,
+    trial_condition_ids: torch.Tensor,
+    trial_run_ids: torch.Tensor,
+    cv_splits: List[Tuple[List[int], List[int]]],
+    metric: str = "cod",
+    device: Optional[torch.device] = None,
+    chunk_size: Optional[int] = None,
+    verbose: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """
+    Cross-validated R² in single-trial beta space (GLMsingle-style fit-once).
+
+    For each LORO fold:
+      1. Partition trials by run membership (using trial_run_ids)
+      2. Average train-run trial betas by condition → (n_voxels, n_conditions)
+      3. For each test trial: predicted = condition_avg[trial_condition]
+      4. Stack predicted vs actual test betas
+    After all folds: compute single R² from concatenated predictions vs actuals.
+
+    Parameters
+    ----------
+    single_trial_betas : (n_voxels, n_trials) betas from full-data fit
+    trial_condition_ids : (n_trials,) which condition each trial belongs to
+    trial_run_ids : (n_trials,) which run each trial came from
+    cv_splits : list of (train_runs, test_runs) tuples
+    metric : 'cod', 'corr', or 'corr2'
+    device : compute device (auto if None)
+    chunk_size : voxel chunk size for GPU memory (None = all at once)
+    verbose : print progress
+
+    Returns
+    -------
+    dict with:
+      'r2': (n_voxels,) beta-space CV R²
+      'n_splits': int
+      'n_test_trials_total': int
+    """
+    from .utils import get_device
+
+    if device is None:
+        device = get_device()
+
+    n_voxels, n_trials = single_trial_betas.shape
+    n_conditions = int(trial_condition_ids.max().item()) + 1
+    n_splits = len(cv_splits)
+
+    # Move small tensors to device
+    trial_condition_ids = trial_condition_ids.to(device)
+    trial_run_ids = trial_run_ids.to(device)
+
+    # Determine chunking
+    if chunk_size is None:
+        chunk_size = n_voxels  # No chunking by default (betas are small)
+
+    # Accumulate predicted and actual test betas across folds
+    all_predicted = []
+    all_actual = []
+
+    for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
+        if verbose:
+            print(f"  Split {split_idx + 1}/{n_splits}: "
+                  f"Train {train_runs} | Test {test_runs}")
+
+        # Build run membership masks
+        train_mask = torch.zeros(n_trials, dtype=torch.bool, device=device)
+        for r in train_runs:
+            train_mask |= (trial_run_ids == r)
+
+        test_mask = torch.zeros(n_trials, dtype=torch.bool, device=device)
+        for r in test_runs:
+            test_mask |= (trial_run_ids == r)
+
+        test_indices = torch.where(test_mask)[0]
+        n_test_trials = len(test_indices)
+
+        if n_test_trials == 0:
+            continue
+
+        # Average train betas by condition: (n_voxels, n_conditions)
+        # Process in voxel chunks
+        test_conditions = trial_condition_ids[test_indices]  # (n_test_trials,)
+
+        for chunk_start in range(0, n_voxels, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_voxels)
+            betas_chunk = single_trial_betas[chunk_start:chunk_end].to(device)
+
+            # Condition averages from train trials
+            condition_avg = torch.zeros(
+                chunk_end - chunk_start, n_conditions, device=device)
+            for c in range(n_conditions):
+                cond_train_mask = train_mask & (trial_condition_ids == c)
+                n_cond_train = cond_train_mask.sum().item()
+                if n_cond_train > 0:
+                    condition_avg[:, c] = betas_chunk[:, cond_train_mask].mean(dim=1)
+
+            # Predicted test betas: for each test trial, use its condition average
+            predicted = condition_avg[:, test_conditions]  # (chunk, n_test_trials)
+            actual = betas_chunk[:, test_indices]           # (chunk, n_test_trials)
+
+            if chunk_start == 0:
+                fold_predicted = predicted.cpu()
+                fold_actual = actual.cpu()
+            else:
+                fold_predicted = torch.cat([fold_predicted, predicted.cpu()], dim=0)
+                fold_actual = torch.cat([fold_actual, actual.cpu()], dim=0)
+
+        all_predicted.append(fold_predicted)
+        all_actual.append(fold_actual)
+
+    # Concatenate across folds: (n_voxels, total_test_trials)
+    all_predicted = torch.cat(all_predicted, dim=1)
+    all_actual = torch.cat(all_actual, dim=1)
+
+    # Compute R²
+    r2 = compute_r2_metric(all_actual, all_predicted, metric=metric)
+
+    total_test_trials = all_predicted.shape[1]
+    if verbose:
+        print(f"  Beta-space CV R²: mean={r2.mean():.4f}, "
+              f"median={r2.median():.4f} "
+              f"({total_test_trials} test trials across {n_splits} folds)")
+
+    return {
+        'r2': r2,
+        'n_splits': n_splits,
+        'n_test_trials_total': total_test_trials,
+    }
