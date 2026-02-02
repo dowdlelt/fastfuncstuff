@@ -809,9 +809,18 @@ def main():
             else:
                 run_lengths.append(n_timepoints - run_starts[i])
 
+        # Auto-determine polort if not specified (GLMdenoise formula)
+        if args.polort is None:
+            avg_run_len = sum(run_lengths) / len(run_lengths)
+            avg_run_duration = avg_run_len * args.tr
+            polort = int(np.floor(1 + avg_run_duration / 150.0))
+            print(f"  Auto-determined polort: {polort} (avg run duration: {avg_run_duration:.1f}s)")
+        else:
+            polort = args.polort
+
         nuisance_blocks = []
         for run_len in run_lengths:
-            nuisance_blocks.append(construct_polynomial_matrix(run_len, args.polort, device))
+            nuisance_blocks.append(construct_polynomial_matrix(run_len, polort, device))
 
         # Add ortvec if provided
         if ortvec_files:
