@@ -39,10 +39,13 @@ except ImportError:
 
 # Import fastfuncsim modules
 try:
-    from fastfuncsim.afni_io import (
-        load_afni_mask,
-        load_and_concatenate_runs,
-        load_nifti,
+    from fastfuncsim.cli_utils import (
+        auto_polort,
+        build_nuisance_per_run,
+        compute_run_lengths,
+        get_average_run_duration,
+        load_and_preprocess_runs,
+        parse_device_arg,
     )
     from fastfuncsim.design_builder import (
         create_onset_matrix_microtime,
@@ -53,8 +56,9 @@ try:
     from fastfuncsim.hrf_selection import (
         fit_glm_hrf_library_with_xval,
         save_hrf_selection_results,
+        _fit_voxelwise_hrf_canonical,
+        _fit_voxelwise_hrf_single_trial,
     )
-    from fastfuncsim.utils import gaussian_blur_3d, get_device, scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -288,6 +292,20 @@ Notes:
              "condition-averaged vs individual trial betas across folds. "
              "Replaces timeseries CV with beta-space CV for HRF selection.",
     )
+    cv_opts.add_argument(
+        "-save_single_trial_betas",
+        action="store_true",
+        help="Save single-trial betas refit with optimal HRF per voxel. "
+             "Only works with -single_trials. Processes voxels in HRF groups "
+             "with chunking to avoid OOM. Saves to {prefix}_stats_single_trial.nii.gz",
+    )
+    cv_opts.add_argument(
+        "-save_canonical_betas",
+        action="store_true",
+        help="Also save betas from canonical HRF fit for comparison. "
+             "Uses one design matrix for all voxels (chunked). "
+             "Saves to {prefix}_canonical_stats.nii.gz",
+    )
 
     # Processing options
     proc_opts = parser.add_argument_group("Processing Options")
@@ -512,188 +530,47 @@ def main():
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
 
-    # Setup device
-    if args.device:
-        if args.device.lower() == "cpu":
-            device = torch.device("cpu")
-        else:
-            device = torch.device(args.device)
-    else:
-        device = get_device()
+    # ==========================================================================
+    # 2. Load and preprocess data
+    # ==========================================================================
+
+    # Parse device argument using unified parser
+    device, _, _ = parse_device_arg(args.device)
     print(f"  Device: {device}")
 
-    # ==========================================================================
-    # 2. Load data
-    # ==========================================================================
+    # Load and preprocess data using shared utility
+    # This handles: metadata extraction, blur, masking, scaling, device strategy
+    load_result = load_and_preprocess_runs(
+        input_files=input_files,
+        tr=args.tr,
+        mask_file=args.mask,
+        blur_fwhm=args.do_blur,
+        do_scale=args.do_scale,
+        device=device,
+        force_cpu=args.keep_on_cpu,
+        verbose=True,
+    )
 
-    print()
-    print("Loading data...")
+    # Extract results
+    data = load_result.data
+    run_starts = load_result.run_starts
+    affine = load_result.affine
+    volume_shape = load_result.volume_shape
+    voxel_sizes = load_result.voxel_sizes
+    tr = load_result.tr
+    mask = load_result.mask
+    mask_flat = load_result.mask_flat
+    n_voxels = load_result.n_voxels
+    n_timepoints = load_result.n_timepoints
+    scale_info = load_result.scale_info
+    violations_mask = load_result.violations_mask
 
-    # Load mask if provided
-    mask = None
-    if args.mask:
-        mask = load_afni_mask(args.mask)
-        print(f"  Mask: {args.mask} ({mask.sum():,} voxels)")
-
-    # Load and concatenate runs
-    # Note: load_and_concatenate_runs returns (data, run_starts)
-    from pathlib import Path as PathLib  # avoid shadowing
-    from typing import cast
-
-    run_paths: list[Union[str, PathLib]] = [PathLib(f) for f in input_files]
-
-    # Estimate dataset size for GPU memory management
-    # Load first file to estimate size
-    first_img = load_nifti(input_files[0])
-    if hasattr(first_img, "shape"):
-        n_voxels_per_run = first_img.shape[0] * first_img.shape[1] * first_img.shape[2]
-        n_timepoints_per_run = (
-            first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[-1]
-        )
-    else:
-        # Fallback - load small dataset to GPU
-        n_voxels_per_run = 10000
-        n_timepoints_per_run = 200
-
-    total_timepoints = n_timepoints_per_run * n_runs
-
-    # If mask provided, only count in-mask voxels (dramatically reduces size)
-    if mask is not None:
-        n_voxels_per_run = int(mask.sum())
-
-    # Estimate memory requirement (in GB)
-    # 4 bytes per float32 value
-    data_size_gb = (n_voxels_per_run * total_timepoints * 4) / (1024**3)
-
-    # GPU memory threshold (conservative: 4GB for data + headroom for computation)
-    gpu_memory_threshold_gb = 4.0
-
-    # Decide whether to keep on CPU
-    # Respect explicit user flag, or auto-detect based on size
-    if args.keep_on_cpu:
-        keep_on_cpu = True
-        if args.verbose:
-            print()
-            print("  Loading to CPU (user-specified)")
-            print()
-    elif device.type == "cuda" and data_size_gb > gpu_memory_threshold_gb:
-        keep_on_cpu = True
-        if args.verbose:
-            print()
-            print(f"⚠️  Large dataset detected ({data_size_gb:.2f} GB)")
-            print("   Loading to CPU and processing voxels in GPU chunks")
-            print()
-    else:
-        keep_on_cpu = False
-
-    # Get affine and volume shape from first input
-    affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
-    volume_shape = tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
-
-    # Get voxel sizes from affine for blur kernel
-    voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
-
-    # ==========================================================================
-    # 2a. Optional: Apply Gaussian blur (must be done on 4D data before flattening)
-    # ==========================================================================
-    if args.do_blur is not None:
-        print()
-        print(f"Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
-
-        # Load runs individually, blur, then concatenate
-        from tqdm import tqdm
-
-        run_data_list = []
-        run_starts = [0]
-        current_timepoint = 0
-
-        for run_idx, run_file in enumerate(
-            tqdm(input_files, desc="  Loading & blurring", unit="run")
-        ):
-            # Load as 4D numpy array
-            img = load_nifti(run_file)
-            data_4d = img.get_fdata(dtype=np.float32)
-
-            if data_4d.ndim != 4:
-                raise ValueError(f"Expected 4D data, got shape {data_4d.shape}")
-
-            # Apply Gaussian blur (works on 4D data)
-            data_4d_blurred = gaussian_blur_3d(
-                data_4d,
-                fwhm_mm=args.do_blur,
-                voxel_sizes=voxel_sizes,
-                device=device,
-                verbose=(run_idx == 0),  # Only print kernel info for first run
-            )
-
-            # Flatten to 2D (n_voxels, n_timepoints)
-            n_tps = data_4d_blurred.shape[3]
-            data_2d = data_4d_blurred.reshape(-1, n_tps)
-
-            # Convert to torch
-            data_tensor = torch.from_numpy(data_2d)
-            if not keep_on_cpu:
-                data_tensor = data_tensor.to(device)
-
-            run_data_list.append(data_tensor)
-
-            # Update run starts
-            current_timepoint += n_tps
-            if run_idx < len(input_files) - 1:
-                run_starts.append(current_timepoint)
-
-            # Clean up
-            del data_4d, data_4d_blurred, data_2d
-
-        # Concatenate all runs
-        data = torch.cat(run_data_list, dim=1)
-        del run_data_list
-
-        # Apply mask AFTER blur (preserve blur-before-mask behavior)
-        if mask is not None:
-            mask_flat = mask.flatten().astype(bool)
-            data = data[mask_flat, :]
-
-        print(f"  ✓ Blurred and concatenated {n_runs} runs")
-    else:
-        # Standard loading without blur
-        mask_flat = mask.flatten().astype(bool) if mask is not None else None
-        data, run_starts = load_and_concatenate_runs(
-            cast(list[Union[str, PathLib]], run_paths),
-            device=device,
-            keep_on_cpu=keep_on_cpu,
-            mask_flat=mask_flat,
-        )
-
-    # Get TR from header if not provided
+    # Update args.tr with extracted value (for consistency with rest of code)
     if args.tr is None:
-        # TR is in zooms[3] for 4D NIfTI (pixdim[4] in raw header)
-        zooms = first_img.header.get_zooms()
-        if len(zooms) > 3 and zooms[3] > 0:
-            args.tr = float(zooms[3])
-            print(f"  TR from header: {args.tr}s")
-        else:
-            print("ERROR: Could not determine TR from NIfTI header.")
-            print("       Please specify TR with -tr option.")
-            sys.exit(1)
+        args.tr = tr
+        print(f"  TR from header: {tr}s")
     else:
         print(f"  TR (specified): {args.tr}s")
-
-    n_voxels, n_timepoints = data.shape
-
-    # ==========================================================================
-    # 2b. Optional: Scale to percent signal change (mean=100 per run)
-    # ==========================================================================
-    scale_info = None
-    violations_mask = None
-    if args.do_scale:
-        print()
-        data, violations_mask, scale_info = scale_to_percent_signal(
-            data=data,
-            run_starts=run_starts,
-            max_scale=200.0,
-            verbose=True,
-        )
 
     print(f"  Data shape: {data.shape} ({n_voxels:,} voxels x {n_timepoints} timepoints)")
     print(f"  Volume shape: {volume_shape}")
@@ -789,11 +666,12 @@ def main():
 
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-        from fastfuncsim.ridge import create_single_trial_design
-        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from tqdm import tqdm
+
         from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
         from fastfuncsim.hrf_selection import load_nuisance_file
-        from tqdm import tqdm
+        from fastfuncsim.ridge import create_single_trial_design
+        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
 
         print()
         print("=" * 70)
@@ -802,40 +680,28 @@ def main():
         print()
 
         # Build nuisance design (polynomials + ortvec, block-diagonal)
-        run_lengths = []
-        for i in range(n_runs):
-            if i < n_runs - 1:
-                run_lengths.append(run_starts[i + 1] - run_starts[i])
-            else:
-                run_lengths.append(n_timepoints - run_starts[i])
+        run_lengths = compute_run_lengths(run_starts, n_timepoints)
 
-        # Auto-determine polort if not specified (GLMdenoise formula)
+        # Auto-determine polort if not specified
         if args.polort is None:
-            avg_run_len = sum(run_lengths) / len(run_lengths)
-            avg_run_duration = avg_run_len * args.tr
-            polort = int(np.floor(1 + avg_run_duration / 150.0))
+            avg_run_duration = get_average_run_duration(run_lengths, args.tr)
+            polort = auto_polort(avg_run_duration, formula="afni")
             print(f"  Auto-determined polort: {polort} (avg run duration: {avg_run_duration:.1f}s)")
         else:
             polort = args.polort
 
-        nuisance_blocks = []
-        for run_len in run_lengths:
-            nuisance_blocks.append(construct_polynomial_matrix(run_len, polort, device))
+        # Build nuisance per run using shared utility
+        nuisance_per_run = build_nuisance_per_run(
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            polort=polort,
+            device=device,
+            ortvec_files=ortvec_files,
+            verbose=False,
+        )
 
-        # Add ortvec if provided
-        if ortvec_files:
-            print("Loading nuisance regressors...")
-            for filepath, label in ortvec_files:
-                nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
-                ortvec_tensor = torch.tensor(nuisance_data, dtype=torch.float32, device=device)
-                # Add to each run's nuisance (if not block-diagonal structure)
-                # For now, assume ortvec spans all runs
-                if len(nuisance_blocks) > 0:
-                    # Concatenate with first block, others stay as poly-only
-                    # This is simplified - full implementation would split ortvec by run
-                    pass
-
-        nuisance_design = torch.block_diag(*nuisance_blocks)
+        # Create block-diagonal nuisance design
+        nuisance_design = torch.block_diag(*nuisance_per_run)
         print(f"Nuisance design shape: {nuisance_design.shape}")
 
         # Generate CV splits
@@ -883,34 +749,11 @@ def main():
         xval_r2_best = xval_r2_all[torch.arange(n_voxels, device=device), hrf_index]
 
         print()
-        print(f"Best HRF selection complete:")
+        print("Best HRF selection complete:")
         print(f"  Mean R²: {xval_r2_best.mean():.4f}")
         print(f"  Median R²: {xval_r2_best.median():.4f}")
 
-        # Refit with optimal HRF per voxel to get final betas
-        print()
-        print("Refitting with optimal HRF per voxel...")
-
-        # Use create_single_trial_design with per-voxel HRFs
-        # Convert hrf_library from (n_hrfs, hrf_len) tensor to list of tensors
-        hrf_list = [hrf_library[i] for i in range(hrf_library.shape[0])]
-
-        st_design_final, trial_labels, trial_cond_ids, trial_run_ids, _ = create_single_trial_design(
-            onsets_by_condition=all_onsets,
-            durations=durations,
-            run_starts=run_starts,
-            tr=args.tr,
-            n_timepoints=n_timepoints,
-            hrf_library=hrf_list,
-            hrf_index_per_voxel=hrf_index,
-            microtime_dt=args.microtime_dt,
-            condition_labels=condition_labels,
-            device=device,
-        )
-        # st_design_final is (n_voxels, n_timepoints, n_trials)
-
-        # Fit per-voxel (this is complex - simplified for now)
-        # For now, use the HRF library approach - group voxels by HRF
+        # Create HRFSelectionResults object
         from fastfuncsim.hrf_selection import HRFSelectionResults
 
         # Create a results object compatible with existing save function
@@ -936,6 +779,64 @@ def main():
                 "hrf_usage_counts": hrf_usage_counts,
             }
         )
+
+        # ==========================================================================
+        # 5b. Optional: Refit with canonical/optimal HRFs for single-trial betas
+        # ==========================================================================
+        # Note: This section only applies to beta-space CV path (single-trial mode)
+        if args.save_canonical_betas:
+            print()
+            print("Fitting canonical HRF for comparison...")
+
+            # Get canonical HRF (usually first in library)
+            # hrf_library is (n_hrfs, n_timepoints), get first HRF as 1D tensor
+            canonical_hrf = hrf_library[0] if hrf_library.dim() == 2 else hrf_library
+
+            # Build canonical condition-level design
+            canonical_results = _fit_voxelwise_hrf_canonical(
+                data=data,
+                onsets=onset_matrix,
+                canonical_hrf=canonical_hrf,
+                nuisance_design=nuisance_design,
+                tr=tr,
+                microtime_dt=args.microtime_dt,
+                microtime_onset=0,  # Default: sample at start of TR
+                device=device,
+                verbose=args.verbose,
+            )
+
+            # Update results
+            results.canonical_results = canonical_results
+            print("  Canonical fit complete.")
+
+        if args.save_single_trial_betas:
+            print()
+            print("Refitting with optimal HRF per voxel (single-trial betas)...")
+
+            # Convert hrf_library from tensor (n_hrfs, n_timepoints) to list of 1D tensors
+            hrf_library_list = [hrf_library[i] for i in range(hrf_library.shape[0])]
+
+            # Refit with optimal HRF per voxel
+            final_results = _fit_voxelwise_hrf_single_trial(
+                data=data,
+                onsets_by_condition=all_onsets,
+                hrf_library=hrf_library_list,
+                hrf_index=hrf_index,
+                nuisance_design=nuisance_design,
+                durations=durations,
+                run_starts=run_starts,
+                tr=tr,
+                n_timepoints=n_timepoints,
+                microtime_dt=args.microtime_dt,
+                condition_labels=condition_labels,
+                device=device,
+                verbose=args.verbose,
+            )
+
+            # Update results
+            results.final_results = final_results
+            print("  Single-trial refit complete.")
+
 
     else:
         # ========== EXISTING TIMESERIES CV PATH (unchanged) ==========
@@ -988,6 +889,13 @@ def main():
         voxel_mask = torch.from_numpy(mask.flatten().astype(bool))
 
     # Save results
+    # Note: If we have single-trial betas, we need to save them separately with trial labels
+    # So temporarily remove final_results from the results object
+    final_results_temp = results.final_results
+
+    if args.save_single_trial_betas and results.final_results is not None:
+        results.final_results = None  # Temporarily remove to prevent save_hrf_selection_results from saving it
+
     output_files = save_hrf_selection_results(
         results=results,
         output_prefix=str(args.prefix),
@@ -1000,6 +908,47 @@ def main():
         onsets=onset_matrix if args.save_hrf_designs else None,
         save_plots=args.save_plots,
     )
+
+    # Restore final_results for custom saving
+    if args.save_single_trial_betas and final_results_temp is not None:
+        results.final_results = final_results_temp
+
+    # ==========================================================================
+    # 6b. Custom saving for single-trial betas (if requested)
+    # ==========================================================================
+    # Note: The canonical betas are already saved correctly by save_hrf_selection_results()
+    # to {prefix}_canonical_stats.nii.gz. For single-trial betas, we need custom saving
+    # to {prefix}_stats_single_trial.nii.gz instead of the default {prefix}_stats.nii.gz
+    if args.save_single_trial_betas and results.final_results is not None:
+        from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
+
+        print("  Saving single-trial betas with custom filename...")
+
+        # Set required metadata for saving (same as canonical_results)
+        results.final_results.original_shape = volume_shape
+        results.final_results.affine = affine
+        if voxel_mask is not None:
+            results.final_results.voxel_mask = voxel_mask
+
+        # Get trial labels from results (stored during refit)
+        trial_labels = results.final_results.trial_labels
+        if trial_labels is None:
+            print("  WARNING: No trial labels found, using generic names")
+            n_trials = results.final_results.betas.shape[1]
+            trial_labels = [f"trial_{i:04d}" for i in range(n_trials)]
+
+        # Save with custom filename using trial labels
+        single_trial_file = f"{args.prefix}_stats_single_trial.nii.gz"
+        write_glm_bucket_as_nifti(
+            results.final_results,
+            output_path=single_trial_file,
+            condition_names=trial_labels,  # Use trial labels, not condition labels!
+            volume_shape=volume_shape,
+            affine=affine,
+            apply_afni_metadata=True,
+        )
+        output_files["single_trial_betas"] = single_trial_file
+        print(f"  Single-trial betas saved: {single_trial_file}")
 
     # Save scaling violation mask if scaling was performed
     if args.do_scale and violations_mask is not None and scale_info is not None:
