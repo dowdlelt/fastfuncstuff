@@ -1,7 +1,78 @@
 # Refactoring Progress Tracker
 
-**Last Updated**: 2026-02-03 (Session: G3 Complete - R² Harmonization)
+**Last Updated**: 2026-02-03 (Session: Single-Trial Beta Refit Feature)
 **Goal**: Complete remaining architecture tasks (G1-G2, G4)
+
+---
+
+## NEW FEATURE: Single-Trial Beta Refit (2026-02-03) — COMPLETE ✅
+
+### Overview
+Implemented complete single-trial beta refit pipeline for beta-space CV HRF selection,
+allowing users to obtain per-voxel optimal HRFs AND single-trial beta estimates (GLMsingle-style).
+
+### F1: Voxel Size Diagnostic Bug Fix — FIXED ✅
+**File**: `fastfuncsim/cli_utils.py` line 290-292
+**Issue**: Voxel sizes extracted from affine diagonal, incorrect for non-axis-aligned images
+  - Example: 1.6×1.6×1.6mm data reported as (1.6, 0.0, 0.0)
+**Fix**: Use `header.get_zooms()` to read pixdim field correctly
+**Impact**: Accurate voxel size reporting across all tools
+
+### F2: CLI Utilities Module — NEW ✅
+**File**: `fastfuncsim/cli_utils.py` (951 lines)
+**Changes**:
+- Consolidated common CLI utilities (argument parsing, CV strategy, data loading)
+- Added `build_nuisance_block_diag()` for REML-style block-diagonal nuisance (D3 task)
+- Added voxel size extraction with pixdim fix
+- Added shared device argument parsing
+**Impact**: ~50 lines duplicated code eliminated in 3dREMLfast.py, improved consistency
+
+### F3: Memory Management Module — NEW ✅
+**File**: `fastfuncsim/memory.py` (398 lines)
+**Changes**:
+- `estimate_chunk_size()`: Unified chunking based on operation type (glm, ridge, pca, ica, denoise)
+- Device-aware memory querying (GPU/CPU/MPS)
+- Operation-specific memory models (accounts for CV, multiple fractions for ridge)
+- Conservative safety factors to prevent OOM
+**Impact**: Replaces hardcoded chunk sizes, automatic adaptation to dataset size
+
+### F4: Canonical HRF Fit Function — NEW ✅
+**File**: `fastfuncsim/hrf_selection.py` lines 971-1108
+**Function**: `_fit_voxelwise_hrf_canonical()`
+- Condition-level GLM fit with canonical HRF for comparison
+- One design matrix for all voxels, processes in chunks
+- Uses memory estimation for adaptive chunking
+**Output**: `{prefix}_canonical_stats.nii.gz` (2 condition regressors)
+
+### F5: Single-Trial HRF Refit Function — NEW ✅
+**File**: `fastfuncsim/hrf_selection.py` lines 1112-1320
+**Function**: `_fit_voxelwise_hrf_single_trial()`
+**Key Innovation**: "Group by HRF" approach to avoid OOM
+  - Old approach: Per-voxel design matrices → 1218 GiB allocation
+  - New approach: One design per HRF (20 total) with chunking
+- Simple OLS: `betas = (X'X)^-1 X'y` to avoid ridge scattering complexity
+- Groups voxels by optimal HRF, processes in chunks
+- Stores trial_labels for proper saving (324 labels for 324 trials)
+**Output**: `{prefix}_stats_single_trial.nii.gz` (324 trial regressors)
+
+### F6: CLI Integration — NEW ✅
+**File**: `bin/3dHRFoptfast.py`
+**New CLI Flags**:
+- `-save_canonical_betas`: Enable canonical HRF fit for comparison
+- `-save_single_trial_betas`: Enable single-trial refit with optimal HRFs
+**Implementation**:
+- Prevents `save_hrf_selection_results()` from saving with wrong labels (2 vs 324)
+- Sets metadata (original_shape, affine, voxel_mask) for proper reshaping
+- Uses trial_labels from results for correct NIfTI output
+**Impact**: Complete GLMsingle-style pipeline: HRF selection → single-trial betas
+
+### Files Modified:
+- `fastfuncsim/cli_utils.py`: New module (951 lines)
+- `fastfuncsim/memory.py`: New module (398 lines)
+- `fastfuncsim/hrf_selection.py`: Added 2 functions (+360 lines)
+- `bin/3dHRFoptfast.py`: CLI integration (+186 lines, -237 lines)
+
+### TEST STATUS**: 323 passed, 1 skipped, 0 failures ✅
 
 ---
 
@@ -143,23 +214,29 @@
 - **Phase E (Numerical Harmonization)**: 3/3 tasks complete ✅
 - **Phase F (Performance Optimizations)**: 3/3 tasks complete ✅
 - **Phase G (Architecture)**: 1/4 tasks complete (G3: R² harmonization) ✅
+- **Phase F (Feature - Single-Trial Refit)**: 6/6 tasks complete ✅ **NEW!**
 
 ### Key Metrics:
 - **Tests**: 323 passed, 1 skipped, 0 failures (up from 317 passed, 6 failed)
 - **Lines of code eliminated**: ~390+ through deduplication
+- **Lines of code added**: ~1,700 (single-trial refit feature, CLI utilities, memory management)
 - **Performance**: Vectorized 3 critical loops in ridge.py (F1-F3)
 - **Numerical improvements**: QR-based projection unified, R² computation harmonized across all modules
-- **Memory management**: Unified chunk size estimation in memory.py
+- **Memory management**: Unified chunk size estimation in memory.py, prevents OOM on large datasets
 - **REML flexibility**: New `build_nuisance_block_diag()` for block-diagonal nuisance
 - **R² consistency**: Single source of truth via `compute_r2_metric()` and `compute_r2_from_sufficient_stats()`
+- **New capability**: Single-trial beta refit with per-voxel optimal HRFs (GLMsingle-style pipeline)
 
 ### Files Modified:
+- `fastfuncsim/cli_utils.py`: **NEW** module (951 lines) - shared utilities, voxel size fix, nuisance builders
+- `fastfuncsim/memory.py`: **NEW** module (398 lines) - unified memory management and chunking
 - `fastfuncsim/denoise.py`: Major refactoring (E2, E3, G3)
 - `fastfuncsim/xval.py`: QR-based projection (E1), compute_r2_from_sufficient_stats (G3)
-- `fastfuncsim/cli_utils.py`: Added `build_nuisance_block_diag()` (D3)
 - `fastfuncsim/ridge.py`: Vectorized scattering, design hashing, R² harmonization (F1-F3, G3)
 - `fastfuncsim/glm_core.py`: R² harmonization (G3)
 - `fastfuncsim/arma_glm.py`: R² harmonization (G3)
+- `fastfuncsim/hrf_selection.py`: **NEW** `_fit_voxelwise_hrf_canonical()` and `_fit_voxelwise_hrf_single_trial()` (+360 lines)
+- `bin/3dHRFoptfast.py`: CLI integration for single-trial refit (+186 lines, -237 lines)
 - `bin/3dREMLfast.py`: Nuisance deduplication, removed 2 duplicate blocks (D3)
 - `tests/test_glm_core_extended.py`: Legendre polynomial tests
 - `tests/test_high_level_confirmation.py`: Microtime and HRF library tests
