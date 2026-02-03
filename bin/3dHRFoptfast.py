@@ -953,7 +953,7 @@ def main():
     # Save scaling violation mask if scaling was performed
     if args.do_scale and violations_mask is not None and scale_info is not None:
         # Sum violations across time to get count per voxel
-        violation_counts = violations_mask.sum(dim=1).cpu().numpy()  # (n_voxels,)
+        violation_counts = violations_mask.cpu().sum(dim=1).numpy()  # (n_voxels,)
 
         # Reshape back to volume
         if mask is not None:

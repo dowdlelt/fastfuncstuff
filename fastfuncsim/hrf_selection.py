@@ -1181,17 +1181,6 @@ def _fit_voxelwise_hrf_single_trial(
     # Group voxels by HRF
     unique_hrfs = torch.unique(hrf_index)
 
-    # Build nuisance per-run list for ridge
-    nuisance_per_run = []
-    for run_idx in range(n_runs):
-        run_start = run_starts[run_idx]
-        run_end = run_starts[run_idx + 1] if run_idx + 1 < n_runs else n_timepoints
-        nuisance_run = nuisance_design[run_start:run_end, :]
-        nuisance_per_run.append(nuisance_run)
-
-    # Create CV splits (use simple split-half: [0] vs [1:])
-    cv_splits = [([0], list(range(1, n_runs)))]
-
     # First, get trial info using canonical HRF (just to get n_trials)
     from .ridge import create_single_trial_design
     st_design_canonical, trial_labels, trial_cond_ids, trial_run_ids, condition_design = create_single_trial_design(
@@ -1246,11 +1235,15 @@ def _fit_voxelwise_hrf_single_trial(
         )
         # st_design is (n_timepoints, n_trials) for this HRF
 
+        # Build full design: [single_trial | nuisance] so drift is modeled
+        full_design = torch.cat([st_design, nuisance_design.to(st_design.device)], dim=1)
+        n_full_regressors = full_design.shape[1]
+
         # Determine chunk size using memory estimation
         voxel_chunk_size = estimate_chunk_size(
             n_voxels=n_group_voxels,
             n_timepoints=n_timepoints,
-            n_regressors=n_trials,
+            n_regressors=n_full_regressors,
             device=device,
             operation="glm",
             min_chunk_size=10000,
@@ -1276,21 +1269,19 @@ def _fit_voxelwise_hrf_single_trial(
                 chunk_data = data[chunk_voxel_indices, :]
 
             # Move design and data to same device
-            st_design_device = st_design.to(device)
+            full_design_device = full_design.to(device)
             chunk_data_device = chunk_data.to(device)
 
-            # Simple OLS fit: betas = (X'X)^-1 X'y
-            # X is (n_timepoints, n_trials), y is (n_voxels, n_timepoints)
-            # Solution: betas = y @ X @ (X'X)^-1
-            XtX = st_design_device.T @ st_design_device  # (n_trials, n_trials)
-            XtX_inv = torch.inverse(XtX)  # (n_trials, n_trials)
-            Xty = chunk_data_device @ st_design_device  # (n_voxels, n_trials)
-            chunk_betas = Xty @ XtX_inv  # (n_voxels, n_trials)
+            # OLS via lstsq (numerically stable for ill-conditioned single-trial designs)
+            # full_design: (n_timepoints, n_trials + n_nuisance), data.T: (n_timepoints, n_voxels)
+            all_betas = torch.linalg.lstsq(full_design_device, chunk_data_device.T).solution  # (n_full, n_voxels)
+            all_betas = all_betas.T  # (n_voxels, n_full)
 
-            # Compute predictions and R²
-            # predictions = X @ betas.T = (n_timepoints, n_trials) @ (n_trials, n_voxels)
-            # Then transpose to get (n_voxels, n_timepoints)
-            chunk_predictions = (st_design_device @ chunk_betas.T).T  # (n_voxels, n_timepoints)
+            # Extract only single-trial betas (first n_trials columns)
+            chunk_betas = all_betas[:, :n_trials]
+
+            # Compute predictions from full model for R²
+            chunk_predictions = (full_design_device @ all_betas.T).T  # (n_voxels, n_timepoints)
             chunk_r2 = compute_r2_metric(chunk_data_device, chunk_predictions)  # (n_voxels,)
 
             # Accumulate results
@@ -1298,7 +1289,7 @@ def _fit_voxelwise_hrf_single_trial(
             all_single_trial_r2[chunk_voxel_indices] = chunk_r2.cpu()
 
             # Clean up
-            del chunk_data, chunk_data_device, st_design_device, chunk_betas, chunk_predictions, chunk_r2
+            del chunk_data, chunk_data_device, full_design_device, all_betas, chunk_betas, chunk_predictions, chunk_r2
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 

@@ -52,7 +52,17 @@ except ImportError:
 
 # Import fastfuncsim modules
 try:
-    from fastfuncsim.afni_io import load_and_concatenate_runs, load_afni_mask, load_nifti
+    from fastfuncsim.afni_io import load_afni_mask, load_nifti
+    from fastfuncsim.cli_utils import (
+        auto_polort,
+        build_nuisance_per_run,
+        compute_run_lengths,
+        get_average_run_duration,
+        load_and_preprocess_runs,
+        LoadResult,
+        save_4d_nifti,
+        save_volume_nifti,
+    )
     from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
     from fastfuncsim.hrf import get_hrf_library
     from fastfuncsim.ridge import (
@@ -332,45 +342,37 @@ def main():
 
     # Load data
     print("Loading data...")
-    first_img = load_nifti(input_files[0])
 
-    # Load mask if provided
-    mask = None
-    if args.mask:
-        mask = load_afni_mask(args.mask)
-        n_voxels_masked = mask.sum()
-        print(f"  Mask: {args.mask} ({n_voxels_masked:,} voxels)")
-    else:
-        print("  No mask specified - using all voxels")
-
-    # Load fMRI data
-    mask_flat = mask.flatten().astype(bool) if mask is not None else None
-    data, run_starts = load_and_concatenate_runs(
-        [Path(f) for f in input_files],
+    # Load and preprocess data using unified utility
+    # Note: do_scale=False here - scaling will be applied separately if requested
+    # to maintain the existing behavior of showing scaling info separately
+    load_result: LoadResult = load_and_preprocess_runs(
+        input_files=input_files,
+        tr=args.tr,
+        mask_file=args.mask,
+        blur_fwhm=None,  # No blur in 3dRidgefast
+        do_scale=False,
         device=device,
-        keep_on_cpu=False,
-        mask_flat=mask_flat,
+        force_cpu=False,  # 3dRidgefast always loads to GPU
+        verbose=True,
     )
 
-    n_voxels, n_timepoints = data.shape
-    n_runs = len(run_starts)
+    # Extract loaded data
+    data = load_result.data
+    run_starts = load_result.run_starts
+    mask = load_result.mask
+    mask_flat = load_result.mask_flat
+    affine = load_result.affine
+    volume_shape = load_result.volume_shape
+    n_voxels = load_result.n_voxels
+    n_timepoints = load_result.n_timepoints
+    n_runs = load_result.n_runs
 
-    print(f"  Data shape: {data.shape} ({n_voxels:,} voxels × {n_timepoints} timepoints)")
-    print(f"  Runs: {n_runs}")
-
-    # Get TR
+    # Update args.tr with loaded value (for later use)
     if args.tr is None:
-        zooms = first_img.header.get_zooms()
-        if len(zooms) > 3 and zooms[3] > 0:
-            args.tr = float(zooms[3])
-            print(f"  TR (from header): {args.tr}s")
-        else:
-            print("ERROR: Could not determine TR from header. Use -tr flag.")
-            sys.exit(1)
-    else:
-        print(f"  TR (specified): {args.tr}s")
+        args.tr = load_result.tr
 
-    # Apply scaling if requested
+    # Apply scaling if requested (maintaining existing behavior)
     scale_info = None
     violations_mask = None
     if args.do_scale:
@@ -385,6 +387,8 @@ def main():
         if violations_mask is not None:
             n_violations = violations_mask.any(dim=1).sum().item()
             print(f"  Clipping violations: {n_violations:,} voxels")
+
+    print()
 
     # Load HRF indices if provided
     hrf_library = None
@@ -445,11 +449,14 @@ def main():
 
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-        from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
-        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.glm_core import construct_polynomial_matrix
         from fastfuncsim.glm_outputs import save_single_trial_results
         from fastfuncsim.ridge import _fit_ridge_multiple_fracs
-        from fastfuncsim.xval import project_out_nuisance_per_run
+        from fastfuncsim.xval import (
+            compute_xval_r2_single_trials,
+            generate_cv_splits,
+            project_out_nuisance_per_run,
+        )
 
         print("Using beta-space cross-validation (GLMsingle-style)")
         print()
@@ -457,29 +464,22 @@ def main():
         # Build nuisance design (polynomials + noise PCs)
         # Auto-determine polort if not specified
         if args.polort is None:
-            avg_run_duration_min = (n_timepoints / n_runs) * args.tr / 60.0
-            polort = max(1, round(avg_run_duration_min / 2))
-            print(f"Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)")
+            run_lengths = compute_run_lengths(run_starts, n_timepoints)
+            avg_run_duration_sec = get_average_run_duration(run_lengths, args.tr)
+            polort = auto_polort(avg_run_duration_sec, formula="afni")
+            print(f"Auto polort: {polort} (based on {avg_run_duration_sec/60:.1f} min avg run)")
         else:
             polort = args.polort
 
-        # Polynomials per run (block-diagonal)
-        poly_blocks = []
-        for run_idx in range(n_runs):
-            start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_len = end_tp - start_tp
-            poly_blocks.append(construct_polynomial_matrix(run_len, polort, device))
-
-        # Build nuisance per run (polys + PCs if provided)
-        nuisance_per_run = []
-        for run_idx in range(n_runs):
-            run_nuisance = poly_blocks[run_idx]
-            if noise_pcs is not None:
-                # noise_pcs is list of (run_len, n_pcs) per run
-                pcs = noise_pcs[run_idx].to(device)
-                run_nuisance = torch.cat([run_nuisance, pcs], dim=1)
-            nuisance_per_run.append(run_nuisance)
+        # Build nuisance per run using shared utility
+        nuisance_per_run = build_nuisance_per_run(
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            polort=polort,
+            device=device,
+            noise_pcs=noise_pcs,
+            verbose=False,
+        )
 
         # Project nuisance from data and design
         print("Projecting nuisance from data and design...")
@@ -517,19 +517,18 @@ def main():
             print("Applying GLMsingle-style autoscaling...")
             # Autoscale: fit OLS on cleaned data for each voxel's selected betas
             # This undoes the ridge shrinkage bias
-            for v in range(n_voxels):
-                # Get this voxel's data and betas
-                voxel_data = data_clean[v, :]
-                voxel_betas = final_betas[v, :]
+            # Vectorized implementation: process all voxels simultaneously
+            # predicted[v, :] = design_clean @ final_betas[v, :]
+            predicted = final_betas @ design_clean.T  # (n_voxels, n_timepoints)
 
-                # Compute predicted signal
-                predicted = design_clean @ voxel_betas
+            # Compute scaling factors for all voxels at once
+            # scale_factor[v] = (data_clean[v] @ predicted[v]) / (predicted[v] @ predicted[v] + eps)
+            numer = (data_clean * predicted).sum(dim=1)  # (n_voxels,)
+            denom = (predicted * predicted).sum(dim=1) + 1e-10  # (n_voxels,)
+            scale_factors = numer / denom  # (n_voxels,)
 
-                # Compute scaling factor (OLS fit of predicted to actual)
-                scale_factor = (voxel_data @ predicted) / (predicted @ predicted + 1e-10)
-
-                # Apply scaling
-                final_betas[v, :] *= scale_factor
+            # Apply scaling (broadcast across trials)
+            final_betas *= scale_factors.unsqueeze(1)  # (n_voxels, n_trials)
 
         print()
         print(f"Beta-space CV R²: mean={xval_r2.mean():.4f}, median={xval_r2.median():.4f}")
@@ -561,8 +560,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Get volume shape and affine for saving
-    vol_shape = first_img.shape[:3]
-    affine = first_img.affine
+    vol_shape = volume_shape
+    # affine is already extracted from load_result
 
     if args.single_trials:
         # ========== SINGLE-TRIAL OUTPUT MODE ==========
@@ -583,142 +582,101 @@ def main():
         )
 
         # Also save ridge-specific outputs
-        def save_result_volume(data_tensor, filename):
-            if mask is not None:
-                full_data = np.zeros(mask.size, dtype=np.float32)
-                full_data[mask_flat] = data_tensor.cpu().numpy()
-                data_3d = full_data.reshape(vol_shape)
-            else:
-                data_3d = data_tensor.cpu().numpy().reshape(vol_shape)
-            img = nib.Nifti1Image(data_3d, affine=affine)
-            nib.save(img, filename)
-            print(f"  {filename}")
-
-        def save_result_4d(data_tensor, filename):
-            n_vols = data_tensor.shape[1]
-            if mask is not None:
-                full_data = np.zeros((mask.size, n_vols), dtype=np.float32)
-                full_data[mask_flat, :] = data_tensor.cpu().numpy()
-                data_4d = full_data.reshape((*vol_shape, n_vols))
-            else:
-                data_4d = data_tensor.cpu().numpy().reshape((*vol_shape, n_vols))
-            img = nib.Nifti1Image(data_4d, affine=affine)
-            nib.save(img, filename)
-            print(f"  {filename}")
-
-        save_result_volume(optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz")
-        save_result_4d(r2_by_frac, f"{args.prefix}_r2_by_frac.nii.gz")
+        # Save optimal fractions and R² per fraction
+        voxel_mask_np = mask_flat if mask is not None else None
+        save_volume_nifti(optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_optimal_frac.nii.gz")
+        save_4d_nifti(r2_by_frac, f"{args.prefix}_r2_by_frac.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_r2_by_frac.nii.gz")
 
     else:
-        # ========== EXISTING OUTPUT MODE (unchanged) ==========
-        # Helper to reshape and save 3D volumes
-        def save_result_volume(data_tensor, filename):
-            if mask is not None:
-                # Unmask to full volume
-                full_data = np.zeros(mask.size, dtype=np.float32)
-                full_data[mask_flat] = data_tensor.cpu().numpy()
-                data_3d = full_data.reshape(vol_shape)
-            else:
-                # No mask - reshape to original volume
-                data_3d = data_tensor.cpu().numpy().reshape(vol_shape)
-
-            img = nib.Nifti1Image(data_3d, affine=affine)
-            nib.save(img, filename)
-            print(f"  {filename}")
-
-        # Helper to reshape and save 4D volumes (e.g., betas, R² per frac)
-        def save_result_4d(data_tensor, filename):
-            """Save 4D volume: data_tensor shape (n_voxels, n_volumes)"""
-            n_vols = data_tensor.shape[1]
-            if mask is not None:
-                # Unmask to full volume: (n_voxels, n_volumes) -> (x, y, z, n_volumes)
-                full_data = np.zeros((mask.size, n_vols), dtype=np.float32)
-                full_data[mask_flat, :] = data_tensor.cpu().numpy()
-                data_4d = full_data.reshape((*vol_shape, n_vols))
-            else:
-                # No mask
-                data_4d = data_tensor.cpu().numpy().reshape((*vol_shape, n_vols))
-
-            img = nib.Nifti1Image(data_4d, affine=affine)
-            nib.save(img, filename)
-            print(f"  {filename}")
+        # ========== EXISTING OUTPUT MODE ==========
+        voxel_mask_np = mask_flat if mask is not None else None
 
         # Save R² maps and optimal fractions
-        save_result_volume(results.r2_initial, f"{args.prefix}_r2_initial.nii.gz")
-        save_result_volume(results.r2, f"{args.prefix}_r2.nii.gz")
-        save_result_volume(results.xval_r2, f"{args.prefix}_xval_r2.nii.gz")
-        save_result_volume(results.optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz")
+        save_volume_nifti(results.r2_initial, f"{args.prefix}_r2_initial.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_r2_initial.nii.gz")
+        save_volume_nifti(results.r2, f"{args.prefix}_r2.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_r2.nii.gz")
+        save_volume_nifti(results.xval_r2, f"{args.prefix}_xval_r2.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_xval_r2.nii.gz")
+        save_volume_nifti(results.optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_optimal_frac.nii.gz")
 
         # Save single-trial betas (4D file)
-        save_result_4d(results.betas_single_trial, f"{args.prefix}_betas_single_trial.nii.gz")
+        save_4d_nifti(results.betas_single_trial, f"{args.prefix}_betas_single_trial.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_betas_single_trial.nii.gz")
 
         # Save trial labels text file
         trial_labels_file = f"{args.prefix}_trial_labels.txt"
-    with open(trial_labels_file, "w") as f:
-        for label in results.trial_labels:
-            f.write(f"{label}\n")
-    print(f"  {trial_labels_file}")
+        with open(trial_labels_file, "w") as f:
+            for label in results.trial_labels:
+                f.write(f"{label}\n")
+        print(f"  {trial_labels_file}")
 
-    # Compute and save mean condition betas (average single-trial betas within each condition)
-    print()
-    print("Computing mean condition betas...")
-    n_conditions = trial_condition_ids.max().item() + 1
-    condition_betas = torch.zeros(n_voxels, n_conditions, device="cpu")
-    for cond_idx in range(n_conditions):
-        cond_mask = trial_condition_ids.cpu() == cond_idx
-        if cond_mask.sum() > 0:
-            condition_betas[:, cond_idx] = results.betas_single_trial[:, cond_mask].mean(dim=1)
+        # Compute and save mean condition betas (average single-trial betas within each condition)
+        print()
+        print("Computing mean condition betas...")
+        n_conditions = trial_condition_ids.max().item() + 1
+        condition_betas = torch.zeros(n_voxels, n_conditions, device="cpu")
+        for cond_idx in range(n_conditions):
+            cond_mask = trial_condition_ids.cpu() == cond_idx
+            if cond_mask.sum() > 0:
+                condition_betas[:, cond_idx] = results.betas_single_trial[:, cond_mask].mean(dim=1)
 
-    save_result_4d(condition_betas, f"{args.prefix}_betas_condition.nii.gz")
+        save_4d_nifti(condition_betas, f"{args.prefix}_betas_condition.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_betas_condition.nii.gz")
 
-    # Save condition labels text file
-    condition_labels_file = f"{args.prefix}_condition_labels.txt"
-    with open(condition_labels_file, "w") as f:
-        for label in condition_labels:
-            f.write(f"{label}\n")
-    print(f"  {condition_labels_file}")
+        # Save condition labels text file
+        condition_labels_file = f"{args.prefix}_condition_labels.txt"
+        with open(condition_labels_file, "w") as f:
+            for label in condition_labels:
+                f.write(f"{label}\n")
+        print(f"  {condition_labels_file}")
 
-    # Save R² per ridge fraction (4D file with one volume per fraction)
-    save_result_4d(results.r2_by_frac, f"{args.prefix}_r2_by_frac.nii.gz")
+        # Save R² per ridge fraction (4D file with one volume per fraction)
+        save_4d_nifti(results.r2_by_frac, f"{args.prefix}_r2_by_frac.nii.gz", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_r2_by_frac.nii.gz")
 
-    # Save fractions text file for reference
-    fracs_file = f"{args.prefix}_ridge_fracs.txt"
-    with open(fracs_file, "w") as f:
-        for frac in fracs:
-            f.write(f"{frac:.4f}\n")
-    print(f"  {fracs_file}")
+        # Save fractions text file for reference
+        fracs_file = f"{args.prefix}_ridge_fracs.txt"
+        with open(fracs_file, "w") as f:
+            for frac in fracs:
+                f.write(f"{frac:.4f}\n")
+        print(f"  {fracs_file}")
 
-    # Save scaling violation mask if scaling was performed
-    if args.do_scale and violations_mask is not None and scale_info is not None:
-        # Sum violations across time to get count per voxel
-        violation_counts = violations_mask.sum(dim=1).cpu().numpy()  # (n_voxels,)
-        save_result_volume(torch.from_numpy(violation_counts), f"{args.prefix}_scale_violations.nii.gz")
+        # Save scaling violation mask if scaling was performed
+        if args.do_scale and violations_mask is not None and scale_info is not None:
+            # Sum violations across time to get count per voxel
+            violation_counts = violations_mask.cpu().sum(dim=1).numpy()  # (n_voxels,)
+            save_volume_nifti(torch.from_numpy(violation_counts), f"{args.prefix}_scale_violations.nii.gz", vol_shape, affine, voxel_mask_np)
+            print(f"  {args.prefix}_scale_violations.nii.gz")
 
-    print()
-    print("Output files created:")
-    print(f"  {args.prefix}_r2_initial.nii.gz - Initial R² (minimal ridge, ~OLS)")
-    print(f"  {args.prefix}_r2.nii.gz - Final R² (in-sample, at optimal ridge)")
-    print(f"  {args.prefix}_xval_r2.nii.gz - Cross-validated R²")
-    print(f"  {args.prefix}_optimal_frac.nii.gz - Optimal ridge fraction per voxel")
-    print(f"  {args.prefix}_betas_single_trial.nii.gz - Single-trial betas (4D, {n_trials} volumes)")
-    print(f"  {args.prefix}_trial_labels.txt - Trial labels for single-trial betas")
-    print(f"  {args.prefix}_betas_condition.nii.gz - Mean condition betas (4D, {n_conditions} volumes)")
-    print(f"  {args.prefix}_condition_labels.txt - Condition labels for condition betas")
-    print(f"  {args.prefix}_r2_by_frac.nii.gz - CV R² per ridge fraction (4D, {len(fracs)} volumes)")
-    print(f"  {args.prefix}_ridge_fracs.txt - Ridge fraction values")
-    if args.do_scale and violations_mask is not None:
-        print(f"  {args.prefix}_scale_violations.nii.gz - Scaling violation counts per voxel")
-    print()
-    print("Summary statistics:")
-    print(f"  Median R² (initial, OLS): {results.r2_initial.median():.4f}")
-    print(f"  Median R² (final, ridge): {results.r2.median():.4f}")
-    print(f"  Median R² (xval): {results.xval_r2.median():.4f}")
-    print(f"  Median optimal ridge fraction: {results.optimal_fracs.median():.4f}")
+        print()
+        print("Output files created:")
+        print(f"  {args.prefix}_r2_initial.nii.gz - Initial R² (minimal ridge, ~OLS)")
+        print(f"  {args.prefix}_r2.nii.gz - Final R² (in-sample, at optimal ridge)")
+        print(f"  {args.prefix}_xval_r2.nii.gz - Cross-validated R²")
+        print(f"  {args.prefix}_optimal_frac.nii.gz - Optimal ridge fraction per voxel")
+        print(f"  {args.prefix}_betas_single_trial.nii.gz - Single-trial betas (4D, {n_trials} volumes)")
+        print(f"  {args.prefix}_trial_labels.txt - Trial labels for single-trial betas")
+        print(f"  {args.prefix}_betas_condition.nii.gz - Mean condition betas (4D, {n_conditions} volumes)")
+        print(f"  {args.prefix}_condition_labels.txt - Condition labels for condition betas")
+        print(f"  {args.prefix}_r2_by_frac.nii.gz - CV R² per ridge fraction (4D, {len(fracs)} volumes)")
+        print(f"  {args.prefix}_ridge_fracs.txt - Ridge fraction values")
+        if args.do_scale and violations_mask is not None:
+            print(f"  {args.prefix}_scale_violations.nii.gz - Scaling violation counts per voxel")
+        print()
+        print("Summary statistics:")
+        print(f"  Median R² (initial, OLS): {results.r2_initial.median():.4f}")
+        print(f"  Median R² (final, ridge): {results.r2.median():.4f}")
+        print(f"  Median R² (xval): {results.xval_r2.median():.4f}")
+        print(f"  Median optimal ridge fraction: {results.optimal_fracs.median():.4f}")
 
-    print()
-    print("=" * 70)
-    print(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
+        print()
+        print("=" * 70)
+        print(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70)
 
 
 if __name__ == "__main__":
