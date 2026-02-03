@@ -8,6 +8,7 @@ captures the true hemodynamic response for each voxel.
 
 Key function: fit_glm_hrf_library_with_xval()
 """
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,14 +18,14 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from .design import convolve_hrf, convolve_hrf_microtime
+from .design import convolve_hrf_microtime
 from .glm_core import GLMResults, construct_polynomial_matrix, fit_glm
 from .hrf import get_hrf_library
+from .memory import estimate_chunk_size
 from .utils import get_device, to_tensor
 from .xval import (
     compute_xval_r2,
     generate_cv_splits,
-    compute_r2_metric,
     project_out_nuisance_per_run,
 )
 
@@ -77,7 +78,7 @@ def load_nuisance_file(
         raise FileNotFoundError(f"Nuisance file not found: {filepath}")
 
     # Read file content
-    with open(filepath, "r") as f:
+    with open(filepath) as f:
         lines = f.readlines()
 
     # Filter out comment lines (AFNI 1D format uses # for comments/headers)
@@ -347,18 +348,14 @@ def fit_glm_hrf_library_with_xval(
     # Using PROJECT-FIRST approach (GLMdenoise-style)
     # =========================================================================
 
-    # Auto-compute polort if not specified (AFNI convention: duration_minutes / 2)
+    # Auto-compute polort if not specified (AFNI formula)
     if polort is None:
-        run_lengths = []
-        for i in range(n_runs):
-            if i < n_runs - 1:
-                run_lengths.append(run_starts[i + 1] - run_starts[i])
-            else:
-                run_lengths.append(n_timepoints - run_starts[i])
-        avg_run_duration_min = (sum(run_lengths) / n_runs * tr) / 60.0
-        polort = max(1, round(avg_run_duration_min / 2))
+        from .cli_utils import auto_polort, compute_run_lengths, get_average_run_duration
+        run_lengths = compute_run_lengths(run_starts, n_timepoints)
+        avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
+        polort = auto_polort(avg_run_duration_sec, formula="afni")
         if verbose:
-            print(f"  Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)")
+            print(f"  Auto polort: {polort} (AFNI formula, {avg_run_duration_sec:.0f}s avg run)")
 
     # Build nuisance blocks per run (for project-first approach)
     nuisance_blocks_per_run = []
@@ -967,6 +964,356 @@ def _fit_voxelwise_hrf(
     results.sigma2 = all_sigma2.cpu()
     results.meanvol = data.mean(dim=1).cpu()
     results.dof = stored_dof  # Propagate dof from fit_glm for 3drefit labeling
+
+    return results
+
+
+def _fit_voxelwise_hrf_canonical(
+    data: torch.Tensor,
+    onsets: torch.Tensor,
+    canonical_hrf: torch.Tensor,
+    nuisance_design: torch.Tensor,
+    tr: float,
+    microtime_dt: float,
+    microtime_onset: int,
+    device: torch.device,
+    verbose: bool = False,
+) -> GLMResults:
+    """
+    Fit GLM with canonical HRF for all voxels (for comparison with per-voxel optimal HRFs).
+
+    This creates ONE design matrix for all voxels (not per-voxel) and processes
+    in chunks to avoid OOM. Used for comparison with the per-voxel optimal HRF results.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        (n_voxels, n_timepoints) fMRI data
+    onsets : torch.Tensor
+        Onset matrix (n_timepoints, n_conditions)
+    canonical_hrf : torch.Tensor
+        (hrf_length,) Canonical HRF to use for all voxels
+    nuisance_design : torch.Tensor
+        (n_timepoints, n_nuisance_cols) Pre-built nuisance design
+    tr : float
+        Repetition time in seconds
+    microtime_dt : float
+        Microtime resolution in seconds
+    microtime_onset : int
+        Microtime onset bin
+    device : torch.device
+        Compute device
+    verbose : bool
+        Print progress messages
+
+    Returns
+    -------
+    GLMResults
+        Results containing betas, R², tstats, etc. from canonical HRF fit
+    """
+    n_voxels = data.shape[0]
+    n_timepoints = onsets.shape[0] // int(round(tr / microtime_dt))
+
+    # Get number of conditions
+    n_conditions = onsets.shape[1]
+
+    if verbose:
+        print("  Fitting canonical HRF (all voxels, one design matrix)...")
+
+    # Create single design matrix with canonical HRF
+    stim_design = convolve_hrf_microtime(
+        onsets,
+        canonical_hrf,
+        n_timepoints=n_timepoints,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        microtime_onset=microtime_onset,
+        device=device,
+    )
+
+    # Build full design: [stimulus | nuisance]
+    full_design = torch.cat([stim_design, nuisance_design], dim=1)
+    stim_indices = list(range(n_conditions))
+
+    # Determine chunk size using memory estimation
+    # This is the simpler case: one design matrix, condition-level (not single-trial)
+    voxel_chunk_size = estimate_chunk_size(
+        n_voxels=n_voxels,
+        n_timepoints=n_timepoints,
+        n_regressors=full_design.shape[1],
+        device=device,
+        operation="glm",
+        min_chunk_size=10000,
+        max_chunk_size=50000 if device.type == "cuda" else 100000,
+        safety_factor=0.4 if device.type == "cuda" else 0.6,
+    )
+
+    n_chunks = (n_voxels + voxel_chunk_size - 1) // voxel_chunk_size
+    if verbose and n_chunks > 1:
+        print(f"  Processing {n_voxels:,} voxels in {n_chunks} chunks of ~{voxel_chunk_size:,}")
+
+    # Initialize output tensors
+    all_betas = torch.zeros(n_voxels, n_conditions, device=device)
+    all_r2 = torch.zeros(n_voxels, device=device)
+    all_tstats = torch.zeros(n_voxels, n_conditions, device=device)
+    all_sigma2 = torch.zeros(n_voxels, device=device)
+
+    # Process in chunks
+    for chunk_idx in range(n_chunks):
+        chunk_start = chunk_idx * voxel_chunk_size
+        chunk_end = min(chunk_start + voxel_chunk_size, n_voxels)
+
+        chunk_data = data[chunk_start:chunk_end, :]
+
+        # Fit GLM for this chunk
+        chunk_results = fit_glm(
+            chunk_data,
+            full_design,
+            tr=tr,
+            max_poly_degree=0,  # Nuisance already included
+            device=device,
+            verbose=False,
+            task_indices=stim_indices,
+        )
+
+        # Accumulate results
+        if chunk_results.betas is not None:
+            all_betas[chunk_start:chunk_end, :] = chunk_results.betas
+
+        if chunk_results.r2 is not None:
+            all_r2[chunk_start:chunk_end] = chunk_results.r2
+
+        if chunk_results.tstats is not None:
+            all_tstats[chunk_start:chunk_end, :] = chunk_results.tstats
+
+        if chunk_results.sigma2 is not None:
+            all_sigma2[chunk_start:chunk_end] = chunk_results.sigma2
+
+        # Clean up
+        del chunk_data, chunk_results
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Build results object
+    results = GLMResults()
+    results.betas = all_betas.cpu()
+    results.r2 = all_r2.cpu()
+    results.tstats = all_tstats.cpu()
+    results.sigma2 = all_sigma2.cpu()
+    results.meanvol = data.mean(dim=1).cpu()
+    results.dof = n_timepoints - full_design.shape[1]  # dof = n - p
+
+    if verbose:
+        print(f"  Canonical fit complete. Mean R²: {results.r2.mean().item():.4f}")
+
+    return results
+
+
+def _fit_voxelwise_hrf_single_trial(
+    data: torch.Tensor,
+    onsets_by_condition: List[List[np.ndarray]],
+    hrf_library: List[torch.Tensor],
+    hrf_index: torch.Tensor,
+    nuisance_design: torch.Tensor,
+    durations: List[float],
+    run_starts: List[int],
+    tr: float,
+    n_timepoints: int,
+    microtime_dt: float,
+    condition_labels: List[str],
+    device: torch.device,
+    verbose: bool = False,
+) -> GLMResults:
+    """
+    Fit single-trial GLM with per-voxel optimal HRFs, grouped by HRF for efficiency.
+
+    This is the key optimization: instead of creating a per-voxel design matrix (which OOMs),
+    we group voxels by their optimal HRF and process each group with one design matrix.
+    Within each HRF group, we use sub-chunking if needed to avoid OOM.
+
+    Follows the same pattern as _fit_voxelwise_hrf() but for single-trial designs.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        (n_voxels, n_timepoints) fMRI data
+    onsets_by_condition : list of list of np.ndarray
+        Onsets organized as [condition][run] -> np.ndarray of onset times (seconds)
+    hrf_library : list of torch.Tensor
+        List of HRF functions, each (hrf_length,)
+    hrf_index : torch.Tensor
+        (n_voxels,) HRF index for each voxel
+    nuisance_design : torch.Tensor
+        (n_timepoints, n_nuisance_cols) Pre-built nuisance design
+    durations : list of float
+        Duration in seconds for each condition
+    run_starts : list of int
+        Starting timepoint for each run
+    tr : float
+        Repetition time in seconds
+    n_timepoints : int
+        Total number of timepoints
+    microtime_dt : float
+        Microtime resolution
+    condition_labels : list of str
+        Condition names
+    device : torch.device
+        Compute device
+    verbose : bool
+        Print progress
+
+    Returns
+    -------
+    GLMResults
+        Single-trial betas and statistics
+    """
+    from .xval import compute_r2_metric
+
+    n_voxels = data.shape[0]
+    n_timepoints = data.shape[1]
+    n_conditions = len(condition_labels)
+    n_hrfs = len(hrf_library)
+    n_runs = len(run_starts)
+
+    if verbose:
+        print(f"  Refitting single-trial betas with optimal HRFs ({n_hrfs} HRF groups)...")
+
+    # Group voxels by HRF
+    unique_hrfs = torch.unique(hrf_index)
+
+    # Build nuisance per-run list for ridge
+    nuisance_per_run = []
+    for run_idx in range(n_runs):
+        run_start = run_starts[run_idx]
+        run_end = run_starts[run_idx + 1] if run_idx + 1 < n_runs else n_timepoints
+        nuisance_run = nuisance_design[run_start:run_end, :]
+        nuisance_per_run.append(nuisance_run)
+
+    # Create CV splits (use simple split-half: [0] vs [1:])
+    cv_splits = [([0], list(range(1, n_runs)))]
+
+    # First, get trial info using canonical HRF (just to get n_trials)
+    from .ridge import create_single_trial_design
+    st_design_canonical, trial_labels, trial_cond_ids, trial_run_ids, condition_design = create_single_trial_design(
+        onsets_by_condition=onsets_by_condition,
+        durations=durations,
+        run_starts=run_starts,
+        tr=tr,
+        n_timepoints=n_timepoints,
+        hrf_library=None,  # Canonical HRF
+        microtime_dt=microtime_dt,
+        condition_labels=condition_labels,
+        device="cpu",  # Create on CPU to save GPU memory
+    )
+    n_trials = len(trial_labels)
+
+    if verbose:
+        print(f"    Single-trial design: {n_trials} trials")
+        print(f"    HRF groups: {len(unique_hrfs)}")
+
+    # Initialize output for single-trial betas
+    all_single_trial_betas = torch.zeros(n_voxels, n_trials, device="cpu")
+    all_single_trial_r2 = torch.zeros(n_voxels, device="cpu")
+
+    # Process each HRF group
+    hrf_iterator = tqdm(unique_hrfs, desc="Refitting HRF groups") if verbose else unique_hrfs.tolist()
+    for hrf_idx in hrf_iterator:
+        hrf_idx_int = hrf_idx.item()
+
+        # Get voxels using this HRF
+        voxel_mask = hrf_index == hrf_idx
+        voxel_indices = torch.where(voxel_mask)[0]
+        n_group_voxels = len(voxel_indices)
+
+        if n_group_voxels == 0:
+            continue
+
+        if verbose:
+            hrf_iterator.set_postfix_str(f"{n_group_voxels:,} voxels")
+
+        # Create single-trial design for this HRF
+        hrf = hrf_library[hrf_idx_int]
+        st_design, _, trial_cond_ids_hrf, trial_run_ids_hrf, _ = create_single_trial_design(
+            onsets_by_condition=onsets_by_condition,
+            durations=durations,
+            run_starts=run_starts,
+            tr=tr,
+            n_timepoints=n_timepoints,
+            microtime_dt=microtime_dt,
+            condition_labels=condition_labels,
+            hrf_library=[hrf],  # Convolve with this HRF
+            device=device,
+        )
+        # st_design is (n_timepoints, n_trials) for this HRF
+
+        # Determine chunk size using memory estimation
+        voxel_chunk_size = estimate_chunk_size(
+            n_voxels=n_group_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_trials,
+            device=device,
+            operation="glm",
+            min_chunk_size=10000,
+            max_chunk_size=50000 if device.type == "cuda" else 100000,
+            safety_factor=0.4 if device.type == "cuda" else 0.6,
+        )
+
+        n_chunks = (n_group_voxels + voxel_chunk_size - 1) // voxel_chunk_size
+
+        if verbose and n_chunks > 1:
+            print(f"      {n_group_voxels:,} voxels in {n_chunks} chunks of ~{voxel_chunk_size:,}")
+
+        # Process this HRF group in chunks
+        for chunk_idx in range(n_chunks):
+            chunk_start = chunk_idx * voxel_chunk_size
+            chunk_end = min(chunk_start + voxel_chunk_size, n_group_voxels)
+            chunk_voxel_indices = voxel_indices[chunk_start:chunk_end]
+
+            # Get data for this chunk
+            if data.device.type == "cpu":
+                chunk_data = data[chunk_voxel_indices.cpu(), :]
+            else:
+                chunk_data = data[chunk_voxel_indices, :]
+
+            # Move design and data to same device
+            st_design_device = st_design.to(device)
+            chunk_data_device = chunk_data.to(device)
+
+            # Simple OLS fit: betas = (X'X)^-1 X'y
+            # X is (n_timepoints, n_trials), y is (n_voxels, n_timepoints)
+            # Solution: betas = y @ X @ (X'X)^-1
+            XtX = st_design_device.T @ st_design_device  # (n_trials, n_trials)
+            XtX_inv = torch.inverse(XtX)  # (n_trials, n_trials)
+            Xty = chunk_data_device @ st_design_device  # (n_voxels, n_trials)
+            chunk_betas = Xty @ XtX_inv  # (n_voxels, n_trials)
+
+            # Compute predictions and R²
+            # predictions = X @ betas.T = (n_timepoints, n_trials) @ (n_trials, n_voxels)
+            # Then transpose to get (n_voxels, n_timepoints)
+            chunk_predictions = (st_design_device @ chunk_betas.T).T  # (n_voxels, n_timepoints)
+            chunk_r2 = compute_r2_metric(chunk_data_device, chunk_predictions)  # (n_voxels,)
+
+            # Accumulate results
+            all_single_trial_betas[chunk_voxel_indices, :] = chunk_betas.cpu()
+            all_single_trial_r2[chunk_voxel_indices] = chunk_r2.cpu()
+
+            # Clean up
+            del chunk_data, chunk_data_device, st_design_device, chunk_betas, chunk_predictions, chunk_r2
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    # Build results object
+    results = GLMResults()
+    results.betas = all_single_trial_betas
+    results.r2 = all_single_trial_r2
+    results.tstats = None  # tstats not computed for ridge
+    results.sigma2 = None  # Not computed for ridge
+    results.meanvol = data.mean(dim=1).cpu()
+    results.dof = n_timepoints - n_trials  # Approximate dof
+    results.trial_labels = trial_labels  # Store trial labels for saving
+
+    if verbose:
+        print(f"    Single-trial refit complete. Mean CV R²: {results.r2.mean().item():.4f}")
 
     return results
 
