@@ -481,54 +481,113 @@ def main():
             verbose=False,
         )
 
-        # Project nuisance from data and design
-        print("Projecting nuisance from data and design...")
-        data_clean, design_clean = project_out_nuisance_per_run(
-            data, design_matrix, nuisance_per_run, run_starts, device=device)
-
-        # Fit ridge for all fractions on cleaned data
-        print(f"Fitting ridge for {len(fracs)} fractions on full data...")
-        coefs = _fit_ridge_multiple_fracs(design_clean, data_clean.T, fracs, device)
-        # coefs: (n_trials, n_fracs, n_voxels)
-
         # Generate CV splits
         cv_splits = generate_cv_splits(n_runs, strategy=1)  # strategy=1 is LORO
 
-        # For each fraction: compute beta-space R²
-        print("Computing beta-space CV R² for each fraction...")
-        r2_by_frac = torch.zeros(n_voxels, len(fracs), device=device)
-        for frac_idx in range(len(fracs)):
-            frac_betas = coefs[:, frac_idx, :].T  # (n_voxels, n_trials)
-            xval = compute_xval_r2_single_trials(
-                frac_betas, trial_condition_ids, trial_run_ids, cv_splits,
-                device=device, verbose=False)
-            r2_by_frac[:, frac_idx] = xval['r2']
+        per_voxel_design = design_matrix.ndim == 3
 
-        # Select optimal fraction per voxel
-        xval_r2, best_frac_idx = r2_by_frac.max(dim=1)
-        optimal_fracs = torch.from_numpy(fracs[best_frac_idx.cpu().numpy()]).to(device)
+        if not per_voxel_design:
+            # ---- Standard path: single design for all voxels ----
+            print("Projecting nuisance from data and design...")
+            data_clean, design_clean = project_out_nuisance_per_run(
+                data, design_matrix, nuisance_per_run, run_starts, device=device)
 
-        # Extract final betas at optimal fraction
-        voxel_indices = torch.arange(n_voxels, device=device)
-        final_betas = coefs[:, best_frac_idx, voxel_indices].T  # (n_voxels, n_trials)
+            print(f"Fitting ridge for {len(fracs)} fractions on full data...")
+            coefs = _fit_ridge_multiple_fracs(design_clean, data_clean.T, fracs, device)
+            # coefs: (n_trials, n_fracs, n_voxels)
 
-        # Apply autoscale if requested
-        if args.autoscale:
-            print("Applying GLMsingle-style autoscaling...")
-            # Autoscale: fit OLS on cleaned data for each voxel's selected betas
-            # This undoes the ridge shrinkage bias
-            # Vectorized implementation: process all voxels simultaneously
-            # predicted[v, :] = design_clean @ final_betas[v, :]
-            predicted = final_betas @ design_clean.T  # (n_voxels, n_timepoints)
+            # For each fraction: compute beta-space R²
+            print("Computing beta-space CV R² for each fraction...")
+            r2_by_frac = torch.zeros(n_voxels, len(fracs), device=device)
+            for frac_idx in range(len(fracs)):
+                frac_betas = coefs[:, frac_idx, :].T  # (n_voxels, n_trials)
+                xval = compute_xval_r2_single_trials(
+                    frac_betas, trial_condition_ids, trial_run_ids, cv_splits,
+                    device=device, verbose=False)
+                r2_by_frac[:, frac_idx] = xval['r2']
 
-            # Compute scaling factors for all voxels at once
-            # scale_factor[v] = (data_clean[v] @ predicted[v]) / (predicted[v] @ predicted[v] + eps)
-            numer = (data_clean * predicted).sum(dim=1)  # (n_voxels,)
-            denom = (predicted * predicted).sum(dim=1) + 1e-10  # (n_voxels,)
-            scale_factors = numer / denom  # (n_voxels,)
+            # Select optimal fraction per voxel
+            xval_r2, best_frac_idx = r2_by_frac.max(dim=1)
+            optimal_fracs = torch.from_numpy(fracs[best_frac_idx.cpu().numpy()]).to(device)
 
-            # Apply scaling (broadcast across trials)
-            final_betas *= scale_factors.unsqueeze(1)  # (n_voxels, n_trials)
+            # Extract final betas at optimal fraction
+            voxel_indices = torch.arange(n_voxels, device=device)
+            final_betas = coefs[:, best_frac_idx, voxel_indices].T  # (n_voxels, n_trials)
+
+            # Apply autoscale if requested
+            if args.autoscale:
+                print("Applying GLMsingle-style autoscaling...")
+                predicted = final_betas @ design_clean.T  # (n_voxels, n_timepoints)
+                numer = (data_clean * predicted).sum(dim=1)
+                denom = (predicted * predicted).sum(dim=1) + 1e-10
+                scale_factors = numer / denom
+                final_betas *= scale_factors.unsqueeze(1)
+
+        else:
+            # ---- Per-voxel HRF path: group by unique design ----
+            # design_matrix is (n_unique_hrfs, n_timepoints, n_trials)
+            assert hrf_indices is not None, "hrf_indices required for per-voxel designs"
+            hrf_indices_device = hrf_indices.to(device)
+            unique_hrfs = torch.unique(hrf_indices_device).tolist()
+            print(f"Per-voxel HRF mode: {len(unique_hrfs)} unique HRFs")
+
+            # Allocate outputs
+            final_betas = torch.zeros(n_voxels, n_trials, device=device)
+            xval_r2 = torch.zeros(n_voxels, device=device)
+            optimal_fracs = torch.zeros(n_voxels, device=device)
+            r2_by_frac = torch.zeros(n_voxels, len(fracs), device=device)
+
+            # Project nuisance from data once (shared across HRF groups)
+            # Use a dummy 2D design just to get projected data
+            dummy_design = design_matrix[0]  # (n_timepoints, n_trials)
+            data_clean, _ = project_out_nuisance_per_run(
+                data, dummy_design, nuisance_per_run, run_starts, device=device)
+
+            for hrf_idx in unique_hrfs:
+                voxel_mask = hrf_indices_device == hrf_idx
+                n_group = voxel_mask.sum().item()
+                print(f"  HRF {hrf_idx}: {n_group:,} voxels")
+
+                # Get this group's 2D design and project nuisance
+                group_design_2d = design_matrix[hrf_idx]  # (n_timepoints, n_trials)
+                _, design_clean_group = project_out_nuisance_per_run(
+                    data[:1],  # minimal data, we only need the projected design
+                    group_design_2d, nuisance_per_run, run_starts, device=device)
+
+                group_data_clean = data_clean[voxel_mask]  # (n_group, n_timepoints)
+
+                # Fit ridge for all fractions
+                group_coefs = _fit_ridge_multiple_fracs(
+                    design_clean_group, group_data_clean.T, fracs, device)
+                # group_coefs: (n_trials, n_fracs, n_group)
+
+                # Beta-space CV for each fraction
+                for frac_idx in range(len(fracs)):
+                    frac_betas = group_coefs[:, frac_idx, :].T  # (n_group, n_trials)
+                    xval = compute_xval_r2_single_trials(
+                        frac_betas, trial_condition_ids, trial_run_ids, cv_splits,
+                        device=device, verbose=False)
+                    r2_by_frac[voxel_mask, frac_idx] = xval['r2'].to(device)
+
+                # Select optimal fraction per voxel in this group
+                group_r2, group_best_idx = r2_by_frac[voxel_mask].max(dim=1)
+                xval_r2[voxel_mask] = group_r2
+                optimal_fracs[voxel_mask] = torch.from_numpy(
+                    fracs[group_best_idx.cpu().numpy()]).to(device)
+
+                # Extract final betas at optimal fraction
+                group_voxel_indices = torch.arange(n_group, device=device)
+                group_final_betas = group_coefs[:, group_best_idx, group_voxel_indices].T
+
+                # Autoscale if requested
+                if args.autoscale:
+                    predicted = group_final_betas @ design_clean_group.T
+                    numer = (group_data_clean * predicted).sum(dim=1)
+                    denom = (predicted * predicted).sum(dim=1) + 1e-10
+                    scale_factors = numer / denom
+                    group_final_betas *= scale_factors.unsqueeze(1)
+
+                final_betas[voxel_mask] = group_final_betas
 
         print()
         print(f"Beta-space CV R²: mean={xval_r2.mean():.4f}, median={xval_r2.median():.4f}")

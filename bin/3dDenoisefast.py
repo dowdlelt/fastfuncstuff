@@ -43,8 +43,14 @@ except ImportError:
 try:
     from fastfuncsim.afni_io import (
         load_afni_mask,
-        load_and_concatenate_runs,
         load_nifti,
+    )
+    from fastfuncsim.cli_utils import (
+        auto_polort,
+        compute_run_lengths,
+        get_average_run_duration,
+        load_and_preprocess_runs,
+        LoadResult,
     )
     from fastfuncsim.denoise import (
         DenoiseResults,
@@ -286,9 +292,10 @@ Notes:
     )
     denoise_opts.add_argument(
         "-cv_metric",
-        choices=["mean", "median"],
-        default="median",
-        help="Aggregation metric across CV folds (default: median)",
+        choices=["cod", "corr", "corr2"],
+        default="cod",
+        help="R² metric for cross-validation: cod (coefficient of determination), "
+        "corr (Pearson correlation), corr2 (correlation squared). Default: cod.",
     )
     denoise_opts.add_argument(
         "-single_trials",
@@ -683,7 +690,7 @@ def save_denoising_results(
     # 7. Plots (based on plots_mode)
     if plots_mode in ["yes", "full"]:
         try:
-            from fastfuncsim.visualization import plot_denoising_summary, plot_denoising_pcs
+            from fastfuncsim.visualization import plot_denoising_pcs, plot_denoising_summary
 
             # Summary plot
             r2_cpu = results.noise_pool_r2.cpu().numpy()
@@ -1051,8 +1058,8 @@ def save_model_fit_outputs(
     output_files : dict
         Dictionary of output file paths
     """
-    import subprocess
     import shutil
+    import subprocess
 
     output_files = {}
     voxel_mask_np = voxel_mask.cpu().numpy() if voxel_mask is not None else None
@@ -1203,118 +1210,37 @@ def main():
     # ==========================================================================
 
     print()
-    print("Loading data...")
 
-    # Load mask if provided
-    mask = None
-    if args.mask:
-        mask = load_afni_mask(args.mask)
-        print(f"  Mask: {args.mask} ({mask.sum():,} voxels)")
+    # Load and preprocess data using unified utility
+    load_result: LoadResult = load_and_preprocess_runs(
+        input_files=input_files,
+        tr=args.tr,
+        mask_file=args.mask,
+        blur_fwhm=args.do_blur,
+        do_scale=False,  # Scaling will be applied later if requested
+        device=device,
+        force_cpu=args.keep_on_cpu,
+        verbose=True,
+    )
 
-    # Load first file for metadata
-    first_img = load_nifti(input_files[0])
-    affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
-    volume_shape = tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
-    voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
+    # Extract loaded data
+    data = load_result.data
+    run_starts = load_result.run_starts
+    affine = load_result.affine
+    volume_shape = load_result.volume_shape
+    voxel_sizes = load_result.voxel_sizes
+    mask = load_result.mask
+    mask_flat = load_result.mask_flat
+    n_voxels = load_result.n_voxels
+    n_timepoints = load_result.n_timepoints
+    n_runs = load_result.n_runs
+    keep_on_cpu = load_result.keep_on_cpu
 
-    # Determine memory strategy
-    if hasattr(first_img, "shape"):
-        n_voxels_per_run = first_img.shape[0] * first_img.shape[1] * first_img.shape[2]
-        n_timepoints_per_run = (
-            first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[-1]
-        )
-    else:
-        n_voxels_per_run = 10000
-        n_timepoints_per_run = 200
-
-    if mask is not None:
-        n_voxels_per_run = int(mask.sum())
-
-    total_timepoints = n_timepoints_per_run * n_runs
-    data_size_gb = (n_voxels_per_run * total_timepoints * 4) / (1024**3)
-    gpu_memory_threshold_gb = 4.0
-
-    if args.keep_on_cpu:
-        keep_on_cpu = True
-        print("\n  Loading to CPU (user-specified)")
-    elif device.type == "cuda" and data_size_gb > gpu_memory_threshold_gb:
-        keep_on_cpu = True
-        print(f"\n  ⚠️  Large dataset ({data_size_gb:.2f} GB)")
-        print("     Loading to CPU and processing in GPU chunks")
-    else:
-        keep_on_cpu = False
-
-    # Load and optionally blur data
-    if args.do_blur is not None:
-        print(f"\nApplying Gaussian blur (FWHM = {args.do_blur} mm)...")
-
-        from tqdm import tqdm
-
-        run_data_list = []
-        run_starts = [0]
-        current_timepoint = 0
-
-        for run_idx, run_file in enumerate(
-            tqdm(input_files, desc="  Loading & blurring", unit="run")
-        ):
-            img = load_nifti(run_file)
-            data_4d = img.get_fdata(dtype=np.float32)
-
-            if data_4d.ndim != 4:
-                print(f"ERROR: Expected 4D data, got {data_4d.ndim}D")
-                sys.exit(1)
-
-            data_4d_blurred = gaussian_blur_3d(
-                data_4d,
-                fwhm_mm=args.do_blur,
-                voxel_sizes=voxel_sizes,
-                device=device,
-                verbose=(run_idx == 0),
-            )
-
-            n_tps = data_4d_blurred.shape[3]
-            data_2d = data_4d_blurred.reshape(-1, n_tps)
-
-            if mask is not None:
-                mask_flat = mask.flatten().astype(bool)
-                data_2d = data_2d[mask_flat, :]
-
-            if keep_on_cpu:
-                data_2d = torch.from_numpy(data_2d).to(torch.float32)
-            else:
-                data_2d = torch.from_numpy(data_2d).to(device=device, dtype=torch.float32)
-
-            run_data_list.append(data_2d)
-            current_timepoint += n_tps
-            if run_idx < len(input_files) - 1:
-                run_starts.append(current_timepoint)
-
-        data = torch.cat(run_data_list, dim=1)
-        del run_data_list
-        print(f"  ✓ Blurred and concatenated {n_runs} runs")
-    else:
-        # Standard loading
-        mask_flat = mask.flatten().astype(bool) if mask is not None else None
-        data, run_starts = load_and_concatenate_runs(
-            [Path(f) for f in input_files],
-            device=device,
-            keep_on_cpu=keep_on_cpu,
-            mask_flat=mask_flat,
-        )
-
-    # Get TR
+    # Update args.tr with loaded value (for later use)
     if args.tr is None:
-        zooms = first_img.header.get_zooms()
-        if len(zooms) > 3 and zooms[3] > 0:
-            args.tr = float(zooms[3])
-            print(f"  TR (from header): {args.tr}s")
-        else:
-            print("ERROR: Could not determine TR from header. Please specify with -tr")
-            sys.exit(1)
-    else:
-        print(f"  TR (specified): {args.tr}s")
+        args.tr = load_result.tr
 
-    n_voxels, n_timepoints = data.shape
+    print()
 
     # Compute brainthresh intensity mask BEFORE scaling
     # This excludes low-intensity voxels from the noise pool
@@ -1533,10 +1459,10 @@ def main():
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
         run_length = end_tp - start_tp
 
-        # Auto-determine polort if not specified
+        # Auto-determine polort if not specified (per-run basis)
         if args.polort is None:
             run_duration = run_length * args.tr
-            polort = int(np.floor(1 + run_duration / 150.0))
+            polort = auto_polort(run_duration, formula="afni")
         else:
             polort = args.polort
 
@@ -1641,11 +1567,16 @@ def main():
     # Fit denoising model
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-        from fastfuncsim.ridge import create_single_trial_design
-        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.denoise import extract_noise_pcs_per_run
         from fastfuncsim.glm_core import fit_glm
         from fastfuncsim.glm_outputs import save_single_trial_results
-        from fastfuncsim.denoise import extract_noise_pcs_per_run
+        from fastfuncsim.ridge import create_single_trial_design
+        from fastfuncsim.xval import (
+            compute_xval_r2,
+            compute_xval_r2_single_trials,
+            generate_cv_splits,
+            project_out_nuisance_per_run,
+        )
 
         print()
         print("=" * 70)
@@ -1653,12 +1584,7 @@ def main():
         print("=" * 70)
         print()
 
-        # Check that we're in single-HRF mode
-        if designs_by_hrf is not None:
-            print("ERROR: -single_trials is not yet supported with per-voxel HRFs")
-            sys.exit(1)
-
-        # 1. Build single-trial design with canonical HRF
+        # 1. Build single-trial design (with optional per-voxel HRFs)
         print("Building single-trial design...")
         st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = create_single_trial_design(
             onsets_by_condition=all_onsets,
@@ -1666,31 +1592,108 @@ def main():
             run_starts=run_starts,
             tr=args.tr,
             n_timepoints=n_timepoints,
+            hrf_library=hrf_library,
+            hrf_index_per_voxel=hrf_indices,
             microtime_dt=args.microtime_dt,
             condition_labels=condition_labels,
             device=device,
         )
+        per_voxel_st = st_design.ndim == 3  # (n_unique_hrfs, n_timepoints, n_trials)
         print(f"  Single-trial design: {st_design.shape}")
         print(f"  Condition design: {cond_design.shape}")
 
-        # 2. Compute initial R² using CONDITION-level design (for noise pool selection)
-        # The noise pool should reflect task signal strength, not trial reliability
+        # Pre-compute HRF group info for per-voxel path (used in steps 2, 5, 7)
+        if per_voxel_st:
+            hrf_indices_dev = hrf_indices.to(data.device)
+            unique_hrfs = torch.unique(hrf_indices_dev).tolist()
+            n_trials = st_design.shape[-1]
+            n_conditions_st = int(trial_cond_ids.max().item()) + 1
+            print(f"  Per-voxel HRF mode: {len(unique_hrfs)} unique HRFs")
+
+        # 2. Compute initial cross-validated R² for noise pool selection
+        # Project out nuisance (polynomials) from both data and design, then
+        # cross-validate with condition-level design (same approach as non-single-trial path)
         print()
-        print("Computing initial R² with condition-level design for noise pool selection...")
+        print("Computing cross-validated R² with condition-level design for noise pool selection...")
+        print("  (project-first nuisance removal, per run)")
         cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=args.n_perms)
 
-        # Build wide design: [condition | nuisance]
-        nuisance_design_init = torch.block_diag(*nuisance_per_run)
-        full_design_init = torch.cat([cond_design, nuisance_design_init], dim=1)
-        task_indices_init = list(range(cond_design.shape[1]))
+        if not per_voxel_st:
+            # Standard path: single condition design for all voxels
+            projected_data, projected_cond_design = project_out_nuisance_per_run(
+                data=data,
+                design=cond_design,
+                nuisance_per_run=nuisance_per_run,
+                run_starts=run_starts,
+                device=data.device,
+            )
 
-        # Fit OLS on full data for initial R²
-        glm_init = fit_glm(
-            data, full_design_init, tr=args.tr, max_poly_degree=0,
-            device=device, verbose=False, task_indices=task_indices_init)
+            n_cond_cols = cond_design.shape[1]
+            xval_init = compute_xval_r2(
+                data=projected_data,
+                design_matrix=projected_cond_design,
+                run_starts=run_starts,
+                stim_indices=list(range(n_cond_cols)),
+                nuisance_indices=[],
+                cv_splits=cv_splits,
+                metric="cod",
+                zero_event_strategy="zero",
+                device=device,
+                verbose=False,
+            )
 
-        initial_r2 = glm_init.r2  # (n_voxels,)
-        print(f"  Initial R²: mean={initial_r2.mean():.4f}, median={initial_r2.median():.4f}")
+            initial_r2 = xval_init["r2"].to(device)
+            del projected_data, projected_cond_design
+        else:
+            # Per-voxel HRF path: compute R² per HRF group with correct design
+            # (matches denoise.py fit_denoising_model per-HRF initial R² logic)
+            print(f"  Computing per-HRF-group R² ({len(unique_hrfs)} groups)...")
+            initial_r2 = torch.zeros(data.shape[0], device=device)
+
+            for hrf_idx in unique_hrfs:
+                voxel_mask = hrf_indices_dev == hrf_idx
+                n_group = voxel_mask.sum().item()
+
+                # Build condition-level design from this HRF's single-trial design
+                hrf_st_design = st_design[hrf_idx]  # (n_tp, n_trials)
+                cond_design_hrf = torch.zeros(
+                    n_timepoints, n_conditions_st, device=device)
+                for c in range(n_conditions_st):
+                    cond_mask = trial_cond_ids == c
+                    if cond_mask.sum() > 0:
+                        cond_design_hrf[:, c] = hrf_st_design[:, cond_mask].sum(dim=1)
+
+                # Project nuisance and compute xval R² for this group
+                group_data = data[voxel_mask]
+                proj_data, proj_design = project_out_nuisance_per_run(
+                    data=group_data,
+                    design=cond_design_hrf,
+                    nuisance_per_run=nuisance_per_run,
+                    run_starts=run_starts,
+                    device=data.device,
+                )
+
+                xval_group = compute_xval_r2(
+                    data=proj_data,
+                    design_matrix=proj_design,
+                    run_starts=run_starts,
+                    stim_indices=list(range(n_conditions_st)),
+                    nuisance_indices=[],
+                    cv_splits=cv_splits,
+                    metric="cod",
+                    zero_event_strategy="zero",
+                    device=device,
+                    verbose=False,
+                )
+
+                initial_r2[voxel_mask] = xval_group['r2'].to(device)
+                print(f"    HRF {hrf_idx}: {n_group:,} voxels, "
+                      f"median R²={xval_group['r2'].median().item():.4f}")
+
+                del proj_data, proj_design
+
+        print(f"  Initial xval R²: mean={initial_r2.mean():.4f}, median={initial_r2.median():.4f}")
+        print(f"  R² range: [{initial_r2.min().item():.4f}, {initial_r2.max().item():.4f}]")
 
         # 3. Select noise pool (R² < threshold)
         print()
@@ -1699,7 +1702,7 @@ def main():
 
         # Apply intensity threshold if provided
         if brainthresh_mask is not None:
-            noise_pool_mask = noise_pool_mask & torch.from_numpy(brainthresh_mask).to(device)
+            noise_pool_mask = noise_pool_mask & brainthresh_mask.to(device)
 
         n_noise = noise_pool_mask.sum().item()
         n_total = noise_pool_mask.numel()
@@ -1713,7 +1716,7 @@ def main():
 
         if noise_fraction > args.max_noise_fraction:
             print(f"WARNING: Noise fraction ({noise_fraction:.2f}) exceeds max ({args.max_noise_fraction})")
-            print(f"  Consider increasing -r2_threshold or using -mask")
+            print("  Consider increasing -r2_threshold or using -mask")
 
         # 4. Extract noise PCs from noise pool
         print()
@@ -1736,7 +1739,9 @@ def main():
         # 5. For each PC count: fit single-trial model with wide design, beta-space CV
         print()
         print(f"Optimizing PC count (0 to {args.max_pcs})...")
-        r2_by_pc = torch.zeros(args.max_pcs + 1)
+        n_voxels_st = data.shape[0]
+        # Collect per-voxel R² at each PC count (on CPU)
+        r2_maps_st = torch.zeros(n_voxels_st, args.max_pcs + 1)
 
         for n_pcs in range(args.max_pcs + 1):
             # Build nuisance: polynomials + first n_pcs per run
@@ -1749,29 +1754,55 @@ def main():
                 nuisance_blocks.append(run_nuisance)
             nuisance_design = torch.block_diag(*nuisance_blocks)
 
-            # Build wide design: [single_trial | nuisance]
-            full_design = torch.cat([st_design, nuisance_design], dim=1)
-            task_indices = list(range(st_design.shape[1]))
-
-            # Fit on full data
-            glm_results = fit_glm(
-                data, full_design, tr=args.tr, max_poly_degree=0,
-                device=device, verbose=False, task_indices=task_indices)
+            # Fit GLM and extract single-trial betas
+            if not per_voxel_st:
+                # Standard 2D path
+                full_design = torch.cat([st_design, nuisance_design], dim=1)
+                task_indices = list(range(st_design.shape[1]))
+                glm_results = fit_glm(
+                    data, full_design, tr=args.tr, max_poly_degree=0,
+                    device=device, verbose=False, task_indices=task_indices)
+                st_betas = glm_results.betas  # (n_voxels, n_trials)
+            else:
+                # Per-voxel HRF path: group by HRF index
+                st_betas = torch.zeros(n_voxels_st, n_trials, device=data.device)
+                task_indices = list(range(n_trials))
+                for hrf_idx in unique_hrfs:
+                    voxel_mask = hrf_indices_dev == hrf_idx
+                    group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
+                    full_design = torch.cat([group_design_2d, nuisance_design], dim=1)
+                    glm_results = fit_glm(
+                        data[voxel_mask], full_design, tr=args.tr,
+                        max_poly_degree=0, device=device, verbose=False,
+                        task_indices=task_indices)
+                    st_betas[voxel_mask] = glm_results.betas
 
             # Beta-space CV
-            st_betas = glm_results.betas  # (n_voxels, n_trials)
             xval = compute_xval_r2_single_trials(
                 st_betas, trial_cond_ids, trial_run_ids, cv_splits,
                 metric=args.cv_metric, device=device, verbose=False)
 
-            # Aggregate across voxels (criteria voxels only for robustness)
-            criteria_mask = initial_r2 >= args.r2_threshold
-            if criteria_mask.sum() > 0:
-                r2_by_pc[n_pcs] = xval['r2'][criteria_mask].median()
-            else:
-                r2_by_pc[n_pcs] = xval['r2'].median()
+            r2_maps_st[:, n_pcs] = xval['r2']
+            print(f"  {n_pcs:2d} PCs: median R² = {r2_maps_st[:, n_pcs].median().item():.4f}")
 
-            print(f"  {n_pcs:2d} PCs: R² = {r2_by_pc[n_pcs].item():.4f}")
+        # Determine criteria mask: voxels above threshold in ANY PC count
+        # Then re-evaluate all PC counts with the same consistent mask
+        criteria_mask = torch.any(r2_maps_st > args.r2_threshold, dim=1)
+        n_criteria = criteria_mask.sum().item()
+        print(f"\n  Criteria voxels (R² > {args.r2_threshold} in any PC): "
+              f"{n_criteria:,} / {n_voxels_st:,}")
+
+        if n_criteria == 0:
+            print("  WARNING: No voxels meet criteria! Using all voxels.")
+            criteria_mask = torch.ones(n_voxels_st, dtype=torch.bool)
+
+        r2_criteria = r2_maps_st[criteria_mask, :]  # (n_criteria, n_pc_counts)
+        r2_by_pc = r2_criteria.median(dim=0).values  # (n_pc_counts,)
+
+        print(f"  Baseline (0 PCs): median R² = {r2_by_pc[0].item():.4f}")
+        best_idx = int(r2_by_pc.argmax().item())
+        print(f"  Best ({best_idx} PCs): median R² = {r2_by_pc[best_idx].item():.4f}")
+        print(f"  Improvement: {r2_by_pc[best_idx].item() - r2_by_pc[0].item():+.4f}")
 
         # 6. Select optimal PC count using pcstop criterion
         print()
@@ -1807,14 +1838,28 @@ def main():
             nuisance_blocks.append(run_nuisance)
         nuisance_design_final = torch.block_diag(*nuisance_blocks)
 
-        full_design_final = torch.cat([st_design, nuisance_design_final], dim=1)
-        task_indices_final = list(range(st_design.shape[1]))
-
-        glm_results_final = fit_glm(
-            data, full_design_final, tr=args.tr, max_poly_degree=0,
-            device=device, verbose=args.verbose, task_indices=task_indices_final)
-
-        final_betas = glm_results_final.betas
+        if not per_voxel_st:
+            # Standard 2D path
+            full_design_final = torch.cat([st_design, nuisance_design_final], dim=1)
+            task_indices_final = list(range(st_design.shape[1]))
+            glm_results_final = fit_glm(
+                data, full_design_final, tr=args.tr, max_poly_degree=0,
+                device=device, verbose=args.verbose, task_indices=task_indices_final)
+            final_betas = glm_results_final.betas
+        else:
+            # Per-voxel HRF path: group by HRF index
+            final_betas = torch.zeros(n_voxels_st, n_trials, device=data.device)
+            task_indices_final = list(range(n_trials))
+            for hrf_idx in unique_hrfs:
+                voxel_mask = hrf_indices_dev == hrf_idx
+                group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
+                full_design_final = torch.cat([group_design_2d, nuisance_design_final], dim=1)
+                glm_results_final = fit_glm(
+                    data[voxel_mask], full_design_final, tr=args.tr,
+                    max_poly_degree=0, device=device,
+                    verbose=(args.verbose and hrf_idx == unique_hrfs[0]),
+                    task_indices=task_indices_final)
+                final_betas[voxel_mask] = glm_results_final.betas
 
         # Compute final beta-space R²
         final_xval = compute_xval_r2_single_trials(
@@ -1891,7 +1936,6 @@ def main():
             variance_threshold=args.variance_threshold,
             nuisance=nuisance_per_run,
             polort=args.polort,
-            metric=args.cv_metric,
             min_noise_voxels=args.min_noise_voxels,
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
@@ -1919,7 +1963,6 @@ def main():
             variance_threshold=args.variance_threshold,
             nuisance=nuisance_per_run,
             polort=args.polort,
-            metric=args.cv_metric,
             min_noise_voxels=args.min_noise_voxels,
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,

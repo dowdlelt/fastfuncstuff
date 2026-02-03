@@ -14,13 +14,23 @@ Design philosophy:
 - Compatible with existing fastfuncsim HRF and denoising pipelines
 - Supports flexible timing (non-TR-locked, variable durations)
 """
+from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+
+# Import for memory-aware chunking
+try:
+    from fastfuncsim.memory import estimate_chunk_size
+except ImportError:
+    # Fallback if memory module not available
+    estimate_chunk_size = None
+
+# Import for R² metric computation
+from fastfuncsim.xval import compute_r2_metric
 
 
 def _fit_ridge_multiple_fracs(
@@ -265,7 +275,8 @@ def create_single_trial_design(
     -------
     design_matrix : torch.Tensor
         If hrf_index_per_voxel is None: (n_timepoints, n_trials)
-        If hrf_index_per_voxel provided: (n_voxels, n_timepoints, n_trials)
+        If hrf_index_per_voxel provided: (n_unique_hrfs, n_timepoints, n_trials)
+        Downstream code groups voxels by hrf_index and indexes design_matrix[hrf_idx].
     trial_labels : list of str
         Label for each trial (e.g., "face_001", "house_023")
     trial_condition_ids : torch.Tensor, shape (n_trials,)
@@ -400,13 +411,10 @@ def create_single_trial_design(
         # Stack: (n_hrfs, n_timepoints, n_trials)
         designs_stacked = torch.stack(designs_by_hrf, dim=0)
 
-        # Select per-voxel designs
-        # Result: (n_voxels, n_timepoints, n_trials)
-        hrf_indices = hrf_index_per_voxel.long().to(device)
-        design_per_voxel = designs_stacked[hrf_indices, :, :]
+        # Return per-HRF designs — NOT expanded to per-voxel!
+        # Downstream code groups voxels by hrf_index and uses designs_stacked[hrf_idx]
 
         # Build condition_design using first HRF design (for CV prediction)
-        # Per-voxel condition designs would require more complex handling
         first_design = designs_by_hrf[0]  # (n_timepoints, n_trials)
         condition_design = torch.zeros(n_timepoints, n_conditions, dtype=torch.float32, device=device)
         for cond_idx in range(n_conditions):
@@ -414,7 +422,7 @@ def create_single_trial_design(
             if cond_mask.sum() > 0:
                 condition_design[:, cond_idx] = first_design[:, cond_mask].sum(dim=1)
 
-        return design_per_voxel, trial_labels, trial_condition_ids, trial_run_ids, condition_design
+        return designs_stacked, trial_labels, trial_condition_ids, trial_run_ids, condition_design
 
 
 def _fit_ridge_chunk(
@@ -587,24 +595,20 @@ def _fit_ridge_chunk(
         # Result: (n_test_tps, n_fracs, chunk_voxels)
         y_pred_all = torch.einsum('tc,cfv->tfv', test_cond_design_clean, cond_betas_all)
 
-        # Scatter predictions to output accumulators (loop for reliable assignment)
+        # Scatter predictions to output accumulators (vectorized)
+        test_tps_tensor = torch.tensor(test_tps, device=device)
         for frac_idx in range(n_fracs):
-            y_pred_frac = y_pred_all[:, frac_idx, :].T  # (chunk_voxels, n_test_tps)
-            for i, tp in enumerate(test_tps):
-                predictions_by_frac[frac_idx][:, tp] = y_pred_frac[:, i]
+            predictions_by_frac[frac_idx][:, test_tps_tensor] = y_pred_all[:, frac_idx, :].T
 
-        # Store cleaned test data
-        for i, tp in enumerate(test_tps):
-            actual_test_clean[:, tp] = test_data_clean[:, i]
+        # Store cleaned test data (vectorized)
+        actual_test_clean[:, test_tps_tensor] = test_data_clean.T
 
     # Compute R² for each fraction (comparing cleaned data to predictions)
     r2_by_frac = torch.zeros(chunk_voxels, n_fracs, device=device)
 
     for frac_idx in range(n_fracs):
         pred = predictions_by_frac[frac_idx]
-        ss_res = ((actual_test_clean - pred) ** 2).sum(dim=1)
-        ss_tot = ((actual_test_clean - actual_test_clean.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
-        r2_by_frac[:, frac_idx] = 1 - ss_res / (ss_tot + 1e-10)
+        r2_by_frac[:, frac_idx] = compute_r2_metric(actual_test_clean, pred, metric="cod")
 
     # Select optimal fraction per voxel (highest CV R²)
     xval_r2, best_frac_idx = r2_by_frac.max(dim=1)
@@ -682,14 +686,10 @@ def _fit_ridge_chunk(
             )
 
     # Compute final R² on cleaned data (using scaled betas)
-    y_pred_final = torch.zeros(chunk_voxels, n_timepoints, device=device)
-    for voxel_idx in range(chunk_voxels):
-        y_pred_voxel = design_clean @ betas_final[voxel_idx, :]
-        y_pred_final[voxel_idx, :] = y_pred_voxel
+    # Vectorized: y_pred_final[v, :] = design_clean @ betas_final[v, :]
+    y_pred_final = betas_final @ design_clean.T  # (chunk_voxels, n_timepoints)
 
-    ss_res_final = ((data_clean - y_pred_final) ** 2).sum(dim=1)
-    ss_tot_final = ((data_clean - data_clean.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
-    r2_final = 1 - ss_res_final / (ss_tot_final + 1e-10)
+    r2_final = compute_r2_metric(data_clean, y_pred_final, metric="cod")
 
     # Compute initial R² (OLS or closest to it)
     # In fractional ridge: frac=1.0 is pure OLS, frac=0 is max regularization
@@ -732,12 +732,11 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     n_fracs = len(fracs)
 
     # Group voxels by unique designs
-    # Hash each design to find duplicates
-    design_hashes = []
-    for vox_idx in range(chunk_voxels):
-        # Simple hash: sum of design matrix (fast but imperfect)
-        design_hash = float(design_per_voxel[vox_idx].sum().item())
-        design_hashes.append(design_hash)
+    # Hash each design to find duplicates (vectorized - single GPU→CPU transfer)
+    # Stack designs to compute hashes all at once
+    # design_per_voxel is a list of (n_timepoints, n_trials) tensors
+    designs_stacked = torch.stack(design_per_voxel, dim=0)  # (chunk_voxels, n_timepoints, n_trials)
+    design_hashes = designs_stacked.sum(dim=(1, 2)).tolist()  # (chunk_voxels,) → list
 
     # Find unique design hashes and group voxels
     unique_hashes = list(set(design_hashes))
@@ -773,14 +772,14 @@ def _fit_ridge_chunk_with_per_voxel_designs(
             device,
         )
 
-        # Scatter results back to output arrays
-        for i, vox_idx in enumerate(voxel_indices):
-            betas_all[vox_idx, :] = group_results["betas"][i, :]
-            r2_initial_all[vox_idx] = group_results["r2_initial"][i]
-            r2_final_all[vox_idx] = group_results["r2_final"][i]
-            xval_r2_all[vox_idx] = group_results["xval_r2"][i]
-            optimal_fracs_all[vox_idx] = group_results["optimal_fracs"][i]
-            r2_by_frac_all[vox_idx, :] = group_results["r2_by_frac"][i, :]
+        # Scatter results back to output arrays (vectorized)
+        idx = torch.tensor(voxel_indices, device=betas_all.device)
+        betas_all[idx] = group_results["betas"]
+        r2_initial_all[idx] = group_results["r2_initial"]
+        r2_final_all[idx] = group_results["r2_final"]
+        xval_r2_all[idx] = group_results["xval_r2"]
+        optimal_fracs_all[idx] = group_results["optimal_fracs"]
+        r2_by_frac_all[idx] = group_results["r2_by_frac"]
 
     return {
         "betas": betas_all,
@@ -805,7 +804,7 @@ def fit_ridge_single_trial(
     cv_splits: Optional[List[Tuple[List[int], List[int]]]] = None,
     trial_labels: Optional[List[str]] = None,
     autoscale: bool = True,
-    chunk_size: int = 10000,
+    chunk_size: Optional[int] = None,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> RidgeResults:
@@ -964,7 +963,7 @@ def fit_ridge_single_trial(
     n_extra = extra_per_run[0].shape[1] if extra_per_run else 0
 
     if verbose:
-        print(f"\nRidge regression single-trial estimation")
+        print("\nRidge regression single-trial estimation")
         print(f"  Voxels: {n_voxels:,}")
         print(f"  Timepoints: {n_timepoints}")
         print(f"  Trials: {n_trials}")
@@ -976,10 +975,35 @@ def fit_ridge_single_trial(
         if nuisance_desc:
             print(f"  Nuisance per run: {n_nuisance} total ({', '.join(nuisance_desc)})")
         else:
-            print(f"  Nuisance per run: none")
+            print("  Nuisance per run: none")
         print(f"  Ridge fractions: {n_fracs} ({fracs[0]:.2f} to {fracs[-1]:.2f})")
         print(f"  CV strategy: {len(cv_splits)} folds")
         print()
+
+    # Determine chunk size (memory-aware if not specified)
+    if chunk_size is None:
+        if estimate_chunk_size is not None:
+            # Determine n_regressors based on design type
+            if per_voxel_design:
+                # For per-voxel designs, use max trials across voxels
+                n_regressors = n_trials
+            else:
+                n_regressors = design_matrix.shape[1]
+
+            chunk_size = estimate_chunk_size(
+                n_voxels=n_voxels,
+                n_timepoints=n_timepoints,
+                n_regressors=n_regressors,
+                device=device,
+                operation="ridge",
+            )
+            if verbose:
+                print(f"  Auto-determined chunk size: {chunk_size:,} voxels")
+        else:
+            # Fallback to conservative default
+            chunk_size = 10000
+            if verbose:
+                print(f"  Using default chunk size: {chunk_size:,} voxels")
 
     # Process in chunks
     n_chunks = (n_voxels + chunk_size - 1) // chunk_size

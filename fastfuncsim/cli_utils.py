@@ -707,6 +707,8 @@ def build_nuisance_per_run(
     if noise_pcs is not None:
         for run_idx, pcs in enumerate(noise_pcs):
             if pcs is not None and pcs.shape[1] > 0:
+                # Ensure noise PCs are on the same device as nuisance
+                pcs = pcs.to(device)
                 # Concatenate existing nuisance + noise PCs
                 nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], pcs], dim=1)
 

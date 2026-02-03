@@ -45,22 +45,64 @@ Key Features
 - Polynomial drift and other nuisance regressors maintained
 - Median R² across CV folds for robust selection
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 
 from .glm_core import fit_glm
 from .pca import PCA
 from .utils import get_device
 from .xval import (
+    compute_r2_from_sufficient_stats,
+    compute_r2_metric,
     compute_xval_r2,
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
+from .memory import estimate_chunk_size
+
+
+def _compute_local_run_starts(
+    run_indices: List[int],
+    run_starts: List[int],
+    n_timepoints: int,
+) -> List[int]:
+    """
+    Compute local run_starts for a subset of runs.
+
+    When we extract a subset of runs (e.g., train_runs in CV), we need
+    new run_starts that start from 0. This function computes those.
+
+    Parameters
+    ----------
+    run_indices : list of int
+        Which runs to include (e.g., [0, 2, 4] for runs 0, 2, 4)
+    run_starts : list of int
+        Global run starting indices
+    n_timepoints : int
+        Total number of timepoints (for computing last run length)
+
+    Returns
+    -------
+    local_run_starts : list of int
+        Run starts for the subset, starting from 0
+        E.g., if run_indices=[0,2,4] with runs of length 100 each,
+        returns [0, 100, 200]
+    """
+    n_runs = len(run_starts)
+    local_run_starts = [0]
+
+    for i, run_idx in enumerate(run_indices[:-1]):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_length = end_tp - start_tp
+        local_run_starts.append(local_run_starts[-1] + run_length)
+
+    return local_run_starts
 
 
 @dataclass
@@ -639,7 +681,7 @@ def cross_validate_noise_pcs(
     print(f"Cross-validating noise PC denoising (0 to {max_components} PCs)")
     print(f"Strategy: {cv_desc}")
     print(f"Total voxels: {n_voxels:,} (processing ALL voxels)")
-    print(f"Method: GLMdenoise-style concatenated predictions")
+    print("Method: GLMdenoise-style concatenated predictions")
     print(f"{'=' * 70}")
 
     # =========================================================================
@@ -655,40 +697,40 @@ def cross_validate_noise_pcs(
     is_loro = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits)
 
     # Determine chunk size for voxel processing
-    # Account for both n_voxels AND n_timepoints to avoid OOM
-    # Main memory consumers: chunk_data (voxels × timepoints), projections, accumulators
+    # Use unified memory estimation from memory.py instead of hardcoded values
     if chunk_size is not None:
         voxel_chunk_size = chunk_size
-    elif is_loro:
-        # Streaming stats: smaller accumulators + GPU projections = can use larger chunks
-        # Memory: chunk_data + projected train/test data (held during projection before concat)
-        # During projection we hold multiple copies, so be conservative
-        # Target: 0.6GB for chunk_data to leave ~1-2GB headroom for projection operations
-        target_chunk_memory_gb = 0.3
-        bytes_per_voxel = n_timepoints * 4  # float32
-        max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
-        voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 42000)
     else:
-        # Full accumulator: much more memory for storing full predictions per PC
-        # Memory: chunk_data + (voxels × timepoints × 4 bytes × n_PCs)
-        # CRITICAL: Full accumulators for split-half are HUGE (voxels × timepoints × n_PCs)
-        # Must keep on CPU and use conservative chunk sizes
-        if use_gpu_for_projections:
-            # GPU projections but CPU accumulators: moderate chunks
-            # Accumulators: voxels × timepoints × (max_components+1) × 4 bytes
-            # For 1.9M voxels × 1065 TPs × 21 PCs = 169 GB (must chunk!)
-            # Target: 50k voxels = ~4.5GB accumulators (fits in RAM)
-            target_chunk_memory_gb = 0.8
-            bytes_per_voxel = n_timepoints * 4
-            max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
-            # Cap at 50k for split-half to keep accumulator size reasonable
-            voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 10000), 50000)
+        # Import estimate_chunk_size from memory module
+        n_task_regs = design_matrix.shape[1]
+        if is_loro:
+            # LORO CV: streaming stats with smaller memory footprint
+            # Can use larger chunks with higher max_chunk_size
+            voxel_chunk_size = estimate_chunk_size(
+                n_voxels=n_voxels,
+                n_timepoints=n_timepoints,
+                n_regressors=n_task_regs,
+                device=proj_device,
+                operation="denoise",
+                min_chunk_size=10000,
+                max_chunk_size=42000,
+                safety_factor=0.3 if proj_device.type == "cuda" else 0.5,
+            )
         else:
-            # CPU projections: smaller chunks to avoid memory issues
-            target_chunk_memory_gb = 0.5
-            bytes_per_voxel = n_timepoints * 4
-            max_voxels_from_memory = int((target_chunk_memory_gb * 1024**3) / bytes_per_voxel)
-            voxel_chunk_size = min(n_voxels, max(max_voxels_from_memory, 5000), 20000)
+            # Split-half CV: full accumulators require more conservative chunks
+            # Adjust min/max_chunk_size based on projection device
+            max_chunk = 50000 if use_gpu_for_projections else 20000
+            min_chunk = 10000 if use_gpu_for_projections else 5000
+            voxel_chunk_size = estimate_chunk_size(
+                n_voxels=n_voxels,
+                n_timepoints=n_timepoints,
+                n_regressors=n_task_regs,
+                device=proj_device,
+                operation="denoise",
+                min_chunk_size=min_chunk,
+                max_chunk_size=max_chunk,
+                safety_factor=0.5,  # Conservative for accumulator memory
+            )
 
     # Move data to CPU for memory efficiency
     data_cpu = data.to(proj_device)
@@ -699,11 +741,11 @@ def cross_validate_noise_pcs(
 
     if is_loro:
         print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
-        print(f"Memory strategy: LORO streaming stats (minimal memory)")
+        print("Memory strategy: LORO streaming stats (minimal memory)")
         print(f"Projection device: {proj_device} (GPU acceleration enabled)")
     else:
         print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
-        print(f"Memory strategy: accumulate predictions per chunk, compute R², discard")
+        print("Memory strategy: accumulate predictions per chunk, compute R², discard")
         print(f"Projection device: {proj_device} (CPU to save GPU memory)")
 
     n_chunks = (n_voxels + voxel_chunk_size - 1) // voxel_chunk_size
@@ -785,115 +827,30 @@ def cross_validate_noise_pcs(
             # ================================================================
             if nuisance_per_run is not None:
                 # Project out nuisance from TRAINING data and design per run
-                train_data_projected_runs = []
-                train_design_projected_runs = []
+                # Use shared QR-based projection function for numerical stability
+                train_run_starts_local = _compute_local_run_starts(train_runs, run_starts, n_timepoints)
+                train_nuisance_per_run = [nuisance_per_run[i] for i in train_runs]
 
-                for run_idx in train_runs:
-                    # Get this run's slice from the concatenated train data
-                    run_start_in_train = 0
-                    for prev_run in train_runs:
-                        if prev_run == run_idx:
-                            break
-                        prev_start = run_starts[prev_run]
-                        prev_end = (
-                            run_starts[prev_run + 1] if prev_run < n_runs - 1 else n_timepoints
-                        )
-                        run_start_in_train += prev_end - prev_start
-
-                    run_start_global = run_starts[run_idx]
-                    run_end_global = (
-                        run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                    )
-                    run_length = run_end_global - run_start_global
-                    run_end_in_train = run_start_in_train + run_length
-
-                    # Get this run's data and design from the train split
-                    run_data = chunk_data_train[:, run_start_in_train:run_end_in_train]
-                    run_design = design_train[run_start_in_train:run_end_in_train, :]
-                    run_nuisance = nuisance_per_run[run_idx].to(proj_device)
-
-                    if run_nuisance.shape[1] > 0:
-                        # Compute projection matrix: P_perp = I - X(X'X)^-1 X'
-                        XtX = run_nuisance.T @ run_nuisance
-                        XtX_inv = torch.linalg.inv(
-                            XtX + 1e-6 * torch.eye(XtX.shape[0], device=proj_device)
-                        )
-                        P_nuisance = run_nuisance @ XtX_inv @ run_nuisance.T
-                        projection = torch.eye(run_length, device=proj_device) - P_nuisance
-
-                        # Project data and design
-                        run_data_proj = (projection @ run_data.T).T
-                        run_design_proj = projection @ run_design
-                    else:
-                        run_data_proj = run_data
-                        run_design_proj = run_design
-
-                    train_data_projected_runs.append(run_data_proj)
-                    train_design_projected_runs.append(run_design_proj)
-
-                # Concatenate projected training data/design
-                data_train_projected = torch.cat(train_data_projected_runs, dim=1)
-                design_train_projected = torch.cat(train_design_projected_runs, dim=0)
-
-                # Free intermediate projection results to reduce fragmentation
-                del train_data_projected_runs, train_design_projected_runs
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                data_train_projected, design_train_projected = project_out_nuisance_per_run(
+                    data=chunk_data_train,
+                    design=design_train,
+                    nuisance_per_run=train_nuisance_per_run,
+                    run_starts=train_run_starts_local,
+                    device=proj_device,
+                )
 
                 # Project out nuisance from TEST data and design
-                test_data_projected_runs = []
-                test_design_projected_runs = []
+                # Use shared QR-based projection function for numerical stability
+                test_run_starts_local = _compute_local_run_starts(test_runs, run_starts, n_timepoints)
+                test_nuisance_per_run = [nuisance_per_run[i] for i in test_runs]
 
-                for run_idx in test_runs:
-                    run_start_global = run_starts[run_idx]
-                    run_end_global = (
-                        run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                    )
-                    run_length = run_end_global - run_start_global
-
-                    run_start_in_test = 0
-                    for prev_run in test_runs:
-                        if prev_run == run_idx:
-                            break
-                        prev_start = run_starts[prev_run]
-                        prev_end = (
-                            run_starts[prev_run + 1] if prev_run < n_runs - 1 else n_timepoints
-                        )
-                        run_start_in_test += prev_end - prev_start
-
-                    run_end_in_test = run_start_in_test + run_length
-                    run_test_data = chunk_data_test[:, run_start_in_test:run_end_in_test]
-                    run_test_design = design_test[run_start_in_test:run_end_in_test, :]
-
-                    nuisance_test_run = nuisance_per_run[run_idx].to(proj_device)
-
-                    if nuisance_test_run.shape[1] > 0:
-                        XtX_test = nuisance_test_run.T @ nuisance_test_run
-                        XtX_test_inv = torch.linalg.inv(
-                            XtX_test + 1e-6 * torch.eye(XtX_test.shape[0], device=proj_device)
-                        )
-                        P_nuisance_test = nuisance_test_run @ XtX_test_inv @ nuisance_test_run.T
-                        projection_test = (
-                            torch.eye(run_length, device=proj_device) - P_nuisance_test
-                        )
-
-                        run_test_data_proj = (projection_test @ run_test_data.T).T
-                        run_test_design_proj = projection_test @ run_test_design
-                    else:
-                        run_test_data_proj = run_test_data
-                        run_test_design_proj = run_test_design
-
-                    test_data_projected_runs.append(run_test_data_proj)
-                    test_design_projected_runs.append(run_test_design_proj)
-
-                # Concatenate projected test data/design
-                data_test_projected = torch.cat(test_data_projected_runs, dim=1)
-                design_test_projected = torch.cat(test_design_projected_runs, dim=0)
-
-                # Free intermediate projection results
-                del test_data_projected_runs, test_design_projected_runs
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                data_test_projected, design_test_projected = project_out_nuisance_per_run(
+                    data=chunk_data_test,
+                    design=design_test,
+                    nuisance_per_run=test_nuisance_per_run,
+                    run_starts=test_run_starts_local,
+                    device=proj_device,
+                )
             else:
                 # No nuisance - no projection needed
                 data_train_projected = chunk_data_train
@@ -1004,12 +961,10 @@ def cross_validate_noise_pcs(
                 sum_act = sum_actual_by_pc[n_pcs]
                 sum_sq_act = sum_sq_actual_by_pc[n_pcs]
 
-                # Compute ss_tot from streaming stats: ss_tot = sum_sq - sum^2 / n
-                mean_actual = sum_act / n_timepoints
-                ss_tot = sum_sq_act - n_timepoints * (mean_actual**2)
-
-                # R² = 1 - ss_res / ss_tot (all on GPU, transfer only final result)
-                r2 = (1.0 - ss_res / (ss_tot + 1e-10)).float()
+                # Compute R² from streaming statistics
+                r2 = compute_r2_from_sufficient_stats(
+                    ss_res, sum_act, sum_sq_act, n_timepoints
+                )
                 r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy()
 
             # Free chunk memory
@@ -1020,10 +975,8 @@ def cross_validate_noise_pcs(
                 pred = pred_by_pc_chunk[n_pcs]  # (chunk_size, n_timepoints)
                 actual = actual_projected_chunk  # (chunk_size, n_timepoints) - PROJECTED data
 
-                # Compute R² per voxel (works on both CPU and GPU)
-                ss_res = ((actual - pred) ** 2).sum(dim=1)
-                ss_tot = ((actual - actual.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
-                r2 = 1 - (ss_res / (ss_tot + 1e-10))
+                # Compute R² per voxel using unified function
+                r2 = compute_r2_metric(actual, pred, metric="cod")
 
                 # Move to CPU if on GPU before converting to numpy
                 r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy() if r2.is_cuda else r2.numpy()
@@ -1089,7 +1042,7 @@ def select_optimal_pcs(
     criteria_mask = np.any(r2_maps > threshold, axis=1)
     n_criteria = np.sum(criteria_mask)
 
-    print(f"\nSelecting optimal PC count:")
+    print("\nSelecting optimal PC count:")
     print(f"  Criteria voxels (R² > {threshold} in any PC): {n_criteria:,} / {r2_maps.shape[0]:,}")
 
     if n_criteria == 0:
@@ -1207,113 +1160,30 @@ def compute_xval_r2_optimal_full(
 
         # Project out nuisance per run (project-first)
         if nuisance_per_run is not None:
-            train_data_projected_runs = []
-            train_design_projected_runs = []
+            # Use shared QR-based projection function for numerical stability
+            train_run_starts_local = _compute_local_run_starts(train_runs, run_starts, n_timepoints)
+            train_nuisance_per_run = [nuisance_per_run[i] for i in train_runs]
 
-            for run_idx in train_runs:
-                run_start_in_train = 0
-                for prev_run in train_runs:
-                    if prev_run == run_idx:
-                        break
-                    prev_start = run_starts[prev_run]
-                    prev_end = run_starts[prev_run + 1] if prev_run < n_runs - 1 else n_timepoints
-                    run_start_in_train += prev_end - prev_start
+            data_train_projected, design_train_projected = project_out_nuisance_per_run(
+                data=data_train,
+                design=design_train,
+                nuisance_per_run=train_nuisance_per_run,
+                run_starts=train_run_starts_local,
+                device=proj_device,
+            )
 
-                run_start_global = run_starts[run_idx]
-                run_end_global = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                run_length = run_end_global - run_start_global
-                run_end_in_train = run_start_in_train + run_length
+            # Project out nuisance from TEST data and design
+            # Use shared QR-based projection function for numerical stability
+            test_run_starts_local = _compute_local_run_starts(test_runs, run_starts, n_timepoints)
+            test_nuisance_per_run = [nuisance_per_run[i] for i in test_runs]
 
-                run_design = design_train[run_start_in_train:run_end_in_train, :].to(proj_device)
-                run_nuisance = nuisance_per_run[run_idx].to(proj_device)
-
-                if run_nuisance.shape[1] > 0:
-                    # Compute projection matrix on CPU
-                    xtx = run_nuisance.T @ run_nuisance
-                    xtx_inv = torch.linalg.inv(
-                        xtx + 1e-6 * torch.eye(xtx.shape[0], device=proj_device)
-                    )
-                    p_nuisance = run_nuisance @ xtx_inv @ run_nuisance.T
-                    projection = torch.eye(run_length, device=proj_device) - p_nuisance
-
-                    # Project design matrix (small)
-                    run_design_proj = projection @ run_design
-
-                    # Project data in chunks to avoid OOM (projection @ data.T creates huge temporaries)
-                    run_data_proj_chunks = []
-                    for vox_start in range(0, n_voxels, voxel_chunk_size):
-                        vox_end = min(vox_start + voxel_chunk_size, n_voxels)
-                        chunk = data_train[
-                            vox_start:vox_end, run_start_in_train:run_end_in_train
-                        ].to(proj_device)
-                        chunk_proj = (projection @ chunk.T).T  # (n_voxels_chunk, run_length)
-                        run_data_proj_chunks.append(chunk_proj)
-                    run_data_proj = torch.cat(run_data_proj_chunks, dim=0)
-                else:
-                    run_data_proj = data_train[:, run_start_in_train:run_end_in_train].to(
-                        proj_device
-                    )
-                    run_design_proj = run_design
-
-                train_data_projected_runs.append(run_data_proj)
-                train_design_projected_runs.append(run_design_proj)
-
-            data_train_projected = torch.cat(train_data_projected_runs, dim=1)
-            design_train_projected = torch.cat(train_design_projected_runs, dim=0)
-
-            test_data_projected_runs = []
-            test_design_projected_runs = []
-
-            for run_idx in test_runs:
-                run_start_global = run_starts[run_idx]
-                run_end_global = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                run_length = run_end_global - run_start_global
-
-                run_start_in_test = 0
-                for prev_run in test_runs:
-                    if prev_run == run_idx:
-                        break
-                    prev_start = run_starts[prev_run]
-                    prev_end = run_starts[prev_run + 1] if prev_run < n_runs - 1 else n_timepoints
-                    run_start_in_test += prev_end - prev_start
-
-                run_end_in_test = run_start_in_test + run_length
-                run_test_design = design_test[run_start_in_test:run_end_in_test, :].to(proj_device)
-                run_nuisance = nuisance_per_run[run_idx].to(proj_device)
-
-                if run_nuisance.shape[1] > 0:
-                    # Compute projection matrix on CPU
-                    xtx_test = run_nuisance.T @ run_nuisance
-                    xtx_test_inv = torch.linalg.inv(
-                        xtx_test + 1e-6 * torch.eye(xtx_test.shape[0], device=proj_device)
-                    )
-                    p_nuisance_test = run_nuisance @ xtx_test_inv @ run_nuisance.T
-                    projection_test = torch.eye(run_length, device=proj_device) - p_nuisance_test
-
-                    # Project design matrix (small)
-                    run_test_design_proj = projection_test @ run_test_design
-
-                    # Project data in chunks to avoid OOM
-                    run_test_data_proj_chunks = []
-                    for vox_start in range(0, n_voxels, voxel_chunk_size):
-                        vox_end = min(vox_start + voxel_chunk_size, n_voxels)
-                        chunk = data_test[vox_start:vox_end, run_start_in_test:run_end_in_test].to(
-                            proj_device
-                        )
-                        chunk_proj = (projection_test @ chunk.T).T
-                        run_test_data_proj_chunks.append(chunk_proj)
-                    run_test_data_proj = torch.cat(run_test_data_proj_chunks, dim=0)
-                else:
-                    run_test_data_proj = data_test[:, run_start_in_test:run_end_in_test].to(
-                        proj_device
-                    )
-                    run_test_design_proj = run_test_design
-
-                test_data_projected_runs.append(run_test_data_proj)
-                test_design_projected_runs.append(run_test_design_proj)
-
-            data_test_projected = torch.cat(test_data_projected_runs, dim=1)
-            design_test_projected = torch.cat(test_design_projected_runs, dim=0)
+            data_test_projected, design_test_projected = project_out_nuisance_per_run(
+                data=data_test,
+                design=design_test,
+                nuisance_per_run=test_nuisance_per_run,
+                run_starts=test_run_starts_local,
+                device=proj_device,
+            )
         else:
             # No nuisance - move data to CPU if needed
             data_train_projected = data_train.to(proj_device)
@@ -1322,6 +1192,7 @@ def compute_xval_r2_optimal_full(
             design_test_projected = design_test.to(proj_device)
 
         # Project nuisance from PCs for training runs
+        # Use QR decomposition for numerical stability (instead of (X'X)^-1)
         train_noise_pcs_projected = []
         for run_idx in train_runs:
             run_start_global = run_starts[run_idx]
@@ -1332,11 +1203,10 @@ def compute_xval_r2_optimal_full(
             if nuisance_per_run is not None:
                 run_nuisance = nuisance_per_run[run_idx].to(device)
                 if run_nuisance.shape[1] > 0:
-                    xtx = run_nuisance.T @ run_nuisance
-                    xtx_inv = torch.linalg.inv(xtx + 1e-6 * torch.eye(xtx.shape[0], device=device))
-                    p_nuisance = run_nuisance @ xtx_inv @ run_nuisance.T
-                    projection = torch.eye(run_length, device=device) - p_nuisance
-                    pcs_projected = projection @ pcs_this_run.to(device)
+                    # Use QR decomposition for numerical stability
+                    Q, _ = torch.linalg.qr(run_nuisance)
+                    # Project: pcs_projected = pcs - Q @ (Q.T @ pcs)
+                    pcs_projected = pcs_this_run.to(device) - Q @ (Q.T @ pcs_this_run.to(device))
                 else:
                     pcs_projected = pcs_this_run.to(device)
             else:
@@ -1385,10 +1255,12 @@ def compute_xval_r2_optimal_full(
             # Accumulate predictions for this fold's test timepoints
             predictions[chunk_start:chunk_end, test_tps_list] = y_pred.cpu()
 
-            # Free GPU memory immediately after each chunk
+            # Free intermediate tensors
             del chunk_train, betas, y_pred
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+
+        # Clear GPU cache once per fold (not after every chunk - empty_cache is expensive)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         if verbose:
             print(f"  Fold {fold_idx + 1}/{n_splits} complete")
@@ -1404,9 +1276,7 @@ def compute_xval_r2_optimal_full(
     if verbose:
         print("  Computing R² from concatenated predictions...")
 
-    ss_res = ((data_cpu - predictions) ** 2).sum(dim=1)
-    ss_tot = ((data_cpu - data_cpu.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
-    r2_all = 1 - (ss_res / (ss_tot + 1e-10))
+    r2_all = compute_r2_metric(data_cpu, predictions, metric="cod")
 
     # Legacy per-fold output (for compatibility; duplicate the single R² value)
     r2_per_fold_all = np.tile(r2_all.numpy(), (n_splits, 1))
@@ -1567,22 +1437,21 @@ def fit_denoising_model(
     n_timepoints = data.shape[1]
     n_voxels = data.shape[0]
 
+    # Ensure hrf_indices is on computation device
+    if hrf_indices is not None:
+        hrf_indices = hrf_indices.to(device)
+
     # Auto-determine polort based on run length if not specified
     # Uses AFNI formula: 1 + floor(run_duration / 150)
     if polort is None:
-        # Calculate median run length (in case runs have different lengths)
-        run_lengths = []
-        for run_idx in range(n_runs):
-            start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_lengths.append(end_tp - start_tp)
-
-        median_run_length = int(np.median(run_lengths))
-        run_duration = median_run_length * tr
-        polort = int(np.floor(1 + run_duration / 150.0))
+        from .cli_utils import auto_polort, compute_run_lengths, get_average_run_duration
+        run_lengths = compute_run_lengths(run_starts, n_timepoints)
+        avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
+        polort = auto_polort(avg_run_duration_sec, formula="afni")
 
         if verbose:
-            print(f"\nAuto-determined polort={polort} (median run: {median_run_length} TRs = {run_duration:.1f}s)")
+            median_run_length = int(torch.tensor(run_lengths).median().item()) if len(run_lengths) > 1 else run_lengths[0]
+            print(f"\nAuto-determined polort={polort} (median run: {median_run_length} TRs = {avg_run_duration_sec:.1f}s)")
 
     # Convert nuisance to list format for consistent handling
     # This ensures extract_noise_pcs_per_run gets the exact same nuisance
@@ -1609,9 +1478,9 @@ def fit_denoising_model(
 
     # Per-HRF mode: Compute initial R² for each HRF group to build unified noise pool
     if per_hrf_mode and initial_r2 is None:
+        unique_hrf_indices = torch.unique(hrf_indices).tolist()
         if verbose:
             print("\nStep 1a: Computing baseline R² per HRF group for unified noise pool...")
-            unique_hrf_indices = torch.unique(hrf_indices).tolist()
             print(f"  Processing {len(unique_hrf_indices)} HRF groups")
 
         # Allocate unified R² array
@@ -1827,7 +1696,7 @@ def fit_denoising_model(
     if verbose:
         print(f"  Noise pool: {n_noise:,} voxels ({n_noise / data.shape[0] * 100:.1f}%)")
         print(f"  Criteria: {n_criteria:,} voxels ({n_criteria / data.shape[0] * 100:.1f}%)")
-        print(f"  Note: Criteria mask will be refined after computing per-PC R² maps")
+        print("  Note: Criteria mask will be refined after computing per-PC R² maps")
 
     # Step 3: Extract noise PCs per run (and optionally loadings)
     if verbose:
@@ -1872,7 +1741,7 @@ def fit_denoising_model(
         if verbose:
             allocated_before = torch.cuda.memory_allocated(device) / 1e9
             print(f"  GPU memory after PCA: {allocated_before:.2f} GB allocated")
-            print(f"  Moving data to CPU for cross-validation (will stream chunks to GPU)")
+            print("  Moving data to CPU for cross-validation (will stream chunks to GPU)")
 
         data = data.to("cpu")
 
@@ -1889,6 +1758,10 @@ def fit_denoising_model(
                 nuisance = [n.to("cpu") for n in nuisance]
             else:
                 nuisance = nuisance.to("cpu")
+
+        # Move hrf_indices to CPU to match data
+        if hrf_indices is not None:
+            hrf_indices = hrf_indices.to("cpu")
 
         torch.cuda.empty_cache()
 
