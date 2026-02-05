@@ -64,6 +64,8 @@ ignore = [
     "E501",  # line too long (handled by formatter)
     "E731",  # lambda assignment (sometimes useful)
     "B008",  # function calls in argument defaults (common in ML)
+    "N806",  # non-lowercase variable names (linear algebra conventions: XtX, P_nuisance, etc.)
+    "N803",  # non-lowercase argument names (linear algebra conventions)
 ]
 
 [tool.ruff.lint.per-file-ignores]

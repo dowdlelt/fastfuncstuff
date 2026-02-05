@@ -260,6 +260,12 @@ Notes:
         help="Print detailed progress information",
     )
     proc_opts.add_argument(
+        "-dry_run",
+        action="store_true",
+        help="Fast testing mode: load only first run, generate synthetic data for rest. "
+        "Results are nonsensical but pipeline runs quickly for testing.",
+    )
+    proc_opts.add_argument(
         "-do_scale",
         action="store_true",
         help="Scale each voxel per run to mean=100 (percent signal change units). "
@@ -354,8 +360,13 @@ def main():
         do_scale=False,
         device=device,
         force_cpu=False,  # 3dRidgefast always loads to GPU
+        dry_run=args.dry_run,
         verbose=True,
     )
+
+    # Modify prefix for dry run mode
+    if args.dry_run:
+        args.prefix = f"dry_run_{args.prefix}"
 
     # Extract loaded data
     data = load_result.data

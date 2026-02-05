@@ -60,6 +60,11 @@ try:
         load_and_concatenate_runs,
         load_nifti,
     )
+    from fastfuncsim.cli_utils import (
+        auto_polort,
+        compute_run_lengths,
+        get_average_run_duration,
+    )
     from fastfuncsim.denoise import (
         extract_noise_pcs_per_run,
         select_noise_pool_voxels,
@@ -67,6 +72,7 @@ try:
     from fastfuncsim.design import convolve_hrf_microtime
     from fastfuncsim.design_builder import parse_afni_timing_file
     from fastfuncsim.glm_core import GLMResults, construct_polynomial_matrix, fit_glm
+    from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
     from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
     from fastfuncsim.utils import (
@@ -80,7 +86,6 @@ try:
         generate_cv_splits,
         project_out_nuisance_per_run,
     )
-    from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -1304,6 +1309,10 @@ def save_pathfinder_results(
 
     # 8. Plots
     if save_plots:
+        # Create figures directory
+        figs_dir = f"{output_prefix}_figures"
+        Path(figs_dir).mkdir(parents=True, exist_ok=True)
+
         try:
             import matplotlib
 
@@ -1328,7 +1337,7 @@ def save_pathfinder_results(
                 ax.scatter(opt_pcs, hrf_idx, marker="x", color="red", s=50)
 
             plt.tight_layout()
-            surface_path = f"{output_prefix}_optimization_surface.png"
+            surface_path = f"{figs_dir}/optimization_surface.png"
             fig.savefig(surface_path, dpi=150)
             plt.close(fig)
             output_files["optimization_surface_plot"] = surface_path
@@ -1341,7 +1350,7 @@ def save_pathfinder_results(
             ax.set_ylabel("Voxel Count")
             ax.set_title("HRF Selection Distribution")
             plt.tight_layout()
-            hist_path = f"{output_prefix}_hrf_histogram.png"
+            hist_path = f"{figs_dir}/hrf_histogram.png"
             fig.savefig(hist_path, dpi=150)
             plt.close(fig)
             output_files["hrf_histogram_plot"] = hist_path
@@ -1534,14 +1543,9 @@ def main():
     print("Building nuisance regressors...")
 
     if args.polort is None:
-        run_lengths = []
-        for i in range(n_runs):
-            if i < n_runs - 1:
-                run_lengths.append(run_starts[i + 1] - run_starts[i])
-            else:
-                run_lengths.append(n_timepoints - run_starts[i])
-        avg_run_duration_min = (sum(run_lengths) / n_runs * args.tr) / 60.0
-        polort = max(1, round(avg_run_duration_min / 2))
+        run_lengths = compute_run_lengths(run_starts, n_timepoints)
+        avg_run_duration_sec = get_average_run_duration(run_lengths, args.tr)
+        polort = auto_polort(avg_run_duration_sec, formula="afni")
     else:
         polort = args.polort
 

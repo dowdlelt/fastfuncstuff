@@ -26,11 +26,14 @@ References:
 - Worsley & Friston (1995): Analysis of fMRI time-series revisited
 - Woolrich et al. (2001): Temporal autocorrelation in SPM
 """
+from __future__ import annotations
 
-import torch
-import numpy as np
 from typing import Optional, Tuple, Union
-from .utils import to_tensor, get_device
+
+import numpy as np
+import torch
+
+from .utils import get_device, to_tensor
 
 
 def generate_fmri_noise(tr: float,
@@ -769,7 +772,7 @@ def estimate_noise_parameters_from_data(
             try:
                 phi = torch.linalg.solve(R, r)
                 ar_coeffs_per_voxel.append(phi.cpu().numpy().tolist())
-            except:
+            except Exception:
                 # Singular matrix - use zeros
                 ar_coeffs_per_voxel.append([0.0] * ar_order)
 

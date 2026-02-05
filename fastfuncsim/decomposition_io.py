@@ -4,6 +4,7 @@ I/O utilities for PCA and ICA decomposition results
 Save and load PCA/ICA spatial maps and timeseries in NIfTI format,
 compatible with AFNI and other neuroimaging tools.
 """
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
@@ -88,7 +89,7 @@ def save_component_maps(
         output_img.header.extensions.append(
             nib.nifti1.Nifti1Extension(
                 'afni',
-                f'BRICK_LABS={label_str}'.encode('utf-8')
+                f'BRICK_LABS={label_str}'.encode()
             )
         )
 
@@ -280,7 +281,7 @@ def load_timeseries(
         labels = None
 
         # Try to read labels from header
-        with open(path, 'r') as f:
+        with open(path) as f:
             first_line = f.readline()
             if first_line.startswith('#'):
                 labels = first_line.strip('# \n').split()

@@ -20,6 +20,7 @@ References:
 - Woolrich et al. (2001): Temporal autocorrelation in univariate linear modeling
 - Worsley & Friston (1995): Analysis of fMRI time-series revisited
 """
+from __future__ import annotations
 
 import warnings
 from pathlib import Path
@@ -28,6 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+
+from .utils import get_device, to_tensor
+from .xval import compute_r2_metric
 
 
 def _debug_memory_snapshot(
@@ -87,8 +91,6 @@ def _debug_memory_snapshot(
 
     print(f"{'=' * 70}\n")
 
-
-from .utils import get_device, to_tensor
 
 # AFNI 3dREMLfit default grid parameters (Grid 3 - medium resolution)
 # These are well-validated values from AFNI documentation
@@ -4187,14 +4189,9 @@ def fit_glm_arma11(
                         fstats_batch = quad_batch / n_regressors
                         del quad_batch, betas_batch_col, var_inv_batch
 
-                    y_mean_batch = Y_batch_dev.mean(dim=0)
-                    ss_total_batch = torch.sum(
-                        (Y_batch_dev - y_mean_batch.unsqueeze(0)) ** 2, dim=0
-                    )
-                    del y_mean_batch
-                    ss_residual_batch = torch.sum(resid_orig_batch**2, dim=1)
-                    r2_batch = 1 - ss_residual_batch / (ss_total_batch + 1e-10)
-                    del ss_total_batch, ss_residual_batch
+                    # Compute R² using unified function
+                    # Y_batch_dev is (n_timepoints, batch_voxels), pred_orig_batch is (batch_voxels, n_timepoints)
+                    r2_batch = compute_r2_metric(Y_batch_dev.T, pred_orig_batch, metric="cod")
 
                     # GLT CONTRASTS (QR path): Compute in-loop
                     if glt_contrasts_tensor is not None:
@@ -4442,14 +4439,8 @@ def fit_glm_arma11(
                         del quad_batch, betas_batch_col, var_inv_batch
 
                     # R²
-                    y_mean_batch = Y_batch_dev.mean(dim=0)
-                    ss_total_batch = torch.sum(
-                        (Y_batch_dev - y_mean_batch.unsqueeze(0)) ** 2, dim=0
-                    )
-                    del y_mean_batch
-                    ss_residual_batch = torch.sum(resid_orig_batch**2, dim=1)
-                    r2_batch = 1 - ss_residual_batch / (ss_total_batch + 1e-10)
-                    del ss_total_batch, ss_residual_batch
+                    # Compute using unified function (Y_batch_dev is transposed)
+                    r2_batch = compute_r2_metric(Y_batch_dev.T, pred_orig_batch, metric="cod")
 
                     # Now compute semi-partial R² (non-QR path)
                     if want_r2_semipartial:
@@ -4883,11 +4874,11 @@ def fit_glm_arma11(
 
             results.fstats[v] = fstat.cpu()
 
-            # R²
-            y_mean_val = y_v_cpu.mean()
-            ss_total = torch.sum((y_v_cpu - y_mean_val) ** 2)
-            ss_residual = torch.sum(resid_orig_cpu**2)
-            results.r2[v] = (1 - ss_residual / (ss_total + 1e-10)).cpu()
+            # R² (per-voxel case - reshape to use unified function)
+            # y_v_cpu and pred_orig_cpu are 1D tensors (n_timepoints,)
+            results.r2[v] = compute_r2_metric(
+                y_v_cpu.unsqueeze(0), pred_orig_cpu.unsqueeze(0), metric="cod"
+            ).squeeze()
 
             # Optional outputs
             if want_residuals:

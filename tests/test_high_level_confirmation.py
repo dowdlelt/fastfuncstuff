@@ -35,11 +35,19 @@ def simulated_data():
         np.array([30.0, 70.0, 110.0, 150.0, 190.0]),
     ]
 
-    # Create simple binary onset matrix (n_timepoints, n_conditions)
+    # Create simple binary onset matrix (n_timepoints, n_conditions) at TR resolution
     onsets_matrix = torch.zeros((n_timepoints, 2))
     for i, onsets in enumerate(stim_onsets):
         for onset in onsets:
             onsets_matrix[int(onset / tr), i] = 1.0
+
+    # Also create microtime-resolution onset matrix for HRF library tests
+    # onsets_to_binary_matrix expects list of lists of arrays per condition per run
+    from fastfuncsim.afni_io import onsets_to_binary_matrix
+    onsets_per_condition = [[stim_onsets[0]], [stim_onsets[1]]]  # 2 conditions, 1 run each
+    onsets_matrix_microtime = onsets_to_binary_matrix(
+        onsets_per_condition, n_timepoints, tr, microtime_dt=0.1
+    )
 
     # Generate ground truth data using a standard HRF
     # Important: simulate_fmri_run expects (n_timepoints, n_conditions) onsets
@@ -71,6 +79,7 @@ def simulated_data():
     return {
         "data": data,  # (n_voxels, n_timepoints)
         "onsets_matrix": onsets_matrix,
+        "onsets_matrix_microtime": onsets_matrix_microtime,
         "tr": tr,
         "n_timepoints": n_timepoints,
     }
@@ -126,7 +135,7 @@ def test_fit_glm_hrf_library_logic(simulated_data):
     """Confirm that fitting with an HRF library works and selects 'best' HRF."""
     data = simulated_data["data"]
     tr = simulated_data["tr"]
-    onsets_matrix = simulated_data["onsets_matrix"]
+    onsets_matrix = simulated_data["onsets_matrix_microtime"]  # Use microtime resolution
 
     # Create HRF library - library always returns 20 HRFs from file
     hrf_library = get_hrf_library(mode="library", tr=tr)
@@ -220,7 +229,7 @@ def test_microtime_resolution(simulated_data):
 
     # Test with TR-locked (legacy) - onsets get rounded
     onsets_tr = onsets_to_binary_matrix(
-        onsets_per_condition, n_timepoints, tr, microtime_resolution=1
+        onsets_per_condition, n_timepoints, tr, microtime_dt=tr
     )
     assert onsets_tr.shape == (n_timepoints, 2)
     # At TR=2.0, onset at 0.5s rounds to TR 0, onset at 10.5s rounds to TR 5
@@ -230,7 +239,7 @@ def test_microtime_resolution(simulated_data):
     # Test with microtime resolution (default 16x)
     microtime_res = 16
     onsets_micro = onsets_to_binary_matrix(
-        onsets_per_condition, n_timepoints, tr, microtime_resolution=microtime_res
+        onsets_per_condition, n_timepoints, tr, microtime_dt=tr / microtime_res
     )
     assert onsets_micro.shape == (n_timepoints * microtime_res, 2)
 
@@ -246,7 +255,8 @@ def test_microtime_resolution(simulated_data):
         onsets_micro,
         hrf,
         n_timepoints,
-        microtime_res,
+        tr=tr,
+        microtime_dt=tr / microtime_res,
         microtime_onset=microtime_res // 2 + 1,  # Middle of TR
     )
     assert design.shape == (n_timepoints, 2), (
@@ -276,24 +286,26 @@ def test_microtime_vs_tr_locked():
 
     # Microtime designs should differ (different sub-TR placement)
     onsets_early_micro = onsets_to_binary_matrix(
-        onsets_early, n_timepoints, tr, microtime_resolution=microtime_res
+        onsets_early, n_timepoints, tr, microtime_dt=tr / microtime_res
     )
     onsets_late_micro = onsets_to_binary_matrix(
-        onsets_late, n_timepoints, tr, microtime_resolution=microtime_res
+        onsets_late, n_timepoints, tr, microtime_dt=tr / microtime_res
     )
 
     design_early = convolve_hrf_microtime(
         onsets_early_micro,
         hrf,
         n_timepoints,
-        microtime_res,
+        tr=tr,
+        microtime_dt=tr / microtime_res,
         microtime_onset=microtime_res // 2 + 1,
     )
     design_late = convolve_hrf_microtime(
         onsets_late_micro,
         hrf,
         n_timepoints,
-        microtime_res,
+        tr=tr,
+        microtime_dt=tr / microtime_res,
         microtime_onset=microtime_res // 2 + 1,
     )
 
@@ -305,10 +317,10 @@ def test_microtime_vs_tr_locked():
 
     # TR-locked designs would be identical (both round to TR 0)
     onsets_early_tr = onsets_to_binary_matrix(
-        onsets_early, n_timepoints, tr, microtime_resolution=1
+        onsets_early, n_timepoints, tr, microtime_dt=tr
     )
     onsets_late_tr = onsets_to_binary_matrix(
-        onsets_late, n_timepoints, tr, microtime_resolution=1
+        onsets_late, n_timepoints, tr, microtime_dt=tr
     )
 
     # Verify both round to TR 0

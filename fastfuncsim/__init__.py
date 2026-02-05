@@ -18,6 +18,7 @@ Main Components:
 - simulation: Simulation pipeline (single and batch)
 - utils: Device management and helpers
 """
+from __future__ import annotations
 
 __version__ = "0.1.0"
 __author__ = "Logan Grosenick (converted from MATLAB)"
@@ -63,6 +64,7 @@ from .arma_glm import (
 # Cross-validated denoising
 from .denoise import (
     DenoiseResults,
+    compute_full_brain_pc_loadings,
     cross_validate_noise_pcs,
     extract_noise_pcs_per_run,
     fit_denoising_model,
@@ -110,13 +112,13 @@ from .glm_outputs import (
 
 # HRF generation
 from .hrf import (
-    create_pighs_library,
     create_flobs_library,  # Backwards compatibility alias
-    pighs_halfcos,
+    create_pighs_library,
     flobs_halfcos,  # Backwards compatibility alias
     get_canonical_hrf,
     get_canonical_hrf_library,
     get_hrf_library,
+    pighs_halfcos,
 )
 
 # HRF selection with cross-validation
@@ -264,6 +266,13 @@ __all__ = [
     "save_arma_rvar",
     "load_arma_params",
     "ARMA11Results",
+    # Cross-validated Denoising
+    "DenoiseResults",
+    "compute_full_brain_pc_loadings",
+    "cross_validate_noise_pcs",
+    "extract_noise_pcs_per_run",
+    "fit_denoising_model",
+    "select_noise_pool_voxels",
     # AFNI File I/O
     "read_afni_onset_file",
     "read_afni_onset_files",

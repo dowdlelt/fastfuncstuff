@@ -44,7 +44,7 @@ class TestPolynomialMatrix:
         assert torch.allclose(poly1[:, 1], t)
 
     def test_construct_polynomial_degree_2(self, device):
-        """Test quadratic polynomial."""
+        """Test quadratic Legendre polynomial."""
         n_timepoints = 100
         poly2 = construct_polynomial_matrix(n_timepoints, max_degree=2, device=device)
 
@@ -52,27 +52,34 @@ class TestPolynomialMatrix:
 
         t = torch.linspace(-1, 1, n_timepoints, device=device)
 
-        # First column: constant
+        # First column: constant (P0)
         assert torch.allclose(poly2[:, 0], torch.ones(n_timepoints, device=device))
 
-        # Second column: linear
+        # Second column: linear (P1 = t)
         assert torch.allclose(poly2[:, 1], t)
 
-        # Third column: quadratic
-        assert torch.allclose(poly2[:, 2], t**2)
+        # Third column: quadratic Legendre (P2 = (3t² - 1) / 2)
+        expected_p2 = (3 * t**2 - 1) / 2
+        assert torch.allclose(poly2[:, 2], expected_p2)
 
     def test_construct_polynomial_degree_3(self, device):
-        """Test cubic polynomial."""
+        """Test cubic Legendre polynomial."""
         n_timepoints = 50
         poly3 = construct_polynomial_matrix(n_timepoints, max_degree=3, device=device)
 
         assert poly3.shape == (n_timepoints, 4)  # constant + linear + quadratic + cubic
 
         t = torch.linspace(-1, 1, n_timepoints, device=device)
+        # First column: constant (P0)
         assert torch.allclose(poly3[:, 0], torch.ones(n_timepoints, device=device))
+        # Second column: linear (P1 = t)
         assert torch.allclose(poly3[:, 1], t)
-        assert torch.allclose(poly3[:, 2], t**2)
-        assert torch.allclose(poly3[:, 3], t**3)
+        # Third column: quadratic Legendre (P2 = (3t² - 1) / 2)
+        expected_p2 = (3 * t**2 - 1) / 2
+        assert torch.allclose(poly3[:, 2], expected_p2)
+        # Fourth column: cubic Legendre (P3 = (5t³ - 3t) / 2)
+        expected_p3 = (5 * t**3 - 3 * t) / 2
+        assert torch.allclose(poly3[:, 3], expected_p3)
 
     def test_construct_polynomial_orthogonal(self, device):
         """Test that polynomial columns have controlled correlations."""

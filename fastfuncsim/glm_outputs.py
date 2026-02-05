@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch

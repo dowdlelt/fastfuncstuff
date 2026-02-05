@@ -1,7 +1,10 @@
 """Timing utilities for performance profiling."""
+from __future__ import annotations
+
 import time
 from contextlib import contextmanager
 from typing import Dict, List, Optional
+
 import torch
 
 
@@ -96,16 +99,26 @@ def get_profiler(enabled: bool = True) -> TimingProfiler:
     return _global_profiler
 
 
-def reset_profiler():
-    """Reset global profiler."""
-    global _global_profiler
-    if _global_profiler is not None:
-        _global_profiler.reset()
-
-
 @contextmanager
 def profile_section(name: str, enabled: bool = True):
-    """Convenience function for profiling a section."""
+    """Context manager for profiling a named code section using global profiler.
+
+    This is a convenience wrapper around TimingProfiler.profile() for the
+    common case of using a global profiler instance.
+
+    Parameters
+    ----------
+    name : str
+        Name of the code section to profile
+    enabled : bool
+        Whether profiling is enabled
+
+    Examples
+    --------
+    >>> with profile_section("section_name", enabled=True):
+    ...     # code to time
+    ...     pass
+    """
     profiler = get_profiler(enabled=enabled)
     with profiler.profile(name):
-        yield profiler
+        yield

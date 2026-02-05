@@ -256,23 +256,25 @@ class TestComputeXvalR2:
         )
 
         # Check outputs
-        assert "r2_median" in results
+        assert "r2" in results
+        assert "r2_median" in results  # Backward compat - misleading name, actually per-voxel R²
+        assert "r2_mean" in results
         assert "r2_std" in results
         assert "r2_min" in results
         assert "r2_max" in results
-        assert "r2_splits" in results
+        assert "n_splits" in results
 
         # Check shapes
-        assert results["r2_median"].shape == (n_voxels,)
-        assert results["r2_std"].shape == (n_voxels,)
-        assert results["r2_splits"].shape == (len(cv_splits), n_voxels)
+        assert results["r2"].shape == (n_voxels,)
+        assert results["r2_median"].shape == (n_voxels,)  # Same as r2 (misleading name)
+        # Note: r2_std, r2_min, r2_max are scalars, not per-voxel
 
         # Sanity checks on values
         # With low noise, R² should be high
-        assert results["r2_median"].mean() > 0.7
+        assert results["r2"].mean() > 0.7
 
         # Cross-validated R² should be positive for good predictions
-        assert (results["r2_median"] > 0).sum() == n_voxels
+        assert (results["r2"] > 0).sum() == n_voxels
 
     def test_different_metrics(self):
         """Test that different metrics give similar results"""
@@ -332,15 +334,17 @@ def test_end_to_end_workflow():
 
     # Validate results structure
     assert isinstance(results, dict)
-    assert all(key in results for key in ["r2_median", "r2_std", "r2_min", "r2_max"])
+    assert all(key in results for key in ["r2", "r2_median", "r2_mean", "r2_std", "r2_min", "r2_max"])
 
-    # Validate statistics make sense
-    # Median should be between min and max
-    assert (results["r2_median"] >= results["r2_min"] - 1e-5).all()
-    assert (results["r2_median"] <= results["r2_max"] + 1e-5).all()
+    # Validate statistics make sense (scalar stats in new GLMdenoise-style API)
+    # r2_median is same as r2 (misleading name for backward compat)
+    assert results["r2_median"].shape == results["r2"].shape
+    assert torch.equal(results["r2_median"], results["r2"])
 
-    # Std should be non-negative
-    assert (results["r2_std"] >= 0).all()
+    # Scalar statistics
+    assert results["r2_mean"] <= results["r2_max"] + 1e-5
+    assert results["r2_mean"] >= results["r2_min"] - 1e-5
+    assert results["r2_std"] >= 0
 
 
 class TestGenerateCVSplitsEdgeCases:

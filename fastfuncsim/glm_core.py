@@ -7,6 +7,7 @@ Supports multiple GLM variants:
 - ARMA(1,1): Accounts for temporal autocorrelation (see arma_glm.py)
 - Ridge: Regularization for correlated regressors (future)
 """
+from __future__ import annotations
 
 import warnings
 from typing import Optional, Union
@@ -16,7 +17,9 @@ from tqdm.auto import tqdm
 
 from .design import convolve_hrf_microtime
 from .design_builder import legendre_polynomials
-from .utils import get_device, optimal_chunk_size, to_tensor
+from .memory import estimate_chunk_size
+from .utils import get_device, to_tensor
+from .xval import compute_r2_metric
 
 
 class GLMResults:
@@ -226,14 +229,11 @@ def fit_glm_chunk(
         predicted_vals = None
         residuals_vals = data - (design @ betas.T).T  # (n_voxels, n_timepoints)
 
+    # Compute residual sum of squares for output
     ss_residual = (residuals_vals**2).sum(dim=1)
 
-    # SST = sum((Y - mean(Y))²)
-    data_mean = data.mean(dim=1, keepdim=True)
-    ss_total = ((data - data_mean) ** 2).sum(dim=1)
-
-    r2 = 1 - ss_residual / (ss_total + 1e-10)  # Add epsilon to avoid division by zero
-    r2 = torch.clamp(r2, 0, 1)  # Clamp to [0, 1]
+    # Compute R² using unified function (allows negative values for poor fits)
+    r2 = compute_r2_metric(data, data - residuals_vals, metric="cod")
 
     return (
         betas,
@@ -402,7 +402,13 @@ def fit_glm(
 
     # Determine chunk size
     if chunk_size is None:
-        chunk_size = optimal_chunk_size(n_voxels, total_timepoints, design_concat.shape[1], device)
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=total_timepoints,
+            n_regressors=design_concat.shape[1],
+            device=device,
+            operation="glm",
+        )
 
         # When streaming from CPU, additional overhead from:
         # 1. Copying data chunk to GPU (temporary during transfer)

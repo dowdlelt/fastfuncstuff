@@ -42,7 +42,15 @@
       "Bash(/home/logan/miniconda3/envs/py312_movie_tasks/bin/python:*)",
       "Bash(~/miniconda3/envs/py312_movie_tasks/bin/ruff check fastfuncsim/arma_glm.py --select F821)",
       "Bash(~/miniconda3/envs/py312_movie_tasks/bin/ruff check:*)",
-      "Bash(~/miniconda3/envs/py312_movie_tasks/bin/pytest:*)"
+      "Bash(~/miniconda3/envs/py312_movie_tasks/bin/pytest:*)",
+      "Bash(tree:*)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(done)",
+      "Bash(wc:*)",
+      "Bash(ruff check:*)",
+      "Bash(pytest:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []

@@ -2,6 +2,7 @@
 Utility functions for fastfuncsim
 Device management and helper functions
 """
+from __future__ import annotations
 
 import platform
 import warnings
@@ -153,66 +154,6 @@ def calc_memory_usage(shape: tuple, dtype: torch.dtype = torch.float32) -> float
 
     bytes_per_element = torch.tensor([], dtype=dtype).element_size()
     return (num_elements * bytes_per_element) / 1e9
-
-
-def optimal_chunk_size(
-    n_voxels: int,
-    n_timepoints: int,
-    n_regressors: int,
-    device: torch.device,
-    safety_factor: float = 0.5,
-) -> int:
-    """
-    Calculate optimal chunk size for processing voxels given memory constraints
-
-    Parameters
-    ----------
-    n_voxels : int
-        Total number of voxels
-    n_timepoints : int
-        Number of timepoints
-    n_regressors : int
-        Number of regressors in design matrix
-    device : torch.device
-        Computing device
-    safety_factor : float
-        Fraction of available memory to use (default: 0.5)
-
-    Returns
-    -------
-    chunk_size : int
-        Optimal chunk size
-    """
-    # Estimate available memory
-    if device.type == "cuda":
-        total_mem = torch.cuda.get_device_properties(device).total_memory / 1e9
-        used_mem = torch.cuda.memory_allocated(device) / 1e9
-        available_mem = (total_mem - used_mem) * safety_factor
-    elif device.type == "mps":
-        # MPS doesn't expose memory info, use conservative estimate
-        available_mem = 4.0 * safety_factor  # Assume 4GB available
-    else:
-        available_mem = 8.0 * safety_factor  # Conservative CPU estimate
-
-    # Memory per voxel in GLM fitting (float32 = 4 bytes):
-    # - data: n_timepoints
-    # - betas: n_regressors
-    # - residuals: n_timepoints
-    # - predicted/temps: n_timepoints (design @ betas.T creates big intermediate)
-    # - ss_total temp: n_timepoints (data - data_mean)
-    # Conservative: 5x timepoints + regressors for all intermediates
-    bytes_per_voxel = (5 * n_timepoints + n_regressors) * 4  # 4 bytes per float32
-    mem_per_voxel_gb = bytes_per_voxel / 1e9
-
-    # Calculate chunk size
-    chunk_size = int(available_mem / mem_per_voxel_gb)
-
-    # Set sensible bounds: at least 1000, at most all voxels
-    # For large datasets, we want to process tens of thousands at once
-    min_chunk = min(1000, n_voxels)
-    chunk_size = max(min_chunk, min(chunk_size, n_voxels))
-
-    return chunk_size
 
 
 def scale_to_percent_signal(
@@ -513,4 +454,125 @@ def gaussian_blur_3d(
     if verbose:
         print(f"  ✓ Blurred {nt} volumes")
 
-    return data_blurred
+
+# ============================================================================
+# Dry run / synthetic data generation
+# ============================================================================
+
+
+def generate_synthetic_runs(
+    first_run_data: Optional[torch.Tensor],
+    n_runs_total: int,
+    run_length: int,
+    n_voxels: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """
+    Generate synthetic fMRI data for dry-run testing.
+
+    For fast testing, generates random positive data without loading real BOLD data.
+    Only the header info (shape, dimensions) is needed from the first run.
+
+    Parameters
+    ----------
+    first_run_data : torch.Tensor, optional
+        Real data from the first run. If None, all data is synthetic.
+    n_runs_total : int
+        Total number of runs to simulate
+    run_length : int
+        Number of timepoints per run
+    n_voxels : int, optional
+        Number of voxels. Required if first_run_data is None.
+    generator : torch.Generator, optional
+        Random number generator for reproducibility
+    verbose : bool, default=True
+        Print progress information
+
+    Returns
+    -------
+    synthetic_data : torch.Tensor
+        Combined data: first_run (if provided) + synthetic runs, shape (n_voxels, n_runs_total * run_length)
+
+    Notes
+    -----
+    - Synthetic data is generated with random positive values (10-100 range)
+    - Data is generated on CPU for speed
+    - When first_run_data is None, ALL runs are synthetic (fastest mode)
+    """
+    if first_run_data is not None:
+        n_voxels = first_run_data.shape[0]
+        n_runs_to_generate = n_runs_total - 1
+        use_first_run = True
+    else:
+        if n_voxels is None:
+            raise ValueError("n_voxels must be provided when first_run_data is None")
+        n_runs_to_generate = n_runs_total
+        use_first_run = False
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("🎭 DRY RUN MODE - Generating Synthetic Data")
+        print("=" * 70)
+        if use_first_run:
+            print(f"  Using real data from run 1: {first_run_data.shape}")
+        else:
+            print(f"  All-synthetic mode: {n_voxels:,} voxels, {n_runs_total} runs")
+        print(f"  Generating {n_runs_to_generate} synthetic runs...")
+        print(f"  Total shape will be: ({n_voxels:,}, {n_runs_total * run_length:,})")
+
+    # Pre-allocate full data tensor on CPU
+    total_tps = n_runs_total * run_length
+    synthetic_data = torch.zeros((n_voxels, total_tps), dtype=torch.float32, device="cpu")
+
+    # Copy first run data if provided
+    if use_first_run:
+        synthetic_data[:, :run_length] = first_run_data
+        start_idx = 1
+    else:
+        start_idx = 0
+
+    # ======================================================================
+    # FAST PATH: Generate all random data at once, then distribute to runs
+    # ======================================================================
+    # Much faster than looping: single torch.randn call instead of N calls
+    synthetic_tps = n_runs_to_generate * run_length
+    if synthetic_tps > 0:
+        # Generate all random data at once: (n_voxels, synthetic_tps)
+        all_random = 50.0 + torch.randn((n_voxels, synthetic_tps), generator=generator) * 15.0
+
+        # Clip to positive range
+        all_random = torch.clamp(all_random, min=10.0, max=100.0)
+
+        # Distribute to runs with progress bar
+        try:
+            from tqdm import tqdm
+
+            if verbose:
+                print()
+            for run_idx in tqdm(range(n_runs_to_generate), desc="  Simulating runs", disable=not verbose):
+                    run_number = run_idx + start_idx
+                    start_tp = run_number * run_length
+                    end_tp = start_tp + run_length
+                    # Slice from the pre-generated random data
+                    src_start = run_idx * run_length
+                    src_end = src_start + run_length
+                    synthetic_data[:, start_tp:end_tp] = all_random[:, src_start:src_end]
+        except ImportError:
+            # Fallback without tqdm
+            for run_idx in range(n_runs_to_generate):
+                run_number = run_idx + start_idx
+                start_tp = run_number * run_length
+                end_tp = start_tp + run_length
+                src_start = run_idx * run_length
+                src_end = src_start + run_length
+                synthetic_data[:, start_tp:end_tp] = all_random[:, src_start:src_end]
+
+                if verbose and (run_idx + 1) % 10 == 0:
+                    print(f"  Generated {run_idx + 1}/{n_runs_to_generate} synthetic runs...")
+
+    if verbose:
+        print(f"  ✓ Synthetic data ready: {synthetic_data.shape}")
+        print(f"  Memory: {synthetic_data.numel() * 4 / 1e9:.2f} GB (CPU)")
+
+    return synthetic_data

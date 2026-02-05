@@ -1730,6 +1730,10 @@ def save_hrf_selection_results(
 
     # 6d. Save design matrix plots if requested
     if save_plots:
+        # Create figures directory
+        figs_dir = f"{output_prefix}_figures"
+        Path(figs_dir).mkdir(parents=True, exist_ok=True)
+
         tr = results.hrf_metadata.get("tr", 1.0)
 
         # Determine n_stim_cols for labeling
@@ -1755,7 +1759,7 @@ def save_hrf_selection_results(
             nuisance_labels = [f"poly{i:02d}" for i in range(n_nuisance)]
             all_labels = stim_labels + nuisance_labels
 
-            design_plot_file = f"{output_prefix}_design.png"
+            design_plot_file = f"{figs_dir}/design.png"
             plot_design_matrix(
                 results.design_matrix,
                 output_file=design_plot_file,
@@ -1773,7 +1777,7 @@ def save_hrf_selection_results(
             nuisance_labels = [f"poly{i:02d}" for i in range(n_nuisance)]
             all_labels = stim_labels + nuisance_labels
 
-            canonical_plot_file = f"{output_prefix}_canonical_design.png"
+            canonical_plot_file = f"{figs_dir}/canonical_design.png"
             plot_design_matrix(
                 results.canonical_design_matrix,
                 output_file=canonical_plot_file,
@@ -1786,7 +1790,7 @@ def save_hrf_selection_results(
 
         # Plot HRF library
         if results.hrf_library is not None:
-            hrf_plot_file = f"{output_prefix}_hrf_library.png"
+            hrf_plot_file = f"{figs_dir}/hrf_library.png"
             plot_hrf_library(
                 results.hrf_library,
                 output_file=hrf_plot_file,

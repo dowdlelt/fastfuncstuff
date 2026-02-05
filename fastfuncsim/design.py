@@ -2,6 +2,7 @@
 Design matrix construction for GLM
 Handles FIR, assumed HRF, and convolution operations
 """
+from __future__ import annotations
 
 from typing import Optional, Union
 
@@ -1531,7 +1532,7 @@ def fit_penalized_glm_cv(
             # Solve for betas (one per voxel)
             try:
                 betas = torch.linalg.solve(penalized_XTX, XTy)  # (n_basis, n_voxels)
-            except:
+            except Exception:
                 # Fallback to lstsq if singular
                 betas = torch.linalg.lstsq(penalized_XTX, XTy).solution
 
@@ -1633,7 +1634,7 @@ def fit_penalized_glm(
         if len(lambda_array) != n_voxels:
             raise ValueError(f"lambda_values length ({len(lambda_array)}) must match n_voxels ({n_voxels})")
         if verbose:
-            print(f"\nFitting penalized GLM (per-voxel λ)...")
+            print("\nFitting penalized GLM (per-voxel λ)...")
             print(f"  λ range: [{lambda_array.min():.3e}, {lambda_array.max():.3e}]")
 
     # Precompute X'X (same for all voxels)
@@ -1666,7 +1667,7 @@ def fit_penalized_glm(
             # Solve for betas
             try:
                 betas_chunk = torch.linalg.solve(penalized_XTX, XTy)  # (n_basis, chunk_voxels)
-            except:
+            except Exception:
                 betas_chunk = torch.linalg.lstsq(penalized_XTX, XTy).solution
 
             betas_chunk = betas_chunk.T  # (chunk_voxels, n_basis)
@@ -1684,7 +1685,7 @@ def fit_penalized_glm(
 
                 try:
                     beta_voxel = torch.linalg.solve(penalized_XTX, XTy_voxel)
-                except:
+                except Exception:
                     beta_voxel = torch.linalg.lstsq(penalized_XTX, XTy_voxel).solution
 
                 betas_chunk[voxel_idx, :] = beta_voxel
@@ -1696,6 +1697,6 @@ def fit_penalized_glm(
             print(f"    Chunk {chunk_idx+1}/{n_chunks}: voxels {start_idx:,}-{end_idx:,}")
 
     if verbose:
-        print(f"  ✓ Penalized GLM complete")
+        print("  ✓ Penalized GLM complete")
 
     return betas

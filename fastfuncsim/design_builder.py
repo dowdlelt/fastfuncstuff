@@ -9,14 +9,16 @@ This module provides functions to build GLM design matrices from:
 The goal is to replicate AFNI's 3dDeconvolve design matrix construction
 while being easier to use and integrate with our fast GLM fitting.
 """
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from pathlib import Path
-from typing import Union, List, Optional, Tuple, Dict
+import torch
 from scipy import special
 from scipy.stats import gamma as scipy_gamma
-import re
-import torch
 
 
 def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
@@ -194,7 +196,7 @@ def parse_afni_timing_file(filepath: Union[str, Path]) -> List[np.ndarray]:
 
     onsets_by_run = []
 
-    with open(filepath, 'r') as f:
+    with open(filepath) as f:
         for line in f:
             line = line.strip()
 

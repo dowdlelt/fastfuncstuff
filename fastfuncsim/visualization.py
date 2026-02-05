@@ -14,6 +14,9 @@ Design Philosophy:
 - Flexible: Support any number of conditions, orderings, magnitudes
 """
 
+from __future__ import annotations
+
+from pathlib import Path
 from typing import Optional, Union
 
 import matplotlib.pyplot as plt
@@ -266,7 +269,7 @@ def plot_simulation_deep_dive(
 
 def plot_batch_summary(
     results_list: list[dict],
-    metrics: list[str] = ["r2", "beta_error", "hrf_recovery"],
+    metrics: list[str] | None = None,
     group_by: Optional[str] = None,
     figsize: tuple[int, int] = (16, 10),
     save_path: Optional[str] = None,
@@ -295,6 +298,9 @@ def plot_batch_summary(
     -------
     fig : matplotlib Figure
     """
+    if metrics is None:
+        metrics = ["r2", "beta_error", "hrf_recovery"]
+
     n_sims = len(results_list)
 
     # Extract data
@@ -1014,6 +1020,7 @@ def plot_denoising_pcs(
     tr: float = 2.0,
     optimal_n_pcs: Optional[int] = None,
     output_prefix: Optional[str] = None,
+    voxel_sizes: Optional[tuple[float, float, float]] = None,
 ) -> list[plt.Figure]:
     """
     Create tedana-style visualization of noise PCs for denoising diagnostics.
@@ -1051,6 +1058,8 @@ def plot_denoising_pcs(
         Optimal number of PCs from cross-validation (for annotation).
     output_prefix : str, optional
         If provided, save figures to {output_prefix}_PC{n}.png.
+    voxel_sizes : tuple of float, optional
+        Voxel sizes in mm (sx, sy, sz). If provided, preserves physical aspect ratio.
 
     Returns
     -------
@@ -1104,12 +1113,12 @@ def plot_denoising_pcs(
             # GridSpec: (1 + n_slices) rows, 1 column
             # First row: timecourse (taller)
             # Remaining rows: one slice position per row, showing all runs L→R (shorter, equal height)
-            fig = plt.figure(figsize=(16, 4 + 3 * n_slices))
+            fig = plt.figure(figsize=(32, 4 + 3 * n_slices))
             height_ratios = [2] + [1] * n_slices  # Timecourse gets more space
             gs = GridSpec(1 + n_slices, 1, figure=fig, height_ratios=height_ratios, hspace=0.3)
             ax_tc = fig.add_subplot(gs[0, 0])  # Timecourse in first row
         else:
-            fig, ax_tc = plt.subplots(1, 1, figsize=(16, 4))
+            fig, ax_tc = plt.subplots(1, 1, figsize=(32, 4))
 
         # --- Top panel: Full-width timecourse ---
         # Compute total timepoints
@@ -1127,7 +1136,7 @@ def plot_denoising_pcs(
                 run_time,
                 pcs[:, pc_idx],
                 color=color,
-                linewidth=1.5,
+                linewidth=1.0,
                 label=f"Run {run_idx + 1}",
                 alpha=0.8,
             )
@@ -1136,6 +1145,7 @@ def plot_denoising_pcs(
         ax_tc.set_xlabel("Time (s)", fontsize=11)
         ax_tc.set_ylabel("PC Amplitude (a.u.)", fontsize=11)
         ax_tc.set_title(f"Timecourse: {pc_label}", fontsize=12, fontweight="bold")
+        ax_tc.set_xlim(0, total_tps * tr)
         ax_tc.grid(True, alpha=0.3)
 
         # Add run boundaries
@@ -1235,17 +1245,47 @@ def plot_denoising_pcs(
                 representative_weights = slices_for_this_position[0][2]
                 vmax = np.percentile(np.abs(representative_weights), 98)
 
+                # Calculate aspect ratio to preserve voxel shape (avoid stretching/squishing)
+                # Get slice dimensions from a single run's slice
+                single_slice = montage_slices[0]
+                slice_height, slice_width = single_slice.shape
+
+                if voxel_sizes is not None and volume_shape is not None:
+                    # Use physical dimensions based on voxel sizes
+                    sx, sy, sz = voxel_sizes
+                    nx, ny, nz = volume_shape
+                    # Calculate aspect based on slice axis
+                    # aspect = height / width (physical dimensions)
+                    if slice_ax_idx == 0:  # Sagittal (y-z plane)
+                        aspect = (ny * sy) / (nz * sz)
+                    elif slice_ax_idx == 1:  # Coronal (x-z plane)
+                        aspect = (nx * sx) / (nz * sz)
+                    else:  # Axial (x-y plane)
+                        aspect = (nx * sx) / (ny * sy)
+                elif volume_shape is not None:
+                    # Assume isotropic voxels, use dimension ratios
+                    nx, ny, nz = volume_shape
+                    if slice_ax_idx == 0:  # Sagittal (y-z plane)
+                        aspect = ny / nz
+                    elif slice_ax_idx == 1:  # Coronal (x-z plane)
+                        aspect = nx / nz
+                    else:  # Axial (x-y plane)
+                        aspect = nx / ny
+                else:
+                    # Fallback: use the actual slice dimensions
+                    aspect = slice_height / slice_width
+
                 # Create subplot for this slice position (row slice_idx+1, column 0)
                 ax = fig.add_subplot(gs[slice_idx + 1, 0])
                 ax.axis("off")
 
-                # Show with symmetric colormap
+                # Show with symmetric colormap and proper aspect ratio
                 im = ax.imshow(
                     montage,
                     cmap="RdBu_r",
                     vmin=-vmax,
                     vmax=vmax,
-                    aspect="auto",  # Fill width
+                    aspect=aspect,
                     origin="lower",  # Already flipped above
                 )
 
@@ -1257,12 +1297,14 @@ def plot_denoising_pcs(
                 )
 
                 # Add colorbar to the right
-                plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="Weight")
+                # plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="Weight")
 
         plt.suptitle(pc_label, fontsize=14, fontweight="bold", y=0.98)
 
         if output_prefix:
             fig_path = f"{output_prefix}_PC{pc_idx + 1:02d}.png"
+            # Ensure parent directory exists
+            Path(fig_path).parent.mkdir(parents=True, exist_ok=True)
             plt.savefig(fig_path, dpi=150, bbox_inches="tight")
 
         figs.append(fig)
@@ -1464,6 +1506,8 @@ def plot_denoising_summary(
     plt.suptitle("Cross-Validated Denoising Results", fontsize=14, fontweight="bold")
 
     if output_path:
+        # Ensure parent directory exists
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
 
     return fig

@@ -15,10 +15,12 @@ Liu, T. T., & Frank, L. R. (2004). Efficiency, power, and entropy in
 event-related fMRI with multiple trial types. Part I: Theory.
 NeuroImage, 21(1), 387-400.
 """
+from __future__ import annotations
 
-import torch
+from typing import Dict, Optional, Tuple, Union
+
 import numpy as np
-from typing import Optional, Union, Dict, Tuple
+import torch
 
 
 def compute_design_matrix_for_condition(
@@ -172,7 +174,7 @@ def compute_estimation_efficiency(
             A_k_inv = torch.linalg.inv(A_k)
             trace_inv = torch.trace(A_k_inv)
             efficiency_k = 1.0 / trace_inv
-        except:
+        except Exception:
             # If inversion fails, efficiency is very low
             efficiency_k = torch.tensor(0.0, device=device)
 

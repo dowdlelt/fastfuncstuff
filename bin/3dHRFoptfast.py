@@ -396,6 +396,12 @@ Notes:
         action="store_true",
         help="Print detailed progress information",
     )
+    proc_opts.add_argument(
+        "-dry_run",
+        action="store_true",
+        help="Fast testing mode: load only first run, generate synthetic data for rest. "
+        "Results are nonsensical but pipeline runs quickly for testing.",
+    )
 
     # Output options
     out_opts = parser.add_argument_group("Output Options")
@@ -548,8 +554,13 @@ def main():
         do_scale=args.do_scale,
         device=device,
         force_cpu=args.keep_on_cpu,
+        dry_run=args.dry_run,
         verbose=True,
     )
+
+    # Modify prefix for dry run mode
+    if args.dry_run:
+        args.prefix = f"dry_run_{args.prefix}"
 
     # Extract results
     data = load_result.data

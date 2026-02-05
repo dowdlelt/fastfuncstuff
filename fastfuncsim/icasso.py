@@ -12,6 +12,7 @@ Himberg, J., Hyvärinen, A., & Esposito, F. (2004). Validating the independent
 components of neuroimaging time series via clustering and visualization.
 NeuroImage, 22(3), 1214-1222.
 """
+from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple, Union
 

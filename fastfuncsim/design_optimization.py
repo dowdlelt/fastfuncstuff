@@ -14,20 +14,21 @@ Based on:
 Author: FastFuncSim
 Date: 2024
 """
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from typing import Dict, List, Tuple, Optional, Union, Literal
-from dataclasses import dataclass
-from scipy.stats import poisson, expon, truncexpon
-import warnings
+from scipy.stats import expon, poisson, truncexpon
 
-# Import our metrics
-from .metrics_empirical import (
-    evaluate_design_empirical
-)
 from .design import convolve_hrf
 from .hrf import get_canonical_hrf
+
+# Import our metrics
+from .metrics_empirical import evaluate_design_empirical
 
 
 @dataclass
@@ -368,8 +369,8 @@ def sample_design_space(
     duration: float,
     isi_constraints: ISIConstraints,
     n_samples: int = 100,
-    event_orderings: List[str] = ['random'],
-    isi_distributions: List[str] = ['exponential'],
+    event_orderings: List[str] | None = None,
+    isi_distributions: List[str] | None = None,
     hrf_type: str = 'spm',
     device: Optional[torch.device] = None,
     seed: Optional[int] = None
@@ -409,6 +410,11 @@ def sample_design_space(
     if device is None:
         device = torch.device('mps' if torch.backends.mps.is_available() else
                             'cuda' if torch.cuda.is_available() else 'cpu')
+
+    if event_orderings is None:
+        event_orderings = ['random']
+    if isi_distributions is None:
+        isi_distributions = ['exponential']
 
     if seed is not None:
         np.random.seed(seed)

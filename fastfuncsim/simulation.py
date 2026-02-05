@@ -2,15 +2,18 @@
 fMRI simulation pipeline
 Single and batch simulation modes
 """
+from __future__ import annotations
 
-import torch
-import numpy as np
-import nibabel as nib
 from pathlib import Path
-from typing import Optional, Union, List, Tuple, Dict, Any
-from .utils import get_device, print_device_info, to_tensor
-from .noise import generate_fmri_noise, add_drift
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import nibabel as nib
+import numpy as np
+import torch
+
 from .design import build_glm_design
+from .noise import add_drift, generate_fmri_noise
+from .utils import get_device, print_device_info, to_tensor
 
 
 def simulate_fmri_run(onsets: torch.Tensor,

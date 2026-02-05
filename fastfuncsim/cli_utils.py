@@ -212,6 +212,7 @@ def load_and_preprocess_runs(
     do_scale: bool = False,
     device: torch.device = torch.device("cpu"),
     force_cpu: bool = False,
+    dry_run: bool = False,
     verbose: bool = True,
 ) -> LoadResult:
     """
@@ -240,6 +241,10 @@ def load_and_preprocess_runs(
         Target compute device
     force_cpu : bool, default=False
         Force data to stay on CPU regardless of size
+    dry_run : bool, default=False
+        If True, load only first run and generate synthetic data for remaining runs.
+        Much faster for testing pipelines. Results will be nonsensical but useful for
+        verifying code logic and performance.
     verbose : bool, default=True
         Print progress information
 
@@ -316,6 +321,82 @@ def load_and_preprocess_runs(
 
     # Determine number of voxels for memory estimation
     n_voxels = mask_flat.sum() if mask_flat is not None else int(np.prod(volume_shape))
+
+    # ======================================================================
+    # DRY RUN MODE: Skip loading data, just read header and generate synthetic
+    # ======================================================================
+    if dry_run:
+        from fastfuncsim.utils import generate_synthetic_runs
+
+        if verbose:
+            print("\n" + "=" * 70)
+            print("🎭 DRY RUN MODE - Fast Pipeline Testing")
+            print("=" * 70)
+            print("  Reading header only, generating synthetic data...")
+
+        # Read only the header (no data loading) using nibabel
+        import nibabel as nib
+        first_img = nib.load(input_files[0])
+        run_length = first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[0]
+
+        if verbose:
+            print(f"  Run length: {run_length} TRs")
+            print(f"  Generating {len(input_files)} runs of synthetic data...")
+
+        # Generate synthetic data for ALL runs (including first one)
+        # No need to load any real data - just use the shape info
+        data = generate_synthetic_runs(
+            first_run_data=None,  # No real data needed
+            n_runs_total=len(input_files),
+            run_length=run_length,
+            n_voxels=n_voxels,
+            verbose=verbose,
+        )
+
+        # Build run_starts
+        run_starts = list(range(0, len(input_files) * run_length, run_length))
+
+        # Always keep on CPU for dry run (fastest)
+        keep_on_cpu = True
+
+        # Scale if requested (apply to synthetic data too)
+        scale_info = None
+        violations_mask = None
+        if do_scale:
+            if verbose:
+                print("\n  Scaling to percent signal change...")
+            data, violations_mask, scale_info = scale_to_percent_signal(
+                data=data,
+                run_starts=run_starts,
+                max_scale=200.0,
+                verbose=verbose,
+            )
+
+        # Create result
+        result = LoadResult(
+            data=data,
+            run_starts=run_starts,
+            affine=affine,
+            volume_shape=volume_shape,
+            voxel_sizes=voxel_sizes,
+            tr=tr,
+            mask=mask,
+            mask_flat=mask_flat,
+            n_voxels=n_voxels,
+            n_timepoints=data.shape[1],
+            n_runs=len(input_files),
+            keep_on_cpu=keep_on_cpu,
+            scale_info=scale_info,
+            violations_mask=violations_mask,
+        )
+
+        if verbose:
+            print(f"\n  Data shape: {data.shape} (n_voxels × n_timepoints)")
+            print(f"  Device: CPU (dry run)")
+            print("  ⚠️  Results are from synthetic data - for testing only!")
+            print("=" * 70 + "\n")
+
+        return result
 
     # Estimate total timepoints
     total_timepoints = 0

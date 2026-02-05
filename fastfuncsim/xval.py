@@ -5,90 +5,15 @@ This module provides functions for computing cross-validated R² metrics
 using run-based train/test splits. The main use case is testing denoising
 methods and model selection (e.g., HRF choice).
 """
+from __future__ import annotations
 
+from itertools import combinations
 from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import torch
-from itertools import combinations
 
-
-def estimate_memory_aware_chunk_size(
-    n_voxels: int,
-    n_timepoints: int,
-    n_regressors: int,
-    device: torch.device,
-    safety_factor: float = 0.25,
-) -> int:
-    """
-    Estimate optimal chunk size considering full pipeline memory requirements.
-
-    This accounts for memory needed by:
-    1. Projection operations: data chunk + intermediate + result
-    2. GLM fitting: data chunk + betas + predictions + residuals
-    3. Design matrix (shared, but needs to fit alongside data)
-    4. PyTorch memory fragmentation and reservation overhead
-
-    Parameters
-    ----------
-    n_voxels : int
-        Total number of voxels
-    n_timepoints : int
-        Total timepoints (all runs concatenated)
-    n_regressors : int
-        Number of regressors in design matrix (for GLM memory estimation)
-    device : torch.device
-        Compute device
-    safety_factor : float
-        Fraction of available memory to use (default: 0.25, very conservative
-        because we have projection + GLM + xval operations plus PyTorch
-        memory fragmentation overhead)
-
-    Returns
-    -------
-    chunk_size : int
-        Recommended number of voxels per chunk
-    """
-    # Estimate available memory
-    if device.type == "cuda":
-        total_mem = torch.cuda.get_device_properties(device).total_memory
-        # Use memory_reserved instead of memory_allocated to account for
-        # PyTorch's memory pool fragmentation
-        reserved_mem = torch.cuda.memory_reserved(device)
-        allocated_mem = torch.cuda.memory_allocated(device)
-        # Available is total minus reserved (not just allocated)
-        # PyTorch reserves memory in pools that may not be fully utilized
-        available_mem = (total_mem - reserved_mem) * safety_factor
-        # Also account for any memory that's allocated but might be freed
-        # Use a more conservative estimate
-        available_mem = min(available_mem, (total_mem - allocated_mem) * safety_factor * 0.8)
-    elif device.type == "mps":
-        available_mem = 4.0 * 1e9 * safety_factor
-    else:
-        available_mem = 8.0 * 1e9 * safety_factor
-
-    # Reserve memory for design matrix (stays on GPU throughout)
-    design_mem = n_timepoints * max(n_regressors, 10) * 4  # float32
-    available_mem -= design_mem
-
-    # Memory per voxel for GLM operations (the bottleneck):
-    # - data: n_timepoints × 4 bytes
-    # - predictions: n_timepoints × 4 bytes
-    # - residuals: n_timepoints × 4 bytes (temporary)
-    # - betas: n_regressors × 4 bytes
-    # - various intermediates: ~2 × n_timepoints × 4 bytes
-    # Conservative: 6 × n_timepoints + n_regressors per voxel
-    bytes_per_voxel = (6 * n_timepoints + max(n_regressors, 10)) * 4
-
-    # Calculate chunk size
-    chunk_size = int(max(available_mem, 1e6) / bytes_per_voxel)
-
-    # Set sensible bounds
-    # For very large datasets, cap at 30k to be extra safe
-    min_chunk = min(1000, n_voxels)  # At least 1000 for efficiency
-    max_chunk = min(30_000, n_voxels)  # Cap at 30k for large datasets
-    chunk_size = max(min_chunk, min(chunk_size, max_chunk))
-
-    return chunk_size
+from .memory import estimate_chunk_size
 
 
 def project_out_nuisance_per_run(
@@ -154,8 +79,12 @@ def project_out_nuisance_per_run(
     # Use memory-aware estimation that considers downstream GLM operations
     effective_chunk_size: int
     if chunk_size is None:
-        effective_chunk_size = estimate_memory_aware_chunk_size(
-            n_voxels, n_timepoints, n_design_cols, device
+        effective_chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_design_cols,
+            device=device,
+            operation="xval",
         )
     else:
         effective_chunk_size = chunk_size
@@ -174,8 +103,10 @@ def project_out_nuisance_per_run(
     # Projection matrices are computed on compute device, then applied
     data_device = data.device
 
-    # Pre-compute all projection matrices (small, one per run)
-    projections = []
+    # Pre-compute QR factorizations for all runs (more stable than explicit projection)
+    # Using QR decomposition: Q is orthonormal basis for nuisance column space
+    # Then projection: y_proj = y - Q @ (Q.T @ y)  [no need for full (n,n) matrix]
+    q_factors = []  # List of Q matrices (or None if no nuisance)
     for run_idx in range(n_runs):
         run_length = run_lengths[run_idx]
 
@@ -188,14 +119,13 @@ def project_out_nuisance_per_run(
         run_nuisance_clean = run_nuisance[:, nonzero_mask]
 
         if run_nuisance_clean.shape[1] > 0:
-            # Compute projection matrix: P_perp = I - X(X'X)^-1 X'
-            XtX = run_nuisance_clean.T @ run_nuisance_clean
-            XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
-            P_nuisance = run_nuisance_clean @ XtX_inv @ run_nuisance_clean.T
-            projection = torch.eye(run_length, device=device) - P_nuisance
-            projections.append(projection)
+            # QR decomposition: Q is (run_length, n_nuisance), orthonormal columns
+            # More numerically stable than computing (X'X)^-1
+            # Also more efficient: Q is (n, p) with p << n, not full (n, n) projection matrix
+            Q, _ = torch.linalg.qr(run_nuisance_clean)
+            q_factors.append(Q)
         else:
-            projections.append(None)  # No projection needed
+            q_factors.append(None)  # No projection needed
 
     # Project design matrix (small, no chunking needed)
     projected_design_runs = []
@@ -204,8 +134,10 @@ def project_out_nuisance_per_run(
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
         run_design = design[start_tp:end_tp, :].to(device)  # (run_length, n_task)
 
-        if projections[run_idx] is not None:
-            run_design_proj = projections[run_idx] @ run_design
+        if q_factors[run_idx] is not None:
+            # Apply projection using Q: design_proj = design - Q @ (Q.T @ design)
+            Q = q_factors[run_idx]
+            run_design_proj = run_design - Q @ (Q.T @ run_design)
         else:
             run_design_proj = run_design
 
@@ -222,10 +154,15 @@ def project_out_nuisance_per_run(
             end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
             run_data = data[:, start_tp:end_tp]  # (n_voxels, run_length)
 
-            if projections[run_idx] is not None:
-                # Move to compute device, project, move back
+            if q_factors[run_idx] is not None:
+                # Move to compute device, project using Q, move back
+                # data_proj = data - Q @ (Q.T @ data.T).T = data - (Q @ Q.T) @ data.T
+                # Simplified: data_proj.T = data.T - Q @ (Q.T @ data.T)
                 run_data_dev = run_data.to(device)
-                run_data_proj = (projections[run_idx] @ run_data_dev.T).T
+                Q = q_factors[run_idx]
+                # Project: (Q @ Q.T) @ run_data_dev.T, then transpose back
+                QQt_data = (Q @ (Q.T @ run_data_dev.T)).T
+                run_data_proj = run_data_dev - QQt_data
                 projected_data_runs.append(run_data_proj.to(data_device))
             else:
                 projected_data_runs.append(run_data)
@@ -249,10 +186,13 @@ def project_out_nuisance_per_run(
                 # Get chunk data for this run
                 run_chunk_data = data[chunk_start:chunk_end, start_tp:end_tp]
 
-                if projections[run_idx] is not None:
-                    # Move chunk to compute device, project, store result
+                if q_factors[run_idx] is not None:
+                    # Move chunk to compute device, project using Q, store result
                     run_chunk_dev = run_chunk_data.to(device)
-                    run_chunk_proj = (projections[run_idx] @ run_chunk_dev.T).T
+                    Q = q_factors[run_idx]
+                    # Project: QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
+                    QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
+                    run_chunk_proj = run_chunk_dev - QQt_data
                     projected_data[chunk_start:chunk_end, start_tp:end_tp] = run_chunk_proj.cpu()
 
                     # Free GPU memory
@@ -260,12 +200,21 @@ def project_out_nuisance_per_run(
                 else:
                     projected_data[chunk_start:chunk_end, start_tp:end_tp] = run_chunk_data.cpu()
 
-            # Clear GPU cache periodically
-            if device.type == "cuda" and chunk_idx % 5 == 0:
-                torch.cuda.empty_cache()
+            # Clear GPU cache occasionally (not too frequently - empty_cache is expensive ~10-50ms)
+            # Only at the midpoint of processing to avoid memory buildup
+            if device.type == "cuda" and n_chunks > 10:
+                mid_point = n_chunks // 2
+                if chunk_idx == mid_point:
+                    torch.cuda.empty_cache()
 
-        # Move to original data device if needed
-        if data_device.type != "cpu":
+        # CRITICAL: When chunking, keep result on CPU even if input was on GPU
+        # This avoids OOM from moving large result back to GPU.
+        # Caller will stream chunks to GPU as needed for computation.
+        if needs_chunking:
+            # Result already on CPU from line 174 - keep it there
+            pass
+        else:
+            # Small data: move back to original device if needed
             projected_data = projected_data.to(data_device)
 
     return projected_data, projected_design
@@ -436,6 +385,8 @@ def project_out_nuisance(
     from both the data and the full design matrix. Critical for cross-validation
     because we need to clean both train and test sets.
 
+    Uses QR decomposition for numerical stability (superior to (X'X)^-1 approach).
+
     Parameters
     ----------
     data : torch.Tensor
@@ -445,7 +396,7 @@ def project_out_nuisance(
     nuisance_indices : list of int
         Which columns are nuisance regressors
     ridge : float, default=1e-6
-        Ridge regularization for numerical stability
+        Ridge regularization for numerical stability (only used if QR fails)
 
     Returns
     -------
@@ -459,15 +410,21 @@ def project_out_nuisance(
     Key steps:
     1. Extract nuisance design: X_nuis = design[:, nuisance_indices]
     2. **CRITICAL**: Remove all-zero columns (run-specific regressors!)
-    3. Compute projection matrix: P = X @ (X.T @ X)^-1 @ X.T
-    4. Project out: data_clean = data - P @ data
-    5. Project out: design_clean = design - P @ design
+    3. Compute QR decomposition: Q, R = qr(X_nuis)
+    4. Project out: data_clean = data - Q @ (Q.T @ data)
+    5. Project out: design_clean = design - Q @ (Q.T @ design)
 
     Why remove zero columns?
     ------------------------
     When we split by runs, some nuisance regressors (like run 3's polynomials)
     will be all-zero in splits that don't include run 3. We must remove these
     before computing the projection, or the matrix will be singular.
+
+    Why QR decomposition?
+    ---------------------
+    QR decomposition is numerically more stable than matrix inversion.
+    Q is (n_timepoints, n_nuisance) where n_nuisance << n_timepoints, making it
+    more memory-efficient than a full (n_timepoints, n_timepoints) projection matrix.
 
     Examples
     --------
@@ -497,19 +454,28 @@ def project_out_nuisance(
 
     X_nuis = X_nuis[:, nonzero_mask]
 
-    # Compute projection matrix: P = X @ (X.T @ X)^-1 @ X.T
-    # Using ridge regularization for numerical stability
-    XtX = X_nuis.T @ X_nuis
-    XtX_reg = XtX + ridge * torch.eye(XtX.shape[0], device=XtX.device, dtype=XtX.dtype)
-    XtX_inv = torch.linalg.inv(XtX_reg)
-    P = X_nuis @ XtX_inv @ X_nuis.T
+    # Use QR decomposition for numerical stability
+    # Q is (n_timepoints, n_nuisance) with orthonormal columns
+    # Projection: y_proj = y - Q @ (Q.T @ y)
+    try:
+        Q, _ = torch.linalg.qr(X_nuis)
 
-    # Project out from data: data_clean = (I - P) @ data
-    # data is (n_voxels, n_timepoints), P is (n_timepoints, n_timepoints)
-    data_cleaned = data - (P @ data.T).T
+        # Project out from data: data_clean = data - Q @ (Q.T @ data.T).T
+        # Equivalent to: data_clean = data - (Q @ Q.T) @ data.T, then transpose
+        data_cleaned = data - (Q @ (Q.T @ data.T)).T
 
-    # Project out from design: design_clean = (I - P) @ design
-    design_cleaned = design_matrix - P @ design_matrix
+        # Project out from design: design_clean = design - Q @ (Q.T @ design)
+        design_cleaned = design_matrix - Q @ (Q.T @ design_matrix)
+
+    except RuntimeError:
+        # Fallback to (X'X)^-1 approach if QR fails (should be rare)
+        XtX = X_nuis.T @ X_nuis
+        XtX_reg = XtX + ridge * torch.eye(XtX.shape[0], device=XtX.device, dtype=XtX.dtype)
+        XtX_inv = torch.linalg.inv(XtX_reg)
+        P = X_nuis @ XtX_inv @ X_nuis.T
+
+        data_cleaned = data - (P @ data.T).T
+        design_cleaned = design_matrix - P @ design_matrix
 
     return data_cleaned, design_cleaned
 
@@ -590,17 +556,84 @@ def compute_r2_metric(
     return r2.float()  # Cast to float32 to save space
 
 
+def compute_r2_from_sufficient_stats(
+    ss_res: torch.Tensor,
+    sum_actual: torch.Tensor,
+    sum_sq_actual: torch.Tensor,
+    n_timepoints: int,
+) -> torch.Tensor:
+    """
+    Compute R² from sufficient statistics (streaming accumulators).
+
+    This is for cases where full data arrays are not available, only
+    pre-accumulated statistics from streaming/online computation.
+
+    Parameters
+    ----------
+    ss_res : torch.Tensor
+        Residual sum of squares (n_voxels,)
+    sum_actual : torch.Tensor
+        Sum of actual data values (n_voxels,)
+    sum_sq_actual : torch.Tensor
+        Sum of squared actual data values (n_voxels,)
+    n_timepoints : int
+        Number of timepoints (to compute variance from sums)
+
+    Returns
+    -------
+    r2 : torch.Tensor
+        R² values (n_voxels,)
+        R² = 1 - ss_res / ss_tot
+        where ss_tot = sum_sq_actual - sum_actual² / n_timepoints
+
+    Notes
+    -----
+    This computes the Coefficient of Determination (CoD) metric only.
+    For correlation-based metrics, full data arrays are needed.
+
+    Derivation:
+    - mean = sum / n
+    - ss_tot = sum((y - mean)²) = sum(y²) - sum(y)² / n
+
+    Examples
+    --------
+    >>> ss_res = torch.tensor([10.0, 20.0])
+    >>> sum_act = torch.tensor([100.0, 200.0])
+    >>> sum_sq_act = torch.tensor([1200.0, 2500.0])
+    >>> n = 100
+    >>> r2 = compute_r2_from_sufficient_stats(ss_res, sum_act, sum_sq_act, n)
+    """
+    # Compute total sum of squares from streaming statistics
+    # ss_tot = sum((y - mean)²) = sum(y²) - sum(y)² / n
+    mean_actual = sum_actual / n_timepoints
+    ss_tot = sum_sq_actual - n_timepoints * (mean_actual**2)
+
+    # Coefficient of determination
+    r2 = 1.0 - ss_res / (ss_tot + 1e-10)
+
+    # Clamp max to 1.0 (values > 1 indicate numerical issues)
+    # Note: R² CAN be negative (model worse than mean) - that's valid information
+    r2 = torch.clamp(r2, max=1.0)
+
+    return r2.float()
+
+
 def _compute_projection_matrix(
     design_matrix: torch.Tensor,
     nuisance_indices: List[int],
     ridge: float = 1e-6,
 ) -> Optional[torch.Tensor]:
     """
-    Compute projection matrix P for nuisance regressors.
+    Compute Q factor from QR decomposition of nuisance regressors.
 
-    Returns P such that: cleaned_data = data - P @ data
+    Returns Q such that: cleaned_data = data - Q @ (Q.T @ data)
 
-    This is a helper to avoid recomputing P for every voxel batch.
+    This is a helper to avoid recomputing Q for every voxel batch.
+    Uses QR decomposition for numerical stability (superior to (X'X)^-1).
+
+    Note: Function name kept for backwards compatibility, but now returns Q
+    instead of full projection matrix P. Q is (n, p) where p << n, making it
+    more memory-efficient than the old (n, n) projection matrix.
     """
     if not nuisance_indices:
         return None
@@ -618,13 +651,21 @@ def _compute_projection_matrix(
 
     X_nuis = X_nuis[:, nonzero_mask]
 
-    # Compute projection matrix: P = X @ (X.T @ X)^-1 @ X.T
-    XtX = X_nuis.T @ X_nuis
-    XtX_reg = XtX + ridge * torch.eye(XtX.shape[0], device=XtX.device, dtype=XtX.dtype)
-    XtX_inv = torch.linalg.inv(XtX_reg)
-    P = X_nuis @ XtX_inv @ X_nuis.T
-
-    return P
+    # Use QR decomposition for numerical stability
+    # Q is (n_timepoints, n_nuisance) with orthonormal columns
+    # Projection: y_proj = y - Q @ (Q.T @ y)
+    try:
+        Q, _ = torch.linalg.qr(X_nuis)
+        return Q
+    except RuntimeError:
+        # Fallback to (X'X)^-1 approach if QR fails (should be rare)
+        XtX = X_nuis.T @ X_nuis
+        XtX_reg = XtX + ridge * torch.eye(XtX.shape[0], device=XtX.device, dtype=XtX.dtype)
+        XtX_inv = torch.linalg.inv(XtX_reg)
+        P = X_nuis @ XtX_inv @ X_nuis.T
+        # Return P for fallback (legacy behavior)
+        # Note: P is (n, n) while Q is (n, p), but callers handle both via same API
+        return P
 
 
 def compute_xval_r2(
@@ -751,16 +792,27 @@ def compute_xval_r2(
 
     # Auto-detect batch size if not provided
     if batch_size is None:
-        # Conservative: 5000 voxels per batch for projection
-        batch_size = min(5000, n_voxels)
+        # Use memory-aware estimation for projection operations
+        n_regressors = len(stim_indices) + len(nuisance_indices)
+        batch_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_regressors,
+            device=device,
+            operation="xval",
+        )
 
     # Auto-detect data chunk size if not provided
     if data_chunk_size is None:
-        # Try to estimate based on available GPU memory
-        # Assume we need ~40 bytes per voxel per timepoint (including temporaries)
-        # For 16 GB GPU, with 3000 timepoints: ~130k voxels max
-        # Be conservative: 100k voxels
-        data_chunk_size = min(100_000, n_voxels)
+        # Use memory-aware estimation for data chunks
+        n_regressors = len(stim_indices) + len(nuisance_indices)
+        data_chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_regressors,
+            device=device,
+            operation="xval",
+        )
 
     # =========================================================================
     # Determine R² computation method: 'fast' (streaming) or 'slow' (full accumulator)
@@ -846,13 +898,13 @@ def compute_xval_r2(
 
         if verbose:
             if data_on_gpu:
-                print(f"  Data on GPU - streaming stats on GPU (fast path)")
+                print("  Data on GPU - streaming stats on GPU (fast path)")
             elif use_gpu_accumulators:
                 accum_mem_mb = n_voxels * 24 / 1e6
                 print(f"  Data on CPU - streaming {effective_batch_size:,} voxel batches to GPU")
                 print(f"  GPU accumulators: {accum_mem_mb:.1f}MB (tiny - avoids transfers)")
             else:
-                print(f"  Data on CPU - CPU accumulators")
+                print("  Data on CPU - CPU accumulators")
     else:
         # SLOW MODE: Full accumulators - need to check memory carefully
         # Check if we can fit accumulators on GPU
@@ -869,7 +921,7 @@ def compute_xval_r2(
                     print(f"  Data on GPU, {free_gb:.1f}GB free (need {needed_gb:.1f}GB) - GPU accumulators")
                 else:
                     print(f"  Data on GPU but only {free_gb:.1f}GB free (need {needed_gb:.1f}GB)")
-                    print(f"  Using CPU accumulators with GPU compute (hybrid mode)")
+                    print("  Using CPU accumulators with GPU compute (hybrid mode)")
 
         if use_gpu_accumulators:
             accumulator_device = device
@@ -920,18 +972,18 @@ def compute_xval_r2(
         train_design = design_matrix[train_tps, :]
         test_design = design_matrix[test_tps, :]
 
-        # 2. Precompute projection matrix P (tiny - stays on GPU)
-        train_P = _compute_projection_matrix(train_design, nuisance_indices)
-        test_P = _compute_projection_matrix(test_design, nuisance_indices)
+        # 2. Precompute projection Q factor (tiny - stays on GPU)
+        train_Q = _compute_projection_matrix(train_design, nuisance_indices)
+        test_Q = _compute_projection_matrix(test_design, nuisance_indices)
 
         # 3. Project design matrices (small - do once per split)
-        if train_P is not None:
-            train_design_clean = train_design - train_P @ train_design
+        if train_Q is not None:
+            train_design_clean = train_design - train_Q @ (train_Q.T @ train_design)
         else:
             train_design_clean = train_design
 
-        if test_P is not None:
-            test_design_clean = test_design - test_P @ test_design
+        if test_Q is not None:
+            test_design_clean = test_design - test_Q @ (test_Q.T @ test_design)
         else:
             test_design_clean = test_design
 
@@ -994,54 +1046,120 @@ def compute_xval_r2(
                 train_stim_design.shape[1], dtype=torch.bool, device=device
             )
 
+        # =========================================================================
+        # OPTIMIZATION 1: Pre-compute OLS pseudoinverse ONCE per split
+        # =========================================================================
+        # train_stim_design_fit is identical for all voxel batches in this split
+        # Computing (X'X)^-1 X' once saves N_batches matrix inversions
+        # Dimensions: (n_stim_fit, n_train_tps) - tiny matrix, stays on device
+        XtX = train_stim_design_fit.T @ train_stim_design_fit
+        XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
+        ols_pseudoinverse = XtX_inv @ train_stim_design_fit.T  # (n_stim_fit, n_train_tps)
+
+        # =========================================================================
+        # OPTIMIZATION 2: CPU-only path when accumulating on CPU
+        # =========================================================================
+        # When accumulator is CPU, we have two options:
+        # A) CPU→GPU→CPU: Fast GPU compute, but transfer overhead + uses GPU memory
+        # B) CPU-only: Slower compute, no transfers, no GPU memory used
+        #
+        # We choose CPU-only when:
+        # - Data is on CPU (not GPU), AND
+        # - Batch size is small enough that transfer overhead dominates
+        #   OR GPU memory is constrained
+        #
+        # For large batches (>= 20k voxels), GPU speed advantage typically wins
+        # For small batches, avoiding transfers is faster
+        use_cpu_only_path = (
+            accumulator_device.type == "cpu"
+            and not data_on_gpu
+            and effective_batch_size < 20_000  # GPU wins for larger batches
+        )
+
+        if use_cpu_only_path:
+            # Move small matrices to CPU for CPU-only computation
+            # This saves GPU memory for large datasets that don't fit on GPU
+            compute_device = torch.device("cpu")
+            ols_pseudoinverse_cpu = ols_pseudoinverse.cpu()
+            train_Q_cpu = train_Q.cpu() if train_Q is not None else None
+            test_Q_cpu = test_Q.cpu() if test_Q is not None else None
+            train_stim_design_cpu = train_stim_design.cpu()
+            test_stim_design_cpu = test_stim_design.cpu()
+            # Move mask tensors to CPU to match compute device
+            train_present_mask = train_present_mask.cpu()
+            test_present_mask = test_present_mask.cpu()
+            predictable_mask = predictable_mask.cpu()
+            unpredictable_mask = unpredictable_mask.cpu()
+            test_only_mask = test_only_mask.cpu()
+            if verbose and batch_size is not None and effective_batch_size < 20_000:
+                print(f"    Using CPU-only path (batch size {effective_batch_size} < 20k threshold)")
+        else:
+            compute_device = device
+
         # 5. Fit OLS and predict in VOXEL BATCHES
         for batch_start in range(0, n_voxels, effective_batch_size):
             batch_end = min(batch_start + effective_batch_size, n_voxels)
             batch_slice = slice(batch_start, batch_end)
 
-            # Get batch data - either slice directly (GPU) or stream (CPU)
-            if data_on_gpu:
+            # Get batch data - use CPU-only path when it's faster
+            if use_cpu_only_path:
+                # OPTIMIZATION 2: Keep data on CPU, compute everything on CPU
+                # Faster for small batches where transfer overhead dominates
+                train_data_batch = data[batch_slice][:, train_tps]  # Stays on CPU
+                test_data_batch = data[batch_slice][:, test_tps]
+                Q_train = train_Q_cpu
+                Q_test = test_Q_cpu
+                stim_design_test = test_stim_design_cpu
+            elif data_on_gpu:
                 # Data on GPU: slice directly (creates view, no copy)
                 train_data_batch = data[batch_slice][:, train_tps]
                 test_data_batch = data[batch_slice][:, test_tps]
+                Q_train = train_Q
+                Q_test = test_Q
+                stim_design_test = test_stim_design
             else:
-                # Data on CPU: stream to GPU
+                # Data on CPU but computing on GPU: stream to GPU
+                # GPU is much faster for large batches
                 train_data_batch = data[batch_slice][:, train_tps].to(device)
                 test_data_batch = data[batch_slice][:, test_tps].to(device)
+                Q_train = train_Q
+                Q_test = test_Q
+                stim_design_test = test_stim_design
 
-            # Project out nuisance from data
-            if train_P is not None:
-                train_data_batch = train_data_batch - (train_P @ train_data_batch.T).T
-            if test_P is not None:
-                test_data_batch = test_data_batch - (test_P @ test_data_batch.T).T
+            # Project out nuisance from data (QR-based projection)
+            if Q_train is not None:
+                train_data_batch = train_data_batch - (Q_train @ (Q_train.T @ train_data_batch.T)).T
+            if Q_test is not None:
+                test_data_batch = test_data_batch - (Q_test @ (Q_test.T @ test_data_batch.T)).T
 
             # Additional projection for 'nuisance' strategy
             if zero_event_strategy == "nuisance":
                 events_to_project = unpredictable_mask | test_only_mask
                 if events_to_project.any():
-                    test_to_project = test_stim_design[:, events_to_project]
+                    test_to_project = stim_design_test[:, events_to_project]
                     XuXu = test_to_project.T @ test_to_project
                     XuXu_inv = torch.linalg.inv(
-                        XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=device)
+                        XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=compute_device)
                     )
                     P_unpred = test_to_project @ XuXu_inv @ test_to_project.T
                     test_data_batch = test_data_batch - (P_unpred @ test_data_batch.T).T
 
-            # OLS fit
-            XtX = train_stim_design_fit.T @ train_stim_design_fit
-            XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
-            betas_fit = XtX_inv @ train_stim_design_fit.T @ train_data_batch.T
+            # OLS fit using precomputed pseudoinverse (OPTIMIZATION 1)
+            if use_cpu_only_path:
+                betas_fit = ols_pseudoinverse_cpu @ train_data_batch.T
+            else:
+                betas_fit = ols_pseudoinverse @ train_data_batch.T
 
             # Predict test data
             if zero_event_strategy == "zero":
                 n_stim = len(stim_indices)
-                betas_full = torch.zeros(n_stim, betas_fit.shape[1], device=device)
+                betas_full = torch.zeros(n_stim, betas_fit.shape[1], device=compute_device)
                 betas_full[train_present_mask, :] = betas_fit
-                test_stim_present = test_stim_design[:, test_present_mask]
+                test_stim_present = stim_design_test[:, test_present_mask]
                 betas_test_present = betas_full[test_present_mask, :]
                 predictions_batch = (test_stim_present @ betas_test_present).T
             elif zero_event_strategy == "nuisance":
-                test_stim_predictable = test_stim_design[:, predictable_mask]
+                test_stim_predictable = stim_design_test[:, predictable_mask]
                 predictions_batch = (test_stim_predictable @ betas_fit).T
             else:
                 raise ValueError(f"Invalid strategy: {zero_event_strategy}")
@@ -1167,9 +1285,18 @@ def compute_xval_r2(
         print()
 
     # Return single R² (not per-fold statistics)
+    # NOTE: Old API had misleading key names and per-fold stats. GLMdenoise-style
+    # concatenation produces single per-voxel R² across all folds, not per-fold values.
     results = {
         "r2": r2_final,
+        # Backward compat - misleading names, kept for ffs_pathfinder compatibility
+        "r2_median": r2_final,  # TODO: Misleading name - actually per-voxel R² tensor, not median
+        "r2_mean": r2_final.mean(),  # Scalar mean
+        "r2_std": r2_final.std(),  # Scalar std
+        "r2_min": r2_final.min(),  # Scalar min
+        "r2_max": r2_final.max(),  # Scalar max
         "n_splits": n_splits,
+        # r2_splits removed - GLMdenoise-style doesn't produce per-fold R²
     }
 
     return results
@@ -1184,7 +1311,7 @@ def compute_xval_r2_single_trials(
     device: Optional[torch.device] = None,
     chunk_size: Optional[int] = None,
     verbose: bool = True,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | int]:
     """
     Cross-validated R² in single-trial beta space (GLMsingle-style fit-once).
 
@@ -1300,6 +1427,8 @@ def compute_xval_r2_single_trials(
 
     return {
         'r2': r2,
+        'r2_median': r2,  # Backward compat: misleading name, actually per-voxel R² tensor
+        'r2_mean': r2.mean(),  # Scalar mean for convenience
         'n_splits': n_splits,
         'n_test_trials_total': total_test_trials,
     }

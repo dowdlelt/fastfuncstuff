@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 try:
-    from fastfuncsim.afni_io import extract_design_metadata, read_afni_design_matrix, load_nifti
+    from fastfuncsim.afni_io import extract_design_metadata, load_nifti, read_afni_design_matrix
     from fastfuncsim.utils import get_device
     from fastfuncsim.xval import compute_xval_r2, generate_cv_splits
 except ImportError as e:
@@ -227,7 +227,7 @@ def main():
 
     # Parse input files
     input_files = parse_input_files(args.input)
-    print(f"Input:")
+    print("Input:")
     if len(input_files) == 1:
         print(f"  • Single file: {input_files[0]}")
     else:
@@ -248,7 +248,7 @@ def main():
     full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
     nuisance_indices = [i for i in range(len(full_labels)) if i not in stim_indices]
 
-    print(f"Regressor breakdown:")
+    print("Regressor breakdown:")
     print(f"  • Stimulus: {len(stim_indices)} columns")
     print(f"  • Nuisance: {len(nuisance_indices)} columns")
     print()
@@ -272,7 +272,7 @@ def main():
         sys.exit(1)
 
     # Generate CV splits
-    print(f"Cross-validation:")
+    print("Cross-validation:")
     print(f"  • Strategy: {cv_strategy}")
     print(f"  • Max permutations: {args.nperms}")
 

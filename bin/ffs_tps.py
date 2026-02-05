@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+
 """
+
 Thin Plate Splines (TPS) for fMRI HRF Estimation with Cross-Validation
 
 Estimates HRF using penalized splines with automatic smoothness selection.
@@ -43,27 +45,30 @@ Examples:
 Author: Logan Thomas
 Date: 2026-01-27
 """
+from __future__ import annotations
 
-import sys
 import argparse
-import numpy as np
-import torch
 
 # Add parent directory to path for imports
 import os
+import sys
+
+import numpy as np
+import torch
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from fastfuncsim.design import (
-    make_tps_design,
-    make_penalty_matrix,
-    fit_penalized_glm_cv,
-    fit_penalized_glm,
-)
-from fastfuncsim.design_builder import legendre_polynomials, parse_afni_timing_file
 from fastfuncsim.afni_io import (
     load_nifti,
     save_nifti,
 )
+from fastfuncsim.design import (
+    fit_penalized_glm,
+    fit_penalized_glm_cv,
+    make_penalty_matrix,
+    make_tps_design,
+)
+from fastfuncsim.design_builder import legendre_polynomials, parse_afni_timing_file
 from fastfuncsim.utils import get_device
 
 
@@ -349,7 +354,7 @@ def main():
     windows = parse_tps_windows(args.tps_window, n_conditions)
 
     if args.verbose:
-        print(f"\nTPS estimation windows:")
+        print("\nTPS estimation windows:")
         for cond_idx, (bot, top) in enumerate(windows):
             label = args.stim_labels[cond_idx]
             duration = top - bot
@@ -368,7 +373,7 @@ def main():
             n_knots_list.append(n_knots)
 
         if args.verbose:
-            print(f"\nAuto-selecting number of knots (~ 1 per TR):")
+            print("\nAuto-selecting number of knots (~ 1 per TR):")
             for cond_idx, n_knots in enumerate(n_knots_list):
                 label = args.stim_labels[cond_idx]
                 print(f"  {label}: {n_knots} knots")
@@ -382,7 +387,7 @@ def main():
     # ========================================================================
 
     if args.verbose:
-        print(f"\nBuilding TPS design matrices...")
+        print("\nBuilding TPS design matrices...")
 
     design_matrices = []
     n_basis_per_condition = []
@@ -500,12 +505,12 @@ def main():
 
         # Add header with metadata
         header_lines = [
-            f"# TPS design matrix",
+            "# TPS design matrix",
             f"# Shape: {design_np.shape[0]} timepoints x {design_np.shape[1]} regressors",
             f"# TR: {tr}s",
             f"# Stimulus regressors: columns 0-{n_stimulus_regressors-1}",
             f"# Polynomial regressors: columns {n_stimulus_regressors}-{design_np.shape[1]-1}",
-            f"#",
+            "#",
         ]
 
         # Add per-condition metadata
@@ -532,7 +537,7 @@ def main():
     # ========================================================================
 
     if args.verbose:
-        print(f"\nPreparing data for GLM fitting...")
+        print("\nPreparing data for GLM fitting...")
 
     # Extract masked voxels: (n_voxels, n_timepoints)
     data_masked = data_full[mask, :]
@@ -562,7 +567,7 @@ def main():
     # ========================================================================
 
     if args.verbose:
-        print(f"\nCreating penalty matrix (2nd order differences)...")
+        print("\nCreating penalty matrix (2nd order differences)...")
 
     # Create block-diagonal penalty matrix for all conditions
     # Each condition gets its own penalty block
@@ -594,7 +599,7 @@ def main():
 
     if args.optimize_level == 'global':
         if args.verbose:
-            print(f"\n" + "="*70)
+            print("\n" + "="*70)
             print("Global λ Optimization (LORO Cross-Validation)")
             print("="*70)
 
@@ -629,7 +634,7 @@ def main():
 
     elif args.optimize_level == 'per_voxel':
         if args.verbose:
-            print(f"\n" + "="*70)
+            print("\n" + "="*70)
             print("Per-Voxel λ Optimization (Adaptive Smoothness)")
             print("="*70)
 
@@ -672,7 +677,7 @@ def main():
                 lambda_map[voxel_idx] = best_lambda_voxel
 
         if args.verbose:
-            print(f"\n✓ Per-voxel λ optimization complete")
+            print("\n✓ Per-voxel λ optimization complete")
             print(f"  λ range: [{lambda_map.min():.3e}, {lambda_map.max():.3e}]")
             print(f"  λ median: {np.median(lambda_map):.3e}")
 
@@ -682,7 +687,7 @@ def main():
 
     if args.save_lambda_map and args.optimize_level == 'per_voxel':
         if args.verbose:
-            print(f"\nSaving lambda map...")
+            print("\nSaving lambda map...")
 
         # Create 3D volume
         lambda_volume = np.zeros((nx, ny, nz))
@@ -699,7 +704,7 @@ def main():
     # ========================================================================
 
     if args.verbose:
-        print(f"\n" + "="*70)
+        print("\n" + "="*70)
         print("Fitting Final TPS Model")
         print("="*70)
 
@@ -737,18 +742,18 @@ def main():
 
         try:
             betas_poly = torch.linalg.solve(poly_XTX, poly_XTy)  # (n_poly, n_voxels)
-        except:
+        except Exception:
             betas_poly = torch.linalg.lstsq(poly_XTX, poly_XTy).solution
 
         betas_poly = betas_poly.T.cpu().numpy()  # (n_voxels, n_poly)
 
         if args.verbose:
-            print(f"  ✓ Polynomial fit complete")
+            print("  ✓ Polynomial fit complete")
     else:
         betas_poly = np.zeros((n_voxels, 0))
 
     if args.verbose:
-        print(f"\n  ✓ TPS model fit complete")
+        print("\n  ✓ TPS model fit complete")
 
     # ========================================================================
     # Extract and save HRF estimates
@@ -797,10 +802,10 @@ def main():
     # ========================================================================
 
     if args.verbose:
-        print(f"\n" + "="*70)
+        print("\n" + "="*70)
         print("TPS HRF Estimation Complete")
         print("="*70)
-        print(f"\nOutput files:")
+        print("\nOutput files:")
         for f in output_files:
             print(f"  {f}")
         if args.save_design:
@@ -812,3 +817,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

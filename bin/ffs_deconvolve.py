@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+
 """
+
 ffs_deconvolve.py - Fast fMRI deconvolution analysis using FIR/TENT models
 
 Estimates HRF shapes directly from data using:
@@ -41,6 +43,7 @@ Per-condition TENT windows:
 For help:
     ffs_deconvolve.py -help
 """
+from __future__ import annotations
 
 import argparse
 import sys
@@ -59,11 +62,11 @@ except ImportError:
 # Import fastfuncsim modules
 try:
     from fastfuncsim.afni_io import (
-        load_nifti,
         get_tr_from_file,
-        save_nifti,
-        onsets_to_tr_matrix,
         load_afni_mask,
+        load_nifti,
+        onsets_to_tr_matrix,
+        save_nifti,
     )
     from fastfuncsim.design import (
         build_glm_design,
@@ -71,8 +74,8 @@ try:
         save_iresp,
     )
     from fastfuncsim.design_builder import (
-        parse_afni_timing_file,
         legendre_polynomials,
+        parse_afni_timing_file,
     )
     from fastfuncsim.glm_core import fit_glm
     from fastfuncsim.utils import get_device
@@ -294,15 +297,15 @@ def parse_tent_windows(tent_window_args, n_conditions):
             bot = float(tent_window_args[0])
             top = float(tent_window_args[1])
         except ValueError:
-            raise ValueError(f"Invalid tent_window values. Expected numeric values.")
+            raise ValueError("Invalid tent_window values. Expected numeric values.")
         if bot >= top:
             raise ValueError(f"Invalid tent_window: bot ({bot}) must be < top ({top})")
         return [(bot, top)] * n_conditions
 
     else:
         raise ValueError(
-            f"Invalid tent_window format. Use either: '0 15' (two values), "
-            f"'0,15' (comma-separated), or '0,15 0,20 ...' (per-condition)"
+            "Invalid tent_window format. Use either: '0 15' (two values), "
+            "'0,15' (comma-separated), or '0,15 0,20 ...' (per-condition)"
         )
 
 
@@ -329,7 +332,7 @@ def main():
     if args.cpu:
         device = torch.device("cpu")
         if args.verbose:
-            print(f"Using CPU")
+            print("Using CPU")
     else:
         device = get_device()
         if args.verbose:
@@ -341,10 +344,10 @@ def main():
 
     if args.verbose:
         print(f"\n{'=' * 70}")
-        print(f"Fast fMRI Deconvolution")
+        print("Fast fMRI Deconvolution")
         print(f"{'=' * 70}")
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"\nInput:")
+        print("\nInput:")
         print(f"  Runs: {n_runs}")
         print(f"  Conditions: {n_conditions}")
 
@@ -366,7 +369,7 @@ def main():
 
     # Load data
     if args.verbose:
-        print(f"\nLoading fMRI data...")
+        print("\nLoading fMRI data...")
 
     data_list = []
     n_timepoints_per_run = []
@@ -440,7 +443,7 @@ def main():
 
     # Load onsets
     if args.verbose:
-        print(f"\nLoading onset timing files...")
+        print("\nLoading onset timing files...")
 
     onsets_per_condition = []
     for onset_file in args.onsets:
@@ -532,7 +535,7 @@ def main():
                     f"  Basis functions: {n_basis_calc} {basis_type} knots → {n_actual} regressors per condition"
                 )
             else:
-                print(f"  Windows (per condition):")
+                print("  Windows (per condition):")
                 basis_type = "cubic spline" if "CSPLIN" in model else "tent"
                 for i, (bot, top) in enumerate(tent_windows):
                     if args.tent_n_basis is None:
@@ -706,13 +709,13 @@ def main():
         design_np = design_full.cpu().numpy()
 
         if args.verbose:
-            print(f"\nSaving design matrix...")
+            print("\nSaving design matrix...")
             print(f"  {design_file}")
 
         # Save as AFNI .1D format with header
         with open(design_file, 'w') as f:
             # Write metadata header
-            f.write(f"# Design matrix for ffs_deconvolve.py\n")
+            f.write("# Design matrix for ffs_deconvolve.py\n")
             f.write(f"# Model: {model}\n")
             f.write(f"# TR: {tr}s\n")
             f.write(f"# Runs: {len(n_timepoints_per_run)}\n")
@@ -730,8 +733,8 @@ def main():
                 f.write(f"# FIR lags: {n_basis_per_condition_list[0]} (duration: {(n_basis_per_condition_list[0]-1)*tr}s)\n")
 
             if args.polort >= 0:
-                f.write(f"#\n")
-                f.write(f"# Polynomial drift (zero-padded per run):\n")
+                f.write("#\n")
+                f.write("# Polynomial drift (zero-padded per run):\n")
                 f.write(f"#   Order: {args.polort}\n")
                 f.write(f"#   Regressors per run: {args.polort + 1}\n")
                 f.write(f"#   Total polynomial regressors: {len(n_timepoints_per_run) * (args.polort + 1)}\n")
@@ -749,11 +752,14 @@ def main():
 
     # Save design matrix plot if requested
     if args.save_design_plot:
-        design_plot_file = f"{args.prefix}_design.png"
+        # Create figures directory
+        figs_dir = f"{args.prefix}_figures"
+        Path(figs_dir).mkdir(parents=True, exist_ok=True)
+        design_plot_file = f"{figs_dir}/design.png"
         design_np = design_full.cpu().numpy()
 
         if args.verbose:
-            print(f"\nSaving design matrix plot...")
+            print("\nSaving design matrix plot...")
             print(f"  {design_plot_file}")
 
         try:
@@ -821,7 +827,7 @@ def main():
             plt.close()
 
             if args.verbose:
-                print(f"  ✓ Design matrix plot saved")
+                print("  ✓ Design matrix plot saved")
 
         except ImportError:
             print("WARNING: matplotlib not available, skipping design plot", file=sys.stderr)
@@ -851,7 +857,7 @@ def main():
 
     # Fit GLM with chunking
     if args.verbose:
-        print(f"\nFitting GLM (chunked for GPU memory)...")
+        print("\nFitting GLM (chunked for GPU memory)...")
         print(f"  Design: {design_full.shape}")
         print(f"  Data: {data_tensor.shape}")
 
@@ -868,7 +874,7 @@ def main():
     )
 
     if args.verbose:
-        print(f"  ✓ GLM fit complete")
+        print("  ✓ GLM fit complete")
 
     # Extract HRF estimates (only stimulus betas, not polynomials)
     if args.verbose:
@@ -952,7 +958,7 @@ def main():
     # Done
     if args.verbose:
         print(f"\n{'=' * 70}")
-        print(f"✓ Deconvolution complete!")
+        print("✓ Deconvolution complete!")
         print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'=' * 70}")
 
@@ -961,3 +967,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

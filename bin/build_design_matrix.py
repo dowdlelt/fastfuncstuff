@@ -1,5 +1,7 @@
 #!/usr/bin/env python
+
 """
+
 Command-line tool for building fMRI design matrices
 
 Simplified syntax compared to AFNI's 3dDeconvolve:
@@ -33,20 +35,19 @@ Individual modulation (IM):
         -stim_IM times.events.txt 'SPMG1(0)' events \\
         -xmat X.xmat.1D
 """
+from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
-import numpy as np
-
+from fastfuncsim.afni_io import get_tr_from_file, load_nifti
 from fastfuncsim.design_builder import (
     build_design_matrix,
-    write_afni_xmat,
     parse_glt_string,
+    write_afni_xmat,
 )
-from fastfuncsim.afni_io import get_tr_from_file, load_nifti
 
 try:
     import nibabel as nib
@@ -266,7 +267,7 @@ def main():
             ortvec_files.append((filepath, label))
 
     if args.verbose and (padortvec_files or ortvec_files):
-        print(f"\nNuisance regressors:")
+        print("\nNuisance regressors:")
         if padortvec_files:
             print(f"  Padded (per-run): {len(padortvec_files)}")
             for filepath, label, run_num in padortvec_files:
@@ -350,3 +351,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+

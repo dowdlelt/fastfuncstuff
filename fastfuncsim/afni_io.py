@@ -41,11 +41,12 @@ Examples
 >>> censored = get_censored_mask(design)
 >>> X_clean, Y_clean = select_uncensored_timepoints(design, fmri_data)
 """
+from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 import subprocess
 import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -169,7 +170,7 @@ def read_afni_onset_file(filepath: Union[str, Path]) -> List[np.ndarray]:
     if not filepath.exists():
         raise FileNotFoundError(f"Onset file not found: {filepath}")
 
-    with open(filepath, "r") as f:
+    with open(filepath) as f:
         lines = f.readlines()
 
     onsets_per_run = []
@@ -473,7 +474,7 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
 
     data_lines = []
 
-    with open(filepath, "r") as f:
+    with open(filepath) as f:
         for line in f:
             line = line.strip()
 

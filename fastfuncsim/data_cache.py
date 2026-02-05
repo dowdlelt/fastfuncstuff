@@ -4,13 +4,16 @@ HDF5 data caching for fast loading of fMRI data.
 Provides ~10x speedup by caching preprocessed (scaled) data in HDF5 format
 instead of loading multiple compressed NIfTI files on each run.
 """
+from __future__ import annotations
 
 import hashlib
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
 import h5py
 import numpy as np
-from pathlib import Path
-from typing import List, Union, Tuple, Optional, Sequence
-import time
 
 
 def _compute_file_hash(files: Sequence[Union[str, Path]]) -> str:

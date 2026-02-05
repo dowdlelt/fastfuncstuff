@@ -2,6 +2,7 @@
 High-level analysis workflows for fMRI data
 Complete pipelines from AFNI files to GLM results
 """
+from __future__ import annotations
 
 import inspect
 from pathlib import Path
@@ -23,7 +24,7 @@ from .afni_io import (
 from .arma_glm import ARMA11Results, fit_glm_arma11, get_default_arma_grids
 from .design import build_glm_design, convolve_hrf_microtime
 from .glm_core import GLMResults, fit_glm, fit_glm_hrf_library
-from .hrf import get_canonical_hrf, get_hrf_library
+from .hrf import get_hrf_library
 from .utils import get_device, to_tensor
 
 
@@ -931,9 +932,9 @@ def analyze_from_design_matrix(
                     )
 
                     from .glm_outputs import (
-                        write_partial_r2_with_labels,
-                        _resolve_shape,
                         _get_voxel_mask,
+                        _resolve_shape,
+                        write_partial_r2_with_labels,
                     )
 
                     # Get design info from outer scope
@@ -993,9 +994,9 @@ def analyze_from_design_matrix(
                     )
 
                     from .glm_outputs import (
-                        write_partial_r2_with_labels,
-                        _resolve_shape,
                         _get_voxel_mask,
+                        _resolve_shape,
+                        write_partial_r2_with_labels,
                     )
 
                     # Get design info from outer scope

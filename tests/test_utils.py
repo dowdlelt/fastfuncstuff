@@ -13,10 +13,10 @@ import numpy as np
 import pytest
 import torch
 
+from fastfuncsim.memory import estimate_chunk_size
 from fastfuncsim.utils import (
     calc_memory_usage,
     get_device,
-    optimal_chunk_size,
     print_device_info,
     to_tensor,
 )
@@ -201,25 +201,27 @@ class TestOptimalChunkSize:
         """Test chunk size calculation for CUDA device"""
         mock_props = mock.MagicMock()
         mock_props.total_memory = 16e9  # 16 GB
-        
+
         with mock.patch("torch.cuda.get_device_properties", return_value=mock_props):
-            with mock.patch("torch.cuda.memory_allocated", return_value=0):
-                chunk_size = optimal_chunk_size(
+            with mock.patch("torch.cuda.memory_reserved", return_value=0):
+                chunk_size = estimate_chunk_size(
                     n_voxels=100000,
                     n_timepoints=1000,
                     n_regressors=50,
                     device=torch.device("cuda"),
+                    operation="glm",
                 )
                 assert chunk_size >= 1000
                 assert chunk_size <= 100000
 
     def test_mps_chunk_size(self):
         """Test chunk size calculation for MPS device"""
-        chunk_size = optimal_chunk_size(
+        chunk_size = estimate_chunk_size(
             n_voxels=100000,
             n_timepoints=1000,
             n_regressors=50,
             device=torch.device("mps"),
+            operation="glm",
         )
         # MPS uses conservative 4GB estimate
         assert chunk_size >= 1000
@@ -227,11 +229,12 @@ class TestOptimalChunkSize:
 
     def test_cpu_chunk_size(self):
         """Test chunk size calculation for CPU device"""
-        chunk_size = optimal_chunk_size(
+        chunk_size = estimate_chunk_size(
             n_voxels=100000,
             n_timepoints=1000,
             n_regressors=50,
             device=torch.device("cpu"),
+            operation="glm",
         )
         # CPU uses 8GB estimate
         assert chunk_size >= 1000
@@ -239,11 +242,12 @@ class TestOptimalChunkSize:
 
     def test_small_dataset_returns_all(self):
         """Test that small datasets return all voxels"""
-        chunk_size = optimal_chunk_size(
+        chunk_size = estimate_chunk_size(
             n_voxels=500,
             n_timepoints=100,
             n_regressors=20,
             device=torch.device("cpu"),
+            operation="glm",
         )
         # Should return all 500 voxels for small dataset
         assert chunk_size == 500
@@ -251,11 +255,12 @@ class TestOptimalChunkSize:
     def test_minimum_chunk_size(self):
         """Test that chunk size respects minimum bounds"""
         # Very large memory requirement per voxel
-        chunk_size = optimal_chunk_size(
+        chunk_size = estimate_chunk_size(
             n_voxels=100000,
             n_timepoints=10000,
             n_regressors=1000,
             device=torch.device("cpu"),
+            operation="glm",
             safety_factor=0.01,  # Very conservative
         )
         # Should be at least min_chunk

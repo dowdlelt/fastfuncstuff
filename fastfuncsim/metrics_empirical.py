@@ -22,10 +22,12 @@ Theory:
 
 Both computed with AR(1) correction for realistic fMRI temporal autocorrelation.
 """
+from __future__ import annotations
 
-import torch
+from typing import Dict, Optional, Union
+
 import numpy as np
-from typing import Optional, Union, Dict
+import torch
 from scipy.linalg import toeplitz
 
 
@@ -174,7 +176,7 @@ def gls_fit(
         L_inv = torch.linalg.inv(L)
         sigma_inv = L_inv.T @ L_inv
         sigma_inv_sqrt = L_inv.T  # For whitening
-    except:
+    except Exception:
         # Fallback: direct inversion with regularization
         sigma_reg = sigma + 1e-6 * torch.eye(n_timepoints, device=device)
         sigma_inv = torch.linalg.inv(sigma_reg)

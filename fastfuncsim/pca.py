@@ -14,6 +14,7 @@ Key Features
 - Memory-efficient chunked processing for large datasets
 - Support for both spatial and temporal PCA
 """
+from __future__ import annotations
 
 from typing import Dict, Optional, Union
 
@@ -105,7 +106,7 @@ class PCA:
         self.n_samples_ = None
         self.n_features_ = None
 
-    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> "PCA":
+    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> PCA:
         """
         Fit PCA on data
 
@@ -395,7 +396,7 @@ class PCA:
         }
 
     @classmethod
-    def from_dict(cls, params: Dict, device: Optional[torch.device] = None) -> "PCA":
+    def from_dict(cls, params: Dict, device: Optional[torch.device] = None) -> PCA:
         """
         Create PCA object from dictionary
 

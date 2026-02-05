@@ -10,14 +10,17 @@ Both files are at 0.1s temporal resolution and must be:
 1. Normalized to peak amplitude = 1.0
 2. Resampled to the target microtime/TR grid
 """
+from __future__ import annotations
 
-import torch
-import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import torch
 from scipy import stats
 from scipy.interpolate import interp1d
-from .utils import to_tensor, get_device
+
+from .utils import get_device, to_tensor
 
 # Constants for pre-computed HRF files
 _HRF_FILE_RESOLUTION = 0.1  # seconds per sample in TSV files

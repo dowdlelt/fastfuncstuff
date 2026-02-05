@@ -12,6 +12,7 @@ Key Features
 - Both spatial and temporal ICA modes
 - Memory-efficient processing for large fMRI datasets
 """
+from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple, Union, cast
 
@@ -107,7 +108,7 @@ class FastICA:
         self.mean_ = None
         self.n_iter_ = None
 
-    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> 'FastICA':
+    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> FastICA:
         """
         Fit ICA on data
 

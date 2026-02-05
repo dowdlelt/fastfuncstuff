@@ -15,7 +15,7 @@ For help:
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional, Union, List, Tuple
+from typing import List, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,28 +28,34 @@ except ImportError:
 
 # Import fastfuncsim modules
 try:
-    from fastfuncsim.analysis import analyze_from_design_matrix
-    from fastfuncsim.glm_outputs import (
-        write_glm_bucket_as_nifti,
-        write_glm_results_nifti,
-        slice_glm_results,
-    )
     from fastfuncsim.afni_io import (
-        read_afni_design_matrix,
-        replace_afni_extension,
         get_tr_from_file,
         load_nifti,
+        read_afni_design_matrix,
+        replace_afni_extension,
     )
+    from fastfuncsim.analysis import analyze_from_design_matrix
+    from fastfuncsim.cli_utils import (
+        auto_polort,
+        build_nuisance_block_diag,
+        compute_run_lengths,
+        get_average_run_duration,
+        parse_device_arg,
+        parse_input_files,
+    )
+    from fastfuncsim.design import convolve_hrf_microtime
     from fastfuncsim.design_builder import (
         create_onset_matrix_microtime,
         parse_afni_timing_file,
         parse_durations,
     )
-    from fastfuncsim.design import convolve_hrf_microtime
+    from fastfuncsim.glm_outputs import (
+        slice_glm_results,
+        write_glm_bucket_as_nifti,
+        write_glm_results_nifti,
+    )
     from fastfuncsim.hrf import get_spmg1_hrf
-    from fastfuncsim.glm_core import construct_polynomial_matrix
-    from fastfuncsim.hrf_selection import load_nuisance_file
-    from fastfuncsim.utils import get_device, scale_to_percent_signal, gaussian_blur_3d
+    from fastfuncsim.utils import gaussian_blur_3d, get_device, scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -72,45 +78,6 @@ def parse_grid_arg(grid_str: str) -> Tuple[float, float, int]:
         print(f"ERROR parsing grid '{grid_str}': {e}")
         sys.exit(1)
 
-
-def parse_input_files(input_arg: Union[str, List[str]]) -> List[str]:
-    """Parse input files (can be list from nargs='+' or single string for backwards compat)
-
-    Supports:
-    - Single file: "/path/to/file.nii.gz"
-    - Multiple files: ["/path/run1.nii.gz", "/path/run2.nii.gz"]
-    - Glob patterns: ["run*.nii.gz"] or "run*.nii.gz"
-    """
-    import glob as glob_module
-
-    # Handle both list (from nargs='+') and string (old behavior)
-    if isinstance(input_arg, str):
-        # Old behavior: space-separated string in quotes
-        input_arg = input_arg.strip().strip('"').strip("'")
-        input_list = input_arg.split()
-    else:
-        # New behavior: list from nargs='+'
-        input_list = input_arg
-
-    # Expand globs and collect files
-    files = []
-    for pattern in input_list:
-        # Try glob expansion
-        matches = glob_module.glob(pattern)
-        if matches:
-            # Sort for consistent ordering
-            files.extend(sorted(matches))
-        else:
-            # Not a glob pattern, use as-is
-            files.append(pattern)
-
-    # Validate files exist
-    for f in files:
-        if not Path(f).exists():
-            print(f"ERROR: Input file not found: {f}")
-            sys.exit(1)
-
-    return files
 
 
 def detect_format(filepath: str) -> str:
@@ -191,10 +158,11 @@ def write_single_trials_output(
         Labels for stimulus regressors
     """
     import nibabel as nib
+
     from fastfuncsim.glm_outputs import (
         _ensure_numpy,
-        _reshape_parameter_map,
         _get_voxel_mask,
+        _reshape_parameter_map,
         _resolve_shape,
     )
 
@@ -699,52 +667,17 @@ def main():
         output_format = detect_format(input_files[0])
     print(f"📥 Input format detected: {output_format}")
     print(
-        f"📤 Output format: NIfTI (.nii.gz) - all outputs written as compressed NIfTI"
+        "📤 Output format: NIfTI (.nii.gz) - all outputs written as compressed NIfTI"
     )
     print()
 
     # Print summary of requested outputs
     print_output_summary(args)
 
-    # Setup device and parse device specification
+    # Parse device specification using shared utility
     import os
 
-    device_spec = args.device
-    cpu_threads_override = None
-    cuda_device_id = None
-
-    if device_spec:
-        # Parse device specification: "cpu", "cuda", "cpu,12", "cuda,0"
-        parts = device_spec.split(",")
-        device_type = parts[0].strip().lower()
-
-        if len(parts) > 1:
-            # User specified threads or device ID
-            try:
-                device_param = int(parts[1].strip())
-                if device_type == "cpu":
-                    cpu_threads_override = device_param
-                elif device_type == "cuda":
-                    cuda_device_id = device_param
-            except ValueError:
-                raise ValueError(
-                    f"Invalid device specification: {device_spec}. Expected format: 'cpu', 'cuda', 'cpu,N', or 'cuda,N'"
-                )
-
-        # Create device
-        if device_type == "cpu":
-            device = torch.device("cpu")
-        elif device_type == "cuda":
-            if cuda_device_id is not None:
-                device = torch.device(f"cuda:{cuda_device_id}")
-            else:
-                device = torch.device("cuda")
-        else:
-            raise ValueError(
-                f"Invalid device type: {device_type}. Must be 'cpu' or 'cuda'"
-            )
-    else:
-        device = get_device()
+    device, cpu_threads_override, cuda_device_id = parse_device_arg(args.device)
 
     # Configure CPU threading for maximum performance
     if device.type == "cpu":
@@ -758,7 +691,7 @@ def main():
             if cpu_threads_override is not None:
                 # User explicitly specified thread count
                 num_threads = cpu_threads_override
-                thread_source = f"user-specified"
+                thread_source = "user-specified"
             else:
                 # Auto-detect: use physical cores for compute efficiency
                 num_threads = physical_cores or logical_cores
@@ -860,7 +793,7 @@ def main():
         run_starts = [0]
         total_tps = 0
         for f in input_files:
-            img_shape = load_nifti(f)[0].shape
+            img_shape = load_nifti(f).shape
             run_len = img_shape[3] if len(img_shape) > 3 else img_shape[0]
             total_tps += run_len
             if f != input_files[-1]:  # Don't add start for after last run
@@ -873,9 +806,10 @@ def main():
 
         # Auto-determine polort if not specified
         if args.polort is None:
-            avg_run_duration_min = (n_timepoints / n_runs) * tr / 60.0
-            polort = max(1, round(avg_run_duration_min / 2))
-            print(f"  Auto polort: {polort} (based on {avg_run_duration_min:.1f} min avg run)")
+            run_lengths = compute_run_lengths(run_starts, n_timepoints)
+            avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
+            polort = auto_polort(avg_run_duration_sec, formula="afni")
+            print(f"  Auto polort: {polort} (based on {avg_run_duration_sec/60:.1f} min avg run)")
         else:
             polort = args.polort
             print(f"  Polort: {polort}")
@@ -911,29 +845,14 @@ def main():
         # Build nuisance design (polynomials + ortvec)
         print()
         print("Building nuisance regressors...")
-
-        # Polynomials per run (block-diagonal)
-        run_lengths = []
-        for i in range(n_runs):
-            if i < n_runs - 1:
-                run_lengths.append(run_starts[i + 1] - run_starts[i])
-            else:
-                run_lengths.append(n_timepoints - run_starts[i])
-
-        poly_blocks = []
-        for run_len in run_lengths:
-            poly_blocks.append(construct_polynomial_matrix(run_len, polort, device))
-        nuisance_design = torch.block_diag(*poly_blocks)
-        print(f"  Polynomial design shape: {nuisance_design.shape}")
-
-        # Add ortvec if provided
-        if args.ortvec:
-            print(f"  Loading {len(args.ortvec)} ortvec file(s)...")
-            for filepath, label in args.ortvec:
-                nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
-                ortvec_tensor = torch.tensor(nuisance_data, dtype=torch.float32, device=device)
-                nuisance_design = torch.cat([nuisance_design, ortvec_tensor], dim=1)
-                print(f"    {label}: {ortvec_tensor.shape[1]} regressor(s)")
+        nuisance_design = build_nuisance_block_diag(
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            polort=polort,
+            device=device,
+            ortvec_files=args.ortvec,
+            verbose=True,
+        )
 
         # Build full design: [task | nuisance]
         full_design = torch.cat([task_design, nuisance_design], dim=1)
@@ -980,10 +899,10 @@ def main():
 
     # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
     if args.beta_cv:
+        from fastfuncsim.analysis import analyze_from_design_matrix
+        from fastfuncsim.glm_outputs import save_single_trial_results
         from fastfuncsim.ridge import create_single_trial_design
         from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
-        from fastfuncsim.glm_outputs import save_single_trial_results
-        from fastfuncsim.analysis import analyze_from_design_matrix
 
         print()
         print("=" * 70)
@@ -1014,31 +933,15 @@ def main():
         # 2. Build wide design: [single_trial | nuisance]
         # Note: design_info was already created with condition-level design
         # We need to rebuild it with single-trial design
-        nuisance_blocks = []
-        for run_idx in range(n_runs):
-            start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_len = end_tp - start_tp
-            poly_block = construct_polynomial_matrix(run_len, polort, device)
-            nuisance_blocks.append(poly_block)
-
-        # Add ortvec if provided
-        if args.ortvec:
-            # ortvec_tensor already added to nuisance_design in design building section
-            # We need to get it from the existing design_info
-            pass  # nuisance already includes ortvec from earlier
-
-        nuisance_design_st = torch.block_diag(*nuisance_blocks)
-
-        # Add ortvec if it was provided
-        if args.ortvec:
-            ortvec_combined = []
-            for filepath, label in args.ortvec:
-                nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
-                ortvec_combined.append(torch.tensor(nuisance_data, dtype=torch.float32, device=device))
-            if ortvec_combined:
-                ortvec_design = torch.cat(ortvec_combined, dim=1)
-                nuisance_design_st = torch.cat([nuisance_design_st, ortvec_design], dim=1)
+        print("Building nuisance regressors for single-trial design...")
+        nuisance_design_st = build_nuisance_block_diag(
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            polort=polort,
+            device=device,
+            ortvec_files=args.ortvec,
+            verbose=True,
+        )
 
         full_design_st = torch.cat([st_design, nuisance_design_st], dim=1)
         task_indices_st = list(range(n_trials))
@@ -1062,13 +965,9 @@ def main():
             "n_runs": n_runs,
         }
 
-        # Load and prepare fMRI data (reuse existing preprocessing if done)
-        if preprocessing_applied:
-            fmri_data_st = fmri_data_preprocessed
-        elif args.cache and cache_metadata is not None:
-            fmri_data_st = input_files  # Will load from cache
-        else:
-            fmri_data_st = input_files
+        # Load and prepare fMRI data
+        # Note: Single-trial mode doesn't use preprocessing caching, just pass input files
+        fmri_data_st = input_files
 
         # Call analyze_from_design_matrix with single-trial design
         # This will fit ARMA(1,1), prewhiten, and return single-trial betas
@@ -1219,10 +1118,11 @@ def main():
                 # Write only betas using the write_glm_results_nifti function correctly
                 # Create a temporary results-like object with only betas
                 import nibabel as nib
+
                 from fastfuncsim.glm_outputs import (
                     _ensure_numpy,
-                    _reshape_parameter_map,
                     _get_voxel_mask,
+                    _reshape_parameter_map,
                     _resolve_shape,
                 )
 
@@ -1243,10 +1143,10 @@ def main():
                 # Nuisance parameters are in the full design matrix but not fitted separately.
                 if stim_indices:
                     print(
-                        f"  ⚠️  Skipping -Onuisance: OLS fit only includes stimulus columns (not nuisance)"
+                        "  ⚠️  Skipping -Onuisance: OLS fit only includes stimulus columns (not nuisance)"
                     )
                     print(
-                        f"      To get nuisance parameters, fit the full model without StimBots/StimTops filtering"
+                        "      To get nuisance parameters, fit the full model without StimBots/StimTops filtering"
                     )
                 else:
                     # No filtering - all regressors are present
@@ -1261,7 +1161,7 @@ def main():
             if want_single_trials:
                 if stim_indices:
                     print(
-                        f"  • Writing OLS single-trial betas (onset order): ols_single.nii.gz"
+                        "  • Writing OLS single-trial betas (onset order): ols_single.nii.gz"
                     )
                     # Need design matrix to extract onset times
                     # Get it from callback_design_info (key is "matrix" from read_afni_design_matrix)
@@ -1275,11 +1175,11 @@ def main():
                         )
                     else:
                         print(
-                            f"      ⚠️  Warning: Design matrix not available, cannot determine onset times"
+                            "      ⚠️  Warning: Design matrix not available, cannot determine onset times"
                         )
                 else:
                     print(
-                        f"  ⚠️  Skipping single-trial output: No stimulus columns found (StimBots/StimTops)"
+                        "  ⚠️  Skipping single-trial output: No stimulus columns found (StimBots/StimTops)"
                     )
 
             # Write partial R² if requested and available
@@ -1305,9 +1205,9 @@ def main():
                 print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
 
                 from fastfuncsim.glm_outputs import (
-                    write_partial_r2_with_labels,
-                    _resolve_shape,
                     _get_voxel_mask,
+                    _resolve_shape,
+                    write_partial_r2_with_labels,
                 )
 
                 # Get metadata for AFNI stat params
@@ -1332,7 +1232,7 @@ def main():
 
                 # Print labels for reference
                 suffix = "_partialR2_task" if r2_mode == "task" else "_partialR2"
-                print(f"     Sub-bricks (partial R² with AFNI stat params):")
+                print("     Sub-bricks (partial R² with AFNI stat params):")
                 for idx, label in enumerate(stim_labels):
                     print(f"       [{idx}] {label}{suffix}")
 
@@ -1420,7 +1320,7 @@ def main():
 
         # Apply scaling if requested (on concatenated 2D data)
         if args.do_scale:
-            print(f"  Applying scaling (mean=100 per run)...")
+            print("  Applying scaling (mean=100 per run)...")
             # Convert to torch for scale_to_percent_signal
             data_tensor = torch.from_numpy(fmri_data_preprocessed)
             data_tensor, violations_mask, scale_info = scale_to_percent_signal(
@@ -1453,7 +1353,7 @@ def main():
         fmri_data_to_use = fmri_data_preprocessed
 
     if args.cache and not preprocessing_applied:
-        from fastfuncsim.data_cache import check_cache_valid, load_cache, save_cache
+        from fastfuncsim.data_cache import check_cache_valid, load_cache
 
         cache_valid = check_cache_valid(args.cache, input_files)
 
@@ -1501,7 +1401,7 @@ def main():
 
         if rvar_path is not None:
             print(f"\n📂 Loading precomputed ARMA parameters from: {rvar_path}")
-            print(f"   (Skipping grid search - saves ~80% compute time)")
+            print("   (Skipping grid search - saves ~80% compute time)")
 
             try:
                 rvar_img = load_nifti(rvar_path)
@@ -1531,7 +1431,7 @@ def main():
 
             except Exception as e:
                 print(f"   ⚠️  Failed to load Rvar file: {e}")
-                print(f"   Proceeding with grid search instead")
+                print("   Proceeding with grid search instead")
                 precomputed_arma = None
 
         results, design_info = analyze_from_design_matrix(
@@ -1651,10 +1551,11 @@ def main():
         print(f"  • Writing REML betas only: {args.Rbeta}")
         # Rbeta: ALL betas, no stats
         import nibabel as nib
+
         from fastfuncsim.glm_outputs import (
             _ensure_numpy,
-            _reshape_parameter_map,
             _get_voxel_mask,
+            _reshape_parameter_map,
             _resolve_shape,
         )
 
@@ -1676,10 +1577,10 @@ def main():
         # NOTE: This only works if full design was fitted (not filtered)
         if fitted_column_indices is not None:
             print(
-                f"  ⚠️  Skipping -Rnuisance: REML fit only includes stimulus columns (not nuisance)"
+                "  ⚠️  Skipping -Rnuisance: REML fit only includes stimulus columns (not nuisance)"
             )
             print(
-                f"      To get nuisance parameters, fit the full model without StimBots/StimTops filtering"
+                "      To get nuisance parameters, fit the full model without StimBots/StimTops filtering"
             )
         elif stim_indices:
             all_indices = list(range(len(full_labels)))
@@ -1770,9 +1671,10 @@ def main():
         # Save in requested format using helper
         # IMPORTANT: nibabel cannot convert NIfTI headers to AFNI headers
         # So we always save variance files as NIfTI (even if user requested AFNI)
-        from fastfuncsim.glm_outputs import _save_nifti_with_format
-        import subprocess
         import shutil
+        import subprocess
+
+        from fastfuncsim.glm_outputs import _save_nifti_with_format
 
         # OPTIMIZATION: Write uncompressed first, then 3drefit, then compress
         # This avoids 3drefit having to decompress/recompress huge files!
@@ -1783,7 +1685,7 @@ def main():
         _save_nifti_with_format(var_img, temp_nii_path, "nifti")
 
         # Label sub-briks using AFNI's 3drefit (fast on uncompressed file)
-        print(f"  • Labeling Rvar sub-briks with 3drefit...")
+        print("  • Labeling Rvar sub-briks with 3drefit...")
 
         # Build 3drefit command with all sub-brik labels
         refit_cmd = ["3drefit"]
@@ -1796,10 +1698,10 @@ def main():
             print(f"    ✓ Labeled {len(var_labels)} sub-briks: {', '.join(var_labels)}")
         except subprocess.CalledProcessError as e:
             print(f"    ⚠️  3drefit labeling failed: {e.stderr}")
-            print(f"    (File was written successfully, but lacks sub-brik labels)")
+            print("    (File was written successfully, but lacks sub-brik labels)")
         except FileNotFoundError:
-            print(f"    ⚠️  3drefit not found in PATH (AFNI not installed?)")
-            print(f"    (File was written successfully, but lacks sub-brik labels)")
+            print("    ⚠️  3drefit not found in PATH (AFNI not installed?)")
+            print("    (File was written successfully, but lacks sub-brik labels)")
 
         # Compress with pigz if available (4-8× faster than gzip)
         if str(rvar_output_path).endswith('.nii.gz'):
@@ -1845,9 +1747,9 @@ def main():
         print(f"  • Writing REML partial R² per condition: {partial_r2_path}")
 
         from fastfuncsim.glm_outputs import (
-            write_partial_r2_with_labels,
-            _resolve_shape,
             _get_voxel_mask,
+            _resolve_shape,
+            write_partial_r2_with_labels,
         )
 
         # Get design info for stat parameters
@@ -1871,7 +1773,7 @@ def main():
         )
 
         suffix = "_partialR2_task" if r2_mode == "task" else "_partialR2"
-        print(f"     Sub-bricks (partial R² with AFNI stat params):")
+        print("     Sub-bricks (partial R² with AFNI stat params):")
         for idx, label in enumerate(fitted_labels):
             print(f"       [{idx}] {label}{suffix}")
 
@@ -1899,9 +1801,9 @@ def main():
         print(f"  • Writing REML nuisance partial R² per regressor: {nuisance_r2_path}")
 
         from fastfuncsim.glm_outputs import (
-            write_partial_r2_with_labels,
-            _resolve_shape,
             _get_voxel_mask,
+            _resolve_shape,
+            write_partial_r2_with_labels,
         )
 
         # Get nuisance labels from design_info
@@ -1927,7 +1829,7 @@ def main():
             mode="full",  # Always use "full" for nuisance (not rescaled)
         )
 
-        print(f"     Sub-bricks (nuisance partial R² with AFNI stat params):")
+        print("     Sub-bricks (nuisance partial R² with AFNI stat params):")
         for idx, label in enumerate(nuisance_labels):
             print(f"       [{idx}] {label}_partialR2")
 
@@ -1955,9 +1857,9 @@ def main():
         print(f"  • Writing REML semi-partial R² per condition: {semipartial_r2_path}")
 
         from fastfuncsim.glm_outputs import (
-            write_partial_r2_with_labels,
-            _resolve_shape,
             _get_voxel_mask,
+            _resolve_shape,
+            write_partial_r2_with_labels,
         )
 
         # Get design info for stat parameters
@@ -1981,7 +1883,7 @@ def main():
         )
 
         suffix = "_semipartialR2_task" if r2_semi_mode == "task" else "_semipartialR2"
-        print(f"     Sub-bricks (semi-partial R² with AFNI stat params):")
+        print("     Sub-bricks (semi-partial R² with AFNI stat params):")
         for idx, label in enumerate(fitted_labels):
             print(f"       [{idx}] {label}{suffix}")
 
@@ -2011,9 +1913,9 @@ def main():
         )
 
         from fastfuncsim.glm_outputs import (
-            write_partial_r2_with_labels,
-            _resolve_shape,
             _get_voxel_mask,
+            _resolve_shape,
+            write_partial_r2_with_labels,
         )
 
         # Get nuisance labels from design_info
@@ -2039,7 +1941,7 @@ def main():
             mode="full",  # Always use "full" for nuisance (not rescaled)
         )
 
-        print(f"     Sub-bricks (nuisance semi-partial R² with AFNI stat params):")
+        print("     Sub-bricks (nuisance semi-partial R² with AFNI stat params):")
         for idx, label in enumerate(nuisance_labels):
             print(f"       [{idx}] {label}_semipartialR2")
 
@@ -2047,6 +1949,7 @@ def main():
         print(f"  • Writing REML fitted model: {args.Rfitts}")
         if results.predicted is not None:
             import nibabel as nib
+
             from fastfuncsim.glm_outputs import _ensure_numpy, _get_voxel_mask
 
             affine = getattr(results, "affine", np.eye(4))
@@ -2076,6 +1979,7 @@ def main():
         print(f"  • Writing REML residuals: {args.Rerrts}")
         if results.residuals is not None:
             import nibabel as nib
+
             from fastfuncsim.glm_outputs import _ensure_numpy, _get_voxel_mask
 
             affine = getattr(results, "affine", np.eye(4))
@@ -2123,7 +2027,7 @@ def main():
             )
         else:
             print(
-                f"      ⚠️  Warning: Design matrix not available, cannot determine onset times"
+                "      ⚠️  Warning: Design matrix not available, cannot determine onset times"
             )
 
     # OLS outputs - already written by callback during analysis!
