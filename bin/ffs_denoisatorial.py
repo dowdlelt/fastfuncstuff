@@ -277,7 +277,8 @@ Notes:
         "-hrf_model",
         type=str,
         default="spmg1",
-        help="HRF model: 'spmg1' (default), 'glmsingle', 'FIR', 'TENT', or 'TENT(bot,top,n)'. "
+        help="HRF model: 'spmg1' (default), 'spmg2', 'spmg3', 'glmsingle', 'FIR', 'TENT', or 'TENT(bot,top,n)'. "
+        "SPMG2 = canonical + temporal derivative. SPMG3 = canonical + time + dispersion derivatives. "
         "FIR/TENT use durations to set window. Mutually exclusive with -hrf_opt.",
     )
     proc_opts.add_argument(
@@ -578,55 +579,31 @@ def main():
     print(f"  Conditions: {n_conditions} ({', '.join(condition_labels)})")
     print(f"  Durations: {durations}s")
 
-    # Parse HRF model (handle backwards compatibility)
-    if args.canonical is not None:
-        print("  WARNING: -canonical is deprecated, use -hrf_model instead")
-        hrf_model_str = args.canonical
-    else:
-        hrf_model_str = args.hrf_model
+    # Parse HRF model arguments
+    from fastfuncsim.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
 
-    # Parse HRF model string
-    try:
-        hrf_model_name, hrf_params = parse_hrf_model(hrf_model_str)
-    except ValueError as e:
-        print(f"ERROR: Invalid HRF model '{hrf_model_str}': {e}")
-        sys.exit(1)
+    hrf_info = parse_hrf_model_args(
+        hrf_model_arg=args.hrf_model,
+        canonical_arg=args.canonical,
+        durations=durations,
+        condition_labels=condition_labels,
+        tr=args.tr,
+    )
 
-    # Determine if FIR/TENT or canonical
-    is_fir_model = hrf_model_name in ("FIR", "TENT", "TENTZERO")
-
-    if is_fir_model:
-        # For FIR/TENT, determine window from durations or params
-        if "bot" in hrf_params and "top" in hrf_params:
-            fir_bot = hrf_params["bot"]
-            fir_top = hrf_params["top"]
-            if "n_basis" in hrf_params:
-                n_basis = hrf_params["n_basis"]
-            else:
-                n_basis = int(np.ceil((fir_top - fir_bot) / args.tr))
-        else:
-            fir_bot = 0.0
-            fir_top = max(durations)
-            n_basis = int(np.ceil(fir_top / args.tr))
-
-        print(f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, {n_basis} basis functions)")
-
-        # Expand condition labels for FIR
-        fir_condition_labels = []
-        for cond_label in condition_labels:
-            for lag_idx in range(n_basis):
-                lag_time = fir_bot + lag_idx * (fir_top - fir_bot) / max(1, n_basis - 1)
-                fir_condition_labels.append(f"{cond_label}_t{lag_time:.1f}s")
-        condition_labels_full = fir_condition_labels
-    else:
-        print(f"  HRF model: {hrf_model_name} (canonical)")
-        condition_labels_full = condition_labels
+    hrf_model_name = hrf_info["hrf_model_name"]
+    hrf_params = hrf_info["hrf_params"]
+    is_fir_model = hrf_info["is_fir_model"]
+    fir_bot = hrf_info["fir_bot"]
+    fir_top = hrf_info["fir_top"]
+    n_basis = hrf_info["n_basis"]
+    condition_labels_full = hrf_info["condition_labels_full"]
 
     # Check for incompatible options with FIR models
-    if is_fir_model and args.hrf_opt:
-        print("ERROR: FIR/TENT models are incompatible with -hrf_opt (per-voxel HRFs)")
-        print("  FIR/TENT use data-driven basis functions, not assumed HRF shapes")
-        sys.exit(1)
+    validate_hrf_compatibility(
+        is_fir_model=is_fir_model,
+        single_trial=False,  # ffs_denoisatorial doesn't have -single_trial
+        hrf_opt=args.hrf_opt,
+    )
 
     # Warn about large max_pcs
     if args.max_pcs > 12:
@@ -798,94 +775,49 @@ def main():
         if len(unique_hrfs) > 5:
             print(f"    ... and {len(unique_hrfs) - 5} more HRFs")
 
-        # Build per-HRF design matrices
-        unique_hrf_indices_list = unique_hrfs.tolist()
-        designs_by_hrf = {}
-        for hrf_idx_val in unique_hrf_indices_list:
-            hrf_kernel = hrf_library[hrf_idx_val]
-            design_for_hrf = convolve_hrf_microtime(
-                onsets_microtime=onset_matrix_micro,
-                hrf=hrf_kernel,
-                n_timepoints=n_timepoints,
-                tr=args.tr,
-                microtime_dt=args.microtime_dt,
-                device=device,
-            )
-            assert isinstance(design_for_hrf, torch.Tensor)
-            designs_by_hrf[hrf_idx_val] = design_for_hrf
-
-        print(f"  Created {len(designs_by_hrf)} HRF-specific design matrices")
-        print(f"  Task predictors: {n_conditions} ({', '.join(condition_labels)})")
+        # Build per-HRF design matrices using refactored function
+        from fastfuncsim.cli_utils import build_task_design_from_args
+        task_design, designs_by_hrf = build_task_design_from_args(
+            hrf_model_name=hrf_model_name,
+            is_fir_model=is_fir_model,
+            fir_bot=fir_bot,
+            fir_top=fir_top,
+            n_basis=n_basis,
+            all_onsets=all_onsets,
+            onset_matrix_micro=onset_matrix_micro,
+            n_conditions=n_conditions,
+            n_timepoints=n_timepoints,
+            run_starts=run_starts,
+            tr=args.tr,
+            microtime_dt=args.microtime_dt,
+            device=device,
+            hrf_opt=args.hrf_opt,
+            hrf_library=hrf_library,
+            hrf_indices=hrf_indices,
+            n_voxels=n_voxels,
+        )
     else:
-        # Single HRF model for all voxels
-        if is_fir_model:
-            # FIR/TENT: Use basis functions (no convolution)
-            print(f"  Building {hrf_model_name} design matrix ({n_basis} basis functions per condition)")
-
-            if hrf_model_name == "FIR":
-                task_design = make_fir_design(
-                    onsets=all_onsets,
-                    n_lags=n_basis,
-                    tr=args.tr,
-                    n_timepoints=n_timepoints,
-                    run_starts=run_starts,
-                    device=device,
-                )
-            elif hrf_model_name in ("TENT", "TENTZERO"):
-                task_design = make_tent_design(
-                    onsets=all_onsets,
-                    bot=fir_bot,
-                    top=fir_top,
-                    n_basis=n_basis,
-                    tr=args.tr,
-                    n_timepoints=n_timepoints,
-                    run_starts=run_starts,
-                    zero_edges=(hrf_model_name == "TENTZERO"),
-                    device=device,
-                )
-            else:
-                print(f"ERROR: Unknown FIR model: {hrf_model_name}")
-                sys.exit(1)
-
-            print(f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors")
-            print(f"    ({n_conditions} conditions × {n_basis} basis functions)")
-
-        else:
-            # Canonical HRF: Convolve with assumed shape
-            if hrf_model_name == "spmg1":
-                print("  Using canonical SPMG1 HRF")
-                hrf = get_spmg1_hrf(
-                    microtime_dt=args.microtime_dt,
-                    stim_duration=0.0,
-                    hrf_duration=32.0,
-                    normalize_peak=True,
-                    device=device,
-                )
-            elif hrf_model_name == "glmsingle":
-                print("  Using canonical GLMsingle HRF")
-                from fastfuncsim.hrf import get_glmsingle_hrf
-                hrf = get_glmsingle_hrf(
-                    microtime_dt=args.microtime_dt,
-                    device=device,
-                )
-            else:
-                print(f"ERROR: Unknown canonical HRF: {hrf_model_name}")
-                sys.exit(1)
-
-            task_design = convolve_hrf_microtime(
-                onsets_microtime=onset_matrix_micro,
-                hrf=hrf,
-                n_timepoints=n_timepoints,
-                tr=args.tr,
-                microtime_dt=args.microtime_dt,
-                device=device,
-            )
-
-        assert isinstance(task_design, torch.Tensor)
-        if is_fir_model:
-            print(f"  Task predictors: {task_design.shape[1]} ({n_conditions} conditions × {n_basis} lags)")
-        else:
-            print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
+        # Single HRF model for all voxels - use refactored function
+        from fastfuncsim.cli_utils import build_task_design_from_args
+        task_design, designs_by_hrf = build_task_design_from_args(
+            hrf_model_name=hrf_model_name,
+            is_fir_model=is_fir_model,
+            fir_bot=fir_bot,
+            fir_top=fir_top,
+            n_basis=n_basis,
+            all_onsets=all_onsets,
+            onset_matrix_micro=onset_matrix_micro,
+            n_conditions=n_conditions,
+            n_timepoints=n_timepoints,
+            run_starts=run_starts,
+            tr=args.tr,
+            microtime_dt=args.microtime_dt,
+            device=device,
+            hrf_opt=None,
+            hrf_library=None,
+            hrf_indices=None,
+            n_voxels=None,
+        )
 
     # Build nuisance per run (polynomials + ortvec)
     nuisance_per_run = []

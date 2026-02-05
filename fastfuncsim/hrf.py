@@ -921,3 +921,282 @@ def get_hrf_library(
         raise ValueError(
             f"Unknown mode: {mode}. Choose 'library', 'pighs', 'single', 'glmsingle', or 'spmg1'"
         )
+
+
+def get_spm_canonical_hrf(
+    microtime_dt: float = 0.1,
+    hrf_duration: float = 32.0,
+    delay: float = 6.0,
+    undershoot: float = 16.0,
+    dispersion: float = 1.0,
+    u_dispersion: float = 1.0,
+    ratio: float = 0.167,
+    onset: float = 0.0,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Generate SPM canonical HRF as difference of two gamma functions.
+
+    This is the standard SPM canonical HRF used with SPMG2/SPMG3 derivatives.
+    Formula: gamma_pdf(t, delay/dispersion) - ratio * gamma_pdf(t, undershoot/u_dispersion)
+
+    Parameters
+    ----------
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds
+    hrf_duration : float, default=32.0
+        Total duration of HRF in seconds
+    delay : float, default=6.0
+        Time to peak of main positive response (seconds)
+    undershoot : float, default=16.0
+        Time to trough of negative undershoot (seconds)
+    dispersion : float, default=1.0
+        Dispersion (width) of main response
+    u_dispersion : float, default=1.0
+        Dispersion (width) of undershoot
+    ratio : float, default=0.167
+        Relative size of undershoot to main response
+    onset : float, default=0.0
+        Time shift of HRF onset (seconds)
+    device : torch.device, optional
+        Device for output tensor
+
+    Returns
+    -------
+    hrf : torch.Tensor
+        Shape (n_timepoints,) canonical HRF
+
+    Notes
+    -----
+    Based on SPM's canonical HRF as described in:
+    Friston et al. (1998). "Event-related fMRI: Characterizing differential responses."
+    NeuroImage, 7(1), 30-40.
+    """
+    if device is None:
+        device = get_device()
+
+    # Create time vector
+    t = np.arange(0, hrf_duration, microtime_dt)
+    t_shifted = t - onset
+    t_shifted = np.maximum(t_shifted, 0)  # Ensure non-negative
+
+    # Compute as difference of two gamma PDFs
+    # Using scipy.stats.gamma for consistency
+    from scipy.stats import gamma
+
+    # Main positive response
+    # gamma.pdf(x, a, scale=s) where a = shape, s = scale
+    # For peak at 'delay' with dispersion 'd': shape = delay/d, scale = d
+    shape1 = delay / dispersion
+    scale1 = dispersion
+    main_response = gamma.pdf(t_shifted, shape1, scale=scale1)
+
+    # Negative undershoot
+    shape2 = undershoot / u_dispersion
+    scale2 = u_dispersion
+    undershoot_response = gamma.pdf(t_shifted, shape2, scale=scale2)
+
+    # Combine
+    hrf = main_response - ratio * undershoot_response
+
+    # Normalize to sum to 1 (area under curve)
+    hrf_sum = np.sum(hrf) * microtime_dt
+    if hrf_sum > 0:
+        hrf = hrf / hrf_sum
+
+    return to_tensor(hrf, device=device, dtype=torch.float32)
+
+
+def get_spm_time_derivative(
+    microtime_dt: float = 0.1,
+    hrf_duration: float = 32.0,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Generate temporal derivative of SPM canonical HRF.
+
+    This captures variability in the peak latency of the BOLD response,
+    allowing the model to accommodate voxel-wise timing differences.
+
+    Parameters
+    ----------
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds
+    hrf_duration : float, default=32.0
+        Total duration of HRF in seconds
+    device : torch.device, optional
+        Device for output tensor
+
+    Returns
+    -------
+    dhrf_dt : torch.Tensor
+        Shape (n_timepoints,) temporal derivative
+
+    Notes
+    -----
+    Computed using finite differences with a 0.1s temporal shift:
+    dhrf/dt ≈ (HRF(t + 0.1) - HRF(t)) / 0.1
+    """
+    if device is None:
+        device = get_device()
+
+    # Finite difference approximation
+    dt_shift = 0.1  # seconds
+
+    # HRF at t
+    hrf_t = get_spm_canonical_hrf(
+        microtime_dt=microtime_dt,
+        hrf_duration=hrf_duration,
+        onset=0.0,
+        device=device,
+    )
+
+    # HRF at t + dt
+    hrf_t_plus_dt = get_spm_canonical_hrf(
+        microtime_dt=microtime_dt,
+        hrf_duration=hrf_duration,
+        onset=dt_shift,
+        device=device,
+    )
+
+    # Derivative
+    dhrf_dt = (hrf_t_plus_dt - hrf_t) / dt_shift
+
+    return dhrf_dt
+
+
+def get_spm_dispersion_derivative(
+    microtime_dt: float = 0.1,
+    hrf_duration: float = 32.0,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Generate dispersion derivative of SPM canonical HRF.
+
+    This captures variability in the width/duration of the BOLD response,
+    accounting for cases where the response is broader or narrower than
+    the canonical shape.
+
+    Parameters
+    ----------
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds
+    hrf_duration : float, default=32.0
+        Total duration of HRF in seconds
+    device : torch.device, optional
+        Device for output tensor
+
+    Returns
+    -------
+    dhrf_dd : torch.Tensor
+        Shape (n_timepoints,) dispersion derivative
+
+    Notes
+    -----
+    Computed using finite differences by varying the dispersion parameter:
+    dhrf/dd ≈ (HRF(dispersion=1.01) - HRF(dispersion=1.0)) / 0.01
+    """
+    if device is None:
+        device = get_device()
+
+    # Finite difference approximation
+    dd_shift = 0.01  # small change in dispersion
+
+    # HRF with standard dispersion
+    hrf_d = get_spm_canonical_hrf(
+        microtime_dt=microtime_dt,
+        hrf_duration=hrf_duration,
+        dispersion=1.0,
+        device=device,
+    )
+
+    # HRF with slightly increased dispersion
+    hrf_d_plus_dd = get_spm_canonical_hrf(
+        microtime_dt=microtime_dt,
+        hrf_duration=hrf_duration,
+        dispersion=1.0 + dd_shift,
+        device=device,
+    )
+
+    # Derivative
+    dhrf_dd = (hrf_d_plus_dd - hrf_d) / dd_shift
+
+    return dhrf_dd
+
+
+def get_spm_hrf_with_derivatives(
+    microtime_dt: float = 0.1,
+    hrf_duration: float = 32.0,
+    n_basis: int = 1,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Generate SPM canonical HRF with derivatives.
+
+    Parameters
+    ----------
+    microtime_dt : float, default=0.1
+        Temporal resolution in seconds
+    hrf_duration : float, default=32.0
+        Total duration of HRF in seconds
+    n_basis : int, default=1
+        Number of basis functions:
+        - 1: Canonical HRF only (SPMG1)
+        - 2: Canonical + temporal derivative (SPMG2)
+        - 3: Canonical + temporal + dispersion derivatives (SPMG3)
+    device : torch.device, optional
+        Device for output tensor
+
+    Returns
+    -------
+    hrf_set : torch.Tensor
+        Shape (n_basis, n_timepoints) set of basis functions
+
+    Notes
+    -----
+    - SPMG1: Single canonical HRF (what we already have)
+    - SPMG2: Canonical + time derivative (models timing variability)
+    - SPMG3: Canonical + time + dispersion (models timing + width variability)
+
+    The derivatives allow flexible HRF modeling to capture voxel-wise variations
+    in hemodynamic response shape.
+    """
+    if device is None:
+        device = get_device()
+
+    if n_basis not in (1, 2, 3):
+        raise ValueError(f"n_basis must be 1, 2, or 3, got {n_basis}")
+
+    # Always start with canonical
+    basis_functions = [
+        get_spm_canonical_hrf(
+            microtime_dt=microtime_dt,
+            hrf_duration=hrf_duration,
+            device=device,
+        )
+    ]
+
+    # Add temporal derivative if requested
+    if n_basis >= 2:
+        basis_functions.append(
+            get_spm_time_derivative(
+                microtime_dt=microtime_dt,
+                hrf_duration=hrf_duration,
+                device=device,
+            )
+        )
+
+    # Add dispersion derivative if requested
+    if n_basis >= 3:
+        basis_functions.append(
+            get_spm_dispersion_derivative(
+                microtime_dt=microtime_dt,
+                hrf_duration=hrf_duration,
+                device=device,
+            )
+        )
+
+    # Stack into (n_basis, n_timepoints)
+    hrf_set = torch.stack(basis_functions, dim=0)
+
+    return hrf_set

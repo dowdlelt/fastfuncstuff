@@ -14,6 +14,7 @@ Key Features
 - Memory-efficient chunked processing for large datasets
 - Support for both spatial and temporal PCA
 """
+
 from __future__ import annotations
 
 from typing import Dict, Optional, Union
@@ -98,13 +99,13 @@ class PCA:
         self.device = device if device is not None else get_device()
 
         # Fitted attributes (set by fit())
-        self.components_ = None
-        self.explained_variance_ = None
-        self.explained_variance_ratio_ = None
-        self.mean_ = None
-        self.n_components_ = None
-        self.n_samples_ = None
-        self.n_features_ = None
+        self.components_: Optional[torch.Tensor] = None
+        self.explained_variance_: Optional[torch.Tensor] = None
+        self.explained_variance_ratio_: Optional[torch.Tensor] = None
+        self.mean_: Optional[torch.Tensor] = None
+        self.n_components_: Optional[int] = None
+        self.n_samples_: Optional[int] = None
+        self.n_features_: Optional[int] = None
 
     def fit(self, X: Union[np.ndarray, torch.Tensor]) -> PCA:
         """

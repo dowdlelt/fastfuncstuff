@@ -1032,3 +1032,406 @@ def parse_device_arg(device_spec: Optional[str]) -> tuple[torch.device, Optional
         raise ValueError(f"Unknown device type: {device_type}. Use 'cpu' or 'cuda'.")
 
     return device, cpu_threads_override, cuda_device_id
+
+
+def parse_hrf_model_args(
+    hrf_model_arg: str,
+    canonical_arg: str | None,
+    durations: list[float],
+    condition_labels: list[str],
+    tr: float,
+) -> dict:
+    """
+    Parse HRF model arguments and expand labels for FIR.
+
+    Handles backwards compatibility with -canonical flag and creates
+    expanded condition labels for FIR/TENT models.
+
+    Parameters
+    ----------
+    hrf_model_arg : str
+        HRF model string from -hrf_model argument
+    canonical_arg : str | None
+        Deprecated -canonical argument (for backwards compatibility)
+    durations : list[float]
+        Durations for each condition (used to determine FIR window)
+    condition_labels : list[str]
+        Condition labels
+    tr : float
+        Repetition time in seconds
+
+    Returns
+    -------
+    dict
+        Dictionary with:
+        - hrf_model_name : str
+        - hrf_params : dict
+        - is_fir_model : bool
+        - fir_bot : float (if FIR)
+        - fir_top : float (if FIR)
+        - n_basis : int (if FIR)
+        - condition_labels_full : list[str]
+
+    Raises
+    ------
+    ValueError
+        If HRF model string is invalid
+    SystemExit
+        If HRF model is invalid (prints error and exits)
+    """
+    from .design import parse_hrf_model
+
+    # Handle backwards compatibility with -canonical
+    if canonical_arg is not None:
+        print("  WARNING: -canonical is deprecated, use -hrf_model instead")
+        hrf_model_str = canonical_arg
+    else:
+        hrf_model_str = hrf_model_arg
+
+    # Parse HRF model string
+    try:
+        hrf_model_name, hrf_params = parse_hrf_model(hrf_model_str)
+    except ValueError as e:
+        print(f"ERROR: Invalid HRF model '{hrf_model_str}': {e}")
+        import sys
+        sys.exit(1)
+
+    # Determine if FIR/TENT or canonical with derivatives
+    is_fir_model = hrf_model_name in ("FIR", "TENT", "TENTZERO")
+    is_spm_deriv = hrf_model_name in ("SPMG2", "SPMG3")  # SPM with derivatives
+
+    if is_fir_model:
+        # For FIR/TENT, determine window from durations or params
+        if "bot" in hrf_params and "top" in hrf_params:
+            # Explicit window specified (e.g., TENT(0,15,6))
+            fir_bot = hrf_params["bot"]
+            fir_top = hrf_params["top"]
+            if "n_basis" in hrf_params:
+                n_basis = hrf_params["n_basis"]
+            else:
+                # Default: 1 basis per TR
+                n_basis = int(np.ceil((fir_top - fir_bot) / tr))
+        else:
+            # Use durations to set window: 0 to max(durations)
+            fir_bot = 0.0
+            fir_top = max(durations)
+            # Default: 1 basis per TR
+            n_basis = int(np.ceil(fir_top / tr))
+
+        print(f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, {n_basis} basis functions)")
+
+        # Expand condition labels for FIR: cond1_t0.0s, cond1_t1.5s, ..., cond2_t0.0s, ...
+        fir_condition_labels = []
+        for cond_label in condition_labels:
+            for lag_idx in range(n_basis):
+                lag_time = fir_bot + lag_idx * (fir_top - fir_bot) / max(1, n_basis - 1)
+                fir_condition_labels.append(f"{cond_label}_t{lag_time:.1f}s")
+        condition_labels_full = fir_condition_labels
+    elif is_spm_deriv:
+        # SPMG2/SPMG3: Canonical HRF with derivatives
+        # Each condition gets multiple basis functions
+        if hrf_model_name == "SPMG2":
+            n_basis = 2  # Canonical + temporal derivative
+            basis_suffixes = ["_canonical", "_timederiv"]
+            print(f"  HRF model: {hrf_model_name} (canonical + temporal derivative, 2 basis functions per condition)")
+        elif hrf_model_name == "SPMG3":
+            n_basis = 3  # Canonical + temporal + dispersion derivatives
+            basis_suffixes = ["_canonical", "_timederiv", "_dispderiv"]
+            print(f"  HRF model: {hrf_model_name} (canonical + time + dispersion derivatives, 3 basis functions per condition)")
+
+        # Expand condition labels: cond1_canonical, cond1_timederiv, ..., cond2_canonical, ...
+        deriv_condition_labels = []
+        for cond_label in condition_labels:
+            for suffix in basis_suffixes:
+                deriv_condition_labels.append(f"{cond_label}{suffix}")
+        condition_labels_full = deriv_condition_labels
+
+        fir_bot = None
+        fir_top = None
+    else:
+        # Simple canonical: spmg1, glmsingle
+        print(f"  HRF model: {hrf_model_name} (canonical)")
+        # Canonical: condition labels stay as-is
+        condition_labels_full = condition_labels
+        fir_bot = None
+        fir_top = None
+        n_basis = 1  # Single basis function per condition
+
+    return {
+        "hrf_model_name": hrf_model_name,
+        "hrf_params": hrf_params,
+        "is_fir_model": is_fir_model,
+        "is_spm_deriv": is_spm_deriv,
+        "fir_bot": fir_bot,
+        "fir_top": fir_top,
+        "n_basis": n_basis,
+        "condition_labels_full": condition_labels_full,
+    }
+
+
+def validate_hrf_compatibility(
+    is_fir_model: bool,
+    single_trial: bool = False,
+    hrf_opt: str | None = None,
+) -> None:
+    """
+    Validate HRF model compatibility with other options.
+
+    FIR/TENT models are incompatible with:
+    - Single-trial refitting (FIR already provides time-resolved estimates)
+    - Per-voxel HRF optimization (FIR uses data-driven basis functions)
+
+    Parameters
+    ----------
+    is_fir_model : bool
+        Whether using FIR/TENT model
+    single_trial : bool, optional
+        Whether single-trial refitting is enabled
+    hrf_opt : str | None, optional
+        Per-voxel HRF optimization mode
+
+    Raises
+    ------
+    SystemExit
+        If incompatible options are detected (prints error and exits)
+    """
+    import sys
+
+    if is_fir_model:
+        if single_trial:
+            print("ERROR: FIR/TENT models are incompatible with -single_trial")
+            print("  FIR already provides time-resolved estimates; single-trial refitting is redundant")
+            sys.exit(1)
+        if hrf_opt:
+            print("ERROR: FIR/TENT models are incompatible with -hrf_opt (per-voxel HRFs)")
+            print("  FIR/TENT use data-driven basis functions, not assumed HRF shapes")
+            sys.exit(1)
+
+
+def build_task_design_from_args(
+    hrf_model_name: str,
+    is_fir_model: bool,
+    fir_bot: float | None,
+    fir_top: float | None,
+    n_basis: int | None,
+    all_onsets: list,
+    onset_matrix_micro: torch.Tensor,
+    n_conditions: int,
+    n_timepoints: int,
+    run_starts: list[int],
+    tr: float,
+    microtime_dt: float,
+    device: torch.device,
+    hrf_opt: str | None = None,
+    hrf_library: torch.Tensor | None = None,
+    hrf_indices: torch.Tensor | None = None,
+    n_voxels: int | None = None,
+) -> tuple[torch.Tensor | None, dict | None]:
+    """
+    Build task design matrix based on HRF model type.
+
+    Handles three modes:
+    1. FIR/TENT models: Use basis functions (no convolution)
+    2. Canonical HRF: Convolve with assumed shape (spmg1 or glmsingle)
+    3. Per-voxel HRF: Build designs_by_hrf dict for each unique HRF
+
+    Parameters
+    ----------
+    hrf_model_name : str
+        HRF model name (e.g., "FIR", "TENT", "spmg1", "glmsingle")
+    is_fir_model : bool
+        Whether using FIR/TENT model
+    fir_bot : float | None
+        FIR window bottom (seconds), required if is_fir_model
+    fir_top : float | None
+        FIR window top (seconds), required if is_fir_model
+    n_basis : int | None
+        Number of basis functions, required if is_fir_model
+    all_onsets : list
+        List of [condition][run] onset arrays
+    onset_matrix_micro : torch.Tensor
+        Onset matrix at microtime resolution (n_microtime, n_conditions)
+    n_conditions : int
+        Number of conditions
+    n_timepoints : int
+        Total number of TR timepoints
+    run_starts : list[int]
+        Starting timepoint for each run
+    tr : float
+        Repetition time in seconds
+    microtime_dt : float
+        Microtime resolution in seconds
+    device : torch.device
+        Device for computation
+    hrf_opt : str | None, optional
+        Per-voxel HRF optimization mode (if enabled)
+    hrf_library : torch.Tensor | None, optional
+        HRF library for per-voxel HRFs (n_hrfs, hrf_length)
+    hrf_indices : torch.Tensor | None, optional
+        HRF indices per voxel (n_voxels,)
+    n_voxels : int | None, optional
+        Number of voxels (for reporting with per-voxel HRFs)
+
+    Returns
+    -------
+    task_design : torch.Tensor | None
+        Task design matrix (n_timepoints, n_task_regressors) or None if per-voxel HRF
+    designs_by_hrf : dict | None
+        Dictionary mapping HRF index to design matrix, or None if single design
+
+    Raises
+    ------
+    SystemExit
+        If required parameters are missing or invalid
+    """
+    import sys
+    from .design import make_fir_design, make_tent_design, convolve_hrf_microtime
+    from .hrf import get_spmg1_hrf
+
+    if hrf_opt:
+        # Per-voxel HRF mode: build designs_by_hrf dict
+        print(f"  Convolving design with {len(hrf_library)} HRFs from library...")
+
+        # Find unique HRF indices
+        unique_hrf_indices = torch.unique(hrf_indices).tolist()
+        n_unique = len(unique_hrf_indices)
+        if n_voxels:
+            print(f"  Processing {n_unique} unique HRFs across {n_voxels:,} voxels")
+        else:
+            print(f"  Processing {n_unique} unique HRFs")
+
+        # Build per-HRF design matrices
+        designs_by_hrf = {}
+        for hrf_idx_val in unique_hrf_indices:
+            hrf_kernel = hrf_library[hrf_idx_val]
+            design_for_hrf = convolve_hrf_microtime(
+                onsets_microtime=onset_matrix_micro,
+                hrf=hrf_kernel,
+                n_timepoints=n_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                device=device,
+            )
+            assert isinstance(design_for_hrf, torch.Tensor)
+            designs_by_hrf[hrf_idx_val] = design_for_hrf
+
+        print(f"  Created {len(designs_by_hrf)} HRF-specific design matrices")
+        print(f"  Task predictors: {n_conditions} conditions")
+        return None, designs_by_hrf
+
+    else:
+        # Single HRF model for all voxels
+        if is_fir_model:
+            # FIR/TENT: Use basis functions (no convolution)
+            print(f"  Building {hrf_model_name} design matrix ({n_basis} basis functions per condition)")
+
+            if hrf_model_name == "FIR":
+                task_design = make_fir_design(
+                    onsets=all_onsets,
+                    n_lags=n_basis,
+                    tr=tr,
+                    n_timepoints=n_timepoints,
+                    run_starts=run_starts,
+                    device=device,
+                )
+            elif hrf_model_name in ("TENT", "TENTZERO"):
+                task_design = make_tent_design(
+                    onsets=all_onsets,
+                    bot=fir_bot,
+                    top=fir_top,
+                    n_basis=n_basis,
+                    tr=tr,
+                    n_timepoints=n_timepoints,
+                    run_starts=run_starts,
+                    zero_edges=(hrf_model_name == "TENTZERO"),
+                    device=device,
+                )
+            else:
+                print(f"ERROR: Unknown FIR model: {hrf_model_name}")
+                sys.exit(1)
+
+            print(f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors")
+            print(f"    ({n_conditions} conditions × {n_basis} basis functions)")
+
+        else:
+            # Canonical HRF: Convolve with assumed shape (with optional derivatives)
+            if hrf_model_name in ("SPMG2", "SPMG3"):
+                # SPM canonical with derivatives
+                print(f"  Using SPM canonical HRF with derivatives ({hrf_model_name})")
+                from .hrf import get_spm_hrf_with_derivatives
+
+                # Get HRF set (canonical + derivatives)
+                # Shape: (n_basis, hrf_length) where n_basis = 2 for SPMG2, 3 for SPMG3
+                hrf_set = get_spm_hrf_with_derivatives(
+                    microtime_dt=microtime_dt,
+                    hrf_duration=32.0,
+                    n_basis=n_basis,
+                    device=device,
+                )
+
+                # Convolve each basis function with onset matrix
+                # Result: list of (n_timepoints, n_conditions) matrices
+                design_per_basis = []
+                for basis_idx in range(n_basis):
+                    hrf_basis = hrf_set[basis_idx]  # Single HRF from the set
+                    design_basis = convolve_hrf_microtime(
+                        onsets_microtime=onset_matrix_micro,
+                        hrf=hrf_basis,
+                        n_timepoints=n_timepoints,
+                        tr=tr,
+                        microtime_dt=microtime_dt,
+                        device=device,
+                    )
+                    design_per_basis.append(design_basis)
+
+                # Interleave columns: cond1_canonical, cond1_timederiv, ..., cond2_canonical, ...
+                # For each condition, stack all basis functions
+                task_columns = []
+                for cond_idx in range(n_conditions):
+                    for basis_idx in range(n_basis):
+                        # Extract this condition's column from this basis
+                        task_columns.append(design_per_basis[basis_idx][:, cond_idx:cond_idx+1])
+
+                # Concatenate all columns
+                task_design = torch.cat(task_columns, dim=1)
+                print(f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors")
+                print(f"    ({n_conditions} conditions × {n_basis} basis functions)")
+
+            elif hrf_model_name == "spmg1":
+                print("  Using canonical SPMG1 HRF")
+                hrf = get_spmg1_hrf(
+                    microtime_dt=microtime_dt,
+                    stim_duration=0.0,
+                    hrf_duration=32.0,
+                    normalize_peak=True,
+                    device=device,
+                )
+                task_design = convolve_hrf_microtime(
+                    onsets_microtime=onset_matrix_micro,
+                    hrf=hrf,
+                    n_timepoints=n_timepoints,
+                    tr=tr,
+                    microtime_dt=microtime_dt,
+                    device=device,
+                )
+            elif hrf_model_name == "glmsingle":
+                print("  Using canonical GLMsingle HRF")
+                from .hrf import get_glmsingle_hrf
+                hrf = get_glmsingle_hrf(
+                    microtime_dt=microtime_dt,
+                    device=device,
+                )
+                task_design = convolve_hrf_microtime(
+                    onsets_microtime=onset_matrix_micro,
+                    hrf=hrf,
+                    n_timepoints=n_timepoints,
+                    tr=tr,
+                    microtime_dt=microtime_dt,
+                    device=device,
+                )
+            else:
+                print(f"ERROR: Unknown canonical HRF: {hrf_model_name}")
+                sys.exit(1)
+
+        assert isinstance(task_design, torch.Tensor), "Expected Tensor for single HRF"
+        return task_design, None

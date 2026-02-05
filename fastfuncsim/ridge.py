@@ -239,6 +239,8 @@ def create_single_trial_design(
     microtime_dt: float = 0.1,
     condition_labels: Optional[List[str]] = None,
     device: Optional[torch.device] = None,
+    hrf_model_name: str = "spmg1",
+    n_basis: int = 1,
 ) -> Tuple[torch.Tensor, List[str], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create single-trial design matrix with optional per-voxel HRFs
@@ -270,21 +272,30 @@ def create_single_trial_design(
         Labels for each condition (for trial naming)
     device : torch.device, optional
         Device for computation
+    hrf_model_name : str, default="spmg1"
+        HRF model name (e.g., "spmg1", "spmg2", "spmg3", "glmsingle")
+        Used to determine which HRF to use
+    n_basis : int, default=1
+        Number of basis functions per trial:
+        - 1: Single HRF (SPMG1, glmsingle)
+        - 2: Canonical + temporal derivative (SPMG2)
+        - 3: Canonical + time + dispersion derivatives (SPMG3)
 
     Returns
     -------
     design_matrix : torch.Tensor
-        If hrf_index_per_voxel is None: (n_timepoints, n_trials)
-        If hrf_index_per_voxel provided: (n_unique_hrfs, n_timepoints, n_trials)
-        Downstream code groups voxels by hrf_index and indexes design_matrix[hrf_idx].
+        If hrf_index_per_voxel is None: (n_timepoints, n_trials * n_basis)
+        If hrf_index_per_voxel provided: (n_unique_hrfs, n_timepoints, n_trials * n_basis)
+        For SPMG2/3, columns are interleaved: trial1_canonical, trial1_timederiv, ..., trial2_canonical, ...
     trial_labels : list of str
-        Label for each trial (e.g., "face_001", "house_023")
-    trial_condition_ids : torch.Tensor, shape (n_trials,)
-        Condition index (0-indexed) for each trial
-    trial_run_ids : torch.Tensor, shape (n_trials,)
-        Run index (0-indexed) for each trial
-    condition_design : torch.Tensor, shape (n_timepoints, n_conditions)
-        Condition-level design (sum of trials per condition)
+        Label for each column (e.g., "face_001_canonical", "face_001_timederiv")
+        Length: n_trials * n_basis
+    trial_condition_ids : torch.Tensor, shape (n_trials * n_basis,)
+        Condition index (0-indexed) for each column
+    trial_run_ids : torch.Tensor, shape (n_trials * n_basis,)
+        Run index (0-indexed) for each column
+    condition_design : torch.Tensor, shape (n_timepoints, n_conditions * n_basis)
+        Condition-level design (sum of trials per condition, with basis functions)
     """
     from .design import convolve_hrf_microtime
     from .hrf import get_canonical_hrf
@@ -353,35 +364,111 @@ def create_single_trial_design(
         if end_bin > start_bin:
             onset_matrix_micro[start_bin:end_bin, trial_idx] = 1.0
 
-    # Apply HRF convolution
+    # Apply HRF convolution (with optional derivatives for SPMG2/SPMG3)
     if hrf_index_per_voxel is None:
         # Single design matrix for all voxels
-        if hrf_library is None or len(hrf_library) == 0:
-            # Use canonical HRF
-            hrf = get_canonical_hrf(
-                stim_duration=0.0, tr=tr, duration=32.0, device=device
-            )
+        is_spm_deriv = hrf_model_name.upper() in ("SPMG2", "SPMG3")
+
+        if is_spm_deriv:
+            # SPMG2/SPMG3: Use SPM canonical with derivatives
+            from .hrf import get_spm_hrf_with_derivatives
+
+            hrf_set = get_spm_hrf_with_derivatives(
+                microtime_dt=microtime_dt,
+                hrf_duration=32.0,
+                n_basis=n_basis,
+                device=device,
+            )  # Shape: (n_basis, hrf_length)
+
+            # Convolve each basis function with onset matrix
+            designs_per_basis = []
+            for basis_idx in range(n_basis):
+                hrf_basis = hrf_set[basis_idx]
+                design_basis = convolve_hrf_microtime(
+                    onset_matrix_micro,
+                    hrf_basis,
+                    n_timepoints=n_timepoints,
+                    tr=tr,
+                    microtime_dt=microtime_dt,
+                    device=device,
+                    return_single_trials=False,
+                )  # (n_timepoints, n_trials)
+                designs_per_basis.append(design_basis)
+
+            # Interleave columns: trial1_canonical, trial1_timederiv, ..., trial2_canonical, ...
+            design_columns = []
+            for trial_idx in range(total_trials):
+                for basis_idx in range(n_basis):
+                    design_columns.append(designs_per_basis[basis_idx][:, trial_idx:trial_idx+1])
+
+            design_matrix = torch.cat(design_columns, dim=1)  # (n_timepoints, n_trials * n_basis)
+
+            # Expand trial labels with basis suffixes
+            basis_suffixes = {
+                2: ["_canonical", "_timederiv"],
+                3: ["_canonical", "_timederiv", "_dispderiv"],
+            }
+            suffixes = basis_suffixes[n_basis]
+
+            expanded_trial_labels = []
+            expanded_condition_ids = []
+            expanded_run_ids = []
+            for trial_idx, label in enumerate(trial_labels):
+                for suffix in suffixes:
+                    expanded_trial_labels.append(label + suffix)
+                    expanded_condition_ids.append(trial_condition_ids[trial_idx].item())
+                    expanded_run_ids.append(trial_run_ids[trial_idx].item())
+
+            trial_labels = expanded_trial_labels
+            trial_condition_ids = torch.tensor(expanded_condition_ids, dtype=torch.long, device=device)
+            trial_run_ids = torch.tensor(expanded_run_ids, dtype=torch.long, device=device)
+
+            # Build condition_design: sum trials within each condition, for each basis
+            condition_design = torch.zeros(n_timepoints, n_conditions * n_basis, dtype=torch.float32, device=device)
+            for cond_idx in range(n_conditions):
+                for basis_idx in range(n_basis):
+                    # Find columns for this condition and basis
+                    # Columns are interleaved, so condition X basis Y is at positions: X*n_basis*trials_per_cond + trial*n_basis + Y
+                    # Actually simpler: check trial_condition_ids and trial label suffix
+                    col_idx_out = cond_idx * n_basis + basis_idx
+                    suffix = suffixes[basis_idx]
+
+                    # Sum all columns that match this condition and suffix
+                    for col_idx, label in enumerate(trial_labels):
+                        if label.endswith(suffix):
+                            # Extract condition from label (before the _XXX suffix)
+                            cond_label = condition_labels[cond_idx]
+                            if label.startswith(cond_label + "_") and label.endswith(suffix):
+                                condition_design[:, col_idx_out] += design_matrix[:, col_idx]
+
         else:
-            # Use first HRF from library (or could default to canonical)
-            hrf = hrf_library[0].to(device)
+            # Standard single-basis (SPMG1, glmsingle)
+            if hrf_library is None or len(hrf_library) == 0:
+                # Use canonical HRF
+                hrf = get_canonical_hrf(
+                    stim_duration=0.0, tr=tr, duration=32.0, device=device
+                )
+            else:
+                # Use first HRF from library
+                hrf = hrf_library[0].to(device)
 
-        # Convolve - returns (n_timepoints, n_trials)
-        design_matrix = convolve_hrf_microtime(
-            onset_matrix_micro,
-            hrf,
-            n_timepoints=n_timepoints,
-            tr=tr,
-            microtime_dt=microtime_dt,
-            device=device,
-            return_single_trials=False,
-        )
+            # Convolve - returns (n_timepoints, n_trials)
+            design_matrix = convolve_hrf_microtime(
+                onset_matrix_micro,
+                hrf,
+                n_timepoints=n_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                device=device,
+                return_single_trials=False,
+            )
 
-        # Build condition_design by summing trials within each condition
-        condition_design = torch.zeros(n_timepoints, n_conditions, dtype=torch.float32, device=device)
-        for cond_idx in range(n_conditions):
-            cond_mask = trial_condition_ids == cond_idx
-            if cond_mask.sum() > 0:
-                condition_design[:, cond_idx] = design_matrix[:, cond_mask].sum(dim=1)
+            # Build condition_design by summing trials within each condition
+            condition_design = torch.zeros(n_timepoints, n_conditions, dtype=torch.float32, device=device)
+            for cond_idx in range(n_conditions):
+                cond_mask = trial_condition_ids == cond_idx
+                if cond_mask.sum() > 0:
+                    condition_design[:, cond_idx] = design_matrix[:, cond_mask].sum(dim=1)
 
         return design_matrix, trial_labels, trial_condition_ids, trial_run_ids, condition_design
 
@@ -392,6 +479,13 @@ def create_single_trial_design(
 
         if n_hrfs == 0:
             raise ValueError("hrf_library must be provided when using per-voxel HRFs")
+
+        # Check incompatibility
+        if n_basis > 1:
+            raise ValueError(
+                f"SPMG2/SPMG3 (n_basis={n_basis}) is incompatible with per-voxel HRFs. "
+                "Use either SPM derivatives OR per-voxel HRF library, not both."
+            )
 
         # Pre-compute convolved designs for each HRF
         designs_by_hrf = []

@@ -499,8 +499,17 @@ Examples:
     onset_group.add_argument(
         "-canonical",
         type=str,
+        default=None,
+        help="(DEPRECATED) Use -hrf_model instead. Canonical HRF: 'spmg1' or 'glmsingle'",
+    )
+    onset_group.add_argument(
+        "-hrf_model",
+        type=str,
         default="spmg1",
-        help="Canonical HRF: 'spmg1' (default) or 'glmsingle'",
+        help="HRF model: 'spmg1' (default), 'spmg2', 'spmg3', 'glmsingle', 'FIR', 'TENT', or 'TENT(bot,top,n)'. "
+             "SPMG2 = canonical + temporal derivative. SPMG3 = canonical + time + dispersion derivatives. "
+             "FIR/TENT use durations to set window (default: 0 to max(durations)). "
+             "Example: 'TENT(0,15,6)' for 6 tent basis functions from 0-15s",
     )
 
     # Help
@@ -787,6 +796,28 @@ def main():
         else:
             print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
 
+        # Parse HRF model arguments
+        print()
+        from fastfuncsim.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
+
+        hrf_info = parse_hrf_model_args(
+            hrf_model_arg=args.hrf_model,
+            canonical_arg=args.canonical,
+            durations=durations,
+            condition_labels=condition_labels,
+            tr=args.tr,
+        )
+
+        hrf_model_name = hrf_info["hrf_model_name"]
+        is_fir_model = hrf_info["is_fir_model"]
+        fir_bot = hrf_info["fir_bot"]
+        fir_top = hrf_info["fir_top"]
+        n_basis = hrf_info["n_basis"]
+        condition_labels_full = hrf_info["condition_labels_full"]
+
+        # 3dREMLfast doesn't support -hrf_opt or -single_trial, so no compatibility check needed
+        # (FIR is compatible with ARMA modeling)
+
         # Compute run starts from input files
         print()
         print("Computing run structure...")
@@ -822,24 +853,31 @@ def main():
             args.microtime_dt, durations, device)
         print(f"  Onset matrix shape: {onset_matrix_micro.shape}")
 
-        # Get canonical HRF
+        # Build task design matrix using refactored function
         print()
-        print(f"Convolving with canonical HRF ({args.canonical})...")
-        if args.canonical.lower() == "spmg1":
-            hrf = get_spmg1_hrf(
-                microtime_dt=args.microtime_dt,
-                stim_duration=0.0,
-                normalize_peak=True,
-                device=device)
-        else:
-            print(f"ERROR: Unsupported canonical HRF: {args.canonical}")
-            print("  Supported: 'spmg1'")
-            sys.exit(1)
+        from fastfuncsim.cli_utils import build_task_design_from_args
 
-        # Convolve to get task design
-        task_design = convolve_hrf_microtime(
-            onset_matrix_micro, hrf, n_timepoints,
-            tr=tr, microtime_dt=args.microtime_dt, device=device)
+        task_design, designs_by_hrf = build_task_design_from_args(
+            hrf_model_name=hrf_model_name,
+            is_fir_model=is_fir_model,
+            fir_bot=fir_bot,
+            fir_top=fir_top,
+            n_basis=n_basis,
+            all_onsets=all_onsets,
+            onset_matrix_micro=onset_matrix_micro,
+            n_conditions=n_conditions,
+            n_timepoints=n_timepoints,
+            run_starts=run_starts,
+            tr=args.tr,
+            microtime_dt=args.microtime_dt,
+            device=device,
+            hrf_opt=None,  # 3dREMLfast doesn't support per-voxel HRFs
+            hrf_library=None,
+            hrf_indices=None,
+            n_voxels=None,
+        )
+
+        assert task_design is not None, "3dREMLfast requires single design (no per-voxel HRFs)"
         print(f"  Task design shape: {task_design.shape}")
 
         # Build nuisance design (polynomials + ortvec)
@@ -867,8 +905,15 @@ def main():
 
         # Build column labels
         column_labels = []
-        for cond_label in condition_labels:
-            column_labels.append(f"{cond_label}#0")
+        if is_fir_model:
+            # FIR: condition_labels_full already has expanded labels (e.g., "cond1_t0.0s", "cond1_t1.5s", ...)
+            # Add #0 suffix to match AFNI format
+            for cond_label in condition_labels_full:
+                column_labels.append(f"{cond_label}#0")
+        else:
+            # Canonical: condition_labels_full = condition_labels (no expansion)
+            for cond_label in condition_labels_full:
+                column_labels.append(f"{cond_label}#0")
 
         # Add nuisance labels
         nuisance_label_offset = len(column_labels)
@@ -880,14 +925,29 @@ def main():
             for _, label in args.ortvec:
                 column_labels.append(label)
 
+        # Build stim_bots and stim_tops
+        if is_fir_model:
+            # FIR: each condition has n_basis columns
+            stim_bots = []
+            stim_tops = []
+            for cond_idx in range(n_conditions):
+                bot = cond_idx * n_basis
+                top = (cond_idx + 1) * n_basis - 1
+                stim_bots.append(bot)
+                stim_tops.append(top)
+        else:
+            # Canonical: each condition has 1 column
+            stim_bots = list(range(n_conditions))
+            stim_tops = list(range(n_conditions))
+
         design_info = {
             "design_matrix": full_design.cpu().numpy(),
             "column_labels": column_labels,
             "stim_indices": task_indices,
             "nuisance_indices": nuisance_indices,
-            "stim_bots": [0],
-            "stim_tops": [len(task_indices) - 1],
-            "stim_labels": condition_labels,
+            "stim_bots": stim_bots,
+            "stim_tops": stim_tops,
+            "stim_labels": condition_labels,  # Use original (unexpanded) labels
             "run_starts": run_starts,
             "n_runs": n_runs,
         }

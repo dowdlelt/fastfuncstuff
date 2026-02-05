@@ -244,6 +244,15 @@ Notes:
         help="Microtime resolution for non-TR-locked onsets (seconds, default: 0.1)",
     )
     proc_opts.add_argument(
+        "-hrf_model",
+        type=str,
+        default="spmg1",
+        help="HRF model: 'spmg1' (default), 'spmg2', 'spmg3', 'glmsingle'. "
+             "SPMG2 = canonical + temporal derivative (2 basis per trial). "
+             "SPMG3 = canonical + time + dispersion derivatives (3 basis per trial). "
+             "NOTE: FIR/TENT not supported in single-trial mode - use 3dDenoisefast instead.",
+    )
+    proc_opts.add_argument(
         "-device",
         type=str,
         help="Force device: 'cpu' or 'cuda' (default: auto-detect GPU)",
@@ -328,6 +337,33 @@ def main():
         print(f"  Using {durations[0]}s for all {len(all_onsets)} conditions")
     else:
         print(f"  Matched {len(durations)} durations to {len(all_onsets)} conditions")
+
+    # Parse HRF model arguments
+    print()
+    from fastfuncsim.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
+
+    # Note: 3dRidgefast doesn't support FIR (use condition-level tools for that)
+    # But it DOES support SPMG2/SPMG3 for single-trial with derivatives
+    hrf_info = parse_hrf_model_args(
+        hrf_model_arg=args.hrf_model if hasattr(args, 'hrf_model') else "spmg1",
+        canonical_arg=None,  # 3dRidgefast doesn't have -canonical
+        durations=durations,
+        condition_labels=condition_labels,
+        tr=args.tr,
+    )
+
+    hrf_model_name = hrf_info["hrf_model_name"]
+    is_fir_model = hrf_info["is_fir_model"]
+    is_spm_deriv = hrf_info.get("is_spm_deriv", False)
+    n_basis = hrf_info["n_basis"]
+
+    # Validate: FIR is incompatible with single-trial
+    if is_fir_model:
+        print("ERROR: FIR/TENT models are incompatible with single-trial estimation")
+        print("  Use 3dDenoisefast or 3dREMLfast for FIR/TENT analysis")
+        sys.exit(1)
+
+    # SPMG2/SPMG3 with HRF library is incompatible (checked in create_single_trial_design)
 
     print()
     print("=" * 70)
@@ -440,11 +476,21 @@ def main():
         microtime_dt=args.microtime_dt,
         condition_labels=condition_labels,
         device=device,
+        hrf_model_name=hrf_model_name,
+        n_basis=n_basis,
     )
 
-    n_trials = len(trial_labels)
-    n_conditions = condition_design.shape[1]
-    print(f"  Total trials: {n_trials}")
+    n_columns = len(trial_labels)
+    n_condition_cols = condition_design.shape[1]
+    # For SPMG1: n_columns = n_trials, n_condition_cols = n_conditions
+    # For SPMG2: n_columns = n_trials * 2, n_condition_cols = n_conditions * 2
+    # For SPMG3: n_columns = n_trials * 3, n_condition_cols = n_conditions * 3
+    n_trials_actual = n_columns // n_basis
+    n_conditions = n_condition_cols // n_basis
+
+    print(f"  Total trials: {n_trials_actual}")
+    print(f"  Total columns: {n_columns} ({n_trials_actual} trials × {n_basis} basis)")
+    print(f"  Condition design: {n_condition_cols} columns ({n_conditions} conditions × {n_basis} basis)")
     print(f"  Conditions: {n_conditions}")
     print(f"  Design shape: {design_matrix.shape}")
 
