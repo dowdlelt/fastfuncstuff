@@ -410,6 +410,110 @@ def extract_noise_pcs_per_run(
     return noise_pcs_per_run
 
 
+def compute_full_brain_pc_loadings(
+    data: torch.Tensor,
+    noise_pcs_per_run: list[torch.Tensor],
+    run_starts: list[int],
+    brain_mask: Optional[torch.Tensor] = None,
+    chunk_size: int = 5000,
+    device: Optional[torch.device] = None,
+    verbose: bool = False,
+) -> list[torch.Tensor]:
+    """
+    Compute full-brain spatial loadings for noise PCs by fitting PCs to all brain voxels.
+
+    This is diagnostic - shows where each PC expresses itself across the full brain,
+    not just the noise pool. Uses OLS: loadings = data @ PCs.
+
+    For orthonormal PCs (from PCA), the loadings are simply data @ PCs since
+    PCs.T @ PCs = I (identity matrix).
+
+    Parameters
+    ----------
+    data : torch.Tensor, shape (n_voxels, n_timepoints)
+        Full fMRI data
+    noise_pcs_per_run : list of torch.Tensor
+        PC timecourses for each run, each shape (n_timepoints_run, n_components)
+    run_starts : list of int
+        Starting timepoint for each run
+    brain_mask : torch.Tensor, optional, shape (n_voxels,)
+        Boolean mask for brain voxels. If None, uses all voxels.
+    chunk_size : int, default=5000
+        Number of voxels to process at once (for memory efficiency)
+    device : torch.device, optional
+        Device for computation (defaults to CPU for safety in plotting context)
+    verbose : bool, default=False
+        Print progress
+
+    Returns
+    -------
+    loadings_per_run : list of torch.Tensor (on CPU)
+        Spatial loadings for each run's PCs, each shape (n_voxels, n_components).
+    """
+    # Use CPU for safety - this is diagnostic plotting, not speed-critical
+    device = device or torch.device("cpu")
+    data = data.to(device)
+
+    n_voxels_full = data.shape[0]
+    n_runs = len(run_starts)
+    n_components = noise_pcs_per_run[0].shape[1]
+
+    # Validate and prepare brain mask
+    if brain_mask is not None:
+        brain_mask = brain_mask.cpu().flatten()
+        # Ensure mask size matches data
+        if brain_mask.shape[0] != n_voxels_full:
+            raise ValueError(
+                f"Brain mask size ({brain_mask.shape[0]}) doesn't match "
+                f"data size ({n_voxels_full})"
+            )
+        voxel_indices = torch.where(brain_mask)[0]
+        n_brain_voxels = len(voxel_indices)
+        if verbose:
+            print(f"  Computing full-brain loadings for {n_brain_voxels} brain voxels...")
+    else:
+        voxel_indices = torch.arange(n_voxels_full)
+        n_brain_voxels = n_voxels_full
+        if verbose:
+            print(f"  Computing loadings for all {n_brain_voxels} voxels...")
+
+    loadings_per_run = []
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
+
+        # Get PCs for this run: (n_tp_run, n_components)
+        pcs = noise_pcs_per_run[run_idx].to(device)
+
+        # Get data for this run: (n_voxels, n_tp_run)
+        run_data = data[:, start_tp:end_tp]
+
+        # Initialize output (all voxels x n_components)
+        loadings_full = torch.zeros(n_voxels_full, pcs.shape[1])
+
+        # Process only brain voxels in chunks
+        for chunk_start in range(0, n_brain_voxels, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_brain_voxels)
+            # Get actual voxel indices for this chunk
+            brain_voxel_idx = voxel_indices[chunk_start:chunk_end]
+
+            # Data chunk: (chunk_size, n_tp_run)
+            chunk_data = run_data[brain_voxel_idx, :]
+
+            # For orthonormal PCs, loadings = data @ PCs (no inverse needed)
+            chunk_loadings = chunk_data @ pcs
+
+            # Place in output at correct positions
+            loadings_full[brain_voxel_idx, :] = chunk_loadings
+
+        loadings_per_run.append(loadings_full)  # Keep on CPU
+
+        if verbose:
+            print(f"    Run {run_idx + 1}: {pcs.shape[1]} PCs, loadings shape {loadings_full.shape}")
+
+    return loadings_per_run
+
+
 def fit_glm_with_noise_pcs(
     data: torch.Tensor,
     design_matrix: torch.Tensor,
@@ -811,8 +915,8 @@ def cross_validate_noise_pcs(
                 end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
                 test_tps.extend(range(start_tp, end_tp))
 
-            train_tps_t = torch.tensor(train_tps, device=proj_device)
-            test_tps_t = torch.tensor(test_tps, device=proj_device)
+            train_tps_t = torch.tensor(train_tps)  # CPU indices for CPU data
+            test_tps_t = torch.tensor(test_tps)
 
             # Extract train/test data for THIS CHUNK
             chunk_data_train = chunk_data_cpu[:, train_tps_t]
@@ -864,14 +968,20 @@ def cross_validate_noise_pcs(
             # ================================================================
             # Pre-compute pseudo-inverses for ALL PC counts
             # ================================================================
+            # CRITICAL: Do this on CPU to avoid GPU memory fragmentation
+            # The matrices are (n_train_tps x n_regs) - manageable size for CPU
+            # Only small pinv_task results move to GPU
             n_task_regs = design_train_projected.shape[1]
             pinv_task_list = []
 
+            # Ensure design is on CPU for pre-computation
+            design_train_cpu = design_train_projected.cpu() if design_train_projected.device.type != "cpu" else design_train_projected
+
             for n_pcs in range(max_components + 1):
-                components = [design_train_projected.to(device)]
+                components = [design_train_cpu]
 
                 if n_pcs > 0:
-                    # Build zero-padded PC matrix
+                    # Build zero-padded PC matrix ON CPU
                     n_train_runs = len(train_noise_pcs_list)
                     pc_padded_blocks = []
 
@@ -880,10 +990,10 @@ def cross_validate_noise_pcs(
                         n_available = pcs_run.shape[1]
                         n_use = min(n_pcs, n_available)
 
-                        padded = torch.zeros((run_length, n_train_runs * n_pcs), device=device)
+                        padded = torch.zeros((run_length, n_train_runs * n_pcs), device="cpu")
                         start_col = block_idx * n_pcs
                         end_col = start_col + n_use
-                        padded[:, start_col:end_col] = pcs_run[:, :n_use]
+                        padded[:, start_col:end_col] = pcs_run[:, :n_use].cpu() if pcs_run.device.type != "cpu" else pcs_run[:, :n_use]
 
                         pc_padded_blocks.append(padded)
 
@@ -892,29 +1002,35 @@ def cross_validate_noise_pcs(
 
                 x_full = torch.cat(components, dim=1)
 
-                # Compute pseudo-inverse for task betas only
+                # Compute pseudo-inverse for task betas only (on CPU)
                 xtx = x_full.T @ x_full
                 xtx_inv = torch.linalg.pinv(xtx)
                 pinv_full = xtx_inv @ x_full.T
                 pinv_task = pinv_full[:n_task_regs, :]
-                pinv_task_list.append(pinv_task)
+
+                # Move only the small result to GPU: (n_task_regs, n_train_tps)
+                pinv_task_list.append(pinv_task.to(device))
 
             design_test_gpu = design_test_projected.to(device)
+
+            # Move projected data to GPU once (before PC loop) for efficiency
+            # When chunking, projection returns CPU data - move to GPU for computation
+            data_train_gpu = data_train_projected.to(device)
+            data_test_gpu = data_test_projected.to(device)
 
             # ================================================================
             # Fit and predict for ALL PC counts
             # ================================================================
             # Get projected test data for R² computation (predictions are in projected space)
             if nuisance_per_run is not None:
-                test_actual_projected = data_test_projected
+                test_actual_projected = data_test_gpu
             else:
-                test_actual_projected = chunk_data_test
+                test_actual_projected = chunk_data_test.to(device)
 
             for n_pcs in range(max_components + 1):
                 pinv_task = pinv_task_list[n_pcs]
 
-                # Fit: betas = pinv @ Y
-                data_train_gpu = data_train_projected.to(device)
+                # Fit: betas = pinv @ Y (data_train_gpu already on GPU from above)
                 betas = (pinv_task @ data_train_gpu.T).T  # (chunk, n_task_regs)
 
                 # Predict: y_pred = X @ betas
@@ -1150,8 +1266,8 @@ def compute_xval_r2_optimal_full(
             end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
             test_tps.extend(range(start_tp, end_tp))
 
-        train_tps_t = torch.tensor(train_tps, device=proj_device)
-        test_tps_t = torch.tensor(test_tps, device=proj_device)
+        train_tps_t = torch.tensor(train_tps)  # CPU indices for CPU data
+        test_tps_t = torch.tensor(test_tps)
 
         data_train = data_cpu[:, train_tps_t]
         data_test = data_cpu[:, test_tps_t]
