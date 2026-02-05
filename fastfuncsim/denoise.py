@@ -63,7 +63,7 @@ from .xval import (
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
-from .memory import estimate_chunk_size
+from .memory import estimate_chunk_size, dyn_chunk_estimator
 
 
 def _compute_local_run_starts(
@@ -808,37 +808,50 @@ def cross_validate_noise_pcs(
         # Import estimate_chunk_size from memory module
         n_task_regs = design_matrix.shape[1]
         if is_loro:
-            # LORO CV: streaming stats with smaller memory footprint
-            # Can use larger chunks with higher max_chunk_size
-            voxel_chunk_size = estimate_chunk_size(
+            # LORO CV: Use new dynamic chunk estimator
+            # Accounts for: streaming stats, data on CPU, n_runs, max_components, CV strategy
+            voxel_chunk_size = dyn_chunk_estimator(
                 n_voxels=n_voxels,
                 n_timepoints=n_timepoints,
-                n_regressors=n_task_regs,
+                n_task_regressors=n_task_regs,
+                n_nuisance_regressors=max_components,  # PCs being tested
                 device=proj_device,
                 operation="denoise",
-                min_chunk_size=10000,
-                max_chunk_size=42000,
-                safety_factor=0.3 if proj_device.type == "cuda" else 0.5,
+                cv_strategy=1,  # LORO
+                n_runs=n_runs,
+                max_components=max_components,
+                data_location="cpu",  # Data stays on CPU, chunks stream to GPU
+                streaming_stats=True,  # LORO uses streaming stats
+                min_chunk_size=20000,
+                max_chunk_size=None,
+                safety_factor=0.5,
+                verbose=verbose,
             )
         else:
-            # Split-half CV: full accumulators require more conservative chunks
-            # Adjust min/max_chunk_size based on projection device
-            max_chunk = 50000 if use_gpu_for_projections else 20000
-            min_chunk = 10000 if use_gpu_for_projections else 5000
-            voxel_chunk_size = estimate_chunk_size(
+            # Split-half or other CV: Use new dynamic chunk estimator
+            # Full accumulators (predictions for all PC counts) require more memory
+            voxel_chunk_size = dyn_chunk_estimator(
                 n_voxels=n_voxels,
                 n_timepoints=n_timepoints,
-                n_regressors=n_task_regs,
+                n_task_regressors=n_task_regs,
+                n_nuisance_regressors=max_components,
                 device=proj_device,
                 operation="denoise",
-                min_chunk_size=min_chunk,
-                max_chunk_size=max_chunk,
-                safety_factor=0.5,  # Conservative for accumulator memory
+                cv_strategy=cv_strategy,  # Could be split-half (0.5) or leave-k-out
+                n_runs=n_runs,
+                max_components=max_components,
+                data_location="cpu",
+                streaming_stats=False,  # Non-LORO uses full accumulators
+                min_chunk_size=10000,
+                max_chunk_size=None,
+                safety_factor=0.5,
+                verbose=verbose,
             )
 
-    # Move data to CPU for memory efficiency
-    data_cpu = data.to(proj_device)
-    design_matrix_cpu = design_matrix.to(proj_device)
+    # CRITICAL: Keep data on CPU, stream chunks to GPU as needed
+    # Only small matrices (design) can go to proj_device
+    data_cpu = data.cpu() if data.device.type != "cpu" else data
+    design_matrix_cpu = design_matrix.to(proj_device)  # Small, can stay on proj_device
 
     # Output: R² maps for all voxels and all PC counts
     r2_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32)
@@ -968,20 +981,20 @@ def cross_validate_noise_pcs(
             # ================================================================
             # Pre-compute pseudo-inverses for ALL PC counts
             # ================================================================
-            # CRITICAL: Do this on CPU to avoid GPU memory fragmentation
-            # The matrices are (n_train_tps x n_regs) - manageable size for CPU
-            # Only small pinv_task results move to GPU
+            # CRITICAL: Now that data_cpu stays on CPU, we have GPU memory for this!
+            # Computing pinv on GPU is MUCH faster (840 calls per chunk = 21 PCs × 40 folds)
+            # Matrices are small: (n_train_tps, n_regs) ≈ (11k, 800) ≈ 35 MB
             n_task_regs = design_train_projected.shape[1]
             pinv_task_list = []
 
-            # Ensure design is on CPU for pre-computation
-            design_train_cpu = design_train_projected.cpu() if design_train_projected.device.type != "cpu" else design_train_projected
+            # Move design to proj_device for fast pinv computation
+            design_train_dev = design_train_projected.to(proj_device)
 
             for n_pcs in range(max_components + 1):
-                components = [design_train_cpu]
+                components = [design_train_dev]
 
                 if n_pcs > 0:
-                    # Build zero-padded PC matrix ON CPU
+                    # Build zero-padded PC matrix on proj_device for fast computation
                     n_train_runs = len(train_noise_pcs_list)
                     pc_padded_blocks = []
 
@@ -990,10 +1003,10 @@ def cross_validate_noise_pcs(
                         n_available = pcs_run.shape[1]
                         n_use = min(n_pcs, n_available)
 
-                        padded = torch.zeros((run_length, n_train_runs * n_pcs), device="cpu")
+                        padded = torch.zeros((run_length, n_train_runs * n_pcs), device=proj_device)
                         start_col = block_idx * n_pcs
                         end_col = start_col + n_use
-                        padded[:, start_col:end_col] = pcs_run[:, :n_use].cpu() if pcs_run.device.type != "cpu" else pcs_run[:, :n_use]
+                        padded[:, start_col:end_col] = pcs_run[:, :n_use].to(proj_device)
 
                         pc_padded_blocks.append(padded)
 
@@ -1002,13 +1015,36 @@ def cross_validate_noise_pcs(
 
                 x_full = torch.cat(components, dim=1)
 
-                # Compute pseudo-inverse for task betas only (on CPU)
-                xtx = x_full.T @ x_full
-                xtx_inv = torch.linalg.pinv(xtx)
-                pinv_full = xtx_inv @ x_full.T
-                pinv_task = pinv_full[:n_task_regs, :]
+                # Compute pseudo-inverse for task betas only (on proj_device = GPU for speed!)
+                # Memory-efficient: Compute (X'X)^-1 @ X' (small matrix)
+                # Numerical stability: Use rcond to handle ill-conditioning
+                #
+                # x_full: (n_timepoints, n_regressors) = (n_tps, n_task + n_pcs)
+                # X'X: (n_regs, n_regs) - small matrix, ~2 MB for 800 regressors
+                # GPU acceleration: 10-100x faster than CPU for SVD/pinv
+                try:
+                    # Try X'X approach first (memory efficient, ~20x less memory than direct pinv)
+                    xtx = x_full.T @ x_full  # (n_regs, n_regs)
+                    xtx_inv = torch.linalg.pinv(xtx, rcond=1e-6)  # Add rcond for stability
+                    pinv_full = xtx_inv @ x_full.T  # (n_regs, n_tps)
+                    pinv_task = pinv_full[:n_task_regs, :]  # (n_task_regs, n_tps)
+                except (torch._C._LinAlgError, RuntimeError) as e:
+                    # Fall back to direct pinv on X (more memory, but more stable)
+                    # Catches both LinAlgError and RuntimeError (MKL errors appear as RuntimeError)
+                    if n_pcs == 0:
+                        # Only warn once per fold
+                        print(f"  Warning: X'X ill-conditioned ({type(e).__name__}), using direct pinv")
+                    try:
+                        pinv_full = torch.linalg.pinv(x_full, rcond=1e-5)  # (n_regs, n_tps)
+                        pinv_task = pinv_full[:n_task_regs, :]  # (n_task_regs, n_tps)
+                    except (torch._C._LinAlgError, RuntimeError):
+                        # Last resort: very conservative rcond
+                        if n_pcs == 0:
+                            print(f"  Warning: Using very conservative rcond=1e-4 for stability")
+                        pinv_full = torch.linalg.pinv(x_full, rcond=1e-4)
+                        pinv_task = pinv_full[:n_task_regs, :]
 
-                # Move only the small result to GPU: (n_task_regs, n_train_tps)
+                # Result already on proj_device, move to final device if different
                 pinv_task_list.append(pinv_task.to(device))
 
             design_test_gpu = design_test_projected.to(device)
@@ -1217,9 +1253,10 @@ def compute_xval_r2_optimal_full(
     # Only move small chunks to GPU for final GLM computation
     proj_device = torch.device("cpu")
 
-    # Move data to CPU if it's on GPU (avoids OOM during indexing/concatenation)
-    data_cpu = data.to(proj_device)
-    design_matrix_cpu = design_matrix.to(proj_device)
+    # CRITICAL: Keep data on CPU, stream chunks to GPU as needed
+    # In single-trial refit, we use CPU for projections to avoid OOM
+    data_cpu = data.cpu() if data.device.type != "cpu" else data
+    design_matrix_cpu = design_matrix.cpu() if design_matrix.device.type != "cpu" else design_matrix
 
     n_runs = len(run_starts)
     n_timepoints = data_cpu.shape[1]

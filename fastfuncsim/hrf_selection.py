@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 from .design import convolve_hrf_microtime
 from .glm_core import GLMResults, construct_polynomial_matrix, fit_glm
 from .hrf import get_hrf_library
-from .memory import estimate_chunk_size
+from .memory import estimate_chunk_size, dyn_chunk_estimator
 from .utils import get_device, to_tensor
 from .xval import (
     compute_xval_r2,
@@ -1035,17 +1035,22 @@ def _fit_voxelwise_hrf_canonical(
     full_design = torch.cat([stim_design, nuisance_design], dim=1)
     stim_indices = list(range(n_conditions))
 
-    # Determine chunk size using memory estimation
-    # This is the simpler case: one design matrix, condition-level (not single-trial)
-    voxel_chunk_size = estimate_chunk_size(
+    # Determine chunk size using dynamic estimator
+    # Simple GLM fit (no CV), condition-level design
+    voxel_chunk_size = dyn_chunk_estimator(
         n_voxels=n_voxels,
         n_timepoints=n_timepoints,
-        n_regressors=full_design.shape[1],
+        n_task_regressors=n_conditions,
+        n_nuisance_regressors=nuisance_design.shape[1],
         device=device,
         operation="glm",
+        cv_strategy=None,  # No cross-validation
+        n_runs=1,
+        data_location="auto",
         min_chunk_size=10000,
-        max_chunk_size=50000 if device.type == "cuda" else 100000,
-        safety_factor=0.4 if device.type == "cuda" else 0.6,
+        max_chunk_size=None,  # Use default from memory.py
+        safety_factor=0.5,
+        verbose=False,  # Don't spam output for simple GLM
     )
 
     n_chunks = (n_voxels + voxel_chunk_size - 1) // voxel_chunk_size
@@ -1239,16 +1244,22 @@ def _fit_voxelwise_hrf_single_trial(
         full_design = torch.cat([st_design, nuisance_design.to(st_design.device)], dim=1)
         n_full_regressors = full_design.shape[1]
 
-        # Determine chunk size using memory estimation
-        voxel_chunk_size = estimate_chunk_size(
+        # Determine chunk size using dynamic estimator
+        # Single-trial GLM (many trial regressors)
+        voxel_chunk_size = dyn_chunk_estimator(
             n_voxels=n_group_voxels,
             n_timepoints=n_timepoints,
-            n_regressors=n_full_regressors,
+            n_task_regressors=st_design.shape[1],  # Number of trials
+            n_nuisance_regressors=nuisance_design.shape[1],
             device=device,
             operation="glm",
+            cv_strategy=None,  # This is final fit, not CV
+            n_runs=len(run_starts),
+            data_location="auto",
             min_chunk_size=10000,
-            max_chunk_size=50000 if device.type == "cuda" else 100000,
-            safety_factor=0.4 if device.type == "cuda" else 0.6,
+            max_chunk_size=None,  # Use default
+            safety_factor=0.5,
+            verbose=False,
         )
 
         n_chunks = (n_group_voxels + voxel_chunk_size - 1) // voxel_chunk_size

@@ -58,8 +58,8 @@ try:
         compute_full_brain_pc_loadings,
         fit_denoising_model,
     )
-    from fastfuncsim.design import convolve_hrf_microtime
-    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
+    from fastfuncsim.design import convolve_hrf_microtime, make_fir_design, make_tent_design
+    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations, parse_hrf_model
     from fastfuncsim.glm_core import construct_polynomial_matrix
     from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
@@ -345,10 +345,18 @@ Notes:
         help="Microtime resolution in seconds (default: 0.1)",
     )
     proc_opts.add_argument(
-        "-canonical",
+        "-hrf_model",
         type=str,
         default="spmg1",
-        help="Canonical HRF mode: 'spmg1' (default) or 'glmsingle'",
+        help="HRF model: 'spmg1' (default), 'glmsingle', 'FIR', 'TENT', or 'TENT(bot,top,n)'. "
+        "FIR/TENT use durations to set window (default: 0 to max(durations)). "
+        "Example: -hrf_model TENT(0,15,6) creates 6 tent bases from 0-15s.",
+    )
+    proc_opts.add_argument(
+        "-canonical",
+        type=str,
+        default=None,
+        help="DEPRECATED: Use -hrf_model instead. Kept for backwards compatibility.",
     )
     proc_opts.add_argument(
         "-do_scale",
@@ -1205,6 +1213,67 @@ def main():
     durations = parse_durations(args.durations, n_conditions, condition_labels)
     print(f"  Durations: {durations}s")
 
+    # Parse HRF model (handle backwards compatibility)
+    if args.canonical is not None:
+        print("  WARNING: -canonical is deprecated, use -hrf_model instead")
+        hrf_model_str = args.canonical
+    else:
+        hrf_model_str = args.hrf_model
+
+    # Parse HRF model string
+    try:
+        hrf_model_name, hrf_params = parse_hrf_model(hrf_model_str)
+    except ValueError as e:
+        print(f"ERROR: Invalid HRF model '{hrf_model_str}': {e}")
+        sys.exit(1)
+
+    # Determine if FIR/TENT or canonical
+    is_fir_model = hrf_model_name in ("FIR", "TENT", "TENTZERO")
+
+    if is_fir_model:
+        # For FIR/TENT, determine window from durations or params
+        if "bot" in hrf_params and "top" in hrf_params:
+            # Explicit window specified (e.g., TENT(0,15,6))
+            fir_bot = hrf_params["bot"]
+            fir_top = hrf_params["top"]
+            if "n_basis" in hrf_params:
+                n_basis = hrf_params["n_basis"]
+            else:
+                # Default: 1 basis per TR
+                n_basis = int(np.ceil((fir_top - fir_bot) / args.tr))
+        else:
+            # Use durations to set window: 0 to max(durations)
+            fir_bot = 0.0
+            fir_top = max(durations)
+            # Default: 1 basis per TR
+            n_basis = int(np.ceil(fir_top / args.tr))
+
+        print(f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, {n_basis} basis functions)")
+
+        # Expand condition labels for FIR: cond1_lag0, cond1_lag1, ..., cond2_lag0, ...
+        fir_condition_labels = []
+        for cond_label in condition_labels:
+            for lag_idx in range(n_basis):
+                lag_time = fir_bot + lag_idx * (fir_top - fir_bot) / max(1, n_basis - 1)
+                fir_condition_labels.append(f"{cond_label}_t{lag_time:.1f}s")
+        # Replace condition_labels with expanded version for FIR
+        condition_labels_full = fir_condition_labels
+    else:
+        print(f"  HRF model: {hrf_model_name} (canonical)")
+        # Canonical: condition labels stay as-is
+        condition_labels_full = condition_labels
+
+    # Check for incompatible options with FIR models
+    if is_fir_model:
+        if args.single_trial:
+            print("ERROR: FIR/TENT models are incompatible with -single_trial")
+            print("  FIR already provides time-resolved estimates; single-trial refitting is redundant")
+            sys.exit(1)
+        if args.hrf_opt:
+            print("ERROR: FIR/TENT models are incompatible with -hrf_opt (per-voxel HRFs)")
+            print("  FIR/TENT use data-driven basis functions, not assumed HRF shapes")
+            sys.exit(1)
+
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
     if args.verbose:
@@ -1407,26 +1476,75 @@ def main():
                         cond_idx,
                     ] = 1.0
 
-    # Convolve design with HRF(s)
+    # Build design matrix based on HRF model
     if hrf_library is None:
-        # Single canonical HRF for all voxels
-        print("  Using canonical SPMG1 HRF for all voxels")
-        hrf = get_spmg1_hrf(
-            microtime_dt=args.microtime_dt,
-            stim_duration=0.0,
-            hrf_duration=32.0,
-            normalize_peak=True,
-            device=device,
-        )
+        # Single HRF model for all voxels
+        if is_fir_model:
+            # FIR/TENT: Use basis functions (no convolution)
+            print(f"  Building {hrf_model_name} design matrix ({n_basis} basis functions per condition)")
 
-        task_design = convolve_hrf_microtime(
-            onsets_microtime=onset_matrix_micro,
-            hrf=hrf,
-            n_timepoints=n_timepoints,
-            tr=args.tr,
-            microtime_dt=args.microtime_dt,
-            device=device,
-        )
+            if hrf_model_name == "FIR":
+                # FIR: Evenly spaced basis functions
+                task_design = make_fir_design(
+                    onsets=all_onsets,  # List of [cond][run] onset arrays
+                    n_lags=n_basis,
+                    tr=args.tr,
+                    n_timepoints=n_timepoints,
+                    run_starts=run_starts,
+                    device=device,
+                )
+            elif hrf_model_name in ("TENT", "TENTZERO"):
+                # TENT: Piecewise linear basis functions
+                task_design = make_tent_design(
+                    onsets=all_onsets,
+                    bot=fir_bot,
+                    top=fir_top,
+                    n_basis=n_basis,
+                    tr=args.tr,
+                    n_timepoints=n_timepoints,
+                    run_starts=run_starts,
+                    zero_edges=(hrf_model_name == "TENTZERO"),
+                    device=device,
+                )
+            else:
+                print(f"ERROR: Unknown FIR model: {hrf_model_name}")
+                sys.exit(1)
+
+            # FIR creates n_conditions × n_basis columns
+            print(f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors")
+            print(f"    ({n_conditions} conditions × {n_basis} basis functions)")
+
+        else:
+            # Canonical HRF: Convolve with assumed shape
+            if hrf_model_name == "spmg1":
+                print("  Using canonical SPMG1 HRF for all voxels")
+                hrf = get_spmg1_hrf(
+                    microtime_dt=args.microtime_dt,
+                    stim_duration=0.0,
+                    hrf_duration=32.0,
+                    normalize_peak=True,
+                    device=device,
+                )
+            elif hrf_model_name == "glmsingle":
+                print("  Using canonical GLMsingle HRF for all voxels")
+                from fastfuncsim.hrf import get_glmsingle_hrf
+                hrf = get_glmsingle_hrf(
+                    microtime_dt=args.microtime_dt,
+                    device=device,
+                )
+            else:
+                print(f"ERROR: Unknown canonical HRF: {hrf_model_name}")
+                sys.exit(1)
+
+            task_design = convolve_hrf_microtime(
+                onsets_microtime=onset_matrix_micro,
+                hrf=hrf,
+                n_timepoints=n_timepoints,
+                tr=args.tr,
+                microtime_dt=args.microtime_dt,
+                device=device,
+            )
+
         # Type assertion for pyright
         assert isinstance(task_design, torch.Tensor), "Expected Tensor for single HRF"
         task_design_per_voxel = None  # Will use single design for all voxels
@@ -1539,7 +1657,12 @@ def main():
 
     # Summary
     if task_design is not None:
-        print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
+        if is_fir_model:
+            # FIR: Show structure, not all labels (too many)
+            print(f"  Task predictors: {task_design.shape[1]} ({n_conditions} conditions × {n_basis} lags)")
+        else:
+            # Canonical: Show condition names
+            print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
         print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
         print(
             f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}"
