@@ -223,9 +223,9 @@ def scale_to_percent_signal(
     mean_per_run = torch.zeros(n_voxels, n_runs, device=device)
     scale_factors = torch.zeros(n_voxels, n_runs, device=device)
 
-    # Track violations
+    # Track violations (keep on CPU to avoid GPU OOM)
     violations_mask = torch.zeros(
-        n_voxels, n_timepoints_total, dtype=torch.bool, device=device
+        n_voxels, n_timepoints_total, dtype=torch.bool, device="cpu"
     )
 
     if verbose:
@@ -258,7 +258,7 @@ def scale_to_percent_signal(
         # Apply ceiling and track violations
         # Values above max_scale (e.g., 200) indicate >100% signal increase
         run_violations = scaled_run > max_scale
-        violations_mask[:, start:end] = run_violations
+        violations_mask[:, start:end] = run_violations.cpu()
 
         # Clip to max_scale (only upper bound - lower values are fine)
         # AFNI uses min(max_scale, scaled_value) - we preserve negative values
