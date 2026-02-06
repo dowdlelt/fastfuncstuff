@@ -1404,7 +1404,7 @@ def build_task_design_from_args(
                 print(f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors")
                 print(f"    ({n_conditions} conditions × {n_basis} basis functions)")
 
-            elif hrf_model_name == "spmg1":
+            elif hrf_model_name == "SPMG1":
                 print("  Using canonical SPMG1 HRF")
                 hrf = get_spmg1_hrf(
                     microtime_dt=microtime_dt,
@@ -1421,7 +1421,7 @@ def build_task_design_from_args(
                     microtime_dt=microtime_dt,
                     device=device,
                 )
-            elif hrf_model_name == "glmsingle":
+            elif hrf_model_name == "GLMSINGLE":
                 print("  Using canonical GLMsingle HRF")
                 from .hrf import get_glmsingle_hrf
                 hrf = get_glmsingle_hrf(
