@@ -1237,7 +1237,7 @@ def main():
     # Check for incompatible options with FIR models
     validate_hrf_compatibility(
         is_fir_model=is_fir_model,
-        single_trial=args.single_trial,
+        single_trial=args.single_trials,
         hrf_opt=args.hrf_opt,
     )
 
