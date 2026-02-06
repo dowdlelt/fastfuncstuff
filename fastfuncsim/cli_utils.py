@@ -1079,7 +1079,7 @@ def parse_hrf_model_args(
     SystemExit
         If HRF model is invalid (prints error and exits)
     """
-    from .design import parse_hrf_model
+    from .design_builder import parse_hrf_model
 
     # Handle backwards compatibility with -canonical
     if canonical_arg is not None:
@@ -1089,12 +1089,19 @@ def parse_hrf_model_args(
         hrf_model_str = hrf_model_arg
 
     # Parse HRF model string
-    try:
-        hrf_model_name, hrf_params = parse_hrf_model(hrf_model_str)
-    except ValueError as e:
-        print(f"ERROR: Invalid HRF model '{hrf_model_str}': {e}")
-        import sys
-        sys.exit(1)
+    # Support both simple names (spmg1, glmsingle) and AFNI format (SPMG1(5), TENT(0,15,6))
+    if "(" in hrf_model_str:
+        # AFNI format with parameters: SPMG1(5), TENT(0,15,6)
+        try:
+            hrf_model_name, hrf_params = parse_hrf_model(hrf_model_str)
+        except ValueError as e:
+            print(f"ERROR: Invalid HRF model '{hrf_model_str}': {e}")
+            import sys
+            sys.exit(1)
+    else:
+        # Simple model name: spmg1, spmg2, spmg3, glmsingle
+        hrf_model_name = hrf_model_str.upper()
+        hrf_params = {}  # No parameters, will use durations from -durations flag
 
     # Determine if FIR/TENT or canonical with derivatives
     is_fir_model = hrf_model_name in ("FIR", "TENT", "TENTZERO")
