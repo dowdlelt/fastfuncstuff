@@ -148,6 +148,36 @@ class TestHRFSelectionSubWorkflows:
         pass
 
 
+class TestHRFSelectionResults:
+    """Test HRFSelectionResults container"""
+
+    def test_hrf_selection_results_initialization(self, device):
+        """Test that HRFSelectionResults can be initialized"""
+        from fastfuncsim.hrf_selection import HRFSelectionResults
+
+        n_voxels = 20
+        n_hrfs = 3
+
+        # Create results object
+        results = HRFSelectionResults()
+
+        # Should have all required attributes (default None)
+        assert hasattr(results, "hrf_index")
+        assert hasattr(results, "xval_r2_best")
+        assert hasattr(results, "xval_r2_all_hrfs")
+        assert hasattr(results, "xval_r2_canonical")
+        assert hasattr(results, "hrf_library")
+        assert hasattr(results, "hrf_metadata")
+
+        # Can set attributes
+        results.hrf_index = torch.zeros(n_voxels, dtype=torch.long, device=device)
+        results.xval_r2_best = torch.randn(n_voxels, device=device)
+        results.xval_r2_all_hrfs = torch.randn(n_voxels, n_hrfs, device=device)
+        results.hrf_metadata = {"mode": "per_voxel", "tr": 2.0}
+
+        assert results.hrf_index.shape == (n_voxels,)
+
+
 # ============================================================================
 # Layer 3: Large/E2E Tests - Full pipeline with ground truth
 # ============================================================================
