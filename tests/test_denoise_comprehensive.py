@@ -143,6 +143,248 @@ class TestDenoiseSubWorkflows:
         pass
 
 
+class TestExtractNoisePCs:
+    """Test noise PC extraction from data"""
+
+    def test_extract_noise_pcs_with_mask(self, device):
+        """Test PC extraction with noise pool mask"""
+        from fastfuncsim.denoise import extract_noise_pcs_per_run
+
+        n_voxels = 100
+        n_timepoints = 200
+        n_noise_voxels = 50
+
+        # Create data with structured noise in noise pool
+        data = torch.randn(n_voxels, n_timepoints, device=device) * 10 + 100
+
+        # Add common noise component to noise pool voxels
+        noise_component = torch.randn(1, n_timepoints, device=device) * 5
+        data[:n_noise_voxels, :] += noise_component
+
+        # Noise pool mask (first 50 voxels)
+        noise_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
+        noise_mask[:n_noise_voxels] = True
+
+        run_starts = [0]
+
+        # Extract PCs
+        pcs_per_run = extract_noise_pcs_per_run(
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=5,
+            variance_threshold=0.95,
+            device=device
+        )
+
+        # Should return list of PCs (one per run)
+        assert len(pcs_per_run) == 1, "Should have 1 run of PCs"
+        pcs = pcs_per_run[0]
+
+        # PCs should capture the common noise structure
+        assert pcs.shape[0] == n_timepoints, f"PCs should have {n_timepoints} timepoints"
+        assert pcs.shape[1] <= 5, f"Should have at most 5 PCs, got {pcs.shape[1]}"
+
+    def test_extract_noise_pcs_returns_empty_for_no_noise(self, device):
+        """Test that empty noise pool returns empty PCs"""
+        from fastfuncsim.denoise import extract_noise_pcs_per_run
+
+        n_voxels = 100
+        n_timepoints = 200
+
+        data = torch.randn(n_voxels, n_timepoints, device=device)
+
+        # Empty noise pool
+        noise_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
+        run_starts = [0]
+
+        # Should handle empty noise pool - need to include last run start
+        run_starts_full = [0, n_timepoints]  # Need end point for last run
+
+        # Since we have no noise voxels, function may raise error or return empty
+        try:
+            pcs_per_run = extract_noise_pcs_per_run(
+                data=data,
+                run_starts=run_starts_full,
+                noise_pool_mask=noise_mask,
+                max_components=5,
+                device=device
+            )
+            # If it succeeds, should have empty PCs for the run
+            assert len(pcs_per_run) == 1
+            assert pcs_per_run[0].shape[1] == 0, "Empty noise pool should return 0 PCs"
+        except (ValueError, RuntimeError):
+            # Also acceptable to raise error for empty noise pool
+            pass
+
+
+class TestCrossValidateNoisePCs:
+    """Test cross-validation for noise PC selection"""
+
+    def test_cross_validate_noise_pcs_returns_arrays(self, device):
+        """Test that CV returns R² maps and summary"""
+        from fastfuncsim.denoise import cross_validate_noise_pcs
+
+        n_voxels = 50
+        n_timepoints = 200
+        n_runs = 2
+        max_components = 3
+        n_trials = 5
+
+        # Create design matrix
+        design_matrix = torch.randn(n_timepoints * n_runs, n_trials, device=device)
+
+        data = torch.randn(n_voxels, n_timepoints * n_runs, device=device)
+        run_starts = [0, n_timepoints]
+
+        # Create simple noise PCs
+        noise_pcs = []
+        for run_idx in range(n_runs):
+            pc = torch.randn(n_timepoints, max_components, device=device)
+            noise_pcs.append(pc)
+
+        # Cross-validate (testing just 0, 1, 2, 3 PCs)
+        r2_maps, r2_summary = cross_validate_noise_pcs(
+            data=data,
+            design_matrix=design_matrix,
+            noise_pcs=noise_pcs,
+            run_starts=run_starts,
+            tr=2.0,
+            max_components=max_components,
+            device=device,
+            verbose=False
+        )
+
+        # Check return types
+        assert isinstance(r2_maps, np.ndarray), "r2_maps should be numpy array"
+        assert isinstance(r2_summary, np.ndarray), "r2_summary should be numpy array"
+
+        # Check shapes
+        assert r2_maps.shape == (n_voxels, max_components + 1), \
+            f"r2_maps should be ({n_voxels}, {max_components + 1})"
+        assert r2_summary.shape == (max_components + 1,), \
+            f"r2_summary should have {max_components + 1} elements"
+
+    def test_cross_validate_noise_pcs_with_design_matrix(self, device):
+        """Test CV with explicit design matrix"""
+        from fastfuncsim.denoise import cross_validate_noise_pcs
+
+        n_voxels = 30
+        n_timepoints = 100
+        n_runs = 2
+        n_trials = 5
+        max_components = 2
+
+        # Create design matrix
+        design_matrix = torch.randn(n_timepoints * n_runs, n_trials, device=device)
+
+        data = torch.randn(n_voxels, n_timepoints * n_runs, device=device)
+        run_starts = [0, n_timepoints]
+
+        # Create noise PCs
+        noise_pcs = [
+            torch.randn(n_timepoints, max_components, device=device),
+            torch.randn(n_timepoints, max_components, device=device),
+        ]
+
+        # Cross-validate with design matrix
+        r2_maps, r2_summary = cross_validate_noise_pcs(
+            data=data,
+            design_matrix=design_matrix,
+            noise_pcs=noise_pcs,
+            run_starts=run_starts,
+            tr=2.0,
+            max_components=max_components,
+            device=device,
+            verbose=False
+        )
+
+        # Should return valid R² values
+        assert np.all(np.isfinite(r2_maps)), "R² maps should be finite"
+        assert np.all(np.isfinite(r2_summary)), "R² summary should be finite"
+
+
+class TestSelectOptimalPCs:
+    """Test optimal PC selection from CV results"""
+
+    def test_select_optimal_pcs_returns_integer(self, device):
+        """Test that optimal PC selection returns integer"""
+        from fastfuncsim.denoise import select_optimal_pcs
+
+        # Create mock R² maps (n_voxels, n_pc_counts)
+        n_voxels = 50
+        max_components = 10
+
+        # Each column is R² for that PC count across all voxels
+        r2_maps = np.random.rand(n_voxels, max_components + 1) * 0.3
+        # Make higher PC counts better
+        for i in range(max_components + 1):
+            r2_maps[:, i] += i * 0.02
+
+        # Select optimal
+        optimal_n_pcs, criteria_mask = select_optimal_pcs(
+            r2_maps=r2_maps,
+            threshold=0.0,
+            metric="median"
+        )
+
+        assert isinstance(optimal_n_pcs, (int, np.integer)), "Should return integer"
+        assert 0 <= optimal_n_pcs <= max_components, f"Should be in range [0, {max_components}]"
+        assert criteria_mask.shape == (n_voxels,), "Criteria mask should match n_voxels"
+
+    def test_select_optimal_pcs_selects_best(self, device):
+        """Test that function selects PC count with highest median R²"""
+        from fastfuncsim.denoise import select_optimal_pcs
+
+        n_voxels = 50
+
+        # Create R² maps where PC=5 is clearly best
+        r2_maps = np.zeros((n_voxels, 11))
+        r2_maps[:, 0] = 0.10  # 0 PCs
+        r2_maps[:, 1] = 0.15  # 1 PC
+        r2_maps[:, 2] = 0.18
+        r2_maps[:, 3] = 0.20
+        r2_maps[:, 4] = 0.22
+        r2_maps[:, 5] = 0.30  # 5 PCs - best
+        r2_maps[:, 6:] = 0.25  # 6+ PCs - worse
+
+        optimal_n_pcs, criteria_mask = select_optimal_pcs(
+            r2_maps=r2_maps,
+            threshold=0.0,
+            metric="median"
+        )
+
+        assert optimal_n_pcs == 5, f"Should select 5 PCs (best R²), got {optimal_n_pcs}"
+
+    def test_select_optimal_pcs_respects_threshold(self, device):
+        """Test that threshold filters criteria voxels"""
+        from fastfuncsim.denoise import select_optimal_pcs
+
+        n_voxels = 50
+
+        # Create R² maps where only some voxels have high R²
+        r2_maps = np.random.rand(n_voxels, 6) * 0.5
+        # First 20 voxels have high R²
+        r2_maps[:20, :] = 0.3 + np.random.rand(20, 6) * 0.2
+
+        # High threshold should select fewer criteria voxels
+        optimal_n_pcs_high, criteria_high = select_optimal_pcs(
+            r2_maps=r2_maps,
+            threshold=0.4,  # High threshold
+            metric="median"
+        )
+
+        optimal_n_pcs_low, criteria_low = select_optimal_pcs(
+            r2_maps=r2_maps,
+            threshold=0.0,  # Low threshold
+            metric="median"
+        )
+
+        # High threshold should have fewer criteria voxels
+        assert criteria_high.sum() <= criteria_low.sum(), \
+            "Higher threshold should select fewer criteria voxels"
+
+
 # ============================================================================
 # Layer 3: Large/E2E Tests - Full pipeline with ground truth
 # ============================================================================
