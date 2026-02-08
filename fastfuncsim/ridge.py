@@ -714,7 +714,7 @@ def _fit_ridge_chunk(
             predictions_by_frac[frac_idx][:, test_tps_tensor] = y_pred_all[:, frac_idx, :].T
 
         # Store cleaned test data (vectorized)
-        actual_test_clean[:, test_tps_tensor] = test_data_clean.T
+        actual_test_clean[:, test_tps_tensor] = test_data_clean
 
     # Compute R² for each fraction (comparing cleaned data to predictions)
     r2_by_frac = torch.zeros(chunk_voxels, n_fracs, device=device)
@@ -1028,10 +1028,12 @@ def fit_ridge_single_trial(
         n_trials = design_matrix.shape[1]
         design_per_voxel_list = None  # Will use single design for all voxels
 
+    # Calculate run lengths (needed for nuisance splitting regardless of polort)
+    run_lengths = np.diff(run_starts + [n_timepoints])
+
     # Auto-determine polort if needed
     if polort is None and nuisance is None:
         # Calculate median run length using pattern from xval.py
-        run_lengths = np.diff(run_starts + [n_timepoints])
         median_run_length = int(np.median(run_lengths))
         run_duration = median_run_length * tr
         polort = int(np.floor(1 + run_duration / 150.0))
@@ -1044,9 +1046,7 @@ def fit_ridge_single_trial(
     poly_per_run = []
     if polort is not None and polort >= 0:
         for run_idx in range(n_runs):
-            start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_length = end_tp - start_tp
+            run_length = run_lengths[run_idx]
             poly = construct_polynomial_matrix(run_length, polort, device=device)
             poly_per_run.append(poly)
 
@@ -1059,14 +1059,12 @@ def fit_ridge_single_trial(
             # Split by runs
             for run_idx in range(n_runs):
                 start_tp = run_starts[run_idx]
-                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                extra_per_run.append(nuisance[start_tp:end_tp, :])
+                run_length = run_lengths[run_idx]
+                extra_per_run.append(nuisance[start_tp:start_tp + run_length, :])
 
     # Combine polynomials + extra regressors (like GLMsingle's combinedmatrix)
     for run_idx in range(n_runs):
-        start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_length = end_tp - start_tp
+        run_length = run_lengths[run_idx]
 
         regressors_for_run = []
         if poly_per_run:
@@ -1287,9 +1285,12 @@ def load_noise_pcs(noise_pc_file: str, run_starts: List[int], n_timepoints: int)
     n_runs = len(run_starts)
     pcs_per_run = []
 
+    # Compute run lengths using the same pattern as slice_by_runs
+    run_lengths = np.diff(run_starts + [n_timepoints])
+
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        pcs_per_run.append(pcs_tensor[start_tp:end_tp, :])
+        run_length = run_lengths[run_idx]
+        pcs_per_run.append(pcs_tensor[start_tp:start_tp + run_length, :])
 
     return pcs_per_run

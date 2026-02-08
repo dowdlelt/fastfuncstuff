@@ -160,12 +160,16 @@ def project_out_nuisance_per_run(
     # Pre-compute QR factorizations using shared helper
     q_factors = compute_qr_projectors(nuisance_per_run, run_starts, device=device)
 
+    # Compute run lengths using the same pattern as slice_by_runs
+    # run_starts contains starting timepoints for each run
+    run_lengths = np.diff(run_starts + [n_timepoints])
+
     # Project design matrix (small, no chunking needed)
     projected_design_runs = []
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_design = design[start_tp:end_tp, :].to(device)  # (run_length, n_task)
+        run_length = run_lengths[run_idx]
+        run_design = design[start_tp:start_tp + run_length, :].to(device)  # (run_length, n_task)
 
         if q_factors[run_idx] is not None:
             # Apply projection using Q: design_proj = design - Q @ (Q.T @ design)
@@ -184,8 +188,8 @@ def project_out_nuisance_per_run(
         projected_data_runs = []
         for run_idx in range(n_runs):
             start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_data = data[:, start_tp:end_tp]  # (n_voxels, run_length)
+            run_length = run_lengths[run_idx]
+            run_data = data[:, start_tp:start_tp + run_length]  # (n_voxels, run_length)
 
             if q_factors[run_idx] is not None:
                 # Move to compute device, project using Q, move back
@@ -214,10 +218,10 @@ def project_out_nuisance_per_run(
             # Process each run for this voxel chunk
             for run_idx in range(n_runs):
                 start_tp = run_starts[run_idx]
-                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                run_length = run_lengths[run_idx]
 
                 # Get chunk data for this run
-                run_chunk_data = data[chunk_start:chunk_end, start_tp:end_tp]
+                run_chunk_data = data[chunk_start:chunk_end, start_tp:start_tp + run_length]
 
                 if q_factors[run_idx] is not None:
                     # Move chunk to compute device, project using Q, store result
@@ -226,12 +230,12 @@ def project_out_nuisance_per_run(
                     # Project: QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
                     QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
                     run_chunk_proj = run_chunk_dev - QQt_data
-                    projected_data[chunk_start:chunk_end, start_tp:end_tp] = run_chunk_proj.cpu()
+                    projected_data[chunk_start:chunk_end, start_tp:start_tp + run_length] = run_chunk_proj.cpu()
 
                     # Free GPU memory
                     del run_chunk_dev, run_chunk_proj
                 else:
-                    projected_data[chunk_start:chunk_end, start_tp:end_tp] = run_chunk_data.cpu()
+                    projected_data[chunk_start:chunk_end, start_tp:start_tp + run_length] = run_chunk_data.cpu()
 
             # Clear GPU cache occasionally (not too frequently - empty_cache is expensive ~10-50ms)
             # Only at the midpoint of processing to avoid memory buildup
@@ -840,6 +844,9 @@ def compute_xval_r2(
     # - Stores full predicted and actual timeseries
     # - Required when we need to average predictions before computing R²
 
+    # Compute run lengths using the same pattern as slice_by_runs
+    run_lengths = np.diff(run_starts + [n_timepoints])
+
     # Check if this is LORO (each timepoint tested exactly once)
     # by verifying test sets are disjoint and cover all timepoints
     all_test_tps = set()
@@ -847,8 +854,8 @@ def compute_xval_r2(
     for _, test_runs in cv_splits:
         for run_idx in test_runs:
             start = run_starts[run_idx]
-            end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            test_tps_run = set(range(start, end))
+            run_length = run_lengths[run_idx]
+            test_tps_run = set(range(start, start + run_length))
             if all_test_tps & test_tps_run:  # Overlap detected
                 is_loro = False
                 break
@@ -975,6 +982,9 @@ def compute_xval_r2(
             n_timepoints, dtype=torch.float32, device=accumulator_device
         )
 
+    # Compute run lengths using the same pattern as slice_by_runs
+    run_lengths = np.diff(run_starts + [n_timepoints])
+
     # Pre-compute timepoint indices for each split (cheap, do once)
     split_info = []
     for train_runs, test_runs in cv_splits:
@@ -982,15 +992,15 @@ def compute_xval_r2(
         train_tps = []
         for run_idx in train_runs:
             start = run_starts[run_idx]
-            end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            train_tps.extend(range(start, end))
+            run_length = run_lengths[run_idx]
+            train_tps.extend(range(start, start + run_length))
 
         # Test timepoints
         test_tps = []
         for run_idx in test_runs:
             start = run_starts[run_idx]
-            end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            test_tps.extend(range(start, end))
+            run_length = run_lengths[run_idx]
+            test_tps.extend(range(start, start + run_length))
 
         split_info.append((train_tps, test_tps))
 
