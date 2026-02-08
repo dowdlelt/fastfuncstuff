@@ -7,7 +7,7 @@ name = "fastfuncsim"
 version = "0.1.0"
 description = "Fast GPU-accelerated functional MRI simulation and GLM fitting"
 authors = [{name = "FastFuncSim Developers"}]
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.23",
     "torch>=2.0",
@@ -22,29 +22,39 @@ where = ["."]
 include = ["fastfuncsim*"]
 exclude = ["tests*", "examples*"]
 
-[tool.pyright]
-include = ["fastfuncsim", "examples"]
-exclude = ["**/node_modules", "**/__pycache__", ".git"]
-typeCheckingMode = "basic"
-reportMissingTypeStubs = false
-reportUnknownMemberType = false
-reportUnknownVariableType = false
-reportUnknownArgumentType = false
-pythonVersion = "3.9"
-pythonPlatform = "All"
+[tool.ty.environment]
+python-version = "3.12"
 
-[tool.mypy]
-python_version = "3.9"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
-check_untyped_defs = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-strict_optional = true
+[tool.ty.rules]
+# Real bugs — keep as errors
+unresolved-reference = "error"
+unresolved-import = "error"
+missing-argument = "error"
+call-non-callable = "error"
+not-iterable = "error"
+invalid-raise = "error"
+invalid-exception-caught = "error"
+division-by-zero = "error"
+
+# Too noisy with torch/numpy stubs — silence
+invalid-argument-type = "ignore"
+not-subscriptable = "ignore"
+invalid-assignment = "ignore"
+unsupported-operator = "ignore"
+no-matching-overload = "ignore"
+invalid-parameter-default = "ignore"
+
+# Too noisy with torch/numpy — silence
+possibly-missing-attribute = "ignore"
+redundant-cast = "ignore"
+
+# Useful but noisy — warn only
+unresolved-attribute = "warn"
+invalid-return-type = "warn"
+unknown-argument = "warn"
+
+[tool.ty.src]
+include = ["fastfuncsim"]
 
 [tool.ruff]
 line-length = 100

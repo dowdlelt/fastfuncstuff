@@ -559,7 +559,7 @@ def plot_parametric_exploration(
     axes = axes.flatten()
 
     # Color map
-    cmap = plt.cm.viridis
+    cmap = plt.cm.viridis  # ty: ignore[unresolved-attribute]
 
     for z_idx, z_val in enumerate(z_vals):
         ax = axes[z_idx]
@@ -1126,7 +1126,7 @@ def plot_denoising_pcs(
         time_axis = np.arange(total_tps) * tr
 
         # Plot each run with different color
-        colors = plt.cm.tab10(np.linspace(0, 1, n_runs))
+        colors = plt.cm.tab10(np.linspace(0, 1, n_runs))  # ty: ignore[unresolved-attribute]
         current_tp = 0
 
         for run_idx, (pcs, color) in enumerate(zip(pcs_np, colors)):

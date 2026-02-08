@@ -362,7 +362,7 @@ def analyze_from_onsets(
 
     if original_shape is not None:
         results.original_shape = original_shape
-        results.full_shape = original_shape  # type: ignore[attr-defined]
+        results.full_shape = original_shape
 
     return results
 
@@ -1068,33 +1068,33 @@ def analyze_from_design_matrix(
 
     if volume_shape is not None:
         results.original_shape = volume_shape
-        results.full_shape = volume_shape  # type: ignore[attr-defined]
+        results.full_shape = volume_shape
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
             results.ols_results.original_shape = volume_shape
-            results.ols_results.full_shape = volume_shape  # type: ignore[attr-defined]
+            results.ols_results.full_shape = volume_shape
 
     if mask_tensor is not None:
-        results.voxel_mask = mask_tensor  # type: ignore[attr-defined]
+        results.voxel_mask = mask_tensor
         design_info["mask_file"] = str(mask_file)
         design_info["mask_threshold"] = mask_threshold
         design_info["mask_voxels"] = int(mask_tensor.sum().item())
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
-            results.ols_results.voxel_mask = mask_tensor  # type: ignore[attr-defined]
+            results.ols_results.voxel_mask = mask_tensor
 
     if affine is not None:
-        results.affine = affine  # type: ignore[attr-defined]
+        results.affine = affine
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
-            results.ols_results.affine = affine  # type: ignore[attr-defined]
+            results.ols_results.affine = affine
 
     # CRITICAL: Attach NIfTI header for perfect output reconstruction
     if nifti_header is not None:
-        results.nifti_header = nifti_header  # type: ignore[attr-defined]
+        results.nifti_header = nifti_header
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
-            results.ols_results.nifti_header = nifti_header  # type: ignore[attr-defined]
+            results.ols_results.nifti_header = nifti_header
 
     # Add scaling info to design_info for cache saving
     design_info["was_scaled"] = was_scaled
@@ -1285,7 +1285,7 @@ def analyze_with_cross_validation(
         # Multiple run files
         data, actual_run_starts = load_and_concatenate_runs(
             fmri_data, device=torch.device("cpu")
-        )  # type: ignore[arg-type]
+        )
         if verbose:
             print(f"  • Loaded {len(fmri_data)} run files")
     elif isinstance(fmri_data, (str, Path)):

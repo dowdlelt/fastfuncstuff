@@ -1462,8 +1462,8 @@ def compute_xval_r2_single_trials(
                 fold_predicted = predicted.cpu()
                 fold_actual = actual.cpu()
             else:
-                fold_predicted = torch.cat([fold_predicted, predicted.cpu()], dim=0)
-                fold_actual = torch.cat([fold_actual, actual.cpu()], dim=0)
+                fold_predicted = torch.cat([fold_predicted, predicted.cpu()], dim=0)  # ty: ignore[unresolved-reference]
+                fold_actual = torch.cat([fold_actual, actual.cpu()], dim=0)  # ty: ignore[unresolved-reference]
 
         all_predicted.append(fold_predicted)
         all_actual.append(fold_actual)

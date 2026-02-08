@@ -454,6 +454,8 @@ def gaussian_blur_3d(
     if verbose:
         print(f"  ✓ Blurred {nt} volumes")
 
+    return data_blurred
+
 
 # ============================================================================
 # Dry run / synthetic data generation

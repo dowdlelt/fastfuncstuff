@@ -1318,7 +1318,7 @@ def get_tr_from_file(filepath: Union[str, Path]) -> float:
     """
     try:
         img = load_nifti(filepath)
-        tr = img.header.get_zooms()[-1]  # Last dimension is time  # type: ignore[attr-defined]
+        tr = img.header.get_zooms()[-1]  # Last dimension is time
         if tr == 0 or tr is None:
             print(f"WARNING: TR not found in {filepath} header, using 1.0")
             return 1.0

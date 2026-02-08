@@ -53,6 +53,10 @@ class GLMResults:
         self.voxel_mask = None  # Optional boolean mask for sparse analyses
         self.full_shape = None  # Original spatial shape before masking
         self.affine = None  # Spatial affine if available
+        self.nifti_header = None  # NIfTI header for output reconstruction (from analysis module)
+        self.hrf_idx = None  # Selected HRF index (from hrf_selection module)
+        self.r2_per_hrf = None  # R² for each HRF in the library (from hrf_selection)
+        self.trial_labels = None  # Trial condition labels (from hrf_selection module)
 
         # GLT contrast results (computed in-loop, not post-hoc)
         self.contrast_labels = None  # List of contrast names
