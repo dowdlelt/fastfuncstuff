@@ -707,6 +707,212 @@ class TestDesignBuilderEdgeCases:
                 os.remove(timing_file)
 
 
+# ============================================================================
+# Tests for design.py core functions (HRF convolution)
+# ============================================================================
+
+import torch
+from fastfuncsim.utils import get_device
+from fastfuncsim.design import convolve_hrf_microtime
+from fastfuncsim.hrf import get_canonical_hrf
+
+
+class TestDesignHrfConvolution:
+    """Test HRF convolution functions in design.py"""
+
+    def test_convolve_hrf_microtime_single_event(self):
+        """Test microtime convolution with single instantaneous event"""
+        device = get_device()
+        tr = 2.0
+        n_timepoints = 50
+        microtime_dt = 0.1
+        bins_per_tr = int(round(tr / microtime_dt))
+
+        # Create onset matrix with single event at timepoint 10 (20 seconds)
+        n_microtime = n_timepoints * bins_per_tr
+        onsets_microtime = torch.zeros(n_microtime, 1, device=device)
+        event_bin = int(round(10 * tr / microtime_dt))  # TR 10 = 20 seconds
+        onsets_microtime[event_bin, 0] = 1.0
+
+        # Get HRF at microtime resolution
+        hrf = get_canonical_hrf(stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device)
+
+        # Convolve
+        design = convolve_hrf_microtime(
+            onsets_microtime=onsets_microtime,
+            hrf=hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+
+        # Check shape
+        assert design.shape == (n_timepoints, 1), f"Expected shape ({n_timepoints}, 1), got {design.shape}"
+
+        # Peak should occur after the event (HRF delay)
+        peak_idx = torch.argmax(design).item()
+        assert peak_idx > 10, f"Peak should be after event at TR 10, got peak at TR {peak_idx}"
+
+        # Peak should be roughly 1.0 (single event scaled to peak=1)
+        peak_value = design.max().item()
+        assert 0.9 < peak_value <= 1.0, f"Single event should peak near 1.0, got {peak_value}"
+
+        # Response should decay to near zero by end
+        assert design[-1, 0].item() < 0.01, "Response should decay to near zero"
+
+    def test_convolve_hrf_microtime_multiple_events(self):
+        """Test microtime convolution with multiple events"""
+        device = get_device()
+        tr = 2.0
+        n_timepoints = 50
+        microtime_dt = 0.1
+        bins_per_tr = int(round(tr / microtime_dt))
+
+        # Create onset matrix with events at TRs 10, 20, 30
+        n_microtime = n_timepoints * bins_per_tr
+        onsets_microtime = torch.zeros(n_microtime, 1, device=device)
+        for event_tr in [10, 20, 30]:
+            event_bin = int(round(event_tr * tr / microtime_dt))
+            onsets_microtime[event_bin, 0] = 1.0
+
+        hrf = get_canonical_hrf(stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device)
+
+        design = convolve_hrf_microtime(
+            onsets_microtime=onsets_microtime,
+            hrf=hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+
+        # Should have three peaks
+        # Find local maxima
+        from scipy.signal import find_peaks
+        peaks, _ = find_peaks(design[:, 0].cpu().numpy(), height=0.1)
+        assert len(peaks) == 3, f"Should have 3 peaks for 3 events, got {len(peaks)}"
+
+        # Each peak should be around 1.0 (events don't overlap)
+        assert design.max().item() <= 1.0, "Non-overlapping events should peak at 1.0"
+
+    def test_convolve_hrf_microtime_overlapping_events(self):
+        """Test that overlapping events sum linearly"""
+        device = get_device()
+        tr = 2.0
+        n_timepoints = 30
+        microtime_dt = 0.1
+        bins_per_tr = int(round(tr / microtime_dt))
+
+        # Two events close together (will overlap)
+        n_microtime = n_timepoints * bins_per_tr
+        onsets_microtime = torch.zeros(n_microtime, 1, device=device)
+
+        # Events at TR 10 and 12 (only 4 seconds apart)
+        event_bin1 = int(round(10 * tr / microtime_dt))
+        event_bin2 = int(round(12 * tr / microtime_dt))
+        onsets_microtime[event_bin1, 0] = 1.0
+        onsets_microtime[event_bin2, 0] = 1.0
+
+        hrf = get_canonical_hrf(stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device)
+
+        design = convolve_hrf_microtime(
+            onsets_microtime=onsets_microtime,
+            hrf=hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+
+        # Overlapping events should sum to > 1.0
+        peak_value = design.max().item()
+        assert peak_value > 1.0, f"Overlapping events should sum > 1.0, got {peak_value}"
+
+    def test_convolve_hrf_microtime_boxcar_stimulus(self):
+        """Test convolution with boxcar (sustained) stimulus"""
+        device = get_device()
+        tr = 2.0
+        n_timepoints = 50
+        microtime_dt = 0.1
+        bins_per_tr = int(round(tr / microtime_dt))
+
+        # Create boxcar stimulus (10 seconds duration)
+        n_microtime = n_timepoints * bins_per_tr
+        onsets_microtime = torch.zeros(n_microtime, 1, device=device)
+
+        start_bin = int(round(10 * tr / microtime_dt))
+        duration_bins = int(round(10.0 / microtime_dt))  # 10 second duration
+        onsets_microtime[start_bin:start_bin + duration_bins, 0] = 1.0
+
+        hrf = get_canonical_hrf(stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device)
+
+        design = convolve_hrf_microtime(
+            onsets_microtime=onsets_microtime,
+            hrf=hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+
+        # Boxcar response should be more sustained than single event
+        # Check that response stays elevated during stimulus
+        stimulus_end_tr = 10 + 5  # 10s start + 10s duration = 20s = TR 10, plus some HRF tail
+
+        # Response should be > 0 during much of the stimulus period
+        mid_stimulus_response = design[12:15, 0].mean().item()  # TR 12-15 (during stimulus)
+        assert mid_stimulus_response > 0.3, f"Response should be elevated during stimulus, got {mid_stimulus_response}"
+
+    def test_convolve_hrf_microtime_empty_onsets(self):
+        """Test convolution with no events"""
+        device = get_device()
+        tr = 2.0
+        n_timepoints = 50
+        microtime_dt = 0.1
+        bins_per_tr = int(round(tr / microtime_dt))
+
+        # Empty onset matrix
+        n_microtime = n_timepoints * bins_per_tr
+        onsets_microtime = torch.zeros(n_microtime, 1, device=device)
+
+        hrf = get_canonical_hrf(stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device)
+
+        design = convolve_hrf_microtime(
+            onsets_microtime=onsets_microtime,
+            hrf=hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+
+        # Should be all zeros
+        assert torch.all(design == 0), "Empty onsets should produce zero design"
+
+    def test_convolve_hrf_microtime_wrong_dimensions(self):
+        """Test that wrong dimensions raise error"""
+        device = get_device()
+        tr = 2.0
+        n_timepoints = 50
+        microtime_dt = 0.1
+
+        # Wrong number of microtime points
+        n_microtime_wrong = 100  # Wrong!
+        onsets_microtime = torch.zeros(n_microtime_wrong, 1, device=device)
+        hrf = get_canonical_hrf(stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device)
+
+        with pytest.raises(ValueError, match="onsets_microtime has.*points, expected"):
+            convolve_hrf_microtime(
+                onsets_microtime=onsets_microtime,
+                hrf=hrf,
+                n_timepoints=n_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                device=device,
+            )
+
+
 if __name__ == "__main__":
     # Run tests
     test_spm_canonical_hrf()
@@ -719,7 +925,7 @@ if __name__ == "__main__":
     test_glt_parsing()
     test_im_mode()
     test_goodlist_utilities()
-    
+
     # Run new tests
     pytest.main([__file__, "-v"])
 
