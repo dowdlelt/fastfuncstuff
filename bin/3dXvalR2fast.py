@@ -356,7 +356,6 @@ def main():
         zero_event_strategy=args.zero_event,
         device=device,
         batch_size=args.batch_size,
-        data_chunk_size=args.data_chunk_size,
         verbose=True,
     )
 

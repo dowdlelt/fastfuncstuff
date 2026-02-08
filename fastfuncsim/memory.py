@@ -19,8 +19,8 @@ import torch
 
 # Default configuration
 DEFAULT_MIN_CHUNK_SIZE = 1000
-DEFAULT_MAX_CHUNK_SIZE_GPU = 100000
-DEFAULT_MAX_CHUNK_SIZE_CPU = 400000
+DEFAULT_MAX_CHUNK_SIZE_GPU = 90000
+DEFAULT_MAX_CHUNK_SIZE_CPU = 350000
 DEFAULT_GPU_MEMORY_SAFETY_FACTOR = 0.5  # Use 50% of available GPU memory
 DEFAULT_CPU_MEMORY_THRESHOLD_GB = 4.0  # Use GPU-like chunks if data < 4GB
 
@@ -127,12 +127,19 @@ def bytes_per_voxel_xval(
 
     Notes
     -----
-    Memory model: (6 * n_timepoints + max(n_regressors, 10)) * 4 bytes
+    Memory model: (8 * n_timepoints + max(n_regressors, 10)) * 4 bytes
     - Includes GLM requirements (5 * n_timepoints + n_regressors)
-    - Plus projection overhead: n_timepoints * 4 bytes
+    - Plus projection overhead: 3 * n_timepoints * 4 bytes
+      * train_data_batch.T: n_timepoints * batch_voxels
+      * Q_train.T @ train_data_batch.T: n_nuisance * batch_voxels (smaller)
+      * Q_train @ (...): n_timepoints * batch_voxels (largest intermediate)
     - Plus cross-validation intermediates
     """
-    return (6 * n_timepoints + max(n_regressors, 10)) * 4
+    # FIXED: Account for transpose intermediate matrix in projection
+    # The operation (Q_train @ (Q_train.T @ train_data_batch.T)).T
+    # creates an intermediate of size (n_timepoints, batch_voxels)
+    # This requires 2 additional n_timepoints worth of memory per voxel
+    return (8 * n_timepoints + max(n_regressors, 10)) * 4
 
 
 def bytes_per_voxel_ridge(

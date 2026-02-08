@@ -1115,7 +1115,6 @@ def analyze_with_cross_validation(
     mask_file: Optional[Union[str, Path]] = None,
     mask_threshold: float = 0.0,
     batch_size: Optional[int] = None,
-    data_chunk_size: Optional[int] = None,
     test_n_voxels: Optional[int] = None,
     verbose: bool = True,
 ) -> Tuple[Dict[str, Union[torch.Tensor, int]], Dict]:
@@ -1168,8 +1167,6 @@ def analyze_with_cross_validation(
         Threshold for mask (voxels > threshold are included)
     batch_size : int, optional
         Voxels per batch for projection (auto-detected if None)
-    data_chunk_size : int, optional
-        Number of voxels to load to GPU at once (auto-detected if None)
     test_n_voxels : int, optional
         If provided, only process first N voxels (for testing)
     verbose : bool, default=True
@@ -1360,7 +1357,6 @@ def analyze_with_cross_validation(
         zero_event_strategy=zero_event_strategy,
         device=device,
         batch_size=batch_size,
-        data_chunk_size=data_chunk_size,
         verbose=verbose,
     )
 
