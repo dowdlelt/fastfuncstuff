@@ -76,7 +76,7 @@ class TestSimulationBasedGLM:
             data_list.append(data)
 
         # Concatenate runs
-        data_all = torch.cat([d.reshape(-1, n_timepoints) for d in data_list], dim=0)  # (n_voxels, total_tp)
+        data_all = torch.cat([d.reshape(-1, n_timepoints) for d in data_list], dim=1)  # (n_voxels, total_tp)
         design_all = torch.cat([onsets for onsets in onsets_list], dim=0)  # (total_tp, n_cond)
 
         # Convolve design with HRF
@@ -322,7 +322,7 @@ class TestCrossValidation:
             data_list.append(data)
 
         # Flatten for CV
-        data_all = torch.cat([d.reshape(-1, n_timepoints) for d in data_list], dim=0)
+        data_all = torch.cat([d.reshape(-1, n_timepoints) for d in data_list], dim=1)
 
         # Build run-wise design
         from fastfuncsim.design import build_glm_design

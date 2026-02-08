@@ -94,7 +94,7 @@ class TestDenoiseWorkflow:
             design_conv = build_glm_design(onsets, hrf, n_timepoints, mode='assumed', device=device)
             design_list.append(design_conv)
 
-        data_all = torch.cat(data_list, dim=0)  # (n_voxels, total_tp)
+        data_all = torch.cat(data_list, dim=1)  # (n_voxels, total_tp) - concatenate along time dimension
 
         # Build polynomial nuisance (block-diagonal per run)
         poly = construct_polynomial_matrix(n_timepoints * n_runs, max_degree=2, device=device)

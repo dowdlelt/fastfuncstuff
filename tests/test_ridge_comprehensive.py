@@ -226,11 +226,6 @@ class TestRidgeSubWorkflows:
 class TestRidgeFullPipeline:
     """Test full ridge regression pipeline with ground truth verification."""
 
-    @pytest.mark.skip(
-        reason="TODO: Investigate test setup - see test_cv_fraction_selection_with_simulation. "
-        "Need to understand how fit_ridge_single_trial processes design_matrix before "
-        "testing ground truth recovery."
-    )
     def test_ridge_recovers_known_single_trial_betas(self, device):
         """Test that ridge can recover known single-trial betas."""
         tr = 2.0
@@ -280,13 +275,26 @@ class TestRidgeFullPipeline:
                 device=device,
             )
 
+        print(f"  Design matrix shape: {design_matrix.shape}")
+        print(f"  Condition design shape: {condition_design.shape}")
+        print(f"  Trial condition IDs: {trial_condition_ids}")
+        print(f"  Design matrix sum: {design_matrix.sum().item():.4f}")
+        print(f"  Condition design sum: {condition_design.sum().item():.4f}")
+
         # Generate data using TRUE single-trial betas
         # data = design @ true_betas + noise
         data_noiseless = design_matrix @ true_single_trial_betas  # (n_timepoints * n_runs,)
+        print(f"  Data noiseless shape: {data_noiseless.shape}")
+        print(f"  Data noiseless mean: {data_noiseless.mean().item():.4f}, std: {data_noiseless.std().item():.4f}")
+        print(f"  Data noiseless first 10: {data_noiseless[:10]}")
+
         data_noiseless = data_noiseless.unsqueeze(0).expand(n_voxels, -1)  # Broadcast to all voxels
 
         # Add noise
         data = data_noiseless + 1.5 * torch.randn_like(data_noiseless) + 100.0
+
+        print(f"  Data final shape: {data.shape}")
+        print(f"  Data final mean: {data.mean().item():.4f}, std: {data.std().item():.4f}")
 
         # Create CV splits
         cv_splits = generate_cv_splits(n_runs=n_runs, strategy=1, n_perms=1)
@@ -303,6 +311,12 @@ class TestRidgeFullPipeline:
 
         # Fit ridge
         fracs = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        print(f"  Data shape: {data.shape}")
+        print(f"  Design matrix shape: {design_matrix.shape}")
+        print(f"  Condition design shape: {condition_design.shape}")
+        print(f"  Data mean: {data.mean().item():.2f}, std: {data.std().item():.2f}")
+        print(f"  Design matrix mean: {design_matrix.mean().item():.4f}, std: {design_matrix.std().item():.4f}")
+
         results = fit_ridge_single_trial(
             data=data,
             design_matrix=design_matrix,
@@ -316,15 +330,22 @@ class TestRidgeFullPipeline:
             cv_splits=cv_splits,
             autoscale=True,
             device=device,
-            verbose=False,
+            verbose=True,  # Enable verbose to see what's happening
         )
 
         # Check that we recovered the single-trial betas
         # Use mean voxel to check correlation
         estimated_betas = results.betas_single_trial.mean(dim=0)  # (n_trials,)
 
-        # Correlation between true and estimated
-        correlation = torch.corrcoef(torch.stack([true_single_trial_betas, estimated_betas]))[0, 1].item()
+        print(f"  True betas shape: {true_single_trial_betas.shape}")
+        print(f"  Estimated betas shape: {estimated_betas.shape}")
+        print(f"  True betas: {true_single_trial_betas[:5]}")
+        print(f"  Estimated betas: {estimated_betas[:5]}")
+        print(f"  Estimated betas has NaN: {torch.isnan(estimated_betas).any()}")
+        print(f"  R² median: {results.r2.median().item():.4f}")
+
+        # Correlation between true and estimated (ensure same device)
+        correlation = torch.corrcoef(torch.stack([true_single_trial_betas, estimated_betas.to(device)]))[0, 1].item()
 
         print(f"  True-estimated beta correlation: {correlation:.3f}")
 
@@ -422,7 +443,7 @@ class TestRidgeFullPipeline:
             )
             data_list.append(data.reshape(-1, n_timepoints))
 
-        data_all = torch.cat(data_list, dim=0)
+        data_all = torch.cat(data_list, dim=1)  # Concatenate along time dimension
 
         # Fit ridge with per-voxel designs
         cv_splits = generate_cv_splits(n_runs=n_runs, strategy=1, n_perms=1)

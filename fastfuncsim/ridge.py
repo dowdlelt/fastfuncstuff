@@ -367,9 +367,14 @@ def create_single_trial_design(
 
         # Set boxcar (handle edge cases)
         start_bin = max(0, onset_bin)
-        end_bin = min(n_microtime, onset_bin + duration_bins)
-        if end_bin > start_bin:
-            onset_matrix_micro[start_bin:end_bin, trial_idx] = 1.0
+        if duration_bins == 0:
+            # Instantaneous event: set single bin
+            onset_matrix_micro[start_bin, trial_idx] = 1.0
+        else:
+            # Boxcar event: set range
+            end_bin = min(n_microtime, onset_bin + duration_bins)
+            if end_bin > start_bin:
+                onset_matrix_micro[start_bin:end_bin, trial_idx] = 1.0
 
     # Apply HRF convolution (with optional derivatives for SPMG2/SPMG3)
     if hrf_index_per_voxel is None:
@@ -451,12 +456,13 @@ def create_single_trial_design(
         else:
             # Standard single-basis (SPMG1, glmsingle)
             if hrf_library is None or len(hrf_library) == 0:
-                # Use canonical HRF
+                # Use canonical HRF at microtime resolution (NOT TR resolution!)
+                # convolve_hrf_microtime expects HRF at the same microtime_dt as the onset matrix
                 hrf = get_canonical_hrf(
-                    stim_duration=0.0, tr=tr, duration=32.0, device=device
+                    stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device
                 )
             else:
-                # Use first HRF from library
+                # Use first HRF from library (should already be at microtime resolution)
                 hrf = hrf_library[0].to(device)
 
             # Convolve - returns (n_timepoints, n_trials)
