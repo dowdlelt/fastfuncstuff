@@ -54,10 +54,10 @@ try:
     )
     from fastfuncsim.hrf import get_hrf_library
     from fastfuncsim.hrf_selection import (
-        fit_glm_hrf_library_with_xval,
-        save_hrf_selection_results,
         _fit_voxelwise_hrf_canonical,
         _fit_voxelwise_hrf_single_trial,
+        fit_glm_hrf_library_with_xval,
+        save_hrf_selection_results,
     )
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -288,23 +288,23 @@ Notes:
         "-single_trials",
         action="store_true",
         help="Use beta-space cross-validation (GLMsingle-style). "
-             "Fits single-trial model once with each HRF, evaluates R² on "
-             "condition-averaged vs individual trial betas across folds. "
-             "Replaces timeseries CV with beta-space CV for HRF selection.",
+        "Fits single-trial model once with each HRF, evaluates R² on "
+        "condition-averaged vs individual trial betas across folds. "
+        "Replaces timeseries CV with beta-space CV for HRF selection.",
     )
     cv_opts.add_argument(
         "-save_single_trial_betas",
         action="store_true",
         help="Save single-trial betas refit with optimal HRF per voxel. "
-             "Only works with -single_trials. Processes voxels in HRF groups "
-             "with chunking to avoid OOM. Saves to {prefix}_stats_single_trial.nii.gz",
+        "Only works with -single_trials. Processes voxels in HRF groups "
+        "with chunking to avoid OOM. Saves to {prefix}_stats_single_trial.nii.gz",
     )
     cv_opts.add_argument(
         "-save_canonical_betas",
         action="store_true",
         help="Also save betas from canonical HRF fit for comparison. "
-             "Uses one design matrix for all voxels (chunked). "
-             "Saves to {prefix}_canonical_stats.nii.gz",
+        "Uses one design matrix for all voxels (chunked). "
+        "Saves to {prefix}_canonical_stats.nii.gz",
     )
 
     # Processing options
@@ -395,6 +395,12 @@ Notes:
         "-verbose",
         action="store_true",
         help="Print detailed progress information",
+    )
+    proc_opts.add_argument(
+        "-debug",
+        action="store_true",
+        help="Full diagnostic mode: saves design figures, runs comparison R² paths, "
+        "prints per-run statistics. Implies -verbose. Use when R² values look wrong.",
     )
     proc_opts.add_argument(
         "-dry_run",
@@ -504,6 +510,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Debug implies verbose
+    if args.debug:
+        args.verbose = True
+
     print_header(args)
 
     # ==========================================================================
@@ -545,7 +555,9 @@ def main():
     print(f"  Device: {device}")
 
     # Load and preprocess data using shared utility
-    # This handles: metadata extraction, blur, masking, scaling, device strategy
+    # This handles: metadata extraction, blur, masking, scaling, device strategy.
+    # Always force CPU: data stays in RAM, GPU used only for computation with
+    # chunk streaming. This prevents OOM on load and avoids duplicate data on GPU.
     load_result = load_and_preprocess_runs(
         input_files=input_files,
         tr=args.tr,
@@ -553,7 +565,7 @@ def main():
         blur_fwhm=args.do_blur,
         do_scale=args.do_scale,
         device=device,
-        force_cpu=args.keep_on_cpu,
+        force_cpu=True,  # Data always on CPU; GPU used for compute only
         dry_run=args.dry_run,
         verbose=True,
     )
@@ -562,7 +574,7 @@ def main():
     if args.dry_run:
         args.prefix = f"dry_run_{args.prefix}"
 
-    # Extract results
+    # Extract results (these are reference copies, not deep copies — no memory duplication)
     data = load_result.data
     run_starts = load_result.run_starts
     affine = load_result.affine
@@ -739,21 +751,29 @@ def main():
                 device=device,
             )
 
-            # Build wide design: [single_trial | nuisance]
-            full_design = torch.cat([st_design, nuisance_design], dim=1)
-            task_indices = list(range(st_design.shape[1]))
-
-            # Fit OLS on full data
+            # Fit OLS: pass task design + nuisance separately to avoid duplicate intercept
             glm_results = fit_glm(
-                data, full_design, tr=args.tr, max_poly_degree=0,
-                device=device, verbose=False, task_indices=task_indices)
+                data,
+                st_design,  # Task-only design
+                tr=args.tr,
+                max_poly_degree=-1,  # No extra polynomials — already in nuisance_design
+                extra_regressors=nuisance_design,  # Nuisance passed separately
+                device=device,
+                verbose=False,
+            )
 
             # Beta-space CV
             st_betas = glm_results.betas  # (n_voxels, n_trials)
             xval = compute_xval_r2_single_trials(
-                st_betas, cond_ids, run_ids, cv_splits,
-                metric=args.metric, device=device, verbose=False)
-            xval_r2_all[:, hrf_idx] = xval['r2']
+                st_betas,
+                cond_ids,
+                run_ids,
+                cv_splits,
+                metric=args.metric,
+                device=device,
+                verbose=False,
+            )
+            xval_r2_all[:, hrf_idx] = xval["r2"]
 
         # Select best HRF per voxel
         hrf_index = xval_r2_all.argmax(dim=1)
@@ -788,13 +808,9 @@ def main():
                 "n_hrfs": n_hrfs,
                 "cv_strategy": cv_strategy,
                 "hrf_usage_counts": hrf_usage_counts,
-            }
+            },
         )
 
-        # ==========================================================================
-        # 5b. Optional: Refit with canonical/optimal HRFs for single-trial betas
-        # ==========================================================================
-        # Note: This section only applies to beta-space CV path (single-trial mode)
         if args.save_canonical_betas:
             print()
             print("Fitting canonical HRF for comparison...")
@@ -820,6 +836,10 @@ def main():
             results.canonical_results = canonical_results
             print("  Canonical fit complete.")
 
+        # ==========================================================================
+        # 5b. Optional: Refit with canonical/optimal HRFs for single-trial betas
+        # ==========================================================================
+        # Note: This section only applies to beta-space CV path (single-trial mode)
         if args.save_single_trial_betas:
             print()
             print("Refitting with optimal HRF per voxel (single-trial betas)...")
@@ -848,9 +868,8 @@ def main():
             results.final_results = final_results
             print("  Single-trial refit complete.")
 
-
     else:
-        # ========== EXISTING TIMESERIES CV PATH (unchanged) ==========
+        # ========== EXISTING Beta @ Design TIMESERIES CV PATH ==========
         results = fit_glm_hrf_library_with_xval(
             data=data,
             onsets=onset_matrix,
@@ -869,6 +888,9 @@ def main():
             verbose=args.verbose,
             chunk_size=args.batch_size,
             r2_method=args.R2method,
+            debug=args.debug,
+            debug_prefix=args.prefix,
+            condition_labels=condition_labels,
         )
 
     # Update metadata with CLI parameters
@@ -905,7 +927,9 @@ def main():
     final_results_temp = results.final_results
 
     if args.save_single_trial_betas and results.final_results is not None:
-        results.final_results = None  # Temporarily remove to prevent save_hrf_selection_results from saving it
+        results.final_results = (
+            None  # Temporarily remove to prevent save_hrf_selection_results from saving it
+        )
 
     output_files = save_hrf_selection_results(
         results=results,
