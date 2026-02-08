@@ -1281,14 +1281,6 @@ def create_onset_matrix_microtime(
     n_conditions = len(all_onsets)
     n_runs = len(run_starts)
 
-    # Compute run lengths in TRs
-    run_lengths = []
-    for i in range(n_runs):
-        if i < n_runs - 1:
-            run_lengths.append(run_starts[i + 1] - run_starts[i])
-        else:
-            run_lengths.append(n_timepoints - run_starts[i])
-
     # Initialize onset matrix
     onset_matrix = torch.zeros((n_microtime, n_conditions), dtype=torch.float32, device=device)
 
@@ -1296,25 +1288,20 @@ def create_onset_matrix_microtime(
         duration = stim_durations[cond_idx]
         duration_bins = max(1, int(np.round(duration / microtime_dt)))
 
-        # Boxcar value is 1.0 (AFNI convention)
-        # The convolution function scales by dt, so the integral is properly computed.
-        # Result: A 3s event produces ~3x larger response than a 1s event (block scaling)
-        boxcar_value = 1.0
-
         for run_idx in range(n_runs):
             onsets = all_onsets[cond_idx][run_idx]
-            run_start_tr = run_starts[run_idx]
+            # Use bins_per_tr-based offset to stay consistent with convolve_hrf_microtime's
+            # sampling grid. convolve_hrf_microtime downsamples at every bins_per_tr bins,
+            # so run boundaries must align to that grid, not to real-time seconds.
+            run_start_micro = run_starts[run_idx] * bins_per_tr
 
             for onset_time in onsets:
-                # Convert onset time (seconds) to microtime bin
-                # onset_time is relative to run start
-                global_time = run_start_tr * tr + onset_time
-                microtime_bin = int(np.round(global_time / microtime_dt))
+                # onset_time is relative to run start, in seconds
+                onset_bin = run_start_micro + int(np.round(onset_time / microtime_dt))
 
-                if 0 <= microtime_bin < n_microtime:
-                    # Place boxcar
-                    end_bin = min(microtime_bin + duration_bins, n_microtime)
-                    onset_matrix[microtime_bin:end_bin, cond_idx] = boxcar_value
+                if 0 <= onset_bin < n_microtime:
+                    end_bin = min(onset_bin + duration_bins, n_microtime)
+                    onset_matrix[onset_bin:end_bin, cond_idx] = 1.0
 
     return onset_matrix
 

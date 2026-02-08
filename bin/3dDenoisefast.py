@@ -59,7 +59,7 @@ try:
         fit_denoising_model,
     )
     from fastfuncsim.design import convolve_hrf_microtime, make_fir_design, make_tent_design
-    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations, parse_hrf_model
+    from fastfuncsim.design_builder import create_onset_matrix_microtime, parse_afni_timing_file, parse_durations, parse_hrf_model
     from fastfuncsim.glm_core import construct_polynomial_matrix
     from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
@@ -1422,26 +1422,17 @@ def main():
             sys.exit(1)
         all_onsets.append(onsets_by_run)
 
-    # Build onset matrix at microtime resolution
-    bins_per_tr = int(np.round(args.tr / args.microtime_dt))
-    n_microtime = n_timepoints * bins_per_tr
-    onset_matrix_micro = torch.zeros((n_microtime, n_conditions), device=device)
-
-    for cond_idx in range(n_conditions):
-        duration_bins = max(1, int(np.round(durations[cond_idx] / args.microtime_dt)))
-
-        for run_idx in range(n_runs):
-            onsets = all_onsets[cond_idx][run_idx]
-            run_start_tr = run_starts[run_idx]
-            run_start_micro = run_start_tr * bins_per_tr
-
-            for onset_time in onsets:
-                onset_bin = run_start_micro + int(np.round(onset_time / args.microtime_dt))
-                if onset_bin < n_microtime:
-                    onset_matrix_micro[
-                        onset_bin : min(onset_bin + duration_bins, n_microtime),
-                        cond_idx,
-                    ] = 1.0
+    # Build onset matrix at microtime resolution (shared function ensures
+    # grid-consistent bin placement matching convolve_hrf_microtime)
+    onset_matrix_micro = create_onset_matrix_microtime(
+        all_onsets=all_onsets,
+        run_starts=run_starts,
+        tr=args.tr,
+        n_timepoints=n_timepoints,
+        microtime_dt=args.microtime_dt,
+        stim_durations=durations,
+        device=device,
+    )
 
     # Build design matrix based on HRF model
     from fastfuncsim.cli_utils import build_task_design_from_args
