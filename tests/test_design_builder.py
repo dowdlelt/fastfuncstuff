@@ -913,6 +913,234 @@ class TestDesignHrfConvolution:
             )
 
 
+class TestDesignConvolveHrfBasic:
+    """Test basic convolve_hrf() function (non-microtime)"""
+
+    def test_convolve_hrf_single_event(self):
+        """Test basic HRF convolution with single event"""
+        from fastfuncsim.design import convolve_hrf
+
+        device = get_device()
+        n_timepoints = 50
+        n_conditions = 2
+
+        # Create onset matrix with events at different timepoints
+        onsets = torch.zeros(n_timepoints, n_conditions, device=device)
+        onsets[10, 0] = 1.0  # Event at TR 10 for condition 0
+        onsets[20, 1] = 1.0  # Event at TR 20 for condition 1
+
+        # Create simple HRF (just a few timepoints)
+        hrf = torch.tensor([0.0, 0.5, 1.0, 0.5, 0.0], device=device)
+
+        # Convolve
+        design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+
+        # Check shape
+        assert design.shape == (n_timepoints, n_conditions), \
+            f"Expected shape ({n_timepoints}, {n_conditions}), got {design.shape}"
+
+        # Peak should occur after the event
+        peak_cond0 = torch.argmax(design[:, 0]).item()
+        peak_cond1 = torch.argmax(design[:, 1]).item()
+        assert peak_cond0 > 10, f"Peak should be after event at TR 10, got {peak_cond0}"
+        assert peak_cond1 > 20, f"Peak should be after event at TR 20, got {peak_cond1}"
+
+    def test_convolve_hrf_multiple_conditions(self):
+        """Test convolve_hrf with multiple conditions"""
+        from fastfuncsim.design import convolve_hrf
+
+        device = get_device()
+        n_timepoints = 100
+        n_conditions = 5
+
+        # Create random onset matrix
+        onsets = torch.zeros(n_timepoints, n_conditions, device=device)
+        for cond in range(n_conditions):
+            # Add 3-5 random events per condition
+            for _ in range(5):
+                event_tp = torch.randint(10, 80, (1,)).item()
+                onsets[event_tp, cond] = 1.0
+
+        hrf = torch.tensor([0.0, 0.3, 0.8, 1.0, 0.7, 0.3, 0.0], device=device)
+
+        design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+
+        # All conditions should have non-zero design
+        assert design.shape == (n_timepoints, n_conditions)
+        for cond in range(n_conditions):
+            assert design[:, cond].sum() > 0, f"Condition {cond} should have non-zero response"
+
+    def test_convolve_hrf_empty_onsets(self):
+        """Test convolve_hrf with all-zero onset matrix"""
+        from fastfuncsim.design import convolve_hrf
+
+        device = get_device()
+        n_timepoints = 50
+
+        onsets = torch.zeros(n_timepoints, 2, device=device)
+        hrf = torch.tensor([0.0, 0.5, 1.0, 0.5, 0.0], device=device)
+
+        design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+
+        # Should be all zeros
+        assert torch.all(design == 0), "Empty onsets should produce zero design"
+
+    def test_convolve_hrf_1d_input(self):
+        """Test that 1D onset matrix is handled correctly"""
+        from fastfuncsim.design import convolve_hrf
+
+        device = get_device()
+        n_timepoints = 50
+
+        # 1D input (single condition)
+        onsets = torch.zeros(n_timepoints, device=device)
+        onsets[10] = 1.0
+        onsets[20] = 1.0
+
+        hrf = torch.tensor([0.0, 0.5, 1.0, 0.5, 0.0], device=device)
+
+        design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
+
+        # Should return (n_timepoints, 1) shape
+        assert design.shape == (n_timepoints, 1)
+        assert design[:, 0].sum() > 0
+
+
+class TestDesignIsTrLocked:
+    """Test is_tr_locked() function"""
+
+    def test_is_tr_locked_exact(self):
+        """Test is_tr_locked with exact TR multiples"""
+        from fastfuncsim.design import is_tr_locked
+
+        tr = 2.0
+
+        # Exact TR multiples should be TR-locked
+        assert is_tr_locked([0.0, 2.0, 4.0, 10.0], tr), \
+            "TR multiples should be TR-locked"
+
+    def test_is_tr_locked_not_locked(self):
+        """Test is_tr_locked with non-TR multiples"""
+        from fastfuncsim.design import is_tr_locked
+
+        tr = 2.0
+
+        # Non-multiples should not be TR-locked
+        assert not is_tr_locked([1.0, 3.0, 5.0], tr), \
+            "Non-TR multiples should not be TR-locked"
+
+    def test_is_tr_locked_tolerance(self):
+        """Test is_tr_locked with floating point tolerance"""
+        from fastfuncsim.design import is_tr_locked
+
+        tr = 2.0
+
+        # Should handle small floating point errors (within 10% threshold)
+        # 2.001 is 0.001/2.0 = 0.05% error - well within 10%
+        assert is_tr_locked([2.001, 4.001], tr), \
+            "Should tolerate small FP errors within threshold"
+        # 2.2 is 0.2/2.0 = 10% error - at the threshold boundary
+        # The function uses < threshold, so 10% exactly should fail
+        assert not is_tr_locked([2.2, 4.2], tr), \
+            "Larger errors should not be TR-locked"
+
+
+class TestDesignGenerateRandomOnsets:
+    """Test generate_random_onsets() function"""
+
+    def test_generate_random_onsets_basic(self):
+        """Test basic random onset generation"""
+        from fastfuncsim.design import generate_random_onsets
+
+        n_timepoints = 100
+        n_conditions = 2
+        isi_mean = 10.0  # Mean ISI of 10 seconds
+        tr = 2.0
+
+        onsets = generate_random_onsets(
+            n_timepoints=n_timepoints,
+            n_conditions=n_conditions,
+            isi_mean=isi_mean,
+            tr=tr,
+            device=torch.device("cpu")
+        )
+
+        # Check shape
+        assert onsets.shape == (n_timepoints, n_conditions), \
+            f"Expected shape ({n_timepoints}, {n_conditions}), got {onsets.shape}"
+
+        # Check that we have some events (should be sparse)
+        n_events_cond0 = onsets[:, 0].sum().item()
+        n_events_cond1 = onsets[:, 1].sum().item()
+
+        assert n_events_cond0 > 0, "Should have generated events for condition 0"
+        assert n_events_cond1 > 0, "Should have generated events for condition 1"
+
+        # With alternating conditions, should have roughly equal numbers
+        ratio = n_events_cond0 / (n_events_cond1 + 1e-6)
+        assert 0.5 < ratio < 2.0, "Alternating conditions should have roughly equal events"
+
+    def test_generate_random_onsets_single_condition(self):
+        """Test with single condition"""
+        from fastfuncsim.design import generate_random_onsets
+
+        n_timepoints = 100
+        n_conditions = 1
+        isi_mean = 8.0
+        tr = 2.0
+
+        onsets = generate_random_onsets(
+            n_timepoints=n_timepoints,
+            n_conditions=n_conditions,
+            isi_mean=isi_mean,
+            tr=tr,
+            device=torch.device("cpu")
+        )
+
+        # Check shape
+        assert onsets.shape == (n_timepoints, n_conditions)
+
+        # Should have some events
+        n_events = onsets[:, 0].sum().item()
+        assert n_events > 0, "Should have generated events"
+
+    def test_generate_random_onsets_isi_range(self):
+        """Test with different ISI ranges"""
+        from fastfuncsim.design import generate_random_onsets
+
+        n_timepoints = 200
+        n_conditions = 2
+        isi_mean = 10.0
+        tr = 2.0
+
+        # Tight ISI range
+        onsets_tight = generate_random_onsets(
+            n_timepoints=n_timepoints,
+            n_conditions=n_conditions,
+            isi_mean=isi_mean,
+            isi_range=(8, 12),  # Narrow range
+            tr=tr,
+            device=torch.device("cpu")
+        )
+
+        # Wide ISI range
+        onsets_wide = generate_random_onsets(
+            n_timepoints=n_timepoints,
+            n_conditions=n_conditions,
+            isi_mean=isi_mean,
+            isi_range=(2, 18),  # Wide range
+            tr=tr,
+            device=torch.device("cpu")
+        )
+
+        # Both should produce valid onset matrices
+        assert onsets_tight.shape == (n_timepoints, n_conditions)
+        assert onsets_wide.shape == (n_timepoints, n_conditions)
+
+        # Wide range might have more variable event timing
+        # (harder to test without detailed analysis, just check it runs)
+
+
 if __name__ == "__main__":
     # Run tests
     test_spm_canonical_hrf()
