@@ -528,6 +528,322 @@ class TestComputeXvalR2EdgeCases:
             )
 
 
+class TestQRProjectors:
+    """Test QR decomposition for nuisance projection"""
+
+    def test_compute_qr_projectors_basic(self):
+        """Test basic QR projector computation"""
+        from fastfuncsim.xval import compute_qr_projectors
+
+        n_timepoints = 100
+        n_nuisance = 5
+        n_runs = 3
+
+        # Create nuisance per run
+        nuisance_per_run = []
+        run_lengths = [30, 40, 30]
+
+        for length in run_lengths:
+            nuisance = torch.randn(length, n_nuisance)
+            nuisance_per_run.append(nuisance)
+
+        run_starts = [0, 30, 70]
+
+        # Compute QR projectors
+        q_factors = compute_qr_projectors(
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=torch.device("cpu")
+        )
+
+        # Should return list of Q factors
+        assert len(q_factors) == n_runs
+        for i, Q in enumerate(q_factors):
+            expected_length = run_lengths[i]
+            expected_cols = n_nuisance
+            assert Q.shape == (expected_length, expected_cols), \
+                f"Q[{i}] should have shape ({expected_length}, {expected_cols}), got {Q.shape}"
+
+        # Q should have orthonormal columns
+        for i, Q in enumerate(q_factors):
+            if Q is not None and Q.shape[1] > 0:  # Check if non-empty
+                # Q.T @ Q should be identity
+                identity = Q.T @ Q
+                assert torch.allclose(identity, torch.eye(Q.shape[1]), atol=1e-4), \
+                    f"Q[{i}] columns should be orthonormal"
+
+    def test_compute_qr_projectors_empty_nuisance(self):
+        """Test QR projectors with no nuisance regressors"""
+        from fastfuncsim.xval import compute_qr_projectors
+
+        n_timepoints = 100
+        n_runs = 3
+
+        # Empty nuisance per run
+        nuisance_per_run = []
+        run_lengths = [30, 40, 30]
+
+        for length in run_lengths:
+            nuisance = torch.zeros(length, 0)  # No nuisance columns
+            nuisance_per_run.append(nuisance)
+
+        run_starts = [0, 30, 70]
+
+        q_factors = compute_qr_projectors(
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=torch.device("cpu")
+        )
+
+        # Should return list of None (one per run)
+        assert len(q_factors) == n_runs
+        assert all(q is None for q in q_factors)
+
+    def test_compute_qr_projectors_rank_deficient(self):
+        """Test QR projectors with rank-deficient nuisance (fewer timepoints than regressors)"""
+        from fastfuncsim.xval import compute_qr_projectors
+
+        # Create nuisance where n_regressors > n_timepoints for one run
+        n_timepoints = 10
+        n_nuisance = 15
+
+        nuisance_per_run = [
+            torch.randn(n_timepoints, n_nuisance),  # Rank-deficient
+            torch.zeros(n_timepoints, 5),  # All zeros -> None
+        ]
+        run_starts = [0, n_timepoints]
+
+        # QR should handle rank-deficient case - Q has at most n_timepoints columns
+        q_factors = compute_qr_projectors(
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=torch.device("cpu")
+        )
+
+        # First run should have Q with rank ≤ n_timepoints
+        assert q_factors[0] is not None
+        assert q_factors[0].shape[0] == n_timepoints
+        # Q should have at most n_timepoints columns (rank-limited)
+        assert q_factors[0].shape[1] <= n_timepoints
+        # Second run should be None (all zeros)
+        assert q_factors[1] is None
+
+
+class TestProjectOutNuisancePerRun:
+    """Test per-run nuisance projection"""
+
+    def test_project_out_nuisance_per_run_basic(self):
+        """Test basic per-run nuisance projection"""
+        from fastfuncsim.xval import project_out_nuisance_per_run
+
+        n_voxels = 50
+        n_timepoints = 100
+        n_runs = 2
+        n_nuisance = 5
+
+        # Create data
+        data = torch.randn(n_voxels, n_timepoints)
+        design = torch.randn(n_timepoints, 10)
+
+        # Create nuisance per run
+        nuisance_per_run = []
+        run_lengths = [50, 50]
+
+        for length in run_lengths:
+            nuisance = torch.randn(length, n_nuisance)
+            nuisance_per_run.append(nuisance)
+
+        run_starts = [0, 50]
+
+        # Project out nuisance
+        data_clean, design_clean = project_out_nuisance_per_run(
+            data=data,
+            design=design,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=torch.device("cpu")
+        )
+
+        # Check shapes
+        assert data_clean.shape == data.shape
+        assert design_clean.shape == design.shape
+
+        # Data should have changed (projection did something)
+        assert not torch.allclose(data, data_clean)
+
+    def test_project_out_nuisance_per_run_with_polynomials(self):
+        """Test per-run projection with Legendre polynomials"""
+        from fastfuncsim.xval import project_out_nuisance_per_run
+        from fastfuncsim.glm_core import construct_polynomial_matrix
+
+        n_voxels = 50
+        n_timepoints = 100
+        n_runs = 2
+
+        # Create data with linear drift
+        time = torch.arange(n_timepoints, dtype=torch.float32) / n_timepoints
+        data = torch.randn(n_voxels, n_timepoints) + 0.5 * time.unsqueeze(0)
+
+        design = torch.randn(n_timepoints, 10)
+
+        # Create polynomials per run (simulating polort=1)
+        nuisance_per_run = []
+        run_lengths = [50, 50]
+
+        for length in run_lengths:
+            poly = construct_polynomial_matrix(length, max_degree=1, device=torch.device("cpu"))
+            nuisance_per_run.append(poly)
+
+        run_starts = [0, 50]
+
+        # Project out polynomials
+        data_clean, design_clean = project_out_nuisance_per_run(
+            data=data,
+            design=design,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=torch.device("cpu")
+        )
+
+        # Check that linear trend was reduced
+        # Compute correlation with time before and after
+        corr_before = (data * time.unsqueeze(0)).sum() / (data.norm() * time.norm())
+        corr_after = (data_clean * time.unsqueeze(0)).sum() / (data_clean.norm() * time.norm())
+
+        assert abs(corr_after) < abs(corr_before), \
+            f"Linear trend should be reduced: before={corr_before:.3f}, after={corr_after:.3f}"
+
+    def test_project_out_nuisance_per_run_empty_nuisance(self):
+        """Test per-run projection with no nuisance"""
+        from fastfuncsim.xval import project_out_nuisance_per_run
+
+        n_voxels = 50
+        n_timepoints = 100
+
+        data = torch.randn(n_voxels, n_timepoints)
+        design = torch.randn(n_timepoints, 10)
+
+        # No nuisance
+        nuisance_per_run = [
+            torch.zeros(50, 0),
+            torch.zeros(50, 0),
+        ]
+        run_starts = [0, 50]
+
+        # Should return original data and design
+        data_clean, design_clean = project_out_nuisance_per_run(
+            data=data,
+            design=design,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=torch.device("cpu")
+        )
+
+        # Should be unchanged (no nuisance to project out)
+        assert torch.allclose(data, data_clean)
+        assert torch.allclose(design, design_clean)
+
+
+class TestComputeR2MetricAdvanced:
+    """Test R² metric computation with different metrics"""
+
+    def test_r2_metric_cod(self):
+        """Test CoD (coefficient of determination) metric"""
+        from fastfuncsim.xval import compute_r2_metric
+
+        n_voxels = 10
+        n_timepoints = 50
+
+        # Create simple test case
+        y_true = torch.randn(n_voxels, n_timepoints)
+        y_pred = y_true + 0.1 * torch.randn_like(y_true)  # Small error
+
+        # Compute CoD
+        r2 = compute_r2_metric(y_true, y_pred, metric="cod")
+
+        # Check shape
+        assert r2.shape == (n_voxels,)
+
+        # Most voxels should have positive R² (prediction is close to true)
+        assert (r2 > 0.5).sum().item() > n_voxels / 2, \
+            "Most voxels should have R² > 0.5 with small noise"
+
+    def test_r2_metric_corr(self):
+        """Test correlation metric"""
+        from fastfuncsim.xval import compute_r2_metric
+
+        n_voxels = 10
+        n_timepoints = 50
+
+        y_true = torch.randn(n_voxels, n_timepoints)
+        y_pred = y_true + 0.1 * torch.randn_like(y_true)
+
+        # Compute correlation
+        r2 = compute_r2_metric(y_true, y_pred, metric="corr")
+
+        # Correlation should be high (close to 1.0)
+        assert r2.shape == (n_voxels,)
+        assert (r2 > 0.8).sum().item() > n_voxels / 2, \
+            "Most voxels should have high correlation with small noise"
+
+    def test_r2_metric_corr2(self):
+        """Test squared correlation metric"""
+        from fastfuncsim.xval import compute_r2_metric
+
+        n_voxels = 10
+        n_timepoints = 50
+
+        y_true = torch.randn(n_voxels, n_timepoints)
+        y_pred = y_true + 0.1 * torch.randn_like(y_true)
+
+        # Compute squared correlation
+        r2 = compute_r2_metric(y_true, y_pred, metric="corr2")
+
+        # Squared correlation should be very high
+        assert r2.shape == (n_voxels,)
+        assert (r2 > 0.6).sum().item() > n_voxels / 2, \
+            "Most voxels should have high squared correlation with small noise"
+
+    def test_r2_metric_perfect_prediction(self):
+        """Test R² with perfect prediction"""
+        from fastfuncsim.xval import compute_r2_metric
+
+        n_voxels = 10
+        n_timepoints = 50
+
+        y_true = torch.randn(n_voxels, n_timepoints)
+        y_pred = y_true.clone()  # Perfect prediction
+
+        # All metrics should give perfect scores
+        r2_cod = compute_r2_metric(y_true, y_pred, metric="cod")
+        r2_corr = compute_r2_metric(y_true, y_pred, metric="corr")
+        r2_corr2 = compute_r2_metric(y_true, y_pred, metric="corr2")
+
+        # CoD might be slightly different due to floating point, but should be near 1
+        assert r2_cod.mean().item() > 0.99, "CoD should be ~1.0 for perfect prediction"
+        assert r2_corr.mean().item() > 0.999, "Correlation should be ~1.0 for perfect prediction"
+        assert r2_corr2.mean().item() > 0.99, "Squared correlation should be ~1.0"
+
+    def test_r2_metric_worst_prediction(self):
+        """Test R² with worst-case prediction (unrelated)"""
+        from fastfuncsim.xval import compute_r2_metric
+
+        n_voxels = 10
+        n_timepoints = 50
+
+        # Use different random seeds to create unrelated data
+        y_true = torch.randn(n_voxels, n_timepoints, generator=torch.Generator().manual_seed(42))
+        y_pred = torch.randn(n_voxels, n_timepoints, generator=torch.Generator().manual_seed(123))
+
+        # Compute R²
+        r2_cod = compute_r2_metric(y_true, y_pred, metric="cod")
+
+        # CoD can be negative (worse than mean)
+        # But we just check it returns something reasonable
+        assert r2_cod.shape == (n_voxels,)
+        assert torch.all(torch.isfinite(r2_cod))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
