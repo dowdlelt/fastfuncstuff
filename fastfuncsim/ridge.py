@@ -99,6 +99,13 @@ def _fit_ridge_multiple_fracs(
     # Keep track of valid rank (may be less than n_features if rank-deficient)
     n_valid_rank = len(S)
 
+    # Edge case: completely rank-deficient (no valid singular values)
+    if n_valid_rank == 0:
+        # Return zero coefficients for all fractions
+        n_fracs = len(fracs)
+        coefs = torch.zeros(n_features, n_fracs, n_targets, device=device)
+        return coefs
+
     # Create alpha grid for interpolation (log-spaced from small to large)
     # Match fracridge exactly: BIG_BIAS = 10e3 = 10000, SMALL_BIAS = 10e-3 = 0.01
     SMALL_BIAS = 10e-3  # 0.01
@@ -590,6 +597,18 @@ def _fit_ridge_chunk(
     n_fracs = len(fracs)
     n_runs = len(run_starts)
 
+    # Validate run_starts
+    if len(run_starts) != n_runs:
+        raise ValueError(
+            f"run_starts has {len(run_starts)} elements but n_runs={n_runs}. "
+            f"run_starts should have exactly n_runs elements (starting TR for each run), "
+            f"not including the total timepoints."
+        )
+
+    # Compute run lengths using pattern from xval.py
+    # run_starts contains starting timepoints for each run, e.g., [0, 120, 240] for 3 runs of 120 TRs
+    run_lengths = np.diff(run_starts + [n_timepoints])
+
     # Cross-validation loop with proper polynomial projection
     predictions_by_frac = [
         torch.zeros(chunk_voxels, n_timepoints, device=device) for _ in range(n_fracs)
@@ -606,8 +625,8 @@ def _fit_ridge_chunk(
         train_run_starts_local = [0]  # Run starts relative to concatenated train data
         for run_idx in train_runs:
             start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            train_tps.extend(range(start_tp, end_tp))
+            run_length = run_lengths[run_idx]
+            train_tps.extend(range(start_tp, start_tp + run_length))
             train_run_starts_local.append(len(train_tps))
         train_run_starts_local = train_run_starts_local[:-1]  # Remove last (it's the total length)
 
@@ -639,8 +658,8 @@ def _fit_ridge_chunk(
         test_run_starts_local = [0]
         for run_idx in test_runs:
             start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            test_tps.extend(range(start_tp, end_tp))
+            run_length = run_lengths[run_idx]
+            test_tps.extend(range(start_tp, start_tp + run_length))
             test_run_starts_local.append(len(test_tps))
         test_run_starts_local = test_run_starts_local[:-1]
 
@@ -985,24 +1004,34 @@ def fit_ridge_single_trial(
     per_voxel_design = isinstance(design_matrix, torch.Tensor) and design_matrix.ndim == 3
 
     if per_voxel_design:
-        # Convert 3D tensor (n_voxels, n_timepoints, n_trials) to list of per-voxel designs
-        n_trials = design_matrix.shape[2]
-        design_per_voxel_list = [design_matrix[i, :, :] for i in range(n_voxels)]
-        if verbose:
-            n_unique_hrfs = len(set(int(design.sum().item()) for design in design_per_voxel_list[:100]))
-            print(f"  Per-voxel HRF designs detected (~{n_unique_hrfs} unique designs in first 100 voxels)")
+        # Check if this is per-voxel (n_voxels, n_tp, n_trials) or per-HRF (n_hrfs, n_tp, n_trials)
+        # Per-HRF designs are returned by create_single_trial_design when hrf_library is provided
+        if design_matrix.shape[0] == n_voxels:
+            # Per-voxel designs (each voxel has its own design matrix)
+            n_trials = design_matrix.shape[2]
+            design_per_voxel_list = [design_matrix[i, :, :] for i in range(n_voxels)]
+            if verbose:
+                n_unique_hrfs = len(set(int(design.sum().item()) for design in design_per_voxel_list[:100]))
+                print(f"  Per-voxel HRF designs detected (~{n_unique_hrfs} unique designs in first 100 voxels)")
+        else:
+            # Per-HRF designs (n_hrfs, n_tp, n_trials) - not yet supported directly
+            # Users should expand per-HRF designs to per-voxel before calling fit_ridge_single_trial
+            raise ValueError(
+                f"Per-HRF design matrix detected with shape {design_matrix.shape}, but "
+                f"fit_ridge_single_trial expects either a single design matrix (n_timepoints, n_trials) "
+                f"or per-voxel designs (n_voxels, n_timepoints, n_trials). "
+                f"When using create_single_trial_design with hrf_library, you must provide "
+                f"hrf_index_per_voxel and expand the designs to per-voxel before calling this function. "
+                f"See create_single_trial_design documentation for per-voxel HRF handling."
+            )
     else:
         n_trials = design_matrix.shape[1]
         design_per_voxel_list = None  # Will use single design for all voxels
 
     # Auto-determine polort if needed
     if polort is None and nuisance is None:
-        # Calculate median run length
-        run_lengths = []
-        for run_idx in range(n_runs):
-            start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_lengths.append(end_tp - start_tp)
+        # Calculate median run length using pattern from xval.py
+        run_lengths = np.diff(run_starts + [n_timepoints])
         median_run_length = int(np.median(run_lengths))
         run_duration = median_run_length * tr
         polort = int(np.floor(1 + run_duration / 150.0))
