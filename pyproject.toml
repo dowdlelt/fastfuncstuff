@@ -48,7 +48,7 @@ strict_optional = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py312"
 
 [tool.ruff.lint]
 # Enable important error detection
