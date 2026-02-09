@@ -358,9 +358,11 @@ def create_single_trial_design(
 
     for trial_idx, (cond_idx, run_idx, trial_in_run, onset_time) in enumerate(trial_info):
         # Convert onset time to microtime bin
-        run_start_time = run_starts[run_idx] * tr
-        onset_relative = onset_time + run_start_time
-        onset_bin = int(round(onset_relative / microtime_dt))
+        # CRITICAL: Use bins_per_tr-based offset (not TR-based) to avoid drift
+        # This must match convolve_hrf_microtime's sampling grid
+        # See design_builder.py:create_onset_matrix_microtime for reference
+        run_start_micro = run_starts[run_idx] * bins_per_tr
+        onset_bin = run_start_micro + int(round(onset_time / microtime_dt))
 
         # Duration in microtime bins
         duration_bins = int(round(durations[cond_idx] / microtime_dt))
