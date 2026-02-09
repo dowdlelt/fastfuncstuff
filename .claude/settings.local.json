@@ -50,7 +50,12 @@
       "Bash(wc:*)",
       "Bash(ruff check:*)",
       "Bash(pytest:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "mcp__zread__get_repo_structure",
+      "mcp__zread__read_file",
+      "WebFetch(domain:docs.astral.sh)",
+      "mcp__zread__search_doc",
+      "Bash(ty check:*)"
     ],
     "deny": [],
     "ask": []

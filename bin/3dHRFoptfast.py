@@ -727,6 +727,57 @@ def main():
         nuisance_design = torch.block_diag(*nuisance_per_run)
         print(f"Nuisance design shape: {nuisance_design.shape}")
 
+        # =========================================================================
+        # CRITICAL: Project data with polynomials BEFORE CV (same as non-single_trial path)
+        # =========================================================================
+        from fastfuncsim.xval import compute_qr_projectors, project_out_nuisance_per_run
+
+        print("\n" + "="*70)
+        print("FIX DEBUG: About to project data with polynomials...")
+        print("="*70)
+
+        # Compute QR factors for projection (same as hrf_selection.py)
+        q_factors = compute_qr_projectors(
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=device,
+        )
+
+        print(f"FIX DEBUG: Computed {len([q for q in q_factors if q is not None])} non-None Q factors")
+
+        # Project data with polynomials (remove drift)
+        # This is essential for proper CV - otherwise test runs influence polynomial fit
+        print("Projecting data with polynomial nuisance regressors...")
+        projected_data = data.clone()
+        n_runs = len(run_starts)
+        for run_idx in range(n_runs):
+            if q_factors[run_idx] is None:
+                continue
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            Q = q_factors[run_idx]
+            run_data = data[:, start_tp:end_tp].to(device)
+            # Project: Y_clean = Y - Q @ (Q.T @ Y)
+            run_data_proj = run_data - (Q @ (Q.T @ run_data.T)).T
+            projected_data[:, start_tp:end_tp] = run_data_proj.cpu()
+
+        # Move to device if needed
+        projected_data = projected_data.to(device)
+        print(f"  Projected data: {projected_data.shape} on {projected_data.device}")
+
+        # VERIFY projection actually happened
+        data_mean_before = data.mean().item()
+        projected_mean = projected_data.mean().item()
+        data_std_before = data.std().item()
+        projected_std = projected_data.std().item()
+        print(f"  Data BEFORE projection: mean={data_mean_before:.4f}, std={data_std_before:.4f}")
+        print(f"  Data AFTER projection:  mean={projected_mean:.4f}, std={projected_std:.4f}")
+        print(f"  Difference: {abs(data_mean_before - projected_mean):.6f}")
+
+        print("\n" + "="*70)
+        print("FIX DEBUG: Projection complete! About to start HRF loop...")
+        print("="*70 + "\n")
+
         # Generate CV splits
         cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=args.n_perms)
         n_hrfs = hrf_library.shape[0]
@@ -751,13 +802,28 @@ def main():
                 device=device,
             )
 
-            # Fit OLS: pass task design + nuisance separately to avoid duplicate intercept
+            # Project the single-trial design with polynomials
+            # This ensures consistency with the non-single_trial path
+            st_design_projected = st_design.clone()
+            for run_idx in range(n_runs):
+                if q_factors[run_idx] is None:
+                    continue
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                Q = q_factors[run_idx]
+                run_design = st_design[start_tp:end_tp, :].to(device)
+                # Project: X_clean = X - Q @ (Q.T @ X)
+                run_design_proj = run_design - (Q @ (Q.T @ run_design))
+                st_design_projected[start_tp:end_tp, :] = run_design_proj.cpu()
+
+            # Fit OLS on PROJECTED data with PROJECTED design
+            # Don't pass extra_regressors since we've already projected
             glm_results = fit_glm(
-                data,
-                st_design,  # Task-only design
+                projected_data,  # Use PROJECTED data (polynomials removed)
+                st_design_projected,  # Use PROJECTED design
                 tr=args.tr,
-                max_poly_degree=-1,  # No extra polynomials — already in nuisance_design
-                extra_regressors=nuisance_design,  # Nuisance passed separately
+                max_poly_degree=-1,  # No extra polynomials — already projected
+                extra_regressors=None,  # No extra regressors — already projected
                 device=device,
                 verbose=False,
             )
