@@ -824,7 +824,9 @@ def main():
 
             if args.verbose and hrf_idx % 5 == 0:
                 col_r2 = fit_r2_all[:, hrf_idx]
-                print(f"    HRF {hrf_idx}: mean R²={col_r2.mean():.4f}, median R²={col_r2.median():.4f}")
+                print(
+                    f"    HRF {hrf_idx}: mean R²={col_r2.mean():.4f}, median R²={col_r2.median():.4f}"
+                )
 
         # Select best HRF per voxel (matches GLMsingle: max over HRFs)
         hrf_index = fit_r2_all.argmax(dim=1).to(device)
@@ -843,7 +845,7 @@ def main():
         hrf_index_cpu = hrf_index.cpu()
 
         for hrf_idx in range(n_hrfs):
-            vox_mask = (hrf_index_cpu == hrf_idx)
+            vox_mask = hrf_index_cpu == hrf_idx
             if not vox_mask.any():
                 continue
             vox_indices = vox_mask.nonzero(as_tuple=True)[0]
@@ -871,24 +873,34 @@ def main():
 
         # ---- Clearly-named R² maps ----
         # In-sample R² (already computed above)
-        canonical_full_r2 = fit_r2_all[:, 0]           # canonical HRF, in-sample
-        hrfopt_full_r2 = xval_r2_best                  # best-HRF per voxel, in-sample
+        canonical_full_r2 = fit_r2_all[:, 0]  # canonical HRF, in-sample
+        hrfopt_full_r2 = xval_r2_best  # best-HRF per voxel, in-sample
 
         # Beta-series CV R² (genuine cross-validated)
-        from fastfuncsim.xval import generate_cv_splits, compute_xval_r2_single_trials
+        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
 
         cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
 
         print()
         print("Computing beta-series CV R² (canonical HRF)...")
         canonical_cv = compute_xval_r2_single_trials(
-            canonical_betas, cond_ids, run_ids, cv_splits, metric="cod", device=device,
+            canonical_betas,
+            cond_ids,
+            run_ids,
+            cv_splits,
+            metric="cod",
+            device=device,
         )
         canonical_xval_r2 = canonical_cv["r2"]
 
         print("Computing beta-series CV R² (optimal HRF per voxel)...")
         hrfopt_cv = compute_xval_r2_single_trials(
-            best_betas, cond_ids, run_ids, cv_splits, metric="cod", device=device,
+            best_betas,
+            cond_ids,
+            run_ids,
+            cv_splits,
+            metric="cod",
+            device=device,
         )
         hrfopt_xval_r2 = hrfopt_cv["r2"]
 
