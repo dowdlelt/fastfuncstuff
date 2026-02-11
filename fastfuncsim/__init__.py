@@ -165,6 +165,8 @@ from .simulation import (
 
 # Utilities
 from .utils import (
+    compute_power_spectra,
+    compute_power_spectrum,
     get_device,
     print_device_info,
     to_tensor,
@@ -223,6 +225,8 @@ __all__ = [
     "write_nifti_files",
     "save_simulation_outputs",
     # Utils
+    "compute_power_spectra",
+    "compute_power_spectrum",
     "get_device",
     "print_device_info",
     "to_tensor",

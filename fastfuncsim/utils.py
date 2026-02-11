@@ -665,3 +665,117 @@ def load_per_run_nuisance_files(
             raise RuntimeError(f"Error loading nuisance file '{run_file}': {e}")
 
     return nuisance_per_run
+
+
+def compute_power_spectrum(
+    signal: np.ndarray | torch.Tensor,
+    sampling_rate: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the one-sided amplitude spectrum of a 1-D signal.
+
+    Uses a real FFT and returns the positive-frequency half only (DC through
+    Nyquist).  Amplitude is normalised so that a pure sine at frequency f
+    with amplitude A gives a spectral peak of A at f.
+
+    Parameters
+    ----------
+    signal : array-like, shape (n_samples,)
+        The input time series.  Must be 1-D.
+    sampling_rate : float
+        Samples per second (Hz).  Determines the frequency axis.
+
+    Returns
+    -------
+    freqs : np.ndarray, shape (n_freqs,)
+        Frequency axis in Hz.  n_freqs = n_samples // 2 + 1.
+    amplitudes : np.ndarray, shape (n_freqs,)
+        One-sided amplitude spectrum.  Units match the input signal.
+
+    Notes
+    -----
+    The two-sided FFT amplitude is halved for all bins except DC (index 0)
+    and the Nyquist bin (index n//2 when n is even) so that the one-sided
+    spectrum has the same total energy as the two-sided spectrum.
+    """
+    if isinstance(signal, torch.Tensor):
+        signal = signal.detach().cpu().numpy()
+    signal = np.asarray(signal, dtype=float)
+
+    if signal.ndim != 1:
+        raise ValueError(
+            f"signal must be 1-D, got shape {signal.shape}. "
+            "For multiple signals use compute_power_spectra()."
+        )
+
+    n = len(signal)
+    fft_vals = np.fft.rfft(signal)
+    amplitudes = np.abs(fft_vals) / n
+
+    # Double all non-DC, non-Nyquist bins to account for the missing
+    # negative-frequency mirror (one-sided → two-sided energy equivalence).
+    amplitudes[1:] *= 2
+    if n % 2 == 0:
+        amplitudes[-1] /= 2  # Nyquist bin is its own mirror — don't double it
+
+    freqs = np.fft.rfftfreq(n, d=1.0 / sampling_rate)
+    return freqs, amplitudes
+
+
+def compute_power_spectra(
+    signals: np.ndarray | torch.Tensor,
+    sampling_rate: float,
+    axis: int = -1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute one-sided amplitude spectra for a batch of signals.
+
+    Applies :func:`compute_power_spectrum` logic across the specified axis.
+    All signals must have the same length along that axis.
+
+    Parameters
+    ----------
+    signals : array-like, shape (..., n_samples, ...)
+        One or more time series.  The time axis is given by ``axis``.
+    sampling_rate : float
+        Samples per second (Hz).
+    axis : int, default=-1
+        Which axis contains the time samples.
+
+    Returns
+    -------
+    freqs : np.ndarray, shape (n_freqs,)
+        Frequency axis in Hz, shared across all signals.
+    amplitudes : np.ndarray, same shape as ``signals`` except along ``axis``
+        One-sided amplitude spectra.  Shape along ``axis`` is
+        ``n_samples // 2 + 1``.
+
+    Examples
+    --------
+    Spectra for all voxels in an (n_voxels, n_timepoints) matrix:
+
+    >>> freqs, amps = compute_power_spectra(data, sampling_rate=1/tr)
+    >>> peak_freq_per_voxel = freqs[amps.argmax(axis=-1)]
+    """
+    if isinstance(signals, torch.Tensor):
+        signals = signals.detach().cpu().numpy()
+    signals = np.asarray(signals, dtype=float)
+
+    n = signals.shape[axis]
+    fft_vals = np.fft.rfft(signals, axis=axis)
+    amplitudes = np.abs(fft_vals) / n
+
+    # Build a broadcastable multiplier: 2× everywhere except DC and Nyquist
+    n_freqs = n // 2 + 1
+    multiplier = np.full(n_freqs, 2.0)
+    multiplier[0] = 1.0          # DC — no mirror
+    if n % 2 == 0:
+        multiplier[-1] = 1.0     # Nyquist — its own mirror
+
+    # Reshape multiplier to broadcast along `axis`
+    shape = [1] * signals.ndim
+    shape[axis] = n_freqs
+    amplitudes *= multiplier.reshape(shape)
+
+    freqs = np.fft.rfftfreq(n, d=1.0 / sampling_rate)
+    return freqs, amplitudes
