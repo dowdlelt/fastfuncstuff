@@ -304,6 +304,10 @@ def _evaluate_hrfs_batched(
                 betas = torch.linalg.lstsq(
                     train_designs_gpu[d_idx], train_data_split.T
                 ).solution
+                # Rank-deficient train design (e.g. a condition absent from all
+                # training runs) causes CUDA gels to return NaN.  Zero those
+                # betas — the minimum-norm / gelsd answer on CPU is also 0.
+                betas = torch.nan_to_num(betas, nan=0.0, posinf=0.0, neginf=0.0)
                 yhat = (test_designs_gpu[d_idx] @ betas).T  # (n_voxels, n_test)
 
                 if metric == "cod":
@@ -339,6 +343,8 @@ def _evaluate_hrfs_batched(
                     betas = torch.linalg.lstsq(
                         train_designs_gpu[d_idx], train_chunk.T
                     ).solution
+                    # Same rank-deficiency guard for chunked path
+                    betas = torch.nan_to_num(betas, nan=0.0, posinf=0.0, neginf=0.0)
                     yhat = (test_designs_gpu[d_idx] @ betas).T  # (chunk, T_test)
 
                     if metric == "cod":
