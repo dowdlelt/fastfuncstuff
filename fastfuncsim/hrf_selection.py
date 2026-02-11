@@ -202,7 +202,7 @@ def _project_design_with_q_factors(
     return torch.cat(projected_runs, dim=0)
 
 
-def _evaluate_hrfs_batched_loro(
+def _evaluate_hrfs_batched(
     projected_data: torch.Tensor,
     projected_designs: List[torch.Tensor],
     run_starts: List[int],
@@ -212,14 +212,15 @@ def _evaluate_hrfs_batched_loro(
     chunk_size: Optional[int] = None,
     verbose: bool = True,
 ) -> torch.Tensor:
-    """Evaluate multiple designs via LORO CV in a single batched pass.
+    """Evaluate multiple designs via CV in a single batched pass.
 
     Key optimization: data is moved to GPU once per voxel chunk per CV split,
     and ALL designs are evaluated on that same data. This reduces CPU-to-GPU
     transfers by len(designs)x compared to per-design evaluation.
 
-    For LORO, each timepoint appears in the test set exactly once across all
-    folds, so we accumulate streaming statistics and compute R² at the end.
+    Uses per-fold R² (compute R² independently per fold, then average), which
+    works for any CV strategy (LORO, split-half, k-fold, etc.) and requires
+    only O(n_voxels × n_designs) memory regardless of the number of folds.
 
     Parameters
     ----------
@@ -230,7 +231,7 @@ def _evaluate_hrfs_batched_loro(
     run_starts : list of int
         Starting timepoint for each run.
     cv_splits : list of (train_runs, test_runs)
-        LORO CV splits (each test_runs has exactly 1 run).
+        Any CV splits (LORO, split-half, k-fold, etc.).
     device : torch.device
         GPU device for computation.
     metric : str
@@ -243,11 +244,11 @@ def _evaluate_hrfs_batched_loro(
     Returns
     -------
     r2 : torch.Tensor
-        (n_voxels, n_designs) R² for each design, on CPU.
+        (n_voxels, n_designs) mean per-fold R² for each design, on CPU.
     """
     n_voxels, n_timepoints = projected_data.shape
     n_designs = len(projected_designs)
-    n_runs = len(run_starts)
+    n_splits = len(cv_splits)
     data_on_device = projected_data.device == device or projected_data.device.type == device.type
 
     if not data_on_device and chunk_size is None:
@@ -269,16 +270,11 @@ def _evaluate_hrfs_batched_loro(
         d = projected_designs[d_idx]
         designs_by_run.append([d[s:e, :] for s, e in zip(run_starts, run_ends)])
 
-    # Accumulators: keep on same device as data to avoid transfers
-    acc_device = projected_data.device
-    sum_y = projected_data.sum(dim=1)          # (n_voxels,)
-    sum_y2 = (projected_data ** 2).sum(dim=1)  # (n_voxels,)
-    sum_yyhat = torch.zeros(n_voxels, n_designs, device=acc_device)
-    sum_yhat = torch.zeros(n_voxels, n_designs, device=acc_device)
-    sum_yhat2 = torch.zeros(n_voxels, n_designs, device=acc_device)
+    # Per-fold R² accumulator on CPU (divide by n_splits each fold)
+    r2_acc = torch.zeros(n_voxels, n_designs)  # CPU, final result
 
     # Main loop: split-outer, chunk-inner (if needed), design-inner
-    split_iter = tqdm(cv_splits, desc="LORO CV splits") if verbose else cv_splits
+    split_iter = tqdm(cv_splits, desc="CV splits") if verbose else cv_splits
     for train_runs, test_runs in split_iter:
         # Pre-compute train/test designs for all HRFs (tiny, on GPU)
         train_designs_gpu = []
@@ -296,35 +292,71 @@ def _evaluate_hrfs_batched_loro(
         # Concatenate run data for this split
         train_data_split = torch.cat([data_by_run[r] for r in train_runs], dim=1)
         test_data_split = torch.cat([data_by_run[r] for r in test_runs], dim=1)
+        n_test = test_data_split.shape[1]
 
         if data_on_device:
             # Fast path: data already on GPU — no chunking, no transfers
+            sum_y_test = test_data_split.sum(dim=1)           # (n_voxels,)
+            sum_y2_test = (test_data_split ** 2).sum(dim=1)   # (n_voxels,)
+            ss_tot = (sum_y2_test - sum_y_test ** 2 / n_test).clamp(min=1e-10)
+
             for d_idx in range(n_designs):
                 betas = torch.linalg.lstsq(
                     train_designs_gpu[d_idx], train_data_split.T
                 ).solution
-                yhat = (test_designs_gpu[d_idx] @ betas).T
+                yhat = (test_designs_gpu[d_idx] @ betas).T  # (n_voxels, n_test)
 
-                sum_yyhat[:, d_idx] += (test_data_split * yhat).sum(dim=1)
-                sum_yhat[:, d_idx] += yhat.sum(dim=1)
-                sum_yhat2[:, d_idx] += (yhat ** 2).sum(dim=1)
+                if metric == "cod":
+                    sum_yyhat = (test_data_split * yhat).sum(dim=1)
+                    sum_yhat2 = (yhat ** 2).sum(dim=1)
+                    ss_res = sum_y2_test - 2 * sum_yyhat + sum_yhat2
+                    r2_fold = (1.0 - ss_res / ss_tot).cpu()
+                elif metric in ("corr", "corr2"):
+                    sum_yhat = yhat.sum(dim=1)
+                    sum_yhat2 = (yhat ** 2).sum(dim=1)
+                    num = n_test * (test_data_split * yhat).sum(dim=1) - sum_y_test * sum_yhat
+                    den_y = (n_test * sum_y2_test - sum_y_test ** 2).clamp(min=1e-10)
+                    den_yhat = (n_test * sum_yhat2 - sum_yhat ** 2).clamp(min=1e-10)
+                    r = (num / torch.sqrt(den_y * den_yhat)).cpu()
+                    r2_fold = r ** 2 if metric == "corr2" else r
+                else:
+                    raise ValueError(f"Unknown metric: {metric}")
+                r2_acc[:, d_idx] += r2_fold / n_splits
         else:
             # Chunked path: stream voxels from CPU to GPU
             for cs in range(0, n_voxels, chunk_size):
                 ce = min(cs + chunk_size, n_voxels)
 
-                train_chunk = train_data_split[cs:ce].to(device)
-                test_chunk = test_data_split[cs:ce].to(device)
+                train_chunk = train_data_split[cs:ce].to(device)  # (chunk, T_train)
+                test_chunk = test_data_split[cs:ce].to(device)    # (chunk, T_test)
+
+                # Per-fold test stats (test timepoints only — correct SS_tot)
+                sum_y_test = test_chunk.sum(dim=1)          # (chunk,)
+                sum_y2_test = (test_chunk ** 2).sum(dim=1)  # (chunk,)
+                ss_tot = (sum_y2_test - sum_y_test ** 2 / n_test).clamp(min=1e-10)
 
                 for d_idx in range(n_designs):
                     betas = torch.linalg.lstsq(
                         train_designs_gpu[d_idx], train_chunk.T
                     ).solution
-                    yhat = (test_designs_gpu[d_idx] @ betas).T
+                    yhat = (test_designs_gpu[d_idx] @ betas).T  # (chunk, T_test)
 
-                    sum_yyhat[cs:ce, d_idx] += (test_chunk * yhat).sum(dim=1).cpu()
-                    sum_yhat[cs:ce, d_idx] += yhat.sum(dim=1).cpu()
-                    sum_yhat2[cs:ce, d_idx] += (yhat ** 2).sum(dim=1).cpu()
+                    if metric == "cod":
+                        sum_yyhat = (test_chunk * yhat).sum(dim=1)
+                        sum_yhat2 = (yhat ** 2).sum(dim=1)
+                        ss_res = sum_y2_test - 2 * sum_yyhat + sum_yhat2
+                        r2_fold = (1.0 - ss_res / ss_tot).cpu()
+                    elif metric in ("corr", "corr2"):
+                        sum_yhat = yhat.sum(dim=1)
+                        sum_yhat2 = (yhat ** 2).sum(dim=1)
+                        num = n_test * (test_chunk * yhat).sum(dim=1) - sum_y_test * sum_yhat
+                        den_y = (n_test * sum_y2_test - sum_y_test ** 2).clamp(min=1e-10)
+                        den_yhat = (n_test * sum_yhat2 - sum_yhat ** 2).clamp(min=1e-10)
+                        r = (num / torch.sqrt(den_y * den_yhat)).cpu()
+                        r2_fold = r ** 2 if metric == "corr2" else r
+                    else:
+                        raise ValueError(f"Unknown metric: {metric}")
+                    r2_acc[cs:ce, d_idx] += r2_fold / n_splits
 
                 del train_chunk, test_chunk
 
@@ -332,22 +364,30 @@ def _evaluate_hrfs_batched_loro(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # Compute final R² from accumulated statistics
-    n_total = float(n_timepoints)
-    if metric == "cod":
-        ss_res = sum_y2.unsqueeze(1) - 2 * sum_yyhat + sum_yhat2
-        ss_tot = (sum_y2 - sum_y ** 2 / n_total).clamp(min=1e-10)
-        r2 = 1.0 - ss_res / ss_tot.unsqueeze(1)
-    elif metric in ("corr", "corr2"):
-        num = n_total * sum_yyhat - sum_y.unsqueeze(1) * sum_yhat
-        den_y = (n_total * sum_y2 - sum_y ** 2).clamp(min=1e-10)
-        den_yhat = (n_total * sum_yhat2 - sum_yhat ** 2).clamp(min=1e-10)
-        r = num / torch.sqrt(den_y.unsqueeze(1) * den_yhat)
-        r2 = r ** 2 if metric == "corr2" else r
-    else:
-        raise ValueError(f"Unknown metric: {metric}")
+    return r2_acc
 
-    return r2
+
+def _evaluate_hrfs_batched_loro(
+    projected_data: torch.Tensor,
+    projected_designs: List[torch.Tensor],
+    run_starts: List[int],
+    cv_splits: List[Tuple[List[int], List[int]]],
+    device: torch.device,
+    metric: str = "cod",
+    chunk_size: Optional[int] = None,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """Backward-compatible alias for _evaluate_hrfs_batched."""
+    return _evaluate_hrfs_batched(
+        projected_data=projected_data,
+        projected_designs=projected_designs,
+        run_starts=run_starts,
+        cv_splits=cv_splits,
+        device=device,
+        metric=metric,
+        chunk_size=chunk_size,
+        verbose=verbose,
+    )
 
 
 def fit_glm_hrf_library_with_xval(
@@ -771,15 +811,17 @@ def fit_glm_hrf_library_with_xval(
     # =========================================================================
     is_loro = all(len(test) == 1 for _, test in cv_splits)
 
-    if is_loro and n_hrfs > 1:
-        # Batched LORO: move data to GPU once per split, evaluate ALL designs.
+    if n_hrfs > 1:
+        # Batched CV: move data to GPU once per split, evaluate ALL designs.
         # Reduces CPU→GPU transfers by (n_hrfs+1)× vs per-design evaluation.
+        # Uses per-fold R² (mean R² across folds) — works for any CV strategy.
+        cv_label = "LORO" if is_loro else f"split-half ({n_splits} perms)"
         if verbose:
             print()
-            print(f"  Batched LORO evaluation: {n_hrfs + 1} designs x {n_splits} splits")
+            print(f"  Batched {cv_label} evaluation: {n_hrfs + 1} designs x {n_splits} splits")
 
         all_designs = all_projected_designs + [projected_canonical_design]
-        r2_all = _evaluate_hrfs_batched_loro(
+        r2_all = _evaluate_hrfs_batched(
             projected_data=projected_data,
             projected_designs=all_designs,
             run_starts=run_starts,
@@ -792,8 +834,8 @@ def fit_glm_hrf_library_with_xval(
         xval_r2_median_all = r2_all[:, :n_hrfs].to(device)
         xval_r2_canonical = r2_all[:, n_hrfs].to(device)
 
-        # Diagnostic: verify batched LORO matches compute_xval_r2 on canonical design
-        if verbose:
+        # Diagnostic: verify batched evaluation matches compute_xval_r2 (LORO only)
+        if verbose and is_loro:
             # Path A: compute_xval_r2 on our QR-projected data+design
             canonical_check = compute_xval_r2(
                 data=projected_data,
@@ -843,7 +885,7 @@ def fit_glm_hrf_library_with_xval(
             del canonical_check, r2_path_a, proj_data_b, proj_design_b
             del canonical_check_b, r2_path_b
     else:
-        # Per-design evaluation (non-LORO or single HRF)
+        # Single-HRF fallback
         if verbose:
             print()
             print(f"  Per-design evaluation: {n_hrfs} HRFs x {n_splits} splits")
