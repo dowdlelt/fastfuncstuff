@@ -218,9 +218,18 @@ def _evaluate_hrfs_batched(
     and ALL designs are evaluated on that same data. This reduces CPU-to-GPU
     transfers by len(designs)x compared to per-design evaluation.
 
-    Uses per-fold R² (compute R² independently per fold, then average), which
-    works for any CV strategy (LORO, split-half, k-fold, etc.) and requires
-    only O(n_voxels × n_designs) memory regardless of the number of folds.
+    Two R² computation strategies (chosen automatically):
+
+    **LORO** (each timepoint in test exactly once):
+      Accumulate SS_res per fold → R² = 1 - SS_res_total / SS_tot_global.
+      Exact and cheap (O(n_voxels × n_designs) memory).
+
+    **Split-half / k-fold** (timepoints in multiple test folds):
+      Accumulate predicted timeseries (sum_yhat) across folds → divide by
+      per-timepoint count → compute R² from averaged predictions.
+      Matches GLMdenoise/compute_xval_r2 "slow" path, avoids the
+      prediction-variance bias that makes all HRFs look equally bad.
+      Memory: O(n_designs × chunk × n_timepoints) per voxel chunk.
 
     Parameters
     ----------
@@ -244,7 +253,7 @@ def _evaluate_hrfs_batched(
     Returns
     -------
     r2 : torch.Tensor
-        (n_voxels, n_designs) mean per-fold R² for each design, on CPU.
+        (n_voxels, n_designs) CV R² for each design, on CPU.
     """
     n_voxels, n_timepoints = projected_data.shape
     n_designs = len(projected_designs)
@@ -270,109 +279,169 @@ def _evaluate_hrfs_batched(
         d = projected_designs[d_idx]
         designs_by_run.append([d[s:e, :] for s, e in zip(run_starts, run_ends)])
 
-    # Per-fold R² accumulator on CPU (divide by n_splits each fold)
-    r2_acc = torch.zeros(n_voxels, n_designs)  # CPU, final result
+    # Detect LORO: each timepoint appears in test exactly once across all folds.
+    # For LORO we use streaming SS_res accumulation (fast, O(n_voxels) accumulators).
+    # For split-half / k-fold we use prediction averaging (correct but needs
+    # O(n_designs x chunk x n_tp) accumulators per voxel chunk).
+    n_test_per_tp = torch.zeros(n_timepoints, dtype=torch.long)
+    for _, test_runs in cv_splits:
+        for r in test_runs:
+            n_test_per_tp[run_starts[r]:run_ends[r]] += 1
+    is_loro_style = bool((n_test_per_tp == 1).all())
 
-    # Main loop: split-outer, chunk-inner (if needed), design-inner
-    split_iter = tqdm(cv_splits, desc="CV splits") if verbose else cv_splits
-    for train_runs, test_runs in split_iter:
-        # Pre-compute train/test designs for all HRFs (tiny, on GPU)
-        train_designs_gpu = []
-        test_designs_gpu = []
-        for d_idx in range(n_designs):
-            td = torch.cat(
-                [designs_by_run[d_idx][r] for r in train_runs], dim=0
-            ).to(device)
-            train_designs_gpu.append(td)
-            te = torch.cat(
-                [designs_by_run[d_idx][r] for r in test_runs], dim=0
-            ).to(device)
-            test_designs_gpu.append(te)
+    # Global SS_tot from ALL timepoints -- used in both paths.
+    if data_on_device:
+        sum_y_all = projected_data.sum(dim=1).cpu()
+        sum_y2_all = (projected_data ** 2).sum(dim=1).cpu()
+    else:
+        sum_y_all = projected_data.sum(dim=1)
+        sum_y2_all = (projected_data ** 2).sum(dim=1)
+    ss_tot_global = (sum_y2_all - sum_y_all ** 2 / n_timepoints).clamp(min=1e-10)
 
-        # Concatenate run data for this split
-        train_data_split = torch.cat([data_by_run[r] for r in train_runs], dim=1)
-        test_data_split = torch.cat([data_by_run[r] for r in test_runs], dim=1)
-        n_test = test_data_split.shape[1]
+    # =========================================================================
+    # Path A: LORO -- fold-outer, SS_res accumulation.
+    # Works because each TP is tested exactly once, so sum_ss_res = SS_res_total.
+    # =========================================================================
+    if is_loro_style and metric == "cod":
+        sum_ss_res = torch.zeros(n_voxels, n_designs)
 
-        # Pre-compute pseudoinverse of each train design once per split.
-        # pinv uses SVD and handles rank-deficient / near-singular designs
-        # correctly (zero betas for near-zero singular values).  This avoids
-        # NaN/Inf from CUDA's gels lstsq driver on ill-conditioned matrices,
-        # and is faster than per-chunk lstsq (one SVD on a tiny matrix,
-        # then cheap matmuls per chunk).
-        # pinv shape: (n_stim_cols, T_train) — tiny, stays on GPU
-        pinv_trains_gpu = [
-            torch.linalg.pinv(td) for td in train_designs_gpu
+        split_iter = tqdm(cv_splits, desc="CV splits") if verbose else cv_splits
+        for train_runs, test_runs in split_iter:
+            train_designs_gpu = [
+                torch.cat([designs_by_run[d][r] for r in train_runs], dim=0).to(device)
+                for d in range(n_designs)
+            ]
+            test_designs_gpu = [
+                torch.cat([designs_by_run[d][r] for r in test_runs], dim=0).to(device)
+                for d in range(n_designs)
+            ]
+            train_data_split = torch.cat([data_by_run[r] for r in train_runs], dim=1)
+            test_data_split = torch.cat([data_by_run[r] for r in test_runs], dim=1)
+
+            # pinv: SVD-based, handles rank-deficient designs (zero betas for
+            # missing events), avoids NaN/Inf from CUDA gels driver.
+            pinv_trains_gpu = [torch.linalg.pinv(td) for td in train_designs_gpu]
+
+            if data_on_device:
+                sum_y2_test_fold = (test_data_split ** 2).sum(dim=1)
+                for d_idx in range(n_designs):
+                    betas = pinv_trains_gpu[d_idx] @ train_data_split.T
+                    yhat = (test_designs_gpu[d_idx] @ betas).T
+                    ss_res = (
+                        sum_y2_test_fold
+                        - 2 * (test_data_split * yhat).sum(dim=1)
+                        + (yhat ** 2).sum(dim=1)
+                    )
+                    sum_ss_res[:, d_idx] += ss_res.cpu()
+            else:
+                for cs in range(0, n_voxels, chunk_size):
+                    ce = min(cs + chunk_size, n_voxels)
+                    train_chunk = train_data_split[cs:ce].to(device)
+                    test_chunk = test_data_split[cs:ce].to(device)
+                    sum_y2_chunk = (test_chunk ** 2).sum(dim=1)
+                    for d_idx in range(n_designs):
+                        betas = pinv_trains_gpu[d_idx] @ train_chunk.T
+                        yhat = (test_designs_gpu[d_idx] @ betas).T
+                        ss_res = (
+                            sum_y2_chunk
+                            - 2 * (test_chunk * yhat).sum(dim=1)
+                            + (yhat ** 2).sum(dim=1)
+                        )
+                        sum_ss_res[cs:ce, d_idx] += ss_res.cpu()
+                    del train_chunk, test_chunk
+
+            del train_data_split, test_data_split, train_designs_gpu, test_designs_gpu, pinv_trains_gpu
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        return 1.0 - sum_ss_res / ss_tot_global.unsqueeze(1)
+
+    # =========================================================================
+    # Path B: Split-half / k-fold -- prediction averaging (chunk-outer).
+    #
+    # For split-half each timepoint appears in ~n_splits/2 test folds.
+    # Averaging predictions across folds before computing R² removes the
+    # between-fold beta variance, which otherwise swamps the small R² differences
+    # between neighbouring HRFs and makes all curves look flat/negative.
+    #
+    # Precompute all fold x design pseudoinverses (tiny matrices, ~30-100 MB)
+    # so the inner chunk loop only does cheap matmuls.
+    # =========================================================================
+
+    # Per-timepoint test count (for averaging).
+    count_per_tp = n_test_per_tp.float()
+
+    if verbose:
+        print(f"  Precomputing {n_splits} x {n_designs} pseudoinverses for split-half CV...")
+    all_pinvs: List[List[torch.Tensor]] = []
+    for train_runs, _ in cv_splits:
+        pinvs_fold = [
+            torch.linalg.pinv(
+                torch.cat([designs_by_run[d][r] for r in train_runs], dim=0).to(device)
+            )
+            for d in range(n_designs)
         ]
+        all_pinvs.append(pinvs_fold)
 
-        if data_on_device:
-            # Fast path: data already on GPU — no chunking, no transfers
-            sum_y_test = test_data_split.sum(dim=1)           # (n_voxels,)
-            sum_y2_test = (test_data_split ** 2).sum(dim=1)   # (n_voxels,)
-            ss_tot = (sum_y2_test - sum_y_test ** 2 / n_test).clamp(min=1e-10)
+    # Compute chunk_size that keeps sum_yhat (n_designs x chunk x n_tp) in GPU memory.
+    if device.type == "cuda":
+        try:
+            free_mem = torch.cuda.mem_get_info()[0]
+            bytes_per_vox = n_designs * n_timepoints * 4
+            split_chunk = max(100, int(free_mem * 0.4 / bytes_per_vox))
+        except Exception:
+            split_chunk = chunk_size or n_voxels
+        chunk_size = min(chunk_size or n_voxels, split_chunk)
+    elif chunk_size is None:
+        chunk_size = n_voxels
+
+    r2_out = torch.zeros(n_voxels, n_designs)
+
+    chunk_iter = range(0, n_voxels, chunk_size)
+    if verbose:
+        chunk_iter = tqdm(list(chunk_iter), desc="Voxel chunks")
+
+    for cs in chunk_iter:
+        ce = min(cs + chunk_size, n_voxels)
+        chunk_len = ce - cs
+
+        # Prediction accumulator: (n_designs, chunk, n_tp) on device.
+        sum_yhat = torch.zeros(n_designs, chunk_len, n_timepoints, device=device)
+
+        for fold_idx, (train_runs, test_runs) in enumerate(cv_splits):
+            train_chunk = torch.cat([data_by_run[r][cs:ce] for r in train_runs], dim=1)
+            if not data_on_device:
+                train_chunk = train_chunk.to(device)
 
             for d_idx in range(n_designs):
-                betas = pinv_trains_gpu[d_idx] @ train_data_split.T  # (n_stim, n_voxels)
-                yhat = (test_designs_gpu[d_idx] @ betas).T           # (n_voxels, n_test)
+                betas = all_pinvs[fold_idx][d_idx] @ train_chunk.T  # (n_stim, chunk)
+                # Accumulate per test run using contiguous slices.
+                for r in test_runs:
+                    r_start, r_end = run_starts[r], run_ends[r]
+                    test_design_r = designs_by_run[d_idx][r].to(device)
+                    yhat_r = (test_design_r @ betas).T               # (chunk, T_r)
+                    sum_yhat[d_idx, :, r_start:r_end] += yhat_r
 
-                if metric == "cod":
-                    sum_yyhat = (test_data_split * yhat).sum(dim=1)
-                    sum_yhat2 = (yhat ** 2).sum(dim=1)
-                    ss_res = sum_y2_test - 2 * sum_yyhat + sum_yhat2
-                    r2_fold = (1.0 - ss_res / ss_tot).cpu()
-                elif metric in ("corr", "corr2"):
-                    sum_yhat = yhat.sum(dim=1)
-                    sum_yhat2 = (yhat ** 2).sum(dim=1)
-                    num = n_test * (test_data_split * yhat).sum(dim=1) - sum_y_test * sum_yhat
-                    den_y = (n_test * sum_y2_test - sum_y_test ** 2).clamp(min=1e-10)
-                    den_yhat = (n_test * sum_yhat2 - sum_yhat ** 2).clamp(min=1e-10)
-                    r = (num / torch.sqrt(den_y * den_yhat)).cpu()
-                    r2_fold = r ** 2 if metric == "corr2" else r
-                else:
-                    raise ValueError(f"Unknown metric: {metric}")
-                r2_acc[:, d_idx] += r2_fold / n_splits
-        else:
-            # Chunked path: stream voxels from CPU to GPU
-            for cs in range(0, n_voxels, chunk_size):
-                ce = min(cs + chunk_size, n_voxels)
+            del train_chunk
 
-                train_chunk = train_data_split[cs:ce].to(device)  # (chunk, T_train)
-                test_chunk = test_data_split[cs:ce].to(device)    # (chunk, T_test)
+        # R2 from averaged predictions.
+        data_chunk = projected_data[cs:ce]
+        if not data_on_device:
+            data_chunk = data_chunk.to(device)
+        count_d = count_per_tp.to(device)
+        ss_tot_chunk = ss_tot_global[cs:ce].to(device)
 
-                # Per-fold test stats (test timepoints only — correct SS_tot)
-                sum_y_test = test_chunk.sum(dim=1)          # (chunk,)
-                sum_y2_test = (test_chunk ** 2).sum(dim=1)  # (chunk,)
-                ss_tot = (sum_y2_test - sum_y_test ** 2 / n_test).clamp(min=1e-10)
+        for d_idx in range(n_designs):
+            avg_yhat_d = sum_yhat[d_idx] / count_d    # (chunk, n_tp)
+            ss_res = ((data_chunk - avg_yhat_d) ** 2).sum(dim=1)
+            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).cpu()
 
-                for d_idx in range(n_designs):
-                    # pinv already on GPU, chunk transpose on GPU: fast matmul
-                    betas = pinv_trains_gpu[d_idx] @ train_chunk.T  # (n_stim, chunk)
-                    yhat = (test_designs_gpu[d_idx] @ betas).T      # (chunk, T_test)
-
-                    if metric == "cod":
-                        sum_yyhat = (test_chunk * yhat).sum(dim=1)
-                        sum_yhat2 = (yhat ** 2).sum(dim=1)
-                        ss_res = sum_y2_test - 2 * sum_yyhat + sum_yhat2
-                        r2_fold = (1.0 - ss_res / ss_tot).cpu()
-                    elif metric in ("corr", "corr2"):
-                        sum_yhat = yhat.sum(dim=1)
-                        sum_yhat2 = (yhat ** 2).sum(dim=1)
-                        num = n_test * (test_chunk * yhat).sum(dim=1) - sum_y_test * sum_yhat
-                        den_y = (n_test * sum_y2_test - sum_y_test ** 2).clamp(min=1e-10)
-                        den_yhat = (n_test * sum_yhat2 - sum_yhat ** 2).clamp(min=1e-10)
-                        r = (num / torch.sqrt(den_y * den_yhat)).cpu()
-                        r2_fold = r ** 2 if metric == "corr2" else r
-                    else:
-                        raise ValueError(f"Unknown metric: {metric}")
-                    r2_acc[cs:ce, d_idx] += r2_fold / n_splits
-
-                del train_chunk, test_chunk
-
-        del train_data_split, test_data_split, train_designs_gpu, test_designs_gpu, pinv_trains_gpu
+        del sum_yhat, data_chunk
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    return r2_acc
+    del all_pinvs
+    return r2_out
 
 
 def _evaluate_hrfs_batched_loro(
