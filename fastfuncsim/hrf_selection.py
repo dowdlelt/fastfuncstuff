@@ -157,6 +157,10 @@ class HRFSelectionResults:
     xval_r2_std: torch.Tensor = None
     xval_r2_all_hrfs: torch.Tensor = None
     xval_r2_canonical: torch.Tensor = None  # Baseline with single canonical HRF
+    canonical_full_r2: Optional[torch.Tensor] = None    # In-sample R², canonical HRF
+    hrfopt_full_r2: Optional[torch.Tensor] = None        # In-sample R², best HRF per voxel
+    canonical_xval_r2: Optional[torch.Tensor] = None     # Beta-series CV R², canonical HRF
+    hrfopt_xval_r2: Optional[torch.Tensor] = None        # Beta-series CV R², best HRF per voxel
     final_results: GLMResults = None
     canonical_results: GLMResults = None  # Full GLM with canonical HRF for comparison
     hrf_library: torch.Tensor = None
@@ -600,7 +604,11 @@ def fit_glm_hrf_library_with_xval(
 
     # If data fits on GPU, move it there to eliminate CPU→GPU transfers entirely.
     # This is the fast path for small/medium datasets (e.g., masked data, ROIs).
-    keep_on_cpu = estimate_keep_on_cpu(n_voxels, n_timepoints, device)
+    # LORO CV needs ~3x data size for working memory (train-split copies + lstsq
+    # workspace), so use a conservative 0.25 safety fraction.
+    keep_on_cpu = estimate_keep_on_cpu(
+        n_voxels, n_timepoints, device, gpu_safety_fraction=0.25,
+    )
     if not keep_on_cpu and device.type != "cpu":
         projected_data = projected_data.to(device)
 
@@ -1778,6 +1786,14 @@ def save_hrf_selection_results(
             voxel_mask,
         )
         output_files["xval_r2_all_hrfs"] = xval_r2_all_file
+
+    # 3d. Save clearly-named R² maps (single-trial path)
+    for field_name in ["canonical_full_r2", "hrfopt_full_r2", "canonical_xval_r2", "hrfopt_xval_r2"]:
+        val = getattr(results, field_name, None)
+        if val is not None:
+            fpath = f"{output_prefix}_{field_name}.nii.gz"
+            _save_volume(val, fpath, volume_shape, affine, voxel_mask)
+            output_files[field_name] = fpath
 
     # 4. Save final betas
     if results.final_results is not None:

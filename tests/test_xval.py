@@ -844,6 +844,241 @@ class TestComputeR2MetricAdvanced:
         assert torch.all(torch.isfinite(r2_cod))
 
 
+class TestSingleTrialCVHelper:
+    """Tests for single_trial_cv_helper batch beta-series CV."""
+
+    @staticmethod
+    def _make_betas(n_voxels=50, n_trials=40, n_conditions=10, n_runs=4, snr=2.0):
+        """Create synthetic betas with known condition structure."""
+        torch.manual_seed(42)
+        trials_per_run = n_trials // n_runs
+        trial_condition_ids = torch.arange(n_conditions).repeat(n_trials // n_conditions)
+        trial_run_ids = torch.arange(n_runs).repeat_interleave(trials_per_run)
+
+        # Ground truth: each condition has a stable pattern across voxels
+        true_patterns = torch.randn(n_voxels, n_conditions)
+        betas = true_patterns[:, trial_condition_ids] + (1.0 / snr) * torch.randn(n_voxels, n_trials)
+        cv_splits = [(
+            [r for r in range(n_runs) if r != held],
+            [held],
+        ) for held in range(n_runs)]
+        return betas, trial_condition_ids, trial_run_ids, cv_splits
+
+    def test_single_variant_equivalence(self):
+        """single_trial_cv_helper(unsqueeze) == compute_xval_r2_single_trials."""
+        from fastfuncsim.xval import compute_xval_r2_single_trials, single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas()
+
+        old = compute_xval_r2_single_trials(
+            betas, cids, rids, splits, device=torch.device("cpu"), verbose=False)
+
+        new = single_trial_cv_helper(
+            betas.unsqueeze(0), cids, rids, splits,
+            zscore_by_run=False, device=torch.device("cpu"), verbose=False)
+
+        torch.testing.assert_close(old["r2"], new["r2"].squeeze(0), atol=1e-5, rtol=1e-5)
+        assert old["n_splits"] == new["n_splits"]
+        assert old["n_test_trials_total"] == new["n_test_trials_total"]
+
+    def test_multi_variant_shape(self):
+        """Output shape is (n_variants, n_voxels) for multiple variants."""
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas()
+        n_variants = 5
+        # Stack identical betas as multiple variants
+        multi = betas.unsqueeze(0).expand(n_variants, -1, -1).clone()
+
+        result = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            device=torch.device("cpu"), verbose=False)
+
+        assert result["r2"].shape == (n_variants, betas.shape[0])
+        assert result["r2_mean"].shape == (n_variants,)
+
+    def test_multi_variant_identical_input_gives_same_r2(self):
+        """All variants identical (no zscore) → same R² per variant."""
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas()
+        n_variants = 3
+        multi = betas.unsqueeze(0).expand(n_variants, -1, -1).clone()
+
+        result = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            zscore_by_run=False, device=torch.device("cpu"), verbose=False)
+
+        # All variants should produce identical R²
+        for v in range(1, n_variants):
+            torch.testing.assert_close(result["r2"][0], result["r2"][v], atol=1e-5, rtol=1e-5)
+
+    def test_zscore_normalization_math(self):
+        """Z-scoring normalizes per-run betas using reference variant stats."""
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas(snr=5.0)
+
+        # Variant 0: original betas (reference)
+        # Variant 1: scaled betas (2x amplitude) — without z-scoring, R² differs
+        scaled = betas * 2.0
+        multi = torch.stack([betas, scaled], dim=0)
+
+        # Without z-scoring: both should get same R² (CoD is scale-invariant for
+        # condition-average predictions, since both prediction and actual scale)
+        result_no_z = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            zscore_by_run=False, device=torch.device("cpu"), verbose=False)
+
+        # With z-scoring from reference (variant 0): variant 1 gets normalized
+        result_z = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            zscore_by_run=True, reference_variant_idx=0,
+            device=torch.device("cpu"), verbose=False)
+
+        # Both variants should have valid R² in both cases
+        assert result_no_z["r2"].shape == (2, betas.shape[0])
+        assert result_z["r2"].shape == (2, betas.shape[0])
+        # Mean R² should be positive (good signal)
+        assert result_z["r2_mean"][0] > 0.0
+        assert result_z["r2_mean"][1] > 0.0
+
+    def test_zscore_reference_variant(self):
+        """Z-scoring with different reference variants gives different results."""
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas(snr=3.0)
+
+        # Variant 0: original, Variant 1: add run-specific offset
+        shifted = betas.clone()
+        for r in range(4):
+            mask = rids == r
+            shifted[:, mask] += r * 0.5  # different offset per run
+
+        multi = torch.stack([betas, shifted], dim=0)
+
+        r_ref0 = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            zscore_by_run=True, reference_variant_idx=0,
+            device=torch.device("cpu"), verbose=False)
+
+        r_ref1 = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            zscore_by_run=True, reference_variant_idx=1,
+            device=torch.device("cpu"), verbose=False)
+
+        # Results should differ because normalization stats come from different variants
+        assert not torch.allclose(r_ref0["r2"], r_ref1["r2"], atol=1e-3)
+
+    def test_single_condition(self):
+        """Edge case: all trials belong to the same condition."""
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        n_voxels, n_trials, n_runs = 20, 16, 4
+        torch.manual_seed(0)
+        betas = torch.randn(1, n_voxels, n_trials)
+        cids = torch.zeros(n_trials, dtype=torch.long)
+        rids = torch.arange(n_runs).repeat_interleave(n_trials // n_runs)
+        splits = [([r for r in range(n_runs) if r != h], [h]) for h in range(n_runs)]
+
+        result = single_trial_cv_helper(
+            betas, cids, rids, splits,
+            device=torch.device("cpu"), verbose=False)
+
+        assert result["r2"].shape == (1, n_voxels)
+        # Single condition: prediction = grand mean of train → should be mediocre
+        assert torch.all(torch.isfinite(result["r2"]))
+
+    def test_zero_variance_voxels(self):
+        """Edge case: voxels with zero variance across trials."""
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas()
+
+        # Set first 5 voxels to constant
+        betas_mod = betas.clone()
+        betas_mod[:5, :] = 1.0
+        multi = betas_mod.unsqueeze(0)
+
+        result = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            device=torch.device("cpu"), verbose=False)
+
+        assert result["r2"].shape == (1, betas.shape[0])
+        assert torch.all(torch.isfinite(result["r2"]))
+
+    def test_chunked_matches_unchunked(self):
+        """Chunked processing gives same result as unchunked."""
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas(n_voxels=100)
+        multi = betas.unsqueeze(0)
+
+        r_full = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            chunk_size=None, device=torch.device("cpu"), verbose=False)
+
+        r_chunked = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            chunk_size=17, device=torch.device("cpu"), verbose=False)
+
+        torch.testing.assert_close(r_full["r2"], r_chunked["r2"], atol=1e-5, rtol=1e-5)
+
+    def test_multi_variant_chunked_matches_unchunked(self):
+        """
+        Chunked processing with >1 variant gives same result as unchunked.
+
+        This is a regression test for a bug where fold_pred chunks were
+        reshaped with (n_variants*n_chunk) then cat on dim=0, causing
+        interleaved variant/voxel ordering incompatible with the final
+        (n_variants, n_voxels) reshape.  Fixed by keeping chunks as
+        (n_variants, n_chunk, n_test) and catting on dim=1.
+        """
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas(n_voxels=100)
+        n_variants = 5
+        # Different variants: scale betas by [0.2, 0.4, 0.6, 0.8, 1.0]
+        multi = torch.stack([betas * s for s in [0.2, 0.4, 0.6, 0.8, 1.0]])
+
+        r_full = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            chunk_size=None, device=torch.device("cpu"), verbose=False)
+
+        r_chunked = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            chunk_size=17, device=torch.device("cpu"), verbose=False)
+
+        assert r_full["r2"].shape == (n_variants, 100)
+        assert r_chunked["r2"].shape == (n_variants, 100)
+        torch.testing.assert_close(r_full["r2"], r_chunked["r2"], atol=1e-5, rtol=1e-5)
+
+    def test_multi_variant_test_variant_idx_chunked_matches_unchunked(self):
+        """
+        test_variant_idx mode (GLMsingle pattern) with chunking gives same
+        result as unchunked.  Covers the combined multi-variant + test_variant_idx
+        + chunked code path.
+        """
+        from fastfuncsim.xval import single_trial_cv_helper
+
+        betas, cids, rids, splits = self._make_betas(n_voxels=80)
+        n_variants = 4
+        multi = torch.stack([betas * s for s in [0.3, 0.6, 0.9, 1.0]])
+
+        # Use last variant (frac=1.0 / OLS) as test target
+        r_full = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            test_variant_idx=n_variants - 1,
+            chunk_size=None, device=torch.device("cpu"), verbose=False)
+
+        r_chunked = single_trial_cv_helper(
+            multi, cids, rids, splits,
+            test_variant_idx=n_variants - 1,
+            chunk_size=11, device=torch.device("cpu"), verbose=False)
+
+        torch.testing.assert_close(r_full["r2"], r_chunked["r2"], atol=1e-5, rtol=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

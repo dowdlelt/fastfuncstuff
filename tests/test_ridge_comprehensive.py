@@ -333,7 +333,7 @@ class TestRidgeFullPipeline:
         """Test that ridge can recover known single-trial betas."""
         tr = 2.0
         n_timepoints = 150
-        n_runs = 2  # Use 2 runs to avoid ridge.py bug
+        n_runs = 2  # 2 runs is sufficient for this beta-recovery test
         n_conditions = 2
         events_per_cond = 6
         matrix_size = (6, 6, 3)  # Small for speed

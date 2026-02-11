@@ -52,6 +52,7 @@ try:
         get_average_run_duration,
         load_and_preprocess_runs,
         LoadResult,
+        preflight_check,
     )
     from fastfuncsim.denoise import (
         DenoiseResults,
@@ -1246,6 +1247,14 @@ def main():
     if args.verbose:
         print(f"  CV strategy: {cv_strategy}")
 
+    # Pre-flight checks (before slow data loading)
+    preflight_check(
+        input_files=input_files,
+        onset_files=onset_files,
+        ortvec_files=[(f, label) for f, label in args.ortvec] if args.ortvec else None,
+        hrf_opt_prefix=args.hrf_opt or None,
+    )
+
     # Setup device
     if args.device:
         device = torch.device(args.device if args.device.lower() != "cpu" else "cpu")
@@ -1593,6 +1602,7 @@ def main():
             compute_xval_r2_single_trials,
             generate_cv_splits,
             project_out_nuisance_per_run,
+            single_trial_cv_helper,
         )
 
         print()
@@ -1763,15 +1773,23 @@ def main():
             verbose=args.verbose,
         )
 
-        # 5. For each PC count: fit single-trial model with wide design, beta-space CV
+        # 5. For each PC count: fit single-trial model with wide design, collect betas
         print()
         print(f"Optimizing PC count (0 to {args.max_pcs})...")
         n_voxels_st = data.shape[0]
-        # Collect per-voxel R² at each PC count (on CPU)
-        r2_maps_st = torch.zeros(n_voxels_st, args.max_pcs + 1)
+        n_pc_counts = args.max_pcs + 1
 
-        pc_range = range(args.max_pcs + 1)
-        for n_pcs in tqdm(pc_range, desc="  Testing PC counts", disable=not args.verbose):
+        # Determine n_trials from the design
+        if not per_voxel_st:
+            n_trials_st = st_design.shape[1]
+        else:
+            n_trials_st = st_design.shape[2]  # (n_unique_hrfs, n_tp, n_trials)
+
+        # Collect all betas: (n_pc_counts, n_voxels, n_trials) on CPU
+        all_st_betas = torch.zeros(n_pc_counts, n_voxels_st, n_trials_st)
+
+        pc_range = range(n_pc_counts)
+        for n_pcs in tqdm(pc_range, desc="  Fitting PC counts", disable=not args.verbose):
             # Build nuisance: polynomials + first n_pcs per run
             nuisance_blocks = []
             for run_idx in range(n_runs):
@@ -1796,11 +1814,10 @@ def main():
                     verbose=False,
                     task_indices=task_indices,
                 )
-                st_betas = glm_results.betas  # (n_voxels, n_trials)
+                all_st_betas[n_pcs] = glm_results.betas.cpu()
             else:
                 # Per-voxel HRF path: group by HRF index
-                st_betas = torch.zeros(n_voxels_st, n_trials, device=data.device)
-                task_indices = list(range(n_trials))
+                task_indices = list(range(n_trials_st))
                 for hrf_idx in unique_hrfs:
                     voxel_mask = hrf_indices_dev == hrf_idx
                     group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
@@ -1814,20 +1831,22 @@ def main():
                         verbose=False,
                         task_indices=task_indices,
                     )
-                    st_betas[voxel_mask] = glm_results.betas
+                    all_st_betas[n_pcs, voxel_mask] = glm_results.betas.cpu()
 
-            # Beta-space CV
-            xval = compute_xval_r2_single_trials(
-                st_betas,
-                trial_cond_ids,
-                trial_run_ids,
-                cv_splits,
-                metric=args.cv_metric,
-                device=device,
-                verbose=False,
-            )
-
-            r2_maps_st[:, n_pcs] = xval["r2"]
+        # Batch beta-space CV across all PC counts at once
+        print("  Computing beta-space CV R² for all PC counts (batch)...")
+        xval = single_trial_cv_helper(
+            all_st_betas,
+            trial_cond_ids,
+            trial_run_ids,
+            cv_splits,
+            metric=args.cv_metric,
+            zscore_by_run=True,
+            reference_variant_idx=0,
+            device=device,
+            verbose=False,
+        )
+        r2_maps_st = xval["r2"].T  # (n_voxels, n_pc_counts)
 
         # Determine criteria mask: voxels above threshold in ANY PC count
         # Then re-evaluate all PC counts with the same consistent mask

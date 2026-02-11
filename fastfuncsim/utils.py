@@ -2,6 +2,7 @@
 Utility functions for fastfuncsim
 Device management and helper functions
 """
+
 from __future__ import annotations
 
 import platform
@@ -91,9 +92,7 @@ def print_device_info(device: torch.device):
     """Print information about the device being used"""
     if device.type == "cuda":
         print(f"Using CUDA GPU: {torch.cuda.get_device_name(device)}")
-        print(
-            f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB"
-        )
+        print(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB")
     elif device.type == "mps":
         print("Using Apple Metal Performance Shaders (MPS)")
     else:
@@ -224,9 +223,7 @@ def scale_to_percent_signal(
     scale_factors = torch.zeros(n_voxels, n_runs, device=device)
 
     # Track violations (keep on CPU to avoid GPU OOM)
-    violations_mask = torch.zeros(
-        n_voxels, n_timepoints_total, dtype=torch.bool, device="cpu"
-    )
+    violations_mask = torch.zeros(n_voxels, n_timepoints_total, dtype=torch.bool, device="cpu")
 
     if verbose:
         print("Scaling to percent signal change (mean=100 per run)...")
@@ -364,7 +361,9 @@ def gaussian_blur_3d(
 
     if verbose:
         print(f"Gaussian blur: FWHM = {fwhm_mm:.1f} mm")
-        print(f"  Voxel sizes: {voxel_sizes[0]:.2f} × {voxel_sizes[1]:.2f} × {voxel_sizes[2]:.2f} mm")
+        print(
+            f"  Voxel sizes: {voxel_sizes[0]:.2f} × {voxel_sizes[1]:.2f} × {voxel_sizes[2]:.2f} mm"
+        )
         print(f"  Sigma (voxels): {sigma_vox[0]:.2f} × {sigma_vox[1]:.2f} × {sigma_vox[2]:.2f}")
 
     # Create 1D Gaussian kernels for each dimension
@@ -409,6 +408,7 @@ def gaussian_blur_3d(
     # Process each timepoint
     if verbose:
         from tqdm import tqdm
+
         iterator = tqdm(range(nt), desc="  Blurring", unit="vol")
     else:
         iterator = range(nt)
@@ -552,14 +552,16 @@ def generate_synthetic_runs(
 
             if verbose:
                 print()
-            for run_idx in tqdm(range(n_runs_to_generate), desc="  Simulating runs", disable=not verbose):
-                    run_number = run_idx + start_idx
-                    start_tp = run_number * run_length
-                    end_tp = start_tp + run_length
-                    # Slice from the pre-generated random data
-                    src_start = run_idx * run_length
-                    src_end = src_start + run_length
-                    synthetic_data[:, start_tp:end_tp] = all_random[:, src_start:src_end]
+            for run_idx in tqdm(
+                range(n_runs_to_generate), desc="  Simulating runs", disable=not verbose
+            ):
+                run_number = run_idx + start_idx
+                start_tp = run_number * run_length
+                end_tp = start_tp + run_length
+                # Slice from the pre-generated random data
+                src_start = run_idx * run_length
+                src_end = src_start + run_length
+                synthetic_data[:, start_tp:end_tp] = all_random[:, src_start:src_end]
         except ImportError:
             # Fallback without tqdm
             for run_idx in range(n_runs_to_generate):
@@ -578,3 +580,88 @@ def generate_synthetic_runs(
         print(f"  Memory: {synthetic_data.numel() * 4 / 1e9:.2f} GB (CPU)")
 
     return synthetic_data
+
+
+def load_per_run_nuisance_files(
+    prefix: str,
+    n_runs: int,
+    suffix: str = "_selected_PCs.txt",
+    verbose: bool = False,
+) -> list[Optional[np.ndarray]]:
+    """
+    Load per-run nuisance/regressor files.
+
+    This is a general function for loading nuisance files that are stored
+    separately per run, with a naming pattern like:
+        {prefix}_run01{suffix}
+        {prefix}_run02{suffix}
+        ...
+
+    Files can be empty (no regressors for that run), and different runs
+    can have different numbers of regressors.
+
+    Parameters
+    ----------
+    prefix : str
+        Prefix for the per-run files (e.g., "dncond_w_condhrf")
+    n_runs : int
+        Number of runs (will load run01 through run{n_runs:02d})
+    suffix : str, default="_selected_PCs.txt"
+        Suffix for each file (includes extension)
+    verbose : bool, default=False
+        Print loading information
+
+    Returns
+    -------
+    nuisance_per_run : list of ndarray or None
+        List of per-run nuisance matrices, each (n_timepoints_run, n_regressors_run)
+        None for runs with empty or missing files (no regressors)
+
+    Examples
+    --------
+    Load per-run noise PCs:
+        >>> pcs = load_per_run_nuisance_files(
+        ...     "dncond_w_condhrf",
+        ...     n_runs=17,
+        ...     suffix="_selected_PCs.txt"
+        ... )
+    """
+    from pathlib import Path
+
+    nuisance_per_run = []
+
+    for run_idx in range(1, n_runs + 1):
+        run_file = f"{prefix}_run{run_idx:02d}{suffix}"
+
+        try:
+            # Check if file exists first
+            if not Path(run_file).exists():
+                if verbose:
+                    print(f"  Run {run_idx:02d}: No file ({run_file})")
+                nuisance_per_run.append(None)
+                continue
+
+            # Load data for this run
+            data = np.loadtxt(run_file)
+
+            # Handle empty files (0 rows or 0 cols)
+            if data.size == 0:
+                if verbose:
+                    print(f"  Run {run_idx:02d}: Empty file")
+                nuisance_per_run.append(None)
+                continue
+
+            # Handle 1D arrays (single regressor) - convert to 2D column vector
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+
+            n_tps, n_regs = data.shape
+            if verbose:
+                print(f"  Run {run_idx:02d}: Loaded {n_regs} regressor(s), {n_tps} timepoints")
+
+            nuisance_per_run.append(data)
+
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"Error loading nuisance file '{run_file}': {e}")
+
+    return nuisance_per_run

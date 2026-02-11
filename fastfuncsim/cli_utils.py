@@ -1442,3 +1442,149 @@ def build_task_design_from_args(
 
         assert isinstance(task_design, torch.Tensor), "Expected Tensor for single HRF"
         return task_design, None
+
+
+def preflight_check(
+    input_files: list[str],
+    onset_files: Optional[list[str]] = None,
+    ortvec_files: Optional[list[tuple[str, str]]] = None,
+    hrf_opt_prefix: Optional[str] = None,
+    denoise_prefix: Optional[str] = None,
+) -> None:
+    """
+    Run pre-flight input checks before slow data loading.
+
+    Validates file existence and basic consistency (onset row counts, ortvec
+    row counts) using only fast header reads and line counts. Collects ALL
+    errors before exiting so users can fix everything in one pass.
+
+    Parameters
+    ----------
+    input_files : list of str
+        Resolved list of input NIfTI run files (already validated to exist).
+    onset_files : list of str, optional
+        AFNI timing files — one per condition. Each must have exactly n_runs rows.
+    ortvec_files : list of (path, label) tuples, optional
+        Nuisance regressor files. Each must exist and have exactly total_timepoints rows.
+    hrf_opt_prefix : str, optional
+        Prefix for HRFoptfast outputs. Checks `{prefix}_hrf_index.nii.gz` exists.
+    denoise_prefix : str, optional
+        Prefix for 3dDenoisefast outputs. Checks `{prefix}_noise_pcs.xmat.1D` exists.
+    """
+    import nibabel as nib
+
+    errors: list[str] = []
+    n_runs = len(input_files)
+
+    # ------------------------------------------------------------------
+    # 1. Onset files: each file must have exactly n_runs non-empty rows
+    # ------------------------------------------------------------------
+    if onset_files:
+        for onset_file in onset_files:
+            try:
+                with open(onset_file) as fh:
+                    rows = [
+                        ln.strip()
+                        for ln in fh
+                        if ln.strip() and not ln.strip().startswith("#")
+                    ]
+                if len(rows) != n_runs:
+                    errors.append(
+                        f"  Onset file '{onset_file}': {len(rows)} rows "
+                        f"but {n_runs} runs were specified"
+                    )
+            except OSError as exc:
+                errors.append(f"  Cannot read onset file '{onset_file}': {exc}")
+
+    # ------------------------------------------------------------------
+    # 2. HRFopt output file
+    # ------------------------------------------------------------------
+    if hrf_opt_prefix:
+        hrf_index_file = f"{hrf_opt_prefix}_hrf_index.nii.gz"
+        if not Path(hrf_index_file).exists():
+            errors.append(f"  -hrf_opt file not found: {hrf_index_file}")
+
+    # ------------------------------------------------------------------
+    # 3. Denoise output file(s)
+    # ------------------------------------------------------------------
+    if denoise_prefix:
+        # Check for per-run files first (e.g., prefix_run01_selected_PCs.txt)
+        # If not found, check for Denoisefast format (prefix_noise_pcs.xmat.1D)
+        per_run_files_exist = False
+        per_run_missing = []
+
+        for run_idx in range(1, n_runs + 1):
+            run_file = Path(f"{denoise_prefix}_run{run_idx:02d}_selected_PCs.txt")
+            if run_file.exists():
+                per_run_files_exist = True
+            else:
+                per_run_missing.append(run_file.name)
+
+        if per_run_files_exist:
+            # At least one per-run file exists - warn about missing ones but don't error
+            # (empty/missing files are allowed for per-run format)
+            if per_run_missing:
+                print(f"  Note: Some per-run denoise files not found (will use no regressors):")
+                for name in per_run_missing[:3]:
+                    print(f"    {name}")
+                if len(per_run_missing) > 3:
+                    print(f"    ... and {len(per_run_missing) - 3} more")
+        else:
+            # No per-run files found - check for Denoisefast format
+            noise_pc_file = f"{denoise_prefix}_noise_pcs.xmat.1D"
+            if not Path(noise_pc_file).exists():
+                errors.append(
+                    f"  -denoise files not found:\n"
+                    f"    Neither per-run files ({denoise_prefix}_run01_selected_PCs.txt, etc.)\n"
+                    f"    nor Denoisefast format ({noise_pc_file})"
+                )
+
+    # ------------------------------------------------------------------
+    # 4. Ortvec files: must exist and have correct row count
+    #    (requires reading NIfTI headers to get total_timepoints)
+    # ------------------------------------------------------------------
+    if ortvec_files:
+        # Fast header-only reads to get total timepoints
+        total_timepoints = 0
+        header_ok = True
+        for nii_file in input_files:
+            try:
+                shape = nib.load(nii_file).shape
+                total_timepoints += shape[3] if len(shape) >= 4 else 1
+            except Exception as exc:
+                errors.append(f"  Cannot read NIfTI header '{nii_file}': {exc}")
+                header_ok = False
+
+        if header_ok:
+            for ortvec_file, label in ortvec_files:
+                if not Path(ortvec_file).exists():
+                    errors.append(f"  -ortvec file not found: {ortvec_file} (label={label})")
+                    continue
+                try:
+                    with open(ortvec_file) as fh:
+                        rows = [
+                            ln
+                            for ln in fh
+                            if ln.strip() and not ln.strip().startswith("#")
+                        ]
+                    if len(rows) != total_timepoints:
+                        errors.append(
+                            f"  -ortvec file '{ortvec_file}' (label={label}): "
+                            f"{len(rows)} rows but expected {total_timepoints} "
+                            f"(sum of all run lengths)"
+                        )
+                except OSError as exc:
+                    errors.append(f"  Cannot read ortvec file '{ortvec_file}': {exc}")
+
+    # ------------------------------------------------------------------
+    # Report and exit
+    # ------------------------------------------------------------------
+    if errors:
+        print()
+        print("=" * 60)
+        print("PRE-FLIGHT CHECK FAILED — fix these before re-running:")
+        print("=" * 60)
+        for err in errors:
+            print(err)
+        print()
+        sys.exit(1)

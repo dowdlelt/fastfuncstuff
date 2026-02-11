@@ -92,10 +92,17 @@ _global_profiler: Optional[TimingProfiler] = None
 
 
 def get_profiler(enabled: bool = True) -> TimingProfiler:
-    """Get or create global profiler."""
+    """Get or create global profiler.
+
+    If the global profiler already exists, its ``enabled`` flag is updated
+    to match the *enabled* argument so callers can re-enable profiling
+    after it was previously disabled.
+    """
     global _global_profiler
     if _global_profiler is None:
         _global_profiler = TimingProfiler(enabled=enabled)
+    else:
+        _global_profiler.enabled = enabled
     return _global_profiler
 
 

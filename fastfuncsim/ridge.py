@@ -38,6 +38,7 @@ def _fit_ridge_multiple_fracs(
     y: torch.Tensor,
     fracs: np.ndarray,
     device: torch.device,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Fit ridge regression for multiple fractions using fracridge algorithm
@@ -54,25 +55,35 @@ def _fit_ridge_multiple_fracs(
     X : torch.Tensor, shape (n_samples, n_features)
         Design matrix
     y : torch.Tensor, shape (n_samples, n_targets)
-        Target data (multiple targets)
+        Target data (multiple targets).  When chunk_size is given, y may
+        remain on CPU; the function streams chunks to the device internally.
     fracs : np.ndarray, shape (n_fracs,)
         Ridge fractions (1 = OLS, 0 = maximum regularization)
     device : torch.device
         Device for computation
+    chunk_size : int, optional
+        When provided, process targets in chunks of this size.  y is kept on
+        its original device (CPU) and only small chunks are moved to the
+        compute device.  The returned tensor lives on CPU.  When None
+        (default), the original single-pass GPU path is used and the returned
+        tensor lives on ``device``.
 
     Returns
     -------
     coefs : torch.Tensor, shape (n_features, n_fracs, n_targets)
-        Coefficients for each fraction and target
+        Coefficients for each fraction and target.
+        Device: same as ``device`` when chunk_size is None; CPU otherwise.
     """
     X = X.to(device)
-    y = y.to(device)
+    chunk_mode = chunk_size is not None
+    if not chunk_mode:
+        y = y.to(device)
 
     n_samples, n_features = X.shape
     n_targets = y.shape[1]
     n_fracs = len(fracs)
 
-    # Compute SVD of X: X = U @ S @ Vt
+    # Compute SVD of X: X = U @ S @ Vt  (small matrices, keep on device)
     U, S, Vt = torch.linalg.svd(X, full_matrices=False)
 
     # Handle rank-deficiency: Filter out zero/tiny singular values
@@ -87,12 +98,6 @@ def _fit_ridge_multiple_fracs(
         U = U[:, valid_mask]
         Vt = Vt[valid_mask, :]
 
-    # Compute U'y
-    Uty = U.T @ y  # (n_valid, n_targets)
-
-    # OLS solution in rotated space: S^{-1} U'y
-    ols_coef_rotated = Uty / S.unsqueeze(1)  # (n_valid, n_targets)
-
     # Squared singular values
     S_sq = S ** 2
 
@@ -101,10 +106,10 @@ def _fit_ridge_multiple_fracs(
 
     # Edge case: completely rank-deficient (no valid singular values)
     if n_valid_rank == 0:
-        # Return zero coefficients for all fractions
-        n_fracs = len(fracs)
-        coefs = torch.zeros(n_features, n_fracs, n_targets, device=device)
-        return coefs
+        if chunk_mode:
+            return torch.zeros(n_features, n_fracs, n_targets)  # CPU
+        else:
+            return torch.zeros(n_features, n_fracs, n_targets, device=device)
 
     # Create alpha grid for interpolation (log-spaced from small to large)
     # Match fracridge exactly: BIG_BIAS = 10e3 = 10000, SMALL_BIAS = 10e-3 = 0.01
@@ -139,66 +144,98 @@ def _fit_ridge_multiple_fracs(
     sclg = S_sq.unsqueeze(0) / (S_sq.unsqueeze(0) + alphagrid.unsqueeze(1))
     sclg_sq = sclg ** 2
 
-    # Allocate output (will be filled after unrotation)
-    coefs = torch.zeros(n_features, n_fracs, n_targets, device=device)
-
-    # ========================================================================
-    # Vectorized interpolation for all targets at once
-    # ========================================================================
-    # Compute coefficient length for each alpha in grid, for all targets
-    # newlen: (n_alphas, n_targets)
-    newlen = torch.sqrt(torch.einsum('aj,jt->at', sclg_sq, ols_coef_rotated ** 2))
-
-    # Normalize to OLS length (alphagrid[0] = 0)
-    # Add epsilon to avoid division by zero for zero-variance voxels
-    ols_len = newlen[0:1, :]  # (1, n_targets)
-    newlen = newlen / (ols_len + 1e-10)  # (n_alphas, n_targets)
-
-    # Handle edge case: if OLS length is zero/tiny, set to 1.0 (will pick OLS = frac 1.0)
-    zero_variance = ols_len.squeeze() < 1e-8
-    if zero_variance.any():
-        # For zero-variance voxels, set newlen to 1.0 everywhere (picks frac=1.0 which is fine)
-        newlen[:, zero_variance] = 1.0
-
-    # Move to CPU for interpolation
+    # log-alpha grid (shared across all chunks / all targets)
     log_alphagrid_np = np.log(1 + alphagrid.flip(0).cpu().numpy())  # (n_alphas,)
-    newlen_np = newlen.flip(0).cpu().numpy()  # (n_alphas, n_targets)
 
-    # Per-target interpolation (each voxel has its own coefficient length curve)
-    log_target_alphas_all = np.zeros((n_fracs, n_targets), dtype=np.float32)
-    for target_idx in range(n_targets):
-        log_target_alphas_all[:, target_idx] = np.interp(
-            fracs, newlen_np[:, target_idx], log_alphagrid_np
-        )
+    if not chunk_mode:
+        # ====================================================================
+        # Original single-pass path (y already on device)
+        # ====================================================================
+        Uty = U.T @ y  # (n_valid, n_targets)
+        ols_coef_rotated = Uty / S.unsqueeze(1)  # (n_valid, n_targets)
 
-    # Convert back to torch
-    targetalphas_all = torch.tensor(
-        np.exp(log_target_alphas_all) - 1, device=device, dtype=X.dtype
-    )  # (n_fracs, n_targets)
+        newlen = torch.sqrt(torch.einsum('aj,jt->at', sclg_sq, ols_coef_rotated ** 2))
+        ols_len = newlen[0:1, :]  # (1, n_targets)
+        newlen = newlen / (ols_len + 1e-10)  # (n_alphas, n_targets)
 
-    # Replace any NaN/inf with zero (will give OLS solution for those voxels)
-    if torch.isnan(targetalphas_all).any() or torch.isinf(targetalphas_all).any():
-        targetalphas_all = torch.nan_to_num(targetalphas_all, nan=0.0, posinf=1e10, neginf=0.0)
+        zero_variance = ols_len.squeeze() < 1e-8
+        if zero_variance.any():
+            newlen[:, zero_variance] = 1.0
 
-    # Compute scaling factors for all targets: (n_valid_rank, n_fracs, n_targets)
-    # S_sq: (n_valid_rank,), targetalphas_all: (n_fracs, n_targets)
-    sc_all = S_sq.unsqueeze(1).unsqueeze(2) / (
-        S_sq.unsqueeze(1).unsqueeze(2) + targetalphas_all.unsqueeze(0)
-    )  # (n_valid_rank, n_fracs, n_targets)
+        newlen_np = newlen.flip(0).cpu().numpy()
 
-    # Apply scaling to OLS coefficients in rotated space
-    # ols_coef_rotated: (n_valid_rank, n_targets)
-    # sc_all: (n_valid_rank, n_fracs, n_targets)
-    ridge_coef_rotated_all = sc_all * ols_coef_rotated.unsqueeze(1)
+        log_target_alphas_all = np.zeros((n_fracs, n_targets), dtype=np.float32)
+        for target_idx in range(n_targets):
+            log_target_alphas_all[:, target_idx] = np.interp(
+                fracs, newlen_np[:, target_idx], log_alphagrid_np
+            )
 
-    # Unrotate: beta = V @ ridge_coef_rotated for all targets/fracs at once
-    # Vt.T: (n_features, n_valid_rank), ridge_coef_rotated_all: (n_valid_rank, n_fracs, n_targets)
-    # Reshape to (n_valid_rank, n_fracs * n_targets) for batch matmul
-    ridge_flat = ridge_coef_rotated_all.reshape(n_valid_rank, n_fracs * n_targets)
-    coefs_flat = Vt.T @ ridge_flat  # (n_features, n_fracs * n_targets)
-    coefs = coefs_flat.reshape(n_features, n_fracs, n_targets)
+        targetalphas_all = torch.tensor(
+            np.exp(log_target_alphas_all) - 1, device=device, dtype=X.dtype
+        )  # (n_fracs, n_targets)
 
-    return coefs
+        if torch.isnan(targetalphas_all).any() or torch.isinf(targetalphas_all).any():
+            targetalphas_all = torch.nan_to_num(targetalphas_all, nan=0.0, posinf=1e10, neginf=0.0)
+
+        sc_all = S_sq.unsqueeze(1).unsqueeze(2) / (
+            S_sq.unsqueeze(1).unsqueeze(2) + targetalphas_all.unsqueeze(0)
+        )  # (n_valid_rank, n_fracs, n_targets)
+
+        ridge_coef_rotated_all = sc_all * ols_coef_rotated.unsqueeze(1)
+
+        ridge_flat = ridge_coef_rotated_all.reshape(n_valid_rank, n_fracs * n_targets)
+        coefs_flat = Vt.T @ ridge_flat  # (n_features, n_fracs * n_targets)
+        coefs = coefs_flat.reshape(n_features, n_fracs, n_targets)
+        return coefs
+
+    else:
+        # ====================================================================
+        # Chunked path: y stays on CPU, accumulate coefs on CPU
+        # Peak GPU memory per chunk ≈ chunk_size * (n_valid * n_fracs + n_features) floats
+        # ====================================================================
+        coefs_cpu = torch.zeros(n_features, n_fracs, n_targets)  # CPU
+
+        for c0 in range(0, n_targets, chunk_size):
+            c1 = min(c0 + chunk_size, n_targets)
+            chunk = c1 - c0
+
+            y_chunk = y[:, c0:c1].to(device)         # (n_samples, chunk)
+            Uty_chunk = U.T @ y_chunk                  # (n_valid, chunk)
+            ols_chunk = Uty_chunk / S.unsqueeze(1)     # (n_valid, chunk)
+
+            newlen_chunk = torch.sqrt(
+                torch.einsum('aj,jt->at', sclg_sq, ols_chunk ** 2)
+            )  # (n_alphas, chunk)
+            ols_len_chunk = newlen_chunk[0:1, :]       # (1, chunk)
+            newlen_chunk = newlen_chunk / (ols_len_chunk + 1e-10)
+
+            zero_variance = ols_len_chunk.squeeze(0) < 1e-8  # (chunk,)
+            if zero_variance.any():
+                newlen_chunk[:, zero_variance] = 1.0
+
+            newlen_np = newlen_chunk.flip(0).cpu().numpy()  # (n_alphas, chunk)
+            log_target_alphas = np.zeros((n_fracs, chunk), dtype=np.float32)
+            for target_idx in range(chunk):
+                log_target_alphas[:, target_idx] = np.interp(
+                    fracs, newlen_np[:, target_idx], log_alphagrid_np
+                )
+
+            targetalphas = torch.tensor(
+                np.exp(log_target_alphas) - 1, device=device, dtype=X.dtype
+            )  # (n_fracs, chunk)
+            if torch.isnan(targetalphas).any() or torch.isinf(targetalphas).any():
+                targetalphas = torch.nan_to_num(targetalphas, nan=0.0, posinf=1e10, neginf=0.0)
+
+            sc_chunk = S_sq.unsqueeze(1).unsqueeze(2) / (
+                S_sq.unsqueeze(1).unsqueeze(2) + targetalphas.unsqueeze(0)
+            )  # (n_valid, n_fracs, chunk)
+
+            ridge_chunk = sc_chunk * ols_chunk.unsqueeze(1)  # (n_valid, n_fracs, chunk)
+            ridge_flat = ridge_chunk.reshape(n_valid_rank, n_fracs * chunk)
+            coefs_flat = Vt.T @ ridge_flat             # (n_features, n_fracs * chunk)
+            coefs_cpu[:, :, c0:c1] = coefs_flat.reshape(n_features, n_fracs, chunk).cpu()
+
+        return coefs_cpu
 
 
 @dataclass

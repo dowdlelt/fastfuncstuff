@@ -642,6 +642,7 @@ def estimate_keep_on_cpu(
     device: torch.device,
     force_cpu: bool = False,
     data_threshold_gb: float = DEFAULT_CPU_MEMORY_THRESHOLD_GB,
+    gpu_safety_fraction: float = 0.6,
 ) -> bool:
     """
     Estimate whether to keep data on CPU based on dataset size.
@@ -660,6 +661,10 @@ def estimate_keep_on_cpu(
         Force CPU storage regardless of data size
     data_threshold_gb : float, default=4.0
         Size threshold in GB for GPU memory
+    gpu_safety_fraction : float, default=0.6
+        Fraction of free GPU memory that the data may occupy. Use lower
+        values when the downstream computation needs significant working
+        memory (e.g., 0.25 for LORO CV which creates train-split copies).
 
     Returns
     -------
@@ -677,7 +682,7 @@ def estimate_keep_on_cpu(
                 torch.cuda.get_device_properties(device).total_memory
                 - torch.cuda.memory_reserved(device)
             ) / (1024**3)
-            return data_size_gb > free_mem * 0.6  # 60% of free memory
+            return data_size_gb > free_mem * gpu_safety_fraction
         except Exception:
             return data_size_gb > data_threshold_gb
     else:

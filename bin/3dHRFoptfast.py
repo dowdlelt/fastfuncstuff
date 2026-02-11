@@ -46,6 +46,7 @@ try:
         get_average_run_duration,
         load_and_preprocess_runs,
         parse_device_arg,
+        preflight_check,
     )
     from fastfuncsim.design_builder import (
         create_onset_matrix_microtime,
@@ -546,6 +547,13 @@ def main():
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
 
+    # Pre-flight checks (before slow data loading)
+    preflight_check(
+        input_files=input_files,
+        onset_files=onset_files,
+        ortvec_files=[(f, label) for f, label in args.ortvec] if args.ortvec else None,
+    )
+
     # ==========================================================================
     # 2. Load and preprocess data
     # ==========================================================================
@@ -688,17 +696,19 @@ def main():
                 print(f"  Nuisance: {f} (label={label})")
 
     if args.single_trials:
-        # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
+        # ========== SINGLE-TRIAL IN-SAMPLE R² PATH (GLMsingle Type-B) ==========
+        # Matches GLMsingle's FitHRF step: for each HRF candidate, fit a single-trial
+        # OLS model (resampling=0) and use in-sample R² on nuisance-projected data
+        # for HRF selection. All HRFs have equal model complexity (one beta per trial),
+        # so in-sample R² is a fair comparison metric.
         from tqdm import tqdm
 
-        from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
-        from fastfuncsim.hrf_selection import load_nuisance_file
         from fastfuncsim.ridge import create_single_trial_design
-        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.xval import compute_qr_projectors, compute_r2_metric
 
         print()
         print("=" * 70)
-        print("Using beta-space cross-validation (GLMsingle-style)")
+        print("Single-trial HRF fitting (GLMsingle Type-B style)")
         print("=" * 70)
         print()
 
@@ -725,16 +735,40 @@ def main():
 
         # Create block-diagonal nuisance design
         nuisance_design = torch.block_diag(*nuisance_per_run)
-        print(f"Nuisance design shape: {nuisance_design.shape}")
+        print(f"  Nuisance design shape: {nuisance_design.shape}")
 
-        # Generate CV splits
-        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=args.n_perms)
         n_hrfs = hrf_library.shape[0]
 
-        # Storage for CV results
-        xval_r2_all = torch.zeros(n_voxels, n_hrfs, device=device)
+        # ---- Project nuisance from data ONCE (reused for all HRFs) ----
+        # This matches GLMsingle: R² is computed on nuisance-projected data,
+        # so it measures task-related variance only (not drift).
+        print("  Projecting nuisance from data (once for all HRFs)...")
+        q_factors = compute_qr_projectors(nuisance_per_run, run_starts, device=device)
 
-        print(f"Evaluating {n_hrfs} HRFs with beta-space CV...")
+        projected_data = data.clone()
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            Q = q_factors[run_idx]
+            if Q is not None:
+                run_data = projected_data[:, start_tp:end_tp].to(device)
+                projected_data[:, start_tp:end_tp] = (run_data - (Q @ (Q.T @ run_data.T)).T).cpu()
+
+        # Storage for R² per HRF (in-sample, on projected data)
+        fit_r2_all = torch.zeros(n_voxels, n_hrfs)
+
+        # Chunk size for voxel streaming (avoid GPU OOM)
+        chunk_size = args.batch_size or 50_000
+        print(f"  Voxel chunk size: {chunk_size:,}")
+
+        # Cache projected designs on CPU for second-pass beta recomputation (~12 MB each)
+        projected_designs_cache = []
+
+        # Canonical betas: stored during first pass (lazy-init)
+        canonical_betas = None  # Will become (n_voxels, n_trials) on CPU
+        n_trials = None
+
+        print(f"  Evaluating {n_hrfs} HRFs (in-sample R² on projected data)...")
         for hrf_idx in tqdm(range(n_hrfs), desc="HRF evaluation"):
             hrf = [hrf_library[hrf_idx]]  # Wrap single HRF in list
 
@@ -751,62 +785,136 @@ def main():
                 device=device,
             )
 
-            # Fit OLS: pass task design + nuisance separately to avoid duplicate intercept
-            glm_results = fit_glm(
-                data,
-                st_design,  # Task-only design
-                tr=args.tr,
-                max_poly_degree=-1,  # No extra polynomials — already in nuisance_design
-                extra_regressors=nuisance_design,  # Nuisance passed separately
-                device=device,
-                verbose=False,
-            )
+            # Project nuisance from single-trial design (per-run, matching data projection)
+            projected_st_design = st_design.clone()
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                Q = q_factors[run_idx]
+                if Q is not None:
+                    run_design = st_design[start_tp:end_tp].to(device)
+                    projected_st_design[start_tp:end_tp] = (
+                        run_design - Q @ (Q.T @ run_design)
+                    ).cpu()
 
-            # Beta-space CV
-            st_betas = glm_results.betas  # (n_voxels, n_trials)
-            xval = compute_xval_r2_single_trials(
-                st_betas,
-                cond_ids,
-                run_ids,
-                cv_splits,
-                metric=args.metric,
-                device=device,
-                verbose=False,
-            )
-            xval_r2_all[:, hrf_idx] = xval["r2"]
+            # Cache projected design for second-pass beta recomputation
+            projected_designs_cache.append(projected_st_design)
 
-        # Select best HRF per voxel
-        hrf_index = xval_r2_all.argmax(dim=1)
-        xval_r2_best = xval_r2_all[torch.arange(n_voxels, device=device), hrf_index]
+            # Lazy-init canonical_betas now that we know n_trials
+            if canonical_betas is None:
+                n_trials = projected_st_design.shape[1]
+                canonical_betas = torch.zeros(n_voxels, n_trials)
+
+            # Fit OLS in voxel chunks (projected data stays on CPU, stream to GPU)
+            proj_design_dev = projected_st_design.to(device)
+
+            for c0 in range(0, n_voxels, chunk_size):
+                c1 = min(c0 + chunk_size, n_voxels)
+                chunk_data = projected_data[c0:c1].to(device)
+
+                chunk_betas = torch.linalg.lstsq(proj_design_dev, chunk_data.T).solution.T
+                chunk_pred = (proj_design_dev @ chunk_betas.T).T
+                chunk_r2 = compute_r2_metric(chunk_data, chunk_pred, metric="cod")
+
+                fit_r2_all[c0:c1, hrf_idx] = chunk_r2.cpu()
+
+                # Store canonical (idx 0) betas for beta-series CV
+                if hrf_idx == 0:
+                    canonical_betas[c0:c1] = chunk_betas.cpu()
+
+            if args.verbose and hrf_idx % 5 == 0:
+                col_r2 = fit_r2_all[:, hrf_idx]
+                print(f"    HRF {hrf_idx}: mean R²={col_r2.mean():.4f}, median R²={col_r2.median():.4f}")
+
+        # Select best HRF per voxel (matches GLMsingle: max over HRFs)
+        hrf_index = fit_r2_all.argmax(dim=1).to(device)
+        xval_r2_best = fit_r2_all[torch.arange(n_voxels), fit_r2_all.argmax(dim=1)]
 
         print()
         print("Best HRF selection complete:")
         print(f"  Mean R²: {xval_r2_best.mean():.4f}")
         print(f"  Median R²: {xval_r2_best.median():.4f}")
+        print(f"  % positive: {100 * (xval_r2_best > 0).float().mean():.1f}%")
+
+        # ---- Second pass: assemble best-HRF betas per voxel (grouped by HRF) ----
+        print()
+        print("Assembling best-HRF betas per voxel...")
+        best_betas = torch.zeros(n_voxels, n_trials)
+        hrf_index_cpu = hrf_index.cpu()
+
+        for hrf_idx in range(n_hrfs):
+            vox_mask = (hrf_index_cpu == hrf_idx)
+            if not vox_mask.any():
+                continue
+            vox_indices = vox_mask.nonzero(as_tuple=True)[0]
+            proj_design_dev = projected_designs_cache[hrf_idx].to(device)
+
+            for c0 in range(0, len(vox_indices), chunk_size):
+                c1 = min(c0 + chunk_size, len(vox_indices))
+                idx = vox_indices[c0:c1]
+                chunk_data = projected_data[idx].to(device)
+                chunk_betas = torch.linalg.lstsq(proj_design_dev, chunk_data.T).solution.T
+                best_betas[idx] = chunk_betas.cpu()
+
+        del projected_designs_cache  # Free ~240 MB
 
         # Create HRFSelectionResults object
         from fastfuncsim.hrf_selection import HRFSelectionResults
 
-        # Create a results object compatible with existing save function
-        # For beta-space CV, we have a single R² per HRF (not per-split std)
-        xval_r2_std = torch.zeros_like(xval_r2_best)  # Not meaningful in beta-space CV
+        xval_r2_std = torch.zeros_like(xval_r2_best)  # Not meaningful for in-sample R²
 
         # Compute HRF usage counts for reporting
-        hrf_usage_counts = torch.bincount(hrf_index.cpu(), minlength=n_hrfs).tolist()
+        hrf_usage_counts = torch.bincount(hrf_index_cpu, minlength=n_hrfs).tolist()
+
+        # Canonical baseline: first HRF in library (index 0)
+        xval_r2_canonical = fit_r2_all[:, 0].to(device)
+
+        # ---- Clearly-named R² maps ----
+        # In-sample R² (already computed above)
+        canonical_full_r2 = fit_r2_all[:, 0]           # canonical HRF, in-sample
+        hrfopt_full_r2 = xval_r2_best                  # best-HRF per voxel, in-sample
+
+        # Beta-series CV R² (genuine cross-validated)
+        from fastfuncsim.xval import generate_cv_splits, compute_xval_r2_single_trials
+
+        cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
+
+        print()
+        print("Computing beta-series CV R² (canonical HRF)...")
+        canonical_cv = compute_xval_r2_single_trials(
+            canonical_betas, cond_ids, run_ids, cv_splits, metric="cod", device=device,
+        )
+        canonical_xval_r2 = canonical_cv["r2"]
+
+        print("Computing beta-series CV R² (optimal HRF per voxel)...")
+        hrfopt_cv = compute_xval_r2_single_trials(
+            best_betas, cond_ids, run_ids, cv_splits, metric="cod", device=device,
+        )
+        hrfopt_xval_r2 = hrfopt_cv["r2"]
+
+        del canonical_betas, best_betas  # Free ~1.4 GB
+
+        print(f"  Canonical in-sample R²: mean={canonical_full_r2.mean():.4f}")
+        print(f"  HRFopt   in-sample R²: mean={hrfopt_full_r2.mean():.4f}")
+        print(f"  Canonical CV R²:        mean={canonical_xval_r2.mean():.4f}")
+        print(f"  HRFopt   CV R²:         mean={hrfopt_xval_r2.mean():.4f}")
 
         results = HRFSelectionResults(
             hrf_index=hrf_index,
             xval_r2_best=xval_r2_best,
             xval_r2_std=xval_r2_std,
-            xval_r2_all_hrfs=xval_r2_all,
-            xval_r2_canonical=None,  # TODO: compute canonical baseline
+            xval_r2_all_hrfs=fit_r2_all.to(device),
+            xval_r2_canonical=xval_r2_canonical,
+            canonical_full_r2=canonical_full_r2,
+            hrfopt_full_r2=hrfopt_full_r2,
+            canonical_xval_r2=canonical_xval_r2,
+            hrfopt_xval_r2=hrfopt_xval_r2,
             final_results=None,  # TODO: refit with optimal HRFs
             canonical_results=None,  # TODO: fit with canonical HRF
             hrf_library=hrf_library,
             hrf_metadata={
-                "mode": "single_trial_beta_space_cv",
+                "mode": "single_trial_insample_r2",
                 "n_hrfs": n_hrfs,
-                "cv_strategy": cv_strategy,
                 "hrf_usage_counts": hrf_usage_counts,
             },
         )
