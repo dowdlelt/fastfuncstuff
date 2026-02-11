@@ -294,6 +294,17 @@ def _evaluate_hrfs_batched(
         test_data_split = torch.cat([data_by_run[r] for r in test_runs], dim=1)
         n_test = test_data_split.shape[1]
 
+        # Pre-compute pseudoinverse of each train design once per split.
+        # pinv uses SVD and handles rank-deficient / near-singular designs
+        # correctly (zero betas for near-zero singular values).  This avoids
+        # NaN/Inf from CUDA's gels lstsq driver on ill-conditioned matrices,
+        # and is faster than per-chunk lstsq (one SVD on a tiny matrix,
+        # then cheap matmuls per chunk).
+        # pinv shape: (n_stim_cols, T_train) — tiny, stays on GPU
+        pinv_trains_gpu = [
+            torch.linalg.pinv(td) for td in train_designs_gpu
+        ]
+
         if data_on_device:
             # Fast path: data already on GPU — no chunking, no transfers
             sum_y_test = test_data_split.sum(dim=1)           # (n_voxels,)
@@ -301,14 +312,8 @@ def _evaluate_hrfs_batched(
             ss_tot = (sum_y2_test - sum_y_test ** 2 / n_test).clamp(min=1e-10)
 
             for d_idx in range(n_designs):
-                betas = torch.linalg.lstsq(
-                    train_designs_gpu[d_idx], train_data_split.T
-                ).solution
-                # Rank-deficient train design (e.g. a condition absent from all
-                # training runs) causes CUDA gels to return NaN.  Zero those
-                # betas — the minimum-norm / gelsd answer on CPU is also 0.
-                betas = torch.nan_to_num(betas, nan=0.0, posinf=0.0, neginf=0.0)
-                yhat = (test_designs_gpu[d_idx] @ betas).T  # (n_voxels, n_test)
+                betas = pinv_trains_gpu[d_idx] @ train_data_split.T  # (n_stim, n_voxels)
+                yhat = (test_designs_gpu[d_idx] @ betas).T           # (n_voxels, n_test)
 
                 if metric == "cod":
                     sum_yyhat = (test_data_split * yhat).sum(dim=1)
@@ -340,12 +345,9 @@ def _evaluate_hrfs_batched(
                 ss_tot = (sum_y2_test - sum_y_test ** 2 / n_test).clamp(min=1e-10)
 
                 for d_idx in range(n_designs):
-                    betas = torch.linalg.lstsq(
-                        train_designs_gpu[d_idx], train_chunk.T
-                    ).solution
-                    # Same rank-deficiency guard for chunked path
-                    betas = torch.nan_to_num(betas, nan=0.0, posinf=0.0, neginf=0.0)
-                    yhat = (test_designs_gpu[d_idx] @ betas).T  # (chunk, T_test)
+                    # pinv already on GPU, chunk transpose on GPU: fast matmul
+                    betas = pinv_trains_gpu[d_idx] @ train_chunk.T  # (n_stim, chunk)
+                    yhat = (test_designs_gpu[d_idx] @ betas).T      # (chunk, T_test)
 
                     if metric == "cod":
                         sum_yyhat = (test_chunk * yhat).sum(dim=1)
@@ -366,7 +368,7 @@ def _evaluate_hrfs_batched(
 
                 del train_chunk, test_chunk
 
-        del train_data_split, test_data_split, train_designs_gpu, test_designs_gpu
+        del train_data_split, test_data_split, train_designs_gpu, test_designs_gpu, pinv_trains_gpu
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
