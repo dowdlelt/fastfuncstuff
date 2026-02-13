@@ -5,6 +5,7 @@ This module contains common utilities used across multiple CLI tools to avoid
 code duplication. Functions include argument parsing, CV strategy parsing,
 data loading, and output formatting.
 """
+
 from __future__ import annotations
 
 import glob as glob_module
@@ -188,19 +189,20 @@ def estimate_device_strategy(
 @dataclass
 class LoadResult:
     """Result from load_and_preprocess_runs()"""
-    data: torch.Tensor              # (n_voxels, n_timepoints) fMRI data
-    run_starts: list[int]           # Starting timepoint for each run
-    affine: np.ndarray              # Affine matrix for NIfTI files
-    volume_shape: tuple             # Shape of 3D volume
-    voxel_sizes: tuple             # Voxel dimensions in mm
-    tr: float                       # Repetition time in seconds
-    mask: Optional[np.ndarray]      # Brain mask (original 3D)
+
+    data: torch.Tensor  # (n_voxels, n_timepoints) fMRI data
+    run_starts: list[int]  # Starting timepoint for each run
+    affine: np.ndarray  # Affine matrix for NIfTI files
+    volume_shape: tuple  # Shape of 3D volume
+    voxel_sizes: tuple  # Voxel dimensions in mm
+    tr: float  # Repetition time in seconds
+    mask: Optional[np.ndarray]  # Brain mask (original 3D)
     mask_flat: Optional[np.ndarray]  # Flattened mask (1D bool)
-    n_voxels: int                   # Number of voxels
-    n_timepoints: int               # Total timepoints
-    n_runs: int                     # Number of runs
-    keep_on_cpu: bool               # Whether data is stored on CPU
-    scale_info: Optional[dict]      # Scaling info if do_scale was True
+    n_voxels: int  # Number of voxels
+    n_timepoints: int  # Total timepoints
+    n_runs: int  # Number of runs
+    keep_on_cpu: bool  # Whether data is stored on CPU
+    scale_info: Optional[dict]  # Scaling info if do_scale was True
     violations_mask: Optional[torch.Tensor]  # Scaling violations if do_scale
 
 
@@ -336,6 +338,7 @@ def load_and_preprocess_runs(
 
         # Read only the header (no data loading) using nibabel
         import nibabel as nib
+
         first_img = nib.load(input_files[0])
         run_length = first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[0]
 
@@ -429,7 +432,9 @@ def load_and_preprocess_runs(
         run_starts = [0]
         current_timepoint = 0
 
-        for run_file in tqdm(input_files, desc="    Loading & blurring", unit="run", disable=not verbose):
+        for run_file in tqdm(
+            input_files, desc="    Loading & blurring", unit="run", disable=not verbose
+        ):
             img = load_nifti(run_file)
             data_4d = img.get_fdata(dtype=np.float32)
 
@@ -471,7 +476,7 @@ def load_and_preprocess_runs(
 
     # Remove duplicate last run_start
     if len(run_starts) > len(input_files):
-        run_starts = run_starts[:len(input_files)]
+        run_starts = run_starts[: len(input_files)]
 
     # Scale to percent signal change if requested
     scale_info = None
@@ -617,18 +622,20 @@ def save_4d_nifti(
 # Design-Building Utilities
 # ============================================================================
 
+
 @dataclass
 class DesignResult:
     """Result from build_design_from_onsets() or related design building functions."""
-    task_design: Optional[torch.Tensor]          # (n_timepoints, n_conditions) or None for per-HRF
-    nuisance_per_run: list[torch.Tensor]         # Per-run nuisance blocks
+
+    task_design: Optional[torch.Tensor]  # (n_timepoints, n_conditions) or None for per-HRF
+    nuisance_per_run: list[torch.Tensor]  # Per-run nuisance blocks
     polort: int
     condition_labels: list[str]
     n_timepoints: int
     n_runs: int
-    task_indices: Optional[list[int]] = None     # Indices of task regressors
-    nuisance_indices: Optional[list[int]] = None # Indices of nuisance regressors
-    ortvec_labels: Optional[list[str]] = None    # Labels for ortvec regressors
+    task_indices: Optional[list[int]] = None  # Indices of task regressors
+    nuisance_indices: Optional[list[int]] = None  # Indices of nuisance regressors
+    ortvec_labels: Optional[list[str]] = None  # Labels for ortvec regressors
 
 
 def auto_polort(
@@ -759,7 +766,9 @@ def build_nuisance_per_run(
                 ortvec = to_tensor(ortvec, device=device)
 
                 if ortvec.shape[0] != n_timepoints:
-                    print(f"ERROR: ortvec file {filepath} has {ortvec.shape[0]} rows, expected {n_timepoints}")
+                    print(
+                        f"ERROR: ortvec file {filepath} has {ortvec.shape[0]} rows, expected {n_timepoints}"
+                    )
                     sys.exit(1)
 
                 ortvec_all.append(ortvec)
@@ -771,7 +780,9 @@ def build_nuisance_per_run(
             ortvec_data = torch.cat(ortvec_all, dim=1) if ortvec_all else None
 
         except ImportError:
-            print("ERROR: Could not import load_nuisance_file. Is fastfuncsim.hrf_selection available?")
+            print(
+                "ERROR: Could not import load_nuisance_file. Is fastfuncsim.hrf_selection available?"
+            )
             sys.exit(1)
 
     # Add ortvec to each run if provided
@@ -896,7 +907,9 @@ def build_nuisance_block_diag(
                     print(f"    {label}: {ortvec_tensor.shape[1]} regressor(s)")
 
         except ImportError:
-            print("ERROR: Could not import load_nuisance_file. Is fastfuncsim.hrf_selection available?")
+            print(
+                "ERROR: Could not import load_nuisance_file. Is fastfuncsim.hrf_selection available?"
+            )
             sys.exit(1)
 
     if verbose:
@@ -959,8 +972,9 @@ def get_average_run_duration(
     return avg_run_len * tr
 
 
-
-def parse_device_arg(device_spec: Optional[str]) -> tuple[torch.device, Optional[int], Optional[int]]:
+def parse_device_arg(
+    device_spec: Optional[str],
+) -> tuple[torch.device, Optional[int], Optional[int]]:
     """
     Parse device argument specification.
 
@@ -998,6 +1012,7 @@ def parse_device_arg(device_spec: Optional[str]) -> tuple[torch.device, Optional
     """
     if not device_spec or device_spec.lower() == "auto":
         from .utils import get_device
+
         return get_device(), None, None
 
     # Parse device specification: "cpu", "cuda", "cpu,12", "cuda,0"
@@ -1097,6 +1112,7 @@ def parse_hrf_model_args(
         except ValueError as e:
             print(f"ERROR: Invalid HRF model '{hrf_model_str}': {e}")
             import sys
+
             sys.exit(1)
     else:
         # Simple model name: spmg1, spmg2, spmg3, glmsingle
@@ -1125,7 +1141,9 @@ def parse_hrf_model_args(
             # Default: 1 basis per TR
             n_basis = int(np.ceil(fir_top / tr))
 
-        print(f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, {n_basis} basis functions)")
+        print(
+            f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, {n_basis} basis functions)"
+        )
 
         # Expand condition labels for FIR: cond1_t0.0s, cond1_t1.5s, ..., cond2_t0.0s, ...
         fir_condition_labels = []
@@ -1140,11 +1158,15 @@ def parse_hrf_model_args(
         if hrf_model_name == "SPMG2":
             n_basis = 2  # Canonical + temporal derivative
             basis_suffixes = ["_canonical", "_timederiv"]
-            print(f"  HRF model: {hrf_model_name} (canonical + temporal derivative, 2 basis functions per condition)")
+            print(
+                f"  HRF model: {hrf_model_name} (canonical + temporal derivative, 2 basis functions per condition)"
+            )
         elif hrf_model_name == "SPMG3":
             n_basis = 3  # Canonical + temporal + dispersion derivatives
             basis_suffixes = ["_canonical", "_timederiv", "_dispderiv"]
-            print(f"  HRF model: {hrf_model_name} (canonical + time + dispersion derivatives, 3 basis functions per condition)")
+            print(
+                f"  HRF model: {hrf_model_name} (canonical + time + dispersion derivatives, 3 basis functions per condition)"
+            )
 
         # Expand condition labels: cond1_canonical, cond1_timederiv, ..., cond2_canonical, ...
         deriv_condition_labels = []
@@ -1207,7 +1229,9 @@ def validate_hrf_compatibility(
     if is_fir_model:
         if single_trial:
             print("ERROR: FIR/TENT models are incompatible with -single_trial")
-            print("  FIR already provides time-resolved estimates; single-trial refitting is redundant")
+            print(
+                "  FIR already provides time-resolved estimates; single-trial refitting is redundant"
+            )
             sys.exit(1)
         if hrf_opt:
             print("ERROR: FIR/TENT models are incompatible with -hrf_opt (per-voxel HRFs)")
@@ -1293,7 +1317,7 @@ def build_task_design_from_args(
     """
     import sys
     from .design import make_fir_design, make_tent_design, convolve_hrf_microtime
-    from .hrf import get_spmg1_hrf
+    from .hrf import get_hrf_library, get_spmg1_hrf
 
     if hrf_opt:
         # Per-voxel HRF mode: build designs_by_hrf dict
@@ -1330,26 +1354,39 @@ def build_task_design_from_args(
         # Single HRF model for all voxels
         if is_fir_model:
             # FIR/TENT: Use basis functions (no convolution)
-            print(f"  Building {hrf_model_name} design matrix ({n_basis} basis functions per condition)")
+            print(
+                f"  Building {hrf_model_name} design matrix ({n_basis} basis functions per condition)"
+            )
 
             if hrf_model_name == "FIR":
+                bins_per_tr = int(round(tr / microtime_dt))
+                onset_matrix_tr = onset_matrix_micro[::bins_per_tr, :]
+                onset_matrix_tr = onset_matrix_tr[:n_timepoints, :]
                 task_design = make_fir_design(
-                    onsets=all_onsets,
+                    onsets=onset_matrix_tr,
                     n_lags=n_basis,
-                    tr=tr,
                     n_timepoints=n_timepoints,
-                    run_starts=run_starts,
                     device=device,
                 )
             elif hrf_model_name in ("TENT", "TENTZERO"):
+                onset_times_list = []
+                for cond_idx in range(n_conditions):
+                    cond_all_runs = []
+                    for run_idx, run_onsets in enumerate(all_onsets[cond_idx]):
+                        if len(run_onsets) > 0:
+                            cond_all_runs.append(run_onsets + run_starts[run_idx] * tr)
+                    if len(cond_all_runs) > 0:
+                        onset_times_list.append(np.concatenate(cond_all_runs))
+                    else:
+                        onset_times_list.append(np.array([], dtype=float))
+
                 task_design = make_tent_design(
-                    onsets=all_onsets,
+                    onset_times_list=onset_times_list,
                     bot=fir_bot,
                     top=fir_top,
                     n_basis=n_basis,
                     tr=tr,
                     n_timepoints=n_timepoints,
-                    run_starts=run_starts,
                     zero_edges=(hrf_model_name == "TENTZERO"),
                     device=device,
                 )
@@ -1357,7 +1394,9 @@ def build_task_design_from_args(
                 print(f"ERROR: Unknown FIR model: {hrf_model_name}")
                 sys.exit(1)
 
-            print(f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors")
+            print(
+                f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors"
+            )
             print(f"    ({n_conditions} conditions × {n_basis} basis functions)")
 
         else:
@@ -1397,11 +1436,13 @@ def build_task_design_from_args(
                 for cond_idx in range(n_conditions):
                     for basis_idx in range(n_basis):
                         # Extract this condition's column from this basis
-                        task_columns.append(design_per_basis[basis_idx][:, cond_idx:cond_idx+1])
+                        task_columns.append(design_per_basis[basis_idx][:, cond_idx : cond_idx + 1])
 
                 # Concatenate all columns
                 task_design = torch.cat(task_columns, dim=1)
-                print(f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors")
+                print(
+                    f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors"
+                )
                 print(f"    ({n_conditions} conditions × {n_basis} basis functions)")
 
             elif hrf_model_name == "SPMG1":
@@ -1423,9 +1464,11 @@ def build_task_design_from_args(
                 )
             elif hrf_model_name == "GLMSINGLE":
                 print("  Using canonical GLMsingle HRF")
-                from .hrf import get_glmsingle_hrf
-                hrf = get_glmsingle_hrf(
+                hrf = get_hrf_library(
+                    mode="glmsingle",
                     microtime_dt=microtime_dt,
+                    stim_duration=0.0,
+                    hrf_duration=32.0,
                     device=device,
                 )
                 task_design = convolve_hrf_microtime(
@@ -1484,9 +1527,7 @@ def preflight_check(
             try:
                 with open(onset_file) as fh:
                     rows = [
-                        ln.strip()
-                        for ln in fh
-                        if ln.strip() and not ln.strip().startswith("#")
+                        ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")
                     ]
                 if len(rows) != n_runs:
                     errors.append(
@@ -1562,11 +1603,7 @@ def preflight_check(
                     continue
                 try:
                     with open(ortvec_file) as fh:
-                        rows = [
-                            ln
-                            for ln in fh
-                            if ln.strip() and not ln.strip().startswith("#")
-                        ]
+                        rows = [ln for ln in fh if ln.strip() and not ln.strip().startswith("#")]
                     if len(rows) != total_timepoints:
                         errors.append(
                             f"  -ortvec file '{ortvec_file}' (label={label}): "

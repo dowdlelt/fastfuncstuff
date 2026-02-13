@@ -45,15 +45,17 @@ Key Features
 - Polynomial drift and other nuisance regressors maintained
 - Median R² across CV folds for robust selection
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from .glm_core import fit_glm
+from .ica import FastICA
 from .pca import PCA
 from .utils import get_device
 from .xval import (
@@ -174,6 +176,320 @@ class DenoiseResults:
     metadata: dict
 
 
+@dataclass
+class ComponentCountEstimate:
+    """Per-run component-count estimates independent of denoising CV."""
+
+    per_run_caps: List[int]
+    variance_caps: List[int]
+    entropy_rank_caps: List[int]
+    mp_caps: List[Optional[int]]
+    search_iterations: List[int]
+    search_final_max_per_run: List[int]
+    search_ceiling_per_run: List[int]
+    mp_reasons: List[str]
+    details_by_run: List[Dict[str, float]]
+
+
+def estimate_noise_component_caps_per_run(
+    data: torch.Tensor,
+    run_starts: List[int],
+    noise_pool_mask: torch.Tensor,
+    max_components: int = 30,
+    nuisance_per_run: Optional[List[torch.Tensor]] = None,
+    min_components: int = 5,
+    variance_threshold: float = 0.90,
+    use_mp_prior: bool = True,
+    mp_relaxation: float = 1.25,
+    device: Optional[torch.device] = None,
+    verbose: bool = False,
+) -> ComponentCountEstimate:
+    """
+    Estimate per-run component caps without using denoising performance.
+
+    This is intended to avoid selecting dimensionality based on downstream
+    denoising R². It uses only the noise-pool spectrum in each run:
+
+    - variance cap: first k reaching cumulative variance threshold
+    - entropy/effective-rank cap: exp(H(p)) on normalized eigenvalues
+    - optional soft Marchenko–Pastur cap (used as a prior, not hard truth)
+
+    Search strategy (per run):
+    1) Start with a moderate component count.
+    2) Fit PCA and compute variance/effective-rank/MP-derived caps.
+    3) If estimate is near current ceiling, expand and repeat.
+    4) Stop when estimate stabilizes or run rank/ceiling is reached.
+
+    Final selected cap remains conservative and bounded. The target uses a
+    blend of variance-cap and effective-rank so it does not over-chase the
+    variance tail; MP is treated as a soft prior (if enabled), not a strict
+    truth condition.
+    """
+    device = device or get_device()
+    n_runs = len(run_starts)
+
+    if max_components < 1:
+        raise ValueError(f"max_components must be >= 1, got {max_components}")
+    min_components = max(1, min(min_components, max_components))
+
+    noise_pool_mask = noise_pool_mask.to(data.device)
+
+    per_run_caps: List[int] = []
+    variance_caps: List[int] = []
+    entropy_rank_caps: List[int] = []
+    mp_caps: List[Optional[int]] = []
+    search_iterations: List[int] = []
+    search_final_max_per_run: List[int] = []
+    search_ceiling_per_run: List[int] = []
+    mp_reasons: List[str] = []
+    details_by_run: List[Dict[str, float]] = []
+
+    # Search controls
+    boundary_fraction = 0.90
+    growth_factor = 1.6
+
+    def _derive_caps(
+        ev: torch.Tensor,
+        ev_ratio: torch.Tensor,
+        n_samples: int,
+        n_features: int,
+        n_ev: int,
+    ) -> tuple[int, int, Optional[int], str, int]:
+        cumvar = torch.cumsum(ev_ratio, dim=0)
+        variance_cap_local = int(torch.searchsorted(cumvar, variance_threshold).item() + 1)
+        variance_cap_local = max(1, min(variance_cap_local, n_ev))
+
+        p = ev / ev.sum()
+        entropy = float((-(p * torch.log(p))).sum().item())
+        effective_rank_local = int(np.round(float(np.exp(entropy))))
+        effective_rank_local = max(1, min(effective_rank_local, n_ev))
+
+        mp_cap_local: Optional[int] = None
+        mp_reason_local = "disabled"
+        if use_mp_prior and n_ev > 4:
+            beta = float(n_features) / float(max(1, n_samples))
+            if beta >= 1.0:
+                bulk_tail = ev[max(1, int(0.5 * n_ev)) :]
+                sigma2_hat = float(torch.median(bulk_tail).item())
+                lambda_plus = sigma2_hat * (1.0 + np.sqrt(beta)) ** 2
+                n_spikes = int((ev.numpy() > lambda_plus).sum())
+                if n_spikes > 0:
+                    mp_cap_local = max(1, int(np.ceil(n_spikes * mp_relaxation)))
+                    mp_reason_local = "ok"
+                else:
+                    mp_reason_local = "no_spikes_above_mp_bulk"
+            else:
+                mp_reason_local = "beta_lt_1"
+        elif use_mp_prior:
+            mp_reason_local = "too_few_eigenvalues"
+
+        blended_target = int(np.round((variance_cap_local + effective_rank_local) / 2.0))
+        raw_target = max(1, min(n_ev, blended_target))
+        return variance_cap_local, effective_rank_local, mp_cap_local, mp_reason_local, raw_target
+
+    print(
+        f"\nEstimating independent component caps per run "
+        f"(search ceiling={max_components}, min={min_components}, var_thr={variance_threshold:.2f})"
+    )
+    print(
+        f"  Search policy: expand when target >= {int(boundary_fraction * 100)}% of current max; "
+        f"growth x{growth_factor:.1f}"
+    )
+
+    run_iterator = range(n_runs)
+    if verbose:
+        try:
+            from tqdm.auto import tqdm
+
+            run_iterator = tqdm(run_iterator, desc="Component cap search", unit="run")
+        except Exception:
+            pass
+
+    for run_idx in run_iterator:
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
+
+        run_data_full = data[:, start_tp:end_tp]
+        run_data = run_data_full[noise_pool_mask, :]
+
+        if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
+            nuisance = nuisance_per_run[run_idx].to(run_data.device)
+            q_nuisance, _ = torch.linalg.qr(nuisance)
+            run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
+
+        voxel_norms = torch.norm(run_data, dim=1, keepdim=True)
+        voxel_norms = torch.clamp(voxel_norms, min=1e-10)
+        run_data = run_data / voxel_norms
+
+        run_data_t = run_data.T.to(device)
+        run_rank_max = min(run_data_t.shape[0], run_data_t.shape[1])
+        search_ceiling = min(max_components, run_rank_max)
+        current_max = min(search_ceiling, max(min_components, 16))
+
+        final_variance_cap = 1
+        final_effective_rank = 1
+        final_mp_cap: Optional[int] = None
+        final_mp_reason = "disabled"
+        final_target = 1
+        n_iters = 0
+
+        while True:
+            n_iters += 1
+            pca = PCA(n_components=current_max, device=device)
+            pca.fit(run_data_t)
+
+            ev = torch.clamp(pca.explained_variance_.detach().float(), min=1e-12).cpu()
+            ev_ratio = torch.clamp(pca.explained_variance_ratio_.detach().float(), min=1e-12).cpu()
+            n_ev = int(ev.shape[0])
+
+            variance_cap, effective_rank, mp_cap, mp_reason, raw_target = _derive_caps(
+                ev=ev,
+                ev_ratio=ev_ratio,
+                n_samples=run_data_t.shape[0],
+                n_features=run_data_t.shape[1],
+                n_ev=n_ev,
+            )
+
+            final_variance_cap = variance_cap
+            final_effective_rank = effective_rank
+            final_mp_cap = mp_cap
+            final_mp_reason = mp_reason
+            final_target = raw_target
+
+            near_boundary = raw_target >= int(np.floor(boundary_fraction * n_ev))
+            can_expand = current_max < search_ceiling
+
+            if verbose:
+                mp_txt_iter = "n/a" if mp_cap is None else str(mp_cap)
+                print(
+                    f"    run {run_idx + 1} iter {n_iters}: max={current_max}, "
+                    f"target={raw_target} (var={variance_cap}, erank={effective_rank}, mp={mp_txt_iter})"
+                )
+
+            if near_boundary and can_expand:
+                next_max = int(np.ceil(current_max * growth_factor))
+                next_max = max(current_max + 1, next_max)
+                current_max = min(search_ceiling, next_max)
+                if device.type == "cuda":
+                    del pca
+                    torch.cuda.empty_cache()
+                continue
+
+            if device.type == "cuda":
+                del pca
+                torch.cuda.empty_cache()
+            break
+
+        cap = final_target
+        if final_mp_cap is not None:
+            cap = min(cap, final_mp_cap)
+        cap = max(min_components, min(cap, current_max, max_components, search_ceiling))
+
+        per_run_caps.append(int(cap))
+        variance_caps.append(int(final_variance_cap))
+        entropy_rank_caps.append(int(final_effective_rank))
+        mp_caps.append(final_mp_cap)
+        mp_reasons.append(str(final_mp_reason))
+        search_iterations.append(int(n_iters))
+        search_final_max_per_run.append(int(current_max))
+        search_ceiling_per_run.append(int(search_ceiling))
+        details_by_run.append(
+            {
+                "run_index": float(run_idx),
+                "n_timepoints": float(run_data_t.shape[0]),
+                "n_noise_voxels": float(run_data_t.shape[1]),
+                "search_ceiling": float(search_ceiling),
+                "search_final_max": float(current_max),
+                "search_iterations": float(n_iters),
+                "variance_cap": float(final_variance_cap),
+                "effective_rank": float(final_effective_rank),
+                "raw_target": float(final_target),
+                "mp_cap": float(final_mp_cap) if final_mp_cap is not None else -1.0,
+                "selected_cap": float(cap),
+            }
+        )
+
+        if device.type == "cuda":
+            del run_data_t
+            torch.cuda.empty_cache()
+
+    print("  Independent component-cap estimation summary:")
+    for run_idx, cap in enumerate(per_run_caps):
+        mp_txt = (
+            f"n/a[{mp_reasons[run_idx]}]" if mp_caps[run_idx] is None else str(mp_caps[run_idx])
+        )
+        hit_ceiling = search_final_max_per_run[run_idx] >= search_ceiling_per_run[run_idx]
+        ceiling_txt = ", ceiling-hit" if hit_ceiling else ""
+        print(
+            f"    Run {run_idx + 1}/{n_runs}: cap={cap} "
+            f"(searched {search_final_max_per_run[run_idx]}/{search_ceiling_per_run[run_idx]} in {search_iterations[run_idx]} iter; "
+            f"var={variance_caps[run_idx]}, erank={entropy_rank_caps[run_idx]}, mp={mp_txt}{ceiling_txt})"
+        )
+
+    return ComponentCountEstimate(
+        per_run_caps=per_run_caps,
+        variance_caps=variance_caps,
+        entropy_rank_caps=entropy_rank_caps,
+        mp_caps=mp_caps,
+        search_iterations=search_iterations,
+        search_final_max_per_run=search_final_max_per_run,
+        search_ceiling_per_run=search_ceiling_per_run,
+        mp_reasons=mp_reasons,
+        details_by_run=details_by_run,
+    )
+
+
+def compute_noise_pool_pca_scree_per_run(
+    data: torch.Tensor,
+    run_starts: List[int],
+    noise_pool_mask: torch.Tensor,
+    max_components: int,
+    nuisance_per_run: Optional[List[torch.Tensor]] = None,
+    device: Optional[torch.device] = None,
+) -> List[torch.Tensor]:
+    """Compute per-run PCA scree spectra from noise-pool data.
+
+    Returns a list where each entry is explained_variance_ratio_ for one run.
+    """
+    device = device or get_device()
+    n_runs = len(run_starts)
+    noise_pool_mask = noise_pool_mask.to(data.device)
+
+    scree_ratio_per_run: List[torch.Tensor] = []
+
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
+
+        run_data_full = data[:, start_tp:end_tp]
+        run_data = run_data_full[noise_pool_mask, :]
+
+        if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
+            nuisance = nuisance_per_run[run_idx].to(run_data.device)
+            q_nuisance, _ = torch.linalg.qr(nuisance)
+            run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
+
+        voxel_norms = torch.norm(run_data, dim=1, keepdim=True)
+        voxel_norms = torch.clamp(voxel_norms, min=1e-10)
+        run_data = run_data / voxel_norms
+
+        run_data_t = run_data.T.to(device)
+        run_rank_max = min(run_data_t.shape[0], run_data_t.shape[1])
+        n_components = max(1, min(int(max_components), int(run_rank_max)))
+
+        pca = PCA(n_components=n_components, device=device)
+        pca.fit(run_data_t)
+
+        ratios = torch.clamp(pca.explained_variance_ratio_.detach().float(), min=1e-12).cpu()
+        scree_ratio_per_run.append(ratios)
+
+        if device.type == "cuda":
+            del pca, run_data_t
+            torch.cuda.empty_cache()
+
+    return scree_ratio_per_run
+
+
 def select_noise_pool_voxels(
     r2: torch.Tensor,
     threshold: float = 0.1,
@@ -257,6 +573,7 @@ def extract_noise_pcs_per_run(
     variance_threshold: float = 0.95,
     return_loadings: bool = False,
     nuisance_per_run: Optional[List[torch.Tensor]] = None,
+    component_caps_per_run: Optional[List[int]] = None,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[torch.Tensor]]]:
@@ -288,6 +605,10 @@ def extract_noise_pcs_per_run(
         CRITICAL: Must be the SAME nuisance used in the GLM model.
     device : torch.device, optional
         Device for computation
+    component_caps_per_run : list of int, optional
+        Optional per-run caps on number of components to keep after PCA.
+        If provided, run i keeps min(max_components, component_caps_per_run[i]) PCs.
+        Useful when dimensionality is estimated independently from denoising CV.
     verbose : bool, default=False
         Print progress information
 
@@ -303,7 +624,13 @@ def extract_noise_pcs_per_run(
     """
     device = device or get_device()
     pca_device = device
+
     n_runs = len(run_starts)
+
+    if component_caps_per_run is not None and len(component_caps_per_run) != n_runs:
+        raise ValueError(
+            f"component_caps_per_run has {len(component_caps_per_run)} entries but n_runs={n_runs}"
+        )
 
     # Ensure mask on same device as data
     noise_pool_mask = noise_pool_mask.to(data.device)
@@ -355,10 +682,16 @@ def extract_noise_pcs_per_run(
         n_comp_var = int(torch.searchsorted(cumvar, variance_threshold).item() + 1)
         n_comp_var = min(n_comp_var, max_components)
 
-        # IMPORTANT: Always extract max_components PCs so all runs have same shape
-        # This is required for proper stacking during cross-validation
-        # The CV loop will select subsets (1, 2, 3, ... n_pcs) for testing
+        # Extract all candidate PCs first, then optionally apply run-specific cap.
         pc_timecourses = pca.transform(run_data_t)[:, :max_components]
+
+        if component_caps_per_run is not None:
+            n_keep = int(max(1, min(component_caps_per_run[run_idx], max_components)))
+            n_keep = min(n_keep, pc_timecourses.shape[1])
+        else:
+            n_keep = pc_timecourses.shape[1]
+
+        pc_timecourses = pc_timecourses[:, :n_keep]
         # Move outputs back to data device to avoid GPU memory growth
         pc_timecourses = pc_timecourses.to(data.device)
 
@@ -375,7 +708,7 @@ def extract_noise_pcs_per_run(
         if return_loadings:
             # Loadings are the principal components (right singular vectors scaled by singular values)
             # components_ has shape (n_components, n_features) = (max_components, n_noise_voxels)
-            loadings = pca.components_[:max_components, :].T  # (n_noise_voxels, max_components)
+            loadings = pca.components_[:n_keep, :].T  # (n_noise_voxels, n_keep)
             pc_loadings_per_run.append(loadings.to(data.device))
 
         # Free GPU memory between runs (large noise pools)
@@ -395,19 +728,155 @@ def extract_noise_pcs_per_run(
                 if max_components <= len(cumvar)
                 else cumvar[-1].item()
             )
-            n_nuisance = (
-                nuisance_per_run[run_idx].shape[1]
-                if nuisance_per_run is not None
-                else 0
-            )
+            n_nuisance = nuisance_per_run[run_idx].shape[1] if nuisance_per_run is not None else 0
             nuisance_msg = f", {n_nuisance} nuisance projected" if n_nuisance > 0 else ""
             print(
-                f"  Run {run_idx + 1}: {max_components} PCs ({var_explained * 100:.1f}% var{nuisance_msg})"
+                f"  Run {run_idx + 1}: {n_keep} PCs ({var_explained * 100:.1f}% var{nuisance_msg})"
             )
 
     if return_loadings:
         return noise_pcs_per_run, pc_loadings_per_run
     return noise_pcs_per_run
+
+
+def extract_noise_ics_per_run(
+    data: torch.Tensor,
+    run_starts: List[int],
+    noise_pool_mask: torch.Tensor,
+    max_components: int = 20,
+    return_loadings: bool = False,
+    return_variance_ratio: bool = False,
+    nuisance_per_run: Optional[List[torch.Tensor]] = None,
+    component_caps_per_run: Optional[List[int]] = None,
+    ica_restarts: int = 1,
+    ica_max_iter: int = 400,
+    ica_tol: float = 1e-5,
+    device: Optional[torch.device] = None,
+    verbose: bool = False,
+) -> Union[
+    List[torch.Tensor],
+    Tuple[List[torch.Tensor], List[torch.Tensor]],
+    Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]],
+    Tuple[List[torch.Tensor], List[torch.Tensor]],
+]:
+    """
+    Extract independent components from noise pool for each run independently.
+
+    Mirrors `extract_noise_pcs_per_run` behavior but uses FastICA instead of PCA.
+    Returned timecourses are ordered by descending per-run component variance
+    in ICA mixing timecourses (simple and robust ordering).
+    """
+    device = device or get_device()
+    n_runs = len(run_starts)
+
+    if component_caps_per_run is not None and len(component_caps_per_run) != n_runs:
+        raise ValueError(
+            f"component_caps_per_run has {len(component_caps_per_run)} entries but n_runs={n_runs}"
+        )
+
+    noise_pool_mask = noise_pool_mask.to(data.device)
+
+    noise_ics_per_run: List[torch.Tensor] = []
+    ic_loadings_per_run: List[torch.Tensor] = []
+    ic_variance_ratio_per_run: List[torch.Tensor] = []
+
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
+
+        run_data_full = data[:, start_tp:end_tp]
+        run_data = run_data_full[noise_pool_mask, :]
+
+        if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
+            nuisance = nuisance_per_run[run_idx].to(run_data.device)
+            q_nuisance, _ = torch.linalg.qr(nuisance)
+            run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
+
+        voxel_norms = torch.norm(run_data, dim=1, keepdim=True)
+        voxel_norms = torch.clamp(voxel_norms, min=1e-10)
+        run_data = run_data / voxel_norms
+
+        run_data_t = run_data.T.to(device)
+        max_components_run = min(max_components, run_data_t.shape[0], run_data_t.shape[1])
+
+        if component_caps_per_run is not None:
+            n_keep = int(max(1, min(component_caps_per_run[run_idx], max_components_run)))
+        else:
+            n_keep = max_components_run
+
+        n_restarts = max(1, int(ica_restarts))
+        best_ica: Optional[FastICA] = None
+        best_score = -float("inf")
+
+        for restart_idx in range(n_restarts):
+            seed = int(run_idx + 1009 * restart_idx)
+            ica_candidate = FastICA(
+                n_components=n_keep,
+                pca_components=n_keep,
+                max_iter=int(ica_max_iter),
+                tol=float(ica_tol),
+                random_state=seed,
+                device=device,
+            )
+            ica_candidate.fit(run_data_t)
+
+            mixing_candidate = ica_candidate.mixing_[:, :n_keep]
+            centered = mixing_candidate - mixing_candidate.mean(dim=0, keepdim=True)
+            std = torch.clamp(centered.std(dim=0, keepdim=True), min=1e-8)
+            z = centered / std
+            kurt = torch.mean(z**4, dim=0) - 3.0
+            score = float(torch.sum(torch.abs(kurt)).item())
+
+            if score > best_score:
+                best_score = score
+                best_ica = ica_candidate
+            elif device.type == "cuda":
+                del ica_candidate
+                torch.cuda.empty_cache()
+
+        if best_ica is None:
+            raise RuntimeError("ICA failed to produce a valid solution")
+
+        ica = best_ica
+        ic_timecourses = ica.mixing_[:, :n_keep]
+
+        # Simple ordering: variance across time for each IC in this run.
+        ic_var = torch.var(ic_timecourses, dim=0, unbiased=False)
+        ic_var = torch.clamp(ic_var, min=1e-12)
+        sort_idx = torch.argsort(ic_var, descending=True)
+        var_ratio = ic_var[sort_idx] / torch.clamp(ic_var.sum(), min=1e-10)
+
+        ic_timecourses = ic_timecourses[:, sort_idx]
+
+        ic_std = ic_timecourses.std(dim=0, keepdim=True)
+        ic_std = torch.clamp(ic_std, min=1e-10)
+        ic_timecourses = (ic_timecourses / ic_std).to(data.device)
+        noise_ics_per_run.append(ic_timecourses)
+        ic_variance_ratio_per_run.append(var_ratio.to(data.device))
+
+        if return_loadings:
+            loadings = ica.components_[:n_keep, :].T
+            loadings = loadings[:, sort_idx].to(data.device)
+            ic_loadings_per_run.append(loadings)
+
+        if device.type == "cuda":
+            del run_data_t, ica
+            torch.cuda.empty_cache()
+
+        if verbose:
+            top_share = float(var_ratio[0].item() * 100.0) if len(var_ratio) > 0 else 0.0
+            print(
+                f"  Run {run_idx + 1}: {n_keep} ICs (sorted by IC timecourse variance; "
+                f"IC1 share={top_share:.2f}% of selected-IC variance, restarts={n_restarts}, score={best_score:.3f})"
+            )
+
+    if return_loadings:
+        if return_variance_ratio:
+            return noise_ics_per_run, ic_loadings_per_run, ic_variance_ratio_per_run
+        return noise_ics_per_run, ic_loadings_per_run
+    if return_variance_ratio:
+        return noise_ics_per_run, ic_variance_ratio_per_run
+    return noise_ics_per_run
 
 
 def compute_full_brain_pc_loadings(
@@ -464,8 +933,7 @@ def compute_full_brain_pc_loadings(
         # Ensure mask size matches data
         if brain_mask.shape[0] != n_voxels_full:
             raise ValueError(
-                f"Brain mask size ({brain_mask.shape[0]}) doesn't match "
-                f"data size ({n_voxels_full})"
+                f"Brain mask size ({brain_mask.shape[0]}) doesn't match data size ({n_voxels_full})"
             )
         voxel_indices = torch.where(brain_mask)[0]
         n_brain_voxels = len(voxel_indices)
@@ -509,7 +977,9 @@ def compute_full_brain_pc_loadings(
         loadings_per_run.append(loadings_full)  # Keep on CPU
 
         if verbose:
-            print(f"    Run {run_idx + 1}: {pcs.shape[1]} PCs, loadings shape {loadings_full.shape}")
+            print(
+                f"    Run {run_idx + 1}: {pcs.shape[1]} PCs, loadings shape {loadings_full.shape}"
+            )
 
     return loadings_per_run
 
@@ -748,7 +1218,9 @@ def cross_validate_noise_pcs(
                 if use_gpu_for_projections:
                     print(f"  GPU has {gpu_free_gb:.1f} GB free → using GPU for projections")
                 else:
-                    print(f"  GPU has {gpu_free_gb:.1f} GB free → using CPU for projections (need >6GB)")
+                    print(
+                        f"  GPU has {gpu_free_gb:.1f} GB free → using CPU for projections (need >6GB)"
+                    )
 
     proj_device = device if use_gpu_for_projections else torch.device("cpu")
 
@@ -772,6 +1244,33 @@ def cross_validate_noise_pcs(
     # Generate CV splits based on strategy
     cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
     n_splits = len(cv_splits)
+
+    # Precompute run timepoint index tensors once (CPU)
+    run_time_indices = []
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_time_indices.append(torch.arange(start_tp, end_tp, dtype=torch.long))
+
+    # Precompute per-fold train/test indices once (avoids rebuilding per chunk)
+    fold_index_info = []
+    for train_runs, test_runs in cv_splits:
+        train_tps_t = torch.cat([run_time_indices[run_idx] for run_idx in train_runs], dim=0)
+        test_tps_t = torch.cat([run_time_indices[run_idx] for run_idx in test_runs], dim=0)
+        fold_index_info.append(
+            {
+                "train_runs": train_runs,
+                "test_runs": test_runs,
+                "train_tps_t": train_tps_t,
+                "test_tps_t": test_tps_t,
+                "test_tps_list": test_tps_t.tolist(),
+            }
+        )
+
+    # Cache noise PCs on compute device once (tiny tensors; avoids repeated transfers)
+    noise_pcs_on_device = [
+        pcs if pcs.device == device else pcs.to(device, non_blocking=True) for pcs in noise_pcs
+    ]
 
     # Describe CV strategy
     if cv_strategy == 1:
@@ -906,7 +1405,9 @@ def cross_validate_noise_pcs(
             # Must use CPU to avoid GPU OOM
             accumulator_device = torch.device("cpu")
             pred_by_pc_chunk = [
-                torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device=accumulator_device)
+                torch.zeros(
+                    chunk_size_actual, n_timepoints, dtype=torch.float32, device=accumulator_device
+                )
                 for _ in range(max_components + 1)
             ]
             actual_projected_chunk = torch.zeros(
@@ -914,22 +1415,12 @@ def cross_validate_noise_pcs(
             )
 
         # Cross-validation loop: accumulate predictions or stats for this chunk
-        for _, (train_runs, test_runs) in enumerate(cv_splits):
-            # Build train/test timepoint indices
-            train_tps = []
-            for run_idx in train_runs:
-                start_tp = run_starts[run_idx]
-                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                train_tps.extend(range(start_tp, end_tp))
-
-            test_tps = []
-            for run_idx in test_runs:
-                start_tp = run_starts[run_idx]
-                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                test_tps.extend(range(start_tp, end_tp))
-
-            train_tps_t = torch.tensor(train_tps)  # CPU indices for CPU data
-            test_tps_t = torch.tensor(test_tps)
+        for fold_info in fold_index_info:
+            train_runs = fold_info["train_runs"]
+            test_runs = fold_info["test_runs"]
+            train_tps_t = fold_info["train_tps_t"]
+            test_tps_t = fold_info["test_tps_t"]
+            test_tps_list = fold_info["test_tps_list"]
 
             # Extract train/test data for THIS CHUNK
             chunk_data_train = chunk_data_cpu[:, train_tps_t]
@@ -945,7 +1436,9 @@ def cross_validate_noise_pcs(
             if nuisance_per_run is not None:
                 # Project out nuisance from TRAINING data and design per run
                 # Use shared QR-based projection function for numerical stability
-                train_run_starts_local = _compute_local_run_starts(train_runs, run_starts, n_timepoints)
+                train_run_starts_local = _compute_local_run_starts(
+                    train_runs, run_starts, n_timepoints
+                )
                 train_nuisance_per_run = [nuisance_per_run[i] for i in train_runs]
 
                 data_train_projected, design_train_projected = project_out_nuisance_per_run(
@@ -958,7 +1451,9 @@ def cross_validate_noise_pcs(
 
                 # Project out nuisance from TEST data and design
                 # Use shared QR-based projection function for numerical stability
-                test_run_starts_local = _compute_local_run_starts(test_runs, run_starts, n_timepoints)
+                test_run_starts_local = _compute_local_run_starts(
+                    test_runs, run_starts, n_timepoints
+                )
                 test_nuisance_per_run = [nuisance_per_run[i] for i in test_runs]
 
                 data_test_projected, design_test_projected = project_out_nuisance_per_run(
@@ -976,7 +1471,7 @@ def cross_validate_noise_pcs(
                 design_test_projected = design_test
 
             # Collect training run PCs (already nuisance-projected during extraction)
-            train_noise_pcs_list = [noise_pcs[run_idx].to(device) for run_idx in train_runs]
+            train_noise_pcs_list = [noise_pcs_on_device[run_idx] for run_idx in train_runs]
 
             # ================================================================
             # Pre-compute pseudo-inverses for ALL PC counts
@@ -1033,7 +1528,9 @@ def cross_validate_noise_pcs(
                     # Catches both LinAlgError and RuntimeError (MKL errors appear as RuntimeError)
                     if n_pcs == 0:
                         # Only warn once per fold
-                        print(f"  Warning: X'X ill-conditioned ({type(e).__name__}), using direct pinv")
+                        print(
+                            f"  Warning: X'X ill-conditioned ({type(e).__name__}), using direct pinv"
+                        )
                     try:
                         pinv_full = torch.linalg.pinv(x_full, rcond=1e-5)  # (n_regs, n_tps)
                         pinv_task = pinv_full[:n_task_regs, :]  # (n_task_regs, n_tps)
@@ -1089,18 +1586,20 @@ def cross_validate_noise_pcs(
                 else:
                     # Full accumulator mode: store predictions
                     # Move to accumulator device (GPU if doing GPU projections, otherwise CPU)
-                    pred_by_pc_chunk[n_pcs][:, test_tps] = y_pred.to(pred_by_pc_chunk[n_pcs].device)
+                    pred_by_pc_chunk[n_pcs][:, test_tps_list] = y_pred.to(
+                        pred_by_pc_chunk[n_pcs].device
+                    )
 
             # For non-LORO mode, store projected actuals
             if not is_loro:
                 if nuisance_per_run is not None:
-                    actual_projected_chunk[:, test_tps] = data_test_projected.to(actual_projected_chunk.device)
+                    actual_projected_chunk[:, test_tps_list] = data_test_projected.to(
+                        actual_projected_chunk.device
+                    )
                 else:
-                    actual_projected_chunk[:, test_tps] = chunk_data_test.to(actual_projected_chunk.device)
-
-            # Free GPU memory for this fold
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+                    actual_projected_chunk[:, test_tps_list] = chunk_data_test.to(
+                        actual_projected_chunk.device
+                    )
 
         # ================================================================
         # Compute R² for this chunk
@@ -1114,9 +1613,7 @@ def cross_validate_noise_pcs(
                 sum_sq_act = sum_sq_actual_by_pc[n_pcs]
 
                 # Compute R² from streaming statistics
-                r2 = compute_r2_from_sufficient_stats(
-                    ss_res, sum_act, sum_sq_act, n_timepoints
-                )
+                r2 = compute_r2_from_sufficient_stats(ss_res, sum_act, sum_sq_act, n_timepoints)
                 r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy()
 
             # Free chunk memory
@@ -1131,7 +1628,9 @@ def cross_validate_noise_pcs(
                 r2 = compute_r2_metric(actual, pred, metric="cod")
 
                 # Move to CPU if on GPU before converting to numpy
-                r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy() if r2.is_cuda else r2.numpy()
+                r2_maps[chunk_start:chunk_end, n_pcs] = (
+                    r2.cpu().numpy() if r2.is_cuda else r2.numpy()
+                )
 
             # Free chunk memory
             del pred_by_pc_chunk, chunk_data_cpu, actual_projected_chunk
@@ -1457,6 +1956,17 @@ def fit_denoising_model(
     polort: Optional[int] = 2,
     pcstop: float = 1.05,
     pcR2cutoff: Optional[float] = None,
+    noise_method: Literal["pca", "ica"] = "pca",
+    auto_component_caps: bool = False,
+    auto_component_estimate_max: Optional[int] = None,
+    auto_component_min: int = 5,
+    auto_component_var_threshold: float = 0.90,
+    auto_component_use_mp: bool = True,
+    ica_restarts: int = 1,
+    ica_max_iter: int = 400,
+    ica_tol: float = 1e-5,
+    compute_noise_pool_pca_scree: bool = True,
+    scree_max_components: Optional[int] = None,
     cv_strategy: Union[int, float] = 1,
     n_perms: int = 100,
     r2_method: str = "auto",
@@ -1578,6 +2088,9 @@ def fit_denoising_model(
     # Validate inputs
     if design_matrix is None and designs_by_hrf is None:
         raise ValueError("Either design_matrix or designs_by_hrf must be provided")
+        if run_starts is None:
+            raise ValueError("run_starts must be provided")
+
     if design_matrix is not None and designs_by_hrf is not None:
         raise ValueError("Cannot provide both design_matrix and designs_by_hrf")
     if designs_by_hrf is not None and hrf_indices is None:
@@ -1598,13 +2111,20 @@ def fit_denoising_model(
     # Uses AFNI formula: 1 + floor(run_duration / 150)
     if polort is None:
         from .cli_utils import auto_polort, compute_run_lengths, get_average_run_duration
+
         run_lengths = compute_run_lengths(run_starts, n_timepoints)
         avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
         polort = auto_polort(avg_run_duration_sec, formula="afni")
 
         if verbose:
-            median_run_length = int(torch.tensor(run_lengths).median().item()) if len(run_lengths) > 1 else run_lengths[0]
-            print(f"\nAuto-determined polort={polort} (median run: {median_run_length} TRs = {avg_run_duration_sec:.1f}s)")
+            median_run_length = (
+                int(torch.tensor(run_lengths).median().item())
+                if len(run_lengths) > 1
+                else run_lengths[0]
+            )
+            print(
+                f"\nAuto-determined polort={polort} (median run: {median_run_length} TRs = {avg_run_duration_sec:.1f}s)"
+            )
 
     # Convert nuisance to list format for consistent handling
     # This ensures extract_noise_pcs_per_run gets the exact same nuisance
@@ -1691,7 +2211,7 @@ def fit_denoising_model(
             )
 
             # Store R² values for this group (ensure same device)
-            initial_r2[voxel_mask] = xval_results['r2'].to(initial_r2.device)  # Task-only R²
+            initial_r2[voxel_mask] = xval_results["r2"].to(initial_r2.device)  # Task-only R²
 
         if verbose:
             print(f"\n  Unified noise pool created from {n_voxels:,} voxels across all HRFs")
@@ -1851,7 +2371,38 @@ def fit_denoising_model(
         print(f"  Criteria: {n_criteria:,} voxels ({n_criteria / data.shape[0] * 100:.1f}%)")
         print("  Note: Criteria mask will be refined after computing per-PC R² maps")
 
-    # Step 3: Extract noise PCs per run (and optionally loadings)
+    noise_pool_pca_scree_ratio_per_run: Optional[List[torch.Tensor]] = None
+    scree_eval_max = (
+        scree_max_components
+        if scree_max_components is not None
+        else (
+            auto_component_estimate_max
+            if auto_component_estimate_max is not None
+            else max(max_components * 2, 60)
+        )
+    )
+    scree_eval_max = max(5, int(scree_eval_max))
+
+    if compute_noise_pool_pca_scree:
+        try:
+            noise_pool_pca_scree_ratio_per_run = compute_noise_pool_pca_scree_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                max_components=scree_eval_max,
+                nuisance_per_run=nuisance_per_run,
+                device=device,
+            )
+            if verbose:
+                print(
+                    f"  Computed noise-pool PCA scree spectra (up to {scree_eval_max} components per run)"
+                )
+        except Exception as e:
+            noise_pool_pca_scree_ratio_per_run = None
+            if verbose:
+                print(f"  Warning: could not compute noise-pool PCA scree spectra: {e}")
+
+    # Step 3: Extract noise components per run (and optionally loadings)
     if verbose:
         n_nuisance = (
             sum(n.shape[1] for n in nuisance_per_run) // n_runs
@@ -1859,33 +2410,120 @@ def fit_denoising_model(
             else 0
         )
         nuisance_msg = f", projecting {n_nuisance} nuisance" if n_nuisance > 0 else ""
-        print(f"\nStep 3: Extracting PCs from noise pool (max={max_components}{nuisance_msg})...")
+        method_label = "ICs" if noise_method == "ica" else "PCs"
+        print(
+            f"\nStep 3: Extracting {method_label} from noise pool "
+            f"(max={max_components}{nuisance_msg})..."
+        )
+        if noise_method == "ica" and not auto_component_caps:
+            print(
+                "  IC count search: OFF (using fixed extraction cap). "
+                "Enable auto_component_caps for adaptive per-run search."
+            )
+
+    component_caps_per_run: Optional[List[int]] = None
+    component_cap_info: Optional[ComponentCountEstimate] = None
+    extraction_max_components = max_components
+    if auto_component_caps:
+        estimate_max_components = (
+            auto_component_estimate_max
+            if auto_component_estimate_max is not None
+            else max(max_components, max_components * 2)
+        )
+        estimate_max_components = max(1, int(estimate_max_components))
+
+        component_cap_info = estimate_noise_component_caps_per_run(
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_pool_mask,
+            max_components=estimate_max_components,
+            nuisance_per_run=nuisance_per_run,
+            min_components=auto_component_min,
+            variance_threshold=auto_component_var_threshold,
+            use_mp_prior=auto_component_use_mp,
+            device=device,
+            verbose=verbose,
+        )
+        component_caps_per_run = component_cap_info.per_run_caps
+
+        if component_caps_per_run:
+            component_caps_per_run = [
+                int(max(1, min(max_components, c))) for c in component_caps_per_run
+            ]
+
+        extraction_max_components = max_components
+
+        if verbose:
+            print(
+                f"  Independent {noise_method.upper()} estimate up to {estimate_max_components}; "
+                f"denoising sweep remains capped at {max_components}"
+            )
 
     pc_loadings = None
-    if return_loadings:
-        noise_pcs, pc_loadings = extract_noise_pcs_per_run(
-            data=data,
-            run_starts=run_starts,
-            noise_pool_mask=noise_pool_mask,
-            max_components=max_components,
-            variance_threshold=variance_threshold,
-            return_loadings=True,
-            nuisance_per_run=nuisance_per_run,
-            device=device,
-            verbose=verbose,
-        )
+    ic_variance_ratio_per_run: Optional[List[torch.Tensor]] = None
+    if noise_method not in {"pca", "ica"}:
+        raise ValueError(f"noise_method must be 'pca' or 'ica', got {noise_method}")
+
+    if noise_method == "pca":
+        if return_loadings:
+            noise_pcs, pc_loadings = extract_noise_pcs_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                max_components=extraction_max_components,
+                variance_threshold=variance_threshold,
+                return_loadings=True,
+                nuisance_per_run=nuisance_per_run,
+                component_caps_per_run=component_caps_per_run,
+                device=device,
+                verbose=verbose,
+            )
+        else:
+            noise_pcs = extract_noise_pcs_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                max_components=extraction_max_components,
+                variance_threshold=variance_threshold,
+                return_loadings=False,
+                nuisance_per_run=nuisance_per_run,
+                component_caps_per_run=component_caps_per_run,
+                device=device,
+                verbose=verbose,
+            )
     else:
-        noise_pcs = extract_noise_pcs_per_run(
-            data=data,
-            run_starts=run_starts,
-            noise_pool_mask=noise_pool_mask,
-            max_components=max_components,
-            variance_threshold=variance_threshold,
-            return_loadings=False,
-            nuisance_per_run=nuisance_per_run,
-            device=device,
-            verbose=verbose,
-        )
+        if return_loadings:
+            noise_pcs, pc_loadings, ic_variance_ratio_per_run = extract_noise_ics_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                max_components=extraction_max_components,
+                return_loadings=True,
+                return_variance_ratio=True,
+                nuisance_per_run=nuisance_per_run,
+                component_caps_per_run=component_caps_per_run,
+                ica_restarts=ica_restarts,
+                ica_max_iter=ica_max_iter,
+                ica_tol=ica_tol,
+                device=device,
+                verbose=verbose,
+            )
+        else:
+            noise_pcs, ic_variance_ratio_per_run = extract_noise_ics_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                max_components=extraction_max_components,
+                return_loadings=False,
+                return_variance_ratio=True,
+                nuisance_per_run=nuisance_per_run,
+                component_caps_per_run=component_caps_per_run,
+                ica_restarts=ica_restarts,
+                ica_max_iter=ica_max_iter,
+                ica_tol=ica_tol,
+                device=device,
+                verbose=verbose,
+            )
 
     # Aggressive GPU cleanup between PCA extraction and cross-validation
     # CRITICAL: Move data to CPU to avoid OOM during cross-validation indexing
@@ -1901,7 +2539,9 @@ def fit_denoising_model(
         # Move design matrix/matrices to CPU
         if per_hrf_mode:
             # Move all HRF-specific designs to CPU
-            designs_by_hrf = {hrf_idx: design.to("cpu") for hrf_idx, design in designs_by_hrf.items()}
+            designs_by_hrf = {
+                hrf_idx: design.to("cpu") for hrf_idx, design in designs_by_hrf.items()
+            }
         else:
             design_matrix = design_matrix.to("cpu")
 
@@ -2043,6 +2683,8 @@ def fit_denoising_model(
 
     # Select optimal number of components using GLMdenoise-style early stopping
     # This is more robust to noise than pure argmax
+    min_improvement = 1e-6  # ignore tiny numerical gains in CV R²
+
     if pcstop < 0:
         # User override: use exactly this many PCs
         optimal_n_components = int(abs(pcstop))
@@ -2058,19 +2700,27 @@ def fit_denoising_model(
         curve = r2_by_n_components - r2_by_n_components[0]
         max_improvement = curve.max()
 
-        # Find first PC count that achieves threshold * max_improvement
-        # Start from 0 PCs and stop when we're within threshold of max
-        threshold = max_improvement / pcstop  # e.g., max/1.05 = within 5% of max
+        # If improvement is negligible, prefer no denoising PCs.
+        if max_improvement < min_improvement:
+            optimal_n_components = 0
+            if verbose:
+                print(
+                    f"  Max improvement {max_improvement:.4g} < {min_improvement:.4g}; selecting 0 PCs"
+                )
+        else:
+            # Find first PC count that achieves threshold * max_improvement
+            # Start from 0 PCs and stop when we're within threshold of max
+            threshold = max_improvement / pcstop  # e.g., max/1.05 = within 5% of max
 
-        optimal_n_components = 0
-        best_so_far = -np.inf
-        for n_pcs in range(len(curve)):
-            if curve[n_pcs] > best_so_far:
-                optimal_n_components = n_pcs
-                best_so_far = curve[n_pcs]
-                # If we're within threshold of max, stop here
-                if best_so_far >= threshold:
-                    break
+            optimal_n_components = 0
+            best_so_far = -np.inf
+            for n_pcs in range(len(curve)):
+                if curve[n_pcs] > best_so_far:
+                    optimal_n_components = n_pcs
+                    best_so_far = curve[n_pcs]
+                    # If we're within threshold of max, stop here
+                    if best_so_far >= threshold:
+                        break
 
         if verbose and pcstop != 1.0:
             argmax_n = int(np.argmax(r2_by_n_components))
@@ -2136,7 +2786,42 @@ def fit_denoising_model(
         "n_noise_voxels": n_noise,
         "n_criteria_voxels": int(criteria_mask.sum().item()),
         "n_runs": len(run_starts),
+        "noise_method": noise_method,
+        "auto_component_caps": auto_component_caps,
+        "auto_component_estimate_max": auto_component_estimate_max,
+        "auto_component_caps_per_run": component_caps_per_run,
+        "extraction_max_components": extraction_max_components,
+        "auto_component_min": auto_component_min,
+        "auto_component_var_threshold": auto_component_var_threshold,
+        "auto_component_use_mp": auto_component_use_mp,
+        "ica_restarts": int(ica_restarts),
+        "ica_max_iter": int(ica_max_iter),
+        "ica_tol": float(ica_tol),
+        "noise_pool_pca_scree_max_components": scree_eval_max,
     }
+
+    if ic_variance_ratio_per_run is not None:
+        metadata["ic_variance_ratio_per_run"] = [
+            ratios.detach().cpu().tolist() for ratios in ic_variance_ratio_per_run
+        ]
+
+    if component_cap_info is not None:
+        metadata["auto_component_variance_caps"] = component_cap_info.variance_caps
+        metadata["auto_component_effective_rank_caps"] = component_cap_info.entropy_rank_caps
+        metadata["auto_component_mp_caps"] = component_cap_info.mp_caps
+        metadata["auto_component_mp_reasons"] = component_cap_info.mp_reasons
+        metadata["auto_component_search_iterations"] = component_cap_info.search_iterations
+        metadata["auto_component_search_final_max_per_run"] = (
+            component_cap_info.search_final_max_per_run
+        )
+        metadata["auto_component_search_ceiling_per_run"] = (
+            component_cap_info.search_ceiling_per_run
+        )
+
+    if noise_pool_pca_scree_ratio_per_run is not None:
+        metadata["noise_pool_pca_scree_ratio_per_run"] = [
+            ratios.detach().cpu().tolist() for ratios in noise_pool_pca_scree_ratio_per_run
+        ]
 
     if verbose:
         print(f"\n{'=' * 70}")

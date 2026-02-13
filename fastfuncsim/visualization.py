@@ -1007,9 +1007,68 @@ def create_interactive_summary_html(
     return output_path
 
 
+def plot_noise_pool_pca_scree(
+    scree_ratio_per_run: list[Union[np.ndarray, torch.Tensor, list[float]]],
+    variance_threshold: Optional[float] = None,
+    output_path: Optional[str] = None,
+) -> plt.Figure:
+    """Plot per-run PCA scree curves from noise-pool data."""
+    ratios_np: list[np.ndarray] = []
+    for ratios in scree_ratio_per_run:
+        if torch.is_tensor(ratios):
+            r = ratios.detach().cpu().numpy()
+        else:
+            r = np.asarray(ratios)
+        if r.ndim == 0:
+            continue
+        ratios_np.append(r.astype(np.float64, copy=False))
+
+    if len(ratios_np) == 0:
+        raise ValueError("scree_ratio_per_run is empty")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    colors = plt.cm.tab10(np.linspace(0, 1, len(ratios_np)))  # ty: ignore[unresolved-attribute]
+
+    for run_idx, (ratios, color) in enumerate(zip(ratios_np, colors)):
+        x = np.arange(1, len(ratios) + 1)
+        ax1.plot(x, ratios, color=color, linewidth=1.5, alpha=0.9, label=f"Run {run_idx + 1}")
+
+        cum = np.cumsum(ratios)
+        cum = np.clip(cum, 0.0, 1.0)
+        ax2.plot(x, cum, color=color, linewidth=1.5, alpha=0.9, label=f"Run {run_idx + 1}")
+
+    ax1.set_title("Noise-pool PCA scree (per-run explained variance ratio)", fontweight="bold")
+    ax1.set_xlabel("Component index")
+    ax1.set_ylabel("Explained variance ratio")
+    ax1.set_yscale("log")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_title("Cumulative explained variance")
+    ax2.set_xlabel("Component index")
+    ax2.set_ylabel("Cumulative variance")
+    ax2.set_ylim(0.0, 1.02)
+    ax2.grid(True, alpha=0.3)
+
+    if variance_threshold is not None:
+        ax2.axhline(variance_threshold, color="gray", linestyle="--", alpha=0.8)
+
+    if len(ratios_np) <= 10:
+        ax1.legend(loc="upper right", fontsize=8, ncol=2)
+
+    fig.tight_layout()
+
+    if output_path is not None:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=180, bbox_inches="tight")
+
+    return fig
+
+
 def plot_denoising_pcs(
     noise_pcs_per_run: list[Union[torch.Tensor, np.ndarray]],
     run_starts: list[int],
+    component_variance_ratio_per_run: Optional[list[Union[torch.Tensor, np.ndarray]]] = None,
     pc_weights_per_run: Optional[list[np.ndarray]] = None,
     volume_shape: Optional[tuple[int, int, int]] = None,
     voxel_mask: Optional[np.ndarray] = None,
@@ -1021,6 +1080,7 @@ def plot_denoising_pcs(
     optimal_n_pcs: Optional[int] = None,
     output_prefix: Optional[str] = None,
     voxel_sizes: Optional[tuple[float, float, float]] = None,
+    return_figs: bool = True,
 ) -> list[plt.Figure]:
     """
     Create tedana-style visualization of noise PCs for denoising diagnostics.
@@ -1035,6 +1095,10 @@ def plot_denoising_pcs(
         PC timecourses per run. Each has shape (n_timepoints_run, n_components).
     run_starts : list of int
         Starting timepoint for each run.
+    component_variance_ratio_per_run : list, optional
+        Per-run variance-share vectors for components, where each run entry has
+        shape (n_components,). Used to annotate each component with a small
+        variance-share text label (e.g., "12.34%").
     pc_weights_per_run : list of ndarray, optional
         Spatial weights per run per PC. Each has shape (n_noise_voxels, n_components).
         If provided, shows brain slices of weights.
@@ -1058,6 +1122,9 @@ def plot_denoising_pcs(
         Optimal number of PCs from cross-validation (for annotation).
     output_prefix : str, optional
         If provided, save figures to {output_prefix}_PC{n}.png.
+    return_figs : bool, default=True
+        Whether to return figure handles. Set to False when saving many plots
+        to avoid retaining open figures in memory.
     voxel_sizes : tuple of float, optional
         Voxel sizes in mm (sx, sy, sz). If provided, preserves physical aspect ratio.
 
@@ -1086,6 +1153,16 @@ def plot_denoising_pcs(
             pcs_np.append(pcs)
 
     n_runs = len(pcs_np)
+
+    var_ratio_np = None
+    if component_variance_ratio_per_run is not None:
+        var_ratio_np = []
+        for ratios in component_variance_ratio_per_run:
+            if torch.is_tensor(ratios):
+                var_ratio_np.append(ratios.detach().cpu().numpy())
+            else:
+                var_ratio_np.append(np.asarray(ratios))
+
     # Get max components across all runs
     max_pcs_available = min(pc.shape[1] for pc in pcs_np)
     n_pcs_to_show = min(n_pcs_to_show, max_pcs_available)
@@ -1152,6 +1229,43 @@ def plot_denoising_pcs(
         for run_idx, start in enumerate(run_starts[1:], 1):
             run_time = start * tr
             ax_tc.axvline(run_time, color="gray", linestyle="--", alpha=0.5, linewidth=1.5)
+
+        # Small per-run variance-share annotation (if provided)
+        if var_ratio_np is not None and n_runs > 0:
+            y_min, y_max = ax_tc.get_ylim()
+            y_pos = y_min + 0.90 * (y_max - y_min)
+
+            fallback_starts = np.cumsum([0] + [pc.shape[0] for pc in pcs_np[:-1]])
+
+            for run_idx in range(n_runs):
+                if run_idx >= len(var_ratio_np):
+                    continue
+                v = var_ratio_np[run_idx]
+                if v is None or v.ndim == 0 or pc_idx >= len(v):
+                    continue
+
+                pct = float(v[pc_idx]) * 100.0
+                run_start = (
+                    run_starts[run_idx]
+                    if run_idx < len(run_starts)
+                    else int(fallback_starts[run_idx])
+                )
+                run_len = pcs_np[run_idx].shape[0]
+                x_center = (run_start + run_len / 2.0) * tr
+
+                ax_tc.text(
+                    x_center,
+                    y_pos,
+                    f"{pct:.1f}%",
+                    ha="center",
+                    va="top",
+                    fontsize=7,
+                    color="dimgray",
+                    bbox=dict(
+                        boxstyle="round,pad=0.10", facecolor="white", alpha=0.40, edgecolor="none"
+                    ),
+                    zorder=4,
+                )
 
         # Color the background differently if included vs not
         if is_in_optimal:
@@ -1307,7 +1421,10 @@ def plot_denoising_pcs(
             Path(fig_path).parent.mkdir(parents=True, exist_ok=True)
             plt.savefig(fig_path, dpi=150, bbox_inches="tight")
 
-        figs.append(fig)
+        if return_figs:
+            figs.append(fig)
+        else:
+            plt.close(fig)
 
     return figs
 

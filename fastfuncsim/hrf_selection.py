@@ -157,10 +157,10 @@ class HRFSelectionResults:
     xval_r2_std: torch.Tensor = None
     xval_r2_all_hrfs: torch.Tensor = None
     xval_r2_canonical: torch.Tensor = None  # Baseline with single canonical HRF
-    canonical_full_r2: Optional[torch.Tensor] = None    # In-sample R², canonical HRF
-    hrfopt_full_r2: Optional[torch.Tensor] = None        # In-sample R², best HRF per voxel
-    canonical_xval_r2: Optional[torch.Tensor] = None     # Beta-series CV R², canonical HRF
-    hrfopt_xval_r2: Optional[torch.Tensor] = None        # Beta-series CV R², best HRF per voxel
+    canonical_full_r2: Optional[torch.Tensor] = None  # In-sample R², canonical HRF
+    hrfopt_full_r2: Optional[torch.Tensor] = None  # In-sample R², best HRF per voxel
+    canonical_xval_r2: Optional[torch.Tensor] = None  # Beta-series CV R², canonical HRF
+    hrfopt_xval_r2: Optional[torch.Tensor] = None  # Beta-series CV R², best HRF per voxel
     final_results: GLMResults = None
     canonical_results: GLMResults = None  # Full GLM with canonical HRF for comparison
     hrf_library: torch.Tensor = None
@@ -286,17 +286,17 @@ def _evaluate_hrfs_batched(
     n_test_per_tp = torch.zeros(n_timepoints, dtype=torch.long)
     for _, test_runs in cv_splits:
         for r in test_runs:
-            n_test_per_tp[run_starts[r]:run_ends[r]] += 1
+            n_test_per_tp[run_starts[r] : run_ends[r]] += 1
     is_loro_style = bool((n_test_per_tp == 1).all())
 
     # Global SS_tot from ALL timepoints -- used in both paths.
     if data_on_device:
         sum_y_all = projected_data.sum(dim=1).cpu()
-        sum_y2_all = (projected_data ** 2).sum(dim=1).cpu()
+        sum_y2_all = (projected_data**2).sum(dim=1).cpu()
     else:
         sum_y_all = projected_data.sum(dim=1)
-        sum_y2_all = (projected_data ** 2).sum(dim=1)
-    ss_tot_global = (sum_y2_all - sum_y_all ** 2 / n_timepoints).clamp(min=1e-10)
+        sum_y2_all = (projected_data**2).sum(dim=1)
+    ss_tot_global = (sum_y2_all - sum_y_all**2 / n_timepoints).clamp(min=1e-10)
 
     # =========================================================================
     # Path A: LORO -- fold-outer, SS_res accumulation.
@@ -323,14 +323,14 @@ def _evaluate_hrfs_batched(
             pinv_trains_gpu = [torch.linalg.pinv(td) for td in train_designs_gpu]
 
             if data_on_device:
-                sum_y2_test_fold = (test_data_split ** 2).sum(dim=1)
+                sum_y2_test_fold = (test_data_split**2).sum(dim=1)
                 for d_idx in range(n_designs):
                     betas = pinv_trains_gpu[d_idx] @ train_data_split.T
                     yhat = (test_designs_gpu[d_idx] @ betas).T
                     ss_res = (
                         sum_y2_test_fold
                         - 2 * (test_data_split * yhat).sum(dim=1)
-                        + (yhat ** 2).sum(dim=1)
+                        + (yhat**2).sum(dim=1)
                     )
                     sum_ss_res[:, d_idx] += ss_res.cpu()
             else:
@@ -338,24 +338,30 @@ def _evaluate_hrfs_batched(
                     ce = min(cs + chunk_size, n_voxels)
                     train_chunk = train_data_split[cs:ce].to(device)
                     test_chunk = test_data_split[cs:ce].to(device)
-                    sum_y2_chunk = (test_chunk ** 2).sum(dim=1)
+                    sum_y2_chunk = (test_chunk**2).sum(dim=1)
                     for d_idx in range(n_designs):
                         betas = pinv_trains_gpu[d_idx] @ train_chunk.T
                         yhat = (test_designs_gpu[d_idx] @ betas).T
                         ss_res = (
-                            sum_y2_chunk
-                            - 2 * (test_chunk * yhat).sum(dim=1)
-                            + (yhat ** 2).sum(dim=1)
+                            sum_y2_chunk - 2 * (test_chunk * yhat).sum(dim=1) + (yhat**2).sum(dim=1)
                         )
                         sum_ss_res[cs:ce, d_idx] += ss_res.cpu()
                     del train_chunk, test_chunk
 
-            del train_data_split, test_data_split, train_designs_gpu, test_designs_gpu, pinv_trains_gpu
+            del (
+                train_data_split,
+                test_data_split,
+                train_designs_gpu,
+                test_designs_gpu,
+                pinv_trains_gpu,
+            )
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         return 1.0 - sum_ss_res / ss_tot_global.unsqueeze(1)
 
+    # --- Path B follows (guard clause above returned for LORO) ---------------
+    # This is an intentional early-return guard rather than a giant else-block.
     # =========================================================================
     # Path B: Split-half / k-fold -- prediction averaging (chunk-outer).
     #
@@ -371,16 +377,47 @@ def _evaluate_hrfs_batched(
     # Per-timepoint test count (for averaging).
     count_per_tp = n_test_per_tp.float()
 
+    # Warn when n_train < n_test (training set smaller than test set).
+    # Having more test data than training data is an unusual split that increases
+    # beta variance per fold.  For HRF shapes far from the true BOLD response (e.g.
+    # slow purely-positive HRFs at the library extremes whose design columns lose
+    # energy to polynomial projection, or early-peak HRFs mismatched to the true
+    # response), a handful of folds can produce sign-flipped betas that dominate the
+    # prediction average → very negative R² for those specific HRFs.  LORO is immune
+    # because each TP is tested once (Path A: SS_res accumulation).
+    #
+    # TODO: investigate further — empirically observed with 9 runs / strategy=0.5
+    # (HRFs 4 and 17-19, 0-indexed) but NOT for HRFs 0-3 (even earlier peaks).
+    # Mechanism: fewer training runs → lower effective SNR for wrong-HRF designs →
+    # sign-flipping OLS betas in specific folds → averaged prediction anti-correlated
+    # with data.  Worth testing with other datasets to characterise the threshold.
+    # Rule of thumb that has worked: cv_strategy >= 5/n_runs (e.g. 0.6 for 9 runs).
+    n_train_per_fold = len(cv_splits[0][0])
+    n_test_per_fold = len(cv_splits[0][1])
+    n_total_runs = n_train_per_fold + n_test_per_fold
+    if n_train_per_fold < n_test_per_fold:
+        import warnings
+
+        rec_frac = n_test_per_fold / n_total_runs
+        msg = (
+            f"Split-half CV: {n_train_per_fold} training runs < {n_test_per_fold} test runs per fold. "
+            f"This can produce unstable beta estimates for HRF shapes far from the "
+            f"true BOLD response, causing very negative R² for those HRFs. "
+            f"Consider using cv_strategy >= {rec_frac:.2f} so training >= test runs."
+        )
+        if verbose:
+            print(f"  Warning: {msg}")
+        warnings.warn(msg, stacklevel=4)
+
     if verbose:
         print(f"  Precomputing {n_splits} x {n_designs} pseudoinverses for split-half CV...")
     all_pinvs: List[List[torch.Tensor]] = []
-    for train_runs, _ in cv_splits:
-        pinvs_fold = [
-            torch.linalg.pinv(
-                torch.cat([designs_by_run[d][r] for r in train_runs], dim=0).to(device)
-            )
-            for d in range(n_designs)
-        ]
+    for fold_idx, (train_runs, _) in enumerate(cv_splits):
+        pinvs_fold = []
+        for d_idx in range(n_designs):
+            X_train = torch.cat([designs_by_run[d_idx][r] for r in train_runs], dim=0).to(device)
+            pinv_X = torch.linalg.pinv(X_train)
+            pinvs_fold.append(pinv_X)
         all_pinvs.append(pinvs_fold)
 
     # Compute chunk_size that keeps sum_yhat (n_designs x chunk x n_tp) in GPU memory.
@@ -415,11 +452,12 @@ def _evaluate_hrfs_batched(
 
             for d_idx in range(n_designs):
                 betas = all_pinvs[fold_idx][d_idx] @ train_chunk.T  # (n_stim, chunk)
+
                 # Accumulate per test run using contiguous slices.
                 for r in test_runs:
                     r_start, r_end = run_starts[r], run_ends[r]
                     test_design_r = designs_by_run[d_idx][r].to(device)
-                    yhat_r = (test_design_r @ betas).T               # (chunk, T_r)
+                    yhat_r = (test_design_r @ betas).T  # (chunk, T_r)
                     sum_yhat[d_idx, :, r_start:r_end] += yhat_r
 
             del train_chunk
@@ -432,7 +470,7 @@ def _evaluate_hrfs_batched(
         ss_tot_chunk = ss_tot_global[cs:ce].to(device)
 
         for d_idx in range(n_designs):
-            avg_yhat_d = sum_yhat[d_idx] / count_d    # (chunk, n_tp)
+            avg_yhat_d = sum_yhat[d_idx] / count_d  # (chunk, n_tp)
             ss_res = ((data_chunk - avg_yhat_d) ** 2).sum(dim=1)
             r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).cpu()
 
@@ -629,7 +667,12 @@ def fit_glm_hrf_library_with_xval(
     # =========================================================================
     # Build per-run nuisance blocks using shared utility
     # =========================================================================
-    from .cli_utils import auto_polort, build_nuisance_per_run, compute_run_lengths, get_average_run_duration
+    from .cli_utils import (
+        auto_polort,
+        build_nuisance_per_run,
+        compute_run_lengths,
+        get_average_run_duration,
+    )
 
     # Auto-compute polort if not specified (AFNI formula)
     if polort is None:
@@ -684,8 +727,11 @@ def fit_glm_hrf_library_with_xval(
     # Project data using Q factors (with chunking for large data)
     # Data is on CPU; project per-run, streaming chunks to GPU
     effective_chunk_size = chunk_size or estimate_chunk_size(
-        n_voxels=n_voxels, n_timepoints=n_timepoints,
-        n_regressors=n_nuisance_cols_per_run, device=device, operation="xval",
+        n_voxels=n_voxels,
+        n_timepoints=n_timepoints,
+        n_regressors=n_nuisance_cols_per_run,
+        device=device,
+        operation="xval",
     )
     data_size_bytes = n_voxels * n_timepoints * 4
     needs_chunking = data_size_bytes > 1e9 or n_voxels > effective_chunk_size
@@ -724,7 +770,10 @@ def fit_glm_hrf_library_with_xval(
     # LORO CV needs ~3x data size for working memory (train-split copies + lstsq
     # workspace), so use a conservative 0.25 safety fraction.
     keep_on_cpu = estimate_keep_on_cpu(
-        n_voxels, n_timepoints, device, gpu_safety_fraction=0.25,
+        n_voxels,
+        n_timepoints,
+        device,
+        gpu_safety_fraction=0.25,
     )
     if not keep_on_cpu and device.type != "cpu":
         projected_data = projected_data.to(device)
@@ -746,9 +795,14 @@ def fit_glm_hrf_library_with_xval(
     for hrf_idx in range(n_hrfs):
         hrf = hrf_library[hrf_idx]
         stim_design = convolve_hrf_microtime(
-            onsets, hrf, n_timepoints,
-            tr=tr, microtime_dt=microtime_dt,
-            microtime_onset=microtime_onset, device=device,
+            onsets,
+            hrf,
+            n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            run_starts=run_starts,
+            device=device,
         )
         projected = _project_design_with_q_factors(
             stim_design, q_factors, run_starts, n_timepoints, n_runs, device
@@ -769,14 +823,18 @@ def fit_glm_hrf_library_with_xval(
     canonical_mode_lower = canonical_mode.lower()
     if canonical_mode_lower == "spmg1":
         canonical_hrf = get_spmg1_hrf(
-            microtime_dt=microtime_dt, stim_duration=0.0,
-            normalize_peak=True, device=device,
+            microtime_dt=microtime_dt,
+            stim_duration=0.0,
+            normalize_peak=True,
+            device=device,
         )
         canonical_label = "SPMG1"
     elif canonical_mode_lower in ("glmsingle", "single"):
         canonical_hrf = get_hrf_library(
-            mode="single", stim_duration=0.0,
-            microtime_dt=microtime_dt, device=device,
+            mode="single",
+            stim_duration=0.0,
+            microtime_dt=microtime_dt,
+            device=device,
         )
         canonical_label = "GLMsingle"
     else:
@@ -789,9 +847,14 @@ def fit_glm_hrf_library_with_xval(
         print(f"  Using {canonical_label} canonical HRF for baseline comparison")
 
     canonical_design = convolve_hrf_microtime(
-        onsets, canonical_hrf, n_timepoints,
-        tr=tr, microtime_dt=microtime_dt,
-        microtime_onset=microtime_onset, device=device,
+        onsets,
+        canonical_hrf,
+        n_timepoints,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        microtime_onset=microtime_onset,
+        run_starts=run_starts,
+        device=device,
     )
     projected_canonical_design = _project_design_with_q_factors(
         canonical_design, q_factors, run_starts, n_timepoints, n_runs, device
@@ -803,6 +866,7 @@ def fit_glm_hrf_library_with_xval(
     if debug:
         _prefix = debug_prefix or "debug"
         from pathlib import Path as _Path
+
         _debug_dir = f"{_prefix}_debug"
         _Path(_debug_dir).mkdir(parents=True, exist_ok=True)
 
@@ -816,33 +880,51 @@ def fit_glm_hrf_library_with_xval(
         print("\nPer-run data statistics (raw):")
         for ri, (rs, re) in enumerate(zip(run_starts, run_ends)):
             rd = data[:, rs:re]
-            print(f"  Run {ri}: TRs [{rs}:{re}] mean={rd.mean():.2f} std={rd.std():.2f} "
-                  f"min={rd.min():.2f} max={rd.max():.2f}")
+            print(
+                f"  Run {ri}: TRs [{rs}:{re}] mean={rd.mean():.2f} std={rd.std():.2f} "
+                f"min={rd.min():.2f} max={rd.max():.2f}"
+            )
 
         print("\nPer-run projected data statistics:")
         for ri, (rs, re) in enumerate(zip(run_starts, run_ends)):
             rd = projected_data[:, rs:re]
-            print(f"  Run {ri}: mean={rd.mean():.4f} std={rd.std():.2f} "
-                  f"min={rd.min():.2f} max={rd.max():.2f}")
+            print(
+                f"  Run {ri}: mean={rd.mean():.4f} std={rd.std():.2f} "
+                f"min={rd.min():.2f} max={rd.max():.2f}"
+            )
 
         # Canonical design statistics
         print(f"\nCanonical design (unprojected): {canonical_design.shape}")
         for c in range(canonical_design.shape[1]):
             col = canonical_design[:, c]
-            lbl = condition_labels[c] if condition_labels and c < len(condition_labels) else f"cond{c}"
-            print(f"  {lbl}: max={col.max():.4f} min={col.min():.4f} "
-                  f"sum_abs={col.abs().sum():.2f} nonzero_frac={(col.abs()>0.01).float().mean():.3f}")
+            lbl = (
+                condition_labels[c]
+                if condition_labels and c < len(condition_labels)
+                else f"cond{c}"
+            )
+            print(
+                f"  {lbl}: max={col.max():.4f} min={col.min():.4f} "
+                f"sum_abs={col.abs().sum():.2f} nonzero_frac={(col.abs() > 0.01).float().mean():.3f}"
+            )
 
         print(f"\nCanonical design (projected): {projected_canonical_design.shape}")
         for c in range(projected_canonical_design.shape[1]):
             col = projected_canonical_design[:, c]
-            lbl = condition_labels[c] if condition_labels and c < len(condition_labels) else f"cond{c}"
-            print(f"  {lbl}: max={col.max():.4f} min={col.min():.4f} "
-                  f"sum_abs={col.abs().sum():.2f} nonzero_frac={(col.abs()>0.01).float().mean():.3f}")
+            lbl = (
+                condition_labels[c]
+                if condition_labels and c < len(condition_labels)
+                else f"cond{c}"
+            )
+            print(
+                f"  {lbl}: max={col.max():.4f} min={col.min():.4f} "
+                f"sum_abs={col.abs().sum():.2f} nonzero_frac={(col.abs() > 0.01).float().mean():.3f}"
+            )
 
         # Nuisance statistics
-        print(f"\nNuisance per run: {n_nuisance_cols_per_run} columns/run, "
-              f"{n_poly_cols} poly + {n_nuisance_cols_per_run - n_poly_cols} extra")
+        print(
+            f"\nNuisance per run: {n_nuisance_cols_per_run} columns/run, "
+            f"{n_poly_cols} poly + {n_nuisance_cols_per_run - n_poly_cols} extra"
+        )
         for ri, nb in enumerate(nuisance_blocks_per_run):
             print(f"  Run {ri}: shape={nb.shape}, col_norms={nb.norm(dim=0).tolist()}")
 
@@ -857,15 +939,17 @@ def fit_glm_hrf_library_with_xval(
         # Quick OLS fit on projected data+design to show what R² looks like
         print(f"\nQuick OLS diagnostic (canonical design on projected data):")
         _X = projected_canonical_design.to(projected_data.device)
-        _b = torch.linalg.lstsq(_X, projected_data[:min(1000, n_voxels), :].T).solution
+        _b = torch.linalg.lstsq(_X, projected_data[: min(1000, n_voxels), :].T).solution
         _pred = (_X @ _b).T
-        _y = projected_data[:min(1000, n_voxels), :]
+        _y = projected_data[: min(1000, n_voxels), :]
         _ss_res = ((_y - _pred) ** 2).sum(dim=1)
         _ss_tot = ((_y - _y.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
         _r2_quick = 1 - _ss_res / _ss_tot.clamp(min=1e-10)
-        print(f"  In-sample R² (first {min(1000, n_voxels)} voxels): "
-              f"mean={_r2_quick.mean():.4f} median={_r2_quick.median():.4f} "
-              f"Q25={_r2_quick.quantile(0.25):.4f} Q75={_r2_quick.quantile(0.75):.4f}")
+        print(
+            f"  In-sample R² (first {min(1000, n_voxels)} voxels): "
+            f"mean={_r2_quick.mean():.4f} median={_r2_quick.median():.4f} "
+            f"Q25={_r2_quick.quantile(0.25):.4f} Q75={_r2_quick.quantile(0.75):.4f}"
+        )
         del _X, _b, _pred, _y, _ss_res, _ss_tot, _r2_quick
 
         # Save design diagnostic figure
@@ -932,19 +1016,25 @@ def fit_glm_hrf_library_with_xval(
 
             # Path B: full 3dDenoisefast-style (project_out_nuisance_per_run + compute_xval_r2)
             proj_data_b, proj_design_b = project_out_nuisance_per_run(
-                data=data, design=canonical_design,
+                data=data,
+                design=canonical_design,
                 nuisance_per_run=nuisance_blocks_per_run,
-                run_starts=run_starts, device=device,
+                run_starts=run_starts,
+                device=device,
             )
             canonical_check_b = compute_xval_r2(
-                data=proj_data_b, design_matrix=proj_design_b,
+                data=proj_data_b,
+                design_matrix=proj_design_b,
                 run_starts=run_starts,
                 stim_indices=list(range(n_stim_cols)),
                 nuisance_indices=[],
                 cv_splits=cv_splits,
-                metric=metric, zero_event_strategy="zero",
-                device=device, batch_size=chunk_size,
-                r2_method=r2_method, verbose=False,
+                metric=metric,
+                zero_event_strategy="zero",
+                device=device,
+                batch_size=chunk_size,
+                r2_method=r2_method,
+                verbose=False,
             )
             r2_path_b = canonical_check_b["r2"].to(device)
 
@@ -1070,6 +1160,7 @@ def fit_glm_hrf_library_with_xval(
         hrf_library=hrf_library,
         hrf_index=hrf_index,
         nuisance_design=nuisance_design,
+        run_starts=run_starts,
         tr=tr,
         microtime_dt=microtime_dt,
         microtime_onset=microtime_onset,
@@ -1142,6 +1233,7 @@ def _fit_voxelwise_hrf(
     hrf_library: torch.Tensor,
     hrf_index: torch.Tensor,
     nuisance_design: torch.Tensor,
+    run_starts: List[int],
     tr: float,
     microtime_dt: float,
     microtime_onset: int,
@@ -1209,6 +1301,7 @@ def _fit_voxelwise_hrf(
             tr=tr,
             microtime_dt=microtime_dt,
             microtime_onset=microtime_onset,
+            run_starts=run_starts,
             device=device,
         )
 
@@ -1740,6 +1833,7 @@ def save_design_diagnostic_figure(
     """
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -1760,7 +1854,9 @@ def save_design_diagnostic_figure(
     ax = axes[0]
     design_np = canonical_design.cpu().numpy()
     for c in range(n_conditions):
-        label = condition_labels[c] if condition_labels and c < len(condition_labels) else f"cond{c}"
+        label = (
+            condition_labels[c] if condition_labels and c < len(condition_labels) else f"cond{c}"
+        )
         ax.plot(time_axis, design_np[:, c], label=label, alpha=0.8)
     for rs in run_starts[1:]:
         ax.axvline(rs * tr, color="gray", linestyle="--", alpha=0.5)
@@ -1773,16 +1869,22 @@ def save_design_diagnostic_figure(
     nuisance_full = torch.block_diag(*nuisance_per_run).cpu().numpy()
     n_nuis_cols = nuisance_full.shape[1]
     # Show as image
-    im = ax.imshow(nuisance_full.T, aspect="auto", cmap="RdBu_r",
-                   extent=[0, n_timepoints * tr, n_nuis_cols - 0.5, -0.5],
-                   interpolation="nearest")
+    im = ax.imshow(
+        nuisance_full.T,
+        aspect="auto",
+        cmap="RdBu_r",
+        extent=[0, n_timepoints * tr, n_nuis_cols - 0.5, -0.5],
+        interpolation="nearest",
+    )
     for rs in run_starts[1:]:
         ax.axvline(rs * tr, color="black", linestyle="-", alpha=0.7)
     ax.set_ylabel("Nuisance column")
     n_poly = nuisance_per_run[0].shape[1]
     n_extra = n_nuis_cols // n_runs - n_poly if n_runs > 0 else 0
-    ax.set_title(f"Block-Diagonal Nuisance ({n_poly} poly + {n_extra} extra per run, "
-                 f"{n_nuis_cols} total columns)")
+    ax.set_title(
+        f"Block-Diagonal Nuisance ({n_poly} poly + {n_extra} extra per run, "
+        f"{n_nuis_cols} total columns)"
+    )
     fig.colorbar(im, ax=ax, shrink=0.6)
 
     # Panel 3: Projected design (if available)
@@ -1790,7 +1892,11 @@ def save_design_diagnostic_figure(
         ax = axes[2]
         proj_np = projected_design.cpu().numpy()
         for c in range(n_conditions):
-            label = condition_labels[c] if condition_labels and c < len(condition_labels) else f"cond{c}"
+            label = (
+                condition_labels[c]
+                if condition_labels and c < len(condition_labels)
+                else f"cond{c}"
+            )
             ax.plot(time_axis, proj_np[:, c], label=label, alpha=0.8)
         for rs in run_starts[1:]:
             ax.axvline(rs * tr, color="gray", linestyle="--", alpha=0.5)
@@ -1907,7 +2013,12 @@ def save_hrf_selection_results(
         output_files["xval_r2_all_hrfs"] = xval_r2_all_file
 
     # 3d. Save clearly-named R² maps (single-trial path)
-    for field_name in ["canonical_full_r2", "hrfopt_full_r2", "canonical_xval_r2", "hrfopt_xval_r2"]:
+    for field_name in [
+        "canonical_full_r2",
+        "hrfopt_full_r2",
+        "canonical_xval_r2",
+        "hrfopt_xval_r2",
+    ]:
         val = getattr(results, field_name, None)
         if val is not None:
             fpath = f"{output_prefix}_{field_name}.nii.gz"

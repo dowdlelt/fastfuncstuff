@@ -2,6 +2,7 @@
 Design matrix construction for GLM
 Handles FIR, assumed HRF, and convolution operations
 """
+
 from __future__ import annotations
 
 from typing import Optional, Union
@@ -77,6 +78,7 @@ def convolve_hrf_microtime(
     tr: float = 1.0,
     microtime_dt: float = 0.1,
     microtime_onset: int = 0,
+    run_starts: Optional[list[int]] = None,
     device: Optional[torch.device] = None,
     return_single_trials: bool = False,
 ) -> Union[torch.Tensor, tuple]:
@@ -109,6 +111,10 @@ def convolve_hrf_microtime(
     microtime_onset : int, default=0
         Which microtime bin within each TR to sample (0-indexed).
         0 = start of TR, bins_per_tr/2 = middle of TR.
+    run_starts : list of int, optional
+        Run boundary starts in TR units (e.g., [0, 200, 400]).
+        When provided, each convolved event is clipped to its originating run
+        so HRF tails cannot bleed into adjacent runs.
     device : torch.device, optional
         Device for computation
     return_single_trials : bool, default=False
@@ -175,6 +181,26 @@ def convolve_hrf_microtime(
     design = torch.zeros(n_timepoints, n_conditions, device=device)
     single_trial_designs = [] if return_single_trials else None
 
+    run_start_bins: Optional[torch.Tensor] = None
+    run_end_bins: Optional[torch.Tensor] = None
+    if run_starts is not None:
+        if len(run_starts) == 0:
+            raise ValueError("run_starts must be non-empty when provided")
+        if run_starts[0] != 0:
+            raise ValueError("run_starts must start at 0")
+        if any(run_starts[i] >= run_starts[i + 1] for i in range(len(run_starts) - 1)):
+            raise ValueError("run_starts must be strictly increasing")
+        if run_starts[-1] >= n_timepoints:
+            raise ValueError("run_starts contains out-of-range index")
+
+        run_starts_full = list(run_starts) + [n_timepoints]
+        run_start_bins = torch.tensor(
+            [s * bins_per_tr for s in run_starts_full[:-1]], device=device, dtype=torch.long
+        )
+        run_end_bins = torch.tensor(
+            [e * bins_per_tr for e in run_starts_full[1:]], device=device, dtype=torch.long
+        )
+
     for cond_idx in range(n_conditions):
         cond_onsets = onsets_microtime[:, cond_idx]
 
@@ -210,6 +236,19 @@ def convolve_hrf_microtime(
             event_vec = single_event.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
             convolved = F.conv1d(event_vec, hrf_kernel, padding=hrf_len - 1)
             convolved = convolved.squeeze()[:n_microtime_points]
+
+            if run_start_bins is not None and run_end_bins is not None:
+                start_idx = int(start.item())
+                run_idx = int(torch.searchsorted(run_start_bins, start_idx, right=True).item() - 1)
+                run_idx = max(0, min(run_idx, len(run_start_bins) - 1))
+                run_start = int(run_start_bins[run_idx].item())
+                run_end = int(run_end_bins[run_idx].item())
+
+                # Ensure no cross-run contamination from HRF tails.
+                if run_start > 0:
+                    convolved[:run_start] = 0
+                if run_end < n_microtime_points:
+                    convolved[run_end:] = 0
 
             # Scale to peak = 1.0
             peak_val = convolved.abs().max()
@@ -396,12 +435,12 @@ def basis_csplin(x: torch.Tensor, knots: list[float], idx: int) -> torch.Tensor:
     # Region 1: 0 <= |t| < 1 (central peak)
     mask1 = torch.abs(t) < 1.0
     t1 = torch.abs(t[mask1])
-    val[mask1] = (2.0/3.0) - t1**2 + 0.5 * t1**3
+    val[mask1] = (2.0 / 3.0) - t1**2 + 0.5 * t1**3
 
     # Region 2: 1 <= |t| < 2 (tails)
     mask2 = (torch.abs(t) >= 1.0) & (torch.abs(t) < 2.0)
     t2 = torch.abs(t[mask2])
-    val[mask2] = (2.0 - t2)**3 / 6.0
+    val[mask2] = (2.0 - t2) ** 3 / 6.0
 
     # Normalize so peak value = 1.0 (for cardinal interpolation)
     # Peak of cubic B-spline is 2/3, so multiply by 3/2
@@ -560,8 +599,7 @@ def make_tent_design(
 
                 # Evaluate tent basis at this relative time
                 tent_val = basis_tent(
-                    torch.tensor(rel_time, device=device),
-                    tent_bot, tent_mid, tent_top
+                    torch.tensor(rel_time, device=device), tent_bot, tent_mid, tent_top
                 ).item()
 
                 # Add contribution to design matrix
@@ -688,9 +726,7 @@ def make_csplin_design(
 
                 # Evaluate cubic spline basis at this relative time
                 csplin_val = basis_csplin(
-                    torch.tensor([rel_time], device=device),
-                    knots,
-                    basis_idx
+                    torch.tensor([rel_time], device=device), knots, basis_idx
                 )[0].item()
 
                 # Add contribution
@@ -960,18 +996,32 @@ def build_glm_design(
 
             elif mode == "tent":
                 design = make_tent_design(
-                    onset, tent_bot, tent_top, tr, n_tp,
-                    n_basis=tent_n_basis, zero_edges=False, device=device
+                    onset,
+                    tent_bot,
+                    tent_top,
+                    tr,
+                    n_tp,
+                    n_basis=tent_n_basis,
+                    zero_edges=False,
+                    device=device,
                 )
 
             elif mode == "tentzero":
                 design = make_tent_design(
-                    onset, tent_bot, tent_top, tr, n_tp,
-                    n_basis=tent_n_basis, zero_edges=True, device=device
+                    onset,
+                    tent_bot,
+                    tent_top,
+                    tr,
+                    n_tp,
+                    n_basis=tent_n_basis,
+                    zero_edges=True,
+                    device=device,
                 )
 
             else:
-                raise ValueError(f"Unknown mode: {mode}. Valid modes: assumed, fir, tent, tentzero, onoff")
+                raise ValueError(
+                    f"Unknown mode: {mode}. Valid modes: assumed, fir, tent, tentzero, onoff"
+                )
 
         designs.append(design)
 
@@ -1225,10 +1275,14 @@ def save_iresp(
     try:
         import nibabel as nib
     except ImportError:
-        raise ImportError("nibabel is required to save NIfTI files. Install with: pip install nibabel")
+        raise ImportError(
+            "nibabel is required to save NIfTI files. Install with: pip install nibabel"
+        )
 
     if iresp.ndim != 5:
-        raise ValueError(f"iresp must be 5D (nx, ny, nz, n_conditions, n_lags), got shape {iresp.shape}")
+        raise ValueError(
+            f"iresp must be 5D (nx, ny, nz, n_conditions, n_lags), got shape {iresp.shape}"
+        )
 
     nx, ny, nz, n_conditions, n_lags = iresp.shape
 
@@ -1246,7 +1300,7 @@ def save_iresp(
 
     # Default condition labels
     if condition_labels is None:
-        condition_labels = [f"cond{i+1}" for i in range(n_conditions)]
+        condition_labels = [f"cond{i + 1}" for i in range(n_conditions)]
 
     if len(condition_labels) != n_conditions:
         raise ValueError(
@@ -1262,12 +1316,12 @@ def save_iresp(
 
         # Create NIfTI image with TR in header
         img = nib.Nifti1Image(cond_hrf, affine)
-        img.header.set_xyzt_units(xyz='mm', t='sec')
-        img.header['pixdim'][4] = tr  # Set TR
+        img.header.set_xyzt_units(xyz="mm", t="sec")
+        img.header["pixdim"][4] = tr  # Set TR
 
         # Add description
         description = f"HRF estimate: {label} (bot={bot}s, top={top}s, n={n_lags})"
-        img.header['descrip'] = description[:80]  # Max 80 chars
+        img.header["descrip"] = description[:80]  # Max 80 chars
 
         # Save file
         output_file = f"{output_prefix}_iresp_{label}.nii.gz"
@@ -1280,6 +1334,7 @@ def save_iresp(
 # ============================================================================
 # Thin Plate Splines (TPS) / Penalized Splines
 # ============================================================================
+
 
 def make_penalty_matrix(n_basis: int, order: int = 2) -> np.ndarray:
     """
@@ -1413,7 +1468,7 @@ def make_tps_design(
                         basis_val = basis_csplin(
                             torch.tensor([rel_time], device=device, dtype=torch.float32),
                             knots.tolist(),
-                            basis_idx
+                            basis_idx,
                         )
                         design[tr_idx, basis_idx] += basis_val.item()
 
@@ -1517,10 +1572,10 @@ def fit_penalized_glm_cv(
 
             # Split data and design
             X_train = design[train_mask, :]  # (n_train, n_basis)
-            y_train = data[:, train_mask]    # (n_voxels, n_train)
+            y_train = data[:, train_mask]  # (n_voxels, n_train)
 
             X_test = design[~train_mask, :]  # (n_test, n_basis)
-            y_test = data[:, ~train_mask]    # (n_voxels, n_test)
+            y_test = data[:, ~train_mask]  # (n_voxels, n_test)
 
             # Fit penalized model: β = (X'X + λD'D)^-1 X'y
             XTX = X_train.T @ X_train  # (n_basis, n_basis)
@@ -1632,7 +1687,9 @@ def fit_penalized_glm(
         global_lambda = False
         lambda_array = lambda_values
         if len(lambda_array) != n_voxels:
-            raise ValueError(f"lambda_values length ({len(lambda_array)}) must match n_voxels ({n_voxels})")
+            raise ValueError(
+                f"lambda_values length ({len(lambda_array)}) must match n_voxels ({n_voxels})"
+            )
         if verbose:
             print("\nFitting penalized GLM (per-voxel λ)...")
             print(f"  λ range: [{lambda_array.min():.3e}, {lambda_array.max():.3e}]")
@@ -1641,7 +1698,7 @@ def fit_penalized_glm(
     XTX = design.T @ design  # (n_basis, n_basis)
 
     # Storage for betas
-    betas = torch.zeros((n_voxels, n_basis), dtype=torch.float32, device='cpu')
+    betas = torch.zeros((n_voxels, n_basis), dtype=torch.float32, device="cpu")
 
     # Process in chunks
     n_chunks = int(np.ceil(n_voxels / chunk_size))
@@ -1694,7 +1751,7 @@ def fit_penalized_glm(
         betas[start_idx:end_idx, :] = betas_chunk.cpu()
 
         if verbose and (chunk_idx % max(1, n_chunks // 5) == 0):
-            print(f"    Chunk {chunk_idx+1}/{n_chunks}: voxels {start_idx:,}-{end_idx:,}")
+            print(f"    Chunk {chunk_idx + 1}/{n_chunks}: voxels {start_idx:,}-{end_idx:,}")
 
     if verbose:
         print("  ✓ Penalized GLM complete")

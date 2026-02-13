@@ -57,10 +57,17 @@ try:
     from fastfuncsim.denoise import (
         DenoiseResults,
         compute_full_brain_pc_loadings,
+        compute_noise_pool_pca_scree_per_run,
+        estimate_noise_component_caps_per_run,
         fit_denoising_model,
     )
     from fastfuncsim.design import convolve_hrf_microtime, make_fir_design, make_tent_design
-    from fastfuncsim.design_builder import create_onset_matrix_microtime, parse_afni_timing_file, parse_durations, parse_hrf_model
+    from fastfuncsim.design_builder import (
+        create_onset_matrix_microtime,
+        parse_afni_timing_file,
+        parse_durations,
+        parse_hrf_model,
+    )
     from fastfuncsim.glm_core import construct_polynomial_matrix
     from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncsim.hrf_selection import load_nuisance_file
@@ -122,13 +129,14 @@ Examples:
                 -save_model_fit \\
                 -prefix sub01_full_diagnostics
 
-  # With mask and spatial PC weight maps
+    # With mask and spatial component weight maps
   3dDenoisefast -input run*.nii.gz \\
                 -onsets stim.txt \\
                 -durations 1.0 \\
                 -tr 2.0 \\
                 -mask brain_mask.nii.gz \\
-                -max_pcs 30 \\
+                                -noise ica \\
+                                -max_comps 30 \\
                 -save_pcs both \\
                 -prefix masked_denoised
 
@@ -159,7 +167,7 @@ Outputs:
 
   With -plots yes/full:
     {prefix}_denoising_summary.png     - CV performance summary
-    {prefix}_pc_diagnostics_PC01.png   - Per-PC timecourse plots (full mode)
+    {prefix}_component_diagnostics_PC01.png - Per-component diagnostic plots (full mode)
 
     With -save_model_fit:
         {prefix}_initial_betas.nii.gz      - Initial model betas (4D)
@@ -224,10 +232,19 @@ Notes:
         "Voxels with R² < threshold are noise pool, >= threshold are criteria.",
     )
     denoise_opts.add_argument(
+        "-noise",
+        type=str,
+        choices=["pca", "ica"],
+        default="pca",
+        help="Noise component method: 'pca' (default) or 'ica'.",
+    )
+    denoise_opts.add_argument(
+        "-max_comps",
         "-max_pcs",
+        dest="max_comps",
         type=int,
         default=20,
-        help="Maximum number of PCs to test (default: 20)",
+        help="Maximum number of noise components to test (default: 20). Alias: -max_pcs",
     )
     denoise_opts.add_argument(
         "-pcstop",
@@ -275,6 +292,67 @@ Notes:
         type=float,
         default=0.95,
         help="Cumulative variance threshold for PC extraction (default: 0.95)",
+    )
+    denoise_opts.add_argument(
+        "-auto_component_caps",
+        action="store_true",
+        help=(
+            "Estimate per-run component caps independently of denoising CV "
+            "(noise-pool spectrum only), then extract only top components per run."
+        ),
+    )
+    denoise_opts.add_argument(
+        "-auto_component_min",
+        type=int,
+        default=5,
+        help="Minimum per-run component cap when -auto_component_caps is enabled (default: 5)",
+    )
+    denoise_opts.add_argument(
+        "-auto_component_var_threshold",
+        type=float,
+        default=0.90,
+        help=(
+            "Variance target used by independent cap estimator (default: 0.90). "
+            "Lower values are more conservative."
+        ),
+    )
+    denoise_opts.add_argument(
+        "-auto_component_estimate_max",
+        type=int,
+        default=None,
+        help=(
+            "Upper bound used only for independent component-count estimation. "
+            "If not set, defaults to 2x -max_comps. Denoising sweep still uses -max_comps."
+        ),
+    )
+    denoise_opts.add_argument(
+        "-auto_component_no_mp",
+        action="store_true",
+        help=(
+            "Disable soft Marchenko-Pastur prior in independent cap estimation. "
+            "Useful if MP assumptions are not trusted for your dataset."
+        ),
+    )
+    denoise_opts.add_argument(
+        "-ica_restarts",
+        type=int,
+        default=5,
+        help=(
+            "Number of ICA random restarts per run; best non-Gaussian solution is kept "
+            "(default: 5). Increase for more robust ICA at higher compute cost."
+        ),
+    )
+    denoise_opts.add_argument(
+        "-ica_max_iter",
+        type=int,
+        default=1000,
+        help="Maximum FastICA iterations per restart (default: 1000)",
+    )
+    denoise_opts.add_argument(
+        "-ica_tol",
+        type=float,
+        default=1e-6,
+        help="FastICA convergence tolerance per restart (default: 1e-6)",
     )
     denoise_opts.add_argument(
         "-cv_strategy",
@@ -414,6 +492,24 @@ Notes:
         help="Save diagnostic plots: 'no' (none), 'yes' (summary), 'full' (summary + per-PC plots)",
     )
     out_opts.add_argument(
+        "-no_scree_plot",
+        dest="scree_plot",
+        action="store_false",
+        help=(
+            "Disable default noise-pool PCA scree plot output. "
+            "By default, scree is saved to {prefix}_figures/noise_pool_pca_scree.png"
+        ),
+    )
+    out_opts.add_argument(
+        "-scree_max_comps",
+        type=int,
+        default=None,
+        help=(
+            "Max PCA components per run for noise-pool scree computation. "
+            "Default: auto (uses auto estimate max when available, else max(2x -max_comps, 60))."
+        ),
+    )
+    out_opts.add_argument(
         "-plot_ax",
         type=str,
         choices=["x", "y", "z"],
@@ -426,6 +522,17 @@ Notes:
         choices=["no", "timecourse", "spatial", "both"],
         default="timecourse",
         help="Save noise PCs: 'no', 'timecourse' (default: .pt file), 'spatial' (NIfTI weight maps), 'both'",
+    )
+    out_opts.add_argument(
+        "-component_map_space",
+        type=str,
+        choices=["full", "noise_pool"],
+        default="full",
+        help=(
+            "Spatial map strategy for component diagnostics: "
+            "'full' (default, refit component weights to all brain voxels) or "
+            "'noise_pool' (show extraction-space weights only)."
+        ),
     )
     out_opts.add_argument(
         "-save_model_fit",
@@ -487,6 +594,106 @@ def print_header(args):
     print()
 
 
+def _select_design_for_visualization(
+    task_design: Optional[torch.Tensor],
+    designs_by_hrf: Optional[dict],
+    hrf_library: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Optional[int]]:
+    """Select task design to visualize.
+
+    For per-voxel HRF mode, picks the middle HRF index (floor(n_hrfs/2)) when
+    n_hrfs > 2. If that HRF is missing from designs_by_hrf, falls back to the
+    nearest available HRF index.
+    """
+    if task_design is not None:
+        return task_design, None
+
+    if designs_by_hrf is None or len(designs_by_hrf) == 0:
+        raise ValueError("No design matrix available for visualization")
+
+    available_indices = sorted(int(k) for k in designs_by_hrf.keys())
+    if hrf_library is not None and len(hrf_library) > 2:
+        target_hrf_idx = int(len(hrf_library) // 2)
+    else:
+        target_hrf_idx = available_indices[len(available_indices) // 2]
+
+    if target_hrf_idx in designs_by_hrf:
+        selected_idx = target_hrf_idx
+    else:
+        selected_idx = min(available_indices, key=lambda x: abs(x - target_hrf_idx))
+
+    return designs_by_hrf[selected_idx], selected_idx
+
+
+def save_final_design_matrix_plot(
+    output_prefix: str,
+    task_design_to_plot: torch.Tensor,
+    nuisance_per_run: list[torch.Tensor],
+    run_starts: list[int],
+    selected_hrf_idx: Optional[int] = None,
+) -> str:
+    """Save high-resolution, non-blurry final design matrix image.
+
+    Final design = [task design, block-diagonal nuisance], in TR-bin space.
+    Time is shown vertically (rows), regressors horizontally (columns).
+    """
+    import matplotlib.pyplot as plt
+
+    fig_dir = Path(f"{output_prefix}_figures")
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    out_path = str(fig_dir / "final_design_matrix.png")
+
+    task_cpu = task_design_to_plot.detach().cpu().float()
+    nuisance_cpu = [n.detach().cpu().float() for n in nuisance_per_run]
+
+    n_task_cols = int(task_cpu.shape[1])
+    total_nuisance_cols = sum(int(n.shape[1]) for n in nuisance_cpu)
+
+    if total_nuisance_cols > 0:
+        nuisance_block = torch.block_diag(*nuisance_cpu)
+        final_design = torch.cat([task_cpu, nuisance_block], dim=1)
+    else:
+        final_design = task_cpu
+
+    design_np = final_design.numpy()
+    abs_max = float(np.percentile(np.abs(design_np), 99.5))
+    if not np.isfinite(abs_max) or abs_max <= 0:
+        abs_max = 1.0
+
+    n_tps, n_cols = design_np.shape
+    fig_h = min(22, max(8, n_tps / 220))
+    fig_w = min(24, max(10, n_cols / 12))
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=300)
+    im = ax.imshow(
+        design_np,
+        aspect="auto",
+        cmap="RdBu_r",
+        vmin=-abs_max,
+        vmax=abs_max,
+        interpolation="nearest",
+        origin="upper",
+    )
+
+    if n_task_cols < n_cols:
+        ax.axvline(n_task_cols - 0.5, color="black", linewidth=1.0)
+    for rs in run_starts[1:]:
+        ax.axhline(rs - 0.5, color="black", linewidth=0.7, alpha=0.6)
+
+    title = "Final design matrix (TR space): task + block-diagonal nuisance"
+    if selected_hrf_idx is not None:
+        title += f" | HRF index used: {selected_hrf_idx}"
+    ax.set_title(title)
+    ax.set_xlabel("Regressors")
+    ax.set_ylabel("Time (TR)")
+    fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+    return out_path
+
+
 def save_denoising_results(
     results: DenoiseResults,
     output_prefix: str,
@@ -494,11 +701,15 @@ def save_denoising_results(
     affine: np.ndarray,
     run_starts: list[int],
     tr: float,
+    data_for_component_maps: Optional[torch.Tensor] = None,
     voxel_mask: Optional[torch.Tensor] = None,
     plots_mode: str = "no",
     slice_axis: str = "x",
+    component_map_space: str = "full",
+    noise_method: str = "pca",
     save_pcs_mode: str = "timecourse",
     condition_labels: Optional[list[str]] = None,
+    save_scree_plot: bool = True,
 ):
     """
     Save denoising results to disk
@@ -517,10 +728,18 @@ def save_denoising_results(
         Starting timepoint for each run
     tr : float
         Repetition time in seconds
+    data_for_component_maps : torch.Tensor, optional
+        Full data tensor (n_voxels, n_timepoints). Required for
+        component_map_space='full' to refit spatial weights to all voxels.
     voxel_mask : torch.Tensor, optional
         Voxel mask (if brain mask was used)
     plots_mode : str
         'no', 'yes' (summary only), or 'full' (summary + per-PC)
+    component_map_space : str
+        Spatial map source for plots: 'full' (refit to all voxels) or
+        'noise_pool' (use extraction-space loadings)
+    noise_method : str
+        Noise component method label ('pca' or 'ica') for logging/metadata.
     save_pcs_mode : str
         'no', 'timecourse', 'spatial', or 'both'
     condition_labels : list of str, optional
@@ -616,6 +835,8 @@ def save_denoising_results(
         "volume_shape": list(volume_shape),
         "tr": tr,
         "run_starts": run_starts,
+        "component_map_space": component_map_space,
+        "noise_method": noise_method,
     }
     if condition_labels:
         metadata["condition_labels"] = condition_labels
@@ -706,6 +927,28 @@ def save_denoising_results(
         f"  Saved selected PCs ({results.optimal_n_components} PCs) as text files for {n_runs} runs"
     )
 
+    # 6c. Noise-pool PCA scree plot (default on)
+    if save_scree_plot:
+        scree_ratio = results.metadata.get("noise_pool_pca_scree_ratio_per_run")
+        if scree_ratio is not None and len(scree_ratio) > 0:
+            try:
+                from fastfuncsim.visualization import plot_noise_pool_pca_scree
+                import matplotlib.pyplot as plt
+
+                fig_prefix = f"{output_prefix}_figures"
+                Path(fig_prefix).mkdir(parents=True, exist_ok=True)
+                scree_path = f"{fig_prefix}/noise_pool_pca_scree.png"
+                scree_fig = plot_noise_pool_pca_scree(
+                    scree_ratio_per_run=scree_ratio,
+                    variance_threshold=results.metadata.get("auto_component_var_threshold", None),
+                    output_path=scree_path,
+                )
+                plt.close(scree_fig)
+                output_files["noise_pool_pca_scree_plot"] = scree_path
+                print(f"  Saved: {scree_path}")
+            except Exception as e:
+                print(f"  Warning: Could not save noise-pool PCA scree plot: {e}")
+
     # 7. Plots (based on plots_mode)
     if plots_mode in ["yes", "full"]:
         try:
@@ -734,15 +977,13 @@ def save_denoising_results(
 
             # Per-PC plots (only for "full" mode)
             if plots_mode == "full":
+                print(
+                    f"  Component diagnostics: method={noise_method.upper()}, map_space={component_map_space}"
+                )
                 # Convert PC tensors to CPU for plotting
                 pcs_cpu = (
                     [pc.cpu() for pc in results.noise_pcs_per_run]
                     if results.noise_pcs_per_run
-                    else None
-                )
-                loadings_cpu = (
-                    [ld.cpu() for ld in results.pc_loadings_per_run]
-                    if results.pc_loadings_per_run
                     else None
                 )
 
@@ -750,23 +991,50 @@ def save_denoising_results(
                 # This maps noise pool indices to full volume space
                 noise_pool_mask_np = results.noise_pool_mask.cpu().numpy()
 
-                pc_figs = plot_denoising_pcs(
+                if component_map_space == "full" and data_for_component_maps is not None:
+                    full_loadings = compute_full_brain_pc_loadings(
+                        data=data_for_component_maps,
+                        noise_pcs_per_run=results.noise_pcs_per_run,
+                        run_starts=run_starts,
+                        brain_mask=None,
+                        chunk_size=5000,
+                        device=None,
+                        verbose=False,
+                    )
+                    loadings_cpu = [ld.numpy() for ld in full_loadings]
+                    noise_pool_mask_for_plot = None
+                else:
+                    loadings_cpu = (
+                        [ld.cpu().numpy() for ld in results.pc_loadings_per_run]
+                        if results.pc_loadings_per_run
+                        else None
+                    )
+                    noise_pool_mask_for_plot = noise_pool_mask_np
+
+                plot_denoising_pcs(
                     noise_pcs_per_run=pcs_cpu,
                     run_starts=run_starts,
+                    component_variance_ratio_per_run=results.metadata.get(
+                        "ic_variance_ratio_per_run"
+                    ),
                     pc_weights_per_run=loadings_cpu,
                     volume_shape=volume_shape,
                     voxel_mask=voxel_mask_np,
-                    noise_pool_mask=noise_pool_mask_np,
-                    n_pcs_to_show=results.metadata.get("max_components", 0),
+                    noise_pool_mask=noise_pool_mask_for_plot,
+                    n_pcs_to_show=results.metadata.get(
+                        "extraction_max_components", results.metadata.get("max_components", 0)
+                    ),
                     n_slices=5,
                     slice_axis=slice_axis,
                     tr=tr,
                     optimal_n_pcs=results.optimal_n_components,
-                    output_prefix=f"{fig_prefix}/pc_diagnostics",
+                    output_prefix=f"{fig_prefix}/component_diagnostics",
+                    return_figs=False,
                 )
-                output_files["pc_diagnostic_plots"] = f"{fig_prefix}/pc_diagnostics_PC*.png"
-                for fig in pc_figs:
-                    plt.close(fig)
+                output_files["component_diagnostic_plots"] = (
+                    f"{fig_prefix}/component_diagnostics_PC*.png"
+                )
+                output_files["pc_diagnostic_plots"] = output_files["component_diagnostic_plots"]
 
         except ImportError as e:
             print(f"  Warning: Could not import visualization module: {e}")
@@ -1545,7 +1813,9 @@ def main():
     if task_design is not None:
         if is_fir_model:
             # FIR: Show structure, not all labels (too many)
-            print(f"  Task predictors: {task_design.shape[1]} ({n_conditions} conditions × {n_basis} lags)")
+            print(
+                f"  Task predictors: {task_design.shape[1]} ({n_conditions} conditions × {n_basis} lags)"
+            )
         else:
             # Canonical: Show condition names
             print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
@@ -1563,6 +1833,25 @@ def main():
         print(
             f"  Total columns per run: {n_task_cols} task + {nuisance_per_run[0].shape[1]} nuisance = {n_task_cols + nuisance_per_run[0].shape[1]}"
         )
+
+    design_plot_path: Optional[str] = None
+    if args.plots == "full":
+        try:
+            design_for_plot, selected_hrf_idx = _select_design_for_visualization(
+                task_design=task_design,
+                designs_by_hrf=designs_by_hrf,
+                hrf_library=hrf_library,
+            )
+            design_plot_path = save_final_design_matrix_plot(
+                output_prefix=args.prefix,
+                task_design_to_plot=design_for_plot,
+                nuisance_per_run=nuisance_per_run,
+                run_starts=run_starts,
+                selected_hrf_idx=selected_hrf_idx,
+            )
+            print(f"  Saved final design matrix image: {design_plot_path}")
+        except Exception as exc:
+            print(f"  Warning: could not save final design matrix image: {exc}")
 
     # ==========================================================================
     # Fit denoising model
@@ -1593,7 +1882,7 @@ def main():
     # Fit denoising model
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-        from fastfuncsim.denoise import extract_noise_pcs_per_run
+        from fastfuncsim.denoise import extract_noise_ics_per_run, extract_noise_pcs_per_run
         from fastfuncsim.glm_core import fit_glm
         from fastfuncsim.glm_outputs import save_single_trial_results
         from fastfuncsim.ridge import create_single_trial_design
@@ -1630,7 +1919,9 @@ def main():
             )
         )
         per_voxel_st = st_design.ndim == 3  # (n_unique_hrfs, n_timepoints, n_trials * n_basis)
-        n_columns = trial_labels.__len__() if hasattr(trial_labels, '__len__') else len(trial_labels)
+        n_columns = (
+            trial_labels.__len__() if hasattr(trial_labels, "__len__") else len(trial_labels)
+        )
         n_basis_actual = n_basis if not is_fir_model else 1
         n_trials_actual = n_columns // n_basis_actual
 
@@ -1761,23 +2052,148 @@ def main():
 
         # 4. Extract noise PCs from noise pool
         print()
-        print(f"Extracting noise PCs (up to {args.max_pcs})...")
-        noise_pcs_per_run = extract_noise_pcs_per_run(
-            data=data,
-            run_starts=run_starts,
-            noise_pool_mask=noise_pool_mask,
-            max_components=args.max_pcs,
-            variance_threshold=args.variance_threshold,
-            nuisance_per_run=nuisance_per_run,
-            device=device,
-            verbose=args.verbose,
+        component_caps_per_run = None
+        extraction_max_comps = args.max_comps
+        noise_pool_scree_ratio_per_run = None
+        if args.auto_component_caps:
+            print("Estimating independent per-run component caps...")
+            estimate_max_comps = (
+                args.auto_component_estimate_max
+                if args.auto_component_estimate_max is not None
+                else max(args.max_comps, 2 * args.max_comps)
+            )
+            cap_info = estimate_noise_component_caps_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                max_components=estimate_max_comps,
+                nuisance_per_run=nuisance_per_run,
+                min_components=args.auto_component_min,
+                variance_threshold=args.auto_component_var_threshold,
+                use_mp_prior=not args.auto_component_no_mp,
+                device=device,
+                verbose=True,
+            )
+            component_caps_per_run = cap_info.per_run_caps
+            component_caps_per_run = [
+                int(max(1, min(args.max_comps, c))) for c in component_caps_per_run
+            ]
+            extraction_max_comps = args.max_comps
+            print(f"  Per-run caps: {component_caps_per_run}")
+            print(
+                f"  Decomposition estimate ceiling: {estimate_max_comps}; denoising sweep cap: {args.max_comps}"
+            )
+            print("  Per-run search diagnostics:")
+            for run_i, cap in enumerate(component_caps_per_run):
+                mp_cap = cap_info.mp_caps[run_i]
+                mp_txt = f"n/a[{cap_info.mp_reasons[run_i]}]" if mp_cap is None else str(mp_cap)
+                print(
+                    f"    Run {run_i + 1}: cap={cap}, "
+                    f"search {cap_info.search_final_max_per_run[run_i]}/{cap_info.search_ceiling_per_run[run_i]} "
+                    f"in {cap_info.search_iterations[run_i]} iter "
+                    f"(var={cap_info.variance_caps[run_i]}, "
+                    f"erank={cap_info.entropy_rank_caps[run_i]}, mp={mp_txt})"
+                )
+
+        if args.scree_plot:
+            scree_eval_max = (
+                args.scree_max_comps
+                if args.scree_max_comps is not None
+                else (
+                    args.auto_component_estimate_max
+                    if args.auto_component_estimate_max is not None
+                    else max(args.max_comps * 2, 60)
+                )
+            )
+            scree_eval_max = max(5, int(scree_eval_max))
+            try:
+                noise_pool_scree_ratio_per_run = compute_noise_pool_pca_scree_per_run(
+                    data=data,
+                    run_starts=run_starts,
+                    noise_pool_mask=noise_pool_mask,
+                    max_components=scree_eval_max,
+                    nuisance_per_run=nuisance_per_run,
+                    device=device,
+                )
+                print(
+                    f"  Computed noise-pool PCA scree spectra (up to {scree_eval_max} components per run)"
+                )
+            except Exception as e:
+                print(f"  Warning: Failed to compute noise-pool PCA scree spectra: {e}")
+
+        print(
+            f"Extracting noise components via {args.noise.upper()} "
+            f"(up to {extraction_max_comps} for decomposition)"
         )
+        want_noise_pool_maps = args.plots == "full" and args.component_map_space == "noise_pool"
+        component_loadings_per_run = None
+        ic_variance_ratio_per_run = None
+        if args.noise == "pca":
+            if want_noise_pool_maps:
+                noise_pcs_per_run, component_loadings_per_run = extract_noise_pcs_per_run(
+                    data=data,
+                    run_starts=run_starts,
+                    noise_pool_mask=noise_pool_mask,
+                    max_components=extraction_max_comps,
+                    variance_threshold=args.variance_threshold,
+                    return_loadings=True,
+                    nuisance_per_run=nuisance_per_run,
+                    component_caps_per_run=component_caps_per_run,
+                    device=device,
+                    verbose=args.verbose,
+                )
+            else:
+                noise_pcs_per_run = extract_noise_pcs_per_run(
+                    data=data,
+                    run_starts=run_starts,
+                    noise_pool_mask=noise_pool_mask,
+                    max_components=extraction_max_comps,
+                    variance_threshold=args.variance_threshold,
+                    nuisance_per_run=nuisance_per_run,
+                    component_caps_per_run=component_caps_per_run,
+                    device=device,
+                    verbose=args.verbose,
+                )
+        else:
+            if want_noise_pool_maps:
+                noise_pcs_per_run, component_loadings_per_run, ic_variance_ratio_per_run = (
+                    extract_noise_ics_per_run(
+                        data=data,
+                        run_starts=run_starts,
+                        noise_pool_mask=noise_pool_mask,
+                        max_components=extraction_max_comps,
+                        return_loadings=True,
+                        return_variance_ratio=True,
+                        nuisance_per_run=nuisance_per_run,
+                        component_caps_per_run=component_caps_per_run,
+                        ica_restarts=args.ica_restarts,
+                        ica_max_iter=args.ica_max_iter,
+                        ica_tol=args.ica_tol,
+                        device=device,
+                        verbose=args.verbose,
+                    )
+                )
+            else:
+                noise_pcs_per_run, ic_variance_ratio_per_run = extract_noise_ics_per_run(
+                    data=data,
+                    run_starts=run_starts,
+                    noise_pool_mask=noise_pool_mask,
+                    max_components=extraction_max_comps,
+                    return_variance_ratio=True,
+                    nuisance_per_run=nuisance_per_run,
+                    component_caps_per_run=component_caps_per_run,
+                    ica_restarts=args.ica_restarts,
+                    ica_max_iter=args.ica_max_iter,
+                    ica_tol=args.ica_tol,
+                    device=device,
+                    verbose=args.verbose,
+                )
 
         # 5. For each PC count: fit single-trial model with wide design, collect betas
         print()
-        print(f"Optimizing PC count (0 to {args.max_pcs})...")
+        print(f"Optimizing component count (0 to {args.max_comps})...")
         n_voxels_st = data.shape[0]
-        n_pc_counts = args.max_pcs + 1
+        n_pc_counts = args.max_comps + 1
 
         # Determine n_trials from the design
         if not per_voxel_st:
@@ -1955,8 +2371,10 @@ def main():
         # Print CV summary
         n_folds = len(cv_splits)
         n_test_trials = final_xval["r2"].numel()
-        print(f"  Beta-space CV R²: mean={final_xval['r2'].mean():.4f}, "
-              f"median={final_xval['r2'].median():.4f} ({n_test_trials} trials across {n_folds} folds)")
+        print(
+            f"  Beta-space CV R²: mean={final_xval['r2'].mean():.4f}, "
+            f"median={final_xval['r2'].median():.4f} ({n_test_trials} trials across {n_folds} folds)"
+        )
 
         # 8. Save outputs
         print()
@@ -2038,15 +2456,79 @@ def main():
             "noise_fraction": float(noise_fraction),
             "pc_selection_curve": r2_by_pc.cpu().tolist(),
             "final_median_r2": float(final_xval["r2"].median()),
+            "noise_method": args.noise,
+            "auto_component_caps": bool(args.auto_component_caps),
+            "auto_component_estimate_max": int(estimate_max_comps)
+            if args.auto_component_caps
+            else None,
+            "extraction_max_components": int(extraction_max_comps),
+            "auto_component_caps_per_run": component_caps_per_run,
+            "auto_component_variance_caps": cap_info.variance_caps
+            if args.auto_component_caps
+            else None,
+            "auto_component_effective_rank_caps": cap_info.entropy_rank_caps
+            if args.auto_component_caps
+            else None,
+            "auto_component_mp_caps": cap_info.mp_caps if args.auto_component_caps else None,
+            "auto_component_mp_reasons": cap_info.mp_reasons if args.auto_component_caps else None,
+            "auto_component_search_iterations": cap_info.search_iterations
+            if args.auto_component_caps
+            else None,
+            "auto_component_search_final_max_per_run": cap_info.search_final_max_per_run
+            if args.auto_component_caps
+            else None,
+            "auto_component_search_ceiling_per_run": cap_info.search_ceiling_per_run
+            if args.auto_component_caps
+            else None,
+            "auto_component_min": int(args.auto_component_min),
+            "auto_component_var_threshold": float(args.auto_component_var_threshold),
+            "auto_component_use_mp": bool(not args.auto_component_no_mp),
+            "component_map_space": args.component_map_space,
+            "ic_variance_ratio_per_run": [
+                v.detach().cpu().tolist() if torch.is_tensor(v) else list(v)
+                for v in ic_variance_ratio_per_run
+            ]
+            if ic_variance_ratio_per_run is not None
+            else None,
+            "noise_pool_pca_scree_ratio_per_run": [
+                v.detach().cpu().tolist() if torch.is_tensor(v) else list(v)
+                for v in noise_pool_scree_ratio_per_run
+            ]
+            if noise_pool_scree_ratio_per_run is not None
+            else None,
         }
         with open(f"{args.prefix}_denoise_metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
         output_files["denoise_metadata"] = f"{args.prefix}_denoise_metadata.json"
 
+        if args.scree_plot and noise_pool_scree_ratio_per_run is not None:
+            try:
+                from fastfuncsim.visualization import plot_noise_pool_pca_scree
+                import matplotlib
+
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                figs_dir = f"{args.prefix}_figures"
+                Path(figs_dir).mkdir(parents=True, exist_ok=True)
+                scree_fig = plot_noise_pool_pca_scree(
+                    scree_ratio_per_run=noise_pool_scree_ratio_per_run,
+                    variance_threshold=args.auto_component_var_threshold,
+                    output_path=f"{figs_dir}/noise_pool_pca_scree.png",
+                )
+                output_files["noise_pool_pca_scree_plot"] = f"{figs_dir}/noise_pool_pca_scree.png"
+                plt.close(scree_fig)
+                print(f"  Saved: {output_files['noise_pool_pca_scree_plot']}")
+            except Exception as e:
+                print(f"  Warning: Failed to save noise-pool PCA scree plot: {e}")
+
         # 9. Generate diagnostic plots (if requested)
         if args.plots in ["yes", "full"]:
             try:
-                from fastfuncsim.visualization import plot_denoising_pcs, plot_denoising_summary
+                from fastfuncsim.visualization import (
+                    plot_denoising_pcs,
+                    plot_denoising_summary,
+                )
                 import matplotlib
 
                 matplotlib.use("Agg")
@@ -2116,53 +2598,63 @@ def main():
                 if args.plots == "full":
                     # Convert PC tensors to CPU for plotting
                     pcs_cpu = [pc.cpu() for pc in noise_pcs_per_run]
+                    print(
+                        f"  Component diagnostics: method={args.noise.upper()}, map_space={args.component_map_space}"
+                    )
 
                     # Only compute spatial loadings if mask matches data
                     # Otherwise, just plot timecourses without spatial maps
                     if mask_mismatch:
                         # Skip spatial weight computation - just plot timecourses
                         loadings_cpu = None
+                        noise_pool_mask_for_plot = None
                     else:
-                        # Compute full-brain loadings for spatial visualization
-                        # This shows how each PC expresses across the data voxels
-                        # Note: data is already brain-masked, so pass None for brain_mask
-                        pc_loadings_brain = compute_full_brain_pc_loadings(
-                            data=data,
-                            noise_pcs_per_run=noise_pcs_per_run,
-                            run_starts=run_starts,
-                            brain_mask=None,  # Process all voxels in data (already masked)
-                            chunk_size=5000,
-                            device=None,  # Let function default to CPU
-                            verbose=args.verbose,
-                        )
-                        loadings_cpu = [ld.numpy() for ld in pc_loadings_brain]
+                        if args.component_map_space == "full":
+                            # Refit component weights on all data voxels
+                            pc_loadings_brain = compute_full_brain_pc_loadings(
+                                data=data,
+                                noise_pcs_per_run=noise_pcs_per_run,
+                                run_starts=run_starts,
+                                brain_mask=None,
+                                chunk_size=5000,
+                                device=None,
+                                verbose=args.verbose,
+                            )
+                            loadings_cpu = [ld.numpy() for ld in pc_loadings_brain]
+                            noise_pool_mask_for_plot = None
+                        else:
+                            loadings_cpu = (
+                                [ld.cpu().numpy() for ld in component_loadings_per_run]
+                                if component_loadings_per_run is not None
+                                else None
+                            )
+                            noise_pool_mask_for_plot = noise_pool_mask_np
 
-                    # Get number of PCs to show - show all available PCs up to max_pcs
-                    n_pcs_to_show = args.max_pcs  # Show all extracted PCs
+                    # Show all extracted components up to configured cap
+                    n_pcs_to_show = args.max_comps
 
-                    pc_figs = plot_denoising_pcs(
+                    plot_denoising_pcs(
                         noise_pcs_per_run=pcs_cpu,
                         run_starts=run_starts,
+                        component_variance_ratio_per_run=ic_variance_ratio_per_run,
                         pc_weights_per_run=loadings_cpu,  # None = no spatial maps
                         volume_shape=volume_shape,
                         voxel_mask=voxel_mask_np,
-                        # IMPORTANT: Don't pass noise_pool_mask when loadings are for ALL voxels
-                        # The plotting function expects noise-pool-only loadings when both masks are provided
-                        noise_pool_mask=None,  # Use direct mapping instead
+                        noise_pool_mask=noise_pool_mask_for_plot,
                         n_pcs_to_show=n_pcs_to_show,
                         n_slices=5,
                         slice_axis=args.plot_ax,
                         tr=args.tr,
                         optimal_n_pcs=optimal_pcs,
-                        output_prefix=f"{args.prefix}_figures/pc_diagnostics",
+                        output_prefix=f"{args.prefix}_figures/component_diagnostics",
                         voxel_sizes=voxel_sizes,  # Preserve physical voxel shape
+                        return_figs=False,
                     )
-                    output_files["pc_diagnostic_plots"] = (
-                        f"{args.prefix}_figures/pc_diagnostics_PC*.png"
+                    output_files["component_diagnostic_plots"] = (
+                        f"{args.prefix}_figures/component_diagnostics_PC*.png"
                     )
-                    for fig in pc_figs:
-                        plt.close(fig)
-                    print(f"  Saved: {output_files['pc_diagnostic_plots']}")
+                    output_files["pc_diagnostic_plots"] = output_files["component_diagnostic_plots"]
+                    print(f"  Saved: {output_files['component_diagnostic_plots']}")
 
             except ImportError as e:
                 print(f"  Warning: Could not import visualization module: {e}")
@@ -2196,7 +2688,7 @@ def main():
             tr=args.tr,
             r2_threshold=args.r2_threshold,
             intensity_mask=brainthresh_mask,
-            max_components=args.max_pcs,
+            max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
             nuisance=nuisance_per_run,
             polort=args.polort,
@@ -2204,6 +2696,17 @@ def main():
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
             pcR2cutoff=args.pcR2cutoff,
+            noise_method=args.noise,
+            auto_component_caps=args.auto_component_caps,
+            auto_component_estimate_max=args.auto_component_estimate_max,
+            auto_component_min=args.auto_component_min,
+            auto_component_var_threshold=args.auto_component_var_threshold,
+            auto_component_use_mp=(not args.auto_component_no_mp),
+            ica_restarts=args.ica_restarts,
+            ica_max_iter=args.ica_max_iter,
+            ica_tol=args.ica_tol,
+            compute_noise_pool_pca_scree=args.scree_plot,
+            scree_max_components=args.scree_max_comps,
             cv_strategy=cv_strategy,
             n_perms=args.n_perms,
             r2_method=args.R2method,
@@ -2223,7 +2726,7 @@ def main():
             tr=args.tr,
             r2_threshold=args.r2_threshold,
             intensity_mask=brainthresh_mask,
-            max_components=args.max_pcs,
+            max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
             nuisance=nuisance_per_run,
             polort=args.polort,
@@ -2231,6 +2734,17 @@ def main():
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
             pcR2cutoff=args.pcR2cutoff,
+            noise_method=args.noise,
+            auto_component_caps=args.auto_component_caps,
+            auto_component_estimate_max=args.auto_component_estimate_max,
+            auto_component_min=args.auto_component_min,
+            auto_component_var_threshold=args.auto_component_var_threshold,
+            auto_component_use_mp=(not args.auto_component_no_mp),
+            ica_restarts=args.ica_restarts,
+            ica_max_iter=args.ica_max_iter,
+            ica_tol=args.ica_tol,
+            compute_noise_pool_pca_scree=args.scree_plot,
+            scree_max_components=args.scree_max_comps,
             cv_strategy=cv_strategy,
             n_perms=args.n_perms,
             r2_method=args.R2method,
@@ -2263,12 +2777,19 @@ def main():
         affine=affine,
         run_starts=run_starts,
         tr=args.tr,
+        data_for_component_maps=data,
         voxel_mask=voxel_mask,
         plots_mode=args.plots,
         slice_axis=args.plot_ax,
+        component_map_space=args.component_map_space,
+        noise_method=args.noise,
         save_pcs_mode=args.save_pcs,
         condition_labels=condition_labels,
+        save_scree_plot=args.scree_plot,
     )
+
+    if design_plot_path is not None:
+        output_files["final_design_matrix_plot"] = design_plot_path
 
     # ==========================================================================
     # Save initial and final model fits (if requested or needed for SNR)

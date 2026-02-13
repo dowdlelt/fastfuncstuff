@@ -14,6 +14,7 @@ Design philosophy:
 - Compatible with existing fastfuncsim HRF and denoising pipelines
 - Supports flexible timing (non-TR-locked, variable durations)
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -99,7 +100,7 @@ def _fit_ridge_multiple_fracs(
         Vt = Vt[valid_mask, :]
 
     # Squared singular values
-    S_sq = S ** 2
+    S_sq = S**2
 
     # Keep track of valid rank (may be less than n_features if rank-deficient)
     n_valid_rank = len(S)
@@ -114,7 +115,7 @@ def _fit_ridge_multiple_fracs(
     # Create alpha grid for interpolation (log-spaced from small to large)
     # Match fracridge exactly: BIG_BIAS = 10e3 = 10000, SMALL_BIAS = 10e-3 = 0.01
     SMALL_BIAS = 10e-3  # 0.01
-    BIG_BIAS = 10e3     # 10000
+    BIG_BIAS = 10e3  # 10000
 
     # Match fracridge logic: if smallest singular value squared is zero, use SMALL_BIAS
     S_min_sq = S[-1].item() ** 2
@@ -134,18 +135,26 @@ def _fit_ridge_multiple_fracs(
         log_min = log_max - 25
 
     # Include alpha=0 at the start (for pure OLS case)
-    alphagrid = torch.cat([
-        torch.tensor([0.0], device=device, dtype=X.dtype),
-        torch.tensor(10 ** np.arange(log_min, log_max, 0.2), device=device, dtype=X.dtype)
-    ])
+    alphagrid = torch.cat(
+        [
+            torch.tensor([0.0], device=device, dtype=X.dtype),
+            torch.tensor(10 ** np.arange(log_min, log_max, 0.2), device=device, dtype=X.dtype),
+        ]
+    )
 
     # Compute coefficient scaling for each alpha in grid
     # sclg = S^2 / (S^2 + alpha), shape: (n_alphas, n_valid_rank)
     sclg = S_sq.unsqueeze(0) / (S_sq.unsqueeze(0) + alphagrid.unsqueeze(1))
-    sclg_sq = sclg ** 2
+    sclg_sq = sclg**2
 
-    # log-alpha grid (shared across all chunks / all targets)
-    log_alphagrid_np = np.log(1 + alphagrid.flip(0).cpu().numpy())  # (n_alphas,)
+    # log10-alpha grid (shared across all chunks / all targets).
+    # Use log10(alpha + _ALPHA_FLOOR) rather than log(1+alpha).
+    # For small alphas (alpha ~ 1e-12), log(1+alpha) ≈ alpha ≈ 0, which
+    # collapses the entire interpolation domain to zero and maps all fracs
+    # to alpha=0 (OLS), disabling regularization entirely.
+    # log10 with a floor correctly separates alpha=0 from tiny positive alphas.
+    _ALPHA_FLOOR = 1e-30  # tiny constant so log10(0) stays finite
+    log_alphagrid_np = np.log10(alphagrid.flip(0).cpu().numpy() + _ALPHA_FLOOR)
 
     if not chunk_mode:
         # ====================================================================
@@ -154,7 +163,7 @@ def _fit_ridge_multiple_fracs(
         Uty = U.T @ y  # (n_valid, n_targets)
         ols_coef_rotated = Uty / S.unsqueeze(1)  # (n_valid, n_targets)
 
-        newlen = torch.sqrt(torch.einsum('aj,jt->at', sclg_sq, ols_coef_rotated ** 2))
+        newlen = torch.sqrt(torch.einsum("aj,jt->at", sclg_sq, ols_coef_rotated**2))
         ols_len = newlen[0:1, :]  # (1, n_targets)
         newlen = newlen / (ols_len + 1e-10)  # (n_alphas, n_targets)
 
@@ -171,7 +180,9 @@ def _fit_ridge_multiple_fracs(
             )
 
         targetalphas_all = torch.tensor(
-            np.exp(log_target_alphas_all) - 1, device=device, dtype=X.dtype
+            np.clip(10.0**log_target_alphas_all - _ALPHA_FLOOR, 0.0, None),
+            device=device,
+            dtype=X.dtype,
         )  # (n_fracs, n_targets)
 
         if torch.isnan(targetalphas_all).any() or torch.isinf(targetalphas_all).any():
@@ -199,14 +210,14 @@ def _fit_ridge_multiple_fracs(
             c1 = min(c0 + chunk_size, n_targets)
             chunk = c1 - c0
 
-            y_chunk = y[:, c0:c1].to(device)         # (n_samples, chunk)
-            Uty_chunk = U.T @ y_chunk                  # (n_valid, chunk)
-            ols_chunk = Uty_chunk / S.unsqueeze(1)     # (n_valid, chunk)
+            y_chunk = y[:, c0:c1].to(device)  # (n_samples, chunk)
+            Uty_chunk = U.T @ y_chunk  # (n_valid, chunk)
+            ols_chunk = Uty_chunk / S.unsqueeze(1)  # (n_valid, chunk)
 
             newlen_chunk = torch.sqrt(
-                torch.einsum('aj,jt->at', sclg_sq, ols_chunk ** 2)
+                torch.einsum("aj,jt->at", sclg_sq, ols_chunk**2)
             )  # (n_alphas, chunk)
-            ols_len_chunk = newlen_chunk[0:1, :]       # (1, chunk)
+            ols_len_chunk = newlen_chunk[0:1, :]  # (1, chunk)
             newlen_chunk = newlen_chunk / (ols_len_chunk + 1e-10)
 
             zero_variance = ols_len_chunk.squeeze(0) < 1e-8  # (chunk,)
@@ -221,7 +232,9 @@ def _fit_ridge_multiple_fracs(
                 )
 
             targetalphas = torch.tensor(
-                np.exp(log_target_alphas) - 1, device=device, dtype=X.dtype
+                np.clip(10.0**log_target_alphas - _ALPHA_FLOOR, 0.0, None),
+                device=device,
+                dtype=X.dtype,
             )  # (n_fracs, chunk)
             if torch.isnan(targetalphas).any() or torch.isinf(targetalphas).any():
                 targetalphas = torch.nan_to_num(targetalphas, nan=0.0, posinf=1e10, neginf=0.0)
@@ -232,7 +245,7 @@ def _fit_ridge_multiple_fracs(
 
             ridge_chunk = sc_chunk * ols_chunk.unsqueeze(1)  # (n_valid, n_fracs, chunk)
             ridge_flat = ridge_chunk.reshape(n_valid_rank, n_fracs * chunk)
-            coefs_flat = Vt.T @ ridge_flat             # (n_features, n_fracs * chunk)
+            coefs_flat = Vt.T @ ridge_flat  # (n_features, n_fracs * chunk)
             coefs_cpu[:, :, c0:c1] = coefs_flat.reshape(n_features, n_fracs, chunk).cpu()
 
         return coefs_cpu
@@ -348,7 +361,7 @@ def create_single_trial_design(
     n_conditions = len(onsets_by_condition)
 
     if condition_labels is None:
-        condition_labels = [f"cond{i+1:02d}" for i in range(n_conditions)]
+        condition_labels = [f"cond{i + 1:02d}" for i in range(n_conditions)]
 
     # Count total trials across all conditions and runs
     total_trials = 0
@@ -381,7 +394,8 @@ def create_single_trial_design(
     # Extract run IDs for each trial
     trial_run_ids = torch.tensor(
         [run_idx for _, run_idx, _, _ in trial_info],
-        dtype=torch.long, device=device,
+        dtype=torch.long,
+        device=device,
     )
 
     # Create onset matrix at microtime resolution
@@ -389,9 +403,7 @@ def create_single_trial_design(
     n_microtime = n_timepoints * bins_per_tr
 
     # Build single-trial onset matrix (microtime)
-    onset_matrix_micro = torch.zeros(
-        n_microtime, total_trials, dtype=torch.float32, device=device
-    )
+    onset_matrix_micro = torch.zeros(n_microtime, total_trials, dtype=torch.float32, device=device)
 
     for trial_idx, (cond_idx, run_idx, trial_in_run, onset_time) in enumerate(trial_info):
         # Convert onset time to microtime bin
@@ -441,6 +453,7 @@ def create_single_trial_design(
                     n_timepoints=n_timepoints,
                     tr=tr,
                     microtime_dt=microtime_dt,
+                    run_starts=run_starts,
                     device=device,
                     return_single_trials=False,
                 )  # (n_timepoints, n_trials)
@@ -450,7 +463,9 @@ def create_single_trial_design(
             design_columns = []
             for trial_idx in range(total_trials):
                 for basis_idx in range(n_basis):
-                    design_columns.append(designs_per_basis[basis_idx][:, trial_idx:trial_idx+1])
+                    design_columns.append(
+                        designs_per_basis[basis_idx][:, trial_idx : trial_idx + 1]
+                    )
 
             design_matrix = torch.cat(design_columns, dim=1)  # (n_timepoints, n_trials * n_basis)
 
@@ -471,11 +486,15 @@ def create_single_trial_design(
                     expanded_run_ids.append(trial_run_ids[trial_idx].item())
 
             trial_labels = expanded_trial_labels
-            trial_condition_ids = torch.tensor(expanded_condition_ids, dtype=torch.long, device=device)
+            trial_condition_ids = torch.tensor(
+                expanded_condition_ids, dtype=torch.long, device=device
+            )
             trial_run_ids = torch.tensor(expanded_run_ids, dtype=torch.long, device=device)
 
             # Build condition_design: sum trials within each condition, for each basis
-            condition_design = torch.zeros(n_timepoints, n_conditions * n_basis, dtype=torch.float32, device=device)
+            condition_design = torch.zeros(
+                n_timepoints, n_conditions * n_basis, dtype=torch.float32, device=device
+            )
             for cond_idx in range(n_conditions):
                 for basis_idx in range(n_basis):
                     # Find columns for this condition and basis
@@ -511,12 +530,30 @@ def create_single_trial_design(
                 n_timepoints=n_timepoints,
                 tr=tr,
                 microtime_dt=microtime_dt,
+                run_starts=run_starts,
                 device=device,
                 return_single_trials=False,
             )
 
+            # Enforce run boundaries: zero HRF tails that bleed into neighbouring runs.
+            # Run boundaries are hard walls — nothing from one run reaches into another.
+            # Without this, near-zero columns in the training design cause condition
+            # numbers ~1e7, making OLS betas wildly unstable during CV.
+            run_ends = run_starts[1:] + [n_timepoints]  # exclusive end TR for each run
+            for run_idx in range(len(run_starts)):
+                trial_mask_run = trial_run_ids == run_idx
+                if trial_mask_run.any():
+                    run_start_tp = run_starts[run_idx]
+                    run_end_tp = run_ends[run_idx]
+                    if run_start_tp > 0:
+                        design_matrix[:run_start_tp, trial_mask_run] = 0.0
+                    if run_end_tp < n_timepoints:
+                        design_matrix[run_end_tp:, trial_mask_run] = 0.0
+
             # Build condition_design by summing trials within each condition
-            condition_design = torch.zeros(n_timepoints, n_conditions, dtype=torch.float32, device=device)
+            condition_design = torch.zeros(
+                n_timepoints, n_conditions, dtype=torch.float32, device=device
+            )
             for cond_idx in range(n_conditions):
                 cond_mask = trial_condition_ids == cond_idx
                 if cond_mask.sum() > 0:
@@ -549,6 +586,7 @@ def create_single_trial_design(
                 n_timepoints=n_timepoints,
                 tr=tr,
                 microtime_dt=microtime_dt,
+                run_starts=run_starts,
                 device=device,
                 return_single_trials=False,
             )
@@ -562,7 +600,9 @@ def create_single_trial_design(
 
         # Build condition_design using first HRF design (for CV prediction)
         first_design = designs_by_hrf[0]  # (n_timepoints, n_trials)
-        condition_design = torch.zeros(n_timepoints, n_conditions, dtype=torch.float32, device=device)
+        condition_design = torch.zeros(
+            n_timepoints, n_conditions, dtype=torch.float32, device=device
+        )
         for cond_idx in range(n_conditions):
             cond_mask = trial_condition_ids == cond_idx
             if cond_mask.sum() > 0:
@@ -582,6 +622,7 @@ def _fit_ridge_chunk(
     condition_design: torch.Tensor,
     autoscale: bool,
     device: torch.device,
+    trial_run_ids: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Fit ridge regression for a chunk of voxels with a SINGLE design matrix
@@ -623,6 +664,10 @@ def _fit_ridge_chunk(
         Fits scale+offset to match unregularized (OLS) beta distribution.
     device : torch.device
         Device for computation
+    trial_run_ids : torch.Tensor, shape (n_trials,), optional
+        Run index (0-indexed) for each trial. When provided, condition-average
+        betas are computed only from training-run trials (not test-run trials
+        whose regressors are near-zero in training data → garbage betas).
 
     Returns
     -------
@@ -675,8 +720,27 @@ def _fit_ridge_chunk(
             train_run_starts_local.append(len(train_tps))
         train_run_starts_local = train_run_starts_local[:-1]  # Remove last (it's the total length)
 
+        # ========================================================================
+        # Build training-trial mask BEFORE extracting design.
+        # Test-run trial columns would be near-zero in training data (only HRF
+        # tail leakage, not exact zero), causing condition numbers ~1e7 and
+        # catastrophically wrong betas.  Use ONLY training-run trial columns.
+        # ========================================================================
+        if trial_run_ids is not None:
+            train_runs_tensor = torch.tensor(
+                train_runs, dtype=trial_run_ids.dtype, device=trial_run_ids.device
+            )
+            train_trial_mask = torch.isin(trial_run_ids, train_runs_tensor)
+        else:
+            train_trial_mask = torch.ones(
+                trial_condition_ids.shape[0], dtype=torch.bool, device=trial_condition_ids.device
+            )
+
         train_data = data_chunk[:, train_tps]  # (chunk_voxels, n_train_tps)
-        train_design_raw = design_matrix[train_tps, :]  # (n_train_tps, n_trials)
+        # Use only training-run trial columns → eliminates near-zero columns
+        train_design_raw = design_matrix[train_tps, :][
+            :, train_trial_mask
+        ]  # (n_train_tps, n_train_trials)
         train_nuisance = [nuisance_per_run[i] for i in train_runs]
 
         # ========================================================================
@@ -691,10 +755,13 @@ def _fit_ridge_chunk(
         )
 
         # ========================================================================
-        # 3. Fit ridge on cleaned train data
+        # 3. Fit ridge on cleaned train data (only training-trial columns)
         # ========================================================================
         train_data_clean_t = train_data_clean.T  # (n_train_tps, chunk_voxels)
-        coefs = _fit_ridge_multiple_fracs(train_design_clean, train_data_clean_t, fracs, device)
+        # coefs_train: (n_train_trials, n_fracs, chunk_voxels)
+        coefs_train = _fit_ridge_multiple_fracs(
+            train_design_clean, train_data_clean_t, fracs, device
+        )
 
         # ========================================================================
         # 4. Extract test data and project polynomials
@@ -709,49 +776,39 @@ def _fit_ridge_chunk(
         test_run_starts_local = test_run_starts_local[:-1]
 
         test_data = data_chunk[:, test_tps]  # (chunk_voxels, n_test_tps)
-        test_design_raw = design_matrix[test_tps, :]  # (n_test_tps, n_trials)
         test_nuisance = [nuisance_per_run[i] for i in test_runs]
-
-        test_data_clean, test_design_clean = project_out_nuisance_per_run(
-            test_data,
-            test_design_raw,
-            test_nuisance,
-            test_run_starts_local,
-            device=device,
-        )
 
         # ========================================================================
         # 5. Average single-trial betas within conditions, predict with condition design
         # ========================================================================
         n_conditions = int(trial_condition_ids.max().item()) + 1
 
-        # Get cleaned condition design for test timepoints
+        # Project nuisance from both test data and condition design in one call
         test_cond_design_raw = condition_design[test_tps, :]  # (n_test_tps, n_conditions)
-        # Project nuisance from condition design
-        _, test_cond_design_clean = project_out_nuisance_per_run(
-            test_data,  # dummy, we only need the design
+        test_data_clean, test_cond_design_clean = project_out_nuisance_per_run(
+            test_data,
             test_cond_design_raw,
             test_nuisance,
             test_run_starts_local,
             device=device,
         )
 
-        # Process all fractions at once (vectorized condition averaging)
-        # coefs: (n_trials, n_fracs, chunk_voxels)
-        # Compute condition-average betas for all fractions simultaneously
+        # Condition-average betas from training-trial coefs.
+        # coefs_train rows correspond to trial_condition_ids[train_trial_mask].
         cond_betas_all = torch.zeros(n_conditions, n_fracs, chunk_voxels, device=device)
+        train_cond_ids = trial_condition_ids[train_trial_mask]  # (n_train_trials,)
 
         for cond_idx in range(n_conditions):
-            cond_mask = trial_condition_ids == cond_idx
+            cond_mask = train_cond_ids == cond_idx
             if cond_mask.sum() > 0:
-                # Average across trials for this condition, for all fractions
-                cond_betas_all[cond_idx, :, :] = coefs[cond_mask, :, :].mean(dim=0)
+                # Average across training trials for this condition, all fractions
+                cond_betas_all[cond_idx, :, :] = coefs_train[cond_mask, :, :].mean(dim=0)
 
         # Predict for all fractions at once
         # test_cond_design_clean: (n_test_tps, n_conditions)
         # cond_betas_all: (n_conditions, n_fracs, chunk_voxels)
         # Result: (n_test_tps, n_fracs, chunk_voxels)
-        y_pred_all = torch.einsum('tc,cfv->tfv', test_cond_design_clean, cond_betas_all)
+        y_pred_all = torch.einsum("tc,cfv->tfv", test_cond_design_clean, cond_betas_all)
 
         # Scatter predictions to output accumulators (vectorized)
         test_tps_tensor = torch.tensor(test_tps, device=device)
@@ -795,6 +852,17 @@ def _fit_ridge_chunk(
     voxel_indices = torch.arange(chunk_voxels, device=device)
     betas_final = coefs_final[:, best_frac_idx, voxel_indices].T  # (chunk_voxels, n_trials)
 
+    # Compute final R² on nuisance-projected data using the fitted model
+    # coefficients at the selected fraction (pre-autoscale).
+    #
+    # IMPORTANT: GLMsingle-style autoscaling below includes an additive offset
+    # in beta space to align regularized and OLS beta distributions. That
+    # offset is intended for beta reporting and can distort time-series
+    # reconstruction if applied back through the design matrix. Therefore,
+    # in-sample R² must be evaluated before autoscaling.
+    y_pred_final = betas_final @ design_clean.T  # (chunk_voxels, n_timepoints)
+    r2_final = compute_r2_metric(data_clean, y_pred_final, metric="cod")
+
     # ========================================================================
     # Apply GLMsingle-style autoscaling to undo shrinkage bias (vectorized)
     # ========================================================================
@@ -815,6 +883,13 @@ def _fit_ridge_chunk(
             regularized_batch = betas_final[needs_scaling, :]  # (n_scale, n_trials)
             ols_batch = betas_ols[needs_scaling, :]  # (n_scale, n_trials)
 
+            # Skip autoscaling for near-constant regularized beta vectors.
+            # In this regime, fitting [scale, offset] is ill-conditioned and can
+            # produce extreme scales that explode individual trial betas.
+            reg_centered = regularized_batch - regularized_batch.mean(dim=1, keepdim=True)
+            reg_var = torch.mean(reg_centered**2, dim=1)
+            valid_variance = reg_var > 1e-8
+
             # Build design matrix for all voxels: [regularized, ones]
             # X_batch: (n_scale, n_trials, 2)
             ones = torch.ones(n_scale, n_trials, 1, dtype=regularized_batch.dtype, device=device)
@@ -823,7 +898,9 @@ def _fit_ridge_chunk(
             # Solve batched OLS: [scale, offset] = (X'X)^{-1} X'y
             # XtX: (n_scale, 2, 2), Xty: (n_scale, 2)
             XtX = torch.bmm(X_batch.transpose(1, 2), X_batch)  # (n_scale, 2, 2)
-            Xty = torch.bmm(X_batch.transpose(1, 2), ols_batch.unsqueeze(2)).squeeze(2)  # (n_scale, 2)
+            Xty = torch.bmm(X_batch.transpose(1, 2), ols_batch.unsqueeze(2)).squeeze(
+                2
+            )  # (n_scale, 2)
 
             # Add small regularization for stability
             XtX = XtX + 1e-10 * torch.eye(2, device=device).unsqueeze(0)
@@ -833,21 +910,18 @@ def _fit_ridge_chunk(
             scales = scale_offset_batch[:, 0]  # (n_scale,)
             offsets = scale_offset_batch[:, 1]  # (n_scale,)
 
-            # Revert to identity if scale is negative
-            invalid_mask = scales < 0
+            # Revert to identity for unstable transforms
+            finite_mask = torch.isfinite(scales) & torch.isfinite(offsets)
+            in_range_mask = (scales > 0.0) & (scales < 100.0)
+            valid_mask = valid_variance & finite_mask & in_range_mask
+            invalid_mask = ~valid_mask
             scales[invalid_mask] = 1.0
             offsets[invalid_mask] = 0.0
 
             # Apply transformations in batch
-            betas_final[needs_scaling, :] = (
-                scales.unsqueeze(1) * regularized_batch + offsets.unsqueeze(1)
-            )
-
-    # Compute final R² on cleaned data (using scaled betas)
-    # Vectorized: y_pred_final[v, :] = design_clean @ betas_final[v, :]
-    y_pred_final = betas_final @ design_clean.T  # (chunk_voxels, n_timepoints)
-
-    r2_final = compute_r2_metric(data_clean, y_pred_final, metric="cod")
+            betas_final[needs_scaling, :] = scales.unsqueeze(
+                1
+            ) * regularized_batch + offsets.unsqueeze(1)
 
     # Compute initial R² (OLS or closest to it)
     # In fractional ridge: frac=1.0 is pure OLS, frac=0 is max regularization
@@ -876,6 +950,7 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     condition_design: torch.Tensor,
     autoscale: bool,
     device: torch.device,
+    trial_run_ids: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Fit ridge regression for a chunk with per-voxel design matrices
@@ -928,6 +1003,7 @@ def _fit_ridge_chunk_with_per_voxel_designs(
             condition_design,
             autoscale,
             device,
+            trial_run_ids=trial_run_ids,
         )
 
         # Scatter results back to output arrays (vectorized)
@@ -961,6 +1037,7 @@ def fit_ridge_single_trial(
     polort: Optional[int] = None,
     cv_splits: Optional[List[Tuple[List[int], List[int]]]] = None,
     trial_labels: Optional[List[str]] = None,
+    trial_run_ids: Optional[torch.Tensor] = None,
     autoscale: bool = True,
     chunk_size: Optional[int] = None,
     device: Optional[torch.device] = None,
@@ -1005,6 +1082,11 @@ def fit_ridge_single_trial(
         Default: leave-one-run-out
     trial_labels : list of str, optional
         Labels for each trial
+    trial_run_ids : torch.Tensor, shape (n_trials,), optional
+        Run index (0-indexed) for each trial. Returned by create_single_trial_design.
+        When provided, CV condition-average betas are computed only from training-run
+        trials, preventing contamination from test-run trial betas (which are
+        undefined in training data and inflate cross-validated R² errors).
     autoscale : bool, default=True
         Apply GLMsingle-style post-hoc scaling to undo shrinkage bias.
         Fits a scale and offset transformation to match the unregularized (OLS)
@@ -1043,6 +1125,7 @@ def fit_ridge_single_trial(
     # Generate CV splits if not provided (LORO by default)
     if cv_splits is None:
         from .xval import generate_cv_splits
+
         cv_splits = generate_cv_splits(n_runs, strategy=1, n_perms=n_runs)
 
     # Determine if we have per-voxel designs
@@ -1056,8 +1139,12 @@ def fit_ridge_single_trial(
             n_trials = design_matrix.shape[2]
             design_per_voxel_list = [design_matrix[i, :, :] for i in range(n_voxels)]
             if verbose:
-                n_unique_hrfs = len(set(int(design.sum().item()) for design in design_per_voxel_list[:100]))
-                print(f"  Per-voxel HRF designs detected (~{n_unique_hrfs} unique designs in first 100 voxels)")
+                n_unique_hrfs = len(
+                    set(int(design.sum().item()) for design in design_per_voxel_list[:100])
+                )
+                print(
+                    f"  Per-voxel HRF designs detected (~{n_unique_hrfs} unique designs in first 100 voxels)"
+                )
         else:
             # Per-HRF designs (n_hrfs, n_tp, n_trials) - not yet supported directly
             # Users should expand per-HRF designs to per-voxel before calling fit_ridge_single_trial
@@ -1105,7 +1192,7 @@ def fit_ridge_single_trial(
             for run_idx in range(n_runs):
                 start_tp = run_starts[run_idx]
                 run_length = run_lengths[run_idx]
-                extra_per_run.append(nuisance[start_tp:start_tp + run_length, :])
+                extra_per_run.append(nuisance[start_tp : start_tp + run_length, :])
 
     # Combine polynomials + extra regressors (like GLMsingle's combinedmatrix)
     for run_idx in range(n_runs):
@@ -1185,6 +1272,7 @@ def fit_ridge_single_trial(
     if verbose:
         try:
             from tqdm import tqdm
+
             chunk_iter = tqdm(range(n_chunks), desc="Ridge fitting", unit="chunk")
         except ImportError:
             chunk_iter = range(n_chunks)
@@ -1200,6 +1288,8 @@ def fit_ridge_single_trial(
         data_chunk = data[chunk_start:chunk_end, :].to(device)
 
         # Fit ridge for this chunk
+        trial_run_ids_dev = trial_run_ids.to(device) if trial_run_ids is not None else None
+
         if per_voxel_design:
             # Per-voxel designs: extract designs for this chunk
             chunk_designs = design_per_voxel_list[chunk_start:chunk_end]
@@ -1214,6 +1304,7 @@ def fit_ridge_single_trial(
                 condition_design=condition_design.to(device),
                 autoscale=autoscale,
                 device=device,
+                trial_run_ids=trial_run_ids_dev,
             )
         else:
             # Single design: use directly
@@ -1228,6 +1319,7 @@ def fit_ridge_single_trial(
                 condition_design=condition_design.to(device),
                 autoscale=autoscale,
                 device=device,
+                trial_run_ids=trial_run_ids_dev,
             )
 
         # Store results
@@ -1304,7 +1396,9 @@ def load_hrf_indices(hrf_index_file: str, mask: Optional[np.ndarray] = None) -> 
     return torch.from_numpy(hrf_data).long()
 
 
-def load_noise_pcs(noise_pc_file: str, run_starts: List[int], n_timepoints: int) -> List[torch.Tensor]:
+def load_noise_pcs(
+    noise_pc_file: str, run_starts: List[int], n_timepoints: int
+) -> List[torch.Tensor]:
     """
     Load noise PCs from Denoisefast output
 
@@ -1336,6 +1430,6 @@ def load_noise_pcs(noise_pc_file: str, run_starts: List[int], n_timepoints: int)
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
         run_length = run_lengths[run_idx]
-        pcs_per_run.append(pcs_tensor[start_tp:start_tp + run_length, :])
+        pcs_per_run.append(pcs_tensor[start_tp : start_tp + run_length, :])
 
     return pcs_per_run

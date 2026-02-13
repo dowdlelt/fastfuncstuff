@@ -7,6 +7,7 @@ Supports multiple GLM variants:
 - ARMA(1,1): Accounts for temporal autocorrelation (see arma_glm.py)
 - Ridge: Regularization for correlated regressors (future)
 """
+
 from __future__ import annotations
 
 import warnings
