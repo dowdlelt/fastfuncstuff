@@ -55,7 +55,10 @@
       "mcp__zread__read_file",
       "WebFetch(domain:docs.astral.sh)",
       "mcp__zread__search_doc",
-      "Bash(ty check:*)"
+      "Bash(ty check:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(conda run:*)",
+      "WebFetch(domain:git.fmrib.ox.ac.uk)"
     ],
     "deny": [],
     "ask": []
