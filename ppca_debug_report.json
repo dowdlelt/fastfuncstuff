@@ -1,0 +1,177 @@
+{
+  "input": "/mnt/belegost/Data/nii_data/PROJECT_TASKFORCE/derivatives/global_proc/ses-01_task-mvpsA_run01_final.ica/filtered_func_data.nii.gz",
+  "mask": "/mnt/belegost/Data/nii_data/PROJECT_TASKFORCE/derivatives/global_proc/ses-01_task-mvpsA_run01_final.ica/filtered_func_data.ica/mask.nii.gz",
+  "melodic_dir": "/mnt/belegost/Data/nii_data/PROJECT_TASKFORCE/derivatives/global_proc/ses-01_task-mvpsA_run01_final.ica/filtered_func_data.ica",
+  "n_voxels": 434572,
+  "n_timepoints": 360,
+  "voxel_sizes": [
+    1.600000023841858,
+    1.600000023841858,
+    1.600000023841858
+  ],
+  "n_eff": 15499,
+  "melodic_ppca_shape": [
+    338,
+    7
+  ],
+  "melodic_ppca_col_peaks": {
+    "col_1": {
+      "first_peak": 70,
+      "argmax": 70,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "col_2": {
+      "first_peak": 1,
+      "argmax": 1,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "col_3": {
+      "first_peak": 70,
+      "argmax": 70,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "col_4": {
+      "first_peak": 41,
+      "argmax": 41,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "col_5": {
+      "first_peak": 49,
+      "argmax": 49,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "col_6": {
+      "first_peak": 28,
+      "argmax": 28,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "col_7": {
+      "first_peak": 72,
+      "argmax": 72,
+      "min": 0.0,
+      "max": 1.0
+    }
+  },
+  "our_runs": {
+    "pca_n_components_359": {
+      "n_eigs_raw": 359,
+      "n_eigs_adj": 339,
+      "max_ev": 339,
+      "cumvar_61": 0.5387937841005623,
+      "cumvar_70": 0.5593226044438779,
+      "cumvar_80": 0.5804255395196378,
+      "estimators": {
+        "lap": 61,
+        "bic": 35,
+        "mdl": 43,
+        "rrn": 26,
+        "aic": 64
+      },
+      "lap_at": {
+        "55": {
+          "norm": 0.9987125724415671,
+          "raw": -17698335.874611307
+        },
+        "58": {
+          "norm": 0.9997511119636517,
+          "raw": -17697717.938231252
+        },
+        "60": {
+          "norm": 0.9999887713926502,
+          "raw": -17697576.529643405
+        },
+        "61": {
+          "norm": 1.0,
+          "raw": -17697569.848564032
+        },
+        "62": {
+          "norm": 0.9999684258141096,
+          "raw": -17697588.63536773
+        },
+        "65": {
+          "norm": 0.9997136758320478,
+          "raw": -17697740.212922927
+        },
+        "68": {
+          "norm": 0.9990073253563632,
+          "raw": -17698160.495104503
+        },
+        "70": {
+          "norm": 0.998310469106132,
+          "raw": -17698575.128172893
+        },
+        "72": {
+          "norm": 0.9973610825811026,
+          "raw": -17699140.018059194
+        },
+        "75": {
+          "norm": 0.9957176480336778,
+          "raw": -17700117.870103817
+        }
+      }
+    },
+    "pca_n_components_360": {
+      "n_eigs_raw": 360,
+      "n_eigs_adj": 339,
+      "max_ev": 339,
+      "cumvar_61": 0.5387937841005623,
+      "cumvar_70": 0.5593226044438779,
+      "cumvar_80": 0.5804255395196378,
+      "estimators": {
+        "lap": 61,
+        "bic": 35,
+        "mdl": 43,
+        "rrn": 26,
+        "aic": 64
+      },
+      "lap_at": {
+        "55": {
+          "norm": 0.9986953035034185,
+          "raw": -17696158.837474708
+        },
+        "58": {
+          "norm": 0.999742430007055,
+          "raw": -17695535.391471818
+        },
+        "60": {
+          "norm": 0.9999857011853581,
+          "raw": -17695390.55085972
+        },
+        "61": {
+          "norm": 1.0,
+          "raw": -17695382.037524603
+        },
+        "62": {
+          "norm": 0.9999726653282371,
+          "raw": -17695398.31224575
+        },
+        "65": {
+          "norm": 0.9997267671332292,
+          "raw": -17695544.716950685
+        },
+        "68": {
+          "norm": 0.9990306276434492,
+          "raw": -17695959.189682346
+        },
+        "70": {
+          "norm": 0.9983403236792373,
+          "raw": -17696370.188015185
+        },
+        "72": {
+          "norm": 0.9973977055279244,
+          "raw": -17696931.41105428
+        },
+        "75": {
+          "norm": 0.9957659783117082,
+          "raw": -17697902.920998134
+        }
+      }
+    }
+  }
+}
