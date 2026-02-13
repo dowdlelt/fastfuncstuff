@@ -12,6 +12,7 @@ Himberg, J., Hyvärinen, A., & Esposito, F. (2004). Validating the independent
 components of neuroimaging time series via clustering and visualization.
 NeuroImage, 22(3), 1214-1222.
 """
+
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -106,8 +107,8 @@ def compute_similarity_matrix(
 
 def cluster_components(
     components_list: List[np.ndarray],
-    method: str = 'average',
-    criterion: str = 'maxclust',
+    method: str = "average",
+    criterion: str = "maxclust",
     n_clusters: Optional[int] = None,
     batch_size: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -215,7 +216,9 @@ def compute_cluster_quality(
         intra_sim = similarity[cluster_mask][:, cluster_mask]
         # Exclude diagonal (self-similarity)
         intra_sim_no_diag = intra_sim[~np.eye(intra_sim.shape[0], dtype=bool)]
-        compactness[cluster_id - 1] = intra_sim_no_diag.mean() if len(intra_sim_no_diag) > 0 else 0.0
+        compactness[cluster_id - 1] = (
+            intra_sim_no_diag.mean() if len(intra_sim_no_diag) > 0 else 0.0
+        )
 
         # Inter-cluster similarity (similarity to other clusters)
         inter_sim = similarity[cluster_mask][:, ~cluster_mask]
@@ -233,10 +236,10 @@ def compute_cluster_quality(
     stability = 0.7 * compactness + 0.3 * isolation_norm
 
     return {
-        'compactness': compactness,
-        'isolation': isolation,
-        'size': size,
-        'stability': stability,
+        "compactness": compactness,
+        "isolation": isolation,
+        "size": size,
+        "stability": stability,
     }
 
 
@@ -357,7 +360,7 @@ def icasso(
     if batch_size is None:
         # Estimate memory needed for similarity matrix (float64)
         # Matrix size: n_total × n_total × 8 bytes
-        matrix_gb = (n_total_components ** 2 * 8) / (1024**3)
+        matrix_gb = (n_total_components**2 * 8) / (1024**3)
 
         # Use batching if matrix > 1 GB (conservative threshold for CPU RAM)
         if matrix_gb > 1.0:
@@ -368,13 +371,18 @@ def icasso(
                 print(f"Auto-selected batch_size={batch_size} for memory efficiency")
 
     if verbose:
-        print(f"Running ICASSO: {n_runs} ICA runs × {n_components} components = {n_total_components} total")
+        print(
+            f"Running ICASSO: {n_runs} ICA runs × {n_components} components = {n_total_components} total"
+        )
         print(f"Memory mode: {'batched' if batch_size else 'standard'}")
 
     # Step 1: Run ICA multiple times
     components_list = []
     mixing_list = []
     pca_variance_explained = None  # Track PCA variance from first run
+
+    pca_eigenvalues = None
+    pca_components_arr = None
 
     iterator = range(n_runs)
     if verbose:
@@ -392,13 +400,15 @@ def icasso(
         # Save PCA variance from first run (same for all runs with same pca_components)
         if i == 0:
             pca_variance_explained = ica.pca_.explained_variance_ratio_.cpu().numpy()
+            pca_eigenvalues = ica.pca_.explained_variance_.cpu().numpy()
+            pca_components_arr = ica.pca_.components_.cpu().numpy()
 
         # Move to CPU immediately and convert to numpy to free GPU memory
         components_list.append(ica.components_.cpu().numpy())
         mixing_list.append(ica.mixing_.cpu().numpy())
 
         # Clear GPU cache periodically to prevent memory accumulation
-        if device.type == 'cuda' and i % 10 == 9:
+        if device.type == "cuda" and i % 10 == 9:
             torch.cuda.empty_cache()
 
     # Step 2: Cluster components
@@ -409,7 +419,7 @@ def icasso(
 
     cluster_labels, similarity = cluster_components(
         components_list,
-        method='average',
+        method="average",
         n_clusters=n_components,
         batch_size=batch_size,
     )
@@ -418,11 +428,13 @@ def icasso(
     quality = compute_cluster_quality(components_list, cluster_labels, similarity)
 
     # Step 4: Select stable clusters
-    stable_mask = quality['stability'] >= min_stability
+    stable_mask = quality["stability"] >= min_stability
     n_stable = stable_mask.sum()
 
     if verbose:
-        print(f"Found {n_stable}/{n_components} stable components (stability >= {min_stability:.2f})")
+        print(
+            f"Found {n_stable}/{n_components} stable components (stability >= {min_stability:.2f})"
+        )
         print(f"  Mean stability: {quality['stability'].mean():.3f}")
         print(f"  Mean compactness: {quality['compactness'].mean():.3f}")
 
@@ -439,36 +451,36 @@ def icasso(
     best_mixing = mixing_list[best_run_idx]
 
     # Match stable centroids to best run components
-    stable_mixing = match_components_to_centroids(
-        best_components,
-        best_mixing,
-        stable_components
-    )
+    stable_mixing = match_components_to_centroids(best_components, best_mixing, stable_components)
 
     # Match ALL centroids to best run components (for saving all components)
     all_mixing = match_components_to_centroids(
         best_components,
         best_mixing,
-        centroids  # ALL centroids, not just stable
+        centroids,  # ALL centroids, not just stable
     )
 
     return {
-        'components': stable_components,
-        'mixing': stable_mixing,
-        'stability': quality['stability'][stable_mask],
-        'all_centroids': centroids,  # ALL component centroids (not just stable)
-        'all_mixing': all_mixing,  # Mixing for ALL centroids
-        'all_stability': quality['stability'],  # Stability for ALL components
-        'cluster_quality': quality,
-        'n_stable': n_stable,
-        'n_components': n_components,
-        'cluster_labels': cluster_labels,
-        'best_run_idx': best_run_idx,
-        'all_components': components_list,
-        'all_mixing_list': mixing_list,  # All mixing matrices from all runs
-        'similarity': similarity,
-        'pca_variance_explained': pca_variance_explained,  # Variance explained by PCA
-        'pca_variance_cumsum': pca_variance_explained.cumsum() if pca_variance_explained is not None else None,
+        "components": stable_components,
+        "mixing": stable_mixing,
+        "stability": quality["stability"][stable_mask],
+        "all_centroids": centroids,  # ALL component centroids (not just stable)
+        "all_mixing": all_mixing,  # Mixing for ALL centroids
+        "all_stability": quality["stability"],  # Stability for ALL components
+        "cluster_quality": quality,
+        "n_stable": n_stable,
+        "n_components": n_components,
+        "cluster_labels": cluster_labels,
+        "best_run_idx": best_run_idx,
+        "all_components": components_list,
+        "all_mixing_list": mixing_list,  # All mixing matrices from all runs
+        "similarity": similarity,
+        "pca_variance_explained": pca_variance_explained,  # Variance explained by PCA
+        "pca_variance_cumsum": pca_variance_explained.cumsum()
+        if pca_variance_explained is not None
+        else None,
+        "pca_eigenvalues": pca_eigenvalues,  # Raw PCA eigenvalues (explained_variance_)
+        "pca_components": pca_components_arr,  # PCA spatial components (k, V)
     }
 
 
@@ -627,6 +639,7 @@ def icasso_auto_select(
     if verbose:
         print("\nRunning PCA for variance analysis...")
     from .ica import FastICA
+
     temp_ica = FastICA(n_components=1, pca_components=pca_components, device=device)
     temp_ica.fit(X)
     pca_variance_curve = temp_ica.pca_.explained_variance_ratio_.cpu().numpy()
@@ -640,9 +653,9 @@ def icasso_auto_select(
 
     for n_comp in n_components_range:
         if verbose:
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             print(f"Testing n_components = {n_comp}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             # Show PCA variance BEFORE running ICA
             if n_comp <= len(pca_cumsum_curve):
@@ -662,7 +675,7 @@ def icasso_auto_select(
         )
 
         all_results[n_comp] = icasso_results
-        n_stable_by_n[n_comp] = icasso_results['n_stable']
+        n_stable_by_n[n_comp] = icasso_results["n_stable"]
 
         if verbose:
             print(f"Stable components: {icasso_results['n_stable']}/{n_comp}")
@@ -673,9 +686,9 @@ def icasso_auto_select(
     optimal_n = max(stability_ratios, key=stability_ratios.get)
 
     if verbose:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("ICASSO Automatic Selection Results")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print("\nn_components | n_stable | ratio | pca_var")
         print("-" * 47)
         for n in sorted(n_stable_by_n.keys()):
@@ -683,9 +696,9 @@ def icasso_auto_select(
             marker = " <-- OPTIMAL" if n == optimal_n else ""
 
             # Get PCA variance for this n_components
-            pca_var_cumsum = all_results[n].get('pca_variance_cumsum')
+            pca_var_cumsum = all_results[n].get("pca_variance_cumsum")
             if pca_var_cumsum is not None and len(pca_var_cumsum) >= n:
-                pca_var = pca_var_cumsum[n-1]
+                pca_var = pca_var_cumsum[n - 1]
                 print(f"{n:12d} | {n_stable_by_n[n]:8d} | {ratio:5.2f} | {pca_var:6.1%}{marker}")
             else:
                 print(f"{n:12d} | {n_stable_by_n[n]:8d} | {ratio:5.2f} | N/A{marker}")
@@ -694,9 +707,9 @@ def icasso_auto_select(
         print(f"Found {n_stable_by_n[optimal_n]} stable components")
 
     return {
-        'optimal_n_components': optimal_n,
-        'optimal_results': all_results[optimal_n],
-        'n_stable_by_n_components': n_stable_by_n,
-        'stability_ratios': stability_ratios,
-        'all_results': all_results,
+        "optimal_n_components": optimal_n,
+        "optimal_results": all_results[optimal_n],
+        "n_stable_by_n_components": n_stable_by_n,
+        "stability_ratios": stability_ratios,
+        "all_results": all_results,
     }
