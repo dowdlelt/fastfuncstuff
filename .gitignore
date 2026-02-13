@@ -64,6 +64,8 @@ design_optimization_results/
 *.BRIK
 *.HEAD
 *.1D
+*.nii
+*.nii.gz
 
 # Test outputs (generated)
 test_data/**/test_*.nii.gz
