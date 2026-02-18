@@ -35,13 +35,12 @@ For help:
 """
 
 import argparse
-import glob as glob_module
 import json
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -64,13 +63,15 @@ try:
         auto_polort,
         compute_run_lengths,
         get_average_run_duration,
+        parse_cv_strategy,
+        parse_input_files,
     )
     from fastfuncsim.denoise import (
         extract_noise_pcs_per_run,
         select_noise_pool_voxels,
     )
     from fastfuncsim.design import convolve_hrf_microtime
-    from fastfuncsim.design_builder import parse_afni_timing_file
+    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
     from fastfuncsim.glm_core import GLMResults, construct_polynomial_matrix, fit_glm
     from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
     from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
@@ -139,81 +140,6 @@ class PathfinderResults:
     final_results: GLMResults = None
     hrf_library: torch.Tensor = None
     metadata: Dict = field(default_factory=dict)
-
-
-def parse_input_files(input_arg: Union[str, List[str]]) -> List[str]:
-    """Parse input files (can be list from nargs='+' or single string)"""
-    if isinstance(input_arg, str):
-        input_arg = input_arg.strip().strip('"').strip("'")
-        input_list = input_arg.split()
-    else:
-        input_list = input_arg
-
-    files = []
-    for pattern in input_list:
-        matches = glob_module.glob(pattern)
-        if matches:
-            files.extend(sorted(matches))
-        else:
-            files.append(pattern)
-
-    for f in files:
-        if not Path(f).exists():
-            print(f"ERROR: Input file not found: {f}")
-            sys.exit(1)
-
-    return files
-
-
-def parse_durations(
-    durations_arg: List[str],
-    n_conditions: int,
-    condition_labels: List[str],
-) -> List[float]:
-    """Parse durations argument."""
-    if len(durations_arg) == 1:
-        try:
-            dur = float(durations_arg[0])
-            return [dur] * n_conditions
-        except ValueError:
-            print(f"ERROR: Could not parse duration '{durations_arg[0]}' as float")
-            sys.exit(1)
-    elif len(durations_arg) == n_conditions:
-        try:
-            return [float(d) for d in durations_arg]
-        except ValueError as e:
-            print(f"ERROR: Could not parse durations: {e}")
-            sys.exit(1)
-    else:
-        print(
-            f"ERROR: Number of durations ({len(durations_arg)}) must be 1 or match "
-            f"number of conditions ({n_conditions})"
-        )
-        print(f"  Conditions: {condition_labels}")
-        sys.exit(1)
-
-
-def parse_cv_strategy(cv_str: str) -> Union[int, float]:
-    """Parse CV strategy string into int or float."""
-    cv_str = cv_str.lower().strip()
-
-    if cv_str in ["loro", "loo"]:
-        return 1
-
-    try:
-        val = float(cv_str)
-        if val == int(val) and val > 1:
-            return int(val)
-        elif 0 < val < 1:
-            return val
-        elif val == 1:
-            return 1
-        else:
-            print(f"ERROR: Invalid cv_strategy value: {cv_str}")
-            sys.exit(1)
-    except ValueError:
-        print(f"ERROR: Could not parse cv_strategy: {cv_str}")
-        sys.exit(1)
 
 
 def create_parser():
@@ -973,7 +899,10 @@ def fit_pathfinder(
 
         # Track best HRF's noise pool/PCs for final use
         mean_r2_this_hrf = r2_by_n_pcs[optimal_pcs]
-        if best_noise_pool_mask is None or mean_r2_this_hrf > xval_r2_by_hrf_and_pcs[:hrf_idx, :].max():
+        if (
+            best_noise_pool_mask is None
+            or mean_r2_this_hrf > xval_r2_by_hrf_and_pcs[:hrf_idx, :].max()
+        ):
             best_noise_pool_mask = noise_pool_mask
             best_criteria_mask = criteria_mask
             best_noise_pcs = noise_pcs
@@ -1034,11 +963,13 @@ def fit_pathfinder(
         noise_pc_design = None
 
     # Fit each HRF group
-    hrf_group_iterator = tqdm(unique_hrfs, desc="Final fit per HRF group") if verbose else unique_hrfs
+    hrf_group_iterator = (
+        tqdm(unique_hrfs, desc="Final fit per HRF group") if verbose else unique_hrfs
+    )
 
     for hrf_idx_t in hrf_group_iterator:
         hrf_idx_int = hrf_idx_t.item()
-        voxel_mask_group = (hrf_index == hrf_idx_t)
+        voxel_mask_group = hrf_index == hrf_idx_t
         voxel_indices = torch.where(voxel_mask_group)[0]
         n_group_voxels = len(voxel_indices)
 
@@ -1083,16 +1014,32 @@ def fit_pathfinder(
 
         # Store results
         if group_results.betas is not None:
-            betas_gpu = group_results.betas.to(device) if group_results.betas.device != device else group_results.betas
+            betas_gpu = (
+                group_results.betas.to(device)
+                if group_results.betas.device != device
+                else group_results.betas
+            )
             final_betas[voxel_indices, :] = betas_gpu
         if group_results.r2 is not None:
-            r2_gpu = group_results.r2.to(device) if group_results.r2.device != device else group_results.r2
+            r2_gpu = (
+                group_results.r2.to(device)
+                if group_results.r2.device != device
+                else group_results.r2
+            )
             final_r2[voxel_indices] = r2_gpu
         if group_results.tstats is not None:
-            tstats_gpu = group_results.tstats.to(device) if group_results.tstats.device != device else group_results.tstats
+            tstats_gpu = (
+                group_results.tstats.to(device)
+                if group_results.tstats.device != device
+                else group_results.tstats
+            )
             final_tstats[voxel_indices, :] = tstats_gpu
         if group_results.sigma2 is not None:
-            sigma2_gpu = group_results.sigma2.to(device) if group_results.sigma2.device != device else group_results.sigma2
+            sigma2_gpu = (
+                group_results.sigma2.to(device)
+                if group_results.sigma2.device != device
+                else group_results.sigma2
+            )
             final_sigma2[voxel_indices] = sigma2_gpu
 
     # Build final GLMResults
@@ -1175,7 +1122,7 @@ def save_pathfinder_results(
     # Generate condition labels if not provided
     n_conditions = results.metadata.get("n_conditions", 1)
     if condition_labels is None:
-        condition_labels = [f"cond{i+1:02d}" for i in range(n_conditions)]
+        condition_labels = [f"cond{i + 1:02d}" for i in range(n_conditions)]
 
     # =========================================================================
     # INITIAL RESULTS (canonical HRF, no denoising)
@@ -1424,7 +1371,9 @@ def main():
     # Determine memory strategy
     if hasattr(first_img, "shape"):
         n_voxels_per_run = first_img.shape[0] * first_img.shape[1] * first_img.shape[2]
-        n_timepoints_per_run = first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[-1]
+        n_timepoints_per_run = (
+            first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[-1]
+        )
     else:
         n_voxels_per_run = 10000
         n_timepoints_per_run = 200
@@ -1503,7 +1452,9 @@ def main():
     # Optional scaling
     if args.do_scale:
         print()
-        data, _, _ = scale_to_percent_signal(data=data, run_starts=run_starts, max_scale=200.0, verbose=True)
+        data, _, _ = scale_to_percent_signal(
+            data=data, run_starts=run_starts, max_scale=200.0, verbose=True
+        )
 
     print(f"  Data shape: {data.shape}")
     print(f"  Volume shape: {volume_shape}")
@@ -1517,7 +1468,9 @@ def main():
     for onset_file in onset_files:
         onsets_by_run = parse_afni_timing_file(onset_file)
         if len(onsets_by_run) != n_runs:
-            print(f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}")
+            print(
+                f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}"
+            )
             sys.exit(1)
         all_onsets.append(onsets_by_run)
 
@@ -1534,7 +1487,9 @@ def main():
             for onset_time in onsets:
                 onset_bin = run_start_micro + int(np.round(onset_time / args.microtime_dt))
                 if onset_bin < n_microtime:
-                    onset_matrix[onset_bin : min(onset_bin + duration_bins, n_microtime), cond_idx] = 1.0
+                    onset_matrix[
+                        onset_bin : min(onset_bin + duration_bins, n_microtime), cond_idx
+                    ] = 1.0
 
     print(f"  Onset matrix shape: {onset_matrix.shape}")
 
@@ -1565,8 +1520,12 @@ def main():
             for run_idx in range(n_runs):
                 start_tp = run_starts[run_idx]
                 end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                run_nuisance = torch.tensor(nuisance_data[start_tp:end_tp, :], dtype=torch.float32, device=device)
-                nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], run_nuisance], dim=1)
+                run_nuisance = torch.tensor(
+                    nuisance_data[start_tp:end_tp, :], dtype=torch.float32, device=device
+                )
+                nuisance_per_run[run_idx] = torch.cat(
+                    [nuisance_per_run[run_idx], run_nuisance], dim=1
+                )
 
     print(f"  Nuisance per run: {nuisance_per_run[0].shape[1]} columns (polort={polort})")
 
@@ -1653,7 +1612,7 @@ def main():
     for i, count in enumerate(results.metadata["hrf_usage_counts"]):
         if count > 0:
             pct = 100 * count / n_voxels
-            print(f"    HRF {i+1}: {count:,} voxels ({pct:.1f}%)")
+            print(f"    HRF {i + 1}: {count:,} voxels ({pct:.1f}%)")
     print()
     print(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
