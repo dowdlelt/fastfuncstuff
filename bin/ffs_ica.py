@@ -25,6 +25,7 @@ Notes
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -33,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.stats import spearmanr
 
 try:
     import nibabel as nib
@@ -202,6 +204,269 @@ def _load_run_ortvec_design(
     return design_tc, labels
 
 
+def _expand_mask_file(mask_path: str, shape3d: tuple[int, int, int]) -> list[tuple[str, np.ndarray]]:
+    """Expand a spatial mask file into one or more boolean 3D masks.
+
+    Supported formats
+    -----------------
+    - 3D binary/non-binary: one mask (values > 0)
+    - 3D integer labels: one mask per positive label value
+    - 4D: one mask per frame (values > 0 in each frame)
+    """
+    img = nib.load(mask_path)
+    data = np.asarray(img.get_fdata(dtype=np.float32))
+    stem = Path(mask_path).name
+
+    masks: list[tuple[str, np.ndarray]] = []
+    if data.ndim == 4:
+        if tuple(data.shape[:3]) != tuple(shape3d):
+            raise ValueError(
+                f"Mask {mask_path} has spatial shape {data.shape[:3]} but run shape is {shape3d}"
+            )
+        for frame_idx in range(data.shape[3]):
+            frame_mask = np.isfinite(data[..., frame_idx]) & (data[..., frame_idx] > 0)
+            masks.append((f"{stem}:frame{frame_idx + 1:03d}", frame_mask))
+        return masks
+
+    if data.ndim != 3:
+        raise ValueError(f"Mask {mask_path} must be 3D or 4D, got ndim={data.ndim}")
+    if tuple(data.shape) != tuple(shape3d):
+        raise ValueError(f"Mask {mask_path} has shape {data.shape} but run shape is {shape3d}")
+
+    finite_data = np.where(np.isfinite(data), data, 0.0)
+    pos_vals = finite_data[finite_data > 0]
+    if pos_vals.size == 0:
+        masks.append((f"{stem}:all", np.zeros(shape3d, dtype=bool)))
+        return masks
+
+    rounded = np.rint(pos_vals)
+    is_integer_like = np.all(np.abs(pos_vals - rounded) < 1e-5)
+    unique_labels = np.unique(rounded.astype(np.int32)) if is_integer_like else np.array([], dtype=np.int32)
+
+    # If >1 positive integer labels, treat as label map with one mask per label.
+    if is_integer_like and unique_labels.size > 1:
+        for lbl in unique_labels:
+            if lbl <= 0:
+                continue
+            masks.append((f"{stem}:label{int(lbl)}", np.rint(finite_data).astype(np.int32) == int(lbl)))
+    else:
+        masks.append((f"{stem}:all", finite_data > 0))
+    return masks
+
+
+def _prepare_guidance_masks(
+    mask_paths: list[str] | None,
+    kind: str,
+    shape3d: tuple[int, int, int],
+    brain_mask3d: np.ndarray | None,
+    n_vox_masked: int,
+    verbose: bool = False,
+) -> list[dict]:
+    """Parse good/bad masks and map them into masked voxel index space."""
+    if not mask_paths:
+        return []
+
+    out: list[dict] = []
+    for path in mask_paths:
+        expanded = _expand_mask_file(path, shape3d)
+        for mask_name, raw_mask in expanded:
+            m = raw_mask.astype(bool)
+            if brain_mask3d is not None:
+                m = m & brain_mask3d
+                selector = m[brain_mask3d]
+            else:
+                selector = m.reshape(-1)
+
+            if selector.shape[0] != n_vox_masked:
+                raise ValueError(
+                    f"Internal mask mapping error for {mask_name}: selector has {selector.shape[0]} "
+                    f"voxels, expected {n_vox_masked}"
+                )
+
+            n_sel = int(selector.sum())
+            if n_sel == 0:
+                if verbose:
+                    print(f"    Warning: {kind} mask {mask_name} has 0 voxels after brain masking; skipped")
+                continue
+
+            out.append(
+                {
+                    "name": mask_name,
+                    "source": path,
+                    "selector": selector.astype(bool),
+                    "n_voxels": n_sel,
+                    "kind": kind,
+                }
+            )
+    return out
+
+
+def _prepare_depth_mask(
+    depth_mask_path: str | None,
+    shape3d: tuple[int, int, int],
+    brain_mask3d: np.ndarray | None,
+    n_vox_masked: int,
+) -> dict | None:
+    """Load depth labels and map each positive integer depth to masked voxel space."""
+    if depth_mask_path is None:
+        return None
+
+    img = nib.load(depth_mask_path)
+    data = np.asarray(img.get_fdata(dtype=np.float32))
+    if data.ndim != 3:
+        raise ValueError(f"-depth_mask must be 3D integer-labeled image, got ndim={data.ndim}")
+    if tuple(data.shape) != tuple(shape3d):
+        raise ValueError(
+            f"Depth mask {depth_mask_path} has shape {data.shape} but run shape is {shape3d}"
+        )
+
+    rounded = np.rint(np.where(np.isfinite(data), data, 0.0)).astype(np.int32)
+    labels = [int(v) for v in np.unique(rounded) if int(v) > 0]
+
+    depth_selectors: dict[int, np.ndarray] = {}
+    for lbl in labels:
+        m = rounded == lbl
+        if brain_mask3d is not None:
+            m = m & brain_mask3d
+            selector = m[brain_mask3d]
+        else:
+            selector = m.reshape(-1)
+        if selector.shape[0] != n_vox_masked:
+            raise ValueError(
+                f"Internal depth mask mapping error for label {lbl}: {selector.shape[0]} vs {n_vox_masked}"
+            )
+        if int(selector.sum()) > 0:
+            depth_selectors[lbl] = selector.astype(bool)
+
+    return {
+        "path": depth_mask_path,
+        "labels": sorted(depth_selectors.keys()),
+        "selectors": depth_selectors,
+    }
+
+
+def _mean_abs_by_selector(comp_kv: np.ndarray, selector_v: np.ndarray) -> np.ndarray:
+    if int(selector_v.sum()) == 0:
+        return np.zeros(comp_kv.shape[0], dtype=np.float32)
+    return np.mean(np.abs(comp_kv[:, selector_v]), axis=1).astype(np.float32)
+
+
+def _mean_z_excess_by_selector(z_kv: np.ndarray, selector_v: np.ndarray, z_thresh: float) -> np.ndarray:
+    if int(selector_v.sum()) == 0:
+        return np.zeros(z_kv.shape[0], dtype=np.float32)
+    z_sel = np.abs(z_kv[:, selector_v])
+    return np.mean(np.maximum(z_sel - float(z_thresh), 0.0), axis=1).astype(np.float32)
+
+
+def _normalize_0_1(x: np.ndarray) -> np.ndarray:
+    if x.size == 0:
+        return x
+    x = x.astype(np.float32)
+    mx = float(np.max(x))
+    if mx <= 1e-8:
+        return np.zeros_like(x)
+    return x / mx
+
+
+def _best_lag_and_r(
+    x_t: np.ndarray,
+    y_t: np.ndarray,
+    tr: float,
+    max_lag_s: float,
+) -> tuple[float, float, str]:
+    """Estimate lag (seconds) and peak correlation between two timeseries.
+
+    Tries rapidtide helpers if available; otherwise uses a normalized
+    numpy cross-correlation fallback.
+    """
+    x = np.asarray(x_t, dtype=np.float64)
+    y = np.asarray(y_t, dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1 or x.shape[0] != y.shape[0]:
+        raise ValueError("Lag input timeseries must be 1D and same length")
+
+    # Attempt rapidtide integration first (API can vary by release).
+    try:
+        rcor = importlib.import_module("rapidtide.correlate")
+        if hasattr(rcor, "quickcorr"):
+            maxlag_tr = int(max(1, round(float(max_lag_s) / float(tr))))
+            lag_tr, r_val = rcor.quickcorr(x, y, maxlag=maxlag_tr)  # type: ignore[attr-defined]
+            return float(lag_tr) * float(tr), float(r_val), "rapidtide.quickcorr"
+    except Exception:
+        pass
+
+    # Robust fallback: z-score and normalized xcorr over bounded lags.
+    x = x - np.mean(x)
+    y = y - np.mean(y)
+    x_std = float(np.std(x))
+    y_std = float(np.std(y))
+    if x_std < 1e-8 or y_std < 1e-8:
+        return 0.0, 0.0, "numpy.xcorr.degenerate"
+    xz = x / x_std
+    yz = y / y_std
+
+    n_t = xz.shape[0]
+    maxlag_tr = int(max(1, round(float(max_lag_s) / float(tr))))
+    maxlag_tr = min(maxlag_tr, n_t - 1)
+
+    full = np.correlate(xz, yz, mode="full") / float(n_t)
+    lags = np.arange(-n_t + 1, n_t, dtype=np.int32)
+    keep = np.abs(lags) <= maxlag_tr
+    full_k = full[keep]
+    lags_k = lags[keep]
+
+    best_idx = int(np.argmax(full_k))
+    lag_tr = int(lags_k[best_idx])
+    r_best = float(full_k[best_idx])
+    return float(lag_tr) * float(tr), r_best, "numpy.xcorr"
+
+
+def _weighted_depth_timeseries(
+    source_vox_t: np.ndarray,
+    selector_v: np.ndarray,
+    weight_v: np.ndarray,
+    min_voxels: int,
+) -> tuple[np.ndarray | None, int]:
+    use = selector_v & np.isfinite(weight_v) & (weight_v > 0)
+    n_use = int(use.sum())
+    if n_use < int(min_voxels):
+        return None, n_use
+    w = np.asarray(weight_v[use], dtype=np.float64)
+    if float(np.sum(w)) <= 1e-12:
+        return None, n_use
+    x = np.asarray(source_vox_t[use, :], dtype=np.float64)
+    return np.average(x, axis=0, weights=w), n_use
+
+
+def _save_depth_lag_plot(
+    lag_matrix_kd: np.ndarray,
+    depth_labels: list[int],
+    out_png: Path,
+    title: str,
+):
+    if plt is None or lag_matrix_kd.size == 0 or len(depth_labels) == 0:
+        return
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    vmax = float(np.nanmax(np.abs(lag_matrix_kd))) if np.isfinite(lag_matrix_kd).any() else 1.0
+    vmax = max(vmax, 1e-3)
+    fig_w = max(8.0, 0.5 * len(depth_labels) + 4.0)
+    fig_h = max(6.0, 0.14 * lag_matrix_kd.shape[0] + 3.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    m = np.where(np.isfinite(lag_matrix_kd), lag_matrix_kd, np.nan)
+    im = ax.imshow(m, aspect="auto", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xlabel("Depth label")
+    ax.set_ylabel("Component index")
+    ax.set_xticks(np.arange(len(depth_labels)))
+    ax.set_xticklabels([str(v) for v in depth_labels], rotation=0)
+    ax.set_yticks(np.arange(lag_matrix_kd.shape[0]))
+    ax.set_yticklabels([str(i + 1) for i in range(lag_matrix_kd.shape[0])], fontsize=8)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Lag (s) vs reference depth")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _save_corr_heatmap(corr_kn: np.ndarray, labels: list[str], out_png: Path, title: str):
     if plt is None or corr_kn.size == 0 or len(labels) == 0:
         return
@@ -224,6 +489,91 @@ def _save_corr_heatmap(corr_kn: np.ndarray, labels: list[str], out_png: Path, ti
     fig.tight_layout()
     fig.savefig(out_png, dpi=180, bbox_inches="tight")
     plt.close(fig)
+
+
+def _save_score_heatmap(scores_kn: np.ndarray, labels: list[str], out_png: Path, title: str, cmap: str):
+    if plt is None or scores_kn.size == 0 or len(labels) == 0:
+        return
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    vmax = float(np.max(scores_kn)) if scores_kn.size > 0 else 1.0
+    vmax = max(vmax, 1e-4)
+    fig_w = max(8.0, 0.45 * len(labels) + 4.0)
+    fig_h = max(6.0, 0.14 * scores_kn.shape[0] + 3.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(scores_kn, aspect="auto", cmap=cmap, vmin=0.0, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xlabel("Mask")
+    ax.set_ylabel("Component index")
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=60, ha="right", fontsize=8)
+    ax.set_yticks(np.arange(scores_kn.shape[0]))
+    ax.set_yticklabels([str(i + 1) for i in range(scores_kn.shape[0])], fontsize=8)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Score")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _preprocess_design_for_correlation(
+    design_tc: torch.Tensor,
+    tr: float,
+    polort: int,
+    high_pass_hz: float | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply the same temporal preprocessing to regressors used for correlation.
+
+    ICA timecourses come from data that has already undergone polort projection
+    and optional high-pass filtering, so we transform condition/ortvec vectors
+    the same way before correlation.
+    """
+    if design_tc.numel() == 0:
+        return design_tc
+
+    # Convert (T, C) -> (C, T) to match utility function conventions.
+    reg_ct = design_tc.T
+    reg_ct = apply_polort_projection(reg_ct, polort=polort, device=device)
+    if high_pass_hz is not None and high_pass_hz > 0:
+        reg_ct = apply_high_pass_fft(reg_ct, tr=tr, high_pass_hz=high_pass_hz)
+    return reg_ct.T
+
+
+def _component_condition_spectral_correlations(
+    mixing_tk: torch.Tensor,
+    design_tc: torch.Tensor,
+) -> np.ndarray:
+    """Correlation between component and design power spectra (per column pair).
+
+    Uses rFFT power (excluding DC), z-scores each spectrum across frequency,
+    then computes Pearson-like cosine in standardized space.
+    """
+    x = mixing_tk.detach().cpu().numpy().astype(np.float64)  # (T, K)
+    y = design_tc.detach().cpu().numpy().astype(np.float64)  # (T, C)
+
+    sx = np.abs(np.fft.rfft(x, axis=0)) ** 2  # (F, K)
+    sy = np.abs(np.fft.rfft(y, axis=0)) ** 2  # (F, C)
+
+    # Drop DC to avoid mean-offset domination.
+    if sx.shape[0] > 1:
+        sx = sx[1:, :]
+        sy = sy[1:, :]
+
+    if sx.shape[0] == 0:
+        return np.zeros((x.shape[1], y.shape[1]), dtype=np.float64)
+
+    # Log-compress power for numerical stability before standardization.
+    sx = np.log1p(sx)
+    sy = np.log1p(sy)
+
+    sx = sx - sx.mean(axis=0, keepdims=True)
+    sy = sy - sy.mean(axis=0, keepdims=True)
+    sx_std = np.clip(sx.std(axis=0, keepdims=True), 1e-8, None)
+    sy_std = np.clip(sy.std(axis=0, keepdims=True), 1e-8, None)
+
+    sxz = sx / sx_std
+    syz = sy / sy_std
+    return (sxz.T @ syz) / float(sxz.shape[0])
 
 
 def _write_melodic_compat_outputs(
@@ -472,6 +822,7 @@ def _run_single_ica(
     _vprint(args.verbose, f"Loading {run_file} ...")
     img = load_nifti(run_file)
     data = img.get_fdata(dtype=np.float32)
+    data_unblurred = data.copy() if (args.depth_lag and args.depth_lag_use_unsmoothed) else None
     affine = img.affine
     shape3d = data.shape[:3]
     n_t = data.shape[3]
@@ -551,6 +902,49 @@ def _run_single_ica(
         raise ValueError(
             f"Only {n_vox_masked} voxels after masking — data appears empty or mask is wrong"
         )
+
+    # --- Spatial guidance masks (good / bad / depth) ---
+    _vsection(args.verbose, "Spatial Guidance Inputs")
+    guidance_good_masks = _prepare_guidance_masks(
+        mask_paths=args.good_mask,
+        kind="good",
+        shape3d=shape3d,
+        brain_mask3d=mask3d,
+        n_vox_masked=n_vox_masked,
+        verbose=args.verbose,
+    )
+    guidance_bad_masks = _prepare_guidance_masks(
+        mask_paths=args.bad_mask,
+        kind="bad",
+        shape3d=shape3d,
+        brain_mask3d=mask3d,
+        n_vox_masked=n_vox_masked,
+        verbose=args.verbose,
+    )
+    depth_mask_info = _prepare_depth_mask(
+        depth_mask_path=args.depth_mask,
+        shape3d=shape3d,
+        brain_mask3d=mask3d,
+        n_vox_masked=n_vox_masked,
+    )
+    _vprint(
+        args.verbose,
+        f"good masks={len(guidance_good_masks)}, bad masks={len(guidance_bad_masks)}, "
+        f"depth labels={0 if depth_mask_info is None else len(depth_mask_info['labels'])}",
+    )
+
+    # Source matrix for depth-lag analysis (post-mask, optional temporal matching).
+    depth_source_vox_t_np: np.ndarray | None = None
+    if args.depth_lag and depth_mask_info is not None:
+        source_4d = data_unblurred if data_unblurred is not None else data
+        if mask3d is not None:
+            depth_source_vox_t_np = source_4d[mask3d].astype(np.float32)
+        else:
+            depth_source_vox_t_np = source_4d.reshape(-1, n_t).astype(np.float32)
+
+    # Done with optional unblurred copy once depth source is prepared.
+    if data_unblurred is not None:
+        del data_unblurred
 
     # --- Estimate spatial smoothness for effective DOF (MELODIC-style) ---
     # FSL MELODIC computes resels = FWHM_x × FWHM_y × FWHM_z from the data,
@@ -939,9 +1333,11 @@ def _run_single_ica(
         torch.cuda.empty_cache()
 
     condition_corr = None
+    condition_spectral_corr = None
     cond_labels = None
     cond_durations = None
     ortvec_corr = None
+    ortvec_spectral_corr = None
     ortvec_labels = None
     if onsets_files is not None and durations is not None:
         try:
@@ -955,7 +1351,18 @@ def _run_single_ica(
                 microtime_dt=args.microtime_dt,
                 device=device,
             )
+            design_tc = _preprocess_design_for_correlation(
+                design_tc=design_tc,
+                tr=tr,
+                polort=polort,
+                high_pass_hz=args.high_pass,
+                device=device,
+            )
             condition_corr = component_condition_correlations(mixing_tk=mixing, design_tc=design_tc)
+            condition_spectral_corr = _component_condition_spectral_correlations(
+                mixing_tk=mixing,
+                design_tc=design_tc,
+            )
         except Exception as e:
             print(f"  Warning: Could not compute condition correlations for run {run_idx + 1}: {e}")
 
@@ -968,7 +1375,18 @@ def _run_single_ica(
                 device=device,
             )
             if ort_tc is not None:
+                ort_tc = _preprocess_design_for_correlation(
+                    design_tc=ort_tc,
+                    tr=tr,
+                    polort=polort,
+                    high_pass_hz=args.high_pass,
+                    device=device,
+                )
                 ortvec_corr = component_condition_correlations(mixing_tk=mixing, design_tc=ort_tc)
+                ortvec_spectral_corr = _component_condition_spectral_correlations(
+                    mixing_tk=mixing,
+                    design_tc=ort_tc,
+                )
         except Exception as e:
             print(f"  Warning: Could not compute ortvec correlations for run {run_idx + 1}: {e}")
 
@@ -1031,6 +1449,25 @@ def _run_single_ica(
         )
         _vprint(args.verbose, f"Correlation plot saved: {corr_plot}")
 
+    spectral_blocks = []
+    spectral_labels = []
+    if condition_spectral_corr is not None and cond_labels is not None:
+        spectral_blocks.append(condition_spectral_corr)
+        spectral_labels.extend(cond_labels)
+    if ortvec_spectral_corr is not None and ortvec_labels is not None:
+        spectral_blocks.append(ortvec_spectral_corr)
+        spectral_labels.extend(ortvec_labels)
+    if len(spectral_blocks) > 0 and len(spectral_labels) > 0:
+        spectral_all = np.concatenate(spectral_blocks, axis=1).astype(np.float32)
+        spectral_plot = Path(f"{out_prefix}_{run_tag}_component_spectral_correlations.png")
+        _save_corr_heatmap(
+            corr_kn=spectral_all,
+            labels=spectral_labels,
+            out_png=spectral_plot,
+            title=f"Run {run_idx + 1}: component spectral correlations",
+        )
+        _vprint(args.verbose, f"Spectral correlation plot saved: {spectral_plot}")
+
     # --- Mixture model z-maps ---
     mixture_meta = []
     z_maps = None
@@ -1078,6 +1515,93 @@ def _run_single_ica(
         )
         _vprint(args.verbose, "Z-maps and signal-prob maps saved")
 
+    # --- Good/Bad guidance scoring (spatial + temporal) ---
+    spatial_scores_good = np.zeros(comp_np.shape[0], dtype=np.float32)
+    spatial_scores_bad = np.zeros(comp_np.shape[0], dtype=np.float32)
+    temporal_good_scores = np.zeros(comp_np.shape[0], dtype=np.float32)
+    temporal_bad_scores = np.zeros(comp_np.shape[0], dtype=np.float32)
+    good_mask_score_table: dict[str, list[float]] = {}
+    bad_mask_score_table: dict[str, list[float]] = {}
+
+    # Explicitly: onsets/durations are GOOD guide, ortvec is BAD guide.
+    if condition_corr is not None:
+        temporal_good_scores = np.max(np.abs(condition_corr), axis=1).astype(np.float32)
+    if ortvec_corr is not None:
+        temporal_bad_scores = np.max(np.abs(ortvec_corr), axis=1).astype(np.float32)
+
+    for entry in guidance_good_masks:
+        selector = entry["selector"]
+        if z_maps is not None:
+            s = _mean_z_excess_by_selector(z_maps, selector, z_thresh=float(args.good_z_thresh))
+        else:
+            # Fallback if z-maps disabled: use abs(IC) magnitude guide.
+            s = _mean_abs_by_selector(comp_np, selector)
+        spatial_scores_good += s
+        good_mask_score_table[entry["name"]] = s.tolist()
+
+    for entry in guidance_bad_masks:
+        selector = entry["selector"]
+        s = _mean_abs_by_selector(comp_np, selector)
+        spatial_scores_bad += s
+        bad_mask_score_table[entry["name"]] = s.tolist()
+
+    if len(guidance_good_masks) > 0:
+        spatial_scores_good /= float(len(guidance_good_masks))
+    if len(guidance_bad_masks) > 0:
+        spatial_scores_bad /= float(len(guidance_bad_masks))
+
+    # Normalize to [0,1] before combining terms from different units/scales.
+    spatial_good_norm = _normalize_0_1(spatial_scores_good)
+    spatial_bad_norm = _normalize_0_1(spatial_scores_bad)
+    temporal_good_norm = _normalize_0_1(temporal_good_scores)
+    temporal_bad_norm = _normalize_0_1(temporal_bad_scores)
+
+    overall_good = 0.65 * spatial_good_norm + 0.35 * temporal_good_norm
+    overall_bad = 0.65 * spatial_bad_norm + 0.35 * temporal_bad_norm
+    good_minus_bad = overall_good - overall_bad
+
+    comp_labels = np.full(comp_np.shape[0], "uncertain", dtype=object)
+    comp_labels[good_minus_bad >= 0.15] = "good"
+    comp_labels[good_minus_bad <= -0.15] = "bad"
+
+    # Depth profiles (machinery setup for later lag-by-depth work).
+    depth_profile_abs: dict[str, list[float]] = {}
+    depth_profile_zexcess: dict[str, list[float]] = {}
+    if depth_mask_info is not None:
+        for lbl in depth_mask_info["labels"]:
+            sel = depth_mask_info["selectors"][lbl]
+            depth_profile_abs[str(lbl)] = _mean_abs_by_selector(comp_np, sel).tolist()
+            if z_maps is not None:
+                depth_profile_zexcess[str(lbl)] = _mean_z_excess_by_selector(
+                    z_maps, sel, z_thresh=float(args.good_z_thresh)
+                ).tolist()
+
+    # Optional per-mask score plots for quick visual QA.
+    guidance_good_plot = None
+    guidance_bad_plot = None
+    if len(good_mask_score_table) > 0:
+        labels = list(good_mask_score_table.keys())
+        table = np.column_stack([np.asarray(good_mask_score_table[k], dtype=np.float32) for k in labels])
+        guidance_good_plot = Path(f"{out_prefix}_{run_tag}_goodmask_scores.png")
+        _save_score_heatmap(
+            scores_kn=table,
+            labels=labels,
+            out_png=guidance_good_plot,
+            title=f"Run {run_idx + 1}: good-mask scores (z>{args.good_z_thresh:g})",
+            cmap="Blues",
+        )
+    if len(bad_mask_score_table) > 0:
+        labels = list(bad_mask_score_table.keys())
+        table = np.column_stack([np.asarray(bad_mask_score_table[k], dtype=np.float32) for k in labels])
+        guidance_bad_plot = Path(f"{out_prefix}_{run_tag}_badmask_scores.png")
+        _save_score_heatmap(
+            scores_kn=table,
+            labels=labels,
+            out_png=guidance_bad_plot,
+            title=f"Run {run_idx + 1}: bad-mask scores (abs IC)",
+            cmap="Reds",
+        )
+
     if args.melodic_compat:
         is_single_run = int(getattr(args, "_n_runs_total", 1)) == 1
         compat_dir = (
@@ -1109,6 +1633,128 @@ def _run_single_ica(
         )
         _vprint(args.verbose, f"MELODIC melodic_IC target: {ic_target}")
         _vprint(args.verbose, f"MELODIC-compatible outputs: {compat_dir}")
+
+    # --- Depth lag analysis (post-step for BOLD-like depth delay signatures) ---
+    depth_lag_results: list[dict] = []
+    depth_lag_matrix_seconds = None
+    depth_lag_matrix_r = None
+    depth_lag_plot = None
+    depth_lag_method = None
+    if args.depth_lag and depth_mask_info is not None and z_maps is not None and depth_source_vox_t_np is not None:
+        _vsection(args.verbose, "Depth Lag Analysis")
+        t_step = time.time()
+
+        depth_source_proc = depth_source_vox_t_np
+        if args.depth_lag_match_preproc:
+            src_tc = torch.as_tensor(depth_source_vox_t_np, device=device, dtype=torch.float32)
+            src_tc = apply_polort_projection(src_tc, polort=polort, device=device)
+            if args.high_pass is not None and args.high_pass > 0:
+                src_tc = apply_high_pass_fft(src_tc, tr=tr, high_pass_hz=args.high_pass)
+            depth_source_proc = src_tc.detach().cpu().numpy().astype(np.float32)
+            del src_tc
+
+        depth_labels = [int(v) for v in depth_mask_info["labels"]]
+        n_comp = int(comp_np.shape[0])
+        depth_lag_matrix_seconds = np.full((n_comp, len(depth_labels)), np.nan, dtype=np.float32)
+        depth_lag_matrix_r = np.full((n_comp, len(depth_labels)), np.nan, dtype=np.float32)
+
+        for ci in range(n_comp):
+            z_w = np.where(z_maps[ci] > float(args.depth_lag_z_thresh), z_maps[ci], 0.0).astype(np.float32)
+
+            depth_ts: dict[int, np.ndarray] = {}
+            depth_nvox: dict[int, int] = {}
+            for lbl in depth_labels:
+                selector = depth_mask_info["selectors"][lbl]
+                ts, n_use = _weighted_depth_timeseries(
+                    source_vox_t=depth_source_proc,
+                    selector_v=selector,
+                    weight_v=z_w,
+                    min_voxels=int(args.depth_lag_min_voxels),
+                )
+                depth_nvox[int(lbl)] = int(n_use)
+                if ts is not None:
+                    depth_ts[int(lbl)] = ts
+
+            ref_depth = int(args.depth_lag_reference_depth)
+            if ref_depth not in depth_ts:
+                depth_lag_results.append(
+                    {
+                        "component_index": int(ci + 1),
+                        "status": "missing_reference_depth",
+                        "reference_depth": ref_depth,
+                        "n_weighted_voxels_by_depth": depth_nvox,
+                    }
+                )
+                continue
+
+            lag_by_depth: dict[str, float | None] = {}
+            r_by_depth: dict[str, float | None] = {}
+            used_depths: list[int] = []
+            used_lags_s: list[float] = []
+
+            for dj, lbl in enumerate(depth_labels):
+                lbl_i = int(lbl)
+                if lbl_i not in depth_ts:
+                    lag_by_depth[str(lbl_i)] = None
+                    r_by_depth[str(lbl_i)] = None
+                    continue
+                lag_s, r_val, method = _best_lag_and_r(
+                    x_t=depth_ts[lbl_i],
+                    y_t=depth_ts[ref_depth],
+                    tr=tr,
+                    max_lag_s=float(args.depth_lag_max_lag_s),
+                )
+                depth_lag_matrix_seconds[ci, dj] = float(lag_s)
+                depth_lag_matrix_r[ci, dj] = float(r_val)
+                lag_by_depth[str(lbl_i)] = float(lag_s)
+                r_by_depth[str(lbl_i)] = float(r_val)
+                if lbl_i != ref_depth:
+                    used_depths.append(lbl_i)
+                    used_lags_s.append(float(lag_s))
+                depth_lag_method = method
+
+            if len(used_depths) >= 3:
+                rho, pval = spearmanr(np.asarray(used_depths, dtype=np.float64), np.asarray(used_lags_s, dtype=np.float64))
+                rho_f = None if not np.isfinite(rho) else float(rho)
+                pval_f = None if not np.isfinite(pval) else float(pval)
+            else:
+                rho_f, pval_f = None, None
+
+            depth_lag_results.append(
+                {
+                    "component_index": int(ci + 1),
+                    "status": "ok",
+                    "reference_depth": ref_depth,
+                    "n_weighted_voxels_by_depth": depth_nvox,
+                    "lag_seconds_by_depth": lag_by_depth,
+                    "peak_r_by_depth": r_by_depth,
+                    "spearman_depth_vs_lag": {
+                        "rho": rho_f,
+                        "pvalue": pval_f,
+                        "n_depths": int(len(used_depths)),
+                    },
+                }
+            )
+
+        depth_lag_plot = Path(f"{out_prefix}_{run_tag}_depth_lag_seconds.png")
+        _save_depth_lag_plot(
+            lag_matrix_kd=depth_lag_matrix_seconds,
+            depth_labels=depth_labels,
+            out_png=depth_lag_plot,
+            title=(
+                f"Run {run_idx + 1}: depth lag vs depth {int(args.depth_lag_reference_depth)} "
+                f"(z>{args.depth_lag_z_thresh:g})"
+            ),
+        )
+        _vprint(
+            args.verbose,
+            (
+                f"Depth lag done for {len(depth_lag_results)} components "
+                f"(ref depth={int(args.depth_lag_reference_depth)}, "
+                f"z>{args.depth_lag_z_thresh:g})"
+            ),
+            t_step,
+        )
 
     elapsed_total = time.time() - t_total
     _vprint(args.verbose, f"Run {run_idx + 1} total elapsed: {elapsed_total:.1f}s")
@@ -1151,9 +1797,82 @@ def _run_single_ica(
         },
         "condition_labels": cond_labels,
         "condition_durations": cond_durations,
+        "condition_corr_preprocessing": {
+            "polort": int(polort),
+            "high_pass_hz": None if args.high_pass is None else float(args.high_pass),
+            "note": "Condition and ortvec vectors are preprocessed to match ICA data temporal filtering",
+        },
         "component_condition_corr": None if condition_corr is None else condition_corr.tolist(),
+        "component_condition_spectral_corr": None
+        if condition_spectral_corr is None
+        else condition_spectral_corr.tolist(),
         "ortvec_labels": ortvec_labels,
         "component_ortvec_corr": None if ortvec_corr is None else ortvec_corr.tolist(),
+        "component_ortvec_spectral_corr": None
+        if ortvec_spectral_corr is None
+        else ortvec_spectral_corr.tolist(),
+        "spatial_guidance": {
+            "good_masks": [
+                {
+                    "name": m["name"],
+                    "source": m["source"],
+                    "n_voxels": int(m["n_voxels"]),
+                }
+                for m in guidance_good_masks
+            ],
+            "bad_masks": [
+                {
+                    "name": m["name"],
+                    "source": m["source"],
+                    "n_voxels": int(m["n_voxels"]),
+                }
+                for m in guidance_bad_masks
+            ],
+            "good_z_thresh": float(args.good_z_thresh),
+            "temporal_guide_roles": {
+                "onsets_durations": "good",
+                "ortvec": "bad",
+            },
+            "component_scores": [
+                {
+                    "component_index": int(ci + 1),
+                    "spatial_good": float(spatial_scores_good[ci]),
+                    "spatial_bad": float(spatial_scores_bad[ci]),
+                    "temporal_good": float(temporal_good_scores[ci]),
+                    "temporal_bad": float(temporal_bad_scores[ci]),
+                    "overall_good": float(overall_good[ci]),
+                    "overall_bad": float(overall_bad[ci]),
+                    "good_minus_bad": float(good_minus_bad[ci]),
+                    "label": str(comp_labels[ci]),
+                }
+                for ci in range(comp_np.shape[0])
+            ],
+            "good_mask_score_table": good_mask_score_table,
+            "bad_mask_score_table": bad_mask_score_table,
+            "depth_mask": None
+            if depth_mask_info is None
+            else {
+                "path": depth_mask_info["path"],
+                "labels": [int(v) for v in depth_mask_info["labels"]],
+                "component_depth_abs_profile": depth_profile_abs,
+                "component_depth_zexcess_profile": depth_profile_zexcess,
+            },
+            "depth_lag": {
+                "enabled": bool(args.depth_lag),
+                "use_unsmoothed_source": bool(args.depth_lag_use_unsmoothed),
+                "match_temporal_preproc": bool(args.depth_lag_match_preproc),
+                "reference_depth": int(args.depth_lag_reference_depth),
+                "z_thresh": float(args.depth_lag_z_thresh),
+                "min_voxels": int(args.depth_lag_min_voxels),
+                "max_lag_seconds": float(args.depth_lag_max_lag_s),
+                "lag_method": depth_lag_method,
+                "component_results": depth_lag_results,
+                "lag_seconds_matrix": None
+                if depth_lag_matrix_seconds is None
+                else depth_lag_matrix_seconds.tolist(),
+                "peak_r_matrix": None if depth_lag_matrix_r is None else depth_lag_matrix_r.tolist(),
+            },
+        },
         "mixture_model": mixture_meta if args.save_mixture_z else None,
         "outputs": {
             "ica_maps": f"{out_prefix}_{run_tag}_ica_maps.nii.gz",
@@ -1162,6 +1881,12 @@ def _run_single_ica(
             "component_correlation_plot": f"{out_prefix}_{run_tag}_component_correlations.png"
             if len(corr_blocks) > 0
             else None,
+            "component_spectral_correlation_plot": f"{out_prefix}_{run_tag}_component_spectral_correlations.png"
+            if len(spectral_blocks) > 0
+            else None,
+            "goodmask_score_plot": None if guidance_good_plot is None else str(guidance_good_plot),
+            "badmask_score_plot": None if guidance_bad_plot is None else str(guidance_bad_plot),
+            "depth_lag_plot": None if depth_lag_plot is None else str(depth_lag_plot),
             "ica_zmaps": f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz"
             if args.save_mixture_z
             else None,
@@ -1393,6 +2118,106 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    spatial = parser.add_argument_group("Spatial guidance (component labeling)")
+    spatial.add_argument(
+        "-good_mask",
+        action="append",
+        default=None,
+        help=(
+            "Repeatable GOOD spatial mask. Supports 3D binary masks, 3D integer-label masks "
+            "(one mask per positive label), or 4D masks (one mask per frame). "
+            "Good score uses thresholded |z|-map excess in these regions."
+        ),
+    )
+    spatial.add_argument(
+        "-bad_mask",
+        action="append",
+        default=None,
+        help=(
+            "Repeatable BAD spatial mask. Supports 3D/4D/label-mask forms like -good_mask. "
+            "Bad score uses mean abs(IC) magnitude in these regions."
+        ),
+    )
+    spatial.add_argument(
+        "-good_z_thresh",
+        type=float,
+        default=2.3,
+        help="Z threshold used for GOOD-mask spatial scoring on |z|-maps (default: 2.3)",
+    )
+    spatial.add_argument(
+        "-depth_mask",
+        type=str,
+        default=None,
+        help=(
+            "Optional 3D integer depth-label map (cortical depth bins). "
+            "Current version records per-component depth profiles to metadata "
+            "for future lag-by-depth analysis."
+        ),
+    )
+    spatial.add_argument(
+        "-depth_lag",
+        dest="depth_lag",
+        action="store_true",
+        default=True,
+        help="Enable post-hoc depth lag analysis when -depth_mask is provided (default: on)",
+    )
+    spatial.add_argument(
+        "-no_depth_lag",
+        dest="depth_lag",
+        action="store_false",
+        help="Disable depth lag analysis even if -depth_mask is provided",
+    )
+    spatial.add_argument(
+        "-depth_lag_reference_depth",
+        type=int,
+        default=3,
+        help="Reference depth label for lag estimation (default: 3)",
+    )
+    spatial.add_argument(
+        "-depth_lag_z_thresh",
+        type=float,
+        default=2.3,
+        help="Component z threshold used to build depth-weighted timeseries (default: 2.3)",
+    )
+    spatial.add_argument(
+        "-depth_lag_min_voxels",
+        type=int,
+        default=20,
+        help="Minimum weighted voxels per depth required for lag estimation (default: 20)",
+    )
+    spatial.add_argument(
+        "-depth_lag_max_lag_s",
+        type=float,
+        default=6.0,
+        help="Maximum absolute lag (seconds) searched in xcorr (default: 6.0)",
+    )
+    spatial.add_argument(
+        "-depth_lag_match_preproc",
+        dest="depth_lag_match_preproc",
+        action="store_true",
+        default=True,
+        help="Apply same polort/high-pass preprocessing to depth source timeseries before lag analysis (default: on)",
+    )
+    spatial.add_argument(
+        "-no_depth_lag_match_preproc",
+        dest="depth_lag_match_preproc",
+        action="store_false",
+        help="Skip temporal preprocessing on depth source timeseries for lag analysis",
+    )
+    spatial.add_argument(
+        "-depth_lag_use_unsmoothed",
+        dest="depth_lag_use_unsmoothed",
+        action="store_true",
+        default=True,
+        help="Use unsmoothed run data (if available) as source for depth lag timeseries (default: on)",
+    )
+    spatial.add_argument(
+        "-no_depth_lag_use_unsmoothed",
+        dest="depth_lag_use_unsmoothed",
+        action="store_false",
+        help="Use current (possibly blurred) data as source for depth lag timeseries",
+    )
+
     out = parser.add_argument_group("Output")
     out.add_argument(
         "-save_mixture_z",
@@ -1466,6 +2291,16 @@ def main() -> None:
         raise ValueError("Use -onsets and -durations together for task correlation annotation")
     if args.onset_row is not None and args.onset_row < 1:
         raise ValueError("-onset_row must be >= 1 (1-based indexing)")
+    if args.good_z_thresh <= 0:
+        raise ValueError("-good_z_thresh must be > 0")
+    if args.depth_lag_reference_depth < 1:
+        raise ValueError("-depth_lag_reference_depth must be >= 1")
+    if args.depth_lag_z_thresh <= 0:
+        raise ValueError("-depth_lag_z_thresh must be > 0")
+    if args.depth_lag_min_voxels < 1:
+        raise ValueError("-depth_lag_min_voxels must be >= 1")
+    if args.depth_lag_max_lag_s <= 0:
+        raise ValueError("-depth_lag_max_lag_s must be > 0")
 
     # --- Resolve high-pass cutoff: Hz vs seconds ---
     if args.high_pass is not None and args.high_pass_s is not None:
@@ -1499,6 +2334,15 @@ def main() -> None:
                     f"-ortvec {spec[0]} has {n_files} files; expected 1 or {len(input_files)}"
                 )
 
+    for flag_name, paths in [("-good_mask", args.good_mask), ("-bad_mask", args.bad_mask)]:
+        if paths is None:
+            continue
+        for p in paths:
+            if not Path(p).exists():
+                raise FileNotFoundError(f"{flag_name} file not found: {p}")
+    if args.depth_mask is not None and not Path(args.depth_mask).exists():
+        raise FileNotFoundError(f"-depth_mask file not found: {args.depth_mask}")
+
     args._n_runs_total = len(input_files)
     device = torch.device("cpu") if args.cpu else get_device()
 
@@ -1517,6 +2361,20 @@ def main() -> None:
         if args.high_pass:
             print(f"High-pass: {args.high_pass:.6f} Hz ({1.0 / args.high_pass:.1f}s period)")
         print(f"Polort: {args.polort if args.polort is not None else '0 (demean)'}")
+        print(
+            f"Spatial guidance: good_masks={0 if args.good_mask is None else len(args.good_mask)}, "
+            f"bad_masks={0 if args.bad_mask is None else len(args.bad_mask)}, "
+            f"depth_mask={'yes' if args.depth_mask else 'no'}"
+        )
+        if args.depth_mask:
+            print(
+                "Depth lag: "
+                f"enabled={args.depth_lag}, ref={args.depth_lag_reference_depth}, "
+                f"z>{args.depth_lag_z_thresh:g}, maxlag={args.depth_lag_max_lag_s:g}s, "
+                f"minvox={args.depth_lag_min_voxels}, "
+                f"match_preproc={args.depth_lag_match_preproc}, "
+                f"use_unsmoothed={args.depth_lag_use_unsmoothed}"
+            )
 
     shared_mask = None
     if args.mask is not None:
