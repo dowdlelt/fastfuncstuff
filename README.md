@@ -22,10 +22,18 @@ pip install -e .
 ```
 
 ### Requirements
-- Python ≥ 3.8
+- Python ≥ 3.12
 - PyTorch ≥ 2.0 (with MPS/CUDA support recommended)
 - NumPy, SciPy
 - Matplotlib (for examples)
+
+Install from a fresh clone:
+
+```bash
+git clone <your-repo-url>
+cd fastfuncsim
+pip install -e .
+```
 
 ## Quick Start
 
