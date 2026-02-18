@@ -23,7 +23,6 @@ For help:
 """
 
 import argparse
-import glob as glob_module
 import json
 import sys
 from datetime import datetime
@@ -47,11 +46,13 @@ try:
         load_nifti,
     )
     from fastfuncsim.cli_utils import (
+        LoadResult,
         auto_polort,
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
-        LoadResult,
+        parse_cv_strategy,
+        parse_input_files,
         preflight_check,
     )
     from fastfuncsim.denoise import (
@@ -77,32 +78,6 @@ except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
     sys.exit(1)
-
-
-def parse_input_files(input_arg: Union[str, list[str]]) -> list[str]:
-    """Parse input files (can be list from nargs='+' or single string)"""
-    if isinstance(input_arg, str):
-        input_arg = input_arg.strip().strip('"').strip("'")
-        input_list = input_arg.split()
-    else:
-        input_list = input_arg
-
-    # Expand globs and collect files
-    files = []
-    for pattern in input_list:
-        matches = glob_module.glob(pattern)
-        if matches:
-            files.extend(sorted(matches))
-        else:
-            files.append(pattern)
-
-    # Validate files exist
-    for f in files:
-        if not Path(f).exists():
-            print(f"ERROR: Input file not found: {f}")
-            sys.exit(1)
-
-    return files
 
 
 def create_parser():
@@ -560,31 +535,6 @@ Notes:
     return parser
 
 
-def parse_cv_strategy(cv_str: str) -> Union[int, float]:
-    """Parse CV strategy string into int or float."""
-    cv_str = cv_str.lower().strip()
-
-    if cv_str in ["loro", "loo"]:
-        return 1  # Leave-one-run-out
-
-    try:
-        # Try parsing as float first
-        val = float(cv_str)
-        if val == int(val) and val > 1:
-            return int(val)  # Leave-N-out
-        elif 0 < val < 1:
-            return val  # Split fraction
-        elif val == 1:
-            return 1  # LORO
-        else:
-            print(f"ERROR: Invalid cv_strategy value: {cv_str}")
-            print("  Must be 'loro', int > 0, or float in (0, 1)")
-            sys.exit(1)
-    except ValueError:
-        print(f"ERROR: Could not parse cv_strategy: {cv_str}")
-        sys.exit(1)
-
-
 def print_header(args):
     """Print program header"""
     print("=" * 70)
@@ -932,8 +882,9 @@ def save_denoising_results(
         scree_ratio = results.metadata.get("noise_pool_pca_scree_ratio_per_run")
         if scree_ratio is not None and len(scree_ratio) > 0:
             try:
-                from fastfuncsim.visualization import plot_noise_pool_pca_scree
                 import matplotlib.pyplot as plt
+
+                from fastfuncsim.visualization import plot_noise_pool_pca_scree
 
                 fig_prefix = f"{output_prefix}_figures"
                 Path(fig_prefix).mkdir(parents=True, exist_ok=True)
@@ -2503,8 +2454,9 @@ def main():
 
         if args.scree_plot and noise_pool_scree_ratio_per_run is not None:
             try:
-                from fastfuncsim.visualization import plot_noise_pool_pca_scree
                 import matplotlib
+
+                from fastfuncsim.visualization import plot_noise_pool_pca_scree
 
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
@@ -2525,11 +2477,12 @@ def main():
         # 9. Generate diagnostic plots (if requested)
         if args.plots in ["yes", "full"]:
             try:
+                import matplotlib
+
                 from fastfuncsim.visualization import (
                     plot_denoising_pcs,
                     plot_denoising_summary,
                 )
-                import matplotlib
 
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt

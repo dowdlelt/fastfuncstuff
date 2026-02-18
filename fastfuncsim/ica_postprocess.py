@@ -457,3 +457,19 @@ def component_condition_spectral_correlations(
     sxz = sx / sx_std
     syz = sy / sy_std
     return (sxz.T @ syz) / float(sxz.shape[0])
+
+
+def auto_mask_from_data(data_4d: np.ndarray, verbose: bool = False) -> np.ndarray:
+    """Compute a simple brain mask from temporal mean intensity."""
+    mean_img = data_4d.mean(axis=-1)
+    robust_max = float(np.percentile(mean_img[mean_img > 0], 98)) if (mean_img > 0).any() else 1.0
+    thresh = robust_max * 0.10
+    mask = mean_img > thresh
+    if verbose:
+        n_total = int(np.prod(mask.shape))
+        n_brain = int(mask.sum())
+        print(
+            f"    Auto-mask: {n_brain:,} / {n_total:,} voxels "
+            f"({100 * n_brain / max(1, n_total):.1f}%) thresh={thresh:.2f}"
+        )
+    return mask

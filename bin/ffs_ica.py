@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -35,17 +34,20 @@ import numpy as np
 import torch
 from scipy.stats import spearmanr
 
-try:
-    import nibabel as nib
-except ImportError:
-    print("ERROR: nibabel is required. Install with: pip install nibabel")
-    sys.exit(1)
-
 # fastfuncsim imports
 try:
     from fastfuncsim.afni_io import get_tr_from_file, load_afni_mask, load_nifti
     from fastfuncsim.cli_utils import parse_input_files, print_cli_header
+    from fastfuncsim.decomposition_io import (
+        save_masked_component_maps_4d as _save_components_4d,
+    )
+    from fastfuncsim.decomposition_io import (
+        write_melodic_compat_outputs as _write_melodic_compat_outputs,
+    )
     from fastfuncsim.ica import FastICA
+    from fastfuncsim.ica_postprocess import (
+        auto_mask_from_data as _auto_mask,
+    )
     from fastfuncsim.ica_postprocess import (
         best_lag_and_r as _best_lag_and_r,
     )
@@ -109,123 +111,6 @@ except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
     sys.exit(1)
-
-
-def _save_components_4d(
-    components_kv: np.ndarray,
-    mask3d: np.ndarray,
-    shape3d: tuple[int, int, int],
-    affine: np.ndarray,
-    out_file: Path,
-):
-    k, n_vox = components_kv.shape
-    out = np.zeros((*shape3d, k), dtype=np.float32)
-    if mask3d is None:
-        if np.prod(shape3d) != n_vox:
-            raise ValueError("Component size does not match full volume size")
-        for i in range(k):
-            out[..., i] = components_kv[i].reshape(shape3d)
-    else:
-        flat_mask = mask3d.reshape(-1)
-        for i in range(k):
-            vol = np.zeros(flat_mask.shape[0], dtype=np.float32)
-            vol[flat_mask] = components_kv[i]
-            out[..., i] = vol.reshape(shape3d)
-
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(out, affine), str(out_file))
-
-
-def _save_component_3d(
-    component_v: np.ndarray,
-    mask3d: np.ndarray | None,
-    shape3d: tuple[int, int, int],
-    affine: np.ndarray,
-    out_file: Path,
-):
-    n_vox = component_v.shape[0]
-    if mask3d is None:
-        if np.prod(shape3d) != n_vox:
-            raise ValueError("Component size does not match full volume size")
-        out = component_v.reshape(shape3d).astype(np.float32)
-    else:
-        flat_mask = mask3d.reshape(-1)
-        out = np.zeros(flat_mask.shape[0], dtype=np.float32)
-        out[flat_mask] = component_v.astype(np.float32)
-        out = out.reshape(shape3d)
-
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(out, affine), str(out_file))
-
-
-def _safe_symlink(target: Path, link_path: Path):
-    link_path.parent.mkdir(parents=True, exist_ok=True)
-    if link_path.exists() or link_path.is_symlink():
-        link_path.unlink()
-    rel_target = os.path.relpath(str(target), start=str(link_path.parent))
-    link_path.symlink_to(rel_target)
-
-
-def _write_melodic_compat_outputs(
-    compat_dir: Path,
-    maps_file: Path,
-    zmaps_file: Path | None,
-    timecourse_file: Path,
-    pca_scree_ratio: np.ndarray,
-    component_explained_share_pct: np.ndarray,
-    component_total_share_pct: np.ndarray,
-    mixing_np: np.ndarray,
-    mask3d: np.ndarray | None,
-    mean3d: np.ndarray,
-    shape3d: tuple[int, int, int],
-    affine: np.ndarray,
-    z_maps: np.ndarray | None = None,
-    p_maps: np.ndarray | None = None,
-    thresh_z_maps: np.ndarray | None = None,
-):
-    compat_dir.mkdir(parents=True, exist_ok=True)
-
-    ic_file = zmaps_file if (zmaps_file is not None and zmaps_file.exists()) else maps_file
-    _safe_symlink(ic_file, compat_dir / "melodic_IC.nii.gz")
-    _safe_symlink(timecourse_file, compat_dir / "melodic_mix")
-    _safe_symlink(timecourse_file, compat_dir / "melodic_Tmodes")
-
-    nib.save(nib.Nifti1Image(mean3d.astype(np.float32), affine), str(compat_dir / "mean.nii.gz"))
-    if mask3d is None:
-        mask_out = np.ones(shape3d, dtype=np.float32)
-    else:
-        mask_out = mask3d.astype(np.float32)
-    nib.save(nib.Nifti1Image(mask_out, affine), str(compat_dir / "mask.nii.gz"))
-
-    ftmix = np.abs(np.fft.rfft(mixing_np, axis=0)) ** 2
-    if ftmix.shape[0] > 1:
-        ftmix = ftmix[1:, :]
-    np.savetxt(compat_dir / "melodic_FTmix", ftmix, fmt="%.8f")
-
-    icstats = np.column_stack([component_explained_share_pct, component_total_share_pct])
-    np.savetxt(compat_dir / "melodic_ICstats", icstats, fmt="%.8f")
-    np.savetxt(compat_dir / "eigenvalues_percent", pca_scree_ratio * 100.0, fmt="%.8f")
-
-    if z_maps is not None and p_maps is not None:
-        stats_dir = compat_dir / "stats"
-        stats_dir.mkdir(parents=True, exist_ok=True)
-        n_comp = z_maps.shape[0]
-        for i in range(n_comp):
-            _save_component_3d(
-                component_v=p_maps[i],
-                mask3d=mask3d,
-                shape3d=shape3d,
-                affine=affine,
-                out_file=stats_dir / f"probmap_{i + 1}.nii.gz",
-            )
-            if thresh_z_maps is not None:
-                _save_component_3d(
-                    component_v=thresh_z_maps[i],
-                    mask3d=mask3d,
-                    shape3d=shape3d,
-                    affine=affine,
-                    out_file=stats_dir / f"thresh_zstat{i + 1}.nii.gz",
-                )
 
 
 def _estimate_spatial_smoothness_resels(
@@ -341,26 +226,6 @@ def _estimate_spatial_smoothness_resels(
     resels = FWHM[0] * FWHM[1] * FWHM[2]
     fwhm_geo = float(np.cbrt(resels))
     return resels, fwhm_geo
-
-
-def _auto_mask(data: np.ndarray, verbose: bool = False) -> np.ndarray:
-    """Compute a brain mask from mean intensity (Otsu-style threshold).
-
-    Uses the temporal mean image, then threshold at 10% of the 98th
-    percentile (robust max) to separate brain from background.
-    """
-    mean_img = data.mean(axis=-1)
-    robust_max = float(np.percentile(mean_img[mean_img > 0], 98)) if (mean_img > 0).any() else 1.0
-    thresh = robust_max * 0.10
-    mask = mean_img > thresh
-    if verbose:
-        n_total = int(np.prod(mask.shape))
-        n_brain = int(mask.sum())
-        print(
-            f"    Auto-mask: {n_brain:,} / {n_total:,} voxels "
-            f"({100 * n_brain / max(1, n_total):.1f}%) thresh={thresh:.2f}"
-        )
-    return mask
 
 
 def _check_finite(t: torch.Tensor, label: str, verbose: bool = False) -> torch.Tensor:

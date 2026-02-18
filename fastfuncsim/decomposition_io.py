@@ -6,6 +6,7 @@ compatible with AFNI and other neuroimaging tools.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
@@ -14,6 +15,140 @@ import numpy as np
 import torch
 
 from .afni_io import get_tr_from_file
+
+
+def save_masked_component_maps_4d(
+    components_kv: np.ndarray,
+    mask3d: np.ndarray | None,
+    shape3d: tuple[int, int, int],
+    affine: np.ndarray,
+    out_file: Union[str, Path],
+) -> Path:
+    """Save (n_components, n_voxels) maps into a 4D image with optional masking."""
+    k, n_vox = components_kv.shape
+    out = np.zeros((*shape3d, k), dtype=np.float32)
+    if mask3d is None:
+        if np.prod(shape3d) != n_vox:
+            raise ValueError("Component size does not match full volume size")
+        for i in range(k):
+            out[..., i] = components_kv[i].reshape(shape3d)
+    else:
+        flat_mask = mask3d.reshape(-1)
+        for i in range(k):
+            vol = np.zeros(flat_mask.shape[0], dtype=np.float32)
+            vol[flat_mask] = components_kv[i]
+            out[..., i] = vol.reshape(shape3d)
+
+    out_path = Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(nib.Nifti1Image(out, affine), str(out_path))
+    return out_path
+
+
+def save_masked_component_map_3d(
+    component_v: np.ndarray,
+    mask3d: np.ndarray | None,
+    shape3d: tuple[int, int, int],
+    affine: np.ndarray,
+    out_file: Union[str, Path],
+) -> Path:
+    """Save a single (n_voxels,) map into a 3D image with optional masking."""
+    n_vox = component_v.shape[0]
+    if mask3d is None:
+        if np.prod(shape3d) != n_vox:
+            raise ValueError("Component size does not match full volume size")
+        out = component_v.reshape(shape3d).astype(np.float32)
+    else:
+        flat_mask = mask3d.reshape(-1)
+        out = np.zeros(flat_mask.shape[0], dtype=np.float32)
+        out[flat_mask] = component_v.astype(np.float32)
+        out = out.reshape(shape3d)
+
+    out_path = Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(nib.Nifti1Image(out, affine), str(out_path))
+    return out_path
+
+
+def safe_relative_symlink(target: Union[str, Path], link_path: Union[str, Path]) -> Path:
+    """Create/replace symlink at link_path pointing to target via relative path."""
+    target_path = Path(target)
+    link = Path(link_path)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    rel_target = os.path.relpath(str(target_path), start=str(link.parent))
+    link.symlink_to(rel_target)
+    return link
+
+
+def write_melodic_compat_outputs(
+    compat_dir: Union[str, Path],
+    maps_file: Union[str, Path],
+    zmaps_file: Union[str, Path, None],
+    timecourse_file: Union[str, Path],
+    pca_scree_ratio: np.ndarray,
+    component_explained_share_pct: np.ndarray,
+    component_total_share_pct: np.ndarray,
+    mixing_np: np.ndarray,
+    mask3d: np.ndarray | None,
+    mean3d: np.ndarray,
+    shape3d: tuple[int, int, int],
+    affine: np.ndarray,
+    z_maps: np.ndarray | None = None,
+    p_maps: np.ndarray | None = None,
+    thresh_z_maps: np.ndarray | None = None,
+) -> Path:
+    """Write MELODIC-style compatibility files for ICA outputs."""
+    compat = Path(compat_dir)
+    maps = Path(maps_file)
+    zmap_path = Path(zmaps_file) if zmaps_file is not None else None
+    tcs = Path(timecourse_file)
+    compat.mkdir(parents=True, exist_ok=True)
+
+    ic_file = zmap_path if (zmap_path is not None and zmap_path.exists()) else maps
+    safe_relative_symlink(ic_file, compat / "melodic_IC.nii.gz")
+    safe_relative_symlink(tcs, compat / "melodic_mix")
+    safe_relative_symlink(tcs, compat / "melodic_Tmodes")
+
+    nib.save(nib.Nifti1Image(mean3d.astype(np.float32), affine), str(compat / "mean.nii.gz"))
+    if mask3d is None:
+        mask_out = np.ones(shape3d, dtype=np.float32)
+    else:
+        mask_out = mask3d.astype(np.float32)
+    nib.save(nib.Nifti1Image(mask_out, affine), str(compat / "mask.nii.gz"))
+
+    ftmix = np.abs(np.fft.rfft(mixing_np, axis=0)) ** 2
+    if ftmix.shape[0] > 1:
+        ftmix = ftmix[1:, :]
+    np.savetxt(compat / "melodic_FTmix", ftmix, fmt="%.8f")
+
+    icstats = np.column_stack([component_explained_share_pct, component_total_share_pct])
+    np.savetxt(compat / "melodic_ICstats", icstats, fmt="%.8f")
+    np.savetxt(compat / "eigenvalues_percent", pca_scree_ratio * 100.0, fmt="%.8f")
+
+    if z_maps is not None and p_maps is not None:
+        stats_dir = compat / "stats"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        n_comp = z_maps.shape[0]
+        for i in range(n_comp):
+            save_masked_component_map_3d(
+                component_v=p_maps[i],
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
+                out_file=stats_dir / f"probmap_{i + 1}.nii.gz",
+            )
+            if thresh_z_maps is not None:
+                save_masked_component_map_3d(
+                    component_v=thresh_z_maps[i],
+                    mask3d=mask3d,
+                    shape3d=shape3d,
+                    affine=affine,
+                    out_file=stats_dir / f"thresh_zstat{i + 1}.nii.gz",
+                )
+
+    return compat
 
 
 def save_component_maps(
