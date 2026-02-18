@@ -4,6 +4,7 @@ I/O utilities for PCA and ICA decomposition results
 Save and load PCA/ICA spatial maps and timeseries in NIfTI format,
 compatible with AFNI and other neuroimaging tools.
 """
+
 from __future__ import annotations
 
 import os
@@ -220,12 +221,9 @@ def save_component_maps(
             raise ValueError(f"Number of labels ({len(labels)}) != n_components ({n_components})")
 
         # AFNI-style sub-brick labels
-        label_str = '~'.join(labels)
+        label_str = "~".join(labels)
         output_img.header.extensions.append(
-            nib.nifti1.Nifti1Extension(
-                'afni',
-                f'BRICK_LABS={label_str}'.encode()
-            )
+            nib.nifti1.Nifti1Extension("afni", f"BRICK_LABS={label_str}".encode())
         )
 
     # Save
@@ -282,14 +280,14 @@ def load_component_maps(
     labels = None
     for ext in map_img.header.extensions:
         if ext.get_code() == 4:  # AFNI extension
-            content = ext.get_content().decode('utf-8')
-            if 'BRICK_LABS=' in content:
-                label_str = content.split('BRICK_LABS=')[1].split('\x00')[0]
-                labels = label_str.split('~')
+            content = ext.get_content().decode("utf-8")
+            if "BRICK_LABS=" in content:
+                label_str = content.split("BRICK_LABS=")[1].split("\x00")[0]
+                labels = label_str.split("~")
                 break
 
     if labels is None:
-        labels = [f'Component_{i}' for i in range(n_components)]
+        labels = [f"Component_{i}" for i in range(n_components)]
 
     return components, labels
 
@@ -341,21 +339,21 @@ def save_timeseries(
 
     output_path = Path(output_file)
 
-    if output_path.suffix == '.1D' or output_path.name.endswith('.1D'):
+    if output_path.suffix == ".1D" or output_path.name.endswith(".1D"):
         # Save as AFNI .1D format
-        with open(output_path, 'w') as f:
+        with open(output_path, "w") as f:
             # Write header with column labels if provided
             if labels is not None:
                 if len(labels) != n_components:
                     raise ValueError(
                         f"Number of labels ({len(labels)}) != n_components ({n_components})"
                     )
-                f.write('# ' + ' '.join(labels) + '\n')
+                f.write("# " + " ".join(labels) + "\n")
 
             # Write data
-            np.savetxt(f, timeseries, fmt='%.6f')
+            np.savetxt(f, timeseries, fmt="%.6f")
 
-    elif output_path.suffix == '.gz' or output_path.suffixes == ['.nii', '.gz']:
+    elif output_path.suffix == ".gz" or output_path.suffixes == [".nii", ".gz"]:
         # Save as NIfTI (1 x 1 x n_timepoints x n_components)
 
         # Get TR
@@ -372,17 +370,14 @@ def save_timeseries(
 
         # Create header with TR
         header = nib.Nifti1Header()
-        header['pixdim'][4] = tr
+        header["pixdim"][4] = tr
 
         # Create and save image
         img = nib.Nifti1Image(data_4d, affine, header)
         nib.save(img, str(output_path))
 
     else:
-        raise ValueError(
-            f"Unsupported file extension: {output_path.suffix}. "
-            f"Use .1D or .nii.gz"
-        )
+        raise ValueError(f"Unsupported file extension: {output_path.suffix}. Use .1D or .nii.gz")
 
 
 def load_timeseries(
@@ -411,15 +406,15 @@ def load_timeseries(
     """
     path = Path(timeseries_file)
 
-    if path.suffix == '.1D' or path.name.endswith('.1D'):
+    if path.suffix == ".1D" or path.name.endswith(".1D"):
         # Load AFNI .1D format
         labels = None
 
         # Try to read labels from header
         with open(path) as f:
             first_line = f.readline()
-            if first_line.startswith('#'):
-                labels = first_line.strip('# \n').split()
+            if first_line.startswith("#"):
+                labels = first_line.strip("# \n").split()
 
         # Load data
         timeseries = np.loadtxt(path)
@@ -430,7 +425,7 @@ def load_timeseries(
 
         return timeseries, labels
 
-    elif path.suffix == '.gz' or path.suffixes == ['.nii', '.gz']:
+    elif path.suffix == ".gz" or path.suffixes == [".nii", ".gz"]:
         # Load NIfTI
         img = nib.load(str(path))
         data = img.get_fdata()
@@ -462,7 +457,7 @@ def save_decomposition_results(
     tr: Optional[float] = None,
     reference_file: Optional[Union[str, Path]] = None,
     labels: Optional[list] = None,
-    method: str = 'ICA',
+    method: str = "ICA",
 ) -> Dict[str, Path]:
     """
     Save complete decomposition results (maps + timeseries)
@@ -514,8 +509,10 @@ def save_decomposition_results(
 
     # Generate labels if not provided
     if labels is None:
-        n_components = components.shape[0] if isinstance(components, np.ndarray) else components.shape[0]
-        labels = [f'{method}_{i:03d}' for i in range(n_components)]
+        n_components = (
+            components.shape[0] if isinstance(components, np.ndarray) else components.shape[0]
+        )
+        labels = [f"{method}_{i:03d}" for i in range(n_components)]
 
     # Save spatial maps
     maps_file = output_dir / f"{output_prefix.name}_maps.nii.gz"
@@ -526,6 +523,6 @@ def save_decomposition_results(
     save_timeseries(timeseries, ts_1d_file, labels=labels)
 
     return {
-        'maps': maps_file,
-        'timeseries_1D': ts_1d_file,
+        "maps": maps_file,
+        "timeseries_1D": ts_1d_file,
     }
