@@ -24,6 +24,18 @@ from .pca import PCA
 
 
 def parse_num_comps_spec(spec: str) -> int | float | str:
+    """Parse CLI component-count specification into normalized value.
+
+    Parameters
+    ----------
+    spec : str
+        User-provided component specification.
+
+    Returns
+    -------
+    int or float or str
+        Parsed numeric value, or normalized mode string.
+    """
     spec_norm = spec.strip().lower()
     if spec_norm in {"auto", "melodic", "hybrid", "current", "erank", "mp"}:
         return spec_norm
@@ -43,6 +55,22 @@ def apply_polort_projection(
     polort: int,
     device: torch.device,
 ) -> torch.Tensor:
+    """Project out polynomial trends from voxel time series.
+
+    Parameters
+    ----------
+    data_vox_t : Tensor, shape (n_vox, n_time)
+        Voxel-by-time matrix.
+    polort : int
+        Maximum polynomial degree to remove.
+    device : torch.device
+        Device used for polynomial basis construction.
+
+    Returns
+    -------
+    torch.Tensor
+        Detrended voxel-by-time matrix.
+    """
     if polort is None or polort < 0:
         return data_vox_t
     poly = construct_polynomial_matrix(
@@ -181,6 +209,18 @@ def apply_melodic_voxel_varnorm(
 
 
 def effective_rank_from_spectrum(evals: np.ndarray) -> int:
+    """Estimate effective rank from eigenvalue spectrum entropy.
+
+    Parameters
+    ----------
+    evals : np.ndarray
+        Nonnegative eigenvalue spectrum.
+
+    Returns
+    -------
+    int
+        Entropy-based effective rank clamped to valid range.
+    """
     ev = np.clip(evals.astype(np.float64), 1e-12, None)
     p = ev / ev.sum()
     h = -(p * np.log(p)).sum()
@@ -189,6 +229,22 @@ def effective_rank_from_spectrum(evals: np.ndarray) -> int:
 
 
 def mp_spikes_from_spectrum(evals: np.ndarray, n_samples: int, n_features: int) -> int:
+    """Count spectrum spikes above Marchenko–Pastur bulk edge.
+
+    Parameters
+    ----------
+    evals : np.ndarray
+        Eigenvalue spectrum sorted descending.
+    n_samples : int
+        Effective sample count.
+    n_features : int
+        Feature dimensionality.
+
+    Returns
+    -------
+    int
+        Number of eigenvalues above the estimated MP upper edge.
+    """
     n_ev = len(evals)
     if n_ev < 5:
         return 0
@@ -1364,6 +1420,36 @@ def build_task_design_for_run(
     microtime_dt: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, list[str], list[float]]:
+    """Build one-run task design matrix from AFNI timing files.
+
+    Parameters
+    ----------
+    onsets_files : list[str]
+        AFNI timing files, one per condition.
+    durations_arg : list[str]
+        Duration arguments passed from CLI.
+    run_idx : int
+        Zero-based run index to select when ``onset_row`` is not provided.
+    onset_row : int or None
+        Optional 1-based row override in each timing file.
+    n_timepoints : int
+        Number of TRs in run.
+    tr : float
+        Repetition time in seconds.
+    microtime_dt : float
+        Microtime bin size in seconds.
+    device : torch.device
+        Torch device for matrix construction.
+
+    Returns
+    -------
+    design : torch.Tensor
+        Run design matrix in TR space.
+    labels : list[str]
+        Condition labels aligned to design columns.
+    durations : list[float]
+        Parsed per-condition durations in seconds.
+    """
     all_onsets_full = [parse_afni_timing_file(fp) for fp in onsets_files]
     n_conds = len(all_onsets_full)
     labels = [f"cond{i + 1}" for i in range(n_conds)]

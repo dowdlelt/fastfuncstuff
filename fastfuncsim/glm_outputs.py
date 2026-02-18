@@ -155,6 +155,20 @@ def _ensure_numpy(array: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
 def _resolve_shape(
     results: ResultsLike, volume_shape: Optional[Sequence[int]]
 ) -> Sequence[int]:
+    """Resolve spatial shape from results metadata or caller fallback.
+
+    Parameters
+    ----------
+    results : ResultsLike
+        GLM-like results object containing optional shape metadata.
+    volume_shape : sequence of int or None
+        Optional fallback shape ``(nx, ny, nz)``.
+
+    Returns
+    -------
+    Sequence[int]
+        Resolved 3D spatial shape.
+    """
     if results.original_shape is not None:
         return results.original_shape
     full_shape = getattr(results, "full_shape", None)
@@ -296,6 +310,20 @@ def slice_glm_results(
 def _build_affine(
     affine: Optional[np.ndarray], voxel_size: Sequence[float]
 ) -> np.ndarray:
+    """Build affine from voxel size when explicit affine is unavailable.
+
+    Parameters
+    ----------
+    affine : np.ndarray or None
+        Existing affine matrix.
+    voxel_size : sequence of float
+        Voxel sizes along x/y/z axes.
+
+    Returns
+    -------
+    np.ndarray
+        Affine matrix for output image construction.
+    """
     if affine is not None:
         return affine
     mat = np.eye(4, dtype=np.float32)
@@ -306,6 +334,18 @@ def _build_affine(
 
 
 def _get_voxel_mask(results: ResultsLike) -> Optional[np.ndarray]:
+    """Extract voxel mask from results object as numpy bool array.
+
+    Parameters
+    ----------
+    results : ResultsLike
+        Results object potentially containing ``voxel_mask``.
+
+    Returns
+    -------
+    np.ndarray or None
+        Boolean mask array, or ``None`` when absent.
+    """
     mask = getattr(results, "voxel_mask", None)
     if mask is None:
         return None
@@ -319,6 +359,22 @@ def _reshape_parameter_map(
     volume_shape: Sequence[int],
     voxel_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
+    """Reshape flat parameter arrays back to 3D/4D image space.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Parameter array, either ``(n_vox,)`` or ``(n_vox, n_maps)``.
+    volume_shape : sequence of int
+        Spatial shape ``(nx, ny, nz)``.
+    voxel_mask : np.ndarray or None, default=None
+        Optional flat boolean mask used for sparse fitting.
+
+    Returns
+    -------
+    np.ndarray
+        Parameter map reshaped into full volume space.
+    """
     if voxel_mask is None:
         if data.ndim == 2:
             return data.reshape(*volume_shape, data.shape[1])

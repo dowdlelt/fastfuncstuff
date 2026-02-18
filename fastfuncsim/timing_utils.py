@@ -12,6 +12,18 @@ class TimingProfiler:
     """Context manager for hierarchical timing profiling."""
 
     def __init__(self, enabled: bool = True):
+        """Create a timing profiler.
+
+        Parameters
+        ----------
+        enabled : bool, default=True
+            Whether profiling instrumentation is active.
+
+        Returns
+        -------
+        None
+            Initializes timing buffers and stack state.
+        """
         self.enabled = enabled
         self.timings: Dict[str, List[float]] = {}
         self.stack: List[tuple] = []  # (name, start_time)

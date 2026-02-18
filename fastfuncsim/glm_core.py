@@ -27,6 +27,17 @@ class GLMResults:
     """Container for GLM results"""
 
     def __init__(self):
+        """Initialize an empty GLM results container.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Initializes all result attributes to ``None``.
+        """
         self.betas = None  # (n_voxels, n_regressors) or (n_x, n_y, n_z, n_regressors)
         self.r2 = None  # (n_voxels,) or (n_x, n_y, n_z) - total model R²
         self.r2_partial = None  # (n_voxels, n_task_regressors) - partial R² per TASK regressor

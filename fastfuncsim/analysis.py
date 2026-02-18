@@ -831,6 +831,23 @@ def analyze_from_design_matrix(
             ]  # Capture design matrix for single trials
 
             def write_ols(ols_results, original_shape, affine):
+                """Write OLS callback outputs during ARMA workflow.
+
+                Parameters
+                ----------
+                ols_results : GLMResults
+                    OLS fit results produced inside ARMA comparison workflow.
+                original_shape : tuple[int, int, int] or None
+                    Spatial shape inferred by caller; may be ``None`` when data was
+                    provided in flattened form.
+                affine : np.ndarray or None
+                    Spatial affine matrix supplied by caller.
+
+                Returns
+                -------
+                None
+                    Writes OLS bucket outputs and optional single-trial files.
+                """
                 # IMPORTANT: When task_indices is passed to fit_glm(), the results
                 # already contain ONLY the task regressors. No slicing needed!
                 # The betas/tstats/fstats already correspond to the stimulus columns.
