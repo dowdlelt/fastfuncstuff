@@ -3,6 +3,7 @@
 This module centralizes masking, scoring, lag analysis, and plotting helpers
 that were previously embedded in CLI scripts.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -109,13 +110,17 @@ def expand_mask_file(mask_path: str, shape3d: tuple[int, int, int]) -> list[tupl
 
     rounded = np.rint(pos_vals)
     is_integer_like = np.all(np.abs(pos_vals - rounded) < 1e-5)
-    unique_labels = np.unique(rounded.astype(np.int32)) if is_integer_like else np.array([], dtype=np.int32)
+    unique_labels = (
+        np.unique(rounded.astype(np.int32)) if is_integer_like else np.array([], dtype=np.int32)
+    )
 
     if is_integer_like and unique_labels.size > 1:
         for lbl in unique_labels:
             if lbl <= 0:
                 continue
-            masks.append((f"{stem}:label{int(lbl)}", np.rint(finite_data).astype(np.int32) == int(lbl)))
+            masks.append(
+                (f"{stem}:label{int(lbl)}", np.rint(finite_data).astype(np.int32) == int(lbl))
+            )
     else:
         masks.append((f"{stem}:all", finite_data > 0))
     return masks
@@ -153,7 +158,9 @@ def prepare_guidance_masks(
             n_sel = int(selector.sum())
             if n_sel == 0:
                 if verbose:
-                    print(f"    Warning: {kind} mask {mask_name} has 0 voxels after brain masking; skipped")
+                    print(
+                        f"    Warning: {kind} mask {mask_name} has 0 voxels after brain masking; skipped"
+                    )
                 continue
 
             out.append(
@@ -215,12 +222,16 @@ def prepare_depth_mask(
 
 
 def mean_abs_by_selector(comp_kv: np.ndarray, selector_v: np.ndarray) -> np.ndarray:
+    """Return per-component mean absolute map value inside a voxel selector."""
     if int(selector_v.sum()) == 0:
         return np.zeros(comp_kv.shape[0], dtype=np.float32)
     return np.mean(np.abs(comp_kv[:, selector_v]), axis=1).astype(np.float32)
 
 
-def mean_z_excess_by_selector(z_kv: np.ndarray, selector_v: np.ndarray, z_thresh: float) -> np.ndarray:
+def mean_z_excess_by_selector(
+    z_kv: np.ndarray, selector_v: np.ndarray, z_thresh: float
+) -> np.ndarray:
+    """Return per-component mean positive excess above |z| threshold in selector."""
     if int(selector_v.sum()) == 0:
         return np.zeros(z_kv.shape[0], dtype=np.float32)
     z_sel = np.abs(z_kv[:, selector_v])
@@ -228,6 +239,7 @@ def mean_z_excess_by_selector(z_kv: np.ndarray, selector_v: np.ndarray, z_thresh
 
 
 def normalize_0_1(x: np.ndarray) -> np.ndarray:
+    """Scale an array to [0, 1] by its maximum, handling empty/degenerate input."""
     if x.size == 0:
         return x
     x = x.astype(np.float32)
@@ -290,6 +302,7 @@ def weighted_depth_timeseries(
     weight_v: np.ndarray,
     min_voxels: int,
 ) -> tuple[np.ndarray | None, int]:
+    """Compute a weighted depth-average timeseries within selected voxels."""
     use = selector_v & np.isfinite(weight_v) & (weight_v > 0)
     n_use = int(use.sum())
     if n_use < int(min_voxels):
@@ -302,6 +315,7 @@ def weighted_depth_timeseries(
 
 
 def save_scree_plot(evr: np.ndarray, out_png: Path, title: str) -> None:
+    """Save explained-variance and cumulative-variance scree plot."""
     if plt is None:
         return
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -332,6 +346,7 @@ def save_depth_lag_plot(
     out_png: Path,
     title: str,
 ) -> None:
+    """Save a component-by-depth lag heatmap in seconds."""
     if plt is None or lag_matrix_kd.size == 0 or len(depth_labels) == 0:
         return
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -357,6 +372,7 @@ def save_depth_lag_plot(
 
 
 def save_corr_heatmap(corr_kn: np.ndarray, labels: list[str], out_png: Path, title: str) -> None:
+    """Save a component-by-regressor correlation heatmap."""
     if plt is None or corr_kn.size == 0 or len(labels) == 0:
         return
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -387,6 +403,7 @@ def save_score_heatmap(
     title: str,
     cmap: str,
 ) -> None:
+    """Save a nonnegative score heatmap (component x label)."""
     if plt is None or scores_kn.size == 0 or len(labels) == 0:
         return
     out_png.parent.mkdir(parents=True, exist_ok=True)

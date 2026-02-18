@@ -77,6 +77,7 @@ def _run_single_ica(
     durations: list[str] | None,
     ortvec_specs: list[list[str]] | None = None,
 ) -> dict:
+    """Run the full ICA workflow for one input run and return run metadata."""
     t_total = time.time()
     t_step = time.time()
     run_tag = f"run{run_idx + 1:02d}"
@@ -1014,6 +1015,7 @@ def _run_single_ica(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build and return the ffs_ica command-line argument parser."""
     parser = argparse.ArgumentParser(
         description="Run-wise whole-brain ICA demo / sanity-check pipeline",
         add_help=False,
@@ -1358,6 +1360,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Parse CLI args and execute run-wise ICA across all input runs."""
     parser = build_parser()
     args = parser.parse_args()
 

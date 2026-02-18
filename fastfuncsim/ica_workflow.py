@@ -18,12 +18,14 @@ from .ica_tools import apply_high_pass_fft, apply_melodic_voxel_varnorm, apply_p
 
 
 def verbose_section(verbose: bool, name: str) -> None:
+    """Print a standardized verbose section header."""
     if not verbose:
         return
     print(f"\n  ── {name} {'─' * max(1, 50 - len(name))}")
 
 
 def verbose_print(verbose: bool, msg: str, t0: float | None = None) -> None:
+    """Print a verbose message, optionally annotated with elapsed time."""
     if not verbose:
         return
     if t0 is not None:
@@ -119,7 +121,9 @@ def estimate_spatial_smoothness_resels(
         fwhm.append(max(1.0, fwhm_ax))
 
     if verbose:
-        verbose_print(True, f"  FWHM per axis: X={fwhm[0]:.3f}, Y={fwhm[1]:.3f}, Z={fwhm[2]:.3f} voxels")
+        verbose_print(
+            True, f"  FWHM per axis: X={fwhm[0]:.3f}, Y={fwhm[1]:.3f}, Z={fwhm[2]:.3f} voxels"
+        )
 
     resels = fwhm[0] * fwhm[1] * fwhm[2]
     fwhm_geo = float(np.cbrt(resels))
@@ -211,7 +215,9 @@ def compute_guidance_scores(
     for entry in guidance_good_masks:
         selector = entry["selector"]
         if z_maps is not None:
-            s = ica_postprocess.mean_z_excess_by_selector(z_maps, selector, z_thresh=float(good_z_thresh))
+            s = ica_postprocess.mean_z_excess_by_selector(
+                z_maps, selector, z_thresh=float(good_z_thresh)
+            )
         else:
             s = ica_postprocess.mean_abs_by_selector(comp_np, selector)
         spatial_scores_good += s
@@ -246,7 +252,9 @@ def compute_guidance_scores(
     if depth_mask_info is not None:
         for lbl in depth_mask_info["labels"]:
             sel = depth_mask_info["selectors"][lbl]
-            depth_profile_abs[str(lbl)] = ica_postprocess.mean_abs_by_selector(comp_np, sel).tolist()
+            depth_profile_abs[str(lbl)] = ica_postprocess.mean_abs_by_selector(
+                comp_np, sel
+            ).tolist()
             if z_maps is not None:
                 depth_profile_zexcess[str(lbl)] = ica_postprocess.mean_z_excess_by_selector(
                     z_maps,
@@ -258,7 +266,9 @@ def compute_guidance_scores(
     guidance_bad_plot = None
     if len(good_mask_score_table) > 0:
         labels = list(good_mask_score_table.keys())
-        table = np.column_stack([np.asarray(good_mask_score_table[k], dtype=np.float32) for k in labels])
+        table = np.column_stack(
+            [np.asarray(good_mask_score_table[k], dtype=np.float32) for k in labels]
+        )
         guidance_good_plot = Path(f"{out_prefix}_{run_tag}_goodmask_scores.png")
         ica_postprocess.save_score_heatmap(
             scores_kn=table,
@@ -270,7 +280,9 @@ def compute_guidance_scores(
 
     if len(bad_mask_score_table) > 0:
         labels = list(bad_mask_score_table.keys())
-        table = np.column_stack([np.asarray(bad_mask_score_table[k], dtype=np.float32) for k in labels])
+        table = np.column_stack(
+            [np.asarray(bad_mask_score_table[k], dtype=np.float32) for k in labels]
+        )
         guidance_bad_plot = Path(f"{out_prefix}_{run_tag}_badmask_scores.png")
         ica_postprocess.save_score_heatmap(
             scores_kn=table,
