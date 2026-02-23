@@ -2,6 +2,7 @@
 High-level analysis workflows for fMRI data
 Complete pipelines from AFNI files to GLM results
 """
+
 from __future__ import annotations
 
 import inspect
@@ -177,8 +178,7 @@ def analyze_from_onsets(
         data = data.reshape(-1, data.shape[3])
     elif data.ndim != 2:
         raise ValueError(
-            f"Data must be 2D (n_voxels, n_timepoints) or 4D (x, y, z, t), "
-            f"got shape {data.shape}"
+            f"Data must be 2D (n_voxels, n_timepoints) or 4D (x, y, z, t), got shape {data.shape}"
         )
 
     n_voxels, n_timepoints = data.shape
@@ -285,8 +285,7 @@ def analyze_from_onsets(
 
     else:
         raise ValueError(
-            f"Unknown hrf_mode: {hrf_mode}. "
-            f"Choose 'canonical', 'library', 'pighs', or 'fir'"
+            f"Unknown hrf_mode: {hrf_mode}. Choose 'canonical', 'library', 'pighs', or 'fir'"
         )
 
     # 5. Fit GLM
@@ -344,9 +343,7 @@ def analyze_from_onsets(
                 _, arma_b_grid = get_default_arma_grids(device)
 
         # ARMA(1,1) prewhitened GLS
-        assert design is not None, (
-            "design should not be None for ARMA (library mode blocked above)"
-        )
+        assert design is not None, "design should not be None for ARMA (library mode blocked above)"
         results = fit_glm_arma11(
             data,
             design,
@@ -528,9 +525,7 @@ def analyze_from_design_matrix(
                     f"number of runs in design matrix ({len(expected_run_starts)})"
                 )
             # Check that run lengths match
-            expected_lengths = get_run_lengths(
-                expected_run_starts, design_info["n_timepoints"]
-            )
+            expected_lengths = get_run_lengths(expected_run_starts, design_info["n_timepoints"])
             actual_lengths = get_run_lengths(actual_run_starts, data.shape[1])
             if expected_lengths != actual_lengths:
                 raise ValueError(
@@ -572,9 +567,7 @@ def analyze_from_design_matrix(
 
         if precomputed_arma_params.ndim == 4:
             # Reshape (x, y, z, 2) -> (n_voxels, 2)
-            arma_volume_shape = tuple(
-                int(dim) for dim in precomputed_arma_params.shape[:3]
-            )
+            arma_volume_shape = tuple(int(dim) for dim in precomputed_arma_params.shape[:3])
 
             # Validate spatial dimensions match data
             if volume_shape is not None and arma_volume_shape != volume_shape:
@@ -616,26 +609,11 @@ def analyze_from_design_matrix(
             f"but data has {n_voxels:,} voxels"
         )
 
-    # AUTO-SCALING: Check if data needs scaling to mean=100
-    # This is standard for AFNI percent signal change convention
-    global_mean = float(data.mean())
+    # Scaling is the caller's responsibility (e.g. via -do_scale in the CLI,
+    # which uses scale_to_percent_signal for correct per-run scaling).
+    # Record for cache metadata only.
     was_scaled = False
-    original_mean = global_mean
-
-    if not (90 <= global_mean <= 110):
-        print(f"\n⚠️  Data mean: {global_mean:.1f} (expected ~100)")
-        print("   Auto-scaling to mean=100 (AFNI convention)")
-
-        # Scale each voxel's timeseries to have mean=100
-        # This preserves relative signal changes while standardizing baseline
-        voxel_means = data.mean(axis=1, keepdims=True)
-        # Avoid division by zero
-        voxel_means = np.where(voxel_means == 0, 1.0, voxel_means)
-        data = (data / voxel_means) * 100.0
-
-        was_scaled = True
-        new_mean = float(data.mean())
-        print(f"   ✓ Scaled: {original_mean:.1f} → {new_mean:.1f}\n")
+    original_mean = float(data.mean())
 
     # Save to HDF5 cache if requested (BEFORE masking/test mode)
     # This allows fast loading on subsequent runs
@@ -665,9 +643,7 @@ def analyze_from_design_matrix(
     # TEST MODE: Create test mask to extract ~N voxels from center
     if test_n_voxels is not None:
         if volume_shape is None:
-            raise ValueError(
-                "Test mode requires 4D input data to determine volume shape"
-            )
+            raise ValueError("Test mode requires 4D input data to determine volume shape")
 
         # Calculate cube size to get approximately test_n_voxels
         cube_side = int(np.ceil(test_n_voxels ** (1 / 3)))
@@ -694,9 +670,7 @@ def analyze_from_design_matrix(
 
         print(f"🧪 Test mode: extracting {kept_voxels:,} voxels from center")
         print(f"   Cube: {cube_side}³ at center {tuple(center)}")
-        print(
-            f"   Bounds: x=[{x_start}:{x_end}], y=[{y_start}:{y_end}], z=[{z_start}:{z_end}]"
-        )
+        print(f"   Bounds: x=[{x_start}:{x_end}], y=[{y_start}:{y_end}], z=[{z_start}:{z_end}]")
 
         data = data[mask_tensor, :]
         n_voxels = kept_voxels
@@ -739,12 +713,8 @@ def analyze_from_design_matrix(
 
         print("📊 Mask applied:")
         print(f"  Total voxels: {n_voxels:,}")
-        print(
-            f"  Kept (in mask): {kept_voxels:,} ({100 * kept_voxels / n_voxels:.1f}%)"
-        )
-        print(
-            f"  Excluded: {excluded_voxels:,} ({100 * excluded_voxels / n_voxels:.1f}%)"
-        )
+        print(f"  Kept (in mask): {kept_voxels:,} ({100 * kept_voxels / n_voxels:.1f}%)")
+        print(f"  Excluded: {excluded_voxels:,} ({100 * excluded_voxels / n_voxels:.1f}%)")
 
         data = data[mask_tensor, :]
         n_voxels = kept_voxels
@@ -823,9 +793,7 @@ def analyze_from_design_matrix(
             callback_volume_shape = volume_shape
             callback_affine = affine
             callback_stim_labels = stim_labels  # Capture labels
-            callback_stim_indices = (
-                stim_indices if stim_indices else None
-            )  # Capture indices
+            callback_stim_indices = stim_indices if stim_indices else None  # Capture indices
             callback_design_matrix = design_info[
                 "matrix"
             ]  # Capture design matrix for single trials
@@ -855,9 +823,7 @@ def analyze_from_design_matrix(
                 # Use captured volume_shape from closure - original_shape from arma may be None
                 # if data was already 2D when passed to fit_glm_arma11
                 shape_to_use = (
-                    original_shape
-                    if original_shape is not None
-                    else callback_volume_shape
+                    original_shape if original_shape is not None else callback_volume_shape
                 )
                 affine_to_use = affine if affine is not None else callback_affine
 
@@ -909,9 +875,7 @@ def analyze_from_design_matrix(
                 single_trials_label = os.environ.get("FASTFUNCSIM_SINGLE_TRIALS")
                 if single_trials_label and callback_stim_indices:
                     output_filename = f"ols_{single_trials_label}_single.nii.gz"
-                    print(
-                        f"  • Writing OLS single-trial betas (onset order): {output_filename}"
-                    )
+                    print(f"  • Writing OLS single-trial betas (onset order): {output_filename}")
                     from .glm_outputs import write_single_trials_output
 
                     write_single_trials_output(
@@ -944,9 +908,7 @@ def analyze_from_design_matrix(
                     else:
                         partial_r2_path = "OLS_partialR2.nii.gz"
 
-                    print(
-                        f"  • Writing OLS partial R² per condition: {partial_r2_path}"
-                    )
+                    print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
 
                     from .glm_outputs import (
                         _get_voxel_mask,
@@ -971,19 +933,13 @@ def analyze_from_design_matrix(
                         mode=r2_partial_mode_env,  # "full" or "task"
                     )
 
-                    suffix = (
-                        "_partialR2_task"
-                        if r2_partial_mode_env == "task"
-                        else "_partialR2"
-                    )
+                    suffix = "_partialR2_task" if r2_partial_mode_env == "task" else "_partialR2"
                     print("     Sub-bricks (partial R² with AFNI stat params):")
                     for idx, label in enumerate(callback_stim_labels):
                         print(f"       [{idx}] {label}{suffix}")
 
                 # Write semi-partial R² if requested (check for env var set by 3dREMLfast.py)
-                r2_semipartial_mode_env = os.environ.get(
-                    "FASTFUNCSIM_R2_SEMIPARTIAL_MODE"
-                )
+                r2_semipartial_mode_env = os.environ.get("FASTFUNCSIM_R2_SEMIPARTIAL_MODE")
                 if (
                     r2_semipartial_mode_env
                     and hasattr(ols_results, "r2_semipartial")
@@ -1000,15 +956,11 @@ def analyze_from_design_matrix(
                                 ".nii", "_semipartialR2.nii.gz"
                             )
                         else:
-                            semipartial_r2_path = (
-                                str(ols_output_path) + "_semipartialR2.nii.gz"
-                            )
+                            semipartial_r2_path = str(ols_output_path) + "_semipartialR2.nii.gz"
                     else:
                         semipartial_r2_path = "OLS_semipartialR2.nii.gz"
 
-                    print(
-                        f"  • Writing OLS semi-partial R² per condition: {semipartial_r2_path}"
-                    )
+                    print(f"  • Writing OLS semi-partial R² per condition: {semipartial_r2_path}")
 
                     from .glm_outputs import (
                         _get_voxel_mask,
@@ -1300,9 +1252,7 @@ def analyze_with_cross_validation(
     # Handle different input types
     if isinstance(fmri_data, list):
         # Multiple run files
-        data, actual_run_starts = load_and_concatenate_runs(
-            fmri_data, device=torch.device("cpu")
-        )
+        data, actual_run_starts = load_and_concatenate_runs(fmri_data, device=torch.device("cpu"))
         if verbose:
             print(f"  • Loaded {len(fmri_data)} run files")
     elif isinstance(fmri_data, (str, Path)):
@@ -1507,9 +1457,7 @@ def compute_contrasts(
 
         # c' (X'X)^-1 c for each contrast
         # (n_contrasts, n_regressors) @ (n_regressors, n_regressors) @ (n_regressors, n_contrasts)
-        contrast_var_factor = torch.sum(
-            contrasts @ xtx_inv * contrasts, dim=1
-        )  # (n_contrasts,)
+        contrast_var_factor = torch.sum(contrasts @ xtx_inv * contrasts, dim=1)  # (n_contrasts,)
 
         # Broadcast sigma2 and contrast_var_factor
         # (n_voxels, 1) * (1, n_contrasts) = (n_voxels, n_contrasts)
@@ -1645,9 +1593,7 @@ def compute_contrasts_from_design(
     n_regressors = design_info["n_regressors"]
     n_contrasts = len(design_info["glt_matrices"])
 
-    contrasts = torch.zeros(
-        (n_contrasts, n_regressors), device=device, dtype=torch.float32
-    )
+    contrasts = torch.zeros((n_contrasts, n_regressors), device=device, dtype=torch.float32)
 
     for i, glt_matrix in enumerate(design_info["glt_matrices"]):
         # Convert numpy array to torch tensor if needed
