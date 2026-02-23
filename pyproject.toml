@@ -16,12 +16,19 @@ dependencies = [
     "scipy>=1.10",
     "matplotlib>=3.7",
     "tqdm>=4.65",
+    "h5py>=3.8",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "scikit-learn>=1.2",
 ]
 
 [tool.setuptools.packages.find]

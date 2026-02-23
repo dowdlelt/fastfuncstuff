@@ -35,6 +35,12 @@ cd fastfuncsim
 pip install -e .
 ```
 
+Install with test dependencies:
+
+```bash
+pip install -e ".[test]"
+```
+
 ## Quick Start
 
 ### 1. Interactive Single Simulation
