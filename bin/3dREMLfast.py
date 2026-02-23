@@ -273,7 +273,13 @@ Examples:
     reml_out = parser.add_argument_group("REML Output Options")
     reml_out.add_argument(
         "-Rvar",
-        help="Output REML variance parameters (6 volumes: a, b, lambda, StDev, -LogLik, LjungBox)",
+        help="Output REML variance parameters (up to 4 volumes: a, b, lambda, StDev)",
+    )
+    reml_out.add_argument(
+        "-load_Rvar",
+        help="Load precomputed ARMA parameters from this file to skip the grid search "
+             "(saves ~80%% compute time on re-runs). Must be a -Rvar output from a "
+             "previous run. If not specified, the grid search always runs from scratch.",
     )
     reml_out.add_argument(
         "-Rbuck", help="Output REML betas + statistics (main bucket output)"
@@ -959,7 +965,6 @@ def main():
 
     # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
     if args.beta_cv:
-        from fastfuncsim.analysis import analyze_from_design_matrix
         from fastfuncsim.glm_outputs import save_single_trial_results
         from fastfuncsim.ridge import create_single_trial_design
         from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
@@ -1446,46 +1451,48 @@ def main():
         if fmri_data_to_use is None:
             fmri_data_to_use = input_files if len(input_files) > 1 else input_files[0]
 
-        # Check if Rvar file exists - if so, load precomputed ARMA params to skip grid search
+        # Load precomputed ARMA params only if explicitly requested via -load_Rvar
         precomputed_arma = None
-        rvar_path = None
-        if args.Rvar:
-            # Try to find Rvar file with automatic extension detection
-            rvar_base = Path(args.Rvar)
-            if rvar_base.exists():
-                rvar_path = rvar_base
-            elif Path(str(rvar_base) + '.nii.gz').exists():
-                rvar_path = Path(str(rvar_base) + '.nii.gz')
-            elif Path(str(rvar_base) + '.nii').exists():
-                rvar_path = Path(str(rvar_base) + '.nii')
+        if args.load_Rvar:
+            # Try with automatic extension detection
+            rvar_base = Path(args.load_Rvar)
+            rvar_path = None
+            for candidate in [rvar_base,
+                               Path(str(rvar_base) + '.nii.gz'),
+                               Path(str(rvar_base) + '.nii')]:
+                if candidate.exists():
+                    rvar_path = candidate
+                    break
 
-        if rvar_path is not None:
+            if rvar_path is None:
+                print(f"\n❌ ERROR: -load_Rvar file not found: {args.load_Rvar}")
+                sys.exit(1)
+
             print(f"\n📂 Loading precomputed ARMA parameters from: {rvar_path}")
             print("   (Skipping grid search - saves ~80% compute time)")
 
             try:
                 rvar_img = load_nifti(rvar_path)
-                rvar_data = rvar_img.get_fdata()  # (x, y, z, n_params)
+                rvar_data = rvar_img.get_fdata()  # (x, y, z[, 1], n_params)
 
-                # Validate dimensions
+                # AFNI bucket files sometimes store sub-briks in the 5th dimension
+                # with a singleton 4th dimension (e.g. shape (x, y, z, 1, n)).
+                # Squeeze out all size-1 dimensions that sit before the last axis.
+                while rvar_data.ndim > 4 and rvar_data.shape[-2] == 1:
+                    rvar_data = rvar_data[..., 0, :]  # drop singleton dim
+
                 if rvar_data.ndim != 4:
-                    raise ValueError(f"Expected 4D Rvar file, got {rvar_data.ndim}D")
+                    raise ValueError(f"Expected 4D Rvar file, got {rvar_data.ndim}D "
+                                     f"(shape {rvar_img.shape}). "
+                                     "Cannot reduce to (x, y, z, n_params).")
+                if rvar_data.shape[3] < 2:
+                    raise ValueError(f"Rvar file must have at least 2 sub-briks (a, b), found {rvar_data.shape[3]}")
 
-                n_params = rvar_data.shape[3]
-                if n_params < 2:
-                    raise ValueError(f"Rvar file must have at least 2 sub-briks (a, b), found {n_params}")
-
-                # Keep as 4D (x, y, z, 2) for consistent masking/test mode with data
-                # Extract only a and b parameters (first 2 sub-briks)
-                precomputed_arma = rvar_data[..., :2]  # (x, y, z, 2)
-
-                # Compute stats for logging
+                precomputed_arma = rvar_data[..., :2]  # (x, y, z, 2) — only a and b needed
                 n_voxels_total = np.prod(precomputed_arma.shape[:3])
                 a_range = (precomputed_arma[..., 0].min(), precomputed_arma[..., 0].max())
                 b_range = (precomputed_arma[..., 1].min(), precomputed_arma[..., 1].max())
-
                 print(f"   ✓ Loaded ARMA params: {n_voxels_total:,} voxels × 2 params (a, b)")
-                print(f"   • Shape: {precomputed_arma.shape} (4D - will be masked consistently with data)")
                 print(f"   • a range: [{a_range[0]:.3f}, {a_range[1]:.3f}]")
                 print(f"   • b range: [{b_range[0]:.3f}, {b_range[1]:.3f}]")
 
@@ -1493,6 +1500,17 @@ def main():
                 print(f"   ⚠️  Failed to load Rvar file: {e}")
                 print("   Proceeding with grid search instead")
                 precomputed_arma = None
+
+        # Warn if the Rvar output file already exists (user may want -load_Rvar instead)
+        if args.Rvar and not args.load_Rvar:
+            rvar_out_base = Path(args.Rvar)
+            for candidate in [rvar_out_base,
+                               Path(str(rvar_out_base) + '.nii.gz'),
+                               Path(str(rvar_out_base) + '.nii')]:
+                if candidate.exists():
+                    print(f"\n⚠️  Note: {candidate} already exists and will be overwritten.")
+                    print("   To reuse precomputed ARMA params instead, pass: -load_Rvar {candidate}")
+                    break
 
         results, design_info = analyze_from_design_matrix(
             fmri_data=fmri_data_to_use,
@@ -1671,7 +1689,7 @@ def main():
             rvar_output_path = Path(str(rvar_output_path) + '.nii.gz')
 
         print(f"  • Writing REML variance parameters: {rvar_output_path}")
-        # Stack variance parameters: a, b, lambda, StDev, -LogLik, LjungBox (placeholder)
+        # Stack variance parameters: a, b, lambda, StDev (all reliably computed)
         var_stack = []
         var_labels = []
 
@@ -1688,17 +1706,8 @@ def main():
             var_stack.append(torch.sqrt(results.sigma2))  # StDev
             var_labels.append("StDev")
 
-        if results.reml_likelihood is not None:
-            var_stack.append(-results.reml_likelihood)  # -LogLik
-            var_labels.append("-LogLik")
-
-        # LjungBox placeholder (would need to compute from whitened residuals)
-        assert results.sigma2 is not None, "Results must have sigma2"
-        var_stack.append(torch.zeros_like(results.sigma2))
-        var_labels.append("LjungBox")
-
         # Stack and write
-        var_data = torch.stack(var_stack, dim=1)  # (n_voxels, 6)
+        var_data = torch.stack(var_stack, dim=1)
         # Write variance parameters directly as 4D NIfTI
         import nibabel as nib
 
