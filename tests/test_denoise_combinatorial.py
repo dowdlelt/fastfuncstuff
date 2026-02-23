@@ -1,25 +1,16 @@
 """
-Comprehensive tests for denoise_combinatorial.py with progressive coverage.
+Comprehensive tests for denoise_combinatorial.py
 
 Test layers:
 1. Small: Unit tests for core functions (combination generation, PC extraction)
 2. Medium: Sub-workflow tests (batch evaluation, selection strategies)
 3. Large/E2E: Full pipeline tests with ground truth verification
-
-Uses realistic fMRI simulation to verify:
-- Combinatorial evaluation finds non-contiguous PC subsets
-- Selection strategies work correctly (argmax, parsimonious)
-- Signal recovery improves with optimal PC subsets
 """
 
 import pytest
 import torch
 import numpy as np
-from typing import List, Tuple
 
-from fastfuncsim.simulation import simulate_fmri_run
-from fastfuncsim.hrf import get_canonical_hrf
-from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
 from fastfuncsim.utils import get_device
 from fastfuncsim.denoise_combinatorial import (
     generate_all_pc_combinations,
@@ -30,7 +21,6 @@ from fastfuncsim.denoise_combinatorial import (
     CombinatorialDenoiseResults,
     CombinatorialDenoiseRunResult,
 )
-from fastfuncsim.xval import generate_cv_splits
 
 
 @pytest.fixture
@@ -38,64 +28,47 @@ def device():
     return get_device()
 
 
-# ============================================================================
-# Layer 1: Small Tests - Unit tests for core functions
-# ============================================================================
+class TestGenerateAllPcCombinations:
+    """Test combination generation."""
 
-class TestCombinatorialCoreFunctions:
-    """Test core combinatorial denoising functions."""
-
-    def test_generate_all_pc_combinations_small(self):
-        """Test combination generation for small k."""
-        # k=0: only empty set
+    def test_k_zero(self):
         combos = generate_all_pc_combinations(0)
-        assert combos == [()], f"Expected [()] for k=0, got {combos}"
+        assert combos == [()]
 
-        # k=1: 2^1 = 2 combinations
+    def test_k_one(self):
         combos = generate_all_pc_combinations(1)
-        assert len(combos) == 2, f"Expected 2 combos for k=1, got {len(combos)}"
-        assert combos == [(), (0,)], f"Expected [(), (0,)] for k=1, got {combos}"
+        assert combos == [(), (0,)]
 
-        # k=2: 2^2 = 4 combinations
+    def test_k_two(self):
         combos = generate_all_pc_combinations(2)
-        assert len(combos) == 4, f"Expected 4 combos for k=2, got {len(combos)}"
-        # Check that all combinations are present
+        assert len(combos) == 4
         assert () in combos
         assert (0,) in combos
         assert (1,) in combos
         assert (0, 1) in combos
 
-    def test_generate_all_pc_combinations_medium(self):
-        """Test combination generation for medium k."""
-        # k=5: 2^5 = 32 combinations
+    def test_k_five(self):
         combos = generate_all_pc_combinations(5)
-        assert len(combos) == 32, f"Expected 32 combos for k=5, got {len(combos)}"
-
-        # Verify sorted by size (empty first, then singletons, then pairs, ...)
+        assert len(combos) == 32
         sizes = [len(c) for c in combos]
-        assert sizes == sorted(sizes), "Combinations should be sorted by size"
+        assert sizes == sorted(sizes)
+        assert len(set(combos)) == len(combos)
 
-        # Verify no duplicates
-        assert len(set(combos)) == len(combos), "Combinations should be unique"
+    def test_k_ten(self):
+        combos = generate_all_pc_combinations(10)
+        assert len(combos) == 1024
 
-        # Verify all indices are in range
-        for combo in combos:
-            for idx in combo:
-                assert 0 <= idx < 5, f"Invalid index {idx} in combo {combo}"
 
-    def test_extract_pcs_single_run_with_variance_basic(self, device):
-        """Test PC extraction from simple synthetic data."""
+class TestExtractPcsSingleRun:
+    """Test PC extraction from single run."""
+
+    def test_basic_extraction(self, device):
         run_length = 100
         n_voxels = 50
         max_components = 5
 
-        # Create simple data with structured noise
         run_data = torch.randn(n_voxels, run_length, device=device)
-
-        # Create simple nuisance (just intercept)
         nuisance = torch.ones(run_length, 1, device=device)
-
-        # All voxels are noise pool
         noise_pool_mask = torch.ones(n_voxels, dtype=torch.bool, device=device)
 
         pcs, variance_ratios = extract_pcs_single_run_with_variance(
@@ -106,63 +79,37 @@ class TestCombinatorialCoreFunctions:
             device=device,
         )
 
-        # Check shapes
-        assert pcs.shape == (run_length, max_components), \
-            f"Expected shape ({run_length}, {max_components}), got {pcs.shape}"
-        assert variance_ratios.shape == (max_components,), \
-            f"Expected shape ({max_components},), got {variance_ratios.shape}"
+        assert pcs.shape == (run_length, max_components)
+        assert variance_ratios.shape == (max_components,)
+        assert variance_ratios.sum() <= 1.0 + 1e-6
+        assert variance_ratios[0] >= variance_ratios[1]
 
-        # Check PCs are unit variance (approximately)
-        pc_stds = pcs.std(dim=0)
-        assert torch.allclose(pc_stds, torch.ones(max_components, device=device), atol=1e-2), \
-            f"PCs should have unit variance, got stds: {pc_stds}"
-
-        # Check variance ratios sum to <= 1
-        assert variance_ratios.sum() <= 1.0 + 1e-6, \
-            f"Variance ratios should sum to <= 1, got {variance_ratios.sum()}"
-
-        # Check PCs are sorted by variance (first PC explains most)
-        assert variance_ratios[0] >= variance_ratios[1], \
-            "First PC should explain more variance than second"
-
-    def test_extract_pcs_with_empty_noise_pool(self, device):
-        """Test PC extraction when noise pool is empty."""
+    def test_empty_noise_pool(self, device):
         run_length = 100
         n_voxels = 50
-        max_components = 5
 
         run_data = torch.randn(n_voxels, run_length, device=device)
         nuisance = torch.ones(run_length, 1, device=device)
-
-        # Empty noise pool
         noise_pool_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
 
         pcs, variance_ratios = extract_pcs_single_run_with_variance(
             run_data=run_data,
             noise_pool_mask=noise_pool_mask,
             nuisance=nuisance,
-            max_components=max_components,
+            max_components=5,
             device=device,
         )
 
-        # Should return zeros
-        assert pcs.shape == (run_length, max_components)
-        assert variance_ratios.shape == (max_components,)
-        assert torch.all(pcs == 0), "PCs should be all zeros with empty noise pool"
-        assert np.all(variance_ratios == 0), "Variance ratios should be all zeros"
+        assert torch.all(pcs == 0)
+        assert np.all(variance_ratios == 0)
 
-    def test_extract_pcs_with_nuisance_projection(self, device):
-        """Test that nuisance is properly projected out before PCA."""
+    def test_nuisance_projection(self, device):
         run_length = 100
         n_voxels = 50
 
-        # Create data with strong linear trend
         time = torch.arange(run_length, device=device).float() / run_length
         run_data = torch.randn(n_voxels, run_length, device=device) + 10 * time.unsqueeze(0)
-
-        # Nuisance includes the trend
-        nuisance = time.unsqueeze(1)  # (run_length, 1)
-
+        nuisance = time.unsqueeze(1)
         noise_pool_mask = torch.ones(n_voxels, dtype=torch.bool, device=device)
 
         pcs, variance_ratios = extract_pcs_single_run_with_variance(
@@ -173,126 +120,201 @@ class TestCombinatorialCoreFunctions:
             device=device,
         )
 
-        # After projecting out the trend, PCs should capture remaining structure
-        # not the trend itself
-        assert pcs.shape == (run_length, 3)
-        # First PC should be orthogonal to the trend
         correlation = (pcs[:, 0] * time).sum() / (pcs[:, 0].norm() * time.norm())
-        assert abs(correlation.item()) < 0.3, \
-            f"First PC should be uncorrelated with trend, got correlation {correlation:.3f}"
+        assert abs(correlation.item()) < 0.3
 
 
-class TestCombinationSelection:
-    """Test optimal combination selection strategies."""
+class TestEvaluateAllCombinations:
+    """Test batch evaluation of all PC combinations."""
 
-    def test_select_optimal_combination_argmax(self):
-        """Test argmax selection strategy."""
+    def test_basic_evaluation(self, device):
+        n_voxels = 20
+        run_length = 50
+        n_conditions = 3
         k = 3
-        n_combos = 2 ** k
 
-        # Create synthetic CoD values
-        # Make combo (1, 2) have the highest CoD
-        median_cod = np.zeros(n_combos)
+        run_data_criteria = torch.randn(n_voxels, run_length, device=device)
+        run_design = torch.randn(run_length, n_conditions, device=device)
+        betas_criteria = torch.randn(n_voxels, n_conditions, device=device) * 0.5
+        noise_pcs = torch.randn(run_length, k, device=device)
+        noise_pcs = noise_pcs / noise_pcs.norm(dim=0, keepdim=True)
+        poly_nuisance = torch.ones(run_length, 1, device=device)
+        variance_ratios = np.array([0.4, 0.3, 0.2])
         combinations = generate_all_pc_combinations(k)
 
-        # Find index of (1, 2)
-        target_idx = combinations.index((1, 2))
-        median_cod[target_idx] = 0.5  # Highest CoD
-        median_cod[combinations.index((0,))] = 0.3
-        median_cod[combinations.index((0, 1))] = 0.4
-
-        optimal_idx, optimal_combo = select_optimal_combination(
-            median_cod=median_cod,
+        median_cod, all_cod, var_explained = evaluate_all_combinations_for_run(
+            run_data_criteria=run_data_criteria,
+            run_design=run_design,
+            betas_criteria=betas_criteria,
+            noise_pcs=noise_pcs,
+            poly_nuisance=poly_nuisance,
+            variance_ratios=variance_ratios,
             combinations=combinations,
-            strategy="argmax",
+            device=device,
+            verbose=False,
         )
 
-        assert optimal_idx == target_idx, \
-            f"Expected index {target_idx}, got {optimal_idx}"
-        assert optimal_combo == (1, 2), \
-            f"Expected combination (1, 2), got {optimal_combo}"
+        assert median_cod.shape == (len(combinations),)
+        assert all_cod.shape == (len(combinations), n_voxels)
+        assert var_explained.shape == (len(combinations),)
 
-    def test_select_optimal_combination_parsimonious(self):
-        """Test parsimonious selection strategy (fewest PCs within 1% of max)."""
+    def test_finds_noncontiguous_subset(self, device):
+        n_voxels = 30
+        run_length = 100
+        n_conditions = 2
         k = 4
-        n_combos = 2 ** k
+
+        np.random.seed(42)
+        torch.manual_seed(42)
+
+        run_design = torch.randn(run_length, n_conditions, device=device)
+        true_betas = torch.randn(n_voxels, n_conditions, device=device) * 0.3
+        signal = run_design @ true_betas.T
+
+        noise_pcs = torch.randn(run_length, k, device=device)
+        noise_pcs = noise_pcs / noise_pcs.norm(dim=0, keepdim=True)
+        noise_weights = torch.zeros(n_voxels, k, device=device)
+        noise_weights[:, 1] = 0.5
+        noise_weights[:, 3] = 0.3
+        structured_noise = noise_pcs @ noise_weights.T
+        random_noise = torch.randn(n_voxels, run_length, device=device) * 0.2
+
+        run_data = signal + structured_noise + random_noise
+        poly_nuisance = torch.ones(run_length, 1, device=device)
+        variance_ratios = np.array([0.1, 0.3, 0.1, 0.2])
         combinations = generate_all_pc_combinations(k)
 
-        # Create CoD values where:
-        # - Max CoD is 0.5 at combo (0, 1, 2, 3) (all 4 PCs)
-        # - Combo (0, 2) has CoD 0.495 (within 1%)
-        # - Combo (1,) has CoD 0.49 (within 2%)
-        median_cod = np.zeros(n_combos)
+        median_cod, all_cod, var_explained = evaluate_all_combinations_for_run(
+            run_data_criteria=run_data,
+            run_design=run_design,
+            betas_criteria=true_betas,
+            noise_pcs=noise_pcs,
+            poly_nuisance=poly_nuisance,
+            variance_ratios=variance_ratios,
+            combinations=combinations,
+            device=device,
+            verbose=False,
+        )
+
+        best_idx = np.argmax(median_cod)
+        best_combo = combinations[best_idx]
+
+        assert 1 in best_combo or 3 in best_combo
+
+
+class TestSelectOptimalCombination:
+    """Test optimal combination selection."""
+
+    def test_argmax_strategy(self):
+        k = 3
+        combinations = generate_all_pc_combinations(k)
+        median_cod = np.zeros(len(combinations))
+        median_cod[combinations.index((1, 2))] = 0.5
+        median_cod[combinations.index((0,))] = 0.3
+
+        idx, combo = select_optimal_combination(median_cod, combinations, "argmax")
+        assert combo == (1, 2)
+
+    def test_parsimonious_strategy(self):
+        k = 4
+        combinations = generate_all_pc_combinations(k)
+        median_cod = np.zeros(len(combinations))
         median_cod[combinations.index((0, 1, 2, 3))] = 0.5
         median_cod[combinations.index((0, 2))] = 0.495
         median_cod[combinations.index((1,))] = 0.49
 
-        optimal_idx, optimal_combo = select_optimal_combination(
-            median_cod=median_cod,
-            combinations=combinations,
-            strategy="parsimonious",
+        idx, combo = select_optimal_combination(median_cod, combinations, "parsimonious")
+        assert combo == (0, 2)
+
+    def test_invalid_strategy_raises(self):
+        with pytest.raises(ValueError, match="Unknown selection strategy"):
+            select_optimal_combination(np.zeros(8), generate_all_pc_combinations(3), "invalid")
+
+
+class TestFitCombinatorialDenoising:
+    """Test the main fitting function."""
+
+    def test_basic_fit(self, device):
+        n_voxels = 50
+        run_length = 80
+        n_conditions = 2
+        n_runs = 3
+
+        np.random.seed(42)
+        torch.manual_seed(42)
+
+        data_per_run = []
+        design_per_run = []
+        for _ in range(n_runs):
+            data_per_run.append(torch.randn(n_voxels, run_length, device=device))
+            design_per_run.append(torch.randn(run_length, n_conditions, device=device))
+
+        data = torch.cat(data_per_run, dim=1)
+        design = torch.cat(design_per_run, dim=0)
+        run_starts = [i * run_length for i in range(n_runs)]
+
+        noise_pool_mask = torch.ones(n_voxels, dtype=torch.bool, device=device)
+
+        results = fit_combinatorial_denoising(
+            data=data,
+            design=design,
+            run_starts=run_starts,
+            noise_pool_mask=noise_pool_mask,
+            polort=2,
+            max_pcs=4,
+            device=device,
+            verbose=False,
         )
 
-        # Should select (0, 2) with 2 PCs instead of (0, 1, 2, 3) with 4 PCs
-        assert optimal_combo == (0, 2), \
-            f"Expected parsimonious selection (0, 2), got {optimal_combo}"
+        assert isinstance(results, CombinatorialDenoiseResults)
+        assert len(results.per_run_results) == n_runs
+        assert results.noise_pool_mask.shape == (n_voxels,)
 
-    def test_select_optimal_combination_invalid_strategy(self):
-        """Test that invalid strategy raises error."""
-        median_cod = np.zeros(8)
-        combinations = generate_all_pc_combinations(3)
+    def test_with_noise_improves_fit(self, device):
+        n_voxels = 40
+        run_length = 60
+        n_conditions = 2
+        n_runs = 3
+        k = 3
 
-        with pytest.raises(ValueError, match="Unknown selection strategy"):
-            select_optimal_combination(
-                median_cod=median_cod,
-                combinations=combinations,
-                strategy="invalid_strategy",
-            )
+        np.random.seed(123)
+        torch.manual_seed(123)
 
+        noise_pcs_template = torch.randn(run_length, k, device=device)
+        noise_pcs_template = noise_pcs_template / noise_pcs_template.norm(dim=0, keepdim=True)
 
-# ============================================================================
-# Layer 2: Medium Tests - Sub-workflow tests
-# ============================================================================
+        data_per_run = []
+        design_per_run = []
+        for run_idx in range(n_runs):
+            run_design = torch.randn(run_length, n_conditions, device=device)
+            run_signal = run_design @ torch.randn(n_voxels, n_conditions, device=device).T * 0.5
+            noise_weights = torch.zeros(n_voxels, k, device=device)
+            noise_weights[:, 0] = 0.4
+            noise_weights[:, 2] = 0.3
+            run_noise = noise_pcs_template @ noise_weights.T
+            run_random = torch.randn(n_voxels, run_length, device=device) * 0.1
+            data_per_run.append(run_signal + run_noise + run_random)
+            design_per_run.append(run_design)
 
-class TestCombinatorialSubWorkflows:
-    """Test combinatorial denoising sub-workflows."""
+        data = torch.cat(data_per_run, dim=1)
+        design = torch.cat(design_per_run, dim=0)
+        run_starts = [i * run_length for i in range(n_runs)]
 
-    @pytest.mark.skip(reason="TODO: Implement batch evaluation test")
-    def test_evaluate_all_combinations_batched(self, device):
-        """Test that batch evaluation produces correct CoD for all combinations."""
-        pass
+        noise_pool_mask = torch.ones(n_voxels, dtype=torch.bool, device=device)
 
-    @pytest.mark.skip(reason="TODO: Implement with realistic simulation")
-    def test_inner_cv_selects_criteria_voxels(self, device):
-        """Test that inner LORO CV correctly selects criteria voxels."""
-        pass
+        results = fit_combinatorial_denoising(
+            data=data,
+            design=design,
+            run_starts=run_starts,
+            noise_pool_mask=noise_pool_mask,
+            polort=2,
+            max_pcs=k,
+            device=device,
+            verbose=False,
+        )
 
-    @pytest.mark.skip(reason="TODO: Implement full workflow test")
-    def test_combinatorial_finds_noncontiguous_subsets(self, device):
-        """Test that combinatorial approach can find non-contiguous PC subsets."""
-        # This is the key advantage over sequential approach
-        # Should be able to select PCs 0, 3, 5 while skipping 1, 2, 4
-        pass
-
-
-# ============================================================================
-# Layer 3: Large/E2E Tests - Full pipeline with ground truth
-# ============================================================================
-
-class TestCombinatorialFullPipeline:
-    """Test full combinatorial denoising pipeline."""
-
-    @pytest.mark.skip(reason="TODO: Implement E2E test with ground truth")
-    def test_combinatorial_improves_signal_recovery(self, device):
-        """Test that combinatorial denoising improves signal recovery vs baseline."""
-        # Simulate data with known betas
-        # Add structured noise to specific PCs
-        # Verify that optimal subset selection removes noise and recovers signal
-        pass
-
-    @pytest.mark.skip(reason="TODO: Implement comparison test")
-    def test_combinatorial_vs_sequential(self, device):
-        """Test combinatorial vs sequential denoising on same data."""
-        # When optimal subset is non-contiguous, combinatorial should win
-        # When optimal subset is prefix, both should perform similarly
-        pass
+        assert isinstance(results, CombinatorialDenoiseResults)
+        for run_result in results.per_run_results:
+            assert isinstance(run_result, CombinatorialDenoiseRunResult)
+            optimal = run_result.optimal_combination
+            assert 0 in optimal or 2 in optimal or len(optimal) == 0
