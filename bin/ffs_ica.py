@@ -951,7 +951,9 @@ def _run_single_ica(
                 "lag_seconds_matrix": None
                 if depth_lag_matrix_seconds is None
                 else depth_lag_matrix_seconds.tolist(),
-                "peak_r_matrix": None if depth_lag_matrix_r is None else depth_lag_matrix_r.tolist(),
+                "peak_r_matrix": None
+                if depth_lag_matrix_r is None
+                else depth_lag_matrix_r.tolist(),
             },
         },
         "mixture_model": mixture_meta if args.save_mixture_z else None,

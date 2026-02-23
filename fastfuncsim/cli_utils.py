@@ -308,7 +308,7 @@ def load_and_preprocess_runs(
 
     if verbose:
         print(f"  Volume shape: {volume_shape}")
-        print(f"  Voxel sizes: {voxel_sizes} mm")
+        print(f"  Voxel sizes: {voxel_sizes:.3f} mm")
         print(f"  TR: {tr} s")
         print(f"  Runs: {len(input_files)}")
 

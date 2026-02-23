@@ -12,9 +12,7 @@ import torch
 
 try:
     import nibabel as nib
-except (
-    ImportError
-) as exc:  # pragma: no cover - nibabel should be installed alongside package
+except ImportError as exc:  # pragma: no cover - nibabel should be installed alongside package
     raise ImportError(
         "nibabel is required to write GLM results as NIfTI files. Install it with `pip install nibabel`."
     ) from exc
@@ -25,7 +23,9 @@ from .glm_core import GLMResults
 ResultsLike = Union[GLMResults, ARMA11Results]
 
 
-def extract_onset_times_from_design(design_matrix: np.ndarray, column_indices: List[int]) -> List[int]:
+def extract_onset_times_from_design(
+    design_matrix: np.ndarray, column_indices: List[int]
+) -> List[int]:
     """
     Extract onset times for stimulus columns from design matrix.
 
@@ -115,30 +115,34 @@ def write_single_trials_output(
     img = _create_nifti_with_header(betas_vol, affine, results, tr)
     output_path = Path(output_path)
     # Ensure .nii.gz extension
-    if not str(output_path).endswith('.nii.gz'):
-        if str(output_path).endswith('.nii'):
-            output_path = Path(str(output_path) + '.gz')
+    if not str(output_path).endswith(".nii.gz"):
+        if str(output_path).endswith(".nii"):
+            output_path = Path(str(output_path) + ".gz")
         else:
-            output_path = Path(str(output_path) + '.nii.gz')
+            output_path = Path(str(output_path) + ".nii.gz")
     nib.save(img, str(output_path))
 
     # Write labels as JSON sidecar
     if labels_reordered:
         # Strip image extensions (.nii.gz or .nii) to get basename, then add .json
         path_str = str(output_path)
-        if path_str.endswith('.nii.gz'):
-            json_path = Path(path_str[:-7] + '.json')  # Remove .nii.gz
-        elif path_str.endswith('.nii'):
-            json_path = Path(path_str[:-4] + '.json')  # Remove .nii
+        if path_str.endswith(".nii.gz"):
+            json_path = Path(path_str[:-7] + ".json")  # Remove .nii.gz
+        elif path_str.endswith(".nii"):
+            json_path = Path(path_str[:-4] + ".json")  # Remove .nii
         else:
-            json_path = output_path.with_suffix('.json')  # Fallback
-        with json_path.open('w') as f:
-            json.dump({
-                "Description": "Single-trial betas reordered by presentation time (onset order)",
-                "Labels": labels_reordered,
-                "OnsetTimes": [onset_times[i] for i in sort_indices],
-                "OriginalColumnIndices": [stim_indices[i] for i in sort_indices],
-            }, f, indent=2)
+            json_path = output_path.with_suffix(".json")  # Fallback
+        with json_path.open("w") as f:
+            json.dump(
+                {
+                    "Description": "Single-trial betas reordered by presentation time (onset order)",
+                    "Labels": labels_reordered,
+                    "OnsetTimes": [onset_times[i] for i in sort_indices],
+                    "OriginalColumnIndices": [stim_indices[i] for i in sort_indices],
+                },
+                f,
+                indent=2,
+            )
 
     return output_path
 
@@ -152,9 +156,7 @@ def _ensure_numpy(array: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
     return array
 
 
-def _resolve_shape(
-    results: ResultsLike, volume_shape: Optional[Sequence[int]]
-) -> Sequence[int]:
+def _resolve_shape(results: ResultsLike, volume_shape: Optional[Sequence[int]]) -> Sequence[int]:
     """Resolve spatial shape from results metadata or caller fallback.
 
     Parameters
@@ -307,9 +309,7 @@ def slice_glm_results(
     return sliced
 
 
-def _build_affine(
-    affine: Optional[np.ndarray], voxel_size: Sequence[float]
-) -> np.ndarray:
+def _build_affine(affine: Optional[np.ndarray], voxel_size: Sequence[float]) -> np.ndarray:
     """Build affine from voxel size when explicit affine is unavailable.
 
     Parameters
@@ -411,16 +411,19 @@ def _strip_imaging_extension(filepath: str) -> str:
     'errts.sub-01'
     """
     EXTENSIONS = [
-        '+orig.BRIK.gz', '+tlrc.BRIK.gz',
-        '+orig.BRIK', '+tlrc.BRIK',
-        '+orig.HEAD', '+tlrc.HEAD',
-        '.nii.gz',
-        '.nii',
+        "+orig.BRIK.gz",
+        "+tlrc.BRIK.gz",
+        "+orig.BRIK",
+        "+tlrc.BRIK",
+        "+orig.HEAD",
+        "+tlrc.HEAD",
+        ".nii.gz",
+        ".nii",
     ]
 
     for ext in EXTENSIONS:
         if filepath.endswith(ext):
-            return filepath[:-len(ext)]
+            return filepath[: -len(ext)]
 
     return filepath
 
@@ -443,15 +446,15 @@ def _normalize_output_path(output_path: Union[str, Path]) -> tuple[Path, str]:
     path_str = str(output_path)
 
     # Detect format from extension
-    if path_str.endswith(('.HEAD', '.head')):
+    if path_str.endswith((".HEAD", ".head")):
         base = _strip_imaging_extension(path_str)
         return Path(base), "afni"
-    elif path_str.endswith(('.BRIK.gz', '.brik.gz', '.BRIK', '.brik')):
+    elif path_str.endswith((".BRIK.gz", ".brik.gz", ".BRIK", ".brik")):
         base = _strip_imaging_extension(path_str)
         return Path(base), "afni"
-    elif path_str.endswith(('.nii.gz', '.NII.GZ')):
+    elif path_str.endswith((".nii.gz", ".NII.GZ")):
         return output_path, "nifti_gz"
-    elif path_str.endswith(('.nii', '.NII')):
+    elif path_str.endswith((".nii", ".NII")):
         return output_path, "nifti"
     else:
         # Default to NIfTI compressed - ADD extension, don't replace
@@ -488,6 +491,7 @@ def _create_nifti_with_header(
     if nifti_header is not None:
         # Copy the complete header from original data
         import copy
+
         new_header = copy.deepcopy(nifti_header)
         # Update shape to match new data
         new_header.set_data_shape(data.shape)
@@ -531,15 +535,16 @@ def _save_nifti_with_format(
     if format == "afni":
         # Redirect AFNI requests to NIfTI with warning
         import warnings
+
         warnings.warn(
             "Direct writing of AFNI HEAD/BRIK format is not supported (cannot preserve metadata). "
             "Writing as compressed NIfTI (.nii.gz) instead. AFNI programs read NIfTI files natively.",
             UserWarning,
-            stacklevel=2
+            stacklevel=2,
         )
         # Use nifti_gz logic
         format = "nifti_gz"
-        
+
     if format == "nifti_gz":
         # Save as compressed NIfTI
         nifti_path = (
@@ -655,7 +660,9 @@ def write_glm_results_nifti(
 
     if stats_stack:
         stats_data = np.stack(stats_stack, axis=-1)
-        stats_img = _create_nifti_with_header(stats_data.astype(dtype, copy=False), affine_mat, results, tr)
+        stats_img = _create_nifti_with_header(
+            stats_data.astype(dtype, copy=False), affine_mat, results, tr
+        )
         stats_path = output_dir / f"{prefix}_stats.nii.gz"
         nib.save(stats_img, stats_path)
         outputs["stats"] = stats_path
@@ -668,7 +675,9 @@ def write_glm_results_nifti(
     if include_fstat and getattr(results, "fstats", None) is not None:
         fstat_np = _ensure_numpy(results.fstats)
         fstat_vol = _reshape_parameter_map(fstat_np, volume_shape, voxel_mask)
-        fstat_img = _create_nifti_with_header(fstat_vol.astype(dtype, copy=False), affine_mat, results, tr)
+        fstat_img = _create_nifti_with_header(
+            fstat_vol.astype(dtype, copy=False), affine_mat, results, tr
+        )
         fstat_path = output_dir / f"{prefix}_fstat.nii.gz"
         nib.save(fstat_img, fstat_path)
         outputs["fstat"] = fstat_path
@@ -676,7 +685,9 @@ def write_glm_results_nifti(
     if include_r2 and getattr(results, "r2", None) is not None:
         r2_np = _ensure_numpy(results.r2)
         r2_vol = _reshape_parameter_map(r2_np, volume_shape, voxel_mask)
-        r2_img = _create_nifti_with_header(r2_vol.astype(dtype, copy=False), affine_mat, results, tr)
+        r2_img = _create_nifti_with_header(
+            r2_vol.astype(dtype, copy=False), affine_mat, results, tr
+        )
         r2_path = output_dir / f"{prefix}_r2.nii.gz"
         nib.save(r2_img, r2_path)
         outputs["r2"] = r2_path
@@ -684,7 +695,9 @@ def write_glm_results_nifti(
     if include_mean and getattr(results, "meanvol", None) is not None:
         mean_np = _ensure_numpy(results.meanvol)
         mean_vol = _reshape_parameter_map(mean_np, volume_shape, voxel_mask)
-        mean_img = _create_nifti_with_header(mean_vol.astype(dtype, copy=False), affine_mat, results, tr)
+        mean_img = _create_nifti_with_header(
+            mean_vol.astype(dtype, copy=False), affine_mat, results, tr
+        )
         mean_path = output_dir / f"{prefix}_mean.nii.gz"
         nib.save(mean_img, mean_path)
         outputs["mean"] = mean_path
@@ -692,7 +705,9 @@ def write_glm_results_nifti(
     if include_sigma and getattr(results, "sigma2", None) is not None:
         sigma_np = np.sqrt(np.maximum(_ensure_numpy(results.sigma2), 0.0))
         sigma_vol = _reshape_parameter_map(sigma_np, volume_shape, voxel_mask)
-        sigma_img = _create_nifti_with_header(sigma_vol.astype(dtype, copy=False), affine_mat, results, tr)
+        sigma_img = _create_nifti_with_header(
+            sigma_vol.astype(dtype, copy=False), affine_mat, results, tr
+        )
         sigma_path = output_dir / f"{prefix}_sigma.nii.gz"
         nib.save(sigma_img, sigma_path)
         outputs["sigma"] = sigma_path
@@ -704,7 +719,9 @@ def write_glm_results_nifti(
             )
         resid_np = _ensure_numpy(results.residuals)
         resid_vol = _reshape_parameter_map(resid_np, volume_shape, voxel_mask)
-        resid_img = _create_nifti_with_header(resid_vol.astype(dtype, copy=False), affine_mat, results, tr)
+        resid_img = _create_nifti_with_header(
+            resid_vol.astype(dtype, copy=False), affine_mat, results, tr
+        )
         resid_path = output_dir / f"{prefix}_residuals.nii.gz"
         nib.save(resid_img, resid_path)
         outputs["residuals"] = resid_path
@@ -716,7 +733,9 @@ def write_glm_results_nifti(
             )
         pred_np = _ensure_numpy(results.predicted)
         pred_vol = _reshape_parameter_map(pred_np, volume_shape, voxel_mask)
-        pred_img = _create_nifti_with_header(pred_vol.astype(dtype, copy=False), affine_mat, results, tr)
+        pred_img = _create_nifti_with_header(
+            pred_vol.astype(dtype, copy=False), affine_mat, results, tr
+        )
         pred_path = output_dir / f"{prefix}_predicted.nii.gz"
         nib.save(pred_img, pred_path)
         outputs["predicted"] = pred_path
@@ -747,17 +766,27 @@ def write_afni_bucket(
     See `write_glm_bucket_as_nifti` for documentation.
     """
     import warnings
+
     warnings.warn(
         "`write_afni_bucket` is deprecated and renamed to `write_glm_bucket_as_nifti`. "
         "It writes NIfTI files (.nii.gz) which AFNI supports. "
         "Please update your code.",
         DeprecationWarning,
-        stacklevel=2
+        stacklevel=2,
     )
     return write_glm_bucket_as_nifti(
-        results, output_path, condition_names, contrast_names, contrast_results,
-        volume_shape, affine, voxel_size, dtype, apply_afni_metadata,
-        compress_output, output_format
+        results,
+        output_path,
+        condition_names,
+        contrast_names,
+        contrast_results,
+        volume_shape,
+        affine,
+        voxel_size,
+        dtype,
+        apply_afni_metadata,
+        compress_output,
+        output_format,
     )
 
 
@@ -926,12 +955,8 @@ def write_glm_bucket_as_nifti(
 
         for idx, name in enumerate(contrast_names):
             # Reshape contrast results
-            cb_vol = _reshape_parameter_map(
-                contrast_betas[:, idx], volume_shape, voxel_mask
-            )
-            ct_vol = _reshape_parameter_map(
-                contrast_tstats[:, idx], volume_shape, voxel_mask
-            )
+            cb_vol = _reshape_parameter_map(contrast_betas[:, idx], volume_shape, voxel_mask)
+            ct_vol = _reshape_parameter_map(contrast_tstats[:, idx], volume_shape, voxel_mask)
 
             # Beta coefficient
             subbricks.append(cb_vol.astype(dtype, copy=False))
@@ -973,16 +998,17 @@ def write_glm_bucket_as_nifti(
     # 3drefit works fine with NIfTI files, so always use NIfTI for buckets
     if detected_format == "afni":
         detected_format = "nifti_gz"  # Default to compressed NIfTI
-        
+
         # Warn user
         import warnings
+
         warnings.warn(
             f"Requested AFNI format output '{output_path}' but direct writing of .HEAD/.BRIK is not supported. "
             f"Writing as compressed NIfTI (.nii.gz) instead, which AFNI reads natively.",
             UserWarning,
-            stacklevel=2
+            stacklevel=2,
         )
-        
+
         # Strip AFNI extension and add .nii.gz
         base_name = _strip_imaging_extension(str(base_path))
         base_path = Path(base_name + ".nii.gz")
@@ -1024,22 +1050,22 @@ def write_glm_bucket_as_nifti(
                 # Get DoF from results
                 dof = getattr(results, "dof", None)
                 if dof is None:
-                    print(
-                        "  ⚠ Warning: No DoF found in results, skipping stat parameters"
-                    )
+                    print("  ⚠ Warning: No DoF found in results, skipping stat parameters")
                 else:
                     # Split into two 3drefit commands to avoid buffer overflow
                     # Command 1: Set labels (write to file to avoid buffer overflow)
                     labels_file = temp_path.parent / f"{temp_path.stem}_labels.txt"
-                    with labels_file.open('w') as f:
+                    with labels_file.open("w") as f:
                         # Write space-separated labels (AFNI format for -relabel_all)
                         f.write(" ".join(labels))
 
                     cmd_relabel = ["3drefit", "-relabel_all", str(labels_file), str(temp_path)]
 
                     # Write relabel command to file for debugging
-                    cmd_file_relabel = temp_path.parent / f"{temp_path.stem}_relabel_3drefit_cmd.txt"
-                    with cmd_file_relabel.open('w') as f:
+                    cmd_file_relabel = (
+                        temp_path.parent / f"{temp_path.stem}_relabel_3drefit_cmd.txt"
+                    )
+                    with cmd_file_relabel.open("w") as f:
                         f.write("# 3drefit command for setting sub-brick labels\n")
                         f.write("# This file is created automatically and can be deleted\n\n")
                         f.write(f"Labels written to: {labels_file}\n\n")
@@ -1047,6 +1073,7 @@ def write_glm_bucket_as_nifti(
                         f.write(f"{cmd_relabel}\n\n")
                         f.write("Command as shell string:\n")
                         import shlex
+
                         shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_relabel)
                         f.write(f"{shell_cmd}\n")
 
@@ -1096,8 +1123,10 @@ def write_glm_bucket_as_nifti(
                     cmd_statpar.append(str(temp_path))
 
                     # Write statpar command to file for debugging
-                    cmd_file_statpar = temp_path.parent / f"{temp_path.stem}_statpar_3drefit_cmd.txt"
-                    with cmd_file_statpar.open('w') as f:
+                    cmd_file_statpar = (
+                        temp_path.parent / f"{temp_path.stem}_statpar_3drefit_cmd.txt"
+                    )
+                    with cmd_file_statpar.open("w") as f:
                         f.write("# 3drefit command for setting statistical parameters\n")
                         f.write("# This file is created automatically and can be deleted\n\n")
                         f.write("Command as list:\n")
@@ -1138,7 +1167,7 @@ def write_glm_bucket_as_nifti(
                 subprocess.run(
                     ["pigz", "-f", str(temp_path)],  # -f: force overwrite
                     check=True,
-                    capture_output=True
+                    capture_output=True,
                 )
                 # pigz creates .nii.gz automatically
                 # Rename if needed (pigz adds .gz to existing name)
@@ -1149,6 +1178,7 @@ def write_glm_bucket_as_nifti(
             except subprocess.CalledProcessError:
                 # pigz failed, fall back to gzip
                 import gzip
+
                 with open(temp_path, "rb") as f_in:
                     with gzip.open(compressed_path, "wb") as f_out:
                         shutil.copyfileobj(f_in, f_out)
@@ -1157,6 +1187,7 @@ def write_glm_bucket_as_nifti(
         else:
             # pigz not available, use standard gzip (slower but universal)
             import gzip
+
             with open(temp_path, "rb") as f_in:
                 with gzip.open(compressed_path, "wb") as f_out:
                     shutil.copyfileobj(f_in, f_out)
@@ -1232,8 +1263,7 @@ def write_ols_arma_comparison(
     # Validate
     if arma_results.ols_results is None:
         raise ValueError(
-            "ARMA results missing ols_results. "
-            "Use want_ols=True when calling fit_glm_arma11()."
+            "ARMA results missing ols_results. Use want_ols=True when calling fit_glm_arma11()."
         )
 
     ols_results = arma_results.ols_results
@@ -1241,21 +1271,15 @@ def write_ols_arma_comparison(
 
     # Extract contrast_results for OLS and ARMA if provided
     # User might pass contrast_results_ols and contrast_results_arma
-    contrast_results_ols = kwargs.pop(
-        "contrast_results_ols", kwargs.get("contrast_results")
-    )
-    contrast_results_arma = kwargs.pop(
-        "contrast_results_arma", kwargs.get("contrast_results")
-    )
+    contrast_results_ols = kwargs.pop("contrast_results_ols", kwargs.get("contrast_results"))
+    contrast_results_arma = kwargs.pop("contrast_results_arma", kwargs.get("contrast_results"))
 
     # Remove the generic one if it exists
     kwargs.pop("contrast_results", None)
 
     # Determine output format and construct paths
     output_format = kwargs.get("output_format")
-    if output_format == "afni" or (
-        output_format is None and "+tlrc" in str(output_prefix)
-    ):
+    if output_format == "afni" or (output_format is None and "+tlrc" in str(output_prefix)):
         # AFNI format
         ols_path = str(output_prefix.parent / f"{output_prefix.stem}_OLS+tlrc")
         arma_path = str(output_prefix.parent / f"{output_prefix.stem}_ARMA+tlrc")
@@ -1305,8 +1329,7 @@ def write_ols_arma_comparison(
         "comparison": {
             "r2_improvement": float(arma_results.r2.mean() - ols_results.r2.mean()),
             "tstat_ratio": float(
-                arma_results.tstats.abs().mean()
-                / (ols_results.tstats.abs().mean() + 1e-10)
+                arma_results.tstats.abs().mean() / (ols_results.tstats.abs().mean() + 1e-10)
             ),
             "beta_correlation": float(
                 np.corrcoef(
@@ -1327,9 +1350,7 @@ def write_ols_arma_comparison(
             f"ARMA has better fit (R² improvement: +{100 * r2_improvement:.2f}%)"
         )
     else:
-        summary["interpretation"]["fit_quality"] = (
-            "ARMA and OLS similar (low autocorrelation)"
-        )
+        summary["interpretation"]["fit_quality"] = "ARMA and OLS similar (low autocorrelation)"
 
     if tstat_ratio < 0.95:
         summary["interpretation"]["tstat_correction"] = (
@@ -1345,9 +1366,7 @@ def write_ols_arma_comparison(
         )
 
     # Write summary JSON
-    summary_path = (
-        output_prefix.parent / f"{output_prefix.stem}_comparison_summary.json"
-    )
+    summary_path = output_prefix.parent / f"{output_prefix.stem}_comparison_summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -1362,9 +1381,7 @@ def write_ols_arma_comparison(
     print("\nARMA:")
     print(f"  Mean R²: {summary['arma']['mean_r2']:.4f}")
     print(f"  Mean |t|: {summary['arma']['mean_abs_tstat']:.3f}")
-    print(
-        f"  Mean (a,b): ({summary['arma']['mean_a']:.3f}, {summary['arma']['mean_b']:.3f})"
-    )
+    print(f"  Mean (a,b): ({summary['arma']['mean_a']:.3f}, {summary['arma']['mean_b']:.3f})")
 
     print("\nComparison:")
     print(f"  R² improvement: {summary['comparison']['r2_improvement']:.4f}")
@@ -1481,7 +1498,7 @@ def write_partial_r2_with_labels(
             # Split into two 3drefit commands to avoid buffer overflow
             # Command 1: Set labels (write to file to avoid buffer overflow)
             labels_file = temp_path.parent / f"{temp_path.stem}_labels.txt"
-            with labels_file.open('w') as f:
+            with labels_file.open("w") as f:
                 # Write space-separated labels (AFNI format for -relabel_all)
                 f.write(" ".join(labels))
 
@@ -1489,7 +1506,7 @@ def write_partial_r2_with_labels(
 
             # Write relabel command to file for debugging
             cmd_file_relabel = temp_path.parent / f"{temp_path.stem}_relabel_3drefit_cmd.txt"
-            with cmd_file_relabel.open('w') as f:
+            with cmd_file_relabel.open("w") as f:
                 f.write("# 3drefit command for setting sub-brick labels (partial R²)\n")
                 f.write("# This file is created automatically and can be deleted\n\n")
                 f.write(f"Labels written to: {labels_file}\n\n")
@@ -1497,6 +1514,7 @@ def write_partial_r2_with_labels(
                 f.write(f"{cmd_relabel}\n\n")
                 f.write("Command as shell string:\n")
                 import shlex
+
                 shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_relabel)
                 f.write(f"{shell_cmd}\n")
 
@@ -1513,16 +1531,22 @@ def write_partial_r2_with_labels(
                     # SAMPLES = n_timepoints
                     # FIT-PARAMETERS = 1 (testing 1 regressor)
                     # ORT-PARAMETERS = n_regressors - 1 (orthogonalized against others)
-                    cmd_statpar.extend([
-                        "-substatpar", str(brick_idx), "fico",
-                        str(n_timepoints), "1", str(n_regressors - 1)
-                    ])
+                    cmd_statpar.extend(
+                        [
+                            "-substatpar",
+                            str(brick_idx),
+                            "fico",
+                            str(n_timepoints),
+                            "1",
+                            str(n_regressors - 1),
+                        ]
+                    )
 
                 cmd_statpar.append(str(temp_path))
 
                 # Write statpar command to file for debugging
                 cmd_file_statpar = temp_path.parent / f"{temp_path.stem}_statpar_3drefit_cmd.txt"
-                with cmd_file_statpar.open('w') as f:
+                with cmd_file_statpar.open("w") as f:
                     f.write("# 3drefit command for setting statistical parameters (partial R²)\n")
                     f.write("# This file is created automatically and can be deleted\n\n")
                     f.write("Command as list:\n")

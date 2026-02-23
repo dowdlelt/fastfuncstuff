@@ -768,9 +768,9 @@ def compute_power_spectra(
     # Build a broadcastable multiplier: 2× everywhere except DC and Nyquist
     n_freqs = n // 2 + 1
     multiplier = np.full(n_freqs, 2.0)
-    multiplier[0] = 1.0          # DC — no mirror
+    multiplier[0] = 1.0  # DC — no mirror
     if n % 2 == 0:
-        multiplier[-1] = 1.0     # Nyquist — its own mirror
+        multiplier[-1] = 1.0  # Nyquist — its own mirror
 
     # Reshape multiplier to broadcast along `axis`
     shape = [1] * signals.ndim

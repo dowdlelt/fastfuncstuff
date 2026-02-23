@@ -1,4 +1,5 @@
 """Timing utilities for performance profiling."""
+
 from __future__ import annotations
 
 import time
@@ -83,9 +84,7 @@ class TimingProfiler:
             mean = total / n_calls
             pct = 100 * total / total_time if total_time > 0 else 0
 
-            lines.append(
-                f"{name:<50} {n_calls:>8} {total:>9.3f}s {mean:>9.3f}s {pct:>5.1f}%"
-            )
+            lines.append(f"{name:<50} {n_calls:>8} {total:>9.3f}s {mean:>9.3f}s {pct:>5.1f}%")
 
         lines.append("-" * 80)
         lines.append(f"{'TOTAL':<50} {'':<8} {total_time:>9.3f}s")
