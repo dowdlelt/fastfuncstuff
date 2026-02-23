@@ -15,7 +15,7 @@ For help:
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -804,7 +804,7 @@ def main():
 
         # Parse HRF model arguments
         print()
-        from fastfuncsim.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
+        from fastfuncsim.cli_utils import parse_hrf_model_args
 
         hrf_info = parse_hrf_model_args(
             hrf_model_arg=args.hrf_model,

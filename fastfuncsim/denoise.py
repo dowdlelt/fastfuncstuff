@@ -44,6 +44,18 @@ Key Features
 - Flexible nuisance regressor framework (PCs, ICs, custom)
 - Polynomial drift and other nuisance regressors maintained
 - Median R² across CV folds for robust selection
+
+References
+----------
+GLMdenoise:
+    Kay KN, Rokem A, Winawer J, Dougherty RF & Wandell BA (2013).
+    GLMdenoise: A fast, automated technique for denoising task-based fMRI data.
+    Frontiers in Neuroscience. https://github.com/cvnlab/GLMdenoise
+
+GLMsingle (Type-C denoising):
+    Prince JS, Charest I, Kurzawski JW, Pyles JA, Tarr MJ, Kay KN.
+    Improving the accuracy of single-trial fMRI response estimates using GLMsingle.
+    eLife (2022). https://github.com/cvnlab/GLMsingle
 """
 
 from __future__ import annotations
@@ -65,7 +77,7 @@ from .xval import (
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
-from .memory import estimate_chunk_size, dyn_chunk_estimator
+from .memory import dyn_chunk_estimator
 
 
 def _compute_local_run_starts(

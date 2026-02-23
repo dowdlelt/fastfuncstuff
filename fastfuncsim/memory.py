@@ -9,25 +9,193 @@ Key principles:
 - Device-aware optimization (GPU vs CPU vs MPS)
 - Per-operation memory models based on actual algorithm requirements
 - Unified chunk size estimation across all modules
+- User-configurable safety factors via MemoryConfig
+
+Configuration
+-------------
+Memory behavior can be customized globally via MemoryConfig:
+
+    from fastfuncsim.memory import MemoryConfig, set_memory_config
+
+    # Use 70% of available GPU memory (more aggressive)
+    config = MemoryConfig(gpu_safety_factor=0.7)
+    set_memory_config(config)
+
+    # Or use 30% of available GPU memory (more conservative)
+    config = MemoryConfig(gpu_safety_factor=0.3)
+    set_memory_config(config)
+
+The configuration applies to all chunk size calculations automatically.
 """
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-# Default configuration
+
+@dataclass
+class MemoryConfig:
+    """
+    Global memory configuration for fastfuncsim.
+
+    This class centralizes all memory-related parameters that affect
+    chunk size estimation and memory usage across the package.
+
+    Attributes
+    ----------
+    gpu_safety_factor : float, default=0.5
+        Fraction of available GPU memory to use (0 < factor <= 1).
+        Lower values = more conservative (fewer OOM errors but smaller chunks).
+        Higher values = more aggressive (larger chunks but OOM risk).
+        Recommended: 0.3-0.5 for limited VRAM, 0.6-0.8 for abundant VRAM.
+
+    cpu_safety_factor : float, default=0.75
+        Fraction of system RAM to use for CPU processing.
+        Aggressive by default (75%) since RAM is typically abundant (64-256GB+).
+        Uses psutil to query actual available memory.
+
+    min_chunk_size : int, default=1000
+        Minimum chunk size (voxels). Prevents excessive overhead from tiny chunks.
+
+    max_chunk_size_gpu : int, default=90000
+        Maximum chunk size on GPU. Limits peak memory even if available.
+
+    max_chunk_size_cpu : int, default=1000000
+        Maximum chunk size on CPU (1M voxels). High since RAM is typically 64-256GB+.
+
+    data_threshold_gb : float, default=4.0
+        Dataset size threshold (GB) for deciding GPU vs CPU data storage.
+        Datasets larger than this will use CPU storage with GPU streaming.
+
+    arma_safety_factor : float, default=0.6
+        Safety factor specifically for ARMA operations, which have higher
+        peak memory due to Cholesky decomposition and matrix operations.
+
+    double_precision_multiplier : float, default=2.0
+        Memory multiplier when using float64 instead of float32.
+
+    Examples
+    --------
+    Default configuration (balanced):
+        >>> config = MemoryConfig()  # 50% GPU, 75% CPU memory usage
+
+    Aggressive configuration (for high-VRAM GPUs):
+        >>> config = MemoryConfig(gpu_safety_factor=0.7, max_chunk_size_gpu=150000)
+
+    Conservative configuration (for limited VRAM):
+        >>> config = MemoryConfig(gpu_safety_factor=0.3, min_chunk_size=500)
+    """
+
+    gpu_safety_factor: float = 0.5
+    cpu_safety_factor: float = 0.75
+    min_chunk_size: int = 1000
+    max_chunk_size_gpu: int = 90000
+    max_chunk_size_cpu: int = 1000000
+    data_threshold_gb: float = 4.0
+    arma_safety_factor: float = 0.6
+    double_precision_multiplier: float = 2.0
+
+    def __post_init__(self):
+        if not 0 < self.gpu_safety_factor <= 1:
+            raise ValueError(f"gpu_safety_factor must be in (0, 1], got {self.gpu_safety_factor}")
+        if not 0 < self.cpu_safety_factor <= 1:
+            raise ValueError(f"cpu_safety_factor must be in (0, 1], got {self.cpu_safety_factor}")
+        if self.min_chunk_size < 100:
+            raise ValueError(f"min_chunk_size must be >= 100, got {self.min_chunk_size}")
+
+
+# Global configuration instance (singleton pattern)
+_global_config: Optional[MemoryConfig] = None
+
+
+def get_memory_config() -> MemoryConfig:
+    """
+    Get the global memory configuration.
+
+    Returns
+    -------
+    MemoryConfig
+        The current global memory configuration. If not set, returns
+        a default configuration, optionally initialized from environment
+        variables.
+
+    Notes
+    -----
+    Environment variables can override defaults:
+    - FFS_GPU_SAFETY_FACTOR: Override gpu_safety_factor
+    - FFS_MIN_CHUNK_SIZE: Override min_chunk_size
+    - FFS_MAX_CHUNK_SIZE_GPU: Override max_chunk_size_gpu
+    - FFS_DATA_THRESHOLD_GB: Override data_threshold_gb
+    """
+    global _global_config
+
+    if _global_config is None:
+        # Check environment variables
+        env_overrides = {}
+        if "FFS_GPU_SAFETY_FACTOR" in os.environ:
+            env_overrides["gpu_safety_factor"] = float(os.environ["FFS_GPU_SAFETY_FACTOR"])
+        if "FFS_CPU_SAFETY_FACTOR" in os.environ:
+            env_overrides["cpu_safety_factor"] = float(os.environ["FFS_CPU_SAFETY_FACTOR"])
+        if "FFS_MIN_CHUNK_SIZE" in os.environ:
+            env_overrides["min_chunk_size"] = int(os.environ["FFS_MIN_CHUNK_SIZE"])
+        if "FFS_MAX_CHUNK_SIZE_GPU" in os.environ:
+            env_overrides["max_chunk_size_gpu"] = int(os.environ["FFS_MAX_CHUNK_SIZE_GPU"])
+        if "FFS_MAX_CHUNK_SIZE_CPU" in os.environ:
+            env_overrides["max_chunk_size_cpu"] = int(os.environ["FFS_MAX_CHUNK_SIZE_CPU"])
+        if "FFS_DATA_THRESHOLD_GB" in os.environ:
+            env_overrides["data_threshold_gb"] = float(os.environ["FFS_DATA_THRESHOLD_GB"])
+        if "FFS_ARMA_SAFETY_FACTOR" in os.environ:
+            env_overrides["arma_safety_factor"] = float(os.environ["FFS_ARMA_SAFETY_FACTOR"])
+
+        _global_config = MemoryConfig(**env_overrides)
+
+    return _global_config
+
+
+def set_memory_config(config: MemoryConfig) -> None:
+    """
+    Set the global memory configuration.
+
+    Parameters
+    ----------
+    config : MemoryConfig
+        The configuration to use globally.
+
+    Examples
+    --------
+    >>> config = MemoryConfig(gpu_safety_factor=0.7)
+    >>> set_memory_config(config)
+    >>> # All subsequent operations use 70% of available GPU memory
+    """
+    global _global_config
+    _global_config = config
+
+
+def reset_memory_config() -> None:
+    """
+    Reset the global memory configuration to defaults.
+
+    This clears any custom configuration and environment variable overrides.
+    """
+    global _global_config
+    _global_config = None
+
+
+# Legacy constants (for backwards compatibility)
 DEFAULT_MIN_CHUNK_SIZE = 1000
 DEFAULT_MAX_CHUNK_SIZE_GPU = 90000
 DEFAULT_MAX_CHUNK_SIZE_CPU = 350000
-DEFAULT_GPU_MEMORY_SAFETY_FACTOR = 0.5  # Use 50% of available GPU memory
-DEFAULT_CPU_MEMORY_THRESHOLD_GB = 4.0  # Use GPU-like chunks if data < 4GB
+DEFAULT_GPU_MEMORY_SAFETY_FACTOR = 0.5
+DEFAULT_CPU_MEMORY_THRESHOLD_GB = 4.0
 
 
 def get_available_memory(
     device: torch.device,
-    safety_factor: float = DEFAULT_GPU_MEMORY_SAFETY_FACTOR,
+    safety_factor: Optional[float] = None,
 ) -> int:
     """
     Get available memory on the specified device in bytes.
@@ -36,8 +204,9 @@ def get_available_memory(
     ----------
     device : torch.device
         Target compute device
-    safety_factor : float, default=0.5
-        Fraction of available memory to use (0 < safety_factor <= 1)
+    safety_factor : float, optional
+        Fraction of available memory to use (0 < safety_factor <= 1).
+        If None, uses config defaults (0.5 for GPU, 0.75 for CPU).
 
     Returns
     -------
@@ -46,27 +215,44 @@ def get_available_memory(
 
     Notes
     -----
-    - For GPU: Returns free GPU memory * safety_factor
-    - For CPU: Returns a fraction of system RAM (conservative estimate)
-    - For MPS: Uses conservative 4GB estimate
+    - For GPU: Returns free GPU memory * gpu_safety_factor (default 50%)
+    - For CPU: Queries actual system RAM via psutil, uses cpu_safety_factor (default 75%)
+    - For MPS: Uses unified memory estimate based on system RAM
     """
+    config = get_memory_config()
+
     if device.type == "cuda":
+        if safety_factor is None:
+            safety_factor = config.gpu_safety_factor
         try:
-            # Use reserved memory to account for fragmentation
+            torch.cuda.empty_cache()
             reserved = torch.cuda.memory_reserved(device)
             total = torch.cuda.get_device_properties(device).total_memory
             free = total - reserved
             return int(free * safety_factor)
         except Exception:
-            # Fallback to conservative 2GB estimate
             return 2 * 1024**3
     elif device.type == "mps":
-        # MPS doesn't have good memory querying - conservative estimate
-        return int(DEFAULT_CPU_MEMORY_THRESHOLD_GB * 1024**3 * safety_factor)
+        if safety_factor is None:
+            safety_factor = config.cpu_safety_factor
+        try:
+            import psutil
+
+            available_gb = psutil.virtual_memory().available / (1024**3)
+            return int(available_gb * 1024**3 * safety_factor)
+        except ImportError:
+            return int(8 * 1024**3 * safety_factor)
     else:
-        # CPU - estimate available RAM (conservative 8GB estimate)
-        # In practice, system RAM is usually sufficient for CPU processing
-        return 128 * 1024**3
+        if safety_factor is None:
+            safety_factor = config.cpu_safety_factor
+        try:
+            import psutil
+
+            mem = psutil.virtual_memory()
+            available_bytes = mem.available
+            return int(available_bytes * safety_factor)
+        except ImportError:
+            return int(128 * 1024**3 * safety_factor)
 
 
 def bytes_per_voxel_glm(
@@ -356,28 +542,32 @@ def dyn_chunk_estimator(
     ...     cv_strategy=0.5,  # Split-half
     ... )
     """
+    config = get_memory_config()
+
     # Auto-detect device
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Set defaults
+    # Set defaults from config
     if min_chunk_size is None:
-        min_chunk_size = min(DEFAULT_MIN_CHUNK_SIZE, n_voxels)
+        min_chunk_size = min(config.min_chunk_size, n_voxels)
 
     if max_chunk_size is None:
         if device.type == "cuda":
-            max_chunk_size = min(DEFAULT_MAX_CHUNK_SIZE_GPU, n_voxels)
+            max_chunk_size = min(config.max_chunk_size_gpu, n_voxels)
         else:
-            max_chunk_size = min(DEFAULT_MAX_CHUNK_SIZE_CPU, n_voxels)
+            max_chunk_size = min(config.max_chunk_size_cpu, n_voxels)
 
     if safety_factor is None:
-        safety_factor = DEFAULT_GPU_MEMORY_SAFETY_FACTOR if device.type == "cuda" else 0.5
+        safety_factor = (
+            config.gpu_safety_factor if device.type == "cuda" else config.cpu_safety_factor
+        )
 
     # Auto-detect data location
     if data_location == "auto":
         # Assume CPU for large datasets on GPU to avoid OOM
         data_size_gb = (n_voxels * n_timepoints * 4) / (1024**3)
-        if device.type == "cuda" and data_size_gb > DEFAULT_CPU_MEMORY_THRESHOLD_GB:
+        if device.type == "cuda" and data_size_gb > config.data_threshold_gb:
             data_location = "cpu"
         else:
             data_location = device.type
@@ -531,14 +721,15 @@ def estimate_chunk_size(
     operation: str = "glm",
     min_chunk_size: Optional[int] = None,
     max_chunk_size: Optional[int] = None,
-    safety_factor: float = DEFAULT_GPU_MEMORY_SAFETY_FACTOR,
+    safety_factor: Optional[float] = None,
+    use_double: bool = False,
     verbose: bool = False,
 ) -> int:
     """
     Estimate optimal chunk size for memory-efficient processing.
 
     This is the unified chunk size estimator for all fastfuncsim operations.
-    It replaces the previous separate estimators in utils.py and xval.py.
+    Automatically uses appropriate defaults for CPU (aggressive) vs GPU (conservative).
 
     Parameters
     ----------
@@ -552,14 +743,14 @@ def estimate_chunk_size(
         Target compute device
     operation : str, default="glm"
         Type of operation: "glm", "xval", "ridge", "denoise", "arma"
-        Note: ARMA uses its own specialized chunking logic; this is provided
-        for API completeness but ARMA modules typically use their own estimators.
     min_chunk_size : int, optional
-        Minimum chunk size (default: 1000 or n_voxels if smaller)
+        Minimum chunk size. Default: from config (1000)
     max_chunk_size : int, optional
-        Maximum chunk size (default: 50000 for GPU, 100000 for CPU)
-    safety_factor : float, default=0.3
-        Fraction of available memory to use (0 < safety_factor <= 1)
+        Maximum chunk size. Default: 90000 for GPU, 1000000 for CPU
+    safety_factor : float, optional
+        Fraction of available memory to use. Default: 0.5 GPU, 0.75 CPU
+    use_double : bool, default=False
+        If True, account for float64 (2x memory)
     verbose : bool, default=False
         Print chunk size estimation details
 
@@ -570,9 +761,15 @@ def estimate_chunk_size(
 
     Notes
     -----
+    CPU vs GPU behavior:
+    - CPU: Aggressive! Uses 75% of available RAM by default. Data is already
+      in RAM, so chunking is for computation efficiency, not memory limits.
+    - GPU: Conservative! Uses 50% of VRAM by default. We stream chunks from
+      CPU to GPU, so careful chunking prevents OOM errors.
+
     The chunk size is determined by:
     1. Per-voxel memory requirement for the operation
-    2. Available device memory
+    2. Available device memory (from config)
     3. Min/max bounds to ensure reasonable chunks
 
     Examples
@@ -584,16 +781,23 @@ def estimate_chunk_size(
     ...     device=torch.device("cuda"),
     ...     operation="xval",
     ... )
+
+    Customize for aggressive GPU usage:
+    >>> from fastfuncsim.memory import MemoryConfig, set_memory_config
+    >>> config = MemoryConfig(gpu_safety_factor=0.7)
+    >>> set_memory_config(config)
     """
-    # Set defaults
+    config = get_memory_config()
+
+    # Set defaults from config
     if min_chunk_size is None:
-        min_chunk_size = min(DEFAULT_MIN_CHUNK_SIZE, n_voxels)
+        min_chunk_size = min(config.min_chunk_size, n_voxels)
 
     if max_chunk_size is None:
         if device.type == "cuda":
-            max_chunk_size = min(DEFAULT_MAX_CHUNK_SIZE_GPU, n_voxels)
+            max_chunk_size = min(config.max_chunk_size_gpu, n_voxels)
         else:
-            max_chunk_size = min(DEFAULT_MAX_CHUNK_SIZE_CPU, n_voxels)
+            max_chunk_size = min(config.max_chunk_size_cpu, n_voxels)
 
     # Get per-voxel memory requirement
     operation = operation.lower()
@@ -608,14 +812,20 @@ def estimate_chunk_size(
     elif operation == "arma":
         bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
     else:
-        print(f"WARNING: Unknown operation '{operation}', using GLM memory model")
         bytes_per_voxel = bytes_per_voxel_glm(n_timepoints, n_regressors)
 
-    # Get available memory
+    # Adjust for double precision
+    if use_double:
+        bytes_per_voxel = int(bytes_per_voxel * config.double_precision_multiplier)
+
+    # Get available memory (uses config defaults if safety_factor is None)
     available_bytes = get_available_memory(device, safety_factor)
 
     # Estimate chunk size based on memory
-    estimated_chunk = available_bytes // bytes_per_voxel
+    if bytes_per_voxel > 0:
+        estimated_chunk = available_bytes // bytes_per_voxel
+    else:
+        estimated_chunk = max_chunk_size
 
     # Apply bounds
     chunk_size = max(min_chunk_size, min(estimated_chunk, max_chunk_size))
@@ -626,12 +836,19 @@ def estimate_chunk_size(
     if verbose:
         memory_per_chunk_mb = (chunk_size * bytes_per_voxel) / (1024**2)
         available_mb = available_bytes / (1024**2)
-        print("  Chunk size estimation:")
+        effective_safety = (
+            safety_factor
+            if safety_factor
+            else (config.gpu_safety_factor if device.type == "cuda" else config.cpu_safety_factor)
+        )
+        print(f"\n  Chunk size estimation:")
         print(f"    Operation: {operation}")
-        print(f"    Per-voxel memory: {bytes_per_voxel} bytes")
-        print(f"    Available memory: {available_mb:.1f} MB")
-        print(f"    Chunk size: {chunk_size} voxels")
+        print(f"    Device: {device}")
+        print(f"    Per-voxel memory: {bytes_per_voxel:,} bytes")
+        print(f"    Available memory: {available_mb:.1f} MB (safety={effective_safety})")
+        print(f"    Chunk size: {chunk_size:,} voxels")
         print(f"    Memory per chunk: {memory_per_chunk_mb:.1f} MB")
+        print(f"    Number of chunks: {(n_voxels + chunk_size - 1) // chunk_size}")
 
     return chunk_size
 

@@ -87,3 +87,4 @@ test_data/**/afni_*.nii.gz
 *.tmp
 *.temp
 *.log
+.coverage

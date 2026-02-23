@@ -9,6 +9,7 @@ This module provides functions to build GLM design matrices from:
 The goal is to replicate AFNI's 3dDeconvolve design matrix construction
 while being easier to use and integrate with our fast GLM fitting.
 """
+
 from __future__ import annotations
 
 import re
@@ -26,6 +27,10 @@ def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
     Create SPM canonical HRF (double gamma function)
 
     This is the standard HRF used in SPM and AFNI's SPMG1 basis function.
+
+    .. deprecated::
+        For AFNI-exact HRF generation, use `hrf.get_spmg1_hrf()` instead,
+        which implements the exact AFNI SPMG1 formula.
 
     Parameters
     ----------
@@ -46,6 +51,9 @@ def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
     - Negative undershoot at ~16s (post-stimulus undershoot)
 
     AFNI's SPMG1(d) uses this HRF with duration d for the stimulus.
+
+    For exact AFNI compatibility, prefer `hrf.get_spmg1_hrf()` which uses
+    the precise AFNI formula: h(t) = exp(-t) * (A1*t^P1 - A2*t^P2)
 
     References
     ----------
@@ -206,7 +214,7 @@ def parse_afni_timing_file(filepath: Union[str, Path]) -> List[np.ndarray]:
             else:
                 # Check for '* *' marker (condition not present)
                 tokens = line.split()
-                if len(tokens) == 2 and tokens[0] == '*' and tokens[1] == '*':
+                if len(tokens) == 2 and tokens[0] == "*" and tokens[1] == "*":
                     # Condition not present in this run
                     onsets_by_run.append(np.array([]))
                 else:
@@ -277,7 +285,7 @@ def create_onset_regressors(
     # Convolve with HRF if provided
     if hrf is not None:
         # Use 'full' mode and truncate to match input length
-        regressor = np.convolve(regressor, hrf, mode='full')[:n_timepoints]
+        regressor = np.convolve(regressor, hrf, mode="full")[:n_timepoints]
 
         # Normalize by max to maintain percent signal change scaling
         # This ensures that a single boxcar+HRF response has amplitude 1.0
@@ -288,7 +296,7 @@ def create_onset_regressors(
             ref_boxcar = np.zeros(len(hrf) * 2)
             duration_tr = int(np.round(duration / tr))
             ref_boxcar[:duration_tr] = 1.0
-            ref_response = np.convolve(ref_boxcar, hrf, mode='full')
+            ref_response = np.convolve(ref_boxcar, hrf, mode="full")
             max_response = ref_response.max()
 
             if max_response > 0:
@@ -329,21 +337,23 @@ def parse_glt_string(glt_string: str) -> Tuple[Dict[str, float], bool]:
     """
     # Remove 'SYM:' prefix if present
     glt_string = glt_string.strip()
-    if glt_string.upper().startswith('SYM:'):
+    if glt_string.upper().startswith("SYM:"):
         glt_string = glt_string[4:].strip()
 
     # Parse weights and labels: pattern is [+/-]weight*label
     # Match: optional sign, number (int or float), *, label
-    pattern = r'([+-]?\s*\d+\.?\d*)\s*\*\s*([A-Za-z_][\w\-]*)'
+    pattern = r"([+-]?\s*\d+\.?\d*)\s*\*\s*([A-Za-z_][\w\-]*)"
     matches = re.findall(pattern, glt_string)
 
     if not matches:
-        raise ValueError(f"Could not parse GLT string: '{glt_string}'. Expected format: 'SYM: +1*label1 -1*label2'")
+        raise ValueError(
+            f"Could not parse GLT string: '{glt_string}'. Expected format: 'SYM: +1*label1 -1*label2'"
+        )
 
     weights = {}
     for weight_str, label in matches:
         # Remove spaces and convert to float
-        weight_str = weight_str.replace(' ', '')
+        weight_str = weight_str.replace(" ", "")
         weight = float(weight_str)
         weights[label] = weight
 
@@ -353,6 +363,7 @@ def parse_glt_string(glt_string: str) -> Tuple[Dict[str, float], bool]:
 
     if not is_valid:
         import warnings
+
         warnings.warn(
             f"GLT weights sum to {weight_sum:.6f}, expected 0 (difference) or 1 (average). "
             f"GLT: '{glt_string}'"
@@ -407,8 +418,9 @@ def glt_weights_to_vector(
             # Try matching base label (e.g., 'movie' matches 'movie#0')
             # For standard mode, this finds the single column
             # For IM mode, this would sum across all events (movie#0, movie#1, ...)
-            matches = [i for i, l in enumerate(regressor_labels)
-                      if l.split('#')[0] == label and '#' in l]
+            matches = [
+                i for i, l in enumerate(regressor_labels) if l.split("#")[0] == label and "#" in l
+            ]
 
             if matches:
                 # Standard mode: single match (movie#0)
@@ -466,17 +478,19 @@ def parse_hrf_model(hrf_string: str) -> Tuple[str, Union[float, Dict]]:
     """
     # Match pattern: MODEL(duration) or MODEL(p1,p2,p3)
     # Model name can contain letters and digits (e.g., SPMG1, BLOCK, TENT)
-    match = re.match(r'^([A-Z][A-Z0-9]*)\(([^)]+)\)$', hrf_string, re.IGNORECASE)
+    match = re.match(r"^([A-Z][A-Z0-9]*)\(([^)]+)\)$", hrf_string, re.IGNORECASE)
 
     if not match:
-        raise ValueError(f"Invalid HRF model string: '{hrf_string}'. Expected format like 'SPMG1(5)' or 'TENT(0,15,6)'")
+        raise ValueError(
+            f"Invalid HRF model string: '{hrf_string}'. Expected format like 'SPMG1(5)' or 'TENT(0,15,6)'"
+        )
 
     model_name = match.group(1).upper()  # Normalize to uppercase
     params_str = match.group(2)
 
     # Handle TENT/TENTzero models with 3 parameters: TENT(bot,top,n)
-    if model_name in ('TENT', 'TENTZERO'):
-        params_parts = params_str.split(',')
+    if model_name in ("TENT", "TENTZERO"):
+        params_parts = params_str.split(",")
         if len(params_parts) != 3:
             raise ValueError(
                 f"Invalid {model_name} model '{hrf_string}'. "
@@ -487,19 +501,16 @@ def parse_hrf_model(hrf_string: str) -> Tuple[str, Union[float, Dict]]:
             top = float(params_parts[1].strip())
             n_basis = int(params_parts[2].strip())
         except ValueError as e:
-            raise ValueError(
-                f"Invalid parameters in '{hrf_string}'. "
-                f"Expected numeric values: {e}"
-            )
+            raise ValueError(f"Invalid parameters in '{hrf_string}'. Expected numeric values: {e}")
 
         if bot >= top:
             raise ValueError(f"In '{hrf_string}': bot ({bot}) must be < top ({top})")
 
-        min_n = 3 if model_name == 'TENTZERO' else 2
+        min_n = 3 if model_name == "TENTZERO" else 2
         if n_basis < min_n:
             raise ValueError(f"In '{hrf_string}': n_basis must be >= {min_n}, got {n_basis}")
 
-        return model_name, {'bot': bot, 'top': top, 'n_basis': n_basis}
+        return model_name, {"bot": bot, "top": top, "n_basis": n_basis}
 
     # Handle simple single-parameter models (SPMG1, BLOCK, etc.)
     else:
@@ -568,8 +579,7 @@ def load_and_pad_ortvec(
     # Validate run number
     if run_number < 1 or run_number > len(n_timepoints_per_run):
         raise ValueError(
-            f"Invalid run_number={run_number}. "
-            f"Must be between 1 and {len(n_timepoints_per_run)}"
+            f"Invalid run_number={run_number}. Must be between 1 and {len(n_timepoints_per_run)}"
         )
 
     # Validate file length matches run length
@@ -585,7 +595,7 @@ def load_and_pad_ortvec(
     padded = np.zeros((total_timepoints, n_cols))
 
     # Insert data at correct position
-    run_start = sum(n_timepoints_per_run[:run_number - 1])
+    run_start = sum(n_timepoints_per_run[: run_number - 1])
     run_end = run_start + expected_rows
     padded[run_start:run_end, :] = data
 
@@ -708,11 +718,13 @@ def build_design_matrix(
 
     # Validate inputs
     if len(stim_labels) != n_stim:
-        raise ValueError(f"stim_labels length ({len(stim_labels)}) must match timing_files ({n_stim})")
+        raise ValueError(
+            f"stim_labels length ({len(stim_labels)}) must match timing_files ({n_stim})"
+        )
 
     # Handle HRF models - can be single string or list
     if hrf_models is None:
-        hrf_models = ['SPMG1(0)'] * n_stim  # Default: impulse with SPM HRF
+        hrf_models = ["SPMG1(0)"] * n_stim  # Default: impulse with SPM HRF
     elif isinstance(hrf_models, str):
         hrf_models = [hrf_models] * n_stim  # Broadcast to all stimuli
     elif len(hrf_models) != n_stim:
@@ -791,7 +803,7 @@ def build_design_matrix(
                 if n_cols == 1:
                     padortvec_labels_list.append(label)
                 else:
-                    padortvec_labels_list.append(f'{label}[{col_idx_local}]')
+                    padortvec_labels_list.append(f"{label}[{col_idx_local}]")
 
     # Load and count ortvec files
     ortvec_data = []
@@ -816,7 +828,7 @@ def build_design_matrix(
                 if n_cols == 1:
                     ortvec_labels_list.append(label)
                 else:
-                    ortvec_labels_list.append(f'{label}[{col_idx_local}]')
+                    ortvec_labels_list.append(f"{label}[{col_idx_local}]")
 
     # Count extra regressors
     if extra_regressors:
@@ -854,7 +866,7 @@ def build_design_matrix(
             for p in range(polort + 1):
                 design_matrix[run_start:run_end, col_idx] = polys[:, p]
                 polort_indices.append(col_idx)
-                regressor_labels.append(f'Run#{run_idx+1}Pol#{p}')
+                regressor_labels.append(f"Run#{run_idx + 1}Pol#{p}")
                 col_idx += 1
     else:
         # No polynomials, still need run_starts
@@ -886,9 +898,9 @@ def build_design_matrix(
         # Get HRF for this stimulus
         hrf_type = hrf_types[stim_idx]
 
-        if hrf_type == 'SPMG1':
+        if hrf_type == "SPMG1":
             hrf = spm_canonical_hrf(tr=tr, duration=32.0)
-        elif hrf_type == 'BLOCK':
+        elif hrf_type == "BLOCK":
             hrf = None  # No HRF convolution
         else:
             raise ValueError(f"Unknown HRF type: {hrf_type}. Supported: SPMG1, BLOCK")
@@ -923,7 +935,7 @@ def build_design_matrix(
                     design_matrix[:, col_idx] = full_regressor
                     stim_indices.append(col_idx)
                     # IM mode: label#0, label#1, label#2, etc.
-                    regressor_labels.append(f'{stim_labels[stim_idx]}#{event_idx}')
+                    regressor_labels.append(f"{stim_labels[stim_idx]}#{event_idx}")
                     col_idx += 1
                     event_idx += 1
 
@@ -953,7 +965,7 @@ def build_design_matrix(
             design_matrix[:, col_idx] = stim_regressor
             stim_indices.append(col_idx)
             # Standard mode: label#0 (only one column per stimulus)
-            regressor_labels.append(f'{stim_labels[stim_idx]}#0')
+            regressor_labels.append(f"{stim_labels[stim_idx]}#0")
             col_idx += 1
 
     # 4. Add extra regressors (if any)
@@ -980,25 +992,25 @@ def build_design_matrix(
         else:
             # Generate default labels
             for idx in range(len(extra_indices)):
-                regressor_labels.append(f'extra_{idx}')
+                regressor_labels.append(f"extra_{idx}")
 
     # Create metadata
     nuisance_indices = polort_indices + padortvec_indices + ortvec_indices + extra_indices
 
     metadata = {
-        'stim_indices': stim_indices,
-        'nuisance_indices': nuisance_indices,
-        'polort_indices': polort_indices,
-        'padortvec_indices': padortvec_indices,
-        'ortvec_indices': ortvec_indices,
-        'extra_indices': extra_indices,
-        'n_runs': n_runs,
-        'n_timepoints_per_run': n_timepoints_per_run,
-        'tr': tr,
-        'hrf_models': hrf_models,
-        'hrf_types': hrf_types,
-        'stim_durations': stim_durations,
-        'polort': polort,
+        "stim_indices": stim_indices,
+        "nuisance_indices": nuisance_indices,
+        "polort_indices": polort_indices,
+        "padortvec_indices": padortvec_indices,
+        "ortvec_indices": ortvec_indices,
+        "extra_indices": extra_indices,
+        "n_runs": n_runs,
+        "n_timepoints_per_run": n_timepoints_per_run,
+        "tr": tr,
+        "hrf_models": hrf_models,
+        "hrf_types": hrf_types,
+        "stim_durations": stim_durations,
+        "polort": polort,
     }
 
     return design_matrix, regressor_labels, run_starts, metadata
@@ -1052,9 +1064,9 @@ def write_afni_xmat(
     >>> write_afni_xmat('X.xmat.1D', design, labels, runs, meta, glt)
     """
     n_timepoints, n_regressors = design_matrix.shape
-    n_runs = metadata['n_runs']
-    tr = metadata['tr']
-    stim_indices = metadata['stim_indices']
+    n_runs = metadata["n_runs"]
+    tr = metadata["tr"]
+    stim_indices = metadata["stim_indices"]
 
     # Extract unique stimulus labels and their column ranges
     stim_labels_list = []
@@ -1066,15 +1078,14 @@ def write_afni_xmat(
         for idx in stim_indices:
             label = regressor_labels[idx]
             # Remove #N suffix to get base label (e.g., movie#0 -> movie)
-            base_label = label.split('#')[0] if '#' in label else label
+            base_label = label.split("#")[0] if "#" in label else label
             if base_label not in seen_stim:
                 stim_labels_list.append(base_label)
                 seen_stim.add(base_label)
 
         # For each unique stimulus, find its bottom and top column indices
         for base_label in stim_labels_list:
-            cols = [i for i in stim_indices
-                   if regressor_labels[i].split('#')[0] == base_label]
+            cols = [i for i in stim_indices if regressor_labels[i].split("#")[0] == base_label]
             stim_bots.append(min(cols))
             stim_tops.append(max(cols))
 
@@ -1085,7 +1096,7 @@ def write_afni_xmat(
     # Build column groups
     # Format: "N@-1,M,K" means N columns in group -1 (nuisance), then groups M, K for stim
     # Group numbering: -1=polort, 0=motion/baseline, 1,2,3,...=stimuli of interest
-    n_nuisance = len(metadata.get('nuisance_indices', []))
+    n_nuisance = len(metadata.get("nuisance_indices", []))
     if n_stim > 0:
         col_groups = f"{n_nuisance}@-1"
         for stim_idx in range(n_stim):
@@ -1094,7 +1105,7 @@ def write_afni_xmat(
         col_groups = f"{n_nuisance}@-1"
 
     # Create header
-    with open(filepath, 'w') as f:
+    with open(filepath, "w") as f:
         # Matrix metadata
         f.write("# <matrix\n")
         f.write(f'#  ni_type = "{n_regressors}*double"\n')
@@ -1109,7 +1120,7 @@ def write_afni_xmat(
 
         # TR and timepoint info
         f.write(f'#  RowTR = "{tr}"\n')
-        f.write(f'#  GoodList = "0..{n_timepoints-1}"\n')
+        f.write(f'#  GoodList = "0..{n_timepoints - 1}"\n')
         f.write(f'#  NRowFull = "{n_timepoints}"\n')
 
         # Run starts
@@ -1150,7 +1161,9 @@ def write_afni_xmat(
                     if i == 0:
                         if val == 0:
                             # Count leading zeros
-                            next_nonzero = nonzero_indices[0] if len(nonzero_indices) > 0 else n_regressors
+                            next_nonzero = (
+                                nonzero_indices[0] if len(nonzero_indices) > 0 else n_regressors
+                            )
                             if next_nonzero > 0:
                                 parts.append(f"{next_nonzero}@0")
                     else:
@@ -1181,7 +1194,7 @@ def write_afni_xmat(
             for idx in stim_indices:
                 label = regressor_labels[idx]
                 # Remove #N suffix to get base label (e.g., movie#0 -> movie)
-                base_label = label.split('#')[0] if '#' in label else label
+                base_label = label.split("#")[0] if "#" in label else label
 
                 if base_label not in stim_info:
                     # Find which stimulus this is
@@ -1193,40 +1206,53 @@ def write_afni_xmat(
 
                     if stim_idx_in_list is not None:
                         # Get HRF model and duration
-                        hrf_type = metadata.get('hrf_types', [])[stim_idx_in_list] if stim_idx_in_list < len(metadata.get('hrf_types', [])) else 'SPMG1'
-                        duration = metadata.get('stim_durations', [])[stim_idx_in_list] if stim_idx_in_list < len(metadata.get('stim_durations', [])) else 0.0
+                        hrf_type = (
+                            metadata.get("hrf_types", [])[stim_idx_in_list]
+                            if stim_idx_in_list < len(metadata.get("hrf_types", []))
+                            else "SPMG1"
+                        )
+                        duration = (
+                            metadata.get("stim_durations", [])[stim_idx_in_list]
+                            if stim_idx_in_list < len(metadata.get("stim_durations", []))
+                            else 0.0
+                        )
 
                         # Find column range for this stimulus
                         # Match labels that are exactly base_label#N
-                        cols_for_stim = [i for i, l in enumerate(regressor_labels)
-                                        if l.split('#')[0] == base_label and '#' in l]
+                        cols_for_stim = [
+                            i
+                            for i, l in enumerate(regressor_labels)
+                            if l.split("#")[0] == base_label and "#" in l
+                        ]
 
                         stim_info[base_label] = {
-                            'idx': stim_idx_in_list + 1,
-                            'hrf': hrf_type,
-                            'duration': duration,
-                            'cols': cols_for_stim,
+                            "idx": stim_idx_in_list + 1,
+                            "hrf": hrf_type,
+                            "duration": duration,
+                            "cols": cols_for_stim,
                         }
 
             # Write basis info for each stimulus
             for stim_label in stim_labels_list:
                 if stim_label in stim_info:
                     info = stim_info[stim_label]
-                    idx = info['idx']
+                    idx = info["idx"]
 
                     # Determine stim option (IM vs regular)
                     # IM mode: multiple columns (label#0, label#1, ...)
                     # Standard mode: single column (label#0)
-                    is_im = len(info['cols']) > 1
+                    is_im = len(info["cols"]) > 1
                     option = "-stim_times_IM" if is_im else "-stim_times"
 
                     f.write(f'#  BasisOption_{idx:06d} = "{option}"\n')
                     f.write(f'#  BasisName_{idx:06d} = "{stim_label}"\n')
-                    f.write(f'#  BasisFormula_{idx:06d} = "{info["hrf"]}({info["duration"]:.0f})"\n')
+                    f.write(
+                        f'#  BasisFormula_{idx:06d} = "{info["hrf"]}({info["duration"]:.0f})"\n'
+                    )
 
                     # Column range
-                    col_start = min(info['cols'])
-                    col_end = max(info['cols'])
+                    col_start = min(info["cols"])
+                    col_end = max(info["cols"])
                     f.write(f'#  BasisColumns_{idx:06d} = "{col_start}:{col_end}"\n')
 
         # Command line (optional)
@@ -1326,15 +1352,17 @@ def parse_durations(
 
     # Parse each duration spec (can be "value" or "value,count")
     for d in durations_arg:
-        if ',' in d:
+        if "," in d:
             # Parse "value,count" format (e.g., "3,20" -> [3, 3, 3, ...])
             try:
-                value_str, count_str = d.split(',')
+                value_str, count_str = d.split(",")
                 value = float(value_str)
                 count = int(count_str)
                 durations_parsed.extend([value] * count)
             except (ValueError, IndexError):
-                print(f"ERROR: Invalid duration format '{d}'. Use 'value' or 'value,count' (e.g., '3,20')")
+                print(
+                    f"ERROR: Invalid duration format '{d}'. Use 'value' or 'value,count' (e.g., '3,20')"
+                )
                 sys.exit(1)
         else:
             # Single value

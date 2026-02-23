@@ -4,6 +4,8 @@
 
 This note records the practical, non-obvious choices FSL MELODIC makes for model-order selection and ICA scaling, especially where behavior differs from a "plain" PCA/ICA workflow. The goal is parity first, experimentation second.
 
+Melodic code location: https://git.fmrib.ox.ac.uk/fsl/melodic
+
 ---
 
 ## High-level takeaway

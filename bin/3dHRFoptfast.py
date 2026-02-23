@@ -46,6 +46,7 @@ try:
         get_average_run_duration,
         load_and_preprocess_runs,
         parse_device_arg,
+        parse_input_files,
         preflight_check,
     )
     from fastfuncsim.design_builder import (
@@ -64,41 +65,6 @@ except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
     sys.exit(1)
-
-
-def parse_input_files(input_arg: Union[str, list[str]]) -> list[str]:
-    """Parse input files (can be list from nargs='+' or single string)
-
-    Supports:
-    - Single file: "/path/to/file.nii.gz"
-    - Multiple files: ["/path/run1.nii.gz", "/path/run2.nii.gz"]
-    - Glob patterns: ["run*.nii.gz"] or "run*.nii.gz"
-    """
-    import glob as glob_module
-
-    # Handle both list (from nargs='+') and string
-    if isinstance(input_arg, str):
-        input_arg = input_arg.strip().strip('"').strip("'")
-        input_list = input_arg.split()
-    else:
-        input_list = input_arg
-
-    # Expand globs and collect files
-    files = []
-    for pattern in input_list:
-        matches = glob_module.glob(pattern)
-        if matches:
-            files.extend(sorted(matches))
-        else:
-            files.append(pattern)
-
-    # Validate files exist
-    for f in files:
-        if not Path(f).exists():
-            print(f"ERROR: Input file not found: {f}")
-            sys.exit(1)
-
-    return files
 
 
 def create_parser():
@@ -758,7 +724,22 @@ def main():
         fit_r2_all = torch.zeros(n_voxels, n_hrfs)
 
         # Chunk size for voxel streaming (avoid GPU OOM)
-        chunk_size = args.batch_size or 50_000
+        if args.batch_size:
+            chunk_size = args.batch_size
+        else:
+            from fastfuncsim.memory import estimate_chunk_size
+
+            n_regressors_for_chunk = len(condition_labels) * max(
+                1, len(all_onsets[0]) // len(condition_labels)
+            )
+            chunk_size = estimate_chunk_size(
+                n_voxels=n_voxels,
+                n_timepoints=n_timepoints,
+                n_regressors=n_regressors_for_chunk,
+                device=device,
+                operation="glm",
+                verbose=False,
+            )
         print(f"  Voxel chunk size: {chunk_size:,}")
 
         # Cache projected designs on CPU for second-pass beta recomputation (~12 MB each)

@@ -13,6 +13,18 @@ Design philosophy:
 - Reproduces GLMsingle functionality but GPU-accelerated
 - Compatible with existing fastfuncsim HRF and denoising pipelines
 - Supports flexible timing (non-TR-locked, variable durations)
+
+References
+----------
+fracridge:
+    Rokem A & Kay KN (2020). Fractional ridge regression: a fast, interpretable
+    reparameterization of ridge regression. PLOS ONE 15(11): e0241943.
+    https://github.com/nrdg/fracridge
+
+GLMsingle (Type-D ridge):
+    Prince JS, Charest I, Kurzawski JW, Pyles JA, Tarr MJ, Kay KN.
+    Improving the accuracy of single-trial fMRI response estimates using GLMsingle.
+    eLife (2022). https://github.com/cvnlab/GLMsingle
 """
 
 from __future__ import annotations

@@ -22,26 +22,13 @@ import torch
 
 try:
     from fastfuncsim.afni_io import extract_design_metadata, load_nifti, read_afni_design_matrix
+    from fastfuncsim.cli_utils import parse_input_files
     from fastfuncsim.utils import get_device
     from fastfuncsim.xval import compute_xval_r2, generate_cv_splits
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
     sys.exit(1)
-
-
-def parse_input_files(input_str: str) -> List[str]:
-    """Parse input file string (space-separated or single file)"""
-    # Remove quotes if present
-    input_str = input_str.strip().strip('"').strip("'")
-    # Split on spaces
-    files = input_str.split()
-    # Validate files exist
-    for f in files:
-        if not Path(f).exists():
-            print(f"ERROR: Input file not found: {f}")
-            sys.exit(1)
-    return files
 
 
 def create_parser():

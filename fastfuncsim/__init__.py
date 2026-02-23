@@ -18,6 +18,7 @@ Main Components:
 - simulation: Simulation pipeline (single and batch)
 - utils: Device management and helpers
 """
+
 from __future__ import annotations
 
 __version__ = "0.1.0"
@@ -97,7 +98,7 @@ from .design_optimization import (
     sample_design_space,
 )
 from .design_optimization import (
-    plot_hrf_recovery as plot_design_hrf_recovery,
+    plot_hrf_index_recovery as plot_design_hrf_recovery,
 )
 from .glm_core import GLMResults, fit_glm, fit_glm_hrf_library, percent_bold_change
 

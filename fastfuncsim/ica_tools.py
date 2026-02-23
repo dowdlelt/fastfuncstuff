@@ -4,6 +4,21 @@ Key algorithms:
 - Minka (2000) Laplace approximation for PPCA dimensionality estimation
 - Gaussian-Gamma Mixture (GGM) model for ICA spatial map thresholding
   (following FSL MELODIC: Beckmann & Smith 2004)
+
+References
+----------
+FSL MELODIC:
+    Beckmann CF & Smith SM (2004). Probabilistic Independent Component Analysis
+    for Functional Magnetic Resonance Imaging. IEEE Trans Med Imaging 23(2):137-152.
+    https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/MELODIC
+
+PPCA dimensionality estimation (Minka's method):
+    Minka TP (2000). Automatic Choice of Dimensionality for PCA.
+    NIPS 13:598-604. https://proceedings.neurips.cc/paper/2000/hash/7503cfacd12053d309b6bed5c89de212-Abstract.html
+
+Marchenko-Pastur distribution:
+    Marchenko VA & Pastur LA (1967). Distribution of eigenvalues for some
+    random matrices. Mathematics of the USSR-Sbornik 1(4):457-483.
 """
 
 from __future__ import annotations

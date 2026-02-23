@@ -14,6 +14,7 @@ Based on:
 Author: FastFuncSim
 Date: 2024
 """
+
 from __future__ import annotations
 
 import warnings
@@ -34,6 +35,7 @@ from .metrics_empirical import evaluate_design_empirical
 @dataclass
 class ISIConstraints:
     """Constraints for ISI distribution generation"""
+
     min_isi: float  # Minimum ISI in seconds
     max_isi: float  # Maximum ISI in seconds
     mean_isi: float  # Target mean ISI in seconds
@@ -43,6 +45,7 @@ class ISIConstraints:
 @dataclass
 class DesignCandidate:
     """Container for a candidate experimental design"""
+
     onsets: torch.Tensor  # (n_timepoints, n_conditions) binary onset matrix
     isis: np.ndarray  # ISI sequence for each condition
     design_matrix: torch.Tensor  # Convolved design matrix
@@ -53,9 +56,9 @@ class DesignCandidate:
 def generate_event_sequence(
     n_trials_per_condition: Union[int, List[int]],
     n_conditions: int,
-    ordering: Literal['random', 'alternating', 'blocked', 'permuted_block'] = 'random',
+    ordering: Literal["random", "alternating", "blocked", "permuted_block"] = "random",
     block_size: Optional[int] = None,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
 ) -> np.ndarray:
     """
     Generate event sequence specifying which condition occurs at each trial.
@@ -85,12 +88,14 @@ def generate_event_sequence(
     else:
         n_trials = list(n_trials_per_condition)
         if len(n_trials) != n_conditions:
-            raise ValueError(f"Length of n_trials_per_condition ({len(n_trials)}) "
-                           f"must match n_conditions ({n_conditions})")
+            raise ValueError(
+                f"Length of n_trials_per_condition ({len(n_trials)}) "
+                f"must match n_conditions ({n_conditions})"
+            )
 
     total_trials = sum(n_trials)
 
-    if ordering == 'random':
+    if ordering == "random":
         # Fully randomized
         event_sequence = []
         for cond_idx in range(n_conditions):
@@ -98,7 +103,7 @@ def generate_event_sequence(
         np.random.shuffle(event_sequence)
         return np.array(event_sequence)
 
-    elif ordering == 'alternating':
+    elif ordering == "alternating":
         # Strict alternation - cycle through conditions
         # If unequal trials, cycle until all conditions exhausted
         event_sequence = []
@@ -112,7 +117,7 @@ def generate_event_sequence(
 
         return np.array(event_sequence)
 
-    elif ordering == 'blocked':
+    elif ordering == "blocked":
         # Blocked design
         if block_size is None:
             # One block per condition
@@ -129,7 +134,7 @@ def generate_event_sequence(
 
         return np.array(event_sequence)
 
-    elif ordering == 'permuted_block':
+    elif ordering == "permuted_block":
         # Permuted mini-blocks (balanced randomization)
         if block_size is None:
             block_size = n_conditions  # One of each condition per block
@@ -161,9 +166,10 @@ def generate_event_sequence(
 def generate_isi_sequence(
     n_events: int,
     isi_constraints: ISIConstraints,
-    distribution: Literal['poisson', 'exponential', 'uniform', 'fixed',
-                          'truncated_exponential', 'poisson_target_mean'] = 'exponential',
-    seed: Optional[int] = None
+    distribution: Literal[
+        "poisson", "exponential", "uniform", "fixed", "truncated_exponential", "poisson_target_mean"
+    ] = "exponential",
+    seed: Optional[int] = None,
 ) -> np.ndarray:
     """
     Generate ISI sequence (inter-stimulus intervals between consecutive events).
@@ -209,12 +215,12 @@ def generate_isi_sequence(
         raise ValueError(f"mean_isi ({target_mean}) must be in [{min_isi}, {max_isi}]")
 
     # Generate initial samples
-    if distribution == 'exponential':
+    if distribution == "exponential":
         # Exponential with rate λ = 1/mean
         scale = target_mean
         isis = expon.rvs(scale=scale, size=n_isis * 2)  # Oversample for clipping
 
-    elif distribution == 'truncated_exponential':
+    elif distribution == "truncated_exponential":
         # Truncated exponential: properly bounded exponential distribution
         # scipy's truncexpon parameterization: X = a + (b-a)*Y where Y ~ truncexp
         # We want distribution over [min_isi, max_isi] with mean target_mean
@@ -236,14 +242,14 @@ def generate_isi_sequence(
         isis = min_isi + isis_standardized * scale_guess
         isis = np.clip(isis, min_isi, max_isi)  # Ensure bounds
 
-    elif distribution == 'poisson':
+    elif distribution == "poisson":
         # Poisson ISIs (discrete count → continuous time)
         lam = target_mean / isi_constraints.tr
         counts = poisson.rvs(mu=lam, size=n_isis * 2)
         isis = counts * isi_constraints.tr
         isis = isis[isis > 0]  # Remove zero ISIs
 
-    elif distribution == 'poisson_target_mean':
+    elif distribution == "poisson_target_mean":
         # Poisson with aggressive mean matching
         # Strategy: Generate Poisson samples, then use tighter tolerance in adjustment
         lam = target_mean / isi_constraints.tr
@@ -261,11 +267,11 @@ def generate_isi_sequence(
             sorted_idx = np.argsort(distances)
             isis = isis[sorted_idx[:n_isis]]  # Select closest to target
 
-    elif distribution == 'uniform':
+    elif distribution == "uniform":
         # Uniform distribution
         isis = np.random.uniform(min_isi, max_isi, size=n_isis)
 
-    elif distribution == 'fixed':
+    elif distribution == "fixed":
         # Fixed ISI (constant spacing)
         isis = np.full(n_isis, target_mean)
         return isis
@@ -284,9 +290,9 @@ def generate_isi_sequence(
         isis = isis[:n_isis]
 
     # Iteratively adjust to match target mean (if not uniform or fixed)
-    if distribution not in ['uniform', 'fixed']:
+    if distribution not in ["uniform", "fixed"]:
         # Tighter tolerance for poisson_target_mean
-        if distribution == 'poisson_target_mean':
+        if distribution == "poisson_target_mean":
             max_iters = 200  # More iterations
             tolerance = 0.001  # 0.1% tolerance (10x tighter!)
         else:
@@ -318,7 +324,7 @@ def create_onset_matrix(
     isis: np.ndarray,
     duration: float,
     tr: float,
-    n_conditions: Optional[int] = None
+    n_conditions: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Convert event sequence and ISI sequence to binary onset matrix.
@@ -371,9 +377,9 @@ def sample_design_space(
     n_samples: int = 100,
     event_orderings: List[str] | None = None,
     isi_distributions: List[str] | None = None,
-    hrf_type: str = 'spm',
+    hrf_type: str = "spm",
     device: Optional[torch.device] = None,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
 ) -> List[DesignCandidate]:
     """
     Sample design space by generating multiple candidate designs with various orderings and ISI distributions.
@@ -408,13 +414,18 @@ def sample_design_space(
         )
     """
     if device is None:
-        device = torch.device('mps' if torch.backends.mps.is_available() else
-                            'cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(
+            "mps"
+            if torch.backends.mps.is_available()
+            else "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
 
     if event_orderings is None:
-        event_orderings = ['random']
+        event_orderings = ["random"]
     if isi_distributions is None:
-        isi_distributions = ['exponential']
+        isi_distributions = ["exponential"]
 
     if seed is not None:
         np.random.seed(seed)
@@ -433,7 +444,7 @@ def sample_design_space(
         stim_duration=0.0,  # Event-related design (brief event)
         tr=isi_constraints.tr,
         duration=32.0,
-        device=device
+        device=device,
     )
 
     # Iterate through all combinations
@@ -446,7 +457,7 @@ def sample_design_space(
                     n_trials_per_condition=n_trials_per_condition,
                     n_conditions=n_conditions,
                     ordering=ordering,
-                    seed=seed + sample_idx if seed is not None else None
+                    seed=seed + sample_idx if seed is not None else None,
                 )
 
                 # Generate ISI sequence (WHEN)
@@ -454,7 +465,9 @@ def sample_design_space(
                     n_events=len(event_sequence),
                     isi_constraints=isi_constraints,
                     distribution=dist,
-                    seed=seed + sample_idx + 1000 if seed is not None else None  # Different seed space
+                    seed=seed + sample_idx + 1000
+                    if seed is not None
+                    else None,  # Different seed space
                 )
 
                 # Combine into onset matrix
@@ -463,16 +476,13 @@ def sample_design_space(
                     isis=isis,
                     duration=duration,
                     tr=isi_constraints.tr,
-                    n_conditions=n_conditions
+                    n_conditions=n_conditions,
                 ).to(device)
 
                 # Generate design matrix (convolve with HRF)
                 n_timepoints = onsets.shape[0]
                 design = convolve_hrf(
-                    onsets=onsets,
-                    hrf=hrf,
-                    n_timepoints=n_timepoints,
-                    device=device
+                    onsets=onsets, hrf=hrf, n_timepoints=n_timepoints, device=device
                 )
 
                 # Compute actual trial counts per condition
@@ -484,19 +494,19 @@ def sample_design_space(
                     isis=isis,
                     design_matrix=design,
                     metadata={
-                        'ordering': ordering,
-                        'distribution': dist,
-                        'sample_idx': sample_idx,
-                        'n_conditions': n_conditions,
-                        'n_trials_requested': n_trials_per_condition,
-                        'n_trials_actual': actual_counts,
-                        'total_events': len(event_sequence),
-                        'duration': duration,
-                        'isi_mean_actual': isis.mean(),
-                        'isi_std': isis.std(),
-                        'isi_min': isis.min(),
-                        'isi_max': isis.max()
-                    }
+                        "ordering": ordering,
+                        "distribution": dist,
+                        "sample_idx": sample_idx,
+                        "n_conditions": n_conditions,
+                        "n_trials_requested": n_trials_per_condition,
+                        "n_trials_actual": actual_counts,
+                        "total_events": len(event_sequence),
+                        "duration": duration,
+                        "isi_mean_actual": isis.mean(),
+                        "isi_std": isis.std(),
+                        "isi_min": isis.min(),
+                        "isi_max": isis.max(),
+                    },
                 )
                 candidates.append(candidate)
                 sample_idx += 1
@@ -517,7 +527,7 @@ def evaluate_design_candidates(
     noise_level: float = 1.0,
     n_voxels: int = 100,
     device: Optional[torch.device] = None,
-    verbose: bool = True
+    verbose: bool = True,
 ) -> List[DesignCandidate]:
     """
     Evaluate all candidate designs using empirical metrics.
@@ -536,12 +546,17 @@ def evaluate_design_candidates(
         candidates: Same list with metrics filled in
     """
     if device is None:
-        device = torch.device('mps' if torch.backends.mps.is_available() else
-                            'cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(
+            "mps"
+            if torch.backends.mps.is_available()
+            else "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
 
     for i, candidate in enumerate(candidates):
         if verbose and (i + 1) % 10 == 0:
-            print(f"Evaluating candidate {i+1}/{len(candidates)}...")
+            print(f"Evaluating candidate {i + 1}/{len(candidates)}...")
 
         # If no data provided, simulate simple data
         if data is None:
@@ -570,16 +585,16 @@ def evaluate_design_candidates(
                 onsets=candidate.onsets,
                 n_conditions=n_conditions,
                 hrf_length=hrf_length,
-                device=device
+                device=device,
             )
             candidate.metrics = metrics
 
         except Exception as e:
             warnings.warn(f"Failed to evaluate candidate {i}: {e}")
             candidate.metrics = {
-                'detection_power': np.nan,
-                'estimation_efficiency': np.nan,
-                'error': str(e)
+                "detection_power": np.nan,
+                "estimation_efficiency": np.nan,
+                "error": str(e),
             }
 
     return candidates
@@ -587,9 +602,9 @@ def evaluate_design_candidates(
 
 def find_optimal_designs(
     candidates: List[DesignCandidate],
-    objective: Literal['power', 'efficiency', 'balanced'] = 'balanced',
+    objective: Literal["power", "efficiency", "balanced"] = "balanced",
     alpha: float = 0.5,
-    top_k: int = 10
+    top_k: int = 10,
 ) -> List[Tuple[int, DesignCandidate, float]]:
     """
     Find optimal designs based on specified objective.
@@ -613,8 +628,8 @@ def find_optimal_designs(
             scores.append((idx, candidate, -np.inf))
             continue
 
-        power = candidate.metrics.get('detection_power', np.nan)
-        efficiency = candidate.metrics.get('estimation_efficiency', np.nan)
+        power = candidate.metrics.get("detection_power", np.nan)
+        efficiency = candidate.metrics.get("estimation_efficiency", np.nan)
 
         if np.isnan(power) or np.isnan(efficiency):
             scores.append((idx, candidate, -np.inf))
@@ -622,11 +637,11 @@ def find_optimal_designs(
 
         # Normalize to [0, 1] range within this set
         # (Will do global normalization after collecting all scores)
-        if objective == 'power':
+        if objective == "power":
             score = power
-        elif objective == 'efficiency':
+        elif objective == "efficiency":
             score = efficiency
-        elif objective == 'balanced':
+        elif objective == "balanced":
             # Need to normalize first
             score = None  # Will compute after normalization
         else:
@@ -635,11 +650,17 @@ def find_optimal_designs(
         scores.append((idx, candidate, score))
 
     # Normalize if using balanced objective
-    if objective == 'balanced':
-        powers = np.array([c.metrics.get('detection_power', np.nan)
-                          for c in candidates if c.metrics is not None])
-        efficiencies = np.array([c.metrics.get('estimation_efficiency', np.nan)
-                                for c in candidates if c.metrics is not None])
+    if objective == "balanced":
+        powers = np.array(
+            [c.metrics.get("detection_power", np.nan) for c in candidates if c.metrics is not None]
+        )
+        efficiencies = np.array(
+            [
+                c.metrics.get("estimation_efficiency", np.nan)
+                for c in candidates
+                if c.metrics is not None
+            ]
+        )
 
         # Remove NaNs for normalization
         powers_valid = powers[~np.isnan(powers)]
@@ -654,8 +675,8 @@ def find_optimal_designs(
                 if candidate.metrics is None:
                     continue
 
-                power = candidate.metrics.get('detection_power', np.nan)
-                efficiency = candidate.metrics.get('estimation_efficiency', np.nan)
+                power = candidate.metrics.get("detection_power", np.nan)
+                efficiency = candidate.metrics.get("estimation_efficiency", np.nan)
 
                 if np.isnan(power) or np.isnan(efficiency):
                     continue
@@ -678,8 +699,8 @@ def find_optimal_designs(
 def compare_designs_summary(
     candidates: List[DesignCandidate],
     top_k: int = 10,
-    objective: str = 'balanced',
-    alpha: float = 0.5
+    objective: str = "balanced",
+    alpha: float = 0.5,
 ) -> str:
     """
     Generate text summary comparing designs.
@@ -694,10 +715,7 @@ def compare_designs_summary(
         summary: Text summary string
     """
     top_designs = find_optimal_designs(
-        candidates=candidates,
-        objective=objective,
-        alpha=alpha,
-        top_k=top_k
+        candidates=candidates, objective=objective, alpha=alpha, top_k=top_k
     )
 
     summary = []
@@ -719,15 +737,17 @@ def compare_designs_summary(
             summary.append(f"  N conditions: {candidate.metadata.get('n_conditions', 'N/A')}")
 
             # Handle both old and new metadata formats
-            n_trials = candidate.metadata.get('n_trials_actual', candidate.metadata.get('n_trials', 'N/A'))
+            n_trials = candidate.metadata.get(
+                "n_trials_actual", candidate.metadata.get("n_trials", "N/A")
+            )
             if isinstance(n_trials, list):
                 summary.append(f"  N trials per condition: {n_trials}")
             else:
                 summary.append(f"  N trials: {n_trials}")
 
             # ISI statistics
-            isi_mean = candidate.metadata.get('isi_mean_actual', 'N/A')
-            isi_std = candidate.metadata.get('isi_std', 'N/A')
+            isi_mean = candidate.metadata.get("isi_mean_actual", "N/A")
+            isi_std = candidate.metadata.get("isi_std", "N/A")
             if isinstance(isi_mean, (int, float)) and isinstance(isi_std, (int, float)):
                 summary.append(f"  ISI: {isi_mean:.2f} ± {isi_std:.2f} s")
             elif isinstance(isi_mean, list):
@@ -736,10 +756,14 @@ def compare_designs_summary(
 
         # Metrics
         if candidate.metrics:
-            summary.append(f"  Detection Power: {candidate.metrics.get('detection_power', np.nan):.4f}")
-            summary.append(f"  Estimation Efficiency: {candidate.metrics.get('estimation_efficiency', np.nan):.4f}")
+            summary.append(
+                f"  Detection Power: {candidate.metrics.get('detection_power', np.nan):.4f}"
+            )
+            summary.append(
+                f"  Estimation Efficiency: {candidate.metrics.get('estimation_efficiency', np.nan):.4f}"
+            )
 
-            rho = candidate.metrics.get('rho', np.nan)
+            rho = candidate.metrics.get("rho", np.nan)
             if not np.isnan(rho):
                 summary.append(f"  AR(1) coefficient: {rho:.3f}")
 
@@ -753,7 +777,7 @@ def compare_designs_summary(
 def plot_fitness_landscape(
     candidates: List[DesignCandidate],
     figsize: Tuple[int, int] = (12, 5),
-    save_path: Optional[str] = None
+    save_path: Optional[str] = None,
 ):
     """
     Plot fitness landscape: Detection Power vs Estimation Efficiency.
@@ -781,20 +805,22 @@ def plot_fitness_landscape(
         if candidate.metrics is None:
             continue
 
-        power = candidate.metrics.get('detection_power', np.nan)
-        efficiency = candidate.metrics.get('estimation_efficiency', np.nan)
+        power = candidate.metrics.get("detection_power", np.nan)
+        efficiency = candidate.metrics.get("estimation_efficiency", np.nan)
 
         if np.isnan(power) or np.isnan(efficiency):
             continue
 
         powers.append(power)
         efficiencies.append(efficiency)
-        distributions.append(candidate.metadata.get('distribution', 'unknown'))
+        distributions.append(candidate.metadata.get("distribution", "unknown"))
 
         # Compute balanced score for sizing
         # Normalize within dataset
         power_norm = (power - min(powers)) / (max(powers) - min(powers) + 1e-10)
-        eff_norm = (efficiency - min(efficiencies)) / (max(efficiencies) - min(efficiencies) + 1e-10)
+        eff_norm = (efficiency - min(efficiencies)) / (
+            max(efficiencies) - min(efficiencies) + 1e-10
+        )
         score = 0.5 * power_norm + 0.5 * eff_norm
         scores.append(score)
 
@@ -813,47 +839,52 @@ def plot_fitness_landscape(
     point_colors = [color_map[d] for d in distributions]
 
     scatter1 = ax1.scatter(
-        efficiencies, powers,
-        c=point_colors,
-        s=100,
-        alpha=0.6,
-        edgecolors='k',
-        linewidths=0.5
+        efficiencies, powers, c=point_colors, s=100, alpha=0.6, edgecolors="k", linewidths=0.5
     )
-    ax1.set_xlabel('Estimation Efficiency', fontsize=12)
-    ax1.set_ylabel('Detection Power', fontsize=12)
-    ax1.set_title('Fitness Landscape (by Distribution)', fontsize=14)
+    ax1.set_xlabel("Estimation Efficiency", fontsize=12)
+    ax1.set_ylabel("Detection Power", fontsize=12)
+    ax1.set_title("Fitness Landscape (by Distribution)", fontsize=14)
     ax1.grid(True, alpha=0.3)
 
     # Legend for distributions
-    legend_elements = [plt.Line2D([0], [0], marker='o', color='w',
-                                  markerfacecolor=color_map[dist], markersize=10, label=dist)
-                      for dist in unique_dists]
-    ax1.legend(handles=legend_elements, loc='best')
+    legend_elements = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=color_map[dist],
+            markersize=10,
+            label=dist,
+        )
+        for dist in unique_dists
+    ]
+    ax1.legend(handles=legend_elements, loc="best")
 
     # Right plot: Sized by balanced score
     scatter2 = ax2.scatter(
-        efficiencies, powers,
+        efficiencies,
+        powers,
         c=scores,
         s=scores * 200,  # Size proportional to score
-        cmap='viridis',
+        cmap="viridis",
         alpha=0.6,
-        edgecolors='k',
-        linewidths=0.5
+        edgecolors="k",
+        linewidths=0.5,
     )
-    ax2.set_xlabel('Estimation Efficiency', fontsize=12)
-    ax2.set_ylabel('Detection Power', fontsize=12)
-    ax2.set_title('Fitness Landscape (by Score)', fontsize=14)
+    ax2.set_xlabel("Estimation Efficiency", fontsize=12)
+    ax2.set_ylabel("Detection Power", fontsize=12)
+    ax2.set_title("Fitness Landscape (by Score)", fontsize=14)
     ax2.grid(True, alpha=0.3)
 
     # Colorbar
     cbar = plt.colorbar(scatter2, ax=ax2)
-    cbar.set_label('Balanced Score', fontsize=10)
+    cbar.set_label("Balanced Score", fontsize=10)
 
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"Saved fitness landscape to {save_path}")
 
     return fig
@@ -862,7 +893,7 @@ def plot_fitness_landscape(
 def plot_pareto_frontier(
     candidates: List[DesignCandidate],
     figsize: Tuple[int, int] = (8, 6),
-    save_path: Optional[str] = None
+    save_path: Optional[str] = None,
 ):
     """
     Plot Pareto frontier of detection power vs estimation efficiency.
@@ -885,8 +916,8 @@ def plot_pareto_frontier(
         if candidate.metrics is None:
             continue
 
-        power = candidate.metrics.get('detection_power', np.nan)
-        efficiency = candidate.metrics.get('estimation_efficiency', np.nan)
+        power = candidate.metrics.get("detection_power", np.nan)
+        efficiency = candidate.metrics.get("estimation_efficiency", np.nan)
 
         if np.isnan(power) or np.isnan(efficiency):
             continue
@@ -920,23 +951,23 @@ def plot_pareto_frontier(
     ax.scatter(
         efficiencies[~is_pareto],
         powers[~is_pareto],
-        c='lightgray',
+        c="lightgray",
         s=50,
         alpha=0.5,
-        label='Non-Pareto'
+        label="Non-Pareto",
     )
 
     # Pareto points
     ax.scatter(
         efficiencies[is_pareto],
         powers[is_pareto],
-        c='red',
+        c="red",
         s=100,
         alpha=0.8,
-        edgecolors='k',
+        edgecolors="k",
         linewidths=1.5,
-        label='Pareto Optimal',
-        zorder=5
+        label="Pareto Optimal",
+        zorder=5,
     )
 
     # Connect Pareto frontier
@@ -944,32 +975,29 @@ def plot_pareto_frontier(
     pareto_pow = powers[is_pareto]
     sorted_idx = np.argsort(pareto_eff)
     ax.plot(
-        pareto_eff[sorted_idx],
-        pareto_pow[sorted_idx],
-        'r--',
-        alpha=0.5,
-        linewidth=1.5,
-        zorder=4
+        pareto_eff[sorted_idx], pareto_pow[sorted_idx], "r--", alpha=0.5, linewidth=1.5, zorder=4
     )
 
-    ax.set_xlabel('Estimation Efficiency', fontsize=12)
-    ax.set_ylabel('Detection Power', fontsize=12)
-    ax.set_title('Pareto Frontier: Power vs Efficiency Trade-off', fontsize=14)
-    ax.legend(loc='best')
+    ax.set_xlabel("Estimation Efficiency", fontsize=12)
+    ax.set_ylabel("Detection Power", fontsize=12)
+    ax.set_title("Pareto Frontier: Power vs Efficiency Trade-off", fontsize=14)
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"Saved Pareto frontier to {save_path}")
 
     # Print Pareto optimal designs
     print(f"\nFound {is_pareto.sum()} Pareto optimal designs:")
     for idx in indices[is_pareto]:
         candidate = candidates[idx]
-        print(f"  Design #{idx}: Power={candidate.metrics['detection_power']:.4f}, "
-              f"Efficiency={candidate.metrics['estimation_efficiency']:.4f}")
+        print(
+            f"  Design #{idx}: Power={candidate.metrics['detection_power']:.4f}, "
+            f"Efficiency={candidate.metrics['estimation_efficiency']:.4f}"
+        )
 
     return fig, indices[is_pareto]
 
@@ -982,13 +1010,13 @@ def plot_isi_range_optimization(
     min_isi_range: Tuple[float, float] = (1.0, 4.0),
     max_isi_range: Tuple[float, float] = (4.0, 12.0),
     n_grid_points: int = 10,
-    isi_distribution: str = 'exponential',
-    event_ordering: str = 'random',
+    isi_distribution: str = "exponential",
+    event_ordering: str = "random",
     n_samples_per_point: int = 3,
     figsize: Tuple[int, int] = (14, 5),
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
-    verbose: bool = True
+    verbose: bool = True,
 ):
     """
     Plot ISI range optimization landscape (Das et al. 2023 Figure 7 style).
@@ -1033,8 +1061,13 @@ def plot_isi_range_optimization(
     import matplotlib.pyplot as plt
 
     if device is None:
-        device = torch.device('mps' if torch.backends.mps.is_available() else
-                            'cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(
+            "mps"
+            if torch.backends.mps.is_available()
+            else "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
 
     # Create grid of ISI parameters
     min_isis = np.linspace(min_isi_range[0], min_isi_range[1], n_grid_points)
@@ -1055,7 +1088,7 @@ def plot_isi_range_optimization(
         print(f"Event Ordering: {event_ordering}")
         print()
 
-    total_points = n_grid_points ** 2
+    total_points = n_grid_points**2
     completed = 0
 
     # Iterate through grid
@@ -1073,10 +1106,7 @@ def plot_isi_range_optimization(
 
             # Create ISI constraints for this grid point
             isi_constraints = ISIConstraints(
-                min_isi=min_isi,
-                max_isi=max_isi,
-                mean_isi=mean_isi,
-                tr=tr
+                min_isi=min_isi, max_isi=max_isi, mean_isi=mean_isi, tr=tr
             )
 
             # Sample designs for this ISI configuration
@@ -1090,21 +1120,27 @@ def plot_isi_range_optimization(
                     event_orderings=[event_ordering],
                     isi_distributions=[isi_distribution],
                     device=device,
-                    seed=42 + i * n_grid_points + j  # Reproducible but varied
+                    seed=42 + i * n_grid_points + j,  # Reproducible but varied
                 )
 
                 # Evaluate designs
                 candidates = evaluate_design_candidates(
-                    candidates=candidates,
-                    device=device,
-                    verbose=False
+                    candidates=candidates, device=device, verbose=False
                 )
 
                 # Average metrics across samples
-                powers = [c.metrics['detection_power'] for c in candidates
-                         if c.metrics is not None and not np.isnan(c.metrics.get('detection_power', np.nan))]
-                efficiencies = [c.metrics['estimation_efficiency'] for c in candidates
-                               if c.metrics is not None and not np.isnan(c.metrics.get('estimation_efficiency', np.nan))]
+                powers = [
+                    c.metrics["detection_power"]
+                    for c in candidates
+                    if c.metrics is not None
+                    and not np.isnan(c.metrics.get("detection_power", np.nan))
+                ]
+                efficiencies = [
+                    c.metrics["estimation_efficiency"]
+                    for c in candidates
+                    if c.metrics is not None
+                    and not np.isnan(c.metrics.get("estimation_efficiency", np.nan))
+                ]
 
                 if len(powers) > 0 and len(efficiencies) > 0:
                     power_grid[i, j] = np.mean(powers)
@@ -1122,7 +1158,9 @@ def plot_isi_range_optimization(
 
             completed += 1
             if verbose and completed % max(1, total_points // 10) == 0:
-                print(f"Progress: {completed}/{total_points} ({100*completed/total_points:.0f}%)")
+                print(
+                    f"Progress: {completed}/{total_points} ({100 * completed / total_points:.0f}%)"
+                )
 
     if verbose:
         print(f"\nCompleted! Valid points: {np.sum(~np.isnan(power_grid))}/{total_points}")
@@ -1134,57 +1172,69 @@ def plot_isi_range_optimization(
     # Plot Detection Power
     im1 = ax1.imshow(
         power_grid.T,  # Transpose for correct orientation
-        origin='lower',
-        extent=[min_isi_range[0], min_isi_range[1],
-                max_isi_range[0], max_isi_range[1]],
-        aspect='auto',
-        cmap='viridis',
-        interpolation='bilinear'
+        origin="lower",
+        extent=[min_isi_range[0], min_isi_range[1], max_isi_range[0], max_isi_range[1]],
+        aspect="auto",
+        cmap="viridis",
+        interpolation="bilinear",
     )
-    ax1.set_xlabel('Minimum ISI (s)', fontsize=12)
-    ax1.set_ylabel('Maximum ISI (s)', fontsize=12)
-    ax1.set_title('Detection Power\n(Das et al. 2023 Style)', fontsize=14)
+    ax1.set_xlabel("Minimum ISI (s)", fontsize=12)
+    ax1.set_ylabel("Maximum ISI (s)", fontsize=12)
+    ax1.set_title("Detection Power\n(Das et al. 2023 Style)", fontsize=14)
     cbar1 = plt.colorbar(im1, ax=ax1)
-    cbar1.set_label('Detection Power (Fd)', fontsize=10)
-    ax1.grid(True, alpha=0.3, color='white', linestyle='--', linewidth=0.5)
+    cbar1.set_label("Detection Power (Fd)", fontsize=10)
+    ax1.grid(True, alpha=0.3, color="white", linestyle="--", linewidth=0.5)
 
     # Mark optimal point
     max_idx = np.unravel_index(np.nanargmax(power_grid), power_grid.shape)
     optimal_min_isi = min_isis[max_idx[0]]
     optimal_max_isi = max_isis[max_idx[1]]
-    ax1.plot(optimal_min_isi, optimal_max_isi, 'r*', markersize=15,
-             markeredgecolor='white', markeredgewidth=1.5, label='Optimal')
-    ax1.legend(loc='upper right')
+    ax1.plot(
+        optimal_min_isi,
+        optimal_max_isi,
+        "r*",
+        markersize=15,
+        markeredgecolor="white",
+        markeredgewidth=1.5,
+        label="Optimal",
+    )
+    ax1.legend(loc="upper right")
 
     # Plot Estimation Efficiency
     im2 = ax2.imshow(
         efficiency_grid.T,
-        origin='lower',
-        extent=[min_isi_range[0], min_isi_range[1],
-                max_isi_range[0], max_isi_range[1]],
-        aspect='auto',
-        cmap='plasma',
-        interpolation='bilinear'
+        origin="lower",
+        extent=[min_isi_range[0], min_isi_range[1], max_isi_range[0], max_isi_range[1]],
+        aspect="auto",
+        cmap="plasma",
+        interpolation="bilinear",
     )
-    ax2.set_xlabel('Minimum ISI (s)', fontsize=12)
-    ax2.set_ylabel('Maximum ISI (s)', fontsize=12)
-    ax2.set_title('Estimation Efficiency\n(Das et al. 2023 Style)', fontsize=14)
+    ax2.set_xlabel("Minimum ISI (s)", fontsize=12)
+    ax2.set_ylabel("Maximum ISI (s)", fontsize=12)
+    ax2.set_title("Estimation Efficiency\n(Das et al. 2023 Style)", fontsize=14)
     cbar2 = plt.colorbar(im2, ax=ax2)
-    cbar2.set_label('Estimation Efficiency (Fe)', fontsize=10)
-    ax2.grid(True, alpha=0.3, color='white', linestyle='--', linewidth=0.5)
+    cbar2.set_label("Estimation Efficiency (Fe)", fontsize=10)
+    ax2.grid(True, alpha=0.3, color="white", linestyle="--", linewidth=0.5)
 
     # Mark optimal point
     max_idx = np.unravel_index(np.nanargmax(efficiency_grid), efficiency_grid.shape)
     optimal_min_isi = min_isis[max_idx[0]]
     optimal_max_isi = max_isis[max_idx[1]]
-    ax2.plot(optimal_min_isi, optimal_max_isi, 'r*', markersize=15,
-             markeredgecolor='white', markeredgewidth=1.5, label='Optimal')
-    ax2.legend(loc='upper right')
+    ax2.plot(
+        optimal_min_isi,
+        optimal_max_isi,
+        "r*",
+        markersize=15,
+        markeredgecolor="white",
+        markeredgewidth=1.5,
+        label="Optimal",
+    )
+    ax2.legend(loc="upper right")
 
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         if verbose:
             print(f"Saved ISI range optimization plot to {save_path}")
 
@@ -1215,11 +1265,11 @@ def plot_isi_range_optimization(
         print("=" * 80)
 
     results_grid = {
-        'power_grid': power_grid,
-        'efficiency_grid': efficiency_grid,
-        'count_grid': count_grid,
-        'min_isis': min_isis,
-        'max_isis': max_isis
+        "power_grid": power_grid,
+        "efficiency_grid": efficiency_grid,
+        "count_grid": count_grid,
+        "min_isis": min_isis,
+        "max_isis": max_isis,
     }
 
     return fig, results_grid
@@ -1234,13 +1284,13 @@ def plot_isi_range_by_target_mean(
     min_isi_range: Tuple[float, float] = (1.0, 4.0),
     max_isi_range: Tuple[float, float] = (4.0, 12.0),
     n_grid_points: int = 10,
-    isi_distribution: str = 'exponential',
-    event_ordering: str = 'random',
+    isi_distribution: str = "exponential",
+    event_ordering: str = "random",
     n_samples_per_point: int = 3,
     figsize_per_row: Tuple[int, int] = (14, 5),
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
-    verbose: bool = True
+    verbose: bool = True,
 ):
     """
     Plot ISI range optimization with EXPLICIT target mean ISIs.
@@ -1288,15 +1338,19 @@ def plot_isi_range_by_target_mean(
     import matplotlib.pyplot as plt
 
     if device is None:
-        device = torch.device('mps' if torch.backends.mps.is_available() else
-                            'cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(
+            "mps"
+            if torch.backends.mps.is_available()
+            else "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
 
     n_target_means = len(target_mean_isis)
 
     # Create figure with rows for each target mean
     fig, axes = plt.subplots(
-        n_target_means, 2,
-        figsize=(figsize_per_row[0], figsize_per_row[1] * n_target_means)
+        n_target_means, 2, figsize=(figsize_per_row[0], figsize_per_row[1] * n_target_means)
     )
 
     # Ensure axes is 2D even if only one target mean
@@ -1312,9 +1366,11 @@ def plot_isi_range_by_target_mean(
     # Process each target mean
     for mean_idx, target_mean in enumerate(target_mean_isis):
         if verbose:
-            print(f"\n{'='*80}")
-            print(f"Processing Target Mean ISI = {target_mean:.2f} s ({mean_idx+1}/{n_target_means})")
-            print(f"{'='*80}")
+            print(f"\n{'=' * 80}")
+            print(
+                f"Processing Target Mean ISI = {target_mean:.2f} s ({mean_idx + 1}/{n_target_means})"
+            )
+            print(f"{'=' * 80}")
 
         # Initialize grids for this target mean
         power_grid = np.zeros((n_grid_points, n_grid_points))
@@ -1333,10 +1389,7 @@ def plot_isi_range_by_target_mean(
 
                 # Create ISI constraints
                 isi_constraints = ISIConstraints(
-                    min_isi=min_isi,
-                    max_isi=max_isi,
-                    mean_isi=target_mean,
-                    tr=tr
+                    min_isi=min_isi, max_isi=max_isi, mean_isi=target_mean, tr=tr
                 )
 
                 # Sample and evaluate
@@ -1350,21 +1403,27 @@ def plot_isi_range_by_target_mean(
                         event_orderings=[event_ordering],
                         isi_distributions=[isi_distribution],
                         device=device,
-                        seed=42 + mean_idx * 1000 + i * n_grid_points + j
+                        seed=42 + mean_idx * 1000 + i * n_grid_points + j,
                     )
 
                     candidates = evaluate_design_candidates(
-                        candidates=candidates,
-                        device=device,
-                        verbose=False
+                        candidates=candidates, device=device, verbose=False
                     )
 
                     # Average metrics
-                    powers = [c.metrics['detection_power'] for c in candidates
-                             if c.metrics is not None and not np.isnan(c.metrics.get('detection_power', np.nan))]
-                    efficiencies = [c.metrics['estimation_efficiency'] for c in candidates
-                                   if c.metrics is not None and not np.isnan(c.metrics.get('estimation_efficiency', np.nan))]
-                    event_counts = [c.metadata['total_events'] for c in candidates]
+                    powers = [
+                        c.metrics["detection_power"]
+                        for c in candidates
+                        if c.metrics is not None
+                        and not np.isnan(c.metrics.get("detection_power", np.nan))
+                    ]
+                    efficiencies = [
+                        c.metrics["estimation_efficiency"]
+                        for c in candidates
+                        if c.metrics is not None
+                        and not np.isnan(c.metrics.get("estimation_efficiency", np.nan))
+                    ]
+                    event_counts = [c.metadata["total_events"] for c in candidates]
 
                     if len(powers) > 0 and len(efficiencies) > 0:
                         power_grid[i, j] = np.mean(powers)
@@ -1386,58 +1445,58 @@ def plot_isi_range_by_target_mean(
         ax_power = axes[mean_idx, 0]
         im1 = ax_power.imshow(
             power_grid.T,
-            origin='lower',
-            extent=[min_isi_range[0], min_isi_range[1],
-                    max_isi_range[0], max_isi_range[1]],
-            aspect='auto',
-            cmap='viridis',
-            interpolation='bilinear'
+            origin="lower",
+            extent=[min_isi_range[0], min_isi_range[1], max_isi_range[0], max_isi_range[1]],
+            aspect="auto",
+            cmap="viridis",
+            interpolation="bilinear",
         )
-        ax_power.set_xlabel('Minimum ISI (s)', fontsize=10)
-        ax_power.set_ylabel('Maximum ISI (s)', fontsize=10)
-        ax_power.set_title(f'Detection Power\n(Target Mean = {target_mean:.1f}s)', fontsize=11)
-        plt.colorbar(im1, ax=ax_power, label='Power')
-        ax_power.grid(True, alpha=0.3, color='white', linestyle='--', linewidth=0.5)
+        ax_power.set_xlabel("Minimum ISI (s)", fontsize=10)
+        ax_power.set_ylabel("Maximum ISI (s)", fontsize=10)
+        ax_power.set_title(f"Detection Power\n(Target Mean = {target_mean:.1f}s)", fontsize=11)
+        plt.colorbar(im1, ax=ax_power, label="Power")
+        ax_power.grid(True, alpha=0.3, color="white", linestyle="--", linewidth=0.5)
 
         # Mark optimal
         if not np.all(np.isnan(power_grid)):
             max_idx = np.unravel_index(np.nanargmax(power_grid), power_grid.shape)
             opt_min = min_isis[max_idx[0]]
             opt_max = max_isis[max_idx[1]]
-            ax_power.plot(opt_min, opt_max, 'r*', markersize=12,
-                         markeredgecolor='white', markeredgewidth=1.5)
+            ax_power.plot(
+                opt_min, opt_max, "r*", markersize=12, markeredgecolor="white", markeredgewidth=1.5
+            )
 
         # Plot estimation efficiency
         ax_eff = axes[mean_idx, 1]
         im2 = ax_eff.imshow(
             efficiency_grid.T,
-            origin='lower',
-            extent=[min_isi_range[0], min_isi_range[1],
-                    max_isi_range[0], max_isi_range[1]],
-            aspect='auto',
-            cmap='plasma',
-            interpolation='bilinear'
+            origin="lower",
+            extent=[min_isi_range[0], min_isi_range[1], max_isi_range[0], max_isi_range[1]],
+            aspect="auto",
+            cmap="plasma",
+            interpolation="bilinear",
         )
-        ax_eff.set_xlabel('Minimum ISI (s)', fontsize=10)
-        ax_eff.set_ylabel('Maximum ISI (s)', fontsize=10)
-        ax_eff.set_title(f'Estimation Efficiency\n(Target Mean = {target_mean:.1f}s)', fontsize=11)
-        plt.colorbar(im2, ax=ax_eff, label='Efficiency')
-        ax_eff.grid(True, alpha=0.3, color='white', linestyle='--', linewidth=0.5)
+        ax_eff.set_xlabel("Minimum ISI (s)", fontsize=10)
+        ax_eff.set_ylabel("Maximum ISI (s)", fontsize=10)
+        ax_eff.set_title(f"Estimation Efficiency\n(Target Mean = {target_mean:.1f}s)", fontsize=11)
+        plt.colorbar(im2, ax=ax_eff, label="Efficiency")
+        ax_eff.grid(True, alpha=0.3, color="white", linestyle="--", linewidth=0.5)
 
         # Mark optimal
         if not np.all(np.isnan(efficiency_grid)):
             max_idx = np.unravel_index(np.nanargmax(efficiency_grid), efficiency_grid.shape)
             opt_min = min_isis[max_idx[0]]
             opt_max = max_isis[max_idx[1]]
-            ax_eff.plot(opt_min, opt_max, 'r*', markersize=12,
-                       markeredgecolor='white', markeredgewidth=1.5)
+            ax_eff.plot(
+                opt_min, opt_max, "r*", markersize=12, markeredgecolor="white", markeredgewidth=1.5
+            )
 
         # Store results
-        results[f'mean_{target_mean:.1f}'] = {
-            'power_grid': power_grid,
-            'efficiency_grid': efficiency_grid,
-            'event_count_grid': event_count_grid,
-            'mean_events': np.nanmean(event_count_grid)
+        results[f"mean_{target_mean:.1f}"] = {
+            "power_grid": power_grid,
+            "efficiency_grid": efficiency_grid,
+            "event_count_grid": event_count_grid,
+            "mean_events": np.nanmean(event_count_grid),
         }
 
         if verbose:
@@ -1447,21 +1506,21 @@ def plot_isi_range_by_target_mean(
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         if verbose:
             print(f"\nSaved to {save_path}")
 
     return fig, results
 
 
-def plot_hrf_recovery(
+def plot_hrf_index_recovery(
     true_hrf_indices: Union[torch.Tensor, np.ndarray],
     recovered_hrf_indices: Union[torch.Tensor, np.ndarray],
     spatial_shape: Optional[Tuple[int, ...]] = None,
     slice_axis: int = 2,
     n_slices: Optional[int] = None,
     figsize: Tuple[int, int] = (16, 6),
-    save_path: Optional[str] = None
+    save_path: Optional[str] = None,
 ):
     """
     Visualize HRF library recovery accuracy.
@@ -1497,7 +1556,7 @@ def plot_hrf_recovery(
         >>> results, recovered_indices, r2 = fit_glm_hrf_library(...)
         >>>
         >>> # Visualize recovery
-        >>> fig, acc = plot_hrf_recovery(
+        >>> fig, acc = plot_hrf_index_recovery(
         ...     true_hrf_indices=true_indices,
         ...     recovered_hrf_indices=recovered_indices,
         ...     spatial_shape=(10, 10, 10)
@@ -1524,7 +1583,7 @@ def plot_hrf_recovery(
     if n_slices is None:
         n_slices = min(n_slices_total, 9)  # Max 9 slices
 
-    slice_indices = np.linspace(0, n_slices_total-1, n_slices, dtype=int)
+    slice_indices = np.linspace(0, n_slices_total - 1, n_slices, dtype=int)
 
     # Create figure
     n_rows = 3  # True, Recovered, Difference
@@ -1534,7 +1593,7 @@ def plot_hrf_recovery(
         axes = axes.reshape(-1, 1)
 
     # Compute accuracy
-    correct = (true_hrf_indices == recovered_hrf_indices)
+    correct = true_hrf_indices == recovered_hrf_indices
     accuracy_overall = correct.mean()
 
     # Extract slices and plot
@@ -1554,51 +1613,63 @@ def plot_hrf_recovery(
         slice_accuracy = (true_slice == rec_slice).mean()
 
         # Plot true
-        im0 = axes[0, i].imshow(true_slice.T, cmap='turbo', interpolation='nearest',
-                                vmin=true_hrf_indices.min(), vmax=true_hrf_indices.max())
-        axes[0, i].set_title(f'Slice {slice_idx}\nTrue', fontsize=9)
-        axes[0, i].axis('off')
+        im0 = axes[0, i].imshow(
+            true_slice.T,
+            cmap="turbo",
+            interpolation="nearest",
+            vmin=true_hrf_indices.min(),
+            vmax=true_hrf_indices.max(),
+        )
+        axes[0, i].set_title(f"Slice {slice_idx}\nTrue", fontsize=9)
+        axes[0, i].axis("off")
         if i == n_slices - 1:
-            plt.colorbar(im0, ax=axes[0, i], label='HRF Index')
+            plt.colorbar(im0, ax=axes[0, i], label="HRF Index")
 
         # Plot recovered
-        im1 = axes[1, i].imshow(rec_slice.T, cmap='turbo', interpolation='nearest',
-                                vmin=true_hrf_indices.min(), vmax=true_hrf_indices.max())
-        axes[1, i].set_title(f'Recovered\n(Acc={slice_accuracy:.2%})', fontsize=9)
-        axes[1, i].axis('off')
+        im1 = axes[1, i].imshow(
+            rec_slice.T,
+            cmap="turbo",
+            interpolation="nearest",
+            vmin=true_hrf_indices.min(),
+            vmax=true_hrf_indices.max(),
+        )
+        axes[1, i].set_title(f"Recovered\n(Acc={slice_accuracy:.2%})", fontsize=9)
+        axes[1, i].axis("off")
         if i == n_slices - 1:
-            plt.colorbar(im1, ax=axes[1, i], label='HRF Index')
+            plt.colorbar(im1, ax=axes[1, i], label="HRF Index")
 
         # Plot difference
         vmax_diff = max(abs(diff_slice.min()), abs(diff_slice.max()), 1e-10)
-        im2 = axes[2, i].imshow(diff_slice.T, cmap='RdBu_r', interpolation='nearest',
-                                vmin=-vmax_diff, vmax=vmax_diff)
-        axes[2, i].set_title('Difference', fontsize=9)
-        axes[2, i].axis('off')
+        im2 = axes[2, i].imshow(
+            diff_slice.T, cmap="RdBu_r", interpolation="nearest", vmin=-vmax_diff, vmax=vmax_diff
+        )
+        axes[2, i].set_title("Difference", fontsize=9)
+        axes[2, i].axis("off")
         if i == n_slices - 1:
-            plt.colorbar(im2, ax=axes[2, i], label='Error')
+            plt.colorbar(im2, ax=axes[2, i], label="Error")
 
     # Add row labels
-    axes[0, 0].set_ylabel('Ground Truth', fontsize=10, rotation=90, labelpad=10)
-    axes[1, 0].set_ylabel('Recovered', fontsize=10, rotation=90, labelpad=10)
-    axes[2, 0].set_ylabel('Error', fontsize=10, rotation=90, labelpad=10)
+    axes[0, 0].set_ylabel("Ground Truth", fontsize=10, rotation=90, labelpad=10)
+    axes[1, 0].set_ylabel("Recovered", fontsize=10, rotation=90, labelpad=10)
+    axes[2, 0].set_ylabel("Error", fontsize=10, rotation=90, labelpad=10)
 
-    plt.suptitle(f'HRF Library Recovery (Overall Accuracy: {accuracy_overall:.2%})',
-                 fontsize=14, y=0.98)
+    plt.suptitle(
+        f"HRF Library Recovery (Overall Accuracy: {accuracy_overall:.2%})", fontsize=14, y=0.98
+    )
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"Saved HRF recovery plot to {save_path}")
 
     # Compute detailed accuracy stats
     accuracy = {
-        'overall_accuracy': accuracy_overall,
-        'mean_absolute_error': np.abs(recovered_hrf_indices - true_hrf_indices).mean(),
-        'median_absolute_error': np.median(np.abs(recovered_hrf_indices - true_hrf_indices)),
-        'max_error': np.abs(recovered_hrf_indices - true_hrf_indices).max(),
-        'correct_voxels': correct.sum(),
-        'total_voxels': correct.size
+        "overall_accuracy": accuracy_overall,
+        "mean_absolute_error": np.abs(recovered_hrf_indices - true_hrf_indices).mean(),
+        "median_absolute_error": np.median(np.abs(recovered_hrf_indices - true_hrf_indices)),
+        "max_error": np.abs(recovered_hrf_indices - true_hrf_indices).max(),
+        "correct_voxels": correct.sum(),
+        "total_voxels": correct.size,
     }
 
     print("\nHRF Recovery Statistics:")
@@ -1624,5 +1695,5 @@ if __name__ == "__main__":
     print("  - plot_pareto_frontier(): Show Pareto optimal designs")
     print("  - plot_isi_range_optimization(): Das 2023 Figure 7 style (auto mean)")
     print("  - plot_isi_range_by_target_mean(): ISI optimization with explicit means")
-    print("  - plot_hrf_recovery(): Visualize HRF library recovery accuracy")
+    print("  - plot_hrf_index_recovery(): Visualize HRF library recovery accuracy")
     print("\nSee example scripts for complete workflows.")
