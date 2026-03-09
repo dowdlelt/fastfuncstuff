@@ -1,0 +1,323 @@
+"""CLI for GPU-accelerated affine/rigid alignment.
+
+Command: allineate (registered as entry point in pyproject.toml)
+
+Usage:
+    allineate -base ref.nii -source mov.nii -prefix out.nii -1Dmatrix_save mat.aff12.1D
+
+Speed presets:
+    -fast       : Skip Powell polish, fewer iterations (~2x faster)
+    -superfast  : Skip coarse search + Powell, minimal Adam (~5x faster, small motion only)
+    Default is balanced quality/speed. For maximum accuracy, use -slow.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+import torch
+
+from .allineate import AffineAlignConfig, allineate
+from .affine import save_matrix_1D, load_matrix_1D, apply_affine, apply_affine_wsinc5, dicom_matrix_to_voxel
+from .io import load_image, save_image
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="allineate",
+        description="GPU-accelerated affine/rigid alignment (inspired by 3dAllineate)",
+        epilog="""Speed/quality presets:
+  -superfast  Skip coarse search, 50 Adam iters, no Powell (~5x faster)
+  -fast       Fewer iters (100/100), no Powell (~2x faster)
+  (default)   150 iters at 2x, 200 at full-res, 500 Powell evals
+  -slow       300 iters at 2x, 400 at full-res, 2000 Powell evals
+
+Examples:
+  # Standard brain alignment:
+  allineate -base mni.nii -source subj.nii -prefix out.nii -cost lpa
+
+  # Fast rigid alignment (e.g., motion correction):
+  allineate -base vol0.nii -source vol1.nii -prefix out.nii -rigid -fast
+
+  # High-quality with wsinc5 output:
+  allineate -base mni.nii -source subj.nii -prefix out.nii -slow -final wsinc5
+
+  # Apply existing matrix:
+  allineate -base mni.nii -source subj.nii -prefix out.nii -1Dmatrix_apply mat.aff12.1D
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # --- Input/Output ---
+    io_group = parser.add_argument_group("Input/Output")
+    io_group.add_argument("-base", required=True,
+                          help="Base/reference image (.nii/.nii.gz)")
+    io_group.add_argument("-source", required=True,
+                          help="Source/moving image to align")
+    io_group.add_argument("-prefix", required=True,
+                          help="Output aligned image")
+    io_group.add_argument("-1Dmatrix_save", default=None,
+                          help="Save affine matrix as .aff12.1D (AFNI format)")
+    io_group.add_argument("-1Dmatrix_apply", default=None,
+                          help="Apply existing matrix (skip alignment)")
+    io_group.add_argument("-base_index", type=int, default=None,
+                          help="Use volume N from 4D base")
+
+    # --- Alignment mode ---
+    mode_group = parser.add_argument_group("Alignment mode")
+    mode_ex = mode_group.add_mutually_exclusive_group()
+    mode_ex.add_argument("-rigid", action="store_true",
+                         help="6 DoF: translation + rotation only")
+    mode_ex.add_argument("-affine", action="store_true", default=True,
+                         help="12 DoF: full affine (default)")
+    mode_ex.add_argument("-EPI", action="store_true",
+                         help="9 DoF: EPI-specific (freeze x/z scale, z shear)")
+
+    # --- Cost function ---
+    cost_group = parser.add_argument_group("Cost function")
+    cost_group.add_argument("-cost", choices=["ls", "lpa", "lpc"], default="lpa",
+                            help="Cost function: ls=clipped Pearson, "
+                                 "lpa=local Pearson absolute (default, "
+                                 "best for similar contrast), "
+                                 "lpc=local Pearson signed (best for "
+                                 "non-similar contrast, e.g. EPI-to-anat)")
+    cost_group.add_argument("-lpa_sigma", type=float, default=4.0,
+                            help="Gaussian sigma for LPA/LPC neighborhoods "
+                                 "in voxels (default: 4.0)")
+
+    # --- Interpolation ---
+    interp_group = parser.add_argument_group("Interpolation")
+    interp_group.add_argument("-interp", choices=["linear", "cubic"],
+                              default="linear",
+                              help="During optimization (default: linear)")
+    interp_group.add_argument("-final", choices=["linear", "cubic", "wsinc5"],
+                              default="linear", dest="final_interp",
+                              help="For output image (default: linear). "
+                                   "wsinc5 gives sharpest results")
+
+    # --- Masking ---
+    mask_group = parser.add_argument_group("Masking")
+    mask_group.add_argument("-source_automask", action="store_true",
+                            help="Automask source to exclude background")
+    mask_group.add_argument("-autoweight", action="store_true", default=True,
+                            help="Weight by base intensity (default: on)")
+    mask_group.add_argument("-noautoweight", action="store_true",
+                            help="Disable intensity-based weighting")
+    mask_group.add_argument("-save_automask", default=None, metavar="PREFIX",
+                            help="Save computed automask to PREFIX")
+
+    # --- Search control ---
+    search_group = parser.add_argument_group("Search control")
+    search_group.add_argument("-cmass", action="store_true", default=True,
+                              help="Center-of-mass pre-alignment (default: on)")
+    search_group.add_argument("-nocmass", action="store_true",
+                              help="Disable center-of-mass pre-alignment")
+    search_group.add_argument("-twopass", action="store_true", default=True,
+                              help="Coarse search + refinement (default)")
+    search_group.add_argument("-onepass", action="store_true",
+                              help="Skip coarse search (small motion only)")
+    search_group.add_argument("-coarse_range", type=float, default=30.0,
+                              help="Coarse rotation range in degrees "
+                                   "(default: 30)")
+    search_group.add_argument("-coarse_step", type=float, default=5.0,
+                              help="Coarse angular step in degrees "
+                                   "(default: 5)")
+    search_group.add_argument("-tbest", type=int, default=3,
+                              help="Coarse candidates to refine (default: 3)")
+    search_group.add_argument("-noautocrop", action="store_true",
+                              help="Disable auto-cropping of zero margins")
+
+    # --- Speed/quality presets ---
+    speed_group = parser.add_argument_group("Speed/quality")
+    speed_ex = speed_group.add_mutually_exclusive_group()
+    speed_ex.add_argument("-superfast", action="store_true",
+                          help="Minimal: onepass, 50 Adam iters, no Powell")
+    speed_ex.add_argument("-fast", action="store_true",
+                          help="Quick: 100 Adam iters, no Powell polish")
+    speed_ex.add_argument("-slow", action="store_true",
+                          help="Thorough: 300/400 Adam iters, 2000 Powell evals")
+
+    # --- Hardware ---
+    hw_group = parser.add_argument_group("Hardware")
+    hw_group.add_argument("-device", default=None,
+                          help="PyTorch device: cuda, mps, cpu (auto-detected)")
+    hw_group.add_argument("-verb", type=int, default=1, choices=[0, 1, 2],
+                          help="Verbosity: 0=quiet, 1=normal, 2=debug")
+
+    args = parser.parse_args(argv)
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Main CLI entry point for allineate."""
+    args = parse_args(argv)
+
+    # --- Device selection ---
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    verb = args.verb
+    if verb >= 1:
+        print(f"allineate: device={device}")
+
+    # --- Load images ---
+    t0 = time.time()
+    base, base_header = load_image(args.base, device=device)
+    source, source_header = load_image(args.source, device=device)
+
+    # Handle 4D base
+    if base.ndim == 4:
+        idx = args.base_index if args.base_index is not None else 0
+        if verb >= 1:
+            print(f"Using volume {idx} from 4D base ({base.shape[0]} volumes)")
+        base = base[idx]
+
+    # Handle 4D source
+    source_4d = None
+    if source.ndim == 4:
+        source_4d = source
+        source = source[0]
+        if verb >= 1:
+            print(f"Source is 4D ({source_4d.shape[0]} volumes), "
+                  f"aligning first volume")
+
+    if verb >= 1:
+        print(f"Base: {args.base} {base.shape}")
+        print(f"Source: {args.source} {source.shape}")
+        print(f"Load time: {time.time() - t0:.2f}s")
+
+    # --- Apply existing matrix ---
+    if getattr(args, "1Dmatrix_apply", None) is not None:
+        matrix_path = getattr(args, "1Dmatrix_apply")
+        if verb >= 1:
+            print(f"Applying matrix from {matrix_path}")
+
+        matrix = load_matrix_1D(
+            matrix_path,
+            base_affine=base_header["affine"],
+            source_affine=source_header["affine"],
+        )
+        matrix = matrix.to(device)
+        if args.final_interp == "wsinc5":
+            warped = apply_affine_wsinc5(source, matrix, base.shape)
+        else:
+            warped = apply_affine(source, matrix, base.shape, zero_outside=True)
+        save_image(warped, args.prefix, header_info=base_header)
+        if verb >= 1:
+            print(f"Saved: {args.prefix}")
+        return
+
+    # --- Build config with speed/quality presets ---
+    dof = "affine"
+    if args.rigid:
+        dof = "rigid"
+    elif args.EPI:
+        dof = "epi"
+
+    # Defaults
+    adam_iters_2x = 150
+    adam_iters_1x = 200
+    powell_maxfev = 500
+    twopass = not args.onepass
+
+    # Apply presets
+    if args.superfast:
+        adam_iters_2x = 50
+        adam_iters_1x = 50
+        powell_maxfev = 0
+        twopass = False
+        if verb >= 1:
+            print("Mode: superfast (onepass, 50 iters, no Powell)")
+    elif args.fast:
+        adam_iters_2x = 100
+        adam_iters_1x = 100
+        powell_maxfev = 0
+        if verb >= 1:
+            print("Mode: fast (100 iters, no Powell)")
+    elif args.slow:
+        adam_iters_2x = 300
+        adam_iters_1x = 400
+        powell_maxfev = 2000
+        if verb >= 1:
+            print("Mode: slow (300/400 iters, 2000 Powell evals)")
+
+    config = AffineAlignConfig(
+        dof=dof,
+        cost=args.cost,
+        lpa_sigma=args.lpa_sigma,
+        twopass=twopass,
+        coarse_range=args.coarse_range,
+        coarse_step=args.coarse_step,
+        tbest=args.tbest,
+        adam_iters_2x=adam_iters_2x,
+        adam_iters_1x=adam_iters_1x,
+        powell_maxfev=powell_maxfev,
+        cmass=not args.nocmass,
+        interp=args.interp,
+        final_interp=args.final_interp,
+        source_automask=args.source_automask,
+        autoweight=not args.noautoweight,
+        autocrop=not args.noautocrop,
+        device=str(device),
+        verb=verb,
+    )
+
+    # --- Run alignment ---
+    t1 = time.time()
+    matrix, warped = allineate(
+        base, source, config,
+        base_header=base_header,
+        source_header=source_header,
+        save_automask_path=args.save_automask,
+    )
+
+    if verb >= 1:
+        print(f"Alignment time: {time.time() - t1:.2f}s")
+
+    # --- Save outputs ---
+    save_image(warped, args.prefix, header_info=base_header)
+    if verb >= 1:
+        print(f"Saved: {args.prefix}")
+
+    matrix_save_path = getattr(args, "1Dmatrix_save", None)
+    if matrix_save_path is not None:
+        save_matrix_1D(
+            matrix, matrix_save_path,
+            base_affine=base_header["affine"],
+            source_affine=source_header["affine"],
+        )
+        if verb >= 1:
+            print(f"Saved matrix: {matrix_save_path}")
+
+    # --- Apply to all 4D volumes ---
+    if source_4d is not None:
+        if verb >= 1:
+            print(f"Applying alignment to all {source_4d.shape[0]} volumes...")
+        aligned_vols = []
+        for t in range(source_4d.shape[0]):
+            if args.final_interp == "wsinc5":
+                vol = apply_affine_wsinc5(source_4d[t], matrix, base.shape)
+            else:
+                vol = apply_affine(source_4d[t], matrix, base.shape,
+                                   zero_outside=True)
+            aligned_vols.append(vol)
+        result_4d = torch.stack(aligned_vols)
+        save_image(result_4d, args.prefix, header_info=base_header)
+        if verb >= 1:
+            print(f"Saved 4D result: {args.prefix}")
+
+    if verb >= 1:
+        print(f"Total time: {time.time() - t0:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
