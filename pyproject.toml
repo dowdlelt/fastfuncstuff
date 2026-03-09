@@ -31,6 +31,11 @@ test = [
     "scikit-learn>=1.2",
 ]
 
+[project.scripts]
+ffs_nwarp = "fastfuncsim.processing.nwarpforge_cli:main"
+ffs_allineate = "fastfuncsim.processing.allineate_cli:main"
+ffs_moco = "fastfuncsim.processing.ffs_moco_cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["fastfuncsim*"]
