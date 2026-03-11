@@ -4,8 +4,8 @@ Comprehensive tests for timing_utils.py.
 Tests the hierarchical timing profiler used for performance optimization.
 """
 
-import pytest
 import time
+
 from fastfuncsim.timing_utils import TimingProfiler, get_profiler, profile_section
 
 

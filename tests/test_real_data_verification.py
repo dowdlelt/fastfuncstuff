@@ -1,16 +1,16 @@
 
-import numpy as np
-import torch
-import pytest
-import nibabel as nib
 from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+import pytest
+import torch
+from scipy.stats import pearsonr
 from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.decomposition import FastICA as SklearnFastICA
-from scipy.stats import pearsonr
 
-from fastfuncsim.pca import PCA
 from fastfuncsim.ica import FastICA
-from fastfuncsim.utils import get_device
+from fastfuncsim.pca import PCA
 
 DATA_PATH = Path("/home/logan/Dropbox/Resources/code/fastfuncsim/test_data/small_validation_afni_data/small_test_r01.nii.gz")
 

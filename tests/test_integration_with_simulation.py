@@ -13,16 +13,15 @@ Uses:
 - Actual GLM fitting with HRF convolution (not just random data)
 """
 
+
+import numpy as np
 import pytest
 import torch
-import numpy as np
-from pathlib import Path
 
-import fastfuncsim as ffs
-from fastfuncsim.simulation import simulate_fmri_run, simulate_fmri_experiment
+from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
 from fastfuncsim.hrf import get_canonical_hrf
-from fastfuncsim.glm_core import fit_glm, construct_polynomial_matrix
-from fastfuncsim.utils import get_device, gaussian_blur_3d, to_tensor
+from fastfuncsim.simulation import simulate_fmri_run
+from fastfuncsim.utils import gaussian_blur_3d, get_device
 
 
 @pytest.fixture

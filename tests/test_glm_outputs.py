@@ -1,11 +1,11 @@
 """Tests for GLM NIfTI export utilities."""
 
-import pytest
 import json
 import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from fastfuncsim.glm_core import fit_glm
@@ -127,8 +127,9 @@ class TestGLMOutputsComprehensive:
 
     def test_write_single_trials_output(self, mock_results):
         """Test writing single trial betas."""
-        from fastfuncsim.glm_outputs import write_single_trials_output
         import nibabel as nib
+
+        from fastfuncsim.glm_outputs import write_single_trials_output
         
         # Setup design matrix with interleaved onsets
         # Reg 0: onset 5
@@ -171,8 +172,9 @@ class TestGLMOutputsComprehensive:
 
     def test_write_glm_bucket_as_nifti(self, mock_results):
         """Test writing AFNI bucket file."""
-        from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
         import nibabel as nib
+
+        from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
         
         with tempfile.TemporaryDirectory() as tmpdir:
             # Test writing NIfTI format
@@ -223,10 +225,9 @@ class TestGLMOutputsComprehensive:
     def test_error_cases(self, mock_results):
         """Test error handling."""
         from fastfuncsim.glm_outputs import (
-            write_glm_results_nifti, 
-            _resolve_shape,
             _reshape_parameter_map,
-            _normalize_output_path
+            _resolve_shape,
+            write_glm_results_nifti,
         )
         
         with tempfile.TemporaryDirectory() as tmpdir:

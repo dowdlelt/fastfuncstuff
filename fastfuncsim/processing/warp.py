@@ -39,18 +39,17 @@ from .basis import (
     evaluate_patch_warp_batched,
 )
 from .cost import (
-    IncrementalCorrelation,
     BatchedIncrementalCorrelation,
+    IncrementalCorrelation,
     _auto_clip,
-    lpa_cost_patch,
     batched_lpa_cost,
 )
 from .interp import (
+    batched_compose_and_interpolate,
     trilinear_interpolate,
     warp_image_linear,
-    batched_compose_and_interpolate,
 )
-from .optimizer import optimize_warp_params_torch, optimize_warp_params_batched
+from .optimizer import optimize_warp_params_batched, optimize_warp_params_torch
 from .penalty import compute_jacobian_energy, compute_penalty_batched
 from .weight import compute_weight_image
 

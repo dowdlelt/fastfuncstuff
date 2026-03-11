@@ -11,8 +11,9 @@ Demonstrates:
    - Beta and t-stat for each contrast
 """
 
-import fastfuncsim as ffs
 import torch
+
+import fastfuncsim as ffs
 
 # Setup
 device = ffs.get_device()
@@ -90,7 +91,7 @@ results = ffs.fit_glm_arma11(
 results.original_shape = matrix_size
 
 print(f"Mean R²: {results.r2.mean():.3f}")
-print(f"Estimated betas:")
+print("Estimated betas:")
 for i in range(n_conditions):
     print(f"  Condition {i+1}: {results.betas[:, i].mean():.3f} (true: {betas_true[i]:.1f})")
 print(f"Mean ARMA a: {results.arma_params[:, 0].mean():.3f}")
@@ -151,7 +152,8 @@ print("=" * 70)
 
 # Read the JSON to show what's in the bucket
 import json
-with open(output_path.with_suffix('.json'), 'r') as f:
+
+with open(output_path.with_suffix('.json')) as f:
     bucket_info = json.load(f)
 
 for idx, label in enumerate(bucket_info['SubBricks']):

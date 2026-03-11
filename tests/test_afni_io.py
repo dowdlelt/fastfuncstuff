@@ -6,11 +6,11 @@ Uses the synthetic_data/ folder with known test datasets:
 - afni_nii_all_ones.nii.gz: Same data in NIfTI format
 """
 
+from pathlib import Path
+
+import nibabel as nib
 import numpy as np
 import pytest
-from pathlib import Path
-import nibabel as nib
-
 
 # Locate synthetic data directory
 SYNTHETIC_DATA_DIR = Path(__file__).parent.parent / "synthetic_data"

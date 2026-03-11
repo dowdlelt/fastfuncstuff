@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Union
 
 import numpy as np
 import torch
@@ -24,8 +24,8 @@ ResultsLike = Union[GLMResults, ARMA11Results]
 
 
 def extract_onset_times_from_design(
-    design_matrix: np.ndarray, column_indices: List[int]
-) -> List[int]:
+    design_matrix: np.ndarray, column_indices: list[int]
+) -> list[int]:
     """
     Extract onset times for stimulus columns from design matrix.
 
@@ -65,10 +65,10 @@ def extract_onset_times_from_design(
 
 def write_single_trials_output(
     results: ResultsLike,
-    output_path: Union[str, Path],
+    output_path: str | Path,
     design_matrix: np.ndarray,
-    stim_indices: List[int],
-    stim_labels: Optional[List[str]],
+    stim_indices: list[int],
+    stim_labels: list[str] | None,
 ) -> Path:
     """
     Write single-trial betas reordered by presentation time.
@@ -147,7 +147,7 @@ def write_single_trials_output(
     return output_path
 
 
-def _ensure_numpy(array: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
+def _ensure_numpy(array: torch.Tensor | np.ndarray) -> np.ndarray:
     """Convert torch tensors to numpy arrays (float32)."""
     if isinstance(array, torch.Tensor):
         return array.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -156,7 +156,7 @@ def _ensure_numpy(array: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
     return array
 
 
-def _resolve_shape(results: ResultsLike, volume_shape: Optional[Sequence[int]]) -> Sequence[int]:
+def _resolve_shape(results: ResultsLike, volume_shape: Sequence[int] | None) -> Sequence[int]:
     """Resolve spatial shape from results metadata or caller fallback.
 
     Parameters
@@ -187,7 +187,7 @@ def _resolve_shape(results: ResultsLike, volume_shape: Optional[Sequence[int]]) 
 
 def slice_glm_results(
     results: ResultsLike,
-    indices: Union[List[int], np.ndarray, torch.Tensor],
+    indices: list[int] | np.ndarray | torch.Tensor,
 ) -> ResultsLike:
     """
     Create a new results object with only selected regressors.
@@ -309,7 +309,7 @@ def slice_glm_results(
     return sliced
 
 
-def _build_affine(affine: Optional[np.ndarray], voxel_size: Sequence[float]) -> np.ndarray:
+def _build_affine(affine: np.ndarray | None, voxel_size: Sequence[float]) -> np.ndarray:
     """Build affine from voxel size when explicit affine is unavailable.
 
     Parameters
@@ -333,7 +333,7 @@ def _build_affine(affine: Optional[np.ndarray], voxel_size: Sequence[float]) -> 
     return mat
 
 
-def _get_voxel_mask(results: ResultsLike) -> Optional[np.ndarray]:
+def _get_voxel_mask(results: ResultsLike) -> np.ndarray | None:
     """Extract voxel mask from results object as numpy bool array.
 
     Parameters
@@ -357,7 +357,7 @@ def _get_voxel_mask(results: ResultsLike) -> Optional[np.ndarray]:
 def _reshape_parameter_map(
     data: np.ndarray,
     volume_shape: Sequence[int],
-    voxel_mask: Optional[np.ndarray] = None,
+    voxel_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Reshape flat parameter arrays back to 3D/4D image space.
 
@@ -428,7 +428,7 @@ def _strip_imaging_extension(filepath: str) -> str:
     return filepath
 
 
-def _normalize_output_path(output_path: Union[str, Path]) -> tuple[Path, str]:
+def _normalize_output_path(output_path: str | Path) -> tuple[Path, str]:
     """
     Normalize output path and detect format from extension.
 
@@ -464,8 +464,8 @@ def _normalize_output_path(output_path: Union[str, Path]) -> tuple[Path, str]:
 def _create_nifti_with_header(
     data: np.ndarray,
     affine: np.ndarray,
-    results: Optional[ResultsLike] = None,
-    tr: Optional[float] = None,
+    results: ResultsLike | None = None,
+    tr: float | None = None,
 ) -> nib.Nifti1Image:
     """
     Create NIfTI image preserving complete header from original data.
@@ -568,9 +568,9 @@ def _save_nifti_with_format(
 
 def write_glm_results_nifti(
     results: ResultsLike,
-    output_dir: Union[str, Path],
+    output_dir: str | Path,
     prefix: str = "glm",
-    condition_names: Optional[Sequence[str]] = None,
+    condition_names: Sequence[str] | None = None,
     include_beta: bool = True,
     include_tstat: bool = True,
     include_fstat: bool = True,
@@ -579,10 +579,10 @@ def write_glm_results_nifti(
     include_sigma: bool = False,
     write_residuals: bool = False,
     write_predictions: bool = False,
-    volume_shape: Optional[Sequence[int]] = None,
-    affine: Optional[np.ndarray] = None,
+    volume_shape: Sequence[int] | None = None,
+    affine: np.ndarray | None = None,
     voxel_size: Sequence[float] = (2.0, 2.0, 2.0),
-    dtype: Union[np.dtype, str] = np.float32,
+    dtype: np.dtype | str = np.float32,
 ) -> dict:
     """
     Write GLM analysis outputs to NIfTI files with AFNI-style stacking of betas and t-stats.
@@ -637,8 +637,8 @@ def write_glm_results_nifti(
     if condition_names is None:
         condition_names = [f"cond_{i + 1:02d}" for i in range(n_regressors)]
 
-    stats_stack: List[np.ndarray] = []
-    stats_labels: List[dict] = []
+    stats_stack: list[np.ndarray] = []
+    stats_labels: list[dict] = []
 
     if include_beta:
         for idx, name in enumerate(condition_names):
@@ -745,17 +745,17 @@ def write_glm_results_nifti(
 
 def write_afni_bucket(
     results: ResultsLike,
-    output_path: Union[str, Path],
-    condition_names: Optional[Sequence[str]] = None,
-    contrast_names: Optional[Sequence[str]] = None,
-    contrast_results: Optional[dict] = None,
-    volume_shape: Optional[Sequence[int]] = None,
-    affine: Optional[np.ndarray] = None,
+    output_path: str | Path,
+    condition_names: Sequence[str] | None = None,
+    contrast_names: Sequence[str] | None = None,
+    contrast_results: dict | None = None,
+    volume_shape: Sequence[int] | None = None,
+    affine: np.ndarray | None = None,
     voxel_size: Sequence[float] = (2.0, 2.0, 2.0),
-    dtype: Union[np.dtype, str] = np.float32,
+    dtype: np.dtype | str = np.float32,
     apply_afni_metadata: bool = True,
     compress_output: bool = True,
-    output_format: Optional[str] = None,
+    output_format: str | None = None,
 ) -> Path:
     """
     write_afni_bucket(results, output_path, ...)
@@ -792,17 +792,17 @@ def write_afni_bucket(
 
 def write_glm_bucket_as_nifti(
     results: ResultsLike,
-    output_path: Union[str, Path],
-    condition_names: Optional[Sequence[str]] = None,
-    contrast_names: Optional[Sequence[str]] = None,
-    contrast_results: Optional[dict] = None,
-    volume_shape: Optional[Sequence[int]] = None,
-    affine: Optional[np.ndarray] = None,
+    output_path: str | Path,
+    condition_names: Sequence[str] | None = None,
+    contrast_names: Sequence[str] | None = None,
+    contrast_results: dict | None = None,
+    volume_shape: Sequence[int] | None = None,
+    affine: np.ndarray | None = None,
     voxel_size: Sequence[float] = (2.0, 2.0, 2.0),
-    dtype: Union[np.dtype, str] = np.float32,
+    dtype: np.dtype | str = np.float32,
     apply_afni_metadata: bool = True,
     compress_output: bool = True,
-    output_format: Optional[str] = None,
+    output_format: str | None = None,
 ) -> Path:
     """
     Write GLM results as a 4D output file (NIfTI) with AFNI-style sub-bricks.
@@ -1204,7 +1204,7 @@ def write_glm_bucket_as_nifti(
 
 def write_ols_arma_comparison(
     arma_results: ARMA11Results,
-    output_prefix: Union[str, Path],
+    output_prefix: str | Path,
     **kwargs,
 ) -> dict:
     """
@@ -1406,14 +1406,14 @@ def write_ols_arma_comparison(
 
 
 def write_partial_r2_with_labels(
-    r2_partial_data: Union[torch.Tensor, np.ndarray],
-    output_path: Union[str, Path],
+    r2_partial_data: torch.Tensor | np.ndarray,
+    output_path: str | Path,
     condition_labels: Sequence[str],
     volume_shape: Sequence[int],
-    voxel_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    affine: Optional[np.ndarray] = None,
-    n_timepoints: Optional[int] = None,
-    n_regressors: Optional[int] = None,
+    voxel_mask: torch.Tensor | np.ndarray | None = None,
+    affine: np.ndarray | None = None,
+    n_timepoints: int | None = None,
+    n_regressors: int | None = None,
     apply_afni_metadata: bool = True,
     mode: str = "full",  # "full" or "task" - affects label suffix
 ) -> Path:
@@ -1577,14 +1577,14 @@ def write_partial_r2_with_labels(
 def save_single_trial_results(
     betas: torch.Tensor,
     xval_r2: torch.Tensor,
-    trial_labels: List[str],
+    trial_labels: list[str],
     trial_condition_ids: torch.Tensor,
     trial_run_ids: torch.Tensor,
-    condition_labels: List[str],
+    condition_labels: list[str],
     output_prefix: str,
     volume_shape: tuple[int, int, int],
     affine: np.ndarray,
-    voxel_mask: Optional[torch.Tensor] = None,
+    voxel_mask: torch.Tensor | None = None,
 ) -> dict[str, str]:
     """
     Save single-trial output files for GLMsingle-style analysis.

@@ -8,11 +8,10 @@ Tests cover:
 - Depth mask handling (prepare_depth_mask)
 """
 
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pytest
-import torch
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from fastfuncsim.ica_postprocess import (
     best_lag_and_r,
@@ -318,7 +317,6 @@ class TestExpandMaskFile:
             mock_img.get_fdata.return_value = np.random.rand(10, 10, 10, 3)
             mock_nib.load.return_value = mock_img
 
-            from fastfuncsim.ica_postprocess import expand_mask_file
 
             # This would require actual file I/O - skip for now
             # The actual tests would need temporary NIfTI files

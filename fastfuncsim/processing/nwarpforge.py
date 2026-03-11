@@ -25,7 +25,6 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from .affine import dicom_matrix_to_voxel
 from .interp import trilinear_interpolate, warp_image_wsinc5
 from .io import load_image, load_warp_field, save_image
 
@@ -116,7 +115,7 @@ def load_affine_1D(
 
     if debug:
         m = matrices[0].cpu().numpy()
-        print(f"[DEBUG] load_affine_1D: Raw matrix from file (t=0):")
+        print("[DEBUG] load_affine_1D: Raw matrix from file (t=0):")
         print(f"  [{m[0, 0]:9.5f} {m[0, 1]:9.5f} {m[0, 2]:9.5f} {m[0, 3]:9.5f}]")
         print(f"  [{m[1, 0]:9.5f} {m[1, 1]:9.5f} {m[1, 2]:9.5f} {m[1, 3]:9.5f}]")
         print(f"  [{m[2, 0]:9.5f} {m[2, 1]:9.5f} {m[2, 2]:9.5f} {m[2, 3]:9.5f}]")
@@ -137,7 +136,7 @@ def load_affine_1D(
     output_xyz2ijk = torch.linalg.inv(output_ijk2xyz)
 
     if debug:
-        print(f"[DEBUG] load_affine_1D: output_affine (NIfTI sform):")
+        print("[DEBUG] load_affine_1D: output_affine (NIfTI sform):")
         a = output_ijk2xyz.cpu().numpy()
         print(f"  [{a[0, 0]:9.5f} {a[0, 1]:9.5f} {a[0, 2]:9.5f} {a[0, 3]:9.5f}]")
         print(f"  [{a[1, 0]:9.5f} {a[1, 1]:9.5f} {a[1, 2]:9.5f} {a[1, 3]:9.5f}]")
@@ -178,12 +177,12 @@ def load_warp(
     xd, yd, zd, header_info = load_warp_field(path, device=device)
 
     if debug:
-        print(f"[DEBUG] load_warp: Raw displacement ranges (before conversion):")
+        print("[DEBUG] load_warp: Raw displacement ranges (before conversion):")
         print(f"  xd: [{xd.min().item():.3f}, {xd.max().item():.3f}]")
         print(f"  yd: [{yd.min().item():.3f}, {yd.max().item():.3f}]")
         print(f"  zd: [{zd.min().item():.3f}, {zd.max().item():.3f}]")
         a = header_info["affine"]
-        print(f"[DEBUG] load_warp: Warp file affine:")
+        print("[DEBUG] load_warp: Warp file affine:")
         print(f"  [{a[0, 0]:9.5f} {a[0, 1]:9.5f} {a[0, 2]:9.5f} {a[0, 3]:9.5f}]")
         print(f"  [{a[1, 0]:9.5f} {a[1, 1]:9.5f} {a[1, 2]:9.5f} {a[1, 3]:9.5f}]")
         print(f"  [{a[2, 0]:9.5f} {a[2, 1]:9.5f} {a[2, 2]:9.5f} {a[2, 3]:9.5f}]")
@@ -191,12 +190,12 @@ def load_warp(
     if units == "mm":
         xd, yd, zd = _convert_warp_mm_to_voxels(xd, yd, zd, header_info["affine"])
         if debug:
-            print(f"[DEBUG] load_warp: After DICOM mm->voxel conversion:")
+            print("[DEBUG] load_warp: After DICOM mm->voxel conversion:")
             print(f"  xd: [{xd.min().item():.3f}, {xd.max().item():.3f}]")
             print(f"  yd: [{yd.min().item():.3f}, {yd.max().item():.3f}]")
             print(f"  zd: [{zd.min().item():.3f}, {zd.max().item():.3f}]")
     elif debug:
-        print(f"[DEBUG] load_warp: Warps assumed to be in voxel units (no conversion)")
+        print("[DEBUG] load_warp: Warps assumed to be in voxel units (no conversion)")
 
     return NonlinearWarp(xd=xd, yd=yd, zd=zd, header_info=header_info)
 
@@ -367,7 +366,7 @@ def resample_warp_to_grid(
 
     if not np.allclose(disp_xform, np.eye(3), atol=1e-4):
         if verb >= 2:
-            print(f"  [resample] rotating displacement vectors (grids have different axes)")
+            print("  [resample] rotating displacement vectors (grids have different axes)")
         D = torch.from_numpy(disp_xform).float().to(device)
         # Stack displacements and rotate
         disp = torch.stack([new_xd.reshape(-1), new_yd.reshape(-1), new_zd.reshape(-1)], dim=0).float()
@@ -771,7 +770,7 @@ def nwarpforge(
     affine_for_matrices = output_affine
     if debug:
         a = affine_for_matrices
-        print(f"[DEBUG] Affine for matrix conversion (output grid):")
+        print("[DEBUG] Affine for matrix conversion (output grid):")
         print(f"  [{a[0, 0]:9.5f} {a[0, 1]:9.5f} {a[0, 2]:9.5f} {a[0, 3]:9.5f}]")
         print(f"  [{a[1, 0]:9.5f} {a[1, 1]:9.5f} {a[1, 2]:9.5f} {a[1, 3]:9.5f}]")
         print(f"  [{a[2, 0]:9.5f} {a[2, 1]:9.5f} {a[2, 2]:9.5f} {a[2, 3]:9.5f}]")
@@ -794,7 +793,7 @@ def nwarpforge(
                 print(f"  Affine: {xform.matrices.shape[0]} time point(s)")
             if debug:
                 m = xform.matrices[0].cpu().numpy()
-                print(f"  [DEBUG] Matrix after conversion (t=0):")
+                print("  [DEBUG] Matrix after conversion (t=0):")
                 print(
                     f"    [{m[0, 0]:9.5f} {m[0, 1]:9.5f} {m[0, 2]:9.5f} {m[0, 3]:9.5f}]"
                 )
@@ -813,7 +812,7 @@ def nwarpforge(
             if verb >= 1:
                 print(f"  Warp: {xform.shape}")
             if debug:
-                print(f"  [DEBUG] Warp displacement ranges:")
+                print("  [DEBUG] Warp displacement ranges:")
                 print(
                     f"    xd: [{xform.xd.min().item():.3f}, {xform.xd.max().item():.3f}]"
                 )

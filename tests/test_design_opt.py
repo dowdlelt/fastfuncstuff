@@ -1,7 +1,7 @@
 """Quick test to verify design optimization imports and basic functionality"""
 
 import sys
-import torch
+
 import numpy as np
 
 print("=" * 80)
@@ -20,9 +20,9 @@ except ImportError as e:
 try:
     from fastfuncsim.design_optimization import (
         ISIConstraints,
+        create_onset_matrix,
         generate_event_sequence,
         generate_isi_sequence,
-        create_onset_matrix
     )
     print("   ✓ design_optimization functions imported")
 except ImportError as e:
@@ -31,8 +31,8 @@ except ImportError as e:
 
 try:
     from fastfuncsim.metrics_empirical import (
+        compute_detection_power_empirical,
         estimate_ar1_coefficient,
-        compute_detection_power_empirical
     )
     print("   ✓ metrics_empirical functions imported")
 except ImportError as e:

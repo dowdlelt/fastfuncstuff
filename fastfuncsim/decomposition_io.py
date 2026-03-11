@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
 
 import nibabel as nib
 import numpy as np
@@ -23,7 +22,7 @@ def save_masked_component_maps_4d(
     mask3d: np.ndarray | None,
     shape3d: tuple[int, int, int],
     affine: np.ndarray,
-    out_file: Union[str, Path],
+    out_file: str | Path,
 ) -> Path:
     """Save (n_components, n_voxels) maps into a 4D image with optional masking."""
     k, n_vox = components_kv.shape
@@ -51,7 +50,7 @@ def save_masked_component_map_3d(
     mask3d: np.ndarray | None,
     shape3d: tuple[int, int, int],
     affine: np.ndarray,
-    out_file: Union[str, Path],
+    out_file: str | Path,
 ) -> Path:
     """Save a single (n_voxels,) map into a 3D image with optional masking."""
     n_vox = component_v.shape[0]
@@ -71,7 +70,7 @@ def save_masked_component_map_3d(
     return out_path
 
 
-def safe_relative_symlink(target: Union[str, Path], link_path: Union[str, Path]) -> Path:
+def safe_relative_symlink(target: str | Path, link_path: str | Path) -> Path:
     """Create/replace symlink at link_path pointing to target via relative path."""
     target_path = Path(target)
     link = Path(link_path)
@@ -84,10 +83,10 @@ def safe_relative_symlink(target: Union[str, Path], link_path: Union[str, Path])
 
 
 def write_melodic_compat_outputs(
-    compat_dir: Union[str, Path],
-    maps_file: Union[str, Path],
-    zmaps_file: Union[str, Path, None],
-    timecourse_file: Union[str, Path],
+    compat_dir: str | Path,
+    maps_file: str | Path,
+    zmaps_file: str | Path | None,
+    timecourse_file: str | Path,
     pca_scree_ratio: np.ndarray,
     component_explained_share_pct: np.ndarray,
     component_total_share_pct: np.ndarray,
@@ -153,10 +152,10 @@ def write_melodic_compat_outputs(
 
 
 def save_component_maps(
-    components: Union[np.ndarray, torch.Tensor],
-    mask_file: Union[str, Path],
-    output_file: Union[str, Path],
-    labels: Optional[list] = None,
+    components: np.ndarray | torch.Tensor,
+    mask_file: str | Path,
+    output_file: str | Path,
+    labels: list | None = None,
 ) -> None:
     """
     Save spatial components as 4D NIfTI file
@@ -231,9 +230,9 @@ def save_component_maps(
 
 
 def load_component_maps(
-    map_file: Union[str, Path],
-    mask_file: Union[str, Path],
-) -> Tuple[np.ndarray, list]:
+    map_file: str | Path,
+    mask_file: str | Path,
+) -> tuple[np.ndarray, list]:
     """
     Load spatial components from 4D NIfTI file
 
@@ -293,11 +292,11 @@ def load_component_maps(
 
 
 def save_timeseries(
-    timeseries: Union[np.ndarray, torch.Tensor],
-    output_file: Union[str, Path],
-    tr: Optional[float] = None,
-    reference_file: Optional[Union[str, Path]] = None,
-    labels: Optional[list] = None,
+    timeseries: np.ndarray | torch.Tensor,
+    output_file: str | Path,
+    tr: float | None = None,
+    reference_file: str | Path | None = None,
+    labels: list | None = None,
 ) -> None:
     """
     Save component timeseries as .1D file or 2D NIfTI
@@ -381,8 +380,8 @@ def save_timeseries(
 
 
 def load_timeseries(
-    timeseries_file: Union[str, Path],
-) -> Tuple[np.ndarray, Optional[list]]:
+    timeseries_file: str | Path,
+) -> tuple[np.ndarray, list | None]:
     """
     Load component timeseries from file
 
@@ -450,15 +449,15 @@ def load_timeseries(
 
 
 def save_decomposition_results(
-    components: Union[np.ndarray, torch.Tensor],
-    timeseries: Union[np.ndarray, torch.Tensor],
-    mask_file: Union[str, Path],
-    output_prefix: Union[str, Path],
-    tr: Optional[float] = None,
-    reference_file: Optional[Union[str, Path]] = None,
-    labels: Optional[list] = None,
+    components: np.ndarray | torch.Tensor,
+    timeseries: np.ndarray | torch.Tensor,
+    mask_file: str | Path,
+    output_prefix: str | Path,
+    tr: float | None = None,
+    reference_file: str | Path | None = None,
+    labels: list | None = None,
     method: str = "ICA",
-) -> Dict[str, Path]:
+) -> dict[str, Path]:
     """
     Save complete decomposition results (maps + timeseries)
 

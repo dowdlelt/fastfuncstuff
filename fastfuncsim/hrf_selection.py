@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -32,8 +31,8 @@ from .xval import (
 
 
 def load_nuisance_file(
-    filepath: Union[str, Path],
-    expected_rows: Optional[int] = None,
+    filepath: str | Path,
+    expected_rows: int | None = None,
 ) -> np.ndarray:
     """
     Load a nuisance regressor file (motion parameters, physio, etc.)
@@ -157,30 +156,30 @@ class HRFSelectionResults:
     xval_r2_std: torch.Tensor = None
     xval_r2_all_hrfs: torch.Tensor = None
     xval_r2_canonical: torch.Tensor = None  # Baseline with single canonical HRF
-    canonical_full_r2: Optional[torch.Tensor] = None  # In-sample R², canonical HRF
-    hrfopt_full_r2: Optional[torch.Tensor] = None  # In-sample R², best HRF per voxel
-    canonical_xval_r2: Optional[torch.Tensor] = None  # Beta-series CV R², canonical HRF
-    hrfopt_xval_r2: Optional[torch.Tensor] = None  # Beta-series CV R², best HRF per voxel
+    canonical_full_r2: torch.Tensor | None = None  # In-sample R², canonical HRF
+    hrfopt_full_r2: torch.Tensor | None = None  # In-sample R², best HRF per voxel
+    canonical_xval_r2: torch.Tensor | None = None  # Beta-series CV R², canonical HRF
+    hrfopt_xval_r2: torch.Tensor | None = None  # Beta-series CV R², best HRF per voxel
     final_results: GLMResults = None
     canonical_results: GLMResults = None  # Full GLM with canonical HRF for comparison
     hrf_library: torch.Tensor = None
-    hrf_metadata: Dict = field(default_factory=dict)
+    hrf_metadata: dict = field(default_factory=dict)
 
     # For ARMA integration: store the convolved design per HRF group
     # This allows reloading without reconvolving
-    hrf_group_indices: Dict[int, torch.Tensor] = field(default_factory=dict)
+    hrf_group_indices: dict[int, torch.Tensor] = field(default_factory=dict)
 
     # Store design matrix (convolved with middle HRF) for debugging
-    design_matrix: Optional[torch.Tensor] = None
+    design_matrix: torch.Tensor | None = None
 
     # Store canonical HRF design matrix for comparison/saving
-    canonical_design_matrix: Optional[torch.Tensor] = None
+    canonical_design_matrix: torch.Tensor | None = None
 
 
 def _project_design_with_q_factors(
     design: torch.Tensor,
     q_factors: list,
-    run_starts: List[int],
+    run_starts: list[int],
     n_timepoints: int,
     n_runs: int,
     device: torch.device,
@@ -204,12 +203,12 @@ def _project_design_with_q_factors(
 
 def _evaluate_hrfs_batched(
     projected_data: torch.Tensor,
-    projected_designs: List[torch.Tensor],
-    run_starts: List[int],
-    cv_splits: List[Tuple[List[int], List[int]]],
+    projected_designs: list[torch.Tensor],
+    run_starts: list[int],
+    cv_splits: list[tuple[list[int], list[int]]],
     device: torch.device,
     metric: str = "cod",
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
     verbose: bool = True,
 ) -> torch.Tensor:
     """Evaluate multiple designs via CV in a single batched pass.
@@ -274,7 +273,7 @@ def _evaluate_hrfs_batched(
     data_by_run = [projected_data[:, s:e] for s, e in zip(run_starts, run_ends)]
 
     # Pre-slice designs by runs
-    designs_by_run: List[List[torch.Tensor]] = []
+    designs_by_run: list[list[torch.Tensor]] = []
     for d_idx in range(n_designs):
         d = projected_designs[d_idx]
         designs_by_run.append([d[s:e, :] for s, e in zip(run_starts, run_ends)])
@@ -411,7 +410,7 @@ def _evaluate_hrfs_batched(
 
     if verbose:
         print(f"  Precomputing {n_splits} x {n_designs} pseudoinverses for split-half CV...")
-    all_pinvs: List[List[torch.Tensor]] = []
+    all_pinvs: list[list[torch.Tensor]] = []
     for fold_idx, (train_runs, _) in enumerate(cv_splits):
         pinvs_fold = []
         for d_idx in range(n_designs):
@@ -484,12 +483,12 @@ def _evaluate_hrfs_batched(
 
 def _evaluate_hrfs_batched_loro(
     projected_data: torch.Tensor,
-    projected_designs: List[torch.Tensor],
-    run_starts: List[int],
-    cv_splits: List[Tuple[List[int], List[int]]],
+    projected_designs: list[torch.Tensor],
+    run_starts: list[int],
+    cv_splits: list[tuple[list[int], list[int]]],
     device: torch.device,
     metric: str = "cod",
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
     verbose: bool = True,
 ) -> torch.Tensor:
     """Backward-compatible alias for _evaluate_hrfs_batched."""
@@ -510,24 +509,24 @@ def fit_glm_hrf_library_with_xval(
     onsets: torch.Tensor,
     hrf_library: torch.Tensor,
     tr: float,
-    run_starts: List[int],
-    stim_durations: Optional[List[float]] = None,
-    cv_strategy: Union[float, int] = 1,
+    run_starts: list[int],
+    stim_durations: list[float] | None = None,
+    cv_strategy: float | int = 1,
     n_perms: int = 100,
     metric: str = "cod",
     microtime_dt: float = 0.1,
     microtime_onset: int = 0,
-    polort: Optional[int] = None,
-    ortvec_files: Optional[List[Tuple[Union[str, Path], str]]] = None,
-    extra_regressors: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    polort: int | None = None,
+    ortvec_files: list[tuple[str | Path, str]] | None = None,
+    extra_regressors: np.ndarray | torch.Tensor | None = None,
     canonical_mode: str = "spmg1",
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
     r2_method: str = "auto",
     debug: bool = False,
-    debug_prefix: Optional[str] = None,
-    condition_labels: Optional[List[str]] = None,
+    debug_prefix: str | None = None,
+    condition_labels: list[str] | None = None,
 ) -> HRFSelectionResults:
     """
     Select best HRF per voxel using cross-validated R².
@@ -929,7 +928,7 @@ def fit_glm_hrf_library_with_xval(
             print(f"  Run {ri}: shape={nb.shape}, col_norms={nb.norm(dim=0).tolist()}")
 
         # Q factor diagnostics
-        print(f"\nQR projectors:")
+        print("\nQR projectors:")
         for ri, qf in enumerate(q_factors):
             if qf is not None:
                 print(f"  Run {ri}: Q shape={qf.shape}, Q columns={qf.shape[1]}")
@@ -937,7 +936,7 @@ def fit_glm_hrf_library_with_xval(
                 print(f"  Run {ri}: None (no nuisance)")
 
         # Quick OLS fit on projected data+design to show what R² looks like
-        print(f"\nQuick OLS diagnostic (canonical design on projected data):")
+        print("\nQuick OLS diagnostic (canonical design on projected data):")
         _X = projected_canonical_design.to(projected_data.device)
         _b = torch.linalg.lstsq(_X, projected_data[: min(1000, n_voxels), :].T).solution
         _pred = (_X @ _b).T
@@ -1233,13 +1232,13 @@ def _fit_voxelwise_hrf(
     hrf_library: torch.Tensor,
     hrf_index: torch.Tensor,
     nuisance_design: torch.Tensor,
-    run_starts: List[int],
+    run_starts: list[int],
     tr: float,
     microtime_dt: float,
     microtime_onset: int,
     device: torch.device,
     verbose: bool,
-    chunk_size: Optional[int],
+    chunk_size: int | None,
 ) -> GLMResults:
     """
     Fit GLM with voxel-wise HRFs by grouping voxels with same HRF.
@@ -1482,16 +1481,16 @@ def _fit_voxelwise_hrf_canonical(
 
 def _fit_voxelwise_hrf_single_trial(
     data: torch.Tensor,
-    onsets_by_condition: List[List[np.ndarray]],
-    hrf_library: List[torch.Tensor],
+    onsets_by_condition: list[list[np.ndarray]],
+    hrf_library: list[torch.Tensor],
     hrf_index: torch.Tensor,
     nuisance_design: torch.Tensor,
-    durations: List[float],
-    run_starts: List[int],
+    durations: list[float],
+    run_starts: list[int],
     tr: float,
     n_timepoints: int,
     microtime_dt: float,
-    condition_labels: List[str],
+    condition_labels: list[str],
     device: torch.device,
     verbose: bool = False,
 ) -> GLMResults:
@@ -1705,11 +1704,11 @@ def _write_afni_xmat(
     design_matrix: np.ndarray,
     output_file: str,
     n_stim_cols: int,
-    condition_labels: Optional[List[str]],
-    run_starts: List[int],
+    condition_labels: list[str] | None,
+    run_starts: list[int],
     tr: float,
-    polort: Optional[int] = None,
-    extra_nuisance_labels: Optional[List[str]] = None,
+    polort: int | None = None,
+    extra_nuisance_labels: list[str] | None = None,
 ) -> None:
     """Write design matrix in AFNI xmat.1D format.
 
@@ -1796,13 +1795,13 @@ def _write_afni_xmat(
 
 def save_design_diagnostic_figure(
     canonical_design: torch.Tensor,
-    nuisance_per_run: List[torch.Tensor],
-    run_starts: List[int],
+    nuisance_per_run: list[torch.Tensor],
+    run_starts: list[int],
     n_timepoints: int,
     tr: float,
     output_path: str,
-    condition_labels: Optional[List[str]] = None,
-    projected_design: Optional[torch.Tensor] = None,
+    condition_labels: list[str] | None = None,
+    projected_design: torch.Tensor | None = None,
 ) -> None:
     """Save diagnostic figure showing design matrix as the code interprets it.
 
@@ -1837,7 +1836,7 @@ def save_design_diagnostic_figure(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print(f"  WARNING: matplotlib not available, skipping design diagnostic figure")
+        print("  WARNING: matplotlib not available, skipping design diagnostic figure")
         return
 
     n_conditions = canonical_design.shape[1]
@@ -1914,15 +1913,15 @@ def save_design_diagnostic_figure(
 def save_hrf_selection_results(
     results: HRFSelectionResults,
     output_prefix: str,
-    volume_shape: Optional[Tuple[int, int, int]] = None,
-    affine: Optional[np.ndarray] = None,
-    voxel_mask: Optional[torch.Tensor] = None,
-    condition_labels: Optional[List[str]] = None,
-    run_starts: Optional[List[int]] = None,
+    volume_shape: tuple[int, int, int] | None = None,
+    affine: np.ndarray | None = None,
+    voxel_mask: torch.Tensor | None = None,
+    condition_labels: list[str] | None = None,
+    run_starts: list[int] | None = None,
     save_all_hrf_designs: bool = False,
-    onsets: Optional[torch.Tensor] = None,
+    onsets: torch.Tensor | None = None,
     save_plots: bool = False,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """
     Save HRF selection results to disk.
 
@@ -2345,7 +2344,7 @@ def save_hrf_selection_results(
     return output_files
 
 
-def load_hrf_selection_for_arma(hrf_library_file: str) -> Dict:
+def load_hrf_selection_for_arma(hrf_library_file: str) -> dict:
     """
     Load HRF selection results for ARMA analysis.
 
@@ -2372,9 +2371,9 @@ def load_hrf_selection_for_arma(hrf_library_file: str) -> Dict:
 def _save_volume(
     data: torch.Tensor,
     filepath: str,
-    volume_shape: Optional[Tuple[int, int, int]],
-    affine: Optional[np.ndarray],
-    voxel_mask: Optional[torch.Tensor],
+    volume_shape: tuple[int, int, int] | None,
+    affine: np.ndarray | None,
+    voxel_mask: torch.Tensor | None,
 ):
     """Helper to save a 1D tensor as a 3D NIfTI volume."""
     import nibabel as nib
@@ -2403,9 +2402,9 @@ def _save_volume(
 def _save_volume_4d(
     data: torch.Tensor,
     filepath: str,
-    volume_shape: Optional[Tuple[int, int, int]],
-    affine: Optional[np.ndarray],
-    voxel_mask: Optional[torch.Tensor],
+    volume_shape: tuple[int, int, int] | None,
+    affine: np.ndarray | None,
+    voxel_mask: torch.Tensor | None,
 ):
     """Helper to save a 2D tensor (n_voxels, n_volumes) as a 4D NIfTI volume."""
     import nibabel as nib
@@ -2434,15 +2433,15 @@ def _save_volume_4d(
 
 
 def plot_design_matrix(
-    design_matrix: Union[torch.Tensor, np.ndarray],
-    output_file: Optional[str] = None,
-    column_labels: Optional[List[str]] = None,
+    design_matrix: torch.Tensor | np.ndarray,
+    output_file: str | None = None,
+    column_labels: list[str] | None = None,
     tr: float = 1.0,
     title: str = "Design Matrix",
-    figsize: Tuple[float, float] = (10, 8),
+    figsize: tuple[float, float] = (10, 8),
     cmap: str = "RdBu_r",
     show_colorbar: bool = True,
-    run_starts: Optional[List[int]] = None,
+    run_starts: list[int] | None = None,
 ) -> None:
     """
     Plot a design matrix in imagesc style.
@@ -2538,12 +2537,12 @@ def plot_design_matrix(
 
 
 def plot_hrf_library(
-    hrf_library: Union[torch.Tensor, np.ndarray],
-    output_file: Optional[str] = None,
+    hrf_library: torch.Tensor | np.ndarray,
+    output_file: str | None = None,
     tr: float = 1.0,
     title: str = "HRF Library",
-    figsize: Tuple[float, float] = (10, 6),
-    highlight_idx: Optional[int] = None,
+    figsize: tuple[float, float] = (10, 6),
+    highlight_idx: int | None = None,
 ) -> None:
     """
     Plot all HRFs in a library as overlaid curves.

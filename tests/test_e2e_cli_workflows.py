@@ -10,25 +10,25 @@ These tests create realistic fMRI data using simulate_fmri_run(),
 then run the full analysis pipelines and verify outputs.
 """
 
-import pytest
-import torch
-import numpy as np
-import tempfile
 import shutil
+import tempfile
 from pathlib import Path
 
-import fastfuncsim as ffs
-from fastfuncsim.simulation import simulate_fmri_run
-from fastfuncsim.hrf import get_canonical_hrf, get_hrf_library
-from fastfuncsim.design import build_glm_design
-from fastfuncsim.glm_core import fit_glm, construct_polynomial_matrix
+import numpy as np
+import pytest
+import torch
+
+from fastfuncsim.cli_utils import build_nuisance_per_run
 from fastfuncsim.denoise import (
-    select_noise_pool_voxels,
     extract_noise_pcs_per_run,
     fit_denoising_model,
+    select_noise_pool_voxels,
 )
+from fastfuncsim.design import build_glm_design
+from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
+from fastfuncsim.hrf import get_canonical_hrf
+from fastfuncsim.simulation import simulate_fmri_run
 from fastfuncsim.utils import get_device, scale_to_percent_signal
-from fastfuncsim.cli_utils import build_nuisance_per_run
 
 
 @pytest.fixture

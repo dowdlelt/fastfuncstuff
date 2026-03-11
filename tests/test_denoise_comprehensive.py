@@ -12,19 +12,16 @@ Uses realistic fMRI simulation to verify:
 - Cross-validation prevents overfitting
 """
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
 
-from fastfuncsim.simulation import simulate_fmri_run
-from fastfuncsim.hrf import get_canonical_hrf
+from fastfuncsim.denoise import (
+    _compute_local_run_starts,
+    select_noise_pool_voxels,
+)
 from fastfuncsim.glm_core import construct_polynomial_matrix
 from fastfuncsim.utils import get_device
-from fastfuncsim.denoise import (
-    select_noise_pool_voxels,
-    _compute_local_run_starts,
-)
-from fastfuncsim.xval import generate_cv_splits
 
 
 @pytest.fixture
@@ -150,8 +147,7 @@ class TestDenoiseSubWorkflows:
         cross_validate_noise_pcs returns an (n_voxels, n_pc_counts) R² map
         and an aggregated (n_pc_counts,) array.  All values should be finite.
         """
-        from fastfuncsim.denoise import extract_noise_pcs_per_run, cross_validate_noise_pcs
-        from fastfuncsim.glm_core import construct_polynomial_matrix
+        from fastfuncsim.denoise import cross_validate_noise_pcs, extract_noise_pcs_per_run
 
         torch.manual_seed(0)
         n_runs, n_tp_run, tr = 3, 60, 2.0
@@ -486,9 +482,7 @@ class TestDenoiseFullPipeline:
         compared to no PCs.  We synthesize data with a strong shared noise
         component and verify that denoising with 1 PC is better than 0 PCs.
         """
-        from fastfuncsim.denoise import (
-            extract_noise_pcs_per_run, cross_validate_noise_pcs)
-        from fastfuncsim.glm_core import construct_polynomial_matrix
+        from fastfuncsim.denoise import cross_validate_noise_pcs, extract_noise_pcs_per_run
 
         torch.manual_seed(42)
         n_runs, n_tp_run, tr = 4, 80, 2.0
@@ -552,9 +546,7 @@ class TestDenoiseFullPipeline:
         PCs (no structured noise), adding more PCs should not substantially
         improve cross-validated R² vs baseline.
         """
-        from fastfuncsim.denoise import (
-            extract_noise_pcs_per_run, cross_validate_noise_pcs)
-        from fastfuncsim.glm_core import construct_polynomial_matrix
+        from fastfuncsim.denoise import cross_validate_noise_pcs, extract_noise_pcs_per_run
 
         torch.manual_seed(99)
         n_runs, n_tp_run, tr = 3, 60, 2.0

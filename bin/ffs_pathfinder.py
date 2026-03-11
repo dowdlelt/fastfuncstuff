@@ -40,7 +40,6 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -134,12 +133,12 @@ class PathfinderResults:
     xval_r2_by_hrf_and_pcs: np.ndarray = None
     noise_pool_mask: torch.Tensor = None
     criteria_mask: torch.Tensor = None
-    noise_pcs_per_run: List[torch.Tensor] = field(default_factory=list)
+    noise_pcs_per_run: list[torch.Tensor] = field(default_factory=list)
     initial_results: GLMResults = None
     initial_xval_r2: torch.Tensor = None
     final_results: GLMResults = None
     hrf_library: torch.Tensor = None
-    metadata: Dict = field(default_factory=dict)
+    metadata: dict = field(default_factory=dict)
 
 
 def create_parser():
@@ -419,16 +418,16 @@ def print_header():
 def cross_validate_denoising_for_hrf(
     data: torch.Tensor,
     design_matrix: torch.Tensor,
-    noise_pcs: List[torch.Tensor],
-    run_starts: List[int],
+    noise_pcs: list[torch.Tensor],
+    run_starts: list[int],
     criteria_mask: torch.Tensor,
-    nuisance_per_run: List[torch.Tensor],
+    nuisance_per_run: list[torch.Tensor],
     max_pcs: int,
-    cv_splits: List[Tuple[List[int], List[int]]],
+    cv_splits: list[tuple[list[int], list[int]]],
     device: torch.device,
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
     verbose: bool = False,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for a single HRF.
 
@@ -651,9 +650,9 @@ def fit_pathfinder(
     onset_matrix: torch.Tensor,
     hrf_library: torch.Tensor,
     tr: float,
-    run_starts: List[int],
-    nuisance_per_run: List[torch.Tensor],
-    cv_splits: List[Tuple[List[int], List[int]]],
+    run_starts: list[int],
+    nuisance_per_run: list[torch.Tensor],
+    cv_splits: list[tuple[list[int], list[int]]],
     r2_threshold: float = 0.05,
     max_pcs: int = 20,
     variance_threshold: float = 0.95,
@@ -663,7 +662,7 @@ def fit_pathfinder(
     microtime_dt: float = 0.1,
     metric: str = "cod",
     device: torch.device = None,
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
     verbose: bool = True,
 ) -> PathfinderResults:
     """
@@ -1098,13 +1097,13 @@ def fit_pathfinder(
 def save_pathfinder_results(
     results: PathfinderResults,
     output_prefix: str,
-    volume_shape: Tuple[int, int, int],
+    volume_shape: tuple[int, int, int],
     affine: np.ndarray,
-    voxel_mask: Optional[torch.Tensor] = None,
-    condition_labels: Optional[List[str]] = None,
+    voxel_mask: torch.Tensor | None = None,
+    condition_labels: list[str] | None = None,
     save_all_hrfs: bool = False,
     save_plots: bool = False,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Save pathfinder results to disk."""
     output_files = {}
     voxel_mask_np = voxel_mask.cpu().numpy() if voxel_mask is not None else None

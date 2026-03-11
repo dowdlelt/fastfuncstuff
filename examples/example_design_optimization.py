@@ -24,21 +24,21 @@ Author: FastFuncSim
 Date: 2024
 """
 
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
 # Import FastFuncSim modules
-import fastfuncsim as ffs
 from fastfuncsim.design_optimization import (
     ISIConstraints,
-    sample_design_space,
+    compare_designs_summary,
     evaluate_design_candidates,
     find_optimal_designs,
-    compare_designs_summary,
     plot_fitness_landscape,
-    plot_pareto_frontier
+    plot_pareto_frontier,
+    sample_design_space,
 )
 
 # Set random seed for reproducibility
@@ -107,7 +107,7 @@ print(f"\nGenerated {len(candidates)} candidate designs")
 
 # Quick check: show first candidate
 first_candidate = candidates[0]
-print(f"\nExample candidate (first design):")
+print("\nExample candidate (first design):")
 print(f"  Ordering: {first_candidate.metadata['ordering']}")
 print(f"  Distribution: {first_candidate.metadata['distribution']}")
 print(f"  Total events: {first_candidate.metadata['total_events']}")

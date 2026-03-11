@@ -30,7 +30,6 @@ GLMsingle (Type-D ridge):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -51,7 +50,7 @@ def _fit_ridge_multiple_fracs(
     y: torch.Tensor,
     fracs: np.ndarray,
     device: torch.device,
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
     """
     Fit ridge regression for multiple fractions using fracridge algorithm
@@ -293,24 +292,24 @@ class RidgeResults:
     xval_r2: torch.Tensor
     optimal_fracs: torch.Tensor
     r2_by_frac: torch.Tensor
-    trial_labels: List[str]
-    metadata: Dict
+    trial_labels: list[str]
+    metadata: dict
 
 
 def create_single_trial_design(
-    onsets_by_condition: List[List[np.ndarray]],
-    durations: List[float],
-    run_starts: List[int],
+    onsets_by_condition: list[list[np.ndarray]],
+    durations: list[float],
+    run_starts: list[int],
     tr: float,
     n_timepoints: int,
-    hrf_library: Optional[List[torch.Tensor]] = None,
-    hrf_index_per_voxel: Optional[torch.Tensor] = None,
+    hrf_library: list[torch.Tensor] | None = None,
+    hrf_index_per_voxel: torch.Tensor | None = None,
     microtime_dt: float = 0.1,
-    condition_labels: Optional[List[str]] = None,
-    device: Optional[torch.device] = None,
+    condition_labels: list[str] | None = None,
+    device: torch.device | None = None,
     hrf_model_name: str = "spmg1",
     n_basis: int = 1,
-) -> Tuple[torch.Tensor, List[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create single-trial design matrix with optional per-voxel HRFs
 
@@ -626,16 +625,16 @@ def create_single_trial_design(
 def _fit_ridge_chunk(
     data_chunk: torch.Tensor,
     design_matrix: torch.Tensor,
-    run_starts: List[int],
-    nuisance_per_run: List[torch.Tensor],
+    run_starts: list[int],
+    nuisance_per_run: list[torch.Tensor],
     fracs: np.ndarray,
-    cv_splits: List[Tuple[List[int], List[int]]],
+    cv_splits: list[tuple[list[int], list[int]]],
     trial_condition_ids: torch.Tensor,
     condition_design: torch.Tensor,
     autoscale: bool,
     device: torch.device,
-    trial_run_ids: Optional[torch.Tensor] = None,
-) -> Dict[str, torch.Tensor]:
+    trial_run_ids: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
     """
     Fit ridge regression for a chunk of voxels with a SINGLE design matrix
 
@@ -953,17 +952,17 @@ def _fit_ridge_chunk(
 
 def _fit_ridge_chunk_with_per_voxel_designs(
     data_chunk: torch.Tensor,
-    design_per_voxel: List[torch.Tensor],
-    run_starts: List[int],
-    nuisance_per_run: List[torch.Tensor],
+    design_per_voxel: list[torch.Tensor],
+    run_starts: list[int],
+    nuisance_per_run: list[torch.Tensor],
     fracs: np.ndarray,
-    cv_splits: List[Tuple[List[int], List[int]]],
+    cv_splits: list[tuple[list[int], list[int]]],
     trial_condition_ids: torch.Tensor,
     condition_design: torch.Tensor,
     autoscale: bool,
     device: torch.device,
-    trial_run_ids: Optional[torch.Tensor] = None,
-) -> Dict[str, torch.Tensor]:
+    trial_run_ids: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
     """
     Fit ridge regression for a chunk with per-voxel design matrices
 
@@ -1039,20 +1038,20 @@ def _fit_ridge_chunk_with_per_voxel_designs(
 
 def fit_ridge_single_trial(
     data: torch.Tensor,
-    design_matrix: Union[torch.Tensor, List[torch.Tensor]],
-    run_starts: List[int],
+    design_matrix: torch.Tensor | list[torch.Tensor],
+    run_starts: list[int],
     tr: float,
     trial_condition_ids: torch.Tensor,
     condition_design: torch.Tensor,
-    fracs: Optional[np.ndarray] = None,
-    nuisance: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    polort: Optional[int] = None,
-    cv_splits: Optional[List[Tuple[List[int], List[int]]]] = None,
-    trial_labels: Optional[List[str]] = None,
-    trial_run_ids: Optional[torch.Tensor] = None,
+    fracs: np.ndarray | None = None,
+    nuisance: torch.Tensor | list[torch.Tensor] | None = None,
+    polort: int | None = None,
+    cv_splits: list[tuple[list[int], list[int]]] | None = None,
+    trial_labels: list[str] | None = None,
+    trial_run_ids: torch.Tensor | None = None,
     autoscale: bool = True,
-    chunk_size: Optional[int] = None,
-    device: Optional[torch.device] = None,
+    chunk_size: int | None = None,
+    device: torch.device | None = None,
     verbose: bool = False,
 ) -> RidgeResults:
     """
@@ -1376,7 +1375,7 @@ def fit_ridge_single_trial(
     )
 
 
-def load_hrf_indices(hrf_index_file: str, mask: Optional[np.ndarray] = None) -> torch.Tensor:
+def load_hrf_indices(hrf_index_file: str, mask: np.ndarray | None = None) -> torch.Tensor:
     """
     Load HRF indices from HRFoptfast output
 
@@ -1409,8 +1408,8 @@ def load_hrf_indices(hrf_index_file: str, mask: Optional[np.ndarray] = None) -> 
 
 
 def load_noise_pcs(
-    noise_pc_file: str, run_starts: List[int], n_timepoints: int
-) -> List[torch.Tensor]:
+    noise_pc_file: str, run_starts: list[int], n_timepoints: int
+) -> list[torch.Tensor]:
     """
     Load noise PCs from Denoisefast output
 

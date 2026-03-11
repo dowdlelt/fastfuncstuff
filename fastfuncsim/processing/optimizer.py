@@ -12,11 +12,11 @@ Key fixes vs initial version:
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
+import numpy as np
 import torch
 from torch import Tensor
-import numpy as np
 
 
 def optimize_warp_params_torch(

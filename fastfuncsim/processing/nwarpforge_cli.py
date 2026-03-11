@@ -11,7 +11,6 @@ Equivalent to AFNI's 3dNwarpApply but with GPU acceleration and wsinc5 interpola
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 
 import torch

@@ -15,7 +15,6 @@ For help:
 import argparse
 import sys
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 import torch
@@ -62,7 +61,7 @@ except ImportError as e:
     sys.exit(1)
 
 
-def parse_grid_arg(grid_str: str) -> Tuple[float, float, int]:
+def parse_grid_arg(grid_str: str) -> tuple[float, float, int]:
     """Parse grid argument like '0.1,0.9,11' into (start, stop, num_points)"""
     try:
         parts = grid_str.split(",")

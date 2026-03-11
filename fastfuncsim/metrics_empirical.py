@@ -24,16 +24,14 @@ Both computed with AR(1) correction for realistic fMRI temporal autocorrelation.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Union
-
 import numpy as np
 import torch
 from scipy.linalg import toeplitz
 
 
 def estimate_ar1_coefficient(
-    residuals: Union[torch.Tensor, np.ndarray],
-    device: Optional[torch.device] = None
+    residuals: torch.Tensor | np.ndarray,
+    device: torch.device | None = None
 ) -> float:
     """
     Estimate AR(1) coefficient from residuals
@@ -80,7 +78,7 @@ def estimate_ar1_coefficient(
 def build_ar1_covariance_matrix(
     n_timepoints: int,
     rho: float,
-    device: Optional[torch.device] = None
+    device: torch.device | None = None
 ) -> torch.Tensor:
     """
     Build AR(1) covariance matrix
@@ -114,11 +112,11 @@ def build_ar1_covariance_matrix(
 
 
 def gls_fit(
-    Y: Union[torch.Tensor, np.ndarray],
-    X: Union[torch.Tensor, np.ndarray],
-    sigma: Union[torch.Tensor, np.ndarray],
-    device: Optional[torch.device] = None
-) -> Dict[str, torch.Tensor]:
+    Y: torch.Tensor | np.ndarray,
+    X: torch.Tensor | np.ndarray,
+    sigma: torch.Tensor | np.ndarray,
+    device: torch.device | None = None
+) -> dict[str, torch.Tensor]:
     """
     Generalized Least Squares (GLS) with known covariance
 
@@ -207,13 +205,13 @@ def gls_fit(
 
 
 def compute_detection_power_empirical(
-    data: Union[torch.Tensor, np.ndarray],
-    design: Union[torch.Tensor, np.ndarray],
-    contrast: Union[torch.Tensor, np.ndarray, None] = None,
+    data: torch.Tensor | np.ndarray,
+    design: torch.Tensor | np.ndarray,
+    contrast: torch.Tensor | np.ndarray | None = None,
     estimate_ar1: bool = True,
-    rho: Optional[float] = None,
-    device: Optional[torch.device] = None
-) -> Dict[str, Union[float, torch.Tensor]]:
+    rho: float | None = None,
+    device: torch.device | None = None
+) -> dict[str, float | torch.Tensor]:
     """
     Compute detection power using GLS with AR(1) correction
 
@@ -320,16 +318,16 @@ def compute_detection_power_empirical(
 
 
 def compute_estimation_efficiency_empirical(
-    data: Union[torch.Tensor, np.ndarray],
-    onsets: Union[torch.Tensor, np.ndarray],
+    data: torch.Tensor | np.ndarray,
+    onsets: torch.Tensor | np.ndarray,
     n_conditions: int,
     hrf_length: int = 30,
-    contrast: Union[torch.Tensor, np.ndarray, None] = None,
+    contrast: torch.Tensor | np.ndarray | None = None,
     estimate_ar1: bool = True,
-    rho: Optional[float] = None,
+    rho: float | None = None,
     tr: float = 1.0,
-    device: Optional[torch.device] = None
-) -> Dict[str, Union[float, torch.Tensor]]:
+    device: torch.device | None = None
+) -> dict[str, float | torch.Tensor]:
     """
     Compute estimation efficiency using FIR design with GLS
 
@@ -459,15 +457,15 @@ def compute_estimation_efficiency_empirical(
 
 
 def evaluate_design_empirical(
-    data: Union[torch.Tensor, np.ndarray],
-    design: Union[torch.Tensor, np.ndarray],
-    onsets: Union[torch.Tensor, np.ndarray],
+    data: torch.Tensor | np.ndarray,
+    design: torch.Tensor | np.ndarray,
+    onsets: torch.Tensor | np.ndarray,
     n_conditions: int,
     hrf_length: int = 30,
-    contrast: Union[torch.Tensor, np.ndarray, None] = None,
+    contrast: torch.Tensor | np.ndarray | None = None,
     tr: float = 1.0,
-    device: Optional[torch.device] = None
-) -> Dict[str, Union[float, torch.Tensor]]:
+    device: torch.device | None = None
+) -> dict[str, float | torch.Tensor]:
     """
     Complete design evaluation: detection power + estimation efficiency
 

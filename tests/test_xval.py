@@ -5,7 +5,6 @@ Tests the core functions in fastfuncsim/xval.py that compute
 cross-validated R² metrics.
 """
 
-import numpy as np
 import pytest
 import torch
 
@@ -673,8 +672,8 @@ class TestProjectOutNuisancePerRun:
 
     def test_project_out_nuisance_per_run_with_polynomials(self):
         """Test per-run projection with Legendre polynomials"""
-        from fastfuncsim.xval import project_out_nuisance_per_run
         from fastfuncsim.glm_core import construct_polynomial_matrix
+        from fastfuncsim.xval import project_out_nuisance_per_run
 
         n_voxels = 50
         n_timepoints = 100

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -155,7 +154,7 @@ def legendre_polynomials(n_timepoints: int, order: int, normalize: bool = False)
     return polynomials
 
 
-def parse_afni_timing_file(filepath: Union[str, Path]) -> List[np.ndarray]:
+def parse_afni_timing_file(filepath: str | Path) -> list[np.ndarray]:
     """
     Parse AFNI timing file format
 
@@ -233,7 +232,7 @@ def create_onset_regressors(
     n_timepoints: int,
     tr: float,
     duration: float = 0.0,
-    hrf: Optional[np.ndarray] = None,
+    hrf: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Create stimulus regressors from onset times
@@ -305,7 +304,7 @@ def create_onset_regressors(
     return regressor
 
 
-def parse_glt_string(glt_string: str) -> Tuple[Dict[str, float], bool]:
+def parse_glt_string(glt_string: str) -> tuple[dict[str, float], bool]:
     """
     Parse AFNI GLT (General Linear Test) contrast string
 
@@ -373,8 +372,8 @@ def parse_glt_string(glt_string: str) -> Tuple[Dict[str, float], bool]:
 
 
 def glt_weights_to_vector(
-    weights: Dict[str, float],
-    regressor_labels: List[str],
+    weights: dict[str, float],
+    regressor_labels: list[str],
 ) -> np.ndarray:
     """
     Convert GLT weights dict to contrast vector
@@ -436,7 +435,7 @@ def glt_weights_to_vector(
     return contrast_vector
 
 
-def parse_hrf_model(hrf_string: str) -> Tuple[str, Union[float, Dict]]:
+def parse_hrf_model(hrf_string: str) -> tuple[str, float | dict]:
     """
     Parse AFNI HRF model string
 
@@ -526,9 +525,9 @@ def parse_hrf_model(hrf_string: str) -> Tuple[str, Union[float, Dict]]:
 
 
 def load_and_pad_ortvec(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     run_number: int,
-    n_timepoints_per_run: List[int],
+    n_timepoints_per_run: list[int],
 ) -> np.ndarray:
     """
     Load nuisance regressor file and zero-pad for specific run
@@ -603,18 +602,18 @@ def load_and_pad_ortvec(
 
 
 def build_design_matrix(
-    timing_files: List[Union[str, Path]],
-    stim_labels: List[str],
-    n_timepoints_per_run: List[int],
+    timing_files: list[str | Path],
+    stim_labels: list[str],
+    n_timepoints_per_run: list[int],
     tr: float,
     polort: int = 3,
-    hrf_models: Optional[Union[str, List[str]]] = None,
-    im_mode: Optional[Union[bool, List[bool]]] = None,
-    padortvec_files: Optional[List[Tuple[Union[str, Path], str, int]]] = None,
-    ortvec_files: Optional[List[Tuple[Union[str, Path], str]]] = None,
-    extra_regressors: Optional[List[np.ndarray]] = None,
-    extra_regressor_labels: Optional[List[str]] = None,
-) -> Tuple[np.ndarray, List[str], List[int], Dict]:
+    hrf_models: str | list[str] | None = None,
+    im_mode: bool | list[bool] | None = None,
+    padortvec_files: list[tuple[str | Path, str, int]] | None = None,
+    ortvec_files: list[tuple[str | Path, str]] | None = None,
+    extra_regressors: list[np.ndarray] | None = None,
+    extra_regressor_labels: list[str] | None = None,
+) -> tuple[np.ndarray, list[str], list[int], dict]:
     """
     Build complete GLM design matrix from onset files and nuisance regressors
 
@@ -1017,13 +1016,13 @@ def build_design_matrix(
 
 
 def write_afni_xmat(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     design_matrix: np.ndarray,
-    regressor_labels: List[str],
-    run_starts: List[int],
-    metadata: Dict,
-    glt_contrasts: Optional[List[Tuple[str, str]]] = None,
-    command_line: Optional[str] = None,
+    regressor_labels: list[str],
+    run_starts: list[int],
+    metadata: dict,
+    glt_contrasts: list[tuple[str, str]] | None = None,
+    command_line: str | None = None,
 ) -> None:
     """
     Write design matrix in AFNI .xmat.1D format

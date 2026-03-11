@@ -12,26 +12,17 @@ The key innovation: we denoise training data but predict non-denoised test data,
 ensuring we're improving signal recovery rather than just fitting the denoising.
 """
 
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-from pathlib import Path
 
 from fastfuncsim import (
-    # GLM and design
-    fit_glm_torch,
-    build_glm_design,
-    # Denoising
     fit_denoising_model,
-    DenoiseResults,
-    # Simulation and noise
-    simulate_fmri_data,
+    # GLM and design
     generate_ar1_noise,
-    # HRF
-    get_hrf_library,
     # Utils
     get_device,
-    to_tensor,
 )
 
 
@@ -76,7 +67,7 @@ def example_basic_denoising():
     task_design = design_matrix["stimulus"]
     nuisance = design_matrix["nuisance"]
 
-    print(f"\nSimulation setup:")
+    print("\nSimulation setup:")
     print(f"  Voxels: {n_voxels}")
     print(f"  Runs: {n_runs} × {n_tps_per_run} TRs")
     print(f"  TR: {tr}s")
@@ -121,7 +112,7 @@ def example_basic_denoising():
     # Concatenate (noise voxels first, task voxels last)
     data = torch.cat([data_noise, data_task], dim=0)
 
-    print(f"\nData simulation:")
+    print("\nData simulation:")
     print(f"  Task voxels: {n_task_voxels} (with signal)")
     print(f"  Noise voxels: {n_noise_voxels} (no signal)")
 
@@ -231,7 +222,7 @@ def example_basic_denoising():
 
     plt.tight_layout()
     plt.savefig("denoising_example_basic.png", dpi=150, bbox_inches="tight")
-    print(f"\n✅ Saved: denoising_example_basic.png")
+    print("\n✅ Saved: denoising_example_basic.png")
     plt.show()
 
     return results

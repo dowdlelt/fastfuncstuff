@@ -61,13 +61,14 @@ GLMsingle (Type-C denoising):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Literal
 
 import numpy as np
 import torch
 
 from .glm_core import fit_glm
 from .ica import FastICA
+from .memory import dyn_chunk_estimator
 from .pca import PCA
 from .utils import get_device
 from .xval import (
@@ -77,14 +78,13 @@ from .xval import (
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
-from .memory import dyn_chunk_estimator
 
 
 def _compute_local_run_starts(
-    run_indices: List[int],
-    run_starts: List[int],
+    run_indices: list[int],
+    run_starts: list[int],
     n_timepoints: int,
-) -> List[int]:
+) -> list[int]:
     """
     Compute local run_starts for a subset of runs.
 
@@ -169,19 +169,19 @@ class DenoiseResults:
     xval_r2_by_n_components: np.ndarray
     xval_r2_median_by_n_components: np.ndarray
     xval_r2_per_fold: np.ndarray
-    xval_r2_per_voxel: Optional[np.ndarray]  # Per-voxel R² when pcR2cutoff used
-    xval_r2_optimal: Optional[torch.Tensor]  # Per-voxel xval R² at optimal PC count
-    xval_r2_optimal_full: Optional[torch.Tensor]  # Per-voxel xval R² at optimal PCs (all voxels)
-    xval_r2_optimal_per_fold: Optional[np.ndarray]  # Per-fold xval R² at optimal PCs (all voxels)
-    xval_r2_optimal_full: Optional[torch.Tensor]  # Per-voxel xval R² at optimal PCs (all voxels)
-    xval_r2_optimal_per_fold: Optional[np.ndarray]  # Per-fold xval R² at optimal PCs (all voxels)
+    xval_r2_per_voxel: np.ndarray | None  # Per-voxel R² when pcR2cutoff used
+    xval_r2_optimal: torch.Tensor | None  # Per-voxel xval R² at optimal PC count
+    xval_r2_optimal_full: torch.Tensor | None  # Per-voxel xval R² at optimal PCs (all voxels)
+    xval_r2_optimal_per_fold: np.ndarray | None  # Per-fold xval R² at optimal PCs (all voxels)
+    xval_r2_optimal_full: torch.Tensor | None  # Per-voxel xval R² at optimal PCs (all voxels)
+    xval_r2_optimal_per_fold: np.ndarray | None  # Per-fold xval R² at optimal PCs (all voxels)
     noise_pool_mask: torch.Tensor
     criteria_mask: torch.Tensor
-    pcselection_mask: Optional[torch.Tensor]  # Voxels used for PC selection (if pcR2cutoff)
+    pcselection_mask: torch.Tensor | None  # Voxels used for PC selection (if pcR2cutoff)
     valid_voxel_mask: torch.Tensor  # Voxels that passed extreme R² filtering
     noise_pool_r2: torch.Tensor
-    noise_pcs_per_run: List[torch.Tensor]
-    pc_loadings_per_run: Optional[List[torch.Tensor]]
+    noise_pcs_per_run: list[torch.Tensor]
+    pc_loadings_per_run: list[torch.Tensor] | None
     baseline_r2: float
     optimal_r2: float
     improvement: float
@@ -192,28 +192,28 @@ class DenoiseResults:
 class ComponentCountEstimate:
     """Per-run component-count estimates independent of denoising CV."""
 
-    per_run_caps: List[int]
-    variance_caps: List[int]
-    entropy_rank_caps: List[int]
-    mp_caps: List[Optional[int]]
-    search_iterations: List[int]
-    search_final_max_per_run: List[int]
-    search_ceiling_per_run: List[int]
-    mp_reasons: List[str]
-    details_by_run: List[Dict[str, float]]
+    per_run_caps: list[int]
+    variance_caps: list[int]
+    entropy_rank_caps: list[int]
+    mp_caps: list[int | None]
+    search_iterations: list[int]
+    search_final_max_per_run: list[int]
+    search_ceiling_per_run: list[int]
+    mp_reasons: list[str]
+    details_by_run: list[dict[str, float]]
 
 
 def estimate_noise_component_caps_per_run(
     data: torch.Tensor,
-    run_starts: List[int],
+    run_starts: list[int],
     noise_pool_mask: torch.Tensor,
     max_components: int = 30,
-    nuisance_per_run: Optional[List[torch.Tensor]] = None,
+    nuisance_per_run: list[torch.Tensor] | None = None,
     min_components: int = 5,
     variance_threshold: float = 0.90,
     use_mp_prior: bool = True,
     mp_relaxation: float = 1.25,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = False,
 ) -> ComponentCountEstimate:
     """
@@ -246,15 +246,15 @@ def estimate_noise_component_caps_per_run(
 
     noise_pool_mask = noise_pool_mask.to(data.device)
 
-    per_run_caps: List[int] = []
-    variance_caps: List[int] = []
-    entropy_rank_caps: List[int] = []
-    mp_caps: List[Optional[int]] = []
-    search_iterations: List[int] = []
-    search_final_max_per_run: List[int] = []
-    search_ceiling_per_run: List[int] = []
-    mp_reasons: List[str] = []
-    details_by_run: List[Dict[str, float]] = []
+    per_run_caps: list[int] = []
+    variance_caps: list[int] = []
+    entropy_rank_caps: list[int] = []
+    mp_caps: list[int | None] = []
+    search_iterations: list[int] = []
+    search_final_max_per_run: list[int] = []
+    search_ceiling_per_run: list[int] = []
+    mp_reasons: list[str] = []
+    details_by_run: list[dict[str, float]] = []
 
     # Search controls
     boundary_fraction = 0.90
@@ -266,7 +266,7 @@ def estimate_noise_component_caps_per_run(
         n_samples: int,
         n_features: int,
         n_ev: int,
-    ) -> tuple[int, int, Optional[int], str, int]:
+    ) -> tuple[int, int, int | None, str, int]:
         cumvar = torch.cumsum(ev_ratio, dim=0)
         variance_cap_local = int(torch.searchsorted(cumvar, variance_threshold).item() + 1)
         variance_cap_local = max(1, min(variance_cap_local, n_ev))
@@ -276,7 +276,7 @@ def estimate_noise_component_caps_per_run(
         effective_rank_local = int(np.round(float(np.exp(entropy))))
         effective_rank_local = max(1, min(effective_rank_local, n_ev))
 
-        mp_cap_local: Optional[int] = None
+        mp_cap_local: int | None = None
         mp_reason_local = "disabled"
         if use_mp_prior and n_ev > 4:
             beta = float(n_features) / float(max(1, n_samples))
@@ -340,7 +340,7 @@ def estimate_noise_component_caps_per_run(
 
         final_variance_cap = 1
         final_effective_rank = 1
-        final_mp_cap: Optional[int] = None
+        final_mp_cap: int | None = None
         final_mp_reason = "disabled"
         final_target = 1
         n_iters = 0
@@ -453,12 +453,12 @@ def estimate_noise_component_caps_per_run(
 
 def compute_noise_pool_pca_scree_per_run(
     data: torch.Tensor,
-    run_starts: List[int],
+    run_starts: list[int],
     noise_pool_mask: torch.Tensor,
     max_components: int,
-    nuisance_per_run: Optional[List[torch.Tensor]] = None,
-    device: Optional[torch.device] = None,
-) -> List[torch.Tensor]:
+    nuisance_per_run: list[torch.Tensor] | None = None,
+    device: torch.device | None = None,
+) -> list[torch.Tensor]:
     """Compute per-run PCA scree spectra from noise-pool data.
 
     Returns a list where each entry is explained_variance_ratio_ for one run.
@@ -467,7 +467,7 @@ def compute_noise_pool_pca_scree_per_run(
     n_runs = len(run_starts)
     noise_pool_mask = noise_pool_mask.to(data.device)
 
-    scree_ratio_per_run: List[torch.Tensor] = []
+    scree_ratio_per_run: list[torch.Tensor] = []
 
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
@@ -579,16 +579,16 @@ def select_noise_pool_voxels(
 
 def extract_noise_pcs_per_run(
     data: torch.Tensor,
-    run_starts: List[int],
+    run_starts: list[int],
     noise_pool_mask: torch.Tensor,
     max_components: int = 20,
     variance_threshold: float = 0.95,
     return_loadings: bool = False,
-    nuisance_per_run: Optional[List[torch.Tensor]] = None,
-    component_caps_per_run: Optional[List[int]] = None,
-    device: Optional[torch.device] = None,
+    nuisance_per_run: list[torch.Tensor] | None = None,
+    component_caps_per_run: list[int] | None = None,
+    device: torch.device | None = None,
     verbose: bool = False,
-) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     Extract principal components from noise pool for each run independently
 
@@ -753,24 +753,19 @@ def extract_noise_pcs_per_run(
 
 def extract_noise_ics_per_run(
     data: torch.Tensor,
-    run_starts: List[int],
+    run_starts: list[int],
     noise_pool_mask: torch.Tensor,
     max_components: int = 20,
     return_loadings: bool = False,
     return_variance_ratio: bool = False,
-    nuisance_per_run: Optional[List[torch.Tensor]] = None,
-    component_caps_per_run: Optional[List[int]] = None,
+    nuisance_per_run: list[torch.Tensor] | None = None,
+    component_caps_per_run: list[int] | None = None,
     ica_restarts: int = 1,
     ica_max_iter: int = 400,
     ica_tol: float = 1e-5,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = False,
-) -> Union[
-    List[torch.Tensor],
-    Tuple[List[torch.Tensor], List[torch.Tensor]],
-    Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]],
-    Tuple[List[torch.Tensor], List[torch.Tensor]],
-]:
+) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]] | tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]] | tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     Extract independent components from noise pool for each run independently.
 
@@ -788,9 +783,9 @@ def extract_noise_ics_per_run(
 
     noise_pool_mask = noise_pool_mask.to(data.device)
 
-    noise_ics_per_run: List[torch.Tensor] = []
-    ic_loadings_per_run: List[torch.Tensor] = []
-    ic_variance_ratio_per_run: List[torch.Tensor] = []
+    noise_ics_per_run: list[torch.Tensor] = []
+    ic_loadings_per_run: list[torch.Tensor] = []
+    ic_variance_ratio_per_run: list[torch.Tensor] = []
 
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
@@ -817,7 +812,7 @@ def extract_noise_ics_per_run(
             n_keep = max_components_run
 
         n_restarts = max(1, int(ica_restarts))
-        best_ica: Optional[FastICA] = None
+        best_ica: FastICA | None = None
         best_score = -float("inf")
 
         for restart_idx in range(n_restarts):
@@ -895,9 +890,9 @@ def compute_full_brain_pc_loadings(
     data: torch.Tensor,
     noise_pcs_per_run: list[torch.Tensor],
     run_starts: list[int],
-    brain_mask: Optional[torch.Tensor] = None,
+    brain_mask: torch.Tensor | None = None,
     chunk_size: int = 5000,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = False,
 ) -> list[torch.Tensor]:
     """
@@ -999,16 +994,16 @@ def compute_full_brain_pc_loadings(
 def fit_glm_with_noise_pcs(
     data: torch.Tensor,
     design_matrix: torch.Tensor,
-    noise_pcs: List[torch.Tensor],
-    run_starts: List[int],
+    noise_pcs: list[torch.Tensor],
+    run_starts: list[int],
     n_pcs_to_use: int,
     tr: float,
-    nuisance: Optional[torch.Tensor] = None,
-    eval_mask: Optional[torch.Tensor] = None,
-    chunk_size: Optional[int] = None,
+    nuisance: torch.Tensor | None = None,
+    eval_mask: torch.Tensor | None = None,
+    chunk_size: int | None = None,
     preload_data_to_device: bool = True,
-    device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fit GLM with noise PCs projected out, compute R² in eval voxels
 
@@ -1115,22 +1110,22 @@ def fit_glm_with_noise_pcs(
 
 def cross_validate_noise_pcs(
     data: torch.Tensor,
-    design_matrix: Optional[torch.Tensor] = None,
-    noise_pcs: List[torch.Tensor] = None,
-    run_starts: List[int] = None,
+    design_matrix: torch.Tensor | None = None,
+    noise_pcs: list[torch.Tensor] = None,
+    run_starts: list[int] = None,
     tr: float = None,
     max_components: int = 20,
-    nuisance: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+    nuisance: torch.Tensor | list[torch.Tensor] | None = None,
     metric: Literal["mean", "median"] = "median",
-    cv_strategy: Union[int, float] = 1,
+    cv_strategy: int | float = 1,
     n_perms: int = 100,
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
     preload_data_to_device: bool = True,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = False,
-    designs_by_hrf: Optional[dict] = None,
-    hrf_indices: Optional[torch.Tensor] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    designs_by_hrf: dict | None = None,
+    hrf_indices: torch.Tensor | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for ALL voxels.
 
@@ -1241,7 +1236,7 @@ def cross_validate_noise_pcs(
     n_timepoints = data.shape[1]
 
     # Convert nuisance to list format if provided as concatenated tensor
-    nuisance_per_run: Optional[list[torch.Tensor]] = None
+    nuisance_per_run: list[torch.Tensor] | None = None
     if nuisance is not None:
         if isinstance(nuisance, list):
             nuisance_per_run = nuisance
@@ -1549,7 +1544,7 @@ def cross_validate_noise_pcs(
                     except (torch._C._LinAlgError, RuntimeError):
                         # Last resort: very conservative rcond
                         if n_pcs == 0:
-                            print(f"  Warning: Using very conservative rcond=1e-4 for stability")
+                            print("  Warning: Using very conservative rcond=1e-4 for stability")
                         pinv_full = torch.linalg.pinv(x_full, rcond=1e-4)
                         pinv_task = pinv_full[:n_task_regs, :]
 
@@ -1676,7 +1671,7 @@ def select_optimal_pcs(
     r2_maps: np.ndarray,
     threshold: float = 0.0,
     metric: str = "median",
-) -> Tuple[int, np.ndarray]:
+) -> tuple[int, np.ndarray]:
     """
     Select optimal PC count using GLMdenoise criteria.
 
@@ -1732,16 +1727,16 @@ def select_optimal_pcs(
 def compute_xval_r2_optimal_full(
     data: torch.Tensor,
     design_matrix: torch.Tensor,
-    noise_pcs: List[torch.Tensor],
-    run_starts: List[int],
+    noise_pcs: list[torch.Tensor],
+    run_starts: list[int],
     optimal_n_components: int,
-    nuisance: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    cv_strategy: Union[int, float] = 1,
+    nuisance: torch.Tensor | list[torch.Tensor] | None = None,
+    cv_strategy: int | float = 1,
     n_perms: int = 100,
-    chunk_size: Optional[int] = None,
-    device: Optional[torch.device] = None,
+    chunk_size: int | None = None,
+    device: torch.device | None = None,
     verbose: bool = False,
-) -> Tuple[torch.Tensor, np.ndarray]:
+) -> tuple[torch.Tensor, np.ndarray]:
     """
     Compute per-voxel cross-validated R² at the optimal PC count for ALL voxels.
 
@@ -1778,7 +1773,7 @@ def compute_xval_r2_optimal_full(
     voxel_chunk_size = chunk_size or 50000
 
     # Convert nuisance to list format if needed
-    nuisance_per_run: Optional[list[torch.Tensor]] = None
+    nuisance_per_run: list[torch.Tensor] | None = None
     if nuisance is not None:
         if isinstance(nuisance, list):
             nuisance_per_run = nuisance
@@ -1950,27 +1945,27 @@ def compute_xval_r2_optimal_full(
 
 def fit_denoising_model(
     data: torch.Tensor,
-    design_matrix: Optional[torch.Tensor] = None,
-    run_starts: List[int] = None,
+    design_matrix: torch.Tensor | None = None,
+    run_starts: list[int] = None,
     tr: float = None,
-    initial_r2: Optional[torch.Tensor] = None,
+    initial_r2: torch.Tensor | None = None,
     r2_threshold: float = 0.05,
-    intensity_mask: Optional[torch.Tensor] = None,
+    intensity_mask: torch.Tensor | None = None,
     max_components: int = 20,
     variance_threshold: float = 0.95,
-    nuisance: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+    nuisance: torch.Tensor | list[torch.Tensor] | None = None,
     metric: Literal["mean", "median"] = "median",
     min_noise_voxels: int = 100,
     max_noise_fraction: float = 0.95,
-    chunk_size: Optional[int] = None,
+    chunk_size: int | None = None,
     preload_data_to_device: bool = True,
     return_loadings: bool = False,
-    polort: Optional[int] = 2,
+    polort: int | None = 2,
     pcstop: float = 1.05,
-    pcR2cutoff: Optional[float] = None,
+    pcR2cutoff: float | None = None,
     noise_method: Literal["pca", "ica"] = "pca",
     auto_component_caps: bool = False,
-    auto_component_estimate_max: Optional[int] = None,
+    auto_component_estimate_max: int | None = None,
     auto_component_min: int = 5,
     auto_component_var_threshold: float = 0.90,
     auto_component_use_mp: bool = True,
@@ -1978,14 +1973,14 @@ def fit_denoising_model(
     ica_max_iter: int = 400,
     ica_tol: float = 1e-5,
     compute_noise_pool_pca_scree: bool = True,
-    scree_max_components: Optional[int] = None,
-    cv_strategy: Union[int, float] = 1,
+    scree_max_components: int | None = None,
+    cv_strategy: int | float = 1,
     n_perms: int = 100,
     r2_method: str = "auto",
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = False,
-    designs_by_hrf: Optional[dict] = None,
-    hrf_indices: Optional[torch.Tensor] = None,
+    designs_by_hrf: dict | None = None,
+    hrf_indices: torch.Tensor | None = None,
 ) -> DenoiseResults:
     """
     Fit cross-validated denoising model
@@ -2141,7 +2136,7 @@ def fit_denoising_model(
     # Convert nuisance to list format for consistent handling
     # This ensures extract_noise_pcs_per_run gets the exact same nuisance
     # matrices that will be used in the GLM model
-    nuisance_per_run: Optional[List[torch.Tensor]] = None
+    nuisance_per_run: list[torch.Tensor] | None = None
     if nuisance is not None:
         if isinstance(nuisance, list):
             nuisance_per_run = nuisance
@@ -2383,7 +2378,7 @@ def fit_denoising_model(
         print(f"  Criteria: {n_criteria:,} voxels ({n_criteria / data.shape[0] * 100:.1f}%)")
         print("  Note: Criteria mask will be refined after computing per-PC R² maps")
 
-    noise_pool_pca_scree_ratio_per_run: Optional[List[torch.Tensor]] = None
+    noise_pool_pca_scree_ratio_per_run: list[torch.Tensor] | None = None
     scree_eval_max = (
         scree_max_components
         if scree_max_components is not None
@@ -2433,8 +2428,8 @@ def fit_denoising_model(
                 "Enable auto_component_caps for adaptive per-run search."
             )
 
-    component_caps_per_run: Optional[List[int]] = None
-    component_cap_info: Optional[ComponentCountEstimate] = None
+    component_caps_per_run: list[int] | None = None
+    component_cap_info: ComponentCountEstimate | None = None
     extraction_max_components = max_components
     if auto_component_caps:
         estimate_max_components = (
@@ -2472,7 +2467,7 @@ def fit_denoising_model(
             )
 
     pc_loadings = None
-    ic_variance_ratio_per_run: Optional[List[torch.Tensor]] = None
+    ic_variance_ratio_per_run: list[torch.Tensor] | None = None
     if noise_method not in {"pca", "ica"}:
         raise ValueError(f"noise_method must be 'pca' or 'ica', got {noise_method}")
 
@@ -2669,7 +2664,7 @@ def fit_denoising_model(
 
     # Apply pcR2cutoff: already handled in select_optimal_pcs above
     # But we can recompute the selection curve using criteria voxels if needed
-    pcselection_mask: Optional[np.ndarray] = None
+    pcselection_mask: np.ndarray | None = None
     if pcR2cutoff is not None and pcR2cutoff > 0:
         # r2_per_voxel shape: (n_voxels, max_components+1)
         # Recompute selection curve using only criteria voxels
@@ -2747,7 +2742,7 @@ def fit_denoising_model(
 
     # Build per-voxel xval R² map at optimal PC count
     # Now we have R² for ALL voxels, not just criteria
-    xval_r2_optimal: Optional[torch.Tensor] = None
+    xval_r2_optimal: torch.Tensor | None = None
     if r2_per_voxel is not None:
         optimal_r2_per_voxel = r2_per_voxel[:, optimal_n_components]
         xval_r2_optimal = torch.from_numpy(optimal_r2_per_voxel).to(torch.float32)
@@ -2755,7 +2750,7 @@ def fit_denoising_model(
     # We already have full-brain R² maps from cross_validate_noise_pcs
     # No need for separate compute_xval_r2_optimal_full call
     xval_r2_optimal_full = xval_r2_optimal
-    xval_r2_optimal_per_fold: Optional[np.ndarray] = (
+    xval_r2_optimal_per_fold: np.ndarray | None = (
         None  # Not meaningful with concatenated approach
     )
 

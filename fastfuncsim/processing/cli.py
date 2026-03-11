@@ -31,7 +31,7 @@ from torch import Tensor
 from .interp import warp_image_linear
 from .io import load_image, load_warp_field, save_image, save_warp_field
 from .memory import estimate_gpu_memory_gb, print_memory_report
-from .warp import QwarpConfig, qwarp, _compute_padding, _pad_volume
+from .warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -631,7 +631,7 @@ def _extract_warp_pcs(
 
     # Write .1D file (AFNI-style: space-separated columns, one row per volume)
     with open(out_path, "w") as f:
-        f.write(f"# Warp displacement PCs from ffs_qwarp\n")
+        f.write("# Warp displacement PCs from ffs_qwarp\n")
         f.write(f"# Active axes: {'+'.join(axis_labels)}, {n_vols} volumes, {n_pcs} PCs\n")
         f.write(f"# Variance explained: {' '.join(f'{v*100:.2f}%' for v in var_explained.tolist())}\n")
         for row in pcs.cpu().numpy():

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from typing import Dict, List, Optional
 
 import torch
 
@@ -26,8 +25,8 @@ class TimingProfiler:
             Initializes timing buffers and stack state.
         """
         self.enabled = enabled
-        self.timings: Dict[str, List[float]] = {}
-        self.stack: List[tuple] = []  # (name, start_time)
+        self.timings: dict[str, list[float]] = {}
+        self.stack: list[tuple] = []  # (name, start_time)
 
     @contextmanager
     def profile(self, name: str):
@@ -99,7 +98,7 @@ class TimingProfiler:
 
 
 # Global profiler instance
-_global_profiler: Optional[TimingProfiler] = None
+_global_profiler: TimingProfiler | None = None
 
 
 def get_profiler(enabled: bool = True) -> TimingProfiler:

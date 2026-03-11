@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import nibabel as nib
 import numpy as np
@@ -30,26 +29,26 @@ from .utils import get_device, to_tensor
 
 
 def analyze_from_onsets(
-    fmri_data: Union[str, Path, List[Union[str, Path]], np.ndarray, torch.Tensor],
-    onset_files: List[Union[str, Path]],
+    fmri_data: str | Path | list[str | Path] | np.ndarray | torch.Tensor,
+    onset_files: list[str | Path],
     tr: float,
     hrf_mode: str = "canonical",
     stim_duration: float = 0.0,
     n_hrfs: int = 20,
     method: str = "ols",
-    arma_a_grid: Optional[torch.Tensor] = None,
-    arma_b_grid: Optional[torch.Tensor] = None,
-    run_starts: Optional[List[int]] = None,
-    device: Optional[torch.device] = None,
-    test_n_voxels: Optional[int] = None,
+    arma_a_grid: torch.Tensor | None = None,
+    arma_b_grid: torch.Tensor | None = None,
+    run_starts: list[int] | None = None,
+    device: torch.device | None = None,
+    test_n_voxels: int | None = None,
     enable_quick_estimate: bool = False,
-    stim_labels: Optional[List[str]] = None,
-    polort: Optional[int] = None,
+    stim_labels: list[str] | None = None,
+    polort: int | None = None,
     verbose: bool = True,
     microtime_dt: float = 0.1,
     microtime_onset: int = 0,
     **hrf_kwargs,
-) -> Union[GLMResults, ARMA11Results]:
+) -> GLMResults | ARMA11Results:
     """
     Complete analysis pipeline: AFNI onset files → HRF → GLM results
 
@@ -159,7 +158,7 @@ def analyze_from_onsets(
         device = get_device()
 
     # 1. Load fMRI data (handle both single file and multiple run files)
-    original_shape: Optional[Tuple[int, int, int]] = None
+    original_shape: tuple[int, int, int] | None = None
 
     if isinstance(fmri_data, list):
         # Multiple run files - concatenate them
@@ -365,33 +364,33 @@ def analyze_from_onsets(
 
 
 def analyze_from_design_matrix(
-    fmri_data: Union[str, Path, List[Union[str, Path]], np.ndarray, torch.Tensor],
-    design_matrix_file: Union[str, Path],
+    fmri_data: str | Path | list[str | Path] | np.ndarray | torch.Tensor,
+    design_matrix_file: str | Path,
     method: str = "ols",
     use_stimulus_only: bool = False,
-    arma_a_grid: Optional[torch.Tensor] = None,
-    arma_b_grid: Optional[torch.Tensor] = None,
-    precomputed_arma_params: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    arma_a_grid: torch.Tensor | None = None,
+    arma_b_grid: torch.Tensor | None = None,
+    precomputed_arma_params: torch.Tensor | np.ndarray | None = None,
     want_ols: bool = False,
-    ols_output_path: Optional[Union[str, Path]] = None,
+    ols_output_path: str | Path | None = None,
     ols_output_format: str = "nii.gz",
-    device: Optional[torch.device] = None,
-    mask_file: Optional[Union[str, Path]] = None,
+    device: torch.device | None = None,
+    mask_file: str | Path | None = None,
     mask_threshold: float = 0.0,
-    cache_file: Optional[Union[str, Path]] = None,
-    cached_metadata: Optional[Dict] = None,
-    test_n_voxels: Optional[int] = None,
-    voxel_chunk_size: Optional[int] = None,
+    cache_file: str | Path | None = None,
+    cached_metadata: dict | None = None,
+    test_n_voxels: int | None = None,
+    voxel_chunk_size: int | None = None,
     use_double: bool = False,
     debug_memory: bool = False,
     enable_quick_estimate: bool = False,
-    use_grid_batching: Optional[bool] = None,
+    use_grid_batching: bool | None = None,
     want_r2_partial: bool = False,
     r2_partial_mode: str = "full",  # "full" or "task" - how to compute partial R²
     want_r2_semipartial: bool = False,
     r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
     legacy_contrasts: bool = False,
-) -> Tuple[Union[GLMResults, ARMA11Results], Dict]:
+) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
 
@@ -483,8 +482,8 @@ def analyze_from_design_matrix(
 
     # 2. Load fMRI data (handle both single file and multiple run files)
     storage_device = torch.device("cpu")
-    mask_tensor: Optional[torch.Tensor] = None
-    volume_shape: Optional[Tuple[int, int, int]] = None
+    mask_tensor: torch.Tensor | None = None
+    volume_shape: tuple[int, int, int] | None = None
     affine = None
     nifti_header = None  # Store full NIfTI header for cache
 
@@ -1073,20 +1072,20 @@ def analyze_from_design_matrix(
 
 
 def analyze_with_cross_validation(
-    fmri_data: Union[str, Path, List[Union[str, Path]], np.ndarray, torch.Tensor],
-    design_matrix_file: Union[str, Path],
-    cv_strategy: Union[float, int] = 0.5,
+    fmri_data: str | Path | list[str | Path] | np.ndarray | torch.Tensor,
+    design_matrix_file: str | Path,
+    cv_strategy: float | int = 0.5,
     n_perms: int = 100,
     metric: str = "cod",
     zero_event_strategy: str = "zero",
     use_stimulus_only: bool = False,
-    device: Optional[torch.device] = None,
-    mask_file: Optional[Union[str, Path]] = None,
+    device: torch.device | None = None,
+    mask_file: str | Path | None = None,
     mask_threshold: float = 0.0,
-    batch_size: Optional[int] = None,
-    test_n_voxels: Optional[int] = None,
+    batch_size: int | None = None,
+    test_n_voxels: int | None = None,
     verbose: bool = True,
-) -> Tuple[Dict[str, Union[torch.Tensor, int]], Dict]:
+) -> tuple[dict[str, torch.Tensor | int], dict]:
     """
     Cross-validated analysis pipeline: compute out-of-sample R²
 
@@ -1349,7 +1348,7 @@ def analyze_with_cross_validation(
 
 
 def _load_fmri_data(
-    fmri_data: Union[str, Path, np.ndarray, torch.Tensor], device: torch.device
+    fmri_data: str | Path | np.ndarray | torch.Tensor, device: torch.device
 ) -> torch.Tensor:
     """
     Load fMRI data from various formats
@@ -1394,10 +1393,10 @@ def _load_fmri_data(
 
 
 def compute_contrasts(
-    results: Union[GLMResults, ARMA11Results],
-    contrasts: Union[np.ndarray, torch.Tensor, List[float]],
-    device: Optional[torch.device] = None,
-) -> Dict[str, torch.Tensor]:
+    results: GLMResults | ARMA11Results,
+    contrasts: np.ndarray | torch.Tensor | list[float],
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
     """
     Compute contrast t-statistics and p-values
 
@@ -1515,12 +1514,12 @@ def compute_contrasts(
 
 
 def compute_contrasts_from_design(
-    results: Union[GLMResults, ARMA11Results],
+    results: GLMResults | ARMA11Results,
     design_info: dict,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     auto_cpu_fallback: bool = True,
     memory_threshold_timepoints: int = 1000,
-) -> Optional[dict]:
+) -> dict | None:
     """
     Compute contrasts from AFNI design matrix metadata with automatic CPU fallback.
 

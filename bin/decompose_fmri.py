@@ -85,8 +85,8 @@ from fastfuncsim.ica import (
     ica_stability_analysis,
     select_n_components_by_stability,
 )
-from fastfuncsim.icasso import icasso, icasso_auto_select
 from fastfuncsim.ica_tools import parse_num_comps_spec
+from fastfuncsim.icasso import icasso, icasso_auto_select
 from fastfuncsim.pca import PCA
 from fastfuncsim.utils import get_device
 

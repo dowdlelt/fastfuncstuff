@@ -13,22 +13,18 @@ Tests critical utility functions used by all CLI tools:
 - Nuisance building
 """
 
-import pytest
-import torch
-import numpy as np
 from pathlib import Path
-import tempfile
 
-from fastfuncsim.utils import get_device
+import pytest
+
 from fastfuncsim.cli_utils import (
-    parse_input_files,
-    parse_cv_strategy,
     auto_polort,
     compute_run_lengths,
     get_average_run_duration,
+    parse_cv_strategy,
     parse_device_arg,
+    parse_input_files,
 )
-
 
 # ============================================================================
 # Layer 1: Small Tests - Unit tests for core utility functions

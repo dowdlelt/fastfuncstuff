@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import platform
 import warnings
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     pass
 
 
-def get_device(prefer_device: Optional[str] = None) -> torch.device:
+def get_device(prefer_device: str | None = None) -> torch.device:
     """
     Select the execution device with mandatory MPS enforcement on macOS.
 
@@ -100,9 +100,9 @@ def print_device_info(device: torch.device):
 
 
 def to_tensor(
-    x: Union[torch.Tensor, np.ndarray, list, tuple],
+    x: torch.Tensor | np.ndarray | list | tuple,
     dtype: torch.dtype = torch.float32,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Convert input to torch tensor with specified dtype and device
@@ -305,7 +305,7 @@ def gaussian_blur_3d(
     data: np.ndarray,
     fwhm_mm: float,
     voxel_sizes: tuple[float, float, float],
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ) -> np.ndarray:
     """
@@ -463,11 +463,11 @@ def gaussian_blur_3d(
 
 
 def generate_synthetic_runs(
-    first_run_data: Optional[torch.Tensor],
+    first_run_data: torch.Tensor | None,
     n_runs_total: int,
     run_length: int,
-    n_voxels: Optional[int] = None,
-    generator: Optional[torch.Generator] = None,
+    n_voxels: int | None = None,
+    generator: torch.Generator | None = None,
     verbose: bool = True,
 ) -> torch.Tensor:
     """
@@ -587,7 +587,7 @@ def load_per_run_nuisance_files(
     n_runs: int,
     suffix: str = "_selected_PCs.txt",
     verbose: bool = False,
-) -> list[Optional[np.ndarray]]:
+) -> list[np.ndarray | None]:
     """
     Load per-run nuisance/regressor files.
 

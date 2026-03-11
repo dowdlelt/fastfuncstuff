@@ -9,7 +9,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 
 import torch
@@ -54,7 +53,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"automask: device={device}")
 
     t0 = time.time()
-    vol, header = load_image(getattr(args, "input"), device=device)
+    vol, header = load_image(args.input, device=device)
 
     # Handle 4D: use first volume
     if vol.ndim == 4:
@@ -63,7 +62,7 @@ def main(argv: list[str] | None = None) -> None:
         vol = vol[0]
 
     if verb >= 1:
-        print(f"Input: {getattr(args, 'input')} {vol.shape}")
+        print(f"Input: {args.input} {vol.shape}")
 
     mask = automask(vol, clip_frac=args.clip_frac, dilate_extra=args.dilate, device=device)
 

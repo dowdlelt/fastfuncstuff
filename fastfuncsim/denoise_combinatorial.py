@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import combinations as itertools_combinations
-from typing import Optional
 
 import numpy as np
 import torch
@@ -34,7 +33,6 @@ from fastfuncsim.xval import (
     project_out_nuisance_per_run,
     slice_by_runs,
 )
-
 
 # ============================================================================
 # Data structures
@@ -199,7 +197,7 @@ def evaluate_all_combinations_for_run(
     combinations: list[tuple[int, ...]],
     variance_ratios: np.ndarray,
     device: torch.device,
-    criteria_chunk_size: Optional[int] = None,  # Will be computed adaptively if None
+    criteria_chunk_size: int | None = None,  # Will be computed adaptively if None
     verbose: bool = False,
     return_raw_cod: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -397,7 +395,7 @@ def select_optimal_combination(
 
 def fit_combinatorial_denoising(
     data: torch.Tensor,
-    design: Optional[torch.Tensor],
+    design: torch.Tensor | None,
     run_starts: list[int],
     tr: float,
     nuisance_per_run: list[torch.Tensor],
@@ -407,9 +405,9 @@ def fit_combinatorial_denoising(
     criteria_r2_threshold: float = 0.0,
     selection_strategy: str = "argmax",
     singleton_only: bool = False,
-    designs_by_hrf: Optional[dict[int, torch.Tensor]] = None,
-    hrf_indices: Optional[torch.Tensor] = None,
-    device: Optional[torch.device] = None,
+    designs_by_hrf: dict[int, torch.Tensor] | None = None,
+    hrf_indices: torch.Tensor | None = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ) -> CombinatorialDenoiseResults:
     """
@@ -492,7 +490,7 @@ def fit_combinatorial_denoising(
         mode_str = "Exhaustive combinatorial"
 
     if verbose:
-        print(f"\nCombinatorial PC Denoising")
+        print("\nCombinatorial PC Denoising")
         print(f"  Mode: {mode_str}")
         print(f"  Runs: {n_runs}")
         print(f"  Max PCs: {max_pcs} -> {n_combos} combinations per run")
@@ -839,7 +837,7 @@ def fit_combinatorial_denoising(
     # ----------------------------------------------------------------
     if verbose:
         print(f"\n{'=' * 60}")
-        print(f"  Combinatorial Denoising Summary")
+        print("  Combinatorial Denoising Summary")
         print(f"{'=' * 60}")
         for res in per_run_results:
             combo_display = tuple(pc + 1 for pc in res.optimal_combination)
@@ -876,7 +874,7 @@ def compute_optimized_xval_r2(
     nuisance_per_run: list[torch.Tensor],
     noise_pcs_per_run: list[torch.Tensor],
     per_run_results: list[CombinatorialDenoiseRunResult],
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ) -> torch.Tensor:
     """
@@ -981,14 +979,14 @@ def compute_optimized_xval_r2(
 
 def compute_optimized_xval_r2_3dDenoise_style(
     data: torch.Tensor,
-    design: Optional[torch.Tensor],
+    design: torch.Tensor | None,
     run_starts: list[int],
     nuisance_per_run: list[torch.Tensor],
     noise_pcs_per_run: list[torch.Tensor],
     per_run_results: list,
-    designs_by_hrf: Optional[dict[int, torch.Tensor]] = None,
-    hrf_indices: Optional[torch.Tensor] = None,
-    device: Optional[torch.device] = None,
+    designs_by_hrf: dict[int, torch.Tensor] | None = None,
+    hrf_indices: torch.Tensor | None = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ) -> torch.Tensor:
     """
@@ -1121,12 +1119,12 @@ def compute_optimized_xval_r2_3dDenoise_style(
 
 def compute_initial_xval_r2(
     data: torch.Tensor,
-    design: Optional[torch.Tensor],
+    design: torch.Tensor | None,
     run_starts: list[int],
     nuisance_per_run: list[torch.Tensor],
-    designs_by_hrf: Optional[dict[int, torch.Tensor]] = None,
-    hrf_indices: Optional[torch.Tensor] = None,
-    device: Optional[torch.device] = None,
+    designs_by_hrf: dict[int, torch.Tensor] | None = None,
+    hrf_indices: torch.Tensor | None = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ) -> torch.Tensor:
     """
@@ -1281,8 +1279,9 @@ def plot_singleton_contributions(
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     from pathlib import Path
+
+    import matplotlib.pyplot as plt
 
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1371,8 +1370,9 @@ def plot_plateau_curves(
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     from pathlib import Path
+
+    import matplotlib.pyplot as plt
 
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1484,8 +1484,9 @@ def plot_inclusion_heatmap(
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     from pathlib import Path
+
+    import matplotlib.pyplot as plt
 
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1594,8 +1595,9 @@ def plot_combinatorial_results(
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     from pathlib import Path
+
+    import matplotlib.pyplot as plt
 
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
 

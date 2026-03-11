@@ -15,8 +15,6 @@ NeuroImage, 22(3), 1214-1222.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union
-
 import numpy as np
 import torch
 from scipy.cluster.hierarchy import fcluster, linkage
@@ -52,8 +50,8 @@ def compute_component_similarity(
 
 
 def compute_similarity_matrix(
-    components_list: List[np.ndarray],
-    batch_size: Optional[int] = None,
+    components_list: list[np.ndarray],
+    batch_size: int | None = None,
 ) -> np.ndarray:
     """
     Compute pairwise similarity matrix across all components from all runs
@@ -106,12 +104,12 @@ def compute_similarity_matrix(
 
 
 def cluster_components(
-    components_list: List[np.ndarray],
+    components_list: list[np.ndarray],
     method: str = "average",
     criterion: str = "maxclust",
-    n_clusters: Optional[int] = None,
-    batch_size: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    n_clusters: int | None = None,
+    batch_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Cluster components across ICA runs using hierarchical clustering
 
@@ -164,10 +162,10 @@ def cluster_components(
 
 
 def compute_cluster_quality(
-    components_list: List[np.ndarray],
+    components_list: list[np.ndarray],
     cluster_labels: np.ndarray,
     similarity: np.ndarray,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """
     Compute quality metrics for each cluster
 
@@ -244,7 +242,7 @@ def compute_cluster_quality(
 
 
 def extract_cluster_centroids(
-    components_list: List[np.ndarray],
+    components_list: list[np.ndarray],
     cluster_labels: np.ndarray,
 ) -> np.ndarray:
     """
@@ -295,15 +293,15 @@ def extract_cluster_centroids(
 
 
 def icasso(
-    X: Union[np.ndarray, torch.Tensor],
+    X: np.ndarray | torch.Tensor,
     n_components: int,
     n_runs: int = 100,
-    pca_components: Optional[Union[int, float, str]] = 0.85,
+    pca_components: int | float | str | None = 0.85,
     min_stability: float = 0.7,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
-    batch_size: Optional[int] = None,
-) -> Dict:
+    batch_size: int | None = None,
+) -> dict:
     """
     Run ICASSO: ICA with component clustering for reliability assessment
 
@@ -485,7 +483,7 @@ def icasso(
 
 
 def find_best_run(
-    components_list: List[np.ndarray],
+    components_list: list[np.ndarray],
     target_components: np.ndarray,
 ) -> int:
     """
@@ -573,15 +571,15 @@ def match_components_to_centroids(
 
 
 def icasso_auto_select(
-    X: Union[np.ndarray, torch.Tensor],
-    n_components_range: Union[range, List[int]],
+    X: np.ndarray | torch.Tensor,
+    n_components_range: range | list[int],
     n_runs: int = 50,
-    pca_components: Optional[Union[int, float, str]] = 0.85,
+    pca_components: int | float | str | None = 0.85,
     min_stability: float = 0.7,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
-    batch_size: Optional[int] = None,
-) -> Dict:
+    batch_size: int | None = None,
+) -> dict:
     """
     Automatically select optimal number of ICA components using ICASSO
 

@@ -21,12 +21,9 @@ import torch
 from torch import Tensor
 
 from .affine import (
-    _build_homo_coords,
-    identity_params,
     params_to_matrix,
     resample_affine_fast,
 )
-
 
 # ---------------------------------------------------------------------------
 # Filter design

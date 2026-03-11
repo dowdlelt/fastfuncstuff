@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -25,7 +25,6 @@ warnings.filterwarnings(
 
 from .affine import (
     _build_homo_coords,
-    apply_affine,
     apply_affine_interp,
     apply_affine_wsinc5,
     identity_params,
@@ -38,7 +37,6 @@ from .affine import (
 from .cost import _separable_smooth_3d, lpa_correlation
 from .interp import _separable_resample_3d
 from .weight import compute_weight_image
-
 
 # ---------------------------------------------------------------------------
 # Configuration & result dataclasses

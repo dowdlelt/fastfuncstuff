@@ -46,7 +46,6 @@ from __future__ import annotations
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -62,7 +61,7 @@ except ImportError as exc:  # pragma: no cover - nibabel is required for AFNI in
 from .utils import get_device, to_tensor
 
 
-def load_nifti(filepath: Union[str, Path]) -> nib.Nifti1Image:
+def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     """
     Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.
 
@@ -142,7 +141,7 @@ def load_nifti(filepath: Union[str, Path]) -> nib.Nifti1Image:
     return nib.load(str(filepath))
 
 
-def read_afni_onset_file(filepath: Union[str, Path]) -> List[np.ndarray]:
+def read_afni_onset_file(filepath: str | Path) -> list[np.ndarray]:
     """
     Read AFNI onset timing file
 
@@ -188,7 +187,7 @@ def read_afni_onset_file(filepath: Union[str, Path]) -> List[np.ndarray]:
     return onsets_per_run
 
 
-def read_afni_onset_files(filepaths: List[Union[str, Path]]) -> List[List[np.ndarray]]:
+def read_afni_onset_files(filepaths: list[str | Path]) -> list[list[np.ndarray]]:
     """
     Read multiple AFNI onset timing files (one per condition)
 
@@ -212,7 +211,7 @@ def read_afni_onset_files(filepaths: List[Union[str, Path]]) -> List[List[np.nda
 
 
 def onsets_to_tr_matrix(
-    onsets_per_condition: List[List[np.ndarray]],
+    onsets_per_condition: list[list[np.ndarray]],
     n_timepoints: int,
     tr: float,
 ) -> np.ndarray:
@@ -270,11 +269,11 @@ def onsets_to_tr_matrix(
 
 
 def onsets_to_binary_matrix(
-    onsets_per_condition: List[List[np.ndarray]],
+    onsets_per_condition: list[list[np.ndarray]],
     n_timepoints: int,
     tr: float,
-    run_starts: Optional[List[int]] = None,
-    device: Optional[torch.device] = None,
+    run_starts: list[int] | None = None,
+    device: torch.device | None = None,
     microtime_dt: float = 0.1,
 ) -> torch.Tensor:
     """
@@ -408,7 +407,7 @@ def parse_afni_matrix_notation(notation: str) -> np.ndarray:
     return matrix
 
 
-def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
+def read_afni_design_matrix(filepath: str | Path) -> dict:
     """
     Read AFNI design matrix file (X.xmat.1D format)
 
@@ -625,9 +624,9 @@ def read_afni_design_matrix(filepath: Union[str, Path]) -> Dict:
 
 
 def extract_stimulus_columns(
-    design_info: Dict,
-    stim_indices: Optional[List[int]] = None,
-    device: Optional[torch.device] = None,
+    design_info: dict,
+    stim_indices: list[int] | None = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Extract stimulus/task regressor columns from AFNI design matrix
@@ -679,7 +678,7 @@ def extract_stimulus_columns(
 
 
 def extract_nuisance_columns(
-    design_info: Dict, device: Optional[torch.device] = None
+    design_info: dict, device: torch.device | None = None
 ) -> torch.Tensor:
     """
     Extract nuisance regressor columns (polynomials + motion) from AFNI design matrix
@@ -722,11 +721,11 @@ def extract_nuisance_columns(
 
 
 def load_and_concatenate_runs(
-    run_files: List[Union[str, Path]],
-    device: Optional[torch.device] = None,
+    run_files: list[str | Path],
+    device: torch.device | None = None,
     keep_on_cpu: bool = False,
-    mask_flat: Optional[np.ndarray] = None,
-) -> Tuple[torch.Tensor, List[int]]:
+    mask_flat: np.ndarray | None = None,
+) -> tuple[torch.Tensor, list[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
 
@@ -839,7 +838,7 @@ def load_and_concatenate_runs(
 
 
 def load_afni_mask(
-    mask_file: Union[str, Path],
+    mask_file: str | Path,
     threshold: float = 0.0,
 ) -> np.ndarray:
     """Load an AFNI-style mask and return a boolean volume.
@@ -889,7 +888,7 @@ def load_afni_mask(
     return mask
 
 
-def get_run_lengths(run_starts: List[int], n_timepoints: int) -> List[int]:
+def get_run_lengths(run_starts: list[int], n_timepoints: int) -> list[int]:
     """
     Calculate run lengths from run starts
 
@@ -923,7 +922,7 @@ def get_run_lengths(run_starts: List[int], n_timepoints: int) -> List[int]:
 
 
 def get_contrast_matrix(
-    design_info: Dict, contrast_index: int, device: Optional[torch.device] = None
+    design_info: dict, contrast_index: int, device: torch.device | None = None
 ) -> torch.Tensor:
     """
     Get a specific contrast matrix from AFNI design info
@@ -963,8 +962,8 @@ def get_contrast_matrix(
 
 
 def extract_design_metadata(
-    design_info: Dict,
-) -> Tuple[List[str], List[str], List[int]]:
+    design_info: dict,
+) -> tuple[list[str], list[str], list[int]]:
     """
     Extract metadata from design_info dictionary with clear, unambiguous names.
 
@@ -1022,7 +1021,7 @@ def extract_design_metadata(
     return full_labels, stim_labels, stim_column_indices
 
 
-def get_regressor_groups(design_info: Dict) -> Dict[str, List[int]]:
+def get_regressor_groups(design_info: dict) -> dict[str, list[int]]:
     """
     Get regressor indices organized by ColumnGroups
 
@@ -1085,9 +1084,9 @@ def get_regressor_groups(design_info: Dict) -> Dict[str, List[int]]:
 
 
 def select_regressors_by_group(
-    design_info: Dict,
-    include_groups: Optional[List[str]] = None,
-    exclude_groups: Optional[List[str]] = None,
+    design_info: dict,
+    include_groups: list[str] | None = None,
+    exclude_groups: list[str] | None = None,
 ) -> np.ndarray:
     """
     Select regressor columns by group type
@@ -1147,7 +1146,7 @@ def select_regressors_by_group(
     return matrix[:, selected_cols]
 
 
-def get_censored_mask(design_info: Dict) -> np.ndarray:
+def get_censored_mask(design_info: dict) -> np.ndarray:
     """
     Get boolean mask indicating which timepoints were censored
 
@@ -1197,9 +1196,9 @@ def get_censored_mask(design_info: Dict) -> np.ndarray:
 
 
 def select_uncensored_timepoints(
-    design_info: Dict,
-    data: Optional[np.ndarray] = None,
-) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    design_info: dict,
+    data: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Select only uncensored timepoints from design matrix and/or data
 
@@ -1297,7 +1296,7 @@ def replace_afni_extension(filepath: str, new_extension: str = ".nii.gz") -> str
     return filepath + new_extension
 
 
-def get_tr_from_file(filepath: Union[str, Path]) -> float:
+def get_tr_from_file(filepath: str | Path) -> float:
     """
     Extract TR (repetition time) from NIfTI header.
 
@@ -1330,8 +1329,8 @@ def get_tr_from_file(filepath: Union[str, Path]) -> float:
 
 
 def load_fmri_data(
-    fmri_file: Union[str, Path],
-    mask_file: Union[str, Path],
+    fmri_file: str | Path,
+    mask_file: str | Path,
     dtype: np.dtype = np.float32,
 ) -> np.ndarray:
     """
@@ -1391,10 +1390,10 @@ def load_fmri_data(
 
 def save_nifti(
     data: np.ndarray,
-    output_path: Union[str, Path],
-    reference_img: Optional[Union[str, Path]] = None,
-    affine: Optional[np.ndarray] = None,
-    tr: Optional[float] = None,
+    output_path: str | Path,
+    reference_img: str | Path | None = None,
+    affine: np.ndarray | None = None,
+    tr: float | None = None,
 ):
     """
     Save data as NIfTI file

@@ -4,27 +4,25 @@ Comprehensive tests for arma_glm.py coverage.
 Targets: internal helpers, memory management, I/O, and error handling.
 """
 
-import pytest
-import torch
-import numpy as np
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
+import pytest
+import torch
 
 from fastfuncsim.arma_glm import (
+    ARMA11Results,
     _compute_arma11_lambda,
-    ensure_zero_in_grid,
     calculate_grid_memory_footprint,
-    estimate_valid_grid_pairs,
-    get_adaptive_batch_size,
-    check_cuda_memory_before_batch,
-    save_arma_rvar,
-    load_arma_params,
     compare_ols_vs_arma11,
+    ensure_zero_in_grid,
+    estimate_valid_grid_pairs,
     fit_glm_arma11,
-    ARMA11Results
+    get_adaptive_batch_size,
+    save_arma_rvar,
 )
-from fastfuncsim.glm_core import fit_glm
+
 
 class TestARMAHelpers:
     """Test hidden and utility functions in arma_glm."""

@@ -57,8 +57,8 @@ try:
         fit_combinatorial_denoising,
         plot_combinatorial_results,
         plot_inclusion_heatmap,
-        plot_singleton_contributions,
         plot_plateau_curves,
+        plot_singleton_contributions,
     )
     from fastfuncsim.design import convolve_hrf_microtime, make_fir_design, make_tent_design
     from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations, parse_hrf_model

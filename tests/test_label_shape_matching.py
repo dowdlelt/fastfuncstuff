@@ -12,7 +12,6 @@ import pytest
 import torch
 
 from fastfuncsim.arma_glm import ARMA11Results, fit_glm_arma11
-from fastfuncsim.glm_core import GLMResults, fit_glm
 
 
 class TestLabelShapeMatching:

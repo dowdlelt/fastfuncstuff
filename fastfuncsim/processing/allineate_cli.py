@@ -14,13 +14,17 @@ Speed presets:
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 
 import torch
 
+from .affine import (
+    apply_affine,
+    apply_affine_wsinc5,
+    load_matrix_1D,
+    save_matrix_1D,
+)
 from .allineate import AffineAlignConfig, allineate
-from .affine import save_matrix_1D, load_matrix_1D, apply_affine, apply_affine_wsinc5, dicom_matrix_to_voxel
 from .io import load_image, save_image
 
 

@@ -13,13 +13,12 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
 
 import numpy as np
 import torch
 
 
-def parse_input_files(input_arg: Union[str, list[str]]) -> list[str]:
+def parse_input_files(input_arg: str | list[str]) -> list[str]:
     """
     Parse input files from command line arguments.
 
@@ -75,7 +74,7 @@ def parse_input_files(input_arg: Union[str, list[str]]) -> list[str]:
     return files
 
 
-def parse_cv_strategy(cv_str: str) -> Union[int, float]:
+def parse_cv_strategy(cv_str: str) -> int | float:
     """
     Parse cross-validation strategy string into int or float.
 
@@ -196,21 +195,21 @@ class LoadResult:
     volume_shape: tuple  # Shape of 3D volume
     voxel_sizes: tuple  # Voxel dimensions in mm
     tr: float  # Repetition time in seconds
-    mask: Optional[np.ndarray]  # Brain mask (original 3D)
-    mask_flat: Optional[np.ndarray]  # Flattened mask (1D bool)
+    mask: np.ndarray | None  # Brain mask (original 3D)
+    mask_flat: np.ndarray | None  # Flattened mask (1D bool)
     n_voxels: int  # Number of voxels
     n_timepoints: int  # Total timepoints
     n_runs: int  # Number of runs
     keep_on_cpu: bool  # Whether data is stored on CPU
-    scale_info: Optional[dict]  # Scaling info if do_scale was True
-    violations_mask: Optional[torch.Tensor]  # Scaling violations if do_scale
+    scale_info: dict | None  # Scaling info if do_scale was True
+    violations_mask: torch.Tensor | None  # Scaling violations if do_scale
 
 
 def load_and_preprocess_runs(
     input_files: list[str],
-    tr: Optional[float] = None,
-    mask_file: Optional[str] = None,
-    blur_fwhm: Optional[float] = None,
+    tr: float | None = None,
+    mask_file: str | None = None,
+    blur_fwhm: float | None = None,
     do_scale: bool = False,
     device: torch.device = torch.device("cpu"),
     force_cpu: bool = False,
@@ -395,7 +394,7 @@ def load_and_preprocess_runs(
 
         if verbose:
             print(f"\n  Data shape: {data.shape} (n_voxels × n_timepoints)")
-            print(f"  Device: CPU (dry run)")
+            print("  Device: CPU (dry run)")
             print("  ⚠️  Results are from synthetic data - for testing only!")
             print("=" * 70 + "\n")
 
@@ -527,7 +526,7 @@ def save_volume_nifti(
     filename: str,
     volume_shape: tuple,
     affine: np.ndarray,
-    mask_flat: Optional[np.ndarray] = None,
+    mask_flat: np.ndarray | None = None,
 ):
     """
     Reshape flat data to 3D volume and save as NIfTI file.
@@ -574,7 +573,7 @@ def save_4d_nifti(
     filename: str,
     volume_shape: tuple,
     affine: np.ndarray,
-    mask_flat: Optional[np.ndarray] = None,
+    mask_flat: np.ndarray | None = None,
 ):
     """
     Reshape (n_voxels, n_volumes) flat data to 4D and save as NIfTI file.
@@ -627,15 +626,15 @@ def save_4d_nifti(
 class DesignResult:
     """Result from build_design_from_onsets() or related design building functions."""
 
-    task_design: Optional[torch.Tensor]  # (n_timepoints, n_conditions) or None for per-HRF
+    task_design: torch.Tensor | None  # (n_timepoints, n_conditions) or None for per-HRF
     nuisance_per_run: list[torch.Tensor]  # Per-run nuisance blocks
     polort: int
     condition_labels: list[str]
     n_timepoints: int
     n_runs: int
-    task_indices: Optional[list[int]] = None  # Indices of task regressors
-    nuisance_indices: Optional[list[int]] = None  # Indices of nuisance regressors
-    ortvec_labels: Optional[list[str]] = None  # Labels for ortvec regressors
+    task_indices: list[int] | None = None  # Indices of task regressors
+    nuisance_indices: list[int] | None = None  # Indices of nuisance regressors
+    ortvec_labels: list[str] | None = None  # Labels for ortvec regressors
 
 
 def auto_polort(
@@ -681,9 +680,9 @@ def build_nuisance_per_run(
     n_timepoints: int,
     polort: int,
     device: torch.device,
-    ortvec_files: Optional[list[tuple[str, str]]] = None,
-    ortvec_data: Optional[torch.Tensor] = None,
-    noise_pcs: Optional[list[torch.Tensor]] = None,
+    ortvec_files: list[tuple[str, str]] | None = None,
+    ortvec_data: torch.Tensor | None = None,
+    noise_pcs: list[torch.Tensor] | None = None,
     verbose: bool = False,
 ) -> list[torch.Tensor]:
     """
@@ -816,7 +815,7 @@ def build_nuisance_block_diag(
     n_timepoints: int,
     polort: int,
     device: torch.device,
-    ortvec_files: Optional[list[tuple[str, str]]] = None,
+    ortvec_files: list[tuple[str, str]] | None = None,
     verbose: bool = False,
 ) -> torch.Tensor:
     """
@@ -973,8 +972,8 @@ def get_average_run_duration(
 
 
 def parse_device_arg(
-    device_spec: Optional[str],
-) -> tuple[torch.device, Optional[int], Optional[int]]:
+    device_spec: str | None,
+) -> tuple[torch.device, int | None, int | None]:
     """
     Parse device argument specification.
 
@@ -1316,7 +1315,8 @@ def build_task_design_from_args(
         If required parameters are missing or invalid
     """
     import sys
-    from .design import make_fir_design, make_tent_design, convolve_hrf_microtime
+
+    from .design import convolve_hrf_microtime, make_fir_design, make_tent_design
     from .hrf import get_hrf_library, get_spmg1_hrf
 
     if hrf_opt:
@@ -1489,10 +1489,10 @@ def build_task_design_from_args(
 
 def preflight_check(
     input_files: list[str],
-    onset_files: Optional[list[str]] = None,
-    ortvec_files: Optional[list[tuple[str, str]]] = None,
-    hrf_opt_prefix: Optional[str] = None,
-    denoise_prefix: Optional[str] = None,
+    onset_files: list[str] | None = None,
+    ortvec_files: list[tuple[str, str]] | None = None,
+    hrf_opt_prefix: str | None = None,
+    denoise_prefix: str | None = None,
 ) -> None:
     """
     Run pre-flight input checks before slow data loading.
@@ -1565,7 +1565,7 @@ def preflight_check(
             # At least one per-run file exists - warn about missing ones but don't error
             # (empty/missing files are allowed for per-run format)
             if per_run_missing:
-                print(f"  Note: Some per-run denoise files not found (will use no regressors):")
+                print("  Note: Some per-run denoise files not found (will use no regressors):")
                 for name in per_run_missing[:3]:
                     print(f"    {name}")
                 if len(per_run_missing) > 3:

@@ -5,8 +5,6 @@ Handles FIR, assumed HRF, and convolution operations
 
 from __future__ import annotations
 
-from typing import Optional, Union
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,7 +16,7 @@ def convolve_hrf(
     onsets: torch.Tensor,
     hrf: torch.Tensor,
     n_timepoints: int,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Convolve onset vector with HRF using fast FFT convolution
@@ -78,10 +76,10 @@ def convolve_hrf_microtime(
     tr: float = 1.0,
     microtime_dt: float = 0.1,
     microtime_onset: int = 0,
-    run_starts: Optional[list[int]] = None,
-    device: Optional[torch.device] = None,
+    run_starts: list[int] | None = None,
+    device: torch.device | None = None,
     return_single_trials: bool = False,
-) -> Union[torch.Tensor, tuple]:
+) -> torch.Tensor | tuple:
     """
     Convolve onset matrix with HRF using microtime (sub-TR) resolution.
 
@@ -181,8 +179,8 @@ def convolve_hrf_microtime(
     design = torch.zeros(n_timepoints, n_conditions, device=device)
     single_trial_designs = [] if return_single_trials else None
 
-    run_start_bins: Optional[torch.Tensor] = None
-    run_end_bins: Optional[torch.Tensor] = None
+    run_start_bins: torch.Tensor | None = None
+    run_end_bins: torch.Tensor | None = None
     if run_starts is not None:
         if len(run_starts) == 0:
             raise ValueError("run_starts must be non-empty when provided")
@@ -277,7 +275,7 @@ def make_fir_design(
     onsets: torch.Tensor,
     n_lags: int,
     n_timepoints: int,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Create FIR (Finite Impulse Response) design matrix
@@ -455,9 +453,9 @@ def make_tent_design(
     top: float,
     tr: float,
     n_timepoints: int,
-    n_basis: Optional[int] = None,
+    n_basis: int | None = None,
     zero_edges: bool = False,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Create TENT basis function design matrix for non-TR-locked onsets
@@ -616,9 +614,9 @@ def make_csplin_design(
     top: float,
     tr: float,
     n_timepoints: int,
-    n_basis: Optional[int] = None,
+    n_basis: int | None = None,
     zero_edges: bool = False,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Create CSPLIN basis function design matrix for non-TR-locked onsets
@@ -738,7 +736,7 @@ def make_csplin_design(
 
 
 def is_tr_locked(
-    onset_times: Union[list, np.ndarray],
+    onset_times: list | np.ndarray,
     tr: float,
     threshold: float = 0.1,
 ) -> bool:
@@ -788,7 +786,7 @@ def is_tr_locked(
 
 
 def make_singletrialdesign(
-    onsets: torch.Tensor, device: Optional[torch.device] = None
+    onsets: torch.Tensor, device: torch.device | None = None
 ) -> torch.Tensor:
     """
     Create single-trial design matrix (one regressor per trial)
@@ -849,7 +847,7 @@ def make_singletrialdesign(
 
 
 def convolve_design_hrf(
-    design: torch.Tensor, hrf: torch.Tensor, device: Optional[torch.device] = None
+    design: torch.Tensor, hrf: torch.Tensor, device: torch.device | None = None
 ) -> torch.Tensor:
     """
     Convolve an existing design matrix with HRF
@@ -898,18 +896,18 @@ def convolve_design_hrf(
 
 
 def build_glm_design(
-    onsets: Union[torch.Tensor, list[torch.Tensor]],
-    hrf: Optional[torch.Tensor] = None,
-    n_timepoints: Optional[Union[int, list[int]]] = None,
+    onsets: torch.Tensor | list[torch.Tensor],
+    hrf: torch.Tensor | None = None,
+    n_timepoints: int | list[int] | None = None,
     mode: str = "assumed",
     n_fir_lags: int = 30,
     tr: float = 1.0,
     tent_bot: float = 0.0,
     tent_top: float = 15.0,
-    tent_n_basis: Optional[int] = None,
+    tent_n_basis: int | None = None,
     single_trial: bool = False,
-    device: Optional[torch.device] = None,
-) -> Union[torch.Tensor, list[torch.Tensor]]:
+    device: torch.device | None = None,
+) -> torch.Tensor | list[torch.Tensor]:
     """
     Build design matrix for GLM fitting
 
@@ -1038,7 +1036,7 @@ def generate_random_onsets(
     isi_range: tuple = (2, 8),
     tr: float = 1.0,
     alternate_conditions: bool = True,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate random onset times with truncated Poisson ISI distribution
@@ -1124,11 +1122,11 @@ def generate_random_onsets(
 
 
 def extract_hrf_estimates(
-    betas: Union[torch.Tensor, np.ndarray],
+    betas: torch.Tensor | np.ndarray,
     n_conditions: int,
     n_lags: int,
-    brain_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    output_shape: Optional[tuple] = None,
+    brain_mask: torch.Tensor | np.ndarray | None = None,
+    output_shape: tuple | None = None,
 ) -> np.ndarray:
     """
     Extract HRF estimates from GLM betas for FIR/TENT models
@@ -1218,12 +1216,12 @@ def extract_hrf_estimates(
 def save_iresp(
     iresp: np.ndarray,
     output_prefix: str,
-    condition_labels: Optional[list[str]] = None,
+    condition_labels: list[str] | None = None,
     tr: float = 1.0,
     bot: float = 0.0,
-    top: Optional[float] = None,
-    affine: Optional[np.ndarray] = None,
-    reference_img: Optional[str] = None,
+    top: float | None = None,
+    affine: np.ndarray | None = None,
+    reference_img: str | None = None,
 ):
     """
     Save HRF estimates as 4D NIfTI files (AFNI-style iresp)
@@ -1385,7 +1383,7 @@ def make_tps_design(
     tr: float,
     n_timepoints: int,
     force_zero_edges: bool = False,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Create penalized spline (P-spline/TPS) design matrix from onset times
@@ -1486,7 +1484,7 @@ def fit_penalized_glm_cv(
     penalty_matrix: np.ndarray,
     lambda_values: list[float],
     run_boundaries: list[tuple[int, int]],
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = False,
 ) -> tuple[float, np.ndarray]:
     """
@@ -1618,8 +1616,8 @@ def fit_penalized_glm(
     data: torch.Tensor,
     design: torch.Tensor,
     penalty_matrix: np.ndarray,
-    lambda_values: Union[float, np.ndarray],
-    device: Optional[torch.device] = None,
+    lambda_values: float | np.ndarray,
+    device: torch.device | None = None,
     chunk_size: int = 60000,
     verbose: bool = False,
 ) -> torch.Tensor:

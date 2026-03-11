@@ -19,8 +19,6 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.utils import get_device
-
 # ============================================================================
 # Shared simulation helpers
 # ============================================================================
@@ -596,7 +594,7 @@ class TestRidgeRecovery:
             isi_min=2.0, isi_max=7.0, n_events_per_cond=10, noise_scale=0.01
         )
 
-        print(f"\nDiagnostics:")
+        print("\nDiagnostics:")
         print(f"  Data shape: {inp['data'].shape}")
         print(f"  Data mean: {inp['data'].mean():.2f}, std: {inp['data'].std():.2f}")
         print(f"  Data min: {inp['data'].min():.2f}, max: {inp['data'].max():.2f}")
@@ -618,7 +616,7 @@ class TestRidgeRecovery:
             chunk_size=20,
         )
 
-        print(f"\nResults:")
+        print("\nResults:")
         print(f"  In-sample R² > 0: {(results.r2 > 0).float().mean():.1%}")
         print(f"  CV R² > 0: {(results.xval_r2 > 0).float().mean():.1%}")
         print(f"  Median in-sample R²: {results.r2.median():.4f}")

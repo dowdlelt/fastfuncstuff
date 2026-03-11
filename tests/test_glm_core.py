@@ -413,7 +413,6 @@ class TestGLMResultsToSpatial:
 
     def test_to_spatial_3d(self, device):
         """Test reshaping results back to 3D spatial format."""
-        from fastfuncsim.glm_core import GLMResults
         
         torch.manual_seed(42)
         nx, ny, nz = 5, 6, 4
@@ -440,8 +439,9 @@ class TestGLMResultsToSpatial:
 
     def test_to_spatial_no_original_shape_warns(self, device):
         """Test that to_spatial warns when original_shape is None."""
-        from fastfuncsim.glm_core import GLMResults
         import warnings
+
+        from fastfuncsim.glm_core import GLMResults
         
         results = GLMResults()
         results.betas = torch.randn(100, 3)

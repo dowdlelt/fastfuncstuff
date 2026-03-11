@@ -17,8 +17,6 @@ Key Features
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Union
-
 import numpy as np
 import torch
 
@@ -90,24 +88,24 @@ class PCA:
 
     def __init__(
         self,
-        n_components: Optional[Union[int, float, str]] = None,
+        n_components: int | float | str | None = None,
         whiten: bool = False,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ):
         self.n_components = n_components
         self.whiten = whiten
         self.device = device if device is not None else get_device()
 
         # Fitted attributes (set by fit())
-        self.components_: Optional[torch.Tensor] = None
-        self.explained_variance_: Optional[torch.Tensor] = None
-        self.explained_variance_ratio_: Optional[torch.Tensor] = None
-        self.mean_: Optional[torch.Tensor] = None
-        self.n_components_: Optional[int] = None
-        self.n_samples_: Optional[int] = None
-        self.n_features_: Optional[int] = None
+        self.components_: torch.Tensor | None = None
+        self.explained_variance_: torch.Tensor | None = None
+        self.explained_variance_ratio_: torch.Tensor | None = None
+        self.mean_: torch.Tensor | None = None
+        self.n_components_: int | None = None
+        self.n_samples_: int | None = None
+        self.n_features_: int | None = None
 
-    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> PCA:
+    def fit(self, X: np.ndarray | torch.Tensor) -> PCA:
         """
         Fit PCA on data
 
@@ -187,7 +185,7 @@ class PCA:
 
         return self
 
-    def transform(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    def transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Transform data to PC space
 
@@ -216,7 +214,7 @@ class PCA:
 
         return X_transformed
 
-    def fit_transform(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    def fit_transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Fit PCA and transform data
 
@@ -233,7 +231,7 @@ class PCA:
         self.fit(X)
         return self.transform(X)
 
-    def inverse_transform(self, X_transformed: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    def inverse_transform(self, X_transformed: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Transform data back to original space
 
@@ -373,7 +371,7 @@ class PCA:
 
         return torch.cumsum(self.explained_variance_ratio_, dim=0)
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """
         Export PCA parameters to dictionary
 
@@ -397,7 +395,7 @@ class PCA:
         }
 
     @classmethod
-    def from_dict(cls, params: Dict, device: Optional[torch.device] = None) -> PCA:
+    def from_dict(cls, params: dict, device: torch.device | None = None) -> PCA:
         """
         Create PCA object from dictionary
 
@@ -429,10 +427,10 @@ class PCA:
 
 
 def explained_variance_analysis(
-    X: Union[np.ndarray, torch.Tensor],
-    max_components: Optional[int] = None,
-    device: Optional[torch.device] = None,
-) -> Dict:
+    X: np.ndarray | torch.Tensor,
+    max_components: int | None = None,
+    device: torch.device | None = None,
+) -> dict:
     """
     Analyze explained variance across different numbers of components
 

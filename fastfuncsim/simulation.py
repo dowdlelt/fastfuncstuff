@@ -5,7 +5,7 @@ Single and batch simulation modes
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import nibabel as nib
 import numpy as np
@@ -17,16 +17,16 @@ from .utils import get_device, print_device_info, to_tensor
 
 
 def simulate_fmri_run(onsets: torch.Tensor,
-                     betas: Union[torch.Tensor, List[float]],
+                     betas: torch.Tensor | list[float],
                      hrf: torch.Tensor,
                      tr: float,
                      n_timepoints: int,
-                     matrix_size: Tuple[int, int, int] = (100, 100, 10),
+                     matrix_size: tuple[int, int, int] = (100, 100, 10),
                      noise_level: float = 1.0,
                      baseline: float = 100.0,
                      add_scanner_drift: bool = True,
                      drift_amplitude: float = 0.5,
-                     device: Optional[torch.device] = None) -> torch.Tensor:
+                     device: torch.device | None = None) -> torch.Tensor:
     """
     Simulate a single fMRI run
 
@@ -124,15 +124,15 @@ def simulate_fmri_run(onsets: torch.Tensor,
 
 
 def simulate_fmri_experiment(n_runs: int,
-                            onsets: Union[torch.Tensor, List[torch.Tensor]],
-                            betas: Union[torch.Tensor, List[float]],
+                            onsets: torch.Tensor | list[torch.Tensor],
+                            betas: torch.Tensor | list[float],
                             hrf: torch.Tensor,
                             tr: float,
-                            n_timepoints: Union[int, List[int]],
-                            matrix_size: Tuple[int, int, int] = (100, 100, 10),
-                            device: Optional[torch.device] = None,
+                            n_timepoints: int | list[int],
+                            matrix_size: tuple[int, int, int] = (100, 100, 10),
+                            device: torch.device | None = None,
                             verbose: bool = True,
-                            **kwargs) -> List[torch.Tensor]:
+                            **kwargs) -> list[torch.Tensor]:
     """
     Simulate a multi-run fMRI experiment
 
@@ -197,11 +197,11 @@ def simulate_fmri_experiment(n_runs: int,
     return data_list
 
 
-def create_parametric_voxels(matrix_size: Tuple[int, int, int],
+def create_parametric_voxels(matrix_size: tuple[int, int, int],
                             n_conditions: int,
-                            hrf_library: Optional[torch.Tensor] = None,
-                            beta_ranges: Optional[List[Tuple[float, float]]] = None,
-                            device: Optional[torch.device] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                            hrf_library: torch.Tensor | None = None,
+                            beta_ranges: list[tuple[float, float]] | None = None,
+                            device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create spatially organized voxels with varying betas and HRFs
 
@@ -287,9 +287,9 @@ def create_parametric_voxels(matrix_size: Tuple[int, int, int],
 
 
 def simulate_batch_experiments(n_experiments: int,
-                              sim_config: Dict,
-                              device: Optional[torch.device] = None,
-                              verbose: bool = True) -> List[Dict]:
+                              sim_config: dict,
+                              device: torch.device | None = None,
+                              verbose: bool = True) -> list[dict]:
     """
     Simulate multiple experiments in batch (for statistical power analysis, etc.)
 
@@ -344,10 +344,10 @@ def simulate_batch_experiments(n_experiments: int,
     return experiments
 
 
-def write_afni_onset_files(onsets_list: Union[List[torch.Tensor], torch.Tensor],
+def write_afni_onset_files(onsets_list: list[torch.Tensor] | torch.Tensor,
                            tr: float,
                            output_dir: Path,
-                           prefix: str = "onsets") -> List[Path]:
+                           prefix: str = "onsets") -> list[Path]:
     """
     Write AFNI-compatible onset timing files
 
@@ -418,12 +418,12 @@ def write_afni_onset_files(onsets_list: Union[List[torch.Tensor], torch.Tensor],
     return onset_files
 
 
-def write_nifti_files(data_list: List[torch.Tensor],
+def write_nifti_files(data_list: list[torch.Tensor],
                       tr: float,
                       output_dir: Path,
                       prefix: str = "run",
-                      affine: Optional[np.ndarray] = None,
-                      voxel_size: Tuple[float, float, float] = (2.0, 2.0, 2.0)) -> List[Path]:
+                      affine: np.ndarray | None = None,
+                      voxel_size: tuple[float, float, float] = (2.0, 2.0, 2.0)) -> list[Path]:
     """
     Write fMRI data as nii.gz files using nibabel
 
@@ -479,15 +479,15 @@ def write_nifti_files(data_list: List[torch.Tensor],
     return nifti_files
 
 
-def save_simulation_outputs(data_list: List[torch.Tensor],
-                            onsets_list: Union[List[torch.Tensor], torch.Tensor],
+def save_simulation_outputs(data_list: list[torch.Tensor],
+                            onsets_list: list[torch.Tensor] | torch.Tensor,
                             tr: float,
-                            output_dir: Union[str, Path],
+                            output_dir: str | Path,
                             label: str,
-                            metadata: Optional[Dict[str, Any]] = None,
-                            affine: Optional[np.ndarray] = None,
-                            voxel_size: Tuple[float, float, float] = (2.0, 2.0, 2.0),
-                            verbose: bool = True) -> Dict[str, Any]:
+                            metadata: dict[str, Any] | None = None,
+                            affine: np.ndarray | None = None,
+                            voxel_size: tuple[float, float, float] = (2.0, 2.0, 2.0),
+                            verbose: bool = True) -> dict[str, Any]:
     """
     Save all simulation outputs to organized folder structure
 

@@ -1,12 +1,13 @@
 """Debug test for Medium test failure - trace data flow"""
 
-import torch
 import numpy as np
-from fastfuncsim.utils import get_device
-from fastfuncsim.ridge import create_single_trial_design, fit_ridge_single_trial
+import torch
+
 from fastfuncsim.glm_core import construct_polynomial_matrix
 from fastfuncsim.hrf import get_canonical_hrf
+from fastfuncsim.ridge import create_single_trial_design, fit_ridge_single_trial
 from fastfuncsim.simulation import simulate_fmri_run
+from fastfuncsim.utils import get_device
 from fastfuncsim.xval import generate_cv_splits
 
 device = get_device()
@@ -124,6 +125,7 @@ fracs = np.array([0.0, 0.3, 0.7, 1.0])
 # Add some debug output to understand the flow
 import sys
 from io import StringIO
+
 old_stdout = sys.stdout
 sys.stdout = mystdout = StringIO()
 

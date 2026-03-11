@@ -19,20 +19,19 @@ Tests validate CORRECTNESS of metric calculations, not just coverage.
 
 from __future__ import annotations
 
-import pytest
 import numpy as np
+import pytest
 import torch
 
-from fastfuncsim.metrics import (
-    compute_estimation_efficiency,
-    compute_detection_power,
-    compute_conditional_entropy,
-    compute_efficiency_power_tradeoff,
-    evaluate_design,
-    compare_designs,
-)
 from fastfuncsim.hrf import get_canonical_hrf
-
+from fastfuncsim.metrics import (
+    compare_designs,
+    compute_conditional_entropy,
+    compute_detection_power,
+    compute_efficiency_power_tradeoff,
+    compute_estimation_efficiency,
+    evaluate_design,
+)
 
 # =============================================================================
 # REALISTIC fMRI DESIGN PARAMETERS

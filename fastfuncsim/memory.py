@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -109,7 +108,7 @@ class MemoryConfig:
 
 
 # Global configuration instance (singleton pattern)
-_global_config: Optional[MemoryConfig] = None
+_global_config: MemoryConfig | None = None
 
 
 def get_memory_config() -> MemoryConfig:
@@ -195,7 +194,7 @@ DEFAULT_CPU_MEMORY_THRESHOLD_GB = 4.0
 
 def get_available_memory(
     device: torch.device,
-    safety_factor: Optional[float] = None,
+    safety_factor: float | None = None,
 ) -> int:
     """
     Get available memory on the specified device in bytes.
@@ -437,16 +436,16 @@ def dyn_chunk_estimator(
     n_timepoints: int,
     n_task_regressors: int,
     n_nuisance_regressors: int = 0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     operation: str = "glm",
-    cv_strategy: Optional[int | float | str] = None,
+    cv_strategy: int | float | str | None = None,
     n_runs: int = 1,
     max_components: int = 0,
     data_location: str = "auto",
-    streaming_stats: Optional[bool] = None,
-    min_chunk_size: Optional[int] = None,
-    max_chunk_size: Optional[int] = None,
-    safety_factor: Optional[float] = None,
+    streaming_stats: bool | None = None,
+    min_chunk_size: int | None = None,
+    max_chunk_size: int | None = None,
+    safety_factor: float | None = None,
     verbose: bool = False,
 ) -> int:
     """
@@ -700,7 +699,7 @@ def dyn_chunk_estimator(
             )
         print(f"  Device: {device} (data on {data_location})")
         print(f"  Max components: {max_components}" if max_components > 0 else "")
-        print(f"\n  Memory calculation:")
+        print("\n  Memory calculation:")
         print(f"    Bytes per voxel: {bytes_per_voxel:,} bytes")
         print(f"    Available memory: {available_mb:.1f} MB (safety_factor={safety_factor})")
         print(f"    Estimated chunk: {estimated_chunk:,} voxels")
@@ -719,9 +718,9 @@ def estimate_chunk_size(
     n_regressors: int,
     device: torch.device,
     operation: str = "glm",
-    min_chunk_size: Optional[int] = None,
-    max_chunk_size: Optional[int] = None,
-    safety_factor: Optional[float] = None,
+    min_chunk_size: int | None = None,
+    max_chunk_size: int | None = None,
+    safety_factor: float | None = None,
     use_double: bool = False,
     verbose: bool = False,
 ) -> int:
@@ -841,7 +840,7 @@ def estimate_chunk_size(
             if safety_factor
             else (config.gpu_safety_factor if device.type == "cuda" else config.cpu_safety_factor)
         )
-        print(f"\n  Chunk size estimation:")
+        print("\n  Chunk size estimation:")
         print(f"    Operation: {operation}")
         print(f"    Device: {device}")
         print(f"    Per-voxel memory: {bytes_per_voxel:,} bytes")

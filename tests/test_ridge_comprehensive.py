@@ -12,22 +12,19 @@ Uses realistic fMRI simulation to verify:
 - Single-trial estimation recovers known betas
 """
 
+
+import numpy as np
 import pytest
 import torch
-import numpy as np
-from typing import List, Tuple
 
-from fastfuncsim.simulation import simulate_fmri_run
-from fastfuncsim.hrf import get_canonical_hrf
-from fastfuncsim.design import build_glm_design
-from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
-from fastfuncsim.utils import get_device
+from fastfuncsim.glm_core import construct_polynomial_matrix
 from fastfuncsim.ridge import (
     _fit_ridge_multiple_fracs,
     create_single_trial_design,
     fit_ridge_single_trial,
-    RidgeResults,
 )
+from fastfuncsim.simulation import simulate_fmri_run
+from fastfuncsim.utils import get_device
 from fastfuncsim.xval import generate_cv_splits
 
 
@@ -484,7 +481,7 @@ class TestRidgeFullPipeline:
         print(f"  Strong trials mean beta: {estimated_strong:.3f}")
         print(f"  Weak trials mean beta: {estimated_weak:.3f}")
 
-        assert estimated_strong > estimated_weak, f"Ridge should distinguish strong vs weak trials"
+        assert estimated_strong > estimated_weak, "Ridge should distinguish strong vs weak trials"
 
     @pytest.mark.skip(reason="Per-voxel HRF feature not fully implemented in ridge.py")
     def test_ridge_with_per_voxel_hrf(self, device):

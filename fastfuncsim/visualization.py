@@ -17,7 +17,6 @@ Design Philosophy:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,17 +25,17 @@ from matplotlib.gridspec import GridSpec
 
 
 def plot_simulation_deep_dive(
-    data: Union[torch.Tensor, np.ndarray],
-    design: Union[torch.Tensor, np.ndarray],
+    data: torch.Tensor | np.ndarray,
+    design: torch.Tensor | np.ndarray,
     results,  # GLMResults object
-    onsets: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    betas_true: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    hrf_true: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    onsets: torch.Tensor | np.ndarray | None = None,
+    betas_true: torch.Tensor | np.ndarray | None = None,
+    hrf_true: torch.Tensor | np.ndarray | None = None,
     voxel_selection: str = "best",
     n_voxels: int = 4,
     tr: float = 1.0,
     figsize: tuple[int, int] = (20, 12),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ):
     """
     Deep dive visualization of single simulation
@@ -270,9 +269,9 @@ def plot_simulation_deep_dive(
 def plot_batch_summary(
     results_list: list[dict],
     metrics: list[str] | None = None,
-    group_by: Optional[str] = None,
+    group_by: str | None = None,
     figsize: tuple[int, int] = (16, 10),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ):
     """
     Summary visualization for batch simulations
@@ -516,7 +515,7 @@ def plot_parametric_exploration(
     z_var: str = "noise_level",
     metric: str = "r2_mean",
     figsize: tuple[int, int] = (14, 10),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ):
     """
     Visualize parametric exploration across three axes
@@ -625,13 +624,13 @@ def plot_parametric_exploration(
 
 
 def plot_hrf_recovery(
-    hrf_estimated: Union[torch.Tensor, np.ndarray],
-    hrf_true: Union[torch.Tensor, np.ndarray],
+    hrf_estimated: torch.Tensor | np.ndarray,
+    hrf_true: torch.Tensor | np.ndarray,
     tr: float = 1.0,
     voxel_selection: str = "best",
     n_voxels: int = 6,
     figsize: tuple[int, int] = (15, 8),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ):
     """
     Visualize HRF recovery quality from FIR estimation
@@ -821,10 +820,10 @@ def plot_hrf_recovery(
 
 def plot_design_comparison(
     designs: dict[str, np.ndarray],
-    labels: Optional[list[str]] = None,
+    labels: list[str] | None = None,
     tr: float = 1.0,
     figsize: tuple[int, int] = (16, 8),
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
 ):
     """
     Compare multiple design matrices visually
@@ -1008,9 +1007,9 @@ def create_interactive_summary_html(
 
 
 def plot_noise_pool_pca_scree(
-    scree_ratio_per_run: list[Union[np.ndarray, torch.Tensor, list[float]]],
-    variance_threshold: Optional[float] = None,
-    output_path: Optional[str] = None,
+    scree_ratio_per_run: list[np.ndarray | torch.Tensor | list[float]],
+    variance_threshold: float | None = None,
+    output_path: str | None = None,
 ) -> plt.Figure:
     """Plot per-run PCA scree curves from noise-pool data."""
     ratios_np: list[np.ndarray] = []
@@ -1066,20 +1065,20 @@ def plot_noise_pool_pca_scree(
 
 
 def plot_denoising_pcs(
-    noise_pcs_per_run: list[Union[torch.Tensor, np.ndarray]],
+    noise_pcs_per_run: list[torch.Tensor | np.ndarray],
     run_starts: list[int],
-    component_variance_ratio_per_run: Optional[list[Union[torch.Tensor, np.ndarray]]] = None,
-    pc_weights_per_run: Optional[list[np.ndarray]] = None,
-    volume_shape: Optional[tuple[int, int, int]] = None,
-    voxel_mask: Optional[np.ndarray] = None,
-    noise_pool_mask: Optional[np.ndarray] = None,
+    component_variance_ratio_per_run: list[torch.Tensor | np.ndarray] | None = None,
+    pc_weights_per_run: list[np.ndarray] | None = None,
+    volume_shape: tuple[int, int, int] | None = None,
+    voxel_mask: np.ndarray | None = None,
+    noise_pool_mask: np.ndarray | None = None,
     n_pcs_to_show: int = 5,
     n_slices: int = 5,
     slice_axis: str = "x",
     tr: float = 2.0,
-    optimal_n_pcs: Optional[int] = None,
-    output_prefix: Optional[str] = None,
-    voxel_sizes: Optional[tuple[float, float, float]] = None,
+    optimal_n_pcs: int | None = None,
+    output_prefix: str | None = None,
+    voxel_sizes: tuple[float, float, float] | None = None,
     return_figs: bool = True,
 ) -> list[plt.Figure]:
     """
@@ -1433,11 +1432,11 @@ def plot_denoising_summary(
     xval_r2_by_n_components: np.ndarray,
     xval_r2_per_fold: np.ndarray,
     optimal_n_components: int,
-    initial_r2_distribution: Optional[np.ndarray] = None,
+    initial_r2_distribution: np.ndarray | None = None,
     r2_threshold: float = 0.05,
-    n_noise_voxels: Optional[int] = None,
-    n_criteria_voxels: Optional[int] = None,
-    output_path: Optional[str] = None,
+    n_noise_voxels: int | None = None,
+    n_criteria_voxels: int | None = None,
+    output_path: str | None = None,
     figsize: tuple[int, int] = (14, 10),
 ) -> plt.Figure:
     """

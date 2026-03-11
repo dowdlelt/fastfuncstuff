@@ -23,8 +23,9 @@ References:
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -35,7 +36,7 @@ from .xval import compute_r2_metric
 
 
 def _debug_memory_snapshot(
-    label: str, device: torch.device, tensors: Optional[Dict[str, torch.Tensor]] = None
+    label: str, device: torch.device, tensors: dict[str, torch.Tensor] | None = None
 ) -> None:
     """Print detailed memory snapshot for debugging.
 
@@ -114,7 +115,7 @@ def check_cuda_memory_before_batch(
     verbose: bool = False,
     use_qr: bool = False,
     has_glts: bool = True,
-    persistent_tensors: Optional[dict] = None,  # NEW: Account for data already on GPU
+    persistent_tensors: dict | None = None,  # NEW: Account for data already on GPU
     use_double: bool = False,
 ) -> int:
     """
@@ -611,98 +612,98 @@ class ARMA11Results:
     """Container for ARMA(1,1) GLM results"""
 
     def __init__(self):
-        self.betas: Optional[torch.Tensor] = (
+        self.betas: torch.Tensor | None = (
             None  # (n_voxels, n_regressors) GLS parameter estimates
         )
-        self.tstats: Optional[torch.Tensor] = (
+        self.tstats: torch.Tensor | None = (
             None  # (n_voxels, n_regressors) t-statistics (corrected)
         )
-        self.r2: Optional[torch.Tensor] = None  # (n_voxels,) R² values (total model)
-        self.r2_partial: Optional[torch.Tensor] = (
+        self.r2: torch.Tensor | None = None  # (n_voxels,) R² values (total model)
+        self.r2_partial: torch.Tensor | None = (
             None  # (n_voxels, n_task_regressors) partial R² per TASK condition
         )
-        self.r2_partial_nuisance: Optional[torch.Tensor] = (
+        self.r2_partial_nuisance: torch.Tensor | None = (
             None  # (n_voxels, n_nuisance_regressors) partial R² per NUISANCE regressor
         )
-        self.r2_semipartial: Optional[torch.Tensor] = (
+        self.r2_semipartial: torch.Tensor | None = (
             None  # (n_voxels, n_task_regressors) semi-partial R² per TASK condition
         )
-        self.r2_semipartial_nuisance: Optional[torch.Tensor] = (
+        self.r2_semipartial_nuisance: torch.Tensor | None = (
             None  # (n_voxels, n_nuisance_regressors) semi-partial R² per NUISANCE regressor
         )
-        self.arma_params: Optional[torch.Tensor] = (
+        self.arma_params: torch.Tensor | None = (
             None  # (n_voxels, 2) - (a, b) per voxel
         )
-        self.arma_lambda: Optional[torch.Tensor] = (
+        self.arma_lambda: torch.Tensor | None = (
             None  # (n_voxels,) - lag-1 correlation
         )
-        self.reml_likelihood: Optional[torch.Tensor] = (
+        self.reml_likelihood: torch.Tensor | None = (
             None  # (n_voxels,) - optimized REML log-likelihood
         )
-        self.residuals: Optional[torch.Tensor] = (
+        self.residuals: torch.Tensor | None = (
             None  # (n_voxels, n_timepoints) - residuals in original space
         )
-        self.predicted: Optional[torch.Tensor] = (
+        self.predicted: torch.Tensor | None = (
             None  # (n_voxels, n_timepoints) - predictions (original space)
         )
-        self.residuals_whitened: Optional[torch.Tensor] = (
+        self.residuals_whitened: torch.Tensor | None = (
             None  # (n_voxels, n_timepoints) - residuals after whitening
         )
-        self.sigma2: Optional[torch.Tensor] = (
+        self.sigma2: torch.Tensor | None = (
             None  # (n_voxels,) - noise variance estimates
         )
-        self.var_betas: Optional[torch.Tensor] = (
+        self.var_betas: torch.Tensor | None = (
             None  # (n_voxels, n_regressors, n_regressors) - covariance
         )
-        self.original_shape: Optional[Tuple[int, int, int]] = (
+        self.original_shape: tuple[int, int, int] | None = (
             None  # Original spatial dimensions
         )
-        self.fstats: Optional[torch.Tensor] = (
+        self.fstats: torch.Tensor | None = (
             None  # (n_voxels,) - omnibus F-statistic across regressors
         )
-        self.dof: Optional[int] = (
+        self.dof: int | None = (
             None  # Degrees of freedom (n_timepoints - n_regressors)
         )
-        self.tr: Optional[float] = None  # Repetition time
-        self.voxel_mask: Optional[torch.Tensor] = (
+        self.tr: float | None = None  # Repetition time
+        self.voxel_mask: torch.Tensor | None = (
             None  # Optional boolean mask for sparse analyses
         )
-        self.full_shape: Optional[Tuple[int, int, int]] = (
+        self.full_shape: tuple[int, int, int] | None = (
             None  # Original spatial shape before masking
         )
 
         # Design filtering metadata (tracks what was actually fitted)
-        self.fitted_column_indices: Optional[List[int]] = (
+        self.fitted_column_indices: list[int] | None = (
             None  # Indices of columns that were fitted (None = all columns)
         )
-        self.n_regressors_full: Optional[int] = (
+        self.n_regressors_full: int | None = (
             None  # Total columns in original design before filtering
         )
 
         # GLT contrast results (computed in-loop, not post-hoc)
-        self.contrast_labels: Optional[List[str]] = None  # List of contrast names
-        self.contrast_betas: Optional[torch.Tensor] = (
+        self.contrast_labels: list[str] | None = None  # List of contrast names
+        self.contrast_betas: torch.Tensor | None = (
             None  # (n_voxels, n_contrasts) - c'β estimates
         )
-        self.contrast_tstats: Optional[torch.Tensor] = (
+        self.contrast_tstats: torch.Tensor | None = (
             None  # (n_voxels, n_contrasts) - t-statistics
         )
-        self.contrast_fstats: Optional[torch.Tensor] = (
+        self.contrast_fstats: torch.Tensor | None = (
             None  # (n_voxels, n_contrasts) - F-statistics (for multi-row GLTs)
         )
-        self.contrast_r2_partial: Optional[torch.Tensor] = (
+        self.contrast_r2_partial: torch.Tensor | None = (
             None  # (n_voxels, n_contrasts) - partial R² for each contrast
         )
-        self.contrast_r2_semipartial: Optional[torch.Tensor] = (
+        self.contrast_r2_semipartial: torch.Tensor | None = (
             None  # (n_voxels, n_contrasts) - semi-partial R² for each contrast
         )
-        self.affine: Optional[np.ndarray] = None  # Spatial affine if available
-        self.ols_results: Optional[Any] = None  # Optional GLMResults for OLS comparison
+        self.affine: np.ndarray | None = None  # Spatial affine if available
+        self.ols_results: Any | None = None  # Optional GLMResults for OLS comparison
 
 
 def _compute_arma11_lambda(
-    a: Union[float, torch.Tensor], b: Union[float, torch.Tensor]
-) -> Union[float, torch.Tensor]:
+    a: float | torch.Tensor, b: float | torch.Tensor
+) -> float | torch.Tensor:
     """
     Compute ARMA(1,1) lag-1 correlation (lambda) - SINGLE SOURCE OF TRUTH
 
@@ -739,7 +740,7 @@ def _compute_arma11_lambda(
 
 def build_arma11_covariance(
     a: float, b: float, n: int, device: torch.device, dtype: torch.dtype = torch.float32
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """
     Build ARMA(1,1) covariance matrix (Toeplitz structure)
 
@@ -817,7 +818,7 @@ def build_arma11_covariance_batch(
     n: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
-) -> Tuple[torch.Tensor, torch.Tensor, list]:
+) -> tuple[torch.Tensor, torch.Tensor, list]:
     """
     Build ALL ARMA(1,1) covariance matrices at once (VECTORIZED!)
 
@@ -1043,10 +1044,10 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
 def reml_grid_search(
     X: torch.Tensor,
     Y: torch.Tensor,
-    a_grid: Optional[torch.Tensor] = None,
-    b_grid: Optional[torch.Tensor] = None,
-    device: Optional[torch.device] = None,
-) -> Tuple[float, float, float]:
+    a_grid: torch.Tensor | None = None,
+    b_grid: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> tuple[float, float, float]:
     """
     Find optimal ARMA(1,1) parameters via REML grid search
 
@@ -1627,7 +1628,7 @@ def _cpu_hierarchical_reml_search(
     b_grid: torch.Tensor,
     precomputed: dict,
     dtype: torch.dtype = torch.float32,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     CPU-OPTIMIZED hierarchical REML grid search with per-voxel early stopping.
 
@@ -1787,7 +1788,7 @@ def _cpu_hierarchical_reml_search(
 def _evaluate_single_param(
     X: torch.Tensor,
     Y_voxel: torch.Tensor,
-    param_key: Tuple[float, float],
+    param_key: tuple[float, float],
     precomputed: dict,
     n_timepoints: int,
     n_regressors: int,
@@ -1833,13 +1834,13 @@ def _evaluate_single_param(
 def batch_reml_grid_search(
     X: torch.Tensor,
     Y_batch: torch.Tensor,
-    a_grid: Optional[torch.Tensor] = None,
-    b_grid: Optional[torch.Tensor] = None,
-    device: Optional[torch.device] = None,
-    precomputed: Optional[dict] = None,
+    a_grid: torch.Tensor | None = None,
+    b_grid: torch.Tensor | None = None,
+    device: torch.device | None = None,
+    precomputed: dict | None = None,
     dtype: torch.dtype = torch.float32,
     enable_early_stopping: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Device-adaptive REML grid search with optimal strategy per device.
 
@@ -2185,11 +2186,11 @@ def batch_reml_grid_search(
 def search_voxels_precomputed_grid(
     X: torch.Tensor,
     Y_batch: torch.Tensor,
-    precomputed_grid: Dict,
+    precomputed_grid: dict,
     device: torch.device,
     verbose: bool = False,
     enable_timing: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Search for optimal ARMA parameters using a precomputed grid.
 
@@ -2310,7 +2311,7 @@ def search_voxels_precomputed_grid(
 
 def prewhiten_with_arma11(
     X: torch.Tensor, Y: torch.Tensor, a: float, b: float
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Prewhiten design and data using ARMA(1,1) covariance
 
@@ -2589,7 +2590,7 @@ def reml_grid_search_batched(
     verbose: bool = False,
     dtype: torch.dtype = torch.float32,
     grid_chunk_size: int = 1,
-    voxel_batch_size: Optional[int] = None,
+    voxel_batch_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     REML grid search with adaptive batching (memory-efficient).
@@ -2859,13 +2860,13 @@ def reml_grid_search_batched(
 
 
 def fit_glm_arma11(
-    data: Union[torch.Tensor, np.ndarray],
-    design: Union[torch.Tensor, np.ndarray],
+    data: torch.Tensor | np.ndarray,
+    design: torch.Tensor | np.ndarray,
     tr: float,
-    a_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    b_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    a_grid: torch.Tensor | np.ndarray | None = None,
+    b_grid: torch.Tensor | np.ndarray | None = None,
     estimate_per_voxel: bool = True,
-    batch_size: Optional[int] = None,
+    batch_size: int | None = None,
     want_residuals: bool = False,
     want_predicted: bool = False,
     want_r2_partial: bool = False,
@@ -2873,20 +2874,20 @@ def fit_glm_arma11(
     want_r2_semipartial: bool = False,
     r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
     want_ols: bool = False,
-    ols_write_callback: Optional[Callable] = None,
-    precomputed_arma_params: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    device: Optional[torch.device] = None,
+    ols_write_callback: Callable | None = None,
+    precomputed_arma_params: torch.Tensor | np.ndarray | None = None,
+    device: torch.device | None = None,
     verbose: bool = True,
     cholesky_on_cpu: bool = True,
     use_double: bool = False,
     use_qr: bool = False,
     debug_memory: bool = False,
     enable_quick_estimate: bool = False,
-    glt_labels: Optional[List[str]] = None,
-    glt_matrices: Optional[List[np.ndarray]] = None,
-    task_indices: Optional[List[int]] = None,
-    use_grid_batching: Optional[bool] = None,
-    spatial_metadata: Optional[dict] = None,
+    glt_labels: list[str] | None = None,
+    glt_matrices: list[np.ndarray] | None = None,
+    task_indices: list[int] | None = None,
+    use_grid_batching: bool | None = None,
+    spatial_metadata: dict | None = None,
     legacy_contrasts: bool = False,
 ) -> ARMA11Results:
     """
@@ -4900,11 +4901,11 @@ def fit_glm_arma11(
 
 
 def compare_ols_vs_arma11(
-    data: Union[torch.Tensor, np.ndarray],
-    design: Union[torch.Tensor, np.ndarray],
+    data: torch.Tensor | np.ndarray,
+    design: torch.Tensor | np.ndarray,
     tr: float,
-    device: Optional[torch.device] = None,
-) -> Dict:
+    device: torch.device | None = None,
+) -> dict:
     """
     Compare OLS vs ARMA(1,1) GLM results
 
@@ -4982,7 +4983,7 @@ def compare_ols_vs_arma11(
 
 
 def compute_ljung_box_statistic(
-    residuals: Union[torch.Tensor, np.ndarray], max_lag: int = 30
+    residuals: torch.Tensor | np.ndarray, max_lag: int = 30
 ) -> np.ndarray:
     """
     Compute Ljung-Box statistic for residual autocorrelation
@@ -5045,10 +5046,10 @@ def compute_ljung_box_statistic(
 
 def save_arma_rvar(
     results: ARMA11Results,
-    output_path: Union[str, Path],
-    volume_shape: Optional[Tuple[int, int, int]] = None,
-    voxel_mask: Optional[np.ndarray] = None,
-    affine: Optional[np.ndarray] = None,
+    output_path: str | Path,
+    volume_shape: tuple[int, int, int] | None = None,
+    voxel_mask: np.ndarray | None = None,
+    affine: np.ndarray | None = None,
     max_lag: int = 30,
 ) -> Path:
     """
@@ -5237,8 +5238,8 @@ def save_arma_rvar(
 
 
 def load_arma_params(
-    filepath: Union[str, Path],
-    voxel_mask: Optional[np.ndarray] = None,
+    filepath: str | Path,
+    voxel_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Load precomputed ARMA(1,1) parameters from -Rvar NIfTI file

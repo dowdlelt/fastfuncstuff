@@ -13,10 +13,10 @@ Test cases:
 6. Multiple runs (4 runs): Missing events across subsets of runs
 """
 
+
 import numpy as np
 import pytest
 import torch
-from typing import Tuple, List
 
 from fastfuncsim.xval import compute_xval_r2, generate_cv_splits
 
@@ -28,7 +28,7 @@ def create_true_betas(
     stim_snr: float = 2.0,
     nuisance_snr: float = 1.0,
     seed: int = 42,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Create true beta values that will be shared across runs.
 
@@ -55,7 +55,7 @@ def create_synthetic_fmri_data(
     true_nuisance_betas: torch.Tensor,
     noise_std: float = 1.0,
     seed: int = 42,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create synthetic fMRI data with known structure using provided true betas.
 
@@ -114,8 +114,8 @@ def create_synthetic_fmri_data(
 
 def zero_out_events(
     stim_design: torch.Tensor,
-    event_indices: List[int],
-    timepoint_ranges: List[Tuple[int, int]],
+    event_indices: list[int],
+    timepoint_ranges: list[tuple[int, int]],
 ) -> torch.Tensor:
     """
     Zero out specific events in specific timepoint ranges.
@@ -370,7 +370,7 @@ def test_xval_test_missing_events():
 
     # Nuisance strategy should perform better (projects out unpredictable event)
     # Zero strategy has beta for missing event which adds unexplained variance
-    print(f"\nComparison:")
+    print("\nComparison:")
     print(f"  Nuisance improvement: {results_by_strategy['nuisance'] - results_by_strategy['zero']:.4f}")
 
     # Both should be reasonable

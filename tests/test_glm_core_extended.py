@@ -13,8 +13,8 @@ import pytest
 import torch
 
 from fastfuncsim.glm_core import (
-    fit_glm,
     construct_polynomial_matrix,
+    fit_glm,
     orthogonalize_design,
     percent_bold_change,
 )

@@ -11,8 +11,9 @@ Tests cover:
 
 import pytest
 import torch
-from fastfuncsim.simulation import simulate_fmri_run, simulate_fmri_experiment
+
 from fastfuncsim.hrf import get_canonical_hrf
+from fastfuncsim.simulation import simulate_fmri_experiment, simulate_fmri_run
 from fastfuncsim.utils import get_device
 
 
@@ -588,8 +589,9 @@ class TestSimulationFileWriting:
     
     def test_write_nifti_files(self, device, tmp_path):
         """Test NIfTI file writing."""
-        from fastfuncsim.simulation import write_nifti_files
         import nibabel as nib
+
+        from fastfuncsim.simulation import write_nifti_files
         
         # Create mock data
         data1 = torch.randn(10, 10, 5, 50)
@@ -611,9 +613,10 @@ class TestSimulationFileWriting:
     
     def test_write_nifti_custom_affine(self, device, tmp_path):
         """Test NIfTI file writing with custom affine."""
-        from fastfuncsim.simulation import write_nifti_files
         import nibabel as nib
         import numpy as np
+
+        from fastfuncsim.simulation import write_nifti_files
         
         data = torch.randn(5, 5, 3, 20)
         

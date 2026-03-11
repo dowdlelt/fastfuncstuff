@@ -18,7 +18,6 @@ from __future__ import annotations
 import math
 import sys
 from dataclasses import dataclass
-from functools import partial
 
 import numpy as np
 import torch
@@ -928,7 +927,7 @@ def _refine_progressive(
     # --- Powell polish (single pass, tighter convergence) ---
     if config.powell_maxfev > 0:
         if verb >= 1:
-            print(f"  Powell polish (full resolution):")
+            print("  Powell polish (full resolution):")
 
         best_params, cost = _refine_powell(
             base, source, weight, best_params, config, bounds, device,

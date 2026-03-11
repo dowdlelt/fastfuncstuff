@@ -1,11 +1,11 @@
 
 import numpy as np
 import torch
-import pytest
+from scipy.stats import pearsonr
+
 from fastfuncsim.ica import ica_stability_analysis, select_n_components_by_stability
 from fastfuncsim.icasso import icasso
-from scipy.stats import pearsonr
-from fastfuncsim.utils import get_device
+
 
 def check_sign_flip_correlation(a, b):
     """

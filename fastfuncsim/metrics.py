@@ -17,8 +17,6 @@ NeuroImage, 21(1), 387-400.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Union
-
 import numpy as np
 import torch
 
@@ -28,7 +26,7 @@ def compute_design_matrix_for_condition(
     condition_idx: int,
     n_timepoints: int,
     mode: str = 'onoff',
-    device: Optional[torch.device] = None
+    device: torch.device | None = None
 ) -> torch.Tensor:
     """
     Extract design matrix for a single condition
@@ -67,13 +65,13 @@ def compute_design_matrix_for_condition(
 
 
 def compute_estimation_efficiency(
-    design: Union[torch.Tensor, np.ndarray],
+    design: torch.Tensor | np.ndarray,
     n_conditions: int,
     hrf_length: int,
     tr: float = 1.0,
     normalize: bool = True,
-    device: Optional[torch.device] = None
-) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    device: torch.device | None = None
+) -> torch.Tensor | dict[str, torch.Tensor]:
     """
     Compute estimation efficiency for HRF shape estimation
 
@@ -212,14 +210,14 @@ def compute_estimation_efficiency(
 
 
 def compute_detection_power(
-    design: Union[torch.Tensor, np.ndarray],
-    hrf_assumed: Union[torch.Tensor, np.ndarray],
+    design: torch.Tensor | np.ndarray,
+    hrf_assumed: torch.Tensor | np.ndarray,
     n_conditions: int,
     effect_size: float = 1.0,
     noise_std: float = 1.0,
     tr: float = 1.0,
-    device: Optional[torch.device] = None
-) -> Dict[str, Union[torch.Tensor, float]]:
+    device: torch.device | None = None
+) -> dict[str, torch.Tensor | float]:
     """
     Compute detection power for activation detection
 
@@ -337,11 +335,11 @@ def compute_detection_power(
 
 
 def compute_conditional_entropy(
-    onsets: Union[torch.Tensor, np.ndarray],
+    onsets: torch.Tensor | np.ndarray,
     n_conditions: int,
     tr: float = 1.0,
-    device: Optional[torch.device] = None
-) -> Dict[str, float]:
+    device: torch.device | None = None
+) -> dict[str, float]:
     """
     Compute conditional entropy (randomness) of design
 
@@ -460,10 +458,10 @@ def compute_conditional_entropy(
 def compute_efficiency_power_tradeoff(
     hrf_length: int,
     n_conditions: int = 1,
-    alpha_range: Tuple[float, float] = (0.0, 1.0),
+    alpha_range: tuple[float, float] = (0.0, 1.0),
     n_points: int = 100,
-    device: Optional[torch.device] = None
-) -> Dict[str, np.ndarray]:
+    device: torch.device | None = None
+) -> dict[str, np.ndarray]:
     """
     Compute theoretical efficiency-power trade-off curve
 
@@ -542,14 +540,14 @@ def compute_efficiency_power_tradeoff(
 
 
 def evaluate_design(
-    design: Union[torch.Tensor, np.ndarray],
-    hrf_assumed: Union[torch.Tensor, np.ndarray],
+    design: torch.Tensor | np.ndarray,
+    hrf_assumed: torch.Tensor | np.ndarray,
     n_conditions: int,
     tr: float = 1.0,
     effect_size: float = 1.0,
     noise_std: float = 1.0,
-    device: Optional[torch.device] = None
-) -> Dict[str, any]:
+    device: torch.device | None = None
+) -> dict[str, any]:
     """
     Complete design evaluation: efficiency + power + entropy
 
@@ -627,14 +625,14 @@ def evaluate_design(
 
 
 def compare_designs(
-    designs_dict: Dict[str, Union[torch.Tensor, np.ndarray]],
-    hrf_assumed: Union[torch.Tensor, np.ndarray],
+    designs_dict: dict[str, torch.Tensor | np.ndarray],
+    hrf_assumed: torch.Tensor | np.ndarray,
     n_conditions: int,
     tr: float = 1.0,
     effect_size: float = 1.0,
     noise_std: float = 1.0,
-    device: Optional[torch.device] = None
-) -> Dict[str, Dict]:
+    device: torch.device | None = None
+) -> dict[str, dict]:
     """
     Compare multiple designs on efficiency, power, entropy
 

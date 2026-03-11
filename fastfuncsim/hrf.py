@@ -13,7 +13,6 @@ Both files are at 0.1s temporal resolution and must be:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -58,7 +57,7 @@ def _resample_hrf(
     hrf: np.ndarray,
     source_dt: float,
     target_dt: float,
-    target_duration: Optional[float] = None,
+    target_duration: float | None = None,
 ) -> np.ndarray:
     """
     Resample HRF from source to target temporal resolution.
@@ -130,7 +129,7 @@ def load_canonical_hrf_library(
     microtime_dt: float = 0.1,
     hrf_duration: float = 32.0,
     stim_duration: float = 0.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Load the pre-computed canonical HRF library from file.
@@ -223,7 +222,7 @@ def load_canonical_hrf_basic(
     microtime_dt: float = 0.1,
     hrf_duration: float = 32.0,
     stim_duration: float = 0.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Load the single canonical (basic) HRF from file.
@@ -293,7 +292,7 @@ def get_canonical_hrf(
     stim_duration: float,
     tr: float,
     duration: float = 32.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate canonical double-gamma HRF (SPM-style)
@@ -360,7 +359,7 @@ def get_spmg1_hrf(
     stim_duration: float = 0.0,
     hrf_duration: float = 32.0,
     normalize_peak: bool = True,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate AFNI's SPMG1 canonical HRF.
@@ -461,7 +460,7 @@ def get_canonical_hrf_library(
     stim_duration: float,
     tr: float,
     n_hrfs: int = 20,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate library of canonical HRFs with parameter variations
@@ -542,7 +541,7 @@ def pighs_halfcos(
     c2: float,
     duration: float = 32.0,
     sample_rate: float = 0.05,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate HRF using half-cosine segments (PIGHS method).
@@ -628,16 +627,16 @@ flobs_halfcos = pighs_halfcos
 
 def create_pighs_library(
     n_hrfs: int = 20,
-    peak_time_range: Tuple[float, float] = (3, 10),
-    rise_fraction_range: Tuple[float, float] = (0.3, 0.7),
-    fall_time_range: Tuple[float, float] = (3, 10),
-    recovery_time_range: Tuple[float, float] = (3, 12),
-    undershoot_range: Tuple[float, float] = (0, 0.35),
+    peak_time_range: tuple[float, float] = (3, 10),
+    rise_fraction_range: tuple[float, float] = (0.3, 0.7),
+    fall_time_range: tuple[float, float] = (3, 10),
+    recovery_time_range: tuple[float, float] = (3, 12),
+    undershoot_range: tuple[float, float] = (0, 0.35),
     duration: float = 32.0,
     microtime_dt: float = 0.1,
     stim_duration: float = 0.0,
-    device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, Dict]:
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, dict]:
     """
     Create HRF library using PIGHS (Parametric Individually Generated HRFs).
 
@@ -792,13 +791,13 @@ def create_pighs_library(
 # Backwards compatibility alias
 def create_flobs_library(
     n_hrfs: int = 20,
-    m1_range: Tuple[float, float] = (0, 2),
-    m2_range: Tuple[float, float] = (3, 8),
-    m3_range: Tuple[float, float] = (3, 10),
-    m4_range: Tuple[float, float] = (3, 12),
-    c2_range: Tuple[float, float] = (0, 0.35),
+    m1_range: tuple[float, float] = (0, 2),
+    m2_range: tuple[float, float] = (3, 8),
+    m3_range: tuple[float, float] = (3, 10),
+    m4_range: tuple[float, float] = (3, 12),
+    c2_range: tuple[float, float] = (0, 0.35),
     **kwargs,
-) -> Tuple[torch.Tensor, Dict]:
+) -> tuple[torch.Tensor, dict]:
     """Deprecated: Use create_pighs_library instead."""
     # Convert old m1/m2 ranges to new peak_time/rise_fraction
     peak_time_range = (m1_range[0] + m2_range[0], m1_range[1] + m2_range[1])
@@ -818,7 +817,7 @@ def get_hrf_library(
     microtime_dt: float = 0.1,
     n_hrfs: int = 20,
     hrf_duration: float = 32.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -932,7 +931,7 @@ def get_spm_canonical_hrf(
     u_dispersion: float = 1.0,
     ratio: float = 0.167,
     onset: float = 0.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate SPM canonical HRF as difference of two gamma functions.
@@ -1010,7 +1009,7 @@ def get_spm_canonical_hrf(
 def get_spm_time_derivative(
     microtime_dt: float = 0.1,
     hrf_duration: float = 32.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate temporal derivative of SPM canonical HRF.
@@ -1068,7 +1067,7 @@ def get_spm_time_derivative(
 def get_spm_dispersion_derivative(
     microtime_dt: float = 0.1,
     hrf_duration: float = 32.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate dispersion derivative of SPM canonical HRF.
@@ -1128,7 +1127,7 @@ def get_spm_hrf_with_derivatives(
     microtime_dt: float = 0.1,
     hrf_duration: float = 32.0,
     n_basis: int = 1,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Generate SPM canonical HRF with derivatives.

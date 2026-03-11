@@ -7,20 +7,20 @@ Test layers:
 3. Large/E2E: Full pipeline tests with ground truth verification
 """
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
 
-from fastfuncsim.utils import get_device
 from fastfuncsim.denoise_combinatorial import (
-    generate_all_pc_combinations,
-    extract_pcs_single_run_with_variance,
-    evaluate_all_combinations_for_run,
-    select_optimal_combination,
-    fit_combinatorial_denoising,
     CombinatorialDenoiseResults,
     CombinatorialDenoiseRunResult,
+    evaluate_all_combinations_for_run,
+    extract_pcs_single_run_with_variance,
+    fit_combinatorial_denoising,
+    generate_all_pc_combinations,
+    select_optimal_combination,
 )
+from fastfuncsim.utils import get_device
 
 
 @pytest.fixture

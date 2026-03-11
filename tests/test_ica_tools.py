@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.glm_core import construct_polynomial_matrix
 from fastfuncsim.ica_tools import (
     apply_high_pass_fft,
     apply_melodic_voxel_varnorm,

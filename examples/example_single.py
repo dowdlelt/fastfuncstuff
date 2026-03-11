@@ -3,9 +3,11 @@ Example: Single Interactive Simulation
 Demonstrates fast interactive workflow for exploring fMRI simulations
 """
 
-import torch
 import matplotlib.pyplot as plt
+import torch
+
 import fastfuncsim as ffs
+
 
 def main():
     print("=" * 60)
@@ -27,7 +29,7 @@ def main():
     # Small test size for interactive speed
     matrix_size = (50, 50, 5)  # 12,500 voxels
 
-    print(f"\nExperiment Setup:")
+    print("\nExperiment Setup:")
     print(f"  TR: {tr}s")
     print(f"  Duration: {total_duration_s}s ({n_timepoints} TRs)")
     print(f"  Conditions: {n_conditions}")
@@ -113,7 +115,7 @@ def main():
         verbose=True
     )
 
-    print(f"\n   Results:")
+    print("\n   Results:")
     print(f"   Mean R²: {results_assumed.r2.mean().item():.3f}")
     print(f"   Median R²: {results_assumed.r2.median().item():.3f}")
     print(f"   Max R²: {results_assumed.r2.max().item():.3f}")
@@ -133,7 +135,7 @@ def main():
         verbose=True
     )
 
-    print(f"\n   Results:")
+    print("\n   Results:")
     print(f"   Mean R²: {results_fir.r2.mean().item():.3f}")
     print(f"   Betas shape: {results_fir.betas.shape}")
 

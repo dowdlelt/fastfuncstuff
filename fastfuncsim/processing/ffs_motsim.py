@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 
@@ -257,7 +256,7 @@ def _run_backward_sim(
     Returns:
         (nt, nz, ny, nx) backward simulation.
     """
-    from .ffs_moco import moco, MocoConfig
+    from .ffs_moco import MocoConfig, moco
 
     # moco's internal resampler doesn't support "linear" — use "cubic" as minimum
     moco_interp = interp if interp != "linear" else "cubic"
@@ -337,7 +336,7 @@ def _save_1d(pcs: Tensor, var_explained: Tensor, path: str,
     """Write PCs as AFNI-style .1D file."""
     n_pcs = pcs.shape[1]
     with open(path, "w") as f:
-        f.write(f"# MotSim regressors (Patriat et al. 2017, PMC5533292)\n")
+        f.write("# MotSim regressors (Patriat et al. 2017, PMC5533292)\n")
         f.write(f"# Variant: {variant}, {n_vols} volumes, {n_pcs} PCs\n")
         f.write(f"# Variance explained: "
                 f"{' '.join(f'{v*100:.2f}%' for v in var_explained.tolist())}\n")

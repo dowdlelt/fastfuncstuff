@@ -14,7 +14,7 @@ Key Features
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union, cast
+from typing import cast
 
 import numpy as np
 import torch
@@ -83,14 +83,14 @@ class FastICA:
 
     def __init__(
         self,
-        n_components: Optional[int] = None,
-        pca_components: Optional[Union[int, float, str]] = 0.85,
+        n_components: int | None = None,
+        pca_components: int | float | str | None = 0.85,
         max_iter: int = 200,
         tol: float = 1e-4,
         fun: str = 'logcosh',
-        random_state: Optional[int] = None,
+        random_state: int | None = None,
         whiten: bool = True,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ):
         self.n_components = n_components
         self.pca_components = pca_components
@@ -108,7 +108,7 @@ class FastICA:
         self.mean_ = None
         self.n_iter_ = None
 
-    def fit(self, X: Union[np.ndarray, torch.Tensor]) -> FastICA:
+    def fit(self, X: np.ndarray | torch.Tensor) -> FastICA:
         """
         Fit ICA on data
 
@@ -189,7 +189,7 @@ class FastICA:
 
         return self
 
-    def transform(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    def transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Transform data to ICA component space (get timeseries)
 
@@ -219,7 +219,7 @@ class FastICA:
 
         return S
 
-    def fit_transform(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    def fit_transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Fit ICA and return component timeseries
 
@@ -236,7 +236,7 @@ class FastICA:
         self.fit(X)
         return self.mixing_
 
-    def inverse_transform(self, S: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    def inverse_transform(self, S: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Reconstruct data from ICA components
 
@@ -265,8 +265,8 @@ class FastICA:
         self,
         X: torch.Tensor,
         n_components: int,
-        w_init: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, int]:
+        w_init: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, int]:
         """
         Core FastICA algorithm (Symmectric / Parallel implementation)
 
@@ -422,8 +422,8 @@ class FastICA:
 
     def compute_variance_explained(
         self,
-        X: Union[np.ndarray, torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        X: np.ndarray | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute variance explained by each ICA component
 
@@ -470,7 +470,7 @@ class FastICA:
 
         return variance_explained, variance_ratio
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Export ICA parameters to dictionary"""
         if self.components_ is None:
             raise RuntimeError("ICA must be fitted first")
@@ -485,14 +485,14 @@ class FastICA:
 
 
 def ica_stability_analysis(
-    X: Union[np.ndarray, torch.Tensor],
+    X: np.ndarray | torch.Tensor,
     n_components: int,
-    pca_components: Optional[Union[int, float, str]] = 0.85,
+    pca_components: int | float | str | None = 0.85,
     n_runs: int = 100,
     n_jobs: int = 1,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
-) -> Dict:
+) -> dict:
     """
     Analyze ICA stability across multiple random initializations
 
@@ -619,14 +619,14 @@ def _compute_component_stability(components_array: np.ndarray) -> np.ndarray:
 
 
 def select_n_components_by_stability(
-    X: Union[np.ndarray, torch.Tensor],
-    n_components_range: Union[range, List[int]],
-    pca_components: Optional[Union[int, float, str]] = 0.85,
+    X: np.ndarray | torch.Tensor,
+    n_components_range: range | list[int],
+    pca_components: int | float | str | None = 0.85,
     n_runs: int = 50,
     min_stability: float = 0.7,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
-) -> Dict:
+) -> dict:
     """
     Automatically select number of ICA components based on stability
 

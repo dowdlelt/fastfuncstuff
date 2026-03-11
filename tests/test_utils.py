@@ -5,7 +5,6 @@ These tests cover device management, tensor conversion,
 memory calculations, and chunk size optimization.
 """
 
-import platform
 import warnings
 from unittest import mock
 

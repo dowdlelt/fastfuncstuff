@@ -28,8 +28,6 @@ References:
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
-
 import numpy as np
 import torch
 
@@ -38,7 +36,7 @@ from .utils import get_device, to_tensor
 
 def generate_fmri_noise(tr: float,
                        duration_s: float,
-                       matrix_size: Tuple[int, int] = (1, 1),
+                       matrix_size: tuple[int, int] = (1, 1),
                        fs_high: float = 10.0,
                        resp_freq: float = 0.35,
                        resp_width: float = 0.1,
@@ -48,7 +46,7 @@ def generate_fmri_noise(tr: float,
                        cardiac_strength: float = 5.0,
                        pink_exp: float = 1.0,
                        normalize: bool = True,
-                       device: Optional[torch.device] = None) -> torch.Tensor:
+                       device: torch.device | None = None) -> torch.Tensor:
     """
     Generate realistic fMRI noise with 1/f spectrum and physiological components
 
@@ -175,8 +173,8 @@ def generate_fmri_noise(tr: float,
 def generate_fmri_noise_batch(tr: float,
                               duration_s: float,
                               n_batches: int,
-                              matrix_size: Tuple[int, int] = (1, 1),
-                              device: Optional[torch.device] = None,
+                              matrix_size: tuple[int, int] = (1, 1),
+                              device: torch.device | None = None,
                               **kwargs) -> torch.Tensor:
     """
     Generate multiple noise realizations in batch (for simulation studies)
@@ -215,7 +213,7 @@ def generate_fmri_noise_batch(tr: float,
 def add_drift(data: torch.Tensor,
               amplitude: float = 0.5,
               n_modes: int = 3,
-              device: Optional[torch.device] = None) -> torch.Tensor:
+              device: torch.device | None = None) -> torch.Tensor:
     """
     Add low-frequency drift to fMRI data (simulates scanner drift)
 
@@ -276,7 +274,7 @@ def add_drift(data: torch.Tensor,
 def add_motion_artifacts(data: torch.Tensor,
                         max_displacement: float = 2.0,
                         n_spikes: int = 3,
-                        device: Optional[torch.device] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                        device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Add motion spikes to fMRI data
 
@@ -331,7 +329,7 @@ def generate_ar1_noise(rho: float,
                        n_timepoints: int,
                        n_voxels: int = 1,
                        normalize: bool = True,
-                       device: Optional[torch.device] = None) -> torch.Tensor:
+                       device: torch.device | None = None) -> torch.Tensor:
     """
     Generate AR(1) temporally autocorrelated noise
 
@@ -410,11 +408,11 @@ def generate_ar1_noise(rho: float,
         return y
 
 
-def generate_ar_noise(rho_coeffs: Union[torch.Tensor, np.ndarray, list],
+def generate_ar_noise(rho_coeffs: torch.Tensor | np.ndarray | list,
                       n_timepoints: int,
                       n_voxels: int = 1,
                       normalize: bool = True,
-                      device: Optional[torch.device] = None) -> torch.Tensor:
+                      device: torch.device | None = None) -> torch.Tensor:
     """
     Generate AR(p) temporally autocorrelated noise
 
@@ -496,12 +494,12 @@ def generate_ar_noise(rho_coeffs: Union[torch.Tensor, np.ndarray, list],
         return y
 
 
-def generate_arma_noise(ar_coeffs: Union[torch.Tensor, np.ndarray, list],
-                        ma_coeffs: Union[torch.Tensor, np.ndarray, list],
+def generate_arma_noise(ar_coeffs: torch.Tensor | np.ndarray | list,
+                        ma_coeffs: torch.Tensor | np.ndarray | list,
                         n_timepoints: int,
                         n_voxels: int = 1,
                         normalize: bool = True,
-                        device: Optional[torch.device] = None) -> torch.Tensor:
+                        device: torch.device | None = None) -> torch.Tensor:
     """
     Generate ARMA(p,q) temporally autocorrelated noise
 
@@ -601,11 +599,11 @@ def generate_arma_noise(ar_coeffs: Union[torch.Tensor, np.ndarray, list],
 
 
 def estimate_noise_parameters_from_data(
-    data: Union[torch.Tensor, np.ndarray],
-    design: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    data: torch.Tensor | np.ndarray,
+    design: torch.Tensor | np.ndarray | None = None,
+    mask: torch.Tensor | np.ndarray | None = None,
     ar_order: int = 1,
-    device: Optional[torch.device] = None
+    device: torch.device | None = None
 ) -> dict:
     """
     Estimate noise parameters from real fMRI data
@@ -798,9 +796,9 @@ def estimate_noise_parameters_from_data(
     }
 
 
-def estimate_sfnr(data: Union[torch.Tensor, np.ndarray],
-                  mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  device: Optional[torch.device] = None) -> dict:
+def estimate_sfnr(data: torch.Tensor | np.ndarray,
+                  mask: torch.Tensor | np.ndarray | None = None,
+                  device: torch.device | None = None) -> dict:
     """
     Estimate temporal Signal Fluctuation to Noise Ratio (SFNR)
 

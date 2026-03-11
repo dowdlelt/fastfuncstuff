@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 from fastfuncsim.afni_io import get_tr_from_file, load_nifti
 from fastfuncsim.design_builder import (
@@ -161,7 +160,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_input_metadata(input_files: List[str], tr_override: Optional[float] = None) -> Tuple[float, List[int]]:
+def get_input_metadata(input_files: list[str], tr_override: float | None = None) -> tuple[float, list[int]]:
     """
     Extract TR and run lengths from input files
 

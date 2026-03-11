@@ -22,11 +22,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from .interp import _grid_sample_3d, _separable_resample_3d, wsinc5_resample_3d
-
 
 # ---------------------------------------------------------------------------
 # Parameter ↔ Matrix conversion

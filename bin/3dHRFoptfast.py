@@ -26,7 +26,6 @@ import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Union
 
 import numpy as np
 import torch
@@ -412,7 +411,7 @@ Notes:
     return parser
 
 
-def parse_cv_strategy(cv_str: str) -> Union[int, float]:
+def parse_cv_strategy(cv_str: str) -> int | float:
     """Parse CV strategy string into int or float."""
     cv_str = cv_str.lower().strip()
 

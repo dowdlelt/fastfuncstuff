@@ -6,8 +6,6 @@ chunking strategies for 4D datasets.
 
 from __future__ import annotations
 
-import torch
-
 
 def estimate_gpu_memory_bytes(
     nx: int, ny: int, nz: int,
@@ -131,5 +129,5 @@ def print_memory_report(nx: int, ny: int, nz: int, nt: int = 1) -> None:
 
     if nt > 1:
         print(f"\n4D dataset: {nt} timepoints")
-        print(f"  Each processed independently (serial chunking)")
+        print("  Each processed independently (serial chunking)")
         print(f"  CPU RAM for source 4D: {nx * ny * nz * nt * 4 / 1e9:.2f} GB")

@@ -8,17 +8,15 @@ Tests cover:
 - Spatial smoothness estimation (basic checks)
 """
 
+
 import numpy as np
-import pytest
 import torch
-from io import StringIO
-import sys
 
 from fastfuncsim.ica_workflow import (
-    sanitize_finite_tensor,
     apply_voxel_variance_normalization,
-    verbose_section,
+    sanitize_finite_tensor,
     verbose_print,
+    verbose_section,
 )
 
 

@@ -6,7 +6,6 @@ while 3dDenoisefast works perfectly with the same data.
 This creates a minimal synthetic test case and traces through both code paths.
 """
 import torch
-import numpy as np
 
 # Setup
 device = torch.device("cpu")
@@ -42,8 +41,8 @@ for run_idx in range(n_runs):
 print(f"Onset matrix: {onset_matrix.shape}, sum={onset_matrix.sum():.0f}")
 
 # Create HRF library
-from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
 from fastfuncsim.design import convolve_hrf_microtime
+from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
 
 hrf_library = get_hrf_library(mode="library", stim_duration=0.0, microtime_dt=microtime_dt, device=device)
 print(f"HRF library: {hrf_library.shape}")
@@ -70,6 +69,7 @@ noise = torch.randn(n_voxels, n_timepoints) * 1.0
 
 # Add polynomial drift per run
 from fastfuncsim.glm_core import construct_polynomial_matrix
+
 drift = torch.zeros(n_voxels, n_timepoints)
 for run_idx in range(n_runs):
     start = run_starts[run_idx]
@@ -92,7 +92,7 @@ print("\n" + "="*70)
 print("PATH 1: 3dDenoisefast approach (project-first, then xval)")
 print("="*70)
 
-from fastfuncsim.xval import project_out_nuisance_per_run, compute_xval_r2, generate_cv_splits
+from fastfuncsim.xval import compute_xval_r2, generate_cv_splits, project_out_nuisance_per_run
 
 # Build nuisance blocks per run
 nuisance_per_run = []

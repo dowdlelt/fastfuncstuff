@@ -5,17 +5,17 @@ Test data: 2 runs, 10x10x10 voxels, 360 TRs each, TR=1s
 Design: 8 polynomials (4 per run) + 2 stimuli (movie, prompt)
 GLT: movie - prompt
 """
-import pytest
-import numpy as np
-import nibabel as nib
-from pathlib import Path
-import torch
-import tempfile
 import shutil
+import tempfile
+from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+import pytest
+import torch
 
 from fastfuncsim.analysis import analyze_from_design_matrix
-from fastfuncsim.data_cache import save_cache, load_cache, check_cache_valid
-
+from fastfuncsim.data_cache import check_cache_valid
 
 # Test data paths
 DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"

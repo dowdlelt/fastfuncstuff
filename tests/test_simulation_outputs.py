@@ -1,13 +1,13 @@
 """Regression tests for simulation output utilities."""
 
+import nibabel as nib
 import numpy as np
 import torch
-import nibabel as nib
 
 from fastfuncsim.simulation import (
+    save_simulation_outputs,
     write_afni_onset_files,
     write_nifti_files,
-    save_simulation_outputs,
 )
 
 

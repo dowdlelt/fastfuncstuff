@@ -4,9 +4,10 @@ Quick Test: ARMA(1,1) Implementation
 Verify that the GPU-accelerated ARMA(1,1) GLM implementation works correctly.
 """
 
-import torch
-import numpy as np
 import sys
+
+import torch
+
 
 def test_arma11_covariance():
     """Test ARMA(1,1) covariance matrix construction"""
@@ -101,7 +102,7 @@ def test_reml_grid_search():
     a_error = abs(a_opt - true_a)
     b_error = abs(b_opt - true_b)
     
-    print(f"\nEstimation errors:")
+    print("\nEstimation errors:")
     print(f"  |a_est - a_true|: {a_error:.3f}")
     print(f"  |b_est - b_true|: {b_error:.3f}")
     
@@ -118,7 +119,7 @@ def test_prewhitening():
     print("Test 3: Prewhitening")
     print("="*70)
     
-    from fastfuncsim.arma_glm import prewhiten_with_arma11, build_arma11_covariance
+    from fastfuncsim.arma_glm import build_arma11_covariance, prewhiten_with_arma11
     from fastfuncsim.utils import get_device
     
     device = get_device()
@@ -175,7 +176,7 @@ def test_glm_arma11():
     true_a = 0.4
     true_b = 0.1
     
-    print(f"\nSimulation setup:")
+    print("\nSimulation setup:")
     print(f"  Timepoints: {n_timepoints}")
     print(f"  Voxels: {n_voxels}")
     print(f"  Regressors: {n_regressors}")
@@ -214,7 +215,7 @@ def test_glm_arma11():
     )
     
     # Compare
-    print(f"\nResults:")
+    print("\nResults:")
     print(f"  OLS R²: {ols_results.r2.mean():.4f}")
     print(f"  ARMA R²: {arma_results.r2.mean():.4f}")
     print(f"  ARMA mean (a, b): ({arma_results.arma_params[:, 0].mean():.3f}, "

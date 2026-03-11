@@ -4,19 +4,19 @@ Tests for design matrix construction
 Validates that our design matrix builder produces results matching AFNI's 3dDeconvolve
 """
 
-import pytest
-import numpy as np
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+from fastfuncsim.afni_io import read_afni_design_matrix
 from fastfuncsim.design_builder import (
-    spm_canonical_hrf,
+    build_design_matrix,
+    create_onset_regressors,
     legendre_polynomials,
     parse_afni_timing_file,
-    create_onset_regressors,
-    build_design_matrix,
+    spm_canonical_hrf,
 )
-from fastfuncsim.afni_io import read_afni_design_matrix
-
 
 # Test data directory
 TEST_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
@@ -274,7 +274,7 @@ def test_compare_with_afni():
     corr_movie = np.corrcoef(afni_stim[:, 0], our_stim[:, 0])[0, 1]
     corr_prompt = np.corrcoef(afni_stim[:, 1], our_stim[:, 1])[0, 1]
 
-    print(f"\nCorrelation with AFNI:")
+    print("\nCorrelation with AFNI:")
     print(f"  Movie regressor: {corr_movie:.6f}")
     print(f"  Prompt regressor: {corr_prompt:.6f}")
 
@@ -289,8 +289,9 @@ def test_compare_with_afni():
 
 def test_write_afni_xmat():
     """Test writing .xmat.1D format"""
-    from fastfuncsim.design_builder import write_afni_xmat
     import tempfile
+
+    from fastfuncsim.design_builder import write_afni_xmat
 
     # Build a simple design matrix
     movie_file = TEST_DATA_DIR / "ses01_times.movie.txt"
@@ -322,7 +323,7 @@ def test_write_afni_xmat():
         )
 
         # Read back and validate
-        with open(output_path, 'r') as f:
+        with open(output_path) as f:
             content = f.read()
 
         # Check header elements
@@ -349,7 +350,7 @@ def test_write_afni_xmat():
         first_row = data_lines[0].strip().split()
         assert len(first_row) == 10, f"Expected 10 columns, got {len(first_row)}"
 
-        print(f"\n✓ .xmat.1D writer test passed!")
+        print("\n✓ .xmat.1D writer test passed!")
         print(f"  Wrote {len(data_lines)} rows x {len(first_row)} columns")
 
     finally:
@@ -409,7 +410,7 @@ def test_im_mode():
 
         # Count non-zero timepoints per column
         nonzero_counts = np.sum(stim_cols > 0, axis=0)
-        print(f"\nIM mode test:")
+        print("\nIM mode test:")
         print(f"  Design shape: {design.shape}")
         print(f"  IM column labels: {labels[4:]}")
         print(f"  Non-zero timepoints per IM column: {nonzero_counts}")
@@ -428,7 +429,7 @@ def test_im_mode():
 
 def test_glt_parsing():
     """Test GLT contrast parsing and validation"""
-    from fastfuncsim.design_builder import parse_glt_string, glt_weights_to_vector
+    from fastfuncsim.design_builder import glt_weights_to_vector, parse_glt_string
 
     # Test valid contrast (difference)
     weights, valid = parse_glt_string('SYM: +1*A -1*B')
@@ -464,8 +465,8 @@ def test_glt_parsing():
 def test_goodlist_utilities():
     """Test GoodList parsing and censoring utilities"""
     from fastfuncsim.afni_io import (
-        read_afni_design_matrix,
         get_censored_mask,
+        read_afni_design_matrix,
         select_uncensored_timepoints,
     )
 
@@ -517,9 +518,10 @@ class TestDesignBuilderEdgeCases:
 
     def test_load_and_pad_ortvec_errors(self):
         """Test error handling in load_and_pad_ortvec."""
-        from fastfuncsim.design_builder import load_and_pad_ortvec
-        import tempfile
         import os
+        import tempfile
+
+        from fastfuncsim.design_builder import load_and_pad_ortvec
 
         # Create dummy ortvec file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
@@ -548,9 +550,10 @@ class TestDesignBuilderEdgeCases:
 
     def test_load_and_pad_ortvec_success(self):
         """Test successful loading and padding."""
-        from fastfuncsim.design_builder import load_and_pad_ortvec
-        import tempfile
         import os
+        import tempfile
+
+        from fastfuncsim.design_builder import load_and_pad_ortvec
 
         # Create dummy ortvec file (5 timepoints, 2 regressors)
         data = np.random.randn(5, 2)
@@ -616,9 +619,10 @@ class TestDesignBuilderEdgeCases:
 
     def test_build_design_matrix_errors(self):
         """Test error handling in build_design_matrix."""
-        from fastfuncsim.design_builder import build_design_matrix
-        import tempfile
         import os
+        import tempfile
+
+        from fastfuncsim.design_builder import build_design_matrix
         
         # Create dummy timing file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
@@ -670,9 +674,10 @@ class TestDesignBuilderEdgeCases:
 
     def test_build_design_matrix_with_extra_regressors(self):
         """Test building design matrix with extra regressors."""
-        from fastfuncsim.design_builder import build_design_matrix
-        import tempfile
         import os
+        import tempfile
+
+        from fastfuncsim.design_builder import build_design_matrix
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
             f.write("10 20\n")
@@ -712,9 +717,10 @@ class TestDesignBuilderEdgeCases:
 # ============================================================================
 
 import torch
-from fastfuncsim.utils import get_device
+
 from fastfuncsim.design import convolve_hrf_microtime
 from fastfuncsim.hrf import get_canonical_hrf
+from fastfuncsim.utils import get_device
 
 
 class TestDesignHrfConvolution:

@@ -10,22 +10,19 @@ This script demonstrates:
 This is the ANALYSIS side - use after data collection for publication-quality results.
 """
 
-import torch
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from arma_glm import (
+    build_arma11_covariance,
+    fit_glm_arma11,
+    reml_grid_search,
+)
+from glm_core import fit_glm
+from hrf import spm_hrf
+from noise import generate_ar1_noise
 
 # Import fastfuncsim modules
-from simulation import simulate_fmri_run
-from hrf import spm_hrf
-from design import create_block_design
-from noise import generate_ar1_noise
-from glm_core import fit_glm
-from arma_glm import (
-    fit_glm_arma11, 
-    compare_ols_vs_arma11,
-    build_arma11_covariance,
-    reml_grid_search
-)
 from utils import get_device
 
 # Set random seed for reproducibility
@@ -56,7 +53,7 @@ def example_1_basic_arma_fit():
     true_a = 0.4
     true_b = 0.1
     
-    print(f"Simulation parameters:")
+    print("Simulation parameters:")
     print(f"  TR: {tr}s")
     print(f"  Duration: {duration}s ({n_timepoints} timepoints)")
     print(f"  Voxels: {n_voxels}")
@@ -290,7 +287,6 @@ def example_3_reml_grid_search_visualization():
                 likelihood_surface[j, i] = np.nan
     
     # Find optimal
-    from arma_glm import reml_grid_search
     a_opt, b_opt, _ = reml_grid_search(design, data, device=device)
     
     # Plot
@@ -339,7 +335,6 @@ def example_4_estimate_from_real_data():
     n_voxels = 500  # Smaller sample for demo
     
     # Generate realistic noise (AR1 with physiological components)
-    from noise import generate_ar1_noise
     ar1_noise = generate_ar1_noise(
         rho=0.35,  # Typical fMRI autocorrelation
         n_timepoints=n_timepoints,
@@ -377,7 +372,7 @@ def example_4_estimate_from_real_data():
     print("Extracted Noise Parameters:")
     print("="*70)
     print(params['summary'])
-    print(f"\nDetailed statistics:")
+    print("\nDetailed statistics:")
     print(f"  AR(1) coefficient range: [{min(params['ar_coefficients_all']):.3f}, "
           f"{max(params['ar_coefficients_all']):.3f}]")
     print(f"  SFNR range: [{min(params['sfnr_all']):.1f}, {max(params['sfnr_all']):.1f}]")

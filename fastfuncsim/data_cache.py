@@ -10,13 +10,12 @@ import hashlib
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
 
 
-def _compute_file_hash(files: Sequence[Union[str, Path]]) -> str:
+def _compute_file_hash(files: Sequence[str | Path]) -> str:
     """Compute hash of file paths and modification times for cache validation."""
     hash_obj = hashlib.md5()
     for f in sorted(files):
@@ -29,15 +28,15 @@ def _compute_file_hash(files: Sequence[Union[str, Path]]) -> str:
 
 
 def save_cache(
-    cache_file: Union[str, Path],
+    cache_file: str | Path,
     data: np.ndarray,
-    input_files: List[Union[str, Path]],
-    run_starts: Optional[List[int]] = None,
-    affine: Optional[np.ndarray] = None,
-    volume_shape: Optional[Tuple[int, ...]] = None,
+    input_files: list[str | Path],
+    run_starts: list[int] | None = None,
+    affine: np.ndarray | None = None,
+    volume_shape: tuple[int, ...] | None = None,
     was_scaled: bool = False,
-    original_mean: Optional[float] = None,
-    nifti_header: Optional[object] = None,
+    original_mean: float | None = None,
+    nifti_header: object | None = None,
 ):
     """
     Save preprocessed fMRI data to HDF5 cache.
@@ -117,10 +116,10 @@ def save_cache(
 
 
 def load_cache(
-    cache_file: Union[str, Path],
-    input_files: Optional[Sequence[Union[str, Path]]] = None,
+    cache_file: str | Path,
+    input_files: Sequence[str | Path] | None = None,
     validate: bool = True,
-) -> Tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, dict]:
     """
     Load preprocessed fMRI data from HDF5 cache.
 
@@ -208,8 +207,8 @@ def load_cache(
 
 
 def check_cache_valid(
-    cache_file: Union[str, Path],
-    input_files: Sequence[Union[str, Path]],
+    cache_file: str | Path,
+    input_files: Sequence[str | Path],
 ) -> bool:
     """
     Check if cache file exists and is valid for given input files.

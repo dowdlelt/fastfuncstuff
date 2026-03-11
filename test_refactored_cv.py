@@ -4,8 +4,9 @@ Test script for the refactored cross_validate_noise_pcs function.
 Verifies that the concatenated prediction approach works correctly.
 """
 
-import torch
 import numpy as np
+import torch
+
 from fastfuncsim.denoise import cross_validate_noise_pcs
 
 # Create synthetic data
@@ -57,7 +58,7 @@ print(f"  r2_median_by_n_components shape: {r2_median.shape} (expected: (21,))")
 print(f"  r2_per_fold shape: {r2_per_fold.shape} (expected: (4, 21))")
 print(f"  r2_per_voxel shape: {r2_per_voxel.shape} (expected: ({n_voxels}, 21))")
 
-print(f"\n  R² values (baseline to best):")
+print("\n  R² values (baseline to best):")
 print(f"    0 PCs: {r2_by_n[0]:.4f}")
 best_idx = int(np.argmax(r2_by_n))
 print(f"    Best ({best_idx} PCs): {r2_by_n[best_idx]:.4f}")

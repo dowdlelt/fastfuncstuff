@@ -11,7 +11,6 @@ Supports multiple GLM variants:
 from __future__ import annotations
 
 import warnings
-from typing import Optional, Union
 
 import torch
 from tqdm.auto import tqdm
@@ -186,8 +185,8 @@ def fit_glm_chunk(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     """
     Fit GLM for a chunk of voxels using efficient batched operations
@@ -261,11 +260,11 @@ def fit_glm_chunk(
 
 
 def fit_glm(
-    data: Union[torch.Tensor, list],
-    design: Union[torch.Tensor, list],
+    data: torch.Tensor | list,
+    design: torch.Tensor | list,
     tr: float,
-    max_poly_degree: Optional[Union[int, list]] = None,
-    extra_regressors: Optional[Union[torch.Tensor, list]] = None,
+    max_poly_degree: int | list | None = None,
+    extra_regressors: torch.Tensor | list | None = None,
     want_residuals: bool = False,
     want_predicted: bool = False,
     want_r2_run: bool = True,
@@ -273,14 +272,14 @@ def fit_glm(
     r2_partial_mode: str = "full",  # "full" or "task" - how to compute partial R²
     want_r2_semipartial: bool = False,
     r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
-    device: Optional[torch.device] = None,
-    chunk_size: Optional[int] = None,
+    device: torch.device | None = None,
+    chunk_size: int | None = None,
     verbose: bool = True,
     preload_data_to_device: bool = True,
     use_double: bool = False,
-    glt_labels: Optional[list] = None,
-    glt_matrices: Optional[list] = None,
-    task_indices: Optional[list] = None,
+    glt_labels: list | None = None,
+    glt_matrices: list | None = None,
+    task_indices: list | None = None,
 ) -> GLMResults:
     """
     Fast GPU-accelerated GLM fitting
@@ -947,13 +946,13 @@ def percent_bold_change(betas: torch.Tensor, meanvol: torch.Tensor) -> torch.Ten
 
 
 def fit_glm_hrf_library(
-    data: Union[torch.Tensor, list],
-    design: Union[torch.Tensor, list],
+    data: torch.Tensor | list,
+    design: torch.Tensor | list,
     hrf_library: torch.Tensor,
     tr: float,
     microtime_dt: float = 0.1,
     microtime_onset: int = 0,
-    n_timepoints: Optional[int] = None,
+    n_timepoints: int | None = None,
     **kwargs,
 ) -> tuple[GLMResults, torch.Tensor, torch.Tensor]:
     """

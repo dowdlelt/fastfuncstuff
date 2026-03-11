@@ -3,11 +3,13 @@ Example: Batch Simulation for Statistical Power Analysis
 Demonstrates fast batch processing for thousands of simulations
 """
 
-import torch
+from time import time
+
 import matplotlib.pyplot as plt
 import numpy as np
-from time import time
+
 import fastfuncsim as ffs
+
 
 def run_single_simulation(config, device):
     """Run a single simulation and GLM fit"""

@@ -19,21 +19,20 @@ Tests validate CORRECTNESS of metric calculations, not just coverage.
 
 from __future__ import annotations
 
-import pytest
 import numpy as np
+import pytest
 import torch
 
+from fastfuncsim.design import convolve_hrf
+from fastfuncsim.hrf import get_canonical_hrf
 from fastfuncsim.metrics_empirical import (
-    estimate_ar1_coefficient,
     build_ar1_covariance_matrix,
-    gls_fit,
     compute_detection_power_empirical,
     compute_estimation_efficiency_empirical,
+    estimate_ar1_coefficient,
     evaluate_design_empirical,
+    gls_fit,
 )
-from fastfuncsim.hrf import get_canonical_hrf
-from fastfuncsim.design import convolve_hrf
-
 
 # =============================================================================
 # CONSTANTS

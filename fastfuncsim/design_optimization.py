@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Literal
 
 import numpy as np
 import torch
@@ -49,16 +49,16 @@ class DesignCandidate:
     onsets: torch.Tensor  # (n_timepoints, n_conditions) binary onset matrix
     isis: np.ndarray  # ISI sequence for each condition
     design_matrix: torch.Tensor  # Convolved design matrix
-    metrics: Optional[Dict] = None  # Computed metrics
-    metadata: Optional[Dict] = None  # Additional info (distribution params, etc.)
+    metrics: dict | None = None  # Computed metrics
+    metadata: dict | None = None  # Additional info (distribution params, etc.)
 
 
 def generate_event_sequence(
-    n_trials_per_condition: Union[int, List[int]],
+    n_trials_per_condition: int | list[int],
     n_conditions: int,
     ordering: Literal["random", "alternating", "blocked", "permuted_block"] = "random",
-    block_size: Optional[int] = None,
-    seed: Optional[int] = None,
+    block_size: int | None = None,
+    seed: int | None = None,
 ) -> np.ndarray:
     """
     Generate event sequence specifying which condition occurs at each trial.
@@ -169,7 +169,7 @@ def generate_isi_sequence(
     distribution: Literal[
         "poisson", "exponential", "uniform", "fixed", "truncated_exponential", "poisson_target_mean"
     ] = "exponential",
-    seed: Optional[int] = None,
+    seed: int | None = None,
 ) -> np.ndarray:
     """
     Generate ISI sequence (inter-stimulus intervals between consecutive events).
@@ -324,7 +324,7 @@ def create_onset_matrix(
     isis: np.ndarray,
     duration: float,
     tr: float,
-    n_conditions: Optional[int] = None,
+    n_conditions: int | None = None,
 ) -> torch.Tensor:
     """
     Convert event sequence and ISI sequence to binary onset matrix.
@@ -371,16 +371,16 @@ def create_onset_matrix(
 
 def sample_design_space(
     n_conditions: int,
-    n_trials_per_condition: Union[int, List[int]],
+    n_trials_per_condition: int | list[int],
     duration: float,
     isi_constraints: ISIConstraints,
     n_samples: int = 100,
-    event_orderings: List[str] | None = None,
-    isi_distributions: List[str] | None = None,
+    event_orderings: list[str] | None = None,
+    isi_distributions: list[str] | None = None,
     hrf_type: str = "spm",
-    device: Optional[torch.device] = None,
-    seed: Optional[int] = None,
-) -> List[DesignCandidate]:
+    device: torch.device | None = None,
+    seed: int | None = None,
+) -> list[DesignCandidate]:
     """
     Sample design space by generating multiple candidate designs with various orderings and ISI distributions.
 
@@ -520,15 +520,15 @@ def sample_design_space(
 
 
 def evaluate_design_candidates(
-    candidates: List[DesignCandidate],
-    data: Optional[torch.Tensor] = None,
+    candidates: list[DesignCandidate],
+    data: torch.Tensor | None = None,
     hrf_length: int = 30,
-    effect_sizes: Optional[List[float]] = None,
+    effect_sizes: list[float] | None = None,
     noise_level: float = 1.0,
     n_voxels: int = 100,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
-) -> List[DesignCandidate]:
+) -> list[DesignCandidate]:
     """
     Evaluate all candidate designs using empirical metrics.
 
@@ -601,11 +601,11 @@ def evaluate_design_candidates(
 
 
 def find_optimal_designs(
-    candidates: List[DesignCandidate],
+    candidates: list[DesignCandidate],
     objective: Literal["power", "efficiency", "balanced"] = "balanced",
     alpha: float = 0.5,
     top_k: int = 10,
-) -> List[Tuple[int, DesignCandidate, float]]:
+) -> list[tuple[int, DesignCandidate, float]]:
     """
     Find optimal designs based on specified objective.
 
@@ -697,7 +697,7 @@ def find_optimal_designs(
 
 
 def compare_designs_summary(
-    candidates: List[DesignCandidate],
+    candidates: list[DesignCandidate],
     top_k: int = 10,
     objective: str = "balanced",
     alpha: float = 0.5,
@@ -775,9 +775,9 @@ def compare_designs_summary(
 
 
 def plot_fitness_landscape(
-    candidates: List[DesignCandidate],
-    figsize: Tuple[int, int] = (12, 5),
-    save_path: Optional[str] = None,
+    candidates: list[DesignCandidate],
+    figsize: tuple[int, int] = (12, 5),
+    save_path: str | None = None,
 ):
     """
     Plot fitness landscape: Detection Power vs Estimation Efficiency.
@@ -891,9 +891,9 @@ def plot_fitness_landscape(
 
 
 def plot_pareto_frontier(
-    candidates: List[DesignCandidate],
-    figsize: Tuple[int, int] = (8, 6),
-    save_path: Optional[str] = None,
+    candidates: list[DesignCandidate],
+    figsize: tuple[int, int] = (8, 6),
+    save_path: str | None = None,
 ):
     """
     Plot Pareto frontier of detection power vs estimation efficiency.
@@ -1007,15 +1007,15 @@ def plot_isi_range_optimization(
     n_trials_per_condition: int,
     duration: float,
     tr: float,
-    min_isi_range: Tuple[float, float] = (1.0, 4.0),
-    max_isi_range: Tuple[float, float] = (4.0, 12.0),
+    min_isi_range: tuple[float, float] = (1.0, 4.0),
+    max_isi_range: tuple[float, float] = (4.0, 12.0),
     n_grid_points: int = 10,
     isi_distribution: str = "exponential",
     event_ordering: str = "random",
     n_samples_per_point: int = 3,
-    figsize: Tuple[int, int] = (14, 5),
-    save_path: Optional[str] = None,
-    device: Optional[torch.device] = None,
+    figsize: tuple[int, int] = (14, 5),
+    save_path: str | None = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ):
     """
@@ -1280,16 +1280,16 @@ def plot_isi_range_by_target_mean(
     n_trials_per_condition: int,
     duration: float,
     tr: float,
-    target_mean_isis: List[float],
-    min_isi_range: Tuple[float, float] = (1.0, 4.0),
-    max_isi_range: Tuple[float, float] = (4.0, 12.0),
+    target_mean_isis: list[float],
+    min_isi_range: tuple[float, float] = (1.0, 4.0),
+    max_isi_range: tuple[float, float] = (4.0, 12.0),
     n_grid_points: int = 10,
     isi_distribution: str = "exponential",
     event_ordering: str = "random",
     n_samples_per_point: int = 3,
-    figsize_per_row: Tuple[int, int] = (14, 5),
-    save_path: Optional[str] = None,
-    device: Optional[torch.device] = None,
+    figsize_per_row: tuple[int, int] = (14, 5),
+    save_path: str | None = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ):
     """
@@ -1514,13 +1514,13 @@ def plot_isi_range_by_target_mean(
 
 
 def plot_hrf_index_recovery(
-    true_hrf_indices: Union[torch.Tensor, np.ndarray],
-    recovered_hrf_indices: Union[torch.Tensor, np.ndarray],
-    spatial_shape: Optional[Tuple[int, ...]] = None,
+    true_hrf_indices: torch.Tensor | np.ndarray,
+    recovered_hrf_indices: torch.Tensor | np.ndarray,
+    spatial_shape: tuple[int, ...] | None = None,
     slice_axis: int = 2,
-    n_slices: Optional[int] = None,
-    figsize: Tuple[int, int] = (16, 6),
-    save_path: Optional[str] = None,
+    n_slices: int | None = None,
+    figsize: tuple[int, int] = (16, 6),
+    save_path: str | None = None,
 ):
     """
     Visualize HRF library recovery accuracy.

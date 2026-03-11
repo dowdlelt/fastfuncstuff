@@ -1,14 +1,14 @@
 
 import numpy as np
-import torch
 import pytest
+import torch
+from scipy.stats import pearsonr
 from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.decomposition import FastICA as SklearnFastICA
-from scipy.stats import pearsonr
 
-from fastfuncsim.pca import PCA
 from fastfuncsim.ica import FastICA
-from fastfuncsim.utils import get_device
+from fastfuncsim.pca import PCA
+
 
 def check_sign_flip_correlation(a, b):
     """

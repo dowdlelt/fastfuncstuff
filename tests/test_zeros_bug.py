@@ -3,7 +3,6 @@
 Quick test to trace the all-zeros bug
 """
 
-import numpy as np
 import torch
 
 from fastfuncsim.design import build_glm_design, generate_random_onsets
@@ -73,7 +72,7 @@ print(f"   Data mean: {data.mean().item():.3f}, std: {data.std().item():.3f}")
 
 # Check a single voxel timecourse
 voxel_timecourse = data[10, 10, 2, :]
-print(f"\n5. Example voxel [10,10,2] timecourse:")
+print("\n5. Example voxel [10,10,2] timecourse:")
 print(
     f"   Min: {voxel_timecourse.min().item():.3f}, Max: {voxel_timecourse.max().item():.3f}"
 )

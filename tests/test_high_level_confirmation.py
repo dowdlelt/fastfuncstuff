@@ -3,18 +3,18 @@ Confirmation tests for high-level fMRI analysis pipelines.
 Verifies AFNI onset parsing, HRF library fitting, and cross-validation.
 """
 
-import pytest
-import numpy as np
-import torch
 from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
 
 from fastfuncsim.analysis import (
     analyze_from_onsets,
     analyze_with_cross_validation,
 )
-from fastfuncsim.hrf import get_hrf_library
 from fastfuncsim.glm_core import fit_glm_hrf_library
-from fastfuncsim.simulation import create_parametric_voxels
+from fastfuncsim.hrf import get_hrf_library
 
 # Test data directory
 TEST_DATA_DIR = (

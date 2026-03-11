@@ -11,9 +11,9 @@ This shows how the GLM engine is the core, and both simulation and
 real data flow through the same analysis functions.
 """
 
-import fastfuncsim as ffs
 import torch
-import numpy as np
+
+import fastfuncsim as ffs
 
 # Setup
 device = ffs.get_device()
@@ -108,6 +108,7 @@ print("=" * 70)
 
 # Check if example simulation exists
 import os
+
 onset_file_1 = '/Users/logan/local_bin/fastfuncsim/simulations/simulation_example_test/onsets_condition1.txt'
 onset_file_2 = '/Users/logan/local_bin/fastfuncsim/simulations/simulation_example_test/onsets_condition2.txt'
 

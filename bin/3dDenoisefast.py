@@ -27,7 +27,6 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -545,10 +544,10 @@ def print_header(args):
 
 
 def _select_design_for_visualization(
-    task_design: Optional[torch.Tensor],
-    designs_by_hrf: Optional[dict],
-    hrf_library: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, Optional[int]]:
+    task_design: torch.Tensor | None,
+    designs_by_hrf: dict | None,
+    hrf_library: torch.Tensor | None,
+) -> tuple[torch.Tensor, int | None]:
     """Select task design to visualize.
 
     For per-voxel HRF mode, picks the middle HRF index (floor(n_hrfs/2)) when
@@ -580,7 +579,7 @@ def save_final_design_matrix_plot(
     task_design_to_plot: torch.Tensor,
     nuisance_per_run: list[torch.Tensor],
     run_starts: list[int],
-    selected_hrf_idx: Optional[int] = None,
+    selected_hrf_idx: int | None = None,
 ) -> str:
     """Save high-resolution, non-blurry final design matrix image.
 
@@ -651,14 +650,14 @@ def save_denoising_results(
     affine: np.ndarray,
     run_starts: list[int],
     tr: float,
-    data_for_component_maps: Optional[torch.Tensor] = None,
-    voxel_mask: Optional[torch.Tensor] = None,
+    data_for_component_maps: torch.Tensor | None = None,
+    voxel_mask: torch.Tensor | None = None,
     plots_mode: str = "no",
     slice_axis: str = "x",
     component_map_space: str = "full",
     noise_method: str = "pca",
     save_pcs_mode: str = "timecourse",
-    condition_labels: Optional[list[str]] = None,
+    condition_labels: list[str] | None = None,
     save_scree_plot: bool = True,
 ):
     """
@@ -1001,7 +1000,7 @@ def compute_bootstrap_se(
     n_task: int,
     n_boots: int = 100,
     chunk_size: int = 5000,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
     verbose: bool = True,
 ) -> np.ndarray:
     """
@@ -1081,8 +1080,8 @@ def compute_bootstrap_se(
 
 def compute_snr(
     betas: np.ndarray,
-    residual_std: Optional[np.ndarray] = None,
-    bootstrap_se: Optional[np.ndarray] = None,
+    residual_std: np.ndarray | None = None,
+    bootstrap_se: np.ndarray | None = None,
 ) -> dict:
     """
     Compute SNR metrics from betas and noise estimates.
@@ -1128,7 +1127,7 @@ def save_snr_outputs(
     output_prefix: str,
     volume_shape: tuple,
     affine: np.ndarray,
-    voxel_mask: Optional[torch.Tensor] = None,
+    voxel_mask: torch.Tensor | None = None,
     create_plots: bool = True,
 ) -> dict:
     """
@@ -1258,11 +1257,11 @@ def save_model_fit_outputs(
     volume_shape: tuple,
     affine: np.ndarray,
     model_type: str,  # "initial" or "denoised"
-    condition_labels: Optional[list[str]] = None,
-    voxel_mask: Optional[torch.Tensor] = None,
-    n_timepoints: Optional[int] = None,
-    n_regressors: Optional[int] = None,
-    bootstrap_se: Optional[np.ndarray] = None,
+    condition_labels: list[str] | None = None,
+    voxel_mask: torch.Tensor | None = None,
+    n_timepoints: int | None = None,
+    n_regressors: int | None = None,
+    bootstrap_se: np.ndarray | None = None,
 ):
     """
     Save GLM model fit outputs (betas, tstats) as NIfTI files with AFNI labeling
@@ -1785,7 +1784,7 @@ def main():
             f"  Total columns per run: {n_task_cols} task + {nuisance_per_run[0].shape[1]} nuisance = {n_task_cols + nuisance_per_run[0].shape[1]}"
         )
 
-    design_plot_path: Optional[str] = None
+    design_plot_path: str | None = None
     if args.plots == "full":
         try:
             design_for_plot, selected_hrf_idx = _select_design_for_visualization(
@@ -2395,7 +2394,7 @@ def main():
             initial_r2_img = nib.Nifti1Image(initial_r2_vol.reshape(volume_shape), affine)
             nib.save(initial_r2_img, f"{args.prefix}_initial_xval_r2.nii.gz")
             output_files["initial_xval_r2"] = f"{args.prefix}_initial_xval_r2.nii.gz"
-            print(f"  Saved: initial cross-validated R²")
+            print("  Saved: initial cross-validated R²")
         else:
             print("  Warning: No mask available, skipping diagnostic mask saves")
 
