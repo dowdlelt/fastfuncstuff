@@ -35,6 +35,8 @@ test = [
 ffs_nwarp = "fastfuncsim.processing.nwarpforge_cli:main"
 ffs_allineate = "fastfuncsim.processing.allineate_cli:main"
 ffs_moco = "fastfuncsim.processing.ffs_moco_cli:main"
+ffs_qwarp = "fastfuncsim.processing.cli:main"
+ffs_motsim = "fastfuncsim.processing.ffs_motsim:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

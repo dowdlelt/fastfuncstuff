@@ -528,6 +528,9 @@ def batched_compose_and_interpolate(
     ny: int,
     nz: int,
     global_warp_3ch: Tensor | None = None,
+    base_i: Tensor | None = None,
+    base_j: Tensor | None = None,
+    base_k: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compose patch warps with global warp and interpolate source for B patches.
 
@@ -544,15 +547,22 @@ def batched_compose_and_interpolate(
         global_warp_3ch: Optional pre-stacked (3, nz, ny, nx) tensor with
             [global_xd, global_yd, global_zd]. Avoids re-stacking every
             optimizer iteration (~45 MB saved per call for typical volumes).
+        base_i/base_j/base_k: Optional pre-computed (B, V) coordinate offsets
+            (ibots[:, None] + ii_p[None, :]). Avoids recomputing every iteration.
 
     Returns:
         warped_vals: (B, V) interpolated source values.
         ah_xd, ah_yd, ah_zd: (B, V) composed displacement fields.
     """
     # Global coordinates after local patch displacement: (B, V)
-    xq = (ibots[:, None] + ii_p[None, :] + patch_xd).clamp(0, nx - 1)
-    yq = (jbots[:, None] + jj_p[None, :] + patch_yd).clamp(0, ny - 1)
-    zq = (kbots[:, None] + kk_p[None, :] + patch_zd).clamp(0, nz - 1)
+    if base_i is not None:
+        xq = (base_i + patch_xd).clamp(0, nx - 1)
+        yq = (base_j + patch_yd).clamp(0, ny - 1)
+        zq = (base_k + patch_zd).clamp(0, nz - 1)
+    else:
+        xq = (ibots[:, None] + ii_p[None, :] + patch_xd).clamp(0, nx - 1)
+        yq = (jbots[:, None] + jj_p[None, :] + patch_yd).clamp(0, ny - 1)
+        zq = (kbots[:, None] + kk_p[None, :] + patch_zd).clamp(0, nz - 1)
 
     # Fused 3-channel global warp interpolation
     if global_warp_3ch is not None:
@@ -567,9 +577,14 @@ def batched_compose_and_interpolate(
     ah_zd = patch_zd + azd
 
     # Source sample locations
-    src_x = (ah_xd + ii_p[None, :] + ibots[:, None]).clamp(-0.499, nx - 0.501)
-    src_y = (ah_yd + jj_p[None, :] + jbots[:, None]).clamp(-0.499, ny - 0.501)
-    src_z = (ah_zd + kk_p[None, :] + kbots[:, None]).clamp(-0.499, nz - 0.501)
+    if base_i is not None:
+        src_x = (ah_xd + base_i).clamp(-0.499, nx - 0.501)
+        src_y = (ah_yd + base_j).clamp(-0.499, ny - 0.501)
+        src_z = (ah_zd + base_k).clamp(-0.499, nz - 0.501)
+    else:
+        src_x = (ah_xd + ii_p[None, :] + ibots[:, None]).clamp(-0.499, nx - 0.501)
+        src_y = (ah_yd + jj_p[None, :] + jbots[:, None]).clamp(-0.499, ny - 0.501)
+        src_z = (ah_zd + kk_p[None, :] + kbots[:, None]).clamp(-0.499, nz - 0.501)
 
     # Batched source interpolation
     warped_vals = batched_trilinear_interpolate(source, src_x, src_y, src_z)

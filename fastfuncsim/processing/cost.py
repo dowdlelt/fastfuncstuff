@@ -518,6 +518,8 @@ class BatchedIncrementalCorrelation:
         warped_source: Tensor,
         weight: Tensor,
         patch_slices: list[tuple[int, int, int, int, int, int]],
+        base_patches: Tensor | None = None,
+        weight_patches: Tensor | None = None,
     ) -> None:
         """Precompute fixed (outside-patch) statistics for all B patches.
 
@@ -527,6 +529,8 @@ class BatchedIncrementalCorrelation:
         Args:
             base, warped_source, weight: (nz, ny, nx) full images.
             patch_slices: List of (ibot, itop, jbot, jtop, kbot, ktop) for B patches.
+            base_patches: Optional pre-extracted (B, V) base patches (avoids re-extraction).
+            weight_patches: Optional pre-extracted (B, V) weight patches (avoids re-extraction).
         """
         B = len(patch_slices)
         device = base.device
@@ -552,19 +556,26 @@ class BatchedIncrementalCorrelation:
         swxy_g = (wm * b * s).sum()
 
         # Subtract each patch's contribution (vectorized: gather all patches at once)
-        # Stack patch data as (B, V) tensors
-        bp_all = torch.stack([
-            base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        # Use pre-extracted patches if available, otherwise extract from volumes
+        if base_patches is not None:
+            bp_all = base_patches
+        else:
+            bp_all = torch.stack([
+                base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ])
+        # warped_source patches always extracted fresh (warped_source changes between phases)
         sp_all = torch.stack([
             warped_source[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
             for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
         ])
-        wp_all = torch.stack([
-            weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        if weight_patches is not None:
+            wp_all = weight_patches
+        else:
+            wp_all = torch.stack([
+                weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ])
 
         if self.base_clip:
             bp_all = bp_all.clamp(self.base_clip[0], self.base_clip[1])

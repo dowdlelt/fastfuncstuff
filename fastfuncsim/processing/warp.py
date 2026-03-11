@@ -54,6 +54,18 @@ from .optimizer import optimize_warp_params_torch, optimize_warp_params_batched
 from .penalty import compute_jacobian_energy, compute_penalty_batched
 from .weight import compute_weight_image
 
+# Cache for torch.compile'd building-block functions (stable identity, compiled once)
+_compile_cache: dict[str, object] = {}
+
+
+def _maybe_compile(fn: object, name: str, device: torch.device, do_compile: bool) -> object:
+    """Return a compiled version of fn for CUDA, caching by name."""
+    if device.type != "cuda" or not do_compile:
+        return fn
+    if name not in _compile_cache:
+        _compile_cache[name] = torch.compile(fn, dynamic=True)
+    return _compile_cache[name]
+
 
 @dataclass
 class QwarpConfig:
@@ -133,6 +145,10 @@ class QwarpConfig:
     """Early stopping: if a level improves cost by less than this fraction, stop
     refining further. 0 = disabled (default). E.g. 0.0001 stops when improvement
     drops below 0.01% of current cost."""
+
+    compile: bool = False
+    """Use torch.compile for building-block functions (CUDA only).
+    Requires warmup on first volume; may not help for small patches."""
 
 
 @dataclass
@@ -223,6 +239,10 @@ def qwarp(
         config = QwarpConfig()
     if device is None:
         device = base.device
+
+    # Enable TF32 for matmuls on Ampere+ GPUs (free perf, ~1e-5 precision)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     base = base.float().to(device)
     source = source.float().to(device)
@@ -654,11 +674,6 @@ def _warpomatic(
         jj_flat = jj_p.reshape(-1)
         kk_flat = kk_p.reshape(-1)
 
-        # Refresh warped source at start of level
-        state.warped_source = warp_image_linear(
-            source, state.xd, state.yd, state.zd
-        )
-
         n_valid = sum(len(ph) for ph in phases)
         state.patches_done = 0
         state.patches_skipped = len(all_patches) - len(valid_patches)
@@ -870,7 +885,10 @@ def _improve_warp_batched(
         patch_slices = [
             (p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop) for p in patches
         ]
-        batch_incor.precompute_fixed_parts(base, state.warped_source, weight, patch_slices)
+        batch_incor.precompute_fixed_parts(
+            base, state.warped_source, weight, patch_slices,
+            base_patches=base_patches, weight_patches=weight_patches,
+        )
 
     # Pre-compute external penalty if needed (vectorized: global sum minus each patch)
     external_pen = torch.zeros(B, device=device)
@@ -894,29 +912,44 @@ def _improve_warp_batched(
     # every optimizer iteration -- saves ~45 MB of memory copies per iter)
     global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)
 
+    # Pre-build expansion matrix: (n_active, n_total) maps active params to
+    # full param vector with axis weight scaling. Replaces a Python for-loop
+    # + per-call torch.zeros allocation from the hot path.
+    expand_mat = torch.zeros(n_active, n_total, device=device)
+    idx = 0
+    for dim_i in active_dims:
+        offset = dim_i * n_basis
+        scale = axis_weights[dim_i]
+        expand_mat[idx:idx+n_basis, offset:offset+n_basis] = scale * torch.eye(n_basis, device=device)
+        idx += n_basis
+
+    # Pre-compute coordinate base offsets: (B, V), constant per phase
+    base_i = ibots[:, None] + ii_flat[None, :]
+    base_j = jbots[:, None] + jj_flat[None, :]
+    base_k = kbots[:, None] + kk_flat[None, :]
+
+    # Optionally compile stable building-block functions (cached by name, compiled once)
+    _eval_warp = _maybe_compile(evaluate_patch_warp_batched, "eval_warp", device, config.compile)
+    _compose = _maybe_compile(batched_compose_and_interpolate, "compose", device, config.compile)
+
     # Define the batched cost function (differentiable through autograd)
     def batched_cost(active_params: Tensor) -> Tensor:
         """(B, n_active) -> (B,) costs. Differentiable."""
         # Expand active params to full params with axis weights
-        full_params = torch.zeros(B, n_total, device=device)
-        idx = 0
-        for dim_i in active_dims:
-            offset = dim_i * n_basis
-            scale = axis_weights[dim_i]
-            full_params[:, offset:offset+n_basis] = active_params[:, idx:idx+n_basis] * scale
-            idx += n_basis
+        full_params = active_params @ expand_mat  # (B, n_active) @ (n_active, n_total) → (B, n_total)
 
         # Batched basis evaluation: (B, V) displacements
-        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
+        hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
 
         # Batched compose + interpolate (fused 4-ch: source + warp in one grid_sample)
-        warped_vals, ah_xd, ah_yd, ah_zd = batched_compose_and_interpolate(
+        warped_vals, ah_xd, ah_yd, ah_zd = _compose(
             source, state.xd, state.yd, state.zd,
             hxd, hyd, hzd,
             ii_flat, jj_flat, kk_flat,
             ibots, jbots, kbots,
             nx, ny, nz,
             global_warp_3ch=global_warp_3ch,
+            base_i=base_i, base_j=base_j, base_k=base_k,
         )
 
         warped_vals = warped_vals * mask_patches
@@ -951,22 +984,17 @@ def _improve_warp_batched(
 
     # Apply optimized parameters - update global warp AND warped_source in one pass
     with torch.no_grad():
-        full_params = torch.zeros(B, n_total, device=device)
-        idx = 0
-        for dim_i in active_dims:
-            offset = dim_i * n_basis
-            scale = axis_weights[dim_i]
-            full_params[:, offset:offset+n_basis] = best_params[:, idx:idx+n_basis] * scale
-            idx += n_basis
+        full_params = best_params @ expand_mat  # reuse pre-built expansion matrix
 
-        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
-        warped_vals, ah_xd, ah_yd, ah_zd = batched_compose_and_interpolate(
+        hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
+        warped_vals, ah_xd, ah_yd, ah_zd = _compose(
             source, state.xd, state.yd, state.zd,
             hxd, hyd, hzd,
             ii_flat, jj_flat, kk_flat,
             ibots, jbots, kbots,
             nx, ny, nz,
             global_warp_3ch=global_warp_3ch,
+            base_i=base_i, base_j=base_j, base_k=base_k,
         )
 
         # Write back warp AND warped_source (non-overlapping patches, safe)

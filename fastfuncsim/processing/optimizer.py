@@ -183,15 +183,17 @@ def optimize_warp_params_batched(
     optimizer = torch.optim.Adam([params], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iter)
 
-    with torch.no_grad():
-        best_costs = batched_cost_fn(params.detach())
+    # Avoid torch.no_grad() for initial eval — if building-block functions
+    # are compiled, the grad_mode toggle triggers a dynamo recompilation.
+    # params.detach() already prevents gradient tracking.
+    best_costs = batched_cost_fn(params.detach()).detach()
     best_params = params.detach().clone()
     prev_total = best_costs.sum().item()
 
     no_improve_count = 0
 
     for step in range(max_iter):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         costs = batched_cost_fn(params)  # (B,) differentiable
         loss = costs.sum()
@@ -209,12 +211,12 @@ def optimize_warp_params_batched(
 
         current_total = loss.item()
 
-        # Per-patch best tracking
+        # Per-patch best tracking (no .any() — avoids GPU→CPU sync;
+        # torch.where is a no-op when improved is all-False)
         with torch.no_grad():
             improved = costs < best_costs
-            if improved.any():
-                best_costs[improved] = costs[improved].detach()
-                best_params[improved] = params[improved].detach()
+            best_costs = torch.where(improved, costs.detach(), best_costs)
+            best_params = torch.where(improved.unsqueeze(1), params.detach(), best_params)
 
         # Early stopping on total improvement
         if abs(current_total - prev_total) < tolerance * max(abs(prev_total), 1e-6):

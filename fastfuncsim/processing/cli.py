@@ -125,6 +125,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                            "{prefix}.nii.gz (original), {prefix}_tsmooth.nii.gz (smoothed), "
                            "plus per-volume _WARP_tXXX and _WARPsmooth_tXXX warp files. "
                            "0 = off [default: %(default)s]")
+    g_ts.add_argument("-n_pcs", type=int, default=0, metavar="N",
+                      help="Extract N principal components from the 4D warp fields "
+                           "for use as regressors of no interest. PCs are extracted "
+                           "per active displacement axis (i.e. axes not disabled by "
+                           "-noXdis/-noYdis/-noZdis). When multiple axes are active, "
+                           "their warps are concatenated before PCA. Output is saved "
+                           "as {prefix}_warps/{basename}_warpPCs.1D with N columns. "
+                           "0 = off [default: %(default)s]")
 
     # ── Warp Initialization ─────────────────────────────────────────────
     g_init = p.add_argument_group(
@@ -293,6 +301,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_hw.add_argument("-gpu_mem", type=float, default=15.0, metavar="GB",
                       help="Available GPU memory in GB. Used for batch size estimation "
                            "[default: %(default)s]")
+    g_hw.add_argument("-compile", action="store_true",
+                      help="Enable torch.compile for building-block functions (CUDA). "
+                           "Adds warmup overhead on first volume but may speed up "
+                           "large datasets. Off by default")
     g_hw.add_argument("-memcheck", action="store_true",
                       help="Print GPU memory estimate for the input data and exit "
                            "without running registration")
@@ -545,6 +557,90 @@ def _apply_warp_to_volume(
     return result
 
 
+def _extract_warp_pcs(
+    all_warps_raw: list[tuple[Tensor, Tensor, Tensor]],
+    n_pcs: int,
+    do_x: bool, do_y: bool, do_z: bool,
+    pad_x: int, pad_y: int, pad_z: int,
+    nx: int, ny: int, nz: int,
+    out_path: str,
+    verb: int = 1,
+) -> None:
+    """Extract temporal PCs from 4D warp fields and save as .1D regressor file.
+
+    Concatenates active axes' 3D warps (unpadded) into a (n_vols, n_voxels)
+    matrix, runs PCA to get temporal PCs, and writes them as columns.
+    Uses the project's PCA class (covariance-trick SVD for efficiency).
+    """
+    from ..pca import PCA
+
+    n_vols = len(all_warps_raw)
+    if n_vols < 3:
+        if verb >= 1:
+            print(f"WARNING: Only {n_vols} volumes, need >= 3 for warp PCA — skipping")
+        return
+
+    n_pcs = min(n_pcs, n_vols - 1)
+
+    # Collect active axis warps, cropping padding
+    axis_labels = []
+    vol_vecs = []
+    for t in range(n_vols):
+        xd, yd, zd = all_warps_raw[t]
+        parts = []
+        if do_x:
+            crop = xd[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx] if (pad_x or pad_y or pad_z) else xd
+            parts.append(crop.reshape(-1))
+            if t == 0:
+                axis_labels.append("X")
+        if do_y:
+            crop = yd[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx] if (pad_x or pad_y or pad_z) else yd
+            parts.append(crop.reshape(-1))
+            if t == 0:
+                axis_labels.append("Y")
+        if do_z:
+            crop = zd[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx] if (pad_x or pad_y or pad_z) else zd
+            parts.append(crop.reshape(-1))
+            if t == 0:
+                axis_labels.append("Z")
+        vol_vecs.append(torch.cat(parts))
+
+    if not axis_labels:
+        if verb >= 1:
+            print("WARNING: No active displacement axes for warp PCA — skipping")
+        return
+
+    # (n_vols, n_voxels_concat) matrix — PCA class handles centering + covariance trick
+    mat = torch.stack(vol_vecs).float()
+    del vol_vecs
+
+    pca = PCA(n_components=n_pcs)
+    scores = pca.fit_transform(mat)  # (n_vols, n_pcs)
+
+    # Normalize scores to unit variance for use as regressors
+    sc_std = scores.std(dim=0, keepdim=True).clamp(min=1e-10)
+    pcs = scores / sc_std
+
+    var_explained = pca.explained_variance_ratio_[:n_pcs]
+
+    if verb >= 1:
+        axes_str = "+".join(axis_labels)
+        var_pct = [f"{v*100:.1f}%" for v in var_explained.tolist()]
+        print(f"Warp PCs ({axes_str}, {n_vols} vols): extracted {n_pcs} PCs, "
+              f"var explained: {', '.join(var_pct)}")
+
+    # Write .1D file (AFNI-style: space-separated columns, one row per volume)
+    with open(out_path, "w") as f:
+        f.write(f"# Warp displacement PCs from ffs_qwarp\n")
+        f.write(f"# Active axes: {'+'.join(axis_labels)}, {n_vols} volumes, {n_pcs} PCs\n")
+        f.write(f"# Variance explained: {' '.join(f'{v*100:.2f}%' for v in var_explained.tolist())}\n")
+        for row in pcs.cpu().numpy():
+            f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
+
+    if verb >= 1:
+        print(f"Saved: {out_path}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -698,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
         maxdisp=args.maxdisp,
         lpa_sigma=args.lpa_sigma,
         level_stop_tol=args.level_stop,
+        compile=args.compile,
     )
 
     if args.blur is not None:
@@ -762,6 +859,10 @@ def main(argv: list[str] | None = None) -> int:
         pad_x, pad_y, pad_z = 0, 0, 0
 
     # --- Process volumes ---
+    # Enable TF32 matmul precision on Ampere+ GPUs (free perf, ~1e-5 precision)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
     all_warped = []
 
     if timeseries_mode:
@@ -771,10 +872,11 @@ def main(argv: list[str] | None = None) -> int:
 
         zpad = _zeropad_width(nt_full)
         do_tsmooth = args.tsmooth > 0
+        do_warp_pcs = args.n_pcs > 0
 
         # Create warp output directory
         warp_dir = f"{prefix}_warps"
-        if not args.no_save_warp:
+        if not args.no_save_warp or do_warp_pcs:
             os.makedirs(warp_dir, exist_ok=True)
             if args.verb >= 1:
                 print(f"Warp output directory: {warp_dir}/")
@@ -907,8 +1009,8 @@ def main(argv: list[str] | None = None) -> int:
                     units="mm",
                 )
 
-            # Keep raw warps for temporal smoothing
-            if do_tsmooth:
+            # Keep raw warps for temporal smoothing or PC extraction
+            if do_tsmooth or do_warp_pcs:
                 all_warps_raw.append((xd_cpu, yd_cpu, zd_cpu))
 
             # Chain: crop padded warp back to unpadded size, add to buffer
@@ -922,13 +1024,11 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     unpadded_warp = (xd_cpu, yd_cpu, zd_cpu)
                 warp_buffer.append((unpadded_warp, src_idx))
-            elif not do_tsmooth:
+            elif not (do_tsmooth or do_warp_pcs):
                 del xd_cpu, yd_cpu, zd_cpu
 
-            # Clear GPU memory
+            # Free GPU tensors (caching allocator reuses memory for next volume)
             del warped, xd, yd, zd, base_gpu, src_gpu, w_gpu
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
         # Save original (unsmoothed) 4D warped timeseries
         warped_4d = torch.stack(all_warped, dim=0)
@@ -976,6 +1076,17 @@ def main(argv: list[str] | None = None) -> int:
             save_image(warped_4d_smooth, f"{prefix}_tsmooth.nii.gz", header_info=base_info)
             if args.verb >= 1:
                 print(f"Saved: {prefix}_tsmooth.nii.gz ({warped_4d_smooth.shape[0]} volumes, smoothed)")
+
+        # --- Extract warp PCs as regressors of no interest ---
+        if do_warp_pcs and all_warps_raw:
+            _extract_warp_pcs(
+                all_warps_raw, args.n_pcs,
+                do_x=not args.noXdis, do_y=not args.noYdis, do_z=not args.noZdis,
+                pad_x=pad_x, pad_y=pad_y, pad_z=pad_z,
+                nx=nx, ny=ny, nz=nz,
+                out_path=os.path.join(warp_dir, f"{warp_basename}_warpPCs.1D"),
+                verb=args.verb,
+            )
 
     else:
         # Standard mode: separate base and source
