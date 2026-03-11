@@ -270,13 +270,13 @@ def _evaluate_hrfs_batched(
 
     # Pre-slice data by runs (views, no copy)
     run_ends = run_starts[1:] + [n_timepoints]
-    data_by_run = [projected_data[:, s:e] for s, e in zip(run_starts, run_ends)]
+    data_by_run = [projected_data[:, s:e] for s, e in zip(run_starts, run_ends, strict=False)]
 
     # Pre-slice designs by runs
     designs_by_run: list[list[torch.Tensor]] = []
     for d_idx in range(n_designs):
         d = projected_designs[d_idx]
-        designs_by_run.append([d[s:e, :] for s, e in zip(run_starts, run_ends)])
+        designs_by_run.append([d[s:e, :] for s, e in zip(run_starts, run_ends, strict=False)])
 
     # Detect LORO: each timepoint appears in test exactly once across all folds.
     # For LORO we use streaming SS_res accumulation (fast, O(n_voxels) accumulators).
@@ -877,7 +877,7 @@ def fit_glm_hrf_library_with_xval(
         # Per-run data statistics
         run_ends = run_starts[1:] + [n_timepoints]
         print("\nPer-run data statistics (raw):")
-        for ri, (rs, re) in enumerate(zip(run_starts, run_ends)):
+        for ri, (rs, re) in enumerate(zip(run_starts, run_ends, strict=False)):
             rd = data[:, rs:re]
             print(
                 f"  Run {ri}: TRs [{rs}:{re}] mean={rd.mean():.2f} std={rd.std():.2f} "
@@ -885,7 +885,7 @@ def fit_glm_hrf_library_with_xval(
             )
 
         print("\nPer-run projected data statistics:")
-        for ri, (rs, re) in enumerate(zip(run_starts, run_ends)):
+        for ri, (rs, re) in enumerate(zip(run_starts, run_ends, strict=False)):
             rd = projected_data[:, rs:re]
             print(
                 f"  Run {ri}: mean={rd.mean():.4f} std={rd.std():.2f} "
@@ -2161,7 +2161,7 @@ def save_hrf_selection_results(
 
             warnings.warn(
                 "save_all_hrf_designs=True but onsets not provided. "
-                "Cannot generate individual HRF design matrices."
+                "Cannot generate individual HRF design matrices.", stacklevel=2
             )
         else:
             # Get parameters from metadata

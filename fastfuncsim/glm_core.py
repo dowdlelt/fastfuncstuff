@@ -78,7 +78,7 @@ class GLMResults:
     def to_spatial(self):
         """Reshape results back to spatial dimensions if available"""
         if self.original_shape is None:
-            warnings.warn("Original shape not stored, cannot reshape")
+            warnings.warn("Original shape not stored, cannot reshape", stacklevel=2)
             return self
 
         if len(self.original_shape) == 3:
@@ -352,7 +352,7 @@ def fit_glm(
     original_shape = None
     data_2d: list[torch.Tensor] = []
     storage_device = device if preload_data_to_device else torch.device("cpu")
-    for i, d in enumerate(data):
+    for _i, d in enumerate(data):
         d_tensor = to_tensor(d, device=storage_device)
         d_tensor = d_tensor.to(dtype)
         if not preload_data_to_device and d_tensor.device.type != "cpu":
@@ -504,7 +504,7 @@ def fit_glm(
     dof = design_concat.shape[0] - design_concat.shape[1]
     if dof <= 0:
         warnings.warn(
-            "Non-positive degrees of freedom detected in GLM fit; statistics may be invalid"
+            "Non-positive degrees of freedom detected in GLM fit; statistics may be invalid", stacklevel=2
         )
         dof = max(1, dof)
 

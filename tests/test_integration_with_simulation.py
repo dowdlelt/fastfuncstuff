@@ -42,7 +42,7 @@ class TestSimulationBasedGLM:
         # Create experimental design
         # 2 conditions, randomized inter-trial intervals
         onsets_list = []
-        for run_idx in range(n_runs):
+        for _run_idx in range(n_runs):
             onsets = torch.zeros(n_timepoints, 2, device=device)
             # Place 10 events per condition at random times
             for cond in [0, 1]:
@@ -304,7 +304,7 @@ class TestCrossValidation:
 
         # Create multi-run experiment
         onsets_list = []
-        for run_idx in range(n_runs):
+        for _run_idx in range(n_runs):
             onsets = torch.zeros(n_timepoints, 2, device=device)
             # Different event timing per run
             event_times = torch.randperm(n_timepoints, device=device)[:8]

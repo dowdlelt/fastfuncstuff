@@ -323,7 +323,7 @@ class TestCrossValidateNoisePCs:
 
         # Create simple noise PCs
         noise_pcs = []
-        for run_idx in range(n_runs):
+        for _run_idx in range(n_runs):
             pc = torch.randn(n_timepoints, max_components, device=device)
             noise_pcs.append(pc)
 

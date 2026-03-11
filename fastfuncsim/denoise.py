@@ -110,7 +110,7 @@ def _compute_local_run_starts(
     n_runs = len(run_starts)
     local_run_starts = [0]
 
-    for i, run_idx in enumerate(run_indices[:-1]):
+    for _i, run_idx in enumerate(run_indices[:-1]):
         start_tp = run_starts[run_idx]
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
         run_length = end_tp - start_tp

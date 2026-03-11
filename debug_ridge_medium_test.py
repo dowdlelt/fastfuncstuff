@@ -25,7 +25,7 @@ print("="*70)
 onsets_by_condition = []
 for cond_idx in range(2):
     cond_onsets = []
-    for run_idx in range(n_runs):
+    for _run_idx in range(n_runs):
         events = np.sort(np.random.choice(n_timepoints, size=6, replace=False))
         cond_onsets.append(events * tr)
     onsets_by_condition.append(cond_onsets)
@@ -66,7 +66,7 @@ true_betas = torch.tensor([3.0, 5.0], device=device)
 
 # Create condition-wise onsets for simulation
 onsets_list = []
-for run_idx in range(n_runs):
+for _run_idx in range(n_runs):
     onsets = torch.zeros(n_timepoints, 2, device=device)
     for cond_idx in range(2):
         events = torch.randperm(n_timepoints, device=device)[:6]
@@ -76,7 +76,7 @@ for run_idx in range(n_runs):
 hrf = get_canonical_hrf(stim_duration=0.0, tr=tr, duration=30.0, device=device)
 
 data_list = []
-for run_idx, onsets in enumerate(onsets_list):
+for _run_idx, onsets in enumerate(onsets_list):
     data = simulate_fmri_run(
         onsets=onsets,
         betas=true_betas.tolist(),

@@ -416,7 +416,7 @@ def create_single_trial_design(
     # Build single-trial onset matrix (microtime)
     onset_matrix_micro = torch.zeros(n_microtime, total_trials, dtype=torch.float32, device=device)
 
-    for trial_idx, (cond_idx, run_idx, trial_in_run, onset_time) in enumerate(trial_info):
+    for trial_idx, (cond_idx, run_idx, _trial_in_run, onset_time) in enumerate(trial_info):
         # Convert onset time to microtime bin
         # CRITICAL: Use bins_per_tr-based offset (not TR-based) to avoid drift
         # This must match convolve_hrf_microtime's sampling grid

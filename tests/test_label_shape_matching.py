@@ -175,7 +175,7 @@ class TestDesignMetadata:
 
         # Extract stimulus indices
         stim_indices = []
-        for bot, top in zip(design_info["stim_bots"], design_info["stim_tops"]):
+        for bot, top in zip(design_info["stim_bots"], design_info["stim_tops"], strict=False):
             stim_indices.extend(range(bot, top + 1))
 
         # Check: correct number of stimulus columns

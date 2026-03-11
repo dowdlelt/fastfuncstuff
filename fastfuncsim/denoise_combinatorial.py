@@ -1297,7 +1297,7 @@ def plot_singleton_contributions(
         baseline_cod = None
         singleton_deltas = []
 
-        for combo, cod in zip(run_res.all_combinations, run_res.all_cod):
+        for combo, cod in zip(run_res.all_combinations, run_res.all_cod, strict=False):
             if len(combo) == 0:
                 baseline_cod = cod
             elif len(combo) == 1:
@@ -1389,7 +1389,7 @@ def plot_plateau_curves(
 
         # Group CoD by number of PCs in combination
         cod_by_n = {n: [] for n in range(max_pcs + 1)}
-        for combo, cod in zip(run_res.all_combinations, run_res.all_cod):
+        for combo, cod in zip(run_res.all_combinations, run_res.all_cod, strict=False):
             n_pcs = len(combo)
             if n_pcs <= max_pcs:
                 cod_by_n[n_pcs].append(cod)
@@ -1506,7 +1506,7 @@ def plot_inclusion_heatmap(
         # Find baseline and singleton CoDs
         baseline_cod = None
         singleton_deltas = {}
-        for combo, cod in zip(run_res.all_combinations, run_res.all_cod):
+        for combo, cod in zip(run_res.all_combinations, run_res.all_cod, strict=False):
             if len(combo) == 0:
                 baseline_cod = cod
             elif len(combo) == 1:

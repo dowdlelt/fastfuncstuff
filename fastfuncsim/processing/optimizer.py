@@ -192,7 +192,7 @@ def optimize_warp_params_batched(
 
     no_improve_count = 0
 
-    for step in range(max_iter):
+    for _step in range(max_iter):
         optimizer.zero_grad(set_to_none=True)
 
         costs = batched_cost_fn(params)  # (B,) differentiable

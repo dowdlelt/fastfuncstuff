@@ -284,7 +284,7 @@ def generate_isi_sequence(
 
     # Select exactly n_isis
     if len(isis) < n_isis:
-        warnings.warn(f"Only generated {len(isis)} valid ISIs, need {n_isis}. Padding with mean.")
+        warnings.warn(f"Only generated {len(isis)} valid ISIs, need {n_isis}. Padding with mean.", stacklevel=2)
         isis = np.concatenate([isis, np.full(n_isis - len(isis), target_mean)])
     else:
         isis = isis[:n_isis]
@@ -299,7 +299,7 @@ def generate_isi_sequence(
             max_iters = 100
             tolerance = 0.01  # 1% of target mean
 
-        for i in range(max_iters):
+        for _i in range(max_iters):
             current_mean = isis.mean()
             error = target_mean - current_mean
 
@@ -451,7 +451,7 @@ def sample_design_space(
     sample_idx = 0
     for ordering in event_orderings:
         for dist in isi_distributions:
-            for rep in range(n_samples):
+            for _rep in range(n_samples):
                 # Generate event sequence (WHAT)
                 event_sequence = generate_event_sequence(
                     n_trials_per_condition=n_trials_per_condition,
@@ -590,7 +590,7 @@ def evaluate_design_candidates(
             candidate.metrics = metrics
 
         except Exception as e:
-            warnings.warn(f"Failed to evaluate candidate {i}: {e}")
+            warnings.warn(f"Failed to evaluate candidate {i}: {e}", stacklevel=2)
             candidate.metrics = {
                 "detection_power": np.nan,
                 "estimation_efficiency": np.nan,

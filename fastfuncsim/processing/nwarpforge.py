@@ -778,7 +778,7 @@ def nwarpforge(
     transforms: list[Transform] = []
     max_time_points = 1
 
-    for i_spec, spec in enumerate(nwarp_specs):
+    for _i_spec, spec in enumerate(nwarp_specs):
         kind = identify_transform_type(spec)
         if verb >= 1:
             print(f"Loading {kind}: {spec}")

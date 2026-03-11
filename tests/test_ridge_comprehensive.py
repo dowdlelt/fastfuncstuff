@@ -168,9 +168,9 @@ class TestRidgeSubWorkflows:
 
         # Create onset lists (simulating what CLI tools would produce)
         onsets_by_condition = []
-        for cond_idx in range(n_conditions):
+        for _cond_idx in range(n_conditions):
             cond_onsets = []
-            for run_idx in range(n_runs):
+            for _run_idx in range(n_runs):
                 # Random event times for this run/condition
                 events = np.sort(np.random.choice(n_timepoints, size=8, replace=False))
                 # Convert to seconds (onsets are in TR units)
@@ -225,9 +225,9 @@ class TestRidgeSubWorkflows:
 
         # Create onsets
         onsets_by_condition = []
-        for cond_idx in range(n_conditions):
+        for _cond_idx in range(n_conditions):
             cond_onsets = []
-            for run_idx in range(n_runs):
+            for _run_idx in range(n_runs):
                 events = np.sort(
                     np.random.choice(n_timepoints, size=events_per_cond, replace=False)
                 )
@@ -361,9 +361,9 @@ class TestRidgeFullPipeline:
         # Create onsets for single-trial design
         onsets_by_condition = []
         trial_idx = 0
-        for cond_idx in range(n_conditions):
+        for _cond_idx in range(n_conditions):
             cond_onsets = []
-            for run_idx in range(n_runs):
+            for _run_idx in range(n_runs):
                 # Each event is a separate trial
                 events = np.sort(
                     np.random.choice(n_timepoints, size=events_per_cond, replace=False)
@@ -511,7 +511,7 @@ class TestRidgeFullPipeline:
         onsets_by_condition = []
         for cond_idx in range(n_conditions):
             cond_onsets = []
-            for run_idx in range(n_runs):
+            for _run_idx in range(n_runs):
                 events = np.sort(np.random.choice(n_timepoints, size=5, replace=False))
                 cond_onsets.append(events * tr)
             onsets_by_condition.append(cond_onsets)
@@ -542,7 +542,7 @@ class TestRidgeFullPipeline:
         hrf = hrf_library[0]
 
         onsets_list = []
-        for run_idx in range(n_runs):
+        for _run_idx in range(n_runs):
             onsets = torch.zeros(n_timepoints, 2, device=device)
             for cond_idx in range(2):
                 events = torch.randperm(n_timepoints, device=device)[:5]

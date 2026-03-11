@@ -249,7 +249,7 @@ def main():
 
     if args.verbose and len(timing_files) > 0:
         print(f"\nStimuli: {len(timing_files)}")
-        for i, (label, hrf, im) in enumerate(zip(stim_labels, hrf_models, im_modes)):
+        for i, (label, hrf, im) in enumerate(zip(stim_labels, hrf_models, im_modes, strict=False)):
             mode_str = " (IM)" if im else ""
             print(f"  {i+1}. {label}: {hrf}{mode_str}")
 

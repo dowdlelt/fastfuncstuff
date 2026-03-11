@@ -770,7 +770,7 @@ def main():
         # Show HRF distribution
         unique_hrfs, counts = torch.unique(hrf_indices, return_counts=True)
         print(f"  HRF distribution across {len(unique_hrfs)} unique HRFs:")
-        for hrf_idx_show, count in zip(unique_hrfs[:5].tolist(), counts[:5].tolist()):
+        for hrf_idx_show, count in zip(unique_hrfs[:5].tolist(), counts[:5].tolist(), strict=False):
             print(f"    HRF {hrf_idx_show}: {count:,} voxels ({count / n_voxels * 100:.1f}%)")
         if len(unique_hrfs) > 5:
             print(f"    ... and {len(unique_hrfs) - 5} more HRFs")

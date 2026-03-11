@@ -1614,7 +1614,7 @@ def main():
         # Show HRF distribution
         unique_hrfs, counts = torch.unique(hrf_indices, return_counts=True)
         print(f"  HRF distribution across {len(unique_hrfs)} unique HRFs:")
-        for hrf_idx, count in zip(unique_hrfs[:5].tolist(), counts[:5].tolist()):
+        for hrf_idx, count in zip(unique_hrfs[:5].tolist(), counts[:5].tolist(), strict=False):
             print(f"    HRF {hrf_idx}: {count:,} voxels ({count / n_voxels * 100:.1f}%)")
         if len(unique_hrfs) > 5:
             print(f"    ... and {len(unique_hrfs) - 5} more HRFs")
@@ -1717,7 +1717,7 @@ def main():
     if args.ortvec:
         # Load and concatenate all ortvec files
         ortvec_all = []
-        for ortvec_file, label in args.ortvec:
+        for ortvec_file, _label in args.ortvec:
             ortvec_data = load_nuisance_file(ortvec_file)
             ortvec_data = to_tensor(ortvec_data, device=device)
             if ortvec_data.shape[0] != n_timepoints:

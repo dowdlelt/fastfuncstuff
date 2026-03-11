@@ -231,7 +231,7 @@ class TestTimingProfilerEdgeCases:
         """Test profiler with many calls to the same operation."""
         profiler = TimingProfiler(enabled=True)
 
-        for i in range(10):
+        for _i in range(10):
             with profiler.profile("repeated_op"):
                 time.sleep(0.001)
 

@@ -365,7 +365,7 @@ def parse_glt_string(glt_string: str) -> tuple[dict[str, float], bool]:
 
         warnings.warn(
             f"GLT weights sum to {weight_sum:.6f}, expected 0 (difference) or 1 (average). "
-            f"GLT: '{glt_string}'"
+            f"GLT: '{glt_string}'", stacklevel=2
         )
 
     return weights, is_valid

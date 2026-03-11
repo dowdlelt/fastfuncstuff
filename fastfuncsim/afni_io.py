@@ -662,7 +662,7 @@ def extract_stimulus_columns(
     if stim_indices is None:
         # Extract all stimulus columns
         stim_cols = []
-        for bot, top in zip(stim_bots, stim_tops):
+        for bot, top in zip(stim_bots, stim_tops, strict=False):
             stim_cols.extend(range(bot, top + 1))
     else:
         # Extract specified stimulus columns
@@ -710,7 +710,7 @@ def extract_nuisance_columns(
 
     # Find nuisance columns (everything except stimulus columns)
     stim_cols = set()
-    for bot, top in zip(stim_bots, stim_tops):
+    for bot, top in zip(stim_bots, stim_tops, strict=False):
         stim_cols.update(range(bot, top + 1))
 
     nuisance_cols = [i for i in range(matrix.shape[1]) if i not in stim_cols]
@@ -1009,7 +1009,7 @@ def extract_design_metadata(
     stim_column_indices = []
 
     if stim_bots and stim_tops:
-        for bot, top in zip(stim_bots, stim_tops):
+        for bot, top in zip(stim_bots, stim_tops, strict=False):
             stim_column_indices.extend(range(bot, top + 1))
 
     # Extract stimulus labels (subset of full labels)

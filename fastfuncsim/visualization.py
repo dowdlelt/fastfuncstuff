@@ -1028,7 +1028,7 @@ def plot_noise_pool_pca_scree(
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
     colors = plt.cm.tab10(np.linspace(0, 1, len(ratios_np)))  # ty: ignore[unresolved-attribute]
 
-    for run_idx, (ratios, color) in enumerate(zip(ratios_np, colors)):
+    for run_idx, (ratios, color) in enumerate(zip(ratios_np, colors, strict=False)):
         x = np.arange(1, len(ratios) + 1)
         ax1.plot(x, ratios, color=color, linewidth=1.5, alpha=0.9, label=f"Run {run_idx + 1}")
 
@@ -1205,7 +1205,7 @@ def plot_denoising_pcs(
         colors = plt.cm.tab10(np.linspace(0, 1, n_runs))  # ty: ignore[unresolved-attribute]
         current_tp = 0
 
-        for run_idx, (pcs, color) in enumerate(zip(pcs_np, colors)):
+        for run_idx, (pcs, color) in enumerate(zip(pcs_np, colors, strict=False)):
             run_length = pcs.shape[0]
             run_time = np.arange(run_length) * tr + current_tp * tr
             ax_tc.plot(

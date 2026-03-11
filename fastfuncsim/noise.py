@@ -203,7 +203,7 @@ def generate_fmri_noise_batch(tr: float,
         device = get_device()
 
     noise_list = []
-    for i in range(n_batches):
+    for _i in range(n_batches):
         noise = generate_fmri_noise(tr, duration_s, matrix_size, device=device, **kwargs)
         noise_list.append(noise)
 

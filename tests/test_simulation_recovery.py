@@ -114,7 +114,7 @@ def _make_event_schedule(
     fill_run = n_events_per_cond < 0
     min_events = abs(n_events_per_cond)
 
-    for cond in range(n_conditions):
+    for _cond in range(n_conditions):
         cond_onsets = []
         for _ in range(n_runs):
             onsets = []

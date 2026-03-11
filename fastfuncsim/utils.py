@@ -63,7 +63,7 @@ def get_device(prefer_device: str | None = None) -> torch.device:
                     "CPU execution is disabled on macOS builds; Apple MPS backend is required."
                 )
             warnings.warn(
-                "CPU execution requested. Performance may be significantly reduced without GPU acceleration."
+                "CPU execution requested. Performance may be significantly reduced without GPU acceleration.", stacklevel=2
             )
             return torch.device("cpu")
         raise ValueError(
@@ -83,7 +83,7 @@ def get_device(prefer_device: str | None = None) -> torch.device:
         return torch.device("cuda")
 
     warnings.warn(
-        "No GPU backend detected; falling back to CPU execution. Performance will be limited."
+        "No GPU backend detected; falling back to CPU execution. Performance will be limited.", stacklevel=2
     )
     return torch.device("cpu")
 
@@ -216,7 +216,7 @@ def scale_to_percent_signal(
 
     # Compute run boundaries
     run_ends = run_starts[1:] + [n_timepoints_total]
-    run_lengths = [end - start for start, end in zip(run_starts, run_ends)]
+    run_lengths = [end - start for start, end in zip(run_starts, run_ends, strict=False)]
 
     # Storage for per-run statistics
     mean_per_run = torch.zeros(n_voxels, n_runs, device=device)
@@ -369,7 +369,7 @@ def gaussian_blur_3d(
     # Create 1D Gaussian kernels for each dimension
     # Kernel size should be large enough to capture the Gaussian (typically 3-4 sigma each side)
     kernels = []
-    for dim, sigma in enumerate(sigma_vox):
+    for _dim, sigma in enumerate(sigma_vox):
         if sigma < 0.1:
             # Very small sigma - skip this dimension (identity)
             kernels.append(None)

@@ -225,7 +225,7 @@ def convolve_hrf_microtime(
         # Storage for single-trial regressors (at microtime resolution)
         trial_regressors_micro = torch.zeros(n_microtime_points, n_events, device=device)
 
-        for event_idx, (start, end) in enumerate(zip(event_starts, event_ends)):
+        for event_idx, (start, end) in enumerate(zip(event_starts, event_ends, strict=False)):
             # Create single-event onset vector
             single_event = torch.zeros(n_microtime_points, device=device)
             single_event[start:end] = cond_onsets[start:end]
@@ -966,7 +966,7 @@ def build_glm_design(
 
     designs = []
 
-    for run_idx, (onset, n_tp) in enumerate(zip(onsets, n_timepoints)):
+    for _run_idx, (onset, n_tp) in enumerate(zip(onsets, n_timepoints, strict=False)):
         onset = to_tensor(onset, device=device)
 
         if single_trial:
@@ -1114,7 +1114,7 @@ def generate_random_onsets(
 
     # Build onset matrix
     onsets = torch.zeros(n_timepoints, n_conditions, device=device)
-    for onset_time, condition in zip(onset_times, conditions):
+    for onset_time, condition in zip(onset_times, conditions, strict=False):
         if onset_time < n_timepoints:
             onsets[onset_time, condition] = 1
 

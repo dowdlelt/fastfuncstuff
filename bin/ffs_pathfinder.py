@@ -1513,7 +1513,7 @@ def main():
 
     # Add ortvec if provided
     if args.ortvec:
-        for ortvec_file, label in args.ortvec:
+        for ortvec_file, _label in args.ortvec:
             nuisance_data = load_nuisance_file(ortvec_file, expected_rows=n_timepoints)
             print(f"  Loaded nuisance: {ortvec_file} ({nuisance_data.shape[1]} columns)")
             for run_idx in range(n_runs):

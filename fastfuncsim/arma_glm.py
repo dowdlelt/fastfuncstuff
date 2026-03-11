@@ -1037,7 +1037,7 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
 
     except RuntimeError as e:
         # Cholesky failed - return large penalty
-        warnings.warn(f"Cholesky decomposition failed: {e}")
+        warnings.warn(f"Cholesky decomposition failed: {e}", stacklevel=2)
         return 1e10
 
 
@@ -1466,7 +1466,7 @@ def precompute_reml_grid(
     except RuntimeError as e:
         # Fallback to sequential if batch fails
         if verbose:
-            warnings.warn(f"Batch Cholesky failed ({e}), falling back to sequential...")
+            warnings.warn(f"Batch Cholesky failed ({e}), falling back to sequential...", stacklevel=2)
 
         # CRITICAL: Clean up GPU memory from failed batch attempt!
         # Delete any partially-allocated batch tensors
@@ -1550,7 +1550,7 @@ def precompute_reml_grid(
             except RuntimeError as e2:
                 if verbose:
                     warnings.warn(
-                        f"Cholesky failed for (a={a_val:.3f}, b={b_val:.3f}): {e2}"
+                        f"Cholesky failed for (a={a_val:.3f}, b={b_val:.3f}): {e2}", stacklevel=2
                     )
                 continue
 
@@ -2246,7 +2246,7 @@ def search_voxels_precomputed_grid(
     use_qr = precomputed_grid[param_list[0]]["use_qr"]
 
     # Evaluate each grid point
-    for grid_idx, (a, b) in enumerate(param_list):
+    for _grid_idx, (a, b) in enumerate(param_list):
         with profile_section("1_get_grid_data", enabled=enable_timing):
             grid_data = precomputed_grid[(a, b)]
 
@@ -3287,7 +3287,7 @@ def fit_glm_arma11(
     raw_dof = n_timepoints - n_regressors
     if raw_dof <= 0:
         warnings.warn(
-            "Non-positive degrees of freedom detected in ARMA(1,1) fit; statistics may be unreliable"
+            "Non-positive degrees of freedom detected in ARMA(1,1) fit; statistics may be unreliable", stacklevel=2
         )
 
     # Allocate storage for results

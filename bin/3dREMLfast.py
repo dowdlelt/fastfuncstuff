@@ -1120,7 +1120,7 @@ def main():
             stim_tops = callback_design_info.get("stim_tops", [])
             stim_indices = []
             if stim_bots and stim_tops:
-                for bot, top in zip(stim_bots, stim_tops):
+                for bot, top in zip(stim_bots, stim_tops, strict=False):
                     stim_indices.extend(range(bot, top + 1))
 
             # Extract labels for stimulus columns only (not all 322 columns!)

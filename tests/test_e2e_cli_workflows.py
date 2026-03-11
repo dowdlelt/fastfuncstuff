@@ -56,7 +56,7 @@ class TestDenoiseWorkflow:
 
         # Create multi-run experiment with varying signal strengths
         onsets_list = []
-        for run_idx in range(n_runs):
+        for _run_idx in range(n_runs):
             onsets = torch.zeros(n_timepoints, 2, device=device)
             # 10 events per condition
             for cond in [0, 1]:

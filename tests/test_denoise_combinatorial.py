@@ -285,7 +285,7 @@ class TestFitCombinatorialDenoising:
 
         data_per_run = []
         design_per_run = []
-        for run_idx in range(n_runs):
+        for _run_idx in range(n_runs):
             run_design = torch.randn(run_length, n_conditions, device=device)
             run_signal = run_design @ torch.randn(n_voxels, n_conditions, device=device).T * 0.5
             noise_weights = torch.zeros(n_voxels, k, device=device)
