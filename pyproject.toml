@@ -65,6 +65,13 @@ where = ["."]
 include = ["fastfuncsim*"]
 exclude = ["tests*", "examples*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+norecursedirs = [".git", ".tox", "dist", "build", "*.egg", "examples"]
+
 [tool.ty.environment]
 python-version = "3.12"
 
