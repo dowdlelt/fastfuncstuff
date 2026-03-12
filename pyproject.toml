@@ -7,7 +7,8 @@ name = "fastfuncsim"
 version = "0.1.0"
 description = "Fast GPU-accelerated functional MRI simulation and GLM fitting"
 readme = "README.md"
-authors = [{name = "FastFuncSim Developers"}]
+license = "MIT"
+authors = [{name = "Logan Grosenick"}]
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.23",
@@ -30,14 +31,34 @@ test = [
     "pytest>=7.0",
     "scikit-learn>=1.2",
 ]
+dev = [
+    "pytest>=7.0",
+    "scikit-learn>=1.2",
+    "ruff>=0.9",
+]
 
 [project.scripts]
+# Analysis tools
+ffs_denoise = "fastfuncsim.cli.denoise:main"
+ffs_hrfopt = "fastfuncsim.cli.hrfopt:main"
+ffs_reml = "fastfuncsim.cli.reml:main"
+ffs_ridge = "fastfuncsim.cli.ridge:main"
+ffs_xval_r2 = "fastfuncsim.cli.xval_r2:main"
+ffs_build_design = "fastfuncsim.cli.build_design:main"
+ffs_decompose = "fastfuncsim.cli.decompose:main"
+ffs_deconvolve = "fastfuncsim.cli.deconvolve:main"
+ffs_denoisatorial = "fastfuncsim.cli.denoisatorial:main"
+ffs_ica = "fastfuncsim.cli.ica:main"
+ffs_pathfinder = "fastfuncsim.cli.pathfinder:main"
+ffs_tps = "fastfuncsim.cli.tps:main"
+# Image processing tools
 ffs_nwarp = "fastfuncsim.processing.nwarpforge_cli:main"
 ffs_allineate = "fastfuncsim.processing.allineate_cli:main"
 ffs_moco = "fastfuncsim.processing.ffs_moco_cli:main"
 ffs_qwarp = "fastfuncsim.processing.cli:main"
 ffs_motsim = "fastfuncsim.processing.ffs_motsim:main"
 ffs_util_pcwarp = "fastfuncsim.processing.pcwarp_cli:main"
+ffs_automask = "fastfuncsim.processing.mask_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -108,6 +129,6 @@ ignore = [
 "__init__.py" = ["F401"]  # Allow unused imports in __init__
 "examples/*.py" = ["B007", "E402"]  # Allow unused loop vars, late imports
 "notebooks/*.ipynb" = ["E702", "F841", "B007"]  # Allow semicolons, unused vars, unused loop vars in notebooks
-"bin/*.py" = ["E402"]  # Allow late imports in CLI scripts (sys.path manipulation)
+"bin/*.py" = ["E402"]  # Allow late imports in thin wrapper scripts
+"fastfuncsim/cli/*.py" = ["E402"]  # Allow late imports in CLI scripts
 "tests/*.py" = ["B023", "E402"]  # Allow function definition in loop, late imports
-"debug_*.py" = ["E402"]  # Allow late imports in debug scripts

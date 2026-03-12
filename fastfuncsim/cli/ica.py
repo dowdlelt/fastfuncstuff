@@ -35,7 +35,7 @@ import torch
 
 # fastfuncsim imports
 try:
-    from fastfuncsim import decomposition_io, ica_postprocess, ica_workflow
+    from fastfuncsim.decomposition import io as decomposition_io, postprocess as ica_postprocess, workflow as ica_workflow
     from fastfuncsim.io.afni import get_tr_from_file, load_afni_mask, load_nifti
     from fastfuncsim.cli_utils import parse_input_files, print_cli_header
     from fastfuncsim.decomposition.ica import FastICA

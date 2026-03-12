@@ -49,14 +49,11 @@ from __future__ import annotations
 
 import argparse
 
-# Add parent directory to path for imports
 import os
 import sys
 
 import numpy as np
 import torch
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from fastfuncsim.io.afni import (
     load_nifti,
