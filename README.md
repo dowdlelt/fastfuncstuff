@@ -44,37 +44,198 @@ fastfuncsim/
 
 ## Command-Line Tools
 
-After installation, these are available as commands:
+All tools are installed as commands via `pip install -e .` and accept
+`-help` for full usage. Input files can be `.nii`, `.nii.gz`, or `.nii.zst`
+(zstandard-compressed NIfTI).
 
-### Analysis
 
-| Command | Description |
-|---------|-------------|
-| `ffs_denoise` | Cross-validated noise PC denoising (GLMdenoise) |
-| `ffs_hrfopt` | Per-voxel HRF optimization via cross-validation |
-| `ffs_reml` | ARMA(1,1) prewhitened GLM (like AFNI 3dREMLfit) |
-| `ffs_ridge` | Fractional ridge regression, per-voxel regularization |
-| `ffs_xval_r2` | Cross-validated R-squared for model comparison |
-| `ffs_build_design` | Build design matrices from AFNI-style onset files |
-| `ffs_deconvolve` | Event-related deconvolution (FIR estimation) |
-| `ffs_ica` | MELODIC-style ICA with auto component selection |
-| `ffs_decompose` | ICA decomposition with stability analysis |
-| `ffs_denoisatorial` | Combinatorial denoising (exhaustive PC subset search) |
-| `ffs_pathfinder` | Joint HRF + denoising optimization |
-| `ffs_tps` | Thin-plate spline HRF estimation |
+### ffs_denoise -- Cross-validated noise PC denoising
+
+Implements the GLMdenoise algorithm (Kay et al., 2013). Identifies a noise
+pool (voxels with low task R-squared), extracts principal components from that
+pool, and uses leave-one-run-out cross-validation to select the optimal number
+of PCs to include as nuisance regressors. The anti-overfitting strategy:
+training data is denoised but test predictions are evaluated against raw data.
+
+Supports PCA or ICA-based noise extraction, automatic component caps via
+Marchenko-Pastur thresholding, brainstem/CSF noise pool targeting, and
+single-trial design modes. Outputs denoised data, noise PC timecourses,
+R-squared maps, and diagnostic plots.
+
+```
+ffs_denoise -input run*.nii.gz -onsets face.txt house.txt \
+            -durations 2.0 5.0 -tr 1.5 -prefix sub01_denoise
+```
+
+
+### ffs_hrfopt -- Per-voxel HRF optimization
+
+Cross-validated HRF library selection. Tests each HRF shape from a library
+(default: 20 canonical variants spanning peak times ~3-8s and with/without
+undershoot) against every voxel via LORO cross-validation. Selects the
+best-fitting HRF per voxel. Supports both canonical parameter-variation
+libraries and PIGHS (half-cosine basis) libraries.
+
+Two-pass GPU-efficient approach: pass 1 evaluates all HRFs in cross-validation,
+pass 2 recomputes betas using the selected HRF per voxel.
+
+```
+ffs_hrfopt -input run*.nii.gz -onsets face.txt house.txt \
+           -durations 2.0 5.0 -tr 1.5 -prefix sub01_hrfopt
+```
+
+
+### ffs_reml -- ARMA(1,1) prewhitened GLM
+
+GPU-accelerated equivalent of AFNI's 3dREMLfit. Fits a GLM with ARMA(1,1)
+noise modeling via REML grid search over (a, b) parameter space. Produces
+correctly-weighted t-statistics that account for temporal autocorrelation.
+Accepts AFNI-style design matrices (`-matrix`) or builds designs from onset
+files. Outputs AFNI-compatible bucket files with beta/t-stat pairs.
+
+```
+ffs_reml -input run*.nii.gz -matrix design.1D -prefix sub01_reml
+```
+
+
+### ffs_ridge -- Fractional ridge regression
+
+Single-trial beta estimation with per-voxel regularization (GLMsingle Type D).
+Uses fractional ridge where the regularization parameter is expressed as a
+fraction of lambda_max, giving a bounded [0, 1] parameter space. Cross-validates
+to select the optimal fraction per voxel. Can incorporate denoising results
+(`-denoise`) and HRF optimization results (`-hrf_opt`) from upstream steps.
+
+```
+ffs_ridge -input run*.nii.gz -onsets face.txt house.txt \
+          -durations 2.0 5.0 -tr 1.5 -prefix sub01_ridge \
+          -denoise sub01_denoise -hrf_opt sub01_hrfopt
+```
+
+
+### ffs_xval_r2 -- Cross-validated R-squared
+
+Computes cross-validated R-squared maps using LORO or split-half CV with
+nuisance projection. Useful for comparing model quality across different
+preprocessing choices or design specifications without overfitting.
+
+```
+ffs_xval_r2 -input run*.nii.gz -onsets face.txt house.txt \
+            -durations 2.0 -tr 1.5 -prefix sub01_xval
+```
+
+
+### ffs_build_design -- Design matrix construction
+
+Builds AFNI-compatible design matrices from onset timing files and HRF
+specifications. Supports microtime resolution convolution, multiple HRF
+models (spmg1, spmg2, spmg3, dmBLOCK, etc.), polynomial drift regressors,
+and extra nuisance regressors from motion files. Outputs a 1D matrix file
+readable by ffs_reml or AFNI programs.
+
+```
+ffs_build_design -onsets face.txt house.txt -durations 2.0 5.0 \
+                 -tr 1.5 -n_timepoints 200 -prefix design
+```
+
+
+### ffs_deconvolve -- Event-related deconvolution
+
+FIR-style deconvolution without assuming an HRF shape. Estimates the
+hemodynamic response at each lag timepoint using regularized least squares.
+Useful for validating HRF assumptions or exploring response dynamics.
+
+```
+ffs_deconvolve -input run*.nii.gz -onsets stim.txt -tr 1.5 \
+               -n_lags 20 -prefix sub01_fir
+```
+
+
+### ffs_ica -- MELODIC-style ICA
+
+Whole-brain ICA with automatic component estimation. Supports Bayesian
+dimensionality estimation (MELODIC-style), ICASSO stability analysis for
+robust component selection, and depth-dependent lag analysis for identifying
+BOLD vs. non-BOLD components. Preprocessing includes optional spatial
+smoothing, polynomial detrending, Fourier high-pass filtering, and
+percent-signal scaling. Processes runs independently.
+
+```
+ffs_ica -input run1.nii.gz -n_components auto -icasso 25 \
+        -prefix sub01_ica
+```
+
+
+### ffs_decompose -- ICA decomposition with stability
+
+Similar to ffs_ica but focused on component stability analysis via ICASSO
+clustering. Runs ICA multiple times with different initializations, clusters
+the resulting components by similarity, and extracts stable centroids.
+
+```
+ffs_decompose -input func.nii.gz -n_components 30 -n_runs 25 \
+              -prefix sub01_decomp
+```
+
+
+### ffs_denoisatorial -- Combinatorial denoising
+
+Exhaustive evaluation of all 2^k PC subsets (for moderate k) to find the
+optimal non-contiguous combination of noise PCs. Unlike sequential denoising
+(which tests prefixes 1..k), this tests every possible subset. Uses LORO
+cross-validation with an inner CV loop for criteria voxel selection. Supports
+"argmax" and "parsimonious" (fewest PCs within 1% of max) selection strategies.
+
+```
+ffs_denoisatorial -input run*.nii.gz -onsets face.txt house.txt \
+                  -durations 2.0 -tr 1.5 -max_pcs 10 -prefix sub01_combo
+```
+
+
+### ffs_pathfinder -- Joint HRF + denoising optimization
+
+Jointly optimizes HRF selection and noise PC denoising. For each candidate
+HRF, evaluates denoised cross-validated R-squared to find the HRF that
+works best with the selected denoising level per voxel.
+
+```
+ffs_pathfinder -input run*.nii.gz -onsets face.txt house.txt \
+               -durations 2.0 -tr 1.5 -prefix sub01_pathfinder
+```
+
+
+### ffs_tps -- Thin-plate spline HRF estimation
+
+Estimates the HRF using penalized cubic splines with automatic
+cross-validated smoothness selection. Adapts to local SNR: high-SNR voxels
+get less smoothing, low-SNR voxels get more. Supports global optimization
+(one smoothness for all voxels) or per-voxel optimization.
+
+```
+ffs_tps -input func.nii.gz -stim_times onsets.txt -tps_window 0,20 \
+        -n_knots 15 -optimize_level global -output_prefix sub01_tps
+```
+
 
 ### Image Processing
 
 | Command | Description |
 |---------|-------------|
-| `ffs_moco` | Motion correction |
-| `ffs_allineate` | Affine alignment |
-| `ffs_nwarp` | Non-linear warping |
-| `ffs_qwarp` | Qwarp-style non-linear registration |
-| `ffs_automask` | Automatic brain masking |
-| `ffs_motsim` | Motion artifact simulation |
+| `ffs_moco` | Rigid-body motion correction with GPU-accelerated cost functions |
+| `ffs_allineate` | Affine (6/9/12-parameter) alignment between volumes |
+| `ffs_nwarp` | Non-linear warping with regularized displacement fields |
+| `ffs_qwarp` | Qwarp-style iterative non-linear registration |
+| `ffs_automask` | Automatic brain mask generation from EPI data |
+| `ffs_motsim` | Simulate motion artifacts for testing correction pipelines |
+| `ffs_util_pcwarp` | PC-based warp field analysis and manipulation |
 
-Each tool accepts `-help` for full usage and options.
+
+### I/O Notes
+
+All tools read `.nii`, `.nii.gz`, and `.nii.zst` (zstandard-compressed NIfTI)
+transparently. Zstandard offers ~30% better compression than gzip at much
+higher decompression speed, useful for large datasets. Install zstandard
+support with `pip install zstandard`.
 
 
 ## Typical Workflow
