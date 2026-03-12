@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from fastfuncsim.arma_glm import (
+from fastfuncsim.glm.arma import (
     ARMA11Results,
     _compute_arma11_lambda,
     calculate_grid_memory_footprint,

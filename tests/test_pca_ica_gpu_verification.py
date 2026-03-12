@@ -6,8 +6,8 @@ from scipy.stats import pearsonr
 from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.decomposition import FastICA as SklearnFastICA
 
-from fastfuncsim.ica import FastICA
-from fastfuncsim.pca import PCA
+from fastfuncsim.decomposition.ica import FastICA
+from fastfuncsim.decomposition.pca import PCA
 
 
 def check_sign_flip_correlation(a, b):

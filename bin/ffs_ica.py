@@ -36,10 +36,10 @@ import torch
 # fastfuncsim imports
 try:
     from fastfuncsim import decomposition_io, ica_postprocess, ica_workflow
-    from fastfuncsim.afni_io import get_tr_from_file, load_afni_mask, load_nifti
+    from fastfuncsim.io.afni import get_tr_from_file, load_afni_mask, load_nifti
     from fastfuncsim.cli_utils import parse_input_files, print_cli_header
-    from fastfuncsim.ica import FastICA
-    from fastfuncsim.ica_tools import (
+    from fastfuncsim.decomposition.ica import FastICA
+    from fastfuncsim.decomposition.tools import (
         apply_high_pass_fft,
         apply_polort_projection,
         batch_mixture_zscores,
@@ -48,7 +48,7 @@ try:
         estimate_ica_component_count,
         parse_num_comps_spec,
     )
-    from fastfuncsim.icasso import icasso
+    from fastfuncsim.decomposition.icasso import icasso
     from fastfuncsim.utils import (
         gaussian_blur_3d,
         get_device,

@@ -53,7 +53,7 @@ except ImportError:
 
 # Import fastfuncsim modules
 try:
-    from fastfuncsim.afni_io import (
+    from fastfuncsim.io.afni import (
         load_afni_mask,
         load_and_concatenate_runs,
         load_nifti,
@@ -65,22 +65,22 @@ try:
         parse_cv_strategy,
         parse_input_files,
     )
-    from fastfuncsim.denoise import (
+    from fastfuncsim.denoise.sequential import (
         extract_noise_pcs_per_run,
         select_noise_pool_voxels,
     )
-    from fastfuncsim.design import convolve_hrf_microtime
-    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
-    from fastfuncsim.glm_core import GLMResults, construct_polynomial_matrix, fit_glm
-    from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
-    from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
-    from fastfuncsim.hrf_selection import load_nuisance_file
+    from fastfuncsim.design.matrices import convolve_hrf_microtime
+    from fastfuncsim.design.builder import parse_afni_timing_file, parse_durations
+    from fastfuncsim.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
+    from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
+    from fastfuncsim.design.hrf import get_hrf_library, get_spmg1_hrf
+    from fastfuncsim.design.hrf_selection import load_nuisance_file
     from fastfuncsim.utils import (
         gaussian_blur_3d,
         get_device,
         scale_to_percent_signal,
     )
-    from fastfuncsim.xval import (
+    from fastfuncsim.glm.xval import (
         compute_xval_r2,
         generate_cv_splits,
         project_out_nuisance_per_run,

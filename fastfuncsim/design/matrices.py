@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .utils import get_device, to_tensor
+from fastfuncsim.utils import get_device, to_tensor
 
 
 def convolve_hrf(

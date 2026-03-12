@@ -26,7 +26,7 @@ __author__ = "Logan Grosenick (converted from MATLAB)"
 
 # Core GLM functionality
 # AFNI file I/O
-from .afni_io import (
+from fastfuncsim.io.afni import (
     extract_nuisance_columns,
     extract_stimulus_columns,
     get_contrast_matrix,
@@ -49,7 +49,7 @@ from .analysis import (
 )
 
 # ARMA(1,1) prewhitening for GLM analysis
-from .arma_glm import (
+from fastfuncsim.glm.arma import (
     ARMA11Results,
     batch_reml_grid_search,
     build_arma11_covariance,
@@ -63,7 +63,7 @@ from .arma_glm import (
 )
 
 # Cross-validated denoising
-from .denoise import (
+from fastfuncsim.denoise.sequential import (
     DenoiseResults,
     compute_full_brain_pc_loadings,
     cross_validate_noise_pcs,
@@ -73,7 +73,7 @@ from .denoise import (
 )
 
 # Design matrix construction
-from .design import (
+from fastfuncsim.design.matrices import (
     build_glm_design,
     convolve_hrf,
     generate_random_onsets,
@@ -82,7 +82,7 @@ from .design import (
 )
 
 # Design optimization (Liu & Frank metrics)
-from .design_optimization import (
+from fastfuncsim.design.optimization import (
     DesignCandidate,
     ISIConstraints,
     compare_designs_summary,
@@ -97,13 +97,13 @@ from .design_optimization import (
     plot_pareto_frontier,
     sample_design_space,
 )
-from .design_optimization import (
+from fastfuncsim.design.optimization import (
     plot_hrf_index_recovery as plot_design_hrf_recovery,
 )
-from .glm_core import GLMResults, fit_glm, fit_glm_hrf_library, percent_bold_change
+from fastfuncsim.glm.core import GLMResults, fit_glm, fit_glm_hrf_library, percent_bold_change
 
 # GLM output utilities
-from .glm_outputs import (
+from fastfuncsim.glm.outputs import (
     slice_glm_results,
     write_afni_bucket,
     write_glm_bucket_as_nifti,
@@ -112,7 +112,7 @@ from .glm_outputs import (
 )
 
 # HRF generation
-from .hrf import (
+from fastfuncsim.design.hrf import (
     create_flobs_library,  # Backwards compatibility alias
     create_pighs_library,
     flobs_halfcos,  # Backwards compatibility alias
@@ -123,7 +123,7 @@ from .hrf import (
 )
 
 # HRF selection with cross-validation
-from .hrf_selection import (
+from fastfuncsim.design.hrf_selection import (
     HRFSelectionResults,
     fit_glm_hrf_library_with_xval,
     load_hrf_selection_for_arma,
@@ -131,7 +131,7 @@ from .hrf_selection import (
 )
 
 # Empirical metrics (GLS with AR(1) correction)
-from .metrics_empirical import (
+from fastfuncsim.simulation.metrics_empirical import (
     build_ar1_covariance_matrix,
     compute_detection_power_empirical,
     compute_estimation_efficiency_empirical,
@@ -141,7 +141,7 @@ from .metrics_empirical import (
 )
 
 # Noise generation
-from .noise import (
+from fastfuncsim.simulation.noise import (
     add_drift,
     add_motion_artifacts,
     estimate_noise_parameters_from_data,
@@ -154,7 +154,7 @@ from .noise import (
 )
 
 # Simulation
-from .simulation import (
+from fastfuncsim.simulation.core import (
     create_parametric_voxels,
     save_simulation_outputs,
     simulate_batch_experiments,

@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .ica_tools import apply_high_pass_fft, apply_polort_projection
+from .tools import apply_high_pass_fft, apply_polort_projection
 
 try:
     import nibabel as nib

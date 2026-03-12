@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.ica_tools import (
+from fastfuncsim.decomposition.tools import (
     apply_high_pass_fft,
     apply_melodic_voxel_varnorm,
     apply_polort_projection,

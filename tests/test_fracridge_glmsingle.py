@@ -12,9 +12,9 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.ridge import _fit_ridge_multiple_fracs
+from fastfuncsim.glm.ridge import _fit_ridge_multiple_fracs
 from fastfuncsim.utils import get_device
-from fastfuncsim.xval import generate_cv_splits, single_trial_cv_helper
+from fastfuncsim.glm.xval import generate_cv_splits, single_trial_cv_helper
 
 
 @pytest.fixture
@@ -320,8 +320,8 @@ class TestFracridgeIntegration:
         Uses a well-spaced block-style design (>5 TRs between events) to ensure
         fracridge estimates are well-conditioned and frac discrimination works.
         """
-        from fastfuncsim.glm_core import construct_polynomial_matrix
-        from fastfuncsim.xval import project_out_nuisance_per_run
+        from fastfuncsim.glm.core import construct_polynomial_matrix
+        from fastfuncsim.glm.xval import project_out_nuisance_per_run
 
         torch.manual_seed(99)
         n_runs, n_tp_run = 4, 120       # 120 TPs per run gives ample spacing
@@ -411,8 +411,8 @@ class TestFracridgeIntegration:
         n_runs=4 case at least runs without errors, produces finite outputs, and
         gives non-degenerate frac selection (not all voxels pick the same frac).
         """
-        from fastfuncsim.glm_core import construct_polynomial_matrix
-        from fastfuncsim.xval import project_out_nuisance_per_run
+        from fastfuncsim.glm.core import construct_polynomial_matrix
+        from fastfuncsim.glm.xval import project_out_nuisance_per_run
 
         torch.manual_seed(17)
         n_runs, n_tp_run = 4, 100

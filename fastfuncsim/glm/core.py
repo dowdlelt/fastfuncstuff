@@ -15,10 +15,10 @@ import warnings
 import torch
 from tqdm.auto import tqdm
 
-from .design import convolve_hrf_microtime
-from .design_builder import legendre_polynomials
-from .memory import estimate_chunk_size
-from .utils import get_device, to_tensor
+from fastfuncsim.design.matrices import convolve_hrf_microtime
+from fastfuncsim.design.builder import legendre_polynomials
+from fastfuncsim.memory import estimate_chunk_size
+from fastfuncsim.utils import get_device, to_tensor
 from .xval import compute_r2_metric
 
 

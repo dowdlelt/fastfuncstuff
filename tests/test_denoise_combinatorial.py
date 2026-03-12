@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.denoise_combinatorial import (
+from fastfuncsim.denoise.combinatorial import (
     CombinatorialDenoiseResults,
     CombinatorialDenoiseRunResult,
     evaluate_all_combinations_for_run,

@@ -48,13 +48,13 @@ try:
         parse_input_files,
         preflight_check,
     )
-    from fastfuncsim.design_builder import (
+    from fastfuncsim.design.builder import (
         create_onset_matrix_microtime,
         parse_afni_timing_file,
         parse_durations,
     )
-    from fastfuncsim.hrf import get_hrf_library
-    from fastfuncsim.hrf_selection import (
+    from fastfuncsim.design.hrf import get_hrf_library
+    from fastfuncsim.design.hrf_selection import (
         _fit_voxelwise_hrf_canonical,
         _fit_voxelwise_hrf_single_trial,
         fit_glm_hrf_library_with_xval,
@@ -668,8 +668,8 @@ def main():
         # so in-sample R² is a fair comparison metric.
         from tqdm import tqdm
 
-        from fastfuncsim.ridge import create_single_trial_design
-        from fastfuncsim.xval import compute_qr_projectors, compute_r2_metric
+        from fastfuncsim.glm.ridge import create_single_trial_design
+        from fastfuncsim.glm.xval import compute_qr_projectors, compute_r2_metric
 
         print()
         print("=" * 70)
@@ -841,7 +841,7 @@ def main():
         del projected_designs_cache  # Free ~240 MB
 
         # Create HRFSelectionResults object
-        from fastfuncsim.hrf_selection import HRFSelectionResults
+        from fastfuncsim.design.hrf_selection import HRFSelectionResults
 
         xval_r2_std = torch.zeros_like(xval_r2_best)  # Not meaningful for in-sample R²
 
@@ -857,7 +857,7 @@ def main():
         hrfopt_full_r2 = xval_r2_best  # best-HRF per voxel, in-sample
 
         # Beta-series CV R² (genuine cross-validated)
-        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.glm.xval import compute_xval_r2_single_trials, generate_cv_splits
 
         cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
 
@@ -1055,7 +1055,7 @@ def main():
     # to {prefix}_canonical_stats.nii.gz. For single-trial betas, we need custom saving
     # to {prefix}_stats_single_trial.nii.gz instead of the default {prefix}_stats.nii.gz
     if args.save_single_trial_betas and results.final_results is not None:
-        from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
+        from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
 
         print("  Saving single-trial betas with custom filename...")
 

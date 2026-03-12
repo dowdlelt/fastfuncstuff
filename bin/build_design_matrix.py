@@ -41,8 +41,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from fastfuncsim.afni_io import get_tr_from_file, load_nifti
-from fastfuncsim.design_builder import (
+from fastfuncsim.io.afni import get_tr_from_file, load_nifti
+from fastfuncsim.design.builder import (
     build_design_matrix,
     parse_glt_string,
     write_afni_xmat,

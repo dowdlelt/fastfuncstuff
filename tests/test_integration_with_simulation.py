@@ -18,9 +18,9 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.glm_core import construct_polynomial_matrix, fit_glm
-from fastfuncsim.hrf import get_canonical_hrf
-from fastfuncsim.simulation import simulate_fmri_run
+from fastfuncsim.glm.core import construct_polynomial_matrix, fit_glm
+from fastfuncsim.design.hrf import get_canonical_hrf
+from fastfuncsim.simulation.core import simulate_fmri_run
 from fastfuncsim.utils import gaussian_blur_3d, get_device
 
 
@@ -79,7 +79,7 @@ class TestSimulationBasedGLM:
         design_all = torch.cat([onsets for onsets in onsets_list], dim=0)  # (total_tp, n_cond)
 
         # Convolve design with HRF
-        from fastfuncsim.design import build_glm_design
+        from fastfuncsim.design.matrices import build_glm_design
         design_conv = build_glm_design(design_all, hrf, n_timepoints * n_runs, mode='assumed', device=device)
 
         # Fit GLM
@@ -135,7 +135,7 @@ class TestSimulationBasedGLM:
         data_flat = data.reshape(-1, n_timepoints)
 
         # Build design
-        from fastfuncsim.design import build_glm_design
+        from fastfuncsim.design.matrices import build_glm_design
         design = build_glm_design(onsets, hrf, n_timepoints, mode='assumed', device=device)
 
         # Fit WITH polynomials (correct)
@@ -189,7 +189,7 @@ class TestSimulationBasedGLM:
         data_flat = data.reshape(-1, n_timepoints)
         n_voxels = data_flat.shape[0]
 
-        from fastfuncsim.design import build_glm_design
+        from fastfuncsim.design.matrices import build_glm_design
         design = build_glm_design(onsets, hrf, n_timepoints, mode='assumed', device=device)
 
         results = fit_glm(
@@ -336,14 +336,14 @@ class TestCrossValidation:
         data_runs = [d.reshape(-1, n_timepoints) for d in data_list]
 
         # Build run-wise design
-        from fastfuncsim.design import build_glm_design
+        from fastfuncsim.design.matrices import build_glm_design
         design_list = []
         for onsets in onsets_list:
             design_conv = build_glm_design(onsets, hrf, n_timepoints, mode='assumed', device=device)
             design_list.append(design_conv)
 
         # Run LORO CV
-        from fastfuncsim.xval import generate_cv_splits
+        from fastfuncsim.glm.xval import generate_cv_splits
         cv_splits = generate_cv_splits(n_runs, strategy=1)
 
         # Simple CV (no nuisance for now)
@@ -393,7 +393,7 @@ class TestDenoise:
         r2[:100] = torch.rand(100) * 0.5 + 0.3   # R² in [0.3, 0.8]
         r2[100:] = torch.rand(400) * 0.05          # R² in [0.0, 0.05]
 
-        from fastfuncsim.denoise import select_noise_pool_voxels
+        from fastfuncsim.denoise.sequential import select_noise_pool_voxels
         noise_pool, criteria = select_noise_pool_voxels(
             r2, threshold=0.1, min_noise_voxels=50
         )

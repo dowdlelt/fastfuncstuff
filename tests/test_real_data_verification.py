@@ -9,8 +9,8 @@ from scipy.stats import pearsonr
 from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.decomposition import FastICA as SklearnFastICA
 
-from fastfuncsim.ica import FastICA
-from fastfuncsim.pca import PCA
+from fastfuncsim.decomposition.ica import FastICA
+from fastfuncsim.decomposition.pca import PCA
 
 DATA_PATH = Path("/home/logan/Dropbox/Resources/code/fastfuncsim/test_data/small_validation_afni_data/small_test_r01.nii.gz")
 

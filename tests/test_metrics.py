@@ -23,8 +23,8 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.hrf import get_canonical_hrf
-from fastfuncsim.metrics import (
+from fastfuncsim.design.hrf import get_canonical_hrf
+from fastfuncsim.simulation.metrics import (
     compare_designs,
     compute_conditional_entropy,
     compute_detection_power,

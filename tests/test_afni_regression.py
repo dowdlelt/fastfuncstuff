@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from fastfuncsim.analysis import analyze_from_design_matrix
-from fastfuncsim.glm_outputs import write_glm_bucket_as_nifti
+from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
 
 # AFNI reference data paths (relative to project root)
 AFNI_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"

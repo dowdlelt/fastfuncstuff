@@ -25,9 +25,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from fastfuncsim.denoise import _compute_local_run_starts
-from fastfuncsim.pca import PCA
-from fastfuncsim.xval import (
+from fastfuncsim.denoise.sequential import _compute_local_run_starts
+from fastfuncsim.decomposition.pca import PCA
+from fastfuncsim.glm.xval import (
     compute_xval_r2,
     generate_cv_splits,
     project_out_nuisance_per_run,
@@ -1028,7 +1028,7 @@ def compute_optimized_xval_r2_3dDenoise_style(
     r2 : torch.Tensor
         Per-voxel cross-validated R2, (n_voxels,).
     """
-    from fastfuncsim.xval import compute_xval_r2, generate_cv_splits, project_out_nuisance_per_run
+    from fastfuncsim.glm.xval import compute_xval_r2, generate_cv_splits, project_out_nuisance_per_run
 
     if device is None:
         from fastfuncsim.utils import get_device

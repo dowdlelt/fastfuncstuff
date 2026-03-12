@@ -18,7 +18,7 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from fastfuncsim.design_optimization import (
+    from fastfuncsim.design.optimization import (
         ISIConstraints,
         create_onset_matrix,
         generate_event_sequence,
@@ -30,7 +30,7 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from fastfuncsim.metrics_empirical import (
+    from fastfuncsim.simulation.metrics_empirical import (
         compute_detection_power_empirical,  # noqa: F401
         estimate_ar1_coefficient,
     )

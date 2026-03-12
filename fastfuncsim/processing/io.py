@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from fastfuncsim.afni_io import load_nifti, save_nifti
+from fastfuncsim.io.afni import load_nifti, save_nifti
 
 try:
     import nibabel as nib

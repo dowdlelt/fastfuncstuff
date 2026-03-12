@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.xval import compute_xval_r2, generate_cv_splits
+from fastfuncsim.glm.xval import compute_xval_r2, generate_cv_splits
 
 
 def create_true_betas(

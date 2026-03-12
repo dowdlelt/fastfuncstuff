@@ -48,8 +48,8 @@ try:
         parse_input_files,
         print_cli_header,
     )
-    from fastfuncsim.denoise import select_noise_pool_voxels
-    from fastfuncsim.denoise_combinatorial import (
+    from fastfuncsim.denoise.sequential import select_noise_pool_voxels
+    from fastfuncsim.denoise.combinatorial import (
         CombinatorialDenoiseResults,
         compute_initial_xval_r2,
         compute_optimized_xval_r2_3dDenoise_style,
@@ -59,11 +59,11 @@ try:
         plot_plateau_curves,
         plot_singleton_contributions,
     )
-    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
-    from fastfuncsim.glm_core import construct_polynomial_matrix
-    from fastfuncsim.hrf import get_hrf_library
-    from fastfuncsim.hrf_selection import load_nuisance_file
-    from fastfuncsim.ridge import load_hrf_indices
+    from fastfuncsim.design.builder import parse_afni_timing_file, parse_durations
+    from fastfuncsim.glm.core import construct_polynomial_matrix
+    from fastfuncsim.design.hrf import get_hrf_library
+    from fastfuncsim.design.hrf_selection import load_nuisance_file
+    from fastfuncsim.glm.ridge import load_hrf_indices
     from fastfuncsim.utils import get_device, scale_to_percent_signal, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")

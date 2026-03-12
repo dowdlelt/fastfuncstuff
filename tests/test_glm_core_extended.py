@@ -12,7 +12,7 @@ Focus on:
 import pytest
 import torch
 
-from fastfuncsim.glm_core import (
+from fastfuncsim.glm.core import (
     construct_polynomial_matrix,
     fit_glm,
     orthogonalize_design,

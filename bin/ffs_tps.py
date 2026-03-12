@@ -58,17 +58,17 @@ import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from fastfuncsim.afni_io import (
+from fastfuncsim.io.afni import (
     load_nifti,
     save_nifti,
 )
-from fastfuncsim.design import (
+from fastfuncsim.design.matrices import (
     fit_penalized_glm,
     fit_penalized_glm_cv,
     make_penalty_matrix,
     make_tps_design,
 )
-from fastfuncsim.design_builder import legendre_polynomials, parse_afni_timing_file
+from fastfuncsim.design.builder import legendre_polynomials, parse_afni_timing_file
 from fastfuncsim.utils import get_device
 
 

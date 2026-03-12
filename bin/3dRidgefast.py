@@ -57,9 +57,9 @@ try:
         save_4d_nifti,
         save_volume_nifti,
     )
-    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
-    from fastfuncsim.hrf import get_hrf_library
-    from fastfuncsim.ridge import (
+    from fastfuncsim.design.builder import parse_afni_timing_file, parse_durations
+    from fastfuncsim.design.hrf import get_hrf_library
+    from fastfuncsim.glm.ridge import (
         create_single_trial_design,
         fit_ridge_single_trial,
         load_hrf_indices,
@@ -533,9 +533,9 @@ def main():
 
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-        from fastfuncsim.glm_outputs import save_single_trial_results
-        from fastfuncsim.ridge import _fit_ridge_multiple_fracs
-        from fastfuncsim.xval import (
+        from fastfuncsim.glm.outputs import save_single_trial_results
+        from fastfuncsim.glm.ridge import _fit_ridge_multiple_fracs
+        from fastfuncsim.glm.xval import (
             compute_r2_metric,
             generate_cv_splits,
             project_out_nuisance_per_run,

@@ -3,8 +3,8 @@ import numpy as np
 import torch
 from scipy.stats import pearsonr
 
-from fastfuncsim.ica import ica_stability_analysis, select_n_components_by_stability
-from fastfuncsim.icasso import icasso
+from fastfuncsim.decomposition.ica import ica_stability_analysis, select_n_components_by_stability
+from fastfuncsim.decomposition.icasso import icasso
 
 
 def check_sign_flip_correlation(a, b):

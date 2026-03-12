@@ -8,7 +8,7 @@ cross-validated R² metrics.
 import pytest
 import torch
 
-from fastfuncsim.xval import (
+from fastfuncsim.glm.xval import (
     compute_r2_metric,
     compute_xval_r2,
     generate_cv_splits,
@@ -532,7 +532,7 @@ class TestQRProjectors:
 
     def test_compute_qr_projectors_basic(self):
         """Test basic QR projector computation"""
-        from fastfuncsim.xval import compute_qr_projectors
+        from fastfuncsim.glm.xval import compute_qr_projectors
 
         _n_timepoints = 100
         n_nuisance = 5
@@ -573,7 +573,7 @@ class TestQRProjectors:
 
     def test_compute_qr_projectors_empty_nuisance(self):
         """Test QR projectors with no nuisance regressors"""
-        from fastfuncsim.xval import compute_qr_projectors
+        from fastfuncsim.glm.xval import compute_qr_projectors
 
         _n_timepoints = 100
         n_runs = 3
@@ -600,7 +600,7 @@ class TestQRProjectors:
 
     def test_compute_qr_projectors_rank_deficient(self):
         """Test QR projectors with rank-deficient nuisance (fewer timepoints than regressors)"""
-        from fastfuncsim.xval import compute_qr_projectors
+        from fastfuncsim.glm.xval import compute_qr_projectors
 
         # Create nuisance where n_regressors > n_timepoints for one run
         n_timepoints = 10
@@ -633,7 +633,7 @@ class TestProjectOutNuisancePerRun:
 
     def test_project_out_nuisance_per_run_basic(self):
         """Test basic per-run nuisance projection"""
-        from fastfuncsim.xval import project_out_nuisance_per_run
+        from fastfuncsim.glm.xval import project_out_nuisance_per_run
 
         n_voxels = 50
         n_timepoints = 100
@@ -672,8 +672,8 @@ class TestProjectOutNuisancePerRun:
 
     def test_project_out_nuisance_per_run_with_polynomials(self):
         """Test per-run projection with Legendre polynomials"""
-        from fastfuncsim.glm_core import construct_polynomial_matrix
-        from fastfuncsim.xval import project_out_nuisance_per_run
+        from fastfuncsim.glm.core import construct_polynomial_matrix
+        from fastfuncsim.glm.xval import project_out_nuisance_per_run
 
         n_voxels = 50
         n_timepoints = 100
@@ -714,7 +714,7 @@ class TestProjectOutNuisancePerRun:
 
     def test_project_out_nuisance_per_run_empty_nuisance(self):
         """Test per-run projection with no nuisance"""
-        from fastfuncsim.xval import project_out_nuisance_per_run
+        from fastfuncsim.glm.xval import project_out_nuisance_per_run
 
         n_voxels = 50
         n_timepoints = 100
@@ -748,7 +748,7 @@ class TestComputeR2MetricAdvanced:
 
     def test_r2_metric_cod(self):
         """Test CoD (coefficient of determination) metric"""
-        from fastfuncsim.xval import compute_r2_metric
+        from fastfuncsim.glm.xval import compute_r2_metric
 
         n_voxels = 10
         n_timepoints = 50
@@ -769,7 +769,7 @@ class TestComputeR2MetricAdvanced:
 
     def test_r2_metric_corr(self):
         """Test correlation metric"""
-        from fastfuncsim.xval import compute_r2_metric
+        from fastfuncsim.glm.xval import compute_r2_metric
 
         n_voxels = 10
         n_timepoints = 50
@@ -787,7 +787,7 @@ class TestComputeR2MetricAdvanced:
 
     def test_r2_metric_corr2(self):
         """Test squared correlation metric"""
-        from fastfuncsim.xval import compute_r2_metric
+        from fastfuncsim.glm.xval import compute_r2_metric
 
         n_voxels = 10
         n_timepoints = 50
@@ -805,7 +805,7 @@ class TestComputeR2MetricAdvanced:
 
     def test_r2_metric_perfect_prediction(self):
         """Test R² with perfect prediction"""
-        from fastfuncsim.xval import compute_r2_metric
+        from fastfuncsim.glm.xval import compute_r2_metric
 
         n_voxels = 10
         n_timepoints = 50
@@ -825,7 +825,7 @@ class TestComputeR2MetricAdvanced:
 
     def test_r2_metric_worst_prediction(self):
         """Test R² with worst-case prediction (unrelated)"""
-        from fastfuncsim.xval import compute_r2_metric
+        from fastfuncsim.glm.xval import compute_r2_metric
 
         n_voxels = 10
         n_timepoints = 50
@@ -865,7 +865,7 @@ class TestSingleTrialCVHelper:
 
     def test_single_variant_equivalence(self):
         """single_trial_cv_helper(unsqueeze) == compute_xval_r2_single_trials."""
-        from fastfuncsim.xval import compute_xval_r2_single_trials, single_trial_cv_helper
+        from fastfuncsim.glm.xval import compute_xval_r2_single_trials, single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas()
 
@@ -882,7 +882,7 @@ class TestSingleTrialCVHelper:
 
     def test_multi_variant_shape(self):
         """Output shape is (n_variants, n_voxels) for multiple variants."""
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas()
         n_variants = 5
@@ -898,7 +898,7 @@ class TestSingleTrialCVHelper:
 
     def test_multi_variant_identical_input_gives_same_r2(self):
         """All variants identical (no zscore) → same R² per variant."""
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas()
         n_variants = 3
@@ -914,7 +914,7 @@ class TestSingleTrialCVHelper:
 
     def test_zscore_normalization_math(self):
         """Z-scoring normalizes per-run betas using reference variant stats."""
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas(snr=5.0)
 
@@ -944,7 +944,7 @@ class TestSingleTrialCVHelper:
 
     def test_zscore_reference_variant(self):
         """Z-scoring with different reference variants gives different results."""
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas(snr=3.0)
 
@@ -971,7 +971,7 @@ class TestSingleTrialCVHelper:
 
     def test_single_condition(self):
         """Edge case: all trials belong to the same condition."""
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         n_voxels, n_trials, n_runs = 20, 16, 4
         torch.manual_seed(0)
@@ -990,7 +990,7 @@ class TestSingleTrialCVHelper:
 
     def test_zero_variance_voxels(self):
         """Edge case: voxels with zero variance across trials."""
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas()
 
@@ -1008,7 +1008,7 @@ class TestSingleTrialCVHelper:
 
     def test_chunked_matches_unchunked(self):
         """Chunked processing gives same result as unchunked."""
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas(n_voxels=100)
         multi = betas.unsqueeze(0)
@@ -1033,7 +1033,7 @@ class TestSingleTrialCVHelper:
         (n_variants, n_voxels) reshape.  Fixed by keeping chunks as
         (n_variants, n_chunk, n_test) and catting on dim=1.
         """
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas(n_voxels=100)
         n_variants = 5
@@ -1058,7 +1058,7 @@ class TestSingleTrialCVHelper:
         result as unchunked.  Covers the combined multi-variant + test_variant_idx
         + chunked code path.
         """
-        from fastfuncsim.xval import single_trial_cv_helper
+        from fastfuncsim.glm.xval import single_trial_cv_helper
 
         betas, cids, rids, splits = self._make_betas(n_voxels=80)
         n_variants = 4

@@ -15,7 +15,7 @@ def test_arma11_covariance():
     print("Test 1: ARMA(1,1) Covariance Matrix")
     print("="*70)
     
-    from fastfuncsim.arma_glm import build_arma11_covariance
+    from fastfuncsim.glm.arma import build_arma11_covariance
     from fastfuncsim.utils import get_device
     
     device = get_device()
@@ -61,8 +61,8 @@ def test_reml_grid_search():
     print("Test 2: REML Grid Search")
     print("="*70)
     
-    from fastfuncsim.arma_glm import reml_grid_search
-    from fastfuncsim.noise import generate_arma_noise
+    from fastfuncsim.glm.arma import reml_grid_search
+    from fastfuncsim.simulation.noise import generate_arma_noise
     from fastfuncsim.utils import get_device
     
     device = get_device()
@@ -119,7 +119,7 @@ def test_prewhitening():
     print("Test 3: Prewhitening")
     print("="*70)
     
-    from fastfuncsim.arma_glm import build_arma11_covariance, prewhiten_with_arma11
+    from fastfuncsim.glm.arma import build_arma11_covariance, prewhiten_with_arma11
     from fastfuncsim.utils import get_device
     
     device = get_device()
@@ -161,9 +161,9 @@ def test_glm_arma11():
     print("Test 4: Full ARMA(1,1) GLM Fit")
     print("="*70)
     
-    from fastfuncsim.arma_glm import fit_glm_arma11
-    from fastfuncsim.glm_core import fit_glm
-    from fastfuncsim.noise import generate_arma_noise
+    from fastfuncsim.glm.arma import fit_glm_arma11
+    from fastfuncsim.glm.core import fit_glm
+    from fastfuncsim.simulation.noise import generate_arma_noise
     from fastfuncsim.utils import get_device
     
     device = get_device()
@@ -242,8 +242,8 @@ def test_batch_processing():
     print("Test 5: Batch Processing")
     print("="*70)
     
-    from fastfuncsim.arma_glm import batch_reml_grid_search
-    from fastfuncsim.noise import generate_arma_noise
+    from fastfuncsim.glm.arma import batch_reml_grid_search
+    from fastfuncsim.simulation.noise import generate_arma_noise
     from fastfuncsim.utils import get_device
     
     device = get_device()

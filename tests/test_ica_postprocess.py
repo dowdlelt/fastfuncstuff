@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from fastfuncsim.ica_postprocess import (
+from fastfuncsim.decomposition.postprocess import (
     best_lag_and_r,
     mean_abs_by_selector,
     mean_z_excess_by_selector,

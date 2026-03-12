@@ -277,7 +277,7 @@ def load_and_preprocess_runs(
     try:
         from tqdm import tqdm
 
-        from fastfuncsim.afni_io import load_afni_mask, load_and_concatenate_runs, load_nifti
+        from fastfuncsim.io.afni import load_afni_mask, load_and_concatenate_runs, load_nifti
         from fastfuncsim.utils import gaussian_blur_3d, scale_to_percent_signal
     except ImportError as e:
         print(f"ERROR: Could not import required modules: {e}")
@@ -733,7 +733,7 @@ def build_nuisance_per_run(
     ...     device=torch.device("cuda"),
     ... )
     """
-    from fastfuncsim.glm_core import construct_polynomial_matrix
+    from fastfuncsim.glm.core import construct_polynomial_matrix
 
     n_runs = len(run_starts)
     nuisance_per_run = []
@@ -754,7 +754,7 @@ def build_nuisance_per_run(
     # Load ortvec files if provided
     if ortvec_files is not None:
         try:
-            from fastfuncsim.hrf_selection import load_nuisance_file
+            from fastfuncsim.design.hrf_selection import load_nuisance_file
             from fastfuncsim.utils import to_tensor
 
             ortvec_all = []
@@ -865,7 +865,7 @@ def build_nuisance_block_diag(
     ...     device=torch.device("cuda"),
     ... )
     """
-    from fastfuncsim.glm_core import construct_polynomial_matrix
+    from fastfuncsim.glm.core import construct_polynomial_matrix
 
     n_runs = len(run_starts)
     run_lengths = []
@@ -891,7 +891,7 @@ def build_nuisance_block_diag(
     # Load and add ortvec files if provided
     if ortvec_files is not None:
         try:
-            from fastfuncsim.hrf_selection import load_nuisance_file
+            from fastfuncsim.design.hrf_selection import load_nuisance_file
             from fastfuncsim.utils import to_tensor
 
             if verbose:
@@ -1093,7 +1093,7 @@ def parse_hrf_model_args(
     SystemExit
         If HRF model is invalid (prints error and exits)
     """
-    from .design_builder import parse_hrf_model
+    from fastfuncsim.design.builder import parse_hrf_model
 
     # Handle backwards compatibility with -canonical
     if canonical_arg is not None:
@@ -1316,8 +1316,8 @@ def build_task_design_from_args(
     """
     import sys
 
-    from .design import convolve_hrf_microtime, make_fir_design, make_tent_design
-    from .hrf import get_hrf_library, get_spmg1_hrf
+    from fastfuncsim.design.matrices import convolve_hrf_microtime, make_fir_design, make_tent_design
+    from fastfuncsim.design.hrf import get_hrf_library, get_spmg1_hrf
 
     if hrf_opt:
         # Per-voxel HRF mode: build designs_by_hrf dict
@@ -1404,7 +1404,7 @@ def build_task_design_from_args(
             if hrf_model_name in ("SPMG2", "SPMG3"):
                 # SPM canonical with derivatives
                 print(f"  Using SPM canonical HRF with derivatives ({hrf_model_name})")
-                from .hrf import get_spm_hrf_with_derivatives
+                from fastfuncsim.design.hrf import get_spm_hrf_with_derivatives
 
                 # Get HRF set (canonical + derivatives)
                 # Shape: (n_basis, hrf_length) where n_basis = 2 for SPMG2, 3 for SPMG3

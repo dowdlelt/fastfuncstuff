@@ -17,15 +17,15 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.glm_core import construct_polynomial_matrix
-from fastfuncsim.ridge import (
+from fastfuncsim.glm.core import construct_polynomial_matrix
+from fastfuncsim.glm.ridge import (
     _fit_ridge_multiple_fracs,
     create_single_trial_design,
     fit_ridge_single_trial,
 )
-from fastfuncsim.simulation import simulate_fmri_run
+from fastfuncsim.simulation.core import simulate_fmri_run
 from fastfuncsim.utils import get_device
-from fastfuncsim.xval import generate_cv_splits
+from fastfuncsim.glm.xval import generate_cv_splits
 
 
 @pytest.fixture
@@ -494,7 +494,7 @@ class TestRidgeFullPipeline:
         n_conditions = 2
 
         # Create HRF library
-        from fastfuncsim.hrf import get_hrf_library
+        from fastfuncsim.design.hrf import get_hrf_library
 
         hrf_library = get_hrf_library(
             models=["spmg1", "spmg2", "flox"],

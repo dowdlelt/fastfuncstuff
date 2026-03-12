@@ -12,7 +12,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from .afni_io import (
+from fastfuncsim.io.afni import (
     extract_stimulus_columns,
     get_run_lengths,
     load_afni_mask,
@@ -21,10 +21,10 @@ from .afni_io import (
     read_afni_design_matrix,
     read_afni_onset_files,
 )
-from .arma_glm import ARMA11Results, fit_glm_arma11, get_default_arma_grids
-from .design import build_glm_design, convolve_hrf_microtime
-from .glm_core import GLMResults, fit_glm, fit_glm_hrf_library
-from .hrf import get_hrf_library
+from fastfuncsim.glm.arma import ARMA11Results, fit_glm_arma11, get_default_arma_grids
+from fastfuncsim.design.matrices import build_glm_design, convolve_hrf_microtime
+from fastfuncsim.glm.core import GLMResults, fit_glm, fit_glm_hrf_library
+from fastfuncsim.design.hrf import get_hrf_library
 from .utils import get_device, to_tensor
 
 
@@ -747,7 +747,7 @@ def analyze_from_design_matrix(
     tr = design_info["tr"]
 
     # Extract stimulus metadata (needed for both OLS and ARMA)
-    from .afni_io import extract_design_metadata
+    from fastfuncsim.io.afni import extract_design_metadata
 
     full_labels, stim_labels, stim_indices = extract_design_metadata(design_info)
 
@@ -786,7 +786,7 @@ def analyze_from_design_matrix(
         # Create simple OLS write callback if output path provided
         ols_write_callback = None
         if ols_output_path is not None:
-            from .glm_outputs import write_glm_bucket_as_nifti
+            from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
 
             # Capture volume_shape and affine from outer scope for the callback
             callback_volume_shape = volume_shape
@@ -875,7 +875,7 @@ def analyze_from_design_matrix(
                 if single_trials_label and callback_stim_indices:
                     output_filename = f"ols_{single_trials_label}_single.nii.gz"
                     print(f"  • Writing OLS single-trial betas (onset order): {output_filename}")
-                    from .glm_outputs import write_single_trials_output
+                    from fastfuncsim.glm.outputs import write_single_trials_output
 
                     write_single_trials_output(
                         ols_results,
@@ -909,7 +909,7 @@ def analyze_from_design_matrix(
 
                     print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
 
-                    from .glm_outputs import (
+                    from fastfuncsim.glm.outputs import (
                         _get_voxel_mask,
                         _resolve_shape,
                         write_partial_r2_with_labels,
@@ -961,7 +961,7 @@ def analyze_from_design_matrix(
 
                     print(f"  • Writing OLS semi-partial R² per condition: {semipartial_r2_path}")
 
-                    from .glm_outputs import (
+                    from fastfuncsim.glm.outputs import (
                         _get_voxel_mask,
                         _resolve_shape,
                         write_partial_r2_with_labels,
@@ -1179,8 +1179,8 @@ def analyze_with_cross_validation(
     - Nuisance regressors are projected out before computing R²
     - Results are CPU tensors for easy saving/analysis
     """
-    from .afni_io import extract_design_metadata, read_afni_design_matrix
-    from .xval import compute_xval_r2, generate_cv_splits
+    from fastfuncsim.io.afni import extract_design_metadata, read_afni_design_matrix
+    from fastfuncsim.glm.xval import compute_xval_r2, generate_cv_splits
 
     # Auto-detect device
     if device is None:

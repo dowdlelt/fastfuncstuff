@@ -11,9 +11,9 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from .design import build_glm_design
+from fastfuncsim.design.matrices import build_glm_design
 from .noise import add_drift, generate_fmri_noise
-from .utils import get_device, print_device_info, to_tensor
+from fastfuncsim.utils import get_device, print_device_info, to_tensor
 
 
 def simulate_fmri_run(onsets: torch.Tensor,

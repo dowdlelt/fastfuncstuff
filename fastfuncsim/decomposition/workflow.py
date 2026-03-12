@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from scipy.stats import spearmanr
 
-from . import ica_postprocess
-from .ica_tools import apply_high_pass_fft, apply_melodic_voxel_varnorm, apply_polort_projection
+from . import postprocess as ica_postprocess
+from .tools import apply_high_pass_fft, apply_melodic_voxel_varnorm, apply_polort_projection
 
 
 def verbose_section(verbose: bool, name: str) -> None:

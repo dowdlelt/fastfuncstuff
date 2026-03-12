@@ -27,7 +27,7 @@ except ImportError:
 
 # Import fastfuncsim modules
 try:
-    from fastfuncsim.afni_io import (
+    from fastfuncsim.io.afni import (
         get_tr_from_file,
         load_nifti,
         read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
@@ -42,12 +42,12 @@ try:
         parse_device_arg,
         parse_input_files,
     )
-    from fastfuncsim.design_builder import (
+    from fastfuncsim.design.builder import (
         create_onset_matrix_microtime,
         parse_afni_timing_file,
         parse_durations,
     )
-    from fastfuncsim.glm_outputs import (
+    from fastfuncsim.glm.outputs import (
         slice_glm_results,
         write_glm_bucket_as_nifti,
     )
@@ -155,7 +155,7 @@ def write_single_trials_output(
     """
     import nibabel as nib
 
-    from fastfuncsim.glm_outputs import (
+    from fastfuncsim.glm.outputs import (
         _ensure_numpy,
         _get_voxel_mask,
         _reshape_parameter_map,
@@ -761,7 +761,7 @@ def main():
     ols_output_path = args.Obuck if args.Obuck else None
 
     # Load or build design matrix
-    from fastfuncsim.afni_io import read_afni_design_matrix
+    from fastfuncsim.io.afni import read_afni_design_matrix
 
     if args.matrix:
         # Load design matrix from file
@@ -961,9 +961,9 @@ def main():
 
     # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
     if args.beta_cv:
-        from fastfuncsim.glm_outputs import save_single_trial_results
-        from fastfuncsim.ridge import create_single_trial_design
-        from fastfuncsim.xval import compute_xval_r2_single_trials, generate_cv_splits
+        from fastfuncsim.glm.outputs import save_single_trial_results
+        from fastfuncsim.glm.ridge import create_single_trial_design
+        from fastfuncsim.glm.xval import compute_xval_r2_single_trials, generate_cv_splits
 
         print()
         print("=" * 70)
@@ -1180,7 +1180,7 @@ def main():
                 # Create a temporary results-like object with only betas
                 import nibabel as nib
 
-                from fastfuncsim.glm_outputs import (
+                from fastfuncsim.glm.outputs import (
                     _ensure_numpy,
                     _get_voxel_mask,
                     _reshape_parameter_map,
@@ -1265,7 +1265,7 @@ def main():
                     partial_r2_path = "OLS_partialR2.nii.gz"
                 print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
 
-                from fastfuncsim.glm_outputs import (
+                from fastfuncsim.glm.outputs import (
                     _get_voxel_mask,
                     _resolve_shape,
                     write_partial_r2_with_labels,
@@ -1561,7 +1561,7 @@ def main():
     want_r2_partial = args.rpartial
 
     # Extract design metadata using helper function (clean naming!)
-    from fastfuncsim.afni_io import extract_design_metadata
+    from fastfuncsim.io.afni import extract_design_metadata
 
     full_labels, stim_labels, stim_column_indices = extract_design_metadata(design_info)
 
@@ -1626,7 +1626,7 @@ def main():
         # Rbeta: ALL betas, no stats
         import nibabel as nib
 
-        from fastfuncsim.glm_outputs import (
+        from fastfuncsim.glm.outputs import (
             _ensure_numpy,
             _get_voxel_mask,
             _reshape_parameter_map,
@@ -1739,7 +1739,7 @@ def main():
         import shutil
         import subprocess
 
-        from fastfuncsim.glm_outputs import _save_nifti_with_format
+        from fastfuncsim.glm.outputs import _save_nifti_with_format
 
         # OPTIMIZATION: Write uncompressed first, then 3drefit, then compress
         # This avoids 3drefit having to decompress/recompress huge files!
@@ -1770,7 +1770,7 @@ def main():
 
         # Compress with pigz/zstd if output is compressed format
         if str(rvar_output_path).endswith('.nii.gz'):
-            from fastfuncsim.afni_io import compress_nifti
+            from fastfuncsim.io.afni import compress_nifti
             print(f"  • Compressing Rvar output...")
             compress_nifti(temp_nii_path, rvar_output_path, remove_original=True)
 
@@ -1792,7 +1792,7 @@ def main():
             partial_r2_path = "REML_partialR2.nii.gz"
         print(f"  • Writing REML partial R² per condition: {partial_r2_path}")
 
-        from fastfuncsim.glm_outputs import (
+        from fastfuncsim.glm.outputs import (
             _get_voxel_mask,
             _resolve_shape,
             write_partial_r2_with_labels,
@@ -1846,7 +1846,7 @@ def main():
 
         print(f"  • Writing REML nuisance partial R² per regressor: {nuisance_r2_path}")
 
-        from fastfuncsim.glm_outputs import (
+        from fastfuncsim.glm.outputs import (
             _get_voxel_mask,
             _resolve_shape,
             write_partial_r2_with_labels,
@@ -1902,7 +1902,7 @@ def main():
             semipartial_r2_path = "REML_semipartialR2.nii.gz"
         print(f"  • Writing REML semi-partial R² per condition: {semipartial_r2_path}")
 
-        from fastfuncsim.glm_outputs import (
+        from fastfuncsim.glm.outputs import (
             _get_voxel_mask,
             _resolve_shape,
             write_partial_r2_with_labels,
@@ -1958,7 +1958,7 @@ def main():
             f"  • Writing REML nuisance semi-partial R² per regressor: {nuisance_semi_r2_path}"
         )
 
-        from fastfuncsim.glm_outputs import (
+        from fastfuncsim.glm.outputs import (
             _get_voxel_mask,
             _resolve_shape,
             write_partial_r2_with_labels,
@@ -1996,7 +1996,7 @@ def main():
         if results.predicted is not None:
             import nibabel as nib
 
-            from fastfuncsim.glm_outputs import _ensure_numpy, _get_voxel_mask
+            from fastfuncsim.glm.outputs import _ensure_numpy, _get_voxel_mask
 
             affine = getattr(results, "affine", np.eye(4))
             volume_shape = getattr(results, "original_shape", None)
@@ -2026,7 +2026,7 @@ def main():
         if results.residuals is not None:
             import nibabel as nib
 
-            from fastfuncsim.glm_outputs import _ensure_numpy, _get_voxel_mask
+            from fastfuncsim.glm.outputs import _ensure_numpy, _get_voxel_mask
 
             affine = getattr(results, "affine", np.eye(4))
             volume_shape = getattr(results, "original_shape", None)
@@ -2062,7 +2062,7 @@ def main():
         output_filename = f"reml_{label}_single.nii.gz"
         print(f"  • Writing REML single-trial betas (onset order): {output_filename}")
         if "matrix" in design_info:
-            from fastfuncsim.glm_outputs import write_single_trials_output
+            from fastfuncsim.glm.outputs import write_single_trials_output
 
             write_single_trials_output(
                 results,

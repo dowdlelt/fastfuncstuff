@@ -16,11 +16,11 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.denoise import (
+from fastfuncsim.denoise.sequential import (
     _compute_local_run_starts,
     select_noise_pool_voxels,
 )
-from fastfuncsim.glm_core import construct_polynomial_matrix
+from fastfuncsim.glm.core import construct_polynomial_matrix
 from fastfuncsim.utils import get_device
 
 
@@ -114,7 +114,7 @@ class TestDenoiseCoreFunctions:
         extract_noise_pcs_per_run returns one tensor per run, each with shape
         (n_tp_run, n_components).  Components should be independent per run.
         """
-        from fastfuncsim.denoise import extract_noise_pcs_per_run
+        from fastfuncsim.denoise.sequential import extract_noise_pcs_per_run
 
         n_runs, n_tp_run = 3, 80
         n_voxels, n_noise = 100, 40
@@ -147,7 +147,7 @@ class TestDenoiseSubWorkflows:
         cross_validate_noise_pcs returns an (n_voxels, n_pc_counts) R² map
         and an aggregated (n_pc_counts,) array.  All values should be finite.
         """
-        from fastfuncsim.denoise import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncsim.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
 
         torch.manual_seed(0)
         n_runs, n_tp_run, tr = 3, 60, 2.0
@@ -190,7 +190,7 @@ class TestDenoiseSubWorkflows:
         select_optimal_pcs returns an index into 0..n_pc_counts-1 and a
         criteria mask.  When PC-0 is clearly the best, index 0 is selected.
         """
-        from fastfuncsim.denoise import select_optimal_pcs
+        from fastfuncsim.denoise.sequential import select_optimal_pcs
 
         n_voxels, n_pc_counts = 200, 6
 
@@ -210,7 +210,7 @@ class TestDenoiseSubWorkflows:
         select_optimal_pcs uses voxels that exceed the threshold in ANY PC
         count as criteria voxels.  Threshold=0 means all voxels are criteria.
         """
-        from fastfuncsim.denoise import select_optimal_pcs
+        from fastfuncsim.denoise.sequential import select_optimal_pcs
 
         n_voxels, n_pc_counts = 100, 4
         # Only voxels 0..19 exceed 0.1 in at least one PC count
@@ -232,7 +232,7 @@ class TestExtractNoisePCs:
 
     def test_extract_noise_pcs_with_mask(self, device):
         """Test PC extraction with noise pool mask"""
-        from fastfuncsim.denoise import extract_noise_pcs_per_run
+        from fastfuncsim.denoise.sequential import extract_noise_pcs_per_run
 
         n_voxels = 100
         n_timepoints = 200
@@ -271,7 +271,7 @@ class TestExtractNoisePCs:
 
     def test_extract_noise_pcs_returns_empty_for_no_noise(self, device):
         """Test that empty noise pool returns empty PCs"""
-        from fastfuncsim.denoise import extract_noise_pcs_per_run
+        from fastfuncsim.denoise.sequential import extract_noise_pcs_per_run
 
         n_voxels = 100
         n_timepoints = 200
@@ -307,7 +307,7 @@ class TestCrossValidateNoisePCs:
 
     def test_cross_validate_noise_pcs_returns_arrays(self, device):
         """Test that CV returns R² maps and summary"""
-        from fastfuncsim.denoise import cross_validate_noise_pcs
+        from fastfuncsim.denoise.sequential import cross_validate_noise_pcs
 
         n_voxels = 50
         n_timepoints = 200
@@ -351,7 +351,7 @@ class TestCrossValidateNoisePCs:
 
     def test_cross_validate_noise_pcs_with_design_matrix(self, device):
         """Test CV with explicit design matrix"""
-        from fastfuncsim.denoise import cross_validate_noise_pcs
+        from fastfuncsim.denoise.sequential import cross_validate_noise_pcs
 
         n_voxels = 30
         n_timepoints = 100
@@ -393,7 +393,7 @@ class TestSelectOptimalPCs:
 
     def test_select_optimal_pcs_returns_integer(self, device):
         """Test that optimal PC selection returns integer"""
-        from fastfuncsim.denoise import select_optimal_pcs
+        from fastfuncsim.denoise.sequential import select_optimal_pcs
 
         # Create mock R² maps (n_voxels, n_pc_counts)
         n_voxels = 50
@@ -418,7 +418,7 @@ class TestSelectOptimalPCs:
 
     def test_select_optimal_pcs_selects_best(self, device):
         """Test that function selects PC count with highest median R²"""
-        from fastfuncsim.denoise import select_optimal_pcs
+        from fastfuncsim.denoise.sequential import select_optimal_pcs
 
         n_voxels = 50
 
@@ -442,7 +442,7 @@ class TestSelectOptimalPCs:
 
     def test_select_optimal_pcs_respects_threshold(self, device):
         """Test that threshold filters criteria voxels"""
-        from fastfuncsim.denoise import select_optimal_pcs
+        from fastfuncsim.denoise.sequential import select_optimal_pcs
 
         n_voxels = 50
 
@@ -482,7 +482,7 @@ class TestDenoiseFullPipeline:
         compared to no PCs.  We synthesize data with a strong shared noise
         component and verify that denoising with 1 PC is better than 0 PCs.
         """
-        from fastfuncsim.denoise import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncsim.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
 
         torch.manual_seed(42)
         n_runs, n_tp_run, tr = 4, 80, 2.0
@@ -546,7 +546,7 @@ class TestDenoiseFullPipeline:
         PCs (no structured noise), adding more PCs should not substantially
         improve cross-validated R² vs baseline.
         """
-        from fastfuncsim.denoise import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncsim.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
 
         torch.manual_seed(99)
         n_runs, n_tp_run, tr = 3, 60, 2.0

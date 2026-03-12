@@ -25,11 +25,11 @@ import numpy as np
 import torch
 from scipy.stats import expon, poisson, truncexpon
 
-from .design import convolve_hrf
+from .matrices import convolve_hrf
 from .hrf import get_canonical_hrf
 
 # Import our metrics
-from .metrics_empirical import evaluate_design_empirical
+from fastfuncsim.simulation.metrics_empirical import evaluate_design_empirical
 
 
 @dataclass

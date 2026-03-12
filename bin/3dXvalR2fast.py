@@ -20,10 +20,10 @@ import numpy as np
 import torch
 
 try:
-    from fastfuncsim.afni_io import extract_design_metadata, load_nifti, read_afni_design_matrix
+    from fastfuncsim.io.afni import extract_design_metadata, load_nifti, read_afni_design_matrix
     from fastfuncsim.cli_utils import parse_input_files
     from fastfuncsim.utils import get_device
-    from fastfuncsim.xval import compute_xval_r2, generate_cv_splits
+    from fastfuncsim.glm.xval import compute_xval_r2, generate_cv_splits
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -294,7 +294,7 @@ def main():
         data = torch.from_numpy(data_np).float()
     else:
         # Multiple runs - use existing loader
-        from fastfuncsim.afni_io import load_and_concatenate_runs as load_runs
+        from fastfuncsim.io.afni import load_and_concatenate_runs as load_runs
 
         data, actual_run_starts = load_runs(
             [Path(f) for f in input_files],
@@ -308,7 +308,7 @@ def main():
     # Apply mask if provided
     if args.mask:
         print(f"Applying mask: {args.mask}")
-        from fastfuncsim.afni_io import load_afni_mask
+        from fastfuncsim.io.afni import load_afni_mask
 
         mask_volume = load_afni_mask(args.mask, threshold=args.mask_threshold)
 

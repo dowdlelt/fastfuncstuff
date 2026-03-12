@@ -60,7 +60,7 @@ except ImportError as exc:  # pragma: no cover - nibabel is required for AFNI in
         "nibabel is required for AFNI mask and imaging utilities. Install it with `pip install nibabel`."
     ) from exc
 
-from .utils import get_device, to_tensor
+from fastfuncsim.utils import get_device, to_tensor
 
 
 def load_nifti(filepath: str | Path) -> nib.Nifti1Image:

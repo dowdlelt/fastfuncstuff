@@ -22,7 +22,7 @@ from scipy.spatial.distance import squareform
 from tqdm.auto import tqdm
 
 from .ica import FastICA
-from .utils import get_device, to_tensor
+from fastfuncsim.utils import get_device, to_tensor
 
 
 def compute_component_similarity(

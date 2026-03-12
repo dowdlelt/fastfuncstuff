@@ -19,7 +19,7 @@ import torch
 from scipy import stats
 from scipy.interpolate import interp1d
 
-from .utils import get_device, to_tensor
+from fastfuncsim.utils import get_device, to_tensor
 
 # Constants for pre-computed HRF files
 _HRF_FILE_RESOLUTION = 0.1  # seconds per sample in TSV files

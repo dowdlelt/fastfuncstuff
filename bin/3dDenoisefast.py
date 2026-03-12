@@ -40,7 +40,7 @@ except ImportError:
 
 # Import fastfuncsim modules
 try:
-    from fastfuncsim.afni_io import (
+    from fastfuncsim.io.afni import (
         load_afni_mask,  # noqa: F401 — availability check
         load_nifti,  # noqa: F401 — availability check
     )
@@ -52,22 +52,22 @@ try:
         parse_input_files,
         preflight_check,
     )
-    from fastfuncsim.denoise import (
+    from fastfuncsim.denoise.sequential import (
         DenoiseResults,
         compute_full_brain_pc_loadings,
         compute_noise_pool_pca_scree_per_run,
         estimate_noise_component_caps_per_run,
         fit_denoising_model,
     )
-    from fastfuncsim.design_builder import (
+    from fastfuncsim.design.builder import (
         create_onset_matrix_microtime,
         parse_afni_timing_file,
         parse_durations,
     )
-    from fastfuncsim.glm_core import construct_polynomial_matrix
-    from fastfuncsim.hrf import get_hrf_library
-    from fastfuncsim.hrf_selection import load_nuisance_file
-    from fastfuncsim.ridge import load_hrf_indices
+    from fastfuncsim.glm.core import construct_polynomial_matrix
+    from fastfuncsim.design.hrf import get_hrf_library
+    from fastfuncsim.design.hrf_selection import load_nuisance_file
+    from fastfuncsim.glm.ridge import load_hrf_indices
     from fastfuncsim.utils import get_device, scale_to_percent_signal, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -1396,7 +1396,7 @@ def save_model_fit_outputs(
         output_files[f"{model_type}_labels"] = labels_path
 
     # Compress with pigz/zstd
-    from fastfuncsim.afni_io import compress_nifti
+    from fastfuncsim.io.afni import compress_nifti
     compress_nifti(bucket_path_nii, bucket_path, remove_original=True)
 
     return output_files
@@ -1835,11 +1835,11 @@ def main():
     # Fit denoising model
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-        from fastfuncsim.denoise import extract_noise_ics_per_run, extract_noise_pcs_per_run
-        from fastfuncsim.glm_core import fit_glm
-        from fastfuncsim.glm_outputs import save_single_trial_results
-        from fastfuncsim.ridge import create_single_trial_design
-        from fastfuncsim.xval import (
+        from fastfuncsim.denoise.sequential import extract_noise_ics_per_run, extract_noise_pcs_per_run
+        from fastfuncsim.glm.core import fit_glm
+        from fastfuncsim.glm.outputs import save_single_trial_results
+        from fastfuncsim.glm.ridge import create_single_trial_design
+        from fastfuncsim.glm.xval import (
             compute_xval_r2,
             compute_xval_r2_single_trials,
             generate_cv_splits,
@@ -2788,7 +2788,7 @@ def main():
         print()
         print("Fitting initial model (no denoising)...")
 
-        from fastfuncsim.glm_core import fit_glm
+        from fastfuncsim.glm.core import fit_glm
 
         # Build zero-padded nuisance for concatenated fit
         n_total_timepoints = data.shape[1]

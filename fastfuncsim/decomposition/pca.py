@@ -20,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .utils import get_device, to_tensor
+from fastfuncsim.utils import get_device, to_tensor
 
 
 class PCA:

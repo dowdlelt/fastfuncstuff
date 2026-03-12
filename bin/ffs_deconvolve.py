@@ -61,23 +61,23 @@ except ImportError:
 
 # Import fastfuncsim modules
 try:
-    from fastfuncsim.afni_io import (
+    from fastfuncsim.io.afni import (
         get_tr_from_file,
         load_afni_mask,
         load_nifti,
         onsets_to_tr_matrix,
         save_nifti,
     )
-    from fastfuncsim.design import (
+    from fastfuncsim.design.matrices import (
         build_glm_design,
         is_tr_locked,
         save_iresp,
     )
-    from fastfuncsim.design_builder import (
+    from fastfuncsim.design.builder import (
         legendre_polynomials,
         parse_afni_timing_file,
     )
-    from fastfuncsim.glm_core import fit_glm
+    from fastfuncsim.glm.core import fit_glm
     from fastfuncsim.utils import get_device
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
@@ -605,7 +605,7 @@ def main():
 
                 # Build design for this condition using exact onset times
                 if model in ("TENT", "TENTzero"):
-                    from fastfuncsim.design import make_tent_design
+                    from fastfuncsim.design.matrices import make_tent_design
                     design_cond = make_tent_design(
                         onset_times_list=[onset_times],
                         bot=bot,
@@ -617,7 +617,7 @@ def main():
                         device=device,
                     )
                 else:  # CSPLIN or CSPLINzero
-                    from fastfuncsim.design import make_csplin_design
+                    from fastfuncsim.design.matrices import make_csplin_design
                     design_cond = make_csplin_design(
                         onset_times_list=[onset_times],
                         bot=bot,

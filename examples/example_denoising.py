@@ -50,7 +50,7 @@ def example_basic_denoising():
     n_timepoints = n_tps_per_run * n_runs
 
     # Build design matrix
-    from fastfuncsim.design_builder import create_design_matrix_from_onsets
+    from fastfuncsim.design.builder import create_design_matrix_from_onsets
 
     design_matrix = create_design_matrix_from_onsets(
         onsets=[onsets],  # one condition

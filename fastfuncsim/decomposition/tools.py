@@ -30,11 +30,11 @@ import torch
 from scipy.special import gammaln as scipy_gammaln
 from tqdm.auto import tqdm
 
-from .denoise import estimate_noise_component_caps_per_run
-from .design import convolve_hrf_microtime
-from .design_builder import create_onset_matrix_microtime, parse_afni_timing_file, parse_durations
-from .glm_core import construct_polynomial_matrix
-from .hrf import get_spmg1_hrf
+from fastfuncsim.denoise.sequential import estimate_noise_component_caps_per_run
+from fastfuncsim.design.matrices import convolve_hrf_microtime
+from fastfuncsim.design.builder import create_onset_matrix_microtime, parse_afni_timing_file, parse_durations
+from fastfuncsim.glm.core import construct_polynomial_matrix
+from fastfuncsim.design.hrf import get_spmg1_hrf
 from .pca import PCA
 
 

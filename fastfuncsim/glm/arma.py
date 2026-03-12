@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from .utils import get_device, to_tensor
+from fastfuncsim.utils import get_device, to_tensor
 from .xval import compute_r2_metric
 
 
@@ -2224,7 +2224,7 @@ def search_voxels_precomputed_grid(
     best_likelihoods : torch.Tensor, shape (n_voxels_batch,)
         Minimum REML likelihood for each voxel
     """
-    from .timing_utils import profile_section
+    from fastfuncsim.timing_utils import profile_section
 
     n_voxels_batch = Y_batch.shape[0]
     n_timepoints, n_regressors = X.shape
@@ -3407,7 +3407,7 @@ def fit_glm_arma11(
     if want_ols:
         if verbose:
             print("\nComputing OLS baseline for comparison...")
-        from .glm_core import fit_glm
+        from .core import fit_glm
 
         # OLS chunk size: let fit_glm auto-estimate from available GPU memory.
         # OLS is much lighter than ARMA (no prewhitening matrices), so it should
@@ -4931,7 +4931,7 @@ def compare_ols_vs_arma11(
         'r2_improvement': R² difference (ARMA - OLS)
         'summary': summary text
     """
-    from .glm_core import fit_glm
+    from .core import fit_glm
 
     if device is None:
         device = get_device()

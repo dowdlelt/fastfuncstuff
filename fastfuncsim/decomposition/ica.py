@@ -22,7 +22,7 @@ import torch
 from tqdm.auto import tqdm
 
 from .pca import PCA
-from .utils import get_device, to_tensor
+from fastfuncsim.utils import get_device, to_tensor
 
 
 class FastICA:

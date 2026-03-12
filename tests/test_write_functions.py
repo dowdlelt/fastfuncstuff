@@ -21,9 +21,9 @@ import pytest
 import torch
 
 import fastfuncsim as ffs
-from fastfuncsim.arma_glm import fit_glm_arma11, load_arma_params, save_arma_rvar
-from fastfuncsim.glm_core import fit_glm
-from fastfuncsim.glm_outputs import (
+from fastfuncsim.glm.arma import fit_glm_arma11, load_arma_params, save_arma_rvar
+from fastfuncsim.glm.core import fit_glm
+from fastfuncsim.glm.outputs import (
     slice_glm_results,
     write_glm_bucket_as_nifti,
     write_ols_arma_comparison,

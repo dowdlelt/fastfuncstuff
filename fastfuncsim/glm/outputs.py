@@ -16,8 +16,8 @@ except ImportError as exc:  # pragma: no cover - nibabel should be installed alo
         "nibabel is required to write GLM results as NIfTI files. Install it with `pip install nibabel`."
     ) from exc
 
-from .arma_glm import ARMA11Results
-from .glm_core import GLMResults
+from .arma import ARMA11Results
+from .core import GLMResults
 
 ResultsLike = GLMResults | ARMA11Results
 
@@ -551,7 +551,7 @@ def _save_nifti_with_format(
             if not str(output_path).endswith(".nii.gz")
             else output_path
         )
-        from .afni_io import save_nifti
+        from fastfuncsim.io.afni import save_nifti
         save_nifti(np.asarray(img.dataobj), str(nifti_path), affine=img.affine)
         return nifti_path
 
@@ -1149,7 +1149,7 @@ def write_glm_bucket_as_nifti(
     # Compress output if requested
     final_path = temp_path
     if compress_output:
-        from .afni_io import compress_nifti
+        from fastfuncsim.io.afni import compress_nifti
 
         base_name = _strip_imaging_extension(str(temp_path))
         compressed_path = Path(base_name + ".nii.gz")
@@ -1521,7 +1521,7 @@ def write_partial_r2_with_labels(
 
     # Compress to .nii.gz if requested
     if str(output_path).endswith(".nii.gz"):
-        from .afni_io import compress_nifti
+        from fastfuncsim.io.afni import compress_nifti
         compress_nifti(temp_path, output_path, remove_original=True)
         final_path = output_path
     else:

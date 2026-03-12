@@ -66,12 +66,12 @@ from typing import Literal
 import numpy as np
 import torch
 
-from .glm_core import fit_glm
-from .ica import FastICA
-from .memory import dyn_chunk_estimator
-from .pca import PCA
-from .utils import get_device
-from .xval import (
+from fastfuncsim.glm.core import fit_glm
+from fastfuncsim.decomposition.ica import FastICA
+from fastfuncsim.memory import dyn_chunk_estimator
+from fastfuncsim.decomposition.pca import PCA
+from fastfuncsim.utils import get_device
+from fastfuncsim.glm.xval import (
     compute_r2_from_sufficient_stats,
     compute_r2_metric,
     compute_xval_r2,
@@ -2117,7 +2117,7 @@ def fit_denoising_model(
     # Auto-determine polort based on run length if not specified
     # Uses AFNI formula: 1 + floor(run_duration / 150)
     if polort is None:
-        from .cli_utils import auto_polort, compute_run_lengths, get_average_run_duration
+        from fastfuncsim.cli_utils import auto_polort, compute_run_lengths, get_average_run_duration
 
         run_lengths = compute_run_lengths(run_starts, n_timepoints)
         avg_run_duration_sec = get_average_run_duration(run_lengths, tr)

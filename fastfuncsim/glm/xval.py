@@ -13,7 +13,7 @@ from itertools import combinations
 import numpy as np
 import torch
 
-from .memory import estimate_chunk_size
+from fastfuncsim.memory import estimate_chunk_size
 
 
 def compute_qr_projectors(
@@ -808,7 +808,7 @@ def compute_xval_r2(
     ... )
     >>> print(f"Xval R²: {results['r2'].mean():.3f}")
     """
-    from .utils import get_device, to_tensor
+    from fastfuncsim.utils import get_device, to_tensor
 
     if device is None:
         device = get_device()
@@ -1430,7 +1430,7 @@ def single_trial_cv_helper(
         'n_splits': int
         'n_test_trials_total': int
     """
-    from .utils import get_device
+    from fastfuncsim.utils import get_device
 
     if device is None:
         device = get_device()

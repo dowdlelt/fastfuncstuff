@@ -78,16 +78,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncsim.afni_io import get_tr_from_file, load_fmri_data
-from fastfuncsim.decomposition_io import save_decomposition_results
-from fastfuncsim.ica import (
+from fastfuncsim.io.afni import get_tr_from_file, load_fmri_data
+from fastfuncsim.decomposition.io import save_decomposition_results
+from fastfuncsim.decomposition.ica import (
     FastICA,
     ica_stability_analysis,
     select_n_components_by_stability,
 )
-from fastfuncsim.ica_tools import parse_num_comps_spec
-from fastfuncsim.icasso import icasso, icasso_auto_select
-from fastfuncsim.pca import PCA
+from fastfuncsim.decomposition.tools import parse_num_comps_spec
+from fastfuncsim.decomposition.icasso import icasso, icasso_auto_select
+from fastfuncsim.decomposition.pca import PCA
 from fastfuncsim.utils import get_device
 
 

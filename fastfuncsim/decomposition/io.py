@@ -14,7 +14,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from .afni_io import get_tr_from_file
+from fastfuncsim.io.afni import get_tr_from_file
 
 
 def save_masked_component_maps_4d(

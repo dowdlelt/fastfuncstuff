@@ -18,12 +18,12 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from .design import convolve_hrf_microtime
-from .glm_core import GLMResults, construct_polynomial_matrix, fit_glm
+from .matrices import convolve_hrf_microtime
+from fastfuncsim.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
 from .hrf import get_hrf_library
-from .memory import dyn_chunk_estimator, estimate_chunk_size, estimate_keep_on_cpu
-from .utils import get_device, to_tensor
-from .xval import (
+from fastfuncsim.memory import dyn_chunk_estimator, estimate_chunk_size, estimate_keep_on_cpu
+from fastfuncsim.utils import get_device, to_tensor
+from fastfuncsim.glm.xval import (
     compute_xval_r2,
     generate_cv_splits,
     project_out_nuisance_per_run,
@@ -666,7 +666,7 @@ def fit_glm_hrf_library_with_xval(
     # =========================================================================
     # Build per-run nuisance blocks using shared utility
     # =========================================================================
-    from .cli_utils import (
+    from fastfuncsim.cli_utils import (
         auto_polort,
         build_nuisance_per_run,
         compute_run_lengths,
@@ -719,7 +719,7 @@ def fit_glm_hrf_library_with_xval(
     if verbose:
         print("Computing QR projectors and projecting data (once for all HRFs)...")
 
-    from .xval import compute_qr_projectors
+    from fastfuncsim.glm.xval import compute_qr_projectors
 
     q_factors = compute_qr_projectors(nuisance_blocks_per_run, run_starts, device=device)
 
@@ -1537,7 +1537,7 @@ def _fit_voxelwise_hrf_single_trial(
     GLMResults
         Single-trial betas and statistics
     """
-    from .xval import compute_r2_metric
+    from fastfuncsim.glm.xval import compute_r2_metric
 
     n_voxels = data.shape[0]
     n_timepoints = data.shape[1]
@@ -1552,7 +1552,7 @@ def _fit_voxelwise_hrf_single_trial(
     unique_hrfs = torch.unique(hrf_index)
 
     # First, get trial info using canonical HRF (just to get n_trials)
-    from .ridge import create_single_trial_design
+    from fastfuncsim.glm.ridge import create_single_trial_design
 
     st_design_canonical, trial_labels, trial_cond_ids, trial_run_ids, condition_design = (
         create_single_trial_design(
@@ -1959,7 +1959,7 @@ def save_hrf_selection_results(
     import json
     from pathlib import Path
 
-    from .glm_outputs import write_glm_bucket_as_nifti
+    from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
 
     output_prefix = Path(output_prefix)
     output_dir = output_prefix.parent

@@ -42,7 +42,7 @@ except ImportError:
     estimate_chunk_size = None
 
 # Import for R² metric computation
-from fastfuncsim.xval import compute_r2_metric
+from fastfuncsim.glm.xval import compute_r2_metric
 
 
 def _fit_ridge_multiple_fracs(
@@ -365,8 +365,8 @@ def create_single_trial_design(
     condition_design : torch.Tensor, shape (n_timepoints, n_conditions * n_basis)
         Condition-level design (sum of trials per condition, with basis functions)
     """
-    from .design import convolve_hrf_microtime
-    from .hrf import get_canonical_hrf
+    from fastfuncsim.design.matrices import convolve_hrf_microtime
+    from fastfuncsim.design.hrf import get_canonical_hrf
 
     device = device or torch.device("cpu")
     n_conditions = len(onsets_by_condition)
@@ -445,7 +445,7 @@ def create_single_trial_design(
 
         if is_spm_deriv:
             # SPMG2/SPMG3: Use SPM canonical with derivatives
-            from .hrf import get_spm_hrf_with_derivatives
+            from fastfuncsim.design.hrf import get_spm_hrf_with_derivatives
 
             hrf_set = get_spm_hrf_with_derivatives(
                 microtime_dt=microtime_dt,
@@ -1122,7 +1122,7 @@ def fit_ridge_single_trial(
     3. Select optimal fraction per voxel via CV R²
     4. Refit with optimal fraction for final beta estimates
     """
-    from .glm_core import construct_polynomial_matrix
+    from .core import construct_polynomial_matrix
 
     device = device or torch.device("cpu")
     n_voxels, n_timepoints = data.shape
