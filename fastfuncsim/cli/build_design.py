@@ -55,11 +55,15 @@ except ImportError:
     sys.exit(1)
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
         description='Build fMRI design matrix with simplified syntax',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         epilog=__doc__,
     )
 

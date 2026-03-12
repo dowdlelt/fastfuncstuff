@@ -207,11 +207,15 @@ def write_single_trials_output(
     return output_path_clean
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         description="3dREMLfast - Fast GPU-accelerated ARMA(1,1) GLM fitting",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         epilog="""
 Examples:
   # Basic REML analysis with main bucket output

@@ -30,11 +30,15 @@ except ImportError as e:
     sys.exit(1)
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         description="3dXvalR2fast - Fast cross-validated R² for fMRI GLM",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         epilog="""
 Examples:
   # Split halves (default, 50/50 train/test)

@@ -1016,12 +1016,16 @@ def _run_single_ica(
     return run_meta
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the ffs_ica command-line argument parser."""
     parser = argparse.ArgumentParser(
         description="Run-wise whole-brain ICA demo / sanity-check pipeline",
         add_help=False,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
     )
 
     req = parser.add_argument_group("Required")

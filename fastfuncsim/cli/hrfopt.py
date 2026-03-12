@@ -66,11 +66,15 @@ except ImportError as e:
     sys.exit(1)
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         description="3dHRFoptfast - Fast GPU-accelerated cross-validated HRF optimization",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         add_help=False,  # We handle -help ourselves to avoid required arg check
         epilog="""
 Examples:

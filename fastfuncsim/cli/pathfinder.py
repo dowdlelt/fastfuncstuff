@@ -140,11 +140,15 @@ class PathfinderResults:
     metadata: dict = field(default_factory=dict)
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         description="ffs_pathfinder - Joint HRF + Denoising Optimization",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         add_help=False,
         epilog="""
 Examples:

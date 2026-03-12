@@ -91,11 +91,15 @@ from fastfuncsim.decomposition.pca import PCA
 from fastfuncsim.utils import get_device
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
         description="PCA and ICA decomposition for fMRI data",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         epilog=__doc__,
     )
 

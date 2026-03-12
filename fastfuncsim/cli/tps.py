@@ -181,9 +181,12 @@ def main():
         sys.argv.remove('-help')
         sys.argv.append('--help')
 
+    class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+        """Show defaults while preserving raw description formatting."""
+
     parser = argparse.ArgumentParser(
         description='TPS HRF estimation with cross-validated smoothness selection',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         epilog=__doc__
     )
 

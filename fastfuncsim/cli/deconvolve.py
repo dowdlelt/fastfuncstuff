@@ -85,12 +85,16 @@ except ImportError as e:
     sys.exit(1)
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults while preserving raw description formatting."""
+
+
 def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
         description="Fast fMRI deconvolution with FIR/TENT models",
         add_help=False,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
     )
 
     # Required arguments
