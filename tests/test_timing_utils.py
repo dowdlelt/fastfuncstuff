@@ -241,7 +241,7 @@ class TestTimingProfilerEdgeCases:
         # Calculate statistics
         times = profiler.timings["repeated_op"]
         mean_time = sum(times) / len(times)
-        total_time = sum(times)
+        _total_time = sum(times)
 
         # All times should be roughly similar (0.001s ± tolerance)
         for t in times:

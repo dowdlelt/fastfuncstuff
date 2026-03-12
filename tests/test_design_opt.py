@@ -11,7 +11,7 @@ print("=" * 80)
 # Test imports
 print("\n1. Testing imports...")
 try:
-    import fastfuncsim as ffs
+    import fastfuncsim as ffs  # noqa: F401
     print("   ✓ fastfuncsim imported")
 except ImportError as e:
     print(f"   ✗ Failed to import fastfuncsim: {e}")
@@ -31,7 +31,7 @@ except ImportError as e:
 
 try:
     from fastfuncsim.metrics_empirical import (
-        compute_detection_power_empirical,
+        compute_detection_power_empirical,  # noqa: F401
         estimate_ar1_coefficient,
     )
     print("   ✓ metrics_empirical functions imported")

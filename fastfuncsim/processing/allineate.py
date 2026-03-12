@@ -1074,9 +1074,9 @@ def allineate(
     # Auto-crop: remove zero margins for faster optimization
     # We optimize on the cropped grid, then adjust the final matrix
     crop_offset = None
-    base_full = base
-    source_on_base_full = source_on_base
-    weight_full = weight
+    _base_full = base
+    _source_on_base_full = source_on_base
+    _weight_full = weight
 
     if config.autocrop:
         base_crop, source_crop, weight_crop, offset = _crop_volumes(

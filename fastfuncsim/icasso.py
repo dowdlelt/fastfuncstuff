@@ -71,9 +71,9 @@ def compute_similarity_matrix(
         Pairwise similarity matrix (absolute correlation)
     """
     # Stack all components
-    n_runs = len(components_list)
-    n_components_per_run = components_list[0].shape[0]
-    n_features = components_list[0].shape[1]
+    _n_runs = len(components_list)
+    _n_components_per_run = components_list[0].shape[0]
+    _n_features = components_list[0].shape[1]
 
     # Concatenate all components
     all_components = np.concatenate(components_list, axis=0)  # (n_runs * n_components, n_features)
@@ -193,7 +193,7 @@ def compute_cluster_quality(
         - 'stability': Combined quality score (0-1)
     """
     n_clusters = cluster_labels.max()
-    n_components_per_run = components_list[0].shape[0]
+    _n_components_per_run = components_list[0].shape[0]
 
     compactness = np.zeros(n_clusters)
     isolation = np.zeros(n_clusters)

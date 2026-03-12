@@ -108,7 +108,7 @@ def load_nuisance_file(
         else:
             data = np.array([[float(x) for x in line.split()] for line in data_lines])
     except ValueError as e:
-        raise ValueError(f"Error parsing nuisance file {filepath}: {e}")
+        raise ValueError(f"Error parsing nuisance file {filepath}: {e}") from e
 
     # Ensure 2D
     if data.ndim == 1:
@@ -411,7 +411,7 @@ def _evaluate_hrfs_batched(
     if verbose:
         print(f"  Precomputing {n_splits} x {n_designs} pseudoinverses for split-half CV...")
     all_pinvs: list[list[torch.Tensor]] = []
-    for fold_idx, (train_runs, _) in enumerate(cv_splits):
+    for _fold_idx, (train_runs, _) in enumerate(cv_splits):
         pinvs_fold = []
         for d_idx in range(n_designs):
             X_train = torch.cat([designs_by_run[d_idx][r] for r in train_runs], dim=0).to(device)
@@ -1260,7 +1260,7 @@ def _fit_voxelwise_hrf(
     n_timepoints = onsets.shape[0] // bins_per_tr
 
     n_conditions = onsets.shape[1]
-    n_nuisance_cols = nuisance_design.shape[1]
+    _n_nuisance_cols = nuisance_design.shape[1]
 
     # Initialize output tensors
     all_betas = torch.zeros(n_voxels, n_conditions, device=device)
@@ -1309,7 +1309,7 @@ def _fit_voxelwise_hrf(
         max_voxels_per_chunk = 50000 if device.type == "cuda" else 100000
         n_chunks = (n_group_voxels + max_voxels_per_chunk - 1) // max_voxels_per_chunk
 
-        def _fit_and_store(voxel_idx: torch.Tensor, label: str) -> None:
+        def _fit_and_store(voxel_idx: torch.Tensor, label: str, _stim_design: torch.Tensor = stim_design) -> None:
             """Fit GLM for a subset of voxels and store results."""
             nonlocal stored_dof
 
@@ -1324,7 +1324,7 @@ def _fit_voxelwise_hrf(
             # max_poly_degree=-1 prevents duplicate polynomials
             subset_results = fit_glm(
                 subset_data,
-                stim_design,  # Task-only design
+                _stim_design,  # Task-only design
                 tr=tr,
                 max_poly_degree=-1,  # No extra polynomials — already in nuisance_design
                 extra_regressors=nuisance_design,  # Nuisance passed separately
@@ -1430,11 +1430,11 @@ def _fit_voxelwise_hrf_canonical(
     GLMResults
         Results containing betas, R², tstats, etc. from canonical HRF fit
     """
-    n_voxels = data.shape[0]
+    _n_voxels = data.shape[0]
     n_timepoints = onsets.shape[0] // int(round(tr / microtime_dt))
 
     # Get number of conditions
-    n_conditions = onsets.shape[1]
+    _n_conditions = onsets.shape[1]
 
     if verbose:
         print("  Fitting canonical HRF (all voxels, one design matrix)...")
@@ -1541,9 +1541,9 @@ def _fit_voxelwise_hrf_single_trial(
 
     n_voxels = data.shape[0]
     n_timepoints = data.shape[1]
-    n_conditions = len(condition_labels)
+    _n_conditions = len(condition_labels)
     n_hrfs = len(hrf_library)
-    n_runs = len(run_starts)
+    _n_runs = len(run_starts)
 
     if verbose:
         print(f"  Refitting single-trial betas with optimal HRFs ({n_hrfs} HRF groups)...")
@@ -1612,7 +1612,7 @@ def _fit_voxelwise_hrf_single_trial(
 
         # Build full design: [single_trial | nuisance] so drift is modeled
         full_design = torch.cat([st_design, nuisance_design.to(st_design.device)], dim=1)
-        n_full_regressors = full_design.shape[1]
+        _n_full_regressors = full_design.shape[1]
 
         # Determine chunk size using dynamic estimator
         # Single-trial GLM (many trial regressors)
@@ -1841,7 +1841,7 @@ def save_design_diagnostic_figure(
 
     n_conditions = canonical_design.shape[1]
     n_runs = len(run_starts)
-    run_ends = run_starts[1:] + [n_timepoints]
+    _run_ends = run_starts[1:] + [n_timepoints]
     time_axis = np.arange(n_timepoints) * tr
 
     n_panels = 3 if projected_design is not None else 2

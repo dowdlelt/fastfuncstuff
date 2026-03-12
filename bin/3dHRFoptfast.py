@@ -552,7 +552,7 @@ def main():
     run_starts = load_result.run_starts
     affine = load_result.affine
     volume_shape = load_result.volume_shape
-    voxel_sizes = load_result.voxel_sizes
+    _voxel_sizes = load_result.voxel_sizes
     tr = load_result.tr
     mask = load_result.mask
     mask_flat = load_result.mask_flat

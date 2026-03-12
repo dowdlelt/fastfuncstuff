@@ -54,7 +54,7 @@ import numpy as np
 import torch
 
 try:
-    import nibabel as nib
+    import nibabel as nib  # noqa: F401 — availability check
 except ImportError:
     print("ERROR: nibabel is required. Install with: pip install nibabel")
     sys.exit(1)
@@ -274,7 +274,7 @@ def parse_tent_windows(tent_window_args, n_conditions):
                 bot = float(parts[0])
                 top = float(parts[1])
             except ValueError:
-                raise ValueError(f"Invalid tent_window values in '{arg}'. Expected numeric values.")
+                raise ValueError(f"Invalid tent_window values in '{arg}'. Expected numeric values.") from None
             if bot >= top:
                 raise ValueError(f"Invalid tent_window '{arg}': bot ({bot}) must be < top ({top})")
             windows.append((bot, top))
@@ -297,7 +297,7 @@ def parse_tent_windows(tent_window_args, n_conditions):
             bot = float(tent_window_args[0])
             top = float(tent_window_args[1])
         except ValueError:
-            raise ValueError("Invalid tent_window values. Expected numeric values.")
+            raise ValueError("Invalid tent_window values. Expected numeric values.") from None
         if bot >= top:
             raise ValueError(f"Invalid tent_window: bot ({bot}) must be < top ({top})")
         return [(bot, top)] * n_conditions
@@ -789,14 +789,14 @@ def main():
 
             # Add horizontal lines for run boundaries
             tr_idx = 0
-            for run_idx, n_tp in enumerate(n_timepoints_per_run[:-1]):
+            for _run_idx, n_tp in enumerate(n_timepoints_per_run[:-1]):
                 tr_idx += n_tp
                 ax.axhline(tr_idx - 0.5, color='yellow', linewidth=1, linestyle='-', alpha=0.5)
 
             # Add vertical lines between conditions (for TENT with different n_basis)
             if len(set(n_basis_per_condition_list)) > 1:
                 basis_idx = 0
-                for cond_idx, n_basis in enumerate(n_basis_per_condition_list[:-1]):
+                for _cond_idx, n_basis in enumerate(n_basis_per_condition_list[:-1]):
                     basis_idx += n_basis
                     ax.axvline(basis_idx - 0.5, color='green', linewidth=1, linestyle='-', alpha=0.5)
 

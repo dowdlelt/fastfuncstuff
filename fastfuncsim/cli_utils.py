@@ -1028,11 +1028,11 @@ def parse_device_arg(
                 cpu_threads_override = device_param
             elif device_type == "cuda":
                 cuda_device_id = device_param
-        except ValueError:
+        except ValueError as err:
             raise ValueError(
                 f"Invalid device specification: {device_spec}. "
                 "Expected format: 'cpu', 'cuda', 'cpu,N', or 'cuda,N'"
-            )
+            ) from err
 
     # Create device
     if device_type == "cpu":

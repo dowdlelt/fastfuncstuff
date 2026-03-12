@@ -66,7 +66,7 @@ class TestDenoiseCoreFunctions:
 
     def test_select_noise_pool_voxels_basic(self, device):
         """Test noise pool selection with R² values."""
-        n_voxels = 100
+        _n_voxels = 100
 
         # Create R² values where first 50 have high R² (signal)
         # and last 50 have low R² (noise pool)
@@ -280,7 +280,7 @@ class TestExtractNoisePCs:
 
         # Empty noise pool
         noise_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
-        run_starts = [0]
+        _run_starts = [0]
 
         # Should handle empty noise pool - need to include last run start
         run_starts_full = [0, n_timepoints]  # Need end point for last run

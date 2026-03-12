@@ -135,7 +135,7 @@ def params_to_matrix_batched(params: Tensor) -> Tensor:
     cx, sx_ = torch.cos(rx_r), torch.sin(rx_r)
     cy, sy_ = torch.cos(ry_r), torch.sin(ry_r)
 
-    zero = torch.zeros(B, device=device, dtype=dtype)
+    _zero = torch.zeros(B, device=device, dtype=dtype)
     one = torch.ones(B, device=device, dtype=dtype)
 
     # Rz @ Rx @ Ry — computed directly as the product

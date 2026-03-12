@@ -513,9 +513,9 @@ def fit_glm(
     # For task F-stats: need (X'X) for task regressors only
     try:
         L_full = torch.linalg.cholesky(xtx_inv)
-        xtx_inv_full_inv = torch.cholesky_inverse(L_full)  # This is X'X for all regressors
+        _xtx_inv_full_inv = torch.cholesky_inverse(L_full)  # This is X'X for all regressors
     except torch.linalg.LinAlgError:
-        xtx_inv_full_inv = torch.linalg.inv(xtx_inv)
+        _xtx_inv_full_inv = torch.linalg.inv(xtx_inv)
 
     try:
         L_task = torch.linalg.cholesky(xtx_inv_task)
@@ -693,8 +693,6 @@ def fit_glm(
         # GLT CONTRASTS (OLS): Compute in-loop using FULL betas
         # For each contrast c: compute c'β and Var(c'β) = c' (σ² (X'X)^-1) c
         if glt_contrasts_tensor is not None:
-            chunk_size_actual = betas_dev.shape[0]
-
             # Compute c'β for all contrasts at once
             # glt_contrasts_tensor: (n_contrasts, n_regressors_full)
             # betas_dev: (chunk_size, n_regressors_full) - FULL betas including nuisance

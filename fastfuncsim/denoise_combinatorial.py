@@ -1285,7 +1285,7 @@ def plot_singleton_contributions(
 
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
 
-    n_runs = len(results.per_run_results)
+    _n_runs = len(results.per_run_results)
     max_pcs = results.metadata.get("max_pcs", 7)
 
     figs = []

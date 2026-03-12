@@ -1688,7 +1688,7 @@ def _cpu_hierarchical_reml_search(
 
     # Create index mapping for (a_idx, b_idx) -> precomputed key
     param_list = list(precomputed.keys())
-    param_to_idx = {params: idx for idx, params in enumerate(param_list)}
+    _param_to_idx = {params: idx for idx, params in enumerate(param_list)}
 
     def get_param_key(a_idx: int, b_idx: int):
         """Get parameter key if it exists in grid"""
@@ -2015,7 +2015,7 @@ def batch_reml_grid_search(
         best_likelihoods[is_background] = -1.0  # Sentinel value (skip in search)
 
     # Only search non-background voxels
-    n_searchable = n_voxels_batch - n_background
+    _n_searchable = n_voxels_batch - n_background
 
     # SMART GRID ORDERING: Evaluate most likely optima first
     # Based on analysis of real fMRI data (synthetic_data/true_afni_remlVar.nii.gz):
@@ -2228,7 +2228,7 @@ def search_voxels_precomputed_grid(
 
     n_voxels_batch = Y_batch.shape[0]
     n_timepoints, n_regressors = X.shape
-    n_grid = len(precomputed_grid)
+    _n_grid = len(precomputed_grid)
 
     # Initialize results — match dtype of input data (important when use_double=True)
     _dtype = Y_batch.dtype
@@ -2754,7 +2754,7 @@ def reml_grid_search_batched(
 
                     # REML likelihood (same formula as AFNI)
                     n = n_timepoints
-                    p = n_regressors
+                    _p = n_regressors
                     likelihoods = -0.5 * (
                         n * torch.log(sse / n)
                         + logdet_R
@@ -2805,7 +2805,7 @@ def reml_grid_search_batched(
 
                         # REML likelihood (same formula as AFNI)
                         n = n_timepoints
-                        p = n_regressors
+                        _p = n_regressors
                         likelihoods = -0.5 * (
                             n * torch.log(sse / n)
                             + logdet_R

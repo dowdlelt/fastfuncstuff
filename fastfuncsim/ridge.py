@@ -390,7 +390,7 @@ def create_single_trial_design(
     trial_condition_ids = []
     repeat_counter = {}  # condition_idx -> current repeat number
 
-    for cond_idx, run_idx, trial_idx, onset_time in trial_info:
+    for cond_idx, _run_idx, _trial_idx, _onset_time in trial_info:
         # Get the repeat number for this condition (starting from 1)
         if cond_idx not in repeat_counter:
             repeat_counter[cond_idx] = 0
@@ -574,7 +574,7 @@ def create_single_trial_design(
 
     else:
         # Per-voxel design matrices
-        n_voxels = hrf_index_per_voxel.shape[0]
+        _n_voxels = hrf_index_per_voxel.shape[0]
         n_hrfs = len(hrf_library) if hrf_library is not None else 0
 
         if n_hrfs == 0:
@@ -997,7 +997,7 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     r2_by_frac_all = torch.zeros(chunk_voxels, n_fracs, device=device)
 
     # Process each group
-    for hash_val, voxel_indices in groups.items():
+    for _hash_val, voxel_indices in groups.items():
         # Get data and design for this group
         group_data = data_chunk[voxel_indices, :]
         group_design = design_per_voxel[voxel_indices[0]]  # All have same design

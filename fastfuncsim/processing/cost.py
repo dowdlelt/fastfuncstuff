@@ -532,8 +532,8 @@ class BatchedIncrementalCorrelation:
             base_patches: Optional pre-extracted (B, V) base patches (avoids re-extraction).
             weight_patches: Optional pre-extracted (B, V) weight patches (avoids re-extraction).
         """
-        B = len(patch_slices)
-        device = base.device
+        _B = len(patch_slices)
+        _device = base.device
 
         b = base.reshape(-1)
         s = warped_source.reshape(-1)

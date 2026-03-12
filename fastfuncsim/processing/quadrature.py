@@ -53,7 +53,7 @@ def design_quadrature_filters(
         (3, size, size, size) complex tensor of spatial-domain filters.
     """
     cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
-    half = size // 2
+    _half = size // 2
 
     # Frequency coordinates for size^3 DFT
     freqs = torch.fft.fftfreq(size, device=device, dtype=dtype) * 2 * math.pi
@@ -134,7 +134,7 @@ def precompute_filter_ffts(
 
     # Pad filters into volume-sized arrays (center the filter)
     padded = torch.zeros(nf, nz, ny, nx, device=device, dtype=cdtype)
-    half = fs // 2
+    _half = fs // 2
 
     # Place filter at origin and wrap around (for circular convolution)
     for d in range(nf):
@@ -266,18 +266,18 @@ def build_phase_normal_equations(
 
     # For X direction: t = [1, 0, 0, -y*s, 0, z*s] where s = deg2rad
     # Non-zero entries: param 0 (=1), param 3 (=-y*s), param 5 (=z*s)
-    tx_0 = torch.ones_like(x)          # param 0: 1
+    _tx_0 = torch.ones_like(x)          # param 0: 1
     tx_3 = -y * deg2rad                 # param 3: -(y-cy) * deg2rad
     tx_5 = z * deg2rad                  # param 5: (z-cz) * deg2rad
 
     # For Y direction: t = [0, 1, 0, x*s, 0, 0] -> params 1, 3, (4 = -z*s)
     # Actually: [0, 1, 0, x*s, -z*s, 0]
-    ty_1 = torch.ones_like(x)          # param 1: 1
+    _ty_1 = torch.ones_like(x)          # param 1: 1
     ty_3 = x * deg2rad                  # param 3: (x-cx) * deg2rad
     ty_4 = -z * deg2rad                 # param 4: -(z-cz) * deg2rad
 
     # For Z direction: t = [0, 0, 1, 0, y*s, -x*s]
-    tz_2 = torch.ones_like(x)          # param 2: 1
+    _tz_2 = torch.ones_like(x)          # param 2: 1
     tz_4 = y * deg2rad                  # param 4: (y-cy) * deg2rad
     tz_5 = -x * deg2rad                # param 5: -(x-cx) * deg2rad
 

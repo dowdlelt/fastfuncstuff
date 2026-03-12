@@ -156,7 +156,7 @@ def test_ica_spatial_recovery():
     # Note: we need to set n_components explicitly
     # pca_components must be >= n_components
     ica = FastICA(n_components=n_comps, pca_components=n_comps + 2, random_state=42, device=torch.device('cpu'))
-    S_est = ica.fit_transform(X) # Returns mixing (Time x Comps) for Spatial ICA? 
+    _S_est = ica.fit_transform(X) # Returns mixing (Time x Comps) for Spatial ICA? 
     # Wait, docstring says:
     # transform -> S (n_samples, n_components). 
     # But for Spatial ICA, we usually want the SPATIAL MAPS.

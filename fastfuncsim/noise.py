@@ -674,7 +674,7 @@ def estimate_noise_parameters_from_data(
         data = data.to(device)
 
     # Handle different data shapes
-    original_shape = data.shape
+    _original_shape = data.shape
     if data.ndim == 1:
         # Single timeseries
         data = data.unsqueeze(1)  # (n_timepoints, 1)

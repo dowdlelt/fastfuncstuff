@@ -506,7 +506,7 @@ class TestSimulateBatchExperiments:
         n_experiments = 10
         sim_config = {'n_runs': 1}
         
-        experiments = simulate_batch_experiments(
+        _experiments = simulate_batch_experiments(
             n_experiments=n_experiments,
             sim_config=sim_config,
             device=device,

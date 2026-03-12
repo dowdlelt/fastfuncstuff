@@ -52,7 +52,6 @@ try:
     from fastfuncsim.denoise_combinatorial import (
         CombinatorialDenoiseResults,
         compute_initial_xval_r2,
-        compute_optimized_xval_r2,
         compute_optimized_xval_r2_3dDenoise_style,
         fit_combinatorial_denoising,
         plot_combinatorial_results,
@@ -60,10 +59,9 @@ try:
         plot_plateau_curves,
         plot_singleton_contributions,
     )
-    from fastfuncsim.design import convolve_hrf_microtime, make_fir_design, make_tent_design
-    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations, parse_hrf_model
+    from fastfuncsim.design_builder import parse_afni_timing_file, parse_durations
     from fastfuncsim.glm_core import construct_polynomial_matrix
-    from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
+    from fastfuncsim.hrf import get_hrf_library
     from fastfuncsim.hrf_selection import load_nuisance_file
     from fastfuncsim.ridge import load_hrf_indices
     from fastfuncsim.utils import get_device, scale_to_percent_signal, to_tensor
@@ -591,12 +589,12 @@ def main():
     )
 
     hrf_model_name = hrf_info["hrf_model_name"]
-    hrf_params = hrf_info["hrf_params"]
+    _hrf_params = hrf_info["hrf_params"]
     is_fir_model = hrf_info["is_fir_model"]
     fir_bot = hrf_info["fir_bot"]
     fir_top = hrf_info["fir_top"]
     n_basis = hrf_info["n_basis"]
-    condition_labels_full = hrf_info["condition_labels_full"]
+    _condition_labels_full = hrf_info["condition_labels_full"]
 
     # Check for incompatible options with FIR models
     validate_hrf_compatibility(

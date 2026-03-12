@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 try:
-    import nibabel as nib
+    import nibabel as nib  # noqa: F401 — availability check
 except ImportError:
     print("ERROR: nibabel is required. Install with: pip install nibabel")
     sys.exit(1)
@@ -30,7 +30,7 @@ try:
     from fastfuncsim.afni_io import (
         get_tr_from_file,
         load_nifti,
-        read_afni_design_matrix,
+        read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
         replace_afni_extension,
     )
     from fastfuncsim.analysis import analyze_from_design_matrix
@@ -42,7 +42,6 @@ try:
         parse_device_arg,
         parse_input_files,
     )
-    from fastfuncsim.design import convolve_hrf_microtime
     from fastfuncsim.design_builder import (
         create_onset_matrix_microtime,
         parse_afni_timing_file,
@@ -51,10 +50,8 @@ try:
     from fastfuncsim.glm_outputs import (
         slice_glm_results,
         write_glm_bucket_as_nifti,
-        write_glm_results_nifti,
     )
-    from fastfuncsim.hrf import get_spmg1_hrf
-    from fastfuncsim.utils import gaussian_blur_3d, get_device, scale_to_percent_signal
+    from fastfuncsim.utils import gaussian_blur_3d, scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -921,7 +918,7 @@ def main():
                 column_labels.append(f"{cond_label}#0")
 
         # Add nuisance labels
-        nuisance_label_offset = len(column_labels)
+        _nuisance_label_offset = len(column_labels)
         for run_idx in range(n_runs):
             for p in range(polort + 1):
                 column_labels.append(f"Run#{run_idx+1}Pol#{p}")
@@ -1099,12 +1096,12 @@ def main():
         return
 
     # Setup OLS write callback if any OLS output is requested
-    ols_write_callback = None
+    _ols_write_callback = None
     if want_ols:
         # Determine stat flags (default to -fout if none specified)
-        want_fstat = args.fout or (not args.tout and not args.rout)
-        want_tstat = args.tout
-        want_rstat = args.rout
+        _want_fstat = args.fout or (not args.tout and not args.rout)
+        _want_tstat = args.tout
+        _want_rstat = args.rout
         # Capture single_trials flag and design_info for callback
         want_single_trials = args.single_trials
         callback_design_info = design_info  # Capture in closure
@@ -1302,7 +1299,7 @@ def main():
 
             print()
 
-        ols_write_callback = write_ols_results
+        _ols_write_callback = write_ols_results
 
     # Set environment variable for partial R² mode (so analysis.py callback can access it)
     if args.rpartial:
@@ -1558,9 +1555,9 @@ def main():
     print()
 
     # Determine stat flags (default to -fout if none specified)
-    want_fstat = args.fout or (not args.tout and not args.rout and not args.rpartial)
-    want_tstat = args.tout
-    want_rstat = args.rout
+    _want_fstat = args.fout or (not args.tout and not args.rout and not args.rpartial)
+    _want_tstat = args.tout
+    _want_rstat = args.rout
     want_r2_partial = args.rpartial
 
     # Extract design metadata using helper function (clean naming!)
@@ -1771,30 +1768,11 @@ def main():
             print("    ⚠️  3drefit not found in PATH (AFNI not installed?)")
             print("    (File was written successfully, but lacks sub-brik labels)")
 
-        # Compress with pigz if available (4-8× faster than gzip)
+        # Compress with pigz/zstd if output is compressed format
         if str(rvar_output_path).endswith('.nii.gz'):
-            print(f"  • Compressing with {'pigz' if shutil.which('pigz') else 'gzip'}...")
-            if shutil.which("pigz"):
-                try:
-                    subprocess.run(["pigz", "-f", str(temp_nii_path)], check=True, capture_output=True)
-                    # pigz creates .nii.gz, rename if needed
-                    pigz_output = Path(str(temp_nii_path) + ".gz")
-                    if pigz_output != rvar_output_path:
-                        pigz_output.rename(rvar_output_path)
-                except subprocess.CalledProcessError:
-                    # Fall back to gzip
-                    import gzip
-                    with open(temp_nii_path, "rb") as f_in:
-                        with gzip.open(rvar_output_path, "wb") as f_out:
-                            shutil.copyfileobj(f_in, f_out)
-                    temp_nii_path.unlink()
-            else:
-                # Use standard gzip
-                import gzip
-                with open(temp_nii_path, "rb") as f_in:
-                    with gzip.open(rvar_output_path, "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                temp_nii_path.unlink()
+            from fastfuncsim.afni_io import compress_nifti
+            print(f"  • Compressing Rvar output...")
+            compress_nifti(temp_nii_path, rvar_output_path, remove_original=True)
 
     # Write partial R² if requested and available
     if (

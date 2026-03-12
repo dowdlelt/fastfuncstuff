@@ -216,7 +216,7 @@ def scale_to_percent_signal(
 
     # Compute run boundaries
     run_ends = run_starts[1:] + [n_timepoints_total]
-    run_lengths = [end - start for start, end in zip(run_starts, run_ends, strict=False)]
+    _run_lengths = [end - start for start, end in zip(run_starts, run_ends, strict=False)]
 
     # Storage for per-run statistics
     mean_per_run = torch.zeros(n_voxels, n_runs, device=device)
@@ -377,7 +377,7 @@ def gaussian_blur_3d(
 
         # Kernel radius: 4 sigma, but at least 1 voxel
         radius = max(1, int(np.ceil(4 * sigma)))
-        kernel_size = 2 * radius + 1
+        _kernel_size = 2 * radius + 1
 
         # Create 1D Gaussian kernel
         x = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
@@ -662,7 +662,7 @@ def load_per_run_nuisance_files(
             nuisance_per_run.append(data)
 
         except (OSError, ValueError) as e:
-            raise RuntimeError(f"Error loading nuisance file '{run_file}': {e}")
+            raise RuntimeError(f"Error loading nuisance file '{run_file}': {e}") from e
 
     return nuisance_per_run
 

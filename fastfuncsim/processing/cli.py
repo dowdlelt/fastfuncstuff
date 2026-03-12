@@ -30,8 +30,10 @@ from torch import Tensor
 
 from .interp import warp_image_linear
 from .io import load_image, load_warp_field, save_image, save_warp_field
+from .mask import automask
 from .memory import estimate_gpu_memory_gb, print_memory_report
 from .warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
+from .weight import _gaussian_smooth_3d
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -265,6 +267,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help="3D weight image (same grid as base). Voxels with weight=0 "
                            "are ignored. If omitted, a weight mask is auto-generated from "
                            "the base image (nonzero voxels)")
+    g_wt.add_argument("-autoweight", action="store_true",
+                      help="Use automask of the base image (blurred) as the weight mask. "
+                           "Much tighter than the default nonzero-voxel weight — excludes "
+                           "noisy background. Overrides -useweight if both given.")
+    g_wt.add_argument("-autoweight_blur", type=float, default=3.0, metavar="SIGMA",
+                      help="Gaussian blur sigma in voxels applied to the masked base "
+                           "image to create a soft-edged weight (default: 3.0). Only "
+                           "used with -autoweight.")
+    g_wt.add_argument("-save_autoweight", type=str, default=None, metavar="FILE.nii.gz",
+                      help="Save the computed autoweight image to this file. "
+                           "Only used with -autoweight.")
 
     # ── Optimizer Tuning ────────────────────────────────────────────────
     g_opt = p.add_argument_group(
@@ -664,63 +677,90 @@ def main(argv: list[str] | None = None) -> int:
     base_data, base_info = load_image(args.base, device=torch.device("cpu"))
 
     # Determine mode: timeseries (single 4D) vs standard (separate base+source)
+    # Also treat base + 4D source as timeseries (warp each source vol to base)
     timeseries_mode = args.source is None
+    source_is_4d = False
+
+    if not timeseries_mode:
+        source_data, source_info = load_image(args.source, device=torch.device("cpu"))
+        if source_data.ndim == 4 and source_data.shape[0] > 1:
+            # 4D source: fold into timeseries mode with external base
+            source_is_4d = True
+            timeseries_mode = True
 
     if timeseries_mode:
-        if base_data.ndim != 4:
-            print("ERROR: -base must be 4D when -source is omitted")
-            return 1
-        nt_orig = base_data.shape[0]
-
-        # Apply timepoint range selection
-        if args.tprange is not None:
-            parts = [int(x) for x in args.tprange.split(",")]
-            if len(parts) == 1:
-                sl = slice(0, parts[0])
-            elif len(parts) == 2:
-                sl = slice(parts[0], parts[1] if parts[1] != -1 else None)
-            elif len(parts) == 3:
-                stop = parts[1] if parts[1] != -1 else None
-                sl = slice(parts[0], stop, parts[2])
+        if source_is_4d:
+            # External base + 4D source: use source_data as the timeseries
+            nt_full, nz, ny, nx = source_data.shape
+            if base_data.ndim == 4:
+                if args.base_index is not None:
+                    base_3d = base_data[args.base_index]
+                else:
+                    base_3d = base_data[0]
             else:
-                print("ERROR: -tprange expects 1-3 comma-separated ints (start,stop[,step])")
-                return 1
-            base_data = base_data[sl]
-            if args.verb >= 1:
-                print(f"Timepoint selection: {nt_orig} -> {base_data.shape[0]} volumes (slice {sl})")
-
-        nt_full, nz, ny, nx = base_data.shape
-        if nt_full < 2:
-            print("ERROR: 4D -base must have at least 2 volumes after -tprange")
-            return 1
-
-        if args.verb >= 1:
-            print(f"Timeseries mode: {nt_full} volumes, {nx}x{ny}x{nz}")
-
-        # Build base from timeseries
-        base_3d = _build_timeseries_base(
-            base_data, args.base_method, args.base_navg, args.verb,
-        )
-
-        # Determine which volumes to warp
-        if args.base_method == "first":
-            # vol[0] is the base, warp vol[1:]
-            source_indices = list(range(1, nt_full))
-        else:
-            # mean/median base: warp ALL volumes (including vol[0])
+                base_3d = base_data
+            # All source volumes get warped; base_data is replaced by source_data
+            # so the timeseries loop can index into it
+            base_data = source_data
             source_indices = list(range(0, nt_full))
+            nt = nt_full
+            if args.verb >= 1:
+                print(f"Timeseries mode (external base): {nt_full} source volumes, "
+                      f"{nx}x{ny}x{nz}")
+        else:
+            if base_data.ndim != 4:
+                print("ERROR: -base must be 4D when -source is omitted")
+                return 1
+            nt_orig = base_data.shape[0]
 
-        nt = len(source_indices)
-        if args.verb >= 1:
+            # Apply timepoint range selection
+            if args.tprange is not None:
+                parts = [int(x) for x in args.tprange.split(",")]
+                if len(parts) == 1:
+                    sl = slice(0, parts[0])
+                elif len(parts) == 2:
+                    sl = slice(parts[0], parts[1] if parts[1] != -1 else None)
+                elif len(parts) == 3:
+                    stop = parts[1] if parts[1] != -1 else None
+                    sl = slice(parts[0], stop, parts[2])
+                else:
+                    print("ERROR: -tprange expects 1-3 comma-separated ints (start,stop[,step])")
+                    return 1
+                base_data = base_data[sl]
+                if args.verb >= 1:
+                    print(f"Timepoint selection: {nt_orig} -> {base_data.shape[0]} volumes (slice {sl})")
+
+            nt_full, nz, ny, nx = base_data.shape
+            if nt_full < 2:
+                print("ERROR: 4D -base must have at least 2 volumes after -tprange")
+                return 1
+
+            if args.verb >= 1:
+                print(f"Timeseries mode: {nt_full} volumes, {nx}x{ny}x{nz}")
+
+            # Build base from timeseries
+            base_3d = _build_timeseries_base(
+                base_data, args.base_method, args.base_navg, args.verb,
+            )
+
+            # Determine which volumes to warp
             if args.base_method == "first":
-                print(f"  Warping vol[1]..vol[{nt_full-1}] -> base ({nt} volumes)")
+                # vol[0] is the base, warp vol[1:]
+                source_indices = list(range(1, nt_full))
             else:
-                print(f"  Warping all {nt} volumes -> {args.base_method} base")
-            if args.tsmooth > 0:
-                print(f"  Temporal warp smoothing: sigma={args.tsmooth:.1f} volumes")
-    else:
-        source_data, source_info = load_image(args.source, device=torch.device("cpu"))
+                # mean/median base: warp ALL volumes (including vol[0])
+                source_indices = list(range(0, nt_full))
 
+            nt = len(source_indices)
+            if args.verb >= 1:
+                if args.base_method == "first":
+                    print(f"  Warping vol[1]..vol[{nt_full-1}] -> base ({nt} volumes)")
+                else:
+                    print(f"  Warping all {nt} volumes -> {args.base_method} base")
+                if args.tsmooth > 0:
+                    print(f"  Temporal warp smoothing: sigma={args.tsmooth:.1f} volumes")
+    else:
+        # Standard mode: 3D source (already loaded above)
         # Extract base volume from 4D if needed
         if base_data.ndim == 4:
             if args.base_index is not None:
@@ -831,7 +871,26 @@ def main(argv: list[str] | None = None) -> int:
 
     # Load or compute weight
     weight = None
-    if args.useweight is not None:
+    if args.autoweight:
+        # Automask base, apply mask to base, then smooth for soft-edged weight
+        mask_bin = automask(base_3d.float(), device=torch.device("cpu"))
+        masked_base = base_3d.float() * mask_bin.float()
+        weight = _gaussian_smooth_3d(masked_base, sigma=args.autoweight_blur)
+        # Normalize to [0, 1]
+        w_max = weight.max()
+        if w_max > 0:
+            weight = weight / w_max
+        if args.verb >= 1:
+            n_nonzero = (weight > 0).sum().item()
+            n_total = weight.numel()
+            print(f"Autoweight: automask + smooth base(sigma={args.autoweight_blur:.1f}), "
+                  f"{n_nonzero}/{n_total} nonzero voxels "
+                  f"({100*n_nonzero/n_total:.1f}%)")
+        if args.save_autoweight is not None:
+            save_image(weight, args.save_autoweight, header_info=base_info)
+            if args.verb >= 1:
+                print(f"Saved autoweight: {args.save_autoweight}")
+    elif args.useweight is not None:
         weight, _ = load_image(args.useweight, device=torch.device("cpu"))
 
     # Load initial warp if provided
@@ -866,8 +925,8 @@ def main(argv: list[str] | None = None) -> int:
     all_warped = []
 
     if timeseries_mode:
-        # For 'first' base method: base = vol[0], prepend unwarped base to output
-        if args.base_method == "first":
+        # For 'first' base method (internal base only): prepend unwarped base to output
+        if args.base_method == "first" and not source_is_4d:
             all_warped.append(base_3d.clone())
 
         zpad = _zeropad_width(nt_full)
@@ -885,6 +944,25 @@ def main(argv: list[str] | None = None) -> int:
 
         # Keep raw voxel-unit warps in CPU RAM when temporal smoothing is needed
         all_warps_raw: list[tuple[Tensor, Tensor, Tensor]] = []
+
+        # For 'first' base method (internal base only): write an identity (zero) warp for vol 0
+        # so the warp file count matches the timeseries length.
+        if args.base_method == "first" and not source_is_4d:
+            padded_shape = (nz + 2 * pad_z, ny + 2 * pad_y, nx + 2 * pad_x)
+            zero_xd = torch.zeros(padded_shape)
+            zero_yd = torch.zeros(padded_shape)
+            zero_zd = torch.zeros(padded_shape)
+            if not args.no_save_warp:
+                save_warp_field(
+                    zero_xd, zero_yd, zero_zd,
+                    os.path.join(warp_dir, f"{warp_basename}_WARP_t{0:0{zpad}d}.nii.gz"),
+                    header_info=base_info,
+                    padding=warp_padding,
+                    units="mm",
+                )
+            if do_tsmooth or do_warp_pcs:
+                all_warps_raw.append((zero_xd, zero_yd, zero_zd))
+            del zero_xd, zero_yd, zero_zd
 
         # Track previous warps for chaining (-chainwarp / -lookback)
         chain_warps = args.chainwarp
@@ -1044,11 +1122,16 @@ def main(argv: list[str] | None = None) -> int:
 
             # Save smoothed warps and recompute warped 4D
             all_warped_smooth = []
-            if args.base_method == "first":
+            if args.base_method == "first" and not source_is_4d:
                 all_warped_smooth.append(base_3d.clone())
 
+            # When base_method=="first" (internal base), all_warps_raw has an identity warp
+            # prepended at index 0, so smoothed_warps is offset by 1 from
+            # source_indices.
+            warp_offset = 1 if (args.base_method == "first" and not source_is_4d) else 0
+
             for i, src_idx in enumerate(source_indices):
-                sxd, syd, szd = smoothed_warps[i]
+                sxd, syd, szd = smoothed_warps[i + warp_offset]
 
                 # Save smoothed warp
                 if not args.no_save_warp:
@@ -1123,15 +1206,35 @@ def main(argv: list[str] | None = None) -> int:
             warped_4d = torch.stack(all_warped, dim=0)
             save_image(warped_4d, f"{prefix}.nii.gz", header_info=base_info)
             if not args.no_save_warp:
+                warp_dir = f"{prefix}_warps"
+                os.makedirs(warp_dir, exist_ok=True)
+                warp_basename = os.path.basename(prefix)
                 zpad = _zeropad_width(nt)
                 for t in range(nt):
                     save_warp_field(
                         all_xd[t], all_yd[t], all_zd[t],
-                        f"{prefix}_WARP_t{t:0{zpad}d}.nii.gz",
+                        os.path.join(warp_dir, f"{warp_basename}_WARP_t{t:0{zpad}d}.nii.gz"),
                         header_info=base_info,
                         padding=warp_padding,
                         units="mm",
                     )
+                if args.verb >= 1:
+                    print(f"Saved {nt} warps to {warp_dir}/")
+
+            # Extract warp PCs if requested
+            if args.n_pcs > 0 and nt > 1:
+                warp_dir = f"{prefix}_warps"
+                os.makedirs(warp_dir, exist_ok=True)
+                warp_basename = os.path.basename(prefix)
+                all_warps_raw = [(all_xd[t], all_yd[t], all_zd[t]) for t in range(nt)]
+                _extract_warp_pcs(
+                    all_warps_raw, args.n_pcs,
+                    do_x=not args.noXdis, do_y=not args.noYdis, do_z=not args.noZdis,
+                    pad_x=pad_x, pad_y=pad_y, pad_z=pad_z,
+                    nx=nx, ny=ny, nz=nz,
+                    out_path=os.path.join(warp_dir, f"{warp_basename}_warpPCs.1D"),
+                    verb=args.verb,
+                )
         else:
             save_image(all_warped[0], f"{prefix}.nii.gz", header_info=base_info)
             if not args.no_save_warp:

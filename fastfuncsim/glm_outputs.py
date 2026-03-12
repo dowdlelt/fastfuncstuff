@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Union
 
 import numpy as np
 import torch
@@ -20,7 +19,7 @@ except ImportError as exc:  # pragma: no cover - nibabel should be installed alo
 from .arma_glm import ARMA11Results
 from .glm_core import GLMResults
 
-ResultsLike = Union[GLMResults, ARMA11Results]
+ResultsLike = GLMResults | ARMA11Results
 
 
 def extract_onset_times_from_design(
@@ -546,13 +545,14 @@ def _save_nifti_with_format(
         format = "nifti_gz"
 
     if format == "nifti_gz":
-        # Save as compressed NIfTI
+        # Save as compressed NIfTI (pigz/zst aware via save_nifti)
         nifti_path = (
             output_path.with_suffix(".nii.gz")
             if not str(output_path).endswith(".nii.gz")
             else output_path
         )
-        nib.save(img, str(nifti_path))
+        from .afni_io import save_nifti
+        save_nifti(np.asarray(img.dataobj), str(nifti_path), affine=img.affine)
         return nifti_path
 
     else:  # format == 'nifti'
@@ -1149,55 +1149,11 @@ def write_glm_bucket_as_nifti(
     # Compress output if requested
     final_path = temp_path
     if compress_output:
-        import shutil
-        import subprocess
+        from .afni_io import compress_nifti
 
-        # Note: detected_format is always 'nifti' or 'nifti_gz' for bucket files
-        # (we force it above), so we always compress as NIfTI
-        # Compress NIfTI: .nii → .nii.gz
-        # IMPORTANT: Strip .nii extension properly, preserving periods in filename
         base_name = _strip_imaging_extension(str(temp_path))
         compressed_path = Path(base_name + ".nii.gz")
-
-        # OPTIMIZATION: Use pigz (parallel gzip) if available - much faster!
-        # For large files (e.g., 870k voxels), pigz can be 4-8× faster than gzip
-        if shutil.which("pigz"):
-            try:
-                # pigz: parallel gzip, uses all CPU cores
-                subprocess.run(
-                    ["pigz", "-f", str(temp_path)],  # -f: force overwrite
-                    check=True,
-                    capture_output=True,
-                )
-                # pigz creates .nii.gz automatically
-                # Rename if needed (pigz adds .gz to existing name)
-                pigz_output = Path(str(temp_path) + ".gz")
-                if pigz_output != compressed_path:
-                    pigz_output.rename(compressed_path)
-                final_path = compressed_path
-            except subprocess.CalledProcessError:
-                # pigz failed, fall back to gzip
-                import gzip
-
-                with open(temp_path, "rb") as f_in:
-                    with gzip.open(compressed_path, "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                temp_path.unlink()
-                final_path = compressed_path
-        else:
-            # pigz not available, use standard gzip (slower but universal)
-            import gzip
-
-            with open(temp_path, "rb") as f_in:
-                with gzip.open(compressed_path, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-            temp_path.unlink()
-            final_path = compressed_path
-    else:
-        # No compression requested
-        # Note: detected_format is always 'nifti' or 'nifti_gz' for bucket files
-        # (we force it above), so this is always a NIfTI file
-        pass  # final_path = temp_path (already set)
+        final_path = compress_nifti(temp_path, compressed_path, remove_original=True)
 
     return final_path
 
@@ -1565,8 +1521,8 @@ def write_partial_r2_with_labels(
 
     # Compress to .nii.gz if requested
     if str(output_path).endswith(".nii.gz"):
-        _save_nifti_with_format(nib.load(temp_path), output_path, "nifti_gz")
-        temp_path.unlink()  # Remove uncompressed
+        from .afni_io import compress_nifti
+        compress_nifti(temp_path, output_path, remove_original=True)
         final_path = output_path
     else:
         final_path = temp_path

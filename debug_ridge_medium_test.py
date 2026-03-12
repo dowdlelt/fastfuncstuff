@@ -23,7 +23,7 @@ print("STEP 1: Create onsets")
 print("="*70)
 
 onsets_by_condition = []
-for cond_idx in range(2):
+for _cond_idx in range(2):
     cond_onsets = []
     for _run_idx in range(n_runs):
         events = np.sort(np.random.choice(n_timepoints, size=6, replace=False))

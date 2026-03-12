@@ -12,6 +12,7 @@ Key Features
 - Both spatial and temporal ICA modes
 - Memory-efficient processing for large fMRI datasets
 """
+
 from __future__ import annotations
 
 from typing import cast
@@ -87,7 +88,7 @@ class FastICA:
         pca_components: int | float | str | None = 0.85,
         max_iter: int = 200,
         tol: float = 1e-4,
-        fun: str = 'logcosh',
+        fun: str = "logcosh",
         random_state: int | None = None,
         whiten: bool = True,
         device: torch.device | None = None,
@@ -128,17 +129,13 @@ class FastICA:
         n_samples, n_features = X.shape
 
         # Step 1: PCA dimensionality reduction
-        self.pca_ = PCA(
-            n_components=self.pca_components,
-            whiten=self.whiten,
-            device=self.device
-        )
+        self.pca_ = PCA(n_components=self.pca_components, whiten=self.whiten, device=self.device)
         X_pca = self.pca_.fit_transform(X)
 
         # Validate PCA n_components
-        if not hasattr(self.pca_, 'n_components_') or self.pca_.n_components_ is None:
-             raise RuntimeError("PCA n_components_ not found")
-        
+        if not hasattr(self.pca_, "n_components_") or self.pca_.n_components_ is None:
+            raise RuntimeError("PCA n_components_ not found")
+
         pca_n_components = cast(int, self.pca_.n_components_)
 
         # Determine number of ICA components
@@ -153,8 +150,8 @@ class FastICA:
         # Select only the TOP n_components for ICA
         # Example: 100 PCA components → take first 50 for 50 ICA components
         if self.pca_.components_ is None:
-             raise RuntimeError("PCA results not found (components_ is None)")
-             
+            raise RuntimeError("PCA results not found (components_ is None)")
+
         pca_components_all = self.pca_.components_  # (n_pca_components, n_voxels)
         pca_components = pca_components_all[:n_components]  # Take TOP n_components only!
 
@@ -167,7 +164,7 @@ class FastICA:
         # FastICA expects Cov = I. We must scale by sqrt(n_voxels).
         n_voxels = pca_components.shape[1]
         X_white = pca_components * np.sqrt(n_voxels)
-        
+
         W, n_iter = self._fastica(X_white, n_components)  # Input: (n_ica, n_voxels)
         self.n_iter_ = n_iter
 
@@ -297,45 +294,45 @@ class FastICA:
             W = w_init.to(self.device).type(X.dtype)
         else:
             W = torch.randn(n_components, n_features, device=self.device, dtype=X.dtype)
-        
+
         # Initial symmetric decorrelation
         W = self._symmetric_decorrelation(W)
 
         # Get nonlinearity functions
         g, g_prime = self._get_nonlinearity(self.fun)
-        
+
         # Optimization: pre-compute float n_samples for division
         scale = 1.0 / n_samples
 
         # FastICA iterations
-        for n_iter in range(self.max_iter):
+        for n_iter in range(self.max_iter):  # noqa: B007
             W_old = W.clone()
 
             # 1. Linear projection
             # W: (n_comp, n_feat), X: (n_feat, n_samp) -> wx: (n_comp, n_samp)
             wx = W @ X
-            
+
             # 2. Apply nonlinearity
             # g_wx: (n_comp, n_samp)
             # g_prime_wx: (n_comp, n_samp)
             g_wx = g(wx)
             g_prime_wx = g_prime(wx)
-            
+
             # 3. Update rule (Symmetric)
             # Term 1: E[x g(w^T x)] -> X * g(wx)^T / N -> No, dimensions match better as:
             # (g_wx @ X.T) / N -> (n_comp, n_samp) @ (n_samp, n_feat) -> (n_comp, n_feat)
             term1 = (g_wx @ X.T) * scale
-            
+
             # Term 2: E[g'(w^T x)] w -> mean(g_prime_wx, dim=1) * W
             # g_prime_mean: (n_comp, 1) broadcasted to (n_comp, n_feat)
             g_prime_mean = g_prime_wx.mean(dim=1, keepdim=True)
             term2 = g_prime_mean * W
-            
+
             W = term1 - term2
-            
+
             # 4. Symmetric Decorrelation
             W = self._symmetric_decorrelation(W)
-            
+
             # 5. Check convergence
             # Distance between subspaces: 1 - min(abs(diag(W @ W_old.T)))
             # Ideally W @ W_old.T should be Identity (or Permutation/Sign matrix)
@@ -343,7 +340,7 @@ class FastICA:
             # abs(diag(W @ W_old.T)) is correlation of w_new_i with w_old_i
             lim = torch.abs(torch.diag(W @ W_old.T))
             delta = torch.max(1 - torch.abs(lim))
-            
+
             if delta < self.tol:
                 break
 
@@ -386,7 +383,7 @@ class FastICA:
         g_prime : callable
             Derivative of nonlinearity
         """
-        if fun == 'logcosh':
+        if fun == "logcosh":
             alpha = 1.0
 
             def g_logcosh(x):
@@ -394,27 +391,29 @@ class FastICA:
 
             def g_prime_logcosh(x):
                 return alpha * (1 - torch.tanh(alpha * x) ** 2)
-            
+
             return g_logcosh, g_prime_logcosh
 
-        elif fun == 'exp':
+        elif fun == "exp":
+
             def g_exp(x):
-                exp_x = torch.exp(-x ** 2 / 2)
+                exp_x = torch.exp(-(x**2) / 2)
                 return x * exp_x
 
             def g_prime_exp(x):
-                exp_x = torch.exp(-x ** 2 / 2)
-                return (1 - x ** 2) * exp_x
-            
+                exp_x = torch.exp(-(x**2) / 2)
+                return (1 - x**2) * exp_x
+
             return g_exp, g_prime_exp
 
-        elif fun == 'cube':
+        elif fun == "cube":
+
             def g_cube(x):
-                return x ** 3
+                return x**3
 
             def g_prime_cube(x):
-                return 3 * x ** 2
-            
+                return 3 * x**2
+
             return g_cube, g_prime_cube
 
         else:
@@ -452,17 +451,17 @@ class FastICA:
         X_centered = X - X.mean(dim=0)
 
         # Total variance
-        total_var = (X_centered ** 2).sum()
+        total_var = (X_centered**2).sum()
 
         # Reconstruct each component separately
         variance_explained = torch.zeros(self.components_.shape[0], device=self.device)
 
         for i in range(self.components_.shape[0]):
             # Reconstruct using only this component
-            reconstruction = self.mixing_[:, i:i+1] @ self.components_[i:i+1, :]
+            reconstruction = self.mixing_[:, i : i + 1] @ self.components_[i : i + 1, :]
 
             # Variance explained = variance of reconstruction
-            var_i = (reconstruction ** 2).sum()
+            var_i = (reconstruction**2).sum()
             variance_explained[i] = var_i
 
         # Compute ratios
@@ -476,11 +475,11 @@ class FastICA:
             raise RuntimeError("ICA must be fitted first")
 
         return {
-            'components': self.components_.cpu().numpy(),
-            'mixing': self.mixing_.cpu().numpy(),
-            'pca': self.pca_.to_dict(),
-            'n_components': self.n_components,
-            'n_iter': self.n_iter_,
+            "components": self.components_.cpu().numpy(),
+            "mixing": self.mixing_.cpu().numpy(),
+            "pca": self.pca_.to_dict(),
+            "n_components": self.n_components,
+            "n_iter": self.n_iter_,
         }
 
 
@@ -566,9 +565,9 @@ def ica_stability_analysis(
     stability_scores = _compute_component_stability(components_array)
 
     return {
-        'components_list': components_list,
-        'stability_scores': stability_scores,
-        'n_runs': n_runs,
+        "components_list": components_list,
+        "stability_scores": stability_scores,
+        "n_runs": n_runs,
     }
 
 
@@ -690,25 +689,27 @@ def select_n_components_by_stability(
             verbose=verbose,
         )
 
-        mean_stability = results['stability_scores'].mean()
+        mean_stability = results["stability_scores"].mean()
         stability_by_n_components[n_comp] = mean_stability
         all_results[n_comp] = results
 
         if verbose:
             print(f"  Mean stability: {mean_stability:.3f}")
-            n_stable = (results['stability_scores'] > min_stability).sum()
+            n_stable = (results["stability_scores"] > min_stability).sum()
             print(f"  Components with stability > {min_stability}: {n_stable}/{n_comp}")
 
     # Select optimal n_components (highest mean stability)
-    optimal_n_components = max(stability_by_n_components, key=lambda k: stability_by_n_components[k])
+    optimal_n_components = max(
+        stability_by_n_components, key=lambda k: stability_by_n_components[k]
+    )
 
     if verbose:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Optimal n_components: {optimal_n_components}")
         print(f"Stability: {stability_by_n_components[optimal_n_components]:.3f}")
 
     return {
-        'optimal_n_components': optimal_n_components,
-        'stability_by_n_components': stability_by_n_components,
-        'all_results': all_results,
+        "optimal_n_components": optimal_n_components,
+        "stability_by_n_components": stability_by_n_components,
+        "all_results": all_results,
     }

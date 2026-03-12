@@ -79,7 +79,6 @@ try:
         gaussian_blur_3d,
         get_device,
         scale_to_percent_signal,
-        to_tensor,
     )
     from fastfuncsim.xval import (
         compute_xval_r2,
@@ -683,7 +682,7 @@ def fit_pathfinder(
     n_voxels, n_timepoints = data.shape
     n_hrfs = hrf_library.shape[0]
     n_runs = len(run_starts)
-    bins_per_tr = int(round(tr / microtime_dt))
+    _bins_per_tr = int(round(tr / microtime_dt))
     n_conditions = onset_matrix.shape[1]
 
     if verbose:
@@ -942,7 +941,6 @@ def fit_pathfinder(
 
     # Build voxel-wise optimal design by grouping voxels by HRF
     unique_hrfs = torch.unique(hrf_index)
-    n_unique_hrfs = len(unique_hrfs)
 
     # Storage for final results
     final_betas = torch.zeros(n_voxels, n_conditions, device=device)

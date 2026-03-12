@@ -404,7 +404,7 @@ def main():
     print("="*70 + "\n")
     
     # Example 1: Basic fit
-    results = example_1_basic_arma_fit()
+    _results = example_1_basic_arma_fit()
     
     # Example 2: Covariance visualization
     example_2_arma_covariance_visualization()

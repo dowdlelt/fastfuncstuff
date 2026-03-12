@@ -280,7 +280,7 @@ def main():
         affine = img.affine
         header = img.header
     except ImportError:
-        raise ImportError("nibabel is required. Install with: pip install nibabel")
+        raise ImportError("nibabel is required. Install with: pip install nibabel") from None
 
     nx, ny, nz, n_timepoints_total = data_full.shape
 
@@ -655,7 +655,6 @@ def main():
         for chunk_idx in range(n_chunks):
             start_idx = chunk_idx * chunk_size_cv
             end_idx = min(start_idx + chunk_size_cv, n_voxels)
-            chunk_voxels = end_idx - start_idx
 
             if args.verbose and chunk_idx % max(1, n_chunks // 10) == 0:
                 print(f"  Chunk {chunk_idx+1}/{n_chunks}: voxels {start_idx:,}-{end_idx:,}")

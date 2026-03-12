@@ -545,7 +545,7 @@ class TestTheoreticalValidation:
         design_many = create_convolved_design(onsets_many, device=device)
         data_many = create_simulated_data(design_many, [1.0], noise_std=0.3, device=device)
 
-        result_few = compute_detection_power_empirical(data_few, design_few, device=device)
+        _result_few = compute_detection_power_empirical(data_few, design_few, device=device)
         result_many = compute_detection_power_empirical(data_many, design_many, device=device)
 
         assert result_many["detection_power"] > 0

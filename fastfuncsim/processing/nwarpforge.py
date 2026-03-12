@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
 
 import numpy as np
 import torch
@@ -60,7 +59,7 @@ class NonlinearWarp:
         return self.xd.shape
 
 
-Transform = Union[AffineTransform, NonlinearWarp]
+Transform = AffineTransform | NonlinearWarp
 
 
 def load_affine_1D(
@@ -480,7 +479,7 @@ def compose_matrix_then_warp(
     ty = transformed[1].reshape(nz, ny, nx)
     tz = transformed[2].reshape(nz, ny, nx)
 
-    N = nz * ny * nx
+    _N = nz * ny * nx
     warp_x_at_t = trilinear_interpolate(
         warp.xd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1)
     ).reshape(nz, ny, nx)
@@ -533,7 +532,7 @@ def compose_warp_then_warp(
     y_after_a = jj + warp_a.yd
     z_after_a = kk + warp_a.zd
 
-    N = nz * ny * nx
+    _N = nz * ny * nx
     bx_at_a = trilinear_interpolate(
         warp_b.xd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1)
     ).reshape(nz, ny, nx)

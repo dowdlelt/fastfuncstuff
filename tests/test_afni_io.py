@@ -249,7 +249,7 @@ class TestSyntheticDataProperties:
 
         img = nib.load(str(NIFTI_ALL_ONES))
         data = img.get_fdata()
-        affine = img.affine
+        _affine = img.affine
 
         # Check it's 4D
         assert len(data.shape) == 4, "Should be 4D (x, y, z, time)"

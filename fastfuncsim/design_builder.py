@@ -222,7 +222,7 @@ def parse_afni_timing_file(filepath: str | Path) -> list[np.ndarray]:
                         onsets = np.array([float(x) for x in tokens])
                         onsets_by_run.append(onsets)
                     except ValueError as e:
-                        raise ValueError(f"Could not parse line '{line}' in {filepath}: {e}")
+                        raise ValueError(f"Could not parse line '{line}' in {filepath}: {e}") from e
 
     return onsets_by_run
 
@@ -500,7 +500,7 @@ def parse_hrf_model(hrf_string: str) -> tuple[str, float | dict]:
             top = float(params_parts[1].strip())
             n_basis = int(params_parts[2].strip())
         except ValueError as e:
-            raise ValueError(f"Invalid parameters in '{hrf_string}'. Expected numeric values: {e}")
+            raise ValueError(f"Invalid parameters in '{hrf_string}'. Expected numeric values: {e}") from e
 
         if bot >= top:
             raise ValueError(f"In '{hrf_string}': bot ({bot}) must be < top ({top})")
@@ -515,11 +515,11 @@ def parse_hrf_model(hrf_string: str) -> tuple[str, float | dict]:
     else:
         try:
             duration = float(params_str)
-        except ValueError:
+        except ValueError as err:
             raise ValueError(
                 f"Invalid duration in HRF model '{hrf_string}'. "
                 f"Expected numeric value or use TENT(bot,top,n) for multi-parameter models"
-            )
+            ) from err
 
         return model_name, duration
 
@@ -969,7 +969,7 @@ def build_design_matrix(
 
     # 4. Add extra regressors (if any)
     if extra_regressors:
-        for idx, reg in enumerate(extra_regressors):
+        for _idx, reg in enumerate(extra_regressors):
             if reg.ndim == 1:
                 design_matrix[:, col_idx] = reg
                 extra_indices.append(col_idx)
@@ -1063,7 +1063,7 @@ def write_afni_xmat(
     >>> write_afni_xmat('X.xmat.1D', design, labels, runs, meta, glt)
     """
     n_timepoints, n_regressors = design_matrix.shape
-    n_runs = metadata["n_runs"]
+    _n_runs = metadata["n_runs"]
     tr = metadata["tr"]
     stim_indices = metadata["stim_indices"]
 
@@ -1144,7 +1144,7 @@ def write_afni_xmat(
             glt_labels = [label for _, label in glt_contrasts]
             f.write(f'#  GltLabels = "{" ; ".join(glt_labels)}"\n')
 
-            for glt_idx, (contrast_str, label) in enumerate(glt_contrasts):
+            for glt_idx, (contrast_str, _label) in enumerate(glt_contrasts):
                 # Parse contrast and create matrix representation
                 weights, _ = parse_glt_string(contrast_str)
                 contrast_vec = glt_weights_to_vector(weights, regressor_labels)

@@ -93,7 +93,7 @@ def generate_event_sequence(
                 f"must match n_conditions ({n_conditions})"
             )
 
-    total_trials = sum(n_trials)
+    _total_trials = sum(n_trials)
 
     if ordering == "random":
         # Fully randomized
@@ -432,9 +432,9 @@ def sample_design_space(
 
     # Compute total number of events
     if isinstance(n_trials_per_condition, int):
-        total_events = n_trials_per_condition * n_conditions
+        _total_events = n_trials_per_condition * n_conditions
     else:
-        total_events = sum(n_trials_per_condition)
+        _total_events = sum(n_trials_per_condition)
 
     candidates = []
 
@@ -838,7 +838,7 @@ def plot_fitness_landscape(
     color_map = {dist: colors[i] for i, dist in enumerate(unique_dists)}
     point_colors = [color_map[d] for d in distributions]
 
-    scatter1 = ax1.scatter(
+    _scatter1 = ax1.scatter(
         efficiencies, powers, c=point_colors, s=100, alpha=0.6, edgecolors="k", linewidths=0.5
     )
     ax1.set_xlabel("Estimation Efficiency", fontsize=12)

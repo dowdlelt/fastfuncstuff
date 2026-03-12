@@ -106,7 +106,7 @@ def create_blocked_onsets(
 
     block_trs = int(np.ceil(block_duration / tr))
     rest_trs = int(np.ceil(rest_duration / tr))
-    cycle_trs = (block_trs + rest_trs) * n_conditions
+    _cycle_trs = (block_trs + rest_trs) * n_conditions
 
     current_time = HRF_LENGTH_TRS
     cond_idx = 0

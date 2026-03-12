@@ -654,7 +654,7 @@ def extract_noise_pcs_per_run(
         # Get run timepoints
         start_tp = run_starts[run_idx]
         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
-        run_length = end_tp - start_tp
+        _run_length = end_tp - start_tp
 
         # Extract run data first, then apply noise pool mask (limits peak memory)
         run_data_full = data[:, start_tp:end_tp]
@@ -932,7 +932,7 @@ def compute_full_brain_pc_loadings(
 
     n_voxels_full = data.shape[0]
     n_runs = len(run_starts)
-    n_components = noise_pcs_per_run[0].shape[1]
+    _n_components = noise_pcs_per_run[0].shape[1]
 
     # Validate and prepare brain mask
     if brain_mask is not None:
@@ -1072,7 +1072,7 @@ def fit_glm_with_noise_pcs(
         for run_idx in range(n_runs):
             start_tp = run_starts[run_idx]
             end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_length = end_tp - start_tp
+            _run_length = end_tp - start_tp
 
             # Get PCs for this run
             run_pcs = noise_pcs[run_idx][:, :n_pcs_to_use]  # (run_length, n_pcs_to_use)
@@ -1198,7 +1198,7 @@ def cross_validate_noise_pcs(
         raise ValueError("hrf_indices required when designs_by_hrf is provided")
 
     # Determine mode
-    per_hrf_mode = designs_by_hrf is not None
+    _per_hrf_mode = designs_by_hrf is not None
 
     # Detect if we can use streaming stats (LORO CV)
     # Need to check this early to determine projection device

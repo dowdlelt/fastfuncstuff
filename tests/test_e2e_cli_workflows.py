@@ -221,7 +221,7 @@ class TestRidgeWorkflow:
         tr = 2.0
         n_timepoints = 120
         matrix_size = (8, 8, 4)
-        n_voxels = 8 * 8 * 4
+        _n_voxels = 8 * 8 * 4
 
         # Create HIGHLY collinear design (events always co-occur)
         onsets = torch.zeros(n_timepoints, 3, device=device)

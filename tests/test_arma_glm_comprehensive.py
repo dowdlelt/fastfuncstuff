@@ -190,7 +190,7 @@ class TestIOAndComparisons:
             )
             
             # save_arma_rvar adds .nii.gz extension if creating NIfTI
-            expected_path = out_path if str(out_path).endswith('.nii.gz') else out_path.with_suffix('.nii.gz')
+            _expected_path = out_path if str(out_path).endswith('.nii.gz') else out_path.with_suffix('.nii.gz')
             # But the function returns the path used.
             # Let's check if file exists.
             # save_arma_rvar uses nibabel which writes NIfTI.

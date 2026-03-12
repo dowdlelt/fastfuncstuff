@@ -144,7 +144,7 @@ def test_prewhitening():
     print(f"L_inv shape: {L_inv.shape}")
     
     # Verify transformation
-    R = build_arma11_covariance(a, b, n, device)
+    _R = build_arma11_covariance(a, b, n, device)
     X_w_manual = L_inv @ X
     
     match = torch.allclose(X_w, X_w_manual, atol=1e-5)

@@ -127,11 +127,11 @@ class TestSanitizeFiniteTensor:
     def test_clones_tensor(self):
         """Test that result is a new tensor."""
         t = torch.tensor([1.0, 2.0, 3.0])
-        result = sanitize_finite_tensor(t, "test")
+        _result = sanitize_finite_tensor(t, "test")
         # When there are no bad values, it should return the original
         # When there are bad values, it should be a clone
         t_with_nan = torch.tensor([1.0, float('nan'), 3.0])
-        result_nan = sanitize_finite_tensor(t_with_nan, "test")
+        _result_nan = sanitize_finite_tensor(t_with_nan, "test")
         # Original should be unchanged
         assert torch.isnan(t_with_nan[1])
 

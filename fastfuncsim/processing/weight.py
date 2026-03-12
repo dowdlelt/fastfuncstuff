@@ -32,7 +32,7 @@ def compute_weight_image(
         (nz, ny, nx) weight image in [0, 1].
     """
     nz, ny, nx = base.shape
-    device = base.device
+    _device = base.device
 
     w = base.abs().clone()
 

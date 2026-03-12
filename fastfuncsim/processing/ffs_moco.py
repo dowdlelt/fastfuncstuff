@@ -23,7 +23,7 @@ warnings.filterwarnings(
     "ignore", message=".*torch._prims_common.check.*", category=FutureWarning
 )
 
-from .affine import (
+from .affine import (  # noqa: E402
     _build_homo_coords,
     apply_affine_interp,
     apply_affine_wsinc5,
@@ -34,9 +34,9 @@ from .affine import (
     resample_affine_fast,
     voxel_matrix_to_dicom,
 )
-from .cost import _separable_smooth_3d, lpa_correlation
-from .interp import _separable_resample_3d
-from .weight import compute_weight_image
+from .cost import _separable_smooth_3d, lpa_correlation  # noqa: E402
+from .interp import _separable_resample_3d  # noqa: E402
+from .weight import compute_weight_image  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration & result dataclasses

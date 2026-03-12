@@ -244,7 +244,7 @@ def parse_component_arg(arg_str):
         raise ValueError(
             f"Invalid component specification: '{arg_str}'. "
             f"Use int (number), float (variance fraction), 'all', or 'auto'"
-        )
+        ) from None
 
     if isinstance(value, float) and not 0.0 < value < 1.0:
         raise ValueError(f"Float component specification must be between 0 and 1, got {value}")

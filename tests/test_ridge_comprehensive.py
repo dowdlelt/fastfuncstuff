@@ -85,7 +85,7 @@ class TestRidgeCoreFunctions:
     def test_fit_ridge_multiple_fracs_collinear(self, device):
         """Test ridge handles collinear designs better than OLS."""
         n_samples = 50
-        n_features = 3
+        _n_features = 3
         n_voxels = 10
 
         # Create collinear design: feature 2 = feature 1 + noise
@@ -341,7 +341,7 @@ class TestRidgeFullPipeline:
         n_runs = 2  # 2 runs is sufficient for this beta-recovery test
         n_conditions = 2
         events_per_cond = 6
-        matrix_size = (6, 6, 3)  # Small for speed
+        _matrix_size = (6, 6, 3)  # Small for speed
         n_voxels = 6 * 6 * 3
 
         # Create ground truth: each trial has a different amplitude
@@ -509,7 +509,7 @@ class TestRidgeFullPipeline:
 
         # Create onsets
         onsets_by_condition = []
-        for cond_idx in range(n_conditions):
+        for _cond_idx in range(n_conditions):
             cond_onsets = []
             for _run_idx in range(n_runs):
                 events = np.sort(np.random.choice(n_timepoints, size=5, replace=False))

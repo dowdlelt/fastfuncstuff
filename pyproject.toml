@@ -37,6 +37,7 @@ ffs_allineate = "fastfuncsim.processing.allineate_cli:main"
 ffs_moco = "fastfuncsim.processing.ffs_moco_cli:main"
 ffs_qwarp = "fastfuncsim.processing.cli:main"
 ffs_motsim = "fastfuncsim.processing.ffs_motsim:main"
+ffs_util_pcwarp = "fastfuncsim.processing.pcwarp_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -97,8 +98,16 @@ ignore = [
     "B008",  # function calls in argument defaults (common in ML)
     "N806",  # non-lowercase variable names (linear algebra conventions: XtX, P_nuisance, etc.)
     "N803",  # non-lowercase argument names (linear algebra conventions)
+    "N802",  # function names should be lowercase (scientific conventions)
+    "N811",  # constant imported as non-constant (numpy/torch aliases)
+    "N812",  # lowercase imported as non-lowercase (numpy/torch aliases)
+    "E741",  # ambiguous variable name (l, O, I — common in math/LA code)
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Allow unused imports in __init__
-"examples/*.py" = ["B007"]  # Allow unused loop variables in examples
+"examples/*.py" = ["B007", "E402"]  # Allow unused loop vars, late imports
+"notebooks/*.ipynb" = ["E702", "F841", "B007"]  # Allow semicolons, unused vars, unused loop vars in notebooks
+"bin/*.py" = ["E402"]  # Allow late imports in CLI scripts (sys.path manipulation)
+"tests/*.py" = ["B023", "E402"]  # Allow function definition in loop, late imports
+"debug_*.py" = ["E402"]  # Allow late imports in debug scripts

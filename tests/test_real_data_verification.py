@@ -85,13 +85,13 @@ def test_real_data_pca_vs_sklearn():
     # Sklearn
     print("Running Sklearn PCA...")
     sk_pca = SklearnPCA(n_components=n_components, svd_solver='full', random_state=42)
-    X_sk = sk_pca.fit_transform(X)
+    _X_sk = sk_pca.fit_transform(X)
     
     # FastFuncSim (GPU)
     print("Running FastFuncSim PCA...")
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     ffs_pca = PCA(n_components=n_components, device=device)
-    X_ffs = ffs_pca.fit_transform(X)
+    _X_ffs = ffs_pca.fit_transform(X)
     
     # Compare Explained Variance Ratio
     print("Explained Variance Ratio Diff:", 
@@ -131,7 +131,7 @@ def test_real_data_ica_vs_sklearn():
     # Better approach: 
     # 1. Run FFS ICA up to PCA stage
     ica_ffs.pca_ = PCA(n_components=n_components, whiten=True, device=device)
-    X_pca_ffs = ica_ffs.pca_.fit_transform(X) # (Samp, Comp)
+    _X_pca_ffs = ica_ffs.pca_.fit_transform(X) # (Samp, Comp)
     
     # Get the whitening matrix / components
     # ica_ffs components_: (Comp, Voxels)

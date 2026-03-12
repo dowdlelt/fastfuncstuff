@@ -222,7 +222,7 @@ class TestComputeXvalR2:
     def test_synthetic_data(self):
         """Test with synthetic data and known ground truth"""
         n_voxels, n_timepoints, n_stim, n_nuisance = 50, 400, 20, 5
-        n_runs = 4
+        _n_runs = 4
 
         # Create synthetic data
         # Ground truth: data = design_stim @ true_betas + noise
@@ -534,7 +534,7 @@ class TestQRProjectors:
         """Test basic QR projector computation"""
         from fastfuncsim.xval import compute_qr_projectors
 
-        n_timepoints = 100
+        _n_timepoints = 100
         n_nuisance = 5
         n_runs = 3
 
@@ -575,7 +575,7 @@ class TestQRProjectors:
         """Test QR projectors with no nuisance regressors"""
         from fastfuncsim.xval import compute_qr_projectors
 
-        n_timepoints = 100
+        _n_timepoints = 100
         n_runs = 3
 
         # Empty nuisance per run
@@ -637,7 +637,7 @@ class TestProjectOutNuisancePerRun:
 
         n_voxels = 50
         n_timepoints = 100
-        n_runs = 2
+        _n_runs = 2
         n_nuisance = 5
 
         # Create data
@@ -677,7 +677,7 @@ class TestProjectOutNuisancePerRun:
 
         n_voxels = 50
         n_timepoints = 100
-        n_runs = 2
+        _n_runs = 2
 
         # Create data with linear drift
         time = torch.arange(n_timepoints, dtype=torch.float32) / n_timepoints

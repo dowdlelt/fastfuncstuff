@@ -49,7 +49,7 @@ from fastfuncsim.design_builder import (
 )
 
 try:
-    import nibabel as nib
+    import nibabel as nib  # noqa: F401 — availability check
 except ImportError:
     print("Error: nibabel is required. Install with: pip install nibabel", file=sys.stderr)
     sys.exit(1)
@@ -269,11 +269,11 @@ def main():
         print("\nNuisance regressors:")
         if padortvec_files:
             print(f"  Padded (per-run): {len(padortvec_files)}")
-            for filepath, label, run_num in padortvec_files:
+            for _filepath, label, run_num in padortvec_files:
                 print(f"    - {label} (run {run_num})")
         if ortvec_files:
             print(f"  Full-length: {len(ortvec_files)}")
-            for filepath, label in ortvec_files:
+            for _filepath, label in ortvec_files:
                 print(f"    - {label}")
 
     # Build design matrix

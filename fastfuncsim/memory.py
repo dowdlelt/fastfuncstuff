@@ -581,7 +581,6 @@ def dyn_chunk_estimator(
             streaming_stats = False
 
     # Normalize cv_strategy to determine train/test split
-    is_loro = cv_strategy == 1 or cv_strategy == "loro"
     if cv_strategy is None or cv_strategy == 1 or cv_strategy == "loro":
         # LORO: train = (n_runs - 1) / n_runs, test = 1 / n_runs
         train_fraction = (n_runs - 1) / n_runs if n_runs > 1 else 0.8

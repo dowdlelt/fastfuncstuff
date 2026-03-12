@@ -228,7 +228,7 @@ def test_compare_with_afni():
 
     # Get actual n_timepoints from AFNI matrix
     total_tps = afni_matrix.shape[0]
-    n_runs = len(afni_design.get('run_starts', [0]))
+    _n_runs = len(afni_design.get('run_starts', [0]))
 
     # Infer timepoints per run from run_starts
     run_starts_afni = afni_design.get('run_starts', [0])
@@ -864,7 +864,7 @@ class TestDesignHrfConvolution:
 
         # Boxcar response should be more sustained than single event
         # Check that response stays elevated during stimulus
-        stimulus_end_tr = 10 + 5  # 10s start + 10s duration = 20s = TR 10, plus some HRF tail
+        _stimulus_end_tr = 10 + 5  # 10s start + 10s duration = 20s = TR 10, plus some HRF tail
 
         # Response should be > 0 during much of the stimulus period
         mid_stimulus_response = design[12:15, 0].mean().item()  # TR 12-15 (during stimulus)

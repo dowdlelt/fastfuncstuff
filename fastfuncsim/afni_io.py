@@ -41,8 +41,10 @@ Examples
 >>> censored = get_censored_mask(design)
 >>> X_clean, Y_clean = select_uncensored_timepoints(design, fmri_data)
 """
+
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -95,28 +97,28 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
         raise FileNotFoundError(f"File not found: {filepath}")
 
     # Handle .nii.zst files by decompressing through zstd
-    if str(filepath).endswith('.nii.zst'):
+    if str(filepath).endswith(".nii.zst"):
         # Check if zstd is available
         try:
-            subprocess.run(['zstd', '--version'], capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
+            subprocess.run(["zstd", "--version"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as err:
             raise RuntimeError(
                 "zstd is not installed or not available in PATH. "
                 "Install zstd to load .nii.zst files."
-            )
+            ) from err
 
         # Decompress to temporary file
-        with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as tmp:
             tmp_path = tmp.name
 
         try:
             # Decompress: zstd -dc input.nii.zst > output.nii
-            with open(tmp_path, 'wb') as out_file:
+            with open(tmp_path, "wb") as out_file:
                 subprocess.run(
-                    ['zstd', '-dc', str(filepath)],
+                    ["zstd", "-dc", str(filepath)],
                     stdout=out_file,
                     check=True,
-                    stderr=subprocess.PIPE
+                    stderr=subprocess.PIPE,
                 )
 
             # Load the decompressed file
@@ -677,9 +679,7 @@ def extract_stimulus_columns(
     return to_tensor(stim_design, device=device, dtype=torch.float32)
 
 
-def extract_nuisance_columns(
-    design_info: dict, device: torch.device | None = None
-) -> torch.Tensor:
+def extract_nuisance_columns(design_info: dict, device: torch.device | None = None) -> torch.Tensor:
     """
     Extract nuisance regressor columns (polynomials + motion) from AFNI design matrix
 
@@ -1388,6 +1388,97 @@ def load_fmri_data(
     return data
 
 
+def compress_nifti(
+    uncompressed_path: str | Path,
+    output_path: str | Path | None = None,
+    *,
+    remove_original: bool = True,
+) -> Path:
+    """Compress an uncompressed .nii file to .nii.gz (pigz) or .nii.zst (zstd).
+
+    The target format is determined by the extension of *output_path*.
+    If *output_path* is None, the extension of *uncompressed_path* is used
+    (which must be .nii.gz or .nii.zst).
+
+    Parameters
+    ----------
+    uncompressed_path : str or Path
+        Path to the uncompressed .nii file on disk.
+    output_path : str or Path, optional
+        Desired compressed output path.  Must end with ``.nii.gz`` or
+        ``.nii.zst``.  When *None*, compression format is inferred from
+        *uncompressed_path* (e.g. if it already ends with ``.nii.gz``
+        nibabel wrote it uncompressed inside a .gz name – we recompress).
+    remove_original : bool
+        Delete *uncompressed_path* after successful compression (default True).
+
+    Returns
+    -------
+    Path
+        Final path of the compressed file.
+    """
+    src = Path(uncompressed_path)
+    if not src.exists():
+        raise FileNotFoundError(f"compress_nifti: source not found: {src}")
+
+    if output_path is not None:
+        dst = Path(output_path)
+    else:
+        dst = src  # in-place: same name, compress based on extension
+
+    dst_str = str(dst)
+
+    if dst_str.endswith(".nii.zst"):
+        return _compress_zst(src, dst, remove_original)
+    elif dst_str.endswith(".nii.gz"):
+        return _compress_gz(src, dst, remove_original)
+    else:
+        raise ValueError(
+            f"compress_nifti: output_path must end with .nii.gz or .nii.zst, got '{dst}'"
+        )
+
+
+def _compress_gz(src: Path, dst: Path, remove_original: bool) -> Path:
+    """Compress *src* (.nii) → *dst* (.nii.gz) using pigz or gzip fallback."""
+    if shutil.which("pigz"):
+        # pigz appends .gz to the input filename.  Work with that.
+        subprocess.run(
+            ["pigz", "-f", str(src)],
+            check=True,
+            capture_output=True,
+        )
+        pigz_out = Path(str(src) + ".gz")
+        if pigz_out != dst:
+            pigz_out.rename(dst)
+        return dst
+
+    # Fallback: Python gzip (single-threaded)
+    import gzip
+
+    with open(src, "rb") as f_in, gzip.open(dst, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    if remove_original and src != dst:
+        src.unlink()
+    return dst
+
+
+def _compress_zst(src: Path, dst: Path, remove_original: bool) -> Path:
+    """Compress *src* (.nii) → *dst* (.nii.zst) using zstd with all cores."""
+    zstd = shutil.which("zstd")
+    if zstd is None:
+        raise RuntimeError(
+            "zstd is not installed or not in PATH.  "
+            "Install zstd to write .nii.zst files (e.g. apt install zstd)."
+        )
+    # -T0 = use all physical cores, -f = overwrite, --rm = remove source
+    cmd = ["zstd", "-T0", "-f"]
+    if remove_original:
+        cmd.append("--rm")
+    cmd.extend([str(src), "-o", str(dst)])
+    subprocess.run(cmd, check=True, capture_output=True)
+    return dst
+
+
 def save_nifti(
     data: np.ndarray,
     output_path: str | Path,
@@ -1395,28 +1486,34 @@ def save_nifti(
     affine: np.ndarray | None = None,
     tr: float | None = None,
 ):
-    """
-    Save data as NIfTI file
+    """Save data as a NIfTI file with efficient compression.
+
+    Compression is chosen automatically from the *output_path* extension:
+
+    * ``.nii``     — uncompressed (nibabel direct write)
+    * ``.nii.gz``  — gzip via **pigz** (multicore) with gzip fallback
+    * ``.nii.zst`` — zstandard via **zstd -T0** (multicore, fastest)
 
     Parameters
     ----------
     data : np.ndarray
-        Data to save (3D or 4D array)
+        Data to save (3D or 4D array).
     output_path : str or Path
-        Output file path
+        Output file path (extension determines compression).
     reference_img : str or Path, optional
-        Reference NIfTI file to copy affine/header from
+        Reference NIfTI file to copy affine/header from.
     affine : np.ndarray, optional
-        4x4 affine transformation matrix
-        If None and no reference_img, uses identity
+        4×4 affine transformation matrix.
+        If None and no *reference_img*, uses identity.
     tr : float, optional
-        Repetition time in seconds (for 4D data)
-        If None, attempts to get from reference_img
+        Repetition time in seconds (for 4D data).
     """
     try:
         import nibabel as nib
-    except ImportError:
-        raise ImportError("nibabel is required to save NIfTI files. Install with: pip install nibabel")
+    except ImportError as err:
+        raise ImportError(
+            "nibabel is required to save NIfTI files. Install with: pip install nibabel"
+        ) from err
 
     # Get affine and header info
     if reference_img is not None:
@@ -1424,7 +1521,6 @@ def save_nifti(
         affine = ref_img.affine
         header = ref_img.header.copy()
     elif affine is None:
-        # Default identity affine
         affine = np.eye(4)
         header = nib.Nifti1Header()
     else:
@@ -1435,8 +1531,23 @@ def save_nifti(
 
     # Set TR if provided
     if tr is not None:
-        img.header.set_xyzt_units(xyz='mm', t='sec')
-        img.header['pixdim'][4] = tr
+        img.header.set_xyzt_units(xyz="mm", t="sec")
+        img.header["pixdim"][4] = tr
 
-    # Save
-    nib.save(img, str(output_path))
+    out = Path(output_path)
+    out_str = str(out)
+
+    if out_str.endswith(".nii.zst") or (out_str.endswith(".nii.gz") and shutil.which("pigz")):
+        # Write uncompressed to a temp file first, then compress externally.
+        # This avoids nibabel's single-threaded gzip and enables pigz / zstd.
+        stem = out.name
+        for ext in (".nii.zst", ".nii.gz"):
+            if stem.endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+        tmp_nii = out.parent / (stem + ".nii")
+        nib.save(img, str(tmp_nii))
+        compress_nifti(tmp_nii, out, remove_original=True)
+    else:
+        # .nii or .nii.gz without pigz → let nibabel handle it directly
+        nib.save(img, str(out))

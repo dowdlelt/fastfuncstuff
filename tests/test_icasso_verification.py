@@ -143,7 +143,7 @@ def test_icasso_main_function():
     )
     
     centroids = results['components'] # stable components
-    mixing = results['mixing']
+    _mixing = results['mixing']
     
     # Check shapes
     assert centroids.shape[0] > 0 # At least one stable component

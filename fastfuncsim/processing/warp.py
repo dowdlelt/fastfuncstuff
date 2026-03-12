@@ -844,7 +844,7 @@ def _improve_warp_batched(
 
     nx, ny, nz = state.nx, state.ny, state.nz
     n_basis = basis.shape[0]
-    V = basis.shape[1]
+    _V = basis.shape[1]
 
     active_dims = [d for d in range(3) if do_xyz[d]]
     n_active = len(active_dims) * n_basis
@@ -904,8 +904,8 @@ def _improve_warp_batched(
             external_pen = global_energy_sum - patch_energies
 
     # Axis weight scales
-    ax_scales = torch.tensor([axis_weights[d] for d in active_dims],
-                             device=device, dtype=torch.float32)
+    _ax_scales = torch.tensor([axis_weights[d] for d in active_dims],
+                              device=device, dtype=torch.float32)
 
     # Pre-stack global warp as 3-channel volume ONCE (avoids re-stacking
     # every optimizer iteration -- saves ~45 MB of memory copies per iter)

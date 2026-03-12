@@ -112,7 +112,7 @@ def _make_event_schedule(
     all_onsets: list[list[np.ndarray]] = []
 
     fill_run = n_events_per_cond < 0
-    min_events = abs(n_events_per_cond)
+    _min_events = abs(n_events_per_cond)
 
     for _cond in range(n_conditions):
         cond_onsets = []
@@ -840,7 +840,7 @@ class TestDenoiseRecovery:
 
         n_tp_total = n_runs * n_tp_run
         run_starts = [i * n_tp_run for i in range(n_runs)]
-        n_voxels = n_task_voxels + n_noise_voxels
+        _n_voxels = n_task_voxels + n_noise_voxels
         microtime_dt = 0.1
 
         # Task design
@@ -1039,7 +1039,7 @@ class TestDenoiseRecovery:
 
         # Build noise pool mask: only noise voxels (last n_noise_voxels)
         n_task = inp["n_task_voxels"]
-        n_noise = inp["n_noise_voxels"]
+        _n_noise = inp["n_noise_voxels"]
         n_voxels_total = inp["data"].shape[0]
         noise_pool_mask = torch.zeros(n_voxels_total, dtype=torch.bool)
         noise_pool_mask[n_task:] = True

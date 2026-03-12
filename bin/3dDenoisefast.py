@@ -41,14 +41,12 @@ except ImportError:
 # Import fastfuncsim modules
 try:
     from fastfuncsim.afni_io import (
-        load_afni_mask,
-        load_nifti,
+        load_afni_mask,  # noqa: F401 — availability check
+        load_nifti,  # noqa: F401 — availability check
     )
     from fastfuncsim.cli_utils import (
         LoadResult,
         auto_polort,
-        compute_run_lengths,
-        get_average_run_duration,
         load_and_preprocess_runs,
         parse_cv_strategy,
         parse_input_files,
@@ -61,18 +59,16 @@ try:
         estimate_noise_component_caps_per_run,
         fit_denoising_model,
     )
-    from fastfuncsim.design import convolve_hrf_microtime, make_fir_design, make_tent_design
     from fastfuncsim.design_builder import (
         create_onset_matrix_microtime,
         parse_afni_timing_file,
         parse_durations,
-        parse_hrf_model,
     )
     from fastfuncsim.glm_core import construct_polynomial_matrix
-    from fastfuncsim.hrf import get_hrf_library, get_spmg1_hrf
+    from fastfuncsim.hrf import get_hrf_library
     from fastfuncsim.hrf_selection import load_nuisance_file
     from fastfuncsim.ridge import load_hrf_indices
-    from fastfuncsim.utils import gaussian_blur_3d, get_device, scale_to_percent_signal, to_tensor
+    from fastfuncsim.utils import get_device, scale_to_percent_signal, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncsim: {e}")
     print("Make sure fastfuncsim is installed: pip install -e .")
@@ -1041,7 +1037,7 @@ def compute_bootstrap_se(
 
     # Compute original fit once
     design_gpu = design.to(device)
-    XtX_inv = torch.linalg.inv(
+    _XtX_inv = torch.linalg.inv(
         design_gpu.T @ design_gpu + 1e-6 * torch.eye(n_regressors, device=device)
     )
 
@@ -1363,7 +1359,10 @@ def save_model_fit_outputs(
     bucket_4d = np.stack(bucket_vols, axis=-1)
     bucket_img = nib.Nifti1Image(bucket_4d, affine)
     bucket_path = f"{output_prefix}_{model_type}_bucket.nii.gz"
-    nib.save(bucket_img, bucket_path)
+
+    # Write uncompressed first for 3drefit, compress after
+    bucket_path_nii = bucket_path.replace(".nii.gz", ".nii")
+    nib.save(bucket_img, bucket_path_nii)
     output_files[f"{model_type}_bucket"] = bucket_path
 
     # Use 3drefit to add proper AFNI labels and DOF
@@ -1382,7 +1381,7 @@ def save_model_fit_outputs(
                     if sbtype == "tstat":
                         refit_cmd.extend(["-substatpar", str(i), "fitt", str(dof)])
 
-            refit_cmd.append(bucket_path)
+            refit_cmd.append(bucket_path_nii)
 
             subprocess.run(refit_cmd, check=True, capture_output=True)
             print(f"  ✓ Applied AFNI labels to {bucket_path}")
@@ -1395,6 +1394,10 @@ def save_model_fit_outputs(
             for i, label in enumerate(sub_brick_labels):
                 f.write(f"{i}\t{label}\n")
         output_files[f"{model_type}_labels"] = labels_path
+
+    # Compress with pigz/zstd
+    from fastfuncsim.afni_io import compress_nifti
+    compress_nifti(bucket_path_nii, bucket_path, remove_original=True)
 
     return output_files
 
@@ -1446,12 +1449,12 @@ def main():
     )
 
     hrf_model_name = hrf_info["hrf_model_name"]
-    hrf_params = hrf_info["hrf_params"]
+    _hrf_params = hrf_info["hrf_params"]
     is_fir_model = hrf_info["is_fir_model"]
     fir_bot = hrf_info["fir_bot"]
     fir_top = hrf_info["fir_top"]
     n_basis = hrf_info["n_basis"]
-    condition_labels_full = hrf_info["condition_labels_full"]
+    _condition_labels_full = hrf_info["condition_labels_full"]
 
     # Check for incompatible options with FIR models
     validate_hrf_compatibility(
@@ -2290,7 +2293,6 @@ def main():
             task_indices_final = list(range(n_trials))
             for hrf_idx in tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verbose):
                 voxel_mask = hrf_indices_dev == hrf_idx
-                n_group_voxels = voxel_mask.sum().item()
                 group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
                 full_design_final = torch.cat([group_design_2d, nuisance_design_final], dim=1)
                 glm_results_final = fit_glm(
@@ -2360,7 +2362,6 @@ def main():
         # Need to map data voxels back to 3D volume for saving
         if mask_flat is not None:
             mask_flat_np = mask_flat.cpu().numpy() if torch.is_tensor(mask_flat) else mask_flat
-            n_voxels_full = mask_flat_np.size
 
             # Helper to map data voxels to full volume
             def map_to_volume(data_1d, mask_1d):
@@ -2518,9 +2519,6 @@ def main():
                     voxel_mask_np = None
 
                 noise_pool_mask_np = noise_pool_mask.cpu().numpy()
-
-                # For compute_full_brain_pc_loadings: pass None (data is already brain voxels)
-                brain_mask_for_loadings = None
 
                 # Create summary plot (CV R² curve)
                 # Note: r2_by_pc is already computed and contains median R² across PC counts

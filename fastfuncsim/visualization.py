@@ -304,8 +304,8 @@ def plot_batch_summary(
 
     # Extract data
     r2_means = [r.get("r2_mean", r.get("mean_r2", np.nan)) for r in results_list]
-    r2_medians = [r.get("r2_median", r.get("median_r2", np.nan)) for r in results_list]
-    r2_stds = [r.get("r2_std", 0) for r in results_list]
+    _r2_medians = [r.get("r2_median", r.get("median_r2", np.nan)) for r in results_list]
+    _r2_stds = [r.get("r2_std", 0) for r in results_list]
 
     # Create figure
     n_plots = len(metrics)
@@ -431,7 +431,7 @@ def plot_batch_summary(
         ax = axes[plot_idx]
 
         hrf_corrs = [r.get("hrf_correlation", np.nan) for r in results_list]
-        hrf_rmses = [r.get("hrf_rmse", np.nan) for r in results_list]
+        _hrf_rmses = [r.get("hrf_rmse", np.nan) for r in results_list]
 
         if not all(np.isnan(hrf_corrs)):
             if group_by and group_by in results_list[0]:
@@ -598,7 +598,7 @@ def plot_parametric_exploration(
         for i in range(len(y_vals)):
             for j in range(len(x_vals)):
                 if not np.isnan(grid_data[i, j]):
-                    text = ax.text(
+                    _text = ax.text(
                         j,
                         i,
                         f"{grid_data[i, j]:.2f}",
@@ -1199,7 +1199,7 @@ def plot_denoising_pcs(
         # --- Top panel: Full-width timecourse ---
         # Compute total timepoints
         total_tps = sum(pc.shape[0] for pc in pcs_np)
-        time_axis = np.arange(total_tps) * tr
+        _time_axis = np.arange(total_tps) * tr
 
         # Plot each run with different color
         colors = plt.cm.tab10(np.linspace(0, 1, n_runs))  # ty: ignore[unresolved-attribute]
@@ -1225,7 +1225,7 @@ def plot_denoising_pcs(
         ax_tc.grid(True, alpha=0.3)
 
         # Add run boundaries
-        for run_idx, start in enumerate(run_starts[1:], 1):
+        for _run_idx, start in enumerate(run_starts[1:], 1):
             run_time = start * tr
             ax_tc.axvline(run_time, color="gray", linestyle="--", alpha=0.5, linewidth=1.5)
 
@@ -1393,7 +1393,7 @@ def plot_denoising_pcs(
                 ax.axis("off")
 
                 # Show with symmetric colormap and proper aspect ratio
-                im = ax.imshow(
+                _im = ax.imshow(
                     montage,
                     cmap="RdBu_r",
                     vmin=-vmax,

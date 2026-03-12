@@ -553,7 +553,7 @@ def make_tent_design(
     design = torch.zeros(n_timepoints, n_actual_basis, device=device)
 
     # Create time vector for each TR (in seconds)
-    tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
+    _tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
 
     # Combine all onset times from all conditions
     all_onset_times = []
@@ -1272,10 +1272,10 @@ def save_iresp(
     """
     try:
         import nibabel as nib
-    except ImportError:
+    except ImportError as err:
         raise ImportError(
             "nibabel is required to save NIfTI files. Install with: pip install nibabel"
-        )
+        ) from err
 
     if iresp.ndim != 5:
         raise ValueError(
@@ -1544,7 +1544,7 @@ def fit_penalized_glm_cv(
         data = data.unsqueeze(0)  # (1, n_timepoints)
 
     n_voxels, n_timepoints = data.shape
-    n_basis = design.shape[1]
+    _n_basis = design.shape[1]
     n_runs = len(run_boundaries)
 
     # Precompute D'D penalty term
