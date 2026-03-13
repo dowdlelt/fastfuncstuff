@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from fastfuncsim.cli_utils import (
+from fastfuncstuff.cli_utils import (
     auto_polort,
     compute_run_lengths,
     get_average_run_duration,

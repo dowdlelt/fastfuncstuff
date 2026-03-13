@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fastfuncsim.io.afni import read_afni_design_matrix
-from fastfuncsim.design.builder import (
+from fastfuncstuff.io.afni import read_afni_design_matrix
+from fastfuncstuff.design.builder import (
     build_design_matrix,
     create_onset_regressors,
     legendre_polynomials,
@@ -291,7 +291,7 @@ def test_write_afni_xmat():
     """Test writing .xmat.1D format"""
     import tempfile
 
-    from fastfuncsim.design.builder import write_afni_xmat
+    from fastfuncstuff.design.builder import write_afni_xmat
 
     # Build a simple design matrix
     movie_file = TEST_DATA_DIR / "ses01_times.movie.txt"
@@ -429,7 +429,7 @@ def test_im_mode():
 
 def test_glt_parsing():
     """Test GLT contrast parsing and validation"""
-    from fastfuncsim.design.builder import glt_weights_to_vector, parse_glt_string
+    from fastfuncstuff.design.builder import glt_weights_to_vector, parse_glt_string
 
     # Test valid contrast (difference)
     weights, valid = parse_glt_string('SYM: +1*A -1*B')
@@ -464,7 +464,7 @@ def test_glt_parsing():
 
 def test_goodlist_utilities():
     """Test GoodList parsing and censoring utilities"""
-    from fastfuncsim.io.afni import (
+    from fastfuncstuff.io.afni import (
         get_censored_mask,
         read_afni_design_matrix,
         select_uncensored_timepoints,
@@ -521,7 +521,7 @@ class TestDesignBuilderEdgeCases:
         import os
         import tempfile
 
-        from fastfuncsim.design.builder import load_and_pad_ortvec
+        from fastfuncstuff.design.builder import load_and_pad_ortvec
 
         # Create dummy ortvec file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
@@ -553,7 +553,7 @@ class TestDesignBuilderEdgeCases:
         import os
         import tempfile
 
-        from fastfuncsim.design.builder import load_and_pad_ortvec
+        from fastfuncstuff.design.builder import load_and_pad_ortvec
 
         # Create dummy ortvec file (5 timepoints, 2 regressors)
         data = np.random.randn(5, 2)
@@ -587,7 +587,7 @@ class TestDesignBuilderEdgeCases:
 
     def test_parse_hrf_model_errors(self):
         """Test error handling in parse_hrf_model."""
-        from fastfuncsim.design.builder import parse_hrf_model
+        from fastfuncstuff.design.builder import parse_hrf_model
 
         # Valid cases
         name, dur = parse_hrf_model("SPMG1(5)")
@@ -609,7 +609,7 @@ class TestDesignBuilderEdgeCases:
 
     def test_glt_weights_to_vector_errors(self):
         """Test error handling in glt_weights_to_vector."""
-        from fastfuncsim.design.builder import glt_weights_to_vector
+        from fastfuncstuff.design.builder import glt_weights_to_vector
 
         labels = ["A", "B", "C"]
         weights = {"A": 1, "D": -1}  # D doesn't exist
@@ -622,7 +622,7 @@ class TestDesignBuilderEdgeCases:
         import os
         import tempfile
 
-        from fastfuncsim.design.builder import build_design_matrix
+        from fastfuncstuff.design.builder import build_design_matrix
         
         # Create dummy timing file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
@@ -677,7 +677,7 @@ class TestDesignBuilderEdgeCases:
         import os
         import tempfile
 
-        from fastfuncsim.design.builder import build_design_matrix
+        from fastfuncstuff.design.builder import build_design_matrix
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
             f.write("10 20\n")
@@ -718,9 +718,9 @@ class TestDesignBuilderEdgeCases:
 
 import torch
 
-from fastfuncsim.design.matrices import convolve_hrf_microtime
-from fastfuncsim.design.hrf import get_canonical_hrf
-from fastfuncsim.utils import get_device
+from fastfuncstuff.design.matrices import convolve_hrf_microtime
+from fastfuncstuff.design.hrf import get_canonical_hrf
+from fastfuncstuff.utils import get_device
 
 
 class TestDesignHrfConvolution:
@@ -924,7 +924,7 @@ class TestDesignConvolveHrfBasic:
 
     def test_convolve_hrf_single_event(self):
         """Test basic HRF convolution with single event"""
-        from fastfuncsim.design.matrices import convolve_hrf
+        from fastfuncstuff.design.matrices import convolve_hrf
 
         device = get_device()
         n_timepoints = 50
@@ -953,7 +953,7 @@ class TestDesignConvolveHrfBasic:
 
     def test_convolve_hrf_multiple_conditions(self):
         """Test convolve_hrf with multiple conditions"""
-        from fastfuncsim.design.matrices import convolve_hrf
+        from fastfuncstuff.design.matrices import convolve_hrf
 
         device = get_device()
         n_timepoints = 100
@@ -978,7 +978,7 @@ class TestDesignConvolveHrfBasic:
 
     def test_convolve_hrf_empty_onsets(self):
         """Test convolve_hrf with all-zero onset matrix"""
-        from fastfuncsim.design.matrices import convolve_hrf
+        from fastfuncstuff.design.matrices import convolve_hrf
 
         device = get_device()
         n_timepoints = 50
@@ -993,7 +993,7 @@ class TestDesignConvolveHrfBasic:
 
     def test_convolve_hrf_1d_input(self):
         """Test that 1D onset matrix is handled correctly"""
-        from fastfuncsim.design.matrices import convolve_hrf
+        from fastfuncstuff.design.matrices import convolve_hrf
 
         device = get_device()
         n_timepoints = 50
@@ -1017,7 +1017,7 @@ class TestDesignIsTrLocked:
 
     def test_is_tr_locked_exact(self):
         """Test is_tr_locked with exact TR multiples"""
-        from fastfuncsim.design.matrices import is_tr_locked
+        from fastfuncstuff.design.matrices import is_tr_locked
 
         tr = 2.0
 
@@ -1027,7 +1027,7 @@ class TestDesignIsTrLocked:
 
     def test_is_tr_locked_not_locked(self):
         """Test is_tr_locked with non-TR multiples"""
-        from fastfuncsim.design.matrices import is_tr_locked
+        from fastfuncstuff.design.matrices import is_tr_locked
 
         tr = 2.0
 
@@ -1037,7 +1037,7 @@ class TestDesignIsTrLocked:
 
     def test_is_tr_locked_tolerance(self):
         """Test is_tr_locked with floating point tolerance"""
-        from fastfuncsim.design.matrices import is_tr_locked
+        from fastfuncstuff.design.matrices import is_tr_locked
 
         tr = 2.0
 
@@ -1056,7 +1056,7 @@ class TestDesignGenerateRandomOnsets:
 
     def test_generate_random_onsets_basic(self):
         """Test basic random onset generation"""
-        from fastfuncsim.design.matrices import generate_random_onsets
+        from fastfuncstuff.design.matrices import generate_random_onsets
 
         n_timepoints = 100
         n_conditions = 2
@@ -1088,7 +1088,7 @@ class TestDesignGenerateRandomOnsets:
 
     def test_generate_random_onsets_single_condition(self):
         """Test with single condition"""
-        from fastfuncsim.design.matrices import generate_random_onsets
+        from fastfuncstuff.design.matrices import generate_random_onsets
 
         n_timepoints = 100
         n_conditions = 1
@@ -1112,7 +1112,7 @@ class TestDesignGenerateRandomOnsets:
 
     def test_generate_random_onsets_isi_range(self):
         """Test with different ISI ranges"""
-        from fastfuncsim.design.matrices import generate_random_onsets
+        from fastfuncstuff.design.matrices import generate_random_onsets
 
         n_timepoints = 200
         n_conditions = 2

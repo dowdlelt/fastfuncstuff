@@ -11,8 +11,8 @@ Critical bugs this catches:
 import pytest
 import torch
 
-import fastfuncsim as ffs
-from fastfuncsim.utils import get_device
+import fastfuncstuff as ffs
+from fastfuncstuff.utils import get_device
 
 
 class TestOLSContrasts:
@@ -448,7 +448,7 @@ class TestContrastEdgeCases:
 
     def test_contrast_no_variance_info(self, device):
         """Test error when results lack variance information."""
-        from fastfuncsim.glm.core import GLMResults
+        from fastfuncstuff.glm.core import GLMResults
 
         # Create results without xtx_inv or var_betas
         results = GLMResults()

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from fastfuncsim.memory import (
+from fastfuncstuff.memory import (
     MemoryConfig,
     bytes_per_voxel_arma,
     bytes_per_voxel_denoise,

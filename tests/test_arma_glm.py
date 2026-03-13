@@ -15,8 +15,8 @@ def test_arma11_covariance():
     print("Test 1: ARMA(1,1) Covariance Matrix")
     print("="*70)
     
-    from fastfuncsim.glm.arma import build_arma11_covariance
-    from fastfuncsim.utils import get_device
+    from fastfuncstuff.glm.arma import build_arma11_covariance
+    from fastfuncstuff.utils import get_device
     
     device = get_device()
     print(f"Using device: {device}")
@@ -61,9 +61,9 @@ def test_reml_grid_search():
     print("Test 2: REML Grid Search")
     print("="*70)
     
-    from fastfuncsim.glm.arma import reml_grid_search
-    from fastfuncsim.simulation.noise import generate_arma_noise
-    from fastfuncsim.utils import get_device
+    from fastfuncstuff.glm.arma import reml_grid_search
+    from fastfuncstuff.simulation.noise import generate_arma_noise
+    from fastfuncstuff.utils import get_device
     
     device = get_device()
     
@@ -119,8 +119,8 @@ def test_prewhitening():
     print("Test 3: Prewhitening")
     print("="*70)
     
-    from fastfuncsim.glm.arma import build_arma11_covariance, prewhiten_with_arma11
-    from fastfuncsim.utils import get_device
+    from fastfuncstuff.glm.arma import build_arma11_covariance, prewhiten_with_arma11
+    from fastfuncstuff.utils import get_device
     
     device = get_device()
     
@@ -161,10 +161,10 @@ def test_glm_arma11():
     print("Test 4: Full ARMA(1,1) GLM Fit")
     print("="*70)
     
-    from fastfuncsim.glm.arma import fit_glm_arma11
-    from fastfuncsim.glm.core import fit_glm
-    from fastfuncsim.simulation.noise import generate_arma_noise
-    from fastfuncsim.utils import get_device
+    from fastfuncstuff.glm.arma import fit_glm_arma11
+    from fastfuncstuff.glm.core import fit_glm
+    from fastfuncstuff.simulation.noise import generate_arma_noise
+    from fastfuncstuff.utils import get_device
     
     device = get_device()
     
@@ -242,9 +242,9 @@ def test_batch_processing():
     print("Test 5: Batch Processing")
     print("="*70)
     
-    from fastfuncsim.glm.arma import batch_reml_grid_search
-    from fastfuncsim.simulation.noise import generate_arma_noise
-    from fastfuncsim.utils import get_device
+    from fastfuncstuff.glm.arma import batch_reml_grid_search
+    from fastfuncstuff.simulation.noise import generate_arma_noise
+    from fastfuncstuff.utils import get_device
     
     device = get_device()
     

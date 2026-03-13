@@ -6,7 +6,7 @@ Demonstrates fast interactive workflow for exploring fMRI simulations
 import matplotlib.pyplot as plt
 import torch
 
-import fastfuncsim as ffs
+import fastfuncstuff as ffs
 
 
 def main():

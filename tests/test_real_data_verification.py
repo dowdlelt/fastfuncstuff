@@ -9,10 +9,10 @@ from scipy.stats import pearsonr
 from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.decomposition import FastICA as SklearnFastICA
 
-from fastfuncsim.decomposition.ica import FastICA
-from fastfuncsim.decomposition.pca import PCA
+from fastfuncstuff.decomposition.ica import FastICA
+from fastfuncstuff.decomposition.pca import PCA
 
-DATA_PATH = Path("/home/logan/Dropbox/Resources/code/fastfuncsim/test_data/small_validation_afni_data/small_test_r01.nii.gz")
+DATA_PATH = Path("/home/logan/Dropbox/Resources/code/fastfuncstuff/test_data/small_validation_afni_data/small_test_r01.nii.gz")
 
 def check_sign_flip_correlation(a, b):
     """

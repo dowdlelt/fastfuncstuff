@@ -9,12 +9,12 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.analysis import (
+from fastfuncstuff.analysis import (
     analyze_from_onsets,
     analyze_with_cross_validation,
 )
-from fastfuncsim.glm.core import fit_glm_hrf_library
-from fastfuncsim.design.hrf import get_hrf_library
+from fastfuncstuff.glm.core import fit_glm_hrf_library
+from fastfuncstuff.design.hrf import get_hrf_library
 
 # Test data directory
 TEST_DATA_DIR = (
@@ -43,7 +43,7 @@ def simulated_data():
 
     # Also create microtime-resolution onset matrix for HRF library tests
     # onsets_to_binary_matrix expects list of lists of arrays per condition per run
-    from fastfuncsim.io.afni import onsets_to_binary_matrix
+    from fastfuncstuff.io.afni import onsets_to_binary_matrix
     onsets_per_condition = [[stim_onsets[0]], [stim_onsets[1]]]  # 2 conditions, 1 run each
     onsets_matrix_microtime = onsets_to_binary_matrix(
         onsets_per_condition, n_timepoints, tr, microtime_dt=0.1
@@ -51,14 +51,14 @@ def simulated_data():
 
     # Generate ground truth data using a standard HRF
     # Important: simulate_fmri_run expects (n_timepoints, n_conditions) onsets
-    from fastfuncsim.design.hrf import get_canonical_hrf
+    from fastfuncstuff.design.hrf import get_canonical_hrf
 
     hrf = get_canonical_hrf(stim_duration=0, tr=tr)
 
     # Create random betas
     betas = torch.randn(n_voxels, 2)
 
-    from fastfuncsim.simulation.core import simulate_fmri_run
+    from fastfuncstuff.simulation.core import simulate_fmri_run
 
     # matrix_size=(10, 10, 1) = 100 voxels
     data_4d = simulate_fmri_run(
@@ -213,9 +213,9 @@ def test_analyze_with_cross_validation_sanity():
 
 def test_microtime_resolution(simulated_data):
     """Confirm sub-TR timing (microtime resolution) works correctly."""
-    from fastfuncsim.io.afni import onsets_to_binary_matrix
-    from fastfuncsim.design.matrices import convolve_hrf_microtime
-    from fastfuncsim.design.hrf import get_canonical_hrf
+    from fastfuncstuff.io.afni import onsets_to_binary_matrix
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.design.hrf import get_canonical_hrf
 
     tr = simulated_data["tr"]
     n_timepoints = simulated_data["n_timepoints"]
@@ -269,9 +269,9 @@ def test_microtime_resolution(simulated_data):
 
 def test_microtime_vs_tr_locked():
     """Confirm microtime produces different results than TR-locked for sub-TR onsets."""
-    from fastfuncsim.io.afni import onsets_to_binary_matrix
-    from fastfuncsim.design.matrices import convolve_hrf, convolve_hrf_microtime
-    from fastfuncsim.design.hrf import get_canonical_hrf
+    from fastfuncstuff.io.afni import onsets_to_binary_matrix
+    from fastfuncstuff.design.matrices import convolve_hrf, convolve_hrf_microtime
+    from fastfuncstuff.design.hrf import get_canonical_hrf
 
     tr = 2.0
     n_timepoints = 100

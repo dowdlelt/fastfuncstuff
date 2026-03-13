@@ -166,7 +166,12 @@ Tensor Sizes:
 
 ======================================================================
 
-ARMA(1,1) batches:   0%|          | 0/3 [00:00<?, ?batch/s]ARMA(1,1) batches:  33%|███▎      | 1/3 [00:00<00:01,  1.10batch/s]ARMA(1,1) batches:  67%|██████▋   | 2/3 [00:01<00:00,  1.25batch/s]ARMA(1,1) batches: 100%|██████████| 3/3 [00:01<00:00,  1.79batch/s]ARMA(1,1) batches: 100%|██████████| 3/3 [00:01<00:00,  1.58batch/s]
+
+ARMA(1,1) batches:   0%|          | 0/3 [00:00<?, ?batch/s]
+ARMA(1,1) batches:  33%|███▎      | 1/3 [00:00<00:01,  1.10batch/s]
+ARMA(1,1) batches:  67%|██████▋   | 2/3 [00:01<00:00,  1.25batch/s]
+ARMA(1,1) batches: 100%|██████████| 3/3 [00:01<00:00,  1.79batch/s]
+ARMA(1,1) batches: 100%|██████████| 3/3 [00:01<00:00,  1.58batch/s]
 
 Complete!
   Mean (a, b): (0.051, 0.307)
@@ -180,9 +185,9 @@ Complete!
   • Writing REML betas + stats (bucket): teststats
   • Writing REML variance parameters: testvar
 Traceback (most recent call last):
-  File "/home/logan/Dropbox/Resources/code/fastfuncsim/synthetic_data/../bin/3dREMLfast.py", line 627, in <module>
+  File "/home/logan/Dropbox/Resources/code/fastfuncstuff/synthetic_data/../bin/3dREMLfast.py", line 627, in <module>
     main()
-  File "/home/logan/Dropbox/Resources/code/fastfuncsim/synthetic_data/../bin/3dREMLfast.py", line 549, in main
+  File "/home/logan/Dropbox/Resources/code/fastfuncstuff/synthetic_data/../bin/3dREMLfast.py", line 549, in main
     nib.save(var_img, str(Path(args.Rvar).with_suffix('.BRIK')))
   File "/home/logan/miniconda3/envs/py312_movie_tasks/lib/python3.12/site-packages/nibabel/loadsave.py", line 203, in save
     raise err

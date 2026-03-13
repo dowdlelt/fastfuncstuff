@@ -13,7 +13,7 @@ Demonstrates:
 
 import torch
 
-import fastfuncsim as ffs
+import fastfuncstuff as ffs
 
 # Setup
 device = ffs.get_device()

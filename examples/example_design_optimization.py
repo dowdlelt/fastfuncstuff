@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 # Import FastFuncSim modules
-from fastfuncsim.design.optimization import (
+from fastfuncstuff.design.optimization import (
     ISIConstraints,
     compare_designs_summary,
     evaluate_design_candidates,

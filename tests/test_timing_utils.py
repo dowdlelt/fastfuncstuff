@@ -6,7 +6,7 @@ Tests the hierarchical timing profiler used for performance optimization.
 
 import time
 
-from fastfuncsim.timing_utils import TimingProfiler, get_profiler, profile_section
+from fastfuncstuff.timing_utils import TimingProfiler, get_profiler, profile_section
 
 
 class TestTimingProfiler:
@@ -192,7 +192,7 @@ class TestProfileSectionDecorator:
     def test_profile_section_uses_global_profiler(self):
         """Test that profile_section uses the global profiler."""
         # Clear global profiler first
-        import fastfuncsim.timing_utils as timing_utils_module
+        import fastfuncstuff.timing_utils as timing_utils_module
         timing_utils_module._global_profiler = None
 
         # Get a fresh global profiler with enabled=True

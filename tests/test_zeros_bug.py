@@ -5,10 +5,10 @@ Quick test to trace the all-zeros bug
 
 import torch
 
-from fastfuncsim.design.matrices import build_glm_design, generate_random_onsets
-from fastfuncsim.design.hrf import get_canonical_hrf
-from fastfuncsim.simulation.core import simulate_fmri_run
-from fastfuncsim.utils import get_device
+from fastfuncstuff.design.matrices import build_glm_design, generate_random_onsets
+from fastfuncstuff.design.hrf import get_canonical_hrf
+from fastfuncstuff.simulation.core import simulate_fmri_run
+from fastfuncstuff.utils import get_device
 
 # Setup
 device = get_device()

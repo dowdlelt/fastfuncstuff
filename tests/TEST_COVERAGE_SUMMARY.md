@@ -143,7 +143,7 @@ The 6 failing tests are **test bugs**, not function bugs. The functions themselv
 ## Running the Tests
 
 ```bash
-cd /home/logan/Dropbox/Resources/code/fastfuncsim
+cd /home/logan/Dropbox/Resources/code/fastfuncstuff
 python -m pytest tests/test_write_functions.py -v
 ```
 

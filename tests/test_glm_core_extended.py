@@ -12,13 +12,13 @@ Focus on:
 import pytest
 import torch
 
-from fastfuncsim.glm.core import (
+from fastfuncstuff.glm.core import (
     construct_polynomial_matrix,
     fit_glm,
     orthogonalize_design,
     percent_bold_change,
 )
-from fastfuncsim.utils import get_device
+from fastfuncstuff.utils import get_device
 
 
 class TestPolynomialMatrix:

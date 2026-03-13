@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.glm.arma import ARMA11Results, fit_glm_arma11
+from fastfuncstuff.glm.arma import ARMA11Results, fit_glm_arma11
 
 
 class TestLabelShapeMatching:
@@ -117,7 +117,7 @@ class TestSingleTrialsOutput:
 
     def test_single_trials_shape_matches_stim_count(self):
         """Test that single-trials output has correct number of trials"""
-        from fastfuncsim.glm.outputs import extract_onset_times_from_design
+        from fastfuncstuff.glm.outputs import extract_onset_times_from_design
 
         n_timepoints = 200
         n_stim = 30
@@ -241,7 +241,7 @@ def test_regression_ValueError_322_vs_252():
 
 def test_extract_design_metadata_helper():
     """Test the new helper function that consolidates duplicate code"""
-    from fastfuncsim.io.afni import extract_design_metadata
+    from fastfuncstuff.io.afni import extract_design_metadata
 
     # Simulate design_info from AFNI .xmat.1D
     design_info = {

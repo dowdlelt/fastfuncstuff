@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from fastfuncsim import (
+from fastfuncstuff import (
     fit_denoising_model,
     # GLM and design
     generate_ar1_noise,
@@ -50,7 +50,7 @@ def example_basic_denoising():
     n_timepoints = n_tps_per_run * n_runs
 
     # Build design matrix
-    from fastfuncsim.design.builder import create_design_matrix_from_onsets
+    from fastfuncstuff.design.builder import create_design_matrix_from_onsets
 
     design_matrix = create_design_matrix_from_onsets(
         onsets=[onsets],  # one condition

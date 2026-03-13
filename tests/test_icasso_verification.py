@@ -3,8 +3,8 @@ import numpy as np
 import torch
 from scipy.stats import pearsonr
 
-from fastfuncsim.decomposition.ica import ica_stability_analysis, select_n_components_by_stability
-from fastfuncsim.decomposition.icasso import icasso
+from fastfuncstuff.decomposition.ica import ica_stability_analysis, select_n_components_by_stability
+from fastfuncstuff.decomposition.icasso import icasso
 
 
 def check_sign_flip_correlation(a, b):
@@ -111,9 +111,9 @@ def test_icasso_auto_select():
     # optimal might be 2 or 3. 
     # But 5 should be lower than 3.
     # Note: select_n_components_by_stability is from ica.py, not icasso_auto_select from icasso.py
-    # But imported from fastfuncsim.ica... 
+    # But imported from fastfuncstuff.ica... 
     # Wait, the previous test file used select_n_components_by_stability from `ica.py`?
-    # No, `fastfuncsim.ica.select_n_components_by_stability`.
+    # No, `fastfuncstuff.ica.select_n_components_by_stability`.
     # Let's verify return type. It returns dict.
     
     assert results['stability_by_n_components'][3] > 0.9

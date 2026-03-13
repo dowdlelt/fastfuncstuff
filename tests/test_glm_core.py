@@ -13,8 +13,8 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.glm.core import fit_glm
-from fastfuncsim.utils import get_device
+from fastfuncstuff.glm.core import fit_glm
+from fastfuncstuff.utils import get_device
 
 
 class TestBasicGLM:
@@ -441,7 +441,7 @@ class TestGLMResultsToSpatial:
         """Test that to_spatial warns when original_shape is None."""
         import warnings
 
-        from fastfuncsim.glm.core import GLMResults
+        from fastfuncstuff.glm.core import GLMResults
         
         results = GLMResults()
         results.betas = torch.randn(100, 3)

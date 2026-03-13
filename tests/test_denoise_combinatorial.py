@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.denoise.combinatorial import (
+from fastfuncstuff.denoise.combinatorial import (
     CombinatorialDenoiseResults,
     CombinatorialDenoiseRunResult,
     evaluate_all_combinations_for_run,
@@ -20,7 +20,7 @@ from fastfuncsim.denoise.combinatorial import (
     generate_all_pc_combinations,
     select_optimal_combination,
 )
-from fastfuncsim.utils import get_device
+from fastfuncstuff.utils import get_device
 
 
 @pytest.fixture

@@ -12,9 +12,9 @@ Tests cover:
 import pytest
 import torch
 
-from fastfuncsim.design.hrf import get_canonical_hrf
-from fastfuncsim.simulation.core import simulate_fmri_experiment, simulate_fmri_run
-from fastfuncsim.utils import get_device
+from fastfuncstuff.design.hrf import get_canonical_hrf
+from fastfuncstuff.simulation.core import simulate_fmri_experiment, simulate_fmri_run
+from fastfuncstuff.utils import get_device
 
 
 class TestSingleRunSimulation:
@@ -387,7 +387,7 @@ class TestCreateParametricVoxels:
     
     def test_basic_parametric_voxels(self, device):
         """Test basic parametric voxel creation."""
-        from fastfuncsim.simulation.core import create_parametric_voxels
+        from fastfuncstuff.simulation.core import create_parametric_voxels
         
         matrix_size = (10, 20, 5)
         n_conditions = 3
@@ -407,7 +407,7 @@ class TestCreateParametricVoxels:
     
     def test_parametric_voxels_with_hrf_library(self, device):
         """Test parametric voxels with HRF library."""
-        from fastfuncsim.simulation.core import create_parametric_voxels
+        from fastfuncstuff.simulation.core import create_parametric_voxels
         
         matrix_size = (20, 20, 5)
         n_conditions = 2
@@ -431,7 +431,7 @@ class TestCreateParametricVoxels:
     
     def test_parametric_voxels_with_custom_beta_ranges(self, device):
         """Test parametric voxels with custom beta ranges."""
-        from fastfuncsim.simulation.core import create_parametric_voxels
+        from fastfuncstuff.simulation.core import create_parametric_voxels
         
         matrix_size = (10, 20, 3)
         n_conditions = 2
@@ -452,7 +452,7 @@ class TestCreateParametricVoxels:
     
     def test_noise_levels_vary_by_z(self, device):
         """Test that noise levels vary across z slices."""
-        from fastfuncsim.simulation.core import create_parametric_voxels
+        from fastfuncstuff.simulation.core import create_parametric_voxels
         
         matrix_size = (5, 20, 10)  # 10 slices
         n_conditions = 1
@@ -479,7 +479,7 @@ class TestSimulateBatchExperiments:
     
     def test_basic_batch_experiments(self, device):
         """Test basic batch experiment simulation."""
-        from fastfuncsim.simulation.core import simulate_batch_experiments
+        from fastfuncstuff.simulation.core import simulate_batch_experiments
         
         n_experiments = 5
         sim_config = {
@@ -501,7 +501,7 @@ class TestSimulateBatchExperiments:
     
     def test_batch_experiments_verbose(self, device, capsys):
         """Test batch experiments with verbose output."""
-        from fastfuncsim.simulation.core import simulate_batch_experiments
+        from fastfuncstuff.simulation.core import simulate_batch_experiments
         
         n_experiments = 10
         sim_config = {'n_runs': 1}
@@ -527,7 +527,7 @@ class TestSimulationFileWriting:
     
     def test_write_afni_onset_files(self, device, tmp_path):
         """Test AFNI onset file writing."""
-        from fastfuncsim.simulation.core import write_afni_onset_files
+        from fastfuncstuff.simulation.core import write_afni_onset_files
         
         # Create onset matrices for 2 runs, 2 conditions
         n_timepoints = 100
@@ -554,7 +554,7 @@ class TestSimulationFileWriting:
     
     def test_write_afni_onset_single_tensor(self, device, tmp_path):
         """Test AFNI onset file writing with single tensor."""
-        from fastfuncsim.simulation.core import write_afni_onset_files
+        from fastfuncstuff.simulation.core import write_afni_onset_files
         
         onsets = torch.zeros(100, 3)
         onsets[10, 0] = 1.0
@@ -571,7 +571,7 @@ class TestSimulationFileWriting:
     
     def test_write_afni_onset_empty_run(self, device, tmp_path):
         """Test AFNI onset file with empty run (no events)."""
-        from fastfuncsim.simulation.core import write_afni_onset_files
+        from fastfuncstuff.simulation.core import write_afni_onset_files
         
         # All zeros - no events
         onsets = torch.zeros(50, 1)
@@ -591,7 +591,7 @@ class TestSimulationFileWriting:
         """Test NIfTI file writing."""
         import nibabel as nib
 
-        from fastfuncsim.simulation.core import write_nifti_files
+        from fastfuncstuff.simulation.core import write_nifti_files
         
         # Create mock data
         data1 = torch.randn(10, 10, 5, 50)
@@ -616,7 +616,7 @@ class TestSimulationFileWriting:
         import nibabel as nib
         import numpy as np
 
-        from fastfuncsim.simulation.core import write_nifti_files
+        from fastfuncstuff.simulation.core import write_nifti_files
         
         data = torch.randn(5, 5, 3, 20)
         
@@ -645,7 +645,7 @@ class TestSaveSimulationOutputs:
     
     def test_save_simulation_outputs_basic(self, device, tmp_path):
         """Test basic simulation output saving."""
-        from fastfuncsim.simulation.core import save_simulation_outputs
+        from fastfuncstuff.simulation.core import save_simulation_outputs
         
         data1 = torch.randn(5, 5, 3, 30)
         data2 = torch.randn(5, 5, 3, 30)
@@ -670,7 +670,7 @@ class TestSaveSimulationOutputs:
     
     def test_save_simulation_outputs_with_metadata(self, device, tmp_path):
         """Test simulation output saving with custom metadata."""
-        from fastfuncsim.simulation.core import save_simulation_outputs
+        from fastfuncstuff.simulation.core import save_simulation_outputs
         
         data = torch.randn(4, 4, 2, 20)
         onsets = torch.zeros(20, 1)
@@ -699,7 +699,7 @@ class TestSaveSimulationOutputs:
     
     def test_save_simulation_outputs_with_tensor_metadata(self, device, tmp_path):
         """Test simulation output saving with tensor in metadata."""
-        from fastfuncsim.simulation.core import save_simulation_outputs
+        from fastfuncstuff.simulation.core import save_simulation_outputs
         
         data = torch.randn(4, 4, 2, 20)
         onsets = torch.zeros(20, 1)

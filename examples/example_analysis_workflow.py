@@ -13,7 +13,7 @@ real data flow through the same analysis functions.
 
 import torch
 
-import fastfuncsim as ffs
+import fastfuncstuff as ffs
 
 # Setup
 device = ffs.get_device()
@@ -109,8 +109,8 @@ print("=" * 70)
 # Check if example simulation exists
 import os
 
-onset_file_1 = '/Users/logan/local_bin/fastfuncsim/simulations/simulation_example_test/onsets_condition1.txt'
-onset_file_2 = '/Users/logan/local_bin/fastfuncsim/simulations/simulation_example_test/onsets_condition2.txt'
+onset_file_1 = '/Users/logan/local_bin/fastfuncstuff/simulations/simulation_example_test/onsets_condition1.txt'
+onset_file_2 = '/Users/logan/local_bin/fastfuncstuff/simulations/simulation_example_test/onsets_condition2.txt'
 
 if os.path.exists(onset_file_1) and os.path.exists(onset_file_2):
     print("\n1. Reading AFNI onset files...")
@@ -147,7 +147,7 @@ print("\n" + "=" * 70)
 print("Example 3: AFNI design matrix → Analysis")
 print("=" * 70)
 
-design_matrix_file = '/Users/logan/local_bin/fastfuncsim/X.xmat.1D'
+design_matrix_file = '/Users/logan/local_bin/fastfuncstuff/X.xmat.1D'
 
 if os.path.exists(design_matrix_file):
     print("\n1. Reading AFNI design matrix...")

@@ -13,7 +13,7 @@ all with GPU acceleration and cross-validated model selection.
 
 ```bash
 git clone <repo-url>
-cd fastfuncsim
+cd fastfuncstuff
 pip install -e .
 ```
 
@@ -30,7 +30,7 @@ PyTorch with CUDA or MPS support.
 ## Package Structure
 
 ```
-fastfuncsim/
+fastfuncstuff/
   glm/             Core GLM engine, cross-validation, ARMA prewhitening
   design/          Design matrices, HRF generation, onset parsing
   denoise/         Cross-validated noise PC denoising
@@ -259,7 +259,7 @@ Or for a simpler GLM:
 ## Python API
 
 ```python
-import fastfuncsim as ffs
+import fastfuncstuff as ffs
 
 device = ffs.get_device()  # auto-detect MPS / CUDA / CPU
 
@@ -348,7 +348,7 @@ data = ffs.simulate_fmri_run(
 Optimize experimental designs using Liu & Frank efficiency metrics:
 
 ```python
-from fastfuncsim.design.optimization import find_optimal_designs, ISIConstraints
+from fastfuncstuff.design.optimization import find_optimal_designs, ISIConstraints
 
 constraints = ISIConstraints(min_isi=2.0, max_isi=12.0, mean_isi=5.0)
 designs = find_optimal_designs(

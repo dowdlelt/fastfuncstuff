@@ -11,14 +11,14 @@ print("=" * 80)
 # Test imports
 print("\n1. Testing imports...")
 try:
-    import fastfuncsim as ffs  # noqa: F401
-    print("   ✓ fastfuncsim imported")
+    import fastfuncstuff as ffs  # noqa: F401
+    print("   ✓ fastfuncstuff imported")
 except ImportError as e:
-    print(f"   ✗ Failed to import fastfuncsim: {e}")
+    print(f"   ✗ Failed to import fastfuncstuff: {e}")
     sys.exit(1)
 
 try:
-    from fastfuncsim.design.optimization import (
+    from fastfuncstuff.design.optimization import (
         ISIConstraints,
         create_onset_matrix,
         generate_event_sequence,
@@ -30,7 +30,7 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from fastfuncsim.simulation.metrics_empirical import (
+    from fastfuncstuff.simulation.metrics_empirical import (
         compute_detection_power_empirical,  # noqa: F401
         estimate_ar1_coefficient,
     )

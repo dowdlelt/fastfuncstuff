@@ -38,7 +38,7 @@ def _make_colored_noise(
 
     Returns (n_voxels, n_timepoints).
     """
-    from fastfuncsim.simulation.noise import generate_ar1_noise
+    from fastfuncstuff.simulation.noise import generate_ar1_noise
 
     torch.manual_seed(seed)
     # generate_ar1_noise returns (n_timepoints, n_voxels) for n_voxels > 1
@@ -155,8 +155,8 @@ def _build_design_and_signal(
 
     Returns (onset_matrix, design) where design is (n_tp_total, n_conditions).
     """
-    from fastfuncsim.design.matrices import convolve_hrf_microtime
-    from fastfuncsim.design.builder import create_onset_matrix_microtime
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.design.builder import create_onset_matrix_microtime
 
     n_conditions = len(all_onsets)
     stim_durations = [stim_duration] * n_conditions
@@ -180,8 +180,8 @@ def _build_design_and_signal(
 
 def test_microtime_convolution_clips_hrf_at_run_boundaries():
     """HRF tails from one run must not bleed into the next when run_starts is provided."""
-    from fastfuncsim.design.matrices import convolve_hrf_microtime
-    from fastfuncsim.design.builder import create_onset_matrix_microtime
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.design.builder import create_onset_matrix_microtime
 
     tr = 1.0
     microtime_dt = 0.1
@@ -301,7 +301,7 @@ class TestHRFRecovery:
 
     def test_hrf_recovery_majority_signal_voxels(self):
         """Signal voxels should predominantly select the true HRF index."""
-        from fastfuncsim.design.hrf_selection import fit_glm_hrf_library_with_xval
+        from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
 
         results = fit_glm_hrf_library_with_xval(
             data=self.data,
@@ -329,7 +329,7 @@ class TestHRFRecovery:
 
     def test_xval_r2_positive_for_signal_voxels(self):
         """CV R² should be positive for the majority of signal voxels."""
-        from fastfuncsim.design.hrf_selection import fit_glm_hrf_library_with_xval
+        from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
 
         results = fit_glm_hrf_library_with_xval(
             data=self.data,
@@ -355,7 +355,7 @@ class TestHRFRecovery:
 
     def test_xval_r2_higher_for_signal_than_noise_voxels(self):
         """Mean CV R² for signal voxels must exceed mean CV R² for noise voxels."""
-        from fastfuncsim.design.hrf_selection import fit_glm_hrf_library_with_xval
+        from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
 
         results = fit_glm_hrf_library_with_xval(
             data=self.data,
@@ -387,9 +387,9 @@ class TestHRFRecovery:
         With 1 event the design is very sparse; with 20 events it may be dense.
         We only check that the function returns plausible outputs, not accuracy.
         """
-        from fastfuncsim.design.matrices import convolve_hrf_microtime
-        from fastfuncsim.design.builder import create_onset_matrix_microtime
-        from fastfuncsim.design.hrf_selection import fit_glm_hrf_library_with_xval
+        from fastfuncstuff.design.matrices import convolve_hrf_microtime
+        from fastfuncstuff.design.builder import create_onset_matrix_microtime
+        from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
 
         n_runs = 4
         n_tp_run = 100
@@ -451,7 +451,7 @@ class TestHRFRecovery:
         The true HRF should yield higher median CV R² across all HRFs than
         a clearly wrong HRF (earliest vs. latest peak).
         """
-        from fastfuncsim.design.hrf_selection import fit_glm_hrf_library_with_xval
+        from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
 
         results = fit_glm_hrf_library_with_xval(
             data=self.data,
@@ -505,7 +505,7 @@ class TestRidgeRecovery:
         noise_scale: float = 0.2,
         seed: int = 3,
     ):
-        from fastfuncsim.glm.ridge import create_single_trial_design
+        from fastfuncstuff.glm.ridge import create_single_trial_design
 
         n_tp_total = n_runs * n_tp_run
         run_starts = [i * n_tp_run for i in range(n_runs)]
@@ -561,7 +561,7 @@ class TestRidgeRecovery:
 
     def test_ridge_runs_without_error_close_isi(self):
         """fit_ridge_single_trial should complete with dense event schedules."""
-        from fastfuncsim.glm.ridge import fit_ridge_single_trial
+        from fastfuncstuff.glm.ridge import fit_ridge_single_trial
 
         inp = self._build_ridge_inputs(isi_min=1.0, isi_max=2.0)
         results = fit_ridge_single_trial(
@@ -588,7 +588,7 @@ class TestRidgeRecovery:
         Dense ISI (3-5 s) creates within-run collinearity that makes single-trial
         CV R² unreliable regardless of ridge regularization.
         """
-        from fastfuncsim.glm.ridge import fit_ridge_single_trial
+        from fastfuncstuff.glm.ridge import fit_ridge_single_trial
 
         inp = self._build_ridge_inputs(
             isi_min=2.0, isi_max=7.0, n_events_per_cond=10, noise_scale=0.01
@@ -645,7 +645,7 @@ class TestRidgeRecovery:
         frac=1.0 means keep 100% of OLS norm = no regularization (OLS);
         frac=0.05 means keep 5% = near-maximum regularization.
         """
-        from fastfuncsim.glm.ridge import fit_ridge_single_trial
+        from fastfuncstuff.glm.ridge import fit_ridge_single_trial
 
         inp = self._build_ridge_inputs(isi_min=1.0, isi_max=2.0, seed=7)
         results = fit_ridge_single_trial(
@@ -677,7 +677,7 @@ class TestRidgeRecovery:
         (= no regularization / OLS); frac=0.0 = maximum regularization.
         So lower mean frac → more regularization selected.
         """
-        from fastfuncsim.glm.ridge import fit_ridge_single_trial
+        from fastfuncstuff.glm.ridge import fit_ridge_single_trial
 
         def _run_mean_frac(isi_min, isi_max, seed):
             inp = self._build_ridge_inputs(
@@ -715,7 +715,7 @@ class TestRidgeRecovery:
     @pytest.mark.parametrize("n_events", [1, 5, 20])
     def test_ridge_varying_event_counts(self, n_events: int):
         """fit_ridge_single_trial should handle 1, 5, 20 events per condition."""
-        from fastfuncsim.glm.ridge import fit_ridge_single_trial
+        from fastfuncstuff.glm.ridge import fit_ridge_single_trial
 
         inp = self._build_ridge_inputs(
             n_events_per_cond=n_events,
@@ -744,7 +744,7 @@ class TestRidgeRecovery:
         With good SNR and wide ISI the estimated betas should be positively
         correlated with the known true betas (which are all positive here).
         """
-        from fastfuncsim.glm.ridge import fit_ridge_single_trial
+        from fastfuncstuff.glm.ridge import fit_ridge_single_trial
 
         # High SNR: build with small noise_scale
         inp = self._build_ridge_inputs(
@@ -832,8 +832,8 @@ class TestDenoiseRecovery:
         Task voxels: strong task response + weak independent noise + weak shared PCs.
         Noise voxels: no task response + strong shared PCs + weak independent noise.
         """
-        from fastfuncsim.design.matrices import convolve_hrf_microtime
-        from fastfuncsim.design.builder import create_onset_matrix_microtime
+        from fastfuncstuff.design.matrices import convolve_hrf_microtime
+        from fastfuncstuff.design.builder import create_onset_matrix_microtime
 
         rng = np.random.default_rng(seed)
         torch.manual_seed(seed)
@@ -907,7 +907,7 @@ class TestDenoiseRecovery:
 
     def test_denoising_model_runs_without_error(self):
         """fit_denoising_model should complete without raising an exception."""
-        from fastfuncsim.denoise.sequential import fit_denoising_model
+        from fastfuncstuff.denoise.sequential import fit_denoising_model
 
         inp = self._build_denoise_inputs()
         results = fit_denoising_model(
@@ -930,7 +930,7 @@ class TestDenoiseRecovery:
         Voxels with strong task signal (high initial R²) should be excluded
         from the noise pool.
         """
-        from fastfuncsim.denoise.sequential import fit_denoising_model
+        from fastfuncstuff.denoise.sequential import fit_denoising_model
 
         inp = self._build_denoise_inputs(task_snr=8.0)
         results = fit_denoising_model(
@@ -964,7 +964,7 @@ class TestDenoiseRecovery:
         When strong shared noise PCs are injected, the optimal PC count
         should be > 0.
         """
-        from fastfuncsim.denoise.sequential import fit_denoising_model
+        from fastfuncstuff.denoise.sequential import fit_denoising_model
 
         inp = self._build_denoise_inputs(n_true_pcs=3, task_snr=3.0)
         results = fit_denoising_model(
@@ -994,7 +994,7 @@ class TestDenoiseRecovery:
         have only independent noise (→ noise pool). PCs extracted from noise pool
         are just noise → no CV improvement.
         """
-        from fastfuncsim.denoise.sequential import fit_denoising_model
+        from fastfuncstuff.denoise.sequential import fit_denoising_model
 
         inp = self._build_denoise_inputs(n_true_pcs=0, task_snr=8.0, seed=55)
         results = fit_denoising_model(
@@ -1032,7 +1032,7 @@ class TestDenoiseRecovery:
         With injected shared PCs, cross_validate_noise_pcs should show
         improving (or non-decreasing) R² as PCs are added up to the true count.
         """
-        from fastfuncsim.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
 
         inp = self._build_denoise_inputs(n_true_pcs=3, task_snr=4.0)
         n_true_pcs = inp["n_true_pcs"]
@@ -1080,7 +1080,7 @@ class TestDenoiseRecovery:
 
     def test_denoise_result_r2_curve_has_correct_length(self):
         """fit_denoising_model should return xval_r2_by_n_components of length max_components+1."""
-        from fastfuncsim.denoise.sequential import fit_denoising_model
+        from fastfuncstuff.denoise.sequential import fit_denoising_model
 
         max_components = 6
         inp = self._build_denoise_inputs()

@@ -3,7 +3,7 @@
 ## Basic Usage
 
 ```python
-import fastfuncsim as ffs
+import fastfuncstuff as ffs
 
 results = ffs.fit_glm_arma11(data, design, tr=2.0)
 
@@ -106,7 +106,7 @@ Special cases: b=0 gives AR(1), a=0 gives MA(1), a=b=0 gives white noise.
 
 ## Related Files
 
-- Library: `fastfuncsim/glm/arma.py`
+- Library: `fastfuncstuff/glm/arma.py`
 - CLI: `ffs_reml` (installed command)
 - Tests: `tests/test_arma_glm.py`, `tests/test_arma_glm_comprehensive.py`
 - Example: `examples/example_arma_glm.py`

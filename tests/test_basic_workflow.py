@@ -14,8 +14,8 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.analysis import analyze_from_design_matrix
-from fastfuncsim.data_cache import check_cache_valid
+from fastfuncstuff.analysis import analyze_from_design_matrix
+from fastfuncstuff.data_cache import check_cache_valid
 
 # Test data paths
 DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
@@ -172,7 +172,7 @@ def test_contrasts_glt(test_data_dir, temp_output_dir):
 
 def test_bucket_output(test_data_dir, temp_output_dir):
     """Test bucket file output with header preservation."""
-    from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
+    from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
 
     results, design_info = analyze_from_design_matrix(
         fmri_data=INPUT_FILES,

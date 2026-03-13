@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.glm.core import fit_glm
-from fastfuncsim.glm.outputs import write_glm_results_nifti
+from fastfuncstuff.glm.core import fit_glm
+from fastfuncstuff.glm.outputs import write_glm_results_nifti
 
 
 def test_write_glm_results_nifti_roundtrip():
@@ -74,7 +74,7 @@ class TestGLMOutputsComprehensive:
     @pytest.fixture
     def mock_results(self):
         """Create a mock GLMResults object."""
-        from fastfuncsim.glm.core import GLMResults
+        from fastfuncstuff.glm.core import GLMResults
         results = GLMResults()
         results.betas = torch.randn(10, 4)  # 10 voxels, 4 regressors
         results.tstats = torch.randn(10, 4)
@@ -89,7 +89,7 @@ class TestGLMOutputsComprehensive:
 
     def test_slice_glm_results(self, mock_results):
         """Test slicing GLM results."""
-        from fastfuncsim.glm.outputs import slice_glm_results
+        from fastfuncstuff.glm.outputs import slice_glm_results
         
         # Slice first 2 regressors
         indices = [0, 1]
@@ -108,7 +108,7 @@ class TestGLMOutputsComprehensive:
 
     def test_extract_onset_times(self):
         """Test extracting onset times from design matrix."""
-        from fastfuncsim.glm.outputs import extract_onset_times_from_design
+        from fastfuncstuff.glm.outputs import extract_onset_times_from_design
         
         # Design matrix: 10 timepoints, 2 regressors
         # Reg 0: onset at 3
@@ -129,7 +129,7 @@ class TestGLMOutputsComprehensive:
         """Test writing single trial betas."""
         import nibabel as nib
 
-        from fastfuncsim.glm.outputs import write_single_trials_output
+        from fastfuncstuff.glm.outputs import write_single_trials_output
         
         # Setup design matrix with interleaved onsets
         # Reg 0: onset 5
@@ -174,7 +174,7 @@ class TestGLMOutputsComprehensive:
         """Test writing AFNI bucket file."""
         import nibabel as nib
 
-        from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
+        from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
         
         with tempfile.TemporaryDirectory() as tmpdir:
             # Test writing NIfTI format
@@ -208,7 +208,7 @@ class TestGLMOutputsComprehensive:
 
     def test_write_afni_bucket_deprecation(self, mock_results):
         """Test deprecated write_afni_bucket function."""
-        from fastfuncsim.glm.outputs import write_afni_bucket
+        from fastfuncstuff.glm.outputs import write_afni_bucket
         
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "old.nii.gz"
@@ -224,7 +224,7 @@ class TestGLMOutputsComprehensive:
 
     def test_error_cases(self, mock_results):
         """Test error handling."""
-        from fastfuncsim.glm.outputs import (
+        from fastfuncstuff.glm.outputs import (
             _reshape_parameter_map,
             _resolve_shape,
             write_glm_results_nifti,
@@ -262,7 +262,7 @@ class TestGLMOutputsComprehensive:
 
     def test_file_format_detection(self):
         """Test file format detection logic."""
-        from fastfuncsim.glm.outputs import _normalize_output_path
+        from fastfuncstuff.glm.outputs import _normalize_output_path
         
         path, fmt = _normalize_output_path("test.nii")
         assert fmt == "nifti"

@@ -12,7 +12,7 @@ Tests cover:
 import numpy as np
 import torch
 
-from fastfuncsim.decomposition.workflow import (
+from fastfuncstuff.decomposition.workflow import (
     apply_voxel_variance_normalization,
     sanitize_finite_tensor,
     verbose_print,
@@ -226,7 +226,7 @@ class TestEstimateSpatialSmoothnessResels:
         # Create simple 4D data
         data_4d = np.random.randn(10, 10, 5, 20)  # Small for speed
 
-        from fastfuncsim.decomposition.workflow import estimate_spatial_smoothness_resels
+        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d)
 
         assert isinstance(resels, float)
@@ -240,7 +240,7 @@ class TestEstimateSpatialSmoothnessResels:
         mask = np.ones((10, 10, 5), dtype=bool)
         mask[:2, :2, :] = False  # Exclude some voxels
 
-        from fastfuncsim.decomposition.workflow import estimate_spatial_smoothness_resels
+        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d, mask=mask)
 
         assert resels > 0
@@ -251,7 +251,7 @@ class TestEstimateSpatialSmoothnessResels:
         # Data with no temporal variance should still return valid results
         data_4d = np.ones((10, 10, 5, 10))
 
-        from fastfuncsim.decomposition.workflow import estimate_spatial_smoothness_resels
+        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d)
 
         # Should still return valid values (uses minimum FWHM of 1.0)
@@ -263,7 +263,7 @@ class TestEstimateSpatialSmoothnessResels:
         data_4d = np.random.randn(5, 5, 3, 10)
         device = torch.device("cpu")
 
-        from fastfuncsim.decomposition.workflow import estimate_spatial_smoothness_resels
+        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d, device=device)
 
         # Just check it doesn't crash

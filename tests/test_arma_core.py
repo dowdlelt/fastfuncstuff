@@ -12,9 +12,9 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.glm.arma import build_arma11_covariance
-from fastfuncsim.simulation.noise import generate_arma_noise
-from fastfuncsim.utils import get_device
+from fastfuncstuff.glm.arma import build_arma11_covariance
+from fastfuncstuff.simulation.noise import generate_arma_noise
+from fastfuncstuff.utils import get_device
 
 
 class TestARMANoiseGeneration:

@@ -1,5 +1,5 @@
 """
-Tests for utility functions in fastfuncsim/utils.py
+Tests for utility functions in fastfuncstuff/utils.py
 
 These tests cover device management, tensor conversion,
 memory calculations, and chunk size optimization.
@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.memory import estimate_chunk_size
-from fastfuncsim.utils import (
+from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.utils import (
     calc_memory_usage,
     get_device,
     print_device_info,

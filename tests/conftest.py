@@ -1,5 +1,5 @@
 """
-Pytest configuration for fastfuncsim tests.
+Pytest configuration for fastfuncstuff tests.
 """
 
 import pytest

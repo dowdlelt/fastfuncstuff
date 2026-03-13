@@ -1,5 +1,5 @@
 """
-Regression tests comparing fastfuncsim outputs against AFNI reference outputs.
+Regression tests comparing fastfuncstuff outputs against AFNI reference outputs.
 
 Uses small validation dataset in test_data/small_validation_afni_data/
 """
@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.analysis import analyze_from_design_matrix
-from fastfuncsim.glm.outputs import write_glm_bucket_as_nifti
+from fastfuncstuff.analysis import analyze_from_design_matrix
+from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
 
 # AFNI reference data paths (relative to project root)
 AFNI_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"

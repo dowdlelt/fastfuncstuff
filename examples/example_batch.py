@@ -8,7 +8,7 @@ from time import time
 import matplotlib.pyplot as plt
 import numpy as np
 
-import fastfuncsim as ffs
+import fastfuncstuff as ffs
 
 
 def run_single_simulation(config, device):

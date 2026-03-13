@@ -6,8 +6,8 @@ from scipy.stats import pearsonr
 from sklearn.decomposition import PCA as SklearnPCA
 from sklearn.decomposition import FastICA as SklearnFastICA
 
-from fastfuncsim.decomposition.ica import FastICA
-from fastfuncsim.decomposition.pca import PCA
+from fastfuncstuff.decomposition.ica import FastICA
+from fastfuncstuff.decomposition.pca import PCA
 
 
 def check_sign_flip_correlation(a, b):
@@ -61,7 +61,7 @@ def check_sign_flip_correlation(a, b):
 ])
 def test_pca_vs_sklearn(n_samples, n_features, n_components):
     """
-    Verify fastfuncsim.PCA matches sklearn.PCA
+    Verify fastfuncstuff.PCA matches sklearn.PCA
     """
     # Generate random data
     rng = np.random.RandomState(42)
@@ -178,9 +178,9 @@ def test_ica_spatial_recovery():
 
 def test_ica_vs_sklearn_spatial_logic():
     """
-    Compare fastfuncsim.FastICA (Spatial) with sklearn.FastICA on Transposed data.
+    Compare fastfuncstuff.FastICA (Spatial) with sklearn.FastICA on Transposed data.
     
-    fastfuncsim: input (Time, Voxels) -> finds independent rows of components_ (Voxels)
+    fastfuncstuff: input (Time, Voxels) -> finds independent rows of components_ (Voxels)
     sklearn: input (Voxels, Time) -> finds independent rows of components_ (Time) ???
     
     No.
@@ -201,7 +201,7 @@ def test_ica_vs_sklearn_spatial_logic():
     M_true = rng.randn(n_time, n_comps)
     X = M_true @ S_true # (100, 500)
     
-    # 1. fastfuncsim FastICA (Spatial)
+    # 1. fastfuncstuff FastICA (Spatial)
     # It does PCA first internally.
     # To match sklearn exactly, sklearn must also do PCA.
     # But sklearn PCA is on columns.

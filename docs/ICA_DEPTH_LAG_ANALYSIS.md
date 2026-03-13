@@ -97,7 +97,7 @@ Deferred intentionally:
 3. Add QC plots per component:
    - depth timeseries overlays,
    - lag-vs-depth scatter with fitted trend.
-4. Introduce a dedicated module in `fastfuncsim/` for this logic (to remove CLI bloat and enable unit tests).
+4. Introduce a dedicated module in `fastfuncstuff/` for this logic (to remove CLI bloat and enable unit tests).
 5. Add targeted tests for:
    - depth selector mapping,
    - weighted timeseries behavior,

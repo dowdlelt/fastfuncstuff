@@ -18,17 +18,17 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncsim.cli_utils import build_nuisance_per_run
-from fastfuncsim.denoise.sequential import (
+from fastfuncstuff.cli_utils import build_nuisance_per_run
+from fastfuncstuff.denoise.sequential import (
     extract_noise_pcs_per_run,
     fit_denoising_model,
     select_noise_pool_voxels,
 )
-from fastfuncsim.design.matrices import build_glm_design
-from fastfuncsim.glm.core import construct_polynomial_matrix, fit_glm
-from fastfuncsim.design.hrf import get_canonical_hrf
-from fastfuncsim.simulation.core import simulate_fmri_run
-from fastfuncsim.utils import get_device, scale_to_percent_signal
+from fastfuncstuff.design.matrices import build_glm_design
+from fastfuncstuff.glm.core import construct_polynomial_matrix, fit_glm
+from fastfuncstuff.design.hrf import get_canonical_hrf
+from fastfuncstuff.simulation.core import simulate_fmri_run
+from fastfuncstuff.utils import get_device, scale_to_percent_signal
 
 
 @pytest.fixture
@@ -257,7 +257,7 @@ class TestRidgeWorkflow:
 
         # Ridge should stabilize
         # Use moderate regularization
-        from fastfuncsim.glm.ridge import _fit_ridge_multiple_fracs
+        from fastfuncstuff.glm.ridge import _fit_ridge_multiple_fracs
 
         # Fit with multiple fractions using core fracridge helper
         fracs = np.array([0.0, 0.1, 0.3, 0.5, 1.0], dtype=np.float32)

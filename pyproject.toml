@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fastfuncsim"
+name = "fastfuncstuff"
 version = "0.1.0"
 description = "Fast GPU-accelerated functional MRI simulation and GLM fitting"
 readme = "README.md"
@@ -39,30 +39,30 @@ dev = [
 
 [project.scripts]
 # Analysis tools
-ffs_denoise = "fastfuncsim.cli.denoise:main"
-ffs_hrfopt = "fastfuncsim.cli.hrfopt:main"
-ffs_reml = "fastfuncsim.cli.reml:main"
-ffs_ridge = "fastfuncsim.cli.ridge:main"
-ffs_xval_r2 = "fastfuncsim.cli.xval_r2:main"
-ffs_build_design = "fastfuncsim.cli.build_design:main"
-ffs_decompose = "fastfuncsim.cli.decompose:main"
-ffs_deconvolve = "fastfuncsim.cli.deconvolve:main"
-ffs_denoisatorial = "fastfuncsim.cli.denoisatorial:main"
-ffs_ica = "fastfuncsim.cli.ica:main"
-ffs_pathfinder = "fastfuncsim.cli.pathfinder:main"
-ffs_tps = "fastfuncsim.cli.tps:main"
+ffs_denoise = "fastfuncstuff.cli.denoise:main"
+ffs_hrfopt = "fastfuncstuff.cli.hrfopt:main"
+ffs_reml = "fastfuncstuff.cli.reml:main"
+ffs_ridge = "fastfuncstuff.cli.ridge:main"
+ffs_xval_r2 = "fastfuncstuff.cli.xval_r2:main"
+ffs_build_design = "fastfuncstuff.cli.build_design:main"
+ffs_decompose = "fastfuncstuff.cli.decompose:main"
+ffs_deconvolve = "fastfuncstuff.cli.deconvolve:main"
+ffs_denoisatorial = "fastfuncstuff.cli.denoisatorial:main"
+ffs_ica = "fastfuncstuff.cli.ica:main"
+ffs_pathfinder = "fastfuncstuff.cli.pathfinder:main"
+ffs_tps = "fastfuncstuff.cli.tps:main"
 # Image processing tools
-ffs_nwarp = "fastfuncsim.processing.nwarpforge_cli:main"
-ffs_allineate = "fastfuncsim.processing.allineate_cli:main"
-ffs_moco = "fastfuncsim.processing.ffs_moco_cli:main"
-ffs_qwarp = "fastfuncsim.processing.cli:main"
-ffs_motsim = "fastfuncsim.processing.ffs_motsim:main"
-ffs_util_pcwarp = "fastfuncsim.processing.pcwarp_cli:main"
-ffs_automask = "fastfuncsim.processing.mask_cli:main"
+ffs_nwarp = "fastfuncstuff.processing.nwarpforge_cli:main"
+ffs_allineate = "fastfuncstuff.processing.allineate_cli:main"
+ffs_moco = "fastfuncstuff.processing.ffs_moco_cli:main"
+ffs_qwarp = "fastfuncstuff.processing.cli:main"
+ffs_motsim = "fastfuncstuff.processing.ffs_motsim:main"
+ffs_util_pcwarp = "fastfuncstuff.processing.pcwarp_cli:main"
+ffs_util_automask = "fastfuncstuff.processing.mask_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["fastfuncsim*"]
+include = ["fastfuncstuff*"]
 exclude = ["tests*", "examples*"]
 
 [tool.pytest.ini_options]
@@ -104,7 +104,7 @@ invalid-return-type = "warn"
 unknown-argument = "warn"
 
 [tool.ty.src]
-include = ["fastfuncsim"]
+include = ["fastfuncstuff"]
 
 [tool.ruff]
 line-length = 100
@@ -137,5 +137,5 @@ ignore = [
 "examples/*.py" = ["B007", "E402"]  # Allow unused loop vars, late imports
 "notebooks/*.ipynb" = ["E702", "F841", "B007"]  # Allow semicolons, unused vars, unused loop vars in notebooks
 "bin/*.py" = ["E402"]  # Allow late imports in thin wrapper scripts
-"fastfuncsim/cli/*.py" = ["E402"]  # Allow late imports in CLI scripts
+"fastfuncstuff/cli/*.py" = ["E402"]  # Allow late imports in CLI scripts
 "tests/*.py" = ["B023", "E402"]  # Allow function definition in loop, late imports

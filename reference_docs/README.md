@@ -18,7 +18,7 @@ Convert from MATLAB (`simulate_movietasks.m` and GLMsingle) to Python with GPU a
 ## Installation
 
 ```bash
-cd /Users/logan/local_bin/fastfuncsim
+cd /Users/logan/local_bin/fastfuncstuff
 pip install -e .
 ```
 
@@ -33,7 +33,7 @@ pip install -e .
 ### 1. Interactive Single Simulation
 
 ```python
-import fastfuncsim as ffs
+import fastfuncstuff as ffs
 
 # Auto-detect best device (MPS/CUDA/CPU)
 device = ffs.get_device()
@@ -121,7 +121,7 @@ power = np.mean([r['mean_r2'] > threshold for r in results_batch])
 ## Architecture
 
 ```
-fastfuncsim/
+fastfuncstuff/
 ├── glm_core.py      # Core GLM engine (THE KEY COMPONENT)
 ├── glm_outputs.py  # NIfTI export utilities for GLM results
 ├── design.py        # Design matrix construction (FIR, HRF convolution)

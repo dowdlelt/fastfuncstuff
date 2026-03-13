@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from fastfuncsim.analysis import analyze_with_cross_validation
+from fastfuncstuff.analysis import analyze_with_cross_validation
 
 # Path to validation data (relative to project root)
 VALIDATION_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"

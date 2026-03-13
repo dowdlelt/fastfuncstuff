@@ -4,7 +4,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from fastfuncsim.simulation.core import (
+from fastfuncstuff.simulation.core import (
     save_simulation_outputs,
     write_afni_onset_files,
     write_nifti_files,

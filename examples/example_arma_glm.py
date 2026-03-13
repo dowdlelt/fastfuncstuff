@@ -22,7 +22,7 @@ from glm_core import fit_glm
 from hrf import spm_hrf
 from noise import generate_ar1_noise
 
-# Import fastfuncsim modules
+# Import fastfuncstuff modules
 from utils import get_device
 
 # Set random seed for reproducibility
