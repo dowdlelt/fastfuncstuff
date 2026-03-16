@@ -335,10 +335,10 @@ def load_and_preprocess_runs(
             print("=" * 70)
             print("  Reading header only, generating synthetic data...")
 
-        # Read only the header (no data loading) using nibabel
-        import nibabel as nib
+        # Read only the header (no data loading)
+        from fastfuncstuff.io.afni import load_nifti
 
-        first_img = nib.load(input_files[0])
+        first_img = load_nifti(input_files[0])
         run_length = first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[0]
 
         if verbose:
@@ -544,11 +544,7 @@ def save_volume_nifti(
     mask_flat : np.ndarray, optional
         Flattened brain mask. If provided, unmasks data before saving.
     """
-    try:
-        import nibabel as nib
-    except ImportError:
-        print("ERROR: nibabel is required. Install with: pip install nibabel")
-        sys.exit(1)
+    from fastfuncstuff.io.afni import save_nifti
 
     # Convert to numpy if tensor
     if torch.is_tensor(data_flat):
@@ -564,8 +560,7 @@ def save_volume_nifti(
     else:
         data_3d = data_np.reshape(volume_shape)
 
-    img = nib.Nifti1Image(data_3d, affine)
-    nib.save(img, filename)
+    save_nifti(data_3d, output_path=filename, affine=affine)
 
 
 def save_4d_nifti(
@@ -591,11 +586,7 @@ def save_4d_nifti(
     mask_flat : np.ndarray, optional
         Flattened brain mask. If provided, unmasks data before saving.
     """
-    try:
-        import nibabel as nib
-    except ImportError:
-        print("ERROR: nibabel is required. Install with: pip install nibabel")
-        sys.exit(1)
+    from fastfuncstuff.io.afni import save_nifti
 
     # Convert to numpy if tensor
     if torch.is_tensor(data_flat):
@@ -613,8 +604,7 @@ def save_4d_nifti(
     else:
         data_4d = data_np.reshape((*volume_shape, n_vols))
 
-    img = nib.Nifti1Image(data_4d, affine)
-    nib.save(img, filename)
+    save_nifti(data_4d, output_path=filename, affine=affine)
 
 
 # ============================================================================
@@ -1514,7 +1504,7 @@ def preflight_check(
     denoise_prefix : str, optional
         Prefix for 3dDenoisefast outputs. Checks `{prefix}_noise_pcs.xmat.1D` exists.
     """
-    import nibabel as nib
+    from fastfuncstuff.io.afni import load_nifti
 
     errors: list[str] = []
     n_runs = len(input_files)
@@ -1590,7 +1580,7 @@ def preflight_check(
         header_ok = True
         for nii_file in input_files:
             try:
-                shape = nib.load(nii_file).shape
+                shape = load_nifti(nii_file).shape
                 total_timepoints += shape[3] if len(shape) >= 4 else 1
             except Exception as exc:
                 errors.append(f"  Cannot read NIfTI header '{nii_file}': {exc}")

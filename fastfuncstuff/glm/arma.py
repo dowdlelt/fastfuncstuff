@@ -1831,6 +1831,7 @@ def _evaluate_single_param(
     return likelihood
 
 
+@torch.inference_mode()
 def batch_reml_grid_search(
     X: torch.Tensor,
     Y_batch: torch.Tensor,
@@ -2309,6 +2310,7 @@ def search_voxels_precomputed_grid(
     return best_params, best_likelihoods
 
 
+@torch.inference_mode()
 def prewhiten_with_arma11(
     X: torch.Tensor, Y: torch.Tensor, a: float, b: float
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -5207,32 +5209,11 @@ def save_arma_rvar(
     if affine is None:
         affine = np.eye(4, dtype=np.float32)
 
-    # Save as NIfTI
-    img = nib.Nifti1Image(rvar_4d.astype(np.float32), affine)
-    img.header.set_xyzt_units(xyz="mm")
+    # Save as NIfTI using save_nifti for efficient compression,
+    # then re-open to add AFNI-compatible metadata (description + sub-brick labels)
+    from fastfuncstuff.io.afni import save_nifti
 
-    # Add description (AFNI-compatible)
-    img.header["descrip"] = (
-        b"ARMA(1,1) -Rvar: [0]=a [1]=b [2]=lam [3]=StDev [4]=-LogLik [5]=LjungBox"
-    )
-
-    # Add AFNI-style sub-brick labels for each volume
-    # These will show up in AFNI's overlay GUI
-    nifti_extension = nib.nifti1.Nifti1Extension(
-        code=6,  # AFNI extension code
-        content=(
-            b"BRICK_LABS~"
-            b"a~"  # Volume 0: AR parameter
-            b"b~"  # Volume 1: MA parameter
-            b"lam~"  # Volume 2: lambda (lag-1 correlation)
-            b"StDev~"  # Volume 3: standard deviation
-            b"-LogLik~"  # Volume 4: negative log-likelihood
-            b"LjungBox"  # Volume 5: Ljung-Box statistic
-        ),
-    )
-    img.header.extensions.append(nifti_extension)
-
-    nib.save(img, output_path)
+    save_nifti(rvar_4d.astype(np.float32), output_path=output_path, affine=affine)
 
     return output_path
 
@@ -5274,14 +5255,14 @@ def load_arma_params(
     ...     precomputed_arma_params=arma_params  # Skip REML estimation!
     ... )
     """
-    import nibabel as nib
+    from fastfuncstuff.io.afni import load_nifti
 
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(f"ARMA params file not found: {filepath}")
 
     # Load NIfTI
-    img = nib.load(str(filepath))
+    img = load_nifti(filepath)
     arma_4d = img.get_fdata(dtype=np.float32)
 
     # Extract a and b volumes (volumes 0 and 1)

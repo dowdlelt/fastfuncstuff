@@ -8,7 +8,6 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-import nibabel as nib
 import numpy as np
 import torch
 
@@ -17,6 +16,7 @@ from fastfuncstuff.io.afni import (
     get_run_lengths,
     load_afni_mask,
     load_and_concatenate_runs,
+    load_nifti,
     onsets_to_binary_matrix,
     read_afni_design_matrix,
     read_afni_onset_files,
@@ -504,7 +504,7 @@ def analyze_from_design_matrix(
         if not first_path.exists():
             raise FileNotFoundError(f"Run file not found: {first_path}")
 
-        first_img = nib.load(str(first_path))
+        first_img = load_nifti(first_path)
         if len(first_img.shape) < 4:
             raise ValueError(
                 f"Expected 4D fMRI runs, but '{first_path.name}' has shape {first_img.shape}"
@@ -539,7 +539,7 @@ def analyze_from_design_matrix(
             fmri_path = Path(fmri_data)
             if not fmri_path.exists():
                 raise FileNotFoundError(f"fMRI data file not found: {fmri_path}")
-            img = nib.load(str(fmri_path))
+            img = load_nifti(fmri_path)
             if len(img.shape) >= 3:
                 volume_shape = tuple(int(dim) for dim in img.shape[:3])
             affine = img.affine
@@ -1256,7 +1256,7 @@ def analyze_with_cross_validation(
             print(f"  • Loaded {len(fmri_data)} run files")
     elif isinstance(fmri_data, (str, Path)):
         # Single file
-        img = nib.load(str(fmri_data))
+        img = load_nifti(fmri_data)
         data_np = img.get_fdata()  # type: ignore[attr-defined]
         data_np = data_np.reshape(-1, data_np.shape[-1])
         data = torch.from_numpy(data_np).float()
@@ -1291,7 +1291,7 @@ def analyze_with_cross_validation(
     if mask_file is not None:
         if verbose:
             print(f"🎭 Applying mask: {mask_file}")
-        mask_img = nib.load(str(mask_file))
+        mask_img = load_nifti(mask_file)
         mask_data = mask_img.get_fdata()  # type: ignore[attr-defined]
         mask_bool = mask_data.flatten() > mask_threshold
         mask_indices = np.where(mask_bool)[0]
@@ -1372,7 +1372,7 @@ def _load_fmri_data(
         if not filepath.exists():
             raise FileNotFoundError(f"fMRI data file not found: {filepath}")
 
-        img = nib.load(str(filepath))
+        img = load_nifti(filepath)
         data_np = img.get_fdata(dtype=np.float32)
 
         # Convert to tensor

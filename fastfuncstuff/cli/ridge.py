@@ -65,7 +65,7 @@ try:
         load_hrf_indices,
         load_noise_pcs,
     )
-    from fastfuncstuff.utils import get_device, scale_to_percent_signal
+    from fastfuncstuff.utils import configure_torch_backends, get_device, scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -383,6 +383,7 @@ def main():
         device = torch.device(args.device)
     else:
         device = get_device()
+    configure_torch_backends(device)
 
     print(f"Device: {device}")
     print()

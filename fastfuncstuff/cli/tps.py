@@ -66,7 +66,7 @@ from fastfuncstuff.design.matrices import (
     make_tps_design,
 )
 from fastfuncstuff.design.builder import legendre_polynomials, parse_afni_timing_file
-from fastfuncstuff.utils import get_device
+from fastfuncstuff.utils import configure_torch_backends, get_device
 
 
 def parse_tps_windows(tps_window_args, n_conditions):
@@ -261,6 +261,7 @@ def main():
         device = get_device()
     else:
         device = torch.device(args.device)
+    configure_torch_backends(device)
 
     if args.verbose:
         print(f"\nDevice: {device}")
@@ -273,14 +274,10 @@ def main():
         print(f"\nLoading data: {args.input}")
 
     # Load NIfTI data
-    try:
-        import nibabel as nib
-        img = nib.load(args.input)
-        data_full = np.array(img.dataobj)
-        affine = img.affine
-        header = img.header
-    except ImportError:
-        raise ImportError("nibabel is required. Install with: pip install nibabel") from None
+    img = load_nifti(args.input)
+    data_full = np.array(img.dataobj)
+    affine = img.affine
+    header = img.header
 
     nx, ny, nz, n_timepoints_total = data_full.shape
 

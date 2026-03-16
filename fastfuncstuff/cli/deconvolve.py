@@ -78,7 +78,7 @@ try:
         parse_afni_timing_file,
     )
     from fastfuncstuff.glm.core import fit_glm
-    from fastfuncstuff.utils import get_device
+    from fastfuncstuff.utils import configure_torch_backends, get_device
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -341,6 +341,7 @@ def main():
         device = get_device()
         if args.verbose:
             print(f"Using device: {device}")
+    configure_torch_backends(device)
 
     # Validate inputs
     n_runs = len(args.input)

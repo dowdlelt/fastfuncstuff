@@ -60,6 +60,8 @@ try:
         fit_glm_hrf_library_with_xval,
         save_hrf_selection_results,
     )
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.utils import configure_torch_backends
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -529,6 +531,7 @@ def main():
 
     # Parse device argument using unified parser
     device, _, _ = parse_device_arg(args.device)
+    configure_torch_backends(device)
     print(f"  Device: {device}")
 
     # Load and preprocess data using shared utility
@@ -1104,8 +1107,7 @@ def main():
 
         # Save as NIfTI
         violation_path = f"{args.prefix}_scale_violations.nii.gz"
-        violation_img = nib.Nifti1Image(violation_vol, affine)
-        nib.save(violation_img, violation_path)
+        save_nifti(violation_vol, output_path=violation_path, affine=affine)
         output_files["scale_violations"] = violation_path
 
         if scale_info["n_violations"] > 0:

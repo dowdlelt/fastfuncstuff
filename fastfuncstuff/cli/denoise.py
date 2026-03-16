@@ -43,6 +43,7 @@ try:
     from fastfuncstuff.io.afni import (
         load_afni_mask,  # noqa: F401 — availability check
         load_nifti,  # noqa: F401 — availability check
+        save_nifti,
     )
     from fastfuncstuff.cli_utils import (
         LoadResult,
@@ -68,7 +69,7 @@ try:
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
     from fastfuncstuff.glm.ridge import load_hrf_indices
-    from fastfuncstuff.utils import get_device, scale_to_percent_signal, to_tensor
+    from fastfuncstuff.utils import configure_torch_backends, get_device, scale_to_percent_signal, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -717,39 +718,34 @@ def save_denoising_results(
 
     # 1. Noise pool mask
     noise_pool_vol = to_volume(results.noise_pool_mask.cpu().numpy().astype(np.float32))
-    noise_pool_img = nib.Nifti1Image(noise_pool_vol, affine)
     noise_pool_path = f"{output_prefix}_noise_pool_mask.nii.gz"
-    nib.save(noise_pool_img, noise_pool_path)
+    save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
     output_files["noise_pool_mask"] = noise_pool_path
 
     # 2. Criteria mask
     criteria_vol = to_volume(results.criteria_mask.cpu().numpy().astype(np.float32))
-    criteria_img = nib.Nifti1Image(criteria_vol, affine)
     criteria_path = f"{output_prefix}_criteria_mask.nii.gz"
-    nib.save(criteria_img, criteria_path)
+    save_nifti(criteria_vol, output_path=criteria_path, affine=affine)
     output_files["criteria_mask"] = criteria_path
 
     # 3. Initial R²
     initial_r2_vol = to_volume(results.noise_pool_r2.cpu().numpy().astype(np.float32))
-    initial_r2_img = nib.Nifti1Image(initial_r2_vol, affine)
     initial_r2_path = f"{output_prefix}_initial_r2.nii.gz"
-    nib.save(initial_r2_img, initial_r2_path)
+    save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine)
     output_files["initial_r2"] = initial_r2_path
 
     # 3b. Xval R² at optimal PC count (criteria voxels only)
     if results.xval_r2_optimal is not None:
         xval_opt_vol = to_volume(results.xval_r2_optimal.cpu().numpy().astype(np.float32))
-        xval_opt_img = nib.Nifti1Image(xval_opt_vol, affine)
         xval_opt_path = f"{output_prefix}_xval_r2_optimal.nii.gz"
-        nib.save(xval_opt_img, xval_opt_path)
+        save_nifti(xval_opt_vol, output_path=xval_opt_path, affine=affine)
         output_files["xval_r2_optimal"] = xval_opt_path
 
     # 3c. Xval R² at optimal PC count (all voxels)
     if results.xval_r2_optimal_full is not None:
         xval_opt_full_vol = to_volume(results.xval_r2_optimal_full.cpu().numpy().astype(np.float32))
-        xval_opt_full_img = nib.Nifti1Image(xval_opt_full_vol, affine)
         xval_opt_full_path = f"{output_prefix}_xval_r2_optimal_full.nii.gz"
-        nib.save(xval_opt_full_img, xval_opt_full_path)
+        save_nifti(xval_opt_full_vol, output_path=xval_opt_full_path, affine=affine)
         output_files["xval_r2_optimal_full"] = xval_opt_full_path
 
     # 3d. Per-fold xval R² at optimal PCs (4D)
@@ -760,9 +756,8 @@ def save_denoising_results(
             fold_vols.append(fold_vol)
 
         fold_4d = np.stack(fold_vols, axis=-1)
-        fold_img = nib.Nifti1Image(fold_4d, affine)
         fold_path = f"{output_prefix}_xval_r2_optimal_per_fold.nii.gz"
-        nib.save(fold_img, fold_path)
+        save_nifti(fold_4d, output_path=fold_path, affine=affine)
         output_files["xval_r2_optimal_per_fold"] = fold_path
 
     # 4. CV R² arrays
@@ -844,9 +839,8 @@ def save_denoising_results(
 
                 # Stack into 4D and save
                 pc_4d = np.stack(pc_vols, axis=-1)
-                pc_img = nib.Nifti1Image(pc_4d, affine)
                 pc_path = f"{output_prefix}_run{run_idx + 1:02d}_pc_weights.nii.gz"
-                nib.save(pc_img, pc_path)
+                save_nifti(pc_4d, output_path=pc_path, affine=affine)
                 output_files[f"run{run_idx + 1}_pc_weights"] = pc_path
 
             print(f"  Saved PC spatial weights for {n_runs} runs")
@@ -1147,31 +1141,27 @@ def save_snr_outputs(
     # Save residual-based SNR volumes
     if "snr_residual" in snr_initial:
         snr_vol = to_volume(snr_initial["snr_residual"].astype(np.float32))
-        snr_img = nib.Nifti1Image(snr_vol, affine)
         snr_path = f"{output_prefix}_snr_residual_initial.nii.gz"
-        nib.save(snr_img, snr_path)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine)
         output_files["snr_residual_initial"] = snr_path
 
     if "snr_residual" in snr_denoised:
         snr_vol = to_volume(snr_denoised["snr_residual"].astype(np.float32))
-        snr_img = nib.Nifti1Image(snr_vol, affine)
         snr_path = f"{output_prefix}_snr_residual_denoised.nii.gz"
-        nib.save(snr_img, snr_path)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine)
         output_files["snr_residual_denoised"] = snr_path
 
     # Save bootstrap-based SNR volumes
     if "snr_bootstrap" in snr_initial:
         snr_vol = to_volume(snr_initial["snr_bootstrap"].astype(np.float32))
-        snr_img = nib.Nifti1Image(snr_vol, affine)
         snr_path = f"{output_prefix}_snr_bootstrap_initial.nii.gz"
-        nib.save(snr_img, snr_path)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine)
         output_files["snr_bootstrap_initial"] = snr_path
 
     if "snr_bootstrap" in snr_denoised:
         snr_vol = to_volume(snr_denoised["snr_bootstrap"].astype(np.float32))
-        snr_img = nib.Nifti1Image(snr_vol, affine)
         snr_path = f"{output_prefix}_snr_bootstrap_denoised.nii.gz"
-        nib.save(snr_img, snr_path)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine)
         output_files["snr_bootstrap_denoised"] = snr_path
 
     # Create scatter plots
@@ -1361,12 +1351,11 @@ def save_model_fit_outputs(
 
     # Stack into 4D
     bucket_4d = np.stack(bucket_vols, axis=-1)
-    bucket_img = nib.Nifti1Image(bucket_4d, affine)
     bucket_path = f"{output_prefix}_{model_type}_bucket.nii.gz"
 
     # Write uncompressed first for 3drefit, compress after
     bucket_path_nii = bucket_path.replace(".nii.gz", ".nii")
-    nib.save(bucket_img, bucket_path_nii)
+    save_nifti(bucket_4d, output_path=bucket_path_nii, affine=affine)
     output_files[f"{model_type}_bucket"] = bucket_path
 
     # Use 3drefit to add proper AFNI labels and DOF
@@ -1485,6 +1474,7 @@ def main():
         device = torch.device(args.device if args.device.lower() != "cpu" else "cpu")
     else:
         device = get_device()
+    configure_torch_backends(device)
     print(f"  Device: {device}")
 
     # ==========================================================================
@@ -2377,8 +2367,7 @@ def main():
             noise_pool_vol = map_to_volume(
                 noise_pool_mask.cpu().numpy().astype(float), mask_flat_np
             )
-            noise_pool_img = nib.Nifti1Image(noise_pool_vol.reshape(volume_shape), affine)
-            nib.save(noise_pool_img, f"{args.prefix}_noise_pool_mask.nii.gz")
+            save_nifti(noise_pool_vol.reshape(volume_shape), output_path=f"{args.prefix}_noise_pool_mask.nii.gz", affine=affine)
             output_files["noise_pool_mask"] = f"{args.prefix}_noise_pool_mask.nii.gz"
             print(f"  Saved: noise pool mask ({noise_pool_mask.sum().item():,} voxels)")
 
@@ -2387,17 +2376,13 @@ def main():
             initial_criteria_vol = map_to_volume(
                 criteria_mask.cpu().numpy().astype(float), mask_flat_np
             )
-            initial_criteria_img = nib.Nifti1Image(
-                initial_criteria_vol.reshape(volume_shape), affine
-            )
-            nib.save(initial_criteria_img, f"{args.prefix}_initial_criteria_mask.nii.gz")
+            save_nifti(initial_criteria_vol.reshape(volume_shape), output_path=f"{args.prefix}_initial_criteria_mask.nii.gz", affine=affine)
             output_files["initial_criteria_mask"] = f"{args.prefix}_initial_criteria_mask.nii.gz"
             print(f"  Saved: initial criteria mask ({criteria_mask.sum().item():,} voxels)")
 
             # Save initial cross-validated R² (before denoising)
             initial_r2_vol = map_to_volume(initial_r2.cpu().numpy(), mask_flat_np)
-            initial_r2_img = nib.Nifti1Image(initial_r2_vol.reshape(volume_shape), affine)
-            nib.save(initial_r2_img, f"{args.prefix}_initial_xval_r2.nii.gz")
+            save_nifti(initial_r2_vol.reshape(volume_shape), output_path=f"{args.prefix}_initial_xval_r2.nii.gz", affine=affine)
             output_files["initial_xval_r2"] = f"{args.prefix}_initial_xval_r2.nii.gz"
             print("  Saved: initial cross-validated R²")
         else:

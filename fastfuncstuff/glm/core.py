@@ -176,6 +176,7 @@ def orthogonalize_design(X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
     return X_orth
 
 
+@torch.inference_mode()
 def fit_glm_chunk(
     data: torch.Tensor,
     design: torch.Tensor,
@@ -237,12 +238,12 @@ def fit_glm_chunk(
 
     if want_predicted or want_residuals:
         # Need full predictions
-        predicted_vals = (design @ betas.T).T  # (n_voxels, n_timepoints)
+        predicted_vals = betas @ design.T  # (n_voxels, n_timepoints)
         residuals_vals = data - predicted_vals
     else:
         # Just compute residuals for R² (more memory efficient)
         predicted_vals = None
-        residuals_vals = data - (design @ betas.T).T  # (n_voxels, n_timepoints)
+        residuals_vals = data - betas @ design.T  # (n_voxels, n_timepoints)
 
     # Compute residual sum of squares for output
     ss_residual = (residuals_vals**2).sum(dim=1)

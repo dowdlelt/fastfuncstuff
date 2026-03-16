@@ -45,6 +45,7 @@ except ImportError:
 from fastfuncstuff.glm.xval import compute_r2_metric
 
 
+@torch.inference_mode()
 def _fit_ridge_multiple_fracs(
     X: torch.Tensor,
     y: torch.Tensor,
@@ -1391,9 +1392,9 @@ def load_hrf_indices(hrf_index_file: str, mask: np.ndarray | None = None) -> tor
     hrf_indices : torch.Tensor, shape (n_voxels,)
         HRF index per voxel (0-indexed, converted from 1-indexed NIFTI)
     """
-    import nibabel as nib
+    from fastfuncstuff.io.afni import load_nifti
 
-    img = nib.load(hrf_index_file)
+    img = load_nifti(hrf_index_file)
     hrf_data = img.get_fdata()
 
     # Convert from 1-indexed (NIFTI) to 0-indexed (Python)

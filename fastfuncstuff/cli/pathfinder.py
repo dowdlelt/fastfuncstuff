@@ -57,6 +57,7 @@ try:
         load_afni_mask,
         load_and_concatenate_runs,
         load_nifti,
+        save_nifti,
     )
     from fastfuncstuff.cli_utils import (
         auto_polort,
@@ -76,6 +77,7 @@ try:
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
     from fastfuncstuff.utils import (
+        configure_torch_backends,
         gaussian_blur_3d,
         get_device,
         scale_to_percent_signal,
@@ -1132,9 +1134,8 @@ def save_pathfinder_results(
     # Initial xval R² (canonical HRF, no denoising)
     if results.initial_xval_r2 is not None:
         initial_xval_r2_vol = to_volume(results.initial_xval_r2.numpy())
-        initial_xval_r2_img = nib.Nifti1Image(initial_xval_r2_vol.astype(np.float32), affine)
         initial_xval_r2_path = f"{output_prefix}_initial_xval_r2.nii.gz"
-        nib.save(initial_xval_r2_img, initial_xval_r2_path)
+        save_nifti(initial_xval_r2_vol.astype(np.float32), output_path=initial_xval_r2_path, affine=affine)
         output_files["initial_xval_r2"] = initial_xval_r2_path
 
     # Initial stats (betas, t-stats) with AFNI-style labels
@@ -1157,9 +1158,8 @@ def save_pathfinder_results(
 
         # Also save initial R² (full-fit, not xval)
         initial_r2_vol = to_volume(results.initial_results.r2.numpy())
-        initial_r2_img = nib.Nifti1Image(initial_r2_vol.astype(np.float32), affine)
         initial_r2_path = f"{output_prefix}_initial_r2.nii.gz"
-        nib.save(initial_r2_img, initial_r2_path)
+        save_nifti(initial_r2_vol.astype(np.float32), output_path=initial_r2_path, affine=affine)
         output_files["initial_r2"] = initial_r2_path
 
     # =========================================================================
@@ -1186,9 +1186,8 @@ def save_pathfinder_results(
 
         # Also save final R² (full-fit, not xval)
         final_r2_vol = to_volume(results.final_results.r2.numpy())
-        final_r2_img = nib.Nifti1Image(final_r2_vol.astype(np.float32), affine)
         final_r2_path = f"{output_prefix}_final_r2.nii.gz"
-        nib.save(final_r2_img, final_r2_path)
+        save_nifti(final_r2_vol.astype(np.float32), output_path=final_r2_path, affine=affine)
         output_files["final_r2"] = final_r2_path
 
     # =========================================================================
@@ -1197,32 +1196,28 @@ def save_pathfinder_results(
 
     # 1. HRF index (1-indexed for AFNI)
     hrf_index_vol = to_volume((results.hrf_index.float() + 1.0).numpy())
-    hrf_index_img = nib.Nifti1Image(hrf_index_vol.astype(np.float32), affine)
     hrf_index_path = f"{output_prefix}_hrf_index.nii.gz"
-    nib.save(hrf_index_img, hrf_index_path)
+    save_nifti(hrf_index_vol.astype(np.float32), output_path=hrf_index_path, affine=affine)
     output_files["hrf_index"] = hrf_index_path
 
     # 2. Best denoised xval R² (final, optimized)
     xval_r2_vol = to_volume(results.xval_r2_best.numpy())
-    xval_r2_img = nib.Nifti1Image(xval_r2_vol.astype(np.float32), affine)
     xval_r2_path = f"{output_prefix}_final_xval_r2.nii.gz"
-    nib.save(xval_r2_img, xval_r2_path)
+    save_nifti(xval_r2_vol.astype(np.float32), output_path=xval_r2_path, affine=affine)
     output_files["final_xval_r2"] = xval_r2_path
 
     # 3. Noise pool mask
     if results.noise_pool_mask is not None:
         noise_pool_vol = to_volume(results.noise_pool_mask.numpy().astype(np.float32))
-        noise_pool_img = nib.Nifti1Image(noise_pool_vol, affine)
         noise_pool_path = f"{output_prefix}_noise_pool_mask.nii.gz"
-        nib.save(noise_pool_img, noise_pool_path)
+        save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
         output_files["noise_pool_mask"] = noise_pool_path
 
     # 4. Criteria mask
     if results.criteria_mask is not None:
         criteria_vol = to_volume(results.criteria_mask.numpy().astype(np.float32))
-        criteria_img = nib.Nifti1Image(criteria_vol, affine)
         criteria_path = f"{output_prefix}_criteria_mask.nii.gz"
-        nib.save(criteria_img, criteria_path)
+        save_nifti(criteria_vol, output_path=criteria_path, affine=affine)
         output_files["criteria_mask"] = criteria_path
 
     # 5. All HRFs denoised R² (4D)
@@ -1233,9 +1228,8 @@ def save_pathfinder_results(
             vol = to_volume(results.xval_r2_all_hrfs[:, hrf_idx].numpy())
             all_hrfs_vols.append(vol)
         all_hrfs_4d = np.stack(all_hrfs_vols, axis=-1)
-        all_hrfs_img = nib.Nifti1Image(all_hrfs_4d.astype(np.float32), affine)
         all_hrfs_path = f"{output_prefix}_xval_r2_all_hrfs.nii.gz"
-        nib.save(all_hrfs_img, all_hrfs_path)
+        save_nifti(all_hrfs_4d.astype(np.float32), output_path=all_hrfs_path, affine=affine)
         output_files["xval_r2_all_hrfs"] = all_hrfs_path
 
     # 6. Noise PCs
@@ -1353,6 +1347,7 @@ def main():
         device = torch.device(args.device if args.device.lower() != "cpu" else "cpu")
     else:
         device = get_device()
+    configure_torch_backends(device)
     print(f"  Device: {device}")
 
     # Load data

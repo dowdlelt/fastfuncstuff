@@ -88,7 +88,7 @@ from fastfuncstuff.decomposition.ica import (
 from fastfuncstuff.decomposition.tools import parse_num_comps_spec
 from fastfuncstuff.decomposition.icasso import icasso, icasso_auto_select
 from fastfuncstuff.decomposition.pca import PCA
-from fastfuncstuff.utils import get_device
+from fastfuncstuff.utils import configure_torch_backends, get_device
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -271,6 +271,7 @@ def main():
         device = torch.device("cpu")
     else:
         device = get_device()
+    configure_torch_backends(device)
 
     if args.verbose:
         print(f"Using device: {device}")

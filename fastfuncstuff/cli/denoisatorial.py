@@ -64,7 +64,8 @@ try:
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
     from fastfuncstuff.glm.ridge import load_hrf_indices
-    from fastfuncstuff.utils import get_device, scale_to_percent_signal, to_tensor
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.utils import configure_torch_backends, get_device, scale_to_percent_signal, to_tensor
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -391,25 +392,22 @@ def save_combinatorial_results(
 
     # 1. Initial R2 volume
     initial_r2_vol = to_volume(initial_r2_full)
-    initial_r2_img = nib.Nifti1Image(initial_r2_vol, affine)
     initial_r2_path = f"{output_prefix}_initial_r2.nii.gz"
-    nib.save(initial_r2_img, initial_r2_path)
+    save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine)
     output_files["initial_r2"] = initial_r2_path
     print(f"  Saved: {initial_r2_path}")
 
     # 2. Optimized R2 volume
     opt_r2_vol = to_volume(optimized_r2_full)
-    opt_r2_img = nib.Nifti1Image(opt_r2_vol, affine)
     opt_r2_path = f"{output_prefix}_optimized_xval_r2.nii.gz"
-    nib.save(opt_r2_img, opt_r2_path)
+    save_nifti(opt_r2_vol, output_path=opt_r2_path, affine=affine)
     output_files["optimized_xval_r2"] = opt_r2_path
     print(f"  Saved: {opt_r2_path}")
 
     # 3. Noise pool mask
     noise_pool_vol = to_volume(results.noise_pool_mask)
-    noise_pool_img = nib.Nifti1Image(noise_pool_vol, affine)
     noise_pool_path = f"{output_prefix}_noise_pool_mask.nii.gz"
-    nib.save(noise_pool_img, noise_pool_path)
+    save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
     output_files["noise_pool_mask"] = noise_pool_path
     print(f"  Saved: {noise_pool_path}")
 
@@ -620,6 +618,7 @@ def main():
         device = torch.device(args.device if args.device.lower() != "cpu" else "cpu")
     else:
         device = get_device()
+    configure_torch_backends(device)
     print(f"  Device: {device}")
 
     # ======================================================================

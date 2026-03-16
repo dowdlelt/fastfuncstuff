@@ -516,6 +516,7 @@ def project_out_nuisance(
     return data_cleaned, design_cleaned
 
 
+@torch.inference_mode()
 def compute_r2_metric(
     y_true: torch.Tensor,
     y_pred: torch.Tensor,
@@ -704,6 +705,7 @@ def _compute_projection_matrix(
         return P
 
 
+@torch.inference_mode()
 def compute_xval_r2(
     data: torch.Tensor,
     design_matrix: np.ndarray | torch.Tensor,

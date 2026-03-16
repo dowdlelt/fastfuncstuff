@@ -22,7 +22,7 @@ import torch
 try:
     from fastfuncstuff.io.afni import extract_design_metadata, load_nifti, read_afni_design_matrix
     from fastfuncstuff.cli_utils import parse_input_files
-    from fastfuncstuff.utils import get_device
+    from fastfuncstuff.utils import configure_torch_backends, get_device
     from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
@@ -279,6 +279,7 @@ def main():
         device = torch.device(args.device)
     else:
         device = get_device()
+    configure_torch_backends(device)
     print(f"Compute device: {device}")
     print()
 
@@ -364,7 +365,7 @@ def main():
     # Write outputs
     print("💾 Writing outputs...")
 
-    import nibabel as nib
+    from fastfuncstuff.io.afni import save_nifti
 
     # Helper to reshape and save
     def save_volume(data_1d, filename, description):
@@ -377,8 +378,7 @@ def main():
         else:
             data_vol = data_1d.cpu().numpy().reshape(volume_shape)
 
-        img = nib.Nifti1Image(data_vol, affine)
-        nib.save(img, filename)
+        save_nifti(data_vol, output_path=filename, affine=affine)
         print(f"  • {description}: {filename}")
 
     # Save single R² map (GLMdenoise-style: from concatenated predictions)

@@ -61,7 +61,9 @@
       "WebFetch(domain:git.fmrib.ox.ac.uk)",
       "Bash(for f:*)",
       "Bash(do echo:*)",
-      "Read(//home/logan/Dropbox/Resources/code/fastfuncsim/**)"
+      "Read(//home/logan/Dropbox/Resources/code/fastfuncsim/**)",
+      "Bash(git checkout:*)",
+      "mcp__web-reader__webReader"
     ],
     "deny": [],
     "ask": []

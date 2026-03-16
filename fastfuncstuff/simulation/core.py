@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.design.matrices import build_glm_design
+from fastfuncstuff.io.afni import save_nifti
 from .noise import add_drift, generate_fmri_noise
 from fastfuncstuff.utils import get_device, print_device_info, to_tensor
 
@@ -463,17 +464,9 @@ def write_nifti_files(data_list: list[torch.Tensor],
         # Convert to numpy
         data_np = data.cpu().numpy() if isinstance(data, torch.Tensor) else data
 
-        # Create nifti image
-        # nibabel expects (x, y, z, t) which matches our format
-        img = nib.Nifti1Image(data_np.astype(np.float32), affine)
-
-        # Set TR in header
-        img.header.set_xyzt_units(xyz='mm', t='sec')
-        img.header['pixdim'][4] = tr
-
-        # Save
+        # Save nifti with TR in header
         filename = output_dir / f"{prefix}{run_idx+1:02d}.nii.gz"
-        nib.save(img, filename)
+        save_nifti(data_np.astype(np.float32), output_path=filename, affine=affine, tr=tr)
         nifti_files.append(filename)
 
     return nifti_files

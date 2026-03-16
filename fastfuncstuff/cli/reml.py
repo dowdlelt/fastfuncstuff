@@ -32,6 +32,7 @@ try:
         load_nifti,
         read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
         replace_afni_extension,
+        save_nifti,
     )
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
@@ -51,7 +52,7 @@ try:
         slice_glm_results,
         write_glm_bucket_as_nifti,
     )
-    from fastfuncstuff.utils import gaussian_blur_3d, scale_to_percent_signal
+    from fastfuncstuff.utils import configure_torch_backends, gaussian_blur_3d, scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -182,9 +183,8 @@ def write_single_trials_output(
     betas_vol = _reshape_parameter_map(betas_reordered, volume_shape, voxel_mask)
 
     # Write NIfTI file
-    img = nib.Nifti1Image(betas_vol, affine)
     output_path_clean = replace_afni_extension(output_path, ".nii.gz")
-    nib.save(img, output_path_clean)
+    save_nifti(betas_vol, output_path=output_path_clean, affine=affine)
 
     # Write labels as JSON sidecar
     if labels_reordered:
@@ -693,6 +693,7 @@ def main():
     import os
 
     device, cpu_threads_override, cuda_device_id = parse_device_arg(args.device)
+    configure_torch_backends(device)
 
     # Configure CPU threading for maximum performance
     if device.type == "cpu":
@@ -1198,9 +1199,8 @@ def main():
                 betas_np = _ensure_numpy(ols_results.betas)
                 betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
-                beta_img = nib.Nifti1Image(betas_vol, affine)
                 # Always write NIfTI .nii.gz regardless of input format
-                nib.save(beta_img, replace_afni_extension(args.Obeta, ".nii.gz"))
+                save_nifti(betas_vol, output_path=replace_afni_extension(args.Obeta, ".nii.gz"), affine=affine)
 
             if args.Onuisance:
                 # NOTE: When task_indices is provided, OLS results contain only stimulus columns.
@@ -1645,9 +1645,8 @@ def main():
         betas_np = _ensure_numpy(results.betas)
         betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
-        beta_img = nib.Nifti1Image(betas_vol, affine)
         # Always write NIfTI .nii.gz regardless of input format
-        nib.save(beta_img, replace_afni_extension(args.Rbeta, ".nii.gz"))
+        save_nifti(betas_vol, output_path=replace_afni_extension(args.Rbeta, ".nii.gz"), affine=affine)
 
     if args.Rnuisance:
         print(f"  • Writing REML nuisance betas + stats: {args.Rnuisance}")
@@ -2019,9 +2018,8 @@ def main():
             else:
                 predicted_vol = predicted_np
 
-            fitts_img = nib.Nifti1Image(predicted_vol, affine)
             # Always write NIfTI .nii.gz regardless of input format
-            nib.save(fitts_img, replace_afni_extension(args.Rfitts, ".nii.gz"))
+            save_nifti(predicted_vol, output_path=replace_afni_extension(args.Rfitts, ".nii.gz"), affine=affine)
         else:
             print("    ⚠️  Warning: Fitted values not available (predicted=None)")
 
@@ -2049,9 +2047,8 @@ def main():
             else:
                 residuals_vol = residuals_np
 
-            errts_img = nib.Nifti1Image(residuals_vol, affine)
             # Always write NIfTI .nii.gz regardless of input format
-            nib.save(errts_img, replace_afni_extension(args.Rerrts, ".nii.gz"))
+            save_nifti(residuals_vol, output_path=replace_afni_extension(args.Rerrts, ".nii.gz"), affine=affine)
         else:
             print("    ⚠️  Warning: Residuals not available")
 
