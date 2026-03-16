@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 # fastfuncstuff imports
 try:
@@ -50,6 +51,7 @@ try:
     )
     from fastfuncstuff.decomposition.icasso import icasso
     from fastfuncstuff.utils import (
+        configure_torch_backends,
         gaussian_blur_3d,
         get_device,
         scale_to_percent_signal,
@@ -96,6 +98,21 @@ def _run_single_ica(
     tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
     _vprint(args.verbose, f"TR = {tr:.4f}s, duration = {tr * n_t:.1f}s")
 
+    # FSL GUI/FEAT typically runs MELODIC on preprocessed filtered_func_data.
+    # Running auto/melodic directly on raw BOLD can yield a lower PPCA model
+    # order even with the same final mask.
+    num_spec_preview = parse_num_comps_spec(args.num_comps)
+    if (
+        isinstance(num_spec_preview, str)
+        and num_spec_preview in {"auto", "melodic"}
+        and Path(run_file).name != "filtered_func_data.nii.gz"
+        and Path(run_file).name != "filtered_func_data"
+    ):
+        print(
+            "  Note: auto/melodic on raw input may not match GUI/FEAT model-order "
+            "selection. GUI parity is typically against filtered_func_data stage."
+        )
+
     if shared_mask is not None and shared_mask.shape != shape3d:
         raise ValueError(
             f"Mask shape {shared_mask.shape} does not match run shape {shape3d} for {run_file}"
@@ -125,8 +142,16 @@ def _run_single_ica(
         mask3d = shared_mask
         _vprint(args.verbose, f"Using provided mask: {int(mask3d.sum()):,} voxels")
     elif not args.no_auto_mask:
-        # Auto-mask: threshold on mean intensity to exclude background
-        mask3d = ica_postprocess.auto_mask_from_data(data, verbose=args.verbose)
+        from fastfuncstuff.processing.mask import automask
+
+        mask3d = automask(torch.as_tensor(mean3d), dilate_extra=0, device=device).cpu().numpy()
+        n_total = int(np.prod(mask3d.shape))
+        n_brain = int(mask3d.sum())
+        if args.verbose:
+            print(
+                f"    Auto-mask: {n_brain:,} / {n_total:,} voxels "
+                f"({100 * n_brain / max(1, n_total):.1f}%)"
+            )
     else:
         mask3d = None  # no masking at all
         _vprint(args.verbose, f"No mask: using all {np.prod(shape3d):,} voxels (no_auto_mask)")
@@ -254,7 +279,7 @@ def _run_single_ica(
 
     # --- To GPU ---
     t_step = time.time()
-    data_vox_t = to_tensor(data_vox_t_np, device=device)
+    data_vox_t = to_tensor(data_vox_t_np, device=device, pin=True)
     _vprint(args.verbose, f"Data on {device}", t_step)
 
     # Free large numpy array
@@ -345,14 +370,34 @@ def _run_single_ica(
         _vprint(args.verbose, f"max_auto_components: {max_auto_k} (absolute)")
 
     _vprint(args.verbose, f"Method: {args.num_comps} ...")
+
+    # FSL update_mask behavior for model-order estimation: exclude very
+    # low-variability voxels before PPCA evidence scan.
+    n_eff_for_model_order = n_eff
+    data_for_model_order = data_vox_t
+    model_order_filter_diag = None
+    if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
+        data_for_model_order, model_order_filter_diag = ica_workflow.filter_voxels_for_melodic_model_order(
+            data_vox_t=data_vox_t
+        )
+        n_vox_model_order = int(data_for_model_order.shape[0])
+        n_eff_for_model_order = max(n_t, int(n_vox_model_order / (2.5 * resels)))
+        _vprint(
+            args.verbose,
+            "MELODIC dim-est filter: "
+            f"kept {n_vox_model_order:,}/{n_vox_masked:,} voxels "
+            f"(thr={model_order_filter_diag['std_threshold']:.6g}); "
+            f"n_eff={n_eff_for_model_order:,}",
+        )
+
     n_components, pca_diag, num_diag = estimate_ica_component_count(
-        data_vox_t=data_vox_t,
+        data_vox_t=data_for_model_order,
         method=num_spec,
         max_auto_components=max_auto_k,
         auto_min_components=args.auto_min_components,
         auto_var_threshold=args.auto_var_threshold,
         use_mp_prior=not args.auto_no_mp,
-        n_eff=n_eff,
+        n_eff=n_eff_for_model_order,
         device=device,
         verbose=args.verbose,
         capture_ppca_trace=bool(args.ppca_debug_dump),
@@ -371,7 +416,7 @@ def _run_single_ica(
             "input_file": run_file,
             "n_voxels": int(n_vox_masked),
             "n_timepoints": int(n_t),
-            "n_eff": int(n_eff),
+            "n_eff": int(n_eff_for_model_order),
             "num_comps_request": args.num_comps,
             "rank_cap": int(pca_diag["rank_cap"]),
             "n_eigs": int(pca_diag["n_eigs"]),
@@ -430,14 +475,14 @@ def _run_single_ica(
             )
         _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
     else:
-        _vprint(args.verbose, f"FastICA: k={n_components}, max_iter={args.ica_max_iter} ...")
+        _vprint(args.verbose, f"FastICA: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity} ...")
         ica = FastICA(
             n_components=n_components,
             pca_components=n_components,
             max_iter=args.ica_max_iter,
             tol=args.ica_tol,
+            fun=args.ica_nonlinearity,
             random_state=run_idx,
-            whiten=False,
             device=device,
         )
         ica.fit(x_t)
@@ -638,13 +683,17 @@ def _run_single_ica(
     _vsection(args.verbose, "Save Outputs")
     t_step = time.time()
     _vprint(args.verbose, "Saving ICA spatial maps ...")
-    decomposition_io.save_masked_component_maps_4d(
-        components_kv=comp_np,
-        mask3d=mask3d,
-        shape3d=shape3d,
-        affine=affine,
-        out_file=Path(f"{out_prefix}_{run_tag}_ica_maps.nii.gz"),
-    )
+    save_items = [
+        (comp_np, f"{out_prefix}_{run_tag}_ica_maps.nii.gz", "maps"),
+    ]
+    for data_arr, fname, label in tqdm(save_items, desc="  Saving NIfTI", leave=False, disable=not args.verbose):
+        decomposition_io.save_masked_component_maps_4d(
+            components_kv=data_arr,
+            mask3d=mask3d,
+            shape3d=shape3d,
+            affine=affine,
+            out_file=Path(fname),
+        )
     _vprint(args.verbose, f"Maps saved: {out_prefix}_{run_tag}_ica_maps.nii.gz", t_step)
 
     # --- Save timecourses ---
@@ -726,27 +775,19 @@ def _run_single_ica(
         n_conv = sum(1 for m in mixture_meta if m.get("converged", False))
         _vprint(args.verbose, f"GGM done: {n_conv}/{n_comps_total} converged", t_step)
 
-        decomposition_io.save_masked_component_maps_4d(
-            components_kv=z_maps,
-            mask3d=mask3d,
-            shape3d=shape3d,
-            affine=affine,
-            out_file=Path(f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz"),
-        )
-        decomposition_io.save_masked_component_maps_4d(
-            components_kv=p_maps,
-            mask3d=mask3d,
-            shape3d=shape3d,
-            affine=affine,
-            out_file=Path(f"{out_prefix}_{run_tag}_ica_signalprob.nii.gz"),
-        )
-        decomposition_io.save_masked_component_maps_4d(
-            components_kv=thresh_z_maps,
-            mask3d=mask3d,
-            shape3d=shape3d,
-            affine=affine,
-            out_file=Path(f"{out_prefix}_{run_tag}_ica_thresh_zmaps.nii.gz"),
-        )
+        ggm_saves = [
+            (z_maps, f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz"),
+            (p_maps, f"{out_prefix}_{run_tag}_ica_signalprob.nii.gz"),
+            (thresh_z_maps, f"{out_prefix}_{run_tag}_ica_thresh_zmaps.nii.gz"),
+        ]
+        for data_arr, fname in tqdm(ggm_saves, desc="  Saving GGM NIfTI", leave=False, disable=not args.verbose):
+            decomposition_io.save_masked_component_maps_4d(
+                components_kv=data_arr,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
+                out_file=Path(fname),
+            )
         _vprint(args.verbose, "Z-maps and signal-prob maps saved")
 
     # --- Good/Bad guidance scoring (spatial + temporal) ---
@@ -867,7 +908,8 @@ def _run_single_ica(
         "tc_var_norm": bool(args.var_norm),
         "smoothness_fwhm_vox": round(float(fwhm_geo), 3),
         "smoothness_resels": round(float(resels), 3),
-        "n_eff": int(n_eff),
+        "n_eff": int(n_eff_for_model_order),
+        "model_order_voxel_filter": model_order_filter_diag,
         "component_variance_share": explained_share.tolist(),
         "component_total_variance_share": total_share.tolist(),
         "component_spatial_stdev_share": stdev_share_sorted.tolist(),
@@ -1159,7 +1201,13 @@ def build_parser() -> argparse.ArgumentParser:
     ica_opts = parser.add_argument_group("ICA / ICASSO")
     ica_opts.add_argument("-ica_max_iter", type=int, default=1000, help="FastICA max iterations")
     ica_opts.add_argument(
-        "-ica_tol", type=float, default=1e-6, help="FastICA convergence tolerance"
+        "-ica_tol", type=float, default=1e-4,
+        help="FastICA convergence tolerance (MELODIC default: 1e-4)"
+    )
+    ica_opts.add_argument(
+        "-ica_nonlinearity", type=str, default="pow3",
+        choices=["pow3", "cube", "logcosh"],
+        help="FastICA contrast function (default: pow3, matching MELODIC)",
     )
     ica_opts.add_argument("-icasso", action="store_true", help="Run ICASSO stability analysis")
     ica_opts.add_argument(
@@ -1434,6 +1482,7 @@ def main() -> None:
 
     args._n_runs_total = len(input_files)
     device = torch.device("cpu") if args.cpu else get_device()
+    configure_torch_backends(device)
 
     print_cli_header("ffs_ica.py", "Fast run-wise whole-brain ICA")
     print(f"Device: {device}")

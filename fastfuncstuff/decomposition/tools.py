@@ -32,9 +32,14 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.denoise.sequential import estimate_noise_component_caps_per_run
 from fastfuncstuff.design.matrices import convolve_hrf_microtime
-from fastfuncstuff.design.builder import create_onset_matrix_microtime, parse_afni_timing_file, parse_durations
+from fastfuncstuff.design.builder import (
+    create_onset_matrix_microtime,
+    parse_afni_timing_file,
+    parse_durations,
+)
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.design.hrf import get_spmg1_hrf
+from fastfuncstuff.utils import to_tensor
 from .pca import PCA
 
 
@@ -65,6 +70,7 @@ def parse_num_comps_spec(spec: str) -> int | float | str:
         ) from exc
 
 
+@torch.inference_mode()
 def apply_polort_projection(
     data_vox_t: torch.Tensor,
     polort: int,
@@ -97,7 +103,29 @@ def apply_polort_projection(
     if poly.shape[1] == 0:
         return data_vox_t
     q, _ = torch.linalg.qr(poly)
-    return data_vox_t - (data_vox_t @ q) @ q.T
+    # Project out polynomials in-place via chunking to avoid allocating
+    # a full (V, T) intermediate when V is very large.
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    n_vox = data_vox_t.shape[0]
+    chunk_size = estimate_chunk_size(
+        n_voxels=n_vox,
+        n_timepoints=data_vox_t.shape[1],
+        n_regressors=q.shape[1],
+        device=data_vox_t.device,
+        operation="ica_varnorm",  # similar memory profile: (T,) per voxel
+    )
+    n_chunks = (n_vox + chunk_size - 1) // chunk_size
+    for v0 in tqdm(
+        range(0, n_vox, chunk_size),
+        total=n_chunks,
+        desc="  Polort project",
+        leave=True,
+        disable=n_chunks <= 1,
+    ):
+        v1 = min(v0 + chunk_size, n_vox)
+        data_vox_t[v0:v1] -= (data_vox_t[v0:v1] @ q) @ q.T
+    return data_vox_t
 
 
 def apply_high_pass_fft(
@@ -147,6 +175,7 @@ def apply_high_pass_fft(
     return torch.fft.irfft(spec, n=n_t, dim=1)
 
 
+@torch.inference_mode()
 def apply_melodic_voxel_varnorm(
     data_vox_t: torch.Tensor,
     pca_dim: int | None = None,
@@ -177,50 +206,90 @@ def apply_melodic_voxel_varnorm(
     n_constant : int
         Number of voxels treated as constant and zeroed.
     """
-    x_t = data_vox_t.T  # (T, V)
+    # Work on a contiguous (T, V) copy so the caller's tensor is not modified.
+    x_t = data_vox_t.T.clone()  # (T, V) — ORIGINAL data
     n_time, n_vox = int(x_t.shape[0]), int(x_t.shape[1])
 
     if n_time < 2 or n_vox < 2:
-        std = torch.std(data_vox_t, dim=1, keepdim=True)
-        const_mask = std.squeeze(1) < 1e-6
-        std = torch.where(const_mask.unsqueeze(1), torch.ones_like(std), std)
-        out = data_vox_t / std
-        out[const_mask] = 0.0
-        return out, int(const_mask.sum().item())
+        std = torch.std(x_t, dim=0, keepdim=True)
+        const_mask = std.squeeze(0) < 1e-6
+        std = torch.where(const_mask.unsqueeze(0), torch.ones_like(std), std)
+        out = x_t / std
+        out[:, const_mask] = 0.0
+        return out.T, int(const_mask.sum().item())
 
-    dim = min(30, n_time - 1) if pca_dim is None else int(pca_dim)
+    # FSL MELODIC setup_classic uses min(30, T-1) for varnorm PCA dim.
+    dim = min(30, max(1, n_time - 1)) if pca_dim is None else int(pca_dim)
     dim = max(1, min(dim, n_time - 1))
 
-    # Remmean(in,2) in FSL: demean each voxel (column in T×V representation)
-    x_t = x_t - x_t.mean(dim=0, keepdim=True)
-
-    # Row-covariance (time×time), consistent with PCA over temporal modes
-    denom = float(max(n_vox - 1, 1))
-    corr_t = (x_t @ x_t.T) / denom
+    # MELODIC varnorm flow (melhlprfns.cc):
+    #   1. std_pca(remmean(in,2), Corr, ...) where remmean(...,2) is ROW-mean
+    #      removal (spatial mean per timepoint), not temporal demeaning.
+    #      Inside std_pca, cov_r again row-centres and divides by V.
+    #   2. calc_white → white/dewhite from eigenvectors/eigenvalues
+    #   3. ws = white * in — whitening applied to ORIGINAL data (not demeaned!)
+    #   4. Threshold |ws| < level → 0
+    #   5. Residual = in - dewhite * ws (ORIGINAL data)
+    #   6. noise_std = stdev(residual) per voxel
+    #   7. Normalize in / noise_std, zero constant voxels
+    #
+    # Step 1: PCA on row-centred data (FSL remmean(...,2) / cov_r semantics)
+    row_mean = x_t.mean(dim=1, keepdim=True)  # (T, 1) spatial mean
+    corr_t = (x_t @ x_t.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
 
     # Eigendecomposition (ascending -> descending)
     evals, evecs = torch.linalg.eigh(corr_t)
+    del corr_t
     order = torch.argsort(evals, descending=True)
     evals = torch.clamp(evals[order][:dim], min=1e-12)
     evecs = evecs[:, order][:, :dim]
 
-    # FSL-style white/dewhite from PCA basis
+    # Step 2: white/dewhite from PCA basis
     sqrt_evals = torch.sqrt(evals)
     white = (evecs / sqrt_evals.unsqueeze(0)).T  # (dim, T)
     dewhite = evecs * sqrt_evals.unsqueeze(0)  # (T, dim)
 
+    # Step 3: Apply whitening to ORIGINAL data (not demeaned), matching MELODIC
     ws = white @ x_t  # (dim, V)
+    # Step 4: Threshold small coefficients
     ws = torch.where(torch.abs(ws) < float(level), torch.zeros_like(ws), ws)
 
-    residual = x_t - (dewhite @ ws)  # (T, V)
-    noise_std = torch.std(residual, dim=0, unbiased=True)
+    # Chunked residual-std + normalization to avoid materializing full (T, V)
+    # residual tensor.  Only the per-voxel std is needed, so we stream chunks.
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    chunk_size = estimate_chunk_size(
+        n_voxels=n_vox,
+        n_timepoints=n_time,
+        n_regressors=0,
+        device=x_t.device,
+        operation="ica_varnorm",
+    )
+
+    noise_std = torch.empty(n_vox, device=x_t.device)
+    n_chunks = (n_vox + chunk_size - 1) // chunk_size
+    for v0 in tqdm(
+        range(0, n_vox, chunk_size),
+        total=n_chunks,
+        desc="  Varnorm residual",
+        leave=True,
+        disable=n_chunks <= 1,
+    ):
+        v1 = min(v0 + chunk_size, n_vox)
+        resid_chunk = x_t[:, v0:v1] - (dewhite @ ws[:, v0:v1])
+        noise_std[v0:v1] = torch.std(resid_chunk, dim=0, unbiased=True)
+        del resid_chunk
+
+    del ws  # free (dim, V) before normalization
+
     const_mask = noise_std < 0.01
     safe_std = torch.where(const_mask, torch.ones_like(noise_std), noise_std)
 
-    x_norm = x_t / safe_std.unsqueeze(0)
-    x_norm[:, const_mask] = 0.0
+    # In-place normalization (avoids allocating a second (T, V) tensor)
+    x_t /= safe_std.unsqueeze(0)
+    x_t[:, const_mask] = 0.0
 
-    return x_norm.T, int(const_mask.sum().item())
+    return x_t.T, int(const_mask.sum().item())
 
 
 def effective_rank_from_spectrum(evals: np.ndarray) -> int:
@@ -412,9 +481,9 @@ def _adjust_eigenspectrum_melodic(
     max_ev = n_feat  # default: keep all
     for i in range(n_feat - 1):
         if cum_pct[i] < threshold <= cum_pct[i + 1]:
-            # Match FSL adj_eigspec(): maxEV is set to the lower crossing index
-            # (1-based ctr_i), which corresponds to i (0-based) elements kept.
-            max_ev = max(1, i)
+            # FSL adj_eigspec(): maxEV = ctr_i (1-based lower crossing index).
+            # In 0-based indexing, this keeps (i + 1) elements.
+            max_ev = max(1, i + 1)
             break
     if max_ev < 3:
         max_ev = n_feat // 2
@@ -817,10 +886,24 @@ def estimate_ica_component_count(
             f"(component cap={rank_cap}) ..."
         )
 
-    pca = PCA(n_components=n_eigs_for_minka, device=device)
-    pca.fit(x_t)
-    ev = pca.explained_variance_.detach().cpu().numpy()
-    evr = pca.explained_variance_ratio_.detach().cpu().numpy()
+    # FSL MELODIC ppca_dim() passes remmean(alldat,2), i.e. row-mean removal
+    # (spatial mean per timepoint). cov_r then forms row-wise covariance.
+    # We match this cov_r semantics directly.
+    x_t_dev = to_tensor(x_t, device=device)
+    # Row-centred covariance (cov_r semantics): subtract per-timepoint spatial mean.
+    # Use identity: (X-m)(X-m)^T = XX^T - V*mm^T to avoid a (T,V) copy.
+    row_mean = x_t_dev.mean(dim=1, keepdim=True)  # (T, 1)
+    corr_t = (x_t_dev @ x_t_dev.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
+    ev_all = torch.linalg.eigvalsh(corr_t).flip(0)  # descending
+    del corr_t
+    ev_all = torch.clamp(ev_all, min=0)
+    total_var = ev_all.sum()
+    evr_all = ev_all / total_var if total_var > 0 else ev_all
+
+    n_keep = min(n_eigs_for_minka, len(ev_all))
+    ev = ev_all[:n_keep].detach().cpu().numpy()
+    evr = evr_all[:n_keep].detach().cpu().numpy()
+    del ev_all, evr_all, x_t_dev
     n_ev = len(ev)
 
     if verbose:
@@ -991,6 +1074,7 @@ def _gauss_pdf_torch(x: torch.Tensor, mean: torch.Tensor, var: torch.Tensor) -> 
     return torch.exp(-0.5 * (x - mean) ** 2 / var) / torch.sqrt(2.0 * torch.pi * var)
 
 
+@torch.inference_mode()
 def batch_fit_ggm(
     components_kv: torch.Tensor,
     n_iter: int = 200,
@@ -1093,7 +1177,7 @@ def batch_fit_ggm(
         new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-8)
 
         # Positive Gamma
-        x_pos_w = torch.where(x > 0, x, torch.zeros_like(x))
+        x_pos_w = x.clamp(min=0)  # avoid torch.zeros_like allocation
         x_pos_cnt = (r_pos * (x > 0).float()).sum(dim=1, keepdim=True).clamp(min=1e-8)
         mu_p_cand = (r_pos * x_pos_w).sum(dim=1, keepdim=True) / x_pos_cnt
         floor_p = (1.5 * new_mu_n + torch.sqrt(new_var_n)).clamp(min=min_mode_offset)
@@ -1101,7 +1185,7 @@ def batch_fit_ggm(
         new_var_p = ((r_pos * (x - new_mu_p) ** 2).sum(dim=1, keepdim=True) / w_p).clamp(min=1e-8)
 
         # Negative Gamma
-        x_neg_w = torch.where(neg_x > 0, neg_x, torch.zeros_like(neg_x))
+        x_neg_w = neg_x.clamp(min=0)  # avoid torch.zeros_like allocation
         x_neg_cnt = (r_neg * (neg_x > 0).float()).sum(dim=1, keepdim=True).clamp(min=1e-8)
         mu_ng_cand = (r_neg * x_neg_w).sum(dim=1, keepdim=True) / x_neg_cnt
         floor_ng = torch.where(
@@ -1135,15 +1219,25 @@ def batch_fit_ggm(
         pi_p = torch.where(a, new_pi_p, pi_p)
         pi_ng = torch.where(a, new_pi_ng, pi_ng)
 
-    # Final posterior
+    # Free EM intermediates before final posterior computation
+    del r_noise, r_pos, r_neg, old_ll
+    if x.device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Final posterior — compute sequentially to minimize peak memory
     p_noise_f = pi_n * _gauss_pdf_torch(x, mu_n, var_n)
     p_pos_f = pi_p * _gamma_pdf_torch(x, mu_p, var_p)
     p_neg_f = pi_ng * _gamma_pdf_torch(neg_x, mu_ng, var_ng)
+    del neg_x  # free (K, V) float64
+
     total_f = (p_noise_f + p_pos_f + p_neg_f).clamp(min=1e-30)
+    del p_noise_f  # only need signal components for p_signal
     p_signal = ((p_pos_f + p_neg_f) / total_f).float()  # (K, V)
+    del p_pos_f, p_neg_f, total_f
 
     sigma_n = torch.sqrt(var_n).clamp(min=1e-8)
     z_signed = ((x - mu_n) / sigma_n).float()  # (K, V)
+    del x  # free last (K, V) float64
 
     return {
         "z_signed": z_signed,
@@ -1398,29 +1492,62 @@ def batch_mixture_zscores(
     if device is not None:
         components_kv = components_kv.to(device)
 
-    result = batch_fit_ggm(components_kv, verbose=verbose)
+    K, V = components_kv.shape
 
-    z_signed = result["z_signed"]  # (K, V) float32
-    p_signal = result["p_signal"]  # (K, V) float32
+    # Determine how many components to process per batch based on available
+    # memory.  Peak GGM EM usage is ~9 simultaneous (K_chunk, V) float64
+    # tensors plus the float32 input.
+    from fastfuncstuff.memory import get_available_memory
 
-    K = components_kv.shape[0]
-    meta_list = []
-    for k in range(K):
-        meta_list.append(
-            {
-                "mu_noise": float(result["mu_noise"][k]),
-                "sigma_noise": float(torch.sqrt(result["var_noise"][k].clamp(min=1e-16))),
-                "mu_signal_pos": float(result["mu_pos"][k]),
-                "sigma_signal_pos": float(torch.sqrt(result["var_pos"][k].clamp(min=1e-16))),
-                "mu_signal_neg": float(result["mu_neg"][k]),
-                "sigma_signal_neg": float(torch.sqrt(result["var_neg"][k].clamp(min=1e-16))),
-                "pi_noise": float(result["pi_noise"][k]),
-                "pi_pos": float(result["pi_pos"][k]),
-                "pi_neg": float(result["pi_neg"][k]),
-                "mixing_signal": float(p_signal[k].mean()),
-                "converged": bool(result["converged"][k]),
-            }
-        )
+    avail = get_available_memory(components_kv.device)
+    # Peak GGM EM uses ~12 simultaneous (K_chunk, V) float64 tensors:
+    # x, neg_x, p_noise, p_pos, p_neg, total, r_noise, r_pos, r_neg,
+    # plus M-step temporaries (torch.where zeros_like, squared diffs, etc.)
+    bytes_per_comp = V * 8 * 12 + V * 4  # 12 float64 + 1 float32 per component
+    k_chunk = max(1, int(avail * 0.8) // max(bytes_per_comp, 1))  # 80% safety margin
+    k_chunk = min(k_chunk, K)
+
+    z_parts: list[torch.Tensor] = []
+    p_parts: list[torch.Tensor] = []
+    meta_list: list[dict] = []
+
+    n_batches = (K + k_chunk - 1) // k_chunk
+    for k0 in tqdm(
+        range(0, K, k_chunk),
+        total=n_batches,
+        desc="  GGM batches",
+        leave=True,
+        disable=n_batches <= 1,
+    ):
+        k1 = min(k0 + k_chunk, K)
+        result = batch_fit_ggm(components_kv[k0:k1], verbose=(verbose and k0 == 0))
+
+        z_parts.append(result["z_signed"].cpu())
+        p_parts.append(result["p_signal"].cpu())
+
+        for k in range(k1 - k0):
+            meta_list.append(
+                {
+                    "mu_noise": float(result["mu_noise"][k]),
+                    "sigma_noise": float(torch.sqrt(result["var_noise"][k].clamp(min=1e-16))),
+                    "mu_signal_pos": float(result["mu_pos"][k]),
+                    "sigma_signal_pos": float(torch.sqrt(result["var_pos"][k].clamp(min=1e-16))),
+                    "mu_signal_neg": float(result["mu_neg"][k]),
+                    "sigma_signal_neg": float(torch.sqrt(result["var_neg"][k].clamp(min=1e-16))),
+                    "pi_noise": float(result["pi_noise"][k]),
+                    "pi_pos": float(result["pi_pos"][k]),
+                    "pi_neg": float(result["pi_neg"][k]),
+                    "mixing_signal": float(result["p_signal"][k].mean()),
+                    "converged": bool(result["converged"][k]),
+                }
+            )
+        del result
+        if components_kv.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    z_signed = torch.cat(z_parts, dim=0)  # stays on CPU to avoid GPU OOM
+    p_signal = torch.cat(p_parts, dim=0)
+    del z_parts, p_parts
 
     return z_signed, p_signal, meta_list
 

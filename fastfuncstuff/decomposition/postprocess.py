@@ -14,10 +14,7 @@ import torch
 
 from .tools import apply_high_pass_fft, apply_polort_projection
 
-try:
-    import nibabel as nib
-except ImportError:  # pragma: no cover - import guard for optional runtime dep
-    nib = None
+from fastfuncstuff.io.afni import load_nifti
 
 try:
     import matplotlib
@@ -79,10 +76,7 @@ def expand_mask_file(mask_path: str, shape3d: tuple[int, int, int]) -> list[tupl
     - 3D integer labels: one mask per positive label value
     - 4D: one mask per frame (values > 0 in each frame)
     """
-    if nib is None:
-        raise ImportError("nibabel is required for mask loading")
-
-    img = nib.load(mask_path)
+    img = load_nifti(mask_path)
     data = np.asarray(img.get_fdata(dtype=np.float32))
     stem = Path(mask_path).name
 
@@ -184,10 +178,7 @@ def prepare_depth_mask(
     """Load depth labels and map each positive integer depth to masked voxel space."""
     if depth_mask_path is None:
         return None
-    if nib is None:
-        raise ImportError("nibabel is required for depth mask loading")
-
-    img = nib.load(depth_mask_path)
+    img = load_nifti(depth_mask_path)
     data = np.asarray(img.get_fdata(dtype=np.float32))
     if data.ndim != 3:
         raise ValueError(f"-depth_mask must be 3D integer-labeled image, got ndim={data.ndim}")

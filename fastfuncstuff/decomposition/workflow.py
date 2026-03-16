@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from scipy.stats import spearmanr
+from tqdm.auto import tqdm
 
 from . import postprocess as ica_postprocess
 from .tools import apply_high_pass_fft, apply_melodic_voxel_varnorm, apply_polort_projection
@@ -35,14 +36,30 @@ def verbose_print(verbose: bool, msg: str, t0: float | None = None) -> None:
         print(f"    {msg}")
 
 
+@torch.inference_mode()
 def sanitize_finite_tensor(t: torch.Tensor, label: str, verbose: bool = False) -> torch.Tensor:
-    """Replace NaN/Inf with 0 and report if needed."""
-    bad = ~torch.isfinite(t)
-    n_bad = int(bad.sum())
+    """Replace NaN/Inf with 0 and report if needed.
+
+    Uses a chunked scan to avoid allocating a full-sized boolean mask
+    (which can OOM on large tensors when .sum() upcasts to int64).
+    """
+    # Scan rows in chunks to keep peak memory low
+    _ROWS_PER_CHUNK = max(1, min(t.shape[0], 4096))
+    n_bad = 0
+    has_bad = False
+    for r0 in range(0, t.shape[0], _ROWS_PER_CHUNK):
+        r1 = min(r0 + _ROWS_PER_CHUNK, t.shape[0])
+        chunk_bad = ~torch.isfinite(t[r0:r1])
+        chunk_n = int(chunk_bad.sum().item())
+        if chunk_n > 0:
+            if not has_bad:
+                t = t.clone()
+                has_bad = True
+            t[r0:r1][chunk_bad] = 0.0
+            n_bad += chunk_n
+        del chunk_bad
     if n_bad > 0:
         print(f"  ⚠ {label}: {n_bad:,} NaN/Inf values → zeroed")
-        t = t.clone()
-        t[bad] = 0.0
     elif verbose:
         print(f"    {label}: finite ✓")
     return t
@@ -76,7 +93,8 @@ def estimate_spatial_smoothness_resels(
     ssminus = [0.0, 0.0, 0.0]
     s2 = [0.0, 0.0, 0.0]
 
-    for t_start in range(0, n_t, chunk_size):
+    n_chunks = (n_t + chunk_size - 1) // chunk_size
+    for t_start in tqdm(range(0, n_t, chunk_size), total=n_chunks, desc="  FWHM estimate", leave=True, disable=n_chunks <= 1):
         t_end = min(t_start + chunk_size, n_t)
         chunk_np = np.empty((t_end - t_start, *shape3d), dtype=np.float32)
         for i, ti in enumerate(range(t_start, t_end)):
@@ -118,7 +136,7 @@ def estimate_spatial_smoothness_resels(
             continue
         sigmasq = -1.0 / (4.0 * np.log(rval))
         fwhm_ax = float(np.sqrt(8.0 * np.log(2.0) * sigmasq))
-        fwhm.append(max(1.0, fwhm_ax))
+        fwhm.append(fwhm_ax)
 
     if verbose:
         verbose_print(
@@ -138,6 +156,7 @@ def apply_voxel_variance_normalization(
 ) -> tuple[torch.Tensor, str]:
     """Apply voxel variance normalization with MELODIC-compatible path when requested."""
     if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
+        # FSL MELODIC setup_classic uses min(30, T-1) for varnorm PCA dim.
         pca_dim = min(30, max(1, n_t - 1))
         data_vox_t, n_const = apply_melodic_voxel_varnorm(
             data_vox_t=data_vox_t,
@@ -163,6 +182,52 @@ def apply_voxel_variance_normalization(
     return data_vox_t, norm_msg
 
 
+@torch.inference_mode()
+def filter_voxels_for_melodic_model_order(
+    data_vox_t: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Apply FSL-style variability thresholding before MELODIC PPCA dim estimation.
+
+    FSL runs ``update_mask`` before PPCA model-order selection and drops voxels
+    with unusually low temporal variability. This helper mirrors the thresholding
+    rule without modifying the caller's full ICA data matrix.
+    """
+    if data_vox_t.ndim != 2 or data_vox_t.shape[0] < 2:
+        return data_vox_t, {
+            "voxels_in": int(data_vox_t.shape[0]),
+            "voxels_kept": int(data_vox_t.shape[0]),
+            "voxels_dropped": 0,
+            "std_threshold": 0.0,
+            "std_mean": 0.0,
+            "std_std": 0.0,
+        }
+
+    # Match FSL melhlprfns.cc update_mask threshold:
+    # keep if std > max(mean(std)-3*std(std), 0.01*mean(std)).
+    d_std = torch.std(data_vox_t, dim=1, unbiased=True)
+    std_mean = float(d_std.mean().item())
+    std_std = float(torch.std(d_std, unbiased=True).item()) if d_std.numel() > 1 else 0.0
+    thr = float(max(std_mean - 3.0 * std_std, 0.01 * std_mean))
+    keep = d_std > thr
+
+    n_in = int(d_std.numel())
+    n_keep = int(keep.sum().item())
+    if n_keep < 2:
+        # Safety fallback: never return an empty/degenerate matrix.
+        keep = torch.ones_like(keep, dtype=torch.bool)
+        n_keep = n_in
+
+    filtered = data_vox_t[keep]
+    return filtered, {
+        "voxels_in": n_in,
+        "voxels_kept": n_keep,
+        "voxels_dropped": int(n_in - n_keep),
+        "std_threshold": thr,
+        "std_mean": std_mean,
+        "std_std": std_std,
+    }
+
+
 def apply_melodic_noise_normalization(
     components: torch.Tensor,
     mixing: torch.Tensor,
@@ -173,9 +238,24 @@ def apply_melodic_noise_normalization(
         tdim, kdim = mixing.shape
         unmix = torch.linalg.pinv(mixing)
         diagvals = 1.0 / torch.sqrt(torch.clamp(torch.diag(unmix @ unmix.T), min=1e-12))
-        residuals = x_t - mixing @ components
-        resid_std = torch.std(residuals, dim=0)
-        del residuals
+        # Chunked residual std to avoid materializing full (T, V) tensor
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        n_vox = x_t.shape[1]
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_vox,
+            n_timepoints=tdim,
+            n_regressors=0,
+            device=x_t.device,
+            operation="ica_varnorm",
+        )
+        resid_std = torch.empty(n_vox, device=x_t.device)
+        n_chunks = (n_vox + chunk_size - 1) // chunk_size
+        for v0 in tqdm(range(0, n_vox, chunk_size), total=n_chunks, desc="  Noise norm", leave=True, disable=n_chunks <= 1):
+            v1 = min(v0 + chunk_size, n_vox)
+            resid_chunk = x_t[:, v0:v1] - mixing @ components[:, v0:v1]
+            resid_std[v0:v1] = torch.std(resid_chunk, dim=0)
+            del resid_chunk
         resid_std = torch.where(resid_std < 0.05, torch.ones_like(resid_std), resid_std)
         dof_factor = float(np.sqrt((tdim - 1.0) / max(tdim - kdim, 1.0)))
         std_noise = 1.0 / (resid_std * dof_factor)

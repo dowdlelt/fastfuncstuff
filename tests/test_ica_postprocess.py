@@ -309,15 +309,5 @@ class TestExpandMaskFile:
 
     def test_expands_4d_mask(self):
         """Test expansion of 4D mask into multiple frame masks."""
-        # This test would require nibabel and actual mask files
-        # For now, we test the concept with a mock
-        with patch('fastfuncstuff.ica_postprocess.nib') as mock_nib:
-            # Setup mock
-            mock_img = MagicMock()
-            mock_img.get_fdata.return_value = np.random.rand(10, 10, 10, 3)
-            mock_nib.load.return_value = mock_img
-
-
-            # This would require actual file I/O - skip for now
-            # The actual tests would need temporary NIfTI files
-            pass
+        # Stub: would require actual NIfTI file I/O to test meaningfully.
+        pass

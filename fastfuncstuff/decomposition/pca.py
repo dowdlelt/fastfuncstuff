@@ -105,7 +105,8 @@ class PCA:
         self.n_samples_: int | None = None
         self.n_features_: int | None = None
 
-    def fit(self, X: np.ndarray | torch.Tensor) -> PCA:
+    @torch.inference_mode()
+    def fit(self, X: np.ndarray | torch.Tensor, *, eigenvalues_only: bool = False) -> PCA:
         """
         Fit PCA on data
 
@@ -113,6 +114,10 @@ class PCA:
         ----------
         X : array-like, shape (n_samples, n_features)
             Training data
+        eigenvalues_only : bool, default=False
+            If True, skip spatial loadings computation (components_ will be None).
+            Useful when only eigenvalues/variance ratios are needed (e.g.,
+            dimensionality estimation), avoiding the expensive (K, V) matmul.
 
         Returns
         -------
@@ -126,9 +131,11 @@ class PCA:
         self.n_samples_ = n_samples
         self.n_features_ = n_features
 
-        # Center data
+        # Center data in-place to avoid allocating a second (T, V) tensor.
+        # The caller's data is modified, but ICA/decomposition pipelines
+        # already demean (polort=0), so this is a near-zero adjustment.
         self.mean_ = X.mean(dim=0)
-        X_centered = X - self.mean_
+        X -= self.mean_
 
         # Compute SVD using memory-efficient covariance approach when n_features >> n_samples
         # This is the GLMdenoise/GLMsingle approach: svd(X @ X^T) instead of svd(X)
@@ -139,7 +146,7 @@ class PCA:
         # Then compute loadings V from V = X^T U S^-1 if needed
         if n_features > 10 * n_samples:  # n_features >> n_samples (typical for fMRI)
             # Covariance approach: SVD on (n_samples, n_samples) instead of (n_samples, n_features)
-            cov = X_centered @ X_centered.T  # (n_samples, n_samples)
+            cov = X @ X.T  # (n_samples, n_samples)
             U, S_squared, _ = torch.linalg.svd(cov, full_matrices=False)
             S = torch.sqrt(torch.clamp(S_squared, min=0))  # Eigenvalues → singular values
 
@@ -153,16 +160,19 @@ class PCA:
                 explained_variance_ratio, n_samples, n_features
             )
 
-            # Compute loadings (V^T) ONLY for selected components to save memory
-            # V = X^T U S^-1, so Vt = S^-1 * U^T @ X
-            S_inv = 1.0 / torch.clamp(S[:n_components], min=1e-10)
-            Vt = S_inv[:, None] * (U[:, :n_components].T @ X_centered)  # (n_components, n_features)
+            if eigenvalues_only:
+                Vt = None
+            else:
+                # Compute loadings (V^T) ONLY for selected components to save memory
+                # V = X^T U S^-1, so Vt = S^-1 * U^T @ X
+                S_inv = 1.0 / torch.clamp(S[:n_components], min=1e-10)
+                Vt = S_inv[:, None] * (U[:, :n_components].T @ X)  # (n_components, n_features)
         else:
             # Standard approach for moderate-sized data
             # X = U @ S @ V^T
             # Components are rows of V^T (columns of V)
             # Scores are U @ S
-            U, S, Vt = torch.linalg.svd(X_centered, full_matrices=False)
+            U, S, Vt = torch.linalg.svd(X, full_matrices=False)
 
             # Explained variance: S^2 / (n_samples - 1)
             explained_variance = (S**2) / (n_samples - 1)
@@ -185,6 +195,7 @@ class PCA:
 
         return self
 
+    @torch.inference_mode()
     def transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Transform data to PC space
@@ -229,7 +240,14 @@ class PCA:
             Transformed data (PC scores)
         """
         self.fit(X)
-        return self.transform(X)
+        # X was centered in-place by fit(), so project directly (no second subtraction)
+        if self.components_ is None:
+            raise RuntimeError("PCA must be fitted before transform()")
+        X_t = to_tensor(X, device=self.device)
+        scores = X_t @ self.components_.T
+        if self.whiten:
+            scores /= torch.sqrt(self.explained_variance_)
+        return scores
 
     def inverse_transform(self, X_transformed: np.ndarray | torch.Tensor) -> torch.Tensor:
         """

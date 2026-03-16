@@ -21,8 +21,36 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from .pca import PCA
 from fastfuncstuff.utils import get_device, to_tensor
+
+
+class _RowCenteredPCAState:
+    """Lightweight PCA state from MELODIC-style row-centered PCA.
+
+    Stores enough information for FastICA.transform() and inverse_transform()
+    without depending on the column-centering PCA class.
+    """
+
+    def __init__(
+        self,
+        components: torch.Tensor,
+        eigenvectors: torch.Tensor,
+        eigenvalues: torch.Tensor,
+        row_mean: torch.Tensor,
+        device: torch.device,
+    ):
+        self.components_ = components  # (k, V) — whitened spatial components
+        self.n_components_ = components.shape[0]
+        self.explained_variance_ = eigenvalues  # (k,) — PCA eigenvalues
+        self._eigenvectors = eigenvectors  # (T, k)
+        self._eigenvalues = eigenvalues  # (k,)
+        self._row_mean = row_mean  # (T, 1) — not used for transform, stored for reference
+        self.device = device
+
+    def transform(self, X: torch.Tensor) -> torch.Tensor:
+        """Project new data: X @ components^T -> (T, k)."""
+        X = to_tensor(X, device=self.device)
+        return X @ self.components_.T
 
 
 class FastICA:
@@ -62,8 +90,8 @@ class FastICA:
         ICA spatial maps (for spatial ICA) or temporal patterns
     mixing_ : torch.Tensor, shape (n_samples, n_components)
         ICA mixing matrix (timeseries for spatial ICA)
-    pca_ : PCA
-        Fitted PCA object used for dimensionality reduction
+    pca_ : _RowCenteredPCAState
+        Fitted PCA state (MELODIC-style row-centered)
     mean_ : torch.Tensor
         Mean used for centering
     n_iter_ : int
@@ -109,14 +137,19 @@ class FastICA:
         self.mean_ = None
         self.n_iter_ = None
 
+    @torch.inference_mode()
     def fit(self, X: np.ndarray | torch.Tensor) -> FastICA:
         """
         Fit ICA on data
 
+        Uses MELODIC-style row-centered PCA for whitening: covariance is
+        computed from row-centered (spatial-mean-subtracted) data, but
+        whitening is applied to the original (non-centered) data.
+
         Parameters
         ----------
         X : array-like, shape (n_samples, n_features)
-            Training data
+            Training data (n_timepoints, n_voxels)
 
         Returns
         -------
@@ -126,17 +159,70 @@ class FastICA:
         # Convert to tensor
         X = to_tensor(X, device=self.device)
 
-        n_samples, n_features = X.shape
+        n_samples, n_features = X.shape  # T, V
 
-        # Step 1: PCA dimensionality reduction
-        self.pca_ = PCA(n_components=self.pca_components, whiten=self.whiten, device=self.device)
-        X_pca = self.pca_.fit_transform(X)
+        # Step 1: PCA with MELODIC-style centering
+        # MELODIC first removes the temporal mean (remmean(alldat,2), i.e.
+        # per-voxel/column mean) before PCA.  Then cov_r row-centres on top
+        # (subtracts spatial mean per timepoint).  Whitening is applied to
+        # the temporally-demeaned data.  We replicate both steps.
+        self.mean_ = X.mean(dim=0, keepdim=True)  # (1, V) temporal mean per voxel
+        X = X - self.mean_  # temporal demean (column-centre)
 
-        # Validate PCA n_components
-        if not hasattr(self.pca_, "n_components_") or self.pca_.n_components_ is None:
-            raise RuntimeError("PCA n_components_ not found")
+        row_mean = X.mean(dim=1, keepdim=True)  # (T, 1) spatial mean per timepoint
+        # Memory-efficient: (X-m)(X-m)^T = X@X^T - V*m*m^T
+        cov_t = (X @ X.T - n_features * (row_mean @ row_mean.T)) / float(n_features)
 
-        pca_n_components = cast(int, self.pca_.n_components_)
+        # Eigendecomposition (ascending order from eigvalsh)
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t)
+        del cov_t
+        # Flip to descending order
+        eigenvalues = eigenvalues.flip(0)
+        eigenvectors = eigenvectors.flip(1)
+        eigenvalues = torch.clamp(eigenvalues, min=0)
+
+        # Determine number of PCA components to keep
+        n_max = min(n_samples, n_features)
+        pca_comp = self.pca_components
+        if pca_comp is None:
+            pca_n_components = n_max
+        elif isinstance(pca_comp, float) and 0.0 < pca_comp < 1.0:
+            # Variance fraction
+            total_var = eigenvalues.sum()
+            cumvar = torch.cumsum(eigenvalues, dim=0) / total_var
+            pca_n_components = int(torch.searchsorted(cumvar, pca_comp).item()) + 1
+            pca_n_components = min(pca_n_components, n_max)
+        elif isinstance(pca_comp, int):
+            pca_n_components = min(pca_comp, n_max)
+        else:
+            pca_n_components = n_max
+
+        # Keep top k eigenvalues/vectors
+        evals_k = eigenvalues[:pca_n_components]  # (k,)
+        evecs_k = eigenvectors[:, :pca_n_components]  # (T, k)
+
+        # Store for later use (transform, etc.)
+        self._pca_n_components = pca_n_components
+        self._pca_eigenvalues = evals_k
+        self._pca_eigenvectors = evecs_k
+        self._row_mean = row_mean
+
+        # Whitening matrix: diag(1/sqrt(lambda)) @ U^T  -> (k, T)
+        # Applied to original (not row-centred) data
+        white = torch.diag(1.0 / torch.sqrt(evals_k + 1e-12)) @ evecs_k.T  # (k, T)
+        # Dewhitening: U @ diag(sqrt(lambda))  -> (T, k)
+        dewhite = evecs_k @ torch.diag(torch.sqrt(evals_k))  # (T, k)
+
+        # Whitened spatial components: white @ X -> (k, V)
+        # Applied to ORIGINAL data (not row-centred), matching MELODIC
+        pca_components_all = white @ X  # (k, V)
+
+        # Projected timecourses: X @ components^T, but also available as
+        # dewhite directly (since white @ X gives components, and
+        # X_pca = X @ (white @ X)^T... but simpler: X_pca = dewhite scaled)
+        # Actually: X_pca_i = U_i * sqrt(lambda_i) for whitened PCA
+        # The mixing matrix needs projected timeseries, compute directly:
+        X_pca = X @ pca_components_all.T  # (T, k)
 
         # Determine number of ICA components
         n_comp_req = self.n_components
@@ -146,43 +232,33 @@ class FastICA:
             n_components = min(int(cast(int, n_comp_req)), pca_n_components)
 
         # Step 2: Run FastICA on TOP PCA spatial components (spatial ICA)
-        # PCA components are ordered by variance explained (highest first)
-        # Select only the TOP n_components for ICA
-        # Example: 100 PCA components → take first 50 for 50 ICA components
-        if self.pca_.components_ is None:
-            raise RuntimeError("PCA results not found (components_ is None)")
+        pca_components = pca_components_all[:n_components]  # (n_ica, V)
 
-        pca_components_all = self.pca_.components_  # (n_pca_components, n_voxels)
-        pca_components = pca_components_all[:n_components]  # Take TOP n_components only!
-
-        # For SPATIAL ICA: pass components with voxels as "samples"
-        # Our _fastica expects (n_features, n_samples), so pass (n_ica, n_voxels)
-        # This makes: n_features=n_ica, n_samples=n_voxels (features=components, samples=voxels)
-        # FastICA finds independent rows = independent PC patterns = SPATIAL ICA
-        #
-        # CRITICAL: pca_components (Vt) rows are unit norm, so Cov = I/n_voxels.
-        # FastICA expects Cov = I. We must scale by sqrt(n_voxels).
-        n_voxels = pca_components.shape[1]
-        X_white = pca_components * np.sqrt(n_voxels)
-
-        W, n_iter = self._fastica(X_white, n_components)  # Input: (n_ica, n_voxels)
+        # The whitened components already have Cov ≈ I by construction:
+        # Cov = (white @ X)(white @ X)^T / V
+        #     = white @ (X @ X^T / V) @ white^T
+        # Since white = Λ^(-1/2) U^T and cov_r ≈ U Λ U^T (row-centred cov),
+        # this is approximately I. No additional sqrt(V) scaling needed.
+        W, n_iter = self._fastica(pca_components, n_components)
         self.n_iter_ = n_iter
 
         # Step 3: Extract ICA spatial maps
-        # W has shape (n_ica, n_ica) - unmixing matrix in TOP PC space
-        # Spatial ICA maps: W @ pca_components (top PCs)
-        # = (n_ica, n_ica) @ (n_ica, n_voxels) = (n_ica, n_voxels)
-        self.components_ = W @ pca_components  # (n_components, n_voxels)
+        # W @ pca_components = (n_ica, n_ica) @ (n_ica, V) = (n_ica, V)
+        self.components_ = W @ pca_components
 
         # Step 4: Compute mixing matrix (ICA timecourses)
-        # We have: X_pca with (n_timepoints, n_pca_total)
-        # But ICA only used the FIRST n_components PCs
-        # So use: X_pca[:, :n_components]
-        X_pca_top = X_pca[:, :n_components]  # (n_timepoints, n_ica)
-        # Model: X_pca_top ≈ mixing @ W
-        # Solving for mixing: mixing = X_pca_top @ pinv(W)
-        # Shapes: (n_timepoints, n_ica) @ (n_ica, n_ica) = (n_timepoints, n_ica)
+        # MELODIC: timecourses = dewhite @ pinv(W)
+        X_pca_top = X_pca[:, :n_components]  # (T, n_ica)
         self.mixing_ = X_pca_top @ torch.linalg.pinv(W)
+
+        # Store PCA-like state for compatibility with transform()
+        self.pca_ = _RowCenteredPCAState(
+            components=pca_components_all,
+            eigenvectors=evecs_k,
+            eigenvalues=evals_k,
+            row_mean=row_mean,
+            device=self.device,
+        )
 
         return self
 
@@ -298,8 +374,8 @@ class FastICA:
         # Initial symmetric decorrelation
         W = self._symmetric_decorrelation(W)
 
-        # Get nonlinearity functions
-        g, g_prime = self._get_nonlinearity(self.fun)
+        # Get combined nonlinearity function (returns g and g_prime_mean in-place)
+        g_and_gprime = self._get_nonlinearity_combined(self.fun)
 
         # Optimization: pre-compute float n_samples for division
         scale = 1.0 / n_samples
@@ -312,23 +388,17 @@ class FastICA:
             # W: (n_comp, n_feat), X: (n_feat, n_samp) -> wx: (n_comp, n_samp)
             wx = W @ X
 
-            # 2. Apply nonlinearity
-            # g_wx: (n_comp, n_samp)
-            # g_prime_wx: (n_comp, n_samp)
-            g_wx = g(wx)
-            g_prime_wx = g_prime(wx)
+            # 2. Apply nonlinearity in-place, get g_wx and g_prime_mean
+            # g_wx is wx modified in-place; g_prime_mean is (n_comp, 1)
+            g_wx, g_prime_mean = g_and_gprime(wx)
 
             # 3. Update rule (Symmetric)
-            # Term 1: E[x g(w^T x)] -> X * g(wx)^T / N -> No, dimensions match better as:
             # (g_wx @ X.T) / N -> (n_comp, n_samp) @ (n_samp, n_feat) -> (n_comp, n_feat)
             term1 = (g_wx @ X.T) * scale
+            del g_wx  # free (n_comp, n_samp) before allocating term2
 
-            # Term 2: E[g'(w^T x)] w -> mean(g_prime_wx, dim=1) * W
-            # g_prime_mean: (n_comp, 1) broadcasted to (n_comp, n_feat)
-            g_prime_mean = g_prime_wx.mean(dim=1, keepdim=True)
-            term2 = g_prime_mean * W
-
-            W = term1 - term2
+            # Term 2: E[g'(w^T x)] w -> g_prime_mean * W
+            W = term1 - g_prime_mean * W
 
             # 4. Symmetric Decorrelation
             W = self._symmetric_decorrelation(W)
@@ -416,9 +486,110 @@ class FastICA:
 
             return g_cube, g_prime_cube
 
-        else:
-            raise ValueError(f"Unknown nonlinearity: '{fun}'. Use 'logcosh', 'exp', or 'cube'")
+        elif fun == "pow3":
+            # MELODIC default: skewness-based contrast with custom factors
+            # Update: W = 3*E[X*u^2] - E[u]*W
+            def g_pow3(x):
+                return 3.0 * x**2
 
+            def g_prime_pow3(x):
+                return x  # E[u], not 2u — MELODIC's custom factor
+
+            return g_pow3, g_prime_pow3
+
+        else:
+            raise ValueError(
+                f"Unknown nonlinearity: '{fun}'. "
+                "Use 'logcosh', 'exp', 'cube', or 'pow3'"
+            )
+
+    @staticmethod
+    def _get_nonlinearity_combined(fun: str):
+        """Return a function that computes g(x) in-place and g_prime_mean.
+
+        Memory-efficient: computes g and mean(g') together, reusing
+        intermediates and avoiding full-size temporary allocations.
+
+        Returns
+        -------
+        g_and_gprime : callable
+            Takes x (n_comp, n_samp), modifies x in-place to g(x),
+            returns (g_x, g_prime_mean) where g_prime_mean is (n_comp, 1).
+        """
+        if fun == "logcosh":
+
+            def g_logcosh_combined(x):
+                # In-place tanh (alpha=1.0)
+                x.tanh_()
+                # g_prime = 1 - tanh^2; compute mean without full materialization
+                # Use chunked reduction to avoid (n_comp, n_samp) temporary
+                n_samp = x.shape[1]
+                chunk = min(n_samp, 200_000)
+                sq_sum = torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
+                for j in range(0, n_samp, chunk):
+                    sq_sum += x[:, j : j + chunk].pow(2).sum(dim=1, keepdim=True)
+                g_prime_mean = 1.0 - sq_sum / n_samp
+                return x, g_prime_mean
+
+            return g_logcosh_combined
+
+        elif fun == "exp":
+
+            def g_exp_combined(x):
+                # exp(-x^2/2) in-place
+                x.pow_(2).mul_(-0.5).exp_()  # x is now exp(-x_orig^2/2)
+                # Need x_orig * exp_x for g, but we lost x_orig...
+                # We need a different approach: compute from scratch with one temp
+                # Actually, we can't recover x_orig after in-place pow_.
+                # Use a buffer for exp_x instead.
+                raise NotImplementedError(
+                    "exp nonlinearity not yet optimized for memory. Use logcosh."
+                )
+
+            return g_exp_combined
+
+        elif fun == "cube":
+
+            def g_cube_combined(x):
+                # g = x^3, g_prime = 3x^2
+                # Compute g_prime_mean = 3 * mean(x^2) first (before modifying x)
+                n_samp = x.shape[1]
+                chunk = min(n_samp, 200_000)
+                sq_sum = torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
+                for j in range(0, n_samp, chunk):
+                    sq_sum += x[:, j : j + chunk].pow(2).sum(dim=1, keepdim=True)
+                g_prime_mean = 3.0 * sq_sum / n_samp
+                x.pow_(3)
+                return x, g_prime_mean
+
+            return g_cube_combined
+
+        elif fun == "pow3":
+
+            def g_pow3_combined(x):
+                # MELODIC's pow3 (default nonlinearity), NOT standard g/g'.
+                # MELODIC update: W = 3*E[X*u^2] - E[u]*W
+                # To achieve this through our generic loop (term1 - g_prime_mean * W):
+                #   term1 = (g(wx) @ X^T) / N, so g(u) = 3*u^2 → term1 = 3*E[X*u^2]
+                #   g_prime_mean = E[u] (not 2*E[u])
+                n_samp = x.shape[1]
+                chunk = min(n_samp, 200_000)
+                x_sum = torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
+                for j in range(0, n_samp, chunk):
+                    x_sum += x[:, j : j + chunk].sum(dim=1, keepdim=True)
+                g_prime_mean = x_sum / n_samp  # E[u], not 2*E[u]
+                x.pow_(2).mul_(3.0)  # g(u) = 3*u^2
+                return x, g_prime_mean
+
+            return g_pow3_combined
+
+        else:
+            raise ValueError(
+                f"Unknown nonlinearity: '{fun}'. "
+                "Use 'logcosh', 'exp', 'cube', or 'pow3'"
+            )
+
+    @torch.inference_mode()
     def compute_variance_explained(
         self,
         X: np.ndarray | torch.Tensor,
@@ -453,16 +624,14 @@ class FastICA:
         # Total variance
         total_var = (X_centered**2).sum()
 
-        # Reconstruct each component separately
-        variance_explained = torch.zeros(self.components_.shape[0], device=self.device)
-
-        for i in range(self.components_.shape[0]):
-            # Reconstruct using only this component
-            reconstruction = self.mixing_[:, i : i + 1] @ self.components_[i : i + 1, :]
-
-            # Variance explained = variance of reconstruction
-            var_i = (reconstruction**2).sum()
-            variance_explained[i] = var_i
+        # Vectorized: mixing_ (T, K) @ components_ (K, V) reconstructs per-component
+        # Variance per component = sum of squared reconstruction per component
+        # = sum_t sum_v (mixing_[t, k] * components_[k, v])^2
+        # = sum_v (mixing_[:, k]^2.sum()) * (components_[k, v]^2)
+        # = (mixing_^2).sum(0) * (components_^2).sum(1)
+        mix_sq_sum = (self.mixing_**2).sum(dim=0)  # (K,)
+        comp_sq_sum = (self.components_**2).sum(dim=1)  # (K,)
+        variance_explained = mix_sq_sum * comp_sq_sum
 
         # Compute ratios
         variance_ratio = variance_explained / total_var

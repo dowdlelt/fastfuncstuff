@@ -10,11 +10,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import nibabel as nib
 import numpy as np
 import torch
 
-from fastfuncstuff.io.afni import get_tr_from_file
+from fastfuncstuff.io.afni import get_tr_from_file, load_nifti, save_nifti
 
 
 def save_masked_component_maps_4d(
@@ -41,7 +40,7 @@ def save_masked_component_maps_4d(
 
     out_path = Path(out_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(out, affine), str(out_path))
+    save_nifti(out, output_path=out_path, affine=affine)
     return out_path
 
 
@@ -66,7 +65,7 @@ def save_masked_component_map_3d(
 
     out_path = Path(out_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(out, affine), str(out_path))
+    save_nifti(out, output_path=out_path, affine=affine)
     return out_path
 
 
@@ -111,12 +110,12 @@ def write_melodic_compat_outputs(
     safe_relative_symlink(tcs, compat / "melodic_mix")
     safe_relative_symlink(tcs, compat / "melodic_Tmodes")
 
-    nib.save(nib.Nifti1Image(mean3d.astype(np.float32), affine), str(compat / "mean.nii.gz"))
+    save_nifti(mean3d.astype(np.float32), output_path=compat / "mean.nii.gz", affine=affine)
     if mask3d is None:
         mask_out = np.ones(shape3d, dtype=np.float32)
     else:
         mask_out = mask3d.astype(np.float32)
-    nib.save(nib.Nifti1Image(mask_out, affine), str(compat / "mask.nii.gz"))
+    save_nifti(mask_out, output_path=compat / "mask.nii.gz", affine=affine)
 
     ftmix = np.abs(np.fft.rfft(mixing_np, axis=0)) ** 2
     if ftmix.shape[0] > 1:
@@ -193,7 +192,7 @@ def save_component_maps(
     n_components, n_voxels = components.shape
 
     # Load mask to get geometry
-    mask_img = nib.load(str(mask_file))
+    mask_img = load_nifti(mask_file)
     mask_data = mask_img.get_fdata()
     mask_bool = mask_data > 0
 
@@ -211,22 +210,13 @@ def save_component_maps(
     for i in range(n_components):
         output_data[..., i][mask_bool] = components[i]
 
-    # Create NIfTI image
-    output_img = nib.Nifti1Image(output_data, mask_img.affine, mask_img.header)
-
-    # Add AFNI sub-brick labels if provided
+    # Validate labels if provided
     if labels is not None:
         if len(labels) != n_components:
             raise ValueError(f"Number of labels ({len(labels)}) != n_components ({n_components})")
 
-        # AFNI-style sub-brick labels
-        label_str = "~".join(labels)
-        output_img.header.extensions.append(
-            nib.nifti1.Nifti1Extension("afni", f"BRICK_LABS={label_str}".encode())
-        )
-
     # Save
-    nib.save(output_img, str(output_file))
+    save_nifti(output_data, output_path=output_file, affine=mask_img.affine)
 
 
 def load_component_maps(
@@ -256,13 +246,13 @@ def load_component_maps(
     >>> print(f"Loaded {components.shape[0]} components")
     """
     # Load mask
-    mask_img = nib.load(str(mask_file))
+    mask_img = load_nifti(mask_file)
     mask_data = mask_img.get_fdata()
     mask_bool = mask_data > 0
     n_voxels = mask_bool.sum()
 
     # Load component maps
-    map_img = nib.load(str(map_file))
+    map_img = load_nifti(map_file)
     map_data = map_img.get_fdata()
 
     if map_data.ndim != 4:
@@ -364,16 +354,8 @@ def save_timeseries(
         # Create 4D volume (1 x 1 x n_timepoints x n_components)
         data_4d = timeseries.T.reshape(1, 1, n_timepoints, n_components)
 
-        # Create affine (identity with TR in pixdim)
-        affine = np.eye(4)
-
-        # Create header with TR
-        header = nib.Nifti1Header()
-        header["pixdim"][4] = tr
-
-        # Create and save image
-        img = nib.Nifti1Image(data_4d, affine, header)
-        nib.save(img, str(output_path))
+        # Save with identity affine and TR
+        save_nifti(data_4d, output_path=output_path, tr=tr)
 
     else:
         raise ValueError(f"Unsupported file extension: {output_path.suffix}. Use .1D or .nii.gz")
@@ -426,7 +408,7 @@ def load_timeseries(
 
     elif path.suffix == ".gz" or path.suffixes == [".nii", ".gz"]:
         # Load NIfTI
-        img = nib.load(str(path))
+        img = load_nifti(path)
         data = img.get_fdata()
 
         # Reshape from (1, 1, n_timepoints, n_components) to (n_timepoints, n_components)
