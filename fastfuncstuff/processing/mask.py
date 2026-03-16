@@ -140,15 +140,19 @@ def _largest_component_gpu(mask: Tensor, vol: Tensor | None = None) -> Tensor:
     mask_5d = mask_f[None, None]
 
     prev_count = 1
-    for _ in range(max(nz, ny, nx)):  # worst case: diagonal of volume
+    check_every = 10
+    max_iter = max(nz, ny, nx)
+    for i in range(max_iter):  # worst case: diagonal of volume
         # Dilate seed
         seed_5d = F.max_pool3d(seed_5d, kernel_size=3, stride=1, padding=1)
         # AND with mask
         seed_5d = seed_5d * mask_5d
-        new_count = int((seed_5d > 0.5).sum().item())
-        if new_count == prev_count:
-            break  # converged
-        prev_count = new_count
+        # Check convergence periodically to avoid GPU sync overhead
+        if (i + 1) % check_every == 0 or i == max_iter - 1:
+            new_count = int((seed_5d > 0.5).sum().item())
+            if new_count == prev_count:
+                break  # converged
+            prev_count = new_count
 
     return seed_5d[0, 0] > 0.5
 
@@ -183,14 +187,18 @@ def _fill_holes_3d(mask: Tensor) -> Tensor:
     seed_5d = seed[None, None]
     bg_5d = bg[None, None]
 
+    check_every = 10
+    max_iter = max(nz, ny, nx)
     prev_count = int((seed_5d > 0.5).sum().item())
-    for _ in range(max(nz, ny, nx)):
+    for i in range(max_iter):
         seed_5d = F.max_pool3d(seed_5d, kernel_size=3, stride=1, padding=1)
         seed_5d = seed_5d * bg_5d
-        new_count = int((seed_5d > 0.5).sum().item())
-        if new_count == prev_count:
-            break
-        prev_count = new_count
+        # Check convergence periodically to avoid GPU sync overhead
+        if (i + 1) % check_every == 0 or i == max_iter - 1:
+            new_count = int((seed_5d > 0.5).sum().item())
+            if new_count == prev_count:
+                break
+            prev_count = new_count
 
     # Exterior background = reachable from border
     exterior = seed_5d[0, 0] > 0.5

@@ -25,7 +25,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from .interp import trilinear_interpolate, warp_image_wsinc5
-from .io import load_image, load_warp_field, save_image
+from .io import derive_mean_output_path, load_image, load_warp_field, save_image
 
 
 @dataclass
@@ -720,6 +720,7 @@ def nwarpforge(
     verb: int = 1,
     time_range: tuple[int, int] | None = None,
     debug: bool = False,
+    save_mean: bool = False,
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -871,3 +872,13 @@ def nwarpforge(
 
     if verb >= 1:
         print(f"Saved: {prefix}")
+
+    if save_mean:
+        if output.ndim == 4:
+            mean_path = derive_mean_output_path(prefix)
+            mean_image = output.mean(dim=0)
+            save_image(mean_image, mean_path, header_info=output_header)
+            if verb >= 1:
+                print(f"Saved mean: {mean_path}")
+        elif verb >= 1:
+            print("-save_mean requested, but output is not 4D; skipping mean output")

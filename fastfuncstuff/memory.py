@@ -387,6 +387,31 @@ def bytes_per_voxel_denoise(
     return (6 * n_timepoints + n_noise_pcs) * 4
 
 
+def bytes_per_voxel_ica_varnorm(
+    n_timepoints: int,
+) -> int:
+    """
+    Estimate memory per voxel for ICA variance normalization chunked ops.
+
+    The MELODIC varnorm step computes residual = x_t - dewhite @ ws per voxel,
+    then takes std.  When chunked, the peak per-voxel cost is:
+      - reconstruction column (T floats)
+      - residual column       (T floats)
+
+    Parameters
+    ----------
+    n_timepoints : int
+        Number of timepoints
+
+    Returns
+    -------
+    int
+        Bytes per voxel (float32)
+    """
+    # reconstruction + residual, both (T,) per voxel
+    return n_timepoints * 4 * 2
+
+
 def bytes_per_voxel_arma(
     n_timepoints: int,
     n_regressors: int,
@@ -807,6 +832,8 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_ridge(n_timepoints, n_regressors)
     elif operation == "denoise":
         bytes_per_voxel = bytes_per_voxel_denoise(n_timepoints, n_regressors)
+    elif operation == "ica_varnorm":
+        bytes_per_voxel = bytes_per_voxel_ica_varnorm(n_timepoints)
     elif operation == "arma":
         bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
     else:

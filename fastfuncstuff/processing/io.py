@@ -21,6 +21,27 @@ except ImportError:
     nib = None
 
 
+def derive_mean_output_path(prefix: str | Path) -> str:
+    """Build mean-image output path as mean_{basename}{ext} in same directory.
+
+    Examples:
+        epi_mc.nii.gz -> mean_epi_mc.nii.gz
+        /tmp/out.nii  -> /tmp/mean_out.nii
+        out           -> mean_out
+    """
+    p = Path(prefix)
+    name = p.name
+
+    if name.endswith(".nii.gz"):
+        stem = name[:-7]
+        ext = ".nii.gz"
+    else:
+        ext = p.suffix
+        stem = p.stem if ext else name
+
+    return str(p.with_name(f"mean_{stem}{ext}"))
+
+
 def _require_nibabel() -> None:
     if nib is None:
         raise ImportError(

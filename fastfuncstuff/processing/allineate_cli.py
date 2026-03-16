@@ -25,7 +25,7 @@ from .affine import (
     save_matrix_1D,
 )
 from .allineate import AffineAlignConfig, allineate
-from .io import load_image, save_image
+from .io import derive_mean_output_path, load_image, save_image
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -69,6 +69,11 @@ Examples:
                           help="Apply existing matrix (skip alignment)")
     io_group.add_argument("-base_index", type=int, default=None,
                           help="Use volume N from 4D base")
+    io_group.add_argument(
+        "-save_mean",
+        action="store_true",
+        help="If source is 4D, save mean output as mean_{prefix_basename}{ext}",
+    )
 
     # --- Alignment mode ---
     mode_group = parser.add_argument_group("Alignment mode")
@@ -318,6 +323,15 @@ def main(argv: list[str] | None = None) -> None:
         save_image(result_4d, args.prefix, header_info=base_header)
         if verb >= 1:
             print(f"Saved 4D result: {args.prefix}")
+
+        if args.save_mean:
+            mean_path = derive_mean_output_path(args.prefix)
+            mean_image = result_4d.mean(dim=0)
+            save_image(mean_image, mean_path, header_info=base_header)
+            if verb >= 1:
+                print(f"Saved mean: {mean_path}")
+    elif args.save_mean and verb >= 1:
+        print("-save_mean requested, but source is not 4D; skipping mean output")
 
     if verb >= 1:
         print(f"Total time: {time.time() - t0:.2f}s")

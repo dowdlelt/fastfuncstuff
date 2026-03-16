@@ -737,6 +737,12 @@ def moco(
     # Create compiled versions of hot-path functions for CUDA (reduces kernel launch overhead)
     if config.compile and device.type == "cuda":
         torch.set_float32_matmul_precision("high")
+        # Enable persistent compile cache so subsequent runs with the same
+        # input shape skip recompilation (~/.cache/torch/inductor/).
+        import os
+        os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+        if config.verb >= 1:
+            print("  torch.compile: compiling (first volume will be slow, cached for next run) ...")
         if config.fixed_iter:
             # In fast mode, compile the entire GN loop (not individual functions)
             # This allows the compiler to trace through everything and fuse

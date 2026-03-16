@@ -103,9 +103,10 @@ def to_tensor(
     x: torch.Tensor | np.ndarray | list | tuple,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
+    pin: bool = False,
 ) -> torch.Tensor:
     """
-    Convert input to torch tensor with specified dtype and device
+    Convert input to torch tensor with specified dtype and device.
 
     Parameters
     ----------
@@ -115,6 +116,9 @@ def to_tensor(
         Target dtype
     device : torch.device, optional
         Target device. If None, keep on current device
+    pin : bool, default=False
+        If True and transferring to a CUDA device, use pinned (page-locked)
+        memory for the intermediate CPU tensor to speed up the transfer.
 
     Returns
     -------
@@ -126,9 +130,26 @@ def to_tensor(
         x = x.to(dtype=dtype)
 
     if device is not None:
-        x = x.to(device=device)
+        if pin and device.type == "cuda" and x.device.type == "cpu":
+            x = x.pin_memory().to(device=device, non_blocking=True)
+        else:
+            x = x.to(device=device)
 
     return x
+
+
+def configure_torch_backends(device: torch.device) -> None:
+    """Configure PyTorch backends for optimal performance.
+
+    Call once at the start of a CLI entry-point after selecting the device.
+
+    Sets:
+      - float32 matmul precision to 'high' (use TF32 on Ampere+)
+      - cudnn.benchmark = True (autotuner for convolutions)
+    """
+    torch.set_float32_matmul_precision("high")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
 
 def calc_memory_usage(shape: tuple, dtype: torch.dtype = torch.float32) -> float:

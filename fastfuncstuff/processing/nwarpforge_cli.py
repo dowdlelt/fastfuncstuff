@@ -65,6 +65,11 @@ Examples:
     )
     io_group.add_argument("-prefix", required=True, help="Output dataset path")
     io_group.add_argument(
+        "-save_mean",
+        action="store_true",
+        help="If output is 4D, save mean as mean_{prefix_basename}{ext}",
+    )
+    io_group.add_argument(
         "-master",
         default=None,
         help="Master dataset defining output grid. "
@@ -159,6 +164,7 @@ def main(argv: list[str] | None = None) -> None:
         verb=verb,
         time_range=time_range,
         debug=args.debug,
+        save_mean=args.save_mean,
     )
 
     if verb >= 1:

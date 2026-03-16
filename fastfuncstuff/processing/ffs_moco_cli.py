@@ -22,7 +22,7 @@ from .ffs_moco import (
     save_moco_aff12,
     save_moco_dfile,
 )
-from .io import load_image, save_image
+from .io import derive_mean_output_path, load_image, save_image
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -153,6 +153,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     out_group.add_argument(
         "-iterfile", default=None, help="Save iterations per volume (.1D)"
     )
+    out_group.add_argument(
+        "-save_mean",
+        action="store_true",
+        help="Save mean of output timeseries as mean_{prefix_basename}{ext}",
+    )
 
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
@@ -245,6 +250,13 @@ def main(argv: list[str] | None = None) -> None:
     save_image(result.aligned, args.prefix, header_info=header_info)
     if verb >= 1:
         print(f"Saved: {args.prefix}")
+
+    if args.save_mean:
+        mean_path = derive_mean_output_path(args.prefix)
+        mean_image = result.aligned.mean(dim=0)
+        save_image(mean_image, mean_path, header_info=header_info)
+        if verb >= 1:
+            print(f"Saved mean: {mean_path}")
 
     # Motion parameters
     onedfile = getattr(args, "1Dfile", None)

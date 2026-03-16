@@ -87,10 +87,7 @@ def _clip_level(vol: Tensor, frac: float = 0.5) -> float:
     v = vol[vol > 0]
     if v.numel() == 0:
         return 1.0
-    sorted_v, _ = v.sort()
-    idx = int(frac * sorted_v.numel())
-    idx = min(idx, sorted_v.numel() - 1)
-    return float(sorted_v[idx].item())
+    return float(v.quantile(frac).item())
 
 
 def _gaussian_smooth_3d(vol: Tensor, sigma: float) -> Tensor:
