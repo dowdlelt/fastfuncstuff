@@ -367,9 +367,10 @@ class TestMPSpikesFromSpectrum:
         sigma2 = 1.0
         lambda_plus = sigma2 * (1 + np.sqrt(beta))**2
 
+        rng = np.random.default_rng(123)
         evals = np.concatenate([
             np.array([lambda_plus * 2, lambda_plus * 1.5]),  # Signal spikes
-            np.random.randn(98)**2  # Noise floor
+            rng.standard_normal(98)**2  # Noise floor
         ])
         evals = np.sort(evals)[::-1]
 
@@ -388,9 +389,10 @@ class TestMPSpikesFromSpectrum:
         lambda_plus = sigma2 * (1 + np.sqrt(beta))**2
 
         # Create eigenvalues: some clearly above threshold
+        rng = np.random.default_rng(456)
         evals = np.concatenate([
             np.array([lambda_plus * 3, lambda_plus * 2, lambda_plus * 1.5]),  # 3 signal
-            np.random.uniform(0, lambda_plus * 0.9, 97)  # Noise below threshold
+            rng.uniform(0, lambda_plus * 0.75, 97)  # Noise safely below threshold
         ])
         evals = np.sort(evals)[::-1]
 

@@ -267,6 +267,7 @@ def apply_melodic_voxel_varnorm(
     )
 
     noise_std = torch.empty(n_vox, device=x_t.device)
+    input_std = torch.std(x_t, dim=0, unbiased=True)
     n_chunks = (n_vox + chunk_size - 1) // chunk_size
     for v0 in tqdm(
         range(0, n_vox, chunk_size),
@@ -282,7 +283,7 @@ def apply_melodic_voxel_varnorm(
 
     del ws  # free (dim, V) before normalization
 
-    const_mask = noise_std < 0.01
+    const_mask = (noise_std < 0.01) | (input_std < 1e-6)
     safe_std = torch.where(const_mask, torch.ones_like(noise_std), noise_std)
 
     # In-place normalization (avoids allocating a second (T, V) tensor)
