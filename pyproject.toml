@@ -9,7 +9,7 @@ description = "Fast GPU-accelerated utilities functional MRI simulation and GLM 
 readme = "README.md"
 license = "MIT"
 authors = [{name = "Logan Dowdle"}]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.23",
     "torch>=2.0",
@@ -21,6 +21,7 @@ dependencies = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",

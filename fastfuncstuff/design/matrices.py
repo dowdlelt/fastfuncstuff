@@ -1270,12 +1270,7 @@ def save_iresp(
     ... )
     >>> # Creates: results/GLM_iresp_faces.nii.gz, results/GLM_iresp_scenes.nii.gz
     """
-    try:
-        import nibabel as nib
-    except ImportError as err:
-        raise ImportError(
-            "nibabel is required to save NIfTI files. Install with: pip install nibabel"
-        ) from err
+    from fastfuncstuff.io.afni import save_nifti
 
     if iresp.ndim != 5:
         raise ValueError(
@@ -1286,7 +1281,8 @@ def save_iresp(
 
     # Get affine matrix
     if reference_img is not None:
-        ref_img = nib.load(reference_img)
+        from fastfuncstuff.io.afni import load_nifti
+        ref_img = load_nifti(reference_img)
         affine = ref_img.affine
     elif affine is None:
         # Default identity affine
@@ -1312,18 +1308,9 @@ def save_iresp(
         # Extract this condition's HRF: (nx, ny, nz, n_lags)
         cond_hrf = iresp[:, :, :, cond_idx, :]
 
-        # Create NIfTI image with TR in header
-        img = nib.Nifti1Image(cond_hrf, affine)
-        img.header.set_xyzt_units(xyz="mm", t="sec")
-        img.header["pixdim"][4] = tr  # Set TR
-
-        # Add description
-        description = f"HRF estimate: {label} (bot={bot}s, top={top}s, n={n_lags})"
-        img.header["descrip"] = description[:80]  # Max 80 chars
-
         # Save file
         output_file = f"{output_prefix}_iresp_{label}.nii.gz"
-        nib.save(img, output_file)
+        save_nifti(cond_hrf, output_path=output_file, affine=affine, tr=tr)
         output_files.append(output_file)
 
     return output_files

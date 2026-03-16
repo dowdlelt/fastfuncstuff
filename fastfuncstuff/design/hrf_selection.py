@@ -2376,7 +2376,7 @@ def _save_volume(
     voxel_mask: torch.Tensor | None,
 ):
     """Helper to save a 1D tensor as a 3D NIfTI volume."""
-    import nibabel as nib
+    from fastfuncstuff.io.afni import save_nifti
 
     data_np = data.cpu().numpy()
 
@@ -2395,8 +2395,7 @@ def _save_volume(
     if affine is None:
         affine = np.eye(4)
 
-    img = nib.Nifti1Image(volume_data.astype(np.float32), affine)
-    nib.save(img, filepath)
+    save_nifti(volume_data.astype(np.float32), output_path=filepath, affine=affine)
 
 
 def _save_volume_4d(
@@ -2407,7 +2406,7 @@ def _save_volume_4d(
     voxel_mask: torch.Tensor | None,
 ):
     """Helper to save a 2D tensor (n_voxels, n_volumes) as a 4D NIfTI volume."""
-    import nibabel as nib
+    from fastfuncstuff.io.afni import save_nifti
 
     data_np = data.cpu().numpy()  # (n_voxels, n_volumes)
     n_volumes = data_np.shape[1]
@@ -2428,8 +2427,7 @@ def _save_volume_4d(
     if affine is None:
         affine = np.eye(4)
 
-    img = nib.Nifti1Image(volume_data.astype(np.float32), affine)
-    nib.save(img, filepath)
+    save_nifti(volume_data.astype(np.float32), output_path=filepath, affine=affine)
 
 
 def plot_design_matrix(
