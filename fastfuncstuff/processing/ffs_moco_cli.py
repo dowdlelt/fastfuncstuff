@@ -23,6 +23,7 @@ from .ffs_moco import (
     save_moco_dfile,
 )
 from .io import derive_mean_output_path, load_image, save_image
+from fastfuncstuff.cli_utils import parse_prefix
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -247,12 +248,14 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Total registration: {time.time() - t1:.2f}s")
 
     # --- Save outputs ---
-    save_image(result.aligned, args.prefix, header_info=header_info)
+    pfx = parse_prefix(args.prefix)
+    out_path = pfx.as_file()
+    save_image(result.aligned, out_path, header_info=header_info)
     if verb >= 1:
-        print(f"Saved: {args.prefix}")
+        print(f"Saved: {out_path}")
 
     if args.save_mean:
-        mean_path = derive_mean_output_path(args.prefix)
+        mean_path = derive_mean_output_path(out_path)
         mean_image = result.aligned.mean(dim=0)
         save_image(mean_image, mean_path, header_info=header_info)
         if verb >= 1:

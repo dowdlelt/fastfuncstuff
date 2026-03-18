@@ -118,7 +118,9 @@ def save_image(
     elif arr.ndim == 4:
         arr = arr.transpose(3, 2, 1, 0)
 
-    save_nifti(arr.astype(np.float32), output_path=path, affine=affine)
+    # Extract header from header_info to preserve TR, xyzt_units, etc.
+    header = header_info.get("header") if header_info is not None else None
+    save_nifti(arr.astype(np.float32), output_path=path, affine=affine, header=header)
 
 
 def save_warp_field(

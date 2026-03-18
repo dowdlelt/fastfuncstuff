@@ -812,6 +812,7 @@ def moco(
         ncols=80,
     )
 
+    # ── Pass 1: estimate parameters ──────────────────────────────────────
     for t in pbar:
         # Mark step begin for CUDA graphs (prevents output tensor reuse issues)
         if use_cudagraphs:
@@ -819,12 +820,11 @@ def moco(
 
         if t == config.base_index and base_vol is None:
             # Base volume — identity transform, just copy
-            aligned[t] = timeseries[t]
             mat = params_to_matrix(identity)
             matrices_vox[t] = mat.cpu()
             all_params[t] = identity.cpu().numpy()
             rms_before[t] = 0.0
-            rms_after[t] = 0.0
+            n_iters[t] = 0
             continue
 
         # Load source volume to GPU
@@ -1035,14 +1035,46 @@ def moco(
                         dph_thresh=config.dph_thresh,
                     )
 
-        # Store results
+        # Store parameters (no resampling yet)
         prev_params = params.clone()
         mat = _p2m(params)
         matrices_vox[t] = mat.cpu()
         all_params[t] = params.detach().cpu().numpy()
         n_iters[t] = n_iter
 
-        # Final resample with high-quality interpolation
+        if not disable_pbar:
+            pbar.set_postfix(it=n_iter, rms0=f"{rms_before[t]:.1f}", refresh=False)
+
+        if config.verb >= 2:
+            pbar.write(f"  Vol {t:4d}: {n_iter:2d} iter, rms_before={rms_before[t]:.4f}")
+
+    if not disable_pbar:
+        pbar.close()
+
+    if config.verb >= 1:
+        elapsed = time.time() - t_start
+        per_vol = elapsed / max(nt - 1, 1)
+        print(f"  Estimation: {elapsed:.2f}s ({per_vol:.3f}s/vol)")
+
+    # ── Pass 2: batch resample with final interpolation ────────────────
+    t_resample = time.time()
+    resample_pbar = tqdm(
+        range(nt),
+        desc="  Resampling",
+        disable=disable_pbar,
+        unit="vol",
+        ncols=80,
+    )
+
+    for t in resample_pbar:
+        if t == config.base_index and base_vol is None:
+            aligned[t] = timeseries[t]
+            rms_after[t] = 0.0
+            continue
+
+        source = timeseries[t].to(device=device, dtype=dtype)
+        mat = matrices_vox[t].to(device=device, dtype=dtype)
+
         aligned_vol = apply_affine_interp(
             source, mat, config.final_interp, vol_shape, zero_outside=True
         )
@@ -1050,26 +1082,13 @@ def moco(
         aligned[t] = aligned_vol.cpu()
         rms_after[t] = _unweighted_rms(base_est, aligned_vol)
 
-        # Update progress bar with current RMS
-        if not disable_pbar:
-            pbar.set_postfix(
-                rms=f"{rms_before[t]:.1f}→{rms_after[t]:.1f}", refresh=False
-            )
-
-        if config.verb >= 2:
-            pbar.write(
-                f"  Vol {t:4d}: {n_iter:2d} iter, "
-                f"rms {rms_before[t]:.4f} -> {rms_after[t]:.4f}"
-            )
-
-    # Close progress bar
     if not disable_pbar:
-        pbar.close()
+        resample_pbar.close()
 
     if config.verb >= 1:
-        elapsed = time.time() - t_start
-        per_vol = elapsed / max(nt - 1, 1)
-        print(f"  Registration: {elapsed:.2f}s ({per_vol:.3f}s/vol)")
+        elapsed_resample = time.time() - t_resample
+        per_vol_resample = elapsed_resample / max(nt - 1, 1)
+        print(f"  Resampling: {elapsed_resample:.2f}s ({per_vol_resample:.3f}s/vol)")
 
     # Convert to DICOM-space matrices and extract params
     affine = header_info["affine"] if header_info else np.eye(4)

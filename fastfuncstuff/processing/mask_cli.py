@@ -1,9 +1,9 @@
-"""CLI for GPU automask creation.
+"""CLI for GPU automask creation (AFNI-compatible).
 
-Command: automask (registered as entry point in pyproject.toml)
+Command: ffs_util_automask (registered as entry point in pyproject.toml)
 
 Usage:
-    automask -input vol.nii -prefix mask.nii [-clip_frac 0.3] [-dilate 2] [-device cuda]
+    ffs_util_automask -input vol.nii -prefix mask.nii [-clfrac 0.5] [-dilate 0] [-device cuda]
 """
 
 from __future__ import annotations
@@ -19,24 +19,42 @@ from .mask import automask
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="automask",
-        description="Create a binary brain mask from a 3D volume (GPU-accelerated)",
+        prog="ffs_util_automask",
+        description="Create a binary brain mask from a 3D volume (GPU, AFNI-compatible)",
     )
     parser.add_argument("-input", required=True, help="Input volume (.nii/.nii.gz)")
     parser.add_argument("-prefix", required=True, help="Output mask file")
-    parser.add_argument("-clip_frac", type=float, default=0.3,
-                        help="Fraction of clip level for threshold (default: 0.3)")
-    parser.add_argument("-dilate", type=int, default=2,
-                        help="Extra dilation iterations (default: 2)")
+    parser.add_argument(
+        "-clfrac",
+        type=float,
+        default=0.5,
+        help="Clip-level fraction for THD_cliplevel (default: 0.5, matching AFNI)",
+    )
+    parser.add_argument(
+        "-dilate", type=int, default=0, help="Extra dilation iterations after mask (default: 0)"
+    )
+    parser.add_argument(
+        "-peelcount", type=int, default=1, help="Peel erosion iterations (AFNI default: 1)"
+    )
+    parser.add_argument(
+        "-peelthr",
+        type=int,
+        default=17,
+        help="Min 18-neighbors to survive peeling (AFNI default: 17)",
+    )
+    # Keep -clip_frac as hidden alias for backwards compat
+    parser.add_argument("-clip_frac", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
-    parser.add_argument("-verb", type=int, default=1, choices=[0, 1],
-                        help="Verbosity (0/1)")
+    parser.add_argument("-verb", type=int, default=1, choices=[0, 1], help="Verbosity (0/1)")
 
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+
+    # Handle backwards-compat alias
+    clip_frac = args.clip_frac if args.clip_frac is not None else args.clfrac
 
     # Device selection
     if args.device:
@@ -64,7 +82,15 @@ def main(argv: list[str] | None = None) -> None:
     if verb >= 1:
         print(f"Input: {args.input} {vol.shape}")
 
-    mask = automask(vol, clip_frac=args.clip_frac, dilate_extra=args.dilate, device=device)
+    mask = automask(
+        vol,
+        clip_frac=clip_frac,
+        dilate_extra=args.dilate,
+        peelcount=args.peelcount,
+        peelthr=args.peelthr,
+        device=device,
+        verbose=verb >= 1,
+    )
 
     # Save as short integer (0/1)
     mask_out = mask.short()
