@@ -63,14 +63,126 @@ except ImportError as exc:  # pragma: no cover - nibabel is required for AFNI in
 from fastfuncstuff.utils import get_device, to_tensor
 
 
+def parse_subbrick_selector(path: str | Path) -> tuple[str, list[int] | None]:
+    """Parse AFNI-style sub-brick selectors from a file path.
+
+    Supports the following selector syntax appended to a file path:
+
+    - ``file.nii.gz[0]``            — single volume
+    - ``file.nii.gz[1,3,5]``        — specific volumes
+    - ``file.nii.gz[0..10]``        — range (inclusive)
+    - ``file.nii.gz[0..$]``         — range to last volume (resolved later)
+    - ``file.nii.gz[0..$(2)]``      — every 2nd volume (step)
+    - ``file.nii.gz[0..10(3)]``     — range with step
+
+    Quoting with single quotes around the selector (shell-style) is stripped
+    automatically: ``file.nii.gz'[0..5]'`` works the same as ``file.nii.gz[0..5]``.
+
+    Parameters
+    ----------
+    path : str or Path
+        File path, optionally with a ``[selector]`` suffix.
+
+    Returns
+    -------
+    clean_path : str
+        The file path with the selector removed.
+    indices : list[int] or None
+        Resolved volume indices, or *None* if no selector was present.
+        A ``$`` end-point is stored as -1 and resolved at load time.
+    """
+    path = str(path).strip().rstrip("'")
+    # Find the bracket selector — scan from the right to avoid matching
+    # brackets that might be in directory names.
+    bracket_start = path.rfind("[")
+    if bracket_start == -1:
+        return path, None
+
+    bracket_end = path.rfind("]")
+    if bracket_end == -1 or bracket_end < bracket_start:
+        return path, None
+
+    # Strip optional leading quote before '['
+    clean_path = path[:bracket_start].rstrip("'")
+    selector = path[bracket_start + 1 : bracket_end]
+
+    return clean_path, _parse_selector(selector)
+
+
+def _parse_selector(selector: str) -> list[int]:
+    """Parse the content inside brackets into a list of volume indices.
+
+    ``$`` is stored as -1 to be resolved once the number of volumes is known.
+    """
+    selector = selector.strip()
+
+    # Comma-separated list: 0,1,3,5
+    if "," in selector:
+        return [int(s.strip()) for s in selector.split(",")]
+
+    # Range: start..end  or  start..end(step)  or  start..$(step)
+    if ".." in selector:
+        range_part, _, step_part = selector.partition("(")
+        step = 1
+        if step_part:
+            step = int(step_part.rstrip(")"))
+
+        start_str, end_str = range_part.split("..", 1)
+        start = int(start_str.strip())
+
+        end_str = end_str.strip()
+        if end_str == "$" or end_str == "":
+            # -1 sentinel → resolve at load time
+            return _range_with_sentinel(start, -1, step)
+
+        end = int(end_str)
+        return list(range(start, end + 1, step))  # inclusive end, like AFNI
+
+    # Single index: 0
+    return [int(selector)]
+
+
+def _range_with_sentinel(start: int, end: int, step: int) -> list[int]:
+    """Build a range list; if *end* is -1, return a marker for deferred resolution."""
+    if end == -1:
+        # Store as (start, sentinel, step) encoded in a list with a negative marker.
+        # Convention: [-1, start, step] — the -1 first element flags deferred.
+        return [-1, start, step]
+    return list(range(start, end + 1, step))
+
+
+def _resolve_indices(indices: list[int], n_volumes: int) -> list[int]:
+    """Resolve deferred ``$`` selectors once the volume count is known."""
+    if indices and indices[0] == -1 and len(indices) == 3:
+        _, start, step = indices
+        return list(range(start, n_volumes, step))
+    # Validate explicit indices
+    for i in indices:
+        if i < 0:
+            raise ValueError(f"Negative volume index {i} is not valid")
+        if i >= n_volumes:
+            raise ValueError(
+                f"Volume index {i} out of range for image with {n_volumes} volumes"
+            )
+    return indices
+
+
 def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     """
     Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.
 
+    Supports AFNI-style sub-brick selectors appended to the path::
+
+        load_nifti("func.nii.gz[0]")          # first volume
+        load_nifti("func.nii.gz[1..$]")       # 2nd through last
+        load_nifti("func.nii.gz[0..250]")     # first 251 volumes
+        load_nifti("func.nii.gz[0..$(2)]")    # every 2nd volume
+        load_nifti("func.nii.gz[1,2,3,5]")    # specific volumes
+
     Parameters
     ----------
     filepath : str or Path
-        Path to NIfTI file. Supports:
+        Path to NIfTI file, optionally with ``[selector]`` suffix. Supports:
         - .nii (uncompressed)
         - .nii.gz (gzip compressed)
         - .nii.zst (zstandard compressed)
@@ -78,12 +190,12 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     Returns
     -------
     nib.Nifti1Image
-        Loaded NIfTI image
+        Loaded NIfTI image (sub-selected if a selector was given)
 
     Examples
     --------
     >>> img = load_nifti('func.nii.gz')
-    >>> img = load_nifti('func.nii.zst')
+    >>> img = load_nifti('func.nii.gz[0]')
     >>> data = img.get_fdata()
 
     Notes
@@ -91,7 +203,9 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     For .nii.zst files, requires zstd to be installed and available in PATH.
     The file is decompressed to a temporary file before loading with nibabel.
     """
-    filepath = Path(filepath)
+    # Parse sub-brick selector before resolving the path
+    clean_path, indices = parse_subbrick_selector(str(filepath))
+    filepath = Path(clean_path)
 
     if not filepath.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
@@ -137,10 +251,31 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
             # Clean up temporary file
             Path(tmp_path).unlink(missing_ok=True)
 
-        return img_inmem
+        img_out = img_inmem
 
-    # Standard nibabel loading for .nii and .nii.gz
-    return nib.load(str(filepath))
+    else:
+        # Standard nibabel loading for .nii and .nii.gz
+        img_out = nib.load(str(filepath))
+
+    # Apply sub-brick selection if requested
+    if indices is not None:
+        data = np.asarray(img_out.dataobj)
+        if data.ndim < 4:
+            raise ValueError(
+                f"Sub-brick selector requires a 4D image, got {data.ndim}D"
+            )
+        n_volumes = data.shape[3]
+        resolved = _resolve_indices(indices, n_volumes)
+        data = data[:, :, :, resolved]
+        header = img_out.header.copy()
+        # Update dim[4] for the new volume count
+        if data.ndim == 4:
+            header["dim"][4] = data.shape[3]
+        elif data.ndim == 3:
+            header["dim"][4] = 1
+        img_out = nib.Nifti1Image(data, img_out.affine, header)
+
+    return img_out
 
 
 def read_afni_onset_file(filepath: str | Path) -> list[np.ndarray]:
@@ -1479,12 +1614,145 @@ def _compress_zst(src: Path, dst: Path, remove_original: bool) -> Path:
     return dst
 
 
+_NIFTI_ECODE_AFNI = 4
+# NIfTI datatype codes used by AFNI's NIfTI_nums consistency string
+_NP_DTYPE_TO_NIFTI_CODE: dict[str, int] = {
+    "float32": 16, "float64": 64, "int16": 4, "int32": 8,
+    "uint8": 2, "int8": 256, "uint16": 512,
+}
+
+
+def _generate_afni_idcode() -> str:
+    """Generate an AFNI-style unique ID: AFN_<22 base64 chars>."""
+    import base64
+    import os
+    raw = base64.b64encode(os.urandom(16)).decode("ascii")
+    # AFNI IDs use a URL-safe-ish alphabet; replace +/ with safe chars
+    raw = raw.replace("+", "x").replace("/", "X").rstrip("=")
+    return f"AFN_{raw[:22]}"
+
+
+def _update_afni_extension(
+    header: object,
+    data_shape: tuple[int, ...],
+    data_dtype: np.dtype,
+) -> None:
+    """Update the AFNI NIfTI extension (ecode=4) in a header, if present.
+
+    Updates:
+        - self_idcode / IDCODE_STRING → new unique ID
+        - IDCODE_DATE → current timestamp
+        - NIfTI_nums → matches actual data shape/dtype
+        - HISTORY_NOTE → appends fastfuncstuff provenance
+        - BRICK_STATS / BRICK_STATSYM / BRICK_LABS → trimmed if volume count changed
+    """
+    import re
+    import sys
+    from datetime import datetime
+
+    try:
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return
+
+    # Find AFNI extension
+    afni_idx = None
+    afni_xml = None
+    for i, ext in enumerate(extensions):
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            afni_idx = i
+            afni_xml = ext.content.decode("utf-8", errors="replace")
+            break
+
+    if afni_idx is None or afni_xml is None:
+        return  # No AFNI extension to update
+
+    new_id = _generate_afni_idcode()
+    now_str = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+
+    # Build NIfTI_nums: "nx,ny,nz,nt,nu,datatype"
+    nx = data_shape[0] if len(data_shape) >= 1 else 1
+    ny = data_shape[1] if len(data_shape) >= 2 else 1
+    nz = data_shape[2] if len(data_shape) >= 3 else 1
+    nt = data_shape[3] if len(data_shape) >= 4 else 1
+    nu = data_shape[4] if len(data_shape) >= 5 else 1
+    dtype_code = _NP_DTYPE_TO_NIFTI_CODE.get(str(data_dtype), 16)
+    new_nums = f"{nx},{ny},{nz},{nt},{nu},{dtype_code}"
+
+    # --- Update self_idcode in the group header ---
+    afni_xml = re.sub(
+        r'self_idcode="[^"]*"',
+        f'self_idcode="{new_id}"',
+        afni_xml,
+    )
+
+    # --- Update NIfTI_nums ---
+    afni_xml = re.sub(
+        r'NIfTI_nums="[^"]*"',
+        f'NIfTI_nums="{new_nums}"',
+        afni_xml,
+    )
+
+    # --- Update IDCODE_STRING ---
+    afni_xml = re.sub(
+        r'(atr_name="IDCODE_STRING"\s*>\s*\n)\s*"[^"]*"',
+        rf'\1 "{new_id}"',
+        afni_xml,
+    )
+
+    # --- Update IDCODE_DATE ---
+    afni_xml = re.sub(
+        r'(atr_name="IDCODE_DATE"\s*>\s*\n)\s*"[^"]*"',
+        rf'\1 "{now_str}"',
+        afni_xml,
+    )
+
+    # --- Append to HISTORY_NOTE ---
+    cmd_line = " ".join(sys.argv)
+    history_entry = f"[fastfuncstuff: {now_str}] {cmd_line}"
+
+    history_match = re.search(
+        r'(atr_name="HISTORY_NOTE"\s*>\s*\n)\s*"([^"]*)"',
+        afni_xml,
+        re.DOTALL,
+    )
+    if history_match:
+        old_history = history_match.group(2)
+        new_history = old_history + r"\n" + history_entry
+        afni_xml = afni_xml[:history_match.start(2)] + new_history + afni_xml[history_match.end(2):]
+    # If no HISTORY_NOTE found, that's fine — don't add one
+
+    # --- Trim per-brick attributes if volume count changed ---
+    # BRICK_STATS has 2*nt floats, BRICK_STATSYM and BRICK_LABS have nt entries
+    old_nums_match = re.search(r'NIfTI_nums="(\d+),(\d+),(\d+),(\d+)', afni_xml)
+    # (already updated, so check original)
+    # Instead, just count entries and trim if needed — simpler to remove
+    # stale per-brick attributes entirely when volume count changes
+    # The BRICK_STATS with 726 floats for 363 volumes won't match 361 volumes
+    n_bricks = nt if nt > 1 else nu
+    for atr_name in ("BRICK_STATS", "BRICK_STATSYM", "BRICK_LABS",
+                      "BRICK_TYPES", "BRICK_FLOAT_FACS"):
+        # Remove these attributes — AFNI will recompute them
+        afni_xml = re.sub(
+            rf'<AFNI_atr\s[^>]*atr_name="{atr_name}"[^>]*>.*?</AFNI_atr>\s*',
+            '',
+            afni_xml,
+            flags=re.DOTALL,
+        )
+
+    # Write back the updated extension
+    import nibabel as nib
+    new_ext = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, afni_xml.encode("utf-8"))
+    extensions[afni_idx] = new_ext
+
+
 def save_nifti(
     data: np.ndarray,
     output_path: str | Path,
     reference_img: str | Path | None = None,
     affine: np.ndarray | None = None,
     tr: float | None = None,
+    header: object | None = None,
 ):
     """Save data as a NIfTI file with efficient compression.
 
@@ -1507,6 +1775,9 @@ def save_nifti(
         If None and no *reference_img*, uses identity.
     tr : float, optional
         Repetition time in seconds (for 4D data).
+    header : nibabel header, optional
+        NIfTI header to copy (preserves TR, xyzt_units, etc.).
+        Overridden by *reference_img* if both are given.
     """
     try:
         import nibabel as nib
@@ -1520,11 +1791,27 @@ def save_nifti(
         ref_img = load_nifti(reference_img)
         affine = ref_img.affine
         header = ref_img.header.copy()
+    elif header is not None:
+        header = header.copy()
+        if affine is None:
+            affine = np.eye(4)
     elif affine is None:
         affine = np.eye(4)
         header = nib.Nifti1Header()
     else:
         header = nib.Nifti1Header()
+
+    # Sync header dims to actual data shape (handles sub-brick selection,
+    # partial loads, or any processing that changed the volume count)
+    if header is not None:
+        header.set_data_shape(data.shape)
+
+    # Update AFNI NIfTI extension if present (ecode=4):
+    #   - new IDCODE so AFNI treats this as a distinct dataset
+    #   - NIfTI_nums consistency string matching actual data
+    #   - IDCODE_DATE with current timestamp
+    #   - HISTORY_NOTE appended with our command
+    _update_afni_extension(header, data.shape, data.dtype)
 
     # Create NIfTI image
     img = nib.Nifti1Image(data, affine, header=header)

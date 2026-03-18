@@ -60,6 +60,7 @@ ffs_qwarp = "fastfuncstuff.processing.cli:main"
 ffs_motsim = "fastfuncstuff.processing.ffs_motsim:main"
 ffs_util_pcwarp = "fastfuncstuff.processing.pcwarp_cli:main"
 ffs_util_automask = "fastfuncstuff.processing.mask_cli:main"
+ffs_slicetime = "fastfuncstuff.processing.slicetime_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
