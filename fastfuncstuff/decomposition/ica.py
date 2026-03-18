@@ -114,8 +114,8 @@ class FastICA:
         self,
         n_components: int | None = None,
         pca_components: int | float | str | None = 0.85,
-        max_iter: int = 200,
-        tol: float = 1e-4,
+        max_iter: int = 500,
+        tol: float = 5e-5,
         fun: str = "logcosh",
         random_state: int | None = None,
         whiten: bool = True,
@@ -365,11 +365,22 @@ class FastICA:
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
 
+        # Promote to float64 for the ICA inner loop.  MELODIC uses C++
+        # doubles; with k~60 components the symmetric-decorrelation SVD on a
+        # k×k matrix accumulates enough float32 rounding to stall convergence.
+        # X is (k, V) after PCA reduction — ~110 MB in float64 for typical
+        # fMRI, well within GPU memory.
+        orig_dtype = X.dtype
+        ica_dtype = torch.float64
+        X = X.to(ica_dtype)
+
         # Initialize unmixing matrix
         if w_init is not None:
-            W = w_init.to(self.device).type(X.dtype)
+            W = w_init.to(device=self.device, dtype=ica_dtype)
         else:
-            W = torch.randn(n_components, n_features, device=self.device, dtype=X.dtype)
+            W = torch.randn(
+                n_components, n_features, device=self.device, dtype=ica_dtype
+            )
 
         # Initial symmetric decorrelation
         W = self._symmetric_decorrelation(W)
@@ -384,8 +395,7 @@ class FastICA:
         for n_iter in range(self.max_iter):  # noqa: B007
             W_old = W.clone()
 
-            # 1. Linear projection
-            # W: (n_comp, n_feat), X: (n_feat, n_samp) -> wx: (n_comp, n_samp)
+            # 1. Linear projection — all float64
             wx = W @ X
 
             # 2. Apply nonlinearity in-place, get g_wx and g_prime_mean
@@ -403,18 +413,18 @@ class FastICA:
             # 4. Symmetric Decorrelation
             W = self._symmetric_decorrelation(W)
 
-            # 5. Check convergence
-            # Distance between subspaces: 1 - min(abs(diag(W @ W_old.T)))
-            # Ideally W @ W_old.T should be Identity (or Permutation/Sign matrix)
-            # Since we track trajectory of W, we check correlation of rows
-            # abs(diag(W @ W_old.T)) is correlation of w_new_i with w_old_i
+            # 5. Check convergence — matches MELODIC criterion:
+            #    minAbsSin = 1 - diag(abs(W' * W_old)).Minimum()
+            #    Our row convention ↔ MELODIC column convention, so
+            #    W @ W_old.T here ≡ W_mel.T @ W_mel_old there.
             lim = torch.abs(torch.diag(W @ W_old.T))
-            delta = torch.max(1 - torch.abs(lim))
+            delta = (1.0 - lim).max()
 
             if delta < self.tol:
                 break
 
-        return W, n_iter + 1
+        # Return W in the original data dtype
+        return W.to(orig_dtype), n_iter + 1
 
     @staticmethod
     def _symmetric_decorrelation(W: torch.Tensor) -> torch.Tensor:

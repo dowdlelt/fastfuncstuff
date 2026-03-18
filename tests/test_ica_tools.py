@@ -117,7 +117,9 @@ class TestApplyPolortProjection:
         n_vox = 5
         n_time = 50
         trend = torch.linspace(0, 10, n_time, device=device)
-        data = trend.unsqueeze(0).expand(n_vox, -1) + 0.1 * torch.randn(n_vox, n_time, device=device)
+        data = trend.unsqueeze(0).expand(n_vox, -1) + 0.1 * torch.randn(
+            n_vox, n_time, device=device
+        )
 
         result = apply_polort_projection(data, polort=1, device=device)
 
@@ -133,22 +135,29 @@ class TestApplyPolortProjection:
         t = torch.linspace(-1, 1, n_time, device=device)
         quadratic = 5 * t**2 + 2 * t + 1
 
-        data = quadratic.unsqueeze(0).expand(n_vox, -1) + 0.01 * torch.randn(n_vox, n_time, device=device)
+        data = quadratic.unsqueeze(0).expand(n_vox, -1) + 0.01 * torch.randn(
+            n_vox, n_time, device=device
+        )
 
         # Compute correlation with quadratic trend before projection
         data_normalized = data[0] - data[0].mean()
         quad_normalized = quadratic - quadratic.mean()
-        corr_before = (data_normalized * quad_normalized).sum() / (data_normalized.norm() * quad_normalized.norm())
+        corr_before = (data_normalized * quad_normalized).sum() / (
+            data_normalized.norm() * quad_normalized.norm()
+        )
 
         result = apply_polort_projection(data, polort=2, device=device)
 
         # Compute correlation after projection
         result_normalized = result[0] - result[0].mean()
-        corr_after = (result_normalized * quad_normalized).sum() / (result_normalized.norm() * quad_normalized.norm() + 1e-10)
+        corr_after = (result_normalized * quad_normalized).sum() / (
+            result_normalized.norm() * quad_normalized.norm() + 1e-10
+        )
 
         # Correlation with quadratic trend should be greatly reduced
-        assert abs(corr_after) < 0.3, \
+        assert abs(corr_after) < 0.3, (
             f"Quadratic trend not removed: corr_before={corr_before:.3f}, corr_after={corr_after:.3f}"
+        )
 
     def test_preserves_data_shape(self, device):
         """Test that output shape matches input shape."""
@@ -365,13 +374,15 @@ class TestMPSpikesFromSpectrum:
 
         # Signal eigenvalues above MP edge
         sigma2 = 1.0
-        lambda_plus = sigma2 * (1 + np.sqrt(beta))**2
+        lambda_plus = sigma2 * (1 + np.sqrt(beta)) ** 2
 
         rng = np.random.default_rng(123)
-        evals = np.concatenate([
-            np.array([lambda_plus * 2, lambda_plus * 1.5]),  # Signal spikes
-            rng.standard_normal(98)**2  # Noise floor
-        ])
+        evals = np.concatenate(
+            [
+                np.array([lambda_plus * 2, lambda_plus * 1.5]),  # Signal spikes
+                rng.standard_normal(98) ** 2,  # Noise floor
+            ]
+        )
         evals = np.sort(evals)[::-1]
 
         spikes = mp_spikes_from_spectrum(evals, n_samples=n_samples, n_features=n_features)
@@ -386,14 +397,16 @@ class TestMPSpikesFromSpectrum:
 
         # Calculate MP upper edge
         sigma2 = 1.0
-        lambda_plus = sigma2 * (1 + np.sqrt(beta))**2
+        lambda_plus = sigma2 * (1 + np.sqrt(beta)) ** 2
 
         # Create eigenvalues: some clearly above threshold
         rng = np.random.default_rng(456)
-        evals = np.concatenate([
-            np.array([lambda_plus * 3, lambda_plus * 2, lambda_plus * 1.5]),  # 3 signal
-            rng.uniform(0, lambda_plus * 0.75, 97)  # Noise safely below threshold
-        ])
+        evals = np.concatenate(
+            [
+                np.array([lambda_plus * 3, lambda_plus * 2, lambda_plus * 1.5]),  # 3 signal
+                rng.uniform(0, lambda_plus * 0.75, 97),  # Noise safely below threshold
+            ]
+        )
         evals = np.sort(evals)[::-1]
 
         spikes = mp_spikes_from_spectrum(evals, n_samples=n_samples, n_features=n_features)

@@ -36,9 +36,13 @@ from tqdm.auto import tqdm
 
 # fastfuncstuff imports
 try:
-    from fastfuncstuff.decomposition import io as decomposition_io, postprocess as ica_postprocess, workflow as ica_workflow
+    from fastfuncstuff.decomposition import (
+        io as decomposition_io,
+        postprocess as ica_postprocess,
+        workflow as ica_workflow,
+    )
     from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
-    from fastfuncstuff.cli_utils import parse_input_files, print_cli_header
+    from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, print_cli_header
     from fastfuncstuff.decomposition.ica import FastICA
     from fastfuncstuff.decomposition.tools import (
         apply_high_pass_fft,
@@ -144,7 +148,11 @@ def _run_single_ica(
     elif not args.no_auto_mask:
         from fastfuncstuff.processing.mask import automask
 
-        mask3d = automask(torch.as_tensor(mean3d), dilate_extra=0, device=device).cpu().numpy()
+        mask3d = (
+            automask(torch.as_tensor(mean3d), dilate_extra=2, device=device, verbose=True)
+            .cpu()
+            .numpy()
+        )
         n_total = int(np.prod(mask3d.shape))
         n_brain = int(mask3d.sum())
         if args.verbose:
@@ -377,8 +385,8 @@ def _run_single_ica(
     data_for_model_order = data_vox_t
     model_order_filter_diag = None
     if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
-        data_for_model_order, model_order_filter_diag = ica_workflow.filter_voxels_for_melodic_model_order(
-            data_vox_t=data_vox_t
+        data_for_model_order, model_order_filter_diag = (
+            ica_workflow.filter_voxels_for_melodic_model_order(data_vox_t=data_vox_t)
         )
         n_vox_model_order = int(data_for_model_order.shape[0])
         n_eff_for_model_order = max(n_t, int(n_vox_model_order / (2.5 * resels)))
@@ -475,7 +483,10 @@ def _run_single_ica(
             )
         _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
     else:
-        _vprint(args.verbose, f"FastICA: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity} ...")
+        _vprint(
+            args.verbose,
+            f"FastICA: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity} ...",
+        )
         ica = FastICA(
             n_components=n_components,
             pca_components=n_components,
@@ -486,11 +497,17 @@ def _run_single_ica(
             device=device,
         )
         ica.fit(x_t)
-        _vprint(args.verbose, f"FastICA converged in {ica.n_iter_} iterations", t_step)
 
         # Check convergence
         if ica.n_iter_ >= args.ica_max_iter:
-            print(f"  ⚠ FastICA did NOT converge in {args.ica_max_iter} iterations")
+            _vprint(
+                args.verbose,
+                f"FastICA did NOT converge after {args.ica_max_iter} iterations",
+                t_step,
+            )
+            print(f"  ⚠ Consider increasing --ica_max_iter or checking data conditioning")
+        else:
+            _vprint(args.verbose, f"FastICA converged in {ica.n_iter_} iterations", t_step)
 
         components = ica.components_.to(device)
         mixing = ica.mixing_.to(device)
@@ -669,7 +686,9 @@ def _run_single_ica(
         except Exception as e:
             print(f"  Warning: Could not compute ortvec correlations for run {run_idx + 1}: {e}")
 
-    out_prefix = Path(args.prefix)
+    pfx = parse_prefix(str(args.prefix))
+    out_prefix = Path(pfx.stem)
+    nii_ext = pfx.nifti_ext
 
     comp_np = components.detach().cpu().numpy().astype(np.float32)
     mixing_np = mixing.detach().cpu().numpy().astype(np.float32)
@@ -684,9 +703,11 @@ def _run_single_ica(
     t_step = time.time()
     _vprint(args.verbose, "Saving ICA spatial maps ...")
     save_items = [
-        (comp_np, f"{out_prefix}_{run_tag}_ica_maps.nii.gz", "maps"),
+        (comp_np, f"{out_prefix}_{run_tag}_ica_maps{nii_ext}", "maps"),
     ]
-    for data_arr, fname, label in tqdm(save_items, desc="  Saving NIfTI", leave=False, disable=not args.verbose):
+    for data_arr, fname, label in tqdm(
+        save_items, desc="  Saving NIfTI", leave=False, disable=not args.verbose
+    ):
         decomposition_io.save_masked_component_maps_4d(
             components_kv=data_arr,
             mask3d=mask3d,
@@ -694,7 +715,7 @@ def _run_single_ica(
             affine=affine,
             out_file=Path(fname),
         )
-    _vprint(args.verbose, f"Maps saved: {out_prefix}_{run_tag}_ica_maps.nii.gz", t_step)
+    _vprint(args.verbose, f"Maps saved: {out_prefix}_{run_tag}_ica_maps{nii_ext}", t_step)
 
     # --- Save timecourses ---
     np.savetxt(
@@ -776,11 +797,13 @@ def _run_single_ica(
         _vprint(args.verbose, f"GGM done: {n_conv}/{n_comps_total} converged", t_step)
 
         ggm_saves = [
-            (z_maps, f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz"),
-            (p_maps, f"{out_prefix}_{run_tag}_ica_signalprob.nii.gz"),
-            (thresh_z_maps, f"{out_prefix}_{run_tag}_ica_thresh_zmaps.nii.gz"),
+            (z_maps, f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}"),
+            (p_maps, f"{out_prefix}_{run_tag}_ica_signalprob{nii_ext}"),
+            (thresh_z_maps, f"{out_prefix}_{run_tag}_ica_thresh_zmaps{nii_ext}"),
         ]
-        for data_arr, fname in tqdm(ggm_saves, desc="  Saving GGM NIfTI", leave=False, disable=not args.verbose):
+        for data_arr, fname in tqdm(
+            ggm_saves, desc="  Saving GGM NIfTI", leave=False, disable=not args.verbose
+        ):
             decomposition_io.save_masked_component_maps_4d(
                 components_kv=data_arr,
                 mask3d=mask3d,
@@ -826,8 +849,8 @@ def _run_single_ica(
         )
         decomposition_io.write_melodic_compat_outputs(
             compat_dir=compat_dir,
-            maps_file=Path(f"{out_prefix}_{run_tag}_ica_maps.nii.gz"),
-            zmaps_file=Path(f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz")
+            maps_file=Path(f"{out_prefix}_{run_tag}_ica_maps{nii_ext}"),
+            zmaps_file=Path(f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}")
             if z_maps is not None
             else None,
             timecourse_file=Path(f"{out_prefix}_{run_tag}_ica_timecourses.1D"),
@@ -844,9 +867,9 @@ def _run_single_ica(
             thresh_z_maps=thresh_z_maps,
         )
         ic_target = (
-            Path(f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz")
-            if z_maps is not None and Path(f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz").exists()
-            else Path(f"{out_prefix}_{run_tag}_ica_maps.nii.gz")
+            Path(f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}")
+            if z_maps is not None and Path(f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}").exists()
+            else Path(f"{out_prefix}_{run_tag}_ica_maps{nii_ext}")
         )
         _vprint(args.verbose, f"MELODIC melodic_IC target: {ic_target}")
         _vprint(args.verbose, f"MELODIC-compatible outputs: {compat_dir}")
@@ -1000,7 +1023,7 @@ def _run_single_ica(
         },
         "mixture_model": mixture_meta if args.save_mixture_z else None,
         "outputs": {
-            "ica_maps": f"{out_prefix}_{run_tag}_ica_maps.nii.gz",
+            "ica_maps": f"{out_prefix}_{run_tag}_ica_maps{nii_ext}",
             "ica_timecourses": f"{out_prefix}_{run_tag}_ica_timecourses.1D",
             "pca_scree_plot": f"{out_prefix}_{run_tag}_pca_scree.png",
             "component_correlation_plot": f"{out_prefix}_{run_tag}_component_correlations.png"
@@ -1012,13 +1035,13 @@ def _run_single_ica(
             "goodmask_score_plot": None if guidance_good_plot is None else str(guidance_good_plot),
             "badmask_score_plot": None if guidance_bad_plot is None else str(guidance_bad_plot),
             "depth_lag_plot": None if depth_lag_plot is None else str(depth_lag_plot),
-            "ica_zmaps": f"{out_prefix}_{run_tag}_ica_zmaps.nii.gz"
+            "ica_zmaps": f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}"
             if args.save_mixture_z
             else None,
-            "ica_signalprob": f"{out_prefix}_{run_tag}_ica_signalprob.nii.gz"
+            "ica_signalprob": f"{out_prefix}_{run_tag}_ica_signalprob{nii_ext}"
             if args.save_mixture_z
             else None,
-            "ica_thresh_zmaps": f"{out_prefix}_{run_tag}_ica_thresh_zmaps.nii.gz"
+            "ica_thresh_zmaps": f"{out_prefix}_{run_tag}_ica_thresh_zmaps{nii_ext}"
             if args.save_mixture_z
             else None,
             "melodic_compat_dir": str(
@@ -1199,13 +1222,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     ica_opts = parser.add_argument_group("ICA / ICASSO")
-    ica_opts.add_argument("-ica_max_iter", type=int, default=1000, help="FastICA max iterations")
     ica_opts.add_argument(
-        "-ica_tol", type=float, default=1e-4,
-        help="FastICA convergence tolerance (MELODIC default: 1e-4)"
+        "-ica_max_iter", type=int, default=500, help="FastICA max iterations (MELODIC default: 500)"
     )
     ica_opts.add_argument(
-        "-ica_nonlinearity", type=str, default="pow3",
+        "-ica_tol",
+        type=float,
+        default=5e-5,
+        help="FastICA convergence tolerance (MELODIC default: 5e-5)",
+    )
+    ica_opts.add_argument(
+        "-ica_nonlinearity",
+        type=str,
+        default="pow3",
         choices=["pow3", "cube", "logcosh"],
         help="FastICA contrast function (default: pow3, matching MELODIC)",
     )
@@ -1542,7 +1571,8 @@ def main() -> None:
             f"IC1 explained share: {run_meta['component_variance_share'][0] * 100:.2f}%"
         )
 
-    summary_path = f"{args.prefix}_ica_summary.json"
+    pfx = parse_prefix(str(args.prefix))
+    summary_path = f"{pfx.stem}_ica_summary.json"
     with open(summary_path, "w") as f:
         json.dump(
             {
