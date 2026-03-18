@@ -42,6 +42,7 @@ try:
         get_average_run_duration,
         parse_device_arg,
         parse_input_files,
+        parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,

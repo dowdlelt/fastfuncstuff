@@ -65,6 +65,7 @@ try:
         get_average_run_duration,
         parse_cv_strategy,
         parse_input_files,
+        parse_prefix,
     )
     from fastfuncstuff.denoise.sequential import (
         extract_noise_pcs_per_run,
@@ -1107,6 +1108,7 @@ def save_pathfinder_results(
     condition_labels: list[str] | None = None,
     save_all_hrfs: bool = False,
     save_plots: bool = False,
+    nii_ext: str = ".nii.gz",
 ) -> dict[str, str]:
     """Save pathfinder results to disk."""
     output_files = {}
@@ -1134,7 +1136,7 @@ def save_pathfinder_results(
     # Initial xval R² (canonical HRF, no denoising)
     if results.initial_xval_r2 is not None:
         initial_xval_r2_vol = to_volume(results.initial_xval_r2.numpy())
-        initial_xval_r2_path = f"{output_prefix}_initial_xval_r2.nii.gz"
+        initial_xval_r2_path = f"{output_prefix}_initial_xval_r2{nii_ext}"
         save_nifti(initial_xval_r2_vol.astype(np.float32), output_path=initial_xval_r2_path, affine=affine)
         output_files["initial_xval_r2"] = initial_xval_r2_path
 
@@ -1145,7 +1147,7 @@ def save_pathfinder_results(
         if voxel_mask is not None:
             results.initial_results.voxel_mask = voxel_mask
 
-        initial_stats_path = f"{output_prefix}_initial_stats.nii.gz"
+        initial_stats_path = f"{output_prefix}_initial_stats{nii_ext}"
         write_glm_bucket_as_nifti(
             results.initial_results,
             initial_stats_path,
@@ -1158,7 +1160,7 @@ def save_pathfinder_results(
 
         # Also save initial R² (full-fit, not xval)
         initial_r2_vol = to_volume(results.initial_results.r2.numpy())
-        initial_r2_path = f"{output_prefix}_initial_r2.nii.gz"
+        initial_r2_path = f"{output_prefix}_initial_r2{nii_ext}"
         save_nifti(initial_r2_vol.astype(np.float32), output_path=initial_r2_path, affine=affine)
         output_files["initial_r2"] = initial_r2_path
 
@@ -1173,7 +1175,7 @@ def save_pathfinder_results(
         if voxel_mask is not None:
             results.final_results.voxel_mask = voxel_mask
 
-        final_stats_path = f"{output_prefix}_final_stats.nii.gz"
+        final_stats_path = f"{output_prefix}_final_stats{nii_ext}"
         write_glm_bucket_as_nifti(
             results.final_results,
             final_stats_path,
@@ -1186,7 +1188,7 @@ def save_pathfinder_results(
 
         # Also save final R² (full-fit, not xval)
         final_r2_vol = to_volume(results.final_results.r2.numpy())
-        final_r2_path = f"{output_prefix}_final_r2.nii.gz"
+        final_r2_path = f"{output_prefix}_final_r2{nii_ext}"
         save_nifti(final_r2_vol.astype(np.float32), output_path=final_r2_path, affine=affine)
         output_files["final_r2"] = final_r2_path
 
@@ -1196,27 +1198,27 @@ def save_pathfinder_results(
 
     # 1. HRF index (1-indexed for AFNI)
     hrf_index_vol = to_volume((results.hrf_index.float() + 1.0).numpy())
-    hrf_index_path = f"{output_prefix}_hrf_index.nii.gz"
+    hrf_index_path = f"{output_prefix}_hrf_index{nii_ext}"
     save_nifti(hrf_index_vol.astype(np.float32), output_path=hrf_index_path, affine=affine)
     output_files["hrf_index"] = hrf_index_path
 
     # 2. Best denoised xval R² (final, optimized)
     xval_r2_vol = to_volume(results.xval_r2_best.numpy())
-    xval_r2_path = f"{output_prefix}_final_xval_r2.nii.gz"
+    xval_r2_path = f"{output_prefix}_final_xval_r2{nii_ext}"
     save_nifti(xval_r2_vol.astype(np.float32), output_path=xval_r2_path, affine=affine)
     output_files["final_xval_r2"] = xval_r2_path
 
     # 3. Noise pool mask
     if results.noise_pool_mask is not None:
         noise_pool_vol = to_volume(results.noise_pool_mask.numpy().astype(np.float32))
-        noise_pool_path = f"{output_prefix}_noise_pool_mask.nii.gz"
+        noise_pool_path = f"{output_prefix}_noise_pool_mask{nii_ext}"
         save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
         output_files["noise_pool_mask"] = noise_pool_path
 
     # 4. Criteria mask
     if results.criteria_mask is not None:
         criteria_vol = to_volume(results.criteria_mask.numpy().astype(np.float32))
-        criteria_path = f"{output_prefix}_criteria_mask.nii.gz"
+        criteria_path = f"{output_prefix}_criteria_mask{nii_ext}"
         save_nifti(criteria_vol, output_path=criteria_path, affine=affine)
         output_files["criteria_mask"] = criteria_path
 
@@ -1228,7 +1230,7 @@ def save_pathfinder_results(
             vol = to_volume(results.xval_r2_all_hrfs[:, hrf_idx].numpy())
             all_hrfs_vols.append(vol)
         all_hrfs_4d = np.stack(all_hrfs_vols, axis=-1)
-        all_hrfs_path = f"{output_prefix}_xval_r2_all_hrfs.nii.gz"
+        all_hrfs_path = f"{output_prefix}_xval_r2_all_hrfs{nii_ext}"
         save_nifti(all_hrfs_4d.astype(np.float32), output_path=all_hrfs_path, affine=affine)
         output_files["xval_r2_all_hrfs"] = all_hrfs_path
 
@@ -1317,6 +1319,10 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    pfx = parse_prefix(args.prefix)
+    args.prefix = pfx.stem  # overwrite with clean stem
+    _nii_ext = pfx.nifti_ext
 
     print_header()
 
@@ -1586,6 +1592,7 @@ def main():
         condition_labels=condition_labels,
         save_all_hrfs=args.save_all_hrfs,
         save_plots=args.plots,
+        nii_ext=_nii_ext,
     )
 
     print()

@@ -78,6 +78,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_utils import parse_prefix
 from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
 from fastfuncstuff.decomposition.io import save_decomposition_results
 from fastfuncstuff.decomposition.ica import (
@@ -266,6 +267,10 @@ def main():
     """Main CLI entry point"""
     args = parse_args()
 
+    pfx = parse_prefix(args.output)
+    args.output = pfx.stem
+    _nii_ext = pfx.nifti_ext
+
     # Setup device
     if args.cpu:
         device = torch.device("cpu")
@@ -388,6 +393,7 @@ def main():
                 reference_file=args.input,
                 labels=pca_labels,
                 method="PCA",
+                nii_ext=_nii_ext,
             )
 
             if args.verbose:
@@ -540,6 +546,7 @@ def main():
                 reference_file=args.input,
                 labels=ica_labels,
                 method="ICA",
+                nii_ext=_nii_ext,
             )
 
             if args.verbose:
@@ -830,6 +837,7 @@ def main():
                 reference_file=args.input,
                 labels=icasso_labels,
                 method="ICASSO",
+                nii_ext=_nii_ext,
             )
 
             # Determine how many actually met threshold

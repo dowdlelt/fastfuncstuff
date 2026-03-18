@@ -68,6 +68,7 @@ try:
         onsets_to_tr_matrix,
         save_nifti,
     )
+    from fastfuncstuff.cli_utils import parse_prefix
     from fastfuncstuff.design.matrices import (
         build_glm_design,
         is_tr_locked,
@@ -331,6 +332,10 @@ def main():
         return 0
 
     args = parser.parse_args()
+
+    pfx = parse_prefix(args.prefix)
+    args.prefix = pfx.stem  # overwrite with clean stem
+    _nii_ext = pfx.nifti_ext
 
     # Setup device
     if args.cpu:
@@ -930,6 +935,7 @@ def main():
             bot=bot_for_save,
             top=top_for_save,
             reference_img=args.input[0],
+            nii_ext=_nii_ext,
         )
         output_files.extend(files)
 
@@ -954,7 +960,7 @@ def main():
             betas_4d = betas_stimulus.T.reshape(nx, ny, nz, n_stimulus_regressors)
 
         # Save as 4D NIfTI
-        beta_file = f"{args.prefix}_betas.nii.gz"
+        beta_file = f"{args.prefix}_betas{_nii_ext}"
         save_nifti(betas_4d, beta_file, reference_img=args.input[0])
 
         if args.verbose:

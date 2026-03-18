@@ -1921,6 +1921,7 @@ def save_hrf_selection_results(
     save_all_hrf_designs: bool = False,
     onsets: torch.Tensor | None = None,
     save_plots: bool = False,
+    nii_ext: str = ".nii.gz",
 ) -> dict[str, str]:
     """
     Save HRF selection results to disk.
@@ -1971,25 +1972,25 @@ def save_hrf_selection_results(
     tr = results.hrf_metadata.get("tr", 1.0)
 
     # 1. Save HRF index map (1-based: 1 to N, not 0 to N-1, since 0 = background)
-    hrf_index_file = f"{output_prefix}_hrf_index.nii.gz"
+    hrf_index_file = f"{output_prefix}_hrf_index{nii_ext}"
     # Add 1 to convert from 0-indexed to 1-indexed for AFNI compatibility
     hrf_index_1based = results.hrf_index.float() + 1.0
     _save_volume(hrf_index_1based, hrf_index_file, volume_shape, affine, voxel_mask)
     output_files["hrf_index"] = hrf_index_file
 
     # 2. Save CV R² for best HRF
-    xval_r2_file = f"{output_prefix}_xval_r2.nii.gz"
+    xval_r2_file = f"{output_prefix}_xval_r2{nii_ext}"
     _save_volume(results.xval_r2_best, xval_r2_file, volume_shape, affine, voxel_mask)
     output_files["xval_r2"] = xval_r2_file
 
     # 3. Save CV R² std
-    xval_std_file = f"{output_prefix}_xval_r2_std.nii.gz"
+    xval_std_file = f"{output_prefix}_xval_r2_std{nii_ext}"
     _save_volume(results.xval_r2_std, xval_std_file, volume_shape, affine, voxel_mask)
     output_files["xval_r2_std"] = xval_std_file
 
     # 3b. Save canonical HRF baseline R² for comparison
     if results.xval_r2_canonical is not None:
-        canonical_r2_file = f"{output_prefix}_xval_r2_canonical.nii.gz"
+        canonical_r2_file = f"{output_prefix}_xval_r2_canonical{nii_ext}"
         _save_volume(
             results.xval_r2_canonical,
             canonical_r2_file,
@@ -2001,7 +2002,7 @@ def save_hrf_selection_results(
 
     # 3c. Save CV R² for ALL HRFs as 4D volume (n_voxels, n_hrfs)
     if results.xval_r2_all_hrfs is not None:
-        xval_r2_all_file = f"{output_prefix}_xval_r2_all_hrfs.nii.gz"
+        xval_r2_all_file = f"{output_prefix}_xval_r2_all_hrfs{nii_ext}"
         _save_volume_4d(
             results.xval_r2_all_hrfs,
             xval_r2_all_file,
@@ -2020,7 +2021,7 @@ def save_hrf_selection_results(
     ]:
         val = getattr(results, field_name, None)
         if val is not None:
-            fpath = f"{output_prefix}_{field_name}.nii.gz"
+            fpath = f"{output_prefix}_{field_name}{nii_ext}"
             _save_volume(val, fpath, volume_shape, affine, voxel_mask)
             output_files[field_name] = fpath
 
@@ -2031,7 +2032,7 @@ def save_hrf_selection_results(
         if voxel_mask is not None:
             results.final_results.voxel_mask = voxel_mask
 
-        betas_file = f"{output_prefix}_stats.nii.gz"
+        betas_file = f"{output_prefix}_stats{nii_ext}"
         write_glm_bucket_as_nifti(
             results.final_results,
             betas_file,
@@ -2048,7 +2049,7 @@ def save_hrf_selection_results(
         if voxel_mask is not None:
             results.canonical_results.voxel_mask = voxel_mask
 
-        canonical_stats_file = f"{output_prefix}_canonical_stats.nii.gz"
+        canonical_stats_file = f"{output_prefix}_canonical_stats{nii_ext}"
         write_glm_bucket_as_nifti(
             results.canonical_results,
             canonical_stats_file,

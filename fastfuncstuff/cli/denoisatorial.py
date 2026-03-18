@@ -46,6 +46,7 @@ try:
         auto_polort,
         load_and_preprocess_runs,
         parse_input_files,
+        parse_prefix,
         print_cli_header,
     )
     from fastfuncstuff.denoise.sequential import select_noise_pool_voxels
@@ -366,6 +367,7 @@ def save_combinatorial_results(
     mask_flat: np.ndarray | None = None,
     plots_mode: str = "no",
     save_pcs_mode: str = "timecourse",
+    nii_ext: str = ".nii.gz",
 ) -> dict:
     """Save combinatorial denoising results to disk."""
     output_files = {}
@@ -392,21 +394,21 @@ def save_combinatorial_results(
 
     # 1. Initial R2 volume
     initial_r2_vol = to_volume(initial_r2_full)
-    initial_r2_path = f"{output_prefix}_initial_r2.nii.gz"
+    initial_r2_path = f"{output_prefix}_initial_r2{nii_ext}"
     save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine)
     output_files["initial_r2"] = initial_r2_path
     print(f"  Saved: {initial_r2_path}")
 
     # 2. Optimized R2 volume
     opt_r2_vol = to_volume(optimized_r2_full)
-    opt_r2_path = f"{output_prefix}_optimized_xval_r2.nii.gz"
+    opt_r2_path = f"{output_prefix}_optimized_xval_r2{nii_ext}"
     save_nifti(opt_r2_vol, output_path=opt_r2_path, affine=affine)
     output_files["optimized_xval_r2"] = opt_r2_path
     print(f"  Saved: {opt_r2_path}")
 
     # 3. Noise pool mask
     noise_pool_vol = to_volume(results.noise_pool_mask)
-    noise_pool_path = f"{output_prefix}_noise_pool_mask.nii.gz"
+    noise_pool_path = f"{output_prefix}_noise_pool_mask{nii_ext}"
     save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
     output_files["noise_pool_mask"] = noise_pool_path
     print(f"  Saved: {noise_pool_path}")
@@ -550,6 +552,10 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    pfx = parse_prefix(args.prefix)
+    args.prefix = pfx.stem  # overwrite with clean stem
+    _nii_ext = pfx.nifti_ext
 
     print_cli_header("ffs_denoisatorial", "Combinatorial PC Denoising")
 
@@ -1002,6 +1008,7 @@ def main():
         mask_flat=mask_flat,
         plots_mode=args.plots,
         save_pcs_mode=args.save_pcs,
+        nii_ext=_nii_ext,
     )
 
     # ======================================================================

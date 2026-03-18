@@ -439,6 +439,7 @@ def save_decomposition_results(
     reference_file: str | Path | None = None,
     labels: list | None = None,
     method: str = "ICA",
+    nii_ext: str = ".nii.gz",
 ) -> dict[str, Path]:
     """
     Save complete decomposition results (maps + timeseries)
@@ -496,7 +497,7 @@ def save_decomposition_results(
         labels = [f"{method}_{i:03d}" for i in range(n_components)]
 
     # Save spatial maps
-    maps_file = output_dir / f"{output_prefix.name}_maps.nii.gz"
+    maps_file = output_dir / f"{output_prefix.name}_maps{nii_ext}"
     save_component_maps(components, mask_file, maps_file, labels=labels)
 
     # Save timeseries (.1D format only)

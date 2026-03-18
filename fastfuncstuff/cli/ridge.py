@@ -53,6 +53,7 @@ try:
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
+        parse_prefix,
         preflight_check,
         save_4d_nifti,
         save_volume_nifti,
@@ -301,6 +302,10 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    pfx = parse_prefix(args.prefix)
+    args.prefix = pfx.stem  # overwrite with clean stem
+    _nii_ext = pfx.nifti_ext
 
     print("=" * 70)
     print("3dRidgefast - Ridge regression with single-trial estimation")
@@ -849,17 +854,17 @@ def main():
         # Also save ridge-specific outputs
         voxel_mask_np = mask_flat if mask is not None else None
         save_volume_nifti(
-            full_r2, f"{args.prefix}_single_trial_full_r2.nii.gz", vol_shape, affine, voxel_mask_np
+            full_r2, f"{args.prefix}_single_trial_full_r2{_nii_ext}", vol_shape, affine, voxel_mask_np
         )
-        print(f"  {args.prefix}_single_trial_full_r2.nii.gz")
+        print(f"  {args.prefix}_single_trial_full_r2{_nii_ext}")
         save_volume_nifti(
-            optimal_fracs, f"{args.prefix}_optimal_frac.nii.gz", vol_shape, affine, voxel_mask_np
+            optimal_fracs, f"{args.prefix}_optimal_frac{_nii_ext}", vol_shape, affine, voxel_mask_np
         )
-        print(f"  {args.prefix}_optimal_frac.nii.gz")
+        print(f"  {args.prefix}_optimal_frac{_nii_ext}")
         save_4d_nifti(
-            r2_by_frac, f"{args.prefix}_r2_by_frac.nii.gz", vol_shape, affine, voxel_mask_np
+            r2_by_frac, f"{args.prefix}_r2_by_frac{_nii_ext}", vol_shape, affine, voxel_mask_np
         )
-        print(f"  {args.prefix}_r2_by_frac.nii.gz")
+        print(f"  {args.prefix}_r2_by_frac{_nii_ext}")
 
     else:
         # ========== EXISTING OUTPUT MODE ==========
@@ -867,33 +872,33 @@ def main():
 
         # Save R² maps and optimal fractions
         save_volume_nifti(
-            results.r2_initial, f"{args.prefix}_r2_initial.nii.gz", vol_shape, affine, voxel_mask_np
+            results.r2_initial, f"{args.prefix}_r2_initial{_nii_ext}", vol_shape, affine, voxel_mask_np
         )
-        print(f"  {args.prefix}_r2_initial.nii.gz")
-        save_volume_nifti(results.r2, f"{args.prefix}_r2.nii.gz", vol_shape, affine, voxel_mask_np)
-        print(f"  {args.prefix}_r2.nii.gz")
+        print(f"  {args.prefix}_r2_initial{_nii_ext}")
+        save_volume_nifti(results.r2, f"{args.prefix}_r2{_nii_ext}", vol_shape, affine, voxel_mask_np)
+        print(f"  {args.prefix}_r2{_nii_ext}")
         save_volume_nifti(
-            results.xval_r2, f"{args.prefix}_xval_r2.nii.gz", vol_shape, affine, voxel_mask_np
+            results.xval_r2, f"{args.prefix}_xval_r2{_nii_ext}", vol_shape, affine, voxel_mask_np
         )
-        print(f"  {args.prefix}_xval_r2.nii.gz")
+        print(f"  {args.prefix}_xval_r2{_nii_ext}")
         save_volume_nifti(
             results.optimal_fracs,
-            f"{args.prefix}_optimal_frac.nii.gz",
+            f"{args.prefix}_optimal_frac{_nii_ext}",
             vol_shape,
             affine,
             voxel_mask_np,
         )
-        print(f"  {args.prefix}_optimal_frac.nii.gz")
+        print(f"  {args.prefix}_optimal_frac{_nii_ext}")
 
         # Save single-trial betas (4D file)
         save_4d_nifti(
             results.betas_single_trial,
-            f"{args.prefix}_betas_single_trial.nii.gz",
+            f"{args.prefix}_betas_single_trial{_nii_ext}",
             vol_shape,
             affine,
             voxel_mask_np,
         )
-        print(f"  {args.prefix}_betas_single_trial.nii.gz")
+        print(f"  {args.prefix}_betas_single_trial{_nii_ext}")
 
         # Save trial labels text file
         trial_labels_file = f"{args.prefix}_trial_labels.txt"
@@ -914,12 +919,12 @@ def main():
 
         save_4d_nifti(
             condition_betas,
-            f"{args.prefix}_betas_condition.nii.gz",
+            f"{args.prefix}_betas_condition{_nii_ext}",
             vol_shape,
             affine,
             voxel_mask_np,
         )
-        print(f"  {args.prefix}_betas_condition.nii.gz")
+        print(f"  {args.prefix}_betas_condition{_nii_ext}")
 
         # Save condition labels text file
         condition_labels_file = f"{args.prefix}_condition_labels.txt"
@@ -930,9 +935,9 @@ def main():
 
         # Save R² per ridge fraction (4D file with one volume per fraction)
         save_4d_nifti(
-            results.r2_by_frac, f"{args.prefix}_r2_by_frac.nii.gz", vol_shape, affine, voxel_mask_np
+            results.r2_by_frac, f"{args.prefix}_r2_by_frac{_nii_ext}", vol_shape, affine, voxel_mask_np
         )
-        print(f"  {args.prefix}_r2_by_frac.nii.gz")
+        print(f"  {args.prefix}_r2_by_frac{_nii_ext}")
 
         # Save fractions text file for reference
         fracs_file = f"{args.prefix}_ridge_fracs.txt"
@@ -947,33 +952,33 @@ def main():
             violation_counts = violations_mask.cpu().sum(dim=1).numpy()  # (n_voxels,)
             save_volume_nifti(
                 torch.from_numpy(violation_counts),
-                f"{args.prefix}_scale_violations.nii.gz",
+                f"{args.prefix}_scale_violations{_nii_ext}",
                 vol_shape,
                 affine,
                 voxel_mask_np,
             )
-            print(f"  {args.prefix}_scale_violations.nii.gz")
+            print(f"  {args.prefix}_scale_violations{_nii_ext}")
 
         print()
         print("Output files created:")
-        print(f"  {args.prefix}_r2_initial.nii.gz - Initial R² (minimal ridge, ~OLS)")
-        print(f"  {args.prefix}_r2.nii.gz - Final R² (in-sample, at optimal ridge)")
-        print(f"  {args.prefix}_xval_r2.nii.gz - Cross-validated R²")
-        print(f"  {args.prefix}_optimal_frac.nii.gz - Optimal ridge fraction per voxel")
+        print(f"  {args.prefix}_r2_initial{_nii_ext} - Initial R² (minimal ridge, ~OLS)")
+        print(f"  {args.prefix}_r2{_nii_ext} - Final R² (in-sample, at optimal ridge)")
+        print(f"  {args.prefix}_xval_r2{_nii_ext} - Cross-validated R²")
+        print(f"  {args.prefix}_optimal_frac{_nii_ext} - Optimal ridge fraction per voxel")
         print(
-            f"  {args.prefix}_betas_single_trial.nii.gz - Single-trial betas (4D, {n_columns} volumes)"
+            f"  {args.prefix}_betas_single_trial{_nii_ext} - Single-trial betas (4D, {n_columns} volumes)"
         )
         print(f"  {args.prefix}_trial_labels.txt - Trial labels for single-trial betas")
         print(
-            f"  {args.prefix}_betas_condition.nii.gz - Mean condition betas (4D, {n_conditions} volumes)"
+            f"  {args.prefix}_betas_condition{_nii_ext} - Mean condition betas (4D, {n_conditions} volumes)"
         )
         print(f"  {args.prefix}_condition_labels.txt - Condition labels for condition betas")
         print(
-            f"  {args.prefix}_r2_by_frac.nii.gz - CV R² per ridge fraction (4D, {len(fracs)} volumes)"
+            f"  {args.prefix}_r2_by_frac{_nii_ext} - CV R² per ridge fraction (4D, {len(fracs)} volumes)"
         )
         print(f"  {args.prefix}_ridge_fracs.txt - Ridge fraction values")
         if args.do_scale and violations_mask is not None:
-            print(f"  {args.prefix}_scale_violations.nii.gz - Scaling violation counts per voxel")
+            print(f"  {args.prefix}_scale_violations{_nii_ext} - Scaling violation counts per voxel")
         print()
         print("Summary statistics:")
         print(f"  Median R² (initial, OLS): {results.r2_initial.median():.4f}")

@@ -46,6 +46,7 @@ try:
         load_and_preprocess_runs,
         parse_device_arg,
         parse_input_files,
+        parse_prefix,
         preflight_check,
     )
     from fastfuncstuff.design.builder import (
@@ -481,6 +482,10 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    pfx = parse_prefix(args.prefix)
+    args.prefix = pfx.stem  # overwrite with clean stem
+    _nii_ext = pfx.nifti_ext
 
     # Debug implies verbose
     if args.debug:
@@ -1049,6 +1054,7 @@ def main():
         save_all_hrf_designs=args.save_hrf_designs,
         onsets=onset_matrix if args.save_hrf_designs else None,
         save_plots=args.save_plots,
+        nii_ext=_nii_ext,
     )
 
     # Restore final_results for custom saving
@@ -1080,7 +1086,7 @@ def main():
             trial_labels = [f"trial_{i:04d}" for i in range(n_trials)]
 
         # Save with custom filename using trial labels
-        single_trial_file = f"{args.prefix}_stats_single_trial.nii.gz"
+        single_trial_file = f"{args.prefix}_stats_single_trial{_nii_ext}"
         write_glm_bucket_as_nifti(
             results.final_results,
             output_path=single_trial_file,
@@ -1106,7 +1112,7 @@ def main():
         violation_vol = violation_vol.reshape(volume_shape)
 
         # Save as NIfTI
-        violation_path = f"{args.prefix}_scale_violations.nii.gz"
+        violation_path = f"{args.prefix}_scale_violations{_nii_ext}"
         save_nifti(violation_vol, output_path=violation_path, affine=affine)
         output_files["scale_violations"] = violation_path
 

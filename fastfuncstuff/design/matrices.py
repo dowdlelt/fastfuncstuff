@@ -1222,6 +1222,7 @@ def save_iresp(
     top: float | None = None,
     affine: np.ndarray | None = None,
     reference_img: str | None = None,
+    nii_ext: str = ".nii.gz",
 ):
     """
     Save HRF estimates as 4D NIfTI files (AFNI-style iresp)
@@ -1309,7 +1310,7 @@ def save_iresp(
         cond_hrf = iresp[:, :, :, cond_idx, :]
 
         # Save file
-        output_file = f"{output_prefix}_iresp_{label}.nii.gz"
+        output_file = f"{output_prefix}_iresp_{label}{nii_ext}"
         save_nifti(cond_hrf, output_path=output_file, affine=affine, tr=tr)
         output_files.append(output_file)
 

@@ -21,7 +21,7 @@ import torch
 
 try:
     from fastfuncstuff.io.afni import extract_design_metadata, load_nifti, read_afni_design_matrix
-    from fastfuncstuff.cli_utils import parse_input_files
+    from fastfuncstuff.cli_utils import parse_input_files, parse_prefix
     from fastfuncstuff.utils import configure_torch_backends, get_device
     from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
 except ImportError as e:
@@ -208,6 +208,10 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
+    pfx = parse_prefix(args.output)
+    args.output = pfx.stem
+    _nii_ext = pfx.nifti_ext
+
     # Print header
     print("=" * 70)
     print("3dXvalR2fast - Cross-Validated R² Computation")
@@ -382,14 +386,14 @@ def main():
         print(f"  • {description}: {filename}")
 
     # Save single R² map (GLMdenoise-style: from concatenated predictions)
-    save_volume(xval_results["r2"], f"{args.output}_r2.nii.gz", "Cross-validated R²")
+    save_volume(xval_results["r2"], f"{args.output}_r2{_nii_ext}", "Cross-validated R²")
 
     # Note: --save-splits is no longer applicable with GLMdenoise-style concatenation
     if args.save_splits:
         print()
         print("  Note: --save-splits is deprecated with GLMdenoise-style concatenation.")
         print("        The new approach computes a single R² from concatenated predictions,")
-        print(f"  • All splits: {args.output}_splits.nii.gz")
+        print(f"  • All splits: {args.output}_splits{_nii_ext}")
 
     print()
     print("=" * 70)

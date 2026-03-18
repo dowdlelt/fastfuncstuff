@@ -55,6 +55,7 @@ import sys
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_utils import parse_prefix
 from fastfuncstuff.io.afni import (
     load_nifti,
     save_nifti,
@@ -236,6 +237,10 @@ def main():
                         help='Print detailed progress information')
 
     args = parser.parse_args()
+
+    pfx = parse_prefix(args.output_prefix)
+    args.output_prefix = pfx.stem
+    _nii_ext = pfx.nifti_ext
 
     # ========================================================================
     # Validate inputs
@@ -689,7 +694,7 @@ def main():
         lambda_volume = np.zeros((nx, ny, nz))
         lambda_volume[mask] = lambda_map
 
-        lambda_file = f"{args.output_prefix}_lambda.nii.gz"
+        lambda_file = f"{args.output_prefix}_lambda{_nii_ext}"
         save_nifti(lambda_volume, lambda_file, affine=affine)
 
         if args.verbose:
@@ -778,7 +783,7 @@ def main():
         hrf_volume[mask, :] = betas_cond
 
         # Save as iresp file
-        iresp_file = f"{args.output_prefix}_iresp_{label}.nii.gz"
+        iresp_file = f"{args.output_prefix}_iresp_{label}{_nii_ext}"
 
         # Save with TR spacing in header
         # The "TR" here is the spacing between HRF samples (knot spacing)
@@ -807,7 +812,7 @@ def main():
         if args.save_design:
             print(f"  {args.output_prefix}_design_TPS.1D")
         if args.save_lambda_map and args.optimize_level == 'per_voxel':
-            print(f"  {args.output_prefix}_lambda.nii.gz")
+            print(f"  {args.output_prefix}_lambda{_nii_ext}")
         print()
 
 

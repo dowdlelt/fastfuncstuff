@@ -18,6 +18,70 @@ import numpy as np
 import torch
 
 
+_NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii")
+
+
+@dataclass
+class PrefixInfo:
+    """Parsed prefix with NIfTI extension separated from the stem.
+
+    Attributes
+    ----------
+    stem : str
+        Prefix with any NIfTI extension stripped.  Safe for use as a
+        directory name or as a base for constructing output paths.
+    nifti_ext : str
+        NIfTI extension to use for volume outputs (e.g. ``".nii.gz"``).
+        Defaults to ``".nii.gz"`` when no extension was specified.
+    """
+
+    stem: str
+    nifti_ext: str
+
+    def with_suffix(self, descriptor: str) -> str:
+        """Build an output path: ``{stem}_{descriptor}{nifti_ext}``.
+
+        Parameters
+        ----------
+        descriptor : str
+            File descriptor (e.g. ``"r2"``, ``"betas"``).
+        """
+        return f"{self.stem}_{descriptor}{self.nifti_ext}"
+
+    def as_file(self) -> str:
+        """Return ``{stem}{nifti_ext}`` — the prefix used as a single output file."""
+        return f"{self.stem}{self.nifti_ext}"
+
+
+def parse_prefix(prefix: str, default_ext: str = ".nii.gz") -> PrefixInfo:
+    """Parse a CLI ``-prefix`` value into a stem and NIfTI extension.
+
+    The user can signal the desired output compression via the prefix
+    extension::
+
+        -prefix out           →  stem="out",       ext=".nii.gz"  (default)
+        -prefix out.nii.gz    →  stem="out",       ext=".nii.gz"
+        -prefix out.nii       →  stem="out",       ext=".nii"
+        -prefix out.nii.zst   →  stem="out",       ext=".nii.zst"
+        -prefix dir/sub01     →  stem="dir/sub01", ext=".nii.gz"
+
+    Parameters
+    ----------
+    prefix : str
+        Raw ``-prefix`` value from argparse.
+    default_ext : str
+        Extension to use when the prefix has none (default ``".nii.gz"``).
+
+    Returns
+    -------
+    PrefixInfo
+    """
+    for ext in _NIFTI_EXTENSIONS:
+        if prefix.endswith(ext):
+            return PrefixInfo(stem=prefix[: -len(ext)], nifti_ext=ext)
+    return PrefixInfo(stem=prefix, nifti_ext=default_ext)
+
+
 def parse_input_files(input_arg: str | list[str]) -> list[str]:
     """
     Parse input files from command line arguments.
@@ -65,9 +129,12 @@ def parse_input_files(input_arg: str | list[str]) -> list[str]:
             # Not a glob pattern, use as-is
             files.append(pattern)
 
-    # Validate files exist
+    # Validate files exist (strip AFNI sub-brick selectors before checking)
+    from fastfuncstuff.io.afni import parse_subbrick_selector
+
     for f in files:
-        if not Path(f).exists():
+        clean_path, _ = parse_subbrick_selector(f)
+        if not Path(clean_path).exists():
             print(f"ERROR: Input file not found: {f}")
             sys.exit(1)
 
