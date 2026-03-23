@@ -75,6 +75,7 @@ def apply_polort_projection(
     data_vox_t: torch.Tensor,
     polort: int,
     device: torch.device,
+    run_starts: list[int] | None = None,
 ) -> torch.Tensor:
     """Project out polynomial trends from voxel time series.
 
@@ -86,6 +87,11 @@ def apply_polort_projection(
         Maximum polynomial degree to remove.
     device : torch.device
         Device used for polynomial basis construction.
+    run_starts : list of int, optional
+        Start indices of each run in the concatenated timeseries.
+        When provided, builds a block-diagonal polynomial basis so each
+        run's polynomials only affect that run's timepoints (per CLAUDE.md).
+        If None, treats the entire timeseries as a single run.
 
     Returns
     -------
@@ -94,12 +100,35 @@ def apply_polort_projection(
     """
     if polort is None or polort < 0:
         return data_vox_t
-    poly = construct_polynomial_matrix(
-        n_timepoints=data_vox_t.shape[1],
-        max_degree=polort,
-        device=device,
-        dtype=data_vox_t.dtype,
-    )
+
+    n_t = data_vox_t.shape[1]
+
+    if run_starts is not None and len(run_starts) > 1:
+        # Block-diagonal polynomial basis: each run gets its own polynomials,
+        # zero-padded so they don't affect other runs' timepoints.
+        poly = torch.zeros(n_t, 0, device=device, dtype=data_vox_t.dtype)
+        run_ends = list(run_starts[1:]) + [n_t]
+        for rs, re in zip(run_starts, run_ends):
+            run_len = re - rs
+            run_poly = construct_polynomial_matrix(
+                n_timepoints=run_len,
+                max_degree=polort,
+                device=device,
+                dtype=data_vox_t.dtype,
+            )
+            # Zero-pad into full timeseries length
+            padded = torch.zeros(n_t, run_poly.shape[1], device=device,
+                                 dtype=data_vox_t.dtype)
+            padded[rs:re, :] = run_poly
+            poly = torch.cat([poly, padded], dim=1)
+    else:
+        poly = construct_polynomial_matrix(
+            n_timepoints=n_t,
+            max_degree=polort,
+            device=device,
+            dtype=data_vox_t.dtype,
+        )
+
     if poly.shape[1] == 0:
         return data_vox_t
     q, _ = torch.linalg.qr(poly)
@@ -133,6 +162,7 @@ def apply_high_pass_fft(
     tr: float,
     high_pass_hz: float,
     transition_width: float = 0.25,
+    run_starts: list[int] | None = None,
 ) -> torch.Tensor:
     """Apply Fourier-based high-pass filter with smooth transition.
 
@@ -149,9 +179,34 @@ def apply_high_pass_fft(
     transition_width : float
         Width of transition band as fraction of cutoff frequency.
         0 = brick wall, 0.25 = smooth over 25% of cutoff.
+    run_starts : list of int, optional
+        Start indices of each run.  When provided, the filter is applied
+        independently to each run segment to avoid spectral leakage
+        across run boundaries.
     """
     if high_pass_hz is None or high_pass_hz <= 0:
         return data_vox_t
+
+    # If multi-run, filter each run segment independently
+    if run_starts is not None and len(run_starts) > 1:
+        n_t = data_vox_t.shape[1]
+        run_ends = list(run_starts[1:]) + [n_t]
+        for rs, re in zip(run_starts, run_ends):
+            data_vox_t[:, rs:re] = _apply_high_pass_single(
+                data_vox_t[:, rs:re], tr, high_pass_hz, transition_width,
+            )
+        return data_vox_t
+
+    return _apply_high_pass_single(data_vox_t, tr, high_pass_hz, transition_width)
+
+
+def _apply_high_pass_single(
+    data_vox_t: torch.Tensor,
+    tr: float,
+    high_pass_hz: float,
+    transition_width: float,
+) -> torch.Tensor:
+    """High-pass filter a single contiguous segment."""
     n_t = data_vox_t.shape[1]
     freqs = torch.fft.rfftfreq(n_t, d=tr).to(data_vox_t.device)
     spec = torch.fft.rfft(data_vox_t, dim=1)

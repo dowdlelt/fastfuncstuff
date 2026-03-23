@@ -662,6 +662,393 @@ class FastICA:
         }
 
 
+class InfoMaxICA:
+    """GPU-accelerated Extended InfoMax ICA for fMRI data.
+
+    Implements the natural gradient InfoMax algorithm (Bell & Sejnowski, 1995)
+    with the extended version (Lee, Girolami & Sejnowski, 1999) that handles
+    both sub- and super-Gaussian sources via adaptive switching.
+
+    Uses the same MELODIC-style row-centered PCA whitening as FastICA, so
+    components_, mixing_, and pca_ are directly interchangeable.
+
+    Follows the GIFT/EEGLAB reference implementation (runica.m) with
+    mini-batch natural gradient, angle-based annealing, and blowup recovery.
+
+    Parameters
+    ----------
+    n_components : int, optional
+        Number of ICA components. If None, uses PCA component count.
+    pca_components : int, float, or str, optional
+        PCA dimensionality reduction (same as FastICA).
+    max_iter : int, default=512
+        Maximum weight update steps (GIFT default).
+    learning_rate : float, optional
+        Initial step size. Default: ``0.015 / log(n_components)`` (GIFT/EEGLAB).
+    anneal_deg : float, default=60.0
+        Anneal when angle between consecutive weight-change vectors exceeds
+        this many degrees (GIFT default).
+    anneal_step : float, optional
+        Learning rate multiplier on anneal. Default: 0.90 (standard) or
+        0.98 (extended). Pass explicitly to override.
+    tol : float, default=1e-6
+        Convergence: stop when squared Frobenius norm of weight change < tol.
+    extended : bool, default=True
+        Use extended InfoMax (adaptive sub/super-Gaussian switching).
+    ext_kurtosis_momentum : float, default=0.5
+        EMA smoothing on kurtosis estimates for sign switching.
+    ext_signs_bias : float, default=0.02
+        Bias toward super-Gaussian in sign determination.
+    random_state : int, optional
+        Random seed for reproducibility.
+    whiten : bool, default=True
+        Whether to whiten data after PCA.
+    device : torch.device, optional
+        Computation device.
+
+    Attributes
+    ----------
+    components_ : torch.Tensor, shape (n_components, n_features)
+        ICA spatial maps.
+    mixing_ : torch.Tensor, shape (n_samples, n_components)
+        ICA mixing matrix (timeseries).
+    pca_ : _RowCenteredPCAState
+        Fitted PCA state.
+    n_iter_ : int
+        Number of iterations run.
+    """
+
+    def __init__(
+        self,
+        n_components: int | None = None,
+        pca_components: int | float | str | None = 0.85,
+        max_iter: int = 512,
+        learning_rate: float | None = None,
+        anneal_deg: float = 60.0,
+        anneal_step: float | None = None,
+        tol: float = 1e-6,
+        extended: bool = True,
+        ext_kurtosis_momentum: float = 0.5,
+        ext_signs_bias: float = 0.02,
+        random_state: int | None = None,
+        whiten: bool = True,
+        device: torch.device | None = None,
+        # Accept but ignore FastICA-specific kwargs for CLI compatibility
+        fun: str | None = None,
+        anneal_every: int | None = None,  # deprecated, ignored
+    ):
+        self.n_components = n_components
+        self.pca_components = pca_components
+        self.max_iter = max_iter
+        self.learning_rate = learning_rate
+        self.anneal_deg = anneal_deg
+        # GIFT defaults: 0.90 for standard, 0.98 for extended
+        self.anneal_step = anneal_step if anneal_step is not None else (0.98 if extended else 0.90)
+        self.tol = tol
+        self.extended = extended
+        self.ext_kurtosis_momentum = ext_kurtosis_momentum
+        self.ext_signs_bias = ext_signs_bias
+        self.random_state = random_state
+        self.whiten = whiten
+        self.device = device if device is not None else get_device()
+
+        # Fitted attributes
+        self.components_: torch.Tensor | None = None
+        self.mixing_: torch.Tensor | None = None
+        self.pca_: _RowCenteredPCAState | None = None
+        self.mean_: torch.Tensor | None = None
+        self.n_iter_: int | None = None
+        self.diagnostics_: dict | None = None
+
+    @torch.inference_mode()
+    def fit(self, X: np.ndarray | torch.Tensor) -> InfoMaxICA:
+        """Fit InfoMax ICA on data.
+
+        Uses the same MELODIC-style row-centered PCA whitening as FastICA.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Training data (n_timepoints, n_voxels).
+
+        Returns
+        -------
+        self
+        """
+        X = to_tensor(X, device=self.device)
+        n_samples, n_features = X.shape  # T, V
+
+        # --- PCA whitening (identical to FastICA) ---
+        self.mean_ = X.mean(dim=0, keepdim=True)
+        X = X - self.mean_
+
+        row_mean = X.mean(dim=1, keepdim=True)
+        cov_t = (X @ X.T - n_features * (row_mean @ row_mean.T)) / float(n_features)
+
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t)
+        del cov_t
+        eigenvalues = eigenvalues.flip(0)
+        eigenvectors = eigenvectors.flip(1)
+        eigenvalues = torch.clamp(eigenvalues, min=0)
+
+        n_max = min(n_samples, n_features)
+        pca_comp = self.pca_components
+        if pca_comp is None:
+            pca_n_components = n_max
+        elif isinstance(pca_comp, float) and 0.0 < pca_comp < 1.0:
+            total_var = eigenvalues.sum()
+            cumvar = torch.cumsum(eigenvalues, dim=0) / total_var
+            pca_n_components = int(torch.searchsorted(cumvar, pca_comp).item()) + 1
+            pca_n_components = min(pca_n_components, n_max)
+        elif isinstance(pca_comp, int):
+            pca_n_components = min(pca_comp, n_max)
+        else:
+            pca_n_components = n_max
+
+        evals_k = eigenvalues[:pca_n_components]
+        evecs_k = eigenvectors[:, :pca_n_components]
+
+        white = torch.diag(1.0 / torch.sqrt(evals_k + 1e-12)) @ evecs_k.T
+        pca_components_all = white @ X  # (k, V)
+        X_pca = X @ pca_components_all.T  # (T, k)
+
+        n_comp_req = self.n_components
+        if n_comp_req is None:
+            n_components = pca_n_components
+        else:
+            n_components = min(int(cast(int, n_comp_req)), pca_n_components)
+
+        pca_components = pca_components_all[:n_components]  # (n_ica, V)
+
+        # --- InfoMax optimization ---
+        W, n_iter, diag = self._infomax(pca_components, n_components)
+        self.n_iter_ = n_iter
+        self.diagnostics_ = diag
+
+        # Extract spatial maps and mixing matrix (same as FastICA)
+        self.components_ = W @ pca_components
+        X_pca_top = X_pca[:, :n_components]
+        self.mixing_ = X_pca_top @ torch.linalg.pinv(W)
+
+        self.pca_ = _RowCenteredPCAState(
+            components=pca_components_all,
+            eigenvectors=evecs_k,
+            eigenvalues=evals_k,
+            row_mean=row_mean,
+            device=self.device,
+        )
+
+        return self
+
+    def _infomax(
+        self,
+        X: torch.Tensor,
+        n_components: int,
+    ) -> tuple[torch.Tensor, int, dict]:
+        """Natural gradient InfoMax optimization (GIFT/EEGLAB-style).
+
+        Uses mini-batch stochastic natural gradient with angle-based
+        annealing and blowup recovery, matching the GIFT runica.m
+        reference implementation.
+
+        After PCA, X is (n_comp, n_vox). The mini-batch outer products
+        are (n_comp, n_comp) — tiny and GPU-friendly.
+
+        Parameters
+        ----------
+        X : (n_components, n_voxels)
+            Whitened PCA spatial components.
+        n_components : int
+            Number of ICA components.
+
+        Returns
+        -------
+        W : (n_components, n_components) unmixing matrix.
+        n_iter : int
+        diagnostics : dict
+        """
+        import math
+
+        n_comp, n_vox = X.shape
+
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+
+        orig_dtype = X.dtype
+        X = X.to(torch.float64)
+
+        # --- Constants from GIFT/EEGLAB runica.m ---
+        MIN_LRATE = 1e-6
+        MAX_LRATE = 0.1
+        MAX_WEIGHT = 1e8
+        RESTART_FAC = 0.9
+
+        # Mini-batch: block = sqrt(n_vox / 3)  (GIFT default)
+        block = max(1, int(math.floor(math.sqrt(n_vox / 3.0))))
+
+        # Learning rate: 0.015 / log(n_comp)  (GIFT default)
+        if self.learning_rate is not None:
+            lr = float(self.learning_rate)
+        else:
+            lr = 0.015 / math.log(max(n_comp, 2))
+        lr = max(MIN_LRATE, min(lr, MAX_LRATE))
+
+        W = torch.eye(n_comp, device=self.device, dtype=torch.float64)
+        I_block = block * torch.eye(n_comp, device=self.device, dtype=torch.float64)
+        initial_W = W.clone()
+
+        # Extended InfoMax state
+        signs = torch.ones(n_comp, 1, device=self.device, dtype=torch.float64)
+        old_kk = torch.zeros(n_comp, device=self.device, dtype=torch.float64)
+        signcount_interval = 1  # check every N blocks initially
+        signcount_since_change = 0
+        SIGNCOUNT_THRESHOLD = 25
+        SIGNCOUNT_STEP = 2
+
+        # Convergence tracking
+        old_delta = None
+        old_change = None
+        annealdeg_rad = self.anneal_deg * math.pi / 180.0
+
+        n_iter = 0
+        for step in range(self.max_iter):
+            n_iter = step
+
+            # Permute data columns each epoch (GIFT-style stochastic gradient)
+            perm = torch.randperm(n_vox, device=self.device)
+            X_perm = X[:, perm]
+
+            # Number of complete blocks this epoch
+            n_blocks = n_vox // block
+
+            for bi in range(n_blocks):
+                t0 = bi * block
+                t1 = t0 + block
+                x_block = X_perm[:, t0:t1]  # (n_comp, block)
+
+                u = W @ x_block  # (n_comp, block)
+
+                if self.extended:
+                    y = torch.tanh(u)
+                    dW = (I_block - (signs * y) @ u.T - u @ u.T) @ W
+                else:
+                    y = torch.sigmoid(u)
+                    dW = (I_block + (1.0 - 2.0 * y) @ u.T) @ W
+
+                W = W + lr * dW
+
+                # Blowup detection
+                if W.abs().max().item() > MAX_WEIGHT:
+                    lr *= RESTART_FAC
+                    W = initial_W.clone()
+                    old_delta = None
+                    old_change = None
+                    if lr < MIN_LRATE:
+                        break
+                    continue
+
+                # Extended: update signs periodically
+                if self.extended and (bi + 1) % signcount_interval == 0:
+                    u_k = W @ x_block
+                    m2 = u_k.pow(2).mean(dim=1)
+                    m4 = u_k.pow(4).mean(dim=1)
+                    kk = (m4 / m2.pow(2)) - 3.0
+
+                    # EMA smoothing on kurtosis
+                    mom = self.ext_kurtosis_momentum
+                    kk = mom * old_kk + (1.0 - mom) * kk
+                    old_kk = kk.clone()
+
+                    new_signs = torch.sign(kk + self.ext_signs_bias).unsqueeze(1)
+                    new_signs[new_signs == 0] = 1.0
+
+                    if (new_signs == signs).all():
+                        signcount_since_change += 1
+                        if signcount_since_change >= SIGNCOUNT_THRESHOLD:
+                            signcount_interval *= SIGNCOUNT_STEP
+                            signcount_since_change = 0
+                    else:
+                        signcount_since_change = 0
+                    signs = new_signs
+
+            # End-of-epoch convergence check (squared Frobenius norm of dW)
+            delta = (lr * dW).reshape(-1)
+            change = (delta @ delta).item()
+
+            # Annealing: angle between consecutive weight-change vectors
+            if old_delta is not None and old_change is not None and old_change > 0 and change > 0:
+                cos_angle = (delta @ old_delta) / math.sqrt(change * old_change)
+                cos_angle = cos_angle.clamp(-1.0, 1.0)
+                angle = torch.acos(cos_angle).item()
+                if angle > annealdeg_rad:
+                    lr *= self.anneal_step
+                    if lr < MIN_LRATE:
+                        break
+
+            old_delta = delta.clone()
+            old_change = change
+
+            if step > 1 and change < self.tol:
+                break
+
+        # Signs summary for diagnostics
+        n_sub = int((signs < 0).sum().item())
+        n_super = int((signs > 0).sum().item())
+
+        diagnostics = {
+            "learning_rate_initial": 0.015 / math.log(max(n_comp, 2)) if self.learning_rate is None else self.learning_rate,
+            "learning_rate_final": lr,
+            "block_size": block,
+            "n_blocks_per_epoch": n_vox // block,
+            "final_change": change,
+            "converged": step > 1 and change < self.tol,
+            "n_sub_gaussian": n_sub,
+            "n_super_gaussian": n_super,
+            "extended": self.extended,
+        }
+
+        return W.to(orig_dtype), n_iter + 1, diagnostics
+
+    def transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
+        """Transform data to ICA component space."""
+        if self.components_ is None:
+            raise RuntimeError("ICA must be fitted before transform()")
+        X = to_tensor(X, device=self.device)
+        X_pca = self.pca_.transform(X)
+        W = self.components_ @ torch.linalg.pinv(self.pca_.components_)
+        return X_pca @ W.T
+
+    def fit_transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
+        """Fit and return mixing matrix."""
+        self.fit(X)
+        return self.mixing_
+
+
+def create_ica(
+    method: str = "fastica",
+    **kwargs,
+) -> FastICA | InfoMaxICA:
+    """Factory to create an ICA estimator by method name.
+
+    Parameters
+    ----------
+    method : str
+        "fastica" or "infomax".
+    **kwargs
+        Passed to the constructor (n_components, pca_components, etc.).
+
+    Returns
+    -------
+    FastICA or InfoMaxICA
+    """
+    if method == "fastica":
+        return FastICA(**kwargs)
+    elif method == "infomax":
+        return InfoMaxICA(**kwargs)
+    else:
+        raise ValueError(f"Unknown ICA method: {method!r}. Use 'fastica' or 'infomax'.")
+
+
 def ica_stability_analysis(
     X: np.ndarray | torch.Tensor,
     n_components: int,

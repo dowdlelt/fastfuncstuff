@@ -69,6 +69,9 @@ design_optimization_results/
 *.nii
 *.nii.gz
 
+# real test data
+test_data/ds005165-download/
+
 # Test outputs (generated)
 test_data/**/test_*.nii.gz
 test_data/**/icasso_*.nii.gz

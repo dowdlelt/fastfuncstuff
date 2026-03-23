@@ -1632,6 +1632,94 @@ def _generate_afni_idcode() -> str:
     return f"AFN_{raw[:22]}"
 
 
+def get_afni_space_info(header: object) -> dict[str, str | int]:
+    """Extract AFNI view code and template space from a NIfTI header.
+
+    Returns a dict with:
+        - ``view``: 0 (orig), 1 (acpc), or 2 (tlrc)
+        - ``space``: e.g. "ORIG", "MNI_2009c_asym", "TLRC"
+
+    If the header has no AFNI extension, returns ``{"view": 0, "space": "ORIG"}``.
+    """
+    import re
+
+    result: dict[str, str | int] = {"view": 0, "space": "ORIG"}
+
+    try:
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return result
+
+    for ext in extensions:
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            xml = ext.content.decode("utf-8", errors="replace")
+
+            # SCENE_DATA — first value is the view code
+            m = re.search(
+                r'atr_name="SCENE_DATA"\s*>\s*\n\s*(\d+)',
+                xml,
+            )
+            if m:
+                result["view"] = int(m.group(1))
+
+            # TEMPLATE_SPACE
+            m = re.search(
+                r'atr_name="TEMPLATE_SPACE"\s*>\s*\n\s*"([^"]*)"',
+                xml,
+            )
+            if m:
+                result["space"] = m.group(1)
+
+            break
+
+    return result
+
+
+def set_afni_space_info(
+    header: object,
+    view: int,
+    space: str,
+) -> None:
+    """Set AFNI view code and template space in a NIfTI header's extension.
+
+    Args:
+        header: nibabel NIfTI header (must already have an AFNI extension)
+        view: 0 (orig), 1 (acpc), or 2 (tlrc)
+        space: Template space string, e.g. "ORIG", "MNI_2009c_asym"
+    """
+    import re
+
+    try:
+        import nibabel as nib
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return
+
+    for i, ext in enumerate(extensions):
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            xml = ext.content.decode("utf-8", errors="replace")
+
+            # Update SCENE_DATA — replace first integer
+            xml = re.sub(
+                r'(atr_name="SCENE_DATA"\s*>\s*\n\s*)\d+',
+                rf'\g<1>{view}',
+                xml,
+            )
+
+            # Update TEMPLATE_SPACE
+            xml = re.sub(
+                r'(atr_name="TEMPLATE_SPACE"\s*>\s*\n\s*)"[^"]*"',
+                rf'\1"{space}"',
+                xml,
+            )
+
+            new_ext = nib.nifti1.Nifti1Extension(
+                _NIFTI_ECODE_AFNI, xml.encode("utf-8")
+            )
+            extensions[i] = new_ext
+            break
+
+
 def _update_afni_extension(
     header: object,
     data_shape: tuple[int, ...],

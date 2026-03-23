@@ -76,6 +76,15 @@ Examples:
         "If not specified, uses source grid or first warp grid.",
     )
 
+    io_group.add_argument(
+        "-dxyz",
+        type=float,
+        default=None,
+        help="Force isotropic output voxel size (mm). "
+        "Recomputes output grid dimensions to cover the same FOV at the new resolution. "
+        "E.g., -dxyz 3.0 for 3mm isotropic output.",
+    )
+
     interp_group = parser.add_argument_group("Interpolation")
     interp_group.add_argument(
         "-interp",
@@ -165,6 +174,7 @@ def main(argv: list[str] | None = None) -> None:
         time_range=time_range,
         debug=args.debug,
         save_mean=args.save_mean,
+        dxyz=args.dxyz,
     )
 
     if verb >= 1:

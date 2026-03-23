@@ -27,6 +27,38 @@ from tqdm import tqdm
 from .interp import trilinear_interpolate, warp_image_wsinc5
 from .io import derive_mean_output_path, load_image, load_warp_field, save_image
 
+from ..io.afni import get_afni_space_info, set_afni_space_info
+
+
+def compute_cardinal_affine(oblique_aff: np.ndarray) -> np.ndarray:
+    """Compute cardinal (deobliqued) affine matching AFNI's ijk_to_dicom.
+
+    When AFNI reads a NIfTI file, it stores the raw sform/qform as
+    ``ijk_to_dicom_real`` (oblique) and computes a cardinal version as
+    ``ijk_to_dicom`` where each voxel axis is aligned to its closest
+    cardinal (x/y/z) direction.  All matrix conversions in AFNI use
+    ``ijk_to_dicom`` (the cardinal version), so we must do the same.
+
+    For each column of the 3×3 rotation/scale block:
+      1. Find the dominant (largest-magnitude) row
+      2. Set that entry to ±voxel_size, zero all others
+
+    The origin (translation) is preserved.
+    """
+    R = oblique_aff[:3, :3]
+    cardinal = np.zeros((4, 4), dtype=np.float64)
+    cardinal[3, 3] = 1.0
+    cardinal[:3, 3] = oblique_aff[:3, 3]
+
+    for col in range(3):
+        vec = R[:, col]
+        voxel_size = np.sqrt(np.sum(vec ** 2))
+        dominant = int(np.argmax(np.abs(vec)))
+        sign = np.sign(vec[dominant])
+        cardinal[dominant, col] = sign * voxel_size
+
+    return cardinal
+
 
 @dataclass
 class AffineTransform:
@@ -47,12 +79,13 @@ class AffineTransform:
 
 @dataclass
 class NonlinearWarp:
-    """Displacement field in voxel units."""
+    """Displacement field (voxel units after prepare_warp, NIfTI mm after load)."""
 
     xd: Tensor  # (nz, ny, nx)
     yd: Tensor
     zd: Tensor
     header_info: dict
+    units: str = "voxels"  # "voxels" or "nifti_mm"
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -121,17 +154,21 @@ def load_affine_1D(
         print(f"  [{m[3, 0]:9.5f} {m[3, 1]:9.5f} {m[3, 2]:9.5f} {m[3, 3]:9.5f}]")
 
     # Convert DICOM mm -> output grid voxel indices
-    # AFNI uses a coordinate system that differs from NIfTI by negating x and y.
-    # When AFNI reads NIfTI, it creates ijk_to_dicom by negating rows 0,1 of sform.
-    # So AFNI_DICOM = flip @ NIfTI_RAS where flip = diag(-1,-1,1,1)
-    # To use DICOM matrices with NIfTI affines, we need:
-    #   M_nifti = flip @ M_dicom @ flip
-    # Then: M_index = inv(nifti_affine) @ M_nifti @ nifti_affine
+    #
+    # AFNI uses CARDINAL (deobliqued) coordinate matrices for this conversion.
+    # When AFNI reads a NIfTI file, it stores the oblique sform as
+    # ijk_to_dicom_real and computes a cardinal (axis-aligned) version as
+    # ijk_to_dicom.  All matrix conversions use ijk_to_dicom (cardinal).
+    #
+    # AFNI_DICOM = flip @ NIfTI_RAS where flip = diag(-1,-1,1,1)
+    # M_nifti = flip @ M_dicom @ flip
+    # M_index = inv(cardinal_affine) @ M_nifti @ cardinal_affine
+    cardinal = compute_cardinal_affine(output_affine)
     flip = torch.tensor(
         [[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
         dtype=torch.float32,
     )
-    output_ijk2xyz = torch.from_numpy(output_affine.astype(np.float32)).float()
+    output_ijk2xyz = torch.from_numpy(cardinal.astype(np.float32)).float()
     output_xyz2ijk = torch.linalg.inv(output_ijk2xyz)
 
     if debug:
@@ -164,19 +201,25 @@ def load_warp(
 ) -> NonlinearWarp:
     """Load nonlinear warp from 4D NIfTI.
 
+    AFNI warps store displacements in DICOM mm.  We convert to NIfTI mm
+    (negate x, y) but do NOT convert to voxels here.  The voxel conversion
+    happens later in ``prepare_warp_for_grid`` using the *output* grid's
+    affine, matching AFNI's ``THD_setup_nwarp`` approach.
+
     Args:
         path: Path to warp file
         device: Torch device
-        units: "mm" (convert DICOM mm to voxels, default), "voxels" (as-is)
+        units: "mm" (convert DICOM→NIfTI mm, default), "voxels" (as-is)
         debug: Print debug info
 
     Returns:
-        NonlinearWarp with displacement fields in voxel units
+        NonlinearWarp with displacements in NIfTI mm (units="mm") or
+        voxel units (units="voxels")
     """
     xd, yd, zd, header_info = load_warp_field(path, device=device)
 
     if debug:
-        print("[DEBUG] load_warp: Raw displacement ranges (before conversion):")
+        print("[DEBUG] load_warp: Raw displacement ranges (DICOM mm):")
         print(f"  xd: [{xd.min().item():.3f}, {xd.max().item():.3f}]")
         print(f"  yd: [{yd.min().item():.3f}, {yd.max().item():.3f}]")
         print(f"  zd: [{zd.min().item():.3f}, {zd.max().item():.3f}]")
@@ -187,62 +230,42 @@ def load_warp(
         print(f"  [{a[2, 0]:9.5f} {a[2, 1]:9.5f} {a[2, 2]:9.5f} {a[2, 3]:9.5f}]")
 
     if units == "mm":
-        xd, yd, zd = _convert_warp_mm_to_voxels(xd, yd, zd, header_info["affine"])
+        # DICOM mm → NIfTI mm: just negate x and y
+        xd = -xd
+        yd = -yd
+        warp_units = "nifti_mm"
         if debug:
-            print("[DEBUG] load_warp: After DICOM mm->voxel conversion:")
+            print("[DEBUG] load_warp: After DICOM→NIfTI mm conversion:")
             print(f"  xd: [{xd.min().item():.3f}, {xd.max().item():.3f}]")
             print(f"  yd: [{yd.min().item():.3f}, {yd.max().item():.3f}]")
             print(f"  zd: [{zd.min().item():.3f}, {zd.max().item():.3f}]")
-    elif debug:
-        print("[DEBUG] load_warp: Warps assumed to be in voxel units (no conversion)")
+    else:
+        warp_units = "voxels"
+        if debug:
+            print("[DEBUG] load_warp: Warps assumed to be in voxel units")
 
-    return NonlinearWarp(xd=xd, yd=yd, zd=zd, header_info=header_info)
-
-
-def _warp_likely_in_mm(xd: Tensor, yd: Tensor, zd: Tensor, header_info: dict) -> bool:
-    """Heuristic: if max displacement > typical voxel size, likely in mm.
-
-    AFNI warps are ALWAYS in DICOM mm, but we check anyway.
-    Uses max absolute displacement across all three components.
-    """
-    max_disp = max(xd.abs().max().item(), yd.abs().max().item(), zd.abs().max().item())
-    # If max displacement > 2 voxels worth, assume mm
-    # Typical voxel is 1-3mm, so displacements > 5 are definitely mm
-    return max_disp > 5.0
+    return NonlinearWarp(
+        xd=xd, yd=yd, zd=zd, header_info=header_info, units=warp_units
+    )
 
 
-def _convert_warp_mm_to_voxels(
+def _nifti_mm_to_voxels(
     xd: Tensor, yd: Tensor, zd: Tensor, affine: np.ndarray
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Convert warp displacements from DICOM mm to voxel units.
+    """Convert NIfTI mm displacements to voxel-index displacements.
 
-    AFNI warp files store displacements in DICOM mm (LPS convention).
-    NIfTI uses RAS convention. We need to negate x and y displacements
-    to convert from DICOM to NIfTI coordinates, then apply the inverse
-    of the NIfTI affine's rotation/scaling to get voxel displacements.
+    Uses the inverse of the affine's 3x3 rotation/scale to convert
+    displacement vectors from NIfTI mm to the affine's voxel space.
     """
-    xd_np = xd.cpu().numpy() if xd.device.type != "cpu" else xd.numpy()
-    yd_np = yd.cpu().numpy() if yd.device.type != "cpu" else yd.numpy()
-    zd_np = zd.cpu().numpy() if zd.device.type != "cpu" else zd.numpy()
+    rs_inv = np.linalg.inv(affine[:3, :3].astype(np.float64)).astype(np.float32)
+    R = torch.from_numpy(rs_inv).to(xd.device)
 
-    # Convert from DICOM mm to NIfTI mm by negating x and y
-    xd_nifti = -xd_np
-    yd_nifti = -yd_np
-    zd_nifti = zd_np
+    # Apply R to displacement vectors: disp_vox = R @ disp_mm
+    vx = R[0, 0] * xd + R[0, 1] * yd + R[0, 2] * zd
+    vy = R[1, 0] * xd + R[1, 1] * yd + R[1, 2] * zd
+    vz = R[2, 0] * xd + R[2, 1] * yd + R[2, 2] * zd
 
-    # Convert NIfTI mm to voxel indices using inverse of affine 3x3
-    rs = affine[:3, :3]
-    rs_inv = np.linalg.inv(rs)
-
-    disp_mm = np.stack([xd_nifti, yd_nifti, zd_nifti], axis=-1)
-    disp_vox = np.einsum("ij,...j->...i", rs_inv, disp_mm)
-
-    device = xd.device
-    xd = torch.from_numpy(disp_vox[..., 0].copy()).to(device)
-    yd = torch.from_numpy(disp_vox[..., 1].copy()).to(device)
-    zd = torch.from_numpy(disp_vox[..., 2].copy()).to(device)
-
-    return xd, yd, zd
+    return vx, vy, vz
 
 
 def parse_nwarp_string(nwarp_str: str) -> list[str]:
@@ -275,113 +298,117 @@ def identify_transform_type(path: str) -> str:
         raise ValueError(f"Cannot identify transform type for: {path}")
 
 
-def resample_warp_to_grid(
+def prepare_warp_for_grid(
     warp: NonlinearWarp,
     target_shape: tuple[int, int, int],
     target_affine: np.ndarray,
     device: torch.device,
     verb: int = 1,
 ) -> NonlinearWarp:
-    """Resample a warp field to a different grid using trilinear interpolation.
+    """Resample a NIfTI-mm warp to the target grid and convert to voxel units.
 
-    Handles the critical case where warp and target grids have different axis
-    orderings (e.g., permuted j↔k). The displacement vectors are transformed
-    from warp-voxel space to target-voxel space during resampling.
+    Follows AFNI's ``THD_setup_nwarp`` approach:
+      1. Map target voxel coords → warp voxel coords (for interpolation)
+      2. Interpolate NIfTI mm displacement values at those locations
+      3. Convert NIfTI mm → target-voxel units using inv(target_R)
 
-    Steps:
-      1. Map target voxel coords → warp voxel coords (for sampling locations)
-      2. Interpolate displacement values at those locations (in warp-voxel units)
-      3. Rotate displacement vectors: warp-voxel → target-voxel space
+    This avoids the error-prone displacement-vector rotation by converting
+    directly from mm to the target grid's voxel space.
 
     Args:
-        warp: Input warp field
+        warp: Input warp with displacements in NIfTI mm (units="nifti_mm")
         target_shape: (nz, ny, nx) target dimensions
         target_affine: Target affine matrix
         device: Torch device
         verb: Verbosity level
 
     Returns:
-        Warp resampled to target grid, with displacements in target-voxel units
+        Warp on target grid with displacements in target-voxel units
     """
+    assert warp.units == "nifti_mm", (
+        f"prepare_warp_for_grid expects NIfTI mm warp, got units={warp.units}"
+    )
+
     src_shape = tuple(warp.xd.shape)
     src_affine = warp.header_info["affine"].astype(np.float64)
     tgt_affine = target_affine.astype(np.float64)
 
-    # Check if shapes and affines match — skip if identical grid
-    if src_shape == target_shape and np.allclose(src_affine, tgt_affine, atol=1e-4):
-        if verb >= 2:
-            print(f"  [resample] grids match {src_shape}, skipping resample")
-        return warp
+    # Use cardinal affines for grid mapping (matching AFNI)
+    src_cardinal = compute_cardinal_affine(src_affine)
+    tgt_cardinal = compute_cardinal_affine(tgt_affine)
 
-    if verb >= 2:
-        print(f"  [resample] {src_shape} -> {target_shape}")
-
-    src_nz, src_ny, src_nx = src_shape
     tgt_nz, tgt_ny, tgt_nx = target_shape
 
-    # Step 1: mapping target voxels → warp voxels for sampling
-    src_xyz2ijk = np.linalg.inv(src_affine)
-    M = (src_xyz2ijk @ tgt_affine).astype(np.float32)
-
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(tgt_nz, dtype=torch.float32, device=device),
-        torch.arange(tgt_ny, dtype=torch.float32, device=device),
-        torch.arange(tgt_nx, dtype=torch.float32, device=device),
-        indexing="ij",
+    # Check if grids match — skip resampling if so
+    needs_resample = not (
+        src_shape == target_shape
+        and np.allclose(src_cardinal, tgt_cardinal, atol=1e-4)
     )
 
-    coords = torch.stack(
-        [
-            ii.reshape(-1),
-            jj.reshape(-1),
-            kk.reshape(-1),
-            torch.ones(tgt_nz * tgt_ny * tgt_nx, dtype=torch.float32, device=device),
-        ],
-        dim=0,
-    )
-
-    M_t = torch.from_numpy(M).float().to(device)
-    src_coords = M_t @ coords
-
-    src_x = src_coords[0].reshape(tgt_nz, tgt_ny, tgt_nx)
-    src_y = src_coords[1].reshape(tgt_nz, tgt_ny, tgt_nx)
-    src_z = src_coords[2].reshape(tgt_nz, tgt_ny, tgt_nx)
-
-    # Step 2: interpolate displacement components at source locations
-    flat_x = src_x.reshape(-1)
-    flat_y = src_y.reshape(-1)
-    flat_z = src_z.reshape(-1)
-    new_xd = trilinear_interpolate(warp.xd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
-    new_yd = trilinear_interpolate(warp.yd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
-    new_zd = trilinear_interpolate(warp.zd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
-
-    # Step 3: rotate displacement vectors from warp-voxel space to target-voxel space
-    # Displacement in warp-voxel → mm: R_warp @ d_warp_vox
-    # mm → target-voxel: R_tgt_inv @ mm_disp
-    # Combined: R_tgt_inv @ R_warp @ d_warp_vox
-    src_R = src_affine[:3, :3]
-    tgt_R_inv = np.linalg.inv(tgt_affine[:3, :3])
-    disp_xform = (tgt_R_inv @ src_R).astype(np.float32)
-
-    if not np.allclose(disp_xform, np.eye(3), atol=1e-4):
+    if needs_resample:
         if verb >= 2:
-            print("  [resample] rotating displacement vectors (grids have different axes)")
-        D = torch.from_numpy(disp_xform).float().to(device)
-        # Stack displacements and rotate
-        disp = torch.stack([new_xd.reshape(-1), new_yd.reshape(-1), new_zd.reshape(-1)], dim=0).float()
-        disp_rot = D @ disp
-        new_xd = disp_rot[0].reshape(tgt_nz, tgt_ny, tgt_nx)
-        new_yd = disp_rot[1].reshape(tgt_nz, tgt_ny, tgt_nx)
-        new_zd = disp_rot[2].reshape(tgt_nz, tgt_ny, tgt_nx)
+            print(f"  [prepare_warp] resampling {src_shape} -> {target_shape}")
+
+        # Map target voxels → warp voxels for interpolation
+        src_xyz2ijk = np.linalg.inv(src_cardinal)
+        M = (src_xyz2ijk @ tgt_cardinal).astype(np.float32)
+
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(tgt_nz, dtype=torch.float32, device=device),
+            torch.arange(tgt_ny, dtype=torch.float32, device=device),
+            torch.arange(tgt_nx, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+
+        coords = torch.stack(
+            [
+                ii.reshape(-1),
+                jj.reshape(-1),
+                kk.reshape(-1),
+                torch.ones(
+                    tgt_nz * tgt_ny * tgt_nx,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            ],
+            dim=0,
+        )
+
+        M_t = torch.from_numpy(M).float().to(device)
+        src_coords = M_t @ coords
+
+        flat_x = src_coords[0]
+        flat_y = src_coords[1]
+        flat_z = src_coords[2]
+
+        # Interpolate NIfTI mm displacements at warp grid locations
+        mm_xd = trilinear_interpolate(warp.xd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
+        mm_yd = trilinear_interpolate(warp.yd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
+        mm_zd = trilinear_interpolate(warp.zd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
+    else:
+        if verb >= 2:
+            print(f"  [prepare_warp] grids match {src_shape}, no resample needed")
+        mm_xd, mm_yd, mm_zd = warp.xd, warp.yd, warp.zd
+
+    # Convert NIfTI mm → target-voxel units using CARDINAL affine
+    # (AFNI uses cardinal coordinate matrices for all conversions)
+    tgt_cardinal = compute_cardinal_affine(target_affine)
+    vx, vy, vz = _nifti_mm_to_voxels(mm_xd, mm_yd, mm_zd, tgt_cardinal)
 
     new_header = {
         "affine": target_affine.copy(),
         "header": warp.header_info.get("header"),
     }
 
-    result = NonlinearWarp(xd=new_xd, yd=new_yd, zd=new_zd, header_info=new_header)
+    result = NonlinearWarp(
+        xd=vx, yd=vy, zd=vz, header_info=new_header, units="voxels"
+    )
     if verb >= 2:
-        print(f"  [resample] result shape = {result.shape}")
+        print(f"  [prepare_warp] result shape = {result.shape}")
+        print(f"  [prepare_warp] voxel disp ranges: "
+              f"x=[{vx.min().item():.2f}, {vx.max().item():.2f}] "
+              f"y=[{vy.min().item():.2f}, {vy.max().item():.2f}] "
+              f"z=[{vz.min().item():.2f}, {vz.max().item():.2f}]")
     return result
 
 
@@ -602,26 +629,22 @@ def compose_chain(
                 )
 
         elif isinstance(xform, NonlinearWarp):
+            # Convert NIfTI mm warp to output-grid voxel units
+            prepared = prepare_warp_for_grid(
+                xform, output_shape, output_affine, device, verb=verb
+            )
             if result_warp is None:
-                resampled = resample_warp_to_grid(
-                    xform, output_shape, output_affine, device, verb=verb
-                )
-                result_warp = resampled
+                result_warp = prepared
                 if verb >= 2:
                     print(
-                        f"  [compose] first warp [{i}]: {xform.shape} -> resampled to {result_warp.shape}"
+                        f"  [compose] first warp [{i}]: {xform.shape} -> {result_warp.shape}"
                     )
             else:
                 if verb >= 2:
                     print(
-                        f"  [compose] resampling warp [{i}] from {xform.shape} to {output_shape}"
+                        f"  [compose] composing warp [{i}] ({xform.shape} -> {output_shape})"
                     )
-                resampled = resample_warp_to_grid(
-                    xform, output_shape, output_affine, device, verb=verb
-                )
-                if verb >= 2:
-                    print(f"  [compose] resampled shape = {resampled.shape}")
-                result_warp = compose_warp_then_warp(result_warp, resampled)
+                result_warp = compose_warp_then_warp(result_warp, prepared)
                 if verb >= 2:
                     print(
                         f"  [compose] after compose: warp shape = {result_warp.shape}"
@@ -683,9 +706,12 @@ def apply_composed_warp(
     out_y = jj + warp.yd
     out_z = kk + warp.zd
 
-    # Convert output-voxel → source-voxel
-    # M = inv(source_affine) @ output_affine
-    M = np.linalg.inv(source_affine.astype(np.float64)) @ output_affine.astype(np.float64)
+    # Convert output-voxel → source-voxel using CARDINAL affines.
+    # AFNI uses cardinal (deobliqued) coordinate matrices for all
+    # index-to-coordinate conversions, so we must do the same.
+    src_card = compute_cardinal_affine(source_affine)
+    out_card = compute_cardinal_affine(output_affine)
+    M = np.linalg.inv(src_card) @ out_card
     M = M.astype(np.float32)
     M_t = torch.from_numpy(M).float().to(device)
 
@@ -710,6 +736,51 @@ def apply_composed_warp(
         return warp_image_linear(source, src_xd, src_yd, src_zd)
 
 
+def _regrid_to_dxyz(
+    output_shape: tuple[int, ...],
+    output_affine: np.ndarray,
+    dxyz: float,
+) -> tuple[tuple[int, ...], np.ndarray]:
+    """Recompute output grid for isotropic voxel size while preserving FOV.
+
+    Takes the existing output grid (shape + affine) and returns a new grid
+    whose voxels are ``dxyz`` mm isotropic, covering the same bounding box.
+
+    Origin is adjusted to preserve the FOV center, matching AFNI's
+    ``r_dxyz_mod_dataxes()`` behavior.
+    """
+    # Current voxel sizes from the affine columns
+    old_voxel_sizes = np.sqrt((output_affine[:3, :3] ** 2).sum(axis=0))
+
+    # output_shape is (nz, ny, nx) = (nk, nj, ni) but affine columns are
+    # (i, j, k) order.  Convert shape to affine axis order.
+    shape_ijk = np.array([output_shape[2], output_shape[1], output_shape[0]])
+
+    # FOV in mm along each voxel axis
+    fov = old_voxel_sizes * shape_ijk
+
+    # New grid dimensions in (i, j, k) order
+    new_ijk = tuple(int(f / dxyz + 0.499) for f in fov)
+    # Convert back to internal (nz, ny, nx) = (nk, nj, ni)
+    new_shape = (new_ijk[2], new_ijk[1], new_ijk[0])
+
+    # New affine: same orientation (unit vectors), scaled by new voxel size
+    direction = output_affine[:3, :3] / old_voxel_sizes[np.newaxis, :]
+    old_R = output_affine[:3, :3]
+    new_R = direction * dxyz
+
+    new_affine = np.eye(4)
+    new_affine[:3, :3] = new_R
+
+    # Adjust origin to preserve FOV center (matches AFNI r_dxyz_mod_dataxes)
+    # Uses (i,j,k) ordered shapes since affine columns are (i,j,k)
+    old_center_offset = old_R @ (shape_ijk - 1.0) * 0.5
+    new_center_offset = new_R @ (np.array(new_ijk) - 1.0) * 0.5
+    new_affine[:3, 3] = output_affine[:3, 3] + old_center_offset - new_center_offset
+
+    return new_shape, new_affine
+
+
 def nwarpforge(
     source_path: str,
     nwarp_specs: list[str],
@@ -721,6 +792,7 @@ def nwarpforge(
     time_range: tuple[int, int] | None = None,
     debug: bool = False,
     save_mean: bool = False,
+    dxyz: float | None = None,
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -734,6 +806,7 @@ def nwarpforge(
         verb: Verbosity level
         time_range: If set, only process volumes in range [start, end)
         debug: Print detailed matrix/warp debug info
+        dxyz: If set, force isotropic output voxel size (mm)
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -748,16 +821,27 @@ def nwarpforge(
     is_4d = source.ndim == 4
     nt = source.shape[0] if is_4d else 1
 
+    master_hdr_obj = None  # nibabel header for AFNI extension propagation
     if master_path is not None:
         master, master_header = load_image(master_path, device=device)
         if master.ndim == 4:
             master = master[0]
         output_shape = tuple(master.shape)
-        output_affine = master_header["affine"]
+        output_affine = compute_cardinal_affine(master_header["affine"])
+        master_space_info = get_afni_space_info(master_header.get("header"))
+        master_hdr_obj = master_header.get("header")
         del master
     else:
         output_shape = tuple(source.shape[-3:]) if is_4d else tuple(source.shape)
-        output_affine = source_header["affine"]
+        output_affine = compute_cardinal_affine(source_header["affine"])
+        master_space_info = get_afni_space_info(source_header.get("header"))
+
+    # Apply -dxyz: recompute grid for isotropic voxel size
+    if dxyz is not None:
+        old_shape = output_shape
+        output_shape, output_affine = _regrid_to_dxyz(output_shape, output_affine, dxyz)
+        if verb >= 1:
+            print(f"nwarpforge: -dxyz {dxyz} mm: {old_shape} -> {output_shape}")
 
     # Matrix conversion: AFNI uses `actual_cmat` from the first nonlinear warp's
     # dataset for converting DICOM matrices to voxel space. However, since we
@@ -823,6 +907,16 @@ def nwarpforge(
                     f"    zd: [{xform.zd.min().item():.3f}, {xform.zd.max().item():.3f}]"
                 )
 
+    # If master didn't provide space info, try the first NIfTI warp in chain
+    if master_hdr_obj is None:
+        for xform in transforms:
+            if isinstance(xform, NonlinearWarp):
+                warp_hdr = xform.header_info.get("header")
+                if warp_hdr is not None:
+                    master_space_info = get_afni_space_info(warp_hdr)
+                    master_hdr_obj = warp_hdr
+                    break
+
     if is_4d and max_time_points > 1:
         nt = max(nt, max_time_points)
 
@@ -867,7 +961,52 @@ def nwarpforge(
     else:
         output = output_volumes[0]
 
-    output_header = {"affine": output_affine, "header": source_header.get("header")}
+    # Build output header: use output_affine (cardinal), don't inherit
+    # source's qform/sform which would conflict with the output grid.
+    # Preserve temporal metadata (TR, units) from source.
+    # Propagate AFNI view/space from master (e.g. tlrc + MNI_2009c_asym).
+    src_hdr = source_header.get("header")
+    try:
+        import nibabel as nib
+        out_hdr = nib.Nifti1Header()
+        if src_hdr is not None:
+            # Copy temporal metadata (units always safe; zooms need valid ndim)
+            out_hdr.set_xyzt_units(*src_hdr.get_xyzt_units())
+            src_zooms = src_hdr.get_zooms()
+            if len(src_zooms) > 3 and output.ndim == 4:
+                # 4D output: set shape first so set_zooms accepts 4 values
+                out_hdr.set_data_shape(output.shape)
+                out_hdr.set_zooms((1.0, 1.0, 1.0, src_zooms[3]))
+
+        # Copy AFNI extension: prefer master (has correct space),
+        # fall back to source (has history).
+        afni_ext_copied = False
+        for hdr_candidate in (master_hdr_obj, src_hdr):
+            if hdr_candidate is None:
+                continue
+            try:
+                for ext in hdr_candidate.extensions:
+                    if ext.get_code() == 4:
+                        out_hdr.extensions.append(ext)
+                        afni_ext_copied = True
+                        break
+            except AttributeError:
+                pass
+            if afni_ext_copied:
+                break
+
+        # Set AFNI view/space from master
+        set_afni_space_info(
+            out_hdr,
+            view=master_space_info["view"],
+            space=master_space_info["space"],
+        )
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"nwarpforge: failed to build output header: {exc}", stacklevel=2)
+        out_hdr = None
+
+    output_header = {"affine": output_affine, "header": out_hdr}
     save_image(output, prefix, header_info=output_header)
 
     if verb >= 1:

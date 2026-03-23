@@ -365,7 +365,7 @@ def analyze_from_onsets(
 
 def analyze_from_design_matrix(
     fmri_data: str | Path | list[str | Path] | np.ndarray | torch.Tensor,
-    design_matrix_file: str | Path,
+    design_matrix_file: str | Path | None = None,
     method: str = "ols",
     use_stimulus_only: bool = False,
     arma_a_grid: torch.Tensor | None = None,
@@ -390,6 +390,7 @@ def analyze_from_design_matrix(
     want_r2_semipartial: bool = False,
     r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
     legacy_contrasts: bool = False,
+    design_info: dict | None = None,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -477,7 +478,12 @@ def analyze_from_design_matrix(
         device = get_device()
 
     # 1. Read design matrix first to get run_starts
-    design_info = read_afni_design_matrix(design_matrix_file)
+    if design_info is None:
+        if design_matrix_file is None:
+            raise ValueError(
+                "Either design_matrix_file or design_info must be provided"
+            )
+        design_info = read_afni_design_matrix(design_matrix_file)
     expected_run_starts = design_info.get("run_starts", None)
 
     # 2. Load fMRI data (handle both single file and multiple run files)

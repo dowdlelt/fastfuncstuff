@@ -672,6 +672,7 @@ def main():
 
     # Get TR from first file
     tr = get_tr_from_file(input_files[0])
+    args.tr = tr
     print(f"⏱️  TR: {tr:.3f} seconds")
     print()
 
@@ -760,9 +761,21 @@ def main():
         print(f"📦 Batch size: {args.batch_size:,} voxels per batch")
         print()
 
-    # Determine if we need OLS (any OLS output requested)
+    # Determine requested output families
     want_ols = (
         args.Obuck is not None or args.Obeta is not None or args.Onuisance is not None
+    )
+    want_reml = any(
+        x is not None
+        for x in [
+            args.Rvar,
+            args.Rbuck,
+            args.Rbeta,
+            args.Rnuisance,
+            args.Rfitts,
+            args.Rerrts,
+            args.Rwherr,
+        ]
     )
     ols_output_path = args.Obuck if args.Obuck else None
 
@@ -948,8 +961,13 @@ def main():
             stim_bots = list(range(n_conditions))
             stim_tops = list(range(n_conditions))
 
+        full_design_np = full_design.cpu().numpy()
         design_info = {
-            "design_matrix": full_design.cpu().numpy(),
+            "matrix": full_design_np,
+            "design_matrix": full_design_np,
+            "tr": args.tr,
+            "n_timepoints": full_design_np.shape[0],
+            "n_regressors": full_design_np.shape[1],
             "column_labels": column_labels,
             "stim_indices": task_indices,
             "nuisance_indices": nuisance_indices,
@@ -1322,6 +1340,7 @@ def main():
     # Preprocessing: Blur and/or Scale if requested
     # ==========================================================================
     preprocessing_applied = args.do_blur is not None or args.do_scale
+    preproc_cached_metadata = None
 
     if preprocessing_applied:
         print()
@@ -1333,23 +1352,29 @@ def main():
         # Get header info from first file
         first_img = load_nifti(input_files[0])
         affine = first_img.affine
+        nifti_header = first_img.header.copy()
         volume_shape = first_img.shape[:3]
         voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
 
-        # Parse design matrix to get run information
-        design_info_pre = read_afni_design_matrix(args.matrix)
-        run_trs = design_info_pre.get("run_trs", None)
+        # Preserve geometry/header metadata so ndarray-based analysis keeps
+        # the same spatial orientation and voxel sizes as the original input.
+        preproc_cached_metadata = {
+            "affine": affine,
+            "volume_shape": volume_shape,
+            "nifti_header": nifti_header,
+        }
 
-        # Compute run_starts from run_trs
-        if run_trs is not None:
-            run_starts = [0]
-            cumsum = 0
-            for rt in run_trs[:-1]:
-                cumsum += rt
-                run_starts.append(cumsum)
-        else:
-            # Assume single run
-            run_starts = [0]
+        # Get run structure for preprocessing. run_starts is already set
+        # by the -onsets or -matrix path above; only re-parse if needed.
+        if args.matrix is not None and not args.onsets:
+            design_info_pre = read_afni_design_matrix(args.matrix)
+            run_trs = design_info_pre.get("run_trs", None)
+            if run_trs is not None:
+                run_starts = [0]
+                cumsum = 0
+                for rt in run_trs[:-1]:
+                    cumsum += rt
+                    run_starts.append(cumsum)
 
         # Load and optionally blur each run
         run_data_list = []
@@ -1417,6 +1442,7 @@ def main():
     # If preprocessing was applied, use that data
     if preprocessing_applied:
         fmri_data_to_use = fmri_data_preprocessed
+        cache_metadata = preproc_cached_metadata
 
     if args.cache and not preprocessing_applied:
         from fastfuncstuff.data_cache import check_cache_valid, load_cache
@@ -1441,11 +1467,30 @@ def main():
 
     # Run analysis
     try:
+        # Determine analysis method from requested outputs
+        analysis_method = "arma11" if want_reml else "ols"
+        if analysis_method == "ols":
+            print("ℹ️  No -R* outputs requested: running OLS only (skipping ARMA grid search)")
+
+            # ARMA-specific options are ignored in OLS-only mode
+            if any(
+                [
+                    args.a_grid,
+                    args.b_grid,
+                    args.grid_batching,
+                    args.no_grid_batching,
+                    args.quick_estimate,
+                    args.load_Rvar,
+                    args.Rvar,
+                ]
+            ):
+                print("   Note: ARMA-specific options are ignored in OLS-only mode")
+
         # Determine grid batching strategy
         use_grid_batching = None  # Auto-detect by default
-        if args.grid_batching:
+        if analysis_method == "arma11" and args.grid_batching:
             use_grid_batching = True
-        elif args.no_grid_batching:
+        elif analysis_method == "arma11" and args.no_grid_batching:
             use_grid_batching = False
 
         # Use cached data if available, otherwise load from files
@@ -1454,7 +1499,7 @@ def main():
 
         # Load precomputed ARMA params only if explicitly requested via -load_Rvar
         precomputed_arma = None
-        if args.load_Rvar:
+        if analysis_method == "arma11" and args.load_Rvar:
             # Try with automatic extension detection
             rvar_base = Path(args.load_Rvar)
             rvar_path = None
@@ -1503,7 +1548,7 @@ def main():
                 precomputed_arma = None
 
         # Warn if the Rvar output file already exists (user may want -load_Rvar instead)
-        if args.Rvar and not args.load_Rvar:
+        if analysis_method == "arma11" and args.Rvar and not args.load_Rvar:
             rvar_out_base = Path(args.Rvar)
             for candidate in [rvar_out_base,
                                Path(str(rvar_out_base) + '.nii.gz'),
@@ -1516,11 +1561,12 @@ def main():
         results, design_info = analyze_from_design_matrix(
             fmri_data=fmri_data_to_use,
             design_matrix_file=args.matrix,
-            method="arma11",  # Always use ARMA for 3dREMLfast
+            design_info=design_info if args.onsets else None,
+            method=analysis_method,
             arma_a_grid=a_grid,
             arma_b_grid=b_grid,
             precomputed_arma_params=precomputed_arma,
-            want_ols=want_ols,
+            want_ols=(want_ols and analysis_method == "arma11"),
             ols_output_path=ols_output_path,
             ols_output_format=output_format,
             device=device,
@@ -1545,6 +1591,14 @@ def main():
             else "full",  # "full" or "task"
             legacy_contrasts=args.legacy_contrasts,
         )
+
+        # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
+        if analysis_method == "ols" and want_ols and _ols_write_callback is not None:
+            _ols_write_callback(
+                results,
+                getattr(results, "original_shape", None),
+                getattr(results, "affine", None),
+            )
     except Exception as e:
         print(f"\n❌ ERROR during analysis: {e}")
         import traceback

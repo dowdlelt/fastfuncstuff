@@ -19,7 +19,10 @@ Core goals
 Notes
 -----
 - Multiple input runs are processed independently by default.
-- Flags for future modes (`-temp_concat`, `-tensor`) are present as placeholders.
+- `-temp_concat`: temporal concatenation mode for single-subject multi-run ICA.
+  Per-run scaling and varnorm, then concatenation with block-diagonal polort
+  and per-run high-pass filtering.
+- `-tensor` is a placeholder for future tensorial ICA.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ try:
     )
     from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
     from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, print_cli_header
-    from fastfuncstuff.decomposition.ica import FastICA
+    from fastfuncstuff.decomposition.ica import FastICA, InfoMaxICA, create_ica
     from fastfuncstuff.decomposition.tools import (
         apply_high_pass_fft,
         apply_polort_projection,
@@ -149,7 +152,7 @@ def _run_single_ica(
         from fastfuncstuff.processing.mask import automask
 
         mask3d = (
-            automask(torch.as_tensor(mean3d), dilate_extra=2, device=device, verbose=True)
+            automask(torch.as_tensor(mean3d), dilate_extra=3, device=device, verbose=True)
             .cpu()
             .numpy()
         )
@@ -449,7 +452,10 @@ def _run_single_ica(
     pca_eigenvalues = None  # PCA explained_variance_ for IC variance computation
     pca_components_for_sort = None  # PCA spatial components (k, V)
     if args.icasso:
-        _vprint(args.verbose, f"ICASSO: {args.icasso_runs} runs, k={n_components} ...")
+        method_name = getattr(args, "ica_method", "fastica")
+        _vprint(
+            args.verbose, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components} ..."
+        )
         icasso_res = icasso(
             X=x_t,
             n_components=n_components,
@@ -459,6 +465,8 @@ def _run_single_ica(
             device=device,
             verbose=args.verbose,
             batch_size=args.icasso_batch_size,
+            ica_method=method_name,
+            base_seed=args.seed,
         )
         components = torch.as_tensor(
             icasso_res["all_centroids"], device=device, dtype=torch.float32
@@ -482,18 +490,29 @@ def _run_single_ica(
                 icasso_res["pca_components"][:n_components], device=device, dtype=torch.float32
             )
         _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
+
+        # Save ICASSO diagnostic plot
+        icasso_plot_path = f"{args.prefix}_run{run_idx + 1:02d}_icasso.png"
+        try:
+            from fastfuncstuff.decomposition.icasso import icasso_plot
+            icasso_plot(icasso_res, output_path=icasso_plot_path)
+            _vprint(args.verbose, f"ICASSO plot: {icasso_plot_path}")
+        except Exception as exc:
+            _vprint(args.verbose, f"ICASSO plot failed: {exc}")
     else:
+        method_name = getattr(args, "ica_method", "fastica")
         _vprint(
             args.verbose,
-            f"FastICA: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity} ...",
+            f"{method_name}: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity} ...",
         )
-        ica = FastICA(
+        ica = create_ica(
+            method=method_name,
             n_components=n_components,
             pca_components=n_components,
             max_iter=args.ica_max_iter,
             tol=args.ica_tol,
             fun=args.ica_nonlinearity,
-            random_state=run_idx,
+            random_state=args.seed + run_idx,
             device=device,
         )
         ica.fit(x_t)
@@ -502,17 +521,35 @@ def _run_single_ica(
         if ica.n_iter_ >= args.ica_max_iter:
             _vprint(
                 args.verbose,
-                f"FastICA did NOT converge after {args.ica_max_iter} iterations",
+                f"{method_name} did NOT converge after {args.ica_max_iter} iterations",
                 t_step,
             )
-            print(f"  ⚠ Consider increasing --ica_max_iter or checking data conditioning")
+            print(f"  ⚠ Consider increasing -ica_max_iter or checking data conditioning")
         else:
-            _vprint(args.verbose, f"FastICA converged in {ica.n_iter_} iterations", t_step)
+            _vprint(args.verbose, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
+
+        # InfoMax diagnostics
+        diag = getattr(ica, "diagnostics_", None)
+        if diag and args.verbose:
+            lr_i = diag["learning_rate_initial"]
+            lr_f = diag["learning_rate_final"]
+            blk = diag["block_size"]
+            n_blk = diag["n_blocks_per_epoch"]
+            chg = diag["final_change"]
+            _vprint(True, f"  lr: {lr_i:.6f} → {lr_f:.6f}, block={blk}, "
+                    f"blocks/epoch={n_blk}, final_change={chg:.2e}")
+            if diag.get("extended"):
+                _vprint(True, f"  sub-Gaussian: {diag['n_sub_gaussian']}, "
+                        f"super-Gaussian: {diag['n_super_gaussian']}")
 
         components = ica.components_.to(device)
         mixing = ica.mixing_.to(device)
         stability = None
-        icasso_meta = {"enabled": False, "fastica_iterations": int(ica.n_iter_)}
+        icasso_meta = {
+            "enabled": False,
+            "ica_method": method_name,
+            "ica_iterations": int(ica.n_iter_),
+        }
 
         # Get PCA info from FastICA's internal PCA
         if hasattr(ica, "pca_") and ica.pca_ is not None:
@@ -1081,6 +1118,583 @@ def _run_single_ica(
     return run_meta
 
 
+# ---------------------------------------------------------------------------
+# Temporal concatenation ICA
+# ---------------------------------------------------------------------------
+
+
+def _run_concat_ica(
+    input_files: list[str],
+    args,
+    device: torch.device,
+    shared_mask: np.ndarray | None,
+) -> dict:
+    """Run ICA on temporally concatenated runs (single-subject multi-run).
+
+    Preprocessing order per run:
+        load → blur → mask → scale_to_percent_signal → voxel_varnorm
+    Then concatenate all runs and apply:
+        block-diagonal polort → per-run high-pass → ICA
+
+    Variance normalization is applied per-run before concatenation,
+    matching MELODIC's temporal concat behavior (per-file varnorm in
+    process_file, then concatenation in setup_classic).
+    """
+    t_total = time.time()
+    n_runs = len(input_files)
+
+    _vsection(args.verbose, "Temporal Concatenation ICA")
+    _vprint(args.verbose, f"Concatenating {n_runs} runs for single ICA decomposition")
+
+    # --- Load all runs, apply per-run preprocessing, collect masked data ---
+    run_data_list: list[torch.Tensor] = []  # each (n_vox, n_t_run)
+    run_lengths: list[int] = []
+    mask3d: np.ndarray | None = None
+    shape3d: tuple[int, ...] | None = None
+    affine: np.ndarray | None = None
+    mean3d_accum: np.ndarray | None = None
+    tr: float | None = None
+    resels_accum: float = 0.0
+    fwhm_geo_accum: float = 0.0
+    n_vox_masked: int = 0
+
+    num_spec = parse_num_comps_spec(args.num_comps)
+
+    for ri, run_file in enumerate(input_files):
+        t_step = time.time()
+        _vsection(args.verbose, f"Load Run {ri + 1}/{n_runs}")
+        _vprint(args.verbose, f"Loading {run_file} ...")
+        img = load_nifti(run_file)
+        data = img.get_fdata(dtype=np.float32)
+        run_shape3d = data.shape[:3]
+        n_t_run = data.shape[3]
+        voxel_sizes = tuple(float(v) for v in img.header.get_zooms()[:3])
+        _vprint(args.verbose, f"  shape={data.shape}, dtype={data.dtype}", t_step)
+
+        # TR from first run (or CLI override)
+        run_tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
+        if tr is None:
+            tr = run_tr
+        elif abs(run_tr - tr) > 1e-4:
+            print(f"  WARNING: Run {ri + 1} TR={run_tr:.4f}s differs from run 1 TR={tr:.4f}s")
+
+        if shape3d is None:
+            shape3d = run_shape3d
+            affine = img.affine
+        elif run_shape3d != shape3d:
+            raise ValueError(f"Run {ri + 1} spatial shape {run_shape3d} != run 1 shape {shape3d}")
+
+        # --- Spatial blur ---
+        if args.do_blur is not None and args.do_blur > 0:
+            t_step = time.time()
+            data = gaussian_blur_3d(
+                data=data,
+                fwhm_mm=float(args.do_blur),
+                voxel_sizes=voxel_sizes,
+                device=device,
+                verbose=False,
+            )
+            _vprint(args.verbose, f"  Blurred FWHM={args.do_blur:.1f}mm", t_step)
+
+        # Temporal mean for this run
+        run_mean3d = data.mean(axis=-1).astype(np.float32)
+        if mean3d_accum is None:
+            mean3d_accum = run_mean3d.copy()
+        else:
+            mean3d_accum += run_mean3d
+
+        # --- Masking (from first run or provided) ---
+        if ri == 0:
+            if shared_mask is not None:
+                mask3d = shared_mask
+                _vprint(args.verbose, f"  Using provided mask: {int(mask3d.sum()):,} voxels")
+            elif not args.no_auto_mask:
+                from fastfuncstuff.processing.mask import automask
+
+                mask3d = (
+                    automask(
+                        torch.as_tensor(run_mean3d),
+                        dilate_extra=2,
+                        device=device,
+                        verbose=args.verbose,
+                    )
+                    .cpu()
+                    .numpy()
+                )
+                _vprint(args.verbose, f"  Auto-mask from run 1: {int(mask3d.sum()):,} voxels")
+
+            if mask3d is not None and mask3d.shape != shape3d:
+                raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
+
+            # Estimate spatial smoothness from first run
+            resels_accum, fwhm_geo_accum = _estimate_spatial_smoothness_resels(
+                data,
+                mask=mask3d,
+                device=device,
+                verbose=args.verbose,
+            )
+
+        # --- Extract masked voxels: (n_vox, n_t_run) ---
+        if mask3d is not None:
+            run_vox_np = data[mask3d].astype(np.float32)
+        else:
+            run_vox_np = data.reshape(-1, n_t_run).astype(np.float32)
+        del data
+
+        if ri == 0:
+            n_vox_masked = run_vox_np.shape[0]
+        elif run_vox_np.shape[0] != n_vox_masked:
+            raise ValueError(
+                f"Run {ri + 1} has {run_vox_np.shape[0]} masked voxels, expected {n_vox_masked}"
+            )
+
+        run_vox = to_tensor(run_vox_np, device=device, pin=True)
+        del run_vox_np
+
+        # --- Per-run percent-signal scaling ---
+        if args.do_scale:
+            t_step = time.time()
+            run_vox, _, _ = scale_to_percent_signal(
+                run_vox,
+                run_starts=[0],
+                verbose=False,
+            )
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verbose)
+            _vprint(args.verbose, f"  Scaled to percent signal", t_step)
+
+        # --- Per-run voxel variance normalization ---
+        if args.voxel_norm:
+            t_step = time.time()
+            run_vox, norm_msg = ica_workflow.apply_voxel_variance_normalization(
+                data_vox_t=run_vox,
+                num_spec=num_spec,
+                n_t=n_t_run,
+                n_vox_masked=n_vox_masked,
+            )
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-varnorm", args.verbose)
+            _vprint(args.verbose, f"  {norm_msg}", t_step)
+
+        run_data_list.append(run_vox)
+        run_lengths.append(n_t_run)
+        _vprint(args.verbose, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} timepoints")
+
+    # Average the mean images
+    mean3d = mean3d_accum / n_runs
+
+    # --- Concatenate all runs ---
+    _vsection(args.verbose, "Concatenate")
+    t_step = time.time()
+    data_vox_t = torch.cat(run_data_list, dim=1)  # (n_vox, total_t)
+    del run_data_list
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    run_starts = []
+    offset = 0
+    for rl in run_lengths:
+        run_starts.append(offset)
+        offset += rl
+    total_t = data_vox_t.shape[1]
+
+    _vprint(
+        args.verbose,
+        f"Concatenated: ({n_vox_masked:,} vox, {total_t} timepoints) from {n_runs} runs",
+        t_step,
+    )
+    _vprint(args.verbose, f"Run starts: {run_starts}, lengths: {run_lengths}")
+
+    # --- Block-diagonal polort detrending ---
+    polort = 0 if args.polort is None else int(args.polort)
+    _vsection(args.verbose, "Polort Detrend (block-diagonal)")
+    t_step = time.time()
+    _vprint(args.verbose, f"Order={polort}, {n_runs} runs (block-diagonal)")
+    data_vox_t = apply_polort_projection(
+        data_vox_t,
+        polort=polort,
+        device=device,
+        run_starts=run_starts,
+    )
+    data_vox_t = _check_finite(data_vox_t, "post-polort-concat", args.verbose)
+    _vprint(args.verbose, "Polort done", t_step)
+
+    # --- Per-run high-pass filter ---
+    if args.high_pass is not None and args.high_pass > 0:
+        _vsection(args.verbose, "High-Pass Filter (per-run)")
+        nyquist = 0.5 / tr
+        if args.high_pass >= nyquist:
+            raise ValueError(
+                f"High-pass cutoff ({args.high_pass:.4f} Hz) >= Nyquist ({nyquist:.4f} Hz)"
+            )
+        t_step = time.time()
+        _vprint(
+            args.verbose,
+            f"FFT high-pass: {args.high_pass:.6f} Hz, applied independently per run",
+        )
+        data_vox_t = apply_high_pass_fft(
+            data_vox_t,
+            tr=tr,
+            high_pass_hz=args.high_pass,
+            run_starts=run_starts,
+        )
+        data_vox_t = _check_finite(data_vox_t, "post-highpass-concat", args.verbose)
+        _vprint(args.verbose, "High-pass done", t_step)
+
+    # --- Sanity check ---
+    data_var = float(torch.var(data_vox_t).item())
+    if data_var < 1e-10:
+        raise ValueError(f"Data variance is ~0 after preprocessing ({data_var:.2e})")
+    _vprint(args.verbose, f"Data variance after preprocessing: {data_var:.4f}")
+
+    # --- Spatial smoothness / effective DOF ---
+    resels = resels_accum
+    fwhm_geo = fwhm_geo_accum
+    n_eff = max(total_t, int(n_vox_masked / (2.5 * resels)))
+    _vprint(
+        args.verbose,
+        f"Effective spatial DOF: {n_eff:,} (resels={resels:.2f}, from run 1)",
+    )
+
+    # --- Component count estimation ---
+    _vsection(args.verbose, "Component Estimation")
+    t_step = time.time()
+
+    if args.max_auto_components <= 1.0:
+        max_auto_k = max(5, int(total_t * args.max_auto_components))
+    else:
+        max_auto_k = int(args.max_auto_components)
+    _vprint(args.verbose, f"max_auto_components: {max_auto_k}")
+    _vprint(args.verbose, f"Method: {args.num_comps}")
+
+    n_eff_for_model_order = n_eff
+    data_for_model_order = data_vox_t
+    model_order_filter_diag = None
+    if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
+        data_for_model_order, model_order_filter_diag = (
+            ica_workflow.filter_voxels_for_melodic_model_order(data_vox_t=data_vox_t)
+        )
+        n_vox_model_order = int(data_for_model_order.shape[0])
+        n_eff_for_model_order = max(total_t, int(n_vox_model_order / (2.5 * resels)))
+        _vprint(
+            args.verbose,
+            f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{n_vox_masked:,} voxels; "
+            f"n_eff={n_eff_for_model_order:,}",
+        )
+
+    n_components, pca_diag, num_diag = estimate_ica_component_count(
+        data_vox_t=data_for_model_order,
+        method=num_spec,
+        max_auto_components=max_auto_k,
+        auto_min_components=args.auto_min_components,
+        auto_var_threshold=args.auto_var_threshold,
+        use_mp_prior=not args.auto_no_mp,
+        n_eff=n_eff_for_model_order,
+        device=device,
+        verbose=args.verbose,
+        capture_ppca_trace=bool(args.ppca_debug_dump),
+    )
+    _vprint(
+        args.verbose,
+        f"Selected {n_components} components (mode={num_diag.get('mode', '?')})",
+        t_step,
+    )
+
+    x_t = data_vox_t.T  # (time, vox)
+    del data_vox_t
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- ICA ---
+    _vsection(args.verbose, "ICA Decomposition")
+    t_step = time.time()
+    if args.icasso:
+        method_name = getattr(args, "ica_method", "fastica")
+        _vprint(args.verbose, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
+        icasso_res = icasso(
+            X=x_t,
+            n_components=n_components,
+            n_runs=args.icasso_runs,
+            pca_components=n_components,
+            min_stability=args.icasso_min_stability,
+            device=device,
+            verbose=args.verbose,
+            batch_size=args.icasso_batch_size,
+            ica_method=method_name,
+            base_seed=args.seed,
+        )
+        components = torch.as_tensor(
+            icasso_res["all_centroids"], device=device, dtype=torch.float32
+        )
+        mixing = torch.as_tensor(icasso_res["all_mixing"], device=device, dtype=torch.float32)
+        stability = np.asarray(icasso_res["all_stability"], dtype=np.float32)
+        icasso_meta = {
+            "enabled": True,
+            "icasso_runs": int(args.icasso_runs),
+            "min_stability": float(args.icasso_min_stability),
+            "n_stable": int(icasso_res["n_stable"]),
+            "stability": stability.tolist(),
+        }
+        _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
+
+        # Save ICASSO diagnostic plot
+        icasso_plot_path = f"{args.prefix}_tempconcat_icasso.png"
+        try:
+            from fastfuncstuff.decomposition.icasso import icasso_plot
+            icasso_plot(icasso_res, output_path=icasso_plot_path)
+            _vprint(args.verbose, f"ICASSO plot: {icasso_plot_path}")
+        except Exception as exc:
+            _vprint(args.verbose, f"ICASSO plot failed: {exc}")
+    else:
+        method_name = getattr(args, "ica_method", "fastica")
+        _vprint(
+            args.verbose,
+            f"{method_name}: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity}",
+        )
+        ica = create_ica(
+            method=method_name,
+            n_components=n_components,
+            pca_components=n_components,
+            max_iter=args.ica_max_iter,
+            tol=args.ica_tol,
+            fun=args.ica_nonlinearity,
+            random_state=args.seed,
+            device=device,
+        )
+        ica.fit(x_t)
+        if ica.n_iter_ >= args.ica_max_iter:
+            _vprint(
+                args.verbose, f"{method_name} did NOT converge after {args.ica_max_iter} iterations"
+            )
+        else:
+            _vprint(args.verbose, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
+
+        # InfoMax diagnostics
+        diag = getattr(ica, "diagnostics_", None)
+        if diag and args.verbose:
+            lr_i = diag["learning_rate_initial"]
+            lr_f = diag["learning_rate_final"]
+            blk = diag["block_size"]
+            n_blk = diag["n_blocks_per_epoch"]
+            chg = diag["final_change"]
+            _vprint(True, f"  lr: {lr_i:.6f} → {lr_f:.6f}, block={blk}, "
+                    f"blocks/epoch={n_blk}, final_change={chg:.2e}")
+            if diag.get("extended"):
+                _vprint(True, f"  sub-Gaussian: {diag['n_sub_gaussian']}, "
+                        f"super-Gaussian: {diag['n_super_gaussian']}")
+
+        components = ica.components_.to(device)
+        mixing = ica.mixing_.to(device)
+        stability = None
+        icasso_meta = {
+            "enabled": False,
+            "ica_method": method_name,
+            "ica_iterations": int(ica.n_iter_),
+        }
+        del ica
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Sign consistency (FSL convention) ---
+    max_abs = torch.max(torch.abs(components), dim=1).values
+    max_pos = torch.max(components, dim=1).values
+    flip_mask = max_abs > max_pos
+    n_flipped = int(flip_mask.sum().item())
+    if n_flipped > 0:
+        components = components.clone()
+        mixing = mixing.clone()
+        components[flip_mask] *= -1.0
+        mixing[:, flip_mask] *= -1.0
+        _vprint(args.verbose, f"Sign-flipped {n_flipped} ICs")
+
+    # --- Ordering by explained share ---
+    ic_stdev = torch.std(components, dim=1)
+    total_stdev = float(ic_stdev.sum().item())
+    stdev_share = ic_stdev / max(total_stdev, 1e-15)
+
+    mix_var = torch.var(mixing, dim=0, unbiased=False)
+    total_mix_var = float(mix_var.sum().item())
+    explained_share_t = mix_var / max(total_mix_var, 1e-15)
+
+    sort_idx = torch.argsort(explained_share_t, descending=True)
+    explained_share = explained_share_t[sort_idx].detach().cpu().numpy().astype(np.float32)
+    stdev_share_sorted = stdev_share[sort_idx].detach().cpu().numpy().astype(np.float32)
+
+    scree = np.asarray(pca_diag["scree_ratio"], dtype=np.float64)
+    retained_frac = float(np.clip(np.sum(scree[:n_components]), 0.0, 1.0))
+    total_share = (explained_share * retained_frac).astype(np.float32)
+
+    components = components[sort_idx, :]
+    mixing = mixing[:, sort_idx]
+    if stability is not None:
+        stability = stability[sort_idx.detach().cpu().numpy()]
+    del sort_idx
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if args.var_norm:
+        mixing = mixing - mixing.mean(dim=0, keepdim=True)
+        mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
+        mixing = mixing / mixing_std
+
+    # --- MELODIC-style noise normalization ---
+    if x_t is not None:
+        _vprint(args.verbose, "Applying MELODIC-style noise normalization ...")
+        components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
+            components=components,
+            mixing=mixing,
+            x_t=x_t,
+        )
+        _vprint(args.verbose, noise_norm_msg)
+    del x_t
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Save outputs (no run tag for concat) ---
+    _vsection(args.verbose, "Save Outputs")
+    t_step = time.time()
+    pfx = parse_prefix(str(args.prefix))
+    out_prefix = Path(pfx.stem)
+    nii_ext = pfx.nifti_ext
+
+    comp_np = components.detach().cpu().numpy().astype(np.float32)
+    mixing_np = mixing.detach().cpu().numpy().astype(np.float32)
+    del components, mixing
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Spatial maps
+    decomposition_io.save_masked_component_maps_4d(
+        components_kv=comp_np,
+        mask3d=mask3d,
+        shape3d=shape3d,
+        affine=affine,
+        out_file=Path(f"{out_prefix}_concat_ica_maps{nii_ext}"),
+    )
+    _vprint(args.verbose, f"Maps: {out_prefix}_concat_ica_maps{nii_ext}", t_step)
+
+    # Timecourses
+    np.savetxt(
+        f"{out_prefix}_concat_ica_timecourses.1D",
+        mixing_np,
+        fmt="%.6f",
+        delimiter="\t",
+    )
+    _vprint(args.verbose, f"Timecourses: {out_prefix}_concat_ica_timecourses.1D")
+
+    # Scree plot
+    ica_postprocess.save_scree_plot(
+        evr=np.asarray(pca_diag["scree_ratio"], dtype=np.float64),
+        out_png=Path(f"{out_prefix}_concat_pca_scree.png"),
+        title="Temporal concat: PCA scree",
+    )
+
+    # Mixture model z-maps
+    mixture_meta = []
+    z_maps = None
+    if args.save_mixture_z:
+        _vsection(args.verbose, "Mixture Model (GGM)")
+        t_step = time.time()
+        comp_tensor = torch.as_tensor(comp_np, device=device)
+        z_tensor, p_tensor, mixture_meta = batch_mixture_zscores(
+            comp_tensor,
+            device=device,
+            verbose=args.verbose,
+        )
+        z_maps = z_tensor.cpu().numpy().astype(np.float32)
+        p_maps = p_tensor.cpu().numpy().astype(np.float32)
+        thresh_z_maps = z_maps.copy()
+        thresh_z_maps[p_maps < float(args.mm_thresh)] = 0.0
+        del comp_tensor, z_tensor, p_tensor
+
+        for data_arr, fname in [
+            (z_maps, f"{out_prefix}_concat_ica_zmaps{nii_ext}"),
+            (p_maps, f"{out_prefix}_concat_ica_signalprob{nii_ext}"),
+            (thresh_z_maps, f"{out_prefix}_concat_ica_thresh_zmaps{nii_ext}"),
+        ]:
+            decomposition_io.save_masked_component_maps_4d(
+                components_kv=data_arr,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
+                out_file=Path(fname),
+            )
+        _vprint(args.verbose, "Z-maps and signal-prob maps saved", t_step)
+
+    # MELODIC compat
+    if args.melodic_compat:
+        compat_dir = Path(f"{out_prefix}_concat.ica")
+        decomposition_io.write_melodic_compat_outputs(
+            compat_dir=compat_dir,
+            maps_file=Path(f"{out_prefix}_concat_ica_maps{nii_ext}"),
+            zmaps_file=Path(f"{out_prefix}_concat_ica_zmaps{nii_ext}")
+            if z_maps is not None
+            else None,
+            timecourse_file=Path(f"{out_prefix}_concat_ica_timecourses.1D"),
+            pca_scree_ratio=np.asarray(pca_diag["scree_ratio"], dtype=np.float64),
+            component_explained_share_pct=np.asarray(explained_share, dtype=np.float64) * 100.0,
+            component_total_share_pct=np.asarray(total_share, dtype=np.float64) * 100.0,
+            mixing_np=mixing_np,
+            mask3d=mask3d,
+            mean3d=mean3d,
+            shape3d=shape3d,
+            affine=affine,
+            z_maps=z_maps,
+            p_maps=p_maps if z_maps is not None else None,
+            thresh_z_maps=thresh_z_maps if z_maps is not None else None,
+        )
+        _vprint(args.verbose, f"MELODIC compat: {compat_dir}")
+
+    elapsed_total = time.time() - t_total
+    _vprint(args.verbose, f"Concat ICA total elapsed: {elapsed_total:.1f}s")
+
+    mask_type = (
+        "provided" if shared_mask is not None else ("auto" if mask3d is not None else "none")
+    )
+    concat_meta = {
+        "mode": "temp_concat",
+        "n_runs": n_runs,
+        "input_files": input_files,
+        "tr": float(tr),
+        "run_lengths": run_lengths,
+        "run_starts": run_starts,
+        "total_timepoints": total_t,
+        "n_voxels": n_vox_masked,
+        "mask_type": mask_type,
+        "polort": polort,
+        "high_pass_hz": None if args.high_pass is None else float(args.high_pass),
+        "voxel_norm": bool(args.voxel_norm),
+        "voxel_norm_scope": "per_run",
+        "num_comps_request": args.num_comps,
+        "n_components_selected": int(n_components),
+        "num_comps_diagnostics": num_diag,
+        "pca_diagnostics": {
+            "rank_cap": pca_diag["rank_cap"],
+            "n_eigs": pca_diag["n_eigs"],
+            "first20_scree_ratio": pca_diag["scree_ratio"][:20],
+        },
+        "icasso": icasso_meta,
+        "smoothness_fwhm_vox": round(float(fwhm_geo), 3),
+        "smoothness_resels": round(float(resels), 3),
+        "n_eff": int(n_eff_for_model_order),
+        "component_variance_share": explained_share.tolist(),
+        "component_total_variance_share": total_share.tolist(),
+        "component_spatial_stdev_share": stdev_share_sorted.tolist(),
+        "elapsed_seconds": round(elapsed_total, 2),
+        "outputs": {
+            "ica_maps": f"{out_prefix}_concat_ica_maps{nii_ext}",
+            "ica_timecourses": f"{out_prefix}_concat_ica_timecourses.1D",
+            "pca_scree_plot": f"{out_prefix}_concat_pca_scree.png",
+            "ica_zmaps": f"{out_prefix}_concat_ica_zmaps{nii_ext}" if args.save_mixture_z else None,
+        },
+        "mixture_model": mixture_meta if args.save_mixture_z else None,
+    }
+
+    with open(f"{out_prefix}_concat_ica_metadata.json", "w") as f:
+        json.dump(concat_meta, f, indent=2)
+
+    return concat_meta
+
+
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
     """Show defaults while preserving raw description formatting."""
 
@@ -1223,7 +1837,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     ica_opts = parser.add_argument_group("ICA / ICASSO")
     ica_opts.add_argument(
-        "-ica_max_iter", type=int, default=500, help="FastICA max iterations (MELODIC default: 500)"
+        "-ica_method",
+        type=str,
+        default="fastica",
+        choices=["fastica", "infomax"],
+        help="ICA algorithm: fastica (MELODIC-style deflation) or "
+        "infomax (natural gradient, often cleaner fMRI components). Default: fastica",
+    )
+    ica_opts.add_argument(
+        "-ica_max_iter", type=int, default=500, help="ICA max iterations (default: 500)"
     )
     ica_opts.add_argument(
         "-ica_tol",
@@ -1237,6 +1859,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="pow3",
         choices=["pow3", "cube", "logcosh"],
         help="FastICA contrast function (default: pow3, matching MELODIC)",
+    )
+    ica_opts.add_argument(
+        "-seed", type=int, default=0,
+        help="Base random seed for ICA. Per-run seed = seed + run_idx. "
+        "ICASSO increments from this base. (default: 0)",
     )
     ica_opts.add_argument("-icasso", action="store_true", help="Run ICASSO stability analysis")
     ica_opts.add_argument(
@@ -1426,13 +2053,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    future = parser.add_argument_group("Future modes (not yet implemented)")
-    future.add_argument(
+    modes = parser.add_argument_group("Multi-run modes")
+    modes.add_argument(
         "-temp_concat",
         action="store_true",
-        help="Placeholder for future temporal concatenation ICA",
+        help=(
+            "Temporal concatenation: per-run scale+varnorm, then concatenate "
+            "and run single ICA with block-diagonal polort and per-run high-pass. "
+            "Requires >= 2 input runs."
+        ),
     )
-    future.add_argument("-tensor", action="store_true", help="Placeholder for future tensorial ICA")
+    modes.add_argument("-tensor", action="store_true", help="Placeholder for future tensorial ICA")
 
     misc = parser.add_argument_group("Misc")
     misc.add_argument("-cpu", action="store_true", help="Force CPU")
@@ -1447,10 +2078,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.temp_concat or args.tensor:
+    if args.tensor:
         raise NotImplementedError(
-            "-temp_concat and -tensor are placeholders for future versions. "
-            "Current implementation supports run-wise ICA only."
+            "-tensor is a placeholder for future tensorial ICA. "
+            "Current implementation supports run-wise and temporal concat ICA."
         )
 
     if (args.onsets is None) ^ (args.durations is None):
@@ -1551,46 +2182,76 @@ def main() -> None:
         print("⚠ No mask and auto-mask disabled — using ALL voxels including background!")
 
     t_pipeline = time.time()
-    all_meta = []
-    for run_idx, run_file in enumerate(input_files):
-        print(f"\n[{run_idx + 1}/{len(input_files)}] Processing: {run_file}")
-        run_meta = _run_single_ica(
-            run_file=run_file,
-            run_idx=run_idx,
+
+    if args.temp_concat:
+        # --- Temporal concatenation mode ---
+        if len(input_files) < 2:
+            raise ValueError("-temp_concat requires at least 2 input runs")
+        print(f"\nMode: temporal concatenation ({len(input_files)} runs → single ICA)")
+        concat_meta = _run_concat_ica(
+            input_files=input_files,
             args=args,
             device=device,
             shared_mask=shared_mask,
-            onsets_files=args.onsets,
-            durations=args.durations,
-            ortvec_specs=args.ortvec,
         )
-        all_meta.append(run_meta)
         print(
-            f"  Selected components: {run_meta['n_components_selected']} "
-            f"({run_meta['mask_type']} mask, {run_meta['n_voxels']:,} vox) | "
-            f"IC1 explained share: {run_meta['component_variance_share'][0] * 100:.2f}%"
+            f"  Selected components: {concat_meta['n_components_selected']} "
+            f"({concat_meta['mask_type']} mask, {concat_meta['n_voxels']:,} vox) | "
+            f"IC1 explained share: {concat_meta['component_variance_share'][0] * 100:.2f}%"
         )
 
-    pfx = parse_prefix(str(args.prefix))
-    summary_path = f"{pfx.stem}_ica_summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(
-            {
-                "n_runs": len(input_files),
-                "input_files": input_files,
-                "num_comps_request": args.num_comps,
-                "device": str(device),
-                "runs": all_meta,
-            },
-            f,
-            indent=2,
-        )
+        pfx = parse_prefix(str(args.prefix))
+        summary_path = f"{pfx.stem}_ica_summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(concat_meta, f, indent=2)
 
-    print("\n" + "=" * 70)
-    elapsed_pipeline = time.time() - t_pipeline
-    print(f"ffs_ica complete ({elapsed_pipeline:.1f}s)")
-    print(f"Summary: {summary_path}")
-    print("=" * 70)
+        print("\n" + "=" * 70)
+        elapsed_pipeline = time.time() - t_pipeline
+        print(f"ffs_ica temp_concat complete ({elapsed_pipeline:.1f}s)")
+        print(f"Summary: {summary_path}")
+        print("=" * 70)
+    else:
+        # --- Run-wise mode (default) ---
+        all_meta = []
+        for run_idx, run_file in enumerate(input_files):
+            print(f"\n[{run_idx + 1}/{len(input_files)}] Processing: {run_file}")
+            run_meta = _run_single_ica(
+                run_file=run_file,
+                run_idx=run_idx,
+                args=args,
+                device=device,
+                shared_mask=shared_mask,
+                onsets_files=args.onsets,
+                durations=args.durations,
+                ortvec_specs=args.ortvec,
+            )
+            all_meta.append(run_meta)
+            print(
+                f"  Selected components: {run_meta['n_components_selected']} "
+                f"({run_meta['mask_type']} mask, {run_meta['n_voxels']:,} vox) | "
+                f"IC1 explained share: {run_meta['component_variance_share'][0] * 100:.2f}%"
+            )
+
+        pfx = parse_prefix(str(args.prefix))
+        summary_path = f"{pfx.stem}_ica_summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(
+                {
+                    "n_runs": len(input_files),
+                    "input_files": input_files,
+                    "num_comps_request": args.num_comps,
+                    "device": str(device),
+                    "runs": all_meta,
+                },
+                f,
+                indent=2,
+            )
+
+        print("\n" + "=" * 70)
+        elapsed_pipeline = time.time() - t_pipeline
+        print(f"ffs_ica complete ({elapsed_pipeline:.1f}s)")
+        print(f"Summary: {summary_path}")
+        print("=" * 70)
 
 
 if __name__ == "__main__":

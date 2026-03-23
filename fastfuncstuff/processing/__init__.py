@@ -21,8 +21,10 @@ from .nwarpforge import (
     compose_matrix_then_warp,
     compose_warp_then_matrix,
     compose_warp_then_warp,
+    compute_cardinal_affine,
     load_affine_1D,
     load_warp,
     nwarpforge,
+    prepare_warp_for_grid,
 )
 from .warp import QwarpConfig, qwarp
