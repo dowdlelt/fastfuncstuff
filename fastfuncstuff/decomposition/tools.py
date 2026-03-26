@@ -1197,7 +1197,7 @@ def batch_fit_ggm(
 
     iterator = range(n_iter)
     if verbose:
-        iterator = tqdm(iterator, desc="  GGM EM", leave=False, unit="it")
+        iterator = tqdm(iterator, desc="  GGM EM", leave=True, unit="it")
 
     for it in iterator:
         # E-step

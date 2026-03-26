@@ -701,17 +701,15 @@ def apply_affine_batched(
         B, -1, -1
     )  # broadcast: (B, 4, 4) @ (B, 4, N)
 
-    src_x = src_coords[:, 0].reshape(B, onz, ony, onx)
-    src_y = src_coords[:, 1].reshape(B, onz, ony, onx)
-    src_z = src_coords[:, 2].reshape(B, onz, ony, onx)
-
-    # Normalize to [-1, 1]
+    # Normalize coords to [-1, 1] grid directly, freeing intermediates
     snz, sny, snx = source.shape
-    gx = 2.0 * src_x / (snx - 1) - 1.0 if snx > 1 else src_x * 0.0
-    gy = 2.0 * src_y / (sny - 1) - 1.0 if sny > 1 else src_y * 0.0
-    gz = 2.0 * src_z / (snz - 1) - 1.0 if snz > 1 else src_z * 0.0
+    gx = 2.0 * src_coords[:, 0].reshape(B, onz, ony, onx) / (snx - 1) - 1.0 if snx > 1 else src_coords[:, 0].reshape(B, onz, ony, onx) * 0.0
+    gy = 2.0 * src_coords[:, 1].reshape(B, onz, ony, onx) / (sny - 1) - 1.0 if sny > 1 else src_coords[:, 1].reshape(B, onz, ony, onx) * 0.0
+    gz = 2.0 * src_coords[:, 2].reshape(B, onz, ony, onx) / (snz - 1) - 1.0 if snz > 1 else src_coords[:, 2].reshape(B, onz, ony, onx) * 0.0
+    del src_coords
 
     grid = torch.stack([gx, gy, gz], dim=-1)  # (B, D, H, W, 3)
+    del gx, gy, gz
     vol = source[None, None].expand(B, 1, snz, sny, snx)  # (B, 1, D, H, W)
 
     result = _grid_sample_3d(vol, grid)

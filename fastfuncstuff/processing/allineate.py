@@ -614,7 +614,9 @@ def _estimate_chunk_size(vol_shape: tuple[int, ...],
             free_mem = 4 * 1024**3
     else:
         free_mem = 4 * 1024**3
-    chunk = max(1, int(free_mem * 0.5 / (voxels * 20)))
+    # Peak memory per candidate: src_coords(16) + gx/gy/gz(12) + grid(12)
+    # + grid_sample output(4) + grid_sample internals (~8) ≈ 52 bytes/voxel
+    chunk = max(1, int(free_mem * 0.5 / (voxels * 52)))
     return min(chunk, 4096)
 
 

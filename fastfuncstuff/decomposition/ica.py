@@ -392,7 +392,9 @@ class FastICA:
         scale = 1.0 / n_samples
 
         # FastICA iterations
-        for n_iter in range(self.max_iter):  # noqa: B007
+        pbar = tqdm(range(self.max_iter), desc="FastICA", leave=True,
+                    disable=not getattr(self, 'verbose', True))
+        for n_iter in pbar:  # noqa: B007
             W_old = W.clone()
 
             # 1. Linear projection — all float64
@@ -419,8 +421,10 @@ class FastICA:
             #    W @ W_old.T here ≡ W_mel.T @ W_mel_old there.
             lim = torch.abs(torch.diag(W @ W_old.T))
             delta = (1.0 - lim).max()
+            pbar.set_postfix(delta=f"{delta.item():.2e}")
 
             if delta < self.tol:
+                pbar.close()
                 break
 
         # Return W in the original data dtype
@@ -911,7 +915,9 @@ class InfoMaxICA:
         annealdeg_rad = self.anneal_deg * math.pi / 180.0
 
         n_iter = 0
-        for step in range(self.max_iter):
+        pbar = tqdm(range(self.max_iter), desc="InfoMax ICA", leave=True,
+                    disable=not getattr(self, 'verbose', True))
+        for step in pbar:
             n_iter = step
 
             # Permute data columns each epoch (GIFT-style stochastic gradient)
@@ -988,7 +994,9 @@ class InfoMaxICA:
             old_delta = delta.clone()
             old_change = change
 
+            pbar.set_postfix(change=f"{change:.2e}", lr=f"{lr:.2e}")
             if step > 1 and change < self.tol:
+                pbar.close()
                 break
 
         # Signs summary for diagnostics

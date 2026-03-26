@@ -1,0 +1,348 @@
+"""Comparison utilities for benchmark validation.
+
+Thin wrappers around existing spatial correlation infrastructure.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch import Tensor
+
+from ..stats.spatial import (
+    consistency_report,
+    optimal_matching,
+    spatial_correlation,
+    spatial_correlation_matrix,
+)
+
+
+def _load_vol(path: str | Path) -> tuple[Tensor, np.ndarray]:
+    """Load a NIfTI file as a torch tensor + affine.
+
+    Squeezes any singleton dimensions (AFNI bucket files sometimes have
+    shape (x,y,z,1,n) instead of (x,y,z,n)).
+    """
+    img = nib.load(str(path))
+    data = np.asarray(img.dataobj, dtype=np.float32)
+    data = np.squeeze(data)
+    return torch.from_numpy(data), img.affine
+
+
+def _automask(vol: Tensor) -> Tensor:
+    """Simple threshold mask: voxels > 10% of robust max."""
+    flat = vol.reshape(-1)
+    robust_max = flat.quantile(0.98)
+    return vol > (robust_max * 0.1)
+
+
+def compare_volumes(
+    a_path: str | Path,
+    b_path: str | Path,
+    mask_path: str | Path | None = None,
+) -> dict:
+    """Spatial correlation between two 3D volumes.
+
+    Returns dict with 'r' (Pearson correlation).
+    """
+    a, _ = _load_vol(a_path)
+    b, _ = _load_vol(b_path)
+
+    # NIfTI 4D: (x, y, z, t) — average over time (last dim)
+    if a.dim() == 4:
+        a = a.mean(-1)
+    if b.dim() == 4:
+        b = b.mean(-1)
+
+    if mask_path is not None:
+        mask_vol, _ = _load_vol(mask_path)
+        mask = mask_vol > 0.5
+    else:
+        mask = _automask(a) & _automask(b)
+
+    r = spatial_correlation(a, b, mask=mask, method="pearson")
+    return {"r": float(r), "n_voxels": int(mask.sum())}
+
+
+def compare_timeseries_4d(
+    a_path: str | Path,
+    b_path: str | Path,
+    mask_path: str | Path | None = None,
+    sample_frac: float = 0.1,
+) -> dict:
+    """Voxelwise temporal correlation between two 4D volumes.
+
+    Computes Pearson r of each voxel's timeseries, returns median and
+    fraction above various thresholds.
+
+    Args:
+        a_path, b_path: Paths to 4D NIfTI files.
+        mask_path: Optional mask. If None, auto-masked from mean.
+        sample_frac: Fraction of voxels to sample (for speed).
+    """
+    a, _ = _load_vol(a_path)
+    b, _ = _load_vol(b_path)
+
+    # NIfTI 4D: (x, y, z, t) -> (t, x, y, z) for temporal analysis
+    if a.dim() == 4:
+        a = a.permute(3, 0, 1, 2)
+    if b.dim() == 4:
+        b = b.permute(3, 0, 1, 2)
+
+    if a.shape != b.shape:
+        return {"error": f"Shape mismatch: {a.shape} vs {b.shape}"}
+
+    # Compute mean for masking — mean over time (dim 0)
+    a_mean = a.mean(0)
+    b_mean = b.mean(0)
+
+    if mask_path is not None:
+        mask_vol, _ = _load_vol(mask_path)
+        mask = mask_vol > 0.5
+    else:
+        mask = _automask(a_mean) & _automask(b_mean)
+
+    # Flatten spatial dims: (T, V)
+    nt = a.shape[0]
+    a_flat = a.reshape(nt, -1)[:, mask.reshape(-1)]
+    b_flat = b.reshape(nt, -1)[:, mask.reshape(-1)]
+
+    n_vox = a_flat.shape[1]
+
+    # Sample if too many voxels
+    if sample_frac < 1.0 and n_vox > 1000:
+        n_sample = max(1000, int(n_vox * sample_frac))
+        idx = torch.randperm(n_vox)[:n_sample]
+        a_flat = a_flat[:, idx]
+        b_flat = b_flat[:, idx]
+        n_vox = n_sample
+
+    # Pearson r per voxel
+    a_z = a_flat - a_flat.mean(0, keepdim=True)
+    b_z = b_flat - b_flat.mean(0, keepdim=True)
+    a_std = a_z.std(0)
+    b_std = b_z.std(0)
+    valid = (a_std > 1e-8) & (b_std > 1e-8)
+
+    r_vals = torch.zeros(n_vox)
+    if valid.any():
+        num = (a_z[:, valid] * b_z[:, valid]).sum(0)
+        denom = a_std[valid] * b_std[valid] * nt
+        r_vals[valid] = num / denom
+
+    r_np = r_vals[valid].numpy()
+    return {
+        "median_r": float(np.median(r_np)) if len(r_np) > 0 else 0.0,
+        "mean_r": float(np.mean(r_np)) if len(r_np) > 0 else 0.0,
+        "frac_above_0.95": float((r_np > 0.95).mean()) if len(r_np) > 0 else 0.0,
+        "frac_above_0.99": float((r_np > 0.99).mean()) if len(r_np) > 0 else 0.0,
+        "n_voxels": int(valid.sum()),
+        "n_total_mask": int(mask.sum()),
+    }
+
+
+def compare_1d_params(
+    a_path: str | Path,
+    b_path: str | Path,
+) -> dict:
+    """Compare two AFNI .1D parameter files column-by-column.
+
+    Returns per-column Pearson correlations.
+    """
+    a = np.loadtxt(str(a_path))
+    b = np.loadtxt(str(b_path))
+
+    if a.ndim == 1:
+        a = a[:, np.newaxis]
+    if b.ndim == 1:
+        b = b[:, np.newaxis]
+
+    n_rows = min(a.shape[0], b.shape[0])
+    n_cols = min(a.shape[1], b.shape[1])
+    a = a[:n_rows, :n_cols]
+    b = b[:n_rows, :n_cols]
+
+    correlations = []
+    for c in range(n_cols):
+        if np.std(a[:, c]) < 1e-10 or np.std(b[:, c]) < 1e-10:
+            correlations.append(float("nan"))
+        else:
+            r = np.corrcoef(a[:, c], b[:, c])[0, 1]
+            correlations.append(float(r))
+
+    return {
+        "per_column_r": correlations,
+        "mean_r": float(np.nanmean(correlations)),
+        "min_r": float(np.nanmin(correlations)),
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+    }
+
+
+def compare_moco_ssd(
+    a_path: str | Path,
+    b_path: str | Path,
+    mask_path: str | Path | None = None,
+) -> dict:
+    """Mean of squared differences between two motion-corrected 4D volumes.
+
+    Reports per-volume MSD and summary stats. MSD normalises over voxel count
+    so it's comparable across different mask sizes.
+    """
+    a, _ = _load_vol(a_path)
+    b, _ = _load_vol(b_path)
+
+    # NIfTI 4D: (x, y, z, t) -> (t, x, y, z)
+    if a.dim() == 4:
+        a = a.permute(3, 0, 1, 2)
+    if b.dim() == 4:
+        b = b.permute(3, 0, 1, 2)
+
+    if a.shape != b.shape:
+        return {"error": f"Shape mismatch: {a.shape} vs {b.shape}"}
+
+    a_mean = a.mean(0)
+    b_mean = b.mean(0)
+
+    if mask_path is not None:
+        mask_vol, _ = _load_vol(mask_path)
+        mask = mask_vol > 0.5
+    else:
+        mask = _automask(a_mean) & _automask(b_mean)
+
+    n_vox = int(mask.sum())
+    nt = a.shape[0]
+
+    # Per-volume MSD within mask
+    mask_flat = mask.reshape(-1)
+    per_vol_msd = []
+    for t in range(nt):
+        diff = a[t].reshape(-1)[mask_flat] - b[t].reshape(-1)[mask_flat]
+        msd = float((diff ** 2).mean())
+        per_vol_msd.append(msd)
+
+    per_vol_msd_arr = np.array(per_vol_msd)
+
+    # Normalise by signal intensity for interpretability
+    signal_mean = float(a.mean(0).reshape(-1)[mask_flat].mean())
+
+    return {
+        "mean_msd": float(per_vol_msd_arr.mean()),
+        "max_msd": float(per_vol_msd_arr.max()),
+        "median_msd": float(np.median(per_vol_msd_arr)),
+        "signal_mean": signal_mean,
+        "nrmsd": float(np.sqrt(per_vol_msd_arr.mean()) / signal_mean) if signal_mean > 0 else 0.0,
+        "n_voxels": n_vox,
+        "n_volumes": nt,
+    }
+
+
+def compare_ica_components(
+    a_path: str | Path,
+    b_path: str | Path,
+    mask_path: str | Path | None = None,
+) -> dict:
+    """Compare ICA spatial maps using optimal matching.
+
+    Uses absolute correlation since ICA components are sign-ambiguous.
+
+    Args:
+        a_path, b_path: Paths to 4D NIfTI component maps.
+        mask_path: Optional mask.
+    """
+    a, _ = _load_vol(a_path)
+    b, _ = _load_vol(b_path)
+
+    # NIfTI 4D: (x, y, z, n_comp) -> need (n_comp, x, y, z)
+    if a.dim() == 4:
+        a = a.permute(3, 0, 1, 2)
+    elif a.dim() == 3:
+        a = a.unsqueeze(0)
+    if b.dim() == 4:
+        b = b.permute(3, 0, 1, 2)
+    elif b.dim() == 3:
+        b = b.unsqueeze(0)
+
+    if mask_path is not None:
+        mask_vol, _ = _load_vol(mask_path)
+        mask = mask_vol > 0.5
+    else:
+        # Use union of nonzero voxels across all components
+        a_any = a.abs().sum(0) > 1e-8
+        b_any = b.abs().sum(0) > 1e-8
+        mask = a_any | b_any
+
+    corr_matrix = spatial_correlation_matrix(a, b, mask=mask)
+    # Use absolute values for sign-ambiguous ICA components
+    abs_corr = np.abs(corr_matrix)
+    row_idx, col_idx, matched_corrs = optimal_matching(abs_corr)
+    report = consistency_report(abs_corr)
+
+    matches = [(int(r), int(c), float(v)) for r, c, v in zip(row_idx, col_idx, matched_corrs)]
+    return {
+        "mean_matched_r": float(matched_corrs.mean()),
+        "median_matched_r": float(np.median(matched_corrs)),
+        "n_components_a": a.shape[0],
+        "n_components_b": b.shape[0],
+        "n_matched": len(matches),
+        "coverage_0.5": report.coverage_at_thresholds.get(0.5, 0.0),
+        "coverage_0.7": report.coverage_at_thresholds.get(0.7, 0.0),
+        "matches": matches,
+    }
+
+
+def compare_bucket_volumes(
+    a_path: str | Path,
+    b_path: str | Path,
+    sub_brick_indices: list[int] | None = None,
+    mask_path: str | Path | None = None,
+) -> dict:
+    """Compare sub-bricks of two GLM bucket files.
+
+    Computes spatial correlation for each sub-brick pair.
+
+    Args:
+        a_path, b_path: Paths to bucket NIfTI files.
+        sub_brick_indices: Which sub-bricks to compare. None = all.
+        mask_path: Optional mask.
+    """
+    a, _ = _load_vol(a_path)
+    b, _ = _load_vol(b_path)
+
+    # NIfTI 4D: (x, y, z, n_bricks) -> (n_bricks, x, y, z)
+    if a.dim() == 4:
+        a = a.permute(3, 0, 1, 2)
+    elif a.dim() == 3:
+        a = a.unsqueeze(0)
+    if b.dim() == 4:
+        b = b.permute(3, 0, 1, 2)
+    elif b.dim() == 3:
+        b = b.unsqueeze(0)
+
+    if mask_path is not None:
+        mask_vol, _ = _load_vol(mask_path)
+        mask = mask_vol > 0.5
+    else:
+        # Mask from first volume of a
+        mask = _automask(a[0])
+
+    if sub_brick_indices is None:
+        n = min(a.shape[0], b.shape[0])
+        sub_brick_indices = list(range(n))
+
+    results = []
+    for idx in sub_brick_indices:
+        if idx < a.shape[0] and idx < b.shape[0]:
+            r = spatial_correlation(a[idx], b[idx], mask=mask, method="pearson")
+            results.append({"index": idx, "r": float(r)})
+
+    r_vals = [x["r"] for x in results]
+    return {
+        "per_brick": results,
+        "mean_r": float(np.mean(r_vals)) if r_vals else 0.0,
+        "min_r": float(np.min(r_vals)) if r_vals else 0.0,
+        "n_bricks": len(results),
+    }

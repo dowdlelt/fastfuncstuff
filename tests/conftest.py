@@ -13,6 +13,12 @@ def pytest_configure(config):
     )
     config.addinivalue_line("markers", "gpu: marks tests that require GPU")
     config.addinivalue_line("markers", "integration: marks integration tests")
+    config.addinivalue_line(
+        "markers", "benchmark_validation: benchmark validation tests (need existing outputs)"
+    )
+    config.addinivalue_line(
+        "markers", "benchmark_full: full benchmark execution tests (need AFNI + data)"
+    )
 
 
 @pytest.fixture(scope="session")

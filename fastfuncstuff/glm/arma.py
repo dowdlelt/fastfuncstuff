@@ -320,7 +320,7 @@ def calculate_grid_memory_footprint(
     Calculate exact memory footprint of REML grid precomputation.
 
     The grid precomputation stores these tensors for each (a,b) pair:
-    - L_inv: inverse Cholesky factor (n_timepoints, n_timepoints)
+    - L: lower Cholesky factor (n_timepoints, n_timepoints)
     - X_w: prewhitened design (n_timepoints, n_regressors)
     - R_qr: upper triangular R from QR(X_w) (n_regressors, n_regressors) - AFNI's "D"
     - logdet_Rcorr: log det of correlation matrix
@@ -345,12 +345,12 @@ def calculate_grid_memory_footprint(
     bytes_per_element = 8 if use_double else 4
 
     # Memory per (a,b) pair
-    L_inv_size = n_timepoints * n_timepoints * bytes_per_element
+    L_size = n_timepoints * n_timepoints * bytes_per_element  # Cholesky factor
     X_w_size = n_timepoints * n_regressors * bytes_per_element
     XwTXw_size = n_regressors * n_regressors * bytes_per_element
     scalars_size = 2 * bytes_per_element  # logdet_R + logdet_XwTXw
 
-    per_pair_bytes = L_inv_size + X_w_size + XwTXw_size + scalars_size
+    per_pair_bytes = L_size + X_w_size + XwTXw_size + scalars_size
 
     # Total for all pairs
     total_bytes = n_valid_ab_pairs * per_pair_bytes
@@ -998,20 +998,16 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
         # MPS has a bug with Cholesky - use CPU as workaround
         if device.type == "mps":
             R_cpu = R.cpu()
-            L_cpu = torch.linalg.cholesky(R_cpu)
-            L_inv_cpu = torch.linalg.inv(L_cpu)
-            L = L_cpu.to(device)
-            L_inv = L_inv_cpu.to(device)
+            L = torch.linalg.cholesky(R_cpu).to(device)
         else:
             L = torch.linalg.cholesky(R)
-            L_inv = torch.linalg.inv(L)
 
         # Term 1: log(det(R)) = 2 * sum(log(diag(L)))
         term1 = 2 * torch.sum(torch.log(torch.diag(L) + 1e-10))
 
-        # Prewhiten design and data
-        X_w = L_inv @ X
-        Y_w = L_inv @ Y
+        # Prewhiten design and data via triangular solve
+        X_w = torch.linalg.solve_triangular(L, X, upper=False)
+        Y_w = torch.linalg.solve_triangular(L, Y, upper=False)
 
         # Term 2: log(det(X' R^(-1) X)) = log(det(X_w' X_w))
         XwTXw = X_w.T @ X_w
@@ -1202,10 +1198,10 @@ def precompute_reml_grid(
     -------
     precomputed : dict
         Contains pre-computed matrices for each valid (a,b):
-        - 'L_inv': inverse Cholesky factor
+        - 'L': lower Cholesky factor (use solve_triangular for prewhitening)
         - 'X_w': prewhitened design
-        - 'XwTXw_reg': regularized X'X
-        - 'logdet_R': log(det(R))
+        - 'R_qr': QR's R factor or X'X
+        - 'logdet_Rcorr': log(det(R))
         - 'logdet_XwTXw': log(det(X'R^-1 X))
     """
     # Ensure X has the correct dtype for all operations
@@ -1278,74 +1274,15 @@ def precompute_reml_grid(
 
         chol_start = time.time()
 
-        if verbose:
-            print("    [DEBUG] Entering Cholesky computation...")
-
         if cholesky_on_cpu or device.type == "mps":
-            # CPU Cholesky: For pure CPU mode with large matrices, chunk the batch
-            # to avoid BLAS backend performance issues
-            # When CUDA is available (even if computing on CPU), PyTorch uses optimized MKL
-            # In pure CPU mode, it may use slower backends, so we chunk
-
-            if verbose:
-                print("    [DEBUG] In cholesky_on_cpu branch")
-                print(
-                    f"    [DEBUG] Checking chunking: device={device.type}, n_tp={n_timepoints}, n_valid={n_valid}"
-                )
-                will_chunk = (
-                    device.type == "cpu" and n_timepoints > 1000 and n_valid > 50
-                )
-                print(f"    [DEBUG] Will use chunking: {will_chunk}")
-
-            # Standard batch Cholesky for GPU-available mode or small grids
-            if verbose:
-                print("    [DEBUG] Using STANDARD batch Cholesky (non-chunked)")
-                print(
-                    f"    [DEBUG] About to call torch.linalg.cholesky on shape {R_batch.shape}..."
-                )
-
             L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
-
-            if verbose:
-                print("    [DEBUG] Cholesky done, computing batch inverse...")
-                print(
-                    f"    [DEBUG] L_batch device: {L_batch.device}, dtype: {L_batch.dtype}"
-                )
-
-            # WORKAROUND: In pure CPU mode, batch inverse hangs!
-            # Do sequential inverse instead when device=cpu
-            if device.type == "cpu":
-                if verbose:
-                    print(
-                        "    [DEBUG] Using SEQUENTIAL inverse for pure CPU mode (batch inv hangs)"
-                    )
-                L_inv_list = []
-                from tqdm.auto import tqdm
-
-                for i in tqdm(
-                    range(n_valid),
-                    desc="  Inverting matrices",
-                    unit="matrix",
-                    disable=not verbose,
-                ):
-                    L_inv_list.append(torch.linalg.inv(L_batch[i]))
-                L_inv_batch = torch.stack(L_inv_list, dim=0)
-            else:
-                L_inv_batch = torch.linalg.inv(L_batch)  # (n_valid, n, n)
-
-            if verbose:
-                print("    [DEBUG] Batch inverse done")
-
-            # KEEP ON CPU - will be moved to GPU ONCE after precomputation
-            # This avoids OOM during grid construction (6+ GiB for large grids)
+            # No inverse needed! We use triangular solve instead of L_inv @ Y
+            # This eliminates O(n_valid * n^3) inverse computation entirely
         else:
             # Direct GPU Cholesky (faster but uses more VRAM)
-            # R_batch already on GPU from build_device logic above
             L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
-            L_inv_batch = torch.linalg.inv(L_batch)  # (n_valid, n, n)
-            # Move to CPU for storage (will be loaded to GPU ONCE after grid complete)
+            # Move to CPU for storage (will be loaded to GPU on-demand)
             L_batch = L_batch.cpu()
-            L_inv_batch = L_inv_batch.cpu()
 
         chol_time = time.time() - chol_start
 
@@ -1357,10 +1294,7 @@ def precompute_reml_grid(
             _debug_memory_snapshot(
                 "Grid: After Cholesky (before R_batch delete)",
                 device,
-                {
-                    "L_batch": L_batch,
-                    "L_inv_batch": L_inv_batch,
-                },
+                {"L_batch": L_batch},
             )
 
         # Free R_batch immediately - don't need it anymore
@@ -1370,23 +1304,18 @@ def precompute_reml_grid(
             _debug_memory_snapshot(
                 "Grid: After R_batch deleted",
                 device,
-                {
-                    "L_batch": L_batch,
-                    "L_inv_batch": L_inv_batch,
-                },
+                {"L_batch": L_batch},
             )
 
         # PHASE 3: Batch prewhitening of design matrix
-        # X_w[i] = L_inv[i] @ X for all i
-        # Use batch matrix multiplication: (n_valid, n, n) @ (n, m) -> (n_valid, n, m)
-        # Move X to same device as L_inv_batch (CPU if cholesky_on_cpu=True)
-        X_build = X.to(L_inv_batch.device)
-        # expand() creates a VIEW (no memory copy!)
+        # X_w[i] = L[i]^{-1} @ X via batched triangular solve (no explicit inverse!)
+        # This exploits L's lower-triangular structure for ~2x fewer FLOPs than bmm
+        X_build = X.to(L_batch.device)
         X_expanded = X_build.unsqueeze(0).expand(n_valid, -1, -1)  # VIEW!
-        X_w_batch = torch.bmm(
-            L_inv_batch, X_expanded
+        X_w_batch = torch.linalg.solve_triangular(
+            L_batch, X_expanded, upper=False
         )  # (n_valid, n_timepoints, n_regressors)
-        del X_expanded, X_build  # Free view and temp tensor
+        del X_expanded, X_build
 
         # PHASE 4: Compute factorization (QR or X'X depending on use_qr flag)
         if use_qr:
@@ -1412,7 +1341,7 @@ def precompute_reml_grid(
         logdet_Rcorr_batch = 2 * torch.sum(
             torch.log(torch.diagonal(L_batch, dim1=1, dim2=2) + 1e-10), dim=1
         )  # (n_valid,)
-        del L_batch  # Don't need L anymore, only L_inv
+        # Keep L_batch — stored per grid point for triangular solve during search
 
         # logdet(X'R^-1 X)
         if use_qr:
@@ -1443,9 +1372,9 @@ def precompute_reml_grid(
         # They will be moved to GPU on-demand during REML search
         for i, (a_val, b_val) in enumerate(param_list):
             precomputed[(a_val, b_val)] = {
-                "L_inv": L_inv_batch[
+                "L": L_batch[
                     i
-                ],  # (n, n) - CPU tensor - inverse Cholesky of correlation matrix
+                ],  # (n, n) - CPU tensor - lower Cholesky factor (use solve_triangular, not matmul!)
                 "X_w": X_w_batch[
                     i
                 ],  # (n, n_regressors) - CPU tensor - prewhitened design
@@ -1474,8 +1403,6 @@ def precompute_reml_grid(
             del R_batch
         if "L_batch" in locals():
             del L_batch  # noqa: F821
-        if "L_inv_batch" in locals():
-            del L_inv_batch  # noqa: F821
         if "X_w_batch" in locals():
             del X_w_batch
         if "Q_batch" in locals():
@@ -1502,33 +1429,28 @@ def precompute_reml_grid(
                 continue
 
             try:
-                # Compute on CPU and store on CPU (moved to GPU on-demand later)
+                # Compute Cholesky on CPU and store on CPU
                 if cholesky_on_cpu or device.type == "mps":
                     R_cpu = R.cpu()
                     L = torch.linalg.cholesky(R_cpu)
-                    L_inv = torch.linalg.inv(L)
                     del R_cpu
                 else:
-                    # Even if cholesky_on_cpu=False, move to CPU for storage
                     L = torch.linalg.cholesky(R).cpu()
-                    L_inv = torch.linalg.inv(L)
 
-                # Prewhiten design on CPU
+                # Prewhiten design via triangular solve (no inverse!)
                 X_cpu = X.cpu() if X.device.type != "cpu" else X
-                X_w = L_inv @ X_cpu
+                X_w = torch.linalg.solve_triangular(L, X_cpu, upper=False)
 
                 logdet_Rcorr = 2 * torch.sum(torch.log(torch.diag(L) + 1e-10))
 
                 if use_qr:
-                    # QR factorization (AFNI's matrix_qrr)
                     Q, R_qr = torch.linalg.qr(X_w)
                     logdet_XwTXw = 2 * torch.sum(
                         torch.log(torch.abs(torch.diag(R_qr)) + 1e-10)
                     )
                 else:
-                    # X'X approach
                     XwTXw = X_w.T @ X_w
-                    R_qr = XwTXw  # Store as R_qr for consistent naming
+                    R_qr = XwTXw
                     sign, logdet_XwTXw = torch.linalg.slogdet(XwTXw)
                     logdet_XwTXw = (
                         logdet_XwTXw
@@ -1536,14 +1458,13 @@ def precompute_reml_grid(
                         else torch.tensor(1e10, device=torch.device("cpu"), dtype=dtype)
                     )
 
-                # Store on CPU - will be moved to GPU on-demand during REML search
                 precomputed[(a_val, b_val)] = {
-                    "L_inv": L_inv,  # CPU tensor
-                    "X_w": X_w,  # CPU tensor
-                    "R_qr": R_qr,  # CPU tensor - QR's R or X'X
-                    "logdet_Rcorr": logdet_Rcorr,  # CPU tensor
-                    "logdet_XwTXw": logdet_XwTXw,  # CPU tensor
-                    "use_qr": use_qr,  # bool
+                    "L": L,  # CPU tensor - lower Cholesky factor
+                    "X_w": X_w,
+                    "R_qr": R_qr,
+                    "logdet_Rcorr": logdet_Rcorr,
+                    "logdet_XwTXw": logdet_XwTXw,
+                    "use_qr": use_qr,
                     "a": a_val,
                     "b": b_val,
                 }
@@ -1555,44 +1476,41 @@ def precompute_reml_grid(
                 continue
 
     # CRITICAL: Delete batch tensors to free memory before GPU transfer
-    # Each precomputed[(a,b)] entry holds a VIEW into these batches
-    # If we don't delete them, moving views to GPU keeps batch tensors alive
     if debug_memory:
         _debug_memory_snapshot(
             "Grid: Before deleting batch tensors",
             device,
             {
-                "L_inv_batch": locals().get("L_inv_batch"),
+                "L_batch": locals().get("L_batch"),
                 "X_w_batch": locals().get("X_w_batch"),
                 "R_batch": locals().get("R_batch"),
             },
         )
 
-        # Calculate expected grid size
-        if "L_inv_batch" in locals():
+        if "L_batch" in locals():
             n_pairs = len(param_list)
             n_regs = X.shape[1]
-            bytes_per_elem = L_inv_batch.element_size()
+            bytes_per_elem = L_batch.element_size()
 
-            expected_L_inv = n_pairs * n_timepoints * n_timepoints * bytes_per_elem
+            expected_L = n_pairs * n_timepoints * n_timepoints * bytes_per_elem
             expected_X_w = n_pairs * n_timepoints * n_regs * bytes_per_elem
             expected_R_qr = n_pairs * n_regs * n_regs * bytes_per_elem
             expected_scalars = n_pairs * 2 * bytes_per_elem
             expected_total = (
-                expected_L_inv + expected_X_w + expected_R_qr + expected_scalars
+                expected_L + expected_X_w + expected_R_qr + expected_scalars
             )
 
-            actual_L_inv = L_inv_batch.element_size() * L_inv_batch.nelement()
+            actual_L = L_batch.element_size() * L_batch.nelement()
             actual_X_w = X_w_batch.element_size() * X_w_batch.nelement()
             actual_R_qr = R_batch.element_size() * R_batch.nelement()
-            actual_total = actual_L_inv + actual_X_w + actual_R_qr
+            actual_total = actual_L + actual_X_w + actual_R_qr
 
             print("\nGRID SIZE VERIFICATION:")
             print(
                 f"  n_pairs={n_pairs}, n_timepoints={n_timepoints}, n_regressors={n_regs}, dtype={dtype}"
             )
             print(f"  Expected grid size: {expected_total / 1024**3:.3f} GiB")
-            print(f"    - L_inv:  {expected_L_inv / 1024**3:.3f} GiB")
+            print(f"    - L:      {expected_L / 1024**3:.3f} GiB")
             print(f"    - X_w:    {expected_X_w / 1024**3:.3f} GiB")
             print(f"    - R_qr:   {expected_R_qr / 1024**3:.3f} GiB")
             print(f"  Actual batch tensors: {actual_total / 1024**3:.3f} GiB")
@@ -1600,8 +1518,8 @@ def precompute_reml_grid(
                 f"  Match: {'✅ YES' if abs(actual_total - expected_total) < 1024**2 else '❌ NO'}"
             )
 
-    if "L_inv_batch" in locals():
-        del L_inv_batch
+    if "L_batch" in locals():
+        del L_batch
     if "X_w_batch" in locals():
         del X_w_batch
     if "R_batch" in locals():
@@ -1799,15 +1717,15 @@ def _evaluate_single_param(
     Helper function for CPU hierarchical search.
     """
     # Get precomputed matrices
-    L_inv = precomputed[param_key]["L_inv"]  # (n_time, n_time)
+    L = precomputed[param_key]["L"]  # (n_time, n_time) - lower Cholesky factor
     X_w = precomputed[param_key]["X_w"]  # (n_time, n_reg)
     R_qr = precomputed[param_key]["R_qr"]  # (n_reg, n_reg)
     logdet_Rcorr = precomputed[param_key]["logdet_Rcorr"]  # scalar
     logdet_XwTXw = precomputed[param_key]["logdet_XwTXw"]  # scalar
     use_qr = precomputed[param_key]["use_qr"]
 
-    # Prewhiten data
-    Y_w = L_inv @ Y_voxel  # (n_time, 1)
+    # Prewhiten data via triangular solve: Y_w = L^{-1} @ Y_voxel
+    Y_w = torch.linalg.solve_triangular(L, Y_voxel, upper=False)  # (n_time, 1)
 
     # Compute beta
     XwTYw = X_w.T @ Y_w  # (n_reg, 1)
@@ -2065,15 +1983,15 @@ def batch_reml_grid_search(
         # We move them to the target device after stacking
         chunk_keys = [param_list[i] for i in chunk_indices]
 
-        L_inv_stack = torch.stack([precomputed[k]["L_inv"] for k in chunk_keys]).to(
+        L_stack = torch.stack([precomputed[k]["L"] for k in chunk_keys]).to(
             device
-        )  # (n_chunk, n_time, n_time)
+        )  # (n_chunk, n_time, n_time) - lower Cholesky factors
         X_w_stack = torch.stack([precomputed[k]["X_w"] for k in chunk_keys]).to(
             device
         )  # (n_chunk, n_time, n_regressors)
         R_qr_stack = torch.stack([precomputed[k]["R_qr"] for k in chunk_keys]).to(
             device
-        )  # (n_chunk, n_reg, n_reg) - upper triangular from QR
+        )  # (n_chunk, n_reg, n_reg)
         logdet_Rcorr_stack = torch.stack(
             [precomputed[k]["logdet_Rcorr"] for k in chunk_keys]
         ).to(device)  # (n_chunk,)
@@ -2081,13 +1999,13 @@ def batch_reml_grid_search(
             [precomputed[k]["logdet_XwTXw"] for k in chunk_keys]
         ).to(device)  # (n_chunk,)
 
-        # PHASE 2: Prewhiten data for THIS CHUNK
-        # Broadcast: (n_chunk, n_time, n_time) @ (n_time, n_voxels) -> (n_chunk, n_time, n_voxels)
+        # PHASE 2: Prewhiten data via batched triangular solve
+        # solve L @ Y_w = Y for each grid point (exploits triangular structure, ~2x fewer FLOPs)
         Y_batch_expanded = Y_batch.unsqueeze(0).expand(
             len(chunk_indices), -1, -1
         )  # VIEW - no VRAM copy!
-        Y_w_all = torch.bmm(
-            L_inv_stack, Y_batch_expanded
+        Y_w_all = torch.linalg.solve_triangular(
+            L_stack, Y_batch_expanded, upper=False
         )  # (n_chunk, n_time, n_voxels)
         del Y_batch_expanded
 
@@ -2129,7 +2047,7 @@ def batch_reml_grid_search(
         del rss_all
 
         chunk_likelihoods = term1 + term2 + term3  # (n_chunk, n_voxels)
-        del term1, term2, term3, L_inv_stack, X_w_stack, R_qr_stack
+        del term1, term2, term3, L_stack, X_w_stack, R_qr_stack
         del logdet_Rcorr_stack, logdet_XwTXw_stack, beta_w_all
 
         # PHASE 6: Update best parameters if this chunk has better likelihoods
@@ -2146,13 +2064,13 @@ def batch_reml_grid_search(
         improve_mask = chunk_best_likelihoods < best_likelihoods
         best_likelihoods[improve_mask] = chunk_best_likelihoods[improve_mask]
 
-        # Map chunk indices to global param list indices
-        for voxel_idx in torch.where(improve_mask)[0]:
-            chunk_param_idx = chunk_best_idx[voxel_idx].item()
-            global_param_idx = chunk_indices[chunk_param_idx]
-            a_val, b_val = param_list[global_param_idx]
-            best_params[voxel_idx, 0] = a_val
-            best_params[voxel_idx, 1] = b_val
+        # Vectorized param update: build params tensor for this chunk, index by best
+        if improve_mask.any():
+            chunk_params = torch.tensor(
+                [param_list[chunk_indices[i]] for i in range(len(chunk_indices))],
+                dtype=dtype, device=device,
+            )  # (n_chunk, 2)
+            best_params[improve_mask] = chunk_params[chunk_best_idx[improve_mask]]
 
         n_chunks_evaluated += 1
 
@@ -2206,7 +2124,7 @@ def search_voxels_precomputed_grid(
         Voxel timeseries data
     precomputed_grid : dict
         Dictionary mapping (a, b) tuples to precomputed matrices:
-        - 'L_inv': Cholesky factor inverse
+        - 'L': lower Cholesky factor (use solve_triangular to prewhiten)
         - 'X_w': Prewhitened design matrix
         - 'R_qr': QR decomposition of X_w
         - 'logdet_Rcorr': log determinant of correlation matrix
@@ -2252,18 +2170,19 @@ def search_voxels_precomputed_grid(
             grid_data = precomputed_grid[(a, b)]
 
             # Get precomputed matrices (already on GPU)
-            L_inv = grid_data["L_inv"]
+            L = grid_data["L"]
             X_w = grid_data["X_w"]
             R_qr = grid_data["R_qr"]
             logdet_Rcorr = grid_data["logdet_Rcorr"]
             logdet_XwTXw = grid_data["logdet_XwTXw"]
 
-        # Prewhiten data: Y_w = L_inv @ Y for all voxels
+        # Prewhiten data: Y_w = L^{-1} @ Y via triangular solve
         with profile_section("2_prewhiten_data", enabled=enable_timing):
-            # Y_batch: (n_voxels, n_timepoints)
-            # L_inv: (n_timepoints, n_timepoints)
-            # Result: (n_voxels, n_timepoints)
-            Y_w_batch = Y_batch @ L_inv.T  # More efficient than L_inv @ Y_batch.T
+            # Y_batch: (n_voxels, n_timepoints), L: (n_timepoints, n_timepoints)
+            # solve_triangular expects (n, n) @ (n, k), so transpose
+            Y_w_batch = torch.linalg.solve_triangular(
+                L, Y_batch.T, upper=False
+            ).T  # (n_voxels, n_timepoints)
 
         # Solve X_w @ beta = Y_w for each voxel
         with profile_section("3_compute_XwTYw", enabled=enable_timing):
@@ -2337,14 +2256,16 @@ def prewhiten_with_arma11(
         Prewhitened design matrix
     Y_white : torch.Tensor
         Prewhitened data
-    L_inv : torch.Tensor
-        Prewhitening matrix (Cholesky factor inverse)
+    L : torch.Tensor
+        Lower Cholesky factor of ARMA covariance.
+        Callers needing L^{-1} @ v should use
+        ``torch.linalg.solve_triangular(L, v, upper=False)``.
 
     Notes
     -----
     Prewhitening transformation:
     - R = L L' (Cholesky)
-    - X* = L^(-1) X
+    - X* = L^(-1) X  (computed via triangular solve, not explicit inverse)
     - Y* = L^(-1) Y
 
     After prewhitening, OLS on (X*, Y*) = GLS on (X, Y).
@@ -2353,14 +2274,13 @@ def prewhiten_with_arma11(
 
     Memory optimization: For large n_timepoints (e.g., 17140), the covariance matrix
     is huge (17140^2 = 2+ GB). Building on CPU avoids GPU fragmentation and OOM errors.
-    Cholesky on CPU is fast, and only L_inv is moved to GPU (much smaller after inversion).
+    Cholesky on CPU is fast, and only L is moved to GPU.
     """
     device = X.device
     n_timepoints = X.shape[0]
 
     # Build ARMA(1,1) covariance on CPU to save GPU memory and avoid fragmentation
-    # For large n_timepoints, building on CPU avoids initial 2+ GB allocation spike
-    # Use X.dtype so L_inv precision matches the inputs (important when use_double=True)
+    # Use X.dtype so precision matches the inputs (important when use_double=True)
     R = build_arma11_covariance(a, b, n_timepoints, torch.device("cpu"), dtype=X.dtype)
 
     if R is None:
@@ -2370,66 +2290,40 @@ def prewhiten_with_arma11(
     try:
         # Compact GPU memory before attempting allocation (minimal cost, big benefit!)
         if device.type == "cuda":
-            torch.cuda.synchronize()  # Ensure all ops complete
-            torch.cuda.empty_cache()  # Release fragmented memory
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # Move R to GPU temporarily for fast Cholesky
         R_gpu = R.to(device)
-
-        # Cholesky on GPU (10-100x faster than CPU!)
         L = torch.linalg.cholesky(R_gpu)
-        del R_gpu  # Free GPU R (but keep CPU R for potential fallback)
-
-        # Compute L_inv on GPU
-        identity = torch.eye(n_timepoints, dtype=L.dtype, device=device)
-        L_inv = torch.linalg.solve_triangular(L, identity, upper=False)
-        del L  # Free GPU L
-        del R  # Success - can now delete CPU R
+        del R_gpu, R
 
     except (RuntimeError, torch.cuda.OutOfMemoryError):
         # GPU OOM - fall back to CPU (slower but safe)
-        # R still exists here since we didn't delete it in try block
-
-        # CRITICAL: Clean up GPU memory from failed try block
-        # If exception occurred, L and identity may still be on GPU
         try:
-            del L
-        except NameError:
-            pass
-        try:
-            del identity
+            del L  # noqa: F821
         except NameError:
             pass
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # Cholesky on CPU
-        # R exists here from line 2382 (only deleted if try succeeds at line 2405)
-        L_cpu = torch.linalg.cholesky(R)  # noqa: F821
-
-        # Compute L_inv on CPU
-        identity_cpu = torch.eye(
-            n_timepoints, dtype=L_cpu.dtype, device=torch.device("cpu")
-        )
-        L_inv_cpu = torch.linalg.solve_triangular(L_cpu, identity_cpu, upper=False)
-        del L_cpu  # Free CPU memory
-
-        # Move only L_inv to GPU (smaller than R)
-        L_inv = L_inv_cpu.to(device)
-        del L_inv_cpu, R  # Cleanup both  # noqa: F821
+        L = torch.linalg.cholesky(R).to(device)
+        del R  # noqa: F821
 
     if Y.ndim == 1:
         Y = Y.unsqueeze(1)
 
-    # Prewhiten using L_inv (on target device, matching X and Y device)
-    X_white = L_inv @ X
-    Y_white = L_inv @ Y
+    # Prewhiten via triangular solve: X* = L^{-1} X, Y* = L^{-1} Y
+    # This is mathematically identical to forming L_inv and multiplying,
+    # but avoids the O(n^3) explicit inverse and exploits triangular structure.
+    X_white = torch.linalg.solve_triangular(L, X, upper=False)
+    Y_white = torch.linalg.solve_triangular(L, Y, upper=False)
 
     if Y_white.shape[1] == 1:
         Y_white = Y_white.squeeze(1)
 
-    return X_white, Y_white, L_inv
+    return X_white, Y_white, L
 
 
 def determine_adaptive_batching_strategy(
@@ -2722,15 +2616,11 @@ def reml_grid_search_batched(
                 # Compute Cholesky
                 L = torch.linalg.cholesky(R)  # On CPU
 
-                # Compute L_inv efficiently
-                identity = torch.eye(n_timepoints, dtype=dtype)
-                L_inv_cpu = torch.linalg.solve_triangular(L, identity, upper=False)
+                # Move L to GPU for triangular solve
+                L_dev = L.to(device)
 
-                # Move to GPU
-                L_inv = L_inv_cpu.to(device)
-
-                # Prewhiten design (same for all voxels)
-                X_w = L_inv @ design_dev  # (n_tp, n_reg)
+                # Prewhiten design via triangular solve (no explicit inverse!)
+                X_w = torch.linalg.solve_triangular(L_dev, design_dev, upper=False)  # (n_tp, n_reg)
                 XwTXw = X_w.T @ X_w
                 XwTXw_reg = XwTXw + 1e-6 * torch.eye(
                     n_regressors, device=device, dtype=dtype
@@ -2743,8 +2633,10 @@ def reml_grid_search_batched(
                 # Process voxels (either all at once or in batches)
                 if load_all_data:
                     # All data already on device - process at once
-                    # Prewhiten ALL voxels at once (matrix multiply!)
-                    y_w = data_dev @ L_inv.T  # (n_voxels, n_tp)
+                    # Prewhiten ALL voxels via triangular solve
+                    y_w = torch.linalg.solve_triangular(
+                        L_dev, data_dev.T, upper=False
+                    ).T  # (n_voxels, n_tp)
 
                     # Solve for ALL voxels: beta = (X'X)^-1 X'y
                     XwTy_w = X_w.T @ y_w.T  # (n_reg, n_voxels)
@@ -2792,8 +2684,10 @@ def reml_grid_search_batched(
                         # Move this batch to device
                         data_batch = data[voxel_start:voxel_end].to(device, dtype=dtype)
 
-                        # Prewhiten this batch
-                        y_w = data_batch @ L_inv.T  # (batch_voxels, n_tp)
+                        # Prewhiten this batch via triangular solve
+                        y_w = torch.linalg.solve_triangular(
+                            L_dev, data_batch.T, upper=False
+                        ).T  # (batch_voxels, n_tp)
 
                         # Solve for this batch: beta = (X'X)^-1 X'y
                         XwTy_w = X_w.T @ y_w.T  # (n_reg, batch_voxels)
@@ -2844,7 +2738,7 @@ def reml_grid_search_batched(
                         del data_batch, y_w, betas, resid_w, sse, likelihoods
 
                 # Free common GPU memory before next iteration
-                del L_inv, X_w, XwTXw, XwTXw_reg
+                del L_dev, X_w, XwTXw, XwTXw_reg
 
             except (torch.linalg.LinAlgError, RuntimeError) as e:
                 # Skip this (a,b) if Cholesky fails
@@ -3550,14 +3444,14 @@ def fit_glm_arma11(
 
             for params in unique_params:
                 a_opt, b_opt = params[0].item(), params[1].item()
-                X_w, _, L_inv = prewhiten_with_arma11(
+                X_w, _, L = prewhiten_with_arma11(
                     design, design[:, 0], a_opt, b_opt
                 )
-                # CRITICAL: Store L_inv on CPU to save GPU memory (1.1 GB per matrix for 17k timepoints!)
+                # CRITICAL: Store L on CPU to save GPU memory (1.1 GB per matrix for 17k timepoints!)
                 # Move to GPU only when needed for batch computation
                 precomputed_grid[(a_opt, b_opt)] = {
                     "X_w": X_w.cpu(),  # Store on CPU
-                    "L_inv": L_inv.cpu(),  # Store on CPU
+                    "L": L.cpu(),  # Store on CPU - lower Cholesky factor
                     "a": a_opt,
                     "b": b_opt,
                 }
@@ -3702,26 +3596,24 @@ def fit_glm_arma11(
                     )
 
                 if debug_memory:
-                    # Sample one grid entry to check size
                     sample_key = list(precomputed_grid.keys())[0]
                     _debug_memory_snapshot(
                         "AFTER grid precomputation (on CPU)",
                         device,
                         {
-                            "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
+                            "sample_L": precomputed_grid[sample_key]["L"],
                             "sample_X_w": precomputed_grid[sample_key]["X_w"],
                             "sample_R_qr": precomputed_grid[sample_key]["R_qr"],
                         },
                     )
 
                 # CRITICAL: Move entire grid to GPU ONCE (not per-batch!)
-                # This is the AFNI strategy: precompute once, reuse for all voxels
                 if device.type == "cuda":
                     if verbose:
                         print("  Loading grid to GPU (one-time cost)...")
                     for key in precomputed_grid:
-                        precomputed_grid[key]["L_inv"] = precomputed_grid[key][
-                            "L_inv"
+                        precomputed_grid[key]["L"] = precomputed_grid[key][
+                            "L"
                         ].to(device)
                         precomputed_grid[key]["X_w"] = precomputed_grid[key]["X_w"].to(
                             device
@@ -3736,7 +3628,6 @@ def fit_glm_arma11(
                             "logdet_XwTXw"
                         ].to(device)
 
-                    # Clear any fragmentation from grid loading
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
@@ -3751,7 +3642,7 @@ def fit_glm_arma11(
                             "AFTER grid loaded to GPU",
                             device,
                             {
-                                "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
+                                "sample_L": precomputed_grid[sample_key]["L"],
                                 "sample_X_w": precomputed_grid[sample_key]["X_w"],
                                 "sample_R_qr": precomputed_grid[sample_key]["R_qr"],
                             },
@@ -3804,8 +3695,8 @@ def fit_glm_arma11(
                     print(f"  Mean λ: {lam.mean():.3f}\n")
 
         # NEW OPTIMIZED APPROACH: Group voxels by (a,b), process each group together
-        # Eliminates CPU<->GPU transfers of L_inv (saves ~87 minutes on large datasets!)
-        # Compute each L_inv once, keep on GPU, process all voxels with that (a,b), then delete
+        # Eliminates CPU<->GPU transfers of L (saves ~87 minutes on large datasets!)
+        # Compute each L once, keep on GPU, process all voxels with that (a,b), then delete
         if verbose:
             print("\n📦 Grouping voxels by optimal ARMA parameters...")
 
@@ -3841,19 +3732,18 @@ def fit_glm_arma11(
         ):
             n_group_voxels = len(voxel_indices)
 
-            # Get L_inv and X_w for this (a,b) pair
+            # Get L and X_w for this (a,b) pair
             # If precomputed_grid exists (from precomputed ARMA params or non-batched grid search),
             # reuse cached values. Otherwise compute on-demand.
             if use_precomputed_arma and (a_opt, b_opt) in precomputed_grid:
-                # Reuse cached L_inv and X_w (stored on CPU to save GPU memory)
+                # Reuse cached L and X_w (stored on CPU to save GPU memory)
                 # Move to GPU only when needed for this group
-                L_inv = precomputed_grid[(a_opt, b_opt)]["L_inv"].to(device)
+                L_chol = precomputed_grid[(a_opt, b_opt)]["L"].to(device)
                 X_w = precomputed_grid[(a_opt, b_opt)]["X_w"].to(device)
             else:
-                # Compute L_inv ONCE for this (a,b) group, keep on GPU
-                # Use first voxel as dummy for prewhiten_with_arma11
+                # Compute L ONCE for this (a,b) group, keep on GPU
                 y_dummy = data[voxel_indices[0]].to(device)
-                X_w, _, L_inv = prewhiten_with_arma11(design, y_dummy, a_opt, b_opt)
+                X_w, _, L_chol = prewhiten_with_arma11(design, y_dummy, a_opt, b_opt)
 
             # OPTIMIZATION: Precompute group-level matrices ONCE per (a,b)
             # X_w is the same for all voxels in this group, so derivatives are constant
@@ -3902,9 +3792,9 @@ def fit_glm_arma11(
 
             # Process voxels in this group using sub-batches (memory-aware)
             # Determine sub-batch size based on available GPU memory
-            # CRITICAL: Pass persistent tensors that stay on GPU (L_inv, X_w, design, etc)
+            # CRITICAL: Pass persistent tensors that stay on GPU (L_chol, X_w, design, etc)
             persistent_gpu_tensors = {
-                "L_inv": L_inv,
+                "L_chol": L_chol,
                 "X_w": X_w,
                 "design": design if design.device.type == "cuda" else None,
             }
@@ -3957,11 +3847,12 @@ def fit_glm_arma11(
                 # Store λ for these voxels (pre-computed above, reuse for all sub-batches)
                 results.arma_lambda[sub_voxel_indices] = lambda_val_cpu
 
-                # Prewhiten data using L_inv (already on GPU from group computation!)
-                # All voxels in this sub-batch have the same (a,b), so same L_inv
-                # Vectorized prewhitening: L_inv @ Y for all voxels at once
+                # Prewhiten data via triangular solve (L_chol on GPU from group computation!)
+                # All voxels in this sub-batch have the same (a,b), so same L_chol
                 t_pw_start = time.time()
-                y_w_batch = (L_inv @ Y_batch_dev).T  # (batch_voxels, n_timepoints)
+                y_w_batch = torch.linalg.solve_triangular(
+                    L_chol, Y_batch_dev, upper=False
+                ).T  # (batch_voxels, n_timepoints)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t_prewhiten_total += time.time() - t_pw_start
@@ -4712,7 +4603,7 @@ def fit_glm_arma11(
                 print(f"    Total:        {total_group_time:6.2f}s\n")
 
             # Delete group-level precomputed matrices to free GPU memory for next group
-            del L_inv, X_w
+            del L_chol, X_w
             if use_qr:
                 del Q_group, R_qr_group, R_inv_group, XwTXw_inv_group
             if device.type == "cuda":
@@ -4764,7 +4655,7 @@ def fit_glm_arma11(
         design_dev = design.to(device) if design.device != device else design
 
         # Prewhiten design (shared across all voxels)
-        X_w, _, L_inv = prewhiten_with_arma11(design_dev, y_mean, a_opt, b_opt)
+        X_w, _, L_global = prewhiten_with_arma11(design_dev, y_mean, a_opt, b_opt)
         XwTXw = X_w.T @ X_w
         XwTXw_reg = XwTXw + 1e-6 * torch.eye(n_regressors, device=device, dtype=dtype)
 
@@ -4782,8 +4673,11 @@ def fit_glm_arma11(
             y_v_cpu = data[v]
             y_v_dev = y_v_cpu.to(device)
 
-            # Prewhiten data
-            _, y_w, _ = prewhiten_with_arma11(design_dev, y_v_dev, a_opt, b_opt)
+            # Prewhiten data via triangular solve (reuse L from global estimation)
+            y_v_col = y_v_dev.unsqueeze(1) if y_v_dev.ndim == 1 else y_v_dev
+            y_w = torch.linalg.solve_triangular(L_global, y_v_col, upper=False)
+            if y_w.shape[-1] == 1:
+                y_w = y_w.squeeze(-1)
 
             # GLS fit
             beta = torch.linalg.solve(XwTXw_reg, X_w.T @ y_w)

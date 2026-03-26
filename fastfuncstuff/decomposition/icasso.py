@@ -403,6 +403,7 @@ def icasso(
             random_state=seed_i,
             device=device,
         )
+        ica.verbose = False  # suppress per-iteration bars during ICASSO
         ica.fit(X_i)
 
         # Capture PCA info from first run

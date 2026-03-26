@@ -28,10 +28,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .affine import resample_to_base_grid
 from .interp import warp_image_linear
 from .io import load_image, load_warp_field, save_image, save_warp_field
 from .mask import automask
 from .memory import estimate_gpu_memory_gb, print_memory_report
+from .nwarpforge import _regrid_to_dxyz
 from .warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
 from .weight import _gaussian_smooth_3d
 
@@ -72,6 +74,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_io.add_argument("-prefix", required=True,
                       help="Output prefix. Produces {prefix}.nii.gz (warped image) "
                            "and {prefix}_WARP*.nii.gz (displacement fields)")
+    g_io.add_argument("-dxyz", type=float, default=None, metavar="MM",
+                      help="Force isotropic output voxel size (mm). Resamples the warped "
+                           "output to cover the same FOV at the new resolution. "
+                           "E.g., -dxyz 1.0 for 1mm isotropic output. Warp field is "
+                           "still saved at the base resolution")
     g_io.add_argument("-save_warp", action="store_true", default=True,
                       help="Save displacement warp field(s) [default: yes]")
     g_io.add_argument("-no_save_warp", action="store_true",
@@ -1245,6 +1252,30 @@ def main(argv: list[str] | None = None) -> int:
                     padding=warp_padding,
                     units="mm",
                 )
+
+    # Post-hoc resample to requested voxel size
+    if args.dxyz is not None:
+        import numpy as np
+        old_vox = np.sqrt((base_info["affine"][:3, :3] ** 2).sum(axis=0))
+        base_shape_zyx = (nz, ny, nx)
+        new_shape, new_affine = _regrid_to_dxyz(base_shape_zyx, base_info["affine"], args.dxyz)
+        if args.verb >= 1:
+            print(f"\n-dxyz {args.dxyz} mm: ({nz},{ny},{nx}) @ "
+                  f"{old_vox[0]:.2f}mm -> {new_shape} @ {args.dxyz:.2f}mm")
+        dxyz_info = {"affine": new_affine, "header": base_info["header"].copy()}
+        out_path = f"{prefix}.nii.gz"
+        warped_data, _ = load_image(out_path, device=torch.device("cpu"))
+        if warped_data.dim() == 4:
+            resampled = torch.stack([
+                resample_to_base_grid(vol, new_shape, base_info["affine"], new_affine)
+                for vol in warped_data
+            ])
+        else:
+            resampled = resample_to_base_grid(
+                warped_data, new_shape, base_info["affine"], new_affine)
+        save_image(resampled, out_path, header_info=dxyz_info)
+        if args.verb >= 1:
+            print(f"Resampled output to {args.dxyz}mm: {out_path}")
 
     elapsed = time.time() - t0
     if args.verb >= 1:
