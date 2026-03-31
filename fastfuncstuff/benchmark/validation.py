@@ -20,6 +20,29 @@ from ..stats.spatial import (
 )
 
 
+def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation between two 1D arrays (numpy)."""
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    a_c = a - a.mean()
+    b_c = b - b.mean()
+    denom = np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())
+    if denom < 1e-15:
+        return 0.0
+    return float((a_c * b_c).sum() / denom)
+
+
+def _matlab_flat_to_c_order(flat: np.ndarray, vol_size: tuple[int, ...]) -> np.ndarray:
+    """Reshape a MATLAB Fortran-order flattened vector to C-order flat.
+
+    MATLAB's ``(:)`` operator flattens in column-major (Fortran) order.
+    NIfTI loaded by nibabel uses C-order. This function reshapes a 1-D
+    MATLAB vector back to 3-D in Fortran order, then re-flattens in C
+    order so voxel indices match nibabel's layout.
+    """
+    return flat.reshape(vol_size, order="F").flatten(order="C")
+
+
 def _load_vol(path: str | Path) -> tuple[Tensor, np.ndarray]:
     """Load a NIfTI file as a torch tensor + affine.
 
@@ -291,6 +314,79 @@ def compare_ica_components(
         "coverage_0.5": report.coverage_at_thresholds.get(0.5, 0.0),
         "coverage_0.7": report.coverage_at_thresholds.get(0.7, 0.0),
         "matches": matches,
+    }
+
+
+def compare_aff12(
+    a_path: str | Path,
+    b_path: str | Path,
+) -> dict:
+    """Compare two AFNI .aff12.1D affine matrices.
+
+    Decomposes each 3×4 matrix into rotation angles (degrees) and
+    translation (mm), then reports per-parameter differences.
+
+    Returns:
+        dict with rotation_diff_deg (3,), translation_diff_mm (3,),
+        max_angle_diff, max_trans_diff, frobenius_norm.
+    """
+    def _load_aff12(path: str | Path) -> np.ndarray:
+        """Load an AFNI .aff12.1D file as a 3×4 matrix."""
+        raw = np.loadtxt(str(path), comments="#")
+        if raw.ndim == 1 and raw.size == 12:
+            return raw.reshape(3, 4)
+        if raw.ndim == 2:
+            # Multi-row (per-volume matrices) — take first row
+            if raw.shape[1] == 12:
+                return raw[0].reshape(3, 4)
+            if raw.shape == (3, 4):
+                return raw
+        raise ValueError(f"Cannot parse aff12 from {path}: shape {raw.shape}")
+
+    def _decompose_aff(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Extract rotation angles (deg) and translation (mm) from 3×4 affine.
+
+        Uses the convention: mat = [R | t] where R is 3×3 rotation.
+        Rotation angles extracted via Euler angle decomposition (xyz convention).
+        """
+        R = mat[:3, :3]
+        t = mat[:3, 3]
+
+        # Euler angles (xyz convention, same as AFNI)
+        sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+        singular = sy < 1e-6
+        if not singular:
+            rx = np.arctan2(R[2, 1], R[2, 2])
+            ry = np.arctan2(-R[2, 0], sy)
+            rz = np.arctan2(R[1, 0], R[0, 0])
+        else:
+            rx = np.arctan2(-R[1, 2], R[1, 1])
+            ry = np.arctan2(-R[2, 0], sy)
+            rz = 0.0
+
+        angles_deg = np.degrees([rx, ry, rz])
+        return angles_deg, t
+
+    mat_a = _load_aff12(a_path)
+    mat_b = _load_aff12(b_path)
+
+    angles_a, trans_a = _decompose_aff(mat_a)
+    angles_b, trans_b = _decompose_aff(mat_b)
+
+    angle_diff = np.abs(angles_a - angles_b)
+    trans_diff = np.abs(trans_a - trans_b)
+    frob = float(np.linalg.norm(mat_a - mat_b, "fro"))
+
+    return {
+        "rotation_diff_deg": angle_diff.tolist(),
+        "translation_diff_mm": trans_diff.tolist(),
+        "max_angle_diff": float(angle_diff.max()),
+        "max_trans_diff": float(trans_diff.max()),
+        "frobenius_norm": frob,
+        "angles_a": angles_a.tolist(),
+        "angles_b": angles_b.tolist(),
+        "trans_a": trans_a.tolist(),
+        "trans_b": trans_b.tolist(),
     }
 
 

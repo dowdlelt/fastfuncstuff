@@ -82,6 +82,60 @@ def parse_prefix(prefix: str, default_ext: str = ".nii.gz") -> PrefixInfo:
     return PrefixInfo(stem=prefix, nifti_ext=default_ext)
 
 
+def clean_condition_labels(raw_labels: list[str]) -> list[str]:
+    """Strip common prefix and suffix from condition labels.
+
+    Onset filenames like ``onsets.localizer.times.faces`` share the prefix
+    ``onsets.localizer.times.`` — stripping it yields just ``faces``.
+    Works on dot-, underscore-, or hyphen-separated names.
+
+    Examples
+    --------
+    >>> clean_condition_labels(["onsets.localizer.times.faces",
+    ...     "onsets.localizer.times.bodies", "onsets.localizer.times.scenes"])
+    ['faces', 'bodies', 'scenes']
+    """
+    import os
+
+    if len(raw_labels) <= 1:
+        return raw_labels
+
+    # Find longest common prefix (character-level), trim to last separator
+    prefix = os.path.commonprefix(raw_labels)
+    for sep in (".", "_", "-"):
+        idx = prefix.rfind(sep)
+        if idx >= 0:
+            prefix = prefix[: idx + 1]
+            break
+    else:
+        prefix = ""
+
+    # Find longest common suffix (character-level), trim to first separator
+    reversed_labels = [lab[::-1] for lab in raw_labels]
+    suffix_rev = os.path.commonprefix(reversed_labels)
+    suffix = suffix_rev[::-1]
+    if suffix:
+        for sep in (".", "_", "-"):
+            idx = suffix.find(sep)
+            if idx >= 0:
+                suffix = suffix[idx:]
+                break
+        else:
+            suffix = ""
+
+    # Strip prefix and suffix
+    cleaned = []
+    for lab in raw_labels:
+        s = lab
+        if prefix:
+            s = s[len(prefix):]
+        if suffix:
+            s = s[: -len(suffix)]
+        cleaned.append(s if s else lab)
+
+    return cleaned
+
+
 def parse_input_files(input_arg: str | list[str]) -> list[str]:
     """
     Parse input files from command line arguments.
@@ -269,7 +323,8 @@ class LoadResult:
     n_runs: int  # Number of runs
     keep_on_cpu: bool  # Whether data is stored on CPU
     scale_info: dict | None  # Scaling info if do_scale was True
-    violations_mask: torch.Tensor | None  # Scaling violations if do_scale
+    violations_mask: torch.Tensor | None = None  # Scaling violations if do_scale
+    nifti_header: object | None = None  # NIfTI header (preserves AFNI extension/space info)
 
 
 def load_and_preprocess_runs(
@@ -355,9 +410,10 @@ def load_and_preprocess_runs(
         print("📂 Loading fMRI Data")
         print("=" * 70)
 
-    # Load metadata from first file
+    # Load metadata from first file (keep header for AFNI space/view info)
     first_img = load_nifti(input_files[0])
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
+    nifti_header = first_img.header.copy() if hasattr(first_img, "header") else None
     volume_shape = tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
 
     # Get voxel sizes and TR from header (using get_zooms() which reads pixdim correctly)
@@ -374,7 +430,7 @@ def load_and_preprocess_runs(
 
     if verbose:
         print(f"  Volume shape: {volume_shape}")
-        print(f"  Voxel sizes: {voxel_sizes:.3f} mm")
+        print(f"  Voxel sizes: {tuple(f'{v:.3f}' for v in voxel_sizes)} mm")
         print(f"  TR: {tr} s")
         print(f"  Runs: {len(input_files)}")
 
@@ -457,6 +513,7 @@ def load_and_preprocess_runs(
             keep_on_cpu=keep_on_cpu,
             scale_info=scale_info,
             violations_mask=violations_mask,
+            nifti_header=nifti_header,
         )
 
         if verbose:
@@ -578,6 +635,7 @@ def load_and_preprocess_runs(
         keep_on_cpu=keep_on_cpu,
         scale_info=scale_info,
         violations_mask=violations_mask,
+        nifti_header=nifti_header,
     )
 
     if verbose:
@@ -594,6 +652,7 @@ def save_volume_nifti(
     volume_shape: tuple,
     affine: np.ndarray,
     mask_flat: np.ndarray | None = None,
+    header: object | None = None,
 ):
     """
     Reshape flat data to 3D volume and save as NIfTI file.
@@ -610,6 +669,8 @@ def save_volume_nifti(
         Affine matrix for NIfTI file
     mask_flat : np.ndarray, optional
         Flattened brain mask. If provided, unmasks data before saving.
+    header : nibabel header, optional
+        NIfTI header to preserve (AFNI space/view info, etc.).
     """
     from fastfuncstuff.io.afni import save_nifti
 
@@ -627,7 +688,7 @@ def save_volume_nifti(
     else:
         data_3d = data_np.reshape(volume_shape)
 
-    save_nifti(data_3d, output_path=filename, affine=affine)
+    save_nifti(data_3d, output_path=filename, affine=affine, header=header)
 
 
 def save_4d_nifti(
@@ -636,6 +697,7 @@ def save_4d_nifti(
     volume_shape: tuple,
     affine: np.ndarray,
     mask_flat: np.ndarray | None = None,
+    header: object | None = None,
 ):
     """
     Reshape (n_voxels, n_volumes) flat data to 4D and save as NIfTI file.
@@ -652,6 +714,8 @@ def save_4d_nifti(
         Affine matrix for NIfTI file
     mask_flat : np.ndarray, optional
         Flattened brain mask. If provided, unmasks data before saving.
+    header : nibabel header, optional
+        NIfTI header to preserve (AFNI space/view info, etc.).
     """
     from fastfuncstuff.io.afni import save_nifti
 
@@ -671,7 +735,7 @@ def save_4d_nifti(
     else:
         data_4d = data_np.reshape((*volume_shape, n_vols))
 
-    save_nifti(data_4d, output_path=filename, affine=affine)
+    save_nifti(data_4d, output_path=filename, affine=affine, header=header)
 
 
 # ============================================================================

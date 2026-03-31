@@ -74,25 +74,75 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
                     if not p.exists():
                         missing.append(str(p))
     else:
-        # Need moco outputs, sswarper outputs, alignment matrices
-        master = ctx.processing_dir / "autobox_anatQQ.sub-01.nii"
-        if not master.exists():
-            missing.append(str(master))
-        e2a = ctx.processing_dir / "anat_al_keep_e2a_only_mat.aff12.1D"
-        if not e2a.exists():
-            missing.append(str(e2a))
+        # Need sswarper output (from align stage)
+        ssw = ctx.processing_dir / "sswarper_output" / "anatQQ.sub-01.nii"
+        if not ssw.exists():
+            missing.append(str(ssw))
+        # Need moco reference mean
+        ref_mean = ctx.processing_dir / "afni_mean_sub-01_ses-01_task-localizer_run-1_bold.nii"
+        if not ref_mean.exists():
+            missing.append(str(ref_mean))
+        # Need inter-run alignment matrices (from crossalign stage)
+        for task, runs in TASKS_RUNS:
+            for run in runs:
+                if task == "localizer" and run == 1:
+                    continue
+                mat = ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_localizer_run-1_mat.aff12.1D"
+                if not mat.exists():
+                    missing.append(str(mat))
     return missing
 
 
-def run_afni(ctx: BenchmarkContext) -> float:
+def _prepare_warp_prerequisites(ctx: BenchmarkContext) -> None:
+    """Create intermediate files needed for warping (autobox, e2a matrix).
+
+    Inter-run alignment matrices are created by the crossalign stage.
+    """
+    p = ctx.processing_dir
+    ssw = p / "sswarper_output"
+
+    # 1. Autobox the MNI-warped anat for a smaller master grid
+    autobox = p / "autobox_anatQQ.sub-01.nii"
+    if not autobox.exists():
+        run_timed(
+            f"3dAutobox -overwrite -npad 3 "
+            f"-prefix {ssw / 'autobox_anatQQ.sub-01.nii'} "
+            f"{ssw / 'anatQQ.sub-01.nii'}",
+            label="3dAutobox anatQQ",
+            cwd=p,
+        )
+        import shutil as sh
+        sh.copy2(ssw / "autobox_anatQQ.sub-01.nii", autobox)
+
+    # 2. EPI-to-anat alignment matrix (align_epi_anat.py + cat_matvec)
+    e2a = p / "anat_al_keep_e2a_only_mat.aff12.1D"
+    if not e2a.exists():
+        run_timed(
+            f"align_epi_anat.py -overwrite "
+            f"-rigid_body -anat_has_skull no -anat2epi "
+            f"-anat {ssw / 'anatSS.sub-01.nii'} "
+            f"-epi {p / 'afni_mean_sub-01_ses-01_task-localizer_run-1_bold.nii'} "
+            f"-epi_base 0 -suffix _al",
+            label="align_epi_anat.py",
+            cwd=p,
+        )
+        run_timed(
+            f"cat_matvec {p / 'anatSS.sub-01_al_mat.aff12.1D'} -I -ONELINE > {e2a}",
+            label="cat_matvec e2a",
+            cwd=p,
+        )
+
+
+def run_ref(ctx: BenchmarkContext) -> float:
     """Run 3dNwarpApply for all runs."""
+    _prepare_warp_prerequisites(ctx)
     master = ctx.processing_dir / "autobox_anatQQ.sub-01.nii"
     total = 0.0
 
     for task, runs in TASKS_RUNS:
         for run in runs:
             out = _afni_mni(ctx, task, run)
-            if out.exists() and not ctx.force_afni:
+            if out.exists() and not ctx.force_ref:
                 continue
             nwarp = _nwarp_chain(ctx, task, run)
             elapsed, _ = run_timed(

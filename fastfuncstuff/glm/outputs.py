@@ -121,7 +121,7 @@ def write_single_trials_output(
             output_path = Path(str(output_path) + ".gz")
         else:
             output_path = Path(str(output_path) + ".nii.gz")
-    save_nifti(np.asarray(img.dataobj), output_path=output_path, affine=img.affine, tr=tr)
+    save_nifti(np.asarray(img.dataobj), output_path=output_path, affine=img.affine, tr=tr, header=img.header)
 
     # Write labels as JSON sidecar
     if labels_reordered:
@@ -553,7 +553,7 @@ def _save_nifti_with_format(
             if not str(output_path).endswith(".nii.gz")
             else output_path
         )
-        save_nifti(np.asarray(img.dataobj), output_path=nifti_path, affine=img.affine)
+        save_nifti(np.asarray(img.dataobj), output_path=nifti_path, affine=img.affine, header=img.header)
         return nifti_path
 
     else:  # format == 'nifti'
@@ -563,7 +563,7 @@ def _save_nifti_with_format(
             if not str(output_path).endswith(".nii")
             else output_path
         )
-        save_nifti(np.asarray(img.dataobj), output_path=nifti_path, affine=img.affine)
+        save_nifti(np.asarray(img.dataobj), output_path=nifti_path, affine=img.affine, header=img.header)
         return nifti_path
 
 
@@ -665,7 +665,7 @@ def write_glm_results_nifti(
             stats_data.astype(dtype, copy=False), affine_mat, results, tr
         )
         stats_path = output_dir / f"{prefix}_stats.nii.gz"
-        save_nifti(np.asarray(stats_img.dataobj), output_path=stats_path, affine=stats_img.affine, tr=tr)
+        save_nifti(np.asarray(stats_img.dataobj), output_path=stats_path, affine=stats_img.affine, tr=tr, header=stats_img.header)
         outputs["stats"] = stats_path
 
         label_path = output_dir / f"{prefix}_stats.json"
@@ -680,7 +680,7 @@ def write_glm_results_nifti(
             fstat_vol.astype(dtype, copy=False), affine_mat, results, tr
         )
         fstat_path = output_dir / f"{prefix}_fstat.nii.gz"
-        save_nifti(np.asarray(fstat_img.dataobj), output_path=fstat_path, affine=fstat_img.affine, tr=tr)
+        save_nifti(np.asarray(fstat_img.dataobj), output_path=fstat_path, affine=fstat_img.affine, tr=tr, header=fstat_img.header)
         outputs["fstat"] = fstat_path
 
     if include_r2 and getattr(results, "r2", None) is not None:
@@ -690,7 +690,7 @@ def write_glm_results_nifti(
             r2_vol.astype(dtype, copy=False), affine_mat, results, tr
         )
         r2_path = output_dir / f"{prefix}_r2.nii.gz"
-        save_nifti(np.asarray(r2_img.dataobj), output_path=r2_path, affine=r2_img.affine, tr=tr)
+        save_nifti(np.asarray(r2_img.dataobj), output_path=r2_path, affine=r2_img.affine, tr=tr, header=r2_img.header)
         outputs["r2"] = r2_path
 
     if include_mean and getattr(results, "meanvol", None) is not None:
@@ -700,7 +700,7 @@ def write_glm_results_nifti(
             mean_vol.astype(dtype, copy=False), affine_mat, results, tr
         )
         mean_path = output_dir / f"{prefix}_mean.nii.gz"
-        save_nifti(np.asarray(mean_img.dataobj), output_path=mean_path, affine=mean_img.affine, tr=tr)
+        save_nifti(np.asarray(mean_img.dataobj), output_path=mean_path, affine=mean_img.affine, tr=tr, header=mean_img.header)
         outputs["mean"] = mean_path
 
     if include_sigma and getattr(results, "sigma2", None) is not None:
@@ -710,7 +710,7 @@ def write_glm_results_nifti(
             sigma_vol.astype(dtype, copy=False), affine_mat, results, tr
         )
         sigma_path = output_dir / f"{prefix}_sigma.nii.gz"
-        save_nifti(np.asarray(sigma_img.dataobj), output_path=sigma_path, affine=sigma_img.affine, tr=tr)
+        save_nifti(np.asarray(sigma_img.dataobj), output_path=sigma_path, affine=sigma_img.affine, tr=tr, header=sigma_img.header)
         outputs["sigma"] = sigma_path
 
     if write_residuals:
@@ -724,7 +724,7 @@ def write_glm_results_nifti(
             resid_vol.astype(dtype, copy=False), affine_mat, results, tr
         )
         resid_path = output_dir / f"{prefix}_residuals.nii.gz"
-        save_nifti(np.asarray(resid_img.dataobj), output_path=resid_path, affine=resid_img.affine, tr=tr)
+        save_nifti(np.asarray(resid_img.dataobj), output_path=resid_path, affine=resid_img.affine, tr=tr, header=resid_img.header)
         outputs["residuals"] = resid_path
 
     if write_predictions:
@@ -738,7 +738,7 @@ def write_glm_results_nifti(
             pred_vol.astype(dtype, copy=False), affine_mat, results, tr
         )
         pred_path = output_dir / f"{prefix}_predicted.nii.gz"
-        save_nifti(np.asarray(pred_img.dataobj), output_path=pred_path, affine=pred_img.affine, tr=tr)
+        save_nifti(np.asarray(pred_img.dataobj), output_path=pred_path, affine=pred_img.affine, tr=tr, header=pred_img.header)
         outputs["predicted"] = pred_path
 
     return outputs
@@ -1023,7 +1023,7 @@ def write_glm_bucket_as_nifti(
         temp_path = base_path
     else:
         temp_path = base_path.with_suffix(".nii")
-    save_nifti(np.asarray(bucket_img.dataobj), output_path=temp_path, affine=bucket_img.affine)
+    save_nifti(np.asarray(bucket_img.dataobj), output_path=temp_path, affine=bucket_img.affine, header=bucket_img.header)
 
     # Write labels as JSON sidecar
     # Strip all suffixes (.nii, .nii.gz, .BRIK, etc.) then add .json
@@ -1542,6 +1542,7 @@ def save_single_trial_results(
     volume_shape: tuple[int, int, int],
     affine: np.ndarray,
     voxel_mask: torch.Tensor | None = None,
+    nifti_header: object | None = None,
 ) -> dict[str, str]:
     """
     Save single-trial output files for GLMsingle-style analysis.
@@ -1615,13 +1616,13 @@ def save_single_trial_results(
 
     # 1. Single-trial betas (4D)
     betas_path = f"{output_prefix}_single_trial_betas.nii.gz"
-    save_nifti(to_volume_4d(betas), output_path=betas_path, affine=affine)
+    save_nifti(to_volume_4d(betas), output_path=betas_path, affine=affine, header=nifti_header)
     output_files["single_trial_betas"] = betas_path
     print(f"  Saved: {betas_path} ({n_trials} trials)")
 
     # 2. Beta-space CV R² (3D)
     r2_path = f"{output_prefix}_single_trial_xval_r2.nii.gz"
-    save_nifti(to_volume_3d(xval_r2), output_path=r2_path, affine=affine)
+    save_nifti(to_volume_3d(xval_r2), output_path=r2_path, affine=affine, header=nifti_header)
     output_files["single_trial_xval_r2"] = r2_path
     print(f"  Saved: {r2_path}")
 
@@ -1633,7 +1634,7 @@ def save_single_trial_results(
             condition_betas[:, c] = betas[:, mask].mean(dim=1)
 
     cond_path = f"{output_prefix}_single_trial_condition_betas.nii.gz"
-    save_nifti(to_volume_4d(condition_betas), output_path=cond_path, affine=affine)
+    save_nifti(to_volume_4d(condition_betas), output_path=cond_path, affine=affine, header=nifti_header)
     output_files["single_trial_condition_betas"] = cond_path
     print(f"  Saved: {cond_path} ({n_conditions} conditions)")
 
@@ -1651,5 +1652,16 @@ def save_single_trial_results(
         json.dump(metadata, f, indent=2)
     output_files["single_trial_labels"] = labels_path
     print(f"  Saved: {labels_path}")
+
+    # 5. Plain text trial order (one line per trial: index condition run)
+    order_path = f"{output_prefix}_single_trial_order.txt"
+    cond_ids = trial_condition_ids.cpu().tolist()
+    run_ids = trial_run_ids.cpu().tolist()
+    with open(order_path, "w") as f:
+        f.write("# trial_index  condition  run\n")
+        for i, label in enumerate(trial_labels):
+            f.write(f"{i:4d}  {label:20s}  run{run_ids[i] + 1}\n")
+    output_files["single_trial_order"] = order_path
+    print(f"  Saved: {order_path}")
 
     return output_files

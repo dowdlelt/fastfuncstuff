@@ -721,22 +721,28 @@ def apply_affine_batched(
 # ---------------------------------------------------------------------------
 
 
-def _ijk2xyz_matrix(nifti_affine: np.ndarray) -> Tensor:
-    """Get the voxel-index-to-xyz (DICOM mm) matrix from a NIfTI affine.
+def _ijk2ras_matrix(nifti_affine: np.ndarray) -> Tensor:
+    """Get the voxel-index-to-RAS mm matrix from a NIfTI affine.
 
-    NIfTI affine maps (i_nifti, j_nifti, k_nifti) to (x, y, z) mm.
-    Our internal convention is (x_idx, y_idx, z_idx) = (i_nifti, j_nifti, k_nifti)
-    since load_image transposes data from (nx, ny, nz) to (nz, ny, nx) but
-    the affine stays the same — index (ix, iy, iz) in our convention maps to
-    column ix, row iy, slice iz in NIfTI, which is (ix, iy, iz) in the affine.
+    NIfTI affine maps (i, j, k) to RAS (x_right, y_anterior, z_superior) mm.
 
     Args:
         nifti_affine: (4, 4) numpy array from the NIfTI header.
 
     Returns:
-        (4, 4) torch tensor mapping our voxel indices to xyz mm.
+        (4, 4) torch tensor mapping voxel indices to RAS mm.
     """
     return torch.from_numpy(nifti_affine.astype(np.float64)).float()
+
+
+# RAS-to-DICOM sign flip: AFNI's DICOM convention is (x=-R+L, y=-A+P, z=-I+S),
+# which negates the first two axes relative to NIfTI's RAS.
+_RAS_TO_DICOM = torch.tensor([
+    [-1, 0, 0, 0],
+    [0, -1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+], dtype=torch.float32)
 
 
 def voxel_matrix_to_dicom(
@@ -744,9 +750,14 @@ def voxel_matrix_to_dicom(
     base_affine: np.ndarray,
     source_affine: np.ndarray,
 ) -> Tensor:
-    """Convert a voxel-space affine to DICOM mm space.
+    """Convert a voxel-space affine to AFNI DICOM mm space.
 
-    M_dicom = source_ijk2xyz @ M_ijk @ inv(base_ijk2xyz)
+    AFNI's .aff12.1D format uses DICOM coordinates (x=-R+L, y=-A+P, z=-I+S),
+    which differs from NIfTI's RAS by negating x and y.
+
+    Steps:
+      1. M_ras = source_ijk2ras @ M_ijk @ inv(base_ijk2ras)
+      2. M_dicom = D @ M_ras @ D  where D = diag(-1,-1,1,1)
 
     Args:
         M_ijk: (4, 4) matrix mapping base voxels to source voxels.
@@ -754,12 +765,19 @@ def voxel_matrix_to_dicom(
         source_affine: NIfTI affine for the source image.
 
     Returns:
-        (4, 4) matrix in DICOM mm coordinates.
+        (4, 4) matrix in DICOM mm coordinates (AFNI convention).
     """
-    base_ijk2xyz = _ijk2xyz_matrix(base_affine)
-    source_ijk2xyz = _ijk2xyz_matrix(source_affine)
-    base_xyz2ijk = torch.linalg.inv(base_ijk2xyz)
-    return source_ijk2xyz @ M_ijk @ base_xyz2ijk
+    device = M_ijk.device
+    base_ijk2ras = _ijk2ras_matrix(base_affine).to(device)
+    source_ijk2ras = _ijk2ras_matrix(source_affine).to(device)
+    base_ras2ijk = torch.linalg.inv(base_ijk2ras)
+
+    # Step 1: voxel → RAS
+    M_ras = source_ijk2ras @ M_ijk @ base_ras2ijk
+
+    # Step 2: RAS → DICOM (negate x,y rows and columns)
+    D = _RAS_TO_DICOM.to(device)
+    return D @ M_ras @ D
 
 
 def dicom_matrix_to_voxel(
@@ -767,9 +785,11 @@ def dicom_matrix_to_voxel(
     base_affine: np.ndarray,
     source_affine: np.ndarray,
 ) -> Tensor:
-    """Convert DICOM mm space affine(s) to voxel-space.
+    """Convert AFNI DICOM mm space affine(s) to voxel-space.
 
-    M_ijk = inv(source_ijk2xyz) @ M_dicom @ base_ijk2xyz
+    Steps:
+      1. M_ras = D @ M_dicom @ D  where D = diag(-1,-1,1,1)
+      2. M_ijk = inv(source_ijk2ras) @ M_ras @ base_ijk2ras
 
     Args:
         M_dicom: (4, 4) or (T, 4, 4) matrix/matrices in DICOM mm coordinates.
@@ -779,17 +799,22 @@ def dicom_matrix_to_voxel(
     Returns:
         (4, 4) or (T, 4, 4) matrix/matrices mapping base voxels to source voxels.
     """
-    base_ijk2xyz = _ijk2xyz_matrix(base_affine)
-    source_ijk2xyz = _ijk2xyz_matrix(source_affine)
-    source_xyz2ijk = torch.linalg.inv(source_ijk2xyz)
+    device = M_dicom.device
+    D = _RAS_TO_DICOM.to(device)
+    base_ijk2ras = _ijk2ras_matrix(base_affine).to(device)
+    source_ijk2ras = _ijk2ras_matrix(source_affine).to(device)
+    source_ras2ijk = torch.linalg.inv(source_ijk2ras)
 
     if M_dicom.ndim == 2:
-        return source_xyz2ijk @ M_dicom @ base_ijk2xyz
+        # DICOM → RAS → voxel
+        M_ras = D @ M_dicom @ D
+        return source_ras2ijk @ M_ras @ base_ijk2ras
     else:
         T = M_dicom.shape[0]
         result = torch.zeros_like(M_dicom)
         for t in range(T):
-            result[t] = source_xyz2ijk @ M_dicom[t] @ base_ijk2xyz
+            M_ras = D @ M_dicom[t] @ D
+            result[t] = source_ras2ijk @ M_ras @ base_ijk2ras
         return result
 
 

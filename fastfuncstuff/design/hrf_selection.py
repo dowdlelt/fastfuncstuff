@@ -1280,7 +1280,7 @@ def _fit_voxelwise_hrf(
     stored_dof = None
 
     for hrf_idx in hrf_iterator:
-        hrf_idx_int = hrf_idx.item()
+        hrf_idx_int = hrf_idx.item() if hasattr(hrf_idx, 'item') else int(hrf_idx)
 
         # Get voxels using this HRF
         voxel_mask = hrf_index == hrf_idx
@@ -1582,7 +1582,7 @@ def _fit_voxelwise_hrf_single_trial(
         tqdm(unique_hrfs, desc="Refitting HRF groups") if verbose else unique_hrfs.tolist()
     )
     for hrf_idx in hrf_iterator:
-        hrf_idx_int = hrf_idx.item()
+        hrf_idx_int = hrf_idx.item() if hasattr(hrf_idx, 'item') else int(hrf_idx)
 
         # Get voxels using this HRF
         voxel_mask = hrf_index == hrf_idx

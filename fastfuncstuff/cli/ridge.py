@@ -206,6 +206,22 @@ Notes:
         "condition-averaged vs individual trial betas across folds. "
         "Replaces timeseries CV with beta-space CV.",
     )
+    ridge_opts.add_argument(
+        "-metric",
+        type=str,
+        default="sse",
+        choices=["sse", "cod", "corr", "corr2"],
+        help="CV metric for fraction selection (default: sse). "
+        "'sse' = sum of squared errors (GLMsingle-compatible, lower=better). "
+        "'cod' = coefficient of determination (higher=better).",
+    )
+    ridge_opts.add_argument(
+        "-zscore_by_run",
+        action="store_true",
+        default=True,
+        help="Z-score betas per run before CV using OLS normalization stats "
+        "(GLMsingle default). Only applies with -single_trials.",
+    )
 
     # Integration options
     integ_opts = parser.add_argument_group("Integration Options")
@@ -460,7 +476,7 @@ def main():
 
         # Load HRF library (reconstruct from metadata or use default)
         # For now, use default library
-        hrf_library = get_hrf_library(mode="library", tr=args.tr, n_hrfs=20)
+        hrf_library = get_hrf_library(mode="library", stim_duration=0.0, microtime_dt=args.microtime_dt, n_hrfs=20)
         print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
     # Load noise PCs if provided
@@ -548,6 +564,7 @@ def main():
         from fastfuncstuff.glm.xval import (
             compute_r2_metric,
             generate_cv_splits,
+            metric_higher_is_better,
             project_out_nuisance_per_run,
             single_trial_cv_helper,
         )
@@ -579,6 +596,7 @@ def main():
         cv_splits = generate_cv_splits(n_runs, strategy=1)  # strategy=1 is LORO
 
         per_voxel_design = design_matrix.ndim == 3
+        _hib = metric_higher_is_better(args.metric)
 
         if not per_voxel_design:
             # ---- Standard path: single design for all voxels ----
@@ -646,6 +664,9 @@ def main():
                     trial_condition_ids,
                     trial_run_ids,
                     cv_splits,
+                    metric=args.metric,
+                    zscore_by_run=args.zscore_by_run,
+                    reference_variant_idx=n_fracs - 1,  # OLS (frac=1.0) sets z-score scale
                     test_variant_idx=n_fracs - 1,
                     device=device,
                     chunk_size=None,
@@ -654,7 +675,12 @@ def main():
                 chunk_r2_frac = xval["r2"].T  # (chunk, n_fracs) on device
 
                 # Select best frac excluding frac=1.0 (last column) — GLMsingle pattern
-                chunk_xval, chunk_best_idx = chunk_r2_frac[:, :-1].max(dim=1)
+                # For SSE (GLMsingle "badness"), minimize; for R² metrics, maximize
+                _hib = metric_higher_is_better(args.metric)
+                if _hib:
+                    chunk_xval, chunk_best_idx = chunk_r2_frac[:, :-1].max(dim=1)
+                else:
+                    chunk_xval, chunk_best_idx = chunk_r2_frac[:, :-1].min(dim=1)
                 xval_r2[c0:c1] = chunk_xval.cpu()
                 r2_by_frac[c0:c1] = chunk_r2_frac.cpu()
                 optimal_fracs[c0:c1] = torch.from_numpy(fracs[chunk_best_idx.cpu().numpy()])
@@ -705,6 +731,19 @@ def main():
             full_r2 = torch.zeros(n_voxels, device=device)
             optimal_fracs = torch.zeros(n_voxels, device=device)
             r2_by_frac = torch.zeros(n_voxels, len(fracs), device=device)
+
+            # Auto-detect chunk size if not specified
+            if args.chunk_size <= 0:
+                from fastfuncstuff.memory import estimate_chunk_size
+
+                args.chunk_size = estimate_chunk_size(
+                    n_voxels=n_voxels,
+                    n_timepoints=n_timepoints,
+                    n_regressors=n_columns,
+                    device=device,
+                    operation="ridge",
+                    verbose=args.verbose,
+                )
 
             # Project nuisance from data once (shared across HRF groups)
             # Use a dummy 2D design just to get projected data
@@ -762,6 +801,9 @@ def main():
                         trial_condition_ids,
                         trial_run_ids,
                         cv_splits,
+                        metric=args.metric,
+                        zscore_by_run=args.zscore_by_run,
+                        reference_variant_idx=n_fracs_pv - 1,
                         test_variant_idx=n_fracs_pv - 1,
                         device=device,
                         verbose=False,
@@ -769,7 +811,11 @@ def main():
                     r2_by_frac[chunk_mask] = xval["r2"].T.to(device)  # (chunk, n_fracs)
 
                     # Select best frac excluding frac=1.0 (last column)
-                    chunk_r2, chunk_best_idx = r2_by_frac[chunk_mask][:, :-1].max(dim=1)
+                    # SSE: minimize; R² metrics: maximize
+                    if _hib:
+                        chunk_r2, chunk_best_idx = r2_by_frac[chunk_mask][:, :-1].max(dim=1)
+                    else:
+                        chunk_r2, chunk_best_idx = r2_by_frac[chunk_mask][:, :-1].min(dim=1)
                     xval_r2[chunk_mask] = chunk_r2
                     optimal_fracs[chunk_mask] = torch.from_numpy(
                         fracs[chunk_best_idx.cpu().numpy()]

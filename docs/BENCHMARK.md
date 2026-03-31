@@ -37,9 +37,13 @@ fastfuncstuff/benchmark/
         warp.py        # Warp apply: 3dNwarpApply vs ffs_nwarp
         glm.py         # GLM: 3dDeconvolve + 3dREMLfit vs ffs_reml
         ica.py         # ICA: melodic vs ffs_ica -temp_concat
+        glmsingle_hrf.py      # GLMsingle Type B: HRF selection vs ffs_hrfopt
+        glmsingle_denoise.py  # GLMsingle Type C: PC denoising vs ffs_denoise
+        glmsingle_ridge.py    # GLMsingle Type D: fracridge vs ffs_ridge
 
 fastfuncstuff/cli/benchmark.py   # CLI entry point (ffs_benchmark)
 tests/test_benchmark.py          # pytest integration wrapper
+test_data/run_glmsingle_comparison.m  # MATLAB script to generate comparison data
 ```
 
 ## Stage Protocol
@@ -158,6 +162,12 @@ Thresholds reflect expected algorithmic agreement, not arbitrary numbers:
 | glm (OLS) | beta map r | 0.99 | Same math, minor float precision differences |
 | glm (REML) | beta map r | 0.95 | Different ARMA implementations, more divergence expected |
 | ica | mean matched \|r\| | 0.70 | ICA is stochastic; masking and component count differences |
+| glmsingle_hrf | HRF index agreement | 70% | HRF selection at boundaries between similar HRFs |
+| glmsingle_hrf | R² spatial corr | 0.90 | In-sample R² should agree closely |
+| glmsingle_denoise | pcnum tolerance | ±2 | PC selection is sensitive to CV curve shape |
+| glmsingle_denoise | beta spatial corr | 0.85 | Denoised betas diverge due to different PC extraction |
+| glmsingle_ridge | FRACvalue corr | 0.80 | Per-voxel fraction selection differs at noise boundaries |
+| glmsingle_ridge | beta spatial corr | 0.85 | Ridge betas after autoscale should agree |
 
 **When to adjust thresholds**: If a stage fails, first check whether the FFS implementation has a bug. If the outputs are genuinely correct but algorithms legitimately disagree (e.g., different warping algorithms), lower the threshold. Document the reason in the stage's `THRESHOLDS` dict comment.
 
@@ -246,6 +256,45 @@ raw data
 ```
 
 All stages use **shared AFNI inputs** where possible: e.g., both AFNI and FFS warping use the same AFNI-generated warp fields and alignment matrices. This isolates each stage to test only its specific algorithm.
+
+## GLMsingle Comparison
+
+The `glmsingle_*` stages compare FFS's single-trial pipeline against Kendrick Kay's GLMsingle MATLAB code. Unlike the AFNI stages (which compare CLI tools), these load pre-computed MATLAB `.mat` files.
+
+### Setup
+
+1. **Resample data to TR-locked grid**: GLMsingle requires onsets aligned to TR boundaries
+   ```bash
+   # Resample from 1.75s to 1.5s TR
+   for r in 1 2 3 4 5; do
+     ffs_slicetime -input raw_run-${r}.nii -prefix st_run-${r}.nii \
+       -tpattern timing.1D -resample 1.5
+     ffs_nwarp -input st_run-${r}.nii -prefix mni_resampled_run-${r}.nii.gz \
+       -nwarp <warp_chain> -master autobox -dxyz 3.0
+   done
+   ```
+
+2. **Run GLMsingle in MATLAB**: `test_data/run_glmsingle_comparison.m` generates `processing/glmsingle_comparison.mat` with Types B, C, D outputs.
+
+3. **Run FFS pipeline**: The benchmark stages call `ffs_hrfopt`, `ffs_denoise`, and `ffs_ridge` with `-single_trials` and GLMsingle-compatible settings.
+
+### Algorithm Alignment
+
+| Aspect | GLMsingle | FFS | Match? |
+|--------|-----------|-----|--------|
+| HRF library | 20 NSD-derived HRFs from `getcanonicalhrflibrary.tsv` | Same file, loaded via `get_hrf_library(mode='library')` | Yes |
+| Fracridge convention | `frac=1` = OLS, `frac=0` = max reg. | Same convention | Yes |
+| HRF selection (Type B) | In-sample R² per HRF, pick best per voxel | Same approach in `ffs_hrfopt -single_trials` | Yes |
+| PC selection CV (Type C) | Beta-space LORO, SSE metric ("badness"), z-score by session | `ffs_denoise -single_trials -cv_metric sse -zscore_by_run` | Yes |
+| PC stop criterion | Walk forward, stop within 5% of max improvement | Same: `-pcstop 1.05` | Yes |
+| Ridge CV (Type D) | SSE of condition-avg train betas vs OLS test betas | `ffs_ridge -single_trials -metric sse -zscore_by_run` | Yes |
+| Autoscale | Scale+offset regularized betas to match OLS | `ffs_ridge -autoscale` | Yes |
+
+### SSE Metric ("Badness")
+
+FFS implements GLMsingle's `calcbadness` as `metric='sse'` in `compute_r2_metric()`. This is the sum of squared errors between predicted (condition-average train betas) and actual (held-out test betas). Lower = better. The `metric_higher_is_better()` helper ensures selection logic uses `argmin` for SSE and `argmax` for R²-family metrics.
+
+GLMsingle convention: `xvaltrend = -median(badness)`, so higher xvaltrend = better. FFS applies the same sign flip internally for the pcstop criterion.
 
 ## OMP_NUM_THREADS
 

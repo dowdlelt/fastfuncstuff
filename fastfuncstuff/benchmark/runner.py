@@ -16,7 +16,7 @@ class BenchmarkContext:
 
     data_dir: Path  # ds005165-download root (always resolved to absolute)
     dataset_id: str = ""  # e.g. "ds005165" — auto-detected if empty
-    force_afni: bool = False
+    force_ref: bool = False
     force_ffs: bool = False
     validate_only: bool = False
     verbose: bool = True
@@ -34,6 +34,7 @@ class BenchmarkContext:
 
     @property
     def processing_dir(self) -> Path:
+        """Preprocessing outputs: moco, slicetime, alignment, warps, resampled data."""
         return self.data_dir / "processing"
 
     @property
@@ -43,6 +44,83 @@ class BenchmarkContext:
     @property
     def anat_dir(self) -> Path:
         return self.data_dir / "sub-01" / "ses-01" / "anat"
+
+    def tpattern_file(self, task: str = "localizer", run: int = 1) -> Path:
+        """Get or create a tpattern file from the BIDS JSON sidecar.
+
+        Reads SliceTiming from the paired JSON and writes one value per line.
+        Cached in processing_dir so it's only created once.
+        """
+        cached = self.processing_dir / f"tpattern_{task}_run-{run}.txt"
+        if cached.exists():
+            return cached
+
+        import json
+
+        json_path = (
+            self.func_dir
+            / f"sub-01_ses-01_task-{task}_run-{run}_bold.json"
+        )
+        if not json_path.exists():
+            raise FileNotFoundError(f"BIDS JSON not found: {json_path}")
+
+        with open(json_path) as f:
+            meta = json.load(f)
+
+        st = meta.get("SliceTiming")
+        if not st:
+            raise ValueError(f"No SliceTiming in {json_path}")
+
+        self.processing_dir.mkdir(parents=True, exist_ok=True)
+        with open(cached, "w") as f:
+            for val in st:
+                f.write(f"{val}\n")
+        return cached
+
+    @property
+    def glmsingle_dir(self) -> Path:
+        """MATLAB GLMsingle outputs (exported NIfTIs)."""
+        return self.data_dir / "glmsingle"
+
+    @property
+    def ffs_hrfopt_dir(self) -> Path:
+        """FFS HRF optimization outputs (Type B)."""
+        return self.data_dir / "ffs_hrfopt"
+
+    @property
+    def ffs_denoise_dir(self) -> Path:
+        """FFS PC denoising outputs (Type C)."""
+        return self.data_dir / "ffs_denoise"
+
+    @property
+    def ffs_ridge_dir(self) -> Path:
+        """FFS fracridge outputs (Type D)."""
+        return self.data_dir / "ffs_ridge"
+
+    @property
+    def afni_glm_dir(self) -> Path:
+        """AFNI 3dDeconvolve/3dREMLfit outputs."""
+        return self.data_dir / "afni_glm"
+
+    @property
+    def ffs_glm_dir(self) -> Path:
+        """FFS OLS/REML outputs."""
+        return self.data_dir / "ffs_glm"
+
+    @property
+    def melodic_ica_dir(self) -> Path:
+        """MELODIC ICA outputs."""
+        return self.data_dir / "melodic_ica"
+
+    @property
+    def ffs_ica_dir(self) -> Path:
+        """FFS ICA outputs."""
+        return self.data_dir / "ffs_ica"
+
+    @property
+    def timing_dir(self) -> Path:
+        """Onset timing files."""
+        return self.processing_dir / "timing_files"
 
     def has_afni(self) -> bool:
         return shutil.which("3dvolreg") is not None
@@ -56,7 +134,7 @@ class StageResult:
     """Result from running one benchmark stage."""
 
     stage_name: str
-    afni_time: float | None = None  # seconds, None if skipped/cached
+    ref_time: float | None = None  # seconds, None if skipped/cached
     ffs_time: float | None = None
     validation: dict[str, Any] = field(default_factory=dict)
     passed: bool = True
@@ -109,6 +187,41 @@ def run_timed(
     return elapsed, result
 
 
+_glmsingle_exported = False  # Module-level flag to avoid re-exporting
+
+
+def _ensure_glmsingle_niftis(ctx: BenchmarkContext) -> None:
+    """Auto-export GLMsingle .mat results to NIfTI if not already done."""
+    global _glmsingle_exported
+    if _glmsingle_exported:
+        return
+
+    nifti_dir = ctx.glmsingle_dir
+    # .mat file can be in glmsingle/ or processing/ (legacy)
+    mat_file = ctx.glmsingle_dir / "glmsingle_comparison.mat"
+    if not mat_file.exists():
+        mat_file = ctx.processing_dir / "glmsingle_comparison.mat"
+    check_file = nifti_dir / "glmsingle_hrf_index.nii.gz"
+
+    if check_file.exists():
+        _glmsingle_exported = True
+        return
+
+    if not mat_file.exists():
+        return  # Will be caught by check_prerequisites
+
+    # Find a template NIfTI for the affine
+    template = ctx.processing_dir / "ffs_mni_resampled_task-localizer_run-1.nii.gz"
+    if not template.exists():
+        return
+
+    print("  Auto-exporting GLMsingle .mat → NIfTI...")
+    from .stages.glmsingle_export import export_glmsingle_niftis
+
+    export_glmsingle_niftis(mat_file, template, nifti_dir)
+    _glmsingle_exported = True
+
+
 def run_stages(
     stages: list,
     ctx: BenchmarkContext,
@@ -119,8 +232,8 @@ def run_stages(
         - name: str
         - check_prerequisites(ctx) -> list[str]
         - validate(ctx) -> dict
-        - run_afni(ctx) -> float  (optional for validate-only)
-        - run_ffs(ctx) -> float   (optional for validate-only)
+        - run_ref(ctx) -> float  (reference tool: AFNI, melodic, MATLAB, etc.)
+        - run_ffs(ctx) -> float  (FFS tool)
     """
     results = []
     stage_timings = {}
@@ -130,6 +243,10 @@ def run_stages(
         print(f"\n{'='*60}")
         print(f"Stage: {name}")
         print(f"{'='*60}")
+
+        # Auto-export GLMsingle NIfTIs from .mat if needed
+        if name.startswith("glmsingle_"):
+            _ensure_glmsingle_niftis(ctx)
 
         # Check prerequisites
         missing = stage.check_prerequisites(ctx)
@@ -151,13 +268,13 @@ def run_stages(
 
         result = StageResult(stage_name=name)
 
-        # Run AFNI (if not validate-only)
-        if not ctx.validate_only and hasattr(stage, "run_afni"):
+        # Run reference tool (if not validate-only)
+        if not ctx.validate_only and hasattr(stage, "run_ref"):
             try:
-                result.afni_time = stage.run_afni(ctx)
+                result.ref_time = stage.run_ref(ctx)
             except Exception as e:
-                result.errors.append(f"AFNI: {e}")
-                print(f"  AFNI error: {e}")
+                result.errors.append(f"Ref: {e}")
+                print(f"  Ref error: {e}")
 
         # Run FFS (if not validate-only)
         if not ctx.validate_only and hasattr(stage, "run_ffs"):
@@ -181,17 +298,17 @@ def run_stages(
         # Print result
         status = "PASS" if result.passed else "FAIL"
         timing = ""
-        if result.afni_time is not None and result.ffs_time is not None:
-            speedup = result.afni_time / result.ffs_time if result.ffs_time > 0 else float("inf")
-            timing = f" | AFNI={result.afni_time:.1f}s FFS={result.ffs_time:.1f}s ({speedup:.1f}x)"
+        if result.ref_time is not None and result.ffs_time is not None:
+            speedup = result.ref_time / result.ffs_time if result.ffs_time > 0 else float("inf")
+            timing = f" | Ref={result.ref_time:.1f}s FFS={result.ffs_time:.1f}s ({speedup:.1f}x)"
         print(f"  {status}: {result.summary}{timing}")
 
         results.append(result)
 
         # Collect timings for cache (only non-zero real timings)
         timing_entry = {}
-        if result.afni_time is not None and result.afni_time > 0:
-            timing_entry["afni_seconds"] = result.afni_time
+        if result.ref_time is not None and result.ref_time > 0:
+            timing_entry["ref_seconds"] = result.ref_time
         if result.ffs_time is not None and result.ffs_time > 0:
             timing_entry["ffs_seconds"] = result.ffs_time
         if timing_entry:

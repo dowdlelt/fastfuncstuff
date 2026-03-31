@@ -67,10 +67,10 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
-def run_afni(ctx: BenchmarkContext) -> float:
+def run_ref(ctx: BenchmarkContext) -> float:
     """Run sswarper2 (skull strip + nonlinear warp to MNI)."""
     ssw_dir = ctx.processing_dir / "sswarper_output"
-    if _afni_anat(ctx).exists() and not ctx.force_afni:
+    if _afni_anat(ctx).exists() and not ctx.force_ref:
         return 0.0
 
     elapsed, _ = run_timed(

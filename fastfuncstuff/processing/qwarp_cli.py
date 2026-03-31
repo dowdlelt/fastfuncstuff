@@ -241,10 +241,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "z*|z| weighting. Produces larger warps than pearclp but can "
                              "capture finer local structure. Slower (~3x)")
     g_cost.add_argument("-lpa_sigma", type=float, default=4.0, metavar="VOXELS",
-                        help="Gaussian sigma for LPA local neighborhoods. Controls the "
-                             "spatial scale of local correlation. Effective window radius "
-                             "is ~3x sigma. Larger = smoother cost, smaller = more local "
+                        help="Kernel parameter for LPA local neighborhoods. "
+                             "For gauss: sigma (effective radius ~3x). "
+                             "For box: half-width radius (cube side = 2r+1). "
+                             "Use 0 with -lpa_kernel box to auto-size to ~500 voxels "
                              "[default: %(default)s voxels]")
+    g_cost.add_argument("-lpa_kernel", choices=["gauss", "box"], default="gauss",
+                        help="LPA neighborhood kernel: gauss=Gaussian weighting "
+                             "(default), box=uniform weighting (like AFNI's "
+                             "space-filling blocks)")
     g_cost.add_argument("-penfac", type=float, default=0.001, metavar="FACTOR",
                         help="Warp distortion penalty factor (Jacobian-based). Prevents "
                              "excessive warp folding. Our Adam optimizer amplifies penalty "
@@ -823,6 +828,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.axweight is not None:
         axis_weights = tuple(max(0.0, min(1.0, w)) for w in args.axweight)
 
+    # Auto-size box radius if requested
+    lpa_sigma_val = args.lpa_sigma
+    if args.lpa_kernel == "box" and lpa_sigma_val <= 0:
+        from .cost import auto_box_radius
+        lpa_sigma_val = float(auto_box_radius(500))
+        if args.verb >= 1:
+            side = 2 * int(lpa_sigma_val) + 1
+            print(f"Auto box radius: {int(lpa_sigma_val)} "
+                  f"({side}³ = {side**3} voxels)")
+
     config = QwarpConfig(
         minpatch=args.minpatch,
         max_level=args.maxlev,
@@ -839,7 +854,8 @@ def main(argv: list[str] | None = None) -> int:
         batch_optimizer_iters=args.batch_iters,
         hfactor_q=args.hfactor_q,
         maxdisp=args.maxdisp,
-        lpa_sigma=args.lpa_sigma,
+        lpa_sigma=lpa_sigma_val,
+        lpa_kernel=args.lpa_kernel,
         level_stop_tol=args.level_stop,
         compile=args.compile,
     )

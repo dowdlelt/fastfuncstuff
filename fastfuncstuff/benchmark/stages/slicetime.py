@@ -20,16 +20,6 @@ def _input_path(ctx: BenchmarkContext) -> Path:
     return ctx.func_dir / "sub-01_ses-01_task-localizer_run-1_bold.nii"
 
 
-def _tpattern_path(ctx: BenchmarkContext) -> Path:
-    """Slice timing file — lives alongside the download."""
-    # Check test_data/ relative to data_dir
-    candidate = ctx.data_dir.parent / "ds005165_slicetiming.txt"
-    if candidate.exists():
-        return candidate
-    # Fall back to data_dir itself
-    return ctx.data_dir / "ds005165_slicetiming.txt"
-
-
 def _afni_out(ctx: BenchmarkContext) -> Path:
     return ctx.processing_dir / "afni_tshift_sub-01_ses-01_task-localizer_run-1_bold.nii"
 
@@ -48,25 +38,27 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     else:
         if not _input_path(ctx).exists():
             missing.append(str(_input_path(ctx)))
-        tp = _tpattern_path(ctx)
-        if not tp.exists():
-            missing.append(str(tp))
+        # SliceTiming comes from BIDS JSON — just need the JSON to exist
+        json_path = ctx.func_dir / "sub-01_ses-01_task-localizer_run-1_bold.json"
+        if not json_path.exists():
+            missing.append(str(json_path))
     return missing
 
 
-def run_afni(ctx: BenchmarkContext) -> float:
+def run_ref(ctx: BenchmarkContext) -> float:
     """Run AFNI 3dTshift."""
     from ..runner import run_timed
 
     out = _afni_out(ctx)
-    if out.exists() and not ctx.force_afni:
+    if out.exists() and not ctx.force_ref:
         return 0.0
 
+    tp = ctx.tpattern_file("localizer", 1)
     elapsed, _ = run_timed(
         f"3dTshift -overwrite "
         f"-prefix {out} "
         f"-tzero 0 "
-        f"-tpattern @{_tpattern_path(ctx)} "
+        f"-tpattern @{tp} "
         f"-wsinc9 "
         f"{_input_path(ctx)}",
         label="3dTshift localizer run-1",
@@ -83,12 +75,13 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     if out.exists() and not ctx.force_ffs:
         return 0.0
 
+    tp = ctx.tpattern_file("localizer", 1)
     elapsed, _ = run_timed(
         f"ffs_slicetime "
         f"-input {_input_path(ctx)} "
         f"-tzero 0 "
         f"-wsinc9 "
-        f"-tpattern {_tpattern_path(ctx)} "
+        f"-tpattern {tp} "
         f"-prefix {out}",
         label="ffs_slicetime localizer run-1",
         cwd=ctx.processing_dir,

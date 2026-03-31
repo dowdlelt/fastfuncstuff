@@ -573,7 +573,8 @@ def main():
     # Parse onset files
     onset_files = args.onsets
     n_conditions = len(onset_files)
-    condition_labels = [Path(f).stem for f in onset_files]
+    from fastfuncstuff.cli_utils import clean_condition_labels
+    condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
 
     for f in onset_files:
         if not Path(f).exists():

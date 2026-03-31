@@ -9,15 +9,23 @@ import numpy as np
 
 
 # Ordered stage names for consistent plot layout
-STAGE_ORDER = ["moco", "slicetime", "align", "warp", "glm", "ica"]
+STAGE_ORDER = ["moco", "slicetime", "crossalign", "align", "warp", "glm", "ica",
+               "ica_single",
+               "glmsingle_prep", "glmsingle_hrf", "glmsingle_denoise", "glmsingle_ridge"]
 
 STAGE_LABELS = {
     "moco": "Motion\nCorrection",
     "slicetime": "Slice\nTiming",
+    "crossalign": "Cross-run\nAlignment",
     "align": "Alignment\n+ Qwarp",
     "warp": "Warp\nApply",
     "glm": "GLM\n(OLS+REML)",
-    "ica": "ICA",
+    "ica": "ICA\n(concat)",
+    "ica_single": "ICA\n(single-run)",
+    "glmsingle_prep": "GLMsingle\nPrep",
+    "glmsingle_hrf": "GLMsingle\nHRF (B)",
+    "glmsingle_denoise": "GLMsingle\nDenoise (C)",
+    "glmsingle_ridge": "GLMsingle\nRidge (D)",
 }
 
 # Short arch labels for plot legends
@@ -40,7 +48,7 @@ def _extract_plot_data(cache: dict[str, Any]) -> list[dict]:
     """Extract per-architecture stage timing data from cache.
 
     Returns list of dicts with keys: arch_id, short_label, dataset_id, stages.
-    Each stage entry has afni_seconds and ffs_seconds.
+    Each stage entry has ref_seconds and ffs_seconds.
     """
     entries = []
     for run in cache.get("runs", []):
@@ -61,15 +69,17 @@ def _extract_plot_data(cache: dict[str, Any]) -> list[dict]:
     return entries
 
 
+def _get_ref_seconds(stage_data: dict) -> float:
+    """Get reference tool timing, supporting both old and new key names."""
+    return stage_data.get("ref_seconds") or stage_data.get("afni_seconds", 0) or 0
+
+
 def plot_timing_bars(
     cache: dict[str, Any],
     output_path: str | Path | None = None,
     title: str | None = None,
 ) -> None:
-    """Grouped bar chart: AFNI vs FFS per stage, grouped by architecture.
-
-    Each architecture gets a pair of bars (AFNI / FFS) for each stage.
-    """
+    """Grouped bar chart: Reference vs FFS per stage, grouped by architecture."""
     import matplotlib.pyplot as plt
 
     entries = _extract_plot_data(cache)
@@ -92,25 +102,25 @@ def plot_timing_bars(
     bar_width = 0.35 / max(n_archs, 1)
     group_width = (2 * bar_width + 0.05) * n_archs + 0.3
 
-    colors_afni = plt.cm.Greys(np.linspace(0.4, 0.7, n_archs))
+    colors_ref = plt.cm.Greys(np.linspace(0.4, 0.7, n_archs))
     colors_ffs = plt.cm.Blues(np.linspace(0.4, 0.8, n_archs))
 
     for arch_idx, entry in enumerate(entries):
-        label_afni = f"AFNI ({entry['short_label']})"
+        label_ref = f"Ref ({entry['short_label']})"
         label_ffs = f"FFS ({entry['short_label']})"
 
-        afni_times = []
+        ref_times = []
         ffs_times = []
         for s in all_stages:
             stage_data = entry["stages"].get(s, {})
-            afni_times.append(stage_data.get("afni_seconds", 0) or 0)
+            ref_times.append(_get_ref_seconds(stage_data))
             ffs_times.append(stage_data.get("ffs_seconds", 0) or 0)
 
         x = np.arange(n_stages) * group_width
         offset = arch_idx * (2 * bar_width + 0.05)
 
-        ax.bar(x + offset, afni_times, bar_width,
-               label=label_afni, color=colors_afni[arch_idx],
+        ax.bar(x + offset, ref_times, bar_width,
+               label=label_ref, color=colors_ref[arch_idx],
                edgecolor="black", linewidth=0.5)
         ax.bar(x + offset + bar_width, ffs_times, bar_width,
                label=label_ffs, color=colors_ffs[arch_idx],
@@ -121,7 +131,7 @@ def plot_timing_bars(
     ax.set_xticks(np.arange(n_stages) * group_width + center_offset)
     ax.set_xticklabels([STAGE_LABELS.get(s, s) for s in all_stages])
     ax.set_ylabel("Time (seconds)")
-    ax.set_title(title or "AFNI vs FFS Benchmark Timing")
+    ax.set_title(title or "Reference vs FFS Benchmark Timing")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(axis="y", alpha=0.3)
 
@@ -139,7 +149,7 @@ def plot_speedup_bars(
     output_path: str | Path | None = None,
     title: str | None = None,
 ) -> None:
-    """Horizontal bar chart: FFS speedup over AFNI per stage, by architecture."""
+    """Horizontal bar chart: FFS speedup over reference per stage, by architecture."""
     import matplotlib.pyplot as plt
 
     entries = _extract_plot_data(cache)
@@ -164,10 +174,10 @@ def plot_speedup_bars(
         speedups = []
         for s in all_stages:
             stage_data = entry["stages"].get(s, {})
-            afni = stage_data.get("afni_seconds", 0) or 0
+            ref = _get_ref_seconds(stage_data)
             ffs = stage_data.get("ffs_seconds", 0) or 0
-            if ffs > 0 and afni > 0:
-                speedups.append(afni / ffs)
+            if ffs > 0 and ref > 0:
+                speedups.append(ref / ffs)
             else:
                 speedups.append(0.0)
 
@@ -190,8 +200,8 @@ def plot_speedup_bars(
     center_offset = (n_archs - 1) * bar_height / 2
     ax.set_yticks(np.arange(n_stages) + center_offset)
     ax.set_yticklabels([STAGE_LABELS.get(s, s) for s in all_stages])
-    ax.set_xlabel("Speedup (AFNI time / FFS time)")
-    ax.set_title(title or "FFS Speedup over AFNI")
+    ax.set_xlabel("Speedup (Ref time / FFS time)")
+    ax.set_title(title or "FFS Speedup over Reference Tools")
     ax.legend(loc="lower right", fontsize=9)
     ax.grid(axis="x", alpha=0.3)
     ax.invert_yaxis()

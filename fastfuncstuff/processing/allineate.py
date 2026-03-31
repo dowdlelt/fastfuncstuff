@@ -71,6 +71,7 @@ class AffineAlignConfig:
     # Cost function
     cost: str = "lpa"  # "ls" (clipped pearson), "lpa", "lpc"
     lpa_sigma: float = 4.0
+    lpa_kernel: str = "gauss"  # "gauss" or "box"
 
     # Coarse search
     twopass: bool = True
@@ -114,6 +115,7 @@ def _compute_cost(
     weight: Tensor | None,
     cost_name: str,
     sigma: float = 4.0,
+    kernel_type: str = "gauss",
 ) -> Tensor:
     """Compute alignment cost (higher = better)."""
     if cost_name in ("ls", "pearclp"):
@@ -122,9 +124,11 @@ def _compute_cost(
             weight.reshape(-1) if weight is not None else None,
         )
     elif cost_name == "lpa":
-        return lpa_correlation(base, warped, weight, sigma=sigma)
+        return lpa_correlation(base, warped, weight, sigma=sigma,
+                               kernel_type=kernel_type)
     elif cost_name == "lpc":
-        return lpc_correlation(base, warped, weight, sigma=sigma)
+        return lpc_correlation(base, warped, weight, sigma=sigma,
+                               kernel_type=kernel_type)
     else:
         raise ValueError(f"Unknown cost function: {cost_name}")
 
@@ -135,6 +139,7 @@ def _batched_cost(
     weight: Tensor | None,
     cost_name: str,
     sigma: float = 4.0,
+    kernel_type: str = "gauss",
 ) -> Tensor:
     """Compute cost for B warped images against a single base.
 
@@ -181,7 +186,8 @@ def _batched_cost(
         costs = torch.zeros(B, device=base.device)
         cost_fn = lpa_correlation if cost_name == "lpa" else lpc_correlation
         for i in range(B):
-            costs[i] = cost_fn(base, warped_batch[i], weight, sigma=sigma)
+            costs[i] = cost_fn(base, warped_batch[i], weight, sigma=sigma,
+                               kernel_type=kernel_type)
         return costs
 
     else:
@@ -576,7 +582,8 @@ def _coarse_search(
             warped_batch = apply_affine_batched(
                 source, matrices[start:end], base.shape)
             costs = _batched_cost(base, warped_batch, weight,
-                                  coarse_cost, config.lpa_sigma)
+                                  coarse_cost, config.lpa_sigma,
+                                  config.lpa_kernel)
         all_costs.append(costs)
         del warped_batch
 
@@ -682,7 +689,8 @@ def _refine_adam_normalized(
         params_phys = _denormalize_t(params_norm, bmin, span)
         matrix = params_to_matrix(params_phys)
         warped = apply_affine(source, matrix, base.shape)
-        cost = _compute_cost(base, warped, weight, config.cost, config.lpa_sigma)
+        cost = _compute_cost(base, warped, weight, config.cost, config.lpa_sigma,
+                             config.lpa_kernel)
 
         loss = -cost
         loss.backward()
@@ -732,6 +740,7 @@ def _make_powell_cost(
     device: torch.device,
     counter: list | None = None,
     pbar=None,
+    lpa_kernel: str = "gauss",
 ):
     """Create a closure for scipy Powell (avoids kwargs issue)."""
 
@@ -748,7 +757,8 @@ def _make_powell_cost(
 
         with torch.no_grad():
             warped = apply_affine(source, matrix, base.shape)
-            cost = _compute_cost(base, warped, weight, cost_name, lpa_sigma)
+            cost = _compute_cost(base, warped, weight, cost_name, lpa_sigma,
+                                 lpa_kernel)
 
         val = -cost.item()
 
@@ -807,6 +817,7 @@ def _refine_powell(
         config.cost, config.lpa_sigma,
         bounds, free_mask, fixed_norm, device,
         counter=counter, pbar=pbar,
+        lpa_kernel=config.lpa_kernel,
     )
 
     # Powell with bounds to keep params in [0,1]
@@ -1213,7 +1224,8 @@ def allineate(
 
     if verb >= 1:
         final_cost = _compute_cost(base, warped, weight,
-                                   config.cost, config.lpa_sigma)
+                                   config.cost, config.lpa_sigma,
+                                   config.lpa_kernel)
         print(f"Final cost: {final_cost.item():.6f}")
 
     return final_matrix, warped

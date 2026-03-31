@@ -404,3 +404,114 @@ def slicetime_correct(
               f"({n_skip} at tzero, skipped)")
 
     return out
+
+
+def temporal_resample(
+    vol4d: Tensor,
+    tr_old: float,
+    tr_new: float,
+    method: str = "cubic",
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> Tensor:
+    """Resample a 4D volume to a new TR grid via temporal interpolation.
+
+    After slice-timing correction all slices share the same temporal grid
+    (at ``tr_old``).  This function resamples onto a new grid with spacing
+    ``tr_new``, which is typically shorter (upsampling) so that event onsets
+    align to TR boundaries — a requirement for GLMsingle-style analysis.
+
+    Parameters
+    ----------
+    vol4d : (nt_old, nz, ny, nx) float tensor
+    tr_old : float
+        Current TR in seconds.
+    tr_new : float
+        Desired output TR in seconds.
+    method : str
+        Interpolation: 'linear', 'cubic' (default).
+    device : torch.device, optional
+    verbose : bool
+
+    Returns
+    -------
+    (nt_new, nz, ny, nx) float tensor at the new TR.
+    """
+    if device is not None:
+        vol4d = vol4d.to(device)
+
+    nt_old, nz, ny, nx = vol4d.shape
+
+    # Total duration = (nt_old - 1) * tr_old  (from first to last sample)
+    total_duration = (nt_old - 1) * tr_old
+    nt_new = int(total_duration / tr_new) + 1
+
+    if verbose:
+        print(f"  resample: {nt_old} vols @ {tr_old:.4f}s -> {nt_new} vols @ {tr_new:.4f}s")
+        print(f"  duration: {total_duration:.2f}s, method: {method}")
+
+    # Build old and new time grids
+    t_old = torch.arange(nt_old, device=vol4d.device, dtype=torch.float64) * tr_old
+    t_new = torch.arange(nt_new, device=vol4d.device, dtype=torch.float64) * tr_new
+
+    # Clamp new times to old range (avoid extrapolation)
+    t_new = t_new.clamp(max=t_old[-1].item())
+
+    # Process slice-by-slice to keep memory manageable
+    out = torch.zeros(nt_new, nz, ny, nx, device=vol4d.device, dtype=vol4d.dtype)
+
+    for kk in range(nz):
+        # (ny*nx, nt_old) — each voxel's time series as a row
+        ts = vol4d[:, kk, :, :].reshape(nt_old, -1).T.to(torch.float64)
+        n_vox = ts.shape[0]
+
+        if method == "linear":
+            # Find insertion indices for t_new in t_old
+            idx = torch.searchsorted(t_old, t_new).clamp(1, nt_old - 1)
+            t0 = t_old[idx - 1]
+            t1 = t_old[idx]
+            w = ((t_new - t0) / (t1 - t0)).unsqueeze(0)  # (1, nt_new)
+            v0 = ts[:, idx - 1]  # (n_vox, nt_new)
+            v1 = ts[:, idx]
+            interp = v0 * (1 - w) + v1 * w
+
+        elif method == "cubic":
+            # Cubic Hermite (Catmull-Rom) spline interpolation
+            idx = torch.searchsorted(t_old, t_new).clamp(1, nt_old - 1)
+            t0 = t_old[idx - 1]
+            t1 = t_old[idx]
+            frac = (t_new - t0) / (t1 - t0)  # (nt_new,)
+            f = frac.unsqueeze(0)  # (1, nt_new)
+            f2 = f * f
+            f3 = f2 * f
+
+            # Catmull-Rom basis
+            h00 = 2 * f3 - 3 * f2 + 1
+            h10 = f3 - 2 * f2 + f
+            h01 = -2 * f3 + 3 * f2
+            h11 = f3 - f2
+
+            # Values at grid points
+            p0 = ts[:, idx - 1]
+            p1 = ts[:, idx]
+
+            # Tangents (finite difference, clamped at boundaries)
+            im1 = (idx - 2).clamp(0)
+            ip1 = idx.clamp(max=nt_old - 1)
+            m0 = (ts[:, idx] - ts[:, im1]) / 2.0
+            m1 = (ts[:, ip1] - ts[:, idx - 1]) / 2.0
+
+            # Scale tangents by the interval length (for non-uniform grids, though
+            # here we have a uniform grid so dt = tr_old for all intervals)
+            interp = h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
+
+        else:
+            raise ValueError(f"Unknown resample method: {method}. Use 'linear' or 'cubic'.")
+
+        # (n_vox, nt_new) -> (nt_new, ny, nx)
+        out[:, kk, :, :] = interp.to(vol4d.dtype).T.reshape(nt_new, ny, nx)
+
+    if verbose:
+        print(f"  resample: done ({nt_new} output volumes)")
+
+    return out

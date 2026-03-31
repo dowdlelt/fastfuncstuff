@@ -73,32 +73,32 @@ def print_timing_report(results: list[StageResult]) -> None:
 
     print(f"\nBENCHMARK: {arch_id}")
     print("=" * 72)
-    print(f"{'Stage':<16} {'AFNI (s)':>10} {'FFS (s)':>10} {'Speedup':>10} {'Status'}")
+    print(f"{'Stage':<16} {'Ref (s)':>10} {'FFS (s)':>10} {'Speedup':>10} {'Status'}")
     print("-" * 72)
 
-    total_afni = 0.0
+    total_ref = 0.0
     total_ffs = 0.0
 
     for r in results:
         status = "PASS" if r.passed else "FAIL"
-        afni_str = f"{r.afni_time:.1f}" if r.afni_time is not None else "-"
+        ref_str = f"{r.ref_time:.1f}" if r.ref_time is not None else "-"
         ffs_str = f"{r.ffs_time:.1f}" if r.ffs_time is not None else "-"
 
-        if r.afni_time is not None and r.ffs_time is not None and r.ffs_time > 0:
-            speedup = r.afni_time / r.ffs_time
+        if r.ref_time is not None and r.ffs_time is not None and r.ffs_time > 0:
+            speedup = r.ref_time / r.ffs_time
             speedup_str = f"{speedup:.1f}x"
-            total_afni += r.afni_time
+            total_ref += r.ref_time
             total_ffs += r.ffs_time
         else:
             speedup_str = "-"
 
         summary_short = r.summary[:30] if r.summary else ""
-        print(f"{r.stage_name:<16} {afni_str:>10} {ffs_str:>10} {speedup_str:>10} {status}  {summary_short}")
+        print(f"{r.stage_name:<16} {ref_str:>10} {ffs_str:>10} {speedup_str:>10} {status}  {summary_short}")
 
     print("-" * 72)
     if total_ffs > 0:
-        total_speedup = f"{total_afni / total_ffs:.1f}x"
-        print(f"{'Total':<16} {total_afni:>10.1f} {total_ffs:>10.1f} {total_speedup:>10}")
+        total_speedup = f"{total_ref / total_ffs:.1f}x"
+        print(f"{'Total':<16} {total_ref:>10.1f} {total_ffs:>10.1f} {total_speedup:>10}")
 
 
 def results_to_json(results: list[StageResult]) -> dict[str, Any]:
@@ -109,7 +109,7 @@ def results_to_json(results: list[StageResult]) -> dict[str, Any]:
         stages[r.stage_name] = {
             "passed": r.passed,
             "summary": r.summary,
-            "afni_seconds": r.afni_time,
+            "ref_seconds": r.ref_time,
             "ffs_seconds": r.ffs_time,
             "validation": _sanitize_for_json(r.validation),
             "errors": r.errors,

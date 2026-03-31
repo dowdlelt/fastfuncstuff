@@ -253,9 +253,10 @@ Notes:
     )
     cv_opts.add_argument(
         "-metric",
-        choices=["cod", "corr", "corr2"],
+        choices=["cod", "corr", "corr2", "sse"],
         default="cod",
-        help="R² metric: 'cod' (coefficient of determination), 'corr', 'corr2' (default: cod)",
+        help="CV metric: 'cod', 'corr', 'corr2', "
+        "'sse' (sum of squared errors, GLMsingle-compatible). Default: cod.",
     )
     cv_opts.add_argument(
         "-single_trials",
@@ -508,7 +509,8 @@ def main():
     # Parse onset files
     onset_files = args.onsets
     n_conditions = len(onset_files)
-    condition_labels = [Path(f).stem for f in onset_files]
+    from fastfuncstuff.cli_utils import clean_condition_labels
+    condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
 
     # Validate onset files exist
     for f in onset_files:

@@ -28,8 +28,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stages", type=str, default=None,
-        help="Comma-separated stage names (moco,slicetime,align,warp,glm,ica). "
-             "Default: all.",
+        help="Comma-separated stage names "
+             "(moco,slicetime,crossalign,align,warp,glm,ica,ica_single,"
+             "glmsingle_prep,glmsingle_matlab,glmsingle_hrf,"
+             "glmsingle_denoise,glmsingle_ridge). Default: all.",
     )
     parser.add_argument(
         "--validate-only", action="store_true",
@@ -40,8 +42,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-run FFS tools even if outputs exist.",
     )
     parser.add_argument(
-        "--force-afni", action="store_true",
-        help="Re-run AFNI tools even if outputs exist.",
+        "--force-ref", "--force-afni", action="store_true", dest="force_ref",
+        help="Re-run reference tools (AFNI/melodic/MATLAB) even if outputs exist.",
     )
     parser.add_argument(
         "--force-all", action="store_true",
@@ -60,6 +62,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Save benchmark plots (timing bars, speedup chart) to this directory.",
     )
     parser.add_argument(
+        "--download", action="store_true",
+        help="Download ds005165 data from OpenNeuro if not present. "
+             "Requires awscli (aws s3 sync --no-sign-request).",
+    )
+    parser.add_argument(
         "--plot-from-cache", type=str, nargs="*", default=None,
         metavar="CACHE_JSON",
         help="Generate plots from one or more benchmark_cache.json files. "
@@ -75,14 +82,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _project_root() -> Path:
+    """Return the fastfuncstuff project root (where test_data/ lives)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_data_dir() -> Path:
+    """Default location for ds005165 data, relative to project root."""
+    return _project_root() / "test_data" / "ds005165-download"
+
+
 def _find_data_dir() -> Path | None:
     """Try to auto-detect the ds005165 data directory."""
     candidates = [
+        _default_data_dir(),
         Path("test_data/ds005165-download"),
-        Path(__file__).resolve().parents[2] / "test_data" / "ds005165-download",
     ]
     for c in candidates:
-        if c.exists() and (c / "processing").exists():
+        if c.exists() and (c / "sub-01").exists():
             return c
     return None
 
@@ -104,22 +121,30 @@ def main(argv: list[str] | None = None) -> int:
 
     # Resolve data directory
     if args.data_dir:
-        data_dir = Path(args.data_dir)
+        data_dir = Path(args.data_dir).resolve()
     else:
         data_dir = _find_data_dir()
         if data_dir is None:
-            print("ERROR: Cannot find ds005165-download directory.")
-            print("Specify with --data-dir or run from the project root.")
-            return 1
+            if args.download:
+                # No existing dir found — use project-root default
+                data_dir = _default_data_dir()
+            else:
+                print("ERROR: Cannot find ds005165-download directory.")
+                print("Specify with --data-dir or run from the project root.")
+                return 1
+
+    # Download data if requested
+    if args.download:
+        _ensure_data(data_dir)
 
     if not data_dir.exists():
         print(f"ERROR: Data directory not found: {data_dir}")
+        print("Use --download to fetch from OpenNeuro.")
         return 1
 
+    # Create processing dir if needed (from-zero runs won't have it yet)
     processing = data_dir / "processing"
-    if not processing.exists():
-        print(f"ERROR: Processing directory not found: {processing}")
-        return 1
+    processing.mkdir(parents=True, exist_ok=True)
 
     # Resolve stages
     stage_names = None
@@ -136,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     force_all = args.force_all
     ctx = BenchmarkContext(
         data_dir=data_dir,
-        force_afni=args.force_afni or force_all,
+        force_ref=args.force_ref or force_all,
         force_ffs=args.force_ffs or force_all,
         validate_only=args.validate_only,
     )
@@ -153,10 +178,10 @@ def main(argv: list[str] | None = None) -> int:
         from ..benchmark.timing_cache import get_cached_timing
 
         for r in results:
-            if r.afni_time is None or r.ffs_time is None:
-                cached_afni, cached_ffs = get_cached_timing(data_dir, r.stage_name)
-                if r.afni_time is None and cached_afni is not None:
-                    r.afni_time = cached_afni
+            if r.ref_time is None or r.ffs_time is None:
+                cached_ref, cached_ffs = get_cached_timing(data_dir, r.stage_name)
+                if r.ref_time is None and cached_ref is not None:
+                    r.ref_time = cached_ref
                 if r.ffs_time is None and cached_ffs is not None:
                     r.ffs_time = cached_ffs
 
@@ -226,6 +251,44 @@ def _plot_from_cache(args) -> int:
     output_dir = args.plot or "benchmark_plots"
     plot_all(merged, output_dir=output_dir)
     return 0
+
+
+def _ensure_data(data_dir: Path) -> None:
+    """Download ds005165 sub-01/ses-01 data from OpenNeuro if not present."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("aws"):
+        print("ERROR: awscli not found. Install with: pip install awscli")
+        sys.exit(1)
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if we already have the essential files
+    func_dir = data_dir / "sub-01" / "ses-01" / "func"
+    anat_dir = data_dir / "sub-01" / "ses-01" / "anat"
+    if (
+        func_dir.exists()
+        and anat_dir.exists()
+        and any(func_dir.glob("*.nii"))
+        and any(anat_dir.glob("*.nii"))
+    ):
+        print(f"Data already present: {data_dir}")
+        return
+
+    print(f"Downloading ds005165 sub-01/ses-01 to {data_dir}...")
+    cmd = [
+        "aws", "s3", "sync", "--no-sign-request",
+        "s3://openneuro.org/ds005165", str(data_dir),
+        "--exclude", "*",
+        "--include", "sub-01/ses-01/*",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Download failed:\n{result.stderr[-500:]}")
+        sys.exit(1)
+
+    print("Download complete.")
 
 
 if __name__ == "__main__":

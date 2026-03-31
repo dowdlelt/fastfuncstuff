@@ -204,8 +204,13 @@ Notes:
         "-r2_threshold",
         type=float,
         default=0.05,
-        help="R² threshold for noise pool selection (default: 0.05). "
-        "Voxels with R² < threshold are noise pool, >= threshold are criteria.",
+        help="Cross-validated R² threshold for noise pool selection (default: 0.05). "
+        "Voxels with CV R² < threshold are noise pool, >= threshold are criteria. "
+        "R² is computed using condition-level design (not single-trial) with COD metric "
+        "on a 0-1 scale. For unmasked data, use -brainthresh to exclude background "
+        "voxels first, otherwise most voxels will have R²≈0 and flood the noise pool. "
+        "GLMsingle auto-determines this via GMM (findtailthreshold); typical values "
+        "range 0.01-0.10 depending on data quality.",
     )
     denoise_opts.add_argument(
         "-noise",
@@ -245,11 +250,13 @@ Notes:
         type=float,
         metavar=("PERCENTILE", "FRACTION"),
         default=None,
-        help="Signal intensity threshold for noise pool selection (GLMdenoise-style). "
-        "PERCENTILE: percentile of mean intensity (e.g., 99). "
-        "FRACTION: fraction of that percentile (e.g., 0.5). "
-        "Voxels with mean intensity < PERCENTILE * FRACTION are excluded from noise pool. "
-        "Applied BEFORE scaling. Example: -brainthresh 99 0.5",
+        help="Signal intensity threshold to exclude non-brain voxels from noise pool. "
+        "Computed from raw (unscaled) mean volume: thresh = percentile(mean, P) * F. "
+        "Voxels with mean intensity BELOW this threshold are excluded. "
+        "GLMsingle default: '99 0.1' (99th percentile × 0.1). "
+        "Critical for unmasked data — without this or -mask, background voxels "
+        "(R²≈0) will dominate the noise pool. "
+        "Example: -brainthresh 99 0.5 (more conservative, excludes dim voxels).",
     )
     denoise_opts.add_argument(
         "-min_noise_voxels",
@@ -349,10 +356,11 @@ Notes:
     )
     denoise_opts.add_argument(
         "-cv_metric",
-        choices=["cod", "corr", "corr2"],
+        choices=["cod", "corr", "corr2", "sse"],
         default="cod",
-        help="R² metric for cross-validation: cod (coefficient of determination), "
-        "corr (Pearson correlation), corr2 (correlation squared). Default: cod.",
+        help="CV metric: cod (coefficient of determination), "
+        "corr (Pearson correlation), corr2 (correlation squared), "
+        "sse (sum of squared errors, GLMsingle-compatible). Default: cod.",
     )
     denoise_opts.add_argument(
         "-single_trials",
@@ -360,6 +368,13 @@ Notes:
         help="Use beta-space cross-validation (GLMsingle-style). "
         "Fits single-trial model once on all data, evaluates R² on "
         "condition-averaged vs individual trial betas across folds.",
+    )
+    denoise_opts.add_argument(
+        "-zscore_by_run",
+        action="store_true",
+        default=False,
+        help="Z-score betas per run before CV using OLS normalization stats "
+        "(GLMsingle default). Only applies with -single_trials.",
     )
 
     # Processing options
@@ -662,6 +677,7 @@ def save_denoising_results(
     condition_labels: list[str] | None = None,
     save_scree_plot: bool = True,
     nii_ext: str = ".nii.gz",
+    nifti_header: object | None = None,
 ):
     """
     Save denoising results to disk
@@ -721,33 +737,33 @@ def save_denoising_results(
     # 1. Noise pool mask
     noise_pool_vol = to_volume(results.noise_pool_mask.cpu().numpy().astype(np.float32))
     noise_pool_path = f"{output_prefix}_noise_pool_mask{nii_ext}"
-    save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
+    save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine, header=nifti_header)
     output_files["noise_pool_mask"] = noise_pool_path
 
     # 2. Criteria mask
     criteria_vol = to_volume(results.criteria_mask.cpu().numpy().astype(np.float32))
     criteria_path = f"{output_prefix}_criteria_mask{nii_ext}"
-    save_nifti(criteria_vol, output_path=criteria_path, affine=affine)
+    save_nifti(criteria_vol, output_path=criteria_path, affine=affine, header=nifti_header)
     output_files["criteria_mask"] = criteria_path
 
     # 3. Initial R²
     initial_r2_vol = to_volume(results.noise_pool_r2.cpu().numpy().astype(np.float32))
     initial_r2_path = f"{output_prefix}_initial_r2{nii_ext}"
-    save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine)
+    save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine, header=nifti_header)
     output_files["initial_r2"] = initial_r2_path
 
     # 3b. Xval R² at optimal PC count (criteria voxels only)
     if results.xval_r2_optimal is not None:
         xval_opt_vol = to_volume(results.xval_r2_optimal.cpu().numpy().astype(np.float32))
         xval_opt_path = f"{output_prefix}_xval_r2_optimal{nii_ext}"
-        save_nifti(xval_opt_vol, output_path=xval_opt_path, affine=affine)
+        save_nifti(xval_opt_vol, output_path=xval_opt_path, affine=affine, header=nifti_header)
         output_files["xval_r2_optimal"] = xval_opt_path
 
     # 3c. Xval R² at optimal PC count (all voxels)
     if results.xval_r2_optimal_full is not None:
         xval_opt_full_vol = to_volume(results.xval_r2_optimal_full.cpu().numpy().astype(np.float32))
         xval_opt_full_path = f"{output_prefix}_xval_r2_optimal_full{nii_ext}"
-        save_nifti(xval_opt_full_vol, output_path=xval_opt_full_path, affine=affine)
+        save_nifti(xval_opt_full_vol, output_path=xval_opt_full_path, affine=affine, header=nifti_header)
         output_files["xval_r2_optimal_full"] = xval_opt_full_path
 
     # 3d. Per-fold xval R² at optimal PCs (4D)
@@ -759,7 +775,7 @@ def save_denoising_results(
 
         fold_4d = np.stack(fold_vols, axis=-1)
         fold_path = f"{output_prefix}_xval_r2_optimal_per_fold{nii_ext}"
-        save_nifti(fold_4d, output_path=fold_path, affine=affine)
+        save_nifti(fold_4d, output_path=fold_path, affine=affine, header=nifti_header)
         output_files["xval_r2_optimal_per_fold"] = fold_path
 
     # 4. CV R² arrays
@@ -842,7 +858,7 @@ def save_denoising_results(
                 # Stack into 4D and save
                 pc_4d = np.stack(pc_vols, axis=-1)
                 pc_path = f"{output_prefix}_run{run_idx + 1:02d}_pc_weights{nii_ext}"
-                save_nifti(pc_4d, output_path=pc_path, affine=affine)
+                save_nifti(pc_4d, output_path=pc_path, affine=affine, header=nifti_header)
                 output_files[f"run{run_idx + 1}_pc_weights"] = pc_path
 
             print(f"  Saved PC spatial weights for {n_runs} runs")
@@ -1126,6 +1142,7 @@ def save_snr_outputs(
     voxel_mask: torch.Tensor | None = None,
     create_plots: bool = True,
     nii_ext: str = ".nii.gz",
+    nifti_header: object | None = None,
 ) -> dict:
     """
     Save SNR volumes and create before/after comparison plots.
@@ -1145,26 +1162,26 @@ def save_snr_outputs(
     if "snr_residual" in snr_initial:
         snr_vol = to_volume(snr_initial["snr_residual"].astype(np.float32))
         snr_path = f"{output_prefix}_snr_residual_initial{nii_ext}"
-        save_nifti(snr_vol, output_path=snr_path, affine=affine)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine, header=nifti_header)
         output_files["snr_residual_initial"] = snr_path
 
     if "snr_residual" in snr_denoised:
         snr_vol = to_volume(snr_denoised["snr_residual"].astype(np.float32))
         snr_path = f"{output_prefix}_snr_residual_denoised{nii_ext}"
-        save_nifti(snr_vol, output_path=snr_path, affine=affine)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine, header=nifti_header)
         output_files["snr_residual_denoised"] = snr_path
 
     # Save bootstrap-based SNR volumes
     if "snr_bootstrap" in snr_initial:
         snr_vol = to_volume(snr_initial["snr_bootstrap"].astype(np.float32))
         snr_path = f"{output_prefix}_snr_bootstrap_initial{nii_ext}"
-        save_nifti(snr_vol, output_path=snr_path, affine=affine)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine, header=nifti_header)
         output_files["snr_bootstrap_initial"] = snr_path
 
     if "snr_bootstrap" in snr_denoised:
         snr_vol = to_volume(snr_denoised["snr_bootstrap"].astype(np.float32))
         snr_path = f"{output_prefix}_snr_bootstrap_denoised{nii_ext}"
-        save_nifti(snr_vol, output_path=snr_path, affine=affine)
+        save_nifti(snr_vol, output_path=snr_path, affine=affine, header=nifti_header)
         output_files["snr_bootstrap_denoised"] = snr_path
 
     # Create scatter plots
@@ -1256,6 +1273,7 @@ def save_model_fit_outputs(
     n_regressors: int | None = None,
     bootstrap_se: np.ndarray | None = None,
     nii_ext: str = ".nii.gz",
+    nifti_header: object | None = None,
 ):
     """
     Save GLM model fit outputs (betas, tstats) as NIfTI files with AFNI labeling
@@ -1359,7 +1377,7 @@ def save_model_fit_outputs(
 
     # Write uncompressed first for 3drefit, compress after
     bucket_path_nii = bucket_path.replace(nii_ext, ".nii")
-    save_nifti(bucket_4d, output_path=bucket_path_nii, affine=affine)
+    save_nifti(bucket_4d, output_path=bucket_path_nii, affine=affine, header=nifti_header)
     output_files[f"{model_type}_bucket"] = bucket_path
 
     # Use 3drefit to add proper AFNI labels and DOF
@@ -1426,7 +1444,8 @@ def main():
     # Parse onset files
     onset_files = args.onsets
     n_conditions = len(onset_files)
-    condition_labels = [Path(f).stem for f in onset_files]
+    from fastfuncstuff.cli_utils import clean_condition_labels
+    condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
 
     # Validate onset files
     for f in onset_files:
@@ -1512,6 +1531,7 @@ def main():
     data = load_result.data
     run_starts = load_result.run_starts
     affine = load_result.affine
+    nifti_header = load_result.nifti_header
     volume_shape = load_result.volume_shape
     voxel_sizes = load_result.voxel_sizes
     mask = load_result.mask
@@ -1613,7 +1633,7 @@ def main():
 
         # Load HRF library (reconstruct from metadata or use default)
         # For now, use default library matching 3dHRFoptfast
-        hrf_library = get_hrf_library(mode="library", tr=args.tr, n_hrfs=20)
+        hrf_library = get_hrf_library(mode="library", stim_duration=0.0, microtime_dt=args.microtime_dt, n_hrfs=20)
         print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
         # Show HRF distribution
@@ -1845,6 +1865,7 @@ def main():
             compute_xval_r2,
             compute_xval_r2_single_trials,
             generate_cv_splits,
+            metric_higher_is_better,
             project_out_nuisance_per_run,
             single_trial_cv_helper,
         )
@@ -2212,19 +2233,25 @@ def main():
             trial_run_ids,
             cv_splits,
             metric=args.cv_metric,
-            zscore_by_run=True,
-            reference_variant_idx=0,
+            zscore_by_run=args.zscore_by_run,
+            reference_variant_idx=0,  # 0 PCs = unregularized baseline for z-score stats
             device=device,
             verbose=False,
         )
         r2_maps_st = xval["r2"].T  # (n_voxels, n_pc_counts)
+        _hib = metric_higher_is_better(args.cv_metric)
+        _metric_label = args.cv_metric.upper()
 
         # Determine criteria mask: voxels above threshold in ANY PC count
-        # Then re-evaluate all PC counts with the same consistent mask
-        criteria_mask = torch.any(r2_maps_st > args.r2_threshold, dim=1)
+        # For SSE (lower=better), use pcR2cutoff-style fallback instead
+        if _hib:
+            criteria_mask = torch.any(r2_maps_st > args.r2_threshold, dim=1)
+        else:
+            # SSE: select voxels with finite values (all should qualify)
+            criteria_mask = torch.any(torch.isfinite(r2_maps_st), dim=1)
         n_criteria = criteria_mask.sum().item()
         print(
-            f"  Criteria voxels (R² > {args.r2_threshold} in any PC): "
+            f"  Criteria voxels ({_metric_label}): "
             f"{n_criteria:,} / {n_voxels_st:,}"
         )
 
@@ -2235,31 +2262,45 @@ def main():
         r2_criteria = r2_maps_st[criteria_mask, :]  # (n_criteria, n_pc_counts)
         r2_by_pc = r2_criteria.median(dim=0).values  # (n_pc_counts,)
 
-        print(f"  Baseline (0 PCs): median R² = {r2_by_pc[0].item():.4f}")
-        best_idx = int(r2_by_pc.argmax().item())
-        print(f"  Best ({best_idx} PCs): median R² = {r2_by_pc[best_idx].item():.4f}")
-        print(f"  Improvement: {r2_by_pc[best_idx].item() - r2_by_pc[0].item():+.4f}")
+        # For SSE, negate to get "xvaltrend" (higher = better), matching GLMsingle's
+        # convention: xvaltrend = -median(glmbadness).  This lets the same pcstop
+        # logic work for both directions.
+        if not _hib:
+            xvaltrend = -r2_by_pc  # negate SSE so higher = better
+        else:
+            xvaltrend = r2_by_pc
+
+        print(f"  Baseline (0 PCs): median {_metric_label} = {r2_by_pc[0].item():.4f}")
+        if _hib:
+            best_idx = int(xvaltrend.argmax().item())
+        else:
+            best_idx = int(xvaltrend.argmax().item())
+        print(f"  Best ({best_idx} PCs): median {_metric_label} = {r2_by_pc[best_idx].item():.4f}")
 
         # 6. Select optimal PC count using pcstop criterion
+        # xvaltrend is always in "higher = better" convention here
         print()
         if args.pcstop < 0:
             # User override: use exactly abs(pcstop) PCs
             optimal_pcs = int(abs(args.pcstop))
             print(f"User-specified PC count: {optimal_pcs}")
         elif args.pcstop == 1.0:
-            # Pure argmax
-            optimal_pcs = int(r2_by_pc.argmax().item())
+            optimal_pcs = int(xvaltrend.argmax().item())
             print(f"Optimal PC count (argmax): {optimal_pcs}")
         else:
-            # GLMdenoise-style: stop when within (pcstop-1)*100% of max
-            max_r2 = r2_by_pc.max().item()
-            threshold = max_r2 / args.pcstop
-            for n_pcs in range(len(r2_by_pc)):
-                if r2_by_pc[n_pcs].item() >= threshold:
-                    optimal_pcs = n_pcs
-                    break
-            else:
-                optimal_pcs = len(r2_by_pc) - 1
+            # GLMdenoise-style: walk forward, track best, stop when within
+            # pcstop fraction of the eventual max.  Operates on xvaltrend
+            # (always higher = better regardless of original metric).
+            curve = xvaltrend - xvaltrend[0]  # starts at 0 for 0 PCs
+            mx = curve.max().item()
+            best = float("-inf")
+            optimal_pcs = 0
+            for p in range(len(curve)):
+                if curve[p].item() > best:
+                    optimal_pcs = p
+                    best = curve[p].item()
+                    if best * args.pcstop >= mx:
+                        break
             print(f"Optimal PC count (pcstop={args.pcstop}): {optimal_pcs}")
 
         # 7. Refit with optimal PC count and save
@@ -2350,6 +2391,7 @@ def main():
             volume_shape=volume_shape,
             affine=affine,
             voxel_mask=voxel_mask,
+            nifti_header=nifti_header,
         )
 
         # Also save PC selection curve
@@ -2371,30 +2413,45 @@ def main():
                 vol[mask_1d] = data_1d
                 return vol
 
-            # Save noise pool mask (low R² voxels used for PC extraction)
-            noise_pool_vol = map_to_volume(
-                noise_pool_mask.cpu().numpy().astype(float), mask_flat_np
-            )
-            save_nifti(noise_pool_vol.reshape(volume_shape), output_path=f"{args.prefix}_noise_pool_mask{_nii_ext}", affine=affine)
-            output_files["noise_pool_mask"] = f"{args.prefix}_noise_pool_mask{_nii_ext}"
-            print(f"  Saved: noise pool mask ({noise_pool_mask.sum().item():,} voxels)")
-
-            # Save initial criteria mask (voxels above R² threshold in any PC count)
-            # This is the initial criteria mask before refinement
-            initial_criteria_vol = map_to_volume(
-                criteria_mask.cpu().numpy().astype(float), mask_flat_np
-            )
-            save_nifti(initial_criteria_vol.reshape(volume_shape), output_path=f"{args.prefix}_initial_criteria_mask{_nii_ext}", affine=affine)
-            output_files["initial_criteria_mask"] = f"{args.prefix}_initial_criteria_mask{_nii_ext}"
-            print(f"  Saved: initial criteria mask ({criteria_mask.sum().item():,} voxels)")
-
-            # Save initial cross-validated R² (before denoising)
-            initial_r2_vol = map_to_volume(initial_r2.cpu().numpy(), mask_flat_np)
-            save_nifti(initial_r2_vol.reshape(volume_shape), output_path=f"{args.prefix}_initial_xval_r2{_nii_ext}", affine=affine)
-            output_files["initial_xval_r2"] = f"{args.prefix}_initial_xval_r2{_nii_ext}"
-            print("  Saved: initial cross-validated R²")
+            def _to_vol(data_1d):
+                return map_to_volume(data_1d, mask_flat_np).reshape(volume_shape)
         else:
-            print("  Warning: No mask available, skipping diagnostic mask saves")
+            # No mask — data already has all voxels, just reshape
+            def _to_vol(data_1d):
+                return data_1d.reshape(volume_shape)
+
+        # Save noise pool mask (low R² voxels used for PC extraction)
+        noise_pool_vol = _to_vol(noise_pool_mask.cpu().numpy().astype(np.float32))
+        save_nifti(noise_pool_vol, output_path=f"{args.prefix}_noise_pool_mask{_nii_ext}", affine=affine, header=nifti_header)
+        output_files["noise_pool_mask"] = f"{args.prefix}_noise_pool_mask{_nii_ext}"
+        print(f"  Saved: noise pool mask ({noise_pool_mask.sum().item():,} voxels)")
+
+        # Save initial criteria mask (voxels above R² threshold in any PC count)
+        initial_criteria_vol = _to_vol(criteria_mask.cpu().numpy().astype(np.float32))
+        save_nifti(initial_criteria_vol, output_path=f"{args.prefix}_initial_criteria_mask{_nii_ext}", affine=affine, header=nifti_header)
+        output_files["initial_criteria_mask"] = f"{args.prefix}_initial_criteria_mask{_nii_ext}"
+        print(f"  Saved: initial criteria mask ({criteria_mask.sum().item():,} voxels)")
+
+        # Save initial cross-validated R² (before denoising)
+        initial_r2_vol = _to_vol(initial_r2.cpu().numpy())
+        save_nifti(initial_r2_vol, output_path=f"{args.prefix}_initial_xval_r2{_nii_ext}", affine=affine, header=nifti_header)
+        output_files["initial_xval_r2"] = f"{args.prefix}_initial_xval_r2{_nii_ext}"
+        print("  Saved: initial cross-validated R²")
+
+        # Save per-run selected PCs as text files (for ridge -denoise consumption)
+        for run_idx in range(n_runs):
+            pcs = noise_pcs_per_run[run_idx]
+            pcs_np = pcs.cpu().numpy() if torch.is_tensor(pcs) else pcs
+            n_selected = min(optimal_pcs, pcs_np.shape[1])
+            selected_pcs = pcs_np[:, :n_selected]
+            pc_txt_path = f"{args.prefix}_run{run_idx + 1:02d}_selected_PCs.txt"
+            with open(pc_txt_path, "w") as f:
+                f.write(f"# Selected noise PCs for run {run_idx + 1}\n")
+                f.write(f"# n_components: {n_selected}\n")
+                f.write(f"# Shape: {selected_pcs.shape[0]} timepoints x {selected_pcs.shape[1]} PCs\n")
+                np.savetxt(f, selected_pcs, fmt="%.6f", delimiter="\t")
+            output_files[f"run{run_idx + 1}_selected_pcs_txt"] = pc_txt_path
+        print(f"  Saved: per-run selected PCs ({optimal_pcs} PCs) for {n_runs} runs")
 
         # Save metadata
         metadata = {
@@ -2734,6 +2791,7 @@ def main():
         condition_labels=condition_labels,
         save_scree_plot=args.scree_plot,
         nii_ext=_nii_ext,
+        nifti_header=nifti_header,
     )
 
     if design_plot_path is not None:
@@ -2843,6 +2901,7 @@ def main():
                 n_regressors=n_total_regs_initial,
                 bootstrap_se=initial_bootstrap_se,
                 nii_ext=_nii_ext,
+                nifti_header=nifti_header,
             )
             output_files.update(initial_files)
 
@@ -2914,6 +2973,7 @@ def main():
                 n_timepoints=n_timepoints,
                 n_regressors=n_total_regs_final,
                 bootstrap_se=final_bootstrap_se,
+                nifti_header=nifti_header,
                 nii_ext=_nii_ext,
             )
             output_files.update(final_files)
@@ -2985,6 +3045,7 @@ def main():
             voxel_mask=voxel_mask,
             create_plots=True,
             nii_ext=_nii_ext,
+            nifti_header=nifti_header,
         )
         output_files.update(snr_files)
 

@@ -2,9 +2,26 @@
 
 from __future__ import annotations
 
-from . import align, glm, ica, moco, slicetime, warp
+from . import (
+    align,
+    crossalign,
+    glm,
+    glmsingle_denoise,
+    glmsingle_hrf,
+    glmsingle_matlab,
+    glmsingle_prep,
+    glmsingle_ridge,
+    ica,
+    ica_single,
+    moco,
+    slicetime,
+    warp,
+)
 
-ALL_STAGES = [moco, slicetime, align, warp, glm, ica]
+ALL_STAGES = [
+    moco, slicetime, crossalign, align, warp, glm, ica, ica_single,
+    glmsingle_prep, glmsingle_matlab, glmsingle_hrf, glmsingle_denoise, glmsingle_ridge,
+]
 
 STAGE_MAP = {s.name: s for s in ALL_STAGES}
 

@@ -81,7 +81,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
-def run_afni(ctx: BenchmarkContext) -> float:
+def run_ref(ctx: BenchmarkContext) -> float:
     """Run AFNI 3dvolreg + 3dTstat for all task/run combos."""
     from pathlib import Path
 
@@ -89,7 +89,7 @@ def run_afni(ctx: BenchmarkContext) -> float:
     for task in TASKS:
         for run in RUNS:
             out = _afni_moco_path(ctx, task, run)
-            if Path(out).exists() and not ctx.force_afni:
+            if Path(out).exists() and not ctx.force_ref:
                 continue
             elapsed, _ = run_timed(
                 f"3dvolreg -overwrite -heptic "

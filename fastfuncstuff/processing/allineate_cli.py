@@ -94,8 +94,17 @@ Examples:
                                  "lpc=local Pearson signed (best for "
                                  "non-similar contrast, e.g. EPI-to-anat)")
     cost_group.add_argument("-lpa_sigma", type=float, default=4.0,
-                            help="Gaussian sigma for LPA/LPC neighborhoods "
-                                 "in voxels (default: 4.0)")
+                            help="Kernel parameter for LPA/LPC neighborhoods "
+                                 "in voxels. For gauss: sigma. "
+                                 "For box: half-width radius. "
+                                 "Use 0 with -lpa_kernel box to auto-size "
+                                 "to ~500 voxels (default: 4.0)")
+    cost_group.add_argument("-lpa_kernel", choices=["gauss", "box"],
+                            default="gauss",
+                            help="LPA/LPC neighborhood kernel: "
+                                 "gauss=Gaussian weighting (default), "
+                                 "box=uniform weighting (like AFNI's "
+                                 "space-filling blocks)")
 
     # --- Interpolation ---
     interp_group = parser.add_argument_group("Interpolation")
@@ -259,10 +268,21 @@ def main(argv: list[str] | None = None) -> None:
         if verb >= 1:
             print("Mode: slow (300/400 iters, 2000 Powell evals)")
 
+    # Auto-size box radius if requested
+    lpa_sigma = args.lpa_sigma
+    if args.lpa_kernel == "box" and lpa_sigma <= 0:
+        from .cost import auto_box_radius
+        lpa_sigma = float(auto_box_radius(500))
+        if verb >= 1:
+            side = 2 * int(lpa_sigma) + 1
+            print(f"Auto box radius: {int(lpa_sigma)} "
+                  f"({side}³ = {side**3} voxels)")
+
     config = AffineAlignConfig(
         dof=dof,
         cost=args.cost,
-        lpa_sigma=args.lpa_sigma,
+        lpa_sigma=lpa_sigma,
+        lpa_kernel=args.lpa_kernel,
         twopass=twopass,
         coarse_range=args.coarse_range,
         coarse_step=args.coarse_step,

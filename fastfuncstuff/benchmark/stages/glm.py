@@ -32,37 +32,31 @@ def _scaled_input(ctx: BenchmarkContext, run: int) -> Path:
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
-    p = ctx.processing_dir
 
     if ctx.validate_only:
+        afni = ctx.afni_glm_dir
+        ffs = ctx.ffs_glm_dir
         # OLS
-        if not (p / "afni_stats_localizer.nii.gz").exists():
-            missing.append(str(p / "afni_stats_localizer.nii.gz"))
-        if not (p / "ffs_stats_localizer.nii.gz").exists():
-            missing.append(str(p / "ffs_stats_localizer.nii.gz"))
-
-        # REML - AFNI produces BRIK/HEAD
-        afni_reml = p / "afni_stats_localizer_REML+tlrc.HEAD"
-        if not afni_reml.exists():
-            missing.append(str(afni_reml))
-        if not (p / "ffs_stats_localizer_REML.nii.gz").exists():
-            missing.append(str(p / "ffs_stats_localizer_REML.nii.gz"))
-
+        if not (afni / "stats_localizer.nii.gz").exists():
+            missing.append(str(afni / "stats_localizer.nii.gz"))
+        if not (ffs / "stats_localizer.nii.gz").exists():
+            missing.append(str(ffs / "stats_localizer.nii.gz"))
+        # REML
+        if not (afni / "stats_localizer_REML+tlrc.HEAD").exists():
+            missing.append(str(afni / "stats_localizer_REML+tlrc.HEAD"))
+        if not (ffs / "stats_localizer_REML.nii.gz").exists():
+            missing.append(str(ffs / "stats_localizer_REML.nii.gz"))
         # REML var
-        afni_var = p / "afni_stats_localizer_REMLvar+tlrc.HEAD"
-        if not afni_var.exists():
-            missing.append(str(afni_var))
-        if not (p / "ffs_stats_localizer_REML_var.nii.gz").exists():
-            missing.append(str(p / "ffs_stats_localizer_REML_var.nii.gz"))
+        if not (afni / "stats_localizer_REMLvar+tlrc.HEAD").exists():
+            missing.append(str(afni / "stats_localizer_REMLvar+tlrc.HEAD"))
+        if not (ffs / "stats_localizer_REML_var.nii.gz").exists():
+            missing.append(str(ffs / "stats_localizer_REML_var.nii.gz"))
     else:
-        # Need scaled inputs and timing files
+        # Need warped MNI data (scaling is done as part of run_ref)
         for run in RUNS:
-            si = _scaled_input(ctx, run)
-            if not si.exists():
-                missing.append(str(si))
-        timing_dir = p / "timing_files"
-        if not timing_dir.exists():
-            missing.append(str(timing_dir))
+            src = ctx.processing_dir / f"afni_mni_task-localizer_run-{run}.nii.gz"
+            if not src.exists():
+                missing.append(str(src))
 
     return missing
 
@@ -91,8 +85,7 @@ def _prepare_scaled_inputs(ctx: BenchmarkContext) -> None:
 
 def _prepare_timing_files(ctx: BenchmarkContext) -> None:
     """Extract timing files from events TSVs if not already done."""
-    p = ctx.processing_dir
-    timing_dir = p / "timing_files"
+    timing_dir = ctx.timing_dir
     if timing_dir.exists() and any(timing_dir.iterdir()):
         return
     timing_dir.mkdir(exist_ok=True)
@@ -104,13 +97,15 @@ def _prepare_timing_files(ctx: BenchmarkContext) -> None:
         f"timing_tool.py -write_multi_timing {timing_dir}/onsets.localizer. "
         f"-multi_timing_ncol_tsv {events}",
         label="timing_tool.py",
-        cwd=p,
+        cwd=ctx.processing_dir,
     )
 
 
-def run_afni(ctx: BenchmarkContext) -> float:
+def run_ref(ctx: BenchmarkContext) -> float:
     """Run 3dDeconvolve + 3dREMLfit."""
     p = ctx.processing_dir
+    afni = ctx.afni_glm_dir
+    afni.mkdir(parents=True, exist_ok=True)
 
     _prepare_scaled_inputs(ctx)
     _prepare_timing_files(ctx)
@@ -118,15 +113,14 @@ def run_afni(ctx: BenchmarkContext) -> float:
     total = 0.0
 
     # 3dDeconvolve (OLS)
-    afni_ols = p / "afni_stats_localizer.nii.gz"
-    if not afni_ols.exists() or ctx.force_afni:
+    afni_ols = afni / "stats_localizer.nii.gz"
+    if not afni_ols.exists() or ctx.force_ref:
         inputs = " ".join(str(_scaled_input(ctx, r)) for r in RUNS)
-        timing_dir = p / "timing_files"
 
         stim_args = ""
         for i, label in enumerate(STIM_LABELS, 1):
             stim_args += (
-                f"-stim_times {i} {timing_dir}/onsets.localizer.times.{label}.txt "
+                f"-stim_times {i} {ctx.timing_dir}/onsets.localizer.times.{label}.txt "
                 f"'SPMG1(3)' -stim_label {i} {label} "
             )
 
@@ -143,19 +137,19 @@ def run_afni(ctx: BenchmarkContext) -> float:
             f"{glt_args} "
             f"-tout -x1D X.xmat.1D -bucket {afni_ols}",
             label="3dDeconvolve",
-            cwd=p,
+            cwd=afni,
         )
         total += elapsed
 
     # 3dREMLfit
-    afni_reml = p / "afni_stats_localizer_REML+tlrc.HEAD"
-    if not afni_reml.exists() or ctx.force_afni:
-        reml_cmd = p / "afni_stats_localizer.REML_cmd"
+    afni_reml = afni / "stats_localizer_REML+tlrc.HEAD"
+    if not afni_reml.exists() or ctx.force_ref:
+        reml_cmd = afni / "stats_localizer.REML_cmd"
         if reml_cmd.exists():
             elapsed, _ = run_timed(
                 f"tcsh {reml_cmd} -overwrite -nofdr",
                 label="3dREMLfit",
-                cwd=p,
+                cwd=afni,
             )
             total += elapsed
 
@@ -164,39 +158,44 @@ def run_afni(ctx: BenchmarkContext) -> float:
 
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_reml (OLS + REML)."""
-    p = ctx.processing_dir
+    afni = ctx.afni_glm_dir
+    ffs = ctx.ffs_glm_dir
+    ffs.mkdir(parents=True, exist_ok=True)
+
     inputs = " ".join(str(_scaled_input(ctx, r)) for r in RUNS)
+    # X.xmat.1D produced by 3dDeconvolve in afni_glm_dir
+    xmat = afni / "X.xmat.1D"
     total = 0.0
 
     # OLS
-    ffs_ols = p / "ffs_stats_localizer.nii.gz"
+    ffs_ols = ffs / "stats_localizer.nii.gz"
     if not ffs_ols.exists() or ctx.force_ffs:
         elapsed, _ = run_timed(
             f"ffs_reml "
             f"-input {inputs} "
-            f"-matrix X.xmat.1D "
+            f"-matrix {xmat} "
             f"-use_double "
             f"-Obuck {ffs_ols} "
             f"-tout",
             label="ffs_reml OLS",
-            cwd=p,
+            cwd=ffs,
         )
         total += elapsed
 
     # REML
-    ffs_reml = p / "ffs_stats_localizer_REML.nii.gz"
-    ffs_var = p / "ffs_stats_localizer_REML_var.nii.gz"
+    ffs_reml = ffs / "stats_localizer_REML.nii.gz"
+    ffs_var = ffs / "stats_localizer_REML_var.nii.gz"
     if not ffs_reml.exists() or ctx.force_ffs:
         elapsed, _ = run_timed(
             f"ffs_reml "
             f"-input {inputs} "
-            f"-matrix X.xmat.1D "
+            f"-matrix {xmat} "
             f"-use_double "
             f"-Rbuck {ffs_reml} "
             f"-Rvar {ffs_var} "
             f"-tout",
             label="ffs_reml REML",
-            cwd=p,
+            cwd=ffs,
         )
         total += elapsed
 
@@ -205,24 +204,25 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 def validate(ctx: BenchmarkContext) -> dict:
     """Compare OLS and REML results between AFNI and FFS."""
-    p = ctx.processing_dir
+    afni = ctx.afni_glm_dir
+    ffs = ctx.ffs_glm_dir
 
     # OLS comparison
     ols_result = compare_bucket_volumes(
-        p / "afni_stats_localizer.nii.gz",
-        p / "ffs_stats_localizer.nii.gz",
+        afni / "stats_localizer.nii.gz",
+        ffs / "stats_localizer.nii.gz",
     )
 
     # REML comparison - AFNI uses BRIK/HEAD format
     reml_result = compare_bucket_volumes(
-        p / "afni_stats_localizer_REML+tlrc.HEAD",
-        p / "ffs_stats_localizer_REML.nii.gz",
+        afni / "stats_localizer_REML+tlrc.HEAD",
+        ffs / "stats_localizer_REML.nii.gz",
     )
 
     # REML variance parameters
     var_result = compare_bucket_volumes(
-        p / "afni_stats_localizer_REMLvar+tlrc.HEAD",
-        p / "ffs_stats_localizer_REML_var.nii.gz",
+        afni / "stats_localizer_REMLvar+tlrc.HEAD",
+        ffs / "stats_localizer_REML_var.nii.gz",
     )
 
     passed = (

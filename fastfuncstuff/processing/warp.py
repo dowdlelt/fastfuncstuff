@@ -138,7 +138,12 @@ class QwarpConfig:
     If set, displacement fields are clamped after each level."""
 
     lpa_sigma: float = 4.0
-    """Gaussian sigma (voxels) for LPA local neighborhoods. Effective radius ~3*sigma."""
+    """Kernel parameter (voxels) for LPA local neighborhoods.
+    For ``lpa_kernel="gauss"``: Gaussian sigma (effective radius ~3*sigma).
+    For ``lpa_kernel="box"``: half-width radius (cube side = 2*r+1)."""
+
+    lpa_kernel: str = "gauss"
+    """Kernel type for LPA neighborhoods: ``"gauss"`` or ``"box"``."""
 
     level_stop_tol: float = 0.0
     """Early stopping: if a level improves cost by less than this fraction, stop
@@ -958,6 +963,7 @@ def _improve_warp_batched(
             corr = batched_lpa_cost(
                 base_patches, warped_vals, weight_patches,
                 nzh, nyh, nxh, sigma=config.lpa_sigma,
+                kernel_type=config.lpa_kernel,
             )
         else:
             corr = batch_incor.evaluate(base_patches, warped_vals, weight_patches)

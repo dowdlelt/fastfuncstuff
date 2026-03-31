@@ -93,6 +93,38 @@ def test_ica_validation():
     _run_validation("ica", expect_fail=True)
 
 
+# --- GLMsingle comparison tests (need MATLAB .mat file) ---
+
+
+@pytest.mark.benchmark_validation
+@pytest.mark.skipif(
+    not _has_stage_outputs("glmsingle_hrf"), reason="GLMsingle comparison data not found"
+)
+def test_glmsingle_hrf_validation():
+    """Validate HRF selection: GLMsingle Type B vs ffs_hrfopt -single_trials."""
+    _run_validation("glmsingle_hrf")
+
+
+@pytest.mark.benchmark_validation
+@pytest.mark.skipif(
+    not _has_stage_outputs("glmsingle_denoise"),
+    reason="GLMsingle denoise comparison data not found",
+)
+def test_glmsingle_denoise_validation():
+    """Validate PC denoising: GLMsingle Type C vs ffs_denoise -single_trials."""
+    _run_validation("glmsingle_denoise")
+
+
+@pytest.mark.benchmark_validation
+@pytest.mark.skipif(
+    not _has_stage_outputs("glmsingle_ridge"),
+    reason="GLMsingle ridge comparison data not found",
+)
+def test_glmsingle_ridge_validation():
+    """Validate fracridge: GLMsingle Type D vs ffs_ridge -single_trials."""
+    _run_validation("glmsingle_ridge")
+
+
 # --- Full execution tests (slow, need AFNI tools) ---
 
 

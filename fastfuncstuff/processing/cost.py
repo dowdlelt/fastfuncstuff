@@ -103,12 +103,55 @@ def _gauss_kernel_1d(sigma: float, device: torch.device) -> Tensor:
     return k / k.sum()
 
 
-def _separable_smooth_3d(vol: Tensor, sigma: float) -> Tensor:
-    """Apply 3D Gaussian smoothing using separable convolution.
+def _box_kernel_1d(radius: int, device: torch.device) -> Tensor:
+    """Create a 1D box (uniform) kernel with half-width ``radius``.
+
+    Returns a normalized kernel of length ``2*radius + 1`` where every
+    element has the same weight.  When applied separably along each axis
+    this gives uniform weighting inside a cube of side ``2*radius + 1``.
+    """
+    if radius < 1:
+        radius = 1
+    size = 2 * radius + 1
+    return torch.ones(size, dtype=torch.float32, device=device) / size
+
+
+def _make_kernel_1d(
+    kernel_type: str, param: float, device: torch.device,
+) -> Tensor:
+    """Create a 1D kernel from a type string and parameter.
+
+    Args:
+        kernel_type: ``"gauss"`` (param=sigma) or ``"box"`` (param=radius).
+        param: Sigma for Gaussian, half-width radius for box.
+        device: Torch device.
+    """
+    if kernel_type == "box":
+        return _box_kernel_1d(int(round(param)), device)
+    return _gauss_kernel_1d(param, device)
+
+
+def auto_box_radius(n_voxels_target: int = 500) -> int:
+    """Compute box kernel half-width that gives ~n_voxels_target in a cube.
+
+    The cube has side ``2*r + 1`` and ``(2*r+1)^3`` voxels.  We solve for
+    the smallest ``r`` where ``(2*r+1)^3 >= n_voxels_target``.
+    """
+    side = round(n_voxels_target ** (1.0 / 3.0))
+    if side % 2 == 0:
+        side += 1  # ensure odd
+    r = side // 2
+    return max(r, 1)
+
+
+def _separable_smooth_3d(vol: Tensor, sigma: float,
+                         kernel_type: str = "gauss") -> Tensor:
+    """Apply 3D smoothing using separable convolution.
 
     Args:
         vol: (1, 1, D, H, W) or (D, H, W) volume.
-        sigma: Gaussian sigma in voxels.
+        sigma: Kernel parameter — Gaussian sigma or box radius, in voxels.
+        kernel_type: ``"gauss"`` or ``"box"``.
 
     Returns:
         Smoothed volume, same shape as input.
@@ -117,7 +160,7 @@ def _separable_smooth_3d(vol: Tensor, sigma: float) -> Tensor:
     if squeeze:
         vol = vol[None, None]
 
-    kernel = _gauss_kernel_1d(sigma, vol.device)
+    kernel = _make_kernel_1d(kernel_type, sigma, vol.device)
     radius = kernel.shape[0] // 2
 
     # Z
@@ -143,15 +186,15 @@ def _separable_smooth_3d(vol: Tensor, sigma: float) -> Tensor:
 
 def lpa_correlation(
     base: Tensor, source: Tensor, weight: Tensor | None = None,
-    sigma: float = 4.0,
+    sigma: float = 4.0, kernel_type: str = "gauss",
 ) -> Tensor:
     """Compute Local Pearson Absolute (LPA) correlation.
 
     For each voxel, computes the absolute Pearson correlation in a
-    Gaussian-weighted local neighborhood. The overall cost is the
-    weighted mean of local absolute correlations.
+    local neighborhood. The overall cost is the weighted mean of local
+    absolute correlations.
 
-    This is computed efficiently using separable Gaussian convolutions:
+    This is computed efficiently using separable convolutions:
       local_mean_x = smooth(w*x) / smooth(w)
       local_var_x  = smooth(w*x*x) / smooth(w) - local_mean_x^2
       local_cov_xy = smooth(w*x*y) / smooth(w) - local_mean_x * local_mean_y
@@ -161,7 +204,9 @@ def lpa_correlation(
         base: (nz, ny, nx) base image.
         source: (nz, ny, nx) source/warped image.
         weight: (nz, ny, nx) optional weight image.
-        sigma: Gaussian neighborhood sigma in voxels.
+        sigma: Kernel parameter — Gaussian sigma or box radius, in voxels.
+        kernel_type: ``"gauss"`` (Gaussian weighting) or ``"box"``
+            (uniform weighting, like AFNI's space-filling blocks).
 
     Returns:
         Scalar: mean absolute local correlation (higher = better).
@@ -174,15 +219,17 @@ def lpa_correlation(
     x = base
     y = source
 
-    # Smoothed weighted statistics (all as 3D volumes)
-    sw = _separable_smooth_3d(w, sigma)
-    sw = sw.clamp(min=1e-10)
+    def _sm(v: Tensor) -> Tensor:
+        return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-    swx = _separable_smooth_3d(w * x, sigma)
-    swy = _separable_smooth_3d(w * y, sigma)
-    swxx = _separable_smooth_3d(w * x * x, sigma)
-    swyy = _separable_smooth_3d(w * y * y, sigma)
-    swxy = _separable_smooth_3d(w * x * y, sigma)
+    # Smoothed weighted statistics (all as 3D volumes)
+    sw = _sm(w).clamp(min=1e-10)
+
+    swx = _sm(w * x)
+    swy = _sm(w * y)
+    swxx = _sm(w * x * x)
+    swyy = _sm(w * y * y)
+    swxy = _sm(w * x * y)
 
     # Local means
     mx = swx / sw
@@ -210,7 +257,7 @@ def lpa_correlation(
 
 def lpc_correlation(
     base: Tensor, source: Tensor, weight: Tensor | None = None,
-    sigma: float = 4.0,
+    sigma: float = 4.0, kernel_type: str = "gauss",
 ) -> Tensor:
     """Compute Local Pearson Correlation (LPC) for cross-modality alignment.
 
@@ -227,7 +274,8 @@ def lpc_correlation(
         base: (nz, ny, nx) base image.
         source: (nz, ny, nx) source/warped image.
         weight: (nz, ny, nx) optional weight image.
-        sigma: Gaussian neighborhood sigma in voxels.
+        sigma: Kernel parameter — Gaussian sigma or box radius, in voxels.
+        kernel_type: ``"gauss"`` or ``"box"``.
 
     Returns:
         Scalar: -mean(z*|z|) (higher = better, matching our convention).
@@ -240,14 +288,16 @@ def lpc_correlation(
     x = base
     y = source
 
-    sw = _separable_smooth_3d(w, sigma)
-    sw = sw.clamp(min=1e-10)
+    def _sm(v: Tensor) -> Tensor:
+        return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-    swx = _separable_smooth_3d(w * x, sigma)
-    swy = _separable_smooth_3d(w * y, sigma)
-    swxx = _separable_smooth_3d(w * x * x, sigma)
-    swyy = _separable_smooth_3d(w * y * y, sigma)
-    swxy = _separable_smooth_3d(w * x * y, sigma)
+    sw = _sm(w).clamp(min=1e-10)
+
+    swx = _sm(w * x)
+    swy = _sm(w * y)
+    swxx = _sm(w * x * x)
+    swyy = _sm(w * y * y)
+    swxy = _sm(w * x * y)
 
     mx = swx / sw
     my = swy / sw
@@ -273,10 +323,11 @@ def lpc_correlation(
 
 def lpa_cost_patch(
     base_patch: Tensor, source_patch: Tensor, weight_patch: Tensor,
-    sigma: float = 2.5,
+    sigma: float = 2.5, kernel_type: str = "gauss",
 ) -> Tensor:
     """LPA correlation on a single patch (3D). Returns scalar, differentiable."""
-    return lpa_correlation(base_patch, source_patch, weight_patch, sigma=sigma)
+    return lpa_correlation(base_patch, source_patch, weight_patch,
+                           sigma=sigma, kernel_type=kernel_type)
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +378,12 @@ def batched_lpa_cost(
     weight_patches: Tensor,
     nzh: int, nyh: int, nxh: int,
     sigma: float = 4.0,
+    kernel_type: str = "gauss",
 ) -> Tensor:
     """Compute LPA cost for B patches in parallel. Fully differentiable.
 
-    Implements AFNI-style Local Pearson Absolute correlation using
-    Gaussian-smoothed local statistics (continuous approximation of
-    AFNI's blok-based approach, much faster on GPU).
+    Implements Local Pearson Absolute correlation using separable
+    convolutions for local statistics computation.
 
     Fisher Z-transform (atanh) and z*|z| weighting match AFNI's aggregation.
 
@@ -341,7 +392,8 @@ def batched_lpa_cost(
         source_patches: (B, V) warped source patch data.
         weight_patches: (B, V) weight data.
         nzh, nyh, nxh: Patch dimensions (V = nzh * nyh * nxh).
-        sigma: Gaussian neighborhood sigma in voxels.
+        sigma: Kernel parameter — Gaussian sigma or box radius, in voxels.
+        kernel_type: ``"gauss"`` or ``"box"``.
 
     Returns:
         (B,) correlation values (higher = better match). Differentiable.
@@ -355,7 +407,7 @@ def batched_lpa_cost(
     w = weight_patches.reshape(B, 1, nzh, nyh, nxh)
 
     # Build kernel once
-    kernel = _gauss_kernel_1d(sigma, device)
+    kernel = _make_kernel_1d(kernel_type, sigma, device)
 
     # Smoothed weighted statistics (6 convolutions, each batched)
     sw = _batched_separable_smooth_3d(w, kernel).clamp(min=1e-10)

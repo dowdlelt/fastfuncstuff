@@ -385,6 +385,10 @@ def create_single_trial_design(
                 trial_info.append((cond_idx, run_idx, trial_idx, onset_time))
                 total_trials += 1
 
+    # Sort trials chronologically by absolute onset time
+    # This matches GLMsingle's convention and makes betas directly comparable
+    trial_info.sort(key=lambda x: run_starts[x[1]] * tr + x[3])
+
     # Generate trial labels and condition IDs
     # Track repeat number per condition (how many times we've seen each condition)
     trial_labels = []
@@ -606,6 +610,18 @@ def create_single_trial_design(
 
         # Stack: (n_hrfs, n_timepoints, n_trials)
         designs_stacked = torch.stack(designs_by_hrf, dim=0)
+
+        # Enforce run boundaries: zero HRF tails that bleed across runs
+        run_ends = run_starts[1:] + [n_timepoints]
+        for run_idx in range(len(run_starts)):
+            trial_mask_run = trial_run_ids == run_idx
+            if trial_mask_run.any():
+                run_start_tp = run_starts[run_idx]
+                run_end_tp = run_ends[run_idx]
+                if run_start_tp > 0:
+                    designs_stacked[:, :run_start_tp, trial_mask_run] = 0.0
+                if run_end_tp < n_timepoints:
+                    designs_stacked[:, run_end_tp:, trial_mask_run] = 0.0
 
         # Return per-HRF designs — NOT expanded to per-voxel!
         # Downstream code groups voxels by hrf_index and uses designs_stacked[hrf_idx]

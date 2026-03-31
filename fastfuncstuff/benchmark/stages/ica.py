@@ -19,18 +19,20 @@ THRESHOLDS = {
 }
 
 
+def _melodic_dir(ctx: BenchmarkContext, dataset: str) -> Path:
+    return ctx.melodic_ica_dir / f"all_{dataset}_melodic.ica"
+
+
 def _melodic_ic(ctx: BenchmarkContext, dataset: str) -> Path:
-    """Path to melodic IC maps."""
-    return ctx.processing_dir / f"all_{dataset}_melodic.ica" / "melodic_IC.nii.gz"
+    return _melodic_dir(ctx, dataset) / "melodic_IC.nii.gz"
 
 
 def _melodic_mask(ctx: BenchmarkContext, dataset: str) -> Path:
-    return ctx.processing_dir / f"all_{dataset}_melodic.ica" / "mask.nii.gz"
+    return _melodic_dir(ctx, dataset) / "mask.nii.gz"
 
 
 def _ffs_ic(ctx: BenchmarkContext, dataset: str) -> Path:
-    """Path to FFS ICA maps."""
-    return ctx.processing_dir / f"all_{dataset}_ffs_concat_ica_maps.nii.gz"
+    return ctx.ffs_ica_dir / f"all_{dataset}_concat_ica_maps.nii.gz"
 
 
 def _mni_inputs(ctx: BenchmarkContext, dataset: str) -> list[Path]:
@@ -61,12 +63,13 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
-def run_afni(ctx: BenchmarkContext) -> float:
+def run_ref(ctx: BenchmarkContext) -> float:
     """Run FSL melodic for both datasets."""
+    ctx.melodic_ica_dir.mkdir(parents=True, exist_ok=True)
     total = 0.0
     for dataset in DATASETS:
-        out_dir = ctx.processing_dir / f"all_{dataset}_melodic.ica"
-        if _melodic_ic(ctx, dataset).exists() and not ctx.force_afni:
+        out_dir = _melodic_dir(ctx, dataset)
+        if _melodic_ic(ctx, dataset).exists() and not ctx.force_ref:
             continue
         inputs = ",".join(str(p) for p in _mni_inputs(ctx, dataset))
         elapsed, _ = run_timed(
@@ -75,7 +78,7 @@ def run_afni(ctx: BenchmarkContext) -> float:
             f"--report --guireport={out_dir}/report.html "
             f"-d 0 --mmthresh=0.5 --Oall --Ostats -v",
             label=f"melodic {dataset}",
-            cwd=ctx.processing_dir,
+            cwd=ctx.melodic_ica_dir,
         )
         total += elapsed
     return total
@@ -83,6 +86,7 @@ def run_afni(ctx: BenchmarkContext) -> float:
 
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_ica -temp_concat for both datasets."""
+    ctx.ffs_ica_dir.mkdir(parents=True, exist_ok=True)
     total = 0.0
     for dataset in DATASETS:
         if _ffs_ic(ctx, dataset).exists() and not ctx.force_ffs:
@@ -94,9 +98,9 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"ffs_ica -input {inputs} "
             f"{mask_arg} "
             f"-temp_concat "
-            f"-prefix all_{dataset}_ffs -verbose",
+            f"-prefix {ctx.ffs_ica_dir / f'all_{dataset}'} -verbose",
             label=f"ffs_ica {dataset}",
-            cwd=ctx.processing_dir,
+            cwd=ctx.ffs_ica_dir,
         )
         total += elapsed
     return total
@@ -106,7 +110,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     """Compare ICA components between melodic and ffs_ica."""
     results = {}
 
-    for dataset in ["rest", "localizer"]:
+    for dataset in DATASETS:
         melodic_path = _melodic_ic(ctx, dataset)
         ffs_path = _ffs_ic(ctx, dataset)
         mask_path = _melodic_mask(ctx, dataset)
@@ -126,7 +130,6 @@ def validate(ctx: BenchmarkContext) -> dict:
         and overall_cov >= THRESHOLDS["coverage_0.5"]
     )
 
-    # Component count comparison
     comp_counts = {
         ds: (r["n_components_a"], r["n_components_b"]) for ds, r in results.items()
     }

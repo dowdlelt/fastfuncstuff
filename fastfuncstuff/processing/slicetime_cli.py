@@ -18,7 +18,7 @@ import torch
 
 from fastfuncstuff.io.afni import get_tr_from_file
 from .io import load_image, save_image
-from .slicetime import load_slice_timing, slicetime_correct
+from .slicetime import load_slice_timing, slicetime_correct, temporal_resample
 
 
 def _resolve_tr(
@@ -106,6 +106,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-ignore", type=int, default=0,
         help="Number of initial volumes to skip (pass through unchanged)",
     )
+    parser.add_argument(
+        "-resample", type=float, default=None, metavar="TR_NEW",
+        help="After slice-timing correction, resample to a new TR grid "
+             "(seconds). E.g., -resample 1.5 resamples 1.75s data to 1.5s. "
+             "Output NIfTI header TR is updated. Useful for TR-locking onsets "
+             "for GLMsingle-style analysis.",
+    )
 
     # Interpolation method — mutually exclusive flags
     interp = parser.add_mutually_exclusive_group()
@@ -190,11 +197,36 @@ def main(argv: list[str] | None = None) -> None:
         verbose=verb >= 1,
     )
 
+    # Optional temporal resampling to a new TR grid
+    output_tr = tr
+    if args.resample is not None:
+        tr_new = args.resample
+        if tr_new <= 0:
+            raise ValueError(f"-resample must be positive, got {tr_new}")
+        if verb >= 1:
+            print(f"Resampling: {tr:.4f}s -> {tr_new:.4f}s")
+        corrected = temporal_resample(
+            corrected,
+            tr_old=tr,
+            tr_new=tr_new,
+            method="cubic",
+            device=device,
+            verbose=verb >= 1,
+        )
+        output_tr = tr_new
+
+    # Update TR in header before saving
+    if header is not None and header.get("header") is not None:
+        header["header"].set_xyzt_units(xyz="mm", t="sec")
+        header["header"]["pixdim"][4] = output_tr
+
     # Save
     save_image(corrected, args.prefix, header_info=header)
 
     if verb >= 1:
         print(f"Saved: {args.prefix}")
+        if args.resample is not None:
+            print(f"  Output TR: {output_tr:.4f}s ({corrected.shape[0]} volumes)")
         print(f"Time: {time.time() - t0:.2f}s")
 
 

@@ -536,6 +536,9 @@ def compute_r2_metric(
                Traditional R², can be negative if prediction is worse than mean
         'corr': Pearson correlation coefficient (range: -1 to 1)
         'corr2': Pearson correlation squared (range: 0 to 1)
+        'sse': Sum of squared errors (lower = better). Equivalent to
+               GLMsingle's "badness" metric. For hyperparameter selection,
+               minimize SSE rather than maximize R².
 
     Returns
     -------
@@ -560,7 +563,16 @@ def compute_r2_metric(
     if y_true.shape != y_pred.shape:
         raise ValueError(f"Shape mismatch: y_true {y_true.shape} vs y_pred {y_pred.shape}")
 
-    if metric == "cod":
+    if metric == "sse":
+        # Sum of squared errors (lower = better).
+        # Equivalent to GLMsingle's "badness" metric (calcbadness in
+        # GLMestimatesingletrial.m). Used for hyperparameter selection in
+        # beta-space CV: predicted condition-average betas vs held-out trial
+        # betas. Selection minimizes SSE rather than maximizing R².
+        r2 = ((y_true - y_pred) ** 2).sum(dim=1)
+        return r2.float()
+
+    elif metric == "cod":
         # Coefficient of determination: R² = 1 - SS_res/SS_tot
         ss_res = ((y_true - y_pred) ** 2).sum(dim=1)
         y_mean = y_true.mean(dim=1, keepdim=True)
@@ -588,9 +600,22 @@ def compute_r2_metric(
         r2 = r**2
 
     else:
-        raise ValueError(f"Unknown metric '{metric}'. Choose from: 'cod', 'corr', 'corr2'")
+        raise ValueError(f"Unknown metric '{metric}'. Choose from: 'cod', 'corr', 'corr2', 'sse'")
 
     return r2.float()  # Cast to float32 to save space
+
+
+def metric_higher_is_better(metric: str) -> bool:
+    """Whether higher values indicate better fit for a given metric.
+
+    Returns True for cod/corr/corr2 (maximize), False for sse (minimize).
+    Used by hyperparameter selection logic (argmax vs argmin).
+    """
+    if metric == "sse":
+        return False
+    if metric in ("cod", "corr", "corr2"):
+        return True
+    raise ValueError(f"Unknown metric '{metric}'")
 
 
 def compute_r2_from_sufficient_stats(
@@ -1402,11 +1427,18 @@ def single_trial_cv_helper(
     cv_splits : list of (train_runs, test_runs)
         LORO or other CV splits.
     metric : str, default='cod'
-        'cod', 'corr', or 'corr2'.
+        'cod', 'corr', 'corr2', or 'sse'.
+        When 'sse', uses GLMsingle's ``calcbadness`` algorithm: each test trial
+        is compared against ALL matching-condition individual training trial
+        betas (not condition averages), test betas always come from variant 0
+        (unregularized), and z-scoring is per session (all runs pooled).
     zscore_by_run : bool, default=False
-        If True, z-score betas per run before CV. Normalization stats (mu, sigma)
+        If True, z-score betas before CV. Normalization stats (mu, sigma)
         are computed from ``reference_variant_idx`` and applied to ALL variants
         (GLMsingle pattern: unregularized variant sets the scale).
+        When ``metric='sse'``, z-scoring is done per session (all runs pooled
+        together) matching GLMsingle's ``calcbadness``. For other metrics,
+        z-scoring is done per run.
     reference_variant_idx : int, default=0
         Which variant supplies the z-scoring normalization stats. Only used when
         ``zscore_by_run=True``.
@@ -1417,6 +1449,7 @@ def single_trial_cv_helper(
         (frac=1) test betas, so the absolute amplitude differences are the
         discriminating signal.  Leave as None for the standard mode where each
         variant is compared against its own test betas.
+        When ``metric='sse'``, this is forced to 0 (matching GLMsingle).
     device : torch.device, optional
         Compute device (auto-detected if None).
     chunk_size : int, optional
@@ -1446,24 +1479,51 @@ def single_trial_cv_helper(
     trial_run_ids = trial_run_ids.to(device)
 
     if chunk_size is None:
-        chunk_size = n_voxels
+        if device is not None and device.type == "cuda":
+            # Auto-size chunks to fit in ~2GB GPU working memory.
+            # Per chunk: betas (n_variants * chunk * n_trials * 4B)
+            #          + condition_avg (n_variants * chunk * n_conditions * 4B)
+            #          + predicted (n_variants * chunk * n_test * 4B)
+            # Rough: 3 * n_variants * chunk * n_trials * 4
+            bytes_per_voxel = 3 * n_variants * n_trials * 4
+            target_bytes = 2 * 1024**3  # 2 GB
+            chunk_size = max(1000, int(target_bytes / max(bytes_per_voxel, 1)))
+            chunk_size = min(chunk_size, n_voxels)
+        else:
+            chunk_size = n_voxels
 
     # =========================================================================
-    # Optional z-scoring by run (GLMsingle normalization)
+    # Optional z-scoring (GLMsingle normalization)
     # =========================================================================
-    if zscore_by_run:
-        # Work on a copy to avoid mutating the caller's tensor
+    # For SSE metric: force test_variant_idx=0 (GLMsingle's calcbadness always
+    # uses unregularized/variant 0 for test betas)
+    if metric == "sse":
+        test_variant_idx = 0
+
+    if metric == "sse":
+        # GLMsingle calcbadness: ALWAYS z-score per session (all runs pooled).
+        # This is unconditional in GLMsingle — part of the calcbadness algorithm,
+        # not a user option. mu/sigma from variant 0 (unregularized).
+        # Clone to avoid inplace update on inference-mode tensors.
         beta_variants = beta_variants.clone()
-        beta_device = beta_variants.device  # May be CPU for large datasets streamed from CPU
+        ref_betas = beta_variants[reference_variant_idx]  # (n_vox, n_trials)
+        mu = ref_betas.mean(dim=1, keepdim=True)    # (n_vox, 1)
+        sigma = ref_betas.std(dim=1, keepdim=True)  # (n_vox, 1)
+        sigma = sigma.clamp(min=1e-10)
+        for v in range(n_variants):
+            beta_variants[v] = (beta_variants[v] - mu) / sigma
+    elif zscore_by_run:
+        # Optional per-run z-scoring for non-SSE metrics.
+        # Clone to avoid inplace update on inference-mode tensors.
+        beta_variants = beta_variants.clone()
+        beta_device = beta_variants.device
         unique_runs = torch.unique(trial_run_ids).tolist()
         for run_id in unique_runs:
-            run_mask = (trial_run_ids == run_id).to(beta_device)  # Match beta tensor device
-            # Compute mu/sigma from reference variant
+            run_mask = (trial_run_ids == run_id).to(beta_device)
             ref_betas = beta_variants[reference_variant_idx, :, run_mask]  # (n_vox, n_run_trials)
             mu = ref_betas.mean(dim=1, keepdim=True)    # (n_vox, 1)
             sigma = ref_betas.std(dim=1, keepdim=True)  # (n_vox, 1)
-            sigma = sigma.clamp(min=1e-10)  # avoid div-by-zero
-            # Apply to ALL variants
+            sigma = sigma.clamp(min=1e-10)
             for v in range(n_variants):
                 beta_variants[v, :, run_mask] = (
                     (beta_variants[v, :, run_mask] - mu) / sigma
@@ -1493,9 +1553,75 @@ def single_trial_cv_helper(
         fold_info.append((train_mask, test_indices, test_conditions, cond_train_masks))
 
     # =========================================================================
-    # Accumulate predicted and actual betas across folds
+    # SSE (GLMsingle calcbadness) vs standard (condition-average) path
     # =========================================================================
-    # We'll accumulate (n_variants * n_voxels, n_test_trials_per_fold) per fold
+    if metric == "sse":
+        # GLMsingle calcbadness: for each test trial, compare against ALL
+        # matching-condition individual training trial betas. Accumulate SSE
+        # directly per variant per voxel across folds.
+        # Test betas always from variant 0 (forced above).
+        sse_accum = torch.zeros(n_variants, n_voxels, device="cpu")
+        total_test_trials = 0
+
+        for fold_idx, (train_mask, test_indices, test_conditions, cond_train_masks) in enumerate(fold_info):
+            if verbose:
+                train_runs, test_runs = cv_splits[fold_idx]
+                print(f"  Split {fold_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}")
+
+            n_test = len(test_indices)
+            total_test_trials += n_test
+
+            for chunk_start in range(0, n_voxels, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, n_voxels)
+
+                # (n_variants, n_chunk, n_trials)
+                betas_chunk = beta_variants[:, chunk_start:chunk_end, :].to(device)
+
+                # Test betas from variant 0: (n_chunk, n_test)
+                test_betas_v0 = betas_chunk[0, :, test_indices]
+
+                # For each test trial, accumulate SSE against all matching
+                # condition train betas from each variant
+                for t_idx in range(n_test):
+                    cond = test_conditions[t_idx].item()
+                    cm = cond_train_masks[cond]
+                    n_match = cm.sum().item()
+                    if n_match == 0:
+                        continue
+
+                    # test_beta: (n_chunk,) from variant 0
+                    test_beta = test_betas_v0[:, t_idx]  # (n_chunk,)
+
+                    # train_betas: (n_variants, n_chunk, n_matching_trials)
+                    train_betas = betas_chunk[:, :, cm]
+
+                    # SSE: sum over matching trials of (train - test)^2
+                    # broadcast test_beta to (1, n_chunk, 1)
+                    diff = train_betas - test_beta.unsqueeze(0).unsqueeze(-1)
+                    sse_per_variant = (diff ** 2).sum(dim=2)  # (n_variants, n_chunk)
+
+                    sse_accum[:, chunk_start:chunk_end] += sse_per_variant.cpu()
+
+        r2 = sse_accum  # "r2" is SSE here (lower = better)
+
+        if verbose:
+            r2_mean = r2.mean(dim=1)
+            for v in range(min(n_variants, 5)):
+                print(f"  Variant {v}: mean SSE={r2_mean[v]:.1f}")
+            if n_variants > 5:
+                print(f"  ... ({n_variants - 5} more variants)")
+            print(f"  ({total_test_trials} test trials across {n_splits} folds)")
+
+        return {
+            "r2": r2,                           # (n_variants, n_voxels) — SSE values
+            "r2_mean": r2.mean(dim=1),           # (n_variants,)
+            "n_splits": n_splits,
+            "n_test_trials_total": total_test_trials,
+        }
+
+    # =========================================================================
+    # Standard path: condition-average prediction (cod, corr, corr2)
+    # =========================================================================
     all_predicted = []  # list of (n_variants * n_voxels, n_test_this_fold)
     all_actual = []
 
@@ -1506,10 +1632,6 @@ def single_trial_cv_helper(
 
         n_test = len(test_indices)
 
-        # Process in voxel chunks to manage memory.
-        # Accumulate as (n_variants, n_chunk, n_test) and cat over dim=1 so
-        # the final layout is (n_variants, n_voxels, n_test) — variants stay
-        # contiguous, enabling a simple reshape to (n_variants*n_voxels, n_test).
         fold_pred_chunks = []
         fold_actual_chunks = []
 
@@ -1528,27 +1650,19 @@ def single_trial_cv_helper(
                 cm = cond_train_masks[c]
                 n_train_c = cm.sum().item()
                 if n_train_c > 0:
-                    # betas_chunk[:, :, cm] is (n_variants, n_chunk, n_train_c)
                     condition_avg[:, :, c] = betas_chunk[:, :, cm].mean(dim=2)
 
             # Predicted: index condition_avg by test_conditions
-            # (n_variants, n_chunk, n_test)
             predicted = condition_avg[:, :, test_conditions]
             if test_variant_idx is not None:
-                # GLMsingle pattern: all variants are scored against the same
-                # reference variant's test betas (e.g. OLS/frac=1).  The
-                # amplitude of the prediction vs the fixed-scale target is the
-                # discriminating signal — no z-scoring needed.
-                ref_test = betas_chunk[test_variant_idx, :, test_indices]  # (n_chunk, n_test)
+                ref_test = betas_chunk[test_variant_idx, :, test_indices]
                 actual = ref_test.unsqueeze(0).expand(n_variants, -1, -1)
             else:
                 actual = betas_chunk[:, :, test_indices]
 
-            # Keep as (n_variants, n_chunk, n_test) — concatenate over voxels (dim=1)
             fold_pred_chunks.append(predicted.cpu())
             fold_actual_chunks.append(actual.cpu())
 
-        # cat over voxels → (n_variants, n_voxels, n_test)
         fold_pred = torch.cat(fold_pred_chunks, dim=1).reshape(n_variants * n_voxels, n_test)
         fold_actual = torch.cat(fold_actual_chunks, dim=1).reshape(n_variants * n_voxels, n_test)
 

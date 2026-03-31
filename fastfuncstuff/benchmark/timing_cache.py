@@ -38,7 +38,7 @@ def save_cache(data_dir: Path, cache: dict[str, Any]) -> None:
 def get_cached_timing(
     data_dir: Path, stage_name: str, dataset_id: str = "",
 ) -> tuple[float | None, float | None]:
-    """Get cached (afni_seconds, ffs_seconds) for a stage on current arch.
+    """Get cached (ref_seconds, ffs_seconds) for a stage on current arch.
 
     Returns (None, None) if no cached data found.
     """
@@ -51,7 +51,9 @@ def get_cached_timing(
             if dataset_id and run.get("dataset_id", "") != dataset_id:
                 continue
             stage = run.get("stages", {}).get(stage_name, {})
-            return stage.get("afni_seconds"), stage.get("ffs_seconds")
+            # Support both old "afni_seconds" and new "ref_seconds" keys
+            ref = stage.get("ref_seconds") or stage.get("afni_seconds")
+            return ref, stage.get("ffs_seconds")
     return None, None
 
 
@@ -62,7 +64,7 @@ def update_cache(
 ) -> None:
     """Update or append timing data for current architecture.
 
-    stage_timings: {stage_name: {"afni_seconds": float, "ffs_seconds": float}}
+    stage_timings: {stage_name: {"ref_seconds": float, "ffs_seconds": float}}
     """
     cache = load_cache(data_dir)
     arch_id = get_arch_id()

@@ -59,7 +59,8 @@ class MocoConfig:
     chain_init: bool = True  # Init from previous volume
     automask: bool = False  # Use automask for weighting
     weight_automask: bool = False  # automask × continuous weight (best of both)
-    lpa_sigma: float = 4.0  # Gaussian sigma for LPA cost
+    lpa_sigma: float = 4.0  # Kernel param for LPA cost (sigma or radius)
+    lpa_kernel: str = "gauss"  # "gauss" or "box"
     powell_maxfev: int = 100  # Max function evals for LPA Powell
     fixed_iter: bool = False  # Fast mode: skip convergence, run exactly max_iter
     compile: bool = True  # Use torch.compile for hot path (CUDA only)
@@ -412,7 +413,8 @@ def gn_lpa_rigid(
         matrix = params_to_matrix(p)
         warped = apply_affine_interp(source, matrix, config.interp, output_shape)
         # lpa_correlation returns higher = better, so negate for minimization
-        cost = -lpa_correlation(base, warped, weight, sigma=config.lpa_sigma)
+        cost = -lpa_correlation(base, warped, weight, sigma=config.lpa_sigma,
+                               kernel_type=config.lpa_kernel)
         return float(cost.item())
 
     result = minimize(
