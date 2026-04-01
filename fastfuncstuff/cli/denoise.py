@@ -384,6 +384,12 @@ Notes:
         help="Mask file to restrict analysis to brain voxels",
     )
     proc_opts.add_argument(
+        "-automask",
+        action="store_true",
+        help="Compute brain mask automatically from mean EPI (AFNI-style automask "
+        "with dilate=4). Applied before brainthresh. Mutually exclusive with -mask.",
+    )
+    proc_opts.add_argument(
         "-hrf_opt",
         type=str,
         default=None,
@@ -1545,6 +1551,59 @@ def main():
     if args.tr is None:
         args.tr = load_result.tr
 
+    # Compute automask if requested (before scaling, before brainthresh)
+    if args.automask:
+        if args.mask:
+            print("ERROR: -automask and -mask are mutually exclusive")
+            sys.exit(1)
+
+        from fastfuncstuff.processing.mask import automask as compute_automask
+
+        print()
+        print("Computing automask from mean EPI...")
+
+        # Compute mean of first run in 3D
+        end_tp = run_starts[1] if n_runs > 1 else n_timepoints
+        if mask_flat is not None:
+            # Data is already masked — unmask to 3D for automask computation
+            mean_1d = data[:, :end_tp].mean(dim=1).cpu()
+            mean_full = torch.zeros(int(np.prod(volume_shape)), dtype=mean_1d.dtype)
+            mean_full[torch.from_numpy(mask_flat)] = mean_1d
+            mean_3d = mean_full.reshape(volume_shape)
+        else:
+            mean_3d = data[:, :end_tp].mean(dim=1).cpu().reshape(volume_shape)
+
+        auto_mask_3d = compute_automask(mean_3d, dilate_extra=4, verbose=True)
+        auto_mask_flat = auto_mask_3d.numpy().flatten().astype(bool)
+
+        # Combine with any existing mask
+        if mask_flat is not None:
+            auto_mask_flat = auto_mask_flat & mask_flat
+        n_automask = auto_mask_flat.sum()
+        print(f"  Automask: {n_automask:,} / {int(np.prod(volume_shape)):,} voxels "
+              f"({100 * n_automask / np.prod(volume_shape):.1f}%)")
+
+        # Apply automask to data
+        auto_mask_flat_t = torch.from_numpy(auto_mask_flat)
+        if mask_flat is not None:
+            # Data already masked — need to sub-select within existing mask
+            existing_mask_t = torch.from_numpy(mask_flat)
+            # Map auto_mask_flat (full volume) to indices within existing mask
+            keep_in_data = auto_mask_flat_t[existing_mask_t]
+            data = data[keep_in_data]
+        else:
+            data = data[auto_mask_flat_t]
+
+        mask = auto_mask_3d.numpy()
+        mask_flat = auto_mask_flat
+        n_voxels = int(auto_mask_flat.sum())
+
+        # Save automask for reference
+        automask_vol = auto_mask_3d.numpy().astype(np.float32)
+        save_nifti(automask_vol, output_path=f"{args.prefix}_automask{_nii_ext}",
+                   affine=affine, header=nifti_header)
+        print(f"  Saved: {args.prefix}_automask{_nii_ext}")
+
     print()
 
     # Compute brainthresh intensity mask BEFORE scaling
@@ -2201,7 +2260,7 @@ def main():
                     data,
                     full_design,
                     tr=args.tr,
-                    max_poly_degree=0,
+                    max_poly_degree=-1,  # block-diagonal nuisance already has per-run constants
                     device=device,
                     verbose=False,
                     task_indices=task_indices,
@@ -2218,7 +2277,7 @@ def main():
                         data[voxel_mask],
                         full_design,
                         tr=args.tr,
-                        max_poly_degree=0,
+                        max_poly_degree=-1,  # block-diagonal nuisance already has per-run constants
                         device=device,
                         verbose=False,
                         task_indices=task_indices,
@@ -2242,16 +2301,14 @@ def main():
         _hib = metric_higher_is_better(args.cv_metric)
         _metric_label = args.cv_metric.upper()
 
-        # Determine criteria mask: voxels above threshold in ANY PC count
-        # For SSE (lower=better), use pcR2cutoff-style fallback instead
-        if _hib:
-            criteria_mask = torch.any(r2_maps_st > args.r2_threshold, dim=1)
-        else:
-            # SSE: select voxels with finite values (all should qualify)
-            criteria_mask = torch.any(torch.isfinite(r2_maps_st), dim=1)
+        # Determine criteria mask from initial R² (COD-based, computed earlier).
+        # This is the GLMsingle/GLMdenoise pattern: criteria voxels are those with
+        # meaningful task signal, regardless of what metric is used for PC optimization.
+        # initial_r2 is always COD (computed at step 2 above).
+        criteria_mask = (initial_r2 > args.r2_threshold).cpu()
         n_criteria = criteria_mask.sum().item()
         print(
-            f"  Criteria voxels ({_metric_label}): "
+            f"  Criteria voxels (initial R² > {args.r2_threshold}): "
             f"{n_criteria:,} / {n_voxels_st:,}"
         )
 
@@ -2323,7 +2380,7 @@ def main():
                 data,
                 full_design_final,
                 tr=args.tr,
-                max_poly_degree=0,
+                max_poly_degree=-1,  # block-diagonal nuisance already has per-run constants
                 device=device,
                 verbose=args.verbose,
                 task_indices=task_indices_final,
@@ -2334,42 +2391,97 @@ def main():
             print(f"  Fitting {len(unique_hrfs)} HRF groups...")
             final_betas = torch.zeros(n_voxels_st, n_trials, device=data.device)
             task_indices_final = list(range(n_trials))
-            for hrf_idx in tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verbose):
+            for i_hrf, hrf_idx in enumerate(tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verbose)):
                 voxel_mask = hrf_indices_dev == hrf_idx
                 group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
                 full_design_final = torch.cat([group_design_2d, nuisance_design_final], dim=1)
+
+                # Diagnostic for first HRF group
+                if i_hrf == 0:
+                    cond_num = torch.linalg.cond(full_design_final).item()
+                    print(f"  Design: {full_design_final.shape}, cond#={cond_num:.1f}")
+                    # Per-run nuisance shape (verify polynomials present)
+                    print(f"  Nuisance per-run shape: {nuisance_per_run[0].shape} "
+                          f"(block-diag total: {nuisance_design_final.shape})")
+                    # Check per-run design energy
+                    for run_idx in range(n_runs):
+                        start_tp = run_starts[run_idx]
+                        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                        run_trial_mask = trial_run_ids == run_idx
+                        run_design = group_design_2d[start_tp:end_tp, run_trial_mask]
+                        design_energy = run_design.abs().sum().item()
+                        n_nonzero = (run_design.abs() > 1e-6).sum().item()
+                        data_run = data[voxel_mask][:, start_tp:end_tp]
+                        print(f"    Run {run_idx+1}: trials={run_trial_mask.sum()}, "
+                              f"design energy={design_energy:.1f}, nonzero={n_nonzero}, "
+                              f"data std={data_run.std().item():.2f}")
+
                 glm_results_final = fit_glm(
                     data[voxel_mask],
                     full_design_final,
                     tr=args.tr,
-                    max_poly_degree=0,
+                    max_poly_degree=-1,  # block-diagonal nuisance already has per-run constants
                     device=device,
-                    verbose=False,  # Chunking handled internally, no verbose per group
+                    verbose=False,
                     task_indices=task_indices_final,
                 )
                 final_betas[voxel_mask] = glm_results_final.betas
             print(f"  Complete. Mean R² = {glm_results_final.r2.mean().item():.3f}")
 
-        # Compute final beta-space R² (cross-validation)
+        # Per-run beta diagnostics (detect runs with degenerate betas)
+        print()
+        print("  Per-run beta diagnostics:")
+        for run_idx in range(n_runs):
+            run_trial_mask = trial_run_ids == run_idx
+            n_run_trials = run_trial_mask.sum().item()
+            run_betas = final_betas[:, run_trial_mask]
+            run_mean = run_betas.mean().item()
+            run_std = run_betas.std().item()
+            run_absmax = run_betas.abs().max().item()
+            print(f"    Run {run_idx + 1}: {n_run_trials} trials, "
+                  f"mean={run_mean:.4f}, std={run_std:.4f}, |max|={run_absmax:.2f}")
+
+        # Compute final beta-space cross-validation
+        # Always compute COD R² for interpretability. If optimization metric
+        # differs (e.g. SSE), also compute and save that separately.
         print()
         print("Evaluating with cross-validation...")
-        final_xval = compute_xval_r2_single_trials(
+        final_xval_cod = compute_xval_r2_single_trials(
             final_betas,
             trial_cond_ids,
             trial_run_ids,
             cv_splits,
-            metric=args.cv_metric,
+            metric="cod",
             device=device,
-            verbose=False,  # Fold splits are noisy, summary below is sufficient
+            verbose=False,
         )
+
+        final_xval_metric = None
+        if args.cv_metric != "cod":
+            final_xval_metric = compute_xval_r2_single_trials(
+                final_betas,
+                trial_cond_ids,
+                trial_run_ids,
+                cv_splits,
+                metric=args.cv_metric,
+                device=device,
+                verbose=False,
+            )
 
         # Print CV summary
         n_folds = len(cv_splits)
-        n_test_trials = final_xval["r2"].numel()
+        n_test_trials = final_xval_cod["r2"].numel()
         print(
-            f"  Beta-space CV R²: mean={final_xval['r2'].mean():.4f}, "
-            f"median={final_xval['r2'].median():.4f} ({n_test_trials} trials across {n_folds} folds)"
+            f"  Beta-space CV R² (COD): mean={final_xval_cod['r2'].mean():.4f}, "
+            f"median={final_xval_cod['r2'].median():.4f} "
+            f"({n_test_trials} trials across {n_folds} folds)"
         )
+        if final_xval_metric is not None:
+            _ml = args.cv_metric.upper()
+            print(
+                f"  Beta-space CV {_ml}: mean={final_xval_metric['r2'].mean():.4f}, "
+                f"median={final_xval_metric['r2'].median():.4f}"
+            )
 
         # 8. Save outputs
         print()
@@ -2382,7 +2494,7 @@ def main():
 
         output_files = save_single_trial_results(
             betas=final_betas,
-            xval_r2=final_xval["r2"],
+            xval_r2=final_xval_cod["r2"],
             trial_labels=trial_labels,
             trial_condition_ids=trial_cond_ids,
             trial_run_ids=trial_run_ids,
@@ -2438,6 +2550,15 @@ def main():
         output_files["initial_xval_r2"] = f"{args.prefix}_initial_xval_r2{_nii_ext}"
         print("  Saved: initial cross-validated R²")
 
+        # Save optimization metric map if different from COD
+        if final_xval_metric is not None:
+            _ml = args.cv_metric.lower()
+            _metric_vol = _to_vol(final_xval_metric["r2"].cpu().numpy())
+            _metric_path = f"{args.prefix}_xval_{_ml}{_nii_ext}"
+            save_nifti(_metric_vol, output_path=_metric_path, affine=affine, header=nifti_header)
+            output_files[f"xval_{_ml}"] = _metric_path
+            print(f"  Saved: xval {_ml} map")
+
         # Save per-run selected PCs as text files (for ridge -denoise consumption)
         for run_idx in range(n_runs):
             pcs = noise_pcs_per_run[run_idx]
@@ -2460,7 +2581,8 @@ def main():
             "n_noise_voxels": int(n_noise),
             "noise_fraction": float(noise_fraction),
             "pc_selection_curve": r2_by_pc.cpu().tolist(),
-            "final_median_r2": float(final_xval["r2"].median()),
+            "final_median_r2": float(final_xval_cod["r2"].median()),
+            "cv_metric": args.cv_metric,
             "noise_method": args.noise,
             "auto_component_caps": bool(args.auto_component_caps),
             "auto_component_estimate_max": int(estimate_max_comps)
@@ -2670,7 +2792,7 @@ def main():
         print("✅ 3dDenoisefast (single-trial mode) Complete!")
         print("=" * 70)
         print(f"  Optimal PCs: {optimal_pcs}")
-        print(f"  Final median beta-space R²: {final_xval['r2'].median():.4f}")
+        print(f"  Final median beta-space R²: {final_xval_cod['r2'].median():.4f}")
         print()
         for key, path in output_files.items():
             print(f"  {key}: {path}")

@@ -168,7 +168,7 @@ def project_out_nuisance_per_run(
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
         run_length = run_lengths[run_idx]
-        run_design = design[start_tp:start_tp + run_length, :].to(device)  # (run_length, n_task)
+        run_design = design[start_tp : start_tp + run_length, :].to(device)  # (run_length, n_task)
 
         if q_factors[run_idx] is not None:
             # Apply projection using Q: design_proj = design - Q @ (Q.T @ design)
@@ -188,7 +188,7 @@ def project_out_nuisance_per_run(
         for run_idx in range(n_runs):
             start_tp = run_starts[run_idx]
             run_length = run_lengths[run_idx]
-            run_data = data[:, start_tp:start_tp + run_length]  # (n_voxels, run_length)
+            run_data = data[:, start_tp : start_tp + run_length]  # (n_voxels, run_length)
 
             if q_factors[run_idx] is not None:
                 # Move to compute device, project using Q, move back
@@ -220,7 +220,7 @@ def project_out_nuisance_per_run(
                 run_length = run_lengths[run_idx]
 
                 # Get chunk data for this run
-                run_chunk_data = data[chunk_start:chunk_end, start_tp:start_tp + run_length]
+                run_chunk_data = data[chunk_start:chunk_end, start_tp : start_tp + run_length]
 
                 if q_factors[run_idx] is not None:
                     # Move chunk to compute device, project using Q, store result
@@ -229,12 +229,16 @@ def project_out_nuisance_per_run(
                     # Project: QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
                     QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
                     run_chunk_proj = run_chunk_dev - QQt_data
-                    projected_data[chunk_start:chunk_end, start_tp:start_tp + run_length] = run_chunk_proj.cpu()
+                    projected_data[chunk_start:chunk_end, start_tp : start_tp + run_length] = (
+                        run_chunk_proj.cpu()
+                    )
 
                     # Free GPU memory
                     del run_chunk_dev, run_chunk_proj
                 else:
-                    projected_data[chunk_start:chunk_end, start_tp:start_tp + run_length] = run_chunk_data.cpu()
+                    projected_data[chunk_start:chunk_end, start_tp : start_tp + run_length] = (
+                        run_chunk_data.cpu()
+                    )
 
             # Clear GPU cache occasionally (not too frequently - empty_cache is expensive ~10-50ms)
             # Only at the midpoint of processing to avoid memory buildup
@@ -1204,9 +1208,13 @@ def compute_xval_r2(
             # Project out nuisance from data (QR-based projection)
             # When nuisance_indices is empty, Q is None → no-op (safe for pre-projected data)
             if Q_train_batch is not None:
-                train_data_batch = train_data_batch - (Q_train_batch @ (Q_train_batch.T @ train_data_batch.T)).T
+                train_data_batch = (
+                    train_data_batch - (Q_train_batch @ (Q_train_batch.T @ train_data_batch.T)).T
+                )
             if Q_test_batch is not None:
-                test_data_batch = test_data_batch - (Q_test_batch @ (Q_test_batch.T @ test_data_batch.T)).T
+                test_data_batch = (
+                    test_data_batch - (Q_test_batch @ (Q_test_batch.T @ test_data_batch.T)).T
+                )
 
             # Additional projection for 'nuisance' strategy
             if zero_event_strategy == "nuisance":
@@ -1371,9 +1379,7 @@ def compute_xval_r2(
                 torch.cuda.empty_cache()
 
     if verbose:
-        q25, q50, q75 = torch.quantile(
-            r2_final.float(), torch.tensor([0.25, 0.50, 0.75])
-        )
+        q25, q50, q75 = torch.quantile(r2_final.float(), torch.tensor([0.25, 0.50, 0.75]))
         print(f"  R² summary: mean={r2_final.mean():.4f}, std={r2_final.std():.4f}")
         print(f"  Quartiles:  Q25={q25:.4f}, Q50={q50:.4f}, Q75={q75:.4f}")
         print(f"  Range:      [{r2_final.min():.4f}, {r2_final.max():.4f}]")
@@ -1495,9 +1501,10 @@ def single_trial_cv_helper(
     # =========================================================================
     # Optional z-scoring (GLMsingle normalization)
     # =========================================================================
-    # For SSE metric: force test_variant_idx=0 (GLMsingle's calcbadness always
-    # uses unregularized/variant 0 for test betas)
-    if metric == "sse":
+    # For SSE metric, default test_variant_idx to 0 (GLMsingle's calcbadness
+    # convention). But if caller explicitly provides a variant index (e.g.,
+    # ridge with frac=1.0 at the last index), honor that.
+    if metric == "sse" and test_variant_idx is None:
         test_variant_idx = 0
 
     if metric == "sse":
@@ -1507,7 +1514,7 @@ def single_trial_cv_helper(
         # Clone to avoid inplace update on inference-mode tensors.
         beta_variants = beta_variants.clone()
         ref_betas = beta_variants[reference_variant_idx]  # (n_vox, n_trials)
-        mu = ref_betas.mean(dim=1, keepdim=True)    # (n_vox, 1)
+        mu = ref_betas.mean(dim=1, keepdim=True)  # (n_vox, 1)
         sigma = ref_betas.std(dim=1, keepdim=True)  # (n_vox, 1)
         sigma = sigma.clamp(min=1e-10)
         for v in range(n_variants):
@@ -1521,13 +1528,11 @@ def single_trial_cv_helper(
         for run_id in unique_runs:
             run_mask = (trial_run_ids == run_id).to(beta_device)
             ref_betas = beta_variants[reference_variant_idx, :, run_mask]  # (n_vox, n_run_trials)
-            mu = ref_betas.mean(dim=1, keepdim=True)    # (n_vox, 1)
+            mu = ref_betas.mean(dim=1, keepdim=True)  # (n_vox, 1)
             sigma = ref_betas.std(dim=1, keepdim=True)  # (n_vox, 1)
             sigma = sigma.clamp(min=1e-10)
             for v in range(n_variants):
-                beta_variants[v, :, run_mask] = (
-                    (beta_variants[v, :, run_mask] - mu) / sigma
-                )
+                beta_variants[v, :, run_mask] = (beta_variants[v, :, run_mask] - mu) / sigma
 
     # =========================================================================
     # Build fold masks once
@@ -1559,11 +1564,14 @@ def single_trial_cv_helper(
         # GLMsingle calcbadness: for each test trial, compare against ALL
         # matching-condition individual training trial betas. Accumulate SSE
         # directly per variant per voxel across folds.
-        # Test betas always from variant 0 (forced above).
+        # Test betas come from test_variant_idx (default 0 for GLMsingle,
+        # but callers may override, e.g. ridge where frac=1.0 is the OLS reference).
         sse_accum = torch.zeros(n_variants, n_voxels, device="cpu")
         total_test_trials = 0
 
-        for fold_idx, (train_mask, test_indices, test_conditions, cond_train_masks) in enumerate(fold_info):
+        for fold_idx, (train_mask, test_indices, test_conditions, cond_train_masks) in enumerate(
+            fold_info
+        ):
             if verbose:
                 train_runs, test_runs = cv_splits[fold_idx]
                 print(f"  Split {fold_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}")
@@ -1577,8 +1585,9 @@ def single_trial_cv_helper(
                 # (n_variants, n_chunk, n_trials)
                 betas_chunk = beta_variants[:, chunk_start:chunk_end, :].to(device)
 
-                # Test betas from variant 0: (n_chunk, n_test)
-                test_betas_v0 = betas_chunk[0, :, test_indices]
+                # Test betas from selected reference variant: (n_chunk, n_test)
+                # test_variant_idx is guaranteed non-None by the block above.
+                test_betas_ref = betas_chunk[int(test_variant_idx), :, test_indices]
 
                 # For each test trial, accumulate SSE against all matching
                 # condition train betas from each variant
@@ -1589,8 +1598,8 @@ def single_trial_cv_helper(
                     if n_match == 0:
                         continue
 
-                    # test_beta: (n_chunk,) from variant 0
-                    test_beta = test_betas_v0[:, t_idx]  # (n_chunk,)
+                    # test_beta: (n_chunk,) from selected reference variant
+                    test_beta = test_betas_ref[:, t_idx]  # (n_chunk,)
 
                     # train_betas: (n_variants, n_chunk, n_matching_trials)
                     train_betas = betas_chunk[:, :, cm]
@@ -1598,7 +1607,7 @@ def single_trial_cv_helper(
                     # SSE: sum over matching trials of (train - test)^2
                     # broadcast test_beta to (1, n_chunk, 1)
                     diff = train_betas - test_beta.unsqueeze(0).unsqueeze(-1)
-                    sse_per_variant = (diff ** 2).sum(dim=2)  # (n_variants, n_chunk)
+                    sse_per_variant = (diff**2).sum(dim=2)  # (n_variants, n_chunk)
 
                     sse_accum[:, chunk_start:chunk_end] += sse_per_variant.cpu()
 
@@ -1613,8 +1622,8 @@ def single_trial_cv_helper(
             print(f"  ({total_test_trials} test trials across {n_splits} folds)")
 
         return {
-            "r2": r2,                           # (n_variants, n_voxels) — SSE values
-            "r2_mean": r2.mean(dim=1),           # (n_variants,)
+            "r2": r2,  # (n_variants, n_voxels) — SSE values
+            "r2_mean": r2.mean(dim=1),  # (n_variants,)
             "n_splits": n_splits,
             "n_test_trials_total": total_test_trials,
         }
@@ -1625,7 +1634,9 @@ def single_trial_cv_helper(
     all_predicted = []  # list of (n_variants * n_voxels, n_test_this_fold)
     all_actual = []
 
-    for fold_idx, (_train_mask, test_indices, test_conditions, cond_train_masks) in enumerate(fold_info):
+    for fold_idx, (_train_mask, test_indices, test_conditions, cond_train_masks) in enumerate(
+        fold_info
+    ):
         if verbose:
             train_runs, test_runs = cv_splits[fold_idx]
             print(f"  Split {fold_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}")
@@ -1643,9 +1654,7 @@ def single_trial_cv_helper(
             betas_chunk = beta_variants[:, chunk_start:chunk_end, :].to(device)
 
             # Condition averages from train trials: (n_variants, n_chunk, n_conditions)
-            condition_avg = torch.zeros(
-                n_variants, n_chunk, n_conditions, device=device
-            )
+            condition_avg = torch.zeros(n_variants, n_chunk, n_conditions, device=device)
             for c in range(n_conditions):
                 cm = cond_train_masks[c]
                 n_train_c = cm.sum().item()
@@ -1689,8 +1698,8 @@ def single_trial_cv_helper(
         print(f"  ({total_test_trials} test trials across {n_splits} folds)")
 
     return {
-        "r2": r2,                           # (n_variants, n_voxels)
-        "r2_mean": r2.mean(dim=1),           # (n_variants,)
+        "r2": r2,  # (n_variants, n_voxels)
+        "r2_mean": r2.mean(dim=1),  # (n_variants,)
         "n_splits": n_splits,
         "n_test_trials_total": total_test_trials,
     }

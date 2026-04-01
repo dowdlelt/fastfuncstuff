@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from . import (
     align,
+    automask,
     crossalign,
     glm,
     glmsingle_denoise,
@@ -20,6 +21,7 @@ from . import (
 
 ALL_STAGES = [
     moco, slicetime, crossalign, align, warp, glm, ica, ica_single,
+    automask,
     glmsingle_prep, glmsingle_matlab, glmsingle_hrf, glmsingle_denoise, glmsingle_ridge,
 ]
 

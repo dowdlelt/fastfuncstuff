@@ -22,33 +22,37 @@ name = "glmsingle_denoise"
 description = "PC denoising (GLMsingle Type C vs ffs_denoise -single_trials)"
 
 THRESHOLDS = {
-    "pcnum_tolerance": 2,          # pcnum must agree within ±2
-    "xvaltrend_corr": 0.90,       # xvaltrend curve correlation
-    "noisepool_overlap": 0.50,     # Jaccard index of noise pool masks
-    "beta_spatial_corr": 0.85,     # spatial correlation of denoised betas (median across trials)
+    "pcnum_tolerance": 2,  # pcnum must agree within ±2
+    "xvaltrend_corr": 0.90,  # xvaltrend curve correlation
+    "noisepool_overlap": 0.50,  # Jaccard index of noise pool masks
+    "beta_spatial_corr": 0.85,  # spatial correlation of denoised betas (median across trials)
 }
 
 
 def _input_files(ctx: BenchmarkContext) -> list[Path]:
     """MNI-space resampled localizer runs."""
     return [
-        ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{r}.nii.gz"
-        for r in range(1, 6)
+        ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{r}.nii.gz" for r in range(1, 6)
     ]
 
 
 def _onset_files(ctx: BenchmarkContext) -> list[Path]:
     """AFNI-style onset timing files (one per condition)."""
-    conds = ["faces", "bodies", "objects", "scenes", "scrambled"]
+    conds = ["faces", "objects", "scenes", "scrambled", "bodies"]
     return [ctx.timing_dir / f"onsets.localizer.times.{c}.txt" for c in conds]
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     gs = ctx.glmsingle_dir
-    for f in ["glmsingle_noisepool.nii.gz", "glmsingle_r2_C.nii.gz",
-              "glmsingle_betas_C.nii.gz", "glmsingle_mask.nii.gz",
-              "glmsingle_pcnum.txt", "glmsingle_xvaltrend.txt"]:
+    for f in [
+        "glmsingle_noisepool.nii.gz",
+        "glmsingle_r2_C.nii.gz",
+        "glmsingle_betas_C.nii.gz",
+        "glmsingle_mask.nii.gz",
+        "glmsingle_pcnum.txt",
+        "glmsingle_xvaltrend.txt",
+    ]:
         p = gs / f
         if not p.exists():
             missing.append(f"GLMsingle: {p}")
@@ -97,10 +101,12 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-prefix {out_prefix} "
         f"-single_trials "
         f"-hrf_opt {hrf_prefix} "
+        f"-tr 1.5 "
         f"-cv_metric sse "
         f"-pcstop 1.05 "
         f"-max_comps 10 "
         f"-brainthresh 99 0.1 "
+        f"-do_scale "
         f"-device cuda"
     )
 
@@ -118,19 +124,15 @@ def validate(ctx: BenchmarkContext) -> dict:
     ffs = ctx.ffs_denoise_dir
 
     # Load GLMsingle results
-    matlab_noisepool = np.array(
-        nib.load(str(gs / "glmsingle_noisepool.nii.gz")).dataobj
-    ).flatten().astype(bool)
-    matlab_betas = np.array(
-        nib.load(str(gs / "glmsingle_betas_C.nii.gz")).dataobj
+    matlab_noisepool = (
+        np.array(nib.load(str(gs / "glmsingle_noisepool.nii.gz")).dataobj).flatten().astype(bool)
     )
-    matlab_mask = np.array(
-        nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj
-    ).flatten().astype(bool)
+    matlab_betas = np.array(nib.load(str(gs / "glmsingle_betas_C.nii.gz")).dataobj)
+    matlab_mask = (
+        np.array(nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj).flatten().astype(bool)
+    )
 
-    matlab_pcnum = int(
-        (gs / "glmsingle_pcnum.txt").read_text().strip()
-    )
+    matlab_pcnum = int((gs / "glmsingle_pcnum.txt").read_text().strip())
     matlab_xvaltrend = np.loadtxt(str(gs / "glmsingle_xvaltrend.txt"))
 
     # Load FFS results
@@ -146,9 +148,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     noise_pool_file = ffs / "denoise_noise_pool_mask.nii.gz"
     ffs_noisepool = None
     if noise_pool_file.exists():
-        ffs_noisepool = np.array(
-            nib.load(str(noise_pool_file)).dataobj
-        ).flatten().astype(bool)
+        ffs_noisepool = np.array(nib.load(str(noise_pool_file)).dataobj).flatten().astype(bool)
 
     # FFS betas (Type C = denoised, before ridge)
     betas_file = ffs / "denoise_single_trial_betas.nii.gz"
@@ -186,9 +186,8 @@ def validate(ctx: BenchmarkContext) -> dict:
         min_len = min(len(matlab_xvaltrend), len(ffs_xvaltrend))
         if min_len >= 2:
             from ..validation import _pearson_r
-            xvaltrend_corr = _pearson_r(
-                matlab_xvaltrend[:min_len], ffs_xvaltrend[:min_len]
-            )
+
+            xvaltrend_corr = _pearson_r(matlab_xvaltrend[:min_len], ffs_xvaltrend[:min_len])
     results["xvaltrend_corr"] = float(xvaltrend_corr)
 
     # 4. Beta spatial correlation (median across trials)
@@ -211,6 +210,7 @@ def validate(ctx: BenchmarkContext) -> dict:
 
         if matlab_betas_flat.shape == ffs_betas_flat.shape:
             from ..validation import _pearson_r
+
             mask = matlab_mask & (np.abs(ffs_betas_flat).sum(axis=1) > 0)
             trial_corrs = []
             n_sample = min(matlab_betas_flat.shape[1], 50)

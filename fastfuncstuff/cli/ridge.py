@@ -476,7 +476,9 @@ def main():
 
         # Load HRF library (reconstruct from metadata or use default)
         # For now, use default library
-        hrf_library = get_hrf_library(mode="library", stim_duration=0.0, microtime_dt=args.microtime_dt, n_hrfs=20)
+        hrf_library = get_hrf_library(
+            mode="library", stim_duration=0.0, microtime_dt=args.microtime_dt, n_hrfs=20
+        )
         print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
     # Load noise PCs if provided
@@ -594,6 +596,8 @@ def main():
 
         # Generate CV splits
         cv_splits = generate_cv_splits(n_runs, strategy=1)  # strategy=1 is LORO
+        cv_metric_token = "sse" if args.metric == "sse" else "r2"
+        cv_metric_label = "SSE (lower=better)" if args.metric == "sse" else "R²"
 
         per_voxel_design = design_matrix.ndim == 3
         _hib = metric_higher_is_better(args.metric)
@@ -846,7 +850,9 @@ def main():
                     del chunk_coefs, chunk_final_betas, chunk_data_clean
 
         print()
-        print(f"Beta-space CV R²:  mean={xval_r2.mean():.4f}, median={xval_r2.median():.4f}")
+        print(
+            f"Beta-space CV {cv_metric_label}:  mean={xval_r2.mean():.4f}, median={xval_r2.median():.4f}"
+        )
         print(f"Full-model R²:     mean={full_r2.mean():.4f}, median={full_r2.median():.4f}")
 
     else:
@@ -895,12 +901,17 @@ def main():
             volume_shape=vol_shape,
             affine=affine,
             voxel_mask=voxel_mask_tensor,
+            xval_metric_name=cv_metric_token,
         )
 
         # Also save ridge-specific outputs
         voxel_mask_np = mask_flat if mask is not None else None
         save_volume_nifti(
-            full_r2, f"{args.prefix}_single_trial_full_r2{_nii_ext}", vol_shape, affine, voxel_mask_np
+            full_r2,
+            f"{args.prefix}_single_trial_full_r2{_nii_ext}",
+            vol_shape,
+            affine,
+            voxel_mask_np,
         )
         print(f"  {args.prefix}_single_trial_full_r2{_nii_ext}")
         save_volume_nifti(
@@ -908,9 +919,13 @@ def main():
         )
         print(f"  {args.prefix}_optimal_frac{_nii_ext}")
         save_4d_nifti(
-            r2_by_frac, f"{args.prefix}_r2_by_frac{_nii_ext}", vol_shape, affine, voxel_mask_np
+            r2_by_frac,
+            f"{args.prefix}_{cv_metric_token}_by_frac{_nii_ext}",
+            vol_shape,
+            affine,
+            voxel_mask_np,
         )
-        print(f"  {args.prefix}_r2_by_frac{_nii_ext}")
+        print(f"  {args.prefix}_{cv_metric_token}_by_frac{_nii_ext}")
 
     else:
         # ========== EXISTING OUTPUT MODE ==========
@@ -918,10 +933,16 @@ def main():
 
         # Save R² maps and optimal fractions
         save_volume_nifti(
-            results.r2_initial, f"{args.prefix}_r2_initial{_nii_ext}", vol_shape, affine, voxel_mask_np
+            results.r2_initial,
+            f"{args.prefix}_r2_initial{_nii_ext}",
+            vol_shape,
+            affine,
+            voxel_mask_np,
         )
         print(f"  {args.prefix}_r2_initial{_nii_ext}")
-        save_volume_nifti(results.r2, f"{args.prefix}_r2{_nii_ext}", vol_shape, affine, voxel_mask_np)
+        save_volume_nifti(
+            results.r2, f"{args.prefix}_r2{_nii_ext}", vol_shape, affine, voxel_mask_np
+        )
         print(f"  {args.prefix}_r2{_nii_ext}")
         save_volume_nifti(
             results.xval_r2, f"{args.prefix}_xval_r2{_nii_ext}", vol_shape, affine, voxel_mask_np
@@ -981,7 +1002,11 @@ def main():
 
         # Save R² per ridge fraction (4D file with one volume per fraction)
         save_4d_nifti(
-            results.r2_by_frac, f"{args.prefix}_r2_by_frac{_nii_ext}", vol_shape, affine, voxel_mask_np
+            results.r2_by_frac,
+            f"{args.prefix}_r2_by_frac{_nii_ext}",
+            vol_shape,
+            affine,
+            voxel_mask_np,
         )
         print(f"  {args.prefix}_r2_by_frac{_nii_ext}")
 
@@ -1024,7 +1049,9 @@ def main():
         )
         print(f"  {args.prefix}_ridge_fracs.txt - Ridge fraction values")
         if args.do_scale and violations_mask is not None:
-            print(f"  {args.prefix}_scale_violations{_nii_ext} - Scaling violation counts per voxel")
+            print(
+                f"  {args.prefix}_scale_violations{_nii_ext} - Scaling violation counts per voxel"
+            )
         print()
         print("Summary statistics:")
         print(f"  Median R² (initial, OLS): {results.r2_initial.median():.4f}")

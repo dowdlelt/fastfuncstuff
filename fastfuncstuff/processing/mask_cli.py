@@ -31,7 +31,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Clip-level fraction for THD_cliplevel (default: 0.5, matching AFNI)",
     )
     parser.add_argument(
-        "-dilate", type=int, default=0, help="Extra dilation iterations after mask (default: 0)"
+        "-dilate", type=int, default=2, help="Extra dilation iterations after mask (default: 2)"
     )
     parser.add_argument(
         "-peelcount", type=int, default=1, help="Peel erosion iterations (AFNI default: 1)"

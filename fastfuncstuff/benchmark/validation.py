@@ -90,6 +90,29 @@ def compare_volumes(
     return {"r": float(r), "n_voxels": int(mask.sum())}
 
 
+def compare_masks(
+    a_path: str | Path,
+    b_path: str | Path,
+) -> dict:
+    """Dice coefficient and voxel counts between two binary masks.
+
+    Returns dict with 'dice', 'n_a', 'n_b', 'n_overlap'.
+    """
+    a, _ = _load_vol(a_path)
+    b, _ = _load_vol(b_path)
+
+    mask_a = a > 0.5
+    mask_b = b > 0.5
+
+    n_a = int(mask_a.sum())
+    n_b = int(mask_b.sum())
+    n_overlap = int((mask_a & mask_b).sum())
+
+    dice = 2.0 * n_overlap / max(n_a + n_b, 1)
+
+    return {"dice": float(dice), "n_a": n_a, "n_b": n_b, "n_overlap": n_overlap}
+
+
 def compare_timeseries_4d(
     a_path: str | Path,
     b_path: str | Path,

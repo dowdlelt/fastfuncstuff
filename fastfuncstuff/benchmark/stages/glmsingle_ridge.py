@@ -23,17 +23,16 @@ name = "glmsingle_ridge"
 description = "Fracridge (GLMsingle Type D vs ffs_ridge -single_trials)"
 
 THRESHOLDS = {
-    "fracvalue_corr": 0.80,       # per-voxel fraction correlation
-    "beta_spatial_corr": 0.85,     # spatial correlation of Type D betas
-    "r2_spatial_corr": 0.90,       # spatial correlation of R² maps
+    "fracvalue_corr": 0.80,  # per-voxel fraction correlation
+    "beta_spatial_corr": 0.85,  # spatial correlation of Type D betas
+    "r2_spatial_corr": 0.90,  # spatial correlation of R² maps
 }
 
 
 def _input_files(ctx: BenchmarkContext) -> list[Path]:
     """MNI-space resampled localizer runs."""
     return [
-        ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{r}.nii.gz"
-        for r in range(1, 6)
+        ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{r}.nii.gz" for r in range(1, 6)
     ]
 
 
@@ -46,15 +45,19 @@ def _onset_files(ctx: BenchmarkContext) -> list[Path]:
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     gs = ctx.glmsingle_dir
-    for f in ["glmsingle_fracvalue.nii.gz", "glmsingle_r2_D.nii.gz",
-              "glmsingle_betas_D.nii.gz", "glmsingle_mask.nii.gz"]:
+    for f in [
+        "glmsingle_fracvalue.nii.gz",
+        "glmsingle_r2_D.nii.gz",
+        "glmsingle_betas_D.nii.gz",
+        "glmsingle_mask.nii.gz",
+    ]:
         p = gs / f
         if not p.exists():
             missing.append(f"GLMsingle: {p}")
 
     ffs_ridge = ctx.ffs_ridge_dir
     if ctx.validate_only:
-        for f in ["ridge_optimal_frac.nii.gz", "ridge_stats_single_trial.nii.gz"]:
+        for f in ["ridge_optimal_frac.nii.gz", "ridge_single_trial_betas.nii.gz"]:
             p = ffs_ridge / f
             if not p.exists():
                 missing.append(f"FFS ridge: {p}")
@@ -82,7 +85,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     out_prefix = str(out_dir / "ridge")
 
     # Skip if outputs exist and not forcing
-    if not ctx.force_ffs and (out_dir / "ridge_stats_single_trial.nii.gz").exists():
+    if not ctx.force_ffs and (out_dir / "ridge_single_trial_betas.nii.gz").exists():
         print("  Skipping ffs_ridge (outputs exist, use --force-ffs to re-run)")
         return 0.0
 
@@ -117,18 +120,12 @@ def validate(ctx: BenchmarkContext) -> dict:
     ffs = ctx.ffs_ridge_dir
 
     # Load GLMsingle NIfTI results
-    matlab_fracvalue = np.array(
-        nib.load(str(gs / "glmsingle_fracvalue.nii.gz")).dataobj
-    ).flatten()
-    matlab_r2 = np.array(
-        nib.load(str(gs / "glmsingle_r2_D.nii.gz")).dataobj
-    ).flatten()
-    matlab_mask = np.array(
-        nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj
-    ).flatten().astype(bool)
-    matlab_betas = np.array(
-        nib.load(str(gs / "glmsingle_betas_D.nii.gz")).dataobj
+    matlab_fracvalue = np.array(nib.load(str(gs / "glmsingle_fracvalue.nii.gz")).dataobj).flatten()
+    matlab_r2 = np.array(nib.load(str(gs / "glmsingle_r2_D.nii.gz")).dataobj).flatten()
+    matlab_mask = (
+        np.array(nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj).flatten().astype(bool)
     )
+    matlab_betas = np.array(nib.load(str(gs / "glmsingle_betas_D.nii.gz")).dataobj)
 
     results = {}
 
@@ -139,7 +136,7 @@ def validate(ctx: BenchmarkContext) -> dict:
         ffs_frac = np.array(nib.load(str(frac_file)).dataobj).flatten()
 
     # Load FFS betas (Type D = ridge regularized)
-    betas_file = ffs / "ridge_stats_single_trial.nii.gz"
+    betas_file = ffs / "ridge_single_trial_betas.nii.gz"
     ffs_betas = None
     if betas_file.exists():
         ffs_betas = np.array(nib.load(str(betas_file)).dataobj)
@@ -155,9 +152,11 @@ def validate(ctx: BenchmarkContext) -> dict:
     # 1. FRACvalue correlation
     frac_corr = float("nan")
     if ffs_frac is not None:
-        mask = matlab_mask & (ffs_frac > 0) & (matlab_fracvalue > 0)
+        mask = matlab_mask & np.isfinite(ffs_frac) & np.isfinite(matlab_fracvalue)
+        mask = mask & (ffs_frac > 0) & (matlab_fracvalue > 0)
         if mask.sum() > 100:
             frac_corr = _pearson_r(matlab_fracvalue[mask], ffs_frac[mask])
+        results["frac_n_voxels"] = int(mask.sum())
     results["fracvalue_corr"] = frac_corr
 
     # 2. Beta spatial correlation (median across trials)
@@ -176,13 +175,22 @@ def validate(ctx: BenchmarkContext) -> dict:
             ffs_betas_flat = ffs_betas
 
         if matlab_betas_flat.shape == ffs_betas_flat.shape:
-            mask = matlab_mask & (np.abs(ffs_betas_flat).sum(axis=1) > 0)
+            mask = matlab_mask.copy()
+            mask = mask & np.isfinite(matlab_betas_flat).all(axis=1)
+            mask = mask & np.isfinite(ffs_betas_flat).all(axis=1)
+            mask = mask & (np.abs(ffs_betas_flat).sum(axis=1) > 0)
             trial_corrs = []
             n_sample = min(matlab_betas_flat.shape[1], 50)
             for t in range(n_sample):
                 r = _pearson_r(matlab_betas_flat[mask, t], ffs_betas_flat[mask, t])
                 trial_corrs.append(r)
             beta_corr = float(np.median(trial_corrs))
+            results["beta_n_voxels"] = int(mask.sum())
+            results["beta_n_trials_sampled"] = int(n_sample)
+        else:
+            results["beta_shape_mismatch"] = (
+                f"matlab={matlab_betas_flat.shape} vs ffs={ffs_betas_flat.shape}"
+            )
     results["beta_spatial_corr"] = beta_corr
 
     # 3. R² spatial correlation
@@ -200,9 +208,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     if not np.isnan(beta_corr):
         passed = passed and beta_corr >= THRESHOLDS["beta_spatial_corr"]
 
-    summary = (
-        f"frac r={frac_corr:.4f}, beta r={beta_corr:.4f}, R² r={r2_corr:.4f}"
-    )
+    summary = f"frac r={frac_corr:.4f}, beta r={beta_corr:.4f}, R² r={r2_corr:.4f}"
     results["passed"] = passed
     results["summary"] = summary
     return results

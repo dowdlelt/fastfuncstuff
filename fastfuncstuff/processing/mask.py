@@ -21,10 +21,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-
 # ---------------------------------------------------------------------------
 # Clip-level estimation (matches THD_cliplevel)
 # ---------------------------------------------------------------------------
+
 
 def _cliplevel(vol: Tensor, mfrac: float = 0.5) -> float:
     """Estimate intensity clip level using AFNI's iterative median algorithm.
@@ -74,7 +74,8 @@ def _cliplevel(vol: Tensor, mfrac: float = 0.5) -> float:
 # 6-connectivity morphological operations (matching AFNI)
 # ---------------------------------------------------------------------------
 
-def _dilate_6conn(mask: Tensor, iterations: int = 1) -> Tensor:
+
+def _dilate_6conn(mask: Tensor, iterations: int = 2) -> Tensor:
     """Dilate with 6-connectivity (face neighbors only).
 
     Uses a 3D convolution with a cross-shaped kernel instead of max_pool3d
@@ -158,6 +159,7 @@ def _peel(mask: Tensor, peelcount: int = 1, peelthr: int = 17) -> Tensor:
 # Connected component (6-connectivity, matching AFNI's THD_mask_clust)
 # ---------------------------------------------------------------------------
 
+
 def _largest_component_6conn(mask: Tensor, vol: Tensor | None = None) -> Tensor:
     """Keep largest connected component using 6-connectivity.
 
@@ -211,6 +213,7 @@ def _largest_component_6conn(mask: Tensor, vol: Tensor | None = None) -> Tensor:
 # Hole filling (matches THD_mask_fillin_once / THD_mask_fillin_completely)
 # ---------------------------------------------------------------------------
 
+
 def _fillin_once(mask: Tensor, nside: int = 1) -> Tensor:
     """Fill voxels that have mask on opposite sides within distance nside.
 
@@ -232,11 +235,11 @@ def _fillin_once(mask: Tensor, nside: int = 1) -> Tensor:
             #   neighbor at i-d  →  neg_slice
             #   the voxel itself →  center_slice
             pos_slice = [slice(None)] * 3
-            pos_slice[axis] = slice(2 * d, sz)         # i+d for i in [d, sz-d)
+            pos_slice[axis] = slice(2 * d, sz)  # i+d for i in [d, sz-d)
             neg_slice = [slice(None)] * 3
-            neg_slice[axis] = slice(0, sz - 2 * d)     # i-d for i in [d, sz-d)
+            neg_slice[axis] = slice(0, sz - 2 * d)  # i-d for i in [d, sz-d)
             center_slice = [slice(None)] * 3
-            center_slice[axis] = slice(d, sz - d)       # i in [d, sz-d)
+            center_slice[axis] = slice(d, sz - d)  # i in [d, sz-d)
 
             # Voxels that have a set neighbor at +d AND -d along this axis
             has_both = mask[tuple(pos_slice)] & mask[tuple(neg_slice)]
@@ -313,10 +316,11 @@ def _fill_holes_3d(mask: Tensor) -> Tensor:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def automask(
     vol: Tensor,
     clip_frac: float = 0.5,
-    dilate_extra: int = 0,
+    dilate_extra: int = 2,
     peelcount: int = 1,
     peelthr: int = 17,
     device: torch.device | None = None,
@@ -341,7 +345,7 @@ def automask(
     clip_frac : float
         Fraction parameter for THD_cliplevel (default 0.5, matching AFNI).
     dilate_extra : int
-        Extra dilation iterations after the algorithm (default 0).
+        Extra dilation iterations after the algorithm (default 1).
     peelcount : int
         Number of peel iterations (AFNI default: 1).
     peelthr : int
@@ -362,8 +366,10 @@ def automask(
     # Step 1: clip level (matches THD_cliplevel)
     clip = _cliplevel(vol, mfrac=clip_frac)
     if verbose:
-        print(f"  automask: shape=({nz},{ny},{nx}) clip={clip:.4f} "
-              f"range=[{vol.min().item():.4f}, {vol.max().item():.4f}]")
+        print(
+            f"  automask: shape=({nz},{ny},{nx}) clip={clip:.4f} "
+            f"range=[{vol.min().item():.4f}, {vol.max().item():.4f}]"
+        )
 
     # Step 2: threshold
     mask = vol.abs() >= clip
@@ -395,7 +401,9 @@ def automask(
     )
     mask = _fillin_completely(mask, nside=nside_large)
     if verbose:
-        print(f"  automask: after large fill (nside={nside_large}): {int(mask.sum().item()):,} voxels")
+        print(
+            f"  automask: after large fill (nside={nside_large}): {int(mask.sum().item()):,} voxels"
+        )
 
     # Step 7: fill interior holes (flood from border)
     mask = _fill_holes_3d(mask)
