@@ -1010,7 +1010,7 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     r2_initial_all = torch.zeros(chunk_voxels, device=device)
     r2_final_all = torch.zeros(chunk_voxels, device=device)
     xval_r2_all = torch.zeros(chunk_voxels, device=device)
-    optimal_fracs_all = torch.zeros(chunk_voxels, device=device)
+    optimal_fracs_all = torch.zeros(chunk_voxels, device=device, dtype=torch.float64)
     r2_by_frac_all = torch.zeros(chunk_voxels, n_fracs, device=device)
 
     # Process each group

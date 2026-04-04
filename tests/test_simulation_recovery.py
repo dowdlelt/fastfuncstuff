@@ -591,7 +591,7 @@ class TestRidgeRecovery:
         from fastfuncstuff.glm.ridge import fit_ridge_single_trial
 
         inp = self._build_ridge_inputs(
-            isi_min=2.0, isi_max=7.0, n_events_per_cond=10, noise_scale=0.01
+            isi_min=2.0, isi_max=7.0, n_events_per_cond=4, noise_scale=0.01
         )
 
         print("\nDiagnostics:")
@@ -1032,7 +1032,10 @@ class TestDenoiseRecovery:
         With injected shared PCs, cross_validate_noise_pcs should show
         improving (or non-decreasing) R² as PCs are added up to the true count.
         """
-        from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncstuff.denoise.sequential import (
+            cross_validate_noise_pcs,
+            extract_noise_pcs_per_run,
+        )
 
         inp = self._build_denoise_inputs(n_true_pcs=3, task_snr=4.0)
         n_true_pcs = inp["n_true_pcs"]

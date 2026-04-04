@@ -12,7 +12,6 @@ Uses realistic fMRI simulation to verify:
 - Single-trial estimation recovers known betas
 """
 
-
 import numpy as np
 import pytest
 import torch
@@ -483,7 +482,6 @@ class TestRidgeFullPipeline:
 
         assert estimated_strong > estimated_weak, "Ridge should distinguish strong vs weak trials"
 
-    @pytest.mark.skip(reason="Per-voxel HRF feature not fully implemented in ridge.py")
     def test_ridge_with_per_voxel_hrf(self, device):
         """Test ridge with per-voxel HRF selection."""
         tr = 2.0
@@ -566,11 +564,13 @@ class TestRidgeFullPipeline:
 
         data_all = torch.cat(data_list, dim=1)  # Concatenate along time dimension
 
+        # Expand per-HRF design to per-voxel: (n_hrfs, n_tp, n_trials) -> (n_voxels, n_tp, n_trials)
+        design_per_voxel = design_stacked[hrf_indices]
+
         # Fit ridge with per-voxel designs
         cv_splits = generate_cv_splits(n_runs=n_runs, strategy=1, n_perms=1)
         fracs = np.array([0.0, 0.5, 1.0])
 
-        # Build polynomials
         poly = construct_polynomial_matrix(n_timepoints * n_runs, max_degree=1, device=device)
         poly_per_run = []
         for i in range(n_runs):
@@ -582,7 +582,7 @@ class TestRidgeFullPipeline:
 
         results = fit_ridge_single_trial(
             data=data_all,
-            design_matrix=design_stacked,  # Pass stacked design
+            design_matrix=design_per_voxel,
             run_starts=run_starts,
             tr=tr,
             trial_condition_ids=trial_condition_ids,

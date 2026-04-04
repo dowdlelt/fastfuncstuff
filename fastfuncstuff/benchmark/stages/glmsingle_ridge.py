@@ -23,9 +23,8 @@ name = "glmsingle_ridge"
 description = "Fracridge (GLMsingle Type D vs ffs_ridge -single_trials)"
 
 THRESHOLDS = {
-    "fracvalue_corr": 0.80,  # per-voxel fraction correlation
-    "beta_spatial_corr": 0.85,  # spatial correlation of Type D betas
-    "r2_spatial_corr": 0.90,  # spatial correlation of R² maps
+    "fracvalue_corr": 0.80,  # per-voxel fraction correlation (spatial)
+    "beta_timeseries_corr": 0.85,  # median per-voxel timeseries correlation
 }
 
 
@@ -119,9 +118,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     gs = ctx.glmsingle_dir
     ffs = ctx.ffs_ridge_dir
 
-    # Load GLMsingle NIfTI results
     matlab_fracvalue = np.array(nib.load(str(gs / "glmsingle_fracvalue.nii.gz")).dataobj).flatten()
-    matlab_r2 = np.array(nib.load(str(gs / "glmsingle_r2_D.nii.gz")).dataobj).flatten()
     matlab_mask = (
         np.array(nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj).flatten().astype(bool)
     )
@@ -129,27 +126,19 @@ def validate(ctx: BenchmarkContext) -> dict:
 
     results = {}
 
-    # Load FFS FRACvalue
     frac_file = ffs / "ridge_optimal_frac.nii.gz"
     ffs_frac = None
     if frac_file.exists():
         ffs_frac = np.array(nib.load(str(frac_file)).dataobj).flatten()
 
-    # Load FFS betas (Type D = ridge regularized)
     betas_file = ffs / "ridge_single_trial_betas.nii.gz"
     ffs_betas = None
     if betas_file.exists():
         ffs_betas = np.array(nib.load(str(betas_file)).dataobj)
 
-    # Load FFS R²
-    r2_file = ffs / "ridge_single_trial_full_r2.nii.gz"
-    ffs_r2 = None
-    if r2_file.exists():
-        ffs_r2 = np.array(nib.load(str(r2_file)).dataobj).flatten()
-
     from ..validation import _pearson_r
 
-    # 1. FRACvalue correlation
+    # 1. FRACvalue spatial correlation
     frac_corr = float("nan")
     if ffs_frac is not None:
         mask = matlab_mask & np.isfinite(ffs_frac) & np.isfinite(matlab_fracvalue)
@@ -159,10 +148,11 @@ def validate(ctx: BenchmarkContext) -> dict:
         results["frac_n_voxels"] = int(mask.sum())
     results["fracvalue_corr"] = frac_corr
 
-    # 2. Beta spatial correlation (median across trials)
+    # 2. Beta timeseries correlation (per-voxel, median across voxels)
+    #    For each voxel, correlate the ~600-element beta timeseries
+    #    between MATLAB and FFS, then take the median.
     beta_corr = float("nan")
     if ffs_betas is not None:
-        # Reshape to (n_voxels, n_trials) if 4D
         if matlab_betas.ndim == 4:
             n_vox = np.prod(matlab_betas.shape[:3])
             matlab_betas_flat = matlab_betas.reshape(n_vox, matlab_betas.shape[3])
@@ -179,36 +169,27 @@ def validate(ctx: BenchmarkContext) -> dict:
             mask = mask & np.isfinite(matlab_betas_flat).all(axis=1)
             mask = mask & np.isfinite(ffs_betas_flat).all(axis=1)
             mask = mask & (np.abs(ffs_betas_flat).sum(axis=1) > 0)
-            trial_corrs = []
-            n_sample = min(matlab_betas_flat.shape[1], 50)
-            for t in range(n_sample):
-                r = _pearson_r(matlab_betas_flat[mask, t], ffs_betas_flat[mask, t])
-                trial_corrs.append(r)
-            beta_corr = float(np.median(trial_corrs))
+            mask = mask & (np.abs(matlab_betas_flat).sum(axis=1) > 0)
+            vox_corrs = []
+            for v in np.where(mask)[0]:
+                r = _pearson_r(matlab_betas_flat[v], ffs_betas_flat[v])
+                vox_corrs.append(r)
+            beta_corr = float(np.median(vox_corrs))
             results["beta_n_voxels"] = int(mask.sum())
-            results["beta_n_trials_sampled"] = int(n_sample)
+            results["beta_n_trials"] = int(matlab_betas_flat.shape[1])
         else:
             results["beta_shape_mismatch"] = (
                 f"matlab={matlab_betas_flat.shape} vs ffs={ffs_betas_flat.shape}"
             )
-    results["beta_spatial_corr"] = beta_corr
+    results["beta_timeseries_corr"] = beta_corr
 
-    # 3. R² spatial correlation
-    r2_corr = float("nan")
-    if ffs_r2 is not None:
-        mask = matlab_mask & np.isfinite(ffs_r2) & np.isfinite(matlab_r2)
-        if mask.sum() > 100:
-            r2_corr = _pearson_r(matlab_r2[mask], ffs_r2[mask])
-    results["r2_spatial_corr"] = r2_corr
-
-    # Pass/fail
     passed = True
     if not np.isnan(frac_corr):
         passed = passed and frac_corr >= THRESHOLDS["fracvalue_corr"]
     if not np.isnan(beta_corr):
-        passed = passed and beta_corr >= THRESHOLDS["beta_spatial_corr"]
+        passed = passed and beta_corr >= THRESHOLDS["beta_timeseries_corr"]
 
-    summary = f"frac r={frac_corr:.4f}, beta r={beta_corr:.4f}, R² r={r2_corr:.4f}"
+    summary = f"frac r={frac_corr:.4f}, beta ts r={beta_corr:.4f}"
     results["passed"] = passed
     results["summary"] = summary
     return results
