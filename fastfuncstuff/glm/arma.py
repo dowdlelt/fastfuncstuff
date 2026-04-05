@@ -993,6 +993,9 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
     n_timepoints, n_regressors = X.shape
     device = X.device
 
+    # solve_triangular requires 2D input
+    Y_2d = Y.unsqueeze(1) if Y.ndim == 1 else Y
+
     try:
         # Cholesky decomposition: R = L L'
         # MPS has a bug with Cholesky - use CPU as workaround
@@ -1007,7 +1010,7 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
 
         # Prewhiten design and data via triangular solve
         X_w = torch.linalg.solve_triangular(L, X, upper=False)
-        Y_w = torch.linalg.solve_triangular(L, Y, upper=False)
+        Y_w = torch.linalg.solve_triangular(L, Y_2d, upper=False)
 
         # Term 2: log(det(X' R^(-1) X)) = log(det(X_w' X_w))
         XwTXw = X_w.T @ X_w

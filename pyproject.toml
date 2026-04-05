@@ -78,6 +78,23 @@ python_classes = "Test*"
 python_functions = "test_*"
 norecursedirs = [".git", ".tox", "dist", "build", "*.egg", "examples"]
 
+[tool.coverage.run]
+source = ["fastfuncstuff"]
+omit = [
+    "fastfuncstuff/benchmark/*",
+    "fastfuncstuff/cli/*",
+    "fastfuncstuff/processing/*_cli.py",
+    "fastfuncstuff/processing/cli.py",
+    "fastfuncstuff/processing/ffs_motsim.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "if TYPE_CHECKING:",
+]
+
 [tool.ty.environment]
 python-version = "3.12"
 

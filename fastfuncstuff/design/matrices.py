@@ -883,13 +883,16 @@ def convolve_design_hrf(
     # Convolve each regressor
     convolved = torch.zeros_like(design)
 
-    # Batch process with conv1d
+    # Batch process with depthwise conv1d (groups=n_regressors)
     # Shape: (1, n_regressors, n_timepoints)
     design_batch = design.T.unsqueeze(0)
-    hrf_kernel = hrf.flip(0).unsqueeze(0).unsqueeze(0)
+    # Kernel shape for groups: (n_regressors, 1, kernel_len)
+    hrf_kernel = hrf.flip(0).unsqueeze(0).unsqueeze(0).expand(n_regressors, 1, -1)
 
-    # Convolve
-    conv_result = F.conv1d(design_batch, hrf_kernel, padding=len(hrf) // 2)
+    # Depthwise convolution: each regressor convolved independently
+    conv_result = F.conv1d(
+        design_batch, hrf_kernel, padding=len(hrf) // 2, groups=n_regressors
+    )
     convolved = conv_result.squeeze(0).T[:n_timepoints]
 
     return convolved

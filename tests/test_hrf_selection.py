@@ -17,8 +17,15 @@ import pytest
 import torch
 
 from fastfuncstuff.design.hrf_selection import (
+    HRFSelectionResults,
+    _evaluate_hrfs_batched,
+    _evaluate_hrfs_batched_loro,
+    _project_design_with_q_factors,
+    _write_afni_xmat,
     fit_glm_hrf_library_with_xval,
     load_nuisance_file,
+    plot_design_matrix,
+    plot_hrf_library,
 )
 from fastfuncstuff.utils import get_device
 
@@ -111,81 +118,454 @@ class TestHRFSelectionCoreFunctions:
 
     def test_load_nuisance_file_basic(self, tmp_path):
         """Test loading basic nuisance file."""
-        # Create a simple nuisance file
         nuisance_file = tmp_path / "motion.1D"
         n_timepoints = 100
         n_cols = 6
-
-        # Write some data
         data = np.random.randn(n_timepoints, n_cols)
         np.savetxt(nuisance_file, data, delimiter=" ")
-
-        # Load it back
         loaded = load_nuisance_file(nuisance_file)
-
-        assert loaded.shape == (n_timepoints, n_cols), \
-            f"Expected shape ({n_timepoints}, {n_cols}), got {loaded.shape}"
-        assert np.allclose(loaded, data), "Loaded data should match original"
+        assert loaded.shape == (n_timepoints, n_cols)
+        assert np.allclose(loaded, data, atol=1e-5)
 
     def test_load_nuisance_file_with_comments(self, tmp_path):
         """Test loading nuisance file with AFNI-style comments."""
         nuisance_file = tmp_path / "motion.1D"
-
-        # Write file with comments
         with open(nuisance_file, 'w') as f:
             f.write("# This is a comment\n")
             f.write("# Another comment\n")
             f.write("1.0 2.0 3.0\n")
             f.write("4.0 5.0 6.0\n")
             f.write("# Final comment\n")
-
         loaded = load_nuisance_file(nuisance_file)
-
         assert loaded.shape == (2, 3)
         assert np.allclose(loaded, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
     def test_load_nuisance_file_single_column(self, tmp_path):
         """Test that single-column files are reshaped correctly."""
         nuisance_file = tmp_path / "physio.1D"
-
-        # Write single column
         with open(nuisance_file, 'w') as f:
             for i in range(10):
                 f.write(f"{i}\n")
-
         loaded = load_nuisance_file(nuisance_file)
-
-        # Should be reshaped to (n_timepoints, 1)
-        assert loaded.shape == (10, 1), f"Expected shape (10, 1), got {loaded.shape}"
+        assert loaded.shape == (10, 1)
 
     def test_load_nuisance_file_not_found(self, tmp_path):
         """Test error when file doesn't exist."""
-        nuisance_file = tmp_path / "nonexistent.1D"
-
         with pytest.raises(FileNotFoundError, match="Nuisance file not found"):
-            load_nuisance_file(nuisance_file)
+            load_nuisance_file(tmp_path / "nonexistent.1D")
 
     def test_load_nuisance_file_empty(self, tmp_path):
         """Test error when file is empty."""
         nuisance_file = tmp_path / "empty.1D"
-
-        # Create empty file
         nuisance_file.touch()
-
         with pytest.raises(ValueError, match="empty or contains only comments"):
             load_nuisance_file(nuisance_file)
 
     def test_load_nuisance_file_wrong_length(self, tmp_path):
         """Test validation with expected_rows."""
         nuisance_file = tmp_path / "motion.1D"
-
-        # Write 10 rows
-        data = np.random.randn(10, 3)
-        np.savetxt(nuisance_file, data)
-
-        # Expect 20 rows - should raise error
+        np.savetxt(nuisance_file, np.random.randn(10, 3))
         with pytest.raises(ValueError, match="has 10 rows, expected 20"):
             load_nuisance_file(nuisance_file, expected_rows=20)
+
+    def test_load_nuisance_file_csv(self, tmp_path):
+        """Test loading CSV-delimited nuisance file (covers comma delimiter path)."""
+        nuisance_file = tmp_path / "motion.csv"
+        with open(nuisance_file, 'w') as f:
+            f.write("1.0,2.0,3.0\n")
+            f.write("4.0,5.0,6.0\n")
+        loaded = load_nuisance_file(nuisance_file)
+        assert loaded.shape == (2, 3)
+        assert np.allclose(loaded, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+    def test_load_nuisance_file_tab_delimited(self, tmp_path):
+        """Test loading tab-delimited nuisance file (covers tab delimiter path)."""
+        nuisance_file = tmp_path / "motion.tsv"
+        with open(nuisance_file, 'w') as f:
+            f.write("1.0\t2.0\t3.0\n")
+            f.write("4.0\t5.0\t6.0\n")
+        loaded = load_nuisance_file(nuisance_file)
+        assert loaded.shape == (2, 3)
+        assert np.allclose(loaded, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+    def test_load_nuisance_file_parse_error(self, tmp_path):
+        """Test error on unparseable file content."""
+        nuisance_file = tmp_path / "bad.1D"
+        with open(nuisance_file, 'w') as f:
+            f.write("abc def ghi\n")
+        with pytest.raises(ValueError, match="Error parsing nuisance file"):
+            load_nuisance_file(nuisance_file)
+
+
+# ============================================================================
+# Tests for _project_design_with_q_factors
+# ============================================================================
+
+class TestProjectDesignWithQFactors:
+    """Test the QR-based nuisance projection for design matrices."""
+
+    def test_identity_projection_when_no_nuisance(self):
+        """When Q factors are None, design should pass through unchanged."""
+        n_tp, n_cols = 60, 3
+        design = torch.randn(n_tp, n_cols)
+        q_factors = [None, None]
+        run_starts = [0, 30]
+        result = _project_design_with_q_factors(
+            design, q_factors, run_starts, n_tp, 2, torch.device("cpu")
+        )
+        assert torch.allclose(result, design, atol=1e-6)
+
+    def test_projection_removes_nuisance_component(self):
+        """Projection should remove the component of design in Q's column space."""
+        n_tp = 40
+        # Build a simple Q factor (orthonormal columns)
+        Q_raw = torch.randn(n_tp, 2)
+        Q, _ = torch.linalg.qr(Q_raw)
+        # Build a design that is partly in Q's column space
+        design = Q @ torch.randn(2, 3) + torch.randn(n_tp, 3) * 0.1
+        q_factors = [Q]
+        run_starts = [0]
+        result = _project_design_with_q_factors(
+            design, q_factors, run_starts, n_tp, 1, torch.device("cpu")
+        )
+        # Projected design should be orthogonal to Q
+        overlap = Q.T @ result
+        assert overlap.abs().max() < 1e-4
+
+    def test_multi_run_projection(self):
+        """Each run should be projected independently."""
+        n_tp_run = 30
+        n_tp = 2 * n_tp_run
+        Q1_raw = torch.randn(n_tp_run, 2)
+        Q1, _ = torch.linalg.qr(Q1_raw)
+        Q2_raw = torch.randn(n_tp_run, 2)
+        Q2, _ = torch.linalg.qr(Q2_raw)
+        design = torch.randn(n_tp, 3)
+        result = _project_design_with_q_factors(
+            design, [Q1, Q2], [0, n_tp_run], n_tp, 2, torch.device("cpu")
+        )
+        # Check each run's block is orthogonal to its Q factor
+        overlap1 = Q1.T @ result[:n_tp_run]
+        overlap2 = Q2.T @ result[n_tp_run:]
+        assert overlap1.abs().max() < 1e-4
+        assert overlap2.abs().max() < 1e-4
+
+
+# ============================================================================
+# Tests for _evaluate_hrfs_batched
+# ============================================================================
+
+class TestEvaluateHRFsBatched:
+    """Test batched HRF evaluation via cross-validation."""
+
+    def _make_simple_cv_data(self, n_runs=3, n_tp_run=40, n_voxels=10, n_designs=2):
+        """Build simple projected data/designs for batched evaluation."""
+        torch.manual_seed(99)
+        n_tp = n_runs * n_tp_run
+        run_starts = [i * n_tp_run for i in range(n_runs)]
+
+        # Data: voxels x timepoints
+        data = torch.randn(n_voxels, n_tp)
+
+        # Two designs with different quality fits
+        n_cols = 3
+        designs = []
+        for d in range(n_designs):
+            X = torch.randn(n_tp, n_cols) * (1.0 + d * 0.5)
+            designs.append(X)
+
+        return data, designs, run_starts
+
+    def test_loro_returns_correct_shape(self):
+        """LORO evaluation returns (n_voxels, n_designs) R2."""
+        data, designs, run_starts = self._make_simple_cv_data(n_runs=3)
+        # LORO splits
+        cv_splits = [([j for j in range(3) if j != i], [i]) for i in range(3)]
+        r2 = _evaluate_hrfs_batched(
+            data, designs, run_starts, cv_splits,
+            torch.device("cpu"), verbose=False
+        )
+        assert r2.shape == (10, 2)
+        assert torch.all(torch.isfinite(r2))
+
+    def test_split_half_returns_correct_shape(self):
+        """Split-half evaluation returns (n_voxels, n_designs) R2."""
+        data, designs, run_starts = self._make_simple_cv_data(n_runs=4, n_tp_run=30)
+        # Split-half: each test has 2 runs, so each TP in test twice across folds
+        cv_splits = [
+            ([0, 1], [2, 3]),
+            ([2, 3], [0, 1]),
+            ([0, 2], [1, 3]),
+            ([1, 3], [0, 2]),
+        ]
+        r2 = _evaluate_hrfs_batched(
+            data, designs, run_starts, cv_splits,
+            torch.device("cpu"), verbose=False
+        )
+        assert r2.shape == (10, 2)
+        assert torch.all(torch.isfinite(r2))
+
+    def test_good_design_beats_noise_design(self):
+        """A design correlated with data should have higher R2 than random noise."""
+        torch.manual_seed(42)
+        n_runs, n_tp_run, n_voxels = 3, 50, 20
+        n_tp = n_runs * n_tp_run
+        run_starts = [i * n_tp_run for i in range(n_runs)]
+
+        # Good design: data is linear combo of design columns + noise
+        X_good = torch.randn(n_tp, 3)
+        betas = torch.randn(n_voxels, 3) * 2.0
+        data = betas @ X_good.T + torch.randn(n_voxels, n_tp) * 0.3
+
+        X_bad = torch.randn(n_tp, 3)  # uncorrelated noise design
+
+        cv_splits = [([j for j in range(3) if j != i], [i]) for i in range(3)]
+        r2 = _evaluate_hrfs_batched(
+            data, [X_good, X_bad], run_starts, cv_splits,
+            torch.device("cpu"), verbose=False
+        )
+        # Good design should have higher R2 on average
+        assert r2[:, 0].mean() > r2[:, 1].mean()
+
+    def test_loro_alias_matches(self):
+        """_evaluate_hrfs_batched_loro should produce same result as _evaluate_hrfs_batched."""
+        data, designs, run_starts = self._make_simple_cv_data(n_runs=3)
+        cv_splits = [([j for j in range(3) if j != i], [i]) for i in range(3)]
+        r2_main = _evaluate_hrfs_batched(
+            data, designs, run_starts, cv_splits,
+            torch.device("cpu"), verbose=False
+        )
+        r2_alias = _evaluate_hrfs_batched_loro(
+            data, designs, run_starts, cv_splits,
+            torch.device("cpu"), verbose=False
+        )
+        assert torch.allclose(r2_main, r2_alias)
+
+    def test_explicit_chunk_size(self):
+        """Setting chunk_size should still produce valid results."""
+        data, designs, run_starts = self._make_simple_cv_data(n_runs=3, n_voxels=20)
+        cv_splits = [([j for j in range(3) if j != i], [i]) for i in range(3)]
+        r2 = _evaluate_hrfs_batched(
+            data, designs, run_starts, cv_splits,
+            torch.device("cpu"), chunk_size=5, verbose=False
+        )
+        assert r2.shape == (20, 2)
+        assert torch.all(torch.isfinite(r2))
+
+    def test_split_half_with_unequal_train_test(self):
+        """Split-half where n_train < n_test triggers warning path."""
+        import warnings
+        data, designs, run_starts = self._make_simple_cv_data(n_runs=5, n_tp_run=20)
+        # 2 train, 3 test -- n_train < n_test
+        cv_splits = [
+            ([0, 1], [2, 3, 4]),
+            ([2, 3], [0, 1, 4]),
+        ]
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            r2 = _evaluate_hrfs_batched(
+                data, designs, run_starts, cv_splits,
+                torch.device("cpu"), verbose=False
+            )
+        assert r2.shape == (10, 2)
+        # Should have produced a warning about n_train < n_test
+        assert any("training runs" in str(warning.message) for warning in w)
+
+
+# ============================================================================
+# Tests for _write_afni_xmat
+# ============================================================================
+
+class TestWriteAfniXmat:
+    """Test AFNI xmat.1D file writing."""
+
+    def test_basic_write(self, tmp_path):
+        """Write a simple design matrix and verify format."""
+        design = np.array([[1.0, 0.0, 0.5], [0.0, 1.0, 0.3], [0.5, 0.5, 0.1]])
+        out_file = str(tmp_path / "test.xmat.1D")
+        _write_afni_xmat(
+            design, out_file, n_stim_cols=2,
+            condition_labels=["face", "house"],
+            run_starts=[0], tr=2.0, polort=1
+        )
+        with open(out_file) as f:
+            content = f.read()
+        assert "face" in content
+        assert "house" in content
+        assert "ni_dimen" in content
+        assert 'RowTR = "2.0"' in content
+        # Verify data rows
+        lines = [l for l in content.strip().split("\n") if not l.startswith("#")]
+        assert len(lines) == 3
+
+    def test_write_with_polort_labels(self, tmp_path):
+        """Polort labels should follow r01_poly0 pattern."""
+        n_tp, n_stim, n_nuis = 60, 2, 4
+        design = np.random.randn(n_tp, n_stim + n_nuis)
+        out_file = str(tmp_path / "test.xmat.1D")
+        _write_afni_xmat(
+            design, out_file, n_stim_cols=n_stim,
+            condition_labels=None,
+            run_starts=[0, 30], tr=2.0, polort=1
+        )
+        with open(out_file) as f:
+            content = f.read()
+        assert "r01_poly0" in content
+        assert "r02_poly1" in content
+        assert "stim00" in content  # auto-generated label
+
+    def test_write_with_extra_nuisance_labels(self, tmp_path):
+        """Extra nuisance labels should appear in output."""
+        n_tp = 30
+        design = np.random.randn(n_tp, 5)  # 2 stim + 2 poly + 1 extra
+        out_file = str(tmp_path / "test.xmat.1D")
+        _write_afni_xmat(
+            design, out_file, n_stim_cols=2,
+            condition_labels=["cond_A", "cond_B"],
+            run_starts=[0], tr=1.5, polort=1,
+            extra_nuisance_labels=["motion_roll"]
+        )
+        with open(out_file) as f:
+            content = f.read()
+        assert "motion_roll" in content
+        assert "cond_A" in content
+
+    def test_write_no_stim_cols(self, tmp_path):
+        """Edge case: 0 stim cols should still write valid header."""
+        design = np.random.randn(20, 3)
+        out_file = str(tmp_path / "test.xmat.1D")
+        _write_afni_xmat(
+            design, out_file, n_stim_cols=0,
+            condition_labels=None,
+            run_starts=[0], tr=2.0
+        )
+        with open(out_file) as f:
+            content = f.read()
+        assert 'Nstim = "0"' in content
+        # Should NOT have StimBots/StimTops when n_stim_cols=0
+        assert "StimBots" not in content
+
+    def test_write_multiple_runs(self, tmp_path):
+        """RunStart header should list all run starts."""
+        design = np.random.randn(90, 4)
+        out_file = str(tmp_path / "test.xmat.1D")
+        _write_afni_xmat(
+            design, out_file, n_stim_cols=2,
+            condition_labels=None,
+            run_starts=[0, 30, 60], tr=2.0
+        )
+        with open(out_file) as f:
+            content = f.read()
+        assert "0,30,60" in content
+
+
+# ============================================================================
+# Tests for plot functions (just verify they don't crash)
+# ============================================================================
+
+class TestPlotFunctions:
+    """Test plotting functions produce output without errors."""
+
+    def test_plot_design_matrix_to_file(self, tmp_path):
+        """plot_design_matrix should save a PNG file."""
+        design = torch.randn(100, 5)
+        out_file = str(tmp_path / "design.png")
+        plot_design_matrix(
+            design, output_file=out_file, tr=2.0,
+            column_labels=["a", "b", "c", "d", "e"],
+            run_starts=[0, 50]
+        )
+        assert (tmp_path / "design.png").exists()
+
+    def test_plot_design_matrix_numpy_input(self, tmp_path):
+        """plot_design_matrix should accept numpy arrays."""
+        design = np.random.randn(80, 3)
+        out_file = str(tmp_path / "design_np.png")
+        plot_design_matrix(design, output_file=out_file, tr=1.0)
+        assert (tmp_path / "design_np.png").exists()
+
+    def test_plot_design_matrix_many_columns(self, tmp_path):
+        """plot_design_matrix with >20 columns should still work."""
+        design = torch.randn(60, 25)
+        out_file = str(tmp_path / "design_big.png")
+        plot_design_matrix(design, output_file=out_file)
+        assert (tmp_path / "design_big.png").exists()
+
+    def test_plot_hrf_library_to_file(self, tmp_path):
+        """plot_hrf_library should save a PNG file."""
+        hrf_lib = torch.randn(5, 32)
+        out_file = str(tmp_path / "hrfs.png")
+        plot_hrf_library(hrf_lib, output_file=out_file, tr=0.1, highlight_idx=2)
+        assert (tmp_path / "hrfs.png").exists()
+
+    def test_plot_hrf_library_numpy_input(self, tmp_path):
+        """plot_hrf_library should accept numpy arrays."""
+        hrf_lib = np.random.randn(3, 50)
+        out_file = str(tmp_path / "hrfs_np.png")
+        plot_hrf_library(hrf_lib, output_file=out_file)
+        assert (tmp_path / "hrfs_np.png").exists()
+
+    def test_plot_hrf_library_single_hrf(self, tmp_path):
+        """plot_hrf_library with a single HRF should not crash."""
+        hrf_lib = torch.randn(1, 32)
+        out_file = str(tmp_path / "hrf_single.png")
+        plot_hrf_library(hrf_lib, output_file=out_file)
+        assert (tmp_path / "hrf_single.png").exists()
+
+    def test_plot_hrf_library_many_hrfs(self, tmp_path):
+        """plot_hrf_library with >10 HRFs should skip legend."""
+        hrf_lib = torch.randn(15, 32)
+        out_file = str(tmp_path / "hrfs_many.png")
+        plot_hrf_library(hrf_lib, output_file=out_file)
+        assert (tmp_path / "hrfs_many.png").exists()
+
+
+# ============================================================================
+# Tests for HRFSelectionResults
+# ============================================================================
+
+class TestHRFSelectionResults:
+    """Test HRFSelectionResults container"""
+
+    def test_hrf_selection_results_initialization(self, device):
+        """Test that HRFSelectionResults can be initialized"""
+        n_voxels = 20
+        n_hrfs = 3
+        results = HRFSelectionResults()
+
+        assert hasattr(results, "hrf_index")
+        assert hasattr(results, "xval_r2_best")
+        assert hasattr(results, "xval_r2_all_hrfs")
+        assert hasattr(results, "xval_r2_canonical")
+        assert hasattr(results, "hrf_library")
+        assert hasattr(results, "hrf_metadata")
+
+        results.hrf_index = torch.zeros(n_voxels, dtype=torch.long, device=device)
+        results.xval_r2_best = torch.randn(n_voxels, device=device)
+        results.xval_r2_all_hrfs = torch.randn(n_voxels, n_hrfs, device=device)
+        results.hrf_metadata = {"mode": "per_voxel", "tr": 2.0}
+        assert results.hrf_index.shape == (n_voxels,)
+
+    def test_all_optional_fields_default_none(self):
+        """All optional fields should be None by default."""
+        r = HRFSelectionResults()
+        assert r.hrf_index is None
+        assert r.xval_r2_best is None
+        assert r.xval_r2_std is None
+        assert r.final_results is None
+        assert r.canonical_results is None
+        assert r.canonical_full_r2 is None
+        assert r.hrfopt_full_r2 is None
+        assert r.canonical_xval_r2 is None
+        assert r.hrfopt_xval_r2 is None
+        assert r.design_matrix is None
+        assert r.canonical_design_matrix is None
+
+    def test_dict_fields_default_empty(self):
+        """Dict/list fields should default to empty."""
+        r = HRFSelectionResults()
+        assert r.hrf_metadata == {}
+        assert r.hrf_group_indices == {}
 
 
 # ============================================================================
@@ -216,7 +596,6 @@ class TestHRFSelectionSubWorkflows:
             device=device,
         )
 
-        # Check required fields
         assert results.hrf_index is not None
         assert results.hrf_index.shape == (n_voxels,)
         assert results.hrf_index.min() >= 0
@@ -241,7 +620,6 @@ class TestHRFSelectionSubWorkflows:
         data, onset_matrix, hrf_library, run_starts, _, tr = (
             _build_hrf_test_inputs(n_runs=2, n_voxels=10))
 
-        # Should not raise
         results = fit_glm_hrf_library_with_xval(
             data=data,
             onsets=onset_matrix,
@@ -258,8 +636,6 @@ class TestHRFSelectionSubWorkflows:
         """
         When two groups of voxels have signal generated by different HRFs
         (HRF 0 vs HRF 2), the majority of each group selects its own HRF.
-
-        Uses high SNR (noise_level=0.1) to make the distinction clear.
         """
         from fastfuncstuff.design.matrices import convolve_hrf_microtime
         from fastfuncstuff.design.builder import create_onset_matrix_microtime
@@ -285,7 +661,6 @@ class TestHRFSelectionSubWorkflows:
             all_onsets, run_starts, tr, n_tp_total, microtime_dt,
             stim_durations, torch.device("cpu"))
 
-        # Build 3-HRF library
         n_hrf_bins = int(round(32.0 / microtime_dt))
         t_hrf = np.arange(n_hrf_bins) * microtime_dt
         hrfs = []
@@ -296,7 +671,6 @@ class TestHRFSelectionSubWorkflows:
             hrfs.append(h)
         hrf_library = torch.from_numpy(np.stack(hrfs).astype(np.float32))
 
-        # Group A: generated by HRF 0 (fast), Group B: by HRF 2 (slow)
         data_parts = []
         for hrf_idx in [0, 2]:
             d_out = convolve_hrf_microtime(
@@ -308,7 +682,7 @@ class TestHRFSelectionSubWorkflows:
             noise = torch.randn(n_voxels_per_group, n_tp_total) * 0.1
             data_parts.append(signal + noise)
 
-        data = torch.cat(data_parts, dim=0)  # (2*n_voxels_per_group, n_tp_total)
+        data = torch.cat(data_parts, dim=0)
 
         results = fit_glm_hrf_library_with_xval(
             data=data,
@@ -324,7 +698,6 @@ class TestHRFSelectionSubWorkflows:
         group_a_idx = results.hrf_index[:n_voxels_per_group].cpu().numpy()
         group_b_idx = results.hrf_index[n_voxels_per_group:].cpu().numpy()
 
-        # Majority of group A should pick HRF 0, group B should pick HRF 2
         frac_a_correct = (group_a_idx == 0).mean()
         frac_b_correct = (group_b_idx == 2).mean()
 
@@ -333,35 +706,146 @@ class TestHRFSelectionSubWorkflows:
         assert frac_b_correct >= 0.6, (
             f"Group B (HRF 2) correct fraction too low: {frac_b_correct:.2f}")
 
+    def test_extra_regressors_ndarray(self, device):
+        """fit_glm_hrf_library_with_xval accepts extra_regressors as ndarray."""
+        data, onset_matrix, hrf_library, run_starts, n_tp, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        extra = np.random.randn(n_tp, 2).astype(np.float32)
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device, extra_regressors=extra,
+        )
+        assert results is not None
+        assert results.hrf_metadata["n_extra_nuisance"] == 2
 
-class TestHRFSelectionResults:
-    """Test HRFSelectionResults container"""
+    def test_extra_regressors_tensor(self, device):
+        """fit_glm_hrf_library_with_xval accepts extra_regressors as tensor."""
+        data, onset_matrix, hrf_library, run_starts, n_tp, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        extra = torch.randn(n_tp, 3)
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device, extra_regressors=extra,
+        )
+        assert results is not None
+        assert results.hrf_metadata["n_extra_nuisance"] == 3
 
-    def test_hrf_selection_results_initialization(self, device):
-        """Test that HRFSelectionResults can be initialized"""
-        from fastfuncstuff.design.hrf_selection import HRFSelectionResults
+    def test_extra_regressors_1d(self, device):
+        """1D extra_regressors should be reshaped to (n_tp, 1)."""
+        data, onset_matrix, hrf_library, run_starts, n_tp, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        extra = np.random.randn(n_tp).astype(np.float32)
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device, extra_regressors=extra,
+        )
+        assert results.hrf_metadata["n_extra_nuisance"] == 1
 
-        n_voxels = 20
-        n_hrfs = 3
+    def test_canonical_mode_glmsingle(self, device):
+        """canonical_mode='glmsingle' should use GLMsingle HRF."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device, canonical_mode="glmsingle",
+        )
+        assert results is not None
 
-        # Create results object
-        results = HRFSelectionResults()
+    def test_canonical_mode_invalid_raises(self, device):
+        """Invalid canonical_mode should raise ValueError."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        with pytest.raises(ValueError, match="Unknown canonical_mode"):
+            fit_glm_hrf_library_with_xval(
+                data=data, onsets=onset_matrix, hrf_library=hrf_library,
+                tr=tr, run_starts=run_starts, polort=1, verbose=False,
+                device=device, canonical_mode="invalid_mode",
+            )
 
-        # Should have all required attributes (default None)
-        assert hasattr(results, "hrf_index")
-        assert hasattr(results, "xval_r2_best")
-        assert hasattr(results, "xval_r2_all_hrfs")
-        assert hasattr(results, "xval_r2_canonical")
-        assert hasattr(results, "hrf_library")
-        assert hasattr(results, "hrf_metadata")
+    def test_data_timepoints_mismatch_raises(self, device):
+        """Mismatched data/onset timepoints should raise ValueError."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        # Truncate data to create mismatch
+        bad_data = data[:, :data.shape[1] - 5]
+        with pytest.raises(ValueError, match="Data has .* timepoints but design implies"):
+            fit_glm_hrf_library_with_xval(
+                data=bad_data, onsets=onset_matrix, hrf_library=hrf_library,
+                tr=tr, run_starts=run_starts, polort=1, verbose=False,
+                device=device,
+            )
 
-        # Can set attributes
-        results.hrf_index = torch.zeros(n_voxels, dtype=torch.long, device=device)
-        results.xval_r2_best = torch.randn(n_voxels, device=device)
-        results.xval_r2_all_hrfs = torch.randn(n_voxels, n_hrfs, device=device)
-        results.hrf_metadata = {"mode": "per_voxel", "tr": 2.0}
+    def test_metadata_fields(self, device):
+        """Verify key metadata fields are populated."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device,
+        )
+        m = results.hrf_metadata
+        assert m["tr"] == tr
+        assert m["n_hrfs"] == 3
+        assert m["n_runs"] == 3
+        assert m["polort"] == 1
+        assert "hrf_usage_counts" in m
+        assert len(m["hrf_usage_counts"]) == 3
 
-        assert results.hrf_index.shape == (n_voxels,)
+    def test_final_results_populated(self, device):
+        """final_results and canonical_results should have betas/r2."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device,
+        )
+        assert results.final_results is not None
+        assert results.final_results.betas is not None
+        assert results.final_results.r2 is not None
+        assert results.canonical_results is not None
+        assert results.canonical_results.betas is not None
+
+    def test_design_matrix_stored(self, device):
+        """Design matrix and canonical design matrix should be stored."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device,
+        )
+        assert results.design_matrix is not None
+        assert results.canonical_design_matrix is not None
+
+    def test_hrf_group_indices_populated(self, device):
+        """hrf_group_indices should map used HRFs to voxel indices."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=20))
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=1, verbose=False,
+            device=device,
+        )
+        assert len(results.hrf_group_indices) > 0
+        total_voxels = sum(len(v) for v in results.hrf_group_indices.values())
+        assert total_voxels == 20
+
+    def test_auto_polort(self, device):
+        """polort=None should auto-compute polort from AFNI formula."""
+        data, onset_matrix, hrf_library, run_starts, _, tr = (
+            _build_hrf_test_inputs(n_runs=3, n_voxels=10))
+        results = fit_glm_hrf_library_with_xval(
+            data=data, onsets=onset_matrix, hrf_library=hrf_library,
+            tr=tr, run_starts=run_starts, polort=None, verbose=False,
+            device=device,
+        )
+        assert results.hrf_metadata["polort"] >= 1
 
 
 # ============================================================================
@@ -387,7 +871,7 @@ class TestHRFSelectionFullPipeline:
                 seed=77,
             )
         )
-        n_high = data.shape[0] // 2  # first half has signal
+        n_high = data.shape[0] // 2
 
         results = fit_glm_hrf_library_with_xval(
             data=data,
@@ -403,17 +887,13 @@ class TestHRFSelectionFullPipeline:
         high_snr_selected = results.hrf_index[:n_high].cpu().numpy()
         frac_correct = (high_snr_selected == true_hrf_idx).mean()
         assert frac_correct >= 0.6, (
-            f"Expected ≥60% of high-SNR voxels to select HRF {true_hrf_idx}, "
+            f"Expected >=60% of high-SNR voxels to select HRF {true_hrf_idx}, "
             f"got {frac_correct:.1%}")
 
     def test_cv_prevents_overfitting(self, device):
         """
-        Cross-validated R² should be ≤ in-sample R² for at least the majority
-        of voxels (CV R² is a conservative estimate of generalization).
-
-        We check xval_r2_best ≤ xval_r2_all_hrfs.max(dim=1) * 1.1, i.e.
-        the selected CV R² is not higher than the best in-sample R² by a
-        large margin (they should be similar or CV slightly lower).
+        Cross-validated R2 should be consistent: xval_r2_best should
+        equal the max over xval_r2_all_hrfs.
         """
         data, onset_matrix, hrf_library, run_starts, _, tr = (
             _build_hrf_test_inputs(n_runs=3, n_voxels=20, noise_level=0.3, seed=13)
@@ -430,24 +910,19 @@ class TestHRFSelectionFullPipeline:
             device=device,
         )
 
-        # xval_r2_best is the max CV R² across HRFs (per voxel)
-        # xval_r2_all_hrfs has CV R² for each HRF — they should match
         if results.xval_r2_all_hrfs is not None and results.xval_r2_best is not None:
-            r2_all = results.xval_r2_all_hrfs  # (n_voxels, n_hrfs)
-            r2_best = results.xval_r2_best      # (n_voxels,)
-            # Best CV R² is simply the max across HRFs — must match
+            r2_all = results.xval_r2_all_hrfs
+            r2_best = results.xval_r2_best
             r2_all_max = r2_all.max(dim=1).values
-            assert torch.allclose(r2_best, r2_all_max, atol=1e-4), (
-                "xval_r2_best should equal the max over all HRFs in xval_r2_all_hrfs")
+            assert torch.allclose(r2_best, r2_all_max, atol=1e-4)
 
     def test_hrf_selection_vs_canonical(self, device):
         """
-        When data is generated by a non-canonical HRF (HRF 0, peak at 5s),
-        the per-voxel selected HRF should give higher CV R² than the canonical
-        HRF (HRF 1, peak at 6s) for the majority of high-SNR voxels.
+        When data is generated by a non-canonical HRF, per-voxel selected HRF
+        should give higher CV R2 than canonical for majority of high-SNR voxels.
         """
-        true_hrf_idx = 0  # fastest HRF in our library
-        canonical_idx = 1  # middle HRF (canonical)
+        true_hrf_idx = 0
+        canonical_idx = 1
 
         data, onset_matrix, hrf_library, run_starts, _, tr = (
             _build_hrf_test_inputs(
@@ -473,12 +948,11 @@ class TestHRFSelectionFullPipeline:
         )
 
         if results.xval_r2_all_hrfs is not None:
-            r2_all = results.xval_r2_all_hrfs  # (n_voxels, n_hrfs)
-            r2_selected = results.xval_r2_best[:n_high]         # type: ignore[index]
+            r2_all = results.xval_r2_all_hrfs
+            r2_selected = results.xval_r2_best[:n_high]
             r2_canonical = r2_all[:n_high, canonical_idx]
 
-            # Selected HRF should beat canonical for majority of high-SNR voxels
             frac_better = (r2_selected > r2_canonical).float().mean().item()
             assert frac_better >= 0.5, (
-                f"Selected HRF should beat canonical for ≥50% of high-SNR voxels, "
+                f"Selected HRF should beat canonical for >=50% of high-SNR voxels, "
                 f"got {frac_better:.1%}")

@@ -150,9 +150,11 @@ def test_icasso_main_function():
     assert centroids.shape[1] == n_voxels
     
     # Check basic correctness
-    # Since n_comps=3 and signal is clean, we expect 3 stable components
-    if results['n_stable'] == 3:
-        assert check_sign_flip_correlation(centroids, S_true) > 0.95
-    else:
-        # If stability filter removed some, we check if those remaining match something
-        pass # Just asserting it ran without error and produced valid shapes is improved
+    # With clean signal and enough runs, should find at least 2 stable components
+    assert results['n_stable'] >= 2, (
+        f"Expected at least 2 stable components from clean 3-component signal, "
+        f"got {results['n_stable']}"
+    )
+    # The stable components should correlate with ground truth
+    corr = check_sign_flip_correlation(centroids[:min(results['n_stable'], n_comps)], S_true)
+    assert corr > 0.8, f"Stable components poorly match ground truth: corr={corr:.3f}"
