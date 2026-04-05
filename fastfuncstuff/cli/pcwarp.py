@@ -103,7 +103,7 @@ def _detect_active_axes(
     Skips the first file (volume 0 may be identity / base-to-base).
     Samples a few files to determine which axes carry displacement.
     """
-    from .io import load_warp_field
+    from fastfuncstuff.processing.io import load_warp_field
 
     # Sample up to 3 non-first files
     candidates = warp_files[1:4] if len(warp_files) > 1 else warp_files[:1]
@@ -218,8 +218,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # --- Load warps and build matrix ---
-    from .io import load_warp_field
-    from ..pca import PCA
+    from fastfuncstuff.processing.io import load_warp_field
+    from fastfuncstuff.decomposition.pca import PCA
 
     if args.verb >= 1:
         print(f"\n  Loading {n_vols} warp files...")

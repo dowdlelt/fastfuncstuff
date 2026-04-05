@@ -18,14 +18,14 @@ import time
 
 import torch
 
-from .affine import (
+from fastfuncstuff.processing.affine import (
     apply_affine,
     apply_affine_wsinc5,
     load_matrix_1D,
     save_matrix_1D,
 )
-from .allineate import AffineAlignConfig, allineate
-from .io import derive_mean_output_path, load_image, save_image
+from fastfuncstuff.processing.allineate import AffineAlignConfig, allineate
+from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -271,7 +271,7 @@ def main(argv: list[str] | None = None) -> None:
     # Auto-size box radius if requested
     lpa_sigma = args.lpa_sigma
     if args.lpa_kernel == "box" and lpa_sigma <= 0:
-        from .cost import auto_box_radius
+        from fastfuncstuff.processing.cost import auto_box_radius
         lpa_sigma = float(auto_box_radius(500))
         if verb >= 1:
             side = 2 * int(lpa_sigma) + 1

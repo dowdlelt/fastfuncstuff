@@ -17,8 +17,8 @@ from pathlib import Path
 import torch
 
 from fastfuncstuff.io.afni import get_tr_from_file
-from .io import load_image, save_image
-from .slicetime import load_slice_timing, slicetime_correct, temporal_resample
+from fastfuncstuff.processing.io import load_image, save_image
+from fastfuncstuff.processing.slicetime import load_slice_timing, slicetime_correct, temporal_resample
 
 
 def _resolve_tr(

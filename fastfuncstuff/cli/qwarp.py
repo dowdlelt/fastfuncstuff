@@ -28,14 +28,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .affine import resample_to_base_grid
-from .interp import warp_image_linear
-from .io import load_image, load_warp_field, save_image, save_warp_field
-from .mask import automask
-from .memory import estimate_gpu_memory_gb, print_memory_report
-from .nwarpforge import _regrid_to_dxyz
-from .warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
-from .weight import _gaussian_smooth_3d
+from fastfuncstuff.processing.affine import resample_to_base_grid
+from fastfuncstuff.processing.interp import warp_image_linear
+from fastfuncstuff.processing.io import load_image, load_warp_field, save_image, save_warp_field
+from fastfuncstuff.processing.mask import automask
+from fastfuncstuff.processing.memory import estimate_gpu_memory_gb, print_memory_report
+from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz
+from fastfuncstuff.processing.warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
+from fastfuncstuff.processing.weight import _gaussian_smooth_3d
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -597,7 +597,7 @@ def _extract_warp_pcs(
     matrix, runs PCA to get temporal PCs, and writes them as columns.
     Uses the project's PCA class (covariance-trick SVD for efficiency).
     """
-    from ..pca import PCA
+    from fastfuncstuff.decomposition.pca import PCA
 
     n_vols = len(all_warps_raw)
     if n_vols < 3:
@@ -831,7 +831,7 @@ def main(argv: list[str] | None = None) -> int:
     # Auto-size box radius if requested
     lpa_sigma_val = args.lpa_sigma
     if args.lpa_kernel == "box" and lpa_sigma_val <= 0:
-        from .cost import auto_box_radius
+        from fastfuncstuff.processing.cost import auto_box_radius
         lpa_sigma_val = float(auto_box_radius(500))
         if args.verb >= 1:
             side = 2 * int(lpa_sigma_val) + 1
