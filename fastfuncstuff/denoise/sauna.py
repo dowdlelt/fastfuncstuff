@@ -104,6 +104,7 @@ class SaunaOutputs:
     magnitude_file: Path
     phase_file: Path | None
     gfactor_file: Path | None
+    noise_std_file: Path | None
     residual_file: Path | None
     metadata_file: Path
 
@@ -1020,21 +1021,19 @@ def run_sauna(
     # ------------------------------------------------------------------
     II /= gfactor[..., None].clamp(min=1e-8)
 
-    # For complex data: σ applies to real and imag separately, so the
-    # noise per complex entry has std σ/√2 per component.
-    # The SVD operates on the complex matrix, so per-entry noise std = σ.
-    # But we measured σ from the real+imag variance, so it's already
-    # the right combined measure for the SVD.
-    if is_complex:
-        noise_sigma = global_sigma / math.sqrt(2.0)
-    else:
-        noise_sigma = global_sigma
+    # Noise sigma for Gavish-Donoho optimal shrinkage.
+    #
+    # global_sigma = sqrt(var_real + var_imag) per voxel — this is the std
+    # of the complex entry (i.e. sqrt(E[|z|²])).  The complex SVD produces
+    # singular values whose Marchenko-Pastur bulk edge is:
+    #   global_sigma * (sqrt(M) + sqrt(N))
+    #
+    # No sqrt(2) adjustment needed: global_sigma already captures the full
+    # noise variance of each complex matrix entry.
+    noise_sigma = global_sigma
 
     if cfg.verbose:
-        print(
-            f"  Noise sigma for shrinkage: {noise_sigma:.6g}"
-            f" ({'complex-adjusted' if is_complex else 'real'})"
-        )
+        print(f"  Noise sigma for shrinkage: {noise_sigma:.6g}")
 
     # Clean nan/inf
     nan_mask = ~torch.isfinite(II)
@@ -1178,13 +1177,26 @@ def run_sauna(
         del phase_out_np
 
     gfactor_file: Path | None = None
+    noise_std_file: Path | None = None
     if cfg.save_gfactor_map:
+        # Normalized g-factor (median = 1): relative spatial noise pattern
         gfactor_file = out_dir / f"{out_prefix.name}_gfactor{ext}"
         save_nifti(
             gfactor.detach().cpu().numpy().astype(np.float32),
             output_path=gfactor_file,
             reference_img=magnitude_file,
         )
+        # Noise std map (g * σ): actual per-voxel noise std in data units
+        # Divide your image by this to flatten the noise field.
+        # Comparable to NORDIC's unnormalized g-factor output.
+        noise_std_file = out_dir / f"{out_prefix.name}_noise_std{ext}"
+        noise_std_map = gfactor * global_sigma
+        save_nifti(
+            noise_std_map.detach().cpu().numpy().astype(np.float32),
+            output_path=noise_std_file,
+            reference_img=magnitude_file,
+        )
+        del noise_std_map
 
     residual_file: Path | None = None
     if residual is not None:
@@ -1236,6 +1248,7 @@ def run_sauna(
             "magnitude": str(magn_path),
             "phase": str(phase_path) if phase_path is not None else None,
             "gfactor": str(gfactor_file) if gfactor_file is not None else None,
+            "noise_std": str(noise_std_file) if noise_std_file is not None else None,
             "residual": str(residual_file) if residual_file is not None else None,
         },
     }
@@ -1248,6 +1261,7 @@ def run_sauna(
         magnitude_file=magn_path,
         phase_file=phase_path,
         gfactor_file=gfactor_file,
+        noise_std_file=noise_std_file,
         residual_file=residual_file,
         metadata_file=meta_file,
     )

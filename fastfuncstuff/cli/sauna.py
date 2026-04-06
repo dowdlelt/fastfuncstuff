@@ -246,6 +246,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  Phase output: {outputs.phase_file}")
     if outputs.gfactor_file is not None:
         print(f"  G-factor output: {outputs.gfactor_file}")
+    if outputs.noise_std_file is not None:
+        print(f"  Noise std output: {outputs.noise_std_file}")
     if outputs.residual_file is not None:
         print(f"  Residual output: {outputs.residual_file}")
     print(f"  Metadata: {outputs.metadata_file}")
