@@ -251,6 +251,37 @@ def _estimate_gfactor_from_noise(
 # ---------------------------------------------------------------------------
 
 
+def _legendre_1d(
+    n_pts: int,
+    max_order: int,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Evaluate Legendre polynomials P_0 … P_{max_order} on [-1, 1].
+
+    Returns (n_pts, max_order + 1) float tensor.
+    """
+    t = torch.linspace(-1.0, 1.0, n_pts, device=device)
+    polys = torch.zeros(n_pts, max_order + 1, device=device)
+    polys[:, 0] = 1.0
+    if max_order >= 1:
+        polys[:, 1] = t
+    for k in range(2, max_order + 1):
+        polys[:, k] = (
+            (2 * k - 1) * t * polys[:, k - 1] - (k - 1) * polys[:, k - 2]
+        ) / k
+    return polys
+
+
+def _enumerate_poly_terms(degree: int) -> list[tuple[int, int, int]]:
+    """Return all (i, j, k) triples with i + j + k <= degree."""
+    terms: list[tuple[int, int, int]] = []
+    for i in range(degree + 1):
+        for j in range(degree + 1 - i):
+            for k in range(degree + 1 - i - j):
+                terms.append((i, j, k))
+    return terms
+
+
 def _construct_3d_legendre_basis(
     shape: tuple[int, int, int],
     degree: int,
@@ -260,6 +291,11 @@ def _construct_3d_legendre_basis(
 
     Uses tensor products P_i(x) · P_j(y) · P_k(z) for all (i, j, k) with
     i + j + k <= degree.  Coordinates are mapped to [-1, 1] in each dimension.
+
+    .. note::
+       This materialises the full (N, n_terms) matrix.  For large volumes
+       and/or high degree, use the chunked normal-equation solver inside
+       ``_fit_polynomial_gfactor`` instead.
 
     Parameters
     ----------
@@ -273,38 +309,18 @@ def _construct_3d_legendre_basis(
             n_terms = C(degree + 3, 3) = (d+1)(d+2)(d+3) / 6
     """
     nx, ny, nz = shape
+    Px = _legendre_1d(nx, degree, device)
+    Py = _legendre_1d(ny, degree, device)
+    Pz = _legendre_1d(nz, degree, device)
 
-    # 1-D Legendre polynomials on [-1, 1] for each axis
-    # P_0(t) = 1, P_1(t) = t, P_k(t) via Bonnet recurrence
-    def _legendre_1d(n_pts: int, max_order: int) -> torch.Tensor:
-        """Return (n_pts, max_order+1) matrix of Legendre P_k(t)."""
-        t = torch.linspace(-1.0, 1.0, n_pts, device=device)
-        polys = torch.zeros(n_pts, max_order + 1, device=device)
-        polys[:, 0] = 1.0
-        if max_order >= 1:
-            polys[:, 1] = t
-        for k in range(2, max_order + 1):
-            polys[:, k] = (
-                (2 * k - 1) * t * polys[:, k - 1] - (k - 1) * polys[:, k - 2]
-            ) / k
-        return polys
-
-    Px = _legendre_1d(nx, degree)  # (nx, d+1)
-    Py = _legendre_1d(ny, degree)  # (ny, d+1)
-    Pz = _legendre_1d(nz, degree)  # (nz, d+1)
-
-    # Enumerate (i, j, k) with i+j+k <= degree
     columns = []
-    for i in range(degree + 1):
-        for j in range(degree + 1 - i):
-            for k in range(degree + 1 - i - j):
-                # Outer product: (nx, 1, 1) * (1, ny, 1) * (1, 1, nz) → (nx, ny, nz)
-                col = (
-                    Px[:, i].unsqueeze(1).unsqueeze(2)
-                    * Py[:, j].unsqueeze(0).unsqueeze(2)
-                    * Pz[:, k].unsqueeze(0).unsqueeze(1)
-                )
-                columns.append(col.reshape(-1))
+    for i, j, k in _enumerate_poly_terms(degree):
+        col = (
+            Px[:, i].unsqueeze(1).unsqueeze(2)
+            * Py[:, j].unsqueeze(0).unsqueeze(2)
+            * Pz[:, k].unsqueeze(0).unsqueeze(1)
+        )
+        columns.append(col.reshape(-1))
 
     return torch.stack(columns, dim=1)  # (N, n_terms)
 
@@ -320,10 +336,15 @@ def _fit_polynomial_gfactor(
     polynomial, so ``g = exp(poly)`` — guaranteeing positivity everywhere
     with smooth extrapolation (no clamping, no sharp edges at boundaries).
 
+    Uses **chunked normal equations** to avoid materialising the full
+    (N, n_terms) design matrix.  Memory cost is O(ny·nz·n_terms) instead
+    of O(nx·ny·nz·n_terms), which makes degree-18 fits on 204×230×58
+    volumes feasible in ~150 MB instead of 14 GB.
+
     Parameters
     ----------
     noise_vols : (nx, ny, nz, k) complex or real
-    degree : total polynomial degree (1–10 typical)
+    degree : total polynomial degree (1–18 typical)
     verbose : print diagnostics
 
     Returns
@@ -332,6 +353,7 @@ def _fit_polynomial_gfactor(
     global_sigma : float — global noise std
     """
     nx, ny, nz, k = noise_vols.shape
+    dev = noise_vols.device
 
     # Voxelwise noise std
     if noise_vols.is_complex():
@@ -345,29 +367,79 @@ def _fit_polynomial_gfactor(
     c4 = _c4_bias_correction(k)
     std_map = std_map / c4
 
-    # Build design matrix on the same device as data
-    dev_orig = std_map.device
-    X = _construct_3d_legendre_basis((nx, ny, nz), degree, device=dev_orig)
-    y = std_map.reshape(-1).float()
+    # Prepare targets in log-space
+    valid_3d = (std_map > 0) & torch.isfinite(std_map)
+    log_std = torch.zeros_like(std_map)
+    log_std[valid_3d] = torch.log(std_map[valid_3d])
 
-    # Mask out zeros / non-finite — log requires strictly positive
-    valid = (y > 0) & torch.isfinite(y)
-    if valid.sum() < X.shape[1]:
-        # Not enough valid voxels — fall back to constant
+    # Term enumeration
+    terms = _enumerate_poly_terms(degree)
+    n_terms = len(terms)
+
+    n_valid = int(valid_3d.sum().item())
+    if n_valid < n_terms:
         if verbose:
-            print(f"  Poly fit deg={degree}: only {valid.sum()} valid voxels, falling back")
-        median_val = float(torch.median(y[valid]).item()) if valid.any() else 1.0
-        gfactor = torch.ones(nx, ny, nz, device=dev_orig)
+            print(f"  Poly fit deg={degree}: only {n_valid} valid voxels, falling back")
+        median_val = (
+            float(torch.median(std_map[valid_3d]).item()) if n_valid > 0 else 1.0
+        )
+        gfactor = torch.ones(nx, ny, nz, device=dev)
         return gfactor, max(median_val, 1e-30)
 
-    # Fit in log-space: log(std) = X @ beta  →  std = exp(X @ beta)
-    # This guarantees positivity everywhere with smooth extrapolation.
-    log_y = torch.log(y[valid])
-    beta = torch.linalg.lstsq(X[valid], log_y.unsqueeze(1)).solution.squeeze(1)
-    fitted = torch.exp((X @ beta).reshape(nx, ny, nz))
+    # 1-D Legendre tables (tiny)
+    Px = _legendre_1d(nx, degree, dev)  # (nx, d+1)
+    Py = _legendre_1d(ny, degree, dev)  # (ny, d+1)
+    Pz = _legendre_1d(nz, degree, dev)  # (nz, d+1)
+
+    # Pre-compute the YZ part of each basis term: Py[:,j] ⊗ Pz[:,k]
+    # Shape: (ny*nz, n_terms)  —  this is the big allocation (~71 MB for 230×58×1330)
+    j_idx = torch.tensor([t[1] for t in terms], device=dev)
+    k_idx = torch.tensor([t[2] for t in terms], device=dev)
+    # (ny, n_terms) * (nz, n_terms) via broadcast → (ny, nz, n_terms) → (ny*nz, n_terms)
+    yz_basis = (
+        Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)
+    ).reshape(ny * nz, n_terms)
+
+    i_idx = torch.tensor([t[0] for t in terms], device=dev)
+
+    # ------------------------------------------------------------------
+    # Accumulate normal equations X^T X and X^T y, one x-slice at a time
+    # ------------------------------------------------------------------
+    XtX = torch.zeros(n_terms, n_terms, device=dev, dtype=torch.float64)
+    Xty = torch.zeros(n_terms, device=dev, dtype=torch.float64)
+
+    for xi in range(nx):
+        mask_slice = valid_3d[xi].reshape(-1)          # (ny*nz,)
+        if not mask_slice.any():
+            continue
+        # Scale YZ basis by Px[xi, i] for each term → X_slice
+        px_vals = Px[xi, i_idx]                         # (n_terms,)
+        X_slice = yz_basis * px_vals.unsqueeze(0)       # (ny*nz, n_terms)
+
+        Xv = X_slice[mask_slice].to(torch.float64)     # (n_valid, n_terms)
+        yv = log_std[xi].reshape(-1)[mask_slice].to(torch.float64)
+
+        XtX.addmm_(Xv.T, Xv)
+        Xty.add_(Xv.T @ yv)
+
+    # Tiny ridge for numerical safety (1e-8 × mean diagonal)
+    diag_mean = XtX.diagonal().mean()
+    XtX.diagonal().add_(1e-8 * diag_mean)
+
+    beta = torch.linalg.solve(XtX, Xty).float()         # (n_terms,)
+
+    # ------------------------------------------------------------------
+    # Evaluate fitted = exp(X @ beta) one x-slice at a time
+    # ------------------------------------------------------------------
+    fitted = torch.empty(nx, ny, nz, device=dev)
+    for xi in range(nx):
+        px_vals = Px[xi, i_idx]
+        X_slice = yz_basis * px_vals.unsqueeze(0)       # (ny*nz, n_terms)
+        fitted[xi] = torch.exp((X_slice @ beta).reshape(ny, nz))
+
+    del yz_basis  # free the biggest temporary
 
     # Normalize to median=1 using valid-voxel median
-    valid_3d = valid.reshape(nx, ny, nz)
     median_noise = float(torch.median(fitted[valid_3d]).item())
     median_noise = max(median_noise, 1e-30)
 
@@ -381,7 +453,6 @@ def _fit_polynomial_gfactor(
     global_sigma = median_noise
 
     if verbose:
-        n_terms = X.shape[1]
         print(
             f"  G-factor poly deg={degree} ({n_terms} terms, c4={c4:.4f}, log-space fit)"
         )
