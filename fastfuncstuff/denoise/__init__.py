@@ -8,6 +8,8 @@ from fastfuncstuff.denoise.sequential import (
     fit_denoising_model,
     select_noise_pool_voxels,
 )
+from fastfuncstuff.denoise.nordic import NordicConfig, NordicOutputs, run_nordic
+from fastfuncstuff.denoise.sauna import SaunaConfig, SaunaOutputs, run_sauna
 
 __all__ = [
     "DenoiseResults",
@@ -16,4 +18,10 @@ __all__ = [
     "extract_noise_pcs_per_run",
     "fit_denoising_model",
     "select_noise_pool_voxels",
+    "NordicConfig",
+    "NordicOutputs",
+    "run_nordic",
+    "SaunaConfig",
+    "SaunaOutputs",
+    "run_sauna",
 ]
