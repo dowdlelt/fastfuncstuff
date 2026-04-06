@@ -334,8 +334,6 @@ def test_loo_fwhm_prefers_moderate_smoothing():
     best_fwhm, scores = _loo_optimize_gfactor_fwhm(
         noise,
         fwhm_candidates=(1.0, 3.0, 5.0, 10.0, 20.0),
-        kernel_size=(3, 3, 3),
-        patch_overlap=2,
         verbose=False,
     )
 
@@ -354,14 +352,12 @@ def test_loo_returns_all_scores():
     best_fwhm, scores = _loo_optimize_gfactor_fwhm(
         noise,
         fwhm_candidates=candidates,
-        kernel_size=(3, 3, 3),
-        patch_overlap=2,
         verbose=False,
     )
 
     assert set(scores.keys()) == set(candidates)
     assert best_fwhm in candidates
-    assert all(v >= 0 for v in scores.values())
+    assert all(np.isfinite(v) for v in scores.values())
 
 
 def test_patch_variance_cov_uniform_is_low():
@@ -414,8 +410,6 @@ def test_calibrate_sigma_near_one_for_correct_sigma():
         noise,
         gfactor,
         sigma,
-        (3, 3, 3),
-        2,
         verbose=False,
     )
 
@@ -632,13 +626,11 @@ def test_loo_degree_returns_all_candidates():
     best_deg, scores = _loo_optimize_gfactor_degree(
         noise,
         degree_candidates=candidates,
-        kernel_size=(3, 3, 3),
-        patch_overlap=2,
         verbose=False,
     )
     assert set(scores.keys()) == set(candidates)
     assert best_deg in candidates
-    assert all(v > 0 for v in scores.values())
+    assert all(np.isfinite(v) for v in scores.values())
 
 
 # ---------------------------------------------------------------------------

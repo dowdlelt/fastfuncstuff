@@ -456,6 +456,65 @@ def bytes_per_voxel_arma(
     return (8 * n_timepoints + 2 * n_regressors + max_lag) * 4
 
 
+def estimate_nordic_llr_memory(
+    shape: tuple[int, int, int, int],
+    kernel_size: tuple[int, int, int],
+    svd_batch_size: int,
+    dtype_bytes: int,
+    return_recon: bool = True,
+) -> dict[str, int]:
+    """Estimate GPU memory breakdown for a single ``_llr_denoise`` call.
+
+    Parameters
+    ----------
+    shape : (nx, ny, nz, nt)
+        Volume shape.
+    kernel_size : (wx, wy, wz)
+        Patch kernel size (clamped to volume dims internally).
+    svd_batch_size : int
+        Batch size for decomposition.
+    dtype_bytes : int
+        Bytes per element (8 for complex64, 4 for float32).
+    return_recon : bool
+        Whether reconstruction is enabled (allocates recon_acc).
+
+    Returns
+    -------
+    dict with keys:
+        data : input volume bytes (already on GPU)
+        recon_acc : reconstruction accumulator bytes
+        diag_maps : diagnostic map bytes (weight + 4 maps)
+        batch_working : peak per-batch working set bytes
+        total : sum of above
+    """
+    nx, ny, nz, nt = shape
+    wx = min(kernel_size[0], nx)
+    wy = min(kernel_size[1], ny)
+    wz = min(kernel_size[2], nz)
+    M = wx * wy * wz
+    N = nt
+    B = svd_batch_size
+    n_spatial = nx * ny * nz
+
+    data_bytes = n_spatial * nt * dtype_bytes
+    recon_bytes = data_bytes if return_recon else 0
+    diag_bytes = 5 * n_spatial * 4  # weight + 4 maps, float32
+
+    # Peak batch working set (eigh path, worst case):
+    # mats(B,M,N) + G(B,N,N) + V(B,N,N) + coeff(B,M,N) + recon_batch(B,M,N)
+    # Not all coexist — peak is mats + coeff + recon_batch + V_k
+    # Conservative: assume 3 copies of (B,M,N) + 1 of (B,N,N)
+    batch_bytes = (3 * B * M * N + B * N * N) * dtype_bytes
+
+    return {
+        "data": data_bytes,
+        "recon_acc": recon_bytes,
+        "diag_maps": diag_bytes,
+        "batch_working": batch_bytes,
+        "total": data_bytes + recon_bytes + diag_bytes + batch_bytes,
+    }
+
+
 def dyn_chunk_estimator(
     n_voxels: int,
     n_timepoints: int,

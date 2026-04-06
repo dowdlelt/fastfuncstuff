@@ -393,54 +393,96 @@ def _fit_polynomial_gfactor(
     return gfactor, global_sigma
 
 
+def _heldout_nll(
+    noise_vol: torch.Tensor,
+    gfactor: torch.Tensor,
+    global_sigma: float,
+) -> float:
+    """Per-voxel negative log-likelihood of held-out noise under the model.
+
+    Model: each voxel i has noise ~ N(0, σ² g_i²).
+    For complex data, real and imag parts are iid N(0, σ² g_i² / 2).
+
+    NLL = Σ_i [ x_i² / (2 σ² g_i²) + log(σ g_i) + ½ log(2π) ]
+
+    The constant ½ log(2π) is dropped (doesn't affect optimization).
+
+    Parameters
+    ----------
+    noise_vol : (nx, ny, nz) or (nx, ny, nz, k) — held-out noise volume(s)
+    gfactor : (nx, ny, nz) — g-factor map (median-normalized to 1)
+    global_sigma : float — global noise std
+
+    Returns
+    -------
+    nll : float — mean per-voxel negative log-likelihood (lower is better)
+    """
+    g = gfactor.clamp(min=1e-8)
+    var_model = (global_sigma * g) ** 2  # (nx, ny, nz)
+
+    if noise_vol.ndim == 4:
+        # Multiple volumes: average NLL across all voxel-volume pairs
+        if noise_vol.is_complex():
+            # Real and imag each ~ N(0, var/2), so combined x²/var = (r²+i²)/var
+            sq = noise_vol.real ** 2 + noise_vol.imag ** 2  # (nx, ny, nz, k)
+        else:
+            sq = noise_vol ** 2
+        # sum over k volumes at each voxel
+        nll_map = sq.sum(dim=-1) / (2.0 * var_model) + noise_vol.shape[-1] * torch.log(var_model) / 2.0
+    else:
+        if noise_vol.is_complex():
+            sq = noise_vol.real ** 2 + noise_vol.imag ** 2
+        else:
+            sq = noise_vol ** 2
+        nll_map = sq / (2.0 * var_model) + torch.log(var_model) / 2.0
+
+    # Only score valid voxels (non-zero g-factor region)
+    valid = torch.isfinite(nll_map) & (gfactor > 0.1)
+    if valid.any():
+        return float(nll_map[valid].mean().item())
+    return float("inf")
+
+
 def _loo_optimize_gfactor_degree(
     noise_vols: torch.Tensor,
     degree_candidates: tuple[int, ...],
-    kernel_size: tuple[int, int, int],
-    patch_overlap: int,
-    n_sample_patches: int = 500,
     verbose: bool = True,
 ) -> tuple[int, dict[int, float]]:
     """LOO cross-validation to select polynomial degree for g-factor.
 
-    Same framework as ``_loo_optimize_gfactor_fwhm`` but over polynomial
-    degree instead of smoothing FWHM.
+    Uses per-voxel negative log-likelihood as the scoring metric.
+    Lower NLL = better model of the held-out noise variance.
 
     Parameters
     ----------
     noise_vols : (nx, ny, nz, k)
     degree_candidates : tuple of degrees to try (e.g., (1, 2, 3, 4, 5, 6))
-    kernel_size, patch_overlap, n_sample_patches : as for _patch_variance_cov
     verbose : print progress
 
     Returns
     -------
     best_degree : int
-    scores : dict mapping degree → mean CoV
+    scores : dict mapping degree → mean NLL
     """
     k = noise_vols.shape[-1]
     scores: dict[int, float] = {}
 
     for deg in degree_candidates:
-        loo_covs = []
+        loo_nlls = []
         for j in range(k):
             train_idx = [i for i in range(k) if i != j]
             train_vols = noise_vols[..., train_idx]
 
-            gf_train, _ = _fit_polynomial_gfactor(train_vols, deg, verbose=False)
+            gf_train, sigma_train = _fit_polynomial_gfactor(
+                train_vols, deg, verbose=False
+            )
 
             test_vol = noise_vols[..., j]
-            cov = _patch_variance_cov(
-                test_vol,
-                gf_train,
-                kernel_size,
-                patch_overlap,
-                n_sample_patches,
-            )
-            loo_covs.append(cov)
+            nll = _heldout_nll(test_vol, gf_train, sigma_train)
+            loo_nlls.append(nll)
 
-        mean_cov = sum(loo_covs) / len(loo_covs)
-        scores[deg] = mean_cov
+        mean_nll = sum(loo_nlls) / len(loo_nlls)
+        scores[deg] = mean_nll
 
     best_degree = min(scores, key=scores.get)  # type: ignore[arg-type]
 
@@ -448,7 +490,7 @@ def _loo_optimize_gfactor_degree(
         print("  LOO polynomial degree optimization:")
         for deg in sorted(scores):
             marker = " ◀ best" if deg == best_degree else ""
-            print(f"    degree={deg:2d}  CoV={scores[deg]:.4f}{marker}")
+            print(f"    degree={deg:2d}  NLL={scores[deg]:.4f}{marker}")
 
     return best_degree, scores
 
@@ -524,9 +566,6 @@ def _patch_variance_cov(
 def _loo_optimize_gfactor_fwhm(
     noise_vols: torch.Tensor,
     fwhm_candidates: tuple[float, ...],
-    kernel_size: tuple[int, int, int],
-    patch_overlap: int,
-    n_sample_patches: int = 500,
     verbose: bool = True,
 ) -> tuple[float, dict[float, float]]:
     """Leave-one-out cross-validation to select optimal g-factor smoothing FWHM.
@@ -534,62 +573,45 @@ def _loo_optimize_gfactor_fwhm(
     For each candidate FWHM:
     1. For each noise volume j (held out):
        a. Estimate g-factor from the other k-1 volumes at this FWHM
-       b. Divide the held-out volume by the g-factor
-       c. Compute per-patch variance CoV (lower = more uniform = better)
-    2. Average CoV across all held-out volumes
-    3. Select FWHM with lowest average CoV
+       b. Score the held-out volume under the model via per-voxel NLL
+    2. Average NLL across all held-out volumes
+    3. Select FWHM with lowest average NLL
 
-    This is principled because each held-out volume is an independent sample
-    of the exact same noise field.  Under-smoothing → g-factor is noisy →
-    corrections on held-out data are wrong → high CoV.  Over-smoothing →
-    real spatial structure lost → systematic residuals → high CoV.
+    Under-smoothing → g-factor is noisy → poor variance model → high NLL.
+    Over-smoothing → real spatial structure lost → systematic bias → high NLL.
 
     Parameters
     ----------
     noise_vols : (nx, ny, nz, k) — noise-only volumes
     fwhm_candidates : tuple of FWHM values to try
-    kernel_size : patch size for variance computation
-    patch_overlap : overlap divisor
-    n_sample_patches : max patches to sample per fold
     verbose : print progress
 
     Returns
     -------
     best_fwhm : float — optimal FWHM
-    scores : dict mapping FWHM → mean CoV score
+    scores : dict mapping FWHM → mean NLL score
     """
     k = noise_vols.shape[-1]
     scores: dict[float, float] = {}
 
     for fwhm in fwhm_candidates:
-        loo_covs = []
+        loo_nlls = []
         for j in range(k):
-            # Train: all volumes except j
             train_idx = [i for i in range(k) if i != j]
             train_vols = noise_vols[..., train_idx]
 
-            # Estimate g-factor from train set (no verbose spam)
-            gf_train, _ = _estimate_gfactor_from_noise(
+            gf_train, sigma_train = _estimate_gfactor_from_noise(
                 train_vols,
                 smooth_fwhm=fwhm,
                 verbose=False,
             )
 
-            # Test: held-out volume
             test_vol = noise_vols[..., j]
+            nll = _heldout_nll(test_vol, gf_train, sigma_train)
+            loo_nlls.append(nll)
 
-            # CoV of per-patch variance on held-out volume
-            cov = _patch_variance_cov(
-                test_vol,
-                gf_train,
-                kernel_size,
-                patch_overlap,
-                n_sample_patches,
-            )
-            loo_covs.append(cov)
-
-        mean_cov = sum(loo_covs) / len(loo_covs)
-        scores[fwhm] = mean_cov
+        mean_nll = sum(loo_nlls) / len(loo_nlls)
+        scores[fwhm] = mean_nll
 
     best_fwhm = min(scores, key=scores.get)  # type: ignore[arg-type]
 
@@ -597,7 +619,7 @@ def _loo_optimize_gfactor_fwhm(
         print("  LOO FWHM optimization:")
         for fwhm in sorted(scores):
             marker = " ◀ best" if fwhm == best_fwhm else ""
-            print(f"    FWHM={fwhm:5.1f}  CoV={scores[fwhm]:.4f}{marker}")
+            print(f"    FWHM={fwhm:5.1f}  NLL={scores[fwhm]:.4f}{marker}")
 
     return best_fwhm, scores
 
@@ -606,34 +628,21 @@ def _calibrate_sigma(
     noise_vols: torch.Tensor,
     gfactor: torch.Tensor,
     global_sigma: float,
-    kernel_size: tuple[int, int, int],
-    patch_overlap: int,
-    n_sample_patches: int = 1000,
     verbose: bool = True,
 ) -> dict[str, float]:
-    """Validate σ calibration using noise volume patch statistics.
+    """Validate σ calibration using held-out noise statistics.
 
-    After g-correction, each patch of M voxels × k volumes should have
-    sample variance ≈ σ².  We compute the empirical distribution of
-    per-patch variances and compare to the theoretical expectation.
-
-    For real data: patch variance ~ σ² · χ²(df) / df where df = M·k - 1
-    For complex: similar with df = 2·M·k - 1 (real + imag dof)
+    After g-correction, each voxel should have variance ≈ σ².  We compute
+    the empirical ratio of measured variance to predicted variance, and
+    the per-voxel NLL as an overall model quality metric.
 
     Returns a diagnostics dict with:
-    - mean_ratio: mean(patch_var) / σ² (should be ≈ 1.0)
-    - cov: coefficient of variation of patch variances
-    - n_patches: number of patches sampled
+    - mean_var_ratio: measured_var / σ² (should be ≈ 1.0)
+    - nll: per-voxel negative log-likelihood
     """
-    cov = _patch_variance_cov(
-        noise_vols,
-        gfactor,
-        kernel_size,
-        patch_overlap,
-        n_sample_patches,
-    )
+    nll = _heldout_nll(noise_vols, gfactor, global_sigma)
 
-    # Also compute mean ratio — recompute with full stats
+    # Global variance ratio
     gc_noise = noise_vols / gfactor[..., None].clamp(min=1e-8)
     if gc_noise.is_complex():
         total_var = float((torch.var(gc_noise.real) + torch.var(gc_noise.imag)).item())
@@ -644,14 +653,14 @@ def _calibrate_sigma(
 
     result = {
         "mean_var_ratio": ratio,
-        "patch_cov": cov,
+        "nll": nll,
         "global_sigma": global_sigma,
         "measured_var": total_var,
         "expected_var": expected_var,
     }
 
     if verbose:
-        print(f"  σ calibration: measured_var/σ²={ratio:.4f} (expect ≈1.0), patch CoV={cov:.4f}")
+        print(f"  σ calibration: measured_var/σ²={ratio:.4f} (expect ≈1.0), NLL={nll:.4f}")
         if abs(ratio - 1.0) > 0.3:
             print(
                 f"  WARNING: σ calibration off by {abs(ratio - 1.0) * 100:.0f}% — "
@@ -665,28 +674,17 @@ def _validate_gfactor_uniformity(
     noise_vols: torch.Tensor,
     gfactor: torch.Tensor,
     global_sigma: float,
-    kernel_size: tuple[int, int, int],
-    patch_overlap: int,
-    n_sample_patches: int = 500,
     verbose: bool = True,
 ) -> float:
-    """Check that g-corrected noise has approximately uniform variance.
+    """Check that g-corrected noise matches the variance model.
 
-    Samples random patches, computes per-patch variance after g-factor
-    correction, and reports the coefficient of variation.  A good g-factor
-    should yield CoV < 0.2 or so.
+    Uses per-voxel NLL as a single scalar quality metric.
 
     Returns
     -------
-    cov : float — coefficient of variation of per-patch noise variance
+    nll : float — per-voxel negative log-likelihood (lower is better)
     """
-    cov = _patch_variance_cov(
-        noise_vols,
-        gfactor,
-        kernel_size,
-        patch_overlap,
-        n_sample_patches,
-    )
+    nll = _heldout_nll(noise_vols, gfactor, global_sigma)
 
     if verbose:
         expected_var = global_sigma**2
@@ -695,13 +693,13 @@ def _validate_gfactor_uniformity(
             measured_var = float((torch.var(gc_noise.real) + torch.var(gc_noise.imag)).item())
         else:
             measured_var = float(torch.var(gc_noise).item())
-        print(f"  G-factor validation: CoV={cov:.4f}")
+        print(f"  G-factor validation: NLL={nll:.4f}")
         print(
             f"  Expected variance (σ²): {expected_var:.4f}, "
             f"measured: {measured_var:.4f}, ratio: {measured_var / max(expected_var, 1e-30):.3f}"
         )
 
-    return cov
+    return nll
 
 
 # ---------------------------------------------------------------------------
@@ -830,43 +828,39 @@ def run_sauna(
             best_fwhm, fwhm_scores = _loo_optimize_gfactor_fwhm(
                 noise_vols,
                 fwhm_candidates=cfg.gfactor_fwhm_range,
-                kernel_size=kernel_pca,
-                patch_overlap=cfg.patch_overlap,
                 verbose=cfg.verbose,
             )
-            best_gauss_cov = fwhm_scores[best_fwhm]
+            best_gauss_nll = fwhm_scores[best_fwhm]
 
             # Polynomial LOO
             best_deg, deg_scores = _loo_optimize_gfactor_degree(
                 noise_vols,
                 degree_candidates=cfg.gfactor_degree_range,
-                kernel_size=kernel_pca,
-                patch_overlap=cfg.patch_overlap,
                 verbose=cfg.verbose,
             )
-            best_poly_cov = deg_scores[best_deg]
+            best_poly_nll = deg_scores[best_deg]
 
-            if best_poly_cov <= best_gauss_cov:
+            if best_poly_nll <= best_gauss_nll:
                 gfactor_method = "polynomial"
                 poly_degree = best_deg
                 loo_scores = {f"poly_deg_{k}": v for k, v in deg_scores.items()}
                 loo_scores["gaussian_best_fwhm"] = best_fwhm
-                loo_scores["gaussian_best_cov"] = best_gauss_cov
+                loo_scores["gaussian_best_nll"] = best_gauss_nll
                 if cfg.verbose:
                     print(
-                        f"  Auto: polynomial (deg={best_deg}, CoV={best_poly_cov:.4f})"
-                        f" beats gaussian (FWHM={best_fwhm}, CoV={best_gauss_cov:.4f})"
+                        f"  Auto: polynomial (deg={best_deg}, NLL={best_poly_nll:.4f})"
+                        f" beats gaussian (FWHM={best_fwhm}, NLL={best_gauss_nll:.4f})"
                     )
             else:
                 gfactor_method = "gaussian"
                 smooth_fwhm = best_fwhm
                 loo_scores = {str(k): v for k, v in fwhm_scores.items()}
                 loo_scores["poly_best_deg"] = best_deg
-                loo_scores["poly_best_cov"] = best_poly_cov
+                loo_scores["poly_best_nll"] = best_poly_nll
                 if cfg.verbose:
                     print(
-                        f"  Auto: gaussian (FWHM={best_fwhm}, CoV={best_gauss_cov:.4f})"
-                        f" beats polynomial (deg={best_deg}, CoV={best_poly_cov:.4f})"
+                        f"  Auto: gaussian (FWHM={best_fwhm}, NLL={best_gauss_nll:.4f})"
+                        f" beats polynomial (deg={best_deg}, NLL={best_poly_nll:.4f})"
                     )
 
     if gfactor_method == "polynomial":
@@ -881,8 +875,6 @@ def run_sauna(
                 poly_degree, deg_scores = _loo_optimize_gfactor_degree(
                     noise_vols,
                     degree_candidates=cfg.gfactor_degree_range,
-                    kernel_size=kernel_pca,
-                    patch_overlap=cfg.patch_overlap,
                     verbose=cfg.verbose,
                 )
                 loo_scores = {f"poly_deg_{k}": v for k, v in deg_scores.items()}
@@ -905,8 +897,6 @@ def run_sauna(
                     smooth_fwhm, fwhm_scores = _loo_optimize_gfactor_fwhm(
                         noise_vols,
                         fwhm_candidates=cfg.gfactor_fwhm_range,
-                        kernel_size=kernel_pca,
-                        patch_overlap=cfg.patch_overlap,
                         verbose=cfg.verbose,
                     )
                     loo_scores = {str(k): v for k, v in fwhm_scores.items()}
@@ -926,16 +916,12 @@ def run_sauna(
             noise_vols,
             gfactor,
             global_sigma,
-            kernel_size=kernel_pca,
-            patch_overlap=cfg.patch_overlap,
             verbose=cfg.verbose,
         )
         sigma_cal = _calibrate_sigma(
             noise_vols,
             gfactor,
             global_sigma,
-            kernel_size=kernel_pca,
-            patch_overlap=cfg.patch_overlap,
             verbose=cfg.verbose,
         )
     del noise_vols

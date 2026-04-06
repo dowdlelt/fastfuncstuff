@@ -166,6 +166,31 @@ ffs_ica -input run1.nii.gz -n_components auto -icasso 25 \
 ```
 
 
+### ffs_nordic -- NORDIC-style complex denoising
+
+Implements a GPU-accelerated NORDIC-style local low-rank denoising workflow
+for fMRI data using magnitude-only or complex magnitude+phase input. Supports
+slice/temporal phase stabilization, trailing noise-volume estimation, patch-SVD
+denoising with NORDIC or MP-style thresholding, and optional g-factor proxy
+map output.
+
+This command is designed to mirror common `NIFTI_NORDIC.m` usage while fitting
+the fastfuncstuff CLI style and output conventions.
+
+```
+ffs_nordic -input-magn sub-08_bold.nii.gz -input-phase sub-08_phase.nii.gz \
+       -prefix NORDIC_sub-08_bold -temporal-phase 1 \
+       -phase-filter-width 10 -noise-volume-last 3 -nordic
+```
+
+Magnitude-only mode:
+
+```
+ffs_nordic -input-magn sub-08_bold.nii.gz -prefix NORDIC_sub-08_mag \
+       -magnitude-only
+```
+
+
 ### ffs_decompose -- ICA decomposition with stability
 
 Similar to ffs_ica but focused on component stability analysis via ICASSO
