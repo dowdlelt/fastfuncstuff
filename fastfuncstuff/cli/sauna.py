@@ -67,6 +67,11 @@ Examples:
         action="store_true",
         help="Save estimated g-factor map from noise volumes",
     )
+    io_group.add_argument(
+        "-save-residual-map",
+        action="store_true",
+        help="Save denoising residual map (magnitude of complex difference)",
+    )
 
     algo_group = parser.add_argument_group("Algorithm")
     algo_group.add_argument(
@@ -195,6 +200,7 @@ def main(argv: list[str] | None = None) -> None:
         patch_overlap=max(1, args.patch_overlap),
         phase_slice_average=args.phase_slice_average,
         save_gfactor_map=args.save_gfactor_map,
+        save_residual_map=args.save_residual_map,
         make_complex_nii=args.make_complex_nii,
         write_gzipped_niftis=True,
         svd_batch_size=args.svd_batch_size,
@@ -220,6 +226,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  Phase output: {outputs.phase_file}")
     if outputs.gfactor_file is not None:
         print(f"  G-factor output: {outputs.gfactor_file}")
+    if outputs.residual_file is not None:
+        print(f"  Residual output: {outputs.residual_file}")
     print(f"  Metadata: {outputs.metadata_file}")
     print(f"  Elapsed: {elapsed:.1f} s")
 

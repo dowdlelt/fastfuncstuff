@@ -65,6 +65,7 @@ class NordicConfig:
     use_magn_for_gfactor: bool = False
     phase_slice_average: bool = False
     save_gfactor_map: bool = False
+    save_residual_map: bool = False
     make_complex_nii: bool = False
     full_dynamic_range: bool = False
     write_gzipped_niftis: bool = True
@@ -80,6 +81,7 @@ class NordicOutputs:
     magnitude_file: Path
     phase_file: Path | None
     gfactor_file: Path | None
+    residual_file: Path | None
     metadata_file: Path
 
 
@@ -1011,6 +1013,11 @@ def run_nordic(
         device=dev,
     )
 
+    # Compute residual (complex difference in transformed space) before
+    # freeing the input.  Reuse KSP2 memory: residual = input - denoised.
+    residual: torch.Tensor | None = None
+    if cfg.save_residual_map:
+        residual = KSP2.to(denoised.device) - denoised
     # Free the input array — denoised is a separate allocation.
     # KSP2 is an alias for II; delete both to drop the refcount.
     del KSP2
@@ -1033,19 +1040,29 @@ def run_nordic(
     # All operations are in-place to avoid allocating a second 4-D copy.
     # MATLAB: IMG2 *= gfactor; IMG2 *= exp(i*angle(DD_phase)); IMG2 *= exp(i*angle(meanphase))
     denoised *= gfactor[..., None]
+    if residual is not None:
+        residual *= gfactor.to(residual.device)[..., None]
 
     if dd_phase is not None:
         _dd_phase_multiply_inplace(denoised, dd_phase, conjugate=True)
+        if residual is not None:
+            _dd_phase_multiply_inplace(
+                residual, dd_phase.to(residual.device), conjugate=True
+            )
         del dd_phase
         if dev.type == "cuda":
             torch.cuda.empty_cache()
 
     if mp_unit is not None:
         _restore_meanphase(denoised, mp_unit)
+        if residual is not None:
+            _restore_meanphase(residual, mp_unit.to(residual.device))
     del mp_unit
 
     # MATLAB: IMG2 *= ABSOLUTE_SCALE
     denoised *= absolute_scale
+    if residual is not None:
+        residual *= absolute_scale
 
     # Clean nan in-place
     nan_mask = ~torch.isfinite(denoised)
@@ -1090,6 +1107,7 @@ def run_nordic(
         )
         del phase_out_np
 
+    gfactor_file: Path | None = None
     if cfg.save_gfactor_map:
         gfactor_file = out_dir / f"{out_prefix.name}_gfactor{ext}"
         save_nifti(
@@ -1097,6 +1115,16 @@ def run_nordic(
             output_path=gfactor_file,
             reference_img=magnitude_file,
         )
+
+    residual_file: Path | None = None
+    if residual is not None:
+        residual_file = out_dir / f"{out_prefix.name}_residual{ext}"
+        save_nifti(
+            torch.abs(residual).cpu().numpy().astype(np.float32),
+            output_path=residual_file,
+            reference_img=magnitude_file,
+        )
+        del residual
 
     meta = {
         "magnitude_file": str(magnitude_file),
@@ -1134,6 +1162,7 @@ def run_nordic(
             "magnitude": str(magn_path),
             "phase": str(phase_path) if phase_path is not None else None,
             "gfactor": str(gfactor_file) if gfactor_file is not None else None,
+            "residual": str(residual_file) if residual_file is not None else None,
         },
     }
 
@@ -1145,5 +1174,6 @@ def run_nordic(
         magnitude_file=magn_path,
         phase_file=phase_path,
         gfactor_file=gfactor_file,
+        residual_file=residual_file,
         metadata_file=meta_file,
     )

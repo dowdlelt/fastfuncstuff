@@ -84,6 +84,7 @@ class SaunaConfig:
     patch_overlap: int = 2
     phase_slice_average: bool = False
     save_gfactor_map: bool = False
+    save_residual_map: bool = False
     make_complex_nii: bool = False
     write_gzipped_niftis: bool = True
     svd_batch_size: int = 512
@@ -101,6 +102,7 @@ class SaunaOutputs:
     magnitude_file: Path
     phase_file: Path | None
     gfactor_file: Path | None
+    residual_file: Path | None
     metadata_file: Path
 
 
@@ -731,6 +733,11 @@ def run_sauna(
         noise_sigma=noise_sigma,
     )
 
+    # Compute residual (complex difference in transformed space) before
+    # freeing the input.  Reuse KSP2 memory: residual = input - denoised.
+    residual: torch.Tensor | None = None
+    if cfg.save_residual_map:
+        residual = KSP2.to(denoised.device) - denoised
     del KSP2
     II = None  # noqa: F841
     if dev.type == "cuda":
@@ -746,18 +753,28 @@ def run_sauna(
     # 7. Undo transformations: gfactor, DD_phase, meanphase, scale
     # ------------------------------------------------------------------
     denoised *= gfactor[..., None]
+    if residual is not None:
+        residual *= gfactor.to(residual.device)[..., None]
 
     if dd_phase is not None:
         _dd_phase_multiply_inplace(denoised, dd_phase, conjugate=True)
+        if residual is not None:
+            _dd_phase_multiply_inplace(
+                residual, dd_phase.to(residual.device), conjugate=True
+            )
         del dd_phase
         if dev.type == "cuda":
             torch.cuda.empty_cache()
 
     if mp_unit is not None:
         _restore_meanphase(denoised, mp_unit)
+        if residual is not None:
+            _restore_meanphase(residual, mp_unit.to(residual.device))
     del mp_unit
 
     denoised *= absolute_scale
+    if residual is not None:
+        residual *= absolute_scale
 
     nan_mask = ~torch.isfinite(denoised)
     if nan_mask.any():
@@ -799,6 +816,7 @@ def run_sauna(
         )
         del phase_out_np
 
+    gfactor_file: Path | None = None
     if cfg.save_gfactor_map:
         gfactor_file = out_dir / f"{out_prefix.name}_gfactor{ext}"
         save_nifti(
@@ -806,6 +824,16 @@ def run_sauna(
             output_path=gfactor_file,
             reference_img=magnitude_file,
         )
+
+    residual_file: Path | None = None
+    if residual is not None:
+        residual_file = out_dir / f"{out_prefix.name}_residual{ext}"
+        save_nifti(
+            torch.abs(residual).cpu().numpy().astype(np.float32),
+            output_path=residual_file,
+            reference_img=magnitude_file,
+        )
+        del residual
 
     meta = {
         "method": "SAUNA",
@@ -844,6 +872,7 @@ def run_sauna(
             "magnitude": str(magn_path),
             "phase": str(phase_path) if phase_path is not None else None,
             "gfactor": str(gfactor_file) if gfactor_file is not None else None,
+            "residual": str(residual_file) if residual_file is not None else None,
         },
     }
 
@@ -855,5 +884,6 @@ def run_sauna(
         magnitude_file=magn_path,
         phase_file=phase_path,
         gfactor_file=gfactor_file,
+        residual_file=residual_file,
         metadata_file=meta_file,
     )

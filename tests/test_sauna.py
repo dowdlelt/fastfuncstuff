@@ -530,3 +530,35 @@ def test_optimal_shrinkage_preserves_strong_signal():
     assert err_opt <= err_hard * 1.05, (
         f"Optimal error ({err_opt:.3f}) should be <= hard error ({err_hard:.3f})"
     )
+
+
+def test_residual_map_saved(tmp_path):
+    """Residual = |input_complex - denoised_complex|, saved as float32 NIfTI."""
+    rng = np.random.RandomState(99)
+    # 16 time volumes + 3 noise volumes
+    magn = np.abs(rng.normal(size=(12, 10, 6, 19))).astype(np.float32)
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    cfg = SaunaConfig(
+        temporal_phase=0,
+        magnitude_only=True,
+        noise_volume_last=3,
+        kernel_size_pca=(3, 3, 3),
+        patch_overlap=2,
+        save_residual_map=True,
+        verbose=False,
+    )
+
+    out = run_sauna(str(magn_file), None, str(tmp_path / "SAUNA_res"), cfg)
+
+    assert out.residual_file is not None and out.residual_file.exists()
+    res = nib.load(out.residual_file).get_fdata(dtype=np.float32)
+    assert res.shape == magn.shape
+    assert np.isfinite(res).all()
+    assert (res >= 0).all()  # magnitude is non-negative
+
+    # Check metadata records residual path
+    with open(out.metadata_file) as f:
+        meta = json.load(f)
+    assert meta["outputs"]["residual"] is not None
