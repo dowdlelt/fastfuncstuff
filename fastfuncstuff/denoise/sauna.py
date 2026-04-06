@@ -341,10 +341,10 @@ def _fit_polynomial_gfactor(
     c4 = _c4_bias_correction(k)
     std_map = std_map / c4
 
-    # Build design matrix (real computation, always on CPU for lstsq)
+    # Build design matrix on the same device as data
     dev_orig = std_map.device
-    X = _construct_3d_legendre_basis((nx, ny, nz), degree, device="cpu")
-    y = std_map.reshape(-1).float().cpu()
+    X = _construct_3d_legendre_basis((nx, ny, nz), degree, device=dev_orig)
+    y = std_map.reshape(-1).float()
 
     # Mask out zeros / non-finite
     valid = (y > 0) & torch.isfinite(y)
@@ -358,7 +358,7 @@ def _fit_polynomial_gfactor(
 
     # Least-squares fit: X[valid] @ beta = y[valid]
     beta = torch.linalg.lstsq(X[valid], y[valid].unsqueeze(1)).solution.squeeze(1)
-    fitted = (X @ beta).reshape(nx, ny, nz).to(dev_orig)
+    fitted = (X @ beta).reshape(nx, ny, nz)
 
     # Clamp negative predictions (polynomials can go negative)
     fitted = torch.clamp(fitted, min=0.0)

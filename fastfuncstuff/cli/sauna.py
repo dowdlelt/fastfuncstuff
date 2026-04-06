@@ -131,6 +131,15 @@ Examples:
         "polynomial (3D Legendre fit), auto (LOO picks best)",
     )
     algo_group.add_argument(
+        "-gfactor-degree-range",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="DEG",
+        help="Polynomial degree candidates for LOO selection "
+        "(default: 1 2 3 4 5 6 8). Only used with -gfactor-method polynomial|auto.",
+    )
+    algo_group.add_argument(
         "-shrinkage",
         choices=["optimal", "hard"],
         default="optimal",
@@ -215,6 +224,9 @@ def main(argv: list[str] | None = None) -> None:
         verbose=not args.quiet,
         gfactor_smooth_fwhm=_parse_fwhm(args.gfactor_smooth_fwhm),
         gfactor_method=args.gfactor_method,
+        gfactor_degree_range=(
+            tuple(args.gfactor_degree_range) if args.gfactor_degree_range is not None else (1, 2, 3, 4, 5, 6, 8)
+        ),
         shrinkage=args.shrinkage,
     )
 
