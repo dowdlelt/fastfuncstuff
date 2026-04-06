@@ -316,6 +316,10 @@ def _fit_polynomial_gfactor(
 ) -> tuple[torch.Tensor, float]:
     """Estimate g-factor by fitting a 3D Legendre polynomial to noise std.
 
+    The fit is performed in **log-space**: we model ``log(std_map)`` as a
+    polynomial, so ``g = exp(poly)`` — guaranteeing positivity everywhere
+    with smooth extrapolation (no clamping, no sharp edges at boundaries).
+
     Parameters
     ----------
     noise_vols : (nx, ny, nz, k) complex or real
@@ -346,7 +350,7 @@ def _fit_polynomial_gfactor(
     X = _construct_3d_legendre_basis((nx, ny, nz), degree, device=dev_orig)
     y = std_map.reshape(-1).float()
 
-    # Mask out zeros / non-finite
+    # Mask out zeros / non-finite — log requires strictly positive
     valid = (y > 0) & torch.isfinite(y)
     if valid.sum() < X.shape[1]:
         # Not enough valid voxels — fall back to constant
@@ -356,36 +360,30 @@ def _fit_polynomial_gfactor(
         gfactor = torch.ones(nx, ny, nz, device=dev_orig)
         return gfactor, max(median_val, 1e-30)
 
-    # Least-squares fit: X[valid] @ beta = y[valid]
-    beta = torch.linalg.lstsq(X[valid], y[valid].unsqueeze(1)).solution.squeeze(1)
-    fitted = (X @ beta).reshape(nx, ny, nz)
+    # Fit in log-space: log(std) = X @ beta  →  std = exp(X @ beta)
+    # This guarantees positivity everywhere with smooth extrapolation.
+    log_y = torch.log(y[valid])
+    beta = torch.linalg.lstsq(X[valid], log_y.unsqueeze(1)).solution.squeeze(1)
+    fitted = torch.exp((X @ beta).reshape(nx, ny, nz))
 
-    # Clamp negative predictions (polynomials can go negative)
-    fitted = torch.clamp(fitted, min=0.0)
-
-    # Normalize to median=1
-    nonzero = fitted[fitted > 0]
-    if nonzero.numel() > 0:
-        median_noise = float(torch.median(nonzero).item())
-    else:
-        median_noise = 1.0
+    # Normalize to median=1 using valid-voxel median
+    valid_3d = valid.reshape(nx, ny, nz)
+    median_noise = float(torch.median(fitted[valid_3d]).item())
     median_noise = max(median_noise, 1e-30)
 
     gfactor = fitted / median_noise
 
-    # Clean pathological values
-    bad = (gfactor < 0.1) | ~torch.isfinite(gfactor)
+    # Only clean truly pathological (non-finite) values
+    bad = ~torch.isfinite(gfactor)
     if bad.any():
-        good_vals = gfactor[~bad & (gfactor > 0)]
-        fill_val = float(torch.median(good_vals).item()) if good_vals.numel() > 0 else 1.0
-        gfactor[bad] = fill_val
+        gfactor[bad] = 1.0
 
     global_sigma = median_noise
 
     if verbose:
         n_terms = X.shape[1]
         print(
-            f"  G-factor poly deg={degree} ({n_terms} terms, c4={c4:.4f})"
+            f"  G-factor poly deg={degree} ({n_terms} terms, c4={c4:.4f}, log-space fit)"
         )
         print(f"  G-factor range: [{float(gfactor.min()):.4f}, {float(gfactor.max()):.4f}]")
         print(f"  Global noise σ: {global_sigma:.6g}")
