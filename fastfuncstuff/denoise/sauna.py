@@ -405,29 +405,32 @@ def _fit_polynomial_gfactor(
 
     # ------------------------------------------------------------------
     # Accumulate normal equations X^T X and X^T y, one x-slice at a time
+    # Float32 accumulation — Legendre values are O(1), sums are O(n_valid),
+    # well within float32 precision.  Consumer GPUs do FP32 matmul ~60×
+    # faster than FP64.
     # ------------------------------------------------------------------
-    XtX = torch.zeros(n_terms, n_terms, device=dev, dtype=torch.float64)
-    Xty = torch.zeros(n_terms, device=dev, dtype=torch.float64)
+    XtX = torch.zeros(n_terms, n_terms, device=dev, dtype=torch.float32)
+    Xty = torch.zeros(n_terms, device=dev, dtype=torch.float32)
 
     for xi in range(nx):
-        mask_slice = valid_3d[xi].reshape(-1)          # (ny*nz,)
-        if not mask_slice.any():
-            continue
-        # Scale YZ basis by Px[xi, i] for each term → X_slice
+        # Mask-weighted approach: multiply by 0/1 mask instead of boolean
+        # indexing.  Avoids copies and keeps tensors at fixed shape for
+        # optimal cuBLAS scheduling.
+        mask_f = valid_3d[xi].reshape(-1, 1).float()   # (ny*nz, 1)
         px_vals = Px[xi, i_idx]                         # (n_terms,)
-        X_slice = yz_basis * px_vals.unsqueeze(0)       # (ny*nz, n_terms)
+        Xw = (yz_basis * px_vals.unsqueeze(0)) * mask_f # (ny*nz, n_terms)
+        yw = log_std[xi].reshape(-1) * mask_f.squeeze() # (ny*nz,)
 
-        Xv = X_slice[mask_slice].to(torch.float64)     # (n_valid, n_terms)
-        yv = log_std[xi].reshape(-1)[mask_slice].to(torch.float64)
+        XtX.addmm_(Xw.T, Xw)
+        Xty.add_(Xw.T @ yw)
 
-        XtX.addmm_(Xv.T, Xv)
-        Xty.add_(Xv.T @ yv)
+    # Promote to float64 only for the tiny solve (condition number)
+    XtX_64 = XtX.double()
+    Xty_64 = Xty.double()
+    diag_mean = XtX_64.diagonal().mean()
+    XtX_64.diagonal().add_(1e-8 * diag_mean)
 
-    # Tiny ridge for numerical safety (1e-8 × mean diagonal)
-    diag_mean = XtX.diagonal().mean()
-    XtX.diagonal().add_(1e-8 * diag_mean)
-
-    beta = torch.linalg.solve(XtX, Xty).float()         # (n_terms,)
+    beta = torch.linalg.solve(XtX_64, Xty_64).float()    # (n_terms,)
 
     # ------------------------------------------------------------------
     # Evaluate fitted = exp(X @ beta) one x-slice at a time
@@ -579,25 +582,26 @@ def _poly_gfactor_multi_degree(
     i_idx = torch.tensor([t[0] for t in terms], device=dev)
 
     # ------------------------------------------------------------------
-    # Pass 1: accumulate normal equations at max degree
+    # Pass 1: accumulate normal equations at max degree (float32)
+    # Mask-weighted: multiply by 0/1 mask instead of boolean indexing.
+    # Float32 matmul is ~60× faster than float64 on consumer GPUs.
     # ------------------------------------------------------------------
-    XtX = torch.zeros(n_terms_max, n_terms_max, device=dev, dtype=torch.float64)
-    Xty = torch.zeros(n_terms_max, device=dev, dtype=torch.float64)
+    XtX = torch.zeros(n_terms_max, n_terms_max, device=dev, dtype=torch.float32)
+    Xty = torch.zeros(n_terms_max, device=dev, dtype=torch.float32)
 
     for xi in range(nx):
-        mask_slice = valid_3d[xi].reshape(-1)
-        if not mask_slice.any():
-            continue
+        mask_f = valid_3d[xi].reshape(-1, 1).float()   # (ny*nz, 1)
         px_vals = Px[xi, i_idx]
-        X_slice = yz_basis * px_vals.unsqueeze(0)
-        Xv = X_slice[mask_slice].to(torch.float64)
-        yv = log_std[xi].reshape(-1)[mask_slice].to(torch.float64)
-        XtX.addmm_(Xv.T, Xv)
-        Xty.add_(Xv.T @ yv)
+        Xw = (yz_basis * px_vals.unsqueeze(0)) * mask_f
+        yw = log_std[xi].reshape(-1) * mask_f.squeeze()
+        XtX.addmm_(Xw.T, Xw)
+        Xty.add_(Xw.T @ yw)
 
-    # Tiny ridge for stability
-    diag_mean = XtX.diagonal().mean()
-    XtX.diagonal().add_(1e-8 * diag_mean)
+    # Promote to float64 only for the tiny solve
+    XtX_64 = XtX.double()
+    Xty_64 = Xty.double()
+    diag_mean = XtX_64.diagonal().mean()
+    XtX_64.diagonal().add_(1e-8 * diag_mean)
 
     # ------------------------------------------------------------------
     # Solve for each candidate degree (tiny sub-system extraction)
@@ -606,8 +610,8 @@ def _poly_gfactor_multi_degree(
     for ci, d in enumerate(degree_candidates):
         cols = col_indices[d]
         idx_t = torch.tensor(cols, device=dev, dtype=torch.long)
-        XtX_d = XtX[idx_t][:, idx_t]
-        Xty_d = Xty[idx_t]
+        XtX_d = XtX_64[idx_t][:, idx_t]
+        Xty_d = Xty_64[idx_t]
         # Add ridge to sub-system too
         diag_d = XtX_d.diagonal().mean()
         XtX_d.diagonal().add_(1e-8 * diag_d)
