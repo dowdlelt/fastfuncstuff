@@ -536,6 +536,11 @@ def _loo_optimize_gfactor_degree(
     k = noise_vols.shape[-1]
     scores: dict[int, float] = {}
 
+    total_fits = len(degree_candidates) * k
+    pbar = tqdm(
+        total=total_fits, desc="  LOO poly degree", unit="fit", disable=not verbose,
+    )
+
     for deg in degree_candidates:
         loo_nlls = []
         for j in range(k):
@@ -549,9 +554,13 @@ def _loo_optimize_gfactor_degree(
             test_vol = noise_vols[..., j]
             nll = _heldout_nll(test_vol, gf_train, sigma_train)
             loo_nlls.append(nll)
+            pbar.update(1)
 
         mean_nll = sum(loo_nlls) / len(loo_nlls)
         scores[deg] = mean_nll
+        pbar.set_postfix(deg=deg, NLL=f"{mean_nll:.4f}")
+
+    pbar.close()
 
     best_degree = min(scores, key=scores.get)  # type: ignore[arg-type]
 
@@ -663,6 +672,11 @@ def _loo_optimize_gfactor_fwhm(
     k = noise_vols.shape[-1]
     scores: dict[float, float] = {}
 
+    total_fits = len(fwhm_candidates) * k
+    pbar = tqdm(
+        total=total_fits, desc="  LOO FWHM", unit="fit", disable=not verbose,
+    )
+
     for fwhm in fwhm_candidates:
         loo_nlls = []
         for j in range(k):
@@ -678,9 +692,13 @@ def _loo_optimize_gfactor_fwhm(
             test_vol = noise_vols[..., j]
             nll = _heldout_nll(test_vol, gf_train, sigma_train)
             loo_nlls.append(nll)
+            pbar.update(1)
 
         mean_nll = sum(loo_nlls) / len(loo_nlls)
         scores[fwhm] = mean_nll
+        pbar.set_postfix(fwhm=fwhm, NLL=f"{mean_nll:.4f}")
+
+    pbar.close()
 
     best_fwhm = min(scores, key=scores.get)  # type: ignore[arg-type]
 
