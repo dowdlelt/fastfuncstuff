@@ -513,6 +513,134 @@ def _heldout_nll(
     return float("inf")
 
 
+def _poly_gfactor_multi_degree(
+    std_map: torch.Tensor,
+    degree_candidates: tuple[int, ...],
+) -> list[tuple[torch.Tensor, float]]:
+    """Fit polynomial g-factors at multiple degrees in a single pass.
+
+    Exploits the fact that lower-degree bases are column subsets of the
+    max-degree basis.  Accumulates normal equations once at max degree,
+    extracts sub-systems for each candidate, and evaluates all fits
+    in a single batched pass.
+
+    Cost: 2 passes over x-slices total (1 accumulate + 1 evaluate) instead
+    of 2 × n_candidates.
+
+    Parameters
+    ----------
+    std_map : (nx, ny, nz) — bias-corrected voxelwise noise std
+    degree_candidates : tuple of polynomial degrees to evaluate
+
+    Returns
+    -------
+    results : list of (gfactor, global_sigma) for each degree candidate,
+              in the same order as degree_candidates
+    """
+    nx, ny, nz = std_map.shape
+    dev = std_map.device
+    n_cand = len(degree_candidates)
+    max_deg = max(degree_candidates)
+
+    # Term enumeration at max degree
+    terms = _enumerate_poly_terms(max_deg)
+    n_terms_max = len(terms)
+
+    # Map each candidate degree → column indices (terms with total_deg ≤ d)
+    term_total_deg = [i + j + k for (i, j, k) in terms]
+    col_indices: dict[int, list[int]] = {
+        d: [idx for idx, td in enumerate(term_total_deg) if td <= d]
+        for d in degree_candidates
+    }
+
+    # Valid mask and log targets
+    valid_3d = (std_map > 0) & torch.isfinite(std_map)
+    log_std = torch.zeros_like(std_map)
+    log_std[valid_3d] = torch.log(std_map[valid_3d])
+
+    n_valid = int(valid_3d.sum().item())
+    if n_valid < n_terms_max:
+        med = float(torch.median(std_map[valid_3d]).item()) if n_valid > 0 else 1.0
+        gf = torch.ones(nx, ny, nz, device=dev)
+        return [(gf.clone(), max(med, 1e-30)) for _ in degree_candidates]
+
+    # 1-D Legendre tables
+    Px = _legendre_1d(nx, max_deg, dev)
+    Py = _legendre_1d(ny, max_deg, dev)
+    Pz = _legendre_1d(nz, max_deg, dev)
+
+    # YZ basis at max degree: (ny*nz, n_terms_max)
+    j_idx = torch.tensor([t[1] for t in terms], device=dev)
+    k_idx = torch.tensor([t[2] for t in terms], device=dev)
+    yz_basis = (
+        Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)
+    ).reshape(ny * nz, n_terms_max)
+
+    i_idx = torch.tensor([t[0] for t in terms], device=dev)
+
+    # ------------------------------------------------------------------
+    # Pass 1: accumulate normal equations at max degree
+    # ------------------------------------------------------------------
+    XtX = torch.zeros(n_terms_max, n_terms_max, device=dev, dtype=torch.float64)
+    Xty = torch.zeros(n_terms_max, device=dev, dtype=torch.float64)
+
+    for xi in range(nx):
+        mask_slice = valid_3d[xi].reshape(-1)
+        if not mask_slice.any():
+            continue
+        px_vals = Px[xi, i_idx]
+        X_slice = yz_basis * px_vals.unsqueeze(0)
+        Xv = X_slice[mask_slice].to(torch.float64)
+        yv = log_std[xi].reshape(-1)[mask_slice].to(torch.float64)
+        XtX.addmm_(Xv.T, Xv)
+        Xty.add_(Xv.T @ yv)
+
+    # Tiny ridge for stability
+    diag_mean = XtX.diagonal().mean()
+    XtX.diagonal().add_(1e-8 * diag_mean)
+
+    # ------------------------------------------------------------------
+    # Solve for each candidate degree (tiny sub-system extraction)
+    # ------------------------------------------------------------------
+    betas_padded = torch.zeros(n_terms_max, n_cand, device=dev)
+    for ci, d in enumerate(degree_candidates):
+        cols = col_indices[d]
+        idx_t = torch.tensor(cols, device=dev, dtype=torch.long)
+        XtX_d = XtX[idx_t][:, idx_t]
+        Xty_d = Xty[idx_t]
+        # Add ridge to sub-system too
+        diag_d = XtX_d.diagonal().mean()
+        XtX_d.diagonal().add_(1e-8 * diag_d)
+        beta_d = torch.linalg.solve(XtX_d, Xty_d).float()
+        betas_padded[idx_t, ci] = beta_d
+
+    # ------------------------------------------------------------------
+    # Pass 2: evaluate ALL candidates in one batched pass
+    # ------------------------------------------------------------------
+    fitted_all = torch.empty(nx, ny, nz, n_cand, device=dev)
+    for xi in range(nx):
+        px_vals = Px[xi, i_idx]
+        X_slice = yz_basis * px_vals.unsqueeze(0)       # (ny*nz, n_terms_max)
+        vals = torch.exp((X_slice @ betas_padded).float())  # (ny*nz, n_cand)
+        fitted_all[xi] = vals.reshape(ny, nz, n_cand)
+
+    del yz_basis
+
+    # Normalize each candidate → (gfactor, global_sigma)
+    results: list[tuple[torch.Tensor, float]] = []
+    for ci in range(n_cand):
+        fitted = fitted_all[..., ci]
+        median_noise = float(torch.median(fitted[valid_3d]).item())
+        median_noise = max(median_noise, 1e-30)
+        gfactor = fitted / median_noise
+        bad = ~torch.isfinite(gfactor)
+        if bad.any():
+            gfactor[bad] = 1.0
+        results.append((gfactor, median_noise))
+
+    return results
+
+
 def _loo_optimize_gfactor_degree(
     noise_vols: torch.Tensor,
     degree_candidates: tuple[int, ...],
@@ -522,6 +650,11 @@ def _loo_optimize_gfactor_degree(
 
     Uses per-voxel negative log-likelihood as the scoring metric.
     Lower NLL = better model of the held-out noise variance.
+
+    Exploits the shared basis structure: all degree candidates are
+    evaluated in a single pair of passes per fold (accumulate + evaluate)
+    via ``_poly_gfactor_multi_degree``.  Cost is O(k) passes instead of
+    O(k × n_candidates).
 
     Parameters
     ----------
@@ -535,34 +668,46 @@ def _loo_optimize_gfactor_degree(
     scores : dict mapping degree → mean NLL
     """
     k = noise_vols.shape[-1]
-    scores: dict[int, float] = {}
+    c4 = _c4_bias_correction(k - 1)  # train on k-1 volumes
 
-    total_fits = len(degree_candidates) * k
     pbar = tqdm(
-        total=total_fits, desc="  LOO poly degree", unit="fit", disable=not verbose,
+        total=k, desc="  LOO poly degree", unit="fold", disable=not verbose,
     )
 
-    for deg in degree_candidates:
-        loo_nlls = []
-        for j in range(k):
-            train_idx = [i for i in range(k) if i != j]
-            train_vols = noise_vols[..., train_idx]
+    # Accumulate NLLs: degree → list of per-fold NLLs
+    loo_nlls: dict[int, list[float]] = {d: [] for d in degree_candidates}
 
-            gf_train, sigma_train = _fit_polynomial_gfactor(
-                train_vols, deg, verbose=False
-            )
+    for j in range(k):
+        train_idx = [i for i in range(k) if i != j]
+        train_vols = noise_vols[..., train_idx]
 
-            test_vol = noise_vols[..., j]
-            nll = _heldout_nll(test_vol, gf_train, sigma_train)
-            loo_nlls.append(nll)
-            pbar.update(1)
+        # Compute std_map from train volumes (same logic as _fit_polynomial_gfactor)
+        if train_vols.is_complex():
+            real_var = torch.var(train_vols.real, dim=-1)
+            imag_var = torch.var(train_vols.imag, dim=-1)
+            std_map = torch.sqrt(real_var + imag_var)
+        else:
+            std_map = torch.std(train_vols, dim=-1)
+        std_map = std_map / c4
 
-        mean_nll = sum(loo_nlls) / len(loo_nlls)
-        scores[deg] = mean_nll
-        pbar.set_postfix(deg=deg, NLL=f"{mean_nll:.4f}")
+        # Fit ALL degree candidates in one pair of passes
+        results = _poly_gfactor_multi_degree(std_map, degree_candidates)
+
+        test_vol = noise_vols[..., j]
+        for ci, d in enumerate(degree_candidates):
+            gf, sigma = results[ci]
+            nll = _heldout_nll(test_vol, gf, sigma)
+            loo_nlls[d].append(nll)
+
+        pbar.update(1)
+        # Show best so far
+        partial = {d: sum(v) / len(v) for d, v in loo_nlls.items() if v}
+        best_so_far = min(partial, key=partial.get)  # type: ignore[arg-type]
+        pbar.set_postfix(fold=j + 1, best_deg=best_so_far, NLL=f"{partial[best_so_far]:.4f}")
 
     pbar.close()
 
+    scores = {d: sum(v) / len(v) for d, v in loo_nlls.items()}
     best_degree = min(scores, key=scores.get)  # type: ignore[arg-type]
 
     if verbose:
