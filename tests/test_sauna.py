@@ -14,8 +14,11 @@ from fastfuncstuff.denoise.sauna import (
     SaunaConfig,
     _c4_bias_correction,
     _calibrate_sigma,
+    _construct_3d_legendre_basis,
     _estimate_gfactor_from_noise,
+    _fit_polynomial_gfactor,
     _gaussian_smooth_3d,
+    _loo_optimize_gfactor_degree,
     _loo_optimize_gfactor_fwhm,
     _patch_variance_cov,
     run_sauna,
@@ -452,7 +455,7 @@ def test_run_sauna_auto_fwhm(tmp_path):
         meta = json.load(f)
     assert meta["config"]["gfactor_smooth_fwhm_requested"] == "auto"
     assert meta["config"]["gfactor_smooth_fwhm_used"] > 0
-    assert meta["noise_estimation"]["loo_fwhm_scores"] is not None
+    assert meta["noise_estimation"]["loo_scores"] is not None
     assert meta["noise_estimation"]["sigma_calibration"] is not None
 
 
@@ -562,3 +565,142 @@ def test_residual_map_saved(tmp_path):
     with open(out.metadata_file) as f:
         meta = json.load(f)
     assert meta["outputs"]["residual"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 3D Legendre basis
+# ---------------------------------------------------------------------------
+
+
+def test_legendre_basis_shape_and_orthogonality():
+    """Basis has correct number of terms and columns are near-orthogonal."""
+    shape = (10, 12, 8)
+    degree = 3
+    B = _construct_3d_legendre_basis(shape, degree)
+    # n_terms = C(degree+3, 3) = (4)(5)(6)/6 = 20
+    expected_terms = (degree + 1) * (degree + 2) * (degree + 3) // 6
+    assert B.shape == (10 * 12 * 8, expected_terms)
+    # First column should be constant (P0 * P0 * P0 = 1)
+    assert torch.allclose(B[:, 0], torch.ones(B.shape[0]))
+
+
+def test_legendre_basis_degree_zero():
+    """Degree 0 gives a single constant column."""
+    B = _construct_3d_legendre_basis((5, 5, 5), 0)
+    assert B.shape == (125, 1)
+    assert torch.allclose(B[:, 0], torch.ones(125))
+
+
+# ---------------------------------------------------------------------------
+# Polynomial g-factor fit
+# ---------------------------------------------------------------------------
+
+
+def test_polynomial_gfactor_uniform_noise():
+    """Uniform noise → poly fit gives near-constant g-factor ≈ 1."""
+    rng = torch.Generator().manual_seed(42)
+    noise = torch.randn(16, 14, 10, 5, generator=rng)
+    gf, sigma = _fit_polynomial_gfactor(noise, degree=2)
+    assert gf.shape == (16, 14, 10)
+    # With uniform noise, g-factor should be close to 1 everywhere
+    assert torch.all(torch.isfinite(gf))
+    assert float(gf.std()) < 0.3, f"g-factor std too high: {gf.std()}"
+
+
+def test_polynomial_gfactor_captures_gradient():
+    """Noise with spatial gradient → poly should capture the trend."""
+    rng = torch.Generator().manual_seed(7)
+    nx, ny, nz, k = 20, 18, 10, 5
+    # Create noise with linear gradient along x
+    x_scale = torch.linspace(0.5, 2.0, nx).unsqueeze(1).unsqueeze(2).unsqueeze(3)
+    noise = torch.randn(nx, ny, nz, k, generator=rng) * x_scale
+    gf, sigma = _fit_polynomial_gfactor(noise, degree=2)
+    # g-factor should be larger at high x than low x
+    assert float(gf[-1, ny // 2, nz // 2]) > float(gf[0, ny // 2, nz // 2])
+
+
+# ---------------------------------------------------------------------------
+# LOO polynomial degree selection
+# ---------------------------------------------------------------------------
+
+
+def test_loo_degree_returns_all_candidates():
+    """LOO returns scores for every candidate degree."""
+    rng = torch.Generator().manual_seed(99)
+    noise = torch.randn(12, 10, 8, 4, generator=rng)
+    candidates = (1, 2, 3)
+    best_deg, scores = _loo_optimize_gfactor_degree(
+        noise,
+        degree_candidates=candidates,
+        kernel_size=(3, 3, 3),
+        patch_overlap=2,
+        verbose=False,
+    )
+    assert set(scores.keys()) == set(candidates)
+    assert best_deg in candidates
+    assert all(v > 0 for v in scores.values())
+
+
+# ---------------------------------------------------------------------------
+# End-to-end polynomial method
+# ---------------------------------------------------------------------------
+
+
+def test_run_sauna_polynomial_method(tmp_path):
+    """SAUNA with gfactor_method='polynomial' runs and produces valid output."""
+    rng = np.random.RandomState(42)
+    magn = np.abs(rng.normal(size=(12, 10, 6, 19))).astype(np.float32)
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    cfg = SaunaConfig(
+        temporal_phase=0,
+        magnitude_only=True,
+        noise_volume_last=3,
+        kernel_size_pca=(3, 3, 3),
+        patch_overlap=2,
+        gfactor_method="polynomial",
+        gfactor_degree_range=(1, 2, 3),
+        save_gfactor_map=True,
+        verbose=False,
+    )
+
+    out = run_sauna(str(magn_file), None, str(tmp_path / "SAUNA_poly"), cfg)
+    assert out.magnitude_file.exists()
+    assert out.gfactor_file is not None and out.gfactor_file.exists()
+
+    den = nib.load(out.magnitude_file).get_fdata(dtype=np.float32)
+    assert den.shape == magn.shape
+    assert np.isfinite(den).all()
+
+    with open(out.metadata_file) as f:
+        meta = json.load(f)
+    assert meta["config"]["gfactor_method_used"] == "polynomial"
+    assert meta["config"]["gfactor_poly_degree"] is not None
+
+
+def test_run_sauna_auto_method(tmp_path):
+    """SAUNA with gfactor_method='auto' picks the better method."""
+    rng = np.random.RandomState(11)
+    magn = np.abs(rng.normal(size=(12, 10, 6, 19))).astype(np.float32)
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    cfg = SaunaConfig(
+        temporal_phase=0,
+        magnitude_only=True,
+        noise_volume_last=3,
+        kernel_size_pca=(3, 3, 3),
+        patch_overlap=2,
+        gfactor_method="auto",
+        gfactor_degree_range=(1, 2, 3),
+        gfactor_fwhm_range=(0.0, 3.0, 5.0),
+        verbose=False,
+    )
+
+    out = run_sauna(str(magn_file), None, str(tmp_path / "SAUNA_auto"), cfg)
+    assert out.magnitude_file.exists()
+
+    with open(out.metadata_file) as f:
+        meta = json.load(f)
+    assert meta["config"]["gfactor_method_used"] in ("gaussian", "polynomial")

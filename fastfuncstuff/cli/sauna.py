@@ -124,6 +124,13 @@ Examples:
         "'auto' uses LOO cross-validation on noise volumes to find optimal FWHM.",
     )
     algo_group.add_argument(
+        "-gfactor-method",
+        choices=["gaussian", "polynomial", "auto"],
+        default="gaussian",
+        help="G-factor estimation method: gaussian (smooth noise std), "
+        "polynomial (3D Legendre fit), auto (LOO picks best)",
+    )
+    algo_group.add_argument(
         "-shrinkage",
         choices=["optimal", "hard"],
         default="optimal",
@@ -207,6 +214,7 @@ def main(argv: list[str] | None = None) -> None:
         decomp_method=args.decomp_method,
         verbose=not args.quiet,
         gfactor_smooth_fwhm=_parse_fwhm(args.gfactor_smooth_fwhm),
+        gfactor_method=args.gfactor_method,
         shrinkage=args.shrinkage,
     )
 

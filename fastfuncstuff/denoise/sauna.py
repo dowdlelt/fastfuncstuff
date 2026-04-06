@@ -92,6 +92,8 @@ class SaunaConfig:
     verbose: bool = True
     gfactor_smooth_fwhm: float | str = "auto"  # float or "auto" (LOO cross-validated)
     gfactor_fwhm_range: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0)
+    gfactor_method: str = "gaussian"  # "gaussian", "polynomial", or "auto"
+    gfactor_degree_range: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 8)
     shrinkage: str = "optimal"  # "optimal" (Gavish-Donoho) or "hard" (MP-PCA)
 
 
@@ -242,6 +244,213 @@ def _estimate_gfactor_from_noise(
         print(f"  Global noise σ: {global_sigma:.6g}")
 
     return gfactor, global_sigma
+
+
+# ---------------------------------------------------------------------------
+# Polynomial g-factor estimation (Legendre basis)
+# ---------------------------------------------------------------------------
+
+
+def _construct_3d_legendre_basis(
+    shape: tuple[int, int, int],
+    degree: int,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Build a 3D Legendre polynomial design matrix up to *total degree*.
+
+    Uses tensor products P_i(x) · P_j(y) · P_k(z) for all (i, j, k) with
+    i + j + k <= degree.  Coordinates are mapped to [-1, 1] in each dimension.
+
+    Parameters
+    ----------
+    shape : (nx, ny, nz)
+    degree : maximum **total** polynomial degree
+    device : target device
+
+    Returns
+    -------
+    basis : (N, n_terms) float tensor, where N = nx * ny * nz and
+            n_terms = C(degree + 3, 3) = (d+1)(d+2)(d+3) / 6
+    """
+    nx, ny, nz = shape
+
+    # 1-D Legendre polynomials on [-1, 1] for each axis
+    # P_0(t) = 1, P_1(t) = t, P_k(t) via Bonnet recurrence
+    def _legendre_1d(n_pts: int, max_order: int) -> torch.Tensor:
+        """Return (n_pts, max_order+1) matrix of Legendre P_k(t)."""
+        t = torch.linspace(-1.0, 1.0, n_pts, device=device)
+        polys = torch.zeros(n_pts, max_order + 1, device=device)
+        polys[:, 0] = 1.0
+        if max_order >= 1:
+            polys[:, 1] = t
+        for k in range(2, max_order + 1):
+            polys[:, k] = (
+                (2 * k - 1) * t * polys[:, k - 1] - (k - 1) * polys[:, k - 2]
+            ) / k
+        return polys
+
+    Px = _legendre_1d(nx, degree)  # (nx, d+1)
+    Py = _legendre_1d(ny, degree)  # (ny, d+1)
+    Pz = _legendre_1d(nz, degree)  # (nz, d+1)
+
+    # Enumerate (i, j, k) with i+j+k <= degree
+    columns = []
+    for i in range(degree + 1):
+        for j in range(degree + 1 - i):
+            for k in range(degree + 1 - i - j):
+                # Outer product: (nx, 1, 1) * (1, ny, 1) * (1, 1, nz) → (nx, ny, nz)
+                col = (
+                    Px[:, i].unsqueeze(1).unsqueeze(2)
+                    * Py[:, j].unsqueeze(0).unsqueeze(2)
+                    * Pz[:, k].unsqueeze(0).unsqueeze(1)
+                )
+                columns.append(col.reshape(-1))
+
+    return torch.stack(columns, dim=1)  # (N, n_terms)
+
+
+def _fit_polynomial_gfactor(
+    noise_vols: torch.Tensor,
+    degree: int,
+    verbose: bool = False,
+) -> tuple[torch.Tensor, float]:
+    """Estimate g-factor by fitting a 3D Legendre polynomial to noise std.
+
+    Parameters
+    ----------
+    noise_vols : (nx, ny, nz, k) complex or real
+    degree : total polynomial degree (1–10 typical)
+    verbose : print diagnostics
+
+    Returns
+    -------
+    gfactor : (nx, ny, nz) float, median-normalized to 1
+    global_sigma : float — global noise std
+    """
+    nx, ny, nz, k = noise_vols.shape
+
+    # Voxelwise noise std
+    if noise_vols.is_complex():
+        real_var = torch.var(noise_vols.real, dim=-1)
+        imag_var = torch.var(noise_vols.imag, dim=-1)
+        std_map = torch.sqrt(real_var + imag_var)
+    else:
+        std_map = torch.std(noise_vols, dim=-1)
+
+    # Bias-correct
+    c4 = _c4_bias_correction(k)
+    std_map = std_map / c4
+
+    # Build design matrix (real computation, always on CPU for lstsq)
+    dev_orig = std_map.device
+    X = _construct_3d_legendre_basis((nx, ny, nz), degree, device="cpu")
+    y = std_map.reshape(-1).float().cpu()
+
+    # Mask out zeros / non-finite
+    valid = (y > 0) & torch.isfinite(y)
+    if valid.sum() < X.shape[1]:
+        # Not enough valid voxels — fall back to constant
+        if verbose:
+            print(f"  Poly fit deg={degree}: only {valid.sum()} valid voxels, falling back")
+        median_val = float(torch.median(y[valid]).item()) if valid.any() else 1.0
+        gfactor = torch.ones(nx, ny, nz, device=dev_orig)
+        return gfactor, max(median_val, 1e-30)
+
+    # Least-squares fit: X[valid] @ beta = y[valid]
+    beta = torch.linalg.lstsq(X[valid], y[valid].unsqueeze(1)).solution.squeeze(1)
+    fitted = (X @ beta).reshape(nx, ny, nz).to(dev_orig)
+
+    # Clamp negative predictions (polynomials can go negative)
+    fitted = torch.clamp(fitted, min=0.0)
+
+    # Normalize to median=1
+    nonzero = fitted[fitted > 0]
+    if nonzero.numel() > 0:
+        median_noise = float(torch.median(nonzero).item())
+    else:
+        median_noise = 1.0
+    median_noise = max(median_noise, 1e-30)
+
+    gfactor = fitted / median_noise
+
+    # Clean pathological values
+    bad = (gfactor < 0.1) | ~torch.isfinite(gfactor)
+    if bad.any():
+        good_vals = gfactor[~bad & (gfactor > 0)]
+        fill_val = float(torch.median(good_vals).item()) if good_vals.numel() > 0 else 1.0
+        gfactor[bad] = fill_val
+
+    global_sigma = median_noise
+
+    if verbose:
+        n_terms = X.shape[1]
+        print(
+            f"  G-factor poly deg={degree} ({n_terms} terms, c4={c4:.4f})"
+        )
+        print(f"  G-factor range: [{float(gfactor.min()):.4f}, {float(gfactor.max()):.4f}]")
+        print(f"  Global noise σ: {global_sigma:.6g}")
+
+    return gfactor, global_sigma
+
+
+def _loo_optimize_gfactor_degree(
+    noise_vols: torch.Tensor,
+    degree_candidates: tuple[int, ...],
+    kernel_size: tuple[int, int, int],
+    patch_overlap: int,
+    n_sample_patches: int = 500,
+    verbose: bool = True,
+) -> tuple[int, dict[int, float]]:
+    """LOO cross-validation to select polynomial degree for g-factor.
+
+    Same framework as ``_loo_optimize_gfactor_fwhm`` but over polynomial
+    degree instead of smoothing FWHM.
+
+    Parameters
+    ----------
+    noise_vols : (nx, ny, nz, k)
+    degree_candidates : tuple of degrees to try (e.g., (1, 2, 3, 4, 5, 6))
+    kernel_size, patch_overlap, n_sample_patches : as for _patch_variance_cov
+    verbose : print progress
+
+    Returns
+    -------
+    best_degree : int
+    scores : dict mapping degree → mean CoV
+    """
+    k = noise_vols.shape[-1]
+    scores: dict[int, float] = {}
+
+    for deg in degree_candidates:
+        loo_covs = []
+        for j in range(k):
+            train_idx = [i for i in range(k) if i != j]
+            train_vols = noise_vols[..., train_idx]
+
+            gf_train, _ = _fit_polynomial_gfactor(train_vols, deg, verbose=False)
+
+            test_vol = noise_vols[..., j]
+            cov = _patch_variance_cov(
+                test_vol,
+                gf_train,
+                kernel_size,
+                patch_overlap,
+                n_sample_patches,
+            )
+            loo_covs.append(cov)
+
+        mean_cov = sum(loo_covs) / len(loo_covs)
+        scores[deg] = mean_cov
+
+    best_degree = min(scores, key=scores.get)  # type: ignore[arg-type]
+
+    if verbose:
+        print("  LOO polynomial degree optimization:")
+        for deg in sorted(scores):
+            marker = " ◀ best" if deg == best_degree else ""
+            print(f"    degree={deg:2d}  CoV={scores[deg]:.4f}{marker}")
+
+    return best_degree, scores
 
 
 def _patch_variance_cov(
@@ -604,32 +813,111 @@ def run_sauna(
     n_noise = cfg.noise_volume_last
     noise_vols = II[..., nt - n_noise :].clone()
 
-    # Determine smoothing FWHM — auto = LOO cross-validation on noise volumes
-    if cfg.gfactor_smooth_fwhm == "auto":
+    gfactor_method = cfg.gfactor_method
+    loo_scores: dict | None = None
+    smooth_fwhm: float = 0.0
+    poly_degree: int = 0
+
+    if gfactor_method == "auto":
+        # Run LOO for both gaussian and polynomial, pick the winner
         if n_noise < 3:
-            # With only 2 noise volumes, LOO has only 1 training vol per fold
-            # (std undefined). Fall back to moderate default.
-            smooth_fwhm = 5.0
-            loo_scores: dict[float, float] | None = None
+            # Can't LOO with < 3 volumes — fall back to gaussian with default
+            gfactor_method = "gaussian"
             if cfg.verbose:
-                print("  FWHM auto: only 2 noise volumes, using default FWHM=5.0")
+                print("  gfactor_method=auto: only 2 noise volumes, using gaussian FWHM=5.0")
         else:
-            smooth_fwhm, loo_scores = _loo_optimize_gfactor_fwhm(
+            # Gaussian LOO
+            best_fwhm, fwhm_scores = _loo_optimize_gfactor_fwhm(
                 noise_vols,
                 fwhm_candidates=cfg.gfactor_fwhm_range,
                 kernel_size=kernel_pca,
                 patch_overlap=cfg.patch_overlap,
                 verbose=cfg.verbose,
             )
-    else:
-        smooth_fwhm = float(cfg.gfactor_smooth_fwhm)
-        loo_scores = None
+            best_gauss_cov = fwhm_scores[best_fwhm]
 
-    gfactor, global_sigma = _estimate_gfactor_from_noise(
-        noise_vols,
-        smooth_fwhm=smooth_fwhm,
-        verbose=cfg.verbose,
-    )
+            # Polynomial LOO
+            best_deg, deg_scores = _loo_optimize_gfactor_degree(
+                noise_vols,
+                degree_candidates=cfg.gfactor_degree_range,
+                kernel_size=kernel_pca,
+                patch_overlap=cfg.patch_overlap,
+                verbose=cfg.verbose,
+            )
+            best_poly_cov = deg_scores[best_deg]
+
+            if best_poly_cov <= best_gauss_cov:
+                gfactor_method = "polynomial"
+                poly_degree = best_deg
+                loo_scores = {f"poly_deg_{k}": v for k, v in deg_scores.items()}
+                loo_scores["gaussian_best_fwhm"] = best_fwhm
+                loo_scores["gaussian_best_cov"] = best_gauss_cov
+                if cfg.verbose:
+                    print(
+                        f"  Auto: polynomial (deg={best_deg}, CoV={best_poly_cov:.4f})"
+                        f" beats gaussian (FWHM={best_fwhm}, CoV={best_gauss_cov:.4f})"
+                    )
+            else:
+                gfactor_method = "gaussian"
+                smooth_fwhm = best_fwhm
+                loo_scores = {str(k): v for k, v in fwhm_scores.items()}
+                loo_scores["poly_best_deg"] = best_deg
+                loo_scores["poly_best_cov"] = best_poly_cov
+                if cfg.verbose:
+                    print(
+                        f"  Auto: gaussian (FWHM={best_fwhm}, CoV={best_gauss_cov:.4f})"
+                        f" beats polynomial (deg={best_deg}, CoV={best_poly_cov:.4f})"
+                    )
+
+    if gfactor_method == "polynomial":
+        # Polynomial path
+        if poly_degree == 0:
+            # Not set by auto — need LOO or use middle of range
+            if n_noise < 3:
+                poly_degree = 3  # sensible default
+                if cfg.verbose:
+                    print(f"  Poly: only 2 noise volumes, using default degree={poly_degree}")
+            else:
+                poly_degree, deg_scores = _loo_optimize_gfactor_degree(
+                    noise_vols,
+                    degree_candidates=cfg.gfactor_degree_range,
+                    kernel_size=kernel_pca,
+                    patch_overlap=cfg.patch_overlap,
+                    verbose=cfg.verbose,
+                )
+                loo_scores = {f"poly_deg_{k}": v for k, v in deg_scores.items()}
+
+        gfactor, global_sigma = _fit_polynomial_gfactor(
+            noise_vols,
+            degree=poly_degree,
+            verbose=cfg.verbose,
+        )
+    else:
+        # Gaussian path (default)
+        if smooth_fwhm == 0.0:
+            # Not yet determined — run FWHM selection
+            if cfg.gfactor_smooth_fwhm == "auto":
+                if n_noise < 3:
+                    smooth_fwhm = 5.0
+                    if cfg.verbose:
+                        print("  FWHM auto: only 2 noise volumes, using default FWHM=5.0")
+                else:
+                    smooth_fwhm, fwhm_scores = _loo_optimize_gfactor_fwhm(
+                        noise_vols,
+                        fwhm_candidates=cfg.gfactor_fwhm_range,
+                        kernel_size=kernel_pca,
+                        patch_overlap=cfg.patch_overlap,
+                        verbose=cfg.verbose,
+                    )
+                    loo_scores = {str(k): v for k, v in fwhm_scores.items()}
+            else:
+                smooth_fwhm = float(cfg.gfactor_smooth_fwhm)
+
+        gfactor, global_sigma = _estimate_gfactor_from_noise(
+            noise_vols,
+            smooth_fwhm=smooth_fwhm,
+            verbose=cfg.verbose,
+        )
 
     # Validate g-factor and σ calibration
     sigma_cal: dict[str, float] | None = None
@@ -851,8 +1139,11 @@ def run_sauna(
             "kernel_size_pca": list(kernel_pca),
             "patch_overlap": cfg.patch_overlap,
             "phase_slice_average": cfg.phase_slice_average,
+            "gfactor_method_requested": cfg.gfactor_method,
+            "gfactor_method_used": gfactor_method,
             "gfactor_smooth_fwhm_requested": str(cfg.gfactor_smooth_fwhm),
-            "gfactor_smooth_fwhm_used": float(smooth_fwhm),
+            "gfactor_smooth_fwhm_used": float(smooth_fwhm) if gfactor_method == "gaussian" else None,
+            "gfactor_poly_degree": poly_degree if gfactor_method == "polynomial" else None,
             "shrinkage": cfg.shrinkage,
         },
         "noise_estimation": {
@@ -860,7 +1151,7 @@ def run_sauna(
             "global_sigma": float(global_sigma),
             "noise_sigma_for_shrinkage": float(noise_sigma),
             "c4_correction": float(_c4_bias_correction(cfg.noise_volume_last)),
-            "loo_fwhm_scores": {str(k): v for k, v in loo_scores.items()} if loo_scores else None,
+            "loo_scores": {str(k): v for k, v in loo_scores.items()} if loo_scores else None,
             "sigma_calibration": sigma_cal,
         },
         "diagnostics": {
