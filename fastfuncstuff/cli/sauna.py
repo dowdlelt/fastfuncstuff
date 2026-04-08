@@ -225,7 +225,9 @@ def main(argv: list[str] | None = None) -> None:
         gfactor_smooth_fwhm=_parse_fwhm(args.gfactor_smooth_fwhm),
         gfactor_method=args.gfactor_method,
         gfactor_degree_range=(
-            tuple(args.gfactor_degree_range) if args.gfactor_degree_range is not None else (1, 2, 3, 4, 5, 6, 8)
+            tuple(args.gfactor_degree_range)
+            if args.gfactor_degree_range is not None
+            else (1, 2, 3, 4, 5, 6, 8)
         ),
         shrinkage=args.shrinkage,
     )

@@ -17,6 +17,8 @@ NeuroImage, 21(1), 387-400.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 
@@ -547,7 +549,7 @@ def evaluate_design(
     effect_size: float = 1.0,
     noise_std: float = 1.0,
     device: torch.device | None = None
-) -> dict[str, any]:
+) -> dict[str, Any]:
     """
     Complete design evaluation: efficiency + power + entropy
 

@@ -128,6 +128,20 @@ unknown-argument = "warn"
 [tool.ty.src]
 include = ["fastfuncstuff"]
 
+# psutil is an optional runtime dep imported inside try/except; not in .venv but in the conda env
+[[tool.ty.overrides]]
+include = ["fastfuncstuff/cli/reml.py", "fastfuncstuff/memory.py", "fastfuncstuff/glm/arma.py", "fastfuncstuff/benchmark/arch.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "warn"
+
+# division-by-zero in benchmark code is guarded at runtime (if ffs > 0 and ref > 0)
+[[tool.ty.overrides]]
+include = ["fastfuncstuff/benchmark/**"]
+
+[tool.ty.overrides.rules]
+division-by-zero = "warn"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

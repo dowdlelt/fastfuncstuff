@@ -852,7 +852,6 @@ def fit_pathfinder(
             max_components=max_pcs,
             variance_threshold=variance_threshold,
             return_loadings=False,
-            polort=2,
             device=device,
             verbose=False,
         )

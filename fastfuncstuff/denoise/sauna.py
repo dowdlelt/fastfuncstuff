@@ -267,9 +267,7 @@ def _legendre_1d(
     if max_order >= 1:
         polys[:, 1] = t
     for k in range(2, max_order + 1):
-        polys[:, k] = (
-            (2 * k - 1) * t * polys[:, k - 1] - (k - 1) * polys[:, k - 2]
-        ) / k
+        polys[:, k] = ((2 * k - 1) * t * polys[:, k - 1] - (k - 1) * polys[:, k - 2]) / k
     return polys
 
 
@@ -381,9 +379,7 @@ def _fit_polynomial_gfactor(
     if n_valid < n_terms:
         if verbose:
             print(f"  Poly fit deg={degree}: only {n_valid} valid voxels, falling back")
-        median_val = (
-            float(torch.median(std_map[valid_3d]).item()) if n_valid > 0 else 1.0
-        )
+        median_val = float(torch.median(std_map[valid_3d]).item()) if n_valid > 0 else 1.0
         gfactor = torch.ones(nx, ny, nz, device=dev)
         return gfactor, max(median_val, 1e-30)
 
@@ -397,9 +393,7 @@ def _fit_polynomial_gfactor(
     j_idx = torch.tensor([t[1] for t in terms], device=dev)
     k_idx = torch.tensor([t[2] for t in terms], device=dev)
     # (ny, n_terms) * (nz, n_terms) via broadcast → (ny, nz, n_terms) → (ny*nz, n_terms)
-    yz_basis = (
-        Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)
-    ).reshape(ny * nz, n_terms)
+    yz_basis = (Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)).reshape(ny * nz, n_terms)
 
     i_idx = torch.tensor([t[0] for t in terms], device=dev)
 
@@ -416,10 +410,10 @@ def _fit_polynomial_gfactor(
         # Mask-weighted approach: multiply by 0/1 mask instead of boolean
         # indexing.  Avoids copies and keeps tensors at fixed shape for
         # optimal cuBLAS scheduling.
-        mask_f = valid_3d[xi].reshape(-1, 1).float()   # (ny*nz, 1)
-        px_vals = Px[xi, i_idx]                         # (n_terms,)
-        Xw = (yz_basis * px_vals.unsqueeze(0)) * mask_f # (ny*nz, n_terms)
-        yw = log_std[xi].reshape(-1) * mask_f.squeeze() # (ny*nz,)
+        mask_f = valid_3d[xi].reshape(-1, 1).float()  # (ny*nz, 1)
+        px_vals = Px[xi, i_idx]  # (n_terms,)
+        Xw = (yz_basis * px_vals.unsqueeze(0)) * mask_f  # (ny*nz, n_terms)
+        yw = log_std[xi].reshape(-1) * mask_f.squeeze()  # (ny*nz,)
 
         XtX.addmm_(Xw.T, Xw)
         Xty.add_(Xw.T @ yw)
@@ -430,7 +424,7 @@ def _fit_polynomial_gfactor(
     diag_mean = XtX_64.diagonal().mean()
     XtX_64.diagonal().add_(1e-8 * diag_mean)
 
-    beta = torch.linalg.solve(XtX_64, Xty_64).float()    # (n_terms,)
+    beta = torch.linalg.solve(XtX_64, Xty_64).float()  # (n_terms,)
 
     # ------------------------------------------------------------------
     # Evaluate fitted = exp(X @ beta) one x-slice at a time
@@ -438,7 +432,7 @@ def _fit_polynomial_gfactor(
     fitted = torch.empty(nx, ny, nz, device=dev)
     for xi in range(nx):
         px_vals = Px[xi, i_idx]
-        X_slice = yz_basis * px_vals.unsqueeze(0)       # (ny*nz, n_terms)
+        X_slice = yz_basis * px_vals.unsqueeze(0)  # (ny*nz, n_terms)
         fitted[xi] = torch.exp((X_slice @ beta).reshape(ny, nz))
 
     del yz_basis  # free the biggest temporary
@@ -457,9 +451,7 @@ def _fit_polynomial_gfactor(
     global_sigma = median_noise
 
     if verbose:
-        print(
-            f"  G-factor poly deg={degree} ({n_terms} terms, c4={c4:.4f}, log-space fit)"
-        )
+        print(f"  G-factor poly deg={degree} ({n_terms} terms, c4={c4:.4f}, log-space fit)")
         print(f"  G-factor range: [{float(gfactor.min()):.4f}, {float(gfactor.max()):.4f}]")
         print(f"  Global noise σ: {global_sigma:.6g}")
 
@@ -497,16 +489,18 @@ def _heldout_nll(
         # Multiple volumes: average NLL across all voxel-volume pairs
         if noise_vol.is_complex():
             # Real and imag each ~ N(0, var/2), so combined x²/var = (r²+i²)/var
-            sq = noise_vol.real ** 2 + noise_vol.imag ** 2  # (nx, ny, nz, k)
+            sq = noise_vol.real**2 + noise_vol.imag**2  # (nx, ny, nz, k)
         else:
-            sq = noise_vol ** 2
+            sq = noise_vol**2
         # sum over k volumes at each voxel
-        nll_map = sq.sum(dim=-1) / (2.0 * var_model) + noise_vol.shape[-1] * torch.log(var_model) / 2.0
+        nll_map = (
+            sq.sum(dim=-1) / (2.0 * var_model) + noise_vol.shape[-1] * torch.log(var_model) / 2.0
+        )
     else:
         if noise_vol.is_complex():
-            sq = noise_vol.real ** 2 + noise_vol.imag ** 2
+            sq = noise_vol.real**2 + noise_vol.imag**2
         else:
-            sq = noise_vol ** 2
+            sq = noise_vol**2
         nll_map = sq / (2.0 * var_model) + torch.log(var_model) / 2.0
 
     # Only score valid voxels (non-zero g-factor region)
@@ -552,8 +546,7 @@ def _poly_gfactor_multi_degree(
     # Map each candidate degree → column indices (terms with total_deg ≤ d)
     term_total_deg = [i + j + k for (i, j, k) in terms]
     col_indices: dict[int, list[int]] = {
-        d: [idx for idx, td in enumerate(term_total_deg) if td <= d]
-        for d in degree_candidates
+        d: [idx for idx, td in enumerate(term_total_deg) if td <= d] for d in degree_candidates
     }
 
     # Valid mask and log targets
@@ -575,9 +568,7 @@ def _poly_gfactor_multi_degree(
     # YZ basis at max degree: (ny*nz, n_terms_max)
     j_idx = torch.tensor([t[1] for t in terms], device=dev)
     k_idx = torch.tensor([t[2] for t in terms], device=dev)
-    yz_basis = (
-        Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)
-    ).reshape(ny * nz, n_terms_max)
+    yz_basis = (Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)).reshape(ny * nz, n_terms_max)
 
     i_idx = torch.tensor([t[0] for t in terms], device=dev)
 
@@ -590,7 +581,7 @@ def _poly_gfactor_multi_degree(
     Xty = torch.zeros(n_terms_max, device=dev, dtype=torch.float32)
 
     for xi in range(nx):
-        mask_f = valid_3d[xi].reshape(-1, 1).float()   # (ny*nz, 1)
+        mask_f = valid_3d[xi].reshape(-1, 1).float()  # (ny*nz, 1)
         px_vals = Px[xi, i_idx]
         Xw = (yz_basis * px_vals.unsqueeze(0)) * mask_f
         yw = log_std[xi].reshape(-1) * mask_f.squeeze()
@@ -624,7 +615,7 @@ def _poly_gfactor_multi_degree(
     fitted_all = torch.empty(nx, ny, nz, n_cand, device=dev)
     for xi in range(nx):
         px_vals = Px[xi, i_idx]
-        X_slice = yz_basis * px_vals.unsqueeze(0)       # (ny*nz, n_terms_max)
+        X_slice = yz_basis * px_vals.unsqueeze(0)  # (ny*nz, n_terms_max)
         vals = torch.exp((X_slice @ betas_padded).float())  # (ny*nz, n_cand)
         fitted_all[xi] = vals.reshape(ny, nz, n_cand)
 
@@ -675,7 +666,10 @@ def _loo_optimize_gfactor_degree(
     c4 = _c4_bias_correction(k - 1)  # train on k-1 volumes
 
     pbar = tqdm(
-        total=k, desc="  LOO poly degree", unit="fold", disable=not verbose,
+        total=k,
+        desc="  LOO poly degree",
+        unit="fold",
+        disable=not verbose,
     )
 
     # Accumulate NLLs: degree → list of per-fold NLLs
@@ -824,7 +818,10 @@ def _loo_optimize_gfactor_fwhm(
 
     total_fits = len(fwhm_candidates) * k
     pbar = tqdm(
-        total=total_fits, desc="  LOO FWHM", unit="fit", disable=not verbose,
+        total=total_fits,
+        desc="  LOO FWHM",
+        unit="fit",
+        disable=not verbose,
     )
 
     for fwhm in fwhm_candidates:
@@ -1268,9 +1265,7 @@ def run_sauna(
     if dd_phase is not None:
         _dd_phase_multiply_inplace(denoised, dd_phase, conjugate=True)
         if residual is not None:
-            _dd_phase_multiply_inplace(
-                residual, dd_phase.to(residual.device), conjugate=True
-            )
+            _dd_phase_multiply_inplace(residual, dd_phase.to(residual.device), conjugate=True)
         del dd_phase
         if dev.type == "cuda":
             torch.cuda.empty_cache()
@@ -1376,7 +1371,9 @@ def run_sauna(
             "gfactor_method_requested": cfg.gfactor_method,
             "gfactor_method_used": gfactor_method,
             "gfactor_smooth_fwhm_requested": str(cfg.gfactor_smooth_fwhm),
-            "gfactor_smooth_fwhm_used": float(smooth_fwhm) if gfactor_method == "gaussian" else None,
+            "gfactor_smooth_fwhm_used": float(smooth_fwhm)
+            if gfactor_method == "gaussian"
+            else None,
             "gfactor_poly_degree": poly_degree if gfactor_method == "polynomial" else None,
             "shrinkage": cfg.shrinkage,
         },

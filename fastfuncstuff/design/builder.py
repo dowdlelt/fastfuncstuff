@@ -1150,37 +1150,18 @@ def write_afni_xmat(
                 contrast_vec = glt_weights_to_vector(weights, regressor_labels)
 
                 # Format: "1,n_regressors,values"
-                # Only include non-zero weights
                 nonzero_indices = np.where(contrast_vec != 0)[0]
                 matrix_str = f"1,{n_regressors},"
 
-                # Build compact representation
-                parts = []
-                for i, val in enumerate(contrast_vec):
-                    if i == 0:
-                        if val == 0:
-                            # Count leading zeros
-                            next_nonzero = (
-                                nonzero_indices[0] if len(nonzero_indices) > 0 else n_regressors
-                            )
-                            if next_nonzero > 0:
-                                parts.append(f"{next_nonzero}@0")
-                    else:
-                        if val != 0:
-                            parts.append(str(val))
-                        else:
-                            # Check if we have contiguous zeros
-                            pass  # Handle in the simplest way
-
-                # Simple format: just list all values with compression for leading zeros
+                # Compact leading zeros then emit every remaining value verbatim so
+                # the total count always equals n_regressors.
                 if len(nonzero_indices) > 0 and nonzero_indices[0] > 0:
-                    matrix_str += f"{nonzero_indices[0]}@0"
-                    for i in range(nonzero_indices[0], n_regressors):
-                        if contrast_vec[i] != 0:
-                            matrix_str += f",{contrast_vec[i]:.0f}"
+                    first_nz = nonzero_indices[0]
+                    matrix_str += f"{first_nz}@0"
+                    remaining = contrast_vec[first_nz:]
+                    matrix_str += "," + ",".join(f"{v:.0f}" for v in remaining)
                 else:
-                    # No leading zeros, just list values
-                    matrix_str += ",".join([str(int(v)) if v != 0 else "0" for v in contrast_vec])
+                    matrix_str += ",".join(f"{v:.0f}" for v in contrast_vec)
 
                 f.write(f'#  GltMatrix_{glt_idx:06d} = "{matrix_str}"\n')
 

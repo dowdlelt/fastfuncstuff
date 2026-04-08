@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -951,15 +952,24 @@ def write_glm_bucket_as_nifti(
         labels.append("Full_Fstat")
 
     # 2. Beta and T-stat for each condition
+    _already_indexed = re.compile(r"#\d+$")
     for idx, name in enumerate(condition_names):
         # Beta coefficient
+        # If the name already ends in #N (IM designs: "faces#0", "faces#1", ...)
+        # don't double-append "#0"; just suffix with "_Coef" / "_Tstat".
+        if _already_indexed.search(name):
+            coef_label = f"{name}_Coef"
+            tstat_label = f"{name}_Tstat"
+        else:
+            coef_label = f"{name}#0_Coef"
+            tstat_label = f"{name}#0_Tstat"
         subbricks.append(betas_vol[..., idx].astype(dtype, copy=False))
-        labels.append(f"{name}#0_Coef")
+        labels.append(coef_label)
 
         # T-statistic (if available)
         if has_tstats and tstats_vol is not None:
             subbricks.append(tstats_vol[..., idx].astype(dtype, copy=False))
-            labels.append(f"{name}#0_Tstat")
+            labels.append(tstat_label)
 
     # 3. Beta and T-stat for each contrast
     # Check if contrasts are in results object first (from in-loop GLT computation)

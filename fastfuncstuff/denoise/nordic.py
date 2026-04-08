@@ -1046,9 +1046,7 @@ def run_nordic(
     if dd_phase is not None:
         _dd_phase_multiply_inplace(denoised, dd_phase, conjugate=True)
         if residual is not None:
-            _dd_phase_multiply_inplace(
-                residual, dd_phase.to(residual.device), conjugate=True
-            )
+            _dd_phase_multiply_inplace(residual, dd_phase.to(residual.device), conjugate=True)
         del dd_phase
         if dev.type == "cuda":
             torch.cuda.empty_cache()

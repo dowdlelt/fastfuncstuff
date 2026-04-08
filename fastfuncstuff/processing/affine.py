@@ -352,8 +352,9 @@ def apply_affine(
         Resampled image with output_shape.
     """
     if output_shape is None:
-        output_shape = source.shape
-    onz, ony, onx = output_shape
+        onz, ony, onx = source.shape
+    else:
+        onz, ony, onx = output_shape
     device = source.device
     dtype = source.dtype
 
@@ -428,8 +429,9 @@ def apply_affine_wsinc5(
         Resampled image with output_shape.
     """
     if output_shape is None:
-        output_shape = source.shape
-    onz, ony, onx = output_shape
+        onz, ony, onx = source.shape
+    else:
+        onz, ony, onx = output_shape
     device = source.device
     dtype = source.dtype
     snz, sny, snx = source.shape
@@ -500,8 +502,9 @@ def apply_affine_interp(
         return apply_affine(source, matrix, output_shape, zero_outside=zero_outside)
 
     if output_shape is None:
-        output_shape = source.shape
-    onz, ony, onx = output_shape
+        onz, ony, onx = source.shape
+    else:
+        onz, ony, onx = output_shape
     device = source.device
     dtype = source.dtype
     snz, sny, snx = source.shape
@@ -673,8 +676,9 @@ def apply_affine_batched(
     """
     B = matrices.shape[0]
     if output_shape is None:
-        output_shape = source.shape
-    onz, ony, onx = output_shape
+        onz, ony, onx = source.shape
+    else:
+        onz, ony, onx = output_shape
     device = source.device
     dtype = source.dtype
 
