@@ -1789,7 +1789,20 @@ def main():
                 var_data_np.reshape(*volume_shape, -1) if volume_shape else var_data_np
             )
 
-        var_img = nib.Nifti1Image(var_vol, affine)
+        # Inherit AFNI header from source data so SCENE_DATA[0] (view) and
+        # TEMPLATE_SPACE carry forward correctly (e.g. TLRC + MNI_2009c_asym).
+        # Then set SCENE_DATA[1] and TYPESTRING to fbuc/3DIM_HEAD_FUNC since
+        # GLM outputs are stat buckets, not EPI timeseries.
+        nifti_header_rvar = getattr(results, "nifti_header", None)
+        if nifti_header_rvar is not None:
+            import copy
+            var_header = copy.deepcopy(nifti_header_rvar)
+            var_header.set_data_shape(var_vol.shape)
+            var_img = nib.Nifti1Image(var_vol, affine, header=var_header)
+        else:
+            var_img = nib.Nifti1Image(var_vol, affine)
+        from fastfuncstuff.io.afni import set_afni_func_type
+        set_afni_func_type(var_img.header, func_code=11)  # fbuc / 3DIM_HEAD_FUNC
 
         # Save in requested format using helper
         # IMPORTANT: nibabel cannot convert NIfTI headers to AFNI headers

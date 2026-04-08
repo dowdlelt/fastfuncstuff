@@ -1051,6 +1051,11 @@ def write_glm_bucket_as_nifti(
     # Create NIfTI image with complete header preservation
     bucket_img = _create_nifti_with_header(bucket_data, affine_mat, results, tr)
 
+    # GLM output is a stats bucket, not an EPI timeseries — update AFNI type
+    # so AFNI sees fbuc/3DIM_HEAD_FUNC rather than the inherited epan/3DIM_HEAD_ANAT
+    from fastfuncstuff.io.afni import set_afni_func_type
+    set_afni_func_type(bucket_img.header, func_code=11)
+
     # Normalize output path and detect format
     base_path, detected_format = _normalize_output_path(output_path)
     if output_format is not None:

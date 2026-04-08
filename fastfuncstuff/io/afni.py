@@ -1720,6 +1720,52 @@ def set_afni_space_info(
             break
 
 
+def set_afni_func_type(header: object, func_code: int = 11) -> None:
+    """Set AFNI SCENE_DATA[1] (func type) and TYPESTRING in a NIfTI AFNI extension.
+
+    Call this after inheriting a header from an EPI source when the output is a
+    stats/parameter bucket — the EPI source has epan/3DIM_HEAD_ANAT, but GLM
+    outputs should be fbuc/3DIM_HEAD_FUNC.
+
+    Parameters
+    ----------
+    header : nibabel NIfTI header with an AFNI extension (ecode=4)
+    func_code : int
+        11 = FUNC_BUCK_TYPE (fbuc) — stat buckets (Rbuck, Rvar, etc.)
+         2 = ANAT_EPI_TYPE  (epan) — EPI timeseries (restore if needed)
+    """
+    import re
+
+    type_str = "3DIM_HEAD_FUNC" if func_code >= 10 else "3DIM_HEAD_ANAT"
+
+    try:
+        import nibabel as nib
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return
+
+    for i, ext in enumerate(extensions):
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            xml = ext.content.decode("utf-8", errors="replace")
+
+            # Update SCENE_DATA[1] (second integer, one per line in NIfTI XML)
+            xml = re.sub(
+                r'(atr_name="SCENE_DATA"[^>]*>\s*\n\s*\d+\s*\n\s*)\d+',
+                rf'\g<1>{func_code}',
+                xml,
+            )
+
+            # Update TYPESTRING
+            xml = re.sub(
+                r'(atr_name="TYPESTRING"\s*>\s*\n\s*)"[^"]*"',
+                rf'\1"{type_str}"',
+                xml,
+            )
+
+            extensions[i] = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
+            break
+
+
 def _update_afni_extension(
     header: object,
     data_shape: tuple[int, ...],
