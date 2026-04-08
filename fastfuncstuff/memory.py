@@ -327,6 +327,95 @@ def bytes_per_voxel_xval(
     return (8 * n_timepoints + max(n_regressors, 10)) * 4
 
 
+def compute_reml_batched_search_strategy(
+    n_voxels: int,
+    n_timepoints: int,
+    n_regressors: int,
+    n_grid: int,
+    device: torch.device,
+    bytes_per_element: int,
+) -> tuple[int, int]:
+    """
+    Jointly optimise grid_chunk_size and voxel_batch_size for batched REML search.
+
+    The batched search stacks G grid points, reads each voxel batch once, and
+    computes all G likelihoods in a single batched GEMM pass.  Memory layout:
+
+    Persistent while the inner voxel loop runs (one allocation per grid chunk):
+        L_inv_stack : G × n_time × n_time  (dominant for large n_time)
+        Q_stack     : G × n_time × n_reg
+
+    Transient per voxel mini-batch (created and freed each pass):
+        Y_w_all     : G × n_time × V       (dominant)
+        QTYw        : G × n_reg  × V
+        scalars     : G × V × 3
+
+    The GPU cuBLAS batched-GEMM throughput plateaus at G ≈ 8–16 for typical
+    matrix sizes; beyond that, adding more grid points reduces V without
+    improving GPU utilisation.  We cap G at ``G_SAT`` and push remaining memory
+    budget into maximising V.
+
+    Parameters
+    ----------
+    n_voxels : int
+    n_timepoints : int
+    n_regressors : int
+    n_grid : int
+        Total number of (a,b) pairs in the precomputed grid.
+    device : torch.device
+    bytes_per_element : int
+        4 for float32, 8 for float64.
+
+    Returns
+    -------
+    grid_chunk : int
+        Number of (a,b) pairs to stack in a single batched GEMM pass.
+    voxel_batch : int
+        Number of voxels to process per inner loop iteration.
+    """
+    config = get_memory_config()
+    available = get_available_memory(device)
+
+    bpe = bytes_per_element
+
+    # --- Persistent cost per grid point (L_inv + Q) ---
+    per_grid_persistent = (n_timepoints * n_timepoints + n_timepoints * n_regressors) * bpe
+
+    # --- Transient cost per (grid_point × voxel) ---
+    # Y_w column + QTYw column + 3 scalars
+    per_grid_per_voxel = (n_timepoints + n_regressors + 3) * bpe
+
+    # cuBLAS batched-GEMM efficiency plateau — beyond this G adds no GPU benefit
+    G_SAT = 16
+
+    # Budget: 40 % for the persistent L_inv + Q stack, 50 % for transient Y_w.
+    # The remaining 10 % is implicit headroom for PyTorch allocator overhead.
+    persistent_budget = int(available * 0.40)
+    transient_budget = int(available * 0.50)
+
+    # Max grid chunk constrained by persistent memory (and the saturation point)
+    max_grid_mem = max(1, persistent_budget // per_grid_persistent)
+    grid_chunk = min(n_grid, max_grid_mem, G_SAT)
+
+    # Max voxel batch given the chosen grid chunk
+    if grid_chunk > 0 and per_grid_per_voxel > 0:
+        max_voxel_mem = transient_budget // (grid_chunk * per_grid_per_voxel)
+    else:
+        max_voxel_mem = config.min_chunk_size
+
+    voxel_batch = int(max_voxel_mem)
+    voxel_batch = min(voxel_batch, n_voxels)
+
+    # Clamp to configured limits
+    if device.type == "cuda":
+        voxel_batch = min(voxel_batch, config.max_chunk_size_gpu)
+    else:
+        voxel_batch = min(voxel_batch, config.max_chunk_size_cpu)
+    voxel_batch = max(voxel_batch, config.min_chunk_size)
+
+    return grid_chunk, voxel_batch
+
+
 def bytes_per_voxel_ridge(
     n_timepoints: int,
     n_regressors: int,
