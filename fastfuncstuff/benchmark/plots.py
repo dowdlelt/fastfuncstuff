@@ -30,38 +30,51 @@ STAGE_LABELS = {
 
 # Short arch labels for plot legends
 def _short_arch(arch_id: str) -> str:
-    """Convert arch_id to a short label for plots."""
-    # linux-x86_64-cuda-NVIDIA_GeForce_RTX_5070_Ti -> RTX 5070 Ti
-    # darwin-arm64-mps-Apple_M4_Pro -> M4 Pro
+    """Convert an arch_id to a short label for plots.
+
+    Handles both v2 IDs (e.g. "cuda-NVIDIA_GeForce_RTX_5070_Ti", "linux-x86_64")
+    and legacy v1 combined IDs (e.g. "linux-x86_64-cuda-NVIDIA_GeForce_RTX_5070_Ti").
+    """
+    for prefix in ("cuda-NVIDIA_GeForce_", "cuda-NVIDIA_", "cuda-", "mps-Apple_", "mps-"):
+        if arch_id.startswith(prefix):
+            return arch_id[len(prefix):].replace("_", " ")
+    # Legacy: linux-x86_64-cuda-NVIDIA_GeForce_RTX_5070_Ti
     parts = arch_id.split("-", 3)
     if len(parts) >= 4:
         accel = parts[3]
-        # Strip common prefixes
         for prefix in ("NVIDIA_GeForce_", "NVIDIA_", "Apple_"):
             if accel.startswith(prefix):
                 accel = accel[len(prefix):]
         return accel.replace("_", " ")
+    # ref_arch_id style: linux-x86_64
+    if len(parts) == 2:
+        return f"{parts[0]}/{parts[1]}"
     return arch_id
 
 
 def _extract_plot_data(cache: dict[str, Any]) -> list[dict]:
-    """Extract per-architecture stage timing data from cache.
+    """Extract per-machine stage timing data from cache.
 
-    Returns list of dicts with keys: arch_id, short_label, dataset_id, stages.
-    Each stage entry has ref_seconds and ffs_seconds.
+    Returns one entry per unique (ref_arch_id, ffs_arch_id) pair, using the
+    latest timing for each stage. Compatible with both v1 and v2 schemas.
     """
+    from .timing_cache import get_latest_per_arch
+
+    collapsed = get_latest_per_arch(cache)
     entries = []
-    for run in cache.get("runs", []):
-        arch_id = run.get("arch_id", "unknown")
+    for run in collapsed:
+        ffs_id = run.get("ffs_arch_id", run.get("arch_id", "unknown"))
         stages = run.get("stages", {})
         if not stages:
             continue
         dataset_id = run.get("dataset_id", "")
-        short = _short_arch(arch_id)
+        short = _short_arch(ffs_id)
         if dataset_id:
             short = f"{short} ({dataset_id})"
         entries.append({
-            "arch_id": arch_id,
+            "arch_id": run.get("arch_id", ffs_id),
+            "ref_arch_id": run.get("ref_arch_id", ""),
+            "ffs_arch_id": ffs_id,
             "dataset_id": dataset_id,
             "short_label": short,
             "stages": stages,

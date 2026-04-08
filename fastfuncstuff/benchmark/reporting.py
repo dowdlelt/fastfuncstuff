@@ -6,15 +6,17 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .arch import get_arch_id, get_arch_info
+from .arch import get_arch_info, get_ffs_arch_id, get_ref_arch_id
 from .runner import StageResult
+from .timing_cache import get_ref_timings_all_archs
 
 
 def print_validation_report(results: list[StageResult]) -> None:
     """Print a validation-only report table to terminal."""
-    arch_id = get_arch_id()
+    ref_id = get_ref_arch_id()
+    ffs_id = get_ffs_arch_id()
 
-    print(f"\nBENCHMARK VALIDATION: {arch_id}")
+    print(f"\nBENCHMARK VALIDATION  ref={ref_id}  ffs={ffs_id}")
     print("=" * 64)
     print(f"{'Stage':<16} {'Status':<8} {'Summary'}")
     print("-" * 64)
@@ -31,7 +33,6 @@ def print_validation_report(results: list[StageResult]) -> None:
         for err in r.errors:
             print(f"  ERROR: {err}")
 
-        # Detailed moco output: per-column motion correlations and MSD
         if r.stage_name == "moco" and r.validation:
             _print_moco_detail(r.validation)
 
@@ -41,7 +42,6 @@ def print_validation_report(results: list[StageResult]) -> None:
 
 def _print_moco_detail(validation: dict) -> None:
     """Print per-column motion correlations and MSD for moco stage."""
-    # Per-column motion parameter correlations
     motion = validation.get("motion_params", {})
     per_run = motion.get("per_run", [])
     if per_run:
@@ -52,7 +52,6 @@ def _print_moco_detail(validation: dict) -> None:
             cols = " ".join(f"{name}={r:.3f}" for name, r in per_col.items())
             print(f"    {task} run-{run}: {cols}")
 
-    # MSD of difference images
     msd_data = validation.get("timeseries_msd", {})
     msd_runs = msd_data.get("per_run", [])
     if msd_runs:
@@ -67,38 +66,96 @@ def _print_moco_detail(validation: dict) -> None:
                       f"nrmsd={entry['nrmsd']:.4f}")
 
 
-def print_timing_report(results: list[StageResult]) -> None:
-    """Print a full timing + validation report table."""
-    arch_id = get_arch_id()
+def print_timing_report(
+    results: list[StageResult], data_dir: Path | None = None,
+) -> None:
+    """Print a full timing + validation report table.
 
-    print(f"\nBENCHMARK: {arch_id}")
-    print("=" * 72)
-    print(f"{'Stage':<16} {'Ref (s)':>10} {'FFS (s)':>10} {'Speedup':>10} {'Status'}")
-    print("-" * 72)
+    When data_dir is provided, missing ref timings are pulled from the cache
+    (queried by CPU arch for ref, GPU for FFS) and annotated:
+      †  = cached from this CPU architecture
+      ‡  = cached from a different CPU architecture
+    """
+    my_ref_id = get_ref_arch_id()
+    my_ffs_id = get_ffs_arch_id()
+
+    # Pre-fetch cached ref timings for stages where ref didn't run this time
+    cached_refs: dict[str, list[tuple[str, float]]] = {}
+    if data_dir is not None:
+        for r in results:
+            if not (r.ref_time and r.ref_time > 0) and r.ffs_time:
+                cached_refs[r.stage_name] = get_ref_timings_all_archs(data_dir, r.stage_name)
+
+    print(f"\nBENCHMARK  ref={my_ref_id}  ffs={my_ffs_id}")
+    print("=" * 80)
+    print(f"{'Stage':<16} {'Ref (s)':>12} {'FFS (s)':>10} {'Speedup':>10} {'Status'}")
+    print("-" * 80)
 
     total_ref = 0.0
     total_ffs = 0.0
+    any_cached_ref = False
+    any_other_arch_ref = False
 
     for r in results:
         status = "PASS" if r.passed else "FAIL"
-        ref_str = f"{r.ref_time:.1f}" if r.ref_time is not None else "-"
-        ffs_str = f"{r.ffs_time:.1f}" if r.ffs_time is not None else "-"
+        ffs_t = r.ffs_time or 0.0
+        ref_t = r.ref_time or 0.0
+        ffs_str = f"{ffs_t:.1f}" if ffs_t > 0 else "-"
 
-        if r.ref_time is not None and r.ffs_time is not None and r.ffs_time > 0:
-            speedup = r.ref_time / r.ffs_time
-            speedup_str = f"{speedup:.1f}x"
-            total_ref += r.ref_time
-            total_ffs += r.ffs_time
+        # Determine best ref timing for display
+        if ref_t > 0:
+            ref_str = f"{ref_t:.1f}"
+        elif r.stage_name in cached_refs:
+            all_refs = cached_refs[r.stage_name]
+            local = next((rv for av, rv in all_refs if av == my_ref_id), None)
+            if local is not None:
+                ref_t = local
+                ref_str = f"{ref_t:.1f}†"
+                any_cached_ref = True
+            elif all_refs:
+                _, best_ref = all_refs[0]  # sorted by ref_seconds asc
+                ref_t = best_ref
+                ref_str = f"{ref_t:.1f}‡"
+                any_other_arch_ref = True
+            else:
+                ref_str = "-"
+        else:
+            ref_str = "-"
+
+        if ref_t > 0 and ffs_t > 0:
+            speedup_str = f"{ref_t / ffs_t:.1f}x"
+            total_ref += ref_t
+            total_ffs += ffs_t
         else:
             speedup_str = "-"
 
-        summary_short = r.summary[:30] if r.summary else ""
-        print(f"{r.stage_name:<16} {ref_str:>10} {ffs_str:>10} {speedup_str:>10} {status}  {summary_short}")
+        summary_short = r.summary[:28] if r.summary else ""
+        print(f"{r.stage_name:<16} {ref_str:>12} {ffs_str:>10} {speedup_str:>10} {status}  {summary_short}")
 
-    print("-" * 72)
+    print("-" * 80)
     if total_ffs > 0:
-        total_speedup = f"{total_ref / total_ffs:.1f}x"
-        print(f"{'Total':<16} {total_ref:>10.1f} {total_ffs:>10.1f} {total_speedup:>10}")
+        print(f"{'Total':<16} {total_ref:>12.1f} {total_ffs:>10.1f} {total_ref / total_ffs:>9.1f}x")
+
+    if any_cached_ref:
+        print(f"  † cached ref timing (CPU arch: {my_ref_id})")
+    if any_other_arch_ref:
+        print(f"  ‡ cached ref timing from a different CPU architecture")
+
+
+def _short_arch(arch_id: str) -> str:
+    """Shorten an arch_id for compact display.
+
+    Handles both v2 IDs (ref_arch_id like "linux-x86_64", ffs_arch_id like
+    "cuda-NVIDIA_GeForce_RTX_5070_Ti") and legacy combined IDs.
+    """
+    for prefix in ("cuda-NVIDIA_GeForce_", "cuda-NVIDIA_", "cuda-", "mps-Apple_", "mps-"):
+        if arch_id.startswith(prefix):
+            return arch_id[len(prefix):].replace("_", " ")
+    # linux-x86_64 or darwin-arm64 style
+    parts = arch_id.split("-", 1)
+    if len(parts) == 2:
+        return f"{parts[0]}/{parts[1]}"
+    return arch_id
 
 
 def results_to_json(results: list[StageResult]) -> dict[str, Any]:
