@@ -13,8 +13,8 @@ import time
 
 import torch
 
-from .io import load_image, save_image
-from .mask import automask
+from fastfuncstuff.processing.io import load_image, save_image
+from fastfuncstuff.processing.mask import automask
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

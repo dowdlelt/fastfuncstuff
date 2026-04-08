@@ -327,6 +327,95 @@ def bytes_per_voxel_xval(
     return (8 * n_timepoints + max(n_regressors, 10)) * 4
 
 
+def compute_reml_batched_search_strategy(
+    n_voxels: int,
+    n_timepoints: int,
+    n_regressors: int,
+    n_grid: int,
+    device: torch.device,
+    bytes_per_element: int,
+) -> tuple[int, int]:
+    """
+    Jointly optimise grid_chunk_size and voxel_batch_size for batched REML search.
+
+    The batched search stacks G grid points, reads each voxel batch once, and
+    computes all G likelihoods in a single batched GEMM pass.  Memory layout:
+
+    Persistent while the inner voxel loop runs (one allocation per grid chunk):
+        L_inv_stack : G × n_time × n_time  (dominant for large n_time)
+        Q_stack     : G × n_time × n_reg
+
+    Transient per voxel mini-batch (created and freed each pass):
+        Y_w_all     : G × n_time × V       (dominant)
+        QTYw        : G × n_reg  × V
+        scalars     : G × V × 3
+
+    The GPU cuBLAS batched-GEMM throughput plateaus at G ≈ 8–16 for typical
+    matrix sizes; beyond that, adding more grid points reduces V without
+    improving GPU utilisation.  We cap G at ``G_SAT`` and push remaining memory
+    budget into maximising V.
+
+    Parameters
+    ----------
+    n_voxels : int
+    n_timepoints : int
+    n_regressors : int
+    n_grid : int
+        Total number of (a,b) pairs in the precomputed grid.
+    device : torch.device
+    bytes_per_element : int
+        4 for float32, 8 for float64.
+
+    Returns
+    -------
+    grid_chunk : int
+        Number of (a,b) pairs to stack in a single batched GEMM pass.
+    voxel_batch : int
+        Number of voxels to process per inner loop iteration.
+    """
+    config = get_memory_config()
+    available = get_available_memory(device)
+
+    bpe = bytes_per_element
+
+    # --- Persistent cost per grid point (L_inv + Q) ---
+    per_grid_persistent = (n_timepoints * n_timepoints + n_timepoints * n_regressors) * bpe
+
+    # --- Transient cost per (grid_point × voxel) ---
+    # Y_w column + QTYw column + 3 scalars
+    per_grid_per_voxel = (n_timepoints + n_regressors + 3) * bpe
+
+    # cuBLAS batched-GEMM efficiency plateau — beyond this G adds no GPU benefit
+    G_SAT = 16
+
+    # Budget: 40 % for the persistent L_inv + Q stack, 50 % for transient Y_w.
+    # The remaining 10 % is implicit headroom for PyTorch allocator overhead.
+    persistent_budget = int(available * 0.40)
+    transient_budget = int(available * 0.50)
+
+    # Max grid chunk constrained by persistent memory (and the saturation point)
+    max_grid_mem = max(1, persistent_budget // per_grid_persistent)
+    grid_chunk = min(n_grid, max_grid_mem, G_SAT)
+
+    # Max voxel batch given the chosen grid chunk
+    if grid_chunk > 0 and per_grid_per_voxel > 0:
+        max_voxel_mem = transient_budget // (grid_chunk * per_grid_per_voxel)
+    else:
+        max_voxel_mem = config.min_chunk_size
+
+    voxel_batch = int(max_voxel_mem)
+    voxel_batch = min(voxel_batch, n_voxels)
+
+    # Clamp to configured limits
+    if device.type == "cuda":
+        voxel_batch = min(voxel_batch, config.max_chunk_size_gpu)
+    else:
+        voxel_batch = min(voxel_batch, config.max_chunk_size_cpu)
+    voxel_batch = max(voxel_batch, config.min_chunk_size)
+
+    return grid_chunk, voxel_batch
+
+
 def bytes_per_voxel_ridge(
     n_timepoints: int,
     n_regressors: int,
@@ -454,6 +543,65 @@ def bytes_per_voxel_arma(
     # Per-voxel: betas, residuals, likelihood
     # This is just a rough estimate - actual ARMA uses grid-specific logic
     return (8 * n_timepoints + 2 * n_regressors + max_lag) * 4
+
+
+def estimate_nordic_llr_memory(
+    shape: tuple[int, int, int, int],
+    kernel_size: tuple[int, int, int],
+    svd_batch_size: int,
+    dtype_bytes: int,
+    return_recon: bool = True,
+) -> dict[str, int]:
+    """Estimate GPU memory breakdown for a single ``_llr_denoise`` call.
+
+    Parameters
+    ----------
+    shape : (nx, ny, nz, nt)
+        Volume shape.
+    kernel_size : (wx, wy, wz)
+        Patch kernel size (clamped to volume dims internally).
+    svd_batch_size : int
+        Batch size for decomposition.
+    dtype_bytes : int
+        Bytes per element (8 for complex64, 4 for float32).
+    return_recon : bool
+        Whether reconstruction is enabled (allocates recon_acc).
+
+    Returns
+    -------
+    dict with keys:
+        data : input volume bytes (already on GPU)
+        recon_acc : reconstruction accumulator bytes
+        diag_maps : diagnostic map bytes (weight + 4 maps)
+        batch_working : peak per-batch working set bytes
+        total : sum of above
+    """
+    nx, ny, nz, nt = shape
+    wx = min(kernel_size[0], nx)
+    wy = min(kernel_size[1], ny)
+    wz = min(kernel_size[2], nz)
+    M = wx * wy * wz
+    N = nt
+    B = svd_batch_size
+    n_spatial = nx * ny * nz
+
+    data_bytes = n_spatial * nt * dtype_bytes
+    recon_bytes = data_bytes if return_recon else 0
+    diag_bytes = 5 * n_spatial * 4  # weight + 4 maps, float32
+
+    # Peak batch working set (eigh path, worst case):
+    # mats(B,M,N) + G(B,N,N) + V(B,N,N) + coeff(B,M,N) + recon_batch(B,M,N)
+    # Not all coexist — peak is mats + coeff + recon_batch + V_k
+    # Conservative: assume 3 copies of (B,M,N) + 1 of (B,N,N)
+    batch_bytes = (3 * B * M * N + B * N * N) * dtype_bytes
+
+    return {
+        "data": data_bytes,
+        "recon_acc": recon_bytes,
+        "diag_maps": diag_bytes,
+        "batch_working": batch_bytes,
+        "total": data_bytes + recon_bytes + diag_bytes + batch_bytes,
+    }
 
 
 def dyn_chunk_estimator(

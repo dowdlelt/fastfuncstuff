@@ -32,6 +32,15 @@ def device():
     return get_device()
 
 
+@pytest.fixture(autouse=True)
+def deterministic_rng():
+    """Stabilize stochastic ridge tests to avoid flaky CI behavior."""
+    np.random.seed(12345)
+    torch.manual_seed(12345)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(12345)
+
+
 # ============================================================================
 # Layer 1: Small Tests - Unit tests for core functions
 # ============================================================================
@@ -446,7 +455,7 @@ class TestRidgeFullPipeline:
             cv_splits=cv_splits,
             autoscale=True,
             device=device,
-            verbose=True,  # Enable verbose to see what's happening
+            verbose=False,
         )
 
         # Check that we recovered the single-trial betas

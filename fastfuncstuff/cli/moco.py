@@ -14,7 +14,7 @@ import time
 
 import torch
 
-from .ffs_moco import (
+from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
     moco,
     save_maxdisp_1D,
@@ -22,7 +22,7 @@ from .ffs_moco import (
     save_moco_aff12,
     save_moco_dfile,
 )
-from .io import derive_mean_output_path, load_image, save_image
+from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
 from fastfuncstuff.cli_utils import parse_prefix
 
 

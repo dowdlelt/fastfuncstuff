@@ -1810,17 +1810,37 @@ def _update_afni_extension(
         afni_xml = afni_xml[:history_match.start(2)] + new_history + afni_xml[history_match.end(2):]
     # If no HISTORY_NOTE found, that's fine — don't add one
 
-    # --- Trim per-brick attributes if volume count changed ---
-    # BRICK_STATS has 2*nt floats, BRICK_STATSYM and BRICK_LABS have nt entries
-    old_nums_match = re.search(r'NIfTI_nums="(\d+),(\d+),(\d+),(\d+)', afni_xml)
-    # (already updated, so check original)
-    # Instead, just count entries and trim if needed — simpler to remove
-    # stale per-brick attributes entirely when volume count changes
-    # The BRICK_STATS with 726 floats for 363 volumes won't match 361 volumes
+    # --- Update DATASET_RANK[1] (sub-brick count) ---
+    # DATASET_RANK is stored as 8 ints: [3, n_sub_briks, 0, 0, 0, 0, 0, 0].
+    # Index 1 must match nt (the new volume count); mismatches cause AFNI's
+    # "NBL does not match nim" error when 3drefit tries to relabel a bucket
+    # whose header was copied from a shorter time-series file.
     n_bricks = nt if nt > 1 else nu
+    afni_xml = re.sub(
+        r'(atr_name="DATASET_RANK"[^>]*>\s*\n\s*\d+\s+)(\d+)',
+        rf'\g<1>{n_bricks}',
+        afni_xml,
+    )
+
+    # --- Update TAXIS_NUMS[0] (number of time steps / sub-bricks) ---
+    # TAXIS_NUMS[0] is the field AFNI's nifti_image_write_engine uses to validate
+    # brick count during write ("NBL == TAXIS_NUMS[0]").  When the header is
+    # copied from an fMRI run file this will be the run length (e.g. 268); it
+    # must be updated to the new brick count or the write fails with
+    # "NBL does not match nim".  The remaining TAXIS_NUMS fields (nt_type,
+    # datum type, offsets) are left unchanged.
+    afni_xml = re.sub(
+        r'(atr_name="TAXIS_NUMS"[^>]*>\s*\n\s*)(\d+)',
+        rf'\g<1>{n_bricks}',
+        afni_xml,
+    )
+
+    # --- Trim per-brick attributes when volume count changed ---
+    # BRICK_STATS/STATSYM/LABS/TYPES all have one entry per sub-brick and are
+    # stale after a volume-count change.  Remove them; AFNI/3drefit regenerates
+    # them from -substatpar / -relabel_all.
     for atr_name in ("BRICK_STATS", "BRICK_STATSYM", "BRICK_LABS",
                       "BRICK_TYPES", "BRICK_FLOAT_FACS"):
-        # Remove these attributes — AFNI will recompute them
         afni_xml = re.sub(
             rf'<AFNI_atr\s[^>]*atr_name="{atr_name}"[^>]*>.*?</AFNI_atr>\s*',
             '',

@@ -21,7 +21,9 @@ Key speedups vs serial version:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -54,10 +56,10 @@ from .penalty import compute_jacobian_energy, compute_penalty_batched
 from .weight import compute_weight_image
 
 # Cache for torch.compile'd building-block functions (stable identity, compiled once)
-_compile_cache: dict[str, object] = {}
+_compile_cache: dict[str, Callable[..., Any]] = {}
 
 
-def _maybe_compile(fn: object, name: str, device: torch.device, do_compile: bool) -> object:
+def _maybe_compile(fn: Callable[..., Any], name: str, device: torch.device, do_compile: bool) -> Callable[..., Any]:
     """Return a compiled version of fn for CUDA, caching by name."""
     if device.type != "cuda" or not do_compile:
         return fn
@@ -562,7 +564,7 @@ def _warpomatic(
 
         if config.verb >= 1:
             elapsed = time.time() - t0
-            if hasattr(pbar, 'set_postfix_str'):
+            if _tqdm is not None and isinstance(pbar, _tqdm):
                 pbar.set_postfix_str(
                     f"cost={first_cost:.5f}=>{state.cost:.5f} {elapsed:.1f}s"
                 )

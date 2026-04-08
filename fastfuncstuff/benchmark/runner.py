@@ -187,6 +187,44 @@ def run_timed(
     return elapsed, result
 
 
+def _format_timing(result: StageResult, stage_name: str, data_dir: Path) -> str:
+    """Format timing info for per-stage output, falling back to cached refs when needed."""
+    ffs_t = result.ffs_time
+    ref_t = result.ref_time
+
+    ref_ran = ref_t is not None and ref_t > 0
+    ffs_ran = ffs_t is not None and ffs_t > 0
+
+    if ref_ran and ffs_ran:
+        # Both measured this run
+        speedup = ref_t / ffs_t
+        return f" | Ref={ref_t:.1f}s FFS={ffs_t:.1f}s ({speedup:.1f}x)"
+
+    if not ffs_ran:
+        return ""
+
+    # FFS ran but ref was skipped — look up cached ref timings across all CPU archs
+    from .arch import get_ref_arch_id
+    from .timing_cache import get_ref_timings_all_archs
+
+    all_refs = get_ref_timings_all_archs(data_dir, stage_name)
+    if not all_refs:
+        return f" | FFS={ffs_t:.1f}s (no cached ref)"
+
+    my_ref_id = get_ref_arch_id()
+    local = next(((a, r) for a, r in all_refs if a == my_ref_id), None)
+    others = [(a, r) for a, r in all_refs if a != my_ref_id]
+
+    parts = [f"FFS={ffs_t:.1f}s"]
+    if local:
+        _, lr = local
+        parts.append(f"cached ref={lr:.1f}s ({lr / ffs_t:.1f}x) [this machine]")
+    for other_id, other_ref in others:
+        parts.append(f"cached ref={other_ref:.1f}s ({other_ref / ffs_t:.1f}x) [{other_id}]")
+
+    return " | " + " | ".join(parts)
+
+
 _glmsingle_exported = False  # Module-level flag to avoid re-exporting
 
 
@@ -297,10 +335,7 @@ def run_stages(
 
         # Print result
         status = "PASS" if result.passed else "FAIL"
-        timing = ""
-        if result.ref_time is not None and result.ffs_time is not None:
-            speedup = result.ref_time / result.ffs_time if result.ffs_time > 0 else float("inf")
-            timing = f" | Ref={result.ref_time:.1f}s FFS={result.ffs_time:.1f}s ({speedup:.1f}x)"
+        timing = _format_timing(result, name, ctx.data_dir)
         print(f"  {status}: {result.summary}{timing}")
 
         results.append(result)
@@ -314,10 +349,10 @@ def run_stages(
         if timing_entry:
             stage_timings[name] = timing_entry
 
-    # Update timing cache if we ran anything
+    # Append this run to the timing cache
     if stage_timings and not ctx.validate_only:
-        from .timing_cache import update_cache
+        from .timing_cache import append_run
 
-        update_cache(ctx.data_dir, stage_timings, dataset_id=ctx.dataset_id)
+        append_run(ctx.data_dir, stage_timings, dataset_id=ctx.dataset_id)
 
     return results

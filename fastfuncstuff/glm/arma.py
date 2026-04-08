@@ -1201,9 +1201,9 @@ def precompute_reml_grid(
     -------
     precomputed : dict
         Contains pre-computed matrices for each valid (a,b):
-        - 'L': lower Cholesky factor (use solve_triangular for prewhitening)
-        - 'X_w': prewhitened design
-        - 'R_qr': QR's R factor or X'X
+        - 'L_inv': lower Cholesky inverse — use L_inv @ Y for GEMM-based whitening
+        - 'X_w': prewhitened design matrix — kept for GLS fitting path
+        - 'Q': orthonormal columns of X_w — use Q'Y_w for Pythagorean RSS
         - 'logdet_Rcorr': log(det(R))
         - 'logdet_XwTXw': log(det(X'R^-1 X))
     """
@@ -1261,13 +1261,6 @@ def precompute_reml_grid(
         print(
             f"  Computing ALL Cholesky factorizations (batched on {chol_location})..."
         )
-        print(
-            f"    [DEBUG] R_batch shape: {R_batch.shape}, device: {R_batch.device}, dtype: {R_batch.dtype}"
-        )
-        print(
-            f"    [DEBUG] Target device: {device.type}, cholesky_on_cpu: {cholesky_on_cpu}"
-        )
-        print(f"    [DEBUG] PyTorch threads: {torch.get_num_threads()}")
 
     # PHASE 2: Batch Cholesky decomposition
     try:
@@ -1279,8 +1272,6 @@ def precompute_reml_grid(
 
         if cholesky_on_cpu or device.type == "mps":
             L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
-            # No inverse needed! We use triangular solve instead of L_inv @ Y
-            # This eliminates O(n_valid * n^3) inverse computation entirely
         else:
             # Direct GPU Cholesky (faster but uses more VRAM)
             L_batch = torch.linalg.cholesky(R_batch)  # (n_valid, n, n)
@@ -1310,87 +1301,53 @@ def precompute_reml_grid(
                 {"L_batch": L_batch},
             )
 
-        # PHASE 3: Batch prewhitening of design matrix
-        # X_w[i] = L[i]^{-1} @ X via batched triangular solve (no explicit inverse!)
-        # This exploits L's lower-triangular structure for ~2x fewer FLOPs than bmm
-        X_build = X.to(L_batch.device)
-        X_expanded = X_build.unsqueeze(0).expand(n_valid, -1, -1)  # VIEW!
-        X_w_batch = torch.linalg.solve_triangular(
-            L_batch, X_expanded, upper=False
-        )  # (n_valid, n_timepoints, n_regressors)
-        del X_expanded, X_build
-
-        # PHASE 4: Compute factorization (QR or X'X depending on use_qr flag)
-        if use_qr:
-            # QR factorization (AFNI approach - more stable, uses more memory)
-            # AFNI uses matrix_qrr(*W, D) to get R factor from QR decomposition
-            # This is numerically superior to forming X'X (avoids squaring condition number)
-            Q_batch, R_batch = torch.linalg.qr(
-                X_w_batch
-            )  # (n_valid, n_timepoints, n_regressors), (n_valid, n_regressors, n_regressors)
-            del Q_batch  # Don't need Q, only R (called "D" in AFNI terminology)
-            # R_batch is the upper triangular factor (AFNI's "D" matrix)
-        else:
-            # X'X approach (faster, less memory, good for well-conditioned matrices)
-            X_w_batch_T = X_w_batch.transpose(1, 2)  # Cache transpose
-            XwTXw_batch = torch.bmm(
-                X_w_batch_T, X_w_batch
-            )  # (n_valid, n_regressors, n_regressors)
-            del X_w_batch_T
-            R_batch = XwTXw_batch  # Store as R_batch for consistent naming
-
-        # PHASE 5: Batch likelihood terms (that don't depend on voxel data)
-        # logdet_Rcorr = 2 * sum(log(diag(L))) - correlation matrix determinant
+        # PHASE 3: Compute logdet from L, then compute L_inv via batched triangular solve.
+        # L_inv @ Y is a plain GEMM — avoids per-voxel triangular solve in the hot path
+        # and eliminates MKL DLASWP stride errors that plagued the slogdet path.
         logdet_Rcorr_batch = 2 * torch.sum(
             torch.log(torch.diagonal(L_batch, dim1=1, dim2=2) + 1e-10), dim=1
-        )  # (n_valid,)
-        # Keep L_batch — stored per grid point for triangular solve during search
+        )  # (n_valid,) — must be computed before L_batch is freed
+        # Solve L @ L_inv = I for each grid point.
+        # The RHS is broadcast (stride-0 expand of I) — each solve_triangular call
+        # reads the same I but writes to a different slice of L_inv_batch.
+        # No .contiguous() needed on the RHS because the LHS (L_batch) is fully contiguous
+        # and PyTorch loops over batch elements calling individual DTRTRS.
+        eye_n = torch.eye(n_timepoints, dtype=dtype, device=L_batch.device)
+        L_inv_batch = torch.linalg.solve_triangular(
+            L_batch, eye_n.unsqueeze(0).expand(n_valid, -1, -1), upper=False
+        )  # (n_valid, n_timepoints, n_timepoints)
+        del L_batch, eye_n  # L no longer needed; L_inv replaces it
 
-        # logdet(X'R^-1 X)
-        if use_qr:
-            # QR: logdet(X'X) = 2 * sum(log(diag(R))) where R is from QR of X_w
-            # This is MUCH more stable than computing det(X'X)!
-            diag_R_batch = torch.diagonal(
-                R_batch, dim1=1, dim2=2
-            )  # (n_valid, n_regressors)
-            logdet_XwTXw_batch = 2 * torch.sum(
-                torch.log(torch.abs(diag_R_batch) + 1e-10), dim=1
-            )  # (n_valid,)
-        else:
-            # X'X: use slogdet
-            sign_batch, logdet_XwTXw_batch = torch.linalg.slogdet(R_batch)
-            logdet_XwTXw_batch = torch.where(
-                sign_batch > 0,
-                logdet_XwTXw_batch,
-                torch.tensor(1e10, device=logdet_XwTXw_batch.device, dtype=dtype),
-            )
-            del sign_batch
+        # PHASE 4: Prewhiten design via batched GEMM (no expand/stride-0 issues)
+        X_cpu = X.to(L_inv_batch.device)
+        X_w_batch = torch.bmm(
+            L_inv_batch, X_cpu.unsqueeze(0).expand(n_valid, -1, -1)
+        )  # (n_valid, n_timepoints, n_regressors)
+        del X_cpu
+
+        # PHASE 5: QR always — eliminates slogdet/DLASWP, enables Pythagorean RSS
+        Q_batch, R_qr_batch = torch.linalg.qr(X_w_batch)
+        # Q_batch: (n_valid, n_time, n_reg), R_qr_batch: (n_valid, n_reg, n_reg)
+        logdet_XwTXw_batch = 2 * torch.sum(
+            torch.log(torch.abs(torch.diagonal(R_qr_batch, dim1=1, dim2=2)) + 1e-10), dim=1
+        )  # (n_valid,)
+        del R_qr_batch  # Not stored; GLS fitting path recomputes fresh QR from X_w
 
         if verbose:
             print("  ✓ Precomputed all matrices!")
             print(f"  Storing {n_valid} parameter sets...")
 
-        # PHASE 6: Store everything in dictionary ON CPU
-        # Tensors are already on CPU from Phase 2 - store as-is
-        # They will be moved to GPU on-demand during REML search
+        # PHASE 6: Store per grid point on CPU
+        # L_inv: GEMM-based whitening in search (no triangular solve in hot path)
+        # X_w: kept for GLS fitting (design is constant across all voxels in a group)
+        # Q: orthonormal cols for Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²
         for i, (a_val, b_val) in enumerate(param_list):
             precomputed[(a_val, b_val)] = {
-                "L": L_batch[
-                    i
-                ],  # (n, n) - CPU tensor - lower Cholesky factor (use solve_triangular, not matmul!)
-                "X_w": X_w_batch[
-                    i
-                ],  # (n, n_regressors) - CPU tensor - prewhitened design
-                "R_qr": R_batch[
-                    i
-                ],  # (n_regressors, n_regressors) - CPU tensor - QR's R or X'X (depending on use_qr)
-                "logdet_Rcorr": logdet_Rcorr_batch[
-                    i
-                ],  # scalar tensor - log det of correlation matrix
-                "logdet_XwTXw": logdet_XwTXw_batch[
-                    i
-                ],  # scalar tensor - log det of X'R^-1 X
-                "use_qr": use_qr,  # bool - which approach was used
+                "L_inv": L_inv_batch[i],          # (n, n) - lower Cholesky inverse
+                "X_w": X_w_batch[i],               # (n, n_reg) - prewhitened design
+                "Q": Q_batch[i],                   # (n, n_reg) - orthonormal cols for RSS
+                "logdet_Rcorr": logdet_Rcorr_batch[i],
+                "logdet_XwTXw": logdet_XwTXw_batch[i],
                 "a": a_val,
                 "b": b_val,
             }
@@ -1406,10 +1363,14 @@ def precompute_reml_grid(
             del R_batch
         if "L_batch" in locals():
             del L_batch  # noqa: F821
+        if "L_inv_batch" in locals():
+            del L_inv_batch  # noqa: F821
         if "X_w_batch" in locals():
             del X_w_batch
         if "Q_batch" in locals():
             del Q_batch
+        if "R_qr_batch" in locals():
+            del R_qr_batch
 
         # Force GPU memory release
         if device.type == "cuda":
@@ -1432,7 +1393,7 @@ def precompute_reml_grid(
                 continue
 
             try:
-                # Compute Cholesky on CPU and store on CPU
+                # Compute Cholesky on CPU
                 if cholesky_on_cpu or device.type == "mps":
                     R_cpu = R.cpu()
                     L = torch.linalg.cholesky(R_cpu)
@@ -1440,34 +1401,31 @@ def precompute_reml_grid(
                 else:
                     L = torch.linalg.cholesky(R).cpu()
 
-                # Prewhiten design via triangular solve (no inverse!)
-                X_cpu = X.cpu() if X.device.type != "cpu" else X
-                X_w = torch.linalg.solve_triangular(L, X_cpu, upper=False)
-
                 logdet_Rcorr = 2 * torch.sum(torch.log(torch.diag(L) + 1e-10))
 
-                if use_qr:
-                    Q, R_qr = torch.linalg.qr(X_w)
-                    logdet_XwTXw = 2 * torch.sum(
-                        torch.log(torch.abs(torch.diag(R_qr)) + 1e-10)
-                    )
-                else:
-                    XwTXw = X_w.T @ X_w
-                    R_qr = XwTXw
-                    sign, logdet_XwTXw = torch.linalg.slogdet(XwTXw)
-                    logdet_XwTXw = (
-                        logdet_XwTXw
-                        if sign > 0
-                        else torch.tensor(1e10, device=torch.device("cpu"), dtype=dtype)
-                    )
+                # Compute L_inv — GEMM-based whitening avoids per-voxel triangular solve
+                n_t = L.shape[0]
+                L_inv = torch.linalg.solve_triangular(
+                    L, torch.eye(n_t, dtype=dtype, device=L.device), upper=False
+                )
+                del L  # L no longer needed; L_inv replaces it
+
+                X_cpu = X.cpu() if X.device.type != "cpu" else X
+                X_w = L_inv @ X_cpu  # GEMM: (n_time, n_reg)
+
+                # QR always — eliminates slogdet/DLASWP, enables Pythagorean RSS
+                Q, R_qr = torch.linalg.qr(X_w)
+                logdet_XwTXw = 2 * torch.sum(
+                    torch.log(torch.abs(torch.diag(R_qr)) + 1e-10)
+                )
+                del R_qr  # Not stored; GLS path recomputes fresh QR from X_w
 
                 precomputed[(a_val, b_val)] = {
-                    "L": L,  # CPU tensor - lower Cholesky factor
+                    "L_inv": L_inv,
                     "X_w": X_w,
-                    "R_qr": R_qr,
+                    "Q": Q,
                     "logdet_Rcorr": logdet_Rcorr,
                     "logdet_XwTXw": logdet_XwTXw,
-                    "use_qr": use_qr,
                     "a": a_val,
                     "b": b_val,
                 }
@@ -1484,38 +1442,36 @@ def precompute_reml_grid(
             "Grid: Before deleting batch tensors",
             device,
             {
-                "L_batch": locals().get("L_batch"),
+                "L_inv_batch": locals().get("L_inv_batch"),
                 "X_w_batch": locals().get("X_w_batch"),
-                "R_batch": locals().get("R_batch"),
+                "Q_batch": locals().get("Q_batch"),
             },
         )
 
-        if "L_batch" in locals():
+        if "L_inv_batch" in locals():
             n_pairs = len(param_list)
             n_regs = X.shape[1]
-            bytes_per_elem = L_batch.element_size()
+            bytes_per_elem = L_inv_batch.element_size()
 
-            expected_L = n_pairs * n_timepoints * n_timepoints * bytes_per_elem
+            expected_L_inv = n_pairs * n_timepoints * n_timepoints * bytes_per_elem
             expected_X_w = n_pairs * n_timepoints * n_regs * bytes_per_elem
-            expected_R_qr = n_pairs * n_regs * n_regs * bytes_per_elem
+            expected_Q = n_pairs * n_timepoints * n_regs * bytes_per_elem
             expected_scalars = n_pairs * 2 * bytes_per_elem
-            expected_total = (
-                expected_L + expected_X_w + expected_R_qr + expected_scalars
-            )
+            expected_total = expected_L_inv + expected_X_w + expected_Q + expected_scalars
 
-            actual_L = L_batch.element_size() * L_batch.nelement()
+            actual_L_inv = L_inv_batch.element_size() * L_inv_batch.nelement()
             actual_X_w = X_w_batch.element_size() * X_w_batch.nelement()
-            actual_R_qr = R_batch.element_size() * R_batch.nelement()
-            actual_total = actual_L + actual_X_w + actual_R_qr
+            actual_Q = Q_batch.element_size() * Q_batch.nelement()
+            actual_total = actual_L_inv + actual_X_w + actual_Q
 
             print("\nGRID SIZE VERIFICATION:")
             print(
                 f"  n_pairs={n_pairs}, n_timepoints={n_timepoints}, n_regressors={n_regs}, dtype={dtype}"
             )
             print(f"  Expected grid size: {expected_total / 1024**3:.3f} GiB")
-            print(f"    - L:      {expected_L / 1024**3:.3f} GiB")
-            print(f"    - X_w:    {expected_X_w / 1024**3:.3f} GiB")
-            print(f"    - R_qr:   {expected_R_qr / 1024**3:.3f} GiB")
+            print(f"    - L_inv: {expected_L_inv / 1024**3:.3f} GiB")
+            print(f"    - X_w:   {expected_X_w / 1024**3:.3f} GiB")
+            print(f"    - Q:     {expected_Q / 1024**3:.3f} GiB")
             print(f"  Actual batch tensors: {actual_total / 1024**3:.3f} GiB")
             print(
                 f"  Match: {'✅ YES' if abs(actual_total - expected_total) < 1024**2 else '❌ NO'}"
@@ -1523,16 +1479,20 @@ def precompute_reml_grid(
 
     if "L_batch" in locals():
         del L_batch
+    if "L_inv_batch" in locals():
+        del L_inv_batch
     if "X_w_batch" in locals():
         del X_w_batch
+    if "Q_batch" in locals():
+        del Q_batch
     if "R_batch" in locals():
         del R_batch
+    if "R_qr_batch" in locals():
+        del R_qr_batch
     if "logdet_Rcorr_batch" in locals():
         del logdet_Rcorr_batch
     if "logdet_XwTXw_batch" in locals():
         del logdet_XwTXw_batch
-    if "diag_R_batch" in locals():
-        del diag_R_batch
 
     if debug_memory:
         _debug_memory_snapshot(
@@ -1720,33 +1680,23 @@ def _evaluate_single_param(
     Helper function for CPU hierarchical search.
     """
     # Get precomputed matrices
-    L = precomputed[param_key]["L"]  # (n_time, n_time) - lower Cholesky factor
-    X_w = precomputed[param_key]["X_w"]  # (n_time, n_reg)
-    R_qr = precomputed[param_key]["R_qr"]  # (n_reg, n_reg)
+    L_inv = precomputed[param_key]["L_inv"]  # (n_time, n_time) - lower Cholesky inverse
+    Q = precomputed[param_key]["Q"]           # (n_time, n_reg) - orthonormal cols
     logdet_Rcorr = precomputed[param_key]["logdet_Rcorr"]  # scalar
     logdet_XwTXw = precomputed[param_key]["logdet_XwTXw"]  # scalar
-    use_qr = precomputed[param_key]["use_qr"]
 
-    # Prewhiten data via triangular solve: Y_w = L^{-1} @ Y_voxel
-    Y_w = torch.linalg.solve_triangular(L, Y_voxel, upper=False)  # (n_time, 1)
+    # Prewhiten data via GEMM: Y_w = L_inv @ Y_voxel  (no triangular solve!)
+    Y_w = L_inv @ Y_voxel  # (n_time, 1)
 
-    # Compute beta
-    XwTYw = X_w.T @ Y_w  # (n_reg, 1)
-    if use_qr:
-        beta_w = torch.linalg.solve_triangular(R_qr, XwTYw, upper=True)
-    else:
-        beta_w = torch.linalg.solve(R_qr, XwTYw)
-
-    # Compute residuals and RSS
-    pred_w = X_w @ beta_w
-    resid_w = Y_w - pred_w
-    rss = torch.sum(resid_w**2).item()
+    # Pythagorean RSS: ||Y_w||² - ||Q'Y_w||²  (no betas needed!)
+    Qt_Yw = Q.T @ Y_w  # (n_reg, 1)
+    rss = (Y_w.pow(2).sum() - Qt_Yw.pow(2).sum()).item()
 
     # Compute REML likelihood
     likelihood = (
         logdet_Rcorr.item()
         + logdet_XwTXw.item()
-        + (n_timepoints - n_regressors) * float(torch.log(torch.tensor(rss + 1e-10)))
+        + (n_timepoints - n_regressors) * float(torch.log(torch.tensor(max(rss, 1e-10))))
     )
 
     return likelihood
@@ -1982,19 +1932,14 @@ def batch_reml_grid_search(
     n_chunks_evaluated = 0
     for chunk_idx, chunk_indices in enumerate(grid_chunks):
         # PHASE 1: Stack precomputed matrices for THIS CHUNK only
-        # Note: precomputed tensors may be on CPU (when cholesky_on_cpu=True)
-        # We move them to the target device after stacking
         chunk_keys = [param_list[i] for i in chunk_indices]
 
-        L_stack = torch.stack([precomputed[k]["L"] for k in chunk_keys]).to(
+        L_inv_stack = torch.stack([precomputed[k]["L_inv"] for k in chunk_keys]).to(
             device
-        )  # (n_chunk, n_time, n_time) - lower Cholesky factors
-        X_w_stack = torch.stack([precomputed[k]["X_w"] for k in chunk_keys]).to(
+        )  # (n_chunk, n_time, n_time) - lower Cholesky inverses
+        Q_stack = torch.stack([precomputed[k]["Q"] for k in chunk_keys]).to(
             device
-        )  # (n_chunk, n_time, n_regressors)
-        R_qr_stack = torch.stack([precomputed[k]["R_qr"] for k in chunk_keys]).to(
-            device
-        )  # (n_chunk, n_reg, n_reg)
+        )  # (n_chunk, n_time, n_regressors) - orthonormal cols for RSS
         logdet_Rcorr_stack = torch.stack(
             [precomputed[k]["logdet_Rcorr"] for k in chunk_keys]
         ).to(device)  # (n_chunk,)
@@ -2002,56 +1947,29 @@ def batch_reml_grid_search(
             [precomputed[k]["logdet_XwTXw"] for k in chunk_keys]
         ).to(device)  # (n_chunk,)
 
-        # PHASE 2: Prewhiten data via batched triangular solve
-        # solve L @ Y_w = Y for each grid point (exploits triangular structure, ~2x fewer FLOPs)
+        # PHASE 2: Prewhiten data via batched GEMM: Y_w = L_inv @ Y  (no triangular solve!)
+        # Y_batch: (n_time, n_voxels)  →  expand to (n_chunk, n_time, n_voxels)
         Y_batch_expanded = Y_batch.unsqueeze(0).expand(
             len(chunk_indices), -1, -1
-        )  # VIEW - no VRAM copy!
-        Y_w_all = torch.linalg.solve_triangular(
-            L_stack, Y_batch_expanded, upper=False
-        )  # (n_chunk, n_time, n_voxels)
-        del Y_batch_expanded
+        )  # VIEW - no VRAM copy
+        Y_w_all = torch.bmm(L_inv_stack, Y_batch_expanded)  # (n_chunk, n_time, n_voxels)
+        del Y_batch_expanded, L_inv_stack
 
-        # PHASE 3: Compute betas for this chunk
-        XwTYw_all = torch.bmm(
-            X_w_stack.transpose(1, 2), Y_w_all
-        )  # (n_chunk, n_reg, n_voxels)
+        # PHASE 3: Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²  (no betas needed!)
+        # Q_stack: (n_chunk, n_time, n_reg), Y_w_all: (n_chunk, n_time, n_vox)
+        Qt_Yw_all = torch.bmm(Q_stack.transpose(1, 2), Y_w_all)  # (n_chunk, n_reg, n_vox)
+        rss_all = Y_w_all.pow(2).sum(dim=1) - Qt_Yw_all.pow(2).sum(dim=1)  # (n_chunk, n_vox)
+        del Y_w_all, Qt_Yw_all, Q_stack
 
-        # Check if using QR or X'X (all entries in chunk should have same use_qr)
-        use_qr = precomputed[chunk_keys[0]]["use_qr"]
-
-        if use_qr:
-            # QR approach: triangular solve (upper triangular R)
-            beta_w_all = torch.linalg.solve_triangular(
-                R_qr_stack,  # (n_chunk, n_reg, n_reg) - upper triangular
-                XwTYw_all,  # (n_chunk, n_reg, n_voxels)
-                upper=True,
-            )
-        else:
-            # X'X approach: general solve (symmetric positive definite)
-            beta_w_all = torch.linalg.solve(
-                R_qr_stack,  # (n_chunk, n_reg, n_reg) - X'X matrix
-                XwTYw_all,  # (n_chunk, n_reg, n_voxels)
-            )
-        del XwTYw_all
-
-        # PHASE 4: Compute residuals and RSS
-        pred_w_all = torch.bmm(X_w_stack, beta_w_all)
-        residuals_w_all = Y_w_all - pred_w_all
-        del Y_w_all, pred_w_all
-
-        rss_all = torch.sum(residuals_w_all**2, dim=1)  # (n_chunk, n_voxels)
-        del residuals_w_all
-
-        # PHASE 5: Compute likelihoods for this chunk
+        # PHASE 4: Compute likelihoods for this chunk
         term1 = logdet_Rcorr_stack.unsqueeze(1)  # (n_chunk, 1)
         term2 = logdet_XwTXw_stack.unsqueeze(1)  # (n_chunk, 1)
         term3 = (n_timepoints - n_regressors) * torch.log(rss_all + 1e-10)
         del rss_all
 
         chunk_likelihoods = term1 + term2 + term3  # (n_chunk, n_voxels)
-        del term1, term2, term3, L_stack, X_w_stack, R_qr_stack
-        del logdet_Rcorr_stack, logdet_XwTXw_stack, beta_w_all
+        del term1, term2, term3
+        del logdet_Rcorr_stack, logdet_XwTXw_stack
 
         # PHASE 6: Update best parameters if this chunk has better likelihoods
         chunk_best_idx = torch.argmin(chunk_likelihoods, dim=0)  # (n_voxels,)
@@ -2127,11 +2045,10 @@ def search_voxels_precomputed_grid(
         Voxel timeseries data
     precomputed_grid : dict
         Dictionary mapping (a, b) tuples to precomputed matrices:
-        - 'L': lower Cholesky factor (use solve_triangular to prewhiten)
-        - 'X_w': Prewhitened design matrix
-        - 'R_qr': QR decomposition of X_w
+        - 'L_inv': lower Cholesky inverse for GEMM-based prewhitening
+        - 'Q': orthonormal columns of prewhitened design for Pythagorean RSS
         - 'logdet_Rcorr': log determinant of correlation matrix
-        - 'logdet_XwTXw': log determinant of X'X
+        - 'logdet_XwTXw': log determinant of X'R^-1 X
     device : torch.device
         Device for computation
     verbose : bool
@@ -2164,66 +2081,32 @@ def search_voxels_precomputed_grid(
     if Y_batch.device != device:
         Y_batch = Y_batch.to(device)
 
-    # Check which approach was used (all grid entries should have same use_qr)
-    use_qr = precomputed_grid[param_list[0]]["use_qr"]
-
-    # Evaluate each grid point
+    # Evaluate each grid point using L_inv GEMM + Pythagorean RSS (no betas needed)
     for _grid_idx, (a, b) in enumerate(param_list):
         with profile_section("1_get_grid_data", enabled=enable_timing):
             grid_data = precomputed_grid[(a, b)]
-
-            # Get precomputed matrices (already on GPU)
-            L = grid_data["L"]
-            X_w = grid_data["X_w"]
-            R_qr = grid_data["R_qr"]
+            L_inv = grid_data["L_inv"]          # (n_time, n_time)
+            Q = grid_data["Q"]                  # (n_time, n_reg) orthonormal
             logdet_Rcorr = grid_data["logdet_Rcorr"]
             logdet_XwTXw = grid_data["logdet_XwTXw"]
 
-        # Prewhiten data: Y_w = L^{-1} @ Y via triangular solve
+        # Prewhiten data via GEMM: Y_w = L_inv @ Y  (no triangular solve!)
+        # Y_batch: (n_voxels, n_time) → transpose for matmul → transpose back
         with profile_section("2_prewhiten_data", enabled=enable_timing):
-            # Y_batch: (n_voxels, n_timepoints), L: (n_timepoints, n_timepoints)
-            # solve_triangular expects (n, n) @ (n, k), so transpose
-            Y_w_batch = torch.linalg.solve_triangular(
-                L, Y_batch.T, upper=False
-            ).T  # (n_voxels, n_timepoints)
+            Y_w_batch = (L_inv @ Y_batch.T).T  # (n_voxels, n_timepoints)
 
-        # Solve X_w @ beta = Y_w for each voxel
-        with profile_section("3_compute_XwTYw", enabled=enable_timing):
-            # Compute X_w' Y_w
-            XwT_Yw = X_w.T @ Y_w_batch.T  # (n_regressors, n_voxels)
-
-        # Solve for beta using appropriate method
-        with profile_section("4_solve_beta", enabled=enable_timing):
-            if use_qr:
-                # QR approach: R' R beta = X_w' Y_w (triangular solves)
-                # R_qr is upper triangular R factor from QR decomposition
-                beta_temp = torch.linalg.solve_triangular(R_qr.T, XwT_Yw, upper=False)
-                beta_batch = torch.linalg.solve_triangular(R_qr, beta_temp, upper=True)
-            else:
-                # X'X approach: (X_w' X_w) beta = X_w' Y_w (general solve)
-                # R_qr is actually X_w' X_w (symmetric positive definite)
-                beta_batch = torch.linalg.solve(R_qr, XwT_Yw)
-            beta_batch = beta_batch.T  # (n_voxels, n_regressors)
-
-        # Compute prewhitened residuals
-        with profile_section("5_compute_residuals", enabled=enable_timing):
-            pred_w = (X_w @ beta_batch.T).T  # (n_voxels, n_timepoints)
-            resid_w = Y_w_batch - pred_w
-            rss_batch = torch.sum(resid_w**2, dim=1)  # (n_voxels,)
+        # Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²  (no betas, no residuals!)
+        with profile_section("3_pythagorean_rss", enabled=enable_timing):
+            Qt_Yw = Q.T @ Y_w_batch.T  # (n_reg, n_voxels)
+            rss_batch = Y_w_batch.pow(2).sum(dim=1) - Qt_Yw.pow(2).sum(dim=0)  # (n_voxels,)
 
         # Compute REML likelihood for this (a, b)
-        with profile_section("6_compute_likelihood", enabled=enable_timing):
-            # L = log(det(R)) + log(det(X'R^-1 X)) + (n-m) log(RSS)
-            term1 = logdet_Rcorr  # Scalar, same for all voxels
-            term2 = logdet_XwTXw  # Scalar, same for all voxels
-            term3 = (n_timepoints - n_regressors) * torch.log(
-                rss_batch + 1e-10
-            )  # (n_voxels,)
-
-            likelihoods = term1 + term2 + term3  # (n_voxels,)
+        with profile_section("4_compute_likelihood", enabled=enable_timing):
+            term3 = (n_timepoints - n_regressors) * torch.log(rss_batch + 1e-10)
+            likelihoods = logdet_Rcorr + logdet_XwTXw + term3  # (n_voxels,)
 
         # Update best parameters where this (a, b) is better
-        with profile_section("7_update_best", enabled=enable_timing):
+        with profile_section("5_update_best", enabled=enable_timing):
             improve_mask = likelihoods < best_likelihoods
             best_likelihoods[improve_mask] = likelihoods[improve_mask]
             best_params[improve_mask, 0] = a
@@ -2490,6 +2373,7 @@ def reml_grid_search_batched(
     dtype: torch.dtype = torch.float32,
     grid_chunk_size: int = 1,
     voxel_batch_size: int | None = None,
+    y_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     REML grid search with adaptive batching (memory-efficient).
@@ -2572,6 +2456,8 @@ def reml_grid_search_batched(
     if load_all_data:
         # Move all data to device ONCE (faster for most cases)
         data_dev = data.to(device, dtype=dtype)
+        if y_scale is not None:
+            data_dev = data_dev / y_scale.to(device=device, dtype=dtype).unsqueeze(1)
         design_dev = design.to(device, dtype=dtype)
     else:
         # Keep data on CPU, will move batches as needed
@@ -2686,6 +2572,8 @@ def reml_grid_search_batched(
 
                         # Move this batch to device
                         data_batch = data[voxel_start:voxel_end].to(device, dtype=dtype)
+                        if y_scale is not None:
+                            data_batch = data_batch / y_scale[voxel_start:voxel_end].to(device=device, dtype=dtype).unsqueeze(1)
 
                         # Prewhiten this batch via triangular solve
                         y_w = torch.linalg.solve_triangular(
@@ -2946,6 +2834,13 @@ def fit_glm_arma11(
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    # Disable TF32 for float32: Blackwell/Ampere use TF32 by default (10-bit mantissa).
+    # Full float32 mantissa (23-bit) is needed for accurate REML/GLS. No-op for float64.
+    _saved_tf32: bool | None = None
+    if device.type == "cuda" and not use_double:
+        _saved_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+
     # Convert to tensors
     data = to_tensor(data, device=None, dtype=dtype)
     if data.device.type != "cpu":
@@ -2984,6 +2879,15 @@ def fit_glm_arma11(
         raise ValueError(f"Data must be 2D or 4D, got {data.ndim}D")
 
     n_voxels, n_timepoints = data.shape
+
+    # Per-voxel normalization for float32 numerical conditioning.
+    # Dividing Y by its std before REML and GLS eliminates catastrophic cancellation
+    # (residuals are O(1) instead of O(signal/noise_ratio)).
+    # REML argmin, R², t-stats, and F-stats are all scale-invariant.
+    # Betas, sigma2, residuals, and predicted are unscaled in post-processing.
+    _y_norm_scale: torch.Tensor | None = None
+    if not use_double:
+        _y_norm_scale = data.std(dim=1).clamp(min=1e-8)  # (n_voxels,) on CPU
 
     # Validate design matrix
     if design.shape[0] != n_timepoints:
@@ -3507,6 +3411,7 @@ def fit_glm_arma11(
                     dtype=dtype,
                     grid_chunk_size=strategy["grid_chunk_size"],
                     voxel_batch_size=strategy["voxel_batch_size"],
+                    y_scale=_y_norm_scale,
                 )
 
                 # Store results
@@ -3604,9 +3509,9 @@ def fit_glm_arma11(
                         "AFTER grid precomputation (on CPU)",
                         device,
                         {
-                            "sample_L": precomputed_grid[sample_key]["L"],
+                            "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
                             "sample_X_w": precomputed_grid[sample_key]["X_w"],
-                            "sample_R_qr": precomputed_grid[sample_key]["R_qr"],
+                            "sample_Q": precomputed_grid[sample_key]["Q"],
                         },
                     )
 
@@ -3615,15 +3520,9 @@ def fit_glm_arma11(
                     if verbose:
                         print("  Loading grid to GPU (one-time cost)...")
                     for key in precomputed_grid:
-                        precomputed_grid[key]["L"] = precomputed_grid[key][
-                            "L"
-                        ].to(device)
-                        precomputed_grid[key]["X_w"] = precomputed_grid[key]["X_w"].to(
-                            device
-                        )
-                        precomputed_grid[key]["R_qr"] = precomputed_grid[key][
-                            "R_qr"
-                        ].to(device)
+                        precomputed_grid[key]["L_inv"] = precomputed_grid[key]["L_inv"].to(device)
+                        precomputed_grid[key]["X_w"] = precomputed_grid[key]["X_w"].to(device)
+                        precomputed_grid[key]["Q"] = precomputed_grid[key]["Q"].to(device)
                         precomputed_grid[key]["logdet_Rcorr"] = precomputed_grid[key][
                             "logdet_Rcorr"
                         ].to(device)
@@ -3645,9 +3544,9 @@ def fit_glm_arma11(
                             "AFTER grid loaded to GPU",
                             device,
                             {
-                                "sample_L": precomputed_grid[sample_key]["L"],
+                                "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
                                 "sample_X_w": precomputed_grid[sample_key]["X_w"],
-                                "sample_R_qr": precomputed_grid[sample_key]["R_qr"],
+                                "sample_Q": precomputed_grid[sample_key]["Q"],
                             },
                         )
 
@@ -3666,6 +3565,8 @@ def fit_glm_arma11(
                     Y_batch = data[
                         batch_start:batch_end
                     ]  # (batch_voxels, n_timepoints)
+                    if _y_norm_scale is not None:
+                        Y_batch = Y_batch / _y_norm_scale[batch_start:batch_end].unsqueeze(1)
 
                     # Search against precomputed grid
                     best_params_batch, best_lik_batch = search_voxels_precomputed_grid(
@@ -3739,14 +3640,16 @@ def fit_glm_arma11(
             # If precomputed_grid exists (from precomputed ARMA params or non-batched grid search),
             # reuse cached values. Otherwise compute on-demand.
             if use_precomputed_arma and (a_opt, b_opt) in precomputed_grid:
-                # Reuse cached L and X_w (stored on CPU to save GPU memory)
+                # Reuse cached L_inv and X_w (stored on CPU to save GPU memory)
                 # Move to GPU only when needed for this group
-                L_chol = precomputed_grid[(a_opt, b_opt)]["L"].to(device)
+                L_chol = precomputed_grid[(a_opt, b_opt)]["L_inv"].to(device)
                 X_w = precomputed_grid[(a_opt, b_opt)]["X_w"].to(device)
+                _using_l_inv = True  # flag: whitening is matmul, not triangular solve
             else:
                 # Compute L ONCE for this (a,b) group, keep on GPU
                 y_dummy = data[voxel_indices[0]].to(device)
                 X_w, _, L_chol = prewhiten_with_arma11(design, y_dummy, a_opt, b_opt)
+                _using_l_inv = False  # L_chol is actual Cholesky factor here
 
             # OPTIMIZATION: Precompute group-level matrices ONCE per (a,b)
             # X_w is the same for all voxels in this group, so derivatives are constant
@@ -3846,16 +3749,23 @@ def fit_glm_arma11(
                 # Load data for these specific voxels (non-contiguous indexing)
                 Y_batch = data[sub_voxel_indices].T  # (n_timepoints, batch_voxels)
                 Y_batch_dev = Y_batch.to(device)
+                if _y_norm_scale is not None:
+                    Y_batch_dev = Y_batch_dev / _y_norm_scale[sub_voxel_indices].to(device).unsqueeze(0)
 
                 # Store λ for these voxels (pre-computed above, reuse for all sub-batches)
                 results.arma_lambda[sub_voxel_indices] = lambda_val_cpu
 
-                # Prewhiten data via triangular solve (L_chol on GPU from group computation!)
-                # All voxels in this sub-batch have the same (a,b), so same L_chol
+                # Prewhiten data (L_chol on GPU from group computation)
+                # All voxels in this sub-batch have the same (a,b), so same whitening
                 t_pw_start = time.time()
-                y_w_batch = torch.linalg.solve_triangular(
-                    L_chol, Y_batch_dev, upper=False
-                ).T  # (batch_voxels, n_timepoints)
+                if _using_l_inv:
+                    # Precomputed path: L_chol is L_inv — use GEMM (faster on GPU)
+                    y_w_batch = (L_chol @ Y_batch_dev).T  # (batch_voxels, n_timepoints)
+                else:
+                    # On-demand path: L_chol is lower triangular — triangular solve
+                    y_w_batch = torch.linalg.solve_triangular(
+                        L_chol, Y_batch_dev, upper=False
+                    ).T  # (batch_voxels, n_timepoints)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t_prewhiten_total += time.time() - t_pw_start
@@ -3903,7 +3813,8 @@ def fit_glm_arma11(
                     resid_orig_batch = Y_batch_dev.T - pred_orig_batch
 
                     df = results.dof
-                    sigma2_batch = torch.sum(resid_w_batch**2, dim=1) / df
+                    # Double-precision accumulation for RSS: eliminates rounding in sum-of-squares
+                    sigma2_batch = (resid_w_batch.to(torch.float64).pow(2).sum(dim=1) / df).to(dtype)
 
                     if not want_residuals:
                         del resid_w_batch
@@ -4189,7 +4100,8 @@ def fit_glm_arma11(
                     resid_orig_batch = Y_batch_dev.T - pred_orig_batch
 
                     df = results.dof
-                    sigma2_batch = torch.sum(resid_w_batch**2, dim=1) / df
+                    # Double-precision accumulation for RSS: eliminates rounding in sum-of-squares
+                    sigma2_batch = (resid_w_batch.to(torch.float64).pow(2).sum(dim=1) / df).to(dtype)
 
                     if not want_residuals:
                         del resid_w_batch
@@ -4675,6 +4587,10 @@ def fit_glm_arma11(
         for v in voxel_iterator:
             y_v_cpu = data[v]
             y_v_dev = y_v_cpu.to(device)
+            if _y_norm_scale is not None:
+                _sv = _y_norm_scale[v]
+                y_v_dev = y_v_dev / _sv
+                y_v_cpu = y_v_cpu / _sv  # keep CPU copy consistent for residuals/r2
 
             # Prewhiten data via triangular solve (reuse L from global estimation)
             y_v_col = y_v_dev.unsqueeze(1) if y_v_dev.ndim == 1 else y_v_dev
@@ -4696,7 +4612,7 @@ def fit_glm_arma11(
 
             # Variance
             df = results.dof
-            sigma2 = torch.sum(resid_w**2) / df
+            sigma2 = (resid_w.to(torch.float64).pow(2).sum() / df).to(dtype)
             sigma2_cpu = sigma2.cpu()
             results.sigma2[v] = sigma2_cpu
 
@@ -4785,6 +4701,26 @@ def fit_glm_arma11(
                 results.residuals_whitened[v] = resid_w.cpu()
             if want_predicted:
                 results.predicted[v] = pred_orig_cpu
+
+    # Unscale results from per-voxel float32 conditioning.
+    # t-stats, R², F-stats, partial R² are scale-invariant — no unscaling needed.
+    # Betas, sigma2, residuals, and predicted must be scaled back to original units.
+    if _y_norm_scale is not None:
+        scale_col = _y_norm_scale.unsqueeze(1)  # (n_voxels, 1)
+        results.betas.mul_(scale_col)
+        results.sigma2.mul_(_y_norm_scale**2)
+        if results.contrast_betas is not None:
+            results.contrast_betas.mul_(scale_col)
+        if results.residuals is not None:
+            results.residuals.mul_(scale_col)
+        if results.residuals_whitened is not None:
+            results.residuals_whitened.mul_(scale_col)
+        if results.predicted is not None:
+            results.predicted.mul_(scale_col)
+
+    # Restore TF32 setting
+    if _saved_tf32 is not None:
+        torch.backends.cuda.matmul.allow_tf32 = _saved_tf32
 
     if verbose:
         print("\nComplete!")

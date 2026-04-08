@@ -15,7 +15,7 @@ import time
 
 import torch
 
-from .nwarpforge import nwarpforge, parse_nwarp_string
+from fastfuncstuff.processing.nwarpforge import nwarpforge, parse_nwarp_string
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

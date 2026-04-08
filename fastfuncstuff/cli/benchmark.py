@@ -14,7 +14,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Benchmark AFNI vs FFS tools: accuracy validation and timing comparison.\n"
             "\n"
             "Requires OpenNeuro ds005165 data and existing AFNI+FFS outputs.\n"
-            "Use --validate-only to compare existing outputs without re-running tools."
+            "Use -validate-only to compare existing outputs without re-running tools."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -23,54 +23,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show this help message",
     )
     parser.add_argument(
-        "--data-dir", type=str, default=None,
+        "-data-dir", type=str, default=None,
         help="Path to ds005165-download directory. Default: auto-detect.",
     )
     parser.add_argument(
-        "--stages", type=str, default=None,
+        "-stages", type=str, default=None,
         help="Comma-separated stage names "
              "(moco,slicetime,crossalign,align,warp,glm,ica,ica_single,"
              "glmsingle_prep,glmsingle_matlab,glmsingle_hrf,"
              "glmsingle_denoise,glmsingle_ridge). Default: all.",
     )
     parser.add_argument(
-        "--validate-only", action="store_true",
+        "-validate-only", action="store_true",
         help="Only validate existing outputs, don't run any tools.",
     )
     parser.add_argument(
-        "--force-ffs", action="store_true",
+        "-force-ffs", action="store_true",
         help="Re-run FFS tools even if outputs exist.",
     )
     parser.add_argument(
-        "--force-ref", "--force-afni", action="store_true", dest="force_ref",
+        "-force-ref", "-force-afni", action="store_true", dest="force_ref",
         help="Re-run reference tools (AFNI/melodic/MATLAB) even if outputs exist.",
     )
     parser.add_argument(
-        "--force-all", action="store_true",
+        "-force-all", action="store_true",
         help="Re-run everything.",
     )
     parser.add_argument(
-        "--json", type=str, default=None, metavar="PATH",
+        "-json", type=str, default=None, metavar="PATH",
         help="Save results as JSON to this path.",
     )
     parser.add_argument(
-        "--report", action="store_true",
+        "-report", action="store_true",
         help="Print detailed timing report (requires timing data).",
     )
     parser.add_argument(
-        "--plot", type=str, default=None, metavar="DIR",
+        "-plot", type=str, default=None, metavar="DIR",
         help="Save benchmark plots (timing bars, speedup chart) to this directory.",
     )
     parser.add_argument(
-        "--download", action="store_true",
+        "-download", action="store_true",
         help="Download ds005165 data from OpenNeuro if not present. "
              "Requires awscli (aws s3 sync --no-sign-request).",
     )
     parser.add_argument(
-        "--plot-from-cache", type=str, nargs="*", default=None,
+        "-plot-from-cache", type=str, nargs="*", default=None,
         metavar="CACHE_JSON",
         help="Generate plots from one or more benchmark_cache.json files. "
              "No stages are run. Multiple files are merged for cross-arch comparison.",
+    )
+    parser.add_argument(
+        "-list-cache", action="store_true",
+        help="List all entries in benchmark_cache.json and exit.",
+    )
+    parser.add_argument(
+        "-remove-cache", type=str, nargs="+", default=None, metavar="IDX_OR_ID",
+        help="Remove cache entries by 1-based index (e.g. 3) or UUID prefix "
+             "(e.g. a1b2c3d4). Use -list-cache first to see indices.",
+    )
+    parser.add_argument(
+        "-import-cache", type=str, default=None, metavar="CACHE_JSON",
+        help="Import runs from another benchmark_cache.json into the local cache. "
+             "Deduplicates by UUID.",
+    )
+    parser.add_argument(
+        "-dry_run", action="store_true",
+        help="Preview -import-cache or -remove-cache without writing changes.",
     )
 
     args = parser.parse_args(argv)
@@ -111,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.plot_from_cache is not None:
         return _plot_from_cache(args)
 
+    # --- Cache management modes (need data_dir, but no stages) ---
+    if args.list_cache or args.remove_cache is not None or args.import_cache is not None:
+        return _manage_cache(args)
+
     from ..benchmark.reporting import (
         print_timing_report,
         print_validation_report,
@@ -130,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                 data_dir = _default_data_dir()
             else:
                 print("ERROR: Cannot find ds005165-download directory.")
-                print("Specify with --data-dir or run from the project root.")
+                print("Specify with -data-dir or run from the project root.")
                 return 1
 
     # Download data if requested
@@ -139,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not data_dir.exists():
         print(f"ERROR: Data directory not found: {data_dir}")
-        print("Use --download to fetch from OpenNeuro.")
+        print("Use -download to fetch from OpenNeuro.")
         return 1
 
     # Create processing dir if needed (from-zero runs won't have it yet)
@@ -187,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Report
     if args.report:
-        print_timing_report(results)
+        print_timing_report(results, data_dir=data_dir)
     else:
         print_validation_report(results)
 
@@ -207,24 +229,80 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if all_passed else 1
 
 
+def _manage_cache(args) -> int:
+    """Handle -list-cache, -remove-cache, and -import-cache operations."""
+    from ..benchmark.timing_cache import (
+        merge_cache_from_file,
+        print_cache,
+        remove_cache_entries,
+    )
+
+    # Resolve data directory
+    if args.data_dir:
+        data_dir = Path(args.data_dir).resolve()
+    else:
+        data_dir = _find_data_dir()
+        if data_dir is None:
+            print("ERROR: Cannot find data directory. Specify with -data-dir.")
+            return 1
+
+    if args.list_cache:
+        stage = args.stages.split(",")[0].strip() if args.stages else None
+        print_cache(data_dir, stage_filter=stage)
+        return 0
+
+    if args.remove_cache is not None:
+        indices = []
+        ids = []
+        for t in args.remove_cache:
+            if t.isdigit():
+                indices.append(int(t))
+            else:
+                ids.append(t)
+
+        if not indices and not ids:
+            print("ERROR: Provide at least one index or ID prefix to remove.")
+            print("       Use -list-cache to see entries.")
+            return 1
+
+        remove_cache_entries(
+            data_dir,
+            indices=indices or None,
+            ids=ids or None,
+            dry_run=args.dry_run,
+        )
+        return 0
+
+    if args.import_cache is not None:
+        source = Path(args.import_cache)
+        try:
+            merge_cache_from_file(data_dir, source, dry_run=args.dry_run)
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}")
+            return 1
+        return 0
+
+    return 0
+
+
 def _plot_from_cache(args) -> int:
-    """Generate plots from committed benchmark_cache.json files."""
+    """Generate plots from one or more benchmark_cache.json files."""
     import json
 
     from ..benchmark.plots import plot_all
+    from ..benchmark.timing_cache import _migrate_v1
 
     cache_files = args.plot_from_cache
     if not cache_files:
-        # Default: look for cache in data dir
         data_dir = Path(args.data_dir) if args.data_dir else _find_data_dir()
         if data_dir is None:
             print("ERROR: No cache files specified and cannot find data directory.")
             return 1
         cache_files = [str(data_dir / "benchmark_cache.json")]
 
-    # Merge caches from multiple files
-    merged = {"schema_version": 1, "runs": []}
-    seen_archs = set()
+    # Merge all files: concatenate runs (v2 entries have UUIDs, so safe to concat)
+    seen_ids: set[str] = set()
+    merged: dict = {"schema_version": 2, "runs": []}
     for cf in cache_files:
         path = Path(cf)
         if not path.exists():
@@ -232,17 +310,15 @@ def _plot_from_cache(args) -> int:
             continue
         with open(path) as f:
             data = json.load(f)
+        # Migrate v1 if needed
+        if data.get("schema_version") != 2:
+            data = _migrate_v1(data)
         for run in data.get("runs", []):
-            arch_id = run.get("arch_id", "unknown")
-            if arch_id not in seen_archs:
-                merged["runs"].append(run)
-                seen_archs.add(arch_id)
-            else:
-                # Merge stages into existing
-                for existing in merged["runs"]:
-                    if existing.get("arch_id") == arch_id:
-                        existing["stages"].update(run.get("stages", {}))
-                        break
+            uid = run.get("id", "")
+            if uid and uid in seen_ids:
+                continue  # skip exact duplicates across files
+            seen_ids.add(uid)
+            merged["runs"].append(run)
 
     if not merged["runs"]:
         print("ERROR: No timing data found in cache files.")
