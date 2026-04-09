@@ -21,6 +21,7 @@ wheels/
 *.egg
 CLAUDE.md
 .claude
+.claude/settings.local.json
 
 # Virtual environments
 venv/
