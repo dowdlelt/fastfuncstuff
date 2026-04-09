@@ -391,6 +391,7 @@ def analyze_from_design_matrix(
     r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
     legacy_contrasts: bool = False,
     design_info: dict | None = None,
+    save_profile_likelihoods: bool = False,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -1035,6 +1036,7 @@ def analyze_from_design_matrix(
             task_indices=stim_indices if stim_indices else None,
             spatial_metadata=spatial_metadata if spatial_metadata else None,
             legacy_contrasts=legacy_contrasts,
+            save_profile_likelihoods=save_profile_likelihoods,
         )
 
     else:

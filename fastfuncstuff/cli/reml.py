@@ -277,6 +277,20 @@ Examples:
         help="Output REML variance parameters (up to 4 volumes: a, b, lambda, StDev)",
     )
     reml_out.add_argument(
+        "-Rlklhd_a",
+        dest="Rlklhd_a",
+        metavar="PREFIX",
+        help="Output profile likelihood along a-axis: 4D NIfTI with n_a sub-briks. "
+             "Sub-brik i = min_b L(a_i, b) per voxel. Argmin sub-brik → optimal a.",
+    )
+    reml_out.add_argument(
+        "-Rlklhd_b",
+        dest="Rlklhd_b",
+        metavar="PREFIX",
+        help="Output profile likelihood along b-axis: 4D NIfTI with n_b sub-briks. "
+             "Sub-brik j = min_a L(a, b_j) per voxel. Argmin sub-brik → optimal b.",
+    )
+    reml_out.add_argument(
         "-load_Rvar",
         help="Load precomputed ARMA parameters from this file to skip the grid search "
              "(saves ~80%% compute time on re-runs). Must be a -Rvar output from a "
@@ -563,6 +577,10 @@ def print_output_summary(args):
         arma_outputs.append(f"  • Rerrts (residuals): {args.Rerrts}")
     if args.Rwherr:
         arma_outputs.append(f"  • Rwherr (whitened residuals): {args.Rwherr}")
+    if getattr(args, "Rlklhd_a", None):
+        arma_outputs.append(f"  • Rlklhd-a (profile likelihood, a-axis): {args.Rlklhd_a}")
+    if getattr(args, "Rlklhd_b", None):
+        arma_outputs.append(f"  • Rlklhd-b (profile likelihood, b-axis): {args.Rlklhd_b}")
 
     if arma_outputs:
         print("ARMA/REML Outputs:")
@@ -652,6 +670,8 @@ def main():
         args.Obuck,
         args.Obeta,
         args.Onuisance,
+        getattr(args, "Rlklhd_a", None),
+        getattr(args, "Rlklhd_b", None),
     ]
     if not any(outputs):
         print("ERROR: At least one output option must be specified")
@@ -1590,6 +1610,9 @@ def main():
             if args.r2semipartial
             else "full",  # "full" or "task"
             legacy_contrasts=args.legacy_contrasts,
+            save_profile_likelihoods=bool(
+                getattr(args, "Rlklhd_a", None) or getattr(args, "Rlklhd_b", None)
+            ),
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
@@ -1844,6 +1867,93 @@ def main():
             from fastfuncstuff.io.afni import compress_nifti
             print(f"  • Compressing Rvar output...")
             compress_nifti(temp_nii_path, rvar_output_path, remove_original=True)
+
+    # Write profile likelihoods if requested
+    _rlklhd_a = getattr(args, "Rlklhd_a", None)
+    _rlklhd_b = getattr(args, "Rlklhd_b", None)
+    _has_profiles = (
+        hasattr(results, "reml_profile_a")
+        and results.reml_profile_a is not None  # type: ignore[union-attr]
+    )
+    if (_rlklhd_a or _rlklhd_b) and _has_profiles:
+        import copy
+        import nibabel as nib
+        from fastfuncstuff.glm.outputs import _save_nifti_with_format
+
+        affine_lk = getattr(results, "affine", np.eye(4))
+        volume_shape_lk = getattr(results, "original_shape", None)
+        voxel_mask_lk = getattr(results, "voxel_mask", None)
+        nifti_header_lk = getattr(results, "nifti_header", None)
+
+        def _write_profile(profile_data: "torch.Tensor", axis_vals: "torch.Tensor", out_prefix: str, axis_name: str) -> None:
+            """Write a (n_voxels, n_vals) profile likelihood tensor as a 4D NIfTI."""
+            import subprocess
+            profile_np = profile_data.cpu().float().numpy()  # (n_voxels, n_vals)
+            n_vals = profile_np.shape[1]
+
+            if volume_shape_lk is not None and voxel_mask_lk is not None:
+                voxel_mask_np = (
+                    voxel_mask_lk.cpu().numpy()
+                    if hasattr(voxel_mask_lk, "cpu") else voxel_mask_lk
+                )
+                vol_4d = np.zeros((*volume_shape_lk, n_vals), dtype=np.float32)
+                vol_4d[voxel_mask_np.reshape(volume_shape_lk)] = profile_np
+            else:
+                vol_4d = profile_np.reshape(-1, n_vals) if volume_shape_lk is None else profile_np
+
+            # Build header
+            if nifti_header_lk is not None:
+                hdr = copy.deepcopy(nifti_header_lk)
+                hdr.set_data_shape(vol_4d.shape)
+                img = nib.Nifti1Image(vol_4d, affine_lk, header=hdr)
+            else:
+                img = nib.Nifti1Image(vol_4d, affine_lk)
+            from fastfuncstuff.io.afni import set_afni_func_type
+            set_afni_func_type(img.header, func_code=11)
+
+            # Normalise output path
+            if not (out_prefix.endswith(".nii.gz") or out_prefix.endswith(".nii")):
+                out_path = Path(out_prefix + ".nii.gz")
+            else:
+                out_path = Path(out_prefix)
+
+            temp_path = out_path.with_suffix(".nii") if str(out_path).endswith(".nii.gz") else out_path
+            _save_nifti_with_format(img, temp_path, "nifti")
+            print(f"  • Wrote {n_vals} sub-briks ({axis_name} profile): {temp_path}")
+
+            # Label sub-briks by parameter value
+            labels = [f"{axis_name}={v:.3f}" for v in axis_vals.tolist()]
+            refit_cmd = ["3drefit"]
+            for idx, lbl in enumerate(labels):
+                refit_cmd.extend(["-sublabel", str(idx), lbl])
+            refit_cmd.append(str(temp_path.absolute()))
+            try:
+                subprocess.run(refit_cmd, check=True, capture_output=True, text=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass  # Labels are optional; file is already written
+
+            # Compress
+            if str(out_path).endswith(".nii.gz"):
+                from fastfuncstuff.io.afni import compress_nifti
+                compress_nifti(temp_path, out_path, remove_original=True)
+                print(f"    ✓ Compressed → {out_path}")
+
+        if _rlklhd_a:
+            print(f"  • Writing REML profile likelihood (a-axis): {_rlklhd_a}")
+            _write_profile(
+                results.reml_profile_a,  # type: ignore[union-attr]
+                results.reml_profile_a_vals,  # type: ignore[union-attr]
+                _rlklhd_a, "a",
+            )
+        if _rlklhd_b:
+            print(f"  • Writing REML profile likelihood (b-axis): {_rlklhd_b}")
+            _write_profile(
+                results.reml_profile_b,  # type: ignore[union-attr]
+                results.reml_profile_b_vals,  # type: ignore[union-attr]
+                _rlklhd_b, "b",
+            )
+    elif (_rlklhd_a or _rlklhd_b) and not _has_profiles:
+        print("  ⚠️  Profile likelihoods requested but not available (OLS mode or precomputed ARMA params?)")
 
     # Write partial R² if requested and available
     if (
