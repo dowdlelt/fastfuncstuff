@@ -334,30 +334,27 @@ have SCENE_DATA[1]=11 (fbuc) and TYPESTRING=3DIM_HEAD_FUNC set by
 
 ---
 
-## 10. Profile Likelihood Outputs (Rlklhd-a, Rlklhd-b)
+## 10. Likelihood Surface Output (-Rlklhd)
 
 **Motivation:** The grid search evaluates the full REML likelihood surface
-L(a, b) for every voxel. Inspecting per-voxel likelihood curves can reveal:
+L(a, b) for every voxel. Inspecting it per voxel can reveal:
 - Whether the optimum is well-defined or flat (parameter unidentifiability)
 - Why ffs and AFNI disagree (different grid point wins?)
-- Pathological voxels with multiple local minima
+- The shape of the joint (a,b) surface — neither axis alone tells you this
 
 **Output format:**
 
-`--Rlklhd-a <prefix>`: 4D NIfTI with `n_a` sub-briks.
-Sub-brik i = `min_b L(a_i, b)` per voxel (profile likelihood along a-axis).
-The sub-brik with the minimum value identifies the optimal a.
+`-Rlklhd <prefix>`: 4D NIfTI with **one sub-brik per valid (a,b) grid point**
+(~117–130 sub-briks). Sub-brik k = `L(a_k, b_k)` per voxel.
 
-`--Rlklhd-b <prefix>`: 4D NIfTI with `n_b` sub-briks.
-Sub-brik j = `min_a L(a, b_j)` per voxel (profile likelihood along b-axis).
-The sub-brik with the minimum value identifies the optimal b.
+Sub-briks are labeled `a=0.00_b=0.30`, `a=0.10_b=-0.20`, etc. via 3drefit,
+so you can identify which (a,b) pair each sub-brik corresponds to in AFNI.
 
-Together these define the selected (a*, b*) pair: `(a[argmin_i], b[argmin_j])`.
-(Note: argmin-a and argmin-b are independent and may not exactly match
-the joint argmin of L(a,b) due to the profile marginalization.)
+The argmin across all sub-briks identifies the selected (a*, b*) for each
+voxel — this is exactly the joint argmin, not a marginal.
 
-**Memory:** `n_voxels × n_a × 4 bytes` ≈ `167k × 10 × 4 = 6.7 MB` for the
-a-profile. Negligible. Both arrays are accumulated during the grid search.
+**Memory:** `n_voxels × n_pairs × 4 bytes` ≈ `167k × 117 × 4 ≈ 78 MB`.
+Accumulated in CPU RAM during the grid search, then written once.
 
 ---
 

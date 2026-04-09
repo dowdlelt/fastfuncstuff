@@ -700,11 +700,9 @@ class ARMA11Results:
         self.affine: np.ndarray | None = None  # Spatial affine if available
         self.ols_results: Any | None = None  # Optional GLMResults for OLS comparison
 
-        # Profile likelihoods along each ARMA parameter axis (optional, see save_profile_likelihoods)
-        self.reml_profile_a: torch.Tensor | None = None  # (n_voxels, n_a) — min_b L(a_i, b) per voxel
-        self.reml_profile_b: torch.Tensor | None = None  # (n_voxels, n_b) — min_a L(a, b_j) per voxel
-        self.reml_profile_a_vals: torch.Tensor | None = None  # (n_a,) sorted unique a values in grid
-        self.reml_profile_b_vals: torch.Tensor | None = None  # (n_b,) sorted unique b values in grid
+        # Full REML likelihood surface over (a,b) grid (optional, see save_lklhd_surface)
+        self.reml_lklhd_surface: torch.Tensor | None = None  # (n_voxels, n_valid_pairs) — L(a_k, b_k) per voxel
+        self.reml_surface_params: list | None = None  # [(a_0,b_0), (a_1,b_1), ...] — grid points in column order
 
 
 def _compute_arma11_lambda(
@@ -2063,12 +2061,11 @@ def search_voxels_precomputed_grid(
     enable_timing : bool
         Enable detailed timing profiling
     return_profile : bool, default=False
-        If True, also return profile likelihoods along each parameter axis:
-        - profile_a: (n_voxels, n_unique_a) — min_b L(a_i, b) per voxel
-        - profile_b: (n_voxels, n_unique_b) — min_a L(a, b_j) per voxel
-        - a_vals: (n_unique_a,) sorted unique a values
-        - b_vals: (n_unique_b,) sorted unique b values
-        Useful for inspecting likelihood curves per voxel.
+        If True, also return the full likelihood surface over the (a,b) grid:
+        - surface: (n_voxels, n_valid_pairs) — L(a_k, b_k) per voxel per grid point
+        - param_list: list of (a, b) tuples in column order
+        Sub-brik k of the surface corresponds to param_list[k].
+        Use argmin across sub-briks to recover the selected (a,b) per voxel.
 
     Returns
     -------
@@ -2076,7 +2073,7 @@ def search_voxels_precomputed_grid(
         Optimal (a, b) for each voxel
     best_likelihoods : torch.Tensor, shape (n_voxels_batch,)
         Minimum REML likelihood for each voxel
-    profile_a, a_vals, profile_b, b_vals : only returned when return_profile=True
+    surface, param_list : only returned when return_profile=True
     """
     from fastfuncstuff.timing_utils import profile_section
 
@@ -2096,20 +2093,9 @@ def search_voxels_precomputed_grid(
     if Y_batch.device != device:
         Y_batch = Y_batch.to(device)
 
-    # Build profile likelihood arrays if requested
+    # Allocate full surface array if requested: (n_voxels, n_valid_pairs)
     if return_profile:
-        a_vals_sorted = sorted(set(k[0] for k in param_list))
-        b_vals_sorted = sorted(set(k[1] for k in param_list))
-        a_to_idx = {a: i for i, a in enumerate(a_vals_sorted)}
-        b_to_idx = {b: i for i, b in enumerate(b_vals_sorted)}
-        profile_a = torch.full(
-            (n_voxels_batch, len(a_vals_sorted)), float("inf"), device=device, dtype=_dtype
-        )
-        profile_b = torch.full(
-            (n_voxels_batch, len(b_vals_sorted)), float("inf"), device=device, dtype=_dtype
-        )
-        a_vals_tensor = torch.tensor(a_vals_sorted, dtype=_dtype)
-        b_vals_tensor = torch.tensor(b_vals_sorted, dtype=_dtype)
+        surface = torch.empty(n_voxels_batch, len(param_list), device=device, dtype=_dtype)
 
     # Evaluate each grid point using L_inv GEMM + Pythagorean RSS (no betas needed)
     for _grid_idx, (a, b) in enumerate(param_list):
@@ -2142,15 +2128,12 @@ def search_voxels_precomputed_grid(
             best_params[improve_mask, 0] = a
             best_params[improve_mask, 1] = b
 
-        # Update profile likelihoods: running min over each axis
+        # Store likelihood for this grid point in the surface
         if return_profile:
-            a_idx = a_to_idx[a]
-            b_idx = b_to_idx[b]
-            profile_a[:, a_idx] = torch.minimum(profile_a[:, a_idx], likelihoods)
-            profile_b[:, b_idx] = torch.minimum(profile_b[:, b_idx], likelihoods)
+            surface[:, _grid_idx] = likelihoods
 
     if return_profile:
-        return best_params, best_likelihoods, profile_a, a_vals_tensor, profile_b, b_vals_tensor
+        return best_params, best_likelihoods, surface, param_list
 
     return best_params, best_likelihoods
 
@@ -3598,11 +3581,9 @@ def fit_glm_arma11(
                 if verbose:
                     batch_iter = tqdm(batch_iter, desc="🔍 ARMA grid search", unit="batch")
 
-                # One-time profile likelihood accumulator setup (across all batches)
-                _profile_accum_a: torch.Tensor | None = None
-                _profile_accum_b: torch.Tensor | None = None
-                _profile_a_vals: torch.Tensor | None = None
-                _profile_b_vals: torch.Tensor | None = None
+                # One-time surface accumulator setup: (n_voxels, n_valid_pairs) on CPU
+                _surface_accum: torch.Tensor | None = None
+                _surface_params: list | None = None
 
                 for batch_idx in batch_iter:
                     batch_start = batch_idx * batch_size
@@ -3626,19 +3607,14 @@ def fit_glm_arma11(
                     )
 
                     if save_profile_likelihoods:
-                        best_params_batch, best_lik_batch, prof_a, a_vals, prof_b, b_vals = search_result
-                        # Accumulate profile arrays into full-size CPU tensors
-                        if _profile_accum_a is None:
-                            _profile_a_vals = a_vals
-                            _profile_b_vals = b_vals
-                            _profile_accum_a = torch.full(
-                                (n_voxels, len(a_vals)), float("inf"), dtype=prof_a.dtype
+                        best_params_batch, best_lik_batch, surface_batch, surf_params = search_result
+                        # Allocate full surface array on first batch
+                        if _surface_accum is None:
+                            _surface_params = surf_params
+                            _surface_accum = torch.empty(
+                                n_voxels, len(surf_params), dtype=surface_batch.dtype
                             )
-                            _profile_accum_b = torch.full(
-                                (n_voxels, len(b_vals)), float("inf"), dtype=prof_b.dtype
-                            )
-                        _profile_accum_a[batch_start:batch_end] = prof_a.cpu()
-                        _profile_accum_b[batch_start:batch_end] = prof_b.cpu()
+                        _surface_accum[batch_start:batch_end] = surface_batch.cpu()
                     else:
                         best_params_batch, best_lik_batch = search_result
 
@@ -3648,12 +3624,10 @@ def fit_glm_arma11(
                         best_lik_batch.cpu()
                     )
 
-                # Store profile likelihoods in results if computed
-                if save_profile_likelihoods and _profile_accum_a is not None:
-                    results.reml_profile_a = _profile_accum_a
-                    results.reml_profile_b = _profile_accum_b
-                    results.reml_profile_a_vals = _profile_a_vals
-                    results.reml_profile_b_vals = _profile_b_vals
+                # Store likelihood surface in results if computed
+                if save_profile_likelihoods and _surface_accum is not None:
+                    results.reml_lklhd_surface = _surface_accum
+                    results.reml_surface_params = _surface_params
 
                 # Compute lambda from (a, b)
                 a_vals = results.arma_params[:, 0]

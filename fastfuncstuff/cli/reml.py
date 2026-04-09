@@ -277,18 +277,13 @@ Examples:
         help="Output REML variance parameters (up to 4 volumes: a, b, lambda, StDev)",
     )
     reml_out.add_argument(
-        "-Rlklhd_a",
-        dest="Rlklhd_a",
+        "-Rlklhd",
+        dest="Rlklhd",
         metavar="PREFIX",
-        help="Output profile likelihood along a-axis: 4D NIfTI with n_a sub-briks. "
-             "Sub-brik i = min_b L(a_i, b) per voxel. Argmin sub-brik → optimal a.",
-    )
-    reml_out.add_argument(
-        "-Rlklhd_b",
-        dest="Rlklhd_b",
-        metavar="PREFIX",
-        help="Output profile likelihood along b-axis: 4D NIfTI with n_b sub-briks. "
-             "Sub-brik j = min_a L(a, b_j) per voxel. Argmin sub-brik → optimal b.",
+        help="Output full REML likelihood surface: 4D NIfTI with one sub-brik per valid "
+             "(a,b) grid point (~117 sub-briks). Sub-brik k = L(a_k, b_k) per voxel. "
+             "Sub-briks are labeled 'a=0.00_b=0.30' etc. Argmin sub-brik identifies "
+             "the selected (a,b) pair for each voxel.",
     )
     reml_out.add_argument(
         "-load_Rvar",
@@ -577,10 +572,8 @@ def print_output_summary(args):
         arma_outputs.append(f"  • Rerrts (residuals): {args.Rerrts}")
     if args.Rwherr:
         arma_outputs.append(f"  • Rwherr (whitened residuals): {args.Rwherr}")
-    if getattr(args, "Rlklhd_a", None):
-        arma_outputs.append(f"  • Rlklhd-a (profile likelihood, a-axis): {args.Rlklhd_a}")
-    if getattr(args, "Rlklhd_b", None):
-        arma_outputs.append(f"  • Rlklhd-b (profile likelihood, b-axis): {args.Rlklhd_b}")
+    if getattr(args, "Rlklhd", None):
+        arma_outputs.append(f"  • Rlklhd (full likelihood surface): {args.Rlklhd}")
 
     if arma_outputs:
         print("ARMA/REML Outputs:")
@@ -670,8 +663,7 @@ def main():
         args.Obuck,
         args.Obeta,
         args.Onuisance,
-        getattr(args, "Rlklhd_a", None),
-        getattr(args, "Rlklhd_b", None),
+        getattr(args, "Rlklhd", None),
     ]
     if not any(outputs):
         print("ERROR: At least one output option must be specified")
@@ -1610,9 +1602,7 @@ def main():
             if args.r2semipartial
             else "full",  # "full" or "task"
             legacy_contrasts=args.legacy_contrasts,
-            save_profile_likelihoods=bool(
-                getattr(args, "Rlklhd_a", None) or getattr(args, "Rlklhd_b", None)
-            ),
+            save_profile_likelihoods=bool(getattr(args, "Rlklhd", None)),
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
@@ -1868,95 +1858,76 @@ def main():
             print(f"  • Compressing Rvar output...")
             compress_nifti(temp_nii_path, rvar_output_path, remove_original=True)
 
-    # Write profile likelihoods if requested
-    _rlklhd_a = getattr(args, "Rlklhd_a", None)
-    _rlklhd_b = getattr(args, "Rlklhd_b", None)
-    _has_profiles = (
-        hasattr(results, "reml_profile_a")
-        and results.reml_profile_a is not None  # type: ignore[union-attr]
+    # Write full REML likelihood surface if requested (-Rlklhd)
+    _rlklhd = getattr(args, "Rlklhd", None)
+    _has_surface = (
+        hasattr(results, "reml_lklhd_surface")
+        and results.reml_lklhd_surface is not None  # type: ignore[union-attr]
     )
-    if (_rlklhd_a or _rlklhd_b) and _has_profiles:
+    if _rlklhd and _has_surface:
         import copy
+        import subprocess
         import nibabel as nib
         from fastfuncstuff.glm.outputs import _save_nifti_with_format
+
+        print(f"  • Writing REML likelihood surface: {_rlklhd}")
+        surface_np = results.reml_lklhd_surface.cpu().float().numpy()  # type: ignore[union-attr]
+        surf_params = results.reml_surface_params  # type: ignore[union-attr]
+        n_pairs = surface_np.shape[1]
+        print(f"    {n_pairs} valid (a,b) grid points → {n_pairs} sub-briks")
 
         affine_lk = getattr(results, "affine", np.eye(4))
         volume_shape_lk = getattr(results, "original_shape", None)
         voxel_mask_lk = getattr(results, "voxel_mask", None)
         nifti_header_lk = getattr(results, "nifti_header", None)
 
-        def _write_profile(profile_data: "torch.Tensor", axis_vals: "torch.Tensor", out_prefix: str, axis_name: str) -> None:
-            """Write a (n_voxels, n_vals) profile likelihood tensor as a 4D NIfTI."""
-            import subprocess
-            profile_np = profile_data.cpu().float().numpy()  # (n_voxels, n_vals)
-            n_vals = profile_np.shape[1]
-
-            if volume_shape_lk is not None and voxel_mask_lk is not None:
-                voxel_mask_np = (
-                    voxel_mask_lk.cpu().numpy()
-                    if hasattr(voxel_mask_lk, "cpu") else voxel_mask_lk
-                )
-                vol_4d = np.zeros((*volume_shape_lk, n_vals), dtype=np.float32)
-                vol_4d[voxel_mask_np.reshape(volume_shape_lk)] = profile_np
-            elif volume_shape_lk is not None:
-                # volume shape known but no mask — data covers full volume
-                vol_4d = profile_np.reshape(*volume_shape_lk, n_vals)
-            else:
-                vol_4d = profile_np
-
-            # Build header
-            if nifti_header_lk is not None:
-                hdr = copy.deepcopy(nifti_header_lk)
-                hdr.set_data_shape(vol_4d.shape)
-                img = nib.Nifti1Image(vol_4d, affine_lk, header=hdr)
-            else:
-                img = nib.Nifti1Image(vol_4d, affine_lk)
-            from fastfuncstuff.io.afni import set_afni_func_type
-            set_afni_func_type(img.header, func_code=11)
-
-            # Normalise output path
-            if not (out_prefix.endswith(".nii.gz") or out_prefix.endswith(".nii")):
-                out_path = Path(out_prefix + ".nii.gz")
-            else:
-                out_path = Path(out_prefix)
-
-            temp_path = out_path.with_suffix(".nii") if str(out_path).endswith(".nii.gz") else out_path
-            _save_nifti_with_format(img, temp_path, "nifti")
-            print(f"  • Wrote {n_vals} sub-briks ({axis_name} profile): {temp_path}")
-
-            # Label sub-briks by parameter value
-            labels = [f"{axis_name}={v:.3f}" for v in axis_vals.tolist()]
-            refit_cmd = ["3drefit"]
-            for idx, lbl in enumerate(labels):
-                refit_cmd.extend(["-sublabel", str(idx), lbl])
-            refit_cmd.append(str(temp_path.absolute()))
-            try:
-                subprocess.run(refit_cmd, check=True, capture_output=True, text=True)
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                pass  # Labels are optional; file is already written
-
-            # Compress
-            if str(out_path).endswith(".nii.gz"):
-                from fastfuncstuff.io.afni import compress_nifti
-                compress_nifti(temp_path, out_path, remove_original=True)
-                print(f"    ✓ Compressed → {out_path}")
-
-        if _rlklhd_a:
-            print(f"  • Writing REML profile likelihood (a-axis): {_rlklhd_a}")
-            _write_profile(
-                results.reml_profile_a,  # type: ignore[union-attr]
-                results.reml_profile_a_vals,  # type: ignore[union-attr]
-                _rlklhd_a, "a",
+        if volume_shape_lk is not None and voxel_mask_lk is not None:
+            voxel_mask_np = (
+                voxel_mask_lk.cpu().numpy()
+                if hasattr(voxel_mask_lk, "cpu") else voxel_mask_lk
             )
-        if _rlklhd_b:
-            print(f"  • Writing REML profile likelihood (b-axis): {_rlklhd_b}")
-            _write_profile(
-                results.reml_profile_b,  # type: ignore[union-attr]
-                results.reml_profile_b_vals,  # type: ignore[union-attr]
-                _rlklhd_b, "b",
-            )
-    elif (_rlklhd_a or _rlklhd_b) and not _has_profiles:
-        print("  ⚠️  Profile likelihoods requested but not available (OLS mode or precomputed ARMA params?)")
+            vol_4d = np.zeros((*volume_shape_lk, n_pairs), dtype=np.float32)
+            vol_4d[voxel_mask_np.reshape(volume_shape_lk)] = surface_np
+        elif volume_shape_lk is not None:
+            vol_4d = surface_np.reshape(*volume_shape_lk, n_pairs)
+        else:
+            vol_4d = surface_np
+
+        if nifti_header_lk is not None:
+            hdr = copy.deepcopy(nifti_header_lk)
+            hdr.set_data_shape(vol_4d.shape)
+            lklhd_img = nib.Nifti1Image(vol_4d, affine_lk, header=hdr)
+        else:
+            lklhd_img = nib.Nifti1Image(vol_4d, affine_lk)
+        from fastfuncstuff.io.afni import set_afni_func_type
+        set_afni_func_type(lklhd_img.header, func_code=11)
+
+        # Normalise output path
+        lklhd_out = _rlklhd
+        if not (lklhd_out.endswith(".nii.gz") or lklhd_out.endswith(".nii")):
+            lklhd_out = lklhd_out + ".nii.gz"
+        lklhd_path = Path(lklhd_out)
+        temp_lklhd = lklhd_path.with_suffix(".nii") if str(lklhd_path).endswith(".nii.gz") else lklhd_path
+        _save_nifti_with_format(lklhd_img, temp_lklhd, "nifti")
+
+        # Label each sub-brik with its (a, b) pair
+        refit_cmd = ["3drefit"]
+        for idx, (a_k, b_k) in enumerate(surf_params):
+            refit_cmd.extend(["-sublabel", str(idx), f"a={a_k:.2f}_b={b_k:.2f}"])
+        refit_cmd.append(str(temp_lklhd.absolute()))
+        try:
+            subprocess.run(refit_cmd, check=True, capture_output=True, text=True)
+            print(f"    ✓ Labeled {n_pairs} sub-briks (a=X.XX_b=Y.YY format)")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("    ⚠️  3drefit labeling skipped (AFNI not in PATH?)")
+
+        if str(lklhd_path).endswith(".nii.gz"):
+            from fastfuncstuff.io.afni import compress_nifti
+            print(f"  • Compressing Rlklhd output...")
+            compress_nifti(temp_lklhd, lklhd_path, remove_original=True)
+
+    elif _rlklhd and not _has_surface:
+        print("  ⚠️  Likelihood surface requested but not available (OLS mode or precomputed ARMA params?)")
 
     # Write partial R² if requested and available
     if (
