@@ -376,3 +376,174 @@ ffs_reml (cli/reml.py)
 write_glm_bucket_as_nifti()   (glm/outputs.py)    → Rbuck
 [Rvar writing block]          (cli/reml.py ~1750)  → Rvar
 ```
+
+---
+
+## 12. Commit History — REML-Related Changes (Bisect Guide)
+
+Ordered newest → oldest. The question is: **at which commit did ffs_reml
+results start diverging from AFNI 3dREMLfit?** Step back through these
+commits to isolate the change that broke numerical equivalence.
+
+To test a specific commit: `git stash && git checkout <hash>` then rerun
+`ffs_reml` and compare to the AFNI reference. Key metric: per-voxel (a,b)
+maps and t-stat distributions.
+
+---
+
+### `8d5f155` — `perf(reml): L_inv+Q precomputation, Pythagorean RSS, float32 accuracy`
+
+**What changed in the REML path:**
+
+- **L_inv replaces L in the cache.** Previously `ddfae62` stored L and used
+  `solve_triangular(L, Y)` per voxel. Now L_inv is precomputed once
+  (`solve_triangular(L, eye)`) and whitening is a plain GEMM `L_inv @ Y`.
+  Mathematically identical (L_inv @ Y = solve(L, Y)), but eliminates the
+  per-voxel triangular solve and the MKL DLASWP error.
+
+- **QR is now always used** (was gated behind `use_qr` flag before). The
+  `use_qr=False` path (X'X → `slogdet`) is completely removed. Both logdets
+  now come from the QR R-diagonal: `2 * sum(log(|diag(R)| + 1e-10))`.
+
+- **Pythagorean RSS** replaces the old beta→residual→RSS pipeline during grid
+  search. `RSS = ‖Y_w‖² − ‖Q'Y_w‖²`. Betas are no longer computed at all
+  during the grid search phase.
+
+- **Float32 y-normalization**: data is divided by `data.std(dim=1)` before
+  the grid search to prevent float32 squaring overflow. Scale-invariant
+  outputs (t-stats, R²) are unaffected; betas/sigma2 are unscaled afterward.
+
+- **Float64 RSS accumulation** in GLS fitting: `resid.to(float64).pow(2).sum()`
+  instead of float32, reducing catastrophic cancellation in sigma2.
+
+**Risk for divergence from AFNI:**
+The `+1e-10` guard in `logdet = 2*sum(log(|diag(R)| + 1e-10))` biases the
+logdet for any near-zero R-diagonal elements. The old QR path had the same
+guard (`abs(diag_R) + 1e-10`), so this is likely not new. The Pythagorean
+RSS is mathematically exact (Pythagoras theorem), not an approximation.
+Low risk for this commit.
+
+---
+
+### `ddfae62` — `Add benchmark framework, REML optimization, and multi-arch timing plots`
+
+**What changed in the REML path:**
+
+- **L_inv → L (solve_triangular).** This was the commit that *removed*
+  `L_inv` and switched to storing L + per-voxel `solve_triangular(L, Y)`.
+  Previously (before this commit) whitening used `L_inv @ Y` (GEMM).
+  (`8d5f155` later reverted back to L_inv.)
+
+- **`use_qr` flag introduced** with two paths: QR path and X'X+slogdet path.
+  The `slogdet` path was the source of the MKL DLASWP error later seen.
+
+- **Phase 6 vectorization:** the `best_params` update loop in
+  `batch_reml_grid_search` was vectorized (removed Python for-loop over
+  voxels, used tensor indexing).
+
+- **`_evaluate_single_param`** switched from `L_inv @ Y` to
+  `solve_triangular(L, Y)`.
+
+**Risk for divergence from AFNI:**
+The switch from GEMM to triangular solve is numerically equivalent. The
+introduction of the `slogdet` path (X'X) *could* have affected results if
+the default was `use_qr=False`, but the default was `use_qr=False` for
+the slogdet path which calls `slogdet(X'X)` — this forms X'X first (squaring
+the condition number) and then computes logdet, which is less accurate than
+QR for ill-conditioned designs. **This is a plausible divergence point** if
+`use_qr` was False by default.
+
+---
+
+### `930d4f7` — test coverage + bug fix: `solve_triangular requires 2D input`
+
+**What changed in the REML path:**
+
+- **Bug fix in `reml_grid_search` (single-voxel path):** `solve_triangular`
+  was passed a 1D Y tensor, causing it to silently fail (all likelihoods
+  identical). Fixed with `Y_2d = Y.unsqueeze(1) if Y.ndim == 1 else Y`.
+
+**Risk for divergence from AFNI:**
+If the single-voxel path (`reml_grid_search`) was being called somewhere,
+this bug would cause all voxels to get identical ARMA params. But the main
+batch path (`batch_reml_grid_search`) was unaffected. Low risk for the
+primary ffs_reml pipeline.
+
+---
+
+### `72052cf` — `Update CLI, GLM, and analysis workflows`
+
+**What changed in the REML path:**
+
+- Removed hand-rolled AFNI extension from Rvar output; switched to using
+  `save_nifti()` helper from `io/afni.py`.
+- Added `@torch.inference_mode()` decorator to key REML functions.
+- Minor cleanups; no changes to the likelihood computation or grid search.
+
+**Risk for divergence from AFNI:** None for numerical results.
+
+---
+
+### `a3e9e6f` — `chore(cli_cleanup): consolidate CLI entry points, misc fixes`
+
+**What changed in the REML path:**
+
+- `cli/reml.py`: minor argument help text changes.
+- `glm/outputs.py`: minor formatting fix.
+- `io/afni.py`: handle missing volume metadata gracefully.
+- No changes to `glm/arma.py`.
+
+**Risk for divergence from AFNI:** None.
+
+---
+
+### `21351e3` — `fix(io): inherit AFNI space/type metadata in GLM outputs`
+
+**What changed in the REML path:**
+
+- Rvar now deep-copies `results.nifti_header` so SCENE_DATA[0] (view=tlrc)
+  and TEMPLATE_SPACE carry forward from the source EPI.
+- `set_afni_func_type()` added to `io/afni.py`; called on both Rbuck and
+  Rvar to set SCENE_DATA[1]=11 (fbuc) and TYPESTRING=3DIM_HEAD_FUNC.
+
+**Risk for divergence from AFNI:** Zero — purely metadata, no change to
+the numerical results.
+
+---
+
+### Summary: Where to Bisect
+
+The most likely suspects for numerical divergence, in order of suspicion:
+
+1. **`ddfae62`** — introduced the `use_qr` flag and X'X+slogdet path. If
+   the default was `use_qr=False` when your reference comparison was run,
+   the slogdet path (via X'X) gives slightly different logdet than the QR
+   path due to squaring the condition number. Also: this commit vectorized
+   the `batch_reml_grid_search` update loop — verify the argmin indexing
+   is still correct.
+
+2. **Anything before `ddfae62`** — the pre-benchmark codebase. If results
+   matched AFNI before the benchmark refactor, that commit is the break point.
+
+3. **`8d5f155`** — Pythagorean RSS + float32 normalization. Very low risk
+   (math is exact), but worth testing since it rewrote the core inner loop.
+
+**Suggested bisect procedure:**
+```bash
+# Test AFNI reference (already have this output)
+# Test each checkpoint:
+git checkout ddfae62^  # just BEFORE the benchmark/REML refactor
+pip install -e . -q
+ffs_reml [your command] -Rvar test_ddfae62_pre.nii.gz
+# compare a/b maps with AFNI reference
+
+git checkout ddfae62
+pip install -e . -q  
+ffs_reml [your command] -Rvar test_ddfae62_post.nii.gz
+# if these differ → ddfae62 is the commit that broke it
+
+git checkout 8d5f155
+pip install -e . -q
+ffs_reml [your command] -Rvar test_8d5f155.nii.gz
+# compare to AFNI
+```
