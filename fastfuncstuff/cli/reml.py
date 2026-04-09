@@ -1898,8 +1898,11 @@ def main():
                 )
                 vol_4d = np.zeros((*volume_shape_lk, n_vals), dtype=np.float32)
                 vol_4d[voxel_mask_np.reshape(volume_shape_lk)] = profile_np
+            elif volume_shape_lk is not None:
+                # volume shape known but no mask — data covers full volume
+                vol_4d = profile_np.reshape(*volume_shape_lk, n_vals)
             else:
-                vol_4d = profile_np.reshape(-1, n_vals) if volume_shape_lk is None else profile_np
+                vol_4d = profile_np
 
             # Build header
             if nifti_header_lk is not None:
