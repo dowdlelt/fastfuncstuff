@@ -73,6 +73,7 @@ design_optimization_results/
 # real test data
 test_data/ds005165-download/
 test_data/nordic_test_data/
+test_data/small_validation_afni_data/
 
 # Test outputs (generated)
 test_data/**/test_*.nii.gz
