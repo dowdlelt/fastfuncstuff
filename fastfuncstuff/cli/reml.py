@@ -60,21 +60,79 @@ except ImportError as e:
     sys.exit(1)
 
 
-def parse_grid_arg(grid_str: str) -> tuple[float, float, int]:
-    """Parse grid argument like '0.1,0.9,11' into (start, stop, num_points)"""
-    try:
-        parts = grid_str.split(",")
+def parse_grid_arg(grid_str: str) -> torch.Tensor:
+    """
+    Parse a grid argument into a 1D tensor of float values.
+
+    Accepted formats:
+      start:stop:num   Linspace range, e.g.  0.025:0.9:32  or  -0.9:0.9:65
+                       (colon separator avoids argparse negative-number issues)
+      v1,v2,v3,...     Explicit list, e.g.   0.1,0.2,0.3,0.5,0.7,0.9
+      start,stop,num   Legacy linspace (3 comma-sep values, last is integer ≥ 2)
+    """
+    grid_str = grid_str.strip()
+
+    # ── Colon-separated linspace: start:stop:num ─────────────────────────────
+    if ":" in grid_str:
+        parts = grid_str.split(":")
         if len(parts) != 3:
-            raise ValueError("Grid must have exactly 3 values: start,stop,num_points")
-        start = float(parts[0])
-        stop = float(parts[1])
-        num_points = int(parts[2])
-        if num_points < 2:
-            raise ValueError("num_points must be >= 2")
-        return start, stop, num_points
-    except ValueError as e:
-        print(f"ERROR parsing grid '{grid_str}': {e}")
+            print(f"ERROR: colon range must be start:stop:num, got '{grid_str}'")
+            sys.exit(1)
+        try:
+            start, stop, num = float(parts[0]), float(parts[1]), int(parts[2])
+        except ValueError:
+            print(f"ERROR parsing range '{grid_str}'")
+            sys.exit(1)
+        if num < 2:
+            print(f"ERROR: num_points must be >= 2 in '{grid_str}'")
+            sys.exit(1)
+        return torch.linspace(start, stop, num)
+
+    # ── Comma-separated: explicit list or legacy start,stop,num ──────────────
+    parts = grid_str.split(",")
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        print(f"ERROR: could not parse grid values '{grid_str}'")
         sys.exit(1)
+
+    # Legacy detection: exactly 3 values where the last is a whole number ≥ 2
+    if len(values) == 3 and values[2] == int(values[2]) and int(values[2]) >= 2:
+        start, stop, num = values[0], values[1], int(values[2])
+        return torch.linspace(start, stop, num)
+
+    # Explicit list
+    if len(values) < 1:
+        print(f"ERROR: grid must have at least one value: '{grid_str}'")
+        sys.exit(1)
+    return torch.tensor(values)
+
+
+def _extract_grid_args(argv: list[str]) -> tuple[list[str], str | None, str | None]:
+    """
+    Pull -a_grid / -b_grid values out of argv before argparse sees them.
+
+    argparse cannot handle option values that start with '-' unless they look
+    like bare negative numbers (e.g. '-0.9' is fine, but '-0.9,0.9,65' is not).
+    Extracting these manually sidesteps the issue entirely.
+    """
+    a_grid_str: str | None = None
+    b_grid_str: str | None = None
+    new_argv: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-a_grid", "--a_grid") and i + 1 < len(argv):
+            a_grid_str = argv[i + 1]; i += 2; continue
+        if tok in ("-b_grid", "--b_grid") and i + 1 < len(argv):
+            b_grid_str = argv[i + 1]; i += 2; continue
+        if tok.startswith(("-a_grid=", "--a_grid=")):
+            a_grid_str = tok.split("=", 1)[1]; i += 1; continue
+        if tok.startswith(("-b_grid=", "--b_grid=")):
+            b_grid_str = tok.split("=", 1)[1]; i += 1; continue
+        new_argv.append(tok)
+        i += 1
+    return new_argv, a_grid_str, b_grid_str
 
 
 
@@ -374,10 +432,22 @@ Examples:
     # ARMA grid options
     arma_opts = parser.add_argument_group("ARMA(1,1) Grid Options")
     arma_opts.add_argument(
-        "-a_grid", help="AR parameter grid: start,stop,num_points (e.g., 0.0,0.9,10)"
+        "-a_grid",
+        help=(
+            "AR parameter grid. Three formats accepted:\n"
+            "  start:stop:num  — linspace, e.g.  0.025:0.9:32  (recommended; handles negatives)\n"
+            "  v1,v2,...       — explicit list, e.g.  0.1,0.3,0.5,0.7,0.9\n"
+            "  start,stop,num  — legacy linspace, e.g.  0.025,0.9,32"
+        ),
     )
     arma_opts.add_argument(
-        "-b_grid", help="MA parameter grid: start,stop,num_points (e.g., -0.8,0.8,17)"
+        "-b_grid",
+        help=(
+            "MA parameter grid. Three formats accepted:\n"
+            "  start:stop:num  — linspace, e.g.  -0.9:0.9:65  (recommended; handles negatives)\n"
+            "  v1,v2,...       — explicit list, e.g.  -0.5,-0.2,0.0,0.2,0.5\n"
+            "  start,stop,num  — legacy linspace, e.g.  -0.9,0.9,65"
+        ),
     )
     arma_opts.add_argument(
         "-grid_batching",
@@ -635,11 +705,30 @@ def print_output_summary(args):
 
 
 def main():
-    parser = create_parser()
-    args = parser.parse_args()
+    # Pre-extract -a_grid / -b_grid before argparse sees them.
+    # argparse cannot handle values like "-0.9,0.9,65" (starts with '-' but not a
+    # bare number), so we pull those out manually before parse_args().
+    raw_argv = sys.argv[1:]
 
-    # Show help if requested
-    if args.help or len(sys.argv) == 1:
+    # Early help / no-args check (before parse_args can fail on grid values)
+    if not raw_argv or any(a in ("-help", "--help", "-h") for a in raw_argv):
+        parser = create_parser()
+        parser.print_help()
+        sys.exit(0)
+
+    filtered_argv, a_grid_str, b_grid_str = _extract_grid_args(raw_argv)
+
+    parser = create_parser()
+    # Temporarily replace sys.argv so parse_args() sees the filtered list
+    _orig_argv = sys.argv
+    sys.argv = [sys.argv[0]] + filtered_argv
+    try:
+        args = parser.parse_args()
+    finally:
+        sys.argv = _orig_argv
+
+    # Show help if requested via the parser's own help flag
+    if args.help or not filtered_argv:
         parser.print_help()
         sys.exit(0)
 
@@ -754,18 +843,23 @@ def main():
         print(f"🖥️  Device: {device}")
     print()
 
-    # Parse ARMA grids if provided
+    # Parse ARMA grids if provided (values pre-extracted from argv by _extract_grid_args)
     a_grid = None
     b_grid = None
-    if args.a_grid:
-        start, stop, num = parse_grid_arg(args.a_grid)
-        a_grid = torch.linspace(start, stop, num, device=device)
-        print(f"🔢 Custom a_grid: [{start}, {stop}] with {num} points")
-    if args.b_grid:
-        start, stop, num = parse_grid_arg(args.b_grid)
-        b_grid = torch.linspace(start, stop, num, device=device)
-        print(f"🔢 Custom b_grid: [{start}, {stop}] with {num} points")
-    if args.a_grid or args.b_grid:
+    if a_grid_str:
+        a_grid = parse_grid_arg(a_grid_str).to(device)
+        print(f"🔢 Custom a_grid: {a_grid.numel()} points [{a_grid[0].item():.4g}, {a_grid[-1].item():.4g}]")
+    elif args.a_grid:
+        # Fallback: value didn't need pre-extraction (no leading '-')
+        a_grid = parse_grid_arg(args.a_grid).to(device)
+        print(f"🔢 Custom a_grid: {a_grid.numel()} points [{a_grid[0].item():.4g}, {a_grid[-1].item():.4g}]")
+    if b_grid_str:
+        b_grid = parse_grid_arg(b_grid_str).to(device)
+        print(f"🔢 Custom b_grid: {b_grid.numel()} points [{b_grid[0].item():.4g}, {b_grid[-1].item():.4g}]")
+    elif args.b_grid:
+        b_grid = parse_grid_arg(args.b_grid).to(device)
+        print(f"🔢 Custom b_grid: {b_grid.numel()} points [{b_grid[0].item():.4g}, {b_grid[-1].item():.4g}]")
+    if a_grid_str or b_grid_str or args.a_grid or args.b_grid:
         print()
 
     # Print batch size if specified
@@ -1487,8 +1581,8 @@ def main():
             # ARMA-specific options are ignored in OLS-only mode
             if any(
                 [
-                    args.a_grid,
-                    args.b_grid,
+                    a_grid_str or args.a_grid,
+                    b_grid_str or args.b_grid,
                     args.grid_batching,
                     args.no_grid_batching,
                     args.quick_estimate,

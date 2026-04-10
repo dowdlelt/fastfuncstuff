@@ -549,10 +549,10 @@ def get_default_arma_grids(device: torch.device) -> tuple[torch.Tensor, torch.Te
 
 
 def ensure_zero_in_grid(
-    a_grid: torch.Tensor, b_grid: torch.Tensor, tolerance: float = 1e-9
+    a_grid: torch.Tensor, b_grid: torch.Tensor, tolerance: float = 1e-6
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Ensure that both grids contain 0.0, adding it if necessary.
+    Ensure that both grids contain exactly 0.0, snapping or adding as needed.
 
     This guarantees that the special case (a=0, b=0) is always tested,
     even if the user provides a grid that starts at 0.1 or has spacing
@@ -564,8 +564,10 @@ def ensure_zero_in_grid(
         AR parameter grid
     b_grid : torch.Tensor
         MA parameter grid
-    tolerance : float, default=1e-9
-        Tolerance for checking if zero is already in the grid
+    tolerance : float, default=1e-6
+        Tolerance for detecting near-zero values.  Must be larger than float32
+        linspace rounding error (~1.2e-7 for values near 1.0) to avoid false
+        negatives, but small enough not to snap a genuine 0.001 grid point.
 
     Returns
     -------
@@ -580,6 +582,11 @@ def ensure_zero_in_grid(
     which is an important baseline for comparison. This function ensures
     it's always tested regardless of user grid specification.
 
+    Two cases handled:
+    - Near-zero value already exists (e.g. 2.98e-8 from float32 linspace):
+      snap it to exactly 0.0 to avoid two near-identical grid points.
+    - No near-zero value: insert 0.0 and re-sort.
+
     Examples
     --------
     >>> a_grid = torch.tensor([0.1, 0.2, 0.3])
@@ -591,19 +598,21 @@ def ensure_zero_in_grid(
     device = a_grid.device
     dtype = a_grid.dtype
 
-    # Check if 0.0 is already in a_grid (within tolerance)
-    if not torch.any(torch.abs(a_grid) < tolerance):
-        # Add 0.0 to a_grid and sort
-        zero_tensor = torch.tensor([0.0], device=device, dtype=dtype)
-        a_grid = torch.cat([zero_tensor, a_grid])
-        a_grid = torch.sort(a_grid)[0]
+    def _ensure_zero(grid: torch.Tensor) -> torch.Tensor:
+        near_zero = torch.abs(grid) < tolerance
+        if torch.any(near_zero):
+            # Snap the near-zero value(s) to exactly 0.0
+            # (avoids duplicates from float32 linspace rounding, e.g. 2.98e-8)
+            grid = grid.clone()
+            grid[near_zero] = 0.0
+        else:
+            # Zero is genuinely absent — insert it
+            zero_tensor = torch.tensor([0.0], device=device, dtype=dtype)
+            grid = torch.sort(torch.cat([zero_tensor, grid]))[0]
+        return grid
 
-    # Check if 0.0 is already in b_grid (within tolerance)
-    if not torch.any(torch.abs(b_grid) < tolerance):
-        # Add 0.0 to b_grid and sort
-        zero_tensor = torch.tensor([0.0], device=device, dtype=dtype)
-        b_grid = torch.cat([zero_tensor, b_grid])
-        b_grid = torch.sort(b_grid)[0]
+    a_grid = _ensure_zero(a_grid)
+    b_grid = _ensure_zero(b_grid)
 
     return a_grid, b_grid
 
