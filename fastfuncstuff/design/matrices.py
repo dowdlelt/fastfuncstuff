@@ -553,7 +553,7 @@ def make_tent_design(
     design = torch.zeros(n_timepoints, n_actual_basis, device=device)
 
     # Create time vector for each TR (in seconds)
-    _tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
+    tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
 
     # Combine all onset times from all conditions
     all_onset_times = []
@@ -586,22 +586,13 @@ def make_tent_design(
             tent_mid = bot + basis_idx * dt
             tent_top = bot + (basis_idx + 1) * dt
 
-        # For each TR, sum contributions from all onsets
-        for tr_idx in range(n_timepoints):
-            tr_time = tr_idx * tr
+        # Vectorized: compute relative time for every (TR, onset) pair at once
+        # tr_times: (n_tp,), onset_times_tensor: (n_onsets,)
+        # rel_times: (n_tp, n_onsets) - time of each TR relative to each onset
+        rel_times = tr_times.unsqueeze(1) - onset_times_tensor.unsqueeze(0)
 
-            # For each onset, calculate relative time and evaluate tent
-            for onset_t in onset_times_tensor:
-                # Time relative to onset (how long after stimulus)
-                rel_time = tr_time - onset_t.item()
-
-                # Evaluate tent basis at this relative time
-                tent_val = basis_tent(
-                    torch.tensor(rel_time, device=device), tent_bot, tent_mid, tent_top
-                ).item()
-
-                # Add contribution to design matrix
-                design[tr_idx, basis_col_idx] += tent_val
+        # Evaluate tent basis on the full (n_tp, n_onsets) matrix, sum over onsets
+        design[:, basis_col_idx] = basis_tent(rel_times, tent_bot, tent_mid, tent_top).sum(dim=1)
 
         basis_col_idx += 1
 
@@ -710,25 +701,18 @@ def make_csplin_design(
 
     onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
 
+    # Create time vector for each TR (in seconds)
+    tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
+
     # For each basis function
     basis_col_idx = 0
     for basis_idx in range(first_basis_idx, last_basis_idx):
-        # For each TR, sum contributions from all onsets
-        for tr_idx in range(n_timepoints):
-            tr_time = tr_idx * tr
+        # Vectorized: compute relative time for every (TR, onset) pair at once
+        # rel_times: (n_tp, n_onsets)
+        rel_times = tr_times.unsqueeze(1) - onset_times_tensor.unsqueeze(0)
 
-            # For each onset, calculate relative time and evaluate cubic spline
-            for onset_t in onset_times_tensor:
-                # Time relative to onset
-                rel_time = tr_time - onset_t.item()
-
-                # Evaluate cubic spline basis at this relative time
-                csplin_val = basis_csplin(
-                    torch.tensor([rel_time], device=device), knots, basis_idx
-                )[0].item()
-
-                # Add contribution
-                design[tr_idx, basis_col_idx] += csplin_val
+        # Evaluate cubic spline basis on full matrix, sum over onsets
+        design[:, basis_col_idx] = basis_csplin(rel_times, knots, basis_idx).sum(dim=1)
 
         basis_col_idx += 1
 
@@ -1283,13 +1267,9 @@ def save_iresp(
 
     nx, ny, nz, n_conditions, n_lags = iresp.shape
 
-    # Get affine matrix
-    if reference_img is not None:
-        from fastfuncstuff.io.afni import load_nifti
-        ref_img = load_nifti(reference_img)
-        affine = ref_img.affine
-    elif affine is None:
-        # Default identity affine
+    # Resolve affine — prefer copying the full header via reference_img so that
+    # space/units/sform codes are preserved.  Fall back to a bare affine matrix.
+    if reference_img is None and affine is None:
         affine = np.eye(4)
 
     # Calculate top if not provided
@@ -1314,7 +1294,10 @@ def save_iresp(
 
         # Save file
         output_file = f"{output_prefix}_iresp_{label}{nii_ext}"
-        save_nifti(cond_hrf, output_path=output_file, affine=affine, tr=tr)
+        save_nifti(
+            cond_hrf, output_path=output_file,
+            reference_img=reference_img, affine=affine, tr=tr,
+        )
         output_files.append(output_file)
 
     return output_files

@@ -52,6 +52,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 try:
     import nibabel as nib  # noqa: F401 — availability check
@@ -72,6 +73,8 @@ try:
     from fastfuncstuff.design.matrices import (
         build_glm_design,
         is_tr_locked,
+        make_csplin_design,
+        make_tent_design,
         save_iresp,
     )
     from fastfuncstuff.design.builder import (
@@ -79,6 +82,7 @@ try:
         parse_afni_timing_file,
     )
     from fastfuncstuff.glm.core import fit_glm
+    from fastfuncstuff.glm.xval import compute_r2_metric
     from fastfuncstuff.utils import configure_torch_backends, get_device
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
@@ -154,6 +158,29 @@ def parse_args():
         type=int,
         metavar="N",
         help="Number of TENT basis functions (knots). Default: auto-calculated for TR spacing.",
+    )
+
+    model_opts.add_argument(
+        "-xval_tr_range",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Cross-validate the TENT window upper bound over ±N TRs around the -tent_window "
+             "top, in steps of 1 TR, using leave-one-run-out CV. The top with the highest "
+             "mean held-out R² is used for the final fit. "
+             "E.g., '-tent_window 0 15 -xval_tr_range 3' tries tops 12s..18s (default: 0 = disabled).",
+    )
+
+    model_opts.add_argument(
+        "-per_voxel",
+        action="store_true",
+        help="When combined with -xval_tr_range, select the best window top *per voxel* "
+             "rather than a single shared top. Each voxel's HRF is estimated with its "
+             "individually optimal window; shorter windows are zero-padded on the right to "
+             "the longest candidate window. Saves additional maps: "
+             "{prefix}_windowsize.nii.gz (winning top in seconds) and "
+             "{prefix}_r2_by_window.nii.gz (LORO R² per candidate, 4D). "
+             "Requires -xval_tr_range > 0 and ≥2 runs.",
     )
 
     model_opts.add_argument(
@@ -236,6 +263,46 @@ def parse_args():
     )
 
     return parser
+
+
+def _labels_from_timing_files(timing_files: list[str]) -> list[str]:
+    """Extract unique condition labels from timing filenames.
+
+    Finds the parts of each stem that differ across files.
+    E.g. ['onsets.localizer.times.bodies.txt', 'onsets.localizer.times.faces.txt']
+    → ['bodies', 'faces']
+    """
+    stems = [Path(f).stem for f in timing_files]
+    if len(stems) == 1:
+        return [stems[0]]
+
+    sep = "." if "." in stems[0] else "_"
+    parts_list = [s.split(sep) for s in stems]
+    max_len = max(len(p) for p in parts_list)
+    min_len = min(len(p) for p in parts_list)
+
+    # Find common prefix length
+    common_prefix = 0
+    for i in range(min_len):
+        if len({p[i] for p in parts_list}) == 1:
+            common_prefix += 1
+        else:
+            break
+
+    # Find common suffix length
+    common_suffix = 0
+    for i in range(1, min_len - common_prefix + 1):
+        if len({p[-i] for p in parts_list}) == 1:
+            common_suffix += 1
+        else:
+            break
+
+    labels = []
+    for parts in parts_list:
+        end = len(parts) - common_suffix if common_suffix > 0 else len(parts)
+        unique = parts[common_prefix:end]
+        labels.append(sep.join(unique) if unique else sep.join(parts))
+    return labels
 
 
 def parse_tent_windows(tent_window_args, n_conditions):
@@ -322,6 +389,251 @@ def print_help(parser):
     parser.print_help()
 
 
+def _fit_noise_gaussian(r2_vals: np.ndarray) -> tuple[float, float]:
+    """
+    Estimate the noise component of a LORO R² distribution.
+
+    Noise voxels cluster around a low R² value (often slightly negative).
+    We estimate the noise Gaussian by folding the left half of the distribution
+    around its median — that left half is almost pure noise, and mirroring it
+    gives a symmetric noise distribution to fit.
+
+    Returns (mu_noise, sigma_noise).
+    """
+    mu = float(np.median(r2_vals))
+    left = r2_vals[r2_vals <= mu]
+    if len(left) < 10:
+        return mu, float(np.std(r2_vals))
+    # Mirror the left half around the median to get a symmetric noise estimate
+    mirrored = np.concatenate([left, 2.0 * mu - left])
+    return mu, float(np.std(mirrored))
+
+
+def _loro_r2_per_voxel(
+    data_clean: list[torch.Tensor],
+    designs_clean: list[torch.Tensor],
+    n_vox: int,
+    device: torch.device,
+    chunk: int = 20000,
+) -> np.ndarray:
+    """
+    LORO CV: fit shared HRF on N-1 runs, predict on held-out run.
+    Returns per-voxel median R² across folds, shape (n_vox,).
+    """
+    n_runs = len(data_clean)
+    fold_r2s: list[np.ndarray] = []
+
+    for held_out in range(n_runs):
+        train_runs = [r for r in range(n_runs) if r != held_out]
+        train_design = torch.cat([designs_clean[r] for r in train_runs], dim=0)
+        test_design = designs_clean[held_out]
+
+        # Pre-factor X'X once per fold (design is tiny: n_regs × n_regs)
+        XtX = train_design.T @ train_design
+        try:
+            L_fold = torch.linalg.cholesky(XtX)
+        except torch.linalg.LinAlgError:
+            L_fold = None  # fall back to solve() below
+
+        r2_parts: list[torch.Tensor] = []
+        for i in range(0, n_vox, chunk):
+            train_c = torch.cat(
+                [data_clean[r][i : i + chunk, :] for r in train_runs], dim=1
+            ).to(device)
+            XtY = train_design.T @ train_c.T  # (n_regs, chunk)
+            if L_fold is not None:
+                betas = torch.cholesky_solve(XtY, L_fold)  # (n_regs, chunk)
+            else:
+                betas = torch.linalg.solve(XtX, XtY)
+            test_c = data_clean[held_out][i : i + chunk, :].to(device)
+            pred = (test_design @ betas).T
+            r2_parts.append(compute_r2_metric(test_c, pred, "cod").cpu())
+
+        fold_r2s.append(torch.cat(r2_parts).numpy())
+
+    # Median across folds per voxel — robust to occasional bad folds
+    return np.median(np.stack(fold_r2s, axis=0), axis=0)  # (n_vox,)
+
+
+def _compute_loro_r2_matrix(
+    data_list: list[np.ndarray],
+    onsets_per_condition: list,
+    model: str,
+    bot: float,
+    candidate_tops: list[float],
+    tr: float,
+    n_conditions: int,
+    polort: int,
+    device: torch.device,
+    verbose: bool,
+    max_voxels: int = 500_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute LORO-CV R² for each candidate window top, for each active voxel.
+
+    Active voxels are those above the bottom-25% variance threshold of
+    non-zero voxels (removes background / CSF rim). Polynomial drift is
+    projected out via QR decomposition once, independent of window top.
+
+    Parameters
+    ----------
+    max_voxels : int
+        Hard cap on the number of active voxels (random subsample if exceeded).
+        Use a large value (e.g. 500_000) to disable subsampling.
+
+    Returns
+    -------
+    r2_matrix : ndarray, shape (n_candidates, n_vox), float32
+        Median LORO R² across folds for each candidate window × active voxel.
+    vox_idx : ndarray, shape (n_vox,), int
+        Indices into the flattened voxel axis of *data_list* (0 … nx*ny*nz-1).
+    """
+    n_tp_per_run = [d.shape[1] for d in data_list]
+    n_voxels_total = data_list[0].shape[0]
+
+    # ── Coarse background filter ─────────────────────────────────────────────
+    rng = np.random.default_rng(42)
+    var_proxy = data_list[0].var(axis=1)
+    nonzero = var_proxy[var_proxy > 0]
+    if len(nonzero) == 0:
+        active_idx = np.arange(n_voxels_total)
+    else:
+        var_thresh = np.percentile(nonzero, 25)
+        active_idx = np.where(var_proxy >= var_thresh)[0]
+
+    if len(active_idx) > max_voxels:
+        vox_idx = np.sort(rng.choice(active_idx, size=max_voxels, replace=False))
+    else:
+        vox_idx = active_idx
+    n_vox = len(vox_idx)
+    data_xval = [d[vox_idx, :] for d in data_list]
+
+    if verbose:
+        print(
+            f"  Active voxels: {n_vox:,} "
+            f"({len(active_idx):,} / {n_voxels_total:,} above variance floor)"
+        )
+
+    # ── Polynomial QR projection (once; window-independent) ─────────────────
+    Q_per_run: list[torch.Tensor | None] = []
+    data_clean: list[torch.Tensor] = []
+
+    for run_idx, n_tp in enumerate(n_tp_per_run):
+        data_r = torch.tensor(data_xval[run_idx], dtype=torch.float32, device=device)
+        if polort >= 0:
+            poly_np = legendre_polynomials(n_tp, polort)
+            poly_r = torch.tensor(poly_np, dtype=torch.float32, device=device)
+            Q, _ = torch.linalg.qr(poly_r)
+            Q_per_run.append(Q)
+            data_r = data_r - (Q @ (Q.T @ data_r.T)).T
+        else:
+            Q_per_run.append(None)
+        data_clean.append(data_r.cpu())
+
+    use_csplin = model in ("CSPLIN", "CSPLINzero")
+    zero_edges = model in ("TENTzero", "CSPLINzero")
+
+    def _build_designs_clean(top_val: float) -> list[torch.Tensor]:
+        """Build poly-projected TENT/CSPLIN designs for one window top."""
+        out = []
+        for run_idx, n_tp in enumerate(n_tp_per_run):
+            cond_parts = []
+            for c in range(n_conditions):
+                fn = make_csplin_design if use_csplin else make_tent_design
+                cond_parts.append(
+                    fn([onsets_per_condition[c][run_idx]], bot, top_val, tr, n_tp,
+                       zero_edges=zero_edges, device=device)
+                )
+            design_r = torch.cat(cond_parts, dim=1)
+            Q = Q_per_run[run_idx]
+            if Q is not None:
+                design_r = design_r - Q @ (Q.T @ design_r)
+            out.append(design_r)
+        return out
+
+    # ── LORO R² for every candidate window ───────────────────────────────────
+    r2_matrix = np.zeros((len(candidate_tops), n_vox), dtype=np.float32)
+    for i, top_k in enumerate(
+        tqdm(candidate_tops, desc="  Window candidates", disable=not verbose)
+    ):
+        designs_k = _build_designs_clean(top_k)
+        r2_matrix[i] = _loro_r2_per_voxel(data_clean, designs_k, n_vox, device)
+
+    return r2_matrix, vox_idx
+
+
+def _xval_tent_top(
+    data_list: list[np.ndarray],
+    onsets_per_condition: list,
+    model: str,
+    bot: float,
+    nominal_top: float,
+    candidate_tops: list[float],
+    tr: float,
+    n_conditions: int,
+    polort: int,
+    device: torch.device,
+    verbose: bool,
+) -> tuple[float, float]:
+    """
+    Select the best shared window top via LORO CV.
+
+    Uses the nominal window to identify signal voxels (fold-over Gaussian model),
+    then picks the candidate with the highest median R² on those signal voxels.
+
+    Returns (best_top, best_median_r2_on_signal_voxels).
+    """
+    r2_matrix, vox_idx = _compute_loro_r2_matrix(
+        data_list, onsets_per_condition, model, bot, candidate_tops,
+        tr, n_conditions, polort, device, verbose,
+        max_voxels=50_000,
+    )
+    n_vox = len(vox_idx)
+
+    # Nominal window R² → noise model → signal voxels
+    nom_idx = min(range(len(candidate_tops)), key=lambda i: abs(candidate_tops[i] - nominal_top))
+    r2_nominal = r2_matrix[nom_idx]
+
+    mu_noise, sigma_noise = _fit_noise_gaussian(r2_nominal)
+    sig_thresh = mu_noise + sigma_noise
+    signal_mask = r2_nominal > sig_thresh
+    n_signal = int(signal_mask.sum())
+
+    if n_signal < 200:
+        cutoff = int(0.80 * n_vox)
+        sig_order = np.argsort(r2_nominal)
+        signal_mask = np.zeros(n_vox, dtype=bool)
+        signal_mask[sig_order[cutoff:]] = True
+        n_signal = int(signal_mask.sum())
+        if verbose:
+            print(
+                f"  Noise model found < 200 signal voxels; "
+                f"falling back to top-20% by R² ({n_signal:,} voxels)"
+            )
+    else:
+        if verbose:
+            print(
+                f"  Noise model: μ={mu_noise:.3f}, σ={sigma_noise:.3f}, "
+                f"threshold={sig_thresh:.3f} → {n_signal:,} signal voxels"
+            )
+
+    scores = np.array(
+        [float(np.median(r2_matrix[i, signal_mask])) for i in range(len(candidate_tops))]
+    )
+    best_idx = int(np.argmax(scores))
+    best_top = candidate_tops[best_idx]
+    best_r2 = scores[best_idx]
+
+    if verbose:
+        print("  LORO R² on signal voxels (median) by window top:")
+        cv_log = sorted(zip(candidate_tops, scores.tolist()), key=lambda x: x[0])
+        for top_k, r2_k in cv_log:
+            marker = " ← selected" if abs(top_k - best_top) < 1e-6 else ""
+            print(f"    {bot:.1f}–{top_k:.2f}s  R²={r2_k:.4f}{marker}")
+
+    return best_top, best_r2
+
+
 def main():
     """Main CLI entry point"""
     parser = parse_args()
@@ -372,7 +684,7 @@ def main():
             return 1
         condition_labels = args.labels
     else:
-        condition_labels = [f"cond{i + 1}" for i in range(n_conditions)]
+        condition_labels = _labels_from_timing_files(args.onsets)
 
     if args.verbose:
         print(f"  Condition labels: {', '.join(condition_labels)}")
@@ -381,21 +693,24 @@ def main():
     if args.verbose:
         print("\nLoading fMRI data...")
 
+    # data_list stores 2D (n_voxels, n_tp) arrays per run (float32)
     data_list = []
     n_timepoints_per_run = []
     tr_values = []
+    nx = ny = nz = None
 
-    for i, input_file in enumerate(args.input):
-        if args.verbose:
-            print(f"  Run {i + 1}: {input_file}")
-
+    for i, input_file in enumerate(tqdm(args.input, desc="Loading runs", unit="run")):
         if not Path(input_file).exists():
             print(f"ERROR: Input file not found: {input_file}", file=sys.stderr)
             return 1
 
-        # Load data
+        # Load data as float32 (matches reml.py pattern)
         img = load_nifti(input_file)
-        data = np.asarray(img.get_fdata())
+        data = img.get_fdata(dtype=np.float32)
+
+        if data.ndim != 4:
+            print(f"ERROR: Expected 4D data, got {data.ndim}D: {input_file}", file=sys.stderr)
+            return 1
 
         # Get TR
         if args.tr is None:
@@ -404,11 +719,15 @@ def main():
         else:
             tr = args.tr
 
-        # Get n_timepoints
-        n_timepoints = data.shape[3] if len(data.shape) > 3 else 1
-        n_timepoints_per_run.append(n_timepoints)
+        # Store spatial dims from first run
+        if nx is None:
+            nx, ny, nz = data.shape[:3]
 
-        data_list.append(data)
+        n_tp = data.shape[3]
+        n_timepoints_per_run.append(n_tp)
+
+        # Flatten to 2D immediately to avoid large 4D concatenation later
+        data_list.append(data.reshape(-1, n_tp))
 
     # Check TR consistency
     if args.tr is None:
@@ -423,9 +742,6 @@ def main():
     if args.verbose:
         print(f"  TR: {tr}s")
         print(f"  Total timepoints: {sum(n_timepoints_per_run)}")
-
-    # Get data shape
-    nx, ny, nz = data_list[0].shape[:3]
 
     if args.verbose:
         print(f"  Data shape: {nx} x {ny} x {nz}")
@@ -557,6 +873,282 @@ def main():
                         f"    {condition_labels[i]}: {bot}s to {top}s ({n_basis_calc} {basis_type} knots → {n_actual} regressors)"
                     )
 
+    # Cross-validate TENT window upper bound if requested
+    # _pv_* variables carry per-voxel mode context into the block below.
+    _do_per_voxel = False
+    _pv_bot: float = 0.0
+    _pv_nom_top: float = 0.0
+    _pv_tops: list[float] = []
+
+    if args.xval_tr_range > 0 and model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
+        if n_runs < 2:
+            print("WARNING: -xval_tr_range requires ≥2 runs. Skipping.", file=sys.stderr)
+        elif tent_windows is None:
+            print("WARNING: tent_windows not set. Skipping xval.", file=sys.stderr)
+        else:
+            unique_tops = {w[1] for w in tent_windows}
+            if len(unique_tops) > 1:
+                print(
+                    "WARNING: -xval_tr_range only supported when all conditions share "
+                    "the same window top. Skipping.",
+                    file=sys.stderr,
+                )
+            else:
+                nom_top = next(iter(unique_tops))
+                nom_bot = tent_windows[0][0]
+
+                # Candidate tops: nom_top ± xval_tr_range TRs, step 1 TR
+                n_range = args.xval_tr_range
+                candidate_tops = [
+                    round(nom_top + k * tr, 6)
+                    for k in range(-n_range, n_range + 1)
+                    if nom_top + k * tr > nom_bot + tr  # needs at least 2 knots
+                ]
+
+                if len(candidate_tops) < 2:
+                    print(
+                        "WARNING: fewer than 2 valid candidate tops; skipping xval.",
+                        file=sys.stderr,
+                    )
+                elif args.per_voxel:
+                    # Per-voxel mode: defer R² computation; keep nominal tent_windows for now
+                    _do_per_voxel = True
+                    _pv_bot = nom_bot
+                    _pv_nom_top = nom_top
+                    _pv_tops = candidate_tops
+                    if args.verbose:
+                        print(f"\nPer-voxel window mode (±{n_range} TRs)...")
+                        print(
+                            f"  Candidates: "
+                            f"{', '.join(f'{t:.2f}s' for t in candidate_tops)}"
+                        )
+                else:
+                    if args.verbose:
+                        print(f"\nCross-validating window top (±{n_range} TRs)...")
+                        print(
+                            f"  Candidates: "
+                            f"{', '.join(f'{t:.2f}s' for t in candidate_tops)}"
+                        )
+
+                    best_top, best_r2 = _xval_tent_top(
+                        data_list=data_list,
+                        onsets_per_condition=onsets_per_condition,
+                        model=model,
+                        bot=nom_bot,
+                        nominal_top=nom_top,
+                        candidate_tops=candidate_tops,
+                        tr=tr,
+                        n_conditions=n_conditions,
+                        polort=args.polort,
+                        device=device,
+                        verbose=args.verbose,
+                    )
+
+                    tent_windows = [(nom_bot, best_top)] * n_conditions
+
+                    if args.verbose:
+                        print(
+                            f"  → Selected: {nom_bot:.1f}s to {best_top:.2f}s  "
+                            f"(LORO R²={best_r2:.4f})"
+                        )
+                    else:
+                        print(
+                            f"xval: selected window {nom_bot:.1f}s to {best_top:.2f}s  "
+                            f"(LORO R²={best_r2:.4f})"
+                        )
+
+    # ── Per-voxel window selection ────────────────────────────────────────────
+    if _do_per_voxel:
+        zero_edges_pv = model in ("TENTzero", "CSPLINzero")
+        use_csplin_pv = model in ("CSPLIN", "CSPLINzero")
+        n_all_voxels = nx * ny * nz
+
+        # 1. LORO R² for every candidate window, all active voxels (no subsampling cap)
+        if args.verbose:
+            print("\nComputing per-voxel LORO R² across all candidate windows...")
+        r2_matrix, vox_idx = _compute_loro_r2_matrix(
+            data_list=data_list,
+            onsets_per_condition=onsets_per_condition,
+            model=model,
+            bot=_pv_bot,
+            candidate_tops=_pv_tops,
+            tr=tr,
+            n_conditions=n_conditions,
+            polort=args.polort,
+            device=device,
+            verbose=args.verbose,
+            max_voxels=500_000,
+        )
+        # r2_matrix: (n_candidates, n_vox); vox_idx: flat [0, nx*ny*nz)
+
+        # 2. Per-voxel argmax → best candidate index → best top value
+        best_cand_per_vox = np.argmax(r2_matrix, axis=0)  # (n_vox,)
+        best_top_per_vox = np.array(
+            [_pv_tops[i] for i in best_cand_per_vox], dtype=np.float32
+        )
+
+        # 3. Save r2_by_window map (4D: one volume per candidate)
+        r2_bw_vol = np.zeros((n_all_voxels, len(_pv_tops)), dtype=np.float32)
+        r2_bw_vol[vox_idx] = r2_matrix.T
+        r2_bw_vol = r2_bw_vol.reshape(nx, ny, nz, len(_pv_tops))
+        r2_bw_file = f"{args.prefix}_r2_by_window{_nii_ext}"
+        save_nifti(r2_bw_vol, r2_bw_file, reference_img=args.input[0])
+        del r2_bw_vol
+        if args.verbose:
+            print(f"  Saved: {r2_bw_file}")
+
+        # 4. Save windowsize map (3D: winning top in seconds)
+        ws_vol = np.zeros(n_all_voxels, dtype=np.float32)
+        ws_vol[vox_idx] = best_top_per_vox
+        ws_vol = ws_vol.reshape(nx, ny, nz)
+        ws_file = f"{args.prefix}_windowsize{_nii_ext}"
+        save_nifti(ws_vol, ws_file, reference_img=args.input[0])
+        del ws_vol
+        if args.verbose:
+            print(f"  Saved: {ws_file}")
+
+        # 5. Output dimensions: max window → max_n_knots timepoints per condition
+        max_top_pv = max(_pv_tops)
+        max_n_knots_pv = round((max_top_pv - _pv_bot) / tr) + 1
+        max_n_basis_out = max_n_knots_pv  # includes zero-padded edges for *zero models
+
+        if args.verbose:
+            print(
+                f"  Output: {max_n_basis_out} timepoints per condition "
+                f"(max window {_pv_bot:.1f}–{max_top_pv:.2f}s)"
+            )
+
+        # 6. Assemble full data tensor (unmasked; vox_idx is in full flat space)
+        data_full_pv = np.concatenate(data_list, axis=1)  # (n_all_vox, total_tp)
+        del data_list
+        data_tensor_pv = torch.tensor(data_full_pv, dtype=torch.float32, device="cpu")
+        del data_full_pv
+
+        # Map voxels not in vox_idx (background) to the nominal top as fallback
+        fallback_top = min(_pv_tops, key=lambda t: abs(t - _pv_nom_top))
+        full_best_top = np.full(n_all_voxels, fallback_top, dtype=np.float32)
+        full_best_top[vox_idx] = best_top_per_vox
+
+        # 7. Assemble per-voxel betas: one (n_all_voxels, max_n_basis_out) array per condition
+        assembled_betas = [
+            np.zeros((n_all_voxels, max_n_basis_out), dtype=np.float32)
+            for _ in range(n_conditions)
+        ]
+
+        unique_tops_pv = sorted(set(full_best_top.tolist()))
+        if args.verbose:
+            print(f"\n  Fitting GLMs for {len(unique_tops_pv)} unique winning windows...")
+
+        def _build_full_design_for_top(top_val: float) -> torch.Tensor:
+            """Build stimulus + poly design for all runs concatenated."""
+            stim_parts = []
+            for run_idx, n_tp in enumerate(n_timepoints_per_run):
+                cond_parts = []
+                for cond_idx in range(n_conditions):
+                    onset_times = onsets_per_condition[cond_idx][run_idx]
+                    if use_csplin_pv:
+                        d_c = make_csplin_design(
+                            onset_times_list=[onset_times],
+                            bot=_pv_bot, top=top_val, tr=tr, n_timepoints=n_tp,
+                            n_basis=args.tent_n_basis,
+                            zero_edges=(model == "CSPLINzero"), device=device,
+                        )
+                    else:
+                        d_c = make_tent_design(
+                            onset_times_list=[onset_times],
+                            bot=_pv_bot, top=top_val, tr=tr, n_timepoints=n_tp,
+                            n_basis=args.tent_n_basis,
+                            zero_edges=(model == "TENTzero"), device=device,
+                        )
+                    cond_parts.append(d_c)
+                stim_parts.append(torch.cat(cond_parts, dim=1))
+            design_stim = torch.cat(stim_parts, dim=0)
+
+            if args.polort < 0:
+                return design_stim
+
+            n_poly_per_run = args.polort + 1
+            total_poly_cols = len(n_timepoints_per_run) * n_poly_per_run
+            poly_full = np.zeros((sum(n_timepoints_per_run), total_poly_cols))
+            tr_start = col_start = 0
+            for run_idx, n_tp in enumerate(n_timepoints_per_run):
+                poly_run = legendre_polynomials(n_tp, args.polort)
+                poly_full[tr_start:tr_start + n_tp, col_start:col_start + n_poly_per_run] = poly_run
+                tr_start += n_tp
+                col_start += n_poly_per_run
+            poly_tensor = torch.tensor(poly_full, dtype=torch.float32, device=device)
+            return torch.cat([design_stim, poly_tensor], dim=1)
+
+        for top_k in tqdm(unique_tops_pv, desc="  Fitting", disable=not args.verbose):
+            vox_this_top = np.where(full_best_top == top_k)[0]
+            n_knots_k = round((top_k - _pv_bot) / tr) + 1
+            n_regs_k = n_knots_k - 2 if zero_edges_pv else n_knots_k
+            n_stim_k = n_conditions * n_regs_k
+
+            design_k = _build_full_design_for_top(top_k)
+
+            data_sub = data_tensor_pv[vox_this_top, :]
+            results_k = fit_glm(
+                data=data_sub,
+                design=design_k,
+                tr=tr,
+                max_poly_degree=-1,
+                device=device,
+                preload_data_to_device=False,
+                chunk_size=60000,
+                verbose=False,
+            )
+            betas_stim_k = results_k.betas[:, :n_stim_k].cpu().numpy()
+
+            for cond_idx in range(n_conditions):
+                cond_start = cond_idx * n_regs_k
+                betas_cond_k = betas_stim_k[:, cond_start:cond_start + n_regs_k]
+
+                padded = np.zeros((len(vox_this_top), max_n_basis_out), dtype=np.float32)
+                if zero_edges_pv:
+                    # slot 0 and slot n_knots_k-1 are forced zeros (edge constraints)
+                    # inner betas at slots 1 … n_regs_k
+                    padded[:, 1:1 + n_regs_k] = betas_cond_k
+                else:
+                    padded[:, :n_regs_k] = betas_cond_k
+                assembled_betas[cond_idx][vox_this_top] = padded
+
+        del data_tensor_pv
+
+        # 8. Save iresp files for each condition (max-window dimensions)
+        if args.verbose:
+            print("\nSaving per-voxel HRF estimates (iresp files)...")
+
+        output_files_pv = []
+        for cond_idx in range(n_conditions):
+            betas_4d = assembled_betas[cond_idx].reshape(nx, ny, nz, max_n_basis_out)
+            iresp_cond = betas_4d[:, :, :, np.newaxis, :]
+            files = save_iresp(
+                iresp=iresp_cond,
+                output_prefix=args.prefix,
+                condition_labels=[condition_labels[cond_idx]],
+                tr=tr,
+                bot=_pv_bot,
+                top=max_top_pv,
+                reference_img=args.input[0],
+                nii_ext=_nii_ext,
+            )
+            output_files_pv.extend(files)
+
+        if args.verbose:
+            for f in output_files_pv:
+                print(f"  ✓ {f}")
+            print(f"\n{'=' * 70}")
+            print("✓ Per-voxel deconvolution complete!")
+            print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 70}")
+        else:
+            print("Created HRF estimate files (per-voxel windows):")
+            for f in output_files_pv:
+                print(f"  {f}")
+
+        return 0
+
     # Build design matrices
     if args.verbose:
         print("\nBuilding design matrices...")
@@ -604,18 +1196,11 @@ def main():
                 # Get onset times (in seconds) for this condition in this run
                 onset_times = run_onsets_all_conds[cond_idx]
 
-                # Debug: check if this condition has any onsets
-                if args.verbose and run_idx == 0:
-                    print(
-                        f"    Condition {cond_idx + 1} ({condition_labels[cond_idx]}): {len(onset_times)} onsets in run 1"
-                    )
-
                 # Get window for this condition
                 bot, top = tent_windows[cond_idx]
 
                 # Build design for this condition using exact onset times
                 if model in ("TENT", "TENTzero"):
-                    from fastfuncstuff.design.matrices import make_tent_design
                     design_cond = make_tent_design(
                         onset_times_list=[onset_times],
                         bot=bot,
@@ -627,7 +1212,6 @@ def main():
                         device=device,
                     )
                 else:  # CSPLIN or CSPLINzero
-                    from fastfuncstuff.design.matrices import make_csplin_design
                     design_cond = make_csplin_design(
                         onset_times_list=[onset_times],
                         bot=bot,
@@ -646,15 +1230,7 @@ def main():
                     n_basis_per_condition_list.append(design_cond.shape[1])
 
             # Concatenate conditions horizontally
-            if args.verbose and run_idx == 0:
-                print(f"  DEBUG: Per-condition designs for run {run_idx + 1}:")
-                for i, d in enumerate(cond_designs):
-                    print(f"    Condition {i + 1}: {d.shape}")
-
             design = torch.cat(cond_designs, dim=1)
-
-            if args.verbose and run_idx == 0:
-                print(f"  DEBUG: Concatenated design for run {run_idx + 1}: {design.shape}")
 
         design_list.append(design)
 
@@ -778,7 +1354,7 @@ def main():
             import matplotlib.pyplot as plt
 
             # Create figure (time on vertical axis)
-            fig, ax = plt.subplots(figsize=(10, 12))
+            _, ax = plt.subplots(figsize=(10, 12))
 
             # Plot design matrix (no interpolation!)
             # Rows = time, Columns = regressors
@@ -846,24 +1422,23 @@ def main():
     if args.verbose:
         print("\nPreparing data for GLM...")
 
-    # Concatenate data across runs
-    data_full = np.concatenate([d for d in data_list], axis=3)
+    # Concatenate runs along time axis (data_list is already 2D per run)
+    data_full = np.concatenate(data_list, axis=1)  # (n_all_voxels, total_tp)
+    del data_list  # free memory
 
-    # Apply mask if provided
-    # fit_glm expects (n_voxels, n_timepoints)
+    # Apply mask if provided; fit_glm expects (n_voxels, n_timepoints)
     if mask is not None:
-        data_masked = data_full[mask, :]  # Shape: (n_voxels, n_timepoints)
+        data_masked = data_full[mask.flatten(), :]  # Shape: (n_voxels_masked, n_timepoints)
         if args.verbose:
             print(f"  Data shape: {data_masked.shape}")
     else:
-        data_masked = data_full.reshape(
-            -1, sum(n_timepoints_per_run)
-        )  # Shape: (n_voxels, n_timepoints)
+        data_masked = data_full  # already (n_all_voxels, n_timepoints)
         if args.verbose:
             print(f"  Data shape: {data_masked.shape} (all voxels)")
 
     # Convert to CPU tensor (will be chunked to GPU during fitting)
     data_tensor = torch.tensor(data_masked, dtype=torch.float32, device="cpu")
+    del data_masked, data_full
 
     # Fit GLM with chunking
     if args.verbose:
@@ -877,6 +1452,9 @@ def main():
         data=data_tensor,
         design=design_full,
         tr=tr,
+        # Polynomials are already included in design_full (block-diagonal per run).
+        # Pass max_poly_degree=-1 so fit_glm does not add a second set.
+        max_poly_degree=-1,
         device=device,
         preload_data_to_device=False,  # Stream chunks to GPU
         chunk_size=60000,  # Voxels per chunk
@@ -911,9 +1489,16 @@ def main():
             betas_4d = np.zeros((nx, ny, nz, n_basis))
             betas_4d[mask, :] = betas_cond
         else:
-            betas_4d = betas_cond.T.reshape(nx, ny, nz, n_basis)
+            betas_4d = betas_cond.reshape(nx, ny, nz, n_basis)
 
-        # Add condition dimension: (nx, ny, nz, 1, n_basis)
+        # For zero-edge models (TENTzero/CSPLINzero) the first and last basis
+        # functions were dropped (forced to zero). Pad them back so the saved
+        # iresp spans the full window [bot, top] with explicit zeros at the edges.
+        if model in ("TENTzero", "CSPLINzero"):
+            zeros = np.zeros((nx, ny, nz, 1), dtype=betas_4d.dtype)
+            betas_4d = np.concatenate([zeros, betas_4d, zeros], axis=3)
+
+        # Add condition dimension: (nx, ny, nz, 1, n_lags)
         iresp_cond = betas_4d[:, :, :, np.newaxis, :]
 
         # Determine window for metadata
@@ -957,7 +1542,7 @@ def main():
         if mask is not None:
             betas_4d[mask, :] = betas_stimulus
         else:
-            betas_4d = betas_stimulus.T.reshape(nx, ny, nz, n_stimulus_regressors)
+            betas_4d = betas_stimulus.reshape(nx, ny, nz, n_stimulus_regressors)
 
         # Save as 4D NIfTI
         beta_file = f"{args.prefix}_betas{_nii_ext}"

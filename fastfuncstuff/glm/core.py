@@ -182,6 +182,7 @@ def fit_glm_chunk(
     design: torch.Tensor,
     want_residuals: bool = False,
     want_predicted: bool = False,
+    cholesky_L: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -202,6 +203,11 @@ def fit_glm_chunk(
         Whether to return residuals
     want_predicted : bool
         Whether to return predicted values
+    cholesky_L : torch.Tensor, optional
+        Pre-computed lower Cholesky factor of X'X (n_regressors, n_regressors).
+        When provided, uses ``cholesky_solve`` which is ~30× faster than
+        ``lstsq`` on CUDA because the expensive factorization is done once
+        outside the voxel loop.  If None, falls back to ``lstsq``.
 
     Returns
     -------
@@ -218,18 +224,17 @@ def fit_glm_chunk(
     """
     n_voxels, n_timepoints = data.shape
 
-    # Solve using batched least squares: beta = (X'X)^-1 X'Y
-    # Using torch.linalg.lstsq is faster than manual (X'X)^-1
-    # Shape: design (T, R), data.T (T, V) -> betas (R, V)
-    try:
-        # lstsq solves X @ beta = Y for beta
-        betas = torch.linalg.lstsq(design, data.T).solution  # (n_regressors, n_voxels)
-        betas = betas.T  # (n_voxels, n_regressors)
-    except RuntimeError:
-        # Fallback to QR decomposition if lstsq fails
-        Q, R = torch.linalg.qr(design)
-        betas = torch.linalg.solve_triangular(R, Q.T @ data.T, upper=True)
-        betas = betas.T
+    # Solve beta = (X'X)^{-1} X'Y
+    if cholesky_L is not None:
+        # Fast path: X'X = L L' already factored — one matmul + triangular solve
+        xty = design.T @ data.T          # (n_regressors, n_voxels)
+        betas = torch.cholesky_solve(xty, cholesky_L).T  # (n_voxels, n_regressors)
+    else:
+        try:
+            betas = torch.linalg.lstsq(design, data.T).solution.T
+        except RuntimeError:
+            Q, R = torch.linalg.qr(design)
+            betas = torch.linalg.solve_triangular(R, Q.T @ data.T, upper=True).T
 
     # Compute predictions and residuals
     # NOTE: design @ betas.T gives (n_timepoints, n_regressors) @ (n_regressors, n_voxels) = (n_timepoints, n_voxels)
@@ -581,9 +586,9 @@ def fit_glm(
         chunk_data_cpu = data_concat[start_idx:end_idx]
         chunk_data = chunk_data_cpu if preload_data_to_device else chunk_data_cpu.to(device)
 
-        # Fit this chunk on the compute device
+        # Fit this chunk using pre-factored Cholesky (avoids re-factorizing design per chunk)
         betas_dev, r2_dev, ss_residual_dev, residuals_dev, predicted_dev = fit_glm_chunk(
-            chunk_data, design_concat, want_residuals, want_predicted
+            chunk_data, design_concat, want_residuals, want_predicted, cholesky_L=L
         )
 
         # Extract only task regressors (ignore nuisance)
