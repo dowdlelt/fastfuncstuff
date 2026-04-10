@@ -1120,7 +1120,10 @@ def _gamma_pdf_torch(x: torch.Tensor, mean: torch.Tensor, var: torch.Tensor) -> 
     b = mean / var  # rate param
     log_pdf = a * torch.log(b) - torch.lgamma(a) + (a - 1.0) * torch.log(x.clamp(min=1e-30)) - b * x
     result = torch.where(
-        x > 0, torch.exp(log_pdf.clamp(-700, 700)), torch.tensor(1e-32, device=x.device)
+        x > 0,
+        torch.exp(log_pdf.clamp(-700, 700)),
+        # Match input dtype to avoid silent float32→float64 promotion in torch.where
+        torch.tensor(1e-32, device=x.device, dtype=x.dtype),
     )
     return result
 
@@ -1159,7 +1162,11 @@ def batch_fit_ggm(
     """
     device = components_kv.device
     K, V = components_kv.shape
-    x = components_kv.double()  # (K, V)
+    # Keep x in float32: the dominant (K, V) tensor costs 2× VRAM in float64.
+    # Linear-space EM in float32 is safe: exp() underflows to 0 for outlier
+    # voxels (|x-mu| > ~13σ in float32), which total.clamp(min=1e-32) handles
+    # correctly — those voxels get equal responsibilities, i.e. they're excluded.
+    x = components_kv.float()  # (K, V) — the key VRAM saving
     n = float(V)
 
     # ----- Initialization -----
@@ -1186,13 +1193,13 @@ def batch_fit_ggm(
     neg_diff = (neg_x - mu_ng) * neg_mask.float()
     var_ng = ((neg_diff**2).sum(dim=1, keepdim=True) / neg_count).clamp(min=0.1)
 
-    # Mixing proportions  (K, 1)
-    pi_n = torch.full((K, 1), 0.8, device=device, dtype=torch.float64)
-    pi_p = torch.full((K, 1), 0.1, device=device, dtype=torch.float64)
-    pi_ng = torch.full((K, 1), 0.1, device=device, dtype=torch.float64)
+    # Mixing proportions (K, 1) — float32, negligible size
+    pi_n = torch.full((K, 1), 0.8, device=device, dtype=torch.float32)
+    pi_p = torch.full((K, 1), 0.1, device=device, dtype=torch.float32)
+    pi_ng = torch.full((K, 1), 0.1, device=device, dtype=torch.float32)
 
     eps_conv = log(V) / 1000.0
-    old_ll = torch.full((K, 1), -1e30, device=device, dtype=torch.float64)
+    old_ll = torch.full((K, 1), -1e30, device=device, dtype=torch.float32)
     converged = torch.zeros(K, dtype=torch.bool, device=device)
 
     iterator = range(n_iter)
@@ -1200,12 +1207,12 @@ def batch_fit_ggm(
         iterator = tqdm(iterator, desc="  GGM EM", leave=True, unit="it")
 
     for it in iterator:
-        # E-step
+        # E-step (linear-space — same ops as before, now in float32)
         p_noise = pi_n * _gauss_pdf_torch(x, mu_n, var_n)
         p_pos = pi_p * _gamma_pdf_torch(x, mu_p, var_p)
         p_neg = pi_ng * _gamma_pdf_torch(neg_x, mu_ng, var_ng)
 
-        total = (p_noise + p_pos + p_neg).clamp(min=1e-30)
+        total = (p_noise + p_pos + p_neg).clamp(min=1e-32)
         r_noise = p_noise / total
         r_pos = p_pos / total
         r_neg = p_neg / total
@@ -1284,29 +1291,29 @@ def batch_fit_ggm(
     p_noise_f = pi_n * _gauss_pdf_torch(x, mu_n, var_n)
     p_pos_f = pi_p * _gamma_pdf_torch(x, mu_p, var_p)
     p_neg_f = pi_ng * _gamma_pdf_torch(neg_x, mu_ng, var_ng)
-    del neg_x  # free (K, V) float64
+    del neg_x  # free (K, V) float32
 
-    total_f = (p_noise_f + p_pos_f + p_neg_f).clamp(min=1e-30)
+    total_f = (p_noise_f + p_pos_f + p_neg_f).clamp(min=1e-32)
     del p_noise_f  # only need signal components for p_signal
-    p_signal = ((p_pos_f + p_neg_f) / total_f).float()  # (K, V)
+    p_signal = (p_pos_f + p_neg_f) / total_f  # (K, V) float32
     del p_pos_f, p_neg_f, total_f
 
     sigma_n = torch.sqrt(var_n).clamp(min=1e-8)
-    z_signed = ((x - mu_n) / sigma_n).float()  # (K, V)
-    del x  # free last (K, V) float64
+    z_signed = (x - mu_n) / sigma_n  # (K, V) float32
+    del x  # free last (K, V) float32
 
     return {
         "z_signed": z_signed,
         "p_signal": p_signal,
-        "mu_noise": mu_n.squeeze(1).float(),
-        "var_noise": var_n.squeeze(1).float(),
-        "mu_pos": mu_p.squeeze(1).float(),
-        "var_pos": var_p.squeeze(1).float(),
-        "mu_neg": mu_ng.squeeze(1).float(),
-        "var_neg": var_ng.squeeze(1).float(),
-        "pi_noise": pi_n.squeeze(1).float(),
-        "pi_pos": pi_p.squeeze(1).float(),
-        "pi_neg": pi_ng.squeeze(1).float(),
+        "mu_noise": mu_n.squeeze(1),
+        "var_noise": var_n.squeeze(1),
+        "mu_pos": mu_p.squeeze(1),
+        "var_pos": var_p.squeeze(1),
+        "mu_neg": mu_ng.squeeze(1),
+        "var_neg": var_ng.squeeze(1),
+        "pi_noise": pi_n.squeeze(1),
+        "pi_pos": pi_p.squeeze(1),
+        "pi_neg": pi_ng.squeeze(1),
         "converged": converged,
     }
 

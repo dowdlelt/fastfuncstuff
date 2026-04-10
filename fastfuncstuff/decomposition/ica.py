@@ -365,21 +365,19 @@ class FastICA:
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
 
-        # Promote to float64 for the ICA inner loop.  MELODIC uses C++
-        # doubles; with k~60 components the symmetric-decorrelation SVD on a
-        # k×k matrix accumulates enough float32 rounding to stall convergence.
-        # X is (k, V) after PCA reduction — ~110 MB in float64 for typical
-        # fMRI, well within GPU memory.
+        # X stays in its incoming dtype (float32).  The dominant (k, V) tensor
+        # would cost 2× VRAM in float64 with no benefit — the matmuls W@X and
+        # g_wx@X.T are reductions over millions of samples (no cancellation).
+        # Only the tiny k×k symmetric-decorrelation SVD needs float64, so we
+        # promote just that step inside _symmetric_decorrelation.
         orig_dtype = X.dtype
-        ica_dtype = torch.float64
-        X = X.to(ica_dtype)
 
         # Initialize unmixing matrix
         if w_init is not None:
-            W = w_init.to(device=self.device, dtype=ica_dtype)
+            W = w_init.to(device=self.device, dtype=orig_dtype)
         else:
             W = torch.randn(
-                n_components, n_features, device=self.device, dtype=ica_dtype
+                n_components, n_features, device=self.device, dtype=orig_dtype
             )
 
         # Initial symmetric decorrelation
@@ -391,13 +389,21 @@ class FastICA:
         # Optimization: pre-compute float n_samples for division
         scale = 1.0 / n_samples
 
+        # Disable TF32 for float32: Blackwell/Ampere use TF32 by default (10-bit mantissa).
+        # With tol=1e-4 and TF32 noise ~3e-4, convergence stalls or takes far more iterations.
+        # Full 23-bit float32 mantissa is needed.  No-op if not on CUDA or dtype is float64.
+        _saved_tf32_ica: bool | None = None
+        if X.device.type == "cuda" and orig_dtype == torch.float32:
+            _saved_tf32_ica = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = False
+
         # FastICA iterations
         pbar = tqdm(range(self.max_iter), desc="FastICA", leave=True,
                     disable=not getattr(self, 'verbose', True))
         for n_iter in pbar:  # noqa: B007
             W_old = W.clone()
 
-            # 1. Linear projection — all float64
+            # 1. Linear projection — (k,k) @ (k,V), fine in float32
             wx = W @ X
 
             # 2. Apply nonlinearity in-place, get g_wx and g_prime_mean
@@ -427,6 +433,10 @@ class FastICA:
                 pbar.close()
                 break
 
+        # Restore TF32 setting
+        if _saved_tf32_ica is not None:
+            torch.backends.cuda.matmul.allow_tf32 = _saved_tf32_ica
+
         # Return W in the original data dtype
         return W.to(orig_dtype), n_iter + 1
 
@@ -447,8 +457,12 @@ class FastICA:
         W_decorr : torch.Tensor, shape (n_components, n_features)
             Decorrelated weight matrix
         """
-        U, S, Vt = torch.linalg.svd(W, full_matrices=False)
-        return U @ Vt
+        # Promote to float64 for the k×k SVD only: with k~60 the eigenvalue
+        # spread can cause float32 rounding to stall convergence.  W is tiny
+        # (k×k), so this costs negligible VRAM and time.
+        orig_dtype = W.dtype
+        U, S, Vt = torch.linalg.svd(W.to(torch.float64), full_matrices=False)
+        return (U @ Vt).to(orig_dtype)
 
     @staticmethod
     def _get_nonlinearity(fun: str):
@@ -878,8 +892,10 @@ class InfoMaxICA:
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
 
+        # X stays in its incoming dtype (float32).  All InfoMax operations
+        # (W@x_block, tanh, outer products, kurtosis, Frobenius norm) are
+        # bounded and well-conditioned in float32.
         orig_dtype = X.dtype
-        X = X.to(torch.float64)
 
         # --- Constants from GIFT/EEGLAB runica.m ---
         MIN_LRATE = 1e-6
@@ -897,13 +913,13 @@ class InfoMaxICA:
             lr = 0.015 / math.log(max(n_comp, 2))
         lr = max(MIN_LRATE, min(lr, MAX_LRATE))
 
-        W = torch.eye(n_comp, device=self.device, dtype=torch.float64)
-        I_block = block * torch.eye(n_comp, device=self.device, dtype=torch.float64)
+        W = torch.eye(n_comp, device=self.device, dtype=orig_dtype)
+        I_block = block * torch.eye(n_comp, device=self.device, dtype=orig_dtype)
         initial_W = W.clone()
 
         # Extended InfoMax state
-        signs = torch.ones(n_comp, 1, device=self.device, dtype=torch.float64)
-        old_kk = torch.zeros(n_comp, device=self.device, dtype=torch.float64)
+        signs = torch.ones(n_comp, 1, device=self.device, dtype=orig_dtype)
+        old_kk = torch.zeros(n_comp, device=self.device, dtype=orig_dtype)
         signcount_interval = 1  # check every N blocks initially
         signcount_since_change = 0
         SIGNCOUNT_THRESHOLD = 25
@@ -913,6 +929,13 @@ class InfoMaxICA:
         old_delta = None
         old_change = None
         annealdeg_rad = self.anneal_deg * math.pi / 180.0
+
+        # Disable TF32 for float32 (same reason as FastICA: 10-bit mantissa
+        # is insufficient for reliable convergence).
+        _saved_tf32_infomax: bool | None = None
+        if X.device.type == "cuda" and orig_dtype == torch.float32:
+            _saved_tf32_infomax = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = False
 
         n_iter = 0
         pbar = tqdm(range(self.max_iter), desc="InfoMax ICA", leave=True,
@@ -1014,6 +1037,10 @@ class InfoMaxICA:
             "n_super_gaussian": n_super,
             "extended": self.extended,
         }
+
+        # Restore TF32 setting
+        if _saved_tf32_infomax is not None:
+            torch.backends.cuda.matmul.allow_tf32 = _saved_tf32_infomax
 
         return W.to(orig_dtype), n_iter + 1, diagnostics
 
