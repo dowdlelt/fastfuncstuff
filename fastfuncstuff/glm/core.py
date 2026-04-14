@@ -17,9 +17,20 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.design.builder import legendre_polynomials
-from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.memory import estimate_chunk_size, make_vram_debugger, bytes_per_voxel_glm
 from fastfuncstuff.utils import get_device, to_tensor
 from .xval import compute_r2_metric
+
+
+def _linalg_device(device: torch.device) -> torch.device:
+    """Return the device to use for linalg operations.
+
+    MPS does not support float64 or several LAPACK-backed routines
+    (lstsq, cholesky_solve, solve_triangular). For those ops we compute
+    on CPU and move the result back to the original device. This helper
+    makes that pattern explicit and centralised.
+    """
+    return torch.device("cpu") if device.type == "mps" else device
 
 
 class GLMResults:
@@ -223,18 +234,22 @@ def fit_glm_chunk(
         (n_voxels, n_timepoints) predicted values if requested
     """
     n_voxels, n_timepoints = data.shape
+    device = data.device
+    # MPS lacks LAPACK-backed routines; compute those on CPU, move result back.
+    ld = _linalg_device(device)
 
     # Solve beta = (X'X)^{-1} X'Y
     if cholesky_L is not None:
-        # Fast path: X'X = L L' already factored — one matmul + triangular solve
-        xty = design.T @ data.T          # (n_regressors, n_voxels)
-        betas = torch.cholesky_solve(xty, cholesky_L).T  # (n_voxels, n_regressors)
+        # Fast path: X'X = L L' already factored — one matmul + triangular solve.
+        # Compute xty on ld directly to avoid an extra MPS→CPU transfer when ld=cpu.
+        xty = design.to(ld).T @ data.to(ld).T   # (n_regressors, n_voxels)
+        betas = torch.cholesky_solve(xty, cholesky_L.to(ld)).to(device).T
     else:
         try:
-            betas = torch.linalg.lstsq(design, data.T).solution.T
+            betas = torch.linalg.lstsq(design.to(ld), data.T.to(ld)).solution.T.to(device)
         except RuntimeError:
-            Q, R = torch.linalg.qr(design)
-            betas = torch.linalg.solve_triangular(R, Q.T @ data.T, upper=True).T
+            Q, R = torch.linalg.qr(design.to(ld))
+            betas = torch.linalg.solve_triangular(R, Q.T @ data.T.to(ld), upper=True).T.to(device)
 
     # Compute predictions and residuals
     # NOTE: design @ betas.T gives (n_timepoints, n_regressors) @ (n_regressors, n_voxels) = (n_timepoints, n_voxels)
@@ -286,6 +301,7 @@ def fit_glm(
     glt_labels: list | None = None,
     glt_matrices: list | None = None,
     task_indices: list | None = None,
+    debug_memory: bool = False,
 ) -> GLMResults:
     """
     Fast GPU-accelerated GLM fitting
@@ -423,28 +439,23 @@ def fit_glm(
 
     # Determine chunk size
     if chunk_size is None:
+        # Pass max_chunk_size=n_voxels so the memory formula drives chunk size directly,
+        # uncapped by the conservative MemoryConfig.max_chunk_size_gpu default.
+        # bytes_per_voxel_glm already accounts for data + betas + residuals + intermediates
+        # (5 × n_timepoints + n_regressors), so no extra reduction is needed for CPU streaming.
         chunk_size = estimate_chunk_size(
             n_voxels=n_voxels,
             n_timepoints=total_timepoints,
             n_regressors=design_concat.shape[1],
             device=device,
             operation="glm",
+            max_chunk_size=n_voxels,
+            use_double=use_double,
         )
-
-        # When streaming from CPU, additional overhead from:
-        # 1. Copying data chunk to GPU (temporary during transfer)
-        # 2. The design_concat is already on GPU and is block-diagonal (can be large)
-        # Be more conservative to avoid OOM on the canonical fit
-        if not preload_data_to_device and device.type == "cuda":
-            # Reduce by 8x to account for all intermediates + design matrix
-            chunk_size = chunk_size // 3  # LTD, trying this to speed things up
-            chunk_size = max(500, chunk_size)  # At least 500 voxels per chunk
 
     if verbose:
         print(f"Fitting GLM: {n_voxels} voxels, {n_runs} runs, {n_task_regressors} task regressors")
         print(f"Processing in chunks of {chunk_size} voxels")
-        if not preload_data_to_device:
-            print("Streaming from CPU (reduced chunk size for memory safety)")
 
     # Also track per-run data for R² calculation
     run_boundaries = [0]
@@ -468,14 +479,14 @@ def fit_glm(
 
     # Pre-compute matrices for statistics
     xtx = design_concat.T @ design_concat
-    # No ridge regularization - match AFNI behavior (will fail if matrix is singular)
-    # Use Cholesky decomposition for symmetric positive definite X'X (2x faster than general inverse)
+    # MPS lacks LAPACK; factor on CPU for these small square matrices.
+    ld = _linalg_device(design_concat.device)
+    xtx_ld = xtx.to(ld)
     try:
-        L = torch.linalg.cholesky(xtx)
-        xtx_inv = torch.cholesky_inverse(L)
+        L = torch.linalg.cholesky(xtx_ld)
+        xtx_inv = torch.cholesky_inverse(L).to(design_concat.device)
     except torch.linalg.LinAlgError:
-        # Fallback to general inverse if Cholesky fails (rare for well-conditioned data)
-        xtx_inv = torch.linalg.inv(xtx)
+        xtx_inv = torch.linalg.inv(xtx_ld).to(design_concat.device)
 
     # Determine which columns are "task" vs "nuisance"
     # If task_indices provided (from AFNI StimBots/StimTops), use those
@@ -517,17 +528,18 @@ def fit_glm(
     # Precompute inverse for F-stat (no ridge - match AFNI behavior)
     # For Full_Fstat: need (X'X) for ALL regressors
     # For task F-stats: need (X'X) for task regressors only
+    # MPS lacks cholesky/inv — use ld (cpu on mps, device otherwise)
     try:
-        L_full = torch.linalg.cholesky(xtx_inv)
-        _xtx_inv_full_inv = torch.cholesky_inverse(L_full)  # This is X'X for all regressors
+        L_full = torch.linalg.cholesky(xtx_inv.to(ld))
+        _xtx_inv_full_inv = torch.cholesky_inverse(L_full).to(device)
     except torch.linalg.LinAlgError:
-        _xtx_inv_full_inv = torch.linalg.inv(xtx_inv)
+        _xtx_inv_full_inv = torch.linalg.inv(xtx_inv.to(ld)).to(device)
 
     try:
-        L_task = torch.linalg.cholesky(xtx_inv_task)
-        xtx_inv_task_inv = torch.cholesky_inverse(L_task)
+        L_task = torch.linalg.cholesky(xtx_inv_task.to(ld))
+        xtx_inv_task_inv = torch.cholesky_inverse(L_task).to(device)
     except torch.linalg.LinAlgError:
-        xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task)
+        xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task.to(ld)).to(device)
     n_task_params = xtx_inv_task.shape[0]
 
     # Setup GLT contrasts (if present) - compute in-loop like ARMA
@@ -576,9 +588,17 @@ def fit_glm(
 
     # Progress bar for chunks
     chunk_iterator = range(n_chunks)
-    if verbose and n_chunks > 1:
+    if verbose:
         chunk_iterator = tqdm(chunk_iterator, desc="Processing voxel chunks", unit="chunk")
 
+    _ols_dbg = make_vram_debugger(
+        device,
+        chunk_size * bytes_per_voxel_glm(total_timepoints, design_concat.shape[1]) * (dtype.itemsize // 4),
+        operation="ols_fit",
+        chunk_size=chunk_size,
+        enabled=debug_memory,
+    )
+    _ols_dbg.__enter__()
     for chunk_idx in chunk_iterator:
         start_idx = chunk_idx * chunk_size
         end_idx = min(start_idx + chunk_size, n_voxels)
@@ -877,6 +897,7 @@ def fit_glm(
         # Clear GPU cache every 10 chunks to prevent fragmentation
         if not preload_data_to_device and device.type == "cuda" and chunk_idx % 10 == 0:
             torch.cuda.empty_cache()
+    _ols_dbg.__exit__(None, None, None)
 
     # Concatenate results
     results = GLMResults()

@@ -32,6 +32,7 @@ import torch
 from tqdm.auto import tqdm
 
 from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.memory import make_vram_debugger, bytes_per_voxel_arma
 from .xval import compute_r2_metric
 
 
@@ -217,10 +218,6 @@ def check_cuda_memory_before_batch(
             ):
                 tensor_bytes = tensor.numel() * tensor.element_size()
                 persistent_mem_info[name] = tensor_bytes
-                if verbose:
-                    print(
-                        f"  Persistent GPU tensor '{name}': {tensor_bytes / 1e9:.2f} GB (already allocated)"
-                    )
 
     # Use 60% of available (leave headroom for PyTorch overhead and temporary allocations)
     # Conservative factor accounts for:
@@ -251,12 +248,6 @@ def check_cuda_memory_before_batch(
             )
 
         return new_batch
-    elif verbose:
-        # Success - batch fits!
-        print(
-            f"  ✓ Batch fits: {required_bytes / 1e9:.2f} GB needed < {usable_mem / 1e9:.2f} GB available"
-        )
-
     return batch_voxels
 
 
@@ -3271,6 +3262,7 @@ def fit_glm_arma11(
             glt_labels=glt_labels,
             glt_matrices=glt_matrices,
             task_indices=fitted_column_indices,  # Extract these columns for output
+            debug_memory=debug_memory,
         )
         if verbose:
             print("✓ OLS fit complete")
@@ -3594,6 +3586,14 @@ def fit_glm_arma11(
                 _surface_accum: torch.Tensor | None = None
                 _surface_params: list | None = None
 
+                _arma_grid_dbg = make_vram_debugger(
+                    device,
+                    batch_size * bytes_per_voxel_arma(n_timepoints, n_regressors) * (dtype.itemsize // 4),
+                    operation="arma_grid_search",
+                    chunk_size=batch_size,
+                    enabled=debug_memory,
+                )
+                _arma_grid_dbg.__enter__()
                 for batch_idx in batch_iter:
                     batch_start = batch_idx * batch_size
                     batch_end = min(batch_start + batch_size, n_voxels)
@@ -3632,6 +3632,7 @@ def fit_glm_arma11(
                     results.reml_likelihood[batch_start:batch_end] = (
                         best_lik_batch.cpu()
                     )
+                _arma_grid_dbg.__exit__(None, None, None)
 
                 # Store likelihood surface in results if computed
                 if save_profile_likelihoods and _surface_accum is not None:
@@ -3795,6 +3796,14 @@ def fit_glm_arma11(
                 eye_group = torch.eye(n_regressors, device=device, dtype=dtype)
 
             # Process each sub-batch within this (a,b) group
+            _gls_dbg = make_vram_debugger(
+                device,
+                sub_batch_size * bytes_per_voxel_arma(n_timepoints, n_regressors) * (dtype.itemsize // 4),
+                operation="gls_fitting",
+                chunk_size=sub_batch_size,
+                enabled=debug_memory and group_idx == 0,  # only report for first group
+            )
+            _gls_dbg.__enter__()
             for sub_batch_idx in range(n_sub_batches):
                 sub_start = sub_batch_idx * sub_batch_size
                 sub_end = min(sub_start + sub_batch_size, n_group_voxels)
@@ -4541,36 +4550,9 @@ def fit_glm_arma11(
                 # Aggressive GPU cache clearing after each sub-batch (helps on smaller GPUs)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+            _gls_dbg.__exit__(None, None, None)
 
             # End of sub-batch loop - all voxels for this (a,b) group processed
-
-            # Print timing summary for this group (first 3 groups only to avoid spam)
-            if verbose and group_idx < 3:
-                print(
-                    f"\n  Group {group_idx + 1} timing ({n_group_voxels:,} voxels, {n_sub_batches} batches):"
-                )
-                print(f"    QR setup:     {t_qr:6.2f}s (once per group)")
-                print(
-                    f"    Prewhiten:    {t_prewhiten_total:6.2f}s ({t_prewhiten_total / n_sub_batches:.3f}s/batch)"
-                )
-                print(
-                    f"    QR solve:     {t_qr_solve_total:6.2f}s ({t_qr_solve_total / n_sub_batches:.3f}s/batch)"
-                )
-                print(
-                    f"    Statistics:   {t_stats_total:6.2f}s ({t_stats_total / n_sub_batches:.3f}s/batch)"
-                )
-                if glt_contrasts_tensor is not None and n_contrasts > 0:
-                    print(
-                        f"    GLT ({n_contrasts}):     {t_glt_total:6.2f}s ({t_glt_total / n_sub_batches:.3f}s/batch)"
-                    )
-                total_group_time = (
-                    t_qr
-                    + t_prewhiten_total
-                    + t_qr_solve_total
-                    + t_stats_total
-                    + t_glt_total
-                )
-                print(f"    Total:        {total_group_time:6.2f}s\n")
 
             # Delete group-level precomputed matrices to free GPU memory for next group
             del L_chol, X_w

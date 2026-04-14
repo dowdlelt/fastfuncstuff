@@ -778,6 +778,7 @@ def analyze_from_design_matrix(
             r2_partial_mode=r2_partial_mode,
             want_r2_semipartial=want_r2_semipartial,
             r2_semipartial_mode=r2_semipartial_mode,
+            debug_memory=debug_memory,
         )
 
     elif method == "arma11":

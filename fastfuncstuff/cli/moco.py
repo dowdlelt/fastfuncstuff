@@ -172,6 +172,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[0, 1, 2],
         help="Verbosity: 0=quiet, 1=normal, 2=debug",
     )
+    hw_group.add_argument(
+        "-debug_memory",
+        action="store_true",
+        help="Print VRAM usage vs. prediction after registration and resampling loops",
+    )
 
     args = parser.parse_args(argv)
     return args
@@ -238,6 +243,7 @@ def main(argv: list[str] | None = None) -> None:
         compile=not args.no_compile,
         device=str(device),
         verb=verb,
+        debug_memory=args.debug_memory,
     )
 
     # --- Run motion correction ---

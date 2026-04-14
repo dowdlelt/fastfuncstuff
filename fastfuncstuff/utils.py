@@ -5,6 +5,7 @@ Device management and helper functions
 
 from __future__ import annotations
 
+import os
 import platform
 import warnings
 from typing import TYPE_CHECKING
@@ -146,10 +147,16 @@ def configure_torch_backends(device: torch.device) -> None:
     Sets:
       - float32 matmul precision to 'high' (use TF32 on Ampere+)
       - cudnn.benchmark = True (autotuner for convolutions)
+      - CPU thread count to physical core count (for CPU and MPS fallback paths)
     """
     torch.set_float32_matmul_precision("high")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+    # Always maximize CPU thread utilization — CPU is used as the linalg
+    # fallback when on MPS, and is the primary compute device when device=cpu.
+    n_cpu = os.cpu_count() or 1
+    torch.set_num_threads(n_cpu)
+    torch.set_num_interop_threads(min(4, n_cpu))
 
 
 def calc_memory_usage(shape: tuple, dtype: torch.dtype = torch.float32) -> float:

@@ -1152,7 +1152,7 @@ def parse_device_arg(
         except ValueError as err:
             raise ValueError(
                 f"Invalid device specification: {device_spec}. "
-                "Expected format: 'cpu', 'cuda', 'cpu,N', or 'cuda,N'"
+                "Expected format: 'cpu', 'cuda', 'cpu,N', 'cuda,N', or 'mps'"
             ) from err
 
     # Create device
@@ -1163,8 +1163,10 @@ def parse_device_arg(
             device = torch.device(f"cuda:{cuda_device_id}")
         else:
             device = torch.device("cuda")
+    elif device_type == "mps":
+        device = torch.device("mps")
     else:
-        raise ValueError(f"Unknown device type: {device_type}. Use 'cpu' or 'cuda'.")
+        raise ValueError(f"Unknown device type: {device_type}. Use 'cpu', 'cuda', or 'mps'.")
 
     return device, cpu_threads_override, cuda_device_id
 

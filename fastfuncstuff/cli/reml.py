@@ -796,6 +796,18 @@ def main():
     import os
 
     device, cpu_threads_override, cuda_device_id = parse_device_arg(args.device)
+
+    # MPS does not support float64. ARMA(1,1) requires float64 for numerical
+    # stability (see CLAUDE.md §8), so fall back to CPU automatically.
+    if device.type == "mps" and args.use_double:
+        import warnings
+        warnings.warn(
+            "MPS does not support float64. -use_double requires CPU; "
+            "switching to device=cpu. Use -device cpu to suppress this warning.",
+            stacklevel=1,
+        )
+        device = torch.device("cpu")
+
     configure_torch_backends(device)
 
     # Configure CPU threading for maximum performance
