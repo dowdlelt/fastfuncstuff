@@ -26,12 +26,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-data-dir", type=str, default=None,
         help="Path to ds005165-download directory. Default: auto-detect.",
     )
+    from ..benchmark.stages import STAGE_MAP as _STAGE_MAP
+    _stage_names = ",".join(_STAGE_MAP)
     parser.add_argument(
         "-stages", type=str, default=None,
-        help="Comma-separated stage names "
-             "(moco,slicetime,crossalign,align,warp,glm,ica,ica_single,"
-             "glmsingle_prep,glmsingle_matlab,glmsingle_hrf,"
-             "glmsingle_denoise,glmsingle_ridge). Default: all.",
+        help=f"Comma-separated stage names ({_stage_names}). Default: all.",
     )
     parser.add_argument(
         "-validate-only", action="store_true",
@@ -89,6 +88,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-dry_run", action="store_true",
         help="Preview -import-cache or -remove-cache without writing changes.",
+    )
+    parser.add_argument(
+        "-device", type=str, default=None,
+        help="PyTorch device passed to FFS tools: cpu, cuda, mps (default: auto-detect).",
+    )
+    parser.add_argument(
+        "-verbose", action="store_true",
+        help="Stream full subprocess output (stdout + stderr) for each FFS/AFNI call. "
+             "Useful for seeing MPS fallback warnings and other diagnostic messages.",
     )
 
     args = parser.parse_args(argv)
@@ -186,11 +194,17 @@ def main(argv: list[str] | None = None) -> int:
         force_ref=args.force_ref or force_all,
         force_ffs=args.force_ffs or force_all,
         validate_only=args.validate_only,
+        device=args.device,
+        show_output=args.verbose,
     )
 
     print(f"Data directory: {data_dir}")
     print(f"Stages: {', '.join(s.name for s in stages)}")
     print(f"Mode: {'validate-only' if ctx.validate_only else 'full'}")
+    if ctx.device:
+        print(f"Device: {ctx.device}")
+    if ctx.show_output:
+        print("Verbose: streaming subprocess output")
 
     # Run
     results = run_stages(stages, ctx)

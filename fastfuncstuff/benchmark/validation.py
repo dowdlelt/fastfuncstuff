@@ -166,11 +166,11 @@ def compare_timeseries_4d(
         b_flat = b_flat[:, idx]
         n_vox = n_sample
 
-    # Pearson r per voxel
+    # Pearson r per voxel (population std, correction=0, so denominator nt is consistent)
     a_z = a_flat - a_flat.mean(0, keepdim=True)
     b_z = b_flat - b_flat.mean(0, keepdim=True)
-    a_std = a_z.std(0)
-    b_std = b_z.std(0)
+    a_std = a_z.std(0, correction=0)
+    b_std = b_z.std(0, correction=0)
     valid = (a_std > 1e-8) & (b_std > 1e-8)
 
     r_vals = torch.zeros(n_vox)
@@ -464,4 +464,100 @@ def compare_bucket_volumes(
         "mean_r": float(np.mean(r_vals)) if r_vals else 0.0,
         "min_r": float(np.min(r_vals)) if r_vals else 0.0,
         "n_bricks": len(results),
+    }
+
+
+def compare_im_bucket(
+    a_path: str | Path,
+    b_path: str | Path,
+    mask_path: str | Path | None = None,
+) -> dict:
+    """Compare IM-model GLM bucket files (F-stat + beta/t-stat pairs).
+
+    Expected bucket layout (both AFNI and ffs_reml -tout):
+        vol 0:    Full-model F-stat
+        vol 1:    beta event-1
+        vol 2:    t-stat event-1
+        vol 3:    beta event-2
+        vol 4:    t-stat event-2
+        ...
+
+    Validation:
+        - F-stat: spatial correlation between AFNI and FFS volumes.
+        - Betas:  per-sub-brick spatial r AND voxelwise "temporal" r
+          (treating the ordered beta volumes as a pseudo-timeseries per voxel).
+        - T-stats: same as betas.
+
+    Returns a dict with separate sub-dicts for fstat, betas, and tstats,
+    each containing mean_r, min_r, and (for betas/tstats) temporal_median_r.
+    """
+    a, _ = _load_vol(a_path)
+    b, _ = _load_vol(b_path)
+
+    if a.dim() == 4:
+        a = a.permute(3, 0, 1, 2)   # (n_bricks, x, y, z)
+    elif a.dim() == 3:
+        a = a.unsqueeze(0)
+    if b.dim() == 4:
+        b = b.permute(3, 0, 1, 2)
+    elif b.dim() == 3:
+        b = b.unsqueeze(0)
+
+    n = min(a.shape[0], b.shape[0])
+
+    if mask_path is not None:
+        mask_vol, _ = _load_vol(mask_path)
+        mask = mask_vol > 0.5
+    else:
+        mask = _automask(a[0])
+
+    def _spatial_r(vol_a: Tensor, vol_b: Tensor) -> float:
+        from ..stats.spatial import spatial_correlation
+        return float(spatial_correlation(vol_a, vol_b, mask=mask, method="pearson"))
+
+    def _temporal_r(vols_a: Tensor, vols_b: Tensor) -> float:
+        """Voxelwise correlation across the volume axis (pseudo-temporal)."""
+        # vols: (n_vols, x, y, z) → flatten to (n_vols, n_vox_masked)
+        mask_flat = mask.reshape(-1)
+        a_flat = vols_a.reshape(vols_a.shape[0], -1)[:, mask_flat].float()
+        b_flat = vols_b.reshape(vols_b.shape[0], -1)[:, mask_flat].float()
+        n_t = a_flat.shape[0]
+        a_z = a_flat - a_flat.mean(0, keepdim=True)
+        b_z = b_flat - b_flat.mean(0, keepdim=True)
+        std_a = a_z.std(0, correction=0)
+        std_b = b_z.std(0, correction=0)
+        valid = (std_a > 1e-8) & (std_b > 1e-8)
+        if not valid.any():
+            return 0.0
+        r_vox = (a_z[:, valid] * b_z[:, valid]).sum(0) / (std_a[valid] * std_b[valid] * n_t)
+        return float(np.median(r_vox.numpy()))
+
+    # F-stat (vol 0)
+    fstat = {"r": _spatial_r(a[0], b[0])}
+
+    # Separate even/odd sub-bricks (starting from vol 1)
+    beta_idx  = list(range(1, n, 2))   # 1, 3, 5, ...
+    tstat_idx = list(range(2, n, 2))   # 2, 4, 6, ...
+
+    def _brick_stats(indices: list[int]) -> dict:
+        if not indices:
+            return {"mean_r": 0.0, "min_r": 0.0, "temporal_median_r": 0.0, "n": 0}
+        r_vals = [_spatial_r(a[i], b[i]) for i in indices]
+        vols_a = torch.stack([a[i] for i in indices])
+        vols_b = torch.stack([b[i] for i in indices])
+        return {
+            "mean_r": float(np.mean(r_vals)),
+            "min_r":  float(np.min(r_vals)),
+            "temporal_median_r": _temporal_r(vols_a, vols_b),
+            "n": len(indices),
+        }
+
+    beta_stats  = _brick_stats(beta_idx)
+    tstat_stats = _brick_stats(tstat_idx)
+
+    return {
+        "fstat": fstat,
+        "betas": beta_stats,
+        "tstats": tstat_stats,
+        "n_bricks_compared": n,
     }

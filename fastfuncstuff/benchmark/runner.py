@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Module-level flag: print subprocess stdout/stderr when True.
+# Set by run_stages() from ctx.show_output so all stage run_timed() calls
+# inherit it without needing to thread the flag through every call site.
+_show_output: bool = False
 
 
 @dataclass
@@ -20,6 +26,12 @@ class BenchmarkContext:
     force_ffs: bool = False
     validate_only: bool = False
     verbose: bool = True
+    device: str | None = None   # PyTorch device to pass to FFS tools (e.g. "mps", "cpu")
+    show_output: bool = False   # Stream subprocess stdout/stderr when True
+
+    def ffs_device_flag(self) -> str:
+        """Return ' -device <device>' for appending to FFS CLI command strings, or ''."""
+        return f" -device {self.device}" if self.device else ""
 
     def __post_init__(self):
         self.data_dir = self.data_dir.resolve()
@@ -175,6 +187,16 @@ def run_timed(
     )
     elapsed = time.monotonic() - start
 
+    # When verbose output is requested, stream stdout/stderr regardless of
+    # success — this surfaces MPS warnings, deprecation notices, etc.
+    if _show_output:
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+            sys.stdout.flush()
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+            sys.stderr.flush()
+
     if result.returncode != 0:
         stderr_tail = result.stderr[-500:] if result.stderr else "(no stderr)"
         raise RuntimeError(
@@ -273,6 +295,8 @@ def run_stages(
         - run_ref(ctx) -> float  (reference tool: AFNI, melodic, MATLAB, etc.)
         - run_ffs(ctx) -> float  (FFS tool)
     """
+    global _show_output
+    _show_output = ctx.show_output
     results = []
     stage_timings = {}
 

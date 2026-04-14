@@ -129,7 +129,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 f"-weight_automask -base 0 "
                 f"-1Dfile {_ffs_motion_path(ctx, task, run)} "
                 f"-1Dmatrix_save {out.replace('.nii', '_mat.aff12.1D')} "
-                f"-prefix {out} -save_mean",
+                f"-prefix {out} -save_mean"
+                f"{ctx.ffs_device_flag()}",
                 label=f"ffs_moco {task} run-{run}",
                 cwd=ctx.processing_dir,
             )

@@ -90,8 +90,7 @@ def _prepare_timing_files(ctx: BenchmarkContext) -> None:
         return
     timing_dir.mkdir(exist_ok=True)
     events = " ".join(
-        str(ctx.func_dir / f"sub-01_ses-01_task-localizer_run-{r}_events.tsv")
-        for r in RUNS
+        str(ctx.func_dir / f"sub-01_ses-01_task-localizer_run-{r}_events.tsv") for r in RUNS
     )
     run_timed(
         f"timing_tool.py -write_multi_timing {timing_dir}/onsets.localizer. "
@@ -171,12 +170,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     ffs_ols = ffs / "stats_localizer.nii.gz"
     if not ffs_ols.exists() or ctx.force_ffs:
         elapsed, _ = run_timed(
-            f"ffs_reml "
-            f"-input {inputs} "
-            f"-matrix {xmat} "
-            f"-use_double "
-            f"-Obuck {ffs_ols} "
-            f"-tout",
+            f"ffs_reml -input {inputs} -matrix {xmat} -Obuck {ffs_ols} -tout"
+            f"{ctx.ffs_device_flag()}",
             label="ffs_reml OLS",
             cwd=ffs,
         )
@@ -187,13 +182,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     ffs_var = ffs / "stats_localizer_REML_var.nii.gz"
     if not ffs_reml.exists() or ctx.force_ffs:
         elapsed, _ = run_timed(
-            f"ffs_reml "
-            f"-input {inputs} "
-            f"-matrix {xmat} "
-            f"-use_double "
-            f"-Rbuck {ffs_reml} "
-            f"-Rvar {ffs_var} "
-            f"-tout",
+            f"ffs_reml -input {inputs} -matrix {xmat} -Rbuck {ffs_reml} -Rvar {ffs_var} -tout"
+            f"{ctx.ffs_device_flag()}",
             label="ffs_reml REML",
             cwd=ffs,
         )
