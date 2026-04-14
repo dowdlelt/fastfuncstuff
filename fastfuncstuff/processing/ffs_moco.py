@@ -18,6 +18,8 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from fastfuncstuff.memory import compute_moco_resample_batch_size, make_vram_debugger
+
 # Suppress PyTorch internal deprecation warnings from torch.compile
 warnings.filterwarnings(
     "ignore", message=".*torch._prims_common.check.*", category=FutureWarning
@@ -26,6 +28,7 @@ warnings.filterwarnings(
 from .affine import (  # noqa: E402
     _build_homo_coords,
     apply_affine_interp,
+    apply_affine_interp_batched,
     apply_affine_wsinc5,
     identity_params,
     matrix_to_params,
@@ -66,6 +69,7 @@ class MocoConfig:
     compile: bool = True  # Use torch.compile for hot path (CUDA only)
     device: str | None = None
     verb: int = 1
+    debug_memory: bool = False
     quad_filter_size: int = 7
     quad_center_freq: float = math.pi / 3.0
     quad_bandwidth: float = 2.0
@@ -513,12 +517,25 @@ def save_moco_1D(
         params_array: (nt, 6) array of [dx, dy, dz, rz, rx, ry] in DICOM space.
         path: output file path.
     """
+    # TODO(sign-convention): benchmark shows pitch, yaw, dL, dP are anti-correlated
+    # with AFNI 3dvolreg (~-0.97) while roll and dS are correctly correlated (+0.94, +0.998).
+    # Hypothesis: all six AFNI .1D params should be the NEGATIVE of the DICOM transform params
+    # (transform corrects motion; .1D reports the motion itself). The z-axis params happen to
+    # be correct because D33=diag(-1,-1,1) does NOT negate z, so -dz_DICOM and -rz_DICOM
+    # accidentally match AFNI's sign. The x,y params need the same negation:
+    #   dL = -dx_DICOM  (not +dx_DICOM)
+    #   dP = -dy_DICOM  (not +dy_DICOM)
+    #   pitch = -rx_DICOM  (not +rx_DICOM)
+    #   yaw   = -ry_DICOM  (not +ry_DICOM)
+    # Verify by running 3dvolreg on a synthetic volume with a known 1mm x-translation
+    # and checking the sign of the output dL column. See docs/OUTSTANDING_ISSUES.md.
     with open(path, "w") as f:
         for t in range(params_array.shape[0]):
             dx, dy, dz = params_array[t, 0], params_array[t, 1], params_array[t, 2]
             rz, rx, ry = params_array[t, 3], params_array[t, 4], params_array[t, 5]
             # AFNI format: roll pitch yaw dS dL dP
             # Mapping: roll=-rz, pitch=rx, yaw=ry, dS=-dz, dL=dx, dP=dy
+            # TODO(sign-convention): pitch/yaw/dL/dP signs are likely wrong — see comment above
             f.write(
                 f"  {-rz:8.4f}  {rx:8.4f}  {ry:8.4f}"
                 f"  {-dz:8.4f}  {dx:8.4f}  {dy:8.4f}\n"
@@ -566,12 +583,16 @@ def save_moco_dfile(
         rms_after: (nt,) RMS after alignment.
         path: output file path.
     """
+    # TODO(sign-convention): same sign issue as save_moco_1D — pitch, yaw, dL, dP
+    # are likely written with wrong sign. See the block comment in save_moco_1D and
+    # docs/OUTSTANDING_ISSUES.md.
     with open(path, "w") as f:
         for t in range(params_array.shape[0]):
             dx, dy, dz = params_array[t, 0], params_array[t, 1], params_array[t, 2]
             rz, rx, ry = params_array[t, 3], params_array[t, 4], params_array[t, 5]
             # AFNI format: roll pitch yaw dS dL dP
             # Mapping: roll=-rz, pitch=rx, yaw=ry, dS=-dz, dL=dx, dP=dy
+            # TODO(sign-convention): pitch/yaw/dL/dP signs are likely wrong — see save_moco_1D
             f.write(
                 f"  {t:4d}  {-rz:8.4f}  {rx:8.4f}  {ry:8.4f}"
                 f"  {-dz:8.4f}  {dx:8.4f}  {dy:8.4f}"
@@ -815,6 +836,11 @@ def moco(
     )
 
     # ── Pass 1: estimate parameters ──────────────────────────────────────
+    _vol_bytes = nz * ny * nx * 4 * 10  # base + source + Jacobian intermediates (rough)
+    _reg_dbg = make_vram_debugger(
+        device, _vol_bytes, operation="moco_registration", chunk_size=1, enabled=config.debug_memory
+    )
+    _reg_dbg.__enter__()
     for t in pbar:
         # Mark step begin for CUDA graphs (prevents output tensor reuse issues)
         if use_cudagraphs:
@@ -1053,6 +1079,8 @@ def moco(
     if not disable_pbar:
         pbar.close()
 
+    _reg_dbg.__exit__(None, None, None)
+
     if config.verb >= 1:
         elapsed = time.time() - t_start
         per_vol = elapsed / max(nt - 1, 1)
@@ -1060,29 +1088,61 @@ def moco(
 
     # ── Pass 2: batch resample with final interpolation ────────────────
     t_resample = time.time()
+
+    batch_size = compute_moco_resample_batch_size(
+        nz, ny, nx, nt, device, interp=config.final_interp
+    )
+    if config.verb >= 1:
+        print(f"  Resampling batch size: {batch_size} volumes")
+
+    # Indices that need actual resampling (base volume is just copied)
+    base_copy_idx = config.base_index if base_vol is None else -1
+
+    _resample_dbg = make_vram_debugger(
+        device, nz * ny * nx * 4 * (3 + batch_size), operation="moco_resample",
+        chunk_size=batch_size, enabled=config.debug_memory
+    )
+    _resample_dbg.__enter__()
+
     resample_pbar = tqdm(
-        range(nt),
+        range(0, nt, batch_size),
         desc="  Resampling",
         disable=disable_pbar,
-        unit="vol",
+        unit="batch",
         ncols=80,
     )
 
-    for t in resample_pbar:
-        if t == config.base_index and base_vol is None:
-            aligned[t] = timeseries[t]
-            rms_after[t] = 0.0
+    for batch_start in resample_pbar:
+        batch_end = min(batch_start + batch_size, nt)
+
+        # Separate base-copy volumes from volumes that need resampling
+        resample_indices = [
+            t for t in range(batch_start, batch_end) if t != base_copy_idx
+        ]
+        for t in range(batch_start, batch_end):
+            if t == base_copy_idx:
+                aligned[t] = timeseries[t]
+                rms_after[t] = 0.0
+
+        if not resample_indices:
             continue
 
-        source = timeseries[t].to(device=device, dtype=dtype)
-        mat = matrices_vox[t].to(device=device, dtype=dtype)
+        # Load batch to GPU and run batched resampling
+        sources_batch = torch.stack(
+            [timeseries[t].to(device=device, dtype=dtype) for t in resample_indices]
+        )
+        matrices_batch = matrices_vox[resample_indices].to(device=device, dtype=dtype)
 
-        aligned_vol = apply_affine_interp(
-            source, mat, config.final_interp, vol_shape, zero_outside=True
+        aligned_batch = apply_affine_interp_batched(
+            sources_batch, matrices_batch, config.final_interp, vol_shape,
+            zero_outside=True
         )
 
-        aligned[t] = aligned_vol.cpu()
-        rms_after[t] = _unweighted_rms(base_est, aligned_vol)
+        for i, t in enumerate(resample_indices):
+            aligned[t] = aligned_batch[i].cpu()
+            rms_after[t] = _unweighted_rms(base_est, aligned_batch[i])
+
+    _resample_dbg.__exit__(None, None, None)
 
     if not disable_pbar:
         resample_pbar.close()

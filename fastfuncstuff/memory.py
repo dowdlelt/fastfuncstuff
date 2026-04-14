@@ -30,7 +30,10 @@ The configuration applies to all chunk size calculations automatically.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import threading
+import time
 from dataclasses import dataclass
 
 import torch
@@ -543,6 +546,62 @@ def bytes_per_voxel_arma(
     # Per-voxel: betas, residuals, likelihood
     # This is just a rough estimate - actual ARMA uses grid-specific logic
     return (8 * n_timepoints + 2 * n_regressors + max_lag) * 4
+
+
+def compute_moco_resample_batch_size(
+    nz: int,
+    ny: int,
+    nx: int,
+    nt: int,
+    device: torch.device,
+    interp: str = "wsinc5",
+) -> int:
+    """Compute batch size for Pass 2 motion-correction resampling.
+
+    In the batched Pass 2 loop we preload B source volumes to the GPU,
+    compute all B coordinate transforms in a single batched matmul, then
+    loop through the B volumes calling the separable resampling kernel.
+
+    Per-batch GPU memory:
+      - B source volumes:   B * nz*ny*nx * 4 bytes
+      - B output volumes:   B * nz*ny*nx * 4 bytes
+      - B coord transforms (src_x, src_y, src_z):  B * 3 * nz*ny*nx * 4 bytes
+      → per-volume cost: 5 * vol_bytes
+
+    One-time kernel overhead (constant, independent of B):
+      - z_results, y_results, x_vals, weights, index arrays: ~6*ntaps * vol_bytes
+
+    Parameters
+    ----------
+    nz, ny, nx : int
+        Spatial dimensions of one volume.
+    nt : int
+        Total number of timepoints (caps the batch size).
+    device : torch.device
+        Target compute device.
+    interp : str
+        Interpolation method; determines ntaps (wsinc5→11, heptic→8,
+        quintic→6, cubic→4, linear→1).
+
+    Returns
+    -------
+    int
+        Batch size (number of volumes per GPU batch), at least 1.
+    """
+    _ntaps = {"wsinc5": 11, "heptic": 8, "quintic": 6, "cubic": 4, "linear": 1}
+    ntaps = _ntaps.get(interp, 11)
+
+    vol_bytes = nz * ny * nx * 4  # float32
+    per_vol_bytes = 5 * vol_bytes
+    kernel_overhead_bytes = 6 * ntaps * vol_bytes
+
+    available = get_available_memory(device)
+    usable = available - kernel_overhead_bytes
+    if usable <= 0:
+        return 1
+
+    batch_size = max(1, min(nt, usable // per_vol_bytes))
+    return batch_size
 
 
 def estimate_nordic_llr_memory(
@@ -1078,3 +1137,193 @@ def estimate_keep_on_cpu(
     else:
         # CPU or MPS - use threshold
         return data_size_gb > data_threshold_gb
+
+
+class VRAMDebugger:
+    """
+    Context manager that samples peak GPU allocation during chunk processing
+    and compares it to the memory module's prediction.
+
+    Sampling uses ``torch.cuda.memory_allocated()`` from a background daemon
+    thread.  That call reads PyTorch's internal allocator counter — an atomic
+    read with no CUDA driver interaction and no GPU synchronisation.  Overhead
+    is in the microsecond range per sample; the thread sleeps between samples.
+
+    Parameters
+    ----------
+    device : torch.device
+        CUDA device to monitor.
+    predicted_peak_bytes : int
+        Expected peak allocation for one chunk (``chunk_size × bytes_per_voxel``).
+    operation : str
+        Label for the report header (e.g. ``"glm"``, ``"xval"``).
+    chunk_size : int
+        Chunk size used, for reporting.
+    sample_ms : float, default=25
+        Sampling interval in milliseconds.  25ms catches peaks in operations
+        that take > ~50ms; lower it if chunks are very fast.
+
+    Examples
+    --------
+    As a context manager around the chunk loop::
+
+        predicted = chunk_size * bytes_per_voxel_glm(n_tp, n_reg)
+        with VRAMDebugger(device, predicted, operation="glm", chunk_size=chunk_size):
+            for start in range(0, n_voxels, chunk_size):
+                chunk = data[start : start + chunk_size].to(device)
+                results[start : start + chunk_size] = fit_glm_chunk(chunk, design).cpu()
+
+    Or use ``make_vram_debugger()`` so the same code path is a no-op when
+    debug mode is off.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        predicted_peak_bytes: int,
+        operation: str = "unknown",
+        chunk_size: int = 0,
+        sample_ms: float = 25.0,
+    ) -> None:
+        if device.type != "cuda":
+            raise ValueError("VRAMDebugger only supports CUDA devices")
+        self.device = device
+        self.predicted_peak_bytes = predicted_peak_bytes
+        self.operation = operation
+        self.chunk_size = chunk_size
+        self._sample_interval = sample_ms / 1000.0
+        self._baseline: int = 0
+        self._peak: int = 0
+        self._n_samples: int = 0
+        self._running: bool = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Flush pending GPU work, snapshot baseline, start sampling thread."""
+        torch.cuda.synchronize(self.device)  # flush queued ops so baseline is clean
+        self._baseline = torch.cuda.memory_allocated(self.device)
+        self._peak = self._baseline
+        self._n_samples = 0
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._sample_loop, daemon=True, name="ffs-vram-debug"
+        )
+        self._thread.start()
+
+    def stop(self) -> dict[str, float]:
+        """Stop the sampling thread and print the comparison report."""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        return self.report()
+
+    def _sample_loop(self) -> None:
+        # Hot loop: atomic read + compare, then sleep.
+        # torch.cuda.memory_allocated() never touches the CUDA driver.
+        while self._running:
+            current = torch.cuda.memory_allocated(self.device)
+            if current > self._peak:
+                self._peak = current
+            self._n_samples += 1
+            time.sleep(self._sample_interval)
+
+    def report(self) -> dict[str, float]:
+        """Print comparison and return a stats dict."""
+        _gb = 1024**3
+        net_peak = self._peak - self._baseline
+        predicted = self.predicted_peak_bytes
+        ratio = net_peak / predicted if predicted > 0 else float("nan")
+
+        if ratio < 0.5:
+            verdict = "VERY CONSERVATIVE — model over-predicted >2x; chunk size could be larger"
+        elif ratio < 0.8:
+            verdict = "conservative — safely under-utilized"
+        elif ratio <= 1.05:
+            verdict = "accurate — model matched reality"
+        elif ratio <= 1.25:
+            verdict = "TIGHT — model under-predicted; within 25%, watch for OOM on other hardware"
+        else:
+            verdict = "UNDER-PREDICTED — actual exceeded model; OOM risk was real"
+
+        print(f"\n[VRAM DEBUG] operation={self.operation}  chunk_size={self.chunk_size:,}")
+        print(f"  Baseline (pre-loop):    {self._baseline / _gb:.3f} GB")
+        print(f"  Peak (during loop):     {self._peak / _gb:.3f} GB")
+        print(f"  Net delta:              {net_peak / _gb:.3f} GB")
+        print(f"  Model predicted:        {predicted / _gb:.3f} GB")
+        print(f"  Ratio actual/predicted: {ratio:.2f}x  →  {verdict}")
+        print(f"  Samples: {self._n_samples} @ {self._sample_interval * 1000:.0f} ms intervals")
+
+        return {
+            "baseline_gb": self._baseline / _gb,
+            "peak_gb": self._peak / _gb,
+            "net_peak_gb": net_peak / _gb,
+            "predicted_gb": predicted / _gb,
+            "ratio": ratio,
+            "n_samples": self._n_samples,
+        }
+
+    def __enter__(self) -> "VRAMDebugger":
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
+
+
+def make_vram_debugger(
+    device: torch.device,
+    predicted_peak_bytes: int,
+    operation: str = "unknown",
+    chunk_size: int = 0,
+    enabled: bool | None = None,
+    sample_ms: float = 25.0,
+) -> "VRAMDebugger | contextlib.AbstractContextManager[None]":
+    """
+    Return a :class:`VRAMDebugger` when debug mode is active, otherwise a
+    no-op context manager.  Use this so a single code path handles both modes.
+
+    Parameters
+    ----------
+    device : torch.device
+    predicted_peak_bytes : int
+        Predicted peak bytes for one chunk (``chunk_size × bytes_per_voxel``).
+    operation : str
+        Label for the report.
+    chunk_size : int
+        Chunk size, for the report.
+    enabled : bool, optional
+        If ``None``, checks the ``FFS_DEBUG_VRAM`` environment variable
+        (any non-empty value other than ``"0"``, ``"false"``, or ``"no"``
+        activates it).  Pass ``True`` / ``False`` to override.
+    sample_ms : float, default=25
+        Sampling interval passed to :class:`VRAMDebugger`.
+
+    Returns
+    -------
+    context manager
+        Wrap your chunk loop with ``with make_vram_debugger(...): ...``.
+
+    Examples
+    --------
+    In a CLI that accepts ``-debug``::
+
+        dbg = make_vram_debugger(
+            device, chunk_size * bytes_per_voxel_glm(n_tp, n_reg),
+            operation="glm", chunk_size=chunk_size,
+            enabled=args.debug,
+        )
+        with dbg:
+            for start in range(0, n_voxels, chunk_size):
+                ...
+
+    Via environment variable (no code change needed)::
+
+        FFS_DEBUG_VRAM=1 ffs_ridge -input data.nii.gz ...
+    """
+    if enabled is None:
+        raw = os.environ.get("FFS_DEBUG_VRAM", "0").strip().lower()
+        enabled = raw not in ("", "0", "false", "no")
+
+    if enabled and device.type == "cuda":
+        return VRAMDebugger(device, predicted_peak_bytes, operation, chunk_size, sample_ms)
+    return contextlib.nullcontext()

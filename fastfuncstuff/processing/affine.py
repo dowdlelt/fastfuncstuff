@@ -547,6 +547,71 @@ def apply_affine_interp(
     return result
 
 
+def apply_affine_interp_batched(
+    sources: Tensor,
+    matrices: Tensor,
+    interp: str = "heptic",
+    output_shape: tuple[int, int, int] | None = None,
+    zero_outside: bool = False,
+) -> Tensor:
+    """Resample a batch of volumes with a batch of affine transforms.
+
+    Builds the coordinate grid once and computes all B transforms via a
+    single batched matmul, then loops calling the per-volume separable
+    kernel.  For Pass 2 moco resampling the cost is dominated by the
+    kernel, but this eliminates B repeated grid-builds and transfers.
+
+    Args:
+        sources: (B, nz, ny, nx) source volumes, already on device.
+        matrices: (B, 4, 4) affine matrices in voxel index space.
+        interp: interpolation method ("linear", "cubic", "quintic",
+            "heptic", "wsinc5").
+        output_shape: (nz, ny, nx) of output grid. Defaults to source shape.
+        zero_outside: If True, zero voxels that map outside the source.
+
+    Returns:
+        (B, nz, ny, nx) resampled volumes.
+    """
+    B = sources.shape[0]
+    device = sources.device
+    dtype = sources.dtype
+    snz, sny, snx = sources.shape[1:]
+    onz, ony, onx = output_shape if output_shape is not None else (snz, sny, snx)
+    N = onz * ony * onx
+
+    # Build output coord grid once: (4, N)
+    coords = _build_homo_coords((onz, ony, onx), device, dtype)
+
+    # Batched coord transform: (B, 4, 4) @ (4, N) → (B, 4, N)
+    # Expand coords to (1, 4, N) then broadcast via bmm
+    src_coords = torch.bmm(matrices, coords.unsqueeze(0).expand(B, -1, -1))  # (B, 4, N)
+
+    results = torch.zeros(B, onz, ony, onx, device=device, dtype=dtype)
+
+    if interp == "linear":
+        for b in range(B):
+            M = matrices[b]
+            results[b] = apply_affine(sources[b], M, output_shape, zero_outside=zero_outside)
+        return results
+
+    for b in range(B):
+        src_x = src_coords[b, 0].reshape(onz, ony, onx)
+        src_y = src_coords[b, 1].reshape(onz, ony, onx)
+        src_z = src_coords[b, 2].reshape(onz, ony, onx)
+
+        results[b] = _separable_resample_3d(sources[b], src_x, src_y, src_z, interp)
+
+        if zero_outside:
+            oob = (
+                (src_x < -0.5) | (src_x > snx - 0.5)
+                | (src_y < -0.5) | (src_y > sny - 0.5)
+                | (src_z < -0.5) | (src_z > snz - 0.5)
+            )
+            results[b][oob] = 0.0
+
+    return results
+
+
 def _build_homo_coords(
     shape: tuple[int, int, int],
     device: torch.device,
@@ -780,6 +845,14 @@ def voxel_matrix_to_dicom(
     M_ras = source_ijk2ras @ M_ijk @ base_ras2ijk
 
     # Step 2: RAS → DICOM (negate x,y rows and columns)
+    # TODO(sign-convention): D=diag(-1,-1,1,1) negates x,y translation BUT NOT z. This is why
+    # the z-axis motion params (roll=-rz, dS=-dz) accidentally come out with the correct sign in
+    # save_moco_1D, while the x,y params (pitch, yaw, dL, dP) require an additional negation
+    # that is not applied. The downstream fix is in save_moco_1D, but the root cause is here:
+    # the D @ M_ras @ D conjugation produces dx_DICOM = -tx_RAS and dy_DICOM = -ty_RAS, while
+    # dz_DICOM = +tz_RAS (no sign flip for z). AFNI .1D params are subject-motion conventions
+    # (the inverse of the image-warp transform), so every component needs an extra negation.
+    # See docs/OUTSTANDING_ISSUES.md and the TODO block in save_moco_1D.
     D = _RAS_TO_DICOM.to(device)
     return D @ M_ras @ D
 
