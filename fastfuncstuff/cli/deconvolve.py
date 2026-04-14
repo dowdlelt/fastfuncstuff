@@ -69,7 +69,7 @@ try:
         onsets_to_tr_matrix,
         save_nifti,
     )
-    from fastfuncstuff.cli_utils import parse_prefix
+    from fastfuncstuff.cli_utils import auto_polort, parse_device_arg, parse_prefix
     from fastfuncstuff.design.matrices import (
         build_glm_design,
         is_tr_locked,
@@ -208,10 +208,11 @@ def parse_args():
 
     proc_opts.add_argument(
         "-polort",
-        type=int,
-        default=3,
+        type=str,
+        default="A",
         metavar="N",
-        help="Polynomial drift order for detrending (default: 3, use -1 for none)",
+        help="Polynomial drift order for detrending. 'A' (default) = auto (AFNI formula: "
+             "1 + floor(run_duration / 150)). Integer N for fixed order. -1 for none.",
     )
 
     proc_opts.add_argument(
@@ -252,7 +253,18 @@ def parse_args():
     hw_opts.add_argument(
         "--cpu",
         action="store_true",
-        help="Force CPU execution (default: auto-detect GPU)",
+        help="Force CPU execution (default: auto-detect GPU). Deprecated: use -device cpu.",
+    )
+    hw_opts.add_argument(
+        "-device",
+        type=str,
+        default=None,
+        help="PyTorch device: cpu, cuda, mps (default: auto-detect). Overrides --cpu.",
+    )
+    hw_opts.add_argument(
+        "-debug_memory",
+        action="store_true",
+        help="Print VRAM usage vs. prediction after each chunk loop (for memory tuning)",
     )
 
     # Help
@@ -649,15 +661,11 @@ def main():
     args.prefix = pfx.stem  # overwrite with clean stem
     _nii_ext = pfx.nifti_ext
 
-    # Setup device
-    if args.cpu:
-        device = torch.device("cpu")
-        if args.verbose:
-            print("Using CPU")
-    else:
-        device = get_device()
-        if args.verbose:
-            print(f"Using device: {device}")
+    # Setup device — -device takes precedence over legacy --cpu flag
+    device_spec = args.device or ("cpu" if args.cpu else None)
+    device, _, _ = parse_device_arg(device_spec)
+    if args.verbose:
+        print(f"Using device: {device}")
     configure_torch_backends(device)
 
     # Validate inputs
@@ -742,6 +750,20 @@ def main():
     if args.verbose:
         print(f"  TR: {tr}s")
         print(f"  Total timepoints: {sum(n_timepoints_per_run)}")
+
+    # Resolve polort: "A" → AFNI auto formula based on run duration
+    polort_str = str(args.polort).strip().upper()
+    if polort_str == "A":
+        run_duration_sec = min(n_timepoints_per_run) * tr
+        args.polort = auto_polort(run_duration_sec, formula="afni")
+        if args.verbose:
+            print(f"  Polort: A → {args.polort} (run duration {run_duration_sec:.1f}s)")
+    else:
+        try:
+            args.polort = int(polort_str)
+        except ValueError:
+            print(f"ERROR: -polort must be 'A' or an integer, got: {args.polort!r}", file=sys.stderr)
+            return 1
 
     if args.verbose:
         print(f"  Data shape: {nx} x {ny} x {nz}")
@@ -1095,8 +1117,9 @@ def main():
                 max_poly_degree=-1,
                 device=device,
                 preload_data_to_device=False,
-                chunk_size=60000,
+                chunk_size=None,  # auto-estimate via memory module
                 verbose=False,
+                debug_memory=args.debug_memory,
             )
             betas_stim_k = results_k.betas[:, :n_stim_k].cpu().numpy()
 
@@ -1457,8 +1480,9 @@ def main():
         max_poly_degree=-1,
         device=device,
         preload_data_to_device=False,  # Stream chunks to GPU
-        chunk_size=60000,  # Voxels per chunk
+        chunk_size=None,  # auto-estimate via memory module
         verbose=args.verbose,
+        debug_memory=args.debug_memory,
     )
 
     if args.verbose:
