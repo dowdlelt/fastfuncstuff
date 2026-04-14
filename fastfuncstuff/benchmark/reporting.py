@@ -66,6 +66,55 @@ def _print_moco_detail(validation: dict) -> None:
                       f"nrmsd={entry['nrmsd']:.4f}")
 
 
+_GLMSINGLE_FFS_STAGES = ("glmsingle_hrf", "glmsingle_denoise", "glmsingle_ridge")
+_GLMSINGLE_REF_STAGE = "glmsingle_matlab"
+
+
+def _glmsingle_aggregate(
+    results: list[StageResult],
+    cached_refs: dict[str, list[tuple[str, float]]],
+    my_ref_id: str,
+) -> tuple[float, float, bool, bool] | None:
+    """Return (ref_t, ffs_t, from_cached_local, from_cached_other) for GLMsingle pipeline.
+
+    Returns None if any FFS stage time is missing or the ref stage is absent.
+    ref_t  = glmsingle_matlab ref_time (live or cached)
+    ffs_t  = sum of hrf + denoise + ridge ffs_times
+    """
+    by_name = {r.stage_name: r for r in results}
+
+    # Sum FFS pipeline times
+    ffs_total = 0.0
+    for stage in _GLMSINGLE_FFS_STAGES:
+        r = by_name.get(stage)
+        t = (r.ffs_time or 0.0) if r else 0.0
+        if t <= 0:
+            return None  # incomplete — don't show a misleading aggregate
+        ffs_total += t
+
+    # Get ref time (live or cached)
+    ref_result = by_name.get(_GLMSINGLE_REF_STAGE)
+    ref_t = (ref_result.ref_time or 0.0) if ref_result else 0.0
+    from_cached_local = from_cached_other = False
+
+    if ref_t <= 0:
+        # Try cache — caller pre-populates cached_refs for all stages including
+        # glmsingle_matlab (even though it has no ffs_time, so it was previously
+        # excluded from the cache prefetch loop).
+        all_refs = cached_refs.get(_GLMSINGLE_REF_STAGE) or []
+        local = next((rv for av, rv in all_refs if av == my_ref_id), None)
+        if local is not None:
+            ref_t = local
+            from_cached_local = True
+        elif all_refs:
+            _, ref_t = all_refs[0]
+            from_cached_other = True
+        else:
+            return None  # no ref timing available at all
+
+    return ref_t, ffs_total, from_cached_local, from_cached_other
+
+
 def print_timing_report(
     results: list[StageResult], data_dir: Path | None = None,
 ) -> None:
@@ -79,11 +128,13 @@ def print_timing_report(
     my_ref_id = get_ref_arch_id()
     my_ffs_id = get_ffs_arch_id()
 
-    # Pre-fetch cached ref timings for stages where ref didn't run this time
+    # Pre-fetch cached ref timings for stages where ref didn't run this time.
+    # Also always fetch for glmsingle_matlab (it has no ffs_time so it's normally
+    # skipped by the loop below, but we need it for the aggregate row).
     cached_refs: dict[str, list[tuple[str, float]]] = {}
     if data_dir is not None:
         for r in results:
-            if not (r.ref_time and r.ref_time > 0) and r.ffs_time:
+            if not (r.ref_time and r.ref_time > 0):
                 cached_refs[r.stage_name] = get_ref_timings_all_archs(data_dir, r.stage_name)
 
     print(f"\nBENCHMARK  ref={my_ref_id}  ffs={my_ffs_id}")
@@ -131,6 +182,23 @@ def print_timing_report(
 
         summary_short = r.summary[:28] if r.summary else ""
         print(f"{r.stage_name:<16} {ref_str:>12} {ffs_str:>10} {speedup_str:>10} {status}  {summary_short}")
+
+        # After the last GLMsingle FFS stage, print the pipeline aggregate row
+        if r.stage_name == _GLMSINGLE_FFS_STAGES[-1]:
+            agg = _glmsingle_aggregate(results, cached_refs, my_ref_id)
+            if agg is not None:
+                agg_ref, agg_ffs, agg_local, agg_other = agg
+                agg_speedup = f"{agg_ref / agg_ffs:.1f}x"
+                if agg_local:
+                    agg_ref_str = f"{agg_ref:.1f}†"
+                    any_cached_ref = True
+                elif agg_other:
+                    agg_ref_str = f"{agg_ref:.1f}‡"
+                    any_other_arch_ref = True
+                else:
+                    agg_ref_str = f"{agg_ref:.1f}"
+                agg_ffs_str = f"{agg_ffs:.1f}"
+                print(f"{'glmsingle(tot)':<16} {agg_ref_str:>12} {agg_ffs_str:>10} {agg_speedup:>10}        (hrf+denoise+ridge vs matlab)")
 
     print("-" * 80)
     if total_ffs > 0:
