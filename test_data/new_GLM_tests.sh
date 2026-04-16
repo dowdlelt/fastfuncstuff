@@ -37,7 +37,7 @@ ffs_deconvolve \
  -onsets ./timing_files/onsets.localizer.times.bodies.txt ./timing_files/onsets.localizer.times.faces.txt ./timing_files/onsets.localizer.times.objects.txt ./timing_files/onsets.localizer.times.scenes.txt ./timing_files/onsets.localizer.times.scrambled.txt  \
  -prefix ffs_tent \
  -model TENT \
- -tent_window 0 15 \
+ -window 0 15 \
  -verbose
 
 # the outputs of this again, should be in the ffs_glm_IM folder. 

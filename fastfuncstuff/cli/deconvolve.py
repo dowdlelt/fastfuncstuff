@@ -29,7 +29,7 @@ TENT model (non-TR-locked):
     ffs_deconvolve.py -input data.nii.gz \\
                       -onsets task.txt \\
                       -model TENT \\
-                      -tent_window 0 20 \\
+                      -window 0 20 \\
                       -prefix results/GLM
 
 Per-condition TENT windows:
@@ -37,7 +37,7 @@ Per-condition TENT windows:
                       -onsets faces.txt scenes.txt objects.txt \\
                       -labels faces scenes objects \\
                       -model TENT \\
-                      -tent_window 0,15 0,20 0,25 \\
+                      -window 0,15 0,20 0,25 \\
                       -prefix results/GLM
 
 For help:
@@ -227,10 +227,10 @@ def parse_args():
         type=int,
         default=0,
         metavar="N",
-        help="Cross-validate the TENT window upper bound over ±N TRs around the -tent_window "
+        help="Cross-validate the TENT window upper bound over ±N TRs around the -window "
              "top, in steps of 1 TR, using leave-one-run-out CV. The top with the highest "
              "mean held-out R² is used for the final fit. "
-             "E.g., '-tent_window 0 15 -xval_tr_range 3' tries tops 12s..18s (default: 0 = disabled).",
+             "E.g., '-window 0 15 -xval_tr_range 3' tries tops 12s..18s (default: 0 = disabled).",
     )
 
     model_opts.add_argument(

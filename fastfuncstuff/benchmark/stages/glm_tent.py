@@ -149,7 +149,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-onsets {timing_args} "
         f"-prefix ffs_tent "
         f"-model TENT "
-        f"-tent_window 0 15 "
+        f"-window 0 15 "
         f"-polort 4 "
         f"-mask {mask}"
         f"{ctx.ffs_device_flag()}",
