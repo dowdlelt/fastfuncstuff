@@ -144,15 +144,62 @@ Notes:
     required.add_argument(
         "-onsets",
         nargs="+",
-        required=True,
-        help="Onset timing files (AFNI format). One file per condition.",
+        required=False,
+        default=None,
+        help="Onset timing files (AFNI format). One file per condition. "
+        "Mutually exclusive with -events.",
     )
     required.add_argument(
         "-durations",
         nargs="+",
-        required=True,
+        required=False,
+        default=None,
         help="Stimulus durations in seconds. Single value, one per condition, or use 'value,count' "
-        "format (e.g., '3,20 5,40' for 20 conditions with 3s, then 40 with 5s).",
+        "format (e.g., '3,20 5,40' for 20 conditions with 3s, then 40 with 5s). "
+        "Required when using -onsets; derived automatically from -events.",
+    )
+
+    # BIDS events options
+    bids_opts = parser.add_argument_group("BIDS Events (alternative to -onsets/-durations)")
+    bids_opts.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS *_events.tsv files, one per run. Sorted by run number automatically. "
+        "Mutually exclusive with -onsets.",
+    )
+    bids_opts.add_argument(
+        "-event_ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to exclude. Only valid with -events.",
+    )
+    bids_opts.add_argument(
+        "-event_cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Custom column names for onset, duration, trial_type. "
+        "Default: onset duration trial_type. Only valid with -events.",
+    )
+    bids_opts.add_argument(
+        "-round_onsets",
+        nargs="?",
+        const=0.7,
+        type=float,
+        default=None,
+        metavar="THRESHOLD",
+        help="Round onsets to nearest TR. Fraction-through-TR >= THRESHOLD → ceil, else floor. "
+        "Default threshold if flag given without value: 0.7.",
+    )
+    bids_opts.add_argument(
+        "-round_durations",
+        type=int,
+        default=None,
+        metavar="PLACES",
+        help="Round stimulus durations to PLACES decimal places.",
     )
     required.add_argument(
         "-tr",
@@ -330,74 +377,83 @@ def main():
     print()
 
     # ========================================================================
-    # Parse onsets and durations (BEFORE loading data - fail fast)
+    # 1. Parse onset metadata (fail-fast, before slow data loading)
     # ========================================================================
-    print("Parsing onset files...")
-    all_onsets = []
-    condition_labels = []
     input_files = args.input
     n_runs = len(input_files)
 
-    for onset_file in args.onsets:
-        condition_label = Path(onset_file).stem
-        runs_onsets = parse_afni_timing_file(onset_file)
-        all_onsets.append(runs_onsets)
-        condition_labels.append(condition_label)
-        n_events = sum(len(run_onsets) for run_onsets in runs_onsets)
-        print(f"  {condition_label}: {n_events} events across {len(runs_onsets)} runs")
-
-    # Parse durations (supports formats: "2.0", "3,20" for 20 copies of 3)
-    print()
-    print("Parsing durations...")
-    durations = parse_durations(args.durations, len(all_onsets), condition_labels)
-
-    # Print summary based on input
-    if len(args.durations) == 1 and "," not in args.durations[0]:
-        print(f"  Using {durations[0]}s for all {len(all_onsets)} conditions")
-    else:
-        print(f"  Matched {len(durations)} durations to {len(all_onsets)} conditions")
-
-    # Parse HRF model arguments
-    print()
-    from fastfuncstuff.cli_utils import parse_hrf_model_args
-
-    # Note: 3dRidgefast doesn't support FIR (use condition-level tools for that)
-    # But it DOES support SPMG2/SPMG3 for single-trial with derivatives
-    hrf_info = parse_hrf_model_args(
-        hrf_model_arg=args.hrf_model if hasattr(args, "hrf_model") else "spmg1",
-        canonical_arg=None,  # 3dRidgefast doesn't have -canonical
-        durations=durations,
-        condition_labels=condition_labels,
-        tr=args.tr,
-    )
-
-    hrf_model_name = hrf_info["hrf_model_name"]
-    is_fir_model = hrf_info["is_fir_model"]
-    n_basis = hrf_info["n_basis"]
-
-    # Validate: FIR is incompatible with single-trial
-    if is_fir_model:
-        print("ERROR: FIR/TENT models are incompatible with single-trial estimation")
-        print("  Use 3dDenoisefast or 3dREMLfast for FIR/TENT analysis")
+    # Validate onset/events mutual exclusivity
+    _has_onsets = bool(args.onsets)
+    _has_events = bool(args.events)
+    if _has_onsets and _has_events:
+        print("ERROR: Specify only one of -onsets/-durations or -events")
+        sys.exit(1)
+    if not _has_onsets and not _has_events:
+        print("ERROR: Must specify one of -onsets/-durations or -events")
+        sys.exit(1)
+    if args.event_ignore and not _has_events:
+        print("ERROR: -event_ignore requires -events")
+        sys.exit(1)
+    if args.event_cols and not _has_events:
+        print("ERROR: -event_cols requires -events")
+        sys.exit(1)
+    if _has_onsets and args.durations is None:
+        print("ERROR: -durations is required when using -onsets")
         sys.exit(1)
 
-    # SPMG2/SPMG3 with HRF library is incompatible (checked in create_single_trial_design)
+    from fastfuncstuff.cli_utils import clean_condition_labels
+    print("Parsing onset metadata...")
+    all_onsets_bids = None  # populated for BIDS path; AFNI path populates later
+    condition_labels = []
+    onset_files = None
 
-    print()
-    print("=" * 70)
-    print(f"Validated: {len(all_onsets)} conditions, {len(durations)} durations")
-    print("=" * 70)
+    if _has_events:
+        from fastfuncstuff.design.bids_events import parse_bids_events
+        if len(args.events) != n_runs:
+            print(
+                f"ERROR: -events: {len(args.events)} files but {n_runs} input runs"
+            )
+            sys.exit(1)
+        event_cols = tuple(args.event_cols) if args.event_cols else None
+        all_onsets_bids, durations, condition_labels = parse_bids_events(
+            event_files=args.events,
+            event_ignore=args.event_ignore,
+            event_cols=event_cols,
+            round_durations=args.round_durations,
+        )
+        n_conditions = len(condition_labels)
+        print(f"  BIDS events: {n_conditions} conditions from {len(args.events)} TSV files")
+        print(f"  Conditions: {condition_labels}")
+        print(f"  Durations: {durations}s")
+    else:
+        onset_files = args.onsets
+        n_conditions = len(onset_files)
+        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
+
+        for f in onset_files:
+            if not Path(f).exists():
+                print(f"ERROR: Onset file not found: {f}")
+                sys.exit(1)
+
+        durations = parse_durations(args.durations, n_conditions, condition_labels)
+        if args.round_durations is not None:
+            durations = [round(d, args.round_durations) for d in durations]
+
+        if len(args.durations) == 1 and "," not in args.durations[0]:
+            print(f"  Using {durations[0]}s for all {n_conditions} conditions")
+        else:
+            print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
 
     # Pre-flight checks (before slow data loading)
     preflight_check(
         input_files=input_files,
-        onset_files=args.onsets,
+        onset_files=onset_files,
         hrf_opt_prefix=args.hrf_opt or None,
         denoise_prefix=args.denoise or None,
     )
 
     # ========================================================================
-    # Set device and load data
+    # 2. Load data
     # ========================================================================
     print()
     if args.device:
@@ -408,9 +464,6 @@ def main():
 
     print(f"Device: {device}")
     print()
-
-    # Load data
-    print("Loading data...")
 
     # Load and preprocess data using unified utility
     # Note: do_scale=False here - scaling will be applied separately if requested
@@ -442,9 +495,74 @@ def main():
     n_timepoints = load_result.n_timepoints
     n_runs = load_result.n_runs
 
-    # Update args.tr with loaded value (for later use)
+    # Update args.tr from header (consistent with hrfopt/denoise)
     if args.tr is None:
         args.tr = load_result.tr
+        print(f"  TR from header: {args.tr}s")
+    else:
+        print(f"  TR (specified): {args.tr}s")
+
+    # ========================================================================
+    # 3. Build all_onsets and apply rounding (TR now known)
+    # ========================================================================
+    print()
+    print("Parsing onset files...")
+    if all_onsets_bids is not None:
+        all_onsets = all_onsets_bids
+        for i, cond in enumerate(condition_labels):
+            n_ev = sum(arr.size for arr in all_onsets[i])
+            print(f"  {cond}: {n_ev} events across {n_runs} runs")
+    else:
+        all_onsets = []
+        for i, onset_file in enumerate(onset_files):
+            runs_onsets = parse_afni_timing_file(onset_file)
+            if len(runs_onsets) != n_runs:
+                print(
+                    f"ERROR: Onset file '{onset_file}' has {len(runs_onsets)} runs, "
+                    f"but {n_runs} input files were provided"
+                )
+                sys.exit(1)
+            all_onsets.append(runs_onsets)
+            n_events = sum(len(r) for r in runs_onsets)
+            print(f"  {condition_labels[i]}: {n_events} events across {n_runs} runs")
+
+    # Apply onset rounding (TR is now known from data load)
+    if args.round_onsets is not None:
+        from fastfuncstuff.design.builder import round_onsets as _round_onsets
+        all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
+
+    # ========================================================================
+    # 4. HRF model args and validation
+    # ========================================================================
+    print()
+    from fastfuncstuff.cli_utils import parse_hrf_model_args
+
+    # Note: 3dRidgefast doesn't support FIR (use condition-level tools for that)
+    # But it DOES support SPMG2/SPMG3 for single-trial with derivatives
+    hrf_info = parse_hrf_model_args(
+        hrf_model_arg=args.hrf_model if hasattr(args, "hrf_model") else "spmg1",
+        canonical_arg=None,  # 3dRidgefast doesn't have -canonical
+        durations=durations,
+        condition_labels=condition_labels,
+        tr=args.tr,
+    )
+
+    hrf_model_name = hrf_info["hrf_model_name"]
+    is_fir_model = hrf_info["is_fir_model"]
+    n_basis = hrf_info["n_basis"]
+
+    # Validate: FIR is incompatible with single-trial
+    if is_fir_model:
+        print("ERROR: FIR/TENT models are incompatible with single-trial estimation")
+        print("  Use 3dDenoisefast or 3dREMLfast for FIR/TENT analysis")
+        sys.exit(1)
+
+    # SPMG2/SPMG3 with HRF library is incompatible (checked in create_single_trial_design)
+
+    print()
+    print("=" * 70)
+    print(f"Validated: {len(all_onsets)} conditions, {len(durations)} durations")
+    print("=" * 70)
 
     # Apply scaling if requested (maintaining existing behavior)
     scale_info = None

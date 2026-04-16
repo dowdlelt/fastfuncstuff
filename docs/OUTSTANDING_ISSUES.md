@@ -98,3 +98,34 @@ Further investigation is required. Components themselves look similar, across 50
 ## ICA No Tensorial Approach currently available. 
 For datasets with the same design (or multiecho dataset) the tensor approach is valid. 
 This is currently not implemente. 
+
+## Parametric Duration Modulation (future feature)
+
+Per-event HRF amplitude scaling by event duration — i.e., each event's HRF is scaled
+by that event's individual duration rather than treating all events of a condition as
+identical.
+
+### What this would look like
+BIDS events TSV already provides per-event `duration` values. The feature would use
+these to scale the HRF amplitude (or boxcar height) for each individual event before
+convolution with the canonical HRF. This is distinct from the current approach where
+all events of a condition share one duration (derived from the unique values in the TSV).
+
+### Why it is not implemented yet
+The current pipeline works at the condition level: `all_onsets[cond][run]` is an array
+of onset times, and `durations[cond]` is a single scalar. Supporting per-event
+modulation requires threading per-event duration values through:
+- `create_onset_matrix_microtime` (currently takes a scalar duration per condition)
+- `build_glm_design` / `build_single_trial_design` (same assumption)
+- The HRF convolution step
+
+This is a moderate refactor — the data structures need to change from scalar durations
+to arrays-of-durations — and should be done carefully to avoid breaking the existing
+API surface.
+
+### Code locations to modify
+- `fastfuncstuff/design/builder.py` — `create_onset_matrix_microtime`: accept per-event
+  duration arrays in addition to scalar duration
+- `fastfuncstuff/design/bids_events.py` — `parse_bids_events`: return per-event durations
+  alongside the per-condition median (already stores them internally in `cond_dur_sets`)
+- All CLIs that accept `-events` — thread per-event durations through to the design builder

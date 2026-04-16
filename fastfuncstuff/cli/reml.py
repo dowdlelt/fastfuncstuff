@@ -556,12 +556,67 @@ Examples:
     onset_group.add_argument(
         "-onsets",
         nargs="+",
-        help="Onset timing files (AFNI format). One per condition. Mutually exclusive with -matrix.",
+        help="Onset timing files (AFNI format). One per condition. Mutually exclusive with -matrix and -events.",
     )
     onset_group.add_argument(
         "-durations",
         nargs="+",
-        help="Stimulus durations. Single value, per-condition, or 'value,count'.",
+        help="Stimulus durations. Single value, per-condition, or 'value,count'. Required with -onsets.",
+    )
+    onset_group.add_argument(
+        "-events",
+        nargs="+",
+        metavar="TSV",
+        help=(
+            "BIDS events TSV files, one per run (e.g. sub-01_task-loc_run-01_events.tsv). "
+            "Mutually exclusive with -matrix and -onsets. Files are sorted by run number "
+            "automatically (handles both run-1 and run-01 zero-padding). "
+            "The TSV must contain 'onset', 'duration', and 'trial_type' columns "
+            "(override with -event_cols). "
+            "Conditions are derived from unique trial_type values (sorted). "
+            "Durations are derived from the TSV data."
+        ),
+    )
+    onset_group.add_argument(
+        "-event_ignore",
+        nargs="+",
+        metavar="CONDITION",
+        help=(
+            "Condition names (trial_type values) to exclude from modeling when using -events. "
+            "E.g. -event_ignore fixation null rest"
+        ),
+    )
+    onset_group.add_argument(
+        "-event_cols",
+        nargs=3,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help=(
+            "Custom column names for -events TSV files, replacing the BIDS defaults. "
+            "Provide exactly 3 names: the columns mapped to onset, duration, and trial_type. "
+            "E.g. -event_cols onset_time duration_s condition_name"
+        ),
+    )
+    onset_group.add_argument(
+        "-round_onsets",
+        nargs="?",
+        const=0.7,
+        type=float,
+        metavar="THRESHOLD",
+        help=(
+            "Snap all onset times to the nearest TR boundary. "
+            "THRESHOLD (default: 0.7) is the fractional position within a TR above which "
+            "an onset rounds up; below it rounds down. "
+            "0.5 = standard nearest-TR rounding."
+        ),
+    )
+    onset_group.add_argument(
+        "-round_durations",
+        type=int,
+        metavar="PLACES",
+        help=(
+            "Round stimulus durations to PLACES decimal places before uniquing "
+            "and design matrix construction (0=integer, 1=tenth, etc.)."
+        ),
     )
     onset_group.add_argument(
         "-microtime_dt",
@@ -732,12 +787,21 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    # Validate design input: must have either -matrix or -onsets (but not both)
-    if args.matrix and args.onsets:
-        print("ERROR: Specify either -matrix or -onsets, not both")
+    # Validate design input: exactly one of -matrix, -onsets, -events
+    _design_sources = [bool(args.matrix), bool(args.onsets), bool(args.events)]
+    if sum(_design_sources) > 1:
+        print("ERROR: Specify only one of -matrix, -onsets, or -events")
         sys.exit(1)
-    if not args.matrix and not args.onsets:
-        print("ERROR: Must specify either -matrix or -onsets")
+    if not any(_design_sources):
+        print("ERROR: Must specify one of -matrix, -onsets, or -events")
+        sys.exit(1)
+
+    # -event_ignore / -event_cols are only meaningful with -events
+    if args.event_ignore and not args.events:
+        print("ERROR: -event_ignore requires -events")
+        sys.exit(1)
+    if args.event_cols and not args.events:
+        print("ERROR: -event_cols requires -events")
         sys.exit(1)
 
     # Check that at least one output is requested
@@ -911,29 +975,87 @@ def main():
         print("=" * 70)
         print()
 
-        # Parse onset files
-        print("Parsing onset files...")
-        all_onsets = []
-        condition_labels = []
-        for onset_file in args.onsets:
-            condition_label = Path(onset_file).stem
-            runs_onsets = parse_afni_timing_file(onset_file)
-            all_onsets.append(runs_onsets)
-            condition_labels.append(condition_label)
-            n_events = sum(len(run_onsets) for run_onsets in runs_onsets)
-            print(f"  {condition_label}: {n_events} events across {len(runs_onsets)} runs")
+        if args.events:
+            # ── BIDS events TSV path ─────────────────────────────────────────
+            from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
 
-        n_conditions = len(all_onsets)
-        n_runs = len(all_onsets[0])  # All conditions must have same number of runs
+            # Validate: one TSV per input run
+            if len(args.events) != len(input_files):
+                print(
+                    f"ERROR: -events requires one TSV per run: "
+                    f"got {len(args.events)} events files but {len(input_files)} input datasets."
+                )
+                sys.exit(1)
 
-        # Parse durations
-        print()
-        print("Parsing durations...")
-        durations = parse_durations(args.durations, n_conditions, condition_labels)
-        if len(args.durations) == 1 and ',' not in args.durations[0]:
-            print(f"  Using {durations[0]}s for all {n_conditions} conditions")
+            # Custom column mapping
+            event_cols = tuple(args.event_cols) if args.event_cols else None
+
+            print("Parsing BIDS events files...")
+            # Show the sorted order so the user can confirm alignment
+            sorted_event_paths = sort_bids_event_files(args.events)
+            for ep in sorted_event_paths:
+                print(f"  {ep}")
+
+            try:
+                all_onsets, durations, condition_labels = parse_bids_events(
+                    event_files=args.events,
+                    event_ignore=args.event_ignore,
+                    event_cols=event_cols,
+                    round_durations=args.round_durations,
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            n_conditions = len(condition_labels)
+            n_runs = len(input_files)
+
+            print()
+            for cidx, label in enumerate(condition_labels):
+                n_events = sum(len(all_onsets[cidx][r]) for r in range(n_runs))
+                print(f"  {label}: {n_events} events across {n_runs} runs  (duration={durations[cidx]:.3f}s)")
+
+            if len(set(durations)) == 1:
+                print(f"\n  Single duration for all conditions: {durations[0]:.3f}s")
+            else:
+                print(f"\n  Per-condition durations: {dict(zip(condition_labels, durations))}")
+
         else:
-            print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
+            # ── AFNI timing files path ───────────────────────────────────────
+            print("Parsing onset files...")
+            all_onsets = []
+            condition_labels = []
+            for onset_file in args.onsets:
+                condition_label = Path(onset_file).stem
+                runs_onsets = parse_afni_timing_file(onset_file)
+                all_onsets.append(runs_onsets)
+                condition_labels.append(condition_label)
+                n_events = sum(len(run_onsets) for run_onsets in runs_onsets)
+                print(f"  {condition_label}: {n_events} events across {len(runs_onsets)} runs")
+
+            n_conditions = len(all_onsets)
+            n_runs = len(all_onsets[0])  # All conditions must have same number of runs
+
+            # Parse durations
+            print()
+            print("Parsing durations...")
+            durations = parse_durations(args.durations, n_conditions, condition_labels)
+            if len(args.durations) == 1 and ',' not in args.durations[0]:
+                print(f"  Using {durations[0]}s for all {n_conditions} conditions")
+            else:
+                print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
+
+        # ── Optional onset / duration rounding ──────────────────────────
+        if args.round_onsets is not None:
+            from fastfuncstuff.design.builder import round_onsets
+            all_onsets = round_onsets(all_onsets, tr, threshold=args.round_onsets)
+            print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
+
+        # For BIDS, round_durations was already applied per-event inside parse_bids_events
+        if args.round_durations is not None and not args.events:
+            dp = args.round_durations
+            durations = [round(d, dp) for d in durations]
+            print(f"Durations rounded to {dp} decimal place(s): {durations}")
 
         # Parse HRF model arguments
         print()

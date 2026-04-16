@@ -116,8 +116,37 @@ def parse_args():
         "-onsets",
         nargs="+",
         metavar="FILE",
-        required=True,
-        help="Onset timing files in AFNI format (one file per condition, each with one row per run)",
+        help=(
+            "Onset timing files in AFNI format (one file per condition, "
+            "each with one row per run).  Mutually exclusive with -events."
+        ),
+    )
+    required.add_argument(
+        "-events",
+        nargs="+",
+        metavar="TSV",
+        help=(
+            "BIDS events TSV files, one per run.  Mutually exclusive with -onsets. "
+            "Files are sorted by run number automatically (run-1 and run-01 both work). "
+            "Conditions come from unique trial_type values; durations are read from the TSV "
+            "and used to auto-estimate per-condition HRF windows unless -window is given. "
+            "Use -event_ignore to skip conditions; -event_cols for non-standard column names."
+        ),
+    )
+    required.add_argument(
+        "-event_ignore",
+        nargs="+",
+        metavar="CONDITION",
+        help="trial_type values to exclude when using -events (e.g. -event_ignore fixation null).",
+    )
+    required.add_argument(
+        "-event_cols",
+        nargs=3,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help=(
+            "Custom column names for -events TSV files, replacing BIDS defaults. "
+            "E.g. -event_cols onset_time duration_s condition_name"
+        ),
     )
 
     required.add_argument(
@@ -141,16 +170,49 @@ def parse_args():
         "-duration",
         type=float,
         metavar="SECONDS",
-        help="HRF duration in seconds (e.g., 20). Required for AUTO/FIR. For TENT, use -tent_window instead.",
+        help=(
+            "Legacy fallback: single HRF window length in seconds applied to all conditions. "
+            "Prefer -window (explicit) or -durations (auto-estimate from stimulus durations). "
+            "If -window or -durations is given, -duration is ignored."
+        ),
     )
 
     model_opts.add_argument(
-        "-tent_window",
+        "-durations",
+        nargs="+",
+        metavar="SECONDS",
+        help=(
+            "Per-condition STIMULUS durations in seconds (one value per condition, or a single "
+            "value for all).  Used with -onsets to auto-estimate the per-condition HRF window "
+            "via canonical-HRF convolution.  With -events the durations come from the TSV "
+            "automatically and this flag is not needed.  Ignored if -window is given."
+        ),
+    )
+
+    model_opts.add_argument(
+        "-window",
         nargs="+",
         metavar="WINDOW",
-        help="TENT window(s) in seconds after stimulus onset. "
-        "Formats: '0 15' (all conditions), '0,15' (all conditions), "
-        "or '0,15 0,20 0,25' (per-condition). For TENT/TENTzero models.",
+        help=(
+            "Explicit HRF analysis window(s) in seconds after stimulus onset.  "
+            "Applies to FIR, TENT, TENTzero, CSPLIN, and CSPLINzero.  "
+            "Formats: '0 15' (shared, all conditions), '0,15' (shared), "
+            "or '0,15 0,20 0,25' (per-condition, one pair per condition).  "
+            "When given, overrides auto-estimation from -durations/-events."
+        ),
+    )
+
+    model_opts.add_argument(
+        "-add_lag",
+        nargs="+",
+        type=int,
+        metavar="TRS",
+        help=(
+            "Per-condition lag adjustment in TRs applied on top of the estimated or explicit "
+            "window.  Positive = more lags, negative = fewer.  "
+            "Provide one value (broadcast to all conditions) or one per condition.  "
+            "E.g. -add_lag 2 or -add_lag 1 0 -2"
+        ),
     )
 
     model_opts.add_argument(
@@ -181,6 +243,34 @@ def parse_args():
              "{prefix}_windowsize.nii.gz (winning top in seconds) and "
              "{prefix}_r2_by_window.nii.gz (LORO R² per candidate, 4D). "
              "Requires -xval_tr_range > 0 and ≥2 runs.",
+    )
+
+    model_opts.add_argument(
+        "-round_onsets",
+        nargs="?",
+        const=0.7,
+        type=float,
+        metavar="THRESHOLD",
+        help=(
+            "Snap all onset times to the nearest TR boundary. "
+            "THRESHOLD (default: 0.7) is the fractional position within a TR above which "
+            "an onset rounds up (ceil); below it rounds down (floor). "
+            "0.5 = standard nearest-TR rounding.  0.7 = biased toward floor "
+            "(only round up if 70%%+ through the TR).  "
+            "Reducing TENT/CSPLIN to FIR: use -round_onsets then -model FIR."
+        ),
+    )
+
+    model_opts.add_argument(
+        "-round_durations",
+        type=int,
+        metavar="PLACES",
+        help=(
+            "Round stimulus durations to PLACES decimal places before uniquing "
+            "and auto-window estimation (0=integer, 1=tenth, etc.).  "
+            "Prevents near-identical durations (e.g. 3.0 vs 3.03) from creating "
+            "spurious per-condition variation."
+        ),
     )
 
     model_opts.add_argument(
@@ -668,9 +758,70 @@ def main():
         print(f"Using device: {device}")
     configure_torch_backends(device)
 
-    # Validate inputs
+    # Validate design source
     n_runs = len(args.input)
-    n_conditions = len(args.onsets)
+    if not args.onsets and not args.events:
+        print("ERROR: Must specify -onsets or -events", file=sys.stderr)
+        return 1
+    if args.onsets and args.events:
+        print("ERROR: -onsets and -events are mutually exclusive", file=sys.stderr)
+        return 1
+    if (args.event_ignore or args.event_cols) and not args.events:
+        print("ERROR: -event_ignore and -event_cols require -events", file=sys.stderr)
+        return 1
+
+    # ── BIDS events: parse early so we have n_conditions/labels/onsets before data load ──
+    condition_durations: list[float] | None = None  # stimulus durations for auto-window
+    if args.events:
+        if len(args.events) != n_runs:
+            print(
+                f"ERROR: -events requires one TSV per run: "
+                f"got {len(args.events)} events files but {n_runs} input datasets.",
+                file=sys.stderr,
+            )
+            return 1
+        from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
+        event_cols = tuple(args.event_cols) if args.event_cols else None
+        try:
+            bids_onsets, bids_durations, bids_labels = parse_bids_events(
+                event_files=args.events,
+                event_ignore=args.event_ignore,
+                event_cols=event_cols,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        n_conditions = len(bids_labels)
+        # User-supplied -labels override BIDS trial_type names
+        if args.labels:
+            if len(args.labels) != n_conditions:
+                print(
+                    f"ERROR: -labels count ({len(args.labels)}) does not match "
+                    f"number of BIDS conditions ({n_conditions}: {bids_labels})",
+                    file=sys.stderr,
+                )
+                return 1
+            condition_labels = args.labels
+        else:
+            condition_labels = bids_labels
+        onsets_per_condition = bids_onsets
+        condition_durations = bids_durations  # used for auto-window estimation
+
+    else:
+        # ── AFNI timing files: labels determined now, onsets loaded after data ──
+        n_conditions = len(args.onsets)
+        if args.labels:
+            if len(args.labels) != n_conditions:
+                print(
+                    f"ERROR: Number of labels ({len(args.labels)}) must match "
+                    f"number of onset files ({n_conditions})",
+                    file=sys.stderr,
+                )
+                return 1
+            condition_labels = args.labels
+        else:
+            condition_labels = _labels_from_timing_files(args.onsets)
+        onsets_per_condition = None  # loaded below, after data
 
     if args.verbose:
         print(f"\n{'=' * 70}")
@@ -680,21 +831,6 @@ def main():
         print("\nInput:")
         print(f"  Runs: {n_runs}")
         print(f"  Conditions: {n_conditions}")
-
-    # Check condition labels
-    if args.labels:
-        if len(args.labels) != n_conditions:
-            print(
-                f"ERROR: Number of labels ({len(args.labels)}) must match "
-                f"number of onset files ({n_conditions})",
-                file=sys.stderr,
-            )
-            return 1
-        condition_labels = args.labels
-    else:
-        condition_labels = _labels_from_timing_files(args.onsets)
-
-    if args.verbose:
         print(f"  Condition labels: {', '.join(condition_labels)}")
 
     # Load data
@@ -790,26 +926,65 @@ def main():
             )
 
     # Load onsets
-    if args.verbose:
-        print("\nLoading onset timing files...")
-
-    onsets_per_condition = []
-    for onset_file in args.onsets:
+    if args.onsets:
+        # ── AFNI timing files ────────────────────────────────────────────────
         if args.verbose:
-            print(f"  {onset_file}")
+            print("\nLoading onset timing files...")
 
-        # Parse AFNI timing file
-        onsets_by_run = parse_afni_timing_file(onset_file)
+        onsets_per_condition = []
+        for onset_file in args.onsets:
+            if args.verbose:
+                print(f"  {onset_file}")
 
-        if len(onsets_by_run) != n_runs:
-            print(
-                f"ERROR: Timing file {onset_file} has {len(onsets_by_run)} runs, "
-                f"but expected {n_runs} runs",
-                file=sys.stderr,
-            )
-            return 1
+            onsets_by_run = parse_afni_timing_file(onset_file)
 
-        onsets_per_condition.append(onsets_by_run)
+            if len(onsets_by_run) != n_runs:
+                print(
+                    f"ERROR: Timing file {onset_file} has {len(onsets_by_run)} runs, "
+                    f"but expected {n_runs} runs",
+                    file=sys.stderr,
+                )
+                return 1
+
+            onsets_per_condition.append(onsets_by_run)
+
+        # Parse per-condition stimulus durations for auto-window estimation
+        if args.durations:
+            from fastfuncstuff.design.builder import parse_durations
+            condition_durations = parse_durations(args.durations, n_conditions, condition_labels)
+            if args.verbose:
+                if len(set(condition_durations)) == 1:
+                    print(f"  Stimulus duration (all conditions): {condition_durations[0]:.3f}s")
+                else:
+                    for lbl, dur in zip(condition_labels, condition_durations):
+                        print(f"  {lbl}: {dur:.3f}s")
+
+    else:
+        # BIDS path: onsets_per_condition already set above
+        if args.verbose:
+            from fastfuncstuff.design.bids_events import sort_bids_event_files
+            print("\nBIDS events files (sorted by run):")
+            for ep in sort_bids_event_files(args.events):
+                print(f"  {ep}")
+            print()
+            for cidx, lbl in enumerate(condition_labels):
+                n_ev = sum(len(onsets_per_condition[cidx][r]) for r in range(n_runs))
+                print(f"  {lbl}: {n_ev} events  (duration={condition_durations[cidx]:.3f}s)")  # type: ignore[index]
+
+    # ── Optional onset / duration rounding ──────────────────────────────────
+    if args.round_onsets is not None:
+        from fastfuncstuff.design.builder import round_onsets
+        onsets_per_condition = round_onsets(onsets_per_condition, tr, threshold=args.round_onsets)
+        if args.verbose:
+            print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
+
+    # For BIDS, round_durations was already applied per-event inside parse_bids_events
+    if args.round_durations is not None and condition_durations is not None and not args.events:
+        dp = args.round_durations
+        condition_durations = [round(d, dp) for d in condition_durations]
+        if args.verbose:
+            print(f"Durations rounded to {dp} decimal place(s): "
+                  f"{[f'{d:.{dp}f}' for d in condition_durations]}")
 
     # Flatten all onset times for TR-locking check
     all_onset_times = []
@@ -837,63 +1012,91 @@ def main():
         if args.verbose:
             print(f"\nUsing {model} model")
 
-    # Determine HRF window parameters
-    if model == "FIR":
-        if args.duration is None:
-            print("ERROR: -duration required for FIR model", file=sys.stderr)
+    # ── Unified window determination (FIR and TENT family) ───────────────────
+    # Resolve add_lag to a per-condition list
+    add_lag_raw = args.add_lag  # list[int] | None
+    if add_lag_raw is not None:
+        if len(add_lag_raw) == 1:
+            add_lag_list = add_lag_raw * n_conditions
+        elif len(add_lag_raw) == n_conditions:
+            add_lag_list = add_lag_raw
+        else:
+            print(
+                f"ERROR: -add_lag must have 1 or {n_conditions} values (got {len(add_lag_raw)})",
+                file=sys.stderr,
+            )
             return 1
+    else:
+        add_lag_list = [0] * n_conditions
 
-        n_lags = int(np.ceil(args.duration / tr))
-        tent_windows = None  # Not used for FIR
+    def _apply_add_lag(windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        """Adjust per-condition (bot, top) windows by add_lag (TR units)."""
+        result = []
+        for (bot, top), lag in zip(windows, add_lag_list):
+            n_trs = max(1, round(top / tr) + lag)
+            result.append((bot, float(n_trs) * tr))
+        return result
 
-        if args.verbose:
-            print(f"  Duration: {args.duration}s ({n_lags} TRs)")
-
-    elif model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
-        # Parse windows for TENT/CSPLIN models
+    # Priority: 1) explicit -window, 2) auto from condition_durations, 3) -duration fallback
+    window_source: str
+    if args.window is not None:
         try:
-            if args.tent_window is not None:
-                tent_windows = parse_tent_windows(args.tent_window, n_conditions)
-            elif args.duration is not None:
-                # Use duration for all conditions
-                tent_windows = [(0.0, args.duration)] * n_conditions
-            else:
-                print(
-                    f"ERROR: Either -tent_window or -duration required for {model} model",
-                    file=sys.stderr,
-                )
-                return 1
+            tent_windows = parse_tent_windows(args.window, n_conditions)
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 1
+        tent_windows = _apply_add_lag(tent_windows)
+        window_source = "explicit -window"
 
-        # Print summary
-        if args.verbose and tent_windows is not None:
-            # Check if all windows are the same
-            if len(set(tent_windows)) == 1:
-                bot, top = tent_windows[0]
-                if args.tent_n_basis is None:
-                    n_basis_calc = round((top - bot) / tr) + 1
-                else:
-                    n_basis_calc = args.tent_n_basis
-                n_actual = n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
-                print(f"  Window: {bot}s to {top}s (all conditions)")
-                basis_type = "cubic spline" if "CSPLIN" in model else "tent"
+    elif condition_durations is not None:
+        from fastfuncstuff.design.hrf import compute_windows_from_durations
+        tent_windows = compute_windows_from_durations(
+            condition_durations, tr, add_lag=add_lag_list
+        )
+        window_source = "auto (HRF convolution)"
+
+    elif args.duration is not None:
+        tent_windows = _apply_add_lag([(0.0, args.duration)] * n_conditions)
+        window_source = f"legacy -duration ({args.duration}s)"
+
+    else:
+        print(
+            f"ERROR: No window specified for {model} model.\n"
+            "  Use -window (explicit), -durations (auto-estimate per condition),\n"
+            "  -events (BIDS, durations from TSV), or -duration (single legacy value).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # For FIR: n_lags per condition = round(top / tr)
+    n_lags_per_cond: list[int] = [max(1, round(top / tr)) for _, top in tent_windows]
+
+    # Verbose window summary
+    if args.verbose:
+        print(f"\nHRF window source: {window_source}")
+        if model == "FIR":
+            if len(set(n_lags_per_cond)) == 1:
                 print(
-                    f"  Basis functions: {n_basis_calc} {basis_type} knots → {n_actual} regressors per condition"
+                    f"  Window (all conditions): {n_lags_per_cond[0]} TRs "
+                    f"({tent_windows[0][1]:.1f}s)"
                 )
             else:
                 print("  Windows (per condition):")
-                basis_type = "cubic spline" if "CSPLIN" in model else "tent"
-                for i, (bot, top) in enumerate(tent_windows):
-                    if args.tent_n_basis is None:
-                        n_basis_calc = round((top - bot) / tr) + 1
-                    else:
-                        n_basis_calc = args.tent_n_basis
+                for lbl, n_l, (_, top) in zip(condition_labels, n_lags_per_cond, tent_windows):
+                    print(f"    {lbl}: {n_l} TRs ({top:.1f}s)")
+        else:
+            basis_type = "cubic spline" if "CSPLIN" in model else "tent"
+            if len(set(tent_windows)) == 1:
+                bot, top = tent_windows[0]
+                n_basis_calc = args.tent_n_basis if args.tent_n_basis else round((top - bot) / tr) + 1
+                n_actual = n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
+                print(f"  Window (all conditions): {bot}s–{top}s → {n_basis_calc} {basis_type} knots, {n_actual} regressors")
+            else:
+                print("  Windows (per condition):")
+                for lbl, (bot, top) in zip(condition_labels, tent_windows):
+                    n_basis_calc = args.tent_n_basis if args.tent_n_basis else round((top - bot) / tr) + 1
                     n_actual = n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
-                    print(
-                        f"    {condition_labels[i]}: {bot}s to {top}s ({n_basis_calc} {basis_type} knots → {n_actual} regressors)"
-                    )
+                    print(f"    {lbl}: {bot}s–{top}s → {n_basis_calc} {basis_type} knots, {n_actual} regressors")
 
     # Cross-validate TENT window upper bound if requested
     # _pv_* variables carry per-voxel mode context into the block below.
@@ -1197,16 +1400,20 @@ def main():
 
         # Build design matrix
         if model == "FIR":
-            # FIR: same n_lags for all conditions
-            design = build_glm_design(
-                onsets=onsets_binary,
-                mode="fir",
-                n_fir_lags=n_lags,
-                tr=tr,
-                device=device,
-            )
-            if run_idx == 0:
-                n_basis_per_condition_list = [n_lags] * n_conditions
+            # Per-condition FIR (each condition may have a different window)
+            cond_designs = []
+            for cond_idx in range(n_conditions):
+                design_cond = build_glm_design(
+                    onsets=onsets_binary[cond_idx : cond_idx + 1, :],
+                    mode="fir",
+                    n_fir_lags=n_lags_per_cond[cond_idx],
+                    tr=tr,
+                    device=device,
+                )
+                cond_designs.append(design_cond)
+                if run_idx == 0:
+                    n_basis_per_condition_list.append(n_lags_per_cond[cond_idx])
+            design = torch.cat(cond_designs, dim=1)
 
         elif model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
             # TENT/CSPLIN: use exact onset times (not binary matrix)

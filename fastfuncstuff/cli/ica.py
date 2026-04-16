@@ -85,6 +85,9 @@ def _run_single_ica(
     onsets_files: list[str] | None,
     durations: list[str] | None,
     ortvec_specs: list[list[str]] | None = None,
+    bids_task_onsets: "list[list[np.ndarray]] | None" = None,
+    bids_task_durations: "list[float] | None" = None,
+    bids_task_labels: "list[str] | None" = None,
 ) -> dict:
     """Run the full ICA workflow for one input run and return run metadata."""
     t_total = time.time()
@@ -672,7 +675,54 @@ def _run_single_ica(
     ortvec_corr = None
     ortvec_spectral_corr = None
     ortvec_labels = None
-    if onsets_files is not None and durations is not None:
+    if bids_task_onsets is not None:
+        # BIDS path: use pre-parsed all_onsets and durations
+        try:
+            from fastfuncstuff.design.builder import create_onset_matrix_microtime
+            from fastfuncstuff.design.hrf import get_spmg1_hrf
+            from fastfuncstuff.design.matrices import convolve_hrf_microtime
+            n_bids_conds = len(bids_task_onsets)
+            # Extract this run's onsets (wrapped in list for single-run onset matrix)
+            onsets_this_run = [
+                [bids_task_onsets[cidx][run_idx]]
+                for cidx in range(n_bids_conds)
+            ]
+            onset_mt = create_onset_matrix_microtime(
+                all_onsets=onsets_this_run,
+                run_starts=[0],
+                tr=tr,
+                n_timepoints=n_t,
+                microtime_dt=args.microtime_dt,
+                stim_durations=bids_task_durations,
+                device=device,
+            )
+            hrf = get_spmg1_hrf(microtime_dt=args.microtime_dt, device=device)
+            design_tc = convolve_hrf_microtime(
+                onsets_microtime=onset_mt,
+                hrf=hrf,
+                n_timepoints=n_t,
+                tr=tr,
+                microtime_dt=args.microtime_dt,
+                run_starts=[0],
+                device=device,
+            )
+            cond_labels = bids_task_labels
+            cond_durations = bids_task_durations
+            design_tc = ica_postprocess.preprocess_design_for_correlation(
+                design_tc=design_tc,
+                tr=tr,
+                polort=polort,
+                high_pass_hz=args.high_pass,
+                device=device,
+            )
+            condition_corr = component_condition_correlations(mixing_tk=mixing, design_tc=design_tc)
+            condition_spectral_corr = ica_postprocess.component_condition_spectral_correlations(
+                mixing_tk=mixing,
+                design_tc=design_tc,
+            )
+        except Exception as e:
+            print(f"  Warning: Could not compute condition correlations for run {run_idx + 1}: {e}")
+    elif onsets_files is not None and durations is not None:
         try:
             design_tc, cond_labels, cond_durations = build_task_design_for_run(
                 onsets_files=onsets_files,
@@ -1881,13 +1931,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     task = parser.add_argument_group("Task annotation (optional)")
     task.add_argument(
-        "-onsets", nargs="+", default=None, help="AFNI timing files (one per condition)"
+        "-onsets", nargs="+", default=None,
+        help="AFNI timing files (one per condition). Mutually exclusive with -events.",
     )
     task.add_argument(
         "-durations",
         nargs="+",
         default=None,
-        help="Durations: one value for all or one per condition",
+        help="Durations: one value for all or one per condition. Required with -onsets.",
+    )
+    task.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS *_events.tsv files for task annotation (one per run). "
+        "Mutually exclusive with -onsets.",
+    )
+    task.add_argument(
+        "-event_ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to exclude. Only valid with -events.",
+    )
+    task.add_argument(
+        "-event_cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Custom column names for onset, duration, trial_type. "
+        "Default: onset duration trial_type. Only valid with -events.",
     )
     task.add_argument(
         "-microtime_dt", type=float, default=0.1, help="Microtime resolution for task regressors"
@@ -2181,6 +2255,36 @@ def main() -> None:
     elif args.no_auto_mask:
         print("⚠ No mask and auto-mask disabled — using ALL voxels including background!")
 
+    # Validate and parse task annotation sources
+    _has_onsets = bool(args.onsets)
+    _has_events = bool(getattr(args, "events", None))
+    if _has_onsets and _has_events:
+        print("ERROR: Specify only one of -onsets or -events for task annotation")
+        sys.exit(1)
+    if getattr(args, "event_ignore", None) and not _has_events:
+        print("ERROR: -event_ignore requires -events")
+        sys.exit(1)
+    if getattr(args, "event_cols", None) and not _has_events:
+        print("ERROR: -event_cols requires -events")
+        sys.exit(1)
+
+    # Parse BIDS events (if provided) for task annotation
+    bids_task_onsets = None     # list[list[ndarray]] — all_onsets[cond][run]
+    bids_task_durations = None  # list[float]
+    bids_task_labels = None     # list[str]
+    if _has_events:
+        from fastfuncstuff.design.bids_events import parse_bids_events
+        event_cols = tuple(args.event_cols) if getattr(args, "event_cols", None) else None
+        bids_task_onsets, bids_task_durations, bids_task_labels = parse_bids_events(
+            event_files=args.events,
+            event_ignore=getattr(args, "event_ignore", None),
+            event_cols=event_cols,
+        )
+        print(
+            f"Task annotation: {len(bids_task_labels)} conditions from BIDS events: "
+            f"{bids_task_labels}"
+        )
+
     t_pipeline = time.time()
 
     if args.temp_concat:
@@ -2221,9 +2325,12 @@ def main() -> None:
                 args=args,
                 device=device,
                 shared_mask=shared_mask,
-                onsets_files=args.onsets,
-                durations=args.durations,
+                onsets_files=args.onsets if _has_onsets else None,
+                durations=args.durations if _has_onsets else None,
                 ortvec_specs=args.ortvec,
+                bids_task_onsets=bids_task_onsets,
+                bids_task_durations=bids_task_durations,
+                bids_task_labels=bids_task_labels,
             )
             all_meta.append(run_meta)
             print(

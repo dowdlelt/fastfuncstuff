@@ -456,6 +456,117 @@ def get_spmg1_hrf(
     return to_tensor(hrf_final, device=device, dtype=torch.float32)
 
 
+def estimate_hrf_window(
+    stim_duration: float,
+    tr: float,
+    threshold: float = 0.10,
+) -> int:
+    """
+    Estimate the FIR/TENT window length for a stimulus of a given duration.
+
+    Convolves the canonical SPMG1 HRF with a boxcar of length *stim_duration*,
+    then finds the last sample where the absolute response exceeds
+    *threshold* × peak.  Returns ``ceil(t / tr)`` in TRs.
+
+    Parameters
+    ----------
+    stim_duration : float
+        Stimulus duration in seconds (0 = brief impulse).
+    tr : float
+        Repetition time in seconds.
+    threshold : float, default=0.10
+        Fraction of peak below which the response is considered "back to
+        baseline".  0.10 means 10% of the peak amplitude.
+
+    Returns
+    -------
+    n_lags : int
+        Number of TRs needed to capture the full HRF response (≥ 1).
+
+    Notes
+    -----
+    ``hrf_duration`` is set to ``stim_duration + 40s`` so the decay tail is
+    never truncated, even for long block designs.
+    """
+    dt = 0.01  # high-resolution computation time step (seconds)
+    # Ensure the HRF is long enough to capture the full tail
+    hrf_duration = max(40.0, stim_duration + 40.0)
+
+    hrf_tensor = get_spmg1_hrf(
+        microtime_dt=dt,
+        stim_duration=stim_duration,
+        hrf_duration=hrf_duration,
+        normalize_peak=True,
+        device=None,  # CPU is fine — this is tiny
+    )
+    hrf = hrf_tensor.cpu().numpy()
+
+    peak = float(np.max(np.abs(hrf)))
+    if peak == 0:
+        return max(1, int(np.ceil(20.0 / tr)))
+
+    above = np.where(np.abs(hrf) > threshold * peak)[0]
+    if len(above) == 0:
+        return 1
+
+    t_last_s = float(above[-1]) * dt  # seconds
+    return max(1, int(np.ceil(t_last_s / tr)))
+
+
+def compute_windows_from_durations(
+    durations: list[float],
+    tr: float,
+    add_lag: list[int] | None = None,
+    threshold: float = 0.10,
+) -> list[tuple[float, float]]:
+    """
+    Compute per-condition FIR/TENT windows from stimulus durations.
+
+    For each condition, calls :func:`estimate_hrf_window` to find the number
+    of TRs needed to model the full HRF, then applies any per-condition lag
+    adjustment.
+
+    Parameters
+    ----------
+    durations : list of float
+        Stimulus duration per condition (seconds).
+    tr : float
+        Repetition time in seconds.
+    add_lag : list of int, optional
+        Per-condition lag adjustment in TRs (positive = more lags,
+        negative = fewer).  Can be length 1 (broadcast to all conditions)
+        or ``len(durations)``.  Defaults to all zeros.
+    threshold : float, default=0.10
+        Passed to :func:`estimate_hrf_window`.
+
+    Returns
+    -------
+    windows : list of (float, float)
+        Per-condition ``(bot, top)`` tuples in seconds.  ``bot`` is always
+        ``0.0``; ``top = n_lags * tr`` after applying *add_lag*.
+    """
+    n = len(durations)
+    if add_lag is None:
+        lags = [0] * n
+    elif len(add_lag) == 1:
+        lags = add_lag * n
+    else:
+        if len(add_lag) != n:
+            raise ValueError(
+                f"add_lag length ({len(add_lag)}) must be 1 or match "
+                f"number of conditions ({n})"
+            )
+        lags = list(add_lag)
+
+    windows: list[tuple[float, float]] = []
+    for dur, lag in zip(durations, lags):
+        n_lags = estimate_hrf_window(dur, tr, threshold)
+        n_lags = max(1, n_lags + lag)
+        windows.append((0.0, float(n_lags) * tr))
+
+    return windows
+
+
 def get_canonical_hrf_library(
     stim_duration: float,
     tr: float,

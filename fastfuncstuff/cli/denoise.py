@@ -176,14 +176,18 @@ Notes:
     required.add_argument(
         "-onsets",
         nargs="+",
-        required=True,
-        help="Onset timing files (AFNI format). One file per condition.",
+        required=False,
+        default=None,
+        help="Onset timing files (AFNI format). One file per condition. "
+        "Mutually exclusive with -events.",
     )
     required.add_argument(
         "-durations",
         nargs="+",
-        required=True,
-        help="Stimulus durations in seconds. Either single value or one per condition.",
+        required=False,
+        default=None,
+        help="Stimulus durations in seconds. Either single value or one per condition. "
+        "Required when using -onsets; derived automatically from -events.",
     )
     required.add_argument(
         "-tr",
@@ -196,6 +200,49 @@ Notes:
         "-prefix",
         required=True,
         help="Output file prefix (e.g., 'output/subject01')",
+    )
+
+    # BIDS events options
+    bids_opts = parser.add_argument_group("BIDS Events (alternative to -onsets/-durations)")
+    bids_opts.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS *_events.tsv files, one per run. Sorted by run number automatically. "
+        "Mutually exclusive with -onsets.",
+    )
+    bids_opts.add_argument(
+        "-event_ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to exclude. Only valid with -events.",
+    )
+    bids_opts.add_argument(
+        "-event_cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Custom column names for onset, duration, trial_type. "
+        "Default: onset duration trial_type. Only valid with -events.",
+    )
+    bids_opts.add_argument(
+        "-round_onsets",
+        nargs="?",
+        const=0.7,
+        type=float,
+        default=None,
+        metavar="THRESHOLD",
+        help="Round onsets to nearest TR. Fraction-through-TR >= THRESHOLD → ceil, else floor. "
+        "Default threshold if flag given without value: 0.7.",
+    )
+    bids_opts.add_argument(
+        "-round_durations",
+        type=int,
+        default=None,
+        metavar="PLACES",
+        help="Round stimulus durations to PLACES decimal places.",
     )
 
     # Denoising options
@@ -1447,21 +1494,63 @@ def main():
         print("ERROR: At least 2 runs required for cross-validation")
         sys.exit(1)
 
-    # Parse onset files
-    onset_files = args.onsets
-    n_conditions = len(onset_files)
+    # Validate onset/events mutual exclusivity
+    _has_onsets = bool(args.onsets)
+    _has_events = bool(args.events)
+    if _has_onsets and _has_events:
+        print("ERROR: Specify only one of -onsets/-durations or -events")
+        sys.exit(1)
+    if not _has_onsets and not _has_events:
+        print("ERROR: Must specify one of -onsets/-durations or -events")
+        sys.exit(1)
+    if args.event_ignore and not _has_events:
+        print("ERROR: -event_ignore requires -events")
+        sys.exit(1)
+    if args.event_cols and not _has_events:
+        print("ERROR: -event_cols requires -events")
+        sys.exit(1)
+    if _has_onsets and args.durations is None:
+        print("ERROR: -durations is required when using -onsets")
+        sys.exit(1)
+
+    # Parse onset metadata (condition labels and durations)
     from fastfuncstuff.cli_utils import clean_condition_labels
-    condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
+    all_onsets_bids = None  # populated here for BIDS path; AFNI path populates later
 
-    # Validate onset files
-    for f in onset_files:
-        if not Path(f).exists():
-            print(f"ERROR: Onset file not found: {f}")
+    if _has_events:
+        from fastfuncstuff.design.bids_events import parse_bids_events
+        if len(args.events) != n_runs:
+            print(
+                f"ERROR: -events: {len(args.events)} files but {n_runs} input runs"
+            )
             sys.exit(1)
+        event_cols = tuple(args.event_cols) if args.event_cols else None
+        all_onsets_bids, durations, condition_labels = parse_bids_events(
+            event_files=args.events,
+            event_ignore=args.event_ignore,
+            event_cols=event_cols,
+            round_durations=args.round_durations,
+        )
+        n_conditions = len(condition_labels)
+        onset_files = None
+        print(f"  BIDS events: {n_conditions} conditions from {len(args.events)} TSV files")
+        print(f"  Conditions: {condition_labels}")
+        print(f"  Durations: {durations}s")
+    else:
+        onset_files = args.onsets
+        n_conditions = len(onset_files)
+        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
 
-    # Parse durations
-    durations = parse_durations(args.durations, n_conditions, condition_labels)
-    print(f"  Durations: {durations}s")
+        # Validate onset files
+        for f in onset_files:
+            if not Path(f).exists():
+                print(f"ERROR: Onset file not found: {f}")
+                sys.exit(1)
+
+        durations = parse_durations(args.durations, n_conditions, condition_labels)
+        if args.round_durations is not None:
+            durations = [round(d, args.round_durations) for d in durations]
+        print(f"  Durations: {durations}s")
 
     # Parse HRF model arguments
     from fastfuncstuff.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
@@ -1722,16 +1811,24 @@ def main():
     print()
     print("Building design matrix...")
 
-    # Parse onset files
-    all_onsets = []
-    for onset_file in onset_files:
-        onsets_by_run = parse_afni_timing_file(onset_file)
-        if len(onsets_by_run) != n_runs:
-            print(
-                f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}"
-            )
-            sys.exit(1)
-        all_onsets.append(onsets_by_run)
+    # Build all_onsets: BIDS (already parsed) or AFNI (parse files now)
+    if all_onsets_bids is not None:
+        all_onsets = all_onsets_bids
+    else:
+        all_onsets = []
+        for onset_file in onset_files:
+            onsets_by_run = parse_afni_timing_file(onset_file)
+            if len(onsets_by_run) != n_runs:
+                print(
+                    f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}"
+                )
+                sys.exit(1)
+            all_onsets.append(onsets_by_run)
+
+    # Apply onset rounding (after TR is known from data load)
+    if args.round_onsets is not None:
+        from fastfuncstuff.design.builder import round_onsets as _round_onsets
+        all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
 
     # Build onset matrix at microtime resolution (shared function ensures
     # grid-consistent bin placement matching convolve_hrf_microtime)

@@ -1312,6 +1312,58 @@ def create_onset_matrix_microtime(
     return onset_matrix
 
 
+def round_onsets(
+    all_onsets: list[list[np.ndarray]],
+    tr: float,
+    threshold: float = 0.7,
+) -> list[list[np.ndarray]]:
+    """
+    Snap onset times to TR boundaries.
+
+    For each onset *t*:
+
+    - ``remainder = t % tr``
+    - if ``remainder / tr >= threshold`` → ceil to start of next TR
+    - else → floor to start of current TR
+
+    ``threshold=0.5`` is equivalent to standard nearest-TR rounding.
+    ``threshold=0.7`` (default) biases toward floor: only rounds up when
+    the onset is 70 %+ through a TR interval.  This is useful for designs
+    where events are nominally TR-locked but have small positive jitter.
+
+    Parameters
+    ----------
+    all_onsets : list[list[ndarray]]
+        Nested structure ``all_onsets[condition_idx][run_idx]``.
+    tr : float
+        Repetition time in seconds.
+    threshold : float, default=0.7
+        Fractional position within a TR above which an onset rounds up.
+
+    Returns
+    -------
+    list[list[ndarray]]
+        Same nested structure with rounded onset times (float64).
+    """
+    result: list[list[np.ndarray]] = []
+    for cond_onsets in all_onsets:
+        cond_result: list[np.ndarray] = []
+        for run_onsets in cond_onsets:
+            arr = np.asarray(run_onsets, dtype=np.float64)
+            if arr.size == 0:
+                cond_result.append(arr)
+                continue
+            remainder = arr % tr
+            rounded = np.where(
+                remainder / tr >= threshold,
+                np.ceil(arr / tr) * tr,
+                np.floor(arr / tr) * tr,
+            )
+            cond_result.append(rounded)
+        result.append(cond_result)
+    return result
+
+
 def parse_durations(
     durations_arg: list[str],
     n_conditions: int,
