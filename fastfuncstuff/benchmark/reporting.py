@@ -11,15 +11,50 @@ from .runner import StageResult
 from .timing_cache import get_ref_timings_all_archs
 
 
-def print_validation_report(results: list[StageResult]) -> None:
-    """Print a validation-only report table to terminal."""
+def _dataset_header(config: Any = None) -> str:
+    """Build a dataset info string from config, if available."""
+    if config is None:
+        return ""
+    parts = []
+    if hasattr(config, "dataset_id") and config.dataset_id:
+        parts.append(f"dataset={config.dataset_id}")
+    if hasattr(config, "subject"):
+        parts.append(f"sub-{config.subject}")
+    if hasattr(config, "session"):
+        parts.append(f"ses-{config.session}")
+    if hasattr(config, "tasks") and config.tasks:
+        task_strs = [f"{t}({len(r)} runs)" for t, r in config.tasks.items()]
+        parts.append("tasks: " + ", ".join(task_strs))
+    return "  ".join(parts)
+
+
+def print_validation_report(
+    results: list[StageResult],
+    config: Any = None,
+    data_dir: Path | None = None,
+) -> None:
+    """Print a validation-only report table to terminal.
+
+    Includes detailed per-stage metrics and historical regression analysis
+    when data_dir is provided.
+    """
+    from .timing_cache import _get_git_info
+
     ref_id = get_ref_arch_id()
     ffs_id = get_ffs_arch_id()
+    git = _get_git_info()
 
-    print(f"\nBENCHMARK VALIDATION  ref={ref_id}  ffs={ffs_id}")
-    print("=" * 64)
+    header = f"\nBENCHMARK VALIDATION  ref={ref_id}  ffs={ffs_id}"
+    if git["commit_short"]:
+        dirty = "*" if git["dirty"] else ""
+        header += f"  commit={git['commit_short']}{dirty} ({git['branch']})"
+    ds = _dataset_header(config)
+    if ds:
+        header += f"\n  {ds}"
+    print(header)
+    print("=" * 80)
     print(f"{'Stage':<16} {'Status':<8} {'Summary'}")
-    print("-" * 64)
+    print("-" * 80)
 
     n_pass = 0
     n_fail = 0
@@ -36,8 +71,13 @@ def print_validation_report(results: list[StageResult]) -> None:
         if r.stage_name == "moco" and r.validation:
             _print_moco_detail(r.validation)
 
-    print("-" * 64)
+    print("-" * 80)
     print(f"Total: {n_pass} passed, {n_fail} failed out of {len(results)} stages")
+
+    # Detailed metrics + historical comparison
+    _print_stage_details(results)
+    if data_dir:
+        _print_regression_analysis(results, data_dir, git)
 
 
 def _print_moco_detail(validation: dict) -> None:
@@ -116,7 +156,7 @@ def _glmsingle_aggregate(
 
 
 def print_timing_report(
-    results: list[StageResult], data_dir: Path | None = None,
+    results: list[StageResult], data_dir: Path | None = None, config: Any = None,
 ) -> None:
     """Print a full timing + validation report table.
 
@@ -124,9 +164,14 @@ def print_timing_report(
     (queried by CPU arch for ref, GPU for FFS) and annotated:
       †  = cached from this CPU architecture
       ‡  = cached from a different CPU architecture
+
+    Also prints detailed per-stage metrics and regression analysis.
     """
+    from .timing_cache import _get_git_info
+
     my_ref_id = get_ref_arch_id()
     my_ffs_id = get_ffs_arch_id()
+    git = _get_git_info()
 
     # Pre-fetch cached ref timings for stages where ref didn't run this time.
     # Also always fetch for glmsingle_matlab (it has no ffs_time so it's normally
@@ -137,7 +182,14 @@ def print_timing_report(
             if not (r.ref_time and r.ref_time > 0):
                 cached_refs[r.stage_name] = get_ref_timings_all_archs(data_dir, r.stage_name)
 
-    print(f"\nBENCHMARK  ref={my_ref_id}  ffs={my_ffs_id}")
+    header = f"\nBENCHMARK  ref={my_ref_id}  ffs={my_ffs_id}"
+    if git["commit_short"]:
+        dirty = "*" if git["dirty"] else ""
+        header += f"  commit={git['commit_short']}{dirty} ({git['branch']})"
+    ds = _dataset_header(config)
+    if ds:
+        header += f"\n  {ds}"
+    print(header)
     print("=" * 80)
     print(f"{'Stage':<16} {'Ref (s)':>12} {'FFS (s)':>10} {'Speedup':>10} {'Status'}")
     print("-" * 80)
@@ -209,6 +261,255 @@ def print_timing_report(
     if any_other_arch_ref:
         print(f"  ‡ cached ref timing from a different CPU architecture")
 
+    # Detailed metrics + historical comparison
+    _print_stage_details(results)
+    if data_dir:
+        _print_regression_analysis(results, data_dir, git)
+
+
+# ---------------------------------------------------------------------------
+# Detailed per-stage metrics
+# ---------------------------------------------------------------------------
+
+# Key metrics to display per stage (in display order).
+# Each entry: (metric_key_substring, display_name, format_spec)
+# If a stage has metrics matching these patterns, they're shown.
+_METRIC_DISPLAY = [
+    # Correlations / R²
+    ("min_r",           "min r",         ".4f"),
+    ("mean_r",          "mean r",        ".4f"),
+    ("median_r",        "median r",      ".4f"),
+    ("overall_mean_r",  "overall mean r",".4f"),
+    ("r2_spatial_corr", "R² spatial r",  ".4f"),
+    ("hrf_index_agreement", "HRF agree", ".1%"),
+    ("fracvalue_corr",  "frac r",        ".4f"),
+    ("beta_spatial_corr", "beta r",      ".4f"),
+    ("beta_timeseries_corr", "beta ts r", ".4f"),
+    ("noisepool_jaccard", "noise Jaccard", ".3f"),
+    ("xvaltrend_corr",  "xval r",        ".3f"),
+    # Differences
+    ("max_angle_diff",  "max angle diff",".3f"),
+    ("max_trans_diff",  "max trans diff", ".3f"),
+    ("mean_angle_diff", "mean angle diff",".3f"),
+    ("mean_trans_diff", "mean trans diff",".3f"),
+    # Counts
+    ("pcnum_diff",      "PC num diff",   ".0f"),
+    ("n_valid_runs",    "valid runs",    ".0f"),
+    ("n_voxels",        "voxels",        "d"),
+    # Coverage
+    ("coverage_0.5",    "cov@0.5",       ".2f"),
+    ("overall_coverage_0.5", "overall cov@0.5", ".2f"),
+    # MSD
+    ("mean_nrmsd",      "mean nrmsd",    ".4f"),
+    ("max_nrmsd",       "max nrmsd",     ".4f"),
+]
+
+
+def _print_stage_details(results: list[StageResult]) -> None:
+    """Print detailed metrics for each stage."""
+    from .timing_cache import extract_scalar_metrics
+
+    has_details = False
+    for r in results:
+        if not r.validation:
+            continue
+        metrics = extract_scalar_metrics(r.validation)
+        if not metrics:
+            continue
+
+        if not has_details:
+            print(f"\n{'DETAILED METRICS':=^80}")
+            has_details = True
+
+        print(f"\n  {r.stage_name}")
+        print(f"  {'-' * 40}")
+
+        # Show key metrics first (matched by display table)
+        shown = set()
+        for pattern, display_name, fmt in _METRIC_DISPLAY:
+            for key, val in sorted(metrics.items()):
+                if key in shown:
+                    continue
+                if pattern in key:
+                    # Include parent context for disambiguation
+                    parts = key.split(".")
+                    if len(parts) > 1 and parts[-1] == pattern:
+                        label = f"{parts[-2]}.{display_name}"
+                    elif key != pattern:
+                        label = key
+                    else:
+                        label = display_name
+                    try:
+                        val_str = f"{val:{fmt}}"
+                    except (ValueError, TypeError):
+                        val_str = str(val)
+                    print(f"    {label:<30} {val_str}")
+                    shown.add(key)
+
+        # Show remaining metrics not in the display table
+        remaining = {k: v for k, v in sorted(metrics.items()) if k not in shown}
+        # Group by top-level key
+        groups: dict[str, list[tuple[str, float]]] = {}
+        for key, val in remaining.items():
+            parts = key.split(".", 1)
+            group = parts[0] if len(parts) > 1 else ""
+            groups.setdefault(group, []).append((key, val))
+
+        for group, items in groups.items():
+            if len(items) > 8:
+                # Summarize large groups (e.g. per-run arrays)
+                vals = [v for _, v in items]
+                print(f"    {group:<30} [{len(items)} values] "
+                      f"mean={sum(vals)/len(vals):.4f} "
+                      f"range=[{min(vals):.4f}, {max(vals):.4f}]")
+            else:
+                for key, val in items:
+                    # Use full dotted key for disambiguation
+                    print(f"    {key:<30} {val:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# Regression analysis
+# ---------------------------------------------------------------------------
+
+def _print_regression_analysis(
+    results: list[StageResult],
+    data_dir: Path,
+    current_git: dict[str, Any],
+) -> None:
+    """Compare current metrics against the previous run and flag regressions."""
+    from .timing_cache import (
+        compare_stage_metrics,
+        extract_scalar_metrics,
+        get_previous_run,
+    )
+
+    current_commit = current_git.get("commit", "")
+    prev_run = get_previous_run(data_dir, current_commit=current_commit)
+    if prev_run is None:
+        return  # no history to compare against
+
+    prev_git = prev_run.get("git", {})
+    prev_commit = prev_git.get("commit_short", "?")
+    prev_ts = prev_run.get("timestamp", "")[:19].replace("T", " ")
+    prev_msg = prev_git.get("message", "")[:50]
+
+    print(f"\n{'REGRESSION ANALYSIS':=^80}")
+    print(f"  Comparing against: {prev_commit} ({prev_ts})")
+    if prev_msg:
+        print(f"  Previous commit: {prev_msg}")
+
+    any_regression = False
+    any_improvement = False
+    n_stages_compared = 0
+
+    for r in results:
+        if not r.validation:
+            continue
+        current_metrics = extract_scalar_metrics(r.validation)
+        if not current_metrics:
+            continue
+
+        prev_stage = prev_run.get("stages", {}).get(r.stage_name, {})
+        prev_metrics = prev_stage.get("metrics", {})
+        if not prev_metrics:
+            continue
+
+        deltas = compare_stage_metrics(current_metrics, prev_metrics, threshold_pct=0.1)
+        if not deltas:
+            continue
+
+        n_stages_compared += 1
+        regressions = [d for d in deltas if d.is_regression]
+        improvements = [d for d in deltas if not d.is_regression]
+
+        if regressions:
+            any_regression = True
+        if improvements:
+            any_improvement = True
+
+        # Only print stages that have changes
+        if not regressions and not improvements:
+            continue
+
+        prev_passed = prev_stage.get("passed")
+        status_change = ""
+        if prev_passed is not None and prev_passed != r.passed:
+            if r.passed and not prev_passed:
+                status_change = "  [FIXED]"
+            elif not r.passed and prev_passed:
+                status_change = "  [BROKEN]"
+
+        print(f"\n  {r.stage_name}{status_change}")
+
+        if regressions:
+            for d in sorted(regressions, key=lambda x: abs(x.pct_change), reverse=True)[:5]:
+                arrow = "v" if d.higher_is_better else "^"
+                print(f"    {arrow} {d.name:<30} {d.previous:.4f} -> {d.current:.4f}  "
+                      f"({d.pct_change:+.1f}%)")
+
+        if improvements:
+            for d in sorted(improvements, key=lambda x: abs(x.pct_change), reverse=True)[:5]:
+                arrow = "^" if d.higher_is_better else "v"
+                print(f"    {arrow} {d.name:<30} {d.previous:.4f} -> {d.current:.4f}  "
+                      f"({d.pct_change:+.1f}%)")
+
+    if n_stages_compared == 0:
+        print("  No previous metrics to compare against.")
+    elif not any_regression and not any_improvement:
+        print("  All metrics stable (< 0.1% change).")
+    else:
+        print(f"\n  {'=' * 60}")
+        parts = []
+        if any_regression:
+            parts.append("REGRESSIONS DETECTED")
+        if any_improvement:
+            parts.append("improvements found")
+        print(f"  {' | '.join(parts)}")
+
+    # FFS timing trend (if we have historical data)
+    _print_ffs_timing_trend(results, data_dir)
+
+
+def _print_ffs_timing_trend(
+    results: list[StageResult],
+    data_dir: Path,
+) -> None:
+    """Show FFS timing trend across recent runs."""
+    from .timing_cache import get_recent_runs
+
+    recent = get_recent_runs(data_dir, max_runs=5)
+    if len(recent) < 2:
+        return
+
+    # Build a table of FFS timings per stage across commits
+    stage_names = [r.stage_name for r in results if r.ffs_time and r.ffs_time > 0]
+    if not stage_names:
+        return
+
+    print(f"\n{'FFS TIMING TREND (last {len(recent)} runs)':=^80}")
+    # Header: commit hashes
+    commits = []
+    for run in recent:
+        git = run.get("git", {})
+        short = git.get("commit_short", "?")
+        dirty = "*" if git.get("dirty") else ""
+        commits.append(f"{short}{dirty}")
+
+    header = f"  {'Stage':<16}" + "".join(f"{c:>12}" for c in commits)
+    print(header)
+    print(f"  {'-' * (16 + 12 * len(commits))}")
+
+    for sname in stage_names:
+        row = f"  {sname:<16}"
+        for run in recent:
+            t = run.get("stages", {}).get(sname, {}).get("ffs_seconds")
+            if t is not None:
+                row += f"{t:>11.1f}s"
+            else:
+                row += f"{'-':>12}"
+        print(row)
+
 
 def _short_arch(arch_id: str) -> str:
     """Shorten an arch_id for compact display.
@@ -226,12 +527,14 @@ def _short_arch(arch_id: str) -> str:
     return arch_id
 
 
-def results_to_json(results: list[StageResult]) -> dict[str, Any]:
+def results_to_json(results: list[StageResult], config: Any = None) -> dict[str, Any]:
     """Convert results to a JSON-serializable dict."""
+    from .timing_cache import _get_git_info, extract_scalar_metrics
+
     arch_info = get_arch_info()
     stages = {}
     for r in results:
-        stages[r.stage_name] = {
+        entry: dict[str, Any] = {
             "passed": r.passed,
             "summary": r.summary,
             "ref_seconds": r.ref_time,
@@ -239,16 +542,26 @@ def results_to_json(results: list[StageResult]) -> dict[str, Any]:
             "validation": _sanitize_for_json(r.validation),
             "errors": r.errors,
         }
+        if r.validation:
+            entry["metrics"] = extract_scalar_metrics(
+                _sanitize_for_json(r.validation),
+            )
+        stages[r.stage_name] = entry
 
-    return {
+    result: dict[str, Any] = {
         "architecture": arch_info,
+        "git": _get_git_info(),
         "stages": stages,
     }
+    if config is not None and hasattr(config, "to_dict"):
+        result["config"] = config.to_dict()
+
+    return result
 
 
-def save_json_report(results: list[StageResult], path: str | Path) -> None:
+def save_json_report(results: list[StageResult], path: str | Path, config: Any = None) -> None:
     """Save results as JSON."""
-    data = results_to_json(results)
+    data = results_to_json(results, config=config)
     with open(str(path), "w") as f:
         json.dump(data, f, indent=2, default=str)
     print(f"\nJSON report saved: {path}")

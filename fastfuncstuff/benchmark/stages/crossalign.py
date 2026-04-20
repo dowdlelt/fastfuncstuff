@@ -21,19 +21,6 @@ from ..validation import compare_aff12, compare_volumes
 name = "crossalign"
 description = "Cross-run EPI alignment (3dAllineate vs ffs_allineate)"
 
-# All runs that need alignment to localizer run-1
-ALIGN_PAIRS = [
-    ("localizer", 2),
-    ("localizer", 3),
-    ("localizer", 4),
-    ("localizer", 5),
-    ("rest", 1),
-    ("rest", 2),
-    ("rest", 3),
-    ("rest", 4),
-    ("rest", 5),
-]
-
 THRESHOLDS = {
     "aligned_image_min_r": 0.98,  # aligned images should be nearly identical
     "max_angle_diff_deg": 0.5,    # rotation must agree within 0.5 degrees
@@ -41,35 +28,56 @@ THRESHOLDS = {
 }
 
 
+def _ref_task_run(ctx: BenchmarkContext) -> tuple[str, int]:
+    """Get the reference task/run for cross-alignment from config."""
+    params = ctx.get_stage_params("crossalign")
+    return params.get("reference_task", "localizer"), params.get("reference_run", 1)
+
+
+def _align_pairs(ctx: BenchmarkContext) -> list[tuple[str, int]]:
+    """All (task, run) pairs that need alignment to the reference, excluding the reference itself."""
+    ref_task, ref_run = _ref_task_run(ctx)
+    pairs = []
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
+            if task == ref_task and run == ref_run:
+                continue
+            pairs.append((task, run))
+    return pairs
+
+
 def _ref_mean(ctx: BenchmarkContext) -> Path:
-    """Reference mean image (localizer run-1, from AFNI moco)."""
-    return ctx.processing_dir / "afni_mean_sub-01_ses-01_task-localizer_run-1_bold.nii"
+    """Reference mean image (from AFNI moco)."""
+    ref_task, ref_run = _ref_task_run(ctx)
+    return ctx.processing_dir / f"afni_mean_{ctx.bids_prefix(ref_task, ref_run)}_bold.nii"
 
 
 def _src_mean(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.processing_dir / f"afni_mean_sub-01_ses-01_task-{task}_run-{run}_bold.nii"
+    return ctx.processing_dir / f"afni_mean_{ctx.bids_prefix(task, run)}_bold.nii"
 
 
 def _afni_mat(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_localizer_run-1_mat.aff12.1D"
+    ref_task, ref_run = _ref_task_run(ctx)
+    return ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
 
 
 def _afni_aligned(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.processing_dir / f"afni_mean_sub-01_ses-01_task-{task}_run-{run}_bold_al.nii"
+    return ctx.processing_dir / f"afni_mean_{ctx.bids_prefix(task, run)}_bold_al.nii"
 
 
 def _ffs_mat(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.processing_dir / f"ffs_mean_{task}_run-{run}_to_localizer_run-1_mat.aff12.1D"
+    ref_task, ref_run = _ref_task_run(ctx)
+    return ctx.processing_dir / f"ffs_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
 
 
 def _ffs_aligned(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.processing_dir / f"ffs_mean_sub-01_ses-01_task-{task}_run-{run}_bold_al.nii"
+    return ctx.processing_dir / f"ffs_mean_{ctx.bids_prefix(task, run)}_bold_al.nii"
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     if ctx.validate_only:
-        for task, run in ALIGN_PAIRS:
+        for task, run in _align_pairs(ctx):
             for p in [_afni_mat(ctx, task, run), _ffs_mat(ctx, task, run)]:
                 if not p.exists():
                     missing.append(str(p))
@@ -78,7 +86,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         ref = _ref_mean(ctx)
         if not ref.exists():
             missing.append(str(ref))
-        for task, run in ALIGN_PAIRS:
+        for task, run in _align_pairs(ctx):
             src = _src_mean(ctx, task, run)
             if not src.exists():
                 missing.append(str(src))
@@ -89,7 +97,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
     """Run AFNI 3dAllineate for all cross-run pairs."""
     total = 0.0
     ref = _ref_mean(ctx)
-    for task, run in ALIGN_PAIRS:
+    for task, run in _align_pairs(ctx):
         mat = _afni_mat(ctx, task, run)
         if mat.exists() and not ctx.force_ref:
             continue
@@ -101,7 +109,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
             f"-base {ref} -source {src} "
             f"-prefix {al_out} "
             f"-1Dmatrix_save {mat}",
-            label=f"3dAllineate mean {task} run-{run} → loc run-1",
+            label=f"3dAllineate mean {task} run-{run} → ref",
             cwd=ctx.processing_dir,
         )
         total += elapsed
@@ -112,7 +120,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_allineate for all cross-run pairs."""
     total = 0.0
     ref = _ref_mean(ctx)
-    for task, run in ALIGN_PAIRS:
+    for task, run in _align_pairs(ctx):
         mat = _ffs_mat(ctx, task, run)
         if mat.exists() and not ctx.force_ffs:
             continue
@@ -125,7 +133,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"-base {ref} -source {src} "
             f"-prefix {al_out} "
             f"-1Dmatrix_save {mat}",
-            label=f"ffs_allineate mean {task} run-{run} → loc run-1",
+            label=f"ffs_allineate mean {task} run-{run} → ref",
             cwd=ctx.processing_dir,
         )
         total += elapsed
@@ -137,7 +145,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     mat_results = []
     img_results = []
 
-    for task, run in ALIGN_PAIRS:
+    for task, run in _align_pairs(ctx):
         afni_m = _afni_mat(ctx, task, run)
         ffs_m = _ffs_mat(ctx, task, run)
 

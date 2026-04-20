@@ -24,6 +24,18 @@ name = "glmsingle_matlab"
 description = "Run MATLAB GLMsingle (reference implementation)"
 
 
+def _glm_params(ctx: BenchmarkContext) -> dict:
+    return ctx.get_stage_params("glm")
+
+
+def _primary_task(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("primary_task", "localizer")
+
+
+def _runs(ctx: BenchmarkContext) -> list[int]:
+    return ctx.runs_for_task(_primary_task(ctx))
+
+
 def _matlab_script(ctx: BenchmarkContext) -> Path:
     """Find the MATLAB comparison script."""
     # Project root: fastfuncstuff/benchmark/stages/glmsingle_matlab.py -> ../../..
@@ -52,8 +64,9 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         missing.append(f"MATLAB script: {script}")
 
     # Need MNI-resampled inputs
-    for r in range(1, 6):
-        f = ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{r}.nii.gz"
+    task = _primary_task(ctx)
+    for r in _runs(ctx):
+        f = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
         if not f.exists():
             missing.append(str(f))
 

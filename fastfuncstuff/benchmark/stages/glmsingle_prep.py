@@ -22,34 +22,57 @@ name = "glmsingle_prep"
 description = "Prepare slicetime-resampled MNI data for GLMsingle"
 
 
+def _glm_params(ctx: BenchmarkContext) -> dict:
+    return ctx.get_stage_params("glm")
+
+
+def _primary_task(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("primary_task", "localizer")
+
+
+def _runs(ctx: BenchmarkContext) -> list[int]:
+    return ctx.runs_for_task(_primary_task(ctx))
+
+
+def _ref_task_run(ctx: BenchmarkContext) -> tuple[str, int]:
+    params = ctx.get_stage_params("crossalign")
+    return params.get("reference_task", "localizer"), params.get("reference_run", 1)
+
+
 def _input_path(ctx: BenchmarkContext, run: int) -> Path:
-    return ctx.func_dir / f"sub-01_ses-01_task-localizer_run-{run}_bold.nii"
+    task = _primary_task(ctx)
+    return ctx.func_dir / f"{ctx.bids_prefix(task, run)}_bold.nii"
 
 
 def _st_path(ctx: BenchmarkContext, run: int) -> Path:
-    return ctx.processing_dir / f"ffs_st_resampled_task-localizer_run-{run}.nii.gz"
+    task = _primary_task(ctx)
+    return ctx.processing_dir / f"ffs_st_resampled_task-{task}_run-{run}.nii.gz"
 
 
 def _output_path(ctx: BenchmarkContext, run: int) -> Path:
-    return ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{run}.nii.gz"
+    task = _primary_task(ctx)
+    return ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{run}.nii.gz"
 
 
 def _nwarp_chain(ctx: BenchmarkContext, run: int) -> str:
-    """Build warp chain for localizer runs (same as warp stage)."""
+    """Build warp chain for runs (same as warp stage)."""
     p = ctx.processing_dir
     ssw = p / "sswarper_output"
+    subid = f"sub-{ctx.subject}"
+    task = _primary_task(ctx)
+    ref_task, ref_run = _ref_task_run(ctx)
 
     parts = [
-        str(ssw / "anatQQ.sub-01_WARP.nii"),
-        str(ssw / "anatQQ.sub-01.aff12.1D"),
+        str(ssw / f"anatQQ.{subid}_WARP.nii"),
+        str(ssw / f"anatQQ.{subid}.aff12.1D"),
         str(p / "anat_al_keep_e2a_only_mat.aff12.1D"),
     ]
 
-    if run > 1:
-        align_mat = p / f"afni_mean_localizer_run-{run}_to_localizer_run-1_mat.aff12.1D"
+    if not (task == ref_task and run == ref_run):
+        align_mat = p / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
         parts.append(str(align_mat))
 
-    moco_mat = p / f"afni_moco_sub-01_ses-01_task-localizer_run-{run}_bold_mat.aff12.1D"
+    moco_mat = p / f"afni_moco_{ctx.bids_prefix(task, run)}_bold_mat.aff12.1D"
     parts.append(str(moco_mat))
 
     return " ".join(parts)
@@ -57,24 +80,28 @@ def _nwarp_chain(ctx: BenchmarkContext, run: int) -> str:
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
+    runs = _runs(ctx)
+    task = _primary_task(ctx)
+
     if ctx.validate_only:
-        for r in range(1, 6):
+        for r in runs:
             out = _output_path(ctx, r)
             if not out.exists():
                 missing.append(str(out))
         return missing
 
     # Need raw inputs + BIDS JSON (for SliceTiming)
-    for r in range(1, 6):
+    for r in runs:
         inp = _input_path(ctx, r)
         if not inp.exists():
             missing.append(str(inp))
-    json_path = ctx.func_dir / "sub-01_ses-01_task-localizer_run-1_bold.json"
+    json_path = ctx.func_dir / f"{ctx.bids_prefix(task, runs[0])}_bold.json"
     if not json_path.exists():
         missing.append(str(json_path))
 
     # Need warp chain files (from moco + align + warp stages)
-    master = ctx.processing_dir / "autobox_anatQQ.sub-01.nii"
+    subid = f"sub-{ctx.subject}"
+    master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
     if not master.exists():
         missing.append(str(master))
     e2a = ctx.processing_dir / "anat_al_keep_e2a_only_mat.aff12.1D"
@@ -85,11 +112,13 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 
 
 def run_ffs(ctx: BenchmarkContext) -> float:
-    """Run slicetime+resample then warp to MNI for all localizer runs."""
+    """Run slicetime+resample then warp to MNI for all runs."""
     total = 0.0
-    master = ctx.processing_dir / "autobox_anatQQ.sub-01.nii"
+    subid = f"sub-{ctx.subject}"
+    task = _primary_task(ctx)
+    master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
 
-    for run in range(1, 6):
+    for run in _runs(ctx):
         out = _output_path(ctx, run)
         if out.exists() and not ctx.force_ffs:
             continue
@@ -97,7 +126,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         # Step 1: slicetime correct + resample to TR=1.5
         st = _st_path(ctx, run)
         if not st.exists() or ctx.force_ffs:
-            tp = ctx.tpattern_file("localizer", run)
+            tp = ctx.tpattern_file(task, run)
             elapsed, _ = run_timed(
                 f"ffs_slicetime "
                 f"-input {_input_path(ctx, run)} "
@@ -105,7 +134,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 f"-tpattern {tp} "
                 f"-resample 1.5 "
                 f"-prefix {st}",
-                label=f"ffs_slicetime -resample 1.5 localizer run-{run}",
+                label=f"ffs_slicetime -resample 1.5 {task} run-{run}",
                 cwd=ctx.processing_dir,
             )
             total += elapsed
@@ -118,7 +147,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f'-nwarp "{nwarp}" '
             f'-source {st} '
             f'-prefix {out}',
-            label=f"ffs_nwarp resampled localizer run-{run}",
+            label=f"ffs_nwarp resampled {task} run-{run}",
             cwd=ctx.processing_dir,
         )
         total += elapsed
@@ -128,17 +157,19 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 def validate(ctx: BenchmarkContext) -> dict:
     """Check that all resampled MNI files exist and have expected shape."""
+    runs = _runs(ctx)
     present = []
     missing = []
-    for r in range(1, 6):
+    for r in runs:
         out = _output_path(ctx, r)
         if out.exists():
             present.append(str(out.name))
         else:
             missing.append(str(out.name))
 
+    n_runs = len(runs)
     passed = len(missing) == 0
-    summary = f"{len(present)}/5 resampled runs present"
+    summary = f"{len(present)}/{n_runs} resampled runs present"
     if missing:
         summary += f", missing: {', '.join(missing)}"
 

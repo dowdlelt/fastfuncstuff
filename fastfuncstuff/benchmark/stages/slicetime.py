@@ -16,16 +16,26 @@ THRESHOLDS = {
 }
 
 
+def _ref_task(ctx: BenchmarkContext) -> str:
+    params = ctx.get_stage_params("crossalign")
+    return params.get("reference_task", "localizer")
+
+
+def _ref_run(ctx: BenchmarkContext) -> int:
+    params = ctx.get_stage_params("crossalign")
+    return params.get("reference_run", 1)
+
+
 def _input_path(ctx: BenchmarkContext) -> Path:
-    return ctx.func_dir / "sub-01_ses-01_task-localizer_run-1_bold.nii"
+    return ctx.func_dir / f"{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.nii"
 
 
 def _afni_out(ctx: BenchmarkContext) -> Path:
-    return ctx.processing_dir / "afni_tshift_sub-01_ses-01_task-localizer_run-1_bold.nii"
+    return ctx.processing_dir / f"afni_tshift_{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.nii"
 
 
 def _ffs_out(ctx: BenchmarkContext) -> Path:
-    return ctx.processing_dir / "ffs_tshift_sub-01_ses-01_task-localizer_run-1_bold.nii"
+    return ctx.processing_dir / f"ffs_tshift_{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.nii"
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
@@ -39,7 +49,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         if not _input_path(ctx).exists():
             missing.append(str(_input_path(ctx)))
         # SliceTiming comes from BIDS JSON — just need the JSON to exist
-        json_path = ctx.func_dir / "sub-01_ses-01_task-localizer_run-1_bold.json"
+        json_path = ctx.func_dir / f"{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.json"
         if not json_path.exists():
             missing.append(str(json_path))
     return missing

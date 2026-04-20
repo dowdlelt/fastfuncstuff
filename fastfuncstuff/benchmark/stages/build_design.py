@@ -18,18 +18,40 @@ from ..runner import BenchmarkContext, run_timed
 name = "build_design"
 description = "Design matrix (3dDeconvolve X.xmat.1D vs ffs_build_design)"
 
-RUNS = [1, 2, 3, 4, 5]
-
-STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
-HRF_MODEL = "SPMG1(3)"
-
-GLTS = [
+_DEFAULT_STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
+_DEFAULT_HRF_MODEL = "SPMG1(3)"
+_DEFAULT_GLTS = [
     ("faces_vs_objects", "SYM: +1*faces -1*objects"),
     ("faces_vs_scenes",  "SYM: +1*faces -1*scenes"),
     ("faces_vs_scrambled", "SYM: +1*faces -1*scrambled"),
 ]
 
 THRESHOLD_MIN_R = 0.99  # applied per-run, per-label (within-run only)
+
+
+def _glm_params(ctx: BenchmarkContext) -> dict:
+    return ctx.get_stage_params("glm")
+
+
+def _primary_task(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("primary_task", "localizer")
+
+
+def _runs(ctx: BenchmarkContext) -> list[int]:
+    return ctx.runs_for_task(_primary_task(ctx))
+
+
+def _stim_labels(ctx: BenchmarkContext) -> list[str]:
+    return _glm_params(ctx).get("stim_labels", _DEFAULT_STIM_LABELS)
+
+
+def _hrf_model(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("hrf_model", _DEFAULT_HRF_MODEL)
+
+
+def _glts(ctx: BenchmarkContext) -> list[tuple[str, str]]:
+    raw = _glm_params(ctx).get("glts", _DEFAULT_GLTS)
+    return [(g[0], g[1]) for g in raw]
 
 
 def _afni_xmat(ctx: BenchmarkContext) -> Path:
@@ -41,11 +63,13 @@ def _ffs_xmat(ctx: BenchmarkContext) -> Path:
 
 
 def _scaled_input(ctx: BenchmarkContext, run: int) -> Path:
-    return ctx.processing_dir / f"scaled_afni_mni_task-localizer_run-{run}.nii.gz"
+    task = _primary_task(ctx)
+    return ctx.processing_dir / f"scaled_afni_mni_task-{task}_run-{run}.nii.gz"
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
+    task = _primary_task(ctx)
 
     afni_xmat = _afni_xmat(ctx)
     if not afni_xmat.exists():
@@ -54,12 +78,12 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         )
 
     timing_dir = ctx.timing_dir
-    for label in STIM_LABELS:
-        t = timing_dir / f"onsets.localizer.times.{label}.txt"
+    for label in _stim_labels(ctx):
+        t = timing_dir / f"onsets.{task}.times.{label}.txt"
         if not t.exists():
             missing.append(str(t))
 
-    for run in RUNS:
+    for run in _runs(ctx):
         s = _scaled_input(ctx, run)
         if not s.exists():
             missing.append(str(s))
@@ -75,7 +99,7 @@ def _detect_polort(afni_xmat_path: Path) -> int:
     col_groups = info.get("column_groups") or []
     # AFNI convention: group <= 0 → baseline/polynomial columns
     n_baseline = sum(1 for g in col_groups if g <= 0)
-    n_runs = len(info.get("run_starts") or [RUNS])
+    n_runs = len(info.get("run_starts") or [0])
     if n_runs == 0:
         return 3  # safe default
     # polort + 1 baseline columns per run
@@ -93,16 +117,17 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
     polort = _detect_polort(_afni_xmat(ctx))
 
-    inputs = " ".join(str(_scaled_input(ctx, r)) for r in RUNS)
+    task = _primary_task(ctx)
+    inputs = " ".join(str(_scaled_input(ctx, r)) for r in _runs(ctx))
 
     stim_args = " ".join(
-        f"-stim {ctx.timing_dir}/onsets.localizer.times.{label}.txt '{HRF_MODEL}' {label}"
-        for label in STIM_LABELS
+        f"-stim {ctx.timing_dir}/onsets.{task}.times.{label}.txt '{_hrf_model(ctx)}' {label}"
+        for label in _stim_labels(ctx)
     )
 
     glt_args = " ".join(
         f"-gltsym '{sym}' {label}"
-        for label, sym in GLTS
+        for label, sym in _glts(ctx)
     )
 
     elapsed, _ = run_timed(

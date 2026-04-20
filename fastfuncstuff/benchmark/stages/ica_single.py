@@ -16,13 +16,16 @@ from ..validation import compare_ica_components
 name = "ica_single"
 description = "ICA single-run (melodic vs ffs_ica per run)"
 
-DATASETS = ["rest", "localizer"]
-RUNS = [1, 2, 3, 4, 5]
-
 THRESHOLDS = {
     "mean_matched_r": 0.60,   # per-run ICA is noisier than concat
     "coverage_0.5": 0.60,
 }
+
+
+def _ica_tasks(ctx: BenchmarkContext) -> list[str]:
+    """Tasks to run ICA on (from config or default to all tasks)."""
+    params = ctx.get_stage_params("ica")
+    return params.get("tasks", ctx.task_names())
 
 
 def _melodic_dir(ctx: BenchmarkContext, dataset: str, run: int) -> Path:
@@ -52,15 +55,15 @@ def _mni_input(ctx: BenchmarkContext, dataset: str, run: int) -> Path:
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     if ctx.validate_only:
-        for dataset in DATASETS:
-            for run in RUNS:
+        for dataset in _ica_tasks(ctx):
+            for run in ctx.runs_for_task(dataset):
                 for path in [_melodic_ic(ctx, dataset, run),
                              _ffs_ic(ctx, dataset, run)]:
                     if not path.exists():
                         missing.append(str(path))
     else:
-        for dataset in DATASETS:
-            for run in RUNS:
+        for dataset in _ica_tasks(ctx):
+            for run in ctx.runs_for_task(dataset):
                 inp = _mni_input(ctx, dataset, run)
                 if not inp.exists():
                     missing.append(str(inp))
@@ -71,8 +74,8 @@ def run_ref(ctx: BenchmarkContext) -> float:
     """Run FSL melodic on each run independently."""
     ctx.melodic_ica_dir.mkdir(parents=True, exist_ok=True)
     total = 0.0
-    for dataset in DATASETS:
-        for run in RUNS:
+    for dataset in _ica_tasks(ctx):
+        for run in ctx.runs_for_task(dataset):
             out_dir = _melodic_dir(ctx, dataset, run)
             if _melodic_ic(ctx, dataset, run).exists() and not ctx.force_ref:
                 continue
@@ -93,17 +96,18 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_ica on each run independently (run-wise default mode)."""
     ctx.ffs_ica_dir.mkdir(parents=True, exist_ok=True)
     total = 0.0
-    for dataset in DATASETS:
+    for dataset in _ica_tasks(ctx):
         # Check if all runs already exist
+        runs = ctx.runs_for_task(dataset)
         all_exist = all(
-            _ffs_ic(ctx, dataset, run).exists() for run in RUNS
+            _ffs_ic(ctx, dataset, run).exists() for run in runs
         )
         if all_exist and not ctx.force_ffs:
             continue
 
         # ffs_ica in default run-wise mode processes all inputs independently
         # but outputs with run01..runNN tags
-        inputs = " ".join(str(_mni_input(ctx, dataset, r)) for r in RUNS)
+        inputs = " ".join(str(_mni_input(ctx, dataset, r)) for r in runs)
         prefix = _ffs_prefix(ctx, dataset)
         elapsed, _ = run_timed(
             f"ffs_ica -input {inputs} "
@@ -121,8 +125,8 @@ def validate(ctx: BenchmarkContext) -> dict:
     comp_counts_melodic = []
     comp_counts_ffs = []
 
-    for dataset in DATASETS:
-        for run in RUNS:
+    for dataset in _ica_tasks(ctx):
+        for run in ctx.runs_for_task(dataset):
             melodic_path = _melodic_ic(ctx, dataset, run)
             ffs_path = _ffs_ic(ctx, dataset, run)
             mask_path = _melodic_mask(ctx, dataset, run)

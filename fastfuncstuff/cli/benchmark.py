@@ -13,7 +13,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=(
             "Benchmark AFNI vs FFS tools: accuracy validation and timing comparison.\n"
             "\n"
-            "Requires OpenNeuro ds005165 data and existing AFNI+FFS outputs.\n"
+            "Supports arbitrary BIDS datasets via -config YAML files.\n"
+            "Default: OpenNeuro ds005165 (sub-01, ses-01).\n"
             "Use -validate-only to compare existing outputs without re-running tools."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -23,8 +24,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Show this help message",
     )
     parser.add_argument(
+        "-config", type=str, default=None, metavar="YAML",
+        help="Path to benchmark config YAML. Defines dataset, subject, session, "
+             "tasks, runs, stages, and stage-specific params. "
+             "Default: auto-detect from data directory or use built-in ds005165 config.",
+    )
+    parser.add_argument(
         "-data-dir", type=str, default=None,
-        help="Path to ds005165-download directory. Default: auto-detect.",
+        help="Path to BIDS dataset directory. Default: auto-detect.",
     )
     from ..benchmark.stages import STAGE_MAP as _STAGE_MAP
     _stage_names = ",".join(_STAGE_MAP)
@@ -141,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_cache or args.remove_cache is not None or args.import_cache is not None:
         return _manage_cache(args)
 
+    from ..benchmark.config import default_config, find_config, load_config
     from ..benchmark.reporting import (
         print_timing_report,
         print_validation_report,
@@ -159,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
                 # No existing dir found — use project-root default
                 data_dir = _default_data_dir()
             else:
-                print("ERROR: Cannot find ds005165-download directory.")
+                print("ERROR: Cannot find data directory.")
                 print("Specify with -data-dir or run from the project root.")
                 return 1
 
@@ -172,14 +180,38 @@ def main(argv: list[str] | None = None) -> int:
         print("Use -download to fetch from OpenNeuro.")
         return 1
 
+    # Load config: explicit -config > auto-detect from data_dir > default
+    if args.config:
+        config_path = Path(args.config)
+        try:
+            config = load_config(config_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"ERROR: {e}")
+            return 1
+        print(f"Config: {config_path}")
+    else:
+        config_path = find_config(data_dir)
+        if config_path is not None:
+            try:
+                config = load_config(config_path)
+            except (FileNotFoundError, ValueError) as e:
+                print(f"WARNING: Found config {config_path} but failed to load: {e}")
+                config = default_config()
+            else:
+                print(f"Config: {config_path}")
+        else:
+            config = default_config()
+
     # Create processing dir if needed (from-zero runs won't have it yet)
     processing = data_dir / "processing"
     processing.mkdir(parents=True, exist_ok=True)
 
-    # Resolve stages
+    # Resolve stages: CLI -stages overrides config, config overrides all-stages
     stage_names = None
     if args.stages:
         stage_names = [s.strip() for s in args.stages.split(",")]
+    elif config.stages:
+        stage_names = config.stages
 
     try:
         stages = get_stages(stage_names)
@@ -196,8 +228,14 @@ def main(argv: list[str] | None = None) -> int:
         validate_only=args.validate_only,
         device=args.device,
         show_output=args.verbose,
+        config=config,
     )
 
+    # Print dataset header
+    tasks_summary = ", ".join(
+        f"{t}({len(r)} runs)" for t, r in ctx.all_task_run_pairs()
+    )
+    print(f"Dataset: {ctx.dataset_id}  sub-{ctx.subject}/ses-{ctx.session}  {tasks_summary}")
     print(f"Data directory: {data_dir}")
     print(f"Stages: {', '.join(s.name for s in stages)}")
     print(f"Mode: {'validate-only' if ctx.validate_only else 'full'}")
@@ -223,12 +261,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Report
     if args.report:
-        print_timing_report(results, data_dir=data_dir)
+        print_timing_report(results, data_dir=data_dir, config=ctx.config)
     else:
-        print_validation_report(results)
+        print_validation_report(results, config=ctx.config, data_dir=data_dir)
 
     if args.json:
-        save_json_report(results, args.json)
+        save_json_report(results, args.json, config=ctx.config)
 
     # Plots
     if args.plot:

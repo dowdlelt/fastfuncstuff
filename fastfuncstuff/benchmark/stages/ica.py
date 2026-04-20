@@ -10,13 +10,16 @@ from ..validation import compare_ica_components
 name = "ica"
 description = "ICA (melodic vs ffs_ica -temp_concat)"
 
-DATASETS = ["rest", "localizer"]
-RUNS = [1, 2, 3, 4, 5]
-
 THRESHOLDS = {
     "mean_matched_r": 0.70,
     "coverage_0.5": 0.80,
 }
+
+
+def _ica_tasks(ctx: BenchmarkContext) -> list[str]:
+    """Tasks to run ICA on (from config or default to all tasks)."""
+    params = ctx.get_stage_params("ica")
+    return params.get("tasks", ctx.task_names())
 
 
 def _melodic_dir(ctx: BenchmarkContext, dataset: str) -> Path:
@@ -39,14 +42,14 @@ def _mni_inputs(ctx: BenchmarkContext, dataset: str) -> list[Path]:
     """Warped functional inputs for ICA."""
     return [
         ctx.processing_dir / f"afni_mni_task-{dataset}_run-{r}.nii.gz"
-        for r in RUNS
+        for r in ctx.runs_for_task(dataset)
     ]
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     if ctx.validate_only:
-        for dataset in DATASETS:
+        for dataset in _ica_tasks(ctx):
             for path in [
                 _melodic_ic(ctx, dataset),
                 _ffs_ic(ctx, dataset),
@@ -56,7 +59,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
                     missing.append(str(path))
     else:
         # Need warped functionals as input
-        for dataset in DATASETS:
+        for dataset in _ica_tasks(ctx):
             for inp in _mni_inputs(ctx, dataset):
                 if not inp.exists():
                     missing.append(str(inp))
@@ -67,7 +70,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
     """Run FSL melodic for both datasets."""
     ctx.melodic_ica_dir.mkdir(parents=True, exist_ok=True)
     total = 0.0
-    for dataset in DATASETS:
+    for dataset in _ica_tasks(ctx):
         out_dir = _melodic_dir(ctx, dataset)
         if _melodic_ic(ctx, dataset).exists() and not ctx.force_ref:
             continue
@@ -88,7 +91,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_ica -temp_concat for both datasets."""
     ctx.ffs_ica_dir.mkdir(parents=True, exist_ok=True)
     total = 0.0
-    for dataset in DATASETS:
+    for dataset in _ica_tasks(ctx):
         if _ffs_ic(ctx, dataset).exists() and not ctx.force_ffs:
             continue
         inputs = " ".join(str(p) for p in _mni_inputs(ctx, dataset))
@@ -110,7 +113,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     """Compare ICA components between melodic and ffs_ica."""
     results = {}
 
-    for dataset in DATASETS:
+    for dataset in _ica_tasks(ctx):
         melodic_path = _melodic_ic(ctx, dataset)
         ffs_path = _ffs_ic(ctx, dataset)
         mask_path = _melodic_mask(ctx, dataset)

@@ -10,8 +10,7 @@ from ..validation import compare_im_bucket
 name = "glm_im"
 description = "IM model OLS (3dDeconvolve -stim_times_IM vs ffs_reml -Obuck)"
 
-RUNS = [1, 2, 3, 4, 5]
-STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
+_DEFAULT_STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
 
 THRESHOLDS = {
     # Spatial r per sub-brick (betas, t-stats, F-stat)
@@ -19,6 +18,29 @@ THRESHOLDS = {
     # Voxelwise "temporal" r across the beta / t-stat stack
     "temporal_min_median_r": 0.95,
 }
+
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+
+def _glm_params(ctx: BenchmarkContext) -> dict:
+    return ctx.get_stage_params("glm")
+
+
+def _primary_task(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("primary_task", "localizer")
+
+
+def _runs(ctx: BenchmarkContext) -> list[int]:
+    return ctx.runs_for_task(_primary_task(ctx))
+
+
+def _stim_labels(ctx: BenchmarkContext) -> list[str]:
+    return _glm_params(ctx).get("stim_labels", _DEFAULT_STIM_LABELS)
+
+
+def _hrf_model(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("hrf_model", "SPMG1(3)")
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
@@ -33,7 +55,8 @@ def _ffs_dir(ctx: BenchmarkContext) -> Path:
 
 
 def _scaled_input(ctx: BenchmarkContext, run: int) -> Path:
-    return ctx.processing_dir / f"scaled_afni_mni_task-localizer_run-{run}.nii.gz"
+    task = _primary_task(ctx)
+    return ctx.processing_dir / f"scaled_afni_mni_task-{task}_run-{run}.nii.gz"
 
 
 def _automask_path(ctx: BenchmarkContext) -> Path:
@@ -46,11 +69,13 @@ def _xmat(ctx: BenchmarkContext) -> Path:
 
 
 def _afni_bucket(ctx: BenchmarkContext) -> Path:
-    return _afni_dir(ctx) / "IM_afni_stats_localizer.nii.gz"
+    task = _primary_task(ctx)
+    return _afni_dir(ctx) / f"IM_afni_stats_{task}.nii.gz"
 
 
 def _ffs_bucket(ctx: BenchmarkContext) -> Path:
-    return _ffs_dir(ctx) / "IM_ffs_stats_localizer.nii.gz"
+    task = _primary_task(ctx)
+    return _ffs_dir(ctx) / f"IM_ffs_stats_{task}.nii.gz"
 
 
 # ── Stage interface ───────────────────────────────────────────────────────────
@@ -63,7 +88,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
             if not p.exists():
                 missing.append(str(p))
     else:
-        for run in RUNS:
+        for run in _runs(ctx):
             src = _scaled_input(ctx, run)
             if not src.exists():
                 missing.append(str(src))
@@ -80,19 +105,21 @@ def run_ref(ctx: BenchmarkContext) -> float:
     if _afni_bucket(ctx).exists() and not ctx.force_ref:
         return 0.0
 
-    inputs = " ".join(str(_scaled_input(ctx, r)) for r in RUNS)
+    task = _primary_task(ctx)
+    stim_labels = _stim_labels(ctx)
+    inputs = " ".join(str(_scaled_input(ctx, r)) for r in _runs(ctx))
     mask = _automask_path(ctx)
 
     stim_args = " ".join(
-        f"-stim_times_IM {i} {ctx.timing_dir}/onsets.localizer.times.{label}.txt "
-        f"'SPMG1(3)' -stim_label {i} {label}"
-        for i, label in enumerate(STIM_LABELS, 1)
+        f"-stim_times_IM {i} {ctx.timing_dir}/onsets.{task}.times.{label}.txt "
+        f"'{_hrf_model(ctx)}' -stim_label {i} {label}"
+        for i, label in enumerate(stim_labels, 1)
     )
 
     elapsed, _ = run_timed(
         f"3dDeconvolve -overwrite "
         f"-input {inputs} "
-        f"-polort A -num_stimts {len(STIM_LABELS)} -float "
+        f"-polort A -num_stimts {len(stim_labels)} -float "
         f"{stim_args} "
         f"-jobs 10 -noFDR "
         f"-tout "
@@ -113,7 +140,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     if _ffs_bucket(ctx).exists() and not ctx.force_ffs:
         return 0.0
 
-    inputs = " ".join(str(_scaled_input(ctx, r)) for r in RUNS)
+    inputs = " ".join(str(_scaled_input(ctx, r)) for r in _runs(ctx))
     mask = _automask_path(ctx)
 
     elapsed, _ = run_timed(

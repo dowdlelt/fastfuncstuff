@@ -8,9 +8,6 @@ from ..validation import compare_1d_params, compare_moco_ssd, compare_volumes
 name = "moco"
 description = "Motion correction (3dvolreg vs ffs_moco)"
 
-TASKS = ["localizer", "rest"]
-RUNS = [1, 2, 3, 4, 5]
-
 MOTION_PARAM_NAMES = ["roll", "pitch", "yaw", "dS", "dL", "dP"]
 
 THRESHOLDS = {
@@ -24,11 +21,11 @@ THRESHOLDS = {
 
 
 def _afni_moco_path(ctx: BenchmarkContext, task: str, run: int) -> str:
-    return str(ctx.processing_dir / f"afni_moco_sub-01_ses-01_task-{task}_run-{run}_bold.nii")
+    return str(ctx.processing_dir / f"afni_moco_{ctx.bids_prefix(task, run)}_bold.nii")
 
 
 def _ffs_moco_path(ctx: BenchmarkContext, task: str, run: int) -> str:
-    return str(ctx.processing_dir / f"ffs_moco_sub-01_ses-01_task-{task}_run-{run}_bold.nii")
+    return str(ctx.processing_dir / f"ffs_moco_{ctx.bids_prefix(task, run)}_bold.nii")
 
 
 def _afni_motion_path(ctx: BenchmarkContext, task: str, run: int) -> str:
@@ -40,15 +37,15 @@ def _ffs_motion_path(ctx: BenchmarkContext, task: str, run: int) -> str:
 
 
 def _afni_mean_path(ctx: BenchmarkContext, task: str, run: int) -> str:
-    return str(ctx.processing_dir / f"afni_mean_sub-01_ses-01_task-{task}_run-{run}_bold.nii")
+    return str(ctx.processing_dir / f"afni_mean_{ctx.bids_prefix(task, run)}_bold.nii")
 
 
 def _ffs_mean_path(ctx: BenchmarkContext, task: str, run: int) -> str:
-    return str(ctx.processing_dir / f"ffs_mean_sub-01_ses-01_task-{task}_run-{run}_bold.nii")
+    return str(ctx.processing_dir / f"ffs_mean_{ctx.bids_prefix(task, run)}_bold.nii")
 
 
 def _input_path(ctx: BenchmarkContext, task: str, run: int) -> str:
-    return str(ctx.func_dir / f"sub-01_ses-01_task-{task}_run-{run}_bold.nii")
+    return str(ctx.func_dir / f"{ctx.bids_prefix(task, run)}_bold.nii")
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
@@ -59,8 +56,8 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 
     if ctx.validate_only:
         # Need both AFNI and FFS outputs
-        for task in TASKS:
-            for run in RUNS:
+        for task, runs in ctx.all_task_run_pairs():
+            for run in runs:
                 for path in [
                     _afni_moco_path(ctx, task, run),
                     _ffs_moco_path(ctx, task, run),
@@ -73,8 +70,8 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
                         missing.append(path)
     else:
         # Need raw input data
-        for task in TASKS:
-            for run in RUNS:
+        for task, runs in ctx.all_task_run_pairs():
+            for run in runs:
                 inp = _input_path(ctx, task, run)
                 if not Path(inp).exists():
                     missing.append(inp)
@@ -86,8 +83,8 @@ def run_ref(ctx: BenchmarkContext) -> float:
     from pathlib import Path
 
     total = 0.0
-    for task in TASKS:
-        for run in RUNS:
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
             out = _afni_moco_path(ctx, task, run)
             if Path(out).exists() and not ctx.force_ref:
                 continue
@@ -117,8 +114,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     from pathlib import Path
 
     total = 0.0
-    for task in TASKS:
-        for run in RUNS:
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
             out = _ffs_moco_path(ctx, task, run)
             if Path(out).exists() and not ctx.force_ffs:
                 continue
@@ -150,8 +147,8 @@ def validate(ctx: BenchmarkContext) -> dict:
     mean_results = []
     ssd_results = []
 
-    for task in TASKS:
-        for run in RUNS:
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
             # Motion parameters (with per-column names)
             mp = compare_1d_params(
                 _afni_motion_path(ctx, task, run),

@@ -26,16 +26,20 @@ THRESHOLDS = {
 }
 
 
+def _subid(ctx: BenchmarkContext) -> str:
+    return f"sub-{ctx.subject}"
+
+
 def _afni_anat(ctx: BenchmarkContext) -> Path:
-    return ctx.processing_dir / "sswarper_output" / "anatQQ.sub-01.nii"
+    return ctx.processing_dir / "sswarper_output" / f"anatQQ.{_subid(ctx)}.nii"
 
 
 def _ffs_anat(ctx: BenchmarkContext) -> Path:
-    return ctx.processing_dir / "ffs_warper" / "anatFFS.sub-01.nii.gz"
+    return ctx.processing_dir / "ffs_warper" / f"anatFFS.{_subid(ctx)}.nii.gz"
 
 
 def _anat_input(ctx: BenchmarkContext) -> Path:
-    return ctx.anat_dir / "sub-01_ses-01_T1w.nii"
+    return ctx.anat_dir / f"{_subid(ctx)}_ses-{ctx.session}_T1w.nii"
 
 
 def _afni_template() -> str:
@@ -81,7 +85,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
         f"sswarper2 "
         f"-input {_anat_input(ctx)} "
         f"-base {_afni_ssw_template()} "
-        f"-subid sub-01 "
+        f"-subid {_subid(ctx)} "
         f"-odir {ssw_dir}",
         label="sswarper2",
         cwd=ctx.processing_dir,
@@ -97,11 +101,11 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     total = 0.0
 
     # Need AFNI skull-stripped anat as input
-    anatSS = ctx.processing_dir / "sswarper_output" / "anatSS.sub-01.nii"
+    anatSS = ctx.processing_dir / "sswarper_output" / f"anatSS.{_subid(ctx)}.nii"
     if not anatSS.exists():
         raise RuntimeError(f"Need AFNI skull-stripped anat: {anatSS}")
 
-    al_out = ffs_dir / "al_ffs_anatSS.sub-01.nii"
+    al_out = ffs_dir / f"al_ffs_anatSS.{_subid(ctx)}.nii"
     if not al_out.exists() or ctx.force_ffs:
         elapsed, _ = run_timed(
             f"ffs_allineate "

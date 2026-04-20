@@ -14,9 +14,6 @@ from ..validation import compare_masks
 name = "automask"
 description = "Brain masking (3dAutomask vs ffs_util_automask)"
 
-TASKS = ["localizer", "rest"]
-RUNS = [1, 2, 3, 4, 5]
-
 THRESHOLDS = {
     "min_dice": 0.90,  # masks should agree on at least 90% of voxels
 }
@@ -24,29 +21,29 @@ THRESHOLDS = {
 
 def _mean_path(ctx: BenchmarkContext, task: str, run: int) -> Path:
     """AFNI mean image (input to both masking tools)."""
-    return ctx.processing_dir / f"afni_mean_sub-01_ses-01_task-{task}_run-{run}_bold.nii"
+    return ctx.processing_dir / f"afni_mean_{ctx.bids_prefix(task, run)}_bold.nii"
 
 
 def _afni_mask(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.processing_dir / f"automask_afni_mean_sub-01_ses-01_task-{task}_run-{run}_bold.nii"
+    return ctx.processing_dir / f"automask_afni_mean_{ctx.bids_prefix(task, run)}_bold.nii"
 
 
 def _ffs_mask(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.processing_dir / f"automask_ffs_mean_sub-01_ses-01_task-{task}_run-{run}_bold.nii"
+    return ctx.processing_dir / f"automask_ffs_mean_{ctx.bids_prefix(task, run)}_bold.nii"
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     if ctx.validate_only:
-        for task in TASKS:
-            for run in RUNS:
+        for task, runs in ctx.all_task_run_pairs():
+            for run in runs:
                 for p in [_afni_mask(ctx, task, run), _ffs_mask(ctx, task, run)]:
                     if not p.exists():
                         missing.append(str(p))
     else:
         # Need mean images from moco stage
-        for task in TASKS:
-            for run in RUNS:
+        for task, runs in ctx.all_task_run_pairs():
+            for run in runs:
                 src = _mean_path(ctx, task, run)
                 if not src.exists():
                     missing.append(str(src))
@@ -56,8 +53,8 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run AFNI 3dAutomask for all mean images."""
     total = 0.0
-    for task in TASKS:
-        for run in RUNS:
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
             out = _afni_mask(ctx, task, run)
             if out.exists() and not ctx.force_ref:
                 continue
@@ -74,8 +71,8 @@ def run_ref(ctx: BenchmarkContext) -> float:
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_util_automask for all mean images."""
     total = 0.0
-    for task in TASKS:
-        for run in RUNS:
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
             out = _ffs_mask(ctx, task, run)
             if out.exists() and not ctx.force_ffs:
                 continue
@@ -93,8 +90,8 @@ def validate(ctx: BenchmarkContext) -> dict:
     """Compare masks using Dice coefficient."""
     results = []
 
-    for task in TASKS:
-        for run in RUNS:
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
             afni_p = _afni_mask(ctx, task, run)
             ffs_p = _ffs_mask(ctx, task, run)
 

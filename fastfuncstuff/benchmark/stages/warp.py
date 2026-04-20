@@ -10,15 +10,15 @@ from ..validation import compare_timeseries_4d, compare_volumes
 name = "warp"
 description = "Warp apply (3dNwarpApply vs ffs_nwarp)"
 
-TASKS_RUNS = [
-    ("localizer", [1, 2, 3, 4, 5]),
-    ("rest", [1, 2, 3, 4, 5]),
-]
-
 THRESHOLDS = {
     "warped_anat_r": 0.80,  # different warping algorithms, expect some disagreement
     "warped_func_min_r": 0.95,
 }
+
+
+def _ref_task_run(ctx: BenchmarkContext) -> tuple[str, int]:
+    params = ctx.get_stage_params("crossalign")
+    return params.get("reference_task", "localizer"), params.get("reference_run", 1)
 
 
 def _afni_mni(ctx: BenchmarkContext, task: str, run: int) -> Path:
@@ -30,27 +30,29 @@ def _ffs_mni(ctx: BenchmarkContext, task: str, run: int) -> Path:
 
 
 def _input_path(ctx: BenchmarkContext, task: str, run: int) -> Path:
-    return ctx.func_dir / f"sub-01_ses-01_task-{task}_run-{run}_bold.nii"
+    return ctx.func_dir / f"{ctx.bids_prefix(task, run)}_bold.nii"
 
 
 def _nwarp_chain(ctx: BenchmarkContext, task: str, run: int) -> str:
     """Build the -nwarp chain string for 3dNwarpApply / ffs_nwarp."""
     p = ctx.processing_dir
     ssw = p / "sswarper_output"
+    subid = f"sub-{ctx.subject}"
+    ref_task, ref_run = _ref_task_run(ctx)
 
     parts = [
-        str(ssw / "anatQQ.sub-01_WARP.nii"),
-        str(ssw / "anatQQ.sub-01.aff12.1D"),
+        str(ssw / f"anatQQ.{subid}_WARP.nii"),
+        str(ssw / f"anatQQ.{subid}.aff12.1D"),
         str(p / "anat_al_keep_e2a_only_mat.aff12.1D"),
     ]
 
-    # run-1 localizer uses the moco matrix directly
+    # Reference run uses the moco matrix directly;
     # other runs need the inter-run alignment matrix first
-    if not (task == "localizer" and run == 1):
-        align_mat = p / f"afni_mean_{task}_run-{run}_to_localizer_run-1_mat.aff12.1D"
+    if not (task == ref_task and run == ref_run):
+        align_mat = p / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
         parts.append(str(align_mat))
 
-    moco_mat = p / f"afni_moco_sub-01_ses-01_task-{task}_run-{run}_bold_mat.aff12.1D"
+    moco_mat = p / f"afni_moco_{ctx.bids_prefix(task, run)}_bold_mat.aff12.1D"
     parts.append(str(moco_mat))
 
     return " ".join(parts)
@@ -58,36 +60,38 @@ def _nwarp_chain(ctx: BenchmarkContext, task: str, run: int) -> str:
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
+    subid = f"sub-{ctx.subject}"
+    ref_task, ref_run = _ref_task_run(ctx)
     if ctx.validate_only:
         # Warped anatomicals
-        afni_anat = ctx.processing_dir / "sswarper_output" / "anatQQ.sub-01.nii"
-        ffs_anat = ctx.processing_dir / "ffs_warper" / "anatFFS.sub-01.nii.gz"
+        afni_anat = ctx.processing_dir / "sswarper_output" / f"anatQQ.{subid}.nii"
+        ffs_anat = ctx.processing_dir / "ffs_warper" / f"anatFFS.{subid}.nii.gz"
         if not afni_anat.exists():
             missing.append(str(afni_anat))
         if not ffs_anat.exists():
             missing.append(str(ffs_anat))
 
         # Warped functionals
-        for task, runs in TASKS_RUNS:
+        for task, runs in ctx.all_task_run_pairs():
             for run in runs:
                 for p in [_afni_mni(ctx, task, run), _ffs_mni(ctx, task, run)]:
                     if not p.exists():
                         missing.append(str(p))
     else:
         # Need sswarper output (from align stage)
-        ssw = ctx.processing_dir / "sswarper_output" / "anatQQ.sub-01.nii"
+        ssw = ctx.processing_dir / "sswarper_output" / f"anatQQ.{subid}.nii"
         if not ssw.exists():
             missing.append(str(ssw))
         # Need moco reference mean
-        ref_mean = ctx.processing_dir / "afni_mean_sub-01_ses-01_task-localizer_run-1_bold.nii"
+        ref_mean = ctx.processing_dir / f"afni_mean_{ctx.bids_prefix(ref_task, ref_run)}_bold.nii"
         if not ref_mean.exists():
             missing.append(str(ref_mean))
         # Need inter-run alignment matrices (from crossalign stage)
-        for task, runs in TASKS_RUNS:
+        for task, runs in ctx.all_task_run_pairs():
             for run in runs:
-                if task == "localizer" and run == 1:
+                if task == ref_task and run == ref_run:
                     continue
-                mat = ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_localizer_run-1_mat.aff12.1D"
+                mat = ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
                 if not mat.exists():
                     missing.append(str(mat))
     return missing
@@ -100,34 +104,37 @@ def _prepare_warp_prerequisites(ctx: BenchmarkContext) -> None:
     """
     p = ctx.processing_dir
     ssw = p / "sswarper_output"
+    subid = f"sub-{ctx.subject}"
+    ref_task, ref_run = _ref_task_run(ctx)
 
     # 1. Autobox the MNI-warped anat for a smaller master grid
-    autobox = p / "autobox_anatQQ.sub-01.nii"
+    autobox = p / f"autobox_anatQQ.{subid}.nii"
     if not autobox.exists():
         run_timed(
             f"3dAutobox -overwrite -npad 3 "
-            f"-prefix {ssw / 'autobox_anatQQ.sub-01.nii'} "
-            f"{ssw / 'anatQQ.sub-01.nii'}",
+            f"-prefix {ssw / f'autobox_anatQQ.{subid}.nii'} "
+            f"{ssw / f'anatQQ.{subid}.nii'}",
             label="3dAutobox anatQQ",
             cwd=p,
         )
         import shutil as sh
-        sh.copy2(ssw / "autobox_anatQQ.sub-01.nii", autobox)
+        sh.copy2(ssw / f"autobox_anatQQ.{subid}.nii", autobox)
 
     # 2. EPI-to-anat alignment matrix (align_epi_anat.py + cat_matvec)
     e2a = p / "anat_al_keep_e2a_only_mat.aff12.1D"
     if not e2a.exists():
+        ref_mean = f"afni_mean_{ctx.bids_prefix(ref_task, ref_run)}_bold.nii"
         run_timed(
             f"align_epi_anat.py -overwrite "
             f"-rigid_body -anat_has_skull no -anat2epi "
-            f"-anat {ssw / 'anatSS.sub-01.nii'} "
-            f"-epi {p / 'afni_mean_sub-01_ses-01_task-localizer_run-1_bold.nii'} "
+            f"-anat {ssw / f'anatSS.{subid}.nii'} "
+            f"-epi {p / ref_mean} "
             f"-epi_base 0 -suffix _al",
             label="align_epi_anat.py",
             cwd=p,
         )
         run_timed(
-            f"cat_matvec {p / 'anatSS.sub-01_al_mat.aff12.1D'} -I -ONELINE > {e2a}",
+            f"cat_matvec {p / f'anatSS.{subid}_al_mat.aff12.1D'} -I -ONELINE > {e2a}",
             label="cat_matvec e2a",
             cwd=p,
         )
@@ -136,10 +143,11 @@ def _prepare_warp_prerequisites(ctx: BenchmarkContext) -> None:
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run 3dNwarpApply for all runs."""
     _prepare_warp_prerequisites(ctx)
-    master = ctx.processing_dir / "autobox_anatQQ.sub-01.nii"
+    subid = f"sub-{ctx.subject}"
+    master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
     total = 0.0
 
-    for task, runs in TASKS_RUNS:
+    for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             out = _afni_mni(ctx, task, run)
             if out.exists() and not ctx.force_ref:
@@ -160,10 +168,11 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_nwarp for all runs."""
-    master = ctx.processing_dir / "autobox_anatQQ.sub-01.nii"
+    subid = f"sub-{ctx.subject}"
+    master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
     total = 0.0
 
-    for task, runs in TASKS_RUNS:
+    for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             out = _ffs_mni(ctx, task, run)
             if out.exists() and not ctx.force_ffs:
@@ -187,14 +196,15 @@ def validate(ctx: BenchmarkContext) -> dict:
     results = {}
 
     # 1. Compare warped anatomicals
-    afni_anat = ctx.processing_dir / "sswarper_output" / "anatQQ.sub-01.nii"
-    ffs_anat = ctx.processing_dir / "ffs_warper" / "anatFFS.sub-01.nii.gz"
+    subid = f"sub-{ctx.subject}"
+    afni_anat = ctx.processing_dir / "sswarper_output" / f"anatQQ.{subid}.nii"
+    ffs_anat = ctx.processing_dir / "ffs_warper" / f"anatFFS.{subid}.nii.gz"
     anat_result = compare_volumes(afni_anat, ffs_anat)
     results["anat_r"] = anat_result["r"]
 
     # 2. Compare warped functionals (mean correlation across runs)
     func_results = []
-    for task, runs in TASKS_RUNS:
+    for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             ts = compare_timeseries_4d(
                 _afni_mni(ctx, task, run), _ffs_mni(ctx, task, run),

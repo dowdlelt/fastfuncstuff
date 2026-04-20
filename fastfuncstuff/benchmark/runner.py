@@ -20,7 +20,7 @@ _show_output: bool = False
 class BenchmarkContext:
     """Shared state for all benchmark stages."""
 
-    data_dir: Path  # ds005165-download root (always resolved to absolute)
+    data_dir: Path  # Dataset root (always resolved to absolute)
     dataset_id: str = ""  # e.g. "ds005165" — auto-detected if empty
     force_ref: bool = False
     force_ffs: bool = False
@@ -28,6 +28,7 @@ class BenchmarkContext:
     verbose: bool = True
     device: str | None = None   # PyTorch device to pass to FFS tools (e.g. "mps", "cpu")
     show_output: bool = False   # Stream subprocess stdout/stderr when True
+    config: Any = None          # BenchmarkConfig — typed as Any to avoid circular import
 
     def ffs_device_flag(self) -> str:
         """Return ' -device <device>' for appending to FFS CLI command strings, or ''."""
@@ -36,13 +37,60 @@ class BenchmarkContext:
     def __post_init__(self):
         self.data_dir = self.data_dir.resolve()
         if not self.dataset_id:
-            # Auto-detect from directory name (e.g. "ds005165-download" -> "ds005165")
-            name = self.data_dir.name
-            for suffix in ("-download", "_download", "-data"):
-                if name.endswith(suffix):
-                    name = name[: -len(suffix)]
-                    break
-            self.dataset_id = name
+            if self.config and self.config.dataset_id:
+                self.dataset_id = self.config.dataset_id
+            else:
+                # Auto-detect from directory name (e.g. "ds005165-download" -> "ds005165")
+                name = self.data_dir.name
+                for suffix in ("-download", "_download", "-data"):
+                    if name.endswith(suffix):
+                        name = name[: -len(suffix)]
+                        break
+                self.dataset_id = name
+
+    # ------------------------------------------------------------------
+    # Config-driven properties (fall back to ds005165 defaults)
+    # ------------------------------------------------------------------
+
+    @property
+    def subject(self) -> str:
+        return self.config.subject if self.config else "01"
+
+    @property
+    def session(self) -> str:
+        return self.config.session if self.config else "01"
+
+    @property
+    def tasks(self) -> dict[str, list[int]]:
+        if self.config and self.config.tasks:
+            return self.config.tasks
+        return {"localizer": [1, 2, 3, 4, 5], "rest": [1, 2, 3, 4, 5]}
+
+    def task_names(self) -> list[str]:
+        """Sorted list of task names."""
+        return sorted(self.tasks.keys())
+
+    def runs_for_task(self, task: str) -> list[int]:
+        """Run numbers for a specific task."""
+        return self.tasks.get(task, [])
+
+    def all_task_run_pairs(self) -> list[tuple[str, list[int]]]:
+        """All (task_name, run_list) pairs, sorted by task name."""
+        return [(t, self.tasks[t]) for t in self.task_names()]
+
+    def get_stage_params(self, stage_name: str) -> dict[str, Any]:
+        """Get stage-specific parameters from the config."""
+        if self.config and self.config.stage_params:
+            return self.config.stage_params.get(stage_name, {})
+        return {}
+
+    def bids_prefix(self, task: str, run: int) -> str:
+        """BIDS filename prefix: sub-{subject}_ses-{session}_task-{task}_run-{run}."""
+        return f"sub-{self.subject}_ses-{self.session}_task-{task}_run-{run}"
+
+    # ------------------------------------------------------------------
+    # Directory properties
+    # ------------------------------------------------------------------
 
     @property
     def processing_dir(self) -> Path:
@@ -51,11 +99,11 @@ class BenchmarkContext:
 
     @property
     def func_dir(self) -> Path:
-        return self.data_dir / "sub-01" / "ses-01" / "func"
+        return self.data_dir / f"sub-{self.subject}" / f"ses-{self.session}" / "func"
 
     @property
     def anat_dir(self) -> Path:
-        return self.data_dir / "sub-01" / "ses-01" / "anat"
+        return self.data_dir / f"sub-{self.subject}" / f"ses-{self.session}" / "anat"
 
     def tpattern_file(self, task: str = "localizer", run: int = 1) -> Path:
         """Get or create a tpattern file from the BIDS JSON sidecar.
@@ -69,10 +117,7 @@ class BenchmarkContext:
 
         import json
 
-        json_path = (
-            self.func_dir
-            / f"sub-01_ses-01_task-{task}_run-{run}_bold.json"
-        )
+        json_path = self.func_dir / f"{self.bids_prefix(task, run)}_bold.json"
         if not json_path.exists():
             raise FileNotFoundError(f"BIDS JSON not found: {json_path}")
 
@@ -373,10 +418,28 @@ def run_stages(
         if timing_entry:
             stage_timings[name] = timing_entry
 
-    # Append this run to the timing cache
-    if stage_timings and not ctx.validate_only:
-        from .timing_cache import append_run
+    # Append this run to the timing cache (including validate-only runs)
+    from .timing_cache import append_run
 
-        append_run(ctx.data_dir, stage_timings, dataset_id=ctx.dataset_id)
+    stage_results = {
+        r.stage_name: {"passed": r.passed, "summary": r.summary}
+        for r in results
+    }
+    stage_validations = {
+        r.stage_name: r.validation
+        for r in results
+        if r.validation
+    }
+
+    # Cache if we have any results (timing or validation)
+    if stage_timings or stage_results:
+        append_run(
+            ctx.data_dir,
+            stage_timings,
+            dataset_id=ctx.dataset_id,
+            config=ctx.config,
+            stage_results=stage_results,
+            stage_validations=stage_validations,
+        )
 
     return results

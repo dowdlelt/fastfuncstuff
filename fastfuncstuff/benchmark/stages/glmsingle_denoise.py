@@ -28,18 +28,37 @@ THRESHOLDS = {
     "beta_spatial_corr": 0.85,  # spatial correlation of denoised betas (median across trials)
 }
 
+_DEFAULT_STIM_LABELS = ["faces", "objects", "scenes", "scrambled", "bodies"]
+
+
+def _glm_params(ctx: BenchmarkContext) -> dict:
+    return ctx.get_stage_params("glm")
+
+
+def _primary_task(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("primary_task", "localizer")
+
+
+def _runs(ctx: BenchmarkContext) -> list[int]:
+    return ctx.runs_for_task(_primary_task(ctx))
+
+
+def _stim_labels(ctx: BenchmarkContext) -> list[str]:
+    return _glm_params(ctx).get("stim_labels", _DEFAULT_STIM_LABELS)
+
 
 def _input_files(ctx: BenchmarkContext) -> list[Path]:
-    """MNI-space resampled localizer runs."""
+    """MNI-space resampled runs."""
+    task = _primary_task(ctx)
     return [
-        ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{r}.nii.gz" for r in range(1, 6)
+        ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz" for r in _runs(ctx)
     ]
 
 
 def _onset_files(ctx: BenchmarkContext) -> list[Path]:
     """AFNI-style onset timing files (one per condition)."""
-    conds = ["faces", "objects", "scenes", "scrambled", "bodies"]
-    return [ctx.timing_dir / f"onsets.localizer.times.{c}.txt" for c in conds]
+    task = _primary_task(ctx)
+    return [ctx.timing_dir / f"onsets.{task}.times.{c}.txt" for c in _stim_labels(ctx)]
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:

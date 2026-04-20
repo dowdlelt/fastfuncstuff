@@ -1,0 +1,52 @@
+# Benchmark config for OpenNeuro ds005165 (sub-01, ses-01)
+#
+# This is the default config used when no -config flag is given.
+# Copy and modify this file as a template for other BIDS datasets.
+
+dataset_id: ds005165
+subject: "01"
+session: "01"
+
+tasks:
+  localizer:
+    runs: [1, 2, 3, 4, 5]
+  rest:
+    runs: [1, 2, 3, 4, 5]
+
+# Stages to run by default.
+# nordic and sauna use separate non-BIDS data — run them explicitly
+# with -stages nordic,sauna if needed.
+stages:
+  - moco
+  - slicetime
+  - crossalign
+  - align
+  - warp
+  - glm
+  - build_design
+  - ica
+  - ica_single
+  - automask
+  - glmsingle_prep
+  - glmsingle_matlab
+  - glmsingle_hrf
+  - glmsingle_denoise
+  - glmsingle_ridge
+  - glm_tent
+  - glm_im
+  - glm_im_reml
+
+stage_params:
+  glm:
+    primary_task: localizer
+    stim_labels: [faces, bodies, objects, scenes, scrambled]
+    glts:
+      - [faces_vs_objects, "+1*faces -1*objects"]
+      - [faces_vs_scenes, "+1*faces -1*scenes"]
+      - [faces_vs_scrambled, "+1*faces -1*scrambled"]
+    hrf_model: "SPMG1(3)"
+  ica:
+    tasks: [rest, localizer]
+  crossalign:
+    reference_task: localizer
+    reference_run: 1

@@ -14,8 +14,7 @@ from ..validation import _automask, _load_vol, _pearson_r, compare_volumes
 name = "glm_tent"
 description = "TENT deconvolution (3dDeconvolve TENT(0,15,11) vs ffs_deconvolve)"
 
-RUNS = [1, 2, 3, 4, 5]
-STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
+_DEFAULT_STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
 
 THRESHOLDS = {
     # Voxelwise temporal correlation across the TENT basis (per condition)
@@ -23,6 +22,25 @@ THRESHOLDS = {
     # Spatial correlation of middle timepoint
     "spatial_middle_min_r": 0.95,
 }
+
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+
+def _glm_params(ctx: BenchmarkContext) -> dict:
+    return ctx.get_stage_params("glm")
+
+
+def _primary_task(ctx: BenchmarkContext) -> str:
+    return _glm_params(ctx).get("primary_task", "localizer")
+
+
+def _runs(ctx: BenchmarkContext) -> list[int]:
+    return ctx.runs_for_task(_primary_task(ctx))
+
+
+def _stim_labels(ctx: BenchmarkContext) -> list[str]:
+    return _glm_params(ctx).get("stim_labels", _DEFAULT_STIM_LABELS)
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -38,7 +56,8 @@ def _ffs_dir(ctx: BenchmarkContext) -> Path:
 
 def _resampled_input(ctx: BenchmarkContext, run: int) -> Path:
     """Unscaled MNI-resampled input (TENT does not need PSC scaling)."""
-    return ctx.processing_dir / f"ffs_mni_resampled_task-localizer_run-{run}.nii.gz"
+    task = _primary_task(ctx)
+    return ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{run}.nii.gz"
 
 
 def _automask_path(ctx: BenchmarkContext) -> Path:
@@ -73,7 +92,7 @@ def _ffs_iresp(ctx: BenchmarkContext, label: str) -> Path:
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     if ctx.validate_only:
-        for label in STIM_LABELS:
+        for label in _stim_labels(ctx):
             afni = _afni_iresp(ctx, label)
             ffs = _ffs_iresp(ctx, label)
             if not afni.exists():
@@ -81,7 +100,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
             if not ffs.exists():
                 missing.append(str(ffs))
     else:
-        for run in RUNS:
+        for run in _runs(ctx):
             src = _resampled_input(ctx, run)
             if not src.exists():
                 missing.append(str(src))
@@ -94,33 +113,36 @@ def run_ref(ctx: BenchmarkContext) -> float:
     afni.mkdir(parents=True, exist_ok=True)
     _ensure_mni_automask(ctx)
 
+    task = _primary_task(ctx)
+    stim_labels = _stim_labels(ctx)
+
     # Skip if all iresps already exist
-    all_exist = all(_afni_iresp(ctx, label).exists() for label in STIM_LABELS)
+    all_exist = all(_afni_iresp(ctx, label).exists() for label in stim_labels)
     if all_exist and not ctx.force_ref:
         return 0.0
 
-    inputs = " ".join(str(_resampled_input(ctx, r)) for r in RUNS)
+    inputs = " ".join(str(_resampled_input(ctx, r)) for r in _runs(ctx))
     mask = _automask_path(ctx)
 
     stim_args = " ".join(
-        f"-stim_times {i} {ctx.timing_dir}/onsets.localizer.times.{label}.txt "
+        f"-stim_times {i} {ctx.timing_dir}/onsets.{task}.times.{label}.txt "
         f"'TENT(0,15,11)' -stim_label {i} {label}"
-        for i, label in enumerate(STIM_LABELS, 1)
+        for i, label in enumerate(stim_labels, 1)
     )
     iresp_args = " ".join(
-        f"-iresp {i} {afni}/iresp_{label}" for i, label in enumerate(STIM_LABELS, 1)
+        f"-iresp {i} {afni}/iresp_{label}" for i, label in enumerate(stim_labels, 1)
     )
 
     elapsed, _ = run_timed(
         f"3dDeconvolve -overwrite "
         f"-input {inputs} "
-        f"-polort A -num_stimts {len(STIM_LABELS)} -float "
+        f"-polort A -num_stimts {len(stim_labels)} -float "
         f"{stim_args} "
         f"-jobs 10 -noFDR "
         f"{iresp_args} "
         f"-mask {mask} "
         f"-x1D {afni}/TENT_X.xmat.1D "
-        f"-bucket {afni}/TENT_afni_stats_localizer.nii.gz",
+        f"-bucket {afni}/TENT_afni_stats_{task}.nii.gz",
         label="3dDeconvolve TENT",
         cwd=afni,
     )
@@ -133,13 +155,16 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     ffs.mkdir(parents=True, exist_ok=True)
     _ensure_mni_automask(ctx)
 
-    all_exist = all(_ffs_iresp(ctx, label).exists() for label in STIM_LABELS)
+    task = _primary_task(ctx)
+    stim_labels = _stim_labels(ctx)
+
+    all_exist = all(_ffs_iresp(ctx, label).exists() for label in stim_labels)
     if all_exist and not ctx.force_ffs:
         return 0.0
 
-    inputs = " ".join(str(_resampled_input(ctx, r)) for r in RUNS)
+    inputs = " ".join(str(_resampled_input(ctx, r)) for r in _runs(ctx))
     timing_args = " ".join(
-        str(ctx.timing_dir / f"onsets.localizer.times.{label}.txt") for label in STIM_LABELS
+        str(ctx.timing_dir / f"onsets.{task}.times.{label}.txt") for label in stim_labels
     )
     mask = _automask_path(ctx)
 
@@ -168,7 +193,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     temporal_medians: list[float] = []
     spatial_middles: list[float] = []
 
-    for label in STIM_LABELS:
+    for label in _stim_labels(ctx):
         afni_path = _afni_iresp(ctx, label)
         ffs_path = _ffs_iresp(ctx, label)
 
