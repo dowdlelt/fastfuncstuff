@@ -27,6 +27,26 @@ from tqdm import tqdm
 from .interp import trilinear_interpolate, warp_image_wsinc5
 from .io import derive_mean_output_path, load_image, load_warp_field, save_image
 
+
+def derive_phase_output_path(prefix: str) -> str:
+    """Derive phase output path from magnitude prefix.
+
+    Examples:
+        out.nii.gz   -> out_phase.nii.gz
+        out.nii      -> out_phase.nii
+    """
+    from pathlib import Path
+    p = Path(prefix)
+    if p.name.endswith(".nii.gz"):
+        stem = p.name[: -len(".nii.gz")]
+        return str(p.parent / f"{stem}_phase.nii.gz")
+    elif p.name.endswith(".nii"):
+        stem = p.name[: -len(".nii")]
+        return str(p.parent / f"{stem}_phase.nii")
+    else:
+        return str(p.parent / f"{p.stem}_phase{p.suffix}")
+
+
 from ..io.afni import get_afni_space_info, set_afni_space_info
 
 
@@ -785,6 +805,8 @@ def nwarpforge(
     source_path: str,
     nwarp_specs: list[str],
     prefix: str,
+    phase_path: str | None = None,
+    phase_prefix: str | None = None,
     master_path: str | None = None,
     interp: str = "wsinc5",
     device: torch.device | None = None,
@@ -797,9 +819,15 @@ def nwarpforge(
     """Main pipeline: compose warps and apply to source.
 
     Args:
-        source_path: Path to source dataset (3D or 4D)
+        source_path: Path to source (magnitude) dataset (3D or 4D)
         nwarp_specs: List of warp/matrix file paths
-        prefix: Output path
+        prefix: Output path for magnitude (or the only output if no phase)
+        phase_path: Optional phase dataset (any range — automatically scaled
+                    to radians).  When provided, magnitude+phase are converted
+                    to real+imag, each component is warped independently, then
+                    converted back to magnitude+phase for output.
+        phase_prefix: Output path for warped phase.  Auto-derived from prefix
+                      (e.g. out.nii.gz -> out_phase.nii.gz) when not given.
         master_path: Path to master dataset for output grid (optional)
         interp: Final interpolation method
         device: Torch device
@@ -817,6 +845,37 @@ def nwarpforge(
         print(
             f"Loaded source: {source_path} {source.shape} ({__import__('time').time() - t0_load:.2f}s)"
         )
+
+    # --- Phase dataset handling ---
+    phase_data: Tensor | None = None
+    if phase_path is not None:
+        phase_raw, _ = load_image(phase_path, device=device)
+        if phase_raw.shape != source.shape:
+            raise ValueError(
+                f"-phase shape {tuple(phase_raw.shape)} does not match "
+                f"-source shape {tuple(source.shape)}"
+            )
+        # Scale arbitrary phase data to radians [-pi, pi].
+        # Works for any input range (raw integer, 0-4096, already radians, etc.)
+        ph_min = phase_raw.min().item()
+        ph_max = phase_raw.max().item()
+        range_norm = ph_max - ph_min
+        if range_norm == 0.0:
+            raise ValueError(
+                f"-phase data is constant ({ph_min}); cannot compute phase"
+            )
+        range_center = (ph_max + ph_min) / range_norm * 0.5
+        phase_data = (phase_raw / range_norm - range_center) * (2.0 * torch.pi)
+        if verb >= 1:
+            print(
+                f"Loaded phase: {phase_path} {phase_raw.shape}  "
+                f"raw range=[{ph_min:.3f}, {ph_max:.3f}] → "
+                f"scaled to [{phase_data.min().item():.3f}, {phase_data.max().item():.3f}] rad"
+            )
+        if phase_prefix is None:
+            phase_prefix = derive_phase_output_path(prefix)
+        if verb >= 1:
+            print(f"Phase output: {phase_prefix}")
 
     is_4d = source.ndim == 4
     nt = source.shape[0] if is_4d else 1
@@ -930,6 +989,7 @@ def nwarpforge(
         t_start, t_end = 0, nt
 
     output_volumes = []
+    phase_volumes: list[Tensor] = []
 
     time_iter = tqdm(
         range(t_start, t_end),
@@ -948,12 +1008,37 @@ def nwarpforge(
 
         src_vol = source[t] if is_4d else source
 
-        warped = apply_composed_warp(
-            src_vol, composed,
-            source_affine=source_header["affine"],
-            output_affine=output_affine,
-            interp=interp,
-        )
+        if phase_data is not None:
+            # Convert magnitude + phase → real + imaginary, warp each, convert back.
+            # real and imag are transient (one 3D volume each) — minimal memory overhead.
+            ph_vol = phase_data[t] if is_4d else phase_data
+            real_vol = src_vol * torch.cos(ph_vol)
+            imag_vol = src_vol * torch.sin(ph_vol)
+
+            warped_real = apply_composed_warp(
+                real_vol, composed,
+                source_affine=source_header["affine"],
+                output_affine=output_affine,
+                interp=interp,
+            )
+            warped_imag = apply_composed_warp(
+                imag_vol, composed,
+                source_affine=source_header["affine"],
+                output_affine=output_affine,
+                interp=interp,
+            )
+
+            # Convert back to magnitude and phase
+            warped = torch.sqrt(warped_real ** 2 + warped_imag ** 2)
+            warped_phase = torch.atan2(warped_imag, warped_real)
+            phase_volumes.append(warped_phase)
+        else:
+            warped = apply_composed_warp(
+                src_vol, composed,
+                source_affine=source_header["affine"],
+                output_affine=output_affine,
+                interp=interp,
+            )
         output_volumes.append(warped)
 
     if is_4d or len(output_volumes) > 1:
@@ -1021,3 +1106,14 @@ def nwarpforge(
                 print(f"Saved mean: {mean_path}")
         elif verb >= 1:
             print("-save_mean requested, but output is not 4D; skipping mean output")
+
+    # Save warped phase if requested
+    if phase_volumes:
+        assert phase_prefix is not None  # set earlier when phase_path was set
+        if len(phase_volumes) > 1:
+            phase_output = torch.stack(phase_volumes)
+        else:
+            phase_output = phase_volumes[0]
+        save_image(phase_output, phase_prefix, header_info=output_header)
+        if verb >= 1:
+            print(f"Saved phase: {phase_prefix}")

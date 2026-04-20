@@ -55,7 +55,15 @@ Examples:
 
     io_group = parser.add_argument_group("Input/Output")
     io_group.add_argument(
-        "-source", required=True, help="Source dataset to warp (3D or 4D NIfTI)"
+        "-source", required=True, help="Source (magnitude) dataset to warp (3D or 4D NIfTI)"
+    )
+    io_group.add_argument(
+        "-phase",
+        default=None,
+        help="Phase dataset (any range — automatically scaled to radians). "
+        "When provided, magnitude+phase are converted to real+imaginary, "
+        "each component is warped separately, then converted back to "
+        "magnitude+phase for output.",
     )
     io_group.add_argument(
         "-nwarp",
@@ -63,7 +71,15 @@ Examples:
         help="Warp chain (quoted, space-separated). "
         "E.g., 'warp1.nii matrix.1D warp2.nii'",
     )
-    io_group.add_argument("-prefix", required=True, help="Output dataset path")
+    io_group.add_argument(
+        "-prefix", required=True, help="Output path for magnitude (or only output)"
+    )
+    io_group.add_argument(
+        "-phase_prefix",
+        default=None,
+        help="Output path for warped phase. Auto-derived from -prefix when not given "
+        "(e.g. out.nii.gz -> out_phase.nii.gz). Only used with -phase.",
+    )
     io_group.add_argument(
         "-save_mean",
         action="store_true",
@@ -167,6 +183,8 @@ def main(argv: list[str] | None = None) -> None:
         source_path=args.source,
         nwarp_specs=nwarp_specs,
         prefix=args.prefix,
+        phase_path=args.phase,
+        phase_prefix=args.phase_prefix,
         master_path=args.master,
         interp=args.interp,
         device=device,
