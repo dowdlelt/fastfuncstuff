@@ -129,3 +129,52 @@ API surface.
 - `fastfuncstuff/design/bids_events.py` — `parse_bids_events`: return per-event durations
   alongside the per-condition median (already stores them internally in `cond_dur_sets`)
 - All CLIs that accept `-events` — thread per-event durations through to the design builder
+
+## ffs_phasereg: broken, producing nonsense output
+
+Phase regression tool runs without errors but produces garbage results on real data.
+
+### Symptoms on real data
+- Correlation map is sparse and does not match expected macrovascular structures
+- Cleaned magnitude data has lost spatial structure
+- R² is always 0 in synthetic tests — the correlation threshold (`|r| > 2/sqrt(n)`) zeros
+  out slopes even for genuinely correlated data (too aggressive, or polort=3 on short
+  timeseries eats the correlation)
+- Slopes are huge when non-zero (±50) — Deming phi=100 clamp inflates slopes on noisy data
+
+### Likely issues
+1. **Correlation threshold too aggressive** — needs tuning or replacement with F-test /
+   permutation approach
+2. **R² formula** — currently `1 - SS_corrected / SS_detrended` with clamp(0,1) hiding
+   negative R² (overcorrection). May need to compute from residual (task-removed) signals
+   instead of detrended signals
+3. **Deming phi clamp** — upper bound of 100 may be too high for real data where magnitude
+   variance >> phase variance but not 100:1
+
+### Standalone components that work
+- `phasereg/deming.py` — Deming/OLS regression confirmed working (0.712 vs 0.833 error)
+- `phasereg/noise.py` — FFT-based variance ratio returns correct phi (~16 for true 16)
+
+### Next steps
+1. Test with real magnitude + phase NIfTI data (the real validation)
+2. Tune correlation threshold or replace with proper statistical test
+3. Verify TENT task removal path end-to-end
+4. Allow negative R² as overcorrection diagnostic
+5. Test CLI end-to-end with actual files
+
+## ffs_nwarp -phase: working but introduces magnitude artifacts
+
+The `-source` / `-phase` complex warping pipeline is functional and produces correct
+phase output. However, the warped magnitude shows artifacts that appear to be introduced
+by the phase component.
+
+### What works
+- Phase scaling to radians (auto-scales any input range to [-π, π])
+- Complex decomposition: mag+phase → real+imag, warp each, recombine
+- Phase output is correct
+
+### What needs investigation
+- Warped magnitude has artifacts not present when warping magnitude alone (without -phase)
+- Root cause unclear — could be interpolation of real/imag components introducing
+  Gibbs-like ringing, or phase unwrapping issues before decomposition, or numerical
+  precision in the recombination step

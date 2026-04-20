@@ -63,7 +63,21 @@
       "Bash(do echo:*)",
       "Read(//home/logan/Dropbox/Resources/code/fastfuncsim/**)",
       "Bash(git checkout:*)",
-      "mcp__web-reader__webReader"
+      "mcp__web-reader__webReader",
+      "Bash(nifti_tool -disp_ext -infile ffs_stats_IM_localizer_REML_var.nii.gz)",
+      "Bash(nifti_tool -disp_ext -infile scaled_afni_mni_task-localizer_run-1.nii.gz)",
+      "WebFetch(domain:www.sciencedirect.com)",
+      "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:pubmed.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:www.frontiersin.org)",
+      "WebFetch(domain:www.biorxiv.org)",
+      "WebFetch(domain:ir.lib.uwo.ca)",
+      "WebFetch(domain:mssc.mu.edu)",
+      "WebFetch(domain:figshare.com)",
+      "WebFetch(domain:www.mssc.mu.edu)",
+      "WebFetch(domain:www.stat.umn.edu)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:academic.oup.com)"
     ],
     "deny": [],
     "ask": []
