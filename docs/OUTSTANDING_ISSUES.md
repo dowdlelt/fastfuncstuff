@@ -178,3 +178,45 @@ by the phase component.
 - Root cause unclear — could be interpolation of real/imag components introducing
   Gibbs-like ringing, or phase unwrapping issues before decomposition, or numerical
   precision in the recombination step
+
+## Open TODOs in source (scan 2026-04-20)
+
+Collected from inline `TODO`/`FIXME` markers. Sign-convention TODOs in
+`processing/affine.py` and `processing/ffs_moco.py` (6 markers) are all tracked
+by the existing moco `.1D` sign-convention section above — left as pointers, not
+duplicated here.
+
+### Memory / chunking — not using `memory.py`
+- `fastfuncstuff/glm/xval.py:986` — hybrid-mode accumulator branch uses hardcoded
+  batch sizes instead of `compute_chunk_size()`; likely over-thrashing on systems
+  where the memory module could allocate a larger batch. Check whether xval has
+  its own memory helper that already covers this path before adding a new one.
+- `fastfuncstuff/glm/xval.py:1260` — float64 cast is done per-batch just for the
+  residual subtraction (`test_data.double() - pred.double()`). Question whether
+  promoting the matmul upstream to float64 once would be cleaner at acceptable
+  VRAM cost, vs. the current duplication.
+- `fastfuncstuff/cli/deconvolve.py:1679` — no chunk-size estimation before
+  `fit_glm`; should route through `compute_chunk_size(operation="glm")`.
+
+### Algorithmic gaps
+- `fastfuncstuff/decomposition/pca.py:353` — Minka's MLE dimensionality selection
+  is not implemented; falls back to 95% variance cumulative. Stub has been there
+  a while; either implement or remove the method.
+- `fastfuncstuff/cli/hrfopt.py:1018-1019` — `final_results` / `canonical_results`
+  are written as `None` in the output bundle; should refit with optimal HRFs and
+  with canonical HRF so downstream code has both for comparison.
+- `fastfuncstuff/design/hrf_selection.py:388` — split-half xval can produce very
+  negative R² for specific HRFs (observed with 9 runs / strategy=0.5 on HRFs 4
+  and 17-19) due to sign-flipped OLS betas in low-SNR folds; LORO is immune.
+  Needs characterisation across datasets to decide whether to warn or switch
+  defaults.
+
+### Minor / CLI surface
+- `fastfuncstuff/cli/reml.py:45` — `parse_prefix` imported but not yet applied
+  to individual output flags; would unify prefix handling across `-Rbuck`,
+  `-Rvar`, etc.
+- `fastfuncstuff/cli/tps.py:443` — run boundaries inferred by equal division;
+  variable-length runs need a `-num_stimts`-style flag.
+- `fastfuncstuff/visualization.py:1289` — PC plotting restricted to noise pool;
+  fitting PCs to the whole-brain mask (and saving per-run 4D NIfTIs of PC
+  spatial maps) would give a fuller picture of where components live.
