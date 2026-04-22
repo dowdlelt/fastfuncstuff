@@ -413,6 +413,47 @@ def compare_aff12(
     }
 
 
+def compare_aff12_series(
+    a_path: str | Path,
+    b_path: str | Path,
+) -> dict:
+    """Compare two multi-row AFNI ``.aff12.1D`` files row-by-row.
+
+    Each row is a 3×4 matrix in DICOM coords. Reports per-entry max/mean
+    differences separated into rotation (columns 0,1,2,4,5,6,8,9,10) and
+    translation (columns 3,7,11) parts, plus Frobenius distance per volume.
+
+    Returns:
+        dict with keys: max_rot_diff, mean_rot_diff, max_trans_diff (mm),
+        mean_trans_diff (mm), max_frobenius, mean_frobenius, n_volumes.
+    """
+    a = np.loadtxt(str(a_path), comments="#")
+    b = np.loadtxt(str(b_path), comments="#")
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    if b.ndim == 1:
+        b = b.reshape(1, -1)
+    if a.shape != b.shape or a.shape[1] != 12:
+        return {
+            "error": f"shape mismatch or wrong width: a={a.shape} b={b.shape}"
+        }
+
+    diff = np.abs(a - b)
+    trans_cols = [3, 7, 11]
+    rot_cols = [c for c in range(12) if c not in trans_cols]
+    per_row_frob = np.linalg.norm(a - b, axis=1)
+
+    return {
+        "n_volumes": int(a.shape[0]),
+        "max_rot_diff": float(diff[:, rot_cols].max()),
+        "mean_rot_diff": float(diff[:, rot_cols].mean()),
+        "max_trans_diff": float(diff[:, trans_cols].max()),
+        "mean_trans_diff": float(diff[:, trans_cols].mean()),
+        "max_frobenius": float(per_row_frob.max()),
+        "mean_frobenius": float(per_row_frob.mean()),
+    }
+
+
 def compare_bucket_volumes(
     a_path: str | Path,
     b_path: str | Path,
