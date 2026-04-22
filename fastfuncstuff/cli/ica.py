@@ -1312,17 +1312,36 @@ def _run_concat_ica(
             run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verbose)
             _vprint(args.verbose, f"  Scaled to percent signal", t_step)
 
-        # --- Per-run voxel variance normalization ---
-        if args.voxel_norm:
-            t_step = time.time()
-            run_vox, norm_msg = ica_workflow.apply_voxel_variance_normalization(
-                data_vox_t=run_vox,
-                num_spec=num_spec,
-                n_t=n_t_run,
-                n_vox_masked=n_vox_masked,
+        # --- Per-run polort (block-diag here = single-run) ---
+        # Tcat default: -1 (off) to defer to high-pass; single-run default: 0.
+        polort_default = -1 if n_runs > 1 else 0
+        polort_r = polort_default if args.polort is None else int(args.polort)
+        if polort_r >= 0:
+            run_vox = apply_polort_projection(
+                run_vox,
+                polort=polort_r,
+                device=device,
+                run_starts=[0],
             )
-            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-varnorm", args.verbose)
-            _vprint(args.verbose, f"  {norm_msg}", t_step)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verbose)
+
+        # --- Per-run high-pass filter ---
+        if args.high_pass is not None and args.high_pass > 0:
+            nyquist = 0.5 / float(tr if tr is not None else run_tr)
+            if args.high_pass >= nyquist:
+                raise ValueError(
+                    f"High-pass cutoff ({args.high_pass:.4f} Hz) >= Nyquist ({nyquist:.4f} Hz)"
+                )
+            run_vox = apply_high_pass_fft(
+                run_vox,
+                tr=float(tr if tr is not None else run_tr),
+                high_pass_hz=float(args.high_pass),
+                run_starts=[0],
+            )
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verbose)
+
+        # --- Per-run temporal mean-center (MELODIC remmean) ---
+        run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
 
         run_data_list.append(run_vox)
         run_lengths.append(n_t_run)
@@ -1331,99 +1350,122 @@ def _run_concat_ica(
     # Average the mean images
     mean3d = mean3d_accum / n_runs
 
-    # --- Concatenate all runs ---
-    _vsection(args.verbose, "Concatenate")
-    t_step = time.time()
-    data_vox_t = torch.cat(run_data_list, dim=1)  # (n_vox, total_t)
-    del run_data_list
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    polort = -1 if (args.polort is None and n_runs > 1) else (0 if args.polort is None else int(args.polort))
 
+    # --- Build alldat = across-run average (MELODIC setup_classic) ---
+    _vsection(args.verbose, "Build alldat (across-run average)")
+    t_step = time.time()
+    min_T = min(run_lengths)
+    max_T = max(run_lengths)
+    if min_T != max_T:
+        _vprint(
+            args.verbose,
+            f"WARNING: unequal run lengths {run_lengths}; truncating to min_T={min_T} for alldat only",
+        )
+    alldat = run_data_list[0][:, :min_T].clone() / float(n_runs)
+    for ri in range(1, n_runs):
+        alldat += run_data_list[ri][:, :min_T] / float(n_runs)
+    alldat = _check_finite(alldat, "alldat", args.verbose)
+    _vprint(args.verbose, f"alldat shape: {tuple(alldat.shape)}", t_step)
+
+    # --- Variance normalization (joint default, per-run opt-in via -sep_vn) ---
+    vn_scope = "per_run"
+    if args.voxel_norm:
+        from fastfuncstuff.decomposition.tools import (
+            apply_melodic_voxel_varnorm,
+            apply_varnorm_map,
+            compute_melodic_varnorm_map,
+        )
+
+        if args.joined_vn:
+            _vsection(args.verbose, "Variance Normalization (joined, from alldat)")
+            t_step = time.time()
+            # MELODIC meldata.cc:403 passes alldat.Nrows() (full T) for alldat-scope varnorm,
+            # distinct from the min(30, T-1) cap used in per-file process_file varnorm.
+            pca_dim_vn = max(1, min_T - 1)
+            noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
+                alldat, pca_dim=pca_dim_vn, level=2.3
+            )
+            alldat = apply_varnorm_map(alldat, noise_std_map, const_mask_vn)
+            for ri in range(n_runs):
+                run_data_list[ri] = apply_varnorm_map(
+                    run_data_list[ri], noise_std_map, const_mask_vn
+                )
+            _vprint(
+                args.verbose,
+                f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant voxels",
+                t_step,
+            )
+            vn_scope = "joined"
+            del noise_std_map, const_mask_vn
+        else:
+            _vsection(args.verbose, "Variance Normalization (per-run)")
+            t_step = time.time()
+            for ri in range(n_runs):
+                pca_dim_r = min(30, max(1, run_lengths[ri] - 1))
+                run_data_list[ri], _ = apply_melodic_voxel_varnorm(
+                    run_data_list[ri], pca_dim=pca_dim_r, level=2.3
+                )
+            # Also varnorm alldat for dim-est self-consistency
+            pca_dim_all = min(30, max(1, min_T - 1))
+            alldat, _ = apply_melodic_voxel_varnorm(alldat, pca_dim=pca_dim_all, level=2.3)
+            _vprint(args.verbose, "Per-run varnorm applied", t_step)
+            vn_scope = "per_run"
+
+    # run_starts / total_t (used by metadata + downstream concat)
     run_starts = []
     offset = 0
     for rl in run_lengths:
         run_starts.append(offset)
         offset += rl
-    total_t = data_vox_t.shape[1]
-
-    _vprint(
-        args.verbose,
-        f"Concatenated: ({n_vox_masked:,} vox, {total_t} timepoints) from {n_runs} runs",
-        t_step,
-    )
-    _vprint(args.verbose, f"Run starts: {run_starts}, lengths: {run_lengths}")
-
-    # --- Block-diagonal polort detrending ---
-    polort = 0 if args.polort is None else int(args.polort)
-    _vsection(args.verbose, "Polort Detrend (block-diagonal)")
-    t_step = time.time()
-    _vprint(args.verbose, f"Order={polort}, {n_runs} runs (block-diagonal)")
-    data_vox_t = apply_polort_projection(
-        data_vox_t,
-        polort=polort,
-        device=device,
-        run_starts=run_starts,
-    )
-    data_vox_t = _check_finite(data_vox_t, "post-polort-concat", args.verbose)
-    _vprint(args.verbose, "Polort done", t_step)
-
-    # --- Per-run high-pass filter ---
-    if args.high_pass is not None and args.high_pass > 0:
-        _vsection(args.verbose, "High-Pass Filter (per-run)")
-        nyquist = 0.5 / tr
-        if args.high_pass >= nyquist:
-            raise ValueError(
-                f"High-pass cutoff ({args.high_pass:.4f} Hz) >= Nyquist ({nyquist:.4f} Hz)"
-            )
-        t_step = time.time()
-        _vprint(
-            args.verbose,
-            f"FFT high-pass: {args.high_pass:.6f} Hz, applied independently per run",
-        )
-        data_vox_t = apply_high_pass_fft(
-            data_vox_t,
-            tr=tr,
-            high_pass_hz=args.high_pass,
-            run_starts=run_starts,
-        )
-        data_vox_t = _check_finite(data_vox_t, "post-highpass-concat", args.verbose)
-        _vprint(args.verbose, "High-pass done", t_step)
+    total_t = int(sum(run_lengths))
 
     # --- Sanity check ---
-    data_var = float(torch.var(data_vox_t).item())
-    if data_var < 1e-10:
-        raise ValueError(f"Data variance is ~0 after preprocessing ({data_var:.2e})")
-    _vprint(args.verbose, f"Data variance after preprocessing: {data_var:.4f}")
+    alldat_var = float(torch.var(alldat).item())
+    if alldat_var < 1e-10:
+        raise ValueError(f"alldat variance is ~0 after preprocessing ({alldat_var:.2e})")
+    _vprint(args.verbose, f"alldat variance after preprocessing: {alldat_var:.4f}")
 
     # --- Spatial smoothness / effective DOF ---
     resels = resels_accum
     fwhm_geo = fwhm_geo_accum
-    n_eff = max(total_t, int(n_vox_masked / (2.5 * resels)))
+    # MELODIC ppca_dim uses the actual kept-voxel count as N_samples (unweighted).
+    # Our prior tcat code used max(total_T, V/(2.5*resels)) which collapsed to total_T.
+    # On alldat (V, min_T), falling back to min_T starves Minka of samples and
+    # truncates the dim estimate. Use V directly (set below after filter).
+    n_eff = n_vox_masked
     _vprint(
         args.verbose,
-        f"Effective spatial DOF: {n_eff:,} (resels={resels:.2f}, from run 1)",
+        f"Using n_eff=V={n_eff:,} for MELODIC-style dim estimation "
+        f"(resels={resels:.2f}, FWHM~{fwhm_geo:.2f} vox)",
     )
 
-    # --- Component count estimation ---
-    _vsection(args.verbose, "Component Estimation")
+    # --- Component count estimation (on alldat, MELODIC-style) ---
+    _vsection(args.verbose, "Component Estimation (on alldat)")
     t_step = time.time()
 
+    # MELODIC caps PPCA search at alldat.Nrows()-2 (melodic.cc handling of pca_dim).
+    # Our legacy default (0.66 * min_T) is tighter and can clip MELODIC-equivalent
+    # solutions; mirror MELODIC's bound when user hasn't overridden.
     if args.max_auto_components <= 1.0:
-        max_auto_k = max(5, int(total_t * args.max_auto_components))
+        max_auto_k = max(5, int((min_T - 2) * args.max_auto_components))
+        if args.max_auto_components >= 0.66:
+            max_auto_k = max(max_auto_k, max(5, min_T - 2))
     else:
         max_auto_k = int(args.max_auto_components)
     _vprint(args.verbose, f"max_auto_components: {max_auto_k}")
     _vprint(args.verbose, f"Method: {args.num_comps}")
 
     n_eff_for_model_order = n_eff
-    data_for_model_order = data_vox_t
-    model_order_filter_diag = None
+    data_for_model_order = alldat
     if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
-        data_for_model_order, model_order_filter_diag = (
-            ica_workflow.filter_voxels_for_melodic_model_order(data_vox_t=data_vox_t)
+        data_for_model_order, _ = ica_workflow.filter_voxels_for_melodic_model_order(
+            data_vox_t=alldat
         )
         n_vox_model_order = int(data_for_model_order.shape[0])
-        n_eff_for_model_order = max(total_t, int(n_vox_model_order / (2.5 * resels)))
+        # MELODIC ppca_dim treats kept voxels as independent samples — match that
+        # rather than dividing by 2.5*resels (which would starve Minka).
+        n_eff_for_model_order = n_vox_model_order
         _vprint(
             args.verbose,
             f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{n_vox_masked:,} voxels; "
@@ -1442,14 +1484,74 @@ def _run_concat_ica(
         verbose=args.verbose,
         capture_ppca_trace=bool(args.ppca_debug_dump),
     )
+    order = int(n_components)
     _vprint(
         args.verbose,
-        f"Selected {n_components} components (mode={num_diag.get('mode', '?')})",
+        f"Selected {order} components (mode={num_diag.get('mode', '?')})",
         t_step,
     )
+    del alldat, data_for_model_order
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    x_t = data_vox_t.T  # (time, vox)
-    del data_vox_t
+    # Keep original (unwhitened, post-varnorm) concat for noise-norm reconstruction.
+    orig_concat_tv: torch.Tensor | None = None
+
+    # --- Whitening ---
+    dwm_list: list[torch.Tensor] | None = None
+    whiten_mode = "joined" if args.joined_whiten else "per_run"
+    if args.joined_whiten:
+        _vsection(args.verbose, "Whitening (joined, on concat)")
+        t_step = time.time()
+        data_vox_t = torch.cat(run_data_list, dim=1)  # (V, T_total)
+        del run_data_list
+        x_t = data_vox_t.T.contiguous()  # (T_total, V) — ICA input
+        del data_vox_t
+        _vprint(args.verbose, f"Joined whiten input: {tuple(x_t.shape)}", t_step)
+    else:
+        _vsection(args.verbose, "Whitening (per-run, block-diag MELODIC-style)")
+        t_step = time.time()
+        dwm_list = []
+        whitened_blocks: list[torch.Tensor] = []
+        for ri in range(n_runs):
+            X_r = run_data_list[ri].T  # (T_r, V)
+            T_r = int(X_r.shape[0])
+            row_mean = X_r.mean(dim=1, keepdim=True)
+            cov_t = (X_r @ X_r.T - n_vox_masked * (row_mean @ row_mean.T)) / float(n_vox_masked)
+            evals_r, evecs_r = torch.linalg.eigh(cov_t)
+            del cov_t
+            idx = torch.argsort(evals_r, descending=True)
+            k_r = min(order, T_r - 1)
+            evals_r = torch.clamp(evals_r[idx][:k_r], min=1e-12)
+            evecs_r = evecs_r[:, idx][:, :k_r]
+            sqrt_ev = torch.sqrt(evals_r)
+            WM_r = (evecs_r / sqrt_ev.unsqueeze(0)).T  # (k_r, T_r)
+            DWM_r = evecs_r * sqrt_ev.unsqueeze(0)  # (T_r, k_r)
+            whitened_r = WM_r @ X_r  # (k_r, V)
+            # Pad to `order` rows if k_r < order (last run or degenerate case)
+            if k_r < order:
+                pad_rows = order - k_r
+                whitened_r = torch.cat(
+                    [whitened_r, torch.zeros(pad_rows, n_vox_masked, device=device)], dim=0
+                )
+                DWM_r = torch.cat(
+                    [DWM_r, torch.zeros(T_r, pad_rows, device=device)], dim=1
+                )
+            whitened_blocks.append(whitened_r)
+            dwm_list.append(DWM_r)
+            del X_r, WM_r
+        # Preserve (T_total, V) concat for noise-norm reconstruction downstream.
+        orig_concat_tv = torch.cat(
+            [rd.T for rd in run_data_list], dim=0
+        ).contiguous()
+        del run_data_list
+        x_t = torch.cat(whitened_blocks, dim=0).contiguous()  # (n_runs*order, V)
+        del whitened_blocks
+        _vprint(
+            args.verbose,
+            f"Per-run whiten: order={order}, stacked shape {tuple(x_t.shape)}",
+            t_step,
+        )
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -1544,6 +1646,29 @@ def _run_concat_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    # --- Per-run whitening: reconstruct (T_total, k) mixing from (n_runs*order, k) ---
+    per_run_tcs: list[np.ndarray] | None = None
+    if dwm_list is not None:
+        mixing_stacked = mixing  # (n_runs*order, k)
+        reconstructed_blocks = []
+        per_run_tcs = []
+        for ri in range(n_runs):
+            row_start = ri * order
+            row_end = row_start + order
+            block = dwm_list[ri] @ mixing_stacked[row_start:row_end]  # (T_r, k)
+            reconstructed_blocks.append(block)
+            per_run_tcs.append(block.detach().cpu().numpy().astype(np.float32))
+        mixing = torch.cat(reconstructed_blocks, dim=0)  # (T_total, k)
+        del mixing_stacked, reconstructed_blocks
+        dwm_list = None
+        # Swap x_t to the unwhitened concat so noise-norm residuals are in data space.
+        if orig_concat_tv is not None:
+            del x_t
+            x_t = orig_concat_tv
+            orig_concat_tv = None
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     # --- Sign consistency (FSL convention) ---
     max_abs = torch.max(torch.abs(components), dim=1).values
     max_pos = torch.max(components, dim=1).values
@@ -1566,6 +1691,7 @@ def _run_concat_ica(
     explained_share_t = mix_var / max(total_mix_var, 1e-15)
 
     sort_idx = torch.argsort(explained_share_t, descending=True)
+    sort_idx_np = sort_idx.detach().cpu().numpy()
     explained_share = explained_share_t[sort_idx].detach().cpu().numpy().astype(np.float32)
     stdev_share_sorted = stdev_share[sort_idx].detach().cpu().numpy().astype(np.float32)
 
@@ -1622,7 +1748,7 @@ def _run_concat_ica(
     )
     _vprint(args.verbose, f"Maps: {out_prefix}_concat_ica_maps{nii_ext}", t_step)
 
-    # Timecourses
+    # Timecourses (concatenated, (T_total, k))
     np.savetxt(
         f"{out_prefix}_concat_ica_timecourses.1D",
         mixing_np,
@@ -1630,6 +1756,19 @@ def _run_concat_ica(
         delimiter="\t",
     )
     _vprint(args.verbose, f"Timecourses: {out_prefix}_concat_ica_timecourses.1D")
+
+    # Per-run timecourses (block-diag whiten path only)
+    per_run_tc_paths: list[str] = []
+    if per_run_tcs is not None:
+        for ri, tc in enumerate(per_run_tcs):
+            tc = tc[:, sort_idx_np]
+            tc_path = f"{out_prefix}_concat_ica_timecourses_run{ri + 1:02d}.1D"
+            np.savetxt(tc_path, tc, fmt="%.6f", delimiter="\t")
+            per_run_tc_paths.append(tc_path)
+        _vprint(
+            args.verbose,
+            f"Per-run timecourses: {len(per_run_tc_paths)} files saved",
+        )
 
     # Scree plot
     ica_postprocess.save_scree_plot(
@@ -1713,7 +1852,8 @@ def _run_concat_ica(
         "polort": polort,
         "high_pass_hz": None if args.high_pass is None else float(args.high_pass),
         "voxel_norm": bool(args.voxel_norm),
-        "voxel_norm_scope": "per_run",
+        "voxel_norm_scope": vn_scope,
+        "whiten_mode": whiten_mode,
         "num_comps_request": args.num_comps,
         "n_components_selected": int(n_components),
         "num_comps_diagnostics": num_diag,
@@ -1733,6 +1873,7 @@ def _run_concat_ica(
         "outputs": {
             "ica_maps": f"{out_prefix}_concat_ica_maps{nii_ext}",
             "ica_timecourses": f"{out_prefix}_concat_ica_timecourses.1D",
+            "ica_timecourses_per_run": per_run_tc_paths if per_run_tc_paths else None,
             "pca_scree_plot": f"{out_prefix}_concat_pca_scree.png",
             "ica_zmaps": f"{out_prefix}_concat_ica_zmaps{nii_ext}" if args.save_mixture_z else None,
         },
@@ -2138,6 +2279,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     modes.add_argument("-tensor", action="store_true", help="Placeholder for future tensorial ICA")
+    vn_group = modes.add_mutually_exclusive_group()
+    vn_group.add_argument(
+        "-joined_vn",
+        dest="joined_vn",
+        action="store_true",
+        default=True,
+        help=(
+            "tcat: compute variance-normalization stdev map jointly from the "
+            "across-run average (MELODIC default). Applies same stdev map to every run."
+        ),
+    )
+    vn_group.add_argument(
+        "-sep_vn",
+        dest="joined_vn",
+        action="store_false",
+        help="tcat: compute variance-normalization per run (legacy behavior).",
+    )
+    modes.add_argument(
+        "-joined_whiten",
+        action="store_true",
+        default=False,
+        help=(
+            "tcat: whiten the concatenated data with a single global PCA. "
+            "Default is per-run PCA+whitening (MELODIC-style block-diagonal) "
+            "which preserves per-run subspaces before ICA."
+        ),
+    )
 
     misc = parser.add_argument_group("Misc")
     misc.add_argument("-cpu", action="store_true", help="Force CPU")

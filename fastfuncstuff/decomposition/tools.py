@@ -348,6 +348,77 @@ def apply_melodic_voxel_varnorm(
     return x_t.T, int(const_mask.sum().item())
 
 
+@torch.inference_mode()
+def compute_melodic_varnorm_map(
+    data_vox_t: torch.Tensor,
+    pca_dim: int | None = None,
+    level: float = 2.3,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Compute the MELODIC varnorm stdev map without applying it.
+
+    Returns (noise_std, const_mask, n_constant). Use apply_varnorm_map to apply
+    the same map to other matching-voxel matrices (e.g., per-run data when the
+    map was computed from an across-run average). Mirrors the PCA+threshold
+    residual-std logic inside apply_melodic_voxel_varnorm.
+    """
+    x_t = data_vox_t.T  # (T, V)
+    n_time, n_vox = int(x_t.shape[0]), int(x_t.shape[1])
+
+    if n_time < 2 or n_vox < 2:
+        std = torch.std(x_t, dim=0, unbiased=True)
+        const_mask = std < 1e-6
+        return std, const_mask, int(const_mask.sum().item())
+
+    dim = min(30, max(1, n_time - 1)) if pca_dim is None else int(pca_dim)
+    dim = max(1, min(dim, n_time - 1))
+
+    row_mean = x_t.mean(dim=1, keepdim=True)
+    corr_t = (x_t @ x_t.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
+    evals, evecs = torch.linalg.eigh(corr_t)
+    del corr_t
+    order = torch.argsort(evals, descending=True)
+    evals = torch.clamp(evals[order][:dim], min=1e-12)
+    evecs = evecs[:, order][:, :dim]
+    sqrt_evals = torch.sqrt(evals)
+    white = (evecs / sqrt_evals.unsqueeze(0)).T
+    dewhite = evecs * sqrt_evals.unsqueeze(0)
+
+    ws = white @ x_t
+    ws = torch.where(torch.abs(ws) < float(level), torch.zeros_like(ws), ws)
+
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    chunk_size = estimate_chunk_size(
+        n_voxels=n_vox,
+        n_timepoints=n_time,
+        n_regressors=0,
+        device=x_t.device,
+        operation="ica_varnorm",
+    )
+    noise_std = torch.empty(n_vox, device=x_t.device)
+    input_std = torch.std(x_t, dim=0, unbiased=True)
+    for v0 in range(0, n_vox, chunk_size):
+        v1 = min(v0 + chunk_size, n_vox)
+        resid_chunk = x_t[:, v0:v1] - (dewhite @ ws[:, v0:v1])
+        noise_std[v0:v1] = torch.std(resid_chunk, dim=0, unbiased=True)
+        del resid_chunk
+
+    const_mask = (noise_std < 0.01) | (input_std < 1e-6)
+    return noise_std, const_mask, int(const_mask.sum().item())
+
+
+def apply_varnorm_map(
+    data_vox_t: torch.Tensor,
+    noise_std: torch.Tensor,
+    const_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Divide each voxel by noise_std; zero constant voxels. Returns new tensor."""
+    safe_std = torch.where(const_mask, torch.ones_like(noise_std), noise_std)
+    out = data_vox_t / safe_std.unsqueeze(1)
+    out[const_mask] = 0.0
+    return out
+
+
 def effective_rank_from_spectrum(evals: np.ndarray) -> int:
     """Estimate effective rank from eigenvalue spectrum entropy.
 
