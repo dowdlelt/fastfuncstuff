@@ -58,6 +58,9 @@ examples/monte_carlo_results/
 examples/simulation_results_isi_sweep/
 design_optimization_results/
 
+# docs, used locally
+docs/REFERENCE_CODE.md
+
 # Plots
 *.png
 *.pdf

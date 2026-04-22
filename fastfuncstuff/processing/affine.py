@@ -845,14 +845,6 @@ def voxel_matrix_to_dicom(
     M_ras = source_ijk2ras @ M_ijk @ base_ras2ijk
 
     # Step 2: RAS → DICOM (negate x,y rows and columns)
-    # TODO(sign-convention): D=diag(-1,-1,1,1) negates x,y translation BUT NOT z. This is why
-    # the z-axis motion params (roll=-rz, dS=-dz) accidentally come out with the correct sign in
-    # save_moco_1D, while the x,y params (pitch, yaw, dL, dP) require an additional negation
-    # that is not applied. The downstream fix is in save_moco_1D, but the root cause is here:
-    # the D @ M_ras @ D conjugation produces dx_DICOM = -tx_RAS and dy_DICOM = -ty_RAS, while
-    # dz_DICOM = +tz_RAS (no sign flip for z). AFNI .1D params are subject-motion conventions
-    # (the inverse of the image-warp transform), so every component needs an extra negation.
-    # See docs/OUTSTANDING_ISSUES.md and the TODO block in save_moco_1D.
     D = _RAS_TO_DICOM.to(device)
     return D @ M_ras @ D
 
@@ -901,33 +893,58 @@ def dicom_matrix_to_voxel(
 
 
 def save_matrix_1D(
-    matrix_ijk: Tensor,
+    matrix: Tensor | np.ndarray,
     path: str | Path,
-    base_affine: np.ndarray,
-    source_affine: np.ndarray,
+    base_affine: np.ndarray | None = None,
+    source_affine: np.ndarray | None = None,
+    header: str | None = None,
 ) -> None:
-    """Save affine matrix as AFNI-compatible .aff12.1D file.
+    """Save affine matrix/matrices as an AFNI-compatible ``.aff12.1D`` file.
 
-    The .aff12.1D format stores 12 numbers (row-major 3x4) in DICOM mm
-    coordinates. The matrix maps base xyz to source xyz.
+    Writes 12 row-major numbers (3×4) per line in DICOM mm coordinates,
+    base→source, matching ``3dvolreg -1Dmatrix_save`` and
+    ``3dAllineate -1Dmatrix_save`` (see AFNI ``3dvolreg.c:1507``).
+
+    Accepts either:
+      - voxel-space matrix ``(4, 4)`` plus ``base_affine`` and ``source_affine``
+        (the canonical allineate case), which are used to convert to DICOM; or
+      - one or more pre-converted DICOM-space matrices ``(4, 4)`` or
+        ``(nt, 4, 4)`` with ``base_affine`` / ``source_affine`` left ``None``
+        (the moco case where per-volume DICOM matrices are already computed).
 
     Args:
-        matrix_ijk: (4, 4) affine in voxel index space.
-        path: Output file path.
-        base_affine: NIfTI affine for base image.
+        matrix: affine matrix/matrices, shape (4,4) or (nt,4,4).
+        path: output file path.
+        base_affine: NIfTI affine for base image. Pass together with
+            ``source_affine`` to indicate ``matrix`` is in voxel-index space.
         source_affine: NIfTI affine for source image.
+        header: optional comment line written as ``# {header}`` at the top.
     """
-    M_dicom = voxel_matrix_to_dicom(matrix_ijk, base_affine, source_affine)
-    M = M_dicom.detach().cpu().numpy()
+    if (base_affine is None) != (source_affine is None):
+        raise ValueError(
+            "save_matrix_1D: pass both base_affine and source_affine, or neither"
+        )
 
-    # Write 12 numbers: rows 0-2, columns 0-3 (row-major)
-    vals = []
-    for i in range(3):
-        for j in range(4):
-            vals.append(f"{M[i, j]:.10f}")
+    if base_affine is not None:
+        m_t = matrix if isinstance(matrix, Tensor) else torch.as_tensor(matrix)
+        M = voxel_matrix_to_dicom(m_t, base_affine, source_affine)
+    else:
+        M = matrix
+
+    if isinstance(M, Tensor):
+        M = M.detach().cpu().numpy()
+    M = np.asarray(M)
+    if M.ndim == 2:
+        M = M[None]
+    if M.ndim != 3 or M.shape[-2:] != (4, 4):
+        raise ValueError(f"save_matrix_1D: expected (4,4) or (nt,4,4), got {M.shape}")
 
     with open(str(path), "w") as f:
-        f.write("  ".join(vals) + "\n")
+        if header:
+            f.write(f"# {header}\n")
+        for t in range(M.shape[0]):
+            vals = [f"{M[t, i, j]:.10f}" for i in range(3) for j in range(4)]
+            f.write("  ".join(vals) + "\n")
 
 
 def load_matrix_1D(

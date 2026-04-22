@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from ..runner import BenchmarkContext, run_timed
-from ..validation import compare_1d_params, compare_moco_ssd, compare_volumes
+from ..validation import (
+    compare_1d_params,
+    compare_aff12_series,
+    compare_moco_ssd,
+    compare_volumes,
+)
 
 name = "moco"
 description = "Motion correction (3dvolreg vs ffs_moco)"
@@ -11,12 +16,18 @@ description = "Motion correction (3dvolreg vs ffs_moco)"
 MOTION_PARAM_NAMES = ["roll", "pitch", "yaw", "dS", "dL", "dP"]
 
 THRESHOLDS = {
-    # Mean images are the primary quality metric — pass/fail
+    # Mean images are the primary alignment quality metric
     "mean_image_min_r": 0.98,
-    # Motion params are diagnostic only — different optimizers find slightly
-    # different paths especially for sub-voxel motion, but converge to the
-    # same alignment (reflected in mean image agreement)
-    "motion_param_mean_r": 0.85,
+    # Motion params: mean correlation across the 6 columns must clear this.
+    # Tolerant of the remaining per-volume Euler-decomposition mismatch but
+    # will catch any sign-convention regression (would drive a column to ~-1).
+    "motion_param_mean_r": 0.90,
+    # aff12 matrices must match direction (base→source, per 3dvolreg.c:1507).
+    # A spurious inversion historically drove max translation diff to ~0.3 mm and
+    # flipped rotation off-diagonals. These thresholds detect any direction
+    # regression while tolerating optimizer divergence on sub-voxel motion.
+    "aff12_max_trans_diff_mm": 0.5,
+    "aff12_max_rot_diff": 0.05,
 }
 
 
@@ -34,6 +45,16 @@ def _afni_motion_path(ctx: BenchmarkContext, task: str, run: int) -> str:
 
 def _ffs_motion_path(ctx: BenchmarkContext, task: str, run: int) -> str:
     return str(ctx.processing_dir / f"ffs_motion_correction_task-{task}_run-{run}.1D")
+
+
+def _afni_aff12_path(ctx: BenchmarkContext, task: str, run: int) -> str:
+    out = _afni_moco_path(ctx, task, run)
+    return out.replace(".nii", "_mat.aff12.1D")
+
+
+def _ffs_aff12_path(ctx: BenchmarkContext, task: str, run: int) -> str:
+    out = _ffs_moco_path(ctx, task, run)
+    return out.replace(".nii", "_mat.aff12.1D")
 
 
 def _afni_mean_path(ctx: BenchmarkContext, task: str, run: int) -> str:
@@ -63,6 +84,8 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
                     _ffs_moco_path(ctx, task, run),
                     _afni_motion_path(ctx, task, run),
                     _ffs_motion_path(ctx, task, run),
+                    _afni_aff12_path(ctx, task, run),
+                    _ffs_aff12_path(ctx, task, run),
                     _afni_mean_path(ctx, task, run),
                     _ffs_mean_path(ctx, task, run),
                 ]:
@@ -142,10 +165,11 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 
 def validate(ctx: BenchmarkContext) -> dict:
-    """Compare motion parameters, mean images, and MSD across all runs."""
+    """Compare motion parameters, aff12 matrices, mean images, and MSD."""
     motion_results = []
     mean_results = []
     ssd_results = []
+    aff12_results = []
 
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
@@ -154,7 +178,6 @@ def validate(ctx: BenchmarkContext) -> dict:
                 _afni_motion_path(ctx, task, run),
                 _ffs_motion_path(ctx, task, run),
             )
-            # Label columns with motion parameter names
             per_col = mp.get("per_column_r", [])
             mp["per_column"] = {
                 MOTION_PARAM_NAMES[i] if i < len(MOTION_PARAM_NAMES) else f"col{i}": r
@@ -163,6 +186,15 @@ def validate(ctx: BenchmarkContext) -> dict:
             mp["task"] = task
             mp["run"] = run
             motion_results.append(mp)
+
+            # aff12 matrix agreement (catches direction/inversion regressions)
+            af = compare_aff12_series(
+                _afni_aff12_path(ctx, task, run),
+                _ffs_aff12_path(ctx, task, run),
+            )
+            af["task"] = task
+            af["run"] = run
+            aff12_results.append(af)
 
             # Mean images
             mv = compare_volumes(
@@ -182,30 +214,44 @@ def validate(ctx: BenchmarkContext) -> dict:
             sd["run"] = run
             ssd_results.append(sd)
 
-    # Aggregate
     motion_min_r = min(m["min_r"] for m in motion_results)
     motion_mean_r = sum(m["mean_r"] for m in motion_results) / len(motion_results)
     mean_min_r = min(m["r"] for m in mean_results)
     mean_mean_r = sum(m["r"] for m in mean_results) / len(mean_results)
 
-    # MSD aggregates
     nrmsd_vals = [s["nrmsd"] for s in ssd_results if "error" not in s]
     mean_nrmsd = sum(nrmsd_vals) / len(nrmsd_vals) if nrmsd_vals else 0.0
     max_nrmsd = max(nrmsd_vals) if nrmsd_vals else 0.0
 
-    # Pass based on output quality (mean images), not parameter paths
-    passed = mean_min_r >= THRESHOLDS["mean_image_min_r"]
+    valid_aff = [a for a in aff12_results if "error" not in a]
+    aff12_max_trans = max((a["max_trans_diff"] for a in valid_aff), default=0.0)
+    aff12_max_rot = max((a["max_rot_diff"] for a in valid_aff), default=0.0)
+
+    # PASS conditions: alignment (mean image), param agreement (sign-regression
+    # catcher), and aff12 direction (inversion-regression catcher).
+    passed = (
+        mean_min_r >= THRESHOLDS["mean_image_min_r"]
+        and motion_mean_r >= THRESHOLDS["motion_param_mean_r"]
+        and aff12_max_trans <= THRESHOLDS["aff12_max_trans_diff_mm"]
+        and aff12_max_rot <= THRESHOLDS["aff12_max_rot_diff"]
+    )
 
     return {
         "passed": passed,
         "summary": (
             f"means min_r={mean_min_r:.4f}, motion mean_r={motion_mean_r:.4f}, "
+            f"aff12 max_trans={aff12_max_trans:.4f}mm, max_rot={aff12_max_rot:.4f}, "
             f"nrmsd={mean_nrmsd:.4f}"
         ),
         "motion_params": {
             "min_r": motion_min_r,
             "mean_r": motion_mean_r,
             "per_run": motion_results,
+        },
+        "aff12": {
+            "max_trans_diff_mm": aff12_max_trans,
+            "max_rot_diff": aff12_max_rot,
+            "per_run": aff12_results,
         },
         "mean_images": {
             "min_r": mean_min_r,

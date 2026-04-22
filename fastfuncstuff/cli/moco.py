@@ -14,12 +14,12 @@ import time
 
 import torch
 
+from fastfuncstuff.processing.affine import save_matrix_1D
 from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
     moco,
     save_maxdisp_1D,
     save_moco_1D,
-    save_moco_aff12,
     save_moco_dfile,
 )
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
@@ -277,7 +277,11 @@ def main(argv: list[str] | None = None) -> None:
     # Affine matrices
     matrix_save = getattr(args, "1Dmatrix_save", None)
     if matrix_save is not None:
-        save_moco_aff12(result.matrices_dicom, matrix_save)
+        save_matrix_1D(
+            result.matrices_dicom,
+            matrix_save,
+            header="ffs_moco matrices (DICOM-to-DICOM, row-by-row):",
+        )
         if verb >= 1:
             print(f"Saved matrices: {matrix_save}")
 

@@ -505,66 +505,28 @@ def save_moco_1D(
 ) -> None:
     """Save 6-column motion parameter file (.1D).
 
-    AFNI 3dvolreg format: roll pitch yaw dS dL dP (degrees, mm)
-    - roll  = rotation about I-S axis (z in DICOM) = -rz
-    - pitch = rotation about R-L axis (x in DICOM) = rx
-    - yaw   = rotation about A-P axis (y in DICOM)   ry
-    - dS    = displacement in Superior direction (z in DICOM)   -dz
-    - dL    = displacement in Left direction (x in DICOM)       dx
-    - dP    = displacement in Posterior direction (y in DICOM)  dy
+    AFNI 3dvolreg format: roll pitch yaw dS dL dP (degrees, mm).
+    Params report the subject's motion (inverse of the correction transform), so
+    every column is the negation of the DICOM correction-matrix component:
+    - roll  = -rz_DICOM  (rotation about I-S axis)
+    - pitch = -rx_DICOM  (rotation about R-L axis)
+    - yaw   = -ry_DICOM  (rotation about A-P axis)
+    - dS    = -dz_DICOM  (displacement in Superior direction)
+    - dL    = -dx_DICOM  (displacement in Left direction)
+    - dP    = -dy_DICOM  (displacement in Posterior direction)
 
     Args:
         params_array: (nt, 6) array of [dx, dy, dz, rz, rx, ry] in DICOM space.
         path: output file path.
     """
-    # TODO(sign-convention): benchmark shows pitch, yaw, dL, dP are anti-correlated
-    # with AFNI 3dvolreg (~-0.97) while roll and dS are correctly correlated (+0.94, +0.998).
-    # Hypothesis: all six AFNI .1D params should be the NEGATIVE of the DICOM transform params
-    # (transform corrects motion; .1D reports the motion itself). The z-axis params happen to
-    # be correct because D33=diag(-1,-1,1) does NOT negate z, so -dz_DICOM and -rz_DICOM
-    # accidentally match AFNI's sign. The x,y params need the same negation:
-    #   dL = -dx_DICOM  (not +dx_DICOM)
-    #   dP = -dy_DICOM  (not +dy_DICOM)
-    #   pitch = -rx_DICOM  (not +rx_DICOM)
-    #   yaw   = -ry_DICOM  (not +ry_DICOM)
-    # Verify by running 3dvolreg on a synthetic volume with a known 1mm x-translation
-    # and checking the sign of the output dL column. See docs/OUTSTANDING_ISSUES.md.
     with open(path, "w") as f:
         for t in range(params_array.shape[0]):
             dx, dy, dz = params_array[t, 0], params_array[t, 1], params_array[t, 2]
             rz, rx, ry = params_array[t, 3], params_array[t, 4], params_array[t, 5]
-            # AFNI format: roll pitch yaw dS dL dP
-            # Mapping: roll=-rz, pitch=rx, yaw=ry, dS=-dz, dL=dx, dP=dy
-            # TODO(sign-convention): pitch/yaw/dL/dP signs are likely wrong — see comment above
             f.write(
-                f"  {-rz:8.4f}  {rx:8.4f}  {ry:8.4f}"
-                f"  {-dz:8.4f}  {dx:8.4f}  {dy:8.4f}\n"
+                f"  {-rz:8.4f}  {-rx:8.4f}  {-ry:8.4f}"
+                f"  {-dz:8.4f}  {-dx:8.4f}  {-dy:8.4f}\n"
             )
-
-
-def save_moco_aff12(
-    matrices_dicom: np.ndarray,
-    path: str,
-) -> None:
-    """Save multi-row .aff12.1D file with one row per volume.
-
-    Saves the INVERSE transformation matrix (base←source), which is what AFNI's 3dvolreg outputs.
-
-    Args:
-        matrices_dicom: (nt, 4, 4) DICOM-space matrices (forward transform: source→base).
-        path: output file path.
-    """
-    with open(path, "w") as f:
-        for t in range(matrices_dicom.shape[0]):
-            # Invert the matrix (AFNI saves the inverse transformation)
-            M = matrices_dicom[t]
-            M_inv = np.linalg.inv(M)
-
-            vals = []
-            for i in range(3):
-                for j in range(4):
-                    vals.append(f"{M_inv[i, j]:.10f}")
-            f.write("  ".join(vals) + "\n")
 
 
 def save_moco_dfile(
@@ -583,19 +545,13 @@ def save_moco_dfile(
         rms_after: (nt,) RMS after alignment.
         path: output file path.
     """
-    # TODO(sign-convention): same sign issue as save_moco_1D — pitch, yaw, dL, dP
-    # are likely written with wrong sign. See the block comment in save_moco_1D and
-    # docs/OUTSTANDING_ISSUES.md.
     with open(path, "w") as f:
         for t in range(params_array.shape[0]):
             dx, dy, dz = params_array[t, 0], params_array[t, 1], params_array[t, 2]
             rz, rx, ry = params_array[t, 3], params_array[t, 4], params_array[t, 5]
-            # AFNI format: roll pitch yaw dS dL dP
-            # Mapping: roll=-rz, pitch=rx, yaw=ry, dS=-dz, dL=dx, dP=dy
-            # TODO(sign-convention): pitch/yaw/dL/dP signs are likely wrong — see save_moco_1D
             f.write(
-                f"  {t:4d}  {-rz:8.4f}  {rx:8.4f}  {ry:8.4f}"
-                f"  {-dz:8.4f}  {dx:8.4f}  {dy:8.4f}"
+                f"  {t:4d}  {-rz:8.4f}  {-rx:8.4f}  {-ry:8.4f}"
+                f"  {-dz:8.4f}  {-dx:8.4f}  {-dy:8.4f}"
                 f"  {rms_before[t]:11.4g}  {rms_after[t]:11.4g}\n"
             )
 

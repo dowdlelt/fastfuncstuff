@@ -18,10 +18,10 @@ from fastfuncstuff.processing.ffs_moco import (
     compute_max_displacement,
     gauss_newton_rigid,
     save_moco_1D,
-    save_moco_aff12,
     save_moco_dfile,
     save_maxdisp_1D,
 )
+from fastfuncstuff.processing.affine import save_matrix_1D
 from fastfuncstuff.processing.slicetime import (
     load_slice_timing,
     shift_timeseries,
@@ -113,20 +113,24 @@ class TestMaxDisplacement:
 
 class TestSaveFunctions:
     def test_save_moco_1D_roundtrip(self, tmp_path):
+        # Input params are DICOM correction-transform [dx, dy, dz, rz, rx, ry].
+        # AFNI .1D reports subject motion = negation of correction, so every
+        # column in the output file is the negation of the DICOM component.
         params = np.array([[1.0, 2.0, 3.0, 0.5, 0.1, 0.2], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
         fpath = str(tmp_path / "moco.1D")
         save_moco_1D(params, fpath)
         data = np.loadtxt(fpath)
+        # Column order: roll=-rz, pitch=-rx, yaw=-ry, dS=-dz, dL=-dx, dP=-dy
         assert data.shape == (2, 6)
-        assert np.allclose(data[0, 4], 1.0, atol=1e-3)
+        assert np.allclose(data[0], [-0.5, -0.1, -0.2, -3.0, -1.0, -2.0], atol=1e-3)
         assert np.allclose(data[1], 0.0, atol=1e-3)
 
-    def test_save_moco_aff12_roundtrip(self, tmp_path):
+    def test_save_matrix_1D_multivolume_roundtrip(self, tmp_path):
         nt = 3
         mats = np.stack([np.eye(4) for _ in range(nt)])
         fpath = str(tmp_path / "moco.aff12.1D")
-        save_moco_aff12(mats, fpath)
-        data = np.loadtxt(fpath)
+        save_matrix_1D(mats, fpath, header="test header")
+        data = np.loadtxt(fpath, comments="#")
         assert data.shape == (nt, 12)
 
     def test_save_moco_dfile(self, tmp_path):

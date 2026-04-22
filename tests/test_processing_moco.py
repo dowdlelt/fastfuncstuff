@@ -24,10 +24,6 @@ from fastfuncstuff.processing.ffs_moco import (
     gauss_newton_rigid_fixed_masked,
     gauss_newton_rigid_masked,
     moco,
-    save_moco_1D,
-    save_moco_aff12,
-    save_moco_dfile,
-    save_maxdisp_1D,
 )
 from fastfuncstuff.processing.weight import compute_weight_image
 
