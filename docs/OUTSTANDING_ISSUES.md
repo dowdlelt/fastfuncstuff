@@ -41,14 +41,75 @@ whole timeseries on GPU could plausibly win, but would be a substantial rewrite.
 Until then: accept the speed gap as the cost of a portable PyTorch implementation
 and focus on correctness + GPU batching for multi-run workflows.
 
-## ICA Temporal Concat differences
-Noting here that the the number of components is very different when using temp concat. 
-This could be due to different masking, or the data reduction that MELODIC performs, or both. 
-Further investigation is required. Components themselves look similar, across 50 to 60%, so its not terrible at this momment. 
+## ICA Temporal Concat differences (closer, not matched)
 
-## ICA No Tensorial Approach currently available. 
-For datasets with the same design (or multiecho dataset) the tensor approach is valid. 
-This is currently not implemente. 
+After re-aligning `_run_concat_ica` to MELODIC's `setup_migp` path and adding
+the `n_eff = floor(V / (2.5 * resels))` correction for the MP noise floor
+(was previously raw voxel count), the over-count on ds005165 dropped but is
+not resolved:
+
+- Before fix: ffs=258 vs melodic=147
+- After fix: ffs=194 (rest) / 192 (localizer) vs melodic=147
+- Matched-component mean |r| = 0.40, coverage@0.5 = 19/147
+
+Remaining suspects (unconfirmed):
+- **`cov_r` centering semantics.** MELODIC's `std_pca` calls
+  `cov_r(Mat, false, econ)` with no explicit `remmean` on the main
+  `perf_pca` path, and with `remmean(in,2)` inside `varnorm`. FFS
+  row-centers explicitly in both. If `cov_r` actually centers by column
+  means (or doesn't center), the noise eigenvalue distribution shifts and
+  PPCA will keep a different number of components. Confirm by reading
+  `miscmaths::cov_r`.
+- **`update_mask` after varnorm.** MELODIC calls `update_mask(Mask, Data)`
+  on the full concat (`meldata.cc:568-572`) to drop constant/degenerate
+  voxels; all downstream stages (varnorm, PCA, whitening, ICA) then run
+  on the reduced matrix. FFS applies an analogous filter only inside
+  `estimate_ica_component_count` (`filter_voxels_for_melodic_model_order`)
+  and not to the main PCA/whitening input. Whether the reduced voxel count
+  also feeds back into `resels` needs checking.
+- **Constant-voxel handling in varnorm.** MELODIC sets `noise_std = 1` and
+  zeroes the column for `noise_std < 0.01` (`melhlprfns.cc:167-171`). FFS
+  matches this but the `const_mask` threshold includes `input_std < 1e-6`
+  as an extra condition — possibly zeroing more columns than MELODIC and
+  skewing the tail of the eigenspectrum.
+- **PCA input for the main whitening.** MELODIC `perf_pca` runs
+  `std_pca(in, ...)` with no remmean. FFS row-centers before the eigen
+  decomposition. Suspected to be equivalent (since per-voxel demean
+  enforces zero column-means before concat and the row-mean drift should
+  be small), but not verified head-to-head.
+
+Next debugging step: dump the raw eigenvalue spectrum (pre- and
+post-MP-adjustment) from both implementations on the same input, so we can
+see whether the discrepancy is in the PCA spectrum itself or only in the
+PPCA/Minka stopping criterion.
+
+## ICA Tensor-ICA (MELODIC `--approach=tica`) not implemented
+
+FFS ships a `-tensor` mode (`_run_tensorial_ica`) that does spatial
+concatenation `(T, n_runs*V)` with a shared temporal mixing and per-run
+spatial maps — adequate for multi-echo or identical-design datasets where
+the user just wants shared temporal structure.
+
+This is **not** the same as MELODIC's tensor ICA (`--approach=tica`):
+
+- MELODIC tICA runs `setup_classic` with per-run PCA+whitening stacked
+  block-diagonally into `(n_runs*order, V)`, then after ICA factors the
+  temporal mixing via `krfact` (Khatri-Rao / Kronecker factorisation,
+  `melodic_src/melodic/melhlprfns.cc:krfact`, `meldata.cc:218-243`) into
+  three modes: spatial × temporal × subject-loadings.
+- Our `-tensor` mode produces two modes only (shared temporal + per-run
+  spatial) and does no Kronecker factorisation.
+
+Implementing true tICA would require:
+1. Per-run PCA+whitening stacked block-diagonally to `(n_runs*order, V)`.
+2. ICA on the stacked matrix.
+3. `krfact` port in `decomposition/` to decompose the `(n_runs*order, k)`
+   mixing into `(n_runs, k)` subject-loadings and `(order, k)` shared
+   temporal modes.
+4. Output `_Smodes.txt` / `_Tmodes.txt`-compatible files.
+
+Not blocking for current benchmark goals; note as a future alignment item
+when group-ICA becomes a priority.
 
 ## Parametric Duration Modulation (future feature)
 

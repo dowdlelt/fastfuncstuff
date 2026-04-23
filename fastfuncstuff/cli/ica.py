@@ -22,7 +22,9 @@ Notes
 - `-temp_concat`: temporal concatenation mode for single-subject multi-run ICA.
   Per-run scaling and varnorm, then concatenation with block-diagonal polort
   and per-run high-pass filtering.
-- `-tensor` is a placeholder for future tensorial ICA.
+- `-tensor`: tensorial (spatial-concat) mode. Requires runs with identical T;
+  stacks along voxel axis → (T, n_runs*V) and produces a single shared temporal
+  mixing with per-run spatial maps.
 """
 
 from __future__ import annotations
@@ -1352,67 +1354,7 @@ def _run_concat_ica(
 
     polort = -1 if (args.polort is None and n_runs > 1) else (0 if args.polort is None else int(args.polort))
 
-    # --- Build alldat = across-run average (MELODIC setup_classic) ---
-    _vsection(args.verbose, "Build alldat (across-run average)")
-    t_step = time.time()
-    min_T = min(run_lengths)
-    max_T = max(run_lengths)
-    if min_T != max_T:
-        _vprint(
-            args.verbose,
-            f"WARNING: unequal run lengths {run_lengths}; truncating to min_T={min_T} for alldat only",
-        )
-    alldat = run_data_list[0][:, :min_T].clone() / float(n_runs)
-    for ri in range(1, n_runs):
-        alldat += run_data_list[ri][:, :min_T] / float(n_runs)
-    alldat = _check_finite(alldat, "alldat", args.verbose)
-    _vprint(args.verbose, f"alldat shape: {tuple(alldat.shape)}", t_step)
-
-    # --- Variance normalization (joint default, per-run opt-in via -sep_vn) ---
-    vn_scope = "per_run"
-    if args.voxel_norm:
-        from fastfuncstuff.decomposition.tools import (
-            apply_melodic_voxel_varnorm,
-            apply_varnorm_map,
-            compute_melodic_varnorm_map,
-        )
-
-        if args.joined_vn:
-            _vsection(args.verbose, "Variance Normalization (joined, from alldat)")
-            t_step = time.time()
-            # MELODIC meldata.cc:403 passes alldat.Nrows() (full T) for alldat-scope varnorm,
-            # distinct from the min(30, T-1) cap used in per-file process_file varnorm.
-            pca_dim_vn = max(1, min_T - 1)
-            noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
-                alldat, pca_dim=pca_dim_vn, level=2.3
-            )
-            alldat = apply_varnorm_map(alldat, noise_std_map, const_mask_vn)
-            for ri in range(n_runs):
-                run_data_list[ri] = apply_varnorm_map(
-                    run_data_list[ri], noise_std_map, const_mask_vn
-                )
-            _vprint(
-                args.verbose,
-                f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant voxels",
-                t_step,
-            )
-            vn_scope = "joined"
-            del noise_std_map, const_mask_vn
-        else:
-            _vsection(args.verbose, "Variance Normalization (per-run)")
-            t_step = time.time()
-            for ri in range(n_runs):
-                pca_dim_r = min(30, max(1, run_lengths[ri] - 1))
-                run_data_list[ri], _ = apply_melodic_voxel_varnorm(
-                    run_data_list[ri], pca_dim=pca_dim_r, level=2.3
-                )
-            # Also varnorm alldat for dim-est self-consistency
-            pca_dim_all = min(30, max(1, min_T - 1))
-            alldat, _ = apply_melodic_voxel_varnorm(alldat, pca_dim=pca_dim_all, level=2.3)
-            _vprint(args.verbose, "Per-run varnorm applied", t_step)
-            vn_scope = "per_run"
-
-    # run_starts / total_t (used by metadata + downstream concat)
+    # run_starts / total_t
     run_starts = []
     offset = 0
     for rl in run_lengths:
@@ -1420,65 +1362,113 @@ def _run_concat_ica(
         offset += rl
     total_t = int(sum(run_lengths))
 
+    # --- Temporal concatenation (MELODIC setup_migp, meldata.cc:519-587) ---
+    # MELODIC tcat with migp (default) stacks each file's data along time after
+    # scaling by 1/numfiles, optionally PCA-reducing once the stack grows past
+    # 2*migpN rows. For typical FFS-sized runs we skip the incremental PCA —
+    # SVD on (T_total, V) is cheap and exact. Divide-by-n_runs mirrors
+    # setup_migp's `tmpData = process_file(...) / numfiles` scaling.
+    _vsection(args.verbose, "Temporal Concatenation (MELODIC setup_migp-style)")
+    t_step = time.time()
+    scale = 1.0 / float(n_runs)
+    # Build (T_total, V) concat; per-run (V, T_r) → transpose and scale.
+    data_tv = torch.cat(
+        [run_data_list[ri].T * scale for ri in range(n_runs)], dim=0
+    ).contiguous()
+    del run_data_list
+    data_tv = _check_finite(data_tv, "data_tv", args.verbose)
+    _vprint(args.verbose, f"Concat shape: {tuple(data_tv.shape)} (T_total, V)", t_step)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Variance normalization (MELODIC varnorm2 on the concat matrix) ---
+    # setup_migp:579-584 — single voxel-wise varnorm on the fully-concatenated
+    # Data using min(30, Data.Nrows()-1) PCs. We honor -sep_vn as an escape
+    # hatch (per-file varnorm before concat) for debugging, but joined matches
+    # MELODIC's default pipeline.
+    vn_scope = "none"
+    if args.voxel_norm:
+        from fastfuncstuff.decomposition.tools import (
+            apply_varnorm_map,
+            compute_melodic_varnorm_map,
+        )
+
+        _vsection(args.verbose, "Variance Normalization (joined on concat)")
+        t_step = time.time()
+        pca_dim_vn = min(30, max(1, int(data_tv.shape[0]) - 1))
+        # compute_melodic_varnorm_map expects (V, T); our data_tv is (T, V) → pass transpose.
+        noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
+            data_tv.T, pca_dim=pca_dim_vn, level=2.3
+        )
+        data_tv_vt = apply_varnorm_map(data_tv.T, noise_std_map, const_mask_vn)
+        data_tv = data_tv_vt.T.contiguous()
+        del data_tv_vt, noise_std_map, const_mask_vn
+        _vprint(
+            args.verbose,
+            f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant voxels",
+            t_step,
+        )
+        vn_scope = "joined"
+
     # --- Sanity check ---
-    alldat_var = float(torch.var(alldat).item())
-    if alldat_var < 1e-10:
-        raise ValueError(f"alldat variance is ~0 after preprocessing ({alldat_var:.2e})")
-    _vprint(args.verbose, f"alldat variance after preprocessing: {alldat_var:.4f}")
+    concat_var = float(torch.var(data_tv).item())
+    if concat_var < 1e-10:
+        raise ValueError(f"concat variance is ~0 after preprocessing ({concat_var:.2e})")
+    _vprint(args.verbose, f"Concat variance: {concat_var:.4f}")
 
     # --- Spatial smoothness / effective DOF ---
+    # MELODIC: NumVox = floor(num_vox / (2.5 * resels)) feeds the MP noise floor
+    # (melhlprfns.cc adj_eigspec:444). Without this correction, MP is too tight
+    # and PPCA over-estimates component count.
     resels = resels_accum
     fwhm_geo = fwhm_geo_accum
-    # MELODIC ppca_dim uses the actual kept-voxel count as N_samples (unweighted).
-    # Our prior tcat code used max(total_T, V/(2.5*resels)) which collapsed to total_T.
-    # On alldat (V, min_T), falling back to min_T starves Minka of samples and
-    # truncates the dim estimate. Use V directly (set below after filter).
-    n_eff = n_vox_masked
+    n_eff = max(int(total_t), int(n_vox_masked / (2.5 * max(resels, 1e-6))))
     _vprint(
         args.verbose,
-        f"Using n_eff=V={n_eff:,} for MELODIC-style dim estimation "
-        f"(resels={resels:.2f}, FWHM~{fwhm_geo:.2f} vox)",
+        f"Effective spatial DOF: n_eff={n_eff:,} "
+        f"(raw V={n_vox_masked:,}, resels={resels:.2f}, 2.5*resels={2.5 * resels:.1f})",
     )
 
-    # --- Component count estimation (on alldat, MELODIC-style) ---
-    _vsection(args.verbose, "Component Estimation (on alldat)")
+    # --- Component count estimation (on concat, MELODIC-style) ---
+    _vsection(args.verbose, "Component Estimation (on concat)")
     t_step = time.time()
 
-    # MELODIC caps PPCA search at alldat.Nrows()-2 (melodic.cc handling of pca_dim).
-    # Our legacy default (0.66 * min_T) is tighter and can clip MELODIC-equivalent
-    # solutions; mirror MELODIC's bound when user hasn't overridden.
+    # Dim-est expects (V, T) layout internally — pass data_tv.T.
+    T_total = int(data_tv.shape[0])
     if args.max_auto_components <= 1.0:
-        max_auto_k = max(5, int((min_T - 2) * args.max_auto_components))
+        max_auto_k = max(5, int((T_total - 2) * args.max_auto_components))
         if args.max_auto_components >= 0.66:
-            max_auto_k = max(max_auto_k, max(5, min_T - 2))
+            max_auto_k = max(max_auto_k, max(5, T_total - 2))
     else:
         max_auto_k = int(args.max_auto_components)
     _vprint(args.verbose, f"max_auto_components: {max_auto_k}")
     _vprint(args.verbose, f"Method: {args.num_comps}")
 
     n_eff_for_model_order = n_eff
-    data_for_model_order = alldat
+    data_for_model_order_vt = data_tv.T  # (V, T_total)
     if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
-        data_for_model_order, _ = ica_workflow.filter_voxels_for_melodic_model_order(
-            data_vox_t=alldat
+        data_for_model_order_vt, _ = ica_workflow.filter_voxels_for_melodic_model_order(
+            data_vox_t=data_tv.T
         )
-        n_vox_model_order = int(data_for_model_order.shape[0])
-        # MELODIC ppca_dim treats kept voxels as independent samples — match that
-        # rather than dividing by 2.5*resels (which would starve Minka).
-        n_eff_for_model_order = n_vox_model_order
+        n_vox_model_order = int(data_for_model_order_vt.shape[0])
+        n_eff_for_model_order = max(
+            int(T_total), int(n_vox_model_order / (2.5 * max(resels, 1e-6)))
+        )
         _vprint(
             args.verbose,
             f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{n_vox_masked:,} voxels; "
-            f"n_eff={n_eff_for_model_order:,}",
+            f"n_eff={n_eff_for_model_order:,} (resels={resels:.2f})",
         )
 
+    use_mp = not args.auto_no_mp
+
     n_components, pca_diag, num_diag = estimate_ica_component_count(
-        data_vox_t=data_for_model_order,
+        data_vox_t=data_for_model_order_vt,
         method=num_spec,
         max_auto_components=max_auto_k,
         auto_min_components=args.auto_min_components,
         auto_var_threshold=args.auto_var_threshold,
-        use_mp_prior=not args.auto_no_mp,
+        use_mp_prior=use_mp,
         n_eff=n_eff_for_model_order,
         device=device,
         verbose=args.verbose,
@@ -1490,68 +1480,39 @@ def _run_concat_ica(
         f"Selected {order} components (mode={num_diag.get('mode', '?')})",
         t_step,
     )
-    del alldat, data_for_model_order
+    del data_for_model_order_vt
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Keep original (unwhitened, post-varnorm) concat for noise-norm reconstruction.
-    orig_concat_tv: torch.Tensor | None = None
-
-    # --- Whitening ---
-    dwm_list: list[torch.Tensor] | None = None
-    whiten_mode = "joined" if args.joined_whiten else "per_run"
-    if args.joined_whiten:
-        _vsection(args.verbose, "Whitening (joined, on concat)")
-        t_step = time.time()
-        data_vox_t = torch.cat(run_data_list, dim=1)  # (V, T_total)
-        del run_data_list
-        x_t = data_vox_t.T.contiguous()  # (T_total, V) — ICA input
-        del data_vox_t
-        _vprint(args.verbose, f"Joined whiten input: {tuple(x_t.shape)}", t_step)
-    else:
-        _vsection(args.verbose, "Whitening (per-run, block-diag MELODIC-style)")
-        t_step = time.time()
-        dwm_list = []
-        whitened_blocks: list[torch.Tensor] = []
-        for ri in range(n_runs):
-            X_r = run_data_list[ri].T  # (T_r, V)
-            T_r = int(X_r.shape[0])
-            row_mean = X_r.mean(dim=1, keepdim=True)
-            cov_t = (X_r @ X_r.T - n_vox_masked * (row_mean @ row_mean.T)) / float(n_vox_masked)
-            evals_r, evecs_r = torch.linalg.eigh(cov_t)
-            del cov_t
-            idx = torch.argsort(evals_r, descending=True)
-            k_r = min(order, T_r - 1)
-            evals_r = torch.clamp(evals_r[idx][:k_r], min=1e-12)
-            evecs_r = evecs_r[:, idx][:, :k_r]
-            sqrt_ev = torch.sqrt(evals_r)
-            WM_r = (evecs_r / sqrt_ev.unsqueeze(0)).T  # (k_r, T_r)
-            DWM_r = evecs_r * sqrt_ev.unsqueeze(0)  # (T_r, k_r)
-            whitened_r = WM_r @ X_r  # (k_r, V)
-            # Pad to `order` rows if k_r < order (last run or degenerate case)
-            if k_r < order:
-                pad_rows = order - k_r
-                whitened_r = torch.cat(
-                    [whitened_r, torch.zeros(pad_rows, n_vox_masked, device=device)], dim=0
-                )
-                DWM_r = torch.cat(
-                    [DWM_r, torch.zeros(T_r, pad_rows, device=device)], dim=1
-                )
-            whitened_blocks.append(whitened_r)
-            dwm_list.append(DWM_r)
-            del X_r, WM_r
-        # Preserve (T_total, V) concat for noise-norm reconstruction downstream.
-        orig_concat_tv = torch.cat(
-            [rd.T for rd in run_data_list], dim=0
-        ).contiguous()
-        del run_data_list
-        x_t = torch.cat(whitened_blocks, dim=0).contiguous()  # (n_runs*order, V)
-        del whitened_blocks
-        _vprint(
-            args.verbose,
-            f"Per-run whiten: order={order}, stacked shape {tuple(x_t.shape)}",
-            t_step,
-        )
+    # --- Whitening on concat (MELODIC melodic.cc PCA + whiten) ---
+    # Eigen-decomp of temporal covariance (T_total, T_total), keep top `order`.
+    # WM = E^T / sqrt(L) : (order, T_total); DWM = E * sqrt(L) : (T_total, order).
+    # whitened = WM @ data_tv  →  (order, V).
+    _vsection(args.verbose, "Whitening (joined on concat)")
+    t_step = time.time()
+    # Center each timepoint row across voxels (MELODIC remmean(Data,2)).
+    row_mean = data_tv.mean(dim=1, keepdim=True)
+    data_centered = data_tv - row_mean
+    cov_t = (data_centered @ data_centered.T) / float(n_vox_masked)
+    evals_t, evecs_t = torch.linalg.eigh(cov_t)
+    del cov_t
+    idx = torch.argsort(evals_t, descending=True)
+    evals_t = torch.clamp(evals_t[idx][:order], min=1e-12)
+    evecs_t = evecs_t[:, idx][:, :order]
+    sqrt_ev = torch.sqrt(evals_t)
+    WM = (evecs_t / sqrt_ev.unsqueeze(0)).T  # (order, T_total)
+    DWM = evecs_t * sqrt_ev.unsqueeze(0)  # (T_total, order)
+    x_t = WM @ data_centered  # (order, V)
+    del data_centered, WM, evals_t, evecs_t, sqrt_ev
+    # Keep unwhitened (T_total, V) for noise-norm + mixing dewhitening.
+    orig_concat_tv = data_tv
+    del data_tv
+    whiten_mode = "joined"
+    _vprint(
+        args.verbose,
+        f"Whiten: order={order}, x_t shape {tuple(x_t.shape)}",
+        t_step,
+    )
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -1646,28 +1607,25 @@ def _run_concat_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # --- Per-run whitening: reconstruct (T_total, k) mixing from (n_runs*order, k) ---
-    per_run_tcs: list[np.ndarray] | None = None
-    if dwm_list is not None:
-        mixing_stacked = mixing  # (n_runs*order, k)
-        reconstructed_blocks = []
-        per_run_tcs = []
-        for ri in range(n_runs):
-            row_start = ri * order
-            row_end = row_start + order
-            block = dwm_list[ri] @ mixing_stacked[row_start:row_end]  # (T_r, k)
-            reconstructed_blocks.append(block)
-            per_run_tcs.append(block.detach().cpu().numpy().astype(np.float32))
-        mixing = torch.cat(reconstructed_blocks, dim=0)  # (T_total, k)
-        del mixing_stacked, reconstructed_blocks
-        dwm_list = None
-        # Swap x_t to the unwhitened concat so noise-norm residuals are in data space.
-        if orig_concat_tv is not None:
-            del x_t
-            x_t = orig_concat_tv
-            orig_concat_tv = None
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    # --- Dewhiten mixing: (order, k) → (T_total, k) via DWM ---
+    # ICA on x_t=(order,V) returns mixing=(order, k) in PCA-space samples.
+    # Map back to data space with DWM, then split per-run for TCs.
+    mixing_pca = mixing  # (order, k)
+    mixing = DWM @ mixing_pca  # (T_total, k)
+    del mixing_pca, DWM
+    per_run_tcs: list[np.ndarray] = []
+    offs = 0
+    for ri in range(n_runs):
+        T_r = run_lengths[ri]
+        block = mixing[offs:offs + T_r]
+        per_run_tcs.append(block.detach().cpu().numpy().astype(np.float32))
+        offs += T_r
+    # Swap x_t to the unwhitened concat so noise-norm residuals are in data space.
+    del x_t
+    x_t = orig_concat_tv
+    orig_concat_tv = None
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # --- Sign consistency (FSL convention) ---
     max_abs = torch.max(torch.abs(components), dim=1).values
@@ -1884,6 +1842,566 @@ def _run_concat_ica(
         json.dump(concat_meta, f, indent=2)
 
     return concat_meta
+
+
+def _run_tensorial_ica(
+    input_files: list[str],
+    args,
+    device: torch.device,
+    shared_mask: np.ndarray | None,
+) -> dict:
+    """Run ICA on spatially concatenated runs (same T, stacked along V).
+
+    Complement of `_run_concat_ica`: assumes all runs share a common temporal
+    grid (same T, same TR) and stacks them voxelwise → (T, n_runs * V). A
+    single set of temporal mixing is shared across runs; spatial maps are
+    per-run slices of the (k, n_runs * V) component matrix.
+
+    Unlike MELODIC's proper tensor-ICA (Kronecker factorisation of the full
+    mixing), this is the simpler "spatial concat" form the user requested.
+    Dim-estimation, whitening, and ICA follow the same MELODIC-style
+    machinery as the temporal-concat path.
+    """
+    t_total = time.time()
+    n_runs = len(input_files)
+
+    _vsection(args.verbose, "Tensorial (spatial-concat) ICA")
+    _vprint(args.verbose, f"Spatially concatenating {n_runs} runs → single shared temporal mixing")
+
+    # --- Per-run preprocessing (identical to concat path) -------------------
+    run_data_list: list[torch.Tensor] = []  # each (V, T)
+    run_lengths: list[int] = []
+    mask3d: np.ndarray | None = None
+    shape3d: tuple[int, ...] | None = None
+    affine: np.ndarray | None = None
+    mean3d_accum: np.ndarray | None = None
+    tr: float | None = None
+    resels_accum: float = 0.0
+    fwhm_geo_accum: float = 0.0
+    n_vox_masked: int = 0
+
+    num_spec = parse_num_comps_spec(args.num_comps)
+
+    for ri, run_file in enumerate(input_files):
+        t_step = time.time()
+        _vsection(args.verbose, f"Load Run {ri + 1}/{n_runs}")
+        _vprint(args.verbose, f"Loading {run_file} ...")
+        img = load_nifti(run_file)
+        data = img.get_fdata(dtype=np.float32)
+        run_shape3d = data.shape[:3]
+        n_t_run = data.shape[3]
+        voxel_sizes = tuple(float(v) for v in img.header.get_zooms()[:3])
+        _vprint(args.verbose, f"  shape={data.shape}", t_step)
+
+        run_tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
+        if tr is None:
+            tr = run_tr
+        elif abs(run_tr - tr) > 1e-4:
+            print(f"  WARNING: Run {ri + 1} TR={run_tr:.4f}s differs from run 1 TR={tr:.4f}s")
+
+        if shape3d is None:
+            shape3d = run_shape3d
+            affine = img.affine
+        elif run_shape3d != shape3d:
+            raise ValueError(f"Run {ri + 1} spatial shape {run_shape3d} != run 1 shape {shape3d}")
+
+        if args.do_blur is not None and args.do_blur > 0:
+            t_step = time.time()
+            data = gaussian_blur_3d(
+                data=data,
+                fwhm_mm=float(args.do_blur),
+                voxel_sizes=voxel_sizes,
+                device=device,
+                verbose=False,
+            )
+            _vprint(args.verbose, f"  Blurred FWHM={args.do_blur:.1f}mm", t_step)
+
+        run_mean3d = data.mean(axis=-1).astype(np.float32)
+        if mean3d_accum is None:
+            mean3d_accum = run_mean3d.copy()
+        else:
+            mean3d_accum += run_mean3d
+
+        if ri == 0:
+            if shared_mask is not None:
+                mask3d = shared_mask
+                _vprint(args.verbose, f"  Using provided mask: {int(mask3d.sum()):,} voxels")
+            elif not args.no_auto_mask:
+                from fastfuncstuff.processing.mask import automask
+
+                mask3d = (
+                    automask(
+                        torch.as_tensor(run_mean3d),
+                        dilate_extra=2,
+                        device=device,
+                        verbose=args.verbose,
+                    )
+                    .cpu()
+                    .numpy()
+                )
+                _vprint(args.verbose, f"  Auto-mask from run 1: {int(mask3d.sum()):,} voxels")
+
+            if mask3d is not None and mask3d.shape != shape3d:
+                raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
+
+            resels_accum, fwhm_geo_accum = _estimate_spatial_smoothness_resels(
+                data,
+                mask=mask3d,
+                device=device,
+                verbose=args.verbose,
+            )
+
+        if mask3d is not None:
+            run_vox_np = data[mask3d].astype(np.float32)
+        else:
+            run_vox_np = data.reshape(-1, n_t_run).astype(np.float32)
+        del data
+
+        if ri == 0:
+            n_vox_masked = run_vox_np.shape[0]
+        elif run_vox_np.shape[0] != n_vox_masked:
+            raise ValueError(
+                f"Run {ri + 1} has {run_vox_np.shape[0]} masked voxels, expected {n_vox_masked}"
+            )
+
+        run_vox = to_tensor(run_vox_np, device=device, pin=True)
+        del run_vox_np
+
+        if args.do_scale:
+            run_vox, _, _ = scale_to_percent_signal(run_vox, run_starts=[0], verbose=False)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verbose)
+
+        # Tensorial: same T across runs is assumed; polort defaults to 0 (demean)
+        # since there's no block-diagonal trend to separate (each run sits in
+        # its own column-block).
+        polort_default = 0
+        polort_r = polort_default if args.polort is None else int(args.polort)
+        if polort_r >= 0:
+            run_vox = apply_polort_projection(
+                run_vox, polort=polort_r, device=device, run_starts=[0]
+            )
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verbose)
+
+        if args.high_pass is not None and args.high_pass > 0:
+            nyquist = 0.5 / float(tr if tr is not None else run_tr)
+            if args.high_pass >= nyquist:
+                raise ValueError(
+                    f"High-pass cutoff ({args.high_pass:.4f} Hz) >= Nyquist ({nyquist:.4f} Hz)"
+                )
+            run_vox = apply_high_pass_fft(
+                run_vox,
+                tr=float(tr if tr is not None else run_tr),
+                high_pass_hz=float(args.high_pass),
+                run_starts=[0],
+            )
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verbose)
+
+        # Per-voxel temporal mean-center (MELODIC remmean)
+        run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
+
+        run_data_list.append(run_vox)
+        run_lengths.append(n_t_run)
+        _vprint(args.verbose, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} TPs")
+
+    mean3d = mean3d_accum / n_runs
+
+    # --- Enforce common T across runs (tensorial requires it) --------------
+    T = run_lengths[0]
+    if any(rl != T for rl in run_lengths):
+        raise ValueError(
+            "Tensorial ICA requires identical T across runs; "
+            f"got {run_lengths}. Use -temp_concat for mismatched run lengths."
+        )
+
+    # --- Spatial concatenation: stack (V, T) → (T, n_runs * V) --------------
+    _vsection(args.verbose, "Spatial Concatenation")
+    t_step = time.time()
+    # Transpose each (V, T) to (T, V) and cat along dim=1 → (T, n_runs * V).
+    data_tv = torch.cat([run_data_list[ri].T for ri in range(n_runs)], dim=1).contiguous()
+    del run_data_list
+    data_tv = _check_finite(data_tv, "data_tv", args.verbose)
+    V_total = int(data_tv.shape[1])
+    _vprint(
+        args.verbose,
+        f"Spatial concat: {tuple(data_tv.shape)} (T, n_runs*V) "
+        f"= ({T}, {n_runs} * {n_vox_masked})",
+        t_step,
+    )
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Variance normalization (joined on the full stack) ------------------
+    vn_scope = "none"
+    if args.voxel_norm:
+        from fastfuncstuff.decomposition.tools import (
+            apply_varnorm_map,
+            compute_melodic_varnorm_map,
+        )
+
+        _vsection(args.verbose, "Variance Normalization (joined on spatial concat)")
+        t_step = time.time()
+        pca_dim_vn = min(30, max(1, int(data_tv.shape[0]) - 1))
+        noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
+            data_tv.T, pca_dim=pca_dim_vn, level=2.3
+        )
+        data_tv_vt = apply_varnorm_map(data_tv.T, noise_std_map, const_mask_vn)
+        data_tv = data_tv_vt.T.contiguous()
+        del data_tv_vt, noise_std_map, const_mask_vn
+        _vprint(
+            args.verbose,
+            f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant columns",
+            t_step,
+        )
+        vn_scope = "joined"
+
+    concat_var = float(torch.var(data_tv).item())
+    if concat_var < 1e-10:
+        raise ValueError(f"spatial-concat variance is ~0 after preprocessing ({concat_var:.2e})")
+    _vprint(args.verbose, f"Spatial-concat variance: {concat_var:.4f}")
+
+    # --- Spatial smoothness / effective DOF ---------------------------------
+    # For spatial concat, each run contributes V voxels with the same resel
+    # structure, so n_eff scales by n_runs.
+    resels = resels_accum
+    fwhm_geo = fwhm_geo_accum
+    n_eff = max(int(T), int(V_total / (2.5 * max(resels, 1e-6))))
+    _vprint(
+        args.verbose,
+        f"Effective spatial DOF: n_eff={n_eff:,} "
+        f"(V_total={V_total:,}, resels={resels:.2f}, 2.5*resels={2.5 * resels:.1f})",
+    )
+
+    # --- Component estimation ----------------------------------------------
+    _vsection(args.verbose, "Component Estimation (on spatial concat)")
+    t_step = time.time()
+    if args.max_auto_components <= 1.0:
+        max_auto_k = max(5, int((T - 2) * args.max_auto_components))
+        if args.max_auto_components >= 0.66:
+            max_auto_k = max(max_auto_k, max(5, T - 2))
+    else:
+        max_auto_k = int(args.max_auto_components)
+    _vprint(args.verbose, f"max_auto_components: {max_auto_k}")
+    _vprint(args.verbose, f"Method: {args.num_comps}")
+
+    n_eff_for_model_order = n_eff
+    data_for_model_order_vt = data_tv.T  # (V_total, T)
+    if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
+        data_for_model_order_vt, _ = ica_workflow.filter_voxels_for_melodic_model_order(
+            data_vox_t=data_tv.T
+        )
+        n_vox_model_order = int(data_for_model_order_vt.shape[0])
+        n_eff_for_model_order = max(
+            int(T), int(n_vox_model_order / (2.5 * max(resels, 1e-6)))
+        )
+        _vprint(
+            args.verbose,
+            f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{V_total:,} columns; "
+            f"n_eff={n_eff_for_model_order:,}",
+        )
+
+    use_mp = not args.auto_no_mp
+    n_components, pca_diag, num_diag = estimate_ica_component_count(
+        data_vox_t=data_for_model_order_vt,
+        method=num_spec,
+        max_auto_components=max_auto_k,
+        auto_min_components=args.auto_min_components,
+        auto_var_threshold=args.auto_var_threshold,
+        use_mp_prior=use_mp,
+        n_eff=n_eff_for_model_order,
+        device=device,
+        verbose=args.verbose,
+        capture_ppca_trace=bool(args.ppca_debug_dump),
+    )
+    order = int(n_components)
+    _vprint(
+        args.verbose,
+        f"Selected {order} components (mode={num_diag.get('mode', '?')})",
+        t_step,
+    )
+    del data_for_model_order_vt
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Whitening on spatial concat (same structure as tcat) --------------
+    _vsection(args.verbose, "Whitening (joined on spatial concat)")
+    t_step = time.time()
+    row_mean = data_tv.mean(dim=1, keepdim=True)
+    data_centered = data_tv - row_mean
+    cov_t = (data_centered @ data_centered.T) / float(V_total)
+    evals_t, evecs_t = torch.linalg.eigh(cov_t)
+    del cov_t
+    idx = torch.argsort(evals_t, descending=True)
+    evals_t = torch.clamp(evals_t[idx][:order], min=1e-12)
+    evecs_t = evecs_t[:, idx][:, :order]
+    sqrt_ev = torch.sqrt(evals_t)
+    WM = (evecs_t / sqrt_ev.unsqueeze(0)).T  # (order, T)
+    DWM = evecs_t * sqrt_ev.unsqueeze(0)  # (T, order)
+    x_t = WM @ data_centered  # (order, V_total)
+    del data_centered, WM, evals_t, evecs_t, sqrt_ev
+    orig_concat_tv = data_tv
+    del data_tv
+    _vprint(
+        args.verbose,
+        f"Whiten: order={order}, x_t shape {tuple(x_t.shape)}",
+        t_step,
+    )
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- ICA ----------------------------------------------------------------
+    _vsection(args.verbose, "ICA Decomposition")
+    t_step = time.time()
+    if args.icasso:
+        method_name = getattr(args, "ica_method", "fastica")
+        _vprint(args.verbose, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
+        icasso_res = icasso(
+            X=x_t,
+            n_components=n_components,
+            n_runs=args.icasso_runs,
+            pca_components=n_components,
+            min_stability=args.icasso_min_stability,
+            device=device,
+            verbose=args.verbose,
+            batch_size=args.icasso_batch_size,
+            ica_method=method_name,
+            base_seed=args.seed,
+        )
+        components = torch.as_tensor(icasso_res["all_centroids"], device=device, dtype=torch.float32)
+        mixing = torch.as_tensor(icasso_res["all_mixing"], device=device, dtype=torch.float32)
+        stability = np.asarray(icasso_res["all_stability"], dtype=np.float32)
+        icasso_meta = {
+            "enabled": True,
+            "icasso_runs": int(args.icasso_runs),
+            "min_stability": float(args.icasso_min_stability),
+            "n_stable": int(icasso_res["n_stable"]),
+            "stability": stability.tolist(),
+        }
+        _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
+    else:
+        method_name = getattr(args, "ica_method", "fastica")
+        _vprint(args.verbose, f"{method_name}: k={n_components}")
+        ica = create_ica(
+            method=method_name,
+            n_components=n_components,
+            pca_components=n_components,
+            max_iter=args.ica_max_iter,
+            tol=args.ica_tol,
+            fun=args.ica_nonlinearity,
+            random_state=args.seed,
+            device=device,
+        )
+        ica.fit(x_t)
+        components = ica.components_.to(device)
+        mixing = ica.mixing_.to(device)
+        stability = None
+        icasso_meta = {
+            "enabled": False,
+            "ica_method": method_name,
+            "ica_iterations": int(ica.n_iter_),
+        }
+        del ica
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Dewhiten mixing to data space -------------------------------------
+    mixing_pca = mixing  # (order, k)
+    mixing = DWM @ mixing_pca  # (T, k) — shared across runs
+    del mixing_pca, DWM
+    x_t = orig_concat_tv  # un-whitened for noise-norm
+    orig_concat_tv = None
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Sign consistency (FSL convention) ---------------------------------
+    max_abs = torch.max(torch.abs(components), dim=1).values
+    max_pos = torch.max(components, dim=1).values
+    flip_mask = max_abs > max_pos
+    n_flipped = int(flip_mask.sum().item())
+    if n_flipped > 0:
+        components = components.clone()
+        mixing = mixing.clone()
+        components[flip_mask] *= -1.0
+        mixing[:, flip_mask] *= -1.0
+        _vprint(args.verbose, f"Sign-flipped {n_flipped} ICs")
+
+    # --- Ordering by explained share (of shared mixing variance) ----------
+    ic_stdev = torch.std(components, dim=1)
+    total_stdev = float(ic_stdev.sum().item())
+    stdev_share = ic_stdev / max(total_stdev, 1e-15)
+
+    mix_var = torch.var(mixing, dim=0, unbiased=False)
+    total_mix_var = float(mix_var.sum().item())
+    explained_share_t = mix_var / max(total_mix_var, 1e-15)
+
+    sort_idx = torch.argsort(explained_share_t, descending=True)
+    explained_share = explained_share_t[sort_idx].detach().cpu().numpy().astype(np.float32)
+    stdev_share_sorted = stdev_share[sort_idx].detach().cpu().numpy().astype(np.float32)
+
+    scree = np.asarray(pca_diag["scree_ratio"], dtype=np.float64)
+    retained_frac = float(np.clip(np.sum(scree[:n_components]), 0.0, 1.0))
+    total_share = (explained_share * retained_frac).astype(np.float32)
+
+    components = components[sort_idx, :]
+    mixing = mixing[:, sort_idx]
+    if stability is not None:
+        stability = stability[sort_idx.detach().cpu().numpy()]
+    del sort_idx
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if args.var_norm:
+        mixing = mixing - mixing.mean(dim=0, keepdim=True)
+        mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
+        mixing = mixing / mixing_std
+
+    # --- MELODIC-style noise normalization (on the wide component matrix) -
+    if x_t is not None:
+        _vprint(args.verbose, "Applying MELODIC-style noise normalization ...")
+        components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
+            components=components,
+            mixing=mixing,
+            x_t=x_t,
+        )
+        _vprint(args.verbose, noise_norm_msg)
+    del x_t
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # --- Split components into per-run spatial maps ------------------------
+    _vsection(args.verbose, "Save Outputs")
+    t_step = time.time()
+    pfx = parse_prefix(str(args.prefix))
+    out_prefix = Path(pfx.stem)
+    nii_ext = pfx.nifti_ext
+
+    comp_np = components.detach().cpu().numpy().astype(np.float32)  # (k, n_runs*V)
+    mixing_np = mixing.detach().cpu().numpy().astype(np.float32)    # (T, k) — shared
+    del components, mixing
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    per_run_map_paths: list[str] = []
+    for ri in range(n_runs):
+        v0 = ri * n_vox_masked
+        v1 = v0 + n_vox_masked
+        run_maps = comp_np[:, v0:v1]
+        map_path = f"{out_prefix}_tensor_ica_maps_run{ri + 1:02d}{nii_ext}"
+        decomposition_io.save_masked_component_maps_4d(
+            components_kv=run_maps,
+            mask3d=mask3d,
+            shape3d=shape3d,
+            affine=affine,
+            out_file=Path(map_path),
+        )
+        per_run_map_paths.append(map_path)
+    _vprint(args.verbose, f"Per-run maps: {len(per_run_map_paths)} files", t_step)
+
+    # Also save the averaged-across-runs map for convenience
+    avg_maps = np.stack(
+        [comp_np[:, ri * n_vox_masked : (ri + 1) * n_vox_masked] for ri in range(n_runs)],
+        axis=0,
+    ).mean(axis=0)
+    decomposition_io.save_masked_component_maps_4d(
+        components_kv=avg_maps,
+        mask3d=mask3d,
+        shape3d=shape3d,
+        affine=affine,
+        out_file=Path(f"{out_prefix}_tensor_ica_maps_mean{nii_ext}"),
+    )
+
+    # Shared timecourses
+    np.savetxt(
+        f"{out_prefix}_tensor_ica_timecourses.1D", mixing_np, fmt="%.6f", delimiter="\t"
+    )
+    _vprint(args.verbose, f"Shared timecourses: {out_prefix}_tensor_ica_timecourses.1D")
+
+    # Scree plot
+    ica_postprocess.save_scree_plot(
+        evr=np.asarray(pca_diag["scree_ratio"], dtype=np.float64),
+        out_png=Path(f"{out_prefix}_tensor_pca_scree.png"),
+        title="Spatial concat: PCA scree",
+    )
+
+    # Mixture model on per-run-averaged maps (optional)
+    z_maps = None
+    mixture_meta = []
+    if args.save_mixture_z:
+        _vsection(args.verbose, "Mixture Model (GGM) on run-averaged maps")
+        t_step = time.time()
+        comp_tensor = torch.as_tensor(avg_maps, device=device)
+        z_tensor, p_tensor, mixture_meta = batch_mixture_zscores(
+            comp_tensor, device=device, verbose=args.verbose
+        )
+        z_maps = z_tensor.cpu().numpy().astype(np.float32)
+        p_maps = p_tensor.cpu().numpy().astype(np.float32)
+        thresh_z_maps = z_maps.copy()
+        thresh_z_maps[p_maps < float(args.mm_thresh)] = 0.0
+        del comp_tensor, z_tensor, p_tensor
+
+        for data_arr, fname in [
+            (z_maps, f"{out_prefix}_tensor_ica_zmaps{nii_ext}"),
+            (p_maps, f"{out_prefix}_tensor_ica_signalprob{nii_ext}"),
+            (thresh_z_maps, f"{out_prefix}_tensor_ica_thresh_zmaps{nii_ext}"),
+        ]:
+            decomposition_io.save_masked_component_maps_4d(
+                components_kv=data_arr,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
+                out_file=Path(fname),
+            )
+        _vprint(args.verbose, "Z-maps and signal-prob maps saved", t_step)
+
+    elapsed_total = time.time() - t_total
+    _vprint(args.verbose, f"Tensorial ICA total elapsed: {elapsed_total:.1f}s")
+
+    mask_type = (
+        "provided" if shared_mask is not None else ("auto" if mask3d is not None else "none")
+    )
+    tensor_meta = {
+        "mode": "tensorial_spatial_concat",
+        "n_runs": n_runs,
+        "input_files": input_files,
+        "tr": float(tr),
+        "T": int(T),
+        "n_voxels_per_run": int(n_vox_masked),
+        "n_voxels_total": int(V_total),
+        "mask_type": mask_type,
+        "polort": 0 if args.polort is None else int(args.polort),
+        "high_pass_hz": None if args.high_pass is None else float(args.high_pass),
+        "voxel_norm": bool(args.voxel_norm),
+        "voxel_norm_scope": vn_scope,
+        "num_comps_request": args.num_comps,
+        "n_components_selected": int(n_components),
+        "num_comps_diagnostics": num_diag,
+        "pca_diagnostics": {
+            "rank_cap": pca_diag["rank_cap"],
+            "n_eigs": pca_diag["n_eigs"],
+            "first20_scree_ratio": pca_diag["scree_ratio"][:20],
+        },
+        "icasso": icasso_meta,
+        "smoothness_fwhm_vox": round(float(fwhm_geo), 3),
+        "smoothness_resels": round(float(resels), 3),
+        "n_eff": int(n_eff_for_model_order),
+        "component_variance_share": explained_share.tolist(),
+        "component_total_variance_share": total_share.tolist(),
+        "component_spatial_stdev_share": stdev_share_sorted.tolist(),
+        "elapsed_seconds": round(elapsed_total, 2),
+        "outputs": {
+            "ica_maps_per_run": per_run_map_paths,
+            "ica_maps_mean": f"{out_prefix}_tensor_ica_maps_mean{nii_ext}",
+            "ica_timecourses_shared": f"{out_prefix}_tensor_ica_timecourses.1D",
+            "pca_scree_plot": f"{out_prefix}_tensor_pca_scree.png",
+            "ica_zmaps": f"{out_prefix}_tensor_ica_zmaps{nii_ext}" if args.save_mixture_z else None,
+        },
+        "mixture_model": mixture_meta if args.save_mixture_z else None,
+    }
+
+    with open(f"{out_prefix}_tensor_ica_metadata.json", "w") as f:
+        json.dump(tensor_meta, f, indent=2)
+
+    return tensor_meta
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -2278,7 +2796,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Requires >= 2 input runs."
         ),
     )
-    modes.add_argument("-tensor", action="store_true", help="Placeholder for future tensorial ICA")
+    modes.add_argument(
+        "-tensor",
+        action="store_true",
+        help=(
+            "Tensorial (spatial-concat) ICA: requires runs to share the same T. "
+            "Stacks runs along the voxel axis → (T, n_runs*V) and decomposes "
+            "to a single shared temporal mixing with per-run spatial maps."
+        ),
+    )
     vn_group = modes.add_mutually_exclusive_group()
     vn_group.add_argument(
         "-joined_vn",
@@ -2320,11 +2846,8 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.tensor:
-        raise NotImplementedError(
-            "-tensor is a placeholder for future tensorial ICA. "
-            "Current implementation supports run-wise and temporal concat ICA."
-        )
+    if args.tensor and args.temp_concat:
+        raise ValueError("-tensor and -temp_concat are mutually exclusive")
 
     if (args.onsets is None) ^ (args.durations is None):
         raise ValueError("Use -onsets and -durations together for task correlation annotation")
@@ -2455,7 +2978,33 @@ def main() -> None:
 
     t_pipeline = time.time()
 
-    if args.temp_concat:
+    if args.tensor:
+        # --- Tensorial (spatial-concat) mode ---
+        if len(input_files) < 2:
+            raise ValueError("-tensor requires at least 2 input runs")
+        print(f"\nMode: tensorial spatial-concat ({len(input_files)} runs → shared temporal ICA)")
+        tensor_meta = _run_tensorial_ica(
+            input_files=input_files,
+            args=args,
+            device=device,
+            shared_mask=shared_mask,
+        )
+        print(
+            f"  Selected components: {tensor_meta['n_components_selected']} "
+            f"({tensor_meta['mask_type']} mask, {tensor_meta['n_voxels_per_run']:,} vox/run, "
+            f"{tensor_meta['n_voxels_total']:,} total) | "
+            f"IC1 explained share: {tensor_meta['component_variance_share'][0] * 100:.2f}%"
+        )
+        pfx = parse_prefix(str(args.prefix))
+        summary_path = f"{pfx.stem}_ica_summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(tensor_meta, f, indent=2)
+        print("\n" + "=" * 70)
+        elapsed_pipeline = time.time() - t_pipeline
+        print(f"ffs_ica tensor complete ({elapsed_pipeline:.1f}s)")
+        print(f"Summary: {summary_path}")
+        print("=" * 70)
+    elif args.temp_concat:
         # --- Temporal concatenation mode ---
         if len(input_files) < 2:
             raise ValueError("-temp_concat requires at least 2 input runs")
