@@ -78,7 +78,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import parse_prefix
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
 from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
 from fastfuncstuff.decomposition.io import save_decomposition_results
 from fastfuncstuff.decomposition.ica import (
@@ -215,11 +215,7 @@ def parse_args():
         help="Force CPU computation (default: use GPU if available)",
     )
 
-    parser.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(parser, default=0)
 
     return parser.parse_args()
 
@@ -278,7 +274,7 @@ def main():
         device = get_device()
     configure_torch_backends(device)
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"Using device: {device}")
 
     # Parse component arguments
@@ -344,7 +340,7 @@ def main():
                 return 1
 
     # Load data
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nLoading data from: {args.input}")
         print(f"Loading mask from: {args.mask}")
 
@@ -355,7 +351,7 @@ def main():
         print(f"Error loading data: {e}", file=sys.stderr)
         return 1
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Data shape: {data.shape}")
         print(f"  TR: {tr}s")
 
@@ -365,7 +361,7 @@ def main():
 
     # ========== PCA ==========
     if pca_n_components is not None:
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\n{'=' * 60}")
             print("Running PCA...")
             print(f"  n_components: {pca_n_components}")
@@ -373,13 +369,13 @@ def main():
         pca = PCA(n_components=pca_n_components, device=device)
         pca_scores = pca.fit_transform(data)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Kept {pca.n_components_} components")
             print(f"  Explained variance: {pca.explained_variance_ratio_.sum().item():.3f}")
             print(f"  Output shape: {pca_scores.shape}")
 
         # Save PCA results
-        if args.verbose:
+        if args.verb >= 1:
             print("  Saving PCA results...")
 
         pca_labels = [f"PC_{i:03d}" for i in range(pca.n_components_)]
@@ -396,7 +392,7 @@ def main():
                 nii_ext=_nii_ext,
             )
 
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"    Maps: {pca_files['maps']}")
                 print(f"    Timeseries: {pca_files['timeseries_1D']}")
 
@@ -406,7 +402,7 @@ def main():
 
     # ========== ICA ==========
     if ica_n_components is not None:
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\n{'=' * 60}")
             print("Running ICA...")
 
@@ -414,17 +410,17 @@ def main():
         if pca_n_components is not None:
             # Use PCA components from above
             pca_for_ica = pca_n_components
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"  Using PCA reduction: {pca_for_ica}")
         else:
             # Default: keep 85% variance
             pca_for_ica = 0.85
-            if args.verbose:
+            if args.verb >= 1:
                 print("  Using default PCA reduction: 85% variance")
 
         # Auto component selection
         if ica_n_components == "auto":
-            if args.verbose:
+            if args.verb >= 1:
                 print("  Automatic component selection enabled")
                 print(
                     f"    Range: {args.ica_range[0]} to {args.ica_range[1]} (step {args.ica_range[2]})"
@@ -441,12 +437,12 @@ def main():
                     n_runs=args.stability if args.stability else 50,
                     min_stability=args.min_stability,
                     device=device,
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
 
                 ica_n_components = auto_results["optimal_n_components"]
 
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"\n  Optimal n_components: {ica_n_components}")
 
                 # Save stability results
@@ -460,7 +456,7 @@ def main():
                     ):
                         f.write(f"{n_comp} {stability:.4f}\n")
 
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"  Saved stability analysis: {stability_file}")
 
             except Exception as e:
@@ -468,7 +464,7 @@ def main():
                 return 1
 
         # Run ICA
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  n_components: {ica_n_components}")
             print(f"  PCA reduction: {pca_for_ica}")
 
@@ -484,7 +480,7 @@ def main():
 
             ica_timeseries = ica.fit_transform(data)
 
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"  Converged in {ica.n_iter_} iterations")
                 print(f"  Output shape: {ica_timeseries.shape}")
 
@@ -494,7 +490,7 @@ def main():
 
         # Stability analysis
         if args.stability and ica_n_components != "auto":
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"\n  Running stability analysis ({args.stability} runs)...")
 
             try:
@@ -504,13 +500,13 @@ def main():
                     pca_components=pca_for_ica,
                     n_runs=args.stability,
                     device=device,
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
 
                 mean_stability = stability_results["stability_scores"].mean()
                 n_stable = (stability_results["stability_scores"] > args.min_stability).sum()
 
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"    Mean stability: {mean_stability:.3f}")
                     print(
                         f"    Components with stability > {args.min_stability}: {n_stable}/{ica_n_components}"
@@ -525,14 +521,14 @@ def main():
                     header="Component stability scores (0-1, higher = more stable)",
                 )
 
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"    Saved stability scores: {stability_file}")
 
             except Exception as e:
                 print(f"Warning: Stability analysis failed: {e}", file=sys.stderr)
 
         # Save ICA results
-        if args.verbose:
+        if args.verb >= 1:
             print("  Saving ICA results...")
 
         ica_labels = [f"IC_{i:03d}" for i in range(ica.components_.shape[0])]
@@ -549,7 +545,7 @@ def main():
                 nii_ext=_nii_ext,
             )
 
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"    Maps: {ica_files['maps']}")
                 print(f"    Timeseries: {ica_files['timeseries_1D']}")
 
@@ -559,7 +555,7 @@ def main():
 
     # ========== ICASSO ==========
     if icasso_n_components is not None:
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\n{'=' * 60}")
             print("Running ICASSO...")
 
@@ -567,13 +563,13 @@ def main():
         # CRITICAL: PCA components must be >= ICA components!
         if pca_n_components is not None:
             pca_for_icasso = pca_n_components
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"  User-specified PCA: {pca_for_icasso}")
         else:
             # Auto-set PCA to extract all possible components
             # PCA should always decompose the data entirely up to min(n_timepoints, n_voxels)
             # Then we select the TOP N for ICA
-            if args.verbose:
+            if args.verb >= 1:
                 n_timepoints, n_voxels = data.shape
                 max_pca = min(n_timepoints, n_voxels)
                 print(f"  Auto-set PCA components: {max_pca} (full decomposition)")
@@ -592,7 +588,7 @@ def main():
 
         # Auto component selection
         if icasso_n_components == "auto":
-            if args.verbose:
+            if args.verb >= 1:
                 print("  Automatic component selection via ICASSO")
                 print(
                     f"    Range: {args.ica_range[0]} to {args.ica_range[1]} (step {args.ica_range[2]})"
@@ -609,7 +605,7 @@ def main():
                     pca_components=pca_for_icasso,
                     min_stability=args.min_stability,
                     device=device,
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                     batch_size=None,  # Auto-select based on size
                 )
 
@@ -623,7 +619,7 @@ def main():
                 n_components_total = optimal_results["n_components"]
                 cluster_quality = optimal_results["cluster_quality"]
 
-                if args.verbose:
+                if args.verb >= 1:
                     print("\nOptimal configuration:")
                     print(f"  Requested: {icasso_results['optimal_n_components']} components")
                     print(f"  Stable: {n_stable} components")
@@ -709,13 +705,13 @@ def main():
                         percent = 100.0 * count / len(cluster_sizes)
                         f.write(f"# {size:4.0f} | {count:5d} | {percent:6.1f}%\n")
 
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"  Saved selection summary: {summary_file}")
 
                 # Save similarity matrix for visualization
                 similarity_file = output_path.parent / f"{output_path.name}_icasso_similarity.npy"
                 np.save(similarity_file, optimal_results["similarity"])
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"  Saved similarity matrix: {similarity_file}")
                     print(f"    Shape: {optimal_results['similarity'].shape}")
                     print(
@@ -732,7 +728,7 @@ def main():
 
         else:
             # Fixed number of components
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"  n_components: {icasso_n_components}")
                 print(f"  n_runs: {args.n_runs}")
                 print(f"  min_stability: {args.min_stability}")
@@ -745,7 +741,7 @@ def main():
                     pca_components=pca_for_icasso,
                     min_stability=args.min_stability,
                     device=device,
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                     batch_size=None,  # Auto-select based on size
                 )
 
@@ -757,7 +753,7 @@ def main():
                 n_components_total = icasso_results["n_components"]
                 cluster_quality = icasso_results["cluster_quality"]
 
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"\nStable components: {n_stable}/{n_components_total}")
                     print(
                         f"  Stability range: {all_stability.min():.3f} - {all_stability.max():.3f}"
@@ -814,7 +810,7 @@ def main():
         # Note: Variance explained computation not meaningful for ICASSO centroids
         # ICASSO components are cluster centroids (averaged spatial patterns), not
         # the original ICA components that can reconstruct data. Use PCA variance instead.
-        if args.verbose:
+        if args.verb >= 1:
             print("\n  Skipping variance explained computation for ICASSO")
             print("    (ICASSO centroids don't reconstruct original data)")
             print(f"    Use PCA variance above: {n_stable} components explain X% of variance")
@@ -823,7 +819,7 @@ def main():
         var_ratio_np = np.zeros(n_stable)
 
         # Save ICASSO results
-        if args.verbose:
+        if args.verb >= 1:
             print("\n  Saving ICASSO results...")
 
         icasso_labels = [f"ICASSO_{i:03d}" for i in range(n_stable)]
@@ -919,7 +915,7 @@ def main():
                 similarity_file = output_path.parent / f"{output_path.name}_icasso_similarity.npy"
                 np.save(similarity_file, icasso_results["similarity"])
 
-                if args.verbose:
+                if args.verb >= 1:
                     print(f"    Similarity matrix: {similarity_file}")
                     print(f"      Shape: {icasso_results['similarity'].shape}")
                     print(
@@ -929,7 +925,7 @@ def main():
                         "      Can be used to create GIFT-style component matching visualizations"
                     )
 
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"    Maps: {icasso_files['maps']}")
                 print(f"    Timeseries: {icasso_files['timeseries_1D']}")
                 print(f"    Stability (saved components): {stability_file}")
@@ -943,7 +939,7 @@ def main():
             traceback.print_exc()
             return 1
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\n{'=' * 60}")
         print("✓ Decomposition complete!")
     else:

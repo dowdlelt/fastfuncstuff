@@ -18,6 +18,7 @@ import time
 
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.processing.affine import (
     apply_affine,
     apply_affine_wsinc5,
@@ -162,8 +163,7 @@ Examples:
     hw_group = parser.add_argument_group("Hardware")
     hw_group.add_argument("-device", default=None,
                           help="PyTorch device: cuda, mps, cpu (auto-detected)")
-    hw_group.add_argument("-verb", type=int, default=1, choices=[0, 1, 2],
-                          help="Verbosity: 0=quiet, 1=normal, 2=debug")
+    add_verbose_arg(hw_group, default=1)
 
     args = parser.parse_args(argv)
     return args

@@ -60,6 +60,7 @@ try:
         save_nifti,
     )
     from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
         auto_polort,
         compute_run_lengths,
         get_average_run_duration,
@@ -387,11 +388,7 @@ Notes:
         default=None,
         help="Number of voxels per batch (default: auto)",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
 
     # Output options
     out_opts = parser.add_argument_group("Output Options")
@@ -1568,7 +1565,7 @@ def main():
         metric=args.metric,
         device=device,
         chunk_size=args.batch_size,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
 
     # Save outputs

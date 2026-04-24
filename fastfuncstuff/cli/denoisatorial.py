@@ -43,6 +43,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_verbose_arg,
         auto_polort,
         load_and_preprocess_runs,
         parse_input_files,
@@ -313,11 +314,7 @@ Notes:
         action="store_true",
         help="Load data to CPU and process in GPU chunks (for large datasets)",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
         action="store_true",
@@ -905,7 +902,7 @@ def main():
         designs_by_hrf=designs_by_hrf,
         hrf_indices=hrf_indices,
         device=device,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
 
     print(f"  Initial R2: median={initial_r2.median().item():.4f}, "

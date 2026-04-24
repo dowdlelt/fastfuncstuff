@@ -7,7 +7,7 @@ import argparse
 import sys
 import time
 
-from fastfuncstuff.cli_utils import parse_prefix, print_cli_header
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header
 from fastfuncstuff.denoise.sauna import SaunaConfig, run_sauna
 from fastfuncstuff.utils import configure_torch_backends, get_device
 
@@ -164,11 +164,7 @@ Examples:
         default="auto",
         help="Decomposition method: auto (eigh when M/N>=2), svd, or eigh",
     )
-    perf_group.add_argument(
-        "-quiet",
-        action="store_true",
-        help="Disable tqdm/progress prints",
-    )
+    add_verbose_arg(perf_group, default=1)
 
     return parser.parse_args(argv)
 
@@ -221,7 +217,7 @@ def main(argv: list[str] | None = None) -> None:
         write_gzipped_niftis=True,
         svd_batch_size=args.svd_batch_size,
         decomp_method=args.decomp_method,
-        verbose=not args.quiet,
+        verbose=args.verb >= 1,
         gfactor_smooth_fwhm=_parse_fwhm(args.gfactor_smooth_fwhm),
         gfactor_method=args.gfactor_method,
         gfactor_degree_range=(

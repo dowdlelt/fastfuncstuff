@@ -53,6 +53,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg
+
 
 class _HelpFormatter(
     argparse.RawDescriptionHelpFormatter,
@@ -178,10 +180,7 @@ def create_parser() -> argparse.ArgumentParser:
 
     # ── Output ───────────────────────────────────────────────────────────
     out = parser.add_argument_group("Output Options")
-    out.add_argument(
-        "-verbose", action="store_true",
-        help="Print detailed progress.",
-    )
+    add_verbose_arg(out, default=0)
 
     parser.add_argument("-help", action="store_true",
                         help="Show this help message and exit.")
@@ -227,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     device, _, _ = parse_device_arg(args.device)
     configure_torch_backends(device)
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\n{'=' * 70}")
         print("Phase Regression (ffs_phasereg)")
         print(f"{'=' * 70}")
@@ -265,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # ── Load data ────────────────────────────────────────────────────────
-    if args.verbose:
+    if args.verb >= 1:
         print("\nLoading data...")
 
     mag_list = []
@@ -312,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         mag_list.append(torch.tensor(mag_data.reshape(-1, n_tp), dtype=torch.float32))
         pha_list.append(torch.tensor(pha_data.reshape(-1, n_tp), dtype=torch.float32))
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Run {i + 1}: {mag_path} ({n_tp} TRs)")
 
     # TR
@@ -324,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         tr = args.tr
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  TR: {tr}s")
         print(f"  Volume: {nx} x {ny} x {nz}")
 
@@ -341,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         n_voxels = int(mask_flat.sum())
         mag_list = [m[mask_flat.astype(bool)] for m in mag_list]
         pha_list = [p[mask_flat.astype(bool)] for p in pha_list]
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Mask: {n_voxels:,} / {n_all_voxels:,} voxels")
     else:
         mask_flat = None
@@ -352,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     if polort_str == "A":
         run_dur = min(n_tp_per_run) * tr
         polort = auto_polort(run_dur, formula="afni")
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Polort: A -> {polort} (run duration {run_dur:.1f}s)")
     else:
         polort = int(polort_str)
@@ -372,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
             onsets_per_condition.append(onsets_by_run)
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Onsets: {len(onsets_per_condition)} conditions")
 
     elif args.events:
@@ -394,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         onsets_per_condition = bids_onsets
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  BIDS events: {len(bids_labels)} conditions ({', '.join(bids_labels)})")
 
     # ── Auto tent window from durations ──────────────────────────────────
@@ -407,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         condition_durations = parse_durations(args.durations, n_conds, cond_labels)
         windows = compute_windows_from_durations(condition_durations, tr)
         tent_window = max(top for _, top in windows)
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Auto TENT window: {tent_window:.1f}s (from stimulus durations)")
 
     # ── Load motion nuisance ─────────────────────────────────────────────
@@ -427,11 +426,11 @@ def main(argv: list[str] | None = None) -> int:
             nuisance_per_run.append(
                 torch.tensor(mot, dtype=torch.float32, device=device)
             )
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Motion: {nuisance_per_run[0].shape[1]} parameters per run")
 
     # ── Run phase regression ─────────────────────────────────────────────
-    if args.verbose:
+    if args.verb >= 1:
         print()
 
     result = phase_regress(
@@ -448,11 +447,11 @@ def main(argv: list[str] | None = None) -> int:
         regression=args.regression,
         tent_window=tent_window,
         device=str(device),
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
 
     # ── Save outputs ─────────────────────────────────────────────────────
-    if args.verbose:
+    if args.verb >= 1:
         print("\nSaving outputs...")
 
     def _to_volume(data_flat, is_4d=False):
@@ -502,7 +501,7 @@ def main(argv: list[str] | None = None) -> int:
     save_nifti(_to_volume(result.phi.numpy()), fname, reference_img=ref_img_path)
     outputs["phi"] = fname
 
-    if args.verbose:
+    if args.verb >= 1:
         for name, path in outputs.items():
             print(f"  {name}: {path}")
         print(f"\n{'=' * 70}")

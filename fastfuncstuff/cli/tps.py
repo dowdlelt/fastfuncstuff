@@ -55,7 +55,7 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import parse_prefix
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
 from fastfuncstuff.io.afni import (
     load_nifti,
     save_nifti,
@@ -233,8 +233,7 @@ def main():
                         help='Save design matrix as .1D file')
     parser.add_argument('-save_lambda_map', action='store_true',
                         help='Save optimal lambda values as NIfTI (per_voxel mode only)')
-    parser.add_argument('-verbose', action='store_true',
-                        help='Print detailed progress information')
+    add_verbose_arg(parser, default=0)
 
     args = parser.parse_args()
 
@@ -256,7 +255,7 @@ def main():
     # Setup
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print("=" * 70)
         print("TPS HRF Estimation with Cross-Validated Smoothness Selection")
         print("=" * 70)
@@ -268,14 +267,14 @@ def main():
         device = torch.device(args.device)
     configure_torch_backends(device)
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nDevice: {device}")
 
     # ========================================================================
     # Load data
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nLoading data: {args.input}")
 
     # Load NIfTI data
@@ -286,14 +285,14 @@ def main():
 
     nx, ny, nz, n_timepoints_total = data_full.shape
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Shape: {data_full.shape}")
         print(f"  Voxels: {nx} x {ny} x {nz} = {nx*ny*nz:,}")
         print(f"  Timepoints: {n_timepoints_total}")
 
     # Get TR from header
     tr = float(header.get_zooms()[3])
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  TR: {tr}s")
 
     # ========================================================================
@@ -301,28 +300,28 @@ def main():
     # ========================================================================
 
     if args.mask:
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nLoading mask: {args.mask}")
         mask_3d = load_nifti(args.mask)
         if mask_3d.shape != (nx, ny, nz):
             raise ValueError(f"Mask shape {mask_3d.shape} doesn't match data {(nx, ny, nz)}")
         mask = mask_3d.astype(bool)
     else:
-        if args.verbose:
+        if args.verb >= 1:
             print("\nGenerating brain mask (non-zero voxels)...")
         # Simple mask: non-zero in at least 10% of timepoints
         nonzero_count = np.sum(data_full != 0, axis=3)
         mask = nonzero_count > (0.1 * n_timepoints_total)
 
     n_voxels = int(np.sum(mask))
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Brain voxels: {n_voxels:,} ({100*n_voxels/(nx*ny*nz):.1f}%)")
 
     # ========================================================================
     # Parse stimulus timing
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nParsing stimulus timing ({n_conditions} conditions)...")
 
     # Parse onset files
@@ -331,7 +330,7 @@ def main():
 
     for cond_idx, onset_file in enumerate(args.stim_times):
         label = args.stim_labels[cond_idx]
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  {label}: {onset_file}")
 
         onsets = parse_afni_timing_file(onset_file)
@@ -346,7 +345,7 @@ def main():
             )
 
         n_events = sum(len(run_onsets) for run_onsets in onsets)
-        if args.verbose:
+        if args.verb >= 1:
             print(f"    {n_runs} runs, {n_events} total events")
 
     # ========================================================================
@@ -355,7 +354,7 @@ def main():
 
     windows = parse_tps_windows(args.tps_window, n_conditions)
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\nTPS estimation windows:")
         for cond_idx, (bot, top) in enumerate(windows):
             label = args.stim_labels[cond_idx]
@@ -374,21 +373,21 @@ def main():
             n_knots = max(5, int(np.ceil(duration / tr)))  # At least 5 knots
             n_knots_list.append(n_knots)
 
-        if args.verbose:
+        if args.verb >= 1:
             print("\nAuto-selecting number of knots (~ 1 per TR):")
             for cond_idx, n_knots in enumerate(n_knots_list):
                 label = args.stim_labels[cond_idx]
                 print(f"  {label}: {n_knots} knots")
     else:
         n_knots_list = [args.n_knots] * n_conditions
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nNumber of knots: {args.n_knots} (all conditions)")
 
     # ========================================================================
     # Build TPS design matrices (one per condition)
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\nBuilding TPS design matrices...")
 
     design_matrices = []
@@ -399,7 +398,7 @@ def main():
         bot, top = windows[cond_idx]
         n_knots = n_knots_list[cond_idx]
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  {label}: {n_knots} knots, window [{bot}s, {top}s]")
 
         # Concatenate onsets across runs
@@ -422,21 +421,21 @@ def main():
 
         design_matrices.append(design_cond)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"    Design shape: {design_cond.shape}")
 
     # Concatenate all conditions
     design_stimulus = torch.cat(design_matrices, dim=1)  # (n_timepoints, n_basis_total)
     n_stimulus_regressors = design_stimulus.shape[1]
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\n  Total stimulus regressors: {n_stimulus_regressors}")
 
     # ========================================================================
     # Add polynomial regressors (zero-padded per run)
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nAdding polynomial regressors (order {args.polort})...")
 
     # Infer run boundaries (assume equal length for now)
@@ -457,7 +456,7 @@ def main():
         end_tr = start_tr + n_timepoints_per_run
         run_boundaries.append((start_tr, end_tr))
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Detected {n_runs} runs of {n_timepoints_per_run} TRs each")
 
     # Create zero-padded polynomials
@@ -480,7 +479,7 @@ def main():
 
         poly_tensor = torch.from_numpy(poly_full).float().to(device)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Polynomial regressors: {total_poly_cols} ({n_poly_per_run} per run x {n_runs} runs)")
     else:
         poly_tensor = torch.zeros((n_timepoints_total, 0), device=device)
@@ -489,7 +488,7 @@ def main():
     # Concatenate stimulus and polynomial regressors
     design_full = torch.cat([design_stimulus, poly_tensor], dim=1)
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nFull design matrix: {design_full.shape}")
         print(f"  Stimulus: {n_stimulus_regressors} regressors")
         print(f"  Polynomials: {total_poly_cols} regressors")
@@ -500,7 +499,7 @@ def main():
 
     if args.save_design:
         design_file = f"{args.output_prefix}_design_TPS.1D"
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nSaving design matrix: {design_file}")
 
         design_np = design_full.cpu().numpy()
@@ -531,20 +530,20 @@ def main():
 
         np.savetxt(design_file, design_np, fmt='%.6f', header=header, comments='')
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  ✓ Saved: {design_file}")
 
     # ========================================================================
     # Prepare data for fitting
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\nPreparing data for GLM fitting...")
 
     # Extract masked voxels: (n_voxels, n_timepoints)
     data_masked = data_full[mask, :]
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Data shape: {data_masked.shape}")
 
     # Convert to tensor (keep on CPU for chunking)
@@ -560,7 +559,7 @@ def main():
     else:
         lambda_values = args.lambda_values
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nLambda search grid ({len(lambda_values)} values):")
         print(f"  {', '.join([f'{lam:.2e}' for lam in lambda_values])}")
 
@@ -568,7 +567,7 @@ def main():
     # Create penalty matrix (block diagonal for multiple conditions)
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\nCreating penalty matrix (2nd order differences)...")
 
     # Create block-diagonal penalty matrix for all conditions
@@ -591,7 +590,7 @@ def main():
         row_offset += n_rows
         col_offset += n_cols
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Penalty matrix: {penalty_matrix.shape}")
         print(f"  Penalizes {n_stimulus_regressors} stimulus regressors across {n_conditions} conditions")
 
@@ -600,7 +599,7 @@ def main():
     # ========================================================================
 
     if args.optimize_level == 'global':
-        if args.verbose:
+        if args.verb >= 1:
             print("\n" + "="*70)
             print("Global λ Optimization (LORO Cross-Validation)")
             print("="*70)
@@ -611,7 +610,7 @@ def main():
         # Fit CV on subset of voxels for speed (e.g., 10k random voxels)
         n_voxels_cv = min(10000, n_voxels)
         if n_voxels_cv < n_voxels:
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"\nUsing {n_voxels_cv:,} random voxels for CV (for speed)")
             cv_indices = np.random.choice(n_voxels, size=n_voxels_cv, replace=False)
             data_cv = data_tensor[cv_indices, :]
@@ -625,17 +624,17 @@ def main():
             lambda_values=lambda_values,
             run_boundaries=run_boundaries,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
 
         # Use this lambda for all voxels
         lambda_map = np.full(n_voxels, best_lambda)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\n✓ Global λ = {best_lambda:.3e}")
 
     elif args.optimize_level == 'per_voxel':
-        if args.verbose:
+        if args.verb >= 1:
             print("\n" + "="*70)
             print("Per-Voxel λ Optimization (Adaptive Smoothness)")
             print("="*70)
@@ -644,7 +643,7 @@ def main():
         # This is SLOW but maximally adaptive
         lambda_map = np.zeros(n_voxels)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nOptimizing λ for {n_voxels:,} voxels...")
             print("  (This may take a while...)")
 
@@ -658,7 +657,7 @@ def main():
             start_idx = chunk_idx * chunk_size_cv
             end_idx = min(start_idx + chunk_size_cv, n_voxels)
 
-            if args.verbose and chunk_idx % max(1, n_chunks // 10) == 0:
+            if args.verb >= 1 and chunk_idx % max(1, n_chunks // 10) == 0:
                 print(f"  Chunk {chunk_idx+1}/{n_chunks}: voxels {start_idx:,}-{end_idx:,}")
 
             # Optimize λ for each voxel in this chunk
@@ -677,7 +676,7 @@ def main():
 
                 lambda_map[voxel_idx] = best_lambda_voxel
 
-        if args.verbose:
+        if args.verb >= 1:
             print("\n✓ Per-voxel λ optimization complete")
             print(f"  λ range: [{lambda_map.min():.3e}, {lambda_map.max():.3e}]")
             print(f"  λ median: {np.median(lambda_map):.3e}")
@@ -687,7 +686,7 @@ def main():
     # ========================================================================
 
     if args.save_lambda_map and args.optimize_level == 'per_voxel':
-        if args.verbose:
+        if args.verb >= 1:
             print("\nSaving lambda map...")
 
         # Create 3D volume
@@ -697,14 +696,14 @@ def main():
         lambda_file = f"{args.output_prefix}_lambda{_nii_ext}"
         save_nifti(lambda_volume, lambda_file, affine=affine)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  ✓ Saved: {lambda_file}")
 
     # ========================================================================
     # Fit final TPS model with optimal λ
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\n" + "="*70)
         print("Fitting Final TPS Model")
         print("="*70)
@@ -712,7 +711,7 @@ def main():
     # Fit penalized GLM for stimulus regressors
     # Then fit polynomial regressors on residuals
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\n  Step 1: Fit penalized TPS model (stimulus regressors)")
 
     betas_stimulus_tensor = fit_penalized_glm(
@@ -722,14 +721,14 @@ def main():
         lambda_values=lambda_map if args.optimize_level == 'per_voxel' else best_lambda,
         device=device,
         chunk_size=args.chunk_size,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
 
     betas_stimulus = betas_stimulus_tensor.cpu().numpy()
 
     # Fit polynomial regressors on residuals (if present)
     if total_poly_cols > 0:
-        if args.verbose:
+        if args.verb >= 1:
             print("\n  Step 2: Fit polynomial regressors (nuisance, no penalty)")
 
         # Compute residuals after removing stimulus effects
@@ -748,22 +747,22 @@ def main():
 
         betas_poly = betas_poly.T.cpu().numpy()  # (n_voxels, n_poly)
 
-        if args.verbose:
+        if args.verb >= 1:
             print("  ✓ Polynomial fit complete")
     else:
         betas_poly = np.zeros((n_voxels, 0))
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\n  ✓ TPS model fit complete")
 
     # ========================================================================
     # Extract and save HRF estimates
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\nExtracting HRF estimates...")
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\nSaving HRF estimates (iresp files)...")
 
     output_files = []
@@ -793,7 +792,7 @@ def main():
 
         output_files.append(iresp_file)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  {label}: {iresp_file}")
             print(f"    Shape: {hrf_volume.shape}")
             print(f"    Knot spacing: {knot_spacing:.3f}s")
@@ -802,7 +801,7 @@ def main():
     # Summary
     # ========================================================================
 
-    if args.verbose:
+    if args.verb >= 1:
         print("\n" + "="*70)
         print("TPS HRF Estimation Complete")
         print("="*70)

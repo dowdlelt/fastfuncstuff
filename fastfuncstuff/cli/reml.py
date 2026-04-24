@@ -36,6 +36,7 @@ try:
     )
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
         auto_polort,
         build_nuisance_block_diag,
         compute_run_lengths,
@@ -537,9 +538,7 @@ Examples:
             "'cuda,N' to use GPU device N (e.g., 'cuda,0' for GPU 0)"
         ),
     )
-    proc_opts.add_argument(
-        "-verbose", action="store_true", help="Print detailed progress information"
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-legacy_contrasts",
         action="store_true",
@@ -1308,7 +1307,7 @@ def main():
             mask_file=args.mask,
             voxel_chunk_size=args.batch_size,
             use_double=args.use_double,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
 
         # 4. Extract single-trial betas

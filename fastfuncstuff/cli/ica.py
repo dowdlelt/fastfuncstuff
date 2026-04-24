@@ -47,7 +47,7 @@ try:
         workflow as ica_workflow,
     )
     from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
-    from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, print_cli_header
+    from fastfuncstuff.cli_utils import add_verbose_arg, parse_input_files, parse_prefix, print_cli_header
     from fastfuncstuff.decomposition.ica import FastICA, InfoMaxICA, create_ica
     from fastfuncstuff.decomposition.tools import (
         apply_high_pass_fft,
@@ -96,8 +96,8 @@ def _run_single_ica(
     t_step = time.time()
     run_tag = f"run{run_idx + 1:02d}"
 
-    _vsection(args.verbose, "Load Data")
-    _vprint(args.verbose, f"Loading {run_file} ...")
+    _vsection(args.verb >= 1, "Load Data")
+    _vprint(args.verb >= 1, f"Loading {run_file} ...")
     img = load_nifti(run_file)
     data = img.get_fdata(dtype=np.float32)
     data_unblurred = data.copy() if (args.depth_lag and args.depth_lag_use_unsmoothed) else None
@@ -105,10 +105,10 @@ def _run_single_ica(
     shape3d = data.shape[:3]
     n_t = data.shape[3]
     voxel_sizes = tuple(float(v) for v in img.header.get_zooms()[:3])
-    _vprint(args.verbose, f"Loaded: shape={data.shape}, dtype={data.dtype}", t_step)
+    _vprint(args.verb >= 1, f"Loaded: shape={data.shape}, dtype={data.dtype}", t_step)
 
     tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
-    _vprint(args.verbose, f"TR = {tr:.4f}s, duration = {tr * n_t:.1f}s")
+    _vprint(args.verb >= 1, f"TR = {tr:.4f}s, duration = {tr * n_t:.1f}s")
 
     # FSL GUI/FEAT typically runs MELODIC on preprocessed filtered_func_data.
     # Running auto/melodic directly on raw BOLD can yield a lower PPCA model
@@ -132,27 +132,27 @@ def _run_single_ica(
 
     # --- Spatial blur ---
     if args.do_blur is not None and args.do_blur > 0:
-        _vsection(args.verbose, "Spatial Blur")
+        _vsection(args.verb >= 1, "Spatial Blur")
         t_step = time.time()
-        _vprint(args.verbose, f"FWHM={args.do_blur:.1f} mm ...")
+        _vprint(args.verb >= 1, f"FWHM={args.do_blur:.1f} mm ...")
         data = gaussian_blur_3d(
             data=data,
             fwhm_mm=float(args.do_blur),
             voxel_sizes=voxel_sizes,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
-        _vprint(args.verbose, "Spatial blur done", t_step)
+        _vprint(args.verb >= 1, "Spatial blur done", t_step)
 
     # Save temporal mean in image space for compatibility outputs
     mean3d = data.mean(axis=-1).astype(np.float32)
 
     # --- Masking ---
-    _vsection(args.verbose, "Masking")
+    _vsection(args.verb >= 1, "Masking")
     t_step = time.time()
     if shared_mask is not None:
         mask3d = shared_mask
-        _vprint(args.verbose, f"Using provided mask: {int(mask3d.sum()):,} voxels")
+        _vprint(args.verb >= 1, f"Using provided mask: {int(mask3d.sum()):,} voxels")
     elif not args.no_auto_mask:
         from fastfuncstuff.processing.mask import automask
 
@@ -163,14 +163,14 @@ def _run_single_ica(
         )
         n_total = int(np.prod(mask3d.shape))
         n_brain = int(mask3d.sum())
-        if args.verbose:
+        if args.verb >= 1:
             print(
                 f"    Auto-mask: {n_brain:,} / {n_total:,} voxels "
                 f"({100 * n_brain / max(1, n_total):.1f}%)"
             )
     else:
         mask3d = None  # no masking at all
-        _vprint(args.verbose, f"No mask: using all {np.prod(shape3d):,} voxels (no_auto_mask)")
+        _vprint(args.verb >= 1, f"No mask: using all {np.prod(shape3d):,} voxels (no_auto_mask)")
 
     # Optional mask blurring to match data blur support at edges.
     # Applies only when spatial blur is enabled and a mask exists.
@@ -191,7 +191,7 @@ def _run_single_ica(
         mask3d = np.logical_or(mask_orig, mask_blurred > blur_mask_thresh)
         n_after = int(mask3d.sum())
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"Blur-mask enabled: {n_before:,} -> {n_after:,} voxels "
             f"(orig ∪ (blurred > {blur_mask_thresh}))",
         )
@@ -201,7 +201,7 @@ def _run_single_ica(
     else:
         data_vox_t_np = data.reshape(-1, n_t).astype(np.float32)
     n_vox_masked = data_vox_t_np.shape[0]
-    _vprint(args.verbose, f"Masked data: ({n_vox_masked:,} vox, {n_t} time)", t_step)
+    _vprint(args.verb >= 1, f"Masked data: ({n_vox_masked:,} vox, {n_t} time)", t_step)
 
     if n_vox_masked < 100:
         raise ValueError(
@@ -209,14 +209,14 @@ def _run_single_ica(
         )
 
     # --- Spatial guidance masks (good / bad / depth) ---
-    _vsection(args.verbose, "Spatial Guidance Inputs")
+    _vsection(args.verb >= 1, "Spatial Guidance Inputs")
     guidance_good_masks = ica_postprocess.prepare_guidance_masks(
         mask_paths=args.good_mask,
         kind="good",
         shape3d=shape3d,
         brain_mask3d=mask3d,
         n_vox_masked=n_vox_masked,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
     guidance_bad_masks = ica_postprocess.prepare_guidance_masks(
         mask_paths=args.bad_mask,
@@ -224,7 +224,7 @@ def _run_single_ica(
         shape3d=shape3d,
         brain_mask3d=mask3d,
         n_vox_masked=n_vox_masked,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
     depth_mask_info = ica_postprocess.prepare_depth_mask(
         depth_mask_path=args.depth_mask,
@@ -233,7 +233,7 @@ def _run_single_ica(
         n_vox_masked=n_vox_masked,
     )
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"good masks={len(guidance_good_masks)}, bad masks={len(guidance_bad_masks)}, "
         f"depth labels={0 if depth_mask_info is None else len(depth_mask_info['labels'])}",
     )
@@ -255,7 +255,7 @@ def _run_single_ica(
     # FSL MELODIC computes resels = FWHM_x × FWHM_y × FWHM_z from the data,
     # then: N_eff = n_vox / (2.5 × resels).  This accounts for spatial
     # autocorrelation so the Minka/Laplace estimator doesn't over-count DOF.
-    _vsection(args.verbose, "Spatial Smoothness")
+    _vsection(args.verb >= 1, "Spatial Smoothness")
     t_step = time.time()
     if args.smoothness_fwhm is not None:
         # User-supplied smoothness in mm → convert to voxels (isotropic)
@@ -265,7 +265,7 @@ def _run_single_ica(
         resels = fwhm_vox**3  # isotropic assumption
         fwhm_geo = fwhm_vox
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"User smoothness: {args.smoothness_fwhm:.1f} mm = {fwhm_vox:.2f} voxels "
             f"(voxel size={mean_vox:.2f} mm), resels={resels:.1f}",
         )
@@ -275,10 +275,10 @@ def _run_single_ica(
             data,
             mask=mask3d,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"Estimated spatial FWHM: {fwhm_geo:.2f} voxels (resels={resels:.2f})",
         )
 
@@ -287,7 +287,7 @@ def _run_single_ica(
     # Floor at n_time to avoid degenerate cases
     n_eff = max(n_t, int(n_vox_masked / (2.5 * resels)))
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Effective spatial DOF: {n_eff:,} "
         f"(raw={n_vox_masked:,}, correction=2.5×{resels:.1f}={2.5 * resels:.1f})",
         t_step,
@@ -296,33 +296,33 @@ def _run_single_ica(
     # --- To GPU ---
     t_step = time.time()
     data_vox_t = to_tensor(data_vox_t_np, device=device, pin=True)
-    _vprint(args.verbose, f"Data on {device}", t_step)
+    _vprint(args.verb >= 1, f"Data on {device}", t_step)
 
     # Free large numpy array
     del data_vox_t_np, data
 
     # --- Percent-signal scaling ---
     if args.do_scale:
-        _vsection(args.verbose, "Scaling")
+        _vsection(args.verb >= 1, "Scaling")
         t_step = time.time()
-        _vprint(args.verbose, "Percent-signal scaling ...")
-        data_vox_t, _, _ = scale_to_percent_signal(data_vox_t, run_starts=[0], verbose=args.verbose)
-        data_vox_t = _check_finite(data_vox_t, "post-scale", args.verbose)
-        _vprint(args.verbose, "Scaling done", t_step)
+        _vprint(args.verb >= 1, "Percent-signal scaling ...")
+        data_vox_t, _, _ = scale_to_percent_signal(data_vox_t, run_starts=[0], verbose=args.verb >= 1)
+        data_vox_t = _check_finite(data_vox_t, "post-scale", args.verb >= 1)
+        _vprint(args.verb >= 1, "Scaling done", t_step)
 
     # --- Polort detrending ---
     polort = 0 if args.polort is None else int(args.polort)
 
-    _vsection(args.verbose, "Polort Detrend")
+    _vsection(args.verb >= 1, "Polort Detrend")
     t_step = time.time()
-    _vprint(args.verbose, f"Order={polort} ...")
+    _vprint(args.verb >= 1, f"Order={polort} ...")
     data_vox_t = apply_polort_projection(data_vox_t, polort=polort, device=device)
-    data_vox_t = _check_finite(data_vox_t, "post-polort", args.verbose)
-    _vprint(args.verbose, "Polort done", t_step)
+    data_vox_t = _check_finite(data_vox_t, "post-polort", args.verb >= 1)
+    _vprint(args.verb >= 1, "Polort done", t_step)
 
     # --- High-pass filter ---
     if args.high_pass is not None and args.high_pass > 0:
-        _vsection(args.verbose, "High-Pass Filter")
+        _vsection(args.verb >= 1, "High-Pass Filter")
         nyquist = 0.5 / tr
         if args.high_pass >= nyquist:
             raise ValueError(
@@ -333,12 +333,12 @@ def _run_single_ica(
         t_step = time.time()
         period_s = 1.0 / args.high_pass
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"FFT high-pass: {args.high_pass:.6f} Hz ({period_s:.1f}s period, Nyquist={nyquist:.4f} Hz) ...",
         )
         data_vox_t = apply_high_pass_fft(data_vox_t, tr=tr, high_pass_hz=args.high_pass)
-        data_vox_t = _check_finite(data_vox_t, "post-highpass", args.verbose)
-        _vprint(args.verbose, "High-pass done", t_step)
+        data_vox_t = _check_finite(data_vox_t, "post-highpass", args.verb >= 1)
+        _vprint(args.verb >= 1, "High-pass done", t_step)
 
     # --- Sanity: check data variance ---
     data_var = float(torch.var(data_vox_t).item())
@@ -347,7 +347,7 @@ def _run_single_ica(
             f"Data variance is ~0 after preprocessing ({data_var:.2e}). "
             "Check mask, scaling, and filter settings."
         )
-    _vprint(args.verbose, f"Data variance after preprocessing: {data_var:.4f}")
+    _vprint(args.verb >= 1, f"Data variance after preprocessing: {data_var:.4f}")
 
     # Parse component mode before voxel normalization so we can
     # choose the exact preprocessing path for MELODIC-like estimation.
@@ -359,7 +359,7 @@ def _run_single_ica(
     # rather than being dominated by high-amplitude voxels.
     # Also excludes constant/near-constant voxels (MELODIC step 3).
     if args.voxel_norm:
-        _vsection(args.verbose, "Voxel Variance Normalization")
+        _vsection(args.verb >= 1, "Voxel Variance Normalization")
         t_step = time.time()
         data_vox_t, norm_msg = ica_workflow.apply_voxel_variance_normalization(
             data_vox_t=data_vox_t,
@@ -367,25 +367,25 @@ def _run_single_ica(
             n_t=n_t,
             n_vox_masked=n_vox_masked,
         )
-        data_vox_t = _check_finite(data_vox_t, "post-voxel-norm", args.verbose)
-        _vprint(args.verbose, norm_msg, t_step)
+        data_vox_t = _check_finite(data_vox_t, "post-voxel-norm", args.verb >= 1)
+        _vprint(args.verb >= 1, norm_msg, t_step)
 
     # --- Component count estimation ---
-    _vsection(args.verbose, "Component Estimation")
+    _vsection(args.verb >= 1, "Component Estimation")
     t_step = time.time()
 
     # Resolve max_auto_components: proportion → absolute integer
     if args.max_auto_components <= 1.0:
         max_auto_k = max(5, int(n_t * args.max_auto_components))
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"max_auto_components: {args.max_auto_components:.0%} of {n_t} timepoints = {max_auto_k}",
         )
     else:
         max_auto_k = int(args.max_auto_components)
-        _vprint(args.verbose, f"max_auto_components: {max_auto_k} (absolute)")
+        _vprint(args.verb >= 1, f"max_auto_components: {max_auto_k} (absolute)")
 
-    _vprint(args.verbose, f"Method: {args.num_comps} ...")
+    _vprint(args.verb >= 1, f"Method: {args.num_comps} ...")
 
     # FSL update_mask behavior for model-order estimation: exclude very
     # low-variability voxels before PPCA evidence scan.
@@ -399,7 +399,7 @@ def _run_single_ica(
         n_vox_model_order = int(data_for_model_order.shape[0])
         n_eff_for_model_order = max(n_t, int(n_vox_model_order / (2.5 * resels)))
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             "MELODIC dim-est filter: "
             f"kept {n_vox_model_order:,}/{n_vox_masked:,} voxels "
             f"(thr={model_order_filter_diag['std_threshold']:.6g}); "
@@ -415,7 +415,7 @@ def _run_single_ica(
         use_mp_prior=not args.auto_no_mp,
         n_eff=n_eff_for_model_order,
         device=device,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
         capture_ppca_trace=bool(args.ppca_debug_dump),
     )
 
@@ -441,9 +441,9 @@ def _run_single_ica(
         }
         with open(ppca_debug_file, "w", encoding="utf-8") as f:
             json.dump(ppca_payload, f, indent=2)
-        _vprint(args.verbose, f"PPCA debug trace: {ppca_debug_file}")
+        _vprint(args.verb >= 1, f"PPCA debug trace: {ppca_debug_file}")
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Selected {n_components} components (mode={num_diag.get('mode', '?')})",
         t_step,
     )
@@ -452,14 +452,14 @@ def _run_single_ica(
     del data_vox_t  # free GPU memory before ICA
 
     # --- ICA ---
-    _vsection(args.verbose, "ICA Decomposition")
+    _vsection(args.verb >= 1, "ICA Decomposition")
     t_step = time.time()
     pca_eigenvalues = None  # PCA explained_variance_ for IC variance computation
     pca_components_for_sort = None  # PCA spatial components (k, V)
     if args.icasso:
         method_name = getattr(args, "ica_method", "fastica")
         _vprint(
-            args.verbose, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components} ..."
+            args.verb >= 1, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components} ..."
         )
         icasso_res = icasso(
             X=x_t,
@@ -468,7 +468,7 @@ def _run_single_ica(
             pca_components=n_components,
             min_stability=args.icasso_min_stability,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
             batch_size=args.icasso_batch_size,
             ica_method=method_name,
             base_seed=args.seed,
@@ -494,20 +494,20 @@ def _run_single_ica(
             pca_components_for_sort = torch.as_tensor(
                 icasso_res["pca_components"][:n_components], device=device, dtype=torch.float32
             )
-        _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
+        _vprint(args.verb >= 1, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
 
         # Save ICASSO diagnostic plot
         icasso_plot_path = f"{args.prefix}_run{run_idx + 1:02d}_icasso.png"
         try:
             from fastfuncstuff.decomposition.icasso import icasso_plot
             icasso_plot(icasso_res, output_path=icasso_plot_path)
-            _vprint(args.verbose, f"ICASSO plot: {icasso_plot_path}")
+            _vprint(args.verb >= 1, f"ICASSO plot: {icasso_plot_path}")
         except Exception as exc:
-            _vprint(args.verbose, f"ICASSO plot failed: {exc}")
+            _vprint(args.verb >= 1, f"ICASSO plot failed: {exc}")
     else:
         method_name = getattr(args, "ica_method", "fastica")
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"{method_name}: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity} ...",
         )
         ica = create_ica(
@@ -525,17 +525,17 @@ def _run_single_ica(
         # Check convergence
         if ica.n_iter_ >= args.ica_max_iter:
             _vprint(
-                args.verbose,
+                args.verb >= 1,
                 f"{method_name} did NOT converge after {args.ica_max_iter} iterations",
                 t_step,
             )
             print(f"  ⚠ Consider increasing -ica_max_iter or checking data conditioning")
         else:
-            _vprint(args.verbose, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
+            _vprint(args.verb >= 1, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
 
         # InfoMax diagnostics
         diag = getattr(ica, "diagnostics_", None)
-        if diag and args.verbose:
+        if diag and args.verb >= 1:
             lr_i = diag["learning_rate_initial"]
             lr_f = diag["learning_rate_final"]
             blk = diag["block_size"]
@@ -588,7 +588,7 @@ def _run_single_ica(
         mixing = mixing.clone()
         components[flip_mask] *= -1.0
         mixing[:, flip_mask] *= -1.0
-        _vprint(args.verbose, f"Sign-flipped {n_flipped} ICs to positive-maximum orientation")
+        _vprint(args.verb >= 1, f"Sign-flipped {n_flipped} ICs to positive-maximum orientation")
 
     # --- Compute ordering metrics ---
     # FSL meldata.cc sorts by spatial-map stdev. Here we expose both stdev-share
@@ -621,12 +621,12 @@ def _run_single_ica(
     total_share = (explained_share * retained_frac).astype(np.float32)
 
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"IC explained-share: top3 = {explained_share[0] * 100:.2f}%, {explained_share[1] * 100:.2f}%, {explained_share[2] * 100:.2f}% "
         f"(sorted by explained-share)",
     )
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"IC total-share: top3 = {total_share[0] * 100:.2f}%, {total_share[1] * 100:.2f}%, {total_share[2] * 100:.2f}% "
         f"(retained PCA variance={retained_frac * 100:.2f}%)",
     )
@@ -657,13 +657,13 @@ def _run_single_ica(
     # This converts raw IC maps into z-score-like units that reflect
     # the signal-to-noise ratio at each voxel.
     if x_t is not None:
-        _vprint(args.verbose, "Applying MELODIC-style noise normalization ...")
+        _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
             mixing=mixing,
             x_t=x_t,
         )
-        _vprint(args.verbose, noise_norm_msg)
+        _vprint(args.verb >= 1, noise_norm_msg)
 
     # Free ICA input matrix now that noise normalization is done
     del x_t
@@ -788,14 +788,14 @@ def _run_single_ica(
         torch.cuda.empty_cache()
 
     # --- Save spatial maps ---
-    _vsection(args.verbose, "Save Outputs")
+    _vsection(args.verb >= 1, "Save Outputs")
     t_step = time.time()
-    _vprint(args.verbose, "Saving ICA spatial maps ...")
+    _vprint(args.verb >= 1, "Saving ICA spatial maps ...")
     save_items = [
         (comp_np, f"{out_prefix}_{run_tag}_ica_maps{nii_ext}", "maps"),
     ]
     for data_arr, fname, label in tqdm(
-        save_items, desc="  Saving NIfTI", leave=False, disable=not args.verbose
+        save_items, desc="  Saving NIfTI", leave=False, disable=not args.verb >= 1
     ):
         decomposition_io.save_masked_component_maps_4d(
             components_kv=data_arr,
@@ -804,7 +804,7 @@ def _run_single_ica(
             affine=affine,
             out_file=Path(fname),
         )
-    _vprint(args.verbose, f"Maps saved: {out_prefix}_{run_tag}_ica_maps{nii_ext}", t_step)
+    _vprint(args.verb >= 1, f"Maps saved: {out_prefix}_{run_tag}_ica_maps{nii_ext}", t_step)
 
     # --- Save timecourses ---
     np.savetxt(
@@ -813,7 +813,7 @@ def _run_single_ica(
         fmt="%.6f",
         delimiter="\t",
     )
-    _vprint(args.verbose, f"Timecourses saved: {out_prefix}_{run_tag}_ica_timecourses.1D")
+    _vprint(args.verb >= 1, f"Timecourses saved: {out_prefix}_{run_tag}_ica_timecourses.1D")
 
     # --- Scree plot ---
     ica_postprocess.save_scree_plot(
@@ -840,7 +840,7 @@ def _run_single_ica(
             out_png=corr_plot,
             title=f"Run {run_idx + 1}: component correlations",
         )
-        _vprint(args.verbose, f"Correlation plot saved: {corr_plot}")
+        _vprint(args.verb >= 1, f"Correlation plot saved: {corr_plot}")
 
     spectral_blocks = []
     spectral_labels = []
@@ -859,7 +859,7 @@ def _run_single_ica(
             out_png=spectral_plot,
             title=f"Run {run_idx + 1}: component spectral correlations",
         )
-        _vprint(args.verbose, f"Spectral correlation plot saved: {spectral_plot}")
+        _vprint(args.verb >= 1, f"Spectral correlation plot saved: {spectral_plot}")
 
     # --- Mixture model z-maps ---
     mixture_meta = []
@@ -867,15 +867,15 @@ def _run_single_ica(
     p_maps = None
     thresh_z_maps = None
     if args.save_mixture_z:
-        _vsection(args.verbose, "Mixture Model (GGM)")
+        _vsection(args.verb >= 1, "Mixture Model (GGM)")
         t_step = time.time()
         n_comps_total = comp_np.shape[0]
-        _vprint(args.verbose, f"Fitting GGM for {n_comps_total} components on {device} ...")
+        _vprint(args.verb >= 1, f"Fitting GGM for {n_comps_total} components on {device} ...")
         comp_tensor = torch.as_tensor(comp_np, device=device)
         z_tensor, p_tensor, mixture_meta = batch_mixture_zscores(
             comp_tensor,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
         z_maps = z_tensor.cpu().numpy().astype(np.float32)
         p_maps = p_tensor.cpu().numpy().astype(np.float32)
@@ -883,7 +883,7 @@ def _run_single_ica(
         thresh_z_maps[p_maps < float(args.mm_thresh)] = 0.0
         del comp_tensor, z_tensor, p_tensor
         n_conv = sum(1 for m in mixture_meta if m.get("converged", False))
-        _vprint(args.verbose, f"GGM done: {n_conv}/{n_comps_total} converged", t_step)
+        _vprint(args.verb >= 1, f"GGM done: {n_conv}/{n_comps_total} converged", t_step)
 
         ggm_saves = [
             (z_maps, f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}"),
@@ -891,7 +891,7 @@ def _run_single_ica(
             (thresh_z_maps, f"{out_prefix}_{run_tag}_ica_thresh_zmaps{nii_ext}"),
         ]
         for data_arr, fname in tqdm(
-            ggm_saves, desc="  Saving GGM NIfTI", leave=False, disable=not args.verbose
+            ggm_saves, desc="  Saving GGM NIfTI", leave=False, disable=not args.verb >= 1
         ):
             decomposition_io.save_masked_component_maps_4d(
                 components_kv=data_arr,
@@ -900,7 +900,7 @@ def _run_single_ica(
                 affine=affine,
                 out_file=Path(fname),
             )
-        _vprint(args.verbose, "Z-maps and signal-prob maps saved")
+        _vprint(args.verb >= 1, "Z-maps and signal-prob maps saved")
 
     # --- Good/Bad guidance scoring (spatial + temporal) ---
     guidance_scores = ica_workflow.compute_guidance_scores(
@@ -960,8 +960,8 @@ def _run_single_ica(
             if z_maps is not None and Path(f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}").exists()
             else Path(f"{out_prefix}_{run_tag}_ica_maps{nii_ext}")
         )
-        _vprint(args.verbose, f"MELODIC melodic_IC target: {ic_target}")
-        _vprint(args.verbose, f"MELODIC-compatible outputs: {compat_dir}")
+        _vprint(args.verb >= 1, f"MELODIC melodic_IC target: {ic_target}")
+        _vprint(args.verb >= 1, f"MELODIC-compatible outputs: {compat_dir}")
 
     # --- Depth lag analysis (post-step for BOLD-like depth delay signatures) ---
     depth_lag_pack = ica_workflow.run_depth_lag_analysis(
@@ -982,7 +982,7 @@ def _run_single_ica(
         out_prefix=out_prefix,
         run_tag=run_tag,
         run_idx=run_idx,
-        verbose=bool(args.verbose),
+        verbose=bool(args.verb >= 1),
     )
     depth_lag_results = depth_lag_pack["depth_lag_results"]
     depth_lag_matrix_seconds = depth_lag_pack["depth_lag_matrix_seconds"]
@@ -991,7 +991,7 @@ def _run_single_ica(
     depth_lag_method = depth_lag_pack["depth_lag_method"]
 
     elapsed_total = time.time() - t_total
-    _vprint(args.verbose, f"Run {run_idx + 1} total elapsed: {elapsed_total:.1f}s")
+    _vprint(args.verb >= 1, f"Run {run_idx + 1} total elapsed: {elapsed_total:.1f}s")
 
     mask_type = (
         "provided" if shared_mask is not None else ("auto" if mask3d is not None else "none")
@@ -1195,8 +1195,8 @@ def _run_concat_ica(
     t_total = time.time()
     n_runs = len(input_files)
 
-    _vsection(args.verbose, "Temporal Concatenation ICA")
-    _vprint(args.verbose, f"Concatenating {n_runs} runs for single ICA decomposition")
+    _vsection(args.verb >= 1, "Temporal Concatenation ICA")
+    _vprint(args.verb >= 1, f"Concatenating {n_runs} runs for single ICA decomposition")
 
     # --- Load all runs, apply per-run preprocessing, collect masked data ---
     run_data_list: list[torch.Tensor] = []  # each (n_vox, n_t_run)
@@ -1214,14 +1214,14 @@ def _run_concat_ica(
 
     for ri, run_file in enumerate(input_files):
         t_step = time.time()
-        _vsection(args.verbose, f"Load Run {ri + 1}/{n_runs}")
-        _vprint(args.verbose, f"Loading {run_file} ...")
+        _vsection(args.verb >= 1, f"Load Run {ri + 1}/{n_runs}")
+        _vprint(args.verb >= 1, f"Loading {run_file} ...")
         img = load_nifti(run_file)
         data = img.get_fdata(dtype=np.float32)
         run_shape3d = data.shape[:3]
         n_t_run = data.shape[3]
         voxel_sizes = tuple(float(v) for v in img.header.get_zooms()[:3])
-        _vprint(args.verbose, f"  shape={data.shape}, dtype={data.dtype}", t_step)
+        _vprint(args.verb >= 1, f"  shape={data.shape}, dtype={data.dtype}", t_step)
 
         # TR from first run (or CLI override)
         run_tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
@@ -1246,7 +1246,7 @@ def _run_concat_ica(
                 device=device,
                 verbose=False,
             )
-            _vprint(args.verbose, f"  Blurred FWHM={args.do_blur:.1f}mm", t_step)
+            _vprint(args.verb >= 1, f"  Blurred FWHM={args.do_blur:.1f}mm", t_step)
 
         # Temporal mean for this run
         run_mean3d = data.mean(axis=-1).astype(np.float32)
@@ -1259,7 +1259,7 @@ def _run_concat_ica(
         if ri == 0:
             if shared_mask is not None:
                 mask3d = shared_mask
-                _vprint(args.verbose, f"  Using provided mask: {int(mask3d.sum()):,} voxels")
+                _vprint(args.verb >= 1, f"  Using provided mask: {int(mask3d.sum()):,} voxels")
             elif not args.no_auto_mask:
                 from fastfuncstuff.processing.mask import automask
 
@@ -1268,12 +1268,12 @@ def _run_concat_ica(
                         torch.as_tensor(run_mean3d),
                         dilate_extra=2,
                         device=device,
-                        verbose=args.verbose,
+                        verbose=args.verb >= 1,
                     )
                     .cpu()
                     .numpy()
                 )
-                _vprint(args.verbose, f"  Auto-mask from run 1: {int(mask3d.sum()):,} voxels")
+                _vprint(args.verb >= 1, f"  Auto-mask from run 1: {int(mask3d.sum()):,} voxels")
 
             if mask3d is not None and mask3d.shape != shape3d:
                 raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
@@ -1283,7 +1283,7 @@ def _run_concat_ica(
                 data,
                 mask=mask3d,
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
         # --- Extract masked voxels: (n_vox, n_t_run) ---
@@ -1311,8 +1311,8 @@ def _run_concat_ica(
                 run_starts=[0],
                 verbose=False,
             )
-            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verbose)
-            _vprint(args.verbose, f"  Scaled to percent signal", t_step)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verb >= 1)
+            _vprint(args.verb >= 1, f"  Scaled to percent signal", t_step)
 
         # --- Per-run polort (block-diag here = single-run) ---
         # Tcat default: -1 (off) to defer to high-pass; single-run default: 0.
@@ -1325,7 +1325,7 @@ def _run_concat_ica(
                 device=device,
                 run_starts=[0],
             )
-            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verbose)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verb >= 1)
 
         # --- Per-run high-pass filter ---
         if args.high_pass is not None and args.high_pass > 0:
@@ -1340,14 +1340,14 @@ def _run_concat_ica(
                 high_pass_hz=float(args.high_pass),
                 run_starts=[0],
             )
-            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verbose)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verb >= 1)
 
         # --- Per-run temporal mean-center (MELODIC remmean) ---
         run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
 
         run_data_list.append(run_vox)
         run_lengths.append(n_t_run)
-        _vprint(args.verbose, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} timepoints")
+        _vprint(args.verb >= 1, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} timepoints")
 
     # Average the mean images
     mean3d = mean3d_accum / n_runs
@@ -1368,7 +1368,7 @@ def _run_concat_ica(
     # 2*migpN rows. For typical FFS-sized runs we skip the incremental PCA —
     # SVD on (T_total, V) is cheap and exact. Divide-by-n_runs mirrors
     # setup_migp's `tmpData = process_file(...) / numfiles` scaling.
-    _vsection(args.verbose, "Temporal Concatenation (MELODIC setup_migp-style)")
+    _vsection(args.verb >= 1, "Temporal Concatenation (MELODIC setup_migp-style)")
     t_step = time.time()
     scale = 1.0 / float(n_runs)
     # Build (T_total, V) concat; per-run (V, T_r) → transpose and scale.
@@ -1376,8 +1376,8 @@ def _run_concat_ica(
         [run_data_list[ri].T * scale for ri in range(n_runs)], dim=0
     ).contiguous()
     del run_data_list
-    data_tv = _check_finite(data_tv, "data_tv", args.verbose)
-    _vprint(args.verbose, f"Concat shape: {tuple(data_tv.shape)} (T_total, V)", t_step)
+    data_tv = _check_finite(data_tv, "data_tv", args.verb >= 1)
+    _vprint(args.verb >= 1, f"Concat shape: {tuple(data_tv.shape)} (T_total, V)", t_step)
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -1393,7 +1393,7 @@ def _run_concat_ica(
             compute_melodic_varnorm_map,
         )
 
-        _vsection(args.verbose, "Variance Normalization (joined on concat)")
+        _vsection(args.verb >= 1, "Variance Normalization (joined on concat)")
         t_step = time.time()
         pca_dim_vn = min(30, max(1, int(data_tv.shape[0]) - 1))
         # compute_melodic_varnorm_map expects (V, T); our data_tv is (T, V) → pass transpose.
@@ -1404,7 +1404,7 @@ def _run_concat_ica(
         data_tv = data_tv_vt.T.contiguous()
         del data_tv_vt, noise_std_map, const_mask_vn
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant voxels",
             t_step,
         )
@@ -1414,7 +1414,7 @@ def _run_concat_ica(
     concat_var = float(torch.var(data_tv).item())
     if concat_var < 1e-10:
         raise ValueError(f"concat variance is ~0 after preprocessing ({concat_var:.2e})")
-    _vprint(args.verbose, f"Concat variance: {concat_var:.4f}")
+    _vprint(args.verb >= 1, f"Concat variance: {concat_var:.4f}")
 
     # --- Spatial smoothness / effective DOF ---
     # MELODIC: NumVox = floor(num_vox / (2.5 * resels)) feeds the MP noise floor
@@ -1424,13 +1424,13 @@ def _run_concat_ica(
     fwhm_geo = fwhm_geo_accum
     n_eff = max(int(total_t), int(n_vox_masked / (2.5 * max(resels, 1e-6))))
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Effective spatial DOF: n_eff={n_eff:,} "
         f"(raw V={n_vox_masked:,}, resels={resels:.2f}, 2.5*resels={2.5 * resels:.1f})",
     )
 
     # --- Component count estimation (on concat, MELODIC-style) ---
-    _vsection(args.verbose, "Component Estimation (on concat)")
+    _vsection(args.verb >= 1, "Component Estimation (on concat)")
     t_step = time.time()
 
     # Dim-est expects (V, T) layout internally — pass data_tv.T.
@@ -1441,8 +1441,8 @@ def _run_concat_ica(
             max_auto_k = max(max_auto_k, max(5, T_total - 2))
     else:
         max_auto_k = int(args.max_auto_components)
-    _vprint(args.verbose, f"max_auto_components: {max_auto_k}")
-    _vprint(args.verbose, f"Method: {args.num_comps}")
+    _vprint(args.verb >= 1, f"max_auto_components: {max_auto_k}")
+    _vprint(args.verb >= 1, f"Method: {args.num_comps}")
 
     n_eff_for_model_order = n_eff
     data_for_model_order_vt = data_tv.T  # (V, T_total)
@@ -1455,7 +1455,7 @@ def _run_concat_ica(
             int(T_total), int(n_vox_model_order / (2.5 * max(resels, 1e-6)))
         )
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{n_vox_masked:,} voxels; "
             f"n_eff={n_eff_for_model_order:,} (resels={resels:.2f})",
         )
@@ -1471,12 +1471,12 @@ def _run_concat_ica(
         use_mp_prior=use_mp,
         n_eff=n_eff_for_model_order,
         device=device,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
         capture_ppca_trace=bool(args.ppca_debug_dump),
     )
     order = int(n_components)
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Selected {order} components (mode={num_diag.get('mode', '?')})",
         t_step,
     )
@@ -1488,7 +1488,7 @@ def _run_concat_ica(
     # Eigen-decomp of temporal covariance (T_total, T_total), keep top `order`.
     # WM = E^T / sqrt(L) : (order, T_total); DWM = E * sqrt(L) : (T_total, order).
     # whitened = WM @ data_tv  →  (order, V).
-    _vsection(args.verbose, "Whitening (joined on concat)")
+    _vsection(args.verb >= 1, "Whitening (joined on concat)")
     t_step = time.time()
     # Center each timepoint row across voxels (MELODIC remmean(Data,2)).
     row_mean = data_tv.mean(dim=1, keepdim=True)
@@ -1509,7 +1509,7 @@ def _run_concat_ica(
     del data_tv
     whiten_mode = "joined"
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Whiten: order={order}, x_t shape {tuple(x_t.shape)}",
         t_step,
     )
@@ -1517,11 +1517,11 @@ def _run_concat_ica(
         torch.cuda.empty_cache()
 
     # --- ICA ---
-    _vsection(args.verbose, "ICA Decomposition")
+    _vsection(args.verb >= 1, "ICA Decomposition")
     t_step = time.time()
     if args.icasso:
         method_name = getattr(args, "ica_method", "fastica")
-        _vprint(args.verbose, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
+        _vprint(args.verb >= 1, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
         icasso_res = icasso(
             X=x_t,
             n_components=n_components,
@@ -1529,7 +1529,7 @@ def _run_concat_ica(
             pca_components=n_components,
             min_stability=args.icasso_min_stability,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
             batch_size=args.icasso_batch_size,
             ica_method=method_name,
             base_seed=args.seed,
@@ -1546,20 +1546,20 @@ def _run_concat_ica(
             "n_stable": int(icasso_res["n_stable"]),
             "stability": stability.tolist(),
         }
-        _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
+        _vprint(args.verb >= 1, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
 
         # Save ICASSO diagnostic plot
         icasso_plot_path = f"{args.prefix}_tempconcat_icasso.png"
         try:
             from fastfuncstuff.decomposition.icasso import icasso_plot
             icasso_plot(icasso_res, output_path=icasso_plot_path)
-            _vprint(args.verbose, f"ICASSO plot: {icasso_plot_path}")
+            _vprint(args.verb >= 1, f"ICASSO plot: {icasso_plot_path}")
         except Exception as exc:
-            _vprint(args.verbose, f"ICASSO plot failed: {exc}")
+            _vprint(args.verb >= 1, f"ICASSO plot failed: {exc}")
     else:
         method_name = getattr(args, "ica_method", "fastica")
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"{method_name}: k={n_components}, max_iter={args.ica_max_iter}, fun={args.ica_nonlinearity}",
         )
         ica = create_ica(
@@ -1575,14 +1575,14 @@ def _run_concat_ica(
         ica.fit(x_t)
         if ica.n_iter_ >= args.ica_max_iter:
             _vprint(
-                args.verbose, f"{method_name} did NOT converge after {args.ica_max_iter} iterations"
+                args.verb >= 1, f"{method_name} did NOT converge after {args.ica_max_iter} iterations"
             )
         else:
-            _vprint(args.verbose, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
+            _vprint(args.verb >= 1, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
 
         # InfoMax diagnostics
         diag = getattr(ica, "diagnostics_", None)
-        if diag and args.verbose:
+        if diag and args.verb >= 1:
             lr_i = diag["learning_rate_initial"]
             lr_f = diag["learning_rate_final"]
             blk = diag["block_size"]
@@ -1637,7 +1637,7 @@ def _run_concat_ica(
         mixing = mixing.clone()
         components[flip_mask] *= -1.0
         mixing[:, flip_mask] *= -1.0
-        _vprint(args.verbose, f"Sign-flipped {n_flipped} ICs")
+        _vprint(args.verb >= 1, f"Sign-flipped {n_flipped} ICs")
 
     # --- Ordering by explained share ---
     ic_stdev = torch.std(components, dim=1)
@@ -1672,19 +1672,19 @@ def _run_concat_ica(
 
     # --- MELODIC-style noise normalization ---
     if x_t is not None:
-        _vprint(args.verbose, "Applying MELODIC-style noise normalization ...")
+        _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
             mixing=mixing,
             x_t=x_t,
         )
-        _vprint(args.verbose, noise_norm_msg)
+        _vprint(args.verb >= 1, noise_norm_msg)
     del x_t
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
     # --- Save outputs (no run tag for concat) ---
-    _vsection(args.verbose, "Save Outputs")
+    _vsection(args.verb >= 1, "Save Outputs")
     t_step = time.time()
     pfx = parse_prefix(str(args.prefix))
     out_prefix = Path(pfx.stem)
@@ -1704,7 +1704,7 @@ def _run_concat_ica(
         affine=affine,
         out_file=Path(f"{out_prefix}_concat_ica_maps{nii_ext}"),
     )
-    _vprint(args.verbose, f"Maps: {out_prefix}_concat_ica_maps{nii_ext}", t_step)
+    _vprint(args.verb >= 1, f"Maps: {out_prefix}_concat_ica_maps{nii_ext}", t_step)
 
     # Timecourses (concatenated, (T_total, k))
     np.savetxt(
@@ -1713,7 +1713,7 @@ def _run_concat_ica(
         fmt="%.6f",
         delimiter="\t",
     )
-    _vprint(args.verbose, f"Timecourses: {out_prefix}_concat_ica_timecourses.1D")
+    _vprint(args.verb >= 1, f"Timecourses: {out_prefix}_concat_ica_timecourses.1D")
 
     # Per-run timecourses (block-diag whiten path only)
     per_run_tc_paths: list[str] = []
@@ -1724,7 +1724,7 @@ def _run_concat_ica(
             np.savetxt(tc_path, tc, fmt="%.6f", delimiter="\t")
             per_run_tc_paths.append(tc_path)
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"Per-run timecourses: {len(per_run_tc_paths)} files saved",
         )
 
@@ -1739,13 +1739,13 @@ def _run_concat_ica(
     mixture_meta = []
     z_maps = None
     if args.save_mixture_z:
-        _vsection(args.verbose, "Mixture Model (GGM)")
+        _vsection(args.verb >= 1, "Mixture Model (GGM)")
         t_step = time.time()
         comp_tensor = torch.as_tensor(comp_np, device=device)
         z_tensor, p_tensor, mixture_meta = batch_mixture_zscores(
             comp_tensor,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
         z_maps = z_tensor.cpu().numpy().astype(np.float32)
         p_maps = p_tensor.cpu().numpy().astype(np.float32)
@@ -1765,7 +1765,7 @@ def _run_concat_ica(
                 affine=affine,
                 out_file=Path(fname),
             )
-        _vprint(args.verbose, "Z-maps and signal-prob maps saved", t_step)
+        _vprint(args.verb >= 1, "Z-maps and signal-prob maps saved", t_step)
 
     # MELODIC compat
     if args.melodic_compat:
@@ -1789,10 +1789,10 @@ def _run_concat_ica(
             p_maps=p_maps if z_maps is not None else None,
             thresh_z_maps=thresh_z_maps if z_maps is not None else None,
         )
-        _vprint(args.verbose, f"MELODIC compat: {compat_dir}")
+        _vprint(args.verb >= 1, f"MELODIC compat: {compat_dir}")
 
     elapsed_total = time.time() - t_total
-    _vprint(args.verbose, f"Concat ICA total elapsed: {elapsed_total:.1f}s")
+    _vprint(args.verb >= 1, f"Concat ICA total elapsed: {elapsed_total:.1f}s")
 
     mask_type = (
         "provided" if shared_mask is not None else ("auto" if mask3d is not None else "none")
@@ -1865,8 +1865,8 @@ def _run_tensorial_ica(
     t_total = time.time()
     n_runs = len(input_files)
 
-    _vsection(args.verbose, "Tensorial (spatial-concat) ICA")
-    _vprint(args.verbose, f"Spatially concatenating {n_runs} runs → single shared temporal mixing")
+    _vsection(args.verb >= 1, "Tensorial (spatial-concat) ICA")
+    _vprint(args.verb >= 1, f"Spatially concatenating {n_runs} runs → single shared temporal mixing")
 
     # --- Per-run preprocessing (identical to concat path) -------------------
     run_data_list: list[torch.Tensor] = []  # each (V, T)
@@ -1884,14 +1884,14 @@ def _run_tensorial_ica(
 
     for ri, run_file in enumerate(input_files):
         t_step = time.time()
-        _vsection(args.verbose, f"Load Run {ri + 1}/{n_runs}")
-        _vprint(args.verbose, f"Loading {run_file} ...")
+        _vsection(args.verb >= 1, f"Load Run {ri + 1}/{n_runs}")
+        _vprint(args.verb >= 1, f"Loading {run_file} ...")
         img = load_nifti(run_file)
         data = img.get_fdata(dtype=np.float32)
         run_shape3d = data.shape[:3]
         n_t_run = data.shape[3]
         voxel_sizes = tuple(float(v) for v in img.header.get_zooms()[:3])
-        _vprint(args.verbose, f"  shape={data.shape}", t_step)
+        _vprint(args.verb >= 1, f"  shape={data.shape}", t_step)
 
         run_tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
         if tr is None:
@@ -1914,7 +1914,7 @@ def _run_tensorial_ica(
                 device=device,
                 verbose=False,
             )
-            _vprint(args.verbose, f"  Blurred FWHM={args.do_blur:.1f}mm", t_step)
+            _vprint(args.verb >= 1, f"  Blurred FWHM={args.do_blur:.1f}mm", t_step)
 
         run_mean3d = data.mean(axis=-1).astype(np.float32)
         if mean3d_accum is None:
@@ -1925,7 +1925,7 @@ def _run_tensorial_ica(
         if ri == 0:
             if shared_mask is not None:
                 mask3d = shared_mask
-                _vprint(args.verbose, f"  Using provided mask: {int(mask3d.sum()):,} voxels")
+                _vprint(args.verb >= 1, f"  Using provided mask: {int(mask3d.sum()):,} voxels")
             elif not args.no_auto_mask:
                 from fastfuncstuff.processing.mask import automask
 
@@ -1934,12 +1934,12 @@ def _run_tensorial_ica(
                         torch.as_tensor(run_mean3d),
                         dilate_extra=2,
                         device=device,
-                        verbose=args.verbose,
+                        verbose=args.verb >= 1,
                     )
                     .cpu()
                     .numpy()
                 )
-                _vprint(args.verbose, f"  Auto-mask from run 1: {int(mask3d.sum()):,} voxels")
+                _vprint(args.verb >= 1, f"  Auto-mask from run 1: {int(mask3d.sum()):,} voxels")
 
             if mask3d is not None and mask3d.shape != shape3d:
                 raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
@@ -1948,7 +1948,7 @@ def _run_tensorial_ica(
                 data,
                 mask=mask3d,
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
         if mask3d is not None:
@@ -1969,7 +1969,7 @@ def _run_tensorial_ica(
 
         if args.do_scale:
             run_vox, _, _ = scale_to_percent_signal(run_vox, run_starts=[0], verbose=False)
-            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verbose)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verb >= 1)
 
         # Tensorial: same T across runs is assumed; polort defaults to 0 (demean)
         # since there's no block-diagonal trend to separate (each run sits in
@@ -1980,7 +1980,7 @@ def _run_tensorial_ica(
             run_vox = apply_polort_projection(
                 run_vox, polort=polort_r, device=device, run_starts=[0]
             )
-            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verbose)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verb >= 1)
 
         if args.high_pass is not None and args.high_pass > 0:
             nyquist = 0.5 / float(tr if tr is not None else run_tr)
@@ -1994,14 +1994,14 @@ def _run_tensorial_ica(
                 high_pass_hz=float(args.high_pass),
                 run_starts=[0],
             )
-            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verbose)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verb >= 1)
 
         # Per-voxel temporal mean-center (MELODIC remmean)
         run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
 
         run_data_list.append(run_vox)
         run_lengths.append(n_t_run)
-        _vprint(args.verbose, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} TPs")
+        _vprint(args.verb >= 1, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} TPs")
 
     mean3d = mean3d_accum / n_runs
 
@@ -2014,15 +2014,15 @@ def _run_tensorial_ica(
         )
 
     # --- Spatial concatenation: stack (V, T) → (T, n_runs * V) --------------
-    _vsection(args.verbose, "Spatial Concatenation")
+    _vsection(args.verb >= 1, "Spatial Concatenation")
     t_step = time.time()
     # Transpose each (V, T) to (T, V) and cat along dim=1 → (T, n_runs * V).
     data_tv = torch.cat([run_data_list[ri].T for ri in range(n_runs)], dim=1).contiguous()
     del run_data_list
-    data_tv = _check_finite(data_tv, "data_tv", args.verbose)
+    data_tv = _check_finite(data_tv, "data_tv", args.verb >= 1)
     V_total = int(data_tv.shape[1])
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Spatial concat: {tuple(data_tv.shape)} (T, n_runs*V) "
         f"= ({T}, {n_runs} * {n_vox_masked})",
         t_step,
@@ -2038,7 +2038,7 @@ def _run_tensorial_ica(
             compute_melodic_varnorm_map,
         )
 
-        _vsection(args.verbose, "Variance Normalization (joined on spatial concat)")
+        _vsection(args.verb >= 1, "Variance Normalization (joined on spatial concat)")
         t_step = time.time()
         pca_dim_vn = min(30, max(1, int(data_tv.shape[0]) - 1))
         noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
@@ -2048,7 +2048,7 @@ def _run_tensorial_ica(
         data_tv = data_tv_vt.T.contiguous()
         del data_tv_vt, noise_std_map, const_mask_vn
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant columns",
             t_step,
         )
@@ -2057,7 +2057,7 @@ def _run_tensorial_ica(
     concat_var = float(torch.var(data_tv).item())
     if concat_var < 1e-10:
         raise ValueError(f"spatial-concat variance is ~0 after preprocessing ({concat_var:.2e})")
-    _vprint(args.verbose, f"Spatial-concat variance: {concat_var:.4f}")
+    _vprint(args.verb >= 1, f"Spatial-concat variance: {concat_var:.4f}")
 
     # --- Spatial smoothness / effective DOF ---------------------------------
     # For spatial concat, each run contributes V voxels with the same resel
@@ -2066,13 +2066,13 @@ def _run_tensorial_ica(
     fwhm_geo = fwhm_geo_accum
     n_eff = max(int(T), int(V_total / (2.5 * max(resels, 1e-6))))
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Effective spatial DOF: n_eff={n_eff:,} "
         f"(V_total={V_total:,}, resels={resels:.2f}, 2.5*resels={2.5 * resels:.1f})",
     )
 
     # --- Component estimation ----------------------------------------------
-    _vsection(args.verbose, "Component Estimation (on spatial concat)")
+    _vsection(args.verb >= 1, "Component Estimation (on spatial concat)")
     t_step = time.time()
     if args.max_auto_components <= 1.0:
         max_auto_k = max(5, int((T - 2) * args.max_auto_components))
@@ -2080,8 +2080,8 @@ def _run_tensorial_ica(
             max_auto_k = max(max_auto_k, max(5, T - 2))
     else:
         max_auto_k = int(args.max_auto_components)
-    _vprint(args.verbose, f"max_auto_components: {max_auto_k}")
-    _vprint(args.verbose, f"Method: {args.num_comps}")
+    _vprint(args.verb >= 1, f"max_auto_components: {max_auto_k}")
+    _vprint(args.verb >= 1, f"Method: {args.num_comps}")
 
     n_eff_for_model_order = n_eff
     data_for_model_order_vt = data_tv.T  # (V_total, T)
@@ -2094,7 +2094,7 @@ def _run_tensorial_ica(
             int(T), int(n_vox_model_order / (2.5 * max(resels, 1e-6)))
         )
         _vprint(
-            args.verbose,
+            args.verb >= 1,
             f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{V_total:,} columns; "
             f"n_eff={n_eff_for_model_order:,}",
         )
@@ -2109,12 +2109,12 @@ def _run_tensorial_ica(
         use_mp_prior=use_mp,
         n_eff=n_eff_for_model_order,
         device=device,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
         capture_ppca_trace=bool(args.ppca_debug_dump),
     )
     order = int(n_components)
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Selected {order} components (mode={num_diag.get('mode', '?')})",
         t_step,
     )
@@ -2123,7 +2123,7 @@ def _run_tensorial_ica(
         torch.cuda.empty_cache()
 
     # --- Whitening on spatial concat (same structure as tcat) --------------
-    _vsection(args.verbose, "Whitening (joined on spatial concat)")
+    _vsection(args.verb >= 1, "Whitening (joined on spatial concat)")
     t_step = time.time()
     row_mean = data_tv.mean(dim=1, keepdim=True)
     data_centered = data_tv - row_mean
@@ -2141,7 +2141,7 @@ def _run_tensorial_ica(
     orig_concat_tv = data_tv
     del data_tv
     _vprint(
-        args.verbose,
+        args.verb >= 1,
         f"Whiten: order={order}, x_t shape {tuple(x_t.shape)}",
         t_step,
     )
@@ -2149,11 +2149,11 @@ def _run_tensorial_ica(
         torch.cuda.empty_cache()
 
     # --- ICA ----------------------------------------------------------------
-    _vsection(args.verbose, "ICA Decomposition")
+    _vsection(args.verb >= 1, "ICA Decomposition")
     t_step = time.time()
     if args.icasso:
         method_name = getattr(args, "ica_method", "fastica")
-        _vprint(args.verbose, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
+        _vprint(args.verb >= 1, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
         icasso_res = icasso(
             X=x_t,
             n_components=n_components,
@@ -2161,7 +2161,7 @@ def _run_tensorial_ica(
             pca_components=n_components,
             min_stability=args.icasso_min_stability,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
             batch_size=args.icasso_batch_size,
             ica_method=method_name,
             base_seed=args.seed,
@@ -2176,10 +2176,10 @@ def _run_tensorial_ica(
             "n_stable": int(icasso_res["n_stable"]),
             "stability": stability.tolist(),
         }
-        _vprint(args.verbose, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
+        _vprint(args.verb >= 1, f"ICASSO done ({icasso_res['n_stable']} stable)", t_step)
     else:
         method_name = getattr(args, "ica_method", "fastica")
-        _vprint(args.verbose, f"{method_name}: k={n_components}")
+        _vprint(args.verb >= 1, f"{method_name}: k={n_components}")
         ica = create_ica(
             method=method_name,
             n_components=n_components,
@@ -2223,7 +2223,7 @@ def _run_tensorial_ica(
         mixing = mixing.clone()
         components[flip_mask] *= -1.0
         mixing[:, flip_mask] *= -1.0
-        _vprint(args.verbose, f"Sign-flipped {n_flipped} ICs")
+        _vprint(args.verb >= 1, f"Sign-flipped {n_flipped} ICs")
 
     # --- Ordering by explained share (of shared mixing variance) ----------
     ic_stdev = torch.std(components, dim=1)
@@ -2257,19 +2257,19 @@ def _run_tensorial_ica(
 
     # --- MELODIC-style noise normalization (on the wide component matrix) -
     if x_t is not None:
-        _vprint(args.verbose, "Applying MELODIC-style noise normalization ...")
+        _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
             mixing=mixing,
             x_t=x_t,
         )
-        _vprint(args.verbose, noise_norm_msg)
+        _vprint(args.verb >= 1, noise_norm_msg)
     del x_t
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
     # --- Split components into per-run spatial maps ------------------------
-    _vsection(args.verbose, "Save Outputs")
+    _vsection(args.verb >= 1, "Save Outputs")
     t_step = time.time()
     pfx = parse_prefix(str(args.prefix))
     out_prefix = Path(pfx.stem)
@@ -2295,7 +2295,7 @@ def _run_tensorial_ica(
             out_file=Path(map_path),
         )
         per_run_map_paths.append(map_path)
-    _vprint(args.verbose, f"Per-run maps: {len(per_run_map_paths)} files", t_step)
+    _vprint(args.verb >= 1, f"Per-run maps: {len(per_run_map_paths)} files", t_step)
 
     # Also save the averaged-across-runs map for convenience
     avg_maps = np.stack(
@@ -2314,7 +2314,7 @@ def _run_tensorial_ica(
     np.savetxt(
         f"{out_prefix}_tensor_ica_timecourses.1D", mixing_np, fmt="%.6f", delimiter="\t"
     )
-    _vprint(args.verbose, f"Shared timecourses: {out_prefix}_tensor_ica_timecourses.1D")
+    _vprint(args.verb >= 1, f"Shared timecourses: {out_prefix}_tensor_ica_timecourses.1D")
 
     # Scree plot
     ica_postprocess.save_scree_plot(
@@ -2327,11 +2327,11 @@ def _run_tensorial_ica(
     z_maps = None
     mixture_meta = []
     if args.save_mixture_z:
-        _vsection(args.verbose, "Mixture Model (GGM) on run-averaged maps")
+        _vsection(args.verb >= 1, "Mixture Model (GGM) on run-averaged maps")
         t_step = time.time()
         comp_tensor = torch.as_tensor(avg_maps, device=device)
         z_tensor, p_tensor, mixture_meta = batch_mixture_zscores(
-            comp_tensor, device=device, verbose=args.verbose
+            comp_tensor, device=device, verbose=args.verb >= 1
         )
         z_maps = z_tensor.cpu().numpy().astype(np.float32)
         p_maps = p_tensor.cpu().numpy().astype(np.float32)
@@ -2351,10 +2351,10 @@ def _run_tensorial_ica(
                 affine=affine,
                 out_file=Path(fname),
             )
-        _vprint(args.verbose, "Z-maps and signal-prob maps saved", t_step)
+        _vprint(args.verb >= 1, "Z-maps and signal-prob maps saved", t_step)
 
     elapsed_total = time.time() - t_total
-    _vprint(args.verbose, f"Tensorial ICA total elapsed: {elapsed_total:.1f}s")
+    _vprint(args.verb >= 1, f"Tensorial ICA total elapsed: {elapsed_total:.1f}s")
 
     mask_type = (
         "provided" if shared_mask is not None else ("auto" if mask3d is not None else "none")
@@ -2835,7 +2835,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     misc = parser.add_argument_group("Misc")
     misc.add_argument("-cpu", action="store_true", help="Force CPU")
-    misc.add_argument("-verbose", action="store_true", help="Verbose logging")
+    add_verbose_arg(misc, default=0)
     misc.add_argument("-help", "--help", action="help")
 
     return parser
@@ -2912,7 +2912,7 @@ def main() -> None:
     print_cli_header("ffs_ica.py", "Fast run-wise whole-brain ICA")
     print(f"Device: {device}")
     print(f"Runs: {len(input_files)}")
-    if args.verbose:
+    if args.verb >= 1:
         print(f"Component selection: {args.num_comps}")
         if args.max_auto_components <= 1.0:
             print(f"Max auto components: {args.max_auto_components:.0%} of timepoints")

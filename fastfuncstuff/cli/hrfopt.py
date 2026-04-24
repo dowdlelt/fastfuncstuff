@@ -39,6 +39,7 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
         compute_run_lengths,
@@ -415,11 +416,7 @@ Notes:
         "requires LORO CV. 'slow' stores full timeseries (for non-LORO CV). "
         "'auto' selects based on CV strategy (default: auto).",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-debug",
         action="store_true",
@@ -540,7 +537,7 @@ def main():
 
     # Debug implies verbose
     if args.debug:
-        args.verbose = True
+        args.verb >= 1 = True
 
     print_header(args)
 
@@ -702,7 +699,7 @@ def main():
                 sys.exit(1)
 
             all_onsets.append(onsets_by_run)
-            if args.verbose:
+            if args.verb >= 1:
                 n_events = sum(len(r) for r in onsets_by_run)
                 print(f"  {condition_labels[i]}: {n_events} events across {n_runs} runs")
 
@@ -770,7 +767,7 @@ def main():
     ortvec_files = None
     if args.ortvec:
         ortvec_files = [(f, label) for f, label in args.ortvec]
-        if args.verbose:
+        if args.verb >= 1:
             for f, label in ortvec_files:
                 print(f"  Nuisance: {f} (label={label})")
 
@@ -916,7 +913,7 @@ def main():
                 if hrf_idx == 0:
                     canonical_betas[c0:c1] = chunk_betas.cpu()
 
-            if args.verbose and hrf_idx % 5 == 0:
+            if args.verb >= 1 and hrf_idx % 5 == 0:
                 col_r2 = fit_r2_all[:, hrf_idx]
                 print(
                     f"    HRF {hrf_idx}: mean R²={col_r2.mean():.4f}, median R²={col_r2.median():.4f}"
@@ -1043,7 +1040,7 @@ def main():
                 microtime_dt=args.microtime_dt,
                 microtime_onset=0,  # Default: sample at start of TR
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
             # Update results
@@ -1075,7 +1072,7 @@ def main():
                 microtime_dt=args.microtime_dt,
                 condition_labels=condition_labels,
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
             # Update results
@@ -1099,7 +1096,7 @@ def main():
             ortvec_files=ortvec_files,
             canonical_mode=args.canonical,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
             chunk_size=args.batch_size,
             r2_method=args.R2method,
             debug=args.debug,

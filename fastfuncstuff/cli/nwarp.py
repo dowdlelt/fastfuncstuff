@@ -15,6 +15,7 @@ import time
 
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.processing.nwarpforge import nwarpforge, parse_nwarp_string
 
 
@@ -119,13 +120,7 @@ Examples:
     hw_group.add_argument(
         "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
     )
-    hw_group.add_argument(
-        "-verb",
-        type=int,
-        default=1,
-        choices=[0, 1, 2],
-        help="Verbosity: 0=quiet, 1=normal, 2=debug",
-    )
+    add_verbose_arg(hw_group, default=1)
 
     debug_group = parser.add_argument_group("Debug")
     debug_group.add_argument(

@@ -33,6 +33,8 @@ import sys
 
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg
+
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -77,10 +79,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-device", default="cpu", metavar="DEV",
         help="Torch device for PCA computation [default: %(default)s].",
     )
-    opt.add_argument(
-        "-verb", type=int, default=1, metavar="V",
-        help="Verbosity level (0=quiet, 1=normal, 2=verbose) [default: %(default)s].",
-    )
+    add_verbose_arg(opt, default=1)
 
     hlp = parser.add_argument_group("Help")
     hlp.add_argument("-help", action="store_true", help="Show this help and exit.")

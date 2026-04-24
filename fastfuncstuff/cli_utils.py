@@ -1092,6 +1092,65 @@ def get_average_run_duration(
     return avg_run_len * tr
 
 
+def add_verbose_arg(parser_or_group, default: int = 1, dest: str = "verb"):
+    """Register canonical verbosity flags on a parser or argument group.
+
+    Canonical flag is ``-verb {0,1,2}`` (integer). ``-verbose`` and ``-quiet``
+    are silent aliases that set the same dest — ``-verbose`` to 2, ``-quiet``
+    to 0. All three are grouped under a "Verbosity" heading in --help so the
+    aliases look intentional rather than accidental.
+
+    Parameters
+    ----------
+    parser_or_group : argparse.ArgumentParser or argparse._ArgumentGroup
+        Where to add the flags. Pass a parser to create a new "Verbosity"
+        group; pass an existing group to add flags to it directly.
+    default : int, default=1
+        Default verbosity level when none of the flags are given.
+    dest : str, default="verb"
+        Destination attribute name on the parsed args. Leave as "verb"
+        unless a tool needs a different name for backwards compatibility.
+
+    Examples
+    --------
+    >>> parser = argparse.ArgumentParser()
+    >>> add_verbose_arg(parser)
+    >>> args = parser.parse_args(["-verbose"])
+    >>> args.verb
+    2
+    """
+    import argparse
+
+    if isinstance(parser_or_group, argparse.ArgumentParser):
+        group = parser_or_group.add_argument_group("Verbosity")
+    else:
+        group = parser_or_group
+
+    group.add_argument(
+        "-verb",
+        type=int,
+        choices=[0, 1, 2],
+        default=default,
+        metavar="LEVEL",
+        dest=dest,
+        help=f"Verbosity: 0=silent, 1=normal, 2=debug (default: {default}).",
+    )
+    group.add_argument(
+        "-verbose",
+        dest=dest,
+        action="store_const",
+        const=2,
+        help="Alias for -verb 2.",
+    )
+    group.add_argument(
+        "-quiet",
+        dest=dest,
+        action="store_const",
+        const=0,
+        help="Alias for -verb 0.",
+    )
+
+
 def parse_device_arg(
     device_spec: str | None,
 ) -> tuple[torch.device, int | None, int | None]:

@@ -6,6 +6,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from fastfuncstuff.cli_utils import add_verbose_arg
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -100,11 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-device", type=str, default=None,
         help="PyTorch device passed to FFS tools: cpu, cuda, mps (default: auto-detect).",
     )
-    parser.add_argument(
-        "-verbose", action="store_true",
-        help="Stream full subprocess output (stdout + stderr) for each FFS/AFNI call. "
-             "Useful for seeing MPS fallback warnings and other diagnostic messages.",
-    )
+    add_verbose_arg(parser, default=0)
 
     args = parser.parse_args(argv)
 
@@ -227,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         force_ffs=args.force_ffs or force_all,
         validate_only=args.validate_only,
         device=args.device,
-        show_output=args.verbose,
+        show_output=args.verb >= 1,
         config=config,
     )
 

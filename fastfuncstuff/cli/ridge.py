@@ -48,6 +48,7 @@ import torch
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
         compute_run_lengths,
@@ -325,11 +326,7 @@ Notes:
         default=0,
         help="Voxels per chunk for processing. 0 = auto-detect based on available memory (default)",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
         action="store_true",
@@ -750,7 +747,7 @@ def main():
                     n_regressors=n_cols,
                     device=device,
                     operation="ridge",
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
 
             n_chunks = (n_voxels + args.chunk_size - 1) // args.chunk_size
@@ -864,7 +861,7 @@ def main():
                     n_regressors=n_columns,
                     device=device,
                     operation="ridge",
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
 
             # Project nuisance from data once (shared across HRF groups)
@@ -989,7 +986,7 @@ def main():
             autoscale=args.autoscale,
             chunk_size=args.chunk_size,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
 
     # Save outputs

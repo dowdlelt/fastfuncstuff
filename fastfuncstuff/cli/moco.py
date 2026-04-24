@@ -23,7 +23,7 @@ from fastfuncstuff.processing.ffs_moco import (
     save_moco_dfile,
 )
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
-from fastfuncstuff.cli_utils import parse_prefix
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -165,13 +165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     hw_group.add_argument(
         "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
     )
-    hw_group.add_argument(
-        "-verb",
-        type=int,
-        default=1,
-        choices=[0, 1, 2],
-        help="Verbosity: 0=quiet, 1=normal, 2=debug",
-    )
+    add_verbose_arg(hw_group, default=1)
     hw_group.add_argument(
         "-debug_memory",
         action="store_true",

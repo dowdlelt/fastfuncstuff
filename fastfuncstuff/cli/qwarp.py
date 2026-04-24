@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.processing.affine import resample_to_base_grid
 from fastfuncstuff.processing.interp import warp_image_linear
 from fastfuncstuff.processing.io import load_image, load_warp_field, save_image, save_warp_field
@@ -83,8 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help="Save displacement warp field(s) [default: yes]")
     g_io.add_argument("-no_save_warp", action="store_true",
                       help="Do not save displacement warp field(s)")
-    g_io.add_argument("-verb", type=int, default=1, metavar="LEVEL",
-                      help="Verbosity: 0=quiet, 1=normal, 2=debug [default: %(default)s]")
+    add_verbose_arg(g_io, default=1)
 
     # ── Timeseries Options ──────────────────────────────────────────────
     g_ts = p.add_argument_group(
