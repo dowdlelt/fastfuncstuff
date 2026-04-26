@@ -119,8 +119,11 @@ Examples:
 
     # --- Masking ---
     mask_group = parser.add_argument_group("Masking")
-    mask_group.add_argument("-source_automask", action="store_true",
+    mask_group.add_argument("-automask", dest="source_automask", action="store_true",
                             help="Automask source to exclude background")
+    mask_group.add_argument("-source_automask", dest="source_automask",
+                            action="store_true",
+                            help="Alias for -automask.")
     mask_group.add_argument("-autoweight", action="store_true", default=True,
                             help="Weight by base intensity (default: on)")
     mask_group.add_argument("-noautoweight", action="store_true",

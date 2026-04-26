@@ -94,9 +94,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-twopass", action="store_true", help="Coarse blur + fine pass"
     )
     method_group.add_argument(
-        "-nochain",
+        "-no_chain",
+        dest="no_chain",
         action="store_true",
         help="Don't chain-initialize from previous volume",
+    )
+    method_group.add_argument(
+        "-nochain",
+        dest="no_chain",
+        action="store_true",
+        help="Alias for -no_chain.",
     )
     method_group.add_argument(
         "-automask", action="store_true", help="Use automask for weighting"
@@ -118,9 +125,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Fast mode: fixed iterations, no convergence check (runs exactly -maxiter)",
     )
     method_group.add_argument(
-        "-no-compile",
+        "-no_compile",
+        dest="no_compile",
         action="store_true",
         help="Disable torch.compile for hot path (default: compile on CUDA)",
+    )
+    method_group.add_argument(
+        "-no-compile",
+        dest="no_compile",
+        action="store_true",
+        help="Alias for -no_compile.",
     )
 
     # --- Interpolation ---
@@ -228,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
         max_iter=args.maxiter,
         twopass=args.twopass,
         blur_fwhm=args.blur,
-        chain_init=not args.nochain,
+        chain_init=not args.no_chain,
         automask=args.automask,
         weight_automask=args.weight_automask,
         dxy_thresh=args.dxy_thresh,

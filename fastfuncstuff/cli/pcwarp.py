@@ -66,8 +66,12 @@ def create_parser() -> argparse.ArgumentParser:
         help="Glob pattern for warp files [default: %(default)s].",
     )
     opt.add_argument(
-        "-output", default=None, metavar="PATH",
+        "-prefix", dest="output", default=None, metavar="PATH",
         help="Output .1D file path. Default: {warp_dir}/warpPCs.1D",
+    )
+    opt.add_argument(
+        "-output", dest="output", default=None, metavar="PATH",
+        help="Alias for -prefix.",
     )
     opt.add_argument(
         "-axes", default=None, metavar="XYZ",

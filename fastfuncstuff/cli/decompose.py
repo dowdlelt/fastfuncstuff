@@ -178,12 +178,19 @@ def parse_args():
         help="Minimum stability threshold for component selection (default: 0.7)",
     )
 
-    # Output
-    parser.add_argument(
-        "-output",
-        required=True,
+    # Output (canonical -prefix; -output is a silent alias)
+    out_group = parser.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        "-prefix",
+        dest="output",
         metavar="PREFIX",
         help="Output prefix for files (e.g., results/decomp)",
+    )
+    out_group.add_argument(
+        "-output",
+        dest="output",
+        metavar="PREFIX",
+        help="Alias for -prefix.",
     )
 
     # Advanced options
@@ -209,10 +216,16 @@ def parse_args():
         help="Random seed for reproducibility",
     )
 
-    parser.add_argument(
+    dev_group = parser.add_argument_group("Device")
+    dev_group.add_argument(
+        "-device",
+        default=None,
+        help="PyTorch device: cuda, mps, cpu (auto-detected by default)",
+    )
+    dev_group.add_argument(
         "-cpu",
         action="store_true",
-        help="Force CPU computation (default: use GPU if available)",
+        help="Alias for -device cpu.",
     )
 
     add_verbose_arg(parser, default=0)
@@ -267,9 +280,11 @@ def main():
     args.output = pfx.stem
     _nii_ext = pfx.nifti_ext
 
-    # Setup device
+    # Setup device (-cpu is an alias for -device cpu)
     if args.cpu:
         device = torch.device("cpu")
+    elif args.device is not None:
+        device = torch.device(args.device)
     else:
         device = get_device()
     configure_torch_backends(device)

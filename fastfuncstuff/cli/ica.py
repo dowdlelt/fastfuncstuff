@@ -2834,7 +2834,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     misc = parser.add_argument_group("Misc")
-    misc.add_argument("-cpu", action="store_true", help="Force CPU")
+    misc.add_argument(
+        "-device",
+        default=None,
+        help="PyTorch device: cuda, mps, cpu (auto-detected by default)",
+    )
+    misc.add_argument("-cpu", action="store_true", help="Alias for -device cpu.")
     add_verbose_arg(misc, default=0)
     misc.add_argument("-help", "--help", action="help")
 
@@ -2906,7 +2911,12 @@ def main() -> None:
         raise FileNotFoundError(f"-depth_mask file not found: {args.depth_mask}")
 
     args._n_runs_total = len(input_files)
-    device = torch.device("cpu") if args.cpu else get_device()
+    if args.cpu:
+        device = torch.device("cpu")
+    elif args.device is not None:
+        device = torch.device(args.device)
+    else:
+        device = get_device()
     configure_torch_backends(device)
 
     print_cli_header("ffs_ica.py", "Fast run-wise whole-brain ICA")
