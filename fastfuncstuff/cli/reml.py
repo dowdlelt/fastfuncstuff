@@ -652,9 +652,6 @@ Examples:
              "Example: 'TENT(0,15,6)' for 6 tent basis functions from 0-15s",
     )
 
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
-
     return parser
 
 
@@ -764,8 +761,8 @@ def main():
     # bare number), so we pull those out manually before parse_args().
     raw_argv = sys.argv[1:]
 
-    # Early help / no-args check (before parse_args can fail on grid values)
-    if not raw_argv or any(a in ("-help", "--help", "-h") for a in raw_argv):
+    # No-args shows help (argparse handles -h/--help itself)
+    if not raw_argv:
         parser = create_parser()
         parser.print_help()
         sys.exit(0)

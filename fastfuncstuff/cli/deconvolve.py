@@ -98,7 +98,6 @@ def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
         description="Fast fMRI deconvolution with FIR/TENT models",
-        add_help=False,
         formatter_class=_HelpFormatter,
     )
 
@@ -353,12 +352,6 @@ def parse_args():
         help="Print VRAM usage vs. prediction after each chunk loop (for memory tuning)",
     )
 
-    # Help
-    parser.add_argument(
-        "-help",
-        action="store_true",
-        help="Show this help message and exit",
-    )
 
     return parser
 
@@ -735,12 +728,6 @@ def _xval_tent_top(
 def main():
     """Main CLI entry point"""
     parser = parse_args()
-
-    # Check for help flag before parsing (to bypass required argument checks)
-    if "-help" in sys.argv or "--help" in sys.argv:
-        print_help(parser)
-        return 0
-
     args = parser.parse_args()
 
     pfx = parse_prefix(args.prefix)

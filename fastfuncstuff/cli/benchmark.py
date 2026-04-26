@@ -22,10 +22,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "-help", action="store_true",
-        help="Show this help message",
-    )
-    parser.add_argument(
         "-config", type=str, default=None, metavar="YAML",
         help="Path to benchmark config YAML. Defines dataset, subject, session, "
              "tasks, runs, stages, and stage-specific params. "
@@ -104,12 +100,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_verbose_arg(parser, default=0)
 
-    args = parser.parse_args(argv)
-
-    if args.help or len(sys.argv) == 1:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 
+    args = parser.parse_args(argv)
     return args
 
 

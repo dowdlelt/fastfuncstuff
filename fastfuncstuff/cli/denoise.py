@@ -87,7 +87,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="3dDenoisefast - Fast GPU-accelerated cross-validated denoising",
         formatter_class=_HelpFormatter,
-        add_help=False,  # We handle -help ourselves
         epilog="""
 Examples:
   # Basic denoising with automatic R² threshold
@@ -594,9 +593,6 @@ Notes:
         help="Number of bootstrap iterations for SE estimation (default: 0 = no bootstrapping). "
         "Recommended: 100-1000 for robust SE. Enables bootstrap-based SNR if -snr is also set.",
     )
-
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
 
     return parser
 
@@ -1470,8 +1466,7 @@ def save_model_fit_outputs(
 def main():
     parser = create_parser()
 
-    # Check for help
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 

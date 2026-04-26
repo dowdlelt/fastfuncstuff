@@ -88,7 +88,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="ffs_denoisatorial - Combinatorial PC Denoising",
         formatter_class=_HelpFormatter,
-        add_help=False,
         epilog="""
 Examples:
   # Basic combinatorial denoising (7 PCs, 128 combinations)
@@ -340,9 +339,6 @@ Notes:
         help="Save noise PCs: 'no', 'timecourse' (default: selected PCs as txt), 'both' (.pt + txt)",
     )
 
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
-
     return parser
 
 
@@ -543,8 +539,8 @@ def save_combinatorial_results(
 def main():
     parser = create_parser()
 
-    # Check for help
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    # Show help and exit when called with no args (argparse's -h/--help is fine)
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 

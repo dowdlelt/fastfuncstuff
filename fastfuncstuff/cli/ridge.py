@@ -83,7 +83,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="3dRidgefast - GPU-accelerated ridge regression with single-trial estimation",
         formatter_class=_HelpFormatter,
-        add_help=False,
         epilog="""
 Examples:
   # Basic single-trial ridge regression
@@ -341,26 +340,12 @@ Notes:
         "Violation locations are saved to {prefix}_scale_violations.nii.gz",
     )
 
-    # Help
-    help_group = parser.add_argument_group("Help")
-    help_group.add_argument(
-        "-help",
-        action="store_true",
-        help="Show this help message and exit",
-    )
-
     return parser
 
 
 def main():
     """Main entry point"""
     parser = create_parser()
-
-    # Handle -help flag
-    if "-help" in sys.argv:
-        parser.print_help()
-        sys.exit(0)
-
     args = parser.parse_args()
 
     pfx = parse_prefix(args.prefix)

@@ -40,7 +40,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract temporal PCs from ffs_qwarp warp displacement files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        add_help=False,
         epilog=(
             "Examples:\n"
             "  ffs_util_pcwarp -warp_dir sub01_warps -n_pcs 5\n"
@@ -84,9 +83,6 @@ def create_parser() -> argparse.ArgumentParser:
         help="Torch device for PCA computation [default: %(default)s].",
     )
     add_verbose_arg(opt, default=1)
-
-    hlp = parser.add_argument_group("Help")
-    hlp.add_argument("-help", action="store_true", help="Show this help and exit.")
 
     return parser
 
@@ -146,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if argv is None:
         argv = sys.argv[1:]
-    if not argv or "-help" in argv:
+    if not argv:
         parser.print_help()
         return 0
 

@@ -2412,7 +2412,6 @@ def build_parser() -> argparse.ArgumentParser:
     """Build and return the ffs_ica command-line argument parser."""
     parser = argparse.ArgumentParser(
         description="Run-wise whole-brain ICA demo / sanity-check pipeline",
-        add_help=False,
         formatter_class=_HelpFormatter,
     )
 
@@ -2841,7 +2840,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     misc.add_argument("-cpu", action="store_true", help="Alias for -device cpu.")
     add_verbose_arg(misc, default=0)
-    misc.add_argument("-help", "--help", action="help")
 
     return parser
 

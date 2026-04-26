@@ -177,11 +177,6 @@ def parse_n_knots(n_knots_args, n_conditions):
 
 
 def main():
-    # Check for -help before parsing (so it works without required args)
-    if '-help' in sys.argv:
-        sys.argv.remove('-help')
-        sys.argv.append('--help')
-
     class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
         """Show defaults while preserving raw description formatting."""
 

@@ -153,7 +153,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="ffs_pathfinder - Joint HRF + Denoising Optimization",
         formatter_class=_HelpFormatter,
-        add_help=False,
         epilog="""
 Examples:
   # Basic joint optimization
@@ -403,8 +402,6 @@ Notes:
         help="Save denoised xval R² for ALL HRFs (4D volume)",
     )
 
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
 
     return parser
 
@@ -1310,7 +1307,7 @@ def save_pathfinder_results(
 def main():
     parser = create_parser()
 
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 

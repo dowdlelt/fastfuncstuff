@@ -66,7 +66,6 @@ class _HelpFormatter(
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Phase regression for macrovascular BOLD suppression",
-        add_help=False,
         formatter_class=_HelpFormatter,
     )
 
@@ -182,21 +181,12 @@ def create_parser() -> argparse.ArgumentParser:
     out = parser.add_argument_group("Output Options")
     add_verbose_arg(out, default=0)
 
-    parser.add_argument("-help", action="store_true",
-                        help="Show this help message and exit.")
-
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for ffs_phasereg."""
     parser = create_parser()
-
-    if "-help" in (argv or sys.argv):
-        print(__doc__)
-        parser.print_help()
-        return 0
-
     args = parser.parse_args(argv)
 
     # ── Imports ──────────────────────────────────────────────────────────

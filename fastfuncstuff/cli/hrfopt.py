@@ -79,7 +79,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="3dHRFoptfast - Fast GPU-accelerated cross-validated HRF optimization",
         formatter_class=_HelpFormatter,
-        add_help=False,  # We handle -help ourselves to avoid required arg check
         epilog="""
 Examples:
   # Basic HRF optimization with library of HRF variants
@@ -460,9 +459,6 @@ Notes:
         help="Save design matrix and HRF library plots as PNG images.",
     )
 
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
-
     return parser
 
 
@@ -525,7 +521,7 @@ def main():
     parser = create_parser()
 
     # Check for help BEFORE parse_args to avoid required argument errors
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 
@@ -537,7 +533,7 @@ def main():
 
     # Debug implies verbose
     if args.debug:
-        args.verb >= 1 = True
+        args.verb = max(args.verb, 1)
 
     print_header(args)
 
