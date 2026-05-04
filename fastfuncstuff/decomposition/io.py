@@ -69,6 +69,126 @@ def save_masked_component_map_3d(
     return out_path
 
 
+def save_psc_zstat_bucket(
+    components_kv: np.ndarray,
+    z_maps_kv: np.ndarray,
+    mixing_tk: np.ndarray,
+    mean3d: np.ndarray,
+    mask3d: np.ndarray | None,
+    shape3d: tuple[int, int, int],
+    affine: np.ndarray,
+    out_file: str | Path,
+    psc_clip: float = 50.0,
+) -> Path:
+    """Save AFNI-style interleaved PSC + Z-stat bucket.
+
+    For each component k, two sub-bricks are written:
+        2k   : PSC map  (% signal change at +1 σ of the component's timecourse)
+        2k+1 : Z-stat   (mixture-model Z, sub-brick typed FIZT)
+
+    PSC formula: PSC[k, v] = 100 * std_t(mixing[:, k]) * components[k, v] / mean[v]
+    (zero where |mean| < eps; absolute |PSC| capped at ``psc_clip`` to control
+    color-scale outliers from low-mean voxels — typical brain values are <5%).
+
+    AFNI sub-brick labels and Z stat-aux are applied via ``3drefit`` if it is
+    on PATH; otherwise a plain text labels file is written next to the NIfTI.
+    """
+    import shutil
+    import subprocess
+
+    k, n_vox = components_kv.shape
+    if z_maps_kv.shape != components_kv.shape:
+        raise ValueError(
+            f"z_maps shape {z_maps_kv.shape} != components shape {components_kv.shape}"
+        )
+    if mixing_tk.shape[1] != k:
+        raise ValueError(
+            f"mixing has {mixing_tk.shape[1]} components, expected {k}"
+        )
+
+    # PSC: per-voxel amplitude as % of voxel mean. Use std across time for the
+    # mixing column to give the component's natural amplitude scale.
+    mix_std = np.asarray(mixing_tk, dtype=np.float64).std(axis=0)  # (k,)
+    comp = np.asarray(components_kv, dtype=np.float64)             # (k, V)
+    flat_mean = np.asarray(mean3d, dtype=np.float64).reshape(-1)
+    if mask3d is not None:
+        flat_mask = mask3d.reshape(-1).astype(bool)
+        masked_mean = flat_mean[flat_mask]
+    else:
+        masked_mean = flat_mean
+    if masked_mean.shape[0] != n_vox:
+        raise ValueError(
+            f"mean voxel count {masked_mean.shape[0]} != component voxels {n_vox}"
+        )
+    eps = max(1e-6, 1e-3 * float(np.median(np.abs(masked_mean[masked_mean > 0])) or 1.0))
+    safe_mean = np.where(np.abs(masked_mean) < eps, 1.0, masked_mean)
+    psc_kv = (100.0 * mix_std[:, None] * comp / safe_mean[None, :]).astype(np.float32)
+    psc_kv[:, np.abs(masked_mean) < eps] = 0.0
+    if psc_clip > 0:
+        np.clip(psc_kv, -float(psc_clip), float(psc_clip), out=psc_kv)
+
+    # Build interleaved (X, Y, Z, 2k) volume.
+    out = np.zeros((*shape3d, 2 * k), dtype=np.float32)
+    if mask3d is None:
+        if int(np.prod(shape3d)) != n_vox:
+            raise ValueError("Component size does not match full volume size")
+        for i in range(k):
+            out[..., 2 * i] = psc_kv[i].reshape(shape3d)
+            out[..., 2 * i + 1] = z_maps_kv[i].astype(np.float32).reshape(shape3d)
+    else:
+        flat_mask = mask3d.reshape(-1).astype(bool)
+        for i in range(k):
+            psc_vol = np.zeros(flat_mask.shape[0], dtype=np.float32)
+            z_vol = np.zeros(flat_mask.shape[0], dtype=np.float32)
+            psc_vol[flat_mask] = psc_kv[i]
+            z_vol[flat_mask] = z_maps_kv[i].astype(np.float32)
+            out[..., 2 * i] = psc_vol.reshape(shape3d)
+            out[..., 2 * i + 1] = z_vol.reshape(shape3d)
+
+    out_path = Path(out_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write uncompressed first so 3drefit can edit, then compress at end.
+    out_str = str(out_path)
+    if out_str.endswith(".nii.gz"):
+        tmp_path = Path(out_str[: -len(".nii.gz")] + ".nii")
+    else:
+        tmp_path = out_path
+    save_nifti(out, output_path=tmp_path, affine=affine)
+
+    sub_labels = []
+    for i in range(k):
+        sub_labels.append(f"IC{i + 1:03d}_PSC")
+        sub_labels.append(f"IC{i + 1:03d}_Z")
+
+    has_3drefit = shutil.which("3drefit") is not None
+    if has_3drefit:
+        cmd = ["3drefit"]
+        for i, lab in enumerate(sub_labels):
+            cmd.extend(["-sublabel", str(i), lab])
+        # Mark every odd sub-brick as Z stat (FIZT, no params).
+        for i in range(k):
+            cmd.extend(["-substatpar", str(2 * i + 1), "fizt"])
+        cmd.append(str(tmp_path))
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"  WARN: 3drefit failed on PSC bucket: {e.stderr.decode(errors='replace')[-300:]}")
+    else:
+        labels_txt = tmp_path.with_suffix("")
+        labels_txt = Path(str(labels_txt) + "_labels.txt")
+        with labels_txt.open("w") as f:
+            for i, lab in enumerate(sub_labels):
+                f.write(f"{i}\t{lab}\n")
+
+    # Compress to .nii.gz if the requested name asked for it.
+    if tmp_path != out_path:
+        from fastfuncstuff.io.afni import compress_nifti
+        compress_nifti(str(tmp_path), str(out_path), remove_original=True)
+
+    return out_path
+
+
 def safe_relative_symlink(target: str | Path, link_path: str | Path) -> Path:
     """Create/replace symlink at link_path pointing to target via relative path."""
     target_path = Path(target)

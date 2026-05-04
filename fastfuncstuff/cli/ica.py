@@ -903,6 +903,26 @@ def _run_single_ica(
             )
         _vprint(args.verb >= 1, "Z-maps and signal-prob maps saved")
 
+    # PSC + Z bucket (AFNI-style interleaved): per-component PSC + FIZT Z.
+    if getattr(args, "psc_bucket", False):
+        if z_maps is None:
+            print("  WARN: -psc_bucket requires mixture-model z-maps; skipping (re-enable with -save_mixture_z)")
+        else:
+            t_step = time.time()
+            psc_path = Path(f"{out_prefix}_{run_tag}_ica_psc_z_bucket{nii_ext}")
+            decomposition_io.save_psc_zstat_bucket(
+                components_kv=comp_np,
+                z_maps_kv=z_maps,
+                mixing_tk=mixing_np,
+                mean3d=mean3d,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
+                out_file=psc_path,
+                psc_clip=float(args.psc_clip),
+            )
+            _vprint(args.verb >= 1, f"PSC+Z bucket: {psc_path}", t_step)
+
     # --- Good/Bad guidance scoring (spatial + temporal) ---
     guidance_scores = ica_workflow.compute_guidance_scores(
         comp_np=comp_np,
@@ -1873,6 +1893,26 @@ def _run_concat_ica(
                 out_file=Path(fname),
             )
         _vprint(args.verb >= 1, "Z-maps and signal-prob maps saved", t_step)
+
+    # PSC + Z bucket (AFNI-style interleaved). Only available alongside z-maps.
+    if getattr(args, "psc_bucket", False):
+        if z_maps is None:
+            print("  WARN: -psc_bucket requires mixture-model z-maps; skipping (re-enable with -save_mixture_z)")
+        else:
+            t_step = time.time()
+            psc_path = Path(f"{out_prefix}_concat_ica_psc_z_bucket{nii_ext}")
+            decomposition_io.save_psc_zstat_bucket(
+                components_kv=comp_np,
+                z_maps_kv=z_maps,
+                mixing_tk=mixing_np,
+                mean3d=mean3d,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
+                out_file=psc_path,
+                psc_clip=float(args.psc_clip),
+            )
+            _vprint(args.verb >= 1, f"PSC+Z bucket: {psc_path}", t_step)
 
     # MELODIC compat
     if args.melodic_compat:
@@ -2881,6 +2921,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help="Mixture-model posterior threshold for thresholded z-maps (default: 0.5, MELODIC style)",
+    )
+    out.add_argument(
+        "-psc_bucket",
+        action="store_true",
+        default=False,
+        help=(
+            "Write an AFNI-style 4D bucket interleaving per-component PSC and "
+            "Z-stat sub-bricks ([PSC1, Z1, PSC2, Z2, ...]). Z bricks are "
+            "labeled FIZT for AFNI thresholding. Requires mixture-model z-maps "
+            "(implies -save_mixture_z)."
+        ),
+    )
+    out.add_argument(
+        "-psc_clip",
+        type=float,
+        default=50.0,
+        help=(
+            "Clip absolute PSC values to this magnitude before writing the "
+            "bucket (default: 50%%). Prevents low-mean voxels from blowing up "
+            "the color scale. Set <=0 to disable clipping."
+        ),
     )
     out.add_argument(
         "-melodic_compat",
