@@ -99,3 +99,6 @@ test_data/**/afni_*.nii.gz
 *.temp
 *.log
 .coverage
+
+# Wiki (lives at ~/Dropbox/Resources/code/fmri_wiki; never track here)
+wiki/
