@@ -351,6 +351,7 @@ def analyze_from_onsets(
             b_grid=arma_b_grid,
             device=device,
             enable_quick_estimate=enable_quick_estimate,
+            run_starts=run_starts,
         )
 
     else:
@@ -1038,6 +1039,11 @@ def analyze_from_design_matrix(
             spatial_metadata=spatial_metadata if spatial_metadata else None,
             legacy_contrasts=legacy_contrasts,
             save_profile_likelihoods=save_profile_likelihoods,
+            run_starts=(
+                actual_run_starts
+                if "actual_run_starts" in locals()
+                else design_info.get("run_starts", None)
+            ),
         )
 
     else:

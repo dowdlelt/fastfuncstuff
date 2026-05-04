@@ -304,10 +304,10 @@ Examples:
              -Rbuck stats_REML -single_trials movie
   # Creates: ols_movie_single.nii.gz, reml_movie_single.nii.gz
 
-  # Custom ARMA grid with double precision
+  # Wider ARMA grid (default matches AFNI: a in [0,0.8], b in [-0.8,0.8])
   ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -use_double \\
-             -a_grid 0.0,0.9,10 -b_grid -0.8,0.8,17
+             -a_grid 0:0.9:10 -b_grid -0.9:0.9:19
 
   # Manual batch size control (for memory tuning)
   ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
@@ -435,19 +435,25 @@ Examples:
     arma_opts.add_argument(
         "-a_grid",
         help=(
-            "AR parameter grid. Three formats accepted:\n"
-            "  start:stop:num  — linspace, e.g.  0.025:0.9:32  (recommended; handles negatives)\n"
+            "AR parameter grid. Default matches AFNI 3dREMLfit:\n"
+            "  0:0.8:9  (i.e. [0.0, 0.1, ..., 0.8], step=0.1, MAXa=0.8)\n"
+            "Three formats accepted:\n"
+            "  start:stop:num  — linspace, e.g.  0:0.9:10  (widen MAXa to 0.9)\n"
             "  v1,v2,...       — explicit list, e.g.  0.1,0.3,0.5,0.7,0.9\n"
-            "  start,stop,num  — legacy linspace, e.g.  0.025,0.9,32"
+            "  start,stop,num  — legacy linspace, e.g.  0,0.9,10\n"
+            "Absolute upper bound is 0.9 (ARMA(1,1) is degenerate above)."
         ),
     )
     arma_opts.add_argument(
         "-b_grid",
         help=(
-            "MA parameter grid. Three formats accepted:\n"
-            "  start:stop:num  — linspace, e.g.  -0.9:0.9:65  (recommended; handles negatives)\n"
+            "MA parameter grid. Default matches AFNI 3dREMLfit:\n"
+            "  -0.8:0.8:17  (i.e. [-0.8, -0.7, ..., 0.7, 0.8], step=0.1, MAXb=0.8)\n"
+            "Three formats accepted:\n"
+            "  start:stop:num  — linspace, e.g.  -0.9:0.9:19  (widen MAXb to 0.9)\n"
             "  v1,v2,...       — explicit list, e.g.  -0.5,-0.2,0.0,0.2,0.5\n"
-            "  start,stop,num  — legacy linspace, e.g.  -0.9,0.9,65"
+            "  start,stop,num  — legacy linspace, e.g.  -0.9,0.9,19\n"
+            "Absolute upper bound is 0.9 (ARMA(1,1) is degenerate above)."
         ),
     )
     arma_opts.add_argument(
