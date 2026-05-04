@@ -237,86 +237,81 @@ def _compare_subspace(mel_dir: Path, trace_dir: Path) -> dict:
 
 
 def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
-    """Recover MELODIC's noise_std map from concat_data and compare to FFS's.
+    """Compare post-varnorm data between FFS and MELODIC using only saved outputs.
 
-    Strategy: MELODIC's concat_data.nii.gz is the post-varnorm (T_migp, V) matrix.
-    FFS dumps migp_pre_varnorm.npy (T_migp, V) before applying its varnorm.
-    If MIGP outputs match, then mel_noise_std[v] = pre[t,v] / mel_post[t,v]
-    is constant in t and recovers MELODIC's noise_std per voxel.
+    Uses MELODIC's concat_data.nii.gz (ground truth) and FFS's
+    migp_post_varnorm.npy. Reports:
+      - Per-voxel temporal r (column-wise Pearson between the two (T,V) matrices)
+      - Post-varnorm eigenvalue spectrum correlation (covariance structure match)
+      - Per-voxel stdev ratio (both should normalize to ~unit variance)
 
-    Reports:
-      - migp_match_r        : pearson(pre_ffs, mel_post * recovered_std)
-                              (sanity: ~1.0 if MIGP outputs truly match)
-      - global_scale_ratio  : median(ffs_noise_std / mel_noise_std)
-                              (≈1 if same units; far from 1 → scaling bug)
-      - per_voxel_r         : pearson(ffs_noise_std, mel_noise_std)
-                              (~1 if same algorithm, different scale; <1 if algo differs)
-      - max_relative_diff   : max |ffs - mel| / mel  (after global scale correction)
+    Note: per-voxel temporal r can be low (~0) even when the subspace matches
+    perfectly (cos=1.0 in _compare_subspace). Varnorm's thresholding step
+    (|whitened| < 2.3 → zero) is discontinuous: tiny numerical differences in
+    the MIGP output propagate through eigendecomposition → different threshold
+    patterns → different noise_std → different post-varnorm temporal patterns.
+    The subspace-level comparison is the correct metric for pipeline correctness.
     """
-    pre_p = trace_dir / "migp_pre_varnorm.npy"
+    post_p = trace_dir / "migp_post_varnorm.npy"
     mel_post_p = mel_dir / "concat_data.nii.gz"
     mask_p = trace_dir / "mask.nii.gz"
     ffs_std_p = trace_dir / "ffs_noise_std.npy"
-    if not pre_p.exists() or not mel_post_p.exists() or not ffs_std_p.exists():
-        return {"error": f"missing inputs: pre={pre_p.exists()} mel_post={mel_post_p.exists()} ffs_std={ffs_std_p.exists()}"}
+    missing = [n for n, p in [("post", post_p), ("mel_post", mel_post_p),
+                               ("ffs_std", ffs_std_p)]
+               if not p.exists()]
+    if missing:
+        return {"error": f"missing: {', '.join(missing)}"}
 
     import nibabel as nib
 
-    pre = np.load(pre_p).astype(np.float64)        # (T, V) FFS pre-varnorm
-    ffs_std = np.load(ffs_std_p).astype(np.float64)  # (V,)
-    mel_img = nib.load(str(mel_post_p))
-    mel_4d = mel_img.get_fdata(dtype=np.float32)   # (X,Y,Z,T)
+    ffs_post = np.load(post_p).astype(np.float64)
+    ffs_std = np.load(ffs_std_p).astype(np.float64)
+    mel_4d = nib.load(str(mel_post_p)).get_fdata(dtype=np.float32)
     if mel_4d.ndim != 4:
         return {"error": f"mel concat_data not 4D: shape={mel_4d.shape}"}
     if not mask_p.exists():
-        # Fall back to MELODIC's mask
         mask_p = mel_dir / "mask.nii.gz"
     mask = nib.load(str(mask_p)).get_fdata() > 0.5
-    mel_post = mel_4d[mask].astype(np.float64).T   # (T, V_masked)
+    mel_post = mel_4d[mask].astype(np.float64).T
 
-    if mel_post.shape != pre.shape:
-        return {
-            "error": f"shape mismatch: ffs_pre={pre.shape}, mel_post={mel_post.shape}",
-        }
+    if mel_post.shape != ffs_post.shape:
+        return {"error": f"shape mismatch: ffs={ffs_post.shape} mel={mel_post.shape}"}
 
-    # Recover MELODIC's noise_std per voxel: ratio = pre / mel_post (should be
-    # constant across t per voxel). Use a robust per-voxel estimate via
-    # least-squares fit through origin: std = (pre . mel_post) / (mel_post . mel_post).
-    num = (pre * mel_post).sum(axis=0)
-    den = (mel_post * mel_post).sum(axis=0)
-    valid = (den > 1e-12) & (np.abs(num) > 1e-12) & (ffs_std > 1e-12)
-    mel_std = np.full_like(ffs_std, np.nan)
-    mel_std[valid] = num[valid] / den[valid]
+    T, V = ffs_post.shape
 
-    # Sanity: how well does mel_post * mel_std reconstruct pre?
-    recon = mel_post * mel_std[None, :]
-    a = pre[:, valid].ravel()
-    b = recon[:, valid].ravel()
-    a_c = a - a.mean()
-    b_c = b - b.mean()
-    denom = float(np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum()))
-    migp_r = float((a_c * b_c).sum() / denom) if denom > 0 else 0.0
+    # Per-voxel temporal r
+    sample_size = min(V, 10000)
+    sample = np.random.choice(V, sample_size, replace=False)
+    corrs = np.array([
+        _pearson_r(ffs_post[:, v], mel_post[:, v])
+        for v in sample
+    ])
+    corrs = corrs[np.isfinite(corrs)]
 
-    ratio = ffs_std[valid] / mel_std[valid]
-    finite = np.isfinite(ratio) & (ratio > 0)
-    median_ratio = float(np.median(ratio[finite]))
+    # Post-varnorm eigenvalue spectrum comparison (ground truth)
+    def _topk_evals(X, k=50):
+        rm = X.mean(axis=1, keepdims=True)
+        C = (X @ X.T - V * (rm @ rm.T)) / float(V)
+        return np.sort(np.linalg.eigvalsh(C))[::-1][:k]
 
-    # After applying the median global ratio, look at remaining per-voxel disagreement.
-    ffs_std_corr = ffs_std[valid] / max(median_ratio, 1e-12)
-    rel = np.abs(ffs_std_corr - mel_std[valid]) / np.maximum(np.abs(mel_std[valid]), 1e-12)
-    rel_finite = rel[np.isfinite(rel)]
+    ffs_evals = _topk_evals(ffs_post)
+    mel_evals = _topk_evals(mel_post)
+    eig_r = _pearson_r(ffs_evals, mel_evals)
 
-    pvr = _pearson_r(ffs_std[valid], mel_std[valid])
+    # Per-voxel stdev (both should be ~1 after varnorm)
+    ffs_vox_std = np.std(ffs_post, axis=0)
+    mel_vox_std = np.std(mel_post, axis=0)
 
     return {
-        "n_voxels": int(valid.sum()),
-        "migp_match_r": migp_r,
-        "global_scale_ratio_ffs_over_mel": median_ratio,
-        "per_voxel_std_r": pvr,
-        "max_relative_diff_after_scale": float(rel_finite.max()) if rel_finite.size else float("nan"),
-        "median_relative_diff_after_scale": float(np.median(rel_finite)) if rel_finite.size else float("nan"),
-        "ffs_std_median": float(np.median(ffs_std[valid])),
-        "mel_std_median": float(np.median(mel_std[valid])),
+        "voxels": V,
+        "post_vn_mean_r": float(corrs.mean()),
+        "post_vn_min_r": float(corrs.min()),
+        "post_vn_n_above_099": int((corrs > 0.99).sum()),
+        "post_vn_n_above_095": int((corrs > 0.95).sum()),
+        "post_vn_eig_r": eig_r,
+        "ffs_vox_std_mean": float(ffs_vox_std.mean()),
+        "mel_vox_std_mean": float(mel_vox_std.mean()),
+        "ffs_noise_std_median": float(np.median(ffs_std)),
     }
 
 

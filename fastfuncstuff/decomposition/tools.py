@@ -372,8 +372,10 @@ def compute_melodic_varnorm_map(
     dim = min(30, max(1, n_time - 1)) if pca_dim is None else int(pca_dim)
     dim = max(1, min(dim, n_time - 1))
 
-    row_mean = x_t.mean(dim=1, keepdim=True)
-    corr_t = (x_t @ x_t.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
+    orig_dtype = x_t.dtype
+    d64 = x_t.to(torch.float64)
+    row_mean = d64.mean(dim=1, keepdim=True)
+    corr_t = (d64 @ d64.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
     evals, evecs = torch.linalg.eigh(corr_t)
     del corr_t
     order = torch.argsort(evals, descending=True)
@@ -382,8 +384,10 @@ def compute_melodic_varnorm_map(
     sqrt_evals = torch.sqrt(evals)
     white = (evecs / sqrt_evals.unsqueeze(0)).T
     dewhite = evecs * sqrt_evals.unsqueeze(0)
+    del d64, evals, evecs, sqrt_evals
 
-    ws = white @ x_t
+    x_t_f = x_t.to(torch.float32) if orig_dtype != torch.float64 else x_t
+    ws = white.to(orig_dtype) @ x_t_f
     ws = torch.where(torch.abs(ws) < float(level), torch.zeros_like(ws), ws)
 
     from fastfuncstuff.memory import estimate_chunk_size
@@ -395,11 +399,12 @@ def compute_melodic_varnorm_map(
         device=x_t.device,
         operation="ica_varnorm",
     )
-    noise_std = torch.empty(n_vox, device=x_t.device)
-    input_std = torch.std(x_t, dim=0, unbiased=True)
+    noise_std = torch.empty(n_vox, device=x_t.device, dtype=orig_dtype)
+    input_std = torch.std(x_t_f, dim=0, unbiased=True)
+    dewhite_f = dewhite.to(orig_dtype)
     for v0 in range(0, n_vox, chunk_size):
         v1 = min(v0 + chunk_size, n_vox)
-        resid_chunk = x_t[:, v0:v1] - (dewhite @ ws[:, v0:v1])
+        resid_chunk = x_t_f[:, v0:v1] - (dewhite_f @ ws[:, v0:v1])
         noise_std[v0:v1] = torch.std(resid_chunk, dim=0, unbiased=True)
         del resid_chunk
 
