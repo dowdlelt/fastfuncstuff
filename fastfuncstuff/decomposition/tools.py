@@ -1208,7 +1208,7 @@ def _gauss_pdf_torch(x: torch.Tensor, mean: torch.Tensor, var: torch.Tensor) -> 
 def batch_fit_ggm(
     components_kv: torch.Tensor,
     n_iter: int = 200,
-    min_mode_offset: float = 0.5,
+    min_mode_offset: float = 0.001,
     verbose: bool = False,
 ) -> dict:
     """Fit GGM to ALL ICA spatial maps simultaneously on GPU.
@@ -1216,29 +1216,38 @@ def batch_fit_ggm(
     This is the batched PyTorch equivalent of fit_ggm — processes K
     components × V voxels in parallel.
 
+    Parameters match MELODIC's `ggmix.cc`: input is z-scored per component,
+    Gamma mean/variance constraints use MELODIC's adaptive `const2` formula,
+    and components with pi_noise<0.4 fall back to a 3-Gaussian mixture.
+
     Parameters
     ----------
     components_kv : Tensor of shape (K, V)
-        Raw ICA spatial map values.
+        Raw ICA spatial map values (will be z-scored internally).
     n_iter : int
         Maximum EM iterations.
     min_mode_offset : float
-        Minimum separation between noise mean and signal mode.
+        Lower floor on Gamma means (MELODIC uses 0.001 in normalized space).
     verbose : bool
         Show tqdm progress bar over EM iterations.
 
     Returns
     -------
     result : dict with Tensor values, each of shape (K,) or (K, V).
+        Note: mu/var fields are in z-scored (per-component) space; z_signed
+        and p_signal are scale-invariant.
     """
     device = components_kv.device
     K, V = components_kv.shape
     # Keep x in float32: the dominant (K, V) tensor costs 2× VRAM in float64.
-    # Linear-space EM in float32 is safe: exp() underflows to 0 for outlier
-    # voxels (|x-mu| > ~13σ in float32), which total.clamp(min=1e-32) handles
-    # correctly — those voxels get equal responsibilities, i.e. they're excluded.
-    x = components_kv.float()  # (K, V) — the key VRAM saving
+    x_raw = components_kv.float()  # (K, V)
     n = float(V)
+
+    # ----- I1: per-component z-score (matches MELODIC ggmix::setup) -----
+    data_mean = x_raw.mean(dim=1, keepdim=True)  # (K, 1)
+    data_std = x_raw.std(dim=1, unbiased=False, keepdim=True).clamp(min=1e-8)
+    x = (x_raw - data_mean) / data_std
+    del x_raw
 
     # ----- Initialization -----
     # Noise Gaussian: median and 25% of variance per component
@@ -1310,27 +1319,36 @@ def batch_fit_ggm(
         new_mu_n = (r_noise * x).sum(dim=1, keepdim=True) / w_n
         new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-8)
 
+        # I2: MELODIC adaptive floor — const2 = (2.6 - pi_n)*sqrt(var_n) ± mu_n
+        sqrt_var_n = torch.sqrt(new_var_n)
+        new_pi_n_now = (w_n / n).clamp(1e-4, 1 - 2e-4)
+
         # Positive Gamma
         x_pos_w = x.clamp(min=0)  # avoid torch.zeros_like allocation
         x_pos_cnt = (r_pos * (x > 0).float()).sum(dim=1, keepdim=True).clamp(min=1e-8)
         mu_p_cand = (r_pos * x_pos_w).sum(dim=1, keepdim=True) / x_pos_cnt
-        floor_p = (1.5 * new_mu_n + torch.sqrt(new_var_n)).clamp(min=min_mode_offset)
+        const2_p = (2.6 - new_pi_n_now) * sqrt_var_n + new_mu_n
+        var_p_cand = ((r_pos * (x - mu_p_cand) ** 2).sum(dim=1, keepdim=True) / w_p).clamp(min=1e-4)
+        floor_p = (
+            0.5 * (const2_p + torch.sqrt(const2_p**2 + 4.0 * var_p_cand))
+        ).clamp(min=min_mode_offset)
         new_mu_p = torch.maximum(mu_p_cand, floor_p)
-        new_var_p = ((r_pos * (x - new_mu_p) ** 2).sum(dim=1, keepdim=True) / w_p).clamp(min=1e-8)
+        # I3: variance upper bound var ≤ 0.5·mu²
+        new_var_p = torch.minimum(var_p_cand, 0.5 * new_mu_p**2).clamp(min=1e-4)
 
-        # Negative Gamma
-        x_neg_w = neg_x.clamp(min=0)  # avoid torch.zeros_like allocation
+        # Negative Gamma (mu_ng stored as positive |mean| for -x)
+        x_neg_w = neg_x.clamp(min=0)
         x_neg_cnt = (r_neg * (neg_x > 0).float()).sum(dim=1, keepdim=True).clamp(min=1e-8)
         mu_ng_cand = (r_neg * x_neg_w).sum(dim=1, keepdim=True) / x_neg_cnt
-        floor_ng = torch.where(
-            new_mu_n < 0,
-            (-1.5 * new_mu_n + torch.sqrt(new_var_n)).clamp(min=min_mode_offset),
-            torch.sqrt(new_var_n).clamp(min=min_mode_offset),
+        const2_ng = (2.6 - new_pi_n_now) * sqrt_var_n - new_mu_n
+        var_ng_cand = ((r_neg * (neg_x - mu_ng_cand) ** 2).sum(dim=1, keepdim=True) / w_ng).clamp(
+            min=1e-4
         )
+        floor_ng = (
+            0.5 * (const2_ng + torch.sqrt(const2_ng**2 + 4.0 * var_ng_cand))
+        ).clamp(min=min_mode_offset)
         new_mu_ng = torch.maximum(mu_ng_cand, floor_ng)
-        new_var_ng = ((r_neg * (neg_x - new_mu_ng) ** 2).sum(dim=1, keepdim=True) / w_ng).clamp(
-            min=1e-8
-        )
+        new_var_ng = torch.minimum(var_ng_cand, 0.5 * new_mu_ng**2).clamp(min=1e-4)
 
         # Proportions
         new_pi_n = (w_n / n).clamp(1e-4, 1 - 2e-4)
@@ -1358,20 +1376,59 @@ def batch_fit_ggm(
     if x.device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Final posterior — compute sequentially to minimize peak memory
+    # I4: GMM fallback for high-signal components (pi_noise < 0.4) ---------
+    # MELODIC switches to a 3-Gaussian mixture when the noise proportion is
+    # small, since a noise-Gaussian + signal-Gammas model is inappropriate
+    # for near-uniform distributions.
+    fb_mask = (pi_n.squeeze(1) < 0.4)  # (K,)
+    if fb_mask.any():
+        fb_idx = fb_mask.nonzero(as_tuple=True)[0]
+        gmm = _batch_gmm_3comp(x[fb_idx], n_iter=n_iter)
+        # Overwrite GGM params with GMM means/vars/props for these components.
+        # In GMM mode we keep the same field names but mu_pos/mu_neg now hold
+        # Gaussian means (positive and negative tails); var_pos/var_neg hold
+        # their variances. p_signal is computed as (g_pos + g_neg) / total.
+        idx2 = fb_idx.unsqueeze(1)
+        mu_n.index_copy_(0, fb_idx, gmm["mu1"])
+        var_n.index_copy_(0, fb_idx, gmm["var1"])
+        mu_p.index_copy_(0, fb_idx, gmm["mu2"])
+        var_p.index_copy_(0, fb_idx, gmm["var2"])
+        mu_ng.index_copy_(0, fb_idx, gmm["mu3"])
+        var_ng.index_copy_(0, fb_idx, gmm["var3"])
+        pi_n.index_copy_(0, fb_idx, gmm["pi1"])
+        pi_p.index_copy_(0, fb_idx, gmm["pi2"])
+        pi_ng.index_copy_(0, fb_idx, gmm["pi3"])
+        del idx2
+
+    # Final posterior — compute sequentially to minimize peak memory.
+    # GGM components: gauss(noise) + gamma(pos) + gamma(neg).
+    # GMM components: gauss(noise) + gauss(pos) + gauss(neg) — mu_ng holds a
+    # *negative* Gaussian mean directly (as set by _batch_gmm_3comp).
     p_noise_f = pi_n * _gauss_pdf_torch(x, mu_n, var_n)
-    p_pos_f = pi_p * _gamma_pdf_torch(x, mu_p, var_p)
-    p_neg_f = pi_ng * _gamma_pdf_torch(neg_x, mu_ng, var_ng)
+    if fb_mask.any():
+        # Per-component selection of Gamma vs Gaussian for the signal components.
+        gamma_pos = pi_p * _gamma_pdf_torch(x, mu_p, var_p)
+        gauss_pos = pi_p * _gauss_pdf_torch(x, mu_p, var_p)
+        fb2 = fb_mask.unsqueeze(1)
+        p_pos_f = torch.where(fb2, gauss_pos, gamma_pos)
+        del gamma_pos, gauss_pos
+        gamma_neg = pi_ng * _gamma_pdf_torch(neg_x, mu_ng, var_ng)
+        gauss_neg = pi_ng * _gauss_pdf_torch(x, mu_ng, var_ng)
+        p_neg_f = torch.where(fb2, gauss_neg, gamma_neg)
+        del gamma_neg, gauss_neg
+    else:
+        p_pos_f = pi_p * _gamma_pdf_torch(x, mu_p, var_p)
+        p_neg_f = pi_ng * _gamma_pdf_torch(neg_x, mu_ng, var_ng)
     del neg_x  # free (K, V) float32
 
     total_f = (p_noise_f + p_pos_f + p_neg_f).clamp(min=1e-32)
-    del p_noise_f  # only need signal components for p_signal
+    del p_noise_f
     p_signal = (p_pos_f + p_neg_f) / total_f  # (K, V) float32
     del p_pos_f, p_neg_f, total_f
 
     sigma_n = torch.sqrt(var_n).clamp(min=1e-8)
-    z_signed = (x - mu_n) / sigma_n  # (K, V) float32
-    del x  # free last (K, V) float32
+    z_signed = (x - mu_n) / sigma_n  # (K, V) float32 — z-scored input space
+    del x
 
     return {
         "z_signed": z_signed,
@@ -1386,6 +1443,95 @@ def batch_fit_ggm(
         "pi_pos": pi_p.squeeze(1),
         "pi_neg": pi_ng.squeeze(1),
         "converged": converged,
+        "gmm_fallback": fb_mask,  # (K,) bool
+        "data_mean": data_mean.squeeze(1),  # (K,) original-space recovery
+        "data_std": data_std.squeeze(1),
+    }
+
+
+@torch.inference_mode()
+def _batch_gmm_3comp(x: torch.Tensor, n_iter: int = 200) -> dict:
+    """Batched 3-Gaussian mixture EM — used as the GMM fallback in batch_fit_ggm.
+
+    Components are ordered (noise, pos, neg) by initialization, but the EM
+    is unconstrained except for variance floor.
+
+    Parameters
+    ----------
+    x : (K, V) z-scored inputs.
+
+    Returns dict with mu/var/pi tensors of shape (K, 1).
+    """
+    device = x.device
+    K, V = x.shape
+    n = float(V)
+    # MELODIC GMM init: m1=mean, m2=m1+sqrt(v1), m3=m1-sqrt(v1); v all = E[x²].
+    v0 = (x * x).mean(dim=1, keepdim=True).clamp(min=1e-4)
+    s0 = torch.sqrt(v0)
+    m1 = x.mean(dim=1, keepdim=True)
+    m2 = m1 + s0
+    m3 = m1 - s0
+    v1 = v0.clone()
+    v2 = v0.clone()
+    v3 = v0.clone()
+    pi1 = torch.full((K, 1), 1.0 / 3.0, device=device, dtype=x.dtype)
+    pi2 = pi1.clone()
+    pi3 = pi1.clone()
+
+    eps_conv = log(V) / 1000.0
+    old_ll = torch.full((K, 1), -1e30, device=device, dtype=x.dtype)
+    converged = torch.zeros(K, dtype=torch.bool, device=device)
+
+    for it in range(n_iter):
+        p1 = pi1 * _gauss_pdf_torch(x, m1, v1)
+        p2 = pi2 * _gauss_pdf_torch(x, m2, v2)
+        p3 = pi3 * _gauss_pdf_torch(x, m3, v3)
+        total = (p1 + p2 + p3).clamp(min=1e-32)
+        r1 = p1 / total
+        r2 = p2 / total
+        r3 = p3 / total
+
+        ll = total.log().sum(dim=1, keepdim=True)
+        if it > 20:
+            converged = converged | (((ll - old_ll) < eps_conv).squeeze(1) & ~converged)
+            if converged.all():
+                break
+        old_ll = ll
+
+        active = ~converged
+        if not active.any():
+            break
+
+        w1 = r1.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        w2 = r2.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        w3 = r3.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        new_m1 = (r1 * x).sum(dim=1, keepdim=True) / w1
+        new_m2 = (r2 * x).sum(dim=1, keepdim=True) / w2
+        new_m3 = (r3 * x).sum(dim=1, keepdim=True) / w3
+        new_v1 = ((r1 * (x - new_m1) ** 2).sum(dim=1, keepdim=True) / w1).clamp(min=1e-4)
+        new_v2 = ((r2 * (x - new_m2) ** 2).sum(dim=1, keepdim=True) / w2).clamp(min=1e-4)
+        new_v3 = ((r3 * (x - new_m3) ** 2).sum(dim=1, keepdim=True) / w3).clamp(min=1e-4)
+        new_pi1 = (w1 / n).clamp(1e-4, 1 - 2e-4)
+        new_pi2 = (w2 / n).clamp(1e-4, 1 - 2e-4)
+        new_pi3 = (w3 / n).clamp(1e-4, 1 - 2e-4)
+        psum = new_pi1 + new_pi2 + new_pi3
+        new_pi1, new_pi2, new_pi3 = new_pi1 / psum, new_pi2 / psum, new_pi3 / psum
+
+        a = active.unsqueeze(1)
+        m1 = torch.where(a, new_m1, m1)
+        m2 = torch.where(a, new_m2, m2)
+        m3 = torch.where(a, new_m3, m3)
+        v1 = torch.where(a, new_v1, v1)
+        v2 = torch.where(a, new_v2, v2)
+        v3 = torch.where(a, new_v3, v3)
+        pi1 = torch.where(a, new_pi1, pi1)
+        pi2 = torch.where(a, new_pi2, pi2)
+        pi3 = torch.where(a, new_pi3, pi3)
+
+    return {
+        "mu1": m1, "var1": v1, "pi1": pi1,
+        "mu2": m2, "var2": v2, "pi2": pi2,
+        "mu3": m3, "var3": v3, "pi3": pi3,
     }
 
 
@@ -1417,7 +1563,7 @@ def _gauss_pdf(x: np.ndarray, mean: float, var: float) -> np.ndarray:
 def fit_ggm(
     values: np.ndarray,
     n_iter: int = 200,
-    min_mode_offset: float = 0.5,
+    min_mode_offset: float = 0.001,
 ) -> dict:
     """Fit a Gaussian-Gamma Mixture (GGM) model to ICA spatial map values.
 
@@ -1445,7 +1591,11 @@ def fit_ggm(
         p_signal : array of posterior signal probability per voxel
         converged : bool
     """
-    x = values.astype(np.float64).ravel()
+    x_raw = values.astype(np.float64).ravel()
+    # I1: per-component z-score (matches MELODIC ggmix::setup)
+    data_mean = float(np.mean(x_raw))
+    data_std = max(float(np.std(x_raw)), 1e-8)
+    x = (x_raw - data_mean) / data_std
     n = len(x)
 
     # Initialize noise Gaussian from central mass
@@ -1502,25 +1652,33 @@ def fit_ggm(
         mu_n = float((r_noise * x).sum() / w_n)
         var_n = max(float((r_noise * (x - mu_n) ** 2).sum() / w_n), 1e-8)
 
+        # I2: MELODIC adaptive floor — const2 = (2.6 - pi_n)·sqrt(var_n) ± mu_n
+        sqrt_var_n = np.sqrt(var_n)
+        pi_n_now = float(np.clip(w_n / n, 1e-4, 1 - 2e-4))
+
         # Positive Gamma (only from x > 0 effectively, but weighted)
         x_pos_weighted = np.where(x > 0, x, 0.0)
         mu_p_new = float((r_pos * x_pos_weighted).sum() / max(float((r_pos * (x > 0)).sum()), 1e-8))
-        mu_p = max(mu_p_new, max(1.5 * mu_n + np.sqrt(var_n), min_mode_offset))
-        var_p_new = float((r_pos * (x - mu_p) ** 2).sum() / w_p)
-        var_p = max(var_p_new, 1e-8)
+        var_p_new = max(float((r_pos * (x - mu_p_new) ** 2).sum() / w_p), 1e-4)
+        const2_p = (2.6 - pi_n_now) * sqrt_var_n + mu_n
+        floor_p = max(0.5 * (const2_p + np.sqrt(const2_p**2 + 4.0 * var_p_new)), min_mode_offset)
+        mu_p = max(mu_p_new, floor_p)
+        # I3: variance upper bound var ≤ 0.5·mu²
+        var_p = max(min(var_p_new, 0.5 * mu_p**2), 1e-4)
 
-        # Negative Gamma (use -x)
+        # Negative Gamma (use -x; mu_ng kept as positive |mean|)
         neg_x = -x
         x_neg_weighted = np.where(neg_x > 0, neg_x, 0.0)
         mu_ng_new = float(
             (r_neg * x_neg_weighted).sum() / max(float((r_neg * (neg_x > 0)).sum()), 1e-8)
         )
-        mu_ng = max(
-            mu_ng_new,
-            max(-1.5 * mu_n + np.sqrt(var_n) if mu_n < 0 else np.sqrt(var_n), min_mode_offset),
+        var_ng_new = max(float((r_neg * (neg_x - mu_ng_new) ** 2).sum() / w_ng), 1e-4)
+        const2_ng = (2.6 - pi_n_now) * sqrt_var_n - mu_n
+        floor_ng = max(
+            0.5 * (const2_ng + np.sqrt(const2_ng**2 + 4.0 * var_ng_new)), min_mode_offset
         )
-        var_ng_new = float((r_neg * (neg_x - mu_ng) ** 2).sum() / w_ng)
-        var_ng = max(var_ng_new, 1e-8)
+        mu_ng = max(mu_ng_new, floor_ng)
+        var_ng = max(min(var_ng_new, 0.5 * mu_ng**2), 1e-4)
 
         # Proportions
         pi_n = float(np.clip(w_n / n, 1e-4, 1 - 2e-4))
@@ -1532,10 +1690,17 @@ def fit_ggm(
         pi_p /= pi_sum
         pi_ng /= pi_sum
 
-    # Final posterior probability of signal (positive OR negative)
-    p_noise_final = pi_n * _gauss_pdf(x, mu_n, var_n)
-    p_pos_final = pi_p * _gamma_pdf(x, mu_p, var_p)
-    p_neg_final = pi_ng * _gamma_pdf(-x, mu_ng, var_ng)
+    # I4: GMM fallback when noise proportion is small (mostly-signal component)
+    gmm_fallback = pi_n < 0.4
+    if gmm_fallback:
+        mu_n, var_n, pi_n, mu_p, var_p, pi_p, mu_ng, var_ng, pi_ng = _gmm_3comp_fit(x, n_iter)
+        p_noise_final = pi_n * _gauss_pdf(x, mu_n, var_n)
+        p_pos_final = pi_p * _gauss_pdf(x, mu_p, var_p)
+        p_neg_final = pi_ng * _gauss_pdf(x, mu_ng, var_ng)
+    else:
+        p_noise_final = pi_n * _gauss_pdf(x, mu_n, var_n)
+        p_pos_final = pi_p * _gamma_pdf(x, mu_p, var_p)
+        p_neg_final = pi_ng * _gamma_pdf(-x, mu_ng, var_ng)
     total_final = np.clip(p_noise_final + p_pos_final + p_neg_final, 1e-30, None)
     p_signal = (p_pos_final + p_neg_final) / total_final
 
@@ -1551,7 +1716,49 @@ def fit_ggm(
         "pi_neg": pi_ng,
         "p_signal": p_signal,
         "converged": converged,
+        "gmm_fallback": gmm_fallback,
+        "data_mean": data_mean,
+        "data_std": data_std,
     }
+
+
+def _gmm_3comp_fit(x: np.ndarray, n_iter: int) -> tuple:
+    """3-Gaussian mixture EM (scalar fallback for fit_ggm)."""
+    n = len(x)
+    v0 = max(float(np.mean(x * x)), 1e-4)
+    s0 = np.sqrt(v0)
+    m1 = float(np.mean(x))
+    m2 = m1 + s0
+    m3 = m1 - s0
+    v1 = v2 = v3 = v0
+    pi1 = pi2 = pi3 = 1.0 / 3.0
+    eps_conv = log(n) / 1000.0
+    old_ll = -np.inf
+    for it in range(n_iter):
+        p1 = pi1 * _gauss_pdf(x, m1, v1)
+        p2 = pi2 * _gauss_pdf(x, m2, v2)
+        p3 = pi3 * _gauss_pdf(x, m3, v3)
+        total = np.clip(p1 + p2 + p3, 1e-30, None)
+        r1, r2, r3 = p1 / total, p2 / total, p3 / total
+        ll = float(np.sum(np.log(total)))
+        if it > 20 and ll - old_ll < eps_conv:
+            break
+        old_ll = ll
+        w1 = max(float(r1.sum()), 1e-8)
+        w2 = max(float(r2.sum()), 1e-8)
+        w3 = max(float(r3.sum()), 1e-8)
+        m1 = float((r1 * x).sum() / w1)
+        m2 = float((r2 * x).sum() / w2)
+        m3 = float((r3 * x).sum() / w3)
+        v1 = max(float((r1 * (x - m1) ** 2).sum() / w1), 1e-4)
+        v2 = max(float((r2 * (x - m2) ** 2).sum() / w2), 1e-4)
+        v3 = max(float((r3 * (x - m3) ** 2).sum() / w3), 1e-4)
+        pi1 = float(np.clip(w1 / n, 1e-4, 1 - 2e-4))
+        pi2 = float(np.clip(w2 / n, 1e-4, 1 - 2e-4))
+        pi3 = float(np.clip(w3 / n, 1e-4, 1 - 2e-4))
+        psum = pi1 + pi2 + pi3
+        pi1, pi2, pi3 = pi1 / psum, pi2 / psum, pi3 / psum
+    return m1, v1, pi1, m2, v2, pi2, m3, v3, pi3
 
 
 def mixture_zscores_signed(comp_map: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -1582,8 +1789,11 @@ def mixture_zscores_signed(comp_map: np.ndarray) -> tuple[np.ndarray, np.ndarray
     sigma_n = max(np.sqrt(result["var_noise"]), 1e-8)
     p_signal = result["p_signal"]
 
-    # Z-score relative to noise distribution
-    z_signed = ((vals - mu_n) / sigma_n).astype(np.float32)
+    # Z-score relative to noise distribution. mu_n / sigma_n are in the
+    # per-component z-scored frame used internally by fit_ggm, so we apply
+    # the same normalization to vals before standardizing by the noise.
+    vals_norm = (vals - result["data_mean"]) / max(result["data_std"], 1e-8)
+    z_signed = ((vals_norm - mu_n) / sigma_n).astype(np.float32)
 
     meta = {
         "mu_noise": float(mu_n),
@@ -1597,6 +1807,7 @@ def mixture_zscores_signed(comp_map: np.ndarray) -> tuple[np.ndarray, np.ndarray
         "pi_neg": float(result["pi_neg"]),
         "mixing_signal": float(np.mean(p_signal)),
         "converged": result["converged"],
+        "gmm_fallback": bool(result.get("gmm_fallback", False)),
     }
 
     return z_signed, p_signal.astype(np.float32), meta
@@ -1673,6 +1884,7 @@ def batch_mixture_zscores(
                     "pi_neg": float(result["pi_neg"][k]),
                     "mixing_signal": float(result["p_signal"][k].mean()),
                     "converged": bool(result["converged"][k]),
+                    "gmm_fallback": bool(result["gmm_fallback"][k]),
                 }
             )
         del result
