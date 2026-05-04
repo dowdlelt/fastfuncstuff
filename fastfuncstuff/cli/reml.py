@@ -778,8 +778,8 @@ def main():
     finally:
         sys.argv = _orig_argv
 
-    # Show help if requested via the parser's own help flag
-    if args.help or not filtered_argv:
+    # Show help if no arguments provided (argparse handles -h/-help itself)
+    if not filtered_argv:
         parser.print_help()
         sys.exit(0)
 
@@ -1797,7 +1797,7 @@ def main():
         results, design_info = analyze_from_design_matrix(
             fmri_data=fmri_data_to_use,
             design_matrix_file=args.matrix,
-            design_info=design_info if args.onsets else None,
+            design_info=design_info if (args.onsets or args.events) else None,
             method=analysis_method,
             arma_a_grid=a_grid,
             arma_b_grid=b_grid,
