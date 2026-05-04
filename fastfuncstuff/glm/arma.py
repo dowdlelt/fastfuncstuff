@@ -2486,10 +2486,12 @@ def reml_grid_search_batched(
         # Keep data on CPU, will move batches as needed
         design_dev = design.to(device, dtype=dtype)
 
-    # Allocate results
+    # Allocate results.
+    # Convention matches compute_reml_likelihood / _evaluate_single_param /
+    # the chunked GPU search: REML neg-log-likelihood, smaller = better.
     best_params = torch.zeros(n_voxels, 2, dtype=dtype, device=torch.device("cpu"))
     best_likelihood = torch.full(
-        (n_voxels,), float("-inf"), dtype=dtype, device=torch.device("cpu")
+        (n_voxels,), float("inf"), dtype=dtype, device=torch.device("cpu")
     )
 
     # Process grid in chunks for efficiency
@@ -2558,25 +2560,22 @@ def reml_grid_search_batched(
                     resid_w = y_w - (betas @ X_w.T)  # (n_voxels, n_tp)
                     sse = torch.sum(resid_w**2, dim=1)  # (n_voxels,)
 
-                    # REML likelihood (same formula as AFNI)
-                    n = n_timepoints
-                    _p = n_regressors
-                    likelihoods = -0.5 * (
-                        n * torch.log(sse / n)
-                        + logdet_R
+                    # REML neg-log-likelihood (matches AFNI 3dREMLfit and the
+                    # CPU/chunked-GPU paths in this file):
+                    #   logdet_R + logdet(X'R^-1 X) + (n - m) * log(SSE)
+                    # Earlier versions used the ML form n*log(SSE/n), which has
+                    # a different multiplier on log(SSE) and so can shift the
+                    # argmin between adjacent grid points.
+                    likelihoods = (
+                        logdet_R
                         + logdet_XwTXw
-                        + n
-                        * (
-                            1
-                            + torch.log(
-                                torch.tensor(2 * torch.pi, dtype=dtype, device=device)
-                            )
-                        )
+                        + (n_timepoints - n_regressors)
+                        * torch.log(sse + 1e-10)
                     )
 
-                    # Update best parameters (vectorized comparison!)
+                    # Update best parameters (vectorized comparison; smaller = better)
                     likelihoods_cpu = likelihoods.cpu()
-                    mask = likelihoods_cpu > best_likelihood
+                    mask = likelihoods_cpu < best_likelihood
                     best_params[mask, 0] = a
                     best_params[mask, 1] = b
                     best_likelihood[mask] = likelihoods_cpu[mask]
@@ -2613,28 +2612,19 @@ def reml_grid_search_batched(
                         resid_w = y_w - (betas @ X_w.T)  # (batch_voxels, n_tp)
                         sse = torch.sum(resid_w**2, dim=1)  # (batch_voxels,)
 
-                        # REML likelihood (same formula as AFNI)
-                        n = n_timepoints
-                        _p = n_regressors
-                        likelihoods = -0.5 * (
-                            n * torch.log(sse / n)
-                            + logdet_R
+                        # REML neg-log-likelihood; see comment in the
+                        # load_all_data branch above for the formula rationale.
+                        likelihoods = (
+                            logdet_R
                             + logdet_XwTXw
-                            + n
-                            * (
-                                1
-                                + torch.log(
-                                    torch.tensor(
-                                        2 * torch.pi, dtype=dtype, device=device
-                                    )
-                                )
-                            )
+                            + (n_timepoints - n_regressors)
+                            * torch.log(sse + 1e-10)
                         )
 
-                        # Update best parameters for this batch (vectorized comparison!)
+                        # Update best parameters for this batch (smaller = better)
                         likelihoods_cpu = likelihoods.cpu()
                         batch_best_likelihood = best_likelihood[voxel_start:voxel_end]
-                        mask = likelihoods_cpu > batch_best_likelihood
+                        mask = likelihoods_cpu < batch_best_likelihood
 
                         # Update using proper indexing (avoid chained indexing which creates copies)
                         if mask.any():
