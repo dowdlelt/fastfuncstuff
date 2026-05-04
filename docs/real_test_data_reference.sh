@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# NOTE (2026-04-28): This script is a legacy prototype.
+# The canonical, maintained benchmark framework is `ffs_benchmark`.
+# See the wiki (external, ~/Dropbox/Resources/code/fmri_wiki) for source-of-truth docs:
+# - software/ffs_benchmark.md
+# - principles/Benchmark validation.md
+
 # TODO this downloded data, etc should be gitignored. We don't want to upload all of this!
 # and if it is the git history, we need to remove that, cause it'll be huge. 
 
