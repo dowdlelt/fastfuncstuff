@@ -2,15 +2,15 @@
 ICASSO: ICA with component clustering for stability-based selection.
 
 Implements the ICASSO algorithm (Himberg et al., 2004) following the
-GIFT/EEGLAB reference implementation (icasso122, runica.m).
+GIFT/icasso122 reference implementation.
 
 Algorithm:
 1. Run ICA many times with different random initializations (and/or
    bootstrap resampling of the data).
-2. Compute absolute correlation similarity between all component
-   estimates across all runs.
+2. Compute pairwise cosine similarity between all demixing vectors
+   projected through the dewhitening matrix, matching GIFT's ``corrw``.
 3. Agglomerative hierarchical clustering (average linkage by default)
-   on the dissimilarity matrix (1 - |correlation|).
+   on the dissimilarity matrix (1 - |cosine similarity|).
 4. For each cluster, compute stability index Iq = mean(intra-cluster
    similarity) - mean(extra-cluster similarity).
 5. Select the centrotype (real ICA estimate most similar to all others
@@ -34,40 +34,121 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 from tqdm.auto import tqdm
 
-from .ica import create_ica
+from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.utils import get_device, to_tensor
+
+from .ica import create_ica
+
+# ---------------------------------------------------------------------------
+# Similarity matrix — GIFT corrw (default)
+# ---------------------------------------------------------------------------
+
+def _recover_W_and_D(
+    ica,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover unmixing W and dewhitening D from a fitted ICA object.
+
+    W = components_ @ pinv(pca_components[:n_ica])   — unmixing in whitened space
+    D = pca_components[:n_ica]                        — dewhitening (whitened → data)
+
+    This avoids storing extra attributes on the ICA classes.
+    """
+    comp = ica.components_                                # (k, V)
+    pca_comp = ica.pca_.components_[:comp.shape[0]]      # (k, V)
+    W = comp @ torch.linalg.pinv(pca_comp)                # (k, k)
+    return W, pca_comp
+
+
+@torch.inference_mode()
+def compute_similarity_corrw(
+    wd_pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device | None = None,
+) -> np.ndarray:
+    """GIFT-style cosine similarity via ``corrw(W, D)``.
+
+    For each run i, ``B_i = rownorm(W_i @ D_i)`` where W_i is the
+    (k, k) unmixing matrix in whitened space and D_i is the (k, V)
+    dewhitening matrix.  All B_i are stacked into a (N, V) matrix and
+    the similarity is ``R = |B @ B'|``, clipped to [0, 1].
+
+    Matches ``icassoCluster.m:215`` → ``abs(corrw(W, dewhitemat))``.
+
+    Parameters
+    ----------
+    wd_pairs : list of (W, D) tuples
+        W: (k, k) unmixing, D: (k, V) dewhitening, per run.
+    device : torch.device, optional
+        Device for the matmul. Falls back to CPU to avoid competing with
+        the ICA loop for GPU memory.
+
+    Returns
+    -------
+    similarity : (N, N) float32 numpy array
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    rows = []
+    for W, D in wd_pairs:
+        W = W.to(device=device, dtype=torch.float32)
+        D = D.to(device=device, dtype=torch.float32)
+        B = W @ D                                     # (k, V)
+        norms = B.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        B = B / norms                                  # row-normalise
+        rows.append(B)
+
+    all_B = torch.cat(rows, dim=0)                     # (N, V)
+    N = all_B.shape[0]
+    del rows
+
+    avail = get_available_memory(device, safety_factor=0.4)
+    chunk_bytes_full = N * all_B.shape[1] * 4          # (N_chunk, V) @ (V, N)
+    max_chunk_rows = max(1, int(avail // chunk_bytes_full)) if chunk_bytes_full > 0 else N
+    max_chunk_rows = min(max_chunk_rows, N)
+
+    if max_chunk_rows >= N:
+        S = torch.abs(all_B @ all_B.T)
+    else:
+        S = torch.empty((N, N), dtype=torch.float32, device=device)
+        for i in range(0, N, max_chunk_rows):
+            j = min(i + max_chunk_rows, N)
+            S[i:j, :] = torch.abs(all_B[i:j] @ all_B.T)
+
+    S.clamp_(0.0, 1.0)
+    return S.cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
-# Similarity matrix
+# Similarity matrix — spatial-map Pearson correlation (fallback)
 # ---------------------------------------------------------------------------
 
 def compute_similarity_matrix(
     components_list: list[np.ndarray],
     batch_size: int | None = None,
 ) -> np.ndarray:
-    """Compute pairwise absolute-correlation similarity matrix.
+    """Pairwise absolute Pearson correlation of spatial maps.
 
     Uses standardized (zero-mean, unit-norm) row vectors so that the
     dot product equals the Pearson correlation.  Takes absolute value
     to handle ICA sign ambiguity (GIFT convention).
 
+    .. note::
+        For GIFT parity prefer :func:`compute_similarity_corrw` which
+        uses demixing-space cosine similarity matching ``corrw.m``.
+        This function is retained as a fallback.
+
     Parameters
     ----------
     components_list : list of (n_components, n_features) arrays
-        Component matrices from different ICA runs.
     batch_size : int, optional
-        Compute in batches to limit memory.
 
     Returns
     -------
-    similarity : (N, N) array, N = n_runs * n_components
-        Absolute Pearson correlation, clipped to [0, 1].
+    similarity : (N, N) float32 array
     """
     all_components = np.concatenate(components_list, axis=0)
     n_total = all_components.shape[0]
 
-    # Standardise rows → dot product = Pearson r
     row_means = all_components.mean(axis=1, keepdims=True)
     centered = all_components - row_means
     norms = np.linalg.norm(centered, axis=1, keepdims=True)
@@ -189,6 +270,126 @@ def compute_cluster_quality(
 
 
 # ---------------------------------------------------------------------------
+# R-index  (Davies-Bouldin validity, GIFT rindex.m)
+# ---------------------------------------------------------------------------
+
+def _clusterstat(
+    mat: np.ndarray,
+    labels: np.ndarray,
+) -> dict:
+    """Compute intra/inter/between cluster statistics on a square matrix.
+
+    Port of GIFT ``clusterstat.m``.  Works with either similarity or
+    distance matrices — the caller decides which to pass.
+
+    Parameters
+    ----------
+    mat : (N, N) symmetric matrix (similarity or distance).
+    labels : (N,) 1-based cluster labels.
+
+    Returns
+    -------
+    dict with keys:
+        N : (K,) cluster sizes.
+        internal.avg : (K,) mean off-diagonal intra-cluster value.
+        external.avg : (K,) mean extra-cluster value.
+        between.avg : (K, K) mean between-cluster value (diagonal = Inf).
+    """
+    cluster_ids = np.unique(labels)
+    K = len(cluster_ids)
+
+    internal_avg = np.full(K, np.nan)
+    external_avg = np.full(K, np.nan)
+    between_avg = np.full((K, K), np.nan)
+    sizes = np.zeros(K, dtype=int)
+
+    for i, ci in enumerate(cluster_ids):
+        mi = labels == ci
+        ni = mi.sum()
+        sizes[i] = ni
+
+        # Intra: off-diagonal entries of sub-matrix
+        S_in = mat[np.ix_(mi, mi)]
+        if ni > 1:
+            mask_offdiag = ~np.eye(ni, dtype=bool)
+            internal_avg[i] = S_in[mask_offdiag].mean()
+
+        # External: members of ci vs non-members
+        if K > 1:
+            S_out = mat[np.ix_(mi, ~mi)]
+            external_avg[i] = S_out.mean() if S_out.size > 0 else np.nan
+
+    # Between-cluster averages (upper triangle, then symmetrise)
+    between_avg[:] = 0.0
+    for i in range(K):
+        mi = labels == cluster_ids[i]
+        for j in range(i + 1, K):
+            mj = labels == cluster_ids[j]
+            vals = mat[np.ix_(mi, mj)]
+            between_avg[i, j] = vals.mean() if vals.size > 0 else 0.0
+    between_avg = between_avg + between_avg.T
+    np.fill_diagonal(between_avg, np.inf)
+
+    return {
+        "N": sizes,
+        "internal": {"avg": internal_avg},
+        "external": {"avg": external_avg},
+        "between": {"avg": between_avg},
+    }
+
+
+def compute_rindex(
+    distance: np.ndarray,
+    linkage_matrix: np.ndarray,
+    max_clusters: int | None = None,
+) -> np.ndarray:
+    """Davies-Bouldin R-index for cluster count selection.
+
+    For each candidate cluster count k, the R-index is:
+
+        R(k) = mean_i( avg_intra_dist(i) / min_j!=i( avg_inter_dist(i,j) ) )
+
+    Lower values indicate better clustering (compact, well-separated).
+    Matches GIFT ``rindex.m`` / ``icassoCluster.m:236``.
+
+    Parameters
+    ----------
+    distance : (N, N) dissimilarity matrix (e.g. ``1 - similarity``).
+    linkage_matrix : scipy linkage matrix from hierarchical clustering.
+    max_clusters : int, optional
+        Maximum number of clusters to evaluate.  Default: N (all).
+
+    Returns
+    -------
+    rindex : (max_clusters,) array, 1-based indexing.
+        ``rindex[0]`` corresponds to k=1 (always NaN).
+        ``rindex[k-1]`` is the R-index for k clusters (NaN if undefined).
+    """
+    N = distance.shape[0]
+    if max_clusters is None:
+        max_clusters = N
+    max_clusters = min(max_clusters, N)
+
+    ri = np.full(max_clusters, np.nan)
+
+    for k in range(2, max_clusters + 1):
+        labels = fcluster(linkage_matrix, k, criterion="maxclust")
+
+        # Skip if any cluster has only 1 member (R-index undefined)
+        _, counts = np.unique(labels, return_counts=True)
+        if (counts == 1).any() or k == 1:
+            continue
+
+        stat = _clusterstat(distance, labels)
+        # R-index = mean( internal.avg / min(between.avg, axis=1) )
+        min_between = stat["between"]["avg"].min(axis=1)
+        ratios = stat["internal"]["avg"] / min_between
+        ri[k - 1] = ratios.mean()
+
+    return ri
+
+
+# ---------------------------------------------------------------------------
 # Centrotype selection  (GIFT convention)
 # ---------------------------------------------------------------------------
 
@@ -239,13 +440,21 @@ def _extract_mixing_for_centrotypes(
     mixing_list: list[np.ndarray],
     components_list: list[np.ndarray],
     all_components: np.ndarray,
+    X: np.ndarray | torch.Tensor | None = None,
+    reproject: bool = False,
 ) -> np.ndarray:
     """Build a mixing matrix for the centrotype components.
 
-    Each centrotype comes from a specific run. We take the mixing
-    column from that run, applying a sign flip if the centrotype
-    spatial map was negatively correlated with the cluster average
-    direction.
+    In randinit mode (``reproject=False``), each centrotype's mixing
+    column is taken from the ICA run that produced it.  This is valid
+    because all runs operate on the same data.
+
+    In bootstrap/both mode (``reproject=True``), each run saw different
+    (resampled) data so its mixing column is wrong for the original
+    data.  Instead we least-squares project the original data X onto
+    the centrotype spatial maps S:
+
+        A = X @ S^T @ (S @ S^T)^{-1}
 
     Parameters
     ----------
@@ -254,13 +463,30 @@ def _extract_mixing_for_centrotypes(
     mixing_list : list of (T, n_comp) arrays.
     components_list : list of (n_comp, V) arrays.
     all_components : (N, V) concatenated component array.
+    X : (T, V) original data, required when ``reproject=True``.
+    reproject : bool
+        If True, reproject X onto centrotype components instead of
+        pulling mixing columns from individual runs.
 
     Returns
     -------
     mixing : (T, n_clusters) mixing matrix.
     """
-    n_samples = mixing_list[0].shape[0]
     n_clusters = len(centrotype_indices)
+
+    if reproject:
+        if X is None:
+            raise ValueError("X required when reproject=True")
+        S = all_components[centrotype_indices]              # (k, V)
+        if isinstance(X, torch.Tensor):
+            X_np = X.cpu().numpy()
+        else:
+            X_np = np.asarray(X)
+        StS = S @ S.T                                      # (k, k)
+        mixing = X_np @ S.T @ np.linalg.inv(StS)           # (T, k)
+        return mixing.astype(np.float64)
+
+    n_samples = mixing_list[0].shape[0]
     mixing = np.empty((n_samples, n_clusters), dtype=np.float64)
 
     for ci, gidx in enumerate(centrotype_indices):
@@ -288,6 +514,7 @@ def icasso(
     base_seed: int = 0,
     mode: str = "randinit",
     linkage_method: str = "average",
+    similarity_method: str = "corrw",
 ) -> dict:
     """Run ICASSO: ICA with component clustering for reliability.
 
@@ -308,7 +535,8 @@ def icasso(
     device : torch.device, optional
     verbose : bool
     batch_size : int, optional
-        Batch size for similarity matrix computation.
+        Batch size for spatial-map similarity (only used when
+        ``similarity_method='spatial'``).
     ica_method : str
         ICA algorithm ('fastica' or 'infomax').
     base_seed : int
@@ -320,6 +548,10 @@ def icasso(
         - 'both': bootstrap data AND random ICA seeds.
     linkage_method : str
         Hierarchical clustering linkage ('average', 'single', 'complete').
+    similarity_method : str
+        'corrw' (default): GIFT-style cosine similarity of demixing
+        vectors projected through dewhitening, matching ``corrw.m``.
+        'spatial': absolute Pearson correlation of spatial maps (legacy).
 
     Returns
     -------
@@ -340,11 +572,12 @@ def icasso(
     X = to_tensor(X, device=device)
 
     n_total = n_runs * n_components
+    use_corrw = similarity_method == "corrw"
 
-    # Auto batch size
-    if batch_size is None:
-        matrix_bytes = n_total ** 2 * 4  # float32
-        if matrix_bytes > 1024 ** 3:  # > 1 GB
+    # Auto batch size for spatial-map path
+    if batch_size is None and not use_corrw:
+        matrix_bytes = n_total ** 2 * 4
+        if matrix_bytes > 1024 ** 3:
             batch_size = max(100, int(np.sqrt(500 * 1024 ** 3 / 4)))
             if verbose:
                 print(f"  Auto batch_size={batch_size} "
@@ -354,31 +587,29 @@ def icasso(
         print(f"ICASSO: {n_runs} runs × {n_components} components "
               f"= {n_total} estimates")
         print(f"  mode={mode}, linkage={linkage_method}, "
-              f"ica={ica_method}, seed={base_seed}")
+              f"ica={ica_method}, seed={base_seed}, "
+              f"similarity={similarity_method}")
 
     # ------------------------------------------------------------------
     # Step 1: Run ICA multiple times
     # ------------------------------------------------------------------
     components_list: list[np.ndarray] = []
     mixing_list: list[np.ndarray] = []
+    wd_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
     pca_eigenvalues = None
     pca_components_arr = None
     pca_variance_explained = None
-
-    n_samples = X.shape[0] if isinstance(X, torch.Tensor) else X.shape[0]
 
     iterator = range(n_runs)
     if verbose:
         iterator = tqdm(iterator, desc="ICASSO ICA runs")
 
     for i in iterator:
-        # Determine seed for this run
         if mode == "randinit":
             seed_i = base_seed + i
             X_i = X
         elif mode == "bootstrap":
-            seed_i = base_seed  # fixed seed
-            # Bootstrap: resample columns (voxels) with replacement
+            seed_i = base_seed
             rng = np.random.RandomState(base_seed + i)
             n_cols = X.shape[1] if isinstance(X, torch.Tensor) else X.shape[1]
             boot_idx = rng.randint(0, n_cols, size=n_cols)
@@ -403,15 +634,18 @@ def icasso(
             random_state=seed_i,
             device=device,
         )
-        ica.verbose = False  # suppress per-iteration bars during ICASSO
+        ica.verbose = False
         ica.fit(X_i)
 
-        # Capture PCA info from first run
         if i == 0:
             evar = ica.pca_.explained_variance_.cpu().numpy()
             pca_variance_explained = evar / evar.sum()
             pca_eigenvalues = evar.copy()
             pca_components_arr = ica.pca_.components_.cpu().numpy()
+
+        if use_corrw:
+            W_i, D_i = _recover_W_and_D(ica)
+            wd_pairs.append((W_i.cpu(), D_i.cpu()))
 
         components_list.append(ica.components_.cpu().numpy())
         mixing_list.append(ica.mixing_.cpu().numpy())
@@ -420,12 +654,17 @@ def icasso(
             torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
-    # Step 2: Similarity matrix (absolute Pearson correlation)
+    # Step 2: Similarity matrix
     # ------------------------------------------------------------------
     if verbose:
-        print(f"Computing {n_total}×{n_total} similarity matrix ...")
+        print(f"Computing {n_total}×{n_total} similarity matrix "
+              f"(method={similarity_method}) ...")
 
-    similarity = compute_similarity_matrix(components_list, batch_size=batch_size)
+    if use_corrw:
+        similarity = compute_similarity_corrw(wd_pairs)
+        del wd_pairs
+    else:
+        similarity = compute_similarity_matrix(components_list, batch_size=batch_size)
 
     # ------------------------------------------------------------------
     # Step 3: Hierarchical clustering
@@ -444,16 +683,32 @@ def icasso(
     iq = quality["iq"]
 
     # ------------------------------------------------------------------
+    # Step 4b: R-index (Davies-Bouldin validity)
+    # ------------------------------------------------------------------
+    distance_matrix = 1.0 - similarity
+    r_index = compute_rindex(distance_matrix, linkage_matrix,
+                             max_clusters=n_total)
+    r_max = np.nanmax(r_index) if np.any(np.isfinite(r_index)) else np.nan
+    if np.isfinite(r_max) and r_max > 0:
+        r_index_normalized = r_index / r_max
+    else:
+        r_index_normalized = r_index.copy()
+
+    # ------------------------------------------------------------------
     # Step 5: Centrotype selection
     # ------------------------------------------------------------------
     centrotype_indices = select_centrotypes(labels, similarity)
     all_components = np.concatenate(components_list, axis=0)
     centroids = all_components[centrotype_indices]
 
-    # Build mixing matrix from centrotype runs
+    # Build mixing matrix from centrotype runs.
+    # Bootstrap mode: each run saw resampled data, so reproject original X.
+    needs_reproject = mode in ("bootstrap", "both")
     all_mixing = _extract_mixing_for_centrotypes(
         centrotype_indices, n_components, mixing_list,
         components_list, all_components,
+        X=X if needs_reproject else None,
+        reproject=needs_reproject,
     )
 
     # ------------------------------------------------------------------
@@ -504,6 +759,8 @@ def icasso(
         "similarity": similarity,
         "linkage_matrix": linkage_matrix,
         "centrotype_indices": centrotype_indices,
+        "r_index": r_index,
+        "r_index_normalized": r_index_normalized,
         "n_components": n_components,
         "n_runs": n_runs,
         "mode": mode,
@@ -564,11 +821,7 @@ def icasso_plot(
     labels = results["cluster_labels"]
     n_components = results["n_components"]
     n_runs = results["n_runs"]
-    min_stab = None
     n_stable = results.get("n_stable", 0)
-
-    # Infer min_stability from stable count
-    iq_valid = iq[~np.isnan(iq)]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
