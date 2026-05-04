@@ -1440,7 +1440,6 @@ def _run_concat_ica(
     # MELODIC's post-varnorm concat_data.nii.gz, isolating varnorm divergence.
     _trace_dir_pre = getattr(args, "trace", None)
     if _trace_dir_pre:
-        from pathlib import Path
         _td_pre: Path = Path(_trace_dir_pre)
         _td_pre.mkdir(parents=True, exist_ok=True)
         np.save(_td_pre / "migp_pre_varnorm.npy", data_tv.cpu().numpy())
