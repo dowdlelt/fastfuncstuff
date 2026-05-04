@@ -22,9 +22,9 @@ def migp_reduce(
     runs: Iterable[torch.Tensor],
     migp_n: int | None = None,
     migp_factor: float = 2.0,
-        scale_by_n: bool = True,
-        device: torch.device | None = None,
-        verbose: bool = False,
+    scale_by_n: bool = True,
+    device: torch.device | None = None,
+    verbose: bool = False,
 ) -> torch.Tensor:
     """Run MELODIC-style MIGP on a sequence of per-run (T_i, V) tensors.
 
@@ -90,18 +90,34 @@ def migp_reduce(
 def _reduce_to_topk(data: torch.Tensor, k: int) -> torch.Tensor:
     """Reduce an (R, V) matrix to its top-k PC time-courses.
 
-    Equivalent to MELODIC's `pcaE.t() * Data` step in setup_migp: takes the
-    top-k right-eigenvectors of `Data^T Data` and projects rows.
+    Matches MELODIC's ``std_pca`` → ``EigenValues`` → ``pcaE.t() * Data``
+    in ``setup_migp``: row-centers (spatial mean per timepoint) before
+    computing the temporal covariance, eigendecomposes it (matching newmat's
+    ``EigenValues`` — ascending order), keeps the top-k eigenvectors, then
+    projects the **original** (non-centered) data.
+
+    Sign convention: after ``eigh``, each eigenvector is flipped so its
+    largest-absolute-value element is positive. This eliminates the arbitrary
+    sign ambiguity inherent to LAPACK's ``dsyevd`` and matches the convention
+    used by Armadillo's ``eig_sym`` (MELODIC's backend).
+
+    Precision: the entire reduction runs in float64 for numerical accuracy.
+    Errors from incremental reductions compound through varnorm's thresholding
+    step — the ~2x speed cost is negligible (covariance is only R×R and the
+    projection dominates runtime). The result is cast back to the input dtype.
     """
     R, V = data.shape
     k_eff = min(k, R, V)
     if R <= k_eff:
-        return data  # nothing to do — stack is already small enough
-    # Covariance-side SVD when V >> R (typical fMRI) is much cheaper and
-    # mirrors the n_features >> n_samples branch in our PCA class.
-    if V > 10 * R:
-        cov = data @ data.T  # (R, R)
-        U, _, _ = torch.linalg.svd(cov, full_matrices=False)
-        return U[:, :k_eff].T @ data  # (k, V)
-    U, _, _ = torch.linalg.svd(data, full_matrices=False)
-    return U[:, :k_eff].T @ data
+        return data
+    orig_dtype = data.dtype
+    d64 = data.to(torch.float64)
+    row_mean = d64.mean(dim=1, keepdim=True)
+    cov = (d64 @ d64.T - V * (row_mean @ row_mean.T)) / float(V)
+    evals, evecs = torch.linalg.eigh(cov)
+    evecs = evecs.flip(1)[:, :k_eff]
+    max_idx = evecs.abs().argmax(dim=0)
+    signs = torch.sign(evecs[max_idx, torch.arange(k_eff, device=evecs.device)])
+    signs[signs == 0] = 1.0
+    evecs = evecs * signs.unsqueeze(0)
+    return (evecs.T @ d64).to(orig_dtype)
