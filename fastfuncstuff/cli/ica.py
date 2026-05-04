@@ -611,7 +611,8 @@ def _run_single_ica(
         explained_share_t = mix_var / total_mix_var
 
     # Sort by explained-share (descending)
-    sort_idx = torch.argsort(explained_share_t, descending=True)
+    sort_key = stdev_share if args.ordering == "stdev" else explained_share_t
+    sort_idx = torch.argsort(sort_key, descending=True)
     explained_share = explained_share_t[sort_idx].detach().cpu().numpy().astype(np.float32)
     stdev_share_sorted = stdev_share[sort_idx].detach().cpu().numpy().astype(np.float32)
 
@@ -1025,6 +1026,7 @@ def _run_single_ica(
         "component_variance_share": explained_share.tolist(),
         "component_total_variance_share": total_share.tolist(),
         "component_spatial_stdev_share": stdev_share_sorted.tolist(),
+        "component_ordering": args.ordering,
         "sorting": {
             "method": "explained_share",
             "explained_share_source": "mixing_variance_unwhitened_pca",
@@ -1370,14 +1372,36 @@ def _run_concat_ica(
     # setup_migp's `tmpData = process_file(...) / numfiles` scaling.
     _vsection(args.verb >= 1, "Temporal Concatenation (MELODIC setup_migp-style)")
     t_step = time.time()
-    scale = 1.0 / float(n_runs)
-    # Build (T_total, V) concat; per-run (V, T_r) → transpose and scale.
-    data_tv = torch.cat(
-        [run_data_list[ri].T * scale for ri in range(n_runs)], dim=0
-    ).contiguous()
-    del run_data_list
-    data_tv = _check_finite(data_tv, "data_tv", args.verb >= 1)
-    _vprint(args.verb >= 1, f"Concat shape: {tuple(data_tv.shape)} (T_total, V)", t_step)
+    if getattr(args, "migp", False):
+        from fastfuncstuff.decomposition.migp import migp_reduce
+
+        migp_n = args.migp_n if args.migp_n > 0 else max(1, 2 * int(run_data_list[0].shape[1]) - 1)
+        runs_tv = [run_data_list[ri].T for ri in range(n_runs)]  # list of (T_r, V)
+        del run_data_list
+        data_tv = migp_reduce(
+            runs_tv,
+            migp_n=migp_n,
+            migp_factor=args.migp_factor,
+            scale_by_n=True,
+            device=device,
+            verbose=args.verb >= 1,
+        ).contiguous()
+        del runs_tv
+        data_tv = _check_finite(data_tv, "data_tv", args.verb >= 1)
+        _vprint(
+            args.verb >= 1,
+            f"MIGP reduced shape: {tuple(data_tv.shape)} (migp_n, V); migp_n={migp_n}",
+            t_step,
+        )
+    else:
+        scale = 1.0 / float(n_runs)
+        # Build (T_total, V) concat; per-run (V, T_r) → transpose and scale.
+        data_tv = torch.cat(
+            [run_data_list[ri].T * scale for ri in range(n_runs)], dim=0
+        ).contiguous()
+        del run_data_list
+        data_tv = _check_finite(data_tv, "data_tv", args.verb >= 1)
+        _vprint(args.verb >= 1, f"Concat shape: {tuple(data_tv.shape)} (T_total, V)", t_step)
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -1648,7 +1672,8 @@ def _run_concat_ica(
     total_mix_var = float(mix_var.sum().item())
     explained_share_t = mix_var / max(total_mix_var, 1e-15)
 
-    sort_idx = torch.argsort(explained_share_t, descending=True)
+    sort_key = stdev_share if args.ordering == "stdev" else explained_share_t
+    sort_idx = torch.argsort(sort_key, descending=True)
     sort_idx_np = sort_idx.detach().cpu().numpy()
     explained_share = explained_share_t[sort_idx].detach().cpu().numpy().astype(np.float32)
     stdev_share_sorted = stdev_share[sort_idx].detach().cpu().numpy().astype(np.float32)
@@ -1827,6 +1852,7 @@ def _run_concat_ica(
         "component_variance_share": explained_share.tolist(),
         "component_total_variance_share": total_share.tolist(),
         "component_spatial_stdev_share": stdev_share_sorted.tolist(),
+        "component_ordering": args.ordering,
         "elapsed_seconds": round(elapsed_total, 2),
         "outputs": {
             "ica_maps": f"{out_prefix}_concat_ica_maps{nii_ext}",
@@ -2234,7 +2260,8 @@ def _run_tensorial_ica(
     total_mix_var = float(mix_var.sum().item())
     explained_share_t = mix_var / max(total_mix_var, 1e-15)
 
-    sort_idx = torch.argsort(explained_share_t, descending=True)
+    sort_key = stdev_share if args.ordering == "stdev" else explained_share_t
+    sort_idx = torch.argsort(sort_key, descending=True)
     explained_share = explained_share_t[sort_idx].detach().cpu().numpy().astype(np.float32)
     stdev_share_sorted = stdev_share[sort_idx].detach().cpu().numpy().astype(np.float32)
 
@@ -2387,6 +2414,7 @@ def _run_tensorial_ica(
         "component_variance_share": explained_share.tolist(),
         "component_total_variance_share": total_share.tolist(),
         "component_spatial_stdev_share": stdev_share_sorted.tolist(),
+        "component_ordering": args.ordering,
         "elapsed_seconds": round(elapsed_total, 2),
         "outputs": {
             "ica_maps_per_run": per_run_map_paths,
@@ -2461,6 +2489,17 @@ def build_parser() -> argparse.ArgumentParser:
         "-auto_no_mp",
         action="store_true",
         help="Disable MP prior in hybrid/current estimator",
+    )
+    basic.add_argument(
+        "-ordering",
+        choices=["var", "stdev"],
+        default="var",
+        help=(
+            "Component sort order: 'var' (default — by mixing variance share) "
+            "or 'stdev' (spatial-stdev share, matches MELODIC `meldata.cc`). "
+            "Hungarian matching is order-invariant; use 'stdev' for "
+            "MELODIC parity diagnostics where component indices must align."
+        ),
     )
 
     proc = parser.add_argument_group("Preprocessing")
@@ -2802,6 +2841,30 @@ def build_parser() -> argparse.ArgumentParser:
             "Tensorial (spatial-concat) ICA: requires runs to share the same T. "
             "Stacks runs along the voxel axis → (T, n_runs*V) and decomposes "
             "to a single shared temporal mixing with per-run spatial maps."
+        ),
+    )
+    modes.add_argument(
+        "-migp",
+        action="store_true",
+        help=(
+            "tcat only: use MELODIC's incremental group PCA (Smith 2014) to "
+            "reduce the running stack to migp_n PC time-courses on the fly. "
+            "Bounds peak memory at migp_factor*migp_n*V regardless of run count."
+        ),
+    )
+    modes.add_argument(
+        "-migp_n", type=int, default=0,
+        help=(
+            "MIGP target dimensionality. 0 (default) → 2*T_first_run - 1 to "
+            "match MELODIC's auto-pick."
+        ),
+    )
+    modes.add_argument(
+        "-migp_factor", type=float, default=2.0,
+        help=(
+            "MIGP reduction trigger: reduce when stack exceeds factor * migp_n rows. "
+            "Default 2.0 matches MELODIC (--migp_factor). Larger values batch more "
+            "files between SVD reductions (fewer calls, more peak memory)."
         ),
     )
     vn_group = modes.add_mutually_exclusive_group()
