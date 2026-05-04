@@ -75,8 +75,9 @@ class FastICA:
         Maximum iterations for FastICA convergence
     tol : float, default=1e-4
         Tolerance for convergence
-    fun : str, default='logcosh'
-        Nonlinearity function: 'logcosh', 'exp', or 'cube'
+    fun : str, default='pow3'
+        Nonlinearity function: 'pow3' (MELODIC's update rule, default),
+        'cube' (standard FastICA cube), 'logcosh', or 'exp'
     random_state : int, optional
         Random seed for reproducibility
     whiten : bool, default=True
@@ -116,7 +117,7 @@ class FastICA:
         pca_components: int | float | str | None = 0.85,
         max_iter: int = 500,
         tol: float = 5e-5,
-        fun: str = "logcosh",
+        fun: str = "pow3",
         random_state: int | None = None,
         whiten: bool = True,
         device: torch.device | None = None,
@@ -436,6 +437,9 @@ class FastICA:
         # Restore TF32 setting
         if _saved_tf32_ica is not None:
             torch.backends.cuda.matmul.allow_tf32 = _saved_tf32_ica
+
+        # Expose final convergence delta for diagnostics (parity vs MELODIC).
+        self._final_delta = float(delta.item())
 
         # Return W in the original data dtype
         return W.to(orig_dtype), n_iter + 1

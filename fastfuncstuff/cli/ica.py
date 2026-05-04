@@ -1376,7 +1376,16 @@ def _run_concat_ica(
         from fastfuncstuff.decomposition.migp import migp_reduce
 
         migp_n = args.migp_n
-        runs_tv = [run_data_list[ri].T for ri in range(n_runs)]  # list of (T_r, V)
+        run_indices = list(range(n_runs))
+        if getattr(args, "migp_shuffle", None):
+            run_indices = [int(x) for x in args.migp_shuffle.split(",")]
+            if len(run_indices) != n_runs or set(run_indices) != set(range(n_runs)):
+                raise ValueError(
+                    f"-migp_shuffle must be a permutation of 0..{n_runs - 1}, "
+                    f"got: {args.migp_shuffle}"
+                )
+            _vprint(args.verb >= 1, f"MIGP shuffle: {run_indices}")
+        runs_tv = [run_data_list[ri].T for ri in run_indices]  # list of (T_r, V)
         del run_data_list
         data_tv = migp_reduce(
             runs_tv,
@@ -1406,6 +1415,23 @@ def _run_concat_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    # --- Trace: dump MIGP/concat output BEFORE varnorm ---
+    # Lets us recover MELODIC's noise_std map by dividing FFS pre-varnorm by
+    # MELODIC's post-varnorm concat_data.nii.gz, isolating varnorm divergence.
+    _trace_dir_pre = getattr(args, "trace", None)
+    if _trace_dir_pre:
+        from pathlib import Path
+        _td_pre: Path = Path(_trace_dir_pre)
+        _td_pre.mkdir(parents=True, exist_ok=True)
+        np.save(_td_pre / "migp_pre_varnorm.npy", data_tv.cpu().numpy())
+        if mask3d is not None:
+            import nibabel as _nib
+            _nib.save(
+                _nib.Nifti1Image(mask3d.astype(np.uint8), affine),
+                str(_td_pre / "mask.nii.gz"),
+            )
+        _vprint(args.verb >= 1, f"Trace: pre-varnorm MIGP → {_td_pre}/migp_pre_varnorm.npy")
+
     # --- Variance normalization (MELODIC varnorm2 on the concat matrix) ---
     # setup_migp:579-584 — single voxel-wise varnorm on the fully-concatenated
     # Data using min(30, Data.Nrows()-1) PCs. We honor -sep_vn as an escape
@@ -1425,8 +1451,20 @@ def _run_concat_ica(
         noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
             data_tv.T, pca_dim=pca_dim_vn, level=2.3
         )
+        # Trace: persist FFS varnorm map BEFORE consuming/freeing it.
+        _trace_dir_vn = getattr(args, "trace", None)
+        if _trace_dir_vn:
+            from pathlib import Path as _PathVN
+            _td_vn = _PathVN(_trace_dir_vn)
+            _td_vn.mkdir(parents=True, exist_ok=True)
+            np.save(_td_vn / "ffs_noise_std.npy", noise_std_map.cpu().numpy())
+            np.save(_td_vn / "ffs_const_mask.npy", const_mask_vn.cpu().numpy())
         data_tv_vt = apply_varnorm_map(data_tv.T, noise_std_map, const_mask_vn)
         data_tv = data_tv_vt.T.contiguous()
+        # Trace: also dump the post-varnorm concat (T,V) for direct comparison
+        # to MELODIC's concat_data.nii.gz.
+        if _trace_dir_vn:
+            np.save(_PathVN(_trace_dir_vn) / "migp_post_varnorm.npy", data_tv.cpu().numpy())
         del data_tv_vt, noise_std_map, const_mask_vn
         _vprint(
             args.verb >= 1,
@@ -1520,6 +1558,7 @@ def _run_concat_ica(
     data_centered = data_tv - row_mean
     cov_t = (data_centered @ data_centered.T) / float(n_vox_masked)
     evals_t, evecs_t = torch.linalg.eigh(cov_t)
+    _trace_cov = cov_t.cpu().numpy() if getattr(args, "trace", None) else None
     del cov_t
     idx = torch.argsort(evals_t, descending=True)
     evals_t = torch.clamp(evals_t[idx][:order], min=1e-12)
@@ -1528,7 +1567,25 @@ def _run_concat_ica(
     WM = (evecs_t / sqrt_ev.unsqueeze(0)).T  # (order, T_total)
     DWM = evecs_t * sqrt_ev.unsqueeze(0)  # (T_total, order)
     x_t = WM @ data_centered  # (order, V)
-    del data_centered, WM, evals_t, evecs_t, sqrt_ev
+
+    # --- Trace: dump PCA intermediates ---
+    trace_dir = getattr(args, "trace", None)
+    if trace_dir:
+        from pathlib import Path as _P
+        _td = _P(trace_dir)
+        _td.mkdir(parents=True, exist_ok=True)
+        _evals_full = evals_t.cpu().numpy()
+        _eigenvalues_pct = np.cumsum(_evals_full) / _evals_full.sum()
+        np.savetxt(_td / "eigenvalues_adjusted", _evals_full, fmt="%.10g")
+        np.savetxt(_td / "eigenvalues_percent", _eigenvalues_pct, fmt="%.10g")
+        np.save(_td / "white_matrix.npy", WM.cpu().numpy())
+        np.save(_td / "dewhite_matrix.npy", DWM.cpu().numpy())
+        np.save(_td / "pca_eigenvalues.npy", _evals_full)
+        if _trace_cov is not None:
+            np.save(_td / "cov_temporal.npy", _trace_cov)
+        _vprint(args.verb >= 1, f"Trace: PCA intermediates → {_td}")
+
+    del data_centered, evals_t, evecs_t, sqrt_ev
     # Keep unwhitened (T_total, V) for noise-norm + mixing dewhitening.
     orig_concat_tv = data_tv
     del data_tv
@@ -1637,7 +1694,7 @@ def _run_concat_ica(
     # Map back to data space with DWM, then split per-run for TCs.
     mixing_pca = mixing  # (order, k)
     mixing = DWM @ mixing_pca  # (T_total, k)
-    del mixing_pca, DWM
+    del mixing_pca
     per_run_tcs: list[np.ndarray] = []
     offs = 0
     for ri in range(n_runs):
@@ -1696,6 +1753,26 @@ def _run_concat_ica(
         mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
         mixing = mixing / mixing_std
 
+    # --- Trace: dump ICA intermediates ---
+    if trace_dir:
+        from pathlib import Path as _P
+        from scipy.stats import kurtosis as _kurt, skew as _skew
+        _td = _P(trace_dir)
+        _td.mkdir(parents=True, exist_ok=True)
+        comp_np = components.detach().cpu().numpy()
+        mix_np = mixing.detach().cpu().numpy()
+        np.save(_td / "ic_maps.npy", comp_np)
+        np.savetxt(_td / "mix_matrix", mix_np, fmt="%.10g")
+        if isinstance(WM, torch.Tensor):
+            np.savetxt(_td / "white_matrix", WM.cpu().numpy(), fmt="%.10g")
+        if isinstance(DWM, torch.Tensor):
+            np.savetxt(_td / "dewhite_matrix", DWM.cpu().numpy(), fmt="%.10g")
+        ic_kurt = np.array([_kurt(c) for c in comp_np])
+        ic_skew = np.array([_skew(c) for c in comp_np])
+        ic_stats = np.column_stack([explained_share, stdev_share_sorted, ic_kurt, ic_skew])
+        np.savetxt(_td / "ICstats", ic_stats, fmt="%.10g")
+        _vprint(args.verb >= 1, f"Trace: ICA intermediates → {_td}")
+
     # --- MELODIC-style noise normalization ---
     if x_t is not None:
         _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
@@ -1706,6 +1783,10 @@ def _run_concat_ica(
         )
         _vprint(args.verb >= 1, noise_norm_msg)
     del x_t
+    if isinstance(WM, torch.Tensor):
+        del WM
+    if isinstance(DWM, torch.Tensor):
+        del DWM
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -2824,6 +2905,17 @@ def build_parser() -> argparse.ArgumentParser:
             "otherwise path is treated as an output directory."
         ),
     )
+    out.add_argument(
+        "-trace",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Dump intermediate matrices for step-by-step parity validation. "
+            "Writes eigenvalues, whitening/dewhitening, unmixing, mixing, "
+            "and IC stats as .npy files to DIR (matches MELODIC --debug outputs)."
+        ),
+    )
 
     modes = parser.add_argument_group("Multi-run modes")
     modes.add_argument(
@@ -2866,6 +2958,17 @@ def build_parser() -> argparse.ArgumentParser:
             "MIGP reduction trigger: reduce when stack exceeds factor * migp_n rows. "
             "Default 2.0 matches MELODIC (--migp_factor). Larger values batch more "
             "files between SVD reductions (fewer calls, more peak memory)."
+        ),
+    )
+    modes.add_argument(
+        "-migp_shuffle",
+        type=str,
+        default=None,
+        metavar="ORDER",
+        help=(
+            "Reorder runs before MIGP accumulation. Comma-separated 0-based "
+            "indices, e.g. '1,0,3,2,4'. MELODIC randomizes file order; use this "
+            "to reproduce MELODIC's order for parity validation. Only used with -migp."
         ),
     )
     vn_group = modes.add_mutually_exclusive_group()

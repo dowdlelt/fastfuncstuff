@@ -196,9 +196,9 @@ def parse_args():
     # Advanced options
     parser.add_argument(
         "-fun",
-        default="logcosh",
-        choices=["logcosh", "exp", "cube"],
-        help="ICA nonlinearity function (default: logcosh)",
+        default="pow3",
+        choices=["pow3", "cube", "logcosh", "exp"],
+        help="ICA nonlinearity function (default: pow3, matching MELODIC)",
     )
 
     parser.add_argument(
