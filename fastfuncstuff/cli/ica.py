@@ -1375,7 +1375,7 @@ def _run_concat_ica(
     if getattr(args, "migp", False):
         from fastfuncstuff.decomposition.migp import migp_reduce
 
-        migp_n = args.migp_n if args.migp_n > 0 else max(1, 2 * int(run_data_list[0].shape[1]) - 1)
+        migp_n = args.migp_n
         runs_tv = [run_data_list[ri].T for ri in range(n_runs)]  # list of (T_r, V)
         del run_data_list
         data_tv = migp_reduce(
@@ -1390,7 +1390,8 @@ def _run_concat_ica(
         data_tv = _check_finite(data_tv, "data_tv", args.verb >= 1)
         _vprint(
             args.verb >= 1,
-            f"MIGP reduced shape: {tuple(data_tv.shape)} (migp_n, V); migp_n={migp_n}",
+            f"MIGP reduced shape: {tuple(data_tv.shape)} (migp_n, V); "
+            f"migp_n={data_tv.shape[0]}{' (auto)' if migp_n is None else ''}",
             t_step,
         )
     else:
@@ -2853,10 +2854,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     modes.add_argument(
-        "-migp_n", type=int, default=0,
+        "-migp_n", type=int, default=None,
         help=(
-            "MIGP target dimensionality. 0 (default) → 2*T_first_run - 1 to "
-            "match MELODIC's auto-pick."
+            "MIGP target dimensionality. Default (unset) → 2*T_first_run - 1 "
+            "matching MELODIC's auto-pick."
         ),
     )
     modes.add_argument(

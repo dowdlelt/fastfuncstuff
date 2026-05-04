@@ -108,6 +108,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"ffs_ica -input {inputs} "
             f"{mask_arg} "
             f"-temp_concat -ordering stdev "
+            f"-migp "
             f"-prefix {ctx.ffs_ica_dir / f'all_{dataset}'} -verbose",
             label=f"ffs_ica {dataset}",
             cwd=ctx.ffs_ica_dir,
@@ -136,21 +137,16 @@ def validate(ctx: BenchmarkContext) -> dict:
     overall_cov = sum(cov_05) / len(cov_05)
 
     passed = (
-        overall_mean >= THRESHOLDS["mean_matched_r"]
-        and overall_cov >= THRESHOLDS["coverage_0.5"]
+        overall_mean >= THRESHOLDS["mean_matched_r"] and overall_cov >= THRESHOLDS["coverage_0.5"]
     )
 
-    comp_counts = {
-        ds: (r["n_components_a"], r["n_components_b"]) for ds, r in results.items()
-    }
+    comp_counts = {ds: (r["n_components_a"], r["n_components_b"]) for ds, r in results.items()}
 
     return {
         "passed": passed,
         "summary": (
             f"mean |r|={overall_mean:.4f}, coverage@0.5={overall_cov:.2f}, "
-            + ", ".join(
-                f"{ds}: melodic={na} ffs={nb}" for ds, (na, nb) in comp_counts.items()
-            )
+            + ", ".join(f"{ds}: melodic={na} ffs={nb}" for ds, (na, nb) in comp_counts.items())
         ),
         "per_dataset": results,
     }
