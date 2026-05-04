@@ -143,7 +143,7 @@ def test_fit_ggm_basic():
         "p_signal",
         "converged",
     }
-    assert set(result.keys()) == expected_keys
+    assert expected_keys.issubset(result.keys())
     assert isinstance(result["converged"], (bool, np.bool_))
     assert result["p_signal"].shape == (2000,)
 

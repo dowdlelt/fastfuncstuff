@@ -35,7 +35,14 @@ def _melodic_mask(ctx: BenchmarkContext, dataset: str) -> Path:
 
 
 def _ffs_ic(ctx: BenchmarkContext, dataset: str) -> Path:
-    return ctx.ffs_ica_dir / f"all_{dataset}_concat_ica_maps.nii.gz"
+    """FFS GMM-z'd component maps (apples-to-apples vs MELODIC's `melodic_IC`).
+
+    MELODIC's `melodic_IC.nii.gz` stores the GGM-mixture-modeled z-stat maps,
+    not the raw ICA components. We therefore compare against ffs_ica's
+    `*_concat_ica_zmaps.nii.gz` (output of `batch_mixture_zscores` ⇒ same
+    space as MELODIC's IC).
+    """
+    return ctx.ffs_ica_dir / f"all_{dataset}_concat_ica_zmaps.nii.gz"
 
 
 def _mni_inputs(ctx: BenchmarkContext, dataset: str) -> list[Path]:
@@ -100,7 +107,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         elapsed, _ = run_timed(
             f"ffs_ica -input {inputs} "
             f"{mask_arg} "
-            f"-temp_concat "
+            f"-temp_concat -ordering stdev "
             f"-prefix {ctx.ffs_ica_dir / f'all_{dataset}'} -verbose",
             label=f"ffs_ica {dataset}",
             cwd=ctx.ffs_ica_dir,
