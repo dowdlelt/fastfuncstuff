@@ -371,6 +371,19 @@ Examples:
         "-Onuisance", help="Output OLS betas + statistics for NUISANCE regressors only"
     )
 
+    # FDR options
+    fdr_group = parser.add_argument_group("FDR Options")
+    fdr_group.add_argument(
+        "-add_fdr",
+        action="store_true",
+        help=(
+            "Compute and store AFNI FDRCURVE attributes for every stat sub-brick "
+            "in -Rbuck / -Obuck / -Rnuisance / -Onuisance outputs (matches AFNI's "
+            "3drefit -addFDR behavior). The GUI / fdrval can then read q from a "
+            "threshold without re-running BH."
+        ),
+    )
+
     # Special output options
     special_out = parser.add_argument_group("Special Output Options")
     special_out.add_argument(
@@ -1438,6 +1451,7 @@ def main():
                     contrast_names=contrast_names,
                     contrast_results=ols_contrast_results,
                     output_format="nifti_gz",  # Force NIfTI output
+                    add_fdr=args.add_fdr,
                 )
 
             if args.Obeta:
@@ -1482,6 +1496,7 @@ def main():
                         args.Onuisance,
                         condition_names=stim_labels,
                         output_format="nifti_gz",  # Force NIfTI output
+                        add_fdr=args.add_fdr,
                     )
 
             if want_single_trials:
@@ -1921,6 +1936,7 @@ def main():
             contrast_names=contrast_names,
             contrast_results=contrast_results,
             output_format="nifti_gz",  # Force NIfTI output
+            add_fdr=args.add_fdr,
         )
 
     if args.Rbeta:
@@ -1977,6 +1993,7 @@ def main():
             args.Rnuisance,
             condition_names=nuisance_names,
             output_format="nifti_gz",  # Force NIfTI output
+            add_fdr=args.add_fdr,
         )
 
     if args.Rvar:
