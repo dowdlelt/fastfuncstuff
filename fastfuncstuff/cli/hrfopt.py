@@ -125,9 +125,11 @@ Examples:
                -prefix sub01_with_nuisance
 
 Outputs:
-  {prefix}_hrf_index.nii.gz       - Which HRF (1-N) was selected per voxel
-  {prefix}_xval_r2.nii.gz         - Cross-validated R² for selected HRF
+  {prefix}_hrf_index.nii.gz       - 2-sub-brick bucket: [0] HRF index (1-N), [1] R² at selected HRF
+                                     Use sub-brick [1] to threshold the index map in AFNI
+  {prefix}_xval_r2.nii.gz         - Cross-validated R² for selected HRF (standalone copy)
   {prefix}_xval_r2_all_hrfs.nii.gz - 4D: CV R² for each HRF (volume per HRF)
+  {prefix}_selected_hrfs.nii.gz   - 4D: the winning HRF shape per voxel (x,y,z,hrf_timepoints at microtime_dt)
   {prefix}_stats.nii.gz           - Final GLM betas and t-stats (AFNI bucket format)
   {prefix}_hrf_library.pt         - HRF library + voxel assignments for ARMA reuse
   {prefix}_metadata.json          - Full metadata for reproducibility
@@ -293,6 +295,17 @@ Notes:
             "'0.5' for split-halves, "
             "any float (0-1) for that train fraction, "
             "any int > 1 for leave-N-out"
+        ),
+    )
+    cv_opts.add_argument(
+        "-select",
+        choices=["xval", "full"],
+        default="xval",
+        help=(
+            "HRF selection criterion. "
+            "'xval': cross-validated R² (LORO or split-half, default). "
+            "'full': in-sample R² on all data (GLMsingle FITHRF behaviour; "
+            "faster, automatically chosen when only one run is present)."
         ),
     )
     cv_opts.add_argument(
@@ -1095,6 +1108,7 @@ def main():
             verbose=args.verb >= 1,
             chunk_size=args.batch_size,
             r2_method=args.R2method,
+            select_mode=args.select,
             debug=args.debug,
             debug_prefix=args.prefix,
             condition_labels=condition_labels,
