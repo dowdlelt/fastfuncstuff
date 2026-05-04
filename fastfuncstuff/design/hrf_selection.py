@@ -711,7 +711,7 @@ def fit_glm_hrf_library_with_xval(
     Notes
     -----
     The final fit groups voxels by their selected HRF to maintain GPU efficiency.
-    This is similar to how 3dREMLfast handles voxel-wise ARMA parameters.
+    This is similar to how ffs_reml handles voxel-wise ARMA parameters.
     """
     if device is None:
         device = get_device()
@@ -1436,7 +1436,7 @@ def _fit_voxelwise_hrf(
 
     This is the key efficiency trick: instead of fitting each voxel separately,
     we group voxels by their selected HRF and fit each group together.
-    Similar to how 3dREMLfast handles voxel-wise ARMA parameters.
+    Similar to how ffs_reml handles voxel-wise ARMA parameters.
 
     Parameters
     ----------

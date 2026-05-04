@@ -536,7 +536,7 @@ def main():
     # Validate: FIR is incompatible with single-trial
     if is_fir_model:
         print("ERROR: FIR/TENT models are incompatible with single-trial estimation")
-        print("  Use 3dDenoisefast or 3dREMLfast for FIR/TENT analysis")
+        print("  Use 3dDenoisefast or ffs_reml for FIR/TENT analysis")
         sys.exit(1)
 
     # SPMG2/SPMG3 with HRF library is incompatible (checked in create_single_trial_design)

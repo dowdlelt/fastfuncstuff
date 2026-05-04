@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-3dREMLfast - Fast ARMA(1,1) GLM for fMRI using GPU acceleration
+ffs_reml - Fast ARMA(1,1) GLM for fMRI using GPU acceleration
 
 This is a PyTorch/GPU-accelerated implementation of AFNI's 3dREMLfit,
 providing 5-50x speedup for ARMA(1,1) prewhitened GLM fitting.
 
 Basic usage:
-    3dREMLfast -input func.nii.gz -matrix X.xmat.1D -Rnuisance stats_REML
+    ffs_reml -input func.nii.gz -matrix X.xmat.1D -Rnuisance stats_REML
 
 For help:
-    3dREMLfast -help
+    ffs_reml -help
 """
 
 import argparse
@@ -274,43 +274,43 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefa
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
-        description="3dREMLfast - Fast GPU-accelerated ARMA(1,1) GLM fitting",
+        description="ffs_reml - Fast GPU-accelerated ARMA(1,1) GLM fitting",
         formatter_class=_HelpFormatter,
         epilog="""
 Examples:
   # Basic REML analysis with main bucket output
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D -Rbuck stats_REML
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D -Rbuck stats_REML
   
   # Multiple runs
-  3dREMLfast -input "run1.nii.gz run2.nii.gz run3.nii.gz" \\
+  ffs_reml -input "run1.nii.gz run2.nii.gz run3.nii.gz" \\
              -matrix X.xmat.1D -Rbuck stats_REML
   
   # With all outputs
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -Rvar params_REML \\
              -Rfitts fitts_REML -Rerrts errts_REML \\
              -Rbeta betas_only_REML -fout -tout -rout
   
   # With OLS comparison
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -Obuck stats_OLS
   
   # Nuisance regressors only
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rnuisance nuisance_REML -Onuisance nuisance_OLS
 
   # Single-trial outputs (reordered by onset time)
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -single_trials movie
   # Creates: ols_movie_single.nii.gz, reml_movie_single.nii.gz
 
   # Custom ARMA grid with double precision
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -use_double \\
              -a_grid 0.0,0.9,10 -b_grid -0.8,0.8,17
 
   # Manual batch size control (for memory tuning)
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -batch_size 2000
         """,
     )
@@ -660,7 +660,7 @@ def print_header(args):
     from datetime import datetime
 
     print("=" * 70)
-    print("3dREMLfast - GPU-Accelerated ARMA(1,1) GLM")
+    print("ffs_reml - GPU-Accelerated ARMA(1,1) GLM")
     print("=" * 70)
     print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
@@ -1072,7 +1072,7 @@ def main():
         n_basis = hrf_info["n_basis"]
         condition_labels_full = hrf_info["condition_labels_full"]
 
-        # 3dREMLfast doesn't support -hrf_opt or -single_trial, so no compatibility check needed
+        # ffs_reml doesn't support -hrf_opt or -single_trial, so no compatibility check needed
         # (FIR is compatible with ARMA modeling)
 
         # Compute run starts from input files
@@ -1128,13 +1128,13 @@ def main():
             tr=args.tr,
             microtime_dt=args.microtime_dt,
             device=device,
-            hrf_opt=None,  # 3dREMLfast doesn't support per-voxel HRFs
+            hrf_opt=None,  # ffs_reml doesn't support per-voxel HRFs
             hrf_library=None,
             hrf_indices=None,
             n_voxels=None,
         )
 
-        assert task_design is not None, "3dREMLfast requires single design (no per-voxel HRFs)"
+        assert task_design is not None, "ffs_reml requires single design (no per-voxel HRFs)"
         print(f"  Task design shape: {task_design.shape}")
 
         # Build nuisance design (polynomials + ortvec)
@@ -1343,7 +1343,7 @@ def main():
 
         print()
         print("=" * 70)
-        print("✅ 3dREMLfast (single-trial mode) Complete!")
+        print("✅ ffs_reml (single-trial mode) Complete!")
         print("=" * 70)
         print(f"  Median beta-space R²: {xval['r2'].median():.4f}")
         print(f"  {xval['n_test_trials_total']} test trials across {xval['n_splits']} folds")
@@ -2459,7 +2459,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("✅ 3dREMLfast completed successfully!")
+    print("✅ ffs_reml completed successfully!")
     print("=" * 70)
 
 

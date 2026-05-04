@@ -139,7 +139,7 @@ Notes:
   - Nuisance files (-ortvec) must be pre-concatenated across runs (matching total timepoints)
   - Common nuisance files: motion parameters (6 columns), physiological regressors, etc.
   - Future: onset files with 'married' durations (e.g., "1:2 4:5") will be supported
-  - HRF library is saved for later ARMA/REML analysis with 3dREMLfast
+  - HRF library is saved for later ARMA/REML analysis with ffs_reml
         """,
     )
 
