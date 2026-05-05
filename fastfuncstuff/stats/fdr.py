@@ -111,6 +111,39 @@ def _storey_pi0(p_sorted: torch.Tensor, lambda_: float = 0.5) -> float:
     return float(min(1.0, max(0.0, above / max(1.0 - lambda_, 1e-12) / n)))
 
 
+def _afni_qfac(p_sorted: torch.Tensor) -> float:
+    """AFNI-style q-scaling factor (mri_fdrize.c::estimate_m1 + qfac remap).
+
+    Histograms p-values in [0.15, 0.95] across 16 bins of width 0.05, takes
+    two estimates of m0 from median bins, picks the larger m0 (smaller m1),
+    then returns qfac = (nq-m1)/nq with AFNI's qfac<0.5 kink remap.
+    Returns 1.0 if there isn't enough data (matches AFNI's mone=0 branch).
+    """
+    nq = p_sorted.numel()
+    if nq < 233:
+        return 1.0
+    p_np = p_sorted.detach().cpu().numpy()
+    in_range = (p_np >= 0.15) & (p_np < 0.95)
+    nh = int(in_range.sum())
+    if nh < 160:
+        return 1.0
+    bins = np.floor((p_np[in_range] - 0.15) * 20.0).astype(np.int64)
+    bins = np.clip(bins, 0, 15)
+    hist = np.bincount(bins, minlength=16).astype(np.float64)
+    hist.sort()
+    ma = nq - 20.0 * (hist[6] + 2 * hist[7] + 2 * hist[8] + hist[9]) / 6.0
+    mb = nq - 20.0 * (
+        hist[5] + 2 * hist[6] + 2 * hist[7] + 2 * hist[8] + 2 * hist[9] + hist[10]
+    ) / 10.0
+    mone = float(min(ma, mb))
+    if mone <= 0.0:
+        return 1.0
+    qfac = (nq - mone) / float(nq)
+    if qfac < 0.5:
+        qfac = 0.25 + qfac * qfac
+    return float(qfac)
+
+
 @torch.inference_mode()
 def fdr_qvalues(
     stats: torch.Tensor,
@@ -119,7 +152,8 @@ def fdr_qvalues(
     dof: float | tuple[float, float] | None = None,
     pvalues: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
-    pi0: bool = True,
+    pi0: bool = False,
+    correction: str = "m1",
 ) -> torch.Tensor:
     """Per-voxel BH FDR q-values (optionally Storey-corrected).
 
@@ -136,7 +170,12 @@ def fdr_qvalues(
     mask : bool Tensor, optional
         Voxels to include. Default: stats != 0 and finite.
     pi0 : bool
-        If True, scale q by Storey's pi0 estimate (matches AFNI's m1 spirit).
+        Deprecated alias: if True, use Storey's pi0 estimator (overrides
+        ``correction``). Prefer ``correction="pi0"``.
+    correction : {"m1", "pi0", "none"}
+        Multiplicative q-scaling correction. ``"m1"`` (default) matches
+        AFNI's `mri_fdrize` qfac (histogram-based m1 estimator + kink
+        remap). ``"pi0"`` uses Storey 2002. ``"none"`` skips scaling.
 
     Returns
     -------
@@ -167,8 +206,13 @@ def fdr_qvalues(
     sort_p, sort_idx = torch.sort(p_use)
     ranks = torch.arange(1, n_use + 1, device=p_use.device, dtype=p_use.dtype)
     q_sorted = (sort_p * n_use) / ranks
-    if pi0:
+    mode = "pi0" if pi0 else correction
+    if mode == "pi0":
         q_sorted = q_sorted * _storey_pi0(sort_p)
+    elif mode == "m1":
+        q_sorted = q_sorted * _afni_qfac(sort_p)
+    elif mode != "none":
+        raise ValueError(f"Unknown correction mode: {correction!r}")
     # Monotonicity: cummin from the right (largest p downward).
     q_sorted = torch.flip(q_sorted, dims=(0,))
     q_sorted = torch.cummin(q_sorted, dim=0).values
@@ -193,12 +237,23 @@ def fdr_qvalues(
 def _q_to_z(q: np.ndarray) -> np.ndarray:
     """AFNI z(q) = qginv(q/2): inverse upper-tail Gaussian of q/2.
 
-    For q very small this gives a large positive z; q=1 → z=0.
+    Mirrors `mri_fdrize.c`'s post-q→z mapping exactly:
+        q < QBOT   → z = ZTOP  (saturated, "honking big")
+        q >= 1.0   → z = 0.0
+        else       → z = -ndtri(q/2)
+    Using QBOT=2.25718e-19 and ZTOP=9.0 ensures the curve-build's klast trim
+    (drop trailing z >= ZTOP) fires the same way as AFNI, so dx/x0 line up.
     """
-    q = np.clip(q, 1e-15, 1.0)
-    # ndtri returns the inverse CDF of N(0,1); we need upper-tail inverse.
-    # qginv(p) = -ndtri(p)  ⇒  z(q) = -ndtri(q/2)
-    return -ndtri(q / 2.0)
+    QBOT = 2.25718e-19
+    ZTOP = 9.0
+    q = np.asarray(q, dtype=np.float64)
+    z = np.zeros_like(q)
+    sat = q < QBOT
+    valid = (q >= QBOT) & (q < 1.0)
+    z[sat] = ZTOP
+    z[valid] = -ndtri(q[valid] / 2.0)
+    # q >= 1.0 stays at 0.0 (already zeroed).
+    return z
 
 
 def compute_fdr_curve(
@@ -207,7 +262,8 @@ def compute_fdr_curve(
     dof: float | tuple[float, float],
     mask: np.ndarray | torch.Tensor | None = None,
     n_curve: int = 101,
-    pi0: bool = True,
+    pi0: bool = False,
+    correction: str = "m1",
 ) -> dict:
     """Build a 101-point AFNI FDRCURVE for one stat sub-brick.
 
@@ -226,7 +282,7 @@ def compute_fdr_curve(
     else:
         m = torch.isfinite(s) & (s != 0)
 
-    q = fdr_qvalues(s, stat_code=stat_code, dof=dof, mask=m, pi0=pi0)
+    q = fdr_qvalues(s, stat_code=stat_code, dof=dof, mask=m, pi0=pi0, correction=correction)
 
     s_in = s[m].cpu().numpy().astype(np.float64)
     q_in = q[m].cpu().numpy().astype(np.float64)
@@ -236,24 +292,50 @@ def compute_fdr_curve(
     if s_in.size == 0:
         return {"x0": 0.0, "dx": 1.0, "z": np.zeros(n_curve, dtype=np.float32)}
 
-    # Build z(q) for in-mask voxels, sort by stat, interpolate onto grid.
+    # AFNI builds the FDRCURVE in |stat| space (see mri_fdrize.c::mri_fdr_curve:
+    # `tar[ii] = fabsf(far[iq[ii]])`). Mirror that exactly — using signed-stat
+    # range gives a non-monotone curve for two-sided stats and breaks AFNI's
+    # GUI direct-q-set feature.
     z_vals = _q_to_z(q_in)
-    s_sorted = np.sort(s_in)
-    # Make z monotone non-decreasing in |stat|: AFNI sorts by z ascending and
-    # uses the upper envelope. For a faithful curve we take cummax of z over
-    # increasing |stat|, matching AFNI's "extreme value" reading.
-    abs_order = np.argsort(np.abs(s_in), kind="stable")
-    s_abs = np.abs(s_in)[abs_order]
+    s_abs_all = np.abs(s_in)
+    abs_order = np.argsort(s_abs_all, kind="stable")
+    s_abs = s_abs_all[abs_order]
+    # q is monotone non-increasing in |stat| after BH cummin, so z is monotone
+    # non-decreasing — the cummax is a numerical safety net for tied stats.
     z_abs = np.maximum.accumulate(z_vals[abs_order])
-    s_grid_min = float(s_sorted[0])
-    s_grid_max = float(s_sorted[-1])
+
+    # AFNI's mri_fdr_curve drops trailing entries where z(q) >= ZTOP=9.0.
+    # In practice the cap that matters for fMRI data is usually lower: BH +
+    # PBOT-floor saturate z at ~7-8 long before ZTOP. Once z plateaus, every
+    # higher |stat| is paired with the same z, so the grid wastes its 101
+    # points on a flat tail (and dx blows up). Clip the grid at the smallest
+    # |stat| that already attains z_max — gives the same lookup table but
+    # with AFNI-like dx in the meaningful range.
+    ZTOP = 9.0
+    n_pts = z_abs.size
+    klast = n_pts - 1
+    while klast > 0 and z_abs[klast] >= ZTOP:
+        klast -= 1
+    if klast == 0:
+        return {"x0": 0.0, "dx": 1.0, "z": np.zeros(n_curve, dtype=np.float32)}
+    if klast < n_pts - 1:
+        klast += 1
+    z_max = float(z_abs[klast])
+    # Plateau-trim: find first index whose z is within float32 epsilon of z_max.
+    plateau = np.searchsorted(z_abs[: klast + 1], z_max - 1e-6, side="left")
+    if plateau < klast:
+        klast = int(plateau) + 1  # keep one entry past the saturation onset
+    s_abs = s_abs[: klast + 1]
+    z_abs = z_abs[: klast + 1]
+
+    s_grid_min = float(s_abs[0])
+    s_grid_max = float(s_abs[-1])
     if s_grid_max <= s_grid_min:
         s_grid_max = s_grid_min + 1.0
     dx = (s_grid_max - s_grid_min) / (n_curve - 1)
     grid = s_grid_min + np.arange(n_curve, dtype=np.float64) * dx
 
-    # Interpolate using |stat| → z mapping (AFNI builds curves in this space).
-    z_curve = np.interp(np.abs(grid), s_abs, z_abs, left=0.0, right=z_abs[-1])
+    z_curve = np.interp(grid, s_abs, z_abs, left=z_abs[0], right=z_abs[-1])
     return {
         "x0": float(s_grid_min),
         "dx": float(dx),
@@ -286,8 +368,7 @@ def add_fdrcurves_to_nifti(
     path = Path(nifti_path)
     # Fully materialize the data into memory and rebuild a fresh image so
     # nib.save below can rewrite `path` without racing a memory map / lazy
-    # ArrayProxy still pointing at the on-disk file (caused SIGBUS, leaving
-    # a 16 KB header stub).
+    # ArrayProxy still pointing at the on-disk file (caused SIGBUS).
     src = nib.load(str(path), mmap=False)
     data = np.asarray(src.dataobj)
     header = src.header.copy()

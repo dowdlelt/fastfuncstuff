@@ -8,6 +8,7 @@ from . import (
     build_design,
     crossalign,
     glm,
+    glm_fdr,
     glm_im,
     glm_im_reml,
     glm_tent,
@@ -32,7 +33,7 @@ ALL_STAGES = [
     ica_trace, ica_solver,
     automask, nordic, sauna,
     glmsingle_prep, glmsingle_matlab, glmsingle_hrf, glmsingle_denoise, glmsingle_ridge,
-    glm_tent, glm_im, glm_im_reml,
+    glm_tent, glm_fdr, glm_im, glm_im_reml,
 ]
 
 STAGE_MAP = {s.name: s for s in ALL_STAGES}
