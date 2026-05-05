@@ -361,11 +361,18 @@ def _run_single_ica(
     if args.voxel_norm:
         _vsection(args.verb >= 1, "Voxel Variance Normalization")
         t_step = time.time()
+        _trace_single_dir = getattr(args, "trace", None)
+        _trace_vn_dir = None
+        if _trace_single_dir:
+            from pathlib import Path as _Pvn
+            _trace_vn_dir = _Pvn(_trace_single_dir) / run_tag
+            _trace_vn_dir.mkdir(parents=True, exist_ok=True)
         data_vox_t, norm_msg = ica_workflow.apply_voxel_variance_normalization(
             data_vox_t=data_vox_t,
             num_spec=num_spec,
             n_t=n_t,
             n_vox_masked=n_vox_masked,
+            trace_dir=_trace_vn_dir,
         )
         data_vox_t = _check_finite(data_vox_t, "post-voxel-norm", args.verb >= 1)
         _vprint(args.verb >= 1, norm_msg, t_step)
@@ -560,6 +567,23 @@ def _run_single_ica(
         if hasattr(ica, "pca_") and ica.pca_ is not None:
             pca_eigenvalues = ica.pca_.explained_variance_[:n_components].to(device)
             pca_components_for_sort = ica.pca_.components_[:n_components].to(device)
+
+        _trace_single_pca = getattr(args, "trace", None)
+        if _trace_single_pca is not None and hasattr(ica, "pca_") and ica.pca_ is not None:
+            from pathlib import Path as _Ptr
+            import numpy as _np_trace
+            _td = _Ptr(_trace_single_pca) / run_tag
+            _td.mkdir(parents=True, exist_ok=True)
+            _ev = ica.pca_.explained_variance_.detach().cpu().numpy()
+            _evecs = ica.pca_._eigenvectors.detach().cpu().numpy()
+            _np_trace.save(str(_td / "pca_eigenvalues.npy"), _ev)
+            _sqrt_ev = np.sqrt(np.maximum(_ev, 1e-12))
+            _WM = (_evecs / _sqrt_ev[np.newaxis, :]).T
+            _DWM = _evecs * _sqrt_ev[np.newaxis, :]
+            _np_trace.save(str(_td / "white_matrix.npy"), _WM)
+            _np_trace.save(str(_td / "dewhite_matrix.npy"), _DWM)
+            _vprint(args.verb >= 1, f"Trace: PCA whitening → {_td}")
+
         # Free the ICA object (holds full PCA state on GPU)
         del ica
 
@@ -782,6 +806,28 @@ def _run_single_ica(
 
     comp_np = components.detach().cpu().numpy().astype(np.float32)
     mixing_np = mixing.detach().cpu().numpy().astype(np.float32)
+
+    _trace_single_ica = getattr(args, "trace", None)
+    if _trace_single_ica is not None:
+        from pathlib import Path as _Pica
+        from scipy.stats import kurtosis as _kurt_t, skew as _skew_t
+        _td = _Pica(_trace_single_ica) / run_tag
+        _td.mkdir(parents=True, exist_ok=True)
+        np.save(str(_td / "ic_maps.npy"), comp_np)
+        np.savetxt(str(_td / "mix_matrix"), mixing_np, fmt="%.10g")
+        if hasattr(explained_share, "tolist"):
+            _es = explained_share.tolist() if hasattr(explained_share, "tolist") else list(explained_share)
+        else:
+            _es = list(explained_share)
+        if hasattr(stdev_share_sorted, "tolist"):
+            _ss = stdev_share_sorted.tolist() if hasattr(stdev_share_sorted, "tolist") else list(stdev_share_sorted)
+        else:
+            _ss = list(stdev_share_sorted)
+        _ic_kurt = np.array([_kurt_t(c) for c in comp_np])
+        _ic_skew = np.array([_skew_t(c) for c in comp_np])
+        _ic_stats = np.column_stack([_es, _ss, _ic_kurt, _ic_skew])
+        np.savetxt(str(_td / "ICstats"), _ic_stats, fmt="%.10g")
+        _vprint(args.verb >= 1, f"Trace: ICA outputs → {_td}")
 
     # Free GPU tensors — we have numpy copies now
     del components, mixing

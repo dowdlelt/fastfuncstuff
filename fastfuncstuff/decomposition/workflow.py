@@ -153,10 +153,10 @@ def apply_voxel_variance_normalization(
     num_spec: int | float | str,
     n_t: int,
     n_vox_masked: int,
+    trace_dir: "Path | None" = None,
 ) -> tuple[torch.Tensor, str]:
     """Apply voxel variance normalization with MELODIC-compatible path when requested."""
     if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
-        # FSL MELODIC setup_classic uses min(30, T-1) for varnorm PCA dim.
         pca_dim = min(30, max(1, n_t - 1))
         data_vox_t, n_const = apply_melodic_voxel_varnorm(
             data_vox_t=data_vox_t,
@@ -167,6 +167,10 @@ def apply_voxel_variance_normalization(
             f"Voxel-norm: MELODIC residual varnorm over {n_vox_masked:,} voxels "
             f"(level=2.3, pca_dim={pca_dim}, {n_const} constant voxels zeroed)"
         )
+        if trace_dir is not None:
+            import numpy as _np
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            _np.save(str(trace_dir / "migp_post_varnorm.npy"), data_vox_t.T.cpu().numpy())
         return data_vox_t, norm_msg
 
     voxel_std = torch.std(data_vox_t, dim=1, keepdim=True)
@@ -175,6 +179,12 @@ def apply_voxel_variance_normalization(
     safe_std = torch.where(const_mask.unsqueeze(1), torch.ones_like(voxel_std), voxel_std)
     data_vox_t = data_vox_t / safe_std
     data_vox_t[const_mask] = 0.0
+    if trace_dir is not None:
+        import numpy as _np
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        _np.save(str(trace_dir / "migp_post_varnorm.npy"), data_vox_t.T.cpu().numpy())
+        _np.save(str(trace_dir / "ffs_noise_std.npy"), safe_std.squeeze(1).cpu().numpy())
+        _np.save(str(trace_dir / "ffs_const_mask.npy"), const_mask.cpu().numpy())
     norm_msg = (
         f"Voxel-norm: divided {n_vox_masked:,} voxels by temporal stdev "
         f"({n_const} constant voxels zeroed, legacy path)"
