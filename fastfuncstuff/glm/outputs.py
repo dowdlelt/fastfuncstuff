@@ -864,7 +864,9 @@ def _inject_fdr_curves(
         return
 
     img = nib.load(str(nifti_path))
-    data = np.asarray(img.dataobj)  # (X, Y, Z, T)
+    # Read data into memory (not memory-mapped) so that
+    # add_fdrcurves_to_nifti can safely overwrite the file.
+    data = img.get_fdata()
     if data.ndim != 4:
         print(f"  ⚠ Warning: FDR curves expect 4D bucket; got {data.shape}")
         return
@@ -877,6 +879,7 @@ def _inject_fdr_curves(
             curves[int(brick_idx)] = curve
         except Exception as e:
             print(f"  ⚠ Warning: FDR curve for brick {brick_idx} ({stat_code}) failed: {e}")
+    del img, data
     if curves:
         add_fdrcurves_to_nifti(nifti_path, curves)
 
