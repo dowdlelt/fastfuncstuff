@@ -284,8 +284,14 @@ def add_fdrcurves_to_nifti(
     import nibabel as nib
 
     path = Path(nifti_path)
-    img = nib.load(str(path))
-    header = img.header
+    # Fully materialize the data into memory and rebuild a fresh image so
+    # nib.save below can rewrite `path` without racing a memory map / lazy
+    # ArrayProxy still pointing at the on-disk file (caused SIGBUS, leaving
+    # a 16 KB header stub).
+    src = nib.load(str(path), mmap=False)
+    data = np.asarray(src.dataobj)
+    header = src.header.copy()
+    affine = src.affine
     extensions = getattr(header, "extensions", None)
     if not extensions:
         raise ValueError(f"{path}: no NIfTI extensions present")
@@ -323,7 +329,10 @@ def add_fdrcurves_to_nifti(
 
     new_ext = nib.nifti1.Nifti1Extension(AFNI_ECODE, afni_xml.encode("utf-8"))
     extensions[afni_idx] = new_ext
-    nib.save(img, str(path))
+    out_img = nib.Nifti1Image(data, affine, header)
+    # Drop the source handle before overwriting the on-disk file.
+    del src
+    nib.save(out_img, str(path))
 
 
 __all__ = [
