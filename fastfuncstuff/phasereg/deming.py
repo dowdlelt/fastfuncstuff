@@ -54,15 +54,22 @@ def deming_regression(
         phi = torch.tensor(phi, dtype=x.dtype, device=x.device)
     phi = phi.broadcast_to(sxx.shape)
 
-    # Closed-form Deming slope:
-    # beta1 = (phi*SYY - SXX + sqrt((SXX - phi*SYY)^2 + 4*phi*SXY^2))
-    #         / (2 * phi * SXY)
-    diff = sxx - phi * syy
+    # Closed-form Deming slope (Wikipedia / scipy.odr convention):
+    # With delta = phi = Var(eps_y) / Var(eps_x),
+    #   beta1 = (SYY - phi*SXX + sqrt((SYY - phi*SXX)^2 + 4*phi*SXY^2))
+    #           / (2 * SXY)
+    # An earlier rewrite of this used (SXX - phi*SYY) and divided by
+    # 2*phi*SXY, which is the same form with phi inverted — i.e. it
+    # treated phi as Var(eps_x)/Var(eps_y), the opposite convention from
+    # what noise.estimate_variance_ratio returns. That made Deming run as
+    # inverse-OLS at fMRI scales (real phi ~ 1e5 → effective delta ~ 1e-5),
+    # producing slope ≈ SYY/SXY which blows up in low-correlation voxels.
+    diff = syy - phi * sxx
     discriminant = diff * diff + 4.0 * phi * sxy * sxy
     sqrt_disc = torch.sqrt(discriminant.clamp(min=0.0))
 
-    numerator = phi * syy - sxx + sqrt_disc
-    denominator = 2.0 * phi * sxy
+    numerator = diff + sqrt_disc
+    denominator = 2.0 * sxy
 
     # Guard against sxy ~ 0 (no correlation -> slope = 0)
     slope = torch.where(

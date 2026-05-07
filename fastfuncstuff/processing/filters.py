@@ -1,0 +1,191 @@
+"""GPU-accelerated Savitzky-Golay filtering for 1-D time series.
+
+Implements the Savitzky-Golay (SGF) filter as batched 1-D convolution on
+PyTorch tensors, enabling voxel-parallel filtering on GPU.  Used by
+phase regression (ffs_phasereg) to smooth noisy phase time series
+(Barry & Gore, Hum Brain Mapp 2014) and generally applicable to any
+per-voxel 1-D signal processing.
+
+The filter fits a polynomial of order *p* to a sliding window of *N*
+samples and replaces the centre sample with the polynomial value.
+This is equivalent to convolution with precomputed coefficients derived
+from the pseudoinverse of a Vandermonde matrix.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+
+
+def _sgf_coefficients(
+    window_length: int,
+    poly_order: int,
+    deriv: int = 0,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Compute Savitzky-Golay convolution kernel.
+
+    Parameters
+    ----------
+    window_length : int
+        Must be odd and > poly_order.
+    poly_order : int
+        Polynomial order for local fitting.
+    deriv : int
+        Derivative order (0 = smoothing).
+    device, dtype : torch device and dtype for the kernel.
+
+    Returns
+    -------
+    kernel : Tensor, shape (window_length,)
+    """
+    if window_length % 2 == 0:
+        raise ValueError("window_length must be odd")
+    if poly_order >= window_length:
+        raise ValueError("poly_order must be < window_length")
+
+    half = window_length // 2
+    order_range = torch.arange(-half, half + 1, device=device, dtype=dtype)
+    n_terms = poly_order + 1
+
+    vander = order_range.unsqueeze(1).pow(
+        torch.arange(n_terms, device=device, dtype=dtype).unsqueeze(0)
+    )
+
+    try:
+        coeffs = torch.linalg.pinv(vander, atol=1e-7)[deriv]
+    except torch._C._LinAlgError:
+        coeffs = torch.zeros(window_length, device=device, dtype=dtype)
+        coeffs[half] = 1.0
+    return coeffs
+
+
+def savgol_filter_1d(
+    data: Tensor,
+    window_length: int,
+    poly_order: int,
+) -> Tensor:
+    """Apply Savitzky-Golay filter to batched 1-D time series on GPU.
+
+    Parameters
+    ----------
+    data : Tensor, shape (..., n_timepoints)
+        Input time series.  Filtering is applied along the last dimension.
+        Any leading dimensions are treated as batch (e.g. n_voxels).
+    window_length : int
+        Odd integer, width of the filtering window.
+    poly_order : int
+        Polynomial order for the local fit (< window_length).
+
+    Returns
+    -------
+    filtered : Tensor, same shape as *data*
+    """
+    if window_length % 2 == 0:
+        raise ValueError("window_length must be odd")
+    if poly_order >= window_length:
+        raise ValueError("poly_order must be < window_length")
+    if data.shape[-1] < window_length:
+        return data.clone()
+
+    kernel = _sgf_coefficients(
+        window_length, poly_order,
+        device=data.device, dtype=data.dtype,
+    )
+
+    original_shape = data.shape
+    if data.dim() == 1:
+        data = data.unsqueeze(0).unsqueeze(0)
+    elif data.dim() == 2:
+        data = data.unsqueeze(1)
+    else:
+        leading = data.shape[:-1]
+        data = data.reshape(-1, 1, data.shape[-1])
+
+    pad = window_length // 2
+    padded = torch.nn.functional.pad(data, (pad, pad), mode="reflect")
+
+    kernel_2d = kernel.view(1, 1, -1)
+    filtered = torch.nn.functional.conv1d(padded, kernel_2d)
+
+    return filtered.reshape(original_shape)
+
+
+def savgol_filter_explore(
+    data: Tensor,
+    n_timepoints: int,
+    device: torch.device,
+    min_window: int = 5,
+    max_window: int | None = None,
+    min_order: int = 2,
+    max_order: int | None = None,
+    step: int = 4,
+    metric_fn=None,
+) -> Tensor:
+    """Data-driven SGF parameter search per voxel (Barry & Gore 2014).
+
+    For each voxel, tries multiple (window, order) combinations and
+    selects the one that optimises *metric_fn*.  If metric_fn is not
+    provided, returns the unfiltered data (pass-through).
+
+    Parameters
+    ----------
+    data : Tensor, shape (n_voxels, n_timepoints)
+        Input time series.
+    n_timepoints : int
+        Number of timepoints (must match data.shape[-1]).
+    device : torch.device
+    min_window : int
+        Minimum SGF window (odd).
+    max_window : int or None
+        Maximum SGF window.  None = min(n_timepoints, 97).
+    min_order : int
+        Minimum polynomial order.
+    max_order : int or None
+        Maximum polynomial order.  None = max_window - 1.
+    step : int
+        Step between window sizes (kept odd).
+    metric_fn : callable or None
+        Function(filtered_data) -> Tensor (n_voxels,) to maximise.
+        If None, returns unfiltered data.
+
+    Returns
+    -------
+    best_filtered : Tensor, shape (n_voxels, n_timepoints)
+        Filtered data using per-voxel optimal parameters.
+    """
+    if metric_fn is None:
+        return data
+
+    if max_window is None:
+        max_window = min(n_timepoints, 97)
+    if max_order is None:
+        max_order = 5
+
+    max_window = min(max_window, n_timepoints)
+    if max_window % 2 == 0:
+        max_window -= 1
+
+    windows = list(range(min_window, max_window + 1, step))
+    windows = [w | 1 for w in windows]
+    windows = sorted(set(w for w in windows if w < n_timepoints))
+
+    best_score = torch.full((data.shape[0],), float("-inf"), device=device)
+    best_filtered = data.clone()
+
+    for w in windows:
+        for p in range(min_order, min(max_order, w - 1) + 1):
+            try:
+                filt = savgol_filter_1d(data, w, p)
+            except torch._C._LinAlgError:
+                continue
+            score = metric_fn(filt)
+            improved = score > best_score
+            best_score = torch.where(improved, score, best_score)
+            best_filtered = torch.where(
+                improved.unsqueeze(-1), filt, best_filtered
+            )
+
+    return best_filtered
