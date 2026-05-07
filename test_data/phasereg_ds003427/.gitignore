@@ -1,0 +1,8 @@
+# Binary test data + intermediate outputs — too large for git
+*.nii
+*.nii.gz
+*.HEAD
+*.BRIK
+*.BRIK.gz
+*.1D
+*.txt
