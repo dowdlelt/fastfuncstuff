@@ -21,7 +21,7 @@ from fastfuncstuff.processing.nwarpforge import nwarpforge, parse_nwarp_string
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="nwarpforge",
+        prog="ffs_nwarp",
         description="GPU-accelerated multi-warp composition and application",
         epilog="""Composition order:
   For -nwarp 'A B C', the result is C(B(A(x)))
@@ -80,6 +80,30 @@ Examples:
         default=None,
         help="Output path for warped phase. Auto-derived from -prefix when not given "
         "(e.g. out.nii.gz -> out_phase.nii.gz). Only used with -phase.",
+    )
+    io_group.add_argument(
+        "-phase_units",
+        choices=["raw", "rad"],
+        default="raw",
+        help="Units of the input phase data (only used with -phase). "
+        "'raw' (default): scanner units (e.g. -4096..4095). Automatically "
+        "scaled to radians. 'rad': already in radians (e.g. unwrapped). "
+        "No scaling applied.",
+    )
+    io_group.add_argument(
+        "-phase_warp",
+        choices=["complex", "split", "direct", "circular"],
+        default="complex",
+        help="How to warp phase data (only used with -phase). "
+        "'complex' (default): convert mag+phase to real/imag, warp each, "
+        "convert back. Magnitude is derived from warped real/imag. "
+        "'split': warp magnitude directly (clean), then warp real/imag "
+        "and extract phase only. Magnitude never touched by phase. "
+        "'direct': warp magnitude and phase independently. Assumes phase "
+        "is already unwrapped. Fastest option. "
+        "'circular': warp cos(phase) and sin(phase) separately (unit "
+        "circle interpolation), then atan2. Handles wraps without "
+        "magnitude corruption.",
     )
     io_group.add_argument(
         "-save_mean",
@@ -152,8 +176,10 @@ def main(argv: list[str] | None = None) -> None:
 
     verb = args.verb
     if verb >= 1:
-        print(f"nwarpforge: device={device}")
-        print(f"nwarpforge: interp={args.interp}")
+        print(f"ffs_nwarp: device={device}")
+        print(f"ffs_nwarp: interp={args.interp}")
+        if args.phase:
+            print(f"ffs_nwarp: phase_warp={args.phase_warp}")
 
     # Parse time_range if provided
     time_range = None
@@ -164,11 +190,11 @@ def main(argv: list[str] | None = None) -> None:
         else:
             time_range = (0, int(parts[0]))
         if verb >= 1:
-            print(f"nwarpforge: time_range={time_range}")
+            print(f"ffs_nwarp: time_range={time_range}")
 
     nwarp_specs = parse_nwarp_string(args.nwarp)
     if verb >= 1:
-        print(f"nwarpforge: chain has {len(nwarp_specs)} transform(s)")
+        print(f"ffs_nwarp: chain has {len(nwarp_specs)} transform(s)")
         for i, spec in enumerate(nwarp_specs):
             print(f"  [{i}] {spec}")
 
@@ -182,6 +208,8 @@ def main(argv: list[str] | None = None) -> None:
         phase_prefix=args.phase_prefix,
         master_path=args.master,
         interp=args.interp,
+        phase_warp=args.phase_warp,
+        phase_units=args.phase_units,
         device=device,
         verb=verb,
         time_range=time_range,
@@ -191,7 +219,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if verb >= 1:
-        print(f"nwarpforge: total time {time.time() - t0:.2f}s")
+        print(f"ffs_nwarp: total time {time.time() - t0:.2f}s")
 
 
 if __name__ == "__main__":
