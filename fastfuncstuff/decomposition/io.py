@@ -217,8 +217,17 @@ def write_melodic_compat_outputs(
     z_maps: np.ndarray | None = None,
     p_maps: np.ndarray | None = None,
     thresh_z_maps: np.ndarray | None = None,
+    comp_kv_for_stats: np.ndarray | None = None,
+    oic_components_kv: np.ndarray | None = None,
 ) -> Path:
-    """Write MELODIC-style compatibility files for ICA outputs."""
+    """Write MELODIC-style compatibility files for ICA outputs.
+
+    Optional parameters extend MELODIC parity:
+      comp_kv_for_stats : (K, V) post-noise-norm spatial IC maps; used to
+        compute the spatial-kurtosis column of melodic_ICstats.
+      oic_components_kv : (K, V) raw pre-noise-norm IC maps; saved as
+        melodic_oIC.nii.gz, the analog of MELODIC's "original" ICs.
+    """
     compat = Path(compat_dir)
     maps = Path(maps_file)
     zmap_path = Path(zmaps_file) if zmaps_file is not None else None
@@ -246,9 +255,43 @@ def write_melodic_compat_outputs(
         ftmix = ftmix[1:, :]
     np.savetxt(compat / "melodic_FTmix", ftmix, fmt="%.8f")
 
-    icstats = np.column_stack([component_explained_share_pct, component_total_share_pct])
+    # melodic_unmix: K × T, the full unmixing W = pinv(mixing). MELODIC's
+    # melodic_unmix folds in the whitening, so this is the source-extraction
+    # operator that maps voxel timecourses back to component timecourses.
+    unmix = np.linalg.pinv(np.asarray(mixing_np, dtype=np.float64))
+    np.savetxt(compat / "melodic_unmix", unmix, fmt="%.8f")
+
+    # melodic_ICstats: K × 4 — explained%, total%, spatial kurtosis, signal-fraction.
+    n_k = component_explained_share_pct.shape[0]
+    if comp_kv_for_stats is not None and comp_kv_for_stats.shape[0] >= n_k:
+        from scipy.stats import kurtosis as _kurt
+        ic_kurt = np.asarray([_kurt(comp_kv_for_stats[i]) for i in range(n_k)], dtype=np.float64)
+    else:
+        ic_kurt = np.zeros(n_k, dtype=np.float64)
+    if p_maps is not None and p_maps.shape[0] >= n_k:
+        ic_signal = np.asarray([float(np.mean(p_maps[i])) for i in range(n_k)], dtype=np.float64)
+    else:
+        ic_signal = np.zeros(n_k, dtype=np.float64)
+    icstats = np.column_stack([
+        component_explained_share_pct,
+        component_total_share_pct,
+        ic_kurt,
+        ic_signal,
+    ])
     np.savetxt(compat / "melodic_ICstats", icstats, fmt="%.8f")
     np.savetxt(compat / "eigenvalues_percent", pca_scree_ratio * 100.0, fmt="%.8f")
+
+    # melodic_oIC: raw IC spatial maps before noise-normalization (FFS analog
+    # of MELODIC's "original" ICs).  Only written if the caller saved a copy
+    # of components prior to apply_melodic_noise_normalization.
+    if oic_components_kv is not None:
+        save_masked_component_maps_4d(
+            components_kv=np.asarray(oic_components_kv, dtype=np.float32),
+            mask3d=mask3d,
+            shape3d=shape3d,
+            affine=affine,
+            out_file=compat / "melodic_oIC.nii.gz",
+        )
 
     if z_maps is not None and p_maps is not None:
         stats_dir = compat / "stats"

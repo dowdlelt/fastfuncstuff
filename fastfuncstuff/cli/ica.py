@@ -678,7 +678,10 @@ def _run_single_ica(
     # the signal-to-noise ratio at each voxel.
     # NOTE: must run BEFORE timecourse var_norm — otherwise mixing @ components
     # no longer reconstructs x_t and resid_std is corrupted, compressing IC peaks ~5x.
+    raw_oic_np: np.ndarray | None = None
     if x_t is not None:
+        # Snapshot raw IC maps for melodic_oIC.nii.gz before noise-norm rescales them.
+        raw_oic_np = components.detach().cpu().numpy().astype(np.float32)
         _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
@@ -1032,6 +1035,8 @@ def _run_single_ica(
             z_maps=z_maps,
             p_maps=p_maps,
             thresh_z_maps=thresh_z_maps,
+            comp_kv_for_stats=comp_np,
+            oic_components_kv=raw_oic_np,
         )
         ic_target = (
             Path(f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}")
@@ -1826,7 +1831,9 @@ def _run_concat_ica(
 
     # --- MELODIC-style noise normalization ---
     # Must run BEFORE timecourse var_norm — see note in single-run path.
+    raw_oic_np: np.ndarray | None = None
     if x_t is not None:
+        raw_oic_np = components.detach().cpu().numpy().astype(np.float32)
         _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
@@ -1998,6 +2005,8 @@ def _run_concat_ica(
             z_maps=z_maps,
             p_maps=p_maps if z_maps is not None else None,
             thresh_z_maps=thresh_z_maps if z_maps is not None else None,
+            comp_kv_for_stats=comp_np,
+            oic_components_kv=raw_oic_np,
         )
         _vprint(args.verb >= 1, f"MELODIC compat: {compat_dir}")
 
