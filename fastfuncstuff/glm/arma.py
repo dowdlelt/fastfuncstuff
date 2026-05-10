@@ -747,7 +747,7 @@ def _compute_arma11_lambda(
 
     Notes
     -----
-    AFNI 3dREMLfit formula from Cox & Reynolds (2006)
+    AFNI 3dREMLfit formula (see 3dREMLfit.c and the AFNI tech note).
     Valid for |a| < 1, |b| < 1 (checked by caller)
     """
     # This formula is mathematically equivalent to gamma1/gamma0

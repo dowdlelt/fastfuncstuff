@@ -16,7 +16,9 @@ Key features:
 - GPU-accelerated with chunking for memory efficiency
 
 References:
-- Chen et al. (2023): "Improved HRF estimation using thin plate splines"
+- Chen, Taylor, Reynolds, Leibenluft, Pine, Brotman, Pagliaccio & Haller (2023):
+  "BOLD response is more than just magnitude: improving detection sensitivity
+  through capturing hemodynamic profiles." NeuroImage 277:120224.
   https://www.sciencedirect.com/science/article/pii/S1053811923003750
 - AFNI's 3dMSS.R for group-level TPS
 

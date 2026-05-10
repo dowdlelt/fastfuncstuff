@@ -4,7 +4,8 @@
 
 `ffs_reml` (CLI) / `fit_glm_arma11()` (API) implements AFNI-style ARMA(1,1)
 prewhitened GLM using REML estimation of temporal autocorrelation parameters.
-The core math follows 3dREMLfit.c / Cox & Reynolds (2006).
+The core math follows AFNI's `3dREMLfit.c` and the accompanying tech note
+(`afni.nimh.nih.gov/pub/dist/doc/misc/3dREMLfit/3dREMLfit.pdf`, RW Cox).
 
 ---
 
