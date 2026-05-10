@@ -803,8 +803,21 @@ def _run_single_ica(
             print(f"  Warning: Could not compute ortvec correlations for run {run_idx + 1}: {e}")
 
     pfx = parse_prefix(str(args.prefix))
-    out_prefix = Path(pfx.stem)
     nii_ext = pfx.nifti_ext
+
+    # Output layout: every generated file lives inside <prefix>.ica/ffs_outputs/.
+    # melodic_compat symlinks (melodic_IC.nii.gz, melodic_mix, …) sit one
+    # level up in <prefix>.ica/ and point INTO ffs_outputs/, so the parent
+    # directory stays clean and there are no symlinks-above-folder gymnastics.
+    _basename = Path(pfx.stem).name
+    _parent_dir = Path(pfx.stem).parent
+    _is_single_run = int(getattr(args, "_n_runs_total", 1)) == 1
+    compat_dir = _parent_dir / (
+        f"{_basename}.ica" if _is_single_run else f"{_basename}_{run_tag}.ica"
+    )
+    _ffs_dir = compat_dir / "ffs_outputs"
+    _ffs_dir.mkdir(parents=True, exist_ok=True)
+    out_prefix = _ffs_dir / _basename
 
     comp_np = components.detach().cpu().numpy().astype(np.float32)
     mixing_np = mixing.detach().cpu().numpy().astype(np.float32)
@@ -1001,10 +1014,6 @@ def _run_single_ica(
     guidance_bad_plot = guidance_scores["guidance_bad_plot"]
 
     if args.melodic_compat:
-        is_single_run = int(getattr(args, "_n_runs_total", 1)) == 1
-        compat_dir = (
-            Path(f"{out_prefix}.ica") if is_single_run else Path(f"{out_prefix}_{run_tag}.ica")
-        )
         decomposition_io.write_melodic_compat_outputs(
             compat_dir=compat_dir,
             maps_file=Path(f"{out_prefix}_{run_tag}_ica_maps{nii_ext}"),
@@ -1862,8 +1871,15 @@ def _run_concat_ica(
     _vsection(args.verb >= 1, "Save Outputs")
     t_step = time.time()
     pfx = parse_prefix(str(args.prefix))
-    out_prefix = Path(pfx.stem)
     nii_ext = pfx.nifti_ext
+
+    # Output layout: see _run_single_ica for rationale.
+    _basename = Path(pfx.stem).name
+    _parent_dir = Path(pfx.stem).parent
+    compat_dir = _parent_dir / f"{_basename}_concat.ica"
+    _ffs_dir = compat_dir / "ffs_outputs"
+    _ffs_dir.mkdir(parents=True, exist_ok=True)
+    out_prefix = _ffs_dir / _basename
 
     comp_np = components.detach().cpu().numpy().astype(np.float32)
     mixing_np = mixing.detach().cpu().numpy().astype(np.float32)
@@ -1964,7 +1980,6 @@ def _run_concat_ica(
 
     # MELODIC compat
     if args.melodic_compat:
-        compat_dir = Path(f"{out_prefix}_concat.ica")
         decomposition_io.write_melodic_compat_outputs(
             compat_dir=compat_dir,
             maps_file=Path(f"{out_prefix}_concat_ica_maps{nii_ext}"),
@@ -2470,8 +2485,15 @@ def _run_tensorial_ica(
     _vsection(args.verb >= 1, "Save Outputs")
     t_step = time.time()
     pfx = parse_prefix(str(args.prefix))
-    out_prefix = Path(pfx.stem)
     nii_ext = pfx.nifti_ext
+
+    # Output layout: see _run_single_ica for rationale.
+    _basename = Path(pfx.stem).name
+    _parent_dir = Path(pfx.stem).parent
+    compat_dir = _parent_dir / f"{_basename}_tensor.ica"
+    _ffs_dir = compat_dir / "ffs_outputs"
+    _ffs_dir.mkdir(parents=True, exist_ok=True)
+    out_prefix = _ffs_dir / _basename
 
     comp_np = components.detach().cpu().numpy().astype(np.float32)  # (k, n_runs*V)
     mixing_np = mixing.detach().cpu().numpy().astype(np.float32)    # (T, k) — shared
