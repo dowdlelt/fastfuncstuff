@@ -117,6 +117,25 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
     ffs_vox_std = np.std(ffs_post, axis=0)
     mel_vox_std = np.std(mel_post, axis=0)
 
+    valid_mask = (mel_vox_std > 1e-8) & (ffs_vox_std > 1e-8)
+    scale_ratio = np.where(valid_mask, ffs_vox_std / mel_vox_std, np.nan)
+    scale_ratio = scale_ratio[np.isfinite(scale_ratio)]
+
+    ffs_vox_mean = np.mean(ffs_post, axis=0)
+    mel_vox_mean = np.mean(mel_post, axis=0)
+    offset_diff = ffs_vox_mean - mel_vox_mean
+    offset_diff_valid = offset_diff[valid_mask]
+
+    sample_idx = rng.choice(V, min(V, 2000), replace=False)
+    rmses = np.array([
+        np.sqrt(np.mean((ffs_post[:, v] - mel_post[:, v]) ** 2))
+        for v in sample_idx
+    ])
+    scales = np.array([
+        np.std(mel_post[:, v]) for v in sample_idx
+    ])
+    nrmse = rmses / np.where(scales > 1e-8, scales, 1.0)
+
     return {
         "voxels": V,
         "post_vn_mean_r": float(corrs.mean()),
@@ -127,6 +146,13 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
         "post_vn_eig_r": eig_r,
         "ffs_vox_std_mean": float(ffs_vox_std.mean()),
         "mel_vox_std_mean": float(mel_vox_std.mean()),
+        "scale_ratio_mean": float(np.mean(scale_ratio)),
+        "scale_ratio_median": float(np.median(scale_ratio)),
+        "scale_ratio_std": float(np.std(scale_ratio)),
+        "offset_mean": float(np.mean(offset_diff_valid)),
+        "offset_std": float(np.std(offset_diff_valid)),
+        "nrmse_mean": float(np.mean(nrmse)),
+        "nrmse_median": float(np.median(nrmse)),
     }
 
 
@@ -344,11 +370,20 @@ def validate(ctx: BenchmarkContext) -> dict:
     mean_mix = float(np.mean(mix_rs)) if mix_rs else 0.0
     mean_white = float(np.mean(white_cos)) if white_cos else 0.0
 
+    vn_scales = [r["varnorm"]["scale_ratio_mean"] for r in valid
+                 if "error" not in r.get("varnorm", {})]
+    vn_nrmses = [r["varnorm"]["nrmse_mean"] for r in valid
+                 if "error" not in r.get("varnorm", {})]
+    mean_vn_scale = float(np.mean(vn_scales)) if vn_scales else 0.0
+    mean_vn_nrmse = float(np.mean(vn_nrmses)) if vn_nrmses else 0.0
+
     passed = mean_eig >= 0.95 and mean_maps >= 0.60
 
     parts = [
         f"eig_r={mean_eig:.4f}",
         f"vn_eig_r={mean_vn_eig:.4f}",
+        f"vn_scale={mean_vn_scale:.4f}",
+        f"vn_nrmse={mean_vn_nrmse:.4f}",
         f"white_cos={mean_white:.4f}",
         f"mix_r={mean_mix:.4f}",
         f"maps_r={mean_maps:.4f}",
@@ -362,9 +397,12 @@ def validate(ctx: BenchmarkContext) -> dict:
         wc = r["whitening"].get("mean_principal_cos", 0)
         vr = r["varnorm"].get("post_vn_eig_r", 0)
         vmr = r["varnorm"].get("post_vn_mean_r", 0)
+        vs = r["varnorm"].get("scale_ratio_mean", 0)
+        vn = r["varnorm"].get("nrmse_mean", 0)
         parts.append(
             f"{ds}/run{rn:02d}: eig={er:.3f} vn_eig={vr:.3f} "
-            f"vn_vox_r={vmr:.3f} white_cos={wc:.4f} maps={mr:.3f}"
+            f"vn_r={vmr:.3f} vn_scale={vs:.4f} vn_nrmse={vn:.4f} "
+            f"white_cos={wc:.4f} maps={mr:.3f}"
         )
 
     return {
@@ -372,6 +410,8 @@ def validate(ctx: BenchmarkContext) -> dict:
         "summary": ", ".join(parts),
         "overall_eig_r": mean_eig,
         "overall_vn_eig_r": mean_vn_eig,
+        "overall_vn_scale": mean_vn_scale,
+        "overall_vn_nrmse": mean_vn_nrmse,
         "overall_white_cos": mean_white,
         "overall_mix_r": mean_mix,
         "overall_maps_r": mean_maps,
