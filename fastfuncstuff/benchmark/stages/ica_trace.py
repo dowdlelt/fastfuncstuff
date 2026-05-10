@@ -317,7 +317,17 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
 
 def _compare_ic_maps(mel_dir: Path, ffs_prefix: Path, mask_path: Path) -> dict:
     mel_ic = mel_dir / "melodic_oIC.nii.gz"
-    ffs_ic = Path(str(ffs_prefix) + "_ica_maps.nii.gz")
+    # ffs_prefix is e.g. <dir>/all_<dataset>_concat (passed as -prefix to
+    # ffs_ica -temp_concat). The concat path appends "_concat.ica" to the
+    # basename, so the compat dir ends up as <basename>_concat.ica with the
+    # actual file at <compat>/ffs_outputs/<basename>_concat_ica_maps.nii.gz.
+    base = ffs_prefix.name
+    ffs_ic = (
+        ffs_prefix.parent
+        / f"{base}_concat.ica"
+        / "ffs_outputs"
+        / f"{base}_concat_ica_maps.nii.gz"
+    )
     if not mel_ic.exists() or not ffs_ic.exists():
         return {"error": "IC map files not found"}
     import torch

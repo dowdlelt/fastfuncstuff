@@ -45,8 +45,18 @@ def _ffs_prefix(ctx: BenchmarkContext, dataset: str) -> str:
 
 
 def _ffs_ic(ctx: BenchmarkContext, dataset: str, run: int) -> Path:
-    """FFS GMM-z'd component maps (apples-to-apples vs `melodic_IC`)."""
-    return ctx.ffs_ica_dir / f"{dataset}_single_run{run:02d}_ica_zmaps.nii.gz"
+    """FFS GMM-z'd component maps (apples-to-apples vs `melodic_IC`).
+
+    Lives inside the per-run `.ica/ffs_outputs/` subfolder after the
+    output-layout refactor.
+    """
+    base = f"{dataset}_single"
+    return (
+        ctx.ffs_ica_dir
+        / f"{base}_run{run:02d}.ica"
+        / "ffs_outputs"
+        / f"{base}_run{run:02d}_ica_zmaps.nii.gz"
+    )
 
 
 def _mni_input(ctx: BenchmarkContext, dataset: str, run: int) -> Path:

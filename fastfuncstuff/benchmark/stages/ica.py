@@ -40,9 +40,16 @@ def _ffs_ic(ctx: BenchmarkContext, dataset: str) -> Path:
     MELODIC's `melodic_IC.nii.gz` stores the GGM-mixture-modeled z-stat maps,
     not the raw ICA components. We therefore compare against ffs_ica's
     `*_concat_ica_zmaps.nii.gz` (output of `batch_mixture_zscores` ⇒ same
-    space as MELODIC's IC).
+    space as MELODIC's IC). Lives inside the `.ica/ffs_outputs/` subfolder
+    after the output-layout refactor.
     """
-    return ctx.ffs_ica_dir / f"all_{dataset}_concat_ica_zmaps.nii.gz"
+    base = f"all_{dataset}"
+    return (
+        ctx.ffs_ica_dir
+        / f"{base}_concat.ica"
+        / "ffs_outputs"
+        / f"{base}_concat_ica_zmaps.nii.gz"
+    )
 
 
 def _mni_inputs(ctx: BenchmarkContext, dataset: str) -> list[Path]:
