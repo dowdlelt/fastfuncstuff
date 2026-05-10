@@ -174,12 +174,14 @@ class FastICA:
         # Memory-efficient: (X-m)(X-m)^T = X@X^T - V*m*m^T
         cov_t = (X @ X.T - n_features * (row_mean @ row_mean.T)) / float(n_features)
 
-        # Eigendecomposition (ascending order from eigvalsh)
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t)
+        # Eigendecomposition in float64 for numerical stability.
+        # The (T,T) covariance is tiny; float32 rounding of near-degenerate
+        # eigenvalues causes large eigenvector rotations that corrupt the
+        # whitening basis and produce speckly ICA components.
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t.to(torch.float64))
         del cov_t
-        # Flip to descending order
-        eigenvalues = eigenvalues.flip(0)
-        eigenvectors = eigenvectors.flip(1)
+        eigenvalues = eigenvalues.float().flip(0)
+        eigenvectors = eigenvectors.float().flip(1)
         eigenvalues = torch.clamp(eigenvalues, min=0)
 
         # Determine number of PCA components to keep
@@ -807,10 +809,10 @@ class InfoMaxICA:
         row_mean = X.mean(dim=1, keepdim=True)
         cov_t = (X @ X.T - n_features * (row_mean @ row_mean.T)) / float(n_features)
 
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t)
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t.to(torch.float64))
         del cov_t
-        eigenvalues = eigenvalues.flip(0)
-        eigenvectors = eigenvectors.flip(1)
+        eigenvalues = eigenvalues.float().flip(0)
+        eigenvectors = eigenvectors.float().flip(1)
         eigenvalues = torch.clamp(eigenvalues, min=0)
 
         n_max = min(n_samples, n_features)

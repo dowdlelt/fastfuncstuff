@@ -670,17 +670,14 @@ def _run_single_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    if args.var_norm:
-        mixing = mixing - mixing.mean(dim=0, keepdim=True)
-        mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
-        mixing = mixing / mixing_std
-
     # --- MELODIC-style noise normalization ---
     # FSL meldata.cc save(): IC_norm = IC * diagvals * stdNoisei
     #   diagvals  = pow(diag(unmix * unmix^T), -0.5)       -- per-component
     #   stdNoisei = pow(stdev(Data-mix*IC)*sqrt((T-1)/(T-K)), -1)  -- per-voxel
     # This converts raw IC maps into z-score-like units that reflect
     # the signal-to-noise ratio at each voxel.
+    # NOTE: must run BEFORE timecourse var_norm — otherwise mixing @ components
+    # no longer reconstructs x_t and resid_std is corrupted, compressing IC peaks ~5x.
     if x_t is not None:
         _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
@@ -689,6 +686,11 @@ def _run_single_ica(
             x_t=x_t,
         )
         _vprint(args.verb >= 1, noise_norm_msg)
+
+    if args.var_norm:
+        mixing = mixing - mixing.mean(dim=0, keepdim=True)
+        mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
+        mixing = mixing / mixing_std
 
     # Free ICA input matrix now that noise normalization is done
     del x_t
@@ -1813,6 +1815,17 @@ def _run_concat_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    # --- MELODIC-style noise normalization ---
+    # Must run BEFORE timecourse var_norm — see note in single-run path.
+    if x_t is not None:
+        _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
+        components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
+            components=components,
+            mixing=mixing,
+            x_t=x_t,
+        )
+        _vprint(args.verb >= 1, noise_norm_msg)
+
     if args.var_norm:
         mixing = mixing - mixing.mean(dim=0, keepdim=True)
         mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
@@ -1837,16 +1850,6 @@ def _run_concat_ica(
         ic_stats = np.column_stack([explained_share, stdev_share_sorted, ic_kurt, ic_skew])
         np.savetxt(_td / "ICstats", ic_stats, fmt="%.10g")
         _vprint(args.verb >= 1, f"Trace: ICA intermediates → {_td}")
-
-    # --- MELODIC-style noise normalization ---
-    if x_t is not None:
-        _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
-        components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
-            components=components,
-            mixing=mixing,
-            x_t=x_t,
-        )
-        _vprint(args.verb >= 1, noise_norm_msg)
     del x_t
     if isinstance(WM, torch.Tensor):
         del WM
@@ -2444,12 +2447,8 @@ def _run_tensorial_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    if args.var_norm:
-        mixing = mixing - mixing.mean(dim=0, keepdim=True)
-        mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
-        mixing = mixing / mixing_std
-
     # --- MELODIC-style noise normalization (on the wide component matrix) -
+    # Must run BEFORE timecourse var_norm — see note in single-run path.
     if x_t is not None:
         _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
@@ -2459,6 +2458,11 @@ def _run_tensorial_ica(
         )
         _vprint(args.verb >= 1, noise_norm_msg)
     del x_t
+
+    if args.var_norm:
+        mixing = mixing - mixing.mean(dim=0, keepdim=True)
+        mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
+        mixing = mixing / mixing_std
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -2600,7 +2604,20 @@ def _run_tensorial_ica(
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
+    """Show defaults while preserving raw description formatting.
+
+    Skip the auto-appended ``(default: ...)`` when the help text already names a
+    default, and skip it for ``store_false`` aliases (they share ``dest`` with
+    their positive partner, so the auto value is misleading).
+    """
+
+    def _get_help_string(self, action):
+        help_str = action.help or ""
+        if "default" in help_str.lower():
+            return help_str
+        if isinstance(action, argparse._StoreFalseAction):
+            return help_str
+        return super()._get_help_string(action)
 
 
 def build_parser() -> argparse.ArgumentParser:
