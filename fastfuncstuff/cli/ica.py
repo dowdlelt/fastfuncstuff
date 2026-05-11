@@ -358,9 +358,14 @@ def _run_single_ica(
     # timeseries by its temporal std so ICA focuses on temporal dynamics
     # rather than being dominated by high-amplitude voxels.
     # Also excludes constant/near-constant voxels (MELODIC step 3).
+    varnorm_std_np: np.ndarray | None = None
     if args.voxel_norm:
         _vsection(args.verb >= 1, "Voxel Variance Normalization")
         t_step = time.time()
+        # Capture std BEFORE normalization — needed for correct PSC amplitudes.
+        # PSC formula: 100 * std(mixing) * comp * varnorm_std / mean.
+        # Without varnorm_std the values are off by CoV (~50-100x too small).
+        varnorm_std_np = data_vox_t.std(dim=1).cpu().numpy()  # (V,) in data units
         _trace_single_dir = getattr(args, "trace", None)
         _trace_vn_dir = None
         if _trace_single_dir:
@@ -1061,6 +1066,7 @@ def _run_single_ica(
             thresh_z_maps=thresh_z_maps,
             comp_kv_for_stats=comp_np,
             oic_components_kv=raw_oic_np,
+            varnorm_std_v=varnorm_std_np,
             write_per_comp_stats=getattr(args, "per_comp_stats", False),
             write_psc_prob=getattr(args, "psc_bucket", True),
             write_zp=getattr(args, "zp_bucket", True),
@@ -1547,6 +1553,7 @@ def _run_concat_ica(
     # hatch (per-file varnorm before concat) for debugging, but joined matches
     # MELODIC's default pipeline.
     vn_scope = "none"
+    varnorm_std_np: np.ndarray | None = None
     if args.voxel_norm:
         from fastfuncstuff.decomposition.tools import (
             apply_varnorm_map,
@@ -1574,7 +1581,9 @@ def _run_concat_ica(
         # to MELODIC's concat_data.nii.gz.
         if _trace_dir_vn:
             np.save(_PathVN(_trace_dir_vn) / "migp_post_varnorm.npy", data_tv.cpu().numpy())
-        del data_tv_vt, noise_std_map, const_mask_vn
+        # Keep noise_std_map alive for PSC computation (passed to write_melodic_compat_outputs).
+        varnorm_std_np = noise_std_map.cpu().numpy()  # (V,) in data units pre-varnorm
+        del data_tv_vt, const_mask_vn
         _vprint(
             args.verb >= 1,
             f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant voxels",
@@ -2038,6 +2047,7 @@ def _run_concat_ica(
             thresh_z_maps=thresh_z_maps if z_maps is not None else None,
             comp_kv_for_stats=comp_np,
             oic_components_kv=raw_oic_np,
+            varnorm_std_v=varnorm_std_np if args.voxel_norm else None,
             write_per_comp_stats=getattr(args, "per_comp_stats", False),
             write_psc_prob=getattr(args, "psc_bucket", True),
             write_zp=getattr(args, "zp_bucket", True),

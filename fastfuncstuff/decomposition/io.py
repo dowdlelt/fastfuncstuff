@@ -73,16 +73,23 @@ def _compute_psc(
     raw_components_kv: np.ndarray,
     mixing_tk: np.ndarray,
     masked_mean_v: np.ndarray,
+    varnorm_std_v: np.ndarray | None = None,
     psc_clip: float = 50.0,
 ) -> np.ndarray:
     """Compute PSC maps (K, V).
 
-    PSC[k, v] = 100 * std_t(mixing[:, k]) * raw_comp[k, v] / mean[v]
+    PSC[k, v] = 100 * std_t(mixing[:, k]) * raw_comp[k, v] * varnorm_std[v] / mean[v]
+
+    ICA operates on varnorm-divided data, so the reconstruction is:
+        mixing[t,k] * comp_raw[k,v] ≈ data_varnorm[t,v] = data_original[t,v] / varnorm_std[v]
+
+    varnorm_std_v must be in the same units as masked_mean_v (both raw-scanner
+    or both PSC-scaled).  When provided, PSC values are in the correct range
+    (~0.1–5 % for BOLD).  Without it, values are off by the CoV (~50–100×).
 
     Uses the pre-noise-normalisation ("raw oIC") spatial maps so that
-    mixing @ raw_comp ≈ preprocessed_data and the amplitude scale is
-    preserved.  Noise-normalised maps are z-stat-scaled and must NOT be
-    used here.
+    mixing @ raw_comp ≈ preprocessed_data and the amplitude scale is preserved.
+    Noise-normalised maps are z-stat-scaled and must NOT be used here.
 
     Returns float32 (K, V) array, clipped to ±psc_clip.
     """
@@ -94,7 +101,12 @@ def _compute_psc(
     eps = max(1e-6, 1e-3 * float(np.median(pos) if pos.size > 0 else 1.0))
     safe_mean = np.where(np.abs(mean_v) < eps, 1.0, mean_v)
 
-    psc = (100.0 * mix_std[:, None] * comp / safe_mean[None, :]).astype(np.float32)
+    if varnorm_std_v is not None:
+        std_v = np.asarray(varnorm_std_v, dtype=np.float64).ravel()
+        psc = (100.0 * mix_std[:, None] * comp * std_v[None, :] / safe_mean[None, :]).astype(np.float32)
+    else:
+        psc = (100.0 * mix_std[:, None] * comp / safe_mean[None, :]).astype(np.float32)
+
     psc[:, np.abs(mean_v) < eps] = 0.0
     if psc_clip > 0:
         np.clip(psc, -float(psc_clip), float(psc_clip), out=psc)
@@ -251,6 +263,7 @@ def write_melodic_compat_outputs(
     thresh_z_maps: np.ndarray | None = None,
     comp_kv_for_stats: np.ndarray | None = None,
     oic_components_kv: np.ndarray | None = None,
+    varnorm_std_v: np.ndarray | None = None,
     write_per_comp_stats: bool = False,
     write_psc_prob: bool = True,
     write_zp: bool = True,
@@ -263,6 +276,9 @@ def write_melodic_compat_outputs(
                              compute the spatial-kurtosis column of melodic_ICstats.
       oic_components_kv    : (K, V) raw pre-noise-norm IC maps; saved as
                              melodic_oIC.nii.gz and used for PSC computation.
+      varnorm_std_v        : (V,) per-voxel temporal std used for varnorm, in the
+                             same units as mean3d.  Required for correct PSC values:
+                             without it, PSC is off by the CoV (~50-100×).
       write_per_comp_stats : Write per-component 3D probmap_NNN.nii.gz and
                              thresh_zstatNNN.nii.gz (zero-padded).  Off by
                              default — the 4D bucket files cover the same data
@@ -376,7 +392,9 @@ def write_melodic_compat_outputs(
         if write_psc_prob and oic_components_kv is not None and p_maps is not None:
             n_k = min(oic_components_kv.shape[0], p_maps.shape[0])
             psc_kv = _compute_psc(
-                oic_components_kv[:n_k], mixing_np[:, :n_k], masked_mean_v, psc_clip=psc_clip
+                oic_components_kv[:n_k], mixing_np[:, :n_k], masked_mean_v,
+                varnorm_std_v=varnorm_std_v,
+                psc_clip=psc_clip,
             )
             _write_interleaved_stat_bucket(
                 vol1_kv=psc_kv,
