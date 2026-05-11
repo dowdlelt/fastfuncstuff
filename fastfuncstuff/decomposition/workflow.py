@@ -242,6 +242,7 @@ def apply_melodic_noise_normalization(
     components: torch.Tensor,
     mixing: torch.Tensor,
     x_t: torch.Tensor,
+    trace_dir: Path | None = None,
 ) -> tuple[torch.Tensor, str]:
     """Apply MELODIC-style IC noise normalization and return status message."""
     try:
@@ -269,6 +270,14 @@ def apply_melodic_noise_normalization(
         resid_std = torch.where(resid_std < 0.05, torch.ones_like(resid_std), resid_std)
         dof_factor = float(np.sqrt((tdim - 1.0) / max(tdim - kdim, 1.0)))
         std_noise = 1.0 / (resid_std * dof_factor)
+
+        if trace_dir is not None:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            np.save(str(trace_dir / "resid_std.npy"), resid_std.cpu().numpy())
+            np.save(str(trace_dir / "noise_inv.npy"), std_noise.cpu().numpy())
+            np.save(str(trace_dir / "diagvals.npy"), diagvals.cpu().numpy())
+            np.save(str(trace_dir / "unmix_matrix.npy"), unmix.cpu().numpy())
+
         components = components * (diagvals.unsqueeze(1) * std_noise.unsqueeze(0))
         del unmix, diagvals, resid_std, std_noise
         return components, "  Noise normalization applied (MELODIC convention)"

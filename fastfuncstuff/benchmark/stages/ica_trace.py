@@ -77,6 +77,10 @@ def _parse_melodic_file_order(log_path: Path) -> list[int]:
 def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
+    valid = np.isfinite(a) & np.isfinite(b)
+    if valid.sum() < 2:
+        return 0.0
+    a, b = a[valid], b[valid]
     a_c = a - a.mean()
     b_c = b - b.mean()
     denom = np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())
@@ -115,7 +119,6 @@ def _compare_ic_stats(mel_dir: Path, trace_dir: Path) -> dict:
     return {
         "melodic_n": mel_stats.shape[0],
         "ffs_n": ffs_stats.shape[0],
-        "variance_share_r": _pearson_r(mel_stats[:n, 0], ffs_stats[:n, 0]),
         "kurtosis_r": _pearson_r(mel_stats[:n, 2], ffs_stats[:n, 2]),
     }
 
@@ -351,6 +354,83 @@ def _compare_ic_maps(mel_dir: Path, ffs_prefix: Path, mask_path: Path) -> dict:
     }
 
 
+def _compare_noise_norm(mel_dir: Path, trace_dir: Path) -> dict:
+    mel_noise_p = mel_dir / "Noise__inv.nii.gz"
+    ffs_noise_p = trace_dir / "noise_inv.npy"
+    ffs_resid_p = trace_dir / "resid_std.npy"
+    ffs_diag_p = trace_dir / "diagvals.npy"
+    missing = [n for n, p in [("mel_noise", mel_noise_p), ("ffs_noise", ffs_noise_p)]
+               if not p.exists()]
+    if missing:
+        return {"error": f"missing: {', '.join(missing)}"}
+
+    import nibabel as nib
+
+    mel_noise_vol = nib.load(str(mel_noise_p)).get_fdata(dtype=np.float32)
+    mask_p = mel_dir / "mask.nii.gz"
+    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mel_noise = mel_noise_vol[mask].astype(np.float64)
+
+    ffs_noise = np.load(str(ffs_noise_p)).astype(np.float64)
+
+    if mel_noise.shape != ffs_noise.shape:
+        return {"error": f"shape mismatch: mel={mel_noise.shape} ffs={ffs_noise.shape}"}
+
+    noise_r = _pearson_r(mel_noise, ffs_noise)
+
+    result = {
+        "noise_inv_r": noise_r,
+        "noise_inv_mel_mean": float(mel_noise.mean()),
+        "noise_inv_ffs_mean": float(ffs_noise.mean()),
+        "voxels": len(mel_noise),
+    }
+
+    if ffs_resid_p.exists():
+        resid = np.load(str(ffs_resid_p)).astype(np.float64)
+        result["resid_std_mean"] = float(resid.mean())
+        result["resid_std_std"] = float(resid.std())
+
+    if ffs_diag_p.exists():
+        diag = np.load(str(ffs_diag_p)).astype(np.float64)
+        result["diagvals_mean"] = float(diag.mean())
+        result["diagvals_n"] = len(diag)
+
+    return result
+
+
+def _compare_unmix(mel_dir: Path, trace_dir: Path) -> dict:
+    mel_unmix_p = mel_dir / "melodic_unmix"
+    ffs_unmix_p = trace_dir / "unmix_matrix.npy"
+    if not mel_unmix_p.exists() or not ffs_unmix_p.exists():
+        return {"error": "unmix files not found"}
+
+    mel_unmix = np.loadtxt(str(mel_unmix_p))
+    ffs_unmix = np.load(str(ffs_unmix_p))
+
+    n_k = min(mel_unmix.shape[0], ffs_unmix.shape[0])
+    n_t = min(mel_unmix.shape[1], ffs_unmix.shape[1])
+
+    cross = np.abs(np.corrcoef(mel_unmix[:n_k, :n_t], ffs_unmix[:n_k, :n_t]))
+    cross_block = cross[:n_k, n_k:]
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
+    corrs = cross_block[row_ind, col_ind]
+
+    return {
+        "mean_matched_r": float(corrs.mean()),
+        "max_matched_r": float(corrs.max()),
+        "min_matched_r": float(corrs.min()),
+        "n_matched": len(corrs),
+    }
+
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # Stage interface
 # ---------------------------------------------------------------------------
@@ -422,6 +502,8 @@ def validate(ctx: BenchmarkContext) -> dict:
             "ic_stats": _compare_ic_stats(mel_dir, td),
             "mixing": _compare_mixing(mel_dir, td),
             "ic_maps": _compare_ic_maps(mel_dir, _ffs_prefix(ctx, dataset), mask_path),
+            "noise_norm": _safe(_compare_noise_norm, mel_dir, td),
+            "unmix": _safe(_compare_unmix, mel_dir, td),
         }
 
     eig_r = np.mean([r["eigenvalues"]["full_spectrum_r"] for r in results.values()])
@@ -430,26 +512,31 @@ def validate(ctx: BenchmarkContext) -> dict:
     )
     passed = eig_r >= 0.95 and maps_r >= 0.60
 
-    parts = [f"eig_r={eig_r:.4f}", f"maps_r={maps_r:.4f}"]
+    header = [f"eig_r={eig_r:.4f}", f"maps_r={maps_r:.4f}"]
+    ds_parts = []
     for ds, r in results.items():
         er = r["eigenvalues"]["full_spectrum_r"]
         mr = r["ic_maps"].get("mean_matched_r", 0)
         sub = r.get("subspace", {})
+        nn = r.get("noise_norm", {}).get("noise_inv_r", None)
+        nn_str = f" noise_r={nn:.3f}" if nn is not None else ""
         if "mean_principal_cos" in sub:
-            parts.append(
-                f"{ds}: eig={er:.3f} maps={mr:.3f} "
+            ds_parts.append(
+                f"  {ds}: eig={er:.3f} maps={mr:.3f} "
                 f"subsp_cos_mean={sub['mean_principal_cos']:.4f} "
                 f"min={sub['min_principal_cos']:.4f} "
                 f">.99={sub['n_above_0.99']}/{sub['k']} "
                 f"first<.95@{sub['first_below_0.95']} "
                 f"first<.50@{sub['first_below_0.50']} "
-                f"var_share_off={sub['var_share_of_disagreeing_dims']:.3f}"
+                f"var_share_off={sub['var_share_of_disagreeing_dims']:.3f}{nn_str}"
             )
         else:
-            parts.append(f"{ds}: eig={er:.3f} maps={mr:.3f} subsp=ERR")
+            ds_parts.append(f"  {ds}: eig={er:.3f} maps={mr:.3f} subsp=ERR")
+
+    summary = ", ".join(header) + "\n" + "\n".join(ds_parts)
 
     return {
         "passed": passed,
-        "summary": ", ".join(parts),
+        "summary": summary,
         "per_dataset": results,
     }

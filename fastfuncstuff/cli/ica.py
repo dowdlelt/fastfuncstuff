@@ -423,7 +423,7 @@ def _run_single_ica(
         n_eff=n_eff_for_model_order,
         device=device,
         verbose=args.verb >= 1,
-        capture_ppca_trace=bool(args.ppca_debug_dump),
+        capture_ppca_trace=bool(args.ppca_debug_dump) or getattr(args, "trace", None) is not None,
     )
 
     ppca_debug_file = None
@@ -449,6 +449,21 @@ def _run_single_ica(
         with open(ppca_debug_file, "w", encoding="utf-8") as f:
             json.dump(ppca_payload, f, indent=2)
         _vprint(args.verb >= 1, f"PPCA debug trace: {ppca_debug_file}")
+
+    _trace_eig_flag = getattr(args, "trace", None)
+    if _trace_eig_flag is not None and "ppca_trace" in pca_diag:
+        from pathlib import Path as _Peig
+        _eig_td = _Peig(_trace_eig_flag) / run_tag
+        _eig_td.mkdir(parents=True, exist_ok=True)
+        _ppt = pca_diag["ppca_trace"]
+        _adj_sorted = np.array(_ppt.get("adjusted_sorted", []), dtype=np.float64)
+        _mp_exp = np.array(_ppt.get("mp_expected", []), dtype=np.float64)
+        if len(_adj_sorted) > 0:
+            np.savetxt(str(_eig_td / "eigenvalues_adjusted"), _adj_sorted, fmt="%.10g")
+        if len(_mp_exp) > 0:
+            np.save(str(_eig_td / "mp_expected.npy"), _mp_exp)
+        _vprint(args.verb >= 1, f"Trace: eigenvalue adjustment → {_eig_td}")
+
     _vprint(
         args.verb >= 1,
         f"Selected {n_components} components (mode={num_diag.get('mode', '?')})",
@@ -582,6 +597,8 @@ def _run_single_ica(
             _DWM = _evecs * _sqrt_ev[np.newaxis, :]
             _np_trace.save(str(_td / "white_matrix.npy"), _WM)
             _np_trace.save(str(_td / "dewhite_matrix.npy"), _DWM)
+            if hasattr(ica.pca_, "components_") and ica.pca_.components_ is not None:
+                _np_trace.save(str(_td / "pca_components.npy"), ica.pca_.components_.detach().cpu().numpy())
             _vprint(args.verb >= 1, f"Trace: PCA whitening → {_td}")
 
         # Free the ICA object (holds full PCA state on GPU)
@@ -683,10 +700,16 @@ def _run_single_ica(
         # Snapshot raw IC maps for melodic_oIC.nii.gz before noise-norm rescales them.
         raw_oic_np = components.detach().cpu().numpy().astype(np.float32)
         _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
+        _nn_trace_dir = None
+        _trace_nn_flag = getattr(args, "trace", None)
+        if _trace_nn_flag is not None:
+            from pathlib import Path as _Pnn
+            _nn_trace_dir = _Pnn(_trace_nn_flag) / run_tag
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
             mixing=mixing,
             x_t=x_t,
+            trace_dir=_nn_trace_dir,
         )
         _vprint(args.verb >= 1, noise_norm_msg)
 
@@ -832,6 +855,8 @@ def _run_single_ica(
         _td = _Pica(_trace_single_ica) / run_tag
         _td.mkdir(parents=True, exist_ok=True)
         np.save(str(_td / "ic_maps.npy"), comp_np)
+        if raw_oic_np is not None:
+            np.save(str(_td / "oic.npy"), raw_oic_np)
         np.savetxt(str(_td / "mix_matrix"), mixing_np, fmt="%.10g")
         if hasattr(explained_share, "tolist"):
             _es = explained_share.tolist() if hasattr(explained_share, "tolist") else list(explained_share)
@@ -966,6 +991,25 @@ def _run_single_ica(
                 out_file=Path(fname),
             )
         _vprint(args.verb >= 1, "Z-maps and signal-prob maps saved")
+
+    _trace_mm_flag = getattr(args, "trace", None)
+    if _trace_mm_flag is not None and mixture_meta:
+        from pathlib import Path as _Pmm
+        _mm_td = _Pmm(_trace_mm_flag) / run_tag
+        _mm_td.mkdir(parents=True, exist_ok=True)
+        _mm_keys = [
+            "mu_noise", "sigma_noise",
+            "mu_signal_pos", "sigma_signal_pos",
+            "mu_signal_neg", "sigma_signal_neg",
+            "pi_noise", "pi_pos", "pi_neg",
+            "mixing_signal",
+        ]
+        _mm_arr = np.array(
+            [[m.get(k, 0.0) for k in _mm_keys] for m in mixture_meta],
+            dtype=np.float64,
+        )
+        np.save(str(_mm_td / "mmstats.npy"), _mm_arr)
+        _vprint(args.verb >= 1, f"Trace: mmstats → {_mm_td}")
 
     # PSC + Z bucket (AFNI-style interleaved): per-component PSC + FIZT Z.
     if getattr(args, "psc_bucket", False):
@@ -1662,8 +1706,13 @@ def _run_concat_ica(
         np.save(_td / "white_matrix.npy", WM.cpu().numpy())
         np.save(_td / "dewhite_matrix.npy", DWM.cpu().numpy())
         np.save(_td / "pca_eigenvalues.npy", _evals_full)
+        np.save(_td / "pca_components.npy", x_t.cpu().numpy())  # (k, V) whitened spatial maps
         if _trace_cov is not None:
             np.save(_td / "cov_temporal.npy", _trace_cov)
+        if "ppca_trace" in pca_diag:
+            _mp_exp = np.array(pca_diag["ppca_trace"].get("mp_expected", []), dtype=np.float64)
+            if len(_mp_exp) > 0:
+                np.save(str(_td / "mp_expected.npy"), _mp_exp)
         _vprint(args.verb >= 1, f"Trace: PCA intermediates → {_td}")
 
     del data_centered, evals_t, evecs_t, sqrt_ev
@@ -1835,10 +1884,12 @@ def _run_concat_ica(
     if x_t is not None:
         raw_oic_np = components.detach().cpu().numpy().astype(np.float32)
         _vprint(args.verb >= 1, "Applying MELODIC-style noise normalization ...")
+        _nn_trace_dir = _P(trace_dir) if trace_dir else None
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
             mixing=mixing,
             x_t=x_t,
+            trace_dir=_nn_trace_dir,
         )
         _vprint(args.verb >= 1, noise_norm_msg)
 
@@ -1856,6 +1907,8 @@ def _run_concat_ica(
         comp_np = components.detach().cpu().numpy()
         mix_np = mixing.detach().cpu().numpy()
         np.save(_td / "ic_maps.npy", comp_np)
+        if raw_oic_np is not None:
+            np.save(_td / "oic.npy", raw_oic_np)
         np.savetxt(_td / "mix_matrix", mix_np, fmt="%.10g")
         if isinstance(WM, torch.Tensor):
             np.savetxt(_td / "white_matrix", WM.cpu().numpy(), fmt="%.10g")
@@ -1964,6 +2017,20 @@ def _run_concat_ica(
                 out_file=Path(fname),
             )
         _vprint(args.verb >= 1, "Z-maps and signal-prob maps saved", t_step)
+
+    if trace_dir and mixture_meta:
+        _mm_keys = [
+            "mu_noise", "sigma_noise",
+            "mu_signal_pos", "sigma_signal_pos",
+            "mu_signal_neg", "sigma_signal_neg",
+            "pi_noise", "pi_pos", "pi_neg",
+            "mixing_signal",
+        ]
+        _mm_arr = np.array(
+            [[m.get(k, 0.0) for k in _mm_keys] for m in mixture_meta],
+            dtype=np.float64,
+        )
+        np.save(_P(trace_dir) / "mmstats.npy", _mm_arr)
 
     # PSC + Z bucket (AFNI-style interleaved). Only available alongside z-maps.
     if getattr(args, "psc_bucket", False):

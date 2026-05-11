@@ -108,18 +108,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _project_root() -> Path:
-    """Return the fastfuncstuff project root (where test_data/ lives)."""
-    return Path(__file__).resolve().parents[2]
-
-
 def _default_data_dir() -> Path:
-    """Default location for ds005165 data, relative to project root."""
-    return _project_root() / "test_data" / "ds005165-download"
+    from .._paths import get_benchmark_data_dir
+    return get_benchmark_data_dir() / "ds005165-download"
 
 
 def _find_data_dir() -> Path | None:
-    """Try to auto-detect the ds005165 data directory."""
     candidates = [
         _default_data_dir(),
         Path("test_data/ds005165-download"),

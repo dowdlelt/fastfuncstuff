@@ -21,9 +21,13 @@ from ..stats.spatial import (
 
 
 def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
-    """Pearson correlation between two 1D arrays (numpy)."""
+    """Pearson correlation between two 1D arrays (numpy), NaN/Inf-safe."""
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
+    valid = np.isfinite(a) & np.isfinite(b)
+    if valid.sum() < 2:
+        return 0.0
+    a, b = a[valid], b[valid]
     a_c = a - a.mean()
     b_c = b - b.mean()
     denom = np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())

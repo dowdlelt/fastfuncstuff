@@ -229,7 +229,6 @@ def _compare_ic_stats(mel_dir: Path, trace_dir: Path) -> dict:
     return {
         "melodic_n": mel_stats.shape[0],
         "ffs_n": ffs_stats.shape[0],
-        "variance_share_r": _pearson_r(mel_stats[:n, 0], ffs_stats[:n, 0]),
         "kurtosis_r": _pearson_r(mel_stats[:n, 2], ffs_stats[:n, 2]),
     }
 
@@ -266,6 +265,144 @@ def _compare_ic_maps(mel_dir: Path, trace_dir: Path, mask_path: Path) -> dict:
         "ffs_n": ffs_maps.shape[0],
         "n_matched": len(corrs),
     }
+
+
+def _compare_noise_norm(mel_dir: Path, trace_dir: Path) -> dict:
+    mel_noise_p = mel_dir / "Noise__inv.nii.gz"
+    ffs_noise_p = trace_dir / "noise_inv.npy"
+    ffs_resid_p = trace_dir / "resid_std.npy"
+    ffs_diag_p = trace_dir / "diagvals.npy"
+    missing = [n for n, p in [("mel_noise", mel_noise_p), ("ffs_noise", ffs_noise_p)]
+               if not p.exists()]
+    if missing:
+        return {"error": f"missing: {', '.join(missing)}"}
+
+    import nibabel as nib
+
+    mel_noise_vol = nib.load(str(mel_noise_p)).get_fdata(dtype=np.float32)
+    mask_p = mel_dir / "mask.nii.gz"
+    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mel_noise = mel_noise_vol[mask].astype(np.float64)
+
+    ffs_noise = np.load(str(ffs_noise_p)).astype(np.float64)
+
+    if mel_noise.shape != ffs_noise.shape:
+        return {"error": f"shape mismatch: mel={mel_noise.shape} ffs={ffs_noise.shape}"}
+
+    noise_r = _pearson_r(mel_noise, ffs_noise)
+
+    result = {
+        "noise_inv_r": noise_r,
+        "noise_inv_mel_mean": float(mel_noise.mean()),
+        "noise_inv_ffs_mean": float(ffs_noise.mean()),
+        "voxels": len(mel_noise),
+    }
+
+    if ffs_resid_p.exists():
+        resid = np.load(str(ffs_resid_p)).astype(np.float64)
+        result["resid_std_mean"] = float(resid.mean())
+        result["resid_std_std"] = float(resid.std())
+
+    if ffs_diag_p.exists():
+        diag = np.load(str(ffs_diag_p)).astype(np.float64)
+        result["diagvals_mean"] = float(diag.mean())
+        result["diagvals_n"] = len(diag)
+
+    return result
+
+
+def _compare_raw_oic(mel_dir: Path, trace_dir: Path) -> dict:
+    mel_oic_p = mel_dir / "melodic_oIC.nii.gz"
+    ffs_oic_p = trace_dir / "oic.npy"
+    if not mel_oic_p.exists() or not ffs_oic_p.exists():
+        return {"error": "raw oIC files not found"}
+
+    import nibabel as nib
+
+    mel_4d = nib.load(str(mel_oic_p)).get_fdata(dtype=np.float32)
+    mask_p = mel_dir / "mask.nii.gz"
+    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mel_maps = mel_4d[mask].T.astype(np.float32)
+
+    ffs_maps = np.load(str(ffs_oic_p)).astype(np.float32)
+
+    n_k = min(mel_maps.shape[0], ffs_maps.shape[0])
+    cross = np.abs(np.corrcoef(mel_maps[:n_k], ffs_maps[:n_k]))
+    cross_block = cross[:n_k, n_k:]
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
+    corrs = cross_block[row_ind, col_ind]
+
+    return {
+        "mean_matched_r": float(corrs.mean()),
+        "max_matched_r": float(corrs.max()),
+        "min_matched_r": float(corrs.min()),
+        "melodic_n": mel_maps.shape[0],
+        "ffs_n": ffs_maps.shape[0],
+        "n_matched": len(corrs),
+    }
+
+
+def _compare_unmix(mel_dir: Path, trace_dir: Path) -> dict:
+    mel_unmix_p = mel_dir / "melodic_unmix"
+    ffs_unmix_p = trace_dir / "unmix_matrix.npy"
+    if not mel_unmix_p.exists() or not ffs_unmix_p.exists():
+        return {"error": "unmix files not found"}
+
+    mel_unmix = np.loadtxt(str(mel_unmix_p))
+    ffs_unmix = np.load(str(ffs_unmix_p))
+
+    n_k = min(mel_unmix.shape[0], ffs_unmix.shape[0])
+    n_t = min(mel_unmix.shape[1], ffs_unmix.shape[1])
+
+    cross = np.abs(np.corrcoef(mel_unmix[:n_k, :n_t], ffs_unmix[:n_k, :n_t]))
+    cross_block = cross[:n_k, n_k:]
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
+    corrs = cross_block[row_ind, col_ind]
+
+    return {
+        "mean_matched_r": float(corrs.mean()),
+        "max_matched_r": float(corrs.max()),
+        "min_matched_r": float(corrs.min()),
+        "n_matched": len(corrs),
+    }
+
+
+def _compare_pca_components(mel_dir: Path, trace_dir: Path) -> dict:
+    mel_pca_p = mel_dir / "melodic_pca.nii.gz"
+    ffs_pca_p = trace_dir / "pca_components.npy"
+    if not mel_pca_p.exists() or not ffs_pca_p.exists():
+        return {"error": "PCA component files not found"}
+
+    import nibabel as nib
+
+    mel_4d = nib.load(str(mel_pca_p)).get_fdata(dtype=np.float32)
+    mask_p = mel_dir / "mask.nii.gz"
+    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mel_pca = mel_4d[mask].T.astype(np.float32)
+
+    ffs_pca = np.load(str(ffs_pca_p)).astype(np.float32)
+
+    n_k = min(mel_pca.shape[0], ffs_pca.shape[0])
+    cross = mel_pca[:n_k] @ ffs_pca[:n_k].T
+    cos_angles = np.linalg.svd(cross, compute_uv=False)
+    cos_angles = np.clip(cos_angles, 0.0, 1.0)
+
+    return {
+        "mean_principal_cos": float(cos_angles.mean()),
+        "min_principal_cos": float(cos_angles.min()),
+        "n_above_099": int((cos_angles > 0.99).sum()),
+        "n_above_095": int((cos_angles > 0.95).sum()),
+        "k": n_k,
+    }
+
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +479,10 @@ def validate(ctx: BenchmarkContext) -> dict:
                 "ic_stats": _compare_ic_stats(mel_dir, td),
                 "mixing": _compare_mixing(mel_dir, td),
                 "ic_maps": _compare_ic_maps(mel_dir, td, mask_path),
+                "noise_norm": _safe(_compare_noise_norm, mel_dir, td),
+                "raw_oic": _safe(_compare_raw_oic, mel_dir, td),
+                "unmix": _safe(_compare_unmix, mel_dir, td),
+                "pca_components": _safe(_compare_pca_components, mel_dir, td),
             }
             per_run_results.append(run_result)
 
@@ -390,24 +531,28 @@ def validate(ctx: BenchmarkContext) -> dict:
         f"n_runs={len(valid)}",
     ]
 
+    run_parts = []
     for r in valid:
         ds, rn = r["dataset"], r["run"]
         er = r["eigenvalues"].get("full_spectrum_r", 0)
         mr = r["ic_maps"].get("mean_matched_r", 0)
         wc = r["whitening"].get("mean_principal_cos", 0)
         vr = r["varnorm"].get("post_vn_eig_r", 0)
-        vmr = r["varnorm"].get("post_vn_mean_r", 0)
         vs = r["varnorm"].get("scale_ratio_mean", 0)
         vn = r["varnorm"].get("nrmse_mean", 0)
-        parts.append(
-            f"{ds}/run{rn:02d}: eig={er:.3f} vn_eig={vr:.3f} "
-            f"vn_r={vmr:.3f} vn_scale={vs:.4f} vn_nrmse={vn:.4f} "
-            f"white_cos={wc:.4f} maps={mr:.3f}"
+        nn = r.get("noise_norm", {}).get("noise_inv_r", None)
+        nn_str = f" noise_r={nn:.3f}" if nn is not None else ""
+        run_parts.append(
+            f"  {ds}/run{rn:02d}: eig={er:.3f} vn_eig={vr:.3f} "
+            f"vn_scale={vs:.4f} vn_nrmse={vn:.4f} "
+            f"white_cos={wc:.4f} maps={mr:.3f}{nn_str}"
         )
+
+    summary = ", ".join(parts) + "\n" + "\n".join(run_parts)
 
     return {
         "passed": passed,
-        "summary": ", ".join(parts),
+        "summary": summary,
         "overall_eig_r": mean_eig,
         "overall_vn_eig_r": mean_vn_eig,
         "overall_vn_scale": mean_vn_scale,

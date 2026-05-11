@@ -4,20 +4,16 @@ A small collection of fMRI analysis tools reimplemented in PyTorch, with a GPU-f
 
 ## Why this exists
 
-I have a slow CPU and a fast graphics card. The standard tools I like — chiefly
-AFNI, with detours through FSL and others — are excellent but were not written
-with my hardware in mind. Waiting for an analysis to finish is a real friction
-when you want to *experiment* with data: try a different HRF, swap in a
-different denoising approach, see what happens. So this project is the
-experiment of asking: how far can you get reimplementing favourite tools on top
-of PyTorch, lean on the GPU when it helps, and keep the CLI/UX close enough to
-AFNI that you do not have to relearn everything?
+I have a slow CPU and a fast graphics card. The tools I like to use, namely AFNI
+are great, but they are really built to take advantage of server CPU setups.  
+This project is an going experiment - how well can current models port good code
+to a pytorch like set up. Python chosen not because of speed, of course, but
+because I can at least review the code for sanity.  
 
-These are offered as-is, without guarantee. The CLIs have been tested
+These are offered as-is, no guarantees. The CLIs have been tested
 extensively in day-to-day use, and an in-tree benchmark (`ffs_benchmark`)
 compares outputs and timing against reference implementations on a public
-dataset. Not every tool matches its reference exactly — the goal is parity
-where parity matters and a clear paper trail when it does not.
+dataset.
 
 ## Install
 

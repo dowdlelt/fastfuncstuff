@@ -77,7 +77,11 @@
       "WebFetch(domain:www.mssc.mu.edu)",
       "WebFetch(domain:www.stat.umn.edu)",
       "WebFetch(domain:en.wikipedia.org)",
-      "WebFetch(domain:academic.oup.com)"
+      "WebFetch(domain:academic.oup.com)",
+      "Bash(jupyter nbconvert *)",
+      "Bash(ffs_benchmark)",
+      "Bash(ffs_benchmark -force-ffs -stages ica_solver)",
+      "Bash(awk *)"
     ],
     "deny": [],
     "ask": []
