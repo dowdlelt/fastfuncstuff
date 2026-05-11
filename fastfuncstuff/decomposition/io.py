@@ -74,14 +74,20 @@ def _compute_psc(
     mixing_tk: np.ndarray,
     masked_mean_v: np.ndarray,
     varnorm_std_v: np.ndarray | None = None,
+    mixing_amplitude_k: np.ndarray | None = None,
     psc_clip: float = 50.0,
 ) -> np.ndarray:
     """Compute PSC maps (K, V).
 
-    PSC[k, v] = 100 * std_t(mixing[:, k]) * raw_comp[k, v] * varnorm_std[v] / mean[v]
+    PSC[k, v] = 100 * amplitude_k * raw_comp[k, v] * varnorm_std[v] / mean[v]
 
     ICA operates on varnorm-divided data, so the reconstruction is:
         mixing[t,k] * comp_raw[k,v] ≈ data_varnorm[t,v] = data_original[t,v] / varnorm_std[v]
+
+    mixing_amplitude_k must be the per-component std of the mixing matrix BEFORE
+    any var_norm step.  var_norm divides each column by its std, so
+    std(mixing_varnormed[:,k]) = 1 regardless of true amplitude, inflating PSC
+    ~7–10×.  Pass the pre-var_norm std (shape (K,)) to get correct amplitudes.
 
     varnorm_std_v must be in the same units as masked_mean_v (both raw-scanner
     or both PSC-scaled).  When provided, PSC values are in the correct range
@@ -93,7 +99,10 @@ def _compute_psc(
 
     Returns float32 (K, V) array, clipped to ±psc_clip.
     """
-    mix_std = np.asarray(mixing_tk, dtype=np.float64).std(axis=0)  # (K,)
+    if mixing_amplitude_k is not None:
+        mix_std = np.asarray(mixing_amplitude_k, dtype=np.float64).ravel()  # (K,)
+    else:
+        mix_std = np.asarray(mixing_tk, dtype=np.float64).std(axis=0)  # (K,)
     comp = np.asarray(raw_components_kv, dtype=np.float64)          # (K, V)
     mean_v = np.asarray(masked_mean_v, dtype=np.float64)
 
@@ -264,6 +273,7 @@ def write_melodic_compat_outputs(
     comp_kv_for_stats: np.ndarray | None = None,
     oic_components_kv: np.ndarray | None = None,
     varnorm_std_v: np.ndarray | None = None,
+    mixing_amplitude_k: np.ndarray | None = None,
     write_per_comp_stats: bool = False,
     write_psc_prob: bool = True,
     write_zp: bool = True,
@@ -279,6 +289,9 @@ def write_melodic_compat_outputs(
       varnorm_std_v        : (V,) per-voxel temporal std used for varnorm, in the
                              same units as mean3d.  Required for correct PSC values:
                              without it, PSC is off by the CoV (~50-100×).
+      mixing_amplitude_k   : (K,) per-component std of mixing BEFORE var_norm.
+                             var_norm sets std(mixing[:,k])=1, inflating PSC ~7-10×.
+                             Pass this to use the true pre-var_norm amplitude.
       write_per_comp_stats : Write per-component 3D probmap_NNN.nii.gz and
                              thresh_zstatNNN.nii.gz (zero-padded).  Off by
                              default — the 4D bucket files cover the same data
@@ -391,9 +404,11 @@ def write_melodic_compat_outputs(
 
         if write_psc_prob and oic_components_kv is not None and p_maps is not None:
             n_k = min(oic_components_kv.shape[0], p_maps.shape[0])
+            amp_k = mixing_amplitude_k[:n_k] if mixing_amplitude_k is not None else None
             psc_kv = _compute_psc(
                 oic_components_kv[:n_k], mixing_np[:, :n_k], masked_mean_v,
                 varnorm_std_v=varnorm_std_v,
+                mixing_amplitude_k=amp_k,
                 psc_clip=psc_clip,
             )
             _write_interleaved_stat_bucket(

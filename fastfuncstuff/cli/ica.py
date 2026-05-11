@@ -718,7 +718,11 @@ def _run_single_ica(
         )
         _vprint(args.verb >= 1, noise_norm_msg)
 
+    mixing_amplitude_np: np.ndarray | None = None
     if args.var_norm:
+        # Capture pre-var_norm std — var_norm sets std(mixing[:,k])=1, so using
+        # std(mixing_varnormed) in PSC would inflate amplitudes ~7-10×.
+        mixing_amplitude_np = mixing.std(dim=0).cpu().numpy()  # (K,)
         mixing = mixing - mixing.mean(dim=0, keepdim=True)
         mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
         mixing = mixing / mixing_std
@@ -1067,6 +1071,7 @@ def _run_single_ica(
             comp_kv_for_stats=comp_np,
             oic_components_kv=raw_oic_np,
             varnorm_std_v=varnorm_std_np,
+            mixing_amplitude_k=mixing_amplitude_np,
             write_per_comp_stats=getattr(args, "per_comp_stats", False),
             write_psc_prob=getattr(args, "psc_bucket", True),
             write_zp=getattr(args, "zp_bucket", True),
@@ -1886,7 +1891,11 @@ def _run_concat_ica(
         )
         _vprint(args.verb >= 1, noise_norm_msg)
 
+    mixing_amplitude_np: np.ndarray | None = None
     if args.var_norm:
+        # Capture pre-var_norm std — var_norm sets std(mixing[:,k])=1, so using
+        # std(mixing_varnormed) in PSC would inflate amplitudes ~7-10×.
+        mixing_amplitude_np = mixing.std(dim=0).cpu().numpy()  # (K,)
         mixing = mixing - mixing.mean(dim=0, keepdim=True)
         mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
         mixing = mixing / mixing_std
@@ -2048,6 +2057,7 @@ def _run_concat_ica(
             comp_kv_for_stats=comp_np,
             oic_components_kv=raw_oic_np,
             varnorm_std_v=varnorm_std_np if args.voxel_norm else None,
+            mixing_amplitude_k=mixing_amplitude_np,
             write_per_comp_stats=getattr(args, "per_comp_stats", False),
             write_psc_prob=getattr(args, "psc_bucket", True),
             write_zp=getattr(args, "zp_bucket", True),
