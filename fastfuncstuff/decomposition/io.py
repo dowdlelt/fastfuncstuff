@@ -234,12 +234,11 @@ def write_melodic_compat_outputs(
     tcs = Path(timecourse_file)
     compat.mkdir(parents=True, exist_ok=True)
 
-    # MELODIC's user-visible melodic_IC.nii.gz is the noise-normalized IC map.
-    # Its mixture-model run writes only stats/probmap_*.nii.gz; whether MELODIC
-    # additionally overwrites melodic_IC with a rescale_nht'd version remains
-    # unverified, so default to the cleaner noise-normed maps file. The GGM
-    # zmaps stays available as *_ica_zmaps.nii.gz for users who want it.
-    safe_relative_symlink(maps, compat / "melodic_IC.nii.gz")
+    # MELODIC's melodic_IC.nii.gz contains the mixture-model z-stat maps (range
+    # ±30–50, std≈1), not the raw noise-normed IC maps.  When GGM zmaps are
+    # available, symlink to those; otherwise fall back to noise-normed maps.
+    ic_target = zmap_path if (zmap_path is not None and zmap_path.exists()) else maps
+    safe_relative_symlink(ic_target, compat / "melodic_IC.nii.gz")
     safe_relative_symlink(tcs, compat / "melodic_mix")
     safe_relative_symlink(tcs, compat / "melodic_Tmodes")
 

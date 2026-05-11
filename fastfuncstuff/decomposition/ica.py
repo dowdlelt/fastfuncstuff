@@ -251,8 +251,10 @@ class FastICA:
 
         # Step 4: Compute mixing matrix (ICA timecourses)
         # MELODIC: timecourses = dewhite @ pinv(W)
-        X_pca_top = X_pca[:, :n_components]  # (T, n_ica)
-        self.mixing_ = X_pca_top @ torch.linalg.pinv(W)
+        # Using dewhite (not X_pca) avoids sqrt(V) scale accumulation
+        # from the dot product over V voxels in X_pca = X @ pca_comp.T.
+        # Slice to n_components when ICA uses fewer than all PCA components.
+        self.mixing_ = dewhite[:, :n_components] @ torch.linalg.pinv(W)
 
         # Store PCA-like state for compatibility with transform()
         self.pca_ = _RowCenteredPCAState(
@@ -833,6 +835,7 @@ class InfoMaxICA:
         evecs_k = eigenvectors[:, :pca_n_components]
 
         white = torch.diag(1.0 / torch.sqrt(evals_k + 1e-12)) @ evecs_k.T
+        dewhite = evecs_k @ torch.diag(torch.sqrt(evals_k))
         pca_components_all = white @ X  # (k, V)
         X_pca = X @ pca_components_all.T  # (T, k)
 
@@ -851,8 +854,7 @@ class InfoMaxICA:
 
         # Extract spatial maps and mixing matrix (same as FastICA)
         self.components_ = W @ pca_components
-        X_pca_top = X_pca[:, :n_components]
-        self.mixing_ = X_pca_top @ torch.linalg.pinv(W)
+        self.mixing_ = dewhite[:, :n_components] @ torch.linalg.pinv(W)
 
         self.pca_ = _RowCenteredPCAState(
             components=pca_components_all,
