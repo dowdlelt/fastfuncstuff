@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from ..runner import BenchmarkContext, run_timed
-from ..validation import _load_vol
+from ..validation import _load_vol, compare_prob_maps
 
 name = "ica_trace"
 description = "ICA step-by-step parity (MELODIC debug vs ffs_ica -trace)"
@@ -495,13 +495,18 @@ def validate(ctx: BenchmarkContext) -> dict:
         mel_dir = _melodic_dir(ctx, dataset)
         td = _trace_dir(ctx, dataset)
         mask_path = mel_dir / "mask.nii.gz"
+        ffs_pfx = _ffs_prefix(ctx, dataset)
+        base = ffs_pfx.name
+        ffs_ica_dir = ffs_pfx.parent / f"{base}_concat.ica"
+        ffs_zp = ffs_ica_dir / "stats" / "z_prob.nii.gz"
         results[dataset] = {
             "eigenvalues": _compare_eigenvalues(mel_dir, td),
             "subspace": _compare_subspace(mel_dir, td),
             "varnorm": _compare_varnorm(mel_dir, td),
             "ic_stats": _compare_ic_stats(mel_dir, td),
             "mixing": _compare_mixing(mel_dir, td),
-            "ic_maps": _compare_ic_maps(mel_dir, _ffs_prefix(ctx, dataset), mask_path),
+            "ic_maps": _compare_ic_maps(mel_dir, ffs_pfx, mask_path),
+            "prob_maps": _safe(compare_prob_maps, mel_dir, ffs_zp, mask_path),
             "noise_norm": _safe(_compare_noise_norm, mel_dir, td),
             "unmix": _safe(_compare_unmix, mel_dir, td),
         }
@@ -510,19 +515,25 @@ def validate(ctx: BenchmarkContext) -> dict:
     maps_r = np.mean(
         [r["ic_maps"].get("mean_matched_r", 0) for r in results.values()]
     )
+    prob_r = np.mean(
+        [r["prob_maps"].get("mean_matched_r", 0) for r in results.values()
+         if "error" not in r.get("prob_maps", {})]
+    ) if any("error" not in r.get("prob_maps", {}) for r in results.values()) else 0.0
     passed = eig_r >= 0.95 and maps_r >= 0.60
 
-    header = [f"eig_r={eig_r:.4f}", f"maps_r={maps_r:.4f}"]
+    header = [f"eig_r={eig_r:.4f}", f"maps_r={maps_r:.4f}", f"prob_r={prob_r:.4f}"]
     ds_parts = []
     for ds, r in results.items():
         er = r["eigenvalues"]["full_spectrum_r"]
         mr = r["ic_maps"].get("mean_matched_r", 0)
+        pr = r["prob_maps"].get("mean_matched_r", None)
+        pr_str = f" prob_r={pr:.3f}" if pr is not None else ""
         sub = r.get("subspace", {})
         nn = r.get("noise_norm", {}).get("noise_inv_r", None)
         nn_str = f" noise_r={nn:.3f}" if nn is not None else ""
         if "mean_principal_cos" in sub:
             ds_parts.append(
-                f"  {ds}: eig={er:.3f} maps={mr:.3f} "
+                f"  {ds}: eig={er:.3f} maps={mr:.3f}{pr_str} "
                 f"subsp_cos_mean={sub['mean_principal_cos']:.4f} "
                 f"min={sub['min_principal_cos']:.4f} "
                 f">.99={sub['n_above_0.99']}/{sub['k']} "
@@ -531,7 +542,7 @@ def validate(ctx: BenchmarkContext) -> dict:
                 f"var_share_off={sub['var_share_of_disagreeing_dims']:.3f}{nn_str}"
             )
         else:
-            ds_parts.append(f"  {ds}: eig={er:.3f} maps={mr:.3f} subsp=ERR")
+            ds_parts.append(f"  {ds}: eig={er:.3f} maps={mr:.3f}{pr_str} subsp=ERR")
 
     summary = ", ".join(header) + "\n" + "\n".join(ds_parts)
 

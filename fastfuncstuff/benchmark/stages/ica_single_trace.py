@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from ..runner import BenchmarkContext, run_timed
-from ..validation import _pearson_r, _load_vol
+from ..validation import _pearson_r, _load_vol, compare_prob_maps
 
 name = "ica_single_trace"
 description = "ICA single-run step-by-step parity (MELODIC debug vs ffs_ica -trace)"
@@ -470,6 +470,8 @@ def validate(ctx: BenchmarkContext) -> dict:
                 })
                 continue
 
+            ffs_zp = (ctx.ffs_ica_dir / f"{dataset}_single_trace_run{run:02d}.ica"
+                      / "stats" / "z_prob.nii.gz")
             run_result = {
                 "dataset": dataset,
                 "run": run,
@@ -479,6 +481,7 @@ def validate(ctx: BenchmarkContext) -> dict:
                 "ic_stats": _compare_ic_stats(mel_dir, td),
                 "mixing": _compare_mixing(mel_dir, td),
                 "ic_maps": _compare_ic_maps(mel_dir, td, mask_path),
+                "prob_maps": _safe(compare_prob_maps, mel_dir, ffs_zp, mask_path),
                 "noise_norm": _safe(_compare_noise_norm, mel_dir, td),
                 "raw_oic": _safe(_compare_raw_oic, mel_dir, td),
                 "unmix": _safe(_compare_unmix, mel_dir, td),
@@ -505,11 +508,15 @@ def validate(ctx: BenchmarkContext) -> dict:
     white_cos = [r["whitening"]["mean_principal_cos"] for r in valid
                  if "error" not in r.get("whitening", {})]
 
+    prob_rs = [r["prob_maps"]["mean_matched_r"] for r in valid
+               if "error" not in r.get("prob_maps", {})]
+
     mean_eig = float(np.mean(eig_rs)) if eig_rs else 0.0
     mean_vn_eig = float(np.mean(varnorm_eig_rs)) if varnorm_eig_rs else 0.0
     mean_maps = float(np.mean(maps_rs)) if maps_rs else 0.0
     mean_mix = float(np.mean(mix_rs)) if mix_rs else 0.0
     mean_white = float(np.mean(white_cos)) if white_cos else 0.0
+    mean_prob = float(np.mean(prob_rs)) if prob_rs else 0.0
 
     vn_scales = [r["varnorm"]["scale_ratio_mean"] for r in valid
                  if "error" not in r.get("varnorm", {})]
@@ -528,6 +535,7 @@ def validate(ctx: BenchmarkContext) -> dict:
         f"white_cos={mean_white:.4f}",
         f"mix_r={mean_mix:.4f}",
         f"maps_r={mean_maps:.4f}",
+        f"prob_r={mean_prob:.4f}",
         f"n_runs={len(valid)}",
     ]
 
@@ -536,6 +544,8 @@ def validate(ctx: BenchmarkContext) -> dict:
         ds, rn = r["dataset"], r["run"]
         er = r["eigenvalues"].get("full_spectrum_r", 0)
         mr = r["ic_maps"].get("mean_matched_r", 0)
+        pr = r["prob_maps"].get("mean_matched_r", None)
+        pr_str = f" prob_r={pr:.3f}" if pr is not None else ""
         wc = r["whitening"].get("mean_principal_cos", 0)
         vr = r["varnorm"].get("post_vn_eig_r", 0)
         vs = r["varnorm"].get("scale_ratio_mean", 0)
@@ -545,7 +555,7 @@ def validate(ctx: BenchmarkContext) -> dict:
         run_parts.append(
             f"  {ds}/run{rn:02d}: eig={er:.3f} vn_eig={vr:.3f} "
             f"vn_scale={vs:.4f} vn_nrmse={vn:.4f} "
-            f"white_cos={wc:.4f} maps={mr:.3f}{nn_str}"
+            f"white_cos={wc:.4f} maps={mr:.3f}{pr_str}{nn_str}"
         )
 
     summary = ", ".join(parts) + "\n" + "\n".join(run_parts)
@@ -560,6 +570,7 @@ def validate(ctx: BenchmarkContext) -> dict:
         "overall_white_cos": mean_white,
         "overall_mix_r": mean_mix,
         "overall_maps_r": mean_maps,
+        "overall_prob_r": mean_prob,
         "n_valid_runs": len(valid),
         "per_run": per_run_results,
     }
