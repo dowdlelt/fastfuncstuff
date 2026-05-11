@@ -1011,26 +1011,6 @@ def _run_single_ica(
         np.save(str(_mm_td / "mmstats.npy"), _mm_arr)
         _vprint(args.verb >= 1, f"Trace: mmstats → {_mm_td}")
 
-    # PSC + Z bucket (AFNI-style interleaved): per-component PSC + FIZT Z.
-    if getattr(args, "psc_bucket", False):
-        if z_maps is None:
-            print("  WARN: -psc_bucket requires mixture-model z-maps; skipping (re-enable with -save_mixture_z)")
-        else:
-            t_step = time.time()
-            psc_path = Path(f"{out_prefix}_{run_tag}_ica_psc_z_bucket{nii_ext}")
-            decomposition_io.save_psc_zstat_bucket(
-                components_kv=comp_np,
-                z_maps_kv=z_maps,
-                mixing_tk=mixing_np,
-                mean3d=mean3d,
-                mask3d=mask3d,
-                shape3d=shape3d,
-                affine=affine,
-                out_file=psc_path,
-                psc_clip=float(args.psc_clip),
-            )
-            _vprint(args.verb >= 1, f"PSC+Z bucket: {psc_path}", t_step)
-
     # --- Good/Bad guidance scoring (spatial + temporal) ---
     guidance_scores = ica_workflow.compute_guidance_scores(
         comp_np=comp_np,
@@ -1081,6 +1061,10 @@ def _run_single_ica(
             thresh_z_maps=thresh_z_maps,
             comp_kv_for_stats=comp_np,
             oic_components_kv=raw_oic_np,
+            write_per_comp_stats=getattr(args, "per_comp_stats", False),
+            write_psc_prob=getattr(args, "psc_bucket", True),
+            write_zp=getattr(args, "zp_bucket", True),
+            psc_clip=float(args.psc_clip),
         )
         ic_target = (
             Path(f"{out_prefix}_{run_tag}_ica_zmaps{nii_ext}")
@@ -2032,27 +2016,7 @@ def _run_concat_ica(
         )
         np.save(_P(trace_dir) / "mmstats.npy", _mm_arr)
 
-    # PSC + Z bucket (AFNI-style interleaved). Only available alongside z-maps.
-    if getattr(args, "psc_bucket", False):
-        if z_maps is None:
-            print("  WARN: -psc_bucket requires mixture-model z-maps; skipping (re-enable with -save_mixture_z)")
-        else:
-            t_step = time.time()
-            psc_path = Path(f"{out_prefix}_concat_ica_psc_z_bucket{nii_ext}")
-            decomposition_io.save_psc_zstat_bucket(
-                components_kv=comp_np,
-                z_maps_kv=z_maps,
-                mixing_tk=mixing_np,
-                mean3d=mean3d,
-                mask3d=mask3d,
-                shape3d=shape3d,
-                affine=affine,
-                out_file=psc_path,
-                psc_clip=float(args.psc_clip),
-            )
-            _vprint(args.verb >= 1, f"PSC+Z bucket: {psc_path}", t_step)
-
-    # MELODIC compat
+    # MELODIC compat (includes psc_prob and z_prob buckets in stats/ by default)
     if args.melodic_compat:
         decomposition_io.write_melodic_compat_outputs(
             compat_dir=compat_dir,
@@ -2074,6 +2038,10 @@ def _run_concat_ica(
             thresh_z_maps=thresh_z_maps if z_maps is not None else None,
             comp_kv_for_stats=comp_np,
             oic_components_kv=raw_oic_np,
+            write_per_comp_stats=getattr(args, "per_comp_stats", False),
+            write_psc_prob=getattr(args, "psc_bucket", True),
+            write_zp=getattr(args, "zp_bucket", True),
+            psc_clip=float(args.psc_clip),
         )
         _vprint(args.verb >= 1, f"MELODIC compat: {compat_dir}")
 
@@ -3085,12 +3053,43 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "-psc_bucket",
         action="store_true",
+        default=True,
+        help=(
+            "Write stats/psc_prob.nii.gz — interleaved [PSC_k, Prob_k] 4D bucket "
+            "inside the .ica compat folder (default: on). PSC uses pre-noise-norm "
+            "maps so mixing@oic ≈ data. Requires -save_mixture_z."
+        ),
+    )
+    out.add_argument(
+        "-no_psc_bucket",
+        dest="psc_bucket",
+        action="store_false",
+        help="Disable the PSC+Prob bucket output.",
+    )
+    out.add_argument(
+        "-zp_bucket",
+        action="store_true",
+        default=True,
+        help=(
+            "Write stats/z_prob.nii.gz — interleaved [Z_k, Prob_k] 4D bucket "
+            "inside the .ica compat folder (default: on). Z bricks typed FIZT "
+            "for AFNI thresholding. Requires -save_mixture_z."
+        ),
+    )
+    out.add_argument(
+        "-no_zp_bucket",
+        dest="zp_bucket",
+        action="store_false",
+        help="Disable the Z+Prob bucket output.",
+    )
+    out.add_argument(
+        "-per_comp_stats",
+        action="store_true",
         default=False,
         help=(
-            "Write an AFNI-style 4D bucket interleaving per-component PSC and "
-            "Z-stat sub-bricks ([PSC1, Z1, PSC2, Z2, ...]). Z bricks are "
-            "labeled FIZT for AFNI thresholding. Requires mixture-model z-maps "
-            "(implies -save_mixture_z)."
+            "Write per-component 3D probmap_NNN.nii.gz and thresh_zstatNNN.nii.gz "
+            "files inside stats/ (zero-padded to component count). Off by default — "
+            "the 4D psc_prob and z_prob buckets are more compact."
         ),
     )
     out.add_argument(
@@ -3098,9 +3097,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=50.0,
         help=(
-            "Clip absolute PSC values to this magnitude before writing the "
-            "bucket (default: 50%%). Prevents low-mean voxels from blowing up "
-            "the color scale. Set <=0 to disable clipping."
+            "Clip absolute PSC values to this magnitude (default: 50%%). "
+            "Prevents low-mean voxels from blowing up the color scale. "
+            "Set <=0 to disable."
         ),
     )
     out.add_argument(

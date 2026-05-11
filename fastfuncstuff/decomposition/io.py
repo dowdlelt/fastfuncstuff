@@ -69,6 +69,120 @@ def save_masked_component_map_3d(
     return out_path
 
 
+def _compute_psc(
+    raw_components_kv: np.ndarray,
+    mixing_tk: np.ndarray,
+    masked_mean_v: np.ndarray,
+    psc_clip: float = 50.0,
+) -> np.ndarray:
+    """Compute PSC maps (K, V).
+
+    PSC[k, v] = 100 * std_t(mixing[:, k]) * raw_comp[k, v] / mean[v]
+
+    Uses the pre-noise-normalisation ("raw oIC") spatial maps so that
+    mixing @ raw_comp ≈ preprocessed_data and the amplitude scale is
+    preserved.  Noise-normalised maps are z-stat-scaled and must NOT be
+    used here.
+
+    Returns float32 (K, V) array, clipped to ±psc_clip.
+    """
+    mix_std = np.asarray(mixing_tk, dtype=np.float64).std(axis=0)  # (K,)
+    comp = np.asarray(raw_components_kv, dtype=np.float64)          # (K, V)
+    mean_v = np.asarray(masked_mean_v, dtype=np.float64)
+
+    pos = mean_v[mean_v > 0]
+    eps = max(1e-6, 1e-3 * float(np.median(pos) if pos.size > 0 else 1.0))
+    safe_mean = np.where(np.abs(mean_v) < eps, 1.0, mean_v)
+
+    psc = (100.0 * mix_std[:, None] * comp / safe_mean[None, :]).astype(np.float32)
+    psc[:, np.abs(mean_v) < eps] = 0.0
+    if psc_clip > 0:
+        np.clip(psc, -float(psc_clip), float(psc_clip), out=psc)
+    return psc
+
+
+def _write_interleaved_stat_bucket(
+    vol1_kv: np.ndarray,
+    vol2_kv: np.ndarray,
+    label1: str,
+    label2: str,
+    out_file: Path,
+    mask3d: np.ndarray | None,
+    shape3d: tuple[int, int, int],
+    affine: np.ndarray,
+    stat1_type: str | None = None,
+    stat2_type: str | None = None,
+) -> Path:
+    """Write interleaved [vol1_0, vol2_0, vol1_1, vol2_1, ...] 4D NIfTI.
+
+    Applies 3drefit sub-brick labels (and stat types where given) when
+    3drefit is on PATH; otherwise writes a companion _labels.txt file.
+    """
+    import shutil
+    import subprocess
+
+    k = vol1_kv.shape[0]
+    n_vox = vol1_kv.shape[1]
+    n_digits = len(str(k))
+
+    out_4d = np.zeros((*shape3d, 2 * k), dtype=np.float32)
+    if mask3d is None:
+        for i in range(k):
+            out_4d[..., 2 * i] = vol1_kv[i].astype(np.float32).reshape(shape3d)
+            out_4d[..., 2 * i + 1] = vol2_kv[i].astype(np.float32).reshape(shape3d)
+    else:
+        flat_mask = mask3d.reshape(-1).astype(bool)
+        for i in range(k):
+            v1 = np.zeros(flat_mask.shape[0], dtype=np.float32)
+            v2 = np.zeros(flat_mask.shape[0], dtype=np.float32)
+            v1[flat_mask] = vol1_kv[i].astype(np.float32)
+            v2[flat_mask] = vol2_kv[i].astype(np.float32)
+            out_4d[..., 2 * i] = v1.reshape(shape3d)
+            out_4d[..., 2 * i + 1] = v2.reshape(shape3d)
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    out_str = str(out_file)
+    if out_str.endswith(".nii.gz"):
+        tmp_path = Path(out_str[:-7] + ".nii")
+    else:
+        tmp_path = out_file
+    save_nifti(out_4d, output_path=tmp_path, affine=affine)
+
+    sub_labels = []
+    for i in range(k):
+        tag = str(i + 1).zfill(n_digits)
+        sub_labels.append(f"IC{tag}_{label1}")
+        sub_labels.append(f"IC{tag}_{label2}")
+
+    has_3drefit = shutil.which("3drefit") is not None
+    if has_3drefit:
+        cmd = ["3drefit"]
+        for i, lab in enumerate(sub_labels):
+            cmd.extend(["-sublabel", str(i), lab])
+        for i in range(k):
+            if stat1_type:
+                cmd.extend(["-substatpar", str(2 * i), stat1_type])
+            if stat2_type:
+                cmd.extend(["-substatpar", str(2 * i + 1), stat2_type])
+        cmd.append(str(tmp_path))
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"  WARN: 3drefit failed: {e.stderr.decode(errors='replace')[-300:]}")
+    else:
+        labels_txt = Path(str(tmp_path.with_suffix("")) + "_labels.txt")
+        with labels_txt.open("w") as f:
+            for i, lab in enumerate(sub_labels):
+                f.write(f"{i}\t{lab}\n")
+
+    if tmp_path != out_file:
+        from fastfuncstuff.io.afni import compress_nifti
+        compress_nifti(str(tmp_path), str(out_file), remove_original=True)
+
+    return out_file
+
+
 def save_psc_zstat_bucket(
     components_kv: np.ndarray,
     z_maps_kv: np.ndarray,
@@ -80,113 +194,31 @@ def save_psc_zstat_bucket(
     out_file: str | Path,
     psc_clip: float = 50.0,
 ) -> Path:
-    """Save AFNI-style interleaved PSC + Z-stat bucket.
+    """Save AFNI-style interleaved PSC + Z-stat bucket (legacy convenience wrapper).
 
-    For each component k, two sub-bricks are written:
-        2k   : PSC map  (% signal change at +1 σ of the component's timecourse)
-        2k+1 : Z-stat   (mixture-model Z, sub-brick typed FIZT)
+    For each component k: sub-brick 2k = PSC, sub-brick 2k+1 = Z (FIZT).
 
-    PSC formula: PSC[k, v] = 100 * std_t(mixing[:, k]) * components[k, v] / mean[v]
-    (zero where |mean| < eps; absolute |PSC| capped at ``psc_clip`` to control
-    color-scale outliers from low-mean voxels — typical brain values are <5%).
-
-    AFNI sub-brick labels and Z stat-aux are applied via ``3drefit`` if it is
-    on PATH; otherwise a plain text labels file is written next to the NIfTI.
+    ``components_kv`` must be the PRE-noise-normalisation ("raw oIC") maps so
+    that mixing @ components ≈ preprocessed_data and the PSC scale is correct.
+    Passing noise-normalised z-stat maps will produce meaningless amplitudes.
     """
-    import shutil
-    import subprocess
-
-    k, n_vox = components_kv.shape
-    if z_maps_kv.shape != components_kv.shape:
-        raise ValueError(
-            f"z_maps shape {z_maps_kv.shape} != components shape {components_kv.shape}"
-        )
-    if mixing_tk.shape[1] != k:
-        raise ValueError(
-            f"mixing has {mixing_tk.shape[1]} components, expected {k}"
-        )
-
-    # PSC: per-voxel amplitude as % of voxel mean. Use std across time for the
-    # mixing column to give the component's natural amplitude scale.
-    mix_std = np.asarray(mixing_tk, dtype=np.float64).std(axis=0)  # (k,)
-    comp = np.asarray(components_kv, dtype=np.float64)             # (k, V)
     flat_mean = np.asarray(mean3d, dtype=np.float64).reshape(-1)
     if mask3d is not None:
-        flat_mask = mask3d.reshape(-1).astype(bool)
-        masked_mean = flat_mean[flat_mask]
+        masked_mean = flat_mean[mask3d.reshape(-1).astype(bool)]
     else:
         masked_mean = flat_mean
-    if masked_mean.shape[0] != n_vox:
-        raise ValueError(
-            f"mean voxel count {masked_mean.shape[0]} != component voxels {n_vox}"
-        )
-    eps = max(1e-6, 1e-3 * float(np.median(np.abs(masked_mean[masked_mean > 0])) or 1.0))
-    safe_mean = np.where(np.abs(masked_mean) < eps, 1.0, masked_mean)
-    psc_kv = (100.0 * mix_std[:, None] * comp / safe_mean[None, :]).astype(np.float32)
-    psc_kv[:, np.abs(masked_mean) < eps] = 0.0
-    if psc_clip > 0:
-        np.clip(psc_kv, -float(psc_clip), float(psc_clip), out=psc_kv)
-
-    # Build interleaved (X, Y, Z, 2k) volume.
-    out = np.zeros((*shape3d, 2 * k), dtype=np.float32)
-    if mask3d is None:
-        if int(np.prod(shape3d)) != n_vox:
-            raise ValueError("Component size does not match full volume size")
-        for i in range(k):
-            out[..., 2 * i] = psc_kv[i].reshape(shape3d)
-            out[..., 2 * i + 1] = z_maps_kv[i].astype(np.float32).reshape(shape3d)
-    else:
-        flat_mask = mask3d.reshape(-1).astype(bool)
-        for i in range(k):
-            psc_vol = np.zeros(flat_mask.shape[0], dtype=np.float32)
-            z_vol = np.zeros(flat_mask.shape[0], dtype=np.float32)
-            psc_vol[flat_mask] = psc_kv[i]
-            z_vol[flat_mask] = z_maps_kv[i].astype(np.float32)
-            out[..., 2 * i] = psc_vol.reshape(shape3d)
-            out[..., 2 * i + 1] = z_vol.reshape(shape3d)
-
-    out_path = Path(out_file)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Write uncompressed first so 3drefit can edit, then compress at end.
-    out_str = str(out_path)
-    if out_str.endswith(".nii.gz"):
-        tmp_path = Path(out_str[: -len(".nii.gz")] + ".nii")
-    else:
-        tmp_path = out_path
-    save_nifti(out, output_path=tmp_path, affine=affine)
-
-    sub_labels = []
-    for i in range(k):
-        sub_labels.append(f"IC{i + 1:03d}_PSC")
-        sub_labels.append(f"IC{i + 1:03d}_Z")
-
-    has_3drefit = shutil.which("3drefit") is not None
-    if has_3drefit:
-        cmd = ["3drefit"]
-        for i, lab in enumerate(sub_labels):
-            cmd.extend(["-sublabel", str(i), lab])
-        # Mark every odd sub-brick as Z stat (FIZT, no params).
-        for i in range(k):
-            cmd.extend(["-substatpar", str(2 * i + 1), "fizt"])
-        cmd.append(str(tmp_path))
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            print(f"  WARN: 3drefit failed on PSC bucket: {e.stderr.decode(errors='replace')[-300:]}")
-    else:
-        labels_txt = tmp_path.with_suffix("")
-        labels_txt = Path(str(labels_txt) + "_labels.txt")
-        with labels_txt.open("w") as f:
-            for i, lab in enumerate(sub_labels):
-                f.write(f"{i}\t{lab}\n")
-
-    # Compress to .nii.gz if the requested name asked for it.
-    if tmp_path != out_path:
-        from fastfuncstuff.io.afni import compress_nifti
-        compress_nifti(str(tmp_path), str(out_path), remove_original=True)
-
-    return out_path
+    psc_kv = _compute_psc(components_kv, mixing_tk, masked_mean, psc_clip=psc_clip)
+    return _write_interleaved_stat_bucket(
+        vol1_kv=psc_kv,
+        vol2_kv=z_maps_kv.astype(np.float32),
+        label1="PSC",
+        label2="Z",
+        out_file=Path(out_file),
+        mask3d=mask3d,
+        shape3d=shape3d,
+        affine=affine,
+        stat2_type="fizt",
+    )
 
 
 def safe_relative_symlink(target: str | Path, link_path: str | Path) -> Path:
@@ -219,14 +251,31 @@ def write_melodic_compat_outputs(
     thresh_z_maps: np.ndarray | None = None,
     comp_kv_for_stats: np.ndarray | None = None,
     oic_components_kv: np.ndarray | None = None,
+    write_per_comp_stats: bool = False,
+    write_psc_prob: bool = True,
+    write_zp: bool = True,
+    psc_clip: float = 50.0,
 ) -> Path:
     """Write MELODIC-style compatibility files for ICA outputs.
 
     Optional parameters extend MELODIC parity:
-      comp_kv_for_stats : (K, V) post-noise-norm spatial IC maps; used to
-        compute the spatial-kurtosis column of melodic_ICstats.
-      oic_components_kv : (K, V) raw pre-noise-norm IC maps; saved as
-        melodic_oIC.nii.gz, the analog of MELODIC's "original" ICs.
+      comp_kv_for_stats    : (K, V) post-noise-norm spatial IC maps; used to
+                             compute the spatial-kurtosis column of melodic_ICstats.
+      oic_components_kv    : (K, V) raw pre-noise-norm IC maps; saved as
+                             melodic_oIC.nii.gz and used for PSC computation.
+      write_per_comp_stats : Write per-component 3D probmap_NNN.nii.gz and
+                             thresh_zstatNNN.nii.gz (zero-padded).  Off by
+                             default — the 4D bucket files cover the same data
+                             more compactly.
+      write_psc_prob       : Write stats/psc_prob.nii.gz — interleaved
+                             [PSC_k, Prob_k] for AFNI viewing (default on).
+                             PSC uses oic_components_kv (pre-noise-norm) so
+                             mixing @ oic ≈ preprocessed data; requires both
+                             oic_components_kv and p_maps.
+      write_zp             : Write stats/z_prob.nii.gz — interleaved [Z_k,
+                             Prob_k] for AFNI viewing (default on); requires
+                             z_maps and p_maps.
+      psc_clip             : Clip PSC to ±psc_clip % (default 50).
     """
     compat = Path(compat_dir)
     maps = Path(maps_file)
@@ -292,26 +341,63 @@ def write_melodic_compat_outputs(
             out_file=compat / "melodic_oIC.nii.gz",
         )
 
-    if z_maps is not None and p_maps is not None:
+    # stats/ sub-folder: bucket files + optional per-component 3D outputs
+    need_stats_dir = (
+        (write_per_comp_stats and z_maps is not None and p_maps is not None)
+        or (write_psc_prob and oic_components_kv is not None and p_maps is not None)
+        or (write_zp and z_maps is not None and p_maps is not None)
+    )
+    if need_stats_dir:
         stats_dir = compat / "stats"
         stats_dir.mkdir(parents=True, exist_ok=True)
-        n_comp = z_maps.shape[0]
-        for i in range(n_comp):
-            save_masked_component_map_3d(
-                component_v=p_maps[i],
-                mask3d=mask3d,
-                shape3d=shape3d,
-                affine=affine,
-                out_file=stats_dir / f"probmap_{i + 1}.nii.gz",
-            )
-            if thresh_z_maps is not None:
+
+        # Pre-compute masked mean for PSC (needed for both psc_prob bucket and
+        # per-component stats when oic is available).
+        flat_mean = np.asarray(mean3d, dtype=np.float64).reshape(-1)
+        masked_mean_v = flat_mean[mask3d.reshape(-1).astype(bool)] if mask3d is not None else flat_mean
+
+        if write_per_comp_stats and z_maps is not None and p_maps is not None:
+            n_comp = z_maps.shape[0]
+            n_digits = len(str(n_comp))
+            for i in range(n_comp):
+                tag = str(i + 1).zfill(n_digits)
                 save_masked_component_map_3d(
-                    component_v=thresh_z_maps[i],
-                    mask3d=mask3d,
-                    shape3d=shape3d,
-                    affine=affine,
-                    out_file=stats_dir / f"thresh_zstat{i + 1}.nii.gz",
+                    component_v=p_maps[i],
+                    mask3d=mask3d, shape3d=shape3d, affine=affine,
+                    out_file=stats_dir / f"probmap_{tag}.nii.gz",
                 )
+                if thresh_z_maps is not None:
+                    save_masked_component_map_3d(
+                        component_v=thresh_z_maps[i],
+                        mask3d=mask3d, shape3d=shape3d, affine=affine,
+                        out_file=stats_dir / f"thresh_zstat{tag}.nii.gz",
+                    )
+
+        if write_psc_prob and oic_components_kv is not None and p_maps is not None:
+            n_k = min(oic_components_kv.shape[0], p_maps.shape[0])
+            psc_kv = _compute_psc(
+                oic_components_kv[:n_k], mixing_np[:, :n_k], masked_mean_v, psc_clip=psc_clip
+            )
+            _write_interleaved_stat_bucket(
+                vol1_kv=psc_kv,
+                vol2_kv=p_maps[:n_k].astype(np.float32),
+                label1="PSC",
+                label2="Prob",
+                out_file=stats_dir / "psc_prob.nii.gz",
+                mask3d=mask3d, shape3d=shape3d, affine=affine,
+            )
+
+        if write_zp and z_maps is not None and p_maps is not None:
+            n_k = min(z_maps.shape[0], p_maps.shape[0])
+            _write_interleaved_stat_bucket(
+                vol1_kv=z_maps[:n_k].astype(np.float32),
+                vol2_kv=p_maps[:n_k].astype(np.float32),
+                label1="Z",
+                label2="Prob",
+                out_file=stats_dir / "z_prob.nii.gz",
+                mask3d=mask3d, shape3d=shape3d, affine=affine,
+                stat1_type="fizt",
+            )
 
     return compat
 
