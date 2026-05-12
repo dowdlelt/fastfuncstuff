@@ -24,6 +24,7 @@ from . import (
     ica_trace,
     moco,
     nordic,
+    phasereg,
     sauna,
     slicetime,
     warp,
@@ -32,7 +33,7 @@ from . import (
 ALL_STAGES = [
     moco, slicetime, crossalign, align, warp, glm, build_design, ica, ica_single,
     ica_single_trace, ica_trace, ica_solver,
-    automask, nordic, sauna,
+    automask, nordic, sauna, phasereg,
     glmsingle_prep, glmsingle_matlab, glmsingle_hrf, glmsingle_denoise, glmsingle_ridge,
     glm_tent, glm_fdr, glm_im, glm_im_reml,
 ]
