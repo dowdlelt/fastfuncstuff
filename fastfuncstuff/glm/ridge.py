@@ -45,6 +45,32 @@ except ImportError:
 from fastfuncstuff.glm.xval import compute_r2_metric
 
 
+def _gpu_interp_fracs(
+    newlen_flipped: torch.Tensor,
+    log_alphagrid: torch.Tensor,
+    fracs: torch.Tensor,
+) -> torch.Tensor:
+    """Vectorized GPU linear interpolation replacing the per-target np.interp loop.
+
+    newlen_flipped : (n_alphas, n_targets) monotonically increasing columns, on device
+    log_alphagrid  : (n_alphas,) corresponding log10(alpha) values, on device
+    fracs          : (n_fracs,) desired fraction query points, on device
+
+    Returns (n_fracs, n_targets) log-alpha values on the same device.
+    """
+    n_alphas, n_targets = newlen_flipped.shape
+    xp = newlen_flipped.T.contiguous()                        # (n_targets, n_alphas)
+    xi = fracs.unsqueeze(0).expand(n_targets, -1)             # (n_targets, n_fracs)
+    idx = torch.searchsorted(xp, xi.contiguous()).clamp(1, n_alphas - 1)
+    idx0 = idx - 1
+    x0 = xp.gather(1, idx0)                                   # (n_targets, n_fracs)
+    x1 = xp.gather(1, idx)
+    y0 = log_alphagrid[idx0]                                  # (n_targets, n_fracs)
+    y1 = log_alphagrid[idx]
+    t = ((xi - x0) / (x1 - x0 + 1e-30)).clamp(0.0, 1.0)
+    return (y0 + t * (y1 - y0)).T                             # (n_fracs, n_targets)
+
+
 @torch.inference_mode()
 def _fit_ridge_multiple_fracs(
     X: torch.Tensor,
@@ -166,7 +192,9 @@ def _fit_ridge_multiple_fracs(
     # to alpha=0 (OLS), disabling regularization entirely.
     # log10 with a floor correctly separates alpha=0 from tiny positive alphas.
     _ALPHA_FLOOR = 1e-30  # tiny constant so log10(0) stays finite
-    log_alphagrid_np = np.log10(alphagrid.flip(0).cpu().numpy() + _ALPHA_FLOOR)
+    # Keep log-alpha grid on device — no CPU roundtrip needed
+    log_alphagrid_dev = torch.log10(alphagrid.flip(0) + _ALPHA_FLOOR)  # (n_alphas,)
+    fracs_dev = torch.tensor(fracs, device=device, dtype=X.dtype)      # (n_fracs,)
 
     if not chunk_mode:
         # ====================================================================
@@ -183,19 +211,12 @@ def _fit_ridge_multiple_fracs(
         if zero_variance.any():
             newlen[:, zero_variance] = 1.0
 
-        newlen_np = newlen.flip(0).cpu().numpy()
+        # Vectorized GPU interpolation — replaces per-target np.interp loop
+        log_target_alphas_all = _gpu_interp_fracs(
+            newlen.flip(0), log_alphagrid_dev, fracs_dev
+        )  # (n_fracs, n_targets) on device
 
-        log_target_alphas_all = np.zeros((n_fracs, n_targets), dtype=np.float32)
-        for target_idx in range(n_targets):
-            log_target_alphas_all[:, target_idx] = np.interp(
-                fracs, newlen_np[:, target_idx], log_alphagrid_np
-            )
-
-        targetalphas_all = torch.tensor(
-            np.clip(10.0**log_target_alphas_all - _ALPHA_FLOOR, 0.0, None),
-            device=device,
-            dtype=X.dtype,
-        )  # (n_fracs, n_targets)
+        targetalphas_all = (10.0 ** log_target_alphas_all - _ALPHA_FLOOR).clamp(min=0.0)
 
         if torch.isnan(targetalphas_all).any() or torch.isinf(targetalphas_all).any():
             targetalphas_all = torch.nan_to_num(targetalphas_all, nan=0.0, posinf=1e10, neginf=0.0)
@@ -236,18 +257,12 @@ def _fit_ridge_multiple_fracs(
             if zero_variance.any():
                 newlen_chunk[:, zero_variance] = 1.0
 
-            newlen_np = newlen_chunk.flip(0).cpu().numpy()  # (n_alphas, chunk)
-            log_target_alphas = np.zeros((n_fracs, chunk), dtype=np.float32)
-            for target_idx in range(chunk):
-                log_target_alphas[:, target_idx] = np.interp(
-                    fracs, newlen_np[:, target_idx], log_alphagrid_np
-                )
+            # Vectorized GPU interpolation — replaces per-target np.interp loop
+            log_target_alphas = _gpu_interp_fracs(
+                newlen_chunk.flip(0), log_alphagrid_dev, fracs_dev
+            )  # (n_fracs, chunk) on device
 
-            targetalphas = torch.tensor(
-                np.clip(10.0**log_target_alphas - _ALPHA_FLOOR, 0.0, None),
-                device=device,
-                dtype=X.dtype,
-            )  # (n_fracs, chunk)
+            targetalphas = (10.0 ** log_target_alphas - _ALPHA_FLOOR).clamp(min=0.0)
             if torch.isnan(targetalphas).any() or torch.isinf(targetalphas).any():
                 targetalphas = torch.nan_to_num(targetalphas, nan=0.0, posinf=1e10, neginf=0.0)
 
@@ -855,7 +870,8 @@ def _fit_ridge_chunk(
 
     # Select optimal fraction per voxel (highest CV R²)
     xval_r2, best_frac_idx = r2_by_frac.max(dim=1)
-    optimal_fracs = torch.from_numpy(fracs[best_frac_idx.cpu().numpy()]).to(device)
+    fracs_dev = torch.tensor(fracs, device=device)
+    optimal_fracs = fracs_dev[best_frac_idx]
 
     # ========================================================================
     # Refit on full data (all runs) with optimal fraction per voxel

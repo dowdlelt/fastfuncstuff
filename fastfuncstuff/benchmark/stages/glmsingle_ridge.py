@@ -123,9 +123,10 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-hrf_opt {hrf_prefix} "
         f"-denoise {denoise_prefix} "
         f"-autoscale "
+        f"-do_scale "
         f"-device cuda"
     )
-
+    print(f"Running ffs_ridge with command:\n  {cmd}")
     elapsed, _ = run_timed(cmd, label="ffs_ridge -single_trials", cwd=ctx.processing_dir)
     return elapsed
 
