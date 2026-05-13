@@ -30,7 +30,7 @@ jobs:
 
       - name: Import smoke test
         run: |
-          python -c "import fastfuncsim as ffs; print('fastfuncsim import OK:', bool(getattr(ffs, '__file__', None)))"
+          python -c "import fastfuncstuff as ffs; print('fastfuncstuff import OK:', bool(getattr(ffs, '__file__', None)))"
 
       - name: Run focused tests
         run: |

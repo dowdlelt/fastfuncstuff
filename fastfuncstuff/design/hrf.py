@@ -885,15 +885,53 @@ def create_pighs_library(
         )
         hrfs_resampled[i] = interpolator(np.clip(target_times, 0, source_times[-1]))
 
+    # Sort by empirical waveform properties so the index map is interpretable:
+    # primary = time-to-peak, secondary = FWHM, tertiary = time to undershoot trough.
+    # Measured from the final resampled waveforms (robust to stim_duration shifts).
+    t_axis = np.arange(hrfs_resampled.shape[1]) * microtime_dt
+
+    emp_peak_time = np.array([
+        t_axis[np.argmax(h)] for h in hrfs_resampled
+    ])
+
+    def _fwhm(h: np.ndarray) -> float:
+        peak_val = h.max()
+        if peak_val <= 0:
+            return 0.0
+        above = np.where(h >= 0.5 * peak_val)[0]
+        return (above[-1] - above[0]) * microtime_dt if len(above) else 0.0
+
+    emp_fwhm = np.array([_fwhm(h) for h in hrfs_resampled])
+
+    def _undershoot_peak_time(h: np.ndarray) -> float:
+        if h.min() >= 0:
+            return float("inf")  # no undershoot → sort last
+        peak_idx = np.argmax(h)
+        tail = h[peak_idx:]
+        neg = np.where(tail < 0)[0]
+        if not len(neg):
+            return float("inf")
+        return t_axis[peak_idx + int(tail[neg[0]:].argmin() + neg[0])]
+
+    emp_undershoot_time = np.array([_undershoot_peak_time(h) for h in hrfs_resampled])
+
+    # lexsort: last key = primary (peak_time), then fwhm, then undershoot_time
+    order = np.lexsort((emp_undershoot_time, emp_fwhm, emp_peak_time))
+    hrfs_resampled = hrfs_resampled[order]
+
     hrf_library = to_tensor(hrfs_resampled, device=device, dtype=torch.float32)
 
     params = {
-        "peak_time": peak_times,
-        "m1": m1_vals,
-        "m2": m2_vals,
-        "m3": m3_vals,
-        "m4": m4_vals,
-        "c2": c2_vals,
+        "peak_time": peak_times[order],
+        "m1": m1_vals[order],
+        "m2": m2_vals[order],
+        "m3": m3_vals[order],
+        "m4": m4_vals[order],
+        "c2": c2_vals[order],
+        "sort_order": order,
+        "emp_peak_time": emp_peak_time[order],
+        "emp_fwhm": emp_fwhm[order],
+        "emp_undershoot_time": emp_undershoot_time[order],
     }
 
     return hrf_library, params

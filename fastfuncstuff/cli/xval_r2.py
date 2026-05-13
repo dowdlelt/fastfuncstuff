@@ -97,11 +97,18 @@ Notes:
         required=True,
         help="Design matrix file (AFNI .xmat.1D format)",
     )
-    required.add_argument(
-        "-output",
+    out_group = parser.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        "-prefix",
+        dest="output",
         type=str,
-        required=True,
         help="Output prefix (will create PREFIX_median.nii.gz, PREFIX_std.nii.gz, etc.)",
+    )
+    out_group.add_argument(
+        "-output",
+        dest="output",
+        type=str,
+        help="Alias for -prefix.",
     )
 
     # Cross-validation options

@@ -5,8 +5,10 @@ This module provides two estimation strategies:
 
 1. **FFT mode** (default, works for task and resting-state data):
    Estimate noise variance from power spectral density outside the typical
-   neural signal band (0.01-0.1 Hz).  High-frequency power is dominated by
-   thermal and physiological noise, giving clean per-voxel noise estimates.
+   neural signal band.  High-frequency power is dominated by thermal and
+   physiological noise, giving clean per-voxel noise estimates.
+   Matches the approach in phaseprep (Liem/Stanley) and Curtis 2014:
+   high-pass filter the signal and take time-domain std.
 
 2. **Residual mode** (requires task design matrix):
    Fit a GLM (task + nuisance) to both magnitude and phase, then compute
@@ -26,6 +28,10 @@ def _psd_noise_variance(
     freq_hi: float | None = None,
 ) -> torch.Tensor:
     """Estimate per-voxel noise variance from out-of-band PSD.
+
+    Uses the same method as phaseprep and Curtis 2014: zero out non-noise
+    frequencies in the FFT, IFFT back, and take the time-domain variance.
+    This avoids PSD normalisation pitfalls.
 
     Parameters
     ----------
@@ -49,26 +55,20 @@ def _psd_noise_variance(
     if freq_hi is None or freq_hi > nyquist:
         freq_hi = nyquist
 
-    # Real FFT along time axis
     spectrum = torch.fft.rfft(data, dim=0)
-    power = (spectrum.real ** 2 + spectrum.imag ** 2) / n_tp
-
-    # Frequency axis for rfft
     freqs = torch.fft.rfftfreq(n_tp, d=tr, device=data.device)
 
-    # Select out-of-band frequencies
     mask = (freqs >= freq_lo) & (freqs <= freq_hi)
     n_bins = mask.sum().item()
 
     if n_bins < 2:
-        # Not enough frequency bins — fall back to temporal variance
         return data.var(dim=0)
 
-    # Mean power in the noise band, scaled to variance
-    # Parseval: sum(power) = var(data) * n_tp, so mean(power_band) ~ var_band
-    noise_power = power[mask].mean(dim=0)
+    filtered = torch.zeros_like(spectrum)
+    filtered[mask] = spectrum[mask]
+    noise_ts = torch.fft.irfft(filtered, n=n_tp, dim=0)
 
-    return noise_power
+    return noise_ts.var(dim=0)
 
 
 def estimate_variance_ratio(
@@ -90,7 +90,7 @@ def estimate_variance_ratio(
     tr : float
         Repetition time in seconds.
     method : {"fft", "residual"}
-        - "fft": estimate from out-of-band spectral power.
+        - "fft": estimate from out-of-band spectral power (Curtis 2014).
         - "residual": estimate from temporal variance of the inputs
           directly (caller should pass GLM residuals).
     design : Tensor or None
@@ -104,7 +104,13 @@ def estimate_variance_ratio(
     Returns
     -------
     phi : Tensor (n_voxels,)
-        Variance ratio, clamped to [0.01, 100] to avoid degenerate slopes.
+        Variance ratio Var(eps_mag)/Var(eps_phase). NOT artificially clamped
+        on the upper end: at fMRI scales (raw scanner-unit mag vs radian
+        phase) phi naturally lands in 10^4–10^6, and Deming's near-OLS
+        approximation only holds when phi >> SYY/SXX. Clamping low (e.g. 100)
+        plants Deming in an "orthogonal-ish" regime that explodes the slope
+        in low-phase-variance voxels and forces R² negative, so we let phi
+        track the actual noise ratio. A tiny floor guards against div-by-zero.
     """
     if method == "fft":
         mag_centered = magnitude - magnitude.mean(dim=0)
@@ -114,7 +120,6 @@ def estimate_variance_ratio(
 
     elif method == "residual":
         if design is not None:
-            # Project out design from both
             Q, _ = torch.linalg.qr(design)
             mag_resid = magnitude - Q @ (Q.T @ magnitude)
             pha_resid = phase - Q @ (Q.T @ phase)
@@ -127,12 +132,11 @@ def estimate_variance_ratio(
     else:
         raise ValueError(f"Unknown method: {method!r}. Use 'fft' or 'residual'.")
 
-    # phi = Var(mag noise) / Var(phase noise), clamped for stability
     phi = torch.where(
         var_pha > 1e-30,
         var_mag / var_pha,
         torch.ones_like(var_mag),
     )
-    phi = phi.clamp(min=0.01, max=100.0)
+    phi = phi.clamp(min=1e-6)
 
     return phi

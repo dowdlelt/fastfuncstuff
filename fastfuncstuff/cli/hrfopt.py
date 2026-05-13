@@ -39,6 +39,7 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
         compute_run_lengths,
@@ -78,7 +79,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="3dHRFoptfast - Fast GPU-accelerated cross-validated HRF optimization",
         formatter_class=_HelpFormatter,
-        add_help=False,  # We handle -help ourselves to avoid required arg check
         epilog="""
 Examples:
   # Basic HRF optimization with library of HRF variants
@@ -125,9 +125,11 @@ Examples:
                -prefix sub01_with_nuisance
 
 Outputs:
-  {prefix}_hrf_index.nii.gz       - Which HRF (1-N) was selected per voxel
-  {prefix}_xval_r2.nii.gz         - Cross-validated R² for selected HRF
+  {prefix}_hrf_index.nii.gz       - 2-sub-brick bucket: [0] HRF index (1-N), [1] R² at selected HRF
+                                     Use sub-brick [1] to threshold the index map in AFNI
+  {prefix}_xval_r2.nii.gz         - Cross-validated R² for selected HRF (standalone copy)
   {prefix}_xval_r2_all_hrfs.nii.gz - 4D: CV R² for each HRF (volume per HRF)
+  {prefix}_selected_hrfs.nii.gz   - 4D: the winning HRF shape per voxel (x,y,z,hrf_timepoints at microtime_dt)
   {prefix}_stats.nii.gz           - Final GLM betas and t-stats (AFNI bucket format)
   {prefix}_hrf_library.pt         - HRF library + voxel assignments for ARMA reuse
   {prefix}_metadata.json          - Full metadata for reproducibility
@@ -137,7 +139,7 @@ Notes:
   - Nuisance files (-ortvec) must be pre-concatenated across runs (matching total timepoints)
   - Common nuisance files: motion parameters (6 columns), physiological regressors, etc.
   - Future: onset files with 'married' durations (e.g., "1:2 4:5") will be supported
-  - HRF library is saved for later ARMA/REML analysis with 3dREMLfast
+  - HRF library is saved for later ARMA/REML analysis with ffs_reml
         """,
     )
 
@@ -296,6 +298,17 @@ Notes:
         ),
     )
     cv_opts.add_argument(
+        "-select",
+        choices=["xval", "full"],
+        default="xval",
+        help=(
+            "HRF selection criterion. "
+            "'xval': cross-validated R² (LORO or split-half, default). "
+            "'full': in-sample R² on all data (GLMsingle FITHRF behaviour; "
+            "faster, automatically chosen when only one run is present)."
+        ),
+    )
+    cv_opts.add_argument(
         "-n_perms",
         type=int,
         default=100,
@@ -415,11 +428,7 @@ Notes:
         "requires LORO CV. 'slow' stores full timeseries (for non-LORO CV). "
         "'auto' selects based on CV strategy (default: auto).",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-debug",
         action="store_true",
@@ -462,9 +471,6 @@ Notes:
         action="store_true",
         help="Save design matrix and HRF library plots as PNG images.",
     )
-
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
 
     return parser
 
@@ -528,7 +534,7 @@ def main():
     parser = create_parser()
 
     # Check for help BEFORE parse_args to avoid required argument errors
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 
@@ -540,7 +546,7 @@ def main():
 
     # Debug implies verbose
     if args.debug:
-        args.verbose = True
+        args.verb = max(args.verb, 1)
 
     print_header(args)
 
@@ -702,7 +708,7 @@ def main():
                 sys.exit(1)
 
             all_onsets.append(onsets_by_run)
-            if args.verbose:
+            if args.verb >= 1:
                 n_events = sum(len(r) for r in onsets_by_run)
                 print(f"  {condition_labels[i]}: {n_events} events across {n_runs} runs")
 
@@ -770,7 +776,7 @@ def main():
     ortvec_files = None
     if args.ortvec:
         ortvec_files = [(f, label) for f, label in args.ortvec]
-        if args.verbose:
+        if args.verb >= 1:
             for f, label in ortvec_files:
                 print(f"  Nuisance: {f} (label={label})")
 
@@ -916,7 +922,7 @@ def main():
                 if hrf_idx == 0:
                     canonical_betas[c0:c1] = chunk_betas.cpu()
 
-            if args.verbose and hrf_idx % 5 == 0:
+            if args.verb >= 1 and hrf_idx % 5 == 0:
                 col_r2 = fit_r2_all[:, hrf_idx]
                 print(
                     f"    HRF {hrf_idx}: mean R²={col_r2.mean():.4f}, median R²={col_r2.median():.4f}"
@@ -1043,7 +1049,7 @@ def main():
                 microtime_dt=args.microtime_dt,
                 microtime_onset=0,  # Default: sample at start of TR
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
             # Update results
@@ -1075,7 +1081,7 @@ def main():
                 microtime_dt=args.microtime_dt,
                 condition_labels=condition_labels,
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
             # Update results
@@ -1099,9 +1105,10 @@ def main():
             ortvec_files=ortvec_files,
             canonical_mode=args.canonical,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
             chunk_size=args.batch_size,
             r2_method=args.R2method,
+            select_mode=args.select,
             debug=args.debug,
             debug_prefix=args.prefix,
             condition_labels=condition_labels,

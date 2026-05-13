@@ -23,7 +23,7 @@ from fastfuncstuff.processing.ffs_moco import (
     save_moco_dfile,
 )
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
-from fastfuncstuff.cli_utils import parse_prefix
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -94,9 +94,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-twopass", action="store_true", help="Coarse blur + fine pass"
     )
     method_group.add_argument(
-        "-nochain",
+        "-no_chain",
+        dest="no_chain",
         action="store_true",
         help="Don't chain-initialize from previous volume",
+    )
+    method_group.add_argument(
+        "-nochain",
+        dest="no_chain",
+        action="store_true",
+        help="Alias for -no_chain.",
     )
     method_group.add_argument(
         "-automask", action="store_true", help="Use automask for weighting"
@@ -118,9 +125,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Fast mode: fixed iterations, no convergence check (runs exactly -maxiter)",
     )
     method_group.add_argument(
-        "-no-compile",
+        "-no_compile",
+        dest="no_compile",
         action="store_true",
         help="Disable torch.compile for hot path (default: compile on CUDA)",
+    )
+    method_group.add_argument(
+        "-no-compile",
+        dest="no_compile",
+        action="store_true",
+        help="Alias for -no_compile.",
     )
 
     # --- Interpolation ---
@@ -165,13 +179,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     hw_group.add_argument(
         "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
     )
-    hw_group.add_argument(
-        "-verb",
-        type=int,
-        default=1,
-        choices=[0, 1, 2],
-        help="Verbosity: 0=quiet, 1=normal, 2=debug",
-    )
+    add_verbose_arg(hw_group, default=1)
     hw_group.add_argument(
         "-debug_memory",
         action="store_true",
@@ -234,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
         max_iter=args.maxiter,
         twopass=args.twopass,
         blur_fwhm=args.blur,
-        chain_init=not args.nochain,
+        chain_init=not args.no_chain,
         automask=args.automask,
         weight_automask=args.weight_automask,
         dxy_thresh=args.dxy_thresh,

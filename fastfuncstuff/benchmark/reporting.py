@@ -302,6 +302,9 @@ _METRIC_DISPLAY = [
     # MSD
     ("mean_nrmsd",      "mean nrmsd",    ".4f"),
     ("max_nrmsd",       "max nrmsd",     ".4f"),
+    # ICA varnorm scale/offset
+    ("vn_scale",        "vn scale",      ".4f"),
+    ("vn_nrmse",        "vn nrmse",      ".4f"),
 ]
 
 

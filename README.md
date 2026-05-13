@@ -1,415 +1,225 @@
-# FastFuncSim
+# fastfuncstuff (ffs)
 
-GPU-accelerated fMRI analysis toolkit: GLM fitting, denoising, HRF optimization,
-ridge regression, ICA decomposition, and design optimization. Built on PyTorch
-for automatic MPS/CUDA/CPU device selection.
+A small collection of fMRI analysis tools reimplemented in PyTorch, with a GPU-first bias.
 
-Implements the GLMsingle/GLMdenoise pipeline (Prince et al., 2022), AFNI-style
-ARMA(1,1) prewhitening, fractional ridge regression, and MELODIC-style ICA --
-all with GPU acceleration and cross-validated model selection.
+## Why this exists
 
+I have a slow CPU and a fast graphics card. The tools I like to use, namely AFNI
+are great, but they are really built to take advantage of server CPU setups.  
+This project is an going experiment - how well can current models port good code
+to a pytorch like set up. Python chosen not because of speed, of course, but
+because I can at least review the code for sanity.  
 
-## Installation
+These are offered as-is, no guarantees. The CLIs have been tested
+extensively in day-to-day use, and an in-tree benchmark (`ffs_benchmark`)
+compares outputs and timing against reference implementations on a public
+dataset.
+
+## Install
+
+`pyproject.toml` is a plain PEP 621 spec (setuptools backend), so any of pip,
+uv, or a conda env + pip will work. There is no conda-forge package; the
+"conda" path means "make the env with conda, then `pip install -e .`".
+
+Python: `>=3.11` is required, **3.13 advised** (latest with broad PyTorch
+wheel coverage). 3.14 may work but is gated on whether your chosen PyTorch
+build has wheels for it.
 
 ```bash
 git clone <repo-url>
 cd fastfuncstuff
+```
+
+**pip** (simplest):
+
+```bash
+python3.13 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-With test/dev dependencies:
+**uv** (fastest):
 
 ```bash
-pip install -e ".[dev]"
+uv venv --python 3.13
+source .venv/bin/activate
+uv pip install -e .
 ```
 
-Requires Python >= 3.12 and PyTorch >= 2.0. For GPU acceleration, install
-PyTorch with CUDA or MPS support.
+**conda** (recommended if you want CUDA without thinking about it):
 
-
-## Package Structure
-
-```
-fastfuncstuff/
-  glm/             Core GLM engine, cross-validation, ARMA prewhitening
-  design/          Design matrices, HRF generation, onset parsing
-  denoise/         Cross-validated noise PC denoising
-  decomposition/   PCA, FastICA, ICASSO stability analysis
-  simulation/      Noise generation, fMRI simulation, design metrics
-  io/              AFNI format support, NIfTI I/O
-  processing/      Motion correction, alignment, warping
-  cli/             Command-line tools (installed as console scripts)
+```bash
+conda create -n ffs python=3.13
+conda activate ffs
+pip install -e .
 ```
 
+Add `".[dev]"` instead of `.` for tests + linters.
 
-## Command-Line Tools
+### PyTorch and the GPU
 
-All tools are installed as commands via `pip install -e .` and accept
-`-help` for full usage. Input files can be `.nii`, `.nii.gz`, or `.nii.zst`
-(zstandard-compressed NIfTI).
+The default `pip install torch` gives you whatever wheel pip resolves for
+your platform — usually CPU on Linux, MPS on Apple Silicon. If you want
+CUDA, install torch *first* from the official index for your CUDA version,
+then `pip install -e .`:
 
-
-### ffs_denoise -- Cross-validated noise PC denoising
-
-Implements the GLMdenoise algorithm (Kay et al., 2013). Identifies a noise
-pool (voxels with low task R-squared), extracts principal components from that
-pool, and uses leave-one-run-out cross-validation to select the optimal number
-of PCs to include as nuisance regressors. The anti-overfitting strategy:
-training data is denoised but test predictions are evaluated against raw data.
-
-Supports PCA or ICA-based noise extraction, automatic component caps via
-Marchenko-Pastur thresholding, brainstem/CSF noise pool targeting, and
-single-trial design modes. Outputs denoised data, noise PC timecourses,
-R-squared maps, and diagnostic plots.
-
-```
-ffs_denoise -input run*.nii.gz -onsets face.txt house.txt \
-            -durations 2.0 5.0 -tr 1.5 -prefix sub01_denoise
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # or cu121, cu126, …
+pip install -e .
 ```
 
+Apple Silicon: the default wheel includes MPS. Some ops still fall back to
+CPU; this is a known weak spot — see the cross-cutting CPU-paths note in the
+wiki. CPU-only works everywhere but is the slow path; that is the whole
+reason this project exists.
 
-### ffs_hrfopt -- Per-voxel HRF optimization
+### File formats
 
-Cross-validated HRF library selection. Tests each HRF shape from a library
-(default: 20 canonical variants spanning peak times ~3-8s and with/without
-undershoot) against every voxel via LORO cross-validation. Selects the
-best-fitting HRF per voxel. Supports both canonical parameter-variation
-libraries and PIGHS (half-cosine basis) libraries.
+Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstandard) transparently.
+Default outputs are `.nii.gz` written with `pigz` when available (parallel
+gzip — much faster than the stdlib path on large 4D files).
 
-Two-pass GPU-efficient approach: pass 1 evaluates all HRFs in cross-validation,
-pass 2 recomputes betas using the selected HRF per voxel.
+## Command-line tools
 
-```
-ffs_hrfopt -input run*.nii.gz -onsets face.txt house.txt \
-           -durations 2.0 5.0 -tr 1.5 -prefix sub01_hrfopt
-```
+Every CLI is registered as a console script and accepts `-help`. Flag style
+follows AFNI conventions (single dash) where possible.
 
+### GLM and design
 
-### ffs_reml -- ARMA(1,1) prewhitened GLM
+| command | description |
+|---|---|
+| `ffs_build_design` | Build a 1D design matrix from onsets, durations, an HRF model, polynomials, and motion. Output is readable by `ffs_reml` and AFNI tools. |
+| `ffs_reml` | OLS / ARMA(1,1) prewhitened GLM with REML grid search over (a, b). AFNI `3dREMLfit`-style bucket output, FDR curves attached. |
+| `ffs_ridge` | Fractional ridge regression for single-trial betas (GLMsingle Type D). Per-voxel optimal fraction by cross-validation. |
+| `ffs_deconvolve` | FIR / event-related deconvolution without an assumed HRF shape. |
+| `ffs_tps` | Thin-plate-spline HRF estimation with cross-validated smoothness. Global or per-voxel λ. |
+| `ffs_xval_r2` | Cross-validated R² maps (LORO or split-half) with proper nuisance projection. |
 
-GPU-accelerated equivalent of AFNI's 3dREMLfit. Fits a GLM with ARMA(1,1)
-noise modeling via REML grid search over (a, b) parameter space. Produces
-correctly-weighted t-statistics that account for temporal autocorrelation.
-Accepts AFNI-style design matrices (`-matrix`) or builds designs from onset
-files. Outputs AFNI-compatible bucket files with beta/t-stat pairs.
+### HRF and denoising
 
-```
-ffs_reml -input run*.nii.gz -matrix design.1D -prefix sub01_reml
-```
+| command | description |
+|---|---|
+| `ffs_hrfopt` | Per-voxel HRF library selection. Tests each HRF in a library by LORO CV; refits with the winner. Canonical or PIGHS libraries. |
+| `ffs_denoise` | GLMdenoise-style noise-PC denoising (Kay et al. 2013). Identifies a noise pool, extracts PCs, picks the count by LORO CV. |
+| `ffs_denoisatorial` | Exhaustive 2^k subset evaluation of noise PCs, when you want the best non-contiguous combination rather than a prefix. |
+| `ffs_pathfinder` | Joint HRF + denoising optimisation. Picks the HRF that works best with the denoising level chosen for that voxel. |
+| `ffs_phasereg` | Magnitude-on-phase Deming regression for macrovascular BOLD suppression (Menon 2002, Curtis 2014, Stanley 2021; phaseprep parity). |
+| `ffs_nordic` | NORDIC-style patch-SVD denoising. Magnitude-only or complex (mag + phase), with optional g-factor map. |
+| `ffs_sauna` | NORDIC-adjacent denoiser. g-factor from trailing noise volumes + Gavish–Donoho optimal singular-value shrinkage. |
 
+### Decomposition
 
-### ffs_ridge -- Fractional ridge regression
+| command | description |
+|---|---|
+| `ffs_ica` | MELODIC-style probabilistic ICA. Auto component count, GGM mixture-model thresholding, MIGP for temporal concat, optional ICASSO and depth-lag classification. |
+| `ffs_decompose` | ICA with an emphasis on stability via ICASSO clustering. |
 
-Single-trial beta estimation with per-voxel regularization (GLMsingle Type D).
-Uses fractional ridge where the regularization parameter is expressed as a
-fraction of lambda_max, giving a bounded [0, 1] parameter space. Cross-validates
-to select the optimal fraction per voxel. Can incorporate denoising results
-(`-denoise`) and HRF optimization results (`-hrf_opt`) from upstream steps.
+### Image processing and registration
 
-```
-ffs_ridge -input run*.nii.gz -onsets face.txt house.txt \
-          -durations 2.0 5.0 -tr 1.5 -prefix sub01_ridge \
-          -denoise sub01_denoise -hrf_opt sub01_hrfopt
-```
+| command | description |
+|---|---|
+| `ffs_moco` | Rigid-body motion correction (Gauss–Newton, heptic resampling). Writes AFNI-compatible motion files. |
+| `ffs_allineate` | 6/9/12-parameter affine alignment. |
+| `ffs_qwarp` | Iterative nonlinear warp estimation (`3dQwarp`-style). |
+| `ffs_nwarp` | Apply a warp to a volume or 4D timeseries. Supports complex (mag + phase) warping. |
+| `ffs_slicetime` | Slice-timing correction (`3dTshift`-style), Fourier or sinc. |
+| `ffs_motsim` | Motion-simulation nuisance regressors (Patriat, Reynolds & Birn 2017). |
+| `ffs_util_automask` | Automatic brain mask from EPI. |
+| `ffs_util_pcwarp` | PC-based warp-field utilities. |
+| `ffs_spatial_xcorr` | Spatial cross-correlation matrix between two 4D volumes within a mask, with optimal matching and consistency metrics. |
 
+### Benchmarking
 
-### ffs_xval_r2 -- Cross-validated R-squared
+| command | description |
+|---|---|
+| `ffs_benchmark` | Run AFNI and `ffs_*` tools side by side on a BIDS dataset (default: OpenNeuro ds005165) and compare outputs and timing. `-validate-only` skips re-running and just compares. |
 
-Computes cross-validated R-squared maps using LORO or split-half CV with
-nuisance projection. Useful for comparing model quality across different
-preprocessing choices or design specifications without overfitting.
+## A typical pipeline
 
-```
-ffs_xval_r2 -input run*.nii.gz -onsets face.txt house.txt \
-            -durations 2.0 -tr 1.5 -prefix sub01_xval
-```
-
-
-### ffs_build_design -- Design matrix construction
-
-Builds AFNI-compatible design matrices from onset timing files and HRF
-specifications. Supports microtime resolution convolution, multiple HRF
-models (spmg1, spmg2, spmg3, dmBLOCK, etc.), polynomial drift regressors,
-and extra nuisance regressors from motion files. Outputs a 1D matrix file
-readable by ffs_reml or AFNI programs.
-
-```
-ffs_build_design -onsets face.txt house.txt -durations 2.0 5.0 \
-                 -tr 1.5 -n_timepoints 200 -prefix design
-```
-
-
-### ffs_deconvolve -- Event-related deconvolution
-
-FIR-style deconvolution without assuming an HRF shape. Estimates the
-hemodynamic response at each lag timepoint using regularized least squares.
-Useful for validating HRF assumptions or exploring response dynamics.
+GLMsingle-style single-trial analysis:
 
 ```
-ffs_deconvolve -input run*.nii.gz -onsets stim.txt -tr 1.5 \
-               -n_lags 20 -prefix sub01_fir
+ffs_denoise   -> noise PCs + count
+ffs_hrfopt    -> per-voxel HRF
+ffs_ridge     -> single-trial betas with per-voxel ridge
 ```
 
-
-### ffs_ica -- MELODIC-style ICA
-
-Whole-brain ICA with automatic component estimation. Supports Bayesian
-dimensionality estimation (MELODIC-style), ICASSO stability analysis for
-robust component selection, and depth-dependent lag analysis for identifying
-BOLD vs. non-BOLD components. Preprocessing includes optional spatial
-smoothing, polynomial detrending, Fourier high-pass filtering, and
-percent-signal scaling. Processes runs independently.
+Or a more conventional GLM:
 
 ```
-ffs_ica -input run1.nii.gz -n_components auto -icasso 25 \
-        -prefix sub01_ica
+ffs_build_design  -> design.1D
+ffs_reml          -> betas, t-stats, F-stats, FDR curves
 ```
 
+CLIs are Python-callable — every tool exposes `def main(argv: list[str] | None = None)`,
+so you can drive a pipeline from a script without going through subprocess:
 
-### ffs_nordic -- NORDIC-style complex denoising
-
-Implements a GPU-accelerated NORDIC-style local low-rank denoising workflow
-for fMRI data using magnitude-only or complex magnitude+phase input. Supports
-slice/temporal phase stabilization, trailing noise-volume estimation, patch-SVD
-denoising with NORDIC or MP-style thresholding, and optional g-factor proxy
-map output.
-
-This command is designed to mirror common `NIFTI_NORDIC.m` usage while fitting
-the fastfuncstuff CLI style and output conventions.
-
+```python
+from fastfuncstuff.cli.reml import main as ffs_reml
+ffs_reml(["-input", "run*.nii.gz", "-matrix", "design.1D", "-prefix", "sub01"])
 ```
-ffs_nordic -input-magn sub-08_bold.nii.gz -input-phase sub-08_phase.nii.gz \
-       -prefix NORDIC_sub-08_bold -temporal-phase 1 \
-       -phase-filter-width 10 -noise-volume-last 3 -nordic
-```
-
-Magnitude-only mode:
-
-```
-ffs_nordic -input-magn sub-08_bold.nii.gz -prefix NORDIC_sub-08_mag \
-       -magnitude-only
-```
-
-
-### ffs_decompose -- ICA decomposition with stability
-
-Similar to ffs_ica but focused on component stability analysis via ICASSO
-clustering. Runs ICA multiple times with different initializations, clusters
-the resulting components by similarity, and extracts stable centroids.
-
-```
-ffs_decompose -input func.nii.gz -n_components 30 -n_runs 25 \
-              -prefix sub01_decomp
-```
-
-
-### ffs_denoisatorial -- Combinatorial denoising
-
-Exhaustive evaluation of all 2^k PC subsets (for moderate k) to find the
-optimal non-contiguous combination of noise PCs. Unlike sequential denoising
-(which tests prefixes 1..k), this tests every possible subset. Uses LORO
-cross-validation with an inner CV loop for criteria voxel selection. Supports
-"argmax" and "parsimonious" (fewest PCs within 1% of max) selection strategies.
-
-```
-ffs_denoisatorial -input run*.nii.gz -onsets face.txt house.txt \
-                  -durations 2.0 -tr 1.5 -max_pcs 10 -prefix sub01_combo
-```
-
-
-### ffs_pathfinder -- Joint HRF + denoising optimization
-
-Jointly optimizes HRF selection and noise PC denoising. For each candidate
-HRF, evaluates denoised cross-validated R-squared to find the HRF that
-works best with the selected denoising level per voxel.
-
-```
-ffs_pathfinder -input run*.nii.gz -onsets face.txt house.txt \
-               -durations 2.0 -tr 1.5 -prefix sub01_pathfinder
-```
-
-
-### ffs_tps -- Thin-plate spline HRF estimation
-
-Estimates the HRF using penalized cubic splines with automatic
-cross-validated smoothness selection. Adapts to local SNR: high-SNR voxels
-get less smoothing, low-SNR voxels get more. Supports global optimization
-(one smoothness for all voxels) or per-voxel optimization.
-
-```
-ffs_tps -input func.nii.gz -stim_times onsets.txt -tps_window 0,20 \
-        -n_knots 15 -optimize_level global -output_prefix sub01_tps
-```
-
-
-### Image Processing
-
-| Command | Description |
-|---------|-------------|
-| `ffs_moco` | Rigid-body motion correction with GPU-accelerated cost functions |
-| `ffs_allineate` | Affine (6/9/12-parameter) alignment between volumes |
-| `ffs_nwarp` | Non-linear warping with regularized displacement fields |
-| `ffs_qwarp` | Qwarp-style iterative non-linear registration |
-| `ffs_automask` | Automatic brain mask generation from EPI data |
-| `ffs_motsim` | Simulate motion artifacts for testing correction pipelines |
-| `ffs_util_pcwarp` | PC-based warp field analysis and manipulation |
-
-
-### I/O Notes
-
-All tools read `.nii`, `.nii.gz`, and `.nii.zst` (zstandard-compressed NIfTI)
-transparently. Zstandard offers ~30% better compression than gzip at much
-higher decompression speed, useful for large datasets. Install zstandard
-support with `pip install zstandard`.
-
-
-## Typical Workflow
-
-A standard GLMsingle-style analysis pipeline:
-
-```
-1. ffs_denoise      Identify and remove structured noise (noise PC selection)
-2. ffs_hrfopt       Select best HRF per voxel from a library
-3. ffs_ridge        Fit single-trial betas with per-voxel regularization
-```
-
-Or for a simpler GLM:
-
-```
-1. ffs_build_design   Construct design matrix from onset times
-2. ffs_reml           Fit GLM with ARMA(1,1) prewhitening
-```
-
 
 ## Python API
+
+The library is usable directly. A skeleton:
 
 ```python
 import fastfuncstuff as ffs
 
-device = ffs.get_device()  # auto-detect MPS / CUDA / CPU
+device = ffs.get_device()  # CUDA / MPS / CPU
+hrf    = ffs.get_canonical_hrf(stim_duration=2.0, tr=1.5, device=device)
+design = ffs.build_glm_design(onsets, hrf, n_timepoints=200, device=device)
 
-# Build design from onset times
-hrf = ffs.get_canonical_hrf(stim_duration=2.0, tr=1.5, device=device)
-design = ffs.build_glm_design(onsets, hrf, n_timepoints=200,
-                               mode='assumed', device=device)
-
-# Fit GLM
 results = ffs.fit_glm(data, design, tr=1.5, device=device)
-# results.betas, results.r2, results.tstats, results.fstats
+# .betas, .r2, .tstats, .fstats, .sigma2, .meanvol
 
-# Write output
 ffs.write_glm_results_nifti(results, output_dir="./out", prefix="sub01",
-                             condition_names=["face", "house"])
+                            condition_names=["face", "house"])
 ```
 
+Other entry points worth knowing about: `fit_glm_arma11`, `fit_glm_hrf_library`,
+`generate_fmri_noise`, `simulate_fmri_run`, and `find_optimal_designs` (Liu &
+Frank efficiency). See `docs/` for details.
 
-### GLM Fitting
+## Design notes worth flagging
 
-`fit_glm()` is the core solver. It handles polynomial detrending, extra
-nuisance regressors, multi-run concatenation, and automatic GPU chunking.
+- **Legendre polynomials**, zero-padded per run, for drift modelling. Raw
+  monomials are numerically unstable; do not use them.
+- **Fractional ridge** in [0, 1] rather than λ in arbitrary units, so the
+  regularisation knob is bounded and interpretable.
+- **Microtime onset alignment** on a sub-TR grid (`bins_per_tr = round(tr/dt)`)
+  to avoid cumulative drift when `tr/dt` is not integer.
+- **Memory module** (`memory.py`) is the single source of truth for chunk
+  sizing on whatever device you have. CLIs do not hard-code chunk sizes.
+- **Default precision is float32**. `-use_double` is exposed where promotion
+  matters for stability (e.g. ARMA log-likelihood).
 
-```python
-results = ffs.fit_glm(
-    data,                     # (n_voxels, n_timepoints) or list of runs
-    design,                   # design matrix or list per run
-    tr=1.5,
-    max_poly_degree=3,        # Legendre polynomial drift removal (default: auto)
-    extra_regressors=None,    # motion params, noise PCs, etc.
-    want_residuals=False,     # return residuals (memory intensive)
-    device=device,
-)
-```
+## Status
 
-Returns a `GLMResults` object with `betas`, `r2`, `r2_run`, `tstats`,
-`fstats`, `sigma2`, `meanvol`, and optionally `residuals` and `predicted`.
-
-
-### HRF Library
-
-Try multiple HRF shapes, pick the best per voxel:
-
-```python
-library = ffs.get_hrf_library('canonical', stim_duration=2.0,
-                               tr=1.5, n_hrfs=20, device=device)
-results, hrf_index, r2_all = ffs.fit_glm_hrf_library(
-    data, onsets, library, tr=1.5, device=device)
-```
-
-
-### ARMA(1,1) Prewhitening
-
-Correct for temporal autocorrelation (equivalent to AFNI 3dREMLfit):
-
-```python
-arma_results = ffs.fit_glm_arma11(
-    data, design, tr=1.5,
-    max_poly_degree=3,
-    device=device,
-)
-```
-
-
-### Noise Generation and Simulation
-
-Generate realistic fMRI noise for power analysis:
-
-```python
-noise = ffs.generate_fmri_noise(
-    tr=1.5, duration_s=300, matrix_size=(64, 64, 30),
-    pink_exp=1.0, resp_freq=0.3, cardiac_freq=1.0,
-    device=device,
-)
-
-data = ffs.simulate_fmri_run(
-    onsets, betas=[3.0, 2.0], hrf=hrf, tr=1.5,
-    n_timepoints=200, matrix_size=(64, 64, 30),
-    device=device,
-)
-```
-
-
-### Design Optimization
-
-Optimize experimental designs using Liu & Frank efficiency metrics:
-
-```python
-from fastfuncstuff.design.optimization import find_optimal_designs, ISIConstraints
-
-constraints = ISIConstraints(min_isi=2.0, max_isi=12.0, mean_isi=5.0)
-designs = find_optimal_designs(
-    n_conditions=3, n_trials=60, tr=1.5,
-    constraints=constraints, n_candidates=1000,
-)
-```
-
-
-## Key Design Decisions
-
-**Legendre polynomials for drift modeling.** Raw monomials are numerically
-unstable. All polynomial regressors use orthogonal Legendre polynomials,
-zero-padded per run during cross-validation.
-
-**Fractional ridge regularization.** Ridge fractions are expressed as fractions
-of lambda_max (range [0, 1]), making the parameter space bounded and
-interpretable regardless of data scale.
-
-**Microtime onset alignment.** Onsets are placed on a sub-TR grid using
-`bins_per_tr = round(tr/dt)` to avoid cumulative drift when tr/dt is
-not an integer.
-
-**GPU memory management.** Large arrays (voxel timeseries) are processed in
-chunks; small matrices (design, polynomials) stay on GPU. The `memory` module
-computes safe chunk sizes for the current device.
-
+Active, single-author, very much a research codebase. The CLIs listed above
+are the ones I use; expect rough edges in less-travelled paths. Outstanding
+issues, hypotheses, and TODOs live alongside the code in a wiki at
+`~/Dropbox/Resources/code/fmri_wiki/` (not part of this repo). If you find a
+bug, the wiki probably already knows about it.
 
 ## License
 
-MIT License. See LICENSE for details.
-
+MIT. See `LICENSE`.
 
 ## References
 
-- Prince JS, Charest I, Kurzawski JW, et al. (2022). Improving the accuracy
-  of single-trial fMRI response estimates using GLMsingle. *eLife*, 11:e77599.
-- Kay K, Rokem A, Winawer J, et al. (2013). GLMdenoise: a fast, automated
-  technique for denoising task-based fMRI data. *Frontiers in Neuroscience*, 7:247.
+Primary inspirations and direct method references — most are linked from
+docstrings in the relevant module:
+
+- AFNI: Cox 1996; `3dREMLfit`, `3dDeconvolve`, `3dQwarp`, `3dTshift`,
+  `3dLocalstat` tech notes.
+- GLMdenoise: Kay, Rokem, Winawer, Dougherty & Wandell (2013), *Front Neurosci*.
+- GLMsingle: Prince, Charest, Kurzawski et al. (2022), *eLife*.
+- Fractional ridge: Rokem & Kay (2020), *GigaScience*.
+- MELODIC / probabilistic ICA: Beckmann & Smith (2004), *IEEE TMI*.
+- MIGP: Smith, Hyvärinen, Varoquaux, Miller & Beckmann (2014), *NeuroImage*.
+- NORDIC: Moeller et al. (2021), *NeuroImage*.
+- Phase regression: Menon (2002); Curtis et al. (2014); Stanley et al. (2021);
+  Liem (phaseprep, 2023).
+- Optimal SVHT / shrinkage: Gavish & Donoho (2014, 2017).
+- Motion simulation: Patriat, Reynolds & Birn (2017), *NeuroImage*.
+- Design efficiency: Liu & Frank (2004); Buracas & Boynton (2002); Das et al. (2023).

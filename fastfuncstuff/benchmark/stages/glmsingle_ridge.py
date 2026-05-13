@@ -47,11 +47,14 @@ def _stim_labels(ctx: BenchmarkContext) -> list[str]:
 
 
 def _input_files(ctx: BenchmarkContext) -> list[Path]:
-    """MNI-space resampled runs."""
+    """MNI-space resampled runs: prefer ffs_mni_resampled_*, fall back to afni_mni_resampled_*."""
     task = _primary_task(ctx)
-    return [
-        ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz" for r in _runs(ctx)
-    ]
+    result = []
+    for r in _runs(ctx):
+        ffs = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
+        afni = ctx.processing_dir / f"afni_mni_resampled_task-{task}_run-{r}.nii.gz"
+        result.append(ffs if ffs.exists() else afni)
+    return result
 
 
 def _onset_files(ctx: BenchmarkContext) -> list[Path]:
@@ -87,9 +90,12 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         hrfopt = ctx.ffs_hrfopt_dir
         if not (hrfopt / "hrfopt_hrf_index.nii.gz").exists():
             missing.append(f"FFS hrfopt: {hrfopt / 'hrfopt_hrf_index.nii.gz'}")
-        for f in _input_files(ctx):
-            if not f.exists():
-                missing.append(str(f))
+        task = _primary_task(ctx)
+        for r in _runs(ctx):
+            ffs_f = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
+            afni_f = ctx.processing_dir / f"afni_mni_resampled_task-{task}_run-{r}.nii.gz"
+            if not ffs_f.exists() and not afni_f.exists():
+                missing.append(str(ffs_f))
         for f in _onset_files(ctx):
             if not f.exists():
                 missing.append(str(f))
@@ -123,9 +129,10 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-hrf_opt {hrf_prefix} "
         f"-denoise {denoise_prefix} "
         f"-autoscale "
+        f"-do_scale "
         f"-device cuda"
     )
-
+    print(f"Running ffs_ridge with command:\n  {cmd}")
     elapsed, _ = run_timed(cmd, label="ffs_ridge -single_trials", cwd=ctx.processing_dir)
     return elapsed
 

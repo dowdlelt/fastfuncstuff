@@ -11,12 +11,18 @@
 % Set reexport=true to force re-exporting NIfTIs from existing .mat.
 %
 % Prerequisites:
-%   - MNI-space 4D data: processing/ffs_mni_resampled_task-localizer_run-{1..5}.nii.gz
-%     These must be slice-time corrected AND resampled to TR=1.5s first:
-%       ffs_slicetime -input <raw> -prefix <st> -tpattern <json> -resample 1.5
-%       ffs_nwarp -input <st> -prefix <mni> -nwarp <chain> -master autobox -dxyz 3.0
-%   - GLMsingle-ltd on the MATLAB path
-%   - fracridge on the MATLAB path
+%   - MNI-space 4D data (either variant, checked in order):
+%       processing/ffs_mni_resampled_task-localizer_run-{1..5}.nii.gz  (ffs_nwarp)
+%       processing/afni_mni_resampled_task-localizer_run-{1..5}.nii.gz (3dNwarpApply)
+%     Created by ffs_benchmark glmsingle_prep stage (run_ffs or run_ref).
+%   - GLMsingle on the MATLAB path  (addpath(genpath('/path/to/GLMsingle/matlab')))
+%   - fracridge on the MATLAB path  (addpath(genpath('/path/to/fracridge')))
+%
+% Usage (manual):
+%   export FFS_BENCHMARK_DATA_DIR=/path/to/ds005165-download
+%   matlab -batch "addpath(genpath('/path/to/GLMsingle/matlab')); \
+%                  addpath(genpath('/path/to/fracridge')); \
+%                  run('/path/to/run_glmsingle_comparison.m')"
 %
 % NIfTI outputs (in glmsingle/):
 %   --- Type B (HRF selection) ---
@@ -38,16 +44,33 @@
 %   --- Shared ---
 %   glmsingle_mask.nii.gz          - brain mask used
 %
-% Usage:
-%   cd test_data/ds005165-download
-%   run('../run_glmsingle_comparison.m')
-%   % Or to force re-run:
-%   rerun = true; run('../run_glmsingle_comparison.m')
+% Or interactively:
+%   rerun = true; run('/path/to/run_glmsingle_comparison.m')
 
-% GLMSINGLE
-addpath(genpath('~/Dropbox/Resources/code/matlab_toolboxes/GLMsingle-ltd/matlab'))
-addpath(genpath('~/Dropbox/Resources/code/matlab_toolboxes/fracridge'))
-cd('/home/logan/Dropbox/Resources/code/fastfuncstuff/test_data/ds005165-download');
+% Check that GLMsingle and fracridge are already on the MATLAB path.
+% Add them in your startup.m or before calling this script, e.g.:
+%   addpath(genpath('/path/to/GLMsingle/matlab'))
+%   addpath(genpath('/path/to/fracridge'))
+if isempty(which('GLMestimatesingletrial'))
+    error(['GLMestimatesingletrial not found on MATLAB path.\n' ...
+           'Add GLMsingle to your path before running:\n' ...
+           '  addpath(genpath(''/path/to/GLMsingle/matlab''))']);
+end
+if isempty(which('fracridge'))
+    error(['fracridge not found on MATLAB path.\n' ...
+           'Add fracridge to your path before running:\n' ...
+           '  addpath(genpath(''/path/to/fracridge''))']);
+end
+
+% Set working directory to the benchmark data directory.
+% When called by ffs_benchmark, FFS_BENCHMARK_DATA_DIR is set automatically
+% and the runner also passes cd() before run() — this is a belt-and-suspenders
+% fallback for standalone use.
+bmark_data_dir = getenv('FFS_BENCHMARK_DATA_DIR');
+if ~isempty(bmark_data_dir)
+    cd(bmark_data_dir);
+end
+% If neither is set, the caller must have cd'd here already.
 
 %% Configuration
 data_dir = 'processing';
@@ -74,11 +97,14 @@ if ~exist('reexport', 'var'), reexport = false; end
 if ~exist(matfile, 'file') || rerun
     fprintf('=== PHASE 1: Running GLMsingle ===\n');
 
-    %% Load data
+    %% Load data (prefer ffs_mni_resampled_*, fall back to afni_mni_resampled_*)
     fprintf('Loading MNI-space resampled data...\n');
     data = cell(1, nruns);
     for r = 1:nruns
         fname = fullfile(data_dir, sprintf('ffs_mni_resampled_task-localizer_run-%d.nii.gz', r));
+        if ~exist(fname, 'file')
+            fname = fullfile(data_dir, sprintf('afni_mni_resampled_task-localizer_run-%d.nii.gz', r));
+        end
         fprintf('  Loading %s...\n', fname);
         nii = niftiread(fname);
         data{r} = single(nii);  % X x Y x Z x T
@@ -209,8 +235,11 @@ if ~exist(nifti_check, 'file') || reexport || rerun
         load(matfile);
     end
 
-    % Get template NIfTI info from input data
+    % Get template NIfTI info from input data (prefer ffs variant, fall back to afni)
     template_file = fullfile(data_dir, 'ffs_mni_resampled_task-localizer_run-1.nii.gz');
+    if ~exist(template_file, 'file')
+        template_file = fullfile(data_dir, 'afni_mni_resampled_task-localizer_run-1.nii.gz');
+    end
     template_info = niftiinfo(template_file);
 
     % Create output directory

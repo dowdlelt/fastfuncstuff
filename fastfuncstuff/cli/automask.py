@@ -13,6 +13,7 @@ import time
 
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.mask import automask
 
@@ -45,7 +46,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Keep -clip_frac as hidden alias for backwards compat
     parser.add_argument("-clip_frac", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
-    parser.add_argument("-verb", type=int, default=1, choices=[0, 1], help="Verbosity (0/1)")
+    add_verbose_arg(parser, default=1)
 
     return parser.parse_args(argv)
 

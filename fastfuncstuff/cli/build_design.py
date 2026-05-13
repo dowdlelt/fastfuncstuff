@@ -41,6 +41,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
 from fastfuncstuff.design.builder import (
     build_design_matrix,
@@ -155,11 +156,7 @@ def parse_args():
         help='Override TR from input files',
     )
 
-    parser.add_argument(
-        '-verbose',
-        action='store_true',
-        help='Print detailed progress information',
-    )
+    add_verbose_arg(parser, default=0)
 
     return parser.parse_args()
 
@@ -218,12 +215,12 @@ def main():
     args = parse_args()
 
     # Get input metadata
-    if args.verbose:
+    if args.verb >= 1:
         print("Reading input file metadata...")
 
     tr, n_timepoints_per_run = get_input_metadata(args.input, args.TR)
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  TR: {tr}s")
         print(f"  Runs: {len(n_timepoints_per_run)}")
         print(f"  Timepoints per run: {n_timepoints_per_run}")
@@ -251,7 +248,7 @@ def main():
             hrf_models.append(hrf_model)
             im_modes.append(True)
 
-    if args.verbose and len(timing_files) > 0:
+    if args.verb >= 1 and len(timing_files) > 0:
         print(f"\nStimuli: {len(timing_files)}")
         for i, (label, hrf, im) in enumerate(zip(stim_labels, hrf_models, im_modes, strict=False)):
             mode_str = " (IM)" if im else ""
@@ -269,7 +266,7 @@ def main():
         for filepath, label in args.ortvecs:
             ortvec_files.append((filepath, label))
 
-    if args.verbose and (padortvec_files or ortvec_files):
+    if args.verb >= 1 and (padortvec_files or ortvec_files):
         print("\nNuisance regressors:")
         if padortvec_files:
             print(f"  Padded (per-run): {len(padortvec_files)}")
@@ -281,7 +278,7 @@ def main():
                 print(f"    - {label}")
 
     # Build design matrix
-    if args.verbose:
+    if args.verb >= 1:
         print("\nBuilding design matrix...")
 
     try:
@@ -300,7 +297,7 @@ def main():
         print(f"Error building design matrix: {e}", file=sys.stderr)
         return 1
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Design matrix shape: {design.shape}")
         print(f"  Columns: {len(labels)}")
         print(f"  Stimulus columns: {len(metadata['stim_indices'])}")
@@ -309,14 +306,14 @@ def main():
     # Parse GLT contrasts
     glt_contrasts = []
     if args.glts:
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nGLT contrasts: {len(args.glts)}")
 
         for contrast_str, label in args.glts:
             # Validate
             weights, valid = parse_glt_string(contrast_str)
 
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"  {label}: {contrast_str}")
                 if not valid:
                     print(f"    WARNING: Weights sum to {sum(weights.values()):.3f} (expected 0 or 1)")
@@ -327,7 +324,7 @@ def main():
     command_line = ' '.join(sys.argv)
 
     # Write output
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nWriting design matrix to: {args.xmat}")
 
     try:
@@ -344,7 +341,7 @@ def main():
         print(f"Error writing design matrix: {e}", file=sys.stderr)
         return 1
 
-    if args.verbose:
+    if args.verb >= 1:
         print("✓ Done!")
     else:
         print(f"Wrote design matrix to {args.xmat}")

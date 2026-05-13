@@ -5,6 +5,7 @@ Thin wrappers around existing spatial correlation infrastructure.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import nibabel as nib
@@ -21,9 +22,13 @@ from ..stats.spatial import (
 
 
 def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
-    """Pearson correlation between two 1D arrays (numpy)."""
+    """Pearson correlation between two 1D arrays (numpy), NaN/Inf-safe."""
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
+    valid = np.isfinite(a) & np.isfinite(b)
+    if valid.sum() < 2:
+        return 0.0
+    a, b = a[valid], b[valid]
     a_c = a - a.mean()
     b_c = b - b.mean()
     denom = np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())
@@ -601,4 +606,64 @@ def compare_im_bucket(
         "betas": beta_stats,
         "tstats": tstat_stats,
         "n_bricks_compared": n,
+    }
+
+
+def compare_prob_maps(
+    mel_dir: Path,
+    ffs_zp_path: Path,
+    mask_path: Path,
+) -> dict:
+    """Greedy-matched correlation between MELODIC per-component prob maps and FFS z_prob bucket.
+
+    MELODIC writes stats/probmap{N}.nii.gz (numeric, not zero-padded).
+    FFS z_prob.nii.gz is interleaved [Z_k, Prob_k, ...] — prob vols at odd indices.
+    """
+    stats_dir = mel_dir / "stats"
+    if not stats_dir.exists():
+        return {"error": "MELODIC stats/ dir not found"}
+
+    mel_prob_files = sorted(
+        stats_dir.glob("probmap*.nii.gz"),
+        key=lambda p: int(re.search(r"\d+", p.name).group()),  # type: ignore[union-attr]
+    )
+    if not mel_prob_files:
+        return {"error": "No MELODIC probmap*.nii.gz found in stats/"}
+
+    if not ffs_zp_path.exists():
+        return {"error": f"FFS z_prob not found: {ffs_zp_path}"}
+
+    mask_vol = nib.load(str(mask_path)).get_fdata() > 0.5  # type: ignore[attr-defined]
+
+    mel_probs = []
+    for f in mel_prob_files:
+        vol = nib.load(str(f)).get_fdata(dtype=np.float32)  # type: ignore[attr-defined]
+        if vol.shape[:3] != mask_vol.shape:
+            return {"error": f"shape mismatch: {f.name} {vol.shape} vs mask {mask_vol.shape}"}
+        mel_probs.append(vol[mask_vol])
+    mel_maps = np.stack(mel_probs, axis=0)  # (k_mel, V)
+
+    ffs_4d = nib.load(str(ffs_zp_path)).get_fdata(dtype=np.float32)  # type: ignore[attr-defined]
+    if ffs_4d.ndim != 4:
+        return {"error": f"FFS z_prob not 4D: {ffs_4d.shape}"}
+    ffs_maps = ffs_4d[mask_vol][:, 1::2].T  # (K, V) — odd sub-bricks = Prob
+
+    k_mel = mel_maps.shape[0]
+    k_ffs = ffs_maps.shape[0]
+    k = min(k_mel, k_ffs)
+
+    cross = np.abs(np.corrcoef(mel_maps[:k], ffs_maps[:k]))  # (2k, 2k)
+    cross_block = cross[:k, k:]  # (k, k) cross-correlation block
+
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
+    corrs = cross_block[row_ind, col_ind]
+
+    return {
+        "mean_matched_r": float(corrs.mean()),
+        "max_matched_r": float(corrs.max()),
+        "min_matched_r": float(corrs.min()),
+        "melodic_n": k_mel,
+        "ffs_n": k_ffs,
+        "n_matched": len(corrs),
     }

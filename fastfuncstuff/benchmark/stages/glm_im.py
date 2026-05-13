@@ -92,20 +92,34 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
             src = _scaled_input(ctx, run)
             if not src.exists():
                 missing.append(str(src))
-        if not _automask_path(ctx).exists():
-            missing.append(str(_automask_path(ctx)))
+        # MNI_automask.nii.gz is created on demand in run_ref/run_ffs via
+        # _ensure_mni_automask — don't gate on it here.
     return missing
+
+
+def _ensure_mni_automask(ctx: BenchmarkContext) -> None:
+    """Create MNI_automask.nii.gz from run-1 resampled data if not present."""
+    mask_path = _automask_path(ctx)
+    if mask_path.exists():
+        return
+    src = _scaled_input(ctx, 1)
+    run_timed(
+        f"3dAutomask -overwrite -prefix {mask_path} {src}",
+        label="3dAutomask MNI (glm_im)",
+        cwd=ctx.processing_dir,
+    )
 
 
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run 3dDeconvolve with -stim_times_IM (one beta per event)."""
     afni = _afni_dir(ctx)
     afni.mkdir(parents=True, exist_ok=True)
-
-    if _afni_bucket(ctx).exists() and not ctx.force_ref:
-        return 0.0
+    _ensure_mni_automask(ctx)
 
     task = _primary_task(ctx)
+    reml_cmd = _afni_dir(ctx) / f"IM_afni_stats_{task}.REML_cmd"
+    if _afni_bucket(ctx).exists() and reml_cmd.exists() and not ctx.force_ref:
+        return 0.0
     stim_labels = _stim_labels(ctx)
     inputs = " ".join(str(_scaled_input(ctx, r)) for r in _runs(ctx))
     mask = _automask_path(ctx)
@@ -116,8 +130,11 @@ def run_ref(ctx: BenchmarkContext) -> float:
         for i, label in enumerate(stim_labels, 1)
     )
 
+    # Pass basename only for -bucket so AFNI writes REML_cmd in cwd (afni dir).
+    # A full path prefix causes AFNI to generate a mangled REML_cmd path.
+    bucket_name = _afni_bucket(ctx).name
     elapsed, _ = run_timed(
-        f"3dDeconvolve -overwrite "
+        f"3dDeconvolve -overwrite -local_times "
         f"-input {inputs} "
         f"-polort A -num_stimts {len(stim_labels)} -float "
         f"{stim_args} "
@@ -125,7 +142,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
         f"-tout "
         f"-mask {mask} "
         f"-x1D {_xmat(ctx)} "
-        f"-bucket {_afni_bucket(ctx)}",
+        f"-bucket {bucket_name}",
         label="3dDeconvolve IM",
         cwd=afni,
     )
@@ -136,6 +153,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_reml OLS using the IM design matrix."""
     ffs = _ffs_dir(ctx)
     ffs.mkdir(parents=True, exist_ok=True)
+    _ensure_mni_automask(ctx)
 
     if _ffs_bucket(ctx).exists() and not ctx.force_ffs:
         return 0.0
@@ -168,17 +186,17 @@ def validate(ctx: BenchmarkContext) -> dict:
         mask_path=mask_path,
     )
 
-    fstat_r      = result["fstat"]["r"]
-    beta_min_r   = result["betas"]["min_r"]
-    beta_temp_r  = result["betas"]["temporal_median_r"]
-    tstat_min_r  = result["tstats"]["min_r"]
+    fstat_r = result["fstat"]["r"]
+    beta_min_r = result["betas"]["min_r"]
+    beta_temp_r = result["betas"]["temporal_median_r"]
+    tstat_min_r = result["tstats"]["min_r"]
     tstat_temp_r = result["tstats"]["temporal_median_r"]
 
     passed = (
-        fstat_r      >= THRESHOLDS["min_r"]
-        and beta_min_r   >= THRESHOLDS["min_r"]
-        and beta_temp_r  >= THRESHOLDS["temporal_min_median_r"]
-        and tstat_min_r  >= THRESHOLDS["min_r"]
+        fstat_r >= THRESHOLDS["min_r"]
+        and beta_min_r >= THRESHOLDS["min_r"]
+        and beta_temp_r >= THRESHOLDS["temporal_min_median_r"]
+        and tstat_min_r >= THRESHOLDS["min_r"]
         and tstat_temp_r >= THRESHOLDS["temporal_min_median_r"]
     )
 

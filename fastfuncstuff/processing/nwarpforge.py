@@ -809,6 +809,8 @@ def nwarpforge(
     phase_prefix: str | None = None,
     master_path: str | None = None,
     interp: str = "wsinc5",
+    phase_warp: str = "complex",
+    phase_units: str = "raw",
     device: torch.device | None = None,
     verb: int = 1,
     time_range: tuple[int, int] | None = None,
@@ -830,6 +832,22 @@ def nwarpforge(
                       (e.g. out.nii.gz -> out_phase.nii.gz) when not given.
         master_path: Path to master dataset for output grid (optional)
         interp: Final interpolation method
+        phase_warp: How to warp phase data when -phase is given:
+            "complex" (default): convert mag+phase to real/imag, warp each,
+                convert back.  Magnitude is derived from warped real/imag
+                (can be corrupted near phase wraps).
+            "split": warp magnitude directly (clean interpolation on smooth
+                signal), then warp real/imag and extract phase only.
+                Magnitude is never touched by phase data.
+            "direct": warp magnitude and phase independently.  Assumes phase
+                is already unwrapped and has no wraps.  Fastest option.
+            "circular": warp cos(phase) and sin(phase) separately (unit
+                circle interpolation), then atan2 back.  Handles wraps
+                without magnitude corruption.  Best for wrapped phase.
+        phase_units: Units of the input phase data:
+            "raw" (default): scanner units (e.g. -4096..4095 integer range).
+                Automatically scaled to radians [-pi, pi].
+            "rad": already in radians (e.g. unwrapped phase).  No scaling.
         device: Torch device
         verb: Verbosity level
         time_range: If set, only process volumes in range [start, end)
@@ -855,22 +873,34 @@ def nwarpforge(
                 f"-phase shape {tuple(phase_raw.shape)} does not match "
                 f"-source shape {tuple(source.shape)}"
             )
-        # Scale arbitrary phase data to radians [-pi, pi].
-        # Works for any input range (raw integer, 0-4096, already radians, etc.)
-        ph_min = phase_raw.min().item()
-        ph_max = phase_raw.max().item()
-        range_norm = ph_max - ph_min
-        if range_norm == 0.0:
+        if phase_units == "raw":
+            # Scale arbitrary scanner phase to radians [-pi, pi].
+            # Works for any input range (raw integer, 0-4096, etc.)
+            ph_min = phase_raw.min().item()
+            ph_max = phase_raw.max().item()
+            range_norm = ph_max - ph_min
+            if range_norm == 0.0:
+                raise ValueError(
+                    f"-phase data is constant ({ph_min}); cannot compute phase"
+                )
+            range_center = (ph_max + ph_min) / range_norm * 0.5
+            phase_data = (phase_raw / range_norm - range_center) * (2.0 * torch.pi)
+            if verb >= 1:
+                print(
+                    f"Loaded phase: {phase_path} {phase_raw.shape}  "
+                    f"raw range=[{ph_min:.3f}, {ph_max:.3f}] -> "
+                    f"scaled to [{phase_data.min().item():.3f}, {phase_data.max().item():.3f}] rad"
+                )
+        elif phase_units == "rad":
+            phase_data = phase_raw
+            if verb >= 1:
+                print(
+                    f"Loaded phase: {phase_path} {phase_raw.shape}  "
+                    f"range=[{phase_data.min().item():.3f}, {phase_data.max().item():.3f}] rad (no scaling)"
+                )
+        else:
             raise ValueError(
-                f"-phase data is constant ({ph_min}); cannot compute phase"
-            )
-        range_center = (ph_max + ph_min) / range_norm * 0.5
-        phase_data = (phase_raw / range_norm - range_center) * (2.0 * torch.pi)
-        if verb >= 1:
-            print(
-                f"Loaded phase: {phase_path} {phase_raw.shape}  "
-                f"raw range=[{ph_min:.3f}, {ph_max:.3f}] → "
-                f"scaled to [{phase_data.min().item():.3f}, {phase_data.max().item():.3f}] rad"
+                f"Unknown phase_units: {phase_units!r}. Use 'raw' or 'rad'."
             )
         if phase_prefix is None:
             phase_prefix = derive_phase_output_path(prefix)
@@ -1009,28 +1039,93 @@ def nwarpforge(
         src_vol = source[t] if is_4d else source
 
         if phase_data is not None:
-            # Convert magnitude + phase → real + imaginary, warp each, convert back.
-            # real and imag are transient (one 3D volume each) — minimal memory overhead.
             ph_vol = phase_data[t] if is_4d else phase_data
-            real_vol = src_vol * torch.cos(ph_vol)
-            imag_vol = src_vol * torch.sin(ph_vol)
 
-            warped_real = apply_composed_warp(
-                real_vol, composed,
-                source_affine=source_header["affine"],
-                output_affine=output_affine,
-                interp=interp,
-            )
-            warped_imag = apply_composed_warp(
-                imag_vol, composed,
-                source_affine=source_header["affine"],
-                output_affine=output_affine,
-                interp=interp,
-            )
+            if phase_warp == "complex":
+                # Current approach: convert mag+phase -> real/imag, warp
+                # each, convert back.  Magnitude is derived from warped
+                # real/imag and can be corrupted near phase wraps.
+                real_vol = src_vol * torch.cos(ph_vol)
+                imag_vol = src_vol * torch.sin(ph_vol)
+                warped_real = apply_composed_warp(
+                    real_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                warped_imag = apply_composed_warp(
+                    imag_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                warped = torch.sqrt(warped_real ** 2 + warped_imag ** 2)
+                warped_phase = torch.atan2(warped_imag, warped_real)
 
-            # Convert back to magnitude and phase
-            warped = torch.sqrt(warped_real ** 2 + warped_imag ** 2)
-            warped_phase = torch.atan2(warped_imag, warped_real)
+            elif phase_warp == "split":
+                # Warp magnitude directly (smooth, interpolates cleanly),
+                # then warp real/imag and extract phase only.  Magnitude
+                # is never touched by phase data.
+                warped = apply_composed_warp(
+                    src_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                real_vol = src_vol * torch.cos(ph_vol)
+                imag_vol = src_vol * torch.sin(ph_vol)
+                warped_real = apply_composed_warp(
+                    real_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                warped_imag = apply_composed_warp(
+                    imag_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                warped_phase = torch.atan2(warped_imag, warped_real)
+
+            elif phase_warp == "direct":
+                # Warp magnitude and phase independently.  Assumes phase
+                # is already unwrapped (no wraps).  Fastest — one warp
+                # per volume instead of two.
+                warped = apply_composed_warp(
+                    src_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                warped_phase = apply_composed_warp(
+                    ph_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+
+            elif phase_warp == "circular":
+                # Warp cos(phase) and sin(phase) separately (unit circle
+                # interpolation), then atan2 back.  Handles wraps without
+                # magnitude corruption.  Best for wrapped phase data.
+                warped = apply_composed_warp(
+                    src_vol, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                cos_ph = torch.cos(ph_vol)
+                sin_ph = torch.sin(ph_vol)
+                warped_cos = apply_composed_warp(
+                    cos_ph, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                warped_sin = apply_composed_warp(
+                    sin_ph, composed,
+                    source_affine=source_header["affine"],
+                    output_affine=output_affine, interp=interp,
+                )
+                warped_phase = torch.atan2(warped_sin, warped_cos)
+
+            else:
+                raise ValueError(
+                    f"Unknown phase_warp: {phase_warp!r}. "
+                    "Use 'complex', 'split', 'direct', or 'circular'."
+                )
             phase_volumes.append(warped_phase)
         else:
             warped = apply_composed_warp(

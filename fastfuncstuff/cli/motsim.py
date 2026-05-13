@@ -11,6 +11,7 @@ import time
 
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.motsim import (
     automask_dilate,
@@ -54,8 +55,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "(-dfile output: vol# roll pitch yaw dI dS dL rms_bef rms_aft)")
     g_io.add_argument("-prefix", required=True, metavar="PREFIX",
                       help="Output prefix. Produces PREFIX_motsim.1D (regressors)")
-    g_io.add_argument("-verb", type=int, default=1, metavar="LEVEL",
-                      help="Verbosity: 0=quiet, 1=normal, 2=debug [default: %(default)s]")
+    add_verbose_arg(g_io, default=1)
 
     # ── PCA options ──
     g_pca = p.add_argument_group("PCA Options")

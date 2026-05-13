@@ -69,7 +69,7 @@ try:
         onsets_to_tr_matrix,
         save_nifti,
     )
-    from fastfuncstuff.cli_utils import auto_polort, parse_device_arg, parse_prefix
+    from fastfuncstuff.cli_utils import add_verbose_arg, auto_polort, parse_device_arg, parse_prefix
     from fastfuncstuff.design.matrices import (
         build_glm_design,
         is_tr_locked,
@@ -98,7 +98,6 @@ def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
         description="Fast fMRI deconvolution with FIR/TENT models",
-        add_help=False,
         formatter_class=_HelpFormatter,
     )
 
@@ -332,11 +331,7 @@ def parse_args():
         help="Save design matrix visualization (PNG image)",
     )
 
-    out_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(out_opts, default=0)
 
     # Hardware options
     hw_opts = parser.add_argument_group("Hardware Options")
@@ -357,12 +352,6 @@ def parse_args():
         help="Print VRAM usage vs. prediction after each chunk loop (for memory tuning)",
     )
 
-    # Help
-    parser.add_argument(
-        "-help",
-        action="store_true",
-        help="Show this help message and exit",
-    )
 
     return parser
 
@@ -739,12 +728,6 @@ def _xval_tent_top(
 def main():
     """Main CLI entry point"""
     parser = parse_args()
-
-    # Check for help flag before parsing (to bypass required argument checks)
-    if "-help" in sys.argv or "--help" in sys.argv:
-        print_help(parser)
-        return 0
-
     args = parser.parse_args()
 
     pfx = parse_prefix(args.prefix)
@@ -754,7 +737,7 @@ def main():
     # Setup device — -device takes precedence over legacy --cpu flag
     device_spec = args.device or ("cpu" if args.cpu else None)
     device, _, _ = parse_device_arg(device_spec)
-    if args.verbose:
+    if args.verb >= 1:
         print(f"Using device: {device}")
     configure_torch_backends(device)
 
@@ -823,7 +806,7 @@ def main():
             condition_labels = _labels_from_timing_files(args.onsets)
         onsets_per_condition = None  # loaded below, after data
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\n{'=' * 70}")
         print("Fast fMRI Deconvolution")
         print(f"{'=' * 70}")
@@ -834,7 +817,7 @@ def main():
         print(f"  Condition labels: {', '.join(condition_labels)}")
 
     # Load data
-    if args.verbose:
+    if args.verb >= 1:
         print("\nLoading fMRI data...")
 
     # data_list stores 2D (n_voxels, n_tp) arrays per run (float32)
@@ -883,7 +866,7 @@ def main():
             return 1
         tr = tr_values[0]
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  TR: {tr}s")
         print(f"  Total timepoints: {sum(n_timepoints_per_run)}")
 
@@ -892,7 +875,7 @@ def main():
     if polort_str == "A":
         run_duration_sec = min(n_timepoints_per_run) * tr
         args.polort = auto_polort(run_duration_sec, formula="afni")
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Polort: A → {args.polort} (run duration {run_duration_sec:.1f}s)")
     else:
         try:
@@ -901,13 +884,13 @@ def main():
             print(f"ERROR: -polort must be 'A' or an integer, got: {args.polort!r}", file=sys.stderr)
             return 1
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Data shape: {nx} x {ny} x {nz}")
 
     # Load mask if provided
     mask = None
     if args.mask:
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nLoading mask: {args.mask}")
         mask = load_afni_mask(args.mask)
 
@@ -920,7 +903,7 @@ def main():
             return 1
 
         n_voxels = np.sum(mask)
-        if args.verbose:
+        if args.verb >= 1:
             print(
                 f"  Mask: {n_voxels} / {nx * ny * nz} voxels ({100 * n_voxels / (nx * ny * nz):.1f}%)"
             )
@@ -928,12 +911,12 @@ def main():
     # Load onsets
     if args.onsets:
         # ── AFNI timing files ────────────────────────────────────────────────
-        if args.verbose:
+        if args.verb >= 1:
             print("\nLoading onset timing files...")
 
         onsets_per_condition = []
         for onset_file in args.onsets:
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"  {onset_file}")
 
             onsets_by_run = parse_afni_timing_file(onset_file)
@@ -952,7 +935,7 @@ def main():
         if args.durations:
             from fastfuncstuff.design.builder import parse_durations
             condition_durations = parse_durations(args.durations, n_conditions, condition_labels)
-            if args.verbose:
+            if args.verb >= 1:
                 if len(set(condition_durations)) == 1:
                     print(f"  Stimulus duration (all conditions): {condition_durations[0]:.3f}s")
                 else:
@@ -961,7 +944,7 @@ def main():
 
     else:
         # BIDS path: onsets_per_condition already set above
-        if args.verbose:
+        if args.verb >= 1:
             from fastfuncstuff.design.bids_events import sort_bids_event_files
             print("\nBIDS events files (sorted by run):")
             for ep in sort_bids_event_files(args.events):
@@ -975,14 +958,14 @@ def main():
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets
         onsets_per_condition = round_onsets(onsets_per_condition, tr, threshold=args.round_onsets)
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
 
     # For BIDS, round_durations was already applied per-event inside parse_bids_events
     if args.round_durations is not None and condition_durations is not None and not args.events:
         dp = args.round_durations
         condition_durations = [round(d, dp) for d in condition_durations]
-        if args.verbose:
+        if args.verb >= 1:
             print(f"Durations rounded to {dp} decimal place(s): "
                   f"{[f'{d:.{dp}f}' for d in condition_durations]}")
 
@@ -997,19 +980,19 @@ def main():
         is_locked = is_tr_locked(all_onset_times, tr, threshold=args.tr_lock_threshold)
         if is_locked:
             model = "FIR"
-            if args.verbose:
+            if args.verb >= 1:
                 print(f"\n✓ Onsets are TR-locked (threshold: {args.tr_lock_threshold * 100:.0f}%)")
                 print("  Using FIR model")
         else:
             model = "TENT"
-            if args.verbose:
+            if args.verb >= 1:
                 print(
                     f"\n✗ Onsets are NOT TR-locked (threshold: {args.tr_lock_threshold * 100:.0f}%)"
                 )
                 print("  Using TENT model")
     else:
         model = args.model
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\nUsing {model} model")
 
     # ── Unified window determination (FIR and TENT family) ───────────────────
@@ -1072,7 +1055,7 @@ def main():
     n_lags_per_cond: list[int] = [max(1, round(top / tr)) for _, top in tent_windows]
 
     # Verbose window summary
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\nHRF window source: {window_source}")
         if model == "FIR":
             if len(set(n_lags_per_cond)) == 1:
@@ -1141,14 +1124,14 @@ def main():
                     _pv_bot = nom_bot
                     _pv_nom_top = nom_top
                     _pv_tops = candidate_tops
-                    if args.verbose:
+                    if args.verb >= 1:
                         print(f"\nPer-voxel window mode (±{n_range} TRs)...")
                         print(
                             f"  Candidates: "
                             f"{', '.join(f'{t:.2f}s' for t in candidate_tops)}"
                         )
                 else:
-                    if args.verbose:
+                    if args.verb >= 1:
                         print(f"\nCross-validating window top (±{n_range} TRs)...")
                         print(
                             f"  Candidates: "
@@ -1166,12 +1149,12 @@ def main():
                         n_conditions=n_conditions,
                         polort=args.polort,
                         device=device,
-                        verbose=args.verbose,
+                        verbose=args.verb >= 1,
                     )
 
                     tent_windows = [(nom_bot, best_top)] * n_conditions
 
-                    if args.verbose:
+                    if args.verb >= 1:
                         print(
                             f"  → Selected: {nom_bot:.1f}s to {best_top:.2f}s  "
                             f"(LORO R²={best_r2:.4f})"
@@ -1189,7 +1172,7 @@ def main():
         n_all_voxels = nx * ny * nz
 
         # 1. LORO R² for every candidate window, all active voxels (no subsampling cap)
-        if args.verbose:
+        if args.verb >= 1:
             print("\nComputing per-voxel LORO R² across all candidate windows...")
         r2_matrix, vox_idx = _compute_loro_r2_matrix(
             data_list=data_list,
@@ -1201,7 +1184,7 @@ def main():
             n_conditions=n_conditions,
             polort=args.polort,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
             max_voxels=500_000,
         )
         # r2_matrix: (n_candidates, n_vox); vox_idx: flat [0, nx*ny*nz)
@@ -1219,7 +1202,7 @@ def main():
         r2_bw_file = f"{args.prefix}_r2_by_window{_nii_ext}"
         save_nifti(r2_bw_vol, r2_bw_file, reference_img=args.input[0])
         del r2_bw_vol
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Saved: {r2_bw_file}")
 
         # 4. Save windowsize map (3D: winning top in seconds)
@@ -1229,7 +1212,7 @@ def main():
         ws_file = f"{args.prefix}_windowsize{_nii_ext}"
         save_nifti(ws_vol, ws_file, reference_img=args.input[0])
         del ws_vol
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Saved: {ws_file}")
 
         # 5. Output dimensions: max window → max_n_knots timepoints per condition
@@ -1237,7 +1220,7 @@ def main():
         max_n_knots_pv = round((max_top_pv - _pv_bot) / tr) + 1
         max_n_basis_out = max_n_knots_pv  # includes zero-padded edges for *zero models
 
-        if args.verbose:
+        if args.verb >= 1:
             print(
                 f"  Output: {max_n_basis_out} timepoints per condition "
                 f"(max window {_pv_bot:.1f}–{max_top_pv:.2f}s)"
@@ -1261,7 +1244,7 @@ def main():
         ]
 
         unique_tops_pv = sorted(set(full_best_top.tolist()))
-        if args.verbose:
+        if args.verb >= 1:
             print(f"\n  Fitting GLMs for {len(unique_tops_pv)} unique winning windows...")
 
         def _build_full_design_for_top(top_val: float) -> torch.Tensor:
@@ -1304,7 +1287,7 @@ def main():
             poly_tensor = torch.tensor(poly_full, dtype=torch.float32, device=device)
             return torch.cat([design_stim, poly_tensor], dim=1)
 
-        for top_k in tqdm(unique_tops_pv, desc="  Fitting", disable=not args.verbose):
+        for top_k in tqdm(unique_tops_pv, desc="  Fitting", disable=not args.verb >= 1):
             vox_this_top = np.where(full_best_top == top_k)[0]
             n_knots_k = round((top_k - _pv_bot) / tr) + 1
             n_regs_k = n_knots_k - 2 if zero_edges_pv else n_knots_k
@@ -1342,7 +1325,7 @@ def main():
         del data_tensor_pv
 
         # 8. Save iresp files for each condition (max-window dimensions)
-        if args.verbose:
+        if args.verb >= 1:
             print("\nSaving per-voxel HRF estimates (iresp files)...")
 
         output_files_pv = []
@@ -1361,7 +1344,7 @@ def main():
             )
             output_files_pv.extend(files)
 
-        if args.verbose:
+        if args.verb >= 1:
             for f in output_files_pv:
                 print(f"  ✓ {f}")
             print(f"\n{'=' * 70}")
@@ -1376,7 +1359,7 @@ def main():
         return 0
 
     # Build design matrices
-    if args.verbose:
+    if args.verb >= 1:
         print("\nBuilding design matrices...")
 
     design_list = []
@@ -1469,7 +1452,7 @@ def main():
 
     n_stimulus_regressors = design_full.shape[1]
 
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  Design matrix shape: {design_full.shape}")
         if len(set(n_basis_per_condition_list)) == 1:
             print(
@@ -1516,7 +1499,7 @@ def main():
         # Append polynomials to design
         design_full = torch.cat([design_full, poly_tensor], dim=1)
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Polynomial drift: {total_poly_cols} regressors ({n_poly_per_run} per run x {len(n_timepoints_per_run)} runs)")
 
     # Save design matrix if requested
@@ -1524,7 +1507,7 @@ def main():
         design_file = f"{args.prefix}_design.1D"
         design_np = design_full.cpu().numpy()
 
-        if args.verbose:
+        if args.verb >= 1:
             print("\nSaving design matrix...")
             print(f"  {design_file}")
 
@@ -1563,7 +1546,7 @@ def main():
             for row in design_np:
                 f.write(" ".join(f"{val:.6f}" for val in row) + "\n")
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  ✓ Design matrix saved ({design_np.shape[0]} rows x {design_np.shape[1]} cols)")
 
     # Save design matrix plot if requested
@@ -1574,7 +1557,7 @@ def main():
         design_plot_file = f"{figs_dir}/design.png"
         design_np = design_full.cpu().numpy()
 
-        if args.verbose:
+        if args.verb >= 1:
             print("\nSaving design matrix plot...")
             print(f"  {design_plot_file}")
 
@@ -1642,14 +1625,14 @@ def main():
             plt.savefig(design_plot_file, dpi=150, bbox_inches='tight')
             plt.close()
 
-            if args.verbose:
+            if args.verb >= 1:
                 print("  ✓ Design matrix plot saved")
 
         except ImportError:
             print("WARNING: matplotlib not available, skipping design plot", file=sys.stderr)
 
     # Prepare data
-    if args.verbose:
+    if args.verb >= 1:
         print("\nPreparing data for GLM...")
 
     # Concatenate runs along time axis (data_list is already 2D per run)
@@ -1659,11 +1642,11 @@ def main():
     # Apply mask if provided; fit_glm expects (n_voxels, n_timepoints)
     if mask is not None:
         data_masked = data_full[mask.flatten(), :]  # Shape: (n_voxels_masked, n_timepoints)
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Data shape: {data_masked.shape}")
     else:
         data_masked = data_full  # already (n_all_voxels, n_timepoints)
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  Data shape: {data_masked.shape} (all voxels)")
 
     # Convert to CPU tensor (will be chunked to GPU during fitting)
@@ -1671,7 +1654,7 @@ def main():
     del data_masked, data_full
 
     # Fit GLM with chunking
-    if args.verbose:
+    if args.verb >= 1:
         print("\nFitting GLM (chunked for GPU memory)...")
         print(f"  Design: {design_full.shape}")
         print(f"  Data: {data_tensor.shape}")
@@ -1688,21 +1671,21 @@ def main():
         device=device,
         preload_data_to_device=False,  # Stream chunks to GPU
         chunk_size=None,  # auto-estimate via memory module
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
         debug_memory=args.debug_memory,
     )
 
-    if args.verbose:
+    if args.verb >= 1:
         print("  ✓ GLM fit complete")
 
     # Extract HRF estimates (only stimulus betas, not polynomials)
-    if args.verbose:
+    if args.verb >= 1:
         print("\nExtracting HRF estimates...")
 
     betas_stimulus = results.betas[:, :n_stimulus_regressors].cpu().numpy()
 
     # Save iresp files (per-condition, since they may have different n_basis)
-    if args.verbose:
+    if args.verb >= 1:
         print("\nSaving HRF estimates (iresp files)...")
 
     output_files = []
@@ -1755,7 +1738,7 @@ def main():
         )
         output_files.extend(files)
 
-    if args.verbose:
+    if args.verb >= 1:
         for f in output_files:
             print(f"  ✓ {f}")
     else:
@@ -1765,7 +1748,7 @@ def main():
 
     # Save beta coefficients if requested
     if args.save_betas:
-        if args.verbose:
+        if args.verb >= 1:
             print("\nSaving beta coefficients...")
 
         # Reshape betas back to 4D
@@ -1779,11 +1762,11 @@ def main():
         beta_file = f"{args.prefix}_betas{_nii_ext}"
         save_nifti(betas_4d, beta_file, reference_img=args.input[0])
 
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  ✓ {beta_file}")
 
     # Done
-    if args.verbose:
+    if args.verb >= 1:
         print(f"\n{'=' * 70}")
         print("✓ Deconvolution complete!")
         print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

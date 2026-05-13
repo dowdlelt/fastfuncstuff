@@ -75,8 +75,9 @@ class FastICA:
         Maximum iterations for FastICA convergence
     tol : float, default=1e-4
         Tolerance for convergence
-    fun : str, default='logcosh'
-        Nonlinearity function: 'logcosh', 'exp', or 'cube'
+    fun : str, default='pow3'
+        Nonlinearity function: 'pow3' (MELODIC's update rule, default),
+        'cube' (standard FastICA cube), 'logcosh', or 'exp'
     random_state : int, optional
         Random seed for reproducibility
     whiten : bool, default=True
@@ -116,7 +117,7 @@ class FastICA:
         pca_components: int | float | str | None = 0.85,
         max_iter: int = 500,
         tol: float = 5e-5,
-        fun: str = "logcosh",
+        fun: str = "pow3",
         random_state: int | None = None,
         whiten: bool = True,
         device: torch.device | None = None,
@@ -173,12 +174,14 @@ class FastICA:
         # Memory-efficient: (X-m)(X-m)^T = X@X^T - V*m*m^T
         cov_t = (X @ X.T - n_features * (row_mean @ row_mean.T)) / float(n_features)
 
-        # Eigendecomposition (ascending order from eigvalsh)
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t)
+        # Eigendecomposition in float64 for numerical stability.
+        # The (T,T) covariance is tiny; float32 rounding of near-degenerate
+        # eigenvalues causes large eigenvector rotations that corrupt the
+        # whitening basis and produce speckly ICA components.
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t.to(torch.float64))
         del cov_t
-        # Flip to descending order
-        eigenvalues = eigenvalues.flip(0)
-        eigenvectors = eigenvectors.flip(1)
+        eigenvalues = eigenvalues.float().flip(0)
+        eigenvectors = eigenvectors.float().flip(1)
         eigenvalues = torch.clamp(eigenvalues, min=0)
 
         # Determine number of PCA components to keep
@@ -248,8 +251,10 @@ class FastICA:
 
         # Step 4: Compute mixing matrix (ICA timecourses)
         # MELODIC: timecourses = dewhite @ pinv(W)
-        X_pca_top = X_pca[:, :n_components]  # (T, n_ica)
-        self.mixing_ = X_pca_top @ torch.linalg.pinv(W)
+        # Using dewhite (not X_pca) avoids sqrt(V) scale accumulation
+        # from the dot product over V voxels in X_pca = X @ pca_comp.T.
+        # Slice to n_components when ICA uses fewer than all PCA components.
+        self.mixing_ = dewhite[:, :n_components] @ torch.linalg.pinv(W)
 
         # Store PCA-like state for compatibility with transform()
         self.pca_ = _RowCenteredPCAState(
@@ -436,6 +441,9 @@ class FastICA:
         # Restore TF32 setting
         if _saved_tf32_ica is not None:
             torch.backends.cuda.matmul.allow_tf32 = _saved_tf32_ica
+
+        # Expose final convergence delta for diagnostics (parity vs MELODIC).
+        self._final_delta = float(delta.item())
 
         # Return W in the original data dtype
         return W.to(orig_dtype), n_iter + 1
@@ -803,10 +811,10 @@ class InfoMaxICA:
         row_mean = X.mean(dim=1, keepdim=True)
         cov_t = (X @ X.T - n_features * (row_mean @ row_mean.T)) / float(n_features)
 
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t)
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t.to(torch.float64))
         del cov_t
-        eigenvalues = eigenvalues.flip(0)
-        eigenvectors = eigenvectors.flip(1)
+        eigenvalues = eigenvalues.float().flip(0)
+        eigenvectors = eigenvectors.float().flip(1)
         eigenvalues = torch.clamp(eigenvalues, min=0)
 
         n_max = min(n_samples, n_features)
@@ -827,6 +835,7 @@ class InfoMaxICA:
         evecs_k = eigenvectors[:, :pca_n_components]
 
         white = torch.diag(1.0 / torch.sqrt(evals_k + 1e-12)) @ evecs_k.T
+        dewhite = evecs_k @ torch.diag(torch.sqrt(evals_k))
         pca_components_all = white @ X  # (k, V)
         X_pca = X @ pca_components_all.T  # (T, k)
 
@@ -845,8 +854,7 @@ class InfoMaxICA:
 
         # Extract spatial maps and mixing matrix (same as FastICA)
         self.components_ = W @ pca_components
-        X_pca_top = X_pca[:, :n_components]
-        self.mixing_ = X_pca_top @ torch.linalg.pinv(W)
+        self.mixing_ = dewhite[:, :n_components] @ torch.linalg.pinv(W)
 
         self.pca_ = _RowCenteredPCAState(
             components=pca_components_all,

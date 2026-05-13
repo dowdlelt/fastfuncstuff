@@ -47,6 +47,7 @@ try:
     )
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_verbose_arg,
         auto_polort,
         load_and_preprocess_runs,
         parse_cv_strategy,
@@ -86,7 +87,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="3dDenoisefast - Fast GPU-accelerated cross-validated denoising",
         formatter_class=_HelpFormatter,
-        add_help=False,  # We handle -help ourselves
         epilog="""
 Examples:
   # Basic denoising with automatic R² threshold
@@ -505,11 +505,7 @@ Notes:
         action="store_true",
         help="Load data to CPU and process in GPU chunks (for large datasets)",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
         action="store_true",
@@ -597,9 +593,6 @@ Notes:
         help="Number of bootstrap iterations for SE estimation (default: 0 = no bootstrapping). "
         "Recommended: 100-1000 for robust SE. Enables bootstrap-based SNR if -snr is also set.",
     )
-
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
 
     return parser
 
@@ -1473,8 +1466,7 @@ def save_model_fit_outputs(
 def main():
     parser = create_parser()
 
-    # Check for help
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 
@@ -1580,7 +1572,7 @@ def main():
 
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
-    if args.verbose:
+    if args.verb >= 1:
         print(f"  CV strategy: {cv_strategy}")
 
     # Pre-flight checks (before slow data loading)
@@ -2005,7 +1997,7 @@ def main():
     # - GPU: auto-detect based on available memory
     if device.type == "cpu":
         chunk_size = n_voxels  # Process all voxels at once on CPU
-        if args.verbose:
+        if args.verb >= 1:
             print(f"  CPU mode: chunk_size = {n_voxels:,} (all voxels)")
     else:
         chunk_size = None  # Auto-detect for GPU
@@ -2272,7 +2264,7 @@ def main():
                     nuisance_per_run=nuisance_per_run,
                     component_caps_per_run=component_caps_per_run,
                     device=device,
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
             else:
                 noise_pcs_per_run = extract_noise_pcs_per_run(
@@ -2284,7 +2276,7 @@ def main():
                     nuisance_per_run=nuisance_per_run,
                     component_caps_per_run=component_caps_per_run,
                     device=device,
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
         else:
             if want_noise_pool_maps:
@@ -2302,7 +2294,7 @@ def main():
                         ica_max_iter=args.ica_max_iter,
                         ica_tol=args.ica_tol,
                         device=device,
-                        verbose=args.verbose,
+                        verbose=args.verb >= 1,
                     )
                 )
             else:
@@ -2318,7 +2310,7 @@ def main():
                     ica_max_iter=args.ica_max_iter,
                     ica_tol=args.ica_tol,
                     device=device,
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
 
         # 5. For each PC count: fit single-trial model with wide design, collect betas
@@ -2337,7 +2329,7 @@ def main():
         all_st_betas = torch.zeros(n_pc_counts, n_voxels_st, n_trials_st)
 
         pc_range = range(n_pc_counts)
-        for n_pcs in tqdm(pc_range, desc="  Fitting PC counts", disable=not args.verbose):
+        for n_pcs in tqdm(pc_range, desc="  Fitting PC counts", disable=not args.verb >= 1):
             # Build nuisance: polynomials + first n_pcs per run
             nuisance_blocks = []
             for run_idx in range(n_runs):
@@ -2479,7 +2471,7 @@ def main():
                 tr=args.tr,
                 max_poly_degree=-1,  # block-diagonal nuisance already has per-run constants
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
                 task_indices=task_indices_final,
             )
             final_betas = glm_results_final.betas
@@ -2488,7 +2480,7 @@ def main():
             print(f"  Fitting {len(unique_hrfs)} HRF groups...")
             final_betas = torch.zeros(n_voxels_st, n_trials, device=data.device)
             task_indices_final = list(range(n_trials))
-            for i_hrf, hrf_idx in enumerate(tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verbose)):
+            for i_hrf, hrf_idx in enumerate(tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verb >= 1)):
                 voxel_mask = hrf_indices_dev == hrf_idx
                 group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
                 full_design_final = torch.cat([group_design_2d, nuisance_design_final], dim=1)
@@ -2841,7 +2833,7 @@ def main():
                                 brain_mask=None,
                                 chunk_size=5000,
                                 device=None,
-                                verbose=args.verbose,
+                                verbose=args.verb >= 1,
                             )
                             loadings_cpu = [ld.numpy() for ld in pc_loadings_brain]
                             noise_pool_mask_for_plot = None
@@ -2937,7 +2929,7 @@ def main():
             preload_data_to_device=not keep_on_cpu,
             return_loadings=(args.save_pcs in ["spatial", "both"] or args.plots == "full"),
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
 
     else:
@@ -2975,7 +2967,7 @@ def main():
             preload_data_to_device=not keep_on_cpu,
             return_loadings=(args.save_pcs in ["spatial", "both"] or args.plots == "full"),
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
 
     # ==========================================================================
@@ -3040,11 +3032,11 @@ def main():
         # This frees up the largest allocation before model fitting
         if torch.is_tensor(data) and data.device.type == "cuda":
             data = data.cpu()
-            if args.verbose:
+            if args.verb >= 1:
                 print("  Moved data tensor to CPU to free GPU memory")
 
         torch.cuda.empty_cache()
-        if args.verbose:
+        if args.verb >= 1:
             print("  Cleared GPU cache before model fitting")
 
     initial_results = None
@@ -3104,7 +3096,7 @@ def main():
                 n_task=n_task_cols,
                 n_boots=args.numboots,
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
         if args.save_model_fit:
@@ -3177,7 +3169,7 @@ def main():
                 n_task=n_task_cols,
                 n_boots=args.numboots,
                 device=device,
-                verbose=args.verbose,
+                verbose=args.verb >= 1,
             )
 
         if args.save_model_fit:

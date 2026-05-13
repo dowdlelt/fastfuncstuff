@@ -351,6 +351,7 @@ def analyze_from_onsets(
             b_grid=arma_b_grid,
             device=device,
             enable_quick_estimate=enable_quick_estimate,
+            run_starts=run_starts,
         )
 
     else:
@@ -876,7 +877,7 @@ def analyze_from_design_matrix(
                     output_format=ols_output_format,
                 )
 
-                # Write single-trials output if requested (check for env var set by 3dREMLfast.py)
+                # Write single-trials output if requested (check for env var set by ffs_reml.py)
                 import os
 
                 single_trials_label = os.environ.get("FASTFUNCSIM_SINGLE_TRIALS")
@@ -893,7 +894,7 @@ def analyze_from_design_matrix(
                         callback_stim_labels,
                     )
 
-                # Write partial R² if requested (check for env var set by 3dREMLfast.py)
+                # Write partial R² if requested (check for env var set by ffs_reml.py)
                 r2_partial_mode_env = os.environ.get("FASTFUNCSIM_R2_PARTIAL_MODE")
                 if (
                     r2_partial_mode_env
@@ -945,7 +946,7 @@ def analyze_from_design_matrix(
                     for idx, label in enumerate(callback_stim_labels):
                         print(f"       [{idx}] {label}{suffix}")
 
-                # Write semi-partial R² if requested (check for env var set by 3dREMLfast.py)
+                # Write semi-partial R² if requested (check for env var set by ffs_reml.py)
                 r2_semipartial_mode_env = os.environ.get("FASTFUNCSIM_R2_SEMIPARTIAL_MODE")
                 if (
                     r2_semipartial_mode_env
@@ -1038,6 +1039,11 @@ def analyze_from_design_matrix(
             spatial_metadata=spatial_metadata if spatial_metadata else None,
             legacy_contrasts=legacy_contrasts,
             save_profile_likelihoods=save_profile_likelihoods,
+            run_starts=(
+                actual_run_starts
+                if "actual_run_starts" in locals()
+                else design_info.get("run_starts", None)
+            ),
         )
 
     else:

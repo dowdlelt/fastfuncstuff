@@ -154,6 +154,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
         for i, (label, sym) in enumerate(glts, 1):
             glt_args += f"-gltsym 'SYM: {sym}' -glt_label {i} {label} "
 
+        # Pass basename only so AFNI writes REML_cmd in cwd (afni dir).
         elapsed, _ = run_timed(
             f"3dDeconvolve -overwrite "
             f"-input {inputs} "
@@ -161,7 +162,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
             f"{stim_args} "
             f"-jobs 10 -noFDR "
             f"{glt_args} "
-            f"-tout -x1D X.xmat.1D -bucket {afni_ols}",
+            f"-tout -x1D X.xmat.1D -bucket {afni_ols.name}",
             label="3dDeconvolve",
             cwd=afni,
         )

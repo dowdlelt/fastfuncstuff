@@ -1581,6 +1581,7 @@ def single_trial_cv_helper(
 
             for chunk_start in range(0, n_voxels, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, n_voxels)
+                n_chunk = chunk_end - chunk_start
 
                 # (n_variants, n_chunk, n_trials)
                 betas_chunk = beta_variants[:, chunk_start:chunk_end, :].to(device)
@@ -1589,27 +1590,38 @@ def single_trial_cv_helper(
                 # test_variant_idx is guaranteed non-None by the block above.
                 test_betas_ref = betas_chunk[int(test_variant_idx), :, test_indices]
 
-                # For each test trial, accumulate SSE against all matching
-                # condition train betas from each variant
-                for t_idx in range(n_test):
-                    cond = test_conditions[t_idx].item()
+                # Vectorized SSE per condition — eliminates per-trial Python loop.
+                # Algebraic expansion: Σ_k(train_k - test_t)²
+                #   = n_train·test_t² - 2·test_t·Σ_k(train_k) + Σ_k(train_k²)
+                # This lets us sum over both train and test trials on GPU simultaneously,
+                # replacing O(n_test) GPU syncs+transfers with O(n_conditions) per chunk.
+                sse_chunk = torch.zeros(n_variants, n_chunk, device=device)
+                for cond in range(n_conditions):
                     cm = cond_train_masks[cond]
-                    n_match = cm.sum().item()
-                    if n_match == 0:
+                    if not cm.any():
+                        continue
+                    test_cond_mask = test_conditions == cond  # (n_test,) on device
+                    if not test_cond_mask.any():
                         continue
 
-                    # test_beta: (n_chunk,) from selected reference variant
-                    test_beta = test_betas_ref[:, t_idx]  # (n_chunk,)
-
-                    # train_betas: (n_variants, n_chunk, n_matching_trials)
+                    # (n_variants, n_chunk, n_train_cond)
                     train_betas = betas_chunk[:, :, cm]
+                    n_train = train_betas.shape[-1]
+                    sum_train = train_betas.sum(dim=-1)           # (n_variants, n_chunk)
+                    sum_sq_train = (train_betas ** 2).sum(dim=-1) # (n_variants, n_chunk)
 
-                    # SSE: sum over matching trials of (train - test)^2
-                    # broadcast test_beta to (1, n_chunk, 1)
-                    diff = train_betas - test_beta.unsqueeze(0).unsqueeze(-1)
-                    sse_per_variant = (diff**2).sum(dim=2)  # (n_variants, n_chunk)
+                    # (n_chunk, n_cond_test) — test betas for this condition
+                    test_betas = test_betas_ref[:, test_cond_mask]
 
-                    sse_accum[:, chunk_start:chunk_end] += sse_per_variant.cpu()
+                    # (n_variants, n_chunk, n_cond_test)
+                    sse_per_test = (
+                        n_train * test_betas.unsqueeze(0) ** 2
+                        - 2 * test_betas.unsqueeze(0) * sum_train.unsqueeze(-1)
+                        + sum_sq_train.unsqueeze(-1)
+                    )
+                    sse_chunk += sse_per_test.sum(dim=-1)
+
+                sse_accum[:, chunk_start:chunk_end] += sse_chunk.cpu()
 
         r2 = sse_accum  # "r2" is SSE here (lower = better)
 

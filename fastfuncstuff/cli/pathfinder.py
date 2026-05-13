@@ -60,6 +60,7 @@ try:
         save_nifti,
     )
     from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
         auto_polort,
         compute_run_lengths,
         get_average_run_duration,
@@ -152,7 +153,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="ffs_pathfinder - Joint HRF + Denoising Optimization",
         formatter_class=_HelpFormatter,
-        add_help=False,
         epilog="""
 Examples:
   # Basic joint optimization
@@ -387,11 +387,7 @@ Notes:
         default=None,
         help="Number of voxels per batch (default: auto)",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
 
     # Output options
     out_opts = parser.add_argument_group("Output Options")
@@ -406,8 +402,6 @@ Notes:
         help="Save denoised xval R² for ALL HRFs (4D volume)",
     )
 
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
 
     return parser
 
@@ -1313,7 +1307,7 @@ def save_pathfinder_results(
 def main():
     parser = create_parser()
 
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 
@@ -1568,7 +1562,7 @@ def main():
         metric=args.metric,
         device=device,
         chunk_size=args.batch_size,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
 
     # Save outputs

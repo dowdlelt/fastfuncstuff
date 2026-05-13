@@ -48,6 +48,7 @@ import torch
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
         compute_run_lengths,
@@ -82,7 +83,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="3dRidgefast - GPU-accelerated ridge regression with single-trial estimation",
         formatter_class=_HelpFormatter,
-        add_help=False,
         epilog="""
 Examples:
   # Basic single-trial ridge regression
@@ -325,11 +325,7 @@ Notes:
         default=0,
         help="Voxels per chunk for processing. 0 = auto-detect based on available memory (default)",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
         action="store_true",
@@ -344,26 +340,12 @@ Notes:
         "Violation locations are saved to {prefix}_scale_violations.nii.gz",
     )
 
-    # Help
-    help_group = parser.add_argument_group("Help")
-    help_group.add_argument(
-        "-help",
-        action="store_true",
-        help="Show this help message and exit",
-    )
-
     return parser
 
 
 def main():
     """Main entry point"""
     parser = create_parser()
-
-    # Handle -help flag
-    if "-help" in sys.argv:
-        parser.print_help()
-        sys.exit(0)
-
     args = parser.parse_args()
 
     pfx = parse_prefix(args.prefix)
@@ -554,7 +536,7 @@ def main():
     # Validate: FIR is incompatible with single-trial
     if is_fir_model:
         print("ERROR: FIR/TENT models are incompatible with single-trial estimation")
-        print("  Use 3dDenoisefast or 3dREMLfast for FIR/TENT analysis")
+        print("  Use 3dDenoisefast or ffs_reml for FIR/TENT analysis")
         sys.exit(1)
 
     # SPMG2/SPMG3 with HRF library is incompatible (checked in create_single_trial_design)
@@ -750,7 +732,7 @@ def main():
                     n_regressors=n_cols,
                     device=device,
                     operation="ridge",
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
 
             n_chunks = (n_voxels + args.chunk_size - 1) // args.chunk_size
@@ -758,6 +740,8 @@ def main():
                 f"Fitting ridge + beta CV in {n_chunks} voxel chunks "
                 f"({args.chunk_size:,} voxels/chunk)..."
             )
+
+            fracs_t = torch.from_numpy(fracs)  # CPU tensor for indexing CPU optimal_fracs
 
             for c0 in range(0, n_voxels, args.chunk_size):
                 c1 = min(c0 + args.chunk_size, n_voxels)
@@ -805,7 +789,7 @@ def main():
                     chunk_xval, chunk_best_idx = chunk_r2_frac[:, :-1].min(dim=1)
                 xval_r2[c0:c1] = chunk_xval.cpu()
                 r2_by_frac[c0:c1] = chunk_r2_frac.cpu()
-                optimal_fracs[c0:c1] = torch.from_numpy(fracs[chunk_best_idx.cpu().numpy()])
+                optimal_fracs[c0:c1] = fracs_t[chunk_best_idx.cpu()]
 
                 # Extract final betas at optimal fraction for this chunk
                 vox_idx = torch.arange(chunk, device=device)
@@ -864,7 +848,7 @@ def main():
                     n_regressors=n_columns,
                     device=device,
                     operation="ridge",
-                    verbose=args.verbose,
+                    verbose=args.verb >= 1,
                 )
 
             # Project nuisance from data once (shared across HRF groups)
@@ -873,6 +857,8 @@ def main():
             data_clean, _ = project_out_nuisance_per_run(
                 data, dummy_design, nuisance_per_run, run_starts, device=device
             )
+
+            fracs_dev = torch.from_numpy(fracs).to(device)  # for GPU indexing in per-voxel path
 
             for hrf_idx in unique_hrfs:
                 voxel_mask_cpu = hrf_indices == hrf_idx  # CPU mask for indexing CPU data_clean
@@ -897,15 +883,13 @@ def main():
                     gc1 = min(gc0 + args.chunk_size, n_group)
                     chunk_size_actual = gc1 - gc0
 
-                    # Get linear indices for this chunk
-                    chunk_voxel_idx = group_voxel_indices[gc0:gc1]  # CPU indices
-                    chunk_mask_cpu = voxel_mask_cpu.clone()
-                    chunk_mask_cpu[:] = False
-                    chunk_mask_cpu[chunk_voxel_idx] = True
-                    chunk_mask = chunk_mask_cpu.to(device)
+                    # Linear voxel indices for this chunk — use directly, no 167k-element
+                    # bool mask clone/zero/scatter/transfer needed
+                    chunk_voxel_idx = group_voxel_indices[gc0:gc1]          # CPU, (chunk,)
+                    chunk_voxel_idx_dev = chunk_voxel_idx.to(device)         # GPU, small
 
-                    # Extract data for this chunk
-                    chunk_data_clean = data_clean[chunk_mask_cpu]  # (chunk, n_timepoints)
+                    # Extract data using integer indexing
+                    chunk_data_clean = data_clean[chunk_voxel_idx]           # (chunk, n_timepoints)
 
                     # Fit ridge for all fractions
                     chunk_coefs = _fit_ridge_multiple_fracs(
@@ -930,18 +914,18 @@ def main():
                         device=device,
                         verbose=False,
                     )
-                    r2_by_frac[chunk_mask] = xval["r2"].T.to(device)  # (chunk, n_fracs)
+                    r2_chunk = xval["r2"].T.to(device)               # (chunk, n_fracs)
+                    r2_by_frac[chunk_voxel_idx_dev] = r2_chunk
 
                     # Select best frac excluding frac=1.0 (last column)
+                    # Use r2_chunk directly — avoids reading back from r2_by_frac
                     # SSE: minimize; R² metrics: maximize
                     if _hib:
-                        chunk_r2, chunk_best_idx = r2_by_frac[chunk_mask][:, :-1].max(dim=1)
+                        chunk_r2, chunk_best_idx = r2_chunk[:, :-1].max(dim=1)
                     else:
-                        chunk_r2, chunk_best_idx = r2_by_frac[chunk_mask][:, :-1].min(dim=1)
-                    xval_r2[chunk_mask] = chunk_r2
-                    optimal_fracs[chunk_mask] = torch.from_numpy(
-                        fracs[chunk_best_idx.cpu().numpy()]
-                    ).to(device)
+                        chunk_r2, chunk_best_idx = r2_chunk[:, :-1].min(dim=1)
+                    xval_r2[chunk_voxel_idx_dev] = chunk_r2
+                    optimal_fracs[chunk_voxel_idx_dev] = fracs_dev[chunk_best_idx]
 
                     # Extract final betas at optimal fraction
                     chunk_voxel_range = torch.arange(chunk_size_actual, device=device)
@@ -955,11 +939,11 @@ def main():
                         scale_factors = numer / denom
                         chunk_final_betas *= scale_factors.unsqueeze(1)
 
-                    final_betas[chunk_mask] = chunk_final_betas
+                    final_betas[chunk_voxel_idx_dev] = chunk_final_betas
 
                     # Full-model R²: task variance explained after nuisance projection
                     predicted_full = chunk_final_betas @ design_clean_group.T  # (chunk, n_tp)
-                    full_r2[chunk_mask] = compute_r2_metric(
+                    full_r2[chunk_voxel_idx_dev] = compute_r2_metric(
                         chunk_data_clean.to(device), predicted_full, metric="cod"
                     )
                     del predicted_full
@@ -989,7 +973,7 @@ def main():
             autoscale=args.autoscale,
             chunk_size=args.chunk_size,
             device=device,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
 
     # Save outputs

@@ -35,7 +35,21 @@ def _melodic_mask(ctx: BenchmarkContext, dataset: str) -> Path:
 
 
 def _ffs_ic(ctx: BenchmarkContext, dataset: str) -> Path:
-    return ctx.ffs_ica_dir / f"all_{dataset}_concat_ica_maps.nii.gz"
+    """FFS GMM-z'd component maps (apples-to-apples vs MELODIC's `melodic_IC`).
+
+    MELODIC's `melodic_IC.nii.gz` stores the GGM-mixture-modeled z-stat maps,
+    not the raw ICA components. We therefore compare against ffs_ica's
+    `*_concat_ica_zmaps.nii.gz` (output of `batch_mixture_zscores` ⇒ same
+    space as MELODIC's IC). Lives inside the `.ica/ffs_outputs/` subfolder
+    after the output-layout refactor.
+    """
+    base = f"all_{dataset}"
+    return (
+        ctx.ffs_ica_dir
+        / f"{base}_concat.ica"
+        / "ffs_outputs"
+        / f"{base}_concat_ica_zmaps.nii.gz"
+    )
 
 
 def _mni_inputs(ctx: BenchmarkContext, dataset: str) -> list[Path]:
@@ -100,7 +114,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         elapsed, _ = run_timed(
             f"ffs_ica -input {inputs} "
             f"{mask_arg} "
-            f"-temp_concat "
+            f"-temp_concat -ordering stdev "
+            f"-migp "
             f"-prefix {ctx.ffs_ica_dir / f'all_{dataset}'} -verbose",
             label=f"ffs_ica {dataset}",
             cwd=ctx.ffs_ica_dir,
@@ -129,21 +144,16 @@ def validate(ctx: BenchmarkContext) -> dict:
     overall_cov = sum(cov_05) / len(cov_05)
 
     passed = (
-        overall_mean >= THRESHOLDS["mean_matched_r"]
-        and overall_cov >= THRESHOLDS["coverage_0.5"]
+        overall_mean >= THRESHOLDS["mean_matched_r"] and overall_cov >= THRESHOLDS["coverage_0.5"]
     )
 
-    comp_counts = {
-        ds: (r["n_components_a"], r["n_components_b"]) for ds, r in results.items()
-    }
+    comp_counts = {ds: (r["n_components_a"], r["n_components_b"]) for ds, r in results.items()}
 
     return {
         "passed": passed,
         "summary": (
             f"mean |r|={overall_mean:.4f}, coverage@0.5={overall_cov:.2f}, "
-            + ", ".join(
-                f"{ds}: melodic={na} ffs={nb}" for ds, (na, nb) in comp_counts.items()
-            )
+            + ", ".join(f"{ds}: melodic={na} ffs={nb}" for ds, (na, nb) in comp_counts.items())
         ),
         "per_dataset": results,
     }

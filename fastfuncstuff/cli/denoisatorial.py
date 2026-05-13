@@ -43,6 +43,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_verbose_arg,
         auto_polort,
         load_and_preprocess_runs,
         parse_input_files,
@@ -87,7 +88,6 @@ def create_parser():
     parser = argparse.ArgumentParser(
         description="ffs_denoisatorial - Combinatorial PC Denoising",
         formatter_class=_HelpFormatter,
-        add_help=False,
         epilog="""
 Examples:
   # Basic combinatorial denoising (7 PCs, 128 combinations)
@@ -313,11 +313,7 @@ Notes:
         action="store_true",
         help="Load data to CPU and process in GPU chunks (for large datasets)",
     )
-    proc_opts.add_argument(
-        "-verbose",
-        action="store_true",
-        help="Print detailed progress information",
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
         action="store_true",
@@ -342,9 +338,6 @@ Notes:
         default="timecourse",
         help="Save noise PCs: 'no', 'timecourse' (default: selected PCs as txt), 'both' (.pt + txt)",
     )
-
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
 
     return parser
 
@@ -546,8 +539,8 @@ def save_combinatorial_results(
 def main():
     parser = create_parser()
 
-    # Check for help
-    if len(sys.argv) == 1 or "-help" in sys.argv or "--help" in sys.argv:
+    # Show help and exit when called with no args (argparse's -h/--help is fine)
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
 
@@ -905,7 +898,7 @@ def main():
         designs_by_hrf=designs_by_hrf,
         hrf_indices=hrf_indices,
         device=device,
-        verbose=args.verbose,
+        verbose=args.verb >= 1,
     )
 
     print(f"  Initial R2: median={initial_r2.median().item():.4f}, "

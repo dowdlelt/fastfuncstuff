@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.processing.affine import resample_to_base_grid
 from fastfuncstuff.processing.interp import warp_image_linear
 from fastfuncstuff.processing.io import load_image, load_warp_field, save_image, save_warp_field
@@ -83,8 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help="Save displacement warp field(s) [default: yes]")
     g_io.add_argument("-no_save_warp", action="store_true",
                       help="Do not save displacement warp field(s)")
-    g_io.add_argument("-verb", type=int, default=1, metavar="LEVEL",
-                      help="Verbosity: 0=quiet, 1=normal, 2=debug [default: %(default)s]")
+    add_verbose_arg(g_io, default=1)
 
     # ── Timeseries Options ──────────────────────────────────────────────
     g_ts = p.add_argument_group(
@@ -180,6 +180,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="Disable internal zero-padding of images. Padding adds ~12%% "
                             "border to allow warps near edges. Disabling saves memory but "
                             "may cause edge artifacts")
+    g_reg.add_argument("-save_intermediates", action="store_true",
+                       help="After each refinement level, save the running warp field and "
+                            "warped source image to {prefix}_levels/. Files are labelled "
+                            "_lev00, _lev01, ... so you can inspect how the warp grows "
+                            "level by level (useful to spot over-warping or where to cut "
+                            "with -maxlev). In timeseries mode, only the FIRST volume's "
+                            "intermediates are saved (the loop would otherwise produce "
+                            "one set per volume — a lot of files)")
 
     # ── Basis Functions ─────────────────────────────────────────────────
     g_basis = p.add_argument_group(
@@ -223,6 +231,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "the head rotates, distortion projects onto other axes. "
                              "E.g. with -noXdis -noZdis (PE along Y/AP), a pitch rotation "
                              "projects some distortion onto Z. Requires timeseries mode")
+    g_disp.add_argument("-affine", type=str, default=None, metavar="MAT.aff12.1D",
+                        help="Single affine matrix (12 or 16 numbers, row-major) that "
+                             "aligns source to base — e.g. output of "
+                             "'3dAllineate -1Dmatrix_save' or '3dvolreg -1Dmatrix_save'. "
+                             "Same purpose as -motparams but for a single static rotation: "
+                             "with -noXdis/-noYdis/-noZdis defining the PE direction, the "
+                             "rotation component is extracted (polar decomposition) and "
+                             "used to project distortion onto each axis. Useful in "
+                             "standard (non-timeseries) mode after rigid pre-alignment. "
+                             "Mutually exclusive with -motparams")
+    g_disp.add_argument("-invert_affine", action="store_true",
+                        help="Treat the -affine matrix as base->source (i.e. estimated "
+                             "head motion rather than the correction). The rotation is "
+                             "inverted before projection. Use this if your matrix maps "
+                             "the base into the source frame")
 
     # ── Cost Function ───────────────────────────────────────────────────
     g_cost = p.add_argument_group(
@@ -250,11 +273,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="LPA neighborhood kernel: gauss=Gaussian weighting "
                              "(default), box=uniform weighting (like AFNI's "
                              "space-filling blocks)")
-    g_cost.add_argument("-penfac", type=float, default=0.001, metavar="FACTOR",
-                        help="Warp distortion penalty factor (Jacobian-based). Prevents "
-                             "excessive warp folding. Our Adam optimizer amplifies penalty "
-                             "gradients vs AFNI's NEWUOA, so this is much lower than AFNI's "
-                             "default of 0.033 [default: %(default)s]")
+    g_cost.add_argument("-penfac", type=float, default=0.033, metavar="FACTOR",
+                        help="Warp distortion penalty factor (Jacobian-energy based). "
+                             "Prevents excessive warp folding / high-frequency rippling. "
+                             "Matches AFNI's Hpen_fbase default. Lower values (~0.001) "
+                             "produce more visibly warped outputs [default: %(default)s]")
+    g_cost.add_argument("-penalty_first_level", type=int, default=3, metavar="N",
+                        help="Refinement level at which the warp penalty turns on; "
+                             "levels below N run unpenalized. AFNI uses 3. Increasing "
+                             "this lets coarse levels deform more freely before "
+                             "regularization engages [default: %(default)s]")
 
     # ── Smoothing ───────────────────────────────────────────────────────
     g_blur = p.add_argument_group(
@@ -309,11 +337,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "than TOL fraction, skip all finer levels. E.g. -level_stop 0.0001 "
                             "stops when improvement drops below 0.01%% of current cost. "
                             "0 = disabled [default: %(default)s]")
-    g_opt.add_argument("-hfactor_q", type=float, default=1.0, metavar="Q",
-                       help="Hfactor parameter scaling for large patches. Controls how "
-                            "much to reduce max displacement for patches larger than "
-                            "minpatch. 1.0 = no scaling (AFNI default), 0.5 = moderate "
-                            "reduction. Range: 0.1-1.0 [default: %(default)s]")
+    g_opt.add_argument("-hfactor_q", type=float, default=0.5, metavar="Q",
+                       help="AFNI-style Hfactor scaling on per-patch displacement bound. "
+                            "At the lev=1 (coarsest) patch size hfactor=1.0; at finer "
+                            "patches it shrinks toward Q, tightening param_max. This "
+                            "is AFNI's primary defense against fine-scale rippling. "
+                            "1.0 disables the mechanism. Range: 0.1-1.0 "
+                            "[default: %(default)s]")
 
     # ── GPU / Hardware ──────────────────────────────────────────────────
     g_hw = p.add_argument_group(
@@ -420,6 +450,83 @@ def _rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> list[
     return matmul(matmul(rz, rx), ry)
 
 
+def _load_affine_rotation(filepath: str, invert: bool = False) -> list[list[float]]:
+    """Load an affine matrix from a .1D / .aff12.1D file and return its rotation.
+
+    Accepts whitespace-separated numbers (comments with '#' ignored). Uses the
+    first 12 (row-major 3x4) or 16 (row-major 4x4) numbers found; falls back
+    to a 3x3 form if exactly 9 are provided. The rotation component of the 3x3
+    linear part is extracted by polar decomposition (R = U @ V^T from SVD,
+    with sign correction to enforce det=+1).
+
+    Args:
+        filepath: Path to text file with the matrix.
+        invert: If True, return R^T (i.e. treat the input as the inverse
+            direction of what we want — e.g. estimated motion rather than
+            applied correction).
+
+    Returns:
+        3x3 rotation matrix as a nested list.
+    """
+    import numpy as np
+
+    vals: list[float] = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for tok in line.split():
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    continue
+            # Stop reading once we have enough; first matrix in the file wins
+            if len(vals) >= 16:
+                break
+
+    if len(vals) >= 16:
+        m = np.array(vals[:16], dtype=np.float64).reshape(4, 4)
+        linear = m[:3, :3]
+    elif len(vals) >= 12:
+        m = np.array(vals[:12], dtype=np.float64).reshape(3, 4)
+        linear = m[:3, :3]
+    elif len(vals) >= 9:
+        linear = np.array(vals[:9], dtype=np.float64).reshape(3, 3)
+    else:
+        raise ValueError(
+            f"Affine file {filepath} has only {len(vals)} numbers; "
+            f"expected 9 (3x3), 12 (3x4), or 16 (4x4)"
+        )
+
+    # Polar decomposition: drop scale/shear, keep rotation.
+    U, _, Vt = np.linalg.svd(linear)
+    R = U @ Vt
+    # Enforce det=+1 (proper rotation, no reflection)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = U @ Vt
+
+    if invert:
+        R = R.T
+
+    return [[float(R[i, j]) for j in range(3)] for i in range(3)]
+
+
+def _compute_axis_weights_from_rotation(
+    R: list[list[float]], pe_dir: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Project the PE direction through rotation R; return |components|.
+
+    Identical math to _compute_axis_weights_from_motion but with the
+    rotation supplied directly (e.g. extracted from an affine).
+    """
+    rx = sum(R[0][j] * pe_dir[j] for j in range(3))
+    ry = sum(R[1][j] * pe_dir[j] for j in range(3))
+    rz = sum(R[2][j] * pe_dir[j] for j in range(3))
+    return (abs(rx), abs(ry), abs(rz))
+
+
 def _compute_axis_weights_from_motion(
     roll_deg: float, pitch_deg: float, yaw_deg: float,
     pe_dir: tuple[float, float, float],
@@ -445,6 +552,45 @@ def _compute_axis_weights_from_motion(
     rz = sum(R[2][j] * pe_dir[j] for j in range(3))
 
     return (abs(rx), abs(ry), abs(rz))
+
+
+def _make_level_callback(
+    levels_dir: str,
+    basename: str,
+    base_info: dict,
+    padding: tuple[int, int, int] | None,
+    nx: int, ny: int, nz: int,
+):
+    """Build a level callback that writes per-level warp + warped image."""
+    from fastfuncstuff.processing.io import save_image, save_warp_field
+
+    os.makedirs(levels_dir, exist_ok=True)
+    pad_x, pad_y, pad_z = padding if padding is not None else (0, 0, 0)
+
+    def callback(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
+        lev_tag = f"lev{level:02d}"
+        xd_cpu = xd.detach().cpu()
+        yd_cpu = yd.detach().cpu()
+        zd_cpu = zd.detach().cpu()
+        save_warp_field(
+            xd_cpu, yd_cpu, zd_cpu,
+            os.path.join(levels_dir, f"{basename}_WARP_{lev_tag}.nii.gz"),
+            header_info=base_info,
+            padding=padding,
+            units="mm",
+        )
+        warped_full = warped.detach().cpu()
+        if pad_x or pad_y or pad_z:
+            warped_cropped = warped_full[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx]
+        else:
+            warped_cropped = warped_full
+        save_image(
+            warped_cropped,
+            os.path.join(levels_dir, f"{basename}_{lev_tag}.nii.gz"),
+            header_info=base_info,
+        )
+
+    return callback
 
 
 def _build_timeseries_base(
@@ -847,6 +993,7 @@ def main(argv: list[str] | None = None) -> int:
         workhard=tuple(args.workhard) if args.workhard else (0, -1),
         cost_method="lpa" if args.lpa else ("pearson" if args.pear else "pearclp"),
         penalty_factor=args.penfac,
+        penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,
         axis_weights=axis_weights,
         verb=args.verb,
@@ -870,6 +1017,9 @@ def main(argv: list[str] | None = None) -> int:
     # Load motion parameters for dynamic axis weighting
     motion_params = None
     pe_direction = None
+    if args.motparams is not None and args.affine is not None:
+        print("ERROR: -motparams and -affine are mutually exclusive")
+        return 1
     if args.motparams is not None:
         if not timeseries_mode:
             print("ERROR: -motparams requires timeseries mode (omit -source)")
@@ -891,6 +1041,31 @@ def main(argv: list[str] | None = None) -> int:
                   f"{len(motion_params)} motion parameter rows")
         # When using motparams, clear warp_flags -- axis_weights will do the work
         config = replace(config, warp_flags=0)
+
+    # Single-affine static axis projection (works in both modes)
+    if args.affine is not None:
+        pe_direction = _pe_direction_from_flags(args.noXdis, args.noYdis, args.noZdis)
+        if sum(pe_direction) < 0.5:
+            print("ERROR: -affine requires -noXdis/-noYdis/-noZdis to define PE direction")
+            return 1
+        R = _load_affine_rotation(args.affine, invert=args.invert_affine)
+        aw = _compute_axis_weights_from_rotation(R, pe_direction)
+        # Merge with any user-supplied -axweight (multiplicative)
+        merged = tuple(max(0.0, min(1.0, a * b)) for a, b in zip(aw, axis_weights, strict=True))
+        if args.verb >= 1:
+            pe_labels = []
+            if pe_direction[0] > 0.5:
+                pe_labels.append("X(RL)")
+            if pe_direction[1] > 0.5:
+                pe_labels.append("Y(AP)")
+            if pe_direction[2] > 0.5:
+                pe_labels.append("Z(IS)")
+            dir_str = "base->source (inverted)" if args.invert_affine else "source->base"
+            print(f"Affine-projected distortion: PE along {'+'.join(pe_labels)}, "
+                  f"matrix direction={dir_str}, "
+                  f"axis_weights=[{merged[0]:.3f},{merged[1]:.3f},{merged[2]:.3f}]")
+        # Clear warp_flags -- axis_weights now carry the PE info
+        config = replace(config, warp_flags=0, axis_weights=merged)
 
     # Load or compute weight
     weight = None
@@ -939,6 +1114,22 @@ def main(argv: list[str] | None = None) -> int:
     else:
         warp_padding = None
         pad_x, pad_y, pad_z = 0, 0, 0
+
+    # Intermediate-warp callback (per-level dump). In timeseries mode, only
+    # the first volume gets the callback (warned below) — otherwise the
+    # _levels/ dir would balloon to one set per volume.
+    level_cb = None
+    if args.save_intermediates:
+        levels_dir = f"{prefix}_levels"
+        warp_basename_for_lev = os.path.basename(prefix)
+        level_cb = _make_level_callback(
+            levels_dir, warp_basename_for_lev, base_info, warp_padding,
+            nx, ny, nz,
+        )
+        if args.verb >= 1:
+            print(f"Saving per-level intermediates to: {levels_dir}/")
+            if timeseries_mode:
+                print("  NOTE: timeseries mode — only volume 0 will dump intermediates")
 
     # --- Process volumes ---
     # Enable TF32 matmul precision on Ampere+ GPUs (free perf, ~1e-5 precision)
@@ -1023,6 +1214,9 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  Motion-projected weights: "
                               f"X={aw[0]:.4f} Y={aw[1]:.4f} Z={aw[2]:.4f} "
                               f"(roll={roll:.2f} pitch={pitch:.2f} yaw={yaw:.2f})")
+            # First volume only: attach per-level intermediate callback
+            if level_cb is not None and i == 0:
+                vol_overrides["level_callback"] = level_cb
             if vol_overrides:
                 vol_config = replace(config, **vol_overrides)
 
@@ -1210,10 +1404,17 @@ def main(argv: list[str] | None = None) -> int:
             src_gpu = src_vol.float().to(device)
             w_gpu = weight.float().to(device) if weight is not None else None
 
+            # Attach intermediate-save callback only on first timepoint
+            t_config = config
+            if level_cb is not None and t == 0:
+                t_config = replace(config, level_callback=level_cb)
+                if nt > 1 and args.verb >= 1:
+                    print("  (saving intermediates for this timepoint only)")
+
             warped, xd, yd, zd = qwarp(
                 base_gpu, src_gpu, weight=w_gpu,
                 initial_warp=initial_warp,
-                config=config, device=device, pad=use_pad,
+                config=t_config, device=device, pad=use_pad,
             )
 
             all_warped.append(warped.cpu())

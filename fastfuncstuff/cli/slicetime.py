@@ -16,6 +16,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.io.afni import get_tr_from_file
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.slicetime import load_slice_timing, slicetime_correct, temporal_resample
@@ -135,8 +136,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.set_defaults(method="fourier")
 
     parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
-    parser.add_argument("-verb", type=int, default=1, choices=[0, 1],
-                        help="Verbosity (0/1)")
+    add_verbose_arg(parser, default=1)
 
     return parser.parse_args(argv)
 

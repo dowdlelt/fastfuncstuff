@@ -99,12 +99,12 @@ class QwarpConfig:
     cost_method: str = "pearclp"
     """Cost function: 'pearclp' (clipped Pearson), 'pearson', or 'lpa'."""
 
-    penalty_factor: float = 0.001
-    """Base penalty factor for warp distortion. Lower than AFNI's 0.033 because
-    Adam's gradient-based updates amplify penalty signal vs NEWUOA."""
+    penalty_factor: float = 0.033
+    """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
 
-    penalty_first_level: int = 4
-    """First level to apply penalty (no penalty before this)."""
+    penalty_first_level: int = 3
+    """First level to apply penalty (no penalty before this). Matches AFNI's
+    Hpen_first_lev=3; on first activation the factor is halved."""
 
     shrink: float = 0.749999
     """Patch shrinkage factor between levels."""
@@ -130,10 +130,12 @@ class QwarpConfig:
     batch_optimizer_iters: int = 60
     """Max iterations for batched Adam optimizer per phase."""
 
-    hfactor_q: float = 1.0
-    """Hfactor shrinkage for large patches. Controls how much param_max is
-    reduced for patches larger than minpatch. AFNI default is 1.0 (no scaling).
-    Values < 1.0 reduce param_max for large patches. Range [0.1, 1.0]."""
+    hfactor_q: float = 0.5
+    """AFNI-style Hfactor shrinkage for *fine* patches: at the lev=1 patch size
+    Hfactor=1.0, and as patches shrink Hfactor decreases toward hfactor_q.
+    This tightens the per-patch displacement bound at deep levels, which is
+    AFNI's primary defense against high-frequency over-warping. 1.0 disables
+    the mechanism. Range [0.1, 1.0]."""
 
     maxdisp: float = 0.0
     """Maximum allowed displacement in voxels. 0 = no limit (default).
@@ -155,6 +157,13 @@ class QwarpConfig:
     compile: bool = False
     """Use torch.compile for building-block functions (CUDA only).
     Requires warmup on first volume; may not help for small patches."""
+
+    level_callback: Callable[..., None] | None = None
+    """Optional callback fired after each level completes. Signature:
+    ``cb(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped_source: Tensor)``.
+    Tensors are on the padded grid in whatever device the warp ran on; the
+    callee is responsible for cropping and moving to CPU if needed. Used to
+    save per-level intermediate warps and warped images."""
 
 
 @dataclass
@@ -446,21 +455,21 @@ def _get_basis_config(
     return basis, half_widths, param_max
 
 
-def _compute_hfactor(patch_size: int, min_patch: int, hfactor_q: float = 0.5) -> float:
-    """Compute AFNI-style Hfactor for scaling param_max based on patch size.
+def _compute_hfactor(patch_size: int, patch_size_lev1: int, hfactor_q: float = 0.5) -> float:
+    """AFNI-style Hfactor scaling on param_max.
 
-    Larger patches get smaller param_max (they cover more volume, so each
-    parameter has bigger effect). At minpatch, hfactor = 1.0.
-
-    From AFNI: hfactor = prat^alpha where alpha = log(hfactor_q) / log(0.1)
-    and prat = minpatch / current_patch_size.
+    AFNI's Hfactor_from_patchsize_ratio uses prat = psize / psize0 where
+    psize0 is the lev=1 (coarsest non-global) patch size. At lev=1 prat=1
+    so hfactor=1; at finer levels prat<1 so hfactor<1, tightening the
+    per-patch displacement bound. hfactor = prat^alpha with
+    alpha = log(hfactor_q) / log(0.1).
     """
     import math
-    if hfactor_q >= 1.0 or hfactor_q < 0.1 or patch_size <= min_patch:
+    if hfactor_q >= 1.0 or hfactor_q < 0.1 or patch_size_lev1 <= 0:
         return 1.0
-    prat = min_patch / patch_size
-    if prat >= 1.0:
+    if patch_size >= patch_size_lev1:
         return 1.0
+    prat = patch_size / patch_size_lev1
     alpha = math.log(hfactor_q) / math.log(0.1)
     return prat ** alpha
 
@@ -572,10 +581,16 @@ def _warpomatic(
             else:
                 print(f" done [cost:{first_cost:.5f}==>{state.cost:.5f}] ({elapsed:.1f}s)")
 
+        if config.level_callback is not None:
+            config.level_callback(0, state.xd, state.yd, state.zd, state.warped_source)
+
     # --- Levels 1..N: progressively smaller patches (batched GPU) ---
     xwid0 = ittt - ibbb + 1
     ywid0 = jttt - jbbb + 1
     zwid0 = kttt - kbbb + 1
+
+    # Lev=1 patch size, the reference for Hfactor scaling
+    max_patch_lev1 = max(1, int(max(xwid0, ywid0, zwid0) * config.shrink))
 
     ngmin = max(config.minpatch, 5)
     if ngmin % 2 == 0:
@@ -664,7 +679,7 @@ def _warpomatic(
         nyh = ywid
         nzh = zwid
         max_patch = max(nxh, nyh, nzh)
-        hfactor = _compute_hfactor(max_patch, ngmin, config.hfactor_q)
+        hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
             basis_type, nxh, nyh, nzh, device, hfactor=hfactor,
         )
@@ -812,6 +827,9 @@ def _warpomatic(
                     f" {state.patches_done} done, {state.patches_skipped} skip]"
                     f" ({elapsed:.1f}s)"
                 )
+
+        if config.level_callback is not None:
+            config.level_callback(lev, state.xd, state.yd, state.zd, state.warped_source)
 
         # Early stopping: if this level barely improved cost, skip finer levels
         if config.level_stop_tol > 0 and cost_at_start < 0:

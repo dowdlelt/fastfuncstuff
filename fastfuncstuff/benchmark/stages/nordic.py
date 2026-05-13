@@ -36,7 +36,8 @@ THRESHOLDS = {
 
 
 def _nordic_dir(ctx: BenchmarkContext) -> Path:
-    return ctx.data_dir.parent / "nordic_test_data"
+    from ..._paths import get_benchmark_data_dir
+    return get_benchmark_data_dir() / "nordic_test_data"
 
 
 def _nordic_toolbox() -> str | None:

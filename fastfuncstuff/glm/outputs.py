@@ -844,6 +844,46 @@ def write_afni_bucket(
     )
 
 
+def _inject_fdr_curves(
+    nifti_path: Path,
+    fdr_specs: Sequence[tuple[int, str, object]],
+) -> None:
+    """Compute and inject AFNI FDRCURVE attrs for each stat sub-brick.
+
+    fdr_specs: iterable of (brick_idx, stat_code, dof_or_dof_pair).
+    """
+    try:
+        import nibabel as nib
+
+        from fastfuncstuff.stats.fdr import (
+            add_fdrcurves_to_nifti,
+            compute_fdr_curve,
+        )
+    except ImportError as e:
+        print(f"  ⚠ Warning: FDR curves skipped (missing dep: {e})")
+        return
+
+    img = nib.load(str(nifti_path))
+    # Read data into memory (not memory-mapped) so that
+    # add_fdrcurves_to_nifti can safely overwrite the file.
+    data = img.get_fdata()
+    if data.ndim != 4:
+        print(f"  ⚠ Warning: FDR curves expect 4D bucket; got {data.shape}")
+        return
+
+    curves: dict[int, dict] = {}
+    for brick_idx, stat_code, dof in fdr_specs:
+        try:
+            slab = data[..., brick_idx].astype(np.float32, copy=False)
+            curve = compute_fdr_curve(slab, stat_code=stat_code, dof=dof)
+            curves[int(brick_idx)] = curve
+        except Exception as e:
+            print(f"  ⚠ Warning: FDR curve for brick {brick_idx} ({stat_code}) failed: {e}")
+    del img, data
+    if curves:
+        add_fdrcurves_to_nifti(nifti_path, curves)
+
+
 def write_glm_bucket_as_nifti(
     results: ResultsLike,
     output_path: str | Path,
@@ -857,6 +897,7 @@ def write_glm_bucket_as_nifti(
     apply_afni_metadata: bool = True,
     compress_output: bool = True,
     output_format: str | None = None,
+    add_fdr: bool = False,
 ) -> Path:
     """
     Write GLM results as a 4D output file (NIfTI) with AFNI-style sub-bricks.
@@ -1156,6 +1197,8 @@ def write_glm_bucket_as_nifti(
                     # Command 2: Set statistical parameters
                     cmd_statpar = ["3drefit"]
                     brick_idx = 0
+                    # Track (brick_idx, stat_code, dof_or_dofs) for FDR curves.
+                    fdr_specs: list[tuple[int, str, object]] = []
 
                     # F-statistic (sub-brick 0) - only if we have fstats
                     has_fstats = getattr(results, "fstats", None) is not None
@@ -1169,6 +1212,7 @@ def write_glm_bucket_as_nifti(
                                 str(dof),
                             ]
                         )
+                        fdr_specs.append((brick_idx, "fift", (float(n_regressors), float(dof))))
                         brick_idx += 1
 
                     # Regressor t-statistics (only if we have tstats)
@@ -1179,6 +1223,7 @@ def write_glm_bucket_as_nifti(
                             cmd_statpar.extend(
                                 ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
                             )
+                            fdr_specs.append((brick_idx + 1, "fitt", float(dof)))
                             brick_idx += 2
                     else:
                         # No t-stats, just skip over betas
@@ -1190,6 +1235,7 @@ def write_glm_bucket_as_nifti(
                             cmd_statpar.extend(
                                 ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
                             )
+                            fdr_specs.append((brick_idx + 1, "fitt", float(dof)))
                             brick_idx += 2
 
                     # Add file path
@@ -1210,6 +1256,10 @@ def write_glm_bucket_as_nifti(
 
                     # Run statpar command
                     subprocess.run(cmd_statpar, check=True, capture_output=True, text=True)
+
+                    # FDR curves (after 3drefit so it doesn't clobber our extension)
+                    if add_fdr and fdr_specs:
+                        _inject_fdr_curves(temp_path, fdr_specs)
 
             except subprocess.CalledProcessError as e:
                 print(f"  ⚠ Warning: 3drefit failed: {e.stderr}")

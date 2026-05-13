@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-3dREMLfast - Fast ARMA(1,1) GLM for fMRI using GPU acceleration
+ffs_reml - Fast ARMA(1,1) GLM for fMRI using GPU acceleration
 
 This is a PyTorch/GPU-accelerated implementation of AFNI's 3dREMLfit,
 providing 5-50x speedup for ARMA(1,1) prewhitened GLM fitting.
 
 Basic usage:
-    3dREMLfast -input func.nii.gz -matrix X.xmat.1D -Rnuisance stats_REML
+    ffs_reml -input func.nii.gz -matrix X.xmat.1D -Rnuisance stats_REML
 
 For help:
-    3dREMLfast -help
+    ffs_reml -help
 """
 
 import argparse
@@ -36,6 +36,7 @@ try:
     )
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
         auto_polort,
         build_nuisance_block_diag,
         compute_run_lengths,
@@ -273,43 +274,43 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefa
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
-        description="3dREMLfast - Fast GPU-accelerated ARMA(1,1) GLM fitting",
+        description="ffs_reml - Fast GPU-accelerated ARMA(1,1) GLM fitting",
         formatter_class=_HelpFormatter,
         epilog="""
 Examples:
   # Basic REML analysis with main bucket output
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D -Rbuck stats_REML
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D -Rbuck stats_REML
   
   # Multiple runs
-  3dREMLfast -input "run1.nii.gz run2.nii.gz run3.nii.gz" \\
+  ffs_reml -input "run1.nii.gz run2.nii.gz run3.nii.gz" \\
              -matrix X.xmat.1D -Rbuck stats_REML
   
   # With all outputs
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -Rvar params_REML \\
              -Rfitts fitts_REML -Rerrts errts_REML \\
              -Rbeta betas_only_REML -fout -tout -rout
   
   # With OLS comparison
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -Obuck stats_OLS
   
   # Nuisance regressors only
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rnuisance nuisance_REML -Onuisance nuisance_OLS
 
   # Single-trial outputs (reordered by onset time)
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -single_trials movie
   # Creates: ols_movie_single.nii.gz, reml_movie_single.nii.gz
 
-  # Custom ARMA grid with double precision
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  # Wider ARMA grid (default matches AFNI: a in [0,0.8], b in [-0.8,0.8])
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -use_double \\
-             -a_grid 0.0,0.9,10 -b_grid -0.8,0.8,17
+             -a_grid 0:0.9:10 -b_grid -0.9:0.9:19
 
   # Manual batch size control (for memory tuning)
-  3dREMLfast -input func.nii.gz -matrix X.xmat.1D \\
+  ffs_reml -input func.nii.gz -matrix X.xmat.1D \\
              -Rbuck stats_REML -batch_size 2000
         """,
     )
@@ -368,6 +369,19 @@ Examples:
     ols_out.add_argument("-Obeta", help="Output OLS betas only (no statistics)")
     ols_out.add_argument(
         "-Onuisance", help="Output OLS betas + statistics for NUISANCE regressors only"
+    )
+
+    # FDR options
+    fdr_group = parser.add_argument_group("FDR Options")
+    fdr_group.add_argument(
+        "-add_fdr",
+        action="store_true",
+        help=(
+            "Compute and store AFNI FDRCURVE attributes for every stat sub-brick "
+            "in -Rbuck / -Obuck / -Rnuisance / -Onuisance outputs (matches AFNI's "
+            "3drefit -addFDR behavior). The GUI / fdrval can then read q from a "
+            "threshold without re-running BH."
+        ),
     )
 
     # Special output options
@@ -434,19 +448,25 @@ Examples:
     arma_opts.add_argument(
         "-a_grid",
         help=(
-            "AR parameter grid. Three formats accepted:\n"
-            "  start:stop:num  — linspace, e.g.  0.025:0.9:32  (recommended; handles negatives)\n"
+            "AR parameter grid. Default matches AFNI 3dREMLfit:\n"
+            "  0:0.8:9  (i.e. [0.0, 0.1, ..., 0.8], step=0.1, MAXa=0.8)\n"
+            "Three formats accepted:\n"
+            "  start:stop:num  — linspace, e.g.  0:0.9:10  (widen MAXa to 0.9)\n"
             "  v1,v2,...       — explicit list, e.g.  0.1,0.3,0.5,0.7,0.9\n"
-            "  start,stop,num  — legacy linspace, e.g.  0.025,0.9,32"
+            "  start,stop,num  — legacy linspace, e.g.  0,0.9,10\n"
+            "Absolute upper bound is 0.9 (ARMA(1,1) is degenerate above)."
         ),
     )
     arma_opts.add_argument(
         "-b_grid",
         help=(
-            "MA parameter grid. Three formats accepted:\n"
-            "  start:stop:num  — linspace, e.g.  -0.9:0.9:65  (recommended; handles negatives)\n"
+            "MA parameter grid. Default matches AFNI 3dREMLfit:\n"
+            "  -0.8:0.8:17  (i.e. [-0.8, -0.7, ..., 0.7, 0.8], step=0.1, MAXb=0.8)\n"
+            "Three formats accepted:\n"
+            "  start:stop:num  — linspace, e.g.  -0.9:0.9:19  (widen MAXb to 0.9)\n"
             "  v1,v2,...       — explicit list, e.g.  -0.5,-0.2,0.0,0.2,0.5\n"
-            "  start,stop,num  — legacy linspace, e.g.  -0.9,0.9,65"
+            "  start,stop,num  — legacy linspace, e.g.  -0.9,0.9,19\n"
+            "Absolute upper bound is 0.9 (ARMA(1,1) is degenerate above)."
         ),
     )
     arma_opts.add_argument(
@@ -537,9 +557,7 @@ Examples:
             "'cuda,N' to use GPU device N (e.g., 'cuda,0' for GPU 0)"
         ),
     )
-    proc_opts.add_argument(
-        "-verbose", action="store_true", help="Print detailed progress information"
-    )
+    add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-legacy_contrasts",
         action="store_true",
@@ -653,9 +671,6 @@ Examples:
              "Example: 'TENT(0,15,6)' for 6 tent basis functions from 0-15s",
     )
 
-    # Help
-    parser.add_argument("-help", action="store_true", help="Show this help message")
-
     return parser
 
 
@@ -664,7 +679,7 @@ def print_header(args):
     from datetime import datetime
 
     print("=" * 70)
-    print("3dREMLfast - GPU-Accelerated ARMA(1,1) GLM")
+    print("ffs_reml - GPU-Accelerated ARMA(1,1) GLM")
     print("=" * 70)
     print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
@@ -765,8 +780,8 @@ def main():
     # bare number), so we pull those out manually before parse_args().
     raw_argv = sys.argv[1:]
 
-    # Early help / no-args check (before parse_args can fail on grid values)
-    if not raw_argv or any(a in ("-help", "--help", "-h") for a in raw_argv):
+    # No-args shows help (argparse handles -h/--help itself)
+    if not raw_argv:
         parser = create_parser()
         parser.print_help()
         sys.exit(0)
@@ -782,8 +797,8 @@ def main():
     finally:
         sys.argv = _orig_argv
 
-    # Show help if requested via the parser's own help flag
-    if args.help or not filtered_argv:
+    # Show help if no arguments provided (argparse handles -h/-help itself)
+    if not filtered_argv:
         parser.print_help()
         sys.exit(0)
 
@@ -1076,7 +1091,7 @@ def main():
         n_basis = hrf_info["n_basis"]
         condition_labels_full = hrf_info["condition_labels_full"]
 
-        # 3dREMLfast doesn't support -hrf_opt or -single_trial, so no compatibility check needed
+        # ffs_reml doesn't support -hrf_opt or -single_trial, so no compatibility check needed
         # (FIR is compatible with ARMA modeling)
 
         # Compute run starts from input files
@@ -1132,13 +1147,13 @@ def main():
             tr=args.tr,
             microtime_dt=args.microtime_dt,
             device=device,
-            hrf_opt=None,  # 3dREMLfast doesn't support per-voxel HRFs
+            hrf_opt=None,  # ffs_reml doesn't support per-voxel HRFs
             hrf_library=None,
             hrf_indices=None,
             n_voxels=None,
         )
 
-        assert task_design is not None, "3dREMLfast requires single design (no per-voxel HRFs)"
+        assert task_design is not None, "ffs_reml requires single design (no per-voxel HRFs)"
         print(f"  Task design shape: {task_design.shape}")
 
         # Build nuisance design (polynomials + ortvec)
@@ -1308,7 +1323,7 @@ def main():
             mask_file=args.mask,
             voxel_chunk_size=args.batch_size,
             use_double=args.use_double,
-            verbose=args.verbose,
+            verbose=args.verb >= 1,
         )
 
         # 4. Extract single-trial betas
@@ -1347,7 +1362,7 @@ def main():
 
         print()
         print("=" * 70)
-        print("✅ 3dREMLfast (single-trial mode) Complete!")
+        print("✅ ffs_reml (single-trial mode) Complete!")
         print("=" * 70)
         print(f"  Median beta-space R²: {xval['r2'].median():.4f}")
         print(f"  {xval['n_test_trials_total']} test trials across {xval['n_splits']} folds")
@@ -1436,6 +1451,7 @@ def main():
                     contrast_names=contrast_names,
                     contrast_results=ols_contrast_results,
                     output_format="nifti_gz",  # Force NIfTI output
+                    add_fdr=args.add_fdr,
                 )
 
             if args.Obeta:
@@ -1480,6 +1496,7 @@ def main():
                         args.Onuisance,
                         condition_names=stim_labels,
                         output_format="nifti_gz",  # Force NIfTI output
+                        add_fdr=args.add_fdr,
                     )
 
             if want_single_trials:
@@ -1801,7 +1818,7 @@ def main():
         results, design_info = analyze_from_design_matrix(
             fmri_data=fmri_data_to_use,
             design_matrix_file=args.matrix,
-            design_info=design_info if args.onsets else None,
+            design_info=design_info if (args.onsets or args.events) else None,
             method=analysis_method,
             arma_a_grid=a_grid,
             arma_b_grid=b_grid,
@@ -1919,6 +1936,7 @@ def main():
             contrast_names=contrast_names,
             contrast_results=contrast_results,
             output_format="nifti_gz",  # Force NIfTI output
+            add_fdr=args.add_fdr,
         )
 
     if args.Rbeta:
@@ -1975,6 +1993,7 @@ def main():
             args.Rnuisance,
             condition_names=nuisance_names,
             output_format="nifti_gz",  # Force NIfTI output
+            add_fdr=args.add_fdr,
         )
 
     if args.Rvar:
@@ -2463,7 +2482,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("✅ 3dREMLfast completed successfully!")
+    print("✅ ffs_reml completed successfully!")
     print("=" * 70)
 
 

@@ -304,6 +304,10 @@ def _evaluate_hrfs_batched(
     if is_loro_style and metric == "cod":
         sum_ss_res = torch.zeros(n_voxels, n_designs)
 
+        if verbose:
+            data_loc = "GPU" if data_on_device else "CPU (streaming chunks to GPU)"
+            print(f"  Compute device: {device} | Data: {data_loc}")
+
         split_iter = tqdm(cv_splits, desc="CV splits") if verbose else cv_splits
         for train_runs, test_runs in split_iter:
             train_designs_gpu = [
@@ -504,6 +508,91 @@ def _evaluate_hrfs_batched_loro(
     )
 
 
+def _evaluate_hrfs_insample(
+    projected_data: torch.Tensor,
+    projected_designs: list[torch.Tensor],
+    device: torch.device,
+    chunk_size: int | None = None,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """Evaluate multiple designs via full-data (in-sample) R².
+
+    Mirrors GLMsingle's FITHRF: fit OLS on all timepoints, report R².
+    No holdout — faster than CV and the only option with a single run.
+
+    Parameters
+    ----------
+    projected_data : torch.Tensor
+        (n_voxels, n_timepoints) Nuisance-projected data, on CPU.
+    projected_designs : list of torch.Tensor
+        Each (n_timepoints, n_stim_cols), on CPU.
+    device : torch.device
+        GPU device for computation.
+    chunk_size : int, optional
+        Voxels per GPU chunk (auto if None).
+    verbose : bool
+        Print progress.
+
+    Returns
+    -------
+    r2 : torch.Tensor
+        (n_voxels, n_designs) In-sample R² for each design, on CPU.
+    """
+    n_voxels, n_timepoints = projected_data.shape
+    n_designs = len(projected_designs)
+    data_on_device = projected_data.device.type == device.type
+
+    if chunk_size is None:
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=projected_designs[0].shape[1],
+            device=device,
+            operation="glm",
+        )
+
+    # SS_tot: mean-subtracted variance per voxel (same denominator as CV path)
+    sum_y = projected_data.sum(dim=1)
+    sum_y2 = (projected_data**2).sum(dim=1)
+    ss_tot = (sum_y2 - sum_y**2 / n_timepoints).clamp(min=1e-10)
+
+    r2_out = torch.zeros(n_voxels, n_designs)
+
+    if verbose:
+        data_loc = "GPU" if data_on_device else "CPU (streaming chunks to GPU)"
+        print(f"  Compute device: {device} | Data: {data_loc}")
+
+    # Pre-compute pseudoinverses for all designs (tiny matrices, stay on GPU)
+    pinvs = [torch.linalg.pinv(d.to(device)) for d in projected_designs]
+    designs_gpu = [d.to(device) for d in projected_designs]
+
+    chunk_iter = range(0, n_voxels, chunk_size)
+    if verbose:
+        from tqdm.auto import tqdm as _tqdm
+        chunk_iter = _tqdm(list(chunk_iter), desc="Voxel chunks (in-sample)")
+
+    for cs in chunk_iter:
+        ce = min(cs + chunk_size, n_voxels)
+        data_chunk = projected_data[cs:ce]
+        if not data_on_device:
+            data_chunk = data_chunk.to(device)
+
+        ss_tot_chunk = ss_tot[cs:ce].to(device)
+
+        for d_idx in range(n_designs):
+            betas = pinvs[d_idx] @ data_chunk.T          # (n_reg, chunk)
+            yhat = (designs_gpu[d_idx] @ betas).T         # (chunk, n_timepoints)
+            ss_res = ((data_chunk - yhat) ** 2).sum(dim=1)
+            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).cpu()
+
+        del data_chunk
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    del pinvs, designs_gpu
+    return r2_out
+
+
 def fit_glm_hrf_library_with_xval(
     data: torch.Tensor,
     onsets: torch.Tensor,
@@ -524,18 +613,23 @@ def fit_glm_hrf_library_with_xval(
     verbose: bool = True,
     chunk_size: int | None = None,
     r2_method: str = "auto",
+    select_mode: str = "xval",
     debug: bool = False,
     debug_prefix: str | None = None,
     condition_labels: list[str] | None = None,
 ) -> HRFSelectionResults:
     """
-    Select best HRF per voxel using cross-validated R².
+    Select best HRF per voxel using cross-validated or in-sample R².
 
     This function:
     1. Loops through each HRF in the library
-    2. For each HRF, computes cross-validated R² across CV splits
-    3. Selects the HRF with highest median CV R² per voxel
+    2. For each HRF, computes R² across CV splits (select_mode='xval') or on all
+       data at once (select_mode='full', like GLMsingle FITHRF)
+    3. Selects the HRF with highest R² per voxel
     4. Refits the full dataset using voxel-wise optimal HRFs
+
+    When select_mode='xval' and only one run is present, automatically falls back
+    to 'full' (LORO CV requires ≥ 2 runs).
 
     Parameters
     ----------
@@ -593,6 +687,14 @@ def fit_glm_hrf_library_with_xval(
         Print progress information
     chunk_size : int, optional
         Number of voxels to process at once (auto if None)
+    select_mode : str, default='xval'
+        HRF selection criterion:
+        - 'xval': cross-validated R² (LORO or split-half, controlled by cv_strategy).
+          More conservative; prevents selecting HRFs that fit noise.
+        - 'full': in-sample R² on all timepoints at once (GLMsingle FITHRF behaviour).
+          Faster; the only valid option with a single run.
+        When 'xval' is requested but only one run is present, automatically
+        falls back to 'full' with a warning.
 
     Returns
     -------
@@ -609,7 +711,7 @@ def fit_glm_hrf_library_with_xval(
     Notes
     -----
     The final fit groups voxels by their selected HRF to maintain GPU efficiency.
-    This is similar to how 3dREMLfast handles voxel-wise ARMA parameters.
+    This is similar to how ffs_reml handles voxel-wise ARMA parameters.
     """
     if device is None:
         device = get_device()
@@ -621,8 +723,34 @@ def fit_glm_hrf_library_with_xval(
     hrf_library = to_tensor(hrf_library, device=device)  # Small - can go to GPU
 
     n_voxels, n_timepoints_data = data.shape
+    _n_voxels_orig = n_voxels
+
+    # Skip zero-variance voxels (background with no signal — fitting on them wastes compute)
+    _nonzero = data.abs().sum(dim=1) > 0
+    _n_zero = int((~_nonzero).sum())
+    _active_idx = None
+    if _n_zero > 0:
+        _active_idx = _nonzero.nonzero(as_tuple=True)[0]
+        data = data[_active_idx]
+        if verbose:
+            print(
+                f"  Zero-variance voxels skipped: {_n_zero:,}/{_n_voxels_orig:,} "
+                f"({100*_n_zero/_n_voxels_orig:.1f}%)"
+            )
+    n_voxels = data.shape[0]
+
     n_hrfs = hrf_library.shape[0]
     n_runs = len(run_starts)
+
+    # Auto-fallback: CV requires ≥ 2 runs
+    if select_mode == "xval" and n_runs < 2:
+        import warnings
+        warnings.warn(
+            "select_mode='xval' requires ≥ 2 runs for cross-validation; "
+            "falling back to select_mode='full' (in-sample R²).",
+            stacklevel=2,
+        )
+        select_mode = "full"
 
     # Calculate bins per TR for microtime
     bins_per_tr = int(round(tr / microtime_dt))
@@ -639,15 +767,18 @@ def fit_glm_hrf_library_with_xval(
 
     if verbose:
         print("=" * 70)
-        print("CROSS-VALIDATED HRF SELECTION")
+        mode_label = "CROSS-VALIDATED" if select_mode == "xval" else "IN-SAMPLE (full-data)"
+        print(f"HRF SELECTION  [{mode_label}]")
         print("=" * 70)
         print(f"  Voxels: {n_voxels:,}")
         print(f"  Timepoints: {n_timepoints}")
         print(f"  Runs: {n_runs}")
         print(f"  HRF candidates: {n_hrfs}")
-        print(
-            f"  CV strategy: {cv_strategy} ({'LORO' if cv_strategy == 1 else 'split-halves' if cv_strategy == 0.5 else cv_strategy})"
-        )
+        print(f"  Select mode: {select_mode}")
+        if select_mode == "xval":
+            print(
+                f"  CV strategy: {cv_strategy} ({'LORO' if cv_strategy == 1 else 'split-halves' if cv_strategy == 0.5 else cv_strategy})"
+            )
         print(
             f"  Microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR, onset bin {microtime_onset})"
         )
@@ -655,13 +786,16 @@ def fit_glm_hrf_library_with_xval(
         print(f"  Data: {data_size_gb:.2f} GB on CPU, compute on {device}")
         print()
 
-    # Generate CV splits
-    cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
-    n_splits = len(cv_splits)
-
-    if verbose:
-        print(f"  CV splits: {n_splits}")
-        print()
+    # Generate CV splits (only needed for xval mode)
+    if select_mode == "xval":
+        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
+        n_splits = len(cv_splits)
+        if verbose:
+            print(f"  CV splits: {n_splits}")
+            print()
+    else:
+        cv_splits = []
+        n_splits = 0
 
     # =========================================================================
     # Build per-run nuisance blocks using shared utility
@@ -967,11 +1101,28 @@ def fit_glm_hrf_library_with_xval(
         print()
 
     # =========================================================================
-    # Evaluate all HRFs + canonical via cross-validation
+    # Evaluate all HRFs + canonical (xval or in-sample, depending on select_mode)
     # =========================================================================
-    is_loro = all(len(test) == 1 for _, test in cv_splits)
+    is_loro = select_mode == "xval" and all(len(test) == 1 for _, test in cv_splits)
 
-    if n_hrfs > 1:
+    if select_mode == "full":
+        # In-sample R²: fit all data, no holdout (GLMsingle FITHRF behaviour)
+        if verbose:
+            print()
+            print(f"  In-sample evaluation: {n_hrfs + 1} designs")
+
+        all_designs = all_projected_designs + [projected_canonical_design]
+        r2_all = _evaluate_hrfs_insample(
+            projected_data=projected_data,
+            projected_designs=all_designs,
+            device=device,
+            chunk_size=effective_chunk_size,
+            verbose=verbose,
+        )
+        xval_r2_median_all = r2_all[:, :n_hrfs].to(device)
+        xval_r2_canonical = r2_all[:, n_hrfs].to(device)
+
+    elif n_hrfs > 1:
         # Batched CV: move data to GPU once per split, evaluate ALL designs.
         # Reduces CPU→GPU transfers by (n_hrfs+1)× vs per-design evaluation.
         # Uses per-fold R² (mean R² across folds) — works for any CV strategy.
@@ -1097,7 +1248,8 @@ def fit_glm_hrf_library_with_xval(
         torch.cuda.empty_cache()
 
     if verbose:
-        print(f"  Canonical HRF mean xval R²: {xval_r2_canonical.mean().item():.4f}")
+        r2_label = "xval R²" if select_mode == "xval" else "in-sample R²"
+        print(f"  Canonical HRF mean {r2_label}: {xval_r2_canonical.mean().item():.4f}")
 
     # Fit full dataset with canonical HRF to get betas/tstats for comparison
     # NOTE: For final fit, we need the full (unprojected) data and design with nuisance
@@ -1139,8 +1291,8 @@ def fit_glm_hrf_library_with_xval(
         print("HRF Selection Summary:")
         hrf_counts = torch.bincount(hrf_index, minlength=n_hrfs)
         print(f"  HRF usage distribution: {hrf_counts.cpu().tolist()}")
-        print(f"  Mean xval R²: {xval_r2_best.mean().item():.4f}")
-        print(f"  Median xval R²: {xval_r2_best.median().item():.4f}")
+        print(f"  Mean {r2_label}: {xval_r2_best.mean().item():.4f}")
+        print(f"  Median {r2_label}: {xval_r2_best.median().item():.4f}")
         r2_improvement = xval_r2_best.mean().item() - xval_r2_canonical.mean().item()
         print(f"  Improvement over canonical: {r2_improvement:+.4f}")
         print()
@@ -1171,10 +1323,11 @@ def fit_glm_hrf_library_with_xval(
     # Build metadata for ARMA reuse
     hrf_metadata = {
         "hrf_mode": "library",  # Will be set by caller if known
+        "select_mode": select_mode,
         "n_hrfs": n_hrfs,
         "tr": tr,
         "stim_durations": stim_durations,
-        "cv_strategy": cv_strategy,
+        "cv_strategy": cv_strategy if select_mode == "xval" else None,
         "n_splits": n_splits,
         "metric": metric,
         "microtime_dt": microtime_dt,
@@ -1190,12 +1343,50 @@ def fit_glm_hrf_library_with_xval(
         "hrf_usage_counts": torch.bincount(hrf_index, minlength=n_hrfs).cpu().tolist(),
     }
 
-    # Build HRF group indices for efficient ARMA reuse
+    # Build HRF group indices for efficient ARMA reuse (index into active voxels)
     hrf_group_indices = {}
     for h in range(n_hrfs):
         mask = hrf_index == h
         if mask.any():
             hrf_group_indices[h] = torch.where(mask)[0]
+
+    # Restore zero-variance voxels: pad all per-voxel tensors back to original count
+    if _active_idx is not None:
+        _active_idx_cpu = _active_idx.cpu()  # always CPU for safe cross-device indexing
+
+        def _pad_to_full(t, fill=0.0):
+            if t is None:
+                return None
+            out = t.new_full((_n_voxels_orig, *t.shape[1:]), fill)
+            out[_active_idx_cpu.to(t.device)] = t
+            return out
+
+        # Remap group indices (which are on device) to original voxel positions on CPU
+        hrf_group_indices = {h: _active_idx_cpu[idx.cpu()] for h, idx in hrf_group_indices.items()}
+
+        hrf_index = _pad_to_full(hrf_index, fill=0).long()
+        xval_r2_best = _pad_to_full(xval_r2_best)
+        xval_r2_std = _pad_to_full(xval_r2_std)
+        xval_r2_median_all = _pad_to_full(xval_r2_median_all)
+        xval_r2_canonical = _pad_to_full(xval_r2_canonical)
+
+        for _glm_res in [final_results, canonical_glm_results]:
+            if _glm_res is None:
+                continue
+            _glm_res.betas = _pad_to_full(_glm_res.betas)
+            _glm_res.r2 = _pad_to_full(_glm_res.r2)
+            if _glm_res.tstats is not None:
+                _glm_res.tstats = _pad_to_full(_glm_res.tstats)
+            if _glm_res.sigma2 is not None:
+                _glm_res.sigma2 = _pad_to_full(_glm_res.sigma2)
+            if _glm_res.fstats is not None:
+                _glm_res.fstats = _pad_to_full(_glm_res.fstats)
+            if _glm_res.meanvol is not None:
+                _glm_res.meanvol = _pad_to_full(_glm_res.meanvol)
+
+        hrf_metadata["n_voxels"] = _n_voxels_orig
+        hrf_metadata["n_active_voxels"] = n_voxels
+        hrf_metadata["n_zero_voxels"] = _n_zero
 
     # Create results container
     results = HRFSelectionResults(
@@ -1245,7 +1436,7 @@ def _fit_voxelwise_hrf(
 
     This is the key efficiency trick: instead of fitting each voxel separately,
     we group voxels by their selected HRF and fit each group together.
-    Similar to how 3dREMLfast handles voxel-wise ARMA parameters.
+    Similar to how ffs_reml handles voxel-wise ARMA parameters.
 
     Parameters
     ----------
@@ -1267,6 +1458,7 @@ def _fit_voxelwise_hrf(
     all_r2 = torch.zeros(n_voxels, device=device)
     all_tstats = torch.zeros(n_voxels, n_conditions, device=device)
     all_sigma2 = torch.zeros(n_voxels, device=device)
+    all_fstats = torch.zeros(n_voxels, device=device)
 
     # Group voxels by HRF
     unique_hrfs = torch.unique(hrf_index)
@@ -1361,6 +1553,12 @@ def _fit_voxelwise_hrf(
                     sigma2_to_store = sigma2_to_store.to(all_sigma2.device)
                 all_sigma2[voxel_idx] = sigma2_to_store
 
+            if subset_results.fstats is not None:
+                fstats_to_store = subset_results.fstats
+                if fstats_to_store.device != all_fstats.device:
+                    fstats_to_store = fstats_to_store.to(all_fstats.device)
+                all_fstats[voxel_idx] = fstats_to_store
+
             del subset_data, subset_results
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -1381,6 +1579,7 @@ def _fit_voxelwise_hrf(
     results.r2 = all_r2.cpu()
     results.tstats = all_tstats.cpu()
     results.sigma2 = all_sigma2.cpu()
+    results.fstats = all_fstats.cpu()
     results.meanvol = data.mean(dim=1).cpu()
     results.dof = stored_dof  # Propagate dof from fit_glm for 3drefit labeling
 
@@ -1971,14 +2170,24 @@ def save_hrf_selection_results(
     # Get TR for plotting
     tr = results.hrf_metadata.get("tr", 1.0)
 
-    # 1. Save HRF index map (1-based: 1 to N, not 0 to N-1, since 0 = background)
+    # 1. Save HRF index bucket: [HRF_index (1-based), R2_HRFsel (max R² at selected HRF)]
+    #    Sub-brick 1 lets you immediately threshold the index map in AFNI by R².
     hrf_index_file = f"{output_prefix}_hrf_index{nii_ext}"
-    # Add 1 to convert from 0-indexed to 1-indexed for AFNI compatibility
-    hrf_index_1based = results.hrf_index.float() + 1.0
-    _save_volume(hrf_index_1based, hrf_index_file, volume_shape, affine, voxel_mask)
+    hrf_index_1based = results.hrf_index.float() + 1.0  # 0-indexed → 1-indexed
+    select_mode = results.hrf_metadata.get("select_mode", "xval")
+    r2_label = "R2_xval" if select_mode == "xval" else "R2_insample"
+    _save_hrf_index_bucket(
+        hrf_index_1based,
+        results.xval_r2_best,
+        hrf_index_file,
+        volume_shape,
+        affine,
+        voxel_mask,
+        r2_label=r2_label,
+    )
     output_files["hrf_index"] = hrf_index_file
 
-    # 2. Save CV R² for best HRF
+    # 2. Save CV R² for best HRF (standalone, for compatibility / plotting)
     xval_r2_file = f"{output_prefix}_xval_r2{nii_ext}"
     _save_volume(results.xval_r2_best, xval_r2_file, volume_shape, affine, voxel_mask)
     output_files["xval_r2"] = xval_r2_file
@@ -2058,6 +2267,15 @@ def save_hrf_selection_results(
             affine=affine,
         )
         output_files["canonical_stats"] = canonical_stats_file
+
+    # 4c. Save selected HRF per voxel as 4D volume (x, y, z, n_hrf_timepoints)
+    if results.hrf_library is not None and results.hrf_index is not None:
+        selected_hrfs_file = f"{output_prefix}_selected_hrfs{nii_ext}"
+        hrf_lib = results.hrf_library.cpu()          # (n_hrfs, n_hrf_timepoints)
+        idx = results.hrf_index.cpu().long()          # (n_voxels,) 0-based
+        selected = hrf_lib[idx, :]                    # (n_voxels, n_hrf_timepoints)
+        _save_volume_4d(selected, selected_hrfs_file, volume_shape, affine, voxel_mask)
+        output_files["selected_hrfs"] = selected_hrfs_file
 
     # 5. Save HRF library for ARMA reuse
     hrf_lib_file = f"{output_prefix}_hrf_library.pt"
@@ -2367,6 +2585,83 @@ def load_hrf_selection_for_arma(hrf_library_file: str) -> dict:
         - metadata: selection parameters
     """
     return torch.load(hrf_library_file, weights_only=False)
+
+
+def _save_hrf_index_bucket(
+    hrf_index: torch.Tensor,
+    r2_max: torch.Tensor,
+    filepath: str,
+    volume_shape: tuple[int, int, int] | None,
+    affine: np.ndarray | None,
+    voxel_mask: torch.Tensor | None,
+    r2_label: str = "R2_xval",
+) -> None:
+    """Save HRF index and max R² as a 2-sub-brick AFNI-style bucket.
+
+    Sub-brick 0: HRF_index  (1-based integer stored as float32)
+    Sub-brick 1: <r2_label> (max R² at the selected HRF; use as threshold mask in AFNI)
+
+    3drefit is called (when available) to embed the sub-brick labels so AFNI
+    displays them immediately without manual relabelling.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path as _Path
+
+    import nibabel as nib
+
+    from fastfuncstuff.io.afni import compress_nifti
+
+    # Stack into (n_voxels, 2)
+    stacked = torch.stack([hrf_index.float().cpu(), r2_max.float().cpu()], dim=1)
+
+    # Unmask and reshape to (x, y, z, 2)
+    stacked_np = stacked.numpy()
+    if volume_shape is not None:
+        n_vox_3d = int(np.prod(volume_shape))
+        full = np.zeros((n_vox_3d, 2), dtype=np.float32)
+        if voxel_mask is not None:
+            full[voxel_mask.cpu().numpy(), :] = stacked_np
+        else:
+            full[:] = stacked_np
+        vol4d = full.reshape((*volume_shape, 2))
+    else:
+        vol4d = stacked_np.reshape(-1, 2)
+
+    if affine is None:
+        affine = np.eye(4)
+
+    fp = _Path(filepath)
+    labels = ["HRF_index", r2_label]
+
+    # Always write an uncompressed .nii first so 3drefit can work on it
+    if str(fp).endswith(".nii.gz"):
+        nii_path = fp.parent / (fp.name[:-3])  # drop .gz → .nii
+    else:
+        nii_path = fp
+
+    nib.save(nib.Nifti1Image(vol4d.astype(np.float32), affine), str(nii_path))
+
+    # Apply sub-brick labels via 3drefit if available
+    if shutil.which("3drefit"):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as lf:
+            lf.write(" ".join(labels))
+            labels_file = lf.name
+        try:
+            subprocess.run(
+                ["3drefit", "-relabel_all", labels_file, str(nii_path)],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError:
+            pass  # File still valid, just unlabelled
+        finally:
+            _Path(labels_file).unlink(missing_ok=True)
+
+    # Compress to final destination if needed
+    if str(fp).endswith(".nii.gz"):
+        compress_nifti(nii_path, fp, remove_original=True)
 
 
 def _save_volume(

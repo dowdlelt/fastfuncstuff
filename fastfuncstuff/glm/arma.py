@@ -96,16 +96,21 @@ def _debug_memory_snapshot(
 
 # AFNI 3dREMLfit default grid parameters (Grid 3 - medium resolution)
 # These are well-validated values from AFNI documentation
+# AFNI 3dREMLfit defaults: -MAXa 0.8, -MAXb 0.8, -Grid 3 (step=0.1).
+# a is non-negative (POScor); b is symmetric.
+# 9 a-values × 17 b-values = 153 candidates (gamma0>0 filter trims to ~117).
+# Users can widen with the CLI -MAXa/-MAXb flags; the absolute upper bound
+# is 0.9 (any closer to 1 and the ARMA(1,1) model is degenerate).
 DEFAULT_ARMA_A_GRID = (
     0.0,
-    0.9,
-    10,
-)  # (start, end, num_points) -> [0.0, 0.1, 0.2, ..., 0.9]
+    0.8,
+    9,
+)  # (start, end, num_points) -> [0.0, 0.1, ..., 0.8]
 DEFAULT_ARMA_B_GRID = (
-    -0.9,
-    0.9,
-    19,
-)  # (start, end, num_points) -> [-0.9, -0.8, ..., 0.8, 0.9]
+    -0.8,
+    0.8,
+    17,
+)  # (start, end, num_points) -> [-0.8, -0.7, ..., 0.7, 0.8]
 
 
 def check_cuda_memory_before_batch(
@@ -519,20 +524,30 @@ def compute_arma_lambda(a: float, b: float) -> float:
 
 def get_default_arma_grids(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Get default ARMA(1,1) parameter grids (AFNI -Grid 3 equivalent)
+    Get default ARMA(1,1) parameter grids — matches AFNI 3dREMLfit defaults.
 
     Returns
     -------
     a_grid : torch.Tensor
-        AR parameter grid [0.0, 0.1, 0.2, ..., 0.9] (10 points, step=0.1)
+        AR parameter grid [0.0, 0.1, ..., 0.8] (9 points, step=0.1)
     b_grid : torch.Tensor
-        MA parameter grid [-0.9, -0.8, ..., 0.8, 0.9] (19 points, step=0.1)
+        MA parameter grid [-0.8, -0.7, ..., 0.7, 0.8] (17 points, step=0.1)
 
     Notes
     -----
-    Total: 190 (a, b) combinations (10 × 19)
-    Matches AFNI 3dREMLfit -Grid 3 (medium resolution, good balance)
-    Invalid combinations filtered by stability criteria during fitting
+    Total: 9 × 17 = 153 (a, b) combinations; the gamma0>0 stability filter
+    inside build_arma11_covariance_batch trims this to ~117 valid points
+    (matching AFNI's effective grid). Equivalent to 3dREMLfit's defaults
+    `-MAXa 0.8 -MAXb 0.8 -Grid 3`.
+
+    To widen the search (rare; only useful for high-correlation signals),
+    pass custom grids via `a_grid` / `b_grid`, e.g.::
+
+        a_grid = torch.arange(0.0, 0.91, 0.1, device=device)   # MAXa=0.9
+        b_grid = torch.arange(-0.9, 0.91, 0.1, device=device)  # MAXb=0.9
+
+    The absolute upper bound for either parameter is 0.9 — beyond that
+    the ARMA(1,1) covariance becomes ill-conditioned.
     """
     a_grid = torch.linspace(*DEFAULT_ARMA_A_GRID, device=device)
     b_grid = torch.linspace(*DEFAULT_ARMA_B_GRID, device=device)
@@ -732,7 +747,7 @@ def _compute_arma11_lambda(
 
     Notes
     -----
-    AFNI 3dREMLfit formula from Cox & Reynolds (2006)
+    AFNI 3dREMLfit formula (see 3dREMLfit.c and the AFNI tech note).
     Valid for |a| < 1, |b| < 1 (checked by caller)
     """
     # This formula is mathematically equivalent to gamma1/gamma0
@@ -742,8 +757,33 @@ def _compute_arma11_lambda(
     return numerator / denominator
 
 
+def _run_block_mask(
+    run_starts: list[int] | torch.Tensor, n: int, device: torch.device
+) -> torch.Tensor:
+    """Boolean mask of shape (n, n) — True iff i and j are in the same run.
+
+    Used to enforce AFNI's block-diagonal correlation structure: ARMA(1,1)
+    correlations stop at run boundaries (concatenated runs are independent
+    realisations). The mask is computed from a per-timepoint run id, so it
+    is a pure tensor op — broadcasts cleanly over a batch of (n, n) Rs.
+    """
+    if isinstance(run_starts, torch.Tensor):
+        starts = run_starts.to(device=device, dtype=torch.long).flatten()
+    else:
+        starts = torch.tensor(list(run_starts), device=device, dtype=torch.long)
+    # run_id[i] = number of run_starts <= i, minus 1
+    idx = torch.arange(n, device=device)
+    run_id = torch.bucketize(idx, starts, right=True) - 1
+    return run_id.unsqueeze(0) == run_id.unsqueeze(1)
+
+
 def build_arma11_covariance(
-    a: float, b: float, n: int, device: torch.device, dtype: torch.dtype = torch.float32
+    a: float,
+    b: float,
+    n: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """
     Build ARMA(1,1) covariance matrix (Toeplitz structure)
@@ -764,6 +804,11 @@ def build_arma11_covariance(
         Computing device
     dtype : torch.dtype, default=torch.float32
         Data type for the covariance matrix (float32 or float64)
+    run_starts : list[int] or torch.Tensor, optional
+        Starting timepoint of each run (e.g. [0, 150, 300] for 3 equal runs).
+        When provided, R is block-diagonal across run boundaries (AFNI 3dREMLfit
+        behaviour) — correlations do not bleed between concatenated runs.
+        For single-run data leave as None (default).
 
     Returns
     -------
@@ -773,7 +818,7 @@ def build_arma11_covariance(
     Notes
     -----
     - λ >= 0 is enforced (AFNI default, invalid combinations return None)
-    - Matrix is symmetric Toeplitz (constant along diagonals)
+    - Matrix is symmetric Toeplitz within each run-block; block-diagonal across runs
     - Fast construction: O(n²) but highly vectorized on GPU (~1ms for n=300)
     - Uses _compute_arma11_lambda() for single source of truth
 
@@ -810,6 +855,11 @@ def build_arma11_covariance(
     distance = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))
     R = corr[distance]
 
+    # Block-diagonal across run boundaries (AFNI behaviour for concatenated runs)
+    if run_starts is not None:
+        mask = _run_block_mask(run_starts, n, device)
+        R = R * mask.to(dtype=dtype)
+
     # Ensure contiguous for MPS compatibility (PyTorch MPS Cholesky bug)
     R = R.contiguous()
 
@@ -822,6 +872,7 @@ def build_arma11_covariance_batch(
     n: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list]:
     """
     Build ALL ARMA(1,1) covariance matrices at once (VECTORIZED!)
@@ -948,6 +999,11 @@ def build_arma11_covariance_batch(
     # Result: (n_valid, n, n) - all covariance matrices at once!
     R_batch = corr[:, distance]
 
+    # Block-diagonal across run boundaries (AFNI behaviour for concatenated runs)
+    if run_starts is not None:
+        mask = _run_block_mask(run_starts, n, device).to(dtype=dtype)
+        R_batch = R_batch * mask  # broadcasts over the n_valid axis
+
     # Ensure contiguous for MPS compatibility
     R_batch = R_batch.contiguous()
 
@@ -1050,6 +1106,7 @@ def reml_grid_search(
     a_grid: torch.Tensor | None = None,
     b_grid: torch.Tensor | None = None,
     device: torch.device | None = None,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> tuple[float, float, float]:
     """
     Find optimal ARMA(1,1) parameters via REML grid search
@@ -1140,7 +1197,9 @@ def reml_grid_search(
             b_val = b.item()
 
             # Build ARMA(1,1) covariance matrix
-            R = build_arma11_covariance(a_val, b_val, n_timepoints, device)
+            R = build_arma11_covariance(
+                a_val, b_val, n_timepoints, device, run_starts=run_starts
+            )
 
             if R is None:
                 # Invalid (a,b) combination
@@ -1168,6 +1227,7 @@ def precompute_reml_grid(
     dtype: torch.dtype = torch.float32,
     debug_memory: bool = False,
     use_qr: bool = False,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> dict:
     """
     Pre-compute Cholesky factorizations for entire REML grid (BATCHED!)
@@ -1246,7 +1306,7 @@ def precompute_reml_grid(
         )
 
     R_batch, params_tensor, param_list = build_arma11_covariance_batch(
-        a_grid, b_grid, n_timepoints, build_device, dtype
+        a_grid, b_grid, n_timepoints, build_device, dtype, run_starts=run_starts
     )
     n_valid = len(param_list)
 
@@ -1392,7 +1452,9 @@ def precompute_reml_grid(
         )
 
         for a_val, b_val in grid_pairs:
-            R = build_arma11_covariance(a_val, b_val, n_timepoints, device, dtype)
+            R = build_arma11_covariance(
+                a_val, b_val, n_timepoints, device, dtype, run_starts=run_starts
+            )
             if R is None:
                 continue
 
@@ -1716,6 +1778,7 @@ def batch_reml_grid_search(
     precomputed: dict | None = None,
     dtype: torch.dtype = torch.float32,
     enable_early_stopping: bool = False,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Device-adaptive REML grid search with optimal strategy per device.
@@ -1809,7 +1872,8 @@ def batch_reml_grid_search(
     # Pre-compute grid if not provided
     if precomputed is None:
         precomputed = precompute_reml_grid(
-            X, n_timepoints, a_grid, b_grid, device, dtype=dtype
+            X, n_timepoints, a_grid, b_grid, device, dtype=dtype,
+            run_starts=run_starts,
         )
 
     n_grid = len(precomputed)
@@ -2140,7 +2204,11 @@ def search_voxels_precomputed_grid(
 
 @torch.inference_mode()
 def prewhiten_with_arma11(
-    X: torch.Tensor, Y: torch.Tensor, a: float, b: float
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    a: float,
+    b: float,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Prewhiten design and data using ARMA(1,1) covariance
@@ -2190,7 +2258,9 @@ def prewhiten_with_arma11(
 
     # Build ARMA(1,1) covariance on CPU to save GPU memory and avoid fragmentation
     # Use X.dtype so precision matches the inputs (important when use_double=True)
-    R = build_arma11_covariance(a, b, n_timepoints, torch.device("cpu"), dtype=X.dtype)
+    R = build_arma11_covariance(
+        a, b, n_timepoints, torch.device("cpu"), dtype=X.dtype, run_starts=run_starts
+    )
 
     if R is None:
         raise ValueError(f"Invalid ARMA(1,1) parameters: a={a}, b={b}")
@@ -2397,6 +2467,7 @@ def reml_grid_search_batched(
     grid_chunk_size: int = 1,
     voxel_batch_size: int | None = None,
     y_scale: torch.Tensor | None = None,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     REML grid search with adaptive batching (memory-efficient).
@@ -2486,10 +2557,12 @@ def reml_grid_search_batched(
         # Keep data on CPU, will move batches as needed
         design_dev = design.to(device, dtype=dtype)
 
-    # Allocate results
+    # Allocate results.
+    # Convention matches compute_reml_likelihood / _evaluate_single_param /
+    # the chunked GPU search: REML neg-log-likelihood, smaller = better.
     best_params = torch.zeros(n_voxels, 2, dtype=dtype, device=torch.device("cpu"))
     best_likelihood = torch.full(
-        (n_voxels,), float("-inf"), dtype=dtype, device=torch.device("cpu")
+        (n_voxels,), float("inf"), dtype=dtype, device=torch.device("cpu")
     )
 
     # Process grid in chunks for efficiency
@@ -2523,6 +2596,7 @@ def reml_grid_search_batched(
                     n_timepoints,
                     device=torch.device("cpu"),
                     dtype=dtype,
+                    run_starts=run_starts,
                 )
 
                 # Compute Cholesky
@@ -2558,25 +2632,22 @@ def reml_grid_search_batched(
                     resid_w = y_w - (betas @ X_w.T)  # (n_voxels, n_tp)
                     sse = torch.sum(resid_w**2, dim=1)  # (n_voxels,)
 
-                    # REML likelihood (same formula as AFNI)
-                    n = n_timepoints
-                    _p = n_regressors
-                    likelihoods = -0.5 * (
-                        n * torch.log(sse / n)
-                        + logdet_R
+                    # REML neg-log-likelihood (matches AFNI 3dREMLfit and the
+                    # CPU/chunked-GPU paths in this file):
+                    #   logdet_R + logdet(X'R^-1 X) + (n - m) * log(SSE)
+                    # Earlier versions used the ML form n*log(SSE/n), which has
+                    # a different multiplier on log(SSE) and so can shift the
+                    # argmin between adjacent grid points.
+                    likelihoods = (
+                        logdet_R
                         + logdet_XwTXw
-                        + n
-                        * (
-                            1
-                            + torch.log(
-                                torch.tensor(2 * torch.pi, dtype=dtype, device=device)
-                            )
-                        )
+                        + (n_timepoints - n_regressors)
+                        * torch.log(sse + 1e-10)
                     )
 
-                    # Update best parameters (vectorized comparison!)
+                    # Update best parameters (vectorized comparison; smaller = better)
                     likelihoods_cpu = likelihoods.cpu()
-                    mask = likelihoods_cpu > best_likelihood
+                    mask = likelihoods_cpu < best_likelihood
                     best_params[mask, 0] = a
                     best_params[mask, 1] = b
                     best_likelihood[mask] = likelihoods_cpu[mask]
@@ -2613,28 +2684,19 @@ def reml_grid_search_batched(
                         resid_w = y_w - (betas @ X_w.T)  # (batch_voxels, n_tp)
                         sse = torch.sum(resid_w**2, dim=1)  # (batch_voxels,)
 
-                        # REML likelihood (same formula as AFNI)
-                        n = n_timepoints
-                        _p = n_regressors
-                        likelihoods = -0.5 * (
-                            n * torch.log(sse / n)
-                            + logdet_R
+                        # REML neg-log-likelihood; see comment in the
+                        # load_all_data branch above for the formula rationale.
+                        likelihoods = (
+                            logdet_R
                             + logdet_XwTXw
-                            + n
-                            * (
-                                1
-                                + torch.log(
-                                    torch.tensor(
-                                        2 * torch.pi, dtype=dtype, device=device
-                                    )
-                                )
-                            )
+                            + (n_timepoints - n_regressors)
+                            * torch.log(sse + 1e-10)
                         )
 
-                        # Update best parameters for this batch (vectorized comparison!)
+                        # Update best parameters for this batch (smaller = better)
                         likelihoods_cpu = likelihoods.cpu()
                         batch_best_likelihood = best_likelihood[voxel_start:voxel_end]
-                        mask = likelihoods_cpu > batch_best_likelihood
+                        mask = likelihoods_cpu < batch_best_likelihood
 
                         # Update using proper indexing (avoid chained indexing which creates copies)
                         if mask.any():
@@ -2700,6 +2762,7 @@ def fit_glm_arma11(
     spatial_metadata: dict | None = None,
     legacy_contrasts: bool = False,
     save_profile_likelihoods: bool = False,
+    run_starts: list[int] | torch.Tensor | None = None,
 ) -> ARMA11Results:
     """
     Fit GLM with ARMA(1,1) prewhitening (AFNI 3dREMLfit style)
@@ -3377,7 +3440,7 @@ def fit_glm_arma11(
             for params in unique_params:
                 a_opt, b_opt = params[0].item(), params[1].item()
                 X_w, _, L = prewhiten_with_arma11(
-                    design, design[:, 0], a_opt, b_opt
+                    design, design[:, 0], a_opt, b_opt, run_starts=run_starts
                 )
                 # CRITICAL: Store L on CPU to save GPU memory (1.1 GB per matrix for 17k timepoints!)
                 # Move to GPU only when needed for batch computation
@@ -3437,6 +3500,7 @@ def fit_glm_arma11(
                     grid_chunk_size=strategy["grid_chunk_size"],
                     voxel_batch_size=strategy["voxel_batch_size"],
                     y_scale=_y_norm_scale,
+                    run_starts=run_starts,
                 )
 
                 # Store results
@@ -3516,6 +3580,7 @@ def fit_glm_arma11(
                     dtype=dtype,
                     debug_memory=debug_memory,
                     use_qr=use_qr,
+                    run_starts=run_starts,
                 )
 
                 # Type assertion: grids are guaranteed to be set by now
@@ -3704,7 +3769,9 @@ def fit_glm_arma11(
             else:
                 # Compute L ONCE for this (a,b) group, keep on GPU
                 y_dummy = data[voxel_indices[0]].to(device)
-                X_w, _, L_chol = prewhiten_with_arma11(design, y_dummy, a_opt, b_opt)
+                X_w, _, L_chol = prewhiten_with_arma11(
+                    design, y_dummy, a_opt, b_opt, run_starts=run_starts
+                )
                 _using_l_inv = False  # L_chol is actual Cholesky factor here
 
             # OPTIMIZATION: Precompute group-level matrices ONCE per (a,b)
@@ -4584,7 +4651,7 @@ def fit_glm_arma11(
 
         # REML grid search
         a_opt, b_opt, likelihood_opt = reml_grid_search(
-            design, y_mean, a_grid, b_grid, device
+            design, y_mean, a_grid, b_grid, device, run_starts=run_starts
         )
 
         if verbose:
@@ -4607,7 +4674,9 @@ def fit_glm_arma11(
         design_dev = design.to(device) if design.device != device else design
 
         # Prewhiten design (shared across all voxels)
-        X_w, _, L_global = prewhiten_with_arma11(design_dev, y_mean, a_opt, b_opt)
+        X_w, _, L_global = prewhiten_with_arma11(
+            design_dev, y_mean, a_opt, b_opt, run_starts=run_starts
+        )
         XwTXw = X_w.T @ X_w
         XwTXw_reg = XwTXw + 1e-6 * torch.eye(n_regressors, device=device, dtype=dtype)
 

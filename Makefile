@@ -10,14 +10,14 @@ help:
 	@echo "  make clean   - Remove generated files"
 
 check: lint
-	ty check fastfuncsim/
+	ty check fastfuncstuff/
 
 lint:
-	ruff check fastfuncsim/ examples/
+	ruff check fastfuncstuff/ examples/
 
 fix:
-	ruff check --fix fastfuncsim/ examples/
-	ruff format fastfuncsim/ examples/
+	ruff check --fix fastfuncstuff/ examples/
+	ruff format fastfuncstuff/ examples/
 
 install:
 	pip install -e ".[dev]"
