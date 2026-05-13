@@ -78,13 +78,9 @@ def _find_romeo() -> str:
     env = os.environ.get("ROMEO_PATH")
     if env and Path(env).exists():
         return env
-    candidates = sorted(Path.home().glob(
-        "Dropbox/Resources/code/mritools_*/bin/romeo"
-    ))
-    if candidates:
-        return str(candidates[-1])
     raise FileNotFoundError(
-        "ROMEO not found. Install it and add to PATH, or set ROMEO_PATH."
+        "ROMEO not found. Add it to PATH or set ROMEO_PATH=/path/to/romeo.\n"
+        "Download from https://github.com/korbinian90/ROMEO/releases"
     )
 
 
@@ -112,20 +108,10 @@ def _run_prep(ctx: BenchmarkContext) -> None:
     phase = dd / PHASE_FILE
 
     if not bold.exists() or not phase.exists():
-        print("  Downloading ds003427 sub-03 checkerboard from OpenNeuro...")
-        subprocess.run(
-            [
-                "aws", "s3", "sync", "--no-sign-request",
-                "--exclude", "*", "--include",
-                "*sub-03_task-checkerboard_acq-ge_run-01_*.nii.gz",
-                "s3://openneuro.org/ds003427",
-                str(dd),
-            ],
-            check=True,
+        raise FileNotFoundError(
+            f"Raw data not found in {dd}\n"
+            f"  Run:  ffs_benchmark -download  to fetch all benchmark datasets."
         )
-
-    if not bold.exists():
-        raise FileNotFoundError(f"Download failed: {bold}")
 
     moco_params = pd / "moco_params.aff12.1D"
     if not moco_params.exists():
@@ -213,8 +199,6 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         for tool in ("3dvolreg", "3dAutomask", "ffs_nwarp"):
             if not shutil.which(tool):
                 missing.append(f"{tool} not found on PATH")
-        # TODO: add ROMEO to PATH (document in wiki) so _find_romeo()
-        # and other users can find it without env vars or globbing
         try:
             _find_romeo()
         except FileNotFoundError as e:

@@ -25,10 +25,11 @@ class BenchmarkContext:
     force_ref: bool = False
     force_ffs: bool = False
     validate_only: bool = False
+    ref_only: bool = False  # run reference tools only; skip FFS and validation
     verbose: bool = True
-    device: str | None = None   # PyTorch device to pass to FFS tools (e.g. "mps", "cpu")
-    show_output: bool = False   # Stream subprocess stdout/stderr when True
-    config: Any = None          # BenchmarkConfig — typed as Any to avoid circular import
+    device: str | None = None  # PyTorch device to pass to FFS tools (e.g. "mps", "cpu")
+    show_output: bool = False  # Stream subprocess stdout/stderr when True
+    config: Any = None  # BenchmarkConfig — typed as Any to avoid circular import
 
     def ffs_device_flag(self) -> str:
         """Return ' -device <device>' for appending to FFS CLI command strings, or ''."""
@@ -221,6 +222,7 @@ def run_timed(
     """
     if verbose:
         print(f"  Running: {label}...")
+        print(f"    Command: {cmd}")
 
     start = time.monotonic()
     result = subprocess.run(
@@ -315,8 +317,10 @@ def _ensure_glmsingle_niftis(ctx: BenchmarkContext) -> None:
     if not mat_file.exists():
         return  # Will be caught by check_prerequisites
 
-    # Find a template NIfTI for the affine
+    # Find a template NIfTI for the affine (prefer ffs, fall back to afni variant)
     template = ctx.processing_dir / "ffs_mni_resampled_task-localizer_run-1.nii.gz"
+    if not template.exists():
+        template = ctx.processing_dir / "afni_mni_resampled_task-localizer_run-1.nii.gz"
     if not template.exists():
         return
 
@@ -347,9 +351,9 @@ def run_stages(
 
     for stage in stages:
         name = stage.name
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Stage: {name}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Auto-export GLMsingle NIfTIs from .mat if needed
         if name.startswith("glmsingle_"):
@@ -383,24 +387,33 @@ def run_stages(
                 result.errors.append(f"Ref: {e}")
                 print(f"  Ref error: {e}")
 
-        # Run FFS (if not validate-only)
-        if not ctx.validate_only and hasattr(stage, "run_ffs"):
+        # In ref_only mode, skip FFS only for stages that have a ref tool to time.
+        # Prep-only stages (run_ffs but no run_ref) must still run in ref_only mode
+        # because they create intermediate files that downstream ref stages depend on.
+        has_ref = hasattr(stage, "run_ref")
+        skip_ffs = ctx.validate_only or (ctx.ref_only and has_ref)
+        if not skip_ffs and hasattr(stage, "run_ffs"):
             try:
                 result.ffs_time = stage.run_ffs(ctx)
             except Exception as e:
                 result.errors.append(f"FFS: {e}")
                 print(f"  FFS error: {e}")
 
-        # Validate
-        try:
-            result.validation = stage.validate(ctx)
-            result.passed = result.validation.get("passed", True)
-            result.summary = result.validation.get("summary", "")
-        except Exception as e:
-            result.passed = False
-            result.errors.append(f"Validation: {e}")
-            result.summary = f"Validation error: {e}"
-            print(f"  Validation error: {e}")
+        # Validate: skip in ref_only mode for stages that have a ref tool
+        # (FFS outputs won't exist). Prep-only stages still validate so we
+        # know the setup succeeded.
+        if not (ctx.ref_only and has_ref):
+            try:
+                result.validation = stage.validate(ctx)
+                result.passed = result.validation.get("passed", True)
+                result.summary = result.validation.get("summary", "")
+            except Exception as e:
+                result.passed = False
+                result.errors.append(f"Validation: {e}")
+                result.summary = f"Validation error: {e}"
+                print(f"  Validation error: {e}")
+        else:
+            result.summary = "ref only"
 
         # Print result
         status = "PASS" if result.passed else "FAIL"
@@ -421,15 +434,8 @@ def run_stages(
     # Append this run to the timing cache (including validate-only runs)
     from .timing_cache import append_run
 
-    stage_results = {
-        r.stage_name: {"passed": r.passed, "summary": r.summary}
-        for r in results
-    }
-    stage_validations = {
-        r.stage_name: r.validation
-        for r in results
-        if r.validation
-    }
+    stage_results = {r.stage_name: {"passed": r.passed, "summary": r.summary} for r in results}
+    stage_validations = {r.stage_name: r.validation for r in results if r.validation}
 
     # Cache if we have any results (timing or validation)
     if stage_timings or stage_results:

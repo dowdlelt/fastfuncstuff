@@ -54,6 +54,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-run everything.",
     )
     parser.add_argument(
+        "-ref-only", action="store_true",
+        help="Run reference tools only (AFNI/melodic/MATLAB). "
+             "Skip FFS and validation. Useful for collecting ref timings "
+             "on machines without GPU support (e.g. Mac).",
+    )
+    parser.add_argument(
         "-json", type=str, default=None, metavar="PATH",
         help="Save results as JSON to this path.",
     )
@@ -67,8 +73,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-download", action="store_true",
-        help="Download ds005165 data from OpenNeuro if not present. "
-             "Requires awscli (aws s3 sync --no-sign-request).",
+        help="Download raw data for all benchmark datasets defined in built-in configs "
+             "(ds005165, ds003427, etc.). Safe to re-run — skips datasets already present. "
+             "Requires awscli (pip install awscli  or  brew install awscli).",
     )
     parser.add_argument(
         "-plot-from-cache", type=str, nargs="*", default=None,
@@ -144,23 +151,19 @@ def main(argv: list[str] | None = None) -> int:
     from ..benchmark.runner import BenchmarkContext, run_stages
     from ..benchmark.stages import get_stages
 
-    # Resolve data directory
+    # Download all datasets first (global setup step)
+    if args.download:
+        _ensure_data()
+
+    # Resolve data directory for this run
     if args.data_dir:
         data_dir = Path(args.data_dir).resolve()
     else:
         data_dir = _find_data_dir()
         if data_dir is None:
-            if args.download:
-                # No existing dir found — use project-root default
-                data_dir = _default_data_dir()
-            else:
-                print("ERROR: Cannot find data directory.")
-                print("Specify with -data-dir or run from the project root.")
-                return 1
-
-    # Download data if requested
-    if args.download:
-        _ensure_data(data_dir)
+            print("ERROR: Cannot find data directory.")
+            print("Specify with -data-dir, or use -download to fetch from OpenNeuro.")
+            return 1
 
     if not data_dir.exists():
         print(f"ERROR: Data directory not found: {data_dir}")
@@ -213,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         force_ref=args.force_ref or force_all,
         force_ffs=args.force_ffs or force_all,
         validate_only=args.validate_only,
+        ref_only=args.ref_only,
         device=args.device,
         show_output=args.verb >= 1,
         config=config,
@@ -225,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dataset: {ctx.dataset_id}  sub-{ctx.subject}/ses-{ctx.session}  {tasks_summary}")
     print(f"Data directory: {data_dir}")
     print(f"Stages: {', '.join(s.name for s in stages)}")
-    print(f"Mode: {'validate-only' if ctx.validate_only else 'full'}")
+    mode = "validate-only" if ctx.validate_only else "ref-only" if ctx.ref_only else "full"
+    print(f"Mode: {mode}")
     if ctx.device:
         print(f"Device: {ctx.device}")
     if ctx.show_output:
@@ -368,42 +373,68 @@ def _plot_from_cache(args) -> int:
     return 0
 
 
-def _ensure_data(data_dir: Path) -> None:
-    """Download ds005165 sub-01/ses-01 data from OpenNeuro if not present."""
+def _ensure_data() -> None:
+    """Download raw data for all datasets defined in built-in configs.
+
+    Iterates every configs/*.yaml that has a ``download.s3_url`` entry and
+    runs ``aws s3 sync`` for each one that is not already present.
+    Manual-only datasets (no s3_url) print their instructions instead.
+    """
     import shutil
     import subprocess
 
-    if not shutil.which("aws"):
-        print("ERROR: awscli not found. Install with: pip install awscli")
-        sys.exit(1)
+    from .._paths import get_benchmark_data_dir
+    from ..benchmark.config import list_builtin_configs, load_config
 
-    data_dir.mkdir(parents=True, exist_ok=True)
+    base = get_benchmark_data_dir()
 
-    # Check if we already have the essential files
-    func_dir = data_dir / "sub-01" / "ses-01" / "func"
-    anat_dir = data_dir / "sub-01" / "ses-01" / "anat"
-    if (
-        func_dir.exists()
-        and anat_dir.exists()
-        and any(func_dir.glob("*.nii"))
-        and any(anat_dir.glob("*.nii"))
-    ):
-        print(f"Data already present: {data_dir}")
+    configs = list_builtin_configs()
+    if not configs:
+        print("No built-in configs found — nothing to download.")
         return
 
-    print(f"Downloading ds005165 sub-01/ses-01 to {data_dir}...")
-    cmd = [
-        "aws", "s3", "sync", "--no-sign-request",
-        "s3://openneuro.org/ds005165", str(data_dir),
-        "--exclude", "*",
-        "--include", "sub-01/ses-01/*",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Download failed:\n{result.stderr[-500:]}")
-        sys.exit(1)
+    for cfg_path in configs:
+        try:
+            cfg = load_config(cfg_path)
+        except Exception as e:
+            print(f"  WARNING: skipping {cfg_path.name}: {e}")
+            continue
 
-    print("Download complete.")
+        dl = cfg.download
+        if dl is None:
+            continue
+
+        data_dir = base / (dl.data_dir_name or f"{cfg.dataset_id}-download")
+
+        if not dl.s3_url:
+            if dl.instructions:
+                print(f"\n[{cfg.dataset_id}] Manual dataset — no auto-download.")
+                print(f"  {dl.instructions}")
+            continue
+
+        # Quick presence check — if the subject directory already exists, skip
+        subj_dir = data_dir / f"sub-{cfg.subject}"
+        if subj_dir.exists() and any(subj_dir.rglob("*.nii*")):
+            print(f"[{cfg.dataset_id}] Data already present: {data_dir}")
+            continue
+
+        if not shutil.which("aws"):
+            print("ERROR: awscli not found. Install with:  pip install awscli  or  brew install awscli")
+            sys.exit(1)
+
+        data_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[{cfg.dataset_id}] Downloading to {data_dir} ...")
+
+        cmd = ["aws", "s3", "sync", "--no-sign-request", dl.s3_url, str(data_dir),
+               "--exclude", "*"]
+        for pattern in dl.include:
+            cmd += ["--include", pattern]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  Download failed:\n{result.stderr[-500:]}")
+            sys.exit(1)
+        print(f"  Done.")
 
 
 if __name__ == "__main__":

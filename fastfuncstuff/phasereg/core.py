@@ -49,9 +49,30 @@ class PhaseRegResult:
     phi : Tensor (n_voxels,)
         Variance ratio used for Deming regression.
     r2_phase : Tensor (n_voxels,)
-        Fraction of magnitude variance explained by phase.
+        Fraction of magnitude variance explained by phase (ODR-shrinkage metric,
+        matches phaseprep / Stanley 2021).
+    r2_naive : Tensor (n_voxels,) or None
+        Naive R²: ``1 - SS_res(observed) / SS_tot`` without ODR shrinkage.
+        Highlights voxels where phase regression had the largest raw effect
+        (useful for QC/visualisation).  None unless r2_mode='naive' or 'both'.
     voxel_mask : Tensor (n_voxels,), bool
         True for voxels where regression was attempted.
+    mag_detrended : Tensor (n_voxels, n_timepoints) or None
+        Magnitude after polynomial (+ nuisance) detrending.  None unless
+        save_intermediates=True.
+    pha_detrended : Tensor (n_voxels, n_timepoints) or None
+        Phase after polynomial (+ nuisance) detrending.  None unless
+        save_intermediates=True.
+    pha_detrended_filt : Tensor (n_voxels, n_timepoints) or None
+        Phase after detrending and optional SGF filtering (the series used for
+        slope estimation and correction).  None unless save_intermediates=True.
+    mag_residual : Tensor (n_voxels, n_timepoints) or None
+        Magnitude after polynomial + task removal (used for slope fit).
+        Identical to mag_detrended when task_removal='none'.  None unless
+        save_intermediates=True.
+    pha_residual_filt : Tensor (n_voxels, n_timepoints) or None
+        Phase after polynomial + task removal + SGF (used for phi estimation
+        and slope fit).  None unless save_intermediates=True.
     """
 
     magnitude_corrected: torch.Tensor
@@ -60,7 +81,13 @@ class PhaseRegResult:
     intercept: torch.Tensor
     phi: torch.Tensor
     r2_phase: torch.Tensor
+    r2_naive: torch.Tensor | None
     voxel_mask: torch.Tensor
+    mag_detrended: torch.Tensor | None = None
+    pha_detrended: torch.Tensor | None = None
+    pha_detrended_filt: torch.Tensor | None = None
+    mag_residual: torch.Tensor | None = None
+    pha_residual_filt: torch.Tensor | None = None
 
 
 def _project_out(data: torch.Tensor, design: torch.Tensor) -> torch.Tensor:
@@ -256,6 +283,8 @@ def phase_regress(
     device: str | torch.device = "cpu",
     chunk_size: int = 50000,
     verbose: bool = False,
+    r2_mode: str = "odr",
+    save_intermediates: bool = False,
 ) -> PhaseRegResult:
     """Phase regression to suppress macrovascular BOLD contamination.
 
@@ -321,6 +350,16 @@ def phase_regress(
         Number of voxels per processing chunk.
     verbose : bool
         Print progress information.
+    r2_mode : {"odr", "naive", "both"}
+        Which R² metric(s) to compute.  "odr" (default) is the ODR-shrinkage
+        R² that matches phaseprep/Stanley and is the canonical metric.
+        "naive" computes ``1 - SS_res(observed) / SS_tot`` without shrinkage,
+        which highlights voxels with the largest raw phase-regression effect
+        and is useful for QC/visualisation.  "both" returns both.
+    save_intermediates : bool
+        If True, populate the intermediate-data fields of PhaseRegResult
+        (mag_detrended, pha_detrended, pha_detrended_filt, mag_residual,
+        pha_residual_filt).  Off by default to avoid storing extra 4D arrays.
 
     Returns
     -------
@@ -577,11 +616,28 @@ def phase_regress(
         torch.zeros_like(ss_total),
     )
 
+    # Naive R²: observed residual without ODR shrinkage.  Larger where phase
+    # regression had the greatest raw effect regardless of ill-conditioning —
+    # useful for finding which voxels were most changed, not for reporting.
+    r2_naive: torch.Tensor | None = None
+    if r2_mode in ("naive", "both"):
+        ss_res_naive = (r_obs ** 2).sum(dim=0)
+        r2_naive = torch.where(
+            ss_total > 1e-30,
+            1.0 - ss_res_naive / ss_total,
+            torch.zeros_like(ss_total),
+        )
+
     if verbose:
         r2_good = r2[vox_mask]
         print(f"  R2 (phase, ODR-style): median={r2_good.median().item():.4f}, "
               f"mean={r2_good.mean().item():.4f}, "
               f"max={r2_good.max().item():.4f}")
+        if r2_naive is not None:
+            r2n_good = r2_naive[vox_mask]
+            print(f"  R2 (naive, no shrinkage): median={r2n_good.median().item():.4f}, "
+                  f"mean={r2n_good.mean().item():.4f}, "
+                  f"max={r2n_good.max().item():.4f}")
         infl_good = inflation[vox_mask]
         print(f"  ODR inflation (1 + A²/φ): median={infl_good.median().item():.3f}, "
               f"max={infl_good.max().item():.3f}, "
@@ -629,7 +685,14 @@ def phase_regress(
         mag_corrected = mag_orig_mean.unsqueeze(0) + eps
         macro_detrended = mag_orig_per_voxel - mag_corrected
 
-    # ── 11. Transpose back to (n_voxels, n_timepoints) ───────────────────
+    # ── 11. Collect optional intermediates ────────────────────────────────
+    interm_mag_dt = mag_detrended.T if save_intermediates else None
+    interm_pha_dt = pha_detrended.T if save_intermediates else None
+    interm_pha_dt_filt = pha_detrended_filt.T if save_intermediates else None
+    interm_mag_res = mag_residual.T if save_intermediates else None
+    interm_pha_res_filt = pha_residual_filt.T if save_intermediates else None
+
+    # ── 12. Transpose back to (n_voxels, n_timepoints) ───────────────────
     return PhaseRegResult(
         magnitude_corrected=mag_corrected.T,
         macrovascular_component=macro_detrended.T,
@@ -637,5 +700,11 @@ def phase_regress(
         intercept=intercept_all,
         phi=phi_tensor,
         r2_phase=r2,
+        r2_naive=r2_naive,
         voxel_mask=vox_mask,
+        mag_detrended=interm_mag_dt,
+        pha_detrended=interm_pha_dt,
+        pha_detrended_filt=interm_pha_dt_filt,
+        mag_residual=interm_mag_res,
+        pha_residual_filt=interm_pha_res_filt,
     )

@@ -63,8 +63,16 @@ OUTPUTS
   prefix_macro.nii.gz       what was subtracted (4D)
   prefix_slope.nii.gz       per-voxel A (3D, raw Deming slope)
   prefix_phi.nii.gz         per-voxel variance ratio used (3D)
-  prefix_r2.nii.gz          ODR-style R² matching phaseprep (3D)
+  prefix_r2.nii.gz          ODR-style R² matching phaseprep (3D) [-r2_mode odr|both]
+  prefix_r2_naive.nii.gz    naive R² (voxels most affected) (3D) [-r2_mode naive|both]
   prefix_mask.nii.gz        analysis mask (3D)
+
+  Intermediates (written with -save_intermediates):
+  prefix_mag_dt.nii.gz      magnitude after poly detrending (4D)
+  prefix_pha_dt.nii.gz      phase after poly detrending (4D)
+  prefix_pha_dt_filt.nii.gz phase after poly detrending + SGF filter (4D)
+  prefix_mag_res.nii.gz     magnitude after poly + task removal (4D)
+  prefix_pha_res_filt.nii.gz phase after poly + task removal + SGF (4D)
 
 References
 ----------
@@ -294,6 +302,28 @@ def create_parser() -> argparse.ArgumentParser:
 
     # ── Output ───────────────────────────────────────────────────────────
     out = parser.add_argument_group("Output Options")
+    out.add_argument(
+        "-r2_mode", choices=["odr", "naive", "both"], default="odr",
+        help="Which R² map(s) to write. 'odr' (default): ODR-shrinkage R² "
+             "matching phaseprep / Stanley 2021 — the canonical metric. "
+             "'naive': 1 - SS_res(observed) / SS_tot without shrinkage — "
+             "highlights voxels with the largest raw phase-regression effect, "
+             "useful for spotting which voxels were most changed even when "
+             "ODR inflation makes the canonical R² appear small. "
+             "'both': write prefix_r2.nii.gz (ODR) and prefix_r2_naive.nii.gz.",
+    )
+    out.add_argument(
+        "-save_intermediates", action="store_true",
+        help="Write intermediate time-series volumes for step-by-step inspection: "
+             "prefix_mag_dt (poly-detrended magnitude), "
+             "prefix_pha_dt (poly-detrended phase), "
+             "prefix_pha_dt_filt (detrended + SGF-filtered phase, differs from "
+             "prefix_pha_dt only when -phase_filter sgf|explore is active), "
+             "prefix_mag_res (magnitude after poly + task removal, used for "
+             "slope estimation), and "
+             "prefix_pha_res_filt (phase after poly + task + SGF, used for phi "
+             "estimation and slope estimation).",
+    )
     add_verbose_arg(out, default=0)
 
     return parser
@@ -584,6 +614,8 @@ def main(argv: list[str] | None = None) -> int:
         keep_drift=args.keep_drift,
         device=str(device),
         verbose=args.verb >= 1,
+        r2_mode=args.r2_mode,
+        save_intermediates=args.save_intermediates,
     )
 
     # ── Save outputs ─────────────────────────────────────────────────────
@@ -623,9 +655,15 @@ def main(argv: list[str] | None = None) -> int:
     save_nifti(_to_volume(result.slope.numpy()), fname, reference_img=ref_img_path)
     outputs["slope"] = fname
 
-    fname = f"{args.prefix}_r2{nii_ext}"
-    save_nifti(_to_volume(result.r2_phase.numpy()), fname, reference_img=ref_img_path)
-    outputs["r2"] = fname
+    if args.r2_mode in ("odr", "both"):
+        fname = f"{args.prefix}_r2{nii_ext}"
+        save_nifti(_to_volume(result.r2_phase.numpy()), fname, reference_img=ref_img_path)
+        outputs["r2"] = fname
+
+    if args.r2_mode in ("naive", "both") and result.r2_naive is not None:
+        fname = f"{args.prefix}_r2_naive{nii_ext}"
+        save_nifti(_to_volume(result.r2_naive.numpy()), fname, reference_img=ref_img_path)
+        outputs["r2_naive"] = fname
 
     fname = f"{args.prefix}_phi{nii_ext}"
     save_nifti(_to_volume(result.phi.numpy()), fname, reference_img=ref_img_path)
@@ -634,6 +672,23 @@ def main(argv: list[str] | None = None) -> int:
     fname = f"{args.prefix}_mask{nii_ext}"
     save_nifti(_to_volume(result.voxel_mask.numpy().astype(np.float32)), fname, reference_img=ref_img_path)
     outputs["mask"] = fname
+
+    if args.save_intermediates:
+        interm_specs = [
+            ("mag_dt",       result.mag_detrended,      True,  "poly-detrended magnitude"),
+            ("pha_dt",       result.pha_detrended,       True,  "poly-detrended phase"),
+            ("pha_dt_filt",  result.pha_detrended_filt,  True,  "detrended + filtered phase"),
+            ("mag_res",      result.mag_residual,        True,  "magnitude task-residual"),
+            ("pha_res_filt", result.pha_residual_filt,   True,  "phase task-residual + filtered"),
+        ]
+        for key, data, is_4d, label in interm_specs:
+            if data is None:
+                continue
+            fname = f"{args.prefix}_{key}{nii_ext}"
+            save_nifti(_to_volume(data.numpy(), is_4d=is_4d), fname, reference_img=ref_img_path)
+            outputs[key] = fname
+            if args.verb >= 1:
+                print(f"  {key} ({label}): {fname}")
 
     if args.verb >= 1:
         for name, path in outputs.items():

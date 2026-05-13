@@ -22,6 +22,12 @@ dataset_id: ds003427
 subject: "03"
 session: "01"
 
+download:
+  data_dir_name: ds003427-download
+  s3_url: s3://openneuro.org/ds003427
+  include:
+    - "*sub-03_task-checkerboard_acq-ge_run-01_*.nii.gz"
+
 tasks:
   checkerboard:
     runs: [1]

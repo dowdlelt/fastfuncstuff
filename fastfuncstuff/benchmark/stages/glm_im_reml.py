@@ -99,8 +99,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
             src = _scaled_input(ctx, run)
             if not src.exists():
                 missing.append(str(src))
-        if not _automask_path(ctx).exists():
-            missing.append(str(_automask_path(ctx)))
+        # MNI_automask.nii.gz is only needed by run_ffs; created on demand there.
     return missing
 
 
@@ -123,6 +122,15 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_reml REML using the IM design matrix."""
     ffs = _ffs_dir(ctx)
     ffs.mkdir(parents=True, exist_ok=True)
+
+    # Ensure mask exists (may not if glm_im ran ref-only on this machine)
+    mask_path = _automask_path(ctx)
+    if not mask_path.exists():
+        run_timed(
+            f"3dAutomask -overwrite -prefix {mask_path} {_scaled_input(ctx, 1)}",
+            label="3dAutomask MNI (glm_im_reml)",
+            cwd=ctx.processing_dir,
+        )
 
     if _ffs_bucket(ctx).exists() and not ctx.force_ffs:
         return 0.0

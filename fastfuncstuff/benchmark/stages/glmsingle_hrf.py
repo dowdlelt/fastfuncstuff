@@ -44,12 +44,14 @@ def _stim_labels(ctx: BenchmarkContext) -> list[str]:
 
 
 def _input_files(ctx: BenchmarkContext) -> list[Path]:
-    """MNI-space resampled runs."""
+    """MNI-space resampled runs: prefer ffs_mni_resampled_*, fall back to afni_mni_resampled_*."""
     task = _primary_task(ctx)
-    return [
-        ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
-        for r in _runs(ctx)
-    ]
+    result = []
+    for r in _runs(ctx):
+        ffs = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
+        afni = ctx.processing_dir / f"afni_mni_resampled_task-{task}_run-{r}.nii.gz"
+        result.append(ffs if ffs.exists() else afni)
+    return result
 
 
 def _onset_files(ctx: BenchmarkContext) -> list[Path]:
@@ -72,9 +74,12 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         if not (ffs / "hrfopt_hrf_index.nii.gz").exists():
             missing.append(f"FFS: {ffs / 'hrfopt_hrf_index.nii.gz'}")
     else:
-        for f in _input_files(ctx):
-            if not f.exists():
-                missing.append(str(f))
+        task = _primary_task(ctx)
+        for r in _runs(ctx):
+            ffs = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
+            afni = ctx.processing_dir / f"afni_mni_resampled_task-{task}_run-{r}.nii.gz"
+            if not ffs.exists() and not afni.exists():
+                missing.append(str(ffs))
         for f in _onset_files(ctx):
             if not f.exists():
                 missing.append(str(f))

@@ -1,15 +1,17 @@
 """Prepare MNI-resampled localizer data for GLMsingle stages.
 
-This stage creates the ``ffs_mni_resampled_task-localizer_run-{1..5}.nii.gz``
-files that all GLMsingle stages (matlab, hrf, denoise, ridge) require.
+Creates TR=1.5s slice-time-corrected MNI-warped data for all GLMsingle stages.
 
-Pipeline per run:
-  1. ffs_slicetime with -resample 1.5 (correct + downsample to TR=1.5s)
-  2. ffs_nwarp to MNI space using the same warp chain as the warp stage
+Two variants, both using the same warp chain as the main warp stage:
+  run_ref: ffs_slicetime (CPU) + 3dNwarpApply → afni_mni_resampled_task-*_run-*.nii.gz
+  run_ffs: ffs_slicetime (CPU, shared intermediate) + ffs_nwarp → ffs_mni_resampled_task-*_run-*.nii.gz
 
-These are separate from the main ``ffs_mni_task-*`` warped data because
-GLMsingle uses a different TR (1.5s resampled from 1.75s) to match the
-MATLAB GLMsingle configuration.
+On Linux/CUDA: both run; ffs_nwarp is faster.
+On Mac/ref-only: only run_ref runs; downstream stages fall back to afni_mni_resampled_*.
+
+All downstream stages (glmsingle_matlab, glm_tent, glmsingle_hrf, glmsingle_denoise,
+glmsingle_ridge) prefer ffs_mni_resampled_* when present, else use afni_mni_resampled_*.
+This ensures MATLAB and FFS always run on the same data for a valid comparison.
 """
 
 from __future__ import annotations
@@ -54,6 +56,11 @@ def _output_path(ctx: BenchmarkContext, run: int) -> Path:
     return ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{run}.nii.gz"
 
 
+def _afni_output_path(ctx: BenchmarkContext, run: int) -> Path:
+    task = _primary_task(ctx)
+    return ctx.processing_dir / f"afni_mni_resampled_task-{task}_run-{run}.nii.gz"
+
+
 def _nwarp_chain(ctx: BenchmarkContext, run: int) -> str:
     """Build warp chain for runs (same as warp stage)."""
     p = ctx.processing_dir
@@ -85,9 +92,10 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 
     if ctx.validate_only:
         for r in runs:
-            out = _output_path(ctx, r)
-            if not out.exists():
-                missing.append(str(out))
+            ffs = _output_path(ctx, r)
+            afni = _afni_output_path(ctx, r)
+            if not ffs.exists() and not afni.exists():
+                missing.append(str(ffs))
         return missing
 
     # Need raw inputs + BIDS JSON (for SliceTiming)
@@ -111,8 +119,74 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
+def _ensure_st_resampled(ctx: BenchmarkContext, run: int, force: bool) -> float:
+    """Run ffs_slicetime -resample 1.5 for one run if not already done.
+
+    Both run_ref and run_ffs share this intermediate so slicetime is never
+    duplicated when both paths run on the same machine.
+
+    Always forced to -device cpu: the TR resampling uses float64 FFT-based
+    Sinc interpolation that is numerically safer on CPU regardless of platform.
+    """
+    task = _primary_task(ctx)
+    st = _st_path(ctx, run)
+    if st.exists() and not force:
+        return 0.0
+    tp = ctx.tpattern_file(task, run)
+    elapsed, _ = run_timed(
+        f"ffs_slicetime "
+        f"-input {_input_path(ctx, run)} "
+        f"-tzero 0 -wsinc9 "
+        f"-tpattern {tp} "
+        f"-resample 1.5 "
+        f"-device cpu "
+        f"-prefix {st}",
+        label=f"ffs_slicetime -resample 1.5 {task} run-{run}",
+        cwd=ctx.processing_dir,
+    )
+    return elapsed
+
+
+def run_ref(ctx: BenchmarkContext) -> float:
+    """Warp TR=1.5s slice-time-corrected data to MNI using 3dNwarpApply.
+
+    Produces afni_mni_resampled_task-*_run-*.nii.gz. Uses the shared
+    ffs_st_resampled_* intermediate (created by ffs_slicetime, CPU-only).
+    """
+    total = 0.0
+    subid = f"sub-{ctx.subject}"
+    master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
+
+    for run in _runs(ctx):
+        out = _afni_output_path(ctx, run)
+        if out.exists() and not ctx.force_ref:
+            continue
+
+        total += _ensure_st_resampled(ctx, run, force=ctx.force_ref)
+
+        st = _st_path(ctx, run)
+        nwarp = _nwarp_chain(ctx, run)
+        task = _primary_task(ctx)
+        elapsed, _ = run_timed(
+            f'3dNwarpApply -overwrite '
+            f'-master {master} -dxyz 3.0 -wsinc5 '
+            f'-nwarp "{nwarp}" '
+            f'-source {st} '
+            f'-prefix {out}',
+            label=f"3dNwarpApply resampled {task} run-{run}",
+            cwd=ctx.processing_dir,
+        )
+        total += elapsed
+
+    return total
+
+
 def run_ffs(ctx: BenchmarkContext) -> float:
-    """Run slicetime+resample then warp to MNI for all runs."""
+    """Warp TR=1.5s slice-time-corrected data to MNI using ffs_nwarp.
+
+    Produces ffs_mni_resampled_task-*_run-*.nii.gz. Shares the
+    ffs_st_resampled_* intermediate with run_ref when both run.
+    """
     total = 0.0
     subid = f"sub-{ctx.subject}"
     task = _primary_task(ctx)
@@ -123,29 +197,14 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         if out.exists() and not ctx.force_ffs:
             continue
 
-        # Step 1: slicetime correct + resample to TR=1.5
-        st = _st_path(ctx, run)
-        if not st.exists() or ctx.force_ffs:
-            tp = ctx.tpattern_file(task, run)
-            elapsed, _ = run_timed(
-                f"ffs_slicetime "
-                f"-input {_input_path(ctx, run)} "
-                f"-tzero 0 -wsinc9 "
-                f"-tpattern {tp} "
-                f"-resample 1.5 "
-                f"-prefix {st}",
-                label=f"ffs_slicetime -resample 1.5 {task} run-{run}",
-                cwd=ctx.processing_dir,
-            )
-            total += elapsed
+        total += _ensure_st_resampled(ctx, run, force=ctx.force_ffs)
 
-        # Step 2: warp to MNI
         nwarp = _nwarp_chain(ctx, run)
         elapsed, _ = run_timed(
             f'ffs_nwarp '
             f'-master {master} -dxyz 3.0 -interp wsinc5 '
             f'-nwarp "{nwarp}" '
-            f'-source {st} '
+            f'-source {_st_path(ctx, run)} '
             f'-prefix {out}',
             label=f"ffs_nwarp resampled {task} run-{run}",
             cwd=ctx.processing_dir,
@@ -156,26 +215,32 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 
 def validate(ctx: BenchmarkContext) -> dict:
-    """Check that all resampled MNI files exist and have expected shape."""
+    """Check that at least one variant of resampled MNI files exists per run."""
     runs = _runs(ctx)
-    present = []
-    missing = []
+    ffs_present, afni_present, missing = [], [], []
     for r in runs:
-        out = _output_path(ctx, r)
-        if out.exists():
-            present.append(str(out.name))
+        ffs = _output_path(ctx, r)
+        afni = _afni_output_path(ctx, r)
+        if ffs.exists():
+            ffs_present.append(ffs.name)
+        elif afni.exists():
+            afni_present.append(afni.name)
         else:
-            missing.append(str(out.name))
+            missing.append(ffs.name)
 
     n_runs = len(runs)
+    n_present = len(ffs_present) + len(afni_present)
     passed = len(missing) == 0
-    summary = f"{len(present)}/{n_runs} resampled runs present"
+    summary = f"{n_present}/{n_runs} resampled runs present"
+    if afni_present:
+        summary += f" ({len(afni_present)} afni, {len(ffs_present)} ffs)"
     if missing:
         summary += f", missing: {', '.join(missing)}"
 
     return {
         "passed": passed,
         "summary": summary,
-        "present": present,
+        "ffs_present": ffs_present,
+        "afni_present": afni_present,
         "missing": missing,
     }

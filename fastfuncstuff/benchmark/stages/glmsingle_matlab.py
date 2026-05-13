@@ -63,12 +63,13 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     if not script.exists():
         missing.append(f"MATLAB script: {script}")
 
-    # Need MNI-resampled inputs
+    # Need MNI-resampled inputs (either ffs or afni variant)
     task = _primary_task(ctx)
     for r in _runs(ctx):
-        f = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
-        if not f.exists():
-            missing.append(str(f))
+        ffs_f = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{r}.nii.gz"
+        afni_f = ctx.processing_dir / f"afni_mni_resampled_task-{task}_run-{r}.nii.gz"
+        if not ffs_f.exists() and not afni_f.exists():
+            missing.append(str(ffs_f))
 
     # If validate-only, check that outputs already exist
     if ctx.validate_only:

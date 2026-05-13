@@ -55,9 +55,12 @@ def _ffs_dir(ctx: BenchmarkContext) -> Path:
 
 
 def _resampled_input(ctx: BenchmarkContext, run: int) -> Path:
-    """Unscaled MNI-resampled input (TENT does not need PSC scaling)."""
+    """Unscaled MNI-resampled input: prefer ffs_mni_resampled_*, fall back to afni_mni_resampled_*."""
     task = _primary_task(ctx)
-    return ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{run}.nii.gz"
+    ffs = ctx.processing_dir / f"ffs_mni_resampled_task-{task}_run-{run}.nii.gz"
+    if ffs.exists():
+        return ffs
+    return ctx.processing_dir / f"afni_mni_resampled_task-{task}_run-{run}.nii.gz"
 
 
 def _automask_path(ctx: BenchmarkContext) -> Path:
