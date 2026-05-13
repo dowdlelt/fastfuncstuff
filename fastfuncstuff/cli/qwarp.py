@@ -223,6 +223,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "the head rotates, distortion projects onto other axes. "
                              "E.g. with -noXdis -noZdis (PE along Y/AP), a pitch rotation "
                              "projects some distortion onto Z. Requires timeseries mode")
+    g_disp.add_argument("-affine", type=str, default=None, metavar="MAT.aff12.1D",
+                        help="Single affine matrix (12 or 16 numbers, row-major) that "
+                             "aligns source to base — e.g. output of "
+                             "'3dAllineate -1Dmatrix_save' or '3dvolreg -1Dmatrix_save'. "
+                             "Same purpose as -motparams but for a single static rotation: "
+                             "with -noXdis/-noYdis/-noZdis defining the PE direction, the "
+                             "rotation component is extracted (polar decomposition) and "
+                             "used to project distortion onto each axis. Useful in "
+                             "standard (non-timeseries) mode after rigid pre-alignment. "
+                             "Mutually exclusive with -motparams")
+    g_disp.add_argument("-invert_affine", action="store_true",
+                        help="Treat the -affine matrix as base->source (i.e. estimated "
+                             "head motion rather than the correction). The rotation is "
+                             "inverted before projection. Use this if your matrix maps "
+                             "the base into the source frame")
 
     # ── Cost Function ───────────────────────────────────────────────────
     g_cost = p.add_argument_group(
@@ -425,6 +440,83 @@ def _rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> list[
         return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
 
     return matmul(matmul(rz, rx), ry)
+
+
+def _load_affine_rotation(filepath: str, invert: bool = False) -> list[list[float]]:
+    """Load an affine matrix from a .1D / .aff12.1D file and return its rotation.
+
+    Accepts whitespace-separated numbers (comments with '#' ignored). Uses the
+    first 12 (row-major 3x4) or 16 (row-major 4x4) numbers found; falls back
+    to a 3x3 form if exactly 9 are provided. The rotation component of the 3x3
+    linear part is extracted by polar decomposition (R = U @ V^T from SVD,
+    with sign correction to enforce det=+1).
+
+    Args:
+        filepath: Path to text file with the matrix.
+        invert: If True, return R^T (i.e. treat the input as the inverse
+            direction of what we want — e.g. estimated motion rather than
+            applied correction).
+
+    Returns:
+        3x3 rotation matrix as a nested list.
+    """
+    import numpy as np
+
+    vals: list[float] = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for tok in line.split():
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    continue
+            # Stop reading once we have enough; first matrix in the file wins
+            if len(vals) >= 16:
+                break
+
+    if len(vals) >= 16:
+        m = np.array(vals[:16], dtype=np.float64).reshape(4, 4)
+        linear = m[:3, :3]
+    elif len(vals) >= 12:
+        m = np.array(vals[:12], dtype=np.float64).reshape(3, 4)
+        linear = m[:3, :3]
+    elif len(vals) >= 9:
+        linear = np.array(vals[:9], dtype=np.float64).reshape(3, 3)
+    else:
+        raise ValueError(
+            f"Affine file {filepath} has only {len(vals)} numbers; "
+            f"expected 9 (3x3), 12 (3x4), or 16 (4x4)"
+        )
+
+    # Polar decomposition: drop scale/shear, keep rotation.
+    U, _, Vt = np.linalg.svd(linear)
+    R = U @ Vt
+    # Enforce det=+1 (proper rotation, no reflection)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = U @ Vt
+
+    if invert:
+        R = R.T
+
+    return [[float(R[i, j]) for j in range(3)] for i in range(3)]
+
+
+def _compute_axis_weights_from_rotation(
+    R: list[list[float]], pe_dir: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Project the PE direction through rotation R; return |components|.
+
+    Identical math to _compute_axis_weights_from_motion but with the
+    rotation supplied directly (e.g. extracted from an affine).
+    """
+    rx = sum(R[0][j] * pe_dir[j] for j in range(3))
+    ry = sum(R[1][j] * pe_dir[j] for j in range(3))
+    rz = sum(R[2][j] * pe_dir[j] for j in range(3))
+    return (abs(rx), abs(ry), abs(rz))
 
 
 def _compute_axis_weights_from_motion(
@@ -878,6 +970,9 @@ def main(argv: list[str] | None = None) -> int:
     # Load motion parameters for dynamic axis weighting
     motion_params = None
     pe_direction = None
+    if args.motparams is not None and args.affine is not None:
+        print("ERROR: -motparams and -affine are mutually exclusive")
+        return 1
     if args.motparams is not None:
         if not timeseries_mode:
             print("ERROR: -motparams requires timeseries mode (omit -source)")
@@ -899,6 +994,31 @@ def main(argv: list[str] | None = None) -> int:
                   f"{len(motion_params)} motion parameter rows")
         # When using motparams, clear warp_flags -- axis_weights will do the work
         config = replace(config, warp_flags=0)
+
+    # Single-affine static axis projection (works in both modes)
+    if args.affine is not None:
+        pe_direction = _pe_direction_from_flags(args.noXdis, args.noYdis, args.noZdis)
+        if sum(pe_direction) < 0.5:
+            print("ERROR: -affine requires -noXdis/-noYdis/-noZdis to define PE direction")
+            return 1
+        R = _load_affine_rotation(args.affine, invert=args.invert_affine)
+        aw = _compute_axis_weights_from_rotation(R, pe_direction)
+        # Merge with any user-supplied -axweight (multiplicative)
+        merged = tuple(max(0.0, min(1.0, a * b)) for a, b in zip(aw, axis_weights, strict=True))
+        if args.verb >= 1:
+            pe_labels = []
+            if pe_direction[0] > 0.5:
+                pe_labels.append("X(RL)")
+            if pe_direction[1] > 0.5:
+                pe_labels.append("Y(AP)")
+            if pe_direction[2] > 0.5:
+                pe_labels.append("Z(IS)")
+            dir_str = "base->source (inverted)" if args.invert_affine else "source->base"
+            print(f"Affine-projected distortion: PE along {'+'.join(pe_labels)}, "
+                  f"matrix direction={dir_str}, "
+                  f"axis_weights=[{merged[0]:.3f},{merged[1]:.3f},{merged[2]:.3f}]")
+        # Clear warp_flags -- axis_weights now carry the PE info
+        config = replace(config, warp_flags=0, axis_weights=merged)
 
     # Load or compute weight
     weight = None
