@@ -1,6 +1,7 @@
 # fastfuncstuff (ffs)
 
 A small collection of fMRI analysis tools reimplemented in PyTorch, with a GPU-first bias.
+TODO: This agent created readme is garbage - sorry, but I wanted to get something to start. its th first thing to fix.
 
 ## Why this exists
 
