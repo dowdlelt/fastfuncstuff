@@ -180,6 +180,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="Disable internal zero-padding of images. Padding adds ~12%% "
                             "border to allow warps near edges. Disabling saves memory but "
                             "may cause edge artifacts")
+    g_reg.add_argument("-save_intermediates", action="store_true",
+                       help="After each refinement level, save the running warp field and "
+                            "warped source image to {prefix}_levels/. Files are labelled "
+                            "_lev00, _lev01, ... so you can inspect how the warp grows "
+                            "level by level (useful to spot over-warping or where to cut "
+                            "with -maxlev). In timeseries mode, only the FIRST volume's "
+                            "intermediates are saved (the loop would otherwise produce "
+                            "one set per volume — a lot of files)")
 
     # ── Basis Functions ─────────────────────────────────────────────────
     g_basis = p.add_argument_group(
@@ -544,6 +552,45 @@ def _compute_axis_weights_from_motion(
     rz = sum(R[2][j] * pe_dir[j] for j in range(3))
 
     return (abs(rx), abs(ry), abs(rz))
+
+
+def _make_level_callback(
+    levels_dir: str,
+    basename: str,
+    base_info: dict,
+    padding: tuple[int, int, int] | None,
+    nx: int, ny: int, nz: int,
+):
+    """Build a level callback that writes per-level warp + warped image."""
+    from fastfuncstuff.processing.io import save_image, save_warp_field
+
+    os.makedirs(levels_dir, exist_ok=True)
+    pad_x, pad_y, pad_z = padding if padding is not None else (0, 0, 0)
+
+    def callback(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
+        lev_tag = f"lev{level:02d}"
+        xd_cpu = xd.detach().cpu()
+        yd_cpu = yd.detach().cpu()
+        zd_cpu = zd.detach().cpu()
+        save_warp_field(
+            xd_cpu, yd_cpu, zd_cpu,
+            os.path.join(levels_dir, f"{basename}_WARP_{lev_tag}.nii.gz"),
+            header_info=base_info,
+            padding=padding,
+            units="mm",
+        )
+        warped_full = warped.detach().cpu()
+        if pad_x or pad_y or pad_z:
+            warped_cropped = warped_full[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx]
+        else:
+            warped_cropped = warped_full
+        save_image(
+            warped_cropped,
+            os.path.join(levels_dir, f"{basename}_{lev_tag}.nii.gz"),
+            header_info=base_info,
+        )
+
+    return callback
 
 
 def _build_timeseries_base(
@@ -1068,6 +1115,22 @@ def main(argv: list[str] | None = None) -> int:
         warp_padding = None
         pad_x, pad_y, pad_z = 0, 0, 0
 
+    # Intermediate-warp callback (per-level dump). In timeseries mode, only
+    # the first volume gets the callback (warned below) — otherwise the
+    # _levels/ dir would balloon to one set per volume.
+    level_cb = None
+    if args.save_intermediates:
+        levels_dir = f"{prefix}_levels"
+        warp_basename_for_lev = os.path.basename(prefix)
+        level_cb = _make_level_callback(
+            levels_dir, warp_basename_for_lev, base_info, warp_padding,
+            nx, ny, nz,
+        )
+        if args.verb >= 1:
+            print(f"Saving per-level intermediates to: {levels_dir}/")
+            if timeseries_mode:
+                print("  NOTE: timeseries mode — only volume 0 will dump intermediates")
+
     # --- Process volumes ---
     # Enable TF32 matmul precision on Ampere+ GPUs (free perf, ~1e-5 precision)
     if device.type == "cuda":
@@ -1151,6 +1214,9 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  Motion-projected weights: "
                               f"X={aw[0]:.4f} Y={aw[1]:.4f} Z={aw[2]:.4f} "
                               f"(roll={roll:.2f} pitch={pitch:.2f} yaw={yaw:.2f})")
+            # First volume only: attach per-level intermediate callback
+            if level_cb is not None and i == 0:
+                vol_overrides["level_callback"] = level_cb
             if vol_overrides:
                 vol_config = replace(config, **vol_overrides)
 
@@ -1338,10 +1404,17 @@ def main(argv: list[str] | None = None) -> int:
             src_gpu = src_vol.float().to(device)
             w_gpu = weight.float().to(device) if weight is not None else None
 
+            # Attach intermediate-save callback only on first timepoint
+            t_config = config
+            if level_cb is not None and t == 0:
+                t_config = replace(config, level_callback=level_cb)
+                if nt > 1 and args.verb >= 1:
+                    print("  (saving intermediates for this timepoint only)")
+
             warped, xd, yd, zd = qwarp(
                 base_gpu, src_gpu, weight=w_gpu,
                 initial_warp=initial_warp,
-                config=config, device=device, pad=use_pad,
+                config=t_config, device=device, pad=use_pad,
             )
 
             all_warped.append(warped.cpu())

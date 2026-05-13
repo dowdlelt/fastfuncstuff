@@ -158,6 +158,13 @@ class QwarpConfig:
     """Use torch.compile for building-block functions (CUDA only).
     Requires warmup on first volume; may not help for small patches."""
 
+    level_callback: Callable[..., None] | None = None
+    """Optional callback fired after each level completes. Signature:
+    ``cb(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped_source: Tensor)``.
+    Tensors are on the padded grid in whatever device the warp ran on; the
+    callee is responsible for cropping and moving to CPU if needed. Used to
+    save per-level intermediate warps and warped images."""
+
 
 @dataclass
 class WarpState:
@@ -574,6 +581,9 @@ def _warpomatic(
             else:
                 print(f" done [cost:{first_cost:.5f}==>{state.cost:.5f}] ({elapsed:.1f}s)")
 
+        if config.level_callback is not None:
+            config.level_callback(0, state.xd, state.yd, state.zd, state.warped_source)
+
     # --- Levels 1..N: progressively smaller patches (batched GPU) ---
     xwid0 = ittt - ibbb + 1
     ywid0 = jttt - jbbb + 1
@@ -817,6 +827,9 @@ def _warpomatic(
                     f" {state.patches_done} done, {state.patches_skipped} skip]"
                     f" ({elapsed:.1f}s)"
                 )
+
+        if config.level_callback is not None:
+            config.level_callback(lev, state.xd, state.yd, state.zd, state.warped_source)
 
         # Early stopping: if this level barely improved cost, skip finer levels
         if config.level_stop_tol > 0 and cost_at_start < 0:
