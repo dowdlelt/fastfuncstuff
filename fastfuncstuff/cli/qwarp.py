@@ -250,11 +250,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="LPA neighborhood kernel: gauss=Gaussian weighting "
                              "(default), box=uniform weighting (like AFNI's "
                              "space-filling blocks)")
-    g_cost.add_argument("-penfac", type=float, default=0.001, metavar="FACTOR",
-                        help="Warp distortion penalty factor (Jacobian-based). Prevents "
-                             "excessive warp folding. Our Adam optimizer amplifies penalty "
-                             "gradients vs AFNI's NEWUOA, so this is much lower than AFNI's "
-                             "default of 0.033 [default: %(default)s]")
+    g_cost.add_argument("-penfac", type=float, default=0.033, metavar="FACTOR",
+                        help="Warp distortion penalty factor (Jacobian-energy based). "
+                             "Prevents excessive warp folding / high-frequency rippling. "
+                             "Matches AFNI's Hpen_fbase default. Lower values (~0.001) "
+                             "produce more visibly warped outputs [default: %(default)s]")
+    g_cost.add_argument("-penalty_first_level", type=int, default=3, metavar="N",
+                        help="Refinement level at which the warp penalty turns on; "
+                             "levels below N run unpenalized. AFNI uses 3. Increasing "
+                             "this lets coarse levels deform more freely before "
+                             "regularization engages [default: %(default)s]")
 
     # ── Smoothing ───────────────────────────────────────────────────────
     g_blur = p.add_argument_group(
@@ -309,11 +314,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "than TOL fraction, skip all finer levels. E.g. -level_stop 0.0001 "
                             "stops when improvement drops below 0.01%% of current cost. "
                             "0 = disabled [default: %(default)s]")
-    g_opt.add_argument("-hfactor_q", type=float, default=1.0, metavar="Q",
-                       help="Hfactor parameter scaling for large patches. Controls how "
-                            "much to reduce max displacement for patches larger than "
-                            "minpatch. 1.0 = no scaling (AFNI default), 0.5 = moderate "
-                            "reduction. Range: 0.1-1.0 [default: %(default)s]")
+    g_opt.add_argument("-hfactor_q", type=float, default=0.5, metavar="Q",
+                       help="AFNI-style Hfactor scaling on per-patch displacement bound. "
+                            "At the lev=1 (coarsest) patch size hfactor=1.0; at finer "
+                            "patches it shrinks toward Q, tightening param_max. This "
+                            "is AFNI's primary defense against fine-scale rippling. "
+                            "1.0 disables the mechanism. Range: 0.1-1.0 "
+                            "[default: %(default)s]")
 
     # ── GPU / Hardware ──────────────────────────────────────────────────
     g_hw = p.add_argument_group(
@@ -847,6 +854,7 @@ def main(argv: list[str] | None = None) -> int:
         workhard=tuple(args.workhard) if args.workhard else (0, -1),
         cost_method="lpa" if args.lpa else ("pearson" if args.pear else "pearclp"),
         penalty_factor=args.penfac,
+        penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,
         axis_weights=axis_weights,
         verb=args.verb,
