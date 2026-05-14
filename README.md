@@ -1,7 +1,8 @@
 # fastfuncstuff (ffs)
 
 A small collection of fMRI analysis tools reimplemented in PyTorch, with a GPU-first bias.
-TODO: This agent created readme is garbage - sorry, but I wanted to get something to start. its th first thing to fix.
+That said - there has been work to speed up the cpu branches - and in some cases they might be faster. 
+For Mac, use of cpu is recommended. CUDA is preferred, where possible. 
 
 ## Why this exists
 
@@ -55,6 +56,8 @@ pip install -e .
 Add `".[dev]"` instead of `.` for tests + linters.
 
 ### PyTorch and the GPU
+*note* Mac should use -device cpu where possible, MPS is flakey. 
+The CPU paths for most tools are also quite fast, and get attention.
 
 The default `pip install torch` gives you whatever wheel pip resolves for
 your platform — usually CPU on Linux, MPS on Apple Silicon. If you want
