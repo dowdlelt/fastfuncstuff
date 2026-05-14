@@ -13,6 +13,16 @@ description = "GLM/REML (3dDeconvolve + 3dREMLfit vs ffs_reml)"
 THRESHOLDS = {
     "ols_beta_min_r": 0.99,
     "reml_beta_min_r": 0.95,
+    # Of the 4 -Rvar subbriks (a, b, lambda, stdev), lambda is the
+    # effective single-AR(1) prewhitening parameter — it's what the GLM
+    # actually applies, and it's the meaningful parity target. The raw
+    # a / b labels alone aren't scientifically meaningful: many (a, b)
+    # pairs sit on a flat λ-ridge and AFNI's serial summation vs our
+    # batched BLAS summation pick different ridge points that produce
+    # the same λ. stdev (noise std) is independently meaningful and
+    # always matches at ~1.0 when prewhitening matches.
+    "reml_lambda_min_r": 0.90,
+    "reml_stdev_min_r": 0.95,
 }
 
 _DEFAULT_STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
@@ -245,21 +255,28 @@ def validate(ctx: BenchmarkContext) -> dict:
         ffs / f"stats_{task}_REML_var.nii.gz",
     )
 
-    passed = (
-        ols_result["min_r"] >= THRESHOLDS["ols_beta_min_r"]
-        and reml_result["min_r"] >= THRESHOLDS["reml_beta_min_r"]
-    )
-
     # Rvar's 4 subbriks are written by ffs_reml as: a, b, lambda, StDev
     # (see -Rvar handler in cli/reml.py). Surface each so we can see which
-    # parameter is the parity offender.
+    # parameter is the parity offender — but only gate PASS/FAIL on
+    # lambda + stdev, since a / b individually live on a flat λ-ridge
+    # where batched vs serial summation picks different valid optima
+    # that produce the same effective prewhitening.
     _var_names = ("a", "b", "lambda", "stdev")
     per_brick = var_result.get("per_brick", [])
+    by_name = {}
     for entry, name in zip(per_brick, _var_names):
         entry["name"] = name
+        by_name[name] = entry["r"]
     var_per = " ".join(
         f"{name}={entry['r']:.3f}"
         for entry, name in zip(per_brick, _var_names)
+    )
+
+    passed = (
+        ols_result["min_r"] >= THRESHOLDS["ols_beta_min_r"]
+        and reml_result["min_r"] >= THRESHOLDS["reml_beta_min_r"]
+        and by_name.get("lambda", 0.0) >= THRESHOLDS["reml_lambda_min_r"]
+        and by_name.get("stdev", 0.0) >= THRESHOLDS["reml_stdev_min_r"]
     )
 
     return {
