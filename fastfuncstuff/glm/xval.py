@@ -532,6 +532,28 @@ def project_out_nuisance(
 
 
 @torch.inference_mode()
+def _cod_kernel(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    """Pure-tensor coefficient-of-determination kernel.
+
+    Extracted as a standalone function so torch.compile can fuse the four
+    elementwise+reduction passes (residual², mean, total², clamp) into a
+    single kernel. Called inside CV inner loops at ~20k invocations per
+    end-to-end denoise/hrfopt/ridge run; cumulative win is meaningful even
+    if each call is modest.
+    """
+    ss_res = ((y_true - y_pred) ** 2).sum(dim=1)
+    y_mean = y_true.mean(dim=1, keepdim=True)
+    ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
+    r2 = 1.0 - (ss_res / (ss_tot + 1e-10))
+    return torch.clamp(r2, max=1.0)
+
+
+try:
+    _cod_kernel_compiled = torch.compile(_cod_kernel, dynamic=True, fullgraph=True)
+except Exception:
+    _cod_kernel_compiled = _cod_kernel
+
+
 def compute_r2_metric(
     y_true: torch.Tensor,
     y_pred: torch.Tensor,
@@ -588,14 +610,11 @@ def compute_r2_metric(
         return r2.float()
 
     elif metric == "cod":
-        # Coefficient of determination: R² = 1 - SS_res/SS_tot
-        ss_res = ((y_true - y_pred) ** 2).sum(dim=1)
-        y_mean = y_true.mean(dim=1, keepdim=True)
-        ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
-        r2 = 1.0 - (ss_res / (ss_tot + 1e-10))
-        # Clamp max to 1.0 (values > 1 indicate numerical issues, e.g. zero variance)
-        # Note: R² CAN be negative (model worse than mean) - that's valid information
-        r2 = torch.clamp(r2, max=1.0)
+        # Coefficient of determination: R² = 1 - SS_res/SS_tot. Fused via
+        # torch.compile in _cod_kernel_compiled so the four element-wise
+        # passes (residual², mean, total², clamp) become a single kernel.
+        # R² can be negative (model worse than mean) — valid information.
+        r2 = _cod_kernel_compiled(y_true, y_pred)
 
     elif metric == "corr":
         # Pearson correlation coefficient
