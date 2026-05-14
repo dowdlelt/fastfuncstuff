@@ -385,6 +385,7 @@ def analyze_from_design_matrix(
     use_double: bool = False,
     debug_memory: bool = False,
     enable_quick_estimate: bool = False,
+    force_exhaustive_search: bool = False,
     use_grid_batching: bool | None = None,
     want_r2_partial: bool = False,
     r2_partial_mode: str = "full",  # "full" or "task" - how to compute partial R²
@@ -1032,6 +1033,7 @@ def analyze_from_design_matrix(
             use_double=use_double,
             debug_memory=debug_memory,
             enable_quick_estimate=enable_quick_estimate,
+            force_exhaustive_search=force_exhaustive_search,
             use_grid_batching=use_grid_batching,
             glt_labels=design_info.get("glt_labels", None),
             glt_matrices=design_info.get("glt_matrices", None),

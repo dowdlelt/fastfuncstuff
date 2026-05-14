@@ -502,6 +502,17 @@ Examples:
             "Use this flag ONLY for exploratory analysis or when speed is critical."
         ),
     )
+    arma_opts.add_argument(
+        "-exhaustive",
+        action="store_true",
+        help=(
+            "Force exhaustive 117-point (a,b) grid search on CPU. Default on "
+            "CPU is AFNI-style hierarchical descent (matches 3dREMLfit, ~3x "
+            "fewer pair evaluations). GPU always uses exhaustive. Required "
+            "when -Rlklhd is set since the likelihood surface needs every "
+            "grid point evaluated."
+        ),
+    )
 
     # Processing options
     proc_opts = parser.add_argument_group("Processing Options")
@@ -1842,6 +1853,7 @@ def main():
             use_double=args.use_double,
             debug_memory=args.debug_memory,
             enable_quick_estimate=args.quick_estimate,
+            force_exhaustive_search=args.exhaustive,
             use_grid_batching=use_grid_batching,
             want_r2_partial=bool(args.rpartial),  # True if flag is set (any mode)
             r2_partial_mode=args.rpartial

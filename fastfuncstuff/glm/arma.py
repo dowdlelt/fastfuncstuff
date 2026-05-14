@@ -1929,6 +1929,176 @@ def search_voxels_precomputed_grid(
     return best_params, best_likelihoods
 
 
+def search_voxels_precomputed_grid_hierarchical(
+    X: torch.Tensor,
+    Y_batch: torch.Tensor,
+    precomputed_grid: dict,
+    device: torch.device,
+    verbose: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched per-voxel hierarchical REML grid search (AFNI parity).
+
+    Implements the same power-of-2 descent as AFNI's REML_find_best_case
+    (remla.c:1398): each voxel starts at (0, 0), then at each level
+    ``dab = 2^lev`` the grid points within ``best ± dab`` are evaluated;
+    after each level the window narrows to ``±dab`` around the voxel's
+    new best. The result is the per-voxel local optimum on the same
+    surface AFNI searches.
+
+    The vectorisation: at each level we evaluate the **union** of all
+    voxels' windows in batched GEMMs over the entire voxel batch, but
+    only update voxels whose own window includes the grid point. This
+    keeps BLAS-3 throughput while preserving per-voxel windowing.
+
+    Parameters
+    ----------
+    X : torch.Tensor, shape (n_timepoints, n_regressors)
+        Design matrix (used only for shape — actual prewhitening uses
+        precomputed L_inv).
+    Y_batch : torch.Tensor, shape (n_voxels_batch, n_timepoints)
+        Voxel timeseries data, voxels-major (matches
+        search_voxels_precomputed_grid's convention).
+    precomputed_grid : dict
+        Same dict shape as precompute_reml_grid produces.
+    device : torch.device
+        Computing device.
+    verbose : bool, default=False
+        Show per-level progress bar.
+
+    Returns
+    -------
+    best_params : torch.Tensor, shape (n_voxels_batch, 2)
+        Optimal (a, b) for each voxel.
+    best_likelihoods : torch.Tensor, shape (n_voxels_batch,)
+        Minimum REML neg-log-likelihood per voxel.
+    """
+    n_voxels_batch = Y_batch.shape[0]
+    n_timepoints, n_regressors = X.shape
+    _dtype = Y_batch.dtype
+
+    if Y_batch.device != device:
+        Y_batch = Y_batch.to(device)
+
+    # Build sorted (a, b) axes from the precomputed dict.
+    param_list = list(precomputed_grid.keys())
+    a_vals_sorted = sorted({a for (a, _) in param_list})
+    b_vals_sorted = sorted({b for (_, b) in param_list})
+    n_a = len(a_vals_sorted)
+    n_b = len(b_vals_sorted)
+
+    # (a_idx, b_idx) -> dict key (with fp-safe lookup)
+    def _key_for(ai: int, bi: int):
+        a_val = a_vals_sorted[ai]
+        b_val = b_vals_sorted[bi]
+        for k in param_list:
+            if abs(k[0] - a_val) < 1e-6 and abs(k[1] - b_val) < 1e-6:
+                return k
+        return None
+
+    # Index of (0, 0) — AFNI's OLS init (always in grid via ensure_zero_in_grid).
+    zero_a_idx = next(i for i, v in enumerate(a_vals_sorted) if abs(v) < 1e-6)
+    zero_b_idx = next(i for i, v in enumerate(b_vals_sorted) if abs(v) < 1e-6)
+
+    # Per-voxel state — best indices and best likelihood so far.
+    best_a_idx = torch.full((n_voxels_batch,), zero_a_idx, dtype=torch.long, device=device)
+    best_b_idx = torch.full((n_voxels_batch,), zero_b_idx, dtype=torch.long, device=device)
+    best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device, dtype=_dtype)
+
+    # Cache of evaluated likelihoods per (ai, bi) so we never recompute
+    # a grid point across levels (matches AFNI's rvab[kk] < BIGVAL skip).
+    evaluated: dict[tuple[int, int], torch.Tensor] = {}
+
+    def _eval_point(ai: int, bi: int) -> torch.Tensor | None:
+        """Evaluate REML likelihood per voxel at grid index (ai, bi)."""
+        if (ai, bi) in evaluated:
+            return evaluated[(ai, bi)]
+        key = _key_for(ai, bi)
+        if key is None:
+            return None
+        gd = precomputed_grid[key]
+        L_inv = gd["L_inv"]
+        Q = gd["Q"]
+        logdet_Rcorr = gd["logdet_Rcorr"]
+        logdet_XwTXw = gd["logdet_XwTXw"]
+        # Single BLAS-3 GEMM across the entire voxel batch.
+        Y_w = (L_inv @ Y_batch.T).T  # (V, T)
+        Qt_Yw = Q.T @ Y_w.T          # (K, V)
+        rss = Y_w.pow(2).sum(dim=1) - Qt_Yw.pow(2).sum(dim=0)  # (V,)
+        lik = logdet_Rcorr + logdet_XwTXw + (n_timepoints - n_regressors) * torch.log(rss + 1e-10)
+        evaluated[(ai, bi)] = lik
+        return lik
+
+    # Step 1: evaluate (0, 0) for everyone (AFNI's OLS init).
+    init_lik = _eval_point(zero_a_idx, zero_b_idx)
+    if init_lik is not None:
+        best_likelihoods = init_lik.clone()
+
+    # Step 2: power-of-2 descent. ltop chosen so the coarsest step covers
+    # the grid: AFNI uses ltop = log2(min(na+1, nb+1)) - 2; we replicate
+    # via bit_length.
+    ltop = max(0, min(n_a, n_b).bit_length() - 2)
+    levels = list(range(ltop, -1, -1))
+
+    if verbose:
+        from tqdm.auto import tqdm as _tqdm
+        level_iter = _tqdm(levels, desc="REML grid search (hierarchical)", unit="level")
+    else:
+        level_iter = levels
+
+    for lev in level_iter:
+        dab = 1 << lev  # 2^lev
+
+        # Per-voxel window at this level. At the coarsest level (ltop) the
+        # window is the entire grid (AFNI's initial pass); at every other
+        # level it narrows to ±dab around the current best.
+        if lev == ltop:
+            a_window_lo = torch.zeros(n_voxels_batch, dtype=torch.long, device=device)
+            a_window_hi = torch.full(
+                (n_voxels_batch,), n_a - 1, dtype=torch.long, device=device
+            )
+            b_window_lo = torch.zeros(n_voxels_batch, dtype=torch.long, device=device)
+            b_window_hi = torch.full(
+                (n_voxels_batch,), n_b - 1, dtype=torch.long, device=device
+            )
+        else:
+            a_window_lo = (best_a_idx - dab).clamp_(0, n_a - 1)
+            a_window_hi = (best_a_idx + dab).clamp_(0, n_a - 1)
+            b_window_lo = (best_b_idx - dab).clamp_(0, n_b - 1)
+            b_window_hi = (best_b_idx + dab).clamp_(0, n_b - 1)
+
+        # Iterate grid points at this step size; only evaluate those whose
+        # union-of-voxel-windows actually covers them.
+        for bi in range(0, n_b, dab):
+            in_b = (bi >= b_window_lo) & (bi <= b_window_hi)
+            if not bool(in_b.any()):
+                continue
+            for ai in range(0, n_a, dab):
+                in_a = (ai >= a_window_lo) & (ai <= a_window_hi)
+                in_window = in_a & in_b
+                if not bool(in_window.any()):
+                    continue
+                lik = _eval_point(ai, bi)
+                if lik is None:
+                    continue
+                improve = in_window & (lik < best_likelihoods)
+                if not bool(improve.any()):
+                    continue
+                best_likelihoods = torch.where(improve, lik, best_likelihoods)
+                best_a_idx = torch.where(
+                    improve, torch.full_like(best_a_idx, ai), best_a_idx
+                )
+                best_b_idx = torch.where(
+                    improve, torch.full_like(best_b_idx, bi), best_b_idx
+                )
+
+    # Translate index → value.
+    a_vals_t = torch.tensor(a_vals_sorted, dtype=_dtype, device=device)
+    b_vals_t = torch.tensor(b_vals_sorted, dtype=_dtype, device=device)
+    best_params = torch.stack([a_vals_t[best_a_idx], b_vals_t[best_b_idx]], dim=1)
+    return best_params, best_likelihoods
+
+
 @torch.inference_mode()
 def prewhiten_with_arma11(
     X: torch.Tensor,
@@ -2482,6 +2652,7 @@ def fit_glm_arma11(
     use_qr: bool = False,
     debug_memory: bool = False,
     enable_quick_estimate: bool = False,
+    force_exhaustive_search: bool = False,
     glt_labels: list[str] | None = None,
     glt_matrices: list[np.ndarray] | None = None,
     task_indices: list[int] | None = None,
@@ -3391,17 +3562,36 @@ def fit_glm_arma11(
                     if _y_norm_scale is not None:
                         Y_batch = Y_batch / _y_norm_scale[batch_start:batch_end].unsqueeze(1)
 
-                    # Search against precomputed grid. Show the per-pair
-                    # progress bar only on the first voxel-batch so the user
-                    # sees movement without 4x repeated bars.
-                    search_result = search_voxels_precomputed_grid(
-                        design,
-                        Y_batch,
-                        precomputed_grid,
-                        device,
-                        verbose=verbose and (batch_idx == 0),
-                        return_profile=save_profile_likelihoods,
+                    # Search against precomputed grid. CPU defaults to
+                    # AFNI-style hierarchical descent (matches 3dREMLfit's
+                    # REML_find_best_case). GPU and any caller asking for
+                    # the full likelihood surface (-Rlklhd) take the
+                    # exhaustive path. -exhaustive forces exhaustive on CPU.
+                    _use_hierarchical = (
+                        device.type == "cpu"
+                        and not force_exhaustive_search
+                        and not save_profile_likelihoods
                     )
+                    if _use_hierarchical:
+                        best_params_batch, best_lik_batch = (
+                            search_voxels_precomputed_grid_hierarchical(
+                                design,
+                                Y_batch,
+                                precomputed_grid,
+                                device,
+                                verbose=verbose and (batch_idx == 0),
+                            )
+                        )
+                        search_result = (best_params_batch, best_lik_batch)
+                    else:
+                        search_result = search_voxels_precomputed_grid(
+                            design,
+                            Y_batch,
+                            precomputed_grid,
+                            device,
+                            verbose=verbose and (batch_idx == 0),
+                            return_profile=save_profile_likelihoods,
+                        )
 
                     if save_profile_likelihoods:
                         best_params_batch, best_lik_batch, surface_batch, surf_params = search_result
