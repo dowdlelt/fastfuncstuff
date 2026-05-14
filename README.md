@@ -12,6 +12,8 @@ Python chosen not because of speed, of course, but because I can at least review
 These are offered as-is, no guarantees.
 The CLIs have been tested extensively in day-to-day use, and an CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
 
+The current validation/benchmark data is in `notebooks/ffs_benchmark_showcase.ipynb` - they you can see how well ffs is able to match the reference implementations. 
+
 ## Install
 
 `pyproject.toml` is a plain PEP 621 spec (setuptools backend), so any of pip,
@@ -23,18 +25,18 @@ wheel coverage). 3.14 may work but is gated on whether your chosen PyTorch
 build has wheels for it.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/dowdlelt/fastfuncstuff.git
 cd fastfuncstuff
 ```
 
-**pip** (simplest):
+**pip**:
 
 ```bash
 python3.13 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-**uv** (fastest):
+**uv**:
 
 ```bash
 uv venv --python 3.13
@@ -73,6 +75,24 @@ I want to improve this, so consider that is on the TODO list.
 Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstandard) transparently.
 ZSTD support also offers another speedup, I tend to work with large files, and compressing and decompressing is a headache. This helps (but reduces compatability).
 Default outputs are `.nii.gz` written with `pigz` when available.
+
+## What I'm very happy with
+
+WIP.
+
+### ffs_nwarp
+One of the things I am most happy with is `ffs_nwarp` which is a near drop in replacment for AFNI's `3dNwarpApply` - produces near identical output, with wsinc5 interp (though permits negative values) but about 50x faster. 
+This is particularly noticeable on my slow CPU, even when I use 10 cores. 
+This for example (as of latest test), "just works" 
+```shell
+ffs_nwarp -interp wsinc5 \
+ -master ./sswarper_output/anatQQ.sub-01.nii \
+ -nwarp './sswarper_output/anatQQ.sub-01_WARP.nii ./sswarper_output/anatQQ.sub-01.aff12.1D anat_al_keep_e2a_only_mat.aff12.1D moco_sub-01_ses-01_task-localizer_run-1_bold_mat.aff12.1D' \
+ -source ../sub-01/ses-01/func/sub-01_ses-01_task-localizer_run-1_bold.nii \
+ -prefix ./ffs_mni_run-01.nii.gz -dxyz 3
+```
+What is also very fun is that this supports phase input and you can choose to warp directly (assume phase is unwrapped/interpolatable) or internally convert to real/imag, apply warps, and save phase out from that. This is useful for `ffs_phasereg`, for example. In other words, once you have magnitude processed its very easy to have the phase tag along. 
+
 
 ## Command-line tool listing
 
