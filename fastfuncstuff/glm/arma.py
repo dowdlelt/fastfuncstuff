@@ -2009,6 +2009,10 @@ def search_voxels_precomputed_grid_hierarchical(
     # a grid point across levels (matches AFNI's rvab[kk] < BIGVAL skip).
     evaluated: dict[tuple[int, int], torch.Tensor] = {}
 
+    # Per-pair progress bar (created below once we know total budget); kept
+    # as a name so the closure in _eval_point can tick it.
+    _pair_pbar = None
+
     def _eval_point(ai: int, bi: int) -> torch.Tensor | None:
         """Evaluate REML likelihood per voxel at grid index (ai, bi)."""
         if (ai, bi) in evaluated:
@@ -2027,6 +2031,8 @@ def search_voxels_precomputed_grid_hierarchical(
         rss = Y_w.pow(2).sum(dim=1) - Qt_Yw.pow(2).sum(dim=0)  # (V,)
         lik = logdet_Rcorr + logdet_XwTXw + (n_timepoints - n_regressors) * torch.log(rss + 1e-10)
         evaluated[(ai, bi)] = lik
+        if _pair_pbar is not None:
+            _pair_pbar.update(1)
         return lik
 
     # Step 1: evaluate (0, 0) for everyone (AFNI's OLS init).
@@ -2040,13 +2046,20 @@ def search_voxels_precomputed_grid_hierarchical(
     ltop = max(0, min(n_a, n_b).bit_length() - 2)
     levels = list(range(ltop, -1, -1))
 
+    # Each grid-point evaluation is one batched GEMM across the whole voxel
+    # batch — show that as the progress unit. Worst case is the full grid
+    # (when voxel windows span everything); typical is 40-80 points.
     if verbose:
         from tqdm.auto import tqdm as _tqdm
-        level_iter = _tqdm(levels, desc="REML grid search (hierarchical)", unit="level")
+        _pair_pbar = _tqdm(
+            total=len(param_list),
+            desc="REML grid search (hierarchical)",
+            unit="pair",
+        )
     else:
-        level_iter = levels
+        _pair_pbar = None
 
-    for lev in level_iter:
+    for lev in levels:
         dab = 1 << lev  # 2^lev
 
         # Per-voxel window at this level. At the coarsest level (ltop) the
@@ -2091,6 +2104,9 @@ def search_voxels_precomputed_grid_hierarchical(
                 best_b_idx = torch.where(
                     improve, torch.full_like(best_b_idx, bi), best_b_idx
                 )
+
+    if _pair_pbar is not None:
+        _pair_pbar.close()
 
     # Translate index → value.
     a_vals_t = torch.tensor(a_vals_sorted, dtype=_dtype, device=device)
