@@ -220,6 +220,17 @@ Notes:
         "Much faster (k+1 combos instead of 2^k).",
     )
     combo_opts.add_argument(
+        "-compare",
+        action="store_true",
+        help="Also run a standard GLMdenoise-style baseline (incremental PCs in "
+        "variance order, stop when adding the next PC gains less than 5%% in "
+        "median R² — i.e. pcstop=1.05). Reports R² boost difference between the "
+        "combinatorial/singleton selection and the GLMdenoise selection, and "
+        "writes {prefix}_r2_glmdenoise and {prefix}_r2_delta NIfTIs alongside "
+        "the usual outputs. Useful for quantifying whether the combinatorial "
+        "approach is actually buying you anything on your data.",
+    )
+    combo_opts.add_argument(
         "-brainthresh",
         nargs=2,
         type=float,
@@ -982,6 +993,84 @@ def main():
     print(f"  Improvement: {improvement:+.4f} (median)")
 
     # ======================================================================
+    # Step 4b (optional): GLMdenoise-style baseline comparison
+    # ======================================================================
+    # When -compare is set, run the standard incremental noise-PC sweep
+    # (variance-ordered PCs, take 0..k, pick k via the GLMdenoise pcstop=1.05
+    # rule on median R²) on the *same* noise pool and noise PCs. Reports how
+    # much R² the combinatorial / singleton choice buys you over the
+    # GLMdenoise default. No-op when -compare isn't set.
+    baseline_r2_t: torch.Tensor | None = None
+    delta_r2_t: torch.Tensor | None = None
+    baseline_k: int | None = None
+    if args.compare:
+        print()
+        print("=" * 70)
+        print("Step 4b: GLMdenoise-style incremental baseline (pcstop=1.05)...")
+        print("=" * 70)
+
+        from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+        r2_maps_inc, r2_summary_inc = cross_validate_noise_pcs(
+            data=data,
+            design_matrix=task_design,
+            noise_pcs=results.noise_pcs_per_run,
+            run_starts=run_starts,
+            tr=args.tr,
+            max_components=args.max_pcs,
+            nuisance=nuisance_per_run,
+            cv_strategy=1,  # LORO — matches the combinatorial path
+            device=device,
+            verbose=args.verb >= 1,
+            designs_by_hrf=designs_by_hrf,
+            hrf_indices=hrf_indices,
+        )
+
+        # pcstop=1.05 rule: walk up while next/current >= 1.05 on median R².
+        # If median is non-positive, fall back to argmax to stay defensive.
+        PCSTOP = 1.05
+        baseline_k = 0
+        for k in range(len(r2_summary_inc) - 1):
+            cur, nxt = r2_summary_inc[k], r2_summary_inc[k + 1]
+            if cur > 1e-6 and nxt / cur >= PCSTOP:
+                baseline_k = k + 1
+            else:
+                break
+        if r2_summary_inc[baseline_k] <= 0:
+            baseline_k = int(np.argmax(r2_summary_inc))
+
+        baseline_r2_np = r2_maps_inc[:, baseline_k]
+        baseline_r2_t = torch.from_numpy(baseline_r2_np).to(optimized_r2.device)
+        delta_r2_t = optimized_r2 - baseline_r2_t
+
+        print(f"  Baseline picked k={baseline_k} PCs (pcstop=1.05)")
+        print(
+            f"  Baseline R²: median={float(baseline_r2_t.median()):.4f}, "
+            f"mean={float(baseline_r2_t.mean()):.4f}"
+        )
+        print(f"  Δ R² (combinatorial − baseline):")
+        print(
+            f"    Mean:    {float(delta_r2_t.mean()):+.4f}    "
+            f"Median: {float(delta_r2_t.median()):+.4f}"
+        )
+        q25, q75 = (
+            float(torch.quantile(delta_r2_t, 0.25)),
+            float(torch.quantile(delta_r2_t, 0.75)),
+        )
+        print(f"    IQR:     [{q25:+.4f}, {q75:+.4f}]")
+        combo_wins = int((delta_r2_t > 0.01).sum())
+        base_wins = int((delta_r2_t < -0.01).sum())
+        n_total = delta_r2_t.numel()
+        print(
+            f"    Voxels combinatorial wins (Δ > 0.01): "
+            f"{combo_wins:,}/{n_total:,} ({100 * combo_wins / max(n_total, 1):.1f}%)"
+        )
+        print(
+            f"    Voxels baseline wins (Δ < -0.01):     "
+            f"{base_wins:,}/{n_total:,} ({100 * base_wins / max(n_total, 1):.1f}%)"
+        )
+
+    # ======================================================================
     # Step 5: Save results
     # ======================================================================
     print()
@@ -1004,6 +1093,26 @@ def main():
         save_pcs_mode=args.save_pcs,
         nii_ext=_nii_ext,
     )
+
+    # Save -compare outputs alongside the standard ones.
+    if args.compare and baseline_r2_t is not None and delta_r2_t is not None:
+        def _flat_to_vol(flat_t: torch.Tensor) -> np.ndarray:
+            flat_np = flat_t.detach().cpu().numpy().astype(np.float32)
+            if mask_flat is not None:
+                vol = np.zeros(mask_flat.size, dtype=np.float32)
+                vol[mask_flat] = flat_np
+            else:
+                vol = flat_np
+            return vol.reshape(volume_shape)
+
+        baseline_path = f"{args.prefix}_r2_glmdenoise{_nii_ext}"
+        delta_path = f"{args.prefix}_r2_delta{_nii_ext}"
+        save_nifti(_flat_to_vol(baseline_r2_t), output_path=baseline_path, affine=affine)
+        save_nifti(_flat_to_vol(delta_r2_t), output_path=delta_path, affine=affine)
+        output_files["r2_glmdenoise"] = baseline_path
+        output_files["r2_delta"] = delta_path
+        print(f"  Saved: {baseline_path}")
+        print(f"  Saved: {delta_path}")
 
     # ======================================================================
     # Summary
