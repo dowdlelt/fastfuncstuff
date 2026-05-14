@@ -2061,6 +2061,11 @@ def search_voxels_precomputed_grid_hierarchical(
 
     for lev in levels:
         dab = 1 << lev  # 2^lev
+        if _pair_pbar is not None:
+            # Surface current level so the user can read remaining work: at
+            # level ltop we visit very few points (coarse step), at level 0
+            # we may visit the entire grid (fine step).
+            _pair_pbar.set_postfix_str(f"level {lev}/{ltop} (step={dab})")
 
         # Per-voxel window at this level. At the coarsest level (ltop) the
         # window is the entire grid (AFNI's initial pass); at every other
