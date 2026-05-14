@@ -1429,6 +1429,14 @@ def load_hrf_indices(hrf_index_file: str, mask: np.ndarray | None = None) -> tor
     img = load_nifti(hrf_index_file)
     hrf_data = img.get_fdata()
 
+    # ffs_hrfopt writes hrf_index as 4D with two sub-briks:
+    # [0] = chosen HRF index (1..N_HRFS) — the actual per-voxel pick
+    # [1] = per-voxel quality/score
+    # Older runs and other writers produce a 3D single-volume file. Accept
+    # both shapes; always read sub-brik 0 from a 4D file.
+    if hrf_data.ndim == 4:
+        hrf_data = hrf_data[..., 0]
+
     # Convert from 1-indexed (NIFTI) to 0-indexed (Python)
     hrf_data = hrf_data - 1.0
 
