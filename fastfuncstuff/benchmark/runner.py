@@ -254,6 +254,13 @@ def run_timed(
         stderr_lines: list[str] = []
         max_tail = 200  # lines kept for error reporting
 
+        # Child Python processes block-buffer stdout when the writer is a
+        # pipe (not a tty), which means print() output sits in libc buffers
+        # for minutes during slow CPU work. PYTHONUNBUFFERED forces every
+        # write to flush immediately so tqdm + banners arrive in real time.
+        import os
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+
         proc = subprocess.Popen(
             cmd,
             shell=isinstance(cmd, str),
@@ -262,6 +269,7 @@ def run_timed(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=env,
         )
 
         import selectors
