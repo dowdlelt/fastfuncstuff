@@ -1957,7 +1957,18 @@ def search_voxels_precomputed_grid(
         surface = torch.empty(n_voxels_batch, len(param_list), device=device, dtype=_dtype)
 
     # Evaluate each grid point using L_inv GEMM + Pythagorean RSS (no betas needed)
-    for _grid_idx, (a, b) in enumerate(param_list):
+    # On CPU at T~1500 / V~50k each grid point is a multi-second BLAS-3 GEMM, so
+    # surface progress when verbose; quiet otherwise.
+    if verbose:
+        from tqdm.auto import tqdm as _tqdm
+        grid_iter = _tqdm(
+            list(enumerate(param_list)),
+            desc="REML grid search",
+            unit="pair",
+        )
+    else:
+        grid_iter = enumerate(param_list)
+    for _grid_idx, (a, b) in grid_iter:
         with profile_section("1_get_grid_data", enabled=enable_timing):
             grid_data = precomputed_grid[(a, b)]
             L_inv = grid_data["L_inv"]          # (n_time, n_time)
@@ -3382,11 +3393,8 @@ def fit_glm_arma11(
                 assert a_grid is not None and b_grid is not None
 
                 if verbose:
-                    print(f"✓ Precomputed {len(precomputed_grid)} valid (a,b) pairs")
+                    print(f"Precomputed {len(precomputed_grid)} valid (a,b) pairs")
                     print(f"  Grid: {len(a_grid)} a values × {len(b_grid)} b values")
-                    print(
-                        "  These matrices will be reused for ALL voxels (massive speedup!)"
-                    )
 
                 if debug_memory:
                     sample_key = list(precomputed_grid.keys())[0]
@@ -3465,13 +3473,15 @@ def fit_glm_arma11(
                     if _y_norm_scale is not None:
                         Y_batch = Y_batch / _y_norm_scale[batch_start:batch_end].unsqueeze(1)
 
-                    # Search against precomputed grid
+                    # Search against precomputed grid. Show the per-pair
+                    # progress bar only on the first voxel-batch so the user
+                    # sees movement without 4x repeated bars.
                     search_result = search_voxels_precomputed_grid(
                         design,
                         Y_batch,
                         precomputed_grid,
                         device,
-                        verbose=False,
+                        verbose=verbose and (batch_idx == 0),
                         return_profile=save_profile_likelihoods,
                     )
 
