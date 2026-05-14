@@ -250,12 +250,24 @@ def validate(ctx: BenchmarkContext) -> dict:
         and reml_result["min_r"] >= THRESHOLDS["reml_beta_min_r"]
     )
 
+    # Rvar's 4 subbriks are written by ffs_reml as: a, b, lambda, StDev
+    # (see -Rvar handler in cli/reml.py). Surface each so we can see which
+    # parameter is the parity offender.
+    _var_names = ("a", "b", "lambda", "stdev")
+    per_brick = var_result.get("per_brick", [])
+    for entry, name in zip(per_brick, _var_names):
+        entry["name"] = name
+    var_per = " ".join(
+        f"{name}={entry['r']:.3f}"
+        for entry, name in zip(per_brick, _var_names)
+    )
+
     return {
         "passed": passed,
         "summary": (
             f"OLS min_r={ols_result['min_r']:.4f}, "
             f"REML min_r={reml_result['min_r']:.4f}, "
-            f"var min_r={var_result['min_r']:.4f}"
+            f"var[{var_per}]"
         ),
         "ols": ols_result,
         "reml": reml_result,
