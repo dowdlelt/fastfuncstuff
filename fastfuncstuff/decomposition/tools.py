@@ -1499,6 +1499,7 @@ def _batch_gmm_3comp(x: torch.Tensor, n_iter: int = 200) -> dict:
     eps_conv = log(V) / 1000.0
     old_ll = torch.full((K, 1), -1e30, device=device, dtype=x.dtype)
     converged = torch.zeros(K, dtype=torch.bool, device=device)
+    CONV_CHECK_INTERVAL = 5  # see batch_fit_ggm for rationale
 
     for it in range(n_iter):
         p1 = pi1 * _gauss_pdf_torch(x, m1, v1)
@@ -1509,12 +1510,12 @@ def _batch_gmm_3comp(x: torch.Tensor, n_iter: int = 200) -> dict:
         r2 = p2 / total
         r3 = p3 / total
 
-        ll = total.log().sum(dim=1, keepdim=True)
-        if it > 20:
+        if it > 20 and (it % CONV_CHECK_INTERVAL == 0):
+            ll = total.log().sum(dim=1, keepdim=True)
             converged = converged | (((ll - old_ll) < eps_conv).squeeze(1) & ~converged)
             if converged.all():
                 break
-        old_ll = ll
+            old_ll = ll
 
         active = ~converged
         if not active.any():
