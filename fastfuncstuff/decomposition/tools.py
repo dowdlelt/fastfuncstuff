@@ -1287,6 +1287,21 @@ def batch_fit_ggm(
     old_ll = torch.full((K, 1), -1e30, device=device, dtype=torch.float32)
     converged = torch.zeros(K, dtype=torch.bool, device=device)
 
+    # Cache the per-iteration invariants. x and neg_x never change inside
+    # the loop, but x.clamp(min=0), neg_x.clamp(min=0), and the (>0) masks
+    # were being recomputed every iteration — ~50 MB of redundant
+    # allocations per iter at typical K, V. Hoisting them is pure
+    # bandwidth savings on CPU and a smaller VRAM win on GPU.
+    x_pos_w = x.clamp(min=0)
+    x_neg_w = neg_x.clamp(min=0)
+    x_pos_mask_f = (x > 0).to(x.dtype)
+    x_neg_mask_f = (neg_x > 0).to(x.dtype)
+
+    # Convergence check is a global reduction. On CPU especially this is
+    # cheap-but-not-free; on GPU it forces a sync on .all(). Check every
+    # CONV_CHECK_INTERVAL iters once past the warm-up.
+    CONV_CHECK_INTERVAL = 5
+
     iterator = range(n_iter)
     if verbose:
         iterator = tqdm(iterator, desc="  GGM EM", leave=True, unit="it")
@@ -1302,14 +1317,14 @@ def batch_fit_ggm(
         r_pos = p_pos / total
         r_neg = p_neg / total
 
-        # Log-likelihood convergence check
-        ll = total.log().sum(dim=1, keepdim=True)  # (K, 1)
-        if it > 20:
+        # Log-likelihood convergence check (less frequent for less sync).
+        if it > 20 and (it % CONV_CHECK_INTERVAL == 0):
+            ll = total.log().sum(dim=1, keepdim=True)  # (K, 1)
             just_converged = ((ll - old_ll) < eps_conv).squeeze(1) & ~converged
             converged = converged | just_converged
             if converged.all():
                 break
-        old_ll = ll
+            old_ll = ll
 
         # M-step (only update components that haven't converged)
         active = ~converged  # (K,)
@@ -1329,8 +1344,7 @@ def batch_fit_ggm(
         new_pi_n_now = (w_n / n).clamp(1e-4, 1 - 2e-4)
 
         # Positive Gamma
-        x_pos_w = x.clamp(min=0)  # avoid torch.zeros_like allocation
-        x_pos_cnt = (r_pos * (x > 0).float()).sum(dim=1, keepdim=True).clamp(min=1e-8)
+        x_pos_cnt = (r_pos * x_pos_mask_f).sum(dim=1, keepdim=True).clamp(min=1e-8)
         mu_p_cand = (r_pos * x_pos_w).sum(dim=1, keepdim=True) / x_pos_cnt
         const2_p = (2.6 - new_pi_n_now) * sqrt_var_n + new_mu_n
         var_p_cand = ((r_pos * (x - mu_p_cand) ** 2).sum(dim=1, keepdim=True) / w_p).clamp(min=1e-4)
@@ -1342,8 +1356,7 @@ def batch_fit_ggm(
         new_var_p = torch.minimum(var_p_cand, 0.5 * new_mu_p**2).clamp(min=1e-4)
 
         # Negative Gamma (mu_ng stored as positive |mean| for -x)
-        x_neg_w = neg_x.clamp(min=0)
-        x_neg_cnt = (r_neg * (neg_x > 0).float()).sum(dim=1, keepdim=True).clamp(min=1e-8)
+        x_neg_cnt = (r_neg * x_neg_mask_f).sum(dim=1, keepdim=True).clamp(min=1e-8)
         mu_ng_cand = (r_neg * x_neg_w).sum(dim=1, keepdim=True) / x_neg_cnt
         const2_ng = (2.6 - new_pi_n_now) * sqrt_var_n - new_mu_n
         var_ng_cand = ((r_neg * (neg_x - mu_ng_cand) ** 2).sum(dim=1, keepdim=True) / w_ng).clamp(
