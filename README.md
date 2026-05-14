@@ -181,26 +181,9 @@ Other entry points worth knowing about: `fit_glm_arma11`, `fit_glm_hrf_library`,
 `generate_fmri_noise`, `simulate_fmri_run`, and `find_optimal_designs` (Liu &
 Frank efficiency). See `docs/` for details.
 
-## Design notes worth flagging
-
-- **Legendre polynomials**, zero-padded per run, for drift modelling. Raw
-  monomials are numerically unstable; do not use them.
-- **Fractional ridge** in [0, 1] rather than λ in arbitrary units, so the
-  regularisation knob is bounded and interpretable.
-- **Microtime onset alignment** on a sub-TR grid (`bins_per_tr = round(tr/dt)`)
-  to avoid cumulative drift when `tr/dt` is not integer.
-- **Memory module** (`memory.py`) is the single source of truth for chunk
-  sizing on whatever device you have. CLIs do not hard-code chunk sizes.
-- **Default precision is float32**. `-use_double` is exposed where promotion
-  matters for stability (e.g. ARMA log-likelihood).
-
 ## Status
 
-Active, single-author, very much a research codebase. The CLIs listed above
-are the ones I use; expect rough edges in less-travelled paths. Outstanding
-issues, hypotheses, and TODOs live alongside the code in a wiki at
-`~/Dropbox/Resources/code/fmri_wiki/` (not part of this repo). If you find a
-bug, the wiki probably already knows about it.
+Active, single-author, very much a research codebase. 
 
 ## License
 
@@ -222,5 +205,5 @@ docstrings in the relevant module:
 - Phase regression: Menon (2002); Curtis et al. (2014); Stanley et al. (2021);
   Liem (phaseprep, 2023).
 - Optimal SVHT / shrinkage: Gavish & Donoho (2014, 2017).
-- Motion simulation: Patriat, Reynolds & Birn (2017), *NeuroImage*.
+- Motion simulation: Patriat, Reynolds & Birn (2017).
 - Design efficiency: Liu & Frank (2004); Buracas & Boynton (2002); Das et al. (2023).
