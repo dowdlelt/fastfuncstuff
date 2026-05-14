@@ -910,7 +910,14 @@ def main():
                 )
 
             torch.set_num_threads(num_threads)
-            torch.set_num_interop_threads(num_threads)
+            # set_num_interop_threads is one-shot and must run before any
+            # parallel work has started; under repeated entry points (tests,
+            # subprocess relaunches, ipython reloads) it may already be set,
+            # so don't fail the run if torch refuses.
+            try:
+                torch.set_num_interop_threads(num_threads)
+            except RuntimeError:
+                pass
             # Also set environment variables for MKL/OpenMP
             os.environ["OMP_NUM_THREADS"] = str(num_threads)
             os.environ["MKL_NUM_THREADS"] = str(num_threads)
