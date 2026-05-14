@@ -1181,6 +1181,142 @@ def estimate_ica_component_count(
     raise ValueError(f"Unsupported -num_comps mode: {mode}")
 
 
+def _ggm_em_step(
+    x: torch.Tensor,
+    neg_x: torch.Tensor,
+    x_pos_w: torch.Tensor,
+    x_neg_w: torch.Tensor,
+    x_pos_mask_f: torch.Tensor,
+    x_neg_mask_f: torch.Tensor,
+    mu_n: torch.Tensor, var_n: torch.Tensor,
+    mu_p: torch.Tensor, var_p: torch.Tensor,
+    mu_ng: torch.Tensor, var_ng: torch.Tensor,
+    pi_n: torch.Tensor, pi_p: torch.Tensor, pi_ng: torch.Tensor,
+    active_mask_2d: torch.Tensor,
+    n_scalar: float,
+    min_mode_offset: float,
+) -> tuple[
+    torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor,  # total (kept for optional convergence check)
+]:
+    """One E+M iteration of the Gaussian-Gamma mixture EM.
+
+    Pure tensor function — every input is a torch.Tensor and every output
+    is a torch.Tensor — so the body can be ahead-of-time compiled via
+    torch.compile to fuse the dozen-plus elementwise ops that dominate
+    runtime on CPU.
+
+    Returns (mu_n, var_n, mu_p, var_p, mu_ng, var_ng, pi_n, pi_p, pi_ng, total)
+    where ``total`` is the per-voxel mixture density (K, V) needed by the
+    convergence check.
+    """
+    # ----- E-step -----
+    # Gaussian PDF inlined to keep this body a single graph.
+    p_noise = pi_n * torch.exp(-0.5 * (x - mu_n) ** 2 / var_n) / torch.sqrt(
+        2.0 * torch.pi * var_n
+    )
+    # Gamma PDF (positive tail), parameterised by mean & variance.
+    a_p = mu_p * mu_p / var_p
+    b_p = mu_p / var_p
+    log_pdf_p = (
+        a_p * torch.log(b_p) - torch.lgamma(a_p)
+        + (a_p - 1.0) * torch.log(x.clamp(min=1e-30)) - b_p * x
+    )
+    p_pos = pi_p * torch.where(
+        x > 0,
+        torch.exp(log_pdf_p.clamp(-700, 700)),
+        torch.tensor(1e-32, device=x.device, dtype=x.dtype),
+    )
+    # Gamma PDF (negative tail) — uses neg_x.
+    a_ng = mu_ng * mu_ng / var_ng
+    b_ng = mu_ng / var_ng
+    log_pdf_ng = (
+        a_ng * torch.log(b_ng) - torch.lgamma(a_ng)
+        + (a_ng - 1.0) * torch.log(neg_x.clamp(min=1e-30)) - b_ng * neg_x
+    )
+    p_neg = pi_ng * torch.where(
+        neg_x > 0,
+        torch.exp(log_pdf_ng.clamp(-700, 700)),
+        torch.tensor(1e-32, device=x.device, dtype=x.dtype),
+    )
+
+    total = (p_noise + p_pos + p_neg).clamp(min=1e-32)
+    r_noise = p_noise / total
+    r_pos = p_pos / total
+    r_neg = p_neg / total
+
+    # ----- M-step -----
+    w_n = r_noise.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    w_p = r_pos.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    w_ng = r_neg.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+    new_mu_n = (r_noise * x).sum(dim=1, keepdim=True) / w_n
+    new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-8)
+
+    sqrt_var_n = torch.sqrt(new_var_n)
+    new_pi_n_now = (w_n / n_scalar).clamp(1e-4, 1 - 2e-4)
+
+    x_pos_cnt = (r_pos * x_pos_mask_f).sum(dim=1, keepdim=True).clamp(min=1e-8)
+    mu_p_cand = (r_pos * x_pos_w).sum(dim=1, keepdim=True) / x_pos_cnt
+    const2_p = (2.6 - new_pi_n_now) * sqrt_var_n + new_mu_n
+    var_p_cand = ((r_pos * (x - mu_p_cand) ** 2).sum(dim=1, keepdim=True) / w_p).clamp(min=1e-4)
+    floor_p = (
+        0.5 * (const2_p + torch.sqrt(const2_p ** 2 + 4.0 * var_p_cand))
+    ).clamp(min=min_mode_offset)
+    new_mu_p = torch.maximum(mu_p_cand, floor_p)
+    new_var_p = torch.minimum(var_p_cand, 0.5 * new_mu_p ** 2).clamp(min=1e-4)
+
+    x_neg_cnt = (r_neg * x_neg_mask_f).sum(dim=1, keepdim=True).clamp(min=1e-8)
+    mu_ng_cand = (r_neg * x_neg_w).sum(dim=1, keepdim=True) / x_neg_cnt
+    const2_ng = (2.6 - new_pi_n_now) * sqrt_var_n - new_mu_n
+    var_ng_cand = ((r_neg * (neg_x - mu_ng_cand) ** 2).sum(dim=1, keepdim=True) / w_ng).clamp(
+        min=1e-4
+    )
+    floor_ng = (
+        0.5 * (const2_ng + torch.sqrt(const2_ng ** 2 + 4.0 * var_ng_cand))
+    ).clamp(min=min_mode_offset)
+    new_mu_ng = torch.maximum(mu_ng_cand, floor_ng)
+    new_var_ng = torch.minimum(var_ng_cand, 0.5 * new_mu_ng ** 2).clamp(min=1e-4)
+
+    new_pi_n = (w_n / n_scalar).clamp(1e-4, 1 - 2e-4)
+    new_pi_p = (w_p / n_scalar).clamp(1e-4, 1 - 2e-4)
+    new_pi_ng = (w_ng / n_scalar).clamp(1e-4, 1 - 2e-4)
+    pi_sum = new_pi_n + new_pi_p + new_pi_ng
+    new_pi_n = new_pi_n / pi_sum
+    new_pi_p = new_pi_p / pi_sum
+    new_pi_ng = new_pi_ng / pi_sum
+
+    # Apply only to active components — converged components keep old state.
+    mu_n = torch.where(active_mask_2d, new_mu_n, mu_n)
+    var_n = torch.where(active_mask_2d, new_var_n, var_n)
+    mu_p = torch.where(active_mask_2d, new_mu_p, mu_p)
+    var_p = torch.where(active_mask_2d, new_var_p, var_p)
+    mu_ng = torch.where(active_mask_2d, new_mu_ng, mu_ng)
+    var_ng = torch.where(active_mask_2d, new_var_ng, var_ng)
+    pi_n = torch.where(active_mask_2d, new_pi_n, pi_n)
+    pi_p = torch.where(active_mask_2d, new_pi_p, pi_p)
+    pi_ng = torch.where(active_mask_2d, new_pi_ng, pi_ng)
+
+    return mu_n, var_n, mu_p, var_p, mu_ng, var_ng, pi_n, pi_p, pi_ng, total
+
+
+# Compiled variant; the bare function above is the parity reference.
+# torch.compile here fuses ~30 elementwise + reduction kernels into 2-4
+# fused kernels, which on CPU mainly cuts memory bandwidth (each (K, V)
+# tensor allocated/freed inside the loop is reusing the same buffers).
+try:
+    _ggm_em_step_compiled = torch.compile(
+        _ggm_em_step, dynamic=True, fullgraph=False, mode="default"
+    )
+except Exception:
+    # If the installed PyTorch can't compile (e.g. inductor missing), the
+    # uncompiled function is still correct.
+    _ggm_em_step_compiled = _ggm_em_step
+
+
 def _gamma_pdf_torch(x: torch.Tensor, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
     """Batched Gamma PDF parameterized by mean and variance.
 
@@ -1307,15 +1443,20 @@ def batch_fit_ggm(
         iterator = tqdm(iterator, desc="  GGM EM", leave=True, unit="it")
 
     for it in iterator:
-        # E-step (linear-space — same ops as before, now in float32)
-        p_noise = pi_n * _gauss_pdf_torch(x, mu_n, var_n)
-        p_pos = pi_p * _gamma_pdf_torch(x, mu_p, var_p)
-        p_neg = pi_ng * _gamma_pdf_torch(neg_x, mu_ng, var_ng)
+        active = ~converged  # (K,)
+        if not active.any():
+            break
+        active_mask_2d = active.unsqueeze(1)
 
-        total = (p_noise + p_pos + p_neg).clamp(min=1e-32)
-        r_noise = p_noise / total
-        r_pos = p_pos / total
-        r_neg = p_neg / total
+        # One full E+M step in a single fused (when compiled) graph.
+        mu_n, var_n, mu_p, var_p, mu_ng, var_ng, pi_n, pi_p, pi_ng, total = (
+            _ggm_em_step_compiled(
+                x, neg_x, x_pos_w, x_neg_w, x_pos_mask_f, x_neg_mask_f,
+                mu_n, var_n, mu_p, var_p, mu_ng, var_ng,
+                pi_n, pi_p, pi_ng,
+                active_mask_2d, float(n), float(min_mode_offset),
+            )
+        )
 
         # Log-likelihood convergence check (less frequent for less sync).
         if it > 20 and (it % CONV_CHECK_INTERVAL == 0):
@@ -1326,71 +1467,8 @@ def batch_fit_ggm(
                 break
             old_ll = ll
 
-        # M-step (only update components that haven't converged)
-        active = ~converged  # (K,)
-        if not active.any():
-            break
-
-        w_n = r_noise.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        w_p = r_pos.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        w_ng = r_neg.sum(dim=1, keepdim=True).clamp(min=1e-8)
-
-        # Noise Gaussian
-        new_mu_n = (r_noise * x).sum(dim=1, keepdim=True) / w_n
-        new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-8)
-
-        # I2: MELODIC adaptive floor — const2 = (2.6 - pi_n)*sqrt(var_n) ± mu_n
-        sqrt_var_n = torch.sqrt(new_var_n)
-        new_pi_n_now = (w_n / n).clamp(1e-4, 1 - 2e-4)
-
-        # Positive Gamma
-        x_pos_cnt = (r_pos * x_pos_mask_f).sum(dim=1, keepdim=True).clamp(min=1e-8)
-        mu_p_cand = (r_pos * x_pos_w).sum(dim=1, keepdim=True) / x_pos_cnt
-        const2_p = (2.6 - new_pi_n_now) * sqrt_var_n + new_mu_n
-        var_p_cand = ((r_pos * (x - mu_p_cand) ** 2).sum(dim=1, keepdim=True) / w_p).clamp(min=1e-4)
-        floor_p = (
-            0.5 * (const2_p + torch.sqrt(const2_p**2 + 4.0 * var_p_cand))
-        ).clamp(min=min_mode_offset)
-        new_mu_p = torch.maximum(mu_p_cand, floor_p)
-        # I3: variance upper bound var ≤ 0.5·mu²
-        new_var_p = torch.minimum(var_p_cand, 0.5 * new_mu_p**2).clamp(min=1e-4)
-
-        # Negative Gamma (mu_ng stored as positive |mean| for -x)
-        x_neg_cnt = (r_neg * x_neg_mask_f).sum(dim=1, keepdim=True).clamp(min=1e-8)
-        mu_ng_cand = (r_neg * x_neg_w).sum(dim=1, keepdim=True) / x_neg_cnt
-        const2_ng = (2.6 - new_pi_n_now) * sqrt_var_n - new_mu_n
-        var_ng_cand = ((r_neg * (neg_x - mu_ng_cand) ** 2).sum(dim=1, keepdim=True) / w_ng).clamp(
-            min=1e-4
-        )
-        floor_ng = (
-            0.5 * (const2_ng + torch.sqrt(const2_ng**2 + 4.0 * var_ng_cand))
-        ).clamp(min=min_mode_offset)
-        new_mu_ng = torch.maximum(mu_ng_cand, floor_ng)
-        new_var_ng = torch.minimum(var_ng_cand, 0.5 * new_mu_ng**2).clamp(min=1e-4)
-
-        # Proportions
-        new_pi_n = (w_n / n).clamp(1e-4, 1 - 2e-4)
-        new_pi_p = (w_p / n).clamp(1e-4, 1 - 2e-4)
-        new_pi_ng = (w_ng / n).clamp(1e-4, 1 - 2e-4)
-        pi_sum = new_pi_n + new_pi_p + new_pi_ng
-        new_pi_n = new_pi_n / pi_sum
-        new_pi_p = new_pi_p / pi_sum
-        new_pi_ng = new_pi_ng / pi_sum
-
-        # Apply only to active components
-        a = active.unsqueeze(1)  # (K, 1)
-        mu_n = torch.where(a, new_mu_n, mu_n)
-        var_n = torch.where(a, new_var_n, var_n)
-        mu_p = torch.where(a, new_mu_p, mu_p)
-        var_p = torch.where(a, new_var_p, var_p)
-        mu_ng = torch.where(a, new_mu_ng, mu_ng)
-        var_ng = torch.where(a, new_var_ng, var_ng)
-        pi_n = torch.where(a, new_pi_n, pi_n)
-        pi_p = torch.where(a, new_pi_p, pi_p)
-        pi_ng = torch.where(a, new_pi_ng, pi_ng)
-
     # Free EM intermediates before final posterior computation
-    del r_noise, r_pos, r_neg, old_ll
+    del old_ll  # r_noise/r_pos/r_neg now live only inside the compiled step
     if x.device.type == "cuda":
         torch.cuda.empty_cache()
 
