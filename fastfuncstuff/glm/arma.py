@@ -362,136 +362,51 @@ def get_adaptive_batch_size(
     use_qr: bool = False,
 ) -> int:
     """
-    Intelligently determine optimal batch size based on GPU memory
+    Recommend a per-call voxel batch size for ARMA(1,1) REML fits.
 
-    Uses device-specific heuristics to maximize GPU utilization while
-    avoiding OOM (Out of Memory) errors.
+    Thin wrapper around ``fastfuncstuff.memory.estimate_chunk_size`` with
+    ``operation="arma"`` so the whole codebase agrees on memory budgeting.
+    GPU vs CPU defaults (safety factor, max chunk size) live in
+    ``MemoryConfig``; tune them there if you want different policy.
 
     Parameters
     ----------
     device : torch.device
         Computing device
-    n_timepoints : int
-        Number of timepoints in data
-    n_regressors : int
-        Number of regressors in design
+    n_timepoints, n_regressors : int
+        Design dimensions
     use_double : bool, default=False
-        If True, use float64 precision (8 bytes per element).
-        If False, use float32 precision (4 bytes per element).
+        Float64 (passed through; doubles per-voxel memory estimate).
+    use_qr : bool, default=False
+        Retained for backwards compatibility; the memory module does not
+        currently differentiate the QR vs X'X paths, so the result is the
+        same. The QR path uses a Q matrix the same shape as X_w, which is
+        already bounded by the conservative per-voxel estimate.
 
     Returns
     -------
     batch_size : int
-        Recommended number of voxels to process in parallel
-
-    Notes
-    -----
-    Memory scaling (with QR factorization):
-    - QR creates temporary Q matrix same size as X_w (~2x memory during factorization!)
-    - Each voxel needs ~2 × (n_timepoints × n_regressors × bytes_per_element) peak memory
-    - Additional workspace for R, inverse matrices, residuals, betas, etc.
-    - Float64 uses 2x memory vs float32, so batch size is automatically halved
-    - QR uses ~2.25x more memory than old X'X approach, but gives better numerical stability
-
-    Device-specific tuning:
-    - MPS (Mac M-series): 36GB unified memory → aggressive batching (50k+ voxels float32, 25k float64)
-    - CUDA (NVIDIA): Depends on VRAM (8GB=10k, 16GB=25k, 24GB=40k, 40GB=60k float32)
-    - CPU: Conservative (5k voxels float32, 2.5k float64) due to slower computation
-
-    Example
-    -------
-    >>> device = torch.device('mps')
-    >>> batch_size = get_adaptive_batch_size(device, n_timepoints=300, n_regressors=48)
-    >>> print(f"Optimal batch: {batch_size:,} voxels")
-    Optimal batch: 50,000 voxels
+        Recommended number of voxels to process in parallel.
     """
-    # ACCURATE memory per voxel calculation for GLS solve
-    bytes_per_element = 8 if use_double else 4
+    del use_qr  # currently unused, see docstring
+    # n_voxels=None at this stage; estimate_chunk_size needs a number, so
+    # pass the configured max so the result is the unconstrained best-fit
+    # batch size. Callers that know n_voxels (e.g. fit_glm_arma11) will
+    # clamp to it themselves.
+    from fastfuncstuff.memory import estimate_chunk_size, get_memory_config
 
-    if use_qr:
-        # QR factorization: needs temporary Q matrix (same size as X_w!)
-        mem_per_voxel = (
-            n_timepoints * n_regressors * bytes_per_element  # X_w_batch
-            + n_timepoints
-            * n_regressors
-            * bytes_per_element  # Q_batch (temporary during QR!)
-            + n_timepoints * bytes_per_element  # y_w_batch
-            + n_regressors * n_regressors * bytes_per_element  # R_qr_batch
-            + n_regressors
-            * n_regressors
-            * bytes_per_element  # eye_batch (for computing inv)
-            + n_regressors * n_regressors * bytes_per_element  # R_inv_batch
-            + n_regressors * n_regressors * bytes_per_element  # XwTXw_inv_batch
-            + n_regressors * bytes_per_element  # betas
-            + n_regressors * bytes_per_element  # tstats
-            + 3 * bytes_per_element  # params (a, b, lambda)
-        )
-    else:
-        # X'X approach: less memory, no temporary Q matrix
-        mem_per_voxel = (
-            n_timepoints * n_regressors * bytes_per_element  # X_w_batch
-            + n_timepoints * bytes_per_element  # y_w_batch
-            + n_regressors * n_regressors * bytes_per_element  # XtX
-            + n_regressors * n_regressors * bytes_per_element  # XtX_inv
-            + n_regressors * bytes_per_element  # betas
-            + n_regressors * bytes_per_element  # tstats
-            + 3 * bytes_per_element  # params (a, b, lambda)
-        )
-
-    if device.type == "mps":
-        # Mac M-series with unified memory (typically 16-64GB)
-        available_gb = 8.0
-        batch_size = int((available_gb * 1e9) / mem_per_voxel)
-        batch_size = max(5000, min(batch_size, 50000))
-
-    elif device.type == "cuda":
-        # NVIDIA GPU - query actual VRAM
-        try:
-            total_mem = torch.cuda.get_device_properties(device).total_memory
-            # Use 50% of VRAM for batch sizing (assumes dedicated GPU)
-            # Leave 13% for PyTorch overhead, CUDA context, fragmentation, and grid memory
-            # (fit_glm_arma11 will further refine this to account for actual grid size)
-            available_mem = total_mem * 0.75
-            batch_size = int(available_mem / mem_per_voxel)
-
-            # Safety clamps based on GPU size
-            # NOTE: With group-level X'X precomputation (99.6% memory reduction),
-            # these caps are MUCH higher than before while still being conservative.
-            # The actual batch size will be further adjusted in fit_glm_arma11().
-            if total_mem < 10e9:  # < 10GB
-                batch_size = min(batch_size, 50000)
-            elif total_mem < 20e9:  # 10-20GB (e.g., RTX 4070, 15-16GB GPUs)
-                batch_size = min(batch_size, 200000)
-            else:  # > 20GB (e.g., RTX 4090, A100)
-                batch_size = min(batch_size, 500000)
-        except Exception:
-            batch_size = 3000
-    else:
-        # CPU or unknown device.
-        # On CPU the per-voxel cost is dominated by BLAS-3 throughput on the
-        # grid-precomputed prewhitening GEMM (L_inv @ Y). Bigger voxel
-        # batches → fewer trips through the 117-pair grid loop AND better
-        # cache reuse per GEMM, so we want to bound this only by available
-        # RAM, not by an arbitrary cap. Earlier cap of 50k voxels meant a
-        # 167k-voxel dataset hit 4 batches × 117 pairs = 468 GEMMs instead
-        # of the natural 1 batch × 117 = 117 GEMMs.
-        try:
-            import psutil
-
-            # Use 50% of available RAM (conservative, leaves room for OS and other processes)
-            available_ram = psutil.virtual_memory().available * 0.5
-            batch_size = int(available_ram / mem_per_voxel)
-            # Cap that matches the large-VRAM GPU branch; the RAM-derived
-            # value above is the real safety bound.
-            batch_size = max(5000, min(batch_size, 500000))
-        except ImportError:
-            # psutil not available, use conservative default
-            batch_size = 5000
-
-    # Ensure reasonable minimum
-    batch_size = max(batch_size, 1000)
-
-    return batch_size
+    config = get_memory_config()
+    n_voxels_placeholder = (
+        config.max_chunk_size_cpu if device.type != "cuda" else config.max_chunk_size_gpu
+    )
+    return estimate_chunk_size(
+        n_voxels=n_voxels_placeholder,
+        n_timepoints=n_timepoints,
+        n_regressors=n_regressors,
+        device=device,
+        operation="arma",
+        use_double=use_double,
+    )
 
 
 def compute_arma_lambda(a: float, b: float) -> float:
@@ -2879,42 +2794,39 @@ def fit_glm_arma11(
                 print(f"  TOTAL EXPECTED: {grid_memory_bytes / 1024**3:.3f} GiB")
                 print(f"{'=' * 70}\n")
 
-            # Reduce batch size to leave room for grid
-            if device.type == "cuda":
-                total_mem = torch.cuda.get_device_properties(device).total_memory
-                # Use 75% of GPU memory (consistent with get_adaptive_batch_size);
-                # subtract stored grid size to get memory available for voxel batches.
-                available_mem = total_mem * 0.75
-            else:  # CPU
-                try:
-                    import psutil
+            # Route batch sizing through the memory module so GPU/CPU policy
+            # lives in one place. Subtract grid memory from the budget first
+            # so we don't blow up when the precomputed grid is big.
+            from fastfuncstuff.memory import (
+                bytes_per_voxel_arma,
+                estimate_chunk_size,
+                get_available_memory,
+                get_memory_config,
+            )
 
-                    # Use 50% of available RAM for CPU
-                    available_mem = psutil.virtual_memory().available * 0.5
-                except ImportError:
-                    # Fallback if psutil not available
-                    available_mem = 16 * 1024**3  # Assume 16GB available
-
+            _mem_cfg = get_memory_config()
+            available_mem = get_available_memory(device)
             memory_for_batches = available_mem - grid_memory_bytes
 
             if memory_for_batches > 0:
-                bytes_per_element = 8 if use_double else 4
-                mem_per_voxel = (
-                    n_timepoints * n_regressors * bytes_per_element  # X_w_batch
-                    + n_timepoints
-                    * n_regressors
-                    * bytes_per_element  # Q_batch (temporary during QR!)
-                    + n_timepoints * bytes_per_element  # y_w_batch
-                    + n_regressors * n_regressors * bytes_per_element  # R_qr_batch
-                    + n_regressors * n_regressors * bytes_per_element  # eye_batch
-                    + n_regressors * n_regressors * bytes_per_element  # R_inv_batch
-                    + n_regressors * n_regressors * bytes_per_element  # XwTXw_inv_batch
-                    + n_regressors * bytes_per_element  # betas
-                    + n_regressors * bytes_per_element  # tstats
-                    + 3 * bytes_per_element  # params (a, b, lambda)
+                bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
+                if use_double:
+                    bytes_per_voxel = int(
+                        bytes_per_voxel * _mem_cfg.double_precision_multiplier
+                    )
+                # estimate_chunk_size clamps to n_voxels, so the result is
+                # already the "fits everything in one batch" answer when
+                # memory allows.
+                batch_size = estimate_chunk_size(
+                    n_voxels=n_voxels,
+                    n_timepoints=n_timepoints,
+                    n_regressors=n_regressors,
+                    device=device,
+                    operation="arma",
+                    use_double=use_double,
                 )
-                batch_size = int(memory_for_batches / mem_per_voxel)
-                batch_size = max(100, min(batch_size, base_batch_size))
+                # Honour the per-call cap from base_batch_size as well.
+                batch_size = max(100, min(batch_size, base_batch_size, n_voxels))
             else:
                 # Grid too large! This shouldn't happen if auto-detection worked
                 # Only possible if user forced use_grid_batching=False
