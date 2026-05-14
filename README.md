@@ -5,16 +5,12 @@ TODO: This agent created readme is garbage - sorry, but I wanted to get somethin
 
 ## Why this exists
 
-I have a slow CPU and a fast graphics card. The tools I like to use, namely AFNI
-are great, but they are really built to take advantage of server CPU setups.  
-This project is an going experiment - how well can current models port good code
-to a pytorch like set up. Python chosen not because of speed, of course, but
-because I can at least review the code for sanity.  
-
-These are offered as-is, no guarantees. The CLIs have been tested
-extensively in day-to-day use, and an in-tree benchmark (`ffs_benchmark`)
-compares outputs and timing against reference implementations on a public
-dataset.
+I have a slow CPU but I was able to get my hands on a reasonble GPU. 
+The tools I like to use, namely AFNI are great, but they are really built to take advantage of server CPU setups.  
+This project is an ongoing experiment - how well can current models port good code to a pytorch like set up. 
+Python chosen not because of speed, of course, but because I can at least review the code for sanity.
+These are offered as-is, no guarantees.
+The CLIs have been tested extensively in day-to-day use, and an CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
 
 ## Install
 
@@ -46,7 +42,7 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-**conda** (recommended if you want CUDA without thinking about it):
+**conda** (What I used, because I'm used to it):
 
 ```bash
 conda create -n ffs python=3.13
@@ -68,32 +64,29 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124   # or cu12
 pip install -e .
 ```
 
-Apple Silicon: the default wheel includes MPS. Some ops still fall back to
-CPU; this is a known weak spot — see the cross-cutting CPU-paths note in the
-wiki. CPU-only works everywhere but is the slow path; that is the whole
-reason this project exists.
+Apple Silicon: the default wheel includes MPS. Many ops still fall back to
+CPU and some break entirely (float64 support, for example) this is a known weak spot CPU-only works everywhere but is the slow path. 
+I want to improve this, so consider that is on the TODO list. 
 
 ### File formats
 
 Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstandard) transparently.
-Default outputs are `.nii.gz` written with `pigz` when available (parallel
-gzip — much faster than the stdlib path on large 4D files).
+ZSTD support also offers another speedup, I tend to work with large files, and compressing and decompressing is a headache. This helps (but reduces compatability).
+Default outputs are `.nii.gz` written with `pigz` when available.
 
-## Command-line tools
+## Command-line tool listing
 
-Every CLI is registered as a console script and accepts `-help`. Flag style
-follows AFNI conventions (single dash) where possible.
+I work in the command line, and I tend to use bash scripts - so, everything is more or less built with that in mind. 
+Every CLI is registered as a console script and accepts `-help`. Flag style follows AFNI conventions (single dash).
 
 ### GLM and design
 
 | command | description |
 |---|---|
-| `ffs_build_design` | Build a 1D design matrix from onsets, durations, an HRF model, polynomials, and motion. Output is readable by `ffs_reml` and AFNI tools. |
 | `ffs_reml` | OLS / ARMA(1,1) prewhitened GLM with REML grid search over (a, b). AFNI `3dREMLfit`-style bucket output, FDR curves attached. |
 | `ffs_ridge` | Fractional ridge regression for single-trial betas (GLMsingle Type D). Per-voxel optimal fraction by cross-validation. |
 | `ffs_deconvolve` | FIR / event-related deconvolution without an assumed HRF shape. |
-| `ffs_tps` | Thin-plate-spline HRF estimation with cross-validated smoothness. Global or per-voxel λ. |
-| `ffs_xval_r2` | Cross-validated R² maps (LORO or split-half) with proper nuisance projection. |
+
 
 ### HRF and denoising
 
@@ -102,7 +95,6 @@ follows AFNI conventions (single dash) where possible.
 | `ffs_hrfopt` | Per-voxel HRF library selection. Tests each HRF in a library by LORO CV; refits with the winner. Canonical or PIGHS libraries. |
 | `ffs_denoise` | GLMdenoise-style noise-PC denoising (Kay et al. 2013). Identifies a noise pool, extracts PCs, picks the count by LORO CV. |
 | `ffs_denoisatorial` | Exhaustive 2^k subset evaluation of noise PCs, when you want the best non-contiguous combination rather than a prefix. |
-| `ffs_pathfinder` | Joint HRF + denoising optimisation. Picks the HRF that works best with the denoising level chosen for that voxel. |
 | `ffs_phasereg` | Magnitude-on-phase Deming regression for macrovascular BOLD suppression (Menon 2002, Curtis 2014, Stanley 2021; phaseprep parity). |
 | `ffs_nordic` | NORDIC-style patch-SVD denoising. Magnitude-only or complex (mag + phase), with optional g-factor map. |
 | `ffs_sauna` | NORDIC-adjacent denoiser. g-factor from trailing noise volumes + Gavish–Donoho optimal singular-value shrinkage. |
@@ -118,7 +110,7 @@ follows AFNI conventions (single dash) where possible.
 
 | command | description |
 |---|---|
-| `ffs_moco` | Rigid-body motion correction (Gauss–Newton, heptic resampling). Writes AFNI-compatible motion files. |
+| `ffs_moco` | Rigid-body motion correction (Gauss–Newton, heptic resampling). Writes AFNI-compatible motion files (3dvolreg is still faster). |
 | `ffs_allineate` | 6/9/12-parameter affine alignment. |
 | `ffs_qwarp` | Iterative nonlinear warp estimation (`3dQwarp`-style). |
 | `ffs_nwarp` | Apply a warp to a volume or 4D timeseries. Supports complex (mag + phase) warping. |
@@ -133,6 +125,17 @@ follows AFNI conventions (single dash) where possible.
 | command | description |
 |---|---|
 | `ffs_benchmark` | Run AFNI and `ffs_*` tools side by side on a BIDS dataset (default: OpenNeuro ds005165) and compare outputs and timing. `-validate-only` skips re-running and just compares. |
+
+### Less used tools
+
+These are either WIP CLI tools, things that I am tinkering with or ones that I just don't think are super important.
+
+| command | description |
+|---|---|
+| `ffs_build_design` | Build a 1D design matrix from onsets, durations, an HRF model, polynomials, and motion. Output is readable by `ffs_reml` and AFNI tools. |
+| `ffs_tps` | Thin-plate-spline HRF estimation with cross-validated smoothness. Global or per-voxel λ. |
+| `ffs_xval_r2` | Cross-validated R² maps (LORO or split-half) with proper nuisance projection. |
+| `ffs_pathfinder` | Joint HRF + denoising optimisation. Picks the HRF that works best with the denoising level chosen for that voxel. |
 
 ## A typical pipeline
 
