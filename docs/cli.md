@@ -49,7 +49,7 @@ ffs_reml \
 Key flags:
 
 - Pass in a BIDS events file with `-events` and skip the headache
-- or pass `-onsets` and `duratotions and let `ffs_reml` build the design internally.
+- or pass `-onsets` and `durations and let `ffs_reml` build the design internally.
 - `-matrix` for an existing design, from 3dDeconvolve (for copmarison, for example)
 - Output controls: `-Rbuck` (REML betas + stats), `-Rbeta` (betas only), `-Rerrts` / `-Rfitts`, `-Obuck` for OLS comparison.
 - `-load_Rvar` to reuse a previous `-Rvar` and skip the (a, b) grid search on re-runs.
