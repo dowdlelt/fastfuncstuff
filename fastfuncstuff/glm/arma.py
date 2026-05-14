@@ -1568,206 +1568,6 @@ def precompute_reml_grid(
     return precomputed
 
 
-def _cpu_hierarchical_reml_search(
-    X: torch.Tensor,
-    Y_batch: torch.Tensor,
-    a_grid: torch.Tensor,
-    b_grid: torch.Tensor,
-    precomputed: dict,
-    dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    CPU-OPTIMIZED hierarchical REML grid search with per-voxel early stopping.
-
-    This implements AFNI's power-of-2 descent strategy (step=8→4→2→1) which
-    works efficiently on CPU because each voxel can narrow its search window
-    independently. This approach does NOT work on GPU batch processing where
-    all voxels must evaluate the same grid points.
-
-    **AFNI-style algorithm:**
-    1. Start at step=8: evaluate grid at (0,0), (0,8), (8,0), (8,8), etc.
-    2. Find best for THIS voxel
-    3. Narrow window around best ± step
-    4. Reduce step to 4, then 2, then 1
-    5. Early stop if no improvement
-
-    **Why CPU-only:**
-    - CPUs process voxels sequentially (or in small thread batches)
-    - Each voxel can have independent search trajectory
-    - Window narrowing works per-voxel
-    - Evaluates ~40-50 grid points instead of 117 (2-3x speedup)
-
-    **Why NOT GPU:**
-    - GPUs process large batches (1000s of voxels) in parallel
-    - All voxels must evaluate same grid points
-    - Can't narrow per-voxel without losing parallelism
-    - Would evaluate all 117 points anyway with extra overhead
-
-    Parameters
-    ----------
-    X : torch.Tensor, shape (n_timepoints, n_regressors)
-        Design matrix
-    Y_batch : torch.Tensor, shape (n_timepoints, n_voxels_batch)
-        Data for batch of voxels
-    a_grid : torch.Tensor
-        AR parameter grid (sorted)
-    b_grid : torch.Tensor
-        MA parameter grid (sorted)
-    precomputed : dict
-        Precomputed REML matrices for all (a,b) pairs
-    dtype : torch.dtype
-        Data type for computation
-
-    Returns
-    -------
-    best_params : torch.Tensor, shape (n_voxels_batch, 2)
-        Optimal (a, b) for each voxel
-    best_likelihoods : torch.Tensor, shape (n_voxels_batch,)
-        Minimum likelihood for each voxel
-    """
-    device = X.device
-    n_timepoints, n_voxels_batch = Y_batch.shape
-    n_regressors = X.shape[1]
-
-    # Sort grids and create lookup
-    a_vals_sorted = torch.sort(a_grid)[0]
-    b_vals_sorted = torch.sort(b_grid)[0]
-
-    # Create index mapping for (a_idx, b_idx) -> precomputed key
-    param_list = list(precomputed.keys())
-    _param_to_idx = {params: idx for idx, params in enumerate(param_list)}
-
-    def get_param_key(a_idx: int, b_idx: int):
-        """Get parameter key if it exists in grid"""
-        if a_idx < 0 or a_idx >= len(a_vals_sorted):
-            return None
-        if b_idx < 0 or b_idx >= len(b_vals_sorted):
-            return None
-        a_val = a_vals_sorted[a_idx].item()
-        b_val = b_vals_sorted[b_idx].item()
-        # Find closest match in precomputed (handle floating point)
-        for key in param_list:
-            if abs(key[0] - a_val) < 1e-6 and abs(key[1] - b_val) < 1e-6:
-                return key
-        return None
-
-    # Initialize results
-    best_params = torch.zeros(n_voxels_batch, 2, device=device, dtype=dtype)
-    best_likelihoods = torch.full(
-        (n_voxels_batch,), float("inf"), device=device, dtype=dtype
-    )
-
-    # Process each voxel independently (the CPU way!)
-    # Show progress bar for CPU since it processes voxels sequentially
-    from tqdm.auto import tqdm
-
-    voxel_iterator = range(n_voxels_batch)
-    if n_voxels_batch > 100:  # Only show for reasonable batch sizes
-        voxel_iterator = tqdm(voxel_iterator, desc="CPU REML search", unit="voxel")
-
-    for voxel_idx in voxel_iterator:
-        Y_voxel = Y_batch[:, voxel_idx : voxel_idx + 1]  # (n_timepoints, 1)
-
-        # Initialize search at (0, 0) if available
-        zero_key = get_param_key(0, 0)
-        if zero_key is not None:
-            lik = _evaluate_single_param(
-                X, Y_voxel, zero_key, precomputed, n_timepoints, n_regressors
-            )
-            best_likelihoods[voxel_idx] = lik
-            best_params[voxel_idx, 0] = zero_key[0]
-            best_params[voxel_idx, 1] = zero_key[1]
-
-        # Current best indices
-        best_a_idx = 0
-        best_b_idx = 0
-
-        # Power-of-2 descent: 8 → 4 → 2 → 1
-        max_level = max(0, min(len(a_vals_sorted), len(b_vals_sorted)).bit_length() - 2)
-
-        for level in range(max_level, -1, -1):
-            step = 1 << level  # 2^level
-
-            # Determine search window around current best
-            # For first iteration (step=8), search entire grid
-            # For later iterations, narrow around best ± 2*step
-            if level == max_level:
-                a_min, a_max = 0, len(a_vals_sorted) - 1
-                b_min, b_max = 0, len(b_vals_sorted) - 1
-            else:
-                window_size = step * 3  # Search ± 3*step around best
-                a_min = max(0, best_a_idx - window_size)
-                a_max = min(len(a_vals_sorted) - 1, best_a_idx + window_size)
-                b_min = max(0, best_b_idx - window_size)
-                b_max = min(len(b_vals_sorted) - 1, best_b_idx + window_size)
-
-            # Evaluate grid points at this step size within window
-            improved = False
-            for b_idx in range(b_min, b_max + 1, step):
-                for a_idx in range(a_min, a_max + 1, step):
-                    # Skip (0,0) if we already evaluated it
-                    if level == max_level and a_idx == 0 and b_idx == 0:
-                        continue
-
-                    param_key = get_param_key(a_idx, b_idx)
-                    if param_key is None:
-                        continue
-
-                    lik = _evaluate_single_param(
-                        X, Y_voxel, param_key, precomputed, n_timepoints, n_regressors
-                    )
-
-                    if lik < best_likelihoods[voxel_idx]:
-                        best_likelihoods[voxel_idx] = lik
-                        best_params[voxel_idx, 0] = param_key[0]
-                        best_params[voxel_idx, 1] = param_key[1]
-                        best_a_idx = a_idx
-                        best_b_idx = b_idx
-                        improved = True
-
-            # Early stopping: if no improvement at this level, done
-            if not improved and level < max_level:
-                break
-
-    return best_params, best_likelihoods
-
-
-def _evaluate_single_param(
-    X: torch.Tensor,
-    Y_voxel: torch.Tensor,
-    param_key: tuple[float, float],
-    precomputed: dict,
-    n_timepoints: int,
-    n_regressors: int,
-) -> float:
-    """
-    Evaluate REML likelihood for a single voxel at single (a,b) parameter.
-
-    Helper function for CPU hierarchical search.
-    """
-    # Get precomputed matrices
-    L_inv = precomputed[param_key]["L_inv"]  # (n_time, n_time) - lower Cholesky inverse
-    Q = precomputed[param_key]["Q"]           # (n_time, n_reg) - orthonormal cols
-    logdet_Rcorr = precomputed[param_key]["logdet_Rcorr"]  # scalar
-    logdet_XwTXw = precomputed[param_key]["logdet_XwTXw"]  # scalar
-
-    # Prewhiten data via GEMM: Y_w = L_inv @ Y_voxel  (no triangular solve!)
-    Y_w = L_inv @ Y_voxel  # (n_time, 1)
-
-    # Pythagorean RSS: ||Y_w||² - ||Q'Y_w||²  (no betas needed!)
-    Qt_Yw = Q.T @ Y_w  # (n_reg, 1)
-    rss = (Y_w.pow(2).sum() - Qt_Yw.pow(2).sum()).item()
-
-    # Compute REML likelihood
-    likelihood = (
-        logdet_Rcorr.item()
-        + logdet_XwTXw.item()
-        + (n_timepoints - n_regressors) * float(torch.log(torch.tensor(max(rss, 1e-10))))
-    )
-
-    return likelihood
-
-
 @torch.inference_mode()
 def batch_reml_grid_search(
     X: torch.Tensor,
@@ -1781,23 +1581,16 @@ def batch_reml_grid_search(
     run_starts: list[int] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Device-adaptive REML grid search with optimal strategy per device.
+    Exhaustive batch-parallel REML grid search.
 
-    **DEVICE-SPECIFIC OPTIMIZATION:**
+    Evaluates all valid (a, b) grid points across the entire voxel batch using
+    batched GEMMs over precomputed Cholesky inverses. Memory-adaptive grid
+    chunking keeps peak usage bounded; smart grid ordering (most common (a, b)
+    pairs first) combined with optional chunk-level early stopping cuts
+    evaluations on data where most voxels share a few common ARMA parameters.
 
-    **CPU Mode** (device.type == 'cpu'):
-    - Uses hierarchical search with per-voxel early stopping (AFNI-style)
-    - Power-of-2 descent: step=8→4→2→1
-    - Each voxel narrows search window independently
-    - Evaluates ~40-50 grid points instead of 117 (2-3x speedup)
-    - Why: CPUs process voxels sequentially, can optimize per-voxel
-
-    **GPU Mode** (device.type in ['cuda', 'mps']):
-    - Uses exhaustive batch-parallel search
-    - Evaluates ALL grid points for ALL voxels in massive parallel operation
-    - Automatically chunks grid if memory usage would be too high
-    - Why: GPUs process 1000s of voxels in parallel, all must evaluate same grid
-    - Hierarchical doesn't work here (can't narrow per-voxel without losing parallelism)
+    The same strategy is used on CPU and GPU: BLAS-3 throughput dominates the
+    cost of evaluating any single grid point on either device.
 
     Parameters
     ----------
@@ -1887,23 +1680,11 @@ def batch_reml_grid_search(
         )
         return best_params, best_likelihoods
 
-    # DEVICE-SPECIFIC SEARCH STRATEGY
-    # CPU: Use hierarchical search with per-voxel early stopping (AFNI-style)
-    # GPU: Use exhaustive batch parallel search (GPU-optimized)
-    if device.type == "cpu":
-        # CPU-OPTIMIZED: Hierarchical search with early stopping
-        # Each voxel can narrow its search window independently
-        # Evaluates ~40-50 grid points instead of 117 (2-3x speedup)
-        return _cpu_hierarchical_reml_search(
-            X, Y_batch, a_grid, b_grid, precomputed, dtype=dtype
-        )
-
-    # EXHAUSTIVE GRID SEARCH - GPU Batch Parallel Approach
-    # Unlike AFNI (sequential per-voxel), we process ALL voxels in parallel
-    # This means we must evaluate the SAME grid points for ALL voxels
-    # Hierarchical search doesn't help because we can't narrow per-voxel
-    # Solution: Evaluate all ~117 grid points in massive parallel operation
-    # This is what GPUs are designed for!
+    # EXHAUSTIVE GRID SEARCH - batch-parallel across all voxels.
+    # Same strategy on CPU and GPU: one BLAS-3 GEMM per grid chunk over the
+    # whole voxel batch, vs AFNI's sequential per-voxel search. With smart
+    # grid ordering and chunk-level early stopping this is ~10-50x faster
+    # than 3dREMLfit on either device.
 
     param_list = list(precomputed.keys())
 
@@ -2558,8 +2339,8 @@ def reml_grid_search_batched(
         design_dev = design.to(device, dtype=dtype)
 
     # Allocate results.
-    # Convention matches compute_reml_likelihood / _evaluate_single_param /
-    # the chunked GPU search: REML neg-log-likelihood, smaller = better.
+    # Convention matches compute_reml_likelihood and batch_reml_grid_search:
+    # REML neg-log-likelihood, smaller = better.
     best_params = torch.zeros(n_voxels, 2, dtype=dtype, device=torch.device("cpu"))
     best_likelihood = torch.full(
         (n_voxels,), float("inf"), dtype=dtype, device=torch.device("cpu")
