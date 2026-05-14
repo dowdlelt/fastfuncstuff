@@ -35,6 +35,26 @@ class BenchmarkContext:
         """Return ' -device <device>' for appending to FFS CLI command strings, or ''."""
         return f" -device {self.device}" if self.device else ""
 
+    @property
+    def ffs_tag(self) -> str:
+        """File/directory name tag identifying the FFS device variant.
+
+        Empty string for the default (GPU / auto-detected) build, ``"_cpu"``
+        for a CPU-forced run. Used by stage helpers to keep CPU-only outputs
+        from overwriting GPU outputs on the same dataset.
+        """
+        return "_cpu" if self.device == "cpu" else ""
+
+    @property
+    def ffs_prefix(self) -> str:
+        """Filename prefix for FFS outputs written into shared dirs.
+
+        ``"ffs"`` by default, ``"ffs_cpu"`` for CPU runs. Use this when a
+        stage writes ``ffs_*`` files into ``processing_dir`` alongside AFNI
+        outputs (e.g. ``ffs_mni_*``, ``ffs_tshift_*``).
+        """
+        return f"ffs{self.ffs_tag}"
+
     def __post_init__(self):
         self.data_dir = self.data_dir.resolve()
         if not self.dataset_id:
@@ -143,17 +163,17 @@ class BenchmarkContext:
     @property
     def ffs_hrfopt_dir(self) -> Path:
         """FFS HRF optimization outputs (Type B)."""
-        return self.data_dir / "ffs_hrfopt"
+        return self.data_dir / f"ffs_hrfopt{self.ffs_tag}"
 
     @property
     def ffs_denoise_dir(self) -> Path:
         """FFS PC denoising outputs (Type C)."""
-        return self.data_dir / "ffs_denoise"
+        return self.data_dir / f"ffs_denoise{self.ffs_tag}"
 
     @property
     def ffs_ridge_dir(self) -> Path:
         """FFS fracridge outputs (Type D)."""
-        return self.data_dir / "ffs_ridge"
+        return self.data_dir / f"ffs_ridge{self.ffs_tag}"
 
     @property
     def afni_glm_dir(self) -> Path:
@@ -163,7 +183,7 @@ class BenchmarkContext:
     @property
     def ffs_glm_dir(self) -> Path:
         """FFS OLS/REML outputs."""
-        return self.data_dir / "ffs_glm"
+        return self.data_dir / f"ffs_glm{self.ffs_tag}"
 
     @property
     def melodic_ica_dir(self) -> Path:
@@ -173,7 +193,7 @@ class BenchmarkContext:
     @property
     def ffs_ica_dir(self) -> Path:
         """FFS ICA outputs."""
-        return self.data_dir / "ffs_ica"
+        return self.data_dir / f"ffs_ica{self.ffs_tag}"
 
     @property
     def timing_dir(self) -> Path:

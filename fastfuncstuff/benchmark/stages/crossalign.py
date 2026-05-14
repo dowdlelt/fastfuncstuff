@@ -132,7 +132,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"-source_automask -autoweight -rigid "
             f"-base {ref} -source {src} "
             f"-prefix {al_out} "
-            f"-1Dmatrix_save {mat}",
+            f"-1Dmatrix_save {mat}"
+            f"{ctx.ffs_device_flag()}",
             label=f"ffs_allineate mean {task} run-{run} → ref",
             cwd=ctx.processing_dir,
         )

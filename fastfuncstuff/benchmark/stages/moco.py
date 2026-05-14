@@ -36,7 +36,7 @@ def _afni_moco_path(ctx: BenchmarkContext, task: str, run: int) -> str:
 
 
 def _ffs_moco_path(ctx: BenchmarkContext, task: str, run: int) -> str:
-    return str(ctx.processing_dir / f"ffs_moco_{ctx.bids_prefix(task, run)}_bold.nii")
+    return str(ctx.processing_dir / f"{ctx.ffs_prefix}_moco_{ctx.bids_prefix(task, run)}_bold.nii")
 
 
 def _afni_motion_path(ctx: BenchmarkContext, task: str, run: int) -> str:

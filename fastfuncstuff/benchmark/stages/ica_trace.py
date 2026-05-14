@@ -481,7 +481,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"-temp_concat -ordering stdev "
             f"-migp -migp_shuffle {shuffle_arg} "
             f"-trace {td} "
-            f"-prefix {pfx} -verbose",
+            f"-prefix {pfx} -verbose"
+            f"{ctx.ffs_device_flag()}",
             label=f"ffs_ica trace {dataset}",
             cwd=ctx.ffs_ica_dir,
         )

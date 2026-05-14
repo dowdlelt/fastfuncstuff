@@ -130,7 +130,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-prefix {FFS_PREFIX} "
         f"-noise-volume-last {NOISE_VOLS} "
         f"-decomp-method eigh "
-        f"-save-gfactor-map",
+        f"-save-gfactor-map"
+        f"{ctx.ffs_device_flag()}",
         label="ffs_nordic",
         cwd=nd,
         verbose=ctx.verbose,

@@ -95,7 +95,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_allineate + ffs_qwarp to MNI."""
-    ffs_dir = ctx.processing_dir / "ffs_warper"
+    ffs_dir = ctx.processing_dir / f"ffs_warper{ctx.ffs_tag}"
     ffs_dir.mkdir(exist_ok=True)
 
     total = 0.0
@@ -113,7 +113,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"-base {_afni_template()} "
             f"-prefix {al_out} "
             f"-source_automask -autoweight "
-            f"-cost lpa -lpa_sigma 5",
+            f"-cost lpa -lpa_sigma 5"
+            f"{ctx.ffs_device_flag()}",
             label="ffs_allineate anat-to-MNI",
             cwd=ffs_dir,
         )
@@ -126,7 +127,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"-source {al_out} "
             f"-base {_afni_template()} "
             f"-minpatch 11 -lpa "
-            f"-prefix {qwarp_out}",
+            f"-prefix {qwarp_out}"
+            f"{ctx.ffs_device_flag()}",
             label="ffs_qwarp anat-to-MNI",
             cwd=ffs_dir,
         )

@@ -92,7 +92,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-tzero 0 "
         f"-wsinc9 "
         f"-tpattern {tp} "
-        f"-prefix {out}",
+        f"-prefix {out}"
+        f"{ctx.ffs_device_flag()}",
         label="ffs_slicetime localizer run-1",
         cwd=ctx.processing_dir,
     )

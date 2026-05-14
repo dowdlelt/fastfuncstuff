@@ -183,7 +183,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 f'-master {master} -dxyz 3.0 -interp wsinc5 '
                 f'-nwarp "{nwarp}" '
                 f'-source {_input_path(ctx, task, run)} '
-                f'-prefix {out}',
+                f'-prefix {out}'
+                f'{ctx.ffs_device_flag()}',
                 label=f"ffs_nwarp {task} run-{run}",
                 cwd=ctx.processing_dir,
             )

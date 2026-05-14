@@ -122,7 +122,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         prefix = _ffs_prefix(ctx, dataset)
         elapsed, _ = run_timed(
             f"ffs_ica -input {inputs} -ordering stdev "
-            f"-prefix {prefix} -verbose",
+            f"-prefix {prefix} -verbose"
+            f"{ctx.ffs_device_flag()}",
             label=f"ffs_ica single {dataset}",
             cwd=ctx.ffs_ica_dir,
         )

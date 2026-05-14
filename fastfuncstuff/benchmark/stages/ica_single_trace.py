@@ -447,7 +447,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 f"{mask_arg} "
                 f"-ordering stdev "
                 f"-trace {trace_base} "
-                f"-prefix {pfx} -verbose",
+                f"-prefix {pfx} -verbose"
+                f"{ctx.ffs_device_flag()}",
                 label=f"ffs_ica trace {dataset} run-{run}",
                 cwd=ctx.ffs_ica_dir,
             )

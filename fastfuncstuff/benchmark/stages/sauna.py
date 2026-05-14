@@ -69,7 +69,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-decomp-method eigh "
         f"-save-gfactor-map "
         f"-gfactor-method polynomial "
-        f"-gfactor-degree-range 16 18 20 23 25 27",
+        f"-gfactor-degree-range 16 18 20 23 25 27"
+        f"{ctx.ffs_device_flag()}",
         label="ffs_sauna",
         cwd=nd,
         verbose=ctx.verbose,

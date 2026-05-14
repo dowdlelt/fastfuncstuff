@@ -42,7 +42,7 @@ def _afni_dir(ctx: BenchmarkContext) -> Path:
 
 
 def _ffs_dir(ctx: BenchmarkContext) -> Path:
-    return ctx.data_dir / "ffs_glm_IM_REML"
+    return ctx.data_dir / f"ffs_glm_IM_REML{ctx.ffs_tag}"
 
 
 def _scaled_input(ctx: BenchmarkContext, run: int) -> Path:

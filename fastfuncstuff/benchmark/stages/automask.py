@@ -78,7 +78,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 continue
             src = _mean_path(ctx, task, run)
             elapsed, _ = run_timed(
-                f"ffs_util_automask -input {src} -prefix {out}",
+                f"ffs_util_automask -input {src} -prefix {out}{ctx.ffs_device_flag()}",
                 label=f"ffs_util_automask {task} run-{run}",
                 cwd=ctx.processing_dir,
             )
