@@ -1976,6 +1976,7 @@ def search_voxels_precomputed_grid_hierarchical(
     n_voxels_batch = Y_batch.shape[0]
     n_timepoints, n_regressors = X.shape
     _dtype = Y_batch.dtype
+    T_minus_K = n_timepoints - n_regressors
 
     if Y_batch.device != device:
         Y_batch = Y_batch.to(device)
@@ -1987,68 +1988,35 @@ def search_voxels_precomputed_grid_hierarchical(
     n_a = len(a_vals_sorted)
     n_b = len(b_vals_sorted)
 
-    # (a_idx, b_idx) -> dict key (with fp-safe lookup)
-    def _key_for(ai: int, bi: int):
-        a_val = a_vals_sorted[ai]
-        b_val = b_vals_sorted[bi]
-        for k in param_list:
-            if abs(k[0] - a_val) < 1e-6 and abs(k[1] - b_val) < 1e-6:
-                return k
-        return None
+    # Build a 2D table (ai, bi) -> precomputed dict key (or None). Cached so
+    # we don't linear-scan param_list per evaluation.
+    key_table: list[list[tuple[float, float] | None]] = [
+        [None] * n_b for _ in range(n_a)
+    ]
+    for k in param_list:
+        a_val, b_val = k
+        for ai, av in enumerate(a_vals_sorted):
+            if abs(av - a_val) < 1e-6:
+                for bi, bv in enumerate(b_vals_sorted):
+                    if abs(bv - b_val) < 1e-6:
+                        key_table[ai][bi] = k
+                        break
+                break
 
     # Index of (0, 0) — AFNI's OLS init (always in grid via ensure_zero_in_grid).
     zero_a_idx = next(i for i, v in enumerate(a_vals_sorted) if abs(v) < 1e-6)
     zero_b_idx = next(i for i, v in enumerate(b_vals_sorted) if abs(v) < 1e-6)
 
-    # Per-voxel state — best indices and best likelihood so far.
+    # Per-voxel state.
     best_a_idx = torch.full((n_voxels_batch,), zero_a_idx, dtype=torch.long, device=device)
     best_b_idx = torch.full((n_voxels_batch,), zero_b_idx, dtype=torch.long, device=device)
     best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device, dtype=_dtype)
 
-    # Cache of evaluated likelihoods per (ai, bi) so we never recompute
-    # a grid point across levels (matches AFNI's rvab[kk] < BIGVAL skip).
-    evaluated: dict[tuple[int, int], torch.Tensor] = {}
-
-    # Per-pair progress bar (created below once we know total budget); kept
-    # as a name so the closure in _eval_point can tick it.
-    _pair_pbar = None
-
-    def _eval_point(ai: int, bi: int) -> torch.Tensor | None:
-        """Evaluate REML likelihood per voxel at grid index (ai, bi)."""
-        if (ai, bi) in evaluated:
-            return evaluated[(ai, bi)]
-        key = _key_for(ai, bi)
-        if key is None:
-            return None
-        gd = precomputed_grid[key]
-        L_inv = gd["L_inv"]
-        Q = gd["Q"]
-        logdet_Rcorr = gd["logdet_Rcorr"]
-        logdet_XwTXw = gd["logdet_XwTXw"]
-        # Single BLAS-3 GEMM across the entire voxel batch.
-        Y_w = (L_inv @ Y_batch.T).T  # (V, T)
-        Qt_Yw = Q.T @ Y_w.T          # (K, V)
-        rss = Y_w.pow(2).sum(dim=1) - Qt_Yw.pow(2).sum(dim=0)  # (V,)
-        lik = logdet_Rcorr + logdet_XwTXw + (n_timepoints - n_regressors) * torch.log(rss + 1e-10)
-        evaluated[(ai, bi)] = lik
-        if _pair_pbar is not None:
-            _pair_pbar.update(1)
-        return lik
-
-    # Step 1: evaluate (0, 0) for everyone (AFNI's OLS init).
-    init_lik = _eval_point(zero_a_idx, zero_b_idx)
-    if init_lik is not None:
-        best_likelihoods = init_lik.clone()
-
-    # Step 2: power-of-2 descent. ltop chosen so the coarsest step covers
-    # the grid: AFNI uses ltop = log2(min(na+1, nb+1)) - 2; we replicate
-    # via bit_length.
+    # Power-of-2 descent setup. ltop chosen so the coarsest step covers
+    # the grid: AFNI uses ltop = log2(min(na+1, nb+1)) - 2.
     ltop = max(0, min(n_a, n_b).bit_length() - 2)
     levels = list(range(ltop, -1, -1))
 
-    # Each grid-point evaluation is one batched GEMM across the whole voxel
-    # batch — show that as the progress unit. Worst case is the full grid
-    # (when voxel windows span everything); typical is 40-80 points.
     if verbose:
         from tqdm.auto import tqdm as _tqdm
         _pair_pbar = _tqdm(
@@ -2059,61 +2027,91 @@ def search_voxels_precomputed_grid_hierarchical(
     else:
         _pair_pbar = None
 
-    for lev in levels:
-        dab = 1 << lev  # 2^lev
+    def _eval_subset(ai: int, bi: int, active_idx: torch.Tensor) -> None:
+        """Evaluate REML likelihood at grid point (ai, bi) for the given
+        voxel subset and update their (best_a_idx, best_b_idx, best_lik)
+        where this evaluation improves on the current best.
+
+        This is the per-voxel work-elimination: BLAS-3 GEMM runs over only
+        the voxels that need this grid point (those with it in their own
+        ± step window), not the full V batch.
+        """
+        key = key_table[ai][bi]
+        if key is None:
+            return
+        gd = precomputed_grid[key]
+        L_inv = gd["L_inv"]
+        Q = gd["Q"]
+        logdet_Rcorr = gd["logdet_Rcorr"]
+        logdet_XwTXw = gd["logdet_XwTXw"]
+
+        Y_sub = Y_batch.index_select(0, active_idx)  # (n_active, T)
+        Y_w = Y_sub @ L_inv.T                         # (n_active, T)
+        Qt_Yw = Y_w @ Q                                # (n_active, K)
+        rss = Y_w.pow(2).sum(dim=1) - Qt_Yw.pow(2).sum(dim=1)  # (n_active,)
+        lik = logdet_Rcorr + logdet_XwTXw + T_minus_K * torch.log(rss + 1e-10)
+
+        cur_best = best_likelihoods.index_select(0, active_idx)
+        improve = lik < cur_best
+        if bool(improve.any()):
+            improved_globals = active_idx.masked_select(improve)
+            best_likelihoods[improved_globals] = lik.masked_select(improve)
+            best_a_idx[improved_globals] = ai
+            best_b_idx[improved_globals] = bi
         if _pair_pbar is not None:
-            # Surface current level so the user can read remaining work: at
-            # level ltop we visit very few points (coarse step), at level 0
-            # we may visit the entire grid (fine step).
-            _pair_pbar.set_postfix_str(f"level {lev}/{ltop} (step={dab})")
+            _pair_pbar.update(1)
 
-        # Per-voxel window at this level. At the coarsest level (ltop) the
-        # window is the entire grid (AFNI's initial pass); at every other
-        # level it narrows to ±dab around the current best.
+    # Step 1: OLS init at (0, 0) for every voxel.
+    _eval_subset(
+        zero_a_idx, zero_b_idx,
+        torch.arange(n_voxels_batch, dtype=torch.long, device=device),
+    )
+
+    # Step 2: power-of-2 descent. At each level a voxel evaluates only the
+    # grid points within ±step of *its own* current best. We iterate the
+    # union of all per-voxel windows, but the BLAS-3 GEMM at each point
+    # runs only over the voxels whose own window contains it. That is
+    # AFNI's per-voxel work elimination, batched over voxel cohorts.
+    for lev in levels:
+        step = 1 << lev
+        if _pair_pbar is not None:
+            _pair_pbar.set_postfix_str(f"level {lev}/{ltop} (step={step})")
+
+        # Window bounds per voxel for this level.
         if lev == ltop:
-            a_window_lo = torch.zeros(n_voxels_batch, dtype=torch.long, device=device)
-            a_window_hi = torch.full(
-                (n_voxels_batch,), n_a - 1, dtype=torch.long, device=device
-            )
-            b_window_lo = torch.zeros(n_voxels_batch, dtype=torch.long, device=device)
-            b_window_hi = torch.full(
-                (n_voxels_batch,), n_b - 1, dtype=torch.long, device=device
-            )
+            # Coarsest pass: window is the entire grid, every voxel
+            # participates in every grid point at this step.
+            a_lo = torch.zeros(n_voxels_batch, dtype=torch.long, device=device)
+            a_hi = torch.full((n_voxels_batch,), n_a - 1, dtype=torch.long, device=device)
+            b_lo = torch.zeros(n_voxels_batch, dtype=torch.long, device=device)
+            b_hi = torch.full((n_voxels_batch,), n_b - 1, dtype=torch.long, device=device)
         else:
-            a_window_lo = (best_a_idx - dab).clamp_(0, n_a - 1)
-            a_window_hi = (best_a_idx + dab).clamp_(0, n_a - 1)
-            b_window_lo = (best_b_idx - dab).clamp_(0, n_b - 1)
-            b_window_hi = (best_b_idx + dab).clamp_(0, n_b - 1)
+            a_lo = (best_a_idx - step).clamp_(0, n_a - 1)
+            a_hi = (best_a_idx + step).clamp_(0, n_a - 1)
+            b_lo = (best_b_idx - step).clamp_(0, n_b - 1)
+            b_hi = (best_b_idx + step).clamp_(0, n_b - 1)
 
-        # Iterate grid points at this step size; only evaluate those whose
-        # union-of-voxel-windows actually covers them.
-        for bi in range(0, n_b, dab):
-            in_b = (bi >= b_window_lo) & (bi <= b_window_hi)
+        for bi in range(0, n_b, step):
+            in_b = (bi >= b_lo) & (bi <= b_hi)
             if not bool(in_b.any()):
                 continue
-            for ai in range(0, n_a, dab):
-                in_a = (ai >= a_window_lo) & (ai <= a_window_hi)
+            for ai in range(0, n_a, step):
+                if key_table[ai][bi] is None:
+                    continue
+                in_a = (ai >= a_lo) & (ai <= a_hi)
                 in_window = in_a & in_b
                 if not bool(in_window.any()):
                     continue
-                lik = _eval_point(ai, bi)
-                if lik is None:
-                    continue
-                improve = in_window & (lik < best_likelihoods)
-                if not bool(improve.any()):
-                    continue
-                best_likelihoods = torch.where(improve, lik, best_likelihoods)
-                best_a_idx = torch.where(
-                    improve, torch.full_like(best_a_idx, ai), best_a_idx
-                )
-                best_b_idx = torch.where(
-                    improve, torch.full_like(best_b_idx, bi), best_b_idx
-                )
+                # Only the voxels whose own window contains (ai, bi)
+                # contribute to this GEMM. At level 0 each voxel's window
+                # is ±1 around its best, so a typical (ai, bi) is active
+                # for ~1/9 of the voxel batch — a real subset GEMM.
+                active_idx = in_window.nonzero(as_tuple=True)[0]
+                _eval_subset(ai, bi, active_idx)
 
     if _pair_pbar is not None:
         _pair_pbar.close()
 
-    # Translate index → value.
     a_vals_t = torch.tensor(a_vals_sorted, dtype=_dtype, device=device)
     b_vals_t = torch.tensor(b_vals_sorted, dtype=_dtype, device=device)
     best_params = torch.stack([a_vals_t[best_a_idx], b_vals_t[best_b_idx]], dim=1)
