@@ -1779,7 +1779,21 @@ def batch_reml_grid_search(
         ]
 
     n_chunks_evaluated = 0
-    for chunk_idx, chunk_indices in enumerate(grid_chunks):
+    # Multi-chunk runs on CPU can take many minutes per chunk on large
+    # voxel batches; surface progress so the user can see something is
+    # happening. Single-chunk runs (typical small-voxel-batch case) skip
+    # the bar to avoid clutter.
+    from tqdm.auto import tqdm as _tqdm
+    chunk_iter = (
+        _tqdm(
+            list(enumerate(grid_chunks)),
+            desc="REML grid search (chunks)",
+            unit="chunk",
+        )
+        if len(grid_chunks) > 1
+        else enumerate(grid_chunks)
+    )
+    for chunk_idx, chunk_indices in chunk_iter:
         # PHASE 1: Stack precomputed matrices for THIS CHUNK only
         chunk_keys = [param_list[i] for i in chunk_indices]
 
