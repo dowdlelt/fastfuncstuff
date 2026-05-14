@@ -1000,6 +1000,22 @@ def main():
     # rule on median R²) on the *same* noise pool and noise PCs. Reports how
     # much R² the combinatorial / singleton choice buys you over the
     # GLMdenoise default. No-op when -compare isn't set.
+    #
+    # FAIRNESS NOTE: both paths use matching LORO CV with identical inputs
+    # (same noise pool, same noise PCs, same nuisance, same task design), so
+    # the comparison is conceptually apples-to-apples. BUT the two paths
+    # evaluate R² through different code:
+    #   - combinatorial: compute_optimized_xval_r2_3dDenoise_style →
+    #     compute_xval_r2 (full prediction accumulators, combinatorial.py:980)
+    #   - baseline below: cross_validate_noise_pcs (streaming sufficient-
+    #     stats accumulators, sequential.py:1111)
+    # Math is equivalent but float reduction order differs → delta map
+    # carries a ~1e-5 implementation-noise floor. Matters only when the
+    # combinatorial advantage is itself near that scale. Tighter fix is to
+    # route the baseline through the same evaluator (fabricate a per-run
+    # result with optimal_combination=(0..k-1) and call
+    # compute_optimized_xval_r2_3dDenoise_style for both). Deferred until
+    # we've seen real-data deltas and know whether the floor matters.
     baseline_r2_t: torch.Tensor | None = None
     delta_r2_t: torch.Tensor | None = None
     baseline_k: int | None = None
