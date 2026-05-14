@@ -467,17 +467,23 @@ def get_adaptive_batch_size(
         except Exception:
             batch_size = 3000
     else:
-        # CPU or unknown device
-        # For CPU, we can use much larger batches since we have more RAM
-        # and can parallelize across cores
+        # CPU or unknown device.
+        # On CPU the per-voxel cost is dominated by BLAS-3 throughput on the
+        # grid-precomputed prewhitening GEMM (L_inv @ Y). Bigger voxel
+        # batches → fewer trips through the 117-pair grid loop AND better
+        # cache reuse per GEMM, so we want to bound this only by available
+        # RAM, not by an arbitrary cap. Earlier cap of 50k voxels meant a
+        # 167k-voxel dataset hit 4 batches × 117 pairs = 468 GEMMs instead
+        # of the natural 1 batch × 117 = 117 GEMMs.
         try:
             import psutil
 
             # Use 50% of available RAM (conservative, leaves room for OS and other processes)
             available_ram = psutil.virtual_memory().available * 0.5
             batch_size = int(available_ram / mem_per_voxel)
-            # Reasonable limits for CPU (parallelizes well with larger batches)
-            batch_size = max(5000, min(batch_size, 50000))
+            # Cap that matches the large-VRAM GPU branch; the RAM-derived
+            # value above is the real safety bound.
+            batch_size = max(5000, min(batch_size, 500000))
         except ImportError:
             # psutil not available, use conservative default
             batch_size = 5000
