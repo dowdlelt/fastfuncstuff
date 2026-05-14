@@ -1248,6 +1248,17 @@ def cross_validate_noise_pcs(
                 end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
                 nuisance_per_run.append(nuisance[start_tp:end_tp, :])
 
+    # Pre-compute QR projection factors once for ALL runs. Each fold's
+    # train/test call below picks the subset of factors it needs by run
+    # index — the QR of a given run's nuisance is invariant across folds,
+    # so caching here saves ~2 * n_folds redundant QRs per chunk.
+    q_factors_all: list[torch.Tensor | None] | None = None
+    if nuisance_per_run is not None:
+        from fastfuncstuff.glm.xval import compute_qr_projectors
+        q_factors_all = compute_qr_projectors(
+            nuisance_per_run, run_starts, device=proj_device
+        )
+
     # Generate CV splits based on strategy
     cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
     n_splits = len(cv_splits)
@@ -1441,12 +1452,18 @@ def cross_validate_noise_pcs(
             # Project nuisance from data and design per run
             # ================================================================
             if nuisance_per_run is not None:
-                # Project out nuisance from TRAINING data and design per run
-                # Use shared QR-based projection function for numerical stability
+                # Project out nuisance from TRAINING data and design per run.
+                # Reuse the per-run QR factors precomputed above (q_factors_all)
+                # — the QR depends only on each run's nuisance, not on the fold.
                 train_run_starts_local = _compute_local_run_starts(
                     train_runs, run_starts, n_timepoints
                 )
                 train_nuisance_per_run = [nuisance_per_run[i] for i in train_runs]
+                train_q_factors = (
+                    [q_factors_all[i] for i in train_runs]
+                    if q_factors_all is not None
+                    else None
+                )
 
                 data_train_projected, design_train_projected = project_out_nuisance_per_run(
                     data=chunk_data_train,
@@ -1454,14 +1471,19 @@ def cross_validate_noise_pcs(
                     nuisance_per_run=train_nuisance_per_run,
                     run_starts=train_run_starts_local,
                     device=proj_device,
+                    precomputed_q_factors=train_q_factors,
                 )
 
-                # Project out nuisance from TEST data and design
-                # Use shared QR-based projection function for numerical stability
+                # Project out nuisance from TEST data and design (same trick).
                 test_run_starts_local = _compute_local_run_starts(
                     test_runs, run_starts, n_timepoints
                 )
                 test_nuisance_per_run = [nuisance_per_run[i] for i in test_runs]
+                test_q_factors = (
+                    [q_factors_all[i] for i in test_runs]
+                    if q_factors_all is not None
+                    else None
+                )
 
                 data_test_projected, design_test_projected = project_out_nuisance_per_run(
                     data=chunk_data_test,
@@ -1469,6 +1491,7 @@ def cross_validate_noise_pcs(
                     nuisance_per_run=test_nuisance_per_run,
                     run_starts=test_run_starts_local,
                     device=proj_device,
+                    precomputed_q_factors=test_q_factors,
                 )
             else:
                 # No nuisance - no projection needed

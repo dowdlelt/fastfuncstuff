@@ -80,6 +80,7 @@ def project_out_nuisance_per_run(
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = False,
+    precomputed_q_factors: list[torch.Tensor | None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Project out nuisance regressors from data and design matrix, per run.
@@ -156,8 +157,18 @@ def project_out_nuisance_per_run(
     # Projection matrices are computed on compute device, then applied
     data_device = data.device
 
-    # Pre-compute QR factorizations using shared helper
-    q_factors = compute_qr_projectors(nuisance_per_run, run_starts, device=device)
+    # Pre-compute QR factorizations using shared helper — or skip if the
+    # caller already computed them for this set of runs (e.g. denoise CV
+    # reuses the same per-run nuisance across many folds).
+    if precomputed_q_factors is not None:
+        if len(precomputed_q_factors) != len(nuisance_per_run):
+            raise ValueError(
+                f"precomputed_q_factors has {len(precomputed_q_factors)} entries "
+                f"but nuisance_per_run has {len(nuisance_per_run)}"
+            )
+        q_factors = precomputed_q_factors
+    else:
+        q_factors = compute_qr_projectors(nuisance_per_run, run_starts, device=device)
 
     # Compute run lengths using the same pattern as slice_by_runs
     # run_starts contains starting timepoints for each run
