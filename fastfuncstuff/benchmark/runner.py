@@ -245,34 +245,77 @@ def run_timed(
         print(f"    Command: {cmd}")
 
     start = time.monotonic()
-    result = subprocess.run(
-        cmd,
-        shell=isinstance(cmd, str),
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-    )
-    elapsed = time.monotonic() - start
 
-    # When verbose output is requested, stream stdout/stderr regardless of
-    # success — this surfaces MPS warnings, deprecation notices, etc.
     if _show_output:
-        if result.stdout:
-            sys.stdout.write(result.stdout)
-            sys.stdout.flush()
-        if result.stderr:
-            sys.stderr.write(result.stderr)
-            sys.stderr.flush()
+        # Stream stdout/stderr line-by-line as the subprocess runs so the
+        # user sees progress (tqdm bars, banners) in real time. Capture into
+        # tail buffers so we can still report a useful error on non-zero exit.
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        max_tail = 200  # lines kept for error reporting
 
-    if result.returncode != 0:
-        stderr_tail = result.stderr[-500:] if result.stderr else "(no stderr)"
+        proc = subprocess.Popen(
+            cmd,
+            shell=isinstance(cmd, str),
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        import selectors
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ, ("stdout", sys.stdout, stdout_lines))
+        sel.register(proc.stderr, selectors.EVENT_READ, ("stderr", sys.stderr, stderr_lines))
+
+        open_streams = 2
+        while open_streams > 0:
+            for key, _ in sel.select(timeout=0.5):
+                _, sink, buf = key.data
+                line = key.fileobj.readline()
+                if not line:
+                    sel.unregister(key.fileobj)
+                    open_streams -= 1
+                    continue
+                sink.write(line)
+                sink.flush()
+                buf.append(line)
+                if len(buf) > max_tail:
+                    del buf[: len(buf) - max_tail]
+
+        proc.wait()
+        elapsed = time.monotonic() - start
+        stdout_tail = "".join(stdout_lines)
+        stderr_tail = "".join(stderr_lines)
+        returncode = proc.returncode
+    else:
+        result = subprocess.run(
+            cmd,
+            shell=isinstance(cmd, str),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+        )
+        elapsed = time.monotonic() - start
+        stdout_tail = result.stdout or ""
+        stderr_tail = result.stderr or ""
+        returncode = result.returncode
+
+    if returncode != 0:
+        tail = stderr_tail[-500:] if stderr_tail else "(no stderr)"
         raise RuntimeError(
-            f"Command failed ({label}): exit code {result.returncode}\n{stderr_tail}"
+            f"Command failed ({label}): exit code {returncode}\n{tail}"
         )
 
     if verbose:
         print(f"  Done: {label} ({elapsed:.1f}s)")
 
+    # Synthesise a CompletedProcess-ish return value for callers that inspect
+    # .stdout / .stderr (only really used for error tails today).
+    result = subprocess.CompletedProcess(
+        args=cmd, returncode=returncode, stdout=stdout_tail, stderr=stderr_tail
+    )
     return elapsed, result
 
 
