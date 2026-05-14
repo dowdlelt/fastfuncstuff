@@ -134,8 +134,13 @@ def validate(ctx: BenchmarkContext) -> dict:
         nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj
     ).flatten().astype(bool)
 
-    # Load FFS results
-    ffs_hrf_index = np.array(nib.load(str(ffs / "hrfopt_hrf_index.nii.gz")).dataobj).flatten()
+    # Load FFS results. ffs_hrfopt writes hrf_index as 4D with 2 sub-briks:
+    # [0] = chosen HRF index (1..N_HRFS), [1] = per-voxel quality/score.
+    # Compare against MATLAB's 3D single-brik output using sub-brik 0.
+    ffs_idx_raw = np.array(nib.load(str(ffs / "hrfopt_hrf_index.nii.gz")).dataobj)
+    if ffs_idx_raw.ndim == 4:
+        ffs_idx_raw = ffs_idx_raw[..., 0]
+    ffs_hrf_index = ffs_idx_raw.flatten()
     ffs_r2 = np.array(nib.load(str(ffs / "hrfopt_xval_r2.nii.gz")).dataobj).flatten()
 
     # Compare within mask
