@@ -69,6 +69,7 @@ end
 bmark_data_dir = getenv('FFS_BENCHMARK_DATA_DIR');
 if ~isempty(bmark_data_dir)
     cd(bmark_data_dir);
+    cd('ds005165-download');  % Subdirectory where data is expected # TODO fix this, shouldn't be hardcoded
 end
 % If neither is set, the caller must have cd'd here already.
 
