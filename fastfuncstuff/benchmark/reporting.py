@@ -74,10 +74,97 @@ def print_validation_report(
     print("-" * 80)
     print(f"Total: {n_pass} passed, {n_fail} failed out of {len(results)} stages")
 
+    # Timing comparison (Ref/FFS/Speedup) — only if any stage has timing data.
+    # Mirrors the table in print_timing_report so users don't need to pass
+    # -report to see how FFS stacks up against the reference tool.
+    if data_dir is not None:
+        _print_timing_summary(results, data_dir)
+
     # Detailed metrics + historical comparison
     _print_stage_details(results)
     if data_dir:
         _print_regression_analysis(results, data_dir, git)
+
+
+def _print_timing_summary(
+    results: list[StageResult],
+    data_dir: Path,
+) -> None:
+    """Compact Ref/FFS/Speedup table; cached refs pulled in for missing live values.
+
+    Skipped entirely when no stage has any timing data — keeps validate-only
+    runs noise-free when they're truly validation-only (no commands timed).
+    """
+    my_ref_id = get_ref_arch_id()
+
+    cached_refs: dict[str, list[tuple[str, float]]] = {}
+    for r in results:
+        if not (r.ref_time and r.ref_time > 0):
+            cached_refs[r.stage_name] = get_ref_timings_all_archs(data_dir, r.stage_name)
+
+    # Also pull cached glmsingle_matlab ref for the pipeline-aggregate row, in
+    # case MATLAB wasn't re-run this invocation (common: run MATLAB once, then
+    # iterate on the FFS stages).
+    if _GLMSINGLE_REF_STAGE not in cached_refs:
+        cached_refs[_GLMSINGLE_REF_STAGE] = get_ref_timings_all_archs(
+            data_dir, _GLMSINGLE_REF_STAGE
+        )
+
+    # Resolve a display ref for each stage (live, then cached-local, then cached-other)
+    rows: list[tuple[str, float, float, str]] = []  # (name, ref_t, ffs_t, ref_marker)
+    any_timing = False
+    any_local_cached = False
+    any_other_cached = False
+    for r in results:
+        ffs_t = r.ffs_time or 0.0
+        ref_t = r.ref_time or 0.0
+        marker = ""
+        if ref_t <= 0 and r.stage_name in cached_refs:
+            all_refs = cached_refs[r.stage_name]
+            local = next((rv for av, rv in all_refs if av == my_ref_id), None)
+            if local is not None:
+                ref_t, marker = local, "†"
+                any_local_cached = True
+            elif all_refs:
+                _, ref_t = all_refs[0]
+                marker = "‡"
+                any_other_cached = True
+        if ref_t > 0 or ffs_t > 0:
+            any_timing = True
+        rows.append((r.stage_name, ref_t, ffs_t, marker))
+
+    if not any_timing:
+        return
+
+    print(f"\n{' TIMING (Ref vs FFS) ':=^80}")
+    print(f"  {'Stage':<16} {'Ref (s)':>12} {'FFS (s)':>10} {'Speedup':>10}")
+    print(f"  {'-' * 50}")
+
+    for sname, ref_t, ffs_t, marker in rows:
+        ref_str = f"{ref_t:.1f}{marker}" if ref_t > 0 else "-"
+        ffs_str = f"{ffs_t:.1f}" if ffs_t > 0 else "-"
+        speedup = f"{ref_t / ffs_t:.1f}x" if (ref_t > 0 and ffs_t > 0) else "-"
+        print(f"  {sname:<16} {ref_str:>12} {ffs_str:>10} {speedup:>10}")
+
+        # GLMsingle pipeline aggregate after the last FFS stage in that pipeline
+        if sname == _GLMSINGLE_FFS_STAGES[-1]:
+            agg = _glmsingle_aggregate(results, cached_refs, my_ref_id)
+            if agg is not None:
+                a_ref, a_ffs, a_local, a_other = agg
+                a_marker = "†" if a_local else ("‡" if a_other else "")
+                print(
+                    f"  {'glmsingle(tot)':<16} {f'{a_ref:.1f}{a_marker}':>12} "
+                    f"{a_ffs:>10.1f} {a_ref / a_ffs:>9.1f}x  (hrf+denoise+ridge vs matlab)"
+                )
+                if a_local:
+                    any_local_cached = True
+                elif a_other:
+                    any_other_cached = True
+
+    if any_local_cached:
+        print(f"  † cached ref timing (CPU arch: {my_ref_id})")
+    if any_other_cached:
+        print("  ‡ cached ref timing from a different CPU architecture")
 
 
 def _print_moco_detail(validation: dict) -> None:
@@ -490,7 +577,7 @@ def _print_ffs_timing_trend(
     if not stage_names:
         return
 
-    print(f"\n{'FFS TIMING TREND (last {len(recent)} runs)':=^80}")
+    print(f"\n{f' FFS TIMING TREND (last {len(recent)} runs) ':=^80}")
     # Header: commit hashes
     commits = []
     for run in recent:
