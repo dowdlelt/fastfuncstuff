@@ -141,8 +141,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-pcstop 1.05 "
         f"-max_comps 10 "
         f"-brainthresh 99 0.1 "
-        f"-do_scale "
-        f"-device cuda"
+        f"-do_scale"
+        f"{ctx.ffs_device_flag()}"
     )
 
     elapsed, _ = run_timed(cmd, label="ffs_denoise -single_trials", cwd=ctx.processing_dir)

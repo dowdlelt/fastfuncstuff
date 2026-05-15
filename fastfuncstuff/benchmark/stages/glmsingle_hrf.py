@@ -124,8 +124,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-single_trials "
         f"-save_single_trial_betas "
         f"-hrf_mode library "
-        f"-metric cod "
-        f"-device cuda"
+        f"-metric cod"
+        f"{ctx.ffs_device_flag()}"
     )
 
     elapsed, _ = run_timed(cmd, label="ffs_hrfopt -single_trials", cwd=ctx.processing_dir)
