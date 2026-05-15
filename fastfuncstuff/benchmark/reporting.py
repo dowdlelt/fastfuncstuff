@@ -568,16 +568,27 @@ def _print_ffs_timing_trend(
     """Show FFS timing trend across recent runs."""
     from .timing_cache import get_recent_runs
 
-    recent = get_recent_runs(data_dir, max_runs=5)
-    if len(recent) < 2:
-        return
-
     # Build a table of FFS timings per stage across commits
     stage_names = [r.stage_name for r in results if r.ffs_time and r.ffs_time > 0]
     if not stage_names:
         return
 
-    print(f"\n{f' FFS TIMING TREND (last {len(recent)} runs) ':=^80}")
+    # Pull a larger window so we can drop runs that didn't touch any of the
+    # stages we care about (e.g. previous invocations that benchmarked only a
+    # different sub-pipeline) and still show ~9 useful columns of history.
+    max_cols = 9
+    raw_recent = get_recent_runs(data_dir, max_runs=50)
+    recent = [
+        run for run in raw_recent
+        if any(
+            run.get("stages", {}).get(s, {}).get("ffs_seconds") is not None
+            for s in stage_names
+        )
+    ][:max_cols]
+    if len(recent) < 2:
+        return
+
+    print(f"\n{f' FFS TIMING TREND (last {len(recent)} runs with these stages) ':=^80}")
     # Header: commit hashes
     commits = []
     for run in recent:
