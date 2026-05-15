@@ -102,6 +102,16 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
+def run_ref(ctx: BenchmarkContext) -> float:
+    """Return the GLMsingle Type D (GLMDENOISE_RR) time from the MATLAB log.
+
+    The MATLAB stage writes per-model timings to
+    ``glmsingle/glmsingle_timings.json``. Returns 0.0 when not available.
+    """
+    from . import glmsingle_matlab
+    return float(glmsingle_matlab.load_timings(ctx).get("type_d", 0.0))
+
+
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_ridge -single_trials on localizer data."""
     out_dir = ctx.ffs_ridge_dir

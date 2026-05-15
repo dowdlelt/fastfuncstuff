@@ -11,17 +11,43 @@ The MATLAB script has two phases:
 Control via ctx.force_ref (treats MATLAB as the "reference" tool):
   - force_ref=False: skip if outputs exist
   - force_ref=True: rerun + reexport
+
+Per-model timings (Types A/B/C/D) are parsed from the MATLAB stdout log
+and saved to ``glmsingle/glmsingle_timings.json`` so that the downstream
+glmsingle_hrf / glmsingle_denoise / glmsingle_ridge stages can report
+them as reference timings for head-to-head comparison against the FFS
+tools.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import shutil
+import subprocess
+import sys
+import time
 from pathlib import Path
 
-from ..runner import BenchmarkContext, run_timed
+from ..runner import BenchmarkContext
 
 name = "glmsingle_matlab"
 description = "Run MATLAB GLMsingle (reference implementation)"
+
+
+# Patterns matching the per-model timing lines emitted by GLMsingle (Types
+# C/D are native; Types A/B come from print statements added to the
+# comparison script). Type A is captured for completeness but not consumed
+# by any downstream stage yet.
+_TIMING_PATTERNS: dict[str, re.Pattern[str]] = {
+    "type_a": re.compile(r"TYPE A DONE,\s*total time:\s*([\d.]+)\s*seconds"),
+    "type_b": re.compile(r"TYPE B HRF fit DONE,\s*total time:\s*([\d.]+)\s*seconds"),
+    "type_c": re.compile(r"Finished processing model 3\.\s*Time taken:\s*([\d.]+)\s*seconds"),
+    "type_d": re.compile(r"Finished processing model 4\.\s*Time taken:\s*([\d.]+)\s*seconds"),
+}
+
+TIMINGS_FILENAME = "glmsingle_timings.json"
 
 
 def _glm_params(ctx: BenchmarkContext) -> dict:
@@ -80,6 +106,97 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
+def _run_matlab_with_log(cmd: str, log_file: Path, cwd: Path) -> float:
+    """Run MATLAB, capturing the full combined stdout+stderr to ``log_file``.
+
+    Unlike ``runner.run_timed`` which truncates streamed output to a 200-line
+    tail, this writes every line to disk so the timing-line regexes can
+    match anywhere in the (multi-thousand-line) MATLAB log.
+    """
+    from ..runner import _show_output
+
+    print("  Running: MATLAB GLMsingle...")
+    print(f"    Command: {cmd}")
+
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    start = time.monotonic()
+
+    with open(log_file, "w") as logf:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            logf.write(line)
+            logf.flush()
+            if _show_output:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        proc.wait()
+
+    elapsed = time.monotonic() - start
+
+    if proc.returncode != 0:
+        try:
+            tail = log_file.read_text(errors="replace")[-500:]
+        except OSError:
+            tail = "(no log)"
+        raise RuntimeError(
+            f"Command failed (MATLAB GLMsingle): exit code {proc.returncode}\n{tail}"
+        )
+
+    print(f"  Done: MATLAB GLMsingle ({elapsed:.1f}s)")
+    return elapsed
+
+
+def _parse_matlab_timings(log_file: Path) -> dict[str, float]:
+    """Extract per-model timings from a MATLAB run log.
+
+    Returns a dict with whichever of ``type_a/b/c/d`` keys were found.
+    Returns ``{}`` if the log is unreadable.
+    """
+    if not log_file.exists():
+        return {}
+    try:
+        text = log_file.read_text(errors="replace")
+    except OSError:
+        return {}
+    found: dict[str, float] = {}
+    for key, pat in _TIMING_PATTERNS.items():
+        m = pat.search(text)
+        if m:
+            try:
+                found[key] = float(m.group(1))
+            except ValueError:
+                pass
+    return found
+
+
+def load_timings(ctx: BenchmarkContext) -> dict[str, float]:
+    """Load the per-model timings JSON, if present. Empty dict otherwise."""
+    tf = ctx.glmsingle_dir / TIMINGS_FILENAME
+    if not tf.exists():
+        return {}
+    try:
+        data = json.loads(tf.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, float] = {}
+    for k, v in data.items():
+        if isinstance(v, (int, float)):
+            out[str(k)] = float(v)
+    return out
+
+
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run MATLAB GLMsingle (treated as the 'reference' tool)."""
     script = _matlab_script(ctx)
@@ -103,11 +220,24 @@ def run_ref(ctx: BenchmarkContext) -> float:
         f"run('{script}');\""
     )
 
-    elapsed, _ = run_timed(
-        matlab_cmd,
-        label="MATLAB GLMsingle",
-        cwd=ctx.data_dir,
-    )
+    log_file = gs / "matlab_run.log"
+    elapsed = _run_matlab_with_log(matlab_cmd, log_file, ctx.data_dir)
+
+    # Parse per-model timings out of the log and persist for downstream
+    # stages. Missing/unmatched keys are silently omitted — the regex may
+    # not match on older MATLAB scripts that don't print Type A/B lines.
+    timings = _parse_matlab_timings(log_file)
+    if timings:
+        try:
+            (gs / TIMINGS_FILENAME).write_text(json.dumps(timings, indent=2))
+        except OSError as e:
+            print(f"  WARNING: could not write {TIMINGS_FILENAME}: {e}")
+        if ctx.verbose:
+            parts = [f"{k}={v:.1f}s" for k, v in sorted(timings.items())]
+            print(f"  Parsed GLMsingle per-model timings: {', '.join(parts)}")
+    elif ctx.verbose:
+        print("  WARNING: no per-model timings parsed from MATLAB log")
+
     return elapsed
 
 

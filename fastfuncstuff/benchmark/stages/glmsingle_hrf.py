@@ -86,6 +86,22 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
+def run_ref(ctx: BenchmarkContext) -> float:
+    """Return the GLMsingle Type B (FITHRF) time parsed from the MATLAB log.
+
+    The MATLAB stage (``glmsingle_matlab``) writes per-model timings to
+    ``glmsingle/glmsingle_timings.json``. This stage doesn't re-run MATLAB
+    — it just surfaces the Type B time as the reference timing so the
+    head-to-head Ref/FFS comparison line lights up against ``ffs_hrfopt``.
+
+    Returns 0.0 when no timing is available (e.g. the MATLAB stage hasn't
+    been run on this machine yet); the runner treats 0.0 as "no ref
+    timing" and falls back to cached arches.
+    """
+    from . import glmsingle_matlab
+    return float(glmsingle_matlab.load_timings(ctx).get("type_b", 0.0))
+
+
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_hrfopt -single_trials on localizer data."""
     out_dir = ctx.ffs_hrfopt_dir
