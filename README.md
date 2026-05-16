@@ -165,15 +165,14 @@ These are either WIP CLI tools, things that I am tinkering with or ones that I j
 GLMsingle-style single-trial analysis:
 
 ```
-ffs_denoise   -> noise PCs + count
 ffs_hrfopt    -> per-voxel HRF
-ffs_ridge     -> single-trial betas with per-voxel ridge
+ffs_denoise   -> noise PCs + count (with voxelwise HRFs)
+ffs_ridge     -> single-trial betas with per-voxel ridge (with HRFs + nuisance PCs)
 ```
 
 Or a more conventional GLM:
 
 ```
-ffs_build_design  -> design.1D
 ffs_reml          -> betas, t-stats, F-stats, FDR curves
 ```
 
