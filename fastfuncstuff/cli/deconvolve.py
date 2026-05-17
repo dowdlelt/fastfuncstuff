@@ -129,22 +129,22 @@ def parse_args():
             "Files are sorted by run number automatically (run-1 and run-01 both work). "
             "Conditions come from unique trial_type values; durations are read from the TSV "
             "and used to auto-estimate per-condition HRF windows unless -window is given. "
-            "Use -event_ignore to skip conditions; -event_cols for non-standard column names."
+            "Use -event-ignore to skip conditions; -event-cols for non-standard column names."
         ),
     )
     required.add_argument(
-        "-event_ignore",
+        "-event-ignore",
         nargs="+",
         metavar="CONDITION",
-        help="trial_type values to exclude when using -events (e.g. -event_ignore fixation null).",
+        help="trial_type values to exclude when using -events (e.g. -event-ignore fixation null).",
     )
     required.add_argument(
-        "-event_cols",
+        "-event-cols",
         nargs=3,
         metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
         help=(
             "Custom column names for -events TSV files, replacing BIDS defaults. "
-            "E.g. -event_cols onset_time duration_s condition_name"
+            "E.g. -event-cols onset_time duration_s condition_name"
         ),
     )
 
@@ -202,7 +202,7 @@ def parse_args():
     )
 
     model_opts.add_argument(
-        "-add_lag",
+        "-add-lag",
         nargs="+",
         type=int,
         metavar="TRS",
@@ -210,42 +210,42 @@ def parse_args():
             "Per-condition lag adjustment in TRs applied on top of the estimated or explicit "
             "window.  Positive = more lags, negative = fewer.  "
             "Provide one value (broadcast to all conditions) or one per condition.  "
-            "E.g. -add_lag 2 or -add_lag 1 0 -2"
+            "E.g. -add-lag 2 or -add-lag 1 0 -2"
         ),
     )
 
     model_opts.add_argument(
-        "-tent_n_basis",
+        "-tent-n-basis",
         type=int,
         metavar="N",
         help="Number of TENT basis functions (knots). Default: auto-calculated for TR spacing.",
     )
 
     model_opts.add_argument(
-        "-xval_tr_range",
+        "-xval-tr-range",
         type=int,
         default=0,
         metavar="N",
         help="Cross-validate the TENT window upper bound over ±N TRs around the -window "
              "top, in steps of 1 TR, using leave-one-run-out CV. The top with the highest "
              "mean held-out R² is used for the final fit. "
-             "E.g., '-window 0 15 -xval_tr_range 3' tries tops 12s..18s (default: 0 = disabled).",
+             "E.g., '-window 0 15 -xval-tr-range 3' tries tops 12s..18s (default: 0 = disabled).",
     )
 
     model_opts.add_argument(
-        "-per_voxel",
+        "-per-voxel",
         action="store_true",
-        help="When combined with -xval_tr_range, select the best window top *per voxel* "
+        help="When combined with -xval-tr-range, select the best window top *per voxel* "
              "rather than a single shared top. Each voxel's HRF is estimated with its "
              "individually optimal window; shorter windows are zero-padded on the right to "
              "the longest candidate window. Saves additional maps: "
              "{prefix}_windowsize.nii.gz (winning top in seconds) and "
              "{prefix}_r2_by_window.nii.gz (LORO R² per candidate, 4D). "
-             "Requires -xval_tr_range > 0 and ≥2 runs.",
+             "Requires -xval-tr-range > 0 and ≥2 runs.",
     )
 
     model_opts.add_argument(
-        "-round_onsets",
+        "-round-onsets",
         nargs="?",
         const=0.7,
         type=float,
@@ -256,12 +256,12 @@ def parse_args():
             "an onset rounds up (ceil); below it rounds down (floor). "
             "0.5 = standard nearest-TR rounding.  0.7 = biased toward floor "
             "(only round up if 70%%+ through the TR).  "
-            "Reducing TENT/CSPLIN to FIR: use -round_onsets then -model FIR."
+            "Reducing TENT/CSPLIN to FIR: use -round-onsets then -model FIR."
         ),
     )
 
     model_opts.add_argument(
-        "-round_durations",
+        "-round-durations",
         type=int,
         metavar="PLACES",
         help=(
@@ -273,7 +273,7 @@ def parse_args():
     )
 
     model_opts.add_argument(
-        "-tr_lock_threshold",
+        "-tr-lock-threshold",
         type=float,
         default=0.1,
         metavar="FRAC",
@@ -314,19 +314,19 @@ def parse_args():
     # Output options
     out_opts = parser.add_argument_group("Output Options")
     out_opts.add_argument(
-        "-save_betas",
+        "-save-betas",
         action="store_true",
         help="Save beta coefficients as 4D NIfTI file",
     )
 
     out_opts.add_argument(
-        "-save_design",
+        "-save-design",
         action="store_true",
         help="Save design matrix as .1D file (AFNI format)",
     )
 
     out_opts.add_argument(
-        "-save_design_plot",
+        "-save-design-plot",
         action="store_true",
         help="Save design matrix visualization (PNG image)",
     )
@@ -347,7 +347,7 @@ def parse_args():
         help="PyTorch device: cpu, cuda, mps (default: auto-detect). Overrides --cpu.",
     )
     hw_opts.add_argument(
-        "-debug_memory",
+        "-debug-memory",
         action="store_true",
         help="Print VRAM usage vs. prediction after each chunk loop (for memory tuning)",
     )
@@ -750,7 +750,7 @@ def main():
         print("ERROR: -onsets and -events are mutually exclusive", file=sys.stderr)
         return 1
     if (args.event_ignore or args.event_cols) and not args.events:
-        print("ERROR: -event_ignore and -event_cols require -events", file=sys.stderr)
+        print("ERROR: -event-ignore and -event-cols require -events", file=sys.stderr)
         return 1
 
     # ── BIDS events: parse early so we have n_conditions/labels/onsets before data load ──
@@ -1005,7 +1005,7 @@ def main():
             add_lag_list = add_lag_raw
         else:
             print(
-                f"ERROR: -add_lag must have 1 or {n_conditions} values (got {len(add_lag_raw)})",
+                f"ERROR: -add-lag must have 1 or {n_conditions} values (got {len(add_lag_raw)})",
                 file=sys.stderr,
             )
             return 1
@@ -1090,14 +1090,14 @@ def main():
 
     if args.xval_tr_range > 0 and model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
         if n_runs < 2:
-            print("WARNING: -xval_tr_range requires ≥2 runs. Skipping.", file=sys.stderr)
+            print("WARNING: -xval-tr-range requires ≥2 runs. Skipping.", file=sys.stderr)
         elif tent_windows is None:
             print("WARNING: tent_windows not set. Skipping xval.", file=sys.stderr)
         else:
             unique_tops = {w[1] for w in tent_windows}
             if len(unique_tops) > 1:
                 print(
-                    "WARNING: -xval_tr_range only supported when all conditions share "
+                    "WARNING: -xval-tr-range only supported when all conditions share "
                     "the same window top. Skipping.",
                     file=sys.stderr,
                 )
