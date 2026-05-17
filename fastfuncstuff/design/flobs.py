@@ -411,6 +411,7 @@ def fit_basis_constrained_ridge(
     prior_weight: float | str = "auto",
     device: torch.device | None = None,
     reconstruct_hrfs: bool = True,
+    chunk_size: int | None = None,
 ) -> FLOBSFitResult:
     """Penalised-least-squares fit with an arbitrary MVN(m, C) shape prior.
 
@@ -526,10 +527,14 @@ def fit_basis_constrained_ridge(
     if device is None:
         device = get_device()
 
+    # Keep data on CPU; the chunked solver below streams slices to the
+    # compute device.  Moving the whole array up front blows GPU
+    # memory for typical fMRI volumes (300k voxels × ~1000 TR × 8 B
+    # ≈ 2.5 GB), and we don't need it all there at once.
     y = (
-        torch.as_tensor(data, dtype=torch.float64, device=device)
+        torch.as_tensor(data, dtype=torch.float64, device="cpu")
         if not isinstance(data, torch.Tensor)
-        else data.to(device=device, dtype=torch.float64)
+        else data.to(device="cpu", dtype=torch.float64)
     )
     X = (
         torch.as_tensor(design_task, dtype=torch.float64, device=device)
@@ -598,22 +603,73 @@ def fit_basis_constrained_ridge(
     for c in range(n_blocks):
         m_bar[c * n_basis:(c + 1) * n_basis] = m_torch
 
-    # Estimate noise variance σ² from an initial OLS pass.  The
-    # Bayesian posterior precision is X'X/σ² + C^-1, equivalent to
-    # X'X + σ²·C^-1 after multiplying through.  So the natural prior
-    # weight is σ²; ``prior_weight="auto"`` uses the mean per-voxel
-    # residual variance, a float overrides as a multiplier on that.
+    # ---------------------------------------------------------------
+    # Voxel-chunked two-pass solver.  We never materialise the full
+    # ``(n_voxels, n_t)`` predicted / residual tensors — for
+    # 306k voxels × 1152 TR × float64 that's ~2.8 GB per tensor, which
+    # OOMs a 16 GB GPU once PyTorch caching and other intermediates
+    # are factored in.  Per-chunk peak memory is
+    # ``chunk × n_t × 16 bytes`` (data + predicted) + tiny constants.
+    #
+    # Pass 1 (OLS)         → ss_res_ols, beta_ols, ss_tot
+    # Pass 2 (constrained) → ss_res, betas
+    # Cholesky factors of X'X and (X'X + λ P) computed once, reused
+    # across chunks.
+    # ---------------------------------------------------------------
     XtX = X_full.T @ X_full
-    Xty = X_full.T @ y.T                              # (n_cols, n_voxels)
+
+    # Pre-factor for the OLS path (shared across chunks).
     try:
         L0 = torch.linalg.cholesky(XtX)
-        beta_ols = torch.cholesky_solve(Xty, L0)
+        use_chol_ols = True
     except torch.linalg.LinAlgError:
-        beta_ols = torch.linalg.lstsq(X_full, y.T).solution
-    resid = y - (X_full @ beta_ols).T                 # (n_voxels, n_t)
+        L0 = None
+        use_chol_ols = False
+
+    if chunk_size is None:
+        # Memory model: per-chunk peak ≈ chunk × n_t × 16 (data +
+        # predicted, float64) + n_cols × chunk × 8 (per-voxel betas).
+        # ``estimate_chunk_size`` handles the per-device defaults.
+        from fastfuncstuff.memory import estimate_chunk_size
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_t,
+            n_regressors=n_cols,
+            device=device,
+            operation="glm",
+            use_double=True,
+        )
+
+    # CPU-resident output accumulators.
+    beta_ols_full = torch.empty((n_voxels, n_cols), dtype=torch.float64, device="cpu")
+    betas_full = torch.empty((n_voxels, n_cols), dtype=torch.float64, device="cpu")
+    ss_res_ols_full = torch.empty(n_voxels, dtype=torch.float64, device="cpu")
+    ss_res_constrained_full = torch.empty(n_voxels, dtype=torch.float64, device="cpu")
+    ss_tot_full = torch.empty(n_voxels, dtype=torch.float64, device="cpu")
+
+    # ----------- Pass 1: OLS + sufficient stats ---------------------
+    for start in range(0, n_voxels, chunk_size):
+        end = min(start + chunk_size, n_voxels)
+        y_chunk = y[start:end].to(device, non_blocking=True)      # (chunk, n_t)
+        Xty_chunk = X_full.T @ y_chunk.T                          # (n_cols, chunk)
+        if use_chol_ols:
+            beta_chunk = torch.cholesky_solve(Xty_chunk, L0)
+        else:
+            beta_chunk = torch.linalg.lstsq(X_full, y_chunk.T).solution
+        pred = (X_full @ beta_chunk).T                            # (chunk, n_t)
+        resid = y_chunk - pred
+        ss_res_chunk = (resid ** 2).sum(dim=1)
+        y_mean = y_chunk.mean(dim=1, keepdim=True)
+        ss_tot_chunk = ((y_chunk - y_mean) ** 2).sum(dim=1)
+
+        beta_ols_full[start:end] = beta_chunk.T.cpu()
+        ss_res_ols_full[start:end] = ss_res_chunk.cpu()
+        ss_tot_full[start:end] = ss_tot_chunk.cpu()
+        del y_chunk, Xty_chunk, beta_chunk, pred, resid, ss_res_chunk, y_mean, ss_tot_chunk
+
+    # σ² mean from accumulated OLS residuals.
     dof = max(1, n_t - n_cols)
-    sigma2_per_voxel = (resid**2).sum(dim=1) / dof    # (n_voxels,)
-    sigma2_mean = float(sigma2_per_voxel.mean().item())
+    sigma2_mean = float(ss_res_ols_full.mean().item() / dof)
 
     if isinstance(prior_weight, str):
         if prior_weight != "auto":
@@ -622,59 +678,60 @@ def fit_basis_constrained_ridge(
     else:
         effective_weight = float(prior_weight) * sigma2_mean
 
-    # Closed-form penalised solve:
-    #   beta = (X'X + λ P)^-1 (X' y + λ P m̄)
-    # where λ = σ²·user_multiplier and P=block-diag(C^-1).
+    # ----------- Pass 2: constrained solve --------------------------
     A = XtX + effective_weight * P
-    rhs = Xty + effective_weight * (P @ m_bar)[:, None]
+    Pm = effective_weight * (P @ m_bar)                            # (n_cols,)
     try:
-        L = torch.linalg.cholesky(A)
-        betas = torch.cholesky_solve(rhs, L)
+        L_A = torch.linalg.cholesky(A)
+        use_chol_A = True
     except torch.linalg.LinAlgError:
-        # Safety net in case nuisance is collinear with task.
-        betas = torch.linalg.solve(A, rhs)
-    # betas: (n_cols, n_voxels) → transpose to (n_voxels, n_cols)
-    betas = betas.T
+        L_A = None
+        use_chol_A = False
 
-    # Predicted timecourse and R²
-    y_pred = betas @ X_full.T               # (n_voxels, n_t)
-    ss_res = ((y - y_pred) ** 2).sum(dim=1)
-    y_mean = y.mean(dim=1, keepdim=True)
-    ss_tot = ((y - y_mean) ** 2).sum(dim=1)
-    r2 = 1.0 - ss_res / torch.clamp(ss_tot, min=1e-30)
+    for start in range(0, n_voxels, chunk_size):
+        end = min(start + chunk_size, n_voxels)
+        y_chunk = y[start:end].to(device, non_blocking=True)
+        Xty_chunk = X_full.T @ y_chunk.T
+        rhs_chunk = Xty_chunk + Pm[:, None]
+        if use_chol_A:
+            beta_chunk = torch.cholesky_solve(rhs_chunk, L_A)
+        else:
+            beta_chunk = torch.linalg.solve(A, rhs_chunk)
+        pred = (X_full @ beta_chunk).T
+        resid = y_chunk - pred
+        ss_res_chunk = (resid ** 2).sum(dim=1)
 
-    # Reconstruct per-(voxel, condition) HRF: basis-coefficient vector
-    # for that condition times the basis functions.  Do this for BOTH
-    # constrained and unconstrained fits so the caller can compare —
-    # this is critical for validating that the prior is doing the
-    # right thing rather than just silently distorting the fit.
-    betas_np = betas.cpu().numpy()
-    betas_ols_np = beta_ols.T.cpu().numpy()           # (n_voxels, n_cols)
+        betas_full[start:end] = beta_chunk.T.cpu()
+        ss_res_constrained_full[start:end] = ss_res_chunk.cpu()
+        del y_chunk, Xty_chunk, rhs_chunk, beta_chunk, pred, resid, ss_res_chunk
+
+    # ----------- R² assembly + return -------------------------------
+    r2 = 1.0 - ss_res_constrained_full / torch.clamp(ss_tot_full, min=1e-30)
+    r2_ols = 1.0 - ss_res_ols_full / torch.clamp(ss_tot_full, min=1e-30)
+
+    betas_np = betas_full.numpy()
+    betas_ols_np = beta_ols_full.numpy()
+
+    # Reconstruct per-(voxel, block) HRFs if requested.  Cost is
+    # n_voxels × n_blocks × n_t × 8 bytes; for single-trial fits the
+    # caller should pass reconstruct_hrfs=False and reconstruct per
+    # chunk on demand (as ffs_fitbasis does in its CLI).
     if reconstruct_hrfs:
-        # Memory cost: n_voxels × n_blocks × n_t × 8 bytes (float64).
-        # For per-condition fits (n_blocks ~ 5) this is small; for
-        # single-trial fits (n_blocks = total events, hundreds) it
-        # can hit tens of GB and we should let the caller compute
-        # what it needs per-chunk via the betas + basis_functions.
         task_betas = betas_np[:, :n_task_cols].reshape(n_voxels, n_blocks, n_basis)
         task_betas_ols = betas_ols_np[:, :n_task_cols].reshape(n_voxels, n_blocks, n_basis)
-        hrfs = task_betas @ basis_functions            # (n_voxels, n_blocks, n_t)
+        hrfs = task_betas @ basis_functions
         hrfs_ols = task_betas_ols @ basis_functions
     else:
         hrfs = None
         hrfs_ols = None
 
-    # Unconstrained-fit R² (reuse residuals we already computed).
-    ss_res_ols = (resid ** 2).sum(dim=1)
-    r2_ols = 1.0 - ss_res_ols / torch.clamp(ss_tot, min=1e-30)
-
     return FLOBSFitResult(
         betas=betas_np,
         hrfs=hrfs,
-        r2=r2.cpu().numpy(),
+        r2=r2.numpy(),
         betas_ols=betas_ols_np,
         hrfs_ols=hrfs_ols,
-        r2_ols=r2_ols.cpu().numpy(),
+        r2_ols=r2_ols.numpy(),
         sigma2_mean=sigma2_mean,
         effective_prior_weight=effective_weight,
         n_iter=1,
