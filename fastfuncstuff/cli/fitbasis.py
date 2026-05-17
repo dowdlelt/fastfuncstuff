@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""
+ffs_fitbasis — constrained basis-set HRF fits (SPMG1/SPMG2/SPMG3/FLOBS).
+
+This is the parametric / basis-set counterpart to [[ffs_deconvolve]].
+Where ``ffs_deconvolve`` does non-parametric FIR/TENT/CSPLIN
+deconvolution (one regressor per lag, no shape assumption),
+``ffs_fitbasis`` fits the HRF as a small linear combination of basis
+functions and optionally applies a Gaussian shape prior so the
+combination can't produce nonsense HRFs.
+
+Three things this tool can do that ``ffs_deconvolve`` cannot:
+
+1. **SPMG2 / SPMG3** — canonical + temporal-derivative (± dispersion-
+   derivative) — recovering both amplitude AND latency per
+   condition/trial.
+2. **FLOBS** — K=3 eigenHRFs derived from half-cosine HRF samples
+   (Woolrich, Behrens, Smith 2004 TR04MW2), with an empirical MVN(m, C)
+   shape prior.
+3. **Single-trial fits** (``-single-trials``) — one block of basis
+   regressors per trial, with the prior applied per-trial.  This is
+   where unconstrained SPMG2/3 fits famously go off the rails at short
+   ISIs; the constraint pulls each trial's coefficients back toward
+   sensible HRF shapes.
+
+The constraint is **generalised ridge** under the hood
+(:func:`fastfuncstuff.design.flobs.fit_basis_constrained_ridge`):
+
+.. math::
+
+    \\hat{\\beta} = (X'X + \\lambda P)^{-1} (X' y + \\lambda P \\bar{m})
+
+with ``P = block-diag(C^{-1})``.  Three choices of (m, C):
+
+- ``-reg none``  → no constraint, plain OLS.
+- ``-reg ridge`` → :func:`spmg_prior` for SPMG models (canonical free,
+  derivative coefficients tightly shrunk to zero), or :func:`ridge_prior`
+  isotropic for FLOBS.  Hand-picked weights; transparent.
+- ``-reg mvn``   → :func:`flobs_prior` for FLOBS (empirical (m, C) from
+  half-cosine samples), :func:`spmg_prior` defaults for SPMG.  This is
+  the closest thing to filmbabe (TR04MW2 §3) implemented as a
+  closed-form generalised ridge instead of full Variational Bayes —
+  matches in the shape-constraint piece, skips AR(P)/MRF.
+
+Outputs (per condition for the default fit, per trial with
+``-single-trials``):
+
+- ``{prefix}_fitbasis_basis.tsv``                — the K basis functions
+- ``{prefix}_fitbasis_r2.nii.gz``                — fit R²
+- ``{prefix}_fitbasis_r2_unconstrained.nii.gz``  — OLS R² for comparison
+- ``{prefix}_fitbasis_iresp_<cond>.nii.gz``      — reconstructed HRF (4-D)
+- ``{prefix}_fitbasis_iresp_<cond>_unconstrained.nii.gz``
+- ``{prefix}_fitbasis_pcweights_<cond>.nii.gz``  — coefficient maps
+- ``{prefix}_fitbasis_pcweights_<cond>_unconstrained.nii.gz``
+- ``{prefix}_fitbasis_amplitude_<cond>.nii.gz``  — peak amplitude for 2nd-level
+- ``{prefix}_fitbasis_amplitude_<cond>_unconstrained.nii.gz``
+- ``{prefix}_fitbasis_metadata.json``            — full provenance
+
+With ``-single-trials``: filenames carry ``_trial<NNN>`` suffix
+instead of ``_<cond>``, and amplitudes are stacked into a single 4-D
+volume per condition (time = trial number) — the GLMsingle-style
+output used for 2nd-level analyses across trials.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+
+try:
+    from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
+        load_and_preprocess_runs,
+        parse_device_arg,
+        parse_input_files,
+        parse_prefix,
+        preflight_check,
+    )
+    from fastfuncstuff.design.builder import (
+        pack_for_shared_task_glm,
+        parse_afni_timing_file,
+        parse_durations,
+    )
+    from fastfuncstuff.design.flobs import (
+        FLOBSBasis,
+        fit_basis_constrained_ridge,
+        flobs_prior,
+        generate_flobs_basis,
+        generate_spmg_basis,
+        ridge_prior,
+        spmg_prior,
+    )
+    from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
+    from fastfuncstuff.design.matrices import save_iresp
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.utils import configure_torch_backends
+except ImportError as e:
+    print(f"ERROR: Could not import fastfuncstuff: {e}")
+    print("Make sure fastfuncstuff is installed: pip install -e .")
+    sys.exit(1)
+
+
+class _HelpFormatter(
+    argparse.RawDescriptionHelpFormatter,
+    argparse.ArgumentDefaultsHelpFormatter,
+):
+    pass
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ffs_fitbasis",
+        description=(
+            "Constrained basis-set HRF fitting (SPMG1/SPMG2/SPMG3/FLOBS) "
+            "with optional shape prior and single-trial mode."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+
+    req = parser.add_argument_group("Required Arguments")
+    req.add_argument("-input", nargs="+", required=True,
+                     help="Input fMRI run files.")
+    req.add_argument("-prefix", required=True,
+                     help="Output prefix (e.g. out/sub01_fb).")
+
+    onset_grp = parser.add_argument_group("Event timing (choose one)")
+    onset_grp.add_argument("-onsets", nargs="+", default=None,
+                           help="AFNI-format onset files, one per condition.")
+    onset_grp.add_argument("-durations", nargs="+", default=None,
+                           help="Stimulus durations (s); one per condition (or single value).")
+    onset_grp.add_argument("-events", nargs="+", default=None, metavar="TSV",
+                           help="BIDS *_events.tsv files, one per run.")
+    # Each event-related flag accepts both hyphen and underscore forms
+    # (``-event-cols`` and ``-event_cols``) so muscle memory from AFNI /
+    # older ffs_* tools works.  argparse dispatches both to the same
+    # ``args.event_cols`` attribute via the canonical dest.
+    onset_grp.add_argument("-event-ignore", "-event_ignore",
+                           dest="event_ignore",
+                           nargs="+", default=None, metavar="LABEL",
+                           help="trial_type values to drop from BIDS events.")
+    onset_grp.add_argument("-event-cols", "-event_cols",
+                           dest="event_cols",
+                           nargs=3, default=None,
+                           metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+                           help="Override BIDS column names (default: onset duration trial_type).")
+    onset_grp.add_argument("-round-onsets", "-round_onsets",
+                           dest="round_onsets",
+                           nargs="?", const=0.7, type=float,
+                           default=None, metavar="THRESHOLD",
+                           help="Snap onsets to nearest TR (default threshold 0.7).")
+    onset_grp.add_argument("-round-durations", "-round_durations",
+                           dest="round_durations",
+                           type=int, default=None, metavar="PLACES",
+                           help="Round event durations to N decimals before grouping.")
+
+    model_grp = parser.add_argument_group("Model + constraint")
+    model_grp.add_argument(
+        "-model",
+        choices=["SPMG1", "SPMG2", "SPMG3", "FLOBS"],
+        default="SPMG2",
+        help=(
+            "Basis-set model.  SPMG1=canonical only (no shape variation), "
+            "SPMG2=canonical+temporal derivative, SPMG3=+ dispersion "
+            "derivative, FLOBS=K eigenHRFs from half-cosine samples + "
+            "empirical MVN(m, C) prior."
+        ),
+    )
+    model_grp.add_argument(
+        "-reg",
+        choices=["none", "ridge", "mvn"],
+        default="mvn",
+        help=(
+            "Regularisation / shape prior:\n"
+            "  none  — plain OLS, no shape constraint (see how it fails);\n"
+            "  ridge — diagonal generalised ridge with hand-picked per-basis "
+            "weights (defaults via spmg_prior / ridge_prior);\n"
+            "  mvn   — multivariate-normal shape prior; for FLOBS this is "
+            "the empirical (m, C) from half-cosine samples — closest to "
+            "filmbabe without full VB.  Default: mvn."
+        ),
+    )
+    model_grp.add_argument(
+        "-single-trials", "-single_trials",
+        dest="single_trials",
+        action="store_true",
+        help=(
+            "Fit one block of basis regressors per TRIAL instead of per "
+            "condition.  Amplitudes / shapes recovered per trial; the "
+            "shape prior is applied independently to each trial's "
+            "coefficient block.  GLMsingle-style output suitable for "
+            "2nd-level analyses across trials."
+        ),
+    )
+
+    # FLOBS-specific knobs (each flag accepts hyphen + underscore forms)
+    flobs_opts = parser.add_argument_group("FLOBS Options (-model FLOBS)")
+    flobs_opts.add_argument("-flobs-n-basis", "-flobs_n_basis",
+                            dest="flobs_n_basis",
+                            type=int, default=3, metavar="K",
+                            help="Number of FLOBS eigenHRFs (TR04MW2 used 3).")
+    flobs_opts.add_argument("-flobs-n-samples", "-flobs_n_samples",
+                            dest="flobs_n_samples",
+                            type=int, default=1000, metavar="N",
+                            help="Number of half-cosine HRF samples for the basis SVD.")
+    flobs_opts.add_argument("-flobs-window", "-flobs_window",
+                            dest="flobs_window",
+                            type=float, default=32.0,
+                            metavar="SECONDS", help="FLOBS basis duration (s).")
+    flobs_opts.add_argument("-flobs-dt", "-flobs_dt",
+                            dest="flobs_dt",
+                            type=float, default=0.1,
+                            metavar="SECONDS", help="FLOBS basis sample spacing (s).")
+    flobs_opts.add_argument("-flobs-seed", "-flobs_seed",
+                            dest="flobs_seed",
+                            type=int, default=42,
+                            help="Seed for the half-cosine sampler.")
+
+    # SPMG/ridge knobs (used when -reg ridge or -reg mvn with SPMG models)
+    spmg_opts = parser.add_argument_group("SPMG Prior Options (-model SPMG*)")
+    spmg_opts.add_argument("-canonical-std", "-canonical_std",
+                           dest="canonical_std",
+                           type=float, default=5.0,
+                           help="Prior std on the canonical-amplitude coefficient (weak prior).")
+    spmg_opts.add_argument("-derivative-std", "-derivative_std",
+                           dest="derivative_std",
+                           type=float, default=0.3,
+                           help="Prior std on the temporal-derivative coefficient (tight).")
+    spmg_opts.add_argument("-dispersion-std", "-dispersion_std",
+                           dest="dispersion_std",
+                           type=float, default=0.2,
+                           help="Prior std on the dispersion-derivative coefficient (SPMG3).")
+
+    # Constraint strength
+    reg_opts = parser.add_argument_group("Constraint strength")
+    reg_opts.add_argument(
+        "-prior-weight", "-prior_weight",
+        dest="prior_weight",
+        default="auto",
+        metavar="VALUE",
+        help=(
+            "Strength of the shape prior.  'auto' uses the Bayesian-"
+            "optimal weight σ² (estimated from an OLS pre-pass).  A "
+            "float overrides as a multiplier on σ² (e.g. 2.0 = twice "
+            "as strong).  Ignored when -reg none."
+        ),
+    )
+
+    # Processing
+    proc = parser.add_argument_group("Processing")
+    proc.add_argument("-tr", type=float, default=None,
+                      help="TR in seconds; read from header if omitted.")
+    proc.add_argument("-mask", default=None, help="Brain mask NIfTI.")
+    proc.add_argument("-polort", type=int, default=None,
+                      help="Polynomial drift order (per run).  None → auto via run duration.")
+    proc.add_argument("-device", default="auto",
+                      help="Compute device: auto, cpu, cuda, mps.")
+    proc.add_argument("-debug-design", "-debug_design",
+                      dest="debug_design",
+                      action="store_true",
+                      help="Print design rank/conditioning before the fit.")
+    add_verbose_arg(proc, default=1)
+
+    # I/O extras
+    out = parser.add_argument_group("Output")
+    # iresp save defaults differ by mode:
+    #   per-condition:  ON  (small tensor, useful for inspection)
+    #   single-trial:   OFF (typically tens of GB; explicit opt-in)
+    # The action below records whether the user actually passed the
+    # flag (`save_iresp_explicit`) so the single-trial branch can
+    # honour user intent vs the per-condition default.
+    out.add_argument(
+        "-save-iresp", "-save_iresp",
+        dest="save_iresp_explicit",
+        action="store_true",
+        default=False,
+        help=(
+            "Force-save reconstructed per-block HRF as 4-D iresp NIfTI. "
+            "Default: ON for per-condition fits (small), OFF for "
+            "single-trial fits (typically tens of GB).  Pass this "
+            "flag to force it on in single-trial mode."
+        ),
+    )
+    out.add_argument(
+        "-no-iresp", "-no_iresp",
+        dest="save_iresp_off",
+        action="store_true",
+        default=False,
+        help="Force iresp save off (only PC weights + amplitude maps emitted).",
+    )
+
+    return parser
+
+
+def _build_prior(
+    *,
+    model: str,
+    reg: str,
+    basis: FLOBSBasis,
+    canonical_std: float,
+    derivative_std: float,
+    dispersion_std: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve (-model, -reg) into a concrete (m, C) prior.
+
+    Naming:
+      ``-reg none``  → identity covariance with trivial precision (the
+                       caller skips applying it via prior_weight=0).
+      ``-reg ridge`` → hand-picked diagonal:
+                         SPMG → spmg_prior(canonical_std, derivative_std[, dispersion_std])
+                         FLOBS → ridge_prior with std picked from FLOBS sample variance
+      ``-reg mvn``   → empirical full-covariance:
+                         FLOBS → flobs_prior(basis)
+                         SPMG  → same as -reg ridge for SPMG (no empirical
+                                 (m, C) to derive — would need a population
+                                 of canonical/derivative-coefficient samples,
+                                 which isn't a thing for SPMG).
+    """
+    n_basis = basis.basis_functions.shape[0]
+    if reg == "none":
+        # Returned but ignored downstream (prior_weight forced to 0).
+        return np.zeros(n_basis), np.eye(n_basis)
+    if model == "FLOBS":
+        if reg == "mvn":
+            return flobs_prior(basis)
+        # ridge: isotropic with std picked from FLOBS empirical scale
+        std = float(np.sqrt(np.median(np.diag(basis.C))))
+        return ridge_prior(n_basis, coefficient_std=max(std, 1e-3))
+    # SPMG family
+    if model == "SPMG1":
+        return ridge_prior(1, coefficient_std=canonical_std)
+    if model == "SPMG2":
+        return spmg_prior(canonical_std=canonical_std,
+                          derivative_std=derivative_std)
+    if model == "SPMG3":
+        return spmg_prior(canonical_std=canonical_std,
+                          derivative_std=derivative_std,
+                          dispersion_std=dispersion_std)
+    raise ValueError(f"Unknown model {model}")
+
+
+def _build_basis(args) -> FLOBSBasis:
+    """Construct the basis FLOBSBasis container from the chosen model."""
+    if args.model == "FLOBS":
+        return generate_flobs_basis(
+            n_basis=args.flobs_n_basis,
+            n_samples=args.flobs_n_samples,
+            duration=args.flobs_window,
+            dt=args.flobs_dt,
+            seed=args.flobs_seed,
+        )
+    n_basis_map = {"SPMG1": 1, "SPMG2": 2, "SPMG3": 3}
+    return generate_spmg_basis(
+        n_basis=n_basis_map[args.model],
+        duration=args.flobs_window,
+        dt=args.flobs_dt,
+    )
+
+
+def _resolve_prior_weight_arg(arg: str | float, reg: str) -> float | str:
+    """Translate the CLI string into a fit_basis_constrained_ridge value."""
+    if reg == "none":
+        return 0.0
+    val = str(arg).strip().lower()
+    if val == "auto":
+        return "auto"
+    return float(arg)
+
+
+def main() -> int:
+    parser = create_parser()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+    args = parser.parse_args()
+
+    pfx = parse_prefix(args.prefix)
+    args.prefix = pfx.stem
+    nii_ext = pfx.nifti_ext
+
+    print("=" * 72)
+    print(" ffs_fitbasis — constrained basis-set HRF fits")
+    print("=" * 72)
+    print(f"  Started: {datetime.now().isoformat(timespec='seconds')}")
+    print(f"  Prefix:  {args.prefix}")
+
+    # ── Validate event input ────────────────────────────────────────
+    has_onsets = bool(args.onsets)
+    has_events = bool(args.events)
+    if has_onsets == has_events:
+        print("ERROR: Specify exactly one of -onsets/-durations or -events.")
+        return 1
+    if has_onsets and args.durations is None:
+        print("ERROR: -durations is required with -onsets.")
+        return 1
+    if args.event_cols and not has_events:
+        print("ERROR: -event-cols requires -events.")
+        return 1
+    if args.event_ignore and not has_events:
+        print("ERROR: -event-ignore requires -events.")
+        return 1
+
+    # ── Parse inputs / events ───────────────────────────────────────
+    input_files = parse_input_files(args.input)
+    n_runs = len(input_files)
+    if has_events:
+        from fastfuncstuff.cli_utils import clean_condition_labels  # noqa: F401
+        from fastfuncstuff.design.bids_events import parse_bids_events
+        if len(args.events) != n_runs:
+            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs.")
+            return 1
+        event_cols = tuple(args.event_cols) if args.event_cols else None
+        all_onsets, durations, condition_labels = parse_bids_events(
+            event_files=args.events,
+            event_ignore=args.event_ignore,
+            event_cols=event_cols,
+            round_durations=args.round_durations,
+        )
+    else:
+        from fastfuncstuff.cli_utils import clean_condition_labels
+        onset_files = args.onsets
+        n_conditions = len(onset_files)
+        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
+        for f in onset_files:
+            if not Path(f).exists():
+                print(f"ERROR: Onset file not found: {f}")
+                return 1
+        durations = parse_durations(args.durations, n_conditions, condition_labels)
+        if args.round_durations is not None:
+            durations = [round(d, args.round_durations) for d in durations]
+        all_onsets = [parse_afni_timing_file(f) for f in onset_files]
+        for i, cond_runs in enumerate(all_onsets):
+            if len(cond_runs) != n_runs:
+                print(
+                    f"ERROR: Onset file {onset_files[i]} has "
+                    f"{len(cond_runs)} runs, but {n_runs} input runs."
+                )
+                return 1
+
+    n_conditions = len(condition_labels)
+    print(f"  {n_conditions} conditions: {condition_labels}")
+
+    preflight_check(input_files=input_files,
+                    onset_files=args.onsets if has_onsets else None,
+                    ortvec_files=None)
+
+    # ── Load data ──────────────────────────────────────────────────
+    device, _, _ = parse_device_arg(args.device)
+    configure_torch_backends(device)
+    print(f"  Compute device: {device}")
+
+    load_result = load_and_preprocess_runs(
+        input_files=input_files, tr=args.tr, mask_file=args.mask,
+        blur_fwhm=None, do_scale=True, device=device, force_cpu=True,
+        dry_run=False, verbose=True,
+    )
+    data = load_result.data
+    run_starts = load_result.run_starts
+    affine = load_result.affine
+    volume_shape = load_result.volume_shape
+    tr = load_result.tr
+    mask = load_result.mask
+    n_voxels = load_result.n_voxels
+    n_timepoints = load_result.n_timepoints
+    if args.tr is None:
+        args.tr = tr
+
+    if args.round_onsets is not None:
+        from fastfuncstuff.design.builder import round_onsets as _round_onsets
+        all_onsets = _round_onsets(all_onsets, tr, threshold=args.round_onsets)
+        print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f}).")
+
+    print(f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, TR={tr}s)")
+
+    # ── Build basis + prior ────────────────────────────────────────
+    print(f"\n  Model: {args.model}    Regularisation: {args.reg}    "
+          f"Single-trials: {args.single_trials}")
+    basis = _build_basis(args)
+    n_basis = basis.basis_functions.shape[0]
+    prior_m, prior_C = _build_prior(
+        model=args.model, reg=args.reg, basis=basis,
+        canonical_std=args.canonical_std,
+        derivative_std=args.derivative_std,
+        dispersion_std=args.dispersion_std,
+    )
+    pw = _resolve_prior_weight_arg(args.prior_weight, args.reg)
+    print(f"  Basis: {n_basis} fns × {basis.basis_functions.shape[1]} samples "
+          f"(dt={basis.dt}s, window={basis.duration:.1f}s)")
+    print(f"  Prior: m = {prior_m},  σ_diag = {np.sqrt(np.diag(prior_C))}")
+    print(f"  Prior weight: {pw!r}")
+
+    # ── Polort resolution ─────────────────────────────────────────
+    if args.polort is None:
+        run_dur_min = (n_timepoints / n_runs) * tr / 60.0
+        polort_resolved = max(0, round(run_dur_min / 2))
+        print(f"  Polort auto: {polort_resolved} (run ≈ {run_dur_min:.1f} min)")
+    else:
+        polort_resolved = int(args.polort)
+
+    # ── Build per-run task design (one block per CONDITION OR per TRIAL) ─
+    # build_pc_basis_design_per_run handles convolving onsets with each
+    # basis function for FIR-locked or TENT-style onsets.  For
+    # single-trial mode we treat each trial as its own "condition" so
+    # the same machinery produces one K-column block per trial.
+    run_starts_ext = list(run_starts) + [n_timepoints]
+    n_tp_per_run = [run_starts_ext[r + 1] - run_starts_ext[r] for r in range(n_runs)]
+    basis_lag_times = np.arange(basis.basis_functions.shape[1]) * basis.dt
+
+    # Auto-detect TR-lock vs sub-TR for the basis convolution path.
+    all_onset_times = [
+        float(t) for cond_runs in all_onsets for run_onsets in cond_runs
+        for t in (run_onsets.tolist() if run_onsets.size else [])
+    ]
+    from fastfuncstuff.design.matrices import is_tr_locked
+    basis_mode = "FIR" if (all_onset_times and is_tr_locked(all_onset_times, tr, threshold=0.1)) else "TENT"
+    print(f"  Onset basis-convolution mode: {basis_mode} "
+          f"({'TR-locked' if basis_mode == 'FIR' else 'sub-TR onsets'})")
+
+    # Build "block list" — each block is one condition (default) or one
+    # trial (single-trials mode).  For single-trial mode, expand each
+    # condition's onset list to a separate one-event-per-block.
+    block_labels: list[str] = []
+    block_onsets_per_run: list[list[np.ndarray]] = []
+    if args.single_trials:
+        for cond_idx, cond_label in enumerate(condition_labels):
+            cond_runs = all_onsets[cond_idx]
+            # number trials in deterministic order: per cond, per run
+            trial_num_global = 0
+            for r, run_arr in enumerate(cond_runs):
+                for t_in_run in run_arr:
+                    # build one-event onset list per run for this trial
+                    per_run = [
+                        np.array([t_in_run]) if rr == r else np.array([])
+                        for rr in range(n_runs)
+                    ]
+                    block_labels.append(
+                        f"{cond_label}_trial{trial_num_global:03d}_run{r + 1}"
+                    )
+                    block_onsets_per_run.append(per_run)
+                    trial_num_global += 1
+    else:
+        for cond_idx, cond_label in enumerate(condition_labels):
+            block_labels.append(cond_label)
+            block_onsets_per_run.append(all_onsets[cond_idx])
+
+    n_blocks = len(block_labels)
+    print(f"  Blocks to fit: {n_blocks}  ({'one per trial' if args.single_trials else 'one per condition'})")
+
+    # Build per-run design with K basis cols per block
+    per_run_designs: list[torch.Tensor] = []
+    for r in range(n_runs):
+        block_designs = []
+        for b_idx in range(n_blocks):
+            # Use the helper's onsets-per-run path: one-condition view.
+            bd = build_pc_basis_design_per_run(
+                onsets_per_run=[block_onsets_per_run[b_idx][r]],
+                pcs=basis.basis_functions,
+                lag_times=basis_lag_times,
+                tr=tr,
+                n_timepoints_per_run=[n_tp_per_run[r]],
+                basis=basis_mode,
+            )
+            block_designs.append(bd[0])
+        concat = np.concatenate(block_designs, axis=1).astype(np.float32)
+        per_run_designs.append(torch.from_numpy(concat))
+
+    # ── Per-run data list ──────────────────────────────────────────
+    # ``load_and_preprocess_runs`` already applies the brain mask when
+    # one is supplied — its returned ``data`` tensor has shape
+    # ``(n_voxels_in_mask, total_tp)``.  Just split by run boundary.
+    per_run_data = [
+        data[:, run_starts_ext[r]:run_starts_ext[r + 1]].clone().detach().float()
+        for r in range(n_runs)
+    ]
+
+    # ── Pack shared-task + block-diag polys ────────────────────────
+    packed = pack_for_shared_task_glm(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_designs,
+        polort=polort_resolved,
+        task_column_labels=[
+            f"{lbl}#PC{b}" for lbl in block_labels for b in range(n_basis)
+        ],
+        device=torch.device("cpu"),
+    )
+    n_task_cols = packed.n_task_cols
+    print(f"  Design: {packed.design_concat.shape}  "
+          f"({n_task_cols} task + "
+          f"{packed.design_concat.shape[1] - n_task_cols} nuisance)")
+
+    task_design = packed.design_concat[:, :n_task_cols]
+    nuisance = (packed.design_concat[:, n_task_cols:]
+                if packed.design_concat.shape[1] > n_task_cols else None)
+
+    # ── Fit ─────────────────────────────────────────────────────────
+    # Eager full-HRF reconstruction (n_vox × n_blocks × n_t × 8 bytes)
+    # is the main memory hog — for single-trial mode with hundreds of
+    # blocks it can hit tens of GB.  Skip it inside the solver; we
+    # build amplitude / iresp downstream in voxel chunks via the
+    # memory module's chunk-size estimator.
+    print(f"\n  Fitting ({args.model} × {args.reg}) …")
+    fit = fit_basis_constrained_ridge(
+        data=packed.data_concat,
+        design_task=task_design,
+        basis_functions=basis.basis_functions,
+        prior_mean=prior_m,
+        prior_cov=prior_C,
+        n_blocks=n_blocks,
+        nuisance=nuisance,
+        prior_weight=pw,
+        device=device,
+        reconstruct_hrfs=False,
+    )
+    print(f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+          f"effective λ={fit.effective_prior_weight:.4g}")
+    print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
+          f"constrained: {fit.r2.mean():.3f}")
+
+    # ── Reshape + save outputs ─────────────────────────────────────
+    n_vox_masked = fit.betas.shape[0]
+    nx, ny, nz = volume_shape
+
+    def _to_volume(masked: np.ndarray) -> np.ndarray:
+        out_shape = (nx, ny, nz) + tuple(masked.shape[1:])
+        out = np.zeros(out_shape, dtype=np.float32)
+        if mask is not None:
+            out[mask, ...] = masked
+        else:
+            out = masked.reshape(out_shape)
+        return out
+
+    task_betas = fit.betas[:, :n_task_cols].reshape(n_vox_masked, n_blocks, n_basis)
+    task_betas_ols = fit.betas_ols[:, :n_task_cols].reshape(n_vox_masked, n_blocks, n_basis)
+
+    # Amplitude = peak of reconstructed HRF per (voxel, block).  Computed
+    # in voxel chunks via the memory module so we never materialise the
+    # full (n_voxels × n_blocks × n_t) HRF tensor — in single-trial mode
+    # that's tens of GB.  The chunk size estimator uses bytes/voxel =
+    # n_blocks × n_t_basis × 8 (HRF) + light overhead.
+    from fastfuncstuff.memory import estimate_chunk_size
+    n_t_basis = basis.basis_functions.shape[1]
+    # bytes per voxel for the per-chunk HRF reconstruction (×2 for
+    # constrained + OLS):  2 × n_blocks × n_t_basis × 8 (float64).
+    bytes_per_vox = 2 * n_blocks * n_t_basis * 8
+    chunk_size = estimate_chunk_size(
+        n_voxels=n_vox_masked,
+        n_timepoints=n_t_basis,
+        n_regressors=n_blocks * n_basis,
+        device=torch.device("cpu"),
+        operation="glm",
+    )
+    # Tighten chunk_size if the HRF reconstruction alone would blow it
+    # (estimate_chunk_size doesn't model the per-block HRF dimension).
+    from fastfuncstuff.memory import get_available_memory
+    avail_bytes = get_available_memory(torch.device("cpu"))
+    safety = 0.25
+    chunk_from_hrf = max(1, int(avail_bytes * safety / max(bytes_per_vox, 1)))
+    chunk_size = min(chunk_size, chunk_from_hrf)
+    print(
+        f"  Amplitude/iresp chunking: {chunk_size:,} voxels per chunk "
+        f"(n_blocks={n_blocks}, n_t_basis={n_t_basis})"
+    )
+
+    amplitude = np.zeros((n_vox_masked, n_blocks), dtype=np.float32)
+    amplitude_ols = np.zeros_like(amplitude)
+    # Pre-allocate full iresp ONLY when -save-iresp and we're in the
+    # per-condition path (n_blocks small).  Single-trial mode skips
+    # the eager full iresp; see "iresp save" section below for the
+    # per-condition save path that streams chunks into save_iresp.
+    # Resolve iresp save policy:
+    #   - per-condition (n_blocks small):  ON by default.
+    #   - single-trial:                    OFF by default; -save-iresp
+    #                                      to force on; -no-iresp to
+    #                                      keep off (redundant).
+    #   - -no-iresp:                       ALWAYS off, in either mode.
+    if args.save_iresp_off:
+        save_full_iresp = False
+        if args.save_iresp_explicit:
+            print("  -no-iresp overrides -save-iresp; iresp save: OFF.")
+    elif args.single_trials:
+        save_full_iresp = bool(args.save_iresp_explicit)
+        if not save_full_iresp:
+            print(
+                "  Single-trial mode: per-trial iresp save is OFF by "
+                "default (pass -save-iresp to opt in).  Amplitude "
+                "maps still emitted."
+            )
+    else:
+        save_full_iresp = True   # per-condition default
+    if save_full_iresp:
+        # Memory estimate for the full iresp tensor:
+        full_iresp_bytes = 2 * n_vox_masked * n_blocks * n_t_basis * 4  # float32
+        full_iresp_gb = full_iresp_bytes / (1024**3)
+        if full_iresp_gb > 8.0:
+            print(
+                f"  WARNING: full iresp tensor would be {full_iresp_gb:.1f} GB.  "
+                "Skipping iresp save.  Amplitude maps are still emitted."
+            )
+            save_full_iresp = False
+        else:
+            print(f"  Per-trial iresp save: ~{full_iresp_gb:.2f} GB in memory.")
+    iresp_buf = (
+        np.zeros((n_vox_masked, n_blocks, n_t_basis), dtype=np.float32)
+        if save_full_iresp else None
+    )
+    iresp_buf_ols = (
+        np.zeros((n_vox_masked, n_blocks, n_t_basis), dtype=np.float32)
+        if save_full_iresp else None
+    )
+
+    for start in range(0, n_vox_masked, chunk_size):
+        end = min(start + chunk_size, n_vox_masked)
+        # (chunk, n_blocks, n_basis) @ (n_basis, n_t) = (chunk, n_blocks, n_t)
+        hrfs_chunk = task_betas[start:end] @ basis.basis_functions
+        hrfs_ols_chunk = task_betas_ols[start:end] @ basis.basis_functions
+        amplitude[start:end] = hrfs_chunk.max(axis=2).astype(np.float32)
+        amplitude_ols[start:end] = hrfs_ols_chunk.max(axis=2).astype(np.float32)
+        if iresp_buf is not None:
+            iresp_buf[start:end] = hrfs_chunk.astype(np.float32)
+            iresp_buf_ols[start:end] = hrfs_ols_chunk.astype(np.float32)
+
+    # Basis TSV (shared)
+    basis_path = f"{args.prefix}_fitbasis_basis.tsv"
+    np.savetxt(basis_path, basis.basis_functions.T, fmt="%.10g", delimiter="\t")
+    print(f"  Wrote {basis_path}")
+
+    # R² volumes (constrained + unconstrained)
+    for arr, sfx in ((fit.r2, ""), (fit.r2_ols, "_unconstrained")):
+        path = f"{args.prefix}_fitbasis_r2{sfx}{nii_ext}"
+        save_nifti(_to_volume(arr[:, None]).squeeze(-1),
+                   output_path=path, reference_img=args.input[0])
+        print(f"  Wrote {path}")
+
+    # ── Per-block outputs ──────────────────────────────────────────
+    # Single-trial mode: amplitude maps stack across trials per cond
+    # for downstream 2nd-level convenience.  iresp & pcweights are still
+    # per-trial 4-D NIfTIs (saved via save_iresp grouping).
+    if args.single_trials:
+        # Group block_labels back into per-condition trial lists for the
+        # amplitude 4D map (time = trial number).  Also emit the iresp
+        # per trial.
+        per_cond_trial_idx: dict[str, list[int]] = {}
+        for b_idx, lbl in enumerate(block_labels):
+            cond = lbl.split("_trial", 1)[0]
+            per_cond_trial_idx.setdefault(cond, []).append(b_idx)
+
+        # Per-condition amplitude 4D (last axis = trial number)
+        for cond, idxs in per_cond_trial_idx.items():
+            for amps, sfx in ((amplitude, ""), (amplitude_ols, "_unconstrained")):
+                amp_stack = amps[:, idxs]              # (n_vox, n_trials_for_cond)
+                amp_vol = _to_volume(amp_stack)         # (nx, ny, nz, n_trials)
+                path = f"{args.prefix}_fitbasis_amplitude_{cond}{sfx}{nii_ext}"
+                save_nifti(amp_vol, output_path=path, reference_img=args.input[0])
+                print(f"  Wrote {path}  (n_trials={len(idxs)})")
+
+        if save_full_iresp and iresp_buf is not None:
+            # Per-trial iresp 4-D (time axis = HRF basis-dt).  Only
+            # available when the iresp buffer fit in memory above.
+            for hrfs_arr, sfx in ((iresp_buf, ""), (iresp_buf_ols, "_unconstrained")):
+                iresp_vol = _to_volume(hrfs_arr)
+                save_iresp(
+                    iresp=iresp_vol,
+                    output_prefix=f"{args.prefix}_fitbasis",
+                    condition_labels=[f"{lbl}{sfx}" for lbl in block_labels],
+                    tr=basis.dt, bot=0.0, top=basis.duration - basis.dt,
+                    reference_img=args.input[0], nii_ext=nii_ext,
+                )
+            print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
+
+        # PC weights per trial (optional but useful for diagnostics) —
+        # only the constrained version, keep file count manageable.
+        # Stacked as (nx, ny, nz, n_trials, K).
+        for cond, idxs in per_cond_trial_idx.items():
+            stack = task_betas[:, idxs, :]            # (n_vox, n_trials, K)
+            stack_ols = task_betas_ols[:, idxs, :]
+            for arr, sfx in ((stack, ""), (stack_ols, "_unconstrained")):
+                vol = _to_volume(arr)                 # (nx,ny,nz,n_trials,K)
+                # Flatten last 2 dims for NIfTI 4D save: trial-major.
+                vol_4d = vol.reshape(nx, ny, nz, len(idxs) * n_basis)
+                path = f"{args.prefix}_fitbasis_pcweights_{cond}{sfx}{nii_ext}"
+                save_nifti(vol_4d, output_path=path, reference_img=args.input[0])
+                print(f"  Wrote {path}  (n_trials×K = {len(idxs)}×{n_basis})")
+
+    else:
+        # Per-condition outputs (the simple case)
+        if save_full_iresp and iresp_buf is not None:
+            for hrfs_arr, sfx in ((iresp_buf, ""), (iresp_buf_ols, "_unconstrained")):
+                iresp_vol = _to_volume(hrfs_arr)
+                save_iresp(
+                    iresp=iresp_vol,
+                    output_prefix=f"{args.prefix}_fitbasis",
+                    condition_labels=[f"{lbl}{sfx}" for lbl in block_labels],
+                    tr=basis.dt, bot=0.0, top=basis.duration - basis.dt,
+                    reference_img=args.input[0], nii_ext=nii_ext,
+                )
+            print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
+
+        for b_idx, lbl in enumerate(block_labels):
+            for tbetas, amps, sfx in (
+                (task_betas, amplitude, ""),
+                (task_betas_ols, amplitude_ols, "_unconstrained"),
+            ):
+                w = _to_volume(tbetas[:, b_idx, :])
+                a = _to_volume(amps[:, b_idx][:, None]).squeeze(-1)
+                w_path = f"{args.prefix}_fitbasis_pcweights_{lbl}{sfx}{nii_ext}"
+                a_path = f"{args.prefix}_fitbasis_amplitude_{lbl}{sfx}{nii_ext}"
+                save_nifti(w, output_path=w_path, reference_img=args.input[0])
+                save_nifti(a, output_path=a_path, reference_img=args.input[0])
+                print(f"  Wrote {w_path}")
+                print(f"  Wrote {a_path}")
+
+    # ── Metadata sidecar ────────────────────────────────────────────
+    metadata = {
+        "tool": "ffs_fitbasis",
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "tr": float(tr),
+        "model": args.model,
+        "regularisation": args.reg,
+        "single_trials": bool(args.single_trials),
+        "n_basis": int(n_basis),
+        "basis_dt_s": float(basis.dt),
+        "basis_duration_s": float(basis.duration),
+        "n_voxels": int(n_voxels),
+        "n_runs": int(n_runs),
+        "n_conditions": int(n_conditions),
+        "n_blocks_fit": int(n_blocks),
+        "condition_labels": list(condition_labels),
+        "polort": int(polort_resolved),
+        "prior_mean": prior_m.tolist(),
+        "prior_cov_diag": np.diag(prior_C).tolist(),
+        "sigma2_mean": float(fit.sigma2_mean),
+        "effective_prior_weight": float(fit.effective_prior_weight),
+        "r2_mean_constrained": float(fit.r2.mean()),
+        "r2_mean_unconstrained": float(fit.r2_ols.mean()),
+    }
+    meta_path = f"{args.prefix}_fitbasis_metadata.json"
+    Path(meta_path).write_text(json.dumps(metadata, indent=2))
+    print(f"  Wrote {meta_path}")
+
+    print(f"\n{'=' * 72}")
+    print(" ✓ ffs_fitbasis complete")
+    print(f"{'=' * 72}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
