@@ -159,10 +159,82 @@ def parse_args():
     model_opts = parser.add_argument_group("Deconvolution Model Options")
     model_opts.add_argument(
         "-model",
-        choices=["AUTO", "FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero"],
+        choices=["AUTO", "FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero", "FLOBS"],
         default="AUTO",
-        help="Deconvolution model: AUTO (auto-detect TR-locking), FIR, TENT, TENTzero, "
-             "CSPLIN (cubic spline - smoother than TENT), CSPLINzero (default: AUTO)",
+        help=(
+            "Deconvolution model: AUTO (auto-detect TR-locking), FIR, TENT, TENTzero, "
+            "CSPLIN (cubic spline — smoother than TENT), CSPLINzero, or FLOBS "
+            "(constrained K-basis fit with a Gaussian shape prior derived from "
+            "half-cosine HRF samples — TR04MW2).  Default: AUTO."
+        ),
+    )
+
+    # FLOBS-specific options
+    flobs_opts = parser.add_argument_group("FLOBS Model Options (only used with -model FLOBS)")
+    flobs_opts.add_argument(
+        "-flobs-n-basis",
+        type=int,
+        default=3,
+        metavar="K",
+        help=(
+            "Number of FLOBS basis functions (eigenHRFs) to retain. "
+            "TR04MW2 default is 3 — first three look like canonical + "
+            "temporal-derivative + dispersion-derivative."
+        ),
+    )
+    flobs_opts.add_argument(
+        "-flobs-n-samples",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="Number of half-cosine HRF samples used to derive the basis.",
+    )
+    flobs_opts.add_argument(
+        "-flobs-window",
+        type=float,
+        default=32.0,
+        metavar="SECONDS",
+        help="FLOBS basis duration (s).  Sampled at -flobs-dt resolution.",
+    )
+    flobs_opts.add_argument(
+        "-flobs-dt",
+        type=float,
+        default=0.1,
+        metavar="SECONDS",
+        help="FLOBS basis sample spacing (s).  0.1 matches canonical libraries.",
+    )
+    flobs_opts.add_argument(
+        "-flobs-prior-weight",
+        default="auto",
+        metavar="VALUE",
+        help=(
+            "Strength of the FLOBS shape prior.  'auto' uses the "
+            "Bayesian-optimal weight σ² (estimated from an OLS pre-pass). "
+            "A float overrides as a multiplier on σ² (e.g. 2.0 = twice "
+            "as strong).  0 = unconstrained OLS."
+        ),
+    )
+    flobs_opts.add_argument(
+        "-flobs-seed",
+        type=int,
+        default=42,
+        help="Seed for the FLOBS half-cosine sampler.",
+    )
+    flobs_opts.add_argument(
+        "-flobs-save-iresp",
+        action="store_true",
+        default=True,
+        help=(
+            "Save the reconstructed per-condition HRF as a 4D iresp NIfTI "
+            "(time on the last axis at -flobs-dt resolution).  This is the "
+            "FLOBS analogue of TENT's iresp output.  Default: on."
+        ),
+    )
+    flobs_opts.add_argument(
+        "-flobs-no-iresp",
+        action="store_false",
+        dest="flobs_save_iresp",
+        help="Disable iresp save (only PC weights + amplitude maps emitted).",
     )
 
     model_opts.add_argument(
@@ -350,6 +422,18 @@ def parse_args():
         "-debug-memory",
         action="store_true",
         help="Print VRAM usage vs. prediction after each chunk loop (for memory tuning)",
+    )
+    hw_opts.add_argument(
+        "-debug-design",
+        dest="debug_design",
+        action="store_true",
+        help=(
+            "Before the GLM fit, print a design inspection: per-column "
+            "L2 norms, near-zero / near-constant columns, X'X rank, "
+            "condition number, and the null-space direction for any "
+            "rank-deficient combination (so you can see WHICH columns "
+            "are degenerate when the fit unexpectedly fails)."
+        ),
     )
 
 
@@ -995,6 +1079,290 @@ def main():
         if args.verb >= 1:
             print(f"\nUsing {model} model")
 
+    # ── FLOBS branch ─────────────────────────────────────────────────────────
+    # **DEPRECATED 2026-05-17**: -model FLOBS in ffs_deconvolve is
+    # kept working for backwards compatibility, but the canonical
+    # home for basis-set / FLOBS fits is now ``ffs_fitbasis``, which
+    # additionally supports SPMG1/SPMG2/SPMG3 bases AND single-trial
+    # mode (-single-trials) with the same shape prior.  Pipe your
+    # arguments to ``ffs_fitbasis -model FLOBS`` and pass any extra
+    # SPMG/regularisation flags.  This branch will be removed in a
+    # later release.
+    if model == "FLOBS":
+        import warnings as _warnings
+        _warnings.warn(
+            "ffs_deconvolve -model FLOBS is deprecated; use ffs_fitbasis "
+            "(same FLOBS basis + constrained fit, plus SPMG1/2/3 bases and "
+            "-single-trials mode).  ffs_deconvolve will continue to host "
+            "FIR/TENT/TENTzero/CSPLIN/CSPLINzero (non-parametric "
+            "deconvolution).  See [[Outstanding issues]] for the rationale.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if args.verb >= 1:
+            print(
+                "\n  ⚠️  -model FLOBS in ffs_deconvolve is deprecated.\n"
+                "      Prefer: ffs_fitbasis -model FLOBS [-single-trials] …\n"
+                "      ffs_fitbasis adds SPMG1/2/3 bases and per-trial fits.\n"
+            )
+        # NOTE: ``save_nifti`` and ``save_iresp`` are already imported
+        # at module scope (lines 65–80) — importing them again HERE
+        # would create local-only bindings that shadow the module
+        # globals for the *entire* main() function (Python's lexical
+        # scope), breaking the FIR/TENT save paths below.  So just
+        # import the FLOBS-specific helpers here.
+        from fastfuncstuff.design.flobs import (
+            generate_flobs_basis,
+            fit_flobs_constrained,
+        )
+        from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
+        from fastfuncstuff.design.builder import pack_for_shared_task_glm
+
+        if args.verb >= 1:
+            print(
+                f"\nFLOBS basis: K={args.flobs_n_basis} from "
+                f"{args.flobs_n_samples} half-cosine samples "
+                f"(window {args.flobs_window:.1f}s, dt {args.flobs_dt:.2f}s)"
+            )
+        basis = generate_flobs_basis(
+            n_basis=args.flobs_n_basis,
+            n_samples=args.flobs_n_samples,
+            duration=args.flobs_window,
+            dt=args.flobs_dt,
+            seed=args.flobs_seed,
+        )
+        ev_frac = (basis.eigenvalues ** 2)
+        ev_frac = ev_frac / max(ev_frac.sum(), 1e-30)
+        if args.verb >= 1:
+            print(
+                f"  Variance explained by top {args.flobs_n_basis}: "
+                f"{ev_frac[:args.flobs_n_basis].sum() * 100:.1f}%  "
+                f"(PC1 alone {ev_frac[0] * 100:.1f}%)"
+            )
+            print(
+                f"  Prior MVN(m, C):  m = {basis.m}, "
+                f"σ_diag = {np.sqrt(np.diag(basis.C))}"
+            )
+
+        # Per-run task designs: each condition convolved with each
+        # basis function.  ``build_pc_basis_design_per_run`` is what
+        # ffs_librarian uses for its NSD refit step — same shape as
+        # what we want here (one block of K cols per condition).
+        n_tp_per_run_list = list(n_timepoints_per_run)
+        basis_lag_times = np.arange(basis.basis_functions.shape[1]) * basis.dt
+        per_run_designs_per_cond: list[list[np.ndarray]] = []
+        for cond_idx in range(n_conditions):
+            cond_onsets_per_run = [
+                onsets_per_condition[cond_idx][r] for r in range(len(n_tp_per_run_list))
+            ]
+            cond_designs = build_pc_basis_design_per_run(
+                onsets_per_run=cond_onsets_per_run,
+                pcs=basis.basis_functions,           # use basis as PCs
+                lag_times=basis_lag_times,
+                tr=tr,
+                n_timepoints_per_run=n_tp_per_run_list,
+                basis="FIR" if model == "FIR" else "TENT",
+            )
+            per_run_designs_per_cond.append(cond_designs)
+
+        # Horizontally concat conditions per run → per-run design
+        # (n_tp_run, n_conditions * n_basis) with condition-major order.
+        per_run_task_designs = []
+        for r in range(len(n_tp_per_run_list)):
+            cond_blocks = [
+                per_run_designs_per_cond[c][r] for c in range(n_conditions)
+            ]
+            per_run_task_designs.append(
+                torch.from_numpy(np.concatenate(cond_blocks, axis=1).astype(np.float32))
+            )
+
+        # Per-run data list
+        if mask is not None:
+            mask_flat = mask.flatten()
+            per_run_data = [
+                torch.from_numpy(d[mask_flat, :].astype(np.float32))
+                for d in data_list
+            ]
+        else:
+            per_run_data = [
+                torch.from_numpy(d.astype(np.float32)) for d in data_list
+            ]
+
+        # Canonical shared-task multi-run GLM packing (same helper the
+        # FIR/TENT path uses) — task block shared across runs,
+        # polynomials block-diagonal per run.
+        packed = pack_for_shared_task_glm(
+            per_run_data=per_run_data,
+            per_run_task_designs=per_run_task_designs,
+            polort=args.polort,
+            task_column_labels=[
+                f"{condition_labels[c]}#PC{b}"
+                for c in range(n_conditions)
+                for b in range(args.flobs_n_basis)
+            ],
+            device=torch.device("cpu"),
+        )
+        if args.verb >= 1:
+            print(
+                f"  Design: {packed.design_concat.shape}  "
+                f"({packed.n_task_cols} task + "
+                f"{packed.design_concat.shape[1] - packed.n_task_cols} nuisance)"
+            )
+
+        # Slice task vs nuisance; fit_flobs_constrained applies the
+        # FLOBS prior ONLY to the task block (nuisance is unpenalized).
+        task_design = packed.design_concat[:, : packed.n_task_cols]
+        nuisance = (
+            packed.design_concat[:, packed.n_task_cols:]
+            if packed.design_concat.shape[1] > packed.n_task_cols
+            else None
+        )
+
+        # Parse prior weight
+        if str(args.flobs_prior_weight).strip().lower() == "auto":
+            pw: float | str = "auto"
+        else:
+            pw = float(args.flobs_prior_weight)
+
+        if args.verb >= 1:
+            print(f"  Fitting (prior_weight={pw!r}) …")
+        fit_dev = parse_device_arg(args.device)
+        if isinstance(fit_dev, tuple):
+            fit_dev = fit_dev[0]
+        fit = fit_flobs_constrained(
+            data=packed.data_concat,
+            design_task=task_design,
+            basis=basis,
+            n_conditions=n_conditions,
+            nuisance=nuisance,
+            prior_weight=pw,
+            device=fit_dev,
+        )
+        if args.verb >= 1:
+            print(f"  ✓ Fit complete.  Mean R² = {fit.r2.mean():.3f}")
+
+        # ── Reshape to volume space ──────────────────────────────────
+        # fit.betas       : (n_voxels_masked, n_total_cols)  CONSTRAINED
+        # fit.hrfs        : (n_voxels_masked, n_conditions, n_t_basis)  CONSTRAINED
+        # fit.r2          : (n_voxels_masked,)  CONSTRAINED
+        # fit.betas_ols   : same shape as fit.betas, UNCONSTRAINED (OLS)
+        # fit.hrfs_ols    : same shape as fit.hrfs,  UNCONSTRAINED
+        # fit.r2_ols      : same shape as fit.r2,    UNCONSTRAINED
+        # Save BOTH so the user can SEE where the FLOBS prior reshapes
+        # the fit — critical for validation ("does the constraint help
+        # or just hide what's there?").
+        task_betas = fit.betas[:, : packed.n_task_cols].reshape(
+            -1, n_conditions, args.flobs_n_basis
+        )
+        task_betas_ols = fit.betas_ols[:, : packed.n_task_cols].reshape(
+            -1, n_conditions, args.flobs_n_basis
+        )
+
+        # Amplitude per (voxel, condition): peak of reconstructed HRF.
+        # Most directly interpretable for 2nd-level analyses (it's the
+        # "signal change" of the modelled response).  Computed for
+        # both constrained and unconstrained fits.
+        amplitude = fit.hrfs.max(axis=2)            # (n_vox, n_cond)
+        amplitude_ols = fit.hrfs_ols.max(axis=2)    # (n_vox, n_cond)
+
+        if args.verb >= 1:
+            print(
+                f"  σ² mean = {fit.sigma2_mean:.4g}, "
+                f"effective prior weight = {fit.effective_prior_weight:.4g}"
+            )
+            print(
+                f"  R² mean — OLS: {fit.r2_ols.mean():.3f}   "
+                f"constrained: {fit.r2.mean():.3f}"
+            )
+
+        def _to_volume(masked_data: np.ndarray, ndim_extra: int) -> np.ndarray:
+            """Place masked-voxel data back into the full volume."""
+            out_shape = (nx, ny, nz) + tuple(masked_data.shape[1:])
+            out = np.zeros(out_shape, dtype=np.float32)
+            if mask is not None:
+                out[mask, ...] = masked_data
+            else:
+                out = masked_data.reshape(out_shape)
+            return out
+
+        # ── Save FLOBS basis (one TSV, shared across conditions) ────
+        basis_path = f"{args.prefix}_flobs_basis.tsv"
+        np.savetxt(
+            basis_path, basis.basis_functions.T, fmt="%.10g", delimiter="\t",
+        )
+        if args.verb >= 1:
+            print(f"  Wrote {basis_path}  (n_lags×K, dt={basis.dt}s)")
+
+        # ── Save R² volumes ─────────────────────────────────────────
+        # Two maps: constrained (the published one) and unconstrained
+        # (so the user can see *where the prior changed the fit*).
+        for r2_arr, suffix in (
+            (fit.r2, ""),
+            (fit.r2_ols, "_unconstrained"),
+        ):
+            r2_path = f"{args.prefix}_flobs_r2{suffix}{_nii_ext}"
+            save_nifti(
+                _to_volume(r2_arr[:, None], 0).squeeze(-1),
+                output_path=r2_path,
+                reference_img=args.input[0],
+            )
+            if args.verb >= 1:
+                print(f"  Wrote {r2_path}")
+
+        # ── Per-condition iresp (reconstructed HRF) — BOTH fits ────
+        if args.flobs_save_iresp:
+            # Constrained: the "shipping" library.  Unconstrained: the
+            # comparison artefact.  Filename convention:
+            # <prefix>_flobs_iresp_<cond>.nii.gz                    (constrained)
+            # <prefix>_flobs_iresp_<cond>_unconstrained.nii.gz       (OLS)
+            for hrfs_arr, fit_suffix in (
+                (fit.hrfs, ""),
+                (fit.hrfs_ols, "_unconstrained"),
+            ):
+                iresp_vol = _to_volume(hrfs_arr, 2)
+                iresp_files = save_iresp(
+                    iresp=iresp_vol,
+                    output_prefix=f"{args.prefix}_flobs",
+                    condition_labels=[
+                        f"{lbl}{fit_suffix}" for lbl in condition_labels
+                    ],
+                    tr=basis.dt,
+                    bot=0.0,
+                    top=basis.duration - basis.dt,
+                    reference_img=args.input[0],
+                    nii_ext=_nii_ext,
+                )
+                if args.verb >= 1:
+                    for f in iresp_files:
+                        print(f"  Wrote {f}")
+
+        # ── Per-condition PC weights + amplitude — BOTH fits ───────
+        for cond_idx, label in enumerate(condition_labels):
+            for tbetas, amps, suffix in (
+                (task_betas, amplitude, ""),
+                (task_betas_ols, amplitude_ols, "_unconstrained"),
+            ):
+                weights_4d = _to_volume(tbetas[:, cond_idx, :], 1)
+                weights_path = (
+                    f"{args.prefix}_flobs_pcweights_{label}{suffix}{_nii_ext}"
+                )
+                save_nifti(weights_4d, output_path=weights_path, reference_img=args.input[0])
+                amp_3d = _to_volume(amps[:, cond_idx][:, None], 0).squeeze(-1)
+                amp_path = (
+                    f"{args.prefix}_flobs_amplitude_{label}{suffix}{_nii_ext}"
+                )
+                save_nifti(amp_3d, output_path=amp_path, reference_img=args.input[0])
+                if args.verb >= 1:
+                    print(f"  Wrote {weights_path}")
+                    print(f"  Wrote {amp_path}")
+
+        if args.verb >= 1:
+            print(f"\n{'=' * 70}")
+            print("✓ FLOBS deconvolution complete!")
+            print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 70}")
+        return 0
+
     # ── Unified window determination (FIR and TENT family) ───────────────────
     # Resolve add_lag to a per-condition list
     add_lag_raw = args.add_lag  # list[int] | None
@@ -1358,99 +1726,56 @@ def main():
 
         return 0
 
-    # Build design matrices
+    # Build per-run task designs via the shared API
+    # ----------------------------------------------------------------
+    # All FIR/TENT/CSPLIN per-run construction now routes through
+    # fastfuncstuff.design.builder.build_per_run_task_designs — the
+    # *same* function librarian uses, so any bug here surfaces in
+    # both tools at once instead of lurking in one.
     if args.verb >= 1:
         print("\nBuilding design matrices...")
 
-    design_list = []
-    n_basis_per_condition_list = []  # Track basis functions per condition (can vary with TENT)
+    from fastfuncstuff.design.builder import build_per_run_task_designs
 
-    for run_idx, n_tp in enumerate(n_timepoints_per_run):
-        # Extract onsets for this run across all conditions
-        run_onsets_all_conds = [onsets_per_condition[cond][run_idx] for cond in range(n_conditions)]
+    # The shared builder accepts (bot, top) windows per condition for
+    # TENT/CSPLIN, or a scalar `top` for FIR (bot=0 always).
+    if model == "FIR":
+        # Convert n_lags_per_cond → per-condition top windows (bot=0).
+        per_cond_window: list[float] | list[tuple[float, float]] = [
+            float(n) * tr for n in n_lags_per_cond
+        ]
+    elif model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
+        if tent_windows is None:
+            raise RuntimeError(f"tent_windows should not be None for {model} model")
+        per_cond_window = [(float(b), float(t)) for b, t in tent_windows]
+    else:
+        # Assumed-HRF path (spmg1/etc.) is handled by a separate branch
+        # earlier in deconvolve; this design-build path only fires for
+        # FIR/TENT/CSPLIN family models.
+        per_cond_window = None  # not used
 
-        # Convert to TR-resolution binary matrix (for FIR/TENT, no convolution)
-        # onsets_to_tr_matrix expects [condition][run] format, so convert:
-        # from [cond1_run0, cond2_run0] to [[cond1_run0], [cond2_run0]]
-        onsets_binary = onsets_to_tr_matrix(
-            [[onset] for onset in run_onsets_all_conds],  # Convert to [condition][run] format
-            n_timepoints=n_tp,
-            tr=tr,
-        )
+    design_result = build_per_run_task_designs(
+        onsets_per_cond_per_run=onsets_per_condition,
+        n_timepoints_per_run=list(n_timepoints_per_run),
+        tr=tr,
+        basis=model,
+        condition_labels=list(condition_labels),
+        fir_window_s=per_cond_window,
+        tent_n_basis=args.tent_n_basis,
+        device=device,
+    )
 
-        # Convert to tensor
-        onsets_binary = torch.tensor(onsets_binary, dtype=torch.float32, device=device)
+    per_run_designs = design_result.per_run
+    n_basis_per_condition_list = list(design_result.n_basis_per_condition)
+    column_labels = list(design_result.column_labels)
+    n_stimulus_regressors = sum(n_basis_per_condition_list)
 
-        # Build design matrix
-        if model == "FIR":
-            # Per-condition FIR (each condition may have a different window)
-            cond_designs = []
-            for cond_idx in range(n_conditions):
-                design_cond = build_glm_design(
-                    onsets=onsets_binary[cond_idx : cond_idx + 1, :],
-                    mode="fir",
-                    n_fir_lags=n_lags_per_cond[cond_idx],
-                    tr=tr,
-                    device=device,
-                )
-                cond_designs.append(design_cond)
-                if run_idx == 0:
-                    n_basis_per_condition_list.append(n_lags_per_cond[cond_idx])
-            design = torch.cat(cond_designs, dim=1)
-
-        elif model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
-            # TENT/CSPLIN: use exact onset times (not binary matrix)
-            # This produces fractional weights for non-TR-locked onsets
-            if tent_windows is None:
-                raise RuntimeError(f"tent_windows should not be None for {model} model")
-
-            cond_designs = []
-            for cond_idx in range(n_conditions):
-                # Get onset times (in seconds) for this condition in this run
-                onset_times = run_onsets_all_conds[cond_idx]
-
-                # Get window for this condition
-                bot, top = tent_windows[cond_idx]
-
-                # Build design for this condition using exact onset times
-                if model in ("TENT", "TENTzero"):
-                    design_cond = make_tent_design(
-                        onset_times_list=[onset_times],
-                        bot=bot,
-                        top=top,
-                        tr=tr,
-                        n_timepoints=n_tp,
-                        n_basis=args.tent_n_basis,
-                        zero_edges=(model == "TENTzero"),
-                        device=device,
-                    )
-                else:  # CSPLIN or CSPLINzero
-                    design_cond = make_csplin_design(
-                        onset_times_list=[onset_times],
-                        bot=bot,
-                        top=top,
-                        tr=tr,
-                        n_timepoints=n_tp,
-                        n_basis=args.tent_n_basis,
-                        zero_edges=(model == "CSPLINzero"),
-                        device=device,
-                    )
-
-                cond_designs.append(design_cond)
-
-                # Track n_basis for this condition
-                if run_idx == 0:
-                    n_basis_per_condition_list.append(design_cond.shape[1])
-
-            # Concatenate conditions horizontally
-            design = torch.cat(cond_designs, dim=1)
-
-        design_list.append(design)
-
-    # Concatenate designs across runs
-    design_full = torch.cat(design_list, dim=0)
-
-    n_stimulus_regressors = design_full.shape[1]
+    # design_full is *only* used by the save_design / save_design_plot
+    # diagnostic paths below; the actual fit operates on the per-run
+    # list (so fit_glm owns block-diagonal polynomial nuisance — see
+    # the fit_glm call near the end of this function).  Reconstruct
+    # the row-concat for those output artifacts.
+    design_full = torch.cat(per_run_designs, dim=0)
 
     if args.verb >= 1:
         print(f"  Design matrix shape: {design_full.shape}")
@@ -1463,44 +1788,12 @@ def main():
             for i, n_basis in enumerate(n_basis_per_condition_list):
                 print(f"    {condition_labels[i]}: {n_basis} regressors")
 
-    # Create column labels for design matrix
-    column_labels = []
-    for cond_idx in range(n_conditions):
-        n_basis = n_basis_per_condition_list[cond_idx]
-        for basis_idx in range(n_basis):
-            column_labels.append(f"{condition_labels[cond_idx]}#{basis_idx}")
-
-    # Add polynomial drift regressors (zero-padded per run)
-    if args.polort >= 0:
-        n_poly_per_run = args.polort + 1
-        total_poly_cols = len(n_timepoints_per_run) * n_poly_per_run
-
-        # Create zero-padded polynomial matrix
-        poly_full = np.zeros((sum(n_timepoints_per_run), total_poly_cols))
-
-        tr_start = 0
-        col_start = 0
-        for run_idx, n_tp in enumerate(n_timepoints_per_run):
-            # Generate polynomials for this run
-            poly_run = legendre_polynomials(n_tp, args.polort)
-
-            # Place in correct position (zero-padded)
-            poly_full[tr_start:tr_start + n_tp, col_start:col_start + n_poly_per_run] = poly_run
-
-            # Add column labels
-            for poly_idx in range(n_poly_per_run):
-                column_labels.append(f"run{run_idx+1}_poly{poly_idx}")
-
-            tr_start += n_tp
-            col_start += n_poly_per_run
-
-        poly_tensor = torch.tensor(poly_full, dtype=torch.float32, device=device)
-
-        # Append polynomials to design
-        design_full = torch.cat([design_full, poly_tensor], dim=1)
-
-        if args.verb >= 1:
-            print(f"  Polynomial drift: {total_poly_cols} regressors ({n_poly_per_run} per run x {len(n_timepoints_per_run)} runs)")
+    # Polynomial nuisance is built by pack_for_shared_task_glm later
+    # in the GLM-prep section.  The old code that appended polys here
+    # (and the parallel set built inside fit_glm via max_poly_degree)
+    # was the historical foot-gun — both can produce the same result
+    # but the duplication has caused real bugs.  Now there's exactly
+    # one place where polys enter the design: pack_for_shared_task_glm.
 
     # Save design matrix if requested
     if args.save_design:
@@ -1631,48 +1924,84 @@ def main():
         except ImportError:
             print("WARNING: matplotlib not available, skipping design plot", file=sys.stderr)
 
-    # Prepare data
+    # Prepare data and pack into the canonical shared-task GLM form.
+    #
+    # The canonical multi-run fMRI GLM is::
+    #
+    #   [  task block  | run0_poly | run1_poly | ... ]
+    #   [   (shared    |   ↑↑↑    |    0      |     ]
+    #   [   across     |   run0    |          |     ]
+    #   [   runs)      |    0     |   run1   |     ]
+    #
+    # i.e. ONE set of task betas estimated jointly across all runs +
+    # per-run polynomial nuisance on a block diagonal (polys absorb
+    # run-specific means / drifts / trends, which are NOT shared).
+    # ``fit_glm`` alone does NOT produce this when handed per-run lists
+    # — it block-diagonalizes the task block too, estimating per-run
+    # betas (1/n_runs of the data per estimate, much noisier).
+    #
+    # ``pack_for_shared_task_glm`` builds the canonical concatenated
+    # form once; the fit then runs with ``max_poly_degree=-1`` to
+    # suppress ``fit_glm``'s auto-poly path (polys are already in the
+    # packed design — don't double-count them).
     if args.verb >= 1:
-        print("\nPreparing data for GLM...")
+        print("\nPreparing data for GLM (shared task + block-diag polys)...")
 
-    # Concatenate runs along time axis (data_list is already 2D per run)
-    data_full = np.concatenate(data_list, axis=1)  # (n_all_voxels, total_tp)
-    del data_list  # free memory
+    from fastfuncstuff.design.builder import pack_for_shared_task_glm
 
-    # Apply mask if provided; fit_glm expects (n_voxels, n_timepoints)
     if mask is not None:
-        data_masked = data_full[mask.flatten(), :]  # Shape: (n_voxels_masked, n_timepoints)
-        if args.verb >= 1:
-            print(f"  Data shape: {data_masked.shape}")
+        mask_flat = mask.flatten()
+        per_run_data = [
+            torch.from_numpy(d[mask_flat, :].astype(np.float32))
+            for d in data_list
+        ]
     else:
-        data_masked = data_full  # already (n_all_voxels, n_timepoints)
-        if args.verb >= 1:
-            print(f"  Data shape: {data_masked.shape} (all voxels)")
+        per_run_data = [
+            torch.from_numpy(d.astype(np.float32)) for d in data_list
+        ]
+    del data_list
 
-    # Convert to CPU tensor (will be chunked to GPU during fitting)
-    data_tensor = torch.tensor(data_masked, dtype=torch.float32, device="cpu")
-    del data_masked, data_full
+    packed = pack_for_shared_task_glm(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_designs,
+        polort=args.polort,
+        task_column_labels=column_labels,
+        device=torch.device("cpu"),
+    )
 
-    # Fit GLM with chunking
+    # Replace the save-design / save-plot artefact with the fully
+    # augmented (task + polys) packed form so what we save matches
+    # what fit_glm sees.
+    design_full = packed.design_concat
+    column_labels = packed.column_labels
+    n_stimulus_regressors = packed.n_task_cols
+
     if args.verb >= 1:
+        n_vox_total = packed.data_concat.shape[0]
+        n_poly_cols = packed.design_concat.shape[1] - packed.n_task_cols
+        print(
+            f"  Data: ({n_vox_total}, {packed.design_concat.shape[0]}) "
+            f"across {len(per_run_data)} runs"
+        )
+        print(
+            f"  Design: {packed.design_concat.shape}  "
+            f"({packed.n_task_cols} task + {n_poly_cols} nuisance "
+            f"= {(args.polort + 1) if args.polort >= 0 else 0} polys × "
+            f"{len(per_run_data)} runs on the block diagonal)"
+        )
         print("\nFitting GLM (chunked for GPU memory)...")
-        print(f"  Design: {design_full.shape}")
-        print(f"  Data: {data_tensor.shape}")
-
-    # TODO estimate chunk size based on GPU memroy, n_voxels * timepoints * 4 bytes, and design matrix size
 
     results = fit_glm(
-        data=data_tensor,
-        design=design_full,
+        data=packed.data_concat,
+        design=packed.design_concat,
         tr=tr,
-        # Polynomials are already included in design_full (block-diagonal per run).
-        # Pass max_poly_degree=-1 so fit_glm does not add a second set.
-        max_poly_degree=-1,
+        max_poly_degree=-1,                       # polys already packed in
         device=device,
-        preload_data_to_device=False,  # Stream chunks to GPU
-        chunk_size=None,  # auto-estimate via memory module
+        preload_data_to_device=False,             # stream chunks to GPU
+        chunk_size=None,                          # auto-estimate
         verbose=args.verb >= 1,
         debug_memory=args.debug_memory,
+        debug_design=args.debug_design,
     )
 
     if args.verb >= 1:
