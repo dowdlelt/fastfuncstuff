@@ -240,6 +240,17 @@ Notes:
         default=20,
         help="Number of HRFs in library (default: 20, only affects pighs mode)",
     )
+    hrf_opts.add_argument(
+        "-hrf-library",
+        dest="hrf_library",
+        default=None,
+        metavar="TSV",
+        help=(
+            "Path to a custom HRF library TSV (same format as "
+            "getcanonicalhrflibrary.tsv, e.g. produced by ffs_librarian). "
+            "Used only when -hrf_mode library."
+        ),
+    )
 
     # PIGHS-specific options
     pighs_opts = parser.add_argument_group("PIGHS Options (only used with -hrf_mode pighs)")
@@ -758,8 +769,11 @@ def main():
         microtime_dt=args.microtime_dt,
         n_hrfs=args.n_hrfs,
         device=device,
+        library_path=args.hrf_library,
         **pighs_kwargs,
     )
+    if args.hrf_library:
+        print(f"  Loaded custom HRF library from {args.hrf_library}")
 
     print(f"  HRF library shape: {hrf_library.shape}")
     print(

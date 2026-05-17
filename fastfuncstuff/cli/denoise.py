@@ -443,6 +443,17 @@ Notes:
         help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz for per-voxel HRFs.",
     )
     proc_opts.add_argument(
+        "-hrf-library",
+        dest="hrf_library",
+        type=str,
+        default=None,
+        metavar="TSV",
+        help=(
+            "Custom HRF library TSV (e.g. from ffs_librarian); used when "
+            "the per-voxel HRF library is loaded for denoising."
+        ),
+    )
+    proc_opts.add_argument(
         "-polort",
         type=int,
         default=None,
@@ -1773,7 +1784,15 @@ def main():
 
         # Load HRF library (reconstruct from metadata or use default)
         # For now, use default library matching 3dHRFoptfast
-        hrf_library = get_hrf_library(mode="library", stim_duration=0.0, microtime_dt=args.microtime_dt, n_hrfs=20)
+        hrf_library = get_hrf_library(
+            mode="library",
+            stim_duration=0.0,
+            microtime_dt=args.microtime_dt,
+            n_hrfs=20,
+            library_path=args.hrf_library,
+        )
+        if args.hrf_library:
+            print(f"  Loaded custom HRF library from {args.hrf_library}")
         print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
         # Show HRF distribution

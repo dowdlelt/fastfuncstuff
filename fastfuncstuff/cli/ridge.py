@@ -284,6 +284,17 @@ Notes:
         default=None,
         help="Denoisefast output prefix. Loads {prefix}_noise_pcs.xmat.1D as nuisance regressors.",
     )
+    integ_opts.add_argument(
+        "-hrf-library",
+        dest="hrf_library",
+        type=str,
+        default=None,
+        metavar="TSV",
+        help=(
+            "Custom HRF library TSV (e.g. from ffs_librarian).  Used "
+            "when per-voxel HRF indices are loaded via -hrf_opt."
+        ),
+    )
 
     # Processing options
     proc_opts = parser.add_argument_group("Processing Options")
@@ -577,8 +588,14 @@ def main():
         # Load HRF library (reconstruct from metadata or use default)
         # For now, use default library
         hrf_library = get_hrf_library(
-            mode="library", stim_duration=0.0, microtime_dt=args.microtime_dt, n_hrfs=20
+            mode="library",
+            stim_duration=0.0,
+            microtime_dt=args.microtime_dt,
+            n_hrfs=20,
+            library_path=args.hrf_library,
         )
+        if args.hrf_library:
+            print(f"  Loaded custom HRF library from {args.hrf_library}")
         print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
     # Load noise PCs if provided

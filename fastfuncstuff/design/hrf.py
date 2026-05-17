@@ -130,6 +130,7 @@ def load_canonical_hrf_library(
     hrf_duration: float = 32.0,
     stim_duration: float = 0.0,
     device: torch.device | None = None,
+    library_path: str | Path | None = None,
 ) -> torch.Tensor:
     """
     Load the pre-computed canonical HRF library from file.
@@ -152,6 +153,13 @@ def load_canonical_hrf_library(
         duration in the onset matrix instead.
     device : torch.device, optional
         Device for output tensor
+    library_path : str or Path, optional
+        Custom TSV file to load instead of the canonical
+        ``getcanonicalhrflibrary.tsv``.  Must follow the same format:
+        a 2D TSV at 0.1 s resolution with shape
+        ``(n_timepoints, n_hrfs)`` — columns are HRFs.  Use this with
+        the output of ``ffs_librarian`` (its ``*_hrflibrary.tsv``)
+        to swap in a data-derived library.
 
     Returns
     -------
@@ -172,8 +180,20 @@ def load_canonical_hrf_library(
     if device is None:
         device = get_device()
 
-    # Load raw library (501 timepoints × 20 HRFs at 0.1s resolution)
-    raw_library = _load_hrf_from_file(_HRF_LIBRARY_FILE)
+    # Load raw library (501 timepoints × 20 HRFs at 0.1s resolution).
+    # If library_path is given, read that TSV (same expected layout) so
+    # callers can swap in a custom library — e.g. one produced by
+    # ffs_librarian — without changing any downstream code.
+    if library_path is not None:
+        path = Path(library_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Custom HRF library not found: {path}")
+        raw_library = np.loadtxt(path)
+    else:
+        raw_library = _load_hrf_from_file(_HRF_LIBRARY_FILE)
+    # Allow 1D input for libraries with a single HRF — treat it as one column.
+    if raw_library.ndim == 1:
+        raw_library = raw_library[:, None]
     n_file_timepoints, n_hrfs = raw_library.shape
 
     # Time vector at source resolution (for convolution)
@@ -967,6 +987,7 @@ def get_hrf_library(
     n_hrfs: int = 20,
     hrf_duration: float = 32.0,
     device: torch.device | None = None,
+    library_path: str | Path | None = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -1044,12 +1065,14 @@ def get_hrf_library(
         )
 
     elif mode_lower in ("library", "canonical"):
-        # Load 20-HRF library from file
+        # Load 20-HRF library from file (canonical by default, or a custom
+        # TSV via library_path — e.g. one written by ffs_librarian).
         return load_canonical_hrf_library(
             microtime_dt=microtime_dt,
             hrf_duration=hrf_duration,
             stim_duration=stim_duration,
             device=device,
+            library_path=library_path,
         )
 
     elif mode_lower in ("pighs", "flobs"):
