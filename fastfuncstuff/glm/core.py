@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import warnings
 
+import numpy as np
 import torch
 from tqdm.auto import tqdm
 
@@ -280,6 +281,126 @@ def fit_glm_chunk(
     )
 
 
+def inspect_design(
+    design: torch.Tensor,
+    column_labels: list[str] | None = None,
+    *,
+    near_zero_eps: float = 1e-10,
+    null_eps_factor: float = 1e-8,
+    top_k_smallest: int = 5,
+    file=None,
+) -> dict:
+    """Print and return a rank / conditioning report for a design matrix.
+
+    Used by ``-debug-design`` flags and the singular-X'X warning path
+    to make it obvious which column(s) are causing degeneracy.  Pure
+    diagnostic — never mutates the design.
+
+    Specifically computes (in float64 for stability):
+
+    - Per-column L2 norm.  Any norm < ``near_zero_eps`` is flagged
+      as "all-zero column" (or essentially so).  This is the single
+      most common cause of "leading minor not positive-definite": the
+      FIRST diagonal of X'X is ||X[:, 0]||², so if column 0 is empty
+      Cholesky fails immediately.
+    - Per-column variance (centered around the per-column mean).  A
+      non-zero column that is a near-constant value still kills the
+      block-diagonal polynomial design if it duplicates a polynomial
+      column's constant.
+    - Rank of X'X (numerical, via SVD with a relative tolerance).
+    - Condition number = largest / smallest singular value of X.
+    - Top-K smallest singular values, with their right-singular
+      vectors (= null-space directions for the rank-deficient ones).
+      The non-zero entries in the right-singular vector for a small
+      σ_i identify the *linear combination of columns* that is
+      degenerate — directly answers "why is my design singular?".
+
+    Returns a dict with the numeric results, in case the caller wants
+    to programmatically check rank deficiency.
+    """
+    import sys
+    if file is None:
+        file = sys.stdout
+    X = design.detach().to(torch.float64).cpu()
+    n_t, p = X.shape
+    if column_labels is None:
+        column_labels = [f"col{i}" for i in range(p)]
+    if len(column_labels) != p:
+        column_labels = column_labels + [f"col{i}" for i in range(len(column_labels), p)]
+
+    col_norms = torch.linalg.vector_norm(X, dim=0)
+    col_means = X.mean(dim=0)
+    col_vars = ((X - col_means) ** 2).sum(dim=0)
+    near_zero = (col_norms < near_zero_eps).nonzero(as_tuple=True)[0].tolist()
+    near_constant = [
+        i for i in range(p)
+        if i not in near_zero and float(col_vars[i]) < near_zero_eps * float(col_norms[i] ** 2 + 1e-30)
+    ]
+
+    # SVD of X is cheaper than eigendecomp of X.T @ X and gives us
+    # both singular values and right-singular vectors in one call.
+    try:
+        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+    except Exception as e:                              # noqa: BLE001
+        print(f"  inspect_design: SVD failed: {e}", file=file)
+        return {"rank": None, "error": str(e)}
+
+    s = S.cpu().numpy()
+    smax = float(s[0]) if s.size else 0.0
+    smin = float(s[-1]) if s.size else 0.0
+    tol = max(n_t, p) * float(torch.finfo(X.dtype).eps) * smax
+    rank = int((S > tol).sum().item())
+    cond = (smax / smin) if smin > 0 else float("inf")
+
+    print(f"  inspect_design: shape ({n_t}, {p})", file=file)
+    print(f"    rank          : {rank} / {p}  (numerical tol {tol:.3g})", file=file)
+    print(f"    cond(X)       : {cond:.3g}", file=file)
+    print(f"    largest σ     : {smax:.3g}", file=file)
+    print(f"    smallest σ    : {smin:.3g}", file=file)
+    if near_zero:
+        print(
+            f"    ALL-ZERO cols : {len(near_zero)} columns at indices "
+            f"{near_zero[:20]}{' …' if len(near_zero) > 20 else ''}",
+            file=file,
+        )
+        for i in near_zero[:5]:
+            print(f"      [{i:3d}] '{column_labels[i]}' — norm {float(col_norms[i]):.3g}", file=file)
+    if near_constant:
+        print(
+            f"    constant cols : {len(near_constant)} columns at indices "
+            f"{near_constant[:10]}{' …' if len(near_constant) > 10 else ''}",
+            file=file,
+        )
+    print(f"    smallest {min(top_k_smallest, p)} σ:", file=file)
+    null_eps = null_eps_factor * smax
+    for k in range(min(top_k_smallest, p)):
+        idx = p - 1 - k
+        sigma = float(s[idx])
+        v = Vh[idx].cpu().numpy()
+        is_null = sigma < null_eps
+        prefix = "    NULL  " if is_null else "          "
+        print(f"{prefix}σ[{idx}] = {sigma:.3g}", file=file)
+        if is_null:
+            # Print the largest |v[j]| entries — these are the columns
+            # in the degenerate linear combination.
+            order = np.argsort(-np.abs(v))[:6]
+            terms = ", ".join(
+                f"{v[j]:+.3f}·'{column_labels[j]}'" for j in order if abs(v[j]) > 0.05
+            )
+            print(f"             ↳ degenerate combo: {terms}", file=file)
+    return {
+        "n_timepoints": n_t,
+        "n_regressors": p,
+        "rank": rank,
+        "cond": cond,
+        "smin": smin,
+        "smax": smax,
+        "near_zero_columns": near_zero,
+        "near_constant_columns": near_constant,
+        "singular_values": s.tolist(),
+    }
+
+
 def fit_glm(
     data: torch.Tensor | list,
     design: torch.Tensor | list,
@@ -302,6 +423,7 @@ def fit_glm(
     glt_matrices: list | None = None,
     task_indices: list | None = None,
     debug_memory: bool = False,
+    debug_design: bool = False,
 ) -> GLMResults:
     """
     Fast GPU-accelerated GLM fitting
@@ -482,11 +604,68 @@ def fit_glm(
     # MPS lacks LAPACK; factor on CPU for these small square matrices.
     ld = _linalg_device(design_concat.device)
     xtx_ld = xtx.to(ld)
+    # ``L`` is the lower Cholesky factor of X'X, used by fit_glm_chunk
+    # to solve per-chunk normal equations in O(p²) instead of O(p³).
+    # If Cholesky fails (non-PD or singular), we set L=None and the
+    # chunk solver falls back to lstsq, which is robust to rank
+    # deficiency.
+    if debug_design:
+        # Up-front inspection: rank, conditioning, null-space directions.
+        # Helps diagnose "should-not-be-singular" failures before they
+        # crash.  Cheap (one SVD on a p × p matrix where p is ~tens).
+        if verbose:
+            print("\n[debug-design] inspecting concatenated design before GLM fit:")
+        inspect_design(design_concat, near_zero_eps=1e-10)
+
+    L = None
     try:
         L = torch.linalg.cholesky(xtx_ld)
         xtx_inv = torch.cholesky_inverse(L).to(design_concat.device)
     except torch.linalg.LinAlgError:
-        xtx_inv = torch.linalg.inv(xtx_ld).to(design_concat.device)
+        # Cholesky requires positive-definite; fall through to inv.
+        L = None
+        try:
+            xtx_inv = torch.linalg.inv(xtx_ld).to(design_concat.device)
+        except torch.linalg.LinAlgError as exc:
+            # Genuinely singular — at least one design column is a
+            # linear combination of the others.  Common causes:
+            #   • event timing that perfectly aliases with one of the
+            #     block-diagonal polynomial regressors;
+            #   • a stim_times file that produced an all-zero FIR lag
+            #     column for some lag (events crowded too close to the
+            #     end of every run);
+            #   • duplicated nuisance columns added externally on top
+            #     of fit_glm's automatic polynomials.
+            # Falling back to the Moore-Penrose pseudo-inverse lets the
+            # fit complete (with a least-norm solution) rather than
+            # crashing; we surface the rank deficit so the analyst
+            # knows the design is degenerate.
+            xtx_f64 = xtx_ld.to(torch.float64)
+            rank = int(torch.linalg.matrix_rank(xtx_f64).item())
+            n_reg = xtx_ld.shape[0]
+            # Always print the design inspection on a singular path —
+            # the user needs to see WHICH columns are degenerate, not
+            # just that something is.  Costs an extra SVD but only
+            # fires once per fit and only when something went wrong.
+            print(
+                "\n[fit_glm] X'X is singular — running design inspection "
+                "to identify the degenerate column(s):"
+            )
+            inspect_design(design_concat)
+            warnings.warn(
+                f"fit_glm: X'X is singular (rank {rank} / {n_reg}); "
+                f"falling back to pseudo-inverse so the fit can complete. "
+                f"The design has {n_reg - rank} redundant column(s); check "
+                "for: (a) all-zero FIR/TENT lag columns from events "
+                "crowded against run boundaries; (b) polynomial nuisance "
+                "regressors that were appended externally AND duplicated "
+                "by max_poly_degree; (c) collinear external regressors "
+                "from -ortvec.  Standard errors and t-stats may be "
+                "misleading.  Original error: " + str(exc),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            xtx_inv = torch.linalg.pinv(xtx_f64).to(xtx_ld.dtype).to(design_concat.device)
 
     # Determine which columns are "task" vs "nuisance"
     # If task_indices provided (from AFNI StimBots/StimTops), use those
@@ -529,17 +708,23 @@ def fit_glm(
     # For Full_Fstat: need (X'X) for ALL regressors
     # For task F-stats: need (X'X) for task regressors only
     # MPS lacks cholesky/inv — use ld (cpu on mps, device otherwise)
-    try:
-        L_full = torch.linalg.cholesky(xtx_inv.to(ld))
-        _xtx_inv_full_inv = torch.cholesky_inverse(L_full).to(device)
-    except torch.linalg.LinAlgError:
-        _xtx_inv_full_inv = torch.linalg.inv(xtx_inv.to(ld)).to(device)
+    # When X'X was singular above we already substituted the
+    # pseudo-inverse for xtx_inv; here we invert *back* to recover the
+    # original X'X.  Both Cholesky and plain inv can fail in that
+    # branch, so fall through to pinv as well (in float64 for numerical
+    # stability) and skip noisy intermediate warnings.
+    def _safe_invert(M, ld_dev, target_dev):
+        try:
+            L_ = torch.linalg.cholesky(M.to(ld_dev))
+            return torch.cholesky_inverse(L_).to(target_dev)
+        except torch.linalg.LinAlgError:
+            try:
+                return torch.linalg.inv(M.to(ld_dev)).to(target_dev)
+            except torch.linalg.LinAlgError:
+                return torch.linalg.pinv(M.to(ld_dev).to(torch.float64)).to(M.dtype).to(target_dev)
 
-    try:
-        L_task = torch.linalg.cholesky(xtx_inv_task.to(ld))
-        xtx_inv_task_inv = torch.cholesky_inverse(L_task).to(device)
-    except torch.linalg.LinAlgError:
-        xtx_inv_task_inv = torch.linalg.inv(xtx_inv_task.to(ld)).to(device)
+    _xtx_inv_full_inv = _safe_invert(xtx_inv, ld, device)
+    xtx_inv_task_inv = _safe_invert(xtx_inv_task, ld, device)
     n_task_params = xtx_inv_task.shape[0]
 
     # Setup GLT contrasts (if present) - compute in-loop like ARMA

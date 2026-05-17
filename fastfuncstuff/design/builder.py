@@ -13,12 +13,22 @@ while being easier to use and integrate with our fast GLM fitting.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
 from scipy import special
 from scipy.stats import gamma as scipy_gamma
+
+from fastfuncstuff.design.matrices import (
+    convolve_hrf,
+    is_tr_locked,
+    make_csplin_design,
+    make_fir_design,
+    make_tent_design,
+)
 
 
 def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
@@ -1418,3 +1428,746 @@ def parse_durations(
         )
         print(f"  Conditions: {condition_labels}")
         sys.exit(1)
+
+
+# ============================================================================
+# Shared per-run task-design builder (FIR / TENT / CSPLIN / assumed-HRF).
+# ============================================================================
+#
+# This is the single source of truth for "given per-condition / per-run
+# onset times, build the per-run task-only design tensors."  Both
+# ``ffs_librarian`` and ``ffs_deconvolve`` (and any future CLI doing
+# FIR/TENT modelling) call this — duplicating the loop has bitten us at
+# least twice (axis-flipped slice; externally-built polynomials competing
+# with fit_glm's automatic ones).
+#
+# Invariants:
+#
+#   1. Returns a LIST of per-run task-only tensors.  Callers always pass
+#      that list to :func:`fit_glm` and let ``fit_glm`` build
+#      block-diagonal polynomials via its ``max_poly_degree`` argument.
+#      Polynomials are NEVER built externally — that path is the
+#      historical foot-gun and is explicitly out of scope here.
+#   2. Column ordering is deterministic: condition-major, basis-minor
+#      (``cond0#0, cond0#1, …, cond0#K, cond1#0, …``).  Column labels
+#      track the same ordering.
+#   3. "auto" basis resolves via :func:`is_tr_locked` — FIR if every
+#      onset is within ``tr_locked_threshold`` of a TR boundary, TENT
+#      otherwise.  Auto-window from event durations + a configurable
+#      floor.  These bells & whistles live here once, not duplicated
+#      across CLIs.
+#   4. Pure numpy/torch — no CLI argument parsing or I/O.  Tests can
+#      drive it directly.
+
+
+@dataclass
+class TaskDesignResult:
+    """Container returned by :func:`build_per_run_task_designs`.
+
+    Attributes
+    ----------
+    per_run : list[torch.Tensor]
+        One ``(n_tp_run, sum(n_basis_per_condition))`` tensor per run,
+        in run order.  Columns are condition-major, basis-minor.  This
+        is the list to pass as ``design=`` to
+        :func:`fastfuncstuff.glm.core.fit_glm` (along with per-run data
+        as a list).
+    column_labels : list[str]
+        Length ``sum(n_basis_per_condition)``.  Format
+        ``"<condition_label>#<basis_idx>"`` so that downstream tools
+        can recover the (condition, basis) of each beta.
+    n_basis_per_condition : list[int]
+        Number of regressors per condition (after any TENTzero edge
+        drop).  Indices into ``column_labels`` for condition *c* span
+        ``sum(n_basis_per_condition[:c])`` to
+        ``sum(n_basis_per_condition[:c+1])``.
+    basis_resolved : str
+        The basis actually used after ``"auto"`` resolution.  One of
+        ``"FIR"``, ``"TENT"``, ``"TENTzero"``, ``"CSPLIN"``,
+        ``"CSPLINzero"``, ``"assumed"``.
+    fir_window_s : list[tuple[float, float]] | None
+        Per-condition ``(bot, top)`` window (seconds) that was used to
+        build the basis.  ``None`` for ``"assumed"``.
+    lag_times_s : list[np.ndarray] | None
+        Per-condition lag-time grid.  For FIR these are TR multiples
+        ``[0, tr, 2tr, …]``; for TENT/CSPLIN they are the knot
+        positions in ``[bot, top]``.  ``None`` for ``"assumed"``.
+    notes : list[str]
+        Human-readable diagnostics ("Auto-resolved basis to TENT
+        because onsets are not TR-locked.", etc.).  Caller logs these.
+    """
+
+    per_run: list[torch.Tensor]
+    column_labels: list[str]
+    n_basis_per_condition: list[int]
+    basis_resolved: str
+    fir_window_s: list[tuple[float, float]] | None = None
+    lag_times_s: list[np.ndarray] | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+_BASIS_CHOICES = (
+    "auto",
+    "FIR",
+    "TENT",
+    "TENTzero",
+    "CSPLIN",
+    "CSPLINzero",
+    "assumed",
+)
+
+
+def _resolve_basis_auto(
+    onsets_per_cond_per_run: list[list[np.ndarray]],
+    tr: float,
+    threshold: float,
+) -> str:
+    """Pick FIR (TR-locked) or TENT (not TR-locked) for ``basis='auto'``.
+
+    Concatenates every onset across all conditions × runs and asks
+    :func:`is_tr_locked`.  All-locked → FIR, otherwise → TENT.  A
+    degenerate empty input falls back to FIR (the no-op case).
+    """
+    all_t = [
+        float(t)
+        for cond_runs in onsets_per_cond_per_run
+        for run_onsets in cond_runs
+        for t in (run_onsets.tolist() if run_onsets.size else [])
+    ]
+    if not all_t:
+        return "FIR"
+    return "FIR" if is_tr_locked(all_t, tr, threshold=threshold) else "TENT"
+
+
+def _resolve_windows(
+    durations_per_condition: list[float] | None,
+    fir_window_s: float | list[float] | list[tuple[float, float]] | None,
+    fir_window_min_s: float,
+    tr: float,
+    n_conditions: int,
+) -> list[tuple[float, float]]:
+    """Compute per-condition ``(bot, top)`` windows in seconds.
+
+    Resolution order:
+
+    1. If ``fir_window_s`` is a list of ``(bot, top)`` tuples with the
+       right length → use as-is (advanced caller specified exact
+       windows, e.g. for AFNI-style TENT(bot,top,n)).
+    2. If ``fir_window_s`` is a list of scalars → ``(0, top_i)`` per
+       condition.
+    3. If ``fir_window_s`` is a scalar → ``(0, top)`` for every cond.
+    4. Else, auto-derive from ``durations_per_condition`` via
+       :func:`estimate_hrf_window` (in seconds), with a global floor
+       of ``fir_window_min_s`` applied to the maximum.
+
+    The ``bot`` value is currently always 0 for the auto path; only
+    explicit ``(bot, top)`` tuples support non-zero starts.
+    """
+    from fastfuncstuff.design.hrf import estimate_hrf_window  # local: avoid cycle
+
+    # Form 1: user supplied per-cond (bot, top) tuples
+    if (
+        isinstance(fir_window_s, list)
+        and fir_window_s
+        and isinstance(fir_window_s[0], tuple)
+    ):
+        if len(fir_window_s) != n_conditions:
+            raise ValueError(
+                f"fir_window_s as list of tuples must have {n_conditions} "
+                f"entries; got {len(fir_window_s)}"
+            )
+        return [(float(b), float(t)) for b, t in fir_window_s]
+
+    # Form 2: user supplied per-cond scalar tops
+    if isinstance(fir_window_s, list):
+        if len(fir_window_s) != n_conditions:
+            raise ValueError(
+                f"fir_window_s as list of scalars must have {n_conditions} "
+                f"entries; got {len(fir_window_s)}"
+            )
+        return [(0.0, float(t)) for t in fir_window_s]
+
+    # Form 3: scalar applies to all
+    if fir_window_s is not None:
+        return [(0.0, float(fir_window_s))] * n_conditions
+
+    # Form 4: auto from durations
+    if durations_per_condition is None:
+        # No duration info & no override: fall back to a single
+        # conservative window of fir_window_min_s.
+        top = max(fir_window_min_s, 20.0)
+        return [(0.0, float(top))] * n_conditions
+
+    per_cond_top = [
+        max(1, estimate_hrf_window(d, tr, threshold=0.10)) * tr
+        for d in durations_per_condition
+    ]
+    # Apply the floor at the *maximum* across conditions — we want a
+    # consistent FIR/TENT length to keep the design rectangular, and
+    # the floor matches NSD's 30 s default (configurable).
+    top_max = max(fir_window_min_s, max(per_cond_top))
+    return [(0.0, top_max)] * n_conditions
+
+
+def _lag_times_for(basis: str, window: tuple[float, float], n_basis: int) -> np.ndarray:
+    """Return the time grid corresponding to a basis' knots/lags."""
+    bot, top = window
+    if basis == "FIR":
+        # FIR uses TR multiples starting at bot.  Caller has already
+        # determined n_basis from window/tr so this is just a grid.
+        return bot + np.arange(n_basis) * ((top - bot) / max(n_basis, 1))
+    # TENT / CSPLIN: knots equally spaced from bot to top.
+    if basis in ("TENTzero", "CSPLINzero"):
+        # Edge knots are dropped from the design.  The visible knots
+        # are at indices 1..n_basis (the kept regressors), so we
+        # generate the interior positions.
+        full = np.linspace(bot, top, n_basis + 2)
+        return full[1:-1]
+    return np.linspace(bot, top, n_basis)
+
+
+def build_per_run_task_designs(
+    onsets_per_cond_per_run: list[list[np.ndarray]],
+    n_timepoints_per_run: list[int],
+    tr: float,
+    *,
+    basis: Literal[
+        "auto", "FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero", "assumed"
+    ] = "auto",
+    condition_labels: list[str] | None = None,
+    durations_per_condition: list[float] | None = None,
+    fir_window_s: float | list[float] | list[tuple[float, float]] | None = None,
+    fir_window_min_s: float = 0.0,
+    tent_n_basis: int | list[int] | None = None,
+    hrf: torch.Tensor | np.ndarray | None = None,
+    tr_locked_threshold: float = 0.1,
+    device: torch.device | None = None,
+) -> TaskDesignResult:
+    """Build per-run task-only design tensors for FIR / TENT / CSPLIN / assumed.
+
+    **Single source of truth** — both ``ffs_librarian`` and
+    ``ffs_deconvolve`` route through here so axis-flip and
+    polynomial-double-counting bugs can't lurk in one tool but not the
+    other.
+
+    Parameters
+    ----------
+    onsets_per_cond_per_run : list[list[np.ndarray]]
+        Nested ``[condition][run] → np.ndarray of onset times (s)``,
+        where times are relative to the START of that run (not the
+        global concatenated timeline).
+    n_timepoints_per_run : list[int]
+        Number of TR samples in each run.  Must match the outer
+        run-dimension of ``onsets_per_cond_per_run``.
+    tr : float
+        Repetition time in seconds.
+    basis : str, default ``"auto"``
+        Basis selection.  ``"auto"`` chooses FIR if all onsets lie
+        within ``tr_locked_threshold`` of a TR boundary, otherwise
+        TENT — see :func:`_resolve_basis_auto`.
+    condition_labels : list[str], optional
+        Per-condition display names used in ``column_labels``.
+        Defaults to ``["cond0", "cond1", …]``.
+    durations_per_condition : list[float], optional
+        Event durations (s).  Used only by the auto-window path to
+        derive an appropriate FIR/TENT window via
+        :func:`estimate_hrf_window`.
+    fir_window_s : float or list, optional
+        Override the window.  Three accepted forms (see
+        :func:`_resolve_windows`):
+
+        - scalar → ``(0, top)`` for every condition;
+        - list of scalars → per-condition ``(0, top_i)``;
+        - list of ``(bot, top)`` tuples → per-condition explicit
+          window (the only form that supports non-zero ``bot``).
+    fir_window_min_s : float, default 0.0
+        Floor applied to the auto-estimated window length.  NSD-style
+        callers pass 30.0; ``ffs_deconvolve`` typically passes 0.0.
+    tent_n_basis : int or list[int], optional
+        Override the number of TENT/CSPLIN basis functions.  Defaults
+        to "one knot per TR + 1" within the window.  For TENTzero /
+        CSPLINzero this is the *full* knot count; the actual
+        regressor count is ``tent_n_basis - 2``.
+    hrf : tensor/ndarray, optional
+        Required when ``basis="assumed"``.  1-D HRF kernel sampled at
+        TR resolution (or microtime if you've upsampled the onsets).
+        Each condition gets convolved with this kernel.
+    tr_locked_threshold : float, default 0.1
+        Tolerance (fraction of TR) used by :func:`is_tr_locked` when
+        ``basis="auto"``.
+    device : torch.device, optional
+        Where to materialize the design tensors.  ``None`` → CPU.
+
+    Returns
+    -------
+    TaskDesignResult
+        See dataclass.  ``result.per_run`` is the per-run task-only
+        list to pass to ``fit_glm``; *let fit_glm add polynomials*.
+
+    Notes
+    -----
+    Anti-pattern this function exists to prevent::
+
+        # DO NOT do this:
+        task = build_my_task_design(...)
+        polys = build_block_diagonal_polys(...)
+        design = torch.cat([task, polys], dim=1)
+        fit_glm(data=concat_data, design=design, max_poly_degree=-1)
+
+    Instead::
+
+        result = build_per_run_task_designs(...)
+        fit_glm(data=per_run_data_list, design=result.per_run,
+                max_poly_degree=polort)  # fit_glm owns the polynomials.
+
+    The first form *does* work but has historically diverged between
+    callers in subtle ways (axis flips, off-by-one polort, block
+    misalignment after a run is excluded).  The second form is the
+    "one right way".
+    """
+    if basis not in _BASIS_CHOICES:
+        raise ValueError(
+            f"basis must be one of {_BASIS_CHOICES}; got {basis!r}"
+        )
+
+    n_conditions = len(onsets_per_cond_per_run)
+    if n_conditions == 0:
+        raise ValueError("onsets_per_cond_per_run is empty (no conditions).")
+    n_runs = len(n_timepoints_per_run)
+    if n_runs == 0:
+        raise ValueError("n_timepoints_per_run is empty (no runs).")
+    for c, cond_runs in enumerate(onsets_per_cond_per_run):
+        if len(cond_runs) != n_runs:
+            raise ValueError(
+                f"Condition {c} has {len(cond_runs)} runs but "
+                f"n_timepoints_per_run has {n_runs}."
+            )
+
+    if condition_labels is None:
+        condition_labels = [f"cond{i}" for i in range(n_conditions)]
+    elif len(condition_labels) != n_conditions:
+        raise ValueError(
+            f"condition_labels has {len(condition_labels)} entries but "
+            f"there are {n_conditions} conditions."
+        )
+
+    if device is None:
+        device = torch.device("cpu")
+
+    notes: list[str] = []
+
+    # ----- Resolve basis ('auto' → FIR/TENT) ----------------------------
+    resolved = basis
+    if basis == "auto":
+        resolved = _resolve_basis_auto(
+            onsets_per_cond_per_run, tr, tr_locked_threshold
+        )
+        notes.append(
+            f"Auto-resolved basis to {resolved} "
+            f"(TR-lock tolerance {tr_locked_threshold:.2f} of TR={tr}s)."
+        )
+
+    if resolved == "assumed":
+        if hrf is None:
+            raise ValueError("basis='assumed' requires the `hrf` argument.")
+        return _build_assumed_designs(
+            onsets_per_cond_per_run, n_timepoints_per_run, tr,
+            condition_labels=condition_labels, hrf=hrf, device=device,
+            notes=notes,
+        )
+
+    # ----- Per-condition windows (bot, top) -----------------------------
+    windows = _resolve_windows(
+        durations_per_condition=durations_per_condition,
+        fir_window_s=fir_window_s,
+        fir_window_min_s=fir_window_min_s,
+        tr=tr,
+        n_conditions=n_conditions,
+    )
+
+    # ----- Per-condition basis counts -----------------------------------
+    n_basis_per_cond: list[int] = []
+    if tent_n_basis is not None:
+        if isinstance(tent_n_basis, int):
+            tent_n_basis_list = [tent_n_basis] * n_conditions
+        else:
+            if len(tent_n_basis) != n_conditions:
+                raise ValueError(
+                    f"tent_n_basis as list must have {n_conditions} entries"
+                )
+            tent_n_basis_list = list(tent_n_basis)
+    else:
+        tent_n_basis_list = [None] * n_conditions  # auto
+
+    for c in range(n_conditions):
+        bot, top = windows[c]
+        if resolved == "FIR":
+            # FIR samples at integer TR offsets.
+            n = max(1, int(np.ceil((top - bot) / tr)))
+        else:
+            # TENT/CSPLIN: one knot per TR + 1 edge knot, unless overridden.
+            if tent_n_basis_list[c] is not None:
+                n_knots = int(tent_n_basis_list[c])
+            else:
+                n_knots = max(2, int(round((top - bot) / tr)) + 1)
+            if resolved in ("TENTzero", "CSPLINzero"):
+                n = n_knots - 2  # edges dropped
+            else:
+                n = n_knots
+        n_basis_per_cond.append(n)
+
+    # ----- Build per-run designs ----------------------------------------
+    per_run: list[torch.Tensor] = []
+    for r, n_run_tp in enumerate(n_timepoints_per_run):
+        cond_blocks: list[torch.Tensor] = []
+        for c in range(n_conditions):
+            onset_times = np.asarray(
+                onsets_per_cond_per_run[c][r], dtype=np.float64
+            )
+            bot, top = windows[c]
+            if resolved == "FIR":
+                # Quantize to nearest TR; build (n_run_tp, 1) onset
+                # vector; expand to (n_run_tp, n_lags) via shifts.
+                onset_vec = torch.zeros(n_run_tp, 1, device=device)
+                if onset_times.size > 0:
+                    idx = np.round(onset_times / tr).astype(int)
+                    idx = idx[(idx >= 0) & (idx < n_run_tp)]
+                    onset_vec[idx, 0] = 1.0
+                block = make_fir_design(
+                    onset_vec, n_basis_per_cond[c], n_run_tp, device=device
+                )
+            elif resolved in ("TENT", "TENTzero"):
+                n_knots = (
+                    n_basis_per_cond[c] + 2
+                    if resolved == "TENTzero"
+                    else n_basis_per_cond[c]
+                )
+                block = make_tent_design(
+                    [onset_times],
+                    bot=bot, top=top, tr=tr,
+                    n_timepoints=n_run_tp,
+                    n_basis=n_knots,
+                    zero_edges=(resolved == "TENTzero"),
+                    device=device,
+                )
+            elif resolved in ("CSPLIN", "CSPLINzero"):
+                n_knots = (
+                    n_basis_per_cond[c] + 2
+                    if resolved == "CSPLINzero"
+                    else n_basis_per_cond[c]
+                )
+                block = make_csplin_design(
+                    [onset_times],
+                    bot=bot, top=top, tr=tr,
+                    n_timepoints=n_run_tp,
+                    n_basis=n_knots,
+                    zero_edges=(resolved == "CSPLINzero"),
+                    device=device,
+                )
+            else:
+                raise ValueError(
+                    f"unreachable: basis '{resolved}' not handled "
+                    "(should have been caught earlier)"
+                )
+            cond_blocks.append(block)
+        # Condition-major concatenation along regressor axis.
+        per_run.append(torch.cat(cond_blocks, dim=1))
+
+    # ----- Column labels, lag times -------------------------------------
+    column_labels: list[str] = []
+    lag_times_s: list[np.ndarray] = []
+    for c in range(n_conditions):
+        n = n_basis_per_cond[c]
+        for k in range(n):
+            column_labels.append(f"{condition_labels[c]}#{k}")
+        lag_times_s.append(_lag_times_for(resolved, windows[c], n))
+
+    return TaskDesignResult(
+        per_run=per_run,
+        column_labels=column_labels,
+        n_basis_per_condition=n_basis_per_cond,
+        basis_resolved=resolved,
+        fir_window_s=list(windows),
+        lag_times_s=lag_times_s,
+        notes=notes,
+    )
+
+
+@dataclass
+class PackedSharedTaskDesign:
+    """Concatenated design ready for the canonical multi-run GLM.
+
+    Returned by :func:`pack_for_shared_task_glm` so callers can hand
+    ``data_concat`` + ``design_concat`` to :func:`fit_glm` with
+    ``max_poly_degree=-1`` and get **shared task betas across runs +
+    block-diagonal polynomial nuisance**, which is the canonical
+    fMRI multi-run GLM:
+
+    .. code-block:: text
+
+           [  task block  | run0_poly | run1_poly | … ]
+           [    (shared    |   ↑↑↑    |    0      |   ]
+           [   across runs)|   run0    |          |   ]
+           [               |    0     |   run1   |   ]
+           [               |          |  poly     |   ]
+
+    Attributes
+    ----------
+    data_concat : torch.Tensor, (n_voxels, sum n_tp_run)
+        Row-concatenated per-run data.
+    design_concat : torch.Tensor, (sum n_tp_run, n_task_cols + n_runs * (polort+1))
+        Shared task (row-stacked across runs) followed by
+        block-diagonal polynomial nuisance.  Pass to ``fit_glm`` with
+        ``max_poly_degree=-1`` to prevent double-adding polynomials.
+    n_task_cols : int
+        Number of task columns at the start of ``design_concat``.
+        Extract task betas via ``results.betas[:, :n_task_cols]``.
+    column_labels : list[str]
+        Length ``design_concat.shape[1]``.  Task labels from
+        :class:`TaskDesignResult`, then ``run{r}_poly{k}`` for each
+        polynomial column.
+    n_tp_per_run : list[int]
+        Run lengths in TR, in run order.  Useful for downstream code
+        that needs to split predictions/residuals back per run.
+    polort : int
+        Polynomial degree used.  ``-1`` means no polynomial nuisance
+        was added.
+    """
+
+    data_concat: torch.Tensor
+    design_concat: torch.Tensor
+    n_task_cols: int
+    column_labels: list[str]
+    n_tp_per_run: list[int]
+    polort: int
+
+
+def pack_for_shared_task_glm(
+    per_run_data: list[torch.Tensor],
+    per_run_task_designs: list[torch.Tensor],
+    polort: int,
+    *,
+    task_column_labels: list[str] | None = None,
+    extra_regressors_per_run: list[torch.Tensor] | None = None,
+    device: torch.device | None = None,
+) -> PackedSharedTaskDesign:
+    """Pack per-run task designs into the canonical "shared-task + block-diagonal-polys" GLM form.
+
+    **Why this exists** — :func:`fit_glm`, when handed per-run lists,
+    block-diagonalizes the TASK matrix too, which estimates separate
+    task betas per run.  For typical fMRI analyses we want a **single
+    set of task betas** estimated jointly across all runs (more data
+    per parameter, cleaner HRF estimates), so we row-concatenate the
+    task block while keeping polynomials per-run on a block diagonal.
+    That is the form ``ffs_deconvolve`` historically built by hand;
+    this helper makes it the one right way.
+
+    The resulting tensors are designed to be fed to ``fit_glm`` as
+    **single tensors** (not lists) with ``max_poly_degree=-1`` to
+    suppress the auto-polynomial path:
+
+    .. code-block:: python
+
+        packed = pack_for_shared_task_glm(
+            per_run_data, per_run_task_designs, polort=4,
+            task_column_labels=task_design_result.column_labels,
+        )
+        result = fit_glm(
+            data=packed.data_concat,
+            design=packed.design_concat,
+            max_poly_degree=-1,        # polys already in design_concat
+        )
+        task_betas = result.betas[:, :packed.n_task_cols]
+
+    Parameters
+    ----------
+    per_run_data : list[torch.Tensor], each shape (n_voxels, n_tp_run)
+        Voxel data per run, in run order.  Must all share the same
+        ``n_voxels`` (i.e. the same brain mask).
+    per_run_task_designs : list[torch.Tensor], each shape (n_tp_run, n_task)
+        Per-run task design (output of
+        :func:`build_per_run_task_designs`).  All runs must have the
+        same ``n_task`` (the task model is shared by definition).
+    polort : int
+        Polynomial nuisance degree.  ``-1`` disables.  ``0`` adds a
+        run-specific constant; ``4`` adds Legendre degrees 0–4 per
+        run (5 columns × n_runs total).
+    task_column_labels : list[str], optional
+        Labels for the task columns.  Defaults to
+        ``["task0", "task1", …]``.
+    extra_regressors_per_run : list[torch.Tensor], optional
+        Per-run external nuisance (e.g. motion, GLMdenoise PCs).  Each
+        tensor must have shape ``(n_tp_run, n_extra)`` with the same
+        ``n_extra`` across runs.  These are appended to each run's
+        polynomial block in the block-diagonal section, so they
+        remain run-specific (no shared external nuisance — that's the
+        canonical convention).
+    device : torch.device, optional
+        Device for the output tensors.  ``None`` → CPU.
+
+    Returns
+    -------
+    PackedSharedTaskDesign
+        Ready to feed to ``fit_glm`` (see class docstring).
+
+    Notes
+    -----
+    Equivalence with the old hand-built deconvolve path is
+    bit-for-bit when both use the same Legendre polynomial
+    construction (``construct_polynomial_matrix`` in glm/core.py
+    delegates to ``legendre_polynomials`` in this module, so they
+    agree).
+    """
+    if not per_run_data:
+        raise ValueError("per_run_data is empty.")
+    if len(per_run_data) != len(per_run_task_designs):
+        raise ValueError(
+            f"per_run_data has {len(per_run_data)} runs but "
+            f"per_run_task_designs has {len(per_run_task_designs)}."
+        )
+    n_runs = len(per_run_data)
+    n_voxels = per_run_data[0].shape[0]
+    n_task = per_run_task_designs[0].shape[1]
+    for r in range(1, n_runs):
+        if per_run_data[r].shape[0] != n_voxels:
+            raise ValueError(
+                f"per_run_data[{r}] has {per_run_data[r].shape[0]} voxels "
+                f"but run 0 has {n_voxels}."
+            )
+        if per_run_task_designs[r].shape[1] != n_task:
+            raise ValueError(
+                f"per_run_task_designs[{r}] has {per_run_task_designs[r].shape[1]} "
+                f"task columns but run 0 has {n_task} — task model must be shared."
+            )
+
+    if extra_regressors_per_run is not None:
+        if len(extra_regressors_per_run) != n_runs:
+            raise ValueError(
+                f"extra_regressors_per_run has {len(extra_regressors_per_run)} "
+                f"runs but data has {n_runs}."
+            )
+        n_extra = extra_regressors_per_run[0].shape[1] if extra_regressors_per_run[0].ndim > 1 else 1
+        for r in range(1, n_runs):
+            x = extra_regressors_per_run[r]
+            n_e_r = x.shape[1] if x.ndim > 1 else 1
+            if n_e_r != n_extra:
+                raise ValueError(
+                    f"extra_regressors_per_run[{r}] has {n_e_r} columns; "
+                    f"run 0 has {n_extra}."
+                )
+    else:
+        n_extra = 0
+
+    if device is None:
+        device = per_run_data[0].device if per_run_data[0].is_floating_point() else torch.device("cpu")
+
+    # --- Row-concat task across runs (this is the "shared task" trick) -----
+    task_concat = torch.cat(
+        [d.to(device).to(torch.float32) for d in per_run_task_designs], dim=0
+    )
+
+    # --- Row-concat data --------------------------------------------------
+    data_concat = torch.cat(
+        [d.to(device).to(torch.float32) for d in per_run_data], dim=1
+    )
+
+    # --- Build block-diagonal nuisance (poly + optional extras) per run ---
+    n_tp_per_run = [d.shape[1] for d in per_run_data]
+    total_tp = sum(n_tp_per_run)
+    n_nuisance_per_run = (polort + 1 if polort >= 0 else 0) + n_extra
+    if n_nuisance_per_run > 0:
+        nuisance_full = torch.zeros(
+            (total_tp, n_runs * n_nuisance_per_run), dtype=torch.float32, device=device,
+        )
+        tr_start = 0
+        col_start = 0
+        for r, n_tp in enumerate(n_tp_per_run):
+            run_blocks: list[torch.Tensor] = []
+            if polort >= 0:
+                poly_np = legendre_polynomials(n_tp, polort)
+                run_blocks.append(torch.from_numpy(poly_np).to(torch.float32).to(device))
+            if extra_regressors_per_run is not None:
+                x = extra_regressors_per_run[r].to(device).to(torch.float32)
+                if x.ndim == 1:
+                    x = x.unsqueeze(1)
+                run_blocks.append(x)
+            run_block = torch.cat(run_blocks, dim=1)
+            nuisance_full[tr_start:tr_start + n_tp, col_start:col_start + run_block.shape[1]] = run_block
+            tr_start += n_tp
+            col_start += run_block.shape[1]
+        design_concat = torch.cat([task_concat, nuisance_full], dim=1)
+    else:
+        design_concat = task_concat
+
+    # --- Column labels ----------------------------------------------------
+    if task_column_labels is None:
+        labels = [f"task{i}" for i in range(n_task)]
+    else:
+        if len(task_column_labels) != n_task:
+            raise ValueError(
+                f"task_column_labels has {len(task_column_labels)} entries; "
+                f"per_run_task_designs has {n_task} task columns."
+            )
+        labels = list(task_column_labels)
+    for r in range(n_runs):
+        if polort >= 0:
+            for k in range(polort + 1):
+                labels.append(f"run{r + 1}_poly{k}")
+        for k in range(n_extra):
+            labels.append(f"run{r + 1}_extra{k}")
+
+    return PackedSharedTaskDesign(
+        data_concat=data_concat,
+        design_concat=design_concat,
+        n_task_cols=n_task,
+        column_labels=labels,
+        n_tp_per_run=n_tp_per_run,
+        polort=polort,
+    )
+
+
+def _build_assumed_designs(
+    onsets_per_cond_per_run: list[list[np.ndarray]],
+    n_timepoints_per_run: list[int],
+    tr: float,
+    *,
+    condition_labels: list[str],
+    hrf: torch.Tensor | np.ndarray,
+    device: torch.device,
+    notes: list[str],
+) -> TaskDesignResult:
+    """Assumed-HRF design: one regressor per condition = onsets ⊛ HRF.
+
+    Implements the trivial "convolve onset train with HRF kernel per
+    condition per run" path so that :func:`build_per_run_task_designs`
+    has a single uniform interface across basis modes.  The HRF is
+    sampled at TR resolution; sub-TR-onset support is currently
+    handled by the caller upstream (e.g. via microtime upsampling).
+    """
+    hrf_t = torch.as_tensor(hrf, dtype=torch.float32, device=device).flatten()
+    n_conditions = len(onsets_per_cond_per_run)
+    per_run: list[torch.Tensor] = []
+    for r, n_run_tp in enumerate(n_timepoints_per_run):
+        cond_cols: list[torch.Tensor] = []
+        for c in range(n_conditions):
+            onset_times = np.asarray(
+                onsets_per_cond_per_run[c][r], dtype=np.float64
+            )
+            onset_vec = torch.zeros(n_run_tp, 1, device=device)
+            if onset_times.size > 0:
+                idx = np.round(onset_times / tr).astype(int)
+                idx = idx[(idx >= 0) & (idx < n_run_tp)]
+                onset_vec[idx, 0] = 1.0
+            conv = convolve_hrf(onset_vec, hrf_t, n_run_tp, device=device)
+            cond_cols.append(conv)
+        per_run.append(torch.cat(cond_cols, dim=1))
+
+    return TaskDesignResult(
+        per_run=per_run,
+        column_labels=list(condition_labels),
+        n_basis_per_condition=[1] * n_conditions,
+        basis_resolved="assumed",
+        fir_window_s=None,
+        lag_times_s=None,
+        notes=notes,
+    )
