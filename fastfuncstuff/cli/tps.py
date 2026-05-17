@@ -24,25 +24,25 @@ References:
 
 Usage:
     ffs_tps.py -input func.nii.gz \\
-               -stim_times face.txt house.txt \\
-               -stim_labels face house \\
-               -tps_window 0,15 0,20 \\
-               -n_knots 10 \\
-               -optimize_level global \\
-               -output_prefix tps_results
+               -stim-times face.txt house.txt \\
+               -stim-labels face house \\
+               -tps-window 0,15 0,20 \\
+               -n-knots 10 \\
+               -optimize-level global \\
+               -output-prefix tps_results
 
 Examples:
     # Global λ optimization (fast, good baseline)
-    ffs_tps.py -input func.nii.gz -stim_times onsets.txt \\
-               -tps_window 0,20 -n_knots 15 -optimize_level global
+    ffs_tps.py -input func.nii.gz -stim-times onsets.txt \\
+               -tps-window 0,20 -n-knots 15 -optimize-level global
 
     # Per-voxel λ optimization (adaptive to local SNR)
-    ffs_tps.py -input func.nii.gz -stim_times onsets.txt \\
-               -tps_window 0,20 -n_knots 15 -optimize_level per_voxel
+    ffs_tps.py -input func.nii.gz -stim-times onsets.txt \\
+               -tps-window 0,20 -n-knots 15 -optimize-level per_voxel
 
     # Custom λ search grid
-    ffs_tps.py -input func.nii.gz -stim_times onsets.txt \\
-               -tps_window 0,20 -lambda_values 0.01 0.1 1 10 100
+    ffs_tps.py -input func.nii.gz -stim-times onsets.txt \\
+               -tps-window 0,20 -lambda-values 0.01 0.1 1 10 100
 
 Author: Logan Thomas
 Date: 2026-01-27
@@ -191,28 +191,28 @@ def main():
     # Input/output
     parser.add_argument('-input', required=True, help='Input fMRI data (4D NIfTI)')
     parser.add_argument('-mask', help='Brain mask (3D NIfTI), auto-generated if not provided')
-    parser.add_argument('-output_prefix', required=True, help='Output file prefix')
+    parser.add_argument('-output-prefix', required=True, help='Output file prefix')
 
     # Stimulus timing
-    parser.add_argument('-stim_times', nargs='+', required=True,
+    parser.add_argument('-stim-times', nargs='+', required=True,
                         help='Onset time files (one per condition)')
-    parser.add_argument('-stim_labels', nargs='+', required=True,
-                        help='Condition labels (must match number of -stim_times files)')
+    parser.add_argument('-stim-labels', nargs='+', required=True,
+                        help='Condition labels (must match number of -stim-times files)')
 
     # TPS parameters
-    parser.add_argument('-tps_window', nargs='+', required=True,
+    parser.add_argument('-tps-window', nargs='+', required=True,
                         help='Estimation window: "0 15", "0,15", or "0,15 0,20" (per-condition)')
-    parser.add_argument('-n_knots', type=int, default=None,
+    parser.add_argument('-n-knots', type=int, default=None,
                         help='Number of basis functions (knots). Default: auto (window_duration / TR)')
-    parser.add_argument('-force_zero_edges', action='store_true',
+    parser.add_argument('-force-zero-edges', action='store_true',
                         help='Force HRF to be zero at window start/end')
 
     # Cross-validation
-    parser.add_argument('-optimize_level', choices=['global', 'per_voxel'], default='global',
+    parser.add_argument('-optimize-level', choices=['global', 'per_voxel'], default='global',
                         help='Smoothness optimization: global (one λ) or per_voxel (adaptive). Default: global')
-    parser.add_argument('-lambda_values', nargs='+', type=float, default=None,
+    parser.add_argument('-lambda-values', nargs='+', type=float, default=None,
                         help='Lambda search grid (e.g., "0.01 0.1 1 10 100"). Default: auto (logarithmic grid)')
-    parser.add_argument('-cv_method', choices=['loro', 'split_half'], default='loro',
+    parser.add_argument('-cv-method', choices=['loro', 'split_half'], default='loro',
                         help='Cross-validation method. Default: loro (leave-one-run-out)')
 
     # Nuisance regressors
@@ -222,13 +222,13 @@ def main():
     # Computational
     parser.add_argument('-device', choices=['cpu', 'cuda', 'auto'], default='auto',
                         help='Computation device. Default: auto')
-    parser.add_argument('-chunk_size', type=int, default=60000,
+    parser.add_argument('-chunk-size', type=int, default=60000,
                         help='Voxels per chunk for GPU memory management. Default: 60000')
 
     # Output options
-    parser.add_argument('-save_design', action='store_true',
+    parser.add_argument('-save-design', action='store_true',
                         help='Save design matrix as .1D file')
-    parser.add_argument('-save_lambda_map', action='store_true',
+    parser.add_argument('-save-lambda-map', action='store_true',
                         help='Save optimal lambda values as NIfTI (per_voxel mode only)')
     add_verbose_arg(parser, default=0)
 
