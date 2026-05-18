@@ -877,6 +877,14 @@ def main() -> int:
                 packed_pc.design_concat[:, n_pc_task_cols:]
                 if packed_pc.design_concat.shape[1] > n_pc_task_cols else None
             )
+            # Inherit -lambda-mode and -prior-weight from the user.
+            # The previous hard-coded ``global / auto`` combination
+            # took σ²_mean across the brain mask, which at 9.4T PSC
+            # scaling is dominated by CSF/edge voxels with huge
+            # variance — every voxel saw the same enormous λ and the
+            # per-condition β collapsed toward `m`, defeating the
+            # whole point of -prior-from per-condition (the prior
+            # ended up being "basically global m" for every voxel).
             pc_fit = fit_basis_constrained_ridge(
                 data=packed_pc.data_concat,
                 design_task=pc_task_design,
@@ -885,10 +893,11 @@ def main() -> int:
                 prior_cov=prior_C,
                 n_blocks=n_cond,
                 nuisance=pc_nuisance,
-                prior_weight="auto",
+                prior_weight=pw,
                 device=device,
                 reconstruct_hrfs=False,
-                lambda_mode="global",
+                lambda_mode=args.lambda_mode,
+                lambda_n_bins=args.lambda_n_bins,
             )
             cond_betas = pc_fit.betas[:, :n_pc_task_cols].reshape(
                 -1, n_cond, n_basis,
