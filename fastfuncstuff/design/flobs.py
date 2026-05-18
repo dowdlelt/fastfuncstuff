@@ -1400,6 +1400,30 @@ def fit_basis_fracridge(
     # SS_res accumulator: (n_fracs, n_voxels), float64 for numeric stability.
     ss_res_accum = torch.zeros(n_fracs, n_voxels, dtype=torch.float64, device=device)
 
+    # Voxel chunk size for the prediction step.  Per-voxel cost during
+    # prediction is roughly ``3 × n_tp_test × n_fracs × 4 bytes``
+    # (y_pred + resid + (resid**2) intermediate), which at 9.4T scale
+    # (306k voxels × 288 TR × 10 fracs) is ~3.5 GB per tensor and
+    # OOMs a 16 GB card after data_clean + coefs are already resident.
+    # Bound the prediction workspace to ~25 % of free VRAM.
+    n_tp_test_max = max(n_tp_per_run)
+    if device.type == "cuda":
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+        except Exception:
+            free_bytes = 4 * 1024 ** 3
+        bytes_per_vox_pred = 3 * n_tp_test_max * n_fracs * 4
+        v_chunk = max(1, int(free_bytes * 0.25 / max(bytes_per_vox_pred, 1)))
+        v_chunk = min(v_chunk, n_voxels)
+    else:
+        v_chunk = n_voxels                                  # CPU: no chunking needed
+    if verbose:
+        n_v_chunks = (n_voxels + v_chunk - 1) // v_chunk
+        print(
+            f"  fracridge: prediction in {n_v_chunks} voxel "
+            f"chunk{'s' if n_v_chunks > 1 else ''} of {v_chunk:,}"
+        )
+
     splits_iter = tqdm(
         splits, total=n_splits,
         desc="  fracridge LORO", unit="fold",
@@ -1424,12 +1448,20 @@ def fit_basis_fracridge(
             X=X_train, y=y_train.T, fracs=fracs, device=device,
         )                                                   # (n_task, n_fracs, n_voxels)
 
-        # Predict per frac: (n_tp_te, n_voxels) for each frac.
-        # einsum: X_test (T,F) @ coefs (F,K,V) -> (T,K,V) -> err (K,T,V) -> (K,V)
-        y_pred = torch.einsum("tf,fkv->tkv", X_test, coefs)  # (T, n_fracs, V)
-        resid = y_test.T.unsqueeze(1) - y_pred              # (T, n_fracs, V)
-        ss_res_accum += (resid ** 2).sum(dim=0).double()
-        del X_train, X_test, y_train, y_test, coefs, y_pred, resid
+        # Chunked prediction: einsum materialises a (T, F, V) tensor
+        # which is ~3.5 GB for 9.4T-scale data and 10 fracs.  Loop
+        # voxel-chunks instead so peak VRAM is bounded.
+        for v0 in range(0, n_voxels, v_chunk):
+            v1 = min(v0 + v_chunk, n_voxels)
+            coefs_chunk = coefs[:, :, v0:v1]                # (n_task, n_fracs, V_c)
+            y_pred = torch.einsum(
+                "tf,fkv->tkv", X_test, coefs_chunk,
+            )                                               # (T, n_fracs, V_c)
+            resid = y_test[v0:v1].T.unsqueeze(1) - y_pred
+            ss_res_accum[:, v0:v1] += (resid ** 2).sum(dim=0).double()
+            del coefs_chunk, y_pred, resid
+
+        del X_train, X_test, y_train, y_test, coefs
 
     # Held-out R² per frac per voxel.  ss_tot_full is (V,); broadcast to (F, V).
     r2_by_frac_t = 1.0 - ss_res_accum / torch.clamp(ss_tot_full.unsqueeze(0), min=1e-30)
