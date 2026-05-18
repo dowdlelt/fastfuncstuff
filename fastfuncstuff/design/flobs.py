@@ -1585,28 +1585,76 @@ def estimate_arma11_per_voxel(
             "check that the design is well-conditioned."
         )
 
-    # If the grid lives on CPU, the search-loop matmul `L_inv @ Y.T`
-    # requires Y on CPU too (or vice versa).  search_voxels_precomputed_grid
-    # only normalises Y to its `device` argument — when grid is CPU and
-    # device is cuda, we silently get a mismatch.  Pin Y to wherever
-    # the grid actually lives.
+    # CRITICAL: precompute_reml_grid stores everything on CPU after the
+    # Cholesky (designed to be loaded on-demand by ffs_reml's batching
+    # path).  For a single big-batch search like ours, leaving the grid
+    # on CPU means the L_inv @ Y.T BLAS-3 inside the search loop runs on
+    # CPU — 117 grid points × multi-second CPU GEMM is ~25 minutes.
+    # Move the entire grid to the compute device once before searching,
+    # exactly like fit_glm_arma11 does.
+    if device.type == "cuda":
+        if verbose:
+            print("  per-voxel ARMA: loading grid to GPU (one-time cost)…")
+        for key in grid:
+            for field in ("L_inv", "X_w", "Q", "logdet_Rcorr", "logdet_XwTXw"):
+                if field in grid[key]:
+                    grid[key][field] = grid[key][field].to(device)
+        torch.cuda.empty_cache()
+
+    # The actual device the grid sits on — informs where Y must live.
     grid_device = next(iter(grid.values()))["L_inv"].device
     Y_search = Y_full.to(grid_device) if Y_full.device != grid_device else Y_full
     X_search = X_full.to(grid_device) if X_full.device != grid_device else X_full
 
+    # Voxel batching for the search.  Each grid iter materialises a
+    # (n_tp, n_vox_batch) prewhitened-Y tensor and the search loop is
+    # over (n_grid_points × n_batches).  Keep batches comfortably under
+    # available memory; fall back to ~50k voxels when introspection
+    # fails.
+    if grid_device.type == "cuda":
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(grid_device)
+        except Exception:
+            free_bytes = 4 * 1024 ** 3
+        # Per voxel cost across the inner loop: Y row (n_tp), Y_w row
+        # (n_tp), one rss + qt_yw scratch.  ~4× n_tp float32 = safe.
+        bytes_per_vox = 4 * total_tp * 4
+        # Use ~25 % of free VRAM for the search workspace (the grid
+        # tensors already occupy a chunk of the remaining 75 %).
+        n_vox_batch = max(1, int(free_bytes * 0.25 / max(bytes_per_vox, 1)))
+        n_vox_batch = min(n_vox_batch, n_voxels)
+    else:
+        # CPU path: keep batches modest to avoid blowing host memory.
+        n_vox_batch = min(n_voxels, 50_000)
+
+    n_batches = (n_voxels + n_vox_batch - 1) // n_vox_batch
     if verbose:
         print(
             f"  per-voxel ARMA: REML search over {n_voxels:,} voxels "
-            f"(grid on {grid_device})…"
+            f"on {grid_device} "
+            f"({n_batches} batch{'es' if n_batches > 1 else ''} × "
+            f"{n_vox_batch:,} vox)…"
         )
-    best_params, _ = search_voxels_precomputed_grid(
-        X=X_search,
-        Y_batch=Y_search,
-        precomputed_grid=grid,
-        device=grid_device,
-        verbose=verbose,
+
+    best_params = torch.empty(n_voxels, 2, dtype=Y_search.dtype)
+    batch_iter = tqdm(
+        range(n_batches), total=n_batches,
+        desc="  REML search batches", unit="batch",
+        leave=False, disable=(not verbose) or n_batches <= 1,
     )
-    return best_params.detach().cpu().numpy().astype(np.float32)
+    for batch_idx in batch_iter:
+        b0 = batch_idx * n_vox_batch
+        b1 = min(b0 + n_vox_batch, n_voxels)
+        bp, _ = search_voxels_precomputed_grid(
+            X=X_search,
+            Y_batch=Y_search[b0:b1],
+            precomputed_grid=grid,
+            device=grid_device,
+            verbose=(verbose and batch_idx == 0),
+        )
+        best_params[b0:b1] = bp.detach().cpu()
+
+    return best_params.numpy().astype(np.float32)
 
 
 def bin_and_whiten_arma11(
