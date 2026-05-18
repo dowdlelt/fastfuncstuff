@@ -2089,6 +2089,201 @@ def vb_update_beta_size(
     return (numer / np.maximum(denom, floor)).astype(np.float32)
 
 
+def compute_xval_r2_per_voxel(
+    per_run_data: list[torch.Tensor],
+    all_onsets: list[list[np.ndarray]],
+    condition_labels: list[str],
+    basis_functions: np.ndarray,
+    basis_lag_times: np.ndarray,
+    basis_mode: str,
+    tr: float,
+    n_tp_per_run: list[int],
+    polort: int,
+    prior_mean: np.ndarray,
+    prior_cov: np.ndarray,
+    prior_weight: float | str,
+    *,
+    single_trials: bool,
+    single_trial_betas: np.ndarray | None = None,
+    block_labels: list[str] | None = None,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> np.ndarray:
+    """LORO cross-validated R² per voxel.
+
+    Per-condition mode (``single_trials=False``):
+        Standard LORO — train on N−1 runs with the user's
+        ``-reg`` / prior config, predict the held-out run with the
+        per-condition task betas, aggregate ``Σ ss_res / Σ ss_tot``
+        across folds.
+
+    Single-trial mode (``single_trials=True``):
+        **No re-fitting** — the single-trial fit's task design has
+        one column per (cond, run, trial), and those columns are
+        time-disjoint across runs (each trial only has non-zero
+        support inside its home run).  ``X'X`` is therefore
+        block-diagonal across runs at the task level, so each
+        trial's β depends *only* on its home run's data.  Subsetting
+        the existing single-trial betas to "trials in train runs",
+        averaging within condition, and predicting the held-out run
+        with the per-condition design gives a faithful held-out R²
+        for free — no per-fold re-fit needed.
+
+        Requires ``single_trial_betas`` (shape
+        ``(n_vox, n_blocks, K)``, from the main fit) and the parallel
+        ``block_labels`` list so we can parse each block's home run
+        from its label (format ``"{cond}_trial{NNN}_run{R}"``).
+
+        Useful diagnostic: if the held-out R² is low while the
+        in-sample R² is high, the single-trial estimates are
+        oscillating around the mean rather than tracking the
+        cross-run condition response.
+
+    Returns ``(n_voxels,)`` of held-out R² values.
+    """
+    from fastfuncstuff.glm.xval import generate_cv_splits
+    from fastfuncstuff.design.builder import (
+        legendre_polynomials, pack_for_shared_task_glm,
+    )
+    from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
+
+    if device is None:
+        device = get_device()
+
+    n_runs = len(per_run_data)
+    if n_runs < 2:
+        raise ValueError(f"xval needs ≥2 runs; got {n_runs}")
+    n_voxels = per_run_data[0].shape[0]
+    n_basis = basis_functions.shape[0]
+    n_cond = len(condition_labels)
+
+    # Per-condition designs for ALL runs — used for prediction in
+    # both single-trial and per-condition modes.
+    cond_designs_per_run: list[torch.Tensor] = []
+    for r in range(n_runs):
+        cond_blocks: list[np.ndarray] = []
+        for c in range(n_cond):
+            bd = build_pc_basis_design_per_run(
+                onsets_per_run=[all_onsets[c][r]],
+                pcs=basis_functions, lag_times=basis_lag_times,
+                tr=tr, n_timepoints_per_run=[n_tp_per_run[r]],
+                basis=basis_mode,
+            )
+            cond_blocks.append(bd[0])
+        cond_designs_per_run.append(
+            torch.from_numpy(
+                np.concatenate(cond_blocks, axis=1).astype(np.float32)
+            ).to(device)
+        )
+
+    splits = generate_cv_splits(n_runs, strategy=1)
+    n_splits = len(splits)
+    if verbose:
+        print(
+            f"  xval R²: {n_splits} folds (LORO), "
+            f"mode={'single-trial → cond-average' if single_trials else 'per-condition'}"
+        )
+
+    ss_res_accum = torch.zeros(n_voxels, dtype=torch.float64, device=device)
+    ss_tot_accum = torch.zeros(n_voxels, dtype=torch.float64, device=device)
+
+    fold_iter = tqdm(
+        splits, total=n_splits, desc="  xval R² folds", unit="fold",
+        leave=False, disable=(not verbose) or n_splits <= 1,
+    )
+    for train_runs, test_runs in fold_iter:
+        # ── Train fit ────────────────────────────────────────────────
+        per_run_data_train = [per_run_data[r] for r in train_runs]
+        if single_trials:
+            # No re-fitting: take the already-computed single-trial
+            # betas from the main fit, restrict to "trials whose
+            # home run is in train_runs", and average per condition.
+            # Block layout is shared with the main fit's block_labels
+            # parameter — each label is "{cond}_trial{NNN}_run{R}",
+            # where R is 1-indexed.
+            cond_betas_train = np.zeros(
+                (n_voxels, n_cond, n_basis), dtype=np.float64,
+            )
+            counts = np.zeros(n_cond, dtype=np.int64)
+            test_run_set = set(test_runs)
+            cond_label_to_idx = {c: i for i, c in enumerate(condition_labels)}
+            assert single_trial_betas is not None and block_labels is not None
+            for b_idx, label in enumerate(block_labels):
+                # Parse "{cond}_trial{NNN}_run{R}" → cond name, run idx (0-based).
+                cond_name, _, tail = str(label).partition("_trial")
+                # tail is "{NNN}_run{R}"
+                run_part = tail.split("_run", 1)[1]
+                home_run = int(run_part) - 1
+                if home_run in test_run_set:
+                    continue                                # exclude test trials
+                c = cond_label_to_idx[cond_name]
+                cond_betas_train[:, c, :] += single_trial_betas[:, b_idx, :]
+                counts[c] += 1
+            # Voxels with zero train trials of some condition → leave
+            # at zero (no estimate available; will predict zero for
+            # that condition in this fold).  Avoid div-by-zero.
+            cond_betas_train /= np.maximum(counts[None, :, None], 1)
+            cond_betas_train_t = torch.from_numpy(cond_betas_train).to(
+                device=device, dtype=torch.float32,
+            )
+        else:
+            # Per-condition train fit.
+            train_designs = [cond_designs_per_run[r] for r in train_runs]
+            packed_train = pack_for_shared_task_glm(
+                per_run_data=per_run_data_train,
+                per_run_task_designs=train_designs,
+                polort=polort, device=device,
+            )
+            n_task_cols_train = packed_train.n_task_cols
+            train_fit = fit_basis_constrained_ridge(
+                data=packed_train.data_concat,
+                design_task=packed_train.design_concat[:, :n_task_cols_train],
+                basis_functions=basis_functions,
+                prior_mean=prior_mean, prior_cov=prior_cov,
+                n_blocks=n_cond,
+                nuisance=(
+                    packed_train.design_concat[:, n_task_cols_train:]
+                    if packed_train.design_concat.shape[1] > n_task_cols_train
+                    else None
+                ),
+                prior_weight=prior_weight, device=device,
+                reconstruct_hrfs=False, lambda_mode="global",
+            )
+            cond_betas_train_t = torch.from_numpy(
+                train_fit.betas[:, :n_task_cols_train].reshape(
+                    n_voxels, n_cond, n_basis,
+                )
+            ).to(device=device, dtype=torch.float32)
+
+        # ── Predict test runs ────────────────────────────────────────
+        cond_betas_flat = cond_betas_train_t.reshape(n_voxels, n_cond * n_basis)
+        for r in test_runs:
+            X_test_cond = cond_designs_per_run[r]                    # (n_tp_r, n_cond*K)
+            test_data = per_run_data[r].to(device).float()           # (n_vox, n_tp_r)
+            # Project out polys per-run from BOTH data and design
+            # so the prediction is comparable on the same residual
+            # subspace the fit operates in.
+            if polort >= 0:
+                Z_r = torch.from_numpy(
+                    legendre_polynomials(n_tp_per_run[r], polort)
+                ).to(device=device, dtype=torch.float32)
+                Q_z, _ = torch.linalg.qr(Z_r)
+                test_data_proj = test_data - (test_data @ Q_z) @ Q_z.T
+                X_test_proj = X_test_cond - Q_z @ (Q_z.T @ X_test_cond)
+            else:
+                test_data_proj = test_data
+                X_test_proj = X_test_cond
+            y_pred = cond_betas_flat @ X_test_proj.T                 # (n_vox, n_tp_r)
+            resid = test_data_proj - y_pred
+            mean_test = test_data_proj.mean(dim=1, keepdim=True)
+            ss_res_accum += (resid ** 2).sum(dim=1).double()
+            ss_tot_accum += ((test_data_proj - mean_test) ** 2).sum(dim=1).double()
+            del test_data, test_data_proj, X_test_proj, y_pred, resid
+
+    r2 = 1.0 - ss_res_accum / torch.clamp(ss_tot_accum, min=1e-30)
+    return r2.cpu().numpy().astype(np.float32)
+
+
 def compute_per_voxel_residuals(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],

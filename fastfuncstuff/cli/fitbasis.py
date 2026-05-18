@@ -94,6 +94,7 @@ try:
         bin_and_whiten_arma11,
         compute_per_voxel_residuals,
         compute_vb_block_trace,
+        compute_xval_r2_per_voxel,
         cv_basis_constrained_ridge,
         decouple_amplitude_prior,
         estimate_and_apply_arma11_prewhitening,
@@ -257,6 +258,27 @@ def create_parser() -> argparse.ArgumentParser:
 
     # Cross-validation
     cv_opts = parser.add_argument_group("Cross-validation (regularization sanity check)")
+    cv_opts.add_argument(
+        "-xval-r2", "-xval_r2",
+        dest="xval_r2",
+        action="store_true",
+        help=(
+            "Emit a per-voxel **held-out R² volume** (LORO) for the "
+            "user's chosen -reg / -prior-weight config.  Writes "
+            "<prefix>_fitbasis_xvalr2.nii.gz alongside the in-sample "
+            "<prefix>_fitbasis_r2.nii.gz.\n"
+            "  Per-condition mode: standard LORO — fit on N−1 runs, "
+            "predict held-out run with the per-condition task betas.\n"
+            "  Single-trial mode: train fits single-trial on N−1 runs, "
+            "averages within-condition trial betas, predicts the "
+            "held-out run with the per-condition design.  Catches the "
+            "case where single-trial estimates collectively fail to "
+            "capture the per-condition response (oscillation around "
+            "the mean, runaway shrinkage, etc.).\n"
+            "  Skips ARMA prewhitening / VB iteration inside the xval "
+            "for speed."
+        ),
+    )
     cv_opts.add_argument(
         "-cv-runs", "-cv_runs",
         dest="cv_runs",
@@ -766,6 +788,14 @@ def main() -> int:
         data[:, run_starts_ext[r]:run_starts_ext[r + 1]].clone().detach().float()
         for r in range(n_runs)
     ]
+
+    # Keep an un-modified copy of per_run_data for xval R² (the
+    # -prior-from shift and -prewhiten arma11 both mutate
+    # per_run_data in place; xval needs the original).  Cheap:
+    # one extra copy of (n_vox × total_tp) float32.
+    per_run_data_orig: list[torch.Tensor] | None = (
+        [d.clone() for d in per_run_data] if args.xval_r2 else None
+    )
 
     # ── Empirical-Bayes per-voxel prior from per-condition pre-fit ─
     # When -prior-from per-condition and -single-trials: run a plain
@@ -1485,6 +1515,57 @@ def main() -> int:
         save_nifti(_to_volume(arr[:, None]).squeeze(-1),
                    output_path=path, reference_img=args.input[0])
         print(f"  Wrote {path}")
+
+    # ── Cross-validated R² (held-out) ──────────────────────────────
+    # Per the user's choice of -reg + -prior-weight, do LORO with
+    # train/test runs and report per-voxel held-out R² as a 3-D
+    # NIfTI.  Operates on the un-modified per_run_data (we kept a
+    # copy upstream when -xval-r2 was on).  Skips prewhitening and
+    # VB iteration inside — the xval measures the model's
+    # generalization, not the noise-model layer.
+    if args.xval_r2:
+        if args.reg in {"fracridge", "mvn-shape"}:
+            print(
+                f"  -xval-r2 not yet supported with -reg {args.reg}; "
+                "skipping."
+            )
+        elif n_runs < 2:
+            print("  -xval-r2 needs ≥2 runs; skipping.")
+        elif per_run_data_orig is None:
+            print(
+                "  -xval-r2 requested but per_run_data_orig was not "
+                "saved (internal); skipping."
+            )
+        else:
+            xval_r2 = compute_xval_r2_per_voxel(
+                per_run_data=per_run_data_orig,
+                all_onsets=all_onsets,
+                condition_labels=list(condition_labels),
+                basis_functions=basis.basis_functions,
+                basis_lag_times=basis_lag_times,
+                basis_mode=basis_mode,
+                tr=tr,
+                n_tp_per_run=n_tp_per_run,
+                polort=polort_resolved,
+                prior_mean=prior_m,
+                prior_cov=prior_C,
+                prior_weight=pw,
+                single_trials=args.single_trials,
+                # Single-trial mode: re-use existing betas (no per-fold re-fit).
+                single_trial_betas=task_betas if args.single_trials else None,
+                block_labels=block_labels if args.single_trials else None,
+                device=device,
+                verbose=args.verb >= 1,
+            )
+            xval_path = f"{args.prefix}_fitbasis_xvalr2{nii_ext}"
+            save_nifti(_to_volume(xval_r2[:, None]).squeeze(-1),
+                       output_path=xval_path, reference_img=args.input[0])
+            print(
+                f"  Wrote {xval_path}  "
+                f"(median={float(np.median(xval_r2)):.3f}, "
+                f"mean={float(np.mean(xval_r2)):.3f}, "
+                f"max={float(np.max(xval_r2)):.3f})"
+            )
 
     # ── Per-block outputs ──────────────────────────────────────────
     # Single-trial mode: amplitude maps stack across trials per cond
