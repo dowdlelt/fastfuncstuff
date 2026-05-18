@@ -93,12 +93,14 @@ try:
         FLOBSFitResult,
         bin_and_whiten_arma11,
         compute_per_voxel_residuals,
+        compute_vb_block_trace,
         cv_basis_constrained_ridge,
         decouple_amplitude_prior,
         estimate_and_apply_arma11_prewhitening,
         estimate_arma11_per_voxel,
         fit_basis_constrained_ridge,
         fit_basis_fracridge,
+        vb_update_beta_size,
         flobs_prior,
         generate_flobs_basis,
         generate_spmg_basis,
@@ -360,6 +362,40 @@ def create_parser() -> argparse.ArgumentParser:
             "Convergence threshold on median |Δa| + |Δb| across voxels "
             "between successive VB iterations.  Default 0.05 (one grid "
             "step in a; tighter values rarely change the final β)."
+        ),
+    )
+    reg_opts.add_argument(
+        "-prior-from", "-prior_from",
+        dest="prior_from",
+        choices=["none", "per-condition"],
+        default="none",
+        help=(
+            "Empirical-Bayes source for the per-voxel prior mean.  "
+            "``none`` (default): use the model's default prior mean "
+            "(zero for SPMG, the empirical FLOBS mean for FLOBS).  "
+            "``per-condition``: run a plain per-condition constrained "
+            "fit first, take the resulting (n_vox, n_cond, K) betas, "
+            "and use them as the prior mean for *every trial of that "
+            "condition at that voxel* in the subsequent single-trial "
+            "fit.  This is the GLMsingle / LSS shrinkage philosophy: "
+            "anchor trial estimates to the condition average, let "
+            "deviations only emerge where the data demands them.  "
+            "Requires -single-trials; rejects -reg mvn-shape and "
+            "fracridge (rotation / CV-loop incompatibilities)."
+        ),
+    )
+    reg_opts.add_argument(
+        "-vb-update-prior",
+        dest="vb_update_prior",
+        action="store_true",
+        help=(
+            "Inside the VB loop, also update the per-voxel prior "
+            "precision β_size each iteration (TR04MW2 §3, gamma "
+            "posterior).  Without this flag the loop only updates "
+            "(a, b); with it the loop updates (a, b) AND β_size, "
+            "matching the full filmbabe VB scheme.  Only meaningful "
+            "with -reg in {ridge, mvn, mvn-shape} since fracridge "
+            "and none have no prior precision to update."
         ),
     )
     reg_opts.add_argument(
@@ -731,6 +767,124 @@ def main() -> int:
         for r in range(n_runs)
     ]
 
+    # ── Empirical-Bayes per-voxel prior from per-condition pre-fit ─
+    # When -prior-from per-condition and -single-trials: run a plain
+    # per-condition constrained fit first, extract (n_vox, n_cond, K)
+    # betas, and use them as the prior mean for *every trial of that
+    # condition at that voxel* in the single-trial fit below.  Then
+    # shift the data by X·m per voxel so the rest of the pipeline
+    # solves for β_centered = β_trial − β_cond.  We restore the full
+    # β_trial = β_centered + β_cond before output.
+    #
+    # Algebra check: y = X β + ε.  With y' = y − X m_v, β' = β − m_v:
+    # y' = X β' + ε.  Residuals match; only the mean of β shifts.
+    # The shape prior is applied to β_centered with prior_mean=0,
+    # so the quadratic ‖β − m_v‖²_{C⁻¹} that the prior penalises
+    # equals ‖β_centered‖²_{C⁻¹} — exactly the right thing.
+    empirical_prior_mean_full: np.ndarray | None = None
+    if args.prior_from == "per-condition":
+        if not args.single_trials:
+            print(
+                "  WARNING: -prior-from per-condition has no effect "
+                "without -single-trials; ignoring."
+            )
+        elif args.reg in {"mvn-shape", "fracridge"}:
+            print(
+                f"ERROR: -prior-from per-condition is not yet compatible "
+                f"with -reg {args.reg} (rotation / CV-loop issues).  "
+                f"Use -reg in {{none, ridge, mvn}}."
+            )
+            return 1
+        else:
+            print(
+                f"\n  Empirical Bayes: per-condition pre-fit "
+                f"({len(condition_labels)} cond × K={n_basis} on "
+                f"{args.model} / {args.reg})…"
+            )
+            pc_designs: list[torch.Tensor] = []
+            for r in range(n_runs):
+                cond_blocks = []
+                for c in range(len(condition_labels)):
+                    bd = build_pc_basis_design_per_run(
+                        onsets_per_run=[all_onsets[c][r]],
+                        pcs=basis.basis_functions,
+                        lag_times=basis_lag_times,
+                        tr=tr,
+                        n_timepoints_per_run=[n_tp_per_run[r]],
+                        basis=basis_mode,
+                    )
+                    cond_blocks.append(bd[0])
+                pc_concat = np.concatenate(cond_blocks, axis=1).astype(np.float32)
+                pc_designs.append(torch.from_numpy(pc_concat))
+
+            n_cond = len(condition_labels)
+            n_pc_task_cols = n_cond * n_basis
+            packed_pc = pack_for_shared_task_glm(
+                per_run_data=per_run_data,
+                per_run_task_designs=pc_designs,
+                polort=polort_resolved,
+                task_column_labels=[
+                    f"{lbl}#PC{b}" for lbl in condition_labels
+                    for b in range(n_basis)
+                ],
+                device=device,
+            )
+            pc_task_design = packed_pc.design_concat[:, :n_pc_task_cols]
+            pc_nuisance = (
+                packed_pc.design_concat[:, n_pc_task_cols:]
+                if packed_pc.design_concat.shape[1] > n_pc_task_cols else None
+            )
+            pc_fit = fit_basis_constrained_ridge(
+                data=packed_pc.data_concat,
+                design_task=pc_task_design,
+                basis_functions=basis.basis_functions,
+                prior_mean=prior_m,
+                prior_cov=prior_C,
+                n_blocks=n_cond,
+                nuisance=pc_nuisance,
+                prior_weight="auto",
+                device=device,
+                reconstruct_hrfs=False,
+                lambda_mode="global",
+            )
+            cond_betas = pc_fit.betas[:, :n_pc_task_cols].reshape(
+                -1, n_cond, n_basis,
+            )
+            print(
+                f"  ✓ Per-condition pre-fit complete.  "
+                f"R² mean: OLS={pc_fit.r2_ols.mean():.3f}, "
+                f"constrained={pc_fit.r2.mean():.3f}"
+            )
+
+            # Map per-condition → per-trial prior mean using block_labels.
+            n_vox_masked_pc = cond_betas.shape[0]
+            empirical_prior_mean_full = np.zeros(
+                (n_vox_masked_pc, n_blocks * n_basis), dtype=np.float32,
+            )
+            cond_to_idx = {c: i for i, c in enumerate(condition_labels)}
+            for b_idx, label in enumerate(block_labels):
+                cond_label = label.split("_trial")[0]
+                ci = cond_to_idx[cond_label]
+                empirical_prior_mean_full[
+                    :, b_idx * n_basis:(b_idx + 1) * n_basis
+                ] = cond_betas[:, ci, :]
+
+            # Shift per_run_data: y → y − X · m_v in place per run.
+            m_t = torch.from_numpy(empirical_prior_mean_full).to(
+                device=device, dtype=torch.float32,
+            )                                          # (n_vox, n_blocks*n_basis)
+            for r in range(n_runs):
+                X_r = per_run_designs[r].to(device).float()   # (n_tp_r, n_task)
+                shift_r = m_t @ X_r.T                          # (n_vox, n_tp_r)
+                per_run_data[r] = (
+                    per_run_data[r].to(device).float() - shift_r
+                )
+            print(
+                f"  ✓ Data shifted; single-trial fit now solves "
+                f"β_centered = β_trial − β_cond per voxel."
+            )
+            del m_t
+
     # ── Optional ARMA(1,1) prewhitening (VB-loop foundation) ───────
     # When enabled, replace the i.i.d. noise assumption with an
     # ARMA(1,1) covariance, applied per-run via Cholesky.
@@ -833,13 +987,30 @@ def main() -> int:
         n_poly_per_run = (polort_resolved + 1) if polort_resolved >= 0 else 0
         n_total_cols = n_task_cols + n_runs * n_poly_per_run
 
-        def _run_cell_fit(cells: list[ARMAWhitenCell]) -> FLOBSFitResult:
+        # Per-voxel diagnostics gathered across cells.  These are kept
+        # at the top-level scope so the VB loop below can pass them
+        # back into the next iteration (β_size update needs σ²_v +
+        # λ_v from the current fit).
+        sigma2_per_voxel_all = np.zeros(n_voxels_total, dtype=np.float32)
+        lambda_per_voxel_all = np.zeros(n_voxels_total, dtype=np.float32)
+        # Track per-cell packed designs so the block-trace pass can
+        # reuse them without re-packing — pack itself is cheap but
+        # this also lets us avoid re-whitening per cell.
+        cell_packed_cache: list = []  # filled by _run_cell_fit
+
+        def _run_cell_fit(
+            cells: list[ARMAWhitenCell],
+            *,
+            prior_weight_per_voxel: np.ndarray | None = None,
+        ) -> FLOBSFitResult:
             betas_all = np.zeros((n_voxels_total, n_total_cols), dtype=np.float64)
             betas_ols_all = np.zeros_like(betas_all)
             r2_all = np.zeros(n_voxels_total, dtype=np.float32)
             r2_ols_all = np.zeros_like(r2_all)
             sigma2_sum = 0.0
             eff_pw_sum = 0.0
+            # Reset caches on each call (cells may have been rebinned).
+            cell_packed_cache.clear()
 
             cell_iter = tqdm(
                 cells, total=len(cells),
@@ -855,10 +1026,15 @@ def main() -> int:
                     extra_regressors_per_run=cell.per_run_polys,
                     device=device,
                 )
+                cell_packed_cache.append(packed_cell)
                 task_design_cell = packed_cell.design_concat[:, :n_task_cols]
                 nuisance_cell = (
                     packed_cell.design_concat[:, n_task_cols:]
                     if packed_cell.design_concat.shape[1] > n_task_cols else None
+                )
+                pw_cell = (
+                    prior_weight_per_voxel[cell.voxel_indices]
+                    if prior_weight_per_voxel is not None else None
                 )
                 cell_fit = fit_basis_constrained_ridge(
                     data=packed_cell.data_concat,
@@ -869,10 +1045,12 @@ def main() -> int:
                     n_blocks=n_blocks,
                     nuisance=nuisance_cell,
                     prior_weight=pw,
+                    prior_weight_per_voxel=pw_cell,
                     device=device,
                     reconstruct_hrfs=False,
                     lambda_mode=args.lambda_mode,
                     lambda_n_bins=args.lambda_n_bins,
+                    return_vb_diagnostics=True,
                 )
                 idx = cell.voxel_indices
                 betas_all[idx] = cell_fit.betas[:, :n_total_cols]
@@ -881,6 +1059,10 @@ def main() -> int:
                 r2_ols_all[idx] = cell_fit.r2_ols.astype(np.float32)
                 sigma2_sum += cell_fit.sigma2_mean * idx.size
                 eff_pw_sum += cell_fit.effective_prior_weight * idx.size
+                if cell_fit.sigma2_per_voxel is not None:
+                    sigma2_per_voxel_all[idx] = cell_fit.sigma2_per_voxel
+                if cell_fit.lambda_per_voxel is not None:
+                    lambda_per_voxel_all[idx] = cell_fit.lambda_per_voxel
 
             return FLOBSFitResult(
                 betas=betas_all,
@@ -892,6 +1074,8 @@ def main() -> int:
                 sigma2_mean=sigma2_sum / max(1, n_voxels_total),
                 effective_prior_weight=eff_pw_sum / max(1, n_voxels_total),
                 n_iter=1,
+                sigma2_per_voxel=sigma2_per_voxel_all.copy(),
+                lambda_per_voxel=lambda_per_voxel_all.copy(),
             )
 
         fit = _run_cell_fit(arma_cells)
@@ -915,6 +1099,57 @@ def main() -> int:
         # the *cleaner* noise structure left after the constrained
         # β has absorbed task + nuisance variance.
         if args.vb_iters >= 1 and arma_ab_per_voxel is not None:
+            # β_size_v: VB-updated prior precision multiplier per voxel.
+            # Starts at the user's -prior-weight (1.0 for auto).  Updated
+            # each iteration when -vb-update-prior is on, following
+            # filmbabe's gamma posterior (TR04MW2 §3).
+            user_mult = (
+                1.0 if isinstance(pw, str)
+                else float(pw)
+            )
+            beta_size_per_voxel = np.full(
+                n_voxels_total, float(user_mult), dtype=np.float32,
+            )
+            prior_pw_per_voxel: np.ndarray | None = None
+            if args.vb_update_prior and args.reg in {"ridge", "mvn", "mvn-shape"}:
+                # Compute initial β_size from the iter-0 fit's posterior
+                # moments so that iter-1 fits with the *updated* prior.
+                # Block-trace per voxel: σ²_v · Σ_b tr(C⁻¹ · (A⁻¹)_b)
+                # via per-cell packed designs cached in _run_cell_fit.
+                block_trace_summed = np.zeros(n_voxels_total, dtype=np.float32)
+                for cell, packed_cell in zip(arma_cells, cell_packed_cache):
+                    idx = cell.voxel_indices
+                    block_trace_summed[idx] = compute_vb_block_trace(
+                        design=packed_cell.design_concat,
+                        prior_cov=prior_C,
+                        n_blocks=n_blocks,
+                        n_basis=n_basis,
+                        lambda_per_voxel=lambda_per_voxel_all[idx],
+                        sigma2_per_voxel=sigma2_per_voxel_all[idx],
+                        device=device,
+                        n_bins=args.lambda_n_bins,
+                        verbose=False,
+                    )
+                task_betas_3d = (
+                    fit.betas[:, :n_task_cols]
+                    .reshape(n_voxels_total, n_blocks, n_basis)
+                )
+                beta_size_per_voxel = vb_update_beta_size(
+                    task_betas=task_betas_3d,
+                    prior_mean=prior_m,
+                    prior_cov=prior_C,
+                    block_trace_summed=block_trace_summed,
+                )
+                # Translate to per-voxel λ: λ_v = β_size_v · σ²_v.
+                prior_pw_per_voxel = (
+                    beta_size_per_voxel * sigma2_per_voxel_all
+                )
+                print(
+                    f"  VB β_size update (iter 0): median={float(np.median(beta_size_per_voxel)):.3f}, "
+                    f"5–95% [{float(np.percentile(beta_size_per_voxel, 5)):.3f}, "
+                    f"{float(np.percentile(beta_size_per_voxel, 95)):.3f}]"
+                )
+            vb_iter = 0
             for vb_iter in range(1, args.vb_iters + 1):
                 print(f"\n  VB iter {vb_iter}/{args.vb_iters}…")
                 # 1. Residuals in original space.
@@ -938,7 +1173,7 @@ def main() -> int:
                     polort=-1,
                     device=device, verbose=True,
                 )
-                # 3. Convergence.
+                # 3. Convergence on (a, b).
                 delta = np.abs(new_ab - arma_ab_per_voxel).sum(axis=1)
                 median_delta = float(np.median(delta))
                 print(
@@ -946,10 +1181,11 @@ def main() -> int:
                     f"{median_delta:.4f}  (tol={args.vb_tol})"
                 )
                 arma_ab_per_voxel = new_ab
-                if median_delta < args.vb_tol:
+                if median_delta < args.vb_tol and not args.vb_update_prior:
+                    # (a, b) loop converged and no β_size update wanted.
                     print(f"  VB converged at iter {vb_iter}.")
                     break
-                # 4. Re-bin + re-fit.
+                # 4. Re-bin + re-fit (with optional VB β_size override).
                 arma_cells = bin_and_whiten_arma11(
                     per_run_data=per_run_data,
                     per_run_task_designs=per_run_designs,
@@ -957,11 +1193,53 @@ def main() -> int:
                     polort=polort_resolved,
                     device=device, verbose=True,
                 )
-                fit = _run_cell_fit(arma_cells)
+                fit = _run_cell_fit(
+                    arma_cells, prior_weight_per_voxel=prior_pw_per_voxel,
+                )
                 print(
                     f"  VB iter {vb_iter} fit: σ²_mean={fit.sigma2_mean:.4g}, "
                     f"R² constrained={fit.r2.mean():.3f}"
                 )
+                # 5. VB β_size update from new posterior.
+                if args.vb_update_prior and args.reg in {"ridge", "mvn", "mvn-shape"}:
+                    block_trace_summed = np.zeros(n_voxels_total, dtype=np.float32)
+                    for cell, packed_cell in zip(arma_cells, cell_packed_cache):
+                        idx = cell.voxel_indices
+                        block_trace_summed[idx] = compute_vb_block_trace(
+                            design=packed_cell.design_concat,
+                            prior_cov=prior_C,
+                            n_blocks=n_blocks,
+                            n_basis=n_basis,
+                            lambda_per_voxel=lambda_per_voxel_all[idx],
+                            sigma2_per_voxel=sigma2_per_voxel_all[idx],
+                            device=device,
+                            n_bins=args.lambda_n_bins,
+                            verbose=False,
+                        )
+                    task_betas_3d = (
+                        fit.betas[:, :n_task_cols]
+                        .reshape(n_voxels_total, n_blocks, n_basis)
+                    )
+                    new_beta_size = vb_update_beta_size(
+                        task_betas=task_betas_3d,
+                        prior_mean=prior_m,
+                        prior_cov=prior_C,
+                        block_trace_summed=block_trace_summed,
+                    )
+                    bs_change = float(np.median(
+                        np.abs(new_beta_size - beta_size_per_voxel)
+                    ))
+                    beta_size_per_voxel = new_beta_size
+                    prior_pw_per_voxel = (
+                        beta_size_per_voxel * sigma2_per_voxel_all
+                    )
+                    print(
+                        f"  VB β_size iter {vb_iter}: "
+                        f"median={float(np.median(beta_size_per_voxel)):.3f}, "
+                        f"5–95% [{float(np.percentile(beta_size_per_voxel, 5)):.3f}, "
+                        f"{float(np.percentile(beta_size_per_voxel, 95)):.3f}], "
+                        f"median |Δβ_size|={bs_change:.4f}"
+                    )
             print(f"  ✓ VB loop complete after {vb_iter} iter(s).")
 
     elif args.reg == "fracridge":
@@ -1029,6 +1307,22 @@ def main() -> int:
         else:
             out = masked.reshape(out_shape)
         return out
+
+    # Restore the empirical-Bayes per-condition prior mean back into
+    # the betas (we fit β_centered = β − m_v on shifted data; the user-
+    # facing output should be the full β_trial = β_centered + β_cond).
+    # Both the constrained and the OLS betas need the same restoration.
+    if empirical_prior_mean_full is not None:
+        fit.betas[:, :n_task_cols] = (
+            fit.betas[:, :n_task_cols] + empirical_prior_mean_full
+        )
+        fit.betas_ols[:, :n_task_cols] = (
+            fit.betas_ols[:, :n_task_cols] + empirical_prior_mean_full
+        )
+        print(
+            "  Restored per-condition empirical prior into single-trial "
+            "betas; output reflects β_trial in original signal units."
+        )
 
     task_betas = fit.betas[:, :n_task_cols].reshape(n_vox_masked, n_blocks, n_basis)
     task_betas_ols = fit.betas_ols[:, :n_task_cols].reshape(n_vox_masked, n_blocks, n_basis)

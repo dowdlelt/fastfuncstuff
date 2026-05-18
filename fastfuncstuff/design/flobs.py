@@ -398,6 +398,10 @@ class FLOBSFitResult:
     sigma2_mean: float
     effective_prior_weight: float
     n_iter: int = 1
+    # Optional VB diagnostics — populated when the caller asks for them
+    # via ``return_vb_diagnostics`` in :func:`fit_basis_constrained_ridge`.
+    sigma2_per_voxel: np.ndarray | None = None      # (n_vox,)
+    lambda_per_voxel: np.ndarray | None = None      # (n_vox,) effective λ used
 
 
 def fit_basis_constrained_ridge(
@@ -410,11 +414,13 @@ def fit_basis_constrained_ridge(
     *,
     nuisance: np.ndarray | torch.Tensor | None = None,
     prior_weight: float | str = "auto",
+    prior_weight_per_voxel: np.ndarray | None = None,
     device: torch.device | None = None,
     reconstruct_hrfs: bool = True,
     chunk_size: int | None = None,
     lambda_mode: str = "global",
     lambda_n_bins: int = 20,
+    return_vb_diagnostics: bool = False,
 ) -> FLOBSFitResult:
     """Penalised-least-squares fit with an arbitrary MVN(m, C) shape prior.
 
@@ -735,6 +741,11 @@ def fit_basis_constrained_ridge(
             f"lambda_mode must be 'global' or 'voxelwise'; got {lambda_mode!r}"
         )
 
+    # prior_weight_per_voxel forces voxelwise mode regardless of caller
+    # preference — the override is intrinsically per-voxel.
+    if prior_weight_per_voxel is not None:
+        lambda_mode = "voxelwise"
+
     Pm_unit = P @ m_bar                                            # (n_cols,)
 
     if lambda_mode == "global":
@@ -774,12 +785,28 @@ def fit_basis_constrained_ridge(
         # Per-voxel σ²_v from pass 1 OLS residuals; user multiplier
         # rescales the whole grid (so prior_weight=auto → unit multiplier,
         # prior_weight=2.0 → 2× σ²_v per voxel, etc.).
-        if isinstance(prior_weight, str):
-            user_mult = 1.0
-        else:
-            user_mult = float(prior_weight)
+        #
+        # VB override: when ``prior_weight_per_voxel`` is provided
+        # (filmbabe β_size update), use those values *directly* as the
+        # per-voxel λ_v.  This bypasses the σ² × user_multiplier
+        # computation — caller has already done that math and knows the
+        # exact effective weight it wants per voxel.
         sigma2_per_voxel = (ss_res_ols_full / dof).clamp_min(1e-30)  # CPU tensor
-        lambda_per_voxel_cpu = user_mult * sigma2_per_voxel             # (n_voxels,)
+        if prior_weight_per_voxel is not None:
+            if prior_weight_per_voxel.shape != (n_voxels,):
+                raise ValueError(
+                    f"prior_weight_per_voxel must have shape ({n_voxels},); "
+                    f"got {prior_weight_per_voxel.shape}"
+                )
+            lambda_per_voxel_cpu = torch.from_numpy(
+                prior_weight_per_voxel.astype(np.float64)
+            ).clamp_min(0.0)
+        else:
+            if isinstance(prior_weight, str):
+                user_mult = 1.0
+            else:
+                user_mult = float(prior_weight)
+            lambda_per_voxel_cpu = user_mult * sigma2_per_voxel        # (n_voxels,)
 
         # Quantile-bin: assign each voxel to one of ``lambda_n_bins``
         # bins by σ² quantile.  Within a bin use the bin's median λ
@@ -875,6 +902,28 @@ def fit_basis_constrained_ridge(
         hrfs = None
         hrfs_ols = None
 
+    # ── Optional VB diagnostics ──────────────────────────────────────
+    # When the caller asks for them (filmbabe loop), surface the per-voxel
+    # σ² and λ that were actually used.  In ``global`` lambda_mode each
+    # voxel sees the same λ = ``effective_weight``.  In ``voxelwise``
+    # mode each voxel sees its bin's median λ (or, with the
+    # ``prior_weight_per_voxel`` override, the exact value passed in).
+    if return_vb_diagnostics:
+        sigma2_pv_np = (
+            (ss_res_ols_full / dof).clamp_min(1e-30).numpy().astype(np.float32)
+        )
+        if lambda_mode == "voxelwise":
+            # ``voxel_bin`` and ``bin_lambda`` are set in the voxelwise
+            # branch above.  Map back: λ_v = bin_lambda[voxel_bin[v]].
+            lambda_pv_np = bin_lambda[voxel_bin].numpy().astype(np.float32)
+        else:
+            lambda_pv_np = np.full(
+                (n_voxels,), float(effective_weight), dtype=np.float32,
+            )
+    else:
+        sigma2_pv_np = None
+        lambda_pv_np = None
+
     return FLOBSFitResult(
         betas=betas_np,
         hrfs=hrfs,
@@ -885,6 +934,8 @@ def fit_basis_constrained_ridge(
         sigma2_mean=sigma2_mean,
         effective_prior_weight=effective_weight,
         n_iter=1,
+        sigma2_per_voxel=sigma2_pv_np,
+        lambda_per_voxel=lambda_pv_np,
     )
 
 
@@ -1848,6 +1899,194 @@ def bin_and_whiten_arma11(
         ))
 
     return cells
+
+
+def compute_vb_block_trace(
+    design: torch.Tensor,
+    prior_cov: np.ndarray,
+    n_blocks: int,
+    n_basis: int,
+    lambda_per_voxel: np.ndarray,
+    sigma2_per_voxel: np.ndarray,
+    *,
+    device: torch.device | None = None,
+    n_bins: int = 20,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Per-voxel block-marginal posterior trace for the VB β_size update.
+
+    Computes ``σ²_v · Σ_b tr(C⁻¹ · (A⁻¹)_b)`` per voxel, where:
+
+    - ``A = X'X + λ_v · P`` is the joint precision used by the
+      constrained solver (P is block-diag(C⁻¹) on the task cols, zero
+      on nuisance).
+    - ``(A⁻¹)_b`` is the K × K block-marginal posterior covariance
+      for task block ``b`` (single-trial: per trial; per-condition:
+      per condition).
+    - ``σ²_v`` rescales because the actual posterior covariance is
+      ``σ²_v · A⁻¹``.
+
+    Voxels are binned by ``λ_v`` quantile (default 20 bins); within a
+    bin all voxels share ``A_bin``, so we invert it *once* per bin and
+    extract the block diagonals.  The output is ``σ²_v · trace_bin``
+    for the voxel's bin, applied per-voxel.
+
+    Returns
+    -------
+    np.ndarray, shape (n_voxels,)
+        Total per-voxel ``σ²_v · Σ_b tr(C⁻¹ · (A⁻¹)_b)``.  Plug into
+        :func:`vb_update_beta_size` as ``block_trace_summed``.
+    """
+    if device is None:
+        device = get_device()
+
+    X = design.to(device=device, dtype=torch.float64)
+    n_cols = X.shape[1]
+    n_task_cols = n_blocks * n_basis
+    if n_task_cols > n_cols:
+        raise ValueError(
+            f"design has {n_cols} cols but n_blocks × n_basis = "
+            f"{n_task_cols} task cols expected"
+        )
+
+    n_voxels = lambda_per_voxel.shape[0]
+    if sigma2_per_voxel.shape[0] != n_voxels:
+        raise ValueError(
+            f"sigma2_per_voxel has {sigma2_per_voxel.shape[0]} entries "
+            f"but lambda_per_voxel has {n_voxels}"
+        )
+
+    # Build P matching the solver: block-diag(C⁻¹) on task cols.
+    C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(
+        device=device, dtype=torch.float64,
+    )
+    P = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=device)
+    for c in range(n_blocks):
+        s = c * n_basis
+        P[s:s + n_basis, s:s + n_basis] = C_inv
+    XtX = X.T @ X
+
+    # Quantile-bin λ_v.
+    lambda_t = torch.from_numpy(lambda_per_voxel.astype(np.float64))
+    n_bins_eff = max(1, min(int(n_bins), n_voxels))
+    if n_bins_eff > 1:
+        qs = torch.linspace(0.0, 1.0, n_bins_eff + 1)[1:-1]
+        edges = torch.quantile(lambda_t, qs.to(lambda_t.dtype))
+        voxel_bin = torch.bucketize(lambda_t, edges)
+    else:
+        voxel_bin = torch.zeros(n_voxels, dtype=torch.long)
+
+    # Per-bin λ and per-bin trace (sum over task blocks).
+    bin_trace_summed = np.zeros(n_bins_eff, dtype=np.float64)
+    bins_iter = range(n_bins_eff)
+    if verbose:
+        bins_iter = tqdm(
+            bins_iter, total=n_bins_eff,
+            desc="  VB block-trace bins", unit="bin", leave=False,
+            disable=n_bins_eff <= 1,
+        )
+    for b in bins_iter:
+        mask_b = voxel_bin == b
+        if not mask_b.any():
+            continue
+        lam_b = float(lambda_t[mask_b].median().item())
+        A_b = XtX + lam_b * P                              # (n_cols, n_cols)
+        # A⁻¹ via Cholesky; fall back to direct inverse on failure
+        # (only happens at λ=0 + rank-deficient X — vanishingly rare
+        # in the VB path because λ_v > 0 after the first iter).
+        try:
+            L_b = torch.linalg.cholesky(A_b)
+            eye_n = torch.eye(n_cols, dtype=A_b.dtype, device=device)
+            A_inv_b = torch.cholesky_solve(eye_n, L_b)
+        except torch.linalg.LinAlgError:
+            A_inv_b = torch.linalg.pinv(A_b)
+        # Sum trace(C⁻¹ · (A⁻¹)_block) over task blocks.
+        t_sum = 0.0
+        for c in range(n_blocks):
+            s = c * n_basis
+            block = A_inv_b[s:s + n_basis, s:s + n_basis]
+            t_sum += float((C_inv * block).sum().item())   # tr(C⁻¹ · block)
+        bin_trace_summed[b] = t_sum
+        del A_b, A_inv_b
+
+    # Broadcast per voxel: σ²_v · bin_trace_summed[bin_of_v].
+    voxel_bin_np = voxel_bin.numpy()
+    return (
+        sigma2_per_voxel.astype(np.float64) * bin_trace_summed[voxel_bin_np]
+    ).astype(np.float32)
+
+
+def vb_update_beta_size(
+    task_betas: np.ndarray,
+    prior_mean: np.ndarray,
+    prior_cov: np.ndarray,
+    block_trace_summed: np.ndarray,
+    *,
+    c_prior: float = 1.0,
+    d_prior: float = 1.0,
+    floor: float = 1e-12,
+) -> np.ndarray:
+    """Filmbabe-style VB update for the per-voxel β_size (prior precision).
+
+    Following FMRIB TR04MW2 §3 (gamma-conjugate posterior on β_size):
+
+    .. math::
+
+        \\hat\\beta_{size,v} = \\frac{n_b K / 2 + c_0}
+                                    {\\tfrac12 \\sum_b ||\\beta_{v,b} - m||^2_{C^{-1}}
+                                     + \\tfrac12 \\, \\mathrm{tr}_{v} + d_0}
+
+    where ``tr_v = σ²_v · Σ_b tr(C⁻¹ · Σ_β,b,v)`` is the block-marginal
+    posterior-covariance trace computed by
+    :func:`compute_vb_block_trace`.  ``c_prior``, ``d_prior`` are the
+    gamma-prior hyperparameters (default ``0`` → non-informative).
+
+    Parameters
+    ----------
+    task_betas : np.ndarray, shape (n_voxels, n_blocks, K)
+        Current posterior mean of the task betas per voxel × block.
+    prior_mean : np.ndarray, shape (K,)
+    prior_cov : np.ndarray, shape (K, K)
+    block_trace_summed : np.ndarray, shape (n_voxels,)
+        Output of :func:`compute_vb_block_trace`.
+    c_prior, d_prior : float, default 1.0 (weakly informative)
+        Gamma-prior hyperparameters on β_size.  ``c=d=0`` reproduces
+        the non-informative MAP estimate but is **unstable**: when the
+        shape prior tightens, ``||β-m||²_{C⁻¹}`` → 0 and the trace
+        term shrinks too, so β_size diverges.  Filmbabe uses weakly
+        informative ``c=d=1`` to bound the update; that's the default
+        here.  Larger ``c, d`` pull the update toward
+        ``β_size ≈ c/d = 1`` (the prior mean) and damp adaptation.
+    floor : float
+        Numerical clamp on the denominator.
+
+    Returns
+    -------
+    np.ndarray, shape (n_voxels,)
+        Updated β_size_v.  Plug into the next constrained-fit call as
+        the per-voxel multiplier on σ²:
+        ``prior_weight_per_voxel = beta_size_v * sigma2_per_voxel``.
+    """
+    K = prior_mean.size
+    n_voxels, n_blocks, K_check = task_betas.shape
+    if K_check != K:
+        raise ValueError(
+            f"task_betas last dim is {K_check} but prior_mean has {K} elements"
+        )
+    if block_trace_summed.shape != (n_voxels,):
+        raise ValueError(
+            f"block_trace_summed must have shape ({n_voxels},); "
+            f"got {block_trace_summed.shape}"
+        )
+
+    C_inv = np.linalg.inv(prior_cov).astype(np.float64)
+    diffs = task_betas.astype(np.float64) - prior_mean[None, None, :]
+    # ||β_b - m||²_{C⁻¹} per (vox, block), summed across blocks.
+    quad = np.einsum("vbi,ij,vbj->vb", diffs, C_inv, diffs).sum(axis=1)
+
+    numer = 0.5 * n_blocks * K + c_prior
+    denom = 0.5 * quad + 0.5 * block_trace_summed.astype(np.float64) + d_prior
+    return (numer / np.maximum(denom, floor)).astype(np.float32)
 
 
 def compute_per_voxel_residuals(
