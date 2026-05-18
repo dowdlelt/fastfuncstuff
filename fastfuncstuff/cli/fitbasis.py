@@ -90,6 +90,7 @@ try:
         FLOBSBasis,
         cv_basis_constrained_ridge,
         decouple_amplitude_prior,
+        estimate_and_apply_arma11_prewhitening,
         fit_basis_constrained_ridge,
         fit_basis_fracridge,
         flobs_prior,
@@ -311,6 +312,22 @@ def create_parser() -> argparse.ArgumentParser:
             "optimal weight σ² (estimated from an OLS pre-pass).  A "
             "float overrides as a multiplier on σ² (e.g. 2.0 = twice "
             "as strong).  Ignored when -reg none."
+        ),
+    )
+    reg_opts.add_argument(
+        "-prewhiten",
+        dest="prewhiten",
+        choices=["none", "arma11"],
+        default="none",
+        help=(
+            "Temporal-noise model.  ``none`` (default): i.i.d. white "
+            "noise (standard OLS / ridge / fracridge assumption).  "
+            "``arma11``: estimate a single global ARMA(1,1) (a, b) "
+            "from the OLS-residual mean timeseries via REML grid "
+            "search (AFNI 3dREMLfit style), then prewhiten data + "
+            "design per run before fitting.  This is the foundation "
+            "for the full iterative VB loop — per-voxel (a, b) and "
+            "alternating β / noise updates are not yet implemented."
         ),
     )
     reg_opts.add_argument(
@@ -681,6 +698,25 @@ def main() -> int:
         data[:, run_starts_ext[r]:run_starts_ext[r + 1]].clone().detach().float()
         for r in range(n_runs)
     ]
+
+    # ── Optional ARMA(1,1) prewhitening (VB-loop foundation) ───────
+    # When enabled, replace the i.i.d. noise assumption with a global
+    # ARMA(1,1) covariance, applied per-run via Cholesky.  This is
+    # phase A of the VB-style alternating noise / β loop (TR04MW2
+    # §3) — single-shot, global (a, b).  Per-voxel ARMA and
+    # iterative updates are not yet implemented.
+    arma_ab: tuple[float, float] | None = None
+    if args.prewhiten == "arma11":
+        per_run_data, per_run_designs, a_opt, b_opt = (
+            estimate_and_apply_arma11_prewhitening(
+                per_run_data=per_run_data,
+                per_run_task_designs=per_run_designs,
+                polort=polort_resolved,
+                device=device,
+                verbose=True,
+            )
+        )
+        arma_ab = (a_opt, b_opt)
 
     # ── Pack shared-task + block-diag polys ────────────────────────
     # Pack on the compute device so the fit doesn't waste cycles
@@ -1185,7 +1221,10 @@ def main() -> int:
         "effective_prior_weight": float(fit.effective_prior_weight),
         "r2_mean_constrained": float(fit.r2.mean()),
         "r2_mean_unconstrained": float(fit.r2_ols.mean()),
+        "prewhiten": args.prewhiten,
     }
+    if arma_ab is not None:
+        metadata["arma11"] = {"a": float(arma_ab[0]), "b": float(arma_ab[1])}
     if cv_result is not None:
         metadata["cv"] = {
             "weights": [str(w) for w in cv_result.weights],

@@ -1404,6 +1404,152 @@ def fit_basis_fracridge(
     )
 
 
+def estimate_and_apply_arma11_prewhitening(
+    per_run_data: list[torch.Tensor],
+    per_run_task_designs: list[torch.Tensor],
+    polort: int,
+    *,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], float, float]:
+    """Global ARMA(1,1) prewhitening foundation for the VB basis-set fit.
+
+    First step toward the iterative Variational Bayes loop (cf. FMRIB
+    TR04MW2 §3): replace the i.i.d. noise assumption with a temporal
+    autocorrelation model, prewhiten, then run the existing
+    constrained-basis solver on the prewhitened design / data.
+
+    This is the "single-shot, global (a,b)" variant — the simplest
+    useful step beyond OLS noise.  Phase B (per-voxel ARMA) and
+    Phase C (alternating β / noise updates) build on top of this
+    scaffold but are not yet implemented.
+
+    Strategy:
+
+    1. OLS pre-pass on each per-run (task design + polynomial
+       nuisance) → residuals.
+    2. Average residuals across voxels per run; concatenate.
+    3. Fit a single global ``(a, b)`` via
+       :func:`fastfuncstuff.glm.arma.reml_grid_search` on the mean
+       residual timeseries vs an all-zeros design (we only want the
+       noise-covariance estimate).
+    4. Per run: build ARMA(1,1) Cholesky factor and apply
+       ``L⁻¹`` to both ``y`` and ``X`` via triangular solve.
+
+    The returned lists feed the existing
+    :func:`fit_basis_constrained_ridge` /
+    :func:`fit_basis_fracridge` paths unchanged.
+
+    Parameters
+    ----------
+    per_run_data, per_run_task_designs
+        Same shapes as the rest of the fit primitives consume.
+    polort
+        Polynomial-nuisance order for the OLS pre-pass.  ``-1``
+        disables.  Used only to estimate residuals for ARMA fitting;
+        the returned prewhitened designs do *not* have polys
+        embedded — callers add them downstream as usual.
+    """
+    from fastfuncstuff.glm.arma import (
+        build_arma11_covariance,
+        reml_grid_search,
+    )
+    from fastfuncstuff.design.builder import legendre_polynomials
+
+    if device is None:
+        device = get_device()
+
+    n_runs = len(per_run_data)
+    if n_runs < 1:
+        raise ValueError("Need at least one run.")
+    if len(per_run_task_designs) != n_runs:
+        raise ValueError(
+            f"per_run_task_designs has {len(per_run_task_designs)} entries "
+            f"but per_run_data has {n_runs}."
+        )
+
+    # ── 1+2. OLS pre-pass per run; pool residuals across voxels. ─────
+    if verbose:
+        print(f"  prewhiten: OLS pre-pass on {n_runs} runs to estimate ARMA(1,1)…")
+
+    residual_mean_per_run: list[np.ndarray] = []
+    for y_r, X_task_r in zip(per_run_data, per_run_task_designs):
+        y_dev = y_r.to(device).float()              # (n_voxels, n_tp_r)
+        X_task_dev = X_task_r.to(device).float()    # (n_tp_r, n_task)
+        n_tp_r = X_task_dev.shape[0]
+
+        if polort >= 0:
+            Z_r = torch.from_numpy(
+                legendre_polynomials(n_tp_r, polort)
+            ).to(device=device, dtype=torch.float32)
+            X_full = torch.cat([X_task_dev, Z_r], dim=1)
+        else:
+            X_full = X_task_dev
+
+        # OLS via lstsq on (X_full, y_dev.T) — (n_tp_r, n_voxels)
+        # Use cholesky_solve for speed since X_full has many fewer
+        # columns than timepoints and is well-conditioned post-polys.
+        XtX = X_full.T @ X_full
+        Xty = X_full.T @ y_dev.T
+        try:
+            L0 = torch.linalg.cholesky(XtX)
+            beta = torch.cholesky_solve(Xty, L0)
+        except torch.linalg.LinAlgError:
+            beta = torch.linalg.lstsq(X_full, y_dev.T).solution
+
+        resid = y_dev - (X_full @ beta).T            # (n_voxels, n_tp_r)
+        residual_mean_per_run.append(resid.mean(dim=0).detach().cpu().numpy())
+        del y_dev, X_task_dev, X_full, XtX, Xty, beta, resid
+
+    residual_concat = np.concatenate(residual_mean_per_run)
+    run_starts: list[int] = [0]
+    for res_run in residual_mean_per_run[:-1]:
+        run_starts.append(run_starts[-1] + res_run.size)
+
+    # ── 3. REML grid search on the mean-residual timeseries. ─────────
+    # Use an empty design (just a constant) — we're estimating noise
+    # covariance after the task+poly fit has already been removed.
+    n_total = residual_concat.size
+    X_const = torch.ones(n_total, 1, device=device, dtype=torch.float32)
+    Y_resid = torch.from_numpy(residual_concat).to(device=device, dtype=torch.float32)
+
+    a_opt, b_opt, _ = reml_grid_search(
+        X=X_const, Y=Y_resid, run_starts=run_starts, device=device,
+    )
+    if verbose:
+        print(f"  prewhiten: global ARMA(1,1) → a={a_opt:.3f}, b={b_opt:.3f}")
+
+    # ── 4. Per-run Cholesky + triangular solve to whiten. ────────────
+    per_run_data_white: list[torch.Tensor] = []
+    per_run_design_white: list[torch.Tensor] = []
+    for r in range(n_runs):
+        n_tp_r = per_run_task_designs[r].shape[0]
+        R_r = build_arma11_covariance(
+            a_opt, b_opt, n_tp_r, torch.device("cpu"),
+            dtype=torch.float32, run_starts=None,
+        )
+        if R_r is None:
+            raise ValueError(
+                f"build_arma11_covariance returned None for run {r} "
+                f"with a={a_opt}, b={b_opt}"
+            )
+        L_r = torch.linalg.cholesky(R_r).to(device)
+
+        # Whiten design: L⁻¹ X (apply along time axis = dim 0).
+        X_r = per_run_task_designs[r].to(device).float()
+        X_r_white = torch.linalg.solve_triangular(L_r, X_r, upper=False)
+
+        # Whiten data: per voxel, treat as (n_tp_r, n_voxels) = data.T.
+        y_r = per_run_data[r].to(device).float()
+        y_r_white = torch.linalg.solve_triangular(L_r, y_r.T, upper=False).T
+
+        per_run_data_white.append(y_r_white)
+        per_run_design_white.append(X_r_white)
+        del R_r, L_r, X_r, X_r_white, y_r, y_r_white
+
+    return per_run_data_white, per_run_design_white, float(a_opt), float(b_opt)
+
+
 def fit_flobs_constrained(
     data: np.ndarray | torch.Tensor,
     design_task: np.ndarray | torch.Tensor,

@@ -22,6 +22,7 @@ from fastfuncstuff.design.flobs import (
     FracRidgeFitResult,
     cv_basis_constrained_ridge,
     decouple_amplitude_prior,
+    estimate_and_apply_arma11_prewhitening,
     fit_basis_constrained_ridge,
     fit_basis_fracridge,
     fit_flobs_constrained,
@@ -686,3 +687,47 @@ def test_fracridge_low_snr_prefers_shrinkage(basis):
     # At least half the voxels should prefer some shrinkage.
     fraction_shrunk = float((fit.optimal_fracs < 1.0).mean())
     assert fraction_shrunk > 0.5, f"only {fraction_shrunk:.2f} voxels shrunk"
+
+
+# ---------- ARMA(1,1) prewhitening foundation -------------------------------
+
+
+def test_arma11_prewhiten_recovers_known_ar_coefficient(basis):
+    """Generate AR(1) noise with known rho; the global-ARMA REML fit
+    should pick that rho off the grid (within one grid step).
+    """
+    rng = np.random.default_rng(0)
+    n_runs, n_tp, n_vox = 3, 200, 30
+    K = basis.basis_functions.shape[0]
+    tr = 1.0
+    true_coefs = rng.multivariate_normal(basis.m, basis.C * 0.3, size=n_vox)
+    basis_tr = basis.basis_functions[:, :: int(round(tr / basis.dt))]
+    target_rho = 0.6
+
+    per_run_data, per_run_designs = [], []
+    for _ in range(n_runs):
+        on = np.zeros(n_tp)
+        on[rng.choice(np.arange(8, n_tp - 30), 7, replace=False)] = 1.0
+        X = np.stack(
+            [np.convolve(on, basis_tr[b])[:n_tp] for b in range(K)], axis=1
+        )
+        y_clean = (X @ true_coefs.T).T
+        eps = rng.standard_normal((n_vox, n_tp))
+        noise = np.zeros_like(eps)
+        noise[:, 0] = eps[:, 0]
+        for t in range(1, n_tp):
+            noise[:, t] = target_rho * noise[:, t - 1] + eps[:, t]
+        y = y_clean + 1.5 * y_clean.std() * noise
+        per_run_data.append(torch.from_numpy(y).float())
+        per_run_designs.append(torch.from_numpy(X).float())
+
+    pwd, pwds, a_opt, b_opt = estimate_and_apply_arma11_prewhitening(
+        per_run_data, per_run_designs, polort=2,
+        device=torch.device("cpu"), verbose=False,
+    )
+    # Default grid step is 0.1, so accept |a - target| ≤ 0.1.
+    assert abs(a_opt - target_rho) <= 0.1, f"got a={a_opt}, expected ~{target_rho}"
+    # Shapes preserved.
+    for r in range(n_runs):
+        assert pwd[r].shape == per_run_data[r].shape
+        assert pwds[r].shape == per_run_designs[r].shape
