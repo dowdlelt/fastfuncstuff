@@ -71,6 +71,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 try:
     from fastfuncstuff.cli_utils import (
@@ -943,7 +944,13 @@ def main() -> int:
         idx = np.argmax(np.abs(hrfs), axis=-1, keepdims=True)
         return np.take_along_axis(hrfs, idx, axis=-1).squeeze(-1)
 
-    for start in range(0, n_vox_masked, chunk_size):
+    n_amp_chunks = (n_vox_masked + chunk_size - 1) // chunk_size
+    for start in tqdm(
+        range(0, n_vox_masked, chunk_size),
+        total=n_amp_chunks,
+        desc="  Amplitude/iresp", unit="chunk",
+        leave=False, disable=n_amp_chunks <= 1,
+    ):
         end = min(start + chunk_size, n_vox_masked)
         # Amplitude and iresp share a single HRF reconstruction at
         # TR (iresp_dt) resolution.  Peak finding on this grid is
@@ -985,7 +992,11 @@ def main() -> int:
             per_cond_trial_idx.setdefault(cond, []).append(b_idx)
 
         # Per-condition amplitude 4D (last axis = trial number)
-        for cond, idxs in per_cond_trial_idx.items():
+        for cond, idxs in tqdm(
+            per_cond_trial_idx.items(),
+            desc="  Single-trial amplitudes", unit="cond",
+            leave=False, disable=len(per_cond_trial_idx) <= 1,
+        ):
             for amps, sfx in ((amplitude, ""), (amplitude_ols, "_unconstrained")):
                 amp_stack = amps[:, idxs]              # (n_vox, n_trials_for_cond)
                 amp_vol = _to_volume(amp_stack)         # (nx, ny, nz, n_trials)
@@ -1010,7 +1021,11 @@ def main() -> int:
         # PC weights per trial (optional but useful for diagnostics) —
         # only the constrained version, keep file count manageable.
         # Stacked as (nx, ny, nz, n_trials, K).
-        for cond, idxs in per_cond_trial_idx.items():
+        for cond, idxs in tqdm(
+            per_cond_trial_idx.items(),
+            desc="  Single-trial pcweights", unit="cond",
+            leave=False, disable=len(per_cond_trial_idx) <= 1,
+        ):
             stack = task_betas[:, idxs, :]            # (n_vox, n_trials, K)
             stack_ols = task_betas_ols[:, idxs, :]
             for arr, sfx in ((stack, ""), (stack_ols, "_unconstrained")):

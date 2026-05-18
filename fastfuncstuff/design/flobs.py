@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives, pighs_halfcos
 from fastfuncstuff.utils import get_device
@@ -678,7 +679,12 @@ def fit_basis_constrained_ridge(
     ss_tot_full = torch.empty(n_voxels, dtype=torch.float64, device="cpu")
 
     # ----------- Pass 1: OLS + sufficient stats ---------------------
-    for start in range(0, n_voxels, chunk_size):
+    n_chunks_p1 = (n_voxels + chunk_size - 1) // chunk_size
+    for start in tqdm(
+        range(0, n_voxels, chunk_size),
+        total=n_chunks_p1, desc="  Pass 1 (OLS)", unit="chunk",
+        leave=False, disable=n_chunks_p1 <= 1,
+    ):
         end = min(start + chunk_size, n_voxels)
         y_chunk = y[start:end].to(device, non_blocking=True)      # (chunk, n_t)
         Xty_chunk = X_full.T @ y_chunk.T                          # (n_cols, chunk)
@@ -742,7 +748,12 @@ def fit_basis_constrained_ridge(
             L_A = None
             use_chol_A = False
 
-        for start in range(0, n_voxels, chunk_size):
+        n_chunks_p2 = (n_voxels + chunk_size - 1) // chunk_size
+        for start in tqdm(
+            range(0, n_voxels, chunk_size),
+            total=n_chunks_p2, desc="  Pass 2 (constrained)", unit="chunk",
+            leave=False, disable=n_chunks_p2 <= 1,
+        ):
             end = min(start + chunk_size, n_voxels)
             y_chunk = y[start:end].to(device, non_blocking=True)
             Xty_chunk = X_full.T @ y_chunk.T
@@ -807,7 +818,12 @@ def fit_basis_constrained_ridge(
         Pm_per_bin = bin_lambda.to(Pm_unit.dtype).unsqueeze(1) * Pm_unit.cpu().unsqueeze(0)
         Pm_per_bin = Pm_per_bin.to(device)
 
-        for start in range(0, n_voxels, chunk_size):
+        n_chunks_p2v = (n_voxels + chunk_size - 1) // chunk_size
+        for start in tqdm(
+            range(0, n_voxels, chunk_size),
+            total=n_chunks_p2v, desc="  Pass 2 (voxelwise λ)", unit="chunk",
+            leave=False, disable=n_chunks_p2v <= 1,
+        ):
             end = min(start + chunk_size, n_voxels)
             y_chunk = y[start:end].to(device, non_blocking=True)
             Xty_chunk = X_full.T @ y_chunk.T                       # (n_cols, chunk)
@@ -1076,12 +1092,18 @@ def cv_basis_constrained_ridge(
     # Loop weights × splits.  For each weight, accumulate ss_res across
     # folds in a single (n_voxels,) tensor — no full-prediction buffer
     # needed when LORO (each timepoint appears in exactly one fold).
-    for wi, w in enumerate(weights_to_run):
+    weights_iter = tqdm(
+        list(enumerate(weights_to_run)), total=n_weights,
+        desc="  CV weights", unit="weight",
+        leave=False, disable=(not verbose) or n_weights <= 1,
+    )
+    for wi, w in weights_iter:
         ss_res_accum = torch.zeros(n_voxels, dtype=torch.float64, device=device)
-        if verbose:
-            label = "OLS" if w == "OLS" else f"weight×σ²={w}"
-            print(f"  CV: {label} …")
-        for train_runs, test_runs in splits:
+        weights_iter.set_postfix_str("OLS" if w == "OLS" else f"λ×σ²={w}")
+        for train_runs, test_runs in tqdm(
+            splits, total=n_splits, desc="    folds", unit="fold",
+            leave=False, disable=(not verbose) or n_splits <= 1,
+        ):
             # Build train / test row-index lists from run boundaries.
             train_rows = torch.cat([
                 torch.arange(run_starts[r], run_ends[r], device=device)
@@ -1310,7 +1332,12 @@ def fit_basis_fracridge(
     # SS_res accumulator: (n_fracs, n_voxels), float64 for numeric stability.
     ss_res_accum = torch.zeros(n_fracs, n_voxels, dtype=torch.float64, device=device)
 
-    for fold_idx, (train_runs, test_runs) in enumerate(splits):
+    splits_iter = tqdm(
+        splits, total=n_splits,
+        desc="  fracridge LORO", unit="fold",
+        leave=False, disable=(not verbose) or n_splits <= 1,
+    )
+    for train_runs, test_runs in splits_iter:
         train_rows = torch.cat([
             torch.arange(run_starts[r], run_ends[r], device=device)
             for r in train_runs
@@ -1334,11 +1361,6 @@ def fit_basis_fracridge(
         y_pred = torch.einsum("tf,fkv->tkv", X_test, coefs)  # (T, n_fracs, V)
         resid = y_test.T.unsqueeze(1) - y_pred              # (T, n_fracs, V)
         ss_res_accum += (resid ** 2).sum(dim=0).double()
-
-        if verbose and ((fold_idx + 1) % max(1, n_splits // 5) == 0
-                        or fold_idx == n_splits - 1):
-            print(f"    fold {fold_idx + 1}/{n_splits}")
-
         del X_train, X_test, y_train, y_test, coefs, y_pred, resid
 
     # Held-out R² per frac per voxel.  ss_tot_full is (V,); broadcast to (F, V).
