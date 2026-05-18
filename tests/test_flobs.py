@@ -17,7 +17,9 @@ import pytest
 
 from fastfuncstuff.design.flobs import (
     FLOBSBasis,
+    FLOBSCVResult,
     FLOBSFitResult,
+    cv_basis_constrained_ridge,
     fit_basis_constrained_ridge,
     fit_flobs_constrained,
     flobs_prior,
@@ -344,6 +346,116 @@ def test_spmg2_constrained_fit_beats_ols_at_low_snr():
     assert err_constrained < err_ols
     # And the derivative coefficient stays sensible (not 100× its truth)
     assert np.median(np.abs(fit.betas[:, 1])) < 1.0
+
+
+# ---------- cv_basis_constrained_ridge --------------------------------------
+
+
+def _build_multirun_synth(basis, n_runs=4, n_tp_run=120, n_vox=60, noise_sigma=1.0,
+                          tr=1.0, seed=11):
+    """Build per-run (data, task design) lists for CV tests.
+
+    Same true coefficient vector for every voxel, drawn from the
+    FLOBS prior so it's a "sensible HRF" by construction.  Onsets
+    differ run-to-run (jittered) so held-out runs are genuinely
+    new data.
+    """
+    rng = np.random.default_rng(seed)
+    true_coefs = rng.multivariate_normal(basis.m, basis.C * 0.3, size=n_vox)  # (n_vox, K)
+    K = basis.basis_functions.shape[0]
+    basis_tr = basis.basis_functions[:, :: max(int(round(tr / basis.dt)), 1)]
+    per_run_data: list = []
+    per_run_task: list = []
+    for r in range(n_runs):
+        onset_idx = np.sort(rng.choice(np.arange(8, n_tp_run - 30), size=7, replace=False))
+        X = np.zeros((n_tp_run, K))
+        on = np.zeros(n_tp_run); on[onset_idx] = 1.0
+        for b in range(K):
+            X[:, b] = np.convolve(on, basis_tr[b])[:n_tp_run]
+        y_clean = (X @ true_coefs.T).T                                 # (n_vox, n_tp)
+        y = y_clean + noise_sigma * y_clean.std() * rng.standard_normal((n_vox, n_tp_run))
+        per_run_data.append(torch.from_numpy(y).float())
+        per_run_task.append(torch.from_numpy(X).float())
+    return per_run_data, per_run_task, true_coefs
+
+
+def test_cv_returns_correct_shapes(basis):
+    per_run_data, per_run_task, _ = _build_multirun_synth(basis, n_runs=4, n_vox=20)
+    cv = cv_basis_constrained_ridge(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_task,
+        basis_functions=basis.basis_functions,
+        prior_mean=basis.m,
+        prior_cov=basis.C,
+        n_blocks=1,
+        polort=2,
+        weight_grid=[0.5, 1.0, 2.0],
+        include_ols=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert isinstance(cv, FLOBSCVResult)
+    assert cv.r2_per_weight.shape == (20, 4)             # OLS + 3 weights
+    assert cv.argmax_weight_idx.shape == (20,)
+    assert cv.weights[0] == "OLS"
+    assert cv.n_splits == 4                              # LORO with 4 runs
+
+
+def test_cv_high_snr_prefers_ols(basis):
+    """At high SNR, OLS should win held-out R² since the prior is
+    unnecessary; constraint at strong weights should hurt."""
+    per_run_data, per_run_task, _ = _build_multirun_synth(
+        basis, n_runs=4, n_vox=40, noise_sigma=0.05,
+    )
+    cv = cv_basis_constrained_ridge(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_task,
+        basis_functions=basis.basis_functions,
+        prior_mean=basis.m,
+        prior_cov=basis.C,
+        n_blocks=1,
+        polort=2,
+        weight_grid=[0.1, 1.0, 10.0],
+        include_ols=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    medians = np.median(cv.r2_per_weight, axis=0)
+    # OLS should be at least as good as the strongest constraint at
+    # high SNR.  At very high SNR both are essentially perfect, so
+    # accept equality — the test is "the strong constraint isn't
+    # *winning* by an appreciable margin," which would be wrong.
+    ols_idx = cv.weights.index("OLS")
+    strong_idx = cv.weights.index(10.0)
+    assert medians[ols_idx] >= medians[strong_idx] - 0.001
+
+
+def test_cv_low_snr_prefers_constrained(basis):
+    """At low SNR, OLS overfits → held-out R² lower than a sensible
+    constraint."""
+    per_run_data, per_run_task, _ = _build_multirun_synth(
+        basis, n_runs=4, n_vox=40, noise_sigma=4.0,
+    )
+    cv = cv_basis_constrained_ridge(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_task,
+        basis_functions=basis.basis_functions,
+        prior_mean=basis.m,
+        prior_cov=basis.C,
+        n_blocks=1,
+        polort=2,
+        weight_grid=[0.1, 1.0, 10.0],
+        include_ols=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    medians = np.median(cv.r2_per_weight, axis=0)
+    ols_idx = cv.weights.index("OLS")
+    # Best constrained should beat OLS at low SNR
+    best_constrained_idx = int(np.argmax([medians[i] for i in range(len(cv.weights))
+                                          if cv.weights[i] != "OLS"]))
+    best_constrained_idx += 1 if ols_idx == 0 else 0     # skip OLS slot
+    assert medians[best_constrained_idx] > medians[ols_idx]
 
 
 def test_constrained_fit_two_conditions(basis):

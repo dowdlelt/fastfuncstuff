@@ -738,6 +738,289 @@ def fit_basis_constrained_ridge(
     )
 
 
+@dataclass
+class FLOBSCVResult:
+    """Output of :func:`cv_basis_constrained_ridge`.
+
+    Attributes
+    ----------
+    weights : list[float | str]
+        The grid of prior-weight multipliers evaluated, in order.
+        ``"OLS"`` is the unconstrained baseline (no shape prior).
+    r2_per_weight : np.ndarray, shape (n_voxels, n_weights)
+        Held-out R² for each (voxel, weight) — single R² per voxel
+        per weight, computed from predictions concatenated across CV
+        folds (the GLMdenoise / GLMsingle convention).
+    argmax_weight_idx : np.ndarray, shape (n_voxels,)
+        For each voxel, the index into ``weights`` whose held-out R²
+        is largest.  Save this as a 3-D NIfTI to see *where* each
+        regularization strength wins.
+    n_splits : int
+        Number of CV folds run.
+    """
+
+    weights: list
+    r2_per_weight: np.ndarray
+    argmax_weight_idx: np.ndarray
+    n_splits: int
+
+
+def cv_basis_constrained_ridge(
+    per_run_data: list[torch.Tensor],
+    per_run_task_designs: list[torch.Tensor],
+    basis_functions: np.ndarray,
+    prior_mean: np.ndarray,
+    prior_cov: np.ndarray,
+    n_blocks: int,
+    polort: int,
+    *,
+    weight_grid: list[float] | None = None,
+    include_ols: bool = True,
+    leave_n_out: int = 1,
+    n_perms: int = 50,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> FLOBSCVResult:
+    """Run-based LORO cross-validation of the constrained-ridge fit.
+
+    Sweeps a grid of prior-weight multipliers (plus an OLS baseline),
+    fits on training runs, predicts held-out runs, and aggregates a
+    single per-voxel R² per weight from the concatenated
+    cross-fold predictions (GLMdenoise convention — see
+    :func:`fastfuncstuff.glm.xval.compute_xval_r2`).
+
+    This is the framework that lets us A/B every later regularization
+    change empirically.  Without it, every choice of prior_weight is
+    a just-so story.
+
+    Strategy:
+
+    1. Project per-run polynomial nuisance out of data AND task
+       design (via :func:`fastfuncstuff.glm.xval.project_out_nuisance_per_run`)
+       once, up front.  After projection the task design is
+       polynomial-free within each run, which makes per-fold fits
+       trivially comparable.
+    2. For each prior_weight in the grid (plus ``"OLS"``):
+       a. For each (train_runs, test_runs) split:
+          - Slice cleaned data + design by train run indices.
+          - Fit :func:`fit_basis_constrained_ridge` (with that weight)
+            on the train slice, ``polort=-1`` so the function
+            doesn't try to add polys again.
+          - Predict the cleaned test data using the task betas:
+            ``y_test_pred = X_test_clean @ β_task``.
+          - Place the predictions into a concatenated-by-time buffer.
+       b. After all splits, compute per-voxel R² from the full
+          concatenated predictions vs the full cleaned data.
+    3. Return :class:`FLOBSCVResult` with per-weight R² maps and a
+       per-voxel argmax.
+
+    Parameters
+    ----------
+    per_run_data : list[torch.Tensor], each (n_voxels, n_tp_run)
+        Voxel data per run.
+    per_run_task_designs : list[torch.Tensor], each (n_tp_run, n_task)
+        Task design per run (output of
+        :func:`fastfuncstuff.design.builder.build_per_run_task_designs`).
+    basis_functions : np.ndarray, shape (n_basis, n_t_basis)
+        Basis used to convolve onsets.  Only needed here for the
+        ``n_basis`` count; reconstruction happens upstream.
+    prior_mean : np.ndarray, shape (n_basis,)
+        Prior mean.
+    prior_cov : np.ndarray, shape (n_basis, n_basis)
+        Prior covariance.
+    n_blocks : int
+        Number of condition / trial blocks in the task design
+        (block_count × n_basis = n_task_cols).
+    polort : int
+        Polynomial detrend order per run.  ``-1`` disables.
+    weight_grid : list[float], optional
+        Multipliers on σ² to evaluate.  Defaults to
+        ``[0.1, 0.3, 1.0, 3.0, 10.0]``.
+    include_ols : bool, default True
+        Also evaluate the unconstrained OLS path as a baseline.
+        Held-out R² of OLS is the right floor: a constrained fit
+        must beat it to earn its keep.
+    leave_n_out : int, default 1
+        How many runs to leave out per fold.  ``1`` = LORO.
+    n_perms : int, default 50
+        Max number of CV splits.  For LORO with ≤50 runs all splits
+        are evaluated.
+    device, verbose
+        Forwarded to the per-fold solver.
+
+    Returns
+    -------
+    FLOBSCVResult
+    """
+    from fastfuncstuff.glm.xval import (
+        generate_cv_splits,
+        project_out_nuisance_per_run,
+    )
+    from fastfuncstuff.design.builder import legendre_polynomials
+
+    if device is None:
+        device = get_device()
+    if weight_grid is None:
+        weight_grid = [0.1, 0.3, 1.0, 3.0, 10.0]
+
+    n_runs = len(per_run_data)
+    if n_runs < 2:
+        raise ValueError(f"CV needs at least 2 runs; got {n_runs}")
+    n_basis = basis_functions.shape[0]
+    n_task_cols = n_blocks * n_basis
+
+    n_tp_per_run = [d.shape[1] for d in per_run_data]
+    run_starts = [0]
+    for n in n_tp_per_run[:-1]:
+        run_starts.append(run_starts[-1] + n)
+
+    # Concatenate data + task design row-wise (no polys yet).
+    # design_full: (total_tp, n_task_cols)
+    # data_full:   (n_voxels, total_tp)
+    data_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)
+    n_voxels = data_full.shape[0]
+    design_full = torch.cat(
+        [t.to(device).float() for t in per_run_task_designs], dim=0
+    )
+
+    # Per-run nuisance (polynomial detrend).  Project out from BOTH
+    # data and task design once, up front — after this the design is
+    # polynomial-free and per-fold fits collapse to a clean ridge
+    # solve on the task block.
+    if polort >= 0:
+        nuisance_per_run = [
+            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort))
+            .to(device).float()
+            for r in range(n_runs)
+        ]
+        if verbose:
+            print(
+                f"  CV: projecting out per-run polynomials (polort={polort}, "
+                f"{polort + 1} cols × {n_runs} runs)…"
+            )
+        data_clean, design_clean = project_out_nuisance_per_run(
+            data=data_full,
+            design=design_full,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=device,
+            verbose=False,
+        )
+    else:
+        data_clean, design_clean = data_full, design_full
+
+    del data_full, design_full
+
+    # Splits
+    splits = generate_cv_splits(n_runs, strategy=leave_n_out, n_perms=n_perms)
+    n_splits = len(splits)
+    if verbose:
+        print(
+            f"  CV: {n_splits} splits (leave-{leave_n_out}-out), "
+            f"{len(weight_grid)} prior weights"
+            + (" + OLS baseline" if include_ols else "") + "."
+        )
+
+    # Per-run boundary tensor for slicing.
+    run_ends = [run_starts[r] + n_tp_per_run[r] for r in range(n_runs)]
+
+    # Cleaned data needs ss_tot computed AFTER nuisance projection
+    # (because the projection removes per-run means; the relevant
+    # SS_tot is the variance of the projected data).
+    y_clean_mean = data_clean.mean(dim=1, keepdim=True)
+    ss_tot_full = ((data_clean - y_clean_mean) ** 2).sum(dim=1)  # (n_voxels,)
+
+    weights_to_run: list[float | str] = list(weight_grid)
+    if include_ols:
+        weights_to_run = ["OLS"] + weights_to_run
+
+    n_weights = len(weights_to_run)
+    r2_per_weight = np.zeros((n_voxels, n_weights), dtype=np.float32)
+
+    # Loop weights × splits.  For each weight, accumulate ss_res across
+    # folds in a single (n_voxels,) tensor — no full-prediction buffer
+    # needed when LORO (each timepoint appears in exactly one fold).
+    for wi, w in enumerate(weights_to_run):
+        ss_res_accum = torch.zeros(n_voxels, dtype=torch.float64, device=device)
+        if verbose:
+            label = "OLS" if w == "OLS" else f"weight×σ²={w}"
+            print(f"  CV: {label} …")
+        for train_runs, test_runs in splits:
+            # Build train / test row-index lists from run boundaries.
+            train_rows = torch.cat([
+                torch.arange(run_starts[r], run_ends[r], device=device)
+                for r in train_runs
+            ])
+            test_rows = torch.cat([
+                torch.arange(run_starts[r], run_ends[r], device=device)
+                for r in test_runs
+            ])
+            X_train = design_clean[train_rows]                 # (n_tp_train, n_task)
+            X_test = design_clean[test_rows]
+            y_train = data_clean[:, train_rows]                # (n_voxels, n_tp_train)
+            y_test = data_clean[:, test_rows]
+
+            # Fit on train.  We treat the cleaned design as a single
+            # task block (no nuisance, polort=-1) and pass through
+            # fit_basis_constrained_ridge with reconstruct_hrfs=False
+            # (we only need task betas).
+            if w == "OLS":
+                # OLS: closed-form via normal equations.  In CV mode
+                # everything stays in design.dtype (float32) for speed
+                # and memory; the constrained primitive uses float64
+                # internally but we cast back here.
+                XtX = X_train.T @ X_train
+                Xty = X_train.T @ y_train.T
+                try:
+                    L0 = torch.linalg.cholesky(XtX)
+                    beta_chunk = torch.cholesky_solve(Xty, L0)
+                except torch.linalg.LinAlgError:
+                    beta_chunk = torch.linalg.lstsq(X_train, y_train.T).solution
+                # beta_chunk: (n_task_cols, n_voxels)
+                task_betas = beta_chunk.T
+            else:
+                fit = fit_basis_constrained_ridge(
+                    data=y_train,
+                    design_task=X_train,
+                    basis_functions=basis_functions,
+                    prior_mean=prior_mean,
+                    prior_cov=prior_cov,
+                    n_blocks=n_blocks,
+                    nuisance=None,                         # already projected
+                    prior_weight=float(w),
+                    device=device,
+                    reconstruct_hrfs=False,
+                )
+                # fit.betas is numpy float64 — cast to match X_test
+                # dtype so the matmul below works.
+                task_betas = torch.from_numpy(
+                    fit.betas[:, :n_task_cols]
+                ).to(device=device, dtype=X_test.dtype)
+
+            # Predict cleaned test data using TASK betas only.
+            y_test_pred = task_betas @ X_test.T              # (n_voxels, n_tp_test)
+            ss_res_split = ((y_test - y_test_pred) ** 2).sum(dim=1)
+            ss_res_accum += ss_res_split.double()
+            del X_train, X_test, y_train, y_test, task_betas, y_test_pred, ss_res_split
+
+        # Compute R² for this weight against the full ss_tot.
+        r2_w = 1.0 - ss_res_accum / torch.clamp(ss_tot_full.double(), min=1e-30)
+        r2_per_weight[:, wi] = r2_w.cpu().numpy()
+        if verbose:
+            print(
+                f"    median held-out R² = {float(np.median(r2_per_weight[:, wi])):.4f}, "
+                f"mean = {float(np.mean(r2_per_weight[:, wi])):.4f}"
+            )
+
+    argmax = np.argmax(r2_per_weight, axis=1).astype(np.int32)
+    return FLOBSCVResult(
+        weights=weights_to_run,
+        r2_per_weight=r2_per_weight,
+        argmax_weight_idx=argmax,
+        n_splits=n_splits,
+    )
+
+
 def fit_flobs_constrained(
     data: np.ndarray | torch.Tensor,
     design_task: np.ndarray | torch.Tensor,

@@ -88,6 +88,7 @@ try:
     )
     from fastfuncstuff.design.flobs import (
         FLOBSBasis,
+        cv_basis_constrained_ridge,
         fit_basis_constrained_ridge,
         flobs_prior,
         generate_flobs_basis,
@@ -235,6 +236,37 @@ def create_parser() -> argparse.ArgumentParser:
                            type=float, default=0.2,
                            help="Prior std on the dispersion-derivative coefficient (SPMG3).")
 
+    # Cross-validation
+    cv_opts = parser.add_argument_group("Cross-validation (regularization sanity check)")
+    cv_opts.add_argument(
+        "-cv-runs", "-cv_runs",
+        dest="cv_runs",
+        action="store_true",
+        help=(
+            "Run LORO cross-validation over a grid of prior-weight "
+            "multipliers (+ OLS baseline) and emit per-voxel held-out "
+            "R² maps.  Use this to validate that the constraint is "
+            "actually helping rather than over-shrinking amplitudes.  "
+            "Adds two output files: <prefix>_fitbasis_cv_r2.tsv "
+            "(median R² per weight) and <prefix>_fitbasis_cv_r2_per_weight"
+            ".nii.gz (4-D, one volume per weight).  Also emits "
+            "<prefix>_fitbasis_cv_argmax.nii.gz (3-D, per-voxel best weight)."
+        ),
+    )
+    cv_opts.add_argument(
+        "-cv-grid", "-cv_grid",
+        dest="cv_grid",
+        default="0.1,0.3,1.0,3.0,10.0",
+        metavar="W1,W2,...",
+        help="Comma-separated grid of prior-weight multipliers to evaluate.",
+    )
+    cv_opts.add_argument(
+        "-cv-leave-n-out", "-cv_leave_n_out",
+        dest="cv_leave_n_out",
+        type=int, default=1, metavar="N",
+        help="Number of runs left out per CV fold (1 = LORO).",
+    )
+
     # Constraint strength
     reg_opts = parser.add_argument_group("Constraint strength")
     reg_opts.add_argument(
@@ -291,6 +323,21 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Force iresp save off (only PC weights + amplitude maps emitted).",
+    )
+    out.add_argument(
+        "-iresp-dt", "-iresp_dt",
+        dest="iresp_dt",
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Time-axis resolution (s) for saved iresp NIfTIs.  Default: "
+            "TR.  The internal basis stays at -flobs-dt (default 0.1 s) "
+            "for accurate amplitude computation; only the SAVED iresp "
+            "is resampled.  Coarser values shrink iresp files by the "
+            "ratio (typically 10-20×) — there's no reason to ship fMRI "
+            "data sampled at 10 ms on a 1.5 s TR.  Pass an explicit "
+            "value like 0.5 for sub-TR HRF inspection."
+        ),
     )
 
     return parser
@@ -639,13 +686,44 @@ def main() -> int:
     # Amplitude = peak of reconstructed HRF per (voxel, block).  Computed
     # in voxel chunks via the memory module so we never materialise the
     # full (n_voxels × n_blocks × n_t) HRF tensor — in single-trial mode
-    # that's tens of GB.  The chunk size estimator uses bytes/voxel =
-    # n_blocks × n_t_basis × 8 (HRF) + light overhead.
-    from fastfuncstuff.memory import estimate_chunk_size
+    # that's tens of GB.
+    #
+    # Two time grids in play:
+    #   basis.dt          high resolution (default 0.1 s) used for
+    #                     accurate amplitude estimation (peak finding).
+    #   iresp_dt          user-chosen save resolution (default = TR).
+    #                     Iresp NIfTIs are resampled to this grid
+    #                     before writing — typical 10-20× size reduction.
+    from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
     n_t_basis = basis.basis_functions.shape[1]
-    # bytes per voxel for the per-chunk HRF reconstruction (×2 for
-    # constrained + OLS):  2 × n_blocks × n_t_basis × 8 (float64).
-    bytes_per_vox = 2 * n_blocks * n_t_basis * 8
+
+    # Resolve -iresp-dt: default to TR.
+    iresp_dt = float(args.iresp_dt) if args.iresp_dt is not None else float(tr)
+    if iresp_dt < basis.dt:
+        print(
+            f"  WARNING: -iresp-dt ({iresp_dt}s) is finer than basis "
+            f"dt ({basis.dt}s); clamping to basis dt (no upsampling)."
+        )
+        iresp_dt = basis.dt
+    # Build resampled basis ONCE (linear interpolation along time axis).
+    # Used for iresp save only; amplitude still computed at basis.dt.
+    src_times = np.arange(n_t_basis) * basis.dt
+    n_t_iresp = max(1, int(np.floor((basis.duration - basis.dt) / iresp_dt)) + 1)
+    dst_times = np.arange(n_t_iresp) * iresp_dt
+    basis_iresp = np.stack(
+        [np.interp(dst_times, src_times, basis.basis_functions[k])
+         for k in range(n_basis)],
+        axis=0,
+    ).astype(np.float64)  # (K, n_t_iresp)
+    print(
+        f"  iresp save grid: dt={iresp_dt:.3f}s × {n_t_iresp} samples "
+        f"(basis stays at {basis.dt:.3f}s × {n_t_basis} for amplitude)"
+    )
+
+    # Chunk size: dominated by full-res HRF reconstruction for
+    # amplitude (chunk × n_blocks × n_t_basis × 8) + iresp resampled
+    # tensor (chunk × n_blocks × n_t_iresp × 4).
+    bytes_per_vox = 2 * n_blocks * (n_t_basis * 8 + n_t_iresp * 4)
     chunk_size = estimate_chunk_size(
         n_voxels=n_vox_masked,
         n_timepoints=n_t_basis,
@@ -653,16 +731,12 @@ def main() -> int:
         device=torch.device("cpu"),
         operation="glm",
     )
-    # Tighten chunk_size if the HRF reconstruction alone would blow it
-    # (estimate_chunk_size doesn't model the per-block HRF dimension).
-    from fastfuncstuff.memory import get_available_memory
     avail_bytes = get_available_memory(torch.device("cpu"))
-    safety = 0.25
-    chunk_from_hrf = max(1, int(avail_bytes * safety / max(bytes_per_vox, 1)))
+    chunk_from_hrf = max(1, int(avail_bytes * 0.25 / max(bytes_per_vox, 1)))
     chunk_size = min(chunk_size, chunk_from_hrf)
     print(
         f"  Amplitude/iresp chunking: {chunk_size:,} voxels per chunk "
-        f"(n_blocks={n_blocks}, n_t_basis={n_t_basis})"
+        f"(n_blocks={n_blocks})"
     )
 
     amplitude = np.zeros((n_vox_masked, n_blocks), dtype=np.float32)
@@ -692,36 +766,43 @@ def main() -> int:
     else:
         save_full_iresp = True   # per-condition default
     if save_full_iresp:
-        # Memory estimate for the full iresp tensor:
-        full_iresp_bytes = 2 * n_vox_masked * n_blocks * n_t_basis * 4  # float32
+        # Memory estimate for the full iresp tensor at the resampled grid:
+        full_iresp_bytes = 2 * n_vox_masked * n_blocks * n_t_iresp * 4  # float32
         full_iresp_gb = full_iresp_bytes / (1024**3)
         if full_iresp_gb > 8.0:
             print(
-                f"  WARNING: full iresp tensor would be {full_iresp_gb:.1f} GB.  "
-                "Skipping iresp save.  Amplitude maps are still emitted."
+                f"  WARNING: full iresp tensor would be {full_iresp_gb:.1f} GB "
+                f"even at iresp_dt={iresp_dt}s.  Skipping iresp save.  "
+                "Amplitude maps are still emitted; try a coarser -iresp-dt."
             )
             save_full_iresp = False
         else:
-            print(f"  Per-trial iresp save: ~{full_iresp_gb:.2f} GB in memory.")
+            print(f"  Per-block iresp save: ~{full_iresp_gb:.2f} GB in memory.")
     iresp_buf = (
-        np.zeros((n_vox_masked, n_blocks, n_t_basis), dtype=np.float32)
+        np.zeros((n_vox_masked, n_blocks, n_t_iresp), dtype=np.float32)
         if save_full_iresp else None
     )
     iresp_buf_ols = (
-        np.zeros((n_vox_masked, n_blocks, n_t_basis), dtype=np.float32)
+        np.zeros((n_vox_masked, n_blocks, n_t_iresp), dtype=np.float32)
         if save_full_iresp else None
     )
 
     for start in range(0, n_vox_masked, chunk_size):
         end = min(start + chunk_size, n_vox_masked)
-        # (chunk, n_blocks, n_basis) @ (n_basis, n_t) = (chunk, n_blocks, n_t)
-        hrfs_chunk = task_betas[start:end] @ basis.basis_functions
-        hrfs_ols_chunk = task_betas_ols[start:end] @ basis.basis_functions
-        amplitude[start:end] = hrfs_chunk.max(axis=2).astype(np.float32)
-        amplitude_ols[start:end] = hrfs_ols_chunk.max(axis=2).astype(np.float32)
+        # Amplitude is computed at basis.dt (high res) so peak finding
+        # captures the actual max even if iresp_dt is coarse.
+        hrfs_chunk_hi = task_betas[start:end] @ basis.basis_functions
+        hrfs_ols_chunk_hi = task_betas_ols[start:end] @ basis.basis_functions
+        amplitude[start:end] = hrfs_chunk_hi.max(axis=2).astype(np.float32)
+        amplitude_ols[start:end] = hrfs_ols_chunk_hi.max(axis=2).astype(np.float32)
         if iresp_buf is not None:
-            iresp_buf[start:end] = hrfs_chunk.astype(np.float32)
-            iresp_buf_ols[start:end] = hrfs_ols_chunk.astype(np.float32)
+            # Save at the coarser iresp_dt grid (10-20× smaller).
+            iresp_buf[start:end] = (
+                task_betas[start:end] @ basis_iresp
+            ).astype(np.float32)
+            iresp_buf_ols[start:end] = (
+                task_betas_ols[start:end] @ basis_iresp
+            ).astype(np.float32)
 
     # Basis TSV (shared)
     basis_path = f"{args.prefix}_fitbasis_basis.tsv"
@@ -766,7 +847,7 @@ def main() -> int:
                     iresp=iresp_vol,
                     output_prefix=f"{args.prefix}_fitbasis",
                     condition_labels=[f"{lbl}{sfx}" for lbl in block_labels],
-                    tr=basis.dt, bot=0.0, top=basis.duration - basis.dt,
+                    tr=iresp_dt, bot=0.0, top=iresp_dt * (n_t_iresp - 1),
                     reference_img=args.input[0], nii_ext=nii_ext,
                 )
             print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
@@ -794,7 +875,7 @@ def main() -> int:
                     iresp=iresp_vol,
                     output_prefix=f"{args.prefix}_fitbasis",
                     condition_labels=[f"{lbl}{sfx}" for lbl in block_labels],
-                    tr=basis.dt, bot=0.0, top=basis.duration - basis.dt,
+                    tr=iresp_dt, bot=0.0, top=iresp_dt * (n_t_iresp - 1),
                     reference_img=args.input[0], nii_ext=nii_ext,
                 )
             print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
@@ -812,6 +893,114 @@ def main() -> int:
                 save_nifti(a, output_path=a_path, reference_img=args.input[0])
                 print(f"  Wrote {w_path}")
                 print(f"  Wrote {a_path}")
+
+    # ── Cross-validation (regularization sanity check) ──────────────
+    # When -cv-runs is set, run LORO across a grid of prior-weight
+    # multipliers + OLS baseline and emit per-voxel held-out R² maps.
+    # This is the framework that answers "is the constraint actually
+    # helping" empirically per voxel — composes with every later
+    # regularization change (voxel-wise λ, amplitude decoupling,
+    # fracridge) since each can be A/B-tested against held-out R².
+    cv_result = None
+    if args.cv_runs:
+        if n_runs < 2:
+            print(
+                f"  WARNING: -cv-runs requires ≥2 runs (got {n_runs}); skipping CV."
+            )
+        else:
+            try:
+                grid = [float(x) for x in str(args.cv_grid).split(",") if x.strip()]
+            except ValueError:
+                print(f"ERROR: -cv-grid must be comma-separated floats; got {args.cv_grid!r}")
+                return 1
+            print(
+                f"\n  Running LORO cross-validation: leave-{args.cv_leave_n_out}-out, "
+                f"{len(grid)} weights {grid} + OLS baseline"
+            )
+            cv_result = cv_basis_constrained_ridge(
+                per_run_data=per_run_data,
+                per_run_task_designs=per_run_designs,
+                basis_functions=basis.basis_functions,
+                prior_mean=prior_m,
+                prior_cov=prior_C,
+                n_blocks=n_blocks,
+                polort=polort_resolved,
+                weight_grid=grid,
+                include_ols=True,
+                leave_n_out=int(args.cv_leave_n_out),
+                device=device,
+                verbose=args.verb >= 1,
+            )
+
+            # TSV summary: median held-out R² per weight.
+            cv_tsv = f"{args.prefix}_fitbasis_cv_r2.tsv"
+            with open(cv_tsv, "w") as f:
+                f.write("weight\tmedian_r2\tmean_r2\tmax_r2\tn_voxels_best\n")
+                argmax = cv_result.argmax_weight_idx
+                for i, w in enumerate(cv_result.weights):
+                    col = cv_result.r2_per_weight[:, i]
+                    n_best = int((argmax == i).sum())
+                    f.write(
+                        f"{w}\t{float(np.median(col)):.6f}\t"
+                        f"{float(np.mean(col)):.6f}\t{float(np.max(col)):.6f}\t"
+                        f"{n_best}\n"
+                    )
+            print(f"  Wrote {cv_tsv}")
+            # Print summary table with two "best" indicators:
+            #   ← best (median): the weight whose median held-out R²
+            #     across all voxels is highest;
+            #   ← most voxels: the weight that wins per-voxel in the
+            #     largest fraction of the brain.
+            #   They often disagree — the first describes the
+            #   "average" voxel, the second is dominated by noise
+            #   voxels where any small bias wins.
+            medians_arr = np.array(
+                [float(np.median(cv_result.r2_per_weight[:, i]))
+                 for i in range(len(cv_result.weights))]
+            )
+            n_best_arr = np.array(
+                [int((cv_result.argmax_weight_idx == i).sum())
+                 for i in range(len(cv_result.weights))]
+            )
+            best_median_i = int(np.argmax(medians_arr))
+            best_count_i = int(np.argmax(n_best_arr))
+            print("  Held-out R² summary:")
+            print(f"    {'weight':>8}  {'median':>9}  {'mean':>9}  {'max':>9}  {'n_best_voxels':>14}")
+            for i, w in enumerate(cv_result.weights):
+                col = cv_result.r2_per_weight[:, i]
+                tags = []
+                if i == best_median_i:
+                    tags.append("best median")
+                if i == best_count_i:
+                    tags.append("most voxels")
+                tag_str = " ← " + " / ".join(tags) if tags else ""
+                print(
+                    f"    {w!r:>8}  {float(np.median(col)):+.4f}  "
+                    f"{float(np.mean(col)):+.4f}  {float(np.max(col)):+.4f}  "
+                    f"{n_best_arr[i]:>14,}{tag_str}"
+                )
+
+            # Per-voxel argmax NIfTI (3-D, one int per voxel).
+            argmax_3d = np.zeros(volume_shape, dtype=np.int32)
+            if mask is not None:
+                argmax_3d[mask] = cv_result.argmax_weight_idx
+            else:
+                argmax_3d = cv_result.argmax_weight_idx.reshape(volume_shape)
+            argmax_path = f"{args.prefix}_fitbasis_cv_argmax{nii_ext}"
+            save_nifti(argmax_3d.astype(np.float32),
+                       output_path=argmax_path, reference_img=args.input[0])
+            print(f"  Wrote {argmax_path}  (int → index into weights list above)")
+
+            # Per-weight R² 4-D NIfTI (one volume per weight in the grid).
+            r2_4d_shape = volume_shape + (cv_result.r2_per_weight.shape[1],)
+            r2_4d = np.zeros(r2_4d_shape, dtype=np.float32)
+            if mask is not None:
+                r2_4d[mask, :] = cv_result.r2_per_weight
+            else:
+                r2_4d = cv_result.r2_per_weight.reshape(r2_4d_shape)
+            r2_4d_path = f"{args.prefix}_fitbasis_cv_r2_per_weight{nii_ext}"
+            save_nifti(r2_4d, output_path=r2_4d_path, reference_img=args.input[0])
+            print(f"  Wrote {r2_4d_path}  (4-D; volume k = held-out R² at weights[k])")
 
     # ── Metadata sidecar ────────────────────────────────────────────
     metadata = {
@@ -837,6 +1026,20 @@ def main() -> int:
         "r2_mean_constrained": float(fit.r2.mean()),
         "r2_mean_unconstrained": float(fit.r2_ols.mean()),
     }
+    if cv_result is not None:
+        metadata["cv"] = {
+            "weights": [str(w) for w in cv_result.weights],
+            "n_splits": int(cv_result.n_splits),
+            "leave_n_out": int(args.cv_leave_n_out),
+            "median_r2_per_weight": [
+                float(np.median(cv_result.r2_per_weight[:, i]))
+                for i in range(len(cv_result.weights))
+            ],
+            "n_voxels_best_per_weight": [
+                int((cv_result.argmax_weight_idx == i).sum())
+                for i in range(len(cv_result.weights))
+            ],
+        }
     meta_path = f"{args.prefix}_fitbasis_metadata.json"
     Path(meta_path).write_text(json.dumps(metadata, indent=2))
     print(f"  Wrote {meta_path}")
