@@ -458,6 +458,74 @@ def test_cv_low_snr_prefers_constrained(basis):
     assert medians[best_constrained_idx] > medians[ols_idx]
 
 
+def test_voxelwise_lambda_runs_and_differs_from_global(basis):
+    """voxelwise λ produces different betas from global λ on
+    heterogeneous-SNR data, and ought to shrink high-SNR voxels less
+    than the global path does."""
+    rng = np.random.default_rng(31)
+    n_t = 200; tr = 1.0
+    sb = generate_spmg_basis(n_basis=2, duration=32.0, dt=0.1)
+    sb_tr = sb.basis_functions[:, :: int(round(tr / sb.dt))]
+    X = np.zeros((n_t, 2))
+    on = np.zeros(n_t); on[[15, 45, 80, 120, 165]] = 1.0
+    for b in range(2):
+        X[:, b] = np.convolve(on, sb_tr[b])[:n_t]
+
+    # Make voxels with VERY heterogeneous SNR — first half low-noise,
+    # second half high-noise — so per-voxel σ² differs by 100×.
+    n_vox = 40
+    true_coefs = np.column_stack([
+        rng.uniform(0.5, 2.0, size=n_vox),
+        rng.normal(0.0, 0.05, size=n_vox),
+    ])
+    y_clean = (X @ true_coefs.T).T                                # (n_vox, n_t)
+    noise = rng.standard_normal((n_vox, n_t))
+    sigma_per_vox = np.concatenate([np.full(n_vox // 2, 0.1),
+                                     np.full(n_vox - n_vox // 2, 5.0)])
+    y = y_clean + sigma_per_vox[:, None] * y_clean.std() * noise
+
+    pm, pc = spmg_prior(canonical_std=5.0, derivative_std=0.3)
+    common = dict(
+        data=torch.from_numpy(y).double(),
+        design_task=torch.from_numpy(X).double(),
+        basis_functions=sb.basis_functions,
+        prior_mean=pm, prior_cov=pc, n_blocks=1,
+        device=torch.device("cpu"),
+    )
+    fit_global = fit_basis_constrained_ridge(**common, lambda_mode="global")
+    fit_voxel = fit_basis_constrained_ridge(**common, lambda_mode="voxelwise",
+                                            lambda_n_bins=8)
+
+    # Different mode → different betas
+    assert not np.allclose(fit_global.betas, fit_voxel.betas, atol=1e-6)
+
+    # On the LOW-noise half (first n_vox/2 voxels), voxelwise λ should
+    # shrink LESS (since σ²_v is much lower than σ²_mean).  Amplitude
+    # coefficients should be CLOSER TO the OLS estimate in voxelwise
+    # mode than in global mode.
+    low_idx = np.arange(n_vox // 2)
+    diff_to_ols_global = np.abs(
+        fit_global.betas[low_idx, 0] - fit_global.betas_ols[low_idx, 0]
+    ).mean()
+    diff_to_ols_voxel = np.abs(
+        fit_voxel.betas[low_idx, 0] - fit_voxel.betas_ols[low_idx, 0]
+    ).mean()
+    assert diff_to_ols_voxel < diff_to_ols_global
+
+
+def test_voxelwise_lambda_invalid_mode(basis):
+    y, X, _ = _build_test_data(basis, n_vox=10)
+    with pytest.raises(ValueError, match="lambda_mode"):
+        fit_basis_constrained_ridge(
+            data=torch.from_numpy(y).double(),
+            design_task=torch.from_numpy(X).double(),
+            basis_functions=basis.basis_functions,
+            prior_mean=basis.m, prior_cov=basis.C, n_blocks=1,
+            lambda_mode="nonsense",
+            device=torch.device("cpu"),
+        )
+
+
 def test_constrained_fit_two_conditions(basis):
     # Two conditions, distinct onsets, distinct true betas.
     rng = np.random.default_rng(11)

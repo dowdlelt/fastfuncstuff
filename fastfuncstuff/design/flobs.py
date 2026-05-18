@@ -412,6 +412,8 @@ def fit_basis_constrained_ridge(
     device: torch.device | None = None,
     reconstruct_hrfs: bool = True,
     chunk_size: int | None = None,
+    lambda_mode: str = "global",
+    lambda_n_bins: int = 20,
 ) -> FLOBSFitResult:
     """Penalised-least-squares fit with an arbitrary MVN(m, C) shape prior.
 
@@ -516,6 +518,31 @@ def fit_basis_constrained_ridge(
         For single-trial mode this can blow up — set False to skip the
         reconstruction; ``hrfs`` and ``hrfs_ols`` will be ``None``,
         and the caller can reconstruct per-chunk on demand.
+    lambda_mode : {"global", "voxelwise"}, default "global"
+        Choice of prior weight λ:
+
+        - ``"global"`` (current default): one scalar λ used for every
+          voxel.  ``"auto"`` resolves to ``λ = σ²_mean`` across voxels.
+        - ``"voxelwise"``: per-voxel λ_v = ``prior_weight × σ²_v``
+          using each voxel's own OLS residual variance.  Honest
+          Bayesian behaviour — high-SNR voxels get less shrinkage
+          (their σ² is low), low-SNR voxels get more.  Implementation
+          bins voxels by σ² quantile (``lambda_n_bins`` bins, default
+          20) and Cholesky-factors one constrained-system matrix per
+          bin, then solves each voxel against its bin's factor.
+          ~20× extra factorisations of a tiny (p × p) matrix; the
+          marginal cost is negligible compared to the per-voxel
+          right-hand-side product.
+
+        When ``prior_weight`` is a scalar (e.g. ``2.0``), it
+        *multiplies* the per-voxel σ²_v in voxelwise mode.  The
+        CV-grid search continues to work in both modes — the grid
+        sweeps the multiplier, not σ² itself.
+    lambda_n_bins : int, default 20
+        Number of σ² quantile bins for ``lambda_mode="voxelwise"``.
+        20 is enough resolution given that fMRI noise variance has
+        a smooth distribution across voxels; higher buys a little
+        per-voxel precision at the cost of more Cholesky factorisations.
 
     Returns
     -------
@@ -679,31 +706,135 @@ def fit_basis_constrained_ridge(
         effective_weight = float(prior_weight) * sigma2_mean
 
     # ----------- Pass 2: constrained solve --------------------------
-    A = XtX + effective_weight * P
-    Pm = effective_weight * (P @ m_bar)                            # (n_cols,)
-    try:
-        L_A = torch.linalg.cholesky(A)
-        use_chol_A = True
-    except torch.linalg.LinAlgError:
-        L_A = None
-        use_chol_A = False
+    # Two modes:
+    #
+    #   global      : one λ for every voxel.  Single A = X'X + λP,
+    #                 one Cholesky factor, share across all chunks.
+    #                 (Cheap; old default.)
+    #
+    #   voxelwise   : per-voxel λ_v ∝ σ²_v.  Bin voxels by σ² quantile,
+    #                 factor one A_b = X'X + λ_b P per bin (where
+    #                 λ_b is the bin centre), solve voxels in that
+    #                 bin against that factor.  Honest-Bayesian per-
+    #                 voxel weighting at ~20× tiny p×p Cholesky cost.
+    #
+    # In voxelwise mode, ``effective_weight`` (computed above) acts as
+    # a global MULTIPLIER applied on top of σ²_v.  The CV grid still
+    # works — it sweeps that multiplier.
+    if lambda_mode not in ("global", "voxelwise"):
+        raise ValueError(
+            f"lambda_mode must be 'global' or 'voxelwise'; got {lambda_mode!r}"
+        )
 
-    for start in range(0, n_voxels, chunk_size):
-        end = min(start + chunk_size, n_voxels)
-        y_chunk = y[start:end].to(device, non_blocking=True)
-        Xty_chunk = X_full.T @ y_chunk.T
-        rhs_chunk = Xty_chunk + Pm[:, None]
-        if use_chol_A:
-            beta_chunk = torch.cholesky_solve(rhs_chunk, L_A)
+    Pm_unit = P @ m_bar                                            # (n_cols,)
+
+    if lambda_mode == "global":
+        # One A, one factor.
+        A = XtX + effective_weight * P
+        Pm = effective_weight * Pm_unit
+        try:
+            L_A = torch.linalg.cholesky(A)
+            use_chol_A = True
+        except torch.linalg.LinAlgError:
+            L_A = None
+            use_chol_A = False
+
+        for start in range(0, n_voxels, chunk_size):
+            end = min(start + chunk_size, n_voxels)
+            y_chunk = y[start:end].to(device, non_blocking=True)
+            Xty_chunk = X_full.T @ y_chunk.T
+            rhs_chunk = Xty_chunk + Pm[:, None]
+            if use_chol_A:
+                beta_chunk = torch.cholesky_solve(rhs_chunk, L_A)
+            else:
+                beta_chunk = torch.linalg.solve(A, rhs_chunk)
+            pred = (X_full @ beta_chunk).T
+            resid = y_chunk - pred
+            ss_res_chunk = (resid ** 2).sum(dim=1)
+
+            betas_full[start:end] = beta_chunk.T.cpu()
+            ss_res_constrained_full[start:end] = ss_res_chunk.cpu()
+            del y_chunk, Xty_chunk, rhs_chunk, beta_chunk, pred, resid, ss_res_chunk
+
+    else:  # voxelwise
+        # Per-voxel σ²_v from pass 1 OLS residuals; user multiplier
+        # rescales the whole grid (so prior_weight=auto → unit multiplier,
+        # prior_weight=2.0 → 2× σ²_v per voxel, etc.).
+        if isinstance(prior_weight, str):
+            user_mult = 1.0
         else:
-            beta_chunk = torch.linalg.solve(A, rhs_chunk)
-        pred = (X_full @ beta_chunk).T
-        resid = y_chunk - pred
-        ss_res_chunk = (resid ** 2).sum(dim=1)
+            user_mult = float(prior_weight)
+        sigma2_per_voxel = (ss_res_ols_full / dof).clamp_min(1e-30)  # CPU tensor
+        lambda_per_voxel_cpu = user_mult * sigma2_per_voxel             # (n_voxels,)
 
-        betas_full[start:end] = beta_chunk.T.cpu()
-        ss_res_constrained_full[start:end] = ss_res_chunk.cpu()
-        del y_chunk, Xty_chunk, rhs_chunk, beta_chunk, pred, resid, ss_res_chunk
+        # Quantile-bin: assign each voxel to one of ``lambda_n_bins``
+        # bins by σ² quantile.  Within a bin use the bin's median λ
+        # as the representative λ_b.
+        n_bins_eff = max(1, min(int(lambda_n_bins), n_voxels))
+        # torch.quantile + bucketize: edges at i/n_bins quantiles,
+        # for i = 1..n_bins-1.
+        if n_bins_eff > 1:
+            qs = torch.linspace(0.0, 1.0, n_bins_eff + 1)[1:-1].to(lambda_per_voxel_cpu.dtype)
+            edges = torch.quantile(lambda_per_voxel_cpu, qs)
+            voxel_bin = torch.bucketize(lambda_per_voxel_cpu, edges)
+        else:
+            voxel_bin = torch.zeros(n_voxels, dtype=torch.long)
+
+        # Per-bin representative λ = median of in-bin λ_v.
+        bin_lambda = torch.empty(n_bins_eff, dtype=torch.float64)
+        for b in range(n_bins_eff):
+            mask_b = voxel_bin == b
+            if mask_b.any():
+                bin_lambda[b] = lambda_per_voxel_cpu[mask_b].median()
+            else:
+                bin_lambda[b] = torch.tensor(0.0, dtype=torch.float64)
+
+        # Pre-factor one A per bin (small p×p matrices; ~20 of them).
+        chol_factors: dict[int, torch.Tensor | None] = {}
+        for b in range(n_bins_eff):
+            lam = float(bin_lambda[b].item())
+            A_b = XtX + lam * P
+            try:
+                chol_factors[b] = torch.linalg.cholesky(A_b)
+            except torch.linalg.LinAlgError:
+                chol_factors[b] = None
+        # Pm shared computation per bin too — Pm_b = λ_b · P · m̄.
+        # Lay out as a (n_bins, n_cols) tensor for fast per-voxel
+        # right-hand-side assembly.
+        Pm_per_bin = bin_lambda.to(Pm_unit.dtype).unsqueeze(1) * Pm_unit.cpu().unsqueeze(0)
+        Pm_per_bin = Pm_per_bin.to(device)
+
+        for start in range(0, n_voxels, chunk_size):
+            end = min(start + chunk_size, n_voxels)
+            y_chunk = y[start:end].to(device, non_blocking=True)
+            Xty_chunk = X_full.T @ y_chunk.T                       # (n_cols, chunk)
+            chunk_bins = voxel_bin[start:end].to(device)
+            # Per-voxel Pm: lookup from Pm_per_bin via the bin index.
+            # Shape: (n_cols, chunk).
+            Pm_chunk = Pm_per_bin[chunk_bins].T
+            rhs_chunk = Xty_chunk + Pm_chunk
+            # Solve per-bin within the chunk.  Group voxels by bin so
+            # we make one cholesky_solve call per (bin, chunk).
+            beta_chunk = torch.empty_like(rhs_chunk)
+            for b in range(n_bins_eff):
+                idx_in_chunk = (chunk_bins == b).nonzero(as_tuple=True)[0]
+                if idx_in_chunk.numel() == 0:
+                    continue
+                rhs_b = rhs_chunk[:, idx_in_chunk]
+                L_b = chol_factors[b]
+                if L_b is not None:
+                    beta_b = torch.cholesky_solve(rhs_b, L_b)
+                else:
+                    lam = float(bin_lambda[b].item())
+                    beta_b = torch.linalg.solve(XtX + lam * P, rhs_b)
+                beta_chunk[:, idx_in_chunk] = beta_b
+            pred = (X_full @ beta_chunk).T
+            resid = y_chunk - pred
+            ss_res_chunk = (resid ** 2).sum(dim=1)
+
+            betas_full[start:end] = beta_chunk.T.cpu()
+            ss_res_constrained_full[start:end] = ss_res_chunk.cpu()
+            del y_chunk, Xty_chunk, Pm_chunk, rhs_chunk, beta_chunk, pred, resid, ss_res_chunk
 
     # ----------- R² assembly + return -------------------------------
     r2 = 1.0 - ss_res_constrained_full / torch.clamp(ss_tot_full, min=1e-30)
@@ -778,6 +909,8 @@ def cv_basis_constrained_ridge(
     include_ols: bool = True,
     leave_n_out: int = 1,
     n_perms: int = 50,
+    lambda_mode: str = "global",
+    lambda_n_bins: int = 20,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> FLOBSCVResult:
@@ -990,6 +1123,8 @@ def cv_basis_constrained_ridge(
                     prior_weight=float(w),
                     device=device,
                     reconstruct_hrfs=False,
+                    lambda_mode=lambda_mode,
+                    lambda_n_bins=lambda_n_bins,
                 )
                 # fit.betas is numpy float64 — cast to match X_test
                 # dtype so the matmul below works.

@@ -270,6 +270,28 @@ def create_parser() -> argparse.ArgumentParser:
     # Constraint strength
     reg_opts = parser.add_argument_group("Constraint strength")
     reg_opts.add_argument(
+        "-lambda-mode", "-lambda_mode",
+        dest="lambda_mode",
+        choices=["global", "voxelwise"],
+        default="global",
+        help=(
+            "How λ is set per voxel.  ``global`` (current default): "
+            "one scalar λ for every voxel from σ²_mean across the "
+            "brain mask.  ``voxelwise``: per-voxel λ_v = σ²_v from "
+            "that voxel's own OLS residual variance — Bayesian-"
+            "honest at the voxel scale (high-SNR voxels get less "
+            "shrinkage, low-SNR more).  Implementation bins voxels "
+            "by σ² quantile (-lambda-n-bins, default 20) and Cholesky-"
+            "factors one matrix per bin; negligible extra cost."
+        ),
+    )
+    reg_opts.add_argument(
+        "-lambda-n-bins", "-lambda_n_bins",
+        dest="lambda_n_bins",
+        type=int, default=20, metavar="N",
+        help="σ² quantile bins for -lambda-mode voxelwise.",
+    )
+    reg_opts.add_argument(
         "-prior-weight", "-prior_weight",
         dest="prior_weight",
         default="auto",
@@ -661,6 +683,8 @@ def main() -> int:
         prior_weight=pw,
         device=device,
         reconstruct_hrfs=False,
+        lambda_mode=args.lambda_mode,
+        lambda_n_bins=args.lambda_n_bins,
     )
     print(f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
           f"effective λ={fit.effective_prior_weight:.4g}")
@@ -928,6 +952,8 @@ def main() -> int:
                 weight_grid=grid,
                 include_ols=True,
                 leave_n_out=int(args.cv_leave_n_out),
+                lambda_mode=args.lambda_mode,
+                lambda_n_bins=args.lambda_n_bins,
                 device=device,
                 verbose=args.verb >= 1,
             )
