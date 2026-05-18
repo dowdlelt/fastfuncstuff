@@ -1018,23 +1018,33 @@ def main() -> int:
                 )
             print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
 
-        # PC weights per trial (optional but useful for diagnostics) —
-        # only the constrained version, keep file count manageable.
-        # Stacked as (nx, ny, nz, n_trials, K).
+        # Basis weights per trial (optional but useful for diagnostics).
+        # One 4-D NIfTI per basis function: time axis = trial number.
+        # This makes each basis-coefficient trajectory directly
+        # viewable as a time series (basisweight01 = canonical amp
+        # across trials, basisweight02 = derivative, etc.) instead of
+        # the previous trial-major interleaving where coefficients
+        # for different basis functions were mixed.
         for cond, idxs in tqdm(
             per_cond_trial_idx.items(),
-            desc="  Single-trial pcweights", unit="cond",
+            desc="  Single-trial basis weights", unit="cond",
             leave=False, disable=len(per_cond_trial_idx) <= 1,
         ):
             stack = task_betas[:, idxs, :]            # (n_vox, n_trials, K)
             stack_ols = task_betas_ols[:, idxs, :]
             for arr, sfx in ((stack, ""), (stack_ols, "_unconstrained")):
-                vol = _to_volume(arr)                 # (nx,ny,nz,n_trials,K)
-                # Flatten last 2 dims for NIfTI 4D save: trial-major.
-                vol_4d = vol.reshape(nx, ny, nz, len(idxs) * n_basis)
-                path = f"{args.prefix}_fitbasis_pcweights_{cond}{sfx}{nii_ext}"
-                save_nifti(vol_4d, output_path=path, reference_img=args.input[0])
-                print(f"  Wrote {path}  (n_trials×K = {len(idxs)}×{n_basis})")
+                for b in range(n_basis):
+                    # (n_vox, n_trials) → (nx, ny, nz, n_trials)
+                    vol_4d = _to_volume(arr[:, :, b])
+                    path = (
+                        f"{args.prefix}_fitbasis_basisweight{b + 1:02d}_"
+                        f"{cond}{sfx}{nii_ext}"
+                    )
+                    save_nifti(vol_4d, output_path=path, reference_img=args.input[0])
+            print(
+                f"  Wrote basisweight01..{n_basis:02d} for {cond} "
+                f"(n_trials={len(idxs)})"
+            )
 
     else:
         # Per-condition outputs (the simple case)
@@ -1057,7 +1067,7 @@ def main() -> int:
             ):
                 w = _to_volume(tbetas[:, b_idx, :])
                 a = _to_volume(amps[:, b_idx][:, None]).squeeze(-1)
-                w_path = f"{args.prefix}_fitbasis_pcweights_{lbl}{sfx}{nii_ext}"
+                w_path = f"{args.prefix}_fitbasis_basisweights_{lbl}{sfx}{nii_ext}"
                 a_path = f"{args.prefix}_fitbasis_amplitude_{lbl}{sfx}{nii_ext}"
                 save_nifti(w, output_path=w_path, reference_img=args.input[0])
                 save_nifti(a, output_path=a_path, reference_img=args.input[0])
