@@ -91,6 +91,7 @@ try:
         cv_basis_constrained_ridge,
         decouple_amplitude_prior,
         fit_basis_constrained_ridge,
+        fit_basis_fracridge,
         flobs_prior,
         generate_flobs_basis,
         generate_spmg_basis,
@@ -174,7 +175,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     model_grp.add_argument(
         "-reg",
-        choices=["none", "ridge", "mvn", "mvn-shape"],
+        choices=["none", "ridge", "mvn", "mvn-shape", "fracridge"],
         default="mvn",
         help=(
             "Regularisation / shape prior:\n"
@@ -182,12 +183,16 @@ def create_parser() -> argparse.ArgumentParser:
             "  ridge     — diagonal generalised ridge with hand-picked weights;\n"
             "  mvn       — full MVN(m, C) prior (empirical from half-cosine "
             "samples for FLOBS; spmg_prior defaults for SPMG).  Closest to "
-            "filmbabe without full VB;\n"
-            "  mvn-shape — TR04MW2 §2.4 amplitude-decoupled prior: "
-            "constrain only the *shape* direction orthogonal to the prior "
-            "mean; leave amplitude unconstrained.  Directly fixes the "
-            "amplitude over-shrinkage on high-SNR voxels.  Recommended "
-            "whenever CV shows OLS winning the max-R² voxels."
+            "the VB shape-prior path without full VB;\n"
+            "  mvn-shape — amplitude-decoupled prior: constrain only the "
+            "*shape* direction orthogonal to the prior mean; leave "
+            "amplitude unconstrained.  Fixes amplitude over-shrinkage on "
+            "high-SNR voxels.\n"
+            "  fracridge — Rokem & Kay (2020) fractional ridge.  No HRF "
+            "prior at all; instead CV picks the per-voxel fraction of "
+            "||β_OLS|| to keep (-fracs grid).  Bypasses prior tuning "
+            "entirely — let the data decide how much shrinkage each "
+            "voxel needs."
         ),
     )
     model_grp.add_argument(
@@ -308,6 +313,18 @@ def create_parser() -> argparse.ArgumentParser:
             "as strong).  Ignored when -reg none."
         ),
     )
+    reg_opts.add_argument(
+        "-fracs",
+        dest="fracs",
+        default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
+        metavar="LIST",
+        help=(
+            "Comma-separated frac grid for -reg fracridge.  Each frac "
+            "is the fraction of ||β_OLS|| to retain (1.0=OLS, →0=max "
+            "shrinkage).  CV picks the best per voxel.  Default 0.1…1.0 "
+            "by 0.1."
+        ),
+    )
 
     # Processing
     proc = parser.add_argument_group("Processing")
@@ -395,8 +412,9 @@ def _build_prior(
                                  which isn't a thing for SPMG).
     """
     n_basis = basis.basis_functions.shape[0]
-    if reg == "none":
-        # Returned but ignored downstream (prior_weight forced to 0).
+    if reg in ("none", "fracridge"):
+        # Returned but ignored downstream (fracridge uses its own
+        # CV-tuned shrinkage; no MVN prior involved).
         return np.zeros(n_basis), np.eye(n_basis)
 
     # First build the base (m, C); then optionally decouple amplitude.
@@ -450,7 +468,7 @@ def _build_basis(args) -> FLOBSBasis:
 
 def _resolve_prior_weight_arg(arg: str | float, reg: str) -> float | str:
     """Translate the CLI string into a fit_basis_constrained_ridge value."""
-    if reg == "none":
+    if reg in ("none", "fracridge"):
         return 0.0
     val = str(arg).strip().lower()
     if val == "auto":
@@ -695,24 +713,58 @@ def main() -> int:
     # build amplitude / iresp downstream in voxel chunks via the
     # memory module's chunk-size estimator.
     print(f"\n  Fitting ({args.model} × {args.reg}) …")
-    fit = fit_basis_constrained_ridge(
-        data=packed.data_concat,
-        design_task=task_design,
-        basis_functions=basis.basis_functions,
-        prior_mean=prior_m,
-        prior_cov=prior_C,
-        n_blocks=n_blocks,
-        nuisance=nuisance,
-        prior_weight=pw,
-        device=device,
-        reconstruct_hrfs=False,
-        lambda_mode=args.lambda_mode,
-        lambda_n_bins=args.lambda_n_bins,
-    )
-    print(f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
-          f"effective λ={fit.effective_prior_weight:.4g}")
-    print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
-          f"constrained: {fit.r2.mean():.3f}")
+    if args.reg == "fracridge":
+        # fracridge has its own per-run nuisance projection and
+        # SVD-based multi-frac solver, so it bypasses the packed
+        # block-diag design entirely and consumes per_run_data /
+        # per_run_designs directly.  The dispatch keeps the
+        # downstream output code (amplitude, iresp, etc.) untouched
+        # because FracRidgeFitResult mirrors FLOBSFitResult's fields.
+        try:
+            fracs_grid = np.array(
+                [float(x) for x in args.fracs.split(",") if x.strip()],
+                dtype=np.float64,
+            )
+        except ValueError as e:
+            print(f"ERROR: -fracs must be comma-separated floats: {e}")
+            return 1
+        if fracs_grid.size == 0 or (fracs_grid <= 0).any() or (fracs_grid > 1).any():
+            print(f"ERROR: -fracs values must be in (0, 1]; got {fracs_grid.tolist()}")
+            return 1
+        fracs_grid.sort()
+        fit = fit_basis_fracridge(
+            per_run_data=per_run_data,
+            per_run_task_designs=per_run_designs,
+            n_blocks=n_blocks,
+            n_basis=n_basis,
+            polort=polort_resolved,
+            fracs=fracs_grid,
+            device=device,
+            verbose=True,
+        )
+        print(f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+              f"median optimal frac = {float(np.median(fit.optimal_fracs)):.2f}")
+        print(f"  Held-out R² mean — OLS (frac=1.0): {fit.r2_ols.mean():.3f}  "
+              f"fracridge optimal: {fit.r2.mean():.3f}")
+    else:
+        fit = fit_basis_constrained_ridge(
+            data=packed.data_concat,
+            design_task=task_design,
+            basis_functions=basis.basis_functions,
+            prior_mean=prior_m,
+            prior_cov=prior_C,
+            n_blocks=n_blocks,
+            nuisance=nuisance,
+            prior_weight=pw,
+            device=device,
+            reconstruct_hrfs=False,
+            lambda_mode=args.lambda_mode,
+            lambda_n_bins=args.lambda_n_bins,
+        )
+        print(f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+              f"effective λ={fit.effective_prior_weight:.4g}")
+        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
+              f"constrained: {fit.r2.mean():.3f}")
 
     # ── Reshape + save outputs ─────────────────────────────────────
     n_vox_masked = fit.betas.shape[0]
@@ -964,7 +1016,51 @@ def main() -> int:
     # regularization change (voxel-wise λ, amplitude decoupling,
     # fracridge) since each can be A/B-tested against held-out R².
     cv_result = None
-    if args.cv_runs:
+
+    # ── fracridge: write intrinsic per-frac CV maps ────────────────
+    # fracridge's CV is baked into the fit; no separate -cv-runs pass
+    # needed.  Always emit the optimal-frac map + the per-frac R² TSV
+    # (and 4-D NIfTI when -cv-runs is set, to match the MVN branch's
+    # outputs).
+    if args.reg == "fracridge":
+        from fastfuncstuff.design.flobs import FracRidgeFitResult
+        assert isinstance(fit, FracRidgeFitResult)            # narrow for type checker
+        fr: FracRidgeFitResult = fit
+        frac_tsv = f"{args.prefix}_fitbasis_cv_r2.tsv"
+        with open(frac_tsv, "w") as fh:
+            fh.write("frac\tmedian_r2\tmean_r2\tmax_r2\tn_voxels_best\n")
+            for j, frac_val in enumerate(fr.fracs):
+                col = fr.r2_by_frac[:, j]
+                n_best = int((np.argmax(fr.r2_by_frac, axis=1) == j).sum())
+                fh.write(
+                    f"{float(frac_val):.3f}\t{float(np.median(col)):.6f}\t"
+                    f"{float(np.mean(col)):.6f}\t{float(np.max(col)):.6f}\t"
+                    f"{n_best}\n"
+                )
+        print(f"  Wrote {frac_tsv}")
+
+        # Per-voxel optimal frac (3-D).
+        optfrac_3d = np.zeros(volume_shape, dtype=np.float32)
+        if mask is not None:
+            optfrac_3d[mask] = fr.optimal_fracs
+        else:
+            optfrac_3d = fr.optimal_fracs.reshape(volume_shape)
+        of_path = f"{args.prefix}_fitbasis_optimal_frac{nii_ext}"
+        save_nifti(optfrac_3d, output_path=of_path, reference_img=args.input[0])
+        print(f"  Wrote {of_path}")
+
+        if args.cv_runs:
+            r2_4d_shape = volume_shape + (fr.r2_by_frac.shape[1],)
+            r2_4d = np.zeros(r2_4d_shape, dtype=np.float32)
+            if mask is not None:
+                r2_4d[mask, :] = fr.r2_by_frac
+            else:
+                r2_4d = fr.r2_by_frac.reshape(r2_4d_shape)
+            r2_path = f"{args.prefix}_fitbasis_cv_r2_per_frac{nii_ext}"
+            save_nifti(r2_4d, output_path=r2_path, reference_img=args.input[0])
+            print(f"  Wrote {r2_path}  (4-D; volume k = held-out R² at fracs[k])")
+
+    if args.cv_runs and args.reg != "fracridge":
         if n_runs < 2:
             print(
                 f"  WARNING: -cv-runs requires ≥2 runs (got {n_runs}); skipping CV."

@@ -19,9 +19,11 @@ from fastfuncstuff.design.flobs import (
     FLOBSBasis,
     FLOBSCVResult,
     FLOBSFitResult,
+    FracRidgeFitResult,
     cv_basis_constrained_ridge,
     decouple_amplitude_prior,
     fit_basis_constrained_ridge,
+    fit_basis_fracridge,
     fit_flobs_constrained,
     flobs_prior,
     generate_flobs_basis,
@@ -633,3 +635,54 @@ def test_constrained_fit_two_conditions(basis):
         beta_c = fit.betas[:, c * n_b:(c + 1) * n_b]
         err = np.linalg.norm(beta_c - coefs[:, c], axis=1).mean()
         assert err < 1.5  # generous, just a sanity check
+
+
+# ---------- fit_basis_fracridge ---------------------------------------------
+
+
+def test_fracridge_returns_correct_shapes(basis):
+    per_run_data, per_run_task, _ = _build_multirun_synth(basis, n_runs=4, n_vox=25)
+    fit = fit_basis_fracridge(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_task,
+        n_blocks=1,
+        n_basis=basis.basis_functions.shape[0],
+        polort=2,
+        fracs=np.array([0.2, 0.5, 1.0]),
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert isinstance(fit, FracRidgeFitResult)
+    n_task = basis.basis_functions.shape[0]
+    assert fit.betas.shape == (25, n_task)
+    assert fit.betas_ols.shape == (25, n_task)
+    assert fit.r2.shape == (25,)
+    assert fit.r2_ols.shape == (25,)
+    assert fit.optimal_fracs.shape == (25,)
+    assert fit.r2_by_frac.shape == (25, 3)
+    # Optimal frac is the one that maximises r2_by_frac per voxel.
+    argmax_frac_idx = np.argmax(fit.r2_by_frac, axis=1)
+    assert np.allclose(fit.optimal_fracs, fit.fracs[argmax_frac_idx])
+    # r2 at optimal frac equals the max along the frac axis.
+    assert np.allclose(fit.r2, fit.r2_by_frac.max(axis=1))
+
+
+def test_fracridge_low_snr_prefers_shrinkage(basis):
+    """At low SNR, lots of voxels should pick a frac < 1.0 (some shrinkage)
+    rather than frac=1.0 (OLS).  Pure OLS overfits the held-out data."""
+    per_run_data, per_run_task, _ = _build_multirun_synth(
+        basis, n_runs=4, n_vox=80, noise_sigma=4.0,
+    )
+    fit = fit_basis_fracridge(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_task,
+        n_blocks=1,
+        n_basis=basis.basis_functions.shape[0],
+        polort=2,
+        fracs=np.linspace(0.1, 1.0, 10),
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    # At least half the voxels should prefer some shrinkage.
+    fraction_shrunk = float((fit.optimal_fracs < 1.0).mean())
+    assert fraction_shrunk > 0.5, f"only {fraction_shrunk:.2f} voxels shrunk"

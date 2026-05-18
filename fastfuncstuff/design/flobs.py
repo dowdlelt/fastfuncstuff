@@ -1159,6 +1159,251 @@ def cv_basis_constrained_ridge(
     )
 
 
+@dataclass
+class FracRidgeFitResult:
+    """Output of :func:`fit_basis_fracridge`.
+
+    Mirrors the fields of :class:`FLOBSFitResult` so the CLI can
+    consume both interchangeably, plus fracridge-specific fields.
+
+    Attributes
+    ----------
+    betas : np.ndarray, shape (n_voxels, n_task_cols)
+        Per-voxel task coefficients at each voxel's CV-optimal frac.
+        Nuisance was projected out up front, so there are no nuisance
+        columns — ``betas[:, :n_task_cols]`` is the full task block.
+    r2 : np.ndarray, shape (n_voxels,)
+        Held-out R² at the optimal frac.
+    betas_ols : np.ndarray, shape (n_voxels, n_task_cols)
+        OLS task betas (frac=1.0).
+    r2_ols : np.ndarray, shape (n_voxels,)
+        Held-out R² at frac=1.0 (the OLS baseline).
+    optimal_fracs : np.ndarray, shape (n_voxels,)
+        Per-voxel argmax over the frac grid.
+    r2_by_frac : np.ndarray, shape (n_voxels, n_fracs)
+        Held-out R² for every frac on the grid.
+    fracs : np.ndarray, shape (n_fracs,)
+        The frac grid evaluated (highest-to-lowest by convention).
+    n_iter : int
+        Always 1 for fracridge (single SVD pass).
+    sigma2_mean : float
+        Mean per-voxel residual variance from OLS pre-pass.  Kept for
+        :class:`FLOBSFitResult` API parity.
+    effective_prior_weight : float
+        Always 0 for fracridge — there is no MVN prior.  Kept for API
+        parity.
+    """
+
+    betas: np.ndarray
+    r2: np.ndarray
+    betas_ols: np.ndarray
+    r2_ols: np.ndarray
+    optimal_fracs: np.ndarray
+    r2_by_frac: np.ndarray
+    fracs: np.ndarray
+    n_iter: int = 1
+    sigma2_mean: float = 0.0
+    effective_prior_weight: float = 0.0
+
+
+def fit_basis_fracridge(
+    per_run_data: list[torch.Tensor],
+    per_run_task_designs: list[torch.Tensor],
+    n_blocks: int,
+    n_basis: int,
+    polort: int,
+    *,
+    fracs: np.ndarray | None = None,
+    leave_n_out: int = 1,
+    n_perms: int = 50,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> FracRidgeFitResult:
+    """Constrained basis-set fit via fractional ridge regression.
+
+    Alternative to the MVN-prior path: instead of constraining HRF
+    *shape* via (m, C), fracridge constrains the OLS coefficient
+    *norm* — keeping a fraction ``f ∈ [0, 1]`` of ``||β_OLS||`` per
+    voxel.  No HRF prior; the only knob is the fraction.  CV across
+    runs picks the per-voxel optimal fraction (GLMsingle convention).
+
+    Strategy:
+
+    1. Project per-run polynomials out of data + task design once.
+    2. LORO over the cleaned data; for each fold, fit all fracs in a
+       single SVD pass (``fastfuncstuff.glm.ridge._fit_ridge_multiple_fracs``),
+       predict the held-out fold, accumulate per-frac SS_res.
+    3. Per voxel, pick the frac with the highest held-out R².
+    4. Re-fit all fracs on the **full** cleaned design (one more SVD
+       pass) and gather per voxel at the optimal frac.
+
+    Returns
+    -------
+    FracRidgeFitResult
+    """
+    from fastfuncstuff.glm.ridge import _fit_ridge_multiple_fracs
+    from fastfuncstuff.glm.xval import (
+        generate_cv_splits,
+        project_out_nuisance_per_run,
+    )
+    from fastfuncstuff.design.builder import legendre_polynomials
+
+    if device is None:
+        device = get_device()
+    if fracs is None:
+        # ffs_ridge defaults; same grid GLMsingle uses by default.
+        fracs = np.linspace(0.1, 1.0, 10).astype(np.float64)
+    fracs = np.asarray(fracs, dtype=np.float64)
+    n_fracs = len(fracs)
+
+    n_runs = len(per_run_data)
+    if n_runs < 2:
+        raise ValueError(f"fracridge CV needs at least 2 runs; got {n_runs}")
+    n_task_cols = n_blocks * n_basis
+
+    n_tp_per_run = [d.shape[1] for d in per_run_data]
+    run_starts = [0]
+    for n in n_tp_per_run[:-1]:
+        run_starts.append(run_starts[-1] + n)
+
+    data_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)
+    n_voxels = data_full.shape[0]
+    design_full = torch.cat(
+        [t.to(device).float() for t in per_run_task_designs], dim=0
+    )
+
+    if polort >= 0:
+        nuisance_per_run = [
+            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort))
+            .to(device).float()
+            for r in range(n_runs)
+        ]
+        if verbose:
+            print(
+                f"  fracridge: projecting out per-run polynomials "
+                f"(polort={polort}, {polort + 1} cols × {n_runs} runs)…"
+            )
+        data_clean, design_clean = project_out_nuisance_per_run(
+            data=data_full,
+            design=design_full,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=device,
+            verbose=False,
+        )
+    else:
+        data_clean, design_clean = data_full, design_full
+    del data_full, design_full
+
+    run_ends = [run_starts[r] + n_tp_per_run[r] for r in range(n_runs)]
+    y_clean_mean = data_clean.mean(dim=1, keepdim=True)
+    ss_tot_full = ((data_clean - y_clean_mean) ** 2).sum(dim=1).double()
+
+    splits = generate_cv_splits(n_runs, strategy=leave_n_out, n_perms=n_perms)
+    n_splits = len(splits)
+    if verbose:
+        print(
+            f"  fracridge: {n_splits} splits (leave-{leave_n_out}-out), "
+            f"{n_fracs} fracs in [{fracs.min():.2f}, {fracs.max():.2f}]"
+        )
+
+    # SS_res accumulator: (n_fracs, n_voxels), float64 for numeric stability.
+    ss_res_accum = torch.zeros(n_fracs, n_voxels, dtype=torch.float64, device=device)
+
+    for fold_idx, (train_runs, test_runs) in enumerate(splits):
+        train_rows = torch.cat([
+            torch.arange(run_starts[r], run_ends[r], device=device)
+            for r in train_runs
+        ])
+        test_rows = torch.cat([
+            torch.arange(run_starts[r], run_ends[r], device=device)
+            for r in test_runs
+        ])
+        X_train = design_clean[train_rows]                  # (n_tp_tr, n_task)
+        X_test = design_clean[test_rows]                    # (n_tp_te, n_task)
+        y_train = data_clean[:, train_rows]                 # (n_voxels, n_tp_tr)
+        y_test = data_clean[:, test_rows]                   # (n_voxels, n_tp_te)
+
+        # _fit_ridge_multiple_fracs expects y as (n_samples, n_targets).
+        coefs = _fit_ridge_multiple_fracs(
+            X=X_train, y=y_train.T, fracs=fracs, device=device,
+        )                                                   # (n_task, n_fracs, n_voxels)
+
+        # Predict per frac: (n_tp_te, n_voxels) for each frac.
+        # einsum: X_test (T,F) @ coefs (F,K,V) -> (T,K,V) -> err (K,T,V) -> (K,V)
+        y_pred = torch.einsum("tf,fkv->tkv", X_test, coefs)  # (T, n_fracs, V)
+        resid = y_test.T.unsqueeze(1) - y_pred              # (T, n_fracs, V)
+        ss_res_accum += (resid ** 2).sum(dim=0).double()
+
+        if verbose and ((fold_idx + 1) % max(1, n_splits // 5) == 0
+                        or fold_idx == n_splits - 1):
+            print(f"    fold {fold_idx + 1}/{n_splits}")
+
+        del X_train, X_test, y_train, y_test, coefs, y_pred, resid
+
+    # Held-out R² per frac per voxel.  ss_tot_full is (V,); broadcast to (F, V).
+    r2_by_frac_t = 1.0 - ss_res_accum / torch.clamp(ss_tot_full.unsqueeze(0), min=1e-30)
+    r2_by_frac = r2_by_frac_t.cpu().numpy().T.astype(np.float32)  # (V, n_fracs)
+
+    optimal_fracs_idx = np.argmax(r2_by_frac, axis=1)               # (V,)
+    optimal_fracs = fracs[optimal_fracs_idx].astype(np.float32)
+    r2_optimal = r2_by_frac[np.arange(n_voxels), optimal_fracs_idx]
+
+    # ── Final fit on full cleaned data, all fracs ────────────────────
+    if verbose:
+        print(f"  fracridge: final SVD fit on full data ({n_voxels:,} voxels × {n_fracs} fracs)…")
+    final_coefs = _fit_ridge_multiple_fracs(
+        X=design_clean, y=data_clean.T, fracs=fracs, device=device,
+    )                                                       # (n_task, n_fracs, n_voxels)
+
+    # Gather per-voxel optimal frac.
+    opt_idx_t = torch.from_numpy(optimal_fracs_idx).to(device=device, dtype=torch.long)
+    # final_coefs[:, opt_idx, voxel] for each voxel — use gather along dim=1.
+    # final_coefs shape (n_task, n_fracs, n_voxels) → (n_task, n_voxels) by selecting
+    # frac index per voxel.  Build a (1, 1, n_voxels) index, expand to (n_task, 1, n_voxels).
+    gather_idx = opt_idx_t.view(1, 1, -1).expand(n_task_cols, 1, -1)
+    betas_opt = final_coefs.gather(1, gather_idx).squeeze(1)  # (n_task, n_voxels)
+    betas = betas_opt.T.cpu().numpy().astype(np.float64)      # (n_voxels, n_task)
+
+    # OLS baseline = frac=1.0 coefficients (last entry if grid ends at 1.0).
+    if np.isclose(fracs[-1], 1.0):
+        ols_idx = n_fracs - 1
+    else:
+        ols_idx = int(np.argmin(np.abs(fracs - 1.0)))
+    betas_ols = final_coefs[:, ols_idx, :].T.cpu().numpy().astype(np.float64)
+    r2_ols = r2_by_frac[:, ols_idx]
+
+    del final_coefs, betas_opt
+
+    # σ²_mean from OLS residuals on full cleaned data — preserved for API parity
+    # and for downstream Bayesian-weight comparison with the MVN path.
+    y_pred_ols = torch.from_numpy(betas_ols).to(device=device, dtype=design_clean.dtype) @ design_clean.T
+    resid_ols = data_clean - y_pred_ols
+    n_total_tp = data_clean.shape[1]
+    sigma2_mean = float(((resid_ols ** 2).sum(dim=1) / max(1, n_total_tp - n_task_cols)).mean().item())
+    del y_pred_ols, resid_ols
+
+    if verbose:
+        print(
+            f"  fracridge: median held-out R² = {float(np.median(r2_optimal)):.4f}, "
+            f"mean = {float(np.mean(r2_optimal)):.4f}; "
+            f"median optimal frac = {float(np.median(optimal_fracs)):.2f}"
+        )
+
+    return FracRidgeFitResult(
+        betas=betas,
+        r2=r2_optimal.astype(np.float32),
+        betas_ols=betas_ols,
+        r2_ols=r2_ols.astype(np.float32),
+        optimal_fracs=optimal_fracs,
+        r2_by_frac=r2_by_frac,
+        fracs=fracs.astype(np.float32),
+        n_iter=1,
+        sigma2_mean=sigma2_mean,
+        effective_prior_weight=0.0,
+    )
+
+
 def fit_flobs_constrained(
     data: np.ndarray | torch.Tensor,
     design_task: np.ndarray | torch.Tensor,
