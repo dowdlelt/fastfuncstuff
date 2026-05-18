@@ -1109,6 +1109,13 @@ def cv_basis_constrained_ridge(
             device=device,
             verbose=False,
         )
+        # See fit_basis_fracridge for rationale — project_out forces
+        # CPU storage for large datasets; LORO slicing needs them on
+        # the compute device.
+        if data_clean.device != device:
+            data_clean = data_clean.to(device)
+        if design_clean.device != device:
+            design_clean = design_clean.to(device)
     else:
         data_clean, design_clean = data_full, design_full
 
@@ -1364,6 +1371,16 @@ def fit_basis_fracridge(
             device=device,
             verbose=False,
         )
+        # project_out_nuisance_per_run allocates the result on CPU
+        # when the dataset is large (>~1 GB) — its design is built
+        # for streaming, not for an in-loop LORO slice.  Push back
+        # to the compute device so train_rows / test_rows (on cuda)
+        # can index data_clean directly.  For 9.4T scale (~1.4 GB
+        # data) this is ~1.4 GB of VRAM, easy on any modern card.
+        if data_clean.device != device:
+            data_clean = data_clean.to(device)
+        if design_clean.device != device:
+            design_clean = design_clean.to(device)
     else:
         data_clean, design_clean = data_full, design_full
     del data_full, design_full
