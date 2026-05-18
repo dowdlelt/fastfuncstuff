@@ -92,6 +92,7 @@ try:
         ARMAWhitenCell,
         FLOBSFitResult,
         bin_and_whiten_arma11,
+        compute_per_voxel_residuals,
         cv_basis_constrained_ridge,
         decouple_amplitude_prior,
         estimate_and_apply_arma11_prewhitening,
@@ -336,6 +337,29 @@ def create_parser() -> argparse.ArgumentParser:
             "and run the constrained fit per cell.  Suppresses the "
             "trial-to-trial amplitude oscillation that autocorrelated "
             "noise induces.  Not yet supported with -reg fracridge."
+        ),
+    )
+    reg_opts.add_argument(
+        "-vb-iters", "-vb_iters",
+        dest="vb_iters",
+        type=int, default=0, metavar="N",
+        help=(
+            "Variational-Bayes iteration count for -prewhiten arma11-voxel "
+            "(FSL filmbabe-style loop, TR04MW2 §3).  ``0`` (default) runs "
+            "the single-pass per-voxel ARMA path.  ``N >= 1`` re-estimates "
+            "(a, b) from the current constrained-fit residuals and re-fits, "
+            "stopping early when the median |Δ(a, b)| < -vb-tol or N is "
+            "reached.  2-3 iterations is the FSL norm; more rarely helps."
+        ),
+    )
+    reg_opts.add_argument(
+        "-vb-tol", "-vb_tol",
+        dest="vb_tol",
+        type=float, default=0.05, metavar="FLOAT",
+        help=(
+            "Convergence threshold on median |Δa| + |Δb| across voxels "
+            "between successive VB iterations.  Default 0.05 (one grid "
+            "step in a; tighter values rarely change the final β)."
         ),
     )
     reg_opts.add_argument(
@@ -808,70 +832,137 @@ def main() -> int:
         n_voxels_total = sum(c.voxel_indices.size for c in arma_cells)
         n_poly_per_run = (polort_resolved + 1) if polort_resolved >= 0 else 0
         n_total_cols = n_task_cols + n_runs * n_poly_per_run
-        betas_all = np.zeros((n_voxels_total, n_total_cols), dtype=np.float64)
-        betas_ols_all = np.zeros_like(betas_all)
-        r2_all = np.zeros(n_voxels_total, dtype=np.float32)
-        r2_ols_all = np.zeros_like(r2_all)
-        sigma2_sum = 0.0
-        eff_pw_sum = 0.0
 
-        cell_iter = tqdm(
-            arma_cells, total=len(arma_cells),
-            desc="  Cells × constrained fit", unit="cell",
-            leave=False, disable=len(arma_cells) <= 1,
-        )
-        for cell in cell_iter:
-            packed_cell = pack_for_shared_task_glm(
-                per_run_data=cell.per_run_data,
-                per_run_task_designs=cell.per_run_task_designs,
-                polort=-1,                          # polys go via extra
-                task_column_labels=task_column_labels,
-                extra_regressors_per_run=cell.per_run_polys,
-                device=device,
-            )
-            task_design_cell = packed_cell.design_concat[:, :n_task_cols]
-            nuisance_cell = (
-                packed_cell.design_concat[:, n_task_cols:]
-                if packed_cell.design_concat.shape[1] > n_task_cols else None
-            )
-            cell_fit = fit_basis_constrained_ridge(
-                data=packed_cell.data_concat,
-                design_task=task_design_cell,
-                basis_functions=basis.basis_functions,
-                prior_mean=prior_m,
-                prior_cov=prior_C,
-                n_blocks=n_blocks,
-                nuisance=nuisance_cell,
-                prior_weight=pw,
-                device=device,
-                reconstruct_hrfs=False,
-                lambda_mode=args.lambda_mode,
-                lambda_n_bins=args.lambda_n_bins,
-            )
-            idx = cell.voxel_indices
-            betas_all[idx] = cell_fit.betas[:, :n_total_cols]
-            betas_ols_all[idx] = cell_fit.betas_ols[:, :n_total_cols]
-            r2_all[idx] = cell_fit.r2.astype(np.float32)
-            r2_ols_all[idx] = cell_fit.r2_ols.astype(np.float32)
-            sigma2_sum += cell_fit.sigma2_mean * idx.size
-            eff_pw_sum += cell_fit.effective_prior_weight * idx.size
+        def _run_cell_fit(cells: list[ARMAWhitenCell]) -> FLOBSFitResult:
+            betas_all = np.zeros((n_voxels_total, n_total_cols), dtype=np.float64)
+            betas_ols_all = np.zeros_like(betas_all)
+            r2_all = np.zeros(n_voxels_total, dtype=np.float32)
+            r2_ols_all = np.zeros_like(r2_all)
+            sigma2_sum = 0.0
+            eff_pw_sum = 0.0
 
-        fit = FLOBSFitResult(
-            betas=betas_all,
-            hrfs=None,                              # type: ignore[arg-type]
-            r2=r2_all,
-            betas_ols=betas_ols_all,
-            hrfs_ols=None,                          # type: ignore[arg-type]
-            r2_ols=r2_ols_all,
-            sigma2_mean=sigma2_sum / max(1, n_voxels_total),
-            effective_prior_weight=eff_pw_sum / max(1, n_voxels_total),
-            n_iter=1,
-        )
-        print(f"  ✓ Per-voxel ARMA fit complete.  "
+            cell_iter = tqdm(
+                cells, total=len(cells),
+                desc="  Cells × constrained fit", unit="cell",
+                leave=False, disable=len(cells) <= 1,
+            )
+            for cell in cell_iter:
+                packed_cell = pack_for_shared_task_glm(
+                    per_run_data=cell.per_run_data,
+                    per_run_task_designs=cell.per_run_task_designs,
+                    polort=-1,                          # polys go via extra
+                    task_column_labels=task_column_labels,
+                    extra_regressors_per_run=cell.per_run_polys,
+                    device=device,
+                )
+                task_design_cell = packed_cell.design_concat[:, :n_task_cols]
+                nuisance_cell = (
+                    packed_cell.design_concat[:, n_task_cols:]
+                    if packed_cell.design_concat.shape[1] > n_task_cols else None
+                )
+                cell_fit = fit_basis_constrained_ridge(
+                    data=packed_cell.data_concat,
+                    design_task=task_design_cell,
+                    basis_functions=basis.basis_functions,
+                    prior_mean=prior_m,
+                    prior_cov=prior_C,
+                    n_blocks=n_blocks,
+                    nuisance=nuisance_cell,
+                    prior_weight=pw,
+                    device=device,
+                    reconstruct_hrfs=False,
+                    lambda_mode=args.lambda_mode,
+                    lambda_n_bins=args.lambda_n_bins,
+                )
+                idx = cell.voxel_indices
+                betas_all[idx] = cell_fit.betas[:, :n_total_cols]
+                betas_ols_all[idx] = cell_fit.betas_ols[:, :n_total_cols]
+                r2_all[idx] = cell_fit.r2.astype(np.float32)
+                r2_ols_all[idx] = cell_fit.r2_ols.astype(np.float32)
+                sigma2_sum += cell_fit.sigma2_mean * idx.size
+                eff_pw_sum += cell_fit.effective_prior_weight * idx.size
+
+            return FLOBSFitResult(
+                betas=betas_all,
+                hrfs=None,                              # type: ignore[arg-type]
+                r2=r2_all,
+                betas_ols=betas_ols_all,
+                hrfs_ols=None,                          # type: ignore[arg-type]
+                r2_ols=r2_ols_all,
+                sigma2_mean=sigma2_sum / max(1, n_voxels_total),
+                effective_prior_weight=eff_pw_sum / max(1, n_voxels_total),
+                n_iter=1,
+            )
+
+        fit = _run_cell_fit(arma_cells)
+        print(f"  ✓ Per-voxel ARMA fit complete (iter 0).  "
               f"σ²_mean={fit.sigma2_mean:.4g}, "
               f"effective λ_mean={fit.effective_prior_weight:.4g}")
         print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
               f"constrained: {fit.r2.mean():.3f}")
+
+        # ── VB iterative loop (filmbabe §3) ────────────────────────
+        # Each iteration:
+        #   1. Compute residuals in the original space from the
+        #      current (a, b)-whitened fit's β.
+        #   2. Re-estimate per-voxel (a, b) by REML on the residuals
+        #      (intercept-only design — pure noise-covariance fit).
+        #   3. Convergence test: median |Δa| + |Δb| < -vb-tol.
+        #   4. Re-bin / re-whiten cells and refit.
+        # Under REML the (a, b) estimate is independent of β when
+        # using the full design Y — but feeding residuals back is
+        # what makes the iteration meaningful: the AR fit now sees
+        # the *cleaner* noise structure left after the constrained
+        # β has absorbed task + nuisance variance.
+        if args.vb_iters >= 1 and arma_ab_per_voxel is not None:
+            for vb_iter in range(1, args.vb_iters + 1):
+                print(f"\n  VB iter {vb_iter}/{args.vb_iters}…")
+                # 1. Residuals in original space.
+                nuis_betas_arr = (
+                    fit.betas[:, n_task_cols:]
+                    if fit.betas.shape[1] > n_task_cols else None
+                )
+                residuals_per_run = compute_per_voxel_residuals(
+                    per_run_data=per_run_data,
+                    per_run_task_designs=per_run_designs,
+                    polort=polort_resolved,
+                    task_betas=fit.betas[:, :n_task_cols],
+                    nuisance_betas=nuis_betas_arr,
+                    device=device,
+                )
+                # 2. Re-estimate (a, b) from residuals.  Use polort=-1
+                # (residuals are already drift-free).
+                new_ab = estimate_arma11_per_voxel(
+                    per_run_data=residuals_per_run,
+                    per_run_task_designs=per_run_designs,
+                    polort=-1,
+                    device=device, verbose=True,
+                )
+                # 3. Convergence.
+                delta = np.abs(new_ab - arma_ab_per_voxel).sum(axis=1)
+                median_delta = float(np.median(delta))
+                print(
+                    f"  VB iter {vb_iter}: median |Δa|+|Δb| = "
+                    f"{median_delta:.4f}  (tol={args.vb_tol})"
+                )
+                arma_ab_per_voxel = new_ab
+                if median_delta < args.vb_tol:
+                    print(f"  VB converged at iter {vb_iter}.")
+                    break
+                # 4. Re-bin + re-fit.
+                arma_cells = bin_and_whiten_arma11(
+                    per_run_data=per_run_data,
+                    per_run_task_designs=per_run_designs,
+                    arma_per_voxel=arma_ab_per_voxel,
+                    polort=polort_resolved,
+                    device=device, verbose=True,
+                )
+                fit = _run_cell_fit(arma_cells)
+                print(
+                    f"  VB iter {vb_iter} fit: σ²_mean={fit.sigma2_mean:.4g}, "
+                    f"R² constrained={fit.r2.mean():.3f}"
+                )
+            print(f"  ✓ VB loop complete after {vb_iter} iter(s).")
 
     elif args.reg == "fracridge":
         # fracridge has its own per-run nuisance projection and

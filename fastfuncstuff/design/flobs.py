@@ -1850,6 +1850,84 @@ def bin_and_whiten_arma11(
     return cells
 
 
+def compute_per_voxel_residuals(
+    per_run_data: list[torch.Tensor],
+    per_run_task_designs: list[torch.Tensor],
+    polort: int,
+    *,
+    task_betas: np.ndarray,
+    nuisance_betas: np.ndarray | None,
+    device: torch.device | None = None,
+) -> list[torch.Tensor]:
+    """Compute residuals ``e = y − (X_task β_task + Z β_nuis)`` per run.
+
+    Works in the **original (un-whitened) space** even when the betas
+    were fit in a whitened domain.  Under prewhitening, the constrained
+    GLS β estimates are identical for whitened and un-whitened X
+    (the whitening just transforms the noise covariance, not the
+    parameter); so the per-voxel betas plug into the un-whitened
+    design without further transformation.
+
+    Used by the VB-style iterative loop to feed residuals back into a
+    fresh per-voxel ARMA REML estimate.
+
+    Parameters
+    ----------
+    per_run_data : list[Tensor], each (n_vox, n_tp_run)
+        Original (un-whitened) data per run.
+    per_run_task_designs : list[Tensor], each (n_tp_run, n_task)
+        Original task design per run.
+    polort : int
+        Polynomial nuisance degree (``-1`` disables; matches the
+        original fit's choice).
+    task_betas : np.ndarray, shape (n_vox, n_task)
+        Per-voxel task coefficients.
+    nuisance_betas : np.ndarray | None, shape (n_vox, n_runs × (polort+1))
+        Per-voxel nuisance coefficients in block-diagonal layout
+        (run-major: cols ``r·k:(r+1)·k`` belong to run ``r``).
+        ``None`` skips the nuisance contribution.
+
+    Returns
+    -------
+    list[Tensor], each (n_vox, n_tp_run)
+        Residuals per run (on ``device``).
+    """
+    from fastfuncstuff.design.builder import legendre_polynomials
+
+    if device is None:
+        device = get_device()
+
+    n_runs = len(per_run_data)
+    n_poly = polort + 1 if polort >= 0 else 0
+    task_betas_t = torch.from_numpy(task_betas).to(device=device, dtype=torch.float32)
+    nuis_betas_t = (
+        torch.from_numpy(nuisance_betas).to(device=device, dtype=torch.float32)
+        if (nuisance_betas is not None and n_poly > 0)
+        else None
+    )
+
+    residuals: list[torch.Tensor] = []
+    for r in range(n_runs):
+        n_tp_r = per_run_data[r].shape[1]
+        X_task_r = per_run_task_designs[r].to(device).float()    # (n_tp_r, n_task)
+        y_r = per_run_data[r].to(device).float()                 # (n_vox, n_tp_r)
+
+        # Task prediction: (n_vox, n_task) @ (n_task, n_tp_r) → (n_vox, n_tp_r)
+        y_pred = task_betas_t @ X_task_r.T
+
+        # Nuisance prediction (run r's slice of the block-diag betas).
+        if nuis_betas_t is not None and n_poly > 0:
+            Z_r = torch.from_numpy(
+                legendre_polynomials(n_tp_r, polort)
+            ).to(device=device, dtype=torch.float32)             # (n_tp_r, n_poly)
+            nuis_beta_r = nuis_betas_t[:, r * n_poly:(r + 1) * n_poly]
+            y_pred = y_pred + nuis_beta_r @ Z_r.T
+
+        residuals.append(y_r - y_pred)
+
+    return residuals
+
+
 def estimate_and_apply_arma11_prewhitening(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],
