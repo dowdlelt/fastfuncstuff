@@ -554,14 +554,17 @@ def fit_basis_constrained_ridge(
     if device is None:
         device = get_device()
 
-    # Keep data on CPU; the chunked solver below streams slices to the
-    # compute device.  Moving the whole array up front blows GPU
-    # memory for typical fMRI volumes (300k voxels × ~1000 TR × 8 B
-    # ≈ 2.5 GB), and we don't need it all there at once.
+    # Respect the caller's device choice.  Data on cuda stays on
+    # cuda; data on CPU stays on CPU.  The chunked solver below
+    # streams slices to the compute device — when source and target
+    # are the same device that's a no-op view, so passing pre-loaded
+    # cuda data avoids unnecessary host↔device transfers per chunk.
+    # (Old code forced CPU "for safety" and re-uploaded chunks every
+    # call — wasteful for cuda users with enough memory.)
     y = (
-        torch.as_tensor(data, dtype=torch.float64, device="cpu")
+        torch.as_tensor(data, dtype=torch.float64)
         if not isinstance(data, torch.Tensor)
-        else data.to(device="cpu", dtype=torch.float64)
+        else data.to(dtype=torch.float64)
     )
     X = (
         torch.as_tensor(design_task, dtype=torch.float64, device=device)
@@ -1268,6 +1271,129 @@ def spmg_prior(
             [canonical_std**2, derivative_std**2, dispersion_std**2]
         ).astype(np.float64)
     return m, C
+
+
+def decouple_amplitude_prior(
+    prior_mean: np.ndarray,
+    prior_cov: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert a full MVN(m, C) prior into the **amplitude-decoupled** form.
+
+    TR04MW2 §2.4 reparameterises ``β = D · ŝ`` — amplitude scalar
+    times unit-norm shape vector — with the prior on ``ŝ`` only.
+    Amplitude is never shrunk; only the shape direction is
+    constrained.  This directly fixes the "amplitudes too small"
+    pathology that CV exposed on high-SNR voxels (TR04MW2 §3 fig 4
+    discusses the same trade-off).
+
+    Implementation as a closed-form generalised ridge:
+
+    1. Pick the amplitude direction ``u = m / ||m||``.  This is the
+       direction in K-D coefficient space along which the prior
+       *expects* an HRF to live.
+    2. Build a Householder-style orthonormal rotation ``R`` whose
+       first column is ``u``.  In this rotated frame, the first
+       coordinate is "amplitude", the remaining K-1 coordinates are
+       "shape".
+    3. The rotated covariance is ``C_r = Rᵀ C R``; the shape sub-
+       covariance is ``C_r[1:, 1:]``.  Set the amplitude row/column
+       to **zero precision** (no penalty in that direction), leaving
+       only the shape precision ``inv(C_r[1:, 1:])``.
+    4. Rotate the resulting precision back to the original frame:
+       ``P_decoupled = R · diag(0, inv(C_r[1:, 1:])) · Rᵀ``.
+
+    The decoupled "mean" is zero — since amplitude is unconstrained
+    we don't pull toward any specific magnitude; the *direction* of
+    the prior was encoded by the rotation.
+
+    Pass the returned ``(m_decoupled, C_decoupled)`` directly to
+    :func:`fit_basis_constrained_ridge` and the rest of the solver
+    works unchanged.
+
+    Parameters
+    ----------
+    prior_mean : np.ndarray, shape (K,)
+        Original prior mean.  Must be non-zero — there's no
+        amplitude direction to decouple from a zero mean.
+    prior_cov : np.ndarray, shape (K, K)
+        Original prior covariance.  Symmetric positive-definite.
+
+    Returns
+    -------
+    m_decoupled : np.ndarray, shape (K,)
+        Zero vector (the prior is centred at the origin in the
+        rotated frame).
+    C_decoupled : np.ndarray, shape (K, K)
+        Pseudo-covariance.  Inverting gives the rank-(K-1) precision
+        matrix that's zero along the amplitude direction.  We return
+        a covariance form so the existing solver can call
+        ``np.linalg.inv(prior_cov)`` and get the right precision —
+        we add a tiny regularizer along the amplitude direction so
+        the inversion is numerically stable but the effective
+        precision in that direction is ~zero.
+    """
+    K = prior_mean.shape[0]
+    if K == 1:
+        # Degenerate: no shape direction to decouple from.  Return a
+        # very weak prior (effectively unconstrained amplitude).
+        return np.zeros(1), np.array([[1e12]])
+    norm_m = float(np.linalg.norm(prior_mean))
+    if norm_m < 1e-12:
+        raise ValueError(
+            "decouple_amplitude_prior: prior_mean is ~zero — no amplitude "
+            "direction to decouple.  Use the plain prior or set a non-zero "
+            "mean (e.g. spmg_prior(canonical_mean=2.0))."
+        )
+    u = prior_mean / norm_m
+
+    # Build R whose first column is u (Gram–Schmidt of [u | I]).
+    R = np.zeros((K, K), dtype=np.float64)
+    R[:, 0] = u
+    fill_idx = 1
+    for k in range(K):
+        if fill_idx == K:
+            break
+        e_k = np.zeros(K); e_k[k] = 1.0
+        # Project off all previously-collected R columns.
+        v = e_k - R[:, :fill_idx] @ (R[:, :fill_idx].T @ e_k)
+        nv = np.linalg.norm(v)
+        if nv > 1e-10:
+            R[:, fill_idx] = v / nv
+            fill_idx += 1
+    # Numerical safety: re-orthonormalise via QR.
+    Q, _ = np.linalg.qr(R)
+    # Ensure first column is still u (QR may flip signs).
+    sign = np.sign(Q[:, 0] @ u)
+    if sign == 0:
+        sign = 1.0
+    Q[:, 0] = sign * Q[:, 0]
+    R = Q
+
+    # Shape block in rotated frame.
+    C_r = R.T @ prior_cov @ R
+    C_shape = C_r[1:, 1:]
+    P_shape = np.linalg.inv(C_shape)                   # (K-1, K-1)
+
+    # Build rotated precision: amplitude precision = 0, shape = P_shape.
+    P_r = np.zeros((K, K), dtype=np.float64)
+    P_r[1:, 1:] = P_shape
+
+    # Rotate precision back: P_decoupled = R · P_r · Rᵀ.
+    P_decoupled = R @ P_r @ R.T
+
+    # Return as a covariance for API uniformity.  Invert with a tiny
+    # ridge along the amplitude direction so the matrix is stably
+    # invertible (the solver inverts C internally to get P).  The
+    # effective precision in the amplitude direction is then
+    # 1/(1e12) = ~0, exactly what we want.
+    amp_proj = np.outer(u, u)                          # rank-1 amplitude
+    C_decoupled = P_decoupled + 1e-12 * amp_proj       # ensure full rank
+    C_decoupled = np.linalg.inv(C_decoupled)
+    # Symmetrize.
+    C_decoupled = 0.5 * (C_decoupled + C_decoupled.T)
+
+    m_decoupled = np.zeros(K, dtype=np.float64)
+    return m_decoupled, C_decoupled
 
 
 def ridge_prior(

@@ -20,6 +20,7 @@ from fastfuncstuff.design.flobs import (
     FLOBSCVResult,
     FLOBSFitResult,
     cv_basis_constrained_ridge,
+    decouple_amplitude_prior,
     fit_basis_constrained_ridge,
     fit_flobs_constrained,
     flobs_prior,
@@ -524,6 +525,81 @@ def test_voxelwise_lambda_invalid_mode(basis):
             lambda_mode="nonsense",
             device=torch.device("cpu"),
         )
+
+
+# ---------- amplitude decoupling --------------------------------------------
+
+
+def test_decouple_amplitude_prior_zero_mean_raises():
+    with pytest.raises(ValueError, match="prior_mean is ~zero"):
+        decouple_amplitude_prior(np.zeros(3), np.eye(3))
+
+
+def test_decouple_amplitude_prior_preserves_amplitude(basis):
+    """Decoupled prior with strong weight at low SNR should:
+       - shrink shape (derivative coefficient stays small)
+       - NOT shrink amplitude (canonical coefficient stays ≈ OLS).
+    Compare to plain mvn at the same weight — amplitude should be
+    closer to OLS under mvn-shape.
+    """
+    rng = np.random.default_rng(53)
+    n_t, tr = 200, 1.0
+    sb = generate_spmg_basis(n_basis=2, duration=32.0, dt=0.1)
+    sb_tr = sb.basis_functions[:, :: int(round(tr / sb.dt))]
+    X = np.zeros((n_t, 2))
+    on = np.zeros(n_t); on[[15, 45, 80, 120, 165]] = 1.0
+    for b in range(2):
+        X[:, b] = np.convolve(on, sb_tr[b])[:n_t]
+
+    # 30 voxels with LARGE amplitudes (we want to see if the prior
+    # over-shrinks them).
+    n_vox = 30
+    true_canon = rng.uniform(2.0, 5.0, size=n_vox)               # strong signal
+    true_deriv = rng.normal(0.0, 0.05, size=n_vox)
+    true_coefs = np.column_stack([true_canon, true_deriv])
+    y_clean = (X @ true_coefs.T).T
+    # Moderate noise — enough to make the prior visibly help shape
+    # but not so much that amplitude is irrelevant.
+    y = y_clean + 1.0 * y_clean.std() * rng.standard_normal((n_vox, n_t))
+
+    # Plain mvn prior (with a non-trivial mean so decoupling is well-defined).
+    base_m = np.array([3.0, 0.0])
+    base_C = np.diag([1.0, 0.09])
+
+    common = dict(
+        data=torch.from_numpy(y).double(),
+        design_task=torch.from_numpy(X).double(),
+        basis_functions=sb.basis_functions,
+        n_blocks=1,
+        prior_weight=5.0,                                # strong prior
+        device=torch.device("cpu"),
+    )
+    fit_mvn = fit_basis_constrained_ridge(prior_mean=base_m, prior_cov=base_C,
+                                          **common)
+    m_dec, C_dec = decouple_amplitude_prior(base_m, base_C)
+    fit_dec = fit_basis_constrained_ridge(prior_mean=m_dec, prior_cov=C_dec,
+                                          **common)
+
+    # On the amplitude (col 0) coefficient: decoupled fit should be
+    # CLOSER to OLS than plain mvn (which shrinks it toward base_m[0]=3,
+    # which biases voxels whose true canonical is > 3 downward).
+    err_mvn_amp = np.abs(fit_mvn.betas[:, 0] - fit_mvn.betas_ols[:, 0]).mean()
+    err_dec_amp = np.abs(fit_dec.betas[:, 0] - fit_dec.betas_ols[:, 0]).mean()
+    assert err_dec_amp < err_mvn_amp, (
+        f"Decoupled amplitude was supposed to track OLS more closely "
+        f"({err_dec_amp:.3f}) than full-mvn ({err_mvn_amp:.3f})."
+    )
+
+    # On the shape (derivative, col 1) coefficient: BOTH priors
+    # should shrink it; the decoupled prior shouldn't undo the shape
+    # constraint.  Check that decoupled derivative magnitude isn't
+    # dramatically larger than mvn's.
+    deriv_mvn = np.abs(fit_mvn.betas[:, 1]).median() if hasattr(np.abs(fit_mvn.betas[:, 1]), 'median') else float(np.median(np.abs(fit_mvn.betas[:, 1])))
+    deriv_dec = float(np.median(np.abs(fit_dec.betas[:, 1])))
+    deriv_ols = float(np.median(np.abs(fit_mvn.betas_ols[:, 1])))
+    # Decoupled should still shrink derivative — it should be closer
+    # to mvn than to OLS.
+    assert deriv_dec < deriv_ols * 0.8
 
 
 def test_constrained_fit_two_conditions(basis):

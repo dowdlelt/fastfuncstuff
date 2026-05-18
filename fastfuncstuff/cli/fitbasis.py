@@ -89,6 +89,7 @@ try:
     from fastfuncstuff.design.flobs import (
         FLOBSBasis,
         cv_basis_constrained_ridge,
+        decouple_amplitude_prior,
         fit_basis_constrained_ridge,
         flobs_prior,
         generate_flobs_basis,
@@ -173,16 +174,20 @@ def create_parser() -> argparse.ArgumentParser:
     )
     model_grp.add_argument(
         "-reg",
-        choices=["none", "ridge", "mvn"],
+        choices=["none", "ridge", "mvn", "mvn-shape"],
         default="mvn",
         help=(
             "Regularisation / shape prior:\n"
-            "  none  — plain OLS, no shape constraint (see how it fails);\n"
-            "  ridge — diagonal generalised ridge with hand-picked per-basis "
-            "weights (defaults via spmg_prior / ridge_prior);\n"
-            "  mvn   — multivariate-normal shape prior; for FLOBS this is "
-            "the empirical (m, C) from half-cosine samples — closest to "
-            "filmbabe without full VB.  Default: mvn."
+            "  none      — plain OLS, no shape constraint (see how it fails);\n"
+            "  ridge     — diagonal generalised ridge with hand-picked weights;\n"
+            "  mvn       — full MVN(m, C) prior (empirical from half-cosine "
+            "samples for FLOBS; spmg_prior defaults for SPMG).  Closest to "
+            "filmbabe without full VB;\n"
+            "  mvn-shape — TR04MW2 §2.4 amplitude-decoupled prior: "
+            "constrain only the *shape* direction orthogonal to the prior "
+            "mean; leave amplitude unconstrained.  Directly fixes the "
+            "amplitude over-shrinkage on high-SNR voxels.  Recommended "
+            "whenever CV shows OLS winning the max-R² voxels."
         ),
     )
     model_grp.add_argument(
@@ -393,23 +398,36 @@ def _build_prior(
     if reg == "none":
         # Returned but ignored downstream (prior_weight forced to 0).
         return np.zeros(n_basis), np.eye(n_basis)
+
+    # First build the base (m, C); then optionally decouple amplitude.
     if model == "FLOBS":
-        if reg == "mvn":
-            return flobs_prior(basis)
-        # ridge: isotropic with std picked from FLOBS empirical scale
-        std = float(np.sqrt(np.median(np.diag(basis.C))))
-        return ridge_prior(n_basis, coefficient_std=max(std, 1e-3))
-    # SPMG family
-    if model == "SPMG1":
-        return ridge_prior(1, coefficient_std=canonical_std)
-    if model == "SPMG2":
-        return spmg_prior(canonical_std=canonical_std,
-                          derivative_std=derivative_std)
-    if model == "SPMG3":
-        return spmg_prior(canonical_std=canonical_std,
-                          derivative_std=derivative_std,
-                          dispersion_std=dispersion_std)
-    raise ValueError(f"Unknown model {model}")
+        if reg in ("mvn", "mvn-shape"):
+            base_m, base_C = flobs_prior(basis)
+        else:                                              # ridge
+            std = float(np.sqrt(np.median(np.diag(basis.C))))
+            base_m, base_C = ridge_prior(n_basis, coefficient_std=max(std, 1e-3))
+    elif model == "SPMG1":
+        base_m, base_C = ridge_prior(1, coefficient_std=canonical_std)
+    elif model == "SPMG2":
+        base_m, base_C = spmg_prior(canonical_std=canonical_std,
+                                    derivative_std=derivative_std)
+    elif model == "SPMG3":
+        base_m, base_C = spmg_prior(canonical_std=canonical_std,
+                                    derivative_std=derivative_std,
+                                    dispersion_std=dispersion_std)
+    else:
+        raise ValueError(f"Unknown model {model}")
+
+    if reg == "mvn-shape":
+        # Need a non-zero mean to define the amplitude direction.
+        if np.linalg.norm(base_m) < 1e-12:
+            # SPMG default has zero mean; pick the canonical-amplitude
+            # axis (first basis function) as the amplitude direction.
+            base_m = np.zeros(n_basis, dtype=np.float64)
+            base_m[0] = float(canonical_std)              # arbitrary positive direction
+        return decouple_amplitude_prior(base_m, base_C)
+
+    return base_m, base_C
 
 
 def _build_basis(args) -> FLOBSBasis:
@@ -647,6 +665,11 @@ def main() -> int:
     ]
 
     # ── Pack shared-task + block-diag polys ────────────────────────
+    # Pack on the compute device so the fit doesn't waste cycles
+    # bouncing the data back and forth.  load_and_preprocess_runs
+    # produces data on CPU (memory-friendly), so this is the
+    # one-time host→device transfer; from here through the solver
+    # it stays on the chosen device.
     packed = pack_for_shared_task_glm(
         per_run_data=per_run_data,
         per_run_task_designs=per_run_designs,
@@ -654,7 +677,7 @@ def main() -> int:
         task_column_labels=[
             f"{lbl}#PC{b}" for lbl in block_labels for b in range(n_basis)
         ],
-        device=torch.device("cpu"),
+        device=device,
     )
     n_task_cols = packed.n_task_cols
     print(f"  Design: {packed.design_concat.shape}  "
@@ -811,14 +834,29 @@ def main() -> int:
         if save_full_iresp else None
     )
 
+    def _signed_peak(hrfs: np.ndarray) -> np.ndarray:
+        """Peak of the reconstructed HRF, **preserving sign**.
+
+        Voxels with inverted BOLD responses (e.g. CSF-adjacent voxels,
+        or anti-correlated networks) have HRFs whose largest deflection
+        is *negative*.  Taking ``hrfs.max(axis=-1)`` reports +0.05 for
+        such voxels (the tiny positive ripple before the trough),
+        which makes second-level maps look uniformly positive.  Instead
+        pick the time-point with the largest *absolute* value and
+        report the signed value there — positive peaks stay positive,
+        negative troughs come out as negative numbers.
+        """
+        idx = np.argmax(np.abs(hrfs), axis=-1, keepdims=True)
+        return np.take_along_axis(hrfs, idx, axis=-1).squeeze(-1)
+
     for start in range(0, n_vox_masked, chunk_size):
         end = min(start + chunk_size, n_vox_masked)
         # Amplitude is computed at basis.dt (high res) so peak finding
-        # captures the actual max even if iresp_dt is coarse.
+        # captures the actual extremum even if iresp_dt is coarse.
         hrfs_chunk_hi = task_betas[start:end] @ basis.basis_functions
         hrfs_ols_chunk_hi = task_betas_ols[start:end] @ basis.basis_functions
-        amplitude[start:end] = hrfs_chunk_hi.max(axis=2).astype(np.float32)
-        amplitude_ols[start:end] = hrfs_ols_chunk_hi.max(axis=2).astype(np.float32)
+        amplitude[start:end] = _signed_peak(hrfs_chunk_hi).astype(np.float32)
+        amplitude_ols[start:end] = _signed_peak(hrfs_ols_chunk_hi).astype(np.float32)
         if iresp_buf is not None:
             # Save at the coarser iresp_dt grid (10-20× smaller).
             iresp_buf[start:end] = (
