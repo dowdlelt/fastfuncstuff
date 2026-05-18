@@ -1675,8 +1675,17 @@ def bin_and_whiten_arma11(
     explicit list — feed them to ``pack_for_shared_task_glm`` via
     ``extra_regressors_per_run`` (with ``polort=-1``) so the
     canonical packer doesn't add un-whitened polys back in.
+
+    Cholesky factors are computed in **one batched call per unique
+    run length** on the compute device — for the typical equal-runs
+    case that's a single ``torch.linalg.cholesky((n_cells, n_t,
+    n_t))`` launch on GPU instead of ``n_cells × n_runs`` separate
+    CPU calls.
     """
-    from fastfuncstuff.glm.arma import build_arma11_covariance
+    from fastfuncstuff.glm.arma import (
+        build_arma11_covariance,
+        build_arma11_covariance_batch,
+    )
     from fastfuncstuff.design.builder import legendre_polynomials
 
     if device is None:
@@ -1716,6 +1725,78 @@ def bin_and_whiten_arma11(
             f"covering {arma_per_voxel.shape[0]:,} voxels"
         )
 
+    # ── Batched Cholesky per unique run length ──────────────────────
+    # For the typical equal-runs case this is ONE batched call on the
+    # compute device instead of ``len(unique_keys) × n_runs`` small
+    # CPU Choleskys (which was the visible CPU usage in the cell loop).
+    # We index L_per_run[run_idx][cell_idx] inside the whitening loop.
+    unique_run_lengths = sorted(set(n_tp_per_run))
+    # Build R_batch for each (a, b) at each unique length once.
+    R_by_length: dict[int, tuple[torch.Tensor, list[tuple[float, float]]]] = {}
+    a_tensor = torch.tensor([k[0] for k in unique_keys],
+                            dtype=torch.float32, device=device)
+    b_tensor = torch.tensor([k[1] for k in unique_keys],
+                            dtype=torch.float32, device=device)
+    if verbose:
+        print(
+            f"  ARMA whiten: batched Cholesky for {len(unique_keys)} cells "
+            f"× {len(unique_run_lengths)} unique run length(s) on {device}…"
+        )
+    for n_t in unique_run_lengths:
+        # build_arma11_covariance_batch takes (a_grid, b_grid) and
+        # returns all valid pairs.  We want the diagonal — a[i] paired
+        # with b[i] — so call it per cell length and pull out the
+        # subset we asked for.  In practice the valid set drops some
+        # pairs (λ ≤ 0), so we fall back to per-cell on misses.
+        R_one_grid, _, param_list_one = build_arma11_covariance_batch(
+            a_tensor, b_tensor, n_t, device, dtype=torch.float32,
+        )
+        # param_list_one is the Cartesian product, not the diagonal.
+        # Map (a, b) → index into the returned batch.
+        lookup = {(float(p[0]), float(p[1])): i for i, p in enumerate(param_list_one)}
+        R_select_idx: list[int] = []
+        missing: list[int] = []
+        for ci, (a, b) in enumerate(unique_keys):
+            j = lookup.get((float(a), float(b)))
+            if j is None:
+                missing.append(ci)
+                R_select_idx.append(-1)
+            else:
+                R_select_idx.append(j)
+        R_select_idx_t = torch.tensor(R_select_idx, dtype=torch.long, device=device)
+        # Build the per-cell stack via index_select where valid, else
+        # fall back to the scalar call (rare; happens at λ <= 0 corners).
+        R_stack = torch.empty(
+            (len(unique_keys), n_t, n_t), dtype=torch.float32, device=device,
+        )
+        valid_mask = R_select_idx_t >= 0
+        if valid_mask.any():
+            R_stack[valid_mask] = R_one_grid.index_select(
+                0, R_select_idx_t[valid_mask],
+            )
+        for ci in missing:
+            a, b = unique_keys[ci]
+            R_r = build_arma11_covariance(
+                float(a), float(b), n_t, device, dtype=torch.float32,
+            )
+            if R_r is None:
+                raise ValueError(
+                    f"build_arma11_covariance failed for (a={a}, b={b}, n={n_t}); "
+                    "(a, b) was selected per-voxel but the grid rejects it."
+                )
+            R_stack[ci] = R_r
+        # Batched Cholesky on device — one kernel launch.
+        L_stack = torch.linalg.cholesky(R_stack)
+        del R_stack, R_one_grid, R_select_idx_t, valid_mask
+        # Cache: keyed by run length, then (a, b) → L tensor.
+        R_by_length[n_t] = (L_stack, [k for k in unique_keys])
+
+    # Per-run L lookup: run r uses the L_stack for length n_tp_per_run[r].
+    L_per_run = []
+    for r in range(n_runs):
+        L_stack, keys_in_stack = R_by_length[n_tp_per_run[r]]
+        L_per_run.append({k: L_stack[i] for i, k in enumerate(keys_in_stack)})
+
     cells: list[ARMAWhitenCell] = []
     cell_iter = tqdm(
         unique_keys, total=len(unique_keys),
@@ -1733,17 +1814,7 @@ def bin_and_whiten_arma11(
         poly_w_runs: list[torch.Tensor] = [] if polys_raw_per_run is not None else None  # type: ignore[assignment]
         data_w_runs: list[torch.Tensor] = []
         for r in range(n_runs):
-            R_r = build_arma11_covariance(
-                float(a), float(b), n_tp_per_run[r],
-                torch.device("cpu"), dtype=torch.float32, run_starts=None,
-            )
-            if R_r is None:
-                raise ValueError(
-                    f"build_arma11_covariance failed for "
-                    f"(a={a}, b={b}, n={n_tp_per_run[r]})"
-                )
-            L_r = torch.linalg.cholesky(R_r).to(device)
-            del R_r
+            L_r = L_per_run[r][(a, b)]
 
             # Whiten task design (shared across all voxels in cell).
             X_task_r = design_task_per_run_dev[r]
@@ -1766,7 +1837,7 @@ def bin_and_whiten_arma11(
                 L_r, y_cell_r.T, upper=False,
             ).T
             data_w_runs.append(y_cell_w)
-            del L_r, y_cell_r, y_cell_w
+            del y_cell_r, y_cell_w
 
         cells.append(ARMAWhitenCell(
             a=float(a), b=float(b),
