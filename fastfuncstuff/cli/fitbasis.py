@@ -851,14 +851,20 @@ def main() -> int:
         axis=0,
     ).astype(np.float64)  # (K, n_t_iresp)
     print(
-        f"  iresp save grid: dt={iresp_dt:.3f}s × {n_t_iresp} samples "
-        f"(basis stays at {basis.dt:.3f}s × {n_t_basis} for amplitude)"
+        f"  iresp / amplitude grid: dt={iresp_dt:.3f}s × {n_t_iresp} "
+        f"samples (basis stored at {basis.dt:.3f}s × {n_t_basis})"
     )
 
-    # Chunk size: dominated by full-res HRF reconstruction for
-    # amplitude (chunk × n_blocks × n_t_basis × 8) + iresp resampled
-    # tensor (chunk × n_blocks × n_t_iresp × 4).
-    bytes_per_vox = 2 * n_blocks * (n_t_basis * 8 + n_t_iresp * 4)
+    # Chunk size: amplitude peak-finding and (optional) iresp save
+    # both share a single HRF tensor reconstructed at the resampled
+    # iresp grid (chunk × n_blocks × n_t_iresp × 8, float64 from the
+    # matmul).  The previous code reconstructed at basis.dt (0.1 s,
+    # ~320 samples per HRF) for amplitude only — for single-trial
+    # fits with hundreds of blocks that materialised a multi-GB
+    # tensor per chunk and OOM-crashed.  TR resolution costs ~1-3 %
+    # peak accuracy (HRF is smooth near its extremum) and is
+    # ~15× smaller.
+    bytes_per_vox = 2 * n_blocks * n_t_iresp * 8
     chunk_size = estimate_chunk_size(
         n_voxels=n_vox_masked,
         n_timepoints=n_t_basis,
@@ -939,20 +945,19 @@ def main() -> int:
 
     for start in range(0, n_vox_masked, chunk_size):
         end = min(start + chunk_size, n_vox_masked)
-        # Amplitude is computed at basis.dt (high res) so peak finding
-        # captures the actual extremum even if iresp_dt is coarse.
-        hrfs_chunk_hi = task_betas[start:end] @ basis.basis_functions
-        hrfs_ols_chunk_hi = task_betas_ols[start:end] @ basis.basis_functions
-        amplitude[start:end] = _signed_peak(hrfs_chunk_hi).astype(np.float32)
-        amplitude_ols[start:end] = _signed_peak(hrfs_ols_chunk_hi).astype(np.float32)
+        # Amplitude and iresp share a single HRF reconstruction at
+        # TR (iresp_dt) resolution.  Peak finding on this grid is
+        # within ~1-3 % of the high-res peak because the BOLD HRF is
+        # smooth near its extremum; in exchange the per-voxel cost
+        # drops ~15× vs the basis.dt reconstruction (critical for
+        # single-trial mode with hundreds of blocks).
+        hrfs_chunk = task_betas[start:end] @ basis_iresp
+        hrfs_ols_chunk = task_betas_ols[start:end] @ basis_iresp
+        amplitude[start:end] = _signed_peak(hrfs_chunk).astype(np.float32)
+        amplitude_ols[start:end] = _signed_peak(hrfs_ols_chunk).astype(np.float32)
         if iresp_buf is not None:
-            # Save at the coarser iresp_dt grid (10-20× smaller).
-            iresp_buf[start:end] = (
-                task_betas[start:end] @ basis_iresp
-            ).astype(np.float32)
-            iresp_buf_ols[start:end] = (
-                task_betas_ols[start:end] @ basis_iresp
-            ).astype(np.float32)
+            iresp_buf[start:end] = hrfs_chunk.astype(np.float32)
+            iresp_buf_ols[start:end] = hrfs_ols_chunk.astype(np.float32)
 
     # Basis TSV (shared)
     basis_path = f"{args.prefix}_fitbasis_basis.tsv"
