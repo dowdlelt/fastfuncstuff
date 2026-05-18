@@ -1534,28 +1534,76 @@ def estimate_arma11_per_voxel(
             f"  per-voxel ARMA: precomputing REML grid "
             f"({len(a_grid)} a × {len(b_grid)} b) over {total_tp} TR…"
         )
-    grid = precompute_reml_grid(
-        X=X_full,
-        n_timepoints=total_tp,
-        a_grid=a_grid,
-        b_grid=b_grid,
-        device=device,
-        verbose=verbose,
-        run_starts=run_starts,
-    )
+
+    # cholesky_on_cpu default = True in ffs_reml's typical large-grid
+    # use case (saves VRAM at the cost of CPU work).  Here we're
+    # specifically inside a GPU-targeted CLI: if the user asked for
+    # cuda we precompute on cuda end-to-end so the BLAS-3 GEMMs in
+    # the search loop don't fall to slow CPU paths.  MPS still gets
+    # CPU Cholesky (float64 / triangular-solve flake on MPS).
+    grid_on_gpu = device.type == "cuda"
+    try:
+        grid = precompute_reml_grid(
+            X=X_full,
+            n_timepoints=total_tp,
+            a_grid=a_grid,
+            b_grid=b_grid,
+            device=device,
+            verbose=verbose,
+            cholesky_on_cpu=not grid_on_gpu,
+            run_starts=run_starts,
+        )
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        # OOM on GPU — fall back to CPU precompute, then move per-cell
+        # entries to device inside the search loop.
+        if grid_on_gpu and ("out of memory" in str(e).lower() or
+                            isinstance(e, torch.cuda.OutOfMemoryError)):
+            if verbose:
+                print(
+                    "  per-voxel ARMA: GPU precompute OOM; falling back "
+                    "to cholesky_on_cpu=True (search loop will stream "
+                    "grid entries device-side)."
+                )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            grid = precompute_reml_grid(
+                X=X_full,
+                n_timepoints=total_tp,
+                a_grid=a_grid,
+                b_grid=b_grid,
+                device=device,
+                verbose=verbose,
+                cholesky_on_cpu=True,
+                run_starts=run_starts,
+            )
+        else:
+            raise
+
     if not grid:
         raise RuntimeError(
             "precompute_reml_grid returned no valid (a, b) pairs — "
             "check that the design is well-conditioned."
         )
 
+    # If the grid lives on CPU, the search-loop matmul `L_inv @ Y.T`
+    # requires Y on CPU too (or vice versa).  search_voxels_precomputed_grid
+    # only normalises Y to its `device` argument — when grid is CPU and
+    # device is cuda, we silently get a mismatch.  Pin Y to wherever
+    # the grid actually lives.
+    grid_device = next(iter(grid.values()))["L_inv"].device
+    Y_search = Y_full.to(grid_device) if Y_full.device != grid_device else Y_full
+    X_search = X_full.to(grid_device) if X_full.device != grid_device else X_full
+
     if verbose:
-        print(f"  per-voxel ARMA: REML search over {n_voxels:,} voxels …")
+        print(
+            f"  per-voxel ARMA: REML search over {n_voxels:,} voxels "
+            f"(grid on {grid_device})…"
+        )
     best_params, _ = search_voxels_precomputed_grid(
-        X=X_full,
-        Y_batch=Y_full,
+        X=X_search,
+        Y_batch=Y_search,
         precomputed_grid=grid,
-        device=device,
+        device=grid_device,
         verbose=verbose,
     )
     return best_params.detach().cpu().numpy().astype(np.float32)
