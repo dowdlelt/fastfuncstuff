@@ -1400,27 +1400,42 @@ def fit_basis_fracridge(
     # SS_res accumulator: (n_fracs, n_voxels), float64 for numeric stability.
     ss_res_accum = torch.zeros(n_fracs, n_voxels, dtype=torch.float64, device=device)
 
-    # Voxel chunk size for the prediction step.  Per-voxel cost during
-    # prediction is roughly ``3 × n_tp_test × n_fracs × 4 bytes``
-    # (y_pred + resid + (resid**2) intermediate), which at 9.4T scale
-    # (306k voxels × 288 TR × 10 fracs) is ~3.5 GB per tensor and
-    # OOMs a 16 GB card after data_clean + coefs are already resident.
-    # Bound the prediction workspace to ~25 % of free VRAM.
+    # Voxel chunk size, used for BOTH:
+    #  (a) the SVD fit itself — _fit_ridge_multiple_fracs materialises
+    #      ``Vt.T @ ridge_flat`` of size ``n_features × (n_fracs · V)``,
+    #      which at 9.4T single-trial scale (n_features=432, V=306k,
+    #      n_fracs=10) is ~5 GB and OOMs on a 16 GB card.  Passing
+    #      ``chunk_size`` switches the function to streaming-over-y
+    #      mode (y stays on CPU, chunks of ``chunk_size`` voxels are
+    #      moved to device per iteration, result returned on CPU).
+    #  (b) the prediction step — y_pred + resid + (resid**2) is
+    #      ``3 × n_tp_test × n_fracs × 4`` bytes per voxel, ~3.5 GB
+    #      at 9.4T scale.
+    #
+    # The per-voxel cost is dominated by whichever phase has more
+    # intermediates.  SVD phase per voxel: roughly
+    # ``2 × n_features × n_fracs × 4`` bytes (ridge_coef_rotated_all
+    # + coefs_flat slice).  Prediction phase per voxel: roughly
+    # ``3 × n_tp_test_max × n_fracs × 4``.  Take the max, target 25 %
+    # of free VRAM.
+    n_features = design_clean.shape[1]
     n_tp_test_max = max(n_tp_per_run)
     if device.type == "cuda":
         try:
             free_bytes, _ = torch.cuda.mem_get_info(device)
         except Exception:
             free_bytes = 4 * 1024 ** 3
+        bytes_per_vox_svd = 2 * n_features * n_fracs * 4
         bytes_per_vox_pred = 3 * n_tp_test_max * n_fracs * 4
-        v_chunk = max(1, int(free_bytes * 0.25 / max(bytes_per_vox_pred, 1)))
+        bytes_per_vox = max(bytes_per_vox_svd, bytes_per_vox_pred)
+        v_chunk = max(1, int(free_bytes * 0.25 / max(bytes_per_vox, 1)))
         v_chunk = min(v_chunk, n_voxels)
     else:
         v_chunk = n_voxels                                  # CPU: no chunking needed
     if verbose:
         n_v_chunks = (n_voxels + v_chunk - 1) // v_chunk
         print(
-            f"  fracridge: prediction in {n_v_chunks} voxel "
+            f"  fracridge: SVD fit + prediction in {n_v_chunks} voxel "
             f"chunk{'s' if n_v_chunks > 1 else ''} of {v_chunk:,}"
         )
 
@@ -1444,16 +1459,27 @@ def fit_basis_fracridge(
         y_test = data_clean[:, test_rows]                   # (n_voxels, n_tp_te)
 
         # _fit_ridge_multiple_fracs expects y as (n_samples, n_targets).
+        # On cuda we pass chunk_size to keep ``Vt.T @ ridge_flat``
+        # bounded — the non-chunked path materialises a 5+ GB tensor
+        # at 9.4T single-trial scale.  The chunked path returns coefs
+        # on CPU; we move slices to device during prediction.
+        use_chunked = device.type == "cuda" and v_chunk < n_voxels
         coefs = _fit_ridge_multiple_fracs(
             X=X_train, y=y_train.T, fracs=fracs, device=device,
+            chunk_size=(v_chunk if use_chunked else None),
         )                                                   # (n_task, n_fracs, n_voxels)
+        coefs_on_cpu = use_chunked                          # tracks where coefs live
 
         # Chunked prediction: einsum materialises a (T, F, V) tensor
         # which is ~3.5 GB for 9.4T-scale data and 10 fracs.  Loop
-        # voxel-chunks instead so peak VRAM is bounded.
+        # voxel-chunks instead so peak VRAM is bounded.  If coefs are
+        # on CPU from the chunked SVD path, move each slice to device
+        # before the einsum.
         for v0 in range(0, n_voxels, v_chunk):
             v1 = min(v0 + v_chunk, n_voxels)
             coefs_chunk = coefs[:, :, v0:v1]                # (n_task, n_fracs, V_c)
+            if coefs_on_cpu:
+                coefs_chunk = coefs_chunk.to(device, non_blocking=True)
             y_pred = torch.einsum(
                 "tf,fkv->tkv", X_test, coefs_chunk,
             )                                               # (T, n_fracs, V_c)
@@ -1462,6 +1488,8 @@ def fit_basis_fracridge(
             del coefs_chunk, y_pred, resid
 
         del X_train, X_test, y_train, y_test, coefs
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # Held-out R² per frac per voxel.  ss_tot_full is (V,); broadcast to (F, V).
     r2_by_frac_t = 1.0 - ss_res_accum / torch.clamp(ss_tot_full.unsqueeze(0), min=1e-30)
@@ -1473,37 +1501,72 @@ def fit_basis_fracridge(
 
     # ── Final fit on full cleaned data, all fracs ────────────────────
     if verbose:
-        print(f"  fracridge: final SVD fit on full data ({n_voxels:,} voxels × {n_fracs} fracs)…")
+        print(
+            f"  fracridge: final SVD fit on full data ({n_voxels:,} "
+            f"voxels × {n_fracs} fracs)…"
+        )
+    # Same VRAM constraint as the LORO fit — use the chunked path on
+    # cuda.  Result is on CPU, so the gather + numpy-cast at the end
+    # happens on host (no extra D→H transfer beyond the final betas).
+    use_chunked_final = device.type == "cuda" and v_chunk < n_voxels
     final_coefs = _fit_ridge_multiple_fracs(
         X=design_clean, y=data_clean.T, fracs=fracs, device=device,
+        chunk_size=(v_chunk if use_chunked_final else None),
     )                                                       # (n_task, n_fracs, n_voxels)
 
-    # Gather per-voxel optimal frac.
-    opt_idx_t = torch.from_numpy(optimal_fracs_idx).to(device=device, dtype=torch.long)
-    # final_coefs[:, opt_idx, voxel] for each voxel — use gather along dim=1.
-    # final_coefs shape (n_task, n_fracs, n_voxels) → (n_task, n_voxels) by selecting
-    # frac index per voxel.  Build a (1, 1, n_voxels) index, expand to (n_task, 1, n_voxels).
+    # Gather per-voxel optimal frac.  When the SVD path was chunked,
+    # final_coefs lives on CPU; do gather on CPU too.
+    if use_chunked_final:
+        opt_idx_t = torch.from_numpy(optimal_fracs_idx).long()
+    else:
+        opt_idx_t = torch.from_numpy(optimal_fracs_idx).to(
+            device=device, dtype=torch.long,
+        )
     gather_idx = opt_idx_t.view(1, 1, -1).expand(n_task_cols, 1, -1)
     betas_opt = final_coefs.gather(1, gather_idx).squeeze(1)  # (n_task, n_voxels)
-    betas = betas_opt.T.cpu().numpy().astype(np.float64)      # (n_voxels, n_task)
+    betas = betas_opt.T.cpu().numpy().astype(np.float64) if betas_opt.is_cuda \
+        else betas_opt.T.numpy().astype(np.float64)           # (n_voxels, n_task)
 
     # OLS baseline = frac=1.0 coefficients (last entry if grid ends at 1.0).
     if np.isclose(fracs[-1], 1.0):
         ols_idx = n_fracs - 1
     else:
         ols_idx = int(np.argmin(np.abs(fracs - 1.0)))
-    betas_ols = final_coefs[:, ols_idx, :].T.cpu().numpy().astype(np.float64)
+    betas_ols_slice = final_coefs[:, ols_idx, :]
+    betas_ols = (
+        betas_ols_slice.T.cpu().numpy().astype(np.float64)
+        if betas_ols_slice.is_cuda
+        else betas_ols_slice.T.numpy().astype(np.float64)
+    )
     r2_ols = r2_by_frac[:, ols_idx]
 
-    del final_coefs, betas_opt
+    del final_coefs, betas_opt, betas_ols_slice
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    # σ²_mean from OLS residuals on full cleaned data — preserved for API parity
-    # and for downstream Bayesian-weight comparison with the MVN path.
-    y_pred_ols = torch.from_numpy(betas_ols).to(device=device, dtype=design_clean.dtype) @ design_clean.T
-    resid_ols = data_clean - y_pred_ols
+    # σ²_mean from OLS residuals on full cleaned data — preserved for
+    # API parity and for downstream Bayesian-weight comparison with the
+    # MVN path.  Chunked over voxels: materialising y_pred_ols + resid
+    # full-size is 2 × (n_voxels × n_t) × 4 bytes, ~2.8 GB at 9.4T
+    # scale, which combined with data_clean (1.4 GB) exhausts VRAM
+    # right after the SVD fit.
     n_total_tp = data_clean.shape[1]
-    sigma2_mean = float(((resid_ols ** 2).sum(dim=1) / max(1, n_total_tp - n_task_cols)).mean().item())
-    del y_pred_ols, resid_ols
+    dof = max(1, n_total_tp - n_task_cols)
+    sigma2_sum = 0.0
+    betas_ols_t = torch.from_numpy(betas_ols).to(
+        device=device, dtype=design_clean.dtype,
+    )
+    Xt = design_clean.T                                     # (n_task, n_t)
+    for v0 in range(0, n_voxels, v_chunk):
+        v1 = min(v0 + v_chunk, n_voxels)
+        y_pred_chunk = betas_ols_t[v0:v1] @ Xt              # (V_c, n_t)
+        resid_chunk = data_clean[v0:v1] - y_pred_chunk
+        sigma2_sum += float((resid_chunk ** 2).sum().item()) / dof
+        del y_pred_chunk, resid_chunk
+    sigma2_mean = sigma2_sum / max(1, n_voxels)
+    del betas_ols_t, Xt
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     if verbose:
         print(
