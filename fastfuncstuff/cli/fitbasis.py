@@ -313,17 +313,20 @@ def create_parser() -> argparse.ArgumentParser:
     reg_opts.add_argument(
         "-lambda-mode", "-lambda_mode",
         dest="lambda_mode",
-        choices=["global", "voxelwise"],
-        default="global",
+        choices=["global", "voxelwise", "auto"],
+        default="auto",
         help=(
-            "How λ is set per voxel.  ``global`` (current default): "
-            "one scalar λ for every voxel from σ²_mean across the "
-            "brain mask.  ``voxelwise``: per-voxel λ_v = σ²_v from "
-            "that voxel's own OLS residual variance — Bayesian-"
-            "honest at the voxel scale (high-SNR voxels get less "
-            "shrinkage, low-SNR more).  Implementation bins voxels "
-            "by σ² quantile (-lambda-n-bins, default 20) and Cholesky-"
-            "factors one matrix per bin; negligible extra cost."
+            "How λ is set per voxel.  ``auto`` (default): voxelwise "
+            "when -single-trials is set (per-trial DOF is too low to "
+            "tolerate a global λ at 9.4T-style SNR variation), global "
+            "otherwise.  ``global``: one scalar λ for every voxel "
+            "from σ²_mean across the brain mask.  ``voxelwise``: "
+            "per-voxel λ_v = σ²_v from that voxel's own OLS residual "
+            "variance — Bayesian-honest at the voxel scale (high-SNR "
+            "voxels get less shrinkage, low-SNR more).  Implementation "
+            "bins voxels by σ² quantile (-lambda-n-bins, default 20) "
+            "and Cholesky-factors one matrix per bin; negligible "
+            "extra cost."
         ),
     )
     reg_opts.add_argument(
@@ -689,6 +692,16 @@ def main() -> int:
     print(f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, TR={tr}s)")
 
     # ── Build basis + prior ────────────────────────────────────────
+    # Resolve -lambda-mode auto: voxelwise for single-trial fits
+    # (low per-trial DOF + high σ² variation across the brain at
+    # 9.4T-style SNR means a global λ over-shrinks high-SNR voxels);
+    # global otherwise (the per-condition fit has enough DOF that a
+    # single shared λ is fine and faster).
+    if args.lambda_mode == "auto":
+        args.lambda_mode = "voxelwise" if args.single_trials else "global"
+        print(f"  Lambda mode auto → {args.lambda_mode} "
+              f"({'single-trials' if args.single_trials else 'per-condition'})")
+
     print(f"\n  Model: {args.model}    Regularisation: {args.reg}    "
           f"Single-trials: {args.single_trials}")
     basis = _build_basis(args)
