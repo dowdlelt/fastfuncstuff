@@ -89,9 +89,13 @@ try:
     )
     from fastfuncstuff.design.flobs import (
         FLOBSBasis,
+        ARMAWhitenCell,
+        FLOBSFitResult,
+        bin_and_whiten_arma11,
         cv_basis_constrained_ridge,
         decouple_amplitude_prior,
         estimate_and_apply_arma11_prewhitening,
+        estimate_arma11_per_voxel,
         fit_basis_constrained_ridge,
         fit_basis_fracridge,
         flobs_prior,
@@ -318,17 +322,20 @@ def create_parser() -> argparse.ArgumentParser:
     reg_opts.add_argument(
         "-prewhiten",
         dest="prewhiten",
-        choices=["none", "arma11"],
+        choices=["none", "arma11", "arma11-voxel"],
         default="none",
         help=(
             "Temporal-noise model.  ``none`` (default): i.i.d. white "
             "noise (standard OLS / ridge / fracridge assumption).  "
-            "``arma11``: estimate a single global ARMA(1,1) (a, b) "
+            "``arma11``: single global ARMA(1,1) (a, b) estimated "
             "from the OLS-residual mean timeseries via REML grid "
-            "search (AFNI 3dREMLfit style), then prewhiten data + "
-            "design per run before fitting.  This is the foundation "
-            "for the full iterative VB loop — per-voxel (a, b) and "
-            "alternating β / noise updates are not yet implemented."
+            "search; prewhiten data + design per run before fitting. "
+            "``arma11-voxel``: per-voxel (a, b) via REML grid search "
+            "(AFNI 3dREMLfit / FSL filmbabe-style noise model); bin "
+            "voxels by grid cell, apply each cell's Cholesky factor, "
+            "and run the constrained fit per cell.  Suppresses the "
+            "trial-to-trial amplitude oscillation that autocorrelated "
+            "noise induces.  Not yet supported with -reg fracridge."
         ),
     )
     reg_opts.add_argument(
@@ -701,12 +708,24 @@ def main() -> int:
     ]
 
     # ── Optional ARMA(1,1) prewhitening (VB-loop foundation) ───────
-    # When enabled, replace the i.i.d. noise assumption with a global
-    # ARMA(1,1) covariance, applied per-run via Cholesky.  This is
-    # phase A of the VB-style alternating noise / β loop (TR04MW2
-    # §3) — single-shot, global (a, b).  Per-voxel ARMA and
-    # iterative updates are not yet implemented.
+    # When enabled, replace the i.i.d. noise assumption with an
+    # ARMA(1,1) covariance, applied per-run via Cholesky.
+    #   arma11        — single global (a, b) from mean OLS residual.
+    #                   Whitens data + design in place; the regular
+    #                   pack-and-fit path consumes the whitened
+    #                   versions unchanged.
+    #   arma11-voxel  — per-voxel (a, b) via REML grid search (same
+    #                   primitives as ffs_reml).  Voxels are binned
+    #                   by grid cell, each cell whitens + fits the
+    #                   constrained basis-set solver independently;
+    #                   per-cell betas are gathered into a synthetic
+    #                   FLOBSFitResult that the downstream output
+    #                   code consumes unchanged.  Suppresses
+    #                   trial-to-trial amplitude oscillations from
+    #                   autocorrelated noise.
     arma_ab: tuple[float, float] | None = None
+    arma_ab_per_voxel: np.ndarray | None = None
+    arma_cells: list[ARMAWhitenCell] | None = None
     if args.prewhiten == "arma11":
         per_run_data, per_run_designs, a_opt, b_opt = (
             estimate_and_apply_arma11_prewhitening(
@@ -718,6 +737,29 @@ def main() -> int:
             )
         )
         arma_ab = (a_opt, b_opt)
+    elif args.prewhiten == "arma11-voxel":
+        if args.reg == "fracridge":
+            print(
+                "ERROR: -prewhiten arma11-voxel is not yet supported "
+                "with -reg fracridge (cell-wise CV needs more work). "
+                "Use -prewhiten arma11 (global) with fracridge for now."
+            )
+            return 1
+        arma_ab_per_voxel = estimate_arma11_per_voxel(
+            per_run_data=per_run_data,
+            per_run_task_designs=per_run_designs,
+            polort=polort_resolved,
+            device=device,
+            verbose=True,
+        )
+        arma_cells = bin_and_whiten_arma11(
+            per_run_data=per_run_data,
+            per_run_task_designs=per_run_designs,
+            arma_per_voxel=arma_ab_per_voxel,
+            polort=polort_resolved,
+            device=device,
+            verbose=True,
+        )
 
     # ── Pack shared-task + block-diag polys ────────────────────────
     # Pack on the compute device so the fit doesn't waste cycles
@@ -725,23 +767,32 @@ def main() -> int:
     # produces data on CPU (memory-friendly), so this is the
     # one-time host→device transfer; from here through the solver
     # it stays on the chosen device.
-    packed = pack_for_shared_task_glm(
-        per_run_data=per_run_data,
-        per_run_task_designs=per_run_designs,
-        polort=polort_resolved,
-        task_column_labels=[
-            f"{lbl}#PC{b}" for lbl in block_labels for b in range(n_basis)
-        ],
-        device=device,
-    )
-    n_task_cols = packed.n_task_cols
-    print(f"  Design: {packed.design_concat.shape}  "
-          f"({n_task_cols} task + "
-          f"{packed.design_concat.shape[1] - n_task_cols} nuisance)")
+    #
+    # arma11-voxel skips this single packed-design path: each ARMA
+    # cell has its own whitened design, so packing happens per cell
+    # inside the dispatch block below.
+    task_column_labels = [
+        f"{lbl}#PC{b}" for lbl in block_labels for b in range(n_basis)
+    ]
+    if arma_cells is None:
+        packed = pack_for_shared_task_glm(
+            per_run_data=per_run_data,
+            per_run_task_designs=per_run_designs,
+            polort=polort_resolved,
+            task_column_labels=task_column_labels,
+            device=device,
+        )
+        n_task_cols = packed.n_task_cols
+        print(f"  Design: {packed.design_concat.shape}  "
+              f"({n_task_cols} task + "
+              f"{packed.design_concat.shape[1] - n_task_cols} nuisance)")
 
-    task_design = packed.design_concat[:, :n_task_cols]
-    nuisance = (packed.design_concat[:, n_task_cols:]
-                if packed.design_concat.shape[1] > n_task_cols else None)
+        task_design = packed.design_concat[:, :n_task_cols]
+        nuisance = (packed.design_concat[:, n_task_cols:]
+                    if packed.design_concat.shape[1] > n_task_cols else None)
+    else:
+        # n_task_cols is fixed by model; nuisance lives per cell.
+        n_task_cols = n_blocks * n_basis
 
     # ── Fit ─────────────────────────────────────────────────────────
     # Eager full-HRF reconstruction (n_vox × n_blocks × n_t × 8 bytes)
@@ -750,7 +801,79 @@ def main() -> int:
     # build amplitude / iresp downstream in voxel chunks via the
     # memory module's chunk-size estimator.
     print(f"\n  Fitting ({args.model} × {args.reg}) …")
-    if args.reg == "fracridge":
+    if arma_cells is not None:
+        # Per-cell constrained fit — each cell shares (a, b), so it
+        # also shares its whitened task design and polynomial nuisance;
+        # only the data (and the subset of voxels) differs.
+        n_voxels_total = sum(c.voxel_indices.size for c in arma_cells)
+        n_poly_per_run = (polort_resolved + 1) if polort_resolved >= 0 else 0
+        n_total_cols = n_task_cols + n_runs * n_poly_per_run
+        betas_all = np.zeros((n_voxels_total, n_total_cols), dtype=np.float64)
+        betas_ols_all = np.zeros_like(betas_all)
+        r2_all = np.zeros(n_voxels_total, dtype=np.float32)
+        r2_ols_all = np.zeros_like(r2_all)
+        sigma2_sum = 0.0
+        eff_pw_sum = 0.0
+
+        cell_iter = tqdm(
+            arma_cells, total=len(arma_cells),
+            desc="  Cells × constrained fit", unit="cell",
+            leave=False, disable=len(arma_cells) <= 1,
+        )
+        for cell in cell_iter:
+            packed_cell = pack_for_shared_task_glm(
+                per_run_data=cell.per_run_data,
+                per_run_task_designs=cell.per_run_task_designs,
+                polort=-1,                          # polys go via extra
+                task_column_labels=task_column_labels,
+                extra_regressors_per_run=cell.per_run_polys,
+                device=device,
+            )
+            task_design_cell = packed_cell.design_concat[:, :n_task_cols]
+            nuisance_cell = (
+                packed_cell.design_concat[:, n_task_cols:]
+                if packed_cell.design_concat.shape[1] > n_task_cols else None
+            )
+            cell_fit = fit_basis_constrained_ridge(
+                data=packed_cell.data_concat,
+                design_task=task_design_cell,
+                basis_functions=basis.basis_functions,
+                prior_mean=prior_m,
+                prior_cov=prior_C,
+                n_blocks=n_blocks,
+                nuisance=nuisance_cell,
+                prior_weight=pw,
+                device=device,
+                reconstruct_hrfs=False,
+                lambda_mode=args.lambda_mode,
+                lambda_n_bins=args.lambda_n_bins,
+            )
+            idx = cell.voxel_indices
+            betas_all[idx] = cell_fit.betas[:, :n_total_cols]
+            betas_ols_all[idx] = cell_fit.betas_ols[:, :n_total_cols]
+            r2_all[idx] = cell_fit.r2.astype(np.float32)
+            r2_ols_all[idx] = cell_fit.r2_ols.astype(np.float32)
+            sigma2_sum += cell_fit.sigma2_mean * idx.size
+            eff_pw_sum += cell_fit.effective_prior_weight * idx.size
+
+        fit = FLOBSFitResult(
+            betas=betas_all,
+            hrfs=None,                              # type: ignore[arg-type]
+            r2=r2_all,
+            betas_ols=betas_ols_all,
+            hrfs_ols=None,                          # type: ignore[arg-type]
+            r2_ols=r2_ols_all,
+            sigma2_mean=sigma2_sum / max(1, n_voxels_total),
+            effective_prior_weight=eff_pw_sum / max(1, n_voxels_total),
+            n_iter=1,
+        )
+        print(f"  ✓ Per-voxel ARMA fit complete.  "
+              f"σ²_mean={fit.sigma2_mean:.4g}, "
+              f"effective λ_mean={fit.effective_prior_weight:.4g}")
+        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
+              f"constrained: {fit.r2.mean():.3f}")
+
+    elif args.reg == "fracridge":
         # fracridge has its own per-run nuisance projection and
         # SVD-based multi-frac solver, so it bypasses the packed
         # block-diag design entirely and consumes per_run_data /
@@ -1255,6 +1378,23 @@ def main() -> int:
     }
     if arma_ab is not None:
         metadata["arma11"] = {"a": float(arma_ab[0]), "b": float(arma_ab[1])}
+    if arma_ab_per_voxel is not None:
+        # 4-D NIfTI: last axis is (a, b).  Lets the user inspect the
+        # ARMA parameter map directly (high-a areas usually = vascular
+        # / large-vessel, low-a = parenchyma).
+        ab_vol = np.zeros(volume_shape + (2,), dtype=np.float32)
+        if mask is not None:
+            ab_vol[mask, :] = arma_ab_per_voxel
+        else:
+            ab_vol = arma_ab_per_voxel.reshape(volume_shape + (2,))
+        ab_path = f"{args.prefix}_fitbasis_arma_ab{nii_ext}"
+        save_nifti(ab_vol, output_path=ab_path, reference_img=args.input[0])
+        print(f"  Wrote {ab_path}  (4-D: sub-brick 0=a, 1=b)")
+        metadata["arma11_per_voxel"] = {
+            "median_a": float(np.median(arma_ab_per_voxel[:, 0])),
+            "median_b": float(np.median(arma_ab_per_voxel[:, 1])),
+            "n_unique_cells": int(arma_cells.__len__() if arma_cells else 0),
+        }
     if cv_result is not None:
         metadata["cv"] = {
             "weights": [str(w) for w in cv_result.weights],

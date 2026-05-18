@@ -1426,6 +1426,263 @@ def fit_basis_fracridge(
     )
 
 
+@dataclass
+class ARMAWhitenCell:
+    """One ARMA(1,1) grid cell after binning + whitening.
+
+    The voxels listed in :attr:`voxel_indices` all share the same
+    ``(a, b)`` and therefore the same per-run Cholesky factor
+    ``L_r``.  The whitened task design (and whitened polynomial
+    nuisance) are stored *per run* and are shared across all voxels
+    in this cell — the only per-voxel object is the whitened data.
+
+    Attributes
+    ----------
+    a, b : float
+        The grid-cell ARMA(1,1) parameters used to whiten this cell.
+    voxel_indices : np.ndarray, shape (n_vox_cell,)
+        Indices into the original full-voxel ordering — gather
+        results back with this when stitching cells together.
+    per_run_data : list[torch.Tensor], each (n_vox_cell, n_tp_run)
+        Per-run data after applying L_r⁻¹ to each voxel timeseries.
+    per_run_task_designs : list[torch.Tensor], each (n_tp_run, n_task)
+        Per-run task design after applying L_r⁻¹.  Shared by every
+        voxel in this cell.
+    per_run_polys : list[torch.Tensor] | None
+        Per-run polynomial nuisance after applying L_r⁻¹.  ``None``
+        when ``polort < 0`` at the source call site.  Feed these to
+        ``pack_for_shared_task_glm`` via ``extra_regressors_per_run``
+        with ``polort=-1`` so the helper doesn't re-build *un-whitened*
+        polys on top.
+    """
+
+    a: float
+    b: float
+    voxel_indices: np.ndarray
+    per_run_data: list[torch.Tensor]
+    per_run_task_designs: list[torch.Tensor]
+    per_run_polys: list[torch.Tensor] | None
+
+
+def estimate_arma11_per_voxel(
+    per_run_data: list[torch.Tensor],
+    per_run_task_designs: list[torch.Tensor],
+    polort: int,
+    *,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> np.ndarray:
+    """REML grid search for per-voxel ARMA(1,1) ``(a, b)``.
+
+    Wraps ``fastfuncstuff.glm.arma`` primitives (the same code that
+    powers ``ffs_reml``): builds the packed task + block-diagonal
+    polynomial design, precomputes ``L⁻¹`` / Q / log-det matrices
+    over the default AFNI 3dREMLfit grid (9 × 7 = 63 cells), and
+    evaluates each voxel's REML likelihood against every grid point.
+
+    Returns ``(n_voxels, 2)`` of grid-snapped ``(a, b)`` per voxel —
+    suitable as input to :func:`bin_and_whiten_arma11`.
+    """
+    from fastfuncstuff.glm.arma import (
+        get_default_arma_grids,
+        precompute_reml_grid,
+        search_voxels_precomputed_grid,
+    )
+    from fastfuncstuff.design.builder import legendre_polynomials
+
+    if device is None:
+        device = get_device()
+
+    n_runs = len(per_run_data)
+    n_tp_per_run = [d.shape[1] for d in per_run_data]
+    run_starts: list[int] = [0]
+    for n in n_tp_per_run[:-1]:
+        run_starts.append(run_starts[-1] + n)
+    total_tp = int(sum(n_tp_per_run))
+
+    # Concat task design row-wise (shared task across runs).
+    design_task = torch.cat(
+        [t.to(device).float() for t in per_run_task_designs], dim=0
+    )                                                          # (total_tp, n_task)
+
+    # Build block-diagonal polynomial nuisance and concatenate.
+    if polort >= 0:
+        n_poly = polort + 1
+        Z_full = torch.zeros(
+            total_tp, n_runs * n_poly, device=device, dtype=torch.float32,
+        )
+        for r in range(n_runs):
+            Z_r = torch.from_numpy(
+                legendre_polynomials(n_tp_per_run[r], polort)
+            ).to(device=device, dtype=torch.float32)
+            Z_full[
+                run_starts[r]:run_starts[r] + n_tp_per_run[r],
+                r * n_poly:(r + 1) * n_poly,
+            ] = Z_r
+        X_full = torch.cat([design_task, Z_full], dim=1)
+    else:
+        X_full = design_task
+
+    Y_full = torch.cat(
+        [d.to(device).float() for d in per_run_data], dim=1
+    )                                                          # (n_vox, total_tp)
+    n_voxels = Y_full.shape[0]
+
+    a_grid, b_grid = get_default_arma_grids(device)
+    if verbose:
+        print(
+            f"  per-voxel ARMA: precomputing REML grid "
+            f"({len(a_grid)} a × {len(b_grid)} b) over {total_tp} TR…"
+        )
+    grid = precompute_reml_grid(
+        X=X_full,
+        n_timepoints=total_tp,
+        a_grid=a_grid,
+        b_grid=b_grid,
+        device=device,
+        verbose=verbose,
+        run_starts=run_starts,
+    )
+    if not grid:
+        raise RuntimeError(
+            "precompute_reml_grid returned no valid (a, b) pairs — "
+            "check that the design is well-conditioned."
+        )
+
+    if verbose:
+        print(f"  per-voxel ARMA: REML search over {n_voxels:,} voxels …")
+    best_params, _ = search_voxels_precomputed_grid(
+        X=X_full,
+        Y_batch=Y_full,
+        precomputed_grid=grid,
+        device=device,
+        verbose=verbose,
+    )
+    return best_params.detach().cpu().numpy().astype(np.float32)
+
+
+def bin_and_whiten_arma11(
+    per_run_data: list[torch.Tensor],
+    per_run_task_designs: list[torch.Tensor],
+    arma_per_voxel: np.ndarray,
+    polort: int,
+    *,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> list[ARMAWhitenCell]:
+    """Group voxels by ARMA grid cell, whiten data + design per cell.
+
+    For each unique ``(a, b)`` in ``arma_per_voxel``: build the per-run
+    Cholesky factor ``L_r``, apply ``L_r⁻¹`` via triangular solve to
+    the (shared) task design, the per-run polynomial nuisance, and
+    that cell's voxels' data.  Whitened polynomials come back as an
+    explicit list — feed them to ``pack_for_shared_task_glm`` via
+    ``extra_regressors_per_run`` (with ``polort=-1``) so the
+    canonical packer doesn't add un-whitened polys back in.
+    """
+    from fastfuncstuff.glm.arma import build_arma11_covariance
+    from fastfuncstuff.design.builder import legendre_polynomials
+
+    if device is None:
+        device = get_device()
+
+    n_runs = len(per_run_data)
+    n_tp_per_run = [d.shape[1] for d in per_run_data]
+    if arma_per_voxel.shape[1] != 2:
+        raise ValueError(
+            f"arma_per_voxel must be (n_voxels, 2); got {arma_per_voxel.shape}"
+        )
+
+    # Pre-build per-run polynomials (un-whitened, on device) — shared
+    # across cells; only the L_r⁻¹ application differs per cell.
+    if polort >= 0:
+        polys_raw_per_run = [
+            torch.from_numpy(
+                legendre_polynomials(n_tp_per_run[r], polort)
+            ).to(device=device, dtype=torch.float32)
+            for r in range(n_runs)
+        ]
+    else:
+        polys_raw_per_run = None
+
+    design_task_per_run_dev = [
+        t.to(device).float() for t in per_run_task_designs
+    ]
+
+    # Unique (a, b) cells (rounded to 6 decimals to avoid float noise).
+    rounded = np.round(arma_per_voxel.astype(np.float64), 6)
+    keys = [tuple(r.tolist()) for r in rounded]
+    unique_keys = sorted(set(keys))
+
+    if verbose:
+        print(
+            f"  per-voxel ARMA: {len(unique_keys)} unique (a, b) cells "
+            f"covering {arma_per_voxel.shape[0]:,} voxels"
+        )
+
+    cells: list[ARMAWhitenCell] = []
+    cell_iter = tqdm(
+        unique_keys, total=len(unique_keys),
+        desc="  ARMA whiten cells", unit="cell",
+        leave=False, disable=(not verbose) or len(unique_keys) <= 1,
+    )
+    for a, b in cell_iter:
+        cell_vox = np.where(
+            (rounded[:, 0] == a) & (rounded[:, 1] == b)
+        )[0].astype(np.int64)
+        if cell_vox.size == 0:
+            continue
+
+        task_w_runs: list[torch.Tensor] = []
+        poly_w_runs: list[torch.Tensor] = [] if polys_raw_per_run is not None else None  # type: ignore[assignment]
+        data_w_runs: list[torch.Tensor] = []
+        for r in range(n_runs):
+            R_r = build_arma11_covariance(
+                float(a), float(b), n_tp_per_run[r],
+                torch.device("cpu"), dtype=torch.float32, run_starts=None,
+            )
+            if R_r is None:
+                raise ValueError(
+                    f"build_arma11_covariance failed for "
+                    f"(a={a}, b={b}, n={n_tp_per_run[r]})"
+                )
+            L_r = torch.linalg.cholesky(R_r).to(device)
+            del R_r
+
+            # Whiten task design (shared across all voxels in cell).
+            X_task_r = design_task_per_run_dev[r]
+            task_w_runs.append(
+                torch.linalg.solve_triangular(L_r, X_task_r, upper=False)
+            )
+
+            # Whiten polynomial nuisance (shared too).
+            if polys_raw_per_run is not None:
+                Z_w = torch.linalg.solve_triangular(
+                    L_r, polys_raw_per_run[r], upper=False,
+                )
+                poly_w_runs.append(Z_w)
+
+            # Whiten this cell's voxels' data.
+            y_cell_r = (
+                per_run_data[r][cell_vox].to(device).float()
+            )                                                  # (n_vox_cell, n_tp_r)
+            y_cell_w = torch.linalg.solve_triangular(
+                L_r, y_cell_r.T, upper=False,
+            ).T
+            data_w_runs.append(y_cell_w)
+            del L_r, y_cell_r, y_cell_w
+
+        cells.append(ARMAWhitenCell(
+            a=float(a), b=float(b),
+            voxel_indices=cell_vox,
+            per_run_data=data_w_runs,
+            per_run_task_designs=task_w_runs,
+            per_run_polys=poly_w_runs,
+        ))
+
+    return cells
+
+
 def estimate_and_apply_arma11_prewhitening(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],

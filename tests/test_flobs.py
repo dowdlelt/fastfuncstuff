@@ -731,3 +731,58 @@ def test_arma11_prewhiten_recovers_known_ar_coefficient(basis):
     for r in range(n_runs):
         assert pwd[r].shape == per_run_data[r].shape
         assert pwds[r].shape == per_run_designs[r].shape
+
+
+# ---------- per-voxel ARMA ---------------------------------------------------
+
+
+def test_per_voxel_arma_recovers_two_groups(basis):
+    """Two voxel groups with different AR(1) rho should recover distinct a."""
+    rng = np.random.default_rng(0)
+    n_runs, n_tp, n_vox = 3, 200, 60
+    K = basis.basis_functions.shape[0]
+    tr = 1.0
+    true_coefs = rng.multivariate_normal(basis.m, basis.C * 0.3, size=n_vox)
+    basis_tr = basis.basis_functions[:, :: int(round(tr / basis.dt))]
+    rho = np.where(np.arange(n_vox) < n_vox // 2, 0.3, 0.7)
+    per_run_data, per_run_designs = [], []
+    for _ in range(n_runs):
+        on = np.zeros(n_tp)
+        on[rng.choice(np.arange(8, n_tp - 30), 7, replace=False)] = 1.0
+        X = np.stack(
+            [np.convolve(on, basis_tr[b])[:n_tp] for b in range(K)], axis=1
+        )
+        y_clean = (X @ true_coefs.T).T
+        eps = rng.standard_normal((n_vox, n_tp))
+        noise = np.zeros_like(eps)
+        noise[:, 0] = eps[:, 0]
+        for t in range(1, n_tp):
+            noise[:, t] = rho * noise[:, t - 1] + eps[:, t]
+        y = y_clean + 1.5 * y_clean.std() * noise
+        per_run_data.append(torch.from_numpy(y).float())
+        per_run_designs.append(torch.from_numpy(X).float())
+
+    from fastfuncstuff.design.flobs import (
+        bin_and_whiten_arma11,
+        estimate_arma11_per_voxel,
+    )
+    ab = estimate_arma11_per_voxel(
+        per_run_data, per_run_designs, polort=2,
+        device=torch.device("cpu"), verbose=False,
+    )
+    assert ab.shape == (n_vox, 2)
+    assert abs(np.median(ab[: n_vox // 2, 0]) - 0.3) <= 0.1
+    assert abs(np.median(ab[n_vox // 2 :, 0]) - 0.7) <= 0.1
+
+    cells = bin_and_whiten_arma11(
+        per_run_data, per_run_designs, ab, polort=2,
+        device=torch.device("cpu"), verbose=False,
+    )
+    # Sum of cell voxel counts == n_vox; each cell has the right shapes.
+    total = sum(c.voxel_indices.size for c in cells)
+    assert total == n_vox
+    cell = cells[0]
+    assert cell.per_run_data[0].shape == (cell.voxel_indices.size, n_tp)
+    assert cell.per_run_task_designs[0].shape == (n_tp, K)
+    assert cell.per_run_polys is not None
+    assert cell.per_run_polys[0].shape == (n_tp, 3)         # polort=2 → 3 cols
