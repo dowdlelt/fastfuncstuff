@@ -1422,6 +1422,20 @@ def main() -> int:
                     )
             print(f"  ✓ VB loop complete after {vb_iter} iter(s).")
 
+        # Stage-exit cleanup.  ``arma_cells`` holds the per-cell
+        # whitened (data, design, polys) tensors — ~7 GB on
+        # 9.4T-scale brains.  ``cell_packed_cache`` mirrors them
+        # via pack_for_shared_task_glm's output.  Nothing downstream
+        # uses either: ``fit.betas`` carries all per-voxel info we
+        # need, the original ``per_run_data`` is intact for
+        # amplitude reconstruction, and ``per_run_data_orig`` is
+        # already cloned for -xval-r2.  Drop them now so the next
+        # stage (amplitude/iresp, xval-r2) doesn't hit OOM.
+        arma_cells = None
+        cell_packed_cache.clear()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     elif args.reg == "fracridge":
         # fracridge has its own per-run nuisance projection and
         # SVD-based multi-frac solver, so it bypasses the packed
@@ -1474,6 +1488,31 @@ def main() -> int:
               f"effective λ={fit.effective_prior_weight:.4g}")
         print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
               f"constrained: {fit.r2.mean():.3f}")
+
+    # ── Stage cleanup: release fit-stage GPU tensors ───────────────
+    # Everything downstream (amplitude / iresp reconstruction,
+    # xval-r2, output writes) reads ``fit`` (CPU numpy) or
+    # ``per_run_data`` / ``per_run_data_orig`` (already on CPU).
+    # The packed task+nuisance design that fit_basis_constrained_ridge
+    # consumed (and fracridge's internals) is no longer needed —
+    # explicit release prevents it from sitting on GPU through the
+    # xval-r2 path which OOMs on big data otherwise.  Each branch
+    # above sets these only in the paths that use them; try/except
+    # keeps the cleanup branch-agnostic.
+    try:
+        del packed
+    except NameError:
+        pass
+    try:
+        del task_design
+    except NameError:
+        pass
+    try:
+        del nuisance
+    except NameError:
+        pass
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # ── Reshape + save outputs ─────────────────────────────────────
     n_vox_masked = fit.betas.shape[0]
