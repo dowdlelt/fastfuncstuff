@@ -130,8 +130,14 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ffs_fitbasis",
         description=(
-            "Constrained basis-set HRF fitting (SPMG1/SPMG2/SPMG3/FLOBS) "
-            "with optional shape prior and single-trial mode."
+            "[BETA] Constrained basis-set HRF fitting "
+            "(SPMG1/SPMG2/SPMG3/FLOBS) with optional shape prior, "
+            "single-trial mode (LSA or LSS), per-voxel ARMA(1,1) "
+            "prewhitening, and a filmbabe-style VB loop.  Outputs "
+            "and flag set are evolving — see "
+            "wiki/notes/ffs_fitbasis_changes.md for the current "
+            "behaviour and open questions, especially around "
+            "single-trial validation."
         ),
         formatter_class=_HelpFormatter,
     )
