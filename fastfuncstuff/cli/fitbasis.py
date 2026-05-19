@@ -730,10 +730,16 @@ def main() -> int:
     # 9.4T-style SNR means a global λ over-shrinks high-SNR voxels);
     # global otherwise (the per-condition fit has enough DOF that a
     # single shared λ is fine and faster).
+    # -reg none disables the prior entirely; the lambda-mode setting
+    # is meaningless then (no λ to set per voxel).  Resolve only when
+    # the prior is actually in play.
     if args.lambda_mode == "auto":
-        args.lambda_mode = "voxelwise" if args.single_trials else "global"
-        print(f"  Lambda mode auto → {args.lambda_mode} "
-              f"({'single-trials' if args.single_trials else 'per-condition'})")
+        if args.reg == "none":
+            args.lambda_mode = "global"     # placeholder; unused downstream
+        else:
+            args.lambda_mode = "voxelwise" if args.single_trials else "global"
+            print(f"  Lambda mode auto → {args.lambda_mode} "
+                  f"({'single-trials' if args.single_trials else 'per-condition'})")
 
     print(f"\n  Model: {args.model}    Regularisation: {args.reg}    "
           f"Single-trials: {args.single_trials}")
@@ -748,8 +754,14 @@ def main() -> int:
     pw = _resolve_prior_weight_arg(args.prior_weight, args.reg)
     print(f"  Basis: {n_basis} fns × {basis.basis_functions.shape[1]} samples "
           f"(dt={basis.dt}s, window={basis.duration:.1f}s)")
-    print(f"  Prior: m = {prior_m},  σ_diag = {np.sqrt(np.diag(prior_C))}")
-    print(f"  Prior weight: {pw!r}")
+    # Only print prior info when the prior is actually applied.  With
+    # -reg none, m/C/λ are all zeros / unused — printing them is noise
+    # that confuses users about whether the prior is active.
+    if args.reg != "none":
+        print(f"  Prior: m = {prior_m},  σ_diag = {np.sqrt(np.diag(prior_C))}")
+        print(f"  Prior weight: {pw!r}")
+    else:
+        print("  Prior: disabled (-reg none)")
 
     # ── Polort resolution ─────────────────────────────────────────
     if args.polort is None:

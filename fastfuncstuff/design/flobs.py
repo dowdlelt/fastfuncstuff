@@ -746,9 +746,37 @@ def fit_basis_constrained_ridge(
     if prior_weight_per_voxel is not None:
         lambda_mode = "voxelwise"
 
+    # ── Fast path: prior_weight effectively zero ────────────────────
+    # When the prior contributes nothing (``-reg none``, or
+    # ``prior_weight_per_voxel`` is all zeros, or scalar 0.0), Pass 2
+    # would solve A = X'X + 0·P → identical to the OLS pass 1.  Skip
+    # it: betas = beta_ols, ss_res = ss_res_ols.  Halves the per-call
+    # work — which matters for LSS where we make N_trials such calls.
+    # Also avoids the voxelwise σ²-binning machinery in that case.
+    _prior_is_zero = (
+        (not isinstance(prior_weight, str) and float(prior_weight) == 0.0)
+        or (prior_weight_per_voxel is not None
+            and not np.any(np.asarray(prior_weight_per_voxel)))
+    )
+    if _prior_is_zero:
+        betas_full.copy_(beta_ols_full)
+        ss_res_constrained_full.copy_(ss_res_ols_full)
+        effective_weight = 0.0
+        # Set voxel_bin / bin_lambda placeholders so the VB-diagnostic
+        # path below doesn't reference unbound names.
+        voxel_bin = torch.zeros(n_voxels, dtype=torch.long)
+        bin_lambda = torch.zeros(1, dtype=torch.float64)
+        # Jump straight to R² assembly + return below.
+        _skip_pass2 = True
+    else:
+        _skip_pass2 = False
+
     Pm_unit = P @ m_bar                                            # (n_cols,)
 
-    if lambda_mode == "global":
+    if _skip_pass2:
+        # Fast path took it; betas / ss_res already populated above.
+        pass
+    elif lambda_mode == "global":
         # One A, one factor.
         A = XtX + effective_weight * P
         Pm = effective_weight * Pm_unit
@@ -1407,15 +1435,21 @@ def fit_basis_lss(
         )
         del packed_lsa
 
-    sigma2_per_voxel = lsa_fit.sigma2_per_voxel
-    if sigma2_per_voxel is None:
-        # Caller passed an lsa_fit without diagnostics — fall back to a
-        # uniform σ²_mean.  Less Bayesian-honest but won't crash.
-        sigma2_per_voxel = np.full(
-            n_voxels, float(lsa_fit.sigma2_mean), dtype=np.float32,
-        )
     user_mult = 1.0 if isinstance(prior_weight, str) else float(prior_weight)
-    prior_pw_per_voxel = (sigma2_per_voxel * user_mult).astype(np.float32)
+    # When the user picked -reg none → prior_weight = 0 → no σ²·user_mult
+    # work is needed at all (the per-trial fits hit the fast path).
+    # Save the per-voxel σ² gathering for the cases that actually use it.
+    if user_mult == 0.0:
+        prior_pw_per_voxel = None
+    else:
+        sigma2_per_voxel = lsa_fit.sigma2_per_voxel
+        if sigma2_per_voxel is None:
+            # Caller passed an lsa_fit without diagnostics — fall back to a
+            # uniform σ²_mean.  Less Bayesian-honest but won't crash.
+            sigma2_per_voxel = np.full(
+                n_voxels, float(lsa_fit.sigma2_mean), dtype=np.float32,
+            )
+        prior_pw_per_voxel = (sigma2_per_voxel * user_mult).astype(np.float32)
 
     # ── Project per-run polys out of data + per-trial designs ───────
     # After projection the LSS design is purely task (block 1..3 per
