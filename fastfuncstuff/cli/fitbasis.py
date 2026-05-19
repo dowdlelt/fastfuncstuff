@@ -1329,6 +1329,17 @@ def main() -> int:
                     nuisance_betas=nuis_betas_arr,
                     device=device,
                 )
+                # Free the previous iter's whitened-cell state — the
+                # 88 cells hold a full copy of the data on GPU + the
+                # packed designs (~7 GB at 9.4T scale).  Residuals
+                # have been computed already (they use the original
+                # per_run_data, not the cells), so the cells are no
+                # longer needed.  Without this, the next REML
+                # precompute + Y_full allocation OOMs.
+                arma_cells = None
+                cell_packed_cache.clear()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 # 2. Re-estimate (a, b) from residuals.  Use polort=-1
                 # (residuals are already drift-free).
                 new_ab = estimate_arma11_per_voxel(
@@ -1337,6 +1348,11 @@ def main() -> int:
                     polort=-1,
                     device=device, verbose=True,
                 )
+                # Free residuals before re-binning + re-fit, which
+                # will allocate new cells.
+                del residuals_per_run
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 # 3. Convergence on (a, b).
                 delta = np.abs(new_ab - arma_ab_per_voxel).sum(axis=1)
                 median_delta = float(np.median(delta))
