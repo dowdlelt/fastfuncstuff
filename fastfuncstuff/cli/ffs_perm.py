@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 try:
     from fastfuncstuff.cli_utils import (
@@ -184,6 +185,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable within-run exchangeability (default: ON when events "
              "are provided).",
     )
+    perm.add_argument(
+        "-welch", action="store_true", default=False,
+        help="(2-sample only) Use Welch's unequal-variance t. Recommended "
+             "when group sizes or variances differ (notably -onevsall).",
+    )
+    perm.add_argument(
+        "-vsmooth", "-vsmooth_mm", "-vsmooth-mm",
+        type=float, default=0.0,
+        metavar="FWHM_MM",
+        help="Variance smoothing: Gaussian-smooth the per-perm variance "
+             "estimate at this FWHM (mm) and emit pseudo-t bricks "
+             "(t_unc_pseudo, t_fwe_pseudo) alongside the regular ones. "
+             "Cluster table for the pseudo branch uses empirical tcrits "
+             "from the permutation null (pseudo-t is not Student-t). "
+             "0 disables.  Matches randomise -v in spirit.",
+    )
 
     clust = p.add_argument_group("Clustering")
     clust.add_argument(
@@ -314,17 +331,58 @@ def _run_perm_one_sample(y_nv, n_perms, seed, args):
     rng = np.random.default_rng(seed)
     signs = generate_sign_flips(y_nv.shape[0], n_perms, rng)
     return signs, one_sample_t_perm(
-        y_nv, signs, device=args.device, show_progress=args.verb >= 1
+        y_nv, signs, device=args.device, show_progress=args.verb >= 1,
+        keep_perm_data=args.vsmooth > 0,
     )
 
 
-def _run_perm_two_sample(y_nv, group, blocks, n_perms, seed, args):
+def _run_perm_two_sample(y_nv, group, blocks, n_perms, seed, args):  # noqa: D401
     rng = np.random.default_rng(seed)
     block_arg = blocks if args.use_blocks else None
     swaps = generate_label_swaps(group, n_perms, rng, blocks=block_arg)
     return swaps, two_sample_t_perm(
-        y_nv, swaps, device=args.device, show_progress=args.verb >= 1
+        y_nv, swaps, device=args.device, show_progress=args.verb >= 1,
+        welch=args.welch,
+        keep_perm_data=args.vsmooth > 0,
     )
+
+
+def _compute_pseudo_t(pstats, test_kind: str, args, mask, voxel_size_mm) -> torch.Tensor:
+    """Recompute per-perm pseudo-t after smoothing each perm's variance map.
+
+    Returns a ``[P, V_in_mask]`` float32 tensor.  Caller is responsible
+    for stripping the identity row from the null distribution.
+    """
+    from fastfuncstuff.stats.smooth3d import (
+        fwhm_mm_to_sigma_vox,
+        smooth_var_per_perm,
+    )
+
+    sigma_vox = fwhm_mm_to_sigma_vox(args.vsmooth, voxel_size_mm)
+    extras = pstats.extras
+    if test_kind == "one":
+        n = pstats.dof + 1  # one-sample N = dof + 1
+        m = extras["perm_means"]                          # [P, V] cpu
+        sum_y2 = extras["sum_y2"]                         # [V] cpu
+        var = (sum_y2[None, :] - n * m * m) / (n - 1)
+        var = var.clamp_min(1e-30)
+        var_smooth = smooth_var_per_perm(var, mask, sigma_vox, device=args.device)
+        return (m * float(np.sqrt(n)) / torch.sqrt(var_smooth.clamp_min(1e-30))).float()
+
+    # two-sample
+    mA = extras["perm_mA"]
+    mB = extras["perm_mB"]
+    if args.welch:
+        nA = extras["_nA"]
+        nB = extras["_nB"]
+        var_A_s = smooth_var_per_perm(extras["perm_varA"], mask, sigma_vox, device=args.device)
+        var_B_s = smooth_var_per_perm(extras["perm_varB"], mask, sigma_vox, device=args.device)
+        denom = torch.sqrt((var_A_s / nA + var_B_s / nB).clamp_min(1e-30))
+    else:
+        pool_factor = float(extras["pool_factor"])
+        var_s = smooth_var_per_perm(extras["perm_var"], mask, sigma_vox, device=args.device)
+        denom = torch.sqrt((var_s * pool_factor).clamp_min(1e-30))
+    return ((mA - mB) / denom).float()
 
 
 def _build_stat_dataset(
@@ -332,13 +390,24 @@ def _build_stat_dataset(
     pstats,
     mask: np.ndarray,
     sidedness_fwe: str,
+    pseudo_t_pv: torch.Tensor | None = None,
 ) -> tuple[np.ndarray, list[str], list[int], int]:
     """Assemble the 4D output volume.
 
     Returns ``(volume, labels, stat_brick_indices, dof)`` where
     ``stat_brick_indices`` lists the 0-based sub-brick indices that hold
     a Student t (so 3drefit can attach ``fitt`` stat params).
+
+    When ``pseudo_t_pv`` is given, two extra bricks are appended:
+    ``t_unc_pseudo`` and ``t_fwe_pseudo``.  These are NOT true Student-t —
+    the value at each voxel is the empirical permutation p (uncorrected
+    or max-stat FWE) re-mapped to a t with the nominal DoF, just so the
+    AFNI viewer threshold slider behaves monotonically.  The cluster
+    table attached for the pseudo branch uses empirical tcrits derived
+    from the permutation null (see :func:`empirical_tcrits`).
     """
+    from fastfuncstuff.stats.cluster import uncorrected_p_from_perms
+
     t = pstats.t.numpy()  # [P, V_in_mask]
     obs_t = t[0]
     null_max = max_abs_t_per_perm(pstats.t, sidedness_fwe)
@@ -367,29 +436,49 @@ def _build_stat_dataset(
         labels = ["meanA", "meanB", "diff", "t_unc", "t_fwe"]
         stat_brick_indices = [3, 4]
 
+    if pseudo_t_pv is not None:
+        pseudo_obs = pseudo_t_pv[0].numpy()
+        pseudo_p_unc = uncorrected_p_from_perms(pseudo_t_pv.numpy(), sidedness_fwe)
+        pseudo_null_max = max_abs_t_per_perm(pseudo_t_pv, sidedness_fwe)
+        pseudo_p_fwe = voxelwise_fwe_p(pseudo_obs, pseudo_null_max, sidedness_fwe)
+        # Map empirical p back to a t-value with the nominal DoF for
+        # viewer thresholding (pseudo-t is not Student-t; this is a
+        # monotonic remap only).
+        t_unc_pseudo = p_to_t(pseudo_p_unc, pstats.dof, sidedness_fwe)
+        t_fwe_pseudo = p_to_t(pseudo_p_fwe, pstats.dof, sidedness_fwe)
+        bricks += [to_vol(t_unc_pseudo), to_vol(t_fwe_pseudo)]
+        idx0 = len(labels)
+        labels += ["t_unc_pseudo", "t_fwe_pseudo"]
+        stat_brick_indices += [idx0, idx0 + 1]
+
     vol4d = np.stack(bricks, axis=-1)
     return vol4d, labels, stat_brick_indices, int(pstats.dof)
 
 
 def _accumulate_cluster_null(
     pstats, mask: np.ndarray, args, save_masks: bool,
+    pseudo_t_pv: torch.Tensor | None = None,
+    tcrits_override: dict[str, np.ndarray] | None = None,
 ) -> tuple[ClusterNull, dict | None]:
     """Build the null in parallel; capture observed masks on the main process.
 
-    Falls back to a single-process pass when ``-jobs 1``.
+    When ``pseudo_t_pv`` is given, the cluster null is built from the
+    pseudo-t permutation matrix instead of the parametric t, using the
+    provided ``tcrits_override`` (empirical pseudo-t critical values).
     """
     nns = (args.nn,) if args.nn else DEFAULT_NN
     sideds = DEFAULT_SIDED if args.sided == "all" else (args.sided,)
-    t = pstats.t.numpy()  # [P, V_in_mask]
+    t_for_cluster = (pseudo_t_pv.numpy() if pseudo_t_pv is not None
+                     else pstats.t.numpy())
 
     obs_masks: dict | None = None
     if save_masks:
         obs_masks = compute_observed_cluster_masks(
-            t[0], mask, pstats.dof, nns=nns, sideds=sideds,
+            t_for_cluster[0], mask, pstats.dof, nns=nns, sideds=sideds,
         )
 
     null = accumulate_cluster_null(
-        t,
+        t_for_cluster,
         mask,
         dof=pstats.dof,
         nns=nns,
@@ -397,6 +486,7 @@ def _accumulate_cluster_null(
         n_jobs=args.jobs,
         verbose=args.verb >= 1,
         fast=not args.with_mass,
+        tcrits_override=tcrits_override,
     )
     return null, obs_masks
 
@@ -514,17 +604,50 @@ def main() -> None:
     if args.verb >= 1:
         print(f"[ffs_perm] perm stat pass: {time.time()-t0:.2f}s", file=sys.stderr)
 
+    # ── (Optional) variance smoothing → pseudo-t per perm ─────────────────
+    pseudo_t_pv: torch.Tensor | None = None
+    pseudo_tcrits: dict[str, np.ndarray] | None = None
+    if args.vsmooth > 0:
+        t0 = time.time()
+        ref_img = load_nifti(args.input or args.input_a[0])
+        zooms = tuple(float(z) for z in ref_img.header.get_zooms()[:3])
+        pseudo_t_pv = _compute_pseudo_t(pstats, test_kind, args, mask, zooms)
+        # Empirical tcrits for the pseudo cluster table — pseudo-t is NOT
+        # Student-t, so we can't use student_t.isf(pthr, dof) here.
+        from fastfuncstuff.stats.cluster import (
+            DEFAULT_PTHR,
+            DEFAULT_SIDED,
+            empirical_tcrits,
+        )
+        sideds_for_pseudo = (
+            DEFAULT_SIDED if args.sided == "all" else (args.sided,)
+        )
+        pseudo_tcrits = {
+            s: empirical_tcrits(pseudo_t_pv.numpy(), DEFAULT_PTHR, s)
+            for s in sideds_for_pseudo
+        }
+        if args.verb >= 1:
+            print(f"[ffs_perm] vsmooth + pseudo-t pass: {time.time()-t0:.2f}s",
+                  file=sys.stderr)
+
     # ── Build stat dataset ─────────────────────────────────────────────────
     vol4d, labels, stat_brick_indices, dof = _build_stat_dataset(
         test_kind, pstats, mask, sidedness_fwe,
+        pseudo_t_pv=pseudo_t_pv,
     )
     stat_path = Path(prefix.with_suffix("stats"))
     save_nifti(vol4d, stat_path, reference_img=args.input or args.input_a[0])
 
     # ── Cluster null + observed masks ──────────────────────────────────────
+    # When pseudo-t is available, cluster correction is built from the
+    # pseudo-t null with empirical tcrits.  The parametric t branch is
+    # still emitted in the stat dataset (t_unc / t_fwe) but is no longer
+    # the one driving the AFNI viewer's cluster panel.
     t0 = time.time()
     null, obs_masks = _accumulate_cluster_null(
         pstats, mask, args, save_masks=args.save_clust_masks,
+        pseudo_t_pv=pseudo_t_pv,
+        tcrits_override=pseudo_tcrits,
     )
     if args.verb >= 1:
         print(f"[ffs_perm] cluster null pass: {time.time()-t0:.2f}s", file=sys.stderr)

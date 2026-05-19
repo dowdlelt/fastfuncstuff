@@ -109,6 +109,40 @@ def test_null_distribution_uniform_one_sample():
     assert 0.025 < rate < 0.085, f"FPR was {rate:.3f}, expected ~0.05"
 
 
+def test_two_sample_welch_matches_scipy():
+    """Welch path returns scipy.ttest_ind(equal_var=False) for the observed row."""
+    rng = np.random.default_rng(11)
+    nA, nB, v = 30, 20, 60
+    yA = rng.normal(size=(nA, v)).astype(np.float32) * 1.5     # higher variance
+    yB = rng.normal(size=(nB, v)).astype(np.float32) * 0.5 + 0.3
+    y = np.concatenate([yA, yB], axis=0)
+    group = np.concatenate([np.ones(nA, dtype=np.int8), np.zeros(nB, dtype=np.int8)])
+    swaps = generate_label_swaps(group, n_perms=4, rng=rng)
+    out_w = two_sample_t_perm(y, swaps, device=_device(), show_progress=False, welch=True)
+    out_p = two_sample_t_perm(y, swaps, device=_device(), show_progress=False, welch=False)
+    ref_welch = ttest_ind(yA, yB, axis=0, equal_var=False).statistic
+    ref_pool = ttest_ind(yA, yB, axis=0, equal_var=True).statistic
+    np.testing.assert_allclose(out_w.t[0].numpy(), ref_welch, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(out_p.t[0].numpy(), ref_pool, rtol=1e-4, atol=1e-4)
+    # Sanity: Welch differs from pooled when variances are unequal.
+    assert not np.allclose(out_w.t[0].numpy(), out_p.t[0].numpy(), atol=1e-3)
+
+
+def test_keep_perm_data_one_sample():
+    """When keep_perm_data=True, extras let us recover variance and recompute t."""
+    rng = np.random.default_rng(13)
+    n, v = 25, 40
+    y = rng.normal(size=(n, v)).astype(np.float32) + 0.2
+    signs = generate_sign_flips(n, n_perms=8, rng=rng)
+    out = one_sample_t_perm(y, signs, device=_device(),
+                            show_progress=False, keep_perm_data=True)
+    m = out.extras["perm_means"].numpy()
+    sum_y2 = out.extras["sum_y2"].numpy()
+    var = (sum_y2[None, :] - n * m * m) / (n - 1)
+    t_reconstructed = m * np.sqrt(n) / np.sqrt(np.clip(var, 1e-30, None))
+    np.testing.assert_allclose(t_reconstructed, out.t.numpy(), rtol=1e-4, atol=1e-4)
+
+
 def test_alternative_detected_one_sample():
     """When the data have a real effect, low p-values are common."""
     rng = np.random.default_rng(9)

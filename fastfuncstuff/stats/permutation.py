@@ -200,6 +200,7 @@ def one_sample_t_perm(
     perm_chunk: int | None = None,
     voxel_chunk: int | None = None,
     show_progress: bool = True,
+    keep_perm_data: bool = False,
 ) -> PermStats:
     """
     Batched 1-sample t-stat across permutations.
@@ -239,6 +240,11 @@ def one_sample_t_perm(
 
     t_out = torch.empty((p, v), dtype=torch.float32)
     mean_obs = torch.empty(v, dtype=torch.float32)
+    # Per-perm mean and the constant ``sum_y2`` together let downstream
+    # code recompute the per-perm variance (var = (sum_y2 - n·m²)/(n-1))
+    # without re-running the matmul.  Cheap to store; only allocated when
+    # asked because at P=10k, V=300k it's 12 GB.
+    perm_means = torch.empty((p, v), dtype=torch.float32) if keep_perm_data else None
 
     sqrt_n = float(np.sqrt(n))
     dof = n - 1
@@ -267,13 +273,19 @@ def one_sample_t_perm(
             var = var.clamp_min(1e-30)  # guard against constant voxels
             t = m * sqrt_n / torch.sqrt(var)
             t_out[p0:p1, v0:v1] = t.cpu()
+            if perm_means is not None:
+                perm_means[p0:p1, v0:v1] = m.cpu()
 
         if bar is not None:
             bar.update(1)
     if bar is not None:
         bar.close()
 
-    return PermStats(t=t_out, mean=mean_obs, extras={}, dof=dof)
+    extras: dict = {}
+    if perm_means is not None:
+        extras["perm_means"] = perm_means
+        extras["sum_y2"] = sum_y2  # per-voxel constant, [V] CPU tensor
+    return PermStats(t=t_out, mean=mean_obs, extras=extras, dof=dof)
 
 
 def two_sample_t_perm(
@@ -283,9 +295,11 @@ def two_sample_t_perm(
     perm_chunk: int | None = None,
     voxel_chunk: int | None = None,
     show_progress: bool = True,
+    welch: bool = False,
+    keep_perm_data: bool = False,
 ) -> PermStats:
     """
-    Batched 2-sample (pooled-variance) t-stat across permutations.
+    Batched 2-sample t-stat across permutations.
 
     Parameters
     ----------
@@ -293,12 +307,14 @@ def two_sample_t_perm(
     group_swaps : np.ndarray[int8], shape (P, N)
         Output of :func:`generate_label_swaps`.  Row 0 is the observed
         group assignment.  Values are 1 (group A) and 0 (group B).
-
-    Notes
-    -----
-    Welch-style unequal-variance is intentionally not implemented in v1;
-    use balanced groups or accept the conservative pooled-variance test
-    when group sizes differ (``-onevsall``).
+    welch : bool, default False
+        If True, use Welch's unequal-variance t-statistic
+        ``t = (mA − mB) / sqrt(var_A/n_A + var_B/n_B)`` per permutation
+        (Bessel-corrected per-group variance recomputed each perm).
+        DoF reported is the conservative ``nA + nB − 2`` (Welch's
+        Satterthwaite DoF varies per voxel and per perm; we use the
+        pooled DoF for cluster-table tcrit lookup, matching randomise).
+        If False, uses the pooled-variance two-sample t.
     """
     n, v = y.shape
     p = group_swaps.shape[0]
@@ -328,6 +344,17 @@ def two_sample_t_perm(
     t_out = torch.empty((p, v), dtype=torch.float32)
     meanA = torch.empty(v, dtype=torch.float32)
     meanB = torch.empty(v, dtype=torch.float32)
+    perm_mA = torch.empty((p, v), dtype=torch.float32) if keep_perm_data else None
+    perm_mB = torch.empty((p, v), dtype=torch.float32) if keep_perm_data else None
+    perm_var = torch.empty((p, v), dtype=torch.float32) if keep_perm_data else None
+    perm_varA = (
+        torch.empty((p, v), dtype=torch.float32)
+        if (keep_perm_data and welch) else None
+    )
+    perm_varB = (
+        torch.empty((p, v), dtype=torch.float32)
+        if (keep_perm_data and welch) else None
+    )
 
     pool_denom = float(nA + nB - 2)
     pool_factor = float(1.0 / nA + 1.0 / nB)
@@ -364,12 +391,28 @@ def two_sample_t_perm(
             ssqB = sum_y2_chunk[None, :] - ssqA
             mA = sumA / nA
             mB = sumB / nB
-            # pooled SS: (SSA - nA·mA²) + (SSB - nB·mB²)
-            pooled_ss = ssqA - nA * mA * mA + ssqB - nB * mB * mB
-            var_pool = pooled_ss / pool_denom
-            denom = torch.sqrt((var_pool * pool_factor).clamp_min(1e-30))
+            if welch:
+                # Bessel-corrected per-group variance, per perm
+                var_A = (ssqA - nA * mA * mA) / (nA - 1)
+                var_B = (ssqB - nB * mB * mB) / (nB - 1)
+                denom = torch.sqrt(
+                    (var_A / nA + var_B / nB).clamp_min(1e-30),
+                )
+            else:
+                # pooled SS: (SSA - nA·mA²) + (SSB - nB·mB²)
+                pooled_ss = ssqA - nA * mA * mA + ssqB - nB * mB * mB
+                var_pool = pooled_ss / pool_denom
+                denom = torch.sqrt((var_pool * pool_factor).clamp_min(1e-30))
             t = (mA - mB) / denom
             t_out[p0:p1, v0:v1] = t.cpu()
+            if perm_mA is not None and perm_mB is not None:
+                perm_mA[p0:p1, v0:v1] = mA.cpu()
+                perm_mB[p0:p1, v0:v1] = mB.cpu()
+                if welch and perm_varA is not None and perm_varB is not None:
+                    perm_varA[p0:p1, v0:v1] = var_A.cpu()
+                    perm_varB[p0:p1, v0:v1] = var_B.cpu()
+                elif perm_var is not None:
+                    perm_var[p0:p1, v0:v1] = var_pool.cpu()
 
         if bar is not None:
             bar.update(1)
@@ -377,4 +420,16 @@ def two_sample_t_perm(
         bar.close()
 
     diff = meanA - meanB
-    return PermStats(t=t_out, mean=diff, extras={"meanA": meanA, "meanB": meanB}, dof=dof)
+    extras: dict = {"meanA": meanA, "meanB": meanB}
+    if keep_perm_data:
+        extras["perm_mA"] = perm_mA
+        extras["perm_mB"] = perm_mB
+        extras["_nA"] = nA
+        extras["_nB"] = nB
+        if welch:
+            extras["perm_varA"] = perm_varA
+            extras["perm_varB"] = perm_varB
+        else:
+            extras["perm_var"] = perm_var
+            extras["pool_factor"] = pool_factor
+    return PermStats(t=t_out, mean=diff, extras=extras, dof=dof)

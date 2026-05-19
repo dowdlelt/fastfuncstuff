@@ -281,6 +281,30 @@ def uncorrected_p_from_perms(t_obs_pv: np.ndarray, sidedness: str) -> np.ndarray
     return ge / float(p)
 
 
+def empirical_tcrits(
+    perm_pseudo_t: np.ndarray,
+    pthr: tuple[float, ...],
+    sidedness: str,
+) -> np.ndarray:
+    """Cluster-defining tcrits from a permutation null when no parametric
+    distribution applies (i.e. pseudo-t under variance smoothing).
+
+    Pools the per-perm permutation null over voxels and perms (under H0
+    each voxel's null is identically distributed within an EB, so pooling
+    is exchangeability-justified) and returns the ``(1 - pthr)`` quantile
+    at each pthr.
+
+    * ``1-sided``: ``tcrit_i = quantile(t_null, 1 - pthr[i])``
+    * ``2-sided`` / ``bi-sided``: ``tcrit_i = quantile(|t_null|, 1 - pthr[i])``
+    """
+    if sidedness == "1-sided":
+        vals = perm_pseudo_t[1:].ravel()  # drop identity
+    else:
+        vals = np.abs(perm_pseudo_t[1:].ravel())
+    qs = np.array([1.0 - p for p in pthr], dtype=np.float64)
+    return np.quantile(vals, qs, method="linear").astype(np.float64)
+
+
 def p_to_t(p: np.ndarray, dof: int, sidedness: str) -> np.ndarray:
     """Convert a per-voxel p back to a t-value for viewer thresholding.
 
@@ -314,6 +338,7 @@ def _null_worker_init(
     nns: tuple[int, ...],
     sideds: tuple[str, ...],
     fast: bool,
+    tcrits_override: dict[str, np.ndarray] | None = None,
 ) -> None:
     _NULL_WORKER_STATE["mask"] = mask
     _NULL_WORKER_STATE["dof"] = dof
@@ -321,11 +346,17 @@ def _null_worker_init(
     _NULL_WORKER_STATE["nns"] = nns
     _NULL_WORKER_STATE["sideds"] = sideds
     _NULL_WORKER_STATE["fast"] = fast
-    _NULL_WORKER_STATE["tcrits"] = {
-        (s, ip): _t_critical(p, dof, s)
-        for s in sideds
-        for ip, p in enumerate(pthr)
-    }
+    if tcrits_override is not None:
+        _NULL_WORKER_STATE["tcrits"] = {
+            (s, ip): float(tcrits_override[s][ip])
+            for s in sideds for ip in range(len(pthr))
+        }
+    else:
+        _NULL_WORKER_STATE["tcrits"] = {
+            (s, ip): _t_critical(p, dof, s)
+            for s in sideds
+            for ip, p in enumerate(pthr)
+        }
 
     if fast:
         # Pre-compute fast-path scratch buffers and helpers.
@@ -339,24 +370,19 @@ def _null_worker_init(
         _NULL_WORKER_STATE["size_scratch"] = np.zeros(v_total, dtype=np.int64)
         # tcrits per sided, descending (the Numba kernel expects sorted desc)
         tcrits_by_sided = {}
-        for s in sideds:
-            arr = np.array(
-                [_t_critical(p, dof, s) for p in pthr], dtype=np.float64,
-            )
-            # pthr defaults are already descending in p (most→least permissive),
-            # which means tcrit goes ascending.  Sort descending now.
-            tcrits_by_sided[s] = np.sort(arr)[::-1].copy()
-            # Map between original pthr index and descending order so we can
-            # write back into [pc, npthr] columns properly.
-        _NULL_WORKER_STATE["tcrits_by_sided"] = tcrits_by_sided
-        # Index permutation: for each sided, perm_to_orig[k] = original pthr
-        # index of the k-th descending-tcrit entry.
         perm_to_orig = {}
         for s in sideds:
-            tcrit_arr = np.array(
-                [_t_critical(p, dof, s) for p in pthr], dtype=np.float64,
-            )
-            perm_to_orig[s] = np.argsort(-tcrit_arr).astype(np.int64)
+            if tcrits_override is not None:
+                arr = np.asarray(tcrits_override[s], dtype=np.float64)
+            else:
+                arr = np.array(
+                    [_t_critical(p, dof, s) for p in pthr], dtype=np.float64,
+                )
+            # Sort descending by tcrit (stricter pthr → larger tcrit).
+            order = np.argsort(-arr)
+            tcrits_by_sided[s] = arr[order].copy()
+            perm_to_orig[s] = order.astype(np.int64)
+        _NULL_WORKER_STATE["tcrits_by_sided"] = tcrits_by_sided
         _NULL_WORKER_STATE["perm_to_orig"] = perm_to_orig
 
 
@@ -436,6 +462,7 @@ def accumulate_cluster_null(
     n_jobs: int | None = None,
     verbose: bool = True,
     fast: bool = True,
+    tcrits_override: dict[str, np.ndarray] | None = None,
 ) -> ClusterNull:
     """Build the ``ClusterNull`` over all permutations, in parallel.
 
@@ -460,7 +487,7 @@ def accumulate_cluster_null(
     n_jobs = min(n_jobs, n_perms)
 
     if n_jobs <= 1:
-        _null_worker_init(mask, dof, pthr, nns, sideds, fast)
+        _null_worker_init(mask, dof, pthr, nns, sideds, fast, tcrits_override)
         bar = tqdm(total=n_perms, desc="cluster null", leave=True, disable=not verbose)
         for p in range(n_perms):
             _, me, mm = _null_worker_chunk((p, t[p:p + 1]))
@@ -486,7 +513,7 @@ def accumulate_cluster_null(
         max_workers=n_jobs,
         mp_context=ctx,
         initializer=_null_worker_init,
-        initargs=(mask, dof, pthr, nns, sideds, fast),
+        initargs=(mask, dof, pthr, nns, sideds, fast, tcrits_override),
     )
     bar = tqdm(total=n_perms, desc="cluster null", leave=True, disable=not verbose)
     try:
