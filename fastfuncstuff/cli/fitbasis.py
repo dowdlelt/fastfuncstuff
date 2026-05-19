@@ -1316,6 +1316,19 @@ def main() -> int:
             vb_iter = 0
             for vb_iter in range(1, args.vb_iters + 1):
                 print(f"\n  VB iter {vb_iter}/{args.vb_iters}…")
+                # Free the previous iter's whitened-cell state BEFORE
+                # we allocate anything for this iter.  Cells hold ~7 GB
+                # at 9.4T scale (data + packed designs per cell).
+                # Residuals use the original per_run_data / fit.betas,
+                # not the cells, so dropping them now is safe — and
+                # essential, since compute_per_voxel_residuals itself
+                # OOMs allocating y_pred when 14 GB of cells are
+                # still resident.
+                arma_cells = None
+                cell_packed_cache.clear()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
                 # 1. Residuals in original space.
                 nuis_betas_arr = (
                     fit.betas[:, n_task_cols:]
@@ -1329,17 +1342,6 @@ def main() -> int:
                     nuisance_betas=nuis_betas_arr,
                     device=device,
                 )
-                # Free the previous iter's whitened-cell state — the
-                # 88 cells hold a full copy of the data on GPU + the
-                # packed designs (~7 GB at 9.4T scale).  Residuals
-                # have been computed already (they use the original
-                # per_run_data, not the cells), so the cells are no
-                # longer needed.  Without this, the next REML
-                # precompute + Y_full allocation OOMs.
-                arma_cells = None
-                cell_packed_cache.clear()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
                 # 2. Re-estimate (a, b) from residuals.  Use polort=-1
                 # (residuals are already drift-free).
                 new_ab = estimate_arma11_per_voxel(
