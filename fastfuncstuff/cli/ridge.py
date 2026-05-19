@@ -676,6 +676,21 @@ def main():
     print("=" * 70)
     print()
 
+    # When per-voxel HRFs are in play (-hrf_opt provided indices),
+    # the timeseries-CV path can't process the resulting per-HRF
+    # design tensor (shape (n_HRFs, n_t, n_trials)) and the only
+    # sane storage avenue is the beta-space CV path (which groups
+    # voxels by HRF index, processes each group with its own design
+    # matrix, no per-voxel design materialisation).  Auto-enable it
+    # rather than crashing on a non-obvious ValueError from
+    # fit_ridge_single_trial.
+    if hrf_indices is not None and not args.single_trials:
+        print(
+            "  NOTE: per-voxel HRF library detected (-hrf_opt provided "
+            "hrf_indices); auto-enabling beta-space CV (-single_trials)."
+        )
+        args.single_trials = True
+
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
         from fastfuncstuff.glm.outputs import save_single_trial_results
