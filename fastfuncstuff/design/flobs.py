@@ -568,10 +568,18 @@ def fit_basis_constrained_ridge(
     # cuda data avoids unnecessary host↔device transfers per chunk.
     # (Old code forced CPU "for safety" and re-uploaded chunks every
     # call — wasteful for cuda users with enough memory.)
+    # Keep ``y`` in its original dtype/device — upcasting the entire
+    # (n_voxels × n_t) tensor to float64 up front doubles peak memory
+    # and OOMs on big data even before the chunked passes start
+    # (e.g. 381k × 2380 × 8B = 7.2 GB on top of the existing float32
+    # copy already on GPU).  The chunk loops below cast per-chunk
+    # with ``.to(device=device, dtype=torch.float64)``, so the math
+    # remains float64 where it matters; only the storage stays in
+    # its original precision.
     y = (
-        torch.as_tensor(data, dtype=torch.float64)
+        torch.as_tensor(data)
         if not isinstance(data, torch.Tensor)
-        else data.to(dtype=torch.float64)
+        else data
     )
     X = (
         torch.as_tensor(design_task, dtype=torch.float64, device=device)
@@ -692,7 +700,9 @@ def fit_basis_constrained_ridge(
         leave=False, disable=n_chunks_p1 <= 1,
     ):
         end = min(start + chunk_size, n_voxels)
-        y_chunk = y[start:end].to(device, non_blocking=True)      # (chunk, n_t)
+        y_chunk = y[start:end].to(
+            device=device, dtype=torch.float64, non_blocking=True,
+        )                                                            # (chunk, n_t)
         Xty_chunk = X_full.T @ y_chunk.T                          # (n_cols, chunk)
         if use_chol_ols:
             beta_chunk = torch.cholesky_solve(Xty_chunk, L0)
@@ -794,7 +804,9 @@ def fit_basis_constrained_ridge(
             leave=False, disable=n_chunks_p2 <= 1,
         ):
             end = min(start + chunk_size, n_voxels)
-            y_chunk = y[start:end].to(device, non_blocking=True)
+            y_chunk = y[start:end].to(
+                device=device, dtype=torch.float64, non_blocking=True,
+            )
             Xty_chunk = X_full.T @ y_chunk.T
             rhs_chunk = Xty_chunk + Pm[:, None]
             if use_chol_A:
@@ -880,7 +892,9 @@ def fit_basis_constrained_ridge(
             leave=False, disable=n_chunks_p2v <= 1,
         ):
             end = min(start + chunk_size, n_voxels)
-            y_chunk = y[start:end].to(device, non_blocking=True)
+            y_chunk = y[start:end].to(
+                device=device, dtype=torch.float64, non_blocking=True,
+            )
             Xty_chunk = X_full.T @ y_chunk.T                       # (n_cols, chunk)
             chunk_bins = voxel_bin[start:end].to(device)
             # Per-voxel Pm: lookup from Pm_per_bin via the bin index.
