@@ -1286,6 +1286,296 @@ class FracRidgeFitResult:
     effective_prior_weight: float = 0.0
 
 
+def fit_basis_lss(
+    per_run_data: list[torch.Tensor],
+    per_run_designs: list[torch.Tensor],
+    block_labels: list[str],
+    condition_labels: list[str],
+    basis_functions: np.ndarray,
+    prior_mean: np.ndarray,
+    prior_cov: np.ndarray,
+    polort: int,
+    *,
+    prior_weight: float | str = "auto",
+    lambda_mode: str = "global",
+    lambda_n_bins: int = 20,
+    lss_exclude: list[str] | None = None,
+    lsa_fit: "FLOBSFitResult | None" = None,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> "FLOBSFitResult":
+    """Least-Squares-Separate single-trial fit (LSS).
+
+    Per-trial estimator commonly used in single-trial fMRI work
+    (Mumford 2012, also GLMsingle / 3dLSS).  For each non-excluded
+    trial, fit a small design with:
+
+    - ``K`` cols for the current trial's onset × basis
+    - ``K`` cols for the sum of all *other* trials in the trial's
+      home condition
+    - ``K`` cols per *other condition* (sum of all trials in that
+      cond)
+
+    The shape prior (m, C) is applied only to the **current trial's**
+    K cols; the rest are nuisance.  Reduces the trial-to-trial
+    coefficient collinearity that the all-at-once "LSA" path suffers
+    from when trials are tightly packed.
+
+    Excluded conditions (``lss_exclude``) contribute their summed
+    K-col regressor to every LSS design but are not iterated over;
+    their per-cond β comes from a parallel LSA fit (which the caller
+    can also supply via ``lsa_fit`` to avoid redundant work).
+
+    ``prior_weight_per_voxel`` is computed once from the LSA fit's
+    per-voxel residual variance (``lsa_fit.sigma2_per_voxel``) and
+    passed to every per-trial fit; this avoids each LSS solve
+    estimating its own (partially-conditioned) σ² from too little
+    data.
+
+    Parameters mirror :func:`fit_basis_constrained_ridge` for the
+    reg / prior knobs; ``polort`` is the per-run polynomial degree
+    (projected out once, before the per-trial loop).
+
+    Returns a :class:`FLOBSFitResult` whose ``betas`` and
+    ``betas_ols`` match the standard single-trial layout
+    ``(n_voxels, n_total_cols)`` — first ``n_blocks × n_basis``
+    entries are the per-trial task betas (LSS for non-excluded
+    trials, LSA for excluded), then per-run polynomial nuisance.
+    """
+    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+    from fastfuncstuff.design.builder import legendre_polynomials
+
+    if device is None:
+        device = get_device()
+    if lss_exclude is None:
+        lss_exclude = []
+    excluded_set = set(lss_exclude)
+
+    n_basis = basis_functions.shape[0]
+    n_runs = len(per_run_data)
+    n_blocks = len(block_labels)
+    n_voxels = per_run_data[0].shape[0]
+    n_tp_per_run = [d.shape[1] for d in per_run_data]
+    total_tp = int(sum(n_tp_per_run))
+    run_starts = [0]
+    for n in n_tp_per_run[:-1]:
+        run_starts.append(run_starts[-1] + n)
+    n_task_cols_full = n_blocks * n_basis
+
+    # Map block_label → condition + trial-index-within-cond.
+    cond_to_blocks: dict[str, list[int]] = {c: [] for c in condition_labels}
+    block_to_cond: list[str] = []
+    for b, label in enumerate(block_labels):
+        cond, _, _ = str(label).partition("_trial")
+        if cond not in cond_to_blocks:
+            raise ValueError(
+                f"block_label {label!r} has condition {cond!r} not in "
+                f"condition_labels {condition_labels}"
+            )
+        cond_to_blocks[cond].append(b)
+        block_to_cond.append(cond)
+
+    # We need a full LSA single-trial fit for: (a) the unconstrained
+    # baseline in betas_ols, (b) σ²_v for the LSS prior weight, (c) the
+    # excluded conditions' main betas.  Caller can pre-supply ``lsa_fit``
+    # to avoid redundant work; otherwise we run it here.
+    if lsa_fit is None:
+        if verbose:
+            print("  LSS: running LSA pre-fit (provides σ²_v, excluded "
+                  "conditions' main betas, and unconstrained baseline)…")
+        from fastfuncstuff.design.builder import pack_for_shared_task_glm
+        packed_lsa = pack_for_shared_task_glm(
+            per_run_data=per_run_data,
+            per_run_task_designs=per_run_designs,
+            polort=polort, device=device,
+        )
+        lsa_fit = fit_basis_constrained_ridge(
+            data=packed_lsa.data_concat,
+            design_task=packed_lsa.design_concat[:, :n_task_cols_full],
+            basis_functions=basis_functions,
+            prior_mean=prior_mean, prior_cov=prior_cov,
+            n_blocks=n_blocks,
+            nuisance=(
+                packed_lsa.design_concat[:, n_task_cols_full:]
+                if packed_lsa.design_concat.shape[1] > n_task_cols_full
+                else None
+            ),
+            prior_weight=prior_weight, device=device,
+            reconstruct_hrfs=False,
+            lambda_mode=lambda_mode, lambda_n_bins=lambda_n_bins,
+            return_vb_diagnostics=True,
+        )
+        del packed_lsa
+
+    sigma2_per_voxel = lsa_fit.sigma2_per_voxel
+    if sigma2_per_voxel is None:
+        # Caller passed an lsa_fit without diagnostics — fall back to a
+        # uniform σ²_mean.  Less Bayesian-honest but won't crash.
+        sigma2_per_voxel = np.full(
+            n_voxels, float(lsa_fit.sigma2_mean), dtype=np.float32,
+        )
+    user_mult = 1.0 if isinstance(prior_weight, str) else float(prior_weight)
+    prior_pw_per_voxel = (sigma2_per_voxel * user_mult).astype(np.float32)
+
+    # ── Project per-run polys out of data + per-trial designs ───────
+    # After projection the LSS design is purely task (block 1..3 per
+    # trial), no polynomial cols.  Each LSS fit then has just the
+    # per-trial task block as ``task`` and the rest of the trial's
+    # design as ``nuisance`` (un-penalised).
+    data_full = torch.cat(
+        [d.to(device).float() for d in per_run_data], dim=1,
+    )                                                            # (n_vox, total_tp)
+    design_full = torch.cat(
+        [d.to(device).float() for d in per_run_designs], dim=0,
+    )                                                            # (total_tp, n_blocks*K)
+    if polort >= 0:
+        nuisance_per_run = [
+            torch.from_numpy(
+                legendre_polynomials(n_tp_per_run[r], polort)
+            ).to(device=device, dtype=torch.float32)
+            for r in range(n_runs)
+        ]
+        if verbose:
+            print(
+                f"  LSS: projecting out per-run polynomials "
+                f"(polort={polort}, {polort + 1} cols × {n_runs} runs)…"
+            )
+        data_clean, design_clean = project_out_nuisance_per_run(
+            data=data_full, design=design_full,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts, device=device, verbose=False,
+        )
+        if data_clean.device != device:
+            data_clean = data_clean.to(device)
+        if design_clean.device != device:
+            design_clean = design_clean.to(device)
+    else:
+        data_clean, design_clean = data_full, design_full
+    del data_full, design_full
+
+    # Per-condition aggregated designs (sum of all that cond's trial
+    # designs across runs).  Shape: (n_cond, total_tp, K).
+    cond_full_designs: dict[str, torch.Tensor] = {}
+    for c in condition_labels:
+        block_ids = cond_to_blocks[c]
+        if not block_ids:
+            cond_full_designs[c] = torch.zeros(
+                total_tp, n_basis, device=device, dtype=torch.float32,
+            )
+            continue
+        # Slice design_clean columns for this cond's blocks and sum.
+        accum = torch.zeros(
+            total_tp, n_basis, device=device, dtype=torch.float32,
+        )
+        for b in block_ids:
+            accum = accum + design_clean[:, b * n_basis:(b + 1) * n_basis]
+        cond_full_designs[c] = accum
+
+    # Initialize result betas from LSA — excluded conds keep their LSA
+    # values; non-excluded conds will be overwritten by LSS below.
+    betas_full = lsa_fit.betas.copy()
+    betas_ols_full = lsa_fit.betas_ols.copy()
+
+    # ── LSS per (non-excluded cond, trial in cond) ──────────────────
+    non_excluded_blocks: list[int] = [
+        b for b, c in enumerate(block_to_cond) if c not in excluded_set
+    ]
+    if not non_excluded_blocks:
+        if verbose:
+            print(
+                "  LSS: all conditions are -lss-exclude'd; nothing to "
+                "fit per-trial.  Returning LSA result."
+            )
+        return lsa_fit
+
+    if verbose:
+        n_excluded_blocks = n_blocks - len(non_excluded_blocks)
+        excluded_str = (
+            f"; {n_excluded_blocks} excluded-cond blocks keep LSA betas"
+            if excluded_set else ""
+        )
+        print(
+            f"  LSS: fitting {len(non_excluded_blocks)} trials "
+            f"({len(condition_labels) - len(excluded_set)} active "
+            f"conditions × ~{len(non_excluded_blocks) // max(1, len(condition_labels) - len(excluded_set))} "
+            f"trials each){excluded_str}…"
+        )
+
+    # Per-trial loop.  Each fit is small (K_total ≈ 4-12 task cols × K)
+    # so we delegate to fit_basis_constrained_ridge directly with
+    # n_blocks=1 (only the current trial's K cols are penalised).
+    trial_iter = tqdm(
+        non_excluded_blocks, total=len(non_excluded_blocks),
+        desc="  LSS trials", unit="trial",
+        leave=False, disable=(not verbose) or len(non_excluded_blocks) <= 1,
+    )
+    for b in trial_iter:
+        cond = block_to_cond[b]
+        # Block 1: this trial's K cols.
+        X_trial = design_clean[:, b * n_basis:(b + 1) * n_basis]    # (T, K)
+        # Block 2: rest of this cond (cond_full − trial).
+        X_rest_of_cond = cond_full_designs[cond] - X_trial            # (T, K)
+        # Block 3: other conds' summed designs (one K-col block each).
+        other_blocks: list[torch.Tensor] = []
+        for other_c in condition_labels:
+            if other_c == cond:
+                continue
+            other_blocks.append(cond_full_designs[other_c])
+        if other_blocks:
+            X_other_conds = torch.cat(other_blocks, dim=1)            # (T, K * (n_cond - 1))
+            nuisance_trial = torch.cat(
+                [X_rest_of_cond, X_other_conds], dim=1,
+            )                                                          # (T, K + K*(n_cond - 1))
+        else:
+            nuisance_trial = X_rest_of_cond
+
+        # Solve the LSS system: task = trial's K cols (penalised by
+        # the user's chosen (m, C) prior); nuisance = everything else
+        # (un-penalised).  σ²_v passed via prior_weight_per_voxel so
+        # the partial fit doesn't re-estimate it.
+        trial_fit = fit_basis_constrained_ridge(
+            data=data_clean,
+            design_task=X_trial,
+            basis_functions=basis_functions,
+            prior_mean=prior_mean, prior_cov=prior_cov,
+            n_blocks=1,
+            nuisance=nuisance_trial,
+            prior_weight=prior_weight,
+            prior_weight_per_voxel=prior_pw_per_voxel,
+            device=device,
+            reconstruct_hrfs=False,
+            lambda_mode=lambda_mode, lambda_n_bins=lambda_n_bins,
+        )
+        # Overwrite this trial's K betas in the result with the LSS
+        # estimate.  The LSA fit's OLS betas stay (they're the
+        # baseline comparator).
+        betas_full[:, b * n_basis:(b + 1) * n_basis] = (
+            trial_fit.betas[:, :n_basis]
+        )
+
+    if verbose:
+        print(f"  ✓ LSS fit complete ({len(non_excluded_blocks)} trials).")
+
+    # Build the result.  R² of the LSS fit isn't trivially
+    # comparable to the LSA fit (every trial sees a different model),
+    # so we report the LSA R² unchanged — both fits explain the same
+    # data, just split per-trial variance differently.  For real held-
+    # out comparison the caller should use -xval-r2.
+    return FLOBSFitResult(
+        betas=betas_full,
+        hrfs=None,                                  # type: ignore[arg-type]
+        r2=lsa_fit.r2,                               # see above
+        betas_ols=betas_ols_full,
+        hrfs_ols=None,                              # type: ignore[arg-type]
+        r2_ols=lsa_fit.r2_ols,
+        sigma2_mean=lsa_fit.sigma2_mean,
+        effective_prior_weight=lsa_fit.effective_prior_weight,
+        n_iter=1,
+        sigma2_per_voxel=lsa_fit.sigma2_per_voxel,
+        lambda_per_voxel=lsa_fit.lambda_per_voxel,
+    )
+
+
 def fit_basis_fracridge(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],

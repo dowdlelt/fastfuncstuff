@@ -101,6 +101,7 @@ try:
         estimate_arma11_per_voxel,
         fit_basis_constrained_ridge,
         fit_basis_fracridge,
+        fit_basis_lss,
         vb_update_beta_size,
         flobs_prior,
         generate_flobs_basis,
@@ -387,6 +388,38 @@ def create_parser() -> argparse.ArgumentParser:
             "Convergence threshold on median |Δa| + |Δb| across voxels "
             "between successive VB iterations.  Default 0.05 (one grid "
             "step in a; tighter values rarely change the final β)."
+        ),
+    )
+    reg_opts.add_argument(
+        "-lss",
+        dest="lss",
+        action="store_true",
+        help=(
+            "Least-Squares-Separate single-trial estimator (Mumford 2012, "
+            "also AFNI 3dLSS / GLMsingle 'L'-mode).  For each trial, fit a "
+            "small design with cols [trial_t | rest_of_cond_c | "
+            "per_other_cond] — the shape prior penalises only the "
+            "current trial's K cols; the rest are nuisance.  Reduces "
+            "trial-to-trial collinearity that the all-at-once LSA path "
+            "suffers from with tightly-packed trials.  Requires "
+            "-single-trials.  Currently supports -reg in {none, ridge, "
+            "mvn, mvn-shape}.  Composes with -prewhiten arma11 (global) "
+            "and -xval-r2; deferred for -prewhiten arma11-voxel, "
+            "-vb-iters, -prior-from per-condition, -reg fracridge."
+        ),
+    )
+    reg_opts.add_argument(
+        "-lss-exclude", "-lss_exclude",
+        dest="lss_exclude",
+        nargs="+",
+        default=[],
+        metavar="COND",
+        help=(
+            "Conditions to exclude from LSS — they contribute their "
+            "summed regressor to every LSS design but are not fit "
+            "per-trial.  These conditions' main betas come from the "
+            "parallel LSA pre-fit.  Useful when only certain conditions "
+            "need trial-level estimates."
         ),
     )
     reg_opts.add_argument(
@@ -1031,7 +1064,68 @@ def main() -> int:
     # build amplitude / iresp downstream in voxel chunks via the
     # memory module's chunk-size estimator.
     print(f"\n  Fitting ({args.model} × {args.reg}) …")
-    if arma_cells is not None:
+    if args.lss:
+        if not args.single_trials:
+            print("ERROR: -lss requires -single-trials.")
+            return 1
+        if args.reg == "fracridge":
+            print(
+                "ERROR: -lss is not yet supported with -reg fracridge. "
+                "Use -reg in {none, ridge, mvn, mvn-shape}."
+            )
+            return 1
+        if arma_cells is not None:
+            print(
+                "ERROR: -lss + -prewhiten arma11-voxel is not yet "
+                "supported.  Use -prewhiten none or -prewhiten arma11 "
+                "(global) with -lss for now."
+            )
+            return 1
+        if args.vb_iters > 0:
+            print(
+                "WARNING: -vb-iters is ignored with -lss (LSS solves "
+                "each trial independently; there's nothing to iterate)."
+            )
+        if args.prior_from == "per-condition":
+            print(
+                "ERROR: -lss + -prior-from per-condition is not yet "
+                "supported.  LSS already anchors each trial to its "
+                "condition-level structure via the rest-of-cond + "
+                "other-cond design columns."
+            )
+            return 1
+        # Validate excluded conditions are real condition labels.
+        bad = [c for c in args.lss_exclude if c not in condition_labels]
+        if bad:
+            print(
+                f"ERROR: -lss-exclude conditions {bad} not in "
+                f"condition_labels {list(condition_labels)}."
+            )
+            return 1
+        fit = fit_basis_lss(
+            per_run_data=per_run_data,
+            per_run_designs=per_run_designs,
+            block_labels=block_labels,
+            condition_labels=list(condition_labels),
+            basis_functions=basis.basis_functions,
+            prior_mean=prior_m, prior_cov=prior_C,
+            polort=polort_resolved,
+            prior_weight=pw,
+            lambda_mode=args.lambda_mode,
+            lambda_n_bins=args.lambda_n_bins,
+            lss_exclude=args.lss_exclude,
+            device=device, verbose=True,
+        )
+        print(
+            f"  ✓ LSS fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+            f"effective λ_mean={fit.effective_prior_weight:.4g}"
+        )
+        print(
+            f"  R² mean — LSA OLS (baseline): {fit.r2_ols.mean():.3f}  "
+            f"LSA constrained: {fit.r2.mean():.3f}  "
+            f"(LSS per-trial R² is not a single value; use -xval-r2)"
+        )
+    elif arma_cells is not None:
         # Per-cell constrained fit — each cell shares (a, b), so it
         # also shares its whitened task design and polynomial nuisance;
         # only the data (and the subset of voxels) differs.
