@@ -504,6 +504,51 @@ def bytes_per_voxel_ica_varnorm(
     return n_timepoints * 4 * 2
 
 
+def bytes_per_voxel_arma_search(
+    n_timepoints: int,
+    n_regressors: int,
+) -> int:
+    """Memory per voxel for the REML grid-search inner loop.
+
+    Used by ``estimate_arma11_per_voxel`` (and ``ffs_reml``'s search
+    path) when scanning all (a, b) grid points against batched voxel
+    timeseries.  Per voxel, per grid point we materialise a whitened
+    Y row (n_timepoints float32), then a small Q'Y_w (n_regressors
+    float32) for the Pythagorean RSS, plus per-voxel result/best-
+    likelihood scratch.  The L_inv and Q matrices themselves are
+    shared across voxels (per grid point) — they live in the
+    precomputed grid, not in the per-voxel chunk.
+
+    Memory model: ``(3 * n_timepoints + n_regressors + 4) * 4 bytes``
+    - Y row on device                : n_timepoints * 4
+    - Y_w transient (L_inv @ Y)      : n_timepoints * 4
+    - resid-scratch (Q' Y_w etc.)    : n_timepoints * 4 (upper bound)
+    - Q'Y_w + likelihood scratch     : n_regressors * 4
+    - best_params / best_likelihoods : 4 floats
+    """
+    return (3 * n_timepoints + n_regressors + 4) * 4
+
+
+def bytes_per_voxel_lss(
+    n_timepoints: int,
+    n_regressors_total: int,
+    n_trials: int,
+) -> int:
+    """Memory per voxel for the batched Least-Squares-Separate solve.
+
+    ``n_regressors_total`` is K_total per trial (trial K + rest-of-cond
+    K + per-other-cond × K).  ``n_trials`` is the per-condition trial
+    count being batched in the current solve.
+
+    Per voxel during a chunk:
+    - y_chunk slice (float32 on device)        : n_timepoints * 4
+    - batched X.T @ y RHS (float64)            : n_trials * K_total * 8
+    - batched β result (float64)               : n_trials * K_total * 8
+    - transient (resid scratch, etc.)          : n_trials * K_total * 8
+    """
+    return n_timepoints * 4 + 3 * n_trials * n_regressors_total * 8
+
+
 def bytes_per_voxel_arma(
     n_timepoints: int,
     n_regressors: int,
@@ -953,6 +998,8 @@ def estimate_chunk_size(
     max_chunk_size: int | None = None,
     safety_factor: float | None = None,
     use_double: bool = False,
+    n_fractions: int = 100,
+    n_trials: int = 1,
     verbose: bool = False,
 ) -> int:
     """
@@ -1036,13 +1083,21 @@ def estimate_chunk_size(
     elif operation == "xval":
         bytes_per_voxel = bytes_per_voxel_xval(n_timepoints, n_regressors)
     elif operation == "ridge":
-        bytes_per_voxel = bytes_per_voxel_ridge(n_timepoints, n_regressors)
+        bytes_per_voxel = bytes_per_voxel_ridge(
+            n_timepoints, n_regressors, n_fractions=n_fractions,
+        )
     elif operation == "denoise":
         bytes_per_voxel = bytes_per_voxel_denoise(n_timepoints, n_regressors)
     elif operation == "ica_varnorm":
         bytes_per_voxel = bytes_per_voxel_ica_varnorm(n_timepoints)
     elif operation == "arma":
         bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
+    elif operation == "arma_search":
+        bytes_per_voxel = bytes_per_voxel_arma_search(n_timepoints, n_regressors)
+    elif operation == "lss":
+        bytes_per_voxel = bytes_per_voxel_lss(
+            n_timepoints, n_regressors, n_trials=n_trials,
+        )
     else:
         bytes_per_voxel = bytes_per_voxel_glm(n_timepoints, n_regressors)
 

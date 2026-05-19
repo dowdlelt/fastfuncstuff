@@ -1713,30 +1713,19 @@ def fit_basis_lss(
         # with n_fractions=N_c approximates the N-trials-of-K_total-
         # results-per-voxel cost; n_regressors=K_total and
         # n_timepoints=total_tp keep it timeseries-aware.
+        # Chunk size via the memory module — "lss" operation models
+        # the per-voxel batched-trial cost (y_chunk + RHS + β float64
+        # all scaled by N_c).  Captures T (timepoints), K_total
+        # (regressors per trial), and N_c (trials in this condition).
         from fastfuncstuff.memory import estimate_chunk_size
         chunk_size_lss = estimate_chunk_size(
             n_voxels=n_voxels,
             n_timepoints=total_tp,
             n_regressors=K_total,
             device=device,
-            operation="ridge",
+            operation="lss",
+            n_trials=N_c,
         )
-        # Also pin against measured free VRAM with explicit
-        # accounting — estimate_chunk_size uses a fixed n_fractions
-        # default; this guards against under-/over-estimation when
-        # N_c is large (single-trial 9.4T) or small.
-        if device.type == "cuda":
-            try:
-                free_bytes, _ = torch.cuda.mem_get_info(device)
-            except Exception:
-                free_bytes = 4 * 1024 ** 3
-            bytes_per_vox = (
-                total_tp * 4                                # y_chunk f32
-                + 2 * N_c * K_total * 8                    # RHS + β f64
-                + N_c * K_total * 8                        # transient
-            )
-            chunk_explicit = max(1, int(free_bytes * 0.25 / max(bytes_per_vox, 1)))
-            chunk_size_lss = min(chunk_size_lss, chunk_explicit)
         chunk_size_lss = max(1, min(chunk_size_lss, n_voxels))
 
         # Process each chunk; group voxels in chunk by bin so we
@@ -1946,18 +1935,20 @@ def fit_basis_fracridge(
     # of free VRAM.
     n_features = design_clean.shape[1]
     n_tp_test_max = max(n_tp_per_run)
-    if device.type == "cuda":
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info(device)
-        except Exception:
-            free_bytes = 4 * 1024 ** 3
-        bytes_per_vox_svd = 2 * n_features * n_fracs * 4
-        bytes_per_vox_pred = 3 * n_tp_test_max * n_fracs * 4
-        bytes_per_vox = max(bytes_per_vox_svd, bytes_per_vox_pred)
-        v_chunk = max(1, int(free_bytes * 0.25 / max(bytes_per_vox, 1)))
-        v_chunk = min(v_chunk, n_voxels)
-    else:
-        v_chunk = n_voxels                                  # CPU: no chunking needed
+    # Chunk size via the memory module — the "ridge" operation's
+    # bytes_per_voxel formula scales linearly with n_fractions, which
+    # captures both the SVD-pass coefs tensor and the prediction
+    # pass's per-frac materialisation.
+    from fastfuncstuff.memory import estimate_chunk_size
+    v_chunk = estimate_chunk_size(
+        n_voxels=n_voxels,
+        n_timepoints=n_tp_test_max,
+        n_regressors=n_features,
+        device=device,
+        operation="ridge",
+        n_fractions=n_fracs,
+    )
+    v_chunk = min(v_chunk, n_voxels)
     if verbose:
         n_v_chunks = (n_voxels + v_chunk - 1) // v_chunk
         print(
@@ -2295,26 +2286,18 @@ def estimate_arma11_per_voxel(
     Y_search = Y_full.to(grid_device) if Y_full.device != grid_device else Y_full
     X_search = X_full.to(grid_device) if X_full.device != grid_device else X_full
 
-    # Voxel batching for the search.  Each grid iter materialises a
-    # (n_tp, n_vox_batch) prewhitened-Y tensor and the search loop is
-    # over (n_grid_points × n_batches).  Keep batches comfortably under
-    # available memory; fall back to ~50k voxels when introspection
-    # fails.
-    if grid_device.type == "cuda":
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info(grid_device)
-        except Exception:
-            free_bytes = 4 * 1024 ** 3
-        # Per voxel cost across the inner loop: Y row (n_tp), Y_w row
-        # (n_tp), one rss + qt_yw scratch.  ~4× n_tp float32 = safe.
-        bytes_per_vox = 4 * total_tp * 4
-        # Use ~25 % of free VRAM for the search workspace (the grid
-        # tensors already occupy a chunk of the remaining 75 %).
-        n_vox_batch = max(1, int(free_bytes * 0.25 / max(bytes_per_vox, 1)))
-        n_vox_batch = min(n_vox_batch, n_voxels)
-    else:
-        # CPU path: keep batches modest to avoid blowing host memory.
-        n_vox_batch = min(n_voxels, 50_000)
+    # Voxel batching for the search — through the memory module so
+    # CPU/GPU thresholds, safety factors, and per-op memory models
+    # are all in one place.  See bytes_per_voxel_arma_search.
+    from fastfuncstuff.memory import estimate_chunk_size
+    n_vox_batch = estimate_chunk_size(
+        n_voxels=n_voxels,
+        n_timepoints=total_tp,
+        n_regressors=X_search.shape[1],
+        device=grid_device,
+        operation="arma_search",
+    )
+    n_vox_batch = min(n_vox_batch, n_voxels)
 
     n_batches = (n_voxels + n_vox_batch - 1) // n_vox_batch
     if verbose:
