@@ -654,6 +654,12 @@ def main() -> int:
 
     # ── Parse inputs / events ───────────────────────────────────────
     input_files = parse_input_files(args.input)
+    # parse_input_files expands glob patterns (?, *, [..]) — overwrite
+    # args.input with the expanded list so downstream references
+    # (reference_img=args.input[0] for save_nifti) see real file paths,
+    # not the unexpanded pattern.  When the user's shell already
+    # expanded the glob, this is a no-op.
+    args.input = input_files
     n_runs = len(input_files)
     if has_events:
         from fastfuncstuff.cli_utils import clean_condition_labels  # noqa: F401

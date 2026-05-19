@@ -911,8 +911,28 @@ def fit_basis_constrained_ridge(
             del y_chunk, Xty_chunk, Pm_chunk, rhs_chunk, beta_chunk, pred, resid, ss_res_chunk
 
     # ----------- R² assembly + return -------------------------------
-    r2 = 1.0 - ss_res_constrained_full / torch.clamp(ss_tot_full, min=1e-30)
-    r2_ols = 1.0 - ss_res_ols_full / torch.clamp(ss_tot_full, min=1e-30)
+    # Some voxels have ss_tot ≈ 0 (e.g. zeroed by PSC scaling
+    # violations, dead voxels, or rare constant timeseries).  The naive
+    # ``1 − ss_res/ss_tot`` with a tiny clamp produces enormous negative
+    # R² values for those voxels (the OLS pass *fits* a constant via
+    # the polynomial nuisance → ss_res = 0 → R² = 1, but the
+    # constrained pass shrinks β toward m → ss_res > 0 → R² = 1 − big
+    # / tiny → −1e28).  A single bad voxel like that destroys the
+    # mean R² printed downstream.  Detect them and report R² = 0
+    # (uninformative); a downstream user-visible mask should drop
+    # these voxels anyway.
+    _SS_TOT_MIN = 1e-6                     # well above float32 floor; well below real-data ss_tot
+    _valid_mask = ss_tot_full > _SS_TOT_MIN
+    r2 = torch.where(
+        _valid_mask,
+        1.0 - ss_res_constrained_full / torch.clamp(ss_tot_full, min=_SS_TOT_MIN),
+        torch.zeros_like(ss_tot_full),
+    )
+    r2_ols = torch.where(
+        _valid_mask,
+        1.0 - ss_res_ols_full / torch.clamp(ss_tot_full, min=_SS_TOT_MIN),
+        torch.zeros_like(ss_tot_full),
+    )
 
     betas_np = betas_full.numpy()
     betas_ols_np = beta_ols_full.numpy()
