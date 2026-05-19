@@ -284,6 +284,17 @@ Notes:
         default=None,
         help="Denoisefast output prefix. Loads {prefix}_noise_pcs.xmat.1D as nuisance regressors.",
     )
+    integ_opts.add_argument(
+        "-hrf-library",
+        dest="hrf_library",
+        type=str,
+        default=None,
+        metavar="TSV",
+        help=(
+            "Custom HRF library TSV (e.g. from ffs_librarian).  Used "
+            "when per-voxel HRF indices are loaded via -hrf_opt."
+        ),
+    )
 
     # Processing options
     proc_opts = parser.add_argument_group("Processing Options")
@@ -577,8 +588,14 @@ def main():
         # Load HRF library (reconstruct from metadata or use default)
         # For now, use default library
         hrf_library = get_hrf_library(
-            mode="library", stim_duration=0.0, microtime_dt=args.microtime_dt, n_hrfs=20
+            mode="library",
+            stim_duration=0.0,
+            microtime_dt=args.microtime_dt,
+            n_hrfs=20,
+            library_path=args.hrf_library,
         )
+        if args.hrf_library:
+            print(f"  Loaded custom HRF library from {args.hrf_library}")
         print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
     # Load noise PCs if provided
@@ -658,6 +675,21 @@ def main():
     print("Ridge regression estimation")
     print("=" * 70)
     print()
+
+    # When per-voxel HRFs are in play (-hrf_opt provided indices),
+    # the timeseries-CV path can't process the resulting per-HRF
+    # design tensor (shape (n_HRFs, n_t, n_trials)) and the only
+    # sane storage avenue is the beta-space CV path (which groups
+    # voxels by HRF index, processes each group with its own design
+    # matrix, no per-voxel design materialisation).  Auto-enable it
+    # rather than crashing on a non-obvious ValueError from
+    # fit_ridge_single_trial.
+    if hrf_indices is not None and not args.single_trials:
+        print(
+            "  NOTE: per-voxel HRF library detected (-hrf_opt provided "
+            "hrf_indices); auto-enabling beta-space CV (-single_trials)."
+        )
+        args.single_trials = True
 
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========

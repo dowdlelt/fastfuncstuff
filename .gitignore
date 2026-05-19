@@ -19,7 +19,6 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-CLAUDE.md
 .claude
 .claude/settings.local.json
 .opencode/

@@ -1310,13 +1310,66 @@ def precompute_reml_grid(
         )  # (n_valid, n_timepoints, n_regressors)
         del X_cpu
 
-        # PHASE 5: QR always — eliminates slogdet/DLASWP, enables Pythagorean RSS
-        Q_batch, R_qr_batch = torch.linalg.qr(X_w_batch)
-        # Q_batch: (n_valid, n_time, n_reg), R_qr_batch: (n_valid, n_reg, n_reg)
-        logdet_XwTXw_batch = 2 * torch.sum(
-            torch.log(torch.abs(torch.diagonal(R_qr_batch, dim1=1, dim2=2)) + 1e-10), dim=1
-        )  # (n_valid,)
-        del R_qr_batch  # Not stored; GLS fitting path recomputes fresh QR from X_w
+        # PHASE 5: Compute orthonormal Q spanning the columns of X_w.
+        # Default path: Cholesky of (X_w' X_w).  Operates on the
+        # SMALL n_reg × n_reg matrix instead of the tall n_t × n_reg
+        # used by QR.  For 9.4T-scale single-trial designs (n_t=2380,
+        # n_reg=1260) this is the difference between minutes-on-CPU
+        # (torch.linalg.qr's batched-non-square path falls back to
+        # host iteration for skinny matrices on cuda) and <1s on GPU.
+        #
+        # Math: X_w' X_w = L L'  (Cholesky)
+        #       X_w = Q R  where R = L', Q = X_w · L^-T
+        #       Q' Q = L^-1 (L L') L^-T = I ✓
+        #
+        # Trade-off: Cholesky's condition number is cond(X)², vs QR's
+        # cond(X).  For nearly-collinear X (degenerate single-trial
+        # designs, identical-timing trials), the Cholesky path can
+        # fail or numerically wobble.  We catch that and fall back
+        # to QR — the slow path is then bounded to the rare cases
+        # that actually need it.
+        try:
+            XtX_batch = torch.bmm(
+                X_w_batch.transpose(1, 2), X_w_batch,
+            )                                              # (n_valid, n_reg, n_reg)
+            L_xtx = torch.linalg.cholesky(XtX_batch)        # lower triangular, batched
+            # Q = X_w @ L^-T = solve_triangular(L, X_w.T, lower).T
+            Q_batch = torch.linalg.solve_triangular(
+                L_xtx, X_w_batch.transpose(1, 2), upper=False,
+            ).transpose(1, 2)                              # (n_valid, n_t, n_reg)
+            logdet_XwTXw_batch = 2 * torch.sum(
+                torch.log(
+                    torch.abs(torch.diagonal(L_xtx, dim1=1, dim2=2)) + 1e-10
+                ),
+                dim=1,
+            )                                              # (n_valid,)
+            del XtX_batch, L_xtx
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        except (torch.linalg.LinAlgError, RuntimeError) as e:
+            # ``RuntimeError`` catches CUDA OOM (which doesn't always
+            # propagate as torch.cuda.OutOfMemoryError on older PyTorch
+            # versions) and any other LinAlg-adjacent failures.
+            is_oom = isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+            is_linalg = isinstance(e, torch.linalg.LinAlgError)
+            if not (is_oom or is_linalg):
+                raise
+            if verbose:
+                reason = "OOM" if is_oom else "Cholesky failed (rank-deficient X)"
+                print(
+                    f"  Fast Q path failed ({reason}); falling back to "
+                    f"torch.linalg.qr — slower but more numerically robust."
+                )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            Q_batch, R_qr_batch = torch.linalg.qr(X_w_batch)
+            logdet_XwTXw_batch = 2 * torch.sum(
+                torch.log(
+                    torch.abs(torch.diagonal(R_qr_batch, dim1=1, dim2=2)) + 1e-10
+                ),
+                dim=1,
+            )
+            del R_qr_batch  # Not stored; GLS fitting path recomputes fresh QR from X_w
 
         if verbose:
             print("  ✓ Precomputed all matrices!")
