@@ -1470,11 +1470,11 @@ def fit_basis_lss(
         del packed_lsa
 
     user_mult = 1.0 if isinstance(prior_weight, str) else float(prior_weight)
-    # When the user picked -reg none → prior_weight = 0 → no σ²·user_mult
-    # work is needed at all (the per-trial fits hit the fast path).
-    # Save the per-voxel σ² gathering for the cases that actually use it.
+    # σ²_per_voxel: used in the batched solve below for voxelwise
+    # λ_v binning.  With -reg none (user_mult = 0) the prior is off
+    # and we don't touch it.
     if user_mult == 0.0:
-        prior_pw_per_voxel = None
+        sigma2_per_voxel = np.zeros(n_voxels, dtype=np.float32)
     else:
         sigma2_per_voxel = lsa_fit.sigma2_per_voxel
         if sigma2_per_voxel is None:
@@ -1483,7 +1483,6 @@ def fit_basis_lss(
             sigma2_per_voxel = np.full(
                 n_voxels, float(lsa_fit.sigma2_mean), dtype=np.float32,
             )
-        prior_pw_per_voxel = (sigma2_per_voxel * user_mult).astype(np.float32)
 
     # ── Project per-run polys out of data + per-trial designs ───────
     # After projection the LSS design is purely task (block 1..3 per
@@ -1569,57 +1568,226 @@ def fit_basis_lss(
             f"trials each){excluded_str}…"
         )
 
-    # Per-trial loop.  Each fit is small (K_total ≈ 4-12 task cols × K)
-    # so we delegate to fit_basis_constrained_ridge directly with
-    # n_blocks=1 (only the current trial's K cols are penalised).
-    trial_iter = tqdm(
-        non_excluded_blocks, total=len(non_excluded_blocks),
-        desc="  LSS trials", unit="trial",
-        leave=False, disable=(not verbose) or len(non_excluded_blocks) <= 1,
-    )
-    for b in trial_iter:
-        cond = block_to_cond[b]
-        # Block 1: this trial's K cols.
-        X_trial = design_clean[:, b * n_basis:(b + 1) * n_basis]    # (T, K)
-        # Block 2: rest of this cond (cond_full − trial).
-        X_rest_of_cond = cond_full_designs[cond] - X_trial            # (T, K)
-        # Block 3: other conds' summed designs (one K-col block each).
-        other_blocks: list[torch.Tensor] = []
-        for other_c in condition_labels:
-            if other_c == cond:
-                continue
-            other_blocks.append(cond_full_designs[other_c])
-        if other_blocks:
-            X_other_conds = torch.cat(other_blocks, dim=1)            # (T, K * (n_cond - 1))
-            nuisance_trial = torch.cat(
-                [X_rest_of_cond, X_other_conds], dim=1,
-            )                                                          # (T, K + K*(n_cond - 1))
-        else:
-            nuisance_trial = X_rest_of_cond
+    # ── Batched per-condition LSS solve ─────────────────────────────
+    # Each LSS fit is tiny on GPU (K_total ≈ 4-12 cols + 12×12 Cholesky)
+    # but the previous per-trial call into fit_basis_constrained_ridge
+    # paid a fixed overhead 420 times for our 9.4T-scale runs (5
+    # accumulator buffer allocations + per-call kernel-launch setup).
+    # Batched approach: group all trials of a condition into one
+    # ``(N_c, T, K_total)`` design batch, one batched Cholesky, one
+    # batched cholesky_solve per voxel chunk.  GPU stays busy with
+    # one big op; CPU stays idle except for the result D→H pull.
+    #
+    # Prior handling: penalty applied only to the trial's K cols
+    # (first K rows of A).  For -reg none / scalar λ = 0 we skip the
+    # prior contribution entirely.  For voxelwise σ²·user_mult we
+    # bin voxels by λ_v quantile (same machinery as the regular
+    # voxelwise solver) — one batched Cholesky per (bin, condition).
 
-        # Solve the LSS system: task = trial's K cols (penalised by
-        # the user's chosen (m, C) prior); nuisance = everything else
-        # (un-penalised).  σ²_v passed via prior_weight_per_voxel so
-        # the partial fit doesn't re-estimate it.
-        trial_fit = fit_basis_constrained_ridge(
-            data=data_clean,
-            design_task=X_trial,
-            basis_functions=basis_functions,
-            prior_mean=prior_mean, prior_cov=prior_cov,
-            n_blocks=1,
-            nuisance=nuisance_trial,
-            prior_weight=prior_weight,
-            prior_weight_per_voxel=prior_pw_per_voxel,
+    # Prior tensors on device when needed.
+    if user_mult > 0:
+        C_inv_t = torch.from_numpy(np.linalg.inv(prior_cov)).to(
+            device=device, dtype=torch.float32,
+        )
+        m_t = torch.from_numpy(prior_mean).to(
+            device=device, dtype=torch.float32,
+        )
+        # Per-voxel λ_v and quantile bins (same as voxelwise solver).
+        # Used only when the caller asked for voxelwise mode; in
+        # global mode we use a single bin with σ²_mean as λ.
+        sigma2_v_t = torch.from_numpy(sigma2_per_voxel).to(
+            device=device, dtype=torch.float32,
+        )
+        lambda_per_voxel = (user_mult * sigma2_v_t).clamp_min(0.0)
+        if lambda_mode == "voxelwise":
+            n_bins_eff = max(1, min(int(lambda_n_bins), n_voxels))
+            if n_bins_eff > 1:
+                qs = torch.linspace(0.0, 1.0, n_bins_eff + 1)[1:-1]
+                edges = torch.quantile(
+                    lambda_per_voxel, qs.to(lambda_per_voxel.dtype),
+                )
+                voxel_bin = torch.bucketize(lambda_per_voxel, edges)
+            else:
+                voxel_bin = torch.zeros(n_voxels, dtype=torch.long, device=device)
+            bin_lambdas = torch.empty(n_bins_eff, device=device, dtype=torch.float32)
+            for b_idx in range(n_bins_eff):
+                mask_b = voxel_bin == b_idx
+                bin_lambdas[b_idx] = (
+                    lambda_per_voxel[mask_b].median()
+                    if mask_b.any() else torch.tensor(0.0)
+                )
+        else:
+            n_bins_eff = 1
+            voxel_bin = torch.zeros(n_voxels, dtype=torch.long, device=device)
+            bin_lambdas = torch.tensor(
+                [float(lambda_per_voxel.mean().item())],
+                device=device, dtype=torch.float32,
+            )
+    else:
+        C_inv_t = None
+        m_t = None
+        n_bins_eff = 1
+        voxel_bin = torch.zeros(n_voxels, dtype=torch.long, device=device)
+        bin_lambdas = torch.zeros(1, device=device, dtype=torch.float32)
+
+    # Group blocks by their parent condition for the outer loop.
+    non_excluded_conds: list[str] = [
+        c for c in condition_labels
+        if c not in excluded_set and cond_to_blocks[c]
+    ]
+    cond_iter = tqdm(
+        non_excluded_conds, total=len(non_excluded_conds),
+        desc="  LSS conds × batched solve", unit="cond",
+        leave=False,
+        disable=(not verbose) or len(non_excluded_conds) <= 1,
+    )
+    for cond_label in cond_iter:
+        cond_blocks = cond_to_blocks[cond_label]
+        N_c = len(cond_blocks)
+        if N_c == 0:
+            continue
+        other_conds = [c for c in condition_labels if c != cond_label]
+        n_other = len(other_conds)
+        K_total = n_basis * (2 + n_other)               # trial + rest + per-other-cond
+
+        # Build the batched design ``X_batch`` on device:
+        #   cols [0:K]   = this trial's K cols (per-trial slice)
+        #   cols [K:2K]  = cond_full − trial            (per-trial)
+        #   cols [2K:]   = per-other-cond aggregates    (CONSTANT across trials)
+        X_batch = torch.empty(
+            N_c, total_tp, K_total,
+            device=device, dtype=torch.float32,
+        )
+        for n, b in enumerate(cond_blocks):
+            X_batch[n, :, :n_basis] = design_clean[
+                :, b * n_basis:(b + 1) * n_basis,
+            ]
+        cond_full_c = cond_full_designs[cond_label]      # (T, K)
+        X_batch[:, :, n_basis:2 * n_basis] = (
+            cond_full_c.unsqueeze(0) - X_batch[:, :, :n_basis]
+        )
+        offset = 2 * n_basis
+        for other_c in other_conds:
+            X_batch[:, :, offset:offset + n_basis] = (
+                cond_full_designs[other_c]
+            )
+            offset += n_basis
+
+        # Batched A = X.T X (shared across voxels — depends only on
+        # the design).  (N_c, K_total, K_total).
+        A_batch_base = torch.einsum("ntk,ntj->nkj", X_batch, X_batch)
+
+        # Per-bin: A_bin = A_batch_base + λ_b · P_trial (penalty on
+        # first K rows/cols only).  Pre-factor one Cholesky per bin.
+        P_trial = torch.zeros(
+            K_total, K_total, device=device, dtype=torch.float32,
+        )
+        if C_inv_t is not None:
+            P_trial[:n_basis, :n_basis] = C_inv_t
+        Pm_first_K_per_bin: torch.Tensor | None = None
+        if C_inv_t is not None and m_t is not None:
+            # λ_b · (C⁻¹ · m) for the prior-mean contribution to
+            # the RHS, broadcast per bin.  (n_bins, K)
+            Pm_unit = C_inv_t @ m_t                            # (K,)
+            Pm_first_K_per_bin = bin_lambdas.unsqueeze(-1) * Pm_unit.unsqueeze(0)
+
+        L_per_bin: list[torch.Tensor] = []
+        for b_idx in range(n_bins_eff):
+            A_bin = A_batch_base + float(bin_lambdas[b_idx]) * P_trial
+            try:
+                L_per_bin.append(torch.linalg.cholesky(A_bin))
+            except torch.linalg.LinAlgError:
+                # Singular: fall back to pseudo-inverse.  Rare with
+                # any positive λ; possible for -reg none + degenerate
+                # design.  Synthesize a "Cholesky" by computing
+                # solve directly later via torch.linalg.solve.
+                L_per_bin.append(None)                          # type: ignore[arg-type]
+
+        # ── Voxel-chunked batched solve ──────────────────────────
+        # Per-voxel memory cost during the batched solve:
+        #   y_chunk_b      : T × 4 bytes   (the cell's data slice)
+        #   X.T @ y_chunk_b: N_c × K_total × 8 (float64 RHS)
+        #   β_chunk_batch  : same as RHS
+        #   trial result   : K × N_c × 4 (per-voxel output before D→H)
+        # Use the memory module's GLM/ridge model — operation="ridge"
+        # with n_fractions=N_c approximates the N-trials-of-K_total-
+        # results-per-voxel cost; n_regressors=K_total and
+        # n_timepoints=total_tp keep it timeseries-aware.
+        from fastfuncstuff.memory import estimate_chunk_size
+        chunk_size_lss = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=total_tp,
+            n_regressors=K_total,
             device=device,
-            reconstruct_hrfs=False,
-            lambda_mode=lambda_mode, lambda_n_bins=lambda_n_bins,
+            operation="ridge",
         )
-        # Overwrite this trial's K betas in the result with the LSS
-        # estimate.  The LSA fit's OLS betas stay (they're the
-        # baseline comparator).
-        betas_full[:, b * n_basis:(b + 1) * n_basis] = (
-            trial_fit.betas[:, :n_basis]
-        )
+        # Also pin against measured free VRAM with explicit
+        # accounting — estimate_chunk_size uses a fixed n_fractions
+        # default; this guards against under-/over-estimation when
+        # N_c is large (single-trial 9.4T) or small.
+        if device.type == "cuda":
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(device)
+            except Exception:
+                free_bytes = 4 * 1024 ** 3
+            bytes_per_vox = (
+                total_tp * 4                                # y_chunk f32
+                + 2 * N_c * K_total * 8                    # RHS + β f64
+                + N_c * K_total * 8                        # transient
+            )
+            chunk_explicit = max(1, int(free_bytes * 0.25 / max(bytes_per_vox, 1)))
+            chunk_size_lss = min(chunk_size_lss, chunk_explicit)
+        chunk_size_lss = max(1, min(chunk_size_lss, n_voxels))
+
+        # Process each chunk; group voxels in chunk by bin so we
+        # use the right Cholesky factor.
+        for v0 in range(0, n_voxels, chunk_size_lss):
+            v1 = min(v0 + chunk_size_lss, n_voxels)
+            chunk_bin_ids = voxel_bin[v0:v1]
+            for b_idx in range(n_bins_eff):
+                in_bin_mask = chunk_bin_ids == b_idx
+                if not in_bin_mask.any():
+                    continue
+                vox_local = torch.where(in_bin_mask)[0]
+                vox_global = vox_local + v0
+                # Slice this bin's voxels (data on device).
+                y_chunk_b = data_clean[vox_global]                   # (V_b, T)
+                # Batched RHS: (N_c, K_total, V_b).  Cast to float64
+                # only for the BLAS-3 step that needs it.
+                Xty = torch.einsum(
+                    "ntk,vt->nkv",
+                    X_batch.to(torch.float64),
+                    y_chunk_b.to(torch.float64),
+                )
+                if Pm_first_K_per_bin is not None:
+                    Xty[:, :n_basis, :] += (
+                        Pm_first_K_per_bin[b_idx].unsqueeze(0).unsqueeze(-1).to(torch.float64)
+                    )
+                # Batched solve.
+                L_b = L_per_bin[b_idx]
+                if L_b is not None:
+                    beta_batch = torch.cholesky_solve(Xty, L_b.to(torch.float64))
+                else:
+                    # Fall back to direct solve (slower; only on singular A).
+                    A_bin_64 = (
+                        A_batch_base + float(bin_lambdas[b_idx]) * P_trial
+                    ).to(torch.float64)
+                    beta_batch = torch.linalg.solve(A_bin_64, Xty)
+                # Extract trial betas (first K rows): (N_c, K, V_b).
+                trial_betas = beta_batch[:, :n_basis, :].cpu().numpy()
+                # Scatter into betas_full at each trial's column block.
+                vox_global_np = vox_global.cpu().numpy()
+                for n, b_global in enumerate(cond_blocks):
+                    # trial_betas[n] is (K, V_b) → write transpose into
+                    # betas_full[vox_global, b_global*K:(b_global+1)*K].
+                    betas_full[
+                        vox_global_np, b_global * n_basis:(b_global + 1) * n_basis,
+                    ] = trial_betas[n].T
+                del Xty, beta_batch, trial_betas, y_chunk_b
+
+        del X_batch, A_batch_base, P_trial, L_per_bin
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     if verbose:
         print(f"  ✓ LSS fit complete ({len(non_excluded_blocks)} trials).")
