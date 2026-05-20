@@ -13,8 +13,14 @@ For help:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Reduce CUDA fragmentation: groups allocate/free n_time×n_time Cholesky tensors
+# in a loop while a multi-GB grid stays resident — exactly the workload
+# expandable_segments was built for. Must be set before `import torch`.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -387,15 +393,17 @@ Examples:
     # Special output options
     special_out = parser.add_argument_group("Special Output Options")
     special_out.add_argument(
-        "-single_trials",
+        "-single_trials", "-single-trials",
+        dest="single_trials",
         type=str,
         default=None,
         metavar="LABEL",
         help=(
-            "Output single-trial betas reordered by presentation time (onset order). "
-            "LABEL will be inserted into filenames: ols_LABEL_single.nii.gz and reml_LABEL_single.nii.gz. "
-            "Trials are sorted chronologically by onset time instead of by column order. "
-            "Only includes stimulus columns."
+            "Single-trial mode. Rebuilds the design so each event onset is its own "
+            "regressor (GLMsingle-style) and fits trial-specific betas, then writes "
+            "them ordered chronologically. LABEL is inserted into filenames: "
+            "ols_LABEL_single.nii.gz, reml_LABEL_single.nii.gz. Requires -events or "
+            "-onsets/-durations; not compatible with -matrix, -hrfopt_prefix, or FIR/TENT."
         ),
     )
 
@@ -681,6 +689,17 @@ Examples:
              "FIR/TENT use durations to set window (default: 0 to max(durations)). "
              "Example: 'TENT(0,15,6)' for 6 tent basis functions from 0-15s",
     )
+    onset_group.add_argument(
+        "-hrfopt_prefix", "-hrf-opt", "-hrf_opt",
+        dest="hrfopt_prefix",
+        type=str,
+        default=None,
+        help=(
+            "Per-voxel HRF mode. PREFIX from ffs_hrfopt — loads {PREFIX}_hrf_index.nii.gz "
+            "and {PREFIX}_hrf_library.pt. Each voxel is fit with its assigned HRF. "
+            "Requires -events or -onsets; mutually exclusive with -matrix."
+        ),
+    )
 
     return parser
 
@@ -758,7 +777,8 @@ def print_output_summary(args):
     if args.single_trials:
         label = args.single_trials
         special_outputs.append(
-            f"  • Single-trial betas (onset order): ols_{label}_single.nii.gz, reml_{label}_single.nii.gz"
+            f"  • Single-trial mode (one regressor per event, chronological output): "
+            f"ols_{label}_single.nii.gz, reml_{label}_single.nii.gz"
         )
 
     if special_outputs:
@@ -828,6 +848,24 @@ def main():
         sys.exit(1)
     if args.event_cols and not args.events:
         print("ERROR: -event_cols requires -events")
+        sys.exit(1)
+
+    # Per-voxel HRF needs the design built from onsets/events — a pre-built
+    # AFNI .xmat.1D file fixed the HRF at build time, so per-voxel HRFs are
+    # mathematically impossible from that input.
+    if args.hrfopt_prefix and not (args.events or args.onsets):
+        print(
+            "ERROR: -hrfopt_prefix requires -events or -onsets/-durations "
+            "(design must be built from onsets, not a pre-built -matrix)."
+        )
+        sys.exit(1)
+
+    # Single-trial design needs onset times; -matrix lacks per-event structure.
+    if args.single_trials and not (args.events or args.onsets):
+        print(
+            "ERROR: -single_trials requires -events or -onsets/-durations "
+            "(per-event regressors must be built from onsets, not a pre-built -matrix)."
+        )
         sys.exit(1)
 
     # Check that at least one output is requested
@@ -1147,6 +1185,34 @@ def main():
             args.microtime_dt, durations, device)
         print(f"  Onset matrix shape: {onset_matrix_micro.shape}")
 
+        # Per-voxel HRF: load assignments + library if -hrfopt_prefix set
+        hrf_library_obj = None
+        hrf_indices_obj = None
+        if args.hrfopt_prefix:
+            from fastfuncstuff.glm.ridge import load_hrf_indices
+
+            hrf_index_file = f"{args.hrfopt_prefix}_hrf_index.nii.gz"
+            hrf_lib_file = f"{args.hrfopt_prefix}_hrf_library.pt"
+            if not Path(hrf_index_file).exists():
+                print(f"ERROR: HRF index file not found: {hrf_index_file}")
+                print(f"  Expected ffs_hrfopt output with prefix: {args.hrfopt_prefix}")
+                sys.exit(1)
+            if not Path(hrf_lib_file).exists():
+                print(f"ERROR: HRF library file not found: {hrf_lib_file}")
+                sys.exit(1)
+
+            print()
+            print(f"Loading per-voxel HRF assignments from {args.hrfopt_prefix}...")
+            # Volume-aligned (no mask) — analyze_from_design_matrix masks alongside data
+            hrf_indices_obj = load_hrf_indices(hrf_index_file, mask=None)
+            hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
+            hrf_library_obj = hrf_lib_data["hrf_library"].to(device)
+            unique_hrfs, counts = torch.unique(hrf_indices_obj, return_counts=True)
+            print(f"  HRF library shape: {tuple(hrf_library_obj.shape)}")
+            print(
+                f"  {len(unique_hrfs)} unique HRFs across {hrf_indices_obj.numel():,} volume voxels"
+            )
+
         # Build task design matrix using refactored function
         print()
         from fastfuncstuff.cli_utils import build_task_design_from_args
@@ -1165,14 +1231,96 @@ def main():
             tr=args.tr,
             microtime_dt=args.microtime_dt,
             device=device,
-            hrf_opt=None,  # ffs_reml doesn't support per-voxel HRFs
-            hrf_library=None,
-            hrf_indices=None,
-            n_voxels=None,
+            hrf_opt=args.hrfopt_prefix,
+            hrf_library=hrf_library_obj,
+            hrf_indices=hrf_indices_obj,
+            n_voxels=hrf_indices_obj.numel() if hrf_indices_obj is not None else None,
         )
 
-        assert task_design is not None, "ffs_reml requires single design (no per-voxel HRFs)"
-        print(f"  Task design shape: {task_design.shape}")
+        per_voxel_hrf_mode = designs_by_hrf is not None
+        if per_voxel_hrf_mode:
+            # In per-HRF mode all designs share column count — use first as the
+            # canonical "task_design" for shape/label bookkeeping below.
+            rep_hrf_idx = next(iter(designs_by_hrf.keys()))
+            task_design = designs_by_hrf[rep_hrf_idx]
+            print(
+                f"  Per-voxel HRF: {len(designs_by_hrf)} task designs, "
+                f"each {tuple(task_design.shape)}"
+            )
+        else:
+            assert task_design is not None
+            print(f"  Task design shape: {task_design.shape}")
+
+        # --- Single-trial design rewrite ---
+        # `-single_trials LABEL` converts the condition-based task design into
+        # one regressor per event (GLMsingle-style). Trials are sorted by
+        # absolute onset time, so output betas read chronologically.
+        is_single_trial = False
+        trial_cond_ids = None
+        trial_run_ids = None
+        if args.single_trials:
+            if is_fir_model:
+                print("ERROR: -single_trials is incompatible with FIR/TENT models.")
+                sys.exit(1)
+            if per_voxel_hrf_mode and (n_basis or 1) > 1:
+                print(
+                    "ERROR: -single_trials with -hrfopt_prefix requires n_basis=1 "
+                    "(SPMG1 / glmsingle). SPM derivatives (SPMG2/3) cannot be combined "
+                    "with per-voxel HRF libraries."
+                )
+                sys.exit(1)
+
+            from fastfuncstuff.glm.ridge import create_single_trial_design
+
+            print()
+            print(f"🎯 Single-trial mode (label: {args.single_trials}) — "
+                  "rebuilding design with one regressor per event"
+                  + (" × per-voxel HRF" if per_voxel_hrf_mode else ""))
+
+            st_design_out, trial_labels, trial_cond_ids, trial_run_ids, _cond_design = (
+                create_single_trial_design(
+                    onsets_by_condition=all_onsets,
+                    durations=durations,
+                    run_starts=run_starts,
+                    tr=args.tr,
+                    n_timepoints=n_timepoints,
+                    microtime_dt=args.microtime_dt,
+                    condition_labels=condition_labels,
+                    device=device,
+                    hrf_model_name=hrf_model_name,
+                    n_basis=n_basis if n_basis else 1,
+                    hrf_library=hrf_library_obj if per_voxel_hrf_mode else None,
+                    hrf_index_per_voxel=hrf_indices_obj if per_voxel_hrf_mode else None,
+                )
+            )
+
+            if per_voxel_hrf_mode:
+                # create_single_trial_design returned (n_hrfs, n_t, n_trials).
+                # Replace the condition-based designs_by_hrf with per-HRF single-trial.
+                assert st_design_out.dim() == 3, (
+                    f"Expected 3D stacked design, got {st_design_out.shape}"
+                )
+                designs_by_hrf = {
+                    int(i): st_design_out[i] for i in range(st_design_out.shape[0])
+                }
+                task_design = designs_by_hrf[next(iter(designs_by_hrf.keys()))]
+                print(
+                    f"  Single-trial × HRF designs: {len(designs_by_hrf)} HRFs, "
+                    f"each {tuple(task_design.shape)}"
+                )
+            else:
+                task_design = st_design_out
+                print(
+                    f"  Single-trial design: {tuple(task_design.shape)} "
+                    f"({len(trial_labels)} columns)"
+                )
+
+            # Override label/count bookkeeping so downstream design_info uses
+            # per-trial columns (each trial is its own "condition" for output).
+            condition_labels_full = trial_labels
+            condition_labels = trial_labels
+            n_conditions = len(trial_labels)
+            is_single_trial = True
 
         # Build nuisance design (polynomials + ortvec)
         print()
@@ -1188,10 +1336,19 @@ def main():
 
         # Build full design: [task | nuisance]
         full_design = torch.cat([task_design, nuisance_design], dim=1)
+        # Per-voxel HRF: build one full design per HRF (same nuisance, different task).
+        full_designs_by_hrf = None
+        if per_voxel_hrf_mode:
+            full_designs_by_hrf = {
+                int(h): torch.cat([designs_by_hrf[h], nuisance_design], dim=1)
+                for h in designs_by_hrf
+            }
         print()
         print(f"Full design matrix shape: {full_design.shape}")
         print(f"  Task columns: {task_design.shape[1]}")
         print(f"  Nuisance columns: {nuisance_design.shape[1]}")
+        if per_voxel_hrf_mode:
+            print(f"  Per-HRF designs: {len(full_designs_by_hrf)}")
 
         # Create design_info dict to match format from read_afni_design_matrix
         task_indices = list(range(task_design.shape[1]))
@@ -1519,15 +1676,14 @@ def main():
 
             if want_single_trials:
                 if stim_indices:
+                    ols_single_path = f"ols_{want_single_trials}_single.nii.gz"
                     print(
-                        "  • Writing OLS single-trial betas (onset order): ols_single.nii.gz"
+                        f"  • Writing OLS single-trial betas (onset order): {ols_single_path}"
                     )
-                    # Need design matrix to extract onset times
-                    # Get it from callback_design_info (key is "matrix" from read_afni_design_matrix)
                     if "matrix" in callback_design_info:
                         write_single_trials_output(
                             ols_results,
-                            "ols_single.nii.gz",
+                            ols_single_path,
                             callback_design_info["matrix"],
                             stim_indices,
                             stim_labels,
@@ -1833,6 +1989,8 @@ def main():
                     print("   To reuse precomputed ARMA params instead, pass: -load_Rvar {candidate}")
                     break
 
+        _per_hrf = locals().get("full_designs_by_hrf") is not None
+
         results, design_info = analyze_from_design_matrix(
             fmri_data=fmri_data_to_use,
             design_matrix_file=args.matrix,
@@ -1866,7 +2024,9 @@ def main():
             if args.r2semipartial
             else "full",  # "full" or "task"
             legacy_contrasts=args.legacy_contrasts,
-            save_profile_likelihoods=bool(getattr(args, "Rlklhd", None)),
+            save_profile_likelihoods=bool(getattr(args, "Rlklhd", None)) and not _per_hrf,
+            designs_by_hrf=locals().get("full_designs_by_hrf"),
+            hrf_indices=locals().get("hrf_indices_obj"),
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
@@ -1957,6 +2117,31 @@ def main():
             output_format="nifti_gz",  # Force NIfTI output
             add_fdr=args.add_fdr,
         )
+
+    # Single-trial REML output: chronologically ordered per-trial betas.
+    if args.single_trials and getattr(results, "betas", None) is not None:
+        stim_idx = design_info.get("stim_indices") or []
+        stim_lbls = (
+            [design_info["column_labels"][i] for i in stim_idx]
+            if "column_labels" in design_info and stim_idx
+            else None
+        )
+        if stim_idx:
+            reml_single_path = f"reml_{args.single_trials}_single.nii.gz"
+            print(
+                f"  • Writing REML single-trial betas (onset order): {reml_single_path}"
+            )
+            write_single_trials_output(
+                results,
+                reml_single_path,
+                design_info["matrix"],
+                stim_idx,
+                stim_lbls,
+            )
+        else:
+            print(
+                "  ⚠️  Skipping REML single-trial output: no stimulus columns in design"
+            )
 
     if args.Rbeta:
         print(f"  • Writing REML betas only: {args.Rbeta}")

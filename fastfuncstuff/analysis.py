@@ -394,6 +394,8 @@ def analyze_from_design_matrix(
     legacy_contrasts: bool = False,
     design_info: dict | None = None,
     save_profile_likelihoods: bool = False,
+    designs_by_hrf: dict[int, torch.Tensor] | None = None,
+    hrf_indices: torch.Tensor | np.ndarray | None = None,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -1015,38 +1017,99 @@ def analyze_from_design_matrix(
         if affine is not None:
             spatial_metadata["affine"] = affine
 
-        results = fit_glm_arma11(
-            data,
-            design,
-            tr=tr,
-            a_grid=arma_a_grid,
-            b_grid=arma_b_grid,
-            precomputed_arma_params=precomputed_arma_params,
-            want_ols=want_ols,
-            want_r2_partial=want_r2_partial,
-            r2_partial_mode=r2_partial_mode,  # "full" or "task"
-            want_r2_semipartial=want_r2_semipartial,
-            r2_semipartial_mode=r2_semipartial_mode,  # "full" or "task"
-            ols_write_callback=ols_write_callback,
-            batch_size=voxel_chunk_size,  # Pass through manual override
-            device=device,
-            use_double=use_double,
-            debug_memory=debug_memory,
-            enable_quick_estimate=enable_quick_estimate,
-            force_exhaustive_search=force_exhaustive_search,
-            use_grid_batching=use_grid_batching,
-            glt_labels=design_info.get("glt_labels", None),
-            glt_matrices=design_info.get("glt_matrices", None),
-            task_indices=stim_indices if stim_indices else None,
-            spatial_metadata=spatial_metadata if spatial_metadata else None,
-            legacy_contrasts=legacy_contrasts,
-            save_profile_likelihoods=save_profile_likelihoods,
-            run_starts=(
-                actual_run_starts
-                if "actual_run_starts" in locals()
-                else design_info.get("run_starts", None)
-            ),
-        )
+        # Per-voxel HRF mode: dispatch to perhrf orchestrator.
+        # designs_by_hrf must contain FULL designs (task+nuisance) per HRF index,
+        # all sharing the same column count/ordering. hrf_indices is aligned to
+        # the volume voxel axis; apply the same mask used on `data`.
+        if designs_by_hrf is not None and hrf_indices is not None:
+            from fastfuncstuff.glm.arma import fit_glm_arma11_perhrf
+
+            hrf_idx_tensor = (
+                torch.as_tensor(hrf_indices)
+                if not isinstance(hrf_indices, torch.Tensor)
+                else hrf_indices
+            ).long()
+            if mask_tensor is not None and hrf_idx_tensor.numel() != data.shape[0]:
+                # Caller passed full-volume indices — align to mask
+                hrf_idx_tensor = hrf_idx_tensor.reshape(-1)[mask_tensor]
+            if hrf_idx_tensor.numel() != data.shape[0]:
+                raise ValueError(
+                    f"hrf_indices length {hrf_idx_tensor.numel()} does not match "
+                    f"masked data voxels {data.shape[0]}"
+                )
+
+            unique_hrfs = sorted(int(h) for h in hrf_idx_tensor.unique().tolist())
+            print(
+                f"\n🎚️  Per-voxel HRF mode: {len(unique_hrfs)} unique HRFs "
+                f"({len(designs_by_hrf)} designs available)"
+            )
+
+            results = fit_glm_arma11_perhrf(
+                data,
+                designs_by_hrf=designs_by_hrf,
+                hrf_indices=hrf_idx_tensor,
+                tr=tr,
+                a_grid=arma_a_grid,
+                b_grid=arma_b_grid,
+                precomputed_arma_params=precomputed_arma_params,
+                want_ols=want_ols,
+                ols_write_callback=ols_write_callback,
+                want_r2_partial=want_r2_partial,
+                r2_partial_mode=r2_partial_mode,
+                want_r2_semipartial=want_r2_semipartial,
+                r2_semipartial_mode=r2_semipartial_mode,
+                batch_size=voxel_chunk_size,
+                device=device,
+                use_double=use_double,
+                debug_memory=debug_memory,
+                enable_quick_estimate=enable_quick_estimate,
+                force_exhaustive_search=force_exhaustive_search,
+                use_grid_batching=use_grid_batching,
+                glt_labels=design_info.get("glt_labels", None),
+                glt_matrices=design_info.get("glt_matrices", None),
+                task_indices=stim_indices if stim_indices else None,
+                legacy_contrasts=legacy_contrasts,
+                save_profile_likelihoods=save_profile_likelihoods,
+                run_starts=(
+                    actual_run_starts
+                    if "actual_run_starts" in locals()
+                    else design_info.get("run_starts", None)
+                ),
+            )
+
+        else:
+            results = fit_glm_arma11(
+                data,
+                design,
+                tr=tr,
+                a_grid=arma_a_grid,
+                b_grid=arma_b_grid,
+                precomputed_arma_params=precomputed_arma_params,
+                want_ols=want_ols,
+                want_r2_partial=want_r2_partial,
+                r2_partial_mode=r2_partial_mode,  # "full" or "task"
+                want_r2_semipartial=want_r2_semipartial,
+                r2_semipartial_mode=r2_semipartial_mode,  # "full" or "task"
+                ols_write_callback=ols_write_callback,
+                batch_size=voxel_chunk_size,  # Pass through manual override
+                device=device,
+                use_double=use_double,
+                debug_memory=debug_memory,
+                enable_quick_estimate=enable_quick_estimate,
+                force_exhaustive_search=force_exhaustive_search,
+                use_grid_batching=use_grid_batching,
+                glt_labels=design_info.get("glt_labels", None),
+                glt_matrices=design_info.get("glt_matrices", None),
+                task_indices=stim_indices if stim_indices else None,
+                spatial_metadata=spatial_metadata if spatial_metadata else None,
+                legacy_contrasts=legacy_contrasts,
+                save_profile_likelihoods=save_profile_likelihoods,
+                run_starts=(
+                    actual_run_starts
+                    if "actual_run_starts" in locals()
+                    else design_info.get("run_starts", None)
+                ),
+            )
 
     else:
         raise ValueError(f"Unknown method: {method}. Choose 'ols' or 'arma11'")
@@ -1080,6 +1143,18 @@ def analyze_from_design_matrix(
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
             results.ols_results.nifti_header = nifti_header
+
+    # Per-HRF mode defers the OLS write callback so it fires once on the
+    # merged OLS result instead of partial per-HRF outputs. Fire it now that
+    # spatial metadata (shape/mask/affine/header) is attached.
+    _deferred_ols_cb = getattr(results, "_deferred_ols_write_callback", None)
+    if _deferred_ols_cb is not None and results.ols_results is not None:
+        _deferred_ols_cb(
+            results.ols_results,
+            getattr(results, "original_shape", None),
+            getattr(results, "affine", None),
+        )
+        results._deferred_ols_write_callback = None
 
     # Add scaling info to design_info for cache saving
     design_info["was_scaled"] = was_scaled

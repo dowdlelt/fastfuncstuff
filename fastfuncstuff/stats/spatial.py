@@ -29,7 +29,6 @@ import numpy as np
 import torch
 from torch import Tensor
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -359,7 +358,7 @@ class ConsistencyReport:
             f"  Mean matched r:   {self.mean_matched_r:.4f}",
             f"  Median matched r: {self.median_matched_r:.4f}",
             f"  Range: [{self.min_matched_r:.4f}, {self.max_matched_r:.4f}]",
-            f"  Coverage:",
+            "  Coverage:",
         ]
         for thresh, pct in sorted(self.coverage_at_thresholds.items()):
             lines.append(f"    r > {thresh:.2f}: {pct:.1f}% of matched pairs")
