@@ -96,6 +96,12 @@ ffs_nwarp -interp wsinc5 \
 ```
 What is also very fun is that this supports phase input and you can choose to warp directly (assume phase is unwrapped/interpolatable) or internally convert to real/imag, apply warps, and save phase out from that. This is useful for `ffs_phasereg`, for example. In other words, once you have magnitude processed its very easy to have the phase tag along. 
 
+### ffs_reml with per-voxel HRFs
+`ffs_reml` can take the output of `ffs_hrfopt` and fit ARMA(1,1) REML using each voxel's best-fitting HRF. Pass `-hrfopt_prefix PREFIX` (the same prefix you gave to `ffs_hrfopt`) and the design is rebuilt per HRF group. Pairs naturally with `-single_trials LABEL`, which rebuilds the design with one regressor per event (GLMsingle-style) and writes chronologically ordered betas.
+
+### ffs_perm (beta)
+Non-parametric permutation testing — generates a null by sign-flipping/permuting labels (FSL/`randomise`-style) and gives you voxelwise + cluster-corrected null distributions. The whole thing is GPU-batched so 5,000 permutations across a full brain takes about 2 minutes here, ~50x faster than the conventional `randomise` workflow (on 8 cores, my machine). Produces AFNI-compatible cluster tables. Still beta — see `-help` for current options.
+
 
 ## Command-line tool listing
 
@@ -106,9 +112,10 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 
 | command | description |
 |---|---|
-| `ffs_reml` | OLS / ARMA(1,1) prewhitened GLM with REML grid search over (a, b). AFNI `3dREMLfit`-style bucket output, FDR curves attached. |
+| `ffs_reml` | OLS / ARMA(1,1) prewhitened GLM with REML grid search over (a, b). AFNI `3dREMLfit`-style bucket output, FDR curves attached. Accepts per-voxel HRF assignments via `-hrfopt_prefix`, and `-single_trials LABEL` rebuilds the design with one regressor per event. |
 | `ffs_ridge` | Fractional ridge regression for single-trial betas (GLMsingle Type D). Per-voxel optimal fraction by cross-validation. |
 | `ffs_deconvolve` | FIR / event-related deconvolution without an assumed HRF shape. |
+| `ffs_perm` *(beta)* | GPU-batched non-parametric permutation testing (ex. for single trials or group statistics). ~5,000 permutations / 2 minutes for a full brain. Writes AFNI-compatible corrected t-stats and attacheds cluster tables (for max cluster size correction). |
 
 
 ### HRF and denoising
