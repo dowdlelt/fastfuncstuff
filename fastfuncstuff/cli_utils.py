@@ -9,8 +9,10 @@ data loading, and output formatting.
 from __future__ import annotations
 
 import glob as glob_module
+import re
 import sys
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -796,6 +798,344 @@ def auto_polort(
         raise ValueError(f"Unknown polort formula: {formula}")
 
 
+# ---------------------------------------------------------------------------
+# Nuisance harmonisation: NuisanceBlock + factories + assembler.
+#
+# Three CLI input modes funnel into the same internal representation
+# (a list[NuisanceBlock]). Downstream consumers see one structure.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NuisanceBlock:
+    """A labelled set of nuisance regressors with explicit per-run mapping.
+
+    ``per_run[i]`` is either an ``(n_timepoints_i, n_cols_block)`` array of
+    regressor values for run ``i`` (any dtype; coerced to float32 on use)
+    or ``None`` meaning "this block contributes nothing to run ``i``"
+    (zero columns get padded in at assembly time).
+
+    Runs with fewer columns than the block's widest run are zero-padded
+    on the right during ``get_run``. This is what makes variable-PC-count-
+    per-run paths (e.g. after Kay-style PC selection) representable
+    without forcing the user to pre-pad.
+
+    Note: data is stored raw. Per-run demeaning happens at assembly,
+    not here, so the original input remains inspectable.
+    """
+
+    label: str
+    per_run: list[np.ndarray | None]
+    column_names: list[str] | None = None
+    # Provenance: filename that fed each run (None where the block is empty).
+    source: list[str | None] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.source:
+            self.source = [None] * len(self.per_run)
+        elif len(self.source) != len(self.per_run):
+            raise ValueError(
+                f"NuisanceBlock {self.label!r}: source has "
+                f"{len(self.source)} entries but per_run has {len(self.per_run)}"
+            )
+
+    @property
+    def n_columns(self) -> int:
+        """Max columns across runs — the assembled block's width."""
+        return max((m.shape[1] for m in self.per_run if m is not None), default=0)
+
+    def get_run(self, run_idx: int, run_length: int) -> np.ndarray:
+        """Return ``(run_length, n_columns)`` for ``run_idx``, zero-padded.
+
+        Empty runs (per_run[run_idx] is None) → all zeros.
+        Short-column runs → right-padded with zero columns.
+        """
+        ncols = self.n_columns
+        m = self.per_run[run_idx]
+        if m is None:
+            return np.zeros((run_length, ncols), dtype=np.float32)
+        if m.shape[0] != run_length:
+            raise ValueError(
+                f"NuisanceBlock {self.label!r}: run {run_idx} has "
+                f"{m.shape[0]} rows, design expects {run_length}"
+            )
+        m = m.astype(np.float32, copy=False)
+        if m.shape[1] < ncols:
+            pad = np.zeros((run_length, ncols - m.shape[1]), dtype=np.float32)
+            return np.hstack([m, pad])
+        return m
+
+    def get_column_names(self) -> list[str]:
+        ncols = self.n_columns
+        if self.column_names is not None and len(self.column_names) == ncols:
+            return list(self.column_names)
+        return [f"{self.label}_{i:02d}" for i in range(ncols)]
+
+
+@dataclass
+class NuisanceAssembly:
+    """Result of assembling polort + nuisance blocks (+ optional noise PCs)
+    into per-run nuisance design matrices.
+
+    Attributes
+    ----------
+    per_run : list[torch.Tensor]
+        One tensor per run, shape ``(run_length_i, n_total_cols_i)``.
+    per_run_column_names : list[list[str]]
+        Names for each column of each run's matrix. Lengths match
+        ``per_run[i].shape[1]``.
+    blocks : list[NuisanceBlock]
+        The blocks consumed (after factory-time loading), for downstream
+        provenance / sidecar emission.
+    """
+
+    per_run: list[torch.Tensor]
+    per_run_column_names: list[list[str]]
+    blocks: list[NuisanceBlock]
+
+
+# Regex priority list for `-ortvec_glob` filename → run-index inference.
+# Try most-specific (BIDS) first; fall through to broad / trailing-number
+# heuristics. Each must yield an all-files-matched, unique, in-bounds
+# assignment to succeed. If none does, the caller gets a list of what
+# was tried so it can pick a different input mode.
+_RUN_INDEX_PATTERNS = (
+    (r"_run-(\d+)_", "BIDS _run-N_"),
+    (r"_run-(\d+)\b", "BIDS _run-N"),
+    (r"_run(\d+)_", "_runN_"),
+    (r"_run(\d+)\b", "_runN"),
+    (r"[._]run[-_]?(\d+)", "broad .run-N / _run_N"),
+    (r"(\d+)\.[^.]+$", "trailing N before extension"),
+    (r"(\d+)\D*$", "trailing N"),
+)
+
+
+def _infer_run_indices_from_filenames(
+    names: list[str],
+    n_runs: int,
+) -> list[int]:
+    """Try patterns in priority order; return 0-indexed run for each name.
+
+    A pattern succeeds when it (a) matches every name, (b) yields unique
+    run numbers, and (c) all numbers fall in ``[1, n_runs]``. The first
+    success wins. If none succeeds we raise ``ValueError`` with the
+    failures from each attempt, so the user can see what's ambiguous.
+    """
+    failures: list[str] = []
+    for pat, desc in _RUN_INDEX_PATTERNS:
+        matches = [re.search(pat, n, re.IGNORECASE) for n in names]
+        if not all(matches):
+            unmatched = [n for n, m in zip(names, matches) if not m]
+            failures.append(f"{desc}: did not match {unmatched[:3]}")
+            continue
+        nums = [int(m.group(1)) for m in matches]
+        dup_counts = Counter(nums)
+        dups = [n for n, c in dup_counts.items() if c > 1]
+        if dups:
+            failures.append(f"{desc}: duplicate run numbers {sorted(dups)}")
+            continue
+        if any(n < 1 or n > n_runs for n in nums):
+            failures.append(
+                f"{desc}: out-of-range run numbers {sorted(nums)} for n_runs={n_runs}"
+            )
+            continue
+        return [n - 1 for n in nums]
+    raise ValueError(
+        "Could not infer per-run indices from filenames. Patterns tried:\n  "
+        + "\n  ".join(failures)
+        + f"\n  Files: {names}\n"
+        "Use -ortvec_run FILE LABEL RUN to assign explicitly, or rename "
+        "files to a BIDS-style _run-NN_ pattern."
+    )
+
+
+def _slice_full_length_per_run(
+    arr: np.ndarray, run_starts: list[int], n_timepoints: int,
+) -> list[np.ndarray]:
+    n_runs = len(run_starts)
+    out = []
+    for i in range(n_runs):
+        end = run_starts[i + 1] if i < n_runs - 1 else n_timepoints
+        out.append(arr[run_starts[i]:end])
+    return out
+
+
+def make_nuisance_block_from_full_length(
+    path: str | Path,
+    label: str,
+    run_starts: list[int],
+    n_timepoints: int,
+) -> NuisanceBlock:
+    """Mode 1: one file with rows for *all* runs concatenated (pre-padded)."""
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    arr = load_nuisance_file(path)
+    if arr.shape[0] != n_timepoints:
+        raise ValueError(
+            f"{path}: has {arr.shape[0]} rows, design has "
+            f"{n_timepoints} total timepoints"
+        )
+    per_run = _slice_full_length_per_run(arr, run_starts, n_timepoints)
+    return NuisanceBlock(
+        label=label,
+        per_run=per_run,
+        source=[str(path)] * len(run_starts),
+    )
+
+
+def make_nuisance_block_from_per_run_file(
+    path: str | Path,
+    label: str,
+    run_idx_1based: int,
+    run_starts: list[int],
+    n_timepoints: int,
+) -> NuisanceBlock:
+    """Mode 2: one file that covers exactly one run; other runs get zeros."""
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    n_runs = len(run_starts)
+    run_idx = run_idx_1based - 1
+    if not (0 <= run_idx < n_runs):
+        raise ValueError(
+            f"run index {run_idx_1based} out of range [1, {n_runs}] for {path}"
+        )
+    expected = (
+        run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+    ) - run_starts[run_idx]
+    arr = load_nuisance_file(path)
+    if arr.shape[0] != expected:
+        raise ValueError(
+            f"{path}: has {arr.shape[0]} rows, run {run_idx_1based} has "
+            f"{expected} timepoints"
+        )
+    per_run: list[np.ndarray | None] = [None] * n_runs
+    per_run[run_idx] = arr
+    source: list[str | None] = [None] * n_runs
+    source[run_idx] = str(path)
+    return NuisanceBlock(label=label, per_run=per_run, source=source)
+
+
+def make_nuisance_block_from_glob(
+    pattern: str,
+    label: str,
+    run_starts: list[int],
+    n_timepoints: int,
+) -> NuisanceBlock:
+    """Mode 3: glob matches N files; infer per-file run index from filename.
+
+    Runs absent from the glob are zero-padded into the block.
+    """
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    matched = sorted(Path(p) for p in glob_module.glob(pattern))
+    if not matched:
+        raise ValueError(f"-ortvec_glob {pattern!r}: matched no files")
+
+    n_runs = len(run_starts)
+    run_indices_0 = _infer_run_indices_from_filenames(
+        [p.name for p in matched], n_runs=n_runs,
+    )
+
+    per_run: list[np.ndarray | None] = [None] * n_runs
+    source: list[str | None] = [None] * n_runs
+    for path, run_idx in zip(matched, run_indices_0):
+        expected = (
+            run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        ) - run_starts[run_idx]
+        arr = load_nuisance_file(path)
+        if arr.shape[0] != expected:
+            raise ValueError(
+                f"{path}: has {arr.shape[0]} rows, run {run_idx + 1} has "
+                f"{expected} timepoints"
+            )
+        per_run[run_idx] = arr
+        source[run_idx] = str(path)
+
+    return NuisanceBlock(label=label, per_run=per_run, source=source)
+
+
+def assemble_per_run_nuisance(
+    blocks: list[NuisanceBlock],
+    run_starts: list[int],
+    n_timepoints: int,
+    polort: int,
+    device: torch.device,
+    noise_pcs: list[torch.Tensor] | None = None,
+    verbose: bool = False,
+) -> NuisanceAssembly:
+    """Combine polynomials + nuisance blocks + optional noise PCs per run.
+
+    Each block is demeaned per-run before concatenation: if any column's
+    per-run mean exceeds 1e-4 in absolute value the column is centred
+    (in-memory; the original NuisanceBlock is untouched). This prevents
+    a non-zero-mean ortvec column from fighting the polort intercept and
+    making the design rank-degenerate.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    n_runs = len(run_starts)
+    per_run_t: list[torch.Tensor] = []
+    per_run_names: list[list[str]] = []
+
+    # Polynomials first (block-diagonal: each run's own columns).
+    for run_idx in range(n_runs):
+        end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_length = end - run_starts[run_idx]
+        if polort >= 0:
+            poly = construct_polynomial_matrix(run_length, polort, device=device)
+            names = [f"r{run_idx + 1:02d}_poly{p}" for p in range(polort + 1)]
+        else:
+            poly = torch.zeros((run_length, 0), device=device)
+            names = []
+        per_run_t.append(poly)
+        per_run_names.append(names)
+
+    # Nuisance blocks.
+    for block in blocks:
+        ncols = block.n_columns
+        if ncols == 0:
+            continue
+        block_demeaned_any_run = False
+        block_col_names = block.get_column_names()
+        for run_idx in range(n_runs):
+            end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_length = end - run_starts[run_idx]
+            m = block.get_run(run_idx, run_length).copy()
+            col_mean = m.mean(axis=0, keepdims=True)
+            if np.max(np.abs(col_mean)) > 1e-4:
+                block_demeaned_any_run = True
+                m = m - col_mean
+            m_t = torch.from_numpy(m).to(device=device, dtype=per_run_t[run_idx].dtype)
+            per_run_t[run_idx] = torch.cat([per_run_t[run_idx], m_t], dim=1)
+            per_run_names[run_idx].extend(block_col_names)
+        if block_demeaned_any_run and verbose:
+            print(
+                f"  Demeaned nuisance block {block.label!r} per-run "
+                "(was not zero-mean as supplied)"
+            )
+
+    # Optional already-loaded per-run noise PCs (legacy path, e.g. ffs_denoise).
+    if noise_pcs is not None:
+        for run_idx, pcs in enumerate(noise_pcs):
+            if pcs is None or pcs.shape[1] == 0:
+                continue
+            pcs = pcs.to(device=device, dtype=per_run_t[run_idx].dtype)
+            per_run_t[run_idx] = torch.cat([per_run_t[run_idx], pcs], dim=1)
+            per_run_names[run_idx].extend(
+                f"noisepc_{c:02d}" for c in range(pcs.shape[1])
+            )
+
+    if verbose:
+        for run_idx, m in enumerate(per_run_t):
+            print(f"  Run {run_idx + 1}: nuisance shape = {tuple(m.shape)}")
+
+    return NuisanceAssembly(
+        per_run=per_run_t,
+        per_run_column_names=per_run_names,
+        blocks=list(blocks),
+    )
+
+
 def build_nuisance_per_run(
     run_starts: list[int],
     n_timepoints: int,
@@ -853,82 +1193,53 @@ def build_nuisance_per_run(
     ...     polort=2,
     ...     device=torch.device("cuda"),
     ... )
+
+    Internal: this is now a thin shim over ``assemble_per_run_nuisance``,
+    which is the canonical entry point taking ``list[NuisanceBlock]``
+    directly. Existing callers passing ``ortvec_files`` / ``ortvec_data``
+    keep working unchanged; the conversion is silent.
     """
-    from fastfuncstuff.glm.core import construct_polynomial_matrix
-
-    n_runs = len(run_starts)
-    nuisance_per_run = []
-
-    # Build polynomial blocks
-    for run_idx in range(n_runs):
-        start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_length = end_tp - start_tp
-
-        if polort >= 0:
-            poly = construct_polynomial_matrix(run_length, polort, device=device)
-        else:
-            poly = torch.zeros((run_length, 0), device=device)
-
-        nuisance_per_run.append(poly)
-
-    # Load ortvec files if provided
+    # Funnel legacy inputs into NuisanceBlocks.
+    blocks: list[NuisanceBlock] = []
     if ortvec_files is not None:
-        try:
-            from fastfuncstuff.design.hrf_selection import load_nuisance_file
-            from fastfuncstuff.utils import to_tensor
-
-            ortvec_all = []
-            ortvec_labels = []
-
-            for filepath, label in ortvec_files:
-                ortvec = load_nuisance_file(filepath)
-                ortvec = to_tensor(ortvec, device=device)
-
-                if ortvec.shape[0] != n_timepoints:
-                    print(
-                        f"ERROR: ortvec file {filepath} has {ortvec.shape[0]} rows, expected {n_timepoints}"
-                    )
-                    sys.exit(1)
-
-                ortvec_all.append(ortvec)
-                ortvec_labels.append(label)
-
-                if verbose:
-                    print(f"  Loaded ortvec: {filepath} (label={label}, shape={ortvec.shape})")
-
-            ortvec_data = torch.cat(ortvec_all, dim=1) if ortvec_all else None
-
-        except ImportError:
+        for filepath, label in ortvec_files:
+            blocks.append(
+                make_nuisance_block_from_full_length(
+                    filepath, label, run_starts, n_timepoints,
+                )
+            )
+            if verbose:
+                print(f"  Loaded ortvec: {filepath} (label={label})")
+    if ortvec_data is not None:
+        # Pre-loaded tensor: slice + wrap as a single block called "ortvec".
+        arr = (
+            ortvec_data.detach().cpu().numpy()
+            if isinstance(ortvec_data, torch.Tensor)
+            else np.asarray(ortvec_data)
+        )
+        if arr.shape[0] != n_timepoints:
             print(
-                "ERROR: Could not import load_nuisance_file. Is fastfuncstuff.hrf_selection available?"
+                f"ERROR: ortvec_data has {arr.shape[0]} rows, expected {n_timepoints}"
             )
             sys.exit(1)
+        blocks.append(
+            NuisanceBlock(
+                label="ortvec",
+                per_run=_slice_full_length_per_run(arr, run_starts, n_timepoints),
+                source=[None] * len(run_starts),
+            )
+        )
 
-    # Add ortvec to each run if provided
-    if ortvec_data is not None:
-        for run_idx in range(n_runs):
-            start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            ortvec_run = ortvec_data[start_tp:end_tp, :]
-
-            # Concatenate polynomials + ortvec for this run
-            nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], ortvec_run], dim=1)
-
-    # Add noise PCs if provided
-    if noise_pcs is not None:
-        for run_idx, pcs in enumerate(noise_pcs):
-            if pcs is not None and pcs.shape[1] > 0:
-                # Ensure noise PCs are on the same device as nuisance
-                pcs = pcs.to(device)
-                # Concatenate existing nuisance + noise PCs
-                nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], pcs], dim=1)
-
-    if verbose:
-        for run_idx, nuisance in enumerate(nuisance_per_run):
-            print(f"  Run {run_idx}: nuisance shape = {nuisance.shape}")
-
-    return nuisance_per_run
+    assembly = assemble_per_run_nuisance(
+        blocks=blocks,
+        run_starts=run_starts,
+        n_timepoints=n_timepoints,
+        polort=polort,
+        device=device,
+        noise_pcs=noise_pcs,
+        verbose=verbose,
+    )
+    return assembly.per_run
 
 
 def build_nuisance_block_diag(
@@ -985,52 +1296,59 @@ def build_nuisance_block_diag(
     ...     polort=2,
     ...     device=torch.device("cuda"),
     ... )
+
+    Internal: this is now a thin shim. Polynomials still go block-diag.
+    Ortvec is treated as SHARED across runs (AFNI ``-ortvec`` semantics):
+    each block's full-length vertical concatenation is appended on the
+    right. A non-zero global mean is detected and subtracted (so it does
+    not fight the per-run polort intercepts).
     """
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
     n_runs = len(run_starts)
-    run_lengths = []
+    run_lengths = [
+        run_starts[i + 1] - run_starts[i] if i < n_runs - 1
+        else n_timepoints - run_starts[i]
+        for i in range(n_runs)
+    ]
 
-    # Compute run lengths
-    for i in range(n_runs):
-        if i < n_runs - 1:
-            run_lengths.append(run_starts[i + 1] - run_starts[i])
-        else:
-            run_lengths.append(n_timepoints - run_starts[i])
-
-    # Build polynomial blocks
+    # Polynomial block-diag.
     poly_blocks = []
     for run_len in run_lengths:
         if polort >= 0:
             poly_blocks.append(construct_polynomial_matrix(run_len, polort, device))
         else:
             poly_blocks.append(torch.zeros((run_len, 0), device=device))
-
-    # Create block-diagonal matrix
     nuisance_design = torch.block_diag(*poly_blocks)
 
-    # Load and add ortvec files if provided
-    if ortvec_files is not None:
-        try:
-            from fastfuncstuff.design.hrf_selection import load_nuisance_file
-            from fastfuncstuff.utils import to_tensor
+    if ortvec_files is None:
+        if verbose:
+            print(f"  Nuisance design shape: {nuisance_design.shape}")
+        return nuisance_design
 
+    # Funnel through NuisanceBlock so loading / row-count validation is shared.
+    if verbose:
+        print(f"  Loading {len(ortvec_files)} ortvec file(s)...")
+    for filepath, label in ortvec_files:
+        block = make_nuisance_block_from_full_length(
+            filepath, label, run_starts, n_timepoints,
+        )
+        # Shared-across-runs layout: reassemble the full-length matrix
+        # (block.from_full_length guarantees per_run[i] is non-None for all i).
+        full = np.vstack([
+            block.get_run(i, run_lengths[i]) for i in range(n_runs)
+        ]).astype(np.float32)
+        col_mean = full.mean(axis=0, keepdims=True)
+        if np.max(np.abs(col_mean)) > 1e-4:
+            full = full - col_mean
             if verbose:
-                print(f"  Loading {len(ortvec_files)} ortvec file(s)...")
-
-            for filepath, label in ortvec_files:
-                nuisance_data = load_nuisance_file(filepath, expected_rows=n_timepoints)
-                ortvec_tensor = to_tensor(nuisance_data, device=device)
-                nuisance_design = torch.cat([nuisance_design, ortvec_tensor], dim=1)
-
-                if verbose:
-                    print(f"    {label}: {ortvec_tensor.shape[1]} regressor(s)")
-
-        except ImportError:
-            print(
-                "ERROR: Could not import load_nuisance_file. Is fastfuncstuff.hrf_selection available?"
-            )
-            sys.exit(1)
+                print(f"    Demeaned ortvec {label!r} (was not zero-mean)")
+        ortvec_tensor = torch.from_numpy(full).to(
+            device=device, dtype=nuisance_design.dtype,
+        )
+        nuisance_design = torch.cat([nuisance_design, ortvec_tensor], dim=1)
+        if verbose:
+            print(f"    {label}: {ortvec_tensor.shape[1]} regressor(s)")
 
     if verbose:
         print(f"  Nuisance design shape: {nuisance_design.shape}")

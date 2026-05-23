@@ -316,17 +316,21 @@ class TestCLIUtilityFunctions:
         assert 0.5 < median_scale < 2.0, f"Median scale factor unusual: {median_scale}"
 
     def test_build_nuisance_per_run(self, device):
-        """Test building per-run nuisance regressors."""
+        """Test building per-run nuisance regressors.
+
+        Note: build_nuisance_per_run now demeans each nuisance block
+        per-run so it doesn't collide with the per-run polort intercept.
+        The contract isn't "exact round-trip of the input" but "each
+        per-run slice is the input minus that run's column mean."
+        """
         n_runs = 3
         n_timepoints = 100
         n_nuisance = 5
         n_total = n_timepoints * n_runs
         run_starts = [i * n_timepoints for i in range(n_runs)]
 
-        # Create nuisance regressors
         nuisance = torch.randn(n_total, n_nuisance, device=device)
 
-        # Build per-run
         nuisance_per_run = build_nuisance_per_run(
             run_starts=run_starts,
             n_timepoints=n_total,
@@ -335,17 +339,29 @@ class TestCLIUtilityFunctions:
             ortvec_data=nuisance,
         )
 
-        # Check structure
+        # Structure unchanged.
         assert len(nuisance_per_run) == n_runs
         for i, run_nuisance in enumerate(nuisance_per_run):
             expected_shape = (n_timepoints, n_nuisance)
-            assert run_nuisance.shape == expected_shape, (
-                f"Run {i} wrong shape: {run_nuisance.shape} vs {expected_shape}"
-            )
+            assert run_nuisance.shape == expected_shape
 
-        # Check values are preserved
-        nuisance_reconstructed = torch.cat(nuisance_per_run, dim=0)
-        assert torch.allclose(nuisance, nuisance_reconstructed, atol=1e-5)
+        # Each run's output must equal that run's input slice with its
+        # column means subtracted (because of demean-on-assemble).
+        for i, run_nuisance in enumerate(nuisance_per_run):
+            start = run_starts[i]
+            end = start + n_timepoints
+            expected = nuisance[start:end, :]
+            expected = expected - expected.mean(dim=0, keepdim=True)
+            assert torch.allclose(
+                run_nuisance, expected.to(run_nuisance.dtype), atol=1e-5,
+            ), f"Run {i} not demeaned-equivalent to input slice"
+
+        # Per-run output should be zero-mean (the whole point of the demean).
+        for i, run_nuisance in enumerate(nuisance_per_run):
+            col_means = run_nuisance.mean(dim=0)
+            assert torch.allclose(
+                col_means, torch.zeros_like(col_means), atol=1e-5,
+            ), f"Run {i} not zero-mean after build_nuisance_per_run"
 
     def test_select_noise_pool_with_ground_truth(self, device):
         """Test noise pool selection when we know ground truth."""
