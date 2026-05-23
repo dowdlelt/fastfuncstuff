@@ -312,9 +312,9 @@ class TestPrecomputeRemlGrid:
         # Grid is a dict keyed by (a,b) tuples
         assert isinstance(grid, dict)
         assert len(grid) > 0
-        # Each entry should have L, X_w, R_qr
+        # Each entry should have the whitening inverse and whitened design
         first_key = next(iter(grid))
-        assert "L" in grid[first_key]
+        assert "L_inv" in grid[first_key]
         assert "X_w" in grid[first_key]
 
     def test_with_qr(self):

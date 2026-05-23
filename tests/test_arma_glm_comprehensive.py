@@ -118,13 +118,13 @@ class TestMemoryManagement:
     @patch('torch.cuda.memory_allocated')
     def test_get_adaptive_batch_size_cuda(self, mock_alloc, mock_reserved, mock_props):
         """Test batch sizing on CUDA."""
-        # Setup mock GPU
-        mock_props.return_value.total_memory = 10 * 1024**3  # 10 GB
-        mock_reserved.return_value = 2 * 1024**3    # 2 GB reserved
-        mock_alloc.return_value = 1 * 1024**3       # 1 GB actual data
-        
+        # Mock a small GPU so the memory budget — not the placeholder cap — limits the batch.
+        mock_props.return_value.total_memory = 256 * 1024**2  # 256 MB
+        mock_reserved.return_value = 0
+        mock_alloc.return_value = 0
+
         device = torch.device('cuda:0')
-        
+
         # Case 1: Small problem
         batch_size = get_adaptive_batch_size(
             device=device,
@@ -132,13 +132,12 @@ class TestMemoryManagement:
             n_regressors=2
         )
         assert batch_size > 0
-        # Should be large (e.g. 50000 cap or similar)
-        
-        # Case 2: Large problem (lots of regressors)
+
+        # Case 2: Large problem (longer TR, many regressors) → smaller batch
         batch_size_large = get_adaptive_batch_size(
             device=device,
-            n_timepoints=1000,
-            n_regressors=50
+            n_timepoints=2000,
+            n_regressors=100
         )
         assert batch_size_large < batch_size
         

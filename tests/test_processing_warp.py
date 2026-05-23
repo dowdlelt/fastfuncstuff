@@ -40,8 +40,8 @@ class TestQwarpConfig:
         assert cfg.use_quintic is False
         assert cfg.use_lite is True
         assert cfg.cost_method == "pearclp"
-        assert cfg.penalty_factor == 0.001
-        assert cfg.penalty_first_level == 4
+        assert cfg.penalty_factor == 0.033  # matches AFNI Hpen_fbase
+        assert cfg.penalty_first_level == 3  # matches AFNI Hpen_first_lev
         assert cfg.shrink == pytest.approx(0.749999)
         assert cfg.max_level == 666
         assert cfg.start_level == 0
@@ -50,7 +50,7 @@ class TestQwarpConfig:
         assert cfg.verb == 1
         assert cfg.batch_optimizer_lr == pytest.approx(0.008)
         assert cfg.batch_optimizer_iters == 60
-        assert cfg.hfactor_q == 1.0
+        assert cfg.hfactor_q == 0.5
         assert cfg.maxdisp == 0.0
         assert cfg.lpa_sigma == 4.0
         assert cfg.lpa_kernel == "gauss"
@@ -379,38 +379,42 @@ class TestFilterPatches:
 # ---------------------------------------------------------------------------
 
 class TestComputeHfactor:
-    def test_at_minpatch(self):
-        """At minpatch, hfactor should be 1.0."""
+    # Signature: _compute_hfactor(patch_size, patch_size_lev1, hfactor_q).
+    # patch_size_lev1 is the COARSEST (level-1) patch size; finer levels
+    # use smaller patch_size, yielding prat<1 and hfactor<1 (tighter bound).
+
+    def test_at_lev1(self):
+        """At level 1 (patch_size == lev1), hfactor should be 1.0."""
         assert _compute_hfactor(25, 25, 0.5) == pytest.approx(1.0)
 
-    def test_below_minpatch(self):
-        """Below minpatch, hfactor should be 1.0."""
-        assert _compute_hfactor(10, 25, 0.5) == pytest.approx(1.0)
+    def test_above_lev1_clamps_to_one(self):
+        """patch_size >= patch_size_lev1 clamps hfactor to 1.0."""
+        assert _compute_hfactor(50, 25, 0.5) == pytest.approx(1.0)
 
     def test_hfactor_q_1(self):
         """With hfactor_q=1.0, always returns 1.0 (disabled)."""
-        assert _compute_hfactor(100, 25, 1.0) == pytest.approx(1.0)
+        assert _compute_hfactor(10, 25, 1.0) == pytest.approx(1.0)
 
     def test_hfactor_q_too_small(self):
         """With hfactor_q < 0.1, returns 1.0."""
-        assert _compute_hfactor(100, 25, 0.05) == pytest.approx(1.0)
+        assert _compute_hfactor(10, 25, 0.05) == pytest.approx(1.0)
 
-    def test_larger_patch_smaller_hfactor(self):
-        """Larger patches should get smaller hfactor (more dampened)."""
-        h50 = _compute_hfactor(50, 25, 0.5)
-        h100 = _compute_hfactor(100, 25, 0.5)
-        assert h50 < 1.0
-        assert h100 < h50
+    def test_finer_patch_smaller_hfactor(self):
+        """Finer (smaller) patches than lev1 should get smaller hfactor."""
+        h10 = _compute_hfactor(10, 25, 0.5)
+        h5 = _compute_hfactor(5, 25, 0.5)
+        assert h10 < 1.0
+        assert h5 < h10
 
     def test_known_value(self):
-        """Check a specific value against the formula."""
-        patch_size = 50
-        min_patch = 25
+        """Check against the formula at a finer-than-lev1 patch."""
+        patch_size = 10
+        patch_size_lev1 = 25
         hfactor_q = 0.5
-        prat = min_patch / patch_size  # 0.5
+        prat = patch_size / patch_size_lev1
         alpha = math.log(hfactor_q) / math.log(0.1)
         expected = prat ** alpha
-        assert _compute_hfactor(patch_size, min_patch, hfactor_q) == pytest.approx(expected)
+        assert _compute_hfactor(patch_size, patch_size_lev1, hfactor_q) == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
