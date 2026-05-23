@@ -1054,6 +1054,98 @@ def make_nuisance_block_from_glob(
     return NuisanceBlock(label=label, per_run=per_run, source=source)
 
 
+def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
+    """Register `-ortvec`, `-ortvec_run`, `-ortvec_glob` on a parser/group.
+
+    All three are repeatable. The CLI then funnels them through
+    `collect_nuisance_blocks(args, ...)` to get a `list[NuisanceBlock]`.
+    """
+    if include_legacy:
+        parser_or_group.add_argument(
+            "-ortvec",
+            action="append",
+            nargs=2,
+            metavar=("FILE", "LABEL"),
+            help=(
+                "Full-length nuisance regressors (pre-concatenated across all runs). "
+                "Repeatable: -ortvec motion.1D motion -ortvec physio.1D physio"
+            ),
+        )
+    parser_or_group.add_argument(
+        "-ortvec_run",
+        "-ortvec-run",
+        action="append",
+        nargs=3,
+        metavar=("FILE", "LABEL", "RUN"),
+        help=(
+            "Per-run nuisance regressors; RUN is 1-based run index. Other runs are zero-padded. "
+            "Repeatable: -ortvec_run motion_r1.1D motion 1 -ortvec_run motion_r2.1D motion 2"
+        ),
+    )
+    parser_or_group.add_argument(
+        "-ortvec_glob",
+        "-ortvec-glob",
+        action="append",
+        nargs=2,
+        metavar=("PATTERN", "LABEL"),
+        help=(
+            "Glob matching per-run nuisance files; run index inferred from filename "
+            "(BIDS-style `_run-N_` preferred). Missing runs zero-padded. "
+            "Repeatable: -ortvec_glob 'motion_run-*.1D' motion"
+        ),
+    )
+
+
+def collect_nuisance_blocks(
+    args,
+    run_starts: list[int],
+    n_timepoints: int,
+    verbose: bool = False,
+) -> list[NuisanceBlock]:
+    """Translate argparse Namespace fields into a list of NuisanceBlock.
+
+    Recognises `args.ortvec`, `args.ortvec_run`, `args.ortvec_glob` — any
+    combination, all repeatable, all optional. Designed to plug into any
+    CLI that called `add_ortvec_arguments` on its parser.
+    """
+    blocks: list[NuisanceBlock] = []
+    for path, label in getattr(args, "ortvec", None) or []:
+        blocks.append(
+            make_nuisance_block_from_full_length(
+                path, label, run_starts, n_timepoints,
+            )
+        )
+        if verbose:
+            print(f"  -ortvec: {path} (label={label})")
+    for path, label, run_str in getattr(args, "ortvec_run", None) or []:
+        try:
+            run_idx = int(run_str)
+        except ValueError:
+            print(
+                f"ERROR: -ortvec_run RUN must be a 1-based integer, got {run_str!r}"
+            )
+            sys.exit(1)
+        blocks.append(
+            make_nuisance_block_from_per_run_file(
+                path, label, run_idx, run_starts, n_timepoints,
+            )
+        )
+        if verbose:
+            print(f"  -ortvec_run: {path} (label={label}, run={run_idx})")
+    for pattern, label in getattr(args, "ortvec_glob", None) or []:
+        block = make_nuisance_block_from_glob(
+            pattern, label, run_starts, n_timepoints,
+        )
+        blocks.append(block)
+        if verbose:
+            matched = [s for s in block.source if s]
+            print(
+                f"  -ortvec_glob: {pattern} (label={label}) → "
+                f"{len(matched)} run(s) assigned"
+            )
+    return blocks
+
+
 def assemble_per_run_nuisance(
     blocks: list[NuisanceBlock],
     run_starts: list[int],
@@ -1144,6 +1236,7 @@ def build_nuisance_per_run(
     ortvec_files: list[tuple[str, str]] | None = None,
     ortvec_data: torch.Tensor | None = None,
     noise_pcs: list[torch.Tensor] | None = None,
+    blocks: list["NuisanceBlock"] | None = None,
     verbose: bool = False,
 ) -> list[torch.Tensor]:
     """
@@ -1199,11 +1292,11 @@ def build_nuisance_per_run(
     directly. Existing callers passing ``ortvec_files`` / ``ortvec_data``
     keep working unchanged; the conversion is silent.
     """
-    # Funnel legacy inputs into NuisanceBlocks.
-    blocks: list[NuisanceBlock] = []
+    # Funnel legacy inputs into NuisanceBlocks; pre-built blocks pass through.
+    all_blocks: list[NuisanceBlock] = list(blocks) if blocks else []
     if ortvec_files is not None:
         for filepath, label in ortvec_files:
-            blocks.append(
+            all_blocks.append(
                 make_nuisance_block_from_full_length(
                     filepath, label, run_starts, n_timepoints,
                 )
@@ -1222,7 +1315,7 @@ def build_nuisance_per_run(
                 f"ERROR: ortvec_data has {arr.shape[0]} rows, expected {n_timepoints}"
             )
             sys.exit(1)
-        blocks.append(
+        all_blocks.append(
             NuisanceBlock(
                 label="ortvec",
                 per_run=_slice_full_length_per_run(arr, run_starts, n_timepoints),
@@ -1231,7 +1324,7 @@ def build_nuisance_per_run(
         )
 
     assembly = assemble_per_run_nuisance(
-        blocks=blocks,
+        blocks=all_blocks,
         run_starts=run_starts,
         n_timepoints=n_timepoints,
         polort=polort,
@@ -1248,6 +1341,7 @@ def build_nuisance_block_diag(
     polort: int,
     device: torch.device,
     ortvec_files: list[tuple[str, str]] | None = None,
+    blocks: list["NuisanceBlock"] | None = None,
     verbose: bool = False,
 ) -> torch.Tensor:
     """
@@ -1321,20 +1415,29 @@ def build_nuisance_block_diag(
             poly_blocks.append(torch.zeros((run_len, 0), device=device))
     nuisance_design = torch.block_diag(*poly_blocks)
 
-    if ortvec_files is None:
+    # Merge legacy ortvec_files into blocks.
+    all_blocks: list[NuisanceBlock] = list(blocks) if blocks else []
+    if ortvec_files:
+        if verbose:
+            print(f"  Loading {len(ortvec_files)} ortvec file(s)...")
+        for filepath, label in ortvec_files:
+            all_blocks.append(
+                make_nuisance_block_from_full_length(
+                    filepath, label, run_starts, n_timepoints,
+                )
+            )
+
+    if not all_blocks:
         if verbose:
             print(f"  Nuisance design shape: {nuisance_design.shape}")
         return nuisance_design
 
-    # Funnel through NuisanceBlock so loading / row-count validation is shared.
-    if verbose:
-        print(f"  Loading {len(ortvec_files)} ortvec file(s)...")
-    for filepath, label in ortvec_files:
-        block = make_nuisance_block_from_full_length(
-            filepath, label, run_starts, n_timepoints,
-        )
-        # Shared-across-runs layout: reassemble the full-length matrix
-        # (block.from_full_length guarantees per_run[i] is non-None for all i).
+    for block in all_blocks:
+        if block.n_columns == 0:
+            continue
+        # Stack per-run matrices into full-length columns. For full-length
+        # files this recovers the SHARED ortvec layout. For per-run files
+        # missing runs come out as zeros — natural per-run nuisance.
         full = np.vstack([
             block.get_run(i, run_lengths[i]) for i in range(n_runs)
         ]).astype(np.float32)
@@ -1342,13 +1445,13 @@ def build_nuisance_block_diag(
         if np.max(np.abs(col_mean)) > 1e-4:
             full = full - col_mean
             if verbose:
-                print(f"    Demeaned ortvec {label!r} (was not zero-mean)")
+                print(f"    Demeaned ortvec {block.label!r} (was not zero-mean)")
         ortvec_tensor = torch.from_numpy(full).to(
             device=device, dtype=nuisance_design.dtype,
         )
         nuisance_design = torch.cat([nuisance_design, ortvec_tensor], dim=1)
         if verbose:
-            print(f"    {label}: {ortvec_tensor.shape[1]} regressor(s)")
+            print(f"    {block.label}: {ortvec_tensor.shape[1]} regressor(s)")
 
     if verbose:
         print(f"  Nuisance design shape: {nuisance_design.shape}")

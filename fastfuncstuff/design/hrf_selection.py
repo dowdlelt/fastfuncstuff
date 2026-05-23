@@ -607,6 +607,7 @@ def fit_glm_hrf_library_with_xval(
     microtime_onset: int = 0,
     polort: int | None = None,
     ortvec_files: list[tuple[str | Path, str]] | None = None,
+    nuisance_blocks: list | None = None,
     extra_regressors: np.ndarray | torch.Tensor | None = None,
     canonical_mode: str = "spmg1",
     device: torch.device | None = None,
@@ -827,6 +828,19 @@ def fit_glm_hrf_library_with_xval(
             ortvec_data = ortvec_data.unsqueeze(1)
         extra_nuisance_labels = [f"extra_{i}" for i in range(ortvec_data.shape[1])]
 
+    # NuisanceBlock labels propagate into the xmat ColumnLabels header (and
+    # downstream sub-brick labels). Legacy ortvec_files appear as "label_NN".
+    if nuisance_blocks:
+        for block in nuisance_blocks:
+            extra_nuisance_labels.extend(block.get_column_names())
+    if ortvec_files:
+        for path, label in ortvec_files:
+            from fastfuncstuff.design.hrf_selection import load_nuisance_file
+            ncols = load_nuisance_file(path).shape[1]
+            extra_nuisance_labels.extend(
+                f"{label}_{i:02d}" for i in range(ncols)
+            )
+
     nuisance_blocks_per_run = build_nuisance_per_run(
         run_starts=run_starts,
         n_timepoints=n_timepoints,
@@ -834,6 +848,7 @@ def fit_glm_hrf_library_with_xval(
         device=device,
         ortvec_files=ortvec_files,
         ortvec_data=ortvec_data,
+        blocks=nuisance_blocks,
         verbose=verbose,
     )
 

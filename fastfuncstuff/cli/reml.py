@@ -42,9 +42,11 @@ try:
     )
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
+        add_ortvec_arguments,
         add_verbose_arg,
         auto_polort,
         build_nuisance_block_diag,
+        collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
         parse_device_arg,
@@ -667,13 +669,7 @@ Examples:
         default=None,
         help="Polynomial order (default: auto based on run length)",
     )
-    onset_group.add_argument(
-        "-ortvec",
-        action="append",
-        nargs=2,
-        metavar=("FILE", "LABEL"),
-        help="Nuisance regressors (can repeat). FILE LABEL",
-    )
+    add_ortvec_arguments(onset_group)
     onset_group.add_argument(
         "-canonical",
         type=str,
@@ -1325,12 +1321,15 @@ def main():
         # Build nuisance design (polynomials + ortvec)
         print()
         print("Building nuisance regressors...")
+        nuisance_blocks = collect_nuisance_blocks(
+            args, run_starts, n_timepoints, verbose=True,
+        )
         nuisance_design = build_nuisance_block_diag(
             run_starts=run_starts,
             n_timepoints=n_timepoints,
             polort=polort,
             device=device,
-            ortvec_files=args.ortvec,
+            blocks=nuisance_blocks,
             verbose=True,
         )
 
@@ -1372,9 +1371,10 @@ def main():
             for p in range(polort + 1):
                 column_labels.append(f"Run#{run_idx+1}Pol#{p}")
 
-        if args.ortvec:
-            for _, label in args.ortvec:
-                column_labels.append(label)
+        # Nuisance block labels (one entry per column; widest column count
+        # per block when per-run widths differ).
+        for block in nuisance_blocks:
+            column_labels.extend(block.get_column_names())
 
         # Build stim_bots and stim_tops
         if is_fir_model:
@@ -1449,12 +1449,15 @@ def main():
         # Note: design_info was already created with condition-level design
         # We need to rebuild it with single-trial design
         print("Building nuisance regressors for single-trial design...")
+        nuisance_blocks_st = collect_nuisance_blocks(
+            args, run_starts, n_timepoints, verbose=False,
+        )
         nuisance_design_st = build_nuisance_block_diag(
             run_starts=run_starts,
             n_timepoints=n_timepoints,
             polort=polort,
             device=device,
-            ortvec_files=args.ortvec,
+            blocks=nuisance_blocks_st,
             verbose=True,
         )
 
@@ -1470,10 +1473,22 @@ def main():
         print()
         print("Running ARMA(1,1) analysis on single-trial design...")
 
+        # Build nuisance labels: per-run poly + per-block column names.
+        nuisance_labels_st: list[str] = []
+        for run_idx in range(n_runs):
+            for p in range(polort + 1):
+                nuisance_labels_st.append(f"r{run_idx + 1:02d}_poly{p}")
+        for block in nuisance_blocks_st:
+            nuisance_labels_st.extend(block.get_column_names())
+        # Pad if rounding/widening mismatch (shouldn't happen, but be safe).
+        while len(nuisance_labels_st) < len(nuisance_indices_st):
+            nuisance_labels_st.append(f"nuisance_{len(nuisance_labels_st)}")
+        nuisance_labels_st = nuisance_labels_st[: len(nuisance_indices_st)]
+
         # Create a temporary design_info for single-trial mode
         design_info_st = {
             "design_matrix": full_design_st.cpu().numpy(),
-            "column_labels": trial_labels + [f"nuisance_{i}" for i in range(len(nuisance_indices_st))],
+            "column_labels": trial_labels + nuisance_labels_st,
             "stim_indices": task_indices_st,
             "nuisance_indices": nuisance_indices_st,
             "run_starts": run_starts,

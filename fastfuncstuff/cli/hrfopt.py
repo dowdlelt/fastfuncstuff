@@ -39,9 +39,11 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+        add_ortvec_arguments,
         add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
+        collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
@@ -367,19 +369,7 @@ Notes:
         default=None,
         help="Polynomial order for drift modeling (default: auto based on run length)",
     )
-    proc_opts.add_argument(
-        "-ortvec",
-        action="append",
-        nargs=2,
-        metavar=("FILE", "LABEL"),
-        help=(
-            "Additional nuisance regressors to project out (can be repeated). "
-            "FILE is a text file with nuisance columns (AFNI 1D, CSV, or whitespace-separated). "
-            "LABEL is a prefix for the column names. "
-            "Files must span all runs concatenated (same length as total timepoints). "
-            "Example: -ortvec motion_all.1D motion -ortvec physio.txt physio"
-        ),
-    )
+    add_ortvec_arguments(proc_opts)
     proc_opts.add_argument(
         "-microtime_dt",
         type=float,
@@ -578,12 +568,14 @@ def main():
     # ==========================================================================
     # 0. Validate flag combinations that don't depend on input files
     # ==========================================================================
+    any_ortvec = bool(args.ortvec or args.ortvec_run or args.ortvec_glob)
     if args.delta_denoise:
-        if not args.ortvec:
+        if not any_ortvec:
             print(
-                "ERROR: -delta_denoise requires at least one -ortvec. "
-                "It compares HRF selection with vs. without the user-supplied "
-                "nuisance regressors; without -ortvec there is nothing to compare."
+                "ERROR: -delta_denoise requires at least one -ortvec / "
+                "-ortvec_run / -ortvec_glob. It compares HRF selection with "
+                "vs. without user-supplied nuisance; without any, there is "
+                "nothing to compare."
             )
             sys.exit(1)
         if args.single_trials or args.save_single_trial_betas:
@@ -819,13 +811,14 @@ def main():
 
     print_summary(args, n_runs, n_conditions, n_voxels, condition_labels)
 
-    # Convert ortvec argument to list of tuples if provided
-    ortvec_files = None
-    if args.ortvec:
-        ortvec_files = [(f, label) for f, label in args.ortvec]
-        if args.verb >= 1:
-            for f, label in ortvec_files:
-                print(f"  Nuisance: {f} (label={label})")
+    # Collect user-supplied nuisance regressors into NuisanceBlock list.
+    nuisance_blocks = collect_nuisance_blocks(
+        args, run_starts, n_timepoints, verbose=(args.verb >= 1),
+    )
+    # Legacy variable retained for back-compat fields (metadata + delta-denoise label).
+    ortvec_files = (
+        [(f, label) for f, label in args.ortvec] if args.ortvec else None
+    )
 
     results_nodenoise = None  # populated only when -delta_denoise is set
     if args.single_trials:
@@ -862,7 +855,7 @@ def main():
             n_timepoints=n_timepoints,
             polort=polort,
             device=device,
-            ortvec_files=ortvec_files,
+            blocks=nuisance_blocks,
             verbose=False,
         )
 
@@ -1150,7 +1143,8 @@ def main():
             metric=args.metric,
             microtime_dt=args.microtime_dt,
             polort=args.polort,
-            ortvec_files=ortvec_files,
+            ortvec_files=None,
+            nuisance_blocks=nuisance_blocks,
             canonical_mode=args.canonical,
             device=device,
             verbose=args.verb >= 1,
@@ -1184,7 +1178,8 @@ def main():
                 metric=args.metric,
                 microtime_dt=args.microtime_dt,
                 polort=args.polort,
-                ortvec_files=None,  # the whole point — strip user nuisance
+                ortvec_files=None,
+                nuisance_blocks=[],  # the whole point — strip user nuisance
                 canonical_mode=args.canonical,
                 device=device,
                 verbose=args.verb >= 1,
@@ -1207,6 +1202,18 @@ def main():
     results.hrf_metadata["durations"] = durations
     if ortvec_files:
         results.hrf_metadata["ortvec_files"] = [(str(f), label) for f, label in ortvec_files]
+    if nuisance_blocks:
+        # Block-level provenance for the JSON sidecar: label, source files per
+        # run (None where the block contributed zeros), and column count.
+        results.hrf_metadata["nuisance_blocks"] = [
+            {
+                "label": b.label,
+                "n_columns": b.n_columns,
+                "source": list(b.source),
+                "column_names": b.get_column_names(),
+            }
+            for b in nuisance_blocks
+        ]
 
     # ==========================================================================
     # 6. Save outputs

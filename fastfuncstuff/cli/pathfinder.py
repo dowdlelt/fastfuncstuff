@@ -60,8 +60,10 @@ try:
         save_nifti,
     )
     from fastfuncstuff.cli_utils import (
+        add_ortvec_arguments,
         add_verbose_arg,
         auto_polort,
+        collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
         parse_cv_strategy,
@@ -346,13 +348,7 @@ Notes:
         default=None,
         help="Polynomial order for drift modeling (default: auto)",
     )
-    proc_opts.add_argument(
-        "-ortvec",
-        action="append",
-        nargs=2,
-        metavar=("FILE", "LABEL"),
-        help="Additional nuisance regressors (can be repeated)",
-    )
+    add_ortvec_arguments(proc_opts)
     proc_opts.add_argument(
         "-microtime_dt",
         type=float,
@@ -1508,20 +1504,25 @@ def main():
         poly_block = construct_polynomial_matrix(run_length, polort, device)
         nuisance_per_run.append(poly_block)
 
-    # Add ortvec if provided
-    if args.ortvec:
-        for ortvec_file, _label in args.ortvec:
-            nuisance_data = load_nuisance_file(ortvec_file, expected_rows=n_timepoints)
-            print(f"  Loaded nuisance: {ortvec_file} ({nuisance_data.shape[1]} columns)")
-            for run_idx in range(n_runs):
-                start_tp = run_starts[run_idx]
-                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                run_nuisance = torch.tensor(
-                    nuisance_data[start_tp:end_tp, :], dtype=torch.float32, device=device
-                )
-                nuisance_per_run[run_idx] = torch.cat(
-                    [nuisance_per_run[run_idx], run_nuisance], dim=1
-                )
+    # Add user nuisance blocks (-ortvec / -ortvec_run / -ortvec_glob).
+    user_blocks = collect_nuisance_blocks(args, run_starts, n_timepoints, verbose=True)
+    for block in user_blocks:
+        if block.n_columns == 0:
+            continue
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_length = end_tp - start_tp
+            m = block.get_run(run_idx, run_length).copy()
+            col_mean = m.mean(axis=0, keepdims=True)
+            if np.max(np.abs(col_mean)) > 1e-4:
+                m = m - col_mean
+            run_nuisance = torch.from_numpy(m).to(
+                device=device, dtype=nuisance_per_run[run_idx].dtype,
+            )
+            nuisance_per_run[run_idx] = torch.cat(
+                [nuisance_per_run[run_idx], run_nuisance], dim=1
+            )
 
     print(f"  Nuisance per run: {nuisance_per_run[0].shape[1]} columns (polort={polort})")
 

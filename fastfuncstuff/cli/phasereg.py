@@ -95,7 +95,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_ortvec_arguments, add_verbose_arg
 
 
 class _HelpFormatter(
@@ -289,9 +289,12 @@ def create_parser() -> argparse.ArgumentParser:
     )
     proc.add_argument(
         "-motion", nargs="+", metavar="FILE",
-        help="Motion parameter files (one per run, AFNI dfile format). "
+        help="(DEPRECATED — use -ortvec_run instead.) "
+             "Motion parameter files, one per run (AFNI dfile format). "
+             "Equivalent to passing each as -ortvec_run FILE motion RUN. "
              "Added as nuisance regressors.",
     )
+    add_ortvec_arguments(proc)
 
     # ── Hardware ─────────────────────────────────────────────────────────
     hw = parser.add_argument_group("Hardware Options")
@@ -570,8 +573,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb >= 1:
             print(f"  Auto TENT window: {tent_window:.1f}s (from stimulus durations)")
 
-    # ── Load motion nuisance ─────────────────────────────────────────────
-    nuisance_per_run = None
+    # ── Build per-run nuisance from -motion / -ortvec* flags ─────────────
+    # -motion remains as a deprecated alias for N invocations of
+    # -ortvec_run FILE motion RUN. Both styles funnel through the unified
+    # NuisanceBlock pathway so per-run / glob / full-length inputs all work.
     if args.motion:
         if len(args.motion) != n_runs:
             print(
@@ -579,16 +584,53 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        nuisance_per_run = []
-        for mot_file in args.motion:
-            mot = np.loadtxt(mot_file, dtype=np.float32)
-            if mot.ndim == 1:
-                mot = mot[:, np.newaxis]
-            nuisance_per_run.append(
-                torch.tensor(mot, dtype=torch.float32, device=device)
-            )
         if args.verb >= 1:
-            print(f"  Motion: {nuisance_per_run[0].shape[1]} parameters per run")
+            print(
+                "WARNING: -motion is deprecated; use "
+                "-ortvec_run FILE motion RUN (repeatable) instead."
+            )
+        args.ortvec_run = list(args.ortvec_run or []) + [
+            [str(f), "motion", str(i + 1)] for i, f in enumerate(args.motion)
+        ]
+
+    nuisance_per_run = None
+    if args.ortvec or args.ortvec_run or args.ortvec_glob:
+        from fastfuncstuff.cli_utils import collect_nuisance_blocks
+
+        run_lengths = [int(m.shape[1]) for m in mag_list]
+        run_starts = [0]
+        for rl in run_lengths[:-1]:
+            run_starts.append(run_starts[-1] + rl)
+        n_timepoints = sum(run_lengths)
+
+        blocks = collect_nuisance_blocks(
+            args, run_starts, n_timepoints, verbose=(args.verb >= 1),
+        )
+        nuisance_per_run = []
+        for run_idx, run_length in enumerate(run_lengths):
+            cols: list[np.ndarray] = []
+            for block in blocks:
+                if block.n_columns == 0:
+                    continue
+                m = block.get_run(run_idx, run_length).copy()
+                col_mean = m.mean(axis=0, keepdims=True)
+                if np.max(np.abs(col_mean)) > 1e-4:
+                    m = m - col_mean
+                cols.append(m)
+            if cols:
+                arr = np.concatenate(cols, axis=1).astype(np.float32)
+                nuisance_per_run.append(
+                    torch.tensor(arr, dtype=torch.float32, device=device)
+                )
+            else:
+                nuisance_per_run.append(
+                    torch.zeros((run_length, 0), dtype=torch.float32, device=device)
+                )
+        if args.verb >= 1:
+            print(
+                f"  Nuisance: {nuisance_per_run[0].shape[1]} regressor(s) per run "
+                f"({len(blocks)} block(s))"
+            )
 
     # ── Run phase regression ─────────────────────────────────────────────
     if args.verb >= 1:

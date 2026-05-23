@@ -47,8 +47,10 @@ try:
     )
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_ortvec_arguments,
         add_verbose_arg,
         auto_polort,
+        collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_cv_strategy,
         parse_input_files,
@@ -459,19 +461,7 @@ Notes:
         default=None,
         help="Polynomial order for drift modeling (default: auto based on run length)",
     )
-    proc_opts.add_argument(
-        "-ortvec",
-        action="append",
-        nargs=2,
-        metavar=("FILE", "LABEL"),
-        help=(
-            "Additional nuisance regressors (can be repeated). "
-            "FILE: text file with nuisance columns. "
-            "LABEL: prefix for column names. "
-            "Must span all runs concatenated. "
-            "Example: -ortvec motion_all.1D motion"
-        ),
-    )
+    add_ortvec_arguments(proc_opts)
     proc_opts.add_argument(
         "-microtime_dt",
         type=float,
@@ -1905,33 +1895,31 @@ def main():
         nuisance_per_run.append(poly)
         max_nuisance_cols = max(max_nuisance_cols, poly.shape[1])
 
-    # Add ortvec files if provided (split by run)
-    if args.ortvec:
-        # Load and concatenate all ortvec files
-        ortvec_all = []
-        for ortvec_file, _label in args.ortvec:
-            ortvec_data = load_nuisance_file(ortvec_file)
-            ortvec_data = to_tensor(ortvec_data, device=device)
-            if ortvec_data.shape[0] != n_timepoints:
-                print(
-                    f"ERROR: ortvec file {ortvec_file} has {ortvec_data.shape[0]} rows, expected {n_timepoints}"
+    # Add user-supplied nuisance blocks (any of -ortvec / -ortvec_run / -ortvec_glob).
+    nuisance_blocks_user = collect_nuisance_blocks(
+        args, run_starts, n_timepoints, verbose=(args.verb >= 1),
+    )
+    if nuisance_blocks_user:
+        for run_idx in range(n_runs):
+            start_tp = run_starts[run_idx]
+            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+            run_length = end_tp - start_tp
+            for block in nuisance_blocks_user:
+                if block.n_columns == 0:
+                    continue
+                m = block.get_run(run_idx, run_length).copy()
+                col_mean = m.mean(axis=0, keepdims=True)
+                if np.max(np.abs(col_mean)) > 1e-4:
+                    m = m - col_mean
+                m_t = torch.from_numpy(m).to(
+                    device=device, dtype=nuisance_per_run[run_idx].dtype,
                 )
-                sys.exit(1)
-            ortvec_all.append(ortvec_data)
-
-        ortvec_concat = torch.cat(ortvec_all, dim=1) if ortvec_all else None
-
-        # Split ortvec by run and concatenate with polynomials
-        if ortvec_concat is not None:
-            for run_idx in range(n_runs):
-                start_tp = run_starts[run_idx]
-                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-                ortvec_run = ortvec_concat[start_tp:end_tp, :]
                 nuisance_per_run[run_idx] = torch.cat(
-                    [nuisance_per_run[run_idx], ortvec_run], dim=1
+                    [nuisance_per_run[run_idx], m_t], dim=1,
                 )
-
-            max_nuisance_cols = nuisance_per_run[0].shape[1]  # All now have same # after ortvec
+            max_nuisance_cols = max(
+                max_nuisance_cols, nuisance_per_run[run_idx].shape[1]
+            )
 
     # Pad all runs to have same number of columns (for CV concatenation compatibility)
     # -------------------------------------------
