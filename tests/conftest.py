@@ -5,6 +5,19 @@ Pytest configuration for fastfuncstuff tests.
 import pytest
 import torch
 
+# Bump dynamo recompile cache size: many tests trigger compiled kernels
+# (e.g. glm.xval._cod_kernel_compiled) with varying shapes, dtypes, devices,
+# and grad-mode states. The default limit (8) is fine for production but
+# fills up across a full test run and turns into FailOnRecompileLimitHit
+# pollution in unrelated downstream tests.
+try:
+    import torch._dynamo
+
+    torch._dynamo.config.cache_size_limit = 256
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+except Exception:
+    pass
+
 
 def pytest_configure(config):
     """Configure pytest with custom markers."""

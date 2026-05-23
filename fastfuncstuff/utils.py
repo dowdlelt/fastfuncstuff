@@ -156,7 +156,13 @@ def configure_torch_backends(device: torch.device) -> None:
     # fallback when on MPS, and is the primary compute device when device=cpu.
     n_cpu = os.cpu_count() or 1
     torch.set_num_threads(n_cpu)
-    torch.set_num_interop_threads(min(4, n_cpu))
+    try:
+        torch.set_num_interop_threads(min(4, n_cpu))
+    except RuntimeError:
+        # set_num_interop_threads can only be called once before any parallel
+        # work starts. Tests/notebooks may call configure_torch_backends
+        # multiple times; the second call is a no-op for interop threads.
+        pass
 
 
 def calc_memory_usage(shape: tuple, dtype: torch.dtype = torch.float32) -> float:
