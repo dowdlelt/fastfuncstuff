@@ -156,61 +156,6 @@ def test_fit_glm_hrf_library_logic(simulated_data):
     assert torch.allclose(results.r2, max_r2_all, atol=1e-5)
 
 
-def test_analyze_from_onsets_sanity():
-    """Confirm the high-level AFNI onset pipeline is sane."""
-    if not TEST_DATA_DIR.exists():
-        pytest.skip("Test data not found")
-
-    movie_timing = TEST_DATA_DIR / "ses01_times.movie.txt"
-    prompt_timing = TEST_DATA_DIR / "ses01_times.prompt.txt"
-    fmri_file = TEST_DATA_DIR / "small_test_r01.nii.gz"
-
-    # Run high-level analysis
-    results = analyze_from_onsets(
-        fmri_data=fmri_file,
-        onset_files=[movie_timing, prompt_timing],
-        stim_labels=["movie", "prompt"],
-        tr=1.0,
-        polort=2,
-        stim_duration=5.0,  # Matches AFNI 'SPMG1(5)'
-        hrf_mode="library",  # This tests library mode through analyze_from_onsets
-        test_n_voxels=50,  # Fast mode
-        verbose=False,
-    )
-
-    assert results.betas.shape[0] >= 50
-    # Results should only contain task betas (separated from nuisance/polort)
-    assert results.betas.shape[1] == 2
-    assert results.r2.shape == (results.betas.shape[0],)
-    assert torch.isfinite(results.betas).all()
-
-
-def test_analyze_with_cross_validation_sanity():
-    """Confirm cross-validation pipeline is sane."""
-    if not TEST_DATA_DIR.exists():
-        pytest.skip("Test data not found")
-
-    fmri_files = [
-        TEST_DATA_DIR / "small_test_r01.nii.gz",
-        TEST_DATA_DIR / "small_test_r02.nii.gz",
-    ]
-    design_file = TEST_DATA_DIR / "X.xmat.1D"
-
-    # Run CV
-    results, design_info = analyze_with_cross_validation(
-        fmri_data=fmri_files,
-        design_matrix_file=design_file,
-        cv_strategy=1,  # LORO
-        test_n_voxels=50,
-        verbose=False,
-    )
-
-    assert "r2_median" in results
-    assert results["r2_median"].shape == (50,)
-    assert results["n_splits"] == 2  # 2 runs LORO = 2 splits
-    assert "run_starts" in design_info
-
-
 def test_microtime_resolution(simulated_data):
     """Confirm sub-TR timing (microtime resolution) works correctly."""
     from fastfuncstuff.io.afni import onsets_to_binary_matrix

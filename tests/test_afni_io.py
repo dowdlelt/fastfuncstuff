@@ -72,7 +72,7 @@ class TestAFNIReading:
 
     def test_read_afni_all_ones(self):
         """Test reading the synthetic all-ones AFNI dataset."""
-        if not AFNI_ALL_ONES_HEAD.exists():
+        if not (AFNI_ALL_ONES_HEAD.exists() and AFNI_ALL_ONES_BRIK.exists()):
             pytest.skip("Synthetic AFNI data not found")
 
         # nibabel can read AFNI format too
@@ -89,7 +89,7 @@ class TestAFNIReading:
 
     def test_afni_nifti_equivalence(self):
         """Test that AFNI and NIfTI versions have same data."""
-        if not (AFNI_ALL_ONES_HEAD.exists() and NIFTI_ALL_ONES.exists()):
+        if not (AFNI_ALL_ONES_HEAD.exists() and AFNI_ALL_ONES_BRIK.exists() and NIFTI_ALL_ONES.exists()):
             pytest.skip("Synthetic data not found")
 
         afni_img = nib.load(str(AFNI_ALL_ONES_HEAD))
