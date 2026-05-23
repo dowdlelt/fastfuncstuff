@@ -482,6 +482,20 @@ Notes:
         action="store_true",
         help="Save design matrix and HRF library plots as PNG images.",
     )
+    out_opts.add_argument(
+        "-delta_denoise",
+        action="store_true",
+        help=(
+            "Quantify how much the user-supplied nuisance regressors (-ortvec) "
+            "changed HRF selection. Re-runs the entire selection pass with "
+            "ortvec stripped, then writes a second set of outputs under "
+            "{prefix}_nodenoise_* and four delta maps under {prefix}_delta_*: "
+            "_delta_xval_r2 (with − without), _delta_hrfopt_r2 (same for in-sample), "
+            "_delta_hrf_changed (1 where selected HRF differs), and "
+            "_delta_hrf_index (signed shift in HRF index). "
+            "Requires at least one -ortvec. Not supported with -single_trials."
+        ),
+    )
 
     return parser
 
@@ -560,6 +574,25 @@ def main():
         args.verb = max(args.verb, 1)
 
     print_header(args)
+
+    # ==========================================================================
+    # 0. Validate flag combinations that don't depend on input files
+    # ==========================================================================
+    if args.delta_denoise:
+        if not args.ortvec:
+            print(
+                "ERROR: -delta_denoise requires at least one -ortvec. "
+                "It compares HRF selection with vs. without the user-supplied "
+                "nuisance regressors; without -ortvec there is nothing to compare."
+            )
+            sys.exit(1)
+        if args.single_trials or args.save_single_trial_betas:
+            print(
+                "ERROR: -delta_denoise is not yet supported with -single_trials "
+                "/ -save_single_trial_betas (beta-space CV path). "
+                "Run without -single_trials to measure the nuisance effect."
+            )
+            sys.exit(1)
 
     # ==========================================================================
     # 1. Parse and validate inputs
@@ -794,6 +827,7 @@ def main():
             for f, label in ortvec_files:
                 print(f"  Nuisance: {f} (label={label})")
 
+    results_nodenoise = None  # populated only when -delta_denoise is set
     if args.single_trials:
         # ========== SINGLE-TRIAL IN-SAMPLE R² PATH (GLMsingle Type-B) ==========
         # Matches GLMsingle's FitHRF step: for each HRF candidate, fit a single-trial
@@ -1128,6 +1162,40 @@ def main():
             condition_labels=condition_labels,
         )
 
+        # ========== -delta_denoise: second pass without ortvec ==========
+        # Quantify the effect of the user-supplied nuisance regressors on
+        # HRF selection by re-running the entire pass with ortvec stripped.
+        # Polort, scaling, library, CV strategy, and select_mode are all
+        # held fixed — only ortvec_files differs.
+        if args.delta_denoise:
+            print()
+            print("=" * 70)
+            print("Running second pass without -ortvec (for -delta_denoise)")
+            print("=" * 70)
+            results_nodenoise = fit_glm_hrf_library_with_xval(
+                data=data,
+                onsets=onset_matrix,
+                hrf_library=hrf_library,
+                tr=args.tr,
+                run_starts=run_starts,
+                stim_durations=durations,
+                cv_strategy=cv_strategy,
+                n_perms=args.n_perms,
+                metric=args.metric,
+                microtime_dt=args.microtime_dt,
+                polort=args.polort,
+                ortvec_files=None,  # the whole point — strip user nuisance
+                canonical_mode=args.canonical,
+                device=device,
+                verbose=args.verb >= 1,
+                chunk_size=args.batch_size,
+                r2_method=args.R2method,
+                select_mode=args.select,
+                debug=False,  # don't double-write debug artifacts
+                debug_prefix=args.prefix,
+                condition_labels=condition_labels,
+            )
+
     # Update metadata with CLI parameters
     results.hrf_metadata["hrf_mode"] = args.hrf_mode
     results.hrf_metadata["canonical_mode"] = args.canonical
@@ -1185,6 +1253,111 @@ def main():
     # Restore final_results for custom saving
     if args.save_single_trial_betas and final_results_temp is not None:
         results.final_results = final_results_temp
+
+    # ==========================================================================
+    # 6a. -delta_denoise: save the nodenoise pass + delta maps
+    # ==========================================================================
+    if args.delta_denoise and results_nodenoise is not None:
+        from fastfuncstuff.design.hrf_selection import _save_volume
+
+        # Mirror the same metadata-stamping the primary pass got, so the
+        # nodenoise pt-bundle is self-describing.
+        results_nodenoise.hrf_metadata["hrf_mode"] = args.hrf_mode
+        results_nodenoise.hrf_metadata["canonical_mode"] = args.canonical
+        results_nodenoise.hrf_metadata["condition_labels"] = condition_labels
+        results_nodenoise.hrf_metadata["input_files"] = input_files
+        results_nodenoise.hrf_metadata["onset_files"] = onset_files
+        if args.events:
+            results_nodenoise.hrf_metadata["event_files"] = args.events
+        results_nodenoise.hrf_metadata["durations"] = durations
+        results_nodenoise.hrf_metadata["delta_denoise_pass"] = "nodenoise"
+
+        print()
+        print(f"Saving nodenoise outputs ({args.prefix}_nodenoise_*) ...")
+        save_hrf_selection_results(
+            results=results_nodenoise,
+            output_prefix=f"{args.prefix}_nodenoise",
+            volume_shape=volume_shape,
+            affine=affine,
+            voxel_mask=voxel_mask,
+            condition_labels=condition_labels,
+            run_starts=run_starts,
+            save_all_hrf_designs=False,  # one set of designs is enough
+            onsets=None,
+            save_plots=False,
+            nii_ext=_nii_ext,
+        )
+
+        # ---- Delta maps (primary − nodenoise) ----
+        # xval R² delta: positive where nuisance helped (CV-honest metric).
+        # Compute on CPU so devices match regardless of where each pass lived.
+        r2_primary = results.xval_r2_best.detach().cpu()
+        r2_nd = results_nodenoise.xval_r2_best.detach().cpu()
+        delta_xval = r2_primary - r2_nd
+        _save_volume(
+            delta_xval,
+            f"{args.prefix}_delta_xval_r2{_nii_ext}",
+            volume_shape, affine, voxel_mask,
+        )
+
+        # In-sample (HRFopt) R² delta — the headline "fit looks better" number.
+        # This field is only present for the time-series path; guard anyway.
+        delta_hrfopt = None
+        if (
+            getattr(results, "hrfopt_full_r2", None) is not None
+            and getattr(results_nodenoise, "hrfopt_full_r2", None) is not None
+        ):
+            r2f_primary = results.hrfopt_full_r2.detach().cpu()
+            r2f_nd = results_nodenoise.hrfopt_full_r2.detach().cpu()
+            delta_hrfopt = r2f_primary - r2f_nd
+            _save_volume(
+                delta_hrfopt,
+                f"{args.prefix}_delta_hrfopt_r2{_nii_ext}",
+                volume_shape, affine, voxel_mask,
+            )
+
+        # HRF index: whether selection changed (uint-style mask) and signed shift.
+        idx_primary = results.hrf_index.detach().cpu().long()
+        idx_nd = results_nodenoise.hrf_index.detach().cpu().long()
+        changed = (idx_primary != idx_nd).to(torch.float32)
+        shift = (idx_primary - idx_nd).to(torch.float32)
+        _save_volume(
+            changed,
+            f"{args.prefix}_delta_hrf_changed{_nii_ext}",
+            volume_shape, affine, voxel_mask,
+        )
+        _save_volume(
+            shift,
+            f"{args.prefix}_delta_hrf_index{_nii_ext}",
+            volume_shape, affine, voxel_mask,
+        )
+
+        # Summary block — keep it the one piece the user actually reads.
+        n_voxels = idx_primary.numel()
+        n_changed = int(changed.sum().item())
+        pct_changed = 100.0 * n_changed / max(n_voxels, 1)
+        med_dxval = float(delta_xval.median().item())
+        med_dxval_changed = (
+            float(delta_xval[changed.bool()].median().item())
+            if n_changed > 0 else float("nan")
+        )
+        med_abs_shift_changed = (
+            float(shift[changed.bool()].abs().median().item())
+            if n_changed > 0 else float("nan")
+        )
+
+        print()
+        print("=" * 70)
+        print("Δ summary: primary (with -ortvec) − nodenoise")
+        print("=" * 70)
+        print(f"  Voxels with changed HRF: {n_changed:,} / {n_voxels:,} ({pct_changed:.2f}%)")
+        print(f"  Median Δ xval R² (all voxels):           {med_dxval:+.4f}")
+        if n_changed > 0:
+            print(f"  Median Δ xval R² (HRF-changed voxels):   {med_dxval_changed:+.4f}")
+            print(f"  Median |Δ HRF index| (changed voxels):   {med_abs_shift_changed:.1f}")
+        if delta_hrfopt is not None:
+            print(f"  Median Δ in-sample R²:                   {float(delta_hrfopt.median().item()):+.4f}")
+        print()
 
     # ==========================================================================
     # 6b. Custom saving for single-trial betas (if requested)
