@@ -23,7 +23,14 @@ from fastfuncstuff.processing.ffs_moco import (
     save_moco_1D,
     save_moco_dfile,
 )
-from fastfuncstuff.processing.io import load_image, save_image
+from fastfuncstuff.processing.io import (
+    derive_mean_output_path,
+    load_image,
+    save_image,
+)
+
+# Sentinel for `-save_mean` given with no value: derive the path from -prefix.
+_MEAN_FROM_PREFIX = "\x00from_prefix"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -194,10 +201,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     out_group.add_argument(
         "-save_mean",
+        nargs="?",
+        const=_MEAN_FROM_PREFIX,
         default=None,
         metavar="PREFIX",
-        help="Save the temporal mean of the corrected series to this prefix. "
-        "Can be used without -prefix to skip writing the full timeseries.",
+        help="Save the temporal mean of the corrected series. With no value, "
+        "derives mean_{prefix} from -prefix (legacy behavior); give a PREFIX to "
+        "write it there (and you may then omit -prefix to skip the full series).",
     )
 
     # --- Hardware ---
@@ -315,9 +325,20 @@ def main(argv: list[str] | None = None) -> None:
         if verb >= 1:
             print(f"Saved: {out_path}")
 
-    # Temporal mean of the corrected series, to its own prefix.
+    # Temporal mean of the corrected series.
     if args.save_mean is not None:
-        mean_path = parse_prefix(args.save_mean).as_file()
+        if args.save_mean is _MEAN_FROM_PREFIX:
+            # legacy: derive mean_{prefix} from the timeseries prefix
+            if args.prefix is None:
+                print(
+                    "Error: -save_mean with no value needs -prefix to derive the "
+                    "mean path; pass -save_mean PREFIX instead.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            mean_path = derive_mean_output_path(parse_prefix(args.prefix).as_file())
+        else:
+            mean_path = parse_prefix(args.save_mean).as_file()
         mean_image = result.aligned.mean(dim=0)
         save_image(mean_image, mean_path, header_info=header_info)
         if verb >= 1:
