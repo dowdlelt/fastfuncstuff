@@ -204,12 +204,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "intermediates are saved (the loop would otherwise produce "
                             "one set per volume — a lot of files)")
     g_reg.add_argument("-partials", action="store_true",
-                       help="Save the resampled (warped) source volume after each "
-                            "refinement level, as {prefix}_lev00.nii.gz, _lev01, ... "
-                            "(zero-padded level next to the prefix). Like "
-                            "-save_intermediates but warped images only, written beside "
-                            "the prefix rather than in a {prefix}_levels/ dir. With "
-                            "-pyramid, partials cover the full-resolution refine levels.")
+                       help="Concatenate the resampled (warped) source from each "
+                            "refinement level into a single 4D file "
+                            "{prefix}_partials.nii.gz -- a level-by-level 'movie' of the "
+                            "warp converging. With -pyramid, covers the full-resolution "
+                            "refine levels.")
     g_reg.add_argument("-partial_warps", action="store_true",
                        help="Save the warp field after each refinement level, as "
                             "{prefix}_WARP_lev00.nii.gz, _WARP_lev01, ... (zero-padded "
@@ -589,50 +588,79 @@ def _compute_axis_weights_from_motion(
     return (abs(rx), abs(ry), abs(rz))
 
 
-def _make_level_callback(
-    levels_dir: str,
-    basename: str,
-    base_info: dict,
-    padding: tuple[int, int, int] | None,
-    nx: int, ny: int, nz: int,
-    save_warps: bool = True,
-    save_images: bool = True,
-):
-    """Build a level callback that writes per-level warp and/or warped image.
+class _LevelDumper:
+    """Per-level warp/image dump callback for ffs_qwarp, with three independent
+    outputs selected at construction:
 
-    Filenames carry a zero-padded level tag (``_lev00``, ``_lev01``, ...).
-    ``save_warps``/``save_images`` select which artifacts to write, so the
-    same machinery backs -save_intermediates (both), -partials (images), and
-    -partial_warps (warps).
+    - ``folder`` (-save_intermediates): per-level warp + warped image written to
+      ``{prefix}_levels/`` as ``{base}_WARP_lev00.nii.gz`` / ``{base}_lev00.nii.gz``.
+    - ``warp_files`` (-partial_warps): per-level warp field written beside the
+      prefix as ``{prefix}_WARP_lev00.nii.gz``.
+    - ``movie`` (-partials): the warped image at each level is accumulated and
+      written once at :meth:`finalize` as a single 4D file
+      ``{prefix}_partials.nii.gz`` -- a level-by-level "movie" of the warp.
+
+    Used as the qwarp level callback (it is callable); call :meth:`finalize`
+    after the run to flush the movie.
     """
-    from fastfuncstuff.processing.io import save_image, save_warp_field
 
-    os.makedirs(levels_dir, exist_ok=True)
-    pad_x, pad_y, pad_z = padding if padding is not None else (0, 0, 0)
+    def __init__(
+        self, prefix: str, base_info: dict, padding: tuple[int, int, int] | None,
+        nx: int, ny: int, nz: int, *, folder: bool, warp_files: bool, movie: bool,
+    ):
+        self.prefix = prefix
+        self.basename = os.path.basename(prefix)
+        self.base_info = base_info
+        self.padding = padding
+        self.nx, self.ny, self.nz = nx, ny, nz
+        self.folder = folder
+        self.warp_files = warp_files
+        self.movie = movie
+        self.frames: list[Tensor] = []
+        self.levels_dir = f"{prefix}_levels"
+        if folder:
+            os.makedirs(self.levels_dir, exist_ok=True)
 
-    def callback(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
+    def _crop(self, warped: Tensor) -> Tensor:
+        warped = warped.detach().cpu()
+        px, py, pz = self.padding if self.padding is not None else (0, 0, 0)
+        if px or py or pz:
+            return warped[pz:pz + self.nz, py:py + self.ny, px:px + self.nx]
+        return warped
+
+    def __call__(self, level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
+        from fastfuncstuff.processing.io import save_image, save_warp_field
+
         lev_tag = f"lev{level:02d}"
-        if save_warps:
+        if self.folder:
             save_warp_field(
                 xd.detach().cpu(), yd.detach().cpu(), zd.detach().cpu(),
-                os.path.join(levels_dir, f"{basename}_WARP_{lev_tag}.nii.gz"),
-                header_info=base_info,
-                padding=padding,
-                units="mm",
+                os.path.join(self.levels_dir, f"{self.basename}_WARP_{lev_tag}.nii.gz"),
+                header_info=self.base_info, padding=self.padding, units="mm",
             )
-        if save_images:
-            warped_full = warped.detach().cpu()
-            if pad_x or pad_y or pad_z:
-                warped_cropped = warped_full[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx]
-            else:
-                warped_cropped = warped_full
             save_image(
-                warped_cropped,
-                os.path.join(levels_dir, f"{basename}_{lev_tag}.nii.gz"),
-                header_info=base_info,
+                self._crop(warped),
+                os.path.join(self.levels_dir, f"{self.basename}_{lev_tag}.nii.gz"),
+                header_info=self.base_info,
             )
+        if self.warp_files:
+            save_warp_field(
+                xd.detach().cpu(), yd.detach().cpu(), zd.detach().cpu(),
+                f"{self.prefix}_WARP_{lev_tag}.nii.gz",
+                header_info=self.base_info, padding=self.padding, units="mm",
+            )
+        if self.movie:
+            self.frames.append(self._crop(warped))
 
-    return callback
+    def finalize(self) -> None:
+        """Write the accumulated per-level warped images as one 4D movie."""
+        if not (self.movie and self.frames):
+            return
+        from fastfuncstuff.processing.io import save_image
+
+        movie = torch.stack(self.frames, dim=0)  # (n_levels, nz, ny, nx)
+        save_image(movie, f"{self.prefix}_partials.nii.gz", header_info=self.base_info)
+        self.frames.clear()
 
 
 def _build_timeseries_base(
@@ -1169,33 +1197,31 @@ def main(argv: list[str] | None = None) -> int:
         warp_padding = None
         pad_x, pad_y, pad_z = 0, 0, 0
 
-    # Per-level dump callback, shared by -save_intermediates (warp + image in a
-    # {prefix}_levels/ dir) and the granular -partials (images) / -partial_warps
-    # (warps) flags (written beside the prefix). In timeseries mode, only the
-    # first volume gets the callback (warned below) — otherwise it would balloon
-    # to one set per volume.
+    # Per-level dump callback:
+    #   -save_intermediates -> warp + image files in {prefix}_levels/
+    #   -partial_warps      -> per-level warp files beside the prefix
+    #   -partials           -> warped images concatenated into one 4D movie
+    #                          {prefix}_partials.nii.gz (flushed after the run)
+    # In timeseries mode only the first volume dumps (warned below).
     level_cb = None
     if args.save_intermediates or args.partials or args.partial_warps:
-        save_imgs = args.partials or args.save_intermediates
-        save_wrps = args.partial_warps or args.save_intermediates
-        if args.save_intermediates:
-            levels_dir = f"{prefix}_levels"
-        else:
-            levels_dir = os.path.dirname(prefix) or "."
-        warp_basename_for_lev = os.path.basename(prefix)
-        level_cb = _make_level_callback(
-            levels_dir, warp_basename_for_lev, base_info, warp_padding,
-            nx, ny, nz, save_warps=save_wrps, save_images=save_imgs,
+        level_cb = _LevelDumper(
+            prefix, base_info, warp_padding, nx, ny, nz,
+            folder=args.save_intermediates,
+            warp_files=args.partial_warps,
+            movie=args.partials,
         )
         if args.verb >= 1:
-            kinds = []
-            if save_imgs:
-                kinds.append("warped images")
-            if save_wrps:
-                kinds.append("warps")
-            print(f"Saving per-level {' + '.join(kinds)} to: {levels_dir}/ (_lev00, _lev01, ...)")
+            outs = []
+            if args.save_intermediates:
+                outs.append(f"warp+image files in {prefix}_levels/")
+            if args.partial_warps:
+                outs.append(f"per-level warps {prefix}_WARP_lev##.nii.gz")
+            if args.partials:
+                outs.append(f"warped-image movie {prefix}_partials.nii.gz")
+            print("Per-level output: " + "; ".join(outs))
             if timeseries_mode:
-                print("  NOTE: timeseries mode — only volume 0 will dump per-level files")
+                print("  NOTE: timeseries mode — only volume 0 dumps per-level output")
 
     # --- Process volumes ---
     # Enable TF32 matmul precision on Ampere+ GPUs (free perf, ~1e-5 precision)
@@ -1559,6 +1585,13 @@ def main(argv: list[str] | None = None) -> int:
         save_image(resampled, out_path, header_info=dxyz_info)
         if args.verb >= 1:
             print(f"Resampled output to {args.dxyz}mm: {out_path}")
+
+    # Flush the per-level warped-image movie (-partials), if requested.
+    if level_cb is not None:
+        n_movie = len(level_cb.frames)
+        level_cb.finalize()
+        if args.verb >= 1 and args.partials and n_movie:
+            print(f"Per-level movie: {prefix}_partials.nii.gz ({n_movie} levels)")
 
     elapsed = time.time() - t0
     if args.verb >= 1:

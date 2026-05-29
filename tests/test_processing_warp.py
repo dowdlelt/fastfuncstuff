@@ -637,33 +637,42 @@ class TestPyramid:
         assert c_warp < c_raw, f"pyramid warp did not improve: {c_warp:.4f} vs raw {c_raw:.4f}"
 
 
-class TestLevelCallback:
-    """Per-level dump callback backing -save_intermediates / -partials / -partial_warps."""
+class TestLevelDumper:
+    """Per-level dump: -save_intermediates (folder) / -partial_warps (files) /
+    -partials (concatenated 4D movie)."""
 
-    def _cb(self, tmp_path, sub, **kw):
-        from fastfuncstuff.cli.qwarp import _make_level_callback
+    def _dumper(self, tmp_path, **kw):
+        from fastfuncstuff.cli.qwarp import _LevelDumper
 
-        return _make_level_callback(
-            str(tmp_path / sub), "p", None, None, 8, 8, 8, **kw
-        )
+        return _LevelDumper(str(tmp_path / "p"), None, None, 8, 8, 8, **kw)
 
-    def test_images_only(self, tmp_path):
+    def test_folder_mode_writes_warp_and_image(self, tmp_path):
         v = torch.zeros(8, 8, 8)
-        self._cb(tmp_path, "img", save_warps=False, save_images=True)(0, v, v, v, v)
-        assert (tmp_path / "img" / "p_lev00.nii.gz").exists()
-        assert not (tmp_path / "img" / "p_WARP_lev00.nii.gz").exists()
+        d = self._dumper(tmp_path, folder=True, warp_files=False, movie=False)
+        d(0, v, v, v, v)
+        assert (tmp_path / "p_levels" / "p_lev00.nii.gz").exists()
+        assert (tmp_path / "p_levels" / "p_WARP_lev00.nii.gz").exists()
 
-    def test_warps_only(self, tmp_path):
+    def test_partial_warps_beside_prefix(self, tmp_path):
         v = torch.zeros(8, 8, 8)
-        self._cb(tmp_path, "wrp", save_warps=True, save_images=False)(1, v, v, v, v)
-        assert (tmp_path / "wrp" / "p_WARP_lev01.nii.gz").exists()
-        assert not (tmp_path / "wrp" / "p_lev01.nii.gz").exists()
+        d = self._dumper(tmp_path, folder=False, warp_files=True, movie=False)
+        d(1, v, v, v, v)
+        assert (tmp_path / "p_WARP_lev01.nii.gz").exists()
+        assert not (tmp_path / "p_lev01.nii.gz").exists()
 
-    def test_both_zero_padded(self, tmp_path):
-        v = torch.zeros(8, 8, 8)
-        self._cb(tmp_path, "both")(2, v, v, v, v)
-        assert (tmp_path / "both" / "p_lev02.nii.gz").exists()
-        assert (tmp_path / "both" / "p_WARP_lev02.nii.gz").exists()
+    def test_partials_movie_is_one_4d_file(self, tmp_path):
+        import nibabel as nib
+
+        d = self._dumper(tmp_path, folder=False, warp_files=False, movie=True)
+        for lev in range(3):
+            d(lev, torch.zeros(8, 8, 8), torch.zeros(8, 8, 8), torch.zeros(8, 8, 8),
+              torch.full((8, 8, 8), float(lev)))
+        d.finalize()
+        out = tmp_path / "p_partials.nii.gz"
+        assert out.exists()
+        # one 4D file with a frame per level (no per-level files written)
+        assert nib.load(str(out)).shape == (8, 8, 8, 3)
+        assert not (tmp_path / "p_lev00.nii.gz").exists()
 
 
 class TestWarpStateMutation:
