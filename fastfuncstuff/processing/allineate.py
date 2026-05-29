@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from scipy.optimize import minimize
 from torch import Tensor
 
+from . import cost_hist
 from .affine import (
     apply_affine,
     apply_affine_batched,
@@ -35,11 +36,21 @@ from .affine import (
     resample_to_base_grid,
 )
 from .cost import (
+    _auto_clip,
     _separable_smooth_3d,
     clipped_pearson_correlation,
     lpa_correlation,
     lpc_correlation,
 )
+from .cost_blok import (
+    BlokSet,
+    assign_bloks,
+    lpa_cost,
+    lpa_cost_batched,
+    lpc_cost,
+    lpc_cost_batched,
+)
+from .cost_hist import clip_range
 from .mask import automask
 from .weight import compute_weight_image
 
@@ -53,7 +64,7 @@ def _tqdm_bar(iterable, total=None, desc=None, disable=False):
     """Wrap iterable in tqdm if available, otherwise passthrough."""
     if tqdm is not None and not disable:
         return tqdm(iterable, total=total, desc=desc, file=sys.stderr,
-                    leave=False, ncols=80)
+                    leave=True, ncols=80)
     return iterable
 
 
@@ -68,20 +79,39 @@ class AffineAlignConfig:
     # Degrees of freedom
     dof: str = "affine"  # "rigid" (6), "affine" (12), "epi" (9)
 
-    # Cost function
-    cost: str = "lpa"  # "ls" (clipped pearson), "lpa", "lpc"
-    lpa_sigma: float = 4.0
-    lpa_kernel: str = "gauss"  # "gauss" or "box"
+    # Cost function. AFNI-faithful: ls, lpa, lpc, mi, nmi, je, hel,
+    # cru/cra/crm (correlation ratio). ffs-special per-voxel Gaussian local
+    # Pearson: lps (absolute), lpsc (signed).
+    cost: str = "lpa"
+    lpa_sigma: float = 4.0          # Gaussian sigma / box radius for lps/lpsc
+    lpa_kernel: str = "gauss"       # "gauss" or "box" (lps/lpsc only)
 
-    # Coarse search
+    # Blok geometry for AFNI-faithful lpa/lpc (radius in mm; None auto-sizes
+    # to ~555 voxels per blok, matching 3dAllineate).
+    bloktype: str = "tohd"          # "tohd" (AFNI default), "rhdd", or "cube"
+    blokrad: float | None = None
+    ppow: float = 1.0               # |z| emphasis exponent (AFNI AFNI_LPC_POWER)
+
+    # Coarse search. Ranges mirror 3dAllineate's defaults: angle ±30°,
+    # shift ±32% of grid size, scale ±20%. ``range_scale`` shrinks all of them
+    # (-smallrange -> 0.5, -verysmallrange -> 0.25).
     twopass: bool = True
-    coarse_range: float = 30.0   # degrees
-    coarse_step: float = 5.0     # degrees
+    coarse_range: float = 30.0     # rotation half-range, degrees
+    coarse_step: float = 5.0       # rotation step, degrees
+    coarse_shift_frac: float = 0.32  # translation half-range (fraction of grid)
+    coarse_shift_steps: int = 7    # samples per translation axis (odd, incl. 0)
+    coarse_scale_range: float = 0.20  # scale half-range (fraction)
+    range_scale: float = 1.0       # global shrink for all coarse ranges + bounds
     tbest: int = 3       # best coarse candidates to carry into refinement
 
-    # Refinement tuning
-    adam_iters_2x: int = 150     # Adam iters at 2x downsampled
-    adam_iters_1x: int = 200     # Adam iters at full resolution
+    # Refinement tuning. Iteration counts are ceilings; Adam stops early on a
+    # relative-tolerance plateau, so generous caps are cheap when converged.
+    adam_iters_2x: int = 300     # Adam iters at 2x downsampled (ceiling)
+    adam_iters_1x: int = 400     # Adam iters at full resolution (ceiling)
+    # lr 0.005 climbs steadily to a good optimum; higher (e.g. 0.02) overshoots
+    # from the cmass start, oscillates, and trips early-stop at a worse point.
+    adam_lr_2x: float = 0.01     # Adam learning rate at 2x
+    adam_lr: float = 0.005       # Adam learning rate at full resolution
     powell_maxfev: int = 500     # Powell max function evaluations (0=skip)
 
     # Center-of-mass
@@ -109,49 +139,118 @@ class AffineAlignConfig:
 # Cost function dispatch
 # ---------------------------------------------------------------------------
 
+# Costs that need the blok lattice (AFNI-faithful local Pearson).
+_BLOK_COSTS = ("lpa", "lpc")
+# Costs built from the 2D joint histogram.
+_HIST_COSTS = ("mi", "nmi", "je", "hel", "cru", "cra", "crm")
+
+
+@dataclass
+class CostContext:
+    """Everything a cost evaluation needs, built once per ``allineate`` call.
+
+    Holds the cost name, the Gaussian-kernel params for the ``lps`` family, the
+    blok geometry params (resolved radius is in mm), the per-grid blok cache,
+    and the intensity clip ranges / bin count for the histogram costs.
+    """
+
+    name: str
+    sigma: float = 4.0
+    kernel: str = "gauss"
+    bloktype: str = "tohd"
+    blokrad_mm: float | None = None
+    base_voxdims: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    ppow: float = 1.0
+    base_clip: tuple[float, float] | None = None
+    source_clip: tuple[float, float] | None = None
+    _blok_cache: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self._blok_cache is None:
+            self._blok_cache = {}
+
+    def blokset(self, shape, voxdims, device) -> BlokSet:
+        """Get (or build + cache) the blok assignment for one grid.
+
+        Cached per (shape, rounded voxdims) so the lattice is computed once and
+        reused across every optimiser iteration on that grid.
+        """
+        key = (tuple(shape), tuple(round(v, 4) for v in voxdims))
+        bs = self._blok_cache.get(key)
+        if bs is None:
+            bs = assign_bloks(tuple(shape), voxdims, self.bloktype,
+                              self.blokrad_mm, device=device)
+            self._blok_cache[key] = bs
+        return bs
+
+
+def _voxdims_from_header(header: dict | None) -> tuple[float, float, float]:
+    """Voxel sizes (dx, dy, dz) in mm from a load_image header (x fastest).
+
+    Falls back to isotropic 1 mm when no affine is available.
+    """
+    if header is None or "affine" not in header:
+        return (1.0, 1.0, 1.0)
+    aff = np.asarray(header["affine"], dtype=np.float64)
+    dx = float(np.linalg.norm(aff[:3, 0]))
+    dy = float(np.linalg.norm(aff[:3, 1]))
+    dz = float(np.linalg.norm(aff[:3, 2]))
+    return (dx or 1.0, dy or 1.0, dz or 1.0)
+
+
 def _compute_cost(
     base: Tensor,
     warped: Tensor,
     weight: Tensor | None,
-    cost_name: str,
-    sigma: float = 4.0,
-    kernel_type: str = "gauss",
+    ctx: CostContext,
+    voxdims: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Tensor:
-    """Compute alignment cost (higher = better)."""
-    if cost_name in ("ls", "pearclp"):
+    """Compute alignment cost for one warped volume (higher == better)."""
+    name = ctx.name
+    if name in ("ls", "pearclp"):
         return clipped_pearson_correlation(
-            base, warped.reshape(-1),
+            base.reshape(-1), warped.reshape(-1),
             weight.reshape(-1) if weight is not None else None,
         )
-    elif cost_name == "lpa":
-        return lpa_correlation(base, warped, weight, sigma=sigma,
-                               kernel_type=kernel_type)
-    elif cost_name == "lpc":
-        return lpc_correlation(base, warped, weight, sigma=sigma,
-                               kernel_type=kernel_type)
-    else:
-        raise ValueError(f"Unknown cost function: {cost_name}")
+    if name == "lps":
+        return lpa_correlation(base, warped, weight, sigma=ctx.sigma,
+                               kernel_type=ctx.kernel)
+    if name == "lpsc":
+        return lpc_correlation(base, warped, weight, sigma=ctx.sigma,
+                               kernel_type=ctx.kernel)
+    if name in _BLOK_COSTS:
+        bs = ctx.blokset(base.shape, voxdims, base.device)
+        fn = lpa_cost if name == "lpa" else lpc_cost
+        return fn(base, warped, weight, bs, ppow=ctx.ppow)
+    if name in _HIST_COSTS:
+        kw = dict(weight=weight, base_clip=ctx.base_clip,
+                  source_clip=ctx.source_clip)
+        if name == "mi":
+            return cost_hist.mi_cost(base, warped, **kw)
+        if name == "nmi":
+            return cost_hist.nmi_cost(base, warped, **kw)
+        if name == "je":
+            return cost_hist.je_cost(base, warped, **kw)
+        if name == "hel":
+            return cost_hist.hel_cost(base, warped, **kw)
+        mode = {"cru": "u", "cra": "a", "crm": "m"}[name]
+        return cost_hist.cr_cost(base, warped, mode=mode, **kw)
+    raise ValueError(f"Unknown cost function: {name}")
 
 
 def _batched_cost(
     base: Tensor,
     warped_batch: Tensor,
     weight: Tensor | None,
-    cost_name: str,
-    sigma: float = 4.0,
-    kernel_type: str = "gauss",
+    ctx: CostContext,
+    voxdims: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Tensor:
-    """Compute cost for B warped images against a single base.
-
-    Returns:
-        (B,) cost values.
-    """
+    """Compute cost for B warped images against a single base -> (B,)."""
     B = warped_batch.shape[0]
 
-    if cost_name in ("ls", "pearclp"):
+    if ctx.name in ("ls", "pearclp"):
         base_flat = base.reshape(-1)
         w_flat = weight.reshape(-1) if weight is not None else None
-        from .cost import _auto_clip
         base_clip = _auto_clip(base_flat, w_flat)
         bc = base_flat.clamp(base_clip[0], base_clip[1])
 
@@ -182,16 +281,16 @@ def _batched_cost(
         denom = (bb * ss).sqrt().clamp(min=1e-10)
         return bs / denom
 
-    elif cost_name in ("lpa", "lpc"):
-        costs = torch.zeros(B, device=base.device)
-        cost_fn = lpa_correlation if cost_name == "lpa" else lpc_correlation
-        for i in range(B):
-            costs[i] = cost_fn(base, warped_batch[i], weight, sigma=sigma,
-                               kernel_type=kernel_type)
-        return costs
+    if ctx.name in _BLOK_COSTS:
+        bs = ctx.blokset(base.shape, voxdims, base.device)
+        fn = lpa_cost_batched if ctx.name == "lpa" else lpc_cost_batched
+        return fn(base, warped_batch, weight, bs, ctx.ppow)
 
-    else:
-        raise ValueError(f"Unknown cost function: {cost_name}")
+    # Histogram / lps costs: evaluate per candidate (coarse grids are small).
+    costs = torch.zeros(B, device=base.device)
+    for i in range(B):
+        costs[i] = _compute_cost(base, warped_batch[i], weight, ctx, voxdims)
+    return costs
 
 
 # ---------------------------------------------------------------------------
@@ -362,11 +461,13 @@ def _compute_source_validity_mask(
 def _compute_param_bounds(
     base_shape: tuple[int, int, int],
     cmass_shift: np.ndarray | None = None,
+    range_scale: float = 1.0,
 ) -> np.ndarray:
     """Compute AFNI-style parameter bounds.
 
     All units match our internal convention (voxels for translations,
-    degrees for rotations, ratios for scales/shears).
+    degrees for rotations, ratios for scales/shears). ``range_scale`` shrinks
+    the translation/rotation/scale ranges (-smallrange -> 0.5, etc.).
 
     Returns:
         (12, 2) array of [min, max] per parameter.
@@ -376,18 +477,18 @@ def _compute_param_bounds(
         cmass_shift = np.zeros(3)
 
     bounds = np.zeros((12, 2))
+    rs = range_scale
 
-    # Translation range: ~1/3 of FOV, centered at cmass
-    bounds[0] = [cmass_shift[0] - 0.321 * (nx - 1),
-                 cmass_shift[0] + 0.321 * (nx - 1)]
-    bounds[1] = [cmass_shift[1] - 0.321 * (ny - 1),
-                 cmass_shift[1] + 0.321 * (ny - 1)]
-    bounds[2] = [cmass_shift[2] - 0.321 * (nz - 1),
-                 cmass_shift[2] + 0.321 * (nz - 1)]
+    # Translation range: ±32% of FOV (* range_scale), centered at cmass.
+    tx, ty, tz = 0.321 * rs * (nx - 1), 0.321 * rs * (ny - 1), 0.321 * rs * (nz - 1)
+    bounds[0] = [cmass_shift[0] - tx, cmass_shift[0] + tx]
+    bounds[1] = [cmass_shift[1] - ty, cmass_shift[1] + ty]
+    bounds[2] = [cmass_shift[2] - tz, cmass_shift[2] + tz]
 
-    bounds[3:6] = [-30.0, 30.0]            # rotations (degrees)
-    bounds[6:9] = [0.711, 1.0 / 0.711]     # scales
-    bounds[9:12] = [-0.1111, 0.1111]        # shears
+    bounds[3:6] = [-30.0 * rs, 30.0 * rs]            # rotations (degrees)
+    sc = 0.20 * rs                                    # scale half-range (±20%)
+    bounds[6:9] = [1.0 - sc, 1.0 + sc]
+    bounds[9:12] = [-0.1111 * rs, 0.1111 * rs]        # shears
 
     return bounds
 
@@ -480,58 +581,78 @@ def _cmass_translation(base: Tensor, source: Tensor,
 # Stage 2: GPU-parallel coarse search
 # ---------------------------------------------------------------------------
 
-def _generate_rotation_candidates(
-    coarse_range: float,
-    coarse_step: float,
-    translation: Tensor,
-    device: torch.device,
-    shift_range: float = 0.0,
-) -> Tensor:
-    """Generate grid of candidate parameter vectors for coarse search.
-
-    Generates a grid of rotation candidates. If shift_range > 0, also
-    tests per-axis translation offsets (±shift on each axis independently,
-    7 shifts total instead of 27 for a full 3D grid).
-
-    Returns:
-        (B, 12) candidate parameter sets.
-    """
-    angles = torch.arange(-coarse_range, coarse_range + coarse_step * 0.5,
-                          coarse_step, device=device)
-    n = angles.shape[0]
-
-    rz_grid, rx_grid, ry_grid = torch.meshgrid(
-        angles, angles, angles, indexing="ij")
-    B_rot = n * n * n
-
-    # Build shift offsets: identity + ±shift per axis (7 total)
-    if shift_range > 0:
-        s = float(shift_range)
-        shift_offsets = torch.tensor([
-            [0, 0, 0],
-            [s, 0, 0], [-s, 0, 0],
-            [0, s, 0], [0, -s, 0],
-            [0, 0, s], [0, 0, -s],
-        ], device=device)
-    else:
-        shift_offsets = torch.zeros(1, 3, device=device)
-    n_shifts = shift_offsets.shape[0]
-
-    B = B_rot * n_shifts
-    params = torch.zeros(B, 12, device=device)
-
-    for si in range(n_shifts):
-        start = si * B_rot
-        end = start + B_rot
-        params[start:end, 0] = translation[0] + shift_offsets[si, 0]
-        params[start:end, 1] = translation[1] + shift_offsets[si, 1]
-        params[start:end, 2] = translation[2] + shift_offsets[si, 2]
-        params[start:end, 3] = rz_grid.reshape(-1)
-        params[start:end, 4] = rx_grid.reshape(-1)
-        params[start:end, 5] = ry_grid.reshape(-1)
+def _base_params(n: int, translations: Tensor, device: torch.device) -> Tensor:
+    """(n, 12) identity-scale param rows with the given (n, 3) translations."""
+    params = torch.zeros(n, 12, device=device)
+    params[:, 0:3] = translations
     params[:, 6:9] = 1.0
-
     return params
+
+
+def _translation_candidates(
+    center: Tensor, shift_range: Tensor, steps: int, device: torch.device
+) -> Tensor:
+    """3D grid of translations (zero rotation) over center ± shift_range.
+
+    ``shift_range`` is a per-axis (3,) half-range in voxels; ``steps`` samples
+    per axis (forced odd so the center is included).
+    """
+    if steps < 1:
+        steps = 1
+    if steps % 2 == 0:
+        steps += 1
+    axes = []
+    for a in range(3):
+        r = float(shift_range[a])
+        axes.append(torch.linspace(-r, r, steps, device=device)
+                    if r > 0 else torch.zeros(1, device=device))
+    gx, gy, gz = torch.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+    offs = torch.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=1)
+    return _base_params(offs.shape[0], center[None, :] + offs, device)
+
+
+def _rotation_candidates(
+    angle_range: float, angle_step: float, translations: Tensor,
+    device: torch.device,
+) -> Tensor:
+    """Rotation grid (±angle_range) replicated at each given translation."""
+    angles = torch.arange(-angle_range, angle_range + angle_step * 0.5,
+                          angle_step, device=device)
+    if angles.numel() == 0:
+        angles = torch.zeros(1, device=device)
+    rz, rx, ry = torch.meshgrid(angles, angles, angles, indexing="ij")
+    rot = torch.stack([rz.reshape(-1), rx.reshape(-1), ry.reshape(-1)], dim=1)
+    nrot = rot.shape[0]
+    if translations.ndim == 1:
+        translations = translations[None, :]
+    blocks = []
+    for t in translations:
+        p = _base_params(nrot, t[None, :].expand(nrot, -1), device)
+        p[:, 3:6] = rot
+        blocks.append(p)
+    return torch.cat(blocks, dim=0)
+
+
+def _eval_candidates(
+    base: Tensor, source: Tensor, weight: Tensor | None, candidates: Tensor,
+    ctx: CostContext, voxdims: tuple[float, float, float],
+    device: torch.device, desc: str, verb: int,
+) -> Tensor:
+    """Cost of every (B, 12) candidate against base (chunked) -> (B,)."""
+    matrices = params_to_matrix_batched(candidates)
+    chunk_size = _estimate_chunk_size(base.shape, device)
+    B = candidates.shape[0]
+    all_costs = []
+    chunks = range(0, B, chunk_size)
+    for start in _tqdm_bar(chunks, total=len(range(0, B, chunk_size)),
+                           desc=desc, disable=verb < 1):
+        end = min(start + chunk_size, B)
+        with torch.no_grad():
+            warped = apply_affine_batched(source, matrices[start:end], base.shape)
+            costs = _batched_cost(base, warped, weight, ctx, voxdims)
+        all_costs.append(costs)
+        del warped
+    return torch.cat(all_costs)
 
 
 def _coarse_search(
@@ -539,74 +660,70 @@ def _coarse_search(
     source: Tensor,
     weight: Tensor | None,
     config: AffineAlignConfig,
+    ctx: CostContext,
+    voxdims: tuple[float, float, float],
     init_translation: Tensor,
     device: torch.device,
     verb: int = 1,
-    shift_range: float = 0.0,
 ) -> list[Tensor]:
-    """GPU-parallel coarse rotation + translation search.
+    """Two-phase broad coarse search (AFNI-style ranges).
 
-    Uses LPA for coarse search when fine cost is LPC (both handle
-    cross-modality via absolute correlation). Uses the user's cost
-    otherwise.
+    Phase A sweeps translations over center ± (coarse_shift_frac * grid) on a
+    3D grid (rotation = 0). Phase B sweeps the rotation grid (±coarse_range) at
+    each of the best translations from phase A. We *evaluate* many positions
+    and keep the best ``tbest`` — we do not optimise each candidate.
 
-    Returns top tbest parameter vectors sorted by cost (best first).
+    Coarse uses the same (signed) cost as the fine pass; ``range_scale`` shrinks
+    the ranges for ``-smallrange`` / ``-verysmallrange``.
+
+    Returns the top ``tbest`` parameter vectors (best first).
     """
-    candidates = _generate_rotation_candidates(
-        config.coarse_range, config.coarse_step, init_translation, device,
-        shift_range=shift_range)
-    B = candidates.shape[0]
+    nz, ny, nx = base.shape
+    rs = config.range_scale
+    # Per-axis translation half-range, in this grid's voxels.
+    shift_range = torch.tensor(
+        [config.coarse_shift_frac * rs * (nx - 1),
+         config.coarse_shift_frac * rs * (ny - 1),
+         config.coarse_shift_frac * rs * (nz - 1)],
+        device=device)
+    angle_range = config.coarse_range * rs
 
+    # --- Phase A: broad translation sweep (no rotation) ---
+    trans_cands = _translation_candidates(
+        init_translation, shift_range, config.coarse_shift_steps, device)
     if verb >= 1:
-        extra = ""
-        if shift_range > 0:
-            extra = f", shift=±{shift_range:.0f}vox"
-        print(f"  Coarse search: {B} candidates "
-              f"(range={config.coarse_range}°, step={config.coarse_step}°"
-              f"{extra})")
+        print(f"  Coarse phase A (translation): {trans_cands.shape[0]} "
+              f"candidates, shift=±({shift_range[0]:.0f},{shift_range[1]:.0f},"
+              f"{shift_range[2]:.0f})vox")
+    costs_a = _eval_candidates(base, source, weight, trans_cands, ctx, voxdims,
+                               device, "Coarse-T", verb)
+    k = min(config.tbest, costs_a.shape[0])
+    top_t = costs_a.topk(k).indices
+    best_translations = trans_cands[top_t, 0:3]  # (k, 3)
 
-    matrices = params_to_matrix_batched(candidates)
-    chunk_size = _estimate_chunk_size(base.shape, device)
-    all_costs = []
+    # --- Phase B: rotation sweep at the best translation(s) ---
+    rot_cands = _rotation_candidates(
+        angle_range, config.coarse_step, best_translations, device)
+    if verb >= 1:
+        print(f"  Coarse phase B (rotation): {rot_cands.shape[0]} candidates, "
+              f"angle=±{angle_range:.0f}°, step={config.coarse_step}°")
+    costs_b = _eval_candidates(base, source, weight, rot_cands, ctx, voxdims,
+                               device, "Coarse-R", verb)
 
-    # Use LPA for coarse when cost is lpc (both handle cross-modality
-    # via absolute correlation). Clipped Pearson fails for inverted
-    # contrast because the global correlation is negative.
-    coarse_cost = "lpa" if config.cost == "lpc" else config.cost
+    # Combine both phases and keep the global best tbest.
+    all_cands = torch.cat([trans_cands, rot_cands], dim=0)
+    all_costs = torch.cat([costs_a, costs_b], dim=0)
+    tbest = min(config.tbest, all_cands.shape[0])
+    top_costs, top_idx = all_costs.topk(tbest)
 
-    chunks = range(0, B, chunk_size)
-    for start in _tqdm_bar(chunks, total=len(range(0, B, chunk_size)),
-                           desc="Coarse", disable=verb < 1):
-        end = min(start + chunk_size, B)
-        with torch.no_grad():
-            warped_batch = apply_affine_batched(
-                source, matrices[start:end], base.shape)
-            costs = _batched_cost(base, warped_batch, weight,
-                                  coarse_cost, config.lpa_sigma,
-                                  config.lpa_kernel)
-        all_costs.append(costs)
-        del warped_batch
-
-    all_costs = torch.cat(all_costs)
-    tbest = min(config.tbest, B)
-    top_costs, top_indices = all_costs.topk(tbest)
-
-    result = []
-    for i in range(tbest):
-        result.append(candidates[top_indices[i]])
-        if verb >= 1 and i == 0:
-            p = candidates[top_indices[i]]
-            shift_str = ""
-            if shift_range > 0:
-                shift_str = (f", shift=({p[0].item():.1f}, "
-                             f"{p[1].item():.1f}, {p[2].item():.1f})")
-            print(f"  Best coarse: cost={top_costs[i].item():.6f}, "
-                  f"rot=({p[3].item():.1f}°, {p[4].item():.1f}°, "
-                  f"{p[5].item():.1f}°){shift_str}")
-
-    if verb >= 1 and tbest > 1:
-        print(f"  Keeping top {tbest} candidates for refinement")
-
+    result = [all_cands[top_idx[i]] for i in range(tbest)]
+    if verb >= 1:
+        p = result[0]
+        print(f"  Best coarse: cost={top_costs[0].item():.6f}, "
+              f"rot=({p[3].item():.1f}°, {p[4].item():.1f}°, {p[5].item():.1f}°), "
+              f"shift=({p[0].item():.1f}, {p[1].item():.1f}, {p[2].item():.1f})")
+        if tbest > 1:
+            print(f"  Keeping top {tbest} candidates for refinement")
     return result
 
 
@@ -637,6 +754,8 @@ def _refine_adam_normalized(
     weight: Tensor | None,
     init_params_phys: np.ndarray,
     config: AffineAlignConfig,
+    ctx: CostContext,
+    voxdims: tuple[float, float, float],
     bounds: np.ndarray,
     device: torch.device,
     verb: int = 1,
@@ -675,6 +794,19 @@ def _refine_adam_normalized(
     best_norm = params_norm.detach().clone()
     no_improve = 0
 
+    # Plateau detection: count an iteration as "improved" only if the cost rose
+    # by more than a *relative* tolerance (an absolute 1e-7 is meaningless when
+    # costs are ~0.02, so the old test never plateaued and just ran to the cap).
+    # Stop once it has been flat for `patience` iterations. This lets us set a
+    # generous iteration ceiling and still finish quickly when converged.
+    rel_tol = 1e-4
+    abs_tol = 1e-6
+    patience = 40
+
+    # Reading the cost back to the host forces a GPU sync, so do it only every
+    # few iterations rather than every step (Adam is smooth enough that the
+    # coarser best-tracking / early-stop cadence costs nothing in accuracy).
+    sync_every = 5
     pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc,
                      disable=verb < 1)
     for it in pbar:
@@ -685,12 +817,14 @@ def _refine_adam_normalized(
             params_norm.data[~free_mask] = identity_norm[~free_mask]
             params_norm.data.clamp_(0.0, 1.0)
 
+        # Snapshot the params that produce this cost (before the step).
+        cand_norm = params_norm.detach().clone()
+
         # Denormalize (differentiable) and build matrix
         params_phys = _denormalize_t(params_norm, bmin, span)
         matrix = params_to_matrix(params_phys)
         warped = apply_affine(source, matrix, base.shape)
-        cost = _compute_cost(base, warped, weight, config.cost, config.lpa_sigma,
-                             config.lpa_kernel)
+        cost = _compute_cost(base, warped, weight, ctx, voxdims)
 
         loss = -cost
         loss.backward()
@@ -701,24 +835,32 @@ def _refine_adam_normalized(
 
         optimizer.step()
 
-        cost_val = cost.item()
-        if cost_val > best_cost + 1e-7:
-            best_cost = cost_val
-            best_norm = params_norm.detach().clone()
-            no_improve = 0
-        else:
-            no_improve += 1
+        if it % sync_every == 0 or it == n_iters - 1:
+            cost_val = cost.item()
+            threshold = best_cost + max(abs_tol, rel_tol * abs(best_cost))
+            if cost_val > threshold:
+                best_cost = cost_val
+                best_norm = cand_norm
+                no_improve = 0
+            else:
+                # Keep the best params even while plateauing/oscillating.
+                if cost_val > best_cost:
+                    best_cost = cost_val
+                    best_norm = cand_norm
+                no_improve += sync_every
 
-        if tqdm is not None and verb >= 1:
-            pbar.set_postfix_str(f"cost={cost_val:.6f}")
-        elif verb >= 2 and (it % 50 == 0 or it == n_iters - 1):
-            print(f"    {desc} iter {it}: cost={cost_val:.6f}")
+            if tqdm is not None and verb >= 1:
+                pbar.set_postfix_str(f"cost={cost_val:.6f}")
+            elif verb >= 2:
+                print(f"    {desc} iter {it}: cost={cost_val:.6f}")
 
-        # Early stopping if no improvement for 40 iters
-        if no_improve >= 40:
-            if verb >= 2:
-                print(f"    {desc} early stop at iter {it}")
-            break
+            # Early stopping once the cost has been flat (within rel_tol) for
+            # `patience` iterations — handles plateaus and oscillation.
+            if no_improve >= patience:
+                if verb >= 2:
+                    print(f"    {desc} converged at iter {it} "
+                          f"(cost={best_cost:.6f})")
+                break
 
     best_phys = _denormalize_t(best_norm.clamp(0.0, 1.0), bmin, span).detach().cpu().numpy()
     return best_phys, best_cost
@@ -732,15 +874,14 @@ def _make_powell_cost(
     base: Tensor,
     source: Tensor,
     weight: Tensor | None,
-    cost_name: str,
-    lpa_sigma: float,
+    ctx: CostContext,
+    voxdims: tuple[float, float, float],
     param_bounds: np.ndarray,
     free_mask: np.ndarray,
     fixed_norm: np.ndarray,
     device: torch.device,
     counter: list | None = None,
     pbar=None,
-    lpa_kernel: str = "gauss",
 ):
     """Create a closure for scipy Powell (avoids kwargs issue)."""
 
@@ -757,8 +898,7 @@ def _make_powell_cost(
 
         with torch.no_grad():
             warped = apply_affine(source, matrix, base.shape)
-            cost = _compute_cost(base, warped, weight, cost_name, lpa_sigma,
-                                 lpa_kernel)
+            cost = _compute_cost(base, warped, weight, ctx, voxdims)
 
         val = -cost.item()
 
@@ -779,6 +919,8 @@ def _refine_powell(
     weight: Tensor | None,
     init_params_phys: np.ndarray,
     config: AffineAlignConfig,
+    ctx: CostContext,
+    voxdims: tuple[float, float, float],
     bounds: np.ndarray,
     device: torch.device,
     verb: int = 1,
@@ -810,18 +952,19 @@ def _refine_powell(
     pbar = None
     if tqdm is not None and verb >= 1:
         pbar = tqdm(total=maxfev, desc=desc, file=sys.stderr,
-                    leave=False, ncols=80)
+                    leave=True, ncols=80)
 
     cost_fn = _make_powell_cost(
         base, source, weight,
-        config.cost, config.lpa_sigma,
+        ctx, voxdims,
         bounds, free_mask, fixed_norm, device,
         counter=counter, pbar=pbar,
-        lpa_kernel=config.lpa_kernel,
     )
 
     # Powell with bounds to keep params in [0,1]
     param_bounds_01 = [(0.0, 1.0)] * nfree
+
+    start_cost = -cost_fn(x0)  # cost at the incoming (refined) params
 
     result = minimize(
         cost_fn, x0, method="Powell",
@@ -836,10 +979,19 @@ def _refine_powell(
     if pbar is not None:
         pbar.close()
 
+    final_cost = -result.fun
+    # Powell's line search can drift out of a narrow basin and converge to a
+    # worse point than it started (seen with the peaky lpc/blok surface). Never
+    # return worse than the start — the polish must only ever help.
+    if final_cost < start_cost:
+        if verb >= 1:
+            print(f"    {desc}: kept pre-polish (start={start_cost:.6f} "
+                  f">= powell={final_cost:.6f}, {counter[0]} evals)")
+        return init_params_phys.copy(), start_cost
+
     full_norm = fixed_norm.copy()
     full_norm[free_mask] = np.clip(result.x, 0.0, 1.0)
     params_phys = _denormalize(full_norm, bounds)
-    final_cost = -result.fun
 
     if verb >= 1:
         print(f"    {desc}: cost={final_cost:.6f} ({counter[0]} evals)")
@@ -857,6 +1009,8 @@ def _refine_progressive(
     weight: Tensor | None,
     trial_params_list: list[np.ndarray],
     config: AffineAlignConfig,
+    ctx: CostContext,
+    voxdims: tuple[float, float, float],
     bounds: np.ndarray,
     device: torch.device,
     verb: int = 1,
@@ -875,7 +1029,14 @@ def _refine_progressive(
     trials = [(0.0, p.copy()) for p in trial_params_list]
 
     # --- Level 2x: downsampled (fast, ~8x fewer voxels) ---
-    can_downsample = min(base.shape) > 16
+    # Skip for the blok / histogram costs: heavy down-blur makes neighbouring
+    # voxels correlated, which inflates within-blok |correlation| (and the joint
+    # histogram) regardless of alignment, so optimizing the downsampled surface
+    # drives *away* from the true full-res basin (verified on EPI->anat lpc).
+    # Those costs refine at full resolution, where the basin is stable.
+    can_downsample = (min(base.shape) > 16
+                      and ctx.name not in _BLOK_COSTS
+                      and ctx.name not in _HIST_COSTS)
     if can_downsample:
         ds = 2
         base_2x = _downsample_3d(_smooth_to_resolution(base, ds), ds)
@@ -885,6 +1046,9 @@ def _refine_progressive(
         # Scale translation bounds for downsampled grid
         bounds_2x = bounds.copy()
         bounds_2x[:3] /= ds
+        # The 2x grid has voxels ds times larger (in mm), so the blok lattice
+        # must be built with scaled voxel sizes to keep a fixed physical blok.
+        voxdims_2x = tuple(v * ds for v in voxdims)
 
         if verb >= 1:
             print(f"  Medium resolution ({base_2x.shape}, {ds}x downsample, "
@@ -896,8 +1060,8 @@ def _refine_progressive(
             params_ds[:3] /= ds
             params_out, cost = _refine_adam_normalized(
                 base_2x, source_2x, weight_2x, params_ds, config,
-                bounds_2x, device,
-                verb=verb, n_iters=config.adam_iters_2x, lr=0.01,
+                ctx, voxdims_2x, bounds_2x, device,
+                verb=verb, n_iters=config.adam_iters_2x, lr=config.adam_lr_2x,
                 desc=f"2x T{i}",
             )
             params_out[:3] *= ds  # scale translations back
@@ -926,8 +1090,8 @@ def _refine_progressive(
     fine_trials = []
     for i, (_, params) in enumerate(trials):
         params_out, cost = _refine_adam_normalized(
-            base, source, weight, params, config, bounds, device,
-            verb=verb, n_iters=config.adam_iters_1x, lr=0.005,
+            base, source, weight, params, config, ctx, voxdims, bounds, device,
+            verb=verb, n_iters=config.adam_iters_1x, lr=config.adam_lr,
             desc=f"Fine T{i}",
         )
         fine_trials.append((cost, params_out))
@@ -942,8 +1106,9 @@ def _refine_progressive(
         if verb >= 1:
             print("  Powell polish (full resolution):")
 
-        best_params, cost = _refine_powell(
-            base, source, weight, best_params, config, bounds, device,
+        best_params, _ = _refine_powell(
+            base, source, weight, best_params, config, ctx, voxdims, bounds,
+            device,
             verb=verb,
             initial_step=0.033,
             ftol=1e-4,
@@ -1113,6 +1278,24 @@ def allineate(
         source_opt = source_on_base
         weight_opt = weight
 
+    # Build the cost context (blok geometry + histogram clips), reused for
+    # every cost evaluation in this run.
+    voxdims = _voxdims_from_header(base_header)
+    blokrad_mm = config.blokrad
+    if config.cost in _BLOK_COSTS and blokrad_mm is None:
+        from .cost_blok import auto_blok_radius
+        blokrad_mm = auto_blok_radius(voxdims, config.bloktype)
+    base_clip = source_clip = None
+    if config.cost in _HIST_COSTS:
+        base_clip = clip_range(base_opt)
+        source_clip = clip_range(source_opt)
+    ctx = CostContext(
+        name=config.cost, sigma=config.lpa_sigma, kernel=config.lpa_kernel,
+        bloktype=config.bloktype, blokrad_mm=blokrad_mm,
+        base_voxdims=voxdims, ppow=config.ppow,
+        base_clip=base_clip, source_clip=source_clip,
+    )
+
     # Stage 1: Center-of-mass initialization
     init_params = identity_params(device=device)
     cmass_shift = np.zeros(3)
@@ -1126,17 +1309,20 @@ def allineate(
                   f"dx={t[0]:.2f}, dy={t[1]:.2f}, dz={t[2]:.2f} voxels")
 
     # Parameter bounds (based on optimization grid size)
-    bounds = _compute_param_bounds(base_opt.shape, cmass_shift)
+    bounds = _compute_param_bounds(base_opt.shape, cmass_shift,
+                                   range_scale=config.range_scale)
 
     # Stage 2: GPU-parallel coarse search (at downsampled resolution)
     if config.twopass:
         min_dim = min(base_opt.shape)
-        # Pick largest downsample that keeps min dim ≥ 32
-        # (local costs need enough voxels for meaningful neighborhoods)
+        # Pick the coarse downsample. The blok/histogram costs are distorted by
+        # heavy down-blur (neighbouring voxels become correlated), so cap them
+        # at 2x; the legacy ls/lps costs tolerate 4x for speed.
+        max_ds = 2 if (ctx.name in _BLOK_COSTS or ctx.name in _HIST_COSTS) else 4
         if min_dim >= 128:
-            ds_factor = 4
+            ds_factor = max_ds
         elif min_dim >= 64:
-            ds_factor = 2
+            ds_factor = min(2, max_ds)
         else:
             ds_factor = 1
 
@@ -1151,18 +1337,14 @@ def allineate(
             coarse_init = init_params.clone()
             coarse_init[:3] /= ds_factor
 
-            # Coarse translation search: ±3 voxels at downsampled res
-            # (= ±6 at 2x, ±12 at 4x full-res voxels)
-            coarse_shift_range = 3.0
-
             if verb >= 1:
                 print(f"  Coarse resolution "
                       f"({base_ds.shape}, {ds_factor}x downsample):")
 
+            voxdims_coarse = tuple(v * ds_factor for v in voxdims)
             best_list = _coarse_search(
-                base_ds, source_ds, weight_ds, config,
-                coarse_init[:3], device, verb,
-                shift_range=coarse_shift_range)
+                base_ds, source_ds, weight_ds, config, ctx, voxdims_coarse,
+                coarse_init[:3], device, verb)
 
             trial_params_list = []
             for p in best_list:
@@ -1173,7 +1355,7 @@ def allineate(
             del base_ds, source_ds, weight_ds
         else:
             best_list = _coarse_search(
-                base_opt, source_opt, weight_opt, config,
+                base_opt, source_opt, weight_opt, config, ctx, voxdims,
                 init_params[:3], device, verb)
             trial_params_list = [p.cpu().numpy().copy() for p in best_list]
     else:
@@ -1185,7 +1367,7 @@ def allineate(
 
     best_params_phys = _refine_progressive(
         base_opt, source_opt, weight_opt, trial_params_list,
-        config, bounds, device, verb)
+        config, ctx, voxdims, bounds, device, verb)
 
     # Build final matrix — adjust for crop offset if needed
     best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
@@ -1223,9 +1405,7 @@ def allineate(
                               zero_outside=True)
 
     if verb >= 1:
-        final_cost = _compute_cost(base, warped, weight,
-                                   config.cost, config.lpa_sigma,
-                                   config.lpa_kernel)
+        final_cost = _compute_cost(base, warped, weight, ctx, voxdims)
         print(f"Final cost: {final_cost.item():.6f}")
 
     return final_matrix, warped
