@@ -26,6 +26,39 @@ from torch import Tensor
 
 from .interp import _grid_sample_3d, _separable_resample_3d, wsinc5_resample_3d
 
+# Cache of constant homogeneous output-grid coordinates, keyed by
+# (shape, device, dtype).  The grid is rebuilt on every apply_affine call
+# otherwise, which dominates the per-iteration cost during optimization.
+_GRID_CACHE: dict[tuple, Tensor] = {}
+
+
+def _homogeneous_grid(
+    shape: tuple[int, int, int], device: torch.device, dtype: torch.dtype
+) -> Tensor:
+    """Return cached (4, N) homogeneous voxel coords for an output grid.
+
+    Rows are (x, y, z, 1) in reshape(-1) (z, y, x) order.  Cached because the
+    grid is constant across optimizer iterations; only the matrix changes.
+    """
+    key = (tuple(shape), device, dtype)
+    coords = _GRID_CACHE.get(key)
+    if coords is None:
+        onz, ony, onx = shape
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(onz, dtype=dtype, device=device),
+            torch.arange(ony, dtype=dtype, device=device),
+            torch.arange(onx, dtype=dtype, device=device),
+            indexing="ij",
+        )
+        coords = torch.stack(
+            [ii.reshape(-1), jj.reshape(-1), kk.reshape(-1),
+             torch.ones(onz * ony * onx, device=device, dtype=dtype)],
+            dim=0,
+        )  # (4, N)
+        _GRID_CACHE[key] = coords
+    return coords
+
+
 # ---------------------------------------------------------------------------
 # Parameter ↔ Matrix conversion
 # ---------------------------------------------------------------------------
@@ -358,25 +391,8 @@ def apply_affine(
     device = source.device
     dtype = source.dtype
 
-    # Build output grid in voxel indices
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(onz, dtype=dtype, device=device),
-        torch.arange(ony, dtype=dtype, device=device),
-        torch.arange(onx, dtype=dtype, device=device),
-        indexing="ij",
-    )
-
-    # Apply affine: source_coords = M @ output_coords
-    # Stack to (N, 4) homogeneous coordinates
-    coords = torch.stack(
-        [
-            ii.reshape(-1),
-            jj.reshape(-1),
-            kk.reshape(-1),
-            torch.ones(onz * ony * onx, device=device, dtype=dtype),
-        ],
-        dim=0,
-    )  # (4, N)
+    # Apply affine: source_coords = M @ output_coords (grid is cached).
+    coords = _homogeneous_grid((onz, ony, onx), device, dtype)
     src_coords = matrix @ coords  # (4, N)
 
     src_x = src_coords[0].reshape(onz, ony, onx)
