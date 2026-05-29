@@ -35,9 +35,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="allineate",
         description="GPU-accelerated affine/rigid alignment (inspired by 3dAllineate)",
         epilog="""Speed/quality presets:
-  -superfast  Skip coarse search, 50 Adam iters, no Powell (~5x faster)
-  -fast       Fewer iters (100/100), no Powell (~2x faster)
-  (default)   150 iters at 2x, 200 at full-res, 500 Powell evals
+  -superfast  Onepass, <=150 Adam iters, no Powell (small motion only)
+  -fast       <=300 Adam iters, no Powell (~2x faster)
+  (default)   <=400 Adam iters + 500 Powell evals (early-stops on plateau)
   -slow       300 iters at 2x, 400 at full-res, 2000 Powell evals
 
 Examples:
@@ -88,24 +88,38 @@ Examples:
 
     # --- Cost function ---
     cost_group = parser.add_argument_group("Cost function")
-    cost_group.add_argument("-cost", choices=["ls", "lpa", "lpc"], default="lpa",
-                            help="Cost function: ls=clipped Pearson, "
-                                 "lpa=local Pearson absolute (default, "
-                                 "best for similar contrast), "
-                                 "lpc=local Pearson signed (best for "
-                                 "non-similar contrast, e.g. EPI-to-anat)")
+    cost_group.add_argument(
+        "-cost",
+        choices=["ls", "lpa", "lpc", "lps", "lpsc",
+                 "mi", "nmi", "je", "hel", "cru", "cra", "crm"],
+        default="lpa",
+        help="Cost function (AFNI-faithful unless noted): "
+             "ls=clipped Pearson; "
+             "lpa=local Pearson absolute (default, similar contrast); "
+             "lpc=local Pearson signed (cross-modal, e.g. EPI-to-anat); "
+             "mi/nmi=(normalized) mutual information; je=joint entropy; "
+             "hel=Hellinger; cru/cra/crm=correlation ratio "
+             "(unsym/additive/multiplicative). "
+             "lps/lpsc=ffs-special per-voxel Gaussian local Pearson "
+             "(absolute/signed).")
+    cost_group.add_argument("-blok", "-bloktype", dest="bloktype",
+                            choices=["tohd", "rhdd", "cube"], default="tohd",
+                            help="Blok shape for lpa/lpc local neighborhoods "
+                                 "(default: tohd, like 3dAllineate)")
+    cost_group.add_argument("-blokrad", type=float, default=None,
+                            help="Blok radius in mm for lpa/lpc "
+                                 "(default: auto, ~555 voxels per blok)")
     cost_group.add_argument("-lpa_sigma", type=float, default=4.0,
-                            help="Kernel parameter for LPA/LPC neighborhoods "
+                            help="Kernel parameter for lps/lpsc neighborhoods "
                                  "in voxels. For gauss: sigma. "
                                  "For box: half-width radius. "
                                  "Use 0 with -lpa_kernel box to auto-size "
                                  "to ~500 voxels (default: 4.0)")
     cost_group.add_argument("-lpa_kernel", choices=["gauss", "box"],
                             default="gauss",
-                            help="LPA/LPC neighborhood kernel: "
+                            help="lps/lpsc neighborhood kernel: "
                                  "gauss=Gaussian weighting (default), "
-                                 "box=uniform weighting (like AFNI's "
-                                 "space-filling blocks)")
+                                 "box=uniform weighting")
 
     # --- Interpolation ---
     interp_group = parser.add_argument_group("Interpolation")
@@ -142,11 +156,20 @@ Examples:
     search_group.add_argument("-onepass", action="store_true",
                               help="Skip coarse search (small motion only)")
     search_group.add_argument("-coarse_range", type=float, default=30.0,
-                              help="Coarse rotation range in degrees "
+                              help="Coarse rotation half-range in degrees "
                                    "(default: 30)")
     search_group.add_argument("-coarse_step", type=float, default=5.0,
                               help="Coarse angular step in degrees "
                                    "(default: 5)")
+    search_group.add_argument("-coarse_shift_frac", type=float, default=0.32,
+                              help="Coarse translation half-range as a fraction "
+                                   "of grid size (default: 0.32, like AFNI)")
+    range_ex = search_group.add_mutually_exclusive_group()
+    range_ex.add_argument("-smallrange", action="store_true",
+                          help="Halve all coarse search ranges "
+                               "(angle/shift/scale)")
+    range_ex.add_argument("-verysmallrange", action="store_true",
+                          help="Quarter all coarse search ranges")
     search_group.add_argument("-tbest", type=int, default=3,
                               help="Coarse candidates to refine (default: 3)")
     search_group.add_argument("-noautocrop", action="store_true",
@@ -156,11 +179,16 @@ Examples:
     speed_group = parser.add_argument_group("Speed/quality")
     speed_ex = speed_group.add_mutually_exclusive_group()
     speed_ex.add_argument("-superfast", action="store_true",
-                          help="Minimal: onepass, 50 Adam iters, no Powell")
+                          help="Minimal: onepass, <=150 Adam iters, no Powell")
     speed_ex.add_argument("-fast", action="store_true",
-                          help="Quick: 100 Adam iters, no Powell polish")
+                          help="Quick: <=300 Adam iters, no Powell polish")
     speed_ex.add_argument("-slow", action="store_true",
-                          help="Thorough: 300/400 Adam iters, 2000 Powell evals")
+                          help="Thorough: <=600/800 Adam iters, 2000 Powell evals")
+    speed_group.add_argument("-lr", "-adam_lr", dest="adam_lr", type=float,
+                             default=0.005,
+                             help="Adam learning rate for full-res refinement "
+                                  "(default: 0.005; higher converges faster but "
+                                  "can overshoot to a worse optimum)")
 
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
@@ -244,32 +272,34 @@ def main(argv: list[str] | None = None) -> None:
     elif args.EPI:
         dof = "epi"
 
-    # Defaults
-    adam_iters_2x = 150
-    adam_iters_1x = 200
+    # Iteration counts are *ceilings*: Adam stops early once the cost plateaus
+    # (relative tolerance), so a generous cap costs nothing when converged but
+    # lets hard cases keep improving instead of cutting off mid-descent.
+    adam_iters_2x = 300
+    adam_iters_1x = 400
     powell_maxfev = 500
     twopass = not args.onepass
 
     # Apply presets
     if args.superfast:
-        adam_iters_2x = 50
-        adam_iters_1x = 50
+        adam_iters_2x = 150
+        adam_iters_1x = 150
         powell_maxfev = 0
         twopass = False
         if verb >= 1:
-            print("Mode: superfast (onepass, 50 iters, no Powell)")
+            print("Mode: superfast (onepass, <=150 iters, no Powell)")
     elif args.fast:
-        adam_iters_2x = 100
-        adam_iters_1x = 100
+        adam_iters_2x = 300
+        adam_iters_1x = 300
         powell_maxfev = 0
         if verb >= 1:
-            print("Mode: fast (100 iters, no Powell)")
+            print("Mode: fast (<=300 iters, no Powell)")
     elif args.slow:
-        adam_iters_2x = 300
-        adam_iters_1x = 400
+        adam_iters_2x = 600
+        adam_iters_1x = 800
         powell_maxfev = 2000
         if verb >= 1:
-            print("Mode: slow (300/400 iters, 2000 Powell evals)")
+            print("Mode: slow (<=600/800 iters, 2000 Powell evals)")
 
     # Auto-size box radius if requested
     lpa_sigma = args.lpa_sigma
@@ -286,9 +316,15 @@ def main(argv: list[str] | None = None) -> None:
         cost=args.cost,
         lpa_sigma=lpa_sigma,
         lpa_kernel=args.lpa_kernel,
+        bloktype=args.bloktype,
+        blokrad=args.blokrad,
         twopass=twopass,
         coarse_range=args.coarse_range,
         coarse_step=args.coarse_step,
+        coarse_shift_frac=args.coarse_shift_frac,
+        range_scale=(0.25 if args.verysmallrange
+                     else 0.5 if args.smallrange else 1.0),
+        adam_lr=args.adam_lr,
         tbest=args.tbest,
         adam_iters_2x=adam_iters_2x,
         adam_iters_1x=adam_iters_1x,
