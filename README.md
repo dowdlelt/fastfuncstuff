@@ -102,6 +102,15 @@ What is also very fun is that this supports phase input and you can choose to wa
 ### ffs_perm (beta)
 Non-parametric permutation testing — generates a null by sign-flipping/permuting labels (FSL/`randomise`-style) and gives you voxelwise + cluster-corrected null distributions. The whole thing is GPU-batched so 5,000 permutations across a full brain takes about 2 minutes here, ~50x faster than the conventional `randomise` workflow (on 8 cores, my machine). Produces AFNI-compatible cluster tables. Still beta — see `-help` for current options.
 
+### ffs_design_spec and ffs_util_concalc
+A specification approach to create design matricies - read in BIDS events and data lengths to produce a TOML file.
+Here you can specify models (SPMG1 or others), durations, etc.
+Comments tell you about your data. 
+This can be edited and compiled to a design matrix (fully AFNI compatable).
+Contrast can easily be added and - this part I really do love - you can run `ffs_util_concalc` to add those contrasts to an existing OLS or REML stats dataset.
+No need to rerun the GLM! 
+Also permits correcting a contrast mistake and doing an inplace update of the stats. 
+
 
 ## Command-line tool listing
 
@@ -112,7 +121,9 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 
 | command | description |
 |---|---|
-| `ffs_reml` | OLS / ARMA(1,1) prewhitened GLM with REML grid search over (a, b). AFNI `3dREMLfit`-style bucket output, FDR curves attached. Accepts per-voxel HRF assignments via `-hrfopt_prefix`, and `-single_trials LABEL` rebuilds the design with one regressor per event. |
+| `ffs_reml` | OLS / ARMA(1,1) prewhitened GLM with REML grid search over (a, b). AFNI `3dREMLfit`-style bucket output, FDR curves attached. Accepts per-voxel HRF assignments via `-hrfopt_prefix`, and `-single_trials LABEL` rebuilds the design with one regressor per event. Can take `-spec design.spec` to compile the whole design itself. |
+| `ffs_design_spec` | Compile a single `design.spec` TOML (runs, events, per-task HRF, nuisance, contrasts with wildcards/F-tests) into an AFNI `.xmat.1D`. `stub` writes a skeleton from `events.tsv` + NIfTI headers. |
+| `ffs_util_concalc` | Recompute or add GLM contrasts (t and F) on an existing REML bucket without rerunning the GLM — reuses the per-(a,b) ARMA inverse so it's near-free. |
 | `ffs_ridge` | Fractional ridge regression for single-trial betas (GLMsingle Type D). Per-voxel optimal fraction by cross-validation. |
 | `ffs_deconvolve` | FIR / event-related deconvolution without an assumed HRF shape. |
 | `ffs_perm` *(beta)* | GPU-batched non-parametric permutation testing (ex. for single trials or group statistics). ~5,000 permutations / 2 minutes for a full brain. Writes AFNI-compatible corrected t-stats and attacheds cluster tables (for max cluster size correction). |
@@ -141,7 +152,7 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 | command | description |
 |---|---|
 | `ffs_moco` | Rigid-body motion correction (Gauss–Newton, heptic resampling). Writes AFNI-compatible motion files (3dvolreg is still faster). |
-| `ffs_allineate` | 6/9/12-parameter affine alignment. |
+| `ffs_allineate` | ~100x faster 6/9/12-parameter affine alignment with `3dAllineate`-style cost functions: `lpa`/`lpc` local Pearson (same- and cross-modal), `ls`, `mi`/`nmi`, Hellinger, and correlation ratio. Use `lpa` for same-contrast (e.g. anat→MNI) and `lpc` for cross-modal (EPI→anat). |
 | `ffs_qwarp` | Iterative nonlinear warp estimation (`3dQwarp`-style). |
 | `ffs_nwarp` | Apply a warp to a volume or 4D timeseries. Supports complex (mag + phase) warping. |
 | `ffs_slicetime` | Slice-timing correction (`3dTshift`-style), Fourier or sinc. |
