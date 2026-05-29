@@ -395,19 +395,21 @@ def batched_gn_estimate(
     dxy_thresh: float,
     dph_thresh: float,
     fixed_iter: bool,
+    init_params: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Gauss-Newton WLS for a whole batch of volumes at once (Triton shears).
 
     Identical normal-equation math to ``gauss_newton_rigid`` — only the resample
-    is the fused shear kernel, applied to all volumes per iteration. Every volume
-    starts from identity (so this requires chain_init off). Volumes converge
-    independently: once a volume's step is below threshold its update is frozen,
-    and the loop ends when all have converged.
+    is the fused shear kernel, applied to all volumes per iteration. Volumes
+    start from identity (or ``init_params`` for a coarse-to-fine refine pass) and
+    converge independently: once a volume's step is below threshold its update is
+    frozen, and the loop ends when all have converged.
 
     Args:
         sources: (B, nz, ny, nx) source volumes on the (CUDA) device.
         base_flat: (N,) flattened base. weight_flat_1d: (N,) weights.
         WJ: (6, N) weighted Jacobian. JtWJ: (6, 6) full normal matrix.
+        init_params: optional (B,12) starting params (default: identity).
     Returns:
         (params (B,12), n_iters (B,), invalid (B,)) — ``invalid`` flags volumes
         whose shear decomposition was ever degenerate (caller re-runs those).
@@ -419,7 +421,10 @@ def batched_gn_estimate(
     eps = 1e-6 * JtWJ.diagonal().mean()
     JtWJ_reg = JtWJ + eps * torch.eye(6, device=device, dtype=dtype)
 
-    params = identity_params(device=device, dtype=dtype)[None].repeat(B, 1)
+    if init_params is None:
+        params = identity_params(device=device, dtype=dtype)[None].repeat(B, 1)
+    else:
+        params = init_params.clone()
     active = torch.ones(B, dtype=torch.bool, device=device)
     n_iters = torch.full((B,), max_iter, dtype=torch.int32, device=device)
     invalid = torch.zeros(B, dtype=torch.bool, device=device)
@@ -655,7 +660,7 @@ def _blur_volume(vol: Tensor, fwhm: float) -> Tensor:
 def _run_batched_estimation(
     timeseries, base_flat, weight_flat_1d, WJ, JtWJ, vol_shape, config, device,
     dtype, all_params, matrices_vox, rms_before, n_iters, base_copy_idx,
-    disable_pbar,
+    disable_pbar, coarse=None,
 ):
     """Estimate all volumes' rigid params with the whole-batch shear GN solver.
 
@@ -663,9 +668,15 @@ def _run_batched_estimation(
     processed in memory-sized chunks; the base volume (``base_copy_idx``, or -1
     when an external base is used) is left at identity; any volume with a
     degenerate decomposition is re-fit per-volume with the general resampler.
+
+    ``coarse`` (when -twopass): a tuple (bf_coarse, wf1_coarse, WJ_c, JtWJ_c) of
+    the coarse-blur normal equations. Each chunk is first solved on
+    coarse-blurred sources (large capture range) and that result seeds the
+    full-resolution fine pass.
     """
     nt = timeseries.shape[0]
     nz, ny, nx = vol_shape
+    coarse_fwhm = max(4.0, config.blur_fwhm) if coarse is not None else 0.0
 
     identity = identity_params(device=device, dtype=dtype)
     indices = [t for t in range(nt) if t != base_copy_idx]
@@ -687,20 +698,37 @@ def _run_batched_estimation(
     )
     for cstart in pbar:
         idx = indices[cstart:cstart + chunk]
-        srcs = torch.stack([timeseries[t].to(device=device, dtype=dtype) for t in idx])
-        if config.blur_fwhm > 0:
-            srcs = torch.stack([_blur_volume(srcs[i], config.blur_fwhm) for i in range(srcs.shape[0])])
+        srcs_raw = torch.stack([timeseries[t].to(device=device, dtype=dtype) for t in idx])
+        B = srcs_raw.shape[0]
 
-        B = srcs.shape[0]
+        # Fine-pass sources (optionally pre-blurred for estimation).
+        if config.blur_fwhm > 0:
+            srcs = torch.stack([_blur_volume(srcs_raw[i], config.blur_fwhm) for i in range(B)])
+        else:
+            srcs = srcs_raw
+
         src_flat = srcs.reshape(B, -1)
         rms_before[idx] = (
             ((base_flat[None] - src_flat) ** 2).mean(dim=1).sqrt().cpu().numpy()
         )
 
+        # Two-pass: coarse-blur solve seeds the fine solve.
+        init_params = None
+        if coarse is not None:
+            bf_c, wf1_c, WJ_c, JtWJ_c = coarse
+            srcs_coarse = torch.stack(
+                [_blur_volume(srcs_raw[i], coarse_fwhm) for i in range(B)]
+            )
+            init_params, _, _ = batched_gn_estimate(
+                srcs_coarse, bf_c, wf1_c, WJ_c, JtWJ_c, vol_shape,
+                config.max_iter, config.interp, config.dxy_thresh,
+                config.dph_thresh, config.fixed_iter,
+            )
+
         params, nit, invalid = batched_gn_estimate(
             srcs, base_flat, weight_flat_1d, WJ, JtWJ, vol_shape,
             config.max_iter, config.interp, config.dxy_thresh, config.dph_thresh,
-            config.fixed_iter,
+            config.fixed_iter, init_params=init_params,
         )
 
         # Re-fit any degenerate-decomposition volumes with the trusted solver.
@@ -846,7 +874,6 @@ def moco(
     batched_eligible = (
         config.cost == "wls"
         and config.use_shear
-        and not config.twopass
         and not config.chain_init
         and device.type == "cuda"
         and shear_resample_triton is not None
@@ -941,10 +968,16 @@ def moco(
 
     # ── Pass 1 (batched): estimate all volumes at once via fused shears ────
     if batched_eligible:
+        _coarse = (
+            (bf_coarse, wf1_coarse, WJ_c, JtWJ_c)
+            if (config.twopass and config.cost == "wls")
+            else None
+        )
         _run_batched_estimation(
             timeseries, base_flat, weight_flat_1d, WJ, JtWJ, vol_shape, config,
             device, dtype, all_params, matrices_vox, rms_before, n_iters,
             config.base_index if base_vol is None else -1, disable_pbar,
+            coarse=_coarse,
         )
 
     # ── Pass 1 (per-volume): estimate parameters ─────────────────────────

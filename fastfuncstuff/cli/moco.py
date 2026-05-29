@@ -146,6 +146,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Fast mode: fixed iterations, no convergence check (runs exactly -maxiter)",
     )
     method_group.add_argument(
+        "-workhard",
+        action="store_true",
+        help="Spend the speed on accuracy: 5x stricter convergence thresholds "
+        "and double the max iterations. Useful for high-motion or demanding runs.",
+    )
+    method_group.add_argument(
         "-no_compile",
         dest="no_compile",
         action="store_true",
@@ -287,6 +293,14 @@ def main(argv: list[str] | None = None) -> None:
     # (Writing the timeseries is gated separately on -prefix below.)
     need_aligned = args.prefix is not None or args.save_mean is not None
 
+    # -workhard: trade the speed headroom for accuracy — stricter convergence
+    # and twice the iteration budget.
+    max_iter = args.maxiter * 2 if args.workhard else args.maxiter
+    dxy_thresh = args.dxy_thresh * 0.2 if args.workhard else args.dxy_thresh
+    dph_thresh = args.dph_thresh * 0.2 if args.workhard else args.dph_thresh
+    if args.workhard and verb >= 1:
+        print(f"  -workhard: max_iter={max_iter}, dxy={dxy_thresh:g}, dph={dph_thresh:g}")
+
     # --- Build config ---
     config = MocoConfig(
         skip_resample=not need_aligned,
@@ -294,15 +308,15 @@ def main(argv: list[str] | None = None) -> None:
         cost=args.cost,
         interp=args.interp,
         final_interp=args.final_interp,
-        max_iter=args.maxiter,
+        max_iter=max_iter,
         twopass=args.twopass,
         blur_fwhm=args.blur,
         chain_init=args.chain_init,
         use_shear=not args.no_shear,
         automask=args.automask,
         weight_automask=args.weight_automask,
-        dxy_thresh=args.dxy_thresh,
-        dph_thresh=args.dph_thresh,
+        dxy_thresh=dxy_thresh,
+        dph_thresh=dph_thresh,
         fixed_iter=args.fast,
         compile=not args.no_compile,
         device=str(device),
