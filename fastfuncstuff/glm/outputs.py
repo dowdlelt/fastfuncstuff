@@ -501,8 +501,10 @@ def _create_nifti_with_header(
         import copy
 
         new_header = copy.deepcopy(nifti_header)
-        # Update shape to match new data
+        # Update shape AND dtype to match new data: a header copied from an
+        # int16 source would otherwise quantize our float stats on write.
         new_header.set_data_shape(data.shape)
+        new_header.set_data_dtype(data.dtype)
         img = nib.Nifti1Image(data, affine, header=new_header)
     else:
         # Fallback: Create basic header
