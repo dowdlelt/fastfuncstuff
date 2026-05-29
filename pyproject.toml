@@ -42,6 +42,7 @@ dev = [
 [project.scripts]
 # Analysis tools
 ffs_build_design = "fastfuncstuff.cli.build_design:main"
+ffs_design_spec = "fastfuncstuff.cli.design_spec:main"
 ffs_decompose = "fastfuncstuff.cli.decompose:main"
 ffs_deconvolve = "fastfuncstuff.cli.deconvolve:main"
 ffs_denoise = "fastfuncstuff.cli.denoise:main"
@@ -67,6 +68,7 @@ ffs_nwarp = "fastfuncstuff.cli.nwarp:main"
 ffs_qwarp = "fastfuncstuff.cli.qwarp:main"
 ffs_slicetime = "fastfuncstuff.cli.slicetime:main"
 ffs_util_automask = "fastfuncstuff.cli.automask:main"
+ffs_util_concalc = "fastfuncstuff.cli.util_concalc:main"
 ffs_util_pcwarp = "fastfuncstuff.cli.pcwarp:main"
 # Stats / utility tools
 ffs_spatial_xcorr = "fastfuncstuff.cli.spatial_xcorr:main"
