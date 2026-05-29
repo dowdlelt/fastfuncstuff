@@ -70,6 +70,22 @@ def load_image(
         "header": img.header.copy(),
     }
 
+    # AFNI/NIfTI files are frequently "fake" 5D (or 4D) with singleton higher
+    # dimensions (e.g. a single 3D volume stored as (x,y,z,1) or (x,y,z,1,1),
+    # or sub-bricks in dim[5] with dim[4]==1). Drop those singleton non-spatial
+    # axes so a lone volume reads as 3D and a real time series as 4D. The first
+    # three (spatial) axes are always kept.
+    if data.ndim > 3:
+        squeeze_axes = tuple(ax for ax in range(3, data.ndim)
+                             if data.shape[ax] == 1)
+        if squeeze_axes:
+            data = np.squeeze(data, axis=squeeze_axes)
+        if data.ndim > 4:
+            raise ValueError(
+                f"Expected 3D or 4D image after squeezing singleton dims, "
+                f"got shape {data.shape}"
+            )
+
     # NIfTI convention: (x, y, z [, t]) -> we want (z, y, x [, t transposed])
     # nibabel loads as (i, j, k [, t]) in file order
     if data.ndim == 3:
