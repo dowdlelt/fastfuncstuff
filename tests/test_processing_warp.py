@@ -587,6 +587,54 @@ class TestPatchPipeline:
 # WarpState mutation patterns
 # ---------------------------------------------------------------------------
 
+class TestPyramid:
+    """Opt-in coarse-to-fine resolution pyramid (config.pyramid_factor)."""
+
+    def _base_and_source(self):
+        from fastfuncstuff.processing.interp import warp_image_linear
+
+        torch.manual_seed(0)
+        b = torch.rand(24, 26, 24)
+        for _ in range(4):
+            b = (
+                b
+                + torch.roll(b, 1, 0) + torch.roll(b, -1, 0)
+                + torch.roll(b, 1, 1) + torch.roll(b, -1, 1)
+                + torch.roll(b, 1, 2) + torch.roll(b, -1, 2)
+            ) / 7.0
+        zz, yy, xx = torch.meshgrid(
+            *[torch.arange(n, dtype=torch.float32) for n in b.shape], indexing="ij"
+        )
+        s = warp_image_linear(
+            b,
+            1.5 * torch.sin(2 * math.pi * yy / b.shape[1]),
+            1.0 * torch.cos(2 * math.pi * zz / b.shape[0]),
+            0.8 * torch.sin(2 * math.pi * xx / b.shape[2]),
+        )
+        return b, s
+
+    def test_default_off(self):
+        assert QwarpConfig().pyramid_factor == 1
+
+    def test_pyramid_runs_and_improves(self):
+        # GPU-first project: exercise the full multi-level path on CUDA (fast),
+        # and only a tiny smoke on CPU so the suite isn't pegged for seconds.
+        from fastfuncstuff.processing.warp import _global_correlation, qwarp
+
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        max_level = 5 if dev.type == "cuda" else 1
+        b, s = self._base_and_source()
+        b, s = b.to(dev), s.to(dev)
+        cfg = QwarpConfig(verb=0, minpatch=11, max_level=max_level, pyramid_factor=2)
+        w, xd, yd, zd = qwarp(b, s, config=cfg, device=dev)
+        assert torch.isfinite(w).all()
+        # _global_correlation returns negated correlation (lower = better)
+        ones = torch.ones_like(b)
+        c_raw = _global_correlation(b, s, ones, None, None)
+        c_warp = _global_correlation(b, w, ones, None, None)
+        assert c_warp < c_raw, f"pyramid warp did not improve: {c_warp:.4f} vs raw {c_raw:.4f}"
+
+
 class TestWarpStateMutation:
     def test_warp_fields_independent(self):
         """Modifying one state's warp should not affect another."""

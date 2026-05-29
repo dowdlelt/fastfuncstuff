@@ -176,6 +176,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_reg.add_argument("-workhard", nargs=2, type=int, default=None, metavar=("START", "END"),
                        help="Run extra optimization passes for levels START..END. "
                             "E.g. -workhard 0 2 works harder on the first 3 levels")
+    g_reg.add_argument("-pyramid", nargs="?", type=int, const=2, default=1, metavar="FACTOR",
+                       help="Coarse-to-fine resolution pyramid: solve the coarse (global) "
+                            "levels on a volume downsampled by FACTOR per axis, then refine "
+                            "the fine levels at full resolution. The coarse levels dominate "
+                            "runtime on large (e.g. 1mm) volumes and their warp is smooth, so "
+                            "an N× downsample is ~N³ less work there. Bare -pyramid uses "
+                            "factor 2. Opt-in; validate against the non-pyramid result "
+                            "[default: off]")
     g_reg.add_argument("-nopad", action="store_true",
                        help="Disable internal zero-padding of images. Padding adds ~12%% "
                             "border to allow warps near edges. Disabling saves memory but "
@@ -1005,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
         lpa_kernel=args.lpa_kernel,
         level_stop_tol=args.level_stop,
         compile=args.compile,
+        pyramid_factor=args.pyramid,
     )
 
     if args.blur is not None:
@@ -1070,9 +1079,13 @@ def main(argv: list[str] | None = None) -> int:
     # Load or compute weight
     weight = None
     if args.autoweight:
-        # Automask base, apply mask to base, then smooth for soft-edged weight
-        mask_bin = automask(base_3d.float(), device=torch.device("cpu"))
-        masked_base = base_3d.float() * mask_bin.float()
+        # Automask base, apply mask to base, then smooth for soft-edged weight.
+        # automask is pure conv3d/tensor ops; run it on the user's device --
+        # forcing CPU here ran hundreds of conv3d passes single-threaded and
+        # dominated startup on large (e.g. 1mm anatomical) volumes.
+        base_dev = base_3d.float().to(device)
+        mask_bin = automask(base_dev, device=device)
+        masked_base = base_dev * mask_bin.float()
         weight = _gaussian_smooth_3d(masked_base, sigma=args.autoweight_blur)
         # Normalize to [0, 1]
         w_max = weight.max()

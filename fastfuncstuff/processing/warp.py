@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -130,6 +130,12 @@ class QwarpConfig:
     batch_optimizer_iters: int = 60
     """Max iterations for batched Adam optimizer per phase."""
 
+    batch_optimizer_iters_lev0: int = 120
+    """Max Adam iterations for the single global level-0 patch (CUDA only).
+    Level 0 is one B=1 patch and the foundational alignment, so it gets a
+    larger budget than the per-phase fine patches. CPU still uses the serial
+    derivative-free optimizer (no launch overhead to amortize there)."""
+
     hfactor_q: float = 0.5
     """AFNI-style Hfactor shrinkage for *fine* patches: at the lev=1 patch size
     Hfactor=1.0, and as patches shrink Hfactor decreases toward hfactor_q.
@@ -158,6 +164,16 @@ class QwarpConfig:
     """Use torch.compile for building-block functions (CUDA only).
     Requires warmup on first volume; may not help for small patches."""
 
+    pyramid_factor: int = 1
+    """Coarse-to-fine resolution pyramid factor (1 = off, the default).
+    When >1, the coarse levels are solved on a volume downsampled by this
+    factor per axis, then the warp is upsampled to seed full-resolution
+    refinement of the fine levels. The coarse levels are the GPU-compute
+    bottleneck on large (e.g. 1mm anatomical) volumes -- an N× downsample is
+    ~N³ less work there. Opt-in because aggressive downsampling can change the
+    warp; validate against the non-pyramid result. Only applies when
+    start_level==0 and no initial warp is supplied."""
+
     level_callback: Callable[..., None] | None = None
     """Optional callback fired after each level completes. Signature:
     ``cb(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped_source: Tensor)``.
@@ -181,6 +197,7 @@ class WarpState:
     cost: float = 666.666
     patches_done: int = 0
     patches_skipped: int = 0
+    last_level: int = 0  # highest refinement level executed (for pyramid hand-off)
 
 
 @dataclass
@@ -310,7 +327,10 @@ def qwarp(
         state.zd = torch.zeros(nz, ny, nx, device=device)
         state.warped_source = source_p.clone()
 
-    _warpomatic(base_p, source_p, weight_p, mask_p, state, config, device)
+    if config.pyramid_factor > 1 and initial_warp is None and config.start_level == 0:
+        _warpomatic_pyramid(base_p, source_p, weight_p, mask_p, state, config, device)
+    else:
+        _warpomatic(base_p, source_p, weight_p, mask_p, state, config, device)
 
     # Final warped image: apply warp to unpadded source, crop to original size
     warped_full = warp_image_linear(source_p, state.xd, state.yd, state.zd)
@@ -474,6 +494,103 @@ def _compute_hfactor(patch_size: int, patch_size_lev1: int, hfactor_q: float = 0
     return prat ** alpha
 
 
+def _global_correlation(
+    base: Tensor,
+    warped_source: Tensor,
+    weight: Tensor,
+    base_clip: tuple[float, float] | None,
+    source_clip: tuple[float, float] | None,
+) -> float:
+    """Weighted (optionally clipped) Pearson cost over the whole volume.
+
+    Returns the negated correlation (lower = better), matching state.cost
+    convention. Single source of truth for the level-boundary cost readout.
+    """
+    b_flat = base.reshape(-1)
+    s_flat = warped_source.reshape(-1)
+    w_flat = weight.reshape(-1)
+    if base_clip:
+        b_flat = b_flat.clamp(base_clip[0], base_clip[1])
+    if source_clip:
+        s_flat = s_flat.clamp(source_clip[0], source_clip[1])
+    wm = w_flat * (w_flat > 0).float()
+    sw = wm.sum()
+    if sw <= 0:
+        return 0.0
+    xbar = (wm * b_flat).sum() / sw
+    ybar = (wm * s_flat).sum() / sw
+    vxx = ((wm * b_flat * b_flat).sum() / sw - xbar * xbar).clamp(min=1e-20)
+    vyy = ((wm * s_flat * s_flat).sum() / sw - ybar * ybar).clamp(min=1e-20)
+    vxy = (wm * b_flat * s_flat).sum() / sw - xbar * ybar
+    return float((-vxy / (vxx * vyy).sqrt()).item())
+
+
+def _warpomatic_pyramid(
+    base: Tensor, source: Tensor, weight: Tensor, mask: Tensor,
+    state: WarpState, config: QwarpConfig, device: torch.device,
+) -> None:
+    """Coarse-to-fine resolution pyramid (opt-in via config.pyramid_factor).
+
+    Solves the coarse levels on a volume downsampled by ``pyramid_factor`` per
+    axis -- where the warp is smooth and low-frequency, so full resolution is
+    wasted compute -- then upsamples the warp to seed full-resolution
+    refinement of the fine levels. ``state`` is the full-resolution state
+    (zero warp). All volumes are the padded full-resolution grid.
+    """
+    import torch.nn.functional as F
+
+    f = config.pyramid_factor
+    nz, ny, nx = base.shape
+    lz = max(16, round(nz / f))
+    ly = max(16, round(ny / f))
+    lx = max(16, round(nx / f))
+
+    def _down(v: Tensor) -> Tensor:
+        return F.interpolate(
+            v[None, None].float(), size=(lz, ly, lx), mode="trilinear", align_corners=False
+        )[0, 0]
+
+    base_lo = _down(base)
+    source_lo = _down(source)
+    weight_lo = _down(weight)
+    mask_lo = (_down(mask) > 0.5).byte()
+
+    lo_state = WarpState(nx=lx, ny=ly, nz=lz)
+    lo_state.xd = torch.zeros(lz, ly, lx, device=device)
+    lo_state.yd = torch.zeros(lz, ly, lx, device=device)
+    lo_state.zd = torch.zeros(lz, ly, lx, device=device)
+    lo_state.warped_source = source_lo.clone()
+
+    if config.verb >= 1:
+        print(f"qwarp_torch: pyramid coarse pass at {lx}x{ly}x{lz} (factor {f})")
+    # pad=False semantics: these are already on the padded grid. Pyramid off in
+    # the recursive call so it doesn't recurse further.
+    lo_cfg = replace(config, pyramid_factor=1)
+    _warpomatic(base_lo, source_lo, weight_lo, mask_lo, lo_state, lo_cfg, device)
+
+    # Upsample the coarse warp to full resolution. Displacements are in voxel
+    # units, so they scale by the per-axis resolution ratio (~f).
+    sx, sy, sz = nx / lx, ny / ly, nz / lz
+
+    def _up(v: Tensor) -> Tensor:
+        return F.interpolate(
+            v[None, None], size=(nz, ny, nx), mode="trilinear", align_corners=False
+        )[0, 0]
+
+    state.xd = _up(lo_state.xd) * sx
+    state.yd = _up(lo_state.yd) * sy
+    state.zd = _up(lo_state.zd) * sz
+    state.warped_source = warp_image_linear(source, state.xd, state.yd, state.zd)
+
+    # Resume full-resolution refinement where the coarse pass left off, with a
+    # one-level overlap so no spatial-frequency band is skipped at the seam.
+    start = max(1, lo_state.last_level - 1)
+    if config.verb >= 1:
+        print(f"qwarp_torch: pyramid full-res refine from lev={start}")
+    refine_cfg = replace(config, pyramid_factor=1, start_level=start)
+    _warpomatic(base, source, weight, mask, state, refine_cfg, device)
+
+
 # ---------------------------------------------------------------------------
 # Main warpomatic loop
 # ---------------------------------------------------------------------------
@@ -508,22 +625,9 @@ def _warpomatic(
 
     # Compute initial cost so it's never the 666.666 sentinel
     with torch.no_grad():
-        b_flat = base.reshape(-1)
-        s_flat = state.warped_source.reshape(-1)
-        w_flat = weight.reshape(-1)
-        if base_clip:
-            b_flat = b_flat.clamp(base_clip[0], base_clip[1])
-        if source_clip:
-            s_flat = s_flat.clamp(source_clip[0], source_clip[1])
-        wm = w_flat * (w_flat > 0).float()
-        sw = wm.sum()
-        if sw > 0:
-            xbar = (wm * b_flat).sum() / sw
-            ybar = (wm * s_flat).sum() / sw
-            vxx = ((wm * b_flat * b_flat).sum() / sw - xbar * xbar).clamp(min=1e-20)
-            vyy = ((wm * s_flat * s_flat).sum() / sw - ybar * ybar).clamp(min=1e-20)
-            vxy = (wm * b_flat * s_flat).sum() / sw - xbar * ybar
-            state.cost = float((-vxy / (vxx * vyy).sqrt()).item())
+        state.cost = _global_correlation(
+            base, state.warped_source, weight, base_clip, source_clip
+        )
 
     # --- Level 0 bounds (always computed for level 1+ patch sizing) ---
     xwid = (imax - imin) // 8
@@ -540,12 +644,33 @@ def _warpomatic(
     if nz == 1:
         kbbb = kttt = 0
 
-    # --- Level 0: global warp (single patch, serial) ---
+    # --- Level 0: global warp (single patch) ---
     if config.start_level == 0:
         first_cost = state.cost
 
-        # Level 0: progressive basis complexity (single patch, use serial optimizer)
+        # Level 0: progressive basis complexity. On CUDA the single global
+        # patch runs through the GPU-resident batched optimizer (B=1) -- this
+        # is the big win, since the serial Powell path syncs to the host on
+        # every cost evaluation and used to dominate the whole runtime.
         lev0_bases = ["cubic_lite", "cubic", "quintic_lite"]
+        use_gpu_lev0 = device.type == "cuda"
+
+        if use_gpu_lev0:
+            lev0_patch = PatchSpec(
+                ibot=ibbb, itop=ittt, jbot=jbbb, jtop=jttt, kbot=kbbb, ktop=kttt,
+                gi=0, gj=0, gk=0,
+            )
+            nxh0 = ittt - ibbb + 1
+            nyh0 = jttt - jbbb + 1
+            nzh0 = kttt - kbbb + 1
+            kk0, jj0, ii0 = torch.meshgrid(
+                torch.arange(nzh0, dtype=torch.float32, device=device),
+                torch.arange(nyh0, dtype=torch.float32, device=device),
+                torch.arange(nxh0, dtype=torch.float32, device=device),
+                indexing="ij",
+            )
+            ii0_flat, jj0_flat, kk0_flat = ii0.reshape(-1), jj0.reshape(-1), kk0.reshape(-1)
+
         if config.verb >= 1 and _tqdm is not None:
             pbar = _tqdm(
                 lev0_bases,
@@ -559,17 +684,43 @@ def _warpomatic(
                 print(f"lev=0 {ibbb}..{ittt} {jbbb}..{jttt} {kbbb}..{kttt}: ", end="", flush=True)
 
         for basis_type in pbar:
-            _improve_warp_serial(
-                base, source, weight, mask, state, config, device,
-                ibbb, ittt, jbbb, jttt, kbbb, kttt,
-                basis_type=basis_type,
-                do_xyz=do_xyz,
-                axis_weights=axis_w,
-                use_penalty=False,
-                pen_fac=0.0,
-                base_clip=base_clip,
-                source_clip=source_clip,
-            )
+            if use_gpu_lev0:
+                basis0, half_widths0, param_max0 = _get_basis_config(
+                    basis_type, nxh0, nyh0, nzh0, device, hfactor=1.0,
+                )
+                _improve_warp_batched(
+                    base, source, weight, mask, state, config, device,
+                    [lev0_patch], basis0, half_widths0, param_max0,
+                    ii0_flat, jj0_flat, kk0_flat,
+                    nxh0, nyh0, nzh0,
+                    do_xyz=do_xyz,
+                    axis_weights=axis_w,
+                    use_penalty=False,
+                    pen_fac=0.0,
+                    base_clip=base_clip,
+                    source_clip=source_clip,
+                    max_iter=config.batch_optimizer_iters_lev0,
+                )
+            else:
+                _improve_warp_serial(
+                    base, source, weight, mask, state, config, device,
+                    ibbb, ittt, jbbb, jttt, kbbb, kttt,
+                    basis_type=basis_type,
+                    do_xyz=do_xyz,
+                    axis_weights=axis_w,
+                    use_penalty=False,
+                    pen_fac=0.0,
+                    base_clip=base_clip,
+                    source_clip=source_clip,
+                )
+
+        # The batched path doesn't set state.cost (only the serial path does),
+        # so recompute the global cost for an accurate level-0 readout.
+        if use_gpu_lev0:
+            with torch.no_grad():
+                state.cost = _global_correlation(
+                    base, state.warped_source, weight, base_clip, source_clip
+                )
 
         if config.verb >= 1:
             elapsed = time.time() - t0
@@ -602,6 +753,8 @@ def _warpomatic(
     for lev in range(lev_start, config.max_level + 1):
         if levdone:
             break
+
+        state.last_level = lev
 
         flev = config.shrink ** lev
         xwid = int(xwid0 * flev)
@@ -794,24 +947,9 @@ def _warpomatic(
 
         # Compute actual global correlation after this level
         with torch.no_grad():
-            b_flat = base.reshape(-1)
-            s_flat = state.warped_source.reshape(-1)
-            w_flat = weight.reshape(-1)
-            if base_clip:
-                b_flat = b_flat.clamp(base_clip[0], base_clip[1])
-            if source_clip:
-                s_flat = s_flat.clamp(source_clip[0], source_clip[1])
-            wm = w_flat * (w_flat > 0).float()
-            sw = wm.sum()
-            if sw > 0:
-                xbar = (wm * b_flat).sum() / sw
-                ybar = (wm * s_flat).sum() / sw
-                vxx = ((wm * b_flat * b_flat).sum() / sw - xbar * xbar).clamp(min=1e-20)
-                vyy = ((wm * s_flat * s_flat).sum() / sw - ybar * ybar).clamp(min=1e-20)
-                vxy = (wm * b_flat * s_flat).sum() / sw - xbar * ybar
-                state.cost = float((-vxy / (vxx * vyy).sqrt()).item())
-            else:
-                state.cost = 0.0
+            state.cost = _global_correlation(
+                base, state.warped_source, weight, base_clip, source_clip
+            )
 
         if config.verb >= 1:
             elapsed = time.time() - t0
@@ -861,8 +999,14 @@ def _improve_warp_batched(
     pen_fac: float = 0.033333,
     base_clip: tuple[float, float] | None = None,
     source_clip: tuple[float, float] | None = None,
+    max_iter: int | None = None,
 ) -> None:
-    """Optimize ALL patches in one checkerboard phase simultaneously on GPU."""
+    """Optimize ALL patches in one checkerboard phase simultaneously on GPU.
+
+    Also used for the single global level-0 patch (B=1): keeping that
+    optimization GPU-resident avoids the per-evaluation CPU<->GPU sync that
+    made the serial Powell path dominate the runtime.
+    """
     B = len(patches)
     if B == 0:
         return
@@ -1003,7 +1147,7 @@ def _improve_warp_batched(
     # Run batched Adam optimizer
     best_params, best_costs = optimize_warp_params_batched(
         batched_cost, B, n_active, param_max, device,
-        max_iter=config.batch_optimizer_iters,
+        max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
         lr=config.batch_optimizer_lr,
     )
 
@@ -1036,7 +1180,12 @@ def _improve_warp_batched(
     state.patches_done += B
 
     if config.verb >= 2:
-        print(f"  phase: B={B} cost={state.cost:.5f}")
+        # Route through tqdm.write so it doesn't stomp on the level progress bar.
+        msg = f"  phase: B={B} cost={state.cost:.5f}"
+        if _tqdm is not None:
+            _tqdm.write(msg)
+        else:
+            print(msg)
 
 
 # ---------------------------------------------------------------------------
