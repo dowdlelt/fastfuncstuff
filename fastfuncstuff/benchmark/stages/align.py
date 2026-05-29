@@ -113,7 +113,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"-base {_afni_template()} "
             f"-prefix {al_out} "
             f"-source_automask -autoweight "
-            f"-cost lpa -lpa_sigma 5"
+            f"-cost lpa "
             f"{ctx.ffs_device_flag()}",
             label="ffs_allineate anat-to-MNI",
             cwd=ffs_dir,

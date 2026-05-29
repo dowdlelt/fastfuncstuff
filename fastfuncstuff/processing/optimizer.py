@@ -190,6 +190,11 @@ def optimize_warp_params_batched(
     best_params = params.detach().clone()
     prev_total = best_costs.sum().item()
 
+    # Aggressive early stopping is what keeps fine levels cheap: each tiny
+    # patch converges in a handful of iterations, so we break once the total
+    # cost stops improving for a few consecutive steps rather than always
+    # running the full budget. (The per-iter loss.item() sync is hidden behind
+    # GPU compute at coarse levels and only fires a few times at fine levels.)
     no_improve_count = 0
 
     for _step in range(max_iter):

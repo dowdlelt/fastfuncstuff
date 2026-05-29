@@ -2366,6 +2366,7 @@ def main():
             import copy
             var_header = copy.deepcopy(nifti_header_rvar)
             var_header.set_data_shape(var_vol.shape)
+            var_header.set_data_dtype(var_vol.dtype)  # don't quantize float stats to an int source dtype
             var_img = nib.Nifti1Image(var_vol, affine, header=var_header)
         else:
             var_img = nib.Nifti1Image(var_vol, affine)
@@ -2451,6 +2452,7 @@ def main():
         if nifti_header_lk is not None:
             hdr = copy.deepcopy(nifti_header_lk)
             hdr.set_data_shape(vol_4d.shape)
+            hdr.set_data_dtype(vol_4d.dtype)  # don't quantize float stats to an int source dtype
             lklhd_img = nib.Nifti1Image(vol_4d, affine_lk, header=hdr)
         else:
             lklhd_img = nib.Nifti1Image(vol_4d, affine_lk)

@@ -374,6 +374,105 @@ def local_pearson_value_batched(
     return agg
 
 
+@dataclass
+class BlokPairs:
+    """Compact (patch, blok) binning for batched per-patch local Pearson.
+
+    Depends only on the per-patch blok assignment (constant while a patch set is
+    optimized), so it is built once per checkerboard phase and reused across the
+    optimizer's iterations. ``torch.unique`` collapses the global blok ids each
+    patch touches (a handful) into a dense bin space, so memory is O(occupied
+    (patch, blok) pairs) rather than O(B * nblok_global).
+    """
+
+    inv: Tensor      # (Nvalid,) valid-voxel -> compact bin id
+    bin_row: Tensor  # (P,) compact bin -> patch index
+    valid: Tensor    # (B*V,) bool, voxels assigned to a real blok
+    n_bins: int
+    batch: int
+
+
+def prepare_blok_pairs(blok_idx: Tensor, nblok: int) -> BlokPairs:
+    """Precompute the compact binning for :func:`local_pearson_value_pairs`.
+
+    Args:
+        blok_idx: (B, V) long; global blok id per patch voxel, <0 to exclude.
+        nblok: total number of bloks in the global lattice.
+    """
+    B, V = blok_idx.shape
+    device = blok_idx.device
+    valid = (blok_idx >= 0).reshape(-1)
+    row = torch.arange(B, device=device)[:, None].expand(B, V).reshape(-1)
+    gid = (row * nblok + blok_idx.reshape(-1))[valid]  # unique per (patch, blok)
+    uniq, inv = torch.unique(gid, return_inverse=True)
+    bin_row = torch.div(uniq, nblok, rounding_mode="floor")
+    return BlokPairs(inv=inv, bin_row=bin_row, valid=valid, n_bins=int(uniq.numel()), batch=B)
+
+
+def local_pearson_value_pairs(
+    base: Tensor, warped: Tensor, weight: Tensor, prep: BlokPairs, ppow: float = 1.0,
+) -> Tensor:
+    """Local-Pearson value for B *independent* (base, warped) pairs -> (B,).
+
+    Unlike :func:`local_pearson_value_batched` (one shared base, B warped
+    candidates -- 3dAllineate's coarse search), every batch element here is its
+    own base+warped pair sharing the per-voxel blok assignment in ``prep``. This
+    is what 3dQwarp needs: B overlapping patches, each scored over the global
+    blok-lattice voxels that fall inside it.
+
+    The per-blok aggregation matches AFNI's GA_pearson_local (Fisher-z log
+    transform, ppow weighting, MINCOR points/blok). The FOV-overlap guard from
+    the allineate path is intentionally omitted -- 3dQwarp does not use it.
+    Differentiable through ``warped``.
+    """
+    device = warped.device
+    v = prep.valid
+    x = base.reshape(-1)[v]
+    y = warped.reshape(-1)[v]
+    w = weight.reshape(-1)[v]
+    inv, P = prep.inv, prep.n_bins
+
+    def _seg(vals: Tensor) -> Tensor:
+        return torch.zeros(P, dtype=vals.dtype, device=device).index_add(0, inv, vals)
+
+    sw = _seg(w)
+    swx = _seg(w * x)
+    swxx = _seg(w * x * x)
+    swy = _seg(w * y)
+    swyy = _seg(w * y * y)
+    swxy = _seg(w * x * y)
+    cnt = _seg(torch.ones_like(w))
+
+    sw_safe = sw.clamp(min=1e-12)
+    xv = swxx - swx * swx / sw_safe
+    yv = swyy - swy * swy / sw_safe
+    xy = swxy - swx * swy / sw_safe
+
+    ok = (cnt >= _MIN_BLOK_PTS) & (xv > 0) & (yv > 0) & (sw > 0)
+    denom = (xv * yv).clamp(min=1e-24).sqrt()
+    pcor = (xy / denom).clamp(-_CMAX, _CMAX)
+    p = torch.log((1.0 + pcor) / (1.0 - pcor))
+    pabs = p.abs() if ppow == 1.0 else p.abs().pow(ppow)
+
+    # Per-blok contributions, then reduce each blok into its patch.
+    contrib = torch.where(ok, sw * p * pabs, torch.zeros_like(p))
+    wcon = torch.where(ok, sw, torch.zeros_like(sw))
+    num = torch.zeros(prep.batch, dtype=contrib.dtype, device=device).index_add(0, prep.bin_row, contrib)
+    den = torch.zeros(prep.batch, dtype=wcon.dtype, device=device).index_add(0, prep.bin_row, wcon)
+    agg = 0.25 * num / den.clamp(min=1e-12)
+    return torch.where(den > 0, agg, torch.zeros_like(agg))
+
+
+def lpc_value_pairs(base, warped, weight, prep, ppow=1.0) -> Tensor:
+    """Per-patch LPC (higher == better): ``-value``."""
+    return -local_pearson_value_pairs(base, warped, weight, prep, ppow)
+
+
+def lpa_value_pairs(base, warped, weight, prep, ppow=1.0) -> Tensor:
+    """Per-patch LPA (higher == better): ``|value|``."""
+    return local_pearson_value_pairs(base, warped, weight, prep, ppow).abs()
+
+
 def lpc_cost_batched(base, warped_batch, weight, blokset, ppow=1.0) -> Tensor:
     """Batched LPC (higher == better): ``-value`` per warped volume."""
     return -local_pearson_value_batched(base, warped_batch, weight, blokset, ppow)

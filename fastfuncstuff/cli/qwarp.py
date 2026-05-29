@@ -176,6 +176,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_reg.add_argument("-workhard", nargs=2, type=int, default=None, metavar=("START", "END"),
                        help="Run extra optimization passes for levels START..END. "
                             "E.g. -workhard 0 2 works harder on the first 3 levels")
+    g_reg.add_argument("-pyramid", nargs="?", type=int, const=2, default=1, metavar="FACTOR",
+                       help="Multi-octave coarse-to-fine resolution pyramid. Builds a "
+                            "halving scale ladder from FACTOR down to full res "
+                            "(4 => 4,2,1; 2 => 2,1): the global warp is solved at the "
+                            "coarsest scale (factor**3 less work -- microtime), and each "
+                            "finer octave is seeded by the previous one so it only refines "
+                            "a few levels with fast early stopping. Bare -pyramid uses "
+                            "factor 2. Opt-in; validate against the non-pyramid result "
+                            "[default: off]")
+    g_reg.add_argument("-keep_worse_levels", action="store_true",
+                       help="Run every refinement level even if it worsens the global "
+                            "cost (AFNI-style). By default ffs_qwarp rolls back and stops "
+                            "when a level degrades the fit -- the finest levels over-warp "
+                            "first, so this both improves the result and skips the most "
+                            "expensive, counterproductive level.")
     g_reg.add_argument("-nopad", action="store_true",
                        help="Disable internal zero-padding of images. Padding adds ~12%% "
                             "border to allow warps near edges. Disabling saves memory but "
@@ -188,6 +203,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "with -maxlev). In timeseries mode, only the FIRST volume's "
                             "intermediates are saved (the loop would otherwise produce "
                             "one set per volume — a lot of files)")
+    g_reg.add_argument("-partials", action="store_true",
+                       help="Concatenate the resampled (warped) source from each "
+                            "refinement level into a single 4D file "
+                            "{prefix}_partials.nii.gz -- a level-by-level 'movie' of the "
+                            "warp converging. With -pyramid, covers the full-resolution "
+                            "refine levels.")
+    g_reg.add_argument("-partial_warps", action="store_true",
+                       help="Save the warp field after each refinement level, as "
+                            "{prefix}_WARP_lev00.nii.gz, _WARP_lev01, ... (zero-padded "
+                            "level next to the prefix). Combine with -partials to save "
+                            "both warped images and warps per level.")
 
     # ── Basis Functions ─────────────────────────────────────────────────
     g_basis = p.add_argument_group(
@@ -259,10 +285,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_cost.add_argument("-pear", action="store_true",
                         help="Plain (unclipped) Pearson correlation")
     g_cost.add_argument("-lpa", action="store_true",
-                        help="Local Pearson Absolute: computes Pearson in local Gaussian "
-                             "neighborhoods, applies Fisher Z-transform (atanh), and uses "
-                             "z*|z| weighting. Produces larger warps than pearclp but can "
-                             "capture finer local structure. Slower (~3x)")
+                        help="Local Pearson Absolute (AFNI-faithful): local Pearson over a "
+                             "single global truncated-octahedron blok lattice (the same "
+                             "GA_BLOK / GA_pearson_local machinery 3dQwarp uses), Fisher-Z "
+                             "transform + |.|. Captures fine local structure")
+    g_cost.add_argument("-lpc", action="store_true",
+                        help="Local Pearson Correlation (AFNI-faithful, cross-modal): same "
+                             "blok local Pearson as -lpa but signed (negated), for "
+                             "contrast-inverted base/source (e.g. EPI-to-anat)")
+    g_cost.add_argument("-lpa_alt", action="store_true",
+                        help="Older LPA: local Pearson via separable Gaussian/box "
+                             "convolution neighborhoods (not blok-based). Kept for "
+                             "comparison; tune with -lpa_sigma / -lpa_kernel")
     g_cost.add_argument("-lpa_sigma", type=float, default=4.0, metavar="VOXELS",
                         help="Kernel parameter for LPA local neighborhoods. "
                              "For gauss: sigma (effective radius ~3x). "
@@ -554,43 +588,79 @@ def _compute_axis_weights_from_motion(
     return (abs(rx), abs(ry), abs(rz))
 
 
-def _make_level_callback(
-    levels_dir: str,
-    basename: str,
-    base_info: dict,
-    padding: tuple[int, int, int] | None,
-    nx: int, ny: int, nz: int,
-):
-    """Build a level callback that writes per-level warp + warped image."""
-    from fastfuncstuff.processing.io import save_image, save_warp_field
+class _LevelDumper:
+    """Per-level warp/image dump callback for ffs_qwarp, with three independent
+    outputs selected at construction:
 
-    os.makedirs(levels_dir, exist_ok=True)
-    pad_x, pad_y, pad_z = padding if padding is not None else (0, 0, 0)
+    - ``folder`` (-save_intermediates): per-level warp + warped image written to
+      ``{prefix}_levels/`` as ``{base}_WARP_lev00.nii.gz`` / ``{base}_lev00.nii.gz``.
+    - ``warp_files`` (-partial_warps): per-level warp field written beside the
+      prefix as ``{prefix}_WARP_lev00.nii.gz``.
+    - ``movie`` (-partials): the warped image at each level is accumulated and
+      written once at :meth:`finalize` as a single 4D file
+      ``{prefix}_partials.nii.gz`` -- a level-by-level "movie" of the warp.
 
-    def callback(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
+    Used as the qwarp level callback (it is callable); call :meth:`finalize`
+    after the run to flush the movie.
+    """
+
+    def __init__(
+        self, prefix: str, base_info: dict, padding: tuple[int, int, int] | None,
+        nx: int, ny: int, nz: int, *, folder: bool, warp_files: bool, movie: bool,
+    ):
+        self.prefix = prefix
+        self.basename = os.path.basename(prefix)
+        self.base_info = base_info
+        self.padding = padding
+        self.nx, self.ny, self.nz = nx, ny, nz
+        self.folder = folder
+        self.warp_files = warp_files
+        self.movie = movie
+        self.frames: list[Tensor] = []
+        self.levels_dir = f"{prefix}_levels"
+        if folder:
+            os.makedirs(self.levels_dir, exist_ok=True)
+
+    def _crop(self, warped: Tensor) -> Tensor:
+        warped = warped.detach().cpu()
+        px, py, pz = self.padding if self.padding is not None else (0, 0, 0)
+        if px or py or pz:
+            return warped[pz:pz + self.nz, py:py + self.ny, px:px + self.nx]
+        return warped
+
+    def __call__(self, level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
+        from fastfuncstuff.processing.io import save_image, save_warp_field
+
         lev_tag = f"lev{level:02d}"
-        xd_cpu = xd.detach().cpu()
-        yd_cpu = yd.detach().cpu()
-        zd_cpu = zd.detach().cpu()
-        save_warp_field(
-            xd_cpu, yd_cpu, zd_cpu,
-            os.path.join(levels_dir, f"{basename}_WARP_{lev_tag}.nii.gz"),
-            header_info=base_info,
-            padding=padding,
-            units="mm",
-        )
-        warped_full = warped.detach().cpu()
-        if pad_x or pad_y or pad_z:
-            warped_cropped = warped_full[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx]
-        else:
-            warped_cropped = warped_full
-        save_image(
-            warped_cropped,
-            os.path.join(levels_dir, f"{basename}_{lev_tag}.nii.gz"),
-            header_info=base_info,
-        )
+        if self.folder:
+            save_warp_field(
+                xd.detach().cpu(), yd.detach().cpu(), zd.detach().cpu(),
+                os.path.join(self.levels_dir, f"{self.basename}_WARP_{lev_tag}.nii.gz"),
+                header_info=self.base_info, padding=self.padding, units="mm",
+            )
+            save_image(
+                self._crop(warped),
+                os.path.join(self.levels_dir, f"{self.basename}_{lev_tag}.nii.gz"),
+                header_info=self.base_info,
+            )
+        if self.warp_files:
+            save_warp_field(
+                xd.detach().cpu(), yd.detach().cpu(), zd.detach().cpu(),
+                f"{self.prefix}_WARP_{lev_tag}.nii.gz",
+                header_info=self.base_info, padding=self.padding, units="mm",
+            )
+        if self.movie:
+            self.frames.append(self._crop(warped))
 
-    return callback
+    def finalize(self) -> None:
+        """Write the accumulated per-level warped images as one 4D movie."""
+        if not (self.movie and self.frames):
+            return
+        from fastfuncstuff.processing.io import save_image
+
+        movie = torch.stack(self.frames, dim=0)  # (n_levels, nz, ny, nx)
+        save_image(movie, f"{self.prefix}_partials.nii.gz", header_info=self.base_info)
+        self.frames.clear()
 
 
 def _build_timeseries_base(
@@ -991,7 +1061,13 @@ def main(argv: list[str] | None = None) -> int:
         use_quintic=args.quintic,
         use_lite=not args.nolite,
         workhard=tuple(args.workhard) if args.workhard else (0, -1),
-        cost_method="lpa" if args.lpa else ("pearson" if args.pear else "pearclp"),
+        cost_method=(
+            "lpc" if args.lpc
+            else "lpa" if args.lpa
+            else "lpa_alt" if args.lpa_alt
+            else "pearson" if args.pear
+            else "pearclp"
+        ),
         penalty_factor=args.penfac,
         penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,
@@ -1005,6 +1081,8 @@ def main(argv: list[str] | None = None) -> int:
         lpa_kernel=args.lpa_kernel,
         level_stop_tol=args.level_stop,
         compile=args.compile,
+        pyramid_factor=args.pyramid,
+        reject_worse_levels=not args.keep_worse_levels,
     )
 
     if args.blur is not None:
@@ -1070,9 +1148,13 @@ def main(argv: list[str] | None = None) -> int:
     # Load or compute weight
     weight = None
     if args.autoweight:
-        # Automask base, apply mask to base, then smooth for soft-edged weight
-        mask_bin = automask(base_3d.float(), device=torch.device("cpu"))
-        masked_base = base_3d.float() * mask_bin.float()
+        # Automask base, apply mask to base, then smooth for soft-edged weight.
+        # automask is pure conv3d/tensor ops; run it on the user's device --
+        # forcing CPU here ran hundreds of conv3d passes single-threaded and
+        # dominated startup on large (e.g. 1mm anatomical) volumes.
+        base_dev = base_3d.float().to(device)
+        mask_bin = automask(base_dev, device=device)
+        masked_base = base_dev * mask_bin.float()
         weight = _gaussian_smooth_3d(masked_base, sigma=args.autoweight_blur)
         # Normalize to [0, 1]
         w_max = weight.max()
@@ -1115,21 +1197,31 @@ def main(argv: list[str] | None = None) -> int:
         warp_padding = None
         pad_x, pad_y, pad_z = 0, 0, 0
 
-    # Intermediate-warp callback (per-level dump). In timeseries mode, only
-    # the first volume gets the callback (warned below) — otherwise the
-    # _levels/ dir would balloon to one set per volume.
+    # Per-level dump callback:
+    #   -save_intermediates -> warp + image files in {prefix}_levels/
+    #   -partial_warps      -> per-level warp files beside the prefix
+    #   -partials           -> warped images concatenated into one 4D movie
+    #                          {prefix}_partials.nii.gz (flushed after the run)
+    # In timeseries mode only the first volume dumps (warned below).
     level_cb = None
-    if args.save_intermediates:
-        levels_dir = f"{prefix}_levels"
-        warp_basename_for_lev = os.path.basename(prefix)
-        level_cb = _make_level_callback(
-            levels_dir, warp_basename_for_lev, base_info, warp_padding,
-            nx, ny, nz,
+    if args.save_intermediates or args.partials or args.partial_warps:
+        level_cb = _LevelDumper(
+            prefix, base_info, warp_padding, nx, ny, nz,
+            folder=args.save_intermediates,
+            warp_files=args.partial_warps,
+            movie=args.partials,
         )
         if args.verb >= 1:
-            print(f"Saving per-level intermediates to: {levels_dir}/")
+            outs = []
+            if args.save_intermediates:
+                outs.append(f"warp+image files in {prefix}_levels/")
+            if args.partial_warps:
+                outs.append(f"per-level warps {prefix}_WARP_lev##.nii.gz")
+            if args.partials:
+                outs.append(f"warped-image movie {prefix}_partials.nii.gz")
+            print("Per-level output: " + "; ".join(outs))
             if timeseries_mode:
-                print("  NOTE: timeseries mode — only volume 0 will dump intermediates")
+                print("  NOTE: timeseries mode — only volume 0 dumps per-level output")
 
     # --- Process volumes ---
     # Enable TF32 matmul precision on Ampere+ GPUs (free perf, ~1e-5 precision)
@@ -1493,6 +1585,13 @@ def main(argv: list[str] | None = None) -> int:
         save_image(resampled, out_path, header_info=dxyz_info)
         if args.verb >= 1:
             print(f"Resampled output to {args.dxyz}mm: {out_path}")
+
+    # Flush the per-level warped-image movie (-partials), if requested.
+    if level_cb is not None:
+        n_movie = len(level_cb.frames)
+        level_cb.finalize()
+        if args.verb >= 1 and args.partials and n_movie:
+            print(f"Per-level movie: {prefix}_partials.nii.gz ({n_movie} levels)")
 
     elapsed = time.time() - t0
     if args.verb >= 1:

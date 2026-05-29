@@ -183,6 +183,34 @@ class TestDataTypeHandling:
         read_data = read_img.get_fdata()
         assert read_data.dtype in [np.float32, np.float64], "Should preserve float type"
 
+    def test_float32_not_quantized_by_int_header(self, temp_output_dir):
+        """save_nifti must write float32 data as float32 even when the supplied
+        header was copied from an int16 input -- otherwise the result is silently
+        quantized to int16 and the AFNI extension's NIfTI_nums datatype no longer
+        matches the file (AFNI's 'dimensions altered' warning)."""
+        import re
+
+        from fastfuncstuff.io.afni import _NIFTI_ECODE_AFNI, save_nifti
+
+        hdr = nib.Nifti1Header()
+        hdr.set_data_dtype(np.int16)
+        xml = (
+            '<?xml version="1.0" ?>\n<AFNI_attributes\n  self_idcode="AFN_old"\n'
+            '  NIfTI_nums="6,7,8,1,1,4"\n  ni_form="ni_group" >\n</AFNI_attributes>\n'
+        )
+        hdr.extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode()))
+
+        data = np.random.rand(6, 7, 8).astype(np.float32)
+        out = temp_output_dir / "dtype_sync.nii.gz"
+        save_nifti(data, str(out), affine=np.eye(4), header=hdr)
+
+        img = nib.load(str(out))
+        assert int(img.header["datatype"]) == 16, "on-disk dtype should be float32"
+        assert np.allclose(np.asarray(img.dataobj), data, atol=1e-5), "data must not be quantized"
+        ext = next(e for e in img.header.extensions if e.get_code() == _NIFTI_ECODE_AFNI)
+        nums = re.search(r'NIfTI_nums="([^"]*)"', ext.content.decode()).group(1)
+        assert nums.endswith(",16"), f"NIfTI_nums datatype should match float32: {nums}"
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""

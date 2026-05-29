@@ -20,8 +20,12 @@ from fastfuncstuff.processing.cost_blok import (
     auto_blok_radius,
     local_pearson_value,
     local_pearson_value_batched,
+    local_pearson_value_pairs,
     lpa_cost,
+    lpa_value_pairs,
     lpc_cost,
+    lpc_value_pairs,
+    prepare_blok_pairs,
 )
 
 DEV = torch.device("cpu")
@@ -62,6 +66,67 @@ class TestBlokGeometry:
 # ---------------------------------------------------------------------------
 # Local Pearson (lpc / lpa) behaviour
 # ---------------------------------------------------------------------------
+
+
+class TestLocalPearsonPairs:
+    """Per-patch batched local Pearson (3dQwarp's B-independent-pairs layout)."""
+
+    def _fisher_z_quarter(self, x, y, w):
+        sw = w.sum()
+        xv = (w * x * x).sum() - (w * x).sum() ** 2 / sw
+        yv = (w * y * y).sum() - (w * y).sum() ** 2 / sw
+        xy = (w * x * y).sum() - (w * x).sum() * (w * y).sum() / sw
+        r = (xy / (xv * yv).clamp(min=1e-24).sqrt()).clamp(-0.9999, 0.9999)
+        z = torch.log((1 + r) / (1 - r))
+        return 0.25 * z * z.abs()
+
+    def test_single_blok_matches_fisher_z(self):
+        torch.manual_seed(0)
+        B, V = 4, 400
+        base = torch.randn(B, V)
+        warped = 0.7 * base + 0.3 * torch.randn(B, V)
+        weight = torch.rand(B, V)
+        prep = prepare_blok_pairs(torch.zeros(B, V, dtype=torch.long), nblok=1)
+        val = local_pearson_value_pairs(base, warped, weight, prep)
+        ref = torch.stack([self._fisher_z_quarter(base[b], warped[b], weight[b]) for b in range(B)])
+        assert torch.allclose(val, ref, atol=1e-5)
+
+    def test_mincor_gates_sparse_blok(self):
+        # A blok with < 9 points contributes nothing -> value 0.
+        V = 400
+        base = torch.randn(1, V)
+        idx = torch.zeros(1, V, dtype=torch.long)
+        idx[0, 5:] = -1  # only 5 valid voxels
+        prep = prepare_blok_pairs(idx, nblok=1)
+        val = local_pearson_value_pairs(base, torch.randn(1, V), torch.rand(1, V), prep)
+        assert float(val[0]) == 0.0
+
+    def test_differentiable_through_warped(self):
+        B, V = 3, 300
+        base = torch.randn(B, V)
+        warped = torch.randn(B, V, requires_grad=True)
+        prep = prepare_blok_pairs(torch.zeros(B, V, dtype=torch.long), nblok=1)
+        local_pearson_value_pairs(base, warped, torch.rand(B, V), prep).sum().backward()
+        assert torch.isfinite(warped.grad).all() and warped.grad.abs().sum() > 0
+
+    def test_compact_binning_bounds_memory(self):
+        # Global lattice has many bloks but each patch touches one -> the compact
+        # bin count is per-patch, not B * nblok_global.
+        B, V, nblok = 500, 343, 9000
+        idx = torch.randint(0, nblok, (B, 1)).expand(B, V).contiguous()
+        prep = prepare_blok_pairs(idx, nblok)
+        assert prep.n_bins <= B  # one distinct blok per patch
+
+    def test_lpc_is_negated_lpa_abs(self):
+        torch.manual_seed(1)
+        B, V = 2, 400
+        base = torch.randn(B, V)
+        warped = torch.randn(B, V)
+        weight = torch.rand(B, V)
+        prep = prepare_blok_pairs(torch.zeros(B, V, dtype=torch.long), nblok=1)
+        val = local_pearson_value_pairs(base, warped, weight, prep)
+        assert torch.allclose(lpc_value_pairs(base, warped, weight, prep), -val)
+        assert torch.allclose(lpa_value_pairs(base, warped, weight, prep), val.abs())
 
 
 class TestLocalPearson:

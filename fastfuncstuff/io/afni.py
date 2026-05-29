@@ -1962,6 +1962,12 @@ def save_nifti(
     # partial loads, or any processing that changed the volume count)
     if header is not None:
         header.set_data_shape(data.shape)
+        # Sync on-disk dtype to the data. A header copied from a short/int input
+        # otherwise forces nibabel to quantize our float32 results to int16 on
+        # write (precision loss), and leaves the AFNI extension's NIfTI_nums
+        # datatype mismatched -- which makes AFNI warn that the file's
+        # "dimensions altered since AFNI extension was added".
+        header.set_data_dtype(data.dtype)
 
     # Update AFNI NIfTI extension if present (ecode=4):
     #   - new IDCODE so AFNI treats this as a distinct dataset
