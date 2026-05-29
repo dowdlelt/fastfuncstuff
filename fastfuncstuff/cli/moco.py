@@ -14,6 +14,7 @@ import time
 
 import torch
 
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
 from fastfuncstuff.processing.affine import save_matrix_1D
 from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
@@ -22,8 +23,7 @@ from fastfuncstuff.processing.ffs_moco import (
     save_moco_1D,
     save_moco_dfile,
 )
-from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
+from fastfuncstuff.processing.io import load_image, save_image
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,7 +56,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="input_file",
         help="4D timeseries (.nii/.nii.gz) [required]",
     )
-    io_group.add_argument("-prefix", required=True, help="Output prefix [required]")
+    io_group.add_argument(
+        "-prefix",
+        default=None,
+        help="Output prefix for the corrected timeseries. Omit to skip writing "
+        "it (e.g. when you only want motion params or -save_mean).",
+    )
     io_group.add_argument(
         "-base",
         default="0",
@@ -75,35 +80,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     method_group.add_argument(
         "-maxiter",
         type=int,
-        default=5,
-        help="GN iterations per volume (default: 5, was 23)",
+        default=23,
+        help="Max GN iterations per volume (default: 23, matches 3dvolreg)",
     )
     method_group.add_argument(
         "-dxy_thresh",
         type=float,
-        default=0.07,
-        help="Translation convergence threshold in voxels (default: 0.07)",
+        default=0.01,
+        help="Translation convergence threshold in voxels (default: 0.01, matches 3dvolreg -x_thresh)",
     )
     method_group.add_argument(
         "-dph_thresh",
         type=float,
-        default=0.21,
-        help="Rotation convergence threshold in degrees (default: 0.21)",
+        default=0.02,
+        help="Rotation convergence threshold in degrees (default: 0.02, matches 3dvolreg -rot_thresh)",
     )
     method_group.add_argument(
         "-twopass", action="store_true", help="Coarse blur + fine pass"
     )
     method_group.add_argument(
-        "-no_chain",
-        dest="no_chain",
+        "-chain_init",
+        dest="chain_init",
         action="store_true",
-        help="Don't chain-initialize from previous volume",
+        help="Warm-start each volume's estimate from the previous volume. "
+        "Faster but tends to under-detect TR-to-TR motion; off by default so "
+        "every volume is estimated independently (matches 3dvolreg sensitivity).",
     )
     method_group.add_argument(
-        "-nochain",
-        dest="no_chain",
+        "-chain-init",
+        dest="chain_init",
         action="store_true",
-        help="Alias for -no_chain.",
+        help="Alias for -chain_init.",
+    )
+    # Deprecated no-ops: chaining is now off by default.
+    method_group.add_argument(
+        "-no_chain", dest="no_chain", action="store_true", help=argparse.SUPPRESS
+    )
+    method_group.add_argument(
+        "-nochain", dest="no_chain", action="store_true", help=argparse.SUPPRESS
     )
     method_group.add_argument(
         "-automask", action="store_true", help="Use automask for weighting"
@@ -152,6 +166,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="final_interp",
         help="For output (default: wsinc5)",
     )
+    interp_group.add_argument(
+        "-no_shear",
+        dest="no_shear",
+        action="store_true",
+        help="Disable shear-based rigid resampling for the final pass "
+        "(AFNI THD_rota_vol method); use the general affine resampler instead.",
+    )
+    interp_group.add_argument(
+        "-no-shear", dest="no_shear", action="store_true", help=argparse.SUPPRESS
+    )
 
     # --- Output files ---
     out_group = parser.add_argument_group("Output files")
@@ -170,8 +194,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     out_group.add_argument(
         "-save_mean",
-        action="store_true",
-        help="Save mean of output timeseries as mean_{prefix_basename}{ext}",
+        default=None,
+        metavar="PREFIX",
+        help="Save the temporal mean of the corrected series to this prefix. "
+        "Can be used without -prefix to skip writing the full timeseries.",
     )
 
     # --- Hardware ---
@@ -193,6 +219,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     """Main CLI entry point for ffs_moco."""
     args = parse_args(argv)
+
+    # Guard against a run that would produce nothing.
+    _any_output = any(
+        getattr(args, name, None) is not None
+        for name in ("prefix", "save_mean", "1Dfile", "1Dmatrix_save", "dfile",
+                     "maxdisp1D", "iterfile")
+    )
+    if not _any_output:
+        print(
+            "Error: no outputs requested. Give at least one of -prefix, "
+            "-save_mean, -1Dfile, -1Dmatrix_save, -dfile, -maxdisp1D, -iterfile.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # --- Device selection ---
     if args.device:
@@ -233,8 +273,13 @@ def main(argv: list[str] | None = None) -> None:
             base_vol = base_vol[0]
         base_index = 0
 
+    # Resampling is only needed if we will emit a corrected series or its mean.
+    # (Writing the timeseries is gated separately on -prefix below.)
+    need_aligned = args.prefix is not None or args.save_mean is not None
+
     # --- Build config ---
     config = MocoConfig(
+        skip_resample=not need_aligned,
         base_index=base_index,
         cost=args.cost,
         interp=args.interp,
@@ -242,7 +287,8 @@ def main(argv: list[str] | None = None) -> None:
         max_iter=args.maxiter,
         twopass=args.twopass,
         blur_fwhm=args.blur,
-        chain_init=not args.no_chain,
+        chain_init=args.chain_init,
+        use_shear=not args.no_shear,
         automask=args.automask,
         weight_automask=args.weight_automask,
         dxy_thresh=args.dxy_thresh,
@@ -262,14 +308,16 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Total registration: {time.time() - t1:.2f}s")
 
     # --- Save outputs ---
-    pfx = parse_prefix(args.prefix)
-    out_path = pfx.as_file()
-    save_image(result.aligned, out_path, header_info=header_info)
-    if verb >= 1:
-        print(f"Saved: {out_path}")
+    # Corrected timeseries (skipped when -prefix is omitted).
+    if args.prefix is not None:
+        out_path = parse_prefix(args.prefix).as_file()
+        save_image(result.aligned, out_path, header_info=header_info)
+        if verb >= 1:
+            print(f"Saved: {out_path}")
 
-    if args.save_mean:
-        mean_path = derive_mean_output_path(out_path)
+    # Temporal mean of the corrected series, to its own prefix.
+    if args.save_mean is not None:
+        mean_path = parse_prefix(args.save_mean).as_file()
         mean_image = result.aligned.mean(dim=0)
         save_image(mean_image, mean_path, header_info=header_info)
         if verb >= 1:

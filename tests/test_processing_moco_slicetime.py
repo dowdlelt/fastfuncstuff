@@ -38,9 +38,11 @@ class TestMocoConfig:
         cfg = MocoConfig()
         assert cfg.base_index == 0
         assert cfg.cost == "wls"
-        assert cfg.max_iter == 5
-        assert cfg.dxy_thresh == pytest.approx(0.07)
-        assert cfg.dph_thresh == pytest.approx(0.21)
+        # defaults match 3dvolreg (-maxite 23, -x_thresh 0.01, -rot_thresh 0.02)
+        assert cfg.max_iter == 23
+        assert cfg.dxy_thresh == pytest.approx(0.01)
+        assert cfg.dph_thresh == pytest.approx(0.02)
+        assert cfg.chain_init is False  # independent per-volume estimation by default
         assert isinstance(cfg.chain_init, bool)
         assert isinstance(cfg.twopass, bool)
         assert cfg.device is None
