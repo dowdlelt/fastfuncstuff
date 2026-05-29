@@ -10,6 +10,7 @@ I have a slow CPU but I was able to get my hands on a reasonble GPU.
 The tools I like to use, namely AFNI are great, but they are really built to take advantage of server CPU setups.
 This project is an ongoing experiment - how well can current models port good code to a pytorch like set up.
 Python chosen not because of speed, of course, but because I can at least review the code for sanity.
+It also makes installion much easier - sure, pure CUDA/C++ would be faster but what a nightmare...
 These are offered as-is, no guarantees.
 The CLIs have been tested extensively in day-to-day use, and an CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
 
