@@ -635,6 +635,35 @@ class TestPyramid:
         assert c_warp < c_raw, f"pyramid warp did not improve: {c_warp:.4f} vs raw {c_raw:.4f}"
 
 
+class TestLevelCallback:
+    """Per-level dump callback backing -save_intermediates / -partials / -partial_warps."""
+
+    def _cb(self, tmp_path, sub, **kw):
+        from fastfuncstuff.cli.qwarp import _make_level_callback
+
+        return _make_level_callback(
+            str(tmp_path / sub), "p", None, None, 8, 8, 8, **kw
+        )
+
+    def test_images_only(self, tmp_path):
+        v = torch.zeros(8, 8, 8)
+        self._cb(tmp_path, "img", save_warps=False, save_images=True)(0, v, v, v, v)
+        assert (tmp_path / "img" / "p_lev00.nii.gz").exists()
+        assert not (tmp_path / "img" / "p_WARP_lev00.nii.gz").exists()
+
+    def test_warps_only(self, tmp_path):
+        v = torch.zeros(8, 8, 8)
+        self._cb(tmp_path, "wrp", save_warps=True, save_images=False)(1, v, v, v, v)
+        assert (tmp_path / "wrp" / "p_WARP_lev01.nii.gz").exists()
+        assert not (tmp_path / "wrp" / "p_lev01.nii.gz").exists()
+
+    def test_both_zero_padded(self, tmp_path):
+        v = torch.zeros(8, 8, 8)
+        self._cb(tmp_path, "both")(2, v, v, v, v)
+        assert (tmp_path / "both" / "p_lev02.nii.gz").exists()
+        assert (tmp_path / "both" / "p_WARP_lev02.nii.gz").exists()
+
+
 class TestWarpStateMutation:
     def test_warp_fields_independent(self):
         """Modifying one state's warp should not affect another."""

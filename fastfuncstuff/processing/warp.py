@@ -563,9 +563,10 @@ def _warpomatic_pyramid(
 
     if config.verb >= 1:
         print(f"qwarp_torch: pyramid coarse pass at {lx}x{ly}x{lz} (factor {f})")
-    # pad=False semantics: these are already on the padded grid. Pyramid off in
-    # the recursive call so it doesn't recurse further.
-    lo_cfg = replace(config, pyramid_factor=1)
+    # Pyramid off in the recursive call so it doesn't recurse further. Drop the
+    # level callback too: per-level dumps (-partials/-partial_warps) come from
+    # the full-resolution refine pass, not the downsampled coarse grid.
+    lo_cfg = replace(config, pyramid_factor=1, level_callback=None)
     _warpomatic(base_lo, source_lo, weight_lo, mask_lo, lo_state, lo_cfg, device)
 
     # Upsample the coarse warp to full resolution. Displacements are in voxel

@@ -196,6 +196,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "with -maxlev). In timeseries mode, only the FIRST volume's "
                             "intermediates are saved (the loop would otherwise produce "
                             "one set per volume — a lot of files)")
+    g_reg.add_argument("-partials", action="store_true",
+                       help="Save the resampled (warped) source volume after each "
+                            "refinement level, as {prefix}_lev00.nii.gz, _lev01, ... "
+                            "(zero-padded level next to the prefix). Like "
+                            "-save_intermediates but warped images only, written beside "
+                            "the prefix rather than in a {prefix}_levels/ dir. With "
+                            "-pyramid, partials cover the full-resolution refine levels.")
+    g_reg.add_argument("-partial_warps", action="store_true",
+                       help="Save the warp field after each refinement level, as "
+                            "{prefix}_WARP_lev00.nii.gz, _WARP_lev01, ... (zero-padded "
+                            "level next to the prefix). Combine with -partials to save "
+                            "both warped images and warps per level.")
 
     # ── Basis Functions ─────────────────────────────────────────────────
     g_basis = p.add_argument_group(
@@ -568,8 +580,16 @@ def _make_level_callback(
     base_info: dict,
     padding: tuple[int, int, int] | None,
     nx: int, ny: int, nz: int,
+    save_warps: bool = True,
+    save_images: bool = True,
 ):
-    """Build a level callback that writes per-level warp + warped image."""
+    """Build a level callback that writes per-level warp and/or warped image.
+
+    Filenames carry a zero-padded level tag (``_lev00``, ``_lev01``, ...).
+    ``save_warps``/``save_images`` select which artifacts to write, so the
+    same machinery backs -save_intermediates (both), -partials (images), and
+    -partial_warps (warps).
+    """
     from fastfuncstuff.processing.io import save_image, save_warp_field
 
     os.makedirs(levels_dir, exist_ok=True)
@@ -577,26 +597,25 @@ def _make_level_callback(
 
     def callback(level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
         lev_tag = f"lev{level:02d}"
-        xd_cpu = xd.detach().cpu()
-        yd_cpu = yd.detach().cpu()
-        zd_cpu = zd.detach().cpu()
-        save_warp_field(
-            xd_cpu, yd_cpu, zd_cpu,
-            os.path.join(levels_dir, f"{basename}_WARP_{lev_tag}.nii.gz"),
-            header_info=base_info,
-            padding=padding,
-            units="mm",
-        )
-        warped_full = warped.detach().cpu()
-        if pad_x or pad_y or pad_z:
-            warped_cropped = warped_full[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx]
-        else:
-            warped_cropped = warped_full
-        save_image(
-            warped_cropped,
-            os.path.join(levels_dir, f"{basename}_{lev_tag}.nii.gz"),
-            header_info=base_info,
-        )
+        if save_warps:
+            save_warp_field(
+                xd.detach().cpu(), yd.detach().cpu(), zd.detach().cpu(),
+                os.path.join(levels_dir, f"{basename}_WARP_{lev_tag}.nii.gz"),
+                header_info=base_info,
+                padding=padding,
+                units="mm",
+            )
+        if save_images:
+            warped_full = warped.detach().cpu()
+            if pad_x or pad_y or pad_z:
+                warped_cropped = warped_full[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx]
+            else:
+                warped_cropped = warped_full
+            save_image(
+                warped_cropped,
+                os.path.join(levels_dir, f"{basename}_{lev_tag}.nii.gz"),
+                header_info=base_info,
+            )
 
     return callback
 
@@ -1128,21 +1147,33 @@ def main(argv: list[str] | None = None) -> int:
         warp_padding = None
         pad_x, pad_y, pad_z = 0, 0, 0
 
-    # Intermediate-warp callback (per-level dump). In timeseries mode, only
-    # the first volume gets the callback (warned below) — otherwise the
-    # _levels/ dir would balloon to one set per volume.
+    # Per-level dump callback, shared by -save_intermediates (warp + image in a
+    # {prefix}_levels/ dir) and the granular -partials (images) / -partial_warps
+    # (warps) flags (written beside the prefix). In timeseries mode, only the
+    # first volume gets the callback (warned below) — otherwise it would balloon
+    # to one set per volume.
     level_cb = None
-    if args.save_intermediates:
-        levels_dir = f"{prefix}_levels"
+    if args.save_intermediates or args.partials or args.partial_warps:
+        save_imgs = args.partials or args.save_intermediates
+        save_wrps = args.partial_warps or args.save_intermediates
+        if args.save_intermediates:
+            levels_dir = f"{prefix}_levels"
+        else:
+            levels_dir = os.path.dirname(prefix) or "."
         warp_basename_for_lev = os.path.basename(prefix)
         level_cb = _make_level_callback(
             levels_dir, warp_basename_for_lev, base_info, warp_padding,
-            nx, ny, nz,
+            nx, ny, nz, save_warps=save_wrps, save_images=save_imgs,
         )
         if args.verb >= 1:
-            print(f"Saving per-level intermediates to: {levels_dir}/")
+            kinds = []
+            if save_imgs:
+                kinds.append("warped images")
+            if save_wrps:
+                kinds.append("warps")
+            print(f"Saving per-level {' + '.join(kinds)} to: {levels_dir}/ (_lev00, _lev01, ...)")
             if timeseries_mode:
-                print("  NOTE: timeseries mode — only volume 0 will dump intermediates")
+                print("  NOTE: timeseries mode — only volume 0 will dump per-level files")
 
     # --- Process volumes ---
     # Enable TF32 matmul precision on Ampere+ GPUs (free perf, ~1e-5 precision)
