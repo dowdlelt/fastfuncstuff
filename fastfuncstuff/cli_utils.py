@@ -1094,6 +1094,47 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
             "Repeatable: -ortvec_glob 'motion_run-*.1D' motion"
         ),
     )
+    parser_or_group.add_argument(
+        "-ortvec_concat",
+        "-ortvec-concat",
+        action="append",
+        nargs=2,
+        metavar=("PATTERN", "LABEL"),
+        help=(
+            "Glob matching N already-full-length per-run files (e.g. AFNI "
+            "mot_demean.r0N.1D — each spans every run with zeros outside its own). "
+            "Expanded into N -ortvec entries labelled LABEL01, LABEL02, … "
+            "(width auto-padded from n_runs). Repeatable: "
+            "-ortvec_concat 'mot_demean.r0*.1D' motion"
+        ),
+    )
+
+
+def expand_ortvec_concat(
+    pattern: str, label: str, n_runs: int,
+) -> list[tuple[Path, str]]:
+    """Expand a ``-ortvec_concat PATTERN LABEL`` invocation into a list of
+    ``(file, suffixed_label)`` pairs, ordered by inferred run index.
+
+    Each matched file is expected to be already full-length (the AFNI
+    ``mot_demean.r0N.1D`` shape), so the caller should treat the result as
+    a sequence of ``-ortvec`` (mode 1) entries. Labels are zero-padded to
+    the width of ``n_runs``: ``motion01``, ``motion02``, ….
+    """
+    matched = sorted(Path(p) for p in glob_module.glob(pattern))
+    if not matched:
+        raise ValueError(f"-ortvec_concat {pattern!r}: matched no files")
+    run_indices_1 = [
+        i + 1 for i in _infer_run_indices_from_filenames(
+            [p.name for p in matched], n_runs=n_runs,
+        )
+    ]
+    width = max(2, len(str(n_runs)))
+    return sorted(
+        ((path, f"{label}{idx:0{width}d}") for path, idx in
+         zip(matched, run_indices_1, strict=True)),
+        key=lambda t: t[1],
+    )
 
 
 def collect_nuisance_blocks(
@@ -1104,9 +1145,10 @@ def collect_nuisance_blocks(
 ) -> list[NuisanceBlock]:
     """Translate argparse Namespace fields into a list of NuisanceBlock.
 
-    Recognises `args.ortvec`, `args.ortvec_run`, `args.ortvec_glob` — any
-    combination, all repeatable, all optional. Designed to plug into any
-    CLI that called `add_ortvec_arguments` on its parser.
+    Recognises ``args.ortvec``, ``args.ortvec_run``, ``args.ortvec_glob``,
+    ``args.ortvec_concat`` — any combination, all repeatable, all optional.
+    Designed to plug into any CLI that called ``add_ortvec_arguments`` on
+    its parser.
     """
     blocks: list[NuisanceBlock] = []
     for path, label in getattr(args, "ortvec", None) or []:
@@ -1143,6 +1185,21 @@ def collect_nuisance_blocks(
                 f"  -ortvec_glob: {pattern} (label={label}) → "
                 f"{len(matched)} run(s) assigned"
             )
+    # -ortvec_concat: glob over already-full-length per-run files; each becomes
+    # its own full-length NuisanceBlock with an auto-suffixed label. Equivalent
+    # to writing N -ortvec calls.
+    for pattern, label in getattr(args, "ortvec_concat", None) or []:
+        n_runs = len(run_starts)
+        for path, suffixed_label in expand_ortvec_concat(pattern, label, n_runs):
+            blocks.append(
+                make_nuisance_block_from_full_length(
+                    path, suffixed_label, run_starts, n_timepoints,
+                )
+            )
+            if verbose:
+                print(
+                    f"  -ortvec_concat: {path} (label={suffixed_label})"
+                )
     return blocks
 
 
