@@ -177,11 +177,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="Run extra optimization passes for levels START..END. "
                             "E.g. -workhard 0 2 works harder on the first 3 levels")
     g_reg.add_argument("-pyramid", nargs="?", type=int, const=2, default=1, metavar="FACTOR",
-                       help="Coarse-to-fine resolution pyramid: solve the coarse (global) "
-                            "levels on a volume downsampled by FACTOR per axis, then refine "
-                            "the fine levels at full resolution. The coarse levels dominate "
-                            "runtime on large (e.g. 1mm) volumes and their warp is smooth, so "
-                            "an N× downsample is ~N³ less work there. Bare -pyramid uses "
+                       help="Multi-octave coarse-to-fine resolution pyramid. Builds a "
+                            "halving scale ladder from FACTOR down to full res "
+                            "(4 => 4,2,1; 2 => 2,1): the global warp is solved at the "
+                            "coarsest scale (factor**3 less work -- microtime), and each "
+                            "finer octave is seeded by the previous one so it only refines "
+                            "a few levels with fast early stopping. Bare -pyramid uses "
                             "factor 2. Opt-in; validate against the non-pyramid result "
                             "[default: off]")
     g_reg.add_argument("-keep_worse_levels", action="store_true",
@@ -285,10 +286,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_cost.add_argument("-pear", action="store_true",
                         help="Plain (unclipped) Pearson correlation")
     g_cost.add_argument("-lpa", action="store_true",
-                        help="Local Pearson Absolute: computes Pearson in local Gaussian "
-                             "neighborhoods, applies Fisher Z-transform (atanh), and uses "
-                             "z*|z| weighting. Produces larger warps than pearclp but can "
-                             "capture finer local structure. Slower (~3x)")
+                        help="Local Pearson Absolute (AFNI-faithful): local Pearson over a "
+                             "single global truncated-octahedron blok lattice (the same "
+                             "GA_BLOK / GA_pearson_local machinery 3dQwarp uses), Fisher-Z "
+                             "transform + |.|. Captures fine local structure")
+    g_cost.add_argument("-lpc", action="store_true",
+                        help="Local Pearson Correlation (AFNI-faithful, cross-modal): same "
+                             "blok local Pearson as -lpa but signed (negated), for "
+                             "contrast-inverted base/source (e.g. EPI-to-anat)")
+    g_cost.add_argument("-lpa_alt", action="store_true",
+                        help="Older LPA: local Pearson via separable Gaussian/box "
+                             "convolution neighborhoods (not blok-based). Kept for "
+                             "comparison; tune with -lpa_sigma / -lpa_kernel")
     g_cost.add_argument("-lpa_sigma", type=float, default=4.0, metavar="VOXELS",
                         help="Kernel parameter for LPA local neighborhoods. "
                              "For gauss: sigma (effective radius ~3x). "
@@ -1024,7 +1033,13 @@ def main(argv: list[str] | None = None) -> int:
         use_quintic=args.quintic,
         use_lite=not args.nolite,
         workhard=tuple(args.workhard) if args.workhard else (0, -1),
-        cost_method="lpa" if args.lpa else ("pearson" if args.pear else "pearclp"),
+        cost_method=(
+            "lpc" if args.lpc
+            else "lpa" if args.lpa
+            else "lpa_alt" if args.lpa_alt
+            else "pearson" if args.pear
+            else "pearclp"
+        ),
         penalty_factor=args.penfac,
         penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,

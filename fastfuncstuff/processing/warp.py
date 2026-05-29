@@ -46,6 +46,12 @@ from .cost import (
     _auto_clip,
     batched_lpa_cost,
 )
+from .cost_blok import (
+    assign_bloks,
+    lpa_value_pairs,
+    lpc_value_pairs,
+    prepare_blok_pairs,
+)
 from .interp import (
     batched_compose_and_interpolate,
     trilinear_interpolate,
@@ -97,7 +103,17 @@ class QwarpConfig:
     """(start_lev, end_lev) range for double-pass optimization."""
 
     cost_method: str = "pearclp"
-    """Cost function: 'pearclp' (clipped Pearson), 'pearson', or 'lpa'."""
+    """Cost function: 'pearclp' (clipped Pearson), 'pearson', 'lpc' / 'lpa'
+    (AFNI-faithful local Pearson over a single global truncated-octahedron blok
+    lattice, matching 3dQwarp -- lpc negates, lpa takes |.|), or 'lpa_alt' (the
+    older Gaussian/box separable-convolution local Pearson)."""
+
+    blok_rad: float = 6.54321
+    """Blok radius in voxels for the lpc/lpa cost. Matches 3dQwarp's fixed tohd
+    radius (create_INCORR_BLOK_set(..., GA_BLOK_TOHD, 6.54321))."""
+
+    lpc_ppow: float = 1.0
+    """AFNI ppow exponent on |Fisher-z| in the local-Pearson aggregation."""
 
     penalty_factor: float = 0.033
     """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
@@ -536,67 +552,98 @@ def _warpomatic_pyramid(
     base: Tensor, source: Tensor, weight: Tensor, mask: Tensor,
     state: WarpState, config: QwarpConfig, device: torch.device,
 ) -> None:
-    """Coarse-to-fine resolution pyramid (opt-in via config.pyramid_factor).
+    """Multi-octave coarse-to-fine resolution pyramid (opt-in, pyramid_factor>1).
 
-    Solves the coarse levels on a volume downsampled by ``pyramid_factor`` per
-    axis -- where the warp is smooth and low-frequency, so full resolution is
-    wasted compute -- then upsamples the warp to seed full-resolution
-    refinement of the fine levels. ``state`` is the full-resolution state
-    (zero warp). All volumes are the padded full-resolution grid.
+    Builds a halving scale ladder from ``pyramid_factor`` down to full res
+    (e.g. 4 -> [4, 2, 1], 2 -> [2, 1]). The global warp is solved at the
+    coarsest scale, where the volume is factor**3 smaller -- microtime -- and
+    every finer octave is *seeded* by upsampling the previous octave's warp and
+    only refines a few levels from the hand-off point. Good seeds mean early
+    stopping fires fast at each scale, so the expensive "full schedule at N x"
+    of a single-hop pyramid is replaced by "a few seeded levels per octave".
+
+    ``state`` is the full-resolution state (zero warp). All volumes are the
+    padded full-resolution grid.
     """
     import torch.nn.functional as F
 
-    f = config.pyramid_factor
     nz, ny, nx = base.shape
-    lz = max(16, round(nz / f))
-    ly = max(16, round(ny / f))
-    lx = max(16, round(nx / f))
 
-    def _down(v: Tensor) -> Tensor:
-        return F.interpolate(
-            v[None, None].float(), size=(lz, ly, lx), mode="trilinear", align_corners=False
+    # Descending halving ladder down to full resolution.
+    scales: list[int] = []
+    s = max(1, config.pyramid_factor)
+    while s >= 2:
+        scales.append(s)
+        s //= 2
+    scales.append(1)
+
+    def _resize(v: Tensor, size: tuple[int, int, int], is_mask: bool = False) -> Tensor:
+        out = F.interpolate(
+            v[None, None].float(), size=size, mode="trilinear", align_corners=False
         )[0, 0]
+        return (out > 0.5).byte() if is_mask else out
 
-    base_lo = _down(base)
-    source_lo = _down(source)
-    weight_lo = _down(weight)
-    mask_lo = (_down(mask) > 0.5).byte()
+    # prev carries the previous octave's warp + grid + last level reached.
+    prev: tuple[Tensor, Tensor, Tensor, int, int, int, int] | None = None
+    work: WarpState | None = None
 
-    lo_state = WarpState(nx=lx, ny=ly, nz=lz)
-    lo_state.xd = torch.zeros(lz, ly, lx, device=device)
-    lo_state.yd = torch.zeros(lz, ly, lx, device=device)
-    lo_state.zd = torch.zeros(lz, ly, lx, device=device)
-    lo_state.warped_source = source_lo.clone()
+    for scale in scales:
+        if scale == 1:
+            gz, gy, gx = nz, ny, nx
+            b_s, src_s, w_s, m_s = base, source, weight, mask
+        else:
+            gz = max(16, round(nz / scale))
+            gy = max(16, round(ny / scale))
+            gx = max(16, round(nx / scale))
+            size = (gz, gy, gx)
+            b_s = _resize(base, size)
+            src_s = _resize(source, size)
+            w_s = _resize(weight, size)
+            m_s = _resize(mask, size, is_mask=True)
 
-    if config.verb >= 1:
-        print(f"qwarp_torch: pyramid coarse pass at {lx}x{ly}x{lz} (factor {f})")
-    # Pyramid off in the recursive call so it doesn't recurse further. Drop the
-    # level callback too: per-level dumps (-partials/-partial_warps) come from
-    # the full-resolution refine pass, not the downsampled coarse grid.
-    lo_cfg = replace(config, pyramid_factor=1, level_callback=None)
-    _warpomatic(base_lo, source_lo, weight_lo, mask_lo, lo_state, lo_cfg, device)
+        st = WarpState(nx=gx, ny=gy, nz=gz)
+        if prev is None:
+            # Coarsest octave: solve the global warp from scratch (microtime).
+            st.xd = torch.zeros(gz, gy, gx, device=device)
+            st.yd = torch.zeros(gz, gy, gx, device=device)
+            st.zd = torch.zeros(gz, gy, gx, device=device)
+            st.warped_source = src_s.clone()
+            start_level = 0
+            if config.verb >= 1:
+                print(f"qwarp_torch: pyramid 1/{scale} at {gx}x{gy}x{gz} (global warp)")
+        else:
+            pxd, pyd, pzd, pgz, pgy, pgx, plast = prev
+            # Upsample the seed warp; displacements are voxel units, so scale by
+            # the per-axis resolution ratio (~2 between octaves).
+            st.xd = _resize(pxd, (gz, gy, gx)) * (gx / pgx)
+            st.yd = _resize(pyd, (gz, gy, gx)) * (gy / pgy)
+            st.zd = _resize(pzd, (gz, gy, gx)) * (gz / pgz)
+            st.warped_source = warp_image_linear(src_s, st.xd, st.yd, st.zd)
+            # Resume one level coarser than where the previous octave stopped
+            # (one-level overlap so no spatial-frequency band is skipped).
+            start_level = max(1, plast - 1)
+            if config.verb >= 1:
+                tag = "full res" if scale == 1 else f"1/{scale}"
+                print(f"qwarp_torch: pyramid {tag} at {gx}x{gy}x{gz}, refine from lev={start_level}")
 
-    # Upsample the coarse warp to full resolution. Displacements are in voxel
-    # units, so they scale by the per-axis resolution ratio (~f).
-    sx, sy, sz = nx / lx, ny / ly, nz / lz
+        # Recurse with pyramid off. Per-level dumps (-partials/-partial_warps)
+        # only fire at full resolution, not on the downsampled octaves.
+        cfg_s = replace(
+            config,
+            pyramid_factor=1,
+            start_level=start_level,
+            level_callback=(config.level_callback if scale == 1 else None),
+        )
+        _warpomatic(b_s, src_s, w_s, m_s, st, cfg_s, device)
+        prev = (st.xd, st.yd, st.zd, gz, gy, gx, st.last_level)
+        work = st
 
-    def _up(v: Tensor) -> Tensor:
-        return F.interpolate(
-            v[None, None], size=(nz, ny, nx), mode="trilinear", align_corners=False
-        )[0, 0]
-
-    state.xd = _up(lo_state.xd) * sx
-    state.yd = _up(lo_state.yd) * sy
-    state.zd = _up(lo_state.zd) * sz
-    state.warped_source = warp_image_linear(source, state.xd, state.yd, state.zd)
-
-    # Resume full-resolution refinement where the coarse pass left off, with a
-    # one-level overlap so no spatial-frequency band is skipped at the seam.
-    start = max(1, lo_state.last_level - 1)
-    if config.verb >= 1:
-        print(f"qwarp_torch: pyramid full-res refine from lev={start}")
-    refine_cfg = replace(config, pyramid_factor=1, start_level=start)
-    _warpomatic(base, source, weight, mask, state, refine_cfg, device)
+    # Hand the full-resolution result back to the caller's state.
+    assert work is not None
+    state.xd, state.yd, state.zd = work.xd, work.yd, work.zd
+    state.warped_source = work.warped_source
+    state.cost = work.cost
+    state.last_level = work.last_level
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +677,18 @@ def _warpomatic(
 
     base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
     source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
+
+    # AFNI-faithful local Pearson (lpc/lpa): one global truncated-octahedron
+    # blok lattice over the whole grid; each patch is later scored over the
+    # bloks that fall inside it. Built once per grid (so once per pyramid octave).
+    blok_index_vol = None
+    nblok = 0
+    if config.cost_method in ("lpc", "lpa"):
+        bs = assign_bloks(
+            (nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0)
+        )
+        blok_index_vol = bs.index.reshape(nz, ny, nx)
+        nblok = bs.nblok
 
     # Compute initial cost so it's never the 666.666 sentinel
     with torch.no_grad():
@@ -708,6 +767,8 @@ def _warpomatic(
                     base_clip=base_clip,
                     source_clip=source_clip,
                     max_iter=config.batch_optimizer_iters_lev0,
+                    blok_index_vol=blok_index_vol,
+                    nblok=nblok,
                 )
             else:
                 _improve_warp_serial(
@@ -720,6 +781,8 @@ def _warpomatic(
                     pen_fac=0.0,
                     base_clip=base_clip,
                     source_clip=source_clip,
+                    blok_index_vol=blok_index_vol,
+                    nblok=nblok,
                 )
 
         # The batched path doesn't set state.cost (only the serial path does),
@@ -921,6 +984,8 @@ def _warpomatic(
                         pen_fac=pen_fff,
                         base_clip=base_clip,
                         source_clip=source_clip,
+                        blok_index_vol=blok_index_vol,
+                        nblok=nblok,
                     )
 
                 # Serial fallback for odd-sized boundary patches
@@ -935,6 +1000,8 @@ def _warpomatic(
                         pen_fac=pen_fff,
                         base_clip=base_clip,
                         source_clip=source_clip,
+                        blok_index_vol=blok_index_vol,
+                        nblok=nblok,
                     )
 
                 # warped_source already updated in _improve_warp_batched and
@@ -1037,6 +1104,8 @@ def _improve_warp_batched(
     base_clip: tuple[float, float] | None = None,
     source_clip: tuple[float, float] | None = None,
     max_iter: int | None = None,
+    blok_index_vol: Tensor | None = None,
+    nblok: int = 0,
 ) -> None:
     """Optimize ALL patches in one checkerboard phase simultaneously on GPU.
 
@@ -1078,10 +1147,20 @@ def _improve_warp_batched(
         for p in patches
     ])
 
-    # Pre-compute cost function fixed parts
-    use_lpa = config.cost_method == "lpa"
+    # Cost selection: blok-based local Pearson (lpc/lpa, AFNI-faithful),
+    # the older convolution LPA (lpa_alt), or INCOR (pearson/pearclp).
+    use_blok = config.cost_method in ("lpc", "lpa")
+    use_conv_lpa = config.cost_method == "lpa_alt"
+    blok_prep = None
+    if use_blok:
+        blok_idx_patches = torch.stack([
+            blok_index_vol[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1].reshape(-1)
+            for p in patches
+        ])
+        blok_prep = prepare_blok_pairs(blok_idx_patches, nblok)
+        _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
     batch_incor = None
-    if not use_lpa:
+    if not (use_blok or use_conv_lpa):
         batch_incor = BatchedIncrementalCorrelation(
             method=config.cost_method,
             base_clip=base_clip,
@@ -1159,8 +1238,10 @@ def _improve_warp_batched(
 
         warped_vals = warped_vals * mask_patches
 
-        # Batched cost: (B,)
-        if use_lpa:
+        # Batched cost: (B,) (all conventions are higher == better here)
+        if use_blok:
+            corr = _blok_value(base_patches, warped_vals, weight_patches, blok_prep, config.lpc_ppow)
+        elif use_conv_lpa:
             corr = batched_lpa_cost(
                 base_patches, warped_vals, weight_patches,
                 nzh, nyh, nxh, sigma=config.lpa_sigma,
@@ -1240,6 +1321,8 @@ def _improve_warp_serial(
     pen_fac: float = 0.033333,
     base_clip: tuple[float, float] | None = None,
     source_clip: tuple[float, float] | None = None,
+    blok_index_vol: Tensor | None = None,
+    nblok: int = 0,
 ) -> bool:
     """Optimize the warp over one patch (serial, for lev=0 and edge cases)."""
     nx, ny, nz = state.nx, state.ny, state.nz
@@ -1288,17 +1371,26 @@ def _improve_warp_serial(
         state.patches_skipped += 1
         return False
 
-    incor = IncrementalCorrelation(method=config.cost_method)
-    if base_clip is not None and source_clip is not None:
-        incor.set_clips(base_clip, source_clip)
-
-    weight_for_fixed = weight.clone()
-    weight_for_fixed[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = 0.0
-    incor.add_fixed(
-        base.reshape(-1),
-        state.warped_source.reshape(-1),
-        weight_for_fixed.reshape(-1),
-    )
+    # Blok local-Pearson (lpc/lpa) is scored on this single patch (B=1) so odd
+    # boundary patches match the batched path; other methods use INCOR.
+    use_blok_serial = config.cost_method in ("lpc", "lpa")
+    incor = None
+    blok_prep_s = None
+    if use_blok_serial:
+        blok_idx_s = blok_index_vol[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)[None, :]
+        blok_prep_s = prepare_blok_pairs(blok_idx_s, nblok)
+        _blok_value_s = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
+    else:
+        incor = IncrementalCorrelation(method=config.cost_method)
+        if base_clip is not None and source_clip is not None:
+            incor.set_clips(base_clip, source_clip)
+        weight_for_fixed = weight.clone()
+        weight_for_fixed[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = 0.0
+        incor.add_fixed(
+            base.reshape(-1),
+            state.warped_source.reshape(-1),
+            weight_for_fixed.reshape(-1),
+        )
 
     pen_external = 0.0
     if use_penalty:
@@ -1358,7 +1450,13 @@ def _improve_warp_serial(
         m_flat = m_patch.reshape(-1).float()
         warped_vals = warped_vals * m_flat
 
-        corr = incor.evaluate(b_local, warped_vals, w_local)
+        if use_blok_serial:
+            corr = float(
+                _blok_value_s(b_local[None], warped_vals[None], w_local[None],
+                              blok_prep_s, config.lpc_ppow)[0]
+            )
+        else:
+            corr = incor.evaluate(b_local, warped_vals, w_local)
         cost = -corr
 
         if use_penalty:
