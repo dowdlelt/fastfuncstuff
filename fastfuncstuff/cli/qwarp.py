@@ -184,6 +184,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "an N× downsample is ~N³ less work there. Bare -pyramid uses "
                             "factor 2. Opt-in; validate against the non-pyramid result "
                             "[default: off]")
+    g_reg.add_argument("-keep_worse_levels", action="store_true",
+                       help="Run every refinement level even if it worsens the global "
+                            "cost (AFNI-style). By default ffs_qwarp rolls back and stops "
+                            "when a level degrades the fit -- the finest levels over-warp "
+                            "first, so this both improves the result and skips the most "
+                            "expensive, counterproductive level.")
     g_reg.add_argument("-nopad", action="store_true",
                        help="Disable internal zero-padding of images. Padding adds ~12%% "
                             "border to allow warps near edges. Disabling saves memory but "
@@ -1033,6 +1039,7 @@ def main(argv: list[str] | None = None) -> int:
         level_stop_tol=args.level_stop,
         compile=args.compile,
         pyramid_factor=args.pyramid,
+        reject_worse_levels=not args.keep_worse_levels,
     )
 
     if args.blur is not None:

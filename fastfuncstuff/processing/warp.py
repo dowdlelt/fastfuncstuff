@@ -160,6 +160,13 @@ class QwarpConfig:
     refining further. 0 = disabled (default). E.g. 0.0001 stops when improvement
     drops below 0.01% of current cost."""
 
+    reject_worse_levels: bool = True
+    """If a refinement level makes the global cost worse, restore the previous
+    level's warp and stop refining. The finest levels over-warp first, so once a
+    level degrades the fit, going finer rarely recovers it -- this both improves
+    the result and skips the most expensive (counterproductive) level. Set False
+    for AFNI-style 'always run every level'."""
+
     compile: bool = False
     """Use torch.compile for building-block functions (CUDA only).
     Requires warmup on first volume; may not help for small patches."""
@@ -804,8 +811,12 @@ def _warpomatic(
         if nz == 1:
             kbbb = kttt = 0
 
-        # Penalty settings
-        pen_lev = (lev - lev_start + 1) ** 0.333
+        # Penalty settings. Ramp with ABSOLUTE level (finer patches => stronger
+        # anti-over-warp pressure), not levels-into-this-pass: a pyramid or
+        # -inilev run resumes at a high lev_start, and the old (lev-lev_start+1)
+        # reset the ramp there, under-penalizing the fine levels and letting
+        # them over-warp. For a full run (lev_start=1) this is identical.
+        pen_lev = lev ** 0.333
         pen_fff = config.penalty_factor * min(3.21, pen_lev)
         use_pen = pen_fff > 0 and lev >= config.penalty_first_level
         if lev == config.penalty_first_level:
@@ -853,6 +864,10 @@ def _warpomatic(
         state.patches_done = 0
         state.patches_skipped = len(all_patches) - len(valid_patches)
         cost_at_start = state.cost
+        # Snapshot the warp so a level that worsens the global cost can be
+        # rolled back (see the reject-worse-levels guard at the end of the loop).
+        if config.reject_worse_levels:
+            saved_xd, saved_yd, saved_zd = state.xd.clone(), state.yd.clone(), state.zd.clone()
 
         # Progress bar for this level: total = n_valid patches * nlevr passes
         total_patches = n_valid * nlevr
@@ -951,6 +966,27 @@ def _warpomatic(
             state.cost = _global_correlation(
                 base, state.warped_source, weight, base_clip, source_clip
             )
+
+        # Reject a level that made the global cost worse: restore the previous
+        # level's warp and stop. cost is negated correlation (lower = better),
+        # so worsening means it went up. A small epsilon avoids stopping on noise.
+        if config.reject_worse_levels and state.cost > cost_at_start + 1e-4:
+            worsened = state.cost
+            with torch.no_grad():
+                state.xd, state.yd, state.zd = saved_xd, saved_yd, saved_zd
+                state.warped_source = warp_image_linear(source, state.xd, state.yd, state.zd)
+            state.cost = cost_at_start
+            if config.verb >= 1:
+                msg = (
+                    f"lev={lev} worsened cost {cost_at_start:.5f}=>{worsened:.5f}; "
+                    f"rolled back and stopping"
+                )
+                if lev_pbar is not None:
+                    lev_pbar.set_postfix_str(msg)
+                    lev_pbar.close()
+                else:
+                    print(f"  {msg}")
+            break
 
         if config.verb >= 1:
             elapsed = time.time() - t0

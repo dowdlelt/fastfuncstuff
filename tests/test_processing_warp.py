@@ -56,6 +56,8 @@ class TestQwarpConfig:
         assert cfg.lpa_kernel == "gauss"
         assert cfg.level_stop_tol == 0.0
         assert cfg.compile is False
+        assert cfg.pyramid_factor == 1
+        assert cfg.reject_worse_levels is True
 
     def test_custom_values(self):
         cfg = QwarpConfig(
