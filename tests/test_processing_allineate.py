@@ -6,14 +6,11 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.processing.affine import (
-    apply_affine,
-    identity_params,
-    params_to_matrix,
-)
 from fastfuncstuff.processing.allineate import (
     AffineAlignConfig,
+    CostContext,
     _batched_cost,
+    _bounds_to_torch,
     _center_of_mass,
     _cmass_translation,
     _compute_cost,
@@ -26,17 +23,17 @@ from fastfuncstuff.processing.allineate import (
     _denormalize_t,
     _downsample_3d,
     _estimate_chunk_size,
-    _generate_rotation_candidates,
     _get_free_mask,
     _identity_physical,
     _make_powell_cost,
     _normalize,
     _normalize_t,
-    _bounds_to_torch,
     _refine_adam_normalized,
     _refine_powell,
+    _rotation_candidates,
     _smooth_to_resolution,
     _tqdm_bar,
+    _translation_candidates,
     allineate,
 )
 
@@ -341,24 +338,35 @@ class TestCenterOfMass:
 class TestComputeCost:
     def test_ls_perfect_match(self):
         vol = _sphere_volume((8, 8, 8)).reshape(-1)
-        cost = _compute_cost(vol, vol, None, "ls")
+        cost = _compute_cost(vol, vol, None, CostContext(name="ls"))
         assert cost.item() > 0.99
 
     def test_lpa_perfect_match(self):
+        # Blok costs need a real grid; 32^3 gives meaningful bloks. The
+        # absolute value is overlap-scaled, so test the meaningful property:
+        # identical volumes score far higher than independent ones.
+        torch.manual_seed(0)
+        vol = _sphere_volume((32, 32, 32)) + 0.05 * torch.randn(32, 32, 32)
+        same = _compute_cost(vol, vol, None, CostContext(name="lpa")).item()
+        indep = _compute_cost(vol, torch.randn(32, 32, 32), None,
+                              CostContext(name="lpa")).item()
+        assert same > indep
+        assert same > 0.05
+
+    def test_lps_perfect_match(self):
         vol = _sphere_volume((8, 8, 8))
-        cost = _compute_cost(vol, vol, None, "lpa")
+        cost = _compute_cost(vol, vol, None, CostContext(name="lps"))
         assert cost.item() > 0.9
 
     def test_lpc_runs(self):
-        vol = _sphere_volume((8, 8, 8))
-        cost = _compute_cost(vol, vol, None, "lpc")
-        # LPC returns log-based values; just verify it runs and is finite
+        vol = _sphere_volume((32, 32, 32))
+        cost = _compute_cost(vol, vol, None, CostContext(name="lpc"))
         assert math.isfinite(cost.item())
 
     def test_unknown_cost_raises(self):
         vol = torch.randn(8, 8, 8)
         with pytest.raises(ValueError, match="Unknown cost"):
-            _compute_cost(vol, vol, None, "bad_cost")
+            _compute_cost(vol, vol, None, CostContext(name="bad_cost"))
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +377,7 @@ class TestBatchedCost:
     def test_ls_batched(self):
         base = _sphere_volume((8, 8, 8))
         warped = base.unsqueeze(0).expand(3, -1, -1, -1)
-        costs = _batched_cost(base, warped, None, "ls")
+        costs = _batched_cost(base, warped, None, CostContext(name="ls"))
         assert costs.shape == (3,)
         assert (costs > 0.9).all()
 
@@ -377,50 +385,59 @@ class TestBatchedCost:
         base = _sphere_volume((8, 8, 8))
         warped = base.unsqueeze(0).expand(3, -1, -1, -1)
         weight = torch.ones_like(base)
-        costs = _batched_cost(base, warped, weight, "ls")
+        costs = _batched_cost(base, warped, weight, CostContext(name="ls"))
         assert costs.shape == (3,)
         assert (costs > 0.9).all()
 
     def test_lpa_batched(self):
-        base = _sphere_volume((8, 8, 8))
+        base = _sphere_volume((32, 32, 32))
         warped = base.unsqueeze(0).expand(2, -1, -1, -1)
-        costs = _batched_cost(base, warped, None, "lpa")
+        costs = _batched_cost(base, warped, None, CostContext(name="lpa"))
         assert costs.shape == (2,)
 
     def test_lpc_batched(self):
-        base = _sphere_volume((8, 8, 8))
+        base = _sphere_volume((32, 32, 32))
         warped = base.unsqueeze(0).expand(2, -1, -1, -1)
-        costs = _batched_cost(base, warped, None, "lpc")
+        costs = _batched_cost(base, warped, None, CostContext(name="lpc"))
         assert costs.shape == (2,)
 
     def test_unknown_raises(self):
         base = torch.randn(8, 8, 8)
         warped = base.unsqueeze(0)
         with pytest.raises(ValueError, match="Unknown cost"):
-            _batched_cost(base, warped, None, "bad")
+            _batched_cost(base, warped, None, CostContext(name="bad"))
 
 
 # ---------------------------------------------------------------------------
-# _generate_rotation_candidates
+# Coarse candidate generators
 # ---------------------------------------------------------------------------
 
-class TestGenerateRotationCandidates:
-    def test_basic(self):
+class TestCandidateGenerators:
+    def test_rotation_grid_basic(self):
         t = torch.tensor([0.0, 0.0, 0.0])
-        cands = _generate_rotation_candidates(10.0, 10.0, t, DEV)
-        # range -10 to 10 step 10 -> angles: -10, 0, 10 -> 3 values
-        # 3^3 = 27 candidates
+        cands = _rotation_candidates(10.0, 10.0, t, DEV)
+        # angles -10, 0, 10 -> 3^3 = 27 candidates; scales == 1
         assert cands.shape == (27, 12)
-        # scales should be 1
         assert (cands[:, 6:9] == 1.0).all()
 
-    def test_with_shift(self):
-        t = torch.tensor([1.0, 2.0, 3.0])
-        cands = _generate_rotation_candidates(10.0, 10.0, t, DEV,
-                                              shift_range=2.0)
-        # 27 rotations * 7 shifts = 189
-        assert cands.shape[0] == 27 * 7
-        assert cands.shape[1] == 12
+    def test_rotation_grid_multi_translation(self):
+        ts = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        cands = _rotation_candidates(10.0, 10.0, ts, DEV)
+        # 2 translations x 27 rotations
+        assert cands.shape == (2 * 27, 12)
+        # first block carries the first translation
+        assert torch.allclose(cands[0, 0:3], ts[0])
+
+    def test_translation_grid_covers_range(self):
+        center = torch.tensor([0.0, 0.0, 0.0])
+        shift_range = torch.tensor([10.0, 10.0, 10.0])
+        cands = _translation_candidates(center, shift_range, 5, DEV)
+        assert cands.shape == (5 ** 3, 12)
+        # rotations are zero, scales 1, and the extreme shift is reached
+        assert (cands[:, 3:6] == 0.0).all()
+        assert (cands[:, 6:9] == 1.0).all()
+        assert float(cands[:, 0].max()) == pytest.approx(10.0)
+        assert float(cands[:, 0].min()) == pytest.approx(-10.0)
 
 
 # ---------------------------------------------------------------------------
@@ -473,9 +490,8 @@ class TestMakePowellCost:
         fixed_norm = identity_norm.copy()
 
         cost_fn = _make_powell_cost(
-            base, source, None, "lpa", 4.0,
+            base, source, None, CostContext(name="lps"), (1.0, 1.0, 1.0),
             bounds, free_mask, fixed_norm, DEV,
-            lpa_kernel="gauss",
         )
         x0 = identity_norm[free_mask]
         val = cost_fn(x0)
@@ -492,7 +508,7 @@ class TestMakePowellCost:
         counter = [0]
 
         cost_fn = _make_powell_cost(
-            base, base, None, "lpa", 4.0,
+            base, base, None, CostContext(name="lps"), (1.0, 1.0, 1.0),
             bounds, free_mask, fixed_norm, DEV,
             counter=counter,
         )
@@ -510,10 +526,11 @@ class TestRefineAdamNormalized:
         source = base.clone()
         bounds = _compute_param_bounds((12, 12, 12))
         init = _identity_physical()
-        cfg = AffineAlignConfig(dof="rigid", cost="lpa", verb=0)
+        cfg = AffineAlignConfig(dof="rigid", cost="lps", verb=0)
 
         params, cost = _refine_adam_normalized(
-            base, source, None, init, cfg, bounds, DEV,
+            base, source, None, init, cfg, CostContext(name="lps"),
+            (1.0, 1.0, 1.0), bounds, DEV,
             verb=0, n_iters=20, lr=0.01,
         )
         assert params.shape == (12,)
@@ -533,10 +550,11 @@ class TestRefinePowell:
         source = base.clone()
         bounds = _compute_param_bounds((10, 10, 10))
         init = _identity_physical()
-        cfg = AffineAlignConfig(dof="rigid", cost="lpa", verb=0)
+        cfg = AffineAlignConfig(dof="rigid", cost="lps", verb=0)
 
         params, cost = _refine_powell(
-            base, source, None, init, cfg, bounds, DEV,
+            base, source, None, init, cfg, CostContext(name="lps"),
+            (1.0, 1.0, 1.0), bounds, DEV,
             verb=0, maxfev=50,
         )
         assert params.shape == (12,)
@@ -576,7 +594,7 @@ class TestAllineate:
 
         cfg = AffineAlignConfig(
             dof="rigid",
-            cost="lpa",
+            cost="lps",
             twopass=True,
             coarse_range=10.0,
             coarse_step=5.0,
@@ -593,7 +611,7 @@ class TestAllineate:
         assert warped.shape == base.shape
 
         # The cost between warped and base should be decent
-        cost = _compute_cost(base, warped, None, "lpa")
+        cost = _compute_cost(base, warped, None, CostContext(name="lps"))
         assert cost.item() > 0.7
 
     def test_config_none_defaults(self):
