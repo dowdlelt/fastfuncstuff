@@ -334,7 +334,26 @@ Examples:
     required.add_argument(
         "-matrix",
         required=False,
-        help="Design matrix file (X.xmat.1D from 3dDeconvolve). Mutually exclusive with -onsets.",
+        help="Design matrix file (X.xmat.1D from 3dDeconvolve). Mutually exclusive with -onsets / -events / -spec.",
+    )
+    required.add_argument(
+        "-spec",
+        required=False,
+        help="ffs_design_spec TOML file. Compiled to <specname>.xmat.1D before "
+             "the GLM runs (so REML errors out fast on a bad spec rather than "
+             "after a long data load). Mutually exclusive with -matrix / -onsets / -events.",
+    )
+    required.add_argument(
+        "-xmat",
+        required=False,
+        help="When using -spec, override the auto-derived output xmat path "
+             "(default: <specname>.xmat.1D in the spec's directory). Ignored "
+             "without -spec.",
+    )
+    required.add_argument(
+        "-overwrite",
+        action="store_true",
+        help="Allow -spec compile to overwrite an existing -xmat output.",
     )
 
     # Output arguments - REML
@@ -700,6 +719,26 @@ Examples:
     return parser
 
 
+def _derive_rvar_path(rbuck_path: str) -> str:
+    """Append ``_ffsremlvar`` to the Rbuck stem, preserving its multi-suffix
+    extension (``.nii.gz`` / ``.nii.zst`` / ``.nii``). Mirrors AFNI's
+    ``<prefix>_REMLvar+orig`` convention but with the FFS-specific suffix so
+    AFNI's REMLvar file in the same directory never gets clobbered.
+
+    Examples:
+        ``stats.nii.gz``         → ``stats_ffsremlvar.nii.gz``
+        ``stats_bucket.nii.zst`` → ``stats_bucket_ffsremlvar.nii.zst``
+        ``stats.nii``            → ``stats_ffsremlvar.nii``
+    """
+    p = Path(rbuck_path)
+    name = p.name
+    for suffix in (".nii.gz", ".nii.zst", ".nii"):
+        if name.endswith(suffix):
+            return str(p.with_name(name[: -len(suffix)] + "_ffsremlvar" + suffix))
+    # Unknown extension: drop the single suffix and re-add it.
+    return str(p.with_name(p.stem + "_ffsremlvar" + p.suffix))
+
+
 def print_header(args):
     """Print program header"""
     from datetime import datetime
@@ -829,14 +868,62 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    # Validate design input: exactly one of -matrix, -onsets, -events
-    _design_sources = [bool(args.matrix), bool(args.onsets), bool(args.events)]
+    # Validate design input: exactly one of -matrix, -onsets, -events, -spec.
+    _design_sources = [
+        bool(args.matrix), bool(args.onsets),
+        bool(args.events), bool(args.spec),
+    ]
     if sum(_design_sources) > 1:
-        print("ERROR: Specify only one of -matrix, -onsets, or -events")
+        print("ERROR: Specify only one of -matrix, -onsets, -events, or -spec")
         sys.exit(1)
     if not any(_design_sources):
-        print("ERROR: Must specify one of -matrix, -onsets, or -events")
+        print("ERROR: Must specify one of -matrix, -onsets, -events, or -spec")
         sys.exit(1)
+
+    # ── -spec handling: compile to xmat *before* loading any data ────────
+    # We do this early so a syntax error or missing event file fails fast
+    # instead of after the slow input load. The compiled xmat becomes the
+    # input for the rest of the pipeline (treated as -matrix from here on).
+    if args.spec:
+        from fastfuncstuff.cli.design_spec import (
+            _do_compile as _design_spec_compile,
+            _resolve_spec_path as _design_spec_resolve,
+        )
+
+        spec_path = _design_spec_resolve(args.spec)
+        if args.xmat:
+            compiled_xmat = Path(args.xmat)
+        else:
+            # Default: <specname>.xmat.1D next to the spec. Avoids clobbering
+            # AFNI's conventional X.xmat.1D in the same directory.
+            stem = spec_path.stem
+            compiled_xmat = spec_path.with_name(f"{stem}.xmat.1D")
+
+        print(f"📐 Compiling spec {spec_path} → {compiled_xmat}", flush=True)
+        compile_args = argparse.Namespace(
+            spec=str(spec_path),
+            xmat=str(compiled_xmat),
+            verb=0,  # quiet — our header above + the REML banner are enough
+            overwrite=args.overwrite,
+        )
+        rc = _design_spec_compile(compile_args)
+        if rc != 0:
+            sys.exit(rc)
+        args.matrix = str(compiled_xmat)
+        args.spec = None  # downstream branches key off args.matrix from here
+
+    # Auto-write Rvar alongside Rbuck so future ffs_concalc has the per-voxel
+    # ARMA (a, b) it needs to rebuild (X̃ᵀX̃)⁻¹ on demand. AFNI does the same
+    # with its `_REMLvar+orig` companion. Skip when the user explicitly set
+    # -Rvar (they already chose a name).
+    if args.Rbuck and not args.Rvar:
+        args.Rvar = _derive_rvar_path(args.Rbuck)
+        print(
+            f"📝 Auto-saving Rvar for concalc: {args.Rvar}\n"
+            "   (sub-bricks 0 and 1 are ARMA `a` and `b`; "
+            "pass -Rvar to override the path)",
+            flush=True,
+        )
 
     # -event_ignore / -event_cols are only meaningful with -events
     if args.event_ignore and not args.events:
@@ -1810,17 +1897,19 @@ def main():
             "nifti_header": nifti_header,
         }
 
-        # Get run structure for preprocessing. run_starts is already set
-        # by the -onsets or -matrix path above; only re-parse if needed.
+        # Get run structure for preprocessing.
+        # The -onsets path sets run_starts earlier (line ~1152). The -matrix
+        # path skips that block, so we have to read RunStart out of the xmat
+        # here. The reader stores it under the key "run_starts" — the older
+        # "run_trs" lookup never worked and left run_starts unbound.
         if args.matrix is not None and not args.onsets:
             design_info_pre = read_afni_design_matrix(args.matrix)
-            run_trs = design_info_pre.get("run_trs", None)
-            if run_trs is not None:
+            run_starts_from_xmat = design_info_pre.get("run_starts")
+            if run_starts_from_xmat:
+                run_starts = [int(rs) for rs in run_starts_from_xmat]
+            else:
+                # No RunStart header → single concatenated block.
                 run_starts = [0]
-                cumsum = 0
-                for rt in run_trs[:-1]:
-                    cumsum += rt
-                    run_starts.append(cumsum)
 
         # Load and optionally blur each run
         run_data_list = []
