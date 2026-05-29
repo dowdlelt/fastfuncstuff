@@ -427,39 +427,253 @@ def test_im_mode():
             os.remove(timing_file)
 
 
+def test_compress_int_sequence():
+    """AFNI compression rules: N@v for runs, a..b for ascending ranges."""
+    from fastfuncstuff.design.builder import _compress_int_sequence
+
+    # Empty.
+    assert _compress_int_sequence([]) == ""
+    # Run of identical values.
+    assert _compress_int_sequence([-1, -1, -1, -1]) == "4@-1"
+    # Ascending sequence ≥ 3.
+    assert _compress_int_sequence([1, 2, 3, 4]) == "1..4"
+    # Ascending pair stays as two values (range form requires 3+).
+    assert _compress_int_sequence([1, 2]) == "1,2"
+    # Mixed: 12 polort + 7 stim + 18 nuisance — the user's case.
+    polort_stim_nuis = [-1] * 12 + list(range(1, 8)) + [0] * 18
+    assert _compress_int_sequence(polort_stim_nuis) == "12@-1,1..7,18@0"
+    # Range form bridges into a run.
+    assert _compress_int_sequence([0, 1, 2, 5, 5, 5]) == "0..2,3@5"
+
+
+def test_columngroups_matches_afni_layout(tmp_path):
+    """ColumnGroups uses -1 for polort, 0 for nuisance, 1..N for stims,
+    in column order, with AFNI's compression."""
+    from fastfuncstuff.design.builder import write_afni_xmat
+    from fastfuncstuff.io.afni import read_afni_design_matrix
+
+    # 12 polort + 7 stim + 18 nuisance, in AFNI order.
+    n_reg = 12 + 7 + 18
+    n_tp = 60
+    design = np.random.RandomState(2).randn(n_tp, n_reg)
+    labels = (
+        [f"Run#{r}Pol#{p}" for r in (1, 2, 3) for p in range(4)]
+        + [f"{s}#0" for s in ["DI", "DP", "PI", "SI", "SP", "motor", "scales"]]
+        + [f"motion0{r}[{c}]" for r in (1, 2, 3) for c in range(6)]
+    )
+    polort_idx = list(range(12))
+    stim_idx = list(range(12, 19))
+    nuis_idx = list(range(19, 37))
+    metadata = {
+        "n_runs": 3, "tr": 1.2,
+        "polort_indices": polort_idx,
+        "stim_indices": stim_idx,
+        "padortvec_indices": [],
+        "ortvec_indices": nuis_idx,
+        "extra_indices": [],
+        "nuisance_indices": polort_idx + nuis_idx,
+        "hrf_types": ["SPMG1"] * 7,
+        "stim_durations": [2.0] * 7,
+    }
+
+    out = tmp_path / "X.xmat.1D"
+    write_afni_xmat(out, design, labels, run_starts=[0, 20, 40],
+                    metadata=metadata)
+
+    text = out.read_text()
+    assert 'ColumnGroups = "12@-1,1..7,18@0"' in text
+    assert 'StimBots = "12..18"' in text
+    assert 'StimTops = "12..18"' in text
+
+    # And the parsed structure agrees.
+    info = read_afni_design_matrix(str(out))
+    assert info["column_groups"][:12] == [-1] * 12
+    assert info["column_groups"][12:19] == list(range(1, 8))
+    assert info["column_groups"][19:] == [0] * 18
+
+
 def test_glt_parsing():
-    """Test GLT contrast parsing and validation"""
+    """Test GLT contrast parsing and validation (single-row, t-test path)."""
     from fastfuncstuff.design.builder import glt_weights_to_vector, parse_glt_string
 
-    # Test valid contrast (difference)
-    weights, valid = parse_glt_string('SYM: +1*A -1*B')
-    assert valid, "Difference contrast should be valid"
-    assert weights == {'A': 1.0, 'B': -1.0}, f"Wrong weights: {weights}"
-    assert abs(sum(weights.values())) < 1e-6, "Weights should sum to 0"
+    # Difference (sum to 0).
+    rows, valid = parse_glt_string('SYM: +1*A -1*B')
+    assert valid
+    assert len(rows) == 1
+    assert rows[0] == {'A': (1.0, None), 'B': (-1.0, None)}
 
-    # Test valid contrast (average)
-    weights, valid = parse_glt_string('SYM: +0.5*A +0.5*B')
-    assert valid, "Average contrast should be valid"
-    assert weights == {'A': 0.5, 'B': 0.5}, f"Wrong weights: {weights}"
-    assert abs(sum(weights.values()) - 1.0) < 1e-6, "Weights should sum to 1"
+    # Average (sum to 1).
+    rows, valid = parse_glt_string('SYM: +0.5*A +0.5*B')
+    assert valid
+    assert rows[0] == {'A': (0.5, None), 'B': (0.5, None)}
 
-    # Test invalid contrast (warning should be raised)
+    # Invalid sum warns and reports invalid.
     import warnings
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        weights, valid = parse_glt_string('SYM: +1*A +1*B')
-        assert len(w) == 1, "Should raise warning for invalid sum"
-        assert not valid, "Should be marked invalid"
-        assert "sum to" in str(w[0].message).lower(), "Warning should mention sum"
+        rows, valid = parse_glt_string('SYM: +1*A +1*B')
+        assert any("sum to" in str(item.message).lower() for item in w)
+        assert not valid
 
-    # Test vector conversion
+    # Vector conversion (scalar back-compat dict).
     labels = ['Poly0', 'Poly1', 'A', 'B', 'C']
-    weights = {'A': 1.0, 'B': -1.0}
-    vec = glt_weights_to_vector(weights, labels)
-    expected = np.array([0, 0, 1, -1, 0])
-    np.testing.assert_array_equal(vec, expected, err_msg="Wrong contrast vector")
+    vec = glt_weights_to_vector({'A': 1.0, 'B': -1.0}, labels)
+    np.testing.assert_array_equal(vec, np.array([0, 0, 1, -1, 0]))
 
-    print("\n✓ GLT parsing tests passed!")
+    # Vector conversion via the new (weight, range) value form.
+    vec2 = glt_weights_to_vector(rows[0] | {'B': (-1.0, None)}, labels)
+    # rows[0] from the warning case had A=+1, B=+1; override B to -1.
+    np.testing.assert_array_equal(vec2, np.array([0, 0, 1, -1, 0]))
+
+
+def test_glt_multirow_f_test():
+    """parse_glt_string handles row separators (\\, |, newline) for F-tests."""
+    from fastfuncstuff.design.builder import (
+        glt_rows_to_matrix,
+        parse_glt_string,
+    )
+
+    # Pipe-separated F-test: 3 single-coefficient rows.
+    rows, _ = parse_glt_string('SYM: +1*A | +1*B | +1*C')
+    assert len(rows) == 3
+    assert rows[0] == {'A': (1.0, None)}
+    assert rows[2] == {'C': (1.0, None)}
+
+    # Newline separator.
+    rows, _ = parse_glt_string('SYM: +1*A\n+1*B')
+    assert len(rows) == 2
+
+    # List-of-strings form (machine-generated specs).
+    rows, _ = parse_glt_string(['SYM: +1*A', 'SYM: +1*B'])
+    assert len(rows) == 2
+
+    # F-test matrix shape — 3 rows, n_regressors cols.
+    labels = ['p0', 'A', 'B', 'C', 'D']
+    rows, _ = parse_glt_string('SYM: +1*A | +1*B | +1*C')
+    mat = glt_rows_to_matrix(rows, labels)
+    assert mat.shape == (3, 5)
+    np.testing.assert_array_equal(
+        mat,
+        np.array([
+            [0, 1, 0, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 0],
+        ]),
+    )
+
+
+def test_glt_sub_range_and_broadcast():
+    """[a..b] sub-indexing + full-width broadcast against stim ranges."""
+    from fastfuncstuff.design.builder import glt_weights_to_vector, parse_glt_string
+
+    # TENT(0,20,6) on TaskA spanning columns 12..17 (6 basis cols).
+    labels = (
+        [f'pol{i}' for i in range(12)]
+        + [f'TaskA#{i}' for i in range(6)]
+        + ['nuis']
+    )
+    stim_ranges = {'TaskA': (12, 17)}
+
+    # Sub-range [2..4] -> weight on columns 14, 15, 16.
+    rows, _ = parse_glt_string('SYM: +1*TaskA[2..4]')
+    vec = glt_weights_to_vector(rows[0], labels, stim_ranges=stim_ranges)
+    expected = np.zeros(len(labels))
+    expected[14:17] = 1.0
+    np.testing.assert_array_equal(vec, expected)
+
+    # No range -> full-width broadcast (cols 12..17 all weight 1).
+    rows, _ = parse_glt_string('SYM: +1*TaskA')
+    vec = glt_weights_to_vector(rows[0], labels, stim_ranges=stim_ranges)
+    expected = np.zeros(len(labels))
+    expected[12:18] = 1.0
+    np.testing.assert_array_equal(vec, expected)
+
+    # Out-of-range sub-index raises.
+    rows, _ = parse_glt_string('SYM: +1*TaskA[2..8]')
+    with pytest.raises(ValueError, match="exceeds basis count"):
+        glt_weights_to_vector(rows[0], labels, stim_ranges=stim_ranges)
+
+
+def test_goodlist_censor_round_trip(tmp_path):
+    """write_afni_xmat with explicit good_list -> reader recovers same indices."""
+    from fastfuncstuff.design.builder import (
+        good_list_from_censor,
+        write_afni_xmat,
+    )
+    from fastfuncstuff.io.afni import read_afni_design_matrix
+
+    # 10-TR run, censor TR 2 and TR 7. Kept indices: 0,1,3,4,5,6,8,9 (8 rows).
+    keep = np.array([1, 1, 0, 1, 1, 1, 1, 0, 1, 1])
+    good_indices, n_full = good_list_from_censor(keep)
+    assert good_indices == [0, 1, 3, 4, 5, 6, 8, 9]
+    assert n_full == 10
+
+    n_kept = len(good_indices)
+    design = np.random.RandomState(0).randn(n_kept, 3).astype(np.float64)
+    labels = ['Pol0', 'taskA#0', 'taskB#0']
+    metadata = {
+        'n_runs': 1, 'tr': 2.0,
+        'stim_indices': [1, 2],
+        'hrf_types': ['SPMG1', 'SPMG1'],
+        'stim_durations': [4.0, 4.0],
+        'nuisance_indices': [0],
+    }
+
+    out = tmp_path / 'X.xmat.1D'
+    write_afni_xmat(
+        out, design, labels, run_starts=[0], metadata=metadata,
+        good_list=good_indices, n_row_full=n_full,
+    )
+
+    info = read_afni_design_matrix(str(out))
+    assert info['n_timepoints'] == 10  # NRowFull, after censor accounting
+    assert list(info['good_list']) == good_indices
+
+
+def test_f_test_glt_matrix_round_trip(tmp_path):
+    """F-test GltMatrix_xxxxxx is written with r>1 and read back identically."""
+    from fastfuncstuff.design.builder import write_afni_xmat
+    from fastfuncstuff.io.afni import read_afni_design_matrix
+
+    n_tp, n_reg = 12, 4
+    design = np.random.RandomState(1).randn(n_tp, n_reg).astype(np.float64)
+    labels = ['Pol0', 'A#0', 'B#0', 'C#0']
+    metadata = {
+        'n_runs': 1, 'tr': 2.0,
+        'stim_indices': [1, 2, 3],
+        'hrf_types': ['SPMG1', 'SPMG1', 'SPMG1'],
+        'stim_durations': [4.0, 4.0, 4.0],
+        'nuisance_indices': [0],
+    }
+
+    # One t-test (1 row) + one F-test (3 rows).
+    glts = [
+        ('SYM: +1*A -1*B', 'A_vs_B'),
+        ('SYM: +1*A | +1*B | +1*C', 'AnyOfABC_F'),
+    ]
+
+    out = tmp_path / 'X.xmat.1D'
+    write_afni_xmat(out, design, labels, run_starts=[0],
+                    metadata=metadata, glt_contrasts=glts)
+
+    info = read_afni_design_matrix(str(out))
+    assert info['n_glt'] == 2
+    assert info['glt_labels'] == ['A_vs_B', 'AnyOfABC_F']
+
+    t_mat = info['glt_matrices'][0]
+    assert t_mat.shape == (1, n_reg)
+    np.testing.assert_array_equal(t_mat, np.array([[0, 1, -1, 0]]))
+
+    f_mat = info['glt_matrices'][1]
+    assert f_mat.shape == (3, n_reg)
+    np.testing.assert_array_equal(
+        f_mat,
+        np.array([
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]),
+    )
 
 
 def test_goodlist_utilities():

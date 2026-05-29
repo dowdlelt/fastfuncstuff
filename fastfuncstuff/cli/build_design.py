@@ -42,12 +42,12 @@ import sys
 from pathlib import Path
 
 from fastfuncstuff.cli_utils import add_verbose_arg
-from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
 from fastfuncstuff.design.builder import (
     build_design_matrix,
     parse_glt_string,
     write_afni_xmat,
 )
+from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
 
 try:
     import nibabel as nib  # noqa: F401 — availability check
@@ -310,13 +310,16 @@ def main():
             print(f"\nGLT contrasts: {len(args.glts)}")
 
         for contrast_str, label in args.glts:
-            # Validate
-            weights, valid = parse_glt_string(contrast_str)
+            # Validate by parsing. parse_glt_string returns one row per
+            # F-test row; t-tests come back as a single-element list.
+            rows, valid = parse_glt_string(contrast_str)
 
             if args.verb >= 1:
-                print(f"  {label}: {contrast_str}")
+                kind = "F" if len(rows) > 1 else "t"
+                print(f"  {label} ({kind}-test, {len(rows)} row(s)): {contrast_str}")
                 if not valid:
-                    print(f"    WARNING: Weights sum to {sum(weights.values()):.3f} (expected 0 or 1)")
+                    row_sums = [sum(w for w, _ in row.values()) for row in rows]
+                    print(f"    WARNING: row sums = {row_sums} (expected 0 or 1 each)")
 
             glt_contrasts.append((contrast_str, label))
 

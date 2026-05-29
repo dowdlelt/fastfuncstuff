@@ -245,204 +245,428 @@ def create_onset_regressors(
     hrf: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Create stimulus regressors from onset times
-
-    Converts onset times (in seconds) to a regressor sampled at TR,
-    optionally convolved with an HRF.
-
-    Parameters
-    ----------
-    onset_times : np.ndarray
-        Onset times in seconds, shape (n_events,)
-    n_timepoints : int
-        Total number of timepoints in the run
-    tr : float
-        Repetition time in seconds
-    duration : float, default=0
-        Duration of each stimulus in seconds
-        - 0: impulse (single TR)
-        - >0: boxcar of specified duration
-    hrf : np.ndarray, optional
-        HRF to convolve with (if None, returns unconfolved regressor)
-        Should be sampled at TR intervals
-
-    Returns
-    -------
-    regressor : np.ndarray
-        Stimulus regressor, shape (n_timepoints,)
+    Legacy TR-resolution onset regressor builder. New code should drive
+    ``build_design_matrix`` (which routes through the proper microtime
+    pipeline: :func:`create_onset_matrix_microtime` →
+    :func:`fastfuncstuff.design.hrf.get_spmg1_hrf` →
+    :func:`fastfuncstuff.design.matrices.convolve_hrf_microtime`). This
+    function is preserved for tests that exercise the TR-only path.
     """
-    # Create stick/boxcar function
     regressor = np.zeros(n_timepoints)
-
     for onset in onset_times:
-        # Convert onset time to TR index
         onset_tr = int(np.round(onset / tr))
-
         if onset_tr < 0 or onset_tr >= n_timepoints:
-            # Skip onsets outside the run
             continue
-
         if duration <= 0:
-            # Impulse (stick function)
             regressor[onset_tr] = 1.0
         else:
-            # Boxcar with duration
-            duration_tr = int(np.round(duration / tr))
+            duration_tr = max(1, int(np.round(duration / tr)))
             end_tr = min(onset_tr + duration_tr, n_timepoints)
             regressor[onset_tr:end_tr] = 1.0
 
-    # Convolve with HRF if provided
     if hrf is not None:
-        # Use 'full' mode and truncate to match input length
         regressor = np.convolve(regressor, hrf, mode="full")[:n_timepoints]
-
-        # Normalize by max to maintain percent signal change scaling
-        # This ensures that a single boxcar+HRF response has amplitude 1.0
-        # (matching AFNI's behavior for proper PSC interpretation)
         if duration > 0:
-            # For boxcar stimuli, need to normalize by the response to a single boxcar
-            # Create reference boxcar and convolve
-            ref_boxcar = np.zeros(len(hrf) * 2)
-            duration_tr = int(np.round(duration / tr))
-            ref_boxcar[:duration_tr] = 1.0
-            ref_response = np.convolve(ref_boxcar, hrf, mode="full")
+            duration_tr = max(1, int(np.round(duration / tr)))
+            ref = np.zeros(len(hrf) + duration_tr)
+            ref[:duration_tr] = 1.0
+            ref_response = np.convolve(ref, hrf, mode="full")
             max_response = ref_response.max()
-
             if max_response > 0:
                 regressor = regressor / max_response
-
     return regressor
 
 
-def parse_glt_string(glt_string: str) -> tuple[dict[str, float], bool]:
+def parse_glt_string(
+    glt_string: str | list[str],
+) -> tuple[list[dict[str, _LabelWeight]], bool]:
     """
-    Parse AFNI GLT (General Linear Test) contrast string
+    Parse AFNI GLT (General Linear Test) contrast string(s).
 
-    Extracts weights for each regressor label from symbolic contrast strings.
-    Also validates that weights sum to 0 (difference) or 1 (average).
+    Single-row strings produce a t-test (one weight dict). Multi-row strings —
+    separated by ``\\``, ``|``, or newline inside the SYM: payload — or a list
+    of SYM: strings produce an F-test (one weight dict per row).
+
+    Each label may optionally carry a sub-range ``label[a..b]`` selecting basis
+    columns within a multi-column stim (AFNI ``-gltsym`` syntax). The range is
+    returned as part of the value, not by mangling the label key.
 
     Parameters
     ----------
-    glt_string : str
+    glt_string : str or list of str
         GLT contrast in AFNI SYM format, e.g.:
-        - 'SYM: +1*labelA -1*labelB' (difference)
-        - 'SYM: +0.5*labelA +0.5*labelB' (average)
-        - 'SYM: +1*cond1 +2*cond2 -3*cond3'
+        - 'SYM: +1*labelA -1*labelB'                       (t-test, difference)
+        - 'SYM: +0.5*labelA +0.5*labelB'                   (t-test, average)
+        - 'SYM: +1*A | +1*B | +1*C'                        (F-test, 3 rows)
+        - 'SYM: +1*TaskA[2..4]'                            (sub-range)
+        - ['SYM: +1*A', 'SYM: +1*B']                       (F-test, list form)
 
     Returns
     -------
-    weights : dict
-        Dictionary mapping label to weight, e.g., {'labelA': 1.0, 'labelB': -1.0}
+    rows : list of dict
+        One dict per contrast row mapping label to a (weight, range_or_None)
+        tuple. ``range_or_None`` is ``(a, b)`` inclusive when ``[a..b]`` is
+        present, else ``None``.
     is_valid : bool
-        True if weights sum to 0 or 1, False otherwise (with warning)
+        True if every row's weights sum to 0 or 1 (difference / average).
 
     Examples
     --------
-    >>> parse_glt_string('SYM: +1*movie -1*prompt')
-    ({'movie': 1.0, 'prompt': -1.0}, True)
+    >>> rows, valid = parse_glt_string('SYM: +1*movie -1*prompt')
+    >>> rows
+    [{'movie': (1.0, None), 'prompt': (-1.0, None)}]
+    >>> valid
+    True
 
-    >>> parse_glt_string('SYM: +0.5*cond1 +0.5*cond2')
-    ({'cond1': 0.5, 'cond2': 0.5}, True)
+    >>> rows, _ = parse_glt_string('SYM: +1*A | +1*B')
+    >>> len(rows)
+    2
     """
-    # Remove 'SYM:' prefix if present
-    glt_string = glt_string.strip()
-    if glt_string.upper().startswith("SYM:"):
-        glt_string = glt_string[4:].strip()
+    # Normalize input into a list of row strings.
+    if isinstance(glt_string, list):
+        row_strings = list(glt_string)
+    else:
+        s = glt_string.strip()
+        if s.upper().startswith("SYM:"):
+            s = s[4:].strip()
+        # Split on backslash, pipe, or newline. Empty fragments dropped.
+        row_strings = [r.strip() for r in re.split(r"[\\|\n]", s) if r.strip()]
 
-    # Parse weights and labels: pattern is [+/-]weight*label
-    # Match: optional sign, number (int or float), *, label
-    pattern = r"([+-]?\s*\d+\.?\d*)\s*\*\s*([A-Za-z_][\w\-]*)"
-    matches = re.findall(pattern, glt_string)
-
-    if not matches:
+    if not row_strings:
         raise ValueError(
-            f"Could not parse GLT string: '{glt_string}'. Expected format: 'SYM: +1*label1 -1*label2'"
+            f"Could not parse GLT string: '{glt_string}'. "
+            "Expected format: 'SYM: +1*label1 -1*label2' (rows separated by \\, |, or newline)"
         )
 
-    weights = {}
-    for weight_str, label in matches:
-        # Remove spaces and convert to float
-        weight_str = weight_str.replace(" ", "")
-        weight = float(weight_str)
-        weights[label] = weight
+    # Per-token pattern: optional sign, number, *, label, optional [a..b]
+    token_pattern = re.compile(
+        r"([+-]?\s*\d+\.?\d*)\s*\*\s*([A-Za-z_][\w\-]*)"
+        r"(?:\[\s*(\d+)\s*\.\.\s*(\d+)\s*\])?"
+    )
 
-    # Validate sum
-    weight_sum = sum(weights.values())
-    is_valid = abs(weight_sum) < 1e-6 or abs(weight_sum - 1.0) < 1e-6
+    rows: list[dict[str, _LabelWeight]] = []
+    overall_valid = True
 
-    if not is_valid:
-        import warnings
+    for row_str in row_strings:
+        # Strip optional 'SYM:' prefix on a per-row basis too (allows list-of-SYM-strings).
+        row_clean = row_str
+        if row_clean.upper().startswith("SYM:"):
+            row_clean = row_clean[4:].strip()
 
-        warnings.warn(
-            f"GLT weights sum to {weight_sum:.6f}, expected 0 (difference) or 1 (average). "
-            f"GLT: '{glt_string}'", stacklevel=2
-        )
+        matches = token_pattern.findall(row_clean)
+        if not matches:
+            raise ValueError(
+                f"Could not parse GLT row: '{row_str}'. "
+                "Expected format: '+1*label1 -1*label2'"
+            )
 
-    return weights, is_valid
+        row_weights: dict[str, _LabelWeight] = {}
+        for weight_str, label, range_lo, range_hi in matches:
+            weight = float(weight_str.replace(" ", ""))
+            rng: tuple[int, int] | None = None
+            if range_lo and range_hi:
+                lo, hi = int(range_lo), int(range_hi)
+                if hi < lo:
+                    raise ValueError(
+                        f"GLT sub-range for '{label}' has hi < lo: [{lo}..{hi}]"
+                    )
+                rng = (lo, hi)
+            row_weights[label] = (weight, rng)
+
+        # Validate sum per row (sub-range broadcasting doesn't change the count
+        # of "explicit" weights — we check the user-written coefficients, not
+        # the eventual broadcast).
+        weight_sum = sum(w for w, _ in row_weights.values())
+        row_valid = abs(weight_sum) < 1e-6 or abs(weight_sum - 1.0) < 1e-6
+        if not row_valid:
+            import warnings
+
+            warnings.warn(
+                f"GLT row weights sum to {weight_sum:.6f}, expected 0 or 1. "
+                f"Row: '{row_str}'",
+                stacklevel=2,
+            )
+            overall_valid = False
+
+        rows.append(row_weights)
+
+    return rows, overall_valid
+
+
+# Internal alias used in annotations above. Kept here (not exposed) to avoid
+# spreading a tuple type across module-level imports.
+_LabelWeight = tuple[float, "tuple[int, int] | None"]
 
 
 def glt_weights_to_vector(
-    weights: dict[str, float],
+    weights: dict[str, float] | dict[str, _LabelWeight],
     regressor_labels: list[str],
+    stim_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> np.ndarray:
     """
-    Convert GLT weights dict to contrast vector
+    Convert GLT weights dict to a single contrast row vector.
 
-    Maps label weights to column indices in design matrix.
+    Maps label weights to column indices in the design matrix. Three label
+    resolution modes are tried in order:
+
+    1. **Exact match** against ``regressor_labels``.
+    2. **Multi-column stim by name** — if ``stim_ranges`` is provided and the
+       label appears there as ``(col_start, col_end)`` inclusive, the weight is
+       broadcast full-width across that range (AFNI ``-gltsym`` default). If
+       the value carries a sub-range ``(a, b)``, only those *basis-relative*
+       columns (``col_start + a`` … ``col_start + b``) are weighted.
+    3. **Base-label match** against ``label#N`` columns (IM mode).
 
     Parameters
     ----------
     weights : dict
-        Dictionary mapping label to weight, e.g., {'movie': 1.0, 'prompt': -1.0}
+        Either ``{label: weight}`` (back-compat scalar form) or
+        ``{label: (weight, range_or_None)}`` as produced by parse_glt_string.
     regressor_labels : list of str
-        Labels for all regressors in design matrix (in column order)
+        Labels for all regressors in design matrix (in column order).
+    stim_ranges : dict, optional
+        Mapping ``base_label -> (col_start, col_end)`` inclusive. Required for
+        full-width broadcast across multi-column bases (TENT, FIR, SPMG2/3).
+        If omitted, multi-column broadcast falls back to the IM-style ``label#N``
+        scan (which only finds suffixed columns).
 
     Returns
     -------
     contrast_vector : np.ndarray
-        Vector of weights, shape (n_regressors,)
-        Zero for regressors not in weights dict
+        Vector of weights, shape (n_regressors,).
 
     Raises
     ------
     ValueError
-        If a label in weights is not found in regressor_labels
+        If a label resolves to no columns or a sub-range exceeds the stim's
+        column count.
 
     Examples
     --------
     >>> weights = {'movie': 1.0, 'prompt': -1.0}
     >>> labels = ['Run1_Poly0', 'Run1_Poly1', 'movie', 'prompt']
     >>> glt_weights_to_vector(weights, labels)
-    array([0., 0., 1., -1.])
+    array([ 0.,  0.,  1., -1.])
+
+    >>> # TENT(0,20,6) on TaskA spanning cols 12..17 — sub-range [2..4]
+    >>> w = {'TaskA': (1.0, (2, 4))}
+    >>> labels = [f'baseline#{i}' for i in range(12)] + [f'TaskA#{i}' for i in range(6)]
+    >>> v = glt_weights_to_vector(w, labels, stim_ranges={'TaskA': (12, 17)})
+    >>> list(v[14:17])
+    [1.0, 1.0, 1.0]
     """
     n_regressors = len(regressor_labels)
     contrast_vector = np.zeros(n_regressors)
+    stim_ranges = stim_ranges or {}
 
-    for label, weight in weights.items():
-        # Try exact match first
+    for label, value in weights.items():
+        # Normalize value: scalar (back-compat) vs (weight, range) tuple.
+        if isinstance(value, tuple):
+            weight, sub_range = value
+        else:
+            weight, sub_range = float(value), None
+
+        # 1) Exact match — single column.
         if label in regressor_labels:
+            if sub_range is not None:
+                raise ValueError(
+                    f"GLT label '{label}' is a single column but a sub-range "
+                    f"{sub_range} was given."
+                )
             idx = regressor_labels.index(label)
             contrast_vector[idx] = weight
-        else:
-            # Try matching base label (e.g., 'movie' matches 'movie#0')
-            # For standard mode, this finds the single column
-            # For IM mode, this would sum across all events (movie#0, movie#1, ...)
-            matches = [
-                i for i, l in enumerate(regressor_labels) if l.split("#")[0] == label and "#" in l
-            ]
+            continue
 
-            if matches:
-                # Standard mode: single match (movie#0)
-                # IM mode: multiple matches (movie#0, movie#1, ...) - weight each equally
-                for idx in matches:
+        # 2) Multi-column stim by name (from StimBots/StimTops metadata).
+        if label in stim_ranges:
+            col_start, col_end = stim_ranges[label]
+            n_basis = col_end - col_start + 1
+            if sub_range is not None:
+                lo, hi = sub_range
+                if hi >= n_basis:
+                    raise ValueError(
+                        f"GLT sub-range [{lo}..{hi}] for '{label}' exceeds "
+                        f"basis count {n_basis} (cols {col_start}..{col_end})."
+                    )
+                contrast_vector[col_start + lo : col_start + hi + 1] = weight
+            else:
+                # Full-width broadcast — weight applied to every basis column.
+                contrast_vector[col_start : col_end + 1] = weight
+            continue
+
+        # 3) Base-label scan for IM-style `label#N` columns.
+        matches = [
+            i for i, l in enumerate(regressor_labels)
+            if l.split("#")[0] == label and "#" in l
+        ]
+        if matches:
+            if sub_range is not None:
+                lo, hi = sub_range
+                if hi >= len(matches):
+                    raise ValueError(
+                        f"GLT sub-range [{lo}..{hi}] for '{label}' exceeds "
+                        f"match count {len(matches)}."
+                    )
+                for idx in matches[lo : hi + 1]:
                     contrast_vector[idx] = weight
             else:
-                raise ValueError(
-                    f"GLT label '{label}' not found in regressor labels. "
-                    f"Available labels: {regressor_labels}"
-                )
+                for idx in matches:
+                    contrast_vector[idx] = weight
+            continue
+
+        raise ValueError(
+            f"GLT label '{label}' not found in regressor labels. "
+            f"Available labels: {regressor_labels}"
+        )
 
     return contrast_vector
+
+
+def glt_rows_to_matrix(
+    rows: list[dict[str, _LabelWeight]],
+    regressor_labels: list[str],
+    stim_ranges: dict[str, tuple[int, int]] | None = None,
+) -> np.ndarray:
+    """
+    Resolve a list of contrast rows (as produced by parse_glt_string) to a
+    GLT matrix of shape ``(n_rows, n_regressors)``. ``n_rows == 1`` is a
+    t-test; ``n_rows > 1`` is an F-test.
+    """
+    n_regressors = len(regressor_labels)
+    matrix = np.zeros((len(rows), n_regressors))
+    for i, row in enumerate(rows):
+        matrix[i] = glt_weights_to_vector(row, regressor_labels, stim_ranges)
+    return matrix
+
+
+def _compress_int_sequence(values: list[int]) -> str:
+    """Compress a sequence of integers using AFNI's two-rule notation:
+
+    - ``a..b`` for ascending runs of consecutive values (step 1).
+    - ``N@v`` for ``N`` repetitions of the same value.
+    - Otherwise the literal value, comma-separated.
+
+    AFNI applies both rules in the same string. Run-of-same wins over
+    range when both could apply (i.e. a single repeated value is never
+    rendered as ``a..a``).
+
+    Examples:
+      ``[1, 2, 3]``               → ``"1..3"``
+      ``[-1, -1, -1, 0, 0]``     → ``"3@-1,2@0"``
+      ``[-1]*12 + [1, 2, 3] + [0]*4`` → ``"12@-1,1..3,4@0"``
+    """
+    if not values:
+        return ""
+    parts: list[str] = []
+    i = 0
+    n = len(values)
+    while i < n:
+        v = values[i]
+        # 1) Run of identical values.
+        j = i
+        while j < n and values[j] == v:
+            j += 1
+        run_len = j - i
+        if run_len >= 2:
+            parts.append(f"{run_len}@{v}")
+            i = j
+            continue
+        # 2) Ascending consecutive run starting at v.
+        j = i
+        while j + 1 < n and values[j + 1] == values[j] + 1:
+            j += 1
+        seq_len = j - i + 1
+        if seq_len >= 3:
+            parts.append(f"{values[i]}..{values[j]}")
+            i = j + 1
+            continue
+        parts.append(f"{v}")
+        i += 1
+    return ",".join(parts)
+
+
+def _compress_index_runs(indices: list[int]) -> str:
+    """
+    Render a sorted list of TR indices in AFNI's GoodList shorthand:
+    contiguous runs become ``a..b``, isolated indices stay as ``n``, all
+    joined by commas. Example: ``[0,1,2,4,5,7]`` → ``"0..2,4..5,7"``.
+    """
+    if not indices:
+        return ""
+    parts: list[str] = []
+    start = prev = indices[0]
+    for v in indices[1:]:
+        if v == prev + 1:
+            prev = v
+            continue
+        parts.append(f"{start}..{prev}" if prev > start else f"{start}")
+        start = prev = v
+    parts.append(f"{start}..{prev}" if prev > start else f"{start}")
+    return ",".join(parts)
+
+
+def good_list_from_censor(
+    keep_mask: np.ndarray | list[int] | list[bool],
+) -> tuple[list[int], int]:
+    """
+    Convert a per-TR keep mask (1=keep, 0=censor, e.g. AFNI ``outcount.1D``)
+    into a (good_list, n_row_full) pair suitable for write_afni_xmat.
+
+    Accepts either a boolean/integer array of length ``n_row_full`` or an
+    already-resolved list of kept TR indices (returned unchanged).
+    """
+    arr = np.asarray(keep_mask)
+    if arr.ndim != 1:
+        raise ValueError(f"keep_mask must be 1-D, got shape {arr.shape}")
+    # Heuristic: if values are only 0/1 (or bool), treat as mask. Otherwise
+    # treat as an already-resolved list of indices.
+    if arr.dtype == bool or set(np.unique(arr).tolist()).issubset({0, 1}):
+        n_row_full = int(arr.size)
+        good = [i for i, v in enumerate(arr.tolist()) if v]
+        return good, n_row_full
+    indices = [int(i) for i in arr.tolist()]
+    return indices, max(indices) + 1
+
+
+def _format_glt_value(v: float) -> str:
+    """Format a GLT weight for the AFNI compact notation. Integer-valued
+    floats render without a decimal; fractional values use general format."""
+    if float(v).is_integer():
+        return f"{int(v)}"
+    return f"{v:g}"
+
+
+def _afni_compact_vector(values: np.ndarray, leading_count: int = 0) -> str:
+    """
+    Serialize a 1-D array in AFNI's compact notation: leading and trailing
+    runs of zeros are compressed to ``N@0``. Interior zeros are left verbatim
+    so the total token count equals the array length once expanded.
+
+    Example: ``[0,0,0,1,-1,0,0,0,0,0,0]`` → ``"3@0,1,-1,6@0"``.
+
+    The ``leading_count`` parameter is unused but reserved so callers can
+    tune behaviour without touching the call sites.
+    """
+    del leading_count  # reserved
+    n = len(values)
+    if n == 0:
+        return ""
+
+    nonzero = np.flatnonzero(values)
+    if len(nonzero) == 0:
+        return f"{n}@0"
+
+    first_nz = int(nonzero[0])
+    last_nz = int(nonzero[-1])
+
+    parts: list[str] = []
+    if first_nz > 0:
+        parts.append(f"{first_nz}@0")
+    parts.extend(_format_glt_value(v) for v in values[first_nz : last_nz + 1])
+    trailing = n - last_nz - 1
+    if trailing > 0:
+        parts.append(f"{trailing}@0")
+    return ",".join(parts)
 
 
 def parse_hrf_model(hrf_string: str) -> tuple[str, float | dict]:
@@ -902,79 +1126,124 @@ def build_design_matrix(
     # Add ortvec labels
     regressor_labels.extend(ortvec_labels_list)
 
-    # 3. Add stimulus regressors (spanning all runs)
+    # 3. Add stimulus regressors via the microtime pipeline.
+    # ------------------------------------------------------------------
+    # All stim regressors are built at microtime_dt = 0.1 s (the codebase
+    # convention) via:
+    #   1) get_spmg1_hrf(microtime_dt)               — proper AFNI SPMG1
+    #   2) create_onset_matrix_microtime(...)         — boxcar at microtime
+    #   3) convolve_hrf_microtime(...)                — convolve, peak-norm,
+    #                                                   downsample to TR
+    # Sub-TR events (duration < TR/2) survive correctly because everything
+    # below the TR grid lives on the fine grid until the final downsample.
+    # ------------------------------------------------------------------
+    from fastfuncstuff.design.hrf import get_spmg1_hrf
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.utils import get_device as _get_device
+
+    microtime_dt = 0.1
+    stim_device = _get_device()
+
+    # Split stim conditions by HRF type. Each condition is either:
+    #   - regular (one regressor),
+    #   - IM (one regressor per event — each event becomes its own "condition"
+    #     in the onset matrix, then is convolved like any other).
+    # We process SPMG1 and BLOCK groups separately because BLOCK skips
+    # convolution entirely.
+    expanded_onsets: list[list[np.ndarray]] = []
+    expanded_durations: list[float] = []
+    expanded_labels: list[str] = []
+    expanded_hrf_types: list[str] = []
+
     for stim_idx in range(n_stim):
-        # Get HRF for this stimulus
         hrf_type = hrf_types[stim_idx]
+        if hrf_type not in ("SPMG1", "BLOCK"):
+            raise ValueError(
+                f"Unknown HRF type: {hrf_type}. Supported: SPMG1, BLOCK"
+            )
 
-        if hrf_type == "SPMG1":
-            hrf = spm_canonical_hrf(tr=tr, duration=32.0)
-        elif hrf_type == "BLOCK":
-            hrf = None  # No HRF convolution
-        else:
-            raise ValueError(f"Unknown HRF type: {hrf_type}. Supported: SPMG1, BLOCK")
-
+        duration = stim_durations[stim_idx]
         if im_mode[stim_idx]:
-            # Individual modulation mode: one column per event
-            # Collect all onsets across all runs and create one regressor per event
+            # IM: each event becomes its own condition with onsets per run.
             event_idx = 0
             for run_idx in range(n_runs):
-                n_tp = n_timepoints_per_run[run_idx]
-                run_start = sum(n_timepoints_per_run[:run_idx])
-                run_end = run_start + n_tp
-
-                onsets = all_onsets[stim_idx][run_idx]
-                duration = stim_durations[stim_idx]
-
-                # Create one column per event in this run
-                for onset in onsets:
-                    event_regressor = create_onset_regressors(
-                        onset_times=np.array([onset]),  # Single onset
-                        n_timepoints=n_tp,
-                        tr=tr,
-                        duration=duration,
-                        hrf=hrf,
-                    )
-
-                    # Place in full time series
-                    full_regressor = np.zeros(total_timepoints)
-                    full_regressor[run_start:run_end] = event_regressor
-
-                    # Add to design matrix
-                    design_matrix[:, col_idx] = full_regressor
-                    stim_indices.append(col_idx)
-                    # IM mode: label#0, label#1, label#2, etc.
-                    regressor_labels.append(f"{stim_labels[stim_idx]}#{event_idx}")
-                    col_idx += 1
+                for onset in all_onsets[stim_idx][run_idx]:
+                    per_run = [
+                        np.array([onset], dtype=np.float64) if r == run_idx
+                        else np.array([], dtype=np.float64)
+                        for r in range(n_runs)
+                    ]
+                    expanded_onsets.append(per_run)
+                    expanded_durations.append(duration)
+                    expanded_labels.append(f"{stim_labels[stim_idx]}#{event_idx}")
+                    expanded_hrf_types.append(hrf_type)
                     event_idx += 1
-
         else:
-            # Standard mode: one column for all events
-            stim_regressor = np.zeros(total_timepoints)
+            expanded_onsets.append(
+                [np.asarray(all_onsets[stim_idx][r], dtype=np.float64)
+                 for r in range(n_runs)]
+            )
+            expanded_durations.append(duration)
+            expanded_labels.append(f"{stim_labels[stim_idx]}#0")
+            expanded_hrf_types.append(hrf_type)
 
-            for run_idx in range(n_runs):
-                n_tp = n_timepoints_per_run[run_idx]
-                run_start = sum(n_timepoints_per_run[:run_idx])
-                run_end = run_start + n_tp
+    if expanded_onsets:
+        onset_matrix = create_onset_matrix_microtime(
+            all_onsets=expanded_onsets,
+            run_starts=run_starts,
+            tr=tr,
+            n_timepoints=total_timepoints,
+            microtime_dt=microtime_dt,
+            stim_durations=expanded_durations,
+            device=stim_device,
+        )
 
-                onsets = all_onsets[stim_idx][run_idx]
-                duration = stim_durations[stim_idx]
+        # SPMG1 columns get HRF convolution; BLOCK columns are downsampled
+        # without convolution.
+        spmg_mask = np.array([h == "SPMG1" for h in expanded_hrf_types])
 
-                regressor = create_onset_regressors(
-                    onset_times=onsets,
-                    n_timepoints=n_tp,
-                    tr=tr,
-                    duration=duration,
-                    hrf=hrf,
-                )
+        # SPMG1 path.
+        if spmg_mask.any():
+            hrf_micro = get_spmg1_hrf(
+                microtime_dt=microtime_dt,
+                stim_duration=0.0,
+                hrf_duration=32.0,
+                normalize_peak=True,
+                device=stim_device,
+            )
+            convolved = convolve_hrf_microtime(
+                onsets_microtime=onset_matrix[:, spmg_mask],
+                hrf=hrf_micro,
+                n_timepoints=total_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                run_starts=run_starts,
+                device=stim_device,
+            )
+            spmg_cols = convolved.cpu().numpy()
+        else:
+            spmg_cols = None
 
-                stim_regressor[run_start:run_end] = regressor
+        # BLOCK path — no HRF convolution. Sample the boxcar at TR grid.
+        if (~spmg_mask).any():
+            bins_per_tr = int(round(tr / microtime_dt))
+            block_cols = (
+                onset_matrix[:, ~spmg_mask][::bins_per_tr][:total_timepoints]
+                .cpu().numpy()
+            )
+        else:
+            block_cols = None
 
-            # Add to design matrix
-            design_matrix[:, col_idx] = stim_regressor
+        # Splice columns back in the original expanded order.
+        spmg_iter = iter(range(spmg_cols.shape[1])) if spmg_cols is not None else iter(())
+        block_iter = iter(range(block_cols.shape[1])) if block_cols is not None else iter(())
+        for k, label in enumerate(expanded_labels):
+            if spmg_mask[k]:
+                design_matrix[:, col_idx] = spmg_cols[:, next(spmg_iter)]
+            else:
+                design_matrix[:, col_idx] = block_cols[:, next(block_iter)]
             stim_indices.append(col_idx)
-            # Standard mode: label#0 (only one column per stimulus)
-            regressor_labels.append(f"{stim_labels[stim_idx]}#0")
+            regressor_labels.append(label)
             col_idx += 1
 
     # 4. Add extra regressors (if any)
@@ -1031,8 +1300,10 @@ def write_afni_xmat(
     regressor_labels: list[str],
     run_starts: list[int],
     metadata: dict,
-    glt_contrasts: list[tuple[str, str]] | None = None,
+    glt_contrasts: list[tuple[str | list[str], str]] | None = None,
     command_line: str | None = None,
+    good_list: list[int] | np.ndarray | None = None,
+    n_row_full: int | None = None,
 ) -> None:
     """
     Write design matrix in AFNI .xmat.1D format
@@ -1102,16 +1373,41 @@ def write_afni_xmat(
     else:
         n_stim = 0
 
-    # Build column groups
-    # Format: "N@-1,M,K" means N columns in group -1 (nuisance), then groups M, K for stim
-    # Group numbering: -1=polort, 0=motion/baseline, 1,2,3,...=stimuli of interest
-    n_nuisance = len(metadata.get("nuisance_indices", []))
-    if n_stim > 0:
-        col_groups = f"{n_nuisance}@-1"
-        for stim_idx in range(n_stim):
-            col_groups += f",{stim_idx + 1}"  # Stimuli start at 1, not 0
-    else:
-        col_groups = f"{n_nuisance}@-1"
+    # Build column groups in column order (AFNI semantics):
+    #   -1     polynomial drift (polort_indices)
+    #    0     baseline / motion / generic nuisance (padortvec, ortvec, extra)
+    #    1..N  one group per stim, numbered by appearance order
+    # The string is N@v compressed for run-length and a..b compressed for
+    # sequential integers so the output matches 3dDeconvolve byte-for-byte
+    # on AFNI-style designs.
+    polort_set = set(metadata.get("polort_indices", []))
+    nuisance0_set = set(
+        metadata.get("padortvec_indices", [])
+        + metadata.get("ortvec_indices", [])
+        + metadata.get("extra_indices", [])
+    )
+    # Map each stim column to its 1-indexed stim group (by stim_labels_list order).
+    stim_col_to_group: dict[int, int] = {}
+    for stim_idx, base_label in enumerate(stim_labels_list):
+        cols = [
+            i for i in stim_indices
+            if regressor_labels[i].split("#")[0] == base_label
+        ]
+        for c in cols:
+            stim_col_to_group[c] = stim_idx + 1
+
+    per_col_group: list[int] = []
+    for col in range(n_regressors):
+        if col in polort_set:
+            per_col_group.append(-1)
+        elif col in stim_col_to_group:
+            per_col_group.append(stim_col_to_group[col])
+        elif col in nuisance0_set:
+            per_col_group.append(0)
+        else:
+            # Unaccounted column — fall back to nuisance baseline.
+            per_col_group.append(0)
+    col_groups = _compress_int_sequence(per_col_group)
 
     # Create header
     with open(filepath, "w") as f:
@@ -1129,8 +1425,28 @@ def write_afni_xmat(
 
         # TR and timepoint info
         f.write(f'#  RowTR = "{tr}"\n')
-        f.write(f'#  GoodList = "0..{n_timepoints - 1}"\n')
-        f.write(f'#  NRowFull = "{n_timepoints}"\n')
+
+        # GoodList: indices in the *full* (uncensored) dataset that survived
+        # into this matrix. Length must equal n_timepoints. Without censoring
+        # this is just 0..n_timepoints-1. AFNI compresses contiguous runs.
+        if good_list is None:
+            good_indices = list(range(n_timepoints))
+            full_len = n_timepoints
+        else:
+            good_indices = [int(i) for i in good_list]
+            if len(good_indices) != n_timepoints:
+                raise ValueError(
+                    f"good_list length ({len(good_indices)}) does not match "
+                    f"design matrix rows ({n_timepoints})."
+                )
+            full_len = n_row_full if n_row_full is not None else (max(good_indices) + 1)
+            if full_len < max(good_indices) + 1:
+                raise ValueError(
+                    f"n_row_full ({full_len}) is smaller than max(good_list)+1 "
+                    f"({max(good_indices) + 1})."
+                )
+        f.write(f'#  GoodList = "{_compress_index_runs(good_indices)}"\n')
+        f.write(f'#  NRowFull = "{full_len}"\n')
 
         # Run starts
         run_starts_str = ",".join(map(str, run_starts))
@@ -1139,39 +1455,43 @@ def write_afni_xmat(
         # Stimulus info
         f.write(f'#  Nstim = "{n_stim}"\n')
         if n_stim > 0:
-            # StimBots and StimTops are comma-separated lists of bottom/top columns for each stimulus
-            stim_bots_str = ",".join(map(str, stim_bots))
-            stim_tops_str = ",".join(map(str, stim_tops))
-            f.write(f'#  StimBots = "{stim_bots_str}"\n')
-            f.write(f'#  StimTops = "{stim_tops_str}"\n')
+            # AFNI emits StimBots/StimTops as a possibly-compressed list
+            # (sequential integers fold into "a..b" form). One bot per stim,
+            # one top per stim, in StimLabels order.
+            f.write(f'#  StimBots = "{_compress_int_sequence(stim_bots)}"\n')
+            f.write(f'#  StimTops = "{_compress_int_sequence(stim_tops)}"\n')
 
             stim_labels_str = " ; ".join(stim_labels_list)
             f.write(f'#  StimLabels = "{stim_labels_str}"\n')
 
-        # GLT contrasts
+        # GLT contrasts. Each entry of glt_contrasts is (sym_str_or_list, label):
+        #   - str  -> rows parsed by parse_glt_string (1 row = t-test, N = F)
+        #   - list -> already a list of SYM: row strings (F-test convenience)
         if glt_contrasts:
             f.write(f'#  Nglt = "{len(glt_contrasts)}"\n')
             glt_labels = [label for _, label in glt_contrasts]
             f.write(f'#  GltLabels = "{" ; ".join(glt_labels)}"\n')
 
+            stim_ranges = dict(
+                zip(stim_labels_list, zip(stim_bots, stim_tops, strict=True), strict=True)
+            )
+
             for glt_idx, (contrast_str, _label) in enumerate(glt_contrasts):
-                # Parse contrast and create matrix representation
-                weights, _ = parse_glt_string(contrast_str)
-                contrast_vec = glt_weights_to_vector(weights, regressor_labels)
+                rows, _valid = parse_glt_string(contrast_str)
+                glt_matrix = glt_rows_to_matrix(rows, regressor_labels, stim_ranges)
+                n_rows = glt_matrix.shape[0]
 
-                # Format: "1,n_regressors,values"
-                nonzero_indices = np.where(contrast_vec != 0)[0]
-                matrix_str = f"1,{n_regressors},"
-
-                # Compact leading zeros then emit every remaining value verbatim so
-                # the total count always equals n_regressors.
-                if len(nonzero_indices) > 0 and nonzero_indices[0] > 0:
-                    first_nz = nonzero_indices[0]
-                    matrix_str += f"{first_nz}@0"
-                    remaining = contrast_vec[first_nz:]
-                    matrix_str += "," + ",".join(f"{v:.0f}" for v in remaining)
+                # AFNI compact notation: "r,nreg,v0,v1,...,v_{r*nreg-1}" with
+                # leading and trailing zero runs compressed via N@0. We flatten
+                # row-major (AFNI's convention per remlfit.html).
+                flat = glt_matrix.reshape(-1)
+                matrix_str = _afni_compact_vector(flat, leading_count=2_000_000)
+                # Prefix with r,nreg
+                header = f"{n_rows},{n_regressors}"
+                if matrix_str:
+                    matrix_str = f"{header},{matrix_str}"
                 else:
-                    matrix_str += ",".join(f"{v:.0f}" for v in contrast_vec)
+                    matrix_str = header
 
                 f.write(f'#  GltMatrix_{glt_idx:06d} = "{matrix_str}"\n')
 

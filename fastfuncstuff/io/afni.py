@@ -536,9 +536,12 @@ def parse_afni_matrix_notation(notation: str) -> np.ndarray:
             # Single value
             values.append(float(part))
 
-    # Create matrix
-    if len(values) != n_cols:
-        raise ValueError(f"Expected {n_cols} values, got {len(values)}")
+    # Total expected value count is n_rows * n_cols (F-tests have r > 1).
+    expected = n_rows * n_cols
+    if len(values) != expected:
+        raise ValueError(
+            f"Expected {expected} values ({n_rows} rows × {n_cols} cols), got {len(values)}"
+        )
 
     matrix = np.array(values).reshape(n_rows, n_cols)
     return matrix
