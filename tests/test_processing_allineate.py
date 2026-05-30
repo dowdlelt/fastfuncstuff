@@ -44,6 +44,7 @@ DEV = torch.device("cpu")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _sphere_volume(shape=(16, 16, 16), center=None, radius=5.0):
     """Create a 3D volume with a bright sphere."""
     nz, ny, nx = shape
@@ -55,15 +56,15 @@ def _sphere_volume(shape=(16, 16, 16), center=None, radius=5.0):
         torch.arange(nx, dtype=torch.float32),
         indexing="ij",
     )
-    dist2 = ((ii - center[0]) ** 2 + (jj - center[1]) ** 2
-             + (kk - center[2]) ** 2)
-    vol = torch.clamp(1.0 - dist2 / (radius ** 2), min=0.0)
+    dist2 = (ii - center[0]) ** 2 + (jj - center[1]) ** 2 + (kk - center[2]) ** 2
+    vol = torch.clamp(1.0 - dist2 / (radius**2), min=0.0)
     return vol
 
 
 # ---------------------------------------------------------------------------
 # AffineAlignConfig
 # ---------------------------------------------------------------------------
+
 
 class TestAffineAlignConfig:
     def test_defaults(self):
@@ -85,6 +86,7 @@ class TestAffineAlignConfig:
 # _tqdm_bar
 # ---------------------------------------------------------------------------
 
+
 class TestTqdmBar:
     def test_passthrough_when_disabled(self):
         items = [1, 2, 3]
@@ -99,6 +101,7 @@ class TestTqdmBar:
 # ---------------------------------------------------------------------------
 # _get_free_mask / _identity_physical
 # ---------------------------------------------------------------------------
+
 
 class TestParameterMasks:
     def test_rigid_mask(self):
@@ -134,12 +137,25 @@ class TestParameterMasks:
 # Normalization / denormalization
 # ---------------------------------------------------------------------------
 
+
 class TestNormalization:
     def test_normalize_denormalize_roundtrip(self):
-        bounds = np.array([[-10, 10], [-5, 5], [0, 20],
-                           [-30, 30], [-30, 30], [-30, 30],
-                           [0.7, 1.4], [0.7, 1.4], [0.7, 1.4],
-                           [-0.1, 0.1], [-0.1, 0.1], [-0.1, 0.1]])
+        bounds = np.array(
+            [
+                [-10, 10],
+                [-5, 5],
+                [0, 20],
+                [-30, 30],
+                [-30, 30],
+                [-30, 30],
+                [0.7, 1.4],
+                [0.7, 1.4],
+                [0.7, 1.4],
+                [-0.1, 0.1],
+                [-0.1, 0.1],
+                [-0.1, 0.1],
+            ]
+        )
         params = _identity_physical()
         normed = _normalize(params, bounds)
         recovered = _denormalize(normed, bounds)
@@ -152,13 +168,24 @@ class TestNormalization:
         np.testing.assert_allclose(normed, 0.5, atol=1e-10)
 
     def test_torch_roundtrip(self):
-        bounds = np.array([[-10, 10], [-5, 5], [0, 20],
-                           [-30, 30], [-30, 30], [-30, 30],
-                           [0.7, 1.4], [0.7, 1.4], [0.7, 1.4],
-                           [-0.1, 0.1], [-0.1, 0.1], [-0.1, 0.1]])
+        bounds = np.array(
+            [
+                [-10, 10],
+                [-5, 5],
+                [0, 20],
+                [-30, 30],
+                [-30, 30],
+                [-30, 30],
+                [0.7, 1.4],
+                [0.7, 1.4],
+                [0.7, 1.4],
+                [-0.1, 0.1],
+                [-0.1, 0.1],
+                [-0.1, 0.1],
+            ]
+        )
         bmin, span = _bounds_to_torch(bounds, DEV)
-        params = torch.tensor(_identity_physical(), dtype=torch.float32,
-                              device=DEV)
+        params = torch.tensor(_identity_physical(), dtype=torch.float32, device=DEV)
         normed = _normalize_t(params, bmin, span)
         recovered = _denormalize_t(normed, bmin, span)
         torch.testing.assert_close(recovered, params, atol=1e-5, rtol=1e-5)
@@ -172,6 +199,7 @@ class TestNormalization:
 # ---------------------------------------------------------------------------
 # _compute_param_bounds
 # ---------------------------------------------------------------------------
+
 
 class TestComputeParamBounds:
     def test_shape(self):
@@ -192,6 +220,7 @@ class TestComputeParamBounds:
 # ---------------------------------------------------------------------------
 # Downsample / smooth
 # ---------------------------------------------------------------------------
+
 
 class TestMultiResolution:
     def test_downsample_factor_1(self):
@@ -220,6 +249,7 @@ class TestMultiResolution:
 # _compute_nonzero_bbox
 # ---------------------------------------------------------------------------
 
+
 class TestNonzeroBbox:
     def test_simple_cube(self):
         vol = torch.zeros(20, 20, 20)
@@ -245,6 +275,7 @@ class TestNonzeroBbox:
 # ---------------------------------------------------------------------------
 # _crop_volumes
 # ---------------------------------------------------------------------------
+
 
 class TestCropVolumes:
     def test_crop_reduces_size(self):
@@ -273,6 +304,7 @@ class TestCropVolumes:
 # _compute_source_validity_mask
 # ---------------------------------------------------------------------------
 
+
 class TestSourceValidityMask:
     def test_identity_all_valid(self):
         shape = (8, 8, 8)
@@ -296,12 +328,12 @@ class TestSourceValidityMask:
 # _center_of_mass / _cmass_translation
 # ---------------------------------------------------------------------------
 
+
 class TestCenterOfMass:
     def test_symmetric_volume(self):
         vol = _sphere_volume((16, 16, 16), center=(8.0, 8.0, 8.0))
         com = _center_of_mass(vol)
-        torch.testing.assert_close(com, torch.tensor([8.0, 8.0, 8.0]),
-                                   atol=0.5, rtol=0.0)
+        torch.testing.assert_close(com, torch.tensor([8.0, 8.0, 8.0]), atol=0.5, rtol=0.0)
 
     def test_weighted_com(self):
         vol = torch.ones(8, 8, 8)
@@ -315,8 +347,7 @@ class TestCenterOfMass:
         vol = torch.zeros(8, 8, 8)
         com = _center_of_mass(vol)
         # Should return center
-        torch.testing.assert_close(com, torch.tensor([4.0, 4.0, 4.0]),
-                                   atol=0.01, rtol=0.0)
+        torch.testing.assert_close(com, torch.tensor([4.0, 4.0, 4.0]), atol=0.01, rtol=0.0)
 
     def test_cmass_translation_identical(self):
         vol = _sphere_volume((12, 12, 12))
@@ -330,10 +361,33 @@ class TestCenterOfMass:
         # Should detect ~2 voxel shift in x
         assert t[0].item() > 1.0
 
+    def test_cmass_maps_native_source_through_grid(self):
+        """The source centroid is taken on its native grid and mapped to base
+        voxels via grid_matrix — not differenced raw.
+
+        Regression: computing the source centroid on the source-resampled-to-base
+        grid clips it to the base FOV (the top of a brain under a short EPI is
+        dropped), so the shift comes up short. With the grid affine the native
+        centroid maps correctly regardless of overlap.
+        """
+        # source COM at x=13 (source voxels); base COM at x=10 (base voxels).
+        base = _sphere_volume((20, 20, 20), center=(10, 10, 10))
+        source = _sphere_volume((20, 20, 20), center=(13, 10, 10))
+        # grid_matrix maps base voxel -> source voxel as a +2 shift in x.
+        grid = torch.eye(4)
+        grid[0, 3] = 2.0
+        # native source COM (x=13) -> base voxels (13-2=11); base COM x=10 -> 1.0
+        t = _cmass_translation(base, source, grid_matrix=grid)
+        assert abs(t[0].item() - 1.0) < 0.6
+        # without the grid map it would be the raw 13-10 = 3 (the buggy value)
+        t_raw = _cmass_translation(base, source)
+        assert abs(t_raw[0].item() - 3.0) < 0.6
+
 
 # ---------------------------------------------------------------------------
 # _compute_cost
 # ---------------------------------------------------------------------------
+
 
 class TestComputeCost:
     def test_ls_perfect_match(self):
@@ -348,8 +402,7 @@ class TestComputeCost:
         torch.manual_seed(0)
         vol = _sphere_volume((32, 32, 32)) + 0.05 * torch.randn(32, 32, 32)
         same = _compute_cost(vol, vol, None, CostContext(name="lpa")).item()
-        indep = _compute_cost(vol, torch.randn(32, 32, 32), None,
-                              CostContext(name="lpa")).item()
+        indep = _compute_cost(vol, torch.randn(32, 32, 32), None, CostContext(name="lpa")).item()
         assert same > indep
         assert same > 0.05
 
@@ -372,6 +425,7 @@ class TestComputeCost:
 # ---------------------------------------------------------------------------
 # _batched_cost
 # ---------------------------------------------------------------------------
+
 
 class TestBatchedCost:
     def test_ls_batched(self):
@@ -412,6 +466,7 @@ class TestBatchedCost:
 # Coarse candidate generators
 # ---------------------------------------------------------------------------
 
+
 class TestCandidateGenerators:
     def test_rotation_grid_basic(self):
         t = torch.tensor([0.0, 0.0, 0.0])
@@ -432,7 +487,7 @@ class TestCandidateGenerators:
         center = torch.tensor([0.0, 0.0, 0.0])
         shift_range = torch.tensor([10.0, 10.0, 10.0])
         cands = _translation_candidates(center, shift_range, 5, DEV)
-        assert cands.shape == (5 ** 3, 12)
+        assert cands.shape == (5**3, 12)
         # rotations are zero, scales 1, and the extreme shift is reached
         assert (cands[:, 3:6] == 0.0).all()
         assert (cands[:, 6:9] == 1.0).all()
@@ -443,6 +498,7 @@ class TestCandidateGenerators:
 # ---------------------------------------------------------------------------
 # _estimate_chunk_size
 # ---------------------------------------------------------------------------
+
 
 class TestEstimateChunkSize:
     def test_cpu(self):
@@ -459,6 +515,7 @@ class TestEstimateChunkSize:
 # ---------------------------------------------------------------------------
 # _compute_grid_matrix
 # ---------------------------------------------------------------------------
+
 
 class TestComputeGridMatrix:
     def test_identity_affines(self):
@@ -480,6 +537,7 @@ class TestComputeGridMatrix:
 # _make_powell_cost
 # ---------------------------------------------------------------------------
 
+
 class TestMakePowellCost:
     def test_cost_fn_returns_float(self):
         base = _sphere_volume((8, 8, 8))
@@ -490,8 +548,15 @@ class TestMakePowellCost:
         fixed_norm = identity_norm.copy()
 
         cost_fn = _make_powell_cost(
-            base, source, None, CostContext(name="lps"), (1.0, 1.0, 1.0),
-            bounds, free_mask, fixed_norm, DEV,
+            base,
+            source,
+            None,
+            CostContext(name="lps"),
+            (1.0, 1.0, 1.0),
+            bounds,
+            free_mask,
+            fixed_norm,
+            DEV,
         )
         x0 = identity_norm[free_mask]
         val = cost_fn(x0)
@@ -508,8 +573,15 @@ class TestMakePowellCost:
         counter = [0]
 
         cost_fn = _make_powell_cost(
-            base, base, None, CostContext(name="lps"), (1.0, 1.0, 1.0),
-            bounds, free_mask, fixed_norm, DEV,
+            base,
+            base,
+            None,
+            CostContext(name="lps"),
+            (1.0, 1.0, 1.0),
+            bounds,
+            free_mask,
+            fixed_norm,
+            DEV,
             counter=counter,
         )
         cost_fn(identity_norm[free_mask])
@@ -520,6 +592,7 @@ class TestMakePowellCost:
 # _refine_adam_normalized (small test)
 # ---------------------------------------------------------------------------
 
+
 class TestRefineAdamNormalized:
     def test_identity_stays_near_identity(self):
         base = _sphere_volume((12, 12, 12))
@@ -529,9 +602,18 @@ class TestRefineAdamNormalized:
         cfg = AffineAlignConfig(dof="rigid", cost="lps", verb=0)
 
         params, cost = _refine_adam_normalized(
-            base, source, None, init, cfg, CostContext(name="lps"),
-            (1.0, 1.0, 1.0), bounds, DEV,
-            verb=0, n_iters=20, lr=0.01,
+            base,
+            source,
+            None,
+            init,
+            cfg,
+            CostContext(name="lps"),
+            (1.0, 1.0, 1.0),
+            bounds,
+            DEV,
+            verb=0,
+            n_iters=20,
+            lr=0.01,
         )
         assert params.shape == (12,)
         # Should stay near identity for identical images
@@ -544,6 +626,7 @@ class TestRefineAdamNormalized:
 # _refine_powell (small test)
 # ---------------------------------------------------------------------------
 
+
 class TestRefinePowell:
     def test_identity_stays_near_identity(self):
         base = _sphere_volume((10, 10, 10))
@@ -553,9 +636,17 @@ class TestRefinePowell:
         cfg = AffineAlignConfig(dof="rigid", cost="lps", verb=0)
 
         params, cost = _refine_powell(
-            base, source, None, init, cfg, CostContext(name="lps"),
-            (1.0, 1.0, 1.0), bounds, DEV,
-            verb=0, maxfev=50,
+            base,
+            source,
+            None,
+            init,
+            cfg,
+            CostContext(name="lps"),
+            (1.0, 1.0, 1.0),
+            bounds,
+            DEV,
+            verb=0,
+            maxfev=50,
         )
         assert params.shape == (12,)
         assert cost > 0.5
@@ -564,6 +655,7 @@ class TestRefinePowell:
 # ---------------------------------------------------------------------------
 # allineate (integration test)
 # ---------------------------------------------------------------------------
+
 
 class TestAllineate:
     def test_identity_alignment(self):
@@ -647,8 +739,10 @@ class TestAllineate:
         matrix, warped = allineate(base, source, config=cfg)
         assert warped.shape == base.shape
 
-    @pytest.mark.skip(reason="_compute_cost passes 3D base to clipped_pearson "
-                       "which expects 1D; pre-existing bug outside test scope")
+    @pytest.mark.skip(
+        reason="_compute_cost passes 3D base to clipped_pearson "
+        "which expects 1D; pre-existing bug outside test scope"
+    )
     def test_ls_cost(self):
         """Test with clipped pearson cost."""
         vol = _sphere_volume((12, 12, 12))
@@ -690,3 +784,100 @@ class TestAllineate:
         )
         matrix, warped = allineate(vol, vol, config=cfg)
         assert matrix.device == torch.device("cpu")
+
+    def test_cmass_direct_reproduces_auto(self):
+        """-cmass_direct with the printed shift reproduces the auto-cmass result.
+
+        The reported shift is in base-grid voxels; feeding it back via
+        cmass_direct must skip the COM estimate and land in the same place. With
+        refinement disabled the final transform is exactly the cmass init, so the
+        two runs must agree bit-for-bit and the warped source's COM must sit on
+        the base COM.
+        """
+        base = _sphere_volume((20, 22, 24), center=(12, 11, 10))
+        source = _sphere_volume((20, 22, 24), center=(8, 14, 13))
+
+        def _cfg(**kw):
+            return AffineAlignConfig(
+                cost="ls",
+                twopass=False,
+                powell_maxfev=0,
+                adam_iters_1x=0,
+                adam_iters_2x=0,
+                autocrop=False,
+                autoweight=False,
+                verb=0,
+                **kw,
+            )
+
+        shift = _cmass_translation(base, source).cpu().numpy()
+        m_auto, w_auto = allineate(base, source, config=_cfg(cmass=True))
+        m_dir, w_dir = allineate(base, source, config=_cfg(cmass_direct=tuple(shift)))
+
+        torch.testing.assert_close(m_auto, m_dir, atol=1e-5, rtol=0.0)
+        torch.testing.assert_close(w_auto, w_dir, atol=1e-5, rtol=0.0)
+        # the cmass shift aligns the source COM onto the base COM
+        torch.testing.assert_close(
+            _center_of_mass(w_auto), _center_of_mass(base), atol=0.6, rtol=0.0
+        )
+
+    def test_save_cmass_writes_file(self, tmp_path):
+        """-save_cmass writes the cmass-positioned source to disk."""
+        base = _sphere_volume((16, 16, 16), center=(8, 8, 8))
+        source = _sphere_volume((16, 16, 16), center=(6, 9, 10))
+        out = tmp_path / "cmass.nii.gz"
+        cfg = AffineAlignConfig(
+            cost="ls",
+            twopass=False,
+            powell_maxfev=0,
+            adam_iters_1x=0,
+            adam_iters_2x=0,
+            autocrop=False,
+            autoweight=False,
+            cmass=True,
+            verb=0,
+        )
+        allineate(base, source, config=cfg, save_cmass_path=str(out))
+        assert out.exists()
+
+    def test_cross_grid_far_apart_brains_align(self):
+        """Cross-grid alignment when the brains start far apart in scanner space.
+
+        Regression: the source was resampled onto the base grid at its
+        un-shifted position, so when the two brains sit far apart in physical
+        space that resample captures the wrong part of the source (often empty),
+        the cost can't see the real overlap, and the result drifts back to the
+        wrong place even though the cmass shift itself was correct. Baking the
+        cmass into the resample lands the source brain in the base FOV first, so
+        the optimiser converges. Here the affines put the brains 24 mm apart.
+        """
+        base = _sphere_volume((30, 40, 40), center=(20, 20, 15), radius=6)
+        source = _sphere_volume((50, 40, 40), center=(20, 20, 15), radius=6)
+        base_aff = np.eye(4)
+        src_aff = np.eye(4)
+        src_aff[2, 3] = 24.0  # source brain sits +24 mm away in physical z
+        cfg = AffineAlignConfig(
+            cost="ls",
+            dof="rigid",
+            twopass=True,
+            coarse_range=6,
+            coarse_step=3,
+            powell_maxfev=0,
+            adam_iters_1x=60,
+            adam_iters_2x=40,
+            autocrop=False,
+            autoweight=False,
+            verb=0,
+        )
+        _, warped = allineate(
+            base,
+            source,
+            config=cfg,
+            base_header={"affine": base_aff},
+            source_header={"affine": src_aff},
+        )
+
+        assert warped.max().item() > 0.5  # the brain actually made it into the FOV
+        torch.testing.assert_close(
+            _center_of_mass(warped), _center_of_mass(base), atol=1.5, rtol=0.0
+        )

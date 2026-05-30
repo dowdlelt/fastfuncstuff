@@ -33,7 +33,6 @@ from .affine import (
     identity_params,
     params_to_matrix,
     params_to_matrix_batched,
-    resample_to_base_grid,
 )
 from .cost import (
     _auto_clip,
@@ -63,14 +62,14 @@ except ImportError:
 def _tqdm_bar(iterable, total=None, desc=None, disable=False):
     """Wrap iterable in tqdm if available, otherwise passthrough."""
     if tqdm is not None and not disable:
-        return tqdm(iterable, total=total, desc=desc, file=sys.stderr,
-                    leave=True, ncols=80)
+        return tqdm(iterable, total=total, desc=desc, file=sys.stderr, leave=True, ncols=80)
     return iterable
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class AffineAlignConfig:
@@ -83,39 +82,44 @@ class AffineAlignConfig:
     # cru/cra/crm (correlation ratio). ffs-special per-voxel Gaussian local
     # Pearson: lps (absolute), lpsc (signed).
     cost: str = "lpa"
-    lpa_sigma: float = 4.0          # Gaussian sigma / box radius for lps/lpsc
-    lpa_kernel: str = "gauss"       # "gauss" or "box" (lps/lpsc only)
+    lpa_sigma: float = 4.0  # Gaussian sigma / box radius for lps/lpsc
+    lpa_kernel: str = "gauss"  # "gauss" or "box" (lps/lpsc only)
 
     # Blok geometry for AFNI-faithful lpa/lpc (radius in mm; None auto-sizes
     # to ~555 voxels per blok, matching 3dAllineate).
-    bloktype: str = "tohd"          # "tohd" (AFNI default), "rhdd", or "cube"
+    bloktype: str = "tohd"  # "tohd" (AFNI default), "rhdd", or "cube"
     blokrad: float | None = None
-    ppow: float = 1.0               # |z| emphasis exponent (AFNI AFNI_LPC_POWER)
+    ppow: float = 1.0  # |z| emphasis exponent (AFNI AFNI_LPC_POWER)
 
     # Coarse search. Ranges mirror 3dAllineate's defaults: angle ±30°,
     # shift ±32% of grid size, scale ±20%. ``range_scale`` shrinks all of them
     # (-smallrange -> 0.5, -verysmallrange -> 0.25).
     twopass: bool = True
-    coarse_range: float = 30.0     # rotation half-range, degrees
-    coarse_step: float = 5.0       # rotation step, degrees
+    coarse_range: float = 30.0  # rotation half-range, degrees
+    coarse_step: float = 5.0  # rotation step, degrees
     coarse_shift_frac: float = 0.32  # translation half-range (fraction of grid)
-    coarse_shift_steps: int = 7    # samples per translation axis (odd, incl. 0)
+    coarse_shift_steps: int = 7  # samples per translation axis (odd, incl. 0)
     coarse_scale_range: float = 0.20  # scale half-range (fraction)
-    range_scale: float = 1.0       # global shrink for all coarse ranges + bounds
-    tbest: int = 3       # best coarse candidates to carry into refinement
+    range_scale: float = 1.0  # global shrink for all coarse ranges + bounds
+    tbest: int = 3  # best coarse candidates to carry into refinement
 
     # Refinement tuning. Iteration counts are ceilings; Adam stops early on a
     # relative-tolerance plateau, so generous caps are cheap when converged.
-    adam_iters_2x: int = 300     # Adam iters at 2x downsampled (ceiling)
-    adam_iters_1x: int = 400     # Adam iters at full resolution (ceiling)
+    adam_iters_2x: int = 300  # Adam iters at 2x downsampled (ceiling)
+    adam_iters_1x: int = 400  # Adam iters at full resolution (ceiling)
     # lr 0.005 climbs steadily to a good optimum; higher (e.g. 0.02) overshoots
     # from the cmass start, oscillates, and trips early-stop at a worse point.
-    adam_lr_2x: float = 0.01     # Adam learning rate at 2x
-    adam_lr: float = 0.005       # Adam learning rate at full resolution
-    powell_maxfev: int = 500     # Powell max function evaluations (0=skip)
+    adam_lr_2x: float = 0.01  # Adam learning rate at 2x
+    adam_lr: float = 0.005  # Adam learning rate at full resolution
+    powell_maxfev: int = 500  # Powell max function evaluations (0=skip)
 
     # Center-of-mass
     cmass: bool = True
+    # Manual cmass shift [dx, dy, dz] in base-grid voxels — the same space and
+    # sign the auto path prints. When set, skips the automatic center-of-mass
+    # estimate and uses these directly, so you can reproduce or hand-tune the
+    # initial placement (manual positioning) instead of relying on COM matching.
+    cmass_direct: tuple[float, float, float] | None = None
 
     # Interpolation
     interp: str = "linear"  # "linear" or "cubic"
@@ -178,8 +182,7 @@ class CostContext:
         key = (tuple(shape), tuple(round(v, 4) for v in voxdims))
         bs = self._blok_cache.get(key)
         if bs is None:
-            bs = assign_bloks(tuple(shape), voxdims, self.bloktype,
-                              self.blokrad_mm, device=device)
+            bs = assign_bloks(tuple(shape), voxdims, self.bloktype, self.blokrad_mm, device=device)
             self._blok_cache[key] = bs
         return bs
 
@@ -209,22 +212,20 @@ def _compute_cost(
     name = ctx.name
     if name in ("ls", "pearclp"):
         return clipped_pearson_correlation(
-            base.reshape(-1), warped.reshape(-1),
+            base.reshape(-1),
+            warped.reshape(-1),
             weight.reshape(-1) if weight is not None else None,
         )
     if name == "lps":
-        return lpa_correlation(base, warped, weight, sigma=ctx.sigma,
-                               kernel_type=ctx.kernel)
+        return lpa_correlation(base, warped, weight, sigma=ctx.sigma, kernel_type=ctx.kernel)
     if name == "lpsc":
-        return lpc_correlation(base, warped, weight, sigma=ctx.sigma,
-                               kernel_type=ctx.kernel)
+        return lpc_correlation(base, warped, weight, sigma=ctx.sigma, kernel_type=ctx.kernel)
     if name in _BLOK_COSTS:
         bs = ctx.blokset(base.shape, voxdims, base.device)
         fn = lpa_cost if name == "lpa" else lpc_cost
         return fn(base, warped, weight, bs, ppow=ctx.ppow)
     if name in _HIST_COSTS:
-        kw = dict(weight=weight, base_clip=ctx.base_clip,
-                  source_clip=ctx.source_clip)
+        kw = dict(weight=weight, base_clip=ctx.base_clip, source_clip=ctx.source_clip)
         if name == "mi":
             return cost_hist.mi_cost(base, warped, **kw)
         if name == "nmi":
@@ -297,6 +298,7 @@ def _batched_cost(
 # Multi-resolution utilities
 # ---------------------------------------------------------------------------
 
+
 def _downsample_3d(vol: Tensor, factor: int) -> Tensor:
     """Downsample a 3D volume by an integer factor using avg pooling."""
     if factor <= 1:
@@ -318,9 +320,10 @@ def _smooth_to_resolution(vol: Tensor, factor: int) -> Tensor:
 # Auto-crop: remove zero margins for faster optimization
 # ---------------------------------------------------------------------------
 
-def _compute_nonzero_bbox(vol: Tensor, pad: int = 8) -> tuple[
-    tuple[int, int, int], tuple[int, int, int]
-]:
+
+def _compute_nonzero_bbox(
+    vol: Tensor, pad: int = 8
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """Compute tight bounding box of nonzero voxels, with padding.
 
     Uses generous padding (default 8 voxels, at least 5% of each axis)
@@ -409,6 +412,7 @@ def _crop_volumes(
 # Source validity mask
 # ---------------------------------------------------------------------------
 
+
 def _compute_source_validity_mask(
     source_shape: tuple[int, int, int],
     base_shape: tuple[int, int, int],
@@ -439,17 +443,24 @@ def _compute_source_validity_mask(
         indexing="ij",
     )
     N = onz * ony * onx
-    coords = torch.stack([ii.reshape(-1), jj.reshape(-1), kk.reshape(-1),
-                          torch.ones(N, device=device, dtype=dtype)], dim=0)
+    coords = torch.stack(
+        [ii.reshape(-1), jj.reshape(-1), kk.reshape(-1), torch.ones(N, device=device, dtype=dtype)],
+        dim=0,
+    )
     src_coords = grid_matrix @ coords  # (4, N)
 
     src_x = src_coords[0]
     src_y = src_coords[1]
     src_z = src_coords[2]
 
-    valid = ((src_x >= -0.5) & (src_x <= snx - 0.5) &
-             (src_y >= -0.5) & (src_y <= sny - 0.5) &
-             (src_z >= -0.5) & (src_z <= snz - 0.5))
+    valid = (
+        (src_x >= -0.5)
+        & (src_x <= snx - 0.5)
+        & (src_y >= -0.5)
+        & (src_y <= sny - 0.5)
+        & (src_z >= -0.5)
+        & (src_z <= snz - 0.5)
+    )
 
     return valid.reshape(onz, ony, onx)
 
@@ -457,6 +468,7 @@ def _compute_source_validity_mask(
 # ---------------------------------------------------------------------------
 # Parameter bounds and normalization (AFNI-style)
 # ---------------------------------------------------------------------------
+
 
 def _compute_param_bounds(
     base_shape: tuple[int, int, int],
@@ -485,10 +497,10 @@ def _compute_param_bounds(
     bounds[1] = [cmass_shift[1] - ty, cmass_shift[1] + ty]
     bounds[2] = [cmass_shift[2] - tz, cmass_shift[2] + tz]
 
-    bounds[3:6] = [-30.0 * rs, 30.0 * rs]            # rotations (degrees)
-    sc = 0.20 * rs                                    # scale half-range (±20%)
+    bounds[3:6] = [-30.0 * rs, 30.0 * rs]  # rotations (degrees)
+    sc = 0.20 * rs  # scale half-range (±20%)
     bounds[6:9] = [1.0 - sc, 1.0 + sc]
-    bounds[9:12] = [-0.1111 * rs, 0.1111 * rs]        # shears
+    bounds[9:12] = [-0.1111 * rs, 0.1111 * rs]  # shears
 
     return bounds
 
@@ -499,9 +511,9 @@ def _get_free_mask(dof: str) -> np.ndarray:
     if dof == "rigid":
         free[6:12] = False
     elif dof == "epi":
-        free[6] = False    # sx
-        free[8] = False    # sz
-        free[11] = False   # shzy
+        free[6] = False  # sx
+        free[8] = False  # sz
+        free[11] = False  # shzy
     return free
 
 
@@ -548,6 +560,7 @@ def _denormalize_t(x_norm: Tensor, bmin: Tensor, span: Tensor) -> Tensor:
 # Stage 1: Center-of-mass initialization
 # ---------------------------------------------------------------------------
 
+
 def _center_of_mass(vol: Tensor, weight: Tensor | None = None) -> Tensor:
     """Compute weighted center of mass in voxel coordinates."""
     device = vol.device
@@ -557,8 +570,7 @@ def _center_of_mass(vol: Tensor, weight: Tensor | None = None) -> Tensor:
     w = weight * vol.abs() if weight is not None else vol.abs()
     wsum = w.sum()
     if wsum < 1e-10:
-        return torch.tensor([nx / 2.0, ny / 2.0, nz / 2.0],
-                            device=device, dtype=dtype)
+        return torch.tensor([nx / 2.0, ny / 2.0, nz / 2.0], device=device, dtype=dtype)
 
     kk, jj, ii = torch.meshgrid(
         torch.arange(nz, dtype=dtype, device=device),
@@ -566,20 +578,35 @@ def _center_of_mass(vol: Tensor, weight: Tensor | None = None) -> Tensor:
         torch.arange(nx, dtype=dtype, device=device),
         indexing="ij",
     )
-    return torch.stack([(w * ii).sum() / wsum,
-                        (w * jj).sum() / wsum,
-                        (w * kk).sum() / wsum])
+    return torch.stack([(w * ii).sum() / wsum, (w * jj).sum() / wsum, (w * kk).sum() / wsum])
 
 
-def _cmass_translation(base: Tensor, source: Tensor,
-                       weight: Tensor | None = None) -> Tensor:
-    """Compute translation to align source center-of-mass to base."""
-    return _center_of_mass(source) - _center_of_mass(base, weight)
+def _cmass_translation(base: Tensor, source: Tensor, grid_matrix: Tensor | None = None) -> Tensor:
+    """Translation (base-grid voxels) mapping the source centroid onto the base.
+
+    Each centroid is the value-weighted centre of mass of its OWN volume on its
+    OWN grid (AFNI's mri_get_cmass_3D). Crucially the source centroid must come
+    from the *native* source, not from the source resampled onto the base grid:
+    that resample clips the source to the base FOV, so anything the base doesn't
+    cover (e.g. the top of the brain under a short EPI) is dropped from the source
+    centroid too and the shift comes up short ("not moved far enough").
+
+    ``grid_matrix`` (base→source voxels) maps the native-source centroid back
+    into base-grid voxels before differencing; pass None when the two already
+    share a grid.
+    """
+    c_base = _center_of_mass(base)
+    c_src = _center_of_mass(source)
+    if grid_matrix is not None:
+        c_h = torch.cat([c_src, c_src.new_ones(1)])
+        c_src = (torch.linalg.inv(grid_matrix) @ c_h)[:3]
+    return c_src - c_base
 
 
 # ---------------------------------------------------------------------------
 # Stage 2: GPU-parallel coarse search
 # ---------------------------------------------------------------------------
+
 
 def _base_params(n: int, translations: Tensor, device: torch.device) -> Tensor:
     """(n, 12) identity-scale param rows with the given (n, 3) translations."""
@@ -604,20 +631,22 @@ def _translation_candidates(
     axes = []
     for a in range(3):
         r = float(shift_range[a])
-        axes.append(torch.linspace(-r, r, steps, device=device)
-                    if r > 0 else torch.zeros(1, device=device))
+        axes.append(
+            torch.linspace(-r, r, steps, device=device) if r > 0 else torch.zeros(1, device=device)
+        )
     gx, gy, gz = torch.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
     offs = torch.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=1)
     return _base_params(offs.shape[0], center[None, :] + offs, device)
 
 
 def _rotation_candidates(
-    angle_range: float, angle_step: float, translations: Tensor,
+    angle_range: float,
+    angle_step: float,
+    translations: Tensor,
     device: torch.device,
 ) -> Tensor:
     """Rotation grid (±angle_range) replicated at each given translation."""
-    angles = torch.arange(-angle_range, angle_range + angle_step * 0.5,
-                          angle_step, device=device)
+    angles = torch.arange(-angle_range, angle_range + angle_step * 0.5, angle_step, device=device)
     if angles.numel() == 0:
         angles = torch.zeros(1, device=device)
     rz, rx, ry = torch.meshgrid(angles, angles, angles, indexing="ij")
@@ -634,9 +663,15 @@ def _rotation_candidates(
 
 
 def _eval_candidates(
-    base: Tensor, source: Tensor, weight: Tensor | None, candidates: Tensor,
-    ctx: CostContext, voxdims: tuple[float, float, float],
-    device: torch.device, desc: str, verb: int,
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor | None,
+    candidates: Tensor,
+    ctx: CostContext,
+    voxdims: tuple[float, float, float],
+    device: torch.device,
+    desc: str,
+    verb: int,
 ) -> Tensor:
     """Cost of every (B, 12) candidate against base (chunked) -> (B,)."""
     matrices = params_to_matrix_batched(candidates)
@@ -644,8 +679,7 @@ def _eval_candidates(
     B = candidates.shape[0]
     all_costs = []
     chunks = range(0, B, chunk_size)
-    for start in _tqdm_bar(chunks, total=len(range(0, B, chunk_size)),
-                           desc=desc, disable=verb < 1):
+    for start in _tqdm_bar(chunks, total=len(range(0, B, chunk_size)), desc=desc, disable=verb < 1):
         end = min(start + chunk_size, B)
         with torch.no_grad():
             warped = apply_affine_batched(source, matrices[start:end], base.shape)
@@ -682,33 +716,42 @@ def _coarse_search(
     rs = config.range_scale
     # Per-axis translation half-range, in this grid's voxels.
     shift_range = torch.tensor(
-        [config.coarse_shift_frac * rs * (nx - 1),
-         config.coarse_shift_frac * rs * (ny - 1),
-         config.coarse_shift_frac * rs * (nz - 1)],
-        device=device)
+        [
+            config.coarse_shift_frac * rs * (nx - 1),
+            config.coarse_shift_frac * rs * (ny - 1),
+            config.coarse_shift_frac * rs * (nz - 1),
+        ],
+        device=device,
+    )
     angle_range = config.coarse_range * rs
 
     # --- Phase A: broad translation sweep (no rotation) ---
     trans_cands = _translation_candidates(
-        init_translation, shift_range, config.coarse_shift_steps, device)
+        init_translation, shift_range, config.coarse_shift_steps, device
+    )
     if verb >= 1:
-        print(f"  Coarse phase A (translation): {trans_cands.shape[0]} "
-              f"candidates, shift=±({shift_range[0]:.0f},{shift_range[1]:.0f},"
-              f"{shift_range[2]:.0f})vox")
-    costs_a = _eval_candidates(base, source, weight, trans_cands, ctx, voxdims,
-                               device, "Coarse-T", verb)
+        print(
+            f"  Coarse phase A (translation): {trans_cands.shape[0]} "
+            f"candidates, shift=±({shift_range[0]:.0f},{shift_range[1]:.0f},"
+            f"{shift_range[2]:.0f})vox"
+        )
+    costs_a = _eval_candidates(
+        base, source, weight, trans_cands, ctx, voxdims, device, "Coarse-T", verb
+    )
     k = min(config.tbest, costs_a.shape[0])
     top_t = costs_a.topk(k).indices
     best_translations = trans_cands[top_t, 0:3]  # (k, 3)
 
     # --- Phase B: rotation sweep at the best translation(s) ---
-    rot_cands = _rotation_candidates(
-        angle_range, config.coarse_step, best_translations, device)
+    rot_cands = _rotation_candidates(angle_range, config.coarse_step, best_translations, device)
     if verb >= 1:
-        print(f"  Coarse phase B (rotation): {rot_cands.shape[0]} candidates, "
-              f"angle=±{angle_range:.0f}°, step={config.coarse_step}°")
-    costs_b = _eval_candidates(base, source, weight, rot_cands, ctx, voxdims,
-                               device, "Coarse-R", verb)
+        print(
+            f"  Coarse phase B (rotation): {rot_cands.shape[0]} candidates, "
+            f"angle=±{angle_range:.0f}°, step={config.coarse_step}°"
+        )
+    costs_b = _eval_candidates(
+        base, source, weight, rot_cands, ctx, voxdims, device, "Coarse-R", verb
+    )
 
     # Combine both phases and keep the global best tbest.
     all_cands = torch.cat([trans_cands, rot_cands], dim=0)
@@ -719,16 +762,17 @@ def _coarse_search(
     result = [all_cands[top_idx[i]] for i in range(tbest)]
     if verb >= 1:
         p = result[0]
-        print(f"  Best coarse: cost={top_costs[0].item():.6f}, "
-              f"rot=({p[3].item():.1f}°, {p[4].item():.1f}°, {p[5].item():.1f}°), "
-              f"shift=({p[0].item():.1f}, {p[1].item():.1f}, {p[2].item():.1f})")
+        print(
+            f"  Best coarse: cost={top_costs[0].item():.6f}, "
+            f"rot=({p[3].item():.1f}°, {p[4].item():.1f}°, {p[5].item():.1f}°), "
+            f"shift=({p[0].item():.1f}, {p[1].item():.1f}, {p[2].item():.1f})"
+        )
         if tbest > 1:
             print(f"  Keeping top {tbest} candidates for refinement")
     return result
 
 
-def _estimate_chunk_size(vol_shape: tuple[int, ...],
-                         device: torch.device) -> int:
+def _estimate_chunk_size(vol_shape: tuple[int, ...], device: torch.device) -> int:
     """Estimate how many candidates we can process at once."""
     voxels = vol_shape[0] * vol_shape[1] * vol_shape[2]
     if device.type == "cuda":
@@ -747,6 +791,7 @@ def _estimate_chunk_size(vol_shape: tuple[int, ...],
 # ---------------------------------------------------------------------------
 # Refinement: Normalized Adam (GPU-fast)
 # ---------------------------------------------------------------------------
+
 
 def _refine_adam_normalized(
     base: Tensor,
@@ -780,7 +825,8 @@ def _refine_adam_normalized(
     bmin, span = _bounds_to_torch(bounds, device)
     identity_norm = _normalize_t(
         torch.tensor(identity_phys, dtype=torch.float32, device=device),
-        bmin, span,
+        bmin,
+        span,
     )
 
     # Initialize in normalized space
@@ -807,8 +853,7 @@ def _refine_adam_normalized(
     # few iterations rather than every step (Adam is smooth enough that the
     # coarser best-tracking / early-stop cadence costs nothing in accuracy).
     sync_every = 5
-    pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc,
-                     disable=verb < 1)
+    pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
     for it in pbar:
         optimizer.zero_grad()
 
@@ -858,8 +903,7 @@ def _refine_adam_normalized(
             # `patience` iterations — handles plateaus and oscillation.
             if no_improve >= patience:
                 if verb >= 2:
-                    print(f"    {desc} converged at iter {it} "
-                          f"(cost={best_cost:.6f})")
+                    print(f"    {desc} converged at iter {it} (cost={best_cost:.6f})")
                 break
 
     best_phys = _denormalize_t(best_norm.clamp(0.0, 1.0), bmin, span).detach().cpu().numpy()
@@ -869,6 +913,7 @@ def _refine_adam_normalized(
 # ---------------------------------------------------------------------------
 # Refinement: Powell (derivative-free, final polish)
 # ---------------------------------------------------------------------------
+
 
 def _make_powell_cost(
     base: Tensor,
@@ -951,14 +996,20 @@ def _refine_powell(
     counter = [0]
     pbar = None
     if tqdm is not None and verb >= 1:
-        pbar = tqdm(total=maxfev, desc=desc, file=sys.stderr,
-                    leave=True, ncols=80)
+        pbar = tqdm(total=maxfev, desc=desc, file=sys.stderr, leave=True, ncols=80)
 
     cost_fn = _make_powell_cost(
-        base, source, weight,
-        ctx, voxdims,
-        bounds, free_mask, fixed_norm, device,
-        counter=counter, pbar=pbar,
+        base,
+        source,
+        weight,
+        ctx,
+        voxdims,
+        bounds,
+        free_mask,
+        fixed_norm,
+        device,
+        counter=counter,
+        pbar=pbar,
     )
 
     # Powell with bounds to keep params in [0,1]
@@ -967,7 +1018,9 @@ def _refine_powell(
     start_cost = -cost_fn(x0)  # cost at the incoming (refined) params
 
     result = minimize(
-        cost_fn, x0, method="Powell",
+        cost_fn,
+        x0,
+        method="Powell",
         bounds=param_bounds_01,
         options={
             "maxfev": maxfev,
@@ -985,8 +1038,10 @@ def _refine_powell(
     # return worse than the start — the polish must only ever help.
     if final_cost < start_cost:
         if verb >= 1:
-            print(f"    {desc}: kept pre-polish (start={start_cost:.6f} "
-                  f">= powell={final_cost:.6f}, {counter[0]} evals)")
+            print(
+                f"    {desc}: kept pre-polish (start={start_cost:.6f} "
+                f">= powell={final_cost:.6f}, {counter[0]} evals)"
+            )
         return init_params_phys.copy(), start_cost
 
     full_norm = fixed_norm.copy()
@@ -1002,6 +1057,7 @@ def _refine_powell(
 # ---------------------------------------------------------------------------
 # Stage 3: Progressive refinement
 # ---------------------------------------------------------------------------
+
 
 def _refine_progressive(
     base: Tensor,
@@ -1034,9 +1090,9 @@ def _refine_progressive(
     # histogram) regardless of alignment, so optimizing the downsampled surface
     # drives *away* from the true full-res basin (verified on EPI->anat lpc).
     # Those costs refine at full resolution, where the basin is stable.
-    can_downsample = (min(base.shape) > 16
-                      and ctx.name not in _BLOK_COSTS
-                      and ctx.name not in _HIST_COSTS)
+    can_downsample = (
+        min(base.shape) > 16 and ctx.name not in _BLOK_COSTS and ctx.name not in _HIST_COSTS
+    )
     if can_downsample:
         ds = 2
         base_2x = _downsample_3d(_smooth_to_resolution(base, ds), ds)
@@ -1051,17 +1107,25 @@ def _refine_progressive(
         voxdims_2x = tuple(v * ds for v in voxdims)
 
         if verb >= 1:
-            print(f"  Medium resolution ({base_2x.shape}, {ds}x downsample, "
-                  f"{len(trials)} trials):")
+            print(f"  Medium resolution ({base_2x.shape}, {ds}x downsample, {len(trials)} trials):")
 
         refined = []
         for i, (_, params) in enumerate(trials):
             params_ds = params.copy()
             params_ds[:3] /= ds
             params_out, cost = _refine_adam_normalized(
-                base_2x, source_2x, weight_2x, params_ds, config,
-                ctx, voxdims_2x, bounds_2x, device,
-                verb=verb, n_iters=config.adam_iters_2x, lr=config.adam_lr_2x,
+                base_2x,
+                source_2x,
+                weight_2x,
+                params_ds,
+                config,
+                ctx,
+                voxdims_2x,
+                bounds_2x,
+                device,
+                verb=verb,
+                n_iters=config.adam_iters_2x,
+                lr=config.adam_lr_2x,
                 desc=f"2x T{i}",
             )
             params_out[:3] *= ds  # scale translations back
@@ -1090,8 +1154,18 @@ def _refine_progressive(
     fine_trials = []
     for i, (_, params) in enumerate(trials):
         params_out, cost = _refine_adam_normalized(
-            base, source, weight, params, config, ctx, voxdims, bounds, device,
-            verb=verb, n_iters=config.adam_iters_1x, lr=config.adam_lr,
+            base,
+            source,
+            weight,
+            params,
+            config,
+            ctx,
+            voxdims,
+            bounds,
+            device,
+            verb=verb,
+            n_iters=config.adam_iters_1x,
+            lr=config.adam_lr,
             desc=f"Fine T{i}",
         )
         fine_trials.append((cost, params_out))
@@ -1107,7 +1181,14 @@ def _refine_progressive(
             print("  Powell polish (full resolution):")
 
         best_params, _ = _refine_powell(
-            base, source, weight, best_params, config, ctx, voxdims, bounds,
+            base,
+            source,
+            weight,
+            best_params,
+            config,
+            ctx,
+            voxdims,
+            bounds,
             device,
             verb=verb,
             initial_step=0.033,
@@ -1123,23 +1204,24 @@ def _refine_progressive(
 # Grid transform computation
 # ---------------------------------------------------------------------------
 
+
 def _compute_grid_matrix(
     source_affine: np.ndarray,
     base_affine: np.ndarray,
     device: torch.device,
 ) -> Tensor:
     """Compute the voxel grid transform: base voxel → source voxel."""
-    base_ijk2xyz = torch.from_numpy(
-        base_affine.astype(np.float64)).float().to(device)
+    base_ijk2xyz = torch.from_numpy(base_affine.astype(np.float64)).float().to(device)
     source_xyz2ijk = torch.linalg.inv(
-        torch.from_numpy(
-            source_affine.astype(np.float64)).float().to(device))
+        torch.from_numpy(source_affine.astype(np.float64)).float().to(device)
+    )
     return source_xyz2ijk @ base_ijk2xyz
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def allineate(
     base: Tensor,
@@ -1148,6 +1230,8 @@ def allineate(
     base_header: dict | None = None,
     source_header: dict | None = None,
     save_automask_path: str | None = None,
+    save_cmass_path: str | None = None,
+    save_weight_path: str | None = None,
 ) -> tuple[Tensor, Tensor]:
     """GPU-accelerated affine/rigid alignment.
 
@@ -1163,6 +1247,9 @@ def allineate(
         base_header: Header info from load_image.
         source_header: Header info from load_image.
         save_automask_path: If set, save the computed automask here.
+        save_cmass_path: If set, save the source positioned by the cmass shift
+            alone (no rotation/scale), on the base grid — lets you eyeball the
+            initial placement and reproduce it with config.cmass_direct.
 
     Returns:
         (matrix, warped):
@@ -1181,64 +1268,117 @@ def allineate(
     source_native = source.to(device)
     verb = config.verb
 
-    # Pre-resample source to base grid if needed
+    # Pre-resample the source onto the base grid, folding in the center-of-mass
+    # (or manual) shift BEFORE resampling. Computing the shift on the native
+    # volumes and baking it into the base→source map is what makes very different
+    # FOVs/orientations work: resampling the source at its un-shifted position
+    # samples wherever the base grid points, so when the brains are far apart in
+    # scanner space the resample captures the *wrong* part of the source and the
+    # cost can never recover — it just drifts back to that wrong place. With the
+    # shift baked in, the source brain lands in the base FOV up front and the
+    # optimiser is left only a small residual. ``align_matrix`` (base voxel →
+    # source-native voxel, shift applied first) is carried through to the final
+    # transform so the chain stays consistent.
     grid_matrix = None
     source_validity = None
-    if (base_header is not None and source_header is not None
-            and source.shape != base.shape):
+    cross_grid = (
+        base_header is not None and source_header is not None and source.shape != base.shape
+    )
+    if cross_grid:
         if verb >= 1:
             print(f"Resampling source {source.shape} to base grid {base.shape}")
-        grid_matrix = _compute_grid_matrix(
-            source_header["affine"], base_header["affine"], device)
+        grid_matrix = _compute_grid_matrix(source_header["affine"], base_header["affine"], device)
 
-        # Compute validity mask: which base voxels are inside the source FOV
-        source_validity = _compute_source_validity_mask(
-            source_native.shape, base.shape, grid_matrix)
-
-        source_on_base = resample_to_base_grid(
-            source_native, base.shape,
-            source_header["affine"], base_header["affine"])
-
-        # Zero out base-grid voxels outside the source FOV
-        # (resample_to_base_grid uses border padding, which gives fake
-        # edge-replicated values for out-of-bounds voxels)
-        source_on_base = source_on_base * source_validity.float()
-
+    cmass_shift = np.zeros(3)
+    if config.cmass_direct is not None:
+        cmass_shift = np.asarray(config.cmass_direct, dtype=np.float64)
         if verb >= 1:
+            t = cmass_shift
+            print(f"  Direct cmass shift: dx={t[0]:.2f}, dy={t[1]:.2f}, dz={t[2]:.2f} voxels")
+    elif config.cmass:
+        translation = _cmass_translation(base, source_native, grid_matrix=grid_matrix)
+        cmass_shift = translation.cpu().numpy()
+        if verb >= 1:
+            t = cmass_shift
+            print(f"  Center-of-mass shift: dx={t[0]:.2f}, dy={t[1]:.2f}, dz={t[2]:.2f} voxels")
+
+    g = grid_matrix if grid_matrix is not None else torch.eye(4, device=device)
+    cmass_mat = torch.eye(4, device=device)
+    cmass_mat[:3, 3] = torch.as_tensor(cmass_shift, device=device, dtype=cmass_mat.dtype)
+    align_matrix = g @ cmass_mat
+
+    if cross_grid or bool(np.any(cmass_shift != 0.0)):
+        source_validity = _compute_source_validity_mask(
+            source_native.shape, base.shape, align_matrix
+        )
+        source_on_base = apply_affine(source_native, align_matrix, base.shape, zero_outside=True)
+        source_on_base = source_on_base * source_validity.float()
+        if verb >= 1 and cross_grid:
             n_valid = int(source_validity.sum().item())
             n_total = source_validity.numel()
-            print(f"  Source covers {n_valid}/{n_total} base voxels "
-                  f"({100.0 * n_valid / n_total:.1f}%)")
+            print(
+                f"  Source covers {n_valid}/{n_total} base voxels "
+                f"({100.0 * n_valid / n_total:.1f}%)"
+            )
     else:
         source_on_base = source_native
 
-    # Weight image
-    weight = compute_weight_image(base) if config.autoweight else None
+    # Weight image — AFNI 3dAllineate mri_weightize: histogram clip level, median
+    # pre-filter, and the bottom-clip + largest-cluster + erode cleanup that drops
+    # the background (otherwise the smoothed weight fills the whole FOV).
+    weight = (
+        compute_weight_image(
+            base,
+            edge_fraction=0.05,
+            median_radius=2.25,
+            clusterize=True,
+            hist_cliplevel=True,
+        )
+        if config.autoweight
+        else None
+    )
 
     # Apply source validity mask to weight (exclude base voxels outside source)
     if source_validity is not None and weight is not None:
         weight = weight * source_validity.float()
 
-    # Source automask
+    # Source automask: restrict the SOURCE to its own object, the way AFNI does
+    # (the source automask is applied to the source data, never to the base
+    # weight). Folding this binary mask into the weight was wrong twice over: it
+    # reshaped the base-space weight into the source's outline, and it replaced
+    # the autoweight's smooth, SNR-graded halo with a hard edge — discarding the
+    # soft base-edge contribution that lpc leans on. The weight stays purely
+    # base-derived (autoweight, optionally FOV-clipped to source coverage).
     if config.source_automask:
         if verb >= 1:
             print("Computing source automask...")
         src_mask = automask(source_on_base, device=device)
-        if weight is not None:
-            weight = weight * src_mask.float()
-        else:
-            weight = src_mask.float()
+        source_on_base = source_on_base * src_mask.float()
         if verb >= 1:
             n = int(src_mask.sum().item())
-            print(f"  Source automask: {n}/{src_mask.numel()} voxels "
-                  f"({100.0 * n / src_mask.numel():.1f}%)")
+            print(
+                f"  Source automask: {n}/{src_mask.numel()} voxels "
+                f"({100.0 * n / src_mask.numel():.1f}%)"
+            )
 
         if save_automask_path is not None:
             from .io import save_image
-            save_image(src_mask.float(), save_automask_path,
-                       header_info=base_header)
+
+            save_image(src_mask.float(), save_automask_path, header_info=base_header)
             if verb >= 1:
                 print(f"  Saved automask: {save_automask_path}")
+
+    # Diagnostic: dump the exact weight the optimiser sees (autoweight × source
+    # validity × source automask), on the full base grid. Compare against AFNI's
+    # 3dAllineate -wtprefix to check the weight/mask is emphasising the right
+    # voxels (e.g. that a faded brain edge isn't being dropped).
+    if save_weight_path is not None:
+        from .io import save_image
+
+        w_save = weight if weight is not None else torch.ones_like(base)
+        save_image(w_save, save_weight_path, header_info=base_header)
+        if verb >= 1:
+            print(f"  Saved optimisation weight: {save_weight_path}")
 
     if verb >= 1:
         print(f"Allineate: {config.dof} alignment, cost={config.cost}")
@@ -1257,14 +1397,14 @@ def allineate(
     _weight_full = weight
 
     if config.autocrop:
-        base_crop, source_crop, weight_crop, offset = _crop_volumes(
-            base, source_on_base, weight)
+        base_crop, source_crop, weight_crop, offset = _crop_volumes(base, source_on_base, weight)
         if base_crop.shape != base.shape:
             crop_offset = offset
             if verb >= 1:
                 savings = 100.0 * (1.0 - (base_crop.numel() / base.numel()))
-                print(f"  Auto-crop: {base.shape} → {base_crop.shape} "
-                      f"({savings:.0f}% fewer voxels)")
+                print(
+                    f"  Auto-crop: {base.shape} → {base_crop.shape} ({savings:.0f}% fewer voxels)"
+                )
             # Use cropped volumes for optimization
             base_opt = base_crop
             source_opt = source_crop
@@ -1284,33 +1424,31 @@ def allineate(
     blokrad_mm = config.blokrad
     if config.cost in _BLOK_COSTS and blokrad_mm is None:
         from .cost_blok import auto_blok_radius
+
         blokrad_mm = auto_blok_radius(voxdims, config.bloktype)
     base_clip = source_clip = None
     if config.cost in _HIST_COSTS:
         base_clip = clip_range(base_opt)
         source_clip = clip_range(source_opt)
     ctx = CostContext(
-        name=config.cost, sigma=config.lpa_sigma, kernel=config.lpa_kernel,
-        bloktype=config.bloktype, blokrad_mm=blokrad_mm,
-        base_voxdims=voxdims, ppow=config.ppow,
-        base_clip=base_clip, source_clip=source_clip,
+        name=config.cost,
+        sigma=config.lpa_sigma,
+        kernel=config.lpa_kernel,
+        bloktype=config.bloktype,
+        blokrad_mm=blokrad_mm,
+        base_voxdims=voxdims,
+        ppow=config.ppow,
+        base_clip=base_clip,
+        source_clip=source_clip,
     )
 
-    # Stage 1: Center-of-mass initialization
+    # Stage 1: the optimiser starts from identity — the cmass/manual shift is
+    # already folded into ``align_matrix`` (the source was resampled through it
+    # above), so only a small residual remains to be found.
     init_params = identity_params(device=device)
-    cmass_shift = np.zeros(3)
-    if config.cmass:
-        translation = _cmass_translation(base_opt, source_opt, weight_opt)
-        cmass_shift = translation.cpu().numpy()
-        init_params[:3] = translation
-        if verb >= 1:
-            t = cmass_shift
-            print(f"  Center-of-mass shift: "
-                  f"dx={t[0]:.2f}, dy={t[1]:.2f}, dz={t[2]:.2f} voxels")
 
-    # Parameter bounds (based on optimization grid size)
-    bounds = _compute_param_bounds(base_opt.shape, cmass_shift,
-                                   range_scale=config.range_scale)
+    # Parameter bounds centred on identity (the residual after the baked shift).
+    bounds = _compute_param_bounds(base_opt.shape, range_scale=config.range_scale)
 
     # Stage 2: GPU-parallel coarse search (at downsampled resolution)
     if config.twopass:
@@ -1327,24 +1465,28 @@ def allineate(
             ds_factor = 1
 
         if ds_factor > 1:
-            base_ds = _downsample_3d(
-                _smooth_to_resolution(base_opt, ds_factor), ds_factor)
-            source_ds = _downsample_3d(
-                _smooth_to_resolution(source_opt, ds_factor), ds_factor)
-            weight_ds = (_downsample_3d(weight_opt, ds_factor)
-                         if weight_opt is not None else None)
+            base_ds = _downsample_3d(_smooth_to_resolution(base_opt, ds_factor), ds_factor)
+            source_ds = _downsample_3d(_smooth_to_resolution(source_opt, ds_factor), ds_factor)
+            weight_ds = _downsample_3d(weight_opt, ds_factor) if weight_opt is not None else None
 
             coarse_init = init_params.clone()
             coarse_init[:3] /= ds_factor
 
             if verb >= 1:
-                print(f"  Coarse resolution "
-                      f"({base_ds.shape}, {ds_factor}x downsample):")
+                print(f"  Coarse resolution ({base_ds.shape}, {ds_factor}x downsample):")
 
             voxdims_coarse = tuple(v * ds_factor for v in voxdims)
             best_list = _coarse_search(
-                base_ds, source_ds, weight_ds, config, ctx, voxdims_coarse,
-                coarse_init[:3], device, verb)
+                base_ds,
+                source_ds,
+                weight_ds,
+                config,
+                ctx,
+                voxdims_coarse,
+                coarse_init[:3],
+                device,
+                verb,
+            )
 
             trial_params_list = []
             for p in best_list:
@@ -1355,8 +1497,16 @@ def allineate(
             del base_ds, source_ds, weight_ds
         else:
             best_list = _coarse_search(
-                base_opt, source_opt, weight_opt, config, ctx, voxdims,
-                init_params[:3], device, verb)
+                base_opt,
+                source_opt,
+                weight_opt,
+                config,
+                ctx,
+                voxdims,
+                init_params[:3],
+                device,
+                verb,
+            )
             trial_params_list = [p.cpu().numpy().copy() for p in best_list]
     else:
         trial_params_list = [init_params.cpu().numpy().copy()]
@@ -1366,43 +1516,65 @@ def allineate(
         print("Refinement phase:")
 
     best_params_phys = _refine_progressive(
-        base_opt, source_opt, weight_opt, trial_params_list,
-        config, ctx, voxdims, bounds, device, verb)
+        base_opt,
+        source_opt,
+        weight_opt,
+        trial_params_list,
+        config,
+        ctx,
+        voxdims,
+        bounds,
+        device,
+        verb,
+    )
 
-    # Build final matrix — adjust for crop offset if needed
+    # Build final matrix — adjust for crop offset if needed.
+    def _residual_to_final(residual: Tensor) -> Tensor:
+        """Map a cropped-base→cropped-source residual to the full base→native pull.
+
+        The residual maps cropped-base voxels → cropped-source voxels. Source was
+        cropped identically, so undo the crop by conjugating with the offset
+        (full_base_voxel = crop_base_voxel + offset → T(+off) @ M @ T(-off)), then
+        compose ``align_matrix`` — the base→source map that already carries the
+        cmass shift the source was resampled through.
+        """
+        if crop_offset is not None:
+            x_off, y_off, z_off = crop_offset
+            T_pos = torch.eye(4, device=device, dtype=torch.float32)
+            T_neg = torch.eye(4, device=device, dtype=torch.float32)
+            T_pos[0, 3], T_pos[1, 3], T_pos[2, 3] = float(x_off), float(y_off), float(z_off)
+            T_neg[0, 3], T_neg[1, 3], T_neg[2, 3] = float(-x_off), float(-y_off), float(-z_off)
+            residual = T_pos @ residual @ T_neg
+        return align_matrix @ residual
+
     best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
-    residual_matrix = params_to_matrix(best_t)
-
-    if crop_offset is not None:
-        # The residual_matrix maps cropped-base voxels → cropped-source voxels.
-        # Since source was cropped identically, we need:
-        #   full_base_voxel = crop_base_voxel + offset
-        # So: M_full = T(+offset) @ M_crop @ T(-offset)
-        # where T(offset) shifts by (x_off, y_off, z_off)
-        x_off, y_off, z_off = crop_offset
-        T_pos = torch.eye(4, device=device, dtype=torch.float32)
-        T_neg = torch.eye(4, device=device, dtype=torch.float32)
-        T_pos[0, 3] = float(x_off)
-        T_pos[1, 3] = float(y_off)
-        T_pos[2, 3] = float(z_off)
-        T_neg[0, 3] = float(-x_off)
-        T_neg[1, 3] = float(-y_off)
-        T_neg[2, 3] = float(-z_off)
-        residual_matrix = T_pos @ residual_matrix @ T_neg
-    final_matrix = (grid_matrix @ residual_matrix
-                    if grid_matrix is not None
-                    else residual_matrix)
+    final_matrix = _residual_to_final(params_to_matrix(best_t))
 
     # Final output: single-step resampling from native source
     # Bring source_native back to GPU if it was offloaded
     source_native = source_native.to(device)
+
+    # Optional diagnostic: write the source positioned by the cmass shift alone
+    # (no refinement), so the placement can be eyeballed and reproduced or
+    # hand-tuned via -cmass_direct. With identity residual this is exactly
+    # ``align_matrix`` — the baked-in shift applied to the native source.
+    if save_cmass_path is not None:
+        from .io import save_image
+
+        cmass_final = _residual_to_final(params_to_matrix(init_params))
+        if config.final_interp == "wsinc5":
+            cmass_warped = apply_affine_wsinc5(source_native, cmass_final, base.shape)
+        else:
+            cmass_warped = apply_affine(source_native, cmass_final, base.shape, zero_outside=True)
+        save_image(cmass_warped, save_cmass_path, header_info=base_header)
+        if verb >= 1:
+            print(f"  Saved cmass-shifted source: {save_cmass_path}")
     if config.final_interp == "wsinc5":
         if verb >= 1:
             print("Applying final wsinc5 interpolation...")
         warped = apply_affine_wsinc5(source_native, final_matrix, base.shape)
     else:
-        warped = apply_affine(source_native, final_matrix, base.shape,
-                              zero_outside=True)
+        warped = apply_affine(source_native, final_matrix, base.shape, zero_outside=True)
 
     if verb >= 1:
         final_cost = _compute_cost(base, warped, weight, ctx, voxdims)

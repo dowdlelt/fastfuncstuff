@@ -58,18 +58,16 @@ Examples:
 
     # --- Input/Output ---
     io_group = parser.add_argument_group("Input/Output")
-    io_group.add_argument("-base", required=True,
-                          help="Base/reference image (.nii/.nii.gz)")
-    io_group.add_argument("-source", required=True,
-                          help="Source/moving image to align")
-    io_group.add_argument("-prefix", required=True,
-                          help="Output aligned image")
-    io_group.add_argument("-1Dmatrix_save", default=None,
-                          help="Save affine matrix as .aff12.1D (AFNI format)")
-    io_group.add_argument("-1Dmatrix_apply", default=None,
-                          help="Apply existing matrix (skip alignment)")
-    io_group.add_argument("-base_index", type=int, default=None,
-                          help="Use volume N from 4D base")
+    io_group.add_argument("-base", required=True, help="Base/reference image (.nii/.nii.gz)")
+    io_group.add_argument("-source", required=True, help="Source/moving image to align")
+    io_group.add_argument("-prefix", required=True, help="Output aligned image")
+    io_group.add_argument(
+        "-1Dmatrix_save", default=None, help="Save affine matrix as .aff12.1D (AFNI format)"
+    )
+    io_group.add_argument(
+        "-1Dmatrix_apply", default=None, help="Apply existing matrix (skip alignment)"
+    )
+    io_group.add_argument("-base_index", type=int, default=None, help="Use volume N from 4D base")
     io_group.add_argument(
         "-save_mean",
         action="store_true",
@@ -79,121 +77,206 @@ Examples:
     # --- Alignment mode ---
     mode_group = parser.add_argument_group("Alignment mode")
     mode_ex = mode_group.add_mutually_exclusive_group()
-    mode_ex.add_argument("-rigid", action="store_true",
-                         help="6 DoF: translation + rotation only")
-    mode_ex.add_argument("-affine", action="store_true", default=True,
-                         help="12 DoF: full affine (default)")
-    mode_ex.add_argument("-EPI", action="store_true",
-                         help="9 DoF: EPI-specific (freeze x/z scale, z shear)")
+    mode_ex.add_argument("-rigid", action="store_true", help="6 DoF: translation + rotation only")
+    mode_ex.add_argument(
+        "-affine", action="store_true", default=True, help="12 DoF: full affine (default)"
+    )
+    mode_ex.add_argument(
+        "-EPI", action="store_true", help="9 DoF: EPI-specific (freeze x/z scale, z shear)"
+    )
 
     # --- Cost function ---
     cost_group = parser.add_argument_group("Cost function")
     cost_group.add_argument(
         "-cost",
-        choices=["ls", "lpa", "lpc", "lps", "lpsc",
-                 "mi", "nmi", "je", "hel", "cru", "cra", "crm"],
+        choices=["ls", "lpa", "lpc", "lps", "lpsc", "mi", "nmi", "je", "hel", "cru", "cra", "crm"],
         default="lpa",
         help="Cost function (AFNI-faithful unless noted): "
-             "ls=clipped Pearson; "
-             "lpa=local Pearson absolute (default, similar contrast); "
-             "lpc=local Pearson signed (cross-modal, e.g. EPI-to-anat); "
-             "mi/nmi=(normalized) mutual information; je=joint entropy; "
-             "hel=Hellinger; cru/cra/crm=correlation ratio "
-             "(unsym/additive/multiplicative). "
-             "lps/lpsc=ffs-special per-voxel Gaussian local Pearson "
-             "(absolute/signed).")
-    cost_group.add_argument("-blok", "-bloktype", dest="bloktype",
-                            choices=["tohd", "rhdd", "cube"], default="tohd",
-                            help="Blok shape for lpa/lpc local neighborhoods "
-                                 "(default: tohd, like 3dAllineate)")
-    cost_group.add_argument("-blokrad", type=float, default=None,
-                            help="Blok radius in mm for lpa/lpc "
-                                 "(default: auto, ~555 voxels per blok)")
-    cost_group.add_argument("-lpa_sigma", type=float, default=4.0,
-                            help="Kernel parameter for lps/lpsc neighborhoods "
-                                 "in voxels. For gauss: sigma. "
-                                 "For box: half-width radius. "
-                                 "Use 0 with -lpa_kernel box to auto-size "
-                                 "to ~500 voxels (default: 4.0)")
-    cost_group.add_argument("-lpa_kernel", choices=["gauss", "box"],
-                            default="gauss",
-                            help="lps/lpsc neighborhood kernel: "
-                                 "gauss=Gaussian weighting (default), "
-                                 "box=uniform weighting")
+        "ls=clipped Pearson; "
+        "lpa=local Pearson absolute (default, similar contrast); "
+        "lpc=local Pearson signed (cross-modal, e.g. EPI-to-anat); "
+        "mi/nmi=(normalized) mutual information; je=joint entropy; "
+        "hel=Hellinger; cru/cra/crm=correlation ratio "
+        "(unsym/additive/multiplicative). "
+        "lps/lpsc=ffs-special per-voxel Gaussian local Pearson "
+        "(absolute/signed).",
+    )
+    cost_group.add_argument(
+        "-blok",
+        "-bloktype",
+        dest="bloktype",
+        choices=["tohd", "rhdd", "cube"],
+        default="tohd",
+        help="Blok shape for lpa/lpc local neighborhoods (default: tohd, like 3dAllineate)",
+    )
+    cost_group.add_argument(
+        "-blokrad",
+        type=float,
+        default=None,
+        help="Blok radius in mm for lpa/lpc (default: auto, ~555 voxels per blok)",
+    )
+    cost_group.add_argument(
+        "-lpa_sigma",
+        type=float,
+        default=4.0,
+        help="Kernel parameter for lps/lpsc neighborhoods "
+        "in voxels. For gauss: sigma. "
+        "For box: half-width radius. "
+        "Use 0 with -lpa_kernel box to auto-size "
+        "to ~500 voxels (default: 4.0)",
+    )
+    cost_group.add_argument(
+        "-lpa_kernel",
+        choices=["gauss", "box"],
+        default="gauss",
+        help="lps/lpsc neighborhood kernel: "
+        "gauss=Gaussian weighting (default), "
+        "box=uniform weighting",
+    )
 
     # --- Interpolation ---
     interp_group = parser.add_argument_group("Interpolation")
-    interp_group.add_argument("-interp", choices=["linear", "cubic"],
-                              default="linear",
-                              help="During optimization (default: linear)")
-    interp_group.add_argument("-final", choices=["linear", "cubic", "wsinc5"],
-                              default="linear", dest="final_interp",
-                              help="For output image (default: linear). "
-                                   "wsinc5 gives sharpest results")
+    interp_group.add_argument(
+        "-interp",
+        choices=["linear", "cubic"],
+        default="linear",
+        help="During optimization (default: linear)",
+    )
+    interp_group.add_argument(
+        "-final",
+        choices=["linear", "cubic", "wsinc5"],
+        default="linear",
+        dest="final_interp",
+        help="For output image (default: linear). wsinc5 gives sharpest results",
+    )
 
     # --- Masking ---
     mask_group = parser.add_argument_group("Masking")
-    mask_group.add_argument("-automask", dest="source_automask", action="store_true",
-                            help="Automask source to exclude background")
-    mask_group.add_argument("-source_automask", dest="source_automask",
-                            action="store_true",
-                            help="Alias for -automask.")
-    mask_group.add_argument("-autoweight", action="store_true", default=True,
-                            help="Weight by base intensity (default: on)")
-    mask_group.add_argument("-noautoweight", action="store_true",
-                            help="Disable intensity-based weighting")
-    mask_group.add_argument("-save_automask", default=None, metavar="PREFIX",
-                            help="Save computed automask to PREFIX")
+    mask_group.add_argument(
+        "-automask",
+        dest="source_automask",
+        action="store_true",
+        help="Automask source to exclude background",
+    )
+    mask_group.add_argument(
+        "-source_automask", dest="source_automask", action="store_true", help="Alias for -automask."
+    )
+    mask_group.add_argument(
+        "-autoweight",
+        action="store_true",
+        default=True,
+        help="Weight by base intensity (default: on)",
+    )
+    mask_group.add_argument(
+        "-noautoweight", action="store_true", help="Disable intensity-based weighting"
+    )
+    mask_group.add_argument(
+        "-save_automask", default=None, metavar="PREFIX", help="Save computed automask to PREFIX"
+    )
+    mask_group.add_argument(
+        "-save_weight",
+        "-save-weight",
+        default=None,
+        metavar="PREFIX",
+        help="Save the exact optimisation weight (autoweight × validity × "
+        "source automask) — compare to AFNI 3dAllineate -wtprefix",
+    )
 
     # --- Search control ---
     search_group = parser.add_argument_group("Search control")
-    search_group.add_argument("-cmass", action="store_true", default=True,
-                              help="Center-of-mass pre-alignment (default: on)")
-    search_group.add_argument("-nocmass", action="store_true",
-                              help="Disable center-of-mass pre-alignment")
-    search_group.add_argument("-twopass", action="store_true", default=True,
-                              help="Coarse search + refinement (default)")
-    search_group.add_argument("-onepass", action="store_true",
-                              help="Skip coarse search (small motion only)")
-    search_group.add_argument("-coarse_range", type=float, default=30.0,
-                              help="Coarse rotation half-range in degrees "
-                                   "(default: 30)")
-    search_group.add_argument("-coarse_step", type=float, default=5.0,
-                              help="Coarse angular step in degrees "
-                                   "(default: 5)")
-    search_group.add_argument("-coarse_shift_frac", type=float, default=0.32,
-                              help="Coarse translation half-range as a fraction "
-                                   "of grid size (default: 0.32, like AFNI)")
+    search_group.add_argument(
+        "-cmass",
+        action="store_true",
+        default=True,
+        help="Center-of-mass pre-alignment (default: on)",
+    )
+    search_group.add_argument(
+        "-nocmass", action="store_true", help="Disable center-of-mass pre-alignment"
+    )
+    search_group.add_argument(
+        "-cmass_direct",
+        "-cmass-direct",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("DX", "DY", "DZ"),
+        help="Manual cmass shift in base-grid voxels "
+        "(same space/sign the auto cmass prints); "
+        "skips automatic center-of-mass",
+    )
+    search_group.add_argument(
+        "-save_cmass",
+        "-save-cmass",
+        default=None,
+        metavar="PREFIX",
+        help="Save the source positioned by the cmass shift "
+        "alone (for checking/hand-tuning placement)",
+    )
+    search_group.add_argument(
+        "-twopass", action="store_true", default=True, help="Coarse search + refinement (default)"
+    )
+    search_group.add_argument(
+        "-onepass", action="store_true", help="Skip coarse search (small motion only)"
+    )
+    search_group.add_argument(
+        "-coarse_range",
+        type=float,
+        default=30.0,
+        help="Coarse rotation half-range in degrees (default: 30)",
+    )
+    search_group.add_argument(
+        "-coarse_step", type=float, default=5.0, help="Coarse angular step in degrees (default: 5)"
+    )
+    search_group.add_argument(
+        "-coarse_shift_frac",
+        type=float,
+        default=0.32,
+        help="Coarse translation half-range as a fraction of grid size (default: 0.32, like AFNI)",
+    )
     range_ex = search_group.add_mutually_exclusive_group()
-    range_ex.add_argument("-smallrange", action="store_true",
-                          help="Halve all coarse search ranges "
-                               "(angle/shift/scale)")
-    range_ex.add_argument("-verysmallrange", action="store_true",
-                          help="Quarter all coarse search ranges")
-    search_group.add_argument("-tbest", type=int, default=3,
-                              help="Coarse candidates to refine (default: 3)")
-    search_group.add_argument("-noautocrop", action="store_true",
-                              help="Disable auto-cropping of zero margins")
+    range_ex.add_argument(
+        "-smallrange",
+        action="store_true",
+        help="Halve all coarse search ranges (angle/shift/scale)",
+    )
+    range_ex.add_argument(
+        "-verysmallrange", action="store_true", help="Quarter all coarse search ranges"
+    )
+    search_group.add_argument(
+        "-tbest", type=int, default=3, help="Coarse candidates to refine (default: 3)"
+    )
+    search_group.add_argument(
+        "-noautocrop", action="store_true", help="Disable auto-cropping of zero margins"
+    )
 
     # --- Speed/quality presets ---
     speed_group = parser.add_argument_group("Speed/quality")
     speed_ex = speed_group.add_mutually_exclusive_group()
-    speed_ex.add_argument("-superfast", action="store_true",
-                          help="Minimal: onepass, <=150 Adam iters, no Powell")
-    speed_ex.add_argument("-fast", action="store_true",
-                          help="Quick: <=300 Adam iters, no Powell polish")
-    speed_ex.add_argument("-slow", action="store_true",
-                          help="Thorough: <=600/800 Adam iters, 2000 Powell evals")
-    speed_group.add_argument("-lr", "-adam_lr", dest="adam_lr", type=float,
-                             default=0.005,
-                             help="Adam learning rate for full-res refinement "
-                                  "(default: 0.005; higher converges faster but "
-                                  "can overshoot to a worse optimum)")
+    speed_ex.add_argument(
+        "-superfast", action="store_true", help="Minimal: onepass, <=150 Adam iters, no Powell"
+    )
+    speed_ex.add_argument(
+        "-fast", action="store_true", help="Quick: <=300 Adam iters, no Powell polish"
+    )
+    speed_ex.add_argument(
+        "-slow", action="store_true", help="Thorough: <=600/800 Adam iters, 2000 Powell evals"
+    )
+    speed_group.add_argument(
+        "-lr",
+        "-adam_lr",
+        dest="adam_lr",
+        type=float,
+        default=0.005,
+        help="Adam learning rate for full-res refinement "
+        "(default: 0.005; higher converges faster but "
+        "can overshoot to a worse optimum)",
+    )
 
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
-    hw_group.add_argument("-device", default=None,
-                          help="PyTorch device: cuda, mps, cpu (auto-detected)")
+    hw_group.add_argument(
+        "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
+    )
     add_verbose_arg(hw_group, default=1)
 
     args = parser.parse_args(argv)
@@ -236,8 +319,7 @@ def main(argv: list[str] | None = None) -> None:
         source_4d = source
         source = source[0]
         if verb >= 1:
-            print(f"Source is 4D ({source_4d.shape[0]} volumes), "
-                  f"aligning first volume")
+            print(f"Source is 4D ({source_4d.shape[0]} volumes), aligning first volume")
 
     if verb >= 1:
         print(f"Base: {args.base} {base.shape}")
@@ -305,11 +387,11 @@ def main(argv: list[str] | None = None) -> None:
     lpa_sigma = args.lpa_sigma
     if args.lpa_kernel == "box" and lpa_sigma <= 0:
         from fastfuncstuff.processing.cost import auto_box_radius
+
         lpa_sigma = float(auto_box_radius(500))
         if verb >= 1:
             side = 2 * int(lpa_sigma) + 1
-            print(f"Auto box radius: {int(lpa_sigma)} "
-                  f"({side}³ = {side**3} voxels)")
+            print(f"Auto box radius: {int(lpa_sigma)} ({side}³ = {side**3} voxels)")
 
     config = AffineAlignConfig(
         dof=dof,
@@ -322,14 +404,14 @@ def main(argv: list[str] | None = None) -> None:
         coarse_range=args.coarse_range,
         coarse_step=args.coarse_step,
         coarse_shift_frac=args.coarse_shift_frac,
-        range_scale=(0.25 if args.verysmallrange
-                     else 0.5 if args.smallrange else 1.0),
+        range_scale=(0.25 if args.verysmallrange else 0.5 if args.smallrange else 1.0),
         adam_lr=args.adam_lr,
         tbest=args.tbest,
         adam_iters_2x=adam_iters_2x,
         adam_iters_1x=adam_iters_1x,
         powell_maxfev=powell_maxfev,
         cmass=not args.nocmass,
+        cmass_direct=(tuple(args.cmass_direct) if args.cmass_direct is not None else None),
         interp=args.interp,
         final_interp=args.final_interp,
         source_automask=args.source_automask,
@@ -342,10 +424,14 @@ def main(argv: list[str] | None = None) -> None:
     # --- Run alignment ---
     t1 = time.time()
     matrix, warped = allineate(
-        base, source, config,
+        base,
+        source,
+        config,
         base_header=base_header,
         source_header=source_header,
         save_automask_path=args.save_automask,
+        save_cmass_path=args.save_cmass,
+        save_weight_path=args.save_weight,
     )
 
     if verb >= 1:
@@ -359,7 +445,8 @@ def main(argv: list[str] | None = None) -> None:
     matrix_save_path = getattr(args, "1Dmatrix_save", None)
     if matrix_save_path is not None:
         save_matrix_1D(
-            matrix, matrix_save_path,
+            matrix,
+            matrix_save_path,
             base_affine=base_header["affine"],
             source_affine=source_header["affine"],
         )
@@ -375,8 +462,7 @@ def main(argv: list[str] | None = None) -> None:
             if args.final_interp == "wsinc5":
                 vol = apply_affine_wsinc5(source_4d[t], matrix, base.shape)
             else:
-                vol = apply_affine(source_4d[t], matrix, base.shape,
-                                   zero_outside=True)
+                vol = apply_affine(source_4d[t], matrix, base.shape, zero_outside=True)
             aligned_vols.append(vol)
         result_4d = torch.stack(aligned_vols)
         save_image(result_4d, args.prefix, header_info=base_header)
