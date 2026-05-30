@@ -21,9 +21,7 @@ from tqdm import tqdm
 from fastfuncstuff.memory import compute_moco_resample_batch_size, make_vram_debugger
 
 # Suppress PyTorch internal deprecation warnings from torch.compile
-warnings.filterwarnings(
-    "ignore", message=".*torch._prims_common.check.*", category=FutureWarning
-)
+warnings.filterwarnings("ignore", message=".*torch._prims_common.check.*", category=FutureWarning)
 
 from .affine import (  # noqa: E402
     _build_homo_coords,
@@ -65,7 +63,9 @@ class MocoConfig:
     blur_fwhm: float = 0.0  # Pre-blur for estimation (mm)
     dxy_thresh: float = 0.01  # Translation convergence, voxels (3dvolreg -x_thresh)
     dph_thresh: float = 0.02  # Rotation convergence, degrees (3dvolreg -rot_thresh)
-    chain_init: bool = False  # Warm-start from previous volume (opt-in; under-detects TR-to-TR motion)
+    chain_init: bool = (
+        False  # Warm-start from previous volume (opt-in; under-detects TR-to-TR motion)
+    )
     automask: bool = False  # Use automask for weighting
     weight_automask: bool = False  # automask × continuous weight (best of both)
     lpa_sigma: float = 4.0  # Kernel param for LPA cost (sigma or radius)
@@ -241,8 +241,8 @@ def gauss_newton_rigid(
 
     # Regularization
     eps = 1e-6 * JtWJ.diagonal().mean()
-    reg = eps * torch.eye(6, device=device, dtype=dtype)
-    JtWJ_reg = JtWJ + reg
+    reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
+    JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
 
     for it in range(config.max_iter):
         matrix = p2m_fn(params)
@@ -255,11 +255,11 @@ def gauss_newton_rigid(
         # Right-hand side: J^T W r
         JtWr = WJ @ residual  # (6,)
 
-        # Solve 6×6 system
-        dp = torch.linalg.solve(JtWJ_reg, JtWr)
+        # Solve 6×6 system (float64; RHS promoted, step cast back to float32)
+        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
 
         # Update only rigid params (first 6)
-        params[:6] += dp
+        params[:6] += dp.to(params.dtype)
 
         # Convergence check
         trans_converged = (dp[:3].abs() < config.dxy_thresh).all()
@@ -283,12 +283,11 @@ def gauss_newton_rigid_masked(
 ) -> tuple[Tensor, int]:
     """GN solver with convergence check, operating only on masked voxels."""
     device = source.device
-    dtype = source.dtype
     params = init_params.clone()
 
     eps = 1e-6 * JtWJ.diagonal().mean()
-    reg = eps * torch.eye(6, device=device, dtype=dtype)
-    JtWJ_reg = JtWJ + reg
+    reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
+    JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
 
     for it in range(config.max_iter):
         matrix = p2m_fn(params)
@@ -299,9 +298,9 @@ def gauss_newton_rigid_masked(
         residual = weight_flat_masked * (base_flat_masked - warped)
 
         JtWr = WJ_masked @ residual
-        dp = torch.linalg.solve(JtWJ_reg, JtWr)
+        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
 
-        params[:6] += dp
+        params[:6] += dp.to(params.dtype)
 
         trans_converged = (dp[:3].abs() < config.dxy_thresh).all()
         rot_converged = (dp[3:].abs() < config.dph_thresh).all()
@@ -323,13 +322,12 @@ def gauss_newton_rigid_fixed(
     interp: str,
 ) -> Tensor:
     device = source.device
-    dtype = source.dtype
     params = init_params.clone()
     output_shape = tuple(source.shape)
 
     eps = 1e-6 * JtWJ.diagonal().mean()
-    reg = eps * torch.eye(6, device=device, dtype=dtype)
-    JtWJ_reg = JtWJ + reg
+    reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
+    JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
 
     for _ in range(max_iter):
         matrix = params_to_matrix(params)
@@ -337,9 +335,9 @@ def gauss_newton_rigid_fixed(
         residual = weight_flat * (base_flat - warped.reshape(-1))
 
         JtWr = WJ @ residual
-        dp = torch.linalg.solve(JtWJ_reg, JtWr)
+        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
 
-        params[:6] += dp
+        params[:6] += dp.to(params.dtype)
 
     return params
 
@@ -360,12 +358,11 @@ def gauss_newton_rigid_fixed_masked(
     coords_masked is (4, M) where M < N. Resamples only M voxels per iteration.
     """
     device = source.device
-    dtype = source.dtype
     params = init_params.clone()
 
     eps = 1e-6 * JtWJ.diagonal().mean()
-    reg = eps * torch.eye(6, device=device, dtype=dtype)
-    JtWJ_reg = JtWJ + reg
+    reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
+    JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
 
     for _ in range(max_iter):
         matrix = params_to_matrix(params)
@@ -376,9 +373,9 @@ def gauss_newton_rigid_fixed_masked(
         residual = weight_flat_masked * (base_flat_masked - warped)
 
         JtWr = WJ_masked @ residual  # (6,)
-        dp = torch.linalg.solve(JtWJ_reg, JtWr)
+        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
 
-        params[:6] += dp
+        params[:6] += dp.to(params.dtype)
 
     return params
 
@@ -419,7 +416,7 @@ def batched_gn_estimate(
     N = base_flat.numel()
 
     eps = 1e-6 * JtWJ.diagonal().mean()
-    JtWJ_reg = JtWJ + eps * torch.eye(6, device=device, dtype=dtype)
+    JtWJ_reg = JtWJ + eps * torch.eye(6, device=device, dtype=JtWJ.dtype)  # float64
 
     if init_params is None:
         params = identity_params(device=device, dtype=dtype)[None].repeat(B, 1)
@@ -435,7 +432,9 @@ def batched_gn_estimate(
         invalid = invalid | ~valid
         residual = weight_flat_1d[None] * (base_flat[None] - warped.reshape(B, N))
         JtWr = residual @ WJ.t()  # (B,6)
-        dp = torch.linalg.solve(JtWJ_reg, JtWr.t()).t()  # (B,6)
+        # Solve in float64 (RHS promoted, step cast back); the Gram matrix and
+        # solve are where ill-conditioning amplifies float32 rounding.
+        dp = torch.linalg.solve(JtWJ_reg, JtWr.t().to(JtWJ_reg.dtype)).t().to(dtype)  # (B,6)
 
         # only update active, validly-decomposed volumes
         upd = (active & valid).unsqueeze(1).to(dtype)
@@ -495,8 +494,9 @@ def gn_lpa_rigid(
         matrix = params_to_matrix(p)
         warped = apply_affine_interp(source, matrix, config.interp, output_shape)
         # lpa_correlation returns higher = better, so negate for minimization
-        cost = -lpa_correlation(base, warped, weight, sigma=config.lpa_sigma,
-                               kernel_type=config.lpa_kernel)
+        cost = -lpa_correlation(
+            base, warped, weight, sigma=config.lpa_sigma, kernel_type=config.lpa_kernel
+        )
         return float(cost.item())
 
     result = minimize(
@@ -601,10 +601,7 @@ def save_moco_1D(
         for t in range(params_array.shape[0]):
             dx, dy, dz = params_array[t, 0], params_array[t, 1], params_array[t, 2]
             rz, rx, ry = params_array[t, 3], params_array[t, 4], params_array[t, 5]
-            f.write(
-                f"  {-rz:8.4f}  {-rx:8.4f}  {-ry:8.4f}"
-                f"  {-dz:8.4f}  {-dx:8.4f}  {-dy:8.4f}\n"
-            )
+            f.write(f"  {-rz:8.4f}  {-rx:8.4f}  {-ry:8.4f}  {-dz:8.4f}  {-dx:8.4f}  {-dy:8.4f}\n")
 
 
 def save_moco_dfile(
@@ -658,9 +655,22 @@ def _blur_volume(vol: Tensor, fwhm: float) -> Tensor:
 
 
 def _run_batched_estimation(
-    timeseries, base_flat, weight_flat_1d, WJ, JtWJ, vol_shape, config, device,
-    dtype, all_params, matrices_vox, rms_before, n_iters, base_copy_idx,
-    disable_pbar, coarse=None,
+    timeseries,
+    base_flat,
+    weight_flat_1d,
+    WJ,
+    JtWJ,
+    vol_shape,
+    config,
+    device,
+    dtype,
+    all_params,
+    matrices_vox,
+    rms_before,
+    n_iters,
+    base_copy_idx,
+    disable_pbar,
+    coarse=None,
 ):
     """Estimate all volumes' rigid params with the whole-batch shear GN solver.
 
@@ -697,7 +707,7 @@ def _run_batched_estimation(
         ncols=80,
     )
     for cstart in pbar:
-        idx = indices[cstart:cstart + chunk]
+        idx = indices[cstart : cstart + chunk]
         srcs_raw = torch.stack([timeseries[t].to(device=device, dtype=dtype) for t in idx])
         B = srcs_raw.shape[0]
 
@@ -708,27 +718,40 @@ def _run_batched_estimation(
             srcs = srcs_raw
 
         src_flat = srcs.reshape(B, -1)
-        rms_before[idx] = (
-            ((base_flat[None] - src_flat) ** 2).mean(dim=1).sqrt().cpu().numpy()
-        )
+        rms_before[idx] = ((base_flat[None] - src_flat) ** 2).mean(dim=1).sqrt().cpu().numpy()
 
         # Two-pass: coarse-blur solve seeds the fine solve.
         init_params = None
         if coarse is not None:
             bf_c, wf1_c, WJ_c, JtWJ_c = coarse
-            srcs_coarse = torch.stack(
-                [_blur_volume(srcs_raw[i], coarse_fwhm) for i in range(B)]
-            )
+            srcs_coarse = torch.stack([_blur_volume(srcs_raw[i], coarse_fwhm) for i in range(B)])
             init_params, _, _ = batched_gn_estimate(
-                srcs_coarse, bf_c, wf1_c, WJ_c, JtWJ_c, vol_shape,
-                config.max_iter, config.interp, config.dxy_thresh,
-                config.dph_thresh, config.fixed_iter,
+                srcs_coarse,
+                bf_c,
+                wf1_c,
+                WJ_c,
+                JtWJ_c,
+                vol_shape,
+                config.max_iter,
+                config.interp,
+                config.dxy_thresh,
+                config.dph_thresh,
+                config.fixed_iter,
             )
 
         params, nit, invalid = batched_gn_estimate(
-            srcs, base_flat, weight_flat_1d, WJ, JtWJ, vol_shape,
-            config.max_iter, config.interp, config.dxy_thresh, config.dph_thresh,
-            config.fixed_iter, init_params=init_params,
+            srcs,
+            base_flat,
+            weight_flat_1d,
+            WJ,
+            JtWJ,
+            vol_shape,
+            config.max_iter,
+            config.interp,
+            config.dxy_thresh,
+            config.dph_thresh,
+            config.fixed_iter,
+            init_params=init_params,
         )
 
         # Re-fit any degenerate-decomposition volumes with the trusted solver.
@@ -736,8 +759,14 @@ def _run_batched_estimation(
             homo = _build_homo_coords(vol_shape, device, dtype)
             for j in invalid.nonzero(as_tuple=True)[0].tolist():
                 p, ni = gauss_newton_rigid(
-                    base_flat, srcs[j], weight_flat_1d, WJ, JtWJ,
-                    identity.clone(), config, coords=homo,
+                    base_flat,
+                    srcs[j],
+                    weight_flat_1d,
+                    WJ,
+                    JtWJ,
+                    identity.clone(),
+                    config,
+                    coords=homo,
                 )
                 params[j] = p
                 nit[j] = ni
@@ -788,9 +817,7 @@ def moco(
     vol_shape = (nz, ny, nx)
 
     if config.verb >= 1:
-        print(
-            f"ffs_moco: {nt} volumes, {vol_shape}, device={device}, cost={config.cost}"
-        )
+        print(f"ffs_moco: {nt} volumes, {vol_shape}, device={device}, cost={config.cost}")
 
     # Get base volume
     if base_vol is not None:
@@ -829,7 +856,12 @@ def moco(
         base_flat = base_est.reshape(-1)  # (N,)
 
         WJ = weight_flat * derivs  # (6, N) — broadcast weight across 6 rows
-        JtWJ = WJ @ WJ.t()  # (6, 6)
+        # AFNI accumulates the registration normal equations in double
+        # (mri_lsqfit.c: "internal calculations are done with doubles"). In
+        # float32 the Gram matrix + 6×6 solve lose ~50% of the GN step once JtWJ
+        # is ill-conditioned (low tSNR, collinear drift); float64 here drops that
+        # to ~0.2%. WJ and the per-iteration RHS stay float32 (negligible loss).
+        JtWJ = WJ.double() @ WJ.double().t()  # (6, 6) float64
 
         weight_flat_1d = weight.reshape(-1)
     elif config.cost == "quad":
@@ -890,7 +922,7 @@ def moco(
             base_flat_masked = base_flat[mask_idx]  # (M,)
             weight_flat_masked = weight_flat_1d[mask_idx]  # (M,)
             WJ_masked = WJ[:, mask_idx]  # (6, M)
-            JtWJ = WJ_masked @ WJ_masked.t()  # (6, 6) recompute from masked
+            JtWJ = WJ_masked.double() @ WJ_masked.double().t()  # (6, 6) float64
             if config.verb >= 1:
                 print(f"  Active voxels: {M:,}/{N:,} ({100 * M / N:.1f}%)")
 
@@ -900,6 +932,7 @@ def moco(
         # Enable persistent compile cache so subsequent runs with the same
         # input shape skip recompilation (~/.cache/torch/inductor/).
         import os
+
         os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
         if config.verb >= 1:
             print("  torch.compile: compiling (first volume will be slow, cached for next run) ...")
@@ -913,9 +946,7 @@ def moco(
                 _gn_fixed = torch.compile(gauss_newton_rigid_fixed_masked, dynamic=True)
             else:
                 _gn_fixed = torch.compile(gauss_newton_rigid_fixed, dynamic=True)
-            _p2m = (
-                params_to_matrix  # Uncompiled - called from within compiled _gn_fixed
-            )
+            _p2m = params_to_matrix  # Uncompiled - called from within compiled _gn_fixed
             _resample = resample_affine_fast  # Uncompiled - called from within compiled _gn_fixed
         else:
             # In slow mode, compile individual functions (convergence check breaks graph)
@@ -941,7 +972,7 @@ def moco(
         wf_coarse = weight_coarse.reshape(1, -1)
         bf_coarse = base_coarse.reshape(-1)
         WJ_c = wf_coarse * derivs_coarse
-        JtWJ_c = WJ_c @ WJ_c.t()
+        JtWJ_c = WJ_c.double() @ WJ_c.double().t()  # (6, 6) float64
         wf1_coarse = weight_coarse.reshape(-1)
     else:
         base_coarse = weight_coarse = None
@@ -974,9 +1005,21 @@ def moco(
             else None
         )
         _run_batched_estimation(
-            timeseries, base_flat, weight_flat_1d, WJ, JtWJ, vol_shape, config,
-            device, dtype, all_params, matrices_vox, rms_before, n_iters,
-            config.base_index if base_vol is None else -1, disable_pbar,
+            timeseries,
+            base_flat,
+            weight_flat_1d,
+            WJ,
+            JtWJ,
+            vol_shape,
+            config,
+            device,
+            dtype,
+            all_params,
+            matrices_vox,
+            rms_before,
+            n_iters,
+            config.base_index if base_vol is None else -1,
+            disable_pbar,
             coarse=_coarse,
         )
 
@@ -1009,9 +1052,7 @@ def moco(
 
         # Load source volume to GPU
         source = timeseries[t].to(device=device, dtype=dtype)
-        source_est = (
-            _blur_volume(source, config.blur_fwhm) if config.blur_fwhm > 0 else source
-        )
+        source_est = _blur_volume(source, config.blur_fwhm) if config.blur_fwhm > 0 else source
 
         # Initial parameters
         if config.chain_init and t > 0:
@@ -1149,15 +1190,11 @@ def moco(
         # Fallback: if result is worse than identity, retry from identity (skip in fixed_iter mode)
         if not config.fixed_iter:
             mat_result = _p2m(params)
-            warped_check = _resample(
-                source_est, mat_result, homo_coords, config.interp, vol_shape
-            )
+            warped_check = _resample(source_est, mat_result, homo_coords, config.interp, vol_shape)
             rms_result = _weighted_rms(base_est, warped_check, weight)
 
             rms_identity = _weighted_rms(base_est, source_est, weight)
-            if rms_result > rms_identity * 1.05 and not torch.equal(
-                init_params[:6], identity[:6]
-            ):
+            if rms_result > rms_identity * 1.05 and not torch.equal(init_params[:6], identity[:6]):
                 if config.verb >= 2:
                     print(
                         f"  Vol {t}: fallback to identity init "
@@ -1255,8 +1292,11 @@ def moco(
         base_copy_idx = config.base_index if base_vol is None else -1
 
         _resample_dbg = make_vram_debugger(
-            device, nz * ny * nx * 4 * (3 + batch_size), operation="moco_resample",
-            chunk_size=batch_size, enabled=config.debug_memory
+            device,
+            nz * ny * nx * 4 * (3 + batch_size),
+            operation="moco_resample",
+            chunk_size=batch_size,
+            enabled=config.debug_memory,
         )
         _resample_dbg.__enter__()
 
@@ -1272,9 +1312,7 @@ def moco(
             batch_end = min(batch_start + batch_size, nt)
 
             # Separate base-copy volumes from volumes that need resampling
-            resample_indices = [
-                t for t in range(batch_start, batch_end) if t != base_copy_idx
-            ]
+            resample_indices = [t for t in range(batch_start, batch_end) if t != base_copy_idx]
             for t in range(batch_start, batch_end):
                 if t == base_copy_idx:
                     aligned[t] = timeseries[t]
@@ -1290,9 +1328,7 @@ def moco(
             matrices_batch = matrices_vox[resample_indices].to(device=device, dtype=dtype)
 
             use_triton = (
-                config.use_shear
-                and device.type == "cuda"
-                and shear_resample_triton is not None
+                config.use_shear and device.type == "cuda" and shear_resample_triton is not None
             )
             if use_triton:
                 # Fused Triton shears (AFNI THD_rota_vol), batched over the whole
@@ -1306,8 +1342,12 @@ def moco(
                     bad = (~valid).nonzero(as_tuple=True)[0].tolist()
                     for j in bad:
                         aligned_batch[j] = resample_affine_fast(
-                            sources_batch[j], matrices_batch[j], homo_coords,
-                            config.final_interp, vol_shape, zero_outside=True,
+                            sources_batch[j],
+                            matrices_batch[j],
+                            homo_coords,
+                            config.final_interp,
+                            vol_shape,
+                            zero_outside=True,
                         )
             elif config.use_shear:
                 # CPU/MPS shear path (no Triton): per-volume gather shears.
@@ -1318,15 +1358,18 @@ def moco(
                     )
                     if w is None:
                         w = resample_affine_fast(
-                            sources_batch[j], matrices_batch[j], homo_coords,
-                            config.final_interp, vol_shape, zero_outside=True,
+                            sources_batch[j],
+                            matrices_batch[j],
+                            homo_coords,
+                            config.final_interp,
+                            vol_shape,
+                            zero_outside=True,
                         )
                     outs.append(w)
                 aligned_batch = torch.stack(outs)
             else:
                 aligned_batch = apply_affine_interp_batched(
-                    sources_batch, matrices_batch, config.final_interp, vol_shape,
-                    zero_outside=True
+                    sources_batch, matrices_batch, config.final_interp, vol_shape, zero_outside=True
                 )
 
             for i, t in enumerate(resample_indices):

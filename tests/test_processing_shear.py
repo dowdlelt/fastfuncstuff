@@ -25,9 +25,12 @@ def _make_volume(nz=24, ny=30, nx=28, seed=0):
     for _ in range(3):
         vol = (
             vol
-            + torch.roll(vol, 1, 0) + torch.roll(vol, -1, 0)
-            + torch.roll(vol, 1, 1) + torch.roll(vol, -1, 1)
-            + torch.roll(vol, 1, 2) + torch.roll(vol, -1, 2)
+            + torch.roll(vol, 1, 0)
+            + torch.roll(vol, -1, 0)
+            + torch.roll(vol, 1, 1)
+            + torch.roll(vol, -1, 1)
+            + torch.roll(vol, 1, 2)
+            + torch.roll(vol, -1, 2)
         ) / 7.0
     return vol
 
@@ -70,6 +73,36 @@ def test_shear_matches_affine_small_rotation_heptic():
         assert rel < 0.02, f"case {c}: relative interior error {rel:.4f}"
 
 
+def test_pitch_dominated_rotation_not_corrupted():
+    """Pitch-dominated motion must not decompose into a spurious rotation.
+
+    Regression: a rotation dominated by one axis (pitch) with tiny components on
+    the others — exactly what a GN fit of pitch-dominated motion produces — drove
+    the closed-form xzyx factorization into a regime where float32 loses ~7 digits
+    in its cube-root/division chain, yielding a plan that passed the exact-zero
+    validity guards yet applied a transform 10-100% off the request (a phantom
+    pitch in the corrected image). Decomposing in float64 (as AFNI does) keeps
+    these on the fast shear path *and* accurate. We shrink the off-axis terms
+    toward the exact-degenerate limit; every well-posed case must stay valid and
+    match the general resampler.
+    """
+    vol = _make_volume(seed=7)
+    shape = vol.shape
+    coords = _build_homo_coords(shape, vol.device, vol.dtype)
+    interior = (slice(6, -6), slice(6, -6), slice(6, -6))
+
+    for eps in (1e-2, 1e-3, 1e-4, 1e-5):
+        M = _rigid_matrix(0.3, 0.2, 0.4, eps, 0.4, eps)  # rx=0.4 dominates
+        ax, scl, sft, valid = rigid_matrix_to_shears(M, shape)
+        assert bool(valid.all()), f"pitch-dominated eps={eps} wrongly flagged invalid"
+
+        out = shear_resample(vol, M, shape, "heptic")
+        ref = resample_affine_fast(vol, M, coords, "heptic", shape, zero_outside=True)
+        a, b = out[interior], ref[interior]
+        rel = (a - b).abs().mean() / b.abs().mean().clamp(min=1e-6)
+        assert rel < 0.01, f"pitch-dominated eps={eps}: relative error {rel:.4f}"
+
+
 def test_pure_axis_rotation_falls_back():
     # exactly axis-aligned rotations are degenerate for every xzyx ordering;
     # shear_resample returns None so the caller uses a general resample.
@@ -90,10 +123,12 @@ def test_identity_is_near_exact():
 
 def test_decomposition_validity_mask_batched():
     shape = (24, 30, 28)
-    Ms = torch.stack([
-        _rigid_matrix(0.3, -0.2, 0.1, 0.8, -0.5, 0.6),
-        _rigid_matrix(0, 0, 0, 0, 0, 0),
-    ])
+    Ms = torch.stack(
+        [
+            _rigid_matrix(0.3, -0.2, 0.1, 0.8, -0.5, 0.6),
+            _rigid_matrix(0, 0, 0, 0, 0, 0),
+        ]
+    )
     _, _, _, valid = rigid_matrix_to_shears(Ms, shape)
     assert valid.shape == (2,)
     assert bool(valid.all())
@@ -125,10 +160,11 @@ def test_batched_moco_estimation_cuda():
         base[None].expand(nt, nz, ny, nx).contiguous().cuda(), mats, (nz, ny, nx), "heptic"
     )[0].cpu()
 
-    common = dict(device="cuda", verb=0, interp="heptic", final_interp="heptic",
-                  base_index=0, compile=False)
-    rB = moco(ts, MocoConfig(use_shear=True, **common))    # batched shear path
-    rP = moco(ts, MocoConfig(use_shear=False, **common))   # per-volume full-3D path
+    common = dict(
+        device="cuda", verb=0, interp="heptic", final_interp="heptic", base_index=0, compile=False
+    )
+    rB = moco(ts, MocoConfig(use_shear=True, **common))  # batched shear path
+    rP = moco(ts, MocoConfig(use_shear=False, **common))  # per-volume full-3D path
 
     assert torch.isfinite(rB.aligned).all()
     interior = (slice(6, -6), slice(6, -6), slice(6, -6))
@@ -142,4 +178,5 @@ def test_batched_moco_estimation_cuda():
     assert err_aligned <= err_pervol * 1.2, f"batched {err_aligned:.4f} vs pervol {err_pervol:.4f}"
     # batched vs per-volume params agree to interpolation-method tolerance
     import numpy as np
+
     assert np.abs(rB.params - rP.params).mean() < 0.1

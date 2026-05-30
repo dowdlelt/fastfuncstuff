@@ -378,6 +378,44 @@ def _shear_best(q: Tensor, d: Tensor):
     return ax, scl, sft, any_valid
 
 
+def _reconstruct_pull(
+    ax: Tensor, scl: Tensor, sft: Tensor, shape: tuple[int, int, int]
+) -> tuple[Tensor, Tensor]:
+    """Compose the pull transform the 4-shear plan *actually* applies.
+
+    Mirrors ``_apply_one_shear`` exactly: each step is a unit-diagonal shear
+    along ``ax`` whose offset is ``a*c_p1 + b*c_p2 + s`` over the two driving
+    axes' centred coordinates. Returns the net (B,3,3) linear part and (B,3)
+    shift in x,y,z index order, so it can be compared against the requested
+    pull matrix to detect a degenerate factorization (see ``rigid_matrix_to_shears``).
+    """
+    B = ax.shape[0]
+    device, dtype = scl.device, scl.dtype
+    nz, ny, nx = shape
+    ctr = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], device=device, dtype=dtype)
+    # per-step shear coeffs (fr_gpu_unpack): a on driving axis p1, b on p2.
+    a_co = torch.where(ax == 0, scl[..., 1], scl[..., 0])  # (B,4)
+    b_co = torch.where(ax == 0, scl[..., 2], torch.where(ax == 1, scl[..., 2], scl[..., 1]))
+    # driving axes per ax: 0->(y,z), 1->(x,z), 2->(x,y)
+    p1 = torch.where(ax == 0, 1, 0)  # (B,4)
+    p2 = torch.where(ax == 2, 1, 2)
+
+    ar = torch.arange(B, device=device)
+    Lt = torch.eye(3, device=device, dtype=dtype)[None].repeat(B, 1, 1)
+    bt = torch.zeros(B, 3, device=device, dtype=dtype)
+    for step in range(4):
+        a_s, p1_s, p2_s = ax[:, step], p1[:, step], p2[:, step]
+        ac, bc, s_s = a_co[:, step], b_co[:, step], sft[:, step]
+        Li = torch.eye(3, device=device, dtype=dtype)[None].repeat(B, 1, 1)
+        Li[ar, a_s, p1_s] -= ac
+        Li[ar, a_s, p2_s] -= bc
+        bi = torch.zeros(B, 3, device=device, dtype=dtype)
+        bi[ar, a_s] = ac * ctr[p1_s] + bc * ctr[p2_s] - s_s
+        bt = (Lt @ bi.unsqueeze(-1)).squeeze(-1) + bt
+        Lt = Lt @ Li
+    return Lt, bt
+
+
 def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     """Decompose a voxel-index pull matrix into a 4-shear plan (shear_best).
 
@@ -388,10 +426,21 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     if matrix.dim() == 2:
         matrix = matrix[None]
     B = matrix.shape[0]
+    out_dtype = matrix.dtype
+    # The closed-form xzyx factorization (cube roots + chained divisions) loses
+    # ~7 digits, so in float32 a near-single-axis rotation (pitch with tiny
+    # roll/yaw, as real GN fits of pitch-dominated motion produce) decomposes
+    # into a catastrophically wrong plan — a spurious rotation 10-100% off the
+    # request. AFNI's thd_shear3d.c is robust only because it is entirely double;
+    # the math is identical. So we decompose in float64 (cheap: per-volume 3x3)
+    # and cast the plan back for the float32 shear apply. The reconstruction
+    # guard below still catches the genuinely degenerate exact-single-axis case.
+    dtype = torch.float64
+    matrix = matrix.to(dtype)
+    device = matrix.device
     A = matrix[:, :3, :3]
     t = matrix[:, :3, 3]
     nz, ny, nx = shape
-    device, dtype = matrix.device, matrix.dtype
     c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], device=device, dtype=dtype)
 
     # Re-express the pull about the centre, then map to the centred forward
@@ -415,14 +464,6 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
 
     ax, scl, sft, any_valid = _shear_best(q, d)
 
-    # Exactly axis-aligned rotations (e.g. pure rz -> q32=0) make every xzyx
-    # ordering degenerate. AFNI perturbs the matrix and retries, but for a
-    # single-axis rotation the perturbed min-norm ordering is unreliable
-    # (picks a wrong factorization). These never arise from real GN-fit float
-    # params (motion mixes all axes; pure translation is caught by near_id
-    # below), so we leave such lanes invalid and let the caller fall back to a
-    # general interpolation resample.
-
     # overwrite near-identity lanes with a trivial plan (shifts d only)
     if bool(near_id.any()):
         triv_ax = torch.tensor([0, 1, 2, 0], device=device).expand(B, 4)
@@ -438,7 +479,16 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
         sft = torch.where(m[:, None], triv_sft, sft)
         any_valid = any_valid | near_id
 
-    return ax, scl, sft, any_valid
+    # Safety net: the plan must reproduce the requested pull. In float64 this
+    # rejects only the genuinely degenerate exact-single-axis rotation (where the
+    # factorization is NaN regardless of precision); those lanes fall back to a
+    # general resample. The linear-part error is scale-free; honest motion is
+    # ~1e-11 here, so the 1e-2 cutoff has enormous margin.
+    Lt, _bt = _reconstruct_pull(ax, scl, sft, shape)
+    recon_err = (Lt - A).abs().amax(dim=(1, 2))
+    any_valid = any_valid & (recon_err <= 1.0e-2)
+
+    return ax.to(torch.int64), scl.to(out_dtype), sft.to(out_dtype), any_valid
 
 
 # ---------------------------------------------------------------------------
