@@ -300,6 +300,13 @@ Examples:
     hw_group.add_argument(
         "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
     )
+    hw_group.add_argument(
+        "-compile",
+        action="store_true",
+        help="torch.compile the batched refinement forward to cut per-iteration "
+        "launch overhead (also enabled by FFS_ALLINEATE_COMPILE=1). First stage "
+        "pays a one-time compile warmup.",
+    )
     add_verbose_arg(hw_group, default=1)
 
     args = parser.parse_args(argv)
@@ -425,6 +432,7 @@ def main(argv: list[str] | None = None) -> None:
         blokrad=args.blokrad,
         ov=args.ov,
         n_match=args.n_match,
+        compile=args.compile,
         twopass=twopass,
         coarse_range=args.coarse_range,
         coarse_step=args.coarse_step,

@@ -109,6 +109,11 @@ class AffineAlignConfig:
     # (0.47 = AFNI default, 1.0 = all); >1.0 is an absolute count (e.g. 150000).
     n_match: float = 0.47
 
+    # torch.compile the batched refinement forward (matrix build + point sample +
+    # blok cost) to cut per-iteration kernel-launch overhead. Also enabled by the
+    # FFS_ALLINEATE_COMPILE=1 environment variable.
+    compile: bool = False
+
     # Coarse search. Ranges mirror 3dAllineate's defaults: angle ±30°,
     # shift ±32% of grid size, scale ±20%. ``range_scale`` shrinks all of them
     # (-smallrange -> 0.5, -verysmallrange -> 0.25).
@@ -874,6 +879,7 @@ def _coarse_search_joint(
         n_iters=40,
         lr=config.adam_lr_2x,
         desc="coarse",
+        compile_fwd=config.compile,
     )
     polished = [(float(out_costs[t]), out_phys[t]) for t in range(len(top))]
     polished.sort(key=lambda x: -x[0])
@@ -1280,6 +1286,7 @@ def _refine_adam_batched(
     n_iters: int = 150,
     lr: float = 0.01,
     desc: str = "Adam",
+    compile_fwd: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Normalized Adam over T trials at once (one batched cost per step).
 
@@ -1317,9 +1324,8 @@ def _refine_adam_batched(
     def _forward(pn: Tensor) -> Tensor:
         return batched_cost_fn(params_to_matrix_batched(_denormalize_t(pn, bmin, span)))
 
-    forward = (
-        torch.compile(_forward) if os.environ.get("FFS_ALLINEATE_COMPILE") == "1" else _forward
-    )
+    use_compile = compile_fwd or os.environ.get("FFS_ALLINEATE_COMPILE") == "1"
+    forward = torch.compile(_forward) if use_compile else _forward
 
     pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
     for it in pbar:
@@ -1626,6 +1632,7 @@ def _refine_progressive(
                 n_iters=n_iters,
                 lr=lr,
                 desc=f"S{si}",
+                compile_fwd=config.compile,
             )
             refined = [(float(out_costs[t]), out_phys[t]) for t in range(len(trials))]
         else:
