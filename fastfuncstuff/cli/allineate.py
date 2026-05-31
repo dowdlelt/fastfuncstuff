@@ -133,6 +133,17 @@ Examples:
         "gauss=Gaussian weighting (default), "
         "box=uniform weighting",
     )
+    cost_group.add_argument(
+        "-ov",
+        "-overlap",
+        dest="ov",
+        type=float,
+        default=0.0,
+        help="Overlap penalty weight (AFNI lpc+/lpa+ 'ov'; default 0=off). "
+        "Adds a differentiable (max(0,9.95-10*overlap))^2 term that pushes the "
+        "refiner back toward full base/source overlap. Try ~0.05-0.5 if a "
+        "whole-brain alignment drifts partly out of overlap.",
+    )
 
     # --- Interpolation ---
     interp_group = parser.add_argument_group("Interpolation")
@@ -244,6 +255,18 @@ Examples:
     )
     search_group.add_argument(
         "-tbest", type=int, default=3, help="Coarse candidates to refine (default: 3)"
+    )
+    search_group.add_argument(
+        "-nmatch",
+        "-n_match",
+        dest="n_match",
+        type=float,
+        default=0.47,
+        help="Match-point budget for lpa/lpc refinement (AFNI npt_match), "
+        "unit-free: <=1.0 is a FRACTION of the in-mask voxels (0.47 = AFNI "
+        "default, 1.0 = all); >1.0 is an absolute count (e.g. 150000). The cost "
+        "is evaluated on that many random weight-domain points per iteration "
+        "instead of the full grid.",
     )
     search_group.add_argument(
         "-noautocrop", action="store_true", help="Disable auto-cropping of zero margins"
@@ -400,6 +423,8 @@ def main(argv: list[str] | None = None) -> None:
         lpa_kernel=args.lpa_kernel,
         bloktype=args.bloktype,
         blokrad=args.blokrad,
+        ov=args.ov,
+        n_match=args.n_match,
         twopass=twopass,
         coarse_range=args.coarse_range,
         coarse_step=args.coarse_step,

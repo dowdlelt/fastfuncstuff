@@ -51,8 +51,12 @@ def _homogeneous_grid(
             indexing="ij",
         )
         coords = torch.stack(
-            [ii.reshape(-1), jj.reshape(-1), kk.reshape(-1),
-             torch.ones(onz * ony * onx, device=device, dtype=dtype)],
+            [
+                ii.reshape(-1),
+                jj.reshape(-1),
+                kk.reshape(-1),
+                torch.ones(onz * ony * onx, device=device, dtype=dtype),
+            ],
             dim=0,
         )  # (4, N)
         _GRID_CACHE[key] = coords
@@ -178,9 +182,7 @@ def params_to_matrix_batched(params: Tensor) -> Tensor:
     r02 = cz * (-sy_) + sz_ * sx_ * cy
     r10 = sz_ * cy + (-cz) * sx_ * (-sy_)  # sz*cy + cz*sx*sy
     r11 = cz * cx
-    r12 = (
-        sz_ * (-sy_) + (-cz) * sx_ * cy
-    )  # -sz*sy - cz*sx*cy ... wait let me redo this properly
+    r12 = sz_ * (-sy_) + (-cz) * sx_ * cy  # -sz*sy - cz*sx*cy ... wait let me redo this properly
 
     # Rz @ Rx @ Ry product:
     # Row 0: [cz*cy + sz*sx*sy,  -sz*cx,  -cz*sy + sz*sx*cy]
@@ -228,12 +230,14 @@ def params_to_matrix_batched(params: Tensor) -> Tensor:
     r21 = sx_
     r22 = cx * cy
 
-    # Apply scale: column j of R gets multiplied by scale[j]
-    # Then shear: S @ (D @ U)
-    # D @ U: column 0 *= sx, column 1 *= sy, column 2 *= sz
-    du00, du01, du02 = r00 * sx, r01 * sy, r02 * sz
-    du10, du11, du12 = r10 * sx, r11 * sy, r12 * sz
-    du20, du21, du22 = r20 * sx, r21 * sy, r22 * sz
+    # D @ U with D = diag(sx, sy, sz): scale each ROW of U (row i by s_i), which
+    # matches params_to_matrix's M3 = S @ D @ U. (Scaling by COLUMN here would be
+    # U @ D — a different, wrong matrix whenever the scales are anisotropic, and
+    # it silently diverged from the single-matrix path until batched affine
+    # refinement used the gradient.)
+    du00, du01, du02 = r00 * sx, r01 * sx, r02 * sx
+    du10, du11, du12 = r10 * sy, r11 * sy, r12 * sy
+    du20, du21, du22 = r20 * sz, r21 * sz, r22 * sz
 
     # S @ (D@U): S = [[1, shyx, shzx], [0, 1, shzy], [0, 0, 1]]
     # row 0 += shyx * row1 + shzx * row2
@@ -342,14 +346,86 @@ def matrix_to_params(mat: Tensor) -> Tensor:
         else torch.tensor(0.0, device=device, dtype=dtype)
     )
 
-    return torch.stack(
-        [dx, dy, dz, rz, rx, ry, sx_scale, sy_scale, sz_scale, shyx, shzx, shzy]
+    return torch.stack([dx, dy, dz, rz, rx, ry, sx_scale, sy_scale, sz_scale, shyx, shzx, shzy])
+
+
+def decompose_affine_sdu(mat: Tensor) -> Tensor:
+    """Decompose a 4x4 affine into the 12 params matching :func:`params_to_matrix`.
+
+    Exact inverse of the T·S·D·U build (``params_to_matrix``): the 3x3 part is
+    factored as ``M3 = S @ D @ U`` with ``U`` a proper rotation (Rz·Rx·Ry), ``D``
+    a positive diagonal scale, and ``S`` a unit upper-triangular shear, via an RQ
+    factorisation (``M3 = R @ Q``; ``R = S@D`` upper-triangular, ``Q = U``
+    orthogonal) with signs fixed so the scales are positive. Unlike the polar
+    decomposition in :func:`matrix_to_params`, this recovers AFNI's
+    shift/angle/scale/shear parameters (used for the final-fit report).
+    """
+    from scipy.linalg import rq
+
+    M = mat.detach().cpu().numpy().astype(np.float64)
+    dx, dy, dz = M[0, 3], M[1, 3], M[2, 3]
+    R, Q = rq(M[:3, :3])
+
+    # Make diag(R) positive: R@diag(s) scales columns, diag(s)@Q scales rows, so
+    # R@Q is preserved while D=diag(R) becomes the positive scales.
+    s = np.sign(np.diag(R))
+    s[s == 0] = 1.0
+    R = R * s[None, :]
+    Q = s[:, None] * Q
+    if np.linalg.det(Q) < 0:  # reflection (det M3 < 0): take a negative x-scale
+        R[:, 0] *= -1.0
+        Q[0, :] *= -1.0
+
+    D = np.diag(R)
+    shyx, shzx, shzy = R[0, 1] / D[1], R[0, 2] / D[2], R[1, 2] / D[2]
+
+    rx = math.degrees(math.asin(float(np.clip(Q[2, 1], -1.0, 1.0))))
+    if abs(math.cos(math.radians(rx))) > 1e-6:
+        rz = math.degrees(math.atan2(-Q[0, 1], Q[1, 1]))
+        ry = math.degrees(math.atan2(-Q[2, 0], Q[2, 2]))
+    else:  # gimbal lock (rx ≈ ±90°): fold ry into rz
+        rz = math.degrees(math.atan2(Q[1, 0], Q[0, 0]))
+        ry = 0.0
+
+    return torch.tensor(
+        [dx, dy, dz, rz, rx, ry, D[0], D[1], D[2], shyx, shzx, shzy],
+        dtype=torch.float32,
     )
 
 
-def identity_params(
-    device: torch.device = None, dtype: torch.dtype = torch.float32
-) -> Tensor:
+def format_final_fit_params(params: Tensor, space: str = "DICOM mm") -> str:
+    """Format 12 affine params as AFNI's '+ Final fine fit Parameters:' block.
+
+    ``params`` is the :func:`params_to_matrix` ordering
+    ``[dx,dy,dz, rz,rx,ry, sx,sy,sz, shyx,shzx,shzy]`` (translations in the units
+    of ``space``). Mirrors 3dAllineate's report: translation enorm, the net
+    rotation magnitude, the scale volume factor, and the three shears.
+    """
+    p = [float(v) for v in params]
+    dx, dy, dz, rz, rx, ry, sx, sy, sz, shyx, shzx, shzy = p
+    enorm = math.sqrt(dx * dx + dy * dy + dz * dz)
+    total = math.sqrt(rz * rz + rx * rx + ry * ry)
+    vol = sx * sy * sz
+    cube = abs(vol) ** (1.0 / 3.0)
+    if vol > 1.0:
+        volnote = " [base smaller than source]"
+    elif vol < 1.0:
+        volnote = " [base larger than source]"
+    else:
+        volnote = ""
+    return (
+        f"+ Final fine fit Parameters ({space}):\n"
+        f"     x-shift={dx:9.4f}   y-shift={dy:9.4f}   z-shift={dz:9.4f}  "
+        f"...  enorm={enorm:9.4f}\n"
+        f"     z-angle={rz:9.4f}   x-angle={rx:9.4f}   y-angle={ry:9.4f}  "
+        f"...  total={total:9.4f} deg\n"
+        f"     x-scale={sx:9.4f}   y-scale={sy:9.4f}   z-scale={sz:9.4f}  "
+        f"...  vol3D={vol:8.4f}=({cube:.4f})^3{volnote}\n"
+        f"   y/x-shear={shyx:9.4f} z/x-shear={shzx:9.4f} z/y-shear={shzy:9.4f}"
+    )
+
+
+def identity_params(device: torch.device = None, dtype: torch.dtype = torch.float32) -> Tensor:
     """Return identity affine parameters (12,)."""
     p = torch.zeros(12, device=device, dtype=dtype)
     p[6] = 1.0  # sx
@@ -619,9 +695,12 @@ def apply_affine_interp_batched(
 
         if zero_outside:
             oob = (
-                (src_x < -0.5) | (src_x > snx - 0.5)
-                | (src_y < -0.5) | (src_y > sny - 0.5)
-                | (src_z < -0.5) | (src_z > snz - 0.5)
+                (src_x < -0.5)
+                | (src_x > snx - 0.5)
+                | (src_y < -0.5)
+                | (src_y > sny - 0.5)
+                | (src_z < -0.5)
+                | (src_z > snz - 0.5)
             )
             results[b][oob] = 0.0
 
@@ -709,9 +788,12 @@ def resample_affine_fast(
 
         if zero_outside:
             oob = (
-                (src_x < -0.5) | (src_x > snx - 0.5)
-                | (src_y < -0.5) | (src_y > sny - 0.5)
-                | (src_z < -0.5) | (src_z > snz - 0.5)
+                (src_x < -0.5)
+                | (src_x > snx - 0.5)
+                | (src_y < -0.5)
+                | (src_y > sny - 0.5)
+                | (src_z < -0.5)
+                | (src_z > snz - 0.5)
             )
             result[oob] = 0.0
         return result
@@ -728,19 +810,120 @@ def resample_affine_fast(
 
     if zero_outside:
         oob = (
-            (src_x < -0.5) | (src_x > snx - 0.5)
-            | (src_y < -0.5) | (src_y > sny - 0.5)
-            | (src_z < -0.5) | (src_z > snz - 0.5)
+            (src_x < -0.5)
+            | (src_x > snx - 0.5)
+            | (src_y < -0.5)
+            | (src_y > sny - 0.5)
+            | (src_z < -0.5)
+            | (src_z > snz - 0.5)
         )
         result[oob] = 0.0
 
     return result
 
 
+def sample_affine_at_points(
+    source: Tensor,
+    matrix: Tensor,
+    points_xyz: Tensor,
+    zero_outside: bool = True,
+) -> Tensor:
+    """Sample ``source`` at M base points transformed by ``matrix`` -> (M,).
+
+    The point-wise analogue of :func:`apply_affine`: instead of warping the full
+    output grid, only the given base points are transformed and interpolated, so
+    the cost is O(M) rather than O(N_voxels). Used by the subsampled refinement
+    path (AFNI npt_match). Differentiable in ``matrix``.
+
+    Args:
+        source: (nz, ny, nx) source image.
+        matrix: (4, 4) affine mapping base voxels -> source voxels.
+        points_xyz: (M, 3) base voxel coordinates as (x, y, z) (x fastest).
+        zero_outside: zero points mapping outside the source (AFNI outval=0).
+
+    Returns:
+        (M,) interpolated source values.
+    """
+    device = source.device
+    dtype = source.dtype
+    M = points_xyz.shape[0]
+    pts = points_xyz.to(device=device, dtype=dtype)
+    homog = torch.cat([pts, torch.ones(M, 1, device=device, dtype=dtype)], dim=1)  # (M,4)
+    src = homog @ matrix.T  # (M, 4)
+    sx, sy, sz = src[:, 0], src[:, 1], src[:, 2]
+
+    snz, sny, snx = source.shape
+    gx = 2.0 * sx / (snx - 1) - 1.0 if snx > 1 else sx * 0.0
+    gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
+    gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
+
+    # grid_sample wants (N, D, H, W, 3); pack the M points along one axis.
+    grid = torch.stack([gx, gy, gz], dim=-1).view(1, M, 1, 1, 3)
+    vol = source[None, None]  # (1, 1, nz, ny, nx)
+    vals = _grid_sample_3d(vol, grid).reshape(M)
+
+    if zero_outside:
+        oob = (
+            (sx < -0.5)
+            | (sx > snx - 0.5)
+            | (sy < -0.5)
+            | (sy > sny - 0.5)
+            | (sz < -0.5)
+            | (sz > snz - 0.5)
+        )
+        vals = vals.masked_fill(oob, 0.0)
+    return vals
+
+
+def sample_affine_at_points_batched(
+    source: Tensor,
+    matrices: Tensor,
+    points_xyz: Tensor,
+    zero_outside: bool = True,
+) -> Tensor:
+    """Sample ``source`` at M points under B transforms -> (B, M).
+
+    Batched :func:`sample_affine_at_points` for the subsampled coarse search:
+    one source volume, B candidate matrices, the same M base points. Uses a
+    single grid_sample with the points packed into the (D, H) grid dims, so only
+    one copy of the source is needed regardless of B. Caller should chunk B to
+    bound the B*M grid memory.
+    """
+    device = source.device
+    dtype = source.dtype
+    B = matrices.shape[0]
+    M = points_xyz.shape[0]
+    pts = points_xyz.to(device=device, dtype=dtype)
+    homog = torch.cat([pts, torch.ones(M, 1, device=device, dtype=dtype)], dim=1)  # (M,4)
+    src = torch.einsum("bij,mj->bmi", matrices.to(dtype), homog)  # (B, M, 4)
+    sx, sy, sz = src[..., 0], src[..., 1], src[..., 2]  # (B, M)
+
+    snz, sny, snx = source.shape
+    gx = 2.0 * sx / (snx - 1) - 1.0 if snx > 1 else sx * 0.0
+    gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
+    gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
+
+    grid = torch.stack([gx, gy, gz], dim=-1).view(1, B, M, 1, 3)
+    vals = _grid_sample_3d(source[None, None], grid).reshape(B, M)
+
+    if zero_outside:
+        oob = (
+            (sx < -0.5)
+            | (sx > snx - 0.5)
+            | (sy < -0.5)
+            | (sy > sny - 0.5)
+            | (sz < -0.5)
+            | (sz > snz - 0.5)
+        )
+        vals = vals.masked_fill(oob, 0.0)
+    return vals
+
+
 def apply_affine_batched(
     source: Tensor,
     matrices: Tensor,
     output_shape: tuple[int, int, int] | None = None,
+    zero_outside: bool = False,
 ) -> Tensor:
     """Apply B affine transforms to the same source in one call.
 
@@ -751,6 +934,8 @@ def apply_affine_batched(
         source: (nz, ny, nx) source image.
         matrices: (B, 4, 4) affine matrices in voxel index space.
         output_shape: (nz, ny, nx) of output grid. Defaults to source shape.
+        zero_outside: If True, zero voxels that map outside the source volume
+            instead of using border padding (AFNI outval=0).
 
     Returns:
         (B, nz, ny, nx) resampled images.
@@ -782,23 +967,37 @@ def apply_affine_batched(
     )  # (4, N)
 
     # Batched matmul: (B, 4, 4) @ (4, N) → (B, 4, N)
-    src_coords = matrices @ coords[None].expand(
-        B, -1, -1
-    )  # broadcast: (B, 4, 4) @ (B, 4, N)
+    src_coords = matrices @ coords[None].expand(B, -1, -1)  # broadcast: (B, 4, 4) @ (B, 4, N)
 
     # Normalize coords to [-1, 1] grid directly, freeing intermediates
     snz, sny, snx = source.shape
-    gx = 2.0 * src_coords[:, 0].reshape(B, onz, ony, onx) / (snx - 1) - 1.0 if snx > 1 else src_coords[:, 0].reshape(B, onz, ony, onx) * 0.0
-    gy = 2.0 * src_coords[:, 1].reshape(B, onz, ony, onx) / (sny - 1) - 1.0 if sny > 1 else src_coords[:, 1].reshape(B, onz, ony, onx) * 0.0
-    gz = 2.0 * src_coords[:, 2].reshape(B, onz, ony, onx) / (snz - 1) - 1.0 if snz > 1 else src_coords[:, 2].reshape(B, onz, ony, onx) * 0.0
+    sx = src_coords[:, 0].reshape(B, onz, ony, onx)
+    sy = src_coords[:, 1].reshape(B, onz, ony, onx)
+    sz = src_coords[:, 2].reshape(B, onz, ony, onx)
     del src_coords
+    gx = 2.0 * sx / (snx - 1) - 1.0 if snx > 1 else sx * 0.0
+    gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
+    gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
+
+    if zero_outside:
+        oob = (
+            (sx < -0.5)
+            | (sx > snx - 0.5)
+            | (sy < -0.5)
+            | (sy > sny - 0.5)
+            | (sz < -0.5)
+            | (sz > snz - 0.5)
+        )
+    del sx, sy, sz
 
     grid = torch.stack([gx, gy, gz], dim=-1)  # (B, D, H, W, 3)
     del gx, gy, gz
     vol = source[None, None].expand(B, 1, snz, sny, snx)  # (B, 1, D, H, W)
 
-    result = _grid_sample_3d(vol, grid)
-    return result[:, 0]  # (B, D, H, W)
+    result = _grid_sample_3d(vol, grid)[:, 0]  # (B, D, H, W)
+    if zero_outside:
+        result = result.masked_fill(oob, 0.0)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -822,12 +1021,15 @@ def _ijk2ras_matrix(nifti_affine: np.ndarray) -> Tensor:
 
 # RAS-to-DICOM sign flip: AFNI's DICOM convention is (x=-R+L, y=-A+P, z=-I+S),
 # which negates the first two axes relative to NIfTI's RAS.
-_RAS_TO_DICOM = torch.tensor([
-    [-1, 0, 0, 0],
-    [0, -1, 0, 0],
-    [0, 0, 1, 0],
-    [0, 0, 0, 1],
-], dtype=torch.float32)
+_RAS_TO_DICOM = torch.tensor(
+    [
+        [-1, 0, 0, 0],
+        [0, -1, 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1],
+    ],
+    dtype=torch.float32,
+)
 
 
 def voxel_matrix_to_dicom(
@@ -937,9 +1139,7 @@ def save_matrix_1D(
         header: optional comment line written as ``# {header}`` at the top.
     """
     if (base_affine is None) != (source_affine is None):
-        raise ValueError(
-            "save_matrix_1D: pass both base_affine and source_affine, or neither"
-        )
+        raise ValueError("save_matrix_1D: pass both base_affine and source_affine, or neither")
 
     if base_affine is not None:
         m_t = matrix if isinstance(matrix, Tensor) else torch.as_tensor(matrix)
@@ -1029,13 +1229,9 @@ def resample_to_base_grid(
 
     # Matrix that maps base voxel indices to source voxel indices:
     # base_ijk → xyz → source_ijk
-    base_ijk2xyz = torch.from_numpy(base_affine.astype(np.float64)).to(
-        dtype=dtype, device=device
-    )
+    base_ijk2xyz = torch.from_numpy(base_affine.astype(np.float64)).to(dtype=dtype, device=device)
     source_xyz2ijk = torch.linalg.inv(
-        torch.from_numpy(source_affine.astype(np.float64)).to(
-            dtype=dtype, device=device
-        )
+        torch.from_numpy(source_affine.astype(np.float64)).to(dtype=dtype, device=device)
     )
     M = source_xyz2ijk @ base_ijk2xyz  # (4, 4): base voxel → source voxel
 

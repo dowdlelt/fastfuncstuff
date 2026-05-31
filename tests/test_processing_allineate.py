@@ -621,6 +621,46 @@ class TestRefineAdamNormalized:
         np.testing.assert_allclose(params[3:6], 0.0, atol=5.0)
         assert cost > 0.5
 
+    def test_no_premature_early_stop_while_improving(self):
+        """Plateau early-stop must NOT fire while the cost keeps improving.
+
+        Regression for the -inf threshold bug: with last_best == -inf the
+        relative plateau threshold was nan, so `best > nan` was always False and
+        the loop early-stopped after ~patience iters regardless of progress.
+        """
+        base = _sphere_volume((8, 8, 8))
+        bounds = _compute_param_bounds((8, 8, 8))
+        init = _identity_physical()
+        cfg = AffineAlignConfig(dof="rigid", verb=0)
+
+        # A cost that strictly increases every evaluation (still differentiable
+        # in the params via the zeroed matrix term) — it never plateaus, so a
+        # correct loop runs the full iteration budget.
+        calls = [0]
+
+        def cost_fn(matrix):
+            calls[0] += 1
+            return matrix.sum() * 0.0 + 0.001 * calls[0]
+
+        n_iters = 120
+        _refine_adam_normalized(
+            base,
+            base,
+            None,
+            init,
+            cfg,
+            CostContext(name="lpa"),
+            (1.0, 1.0, 1.0),
+            bounds,
+            DEV,
+            verb=0,
+            n_iters=n_iters,
+            lr=0.01,
+            cost_fn=cost_fn,
+        )
+        # Must run essentially the whole budget, not stop near `patience` (~40).
+        assert calls[0] > n_iters - 5
+
 
 # ---------------------------------------------------------------------------
 # _refine_powell (small test)
@@ -880,4 +920,259 @@ class TestAllineate:
         assert warped.max().item() > 0.5  # the brain actually made it into the FOV
         torch.testing.assert_close(
             _center_of_mass(warped), _center_of_mass(base), atol=1.5, rtol=0.0
+        )
+
+
+# ---------------------------------------------------------------------------
+# outval=0 during optimization (AFNI-faithful out-of-volume fill)
+# ---------------------------------------------------------------------------
+
+
+class TestZeroOutsideBatched:
+    def test_batched_matches_single(self):
+        """apply_affine_batched(zero_outside) must match the single-volume path."""
+        from fastfuncstuff.processing.affine import (
+            apply_affine,
+            apply_affine_batched,
+            identity_params,
+            params_to_matrix,
+        )
+
+        src = _sphere_volume((16, 16, 16), center=(8, 8, 8), radius=5)
+        # A shift big enough that part of the brain maps outside the volume.
+        p = identity_params().clone()
+        p[0] = 7.0  # +7 vox in x
+        M = params_to_matrix(p)
+        single = apply_affine(src, M, src.shape, zero_outside=True)
+        batched = apply_affine_batched(src, M[None], src.shape, zero_outside=True)[0]
+        torch.testing.assert_close(batched, single, atol=1e-5, rtol=0.0)
+
+    def test_zeros_beyond_border_value(self):
+        """Out-of-volume voxels read 0, not a replicated border (the AFNI fix)."""
+        from fastfuncstuff.processing.affine import (
+            apply_affine,
+            identity_params,
+            params_to_matrix,
+        )
+
+        src = _sphere_volume((16, 16, 16), center=(8, 8, 8), radius=5) + 0.3  # nonzero edge
+        p = identity_params().clone()
+        p[0] = 20.0  # shift everything fully out of the source
+        M = params_to_matrix(p)
+        zeroed = apply_affine(src, M, src.shape, zero_outside=True)
+        bordered = apply_affine(src, M, src.shape, zero_outside=False)
+        assert float(zeroed.abs().max()) < 1e-6  # all out -> all zero
+        assert float(bordered.abs().max()) > 0.1  # border padding keeps edge value
+
+
+# ---------------------------------------------------------------------------
+# -ov overlap penalty (AFNI lpc+/lpa+)
+# ---------------------------------------------------------------------------
+
+
+class TestOverlapPenalty:
+    def _ctx_with_cov(self, ov_weight=0.1):
+        from fastfuncstuff.processing.mask import automask
+
+        blob = _sphere_volume((20, 20, 20), center=(10, 10, 10), radius=6)
+        base_dom = automask(blob, device=DEV).float()
+        src_cov = automask(blob, device=DEV).float()
+        denom = float(min(base_dom.sum().item(), src_cov.sum().item()))
+        ctx = CostContext(
+            name="lpa",
+            ov_weight=ov_weight,
+            src_cov=src_cov,
+            base_dom=base_dom,
+            ov_denom=denom,
+        )
+        return ctx
+
+    def test_penalty_zero_at_identity_large_off_overlap(self):
+        from fastfuncstuff.processing.affine import identity_params, params_to_matrix
+        from fastfuncstuff.processing.allineate import _overlap_penalty
+
+        ctx = self._ctx_with_cov()
+        ident = params_to_matrix(identity_params())
+        pen_ident = _overlap_penalty(ctx, ident, ctx.src_cov.shape)
+
+        p = identity_params().clone()
+        p[0] = 30.0  # shift coverage fully out of the base domain
+        pen_off = _overlap_penalty(ctx, params_to_matrix(p), ctx.src_cov.shape)
+
+        assert pen_ident.item() < 1.0  # near-full overlap -> ~0 penalty
+        assert pen_off.item() > 50.0  # no overlap -> large penalty
+
+    def test_compute_cost_subtracts_penalty(self):
+        """With ov>0 a low-overlap warp scores strictly below the same warp at ov=0."""
+        from fastfuncstuff.processing.affine import identity_params, params_to_matrix
+
+        base = _sphere_volume((20, 20, 20), center=(10, 10, 10), radius=6)
+        warped = base.clone()
+        p = identity_params().clone()
+        p[0] = 30.0
+        M = params_to_matrix(p)
+
+        ctx_off = self._ctx_with_cov(ov_weight=0.0)
+        ctx_on = self._ctx_with_cov(ov_weight=0.1)
+        c_off = _compute_cost(base, warped, None, ctx_off, matrix=M)
+        c_on = _compute_cost(base, warped, None, ctx_on, matrix=M)
+        assert c_on.item() < c_off.item() - 1.0
+
+    def test_allineate_with_ov_recovers_small_shift(self):
+        """-ov plumbs through end-to-end and doesn't break a normal recovery."""
+        base = _sphere_volume((20, 20, 20), center=(10, 10, 10), radius=6)
+        source = _sphere_volume((20, 20, 20), center=(11.5, 10, 10), radius=6)
+        cfg = AffineAlignConfig(
+            dof="rigid",
+            cost="lpa",
+            ov=0.1,
+            twopass=True,
+            coarse_range=8.0,
+            coarse_step=4.0,
+            tbest=1,
+            autocrop=False,
+            adam_iters_2x=40,
+            adam_iters_1x=60,
+            powell_maxfev=0,
+            verb=0,
+        )
+        _, warped = allineate(base, source, config=cfg)
+        torch.testing.assert_close(
+            _center_of_mass(warped), _center_of_mass(base), atol=1.0, rtol=0.0
+        )
+
+
+# ---------------------------------------------------------------------------
+# Match-point subsampling (point-wise blok refinement)
+# ---------------------------------------------------------------------------
+
+
+class TestSubsampling:
+    def test_sample_affine_matches_full_at_points(self):
+        """sample_affine_at_points equals apply_affine read at the same points."""
+        from fastfuncstuff.processing.affine import (
+            apply_affine,
+            identity_params,
+            params_to_matrix,
+            sample_affine_at_points,
+        )
+
+        vol = _sphere_volume((16, 16, 16), center=(8, 8, 8), radius=5)
+        p = identity_params().clone()
+        p[0], p[1] = 2.0, -1.0  # shift in x, y
+        M = params_to_matrix(p)
+        full = apply_affine(vol, M, vol.shape, zero_outside=True)
+
+        # A handful of base points (x, y, z).
+        pts = torch.tensor([[8.0, 8.0, 8.0], [5.0, 9.0, 7.0], [10.0, 6.0, 8.0], [3.0, 3.0, 3.0]])
+        sampled = sample_affine_at_points(vol, M, pts, zero_outside=True)
+        flat = full.reshape(-1)
+        nz, ny, nx = vol.shape
+        for k, (x, y, z) in enumerate(pts.tolist()):
+            ref = flat[int(z) * ny * nx + int(y) * nx + int(x)]
+            torch.testing.assert_close(sampled[k], ref, atol=1e-4, rtol=0.0)
+
+    def test_batched_adam_matches_sequential(self):
+        """_refine_adam_batched row t equals _refine_adam_normalized on trial t."""
+        from fastfuncstuff.processing.allineate import _refine_adam_batched
+
+        bounds = _compute_param_bounds((16, 16, 16))
+        cfg = AffineAlignConfig(dof="rigid", verb=0)
+        target = torch.tensor([2.0, -1.0, 0.5])
+        dummy = _sphere_volume((8, 8, 8))
+        init = _identity_physical()
+
+        # Same separable cost expressed per-matrix and batched.
+        def scost(mat):
+            return -((mat[:3, 3] - target) ** 2).sum()
+
+        def bcost(mats):
+            return -((mats[:, :3, 3] - target) ** 2).sum(dim=1)
+
+        p_seq, _ = _refine_adam_normalized(
+            dummy,
+            dummy,
+            None,
+            init,
+            cfg,
+            CostContext(name="lpa"),
+            (1.0, 1.0, 1.0),
+            bounds,
+            DEV,
+            verb=0,
+            n_iters=200,
+            lr=0.02,
+            cost_fn=scost,
+        )
+        out_phys, _ = _refine_adam_batched(
+            [init.copy() for _ in range(3)],
+            cfg,
+            bounds,
+            DEV,
+            bcost,
+            verb=0,
+            n_iters=200,
+            lr=0.02,
+        )
+        # All three batched rows identical (same init/cost) and equal to seq.
+        for t in range(3):
+            np.testing.assert_allclose(out_phys[t][:3], p_seq[:3], atol=0.05)
+            np.testing.assert_allclose(out_phys[t][:3], target.numpy(), atol=0.5)
+
+    def test_sample_batched_matches_single(self):
+        """sample_affine_at_points_batched equals the single-matrix sampler."""
+        from fastfuncstuff.processing.affine import (
+            identity_params,
+            params_to_matrix,
+            sample_affine_at_points,
+            sample_affine_at_points_batched,
+        )
+
+        vol = _sphere_volume((16, 16, 16), center=(8, 8, 8), radius=5)
+        pts = torch.tensor([[8.0, 8.0, 8.0], [5.0, 9.0, 7.0], [10.0, 6.0, 8.0]])
+        mats = []
+        for dx, ry in [(0.0, 0.0), (2.0, 5.0), (-3.0, -8.0)]:
+            p = identity_params().clone()
+            p[0], p[5] = dx, ry
+            mats.append(params_to_matrix(p))
+        M = torch.stack(mats)
+        batched = sample_affine_at_points_batched(vol, M, pts, zero_outside=True)
+        for b in range(M.shape[0]):
+            single = sample_affine_at_points(vol, M[b], pts, zero_outside=True)
+            torch.testing.assert_close(batched[b], single, atol=1e-4, rtol=0.0)
+
+    def test_assign_bloks_points_partitions(self):
+        """assign_bloks_points labels points and respects MINCOR pruning."""
+        from fastfuncstuff.processing.cost_blok import assign_bloks_points
+
+        # A dense cube of points in mm (1 mm spacing): plenty per blok.
+        g = torch.arange(0, 20, dtype=torch.float32)
+        zz, yy, xx = torch.meshgrid(g, g, g, indexing="ij")
+        coords = torch.stack([xx.reshape(-1), yy.reshape(-1), zz.reshape(-1)], dim=1)
+        bs = assign_bloks_points(coords, bloktype="tohd", blokrad=6.0)
+        assert bs.index.shape[0] == coords.shape[0]
+        assert bs.n_populated >= 1
+        assert int((bs.index >= 0).sum()) > 0
+
+    def test_allineate_subsampled_recovers_shift(self):
+        """Forcing subsampling (small -nmatch) still recovers a small shift (lpa)."""
+        base = _sphere_volume((28, 28, 28), center=(14, 14, 14), radius=9)
+        source = _sphere_volume((28, 28, 28), center=(15.5, 14, 14), radius=9)
+        cfg = AffineAlignConfig(
+            dof="rigid",
+            cost="lpa",
+            n_match=1500,  # < domain -> exercises the point-sampled path
+            twopass=True,
+            coarse_range=8.0,
+            coarse_step=4.0,
+            tbest=1,
+            autocrop=False,
+            adam_iters_2x=40,
+            adam_iters_1x=60,
+            powell_maxfev=0,
+            verb=0,
+        )
+        _, warped = allineate(base, source, config=cfg)
+        torch.testing.assert_close(
+            _center_of_mass(warped), _center_of_mass(base), atol=1.2, rtol=0.0
         )

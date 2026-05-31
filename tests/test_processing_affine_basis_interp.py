@@ -50,12 +50,53 @@ class TestAffine:
         p2 = matrix_to_params(M)
         assert torch.allclose(p, p2, atol=1e-4)
 
+    def test_decompose_affine_sdu_roundtrip(self):
+        """decompose_affine_sdu is the exact inverse of params_to_matrix."""
+        from fastfuncstuff.processing.affine import decompose_affine_sdu
+
+        # translation + rotation (Z,X,Y) + anisotropic scale + shear
+        p = torch.tensor(
+            [-0.5, -22.5, -58.0, 3.88, 0.32, -0.50, 1.105, 1.076, 1.060, -0.002, -0.0035, -0.023]
+        )
+        M = params_to_matrix(p)
+        p2 = decompose_affine_sdu(M)
+        torch.testing.assert_close(p, p2, atol=2e-3, rtol=0.0)
+
+    def test_format_final_fit_params_block(self):
+        from fastfuncstuff.processing.affine import format_final_fit_params
+
+        p = torch.tensor(
+            [
+                -0.479,
+                -22.484,
+                -57.972,
+                3.8835,
+                0.3227,
+                -0.5023,
+                1.1047,
+                1.0760,
+                1.0602,
+                -0.0019,
+                -0.0035,
+                -0.0233,
+            ]
+        )
+        s = format_final_fit_params(p)
+        assert "x-shift=  -0.4790" in s
+        assert "enorm=" in s and "62.1" in s  # sqrt(0.48^2+22.48^2+57.97^2)
+        assert "z-angle=   3.8835" in s
+        assert "base smaller than source" in s  # vol3D > 1
+
     def test_params_to_matrix_batched(self):
         B = 4
         params = torch.zeros(B, 12)
         params[:, :3] = torch.randn(B, 3)
         params[:, 3:6] = torch.randn(B, 3) * 5.0
-        params[:, 6:9] = 1.0
+        # Anisotropic scale + nonzero shear: must match the single path here too
+        # (a regression guard — scaling D@U by column instead of row diverged only
+        # for non-identity scale, which the old scale==1 test never exercised).
+        params[:, 6:9] = 1.0 + torch.randn(B, 3) * 0.05
+        params[:, 9:12] = torch.randn(B, 3) * 0.03
         M_batch = params_to_matrix_batched(params)
         for i in range(B):
             M_single = params_to_matrix(params[i])

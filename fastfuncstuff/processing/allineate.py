@@ -33,6 +33,8 @@ from .affine import (
     identity_params,
     params_to_matrix,
     params_to_matrix_batched,
+    sample_affine_at_points,
+    sample_affine_at_points_batched,
 )
 from .cost import (
     _auto_clip,
@@ -44,6 +46,9 @@ from .cost import (
 from .cost_blok import (
     BlokSet,
     assign_bloks,
+    assign_bloks_points,
+    local_pearson_value,
+    local_pearson_value_batched,
     lpa_cost,
     lpa_cost_batched,
     lpc_cost,
@@ -90,6 +95,18 @@ class AffineAlignConfig:
     bloktype: str = "tohd"  # "tohd" (AFNI default), "rhdd", or "cube"
     blokrad: float | None = None
     ppow: float = 1.0  # |z| emphasis exponent (AFNI AFNI_LPC_POWER)
+
+    # Overlap penalty weight (AFNI lpc+/lpa+ "ov"). 0 = off (default). When > 0,
+    # a differentiable (max(0, 9.95-10*overlap))**2 term is subtracted from the
+    # cost so the refiner is pushed back toward full base/source overlap.
+    ov: float = 0.0
+
+    # Match-point subsampling for blok-cost (lpa/lpc) refinement (AFNI npt_match).
+    # The cost is evaluated on a fixed random subset of weight-domain points via
+    # point-wise sampling, so each iteration is O(n_match) instead of O(all
+    # voxels). Interpreted unit-free: <=1.0 is a *fraction* of the in-mask voxels
+    # (0.47 = AFNI default, 1.0 = all); >1.0 is an absolute count (e.g. 150000).
+    n_match: float = 0.47
 
     # Coarse search. Ranges mirror 3dAllineate's defaults: angle ±30°,
     # shift ±32% of grid size, scale ±20%. ``range_scale`` shrinks all of them
@@ -167,24 +184,138 @@ class CostContext:
     ppow: float = 1.0
     base_clip: tuple[float, float] | None = None
     source_clip: tuple[float, float] | None = None
+    # Overlap penalty (AFNI lpc+/lpa+ "ov"): differentiable additive term so the
+    # gradient-based refiner is steered away from low-overlap configurations.
+    # ``src_cov`` is a soft source-coverage map on the optimisation grid that is
+    # warped with the candidate transform; ``base_dom`` is the base brain domain;
+    # ``ov_denom`` mirrors AFNI's MIN(nbsmask, najmask) normaliser. ``ov_weight``
+    # is 0 (off) unless the user passes -ov.
+    ov_weight: float = 0.0
+    src_cov: Tensor | None = None
+    base_dom: Tensor | None = None
+    ov_denom: float = 1.0
     _blok_cache: dict = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self._blok_cache is None:
             self._blok_cache = {}
 
-    def blokset(self, shape, voxdims, device) -> BlokSet:
+    def blokset(self, shape, voxdims, device, blokrad_mm=None) -> BlokSet:
         """Get (or build + cache) the blok assignment for one grid.
 
-        Cached per (shape, rounded voxdims) so the lattice is computed once and
-        reused across every optimiser iteration on that grid.
+        Cached per (shape, rounded voxdims, blokrad) so the lattice is computed
+        once and reused across every optimiser iteration on that grid. The blur
+        pyramid passes a per-stage ``blokrad_mm`` (inflated by the smoothing
+        radius, AFNI-style), so the radius is part of the cache key.
         """
-        key = (tuple(shape), tuple(round(v, 4) for v in voxdims))
+        rad = self.blokrad_mm if blokrad_mm is None else blokrad_mm
+        key = (
+            tuple(shape),
+            tuple(round(v, 4) for v in voxdims),
+            None if rad is None else round(rad, 4),
+        )
         bs = self._blok_cache.get(key)
         if bs is None:
-            bs = assign_bloks(tuple(shape), voxdims, self.bloktype, self.blokrad_mm, device=device)
+            bs = assign_bloks(tuple(shape), voxdims, self.bloktype, rad, device=device)
             self._blok_cache[key] = bs
         return bs
+
+
+@dataclass
+class SampleSet:
+    """A fixed random subset of weight-domain points for subsampled blok costs.
+
+    Built once per run from the voxels the optimiser actually cares about
+    (weight > 0), so the per-iteration cost of the local-Pearson refinement is
+    O(M) instead of O(all voxels). The matching points are fixed across
+    iterations (a stable cost surface, like AFNI's npt_match), and the per-stage
+    blok lattice over them is cached by blok radius.
+    """
+
+    idx_flat: Tensor  # (M,) flat indices into the optimisation grid
+    points_xyz: Tensor  # (M, 3) base voxel coords (x, y, z) for the point sampler
+    coords_mm: Tensor  # (M, 3) physical mm coords for blok assignment
+    weight_s: Tensor  # (M,) gathered weight
+    bloktype: str = "tohd"
+    _blok_cache: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self._blok_cache is None:
+            self._blok_cache = {}
+
+    def blokset(self, blokrad_mm, device) -> BlokSet:
+        key = None if blokrad_mm is None else round(blokrad_mm, 4)
+        bs = self._blok_cache.get(key)
+        if bs is None:
+            bs = assign_bloks_points(self.coords_mm, self.bloktype, blokrad_mm, device=device)
+            self._blok_cache[key] = bs
+        return bs
+
+
+_SAMPLE_DEFAULT_FRAC = 0.47  # AFNI 3dAllineate default: 47% of the in-mask voxels
+
+
+def _build_sample_set(
+    base_opt: Tensor,
+    weight_opt: Tensor | None,
+    voxdims: tuple[float, float, float],
+    n_match: float,
+    bloktype: str,
+    device: torch.device,
+) -> SampleSet | None:
+    """Draw a fixed random subset of the weight domain for subsampled costs.
+
+    The domain is ``weight > 0`` (the autoweight already drops the background and
+    fades the FOV edge); without a weight it falls back to nonzero base voxels.
+    ``n_match`` is interpreted like 3dAllineate's npt_match but unit-free:
+    ``<= 0`` -> default 47% of the domain; ``<= 1.0`` -> that *fraction* of the
+    domain (so 1.0 == all); ``> 1.0`` -> that many points (e.g. 150000).
+    Returns None if the domain is too small to bother subsampling.
+    """
+    _, ny, nx = base_opt.shape
+    if weight_opt is not None:
+        domain = (weight_opt.reshape(-1) > 0).nonzero(as_tuple=False).reshape(-1)
+    else:
+        domain = (base_opt.reshape(-1) != 0).nonzero(as_tuple=False).reshape(-1)
+    n_dom = int(domain.numel())
+    if n_dom < 2000:  # tiny / synthetic: not worth the point machinery
+        return None
+
+    if n_match <= 0.0:
+        budget = int(_SAMPLE_DEFAULT_FRAC * n_dom)
+    elif n_match <= 1.0:
+        budget = int(n_match * n_dom)
+    else:
+        budget = int(n_match)
+    if budget >= n_dom:
+        idx_flat = domain
+    else:
+        # Deterministic subset so the cost surface is stable across iterations
+        # and reproducible across runs.
+        g = torch.Generator(device="cpu").manual_seed(12345)
+        perm = torch.randperm(n_dom, generator=g)[:budget]
+        idx_flat = domain[perm.to(domain.device)]
+
+    nxy = ny * nx
+    z = torch.div(idx_flat, nxy, rounding_mode="floor")
+    rem = idx_flat - z * nxy
+    y = torch.div(rem, nx, rounding_mode="floor")
+    x = rem - y * nx
+    points_xyz = torch.stack([x, y, z], dim=1).to(dtype=torch.float32)
+    dx, dy, dz = (float(v) for v in voxdims)
+    coords_mm = points_xyz * torch.tensor([dx, dy, dz], device=points_xyz.device)
+    weight_s = (
+        weight_opt.reshape(-1)[idx_flat]
+        if weight_opt is not None
+        else torch.ones(idx_flat.numel(), device=device)
+    )
+    return SampleSet(
+        idx_flat=idx_flat,
+        points_xyz=points_xyz,
+        coords_mm=coords_mm,
+        weight_s=weight_s,
+        bloktype=bloktype,
+    )
 
 
 def _voxdims_from_header(header: dict | None) -> tuple[float, float, float]:
@@ -201,42 +332,73 @@ def _voxdims_from_header(header: dict | None) -> tuple[float, float, float]:
     return (dx or 1.0, dy or 1.0, dz or 1.0)
 
 
+def _overlap_penalty(ctx: CostContext, matrix: Tensor, out_shape) -> Tensor:
+    """AFNI lpc+/lpa+ overlap penalty as a differentiable scalar (>= 0).
+
+    Warps the soft source-coverage map by ``matrix`` and measures the fraction
+    of the base brain domain it covers, then applies AFNI's
+    ``(max(0, 9.95 - 10*ov))**2`` shape (mri_genalign.c GA_scalar_costfun). The
+    fraction depends on the warp through grid_sample, so the term is
+    differentiable and the Adam/Powell refiner is actively pushed back toward
+    overlap rather than only being re-ranked after the fact.
+    """
+    warped_cov = apply_affine(ctx.src_cov, matrix, out_shape, zero_outside=True)
+    ov = (ctx.base_dom * warped_cov).sum() / max(ctx.ov_denom, 1e-6)
+    ovv = torch.clamp(9.95 - 10.0 * ov, min=0.0)
+    return ovv * ovv
+
+
 def _compute_cost(
     base: Tensor,
     warped: Tensor,
     weight: Tensor | None,
     ctx: CostContext,
     voxdims: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    matrix: Tensor | None = None,
+    blokrad_mm: float | None = None,
 ) -> Tensor:
-    """Compute alignment cost for one warped volume (higher == better)."""
+    """Compute alignment cost for one warped volume (higher == better).
+
+    ``matrix`` (base->source voxel map) is only needed when the overlap penalty
+    is active; ``blokrad_mm`` overrides the blok radius for the current blur
+    pyramid stage.
+    """
     name = ctx.name
     if name in ("ls", "pearclp"):
-        return clipped_pearson_correlation(
+        cost = clipped_pearson_correlation(
             base.reshape(-1),
             warped.reshape(-1),
             weight.reshape(-1) if weight is not None else None,
         )
-    if name == "lps":
-        return lpa_correlation(base, warped, weight, sigma=ctx.sigma, kernel_type=ctx.kernel)
-    if name == "lpsc":
-        return lpc_correlation(base, warped, weight, sigma=ctx.sigma, kernel_type=ctx.kernel)
-    if name in _BLOK_COSTS:
-        bs = ctx.blokset(base.shape, voxdims, base.device)
+    elif name == "lps":
+        cost = lpa_correlation(base, warped, weight, sigma=ctx.sigma, kernel_type=ctx.kernel)
+    elif name == "lpsc":
+        cost = lpc_correlation(base, warped, weight, sigma=ctx.sigma, kernel_type=ctx.kernel)
+    elif name in _BLOK_COSTS:
+        bs = ctx.blokset(base.shape, voxdims, base.device, blokrad_mm=blokrad_mm)
         fn = lpa_cost if name == "lpa" else lpc_cost
-        return fn(base, warped, weight, bs, ppow=ctx.ppow)
-    if name in _HIST_COSTS:
+        cost = fn(base, warped, weight, bs, ppow=ctx.ppow)
+    elif name in _HIST_COSTS:
         kw = dict(weight=weight, base_clip=ctx.base_clip, source_clip=ctx.source_clip)
         if name == "mi":
-            return cost_hist.mi_cost(base, warped, **kw)
-        if name == "nmi":
-            return cost_hist.nmi_cost(base, warped, **kw)
-        if name == "je":
-            return cost_hist.je_cost(base, warped, **kw)
-        if name == "hel":
-            return cost_hist.hel_cost(base, warped, **kw)
-        mode = {"cru": "u", "cra": "a", "crm": "m"}[name]
-        return cost_hist.cr_cost(base, warped, mode=mode, **kw)
-    raise ValueError(f"Unknown cost function: {name}")
+            cost = cost_hist.mi_cost(base, warped, **kw)
+        elif name == "nmi":
+            cost = cost_hist.nmi_cost(base, warped, **kw)
+        elif name == "je":
+            cost = cost_hist.je_cost(base, warped, **kw)
+        elif name == "hel":
+            cost = cost_hist.hel_cost(base, warped, **kw)
+        else:
+            mode = {"cru": "u", "cra": "a", "crm": "m"}[name]
+            cost = cost_hist.cr_cost(base, warped, mode=mode, **kw)
+    else:
+        raise ValueError(f"Unknown cost function: {name}")
+
+    # Overlap penalty (subtracted because we maximise; AFNI adds it to a cost it
+    # minimises). Only when -ov is set and a transform is available.
+    if ctx.ov_weight > 0.0 and ctx.src_cov is not None and matrix is not None:
+        cost = cost - ctx.ov_weight * _overlap_penalty(ctx, matrix, base.shape)
+    return cost
 
 
 def _batched_cost(
@@ -608,6 +770,135 @@ def _cmass_translation(base: Tensor, source: Tensor, grid_matrix: Tensor | None 
 # ---------------------------------------------------------------------------
 
 
+def _coarse_search_joint(
+    base_opt: Tensor,
+    source_opt: Tensor,
+    sample: SampleSet,
+    ctx: CostContext,
+    config: AffineAlignConfig,
+    bounds: np.ndarray,
+    device: torch.device,
+    verb: int = 1,
+) -> list[np.ndarray]:
+    """Joint rigid coarse search, point-subsampled (AFNI ransetup-style).
+
+    Instead of the split translation→rotation sweep (which seeds the refiner far
+    from the basin when both are needed, because the best translation at zero
+    rotation is not the best translation at the true rotation), this:
+
+      1. builds a *joint* seed set over (translation, rotation) — a coarse grid
+         plus a few random points — so every seed is a real (T, R) pair;
+      2. scores them all on a small subset of the match points (batched, on a
+         mild blur for a wide basin) — full-resolution points, not a distorted
+         2x-downsample, so the ranking signal is real;
+      3. polishes the best NKEEP with a short subsampled joint Adam;
+      4. dedups by parameter distance and returns the best ``tbest``.
+
+    All evaluation is point-wise (O(M)), so the joint search is cheaper than the
+    old split+downsample one despite covering more of the space jointly.
+    """
+    free_mask = _get_free_mask(config.dof)
+    is_lpc = ctx.name == "lpc"
+    voxdims = ctx.base_voxdims
+    vmean = sum(voxdims) / 3.0
+    sigma = 2.0  # mild blur: wide capture basin for the seed polish
+
+    # Coarse match points: a small subset of the refinement sample (AFNI scores
+    # the coarse pass on far fewer points than the fine pass).
+    n_coarse = min(int(sample.idx_flat.numel()), 40000)
+    pts_xyz = sample.points_xyz[:n_coarse]
+    coords_mm = sample.coords_mm[:n_coarse]
+    weight_c = sample.weight_s[:n_coarse]
+    idx_c = sample.idx_flat[:n_coarse]
+
+    blokrad_c = math.sqrt(ctx.blokrad_mm**2 + (sigma * vmean) ** 2) if ctx.blokrad_mm else None
+    base_blur = _separable_smooth_3d(base_opt, sigma)
+    source_blur = _separable_smooth_3d(source_opt, sigma)
+    base_pts = base_blur.reshape(-1)[idx_c]
+    blokset_c = assign_bloks_points(coords_mm, ctx.bloktype, blokrad_c, device=device)
+
+    # --- joint seed set: grid over (3 translations x 3 rotations per axis) ---
+    def _axis(lo, hi, n):
+        return torch.linspace(float(lo), float(hi), n, device=device)
+
+    n_t, n_r = 3, 5  # rotation finer (cmass fixes translation, not rotation)
+    tax = [_axis(bounds[a, 0], bounds[a, 1], n_t) for a in range(3)]
+    rax = [_axis(bounds[3 + a, 0], bounds[3 + a, 1], n_r) for a in range(3)]
+    tg = torch.meshgrid(*tax, indexing="ij")
+    rg = torch.meshgrid(*rax, indexing="ij")
+    trans = torch.stack([g.reshape(-1) for g in tg], dim=1)  # (n_t^3, 3)
+    rots = torch.stack([g.reshape(-1) for g in rg], dim=1)  # (n_r^3, 3)
+    nt3, nr3 = trans.shape[0], rots.shape[0]
+    seeds = _base_params(nt3 * nr3, trans.repeat_interleave(nr3, 0), device)
+    seeds[:, 3:6] = rots.repeat(nt3, 1)
+
+    # plus a handful of random joint seeds (deterministic) for robustness
+    n_rand = 32
+    g = torch.Generator(device="cpu").manual_seed(2024)
+    rnd = _base_params(n_rand, torch.zeros(n_rand, 3, device=device), device)
+    for a in range(6):
+        lo, hi = float(bounds[a, 0]), float(bounds[a, 1])
+        rnd[:, a] = torch.rand(n_rand, generator=g).to(device) * (hi - lo) + lo
+    seeds = torch.cat([seeds, rnd], dim=0)
+
+    # --- batched subsampled evaluation of every seed ---
+    matrices = params_to_matrix_batched(seeds)
+    B = matrices.shape[0]
+    chunk = max(1, int(3.0e7 / max(1, n_coarse)))
+    costs = []
+    for s in range(0, B, chunk):
+        with torch.no_grad():
+            wb = sample_affine_at_points_batched(
+                source_blur, matrices[s : s + chunk], pts_xyz, zero_outside=True
+            )
+            val = local_pearson_value_batched(base_pts, wb, weight_c, blokset_c, ctx.ppow)
+        costs.append((-val) if is_lpc else val.abs())
+    costs = torch.cat(costs)
+
+    # --- polish a few of the best seeds with a short joint subsampled Adam ---
+    # The batched eval above already ranks 3000+ seeds, so we only polish a
+    # handful past the `tbest` we keep (a couple spares for the dedup) with few
+    # iters — and we polish them all in one batched Adam, which keeps the GPU
+    # busy (launch-bound otherwise). The fine refinement does the heavy lifting.
+    nkeep = min(B, config.tbest + 2)
+    top = costs.topk(nkeep).indices.tolist()
+    coarse_cost = _batched_sampled_cost(source_blur, pts_xyz, base_pts, weight_c, blokset_c, ctx)
+    out_phys, out_costs = _refine_adam_batched(
+        [seeds[i].cpu().numpy() for i in top],
+        config,
+        bounds,
+        device,
+        coarse_cost,
+        verb=0,
+        n_iters=40,
+        lr=config.adam_lr_2x,
+        desc="coarse",
+    )
+    polished = [(float(out_costs[t]), out_phys[t]) for t in range(len(top))]
+    polished.sort(key=lambda x: -x[0])
+
+    # --- dedup by parameter distance, keep tbest distinct ---
+    trials = [polished[0]]
+    for c, p in polished[1:]:
+        nj = _normalize(p, bounds)
+        if all(
+            np.max(np.abs(nj[free_mask] - _normalize(pk, bounds)[free_mask])) >= 0.05
+            for _, pk in trials
+        ):
+            trials.append((c, p))
+        if len(trials) >= config.tbest:
+            break
+
+    if verb >= 1:
+        p = trials[0][1]
+        print(
+            f"  Joint coarse: {B} seeds → polished {nkeep} → kept {len(trials)} "
+            f"(best cost={trials[0][0]:.4f}, rot=({p[3]:.1f}°,{p[4]:.1f}°,{p[5]:.1f}°), "
+            f"shift=({p[0]:.1f},{p[1]:.1f},{p[2]:.1f}))"
+        )
+    return [p for _, p in trials]
+
+
 def _base_params(n: int, translations: Tensor, device: torch.device) -> Tensor:
     """(n, 12) identity-scale param rows with the given (n, 3) translations."""
     params = torch.zeros(n, 12, device=device)
@@ -682,7 +973,15 @@ def _eval_candidates(
     for start in _tqdm_bar(chunks, total=len(range(0, B, chunk_size)), desc=desc, disable=verb < 1):
         end = min(start + chunk_size, B)
         with torch.no_grad():
-            warped = apply_affine_batched(source, matrices[start:end], base.shape)
+            # zero_outside (AFNI outval=0): base voxels mapping outside the
+            # source read 0, not a replicated border. Border padding smears the
+            # brain edge into the shifted-in region and manufactures spurious
+            # local correlation, letting the search drift out of overlap; the
+            # zero fill dilutes those edge bloks instead (AFNI's implicit
+            # overlap mechanism). See mri_genalign_util.c GA_interp_* outval.
+            warped = apply_affine_batched(
+                source, matrices[start:end], base.shape, zero_outside=True
+            )
             costs = _batched_cost(base, warped, weight, ctx, voxdims)
         all_costs.append(costs)
         del warped
@@ -807,8 +1106,14 @@ def _refine_adam_normalized(
     n_iters: int = 150,
     lr: float = 0.01,
     desc: str = "Adam",
+    blokrad_mm: float | None = None,
+    cost_fn=None,
 ) -> tuple[np.ndarray, float]:
     """Refine parameters using Adam on [0,1] normalized params (GPU).
+
+    ``cost_fn``, when given, maps a (4,4) matrix to a scalar cost (higher ==
+    better) and replaces the full-grid ``apply_affine`` + ``_compute_cost`` path
+    — used for the subsampled blok refinement.
 
     The key fix over raw Adam: all 12 parameters are normalized to [0,1]
     using AFNI-style bounds, so translations (voxels), rotations (degrees),
@@ -836,23 +1141,23 @@ def _refine_adam_normalized(
 
     optimizer = torch.optim.Adam([params_norm], lr=lr)
 
-    best_cost = -float("inf")
+    # Best tracking lives on-device (no per-iter host sync): every step updates
+    # best_norm / best_cost_t with torch.where / torch.maximum, which keeps the
+    # GPU pipeline running ahead. We only copy a scalar back to the host every
+    # `sync_every` steps — purely for the plateau test and the progress bar.
+    best_cost_t = torch.full((), -float("inf"), device=device)
     best_norm = params_norm.detach().clone()
+    last_best = -float("inf")
     no_improve = 0
 
-    # Plateau detection: count an iteration as "improved" only if the cost rose
-    # by more than a *relative* tolerance (an absolute 1e-7 is meaningless when
-    # costs are ~0.02, so the old test never plateaued and just ran to the cap).
-    # Stop once it has been flat for `patience` iterations. This lets us set a
-    # generous iteration ceiling and still finish quickly when converged.
+    # Plateau detection: count progress only when the *best* cost rose by more
+    # than a relative tolerance; stop once flat for `patience` iterations. The
+    # generous iteration ceiling then costs nothing when converged.
     rel_tol = 1e-4
     abs_tol = 1e-6
     patience = 40
+    sync_every = 15
 
-    # Reading the cost back to the host forces a GPU sync, so do it only every
-    # few iterations rather than every step (Adam is smooth enough that the
-    # coarser best-tracking / early-stop cadence costs nothing in accuracy).
-    sync_every = 5
     pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
     for it in pbar:
         optimizer.zero_grad()
@@ -868,8 +1173,14 @@ def _refine_adam_normalized(
         # Denormalize (differentiable) and build matrix
         params_phys = _denormalize_t(params_norm, bmin, span)
         matrix = params_to_matrix(params_phys)
-        warped = apply_affine(source, matrix, base.shape)
-        cost = _compute_cost(base, warped, weight, ctx, voxdims)
+        if cost_fn is not None:
+            cost = cost_fn(matrix)
+        else:
+            # zero_outside (AFNI outval=0) during optimization — see _eval_candidates.
+            warped = apply_affine(source, matrix, base.shape, zero_outside=True)
+            cost = _compute_cost(
+                base, warped, weight, ctx, voxdims, matrix=matrix, blokrad_mm=blokrad_mm
+            )
 
         loss = -cost
         loss.backward()
@@ -880,34 +1191,149 @@ def _refine_adam_normalized(
 
         optimizer.step()
 
+        # On-device best tracking — no sync, so the GPU can keep going.
+        with torch.no_grad():
+            cur = cost.detach()
+            improved = cur > best_cost_t
+            best_norm = torch.where(improved, cand_norm, best_norm)
+            best_cost_t = torch.maximum(best_cost_t, cur)
+
         if it % sync_every == 0 or it == n_iters - 1:
-            cost_val = cost.item()
-            threshold = best_cost + max(abs_tol, rel_tol * abs(best_cost))
-            if cost_val > threshold:
-                best_cost = cost_val
-                best_norm = cand_norm
+            bc = best_cost_t.item()  # the only host sync
+            # Guard the first sync: with last_best == -inf the relative threshold
+            # is -inf + inf == nan, and `bc > nan` is always False, which would
+            # (wrongly) trip the plateau counter from iteration 0.
+            thr = (
+                last_best + max(abs_tol, rel_tol * abs(last_best))
+                if math.isfinite(last_best)
+                else -float("inf")
+            )
+            if bc > thr:
+                last_best = bc
                 no_improve = 0
             else:
-                # Keep the best params even while plateauing/oscillating.
-                if cost_val > best_cost:
-                    best_cost = cost_val
-                    best_norm = cand_norm
                 no_improve += sync_every
 
             if tqdm is not None and verb >= 1:
-                pbar.set_postfix_str(f"cost={cost_val:.6f}")
+                pbar.set_postfix_str(f"cost={bc:.6f}")
             elif verb >= 2:
-                print(f"    {desc} iter {it}: cost={cost_val:.6f}")
+                print(f"    {desc} iter {it}: best={bc:.6f}")
 
-            # Early stopping once the cost has been flat (within rel_tol) for
+            # Early stopping once the best has been flat (within rel_tol) for
             # `patience` iterations — handles plateaus and oscillation.
             if no_improve >= patience:
-                if verb >= 2:
-                    print(f"    {desc} converged at iter {it} (cost={best_cost:.6f})")
+                # Only print when there's no live bar; otherwise it interleaves
+                # with tqdm's in-place redraw and leaves a stale duplicate line.
+                if verb >= 2 and tqdm is None:
+                    print(f"    {desc} converged at iter {it} (best={bc:.6f})")
                 break
 
     best_phys = _denormalize_t(best_norm.clamp(0.0, 1.0), bmin, span).detach().cpu().numpy()
-    return best_phys, best_cost
+    return best_phys, best_cost_t.item()
+
+
+def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset, ctx: CostContext):
+    """Build a batched blok cost: (T,4,4) matrices -> (T,) costs (higher better).
+
+    Scores T independent transforms against one shared base/point/blok set in a
+    single set of kernels — the GPU does T× the work per launch, which is what
+    lifts utilisation out of the launch-bound regime.
+    """
+    is_lpc = ctx.name == "lpc"
+
+    def fn(matrices: Tensor) -> Tensor:
+        warped = sample_affine_at_points_batched(
+            source_stage, matrices, points_xyz, zero_outside=True
+        )  # (T, M)
+        val = local_pearson_value_batched(base_pts, warped, weight_s, blokset, ctx.ppow)  # (T,)
+        c = (-val) if is_lpc else val.abs()
+        if ctx.ov_weight > 0.0 and ctx.src_cov is not None:
+            pens = torch.stack(
+                [
+                    _overlap_penalty(ctx, matrices[t], ctx.src_cov.shape)
+                    for t in range(matrices.shape[0])
+                ]
+            )
+            c = c - ctx.ov_weight * pens
+        return c
+
+    return fn
+
+
+def _refine_adam_batched(
+    init_params_phys_list: list[np.ndarray],
+    config: AffineAlignConfig,
+    bounds: np.ndarray,
+    device: torch.device,
+    batched_cost_fn,
+    verb: int = 1,
+    n_iters: int = 150,
+    lr: float = 0.01,
+    desc: str = "Adam",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalized Adam over T trials at once (one batched cost per step).
+
+    The T trials are independent (separate parameter rows), so a single
+    ``loss = -cost.sum()`` backward produces per-row gradients and Adam steps
+    them together. Best tracking and the plateau early-stop are per-trial; we
+    stop once *all* trials have plateaued.
+
+    Returns:
+        (params_phys, costs): (T, 12) refined params and (T,) best costs.
+    """
+    free_mask = torch.tensor(_get_free_mask(config.dof), dtype=torch.bool, device=device)
+    bmin, span = _bounds_to_torch(bounds, device)
+    identity_norm = _normalize_t(
+        torch.tensor(_identity_physical(), dtype=torch.float32, device=device), bmin, span
+    )
+
+    init = torch.tensor(np.stack(init_params_phys_list), dtype=torch.float32, device=device)
+    T = init.shape[0]
+    params_norm = _normalize_t(init, bmin, span).clone().detach()
+    params_norm.requires_grad_(True)
+    optimizer = torch.optim.Adam([params_norm], lr=lr)
+
+    best_cost_t = torch.full((T,), -float("inf"), device=device)
+    best_norm = params_norm.detach().clone()
+    last_best = np.full(T, -np.inf)
+    no_improve = np.zeros(T, dtype=np.int64)
+    rel_tol, abs_tol, patience, sync_every = 1e-4, 1e-6, 40, 15
+
+    pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
+    for it in pbar:
+        optimizer.zero_grad()
+        with torch.no_grad():
+            params_norm.data[:, ~free_mask] = identity_norm[~free_mask]
+            params_norm.data.clamp_(0.0, 1.0)
+        cand_norm = params_norm.detach().clone()
+        matrices = params_to_matrix_batched(_denormalize_t(params_norm, bmin, span))
+        cost = batched_cost_fn(matrices)  # (T,)
+        (-cost.sum()).backward()
+        if params_norm.grad is not None:
+            params_norm.grad.data[:, ~free_mask] = 0.0
+        optimizer.step()
+
+        with torch.no_grad():
+            cur = cost.detach()
+            improved = cur > best_cost_t
+            best_norm = torch.where(improved[:, None], cand_norm, best_norm)
+            best_cost_t = torch.maximum(best_cost_t, cur)
+
+        if it % sync_every == 0 or it == n_iters - 1:
+            bc = best_cost_t.detach().cpu().numpy()
+            finite = np.isfinite(last_best)
+            lb = np.where(finite, last_best, 0.0)  # avoid -inf+inf -> nan in the unused branch
+            thr = np.where(finite, lb + np.maximum(abs_tol, rel_tol * np.abs(lb)), -np.inf)
+            imp = bc > thr
+            last_best = np.where(imp, bc, last_best)
+            no_improve = np.where(imp, 0, no_improve + sync_every)
+            if tqdm is not None and verb >= 1:
+                pbar.set_postfix_str(f"best={bc.max():.6f}")
+            if bool((no_improve >= patience).all()):
+                break
+
+    best_phys = _denormalize_t(best_norm.clamp(0.0, 1.0), bmin, span).detach().cpu().numpy()
+    return best_phys, best_cost_t.detach().cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -927,8 +1353,13 @@ def _make_powell_cost(
     device: torch.device,
     counter: list | None = None,
     pbar=None,
+    matrix_cost_fn=None,
 ):
-    """Create a closure for scipy Powell (avoids kwargs issue)."""
+    """Create a closure for scipy Powell (avoids kwargs issue).
+
+    ``matrix_cost_fn``, when given, maps a (4,4) matrix to a scalar cost (higher
+    == better) and replaces the full-grid path (subsampled blok refinement).
+    """
 
     def cost_fn(x_free_norm: np.ndarray) -> float:
         # Clamp to [0,1] — Powell can overshoot, producing garbage warps
@@ -942,8 +1373,12 @@ def _make_powell_cost(
         matrix = params_to_matrix(params_t)
 
         with torch.no_grad():
-            warped = apply_affine(source, matrix, base.shape)
-            cost = _compute_cost(base, warped, weight, ctx, voxdims)
+            if matrix_cost_fn is not None:
+                cost = matrix_cost_fn(matrix)
+            else:
+                # zero_outside (AFNI outval=0) during optimization — see _eval_candidates.
+                warped = apply_affine(source, matrix, base.shape, zero_outside=True)
+                cost = _compute_cost(base, warped, weight, ctx, voxdims, matrix=matrix)
 
         val = -cost.item()
 
@@ -973,6 +1408,7 @@ def _refine_powell(
     ftol: float = 1e-4,
     maxfev: int = 500,
     desc: str = "Powell",
+    cost_fn=None,
 ) -> tuple[np.ndarray, float]:
     """Refine parameters using Powell's method (derivative-free).
 
@@ -998,7 +1434,7 @@ def _refine_powell(
     if tqdm is not None and verb >= 1:
         pbar = tqdm(total=maxfev, desc=desc, file=sys.stderr, leave=True, ncols=80)
 
-    cost_fn = _make_powell_cost(
+    powell_cost = _make_powell_cost(
         base,
         source,
         weight,
@@ -1010,15 +1446,16 @@ def _refine_powell(
         device,
         counter=counter,
         pbar=pbar,
+        matrix_cost_fn=cost_fn,
     )
 
     # Powell with bounds to keep params in [0,1]
     param_bounds_01 = [(0.0, 1.0)] * nfree
 
-    start_cost = -cost_fn(x0)  # cost at the incoming (refined) params
+    start_cost = -powell_cost(x0)  # cost at the incoming (refined) params
 
     result = minimize(
-        cost_fn,
+        powell_cost,
         x0,
         method="Powell",
         bounds=param_bounds_01,
@@ -1070,117 +1507,157 @@ def _refine_progressive(
     bounds: np.ndarray,
     device: torch.device,
     verb: int = 1,
-) -> np.ndarray:
+    sample: SampleSet | None = None,
+) -> tuple[np.ndarray, float]:
     """Progressive multi-resolution refinement: Adam (GPU) + Powell polish.
 
-    Resolution pyramid (smooth + downsample for speed):
-      - Level 2x: smooth σ=4, downsample 2x → fast Adam, all trials
-      - Level 1x: full resolution → Adam, deduplicate to best trial
+    Blur pyramid (full resolution throughout — NO decimation):
+      - Blurred stage: smooth base+source (σ≈2 vox) → wide basin, all trials
+      - Sharp stage: full resolution → Adam, deduplicate to best trial
       - Powell polish on best
 
+    AFNI widens the capture basin by *smoothing* both images and shrinking the
+    blur across passes (3dAllineate ``smooth_radius_*``), never by downsampling:
+    decimation changes the blok lattice geometry and aliases the cost surface,
+    which for the local-Pearson costs drove the optimiser away from the true
+    basin. For the blok costs the blok radius is inflated by the blur radius
+    (AFNI ``rad=sqrt(blokrad^2+smooth^2)``) so the now-correlated neighbours
+    don't dominate the within-blok variance.
+
     Returns:
-        (12,) best refined parameters in physical units.
+        (params, cost): the (12,) best refined parameters (physical units) and
+        the best cost achieved (the in-mask sampled cost for blok costs).
     """
     free_mask = _get_free_mask(config.dof)
     trials = [(0.0, p.copy()) for p in trial_params_list]
 
-    # --- Level 2x: downsampled (fast, ~8x fewer voxels) ---
-    # Skip for the blok / histogram costs: heavy down-blur makes neighbouring
-    # voxels correlated, which inflates within-blok |correlation| (and the joint
-    # histogram) regardless of alignment, so optimizing the downsampled surface
-    # drives *away* from the true full-res basin (verified on EPI->anat lpc).
-    # Those costs refine at full resolution, where the basin is stable.
-    can_downsample = (
-        min(base.shape) > 16 and ctx.name not in _BLOK_COSTS and ctx.name not in _HIST_COSTS
-    )
-    if can_downsample:
-        ds = 2
-        base_2x = _downsample_3d(_smooth_to_resolution(base, ds), ds)
-        source_2x = _downsample_3d(_smooth_to_resolution(source, ds), ds)
-        weight_2x = _downsample_3d(weight, ds) if weight is not None else None
+    vmean = sum(voxdims) / 3.0
 
-        # Scale translation bounds for downsampled grid
-        bounds_2x = bounds.copy()
-        bounds_2x[:3] /= ds
-        # The 2x grid has voxels ds times larger (in mm), so the blok lattice
-        # must be built with scaled voxel sizes to keep a fixed physical blok.
-        voxdims_2x = tuple(v * ds for v in voxdims)
+    def _stage_blokrad(sigma_vox: float) -> float | None:
+        if ctx.blokrad_mm is None or sigma_vox <= 0.0:
+            return ctx.blokrad_mm
+        return math.sqrt(ctx.blokrad_mm**2 + (sigma_vox * vmean) ** 2)
+
+    # Subsampled blok cost: evaluate lpa/lpc on the fixed point set in ``sample``
+    # (point-wise warp + point blok lattice), so each iteration is O(M) instead
+    # of O(all voxels). Only for the blok costs; other costs keep the full grid.
+    use_sample = sample is not None and ctx.name in _BLOK_COSTS
+
+    def _sampled_cost_fn(base_stage: Tensor, source_stage: Tensor, blokrad_stage, samp: SampleSet):
+        base_pts = base_stage.reshape(-1)[samp.idx_flat]
+        blokset_s = samp.blokset(blokrad_stage, device)
+        is_lpc = ctx.name == "lpc"
+
+        def fn(matrix: Tensor) -> Tensor:
+            warped_s = sample_affine_at_points(
+                source_stage, matrix, samp.points_xyz, zero_outside=True
+            )
+            val = local_pearson_value(base_pts, warped_s, samp.weight_s, blokset_s, ppow=ctx.ppow)
+            c = (-val) if is_lpc else val.abs()
+            if ctx.ov_weight > 0.0 and ctx.src_cov is not None:
+                c = c - ctx.ov_weight * _overlap_penalty(ctx, matrix, ctx.src_cov.shape)
+            return c
+
+        return fn
+
+    # Stages: (sigma_vox, n_iters, lr, dedup_after). A blurred basin-widening
+    # stage first (only when the volume is big enough for blurring to matter),
+    # then the sharp full-resolution stage. Translations stay in full-grid
+    # voxels throughout (no bound rescaling), since we never decimate.
+    #
+    # All stages use the full match-point set: refinement is launch-bound (each
+    # Adam iteration is dominated by kernel-launch / autograd overhead, ~constant
+    # for ≳300k points), so a per-stage point ramp bought no speed and only made
+    # the blur trajectories noisier (changing how many trials survived dedup).
+    stages: list[tuple[float, int, float, bool]] = []
+    if min(base.shape) > 16:
+        stages.append((2.0, config.adam_iters_2x, config.adam_lr_2x, True))
+    stages.append((0.0, config.adam_iters_1x, config.adam_lr, False))
+
+    for si, (sigma_vox, n_iters, lr, dedup_after) in enumerate(stages):
+        if sigma_vox > 0.0:
+            base_s = _separable_smooth_3d(base, sigma_vox)
+            source_s = _separable_smooth_3d(source, sigma_vox)
+            label = f"Blur σ={sigma_vox:g}vox"
+        else:
+            base_s, source_s = base, source
+            label = "Full resolution"
+        blokrad_stage = _stage_blokrad(sigma_vox)
 
         if verb >= 1:
-            print(f"  Medium resolution ({base_2x.shape}, {ds}x downsample, {len(trials)} trials):")
+            npts = f", {sample.idx_flat.numel()} pts" if use_sample else ""
+            print(f"  {label} ({base_s.shape}{npts}, {len(trials)} trials):")
 
-        refined = []
-        for i, (_, params) in enumerate(trials):
-            params_ds = params.copy()
-            params_ds[:3] /= ds
-            params_out, cost = _refine_adam_normalized(
-                base_2x,
-                source_2x,
-                weight_2x,
-                params_ds,
+        if use_sample:
+            # All trials in one batched Adam — T× the work per launch.
+            base_pts = base_s.reshape(-1)[sample.idx_flat]
+            blokset_s = sample.blokset(blokrad_stage, device)
+            bcost = _batched_sampled_cost(
+                source_s, sample.points_xyz, base_pts, sample.weight_s, blokset_s, ctx
+            )
+            out_phys, out_costs = _refine_adam_batched(
+                [p for _, p in trials],
                 config,
-                ctx,
-                voxdims_2x,
-                bounds_2x,
+                bounds,
                 device,
+                bcost,
                 verb=verb,
-                n_iters=config.adam_iters_2x,
-                lr=config.adam_lr_2x,
-                desc=f"2x T{i}",
+                n_iters=n_iters,
+                lr=lr,
+                desc=f"S{si}",
             )
-            params_out[:3] *= ds  # scale translations back
-            refined.append((cost, params_out))
-            if verb >= 1:
-                print(f"    Trial {i}: cost={cost:.6f}")
-
-        # Sort and deduplicate
+            refined = [(float(out_costs[t]), out_phys[t]) for t in range(len(trials))]
+        else:
+            refined = []
+            for i, (_, params) in enumerate(trials):
+                params_out, cost = _refine_adam_normalized(
+                    base_s,
+                    source_s,
+                    weight,
+                    params,
+                    config,
+                    ctx,
+                    voxdims,
+                    bounds,
+                    device,
+                    verb=verb,
+                    n_iters=n_iters,
+                    lr=lr,
+                    desc=f"S{si} T{i}",
+                    blokrad_mm=blokrad_stage,
+                )
+                refined.append((cost, params_out))
         refined.sort(key=lambda c: -c[0])
-        trials = [refined[0]]
-        for j in range(1, len(refined)):
-            nj = _normalize(refined[j][1], bounds)
-            too_close = any(
-                np.max(np.abs(nj[free_mask] - _normalize(pk, bounds)[free_mask])) < 0.02
-                for _, pk in trials
-            )
-            if not too_close:
-                trials.append(refined[j])
 
-        del base_2x, source_2x, weight_2x
+        if dedup_after:
+            # Keep the best plus any trial not too close to a better one, so the
+            # sharp stage still explores distinct basins.
+            trials = [refined[0]]
+            for j in range(1, len(refined)):
+                nj = _normalize(refined[j][1], bounds)
+                too_close = any(
+                    np.max(np.abs(nj[free_mask] - _normalize(pk, bounds)[free_mask])) < 0.02
+                    for _, pk in trials
+                )
+                if not too_close:
+                    trials.append(refined[j])
+        else:
+            trials = refined
 
-    # --- Level 1x: full resolution Adam ---
-    if verb >= 1:
-        print(f"  Full resolution ({base.shape}, {len(trials)} trials):")
+        if sigma_vox > 0.0:
+            del base_s, source_s
 
-    fine_trials = []
-    for i, (_, params) in enumerate(trials):
-        params_out, cost = _refine_adam_normalized(
-            base,
-            source,
-            weight,
-            params,
-            config,
-            ctx,
-            voxdims,
-            bounds,
-            device,
-            verb=verb,
-            n_iters=config.adam_iters_1x,
-            lr=config.adam_lr,
-            desc=f"Fine T{i}",
-        )
-        fine_trials.append((cost, params_out))
-        if verb >= 1:
-            print(f"    Trial {i} Adam: cost={cost:.6f}")
-
-    fine_trials.sort(key=lambda c: -c[0])
-    best_params = fine_trials[0][1]
+    best_cost, best_params = trials[0]
 
     # --- Powell polish (single pass, tighter convergence) ---
     if config.powell_maxfev > 0:
         if verb >= 1:
             print("  Powell polish (full resolution):")
 
-        best_params, _ = _refine_powell(
+        polish_cost_fn = (
+            _sampled_cost_fn(base, source, ctx.blokrad_mm, sample) if use_sample else None
+        )
+        best_params, best_cost = _refine_powell(
             base,
             source,
             weight,
@@ -1195,9 +1672,10 @@ def _refine_progressive(
             ftol=1e-4,
             maxfev=config.powell_maxfev,
             desc="Polish",
+            cost_fn=polish_cost_fn,
         )
 
-    return best_params
+    return best_params, best_cost
 
 
 # ---------------------------------------------------------------------------
@@ -1430,6 +1908,21 @@ def allineate(
     if config.cost in _HIST_COSTS:
         base_clip = clip_range(base_opt)
         source_clip = clip_range(source_opt)
+
+    # Overlap penalty inputs (only when -ov is requested). ``src_cov`` is the
+    # source coverage on the optimisation grid (a binary automask — grid_sample's
+    # linear interpolation already gives a differentiable boundary, and a blurred
+    # mask would leak mass outside ``base_dom`` and read overlap < 1 even at the
+    # true alignment, breaking AFNI's 9.95/10 calibration). ``base_dom`` is the
+    # base brain domain; ``ov_denom`` mirrors AFNI's MIN(nbsmask, najmask) so a
+    # source brain smaller than the base can still reach overlap ~1.
+    src_cov = base_dom = None
+    ov_denom = 1.0
+    if config.ov > 0.0:
+        base_dom = automask(base_opt, device=device).float()
+        src_cov = automask(source_opt, device=device).float()
+        ov_denom = float(min(base_dom.sum().item(), src_cov.sum().item()))
+
     ctx = CostContext(
         name=config.cost,
         sigma=config.lpa_sigma,
@@ -1440,6 +1933,10 @@ def allineate(
         ppow=config.ppow,
         base_clip=base_clip,
         source_clip=source_clip,
+        ov_weight=config.ov,
+        src_cov=src_cov,
+        base_dom=base_dom,
+        ov_denom=ov_denom,
     )
 
     # Stage 1: the optimiser starts from identity — the cmass/manual shift is
@@ -1450,13 +1947,34 @@ def allineate(
     # Parameter bounds centred on identity (the residual after the baked shift).
     bounds = _compute_param_bounds(base_opt.shape, range_scale=config.range_scale)
 
-    # Stage 2: GPU-parallel coarse search (at downsampled resolution)
-    if config.twopass:
+    # Match-point subsampling for the blok costs: build a fixed random subset of
+    # the weight domain once (point-wise sampling), shared by the joint coarse
+    # search and the refinement, so both are O(n_match) instead of O(all voxels)
+    # and the bloks are populated only by brain points, not the background.
+    sample = None
+    if config.cost in _BLOK_COSTS:
+        sample = _build_sample_set(
+            base_opt, weight_opt, voxdims, config.n_match, config.bloktype, device
+        )
+        if sample is not None and verb >= 1:
+            n_dom = int((weight_opt > 0).sum()) if weight_opt is not None else base_opt.numel()
+            print(
+                f"  Match-point subsampling: {sample.idx_flat.numel()} points (of {n_dom} in domain)"
+            )
+
+    # Stage 2: coarse search to seed the refinement.
+    if not config.twopass:
+        trial_params_list = [init_params.cpu().numpy().copy()]
+    elif sample is not None:
+        # Blok costs: joint (translation+rotation) subsampled coarse search, at
+        # full resolution (no decimation) — see _coarse_search_joint.
+        trial_params_list = _coarse_search_joint(
+            base_opt, source_opt, sample, ctx, config, bounds, device, verb
+        )
+    else:
+        # Other costs: the split translation→rotation sweep on a downsampled grid.
         min_dim = min(base_opt.shape)
-        # Pick the coarse downsample. The blok/histogram costs are distorted by
-        # heavy down-blur (neighbouring voxels become correlated), so cap them
-        # at 2x; the legacy ls/lps costs tolerate 4x for speed.
-        max_ds = 2 if (ctx.name in _BLOK_COSTS or ctx.name in _HIST_COSTS) else 4
+        max_ds = 2 if ctx.name in _HIST_COSTS else 4
         if min_dim >= 128:
             ds_factor = max_ds
         elif min_dim >= 64:
@@ -1508,14 +2026,12 @@ def allineate(
                 verb,
             )
             trial_params_list = [p.cpu().numpy().copy() for p in best_list]
-    else:
-        trial_params_list = [init_params.cpu().numpy().copy()]
 
     # Stage 3: Progressive refinement (Adam GPU + Powell polish)
     if verb >= 1:
         print("Refinement phase:")
 
-    best_params_phys = _refine_progressive(
+    best_params_phys, best_refine_cost = _refine_progressive(
         base_opt,
         source_opt,
         weight_opt,
@@ -1526,6 +2042,7 @@ def allineate(
         bounds,
         device,
         verb,
+        sample=sample,
     )
 
     # Build final matrix — adjust for crop offset if needed.
@@ -1549,6 +2066,22 @@ def allineate(
 
     best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
     final_matrix = _residual_to_final(params_to_matrix(best_t))
+
+    # AFNI-style final-fit parameter report. The final matrix is voxel base->
+    # source; convert to AFNI DICOM mm when both affines are known so the numbers
+    # are directly comparable to 3dAllineate, otherwise report in voxel space.
+    if verb >= 1:
+        from .affine import decompose_affine_sdu, format_final_fit_params, voxel_matrix_to_dicom
+
+        if base_header is not None and source_header is not None:
+            m_report = voxel_matrix_to_dicom(
+                final_matrix, base_header["affine"], source_header["affine"]
+            )
+            space = "DICOM mm"
+        else:
+            m_report = final_matrix
+            space = "voxel index"
+        print(format_final_fit_params(decompose_affine_sdu(m_report), space=space))
 
     # Final output: single-step resampling from native source
     # Bring source_native back to GPU if it was offloaded
@@ -1577,7 +2110,15 @@ def allineate(
         warped = apply_affine(source_native, final_matrix, base.shape, zero_outside=True)
 
     if verb >= 1:
-        final_cost = _compute_cost(base, warped, weight, ctx, voxdims)
-        print(f"Final cost: {final_cost.item():.6f}")
+        # For blok costs, report the in-mask cost the optimiser actually achieved
+        # (returned from refinement) — it's computed on the brain match points,
+        # not the whole grid, so it isn't diluted by background bloks, and it's
+        # free (no extra full-grid blok lattice to build). Other costs print the
+        # full-grid value of the final warp.
+        if config.cost in _BLOK_COSTS and sample is not None:
+            print(f"Final cost ({config.cost}, in-mask): {best_refine_cost:.6f}")
+        else:
+            final_cost = _compute_cost(base, warped, weight, ctx, voxdims)
+            print(f"Final cost: {final_cost.item():.6f}")
 
     return final_matrix, warped

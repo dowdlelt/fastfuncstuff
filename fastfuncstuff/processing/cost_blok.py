@@ -156,10 +156,6 @@ def assign_bloks(
     if blokrad is None:
         blokrad = auto_blok_radius((dx, dy, dz), bloktype)
 
-    lat_list, siz = _lattice(bloktype, blokrad)
-    lat = torch.tensor(lat_list, dtype=torch.float64, device=device)  # (3,3)
-    invlat = torch.linalg.inv(lat)
-
     # Physical coordinates of every voxel, in reshape(-1) (z, y, x) order.
     kk, jj, ii = torch.meshgrid(
         torch.arange(nz, dtype=torch.float64, device=device),
@@ -171,13 +167,64 @@ def assign_bloks(
         [(ii * dx).reshape(-1), (jj * dy).reshape(-1), (kk * dz).reshape(-1)],
         dim=1,
     )  # (N, 3)
+    valid_mask = None if mask is None else (mask.reshape(-1) > 0)
+    index, nblok, n_populated = _assign_xyz_to_bloks(xyz, bloktype, blokrad, device, valid_mask)
+    return BlokSet(
+        index=index, nblok=nblok, bloktype=bloktype, blokrad=float(blokrad), n_populated=n_populated
+    )
+
+
+def assign_bloks_points(
+    coords_xyz_mm: Tensor,
+    bloktype: str = "tohd",
+    blokrad: float | None = None,
+    voxdims: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    device: torch.device | None = None,
+) -> BlokSet:
+    """Assign an arbitrary set of points (in mm) to space-filling bloks.
+
+    The point-sampled analogue of :func:`assign_bloks` for subsampled matching:
+    instead of tiling a full grid, only the given ``coords_xyz_mm`` (M, 3) are
+    assigned, so the per-iteration cost is O(M). ``blokrad`` keeps the same
+    geometric (volume-based) size as the full-grid path — the bloks are simply
+    populated by the sampled points (AFNI sizes bloks by volume and fills them
+    with the npt_match samples). Returns a :class:`BlokSet` whose ``index`` is
+    length M.
+    """
+    if device is None:
+        device = coords_xyz_mm.device
+    if blokrad is None:
+        blokrad = auto_blok_radius(voxdims, bloktype)
+    xyz = coords_xyz_mm.to(device=device, dtype=torch.float64)
+    index, nblok, n_populated = _assign_xyz_to_bloks(xyz, bloktype, blokrad, device, None)
+    return BlokSet(
+        index=index, nblok=nblok, bloktype=bloktype, blokrad=float(blokrad), n_populated=n_populated
+    )
+
+
+def _assign_xyz_to_bloks(
+    xyz: Tensor,
+    bloktype: str,
+    blokrad: float,
+    device: torch.device,
+    valid_mask: Tensor | None,
+) -> tuple[Tensor, int, int]:
+    """Core blok assignment over physical points ``xyz`` (N, 3) in mm.
+
+    Returns ``(index, nblok, n_populated)`` where ``index`` is (N,) long with -1
+    for points outside any blok / masked out / in a sparse blok. Shared by the
+    full-grid :func:`assign_bloks` and the subsampled :func:`assign_bloks_points`.
+    """
+    lat_list, siz = _lattice(bloktype, blokrad)
+    lat = torch.tensor(lat_list, dtype=torch.float64, device=device)  # (3,3)
+    invlat = torch.linalg.inv(lat)
 
     # Nearest integer lattice index (AFNI: floor(pqr + 0.499)).
     pqr = xyz @ invlat.T  # (N, 3)
     base_lat = torch.floor(pqr + 0.499)  # (N, 3) float
 
     # Search the 3x3x3 neighbourhood; keep the nearest centre whose polyhedron
-    # actually contains the voxel (a clean Voronoi partition).
+    # actually contains the point (a clean Voronoi partition).
     best_d2 = torch.full((xyz.shape[0],), float("inf"), dtype=torch.float64, device=device)
     best_lat = base_lat.clone()
     found = torch.zeros(xyz.shape[0], dtype=torch.bool, device=device)
@@ -199,8 +246,8 @@ def assign_bloks(
     _, inverse = torch.unique(chosen, dim=0, return_inverse=True)
     index = inverse.clone()
     index[~found] = -1
-    if mask is not None:
-        index[mask.reshape(-1) <= 0] = -1
+    if valid_mask is not None:
+        index[~valid_mask] = -1
 
     nblok = int(inverse.max().item()) + 1 if inverse.numel() else 0
 
@@ -219,9 +266,7 @@ def assign_bloks(
         index[drop] = -1
 
     n_populated = int(torch.unique(index[index >= 0]).numel()) if (index >= 0).any() else 0
-    return BlokSet(
-        index=index, nblok=nblok, bloktype=bloktype, blokrad=float(blokrad), n_populated=n_populated
-    )
+    return index, nblok, n_populated
 
 
 def local_pearson_value(
@@ -260,17 +305,15 @@ def local_pearson_value(
     else:
         wv = weight.reshape(-1)[valid]
 
-    def _seg_sum(vals: Tensor) -> Tensor:
-        out = torch.zeros(nblok, dtype=vals.dtype, device=device)
-        return out.index_add(0, bi, vals)
-
-    sw = _seg_sum(wv)
-    swx = _seg_sum(wv * bv)
-    swy = _seg_sum(wv * yv)
-    swxx = _seg_sum(wv * bv * bv)
-    swyy = _seg_sum(wv * yv * yv)
-    swxy = _seg_sum(wv * bv * yv)
-    cnt = _seg_sum(torch.ones_like(wv))
+    # One fused scatter instead of seven: stack the per-point quantities into a
+    # (Nvalid, 7) tensor and index_add once into (nblok, 7). This is the
+    # per-iteration hot path of the subsampled refinement, so collapsing seven
+    # kernel launches (and their memory passes) into one is a measurable win.
+    wb = wv * bv
+    wy = wv * yv
+    stacked = torch.stack([wv, wb, wy, wb * bv, wy * yv, wb * yv, torch.ones_like(wv)], dim=1)
+    seg = torch.zeros(nblok, 7, dtype=stacked.dtype, device=device).index_add(0, bi, stacked)
+    sw, swx, swy, swxx, swyy, swxy, cnt = seg.unbind(1)
 
     sw_safe = sw.clamp(min=1e-12)
     xv_ = swxx - swx * swx / sw_safe
@@ -385,9 +428,9 @@ class BlokPairs:
     (patch, blok) pairs) rather than O(B * nblok_global).
     """
 
-    inv: Tensor      # (Nvalid,) valid-voxel -> compact bin id
+    inv: Tensor  # (Nvalid,) valid-voxel -> compact bin id
     bin_row: Tensor  # (P,) compact bin -> patch index
-    valid: Tensor    # (B*V,) bool, voxels assigned to a real blok
+    valid: Tensor  # (B*V,) bool, voxels assigned to a real blok
     n_bins: int
     batch: int
 
@@ -410,7 +453,11 @@ def prepare_blok_pairs(blok_idx: Tensor, nblok: int) -> BlokPairs:
 
 
 def local_pearson_value_pairs(
-    base: Tensor, warped: Tensor, weight: Tensor, prep: BlokPairs, ppow: float = 1.0,
+    base: Tensor,
+    warped: Tensor,
+    weight: Tensor,
+    prep: BlokPairs,
+    ppow: float = 1.0,
 ) -> Tensor:
     """Local-Pearson value for B *independent* (base, warped) pairs -> (B,).
 
@@ -457,7 +504,9 @@ def local_pearson_value_pairs(
     # Per-blok contributions, then reduce each blok into its patch.
     contrib = torch.where(ok, sw * p * pabs, torch.zeros_like(p))
     wcon = torch.where(ok, sw, torch.zeros_like(sw))
-    num = torch.zeros(prep.batch, dtype=contrib.dtype, device=device).index_add(0, prep.bin_row, contrib)
+    num = torch.zeros(prep.batch, dtype=contrib.dtype, device=device).index_add(
+        0, prep.bin_row, contrib
+    )
     den = torch.zeros(prep.batch, dtype=wcon.dtype, device=device).index_add(0, prep.bin_row, wcon)
     agg = 0.25 * num / den.clamp(min=1e-12)
     return torch.where(den > 0, agg, torch.zeros_like(agg))
