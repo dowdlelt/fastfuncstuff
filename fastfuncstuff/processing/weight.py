@@ -45,7 +45,7 @@ def compute_weight_image(
 
     w = base.abs().clone()
 
-    # Zero edges
+    # Edge fade widths (AFNI -edging: a border band that gets zero weight).
     xfade = max(2, int(edge_fraction * nx + 2))
     yfade = max(2, int(edge_fraction * ny + 2))
     zfade = max(2, int(edge_fraction * nz + 2))
@@ -57,15 +57,23 @@ def compute_weight_image(
     if 6 * zfade >= nz:
         zfade = (nz - 1) // 6
 
-    if zfade > 0 and nz > 1:
-        w[:zfade, :, :] = 0.0
-        w[-zfade:, :, :] = 0.0
-    if xfade > 0:
-        w[:, :, :xfade] = 0.0
-        w[:, :, -xfade:] = 0.0
-    if yfade > 0:
-        w[:, :yfade, :] = 0.0
-        w[:, -yfade:, :] = 0.0
+    def _zero_edges(vol: Tensor) -> Tensor:
+        if zfade > 0 and nz > 1:
+            vol[:zfade, :, :] = 0.0
+            vol[-zfade:, :, :] = 0.0
+        if xfade > 0:
+            vol[:, :, :xfade] = 0.0
+            vol[:, :, -xfade:] = 0.0
+        if yfade > 0:
+            vol[:, :yfade, :] = 0.0
+            vol[:, -yfade:, :] = 0.0
+        return vol
+
+    # NB: the border is zeroed *after* smoothing (below), not before. The base is
+    # a single 3D volume with no motion-driven edge artifacts to suppress (those
+    # live in the timeseries), and zeroing before the blur would just let the
+    # Gaussian bleed interior weight back into the border anyway. AFNI's -edging
+    # guarantees the final weight is zero in the border band.
 
     # Clip super-large values (squash spikes to reasonability).
     cliplev = _thd_cliplevel(w, 0.5) if hist_cliplevel else _clip_level(w)
@@ -94,6 +102,10 @@ def compute_weight_image(
         mask = _erode_6conn(mask)
         mask = _largest_component_6conn(mask, vol=w)
         w = w * mask.to(w.dtype)
+
+    # Re-zero the border after smoothing/clustering so it is exactly zero in the
+    # output (the blur above spreads interior weight into the faded band).
+    w = _zero_edges(w)
 
     # Normalize to [0, 1]
     w_max = w.max()

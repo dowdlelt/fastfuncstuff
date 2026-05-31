@@ -42,8 +42,12 @@ def test_default_weight_unchanged_fills_fov():
     """Default path (moco/qwarp) stays Gaussian-only: background not clustered out."""
     img = _brain_with_background()
     w = compute_weight_image(img)  # defaults: no median, no clusterize
-    # without clusterize the smoothed weight covers most of the FOV
-    assert int((w > 0).sum()) > 0.8 * w.numel()
+    # Without clusterize the smoothed weight still covers most of the interior
+    # (far broader than the <0.3 clusterize path); the border band is zeroed
+    # (AFNI -edging), so it no longer fills the entire FOV.
+    assert int((w > 0).sum()) > 0.5 * w.numel()
+    # The edge band is exactly zero (post-smooth -edging).
+    assert float(w[:3].abs().sum()) == 0.0  # first z-faces zeroed
 
 
 def test_thd_cliplevel_separates_brain_from_background():
