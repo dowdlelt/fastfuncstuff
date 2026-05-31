@@ -82,6 +82,21 @@ class MocoConfig:
     quad_center_freq: float = math.pi / 3.0
     quad_bandwidth: float = 2.0
 
+    # -reweight: data-driven weight refinement pre-pass (see moco_reweight.py).
+    reweight: bool = False
+    reweight_minparams: int = 2  # of 3 displacement axes that must agree to keep a patch
+    reweight_rmin: float = 0.1  # per-axis correlation threshold
+    reweight_polort: int = -1  # detrend degree; <0 = auto (1 + floor(nt*TR/150))
+    reweight_bloktype: str = "rhdd"  # "rhdd", "tohd", or "cube"
+    reweight_blokrad: float = 0.0  # blok radius (mm); 0 = auto ~555 voxels
+    reweight_maxiter: int = 6  # GN iters for the cheap per-patch estimate
+    reweight_min_motion: float = 0.05  # guard: skip if global motion below this
+    # When set, use these directly instead of recomputing (used by the recursive
+    # global/preweight estimate so it reuses the full estimation path without
+    # rebuilding the weight or the expensive derivative images).
+    weight_override: Tensor | None = None
+    derivs_override: Tensor | None = None
+
 
 @dataclass
 class MocoResult:
@@ -95,6 +110,13 @@ class MocoResult:
     rms_before: np.ndarray  # (nt,) weighted RMS before alignment
     rms_after: np.ndarray  # (nt,) weighted RMS after alignment
     n_iters: np.ndarray  # (nt,) iterations per volume
+
+    # Populated only when -reweight ran (else None).
+    weight_orig: Tensor | None = None  # (nz, ny, nx) original weight
+    weight_refined: Tensor | None = None  # (nz, ny, nx) reweighted weight
+    patch_labels: Tensor | None = None  # (nz, ny, nx) int patch label map
+    params_preweight: np.ndarray | None = None  # (nt, 6) params under original weight
+    reweight_applied: bool = False  # False if the low-motion guard skipped it
 
 
 # ---------------------------------------------------------------------------
@@ -825,8 +847,10 @@ def moco(
     else:
         base = timeseries[config.base_index].to(device=device, dtype=dtype)
 
-    # Compute weight image
-    if config.weight_automask:
+    # Compute weight image (or use an injected one for the preweight estimate).
+    if config.weight_override is not None:
+        weight = config.weight_override.to(device=device, dtype=dtype)
+    elif config.weight_automask:
         from .mask import automask as compute_automask
 
         mask = compute_automask(base, device=device)
@@ -844,12 +868,89 @@ def moco(
     # Pre-blur if requested
     base_est = _blur_volume(base, config.blur_fwhm) if config.blur_fwhm > 0 else base
 
-    # Setup for WLS
-    if config.cost == "wls":
+    # Derivative images are shared by the WLS pass and the reweight pre-pass; they
+    # depend only on the (blurred) base, not the weight, so compute them at most
+    # once. An override (from the recursive global/preweight call) skips the
+    # recompute entirely — same base_est, so the derivatives are identical.
+    derivs = config.derivs_override
+
+    # ── -reweight pre-pass: learn which patches carry consistent motion and
+    #    drop the rest from the weight before building the normal equations. ──
+    reweight_out: tuple | None = None  # (weight_orig, refined, labels, applied)
+    params_preweight = None
+    if config.reweight and config.weight_override is None:
+        from dataclasses import replace
+
+        from .moco_reweight import compute_reweight
+
         t0 = time.time()
         derivs = compute_derivative_images(base_est, device, verb=config.verb)
         if config.verb >= 1:
             print(f"  Derivative images: {time.time() - t0:.2f}s")
+        weight0 = weight
+
+        # Global consensus motion = the whole-image fit under the ORIGINAL weight.
+        # Reuse the full (fast, batched) estimation path by re-entering moco() with
+        # the weight pinned, derivatives handed over, and reweight off (estimate-
+        # only — no resampling). This is both the consensus the reweight prediction
+        # needs AND the "preweight" motion the user compares against the final params.
+        t_global = time.time()
+        pre_cfg = replace(
+            config,
+            reweight=False,
+            weight_override=weight0,
+            derivs_override=derivs,  # reuse — same base_est, avoids a 2nd wsinc5 build
+            skip_resample=True,
+            verb=0,
+        )
+        pre_res = moco(timeseries, pre_cfg, header_info=header_info, base_vol=base_vol)
+        global_matrices = pre_res.matrices_vox  # (nt, 4, 4) voxel-space
+        params_preweight = pre_res.params
+        if config.verb >= 1:
+            print(f"  Reweight global fit: {time.time() - t_global:.2f}s")
+
+        affine = header_info["affine"] if header_info else np.eye(4)
+        voxdims = tuple(float(v) for v in _get_voxel_sizes(affine))
+        tr = 2.0
+        try:
+            hdr = header_info.get("header") if header_info else None
+            if hdr is not None:
+                z = hdr.get_zooms()
+                if len(z) >= 4 and float(z[3]) > 0:
+                    tr = float(z[3])
+        except Exception:
+            pass
+
+        rw = compute_reweight(
+            base_est,
+            timeseries,
+            weight0,
+            derivs,
+            global_matrices,
+            voxdims=voxdims,
+            tr=tr,
+            bloktype=config.reweight_bloktype,
+            blokrad=config.reweight_blokrad,
+            minparams=config.reweight_minparams,
+            rmin=config.reweight_rmin,
+            polort=config.reweight_polort,
+            max_iter=config.reweight_maxiter,
+            min_motion=config.reweight_min_motion,
+            device=device,
+            verb=config.verb,
+        )
+        weight = rw.weight
+        reweight_out = (weight0, rw.weight, rw.patch_labels, rw.applied)
+        if config.verb >= 1:
+            print(f"  Reweight pre-pass: {time.time() - t0:.2f}s")
+
+    # Setup for WLS
+    if config.cost == "wls":
+        t0 = time.time()
+        if derivs is None:
+            derivs = compute_derivative_images(base_est, device, verb=config.verb)
+            if config.verb >= 1:
+                print(f"  Derivative images: {time.time() - t0:.2f}s")
 
         # Pre-compute normal equations
         weight_flat = weight.reshape(1, -1)  # (1, N)
@@ -1408,6 +1509,12 @@ def moco(
         # Max displacement
         max_disp[t] = compute_max_displacement(M_vox, vol_shape, voxel_sizes)
 
+    if reweight_out is not None:
+        weight_orig, weight_refined, patch_labels, applied = reweight_out
+    else:
+        weight_orig = weight_refined = patch_labels = None
+        applied = False
+
     return MocoResult(
         aligned=aligned,
         params=params_dicom,
@@ -1417,4 +1524,9 @@ def moco(
         rms_before=rms_before,
         rms_after=rms_after,
         n_iters=n_iters,
+        weight_orig=weight_orig,
+        weight_refined=weight_refined,
+        patch_labels=patch_labels,
+        params_preweight=params_preweight,
+        reweight_applied=applied,
     )

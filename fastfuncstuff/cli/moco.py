@@ -32,6 +32,17 @@ from fastfuncstuff.processing.io import (
 # Sentinel for `-save_mean` given with no value: derive the path from -prefix.
 _MEAN_FROM_PREFIX = "\x00from_prefix"
 
+# Sentinel for `-save_weight` given with no value: derive the paths from -prefix.
+_WEIGHT_FROM_PREFIX = "\x00weight_from_prefix"
+
+
+def _sibling(path: str, prefix: str) -> str:
+    """Return ``path`` with ``prefix`` prepended to its basename (dir preserved)."""
+    import os
+
+    d, base = os.path.split(path)
+    return os.path.join(d, prefix + base)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
@@ -102,9 +113,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.02,
         help="Rotation convergence threshold in degrees (default: 0.02, matches 3dvolreg -rot_thresh)",
     )
-    method_group.add_argument(
-        "-twopass", action="store_true", help="Coarse blur + fine pass"
-    )
+    method_group.add_argument("-twopass", action="store_true", help="Coarse blur + fine pass")
     method_group.add_argument(
         "-chain_init",
         dest="chain_init",
@@ -126,9 +135,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     method_group.add_argument(
         "-nochain", dest="no_chain", action="store_true", help=argparse.SUPPRESS
     )
-    method_group.add_argument(
-        "-automask", action="store_true", help="Use automask for weighting"
-    )
+    method_group.add_argument("-automask", action="store_true", help="Use automask for weighting")
     method_group.add_argument(
         "-weight_automask",
         action="store_true",
@@ -164,6 +171,79 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Alias for -no_compile.",
     )
 
+    # --- Reweight (data-driven weight refinement) ---
+    rw_group = parser.add_argument_group("Reweight")
+    rw_group.add_argument(
+        "-reweight",
+        action="store_true",
+        help="Pre-pass that drops weight regions whose local displacement doesn't "
+        "match what the global head motion predicts there (removes bright "
+        "artifacts/ghosts that mislead alignment). Like -twopass, it looks at the "
+        "data first, then runs the normal estimation with the refined weight.",
+    )
+    rw_group.add_argument(
+        "-reweight_minparams",
+        "-reweight-minparams",
+        dest="reweight_minparams",
+        type=int,
+        default=2,
+        help="Keep a patch if its displacement agrees with the global-motion "
+        "prediction on at least this many of the 3 axes (default: 2).",
+    )
+    rw_group.add_argument(
+        "-reweight_rmin",
+        "-reweight-rmin",
+        dest="reweight_rmin",
+        type=float,
+        default=0.1,
+        help="Per-axis correlation threshold for 'agrees' (default: 0.1).",
+    )
+    rw_group.add_argument(
+        "-reweight_polort",
+        "-reweight-polort",
+        dest="reweight_polort",
+        type=int,
+        default=-1,
+        help="Detrend degree for the per-patch time-courses before correlating "
+        "(default: -1 = auto, 1 + floor(nt*TR/150)).",
+    )
+    rw_group.add_argument(
+        "-reweight_bloktype",
+        "-reweight-bloktype",
+        dest="reweight_bloktype",
+        choices=["rhdd", "tohd", "cube"],
+        default="rhdd",
+        help="Space-filling patch shape (default: rhdd, AFNI's LPC default).",
+    )
+    rw_group.add_argument(
+        "-reweight_blokrad",
+        "-reweight-blokrad",
+        dest="reweight_blokrad",
+        type=float,
+        default=0.0,
+        help="Patch radius in mm (default: 0 = auto, ~555 voxels/patch).",
+    )
+    rw_group.add_argument(
+        "-reweight_maxiter",
+        "-reweight-maxiter",
+        dest="reweight_maxiter",
+        type=int,
+        default=6,
+        help="Gauss-Newton iterations for the cheap per-patch estimate (default: 6).",
+    )
+    rw_group.add_argument(
+        "-save_weight",
+        "-save-weight",
+        dest="save_weight",
+        nargs="?",
+        const=_WEIGHT_FROM_PREFIX,
+        default=None,
+        metavar="PREFIX",
+        help="Save the original weight, the reweighted weight, and the patch "
+        "label map (random id per kept patch). With no value, derives the paths "
+        "from -prefix.",
+    )
+
     # --- Interpolation ---
     interp_group = parser.add_argument_group("Interpolation")
     interp_group.add_argument(
@@ -192,19 +272,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # --- Output files ---
     out_group = parser.add_argument_group("Output files")
-    out_group.add_argument(
-        "-1Dfile", default=None, help="Save 6-column motion parameters (.1D)"
-    )
-    out_group.add_argument(
-        "-1Dmatrix_save", default=None, help="Save affine matrices (.aff12.1D)"
-    )
+    out_group.add_argument("-1Dfile", default=None, help="Save 6-column motion parameters (.1D)")
+    out_group.add_argument("-1Dmatrix_save", default=None, help="Save affine matrices (.aff12.1D)")
     out_group.add_argument("-dfile", default=None, help="Save 9-column diagnostic file")
-    out_group.add_argument(
-        "-maxdisp1D", default=None, help="Save max displacement per volume"
-    )
-    out_group.add_argument(
-        "-iterfile", default=None, help="Save iterations per volume (.1D)"
-    )
+    out_group.add_argument("-maxdisp1D", default=None, help="Save max displacement per volume")
+    out_group.add_argument("-iterfile", default=None, help="Save iterations per volume (.1D)")
     out_group.add_argument(
         "-save_mean",
         nargs="?",
@@ -239,8 +311,16 @@ def main(argv: list[str] | None = None) -> None:
     # Guard against a run that would produce nothing.
     _any_output = any(
         getattr(args, name, None) is not None
-        for name in ("prefix", "save_mean", "1Dfile", "1Dmatrix_save", "dfile",
-                     "maxdisp1D", "iterfile")
+        for name in (
+            "prefix",
+            "save_mean",
+            "1Dfile",
+            "1Dmatrix_save",
+            "dfile",
+            "maxdisp1D",
+            "iterfile",
+            "save_weight",
+        )
     )
     if not _any_output:
         print(
@@ -322,6 +402,13 @@ def main(argv: list[str] | None = None) -> None:
         device=str(device),
         verb=verb,
         debug_memory=args.debug_memory,
+        reweight=args.reweight,
+        reweight_minparams=args.reweight_minparams,
+        reweight_rmin=args.reweight_rmin,
+        reweight_polort=args.reweight_polort,
+        reweight_bloktype=args.reweight_bloktype,
+        reweight_blokrad=args.reweight_blokrad,
+        reweight_maxiter=args.reweight_maxiter,
     )
 
     # --- Run motion correction ---
@@ -365,6 +452,15 @@ def main(argv: list[str] | None = None) -> None:
         if verb >= 1:
             print(f"Saved 1Dfile: {onedfile}")
 
+        # Reweight diagnostic: the pre-reweight (consensus) motion estimated with
+        # the original weight, in the same AFNI 6-column format, for comparison
+        # against the final post-reweight params above.
+        if args.reweight and result.params_preweight is not None:
+            pre_path = _sibling(onedfile, "preweight_")
+            save_moco_1D(result.params_preweight, pre_path)
+            if verb >= 1:
+                print(f"Saved preweight params: {pre_path}")
+
     # Affine matrices
     matrix_save = getattr(args, "1Dmatrix_save", None)
     if matrix_save is not None:
@@ -395,6 +491,39 @@ def main(argv: list[str] | None = None) -> None:
                 f.write(f"{it}\n")
         if verb >= 1:
             print(f"Saved iterfile: {args.iterfile}")
+
+    # Reweight weight images + patch label map.
+    if args.save_weight is not None:
+        if not args.reweight:
+            print(
+                "Warning: -save_weight given without -reweight; nothing to save.",
+                file=sys.stderr,
+            )
+        elif result.weight_refined is None or result.patch_labels is None:
+            print(
+                "Warning: reweight did not run (no patches / guard); skipping -save_weight.",
+                file=sys.stderr,
+            )
+        else:
+            if args.save_weight is _WEIGHT_FROM_PREFIX:
+                if args.prefix is None:
+                    print(
+                        "Error: -save_weight with no value needs -prefix to derive "
+                        "the paths; pass -save_weight PREFIX instead.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                pfx = parse_prefix(args.prefix)
+            else:
+                pfx = parse_prefix(args.save_weight)
+            w_orig = pfx.with_suffix("weight_orig")
+            w_new = pfx.with_suffix("weight_reweight")
+            w_patch = pfx.with_suffix("patches")
+            save_image(result.weight_orig, w_orig, header_info=header_info)
+            save_image(result.weight_refined, w_new, header_info=header_info)
+            save_image(result.patch_labels.float(), w_patch, header_info=header_info)
+            if verb >= 1:
+                print(f"Saved weights: {w_orig}, {w_new}, {w_patch}")
 
     if verb >= 1:
         print(f"Total time: {time.time() - t0:.2f}s")
