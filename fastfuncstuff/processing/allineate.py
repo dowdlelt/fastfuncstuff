@@ -16,6 +16,7 @@ Hybrid approach:
 from __future__ import annotations
 
 import math
+import os
 import sys
 from dataclasses import dataclass
 
@@ -889,14 +890,23 @@ def _coarse_search_joint(
         if len(trials) >= config.tbest:
             break
 
+    # Insurance seed (AFNI carries the identity/pinit transform into the fine
+    # pass): the cmass shift is already baked into align_matrix, so the identity
+    # *residual* is the "trust cmass, no rotation" fallback. If the coarse search
+    # ever ranks only bad basins, refinement still has this known-decent start to
+    # fall back to, and it's nearly free now that trials are batched.
+    out = [p for _, p in trials]
+    out.append(_identity_physical())
+
     if verb >= 1:
         p = trials[0][1]
         print(
             f"  Joint coarse: {B} seeds → polished {nkeep} → kept {len(trials)} "
-            f"(best cost={trials[0][0]:.4f}, rot=({p[3]:.1f}°,{p[4]:.1f}°,{p[5]:.1f}°), "
+            f"(+identity) (best cost={trials[0][0]:.4f}, "
+            f"rot=({p[3]:.1f}°,{p[4]:.1f}°,{p[5]:.1f}°), "
             f"shift=({p[0]:.1f},{p[1]:.1f},{p[2]:.1f}))"
         )
-    return [p for _, p in trials]
+    return out
 
 
 def _base_params(n: int, translations: Tensor, device: torch.device) -> Tensor:
@@ -1299,6 +1309,18 @@ def _refine_adam_batched(
     no_improve = np.zeros(T, dtype=np.int64)
     rel_tol, abs_tol, patience, sync_every = 1e-4, 1e-6, 40, 15
 
+    # Forward = normalized params -> (T,) cost. The per-iter cost is launch-bound
+    # (dozens of small kernels: matrix build + sample + blok scatter), so the
+    # whole forward is a torch.compile target. Opt-in (FFS_ALLINEATE_COMPILE=1)
+    # while it's validated for speed on real GPUs; the sync / early-stop break
+    # live outside it, so they don't fragment the compiled graph.
+    def _forward(pn: Tensor) -> Tensor:
+        return batched_cost_fn(params_to_matrix_batched(_denormalize_t(pn, bmin, span)))
+
+    forward = (
+        torch.compile(_forward) if os.environ.get("FFS_ALLINEATE_COMPILE") == "1" else _forward
+    )
+
     pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
     for it in pbar:
         optimizer.zero_grad()
@@ -1306,8 +1328,7 @@ def _refine_adam_batched(
             params_norm.data[:, ~free_mask] = identity_norm[~free_mask]
             params_norm.data.clamp_(0.0, 1.0)
         cand_norm = params_norm.detach().clone()
-        matrices = params_to_matrix_batched(_denormalize_t(params_norm, bmin, span))
-        cost = batched_cost_fn(matrices)  # (T,)
+        cost = forward(params_norm)  # (T,)
         (-cost.sum()).backward()
         if params_norm.grad is not None:
             params_norm.grad.data[:, ~free_mask] = 0.0

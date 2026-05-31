@@ -252,23 +252,14 @@ def params_to_matrix_batched(params: Tensor) -> Tensor:
     m21 = du21
     m22 = du22
 
-    # Build (B, 4, 4)
-    M = torch.zeros(B, 4, 4, device=device, dtype=dtype)
-    M[:, 0, 0] = m00
-    M[:, 0, 1] = m01
-    M[:, 0, 2] = m02
-    M[:, 0, 3] = dx
-    M[:, 1, 0] = m10
-    M[:, 1, 1] = m11
-    M[:, 1, 2] = m12
-    M[:, 1, 3] = dy
-    M[:, 2, 0] = m20
-    M[:, 2, 1] = m21
-    M[:, 2, 2] = m22
-    M[:, 2, 3] = dz
-    M[:, 3, 3] = one
-
-    return M
+    # Assemble (B, 4, 4) with a few stacks rather than ~13 scalar index-writes:
+    # fewer kernel launches per call, which matters in the launch-bound batched
+    # Adam loop. Still differentiable (stack carries grad to the m../d. terms).
+    row0 = torch.stack([m00, m01, m02, dx], dim=1)
+    row1 = torch.stack([m10, m11, m12, dy], dim=1)
+    row2 = torch.stack([m20, m21, m22, dz], dim=1)
+    row3 = torch.stack([_zero, _zero, _zero, one], dim=1)
+    return torch.stack([row0, row1, row2, row3], dim=1)
 
 
 def matrix_to_params(mat: Tensor) -> Tensor:
