@@ -801,6 +801,149 @@ def _run_batched_estimation(
 
 
 # ---------------------------------------------------------------------------
+# Pass 2: resample with precomputed matrices
+# ---------------------------------------------------------------------------
+
+
+def resample_timeseries(
+    timeseries: Tensor,
+    matrices_vox: Tensor,
+    config: MocoConfig,
+    device: torch.device,
+    base_copy_idx: int = -1,
+    base_est: Tensor | None = None,
+    homo_coords: Tensor | None = None,
+    disable_pbar: bool = True,
+) -> tuple[Tensor, np.ndarray]:
+    """Apply precomputed per-volume voxel matrices to a 4D timeseries.
+
+    This is Pass 2 of motion correction, split out so a single set of estimated
+    matrices can be applied to additional echoes (multi-echo registration): the
+    motion is estimated once from one echo, then every echo is resampled with
+    the same transforms and interpolation.
+
+    Args:
+        timeseries: (nt, nz, ny, nx) source series (CPU or GPU).
+        matrices_vox: (nt, 4, 4) voxel-space transforms, one per volume.
+        config: MocoConfig (uses final_interp, use_shear, debug_memory, verb).
+        device: torch device for compute.
+        base_copy_idx: volume copied verbatim (the base); -1 to resample all.
+        base_est: (nz, ny, nx) base for the post-alignment RMS; None leaves it 0.
+        homo_coords: prebuilt (4, N) grid; rebuilt if None.
+        disable_pbar: hide the tqdm progress bar.
+
+    Returns:
+        (aligned (nt, nz, ny, nx) on CPU, rms_after (nt,)).
+    """
+    dtype = torch.float32
+    nt = timeseries.shape[0]
+    nz, ny, nx = timeseries.shape[1:]
+    vol_shape = (nz, ny, nx)
+    if homo_coords is None:
+        homo_coords = _build_homo_coords(vol_shape, device, dtype)
+
+    aligned = torch.zeros_like(timeseries)
+    rms_after = np.zeros(nt, dtype=np.float64)
+
+    batch_size = compute_moco_resample_batch_size(nz, ny, nx, nt, device, interp=config.final_interp)
+    if config.verb >= 1:
+        print(f"  Resampling batch size: {batch_size} volumes")
+
+    _resample_dbg = make_vram_debugger(
+        device,
+        nz * ny * nx * 4 * (3 + batch_size),
+        operation="moco_resample",
+        chunk_size=batch_size,
+        enabled=config.debug_memory,
+    )
+    _resample_dbg.__enter__()
+
+    resample_pbar = tqdm(
+        range(0, nt, batch_size),
+        desc="  Resampling",
+        disable=disable_pbar,
+        unit="batch",
+        ncols=80,
+    )
+
+    for batch_start in resample_pbar:
+        batch_end = min(batch_start + batch_size, nt)
+
+        # Separate base-copy volumes from volumes that need resampling
+        resample_indices = [t for t in range(batch_start, batch_end) if t != base_copy_idx]
+        for t in range(batch_start, batch_end):
+            if t == base_copy_idx:
+                aligned[t] = timeseries[t]
+                rms_after[t] = 0.0
+
+        if not resample_indices:
+            continue
+
+        # Load batch to GPU
+        sources_batch = torch.stack(
+            [timeseries[t].to(device=device, dtype=dtype) for t in resample_indices]
+        )
+        matrices_batch = matrices_vox[resample_indices].to(device=device, dtype=dtype)
+
+        use_triton = (
+            config.use_shear and device.type == "cuda" and shear_resample_triton is not None
+        )
+        if use_triton:
+            # Fused Triton shears (AFNI THD_rota_vol), batched over the whole
+            # chunk — ~250x the general resampler. Volumes with a degenerate
+            # decomposition (valid=False, essentially never) get the general
+            # resampler instead.
+            aligned_batch, valid = shear_resample_triton(
+                sources_batch, matrices_batch, vol_shape, config.final_interp
+            )
+            if not bool(valid.all()):
+                bad = (~valid).nonzero(as_tuple=True)[0].tolist()
+                for j in bad:
+                    aligned_batch[j] = resample_affine_fast(
+                        sources_batch[j],
+                        matrices_batch[j],
+                        homo_coords,
+                        config.final_interp,
+                        vol_shape,
+                        zero_outside=True,
+                    )
+        elif config.use_shear:
+            # CPU/MPS shear path (no Triton): per-volume gather shears.
+            outs = []
+            for j in range(len(resample_indices)):
+                w = shear_resample(
+                    sources_batch[j], matrices_batch[j], vol_shape, config.final_interp
+                )
+                if w is None:
+                    w = resample_affine_fast(
+                        sources_batch[j],
+                        matrices_batch[j],
+                        homo_coords,
+                        config.final_interp,
+                        vol_shape,
+                        zero_outside=True,
+                    )
+                outs.append(w)
+            aligned_batch = torch.stack(outs)
+        else:
+            aligned_batch = apply_affine_interp_batched(
+                sources_batch, matrices_batch, config.final_interp, vol_shape, zero_outside=True
+            )
+
+        for i, t in enumerate(resample_indices):
+            aligned[t] = aligned_batch[i].cpu()
+            if base_est is not None:
+                rms_after[t] = _unweighted_rms(base_est, aligned_batch[i])
+
+    _resample_dbg.__exit__(None, None, None)
+
+    if not disable_pbar:
+        resample_pbar.close()
+
+    return aligned, rms_after
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -1080,8 +1223,9 @@ def moco(
         bf_coarse = wf1_coarse = WJ_c = JtWJ_c = None
 
     # Allocate output arrays
-    # Skip the big CPU allocation when no aligned output is requested.
-    aligned = timeseries.new_empty(0) if config.skip_resample else torch.zeros_like(timeseries)
+    # The aligned series is produced by Pass 2 (resample_timeseries); start
+    # empty so the estimate-only path costs nothing.
+    aligned = timeseries.new_empty(0)
     all_params = np.zeros((nt, 12), dtype=np.float64)
     matrices_vox = torch.zeros(nt, 4, 4, dtype=dtype)
     rms_before = np.zeros(nt, dtype=np.float64)
@@ -1383,104 +1527,18 @@ def moco(
         if config.verb >= 1:
             print("  Resampling: skipped (estimate-only; no aligned output requested)")
     else:
-        batch_size = compute_moco_resample_batch_size(
-            nz, ny, nx, nt, device, interp=config.final_interp
-        )
-        if config.verb >= 1:
-            print(f"  Resampling batch size: {batch_size} volumes")
-
-        # Indices that need actual resampling (base volume is just copied)
+        # Base volume is copied verbatim; external base means no copy index.
         base_copy_idx = config.base_index if base_vol is None else -1
-
-        _resample_dbg = make_vram_debugger(
+        aligned, rms_after = resample_timeseries(
+            timeseries,
+            matrices_vox,
+            config,
             device,
-            nz * ny * nx * 4 * (3 + batch_size),
-            operation="moco_resample",
-            chunk_size=batch_size,
-            enabled=config.debug_memory,
+            base_copy_idx=base_copy_idx,
+            base_est=base_est,
+            homo_coords=homo_coords,
+            disable_pbar=disable_pbar,
         )
-        _resample_dbg.__enter__()
-
-        resample_pbar = tqdm(
-            range(0, nt, batch_size),
-            desc="  Resampling",
-            disable=disable_pbar,
-            unit="batch",
-            ncols=80,
-        )
-
-        for batch_start in resample_pbar:
-            batch_end = min(batch_start + batch_size, nt)
-
-            # Separate base-copy volumes from volumes that need resampling
-            resample_indices = [t for t in range(batch_start, batch_end) if t != base_copy_idx]
-            for t in range(batch_start, batch_end):
-                if t == base_copy_idx:
-                    aligned[t] = timeseries[t]
-                    rms_after[t] = 0.0
-
-            if not resample_indices:
-                continue
-
-            # Load batch to GPU
-            sources_batch = torch.stack(
-                [timeseries[t].to(device=device, dtype=dtype) for t in resample_indices]
-            )
-            matrices_batch = matrices_vox[resample_indices].to(device=device, dtype=dtype)
-
-            use_triton = (
-                config.use_shear and device.type == "cuda" and shear_resample_triton is not None
-            )
-            if use_triton:
-                # Fused Triton shears (AFNI THD_rota_vol), batched over the whole
-                # chunk — ~250x the general resampler. Volumes with a degenerate
-                # decomposition (valid=False, essentially never) get the general
-                # resampler instead.
-                aligned_batch, valid = shear_resample_triton(
-                    sources_batch, matrices_batch, vol_shape, config.final_interp
-                )
-                if not bool(valid.all()):
-                    bad = (~valid).nonzero(as_tuple=True)[0].tolist()
-                    for j in bad:
-                        aligned_batch[j] = resample_affine_fast(
-                            sources_batch[j],
-                            matrices_batch[j],
-                            homo_coords,
-                            config.final_interp,
-                            vol_shape,
-                            zero_outside=True,
-                        )
-            elif config.use_shear:
-                # CPU/MPS shear path (no Triton): per-volume gather shears.
-                outs = []
-                for j in range(len(resample_indices)):
-                    w = shear_resample(
-                        sources_batch[j], matrices_batch[j], vol_shape, config.final_interp
-                    )
-                    if w is None:
-                        w = resample_affine_fast(
-                            sources_batch[j],
-                            matrices_batch[j],
-                            homo_coords,
-                            config.final_interp,
-                            vol_shape,
-                            zero_outside=True,
-                        )
-                    outs.append(w)
-                aligned_batch = torch.stack(outs)
-            else:
-                aligned_batch = apply_affine_interp_batched(
-                    sources_batch, matrices_batch, config.final_interp, vol_shape, zero_outside=True
-                )
-
-            for i, t in enumerate(resample_indices):
-                aligned[t] = aligned_batch[i].cpu()
-                rms_after[t] = _unweighted_rms(base_est, aligned_batch[i])
-
-        _resample_dbg.__exit__(None, None, None)
-
-        if not disable_pbar:
-            resample_pbar.close()
 
         if config.verb >= 1:
             elapsed_resample = time.time() - t_resample
