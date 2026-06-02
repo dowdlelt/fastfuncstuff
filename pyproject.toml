@@ -69,6 +69,7 @@ ffs_qwarp = "fastfuncstuff.cli.qwarp:main"
 ffs_slicetime = "fastfuncstuff.cli.slicetime:main"
 ffs_util_automask = "fastfuncstuff.cli.automask:main"
 ffs_util_concalc = "fastfuncstuff.cli.util_concalc:main"
+ffs_util_localstat = "fastfuncstuff.cli.util_localstat:main"
 ffs_util_pcwarp = "fastfuncstuff.cli.pcwarp:main"
 # Stats / utility tools
 ffs_spatial_xcorr = "fastfuncstuff.cli.spatial_xcorr:main"

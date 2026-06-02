@@ -891,11 +891,14 @@ class TestAllineate:
         cmass into the resample lands the source brain in the base FOV first, so
         the optimiser converges. Here the affines put the brains 24 mm apart.
         """
-        base = _sphere_volume((30, 40, 40), center=(20, 20, 15), radius=6)
-        source = _sphere_volume((50, 40, 40), center=(20, 20, 15), radius=6)
+        # Small grids on purpose: this is a CPU regression test, and its point is
+        # the *geometry* (different FOVs, brains far apart, must still converge),
+        # not resolution. Keep it cheap so it doesn't saturate every core.
+        base = _sphere_volume((16, 22, 22), center=(11, 11, 8), radius=4)
+        source = _sphere_volume((28, 22, 22), center=(11, 11, 8), radius=4)
         base_aff = np.eye(4)
         src_aff = np.eye(4)
-        src_aff[2, 3] = 24.0  # source brain sits +24 mm away in physical z
+        src_aff[2, 3] = 12.0  # source brain sits +12 mm away in physical z
         cfg = AffineAlignConfig(
             cost="ls",
             dof="rigid",
@@ -903,8 +906,8 @@ class TestAllineate:
             coarse_range=6,
             coarse_step=3,
             powell_maxfev=0,
-            adam_iters_1x=60,
-            adam_iters_2x=40,
+            adam_iters_1x=45,
+            adam_iters_2x=30,
             autocrop=False,
             autoweight=False,
             verb=0,

@@ -44,14 +44,10 @@ def derive_mean_output_path(prefix: str | Path) -> str:
 
 def _require_nibabel() -> None:
     if nib is None:
-        raise ImportError(
-            "nibabel is required for NIfTI I/O. Install with: pip install nibabel"
-        )
+        raise ImportError("nibabel is required for NIfTI I/O. Install with: pip install nibabel")
 
 
-def load_image(
-    path: str | Path, device: torch.device | None = None
-) -> tuple[Tensor, object]:
+def load_image(path: str | Path, device: torch.device | None = None) -> tuple[Tensor, object]:
     """Load a NIfTI image as a torch tensor.
 
     Args:
@@ -76,14 +72,12 @@ def load_image(
     # axes so a lone volume reads as 3D and a real time series as 4D. The first
     # three (spatial) axes are always kept.
     if data.ndim > 3:
-        squeeze_axes = tuple(ax for ax in range(3, data.ndim)
-                             if data.shape[ax] == 1)
+        squeeze_axes = tuple(ax for ax in range(3, data.ndim) if data.shape[ax] == 1)
         if squeeze_axes:
             data = np.squeeze(data, axis=squeeze_axes)
         if data.ndim > 4:
             raise ValueError(
-                f"Expected 3D or 4D image after squeezing singleton dims, "
-                f"got shape {data.shape}"
+                f"Expected 3D or 4D image after squeezing singleton dims, got shape {data.shape}"
             )
 
     # NIfTI convention: (x, y, z [, t]) -> we want (z, y, x [, t transposed])
@@ -111,6 +105,7 @@ def save_image(
     header_info: dict | None = None,
     affine: np.ndarray | None = None,
     use_pigz: bool = True,
+    brick_labels: list[str] | None = None,
 ) -> None:
     """Save a torch tensor as a NIfTI image.
 
@@ -120,6 +115,8 @@ def save_image(
         header_info: Dict from load_image with 'affine' and 'header'.
         affine: 4x4 affine matrix. Uses header_info's affine or identity if None.
         use_pigz: Use pigz for parallel gzip compression (default: True if available).
+        brick_labels: Optional per-sub-brick labels written into the AFNI NIfTI
+            extension (BRICK_LABS) so AFNI viewers show them.
     """
     arr = data.detach().cpu().numpy()
 
@@ -136,7 +133,13 @@ def save_image(
 
     # Extract header from header_info to preserve TR, xyzt_units, etc.
     header = header_info.get("header") if header_info is not None else None
-    save_nifti(arr.astype(np.float32), output_path=path, affine=affine, header=header)
+    save_nifti(
+        arr.astype(np.float32),
+        output_path=path,
+        affine=affine,
+        header=header,
+        brick_labels=brick_labels,
+    )
 
 
 def save_warp_field(
@@ -236,9 +239,7 @@ def load_warp_field(
         data = data.squeeze(4)
 
     if data.ndim != 4 or data.shape[3] != 3:
-        raise ValueError(
-            f"Expected 4D NIfTI with shape (nx,ny,nz,3), got shape {data.shape}"
-        )
+        raise ValueError(f"Expected 4D NIfTI with shape (nx,ny,nz,3), got shape {data.shape}")
 
     # (nx, ny, nz, 3) -> transpose to (nz, ny, nx, 3)
     data = data.transpose(2, 1, 0, 3)

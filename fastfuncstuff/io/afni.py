@@ -161,9 +161,7 @@ def _resolve_indices(indices: list[int], n_volumes: int) -> list[int]:
         if i < 0:
             raise ValueError(f"Negative volume index {i} is not valid")
         if i >= n_volumes:
-            raise ValueError(
-                f"Volume index {i} out of range for image with {n_volumes} volumes"
-            )
+            raise ValueError(f"Volume index {i} out of range for image with {n_volumes} volumes")
     return indices
 
 
@@ -261,9 +259,7 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     if indices is not None:
         data = np.asarray(img_out.dataobj)
         if data.ndim < 4:
-            raise ValueError(
-                f"Sub-brick selector requires a 4D image, got {data.ndim}D"
-            )
+            raise ValueError(f"Sub-brick selector requires a 4D image, got {data.ndim}D")
         n_volumes = data.shape[3]
         resolved = _resolve_indices(indices, n_volumes)
         data = data[:, :, :, resolved]
@@ -1620,8 +1616,13 @@ def _compress_zst(src: Path, dst: Path, remove_original: bool) -> Path:
 _NIFTI_ECODE_AFNI = 4
 # NIfTI datatype codes used by AFNI's NIfTI_nums consistency string
 _NP_DTYPE_TO_NIFTI_CODE: dict[str, int] = {
-    "float32": 16, "float64": 64, "int16": 4, "int32": 8,
-    "uint8": 2, "int8": 256, "uint16": 512,
+    "float32": 16,
+    "float64": 64,
+    "int16": 4,
+    "int32": 8,
+    "uint8": 2,
+    "int8": 256,
+    "uint16": 512,
 }
 
 
@@ -1629,6 +1630,7 @@ def _generate_afni_idcode() -> str:
     """Generate an AFNI-style unique ID: AFN_<22 base64 chars>."""
     import base64
     import os
+
     raw = base64.b64encode(os.urandom(16)).decode("ascii")
     # AFNI IDs use a URL-safe-ish alphabet; replace +/ with safe chars
     raw = raw.replace("+", "x").replace("/", "X").rstrip("=")
@@ -1694,6 +1696,7 @@ def set_afni_space_info(
 
     try:
         import nibabel as nib
+
         extensions = header.extensions  # type: ignore[union-attr]
     except AttributeError:
         return
@@ -1705,7 +1708,7 @@ def set_afni_space_info(
             # Update SCENE_DATA — replace first integer
             xml = re.sub(
                 r'(atr_name="SCENE_DATA"\s*>\s*\n\s*)\d+',
-                rf'\g<1>{view}',
+                rf"\g<1>{view}",
                 xml,
             )
 
@@ -1716,9 +1719,7 @@ def set_afni_space_info(
                 xml,
             )
 
-            new_ext = nib.nifti1.Nifti1Extension(
-                _NIFTI_ECODE_AFNI, xml.encode("utf-8")
-            )
+            new_ext = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
             extensions[i] = new_ext
             break
 
@@ -1743,6 +1744,7 @@ def set_afni_func_type(header: object, func_code: int = 11) -> None:
 
     try:
         import nibabel as nib
+
         extensions = header.extensions  # type: ignore[union-attr]
     except AttributeError:
         return
@@ -1754,7 +1756,7 @@ def set_afni_func_type(header: object, func_code: int = 11) -> None:
             # Update SCENE_DATA[1] (second integer, one per line in NIfTI XML)
             xml = re.sub(
                 r'(atr_name="SCENE_DATA"[^>]*>\s*\n\s*\d+\s*\n\s*)\d+',
-                rf'\g<1>{func_code}',
+                rf"\g<1>{func_code}",
                 xml,
             )
 
@@ -1856,7 +1858,9 @@ def _update_afni_extension(
     if history_match:
         old_history = history_match.group(2)
         new_history = old_history + r"\n" + history_entry
-        afni_xml = afni_xml[:history_match.start(2)] + new_history + afni_xml[history_match.end(2):]
+        afni_xml = (
+            afni_xml[: history_match.start(2)] + new_history + afni_xml[history_match.end(2) :]
+        )
     # If no HISTORY_NOTE found, that's fine — don't add one
 
     # --- Update DATASET_RANK[1] (sub-brick count) ---
@@ -1867,7 +1871,7 @@ def _update_afni_extension(
     n_bricks = nt if nt > 1 else nu
     afni_xml = re.sub(
         r'(atr_name="DATASET_RANK"[^>]*>\s*\n\s*\d+\s+)(\d+)',
-        rf'\g<1>{n_bricks}',
+        rf"\g<1>{n_bricks}",
         afni_xml,
     )
 
@@ -1880,7 +1884,7 @@ def _update_afni_extension(
     # datum type, offsets) are left unchanged.
     afni_xml = re.sub(
         r'(atr_name="TAXIS_NUMS"[^>]*>\s*\n\s*)(\d+)',
-        rf'\g<1>{n_bricks}',
+        rf"\g<1>{n_bricks}",
         afni_xml,
     )
 
@@ -1888,19 +1892,86 @@ def _update_afni_extension(
     # BRICK_STATS/STATSYM/LABS/TYPES all have one entry per sub-brick and are
     # stale after a volume-count change.  Remove them; AFNI/3drefit regenerates
     # them from -substatpar / -relabel_all.
-    for atr_name in ("BRICK_STATS", "BRICK_STATSYM", "BRICK_LABS",
-                      "BRICK_TYPES", "BRICK_FLOAT_FACS"):
+    for atr_name in (
+        "BRICK_STATS",
+        "BRICK_STATSYM",
+        "BRICK_LABS",
+        "BRICK_TYPES",
+        "BRICK_FLOAT_FACS",
+    ):
         afni_xml = re.sub(
             rf'<AFNI_atr\s[^>]*atr_name="{atr_name}"[^>]*>.*?</AFNI_atr>\s*',
-            '',
+            "",
             afni_xml,
             flags=re.DOTALL,
         )
 
     # Write back the updated extension
     import nibabel as nib
+
     new_ext = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, afni_xml.encode("utf-8"))
     extensions[afni_idx] = new_ext
+
+
+def _set_afni_brick_labels(header: object, labels: list[str]) -> None:
+    """Set per-sub-brick labels (BRICK_LABS) so AFNI viewers show them.
+
+    NIfTI has no native sub-brick labels; AFNI stores them in its NIfTI
+    extension (ecode=4) as a ``~``-separated ``BRICK_LABS`` attribute. This
+    injects/replaces that attribute, reusing an existing AFNI extension when the
+    input had one, or creating a minimal one (matching what AFNI itself writes)
+    for a plain NIfTI input. Call *after* :func:`_update_afni_extension`, which
+    strips any stale BRICK_LABS first.
+    """
+    import re
+
+    import nibabel as nib
+
+    try:
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return
+
+    labs = "~".join(labels)
+    atr = (
+        "<AFNI_atr\n"
+        '  ni_type="String"\n'
+        '  ni_dimen="1"\n'
+        '  atr_name="BRICK_LABS" >\n'
+        f' "{labs}"\n'
+        "</AFNI_atr>\n"
+    )
+
+    afni_idx = None
+    for i, ext in enumerate(extensions):
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            afni_idx = i
+            break
+
+    if afni_idx is not None:
+        xml = extensions[afni_idx].content.decode("utf-8", errors="replace")
+        xml = re.sub(
+            r'<AFNI_atr\s[^>]*atr_name="BRICK_LABS"[^>]*>.*?</AFNI_atr>\s*',
+            "",
+            xml,
+            flags=re.DOTALL,
+        )
+        if "</AFNI_attributes>" in xml:
+            xml = xml.replace("</AFNI_attributes>", atr + "</AFNI_attributes>", 1)
+        else:
+            xml = xml + atr
+        extensions[afni_idx] = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
+    else:
+        idc = _generate_afni_idcode()
+        payload = (
+            "<?xml version='1.0' ?>\n"
+            "<AFNI_attributes\n"
+            f'  self_idcode="{idc}"\n'
+            '  ni_form="ni_group" >\n'
+            f"{atr}"
+            "</AFNI_attributes>\n\x00"
+        )
+        extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, payload.encode("utf-8")))
 
 
 def save_nifti(
@@ -1910,6 +1981,7 @@ def save_nifti(
     affine: np.ndarray | None = None,
     tr: float | None = None,
     header: object | None = None,
+    brick_labels: list[str] | None = None,
 ):
     """Save data as a NIfTI file with efficient compression.
 
@@ -1975,6 +2047,10 @@ def save_nifti(
     #   - IDCODE_DATE with current timestamp
     #   - HISTORY_NOTE appended with our command
     _update_afni_extension(header, data.shape, data.dtype)
+
+    # Per-sub-brick labels for AFNI viewers (NIfTI has no native equivalent).
+    if brick_labels is not None:
+        _set_afni_brick_labels(header, brick_labels)
 
     # Create NIfTI image
     img = nib.Nifti1Image(data, affine, header=header)
