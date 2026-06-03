@@ -19,6 +19,7 @@ dependencies = [
     "tqdm>=4.65",
     "h5py>=3.8",
     "pyyaml>=6.0",
+    "warpkit>=1.2",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -62,6 +63,7 @@ ffs_tps = "fastfuncstuff.cli.tps:main"
 ffs_xval_r2 = "fastfuncstuff.cli.xval_r2:main"
 # Image processing tools
 ffs_allineate = "fastfuncstuff.cli.allineate:main"
+ffs_medic = "fastfuncstuff.cli.medic:main"
 ffs_moco = "fastfuncstuff.cli.moco:main"
 ffs_motsim = "fastfuncstuff.cli.motsim:main"
 ffs_nwarp = "fastfuncstuff.cli.nwarp:main"
@@ -69,6 +71,7 @@ ffs_qwarp = "fastfuncstuff.cli.qwarp:main"
 ffs_slicetime = "fastfuncstuff.cli.slicetime:main"
 ffs_util_automask = "fastfuncstuff.cli.automask:main"
 ffs_util_concalc = "fastfuncstuff.cli.util_concalc:main"
+ffs_util_convert_medic = "fastfuncstuff.cli.util_convert_medic:main"
 ffs_util_localstat = "fastfuncstuff.cli.util_localstat:main"
 ffs_util_pcwarp = "fastfuncstuff.cli.pcwarp:main"
 # Stats / utility tools

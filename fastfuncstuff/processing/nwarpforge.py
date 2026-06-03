@@ -36,6 +36,7 @@ def derive_phase_output_path(prefix: str) -> str:
         out.nii      -> out_phase.nii
     """
     from pathlib import Path
+
     p = Path(prefix)
     if p.name.endswith(".nii.gz"):
         stem = p.name[: -len(".nii.gz")]
@@ -72,7 +73,7 @@ def compute_cardinal_affine(oblique_aff: np.ndarray) -> np.ndarray:
 
     for col in range(3):
         vec = R[:, col]
-        voxel_size = np.sqrt(np.sum(vec ** 2))
+        voxel_size = np.sqrt(np.sum(vec**2))
         dominant = int(np.argmax(np.abs(vec)))
         sign = np.sign(vec[dominant])
         cardinal[dominant, col] = sign * voxel_size
@@ -112,7 +113,45 @@ class NonlinearWarp:
         return self.xd.shape
 
 
-Transform = AffineTransform | NonlinearWarp
+@dataclass
+class TimeVaryingWarp:
+    """Per-frame displacement field (e.g. a MEDIC frame-wise distortion warp).
+
+    Holds one 3-vector displacement field per time point in NIfTI mm (same
+    convention as a loaded ffs_qwarp warp), so each frame goes through
+    :func:`prepare_warp_for_grid` and composes to any ``-master`` output grid.
+    Analogous to ``AffineTransform``'s time dependence: ``at_time(t)`` selects
+    the frame's :class:`NonlinearWarp`.  On disk it is either per-frame 3D files
+    (a ``warp_*`` wildcard) or one 5D ``(nx, ny, nz, T, 3)`` file.
+    """
+
+    xd: Tensor  # (T, nz, ny, nx)
+    yd: Tensor
+    zd: Tensor
+    header_info: dict
+    units: str = "nifti_mm"
+
+    @property
+    def n_time(self) -> int:
+        return self.xd.shape[0]
+
+    @property
+    def spatial_shape(self) -> tuple[int, int, int]:
+        s = self.xd.shape
+        return (int(s[1]), int(s[2]), int(s[3]))
+
+    def at_time(self, t: int) -> NonlinearWarp:
+        idx = min(t, self.xd.shape[0] - 1)
+        return NonlinearWarp(
+            xd=self.xd[idx],
+            yd=self.yd[idx],
+            zd=self.zd[idx],
+            header_info=self.header_info,
+            units=self.units,
+        )
+
+
+Transform = AffineTransform | NonlinearWarp | TimeVaryingWarp
 
 
 def load_affine_1D(
@@ -153,9 +192,7 @@ def load_affine_1D(
             [[float(x) for x in line.split()[:12]] for line in lines], dtype=np.float32
         )
         if mats_12.shape[1] != 12:
-            raise ValueError(
-                f"Expected 12 values per row in {path}, got {mats_12.shape[1]}"
-            )
+            raise ValueError(f"Expected 12 values per row in {path}, got {mats_12.shape[1]}")
 
     T = mats_12.shape[0]
     matrices = torch.zeros(T, 4, 4, dtype=torch.float32)
@@ -264,9 +301,7 @@ def load_warp(
         if debug:
             print("[DEBUG] load_warp: Warps assumed to be in voxel units")
 
-    return NonlinearWarp(
-        xd=xd, yd=yd, zd=zd, header_info=header_info, units=warp_units
-    )
+    return NonlinearWarp(xd=xd, yd=yd, zd=zd, header_info=header_info, units=warp_units)
 
 
 def _nifti_mm_to_voxels(
@@ -286,6 +321,88 @@ def _nifti_mm_to_voxels(
     vz = R[2, 0] * xd + R[2, 1] * yd + R[2, 2] * zd
 
     return vx, vy, vz
+
+
+def _is_time_varying_warp(path: str | Path) -> bool:
+    """True if ``path`` is a 5D ``(nx, ny, nz, T, 3)`` per-frame warp (T > 1)."""
+    from typing import cast
+
+    import nibabel as nib
+
+    shape = cast(nib.Nifti1Image, nib.load(str(path))).shape
+    return len(shape) == 5 and shape[-1] == 3 and shape[3] > 1
+
+
+def load_time_varying_warp(
+    path: str | Path,
+    device: torch.device | None = None,
+    debug: bool = False,
+) -> TimeVaryingWarp:
+    """Load a 5D ``(nx, ny, nz, T, 3)`` per-frame warp (ffs_medic / qwarp mm).
+
+    Displacements use the same DICOM-mm convention as ffs_qwarp warps; converted
+    to NIfTI mm here (negate x/y, the per-frame analogue of :func:`load_warp`
+    with ``units="mm"``) so the warp composes to any ``-master`` grid via
+    :func:`prepare_warp_for_grid`.
+    """
+    from typing import cast
+
+    import nibabel as nib
+
+    img = cast(nib.Nifti1Image, nib.load(str(path)))
+    data = np.asarray(img.dataobj, dtype=np.float32)  # (nx, ny, nz, T, 3)
+    if data.ndim != 5 or data.shape[-1] != 3:
+        raise ValueError(f"Expected 5D (nx,ny,nz,T,3) warp, got shape {data.shape}: {path}")
+
+    # (nx, ny, nz, T, c) -> per-component (T, nz, ny, nx); negate x/y to go
+    # DICOM mm -> NIfTI mm (matches load_warp units="mm").
+    def _comp(c: int, sign: float) -> Tensor:
+        arr = np.ascontiguousarray(data[..., c].transpose(3, 2, 1, 0)) * sign
+        t = torch.from_numpy(arr)
+        return t.to(device) if device is not None else t
+
+    header_info = {"affine": img.affine.copy(), "header": img.header.copy()}
+    warp = TimeVaryingWarp(
+        xd=_comp(0, -1.0),
+        yd=_comp(1, -1.0),
+        zd=_comp(2, 1.0),
+        header_info=header_info,
+        units="nifti_mm",
+    )
+    if debug:
+        print(
+            f"[DEBUG] load_time_varying_warp: {warp.n_time} frames, "
+            f"spatial {warp.spatial_shape}, units=nifti_mm"
+        )
+    return warp
+
+
+def load_time_varying_warp_from_files(
+    paths: list[str],
+    device: torch.device | None = None,
+    debug: bool = False,
+) -> TimeVaryingWarp:
+    """Build a per-frame warp from a sorted list of 3D ``(nx,ny,nz,3)`` files.
+
+    Each file is one frame's displacement field in the same mm warp convention
+    as ffs_qwarp (DICOM mm on disk); loaded with :func:`load_warp` exactly as a
+    static warp, so per-frame distortion warps compose to any ``-master`` grid.
+    ``paths`` should already be sorted into frame order.
+    """
+    frames = [load_warp(p, device=device, units="mm") for p in paths]
+    warp = TimeVaryingWarp(
+        xd=torch.stack([f.xd for f in frames]),
+        yd=torch.stack([f.yd for f in frames]),
+        zd=torch.stack([f.zd for f in frames]),
+        header_info=frames[0].header_info,
+        units="nifti_mm",
+    )
+    if debug:
+        print(
+            f"[DEBUG] load_time_varying_warp_from_files: {warp.n_time} frames "
+            f"from {len(paths)} files, spatial {warp.spatial_shape}"
+        )
+    return warp
 
 
 def parse_nwarp_string(nwarp_str: str) -> list[str]:
@@ -361,8 +478,7 @@ def prepare_warp_for_grid(
 
     # Check if grids match — skip resampling if so
     needs_resample = not (
-        src_shape == target_shape
-        and np.allclose(src_cardinal, tgt_cardinal, atol=1e-4)
+        src_shape == target_shape and np.allclose(src_cardinal, tgt_cardinal, atol=1e-4)
     )
 
     if needs_resample:
@@ -402,9 +518,21 @@ def prepare_warp_for_grid(
         flat_z = src_coords[2]
 
         # Interpolate NIfTI mm displacements at warp grid locations
-        mm_xd = trilinear_interpolate(warp.xd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
-        mm_yd = trilinear_interpolate(warp.yd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
-        mm_zd = trilinear_interpolate(warp.zd, flat_x, flat_y, flat_z).float().reshape(tgt_nz, tgt_ny, tgt_nx)
+        mm_xd = (
+            trilinear_interpolate(warp.xd, flat_x, flat_y, flat_z)
+            .float()
+            .reshape(tgt_nz, tgt_ny, tgt_nx)
+        )
+        mm_yd = (
+            trilinear_interpolate(warp.yd, flat_x, flat_y, flat_z)
+            .float()
+            .reshape(tgt_nz, tgt_ny, tgt_nx)
+        )
+        mm_zd = (
+            trilinear_interpolate(warp.zd, flat_x, flat_y, flat_z)
+            .float()
+            .reshape(tgt_nz, tgt_ny, tgt_nx)
+        )
     else:
         if verb >= 2:
             print(f"  [prepare_warp] grids match {src_shape}, no resample needed")
@@ -420,15 +548,15 @@ def prepare_warp_for_grid(
         "header": warp.header_info.get("header"),
     }
 
-    result = NonlinearWarp(
-        xd=vx, yd=vy, zd=vz, header_info=new_header, units="voxels"
-    )
+    result = NonlinearWarp(xd=vx, yd=vy, zd=vz, header_info=new_header, units="voxels")
     if verb >= 2:
         print(f"  [prepare_warp] result shape = {result.shape}")
-        print(f"  [prepare_warp] voxel disp ranges: "
-              f"x=[{vx.min().item():.2f}, {vx.max().item():.2f}] "
-              f"y=[{vy.min().item():.2f}, {vy.max().item():.2f}] "
-              f"z=[{vz.min().item():.2f}, {vz.max().item():.2f}]")
+        print(
+            f"  [prepare_warp] voxel disp ranges: "
+            f"x=[{vx.min().item():.2f}, {vx.max().item():.2f}] "
+            f"y=[{vy.min().item():.2f}, {vy.max().item():.2f}] "
+            f"z=[{vz.min().item():.2f}, {vz.max().item():.2f}]"
+        )
     return result
 
 
@@ -644,31 +772,25 @@ def compose_chain(
 
             result_warp = compose_warp_then_matrix(result_warp, mat)
             if verb >= 2:
-                print(
-                    f"  [compose] after affine [{i}]: warp shape = {result_warp.shape}"
-                )
+                print(f"  [compose] after affine [{i}]: warp shape = {result_warp.shape}")
 
-        elif isinstance(xform, NonlinearWarp):
-            # Convert NIfTI mm warp to output-grid voxel units
+        elif isinstance(xform, NonlinearWarp | TimeVaryingWarp):
+            # Resolve a time-varying warp to this frame's field, then convert the
+            # NIfTI mm warp to output-grid voxel units (composes to any -master).
+            frame_warp = xform.at_time(time_idx) if isinstance(xform, TimeVaryingWarp) else xform
             prepared = prepare_warp_for_grid(
-                xform, output_shape, output_affine, device, verb=verb
+                frame_warp, output_shape, output_affine, device, verb=verb
             )
             if result_warp is None:
                 result_warp = prepared
                 if verb >= 2:
-                    print(
-                        f"  [compose] first warp [{i}]: {xform.shape} -> {result_warp.shape}"
-                    )
+                    print(f"  [compose] first warp [{i}]: {prepared.shape} -> {result_warp.shape}")
             else:
                 if verb >= 2:
-                    print(
-                        f"  [compose] composing warp [{i}] ({xform.shape} -> {output_shape})"
-                    )
+                    print(f"  [compose] composing warp [{i}] -> {output_shape}")
                 result_warp = compose_warp_then_warp(result_warp, prepared)
                 if verb >= 2:
-                    print(
-                        f"  [compose] after compose: warp shape = {result_warp.shape}"
-                    )
+                    print(f"  [compose] after compose: warp shape = {result_warp.shape}")
 
     if result_warp is None:
         result_warp = NonlinearWarp(
@@ -736,12 +858,15 @@ def apply_composed_warp(
     M_t = torch.from_numpy(M).float().to(device)
 
     N = nz * ny * nx
-    coords = torch.stack([
-        out_x.reshape(-1),
-        out_y.reshape(-1),
-        out_z.reshape(-1),
-        torch.ones(N, dtype=torch.float32, device=device),
-    ], dim=0)
+    coords = torch.stack(
+        [
+            out_x.reshape(-1),
+            out_y.reshape(-1),
+            out_z.reshape(-1),
+            torch.ones(N, dtype=torch.float32, device=device),
+        ],
+        dim=0,
+    )
 
     src_coords = M_t @ coords
     src_xd = src_coords[0].reshape(nz, ny, nx) - ii
@@ -880,9 +1005,7 @@ def nwarpforge(
             ph_max = phase_raw.max().item()
             range_norm = ph_max - ph_min
             if range_norm == 0.0:
-                raise ValueError(
-                    f"-phase data is constant ({ph_min}); cannot compute phase"
-                )
+                raise ValueError(f"-phase data is constant ({ph_min}); cannot compute phase")
             range_center = (ph_max + ph_min) / range_norm * 0.5
             phase_data = (phase_raw / range_norm - range_center) * (2.0 * torch.pi)
             if verb >= 1:
@@ -899,9 +1022,7 @@ def nwarpforge(
                     f"range=[{phase_data.min().item():.3f}, {phase_data.max().item():.3f}] rad (no scaling)"
                 )
         else:
-            raise ValueError(
-                f"Unknown phase_units: {phase_units!r}. Use 'raw' or 'rad'."
-            )
+            raise ValueError(f"Unknown phase_units: {phase_units!r}. Use 'raw' or 'rad'.")
         if phase_prefix is None:
             phase_prefix = derive_phase_output_path(prefix)
         if verb >= 1:
@@ -952,14 +1073,33 @@ def nwarpforge(
     max_time_points = 1
 
     for _i_spec, spec in enumerate(nwarp_specs):
+        # A glob token (e.g. 'warp_*.nii.gz') expands, sorted, to one warp per
+        # frame -> a single time-varying slot in the chain. A pattern matching
+        # exactly one file falls through to normal single-warp handling.
+        if any(c in spec for c in "*?[") and not Path(spec).exists():
+            import glob as _glob
+
+            matches = sorted(_glob.glob(spec))
+            if not matches:
+                raise FileNotFoundError(f"-nwarp pattern matched no files: {spec}")
+            if len(matches) > 1:
+                tv = load_time_varying_warp_from_files(matches, device=device, debug=debug)
+                transforms.append(tv)
+                max_time_points = max(max_time_points, tv.n_time)
+                if verb >= 1:
+                    print(
+                        f"Loading time-varying warp: {tv.n_time} frames from "
+                        f"{len(matches)} files matching {spec}"
+                    )
+                continue
+            spec = matches[0]
+
         kind = identify_transform_type(spec)
         if verb >= 1:
             print(f"Loading {kind}: {spec}")
 
         if kind == "affine":
-            xform = load_affine_1D(
-                spec, affine_for_matrices, device=device, debug=debug
-            )
+            xform = load_affine_1D(spec, affine_for_matrices, device=device, debug=debug)
             transforms.append(xform)
             max_time_points = max(max_time_points, xform.matrices.shape[0])
             if verb >= 1:
@@ -967,18 +1107,16 @@ def nwarpforge(
             if debug:
                 m = xform.matrices[0].cpu().numpy()
                 print("  [DEBUG] Matrix after conversion (t=0):")
-                print(
-                    f"    [{m[0, 0]:9.5f} {m[0, 1]:9.5f} {m[0, 2]:9.5f} {m[0, 3]:9.5f}]"
-                )
-                print(
-                    f"    [{m[1, 0]:9.5f} {m[1, 1]:9.5f} {m[1, 2]:9.5f} {m[1, 3]:9.5f}]"
-                )
-                print(
-                    f"    [{m[2, 0]:9.5f} {m[2, 1]:9.5f} {m[2, 2]:9.5f} {m[2, 3]:9.5f}]"
-                )
-                print(
-                    f"    [{m[3, 0]:9.5f} {m[3, 1]:9.5f} {m[3, 2]:9.5f} {m[3, 3]:9.5f}]"
-                )
+                print(f"    [{m[0, 0]:9.5f} {m[0, 1]:9.5f} {m[0, 2]:9.5f} {m[0, 3]:9.5f}]")
+                print(f"    [{m[1, 0]:9.5f} {m[1, 1]:9.5f} {m[1, 2]:9.5f} {m[1, 3]:9.5f}]")
+                print(f"    [{m[2, 0]:9.5f} {m[2, 1]:9.5f} {m[2, 2]:9.5f} {m[2, 3]:9.5f}]")
+                print(f"    [{m[3, 0]:9.5f} {m[3, 1]:9.5f} {m[3, 2]:9.5f} {m[3, 3]:9.5f}]")
+        elif _is_time_varying_warp(spec):
+            tv = load_time_varying_warp(spec, device=device, debug=debug)
+            transforms.append(tv)
+            max_time_points = max(max_time_points, tv.n_time)
+            if verb >= 1:
+                print(f"  Time-varying warp: {tv.n_time} frames, spatial {tv.spatial_shape}")
         else:
             xform = load_warp(spec, device=device, debug=debug)
             transforms.append(xform)
@@ -986,15 +1124,9 @@ def nwarpforge(
                 print(f"  Warp: {xform.shape}")
             if debug:
                 print("  [DEBUG] Warp displacement ranges:")
-                print(
-                    f"    xd: [{xform.xd.min().item():.3f}, {xform.xd.max().item():.3f}]"
-                )
-                print(
-                    f"    yd: [{xform.yd.min().item():.3f}, {xform.yd.max().item():.3f}]"
-                )
-                print(
-                    f"    zd: [{xform.zd.min().item():.3f}, {xform.zd.max().item():.3f}]"
-                )
+                print(f"    xd: [{xform.xd.min().item():.3f}, {xform.xd.max().item():.3f}]")
+                print(f"    yd: [{xform.yd.min().item():.3f}, {xform.yd.max().item():.3f}]")
+                print(f"    zd: [{xform.zd.min().item():.3f}, {xform.zd.max().item():.3f}]")
 
     # If master didn't provide space info, try the first NIfTI warp in chain
     if master_hdr_obj is None:
@@ -1048,16 +1180,20 @@ def nwarpforge(
                 real_vol = src_vol * torch.cos(ph_vol)
                 imag_vol = src_vol * torch.sin(ph_vol)
                 warped_real = apply_composed_warp(
-                    real_vol, composed,
+                    real_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 warped_imag = apply_composed_warp(
-                    imag_vol, composed,
+                    imag_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
-                warped = torch.sqrt(warped_real ** 2 + warped_imag ** 2)
+                warped = torch.sqrt(warped_real**2 + warped_imag**2)
                 warped_phase = torch.atan2(warped_imag, warped_real)
 
             elif phase_warp == "split":
@@ -1065,21 +1201,27 @@ def nwarpforge(
                 # then warp real/imag and extract phase only.  Magnitude
                 # is never touched by phase data.
                 warped = apply_composed_warp(
-                    src_vol, composed,
+                    src_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 real_vol = src_vol * torch.cos(ph_vol)
                 imag_vol = src_vol * torch.sin(ph_vol)
                 warped_real = apply_composed_warp(
-                    real_vol, composed,
+                    real_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 warped_imag = apply_composed_warp(
-                    imag_vol, composed,
+                    imag_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 warped_phase = torch.atan2(warped_imag, warped_real)
 
@@ -1088,14 +1230,18 @@ def nwarpforge(
                 # is already unwrapped (no wraps).  Fastest — one warp
                 # per volume instead of two.
                 warped = apply_composed_warp(
-                    src_vol, composed,
+                    src_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 warped_phase = apply_composed_warp(
-                    ph_vol, composed,
+                    ph_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
 
             elif phase_warp == "circular":
@@ -1103,21 +1249,27 @@ def nwarpforge(
                 # interpolation), then atan2 back.  Handles wraps without
                 # magnitude corruption.  Best for wrapped phase data.
                 warped = apply_composed_warp(
-                    src_vol, composed,
+                    src_vol,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 cos_ph = torch.cos(ph_vol)
                 sin_ph = torch.sin(ph_vol)
                 warped_cos = apply_composed_warp(
-                    cos_ph, composed,
+                    cos_ph,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 warped_sin = apply_composed_warp(
-                    sin_ph, composed,
+                    sin_ph,
+                    composed,
                     source_affine=source_header["affine"],
-                    output_affine=output_affine, interp=interp,
+                    output_affine=output_affine,
+                    interp=interp,
                 )
                 warped_phase = torch.atan2(warped_sin, warped_cos)
 
@@ -1129,7 +1281,8 @@ def nwarpforge(
             phase_volumes.append(warped_phase)
         else:
             warped = apply_composed_warp(
-                src_vol, composed,
+                src_vol,
+                composed,
                 source_affine=source_header["affine"],
                 output_affine=output_affine,
                 interp=interp,
@@ -1148,6 +1301,7 @@ def nwarpforge(
     src_hdr = source_header.get("header")
     try:
         import nibabel as nib
+
         out_hdr = nib.Nifti1Header()
         if src_hdr is not None:
             # Copy temporal metadata (units always safe; zooms need valid ndim)
@@ -1183,6 +1337,7 @@ def nwarpforge(
         )
     except Exception as exc:
         import warnings
+
         warnings.warn(f"nwarpforge: failed to build output header: {exc}", stacklevel=2)
         out_hdr = None
 
