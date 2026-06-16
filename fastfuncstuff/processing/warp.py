@@ -55,7 +55,7 @@ from .cost_blok import (
 from .interp import (
     batched_compose_and_interpolate,
     trilinear_interpolate,
-    warp_image_linear,
+    warp_image,
 )
 from .optimizer import optimize_warp_params_batched, optimize_warp_params_torch
 from .penalty import compute_jacobian_energy, compute_penalty_batched
@@ -96,11 +96,23 @@ class QwarpConfig:
     use_quintic: bool = False
     """Use quintic (5th order) basis at final level."""
 
+    interp: str = "linear"
+    """Image interpolation used when sampling the source during cost evaluation
+    (warped_source). AFNI 3dQwarp optimizes with linear; higher-order kernels
+    (cubic/quintic/heptic/wsinc5) cost more for ~no output-quality gain because
+    output sharpness comes from `final_interp`, not estimation. The fused per-patch
+    inner loop is always linear regardless of this setting."""
+
+    final_interp: str = "wsinc5"
+    """Image interpolation for the final warped output (single pass over the
+    original source through the total warp). Defaults to wsinc5 like 3dQwarp."""
+
     use_lite: bool = True
     """Use 'lite' (reduced parameter) basis functions."""
 
-    workhard: tuple[int, int] = (0, -1)
-    """(start_lev, end_lev) range for double-pass optimization."""
+    workhard: tuple[int, int] | None = None
+    """(start_lev, end_lev) inclusive range for double-pass optimization, or None
+    to disable. end_lev < 0 means "through the last level"."""
 
     cost_method: str = "pearclp"
     """Cost function: 'pearclp' (clipped Pearson), 'pearson', 'lpc' / 'lpa'
@@ -145,6 +157,14 @@ class QwarpConfig:
 
     batch_optimizer_iters: int = 60
     """Max iterations for batched Adam optimizer per phase."""
+
+    batch_optimizer_tol: float = 1e-4
+    """Per-patch relative-improvement threshold below which a patch counts as
+    'stalled'. Lower => patches keep optimizing longer (more warp, slower)."""
+
+    batch_optimizer_patience: int = 5
+    """Consecutive stalled steps before a patch is considered converged. The
+    batch loop stops only once every patch has converged (or hits the iter cap)."""
 
     batch_optimizer_iters_lev0: int = 120
     """Max Adam iterations for the single global level-0 patch (CUDA only).
@@ -221,6 +241,11 @@ class WarpState:
     patches_done: int = 0
     patches_skipped: int = 0
     last_level: int = 0  # highest refinement level executed (for pyramid hand-off)
+
+    # Per-level optimizer-budget telemetry (batched path only); reset each level.
+    opt_steps_weighted: int = 0   # sum over batches of steps_run * B
+    opt_patches_counted: int = 0  # patches that went through the batched optimizer
+    opt_hit_budget: int = 0       # patches still improving at the iteration cap
 
 
 @dataclass
@@ -343,7 +368,9 @@ def qwarp(
             state.xd = initial_warp[0].float().to(device)
             state.yd = initial_warp[1].float().to(device)
             state.zd = initial_warp[2].float().to(device)
-        state.warped_source = warp_image_linear(source_p, state.xd, state.yd, state.zd)
+        state.warped_source = warp_image(
+            source_p, state.xd, state.yd, state.zd, mode=config.interp
+        )
     else:
         state.xd = torch.zeros(nz, ny, nx, device=device)
         state.yd = torch.zeros(nz, ny, nx, device=device)
@@ -355,8 +382,10 @@ def qwarp(
     else:
         _warpomatic(base_p, source_p, weight_p, mask_p, state, config, device)
 
-    # Final warped image: apply warp to unpadded source, crop to original size
-    warped_full = warp_image_linear(source_p, state.xd, state.yd, state.zd)
+    # Final warped image: apply warp to unpadded source, crop to original size.
+    # Single pass through the total warp; final_interp (wsinc5 by default, like
+    # 3dQwarp) is where output sharpness comes from.
+    warped_full = warp_image(source_p, state.xd, state.yd, state.zd, mode=config.final_interp)
     warped = warped_full[pad_z:pad_z+nz_orig, pad_y:pad_y+ny_orig, pad_x:pad_x+nx_orig]
 
     # Return full padded warp field (caller/io.py handles grid info)
@@ -618,7 +647,7 @@ def _warpomatic_pyramid(
             st.xd = _resize(pxd, (gz, gy, gx)) * (gx / pgx)
             st.yd = _resize(pyd, (gz, gy, gx)) * (gy / pgy)
             st.zd = _resize(pzd, (gz, gy, gx)) * (gz / pgz)
-            st.warped_source = warp_image_linear(src_s, st.xd, st.yd, st.zd)
+            st.warped_source = warp_image(src_s, st.xd, st.yd, st.zd, mode=config.interp)
             # Resume one level coarser than where the previous octave stopped
             # (one-level overlap so no spatial-frequency band is skipped).
             start_level = max(1, plast - 1)
@@ -890,9 +919,16 @@ def _warpomatic(
         if levdone and config.use_quintic:
             basis_type = "quintic_lite" if config.use_lite else "quintic"
 
-        # Workhard passes
-        wh1, wh2 = config.workhard
-        nlevr = 2 if (wh1 <= lev <= wh2) else 1
+        # Workhard passes. workhard is None when disabled; END < 0 means "through
+        # the last level" (the loop self-terminates at minpatch), so -workhard 0 -1
+        # doubles every level as it reads.
+        nlevr = 1
+        if config.workhard is not None:
+            wh1, wh2 = config.workhard
+            if wh2 < 0:
+                wh2 = config.max_level
+            if wh1 <= lev <= wh2:
+                nlevr = 2
 
         # Generate patch grid and filter
         all_patches = _generate_patch_grid(
@@ -926,6 +962,9 @@ def _warpomatic(
         n_valid = sum(len(ph) for ph in phases)
         state.patches_done = 0
         state.patches_skipped = len(all_patches) - len(valid_patches)
+        state.opt_steps_weighted = 0
+        state.opt_patches_counted = 0
+        state.opt_hit_budget = 0
         cost_at_start = state.cost
         # Snapshot the warp so a level that worsens the global cost can be
         # rolled back (see the reject-worse-levels guard at the end of the loop).
@@ -1026,7 +1065,7 @@ def _warpomatic(
                 state.yd.clamp_(-config.maxdisp, config.maxdisp)
                 state.zd.clamp_(-config.maxdisp, config.maxdisp)
             # Refresh warped_source with smoothed warp
-            state.warped_source = warp_image_linear(source, state.xd, state.yd, state.zd)
+            state.warped_source = warp_image(source, state.xd, state.yd, state.zd, mode=config.interp)
 
         # Compute actual global correlation after this level
         with torch.no_grad():
@@ -1041,7 +1080,7 @@ def _warpomatic(
             worsened = state.cost
             with torch.no_grad():
                 state.xd, state.yd, state.zd = saved_xd, saved_yd, saved_zd
-                state.warped_source = warp_image_linear(source, state.xd, state.yd, state.zd)
+                state.warped_source = warp_image(source, state.xd, state.yd, state.zd, mode=config.interp)
             state.cost = cost_at_start
             if config.verb >= 1:
                 msg = (
@@ -1057,17 +1096,25 @@ def _warpomatic(
 
         if config.verb >= 1:
             elapsed = time.time() - t0
+            # Optimizer-budget readout: mean Adam steps/patch and the share of
+            # patches that were still improving when they hit the iter cap (a high
+            # % means raising -batch_iters would buy more warp).
+            budget_str = ""
+            if state.opt_patches_counted > 0:
+                mean_iters = state.opt_steps_weighted / state.opt_patches_counted
+                hit_pct = 100.0 * state.opt_hit_budget / state.opt_patches_counted
+                budget_str = f" iters~{mean_iters:.0f} cap {hit_pct:.0f}%"
             if lev_pbar is not None:
                 lev_pbar.set_postfix_str(
                     f"cost={cost_at_start:.5f}=>{state.cost:.5f} "
-                    f"({state.patches_done}done {state.patches_skipped}skip) {elapsed:.1f}s"
+                    f"({state.patches_done}done {state.patches_skipped}skip){budget_str} {elapsed:.1f}s"
                 )
                 lev_pbar.close()
             else:
                 print(
                     f" done [cost:{cost_at_start:.5f}==>{state.cost:.5f};"
                     f" {state.patches_done} done, {state.patches_skipped} skip]"
-                    f" ({elapsed:.1f}s)"
+                    f"{budget_str} ({elapsed:.1f}s)"
                 )
 
         if config.level_callback is not None:
@@ -1263,11 +1310,17 @@ def _improve_warp_batched(
         return cost
 
     # Run batched Adam optimizer
-    best_params, best_costs = optimize_warp_params_batched(
+    best_params, _best_costs, opt_stats = optimize_warp_params_batched(
         batched_cost, B, n_active, param_max, device,
         max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
         lr=config.batch_optimizer_lr,
+        tolerance=config.batch_optimizer_tol,
+        patience=config.batch_optimizer_patience,
     )
+    # Accumulate per-level optimizer-budget telemetry (batched path only).
+    state.opt_steps_weighted += opt_stats.steps_run * opt_stats.n_patches
+    state.opt_patches_counted += opt_stats.n_patches
+    state.opt_hit_budget += opt_stats.hit_budget
 
     # Apply optimized parameters - update global warp AND warped_source in one pass
     with torch.no_grad():

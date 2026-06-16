@@ -30,7 +30,7 @@ from torch import Tensor
 
 from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.processing.affine import resample_to_base_grid
-from fastfuncstuff.processing.interp import warp_image_linear
+from fastfuncstuff.processing.interp import WARP_INTERP_MODES, warp_image, warp_image_linear
 from fastfuncstuff.processing.io import load_image, load_warp_field, save_image, save_warp_field
 from fastfuncstuff.processing.mask import automask
 from fastfuncstuff.processing.memory import estimate_gpu_memory_gb, print_memory_report
@@ -174,8 +174,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "Useful to skip the expensive global warp if -iniwarp provides "
                             "a good starting point [default: %(default)s]")
     g_reg.add_argument("-workhard", nargs=2, type=int, default=None, metavar=("START", "END"),
-                       help="Run extra optimization passes for levels START..END. "
-                            "E.g. -workhard 0 2 works harder on the first 3 levels")
+                       help="Double-pass optimization for levels START..END (inclusive). "
+                            "END < 0 means through the last level, so -workhard 0 -1 works "
+                            "hard on every level. E.g. -workhard 0 2 = first 3 levels")
     g_reg.add_argument("-pyramid", nargs="?", type=int, const=2, default=1, metavar="FACTOR",
                        help="Multi-octave coarse-to-fine resolution pyramid. Builds a "
                             "halving scale ladder from FACTOR down to full res "
@@ -226,6 +227,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_basis.add_argument("-nolite", action="store_true",
                          help="Use full (non-lite) basis function sets. Lite uses fewer "
                               "parameters per patch for speed; nolite uses all cross-terms")
+
+    # ── Interpolation ───────────────────────────────────────────────────
+    g_interp = p.add_argument_group(
+        "Interpolation",
+        "Image interpolation kernels. These resample the image; they are\n"
+        "independent of the warp basis above.",
+    )
+    g_interp.add_argument("-final", choices=list(WARP_INTERP_MODES), default="wsinc5",
+                          help="Interpolation for the final warped output (one pass over "
+                               "the source through the total warp). [default: wsinc5, like "
+                               "3dQwarp]. Use 'linear' for speed.")
+    g_interp.add_argument("-interp", choices=list(WARP_INTERP_MODES), default="linear",
+                          help="Interpolation used while sampling the source during "
+                               "optimization (cost evaluation). [default: linear, like "
+                               "3dQwarp]. Higher orders cost more for ~no output-quality "
+                               "gain (output sharpness is set by -final); the fused per-patch "
+                               "inner loop stays linear regardless.")
 
     # ── Displacement Constraints ────────────────────────────────────────
     g_disp = p.add_argument_group(
@@ -366,6 +384,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="Maximum optimizer iterations per checkerboard phase. "
                             "More iters = better convergence per phase but slower "
                             "[default: %(default)s]")
+    g_opt.add_argument("-batch_tol", "-batch-tol", type=float, default=1e-4, metavar="TOL",
+                       help="Per-patch relative-improvement threshold below which a patch "
+                            "counts as 'stalled'. Lower = patches keep optimizing longer "
+                            "(more warp, slower) [default: %(default)s]")
+    g_opt.add_argument("-batch_patience", "-batch-patience", type=int, default=5, metavar="N",
+                       help="Consecutive stalled steps before a patch is considered "
+                            "converged; the batch stops only once every patch has converged "
+                            "(or hits -batch_iters) [default: %(default)s]")
     g_opt.add_argument("-level_stop", type=float, default=0.0, metavar="TOL",
                        help="Early stopping: if a refinement level improves cost by less "
                             "than TOL fraction, skip all finer levels. E.g. -level_stop 0.0001 "
@@ -774,6 +800,7 @@ def _apply_warp_to_volume(
     source: Tensor, xd: Tensor, yd: Tensor, zd: Tensor,
     pad_x: int, pad_y: int, pad_z: int,
     device: torch.device,
+    interp: str = "wsinc5",
 ) -> Tensor:
     """Apply a padded-grid warp to a source volume, returning cropped result.
 
@@ -791,7 +818,7 @@ def _apply_warp_to_volume(
     xd_gpu = xd.float().to(device)
     yd_gpu = yd.float().to(device)
     zd_gpu = zd.float().to(device)
-    warped_full = warp_image_linear(source_p, xd_gpu, yd_gpu, zd_gpu)
+    warped_full = warp_image(source_p, xd_gpu, yd_gpu, zd_gpu, mode=interp)
     warped = warped_full[pad_z:pad_z+nz, pad_y:pad_y+ny, pad_x:pad_x+nx]
     result = warped.cpu()
     del source_p, xd_gpu, yd_gpu, zd_gpu, warped_full, warped
@@ -1060,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
         start_level=args.inilev,
         use_quintic=args.quintic,
         use_lite=not args.nolite,
-        workhard=tuple(args.workhard) if args.workhard else (0, -1),
+        workhard=tuple(args.workhard) if args.workhard else None,
         cost_method=(
             "lpc" if args.lpc
             else "lpa" if args.lpa
@@ -1075,6 +1102,8 @@ def main(argv: list[str] | None = None) -> int:
         verb=args.verb,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
+        batch_optimizer_tol=args.batch_tol,
+        batch_optimizer_patience=args.batch_patience,
         hfactor_q=args.hfactor_q,
         maxdisp=args.maxdisp,
         lpa_sigma=lpa_sigma_val,
@@ -1083,6 +1112,8 @@ def main(argv: list[str] | None = None) -> int:
         compile=args.compile,
         pyramid_factor=args.pyramid,
         reject_worse_levels=not args.keep_worse_levels,
+        interp=args.interp,
+        final_interp=args.final,
     )
 
     if args.blur is not None:
@@ -1457,6 +1488,7 @@ def main(argv: list[str] | None = None) -> int:
                 warped_smooth = _apply_warp_to_volume(
                     src_vol, sxd, syd, szd,
                     pad_x, pad_y, pad_z, device,
+                    interp=args.final,
                 )
                 all_warped_smooth.append(warped_smooth)
 

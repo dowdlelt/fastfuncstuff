@@ -13,10 +13,19 @@ Key fixes vs initial version:
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import NamedTuple
 
 import numpy as np
 import torch
 from torch import Tensor
+
+
+class BatchOptStats(NamedTuple):
+    """Optimizer-budget telemetry for one batched-patch optimization call."""
+
+    steps_run: int       # Adam steps actually executed (<= max_iter)
+    n_patches: int       # number of patches in the batch
+    hit_budget: int      # patches still improving when the loop hit max_iter
 
 
 def optimize_warp_params_torch(
@@ -158,7 +167,8 @@ def optimize_warp_params_batched(
     max_iter: int = 50,
     lr: float = 0.005,
     tolerance: float = 1e-4,
-) -> tuple[Tensor, Tensor]:
+    patience: int = 5,
+) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Optimize parameters for B patches simultaneously using autograd.
 
     All patches are optimized in parallel via Adam with box constraints,
@@ -172,10 +182,12 @@ def optimize_warp_params_batched(
         device: Torch device.
         max_iter: Maximum optimizer steps.
         lr: Learning rate for Adam.
-        tolerance: Early stopping tolerance.
+        tolerance: Per-patch relative-improvement threshold for "stalled".
+        patience: Consecutive stalled steps before a patch is considered
+            converged. The loop stops only once ALL patches have converged.
 
     Returns:
-        (best_params, best_costs): (B, n_params) and (B,) tensors.
+        (best_params, best_costs, stats): (B, n_params), (B,), and budget stats.
     """
     params = torch.zeros(B, n_params, device=device, dtype=torch.float32,
                          requires_grad=True)
@@ -188,16 +200,21 @@ def optimize_warp_params_batched(
     # params.detach() already prevents gradient tracking.
     best_costs = batched_cost_fn(params.detach()).detach()
     best_params = params.detach().clone()
-    prev_total = best_costs.sum().item()
+    prev_costs = best_costs.clone()
 
-    # Aggressive early stopping is what keeps fine levels cheap: each tiny
-    # patch converges in a handful of iterations, so we break once the total
-    # cost stops improving for a few consecutive steps rather than always
-    # running the full budget. (The per-iter loss.item() sync is hidden behind
-    # GPU compute at coarse levels and only fires a few times at fine levels.)
-    no_improve_count = 0
+    # Per-patch early stopping: each patch tracks its OWN no-improvement streak,
+    # and the loop only stops once EVERY patch has stalled (or the budget is
+    # hit). The old code stopped on the *summed* cost, so once the easy patches
+    # plateaued the whole batch broke -- starving the few stubborn patches that
+    # were still improving (a real under-warp source). Gradients are per-patch
+    # independent (loss is a sum of independent per-patch costs), so keeping
+    # converged patches in the loop costs nothing, and best_params tracking
+    # protects them from late drift.
+    no_improve = torch.zeros(B, dtype=torch.int32, device=device)
 
+    steps_run = 0
     for _step in range(max_iter):
+        steps_run += 1
         optimizer.zero_grad(set_to_none=True)
 
         costs = batched_cost_fn(params)  # (B,) differentiable
@@ -210,26 +227,27 @@ def optimize_warp_params_batched(
         optimizer.step()
         scheduler.step()
 
-        # Project back into box constraints
         with torch.no_grad():
+            # Project back into box constraints
             params.data.clamp_(-param_max, param_max)
 
-        current_total = loss.item()
-
-        # Per-patch best tracking (no .any() — avoids GPU→CPU sync;
-        # torch.where is a no-op when improved is all-False)
-        with torch.no_grad():
+            # Per-patch best tracking (torch.where is a no-op when all-False)
             improved = costs < best_costs
             best_costs = torch.where(improved, costs.detach(), best_costs)
             best_params = torch.where(improved.unsqueeze(1), params.detach(), best_params)
 
-        # Early stopping on total improvement
-        if abs(current_total - prev_total) < tolerance * max(abs(prev_total), 1e-6):
-            no_improve_count += 1
-            if no_improve_count >= 5:
-                break
-        else:
-            no_improve_count = 0
-        prev_total = current_total
+            # Per-patch relative improvement vs the previous step
+            rel = (prev_costs - costs).abs() / prev_costs.abs().clamp_min(1e-6)
+            stalled = rel < tolerance
+            no_improve = torch.where(stalled, no_improve + 1, torch.zeros_like(no_improve))
+            prev_costs = costs.detach().clone()
 
-    return best_params, best_costs
+            # One GPU→CPU sync per step (same cadence as the old loss.item())
+            if bool((no_improve >= patience).all()):
+                break
+
+    # Patches still improving (not yet stalled) when we ran out of budget.
+    hit_budget = (
+        int((no_improve < patience).sum().item()) if steps_run >= max_iter else 0
+    )
+    return best_params, best_costs, BatchOptStats(steps_run, B, hit_budget)

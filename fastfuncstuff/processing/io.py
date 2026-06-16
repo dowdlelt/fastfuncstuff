@@ -159,8 +159,11 @@ def save_warp_field(
     [x_displacement, y_displacement, z_displacement].
 
     When units="voxels", displacements are in voxel index units (our internal format).
-    When units="mm", displacements are converted to mm using the affine matrix
-    (for AFNI compatibility - AFNI stores warps in DICOM mm).
+    When units="mm", displacements are converted to mm using the CARDINAL
+    (deobliqued) affine, matching AFNI: all of AFNI's warp conversions go through
+    ijk_to_dicom (cardinal), so a warp constrained to one grid axis stays in one
+    component even for oblique data. The original (possibly oblique) affine is still
+    written to the file header.
 
     Args:
         xd, yd, zd: (nz, ny, nx) displacement fields in voxel units.
@@ -195,12 +198,19 @@ def save_warp_field(
     zd_np = zd.detach().cpu().numpy()
 
     if units == "mm":
-        # Convert voxel displacements to mm using the voxel-to-world rotation/scale
-        # The affine is [R*S | t; 0 0 0 1], we need R*S to convert displacement vectors
-        # disp_mm = R*S @ disp_vox (just the 3x3 rotation+scale, not the translation)
-        rs = affine[:3, :3]
-        # Apply rotation+scale to displacement vectors
-        # Shape: each is (nz, ny, nx), stack to (..., 3), matmul, unstack
+        # Convert voxel displacements to mm with the CARDINAL (deobliqued) affine,
+        # not the raw oblique one. AFNI does every warp conversion through
+        # ijk_to_dicom (the cardinal version), carrying obliquity separately rather
+        # than folding it into the displacement values (3dQwarp -help: "(xd,yd,zd)
+        # are stored in DICOM order"; ijk_to_dicom aligns grid axes to x/y/z). Using
+        # the oblique rs here would rotate a single-grid-axis warp across components
+        # and would NOT be undone on apply, which goes through compute_cardinal_affine
+        # too. For axis-aligned data cardinal == oblique, so this is a no-op there.
+        from .nwarpforge import compute_cardinal_affine
+
+        rs = compute_cardinal_affine(affine)[:3, :3]
+        # Apply scale (cardinal rs is diagonal up to axis permutation/sign) to the
+        # displacement vectors. Shape: each is (nz, ny, nx), stack to (..., 3).
         disp_vox = np.stack([xd_np, yd_np, zd_np], axis=-1)  # (nz, ny, nx, 3)
         disp_mm = np.einsum("ij,...j->...i", rs, disp_vox)  # (nz, ny, nx, 3)
         xd_np = disp_mm[..., 0]

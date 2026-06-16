@@ -13,7 +13,7 @@ CUDA is the primary target. Design every new algorithm so the hot path lives on 
 Practical rules:
 - Honour the user's `-device` flag end-to-end. Never silently force CPU mid-pipeline.
 - Write the CPU path even when slower, so users without a GPU aren't blocked.
-- Long-running loops (voxel chunks, CV folds, per-trial saves) should show a `tqdm` bar with `leave=False` and `disable=` for trivial cases — silence on tiny workloads, visible progress on real ones.
+- Long-running loops (voxel chunks, CV folds, per-trial saves) should show a `tqdm` bar with `leave=True` and `disable=` for trivial cases — silence on tiny workloads, visible progress on real ones, and a persistent final line that doubles as timing info.
 
 The companion wiki at `../fmri_wiki/` (Obsidian-compatible) is the long-form knowledge base: papers, design rationale, principles, debugging stories. **Read `../fmri_wiki/index.md` first** when a question touches methodology or "why does it do X this way".
 

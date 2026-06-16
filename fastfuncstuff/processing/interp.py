@@ -159,6 +159,46 @@ def warp_image_wsinc5(
     return wsinc5_resample_3d(source, x_coords, y_coords, z_coords)
 
 
+# Selectable warp interpolation kernels, in increasing cost order. "linear" is
+# the fast grid_sample path; the rest are AFNI's separable Lagrange / windowed-
+# sinc interpolants (see _KERNELS below).
+WARP_INTERP_MODES = ("linear", "cubic", "quintic", "heptic", "wsinc5")
+
+
+def warp_image(
+    source: Tensor,
+    warp_xd: Tensor,
+    warp_yd: Tensor,
+    warp_zd: Tensor,
+    mode: str = "linear",
+    mask: Tensor | None = None,
+) -> Tensor:
+    """Apply a displacement warp to ``source`` with a selectable interpolation kernel.
+
+    ``mode="linear"`` dispatches to :func:`warp_image_linear` (the fast estimation
+    path). Higher-order modes use the separable kernels for sharper output, as in
+    AFNI's ``-ainterp``/``-final``. Displacement convention matches
+    :func:`warp_image_linear`: output voxel (i,j,k) samples source at (i+xd,j+yd,k+zd).
+    """
+    if mode == "linear":
+        return warp_image_linear(source, warp_xd, warp_yd, warp_zd, mask=mask)
+    if mode not in _KERNELS:
+        raise ValueError(f"unknown interp mode {mode!r}; choose from {WARP_INTERP_MODES}")
+
+    out_nz, out_ny, out_nx = warp_xd.shape
+    device = source.device
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(out_nz, dtype=torch.float32, device=device),
+        torch.arange(out_ny, dtype=torch.float32, device=device),
+        torch.arange(out_nx, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    result = _separable_resample_3d(source, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)
+    if mask is not None:
+        result = result * mask.float()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Interpolation kernels
 # ---------------------------------------------------------------------------

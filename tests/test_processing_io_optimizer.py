@@ -152,13 +152,15 @@ class TestOptimizeWarpParamsBatched:
         def batched_cost(p):
             return ((p - targets) ** 2).sum(dim=1)
 
-        best_p, best_c = optimize_warp_params_batched(
+        best_p, best_c, stats = optimize_warp_params_batched(
             batched_cost, B=B, n_params=n_params,
             param_max=1.0, device=DEVICE, max_iter=100, lr=0.05,
         )
         assert best_p.shape == (B, n_params)
         assert best_c.shape == (B,)
         assert (best_c < 0.1).all()
+        assert stats.n_patches == B
+        assert 0 < stats.steps_run <= 100
 
     def test_early_stopping(self):
         """Should stop early when converged."""
@@ -167,9 +169,10 @@ class TestOptimizeWarpParamsBatched:
         def cost_fn(p):
             return (p ** 2).sum(dim=1)
 
-        best_p, best_c = optimize_warp_params_batched(
+        best_p, best_c, stats = optimize_warp_params_batched(
             cost_fn, B=B, n_params=n_params,
             param_max=1.0, device=DEVICE, max_iter=500, tolerance=1e-6,
         )
-        # Should have converged near zero
+        # Should have converged near zero, and stopped before the full budget
         assert (best_c < 0.01).all()
+        assert stats.steps_run < 500
