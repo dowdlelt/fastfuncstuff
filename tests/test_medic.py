@@ -89,6 +89,137 @@ def test_undistort_series_applies_pull_warp():
         expected = yy[:, 1:-2, :] + shifts[t]
         assert torch.allclose(interior, expected, atol=1e-3)
 
+    # Streaming refactor: routing frames through an explicit compute device must not
+    # change the result, and the output stays on the series' (host) device.
+    streamed = undistort_series(
+        series, disp, pe_nifti_axis=1, interp="linear", verbose=False, device=series.device
+    )
+    assert streamed.device == series.device
+    assert torch.equal(streamed, out)
+
+
+def test_time_chunk_frames_respects_budget():
+    """_time_chunk_frames divides the memory budget into whole frames (>= 1)."""
+    import fastfuncstuff.memory as mem
+    from fastfuncstuff.processing import medic
+
+    n_voxels = 1000
+    n_fields = 6
+    # Force a known byte budget: 10 frames' worth of 6 float32 fields.
+    budget = 10 * n_fields * n_voxels * 4
+    orig = mem.get_available_memory
+    mem.get_available_memory = lambda device, *a, **k: budget
+    try:
+        chunk = medic._time_chunk_frames(n_voxels, torch.device("cpu"), n_fields=n_fields)
+    finally:
+        mem.get_available_memory = orig
+    assert chunk == 10
+
+    # A budget too small for even one field still yields a usable single frame.
+    mem.get_available_memory = lambda device, *a, **k: 1
+    try:
+        assert medic._time_chunk_frames(n_voxels, torch.device("cpu")) == 1
+    finally:
+        mem.get_available_memory = orig
+
+
+def test_field_to_pull_warp_matches_manual_inversion():
+    """field_to_pull_warp reproduces the per-frame field->disp->invert tail (host)."""
+    from fastfuncstuff.processing.medic import field_to_pull_warp
+
+    torch.manual_seed(0)
+    nx = ny = nz = 8
+    nt = 5
+    trt, pe_dir, pe_axis = 0.03, "j-", 1
+    field = torch.randn(nx, ny, nz, nt) * 20.0  # Hz
+
+    # Reference: the exact inline math the helper replaced.
+    disp_native = field_to_displacement_pe(field, trt, pe_dir)
+    ref_pull = torch.empty_like(disp_native)
+    for t in range(nt):
+        ref_pull[..., t] = invert_displacement_pe(disp_native[..., t], pe_axis)
+    ref_undist = displacement_pe_to_field(ref_pull, trt, pe_dir)
+    a, b = ref_undist[..., 0].reshape(-1), field[..., 0].reshape(-1)
+    if torch.dot(a - a.mean(), b - b.mean()) < 0:
+        ref_undist = -ref_undist
+
+    disp_pull, field_undist = field_to_pull_warp(
+        field, trt, pe_dir, pe_axis, torch.device("cpu"), verbose=False
+    )
+    assert disp_pull.device.type == "cpu" and field_undist.device.type == "cpu"
+    assert torch.allclose(disp_pull, ref_pull, atol=1e-5)
+    assert torch.allclose(field_undist, ref_undist, atol=1e-5)
+    # Sign check guarantees a non-negative frame-0 correlation with the native field.
+    a, b = field_undist[..., 0].reshape(-1), field[..., 0].reshape(-1)
+    assert torch.dot(a - a.mean(), b - b.mean()) >= 0
+
+
+def test_detrend_time_removes_mean_and_linear():
+    """detrend_time annihilates per-voxel const+linear and is orthogonal to them."""
+    from fastfuncstuff.processing.medic import detrend_time
+
+    nx = ny = nz = 4
+    nt = 40
+    t = torch.arange(nt, dtype=torch.float32)
+    osc = torch.sin(2 * torch.pi * t / 10.0)
+    field = torch.zeros(nx, ny, nz, nt)
+    for ix in range(nx):
+        field[ix] = (5.0 + ix) + 0.3 * ix * t + osc  # per-voxel offset + slope + shared osc
+
+    out = detrend_time(field, order=1)
+    # Result is orthogonal to the removed basis: zero mean and zero linear trend.
+    assert out.mean(dim=-1).abs().max() < 1e-3
+    tc = t - t.mean()
+    assert (out * tc).sum(dim=-1).abs().max() < 1e-2
+
+    # Detrend is a linear projection, so the exactly-in-span const+linear vanish and
+    # only the (shared) oscillation's residual remains — independent of voxel offset/slope.
+    osc_field = osc.view(1, 1, 1, nt).expand(nx, ny, nz, nt)
+    assert torch.allclose(out, detrend_time(osc_field, order=1), atol=1e-4)
+
+    # A pure const+linear field detrends to ~0.
+    poly = torch.zeros(nx, ny, nz, nt)
+    for ix in range(nx):
+        poly[ix] = (2.0 + ix) - 0.5 * ix * t
+    assert detrend_time(poly, order=1).abs().max() < 1e-2
+
+    # order < 0 is a no-op: the raw field map (mean + trend) is returned unchanged.
+    assert torch.equal(detrend_time(field, order=-1), field)
+
+
+def test_undistort_series_extra_axis_shifts_slice():
+    """extra_disp on the k axis shifts along z, jointly with the PE-axis warp."""
+    nx = ny = nz = 12
+    nt = 2
+    # ramp along k (z): series[x,y,z,t] = z; and along j for the PE warp: + y
+    zz = torch.arange(nz, dtype=torch.float32).view(1, 1, nz).expand(nx, ny, nz)
+    yy = torch.arange(ny, dtype=torch.float32).view(1, ny, 1).expand(nx, ny, nz)
+    series = (yy + zz).unsqueeze(-1).repeat(1, 1, 1, nt).contiguous()
+    pe_disp = torch.full((nx, ny, nz, nt), 1.0)  # +1 along j
+    z_disp = torch.full((nx, ny, nz, nt), 2.0)  # +2 along k
+    out = undistort_series(
+        series,
+        pe_disp,
+        pe_nifti_axis=1,
+        interp="linear",
+        verbose=False,
+        extra_disp=z_disp,
+        extra_nifti_axis=2,
+    )
+    interior = out[:, 1:-2, 1:-2, 0]
+    expected = (yy + zz)[:, 1:-2, 1:-2] + 1.0 + 2.0
+    assert torch.allclose(interior, expected, atol=1e-3)
+
+
+def test_undistort_series_extra_axis_requires_pair():
+    series = torch.zeros(4, 4, 4, 1)
+    disp = torch.zeros(4, 4, 4, 1)
+    try:
+        undistort_series(series, disp, 1, extra_disp=disp, verbose=False)
+        raise AssertionError("expected ValueError for missing extra_nifti_axis")
+    except ValueError:
+        pass
+
 
 def test_undistort_series_circular_phase():
     """Circular mode undistorts wrapped phase without smearing across wraps."""

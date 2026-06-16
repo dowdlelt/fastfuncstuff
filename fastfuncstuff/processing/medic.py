@@ -22,7 +22,9 @@ Design notes live in the wiki: ``concepts/MEDIC.md``.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -98,15 +100,63 @@ def warpkit_field_native(
     ]
     if verbose:
         print(f"  warpkit: in-process C++ ROMEO unwrap + field map ({ne} echoes, {nt} frames)")
-    field_img = unwrap_and_compute_field_maps(
-        phase_imgs,
-        mag_imgs,
-        np.asarray(tes, dtype=np.float32),
-        svd_filt=svd_filt,
-        border_filt=border_filt,
-        n_cpus=n_cpus,
-    )
+    t0 = time.perf_counter()
+    with _warpkit_progress(nt, enabled=verbose and nt > 1):
+        field_img = unwrap_and_compute_field_maps(
+            phase_imgs,
+            mag_imgs,
+            np.asarray(tes, dtype=np.float32),
+            svd_filt=svd_filt,
+            border_filt=border_filt,
+            n_cpus=n_cpus,
+        )
+    if verbose:
+        dt = time.perf_counter() - t0
+        print(f"  warpkit: done in {dt:.1f}s ({dt / nt:.2f}s/frame)")
     return np.asarray(field_img.dataobj, dtype=np.float32)  # (nx, ny, nz, T)
+
+
+# warpkit's per-frame stages (unwrap, temporal-consistency, field map) are each
+# dispatched through ``warpkit.unwrap.run_executor``, which invokes ``post_fn``
+# once per completed frame.  We have no other window into the compiled C++
+# pipeline, so we temporarily wrap that symbol to drive a tqdm bar per stage.
+_WARPKIT_STAGE_DESC = {
+    "unwrap_phase": "ROMEO unwrap",
+    "check_temporal_consistency_corr": "temporal consistency",
+    "compute_field_map": "field map",
+}
+
+
+@contextmanager
+def _warpkit_progress(n_frames: int, *, enabled: bool):
+    """Patch ``warpkit.unwrap.run_executor`` to show a per-stage frame bar."""
+    import warpkit.unwrap as _wku
+
+    if not enabled:
+        yield
+        return
+
+    orig = _wku.run_executor
+
+    def run_executor_with_bar(ncpus, type, fn, iterator, initializer=None, post_fn=None):
+        desc = _WARPKIT_STAGE_DESC.get(getattr(fn, "__name__", ""), "warpkit")
+        bar = tqdm(total=n_frames, desc=f"    {desc}", unit="frame", leave=True)
+
+        def wrapped_post(idx, result):
+            if post_fn is not None:
+                post_fn(idx, result)
+            bar.update(1)
+
+        try:
+            orig(ncpus, type, fn, iterator, initializer=initializer, post_fn=wrapped_post)
+        finally:
+            bar.close()
+
+    _wku.run_executor = run_executor_with_bar
+    try:
+        yield
+    finally:
+        _wku.run_executor = orig
 
 
 def compute_frame_masks(
@@ -207,13 +257,88 @@ def invert_displacement_pe(disp: Tensor, pe_tensor_axis: int, iters: int = 50) -
 # ----------------------------------------------------------------------------
 @dataclass
 class MedicResult:
-    """End-to-end MEDIC output (all torch tensors, (nx, ny, nz, T) NIfTI layout)."""
+    """End-to-end MEDIC output (all torch tensors, (nx, ny, nz, T) NIfTI layout).
+
+    The per-frame fields are full-resolution 4D and live on the **host**: a single
+    ``(nx, ny, nz, T)`` float32 volume is multiple GiB at typical grids, so several
+    of them cannot co-reside on a consumer GPU. The GPU only ever holds a time-chunk
+    (see :func:`medic_fieldmaps`); apply (:func:`undistort_series`) streams frames.
+    """
 
     field_native: Tensor  # Hz, distorted space (from warpkit)
     displacement_pe: Tensor  # voxels along PE, undistorted-space pull warp
     field_undistorted: Tensor  # Hz, undistorted space
     masks: Tensor  # int8 0/1/2
     pe_tensor_axis: int
+
+
+def _time_chunk_frames(n_voxels: int, device: torch.device, n_fields: int = 6) -> int:
+    """Frames per GPU chunk so ~``n_fields`` full-volume float32 fields fit the budget.
+
+    The field-map -> displacement -> 1-D inversion math is per-frame independent, so we
+    stream time-chunks: only ``chunk`` frames of each ``(nx, ny, nz, T)`` field are
+    GPU-resident at once. ``n_fields`` covers the simultaneously-live volumes
+    (native / disp / pull / undistorted + the inversion's working tensors). The byte
+    budget comes from the [[Memory module]] (``get_available_memory`` applies the GPU
+    safety factor); CPU returns a large budget so the whole series is one chunk there.
+    """
+    from ..memory import get_available_memory
+
+    budget = get_available_memory(device)
+    per_frame = max(1, n_fields * n_voxels * 4)  # float32
+    return max(1, int(budget // per_frame))
+
+
+def field_to_pull_warp(
+    field_native: Tensor,
+    total_readout_time: float,
+    pe_dir: str,
+    pe_axis: int,
+    device: torch.device,
+    verbose: bool = True,
+) -> tuple[Tensor, Tensor]:
+    """Native field map (Hz) -> (PE pull warp, undistorted field map), host tensors.
+
+    The cheap deterministic tail of MEDIC: field -> PE displacement -> 1-D inversion
+    (the undistorted-space pull) -> undistorted-space field map. It is fully derived
+    from ``field_native``, so a cached field map can be turned back into the warp
+    without re-running warpkit. Streamed in time-chunks (:func:`_time_chunk_frames`)
+    so only a chunk of frames is ever GPU-resident; inputs and outputs live on the host.
+
+    Returns ``(disp_pull, field_undist)``, both ``(nx, ny, nz, T)`` on the host.
+    """
+    nx, ny, nz, nt = field_native.shape
+    disp_pull = torch.empty_like(field_native)  # host
+    field_undist = torch.empty_like(field_native)  # host
+    chunk = min(nt, _time_chunk_frames(nx * ny * nz, device))
+    inv_it = tqdm(
+        range(0, nt, chunk),
+        desc="invert displacement",
+        disable=not verbose or nt == 1,
+        leave=True,
+    )
+    for t0 in inv_it:
+        t1 = min(t0 + chunk, nt)
+        disp_c = field_to_displacement_pe(
+            field_native[..., t0:t1].to(device), total_readout_time, pe_dir
+        )
+        pull_c = torch.empty_like(disp_c)
+        for k in range(t1 - t0):
+            pull_c[..., k] = invert_displacement_pe(disp_c[..., k], pe_axis)
+        field_undist[..., t0:t1] = displacement_pe_to_field(
+            pull_c, total_readout_time, pe_dir
+        ).cpu()
+        disp_pull[..., t0:t1] = pull_c.cpu()
+        del disp_c, pull_c
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Sign check (frame 0): undistorted field should correlate with the native one.
+    a = field_undist[..., 0].reshape(-1)
+    b = field_native[..., 0].reshape(-1)
+    if torch.dot(a - a.mean(), b - b.mean()) < 0:
+        field_undist = -field_undist
+    return disp_pull, field_undist
 
 
 def medic_fieldmaps(
@@ -253,7 +378,6 @@ def medic_fieldmaps(
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tes_np = np.asarray(tes, dtype=np.float32)
-    _nx, _ny, _nz, _ne, nt = phase.shape
     pe_axis = PE_AXIS_MAP[pe_dir]
 
     _dbg = None
@@ -271,7 +395,8 @@ def medic_fieldmaps(
                 affine=affine,
             )
 
-    # 1. estimation: warpkit native field map (Hz, distorted space).
+    # 1. estimation: warpkit native field map (Hz, distorted space). The per-frame
+    #    fields stay on the host; the GPU only ever sees a time-chunk (step 2).
     field_native_np = warpkit_field_native(
         phase,
         mag,
@@ -282,32 +407,26 @@ def medic_fieldmaps(
         border_filt=border_filt,
         verbose=verbose,
     )
-    field_native = torch.nan_to_num(
-        torch.from_numpy(np.ascontiguousarray(field_native_np)).to(device)
-    )
+    field_native = torch.nan_to_num(torch.from_numpy(np.ascontiguousarray(field_native_np)))
     masks_t = torch.from_numpy(
         compute_frame_masks(mag, tes_np, automask_dilation, device=device, verbose=verbose)
-    ).to(device)
+    )
     if _dbg is not None:
         _dbg("fieldmap_native", field_native_np)
-        _dbg("mask", masks_t.cpu().numpy())
+        _dbg("mask", masks_t.numpy())
 
-    # 2. our warp: field -> PE displacement (voxels, distorted) -> invert (pull).
-    disp_native = field_to_displacement_pe(field_native, total_readout_time, pe_dir)
-    disp_pull = torch.empty_like(disp_native)
-    inv_it = tqdm(range(nt), desc="invert displacement", disable=not verbose or nt == 1)
-    for t in inv_it:
-        disp_pull[..., t] = invert_displacement_pe(disp_native[..., t], pe_axis)
+    # 2. our warp: field -> PE displacement -> invert (pull) -> undistorted field,
+    #    chunked over time on ``device`` with host-resident results (see helper).
+    disp_pull, field_undist = field_to_pull_warp(
+        field_native, total_readout_time, pe_dir, pe_axis, device, verbose=verbose
+    )
     if _dbg is not None:
-        _dbg("disp_pull_vox", disp_pull.cpu().numpy())
-        _dbg("disp_native_vox", disp_native.cpu().numpy())
-
-    # 3. undistorted-space field map (sign check + deliverable).
-    field_undist = displacement_pe_to_field(disp_pull, total_readout_time, pe_dir)
-    a = field_undist[..., 0].reshape(-1)
-    b = field_native[..., 0].reshape(-1)
-    if torch.dot(a - a.mean(), b - b.mean()) < 0:
-        field_undist = -field_undist
+        _dbg("disp_pull_vox", disp_pull.numpy())
+        # disp_native is just field x readout (elementwise); recompute on host for QC.
+        _dbg(
+            "disp_native_vox",
+            field_to_displacement_pe(field_native, total_readout_time, pe_dir).numpy(),
+        )
 
     return MedicResult(
         field_native=field_native,
@@ -376,6 +495,31 @@ def save_medic_warp(
     return os.path.join(warp_dir, f"warp_*{nii_ext}")
 
 
+def detrend_time(field: Tensor, order: int = 1) -> Tensor:
+    """Remove the per-voxel mean + polynomial trend along time (Legendre basis).
+
+    For a per-frame field map ``(nx, ny, nz, T)``, regress each voxel's time series
+    on Legendre polynomials up to ``order`` (0 = demean, 1 = demean + linear detrend)
+    and return the residual — the oscillation about the slow trend. Reuses
+    :func:`glm.core.construct_polynomial_matrix` (orthogonal Legendre, AFNI-style)
+    so the drift model matches the rest of the codebase.
+
+    ``order < 0`` is a no-op: the raw field map is returned unchanged (use this to
+    drive the slice shift off the original field map, mean and trend included).
+    """
+    if order < 0:
+        return field.clone()
+
+    from ..glm.core import construct_polynomial_matrix
+
+    nx, ny, nz, nt = field.shape
+    p = construct_polynomial_matrix(nt, order, field.device, field.dtype)  # (T, order+1)
+    y = field.reshape(-1, nt).t()  # (T, V)
+    betas = torch.linalg.lstsq(p, y).solution
+    resid = y - p @ betas
+    return resid.t().reshape(nx, ny, nz, nt)
+
+
 def undistort_series(
     series: Tensor,
     disp_pull: Tensor,
@@ -384,6 +528,9 @@ def undistort_series(
     circular: bool = False,
     verbose: bool = True,
     desc: str = "undistort",
+    extra_disp: Tensor | None = None,
+    extra_nifti_axis: int | None = None,
+    device: torch.device | None = None,
 ) -> Tensor:
     """Apply the per-frame undistortion pull warp to a 4D series, in native space.
 
@@ -392,6 +539,12 @@ def undistort_series(
     change. Distortion correction is intrinsically a native-space operation;
     motion / coregistration / atlas come afterward as affines (compose those with
     ffs_nwarp -master).
+
+    ``series``, ``disp_pull`` and the output stay on whatever device they arrive on
+    (the host, for a multi-GiB series): each frame is the natural work unit, so the
+    warp is done one frame at a time on ``device`` (default: ``series``'s own device)
+    and copied back. This streaming is what keeps a giant series off the GPU — only a
+    single frame's tensors are device-resident at once.
 
     Parameters
     ----------
@@ -407,6 +560,15 @@ def undistort_series(
     circular : bool
         Treat ``series`` as wrapped phase in radians: warp cos/sin and atan2 back
         so wraps don't smear. Use for phase; leave False for magnitude.
+    extra_disp : Tensor or None
+        Optional second per-frame displacement (nx, ny, nz, T) on ``extra_nifti_axis``,
+        applied in the *same* resample as ``disp_pull`` so there is no double
+        interpolation. Used by the 3D-EPI slice-direction debug (``-debug_3d``).
+    extra_nifti_axis : int or None
+        Axis for ``extra_disp`` (0=i, 1=j, 2=k).
+    device : torch.device or None
+        Compute device for the per-frame warp. Default: ``series``'s own device.
+        Pass a GPU here with a host-resident ``series`` to stream frame-by-frame.
 
     Returns
     -------
@@ -415,23 +577,29 @@ def undistort_series(
     """
     from .interp import warp_image_linear, warp_image_wsinc5
 
+    if (extra_disp is None) != (extra_nifti_axis is None):
+        raise ValueError("extra_disp and extra_nifti_axis must be given together")
+
     wfun = warp_image_wsinc5 if interp == "wsinc5" else warp_image_linear
+    cdev = device if device is not None else series.device
     nt = series.shape[-1]
-    out = torch.empty_like(series)
-    it = tqdm(range(nt), desc=desc, disable=not verbose or nt == 1, leave=False)
+    out = torch.empty_like(series)  # follows series' device (host for a big series)
+    it = tqdm(range(nt), desc=desc, disable=not verbose or nt == 1, leave=True)
     for t in it:
-        # (nx,ny,nz) NIfTI order -> (nz,ny,nx) for the warp kernels.
-        d = disp_pull[..., t].permute(2, 1, 0).contiguous()
+        # (nx,ny,nz) NIfTI order -> (nz,ny,nx) for the warp kernels; stream to cdev.
+        d = disp_pull[..., t].permute(2, 1, 0).contiguous().to(cdev)
         zero = torch.zeros_like(d)
         comps = [zero, zero, zero]
         comps[pe_nifti_axis] = d  # xd/yd/zd indexed by i/j/k
+        if extra_disp is not None and extra_nifti_axis is not None:
+            ed = extra_disp[..., t].permute(2, 1, 0).contiguous().to(cdev)
+            comps[extra_nifti_axis] = comps[extra_nifti_axis] + ed
+        vol = series[..., t].permute(2, 1, 0).contiguous().to(cdev)
         if circular:
-            vol = series[..., t].permute(2, 1, 0).contiguous()
             cos_w = wfun(torch.cos(vol), comps[0], comps[1], comps[2])
             sin_w = wfun(torch.sin(vol), comps[0], comps[1], comps[2])
-            out[..., t] = torch.atan2(sin_w, cos_w).permute(2, 1, 0)
+            out[..., t] = torch.atan2(sin_w, cos_w).permute(2, 1, 0).to(out.device)
         else:
-            vol = series[..., t].permute(2, 1, 0).contiguous()
             warped = wfun(vol, comps[0], comps[1], comps[2])
-            out[..., t] = warped.permute(2, 1, 0)
+            out[..., t] = warped.permute(2, 1, 0).to(out.device)
     return out

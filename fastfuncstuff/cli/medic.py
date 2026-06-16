@@ -208,6 +208,14 @@ def create_parser() -> argparse.ArgumentParser:
 
     out = parser.add_argument_group("Output Options")
     out.add_argument(
+        "-recompute",
+        dest="recompute",
+        action="store_true",
+        help="Force a fresh warpkit estimate even if {prefix}_fieldmap already exists. "
+        "By default a re-run reuses the cached field map (the slow part) and only "
+        "re-derives the cheap pull warp, so adding an output later is near-instant.",
+    )
+    out.add_argument(
         "-debug",
         action="store_true",
         help="Write sanity-check intermediates to {prefix}_debug/: warpkit native "
@@ -220,6 +228,107 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Verbosity (0 = quiet).",
+    )
+
+    d3 = parser.add_argument_group(
+        "3D-EPI slice-direction debug (experimental; for finding residual k-shift)"
+    )
+    d3.add_argument(
+        "-debug_3d",
+        "-debug-3d",
+        dest="debug_3d",
+        action="store_true",
+        help="Add an experimental slice-direction (k) displacement to the later "
+        "echoes, proportional to the demeaned+detrended per-frame field map and "
+        "growing linearly with echo index (0 at echo 1, max at the last echo). "
+        "Writes {prefix}_e{N}_3ddebug_{pos,neg} for both signs so you can see which "
+        "direction cancels the residual up/down motion, plus {prefix}_fieldmap_detrend.",
+    )
+    d3.add_argument(
+        "-3d_debug_shift",
+        "-3d-debug-shift",
+        dest="debug3d_shift",
+        type=float,
+        default=1.0,
+        help="Slice-shift scale in voxels per Hz of detrended field at the LAST echo "
+        "(default 1.0: a 3 Hz deflection -> 3 voxel shift at the last echo). Earlier "
+        "echoes scale down linearly to 0 at echo 1.",
+    )
+    d3.add_argument(
+        "-3d_debug_detrend",
+        "-3d-debug-detrend",
+        dest="debug3d_detrend",
+        type=int,
+        default=1,
+        help="Polynomial order for detrending the field-map time series before "
+        "deriving the shift (0 = demean only, 1 = demean + linear; default 1). "
+        "Use -1 to skip detrending and drive the shift off the RAW field map "
+        "(mean + trend included).",
+    )
+    d3.add_argument(
+        "-debug_3d_echo",
+        "-debug-3d-echo",
+        dest="debug3d_echo",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Only warp echo N (1-based) — usually the last echo, where the residual "
+        "is largest. Skips the other echoes for an ~n_echoes-fold speedup while tuning.",
+    )
+    d3.add_argument(
+        "-3d_debug_subtract_first",
+        "-3d-debug-subtract-first",
+        dest="debug3d_subtract_first",
+        action="store_true",
+        help="Subtract the first field-map volume (after any -3d_debug_detrend) before "
+        "deriving the shift, so frame 1 gets no k-shift and later frames shift relative "
+        "to it. Pair with -3d_debug_detrend -1 to reference the raw field map to frame 1.",
+    )
+    d3.add_argument(
+        "-3d_debug_multiply",
+        "-3d-debug-multiply",
+        dest="debug3d_multiply",
+        action="store_true",
+        help="Multiply the (detrended) per-frame field by the per-voxel temporal MEAN of "
+        "the field (computed before detrending), so the shift is largest where a big "
+        "static field and a big oscillation coincide. Note: this is Hz x Hz, so the "
+        "effective magnitude jumps — expect to need a much smaller -3d_debug_shift.",
+    )
+    d3.add_argument(
+        "-3d_debug_proportion",
+        "-3d-debug-proportion",
+        dest="debug3d_proportion",
+        action="store_true",
+        help="Divide the (detrended) per-frame field by the per-voxel temporal MEAN of "
+        "the field (proportion / fractional change). The opposite of -3d_debug_multiply "
+        "(can't combine the two); voxels with ~0 mean field are set to 0.",
+    )
+    d3.add_argument(
+        "-3d_debug_invert",
+        "-3d-debug-invert",
+        dest="debug3d_invert",
+        action="store_true",
+        help="Invert the k displacement with the same per-frame fixed-point used by the "
+        "real PE undistortion (invert_displacement_pe), instead of applying scale*field "
+        "directly as the pull. Correct for large/spatially-varying shifts (the direct "
+        "mode pulls from the wrong location there); note it ~negates the effective sign.",
+    )
+    d3.add_argument(
+        "-3d_debug_sign",
+        "-3d-debug-sign",
+        dest="debug3d_sign",
+        choices=["neg", "pos", "both"],
+        default="neg",
+        help="Which sign(s) of the slice shift to write. The residual was found to be "
+        "negative, so the default 'neg' writes only that (2x faster); 'both' writes "
+        "pos+neg, 'pos' only positive.",
+    )
+    d3.add_argument(
+        "-3d_debug_recompute",
+        "-3d-debug-recompute",
+        dest="recompute",
+        action="store_true",
+        help="Deprecated alias for -recompute (forces a fresh warpkit estimate).",
     )
     return parser
 
@@ -238,6 +347,28 @@ def _read_metadata(paths: list[str]) -> tuple[list[float], float, str]:
             pe = str(m["PhaseEncodingDirection"])
     assert trt is not None and pe is not None
     return tes_ms, trt, pe
+
+
+def _load_cached_volume(path: str, expected_shape: tuple[int, ...], device):
+    """Load a cached 4D NIfTI as a torch tensor if it exists and matches shape.
+
+    Used only by -debug_3d to skip re-running the (slow) warpkit field-map estimate
+    and the displacement inversion when iterating on shift/sign/detrend. Returns None
+    if the file is missing or its shape disagrees with the current frame selection.
+    """
+    import os
+    from typing import cast
+
+    import nibabel as nib
+    import torch
+
+    if not os.path.exists(path):
+        return None
+    img = cast(nib.Nifti1Image, nib.load(path))
+    arr = np.asarray(img.dataobj, dtype=np.float32)
+    if arr.shape != tuple(expected_shape):
+        return None
+    return torch.from_numpy(np.ascontiguousarray(arr)).to(device)
 
 
 def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
@@ -278,6 +409,10 @@ def main(argv: list[str] | None = None) -> int:
         from fastfuncstuff.io.afni import save_nifti
         from fastfuncstuff.processing.medic import (
             PE_AXIS_MAP,
+            detrend_time,
+            displacement_pe_to_field,
+            field_to_pull_warp,
+            invert_displacement_pe,
             medic_fieldmaps,
             rescale_phase_to_radians,
             save_medic_warp,
@@ -383,49 +518,209 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {ne} echoes, {nt} frames, grid {nx}x{ny}x{nz}")
         print(f"  TEs: {tes} ms   readout: {total_readout_time}s   PE: {pe_dir}\n")
 
-    result = medic_fieldmaps(
-        phase=phase,
-        mag=mag,
-        tes=tes,
-        affine=affine,
-        total_readout_time=total_readout_time,
-        pe_dir=pe_dir,
-        svd_filt=args.svd_filt,
-        n_cpus=args.n_cpus,
-        device=device,
-        debug_dir=f"{prefix_stem}_debug" if args.debug else None,
-        verbose=args.verb >= 1,
-    )
-
-    pe_axis = result.pe_tensor_axis
-    disp_pull = result.displacement_pe  # (nx,ny,nz,T) torch, on device
-
-    if args.verb >= 1:
-        print("\nApplying undistortion (native space, GPU)...")
-
-    # Undistort each magnitude echo with the per-frame warp (feeds ffs_moco).
-    undist_paths = []
-    for e in range(ne):
-        series = torch.from_numpy(np.ascontiguousarray(mag[:, :, :, e, :])).to(device)
-        undist = undistort_series(
-            series,
-            disp_pull,
-            pe_axis,
-            interp=args.interp,
-            verbose=args.verb >= 1,
-            desc=f"undistort mag e{e + 1}",
+    pe_axis = PE_AXIS_MAP[pe_dir]
+    Z_AXIS = 2  # slice / partition-encode (k) — the residual axis for -debug_3d
+    if args.debug_3d and pe_axis == Z_AXIS:
+        print(
+            "ERROR: -debug_3d targets the slice (k) direction, but the phase-encode "
+            f"direction is also k ({pe_dir}); the residual would collide with the "
+            "primary correction. -debug_3d is for in-plane PE (i/j) acquisitions.",
+            file=sys.stderr,
         )
-        out_path = f"{prefix_stem}_e{e + 1}_undist{nii_ext}"
-        save_nifti(undist.cpu().numpy(), out_path, affine=affine)
-        undist_paths.append(out_path)
+        return 1
+    if args.debug3d_echo is not None and not (1 <= args.debug3d_echo <= ne):
+        print(f"ERROR: -debug_3d_echo {args.debug3d_echo} out of range 1..{ne}.", file=sys.stderr)
+        return 1
+    if args.debug3d_multiply and args.debug3d_proportion:
+        print(
+            "ERROR: -3d_debug_multiply and -3d_debug_proportion are opposites; pick one.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Field map (Hz, native) + per-frame pull warp. warpkit estimation is the slow
+    # part and depends only on the inputs, so any re-run (e.g. to add an output, or to
+    # iterate on -debug_3d knobs) reuses the cached {prefix}_fieldmap and re-derives the
+    # cheap pull warp. -recompute forces a fresh estimate. Fields stay host-resident.
+    field_cache = f"{prefix_stem}_fieldmap{nii_ext}"
+    disp_cache = f"{prefix_stem}_disp_pull_vox{nii_ext}"
+    expected = (nx, ny, nz, nt)
+    host = torch.device("cpu")
+    result = None
+    field_native = None
+    disp_pull = None
+    field_undist = None
+    if not args.recompute:
+        field_native = _load_cached_volume(field_cache, expected, host)
+        if field_native is not None:
+            disp_pull = _load_cached_volume(disp_cache, expected, host)
+            if disp_pull is None:
+                # Field map cached but not the pull warp — redo just the cheap tail.
+                disp_pull, field_undist = field_to_pull_warp(
+                    field_native, total_readout_time, pe_dir, pe_axis, device, args.verb >= 1
+                )
+            if args.verb >= 1:
+                print(f"\nReusing cached field map: {field_cache} (skipping warpkit).")
+                print("  (pass -recompute to force a fresh estimate.)")
+
+    if field_native is None or disp_pull is None:
+        result = medic_fieldmaps(
+            phase=phase,
+            mag=mag,
+            tes=tes,
+            affine=affine,
+            total_readout_time=total_readout_time,
+            pe_dir=pe_dir,
+            svd_filt=args.svd_filt,
+            n_cpus=args.n_cpus,
+            device=device,
+            debug_dir=f"{prefix_stem}_debug" if args.debug else None,
+            verbose=args.verb >= 1,
+        )
+        field_native = result.field_native
+        disp_pull = result.displacement_pe  # (nx,ny,nz,T) torch, host
+        field_undist = result.field_undistorted
+        # Cache the pull warp so any later re-run is instant; the field map cache is
+        # written below (the "field map (Hz, native) QC" output).
+        save_nifti(disp_pull.cpu().numpy(), disp_cache, affine=affine)
+
+    # In -debug_3d mode the standard per-echo undistortion is redundant with the
+    # 3ddebug outputs, and the whole point is to iterate fast, so skip it.
+    undist_paths: list[str] = []
+    if not args.debug_3d:
         if args.verb >= 1:
-            print(f"  undistorted magnitude echo {e + 1}: {out_path}")
+            print("\nApplying undistortion (native space, GPU)...")
+        # Undistort each magnitude echo with the per-frame warp (feeds ffs_moco).
+        for e in range(ne):
+            # Keep the echo on the host; undistort_series streams frames to the GPU.
+            series = torch.from_numpy(np.ascontiguousarray(mag[:, :, :, e, :]))
+            undist = undistort_series(
+                series,
+                disp_pull,
+                pe_axis,
+                interp=args.interp,
+                verbose=args.verb >= 1,
+                desc=f"undistort mag e{e + 1}",
+                device=device,
+            )
+            out_path = f"{prefix_stem}_e{e + 1}_undist{nii_ext}"
+            save_nifti(undist.cpu().numpy(), out_path, affine=affine)
+            undist_paths.append(out_path)
+            if args.verb >= 1:
+                print(f"  undistorted magnitude echo {e + 1}: {out_path}")
+
+    # 3D-EPI slice-direction debug: experimental residual k-shift on later echoes.
+    if args.debug_3d:
+        raw_field = args.debug3d_detrend < 0
+        # Per-voxel temporal mean of the field BEFORE detrending (the static component).
+        mean_field = field_native.mean(dim=-1, keepdim=True)
+        field_dt = detrend_time(field_native, args.debug3d_detrend)
+        if args.debug3d_subtract_first:
+            # Reference to frame 1: its field becomes 0 (no shift), others relative to it.
+            field_dt = field_dt - field_dt[..., :1]
+        if args.debug3d_multiply:
+            # Scale by the static field so the shift is largest where a big static field
+            # and a big oscillation coincide (Hz x Hz — expect a smaller -3d_debug_shift).
+            field_dt = field_dt * mean_field
+        elif args.debug3d_proportion:
+            # Fractional change: detrended field / static field. Near-zero mean (e.g.
+            # background) would blow up, so those voxels are zeroed.
+            near0 = mean_field.abs() < 1e-6
+            denom = torch.where(near0, torch.ones_like(mean_field), mean_field)
+            field_dt = torch.where(
+                near0.expand_as(field_dt), torch.zeros_like(field_dt), field_dt / denom
+            )
+        # The field that is multiplied through. Write it unless it is the untouched raw
+        # field map (already on disk as the {prefix}_fieldmap cache).
+        processed = (
+            (not raw_field)
+            or args.debug3d_subtract_first
+            or args.debug3d_multiply
+            or args.debug3d_proportion
+        )
+        dt_path = f"{prefix_stem}_fieldmap_detrend{nii_ext}"
+        if processed:
+            save_nifti(field_dt.cpu().numpy(), dt_path, affine=affine)
+        echo_list = range(ne) if args.debug3d_echo is None else [args.debug3d_echo - 1]
+        signs = {
+            "neg": [(-1.0, "neg")],
+            "pos": [(1.0, "pos")],
+            "both": [(1.0, "pos"), (-1.0, "neg")],
+        }
+        sign_list = signs[args.debug3d_sign]
+        if args.verb >= 1:
+            src = (
+                "RAW field map"
+                if raw_field
+                else f"detrended field map (polort {args.debug3d_detrend})"
+            )
+            if args.debug3d_subtract_first:
+                src += " minus first volume"
+            if args.debug3d_multiply:
+                src += " x mean field"
+            if args.debug3d_proportion:
+                src += " / mean field"
+            src += f": {dt_path}" if processed else " (no detrend)"
+            print(f"\n3D debug: {src}")
+            mode = "inverted pull (fixed-point)" if args.debug3d_invert else "direct pull"
+            print(
+                f"  slice(k) shift = sign * {args.debug3d_shift} vox/Hz * "
+                f"(echo_idx / (ne-1)) * field; sign(s): {args.debug3d_sign}; {mode}."
+            )
+            if args.debug3d_echo is not None:
+                print(f"  restricting to echo {args.debug3d_echo} (-debug_3d_echo).")
+
+        for e in echo_list:
+            series = torch.from_numpy(np.ascontiguousarray(mag[:, :, :, e, :]))
+            frac = e / (ne - 1) if ne > 1 else 0.0
+            if frac == 0.0:
+                # Echo 1 (and any single-echo case): no slice shift -> one reference file.
+                undist = undistort_series(
+                    series,
+                    disp_pull,
+                    pe_axis,
+                    interp=args.interp,
+                    verbose=args.verb >= 1,
+                    desc=f"3ddebug e{e + 1}",
+                    device=device,
+                )
+                out_path = f"{prefix_stem}_e{e + 1}_3ddebug{nii_ext}"
+                save_nifti(undist.cpu().numpy(), out_path, affine=affine)
+                if args.verb >= 1:
+                    print(f"  3ddebug echo {e + 1} (no shift): {out_path}")
+                continue
+            for sign, tag in sign_list:
+                # Forward k displacement (voxels) we believe the data underwent.
+                z_disp = (sign * args.debug3d_shift * frac) * field_dt
+                if args.debug3d_invert:
+                    # Invert to the undistorted-space pull, per frame — the same
+                    # fixed-point the real PE undistortion uses. Required when the
+                    # shift is large/varying, else the pull samples the wrong voxel.
+                    z_pull = torch.empty_like(z_disp)
+                    for t in range(z_disp.shape[-1]):
+                        z_pull[..., t] = invert_displacement_pe(z_disp[..., t], Z_AXIS)
+                    z_disp = z_pull
+                undist = undistort_series(
+                    series,
+                    disp_pull,
+                    pe_axis,
+                    interp=args.interp,
+                    verbose=args.verb >= 1,
+                    desc=f"3ddebug e{e + 1} {tag}",
+                    extra_disp=z_disp,
+                    extra_nifti_axis=Z_AXIS,
+                    device=device,
+                )
+                out_path = f"{prefix_stem}_e{e + 1}_3ddebug_{tag}{nii_ext}"
+                save_nifti(undist.cpu().numpy(), out_path, affine=affine)
+                if args.verb >= 1:
+                    print(f"  3ddebug echo {e + 1} {tag} (frac {frac:.2f}): {out_path}")
 
     if args.apply_phase:
         ph_lo, ph_hi = float(phase.min()), float(phase.max())
         for e in range(ne):
             ph_rad = rescale_phase_to_radians(phase[:, :, :, e, :].astype(np.float32), ph_lo, ph_hi)
-            series = torch.from_numpy(np.ascontiguousarray(ph_rad)).to(device)
+            series = torch.from_numpy(np.ascontiguousarray(ph_rad))
             undist = undistort_series(
                 series,
                 disp_pull,
@@ -434,21 +729,28 @@ def main(argv: list[str] | None = None) -> int:
                 circular=True,
                 verbose=args.verb >= 1,
                 desc=f"undistort phase e{e + 1}",
+                device=device,
             )
             out_path = f"{prefix_stem}_e{e + 1}_phase_undist{nii_ext}"
             save_nifti(undist.cpu().numpy(), out_path, affine=affine)
             if args.verb >= 1:
                 print(f"  undistorted phase echo {e + 1} (rad): {out_path}")
 
-    # Field map (Hz, native space) QC.
-    fmap_path = f"{prefix_stem}_fieldmap{nii_ext}"
-    save_nifti(result.field_native.cpu().numpy(), fmap_path, affine=affine)
-    if args.verb >= 1:
-        print(f"\n  field map (Hz, native): {fmap_path}")
+    # Field map (Hz, native space) QC + field-map cache. When reusing the cache
+    # (result is None) it already exists on disk — don't rewrite it.
+    if result is not None:
+        fmap_path = f"{prefix_stem}_fieldmap{nii_ext}"
+        save_nifti(field_native.cpu().numpy(), fmap_path, affine=affine)
+        if args.verb >= 1:
+            print(f"\n  field map (Hz, native): {fmap_path}")
 
     if args.save_undist:
+        # field_undist is set whenever we ran the warp tail (fresh or pull re-derive);
+        # only the disp-cache fast path leaves it None, so derive it from the pull warp.
+        if field_undist is None:
+            field_undist = displacement_pe_to_field(disp_pull, total_readout_time, pe_dir)
         undist_path = f"{prefix_stem}_fieldmap_undistorted{nii_ext}"
-        save_nifti(result.field_undistorted.cpu().numpy(), undist_path, affine=affine)
+        save_nifti(field_undist.cpu().numpy(), undist_path, affine=affine)
         if args.verb >= 1:
             print(f"  field map (Hz, undistorted): {undist_path}")
 
@@ -459,6 +761,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb >= 1:
             kind = "5D mm file" if args.warp_5d else f"per-frame mm files ({nt})"
             print(f"  distortion warp ({kind}, PE={pe_dir}): {warp_spec}")
+
+    if args.debug_3d:
+        if args.verb >= 1:
+            print(f"\nDone: {datetime.now():%Y-%m-%d %H:%M:%S}")
+            print(
+                "3d-debug: overlay {prefix}_e{N}_3ddebug_{pos,neg} on the brain's "
+                "up/down (k) motion;"
+            )
+            print(
+                "  pick the sign that cancels it, then bisect -3d_debug_shift. Reruns "
+                "reuse the cached field map (skip warpkit); -recompute forces fresh."
+            )
+        else:
+            print("MEDIC 3d-debug complete.")
+        return 0
 
     if args.verb >= 1:
         print(f"\nDone: {datetime.now():%Y-%m-%d %H:%M:%S}")
