@@ -2068,10 +2068,10 @@ def search_voxels_precomputed_grid(
     for _grid_idx, (a, b) in grid_iter:
         with profile_section("1_get_grid_data", enabled=enable_timing):
             grid_data = precomputed_grid[(a, b)]
-            L_inv = grid_data["L_inv"]          # (n_time, n_time)
-            Q = grid_data["Q"]                  # (n_time, n_reg) orthonormal
-            logdet_Rcorr = grid_data["logdet_Rcorr"]
-            logdet_XwTXw = grid_data["logdet_XwTXw"]
+            L_inv = grid_data["L_inv"].to(device)   # (n_time, n_time)
+            Q = grid_data["Q"].to(device)            # (n_time, n_reg) orthonormal
+            logdet_Rcorr = grid_data["logdet_Rcorr"].item()
+            logdet_XwTXw = grid_data["logdet_XwTXw"].item()
 
         # Prewhiten data via GEMM: Y_w = L_inv @ Y  (no triangular solve!)
         # Y_batch: (n_voxels, n_time) → transpose for matmul → transpose back
@@ -2216,10 +2216,10 @@ def search_voxels_precomputed_grid_hierarchical(
         if key is None:
             return
         gd = precomputed_grid[key]
-        L_inv = gd["L_inv"]
-        Q = gd["Q"]
-        logdet_Rcorr = gd["logdet_Rcorr"]
-        logdet_XwTXw = gd["logdet_XwTXw"]
+        L_inv = gd["L_inv"].to(device)
+        Q = gd["Q"].to(device)
+        logdet_Rcorr = gd["logdet_Rcorr"].item()
+        logdet_XwTXw = gd["logdet_XwTXw"].item()
 
         Y_sub = Y_batch.index_select(0, active_idx)  # (n_active, T)
         Y_w = Y_sub @ L_inv.T                         # (n_active, T)
@@ -3299,6 +3299,18 @@ def fit_glm_arma11(
 
     if device is None:
         device = get_device()
+
+    # MPS has no float64 support; use the working dtype for accumulation there.
+    # On CUDA/CPU the fp64 accumulator eliminates rounding in sum-of-squares.
+    _accum_dtype = dtype if device.type == "mps" else torch.float64
+    if device.type == "mps":
+        print(
+            "\n⚠️  WARNING: MPS (Apple Silicon GPU) does not support float64.\n"
+            "   RSS accumulation will use float32, which may reduce numerical\n"
+            "   precision of sigma² / t-stat estimates compared to CPU or CUDA.\n"
+            "   For full precision, rerun with: -device cpu\n",
+            flush=True,
+        )
     storage_device = torch.device("cpu")
 
     # Enable cuDNN benchmarking for optimal kernel selection (GPU only)
@@ -4392,7 +4404,7 @@ def fit_glm_arma11(
                     # Double-precision accumulation for RSS: eliminates rounding in sum-of-squares
                     # fp64 accumulator avoids RSS rounding without materializing a fp64 copy
                     sigma2_batch = (
-                        resid_w_batch.pow(2).sum(dim=1, dtype=torch.float64) / df
+                        resid_w_batch.pow(2).sum(dim=1, dtype=_accum_dtype) / df
                     ).to(dtype)
 
                     if not want_residuals:
@@ -4654,7 +4666,7 @@ def fit_glm_arma11(
                     # Double-precision accumulation for RSS: eliminates rounding in sum-of-squares
                     # fp64 accumulator avoids RSS rounding without materializing a fp64 copy
                     sigma2_batch = (
-                        resid_w_batch.pow(2).sum(dim=1, dtype=torch.float64) / df
+                        resid_w_batch.pow(2).sum(dim=1, dtype=_accum_dtype) / df
                     ).to(dtype)
 
                     if not want_residuals:
@@ -5101,7 +5113,7 @@ def fit_glm_arma11(
 
             # Variance
             df = results.dof
-            sigma2 = (resid_w.to(torch.float64).pow(2).sum() / df).to(dtype)
+            sigma2 = (resid_w.to(_accum_dtype).pow(2).sum() / df).to(dtype)
             sigma2_cpu = sigma2.cpu()
             results.sigma2[v] = sigma2_cpu
 
