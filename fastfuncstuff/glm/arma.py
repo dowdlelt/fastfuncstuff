@@ -3458,7 +3458,6 @@ def fit_glm_arma11(
             # lives in one place. Subtract grid memory from the budget first
             # so we don't blow up when the precomputed grid is big.
             from fastfuncstuff.memory import (
-                bytes_per_voxel_arma,
                 estimate_chunk_size,
                 get_available_memory,
                 get_memory_config,
