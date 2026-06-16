@@ -141,8 +141,10 @@ def test_run_nordic_complex_outputs(tmp_path):
     den_magn = nib.load(out.magnitude_file).get_fdata(dtype=np.float32)
     den_phase = nib.load(out.phase_file).get_fdata(dtype=np.float32)
 
-    assert den_magn.shape == magn.shape
-    assert den_phase.shape == phase.shape
+    # The 2 trailing noise volumes are trimmed from the saved output.
+    expected_shape = magn.shape[:3] + (magn.shape[3] - 2,)
+    assert den_magn.shape == expected_shape
+    assert den_phase.shape == expected_shape
     assert np.isfinite(den_magn).all()
     assert np.isfinite(den_phase).all()
 
@@ -269,6 +271,53 @@ def test_noise_volume_branch_drives_measured_noise(tmp_path):
 
     # With explicit noisy trailing volumes, measured noise should be > fallback 1.0.
     assert meta["threshold"]["measured_noise"] > 1.0
+
+
+def test_noise_volumes_trimmed_from_output(tmp_path):
+    """Trailing noise volumes calibrate the threshold then get trimmed.
+
+    The saved output (and its NIfTI header dim[4]) must be the signal-only
+    length, and the metadata must record how many volumes were dropped.
+    """
+    rng = np.random.default_rng(2024)
+    nt, n_noise = 18, 3
+    magn = np.abs(rng.normal(scale=0.1, size=(8, 8, 4, nt))).astype(np.float32)
+    magn[..., -n_noise:] = np.abs(rng.normal(scale=3.0, size=(8, 8, 4, n_noise))).astype(np.float32)
+
+    magn_file = tmp_path / "magn_trim.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    cfg = NordicConfig(
+        temporal_phase=0,
+        magnitude_only=True,
+        noise_volume_last=n_noise,
+        kernel_size_pca=(3, 3, 2),
+        kernel_size_gfactor=(3, 3, 1),
+        gfactor_nvols=8,
+        patch_overlap=2,
+        gfactor_patch_overlap=2,
+        save_residual_map=True,
+        verbose=False,
+    )
+
+    out = run_nordic(str(magn_file), None, str(tmp_path / "NORDIC_trim"), cfg)
+
+    img = nib.load(out.magnitude_file)
+    den = img.get_fdata(dtype=np.float32)
+    # Data array and on-disk header agree on the trimmed length.
+    assert den.shape == (8, 8, 4, nt - n_noise)
+    assert int(img.header.get_data_shape()[3]) == nt - n_noise
+
+    # Residual map follows the same trimmed length.
+    assert out.residual_file is not None
+    res = nib.load(out.residual_file).get_fdata(dtype=np.float32)
+    assert res.shape == (8, 8, 4, nt - n_noise)
+
+    with open(out.metadata_file, encoding="utf-8") as f:
+        meta = json.load(f)
+    assert meta["shape"][3] == nt
+    assert meta["output_shape"][3] == nt - n_noise
+    assert meta["noise_volumes_trimmed"] == n_noise
 
 
 def test_mp2_forces_unit_gfactor(tmp_path):

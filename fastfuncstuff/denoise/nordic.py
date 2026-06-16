@@ -782,9 +782,19 @@ def run_nordic(
     del ii_np
     nx, ny, nz, nt = II.shape
 
+    # Trailing noise-only volumes calibrate the threshold but must not enter
+    # the patch/SVD math — their statistics differ from the signal volumes and
+    # would corrupt the low-rank estimate. Size the kernel, the threshold, and
+    # the saved output to the signal-only length; the noise volumes are dropped
+    # once measured_noise has been computed (step 5b).
+    n_noise_vols = (
+        cfg.noise_volume_last if (cfg.noise_volume_last > 0 and nt > cfg.noise_volume_last) else 0
+    )
+    nt_keep = nt - n_noise_vols
+
     # Kernel sizes
     if cfg.kernel_size_pca is None:
-        kernel_pca = _default_kernel_size_pca(nt, n_slices=nz)
+        kernel_pca = _default_kernel_size_pca(nt_keep, n_slices=nz)
     else:
         kernel_pca = cfg.kernel_size_pca
 
@@ -847,7 +857,7 @@ def run_nordic(
     gfactor_file: Path | None = None
 
     if cfg.save_gfactor_map or cfg.nordic or cfg.mp_mode == 1:
-        g_nvol = min(max(1, cfg.gfactor_nvols), nt)
+        g_nvol = min(max(1, cfg.gfactor_nvols), nt_keep)
         if cfg.use_magn_for_gfactor:
             g_data = torch.abs(II[..., :g_nvol]).to(dtype)
         else:
@@ -954,6 +964,19 @@ def run_nordic(
         print(f"  Measured noise sigma: {measured_noise:.6g}")
 
     # ------------------------------------------------------------------
+    # 5b. Drop the trailing noise volumes now that the threshold is
+    #     calibrated, so they never enter the patch/SVD. dd_phase is
+    #     trimmed in lockstep so the inverse phase reapplication in step 8
+    #     lines up with the denoised length.
+    # ------------------------------------------------------------------
+    if n_noise_vols > 0:
+        KSP2 = KSP2[..., :nt_keep]
+        if dd_phase is not None:
+            dd_phase = dd_phase[..., :nt_keep]
+        if cfg.verbose:
+            print(f"  Trimmed {n_noise_vols} noise volume(s) before denoising: {nt} -> {nt_keep}")
+
+    # ------------------------------------------------------------------
     # 6. Compute NORDIC threshold
     # ------------------------------------------------------------------
     if cfg.mp_mode > 0:
@@ -963,7 +986,7 @@ def run_nordic(
         threshold_mode = "nordic"
         threshold_value = _estimate_nordic_lambda(
             kernel_size=kernel_pca,
-            n_timepoints=nt,
+            n_timepoints=nt_keep,
             measured_noise=measured_noise,
             factor_error=cfg.factor_error,
             is_complex=is_complex,
@@ -1129,6 +1152,8 @@ def run_nordic(
         "phase_file": str(phase_file) if phase_file is not None else None,
         "output_prefix": str(output_prefix),
         "shape": [int(nx), int(ny), int(nz), int(nt)],
+        "output_shape": [int(nx), int(ny), int(nz), int(nt_keep)],
+        "noise_volumes_trimmed": int(n_noise_vols),
         "device": str(dev),
         "absolute_scale": absolute_scale,
         "config": {
