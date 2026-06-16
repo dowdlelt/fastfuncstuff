@@ -139,13 +139,13 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 | `ffs_denoisatorial` | Exhaustive 2^k subset evaluation of noise PCs, when you want the best non-contiguous combination rather than a prefix. |
 | `ffs_phasereg` | Magnitude-on-phase Deming regression for macrovascular BOLD suppression (Menon 2002, Curtis 2014, Stanley 2021; phaseprep parity). |
 | `ffs_nordic` | NORDIC-style patch-SVD denoising. Magnitude-only or complex (mag + phase), with optional g-factor map. |
-| `ffs_sauna` | NORDIC-adjacent denoiser. g-factor from trailing noise volumes + Gavish–Donoho optimal singular-value shrinkage. |
+| `ffs_sauna` *(beta)*  | NORDIC-adjacent denoiser. g-factor from trailing noise volumes + Gavish–Donoho optimal singular-value shrinkage. VERY experimental, was an exploration, not vetted (but produces very similar timeseries) |
 
 ### Decomposition
 
 | command | description |
 |---|---|
-| `ffs_ica` | MELODIC-style probabilistic ICA. Auto component count, GGM mixture-model thresholding, MIGP for temporal concat, optional ICASSO and depth-lag classification. |
+| `ffs_ica` | MELODIC-style probabilistic ICA. Auto component count, GGM mixture-model thresholding, MIGP for temporal concat, optional ICASSO and *(beta)* depth-lag/mask/nuisance component classification (on TODO list for testing). |
 | `ffs_decompose` | ICA with an emphasis on stability via ICASSO clustering. |
 
 ### Image processing and registration
@@ -153,7 +153,7 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 | command | description |
 |---|---|
 | `ffs_moco` | Rigid-body motion correction (Gauss–Newton, wsinc5/heptic resampling). Writes AFNI-compatible motion files. Estimation and resampling for ~300 volume 2D data is ~3 seconds, time dominated by I/O. |
-| `ffs_allineate` | ~100x faster 6/9/12-parameter affine alignment with `3dAllineate`-style cost functions: `lpa`/`lpc` local Pearson (same- and cross-modal), `ls`, `mi`/`nmi`, Hellinger, and correlation ratio. Use `lpa` for same-contrast (e.g. anat→MNI) and `lpc` for cross-modal (EPI→anat). |
+| `ffs_allineate` | ~100x faster 6/9/12-parameter affine alignment with `3dAllineate`-style cost functions: `lpa`/`lpc` local Pearson (same- and cross-modal), `ls`, `mi`/`nmi`, Hellinger, and correlation ratio. Use `lpa` for same-contrast (e.g. anat→MNI) and `lpc` for cross-modal (EPI→anat).|
 | `ffs_qwarp` | Iterative nonlinear warp estimation (`3dQwarp`-style). |
 | `ffs_nwarp` | Apply a warp to a volume or 4D timeseries. Supports complex (mag + phase) warping. |
 | `ffs_slicetime` | Slice-timing correction (`3dTshift`-style), Fourier or sinc. |
@@ -175,7 +175,7 @@ These are either WIP CLI tools, things that I am tinkering with or ones that I j
 | command | description |
 |---|---|
 | `ffs_build_design` | Build a 1D design matrix from onsets, durations, an HRF model, polynomials, and motion. Output is readable by `ffs_reml` and AFNI tools. |
-| `ffs_tps` | Thin-plate-spline HRF estimation with cross-validated smoothness. Global or per-voxel λ. |
+| `ffs_tps` *(beta)*  | Thin-plate-spline HRF estimation with cross-validated smoothness. Global or per-voxel λ. Further work required here |
 | `ffs_xval_r2` | Cross-validated R² maps (LORO or split-half) with proper nuisance projection. |
 | `ffs_pathfinder` | Joint HRF + denoising optimisation. Picks the HRF that works best with the denoising level chosen for that voxel. |
 
