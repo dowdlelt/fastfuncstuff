@@ -48,7 +48,7 @@ from fastfuncstuff.memory import (
     estimate_nordic_llr_memory,
     get_available_memory,
 )
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64, to_tensor
 
 # Reuse phase stabilization and LLR infrastructure from NORDIC
 from fastfuncstuff.denoise.nordic import (
@@ -418,13 +418,14 @@ def _fit_polynomial_gfactor(
         XtX.addmm_(Xw.T, Xw)
         Xty.add_(Xw.T @ yw)
 
-    # Promote to float64 only for the tiny solve (condition number)
-    XtX_64 = XtX.double()
-    Xty_64 = Xty.double()
+    # Promote to float64 only for the tiny solve (condition number). MPS has no
+    # float64, so the tiny system is solved on CPU and the result returns to dev.
+    XtX_64 = to_linalg_f64(XtX)
+    Xty_64 = to_linalg_f64(Xty)
     diag_mean = XtX_64.diagonal().mean()
     XtX_64.diagonal().add_(1e-8 * diag_mean)
 
-    beta = torch.linalg.solve(XtX_64, Xty_64).float()  # (n_terms,)
+    beta = torch.linalg.solve(XtX_64, Xty_64).to(device=dev, dtype=torch.float32)  # (n_terms,)
 
     # ------------------------------------------------------------------
     # Evaluate fitted = exp(X @ beta) one x-slice at a time
@@ -588,9 +589,11 @@ def _poly_gfactor_multi_degree(
         XtX.addmm_(Xw.T, Xw)
         Xty.add_(Xw.T @ yw)
 
-    # Promote to float64 only for the tiny solve
-    XtX_64 = XtX.double()
-    Xty_64 = Xty.double()
+    # Promote to float64 only for the tiny solve. MPS has no float64, so the
+    # tiny sub-systems are solved on CPU (ld) and results return to dev.
+    ld = linalg_device(dev)
+    XtX_64 = to_linalg_f64(XtX)
+    Xty_64 = to_linalg_f64(Xty)
     diag_mean = XtX_64.diagonal().mean()
     XtX_64.diagonal().add_(1e-8 * diag_mean)
 
@@ -600,14 +603,14 @@ def _poly_gfactor_multi_degree(
     betas_padded = torch.zeros(n_terms_max, n_cand, device=dev)
     for ci, d in enumerate(degree_candidates):
         cols = col_indices[d]
-        idx_t = torch.tensor(cols, device=dev, dtype=torch.long)
+        idx_t = torch.tensor(cols, device=ld, dtype=torch.long)
         XtX_d = XtX_64[idx_t][:, idx_t]
         Xty_d = Xty_64[idx_t]
         # Add ridge to sub-system too
         diag_d = XtX_d.diagonal().mean()
         XtX_d.diagonal().add_(1e-8 * diag_d)
-        beta_d = torch.linalg.solve(XtX_d, Xty_d).float()
-        betas_padded[idx_t, ci] = beta_d
+        beta_d = torch.linalg.solve(XtX_d, Xty_d).to(device=dev, dtype=torch.float32)
+        betas_padded[idx_t.to(dev), ci] = beta_d
 
     # ------------------------------------------------------------------
     # Pass 2: evaluate ALL candidates in one batched pass

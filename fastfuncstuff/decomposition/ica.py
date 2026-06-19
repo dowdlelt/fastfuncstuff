@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, to_linalg_f64, to_tensor
 
 
 class _RowCenteredPCAState:
@@ -178,10 +178,12 @@ class FastICA:
         # The (T,T) covariance is tiny; float32 rounding of near-degenerate
         # eigenvalues causes large eigenvector rotations that corrupt the
         # whitening basis and produce speckly ICA components.
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t.to(torch.float64))
+        # float64 eigh on CPU when on MPS (no float64); results return to device.
+        _dev = cov_t.device
+        eigenvalues, eigenvectors = torch.linalg.eigh(to_linalg_f64(cov_t))
         del cov_t
-        eigenvalues = eigenvalues.float().flip(0)
-        eigenvectors = eigenvectors.float().flip(1)
+        eigenvalues = eigenvalues.float().flip(0).to(_dev)
+        eigenvectors = eigenvectors.float().flip(1).to(_dev)
         eigenvalues = torch.clamp(eigenvalues, min=0)
 
         # Determine number of PCA components to keep
@@ -469,8 +471,9 @@ class FastICA:
         # spread can cause float32 rounding to stall convergence.  W is tiny
         # (k×k), so this costs negligible VRAM and time.
         orig_dtype = W.dtype
-        U, S, Vt = torch.linalg.svd(W.to(torch.float64), full_matrices=False)
-        return (U @ Vt).to(orig_dtype)
+        # float64 k×k SVD on CPU when on MPS (no float64); result returns to device.
+        U, S, Vt = torch.linalg.svd(to_linalg_f64(W), full_matrices=False)
+        return (U @ Vt).to(device=W.device, dtype=orig_dtype)
 
     @staticmethod
     def _get_nonlinearity(fun: str):
@@ -811,10 +814,12 @@ class InfoMaxICA:
         row_mean = X.mean(dim=1, keepdim=True)
         cov_t = (X @ X.T - n_features * (row_mean @ row_mean.T)) / float(n_features)
 
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_t.to(torch.float64))
+        # float64 eigh on CPU when on MPS (no float64); results return to device.
+        _dev = cov_t.device
+        eigenvalues, eigenvectors = torch.linalg.eigh(to_linalg_f64(cov_t))
         del cov_t
-        eigenvalues = eigenvalues.float().flip(0)
-        eigenvectors = eigenvectors.float().flip(1)
+        eigenvalues = eigenvalues.float().flip(0).to(_dev)
+        eigenvectors = eigenvectors.float().flip(1).to(_dev)
         eigenvalues = torch.clamp(eigenvalues, min=0)
 
         n_max = min(n_samples, n_features)

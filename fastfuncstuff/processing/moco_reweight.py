@@ -40,6 +40,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.design.builder import legendre_polynomials
+from fastfuncstuff.utils import linalg_device, warn_mps_float32_precision
 
 from .affine import _build_homo_coords, identity_params, params_to_matrix_batched
 from .cost_blok import assign_bloks
@@ -118,18 +119,23 @@ def _estimate_motion(
     weight_v = weight0.reshape(-1)[flat_idx]  # (Nv,)
     WJ_v = derivs[:ndof, flat_idx] * weight_v[None]  # (ndof, Nv)
 
-    # Per-group normal matrix JtWJ (P, ndof, ndof), float64 (matches whole-image GN).
-    JtWJ = torch.zeros(P, ndof, ndof, dtype=torch.float64, device=device)
-    WJ64 = WJ_v.double()
+    # Per-group normal matrix JtWJ (P, ndof, ndof), float64 (matches whole-image
+    # GN). MPS has no float64, so the normal equations and per-group solve run in
+    # float32 there (use -device cpu for full-precision reweighting).
+    solve_dtype = torch.float32 if device.type == "mps" else torch.float64
+    if device.type == "mps":
+        warn_mps_float32_precision("moco reweight GN solve")
+    JtWJ = torch.zeros(P, ndof, ndof, dtype=solve_dtype, device=device)
+    WJ64 = WJ_v.to(solve_dtype)
     for a in range(ndof):
         for b in range(a, ndof):
-            seg = torch.zeros(P, dtype=torch.float64, device=device)
+            seg = torch.zeros(P, dtype=solve_dtype, device=device)
             seg.index_add_(0, bi, WJ64[a] * WJ64[b])
             JtWJ[:, a, b] = seg
             if a != b:
                 JtWJ[:, b, a] = seg
     eps = 1e-6 * JtWJ.diagonal(dim1=1, dim2=2).mean().clamp(min=1e-30)
-    JtWJ_reg = JtWJ + eps * torch.eye(ndof, dtype=torch.float64, device=device)[None]
+    JtWJ_reg = JtWJ + eps * torch.eye(ndof, dtype=solve_dtype, device=device)[None]
 
     out = torch.zeros(nt, P, ndof, dtype=torch.float64)
     ident = identity_params(device=device, dtype=dtype)
@@ -153,11 +159,12 @@ def _estimate_motion(
                 source, src[:, 0], src[:, 1], src[:, 2], _REWEIGHT_INTERP
             )  # (Nv,)
             residual = weight_v * (base_v - warped)  # (Nv,)
-            rhs = torch.zeros(P, ndof, dtype=torch.float64, device=device)
-            rhs.index_add_(0, bi, (WJ_v * residual[None]).t().double())  # (P, ndof)
+            rhs = torch.zeros(P, ndof, dtype=solve_dtype, device=device)
+            rhs.index_add_(0, bi, (WJ_v * residual[None]).t().to(solve_dtype))  # (P, ndof)
             dp = torch.linalg.solve(JtWJ_reg, rhs)  # (P, ndof)
             params[:, :ndof] += dp.to(dtype)
-        out[t] = params[:, :ndof].detach().double().cpu()
+        # .cpu() before .double(): MPS has no float64.
+        out[t] = params[:, :ndof].detach().cpu().double()
 
     return out
 
@@ -282,14 +289,19 @@ def compute_reweight(
 
     # --- Predicted vs measured patch displacement ---------------------------
     # Patch centroids (x, y, z) in voxel index space, on CPU for the stats below.
-    cnt = torch.zeros(P, dtype=torch.float64, device=device)
-    cnt.index_add_(0, bi, torch.ones(bi.numel(), dtype=torch.float64, device=device))
-    cen = torch.zeros(P, 3, dtype=torch.float64, device=device)
+    # These centroid stats are float64 and end up on CPU anyway (xp.cpu() below),
+    # so compute them on linalg_device — i.e. CPU on MPS, which has no float64.
+    ld = linalg_device(device)
+    bi_ld = bi.to(ld)
+    coords_ld = coords_v.to(ld)
+    cnt = torch.zeros(P, dtype=torch.float64, device=ld)
+    cnt.index_add_(0, bi_ld, torch.ones(bi.numel(), dtype=torch.float64, device=ld))
+    cen = torch.zeros(P, 3, dtype=torch.float64, device=ld)
     for j in range(3):
-        s = torch.zeros(P, dtype=torch.float64, device=device)
-        s.index_add_(0, bi, coords_v[j].double())
+        s = torch.zeros(P, dtype=torch.float64, device=ld)
+        s.index_add_(0, bi_ld, coords_ld[j].double())
         cen[:, j] = s / cnt.clamp(min=1)
-    xp = torch.cat([cen, torch.ones(P, 1, dtype=torch.float64, device=device)], dim=1)  # (P,4)
+    xp = torch.cat([cen, torch.ones(P, 1, dtype=torch.float64, device=ld)], dim=1)  # (P,4)
     xp = xp.cpu()
 
     # Displacement the GLOBAL motion implies at each patch centre, per TR

@@ -1064,7 +1064,12 @@ def main():
                 else (os.cpu_count() or 12)
             )
             torch.set_num_threads(num_threads)
-            torch.set_num_interop_threads(num_threads)
+            # One-shot and must precede any parallel work; configure_torch_backends
+            # above may already have set it, so don't fail the run if torch refuses.
+            try:
+                torch.set_num_interop_threads(num_threads)
+            except RuntimeError:
+                pass
             os.environ["OMP_NUM_THREADS"] = str(num_threads)
             os.environ["MKL_NUM_THREADS"] = str(num_threads)
             print(f"🖥️  Device: {device}")

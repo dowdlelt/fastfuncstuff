@@ -28,6 +28,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.utils import warn_mps_float32_precision
 
 # ---------------------------------------------------------------------------
 # Model
@@ -161,10 +162,13 @@ def fit_loglinear(y: Tensor, tes: Tensor, weights: Tensor | None = None) -> tupl
     """
     w = torch.ones_like(y) if weights is None else weights
     logy = torch.log(y.abs() + 1.0)
-    # Design columns c0 = 1, c1 = -TE.  (work in float64 for the small solve)
-    te = tes.to(torch.float64)
-    w = w.to(torch.float64)
-    logy = logy.to(torch.float64)
+    # Design columns c0 = 1, c1 = -TE. Work in float64 for the closed-form solve;
+    # MPS has no float64, so it computes in float32 there (full-batch over voxels,
+    # so a CPU fallback would be a large transfer — use -device cpu for full precision).
+    dtype = torch.float32 if y.device.type == "mps" else torch.float64
+    te = tes.to(dtype)
+    w = w.to(dtype)
+    logy = logy.to(dtype)
 
     a00 = w.sum(dim=1)
     a01 = (w * -te).sum(dim=1)
@@ -196,7 +200,14 @@ def _lm_curvefit_chunk(
     n_iter: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Batched LM for one chunk. Returns t2s, s0, failures, t2s_var, s0_var, covar."""
-    dtype = torch.float64
+    # MPS has no float64; the LM fit runs in float32 there (use -device cpu for
+    # full float64 precision). The fit is full-batch over voxels, so a CPU
+    # fallback would mean a large host transfer per chunk.
+    if y.device.type == "mps":
+        warn_mps_float32_precision("multi-echo T2*/S0 LM fit")
+        dtype = torch.float32
+    else:
+        dtype = torch.float64
     te = tes.to(dtype)
     y = y.to(dtype)
     w = weights.to(dtype)

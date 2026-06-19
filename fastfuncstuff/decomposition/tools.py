@@ -39,7 +39,7 @@ from fastfuncstuff.design.builder import (
 )
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.design.hrf import get_spmg1_hrf
-from fastfuncstuff.utils import to_tensor
+from fastfuncstuff.utils import to_linalg_f64, to_tensor
 from .pca import PCA
 
 
@@ -373,18 +373,29 @@ def compute_melodic_varnorm_map(
     dim = max(1, min(dim, n_time - 1))
 
     orig_dtype = x_t.dtype
-    d64 = x_t.to(torch.float64)
-    row_mean = d64.mean(dim=1, keepdim=True)
-    corr_t = (d64 @ d64.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
+    dev = x_t.device
+    if dev.type == "mps":
+        # MPS has no float64. Accumulate the T×T covariance in float32 with a
+        # mean-centred two-pass form (stable, no catastrophic cancellation),
+        # then do the precision-sensitive eigendecomposition in float64 on CPU.
+        xc = x_t - x_t.mean(dim=1, keepdim=True)
+        corr_t = to_linalg_f64(xc @ xc.T / float(n_vox))
+        del xc
+    else:
+        d64 = x_t.to(torch.float64)
+        row_mean = d64.mean(dim=1, keepdim=True)
+        corr_t = (d64 @ d64.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
+        del d64
     evals, evecs = torch.linalg.eigh(corr_t)
     del corr_t
     order = torch.argsort(evals, descending=True)
     evals = torch.clamp(evals[order][:dim], min=1e-12)
     evecs = evecs[:, order][:, :dim]
     sqrt_evals = torch.sqrt(evals)
-    white = (evecs / sqrt_evals.unsqueeze(0)).T
-    dewhite = evecs * sqrt_evals.unsqueeze(0)
-    del d64, evals, evecs, sqrt_evals
+    # Whitening bases return to the compute device for the big f32 matmuls below.
+    white = ((evecs / sqrt_evals.unsqueeze(0)).T).to(dev)
+    dewhite = (evecs * sqrt_evals.unsqueeze(0)).to(dev)
+    del evals, evecs, sqrt_evals
 
     x_t_f = x_t.to(torch.float32) if orig_dtype != torch.float64 else x_t
     ws = white.to(orig_dtype) @ x_t_f

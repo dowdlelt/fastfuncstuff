@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, to_tensor, warn_mps_float32_precision
 from fastfuncstuff.memory import make_vram_debugger, bytes_per_voxel_arma
 from .xval import compute_r2_metric
 
@@ -962,7 +962,8 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
 
     try:
         # Cholesky decomposition: R = L L'
-        # MPS has a bug with Cholesky - use CPU as workaround
+        # Conservative CPU fallback on MPS (the result is float32 here, since
+        # use_double is forced off on MPS) — factor on CPU, move back.
         if device.type == "mps":
             R_cpu = R.cpu()
             L = torch.linalg.cholesky(R_cpu).to(device)
@@ -3295,22 +3296,22 @@ def fit_glm_arma11(
     - Worsley & Friston (1995): Analysis of fMRI time-series revisited—again
     """
     # Setup precision
-    dtype = torch.float64 if use_double else torch.float32
-
     if device is None:
         device = get_device()
 
-    # MPS has no float64 support; use the working dtype for accumulation there.
-    # On CUDA/CPU the fp64 accumulator eliminates rounding in sum-of-squares.
+    # MPS has no float64; a full-data float64 fit is impossible there. Downgrade
+    # to float32 and warn once (the stable two-pass accumulation keeps R²/sigma²
+    # parity tight; -device cpu gives guaranteed full float64).
+    if use_double and device.type == "mps":
+        warn_mps_float32_precision("ARMA fit")
+        use_double = False
+    dtype = torch.float64 if use_double else torch.float32
+
+    # On CUDA/CPU the fp64 accumulator eliminates rounding in sum-of-squares;
+    # MPS cannot hold float64 so it accumulates in float32.
     _accum_dtype = dtype if device.type == "mps" else torch.float64
     if device.type == "mps":
-        print(
-            "\n⚠️  WARNING: MPS (Apple Silicon GPU) does not support float64.\n"
-            "   RSS accumulation will use float32, which may reduce numerical\n"
-            "   precision of sigma² / t-stat estimates compared to CPU or CUDA.\n"
-            "   For full precision, rerun with: -device cpu\n",
-            flush=True,
-        )
+        warn_mps_float32_precision("ARMA RSS accumulation")
     storage_device = torch.device("cpu")
 
     # Enable cuDNN benchmarking for optimal kernel selection (GPU only)

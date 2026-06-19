@@ -43,6 +43,7 @@ except ImportError:
 
 # Import for R² metric computation
 from fastfuncstuff.glm.xval import compute_r2_metric
+from fastfuncstuff.utils import accum_dtype
 
 
 def _gpu_interp_fracs(
@@ -870,7 +871,8 @@ def _fit_ridge_chunk(
 
     # Select optimal fraction per voxel (highest CV R²)
     xval_r2, best_frac_idx = r2_by_frac.max(dim=1)
-    fracs_dev = torch.tensor(fracs, device=device)
+    # fracs is a numpy float64 array; force float32 so this is valid on MPS.
+    fracs_dev = torch.tensor(fracs, device=device, dtype=torch.float32)
     optimal_fracs = fracs_dev[best_frac_idx]
 
     # ========================================================================
@@ -1026,7 +1028,8 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     r2_initial_all = torch.zeros(chunk_voxels, device=device)
     r2_final_all = torch.zeros(chunk_voxels, device=device)
     xval_r2_all = torch.zeros(chunk_voxels, device=device)
-    optimal_fracs_all = torch.zeros(chunk_voxels, device=device, dtype=torch.float64)
+    # float64 on CUDA/CPU; MPS has no float64 so f32 (a fraction in [0,1]).
+    optimal_fracs_all = torch.zeros(chunk_voxels, device=device, dtype=accum_dtype(device))
     r2_by_frac_all = torch.zeros(chunk_voxels, n_fracs, device=device)
 
     # Process each group

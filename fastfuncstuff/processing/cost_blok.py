@@ -43,6 +43,15 @@ from torch import Tensor
 # Max correlation allowed before the Fisher stretch blows up (mri_genalign.c).
 _CMAX = 0.9999
 
+
+def _coord_dtype(device: torch.device) -> torch.dtype:
+    """Coordinate dtype for lattice geometry: float64, or float32 on MPS.
+
+    MPS has no float64. Blok coordinates are small (≤ a few hundred), so float32
+    floor/round math is exact enough for the lattice assignment there.
+    """
+    return torch.float32 if device.type == "mps" else torch.float64
+
 # volume(blok) / siz**3 for each shape — used by the auto-radius formula
 # (GA_BLOK_VOLFAC + the inside-test comments in mri_genalign_util.c).
 _VOLFAC = {"ball": 4.18879, "cube": 8.0, "rhdd": 2.0, "tohd": 4.0}
@@ -157,10 +166,11 @@ def assign_bloks(
         blokrad = auto_blok_radius((dx, dy, dz), bloktype)
 
     # Physical coordinates of every voxel, in reshape(-1) (z, y, x) order.
+    cdt = _coord_dtype(device)
     kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=torch.float64, device=device),
-        torch.arange(ny, dtype=torch.float64, device=device),
-        torch.arange(nx, dtype=torch.float64, device=device),
+        torch.arange(nz, dtype=cdt, device=device),
+        torch.arange(ny, dtype=cdt, device=device),
+        torch.arange(nx, dtype=cdt, device=device),
         indexing="ij",
     )
     xyz = torch.stack(
@@ -195,7 +205,7 @@ def assign_bloks_points(
         device = coords_xyz_mm.device
     if blokrad is None:
         blokrad = auto_blok_radius(voxdims, bloktype)
-    xyz = coords_xyz_mm.to(device=device, dtype=torch.float64)
+    xyz = coords_xyz_mm.to(device=device, dtype=_coord_dtype(device))
     index, nblok, n_populated = _assign_xyz_to_bloks(xyz, bloktype, blokrad, device, None)
     return BlokSet(
         index=index, nblok=nblok, bloktype=bloktype, blokrad=float(blokrad), n_populated=n_populated
@@ -215,8 +225,9 @@ def _assign_xyz_to_bloks(
     for points outside any blok / masked out / in a sparse blok. Shared by the
     full-grid :func:`assign_bloks` and the subsampled :func:`assign_bloks_points`.
     """
+    cdt = _coord_dtype(device)  # matches xyz dtype (float32 on MPS, float64 else)
     lat_list, siz = _lattice(bloktype, blokrad)
-    lat = torch.tensor(lat_list, dtype=torch.float64, device=device)  # (3,3)
+    lat = torch.tensor(lat_list, dtype=cdt, device=device)  # (3,3)
     invlat = torch.linalg.inv(lat)
 
     # Nearest integer lattice index (AFNI: floor(pqr + 0.499)).
@@ -225,13 +236,13 @@ def _assign_xyz_to_bloks(
 
     # Search the 3x3x3 neighbourhood; keep the nearest centre whose polyhedron
     # actually contains the point (a clean Voronoi partition).
-    best_d2 = torch.full((xyz.shape[0],), float("inf"), dtype=torch.float64, device=device)
+    best_d2 = torch.full((xyz.shape[0],), float("inf"), dtype=cdt, device=device)
     best_lat = base_lat.clone()
     found = torch.zeros(xyz.shape[0], dtype=torch.bool, device=device)
     for dp in (-1, 0, 1):
         for dq in (-1, 0, 1):
             for dr in (-1, 0, 1):
-                cand = base_lat + torch.tensor([dp, dq, dr], dtype=torch.float64, device=device)
+                cand = base_lat + torch.tensor([dp, dq, dr], dtype=cdt, device=device)
                 centre = cand @ lat.T  # (N, 3)
                 off = xyz - centre
                 ins = _inside(off, bloktype, siz)

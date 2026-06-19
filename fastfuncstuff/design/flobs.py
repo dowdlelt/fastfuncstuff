@@ -39,7 +39,29 @@ import torch
 from tqdm.auto import tqdm
 
 from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives, pighs_halfcos
-from fastfuncstuff.utils import get_device
+from fastfuncstuff.utils import get_device, warn_mps_cpu_fallback
+
+
+def _move_mps_to_cpu(obj: object) -> object:
+    """Recursively move MPS tensors (and lists/tuples of them) to CPU."""
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu() if obj.device.type == "mps" else obj
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_move_mps_to_cpu(x) for x in obj)
+    return obj
+
+
+def _cpu_if_mps(device: torch.device, *inputs: object) -> tuple:
+    """Redirect a float64-only FLOBS solver to CPU on MPS (no float64 on Metal).
+
+    Returns ``(device, *moved)`` where ``device`` becomes CPU on MPS and any
+    MPS tensor input (or list/tuple of tensors) is moved to CPU so downstream
+    ``.to(cpu, float64)`` casts are safe (a combined device+dtype cast on an MPS
+    tensor would raise).
+    """
+    if device.type != "mps":
+        return (device, *inputs)
+    return (torch.device("cpu"), *(_move_mps_to_cpu(x) for x in inputs))
 
 
 # ----------------------------------------------------------------------------
@@ -560,6 +582,14 @@ def fit_basis_constrained_ridge(
     """
     if device is None:
         device = get_device()
+
+    # Bayesian constrained-ridge is float64 end-to-end; MPS has no float64, so
+    # run the whole solver on CPU there (full-precision, just not accelerated).
+    if device.type == "mps":
+        warn_mps_cpu_fallback("FLOBS constrained-ridge")
+    device, data, design_task, nuisance = _cpu_if_mps(
+        device, data, design_task, nuisance
+    )
 
     # Respect the caller's device choice.  Data on cuda stays on
     # cuda; data on CPU stays on CPU.  The chunked solver below
@@ -1125,6 +1155,11 @@ def cv_basis_constrained_ridge(
 
     if device is None:
         device = get_device()
+    if device.type == "mps":
+        warn_mps_cpu_fallback("FLOBS constrained-ridge CV")
+    device, per_run_data, per_run_task_designs = _cpu_if_mps(
+        device, per_run_data, per_run_task_designs
+    )
     if weight_grid is None:
         weight_grid = [0.1, 0.3, 1.0, 3.0, 10.0]
 
@@ -1409,6 +1444,11 @@ def fit_basis_lss(
 
     if device is None:
         device = get_device()
+    if device.type == "mps":
+        warn_mps_cpu_fallback("FLOBS LSS")
+    device, per_run_data, per_run_designs = _cpu_if_mps(
+        device, per_run_data, per_run_designs
+    )
     if lss_exclude is None:
         lss_exclude = []
     excluded_set = set(lss_exclude)
@@ -1845,6 +1885,11 @@ def fit_basis_fracridge(
 
     if device is None:
         device = get_device()
+    if device.type == "mps":
+        warn_mps_cpu_fallback("FLOBS fracridge")
+    device, per_run_data, per_run_task_designs = _cpu_if_mps(
+        device, per_run_data, per_run_task_designs
+    )
     if fracs is None:
         # ffs_ridge defaults; same grid GLMsingle uses by default.
         fracs = np.linspace(0.1, 1.0, 10).astype(np.float64)
@@ -2560,6 +2605,9 @@ def compute_vb_block_trace(
     """
     if device is None:
         device = get_device()
+    if device.type == "mps":
+        warn_mps_cpu_fallback("FLOBS VB block-trace")
+    device, design = _cpu_if_mps(device, design)
 
     X = design.to(device=device, dtype=torch.float64)
     n_cols = X.shape[1]
@@ -2770,6 +2818,9 @@ def compute_xval_r2_per_voxel(
 
     if device is None:
         device = get_device()
+    if device.type == "mps":
+        warn_mps_cpu_fallback("FLOBS xval R²")
+    device, per_run_data = _cpu_if_mps(device, per_run_data)
 
     n_runs = len(per_run_data)
     if n_runs < 2:

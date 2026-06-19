@@ -149,7 +149,9 @@ def _thd_cliplevel(vol: Tensor, mfrac: float = 0.5) -> float:
     npos = int(kk.numel())
     if npos <= 222:
         return 0.0
-    dsum = float((kk.double() * kk.double()).sum())
+    # .cpu() before float64: MPS has no float64; this is a tiny scalar reduction.
+    kk_f = kk.cpu().double()
+    dsum = float((kk_f * kk_f).sum())
     hist = torch.bincount(kk, minlength=nhist + 1).cpu()
     h = hist.tolist()
 

@@ -1286,26 +1286,31 @@ def compute_xval_r2(
                 # Compute residuals and stats on GPU, accumulate to accumulators
                 n_test_tps = len(test_tps)
 
-                # Compute stats in float64 for precision
-                # TODO - we make these float64 for a subtraction, does that matter? wouldn't it make more sense
-                # If they were float64 for the matrix multiplcation up above? or am I overhtinking it, and risking vram OOM.
-                # Wouldn't it be better to make it double to start with rather than a duplication here?
-                test_data_f64 = test_data_batch.double()
-                pred_f64 = predictions_batch.double()
+                # Compute per-batch stats. On CUDA/CPU we promote to float64 on
+                # the compute device for the subtraction. MPS has no float64, so
+                # there we reduce in float32 on-device (SS_res is a difference, so
+                # no catastrophic cancellation) and promote to float64 only after
+                # moving onto the CPU float64 accumulators below.
+                if test_data_batch.device.type == "mps":
+                    residuals = test_data_batch - predictions_batch
+                    ss_res_batch = (residuals**2).sum(dim=1)
+                    sum_actual_batch = test_data_batch.sum(dim=1)
+                    sum_sq_actual_batch = (test_data_batch**2).sum(dim=1)
+                else:
+                    test_data_f64 = test_data_batch.double()
+                    pred_f64 = predictions_batch.double()
+                    residuals = test_data_f64 - pred_f64
+                    ss_res_batch = (residuals**2).sum(dim=1)
+                    sum_actual_batch = test_data_f64.sum(dim=1)
+                    sum_sq_actual_batch = (test_data_f64**2).sum(dim=1)
 
-                # SS_res = Σ(actual - pred)²
-                residuals = test_data_f64 - pred_f64
-                ss_res_batch = (residuals**2).sum(dim=1)
-
-                # For SS_tot later: need Σ actual and Σ actual²
-                sum_actual_batch = test_data_f64.sum(dim=1)
-                sum_sq_actual_batch = (test_data_f64**2).sum(dim=1)
-
-                # Accumulate (may need to move to CPU if accumulators are there)
+                # Accumulate (may need to move to CPU if accumulators are there).
+                # .cpu().double() is a no-op cast when already float64 (CUDA), and
+                # the float32→float64 promotion on MPS.
                 if accumulator_device.type == "cpu":
-                    ss_res_accumulator[batch_slice] += ss_res_batch.cpu()
-                    sum_actual[batch_slice] += sum_actual_batch.cpu()
-                    sum_sq_actual[batch_slice] += sum_sq_actual_batch.cpu()
+                    ss_res_accumulator[batch_slice] += ss_res_batch.cpu().double()
+                    sum_actual[batch_slice] += sum_actual_batch.cpu().double()
+                    sum_sq_actual[batch_slice] += sum_sq_actual_batch.cpu().double()
                     count_timepoints[batch_slice] += n_test_tps
                 else:
                     ss_res_accumulator[batch_slice] += ss_res_batch
@@ -1313,14 +1318,7 @@ def compute_xval_r2(
                     sum_sq_actual[batch_slice] += sum_sq_actual_batch
                     count_timepoints[batch_slice] += n_test_tps
 
-                del (
-                    test_data_f64,
-                    pred_f64,
-                    residuals,
-                    ss_res_batch,
-                    sum_actual_batch,
-                    sum_sq_actual_batch,
-                )
+                del residuals, ss_res_batch, sum_actual_batch, sum_sq_actual_batch
             else:
                 # SLOW MODE: Accumulate full timeseries
                 if accumulator_device.type != "cpu":

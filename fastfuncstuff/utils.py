@@ -6,7 +6,6 @@ Device management and helper functions
 from __future__ import annotations
 
 import os
-import platform
 import warnings
 from typing import TYPE_CHECKING
 
@@ -19,11 +18,19 @@ if TYPE_CHECKING:
 
 def get_device(prefer_device: str | None = None) -> torch.device:
     """
-    Select the execution device with mandatory MPS enforcement on macOS.
+    Select the execution device.
 
-    When running on macOS, FastFuncSim requires the Apple Metal Performance
-    Shaders (MPS) backend. CUDA is supported on other platforms, and CPU
-    execution is only used when no GPU backend is available off macOS.
+    This is a CUDA-first codebase with a first-class CPU fallback; Apple Silicon
+    (MPS) is supported as a best-effort third device. An explicitly requested
+    backend is always honoured end-to-end — we never silently override the
+    caller's choice. When no preference is given we auto-detect: CUDA where
+    available, then MPS on Apple Silicon, then CPU.
+
+    On MPS the only hard limitation is float64 (the Metal backend has no float64
+    support at all); numerically sensitive steps fall back to CPU-float64 via
+    :func:`linalg_device`, and reduction accumulators stay on-device in float32.
+    Users who want guaranteed full float64 precision on a Mac can pass
+    ``-device cpu``.
 
     Parameters
     ----------
@@ -39,17 +46,15 @@ def get_device(prefer_device: str | None = None) -> torch.device:
     Raises
     ------
     RuntimeError
-        If the required backend (especially MPS on macOS) is unavailable.
+        If an explicitly requested backend is unavailable.
     """
-    is_mac = platform.system() == "Darwin"
-
     if prefer_device is not None:
         prefer_device = prefer_device.lower()
         if prefer_device == "mps":
             if not torch.backends.mps.is_available():
                 raise RuntimeError(
                     "MPS device requested but not available. Enable Apple Metal Performance "
-                    "Shaders (macOS 13+ with Apple Silicon) before running FastFuncSim."
+                    "Shaders (macOS 13+ with Apple Silicon) before running."
                 )
             return torch.device("mps")
         if prefer_device == "cuda":
@@ -59,34 +64,104 @@ def get_device(prefer_device: str | None = None) -> torch.device:
                 )
             return torch.device("cuda")
         if prefer_device == "cpu":
-            if is_mac:
-                raise RuntimeError(
-                    "CPU execution is disabled on macOS builds; Apple MPS backend is required."
-                )
-            warnings.warn(
-                "CPU execution requested. Performance may be significantly reduced without GPU acceleration.", stacklevel=2
-            )
             return torch.device("cpu")
         raise ValueError(
             f"Unknown prefer_device='{prefer_device}'. Expected 'mps', 'cuda', or 'cpu'."
         )
 
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-
-    if is_mac:
-        raise RuntimeError(
-            "FastFuncSim requires the Apple Metal Performance Shaders (MPS) backend on macOS, but it was not detected. "
-            "Please update to macOS 13+ with Apple Silicon and install a recent PyTorch build with MPS support."
-        )
-
     if torch.cuda.is_available():
         return torch.device("cuda")
+
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
 
     warnings.warn(
         "No GPU backend detected; falling back to CPU execution. Performance will be limited.", stacklevel=2
     )
     return torch.device("cpu")
+
+
+def linalg_device(device: torch.device) -> torch.device:
+    """Return the device to use for float64 / LAPACK-backed linear algebra.
+
+    MPS has no float64 support, so numerically sensitive steps that require
+    float64 (REML likelihood, Cholesky/SVD/pinv on near-singular or small
+    matrices) run on CPU and have their result moved back to the original
+    device. For CUDA and CPU this is a no-op. Centralising the pattern here
+    keeps the float64-fallback policy in one place.
+    """
+    return torch.device("cpu") if device.type == "mps" else device
+
+
+def accum_dtype(device: torch.device) -> torch.dtype:
+    """Return the dtype for reduction accumulators (sum-of-squares, R², RSS).
+
+    On CUDA/CPU we accumulate in float64 to eliminate rounding in long
+    sum-of-squares reductions. MPS cannot hold float64, so we accumulate in
+    float32 there; callers should pair this with a numerically stable
+    *two-pass* (mean-centred) reduction to avoid catastrophic cancellation.
+    """
+    return torch.float32 if device.type == "mps" else torch.float64
+
+
+def to_linalg_f64(t: torch.Tensor) -> torch.Tensor:
+    """Move a tensor to float64 on its :func:`linalg_device`.
+
+    Convenience for the common "promote to float64 for a sensitive linalg step"
+    pattern. On MPS this lands on CPU (float64); elsewhere it stays put. The
+    caller is responsible for casting the result back, e.g.
+    ``result.to(orig.dtype).to(orig.device)``.
+
+    Device is changed *before* dtype: a combined ``.to(cpu, float64)`` on an MPS
+    tensor still attempts the float64 cast on MPS first and raises, so the two
+    steps must be ordered.
+    """
+    return t.to(device=linalg_device(t.device)).to(torch.float64)
+
+
+_MPS_FLOAT32_WARNED = False
+
+
+def warn_mps_float32_precision(context: str = "") -> None:
+    """Emit a one-time warning that MPS uses float32 where CPU/CUDA use float64.
+
+    MPS has no float64, so sum-of-squares accumulation runs in float32 there.
+    With a numerically stable (mean-centred) reduction the precision loss is
+    small, but we still tell the user once how to get guaranteed full precision.
+    Deduplicated process-wide to avoid spamming long voxel-chunk loops.
+    """
+    global _MPS_FLOAT32_WARNED
+    if _MPS_FLOAT32_WARNED:
+        return
+    _MPS_FLOAT32_WARNED = True
+    suffix = f" ({context})" if context else ""
+    warnings.warn(
+        "MPS has no float64; accumulation uses float32" + suffix + ". This may slightly "
+        "reduce sigma²/t-stat precision versus CPU/CUDA. Use -device cpu for full float64.",
+        stacklevel=2,
+    )
+
+
+_MPS_CPU_FALLBACK_WARNED: set[str] = set()
+
+
+def warn_mps_cpu_fallback(op: str = "") -> None:
+    """One-time warning that a float64-only op falls back to CPU on MPS.
+
+    Some computations (e.g. the Bayesian constrained-ridge FLOBS fit) are
+    float64 end-to-end with no acceptable float32 variant. MPS has no float64,
+    so we run the whole op on CPU there — correct and full-precision, just not
+    GPU-accelerated. Deduplicated per ``op`` to avoid repeat spam.
+    """
+    if op in _MPS_CPU_FALLBACK_WARNED:
+        return
+    _MPS_CPU_FALLBACK_WARNED.add(op)
+    label = op or "this float64 computation"
+    warnings.warn(
+        f"{label} is float64-only and has no MPS support; running on CPU. "
+        "Use a CUDA GPU or -device cpu for the intended path.",
+        stacklevel=2,
+    )
 
 
 def print_device_info(device: torch.device):

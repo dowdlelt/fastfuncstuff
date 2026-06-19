@@ -70,7 +70,7 @@ from fastfuncstuff.glm.core import fit_glm
 from fastfuncstuff.decomposition.ica import FastICA
 from fastfuncstuff.memory import dyn_chunk_estimator
 from fastfuncstuff.decomposition.pca import PCA
-from fastfuncstuff.utils import get_device
+from fastfuncstuff.utils import get_device, linalg_device
 from fastfuncstuff.glm.xval import (
     compute_r2_from_sufficient_stats,
     compute_r2_metric,
@@ -1402,18 +1402,20 @@ def cross_validate_noise_pcs(
         chunk_data_cpu = data_cpu[chunk_start:chunk_end, :]
 
         if is_loro:
-            # Streaming stats: accumulate ss_res, sum, sum_sq for each PC count
-            # Keep on GPU - they're tiny (~24 bytes/voxel) and avoid 1000s of transfers
+            # Streaming stats: accumulate ss_res, sum, sum_sq for each PC count.
+            # float64 accumulators; kept on GPU (CUDA) to avoid 1000s of transfers,
+            # but on CPU for MPS, which has no float64 (they're tiny, ~24 B/voxel).
+            accum_dev = linalg_device(device)
             ss_res_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device=device)
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device=accum_dev)
                 for _ in range(max_components + 1)
             ]
             sum_actual_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device=device)
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device=accum_dev)
                 for _ in range(max_components + 1)
             ]
             sum_sq_actual_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device=device)
+                torch.zeros(chunk_size_actual, dtype=torch.float64, device=accum_dev)
                 for _ in range(max_components + 1)
             ]
         else:
@@ -1600,19 +1602,26 @@ def cross_validate_noise_pcs(
                 y_pred = (design_test_gpu @ betas.T).T  # (chunk, n_test_tps)
 
                 if is_loro:
-                    # Streaming stats: accumulate ss_res, sum_actual, sum_sq_actual
-                    # Keep on GPU - accumulators are on GPU, avoid thousands of transfers
-                    test_actual_f64 = test_actual_projected.double()
-                    y_pred_f64 = y_pred.double()
+                    # Streaming stats: accumulate ss_res, sum_actual, sum_sq_actual.
+                    # CUDA/CPU promote to float64 on-device; MPS has no float64, so
+                    # reduce in float32 on-device and promote to float64 on the CPU
+                    # accumulators (.to(accum_dev).to(float64) — device before dtype).
+                    if test_actual_projected.device.type == "mps":
+                        residuals = test_actual_projected - y_pred
+                        ss_res_fold = (residuals**2).sum(dim=1)
+                        sum_fold = test_actual_projected.sum(dim=1)
+                        sum_sq_fold = (test_actual_projected**2).sum(dim=1)
+                    else:
+                        test_actual_f64 = test_actual_projected.double()
+                        y_pred_f64 = y_pred.double()
+                        residuals = test_actual_f64 - y_pred_f64
+                        ss_res_fold = (residuals**2).sum(dim=1)
+                        sum_fold = test_actual_f64.sum(dim=1)
+                        sum_sq_fold = (test_actual_f64**2).sum(dim=1)
 
-                    residuals = test_actual_f64 - y_pred_f64
-                    ss_res_fold = (residuals**2).sum(dim=1)
-                    sum_fold = test_actual_f64.sum(dim=1)
-                    sum_sq_fold = (test_actual_f64**2).sum(dim=1)
-
-                    ss_res_by_pc[n_pcs] += ss_res_fold
-                    sum_actual_by_pc[n_pcs] += sum_fold
-                    sum_sq_actual_by_pc[n_pcs] += sum_sq_fold
+                    ss_res_by_pc[n_pcs] += ss_res_fold.to(accum_dev).to(torch.float64)
+                    sum_actual_by_pc[n_pcs] += sum_fold.to(accum_dev).to(torch.float64)
+                    sum_sq_actual_by_pc[n_pcs] += sum_sq_fold.to(accum_dev).to(torch.float64)
                 else:
                     # Full accumulator mode: store predictions
                     # Move to accumulator device (GPU if doing GPU projections, otherwise CPU)

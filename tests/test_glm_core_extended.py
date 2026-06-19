@@ -50,17 +50,22 @@ class TestPolynomialMatrix:
 
         assert poly2.shape == (n_timepoints, 3)  # constant + linear + quadratic
 
-        t = torch.linspace(-1, 1, n_timepoints, device=device)
+        # Compare against a float64 reference on CPU: the production matrix is
+        # numpy-float64 cast to float32, so a float32 closed form recomputed on
+        # the device (esp. MPS, which has no float64) differs by ~1 ULP. atol
+        # suits the float32 storage precision.
+        poly2_cpu = poly2.cpu().double()
+        t = torch.linspace(-1, 1, n_timepoints, dtype=torch.float64)
 
         # First column: constant (P0)
-        assert torch.allclose(poly2[:, 0], torch.ones(n_timepoints, device=device))
+        assert torch.allclose(poly2_cpu[:, 0], torch.ones(n_timepoints, dtype=torch.float64), atol=1e-5)
 
         # Second column: linear (P1 = t)
-        assert torch.allclose(poly2[:, 1], t)
+        assert torch.allclose(poly2_cpu[:, 1], t, atol=1e-5)
 
         # Third column: quadratic Legendre (P2 = (3t² - 1) / 2)
         expected_p2 = (3 * t**2 - 1) / 2
-        assert torch.allclose(poly2[:, 2], expected_p2)
+        assert torch.allclose(poly2_cpu[:, 2], expected_p2, atol=1e-5)
 
     def test_construct_polynomial_degree_3(self, device):
         """Test cubic Legendre polynomial."""

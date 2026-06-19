@@ -21,6 +21,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff.utils import linalg_device
+
 from .interp import _cubic_kernel, _heptic_kernel, _quintic_kernel
 
 _BIG_NORM = 1.0e38
@@ -427,6 +429,7 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
         matrix = matrix[None]
     B = matrix.shape[0]
     out_dtype = matrix.dtype
+    out_device = matrix.device
     # The closed-form xzyx factorization (cube roots + chained divisions) loses
     # ~7 digits, so in float32 a near-single-axis rotation (pitch with tiny
     # roll/yaw, as real GN fits of pitch-dominated motion produce) decomposes
@@ -435,9 +438,10 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     # the math is identical. So we decompose in float64 (cheap: per-volume 3x3)
     # and cast the plan back for the float32 shear apply. The reconstruction
     # guard below still catches the genuinely degenerate exact-single-axis case.
+    # MPS has no float64, so the (tiny) decomposition runs on CPU there.
     dtype = torch.float64
-    matrix = matrix.to(dtype)
-    device = matrix.device
+    device = linalg_device(out_device)
+    matrix = matrix.to(device).to(dtype)
     A = matrix[:, :3, :3]
     t = matrix[:, :3, 3]
     nz, ny, nx = shape
@@ -488,7 +492,13 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     recon_err = (Lt - A).abs().amax(dim=(1, 2))
     any_valid = any_valid & (recon_err <= 1.0e-2)
 
-    return ax.to(torch.int64), scl.to(out_dtype), sft.to(out_dtype), any_valid
+    # Plan returns to the caller's device (CPU→original when MPS).
+    return (
+        ax.to(device=out_device, dtype=torch.int64),
+        scl.to(device=out_device, dtype=out_dtype),
+        sft.to(device=out_device, dtype=out_dtype),
+        any_valid.to(out_device),
+    )
 
 
 # ---------------------------------------------------------------------------

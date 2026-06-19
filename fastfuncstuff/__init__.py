@@ -167,10 +167,13 @@ from fastfuncstuff.simulation.metrics_empirical import (
 # Utilities
 # ---------------------------------------------------------------------------
 from fastfuncstuff.utils import (
+    accum_dtype,
     compute_power_spectra,
     compute_power_spectrum,
     get_device,
+    linalg_device,
     print_device_info,
+    to_linalg_f64,
     to_tensor,
 )
 
@@ -292,10 +295,13 @@ __all__ = [
     "compute_estimation_efficiency_empirical",
     "evaluate_design_empirical",
     # Utils
+    "accum_dtype",
     "compute_power_spectra",
     "compute_power_spectrum",
     "get_device",
+    "linalg_device",
     "print_device_info",
+    "to_linalg_f64",
     "to_tensor",
     # Visualization
     "plot_simulation_deep_dive",

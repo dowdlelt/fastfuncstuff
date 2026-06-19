@@ -27,6 +27,16 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 
+def _interp_dtype(device: torch.device) -> torch.dtype:
+    """Interpolation working dtype: float64, or float32 on MPS (no float64).
+
+    Slice-timing shifts are interpolations whose error floor sits well below
+    fMRI SNR, so float32 on MPS is acceptable (use ``-device cpu`` for the exact
+    float64 path that matches 3dTshift bit-for-bit).
+    """
+    return torch.float32 if device.type == "mps" else torch.float64
+
+
 # ---------------------------------------------------------------------------
 # Slice timing loading
 # ---------------------------------------------------------------------------
@@ -109,15 +119,16 @@ def _next_fft_size(n: int) -> int:
 
 
 def _shift_fourier(ts: Tensor, frac_shift: float) -> Tensor:
-    """Shift via Fourier phase rotation.  Promoted to float64 internally."""
+    """Shift via Fourier phase rotation.  Promoted to float64 (float32 on MPS)."""
     orig_dtype = ts.dtype
-    ts = ts.to(torch.float64)
+    dtype = _interp_dtype(ts.device)
+    ts = ts.to(dtype)
 
     nt = ts.shape[1]
     nup = _next_fft_size(nt + 4)
 
     # Zero-pad
-    padded = torch.zeros(ts.shape[0], nup, device=ts.device, dtype=torch.float64)
+    padded = torch.zeros(ts.shape[0], nup, device=ts.device, dtype=dtype)
     padded[:, :nt] = ts
 
     # Forward FFT
@@ -125,7 +136,7 @@ def _shift_fourier(ts: Tensor, frac_shift: float) -> Tensor:
 
     # Phase shift: exp(-i * 2π * k * frac_shift / nup)
     nfreq = spec.shape[1]
-    k = torch.arange(nfreq, device=ts.device, dtype=torch.float64)
+    k = torch.arange(nfreq, device=ts.device, dtype=dtype)
     phase = -2.0 * math.pi * frac_shift * k / nup
     shift_kernel = torch.complex(torch.cos(phase), torch.sin(phase))
     spec = spec * shift_kernel[None, :]
@@ -144,7 +155,8 @@ def _shift_polynomial(ts: Tensor, frac_shift: float, order: int) -> Tensor:
     order: 1=linear, 3=cubic, 5=quintic, 7=heptic
     """
     orig_dtype = ts.dtype
-    ts = ts.to(torch.float64)
+    dtype = _interp_dtype(ts.device)
+    ts = ts.to(dtype)
     nt = ts.shape[1]
 
     af = -frac_shift
@@ -154,7 +166,7 @@ def _shift_polynomial(ts: Tensor, frac_shift: float, order: int) -> Tensor:
     half = order // 2
     n_pts = order + 1
 
-    # Lagrange weights (float64)
+    # Lagrange weights
     nodes = [float(-half + j) for j in range(n_pts)]
     weights_list = []
     for j in range(n_pts):
@@ -163,7 +175,7 @@ def _shift_polynomial(ts: Tensor, frac_shift: float, order: int) -> Tensor:
             if k_idx != j:
                 w *= (aa - nodes[k_idx]) / (nodes[j] - nodes[k_idx])
         weights_list.append(w)
-    weights = torch.tensor(weights_list, dtype=torch.float64, device=ts.device)
+    weights = torch.tensor(weights_list, dtype=dtype, device=ts.device)
 
     # Build output: weighted sum of shifted versions
     out = torch.zeros_like(ts)
@@ -204,7 +216,8 @@ def _m3_window(x: Tensor) -> Tensor:
 def _shift_wsinc(ts: Tensor, frac_shift: float, half_width: int) -> Tensor:
     """Windowed-sinc shift.  Promoted to float64.  half_width=5 or 9."""
     orig_dtype = ts.dtype
-    ts = ts.to(torch.float64)
+    dtype = _interp_dtype(ts.device)
+    ts = ts.to(dtype)
     nt = ts.shape[1]
 
     af = -frac_shift
@@ -213,7 +226,7 @@ def _shift_wsinc(ts: Tensor, frac_shift: float, half_width: int) -> Tensor:
 
     n_pts = 2 * half_width
     offsets = torch.arange(-(half_width - 1), half_width + 1,
-                           dtype=torch.float64, device=ts.device)
+                           dtype=dtype, device=ts.device)
     dist = aa - offsets
     weights = _sinc(dist) * _m3_window(dist / half_width)
     wsum = weights.sum()
@@ -366,9 +379,9 @@ def slicetime_correct(
         orig_min = ts.min(dim=1).values
         orig_max = ts.max(dim=1).values
 
-        # 2. Detrend (float64 for accumulation precision)
-        ts_f64 = ts.to(torch.float64)
-        ts_dt, intercepts, slopes = _linear_detrend(ts_f64)
+        # 2. Detrend (float64 for accumulation precision; float32 on MPS)
+        ts_hp = ts.to(_interp_dtype(ts.device))
+        ts_dt, intercepts, slopes = _linear_detrend(ts_hp)
         ts_dt = ts_dt.to(ts.dtype)
 
         # 3. Record detrended range
@@ -382,9 +395,9 @@ def slicetime_correct(
         # 5. Clip to detrended range
         ts_shifted = ts_shifted.clamp(min=dt_min[:, None], max=dt_max[:, None])
 
-        # 6. Retrend (float64 for accumulation precision)
+        # 6. Retrend (float64 for accumulation precision; float32 on MPS)
         ts_shifted = _linear_retrend(
-            ts_shifted.to(torch.float64),
+            ts_shifted.to(_interp_dtype(ts.device)),
             intercepts, slopes,
         ).to(ts.dtype)
 
@@ -450,9 +463,10 @@ def temporal_resample(
         print(f"  resample: {nt_old} vols @ {tr_old:.4f}s -> {nt_new} vols @ {tr_new:.4f}s")
         print(f"  duration: {total_duration:.2f}s, method: {method}")
 
-    # Build old and new time grids
-    t_old = torch.arange(nt_old, device=vol4d.device, dtype=torch.float64) * tr_old
-    t_new = torch.arange(nt_new, device=vol4d.device, dtype=torch.float64) * tr_new
+    # Build old and new time grids (float32 on MPS, which has no float64)
+    grid_dtype = _interp_dtype(vol4d.device)
+    t_old = torch.arange(nt_old, device=vol4d.device, dtype=grid_dtype) * tr_old
+    t_new = torch.arange(nt_new, device=vol4d.device, dtype=grid_dtype) * tr_new
 
     # Clamp new times to old range (avoid extrapolation)
     t_new = t_new.clamp(max=t_old[-1].item())
@@ -462,7 +476,7 @@ def temporal_resample(
 
     for kk in range(nz):
         # (ny*nx, nt_old) — each voxel's time series as a row
-        ts = vol4d[:, kk, :, :].reshape(nt_old, -1).T.to(torch.float64)
+        ts = vol4d[:, kk, :, :].reshape(nt_old, -1).T.to(grid_dtype)
         n_vox = ts.shape[0]
 
         if method == "linear":

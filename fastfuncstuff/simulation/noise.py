@@ -133,14 +133,15 @@ def generate_fmri_noise(tr: float,
     # Create complex spectrum
     complex_spectrum = amplitude_all * torch.exp(1j * phases)
 
-    # Ensure real output via conjugate symmetry
-    # DC and Nyquist components must be real
-    # Create new tensor to avoid in-place operation error on MPS
-    dc_real = complex_spectrum[0, :].real.clone()
-    complex_spectrum = torch.cat([
-        dc_real.unsqueeze(0),
-        complex_spectrum[1:, :]
-    ], dim=0)
+    # Ensure real output via conjugate symmetry: the DC component must be real.
+    # Keep it complex64 (zero imaginary) rather than a real tensor — MPS cannot
+    # torch.cat a real tensor with a complex one (mixed-dtype cat raises). Out of
+    # place to avoid the MPS in-place-on-complex error.
+    dc_term = torch.complex(
+        complex_spectrum[0, :].real,
+        torch.zeros_like(complex_spectrum[0, :].real),
+    ).unsqueeze(0)
+    complex_spectrum = torch.cat([dc_term, complex_spectrum[1:, :]], dim=0)
 
     # Inverse FFT to get time series
     noise_high = torch.fft.irfft(complex_spectrum, n=n_samples, dim=0).real

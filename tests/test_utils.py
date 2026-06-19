@@ -49,21 +49,22 @@ class TestGetDevice:
                 get_device(prefer_device="mps")
 
     def test_prefer_cpu_on_non_mac(self):
-        """Test requesting CPU on non-Mac platform issues warning"""
+        """Requesting CPU is honoured on any platform, with no warning."""
         with mock.patch("platform.system", return_value="Linux"):
             with mock.patch("torch.backends.mps.is_available", return_value=False):
                 with warnings.catch_warnings(record=True) as w:
                     warnings.simplefilter("always")
                     device = get_device(prefer_device="cpu")
                     assert device.type == "cpu"
-                    assert len(w) == 1
-                    assert "CPU execution requested" in str(w[0].message)
+                    # CPU is a first-class device choice — no warning on request.
+                    assert not any("CPU" in str(x.message) for x in w)
 
-    def test_prefer_cpu_on_mac_raises(self):
-        """Test requesting CPU on macOS raises RuntimeError"""
+    def test_prefer_cpu_on_mac_returns_cpu(self):
+        """Requesting CPU on macOS is honoured (no longer raises)."""
         with mock.patch("platform.system", return_value="Darwin"):
-            with pytest.raises(RuntimeError, match="CPU execution is disabled on macOS"):
-                get_device(prefer_device="cpu")
+            with mock.patch("torch.backends.mps.is_available", return_value=True):
+                device = get_device(prefer_device="cpu")
+                assert device.type == "cpu"
 
     def test_invalid_device_preference(self):
         """Test invalid device preference raises ValueError"""
@@ -71,10 +72,11 @@ class TestGetDevice:
             get_device(prefer_device="tpu")
 
     def test_auto_select_mps_when_available(self):
-        """Test auto-selecting MPS when available"""
-        with mock.patch("torch.backends.mps.is_available", return_value=True):
-            device = get_device()
-            assert device.type == "mps"
+        """Test auto-selecting MPS when available (and CUDA is not)."""
+        with mock.patch("torch.cuda.is_available", return_value=False):
+            with mock.patch("torch.backends.mps.is_available", return_value=True):
+                device = get_device()
+                assert device.type == "mps"
 
     def test_auto_select_cuda_when_mps_unavailable(self):
         """Test auto-selecting CUDA when MPS unavailable on non-Mac"""
@@ -96,12 +98,16 @@ class TestGetDevice:
                         assert len(w) == 1
                         assert "No GPU backend detected" in str(w[0].message)
 
-    def test_mac_without_mps_raises(self):
-        """Test macOS without MPS raises RuntimeError"""
+    def test_mac_without_mps_falls_back_to_cpu(self):
+        """macOS without MPS (and no CUDA) falls back to CPU with a warning."""
         with mock.patch("torch.backends.mps.is_available", return_value=False):
             with mock.patch("platform.system", return_value="Darwin"):
-                with pytest.raises(RuntimeError, match="requires the Apple Metal Performance Shaders"):
-                    get_device()
+                with mock.patch("torch.cuda.is_available", return_value=False):
+                    with warnings.catch_warnings(record=True) as w:
+                        warnings.simplefilter("always")
+                        device = get_device()
+                        assert device.type == "cpu"
+                        assert any("No GPU backend detected" in str(x.message) for x in w)
 
 
 class TestPrintDeviceInfo:

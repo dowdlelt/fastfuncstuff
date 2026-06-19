@@ -222,6 +222,21 @@ def _unweighted_rms(base: Tensor, source: Tensor) -> float:
     return float(rms.item())
 
 
+def _gram_normal_eq(WJ: Tensor, device: torch.device) -> Tensor:
+    """Form the (6, 6) registration normal-equation matrix J'WJ.
+
+    AFNI accumulates these in double (mri_lsqfit.c: "internal calculations are
+    done with doubles"); in float32 the Gram + 6×6 solve lose ~50% of the GN
+    step once J'WJ is ill-conditioned (low tSNR, collinear drift), float64 drops
+    that to ~0.2%. MPS has no float64, so the Gram and downstream solve run in
+    float32 there — use ``-device cpu`` for full-precision registration. The
+    solver follows ``JtWJ.dtype`` end-to-end, so the returned dtype controls it.
+    """
+    if device.type == "mps":
+        return WJ @ WJ.t()
+    return WJ.double() @ WJ.double().t()
+
+
 def gauss_newton_rigid(
     base_flat: Tensor,
     source: Tensor,
@@ -1105,7 +1120,7 @@ def moco(
         # float32 the Gram matrix + 6×6 solve lose ~50% of the GN step once JtWJ
         # is ill-conditioned (low tSNR, collinear drift); float64 here drops that
         # to ~0.2%. WJ and the per-iteration RHS stay float32 (negligible loss).
-        JtWJ = WJ.double() @ WJ.double().t()  # (6, 6) float64
+        JtWJ = _gram_normal_eq(WJ, device)  # (6, 6)
 
         weight_flat_1d = weight.reshape(-1)
     elif config.cost == "quad":
@@ -1166,7 +1181,7 @@ def moco(
             base_flat_masked = base_flat[mask_idx]  # (M,)
             weight_flat_masked = weight_flat_1d[mask_idx]  # (M,)
             WJ_masked = WJ[:, mask_idx]  # (6, M)
-            JtWJ = WJ_masked.double() @ WJ_masked.double().t()  # (6, 6) float64
+            JtWJ = _gram_normal_eq(WJ_masked, device)  # (6, 6)
             if config.verb >= 1:
                 print(f"  Active voxels: {M:,}/{N:,} ({100 * M / N:.1f}%)")
 
@@ -1216,7 +1231,7 @@ def moco(
         wf_coarse = weight_coarse.reshape(1, -1)
         bf_coarse = base_coarse.reshape(-1)
         WJ_c = wf_coarse * derivs_coarse
-        JtWJ_c = WJ_c.double() @ WJ_c.double().t()  # (6, 6) float64
+        JtWJ_c = _gram_normal_eq(WJ_c, device)  # (6, 6)
         wf1_coarse = weight_coarse.reshape(-1)
     else:
         base_coarse = weight_coarse = None

@@ -47,6 +47,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.memory import get_available_memory
+from fastfuncstuff.utils import warn_mps_float32_precision
 
 # ACF model is fit with at least this many distinct radius bins present; below
 # this a 3-parameter fit is meaningless.  AFNI requires >= 10 surviving
@@ -430,7 +431,7 @@ def fit_acf_batched(
     def lm_run(a, b, c):
         """One bounded LM descent from (a, b, c); returns final params + cost."""
         a, b, c = clamp(a, b, c)
-        lam = torch.full((v,), 1e-3, dtype=torch.float64, device=device)
+        lam = torch.full((v,), 1e-3, dtype=y.dtype, device=device)
         cur = cost(a, b, c)
         idx = torch.arange(3, device=device)
         for _ in range(n_iter):
@@ -442,7 +443,7 @@ def fit_acf_batched(
             jb = (a * ex * (r * r) / (b**3)) * w
             jc = ((1.0 - a) * fx * r / (c * c)) * w
 
-            jtj = torch.empty((v, 3, 3), dtype=torch.float64, device=device)
+            jtj = torch.empty((v, 3, 3), dtype=y.dtype, device=device)
             jtj[:, 0, 0] = (ja * ja).sum(1)
             jtj[:, 1, 1] = (jb * jb).sum(1)
             jtj[:, 2, 2] = (jc * jc).sum(1)
@@ -476,7 +477,7 @@ def fit_acf_batched(
         return a, b, c, cur
 
     def start_params(sa, sb, sc):
-        return torch.full((v, 1), sa, dtype=torch.float64, device=device), b0c * sb, c0c * sc
+        return torch.full((v, 1), sa, dtype=y.dtype, device=device), b0c * sb, c0c * sc
 
     # Multi-start: keep the lowest-cost descent per voxel. (A tolerance that
     # prefers the seed solution was tried to tame the c lower-tail drift -- it
@@ -654,7 +655,12 @@ def local_acf(
                 "ACF estimates will be noisy."
             )
 
-    bin_radius_d = nb.bin_radius.to(device)
+    # MPS has no float64; the batched ACF LM fit runs in float32 there (the fit
+    # is full-batch over voxels, so a CPU fallback would be a large transfer).
+    acf_dtype = torch.float32 if device.type == "mps" else torch.float64
+    if device.type == "mps":
+        warn_mps_float32_precision("ACF (FWHMx) LM fit")
+    bin_radius_d = nb.bin_radius.to(device=device, dtype=acf_dtype)
 
     # --- choose z-slab thickness from the memory model ---
     # Per output z-plane device footprint: input sub-volume planes (with halo),
@@ -736,8 +742,8 @@ def local_acf(
             fit_chunk = max(4096, min(fit_chunk, idx.numel()))
             for c0 in range(0, idx.numel(), fit_chunk):
                 cidx = idx[c0 : c0 + fit_chunk]
-                yc = y32[cidx].to(torch.float64)
-                wc = wbool[cidx].to(torch.float64)
+                yc = y32[cidx].to(acf_dtype)
+                wc = wbool[cidx].to(acf_dtype)
                 a, b, c, ok = fit_acf_batched(bin_radius_d, yc, wc, n_iter=lm_iters)
                 fwhm = acf_fwhm_batched(a, b, c, 0.5)
                 fwqm = acf_fwhm_batched(a, b, c, 0.25)

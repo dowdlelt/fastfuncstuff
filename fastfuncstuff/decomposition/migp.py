@@ -16,6 +16,8 @@ from collections.abc import Iterable
 
 import torch
 
+from fastfuncstuff.utils import to_linalg_f64
+
 
 @torch.inference_mode()
 def migp_reduce(
@@ -111,7 +113,9 @@ def _reduce_to_topk(data: torch.Tensor, k: int) -> torch.Tensor:
     if R <= k_eff:
         return data
     orig_dtype = data.dtype
-    d64 = data.to(torch.float64)
+    # MIGP's incremental SVD needs float64; MPS has none, so run on CPU and
+    # return the reduced result to the original device.
+    d64 = to_linalg_f64(data)
     row_mean = d64.mean(dim=1, keepdim=True)
     cov = (d64 @ d64.T - V * (row_mean @ row_mean.T)) / float(V)
     evals, evecs = torch.linalg.eigh(cov)
@@ -120,4 +124,4 @@ def _reduce_to_topk(data: torch.Tensor, k: int) -> torch.Tensor:
     signs = torch.sign(evecs[max_idx, torch.arange(k_eff, device=evecs.device)])
     signs[signs == 0] = 1.0
     evecs = evecs * signs.unsqueeze(0)
-    return (evecs.T @ d64).to(orig_dtype)
+    return (evecs.T @ d64).to(device=data.device, dtype=orig_dtype)

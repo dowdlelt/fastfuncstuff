@@ -19,19 +19,12 @@ from tqdm.auto import tqdm
 from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.design.builder import legendre_polynomials
 from fastfuncstuff.memory import estimate_chunk_size, make_vram_debugger, bytes_per_voxel_glm
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, linalg_device, to_tensor
 from .xval import compute_r2_metric
 
-
-def _linalg_device(device: torch.device) -> torch.device:
-    """Return the device to use for linalg operations.
-
-    MPS does not support float64 or several LAPACK-backed routines
-    (lstsq, cholesky_solve, solve_triangular). For those ops we compute
-    on CPU and move the result back to the original device. This helper
-    makes that pattern explicit and centralised.
-    """
-    return torch.device("cpu") if device.type == "mps" else device
+# MPS's only hard gap is float64 (the Metal backend has no float64 support at
+# all); the f64 linalg routines used below run on CPU on MPS via this helper.
+_linalg_device = linalg_device
 
 
 class GLMResults:
@@ -321,7 +314,8 @@ def inspect_design(
     import sys
     if file is None:
         file = sys.stdout
-    X = design.detach().to(torch.float64).cpu()
+    # .cpu() before float64: MPS cannot hold float64, so move off-device first.
+    X = design.detach().cpu().to(torch.float64)
     n_t, p = X.shape
     if column_labels is None:
         column_labels = [f"col{i}" for i in range(p)]
@@ -475,12 +469,22 @@ def fit_glm(
     results : GLMResults
         Object containing betas, R², etc.
     """
-    # Setup precision
-    dtype = torch.float64 if use_double else torch.float32
-
     # Setup device
     if device is None:
         device = get_device()
+
+    # Setup precision. MPS has no float64, so a full-data float64 fit is
+    # impossible there; downgrade to float32 (the sensitive normal-equation
+    # solve still runs in float64 on CPU via _linalg_device).
+    if use_double and device.type == "mps":
+        warnings.warn(
+            "use_double requested but MPS has no float64 support; using float32 "
+            "for the data. The normal-equation solve still runs in float64 on CPU. "
+            "For a full float64 fit, use -device cpu.",
+            stacklevel=2,
+        )
+        use_double = False
+    dtype = torch.float64 if use_double else torch.float32
 
     # Handle single vs multiple runs
     is_single_run = not isinstance(data, list)
