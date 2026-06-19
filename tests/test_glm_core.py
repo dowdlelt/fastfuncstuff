@@ -574,13 +574,10 @@ class TestGLMAdvancedFeatures:
             verbose=False, device=device
         )
 
-        # Results should be in float64 — except on MPS, which has no float64 and
-        # so downgrades use_double to float32 (the normal-equation solve still
-        # runs in float64 on CPU). See fit_glm / utils.linalg_device.
-        if device.type == "mps":
-            assert results.betas.dtype == torch.float32
-        else:
-            assert results.betas.dtype == torch.float64
+        # Results should be in float64. On MPS (no float64) fit_glm honours the
+        # request by transparently running the fit on CPU, so betas are still
+        # float64 regardless of the requested device.
+        assert results.betas.dtype == torch.float64
 
     def test_streaming_mode(self, device):
         """Test GLM with preload_data_to_device=False (streaming)."""

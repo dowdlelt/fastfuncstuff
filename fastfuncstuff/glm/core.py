@@ -473,17 +473,16 @@ def fit_glm(
     if device is None:
         device = get_device()
 
-    # Setup precision. MPS has no float64, so a full-data float64 fit is
-    # impossible there; downgrade to float32 (the sensitive normal-equation
-    # solve still runs in float64 on CPU via _linalg_device).
+    # Setup precision. MPS has no float64, so honour an explicit full-precision
+    # request by running on CPU rather than silently downgrading to float32.
     if use_double and device.type == "mps":
         warnings.warn(
-            "use_double requested but MPS has no float64 support; using float32 "
-            "for the data. The normal-equation solve still runs in float64 on CPU. "
-            "For a full float64 fit, use -device cpu.",
+            "use_double requested but MPS has no float64; running on CPU to honour "
+            "the full-precision request. Pass -device cpu to silence this, or drop "
+            "use_double to run float32 on MPS.",
             stacklevel=2,
         )
-        use_double = False
+        device = torch.device("cpu")
     dtype = torch.float64 if use_double else torch.float32
 
     # Handle single vs multiple runs

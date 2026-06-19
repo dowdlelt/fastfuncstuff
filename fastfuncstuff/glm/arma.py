@@ -3299,12 +3299,22 @@ def fit_glm_arma11(
     if device is None:
         device = get_device()
 
-    # MPS has no float64; a full-data float64 fit is impossible there. Downgrade
-    # to float32 and warn once (the stable two-pass accumulation keeps R²/sigma²
-    # parity tight; -device cpu gives guaranteed full float64).
+    # MPS has no float64. Honour an explicit full-precision request by running on
+    # CPU rather than silently downgrading — and CPU is faster for the REML path
+    # anyway (MPS's batched Cholesky/triangular-solve is ~5x slower than LAPACK).
     if use_double and device.type == "mps":
-        warn_mps_float32_precision("ARMA fit")
-        use_double = False
+        warnings.warn(
+            "use_double requested but MPS has no float64; running ARMA on CPU to "
+            "honour the full-precision request. Pass -device cpu to silence this, "
+            "or drop use_double to run float32 on MPS.",
+            stacklevel=2,
+        )
+        device = torch.device("cpu")
+        # Move inputs off MPS before the float64 cast below (MPS can't cast f64).
+        if isinstance(data, torch.Tensor) and data.device.type == "mps":
+            data = data.cpu()
+        if isinstance(design, torch.Tensor) and design.device.type == "mps":
+            design = design.cpu()
     dtype = torch.float64 if use_double else torch.float32
 
     # On CUDA/CPU the fp64 accumulator eliminates rounding in sum-of-squares;
