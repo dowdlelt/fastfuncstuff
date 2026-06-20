@@ -8,7 +8,7 @@ import sys
 import time
 
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header
-from fastfuncstuff.denoise.nordic import NordicConfig, run_nordic
+from fastfuncstuff.denoise.nordic import NordicConfig, run_nordic, run_nordic_multiecho
 from fastfuncstuff.utils import configure_torch_backends, get_device
 
 
@@ -40,11 +40,20 @@ Examples:
     )
 
     io_group = parser.add_argument_group("Input/Output")
-    io_group.add_argument("-input-magn", required=True, help="Input magnitude NIfTI file")
+    io_group.add_argument(
+        "-input-magn",
+        "-input_magn",
+        nargs="+",
+        required=True,
+        help="Input magnitude NIfTI file(s). Pass one per echo (>=2) to enable "
+        "the multi-echo cross-echo signal-rescue path.",
+    )
     io_group.add_argument(
         "-input-phase",
+        "-input_phase",
+        nargs="+",
         default=None,
-        help="Input phase NIfTI file (required unless -magnitude-only)",
+        help="Input phase NIfTI file(s); one per magnitude file. Required unless -magnitude-only.",
     )
     io_group.add_argument("-prefix", required=True, help="Output prefix")
     io_group.add_argument(
@@ -61,6 +70,12 @@ Examples:
         "-save-residual-map",
         action="store_true",
         help="Save denoising residual map (magnitude of complex difference)",
+    )
+    io_group.add_argument(
+        "-save-num-comps",
+        "-save_num_comps",
+        action="store_true",
+        help="Save per-voxel count of components removed (patch-averaged, fractional)",
     )
 
     algo_group = parser.add_argument_group("Algorithm")
@@ -151,6 +166,32 @@ Examples:
         help="Enable mean-phase removal per slice (MATLAB phase_slice_average_for_kspace_centering=1)",
     )
 
+    me_group = parser.add_argument_group("Multi-echo rescue (>=2 echoes)")
+    me_group.add_argument(
+        "-no-rescue",
+        "-no_rescue",
+        dest="rescue",
+        action="store_false",
+        help="Disable the cross-echo signal-rescue guard (denoise each echo "
+        "independently). Default: rescue on for multi-echo input.",
+    )
+    me_group.add_argument(
+        "-rescue-band",
+        "-rescue_band",
+        type=float,
+        default=0.25,
+        help="Fraction of each echo's kill set (top singular values, nearest the "
+        "threshold) tested for rescue. Larger = more components considered.",
+    )
+    me_group.add_argument(
+        "-rescue-alpha",
+        "-rescue_alpha",
+        type=float,
+        default=0.05,
+        help="Per-patch false-rescue rate. The rescue threshold is the "
+        "(1 - alpha) quantile of the all-thermal-noise null.",
+    )
+
     perf_group = parser.add_argument_group("Performance")
     perf_group.add_argument(
         "-device",
@@ -177,8 +218,18 @@ Examples:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    if not args.magnitude_only and args.input_phase is None:
+    magn_files: list[str] = list(args.input_magn)
+    phase_files: list[str] | None = list(args.input_phase) if args.input_phase is not None else None
+    n_echoes = len(magn_files)
+
+    if not args.magnitude_only and phase_files is None:
         print("ERROR: -input-phase is required unless -magnitude-only is set")
+        sys.exit(1)
+    if phase_files is not None and len(phase_files) != n_echoes:
+        print(
+            f"ERROR: got {n_echoes} magnitude file(s) but {len(phase_files)} phase file(s) "
+            "(need one phase per echo)"
+        )
         sys.exit(1)
 
     prefix_info = parse_prefix(args.prefix)
@@ -188,10 +239,12 @@ def main(argv: list[str] | None = None) -> None:
     configure_torch_backends(device)
 
     print_cli_header("ffs_nordic", "NORDIC-style denoising")
-    print(f"Input magnitude: {args.input_magn}")
-    print(f"Input phase: {args.input_phase}")
+    print(f"Input magnitude: {magn_files}")
+    print(f"Input phase: {phase_files}")
     print(f"Output prefix: {prefix}")
     print(f"Device: {device}")
+    if n_echoes > 1:
+        print(f"Multi-echo: {n_echoes} echoes, rescue={'on' if args.rescue else 'off'}")
 
     cfg = NordicConfig(
         temporal_phase=args.temporal_phase,
@@ -210,31 +263,51 @@ def main(argv: list[str] | None = None) -> None:
         phase_slice_average=args.phase_slice_average,
         save_gfactor_map=args.save_gfactor_map,
         save_residual_map=args.save_residual_map,
+        save_num_comps=args.save_num_comps,
         make_complex_nii=args.make_complex_nii,
         svd_batch_size=args.svd_batch_size,
         decomp_method=args.decomp_method,
+        rescue=args.rescue,
+        rescue_band=args.rescue_band,
+        rescue_alpha=args.rescue_alpha,
         verbose=args.verb >= 1,
     )
 
     t0 = time.time()
-    outputs = run_nordic(
-        magnitude_file=args.input_magn,
-        phase_file=args.input_phase,
-        output_prefix=prefix,
-        config=cfg,
-        device=device,
-    )
+    if n_echoes > 1:
+        all_outputs = run_nordic_multiecho(
+            magnitude_files=magn_files,
+            phase_files=phase_files,  # type: ignore[arg-type]
+            output_prefix=prefix,
+            config=cfg,
+            device=device,
+        )
+    else:
+        all_outputs = [
+            run_nordic(
+                magnitude_file=magn_files[0],
+                phase_file=phase_files[0] if phase_files is not None else None,
+                output_prefix=prefix,
+                config=cfg,
+                device=device,
+            )
+        ]
     elapsed = time.time() - t0
 
     print("\nDone")
-    print(f"  Magnitude output: {outputs.magnitude_file}")
-    if outputs.phase_file is not None:
-        print(f"  Phase output: {outputs.phase_file}")
-    if outputs.gfactor_file is not None:
-        print(f"  G-factor output: {outputs.gfactor_file}")
-    if outputs.residual_file is not None:
-        print(f"  Residual output: {outputs.residual_file}")
-    print(f"  Metadata: {outputs.metadata_file}")
+    for i, outputs in enumerate(all_outputs):
+        if n_echoes > 1:
+            print(f"  [echo {i + 1}]")
+        print(f"  Magnitude output: {outputs.magnitude_file}")
+        if outputs.phase_file is not None:
+            print(f"  Phase output: {outputs.phase_file}")
+        if outputs.gfactor_file is not None:
+            print(f"  G-factor output: {outputs.gfactor_file}")
+        if outputs.residual_file is not None:
+            print(f"  Residual output: {outputs.residual_file}")
+        if outputs.num_comps_file is not None:
+            print(f"  Num-comps output: {outputs.num_comps_file}")
+        print(f"  Metadata: {outputs.metadata_file}")
     print(f"  Elapsed: {elapsed:.1f} s")
 
 

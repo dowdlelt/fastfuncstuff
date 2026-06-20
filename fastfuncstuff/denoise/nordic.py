@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +40,6 @@ from fastfuncstuff.memory import (
     get_available_memory,
 )
 from fastfuncstuff.utils import get_device, to_tensor
-
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -66,12 +66,22 @@ class NordicConfig:
     phase_slice_average: bool = False
     save_gfactor_map: bool = False
     save_residual_map: bool = False
+    save_num_comps: bool = False
     make_complex_nii: bool = False
     full_dynamic_range: bool = False
     write_gzipped_niftis: bool = True
     svd_batch_size: int = 512
     decomp_method: str = "auto"
     verbose: bool = True
+
+    # Multi-echo signal-rescue (only active on the multi-echo path; see
+    # run_nordic_multiecho). A component NORDIC would remove from one echo is
+    # protected if it has a correlated partner in another echo — thermal noise
+    # is the only thing independent across echoes, so cross-echo correlation
+    # marks signal. These have no effect on the single-echo path.
+    rescue: bool = True
+    rescue_band: float = 0.25  # top fraction of each echo's kill set tested
+    rescue_alpha: float = 0.05  # false-rescue rate = (1 - alpha) null quantile
 
 
 @dataclass
@@ -82,6 +92,7 @@ class NordicOutputs:
     phase_file: Path | None
     gfactor_file: Path | None
     residual_file: Path | None
+    num_comps_file: Path | None
     metadata_file: Path
 
 
@@ -102,6 +113,9 @@ class _LLRStats:
     threshold_map: torch.Tensor
     energy_removed: torch.Tensor
     snr_weight: torch.Tensor
+    # Per-voxel count of components rescued from removal by the cross-echo
+    # guard. Zero everywhere on the single-echo path. Diagnostic only.
+    rescued_map: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +710,262 @@ def _llr_denoise(
 
 
 # ---------------------------------------------------------------------------
+# Multi-echo cross-echo signal rescue
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=4096)
+def _rescue_null_threshold(
+    n_time: int,
+    k_cand: int,
+    d_target: int,
+    n_other: int,
+    alpha: float,
+    n_trials: int = 4000,
+) -> float:
+    """Per-patch family-wise rescue threshold under H0 (all thermal noise).
+
+    Returns the ``(1 - alpha)`` quantile of the *max* projection norm
+
+        max over candidate i, other echo e'   || P_{S_{e'}} v_i ||
+
+    where each candidate ``v_i`` is a Haar-random complex unit temporal vector
+    in ``C^n_time`` (the SVD right vectors of a pure-noise patch are Haar) and
+    each target ``S_{e'}`` is a Haar-random ``d_target``-dim complex subspace
+    (independent across the ``n_other`` other echoes). Controls the probability
+    of *any* false rescue in a patch at ``alpha``.
+
+    Content-independent — depends only on the dimensions — so it is cached and
+    reused across every patch of the run. Computed on CPU (one-off, tiny) and
+    seeded for reproducibility. The quantile reduction is in float64.
+    """
+    if k_cand <= 0 or d_target <= 0 or n_other <= 0:
+        return 1.0  # nothing to compare → never rescue
+    k = min(k_cand, n_time)
+    d = min(d_target, n_time)
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    stats = []
+    done = 0
+    chunk = 512
+    while done < n_trials:
+        b = min(chunk, n_trials - done)
+        # Haar-orthonormal candidate columns: QR of complex Gaussian.
+        cg = torch.randn(b, n_time, k, dtype=torch.complex64, generator=gen)
+        cq, _ = torch.linalg.qr(cg)  # (b, n_time, k)
+        best = torch.zeros(b, k)
+        for _ in range(n_other):
+            qg = torch.randn(b, n_time, d, dtype=torch.complex64, generator=gen)
+            qq, _ = torch.linalg.qr(qg)  # (b, n_time, d)
+            proj = qq.mH @ cq  # (b, d, k)
+            pn = (proj.abs() ** 2).sum(dim=1).sqrt()  # (b, k) per-candidate proj norm
+            best = torch.maximum(best, pn)
+        stats.append(best.amax(dim=1))  # (b,) max over candidates
+        done += b
+    stat = torch.cat(stats).double()
+    return float(torch.quantile(stat, 1.0 - alpha).item())
+
+
+def _llr_denoise_multiecho(
+    data_echoes: list[torch.Tensor],
+    kernel_size: tuple[int, int, int],
+    patch_overlap: int,
+    threshold_mode: str,
+    threshold_values: list[float],
+    *,
+    rescue: bool,
+    rescue_band: float,
+    rescue_alpha: float,
+    verbose: bool,
+    svd_batch_size: int = 512,
+    device: torch.device | None = None,
+) -> list[tuple[torch.Tensor, _LLRStats]]:
+    """Per-echo NORDIC LLR with a cross-echo signal-rescue guard.
+
+    Each echo is denoised exactly as the single-echo path (same threshold, same
+    reconstruction), but before a below-threshold component is removed it is
+    tested against the *other* echoes. A component in echo e's **marginal kill
+    band** (the top ``rescue_band`` fraction of its kill set, by singular value)
+    that aligns — above the null threshold — with another echo's signal subspace
+    (that echo's keep set ∪ its marginal band) is **promoted back to keep**.
+    Thermal noise is independent across echoes, so cross-echo alignment marks
+    signal. The guard only ever moves components kill→keep; with ``rescue=False``
+    (or no alignment found) the result is identical to E independent runs.
+
+    Returns one ``(recon, stats)`` per echo, in input order. Patches share
+    corners across echoes (same grid), so the candidate→target test is a small
+    batched matmul on the temporal singular vectors.
+    """
+    E = len(data_echoes)
+    if device is None:
+        device = data_echoes[0].device
+    data_dev = data_echoes[0].device
+    cross_device = device != data_dev
+
+    nx, ny, nz, nt = data_echoes[0].shape
+    wx = min(kernel_size[0], nx)
+    wy = min(kernel_size[1], ny)
+    wz = min(kernel_size[2], nz)
+    M = wx * wy * wz
+    N = nt
+    K = min(M, N)
+
+    sx = max(1, wx // max(1, patch_overlap))
+    sy = max(1, wy // max(1, patch_overlap))
+    sz = max(1, wz // max(1, patch_overlap))
+    xs = _build_patch_starts(nx, wx, sx)
+    ys = _build_patch_starts(ny, wy, sy)
+    zs = _build_patch_starts(nz, wz, sz)
+    corners = [(x0, y0, z0) for x0 in xs for y0 in ys for z0 in zs]
+    total = len(corners)
+
+    # Accumulators (one recon per echo; geometry weight shared).
+    recon_acc = [
+        torch.zeros(nx, ny, nz, nt, dtype=data_echoes[e].dtype, device=device) for e in range(E)
+    ]
+    weight = torch.zeros((nx, ny, nz), dtype=torch.float32, device=device)
+    removed_map = [torch.zeros_like(weight) for _ in range(E)]
+    rescued_map = [torch.zeros_like(weight) for _ in range(E)]
+
+    # Per-patch voxel offsets (same machinery as _llr_denoise).
+    _ox, _oy, _oz = torch.arange(wx), torch.arange(wy), torch.arange(wz)
+    gx, gy, gz = torch.meshgrid(_ox, _oy, _oz, indexing="ij")
+    dx, dy, dz = gx.ravel(), gy.ravel(), gz.ravel()
+    local_offsets_flat = dx * (ny * nz) + dy * nz + dz  # (M,)
+    corner_xs = torch.tensor([c[0] for c in corners], dtype=torch.long)
+    corner_ys = torch.tensor([c[1] for c in corners], dtype=torch.long)
+    corner_zs = torch.tensor([c[2] for c in corners], dtype=torch.long)
+    corners_flat = corner_xs * (ny * nz) + corner_ys * nz + corner_zs
+
+    recon_flat = [r.reshape(-1, nt) for r in recon_acc]
+    weight_flat = weight.reshape(-1)
+    removed_flat = [m.reshape(-1) for m in removed_map]
+    rescued_flat = [m.reshape(-1) for m in rescued_map]
+    ones_BM = torch.ones(svd_batch_size * M, device=device)
+
+    idx_arange = torch.arange(K, device=device)
+
+    pbar = tqdm(total=total, desc="ME-LLR patches", unit="patch") if verbose else None
+
+    for batch_start in range(0, total, svd_batch_size):
+        B = min(svd_batch_size, total - batch_start)
+        bx = corner_xs[batch_start : batch_start + B]
+        by = corner_ys[batch_start : batch_start + B]
+        bz = corner_zs[batch_start : batch_start + B]
+        xi = (bx[:, None] + dx[None, :]).to(data_dev)  # (B, M)
+        yi = (by[:, None] + dy[None, :]).to(data_dev)
+        zi = (bz[:, None] + dz[None, :]).to(data_dev)
+        b_corners_flat = corners_flat[batch_start : batch_start + B]
+        flat_b = (b_corners_flat[:, None] + local_offsets_flat[None, :]).reshape(-1).to(device)
+
+        # ---- Pass 1: per-echo SVD → temporal vectors + base keep count ----
+        vh_list: list[torch.Tensor] = []  # (B, K, N) rows = right singular vectors
+        n_keep_list: list[torch.Tensor] = []  # (B,) base keep count (prefix)
+        for e in range(E):
+            mats = data_echoes[e][xi, yi, zi, :]
+            if cross_device:
+                mats = mats.to(device)
+            # Right singular vectors (rows of vh) carry the temporal structure;
+            # U is not needed — reconstruction uses the projection X V V^H.
+            _, s, vh = torch.linalg.svd(mats, full_matrices=False)
+            del mats
+            s0 = s.abs()
+            if threshold_mode == "mp":
+                cuts, _ = _mp_hard_index_batch(s0, m=M, n=N)
+                n_keep = cuts.to(device)
+            else:
+                n_keep = (s0 >= threshold_values[e]).sum(dim=1).to(device)
+            vh_list.append(vh)
+            n_keep_list.append(n_keep.clamp(min=0, max=K))
+            del s, s0
+
+        # ---- Base keep / marginal-band masks (B, K) ----
+        keep_masks = [idx_arange[None, :] < nk[:, None] for nk in n_keep_list]
+        n_kill = [K - nk for nk in n_keep_list]
+        band_counts = [torch.ceil(rescue_band * nkl.float()).long() for nkl in n_kill]
+        band_masks = [
+            (idx_arange[None, :] >= n_keep_list[e][:, None])
+            & (idx_arange[None, :] < (n_keep_list[e] + band_counts[e])[:, None])
+            for e in range(E)
+        ]
+        target_masks = [keep_masks[e] | band_masks[e] for e in range(E)]
+        aug_masks = [keep_masks[e].clone() for e in range(E)]
+        rescued_counts = [torch.zeros(B, device=device) for _ in range(E)]
+
+        # ---- Pass 2: cross-echo rescue ----
+        if rescue and E >= 2:
+            for e in range(E):
+                cand_e = band_masks[e]  # (B, K)
+                if not bool(cand_e.any()):
+                    continue
+                proj_best = torch.zeros(B, K, device=device)  # per-candidate max proj norm
+                d_target_rep = 0
+                for ep in range(E):
+                    if ep == e:
+                        continue
+                    corr = vh_list[e] @ vh_list[ep].mH  # (B, K, K) complex inner products
+                    tgt = target_masks[ep].float()  # (B, K) cols to keep
+                    p2 = (corr.abs() ** 2) * tgt[:, None, :]
+                    pn = p2.sum(dim=2).sqrt()  # (B, K) proj norm of each comp onto e' target
+                    proj_best = torch.maximum(proj_best, pn)
+                    d_target_rep = max(d_target_rep, int(target_masks[ep].sum(dim=1).max().item()))
+                    del corr, p2, pn
+                # Conservative per-batch null dims (batch-max candidate / target sizes).
+                k_cand_rep = int(band_counts[e].max().item())
+                thr = _rescue_null_threshold(
+                    n_time=N,
+                    k_cand=k_cand_rep,
+                    d_target=d_target_rep,
+                    n_other=E - 1,
+                    alpha=rescue_alpha,
+                )
+                resc = cand_e & (proj_best > thr)  # (B, K)
+                aug_masks[e] = aug_masks[e] | resc
+                rescued_counts[e] = resc.sum(dim=1).float()
+
+        # ---- Pass 3: reconstruct each echo with its augmented mask ----
+        weight_flat.index_add_(0, flat_b, ones_BM[: B * M])
+        for e in range(E):
+            mats = data_echoes[e][xi, yi, zi, :]
+            if cross_device:
+                mats = mats.to(device)
+            # X_denoised = X V_k V_k^H, with V_k = kept right singular vectors.
+            # Zero non-kept rows of vh, then P = vh_k^H vh_k is the projector.
+            vh_k = vh_list[e] * aug_masks[e][:, :, None]  # (B, K, N)
+            proj = vh_k.mH @ vh_k  # (B, N, N)
+            del vh_k
+            recon = mats @ proj  # (B, M, N)
+            del mats, proj
+            recon_flat[e].index_add_(0, flat_b, recon.reshape(-1, nt))
+            del recon
+            n_removed = (K - aug_masks[e].sum(dim=1)).float()  # (B,)
+            removed_flat[e].index_add_(0, flat_b, n_removed.repeat_interleave(M))
+            rescued_flat[e].index_add_(0, flat_b, rescued_counts[e].repeat_interleave(M))
+
+        del vh_list
+        if pbar is not None:
+            pbar.update(B)
+
+    if pbar is not None:
+        pbar.close()
+
+    w = torch.clamp(weight, min=1.0)
+    results: list[tuple[torch.Tensor, _LLRStats]] = []
+    zeros_w = torch.zeros_like(w)
+    for e in range(E):
+        recon_out = recon_acc[e] / w[..., None]
+        stats = _LLRStats(
+            weight=w,
+            noise_map=zeros_w,
+            threshold_map=removed_map[e] / w,
+            energy_removed=zeros_w,
+            snr_weight=zeros_w,
+            rescued_map=rescued_map[e] / w,
+        )
+        results.append((recon_out, stats))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # NORDIC threshold estimation  (MATLAB lines ~580-600)
 # ---------------------------------------------------------------------------
 
@@ -729,19 +999,49 @@ def _estimate_nordic_lambda(
 # ---------------------------------------------------------------------------
 
 
-def run_nordic(
+@dataclass
+class _PreppedEcho:
+    """Output of NORDIC preprocessing (steps 1-6) for a single echo.
+
+    Shared by the single-echo (run_nordic) and multi-echo
+    (run_nordic_multiecho) paths so prep/finalize have one source of truth.
+    """
+
+    ksp2: torch.Tensor | None  # prepped complex data, length nt_keep
+    gfactor: torch.Tensor
+    mp_unit: torch.Tensor | None
+    dd_phase: torch.Tensor | None
+    threshold_mode: str
+    threshold_value: float
+    measured_noise: float
+    absolute_scale: float
+    kernel_pca: tuple[int, int, int]
+    is_complex: bool
+    phase_in_used: bool
+    n_noise_vols: int
+    orig_shape: tuple[int, int, int, int]  # nx, ny, nz, nt (pre-trim)
+    nt_keep: int
+
+
+def _prepare_echo(
     magnitude_file: str,
     phase_file: str | None,
-    output_prefix: str,
-    config: NordicConfig | None = None,
-    device: torch.device | None = None,
-) -> NordicOutputs:
-    """Run NORDIC-style denoising matching NIFTI_NORDIC.m data flow."""
-    cfg = config or NordicConfig()
-    dev = (
-        device if device is not None else get_device("cuda" if torch.cuda.is_available() else None)
-    )
+    cfg: NordicConfig,
+    dev: torch.device,
+    *,
+    gfactor_override: torch.Tensor | None = None,
+    measured_noise_override: float | None = None,
+    echo_label: str = "",
+) -> _PreppedEcho:
+    """NORDIC preprocessing for one echo: load -> phase -> g-factor -> threshold.
 
+    ``gfactor_override`` / ``measured_noise_override`` let later echoes reuse
+    echo 1's g-factor map and noise scale so every echo is normalized
+    identically — the precondition for the cross-echo rescue guard to be valid
+    (g-factor is coil/acceleration geometry, TE-invariant; thermal sigma is
+    TE-invariant). When ``gfactor_override`` is given the MP g-factor pass is
+    skipped entirely.
+    """
     # ------------------------------------------------------------------
     # 1. Load data, form complex, apply ABSOLUTE_SCALE
     # ------------------------------------------------------------------
@@ -799,7 +1099,7 @@ def run_nordic(
         kernel_pca = cfg.kernel_size_pca
 
     if cfg.verbose:
-        print("\nNORDIC denoising")
+        print(f"\nNORDIC denoising{echo_label}")
         print(f"  Input shape: {tuple(II.shape)}")
         print(f"  Device: {dev}")
         print(f"  Kernel PCA: {kernel_pca}")
@@ -854,9 +1154,13 @@ def run_nordic(
     # 3. G-factor estimation  (MP-PCA pass on first N volumes)
     # ------------------------------------------------------------------
     gfactor = torch.ones((nx, ny, nz), dtype=torch.float32, device=dev)
-    gfactor_file: Path | None = None
 
-    if cfg.save_gfactor_map or cfg.nordic or cfg.mp_mode == 1:
+    if gfactor_override is not None:
+        # Multi-echo: reuse echo 1's g-factor map (estimated where signal is
+        # strongest). g-factor is TE-invariant, so this is both correct and a
+        # large speedup (skips the per-echo MP pass).
+        gfactor = gfactor_override.to(dev)
+    elif cfg.save_gfactor_map or cfg.nordic or cfg.mp_mode == 1:
         g_nvol = min(max(1, cfg.gfactor_nvols), nt_keep)
         if cfg.use_magn_for_gfactor:
             g_data = torch.abs(II[..., :g_nvol]).to(dtype)
@@ -960,6 +1264,12 @@ def run_nordic(
         measured_noise /= math.sqrt(2.0)
     measured_noise = max(measured_noise, 1e-8)
 
+    if measured_noise_override is not None:
+        # Multi-echo: share a single thermal sigma across echoes (thermal noise
+        # is TE-invariant; this keeps every echo's NORDIC threshold on the same
+        # scale so the cross-echo comparison is apples-to-apples).
+        measured_noise = max(measured_noise_override, 1e-8)
+
     if cfg.verbose:
         print(f"  Measured noise sigma: {measured_noise:.6g}")
 
@@ -995,67 +1305,55 @@ def run_nordic(
         if cfg.verbose:
             print(f"  NORDIC lambda: {threshold_value:.6g}")
 
-    # ------------------------------------------------------------------
-    # 7. Main LLR denoising
-    # ------------------------------------------------------------------
-    # Memory check: if data + accumulators + working set exceeds available
-    # GPU memory, offload data to CPU and stream patches to GPU per batch.
-    if dev.type == "cuda":
-        mem_est = estimate_nordic_llr_memory(
-            shape=KSP2.shape,
-            kernel_size=kernel_pca,
-            svd_batch_size=cfg.svd_batch_size,
-            dtype_bytes=KSP2.element_size(),
-            return_recon=True,
-        )
-        avail = get_available_memory(dev)
-        # Need accumulators + working set on GPU (data can go to CPU)
-        gpu_without_data = mem_est["total"] - mem_est["data"]
-        if mem_est["total"] > avail:
-            if cfg.verbose:
-                print(
-                    f"  Memory guard: LLR needs ~{mem_est['total'] / 1024**3:.2f} GiB "
-                    f"but only {avail / 1024**3:.2f} GiB available."
-                )
-                print(
-                    f"  Offloading input ({mem_est['data'] / 1024**3:.2f} GiB) to CPU; "
-                    f"accumulators + working set = {gpu_without_data / 1024**3:.2f} GiB stay on GPU."
-                )
-            KSP2 = KSP2.cpu()
-            torch.cuda.empty_cache()
-
-    denoised, llr_stats = _llr_denoise(
-        KSP2,
-        kernel_size=kernel_pca,
-        patch_overlap=max(1, cfg.patch_overlap),
+    return _PreppedEcho(
+        ksp2=KSP2,
+        gfactor=gfactor,
+        mp_unit=mp_unit,
+        dd_phase=dd_phase,
         threshold_mode=threshold_mode,
         threshold_value=threshold_value,
-        verbose=cfg.verbose,
-        svd_batch_size=cfg.svd_batch_size,
-        decomp_method=cfg.decomp_method,
-        device=dev,
+        measured_noise=measured_noise,
+        absolute_scale=absolute_scale,
+        kernel_pca=kernel_pca,
+        is_complex=is_complex,
+        phase_in_used=phase_in_used,
+        n_noise_vols=n_noise_vols,
+        orig_shape=(nx, ny, nz, nt),
+        nt_keep=nt_keep,
     )
 
-    # Compute residual (complex difference in transformed space) before
-    # freeing the input.  Reuse KSP2 memory: residual = input - denoised.
-    residual: torch.Tensor | None = None
-    if cfg.save_residual_map:
-        residual = KSP2.to(denoised.device) - denoised
-    # Free the input array — denoised is a separate allocation.
-    # KSP2 is an alias for II; delete both to drop the refcount.
-    del KSP2
-    II = None  # noqa: F841
-    if dev.type == "cuda":
-        torch.cuda.empty_cache()
 
-    mean_removed = float(torch.mean(llr_stats.threshold_map).item())
-    if cfg.verbose:
-        print(f"  Mean components removed per patch: {mean_removed:.3f}")
-        if mean_removed < 0.1:
-            print(
-                "  WARNING: Near no-op denoising detected "
-                f"(mean singular values removed per patch={mean_removed:.4f})."
-            )
+def _finalize_echo(
+    prepped: _PreppedEcho,
+    denoised: torch.Tensor,
+    llr_stats: _LLRStats,
+    residual: torch.Tensor | None,
+    mean_removed: float,
+    output_prefix: str,
+    cfg: NordicConfig,
+    dev: torch.device,
+    magnitude_file: str,
+    phase_file: str | None,
+    *,
+    extra_meta: dict | None = None,
+) -> NordicOutputs:
+    """Undo NORDIC transforms (step 8) and write outputs (step 9) for one echo.
+
+    ``extra_meta`` is merged into the metadata JSON (multi-echo uses it to record
+    echo index and rescue counts).
+    """
+    gfactor = prepped.gfactor
+    dd_phase = prepped.dd_phase
+    mp_unit = prepped.mp_unit
+    absolute_scale = prepped.absolute_scale
+    phase_in_used = prepped.phase_in_used
+    nx, ny, nz, nt = prepped.orig_shape
+    nt_keep = prepped.nt_keep
+    n_noise_vols = prepped.n_noise_vols
+    kernel_pca = prepped.kernel_pca
+    threshold_mode = prepped.threshold_mode
+    threshold_value = prepped.threshold_value
+    measured_noise = prepped.measured_noise
 
     # ------------------------------------------------------------------
     # 8. Undo transformations: gfactor, meanphase, DD_phase, scale
@@ -1147,6 +1445,27 @@ def run_nordic(
         )
         del residual
 
+    rescued_file: Path | None = None
+    if llr_stats.rescued_map is not None and cfg.rescue:
+        rescued_file = out_dir / f"{out_prefix.name}_rescued{ext}"
+        save_nifti(
+            llr_stats.rescued_map.detach().cpu().numpy().astype(np.float32),
+            output_path=rescued_file,
+            reference_img=magnitude_file,
+        )
+
+    # Per-voxel count of components removed (patch-averaged, so fractional):
+    # shows where energy is being taken from. This is the same threshold_map
+    # that feeds mean_threshold_removed.
+    num_comps_file: Path | None = None
+    if cfg.save_num_comps:
+        num_comps_file = out_dir / f"{out_prefix.name}_numcomps{ext}"
+        save_nifti(
+            llr_stats.threshold_map.detach().cpu().numpy().astype(np.float32),
+            output_path=num_comps_file,
+            reference_img=magnitude_file,
+        )
+
     meta = {
         "magnitude_file": str(magnitude_file),
         "phase_file": str(phase_file) if phase_file is not None else None,
@@ -1186,8 +1505,12 @@ def run_nordic(
             "phase": str(phase_path) if phase_path is not None else None,
             "gfactor": str(gfactor_file) if gfactor_file is not None else None,
             "residual": str(residual_file) if residual_file is not None else None,
+            "rescued": str(rescued_file) if rescued_file is not None else None,
+            "num_comps": str(num_comps_file) if num_comps_file is not None else None,
         },
     }
+    if extra_meta is not None:
+        meta.update(extra_meta)
 
     meta_file = out_dir / f"{out_prefix.name}_metadata.json"
     with open(meta_file, "w", encoding="utf-8") as f:
@@ -1198,5 +1521,250 @@ def run_nordic(
         phase_file=phase_path,
         gfactor_file=gfactor_file,
         residual_file=residual_file,
+        num_comps_file=num_comps_file,
         metadata_file=meta_file,
     )
+
+
+def _llr_main_pass(
+    prepped: _PreppedEcho,
+    cfg: NordicConfig,
+    dev: torch.device,
+) -> tuple[torch.Tensor, _LLRStats, torch.Tensor | None, float]:
+    """Step 7: memory guard + main single-echo LLR. Returns
+    (denoised, stats, residual, mean_removed). Consumes prepped.ksp2."""
+    KSP2 = prepped.ksp2
+    assert KSP2 is not None
+    kernel_pca = prepped.kernel_pca
+
+    # Memory check: if data + accumulators + working set exceeds available
+    # GPU memory, offload data to CPU and stream patches to GPU per batch.
+    if dev.type == "cuda":
+        mem_est = estimate_nordic_llr_memory(
+            shape=KSP2.shape,
+            kernel_size=kernel_pca,
+            svd_batch_size=cfg.svd_batch_size,
+            dtype_bytes=KSP2.element_size(),
+            return_recon=True,
+        )
+        avail = get_available_memory(dev)
+        gpu_without_data = mem_est["total"] - mem_est["data"]
+        if mem_est["total"] > avail:
+            if cfg.verbose:
+                print(
+                    f"  Memory guard: LLR needs ~{mem_est['total'] / 1024**3:.2f} GiB "
+                    f"but only {avail / 1024**3:.2f} GiB available."
+                )
+                print(
+                    f"  Offloading input ({mem_est['data'] / 1024**3:.2f} GiB) to CPU; "
+                    f"accumulators + working set = {gpu_without_data / 1024**3:.2f} GiB stay on GPU."
+                )
+            KSP2 = KSP2.cpu()
+            torch.cuda.empty_cache()
+
+    denoised, llr_stats = _llr_denoise(
+        KSP2,
+        kernel_size=kernel_pca,
+        patch_overlap=max(1, cfg.patch_overlap),
+        threshold_mode=prepped.threshold_mode,
+        threshold_value=prepped.threshold_value,
+        verbose=cfg.verbose,
+        svd_batch_size=cfg.svd_batch_size,
+        decomp_method=cfg.decomp_method,
+        device=dev,
+    )
+
+    residual: torch.Tensor | None = None
+    if cfg.save_residual_map:
+        residual = KSP2.to(denoised.device) - denoised
+    del KSP2
+    prepped.ksp2 = None
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+
+    mean_removed = float(torch.mean(llr_stats.threshold_map).item())
+    if cfg.verbose:
+        print(f"  Mean components removed per patch: {mean_removed:.3f}")
+        if mean_removed < 0.1:
+            print(
+                "  WARNING: Near no-op denoising detected "
+                f"(mean singular values removed per patch={mean_removed:.4f})."
+            )
+    return denoised, llr_stats, residual, mean_removed
+
+
+def run_nordic(
+    magnitude_file: str,
+    phase_file: str | None,
+    output_prefix: str,
+    config: NordicConfig | None = None,
+    device: torch.device | None = None,
+) -> NordicOutputs:
+    """Run NORDIC-style denoising matching NIFTI_NORDIC.m data flow."""
+    cfg = config or NordicConfig()
+    dev = (
+        device if device is not None else get_device("cuda" if torch.cuda.is_available() else None)
+    )
+
+    prepped = _prepare_echo(magnitude_file, phase_file, cfg, dev)
+    denoised, llr_stats, residual, mean_removed = _llr_main_pass(prepped, cfg, dev)
+    return _finalize_echo(
+        prepped,
+        denoised,
+        llr_stats,
+        residual,
+        mean_removed,
+        output_prefix,
+        cfg,
+        dev,
+        magnitude_file,
+        phase_file,
+    )
+
+
+def run_nordic_multiecho(
+    magnitude_files: list[str],
+    phase_files: list[str | None] | None,
+    output_prefix: str,
+    config: NordicConfig | None = None,
+    device: torch.device | None = None,
+) -> list[NordicOutputs]:
+    """Multi-echo NORDIC: denoise each echo independently, guarded by a
+    cross-echo signal-rescue step (see ``_llr_denoise_multiecho``).
+
+    g-factor is estimated once on echo 1 and shared (it is TE-invariant); the
+    thermal sigma from echo 1 is shared too, so every echo's threshold sits on
+    the same scale. Outputs one denoised file per echo (``{prefix}_echo-NN``),
+    each with its own metadata + rescue-count map. Returns one ``NordicOutputs``
+    per echo, in input order.
+    """
+    cfg = config or NordicConfig()
+    dev = (
+        device if device is not None else get_device("cuda" if torch.cuda.is_available() else None)
+    )
+    E = len(magnitude_files)
+    if E < 2:
+        raise ValueError("run_nordic_multiecho requires >= 2 echoes")
+    if phase_files is None:
+        phase_files = [None] * E
+    if len(phase_files) != E:
+        raise ValueError(f"got {E} magnitude files but {len(phase_files)} phase files")
+
+    # 1. Prep echo 1 fully → shared g-factor map + shared thermal sigma.
+    p0 = _prepare_echo(magnitude_files[0], phase_files[0], cfg, dev, echo_label=" (echo 1)")
+    prepped = [p0]
+    shared_gfactor = p0.gfactor
+    shared_sigma = p0.measured_noise
+
+    # 2. Prep echoes 2..E reusing echo 1's g-factor map and thermal sigma.
+    for e in range(1, E):
+        prepped.append(
+            _prepare_echo(
+                magnitude_files[e],
+                phase_files[e],
+                cfg,
+                dev,
+                gfactor_override=shared_gfactor,
+                measured_noise_override=shared_sigma,
+                echo_label=f" (echo {e + 1})",
+            )
+        )
+
+    # 3. Memory guard: the joint pass holds E echoes' data + E recon
+    #    accumulators. Offload echo data to CPU and stream patches if the
+    #    estimated GPU footprint exceeds what's available (accumulators stay on
+    #    GPU; the LLR's cross-device path transfers patches per batch).
+    data_echoes: list[torch.Tensor] = [p.ksp2 for p in prepped]  # type: ignore[misc]
+    if dev.type == "cuda":
+        mem_est = estimate_nordic_llr_memory(
+            shape=data_echoes[0].shape,
+            kernel_size=prepped[0].kernel_pca,
+            svd_batch_size=cfg.svd_batch_size,
+            dtype_bytes=data_echoes[0].element_size(),
+            return_recon=True,
+            n_echoes=E,
+        )
+        avail = get_available_memory(dev)
+        if mem_est["total"] > avail:
+            if cfg.verbose:
+                print(
+                    f"  Memory guard: {E}-echo LLR estimate ~"
+                    f"{mem_est['total'] / 1024**3:.2f} GiB > {avail / 1024**3:.2f} GiB; "
+                    "offloading echo data to CPU."
+                )
+            data_echoes = [d.cpu() for d in data_echoes]
+            for p in prepped:
+                p.ksp2 = None
+            torch.cuda.empty_cache()
+
+    # 4. Joint multi-echo LLR with cross-echo rescue.
+    results = _llr_denoise_multiecho(
+        data_echoes,
+        kernel_size=prepped[0].kernel_pca,
+        patch_overlap=max(1, cfg.patch_overlap),
+        threshold_mode=prepped[0].threshold_mode,
+        threshold_values=[p.threshold_value for p in prepped],
+        rescue=cfg.rescue,
+        rescue_band=cfg.rescue_band,
+        rescue_alpha=cfg.rescue_alpha,
+        verbose=cfg.verbose,
+        svd_batch_size=cfg.svd_batch_size,
+        device=dev,
+    )
+    # Per-echo residual = original − denoised, computed before the echo data is
+    # freed. Each residual goes through the same inverse transforms as the
+    # denoised output in _finalize_echo, so the saved map is in native units and
+    # directly comparable across echoes (a voxel correlated with its later-echo
+    # counterpart in the residual flags over-removed shared signal).
+    residuals: list[torch.Tensor | None] = [None] * E
+    if cfg.save_residual_map:
+        for e in range(E):
+            denoised_e = results[e][0]
+            residuals[e] = data_echoes[e].to(denoised_e.device) - denoised_e
+    del data_echoes
+    for p in prepped:
+        p.ksp2 = None
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # 5. Finalize each echo (undo transforms + write outputs).
+    outputs: list[NordicOutputs] = []
+    for e in range(E):
+        denoised, stats = results[e]
+        mean_removed = float(torch.mean(stats.threshold_map).item())
+        mean_rescued = (
+            float(torch.mean(stats.rescued_map).item()) if stats.rescued_map is not None else 0.0
+        )
+        if cfg.verbose:
+            print(
+                f"  Echo {e + 1}: mean removed/patch {mean_removed:.3f}, "
+                f"mean rescued/patch {mean_rescued:.4f}"
+            )
+        extra_meta = {
+            "multiecho": {
+                "echo_index": e + 1,
+                "n_echoes": E,
+                "rescue_enabled": bool(cfg.rescue),
+                "rescue_band": cfg.rescue_band,
+                "rescue_alpha": cfg.rescue_alpha,
+                "mean_rescued_per_patch": mean_rescued,
+                "shared_gfactor_from": "echo-1",
+                "shared_sigma": float(shared_sigma),
+            }
+        }
+        outputs.append(
+            _finalize_echo(
+                prepped[e],
+                denoised,
+                stats,
+                residuals[e],
+                mean_removed,
+                f"{output_prefix}_echo-{e + 1:02d}",
+                cfg,
+                dev,
+                magnitude_files[e],
+                phase_files[e],
+                extra_meta=extra_meta,
+            )
+        )
+    return outputs

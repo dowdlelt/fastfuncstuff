@@ -615,11 +615,7 @@ def bytes_per_voxel_arma_dsort(
     Returned in float32 bytes; ``estimate_chunk_size`` scales for float64.
     """
     p_ext = n_regressors + n_dsort
-    return (
-        n_timepoints * p_ext
-        + 3 * p_ext * p_ext
-        + (3 + n_dsort) * n_timepoints
-    ) * 4
+    return (n_timepoints * p_ext + 3 * p_ext * p_ext + (3 + n_dsort) * n_timepoints) * 4
 
 
 def compute_moco_resample_batch_size(
@@ -684,13 +680,14 @@ def estimate_nordic_llr_memory(
     svd_batch_size: int,
     dtype_bytes: int,
     return_recon: bool = True,
+    n_echoes: int = 1,
 ) -> dict[str, int]:
     """Estimate GPU memory breakdown for a single ``_llr_denoise`` call.
 
     Parameters
     ----------
     shape : (nx, ny, nz, nt)
-        Volume shape.
+        Volume shape (one echo).
     kernel_size : (wx, wy, wz)
         Patch kernel size (clamped to volume dims internally).
     svd_batch_size : int
@@ -699,13 +696,18 @@ def estimate_nordic_llr_memory(
         Bytes per element (8 for complex64, 4 for float32).
     return_recon : bool
         Whether reconstruction is enabled (allocates recon_acc).
+    n_echoes : int
+        Number of echoes processed jointly (the multi-echo rescue path holds
+        E echoes' data + E recon accumulators, and keeps all E echoes' temporal
+        singular vectors ``vh`` live per batch for the cross-echo test). For
+        ``n_echoes == 1`` this is exactly the single-echo footprint.
 
     Returns
     -------
     dict with keys:
-        data : input volume bytes (already on GPU)
-        recon_acc : reconstruction accumulator bytes
-        diag_maps : diagnostic map bytes (weight + 4 maps)
+        data : input volume bytes (already on GPU), summed over echoes
+        recon_acc : reconstruction accumulator bytes, summed over echoes
+        diag_maps : diagnostic map bytes
         batch_working : peak per-batch working set bytes
         total : sum of above
     """
@@ -715,18 +717,25 @@ def estimate_nordic_llr_memory(
     wz = min(kernel_size[2], nz)
     M = wx * wy * wz
     N = nt
+    K = min(M, N)
     B = svd_batch_size
     n_spatial = nx * ny * nz
+    E = max(1, n_echoes)
 
-    data_bytes = n_spatial * nt * dtype_bytes
-    recon_bytes = data_bytes if return_recon else 0
-    diag_bytes = 5 * n_spatial * 4  # weight + 4 maps, float32
+    data_bytes = E * n_spatial * nt * dtype_bytes
+    recon_bytes = (E * n_spatial * nt * dtype_bytes) if return_recon else 0
+    # weight + 4 maps (single-echo) or weight + 2 maps/echo (multi-echo).
+    diag_bytes = (5 if E == 1 else 1 + 2 * E) * n_spatial * 4  # float32
 
-    # Peak batch working set (eigh path, worst case):
-    # mats(B,M,N) + G(B,N,N) + V(B,N,N) + coeff(B,M,N) + recon_batch(B,M,N)
-    # Not all coexist — peak is mats + coeff + recon_batch + V_k
-    # Conservative: assume 3 copies of (B,M,N) + 1 of (B,N,N)
-    batch_bytes = (3 * B * M * N + B * N * N) * dtype_bytes
+    # Peak batch working set.
+    #  single-echo (eigh path, worst case): 3*(B,M,N) + (B,N,N)
+    #  multi-echo: all E temporal vectors vh(B,K,N) live at once for the
+    #    cross-echo test, plus one echo's transient mats/proj/recon
+    #    (2*(B,M,N) + (B,N,N)) during pass-3 reconstruction.
+    if E == 1:
+        batch_bytes = (3 * B * M * N + B * N * N) * dtype_bytes
+    else:
+        batch_bytes = (E * B * K * N + 2 * B * M * N + B * N * N) * dtype_bytes
 
     return {
         "data": data_bytes,
@@ -1113,7 +1122,9 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_xval(n_timepoints, n_regressors)
     elif operation == "ridge":
         bytes_per_voxel = bytes_per_voxel_ridge(
-            n_timepoints, n_regressors, n_fractions=n_fractions,
+            n_timepoints,
+            n_regressors,
+            n_fractions=n_fractions,
         )
     elif operation == "denoise":
         bytes_per_voxel = bytes_per_voxel_denoise(n_timepoints, n_regressors)
@@ -1126,12 +1137,12 @@ def estimate_chunk_size(
     elif operation == "arma_dsort":
         # n_trials carries the dsort regressor count q (per the lss precedent of
         # overloading n_trials for an operation-specific multiplicity).
-        bytes_per_voxel = bytes_per_voxel_arma_dsort(
-            n_timepoints, n_regressors, n_dsort=n_trials
-        )
+        bytes_per_voxel = bytes_per_voxel_arma_dsort(n_timepoints, n_regressors, n_dsort=n_trials)
     elif operation == "lss":
         bytes_per_voxel = bytes_per_voxel_lss(
-            n_timepoints, n_regressors, n_trials=n_trials,
+            n_timepoints,
+            n_regressors,
+            n_trials=n_trials,
         )
     else:
         bytes_per_voxel = bytes_per_voxel_glm(n_timepoints, n_regressors)

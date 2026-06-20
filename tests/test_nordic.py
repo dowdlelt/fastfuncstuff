@@ -13,8 +13,11 @@ from fastfuncstuff.denoise.nordic import (
     _default_kernel_size_pca,
     _estimate_nordic_lambda,
     _llr_denoise,
+    _llr_denoise_multiecho,
     _phase_to_radians,
+    _rescue_null_threshold,
     run_nordic,
+    run_nordic_multiecho,
 )
 
 
@@ -439,3 +442,214 @@ def test_residual_map_saved(tmp_path):
     with open(out.metadata_file) as f:
         meta = json.load(f)
     assert meta["outputs"]["residual"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Multi-echo cross-echo signal rescue
+# ---------------------------------------------------------------------------
+
+
+def _make_me_echoes(weights, nt=80, rank=2, noise=0.5, seed=0, shape=(10, 10, 4)):
+    """Build E complex echoes: one shared low-rank time course at per-echo
+    weights (HDR), plus independent thermal noise. Returns (echoes, sig)."""
+    torch.manual_seed(seed)
+    nx, ny, nz = shape
+    m = nx * ny * nz
+    vt = torch.linalg.qr(torch.randn(nt, rank, dtype=torch.cfloat))[0]  # (nt, rank)
+    u = torch.randn(m, rank, dtype=torch.cfloat)
+    sig = (u @ vt.mH).reshape(nx, ny, nz, nt)
+    echoes = []
+    for w in weights:
+        n = (torch.randn(nx, ny, nz, nt) + 1j * torch.randn(nx, ny, nz, nt)) * noise
+        echoes.append((w * sig + n).to(torch.cfloat))
+    return echoes, sig
+
+
+def test_rescue_null_threshold_monotone():
+    """Null threshold rises with target dimension, falls with alpha, in (0, 1)."""
+    t_small_d = _rescue_null_threshold(120, 10, 3, 2, 0.05)
+    t_big_d = _rescue_null_threshold(120, 10, 12, 2, 0.05)
+    t_loose = _rescue_null_threshold(120, 10, 3, 2, 0.20)
+    assert 0.0 < t_small_d < t_big_d < 1.0
+    assert t_loose < t_small_d  # larger alpha => lower bar
+    # Degenerate inputs never rescue.
+    assert _rescue_null_threshold(120, 0, 3, 2, 0.05) == 1.0
+    assert _rescue_null_threshold(120, 10, 3, 0, 0.05) == 1.0
+
+
+def test_rescue_recovers_buried_signal():
+    """A signal buried below threshold in the weak echo but kept in a strong
+    echo is rescued; without rescue it is removed entirely."""
+    echoes, sig = _make_me_echoes([1.0, 2.0, 3.0])
+    kw = dict(
+        kernel_size=(10, 10, 4),
+        patch_overlap=1,
+        threshold_mode="nordic",
+        threshold_values=[30.0, 30.0, 30.0],  # weak echo signal (SV~26) buried
+        rescue_band=0.25,
+        rescue_alpha=0.05,
+        verbose=False,
+        device=torch.device("cpu"),
+    )
+    res_off = _llr_denoise_multiecho(echoes, rescue=False, **kw)
+    res_on = _llr_denoise_multiecho(echoes, rescue=True, **kw)
+
+    true1 = (1.0 * sig).abs()
+    # Without rescue the weak echo loses its signal (recon ~ 0).
+    assert float(res_off[0][1].rescued_map.mean()) == 0.0
+    assert float(res_off[0][0].abs().mean()) < 0.25 * float(true1.mean())
+    # With rescue the weak echo's signal components come back.
+    assert float(res_on[0][1].rescued_map.mean()) > 0.0
+    assert float(res_on[0][0].abs().mean()) > 2.0 * float(res_off[0][0].abs().mean())
+
+
+def test_no_rescue_matches_independent_nordic():
+    """rescue=False must reproduce plain per-echo NORDIC (the guard only ever
+    moves components keep<-kill; it never alters the base reconstruction)."""
+    echoes, _ = _make_me_echoes([1.0, 2.5, 4.0], seed=3)
+    thr = [22.0, 22.0, 22.0]
+    res = _llr_denoise_multiecho(
+        echoes,
+        kernel_size=(10, 10, 4),
+        patch_overlap=1,
+        threshold_mode="nordic",
+        threshold_values=thr,
+        rescue=False,
+        rescue_band=0.25,
+        rescue_alpha=0.05,
+        verbose=False,
+        device=torch.device("cpu"),
+    )
+    for e in range(len(echoes)):
+        recon_indep, _ = _llr_denoise(
+            echoes[e],
+            kernel_size=(10, 10, 4),
+            patch_overlap=1,
+            threshold_mode="nordic",
+            threshold_value=thr[e],
+            verbose=False,
+            decomp_method="svd",
+            device=torch.device("cpu"),
+        )
+        a = res[e][0].abs().ravel().numpy()
+        b = recon_indep.abs().ravel().numpy()
+        r = np.corrcoef(a, b)[0, 1]
+        assert r > 0.999, f"echo {e}: rescue=off diverges from independent NORDIC (r={r:.5f})"
+
+
+def test_false_rescue_rate_controlled():
+    """Under pure thermal noise (no signal), the per-patch false-rescue rate
+    tracks alpha — it should stay well below the band size."""
+    n_trials = 16
+    rescued = 0
+    for seed in range(n_trials):
+        torch.manual_seed(1000 + seed)
+        echoes = [
+            (torch.randn(10, 10, 4, 60) + 1j * torch.randn(10, 10, 4, 60)).to(torch.cfloat)
+            for _ in range(3)
+        ]
+        res = _llr_denoise_multiecho(
+            echoes,
+            kernel_size=(10, 10, 4),
+            patch_overlap=1,
+            threshold_mode="nordic",
+            threshold_values=[30.0, 30.0, 30.0],
+            rescue=True,
+            rescue_band=0.25,
+            rescue_alpha=0.05,
+            verbose=False,
+            device=torch.device("cpu"),
+        )
+        rescued += sum(float(res[e][1].rescued_map.mean()) for e in range(3))
+    mean_rescued = rescued / n_trials
+    # alpha=0.05 per-patch FWER across 3 echoes => well under 1 component/trial.
+    assert mean_rescued < 1.0, f"too many false rescues under noise: {mean_rescued:.3f}"
+
+
+def test_run_nordic_multiecho_end_to_end(tmp_path):
+    """Full multi-echo run writes one output + metadata per echo, shares the
+    g-factor map, and records the rescue block."""
+    rng = np.random.default_rng(7)
+    nx, ny, nz, nt = 12, 12, 3, 40
+    m = nx * ny * nz
+    vt = np.linalg.qr(rng.standard_normal((nt, 2)) + 1j * rng.standard_normal((nt, 2)))[0]
+    usp = rng.standard_normal((m, 2)) + 1j * rng.standard_normal((m, 2))
+    sig = (usp @ vt.conj().T).reshape(nx, ny, nz, nt)
+
+    magn_files, phase_files = [], []
+    for e, w in enumerate([1.0, 2.5, 4.0]):
+        cn = w * sig + (rng.standard_normal(sig.shape) + 1j * rng.standard_normal(sig.shape)) * 0.4
+        mf = tmp_path / f"magn_e{e}.nii.gz"
+        pf = tmp_path / f"phase_e{e}.nii.gz"
+        _write_nifti(mf, np.abs(cn))
+        _write_nifti(pf, np.angle(cn))
+        magn_files.append(str(mf))
+        phase_files.append(str(pf))
+
+    cfg = NordicConfig(
+        noise_volume_last=3,
+        factor_error=1.2,
+        save_gfactor_map=True,
+        save_residual_map=True,
+        save_num_comps=True,
+        rescue=True,
+        verbose=False,
+    )
+    outs = run_nordic_multiecho(
+        magn_files, phase_files, str(tmp_path / "ME"), cfg, device=torch.device("cpu")
+    )
+    assert len(outs) == 3
+
+    gmaps = []
+    for e, out in enumerate(outs):
+        assert out.magnitude_file.exists()
+        img = nib.load(out.magnitude_file).get_fdata(dtype=np.float32)
+        assert img.shape == (nx, ny, nz, nt - 3)  # noise vols trimmed
+        with open(out.metadata_file) as f:
+            meta = json.load(f)
+        me = meta["multiecho"]
+        assert me["echo_index"] == e + 1 and me["n_echoes"] == 3
+        assert me["rescue_enabled"] is True
+        assert out.gfactor_file is not None
+        # Per-echo residual is produced on the multi-echo path (the cross-echo
+        # over-removal check the user runs on whole-brain output).
+        assert out.residual_file is not None and out.residual_file.exists()
+        res = nib.load(out.residual_file).get_fdata(dtype=np.float32)
+        assert res.shape == (nx, ny, nz, nt - 3)
+        assert np.all(np.isfinite(res)) and np.any(res > 0)
+        assert meta["outputs"]["residual"] is not None
+        # Per-voxel num-components-removed map (patch-averaged, fractional).
+        assert out.num_comps_file is not None and out.num_comps_file.exists()
+        nc = nib.load(out.num_comps_file).get_fdata(dtype=np.float32)
+        assert nc.shape == (nx, ny, nz)  # spatial map, one value per voxel
+        assert np.all(nc >= 0) and np.any(nc > 0)
+        assert meta["outputs"]["num_comps"] is not None
+        gmaps.append(nib.load(out.gfactor_file).get_fdata(dtype=np.float32))
+
+    # g-factor is estimated once on echo 1 and shared across echoes.
+    assert np.allclose(gmaps[0], gmaps[1]) and np.allclose(gmaps[0], gmaps[2])
+
+
+def test_rescue_is_all_pairs_not_anchored():
+    """No echo is a privileged reference: a component kept in echoes 1 & 2 but
+    buried in echo 3 must be rescued in echo 3 (candidate=echo3 band tested
+    against echoes 1/2 targets). Mirror case: buried in echo 1, kept in 2 & 3."""
+    # Strong in echoes 1,2 (kept), weak in echo 3 (buried) -> rescue echo 3.
+    echoes, _ = _make_me_echoes([4.0, 4.0, 1.0], seed=11)
+    kw = dict(
+        kernel_size=(10, 10, 4),
+        patch_overlap=1,
+        threshold_mode="nordic",
+        threshold_values=[30.0, 30.0, 30.0],
+        rescue_band=0.25,
+        rescue_alpha=0.05,
+        verbose=False,
+        device=torch.device("cpu"),
+    )
+    res = _llr_denoise_multiecho(echoes, rescue=True, **kw)
+    assert float(res[2][1].rescued_map.mean()) > 0.0, "buried last echo not rescued"
+
+    # Symmetric: weak in echo 1 (buried), strong in echoes 2,3 (kept).
+    echoes2, _ = _make_me_echoes([1.0, 4.0, 4.0], seed=12)
+    res2 = _llr_denoise_multiecho(echoes2, rescue=True, **kw)
+    assert float(res2[0][1].rescued_map.mean()) > 0.0, "buried first echo not rescued"
