@@ -16,6 +16,7 @@ from fastfuncstuff.denoise.nordic import (
     _llr_denoise_multiecho,
     _phase_to_radians,
     _rescue_null_threshold,
+    _residual_xcorr_qc,
     run_nordic,
     run_nordic_multiecho,
 )
@@ -675,6 +676,82 @@ def test_per_echo_gfactor_estimates_independently(tmp_path):
     # Independently estimated -> not the shared (identical) maps of the default.
     assert not np.allclose(gmaps[0], gmaps[1])
     assert not np.allclose(gmaps[0], gmaps[2])
+
+
+def test_residual_xcorr_qc_detects_shared_voxel():
+    """A voxel whose residual time course is shared across echoes lights up
+    (max r ~ 1); pure-noise voxels stay near the null. Focal, not patch-wide."""
+    nx, ny, nz, nt = 6, 6, 2, 100
+    rng = np.random.default_rng(0)
+    shared = rng.standard_normal(nt) + 1j * rng.standard_normal(nt)
+    res = []
+    for _ in range(3):
+        r = rng.standard_normal((nx, ny, nz, nt)) + 1j * rng.standard_normal((nx, ny, nz, nt))
+        # Inject the same time course (different per-echo weight) at one voxel.
+        r[2, 3, 1, :] = shared * (1.0 + rng.standard_normal())
+        res.append(torch.from_numpy(r).to(torch.complex64))
+    max_r, tstat, dof = _residual_xcorr_qc(res)
+    assert max_r.shape == (nx, ny, nz) and dof == nt - 2
+    assert max_r[2, 3, 1] > 0.9, "shared-signal voxel not detected"
+    # The vast majority of (independent-noise) voxels sit near the null (1/sqrt T).
+    others = max_r.clone()
+    others[2, 3, 1] = 0.0
+    assert float(others.mean()) < 0.3
+    assert torch.all(tstat >= 0)
+
+
+def test_residual_qc_maps_written(tmp_path):
+    """Multi-echo run writes the three QC maps and records the summary."""
+    rng = np.random.default_rng(5)
+    nx, ny, nz, nt = 12, 12, 3, 40
+    m = nx * ny * nz
+    vt = np.linalg.qr(rng.standard_normal((nt, 2)) + 1j * rng.standard_normal((nt, 2)))[0]
+    usp = rng.standard_normal((m, 2)) + 1j * rng.standard_normal((m, 2))
+    sig = (usp @ vt.conj().T).reshape(nx, ny, nz, nt)
+    magn_files, phase_files = [], []
+    for e, w in enumerate([1.0, 2.5, 4.0]):
+        cn = w * sig + (rng.standard_normal(sig.shape) + 1j * rng.standard_normal(sig.shape)) * 0.4
+        mf = tmp_path / f"magn_e{e}.nii.gz"
+        pf = tmp_path / f"phase_e{e}.nii.gz"
+        _write_nifti(mf, np.abs(cn))
+        _write_nifti(pf, np.angle(cn))
+        magn_files.append(str(mf))
+        phase_files.append(str(pf))
+
+    cfg = NordicConfig(noise_volume_last=3, factor_error=1.2, rescue=True, verbose=False)
+    run_nordic_multiecho(
+        magn_files, phase_files, str(tmp_path / "ME"), cfg, device=torch.device("cpu")
+    )
+    for suffix in ("_resid_xcorr", "_resid_xcorr_tstat", "_resid_xcorr_q"):
+        f = tmp_path / f"ME{suffix}.nii.gz"
+        assert f.exists(), f"missing QC map {suffix}"
+        arr = nib.load(f).get_fdata(dtype=np.float32)
+        assert arr.shape == (nx, ny, nz) and np.all(np.isfinite(arr))
+    # Summary lands in each echo's metadata.
+    with open(tmp_path / "ME_echo-01_metadata.json") as f:
+        meta = json.load(f)
+    assert "residual_qc" in meta
+    assert 0.0 <= meta["residual_qc"]["frac_q_lt_0.05"] <= 1.0
+
+
+def test_resid_qc_can_be_disabled(tmp_path):
+    """-no-resid-qc (resid_qc=False) suppresses the QC maps."""
+    rng = np.random.default_rng(9)
+    nx, ny, nz, nt = 10, 10, 2, 30
+    magn_files, phase_files = [], []
+    for e in range(2):
+        cn = rng.standard_normal((nx, ny, nz, nt)) + 1j * rng.standard_normal((nx, ny, nz, nt))
+        mf = tmp_path / f"m{e}.nii.gz"
+        pf = tmp_path / f"p{e}.nii.gz"
+        _write_nifti(mf, np.abs(cn))
+        _write_nifti(pf, np.angle(cn))
+        magn_files.append(str(mf))
+        phase_files.append(str(pf))
+    cfg = NordicConfig(rescue=True, resid_qc=False, verbose=False)
+    run_nordic_multiecho(
+        magn_files, phase_files, str(tmp_path / "NQ"), cfg, device=torch.device("cpu")
+    )
+    assert not (tmp_path / "NQ_resid_xcorr.nii.gz").exists()
 
 
 def test_rescue_is_all_pairs_not_anchored():

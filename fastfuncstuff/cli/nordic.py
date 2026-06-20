@@ -77,6 +77,13 @@ Examples:
         action="store_true",
         help="Save per-voxel count of components removed (patch-averaged, fractional)",
     )
+    io_group.add_argument(
+        "-no-resid-qc",
+        "-no_resid_qc",
+        dest="resid_qc",
+        action="store_false",
+        help="Disable the multi-echo cross-echo residual correlation QC maps (on by default)",
+    )
 
     algo_group = parser.add_argument_group("Algorithm")
     algo_group.add_argument(
@@ -281,6 +288,7 @@ def main(argv: list[str] | None = None) -> None:
         rescue_band=args.rescue_band,
         rescue_alpha=args.rescue_alpha,
         per_echo_gfactor=args.per_echo_gfactor,
+        resid_qc=args.resid_qc,
         verbose=args.verb >= 1,
     )
 

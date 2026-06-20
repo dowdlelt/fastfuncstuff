@@ -89,6 +89,10 @@ class NordicConfig:
     # via a per-echo MP pass — equivalent to NORDIC-normalizing each echo
     # independently, with the joint rescue still applied. Costs E g-factor passes.
     per_echo_gfactor: bool = False
+    # Multi-echo QC: voxel-wise cross-echo residual correlation map (flags where
+    # shared signal was removed) + an FDR (1-q) map and AFNI-header FDR curve.
+    # Cheap (reuses the residuals); on by default for the multi-echo path.
+    resid_qc: bool = True
 
 
 @dataclass
@@ -770,6 +774,133 @@ def _rescue_null_threshold(
         done += b
     stat = torch.cat(stats).double()
     return float(torch.quantile(stat, 1.0 - alpha).item())
+
+
+def _residual_xcorr_qc(
+    residuals: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Voxel-wise cross-echo residual correlation QC for the multi-echo path.
+
+    The residual of each echo is the reconstruction of the *removed* components.
+    Thermal noise is independent across echoes, so under correct denoising the
+    residuals are uncorrelated voxel-by-voxel. A voxel where two echoes' removed
+    signals **correlate** is a voxel where shared (non-thermal) signal was taken
+    out — over-removal. Because a removed component's spatial loading can be sharp
+    (a vein, an edge), this shows up as focal single-voxel peaks, not whole
+    patches, which is why the per-voxel view matters.
+
+    Computed in the g-factor-normalized algorithm space (cleanest null) on the
+    complex residuals. Returns ``(max_r, tstat, dof)``:
+
+    - ``max_r`` (nx, ny, nz): max over echo pairs of the magnitude of the
+      Hermitian temporal correlation — raw r, for eyeballing peaks.
+    - ``tstat`` (nx, ny, nz): ``r`` mapped to a Student-t, ``t = r·√(dof/(1-r²))``
+      with ``dof = T - 2``, so it can be tagged ``fitt`` and FDR-thresholded
+      (AFNI computes q from this exactly as it does for correlation bricks).
+    - ``dof``: ``T - 2``.
+
+    Voxels with ~zero residual energy in any echo (outside the brain / fully
+    kept) get r = 0.
+    """
+    E = len(residuals)
+    nx, ny, nz, nt = residuals[0].shape
+    dev = residuals[0].device
+    # (E, V, T) complex, demeaned over time and unit-normalized per voxel.
+    flat = []
+    for r in residuals:
+        a = r.reshape(-1, nt).to(torch.complex64)
+        a = a - a.mean(dim=1, keepdim=True)
+        norm = a.abs().pow(2).sum(dim=1, keepdim=True).sqrt()
+        a = a / norm.clamp(min=1e-12)
+        flat.append((a, norm.squeeze(1)))
+    max_r = torch.zeros(nx * ny * nz, device=dev)
+    for e in range(E):
+        ae, ne = flat[e]
+        for ep in range(e + 1, E):
+            aep, nep = flat[ep]
+            # Hermitian temporal correlation magnitude (scale-invariant).
+            r = (ae * aep.conj()).sum(dim=1).abs()
+            valid = (ne > 1e-12) & (nep > 1e-12)
+            r = torch.where(valid, r, torch.zeros_like(r))
+            max_r = torch.maximum(max_r, r)
+    max_r = max_r.clamp(0.0, 0.999999).reshape(nx, ny, nz)
+    dof = max(1, nt - 2)
+    tstat = max_r * torch.sqrt(dof / (1.0 - max_r.pow(2)).clamp(min=1e-12))
+    return max_r, tstat, dof
+
+
+def _save_residual_qc(
+    max_r: torch.Tensor,
+    tstat: torch.Tensor,
+    dof: int,
+    output_prefix: str,
+    reference_img: str,
+    cfg: NordicConfig,
+) -> dict:
+    """Write the cross-echo residual QC maps and return a summary dict.
+
+    Three small 3D maps (dataset-level, not per echo):
+      ``_resid_xcorr``        raw max-over-pairs r (eyeball the focal peaks),
+      ``_resid_xcorr_tstat``  r→t (``fitt``, dof) with an AFNI FDRCURVE injected
+                              so AFNI's GUI / ``fdrval`` read q natively,
+      ``_resid_xcorr_q``      ``1 - q`` (BH-FDR) for non-AFNI viewers.
+    """
+    from fastfuncstuff.stats.fdr import (
+        add_fdrcurves_to_nifti,
+        compute_fdr_curve,
+        fdr_qvalues,
+    )
+
+    out_dir = Path(output_prefix).parent
+    name = Path(output_prefix).name
+    ext = ".nii.gz" if cfg.write_gzipped_niftis else ".nii"
+    mask = tstat > 0
+    q = fdr_qvalues(tstat, stat_code="fitt", dof=float(dof), mask=mask)
+    one_minus_q = torch.where(torch.isfinite(q), 1.0 - q, torch.zeros_like(q))
+
+    r_path = out_dir / f"{name}_resid_xcorr{ext}"
+    t_path = out_dir / f"{name}_resid_xcorr_tstat{ext}"
+    q_path = out_dir / f"{name}_resid_xcorr_q{ext}"
+    save_nifti(
+        max_r.cpu().numpy().astype(np.float32), output_path=r_path, reference_img=reference_img
+    )
+    save_nifti(
+        tstat.cpu().numpy().astype(np.float32), output_path=t_path, reference_img=reference_img
+    )
+    save_nifti(
+        one_minus_q.cpu().numpy().astype(np.float32),
+        output_path=q_path,
+        reference_img=reference_img,
+    )
+
+    # AFNI-native q: build the FDR curve from the t-brick and inject it. Needs an
+    # AFNI extension on the file (present for AFNI output / AFNI-sourced NIfTI);
+    # the explicit _q map covers viewers that lack it, so failure is non-fatal.
+    fdr_in_header = False
+    try:
+        curve = compute_fdr_curve(tstat, "fitt", float(dof), mask=mask)
+        add_fdrcurves_to_nifti(t_path, {0: curve})
+        fdr_in_header = True
+    except Exception as exc:  # noqa: BLE001 — QC is best-effort
+        if cfg.verbose:
+            print(f"  Residual QC: FDR curve not injected into header ({exc}); _q map written.")
+
+    qf = q.flatten()
+    qf = qf[torch.isfinite(qf)]
+    n_valid = int(qf.numel())
+    frac_q05 = float((qf < 0.05).float().mean().item()) if n_valid else 0.0
+    return {
+        "max_r": float(max_r.max().item()),
+        "dof": int(dof),
+        "n_valid_voxels": n_valid,
+        "frac_q_lt_0.05": frac_q05,
+        "fdr_in_header": fdr_in_header,
+        "maps": {
+            "raw_r": str(r_path),
+            "tstat": str(t_path),
+            "one_minus_q": str(q_path),
+        },
+    }
 
 
 def _llr_denoise_multiecho(
@@ -1724,7 +1855,7 @@ def run_nordic_multiecho(
     # directly comparable across echoes (a voxel correlated with its later-echo
     # counterpart in the residual flags over-removed shared signal).
     residuals: list[torch.Tensor | None] = [None] * E
-    if cfg.save_residual_map:
+    if cfg.save_residual_map or cfg.resid_qc:
         for e in range(E):
             denoised_e = results[e][0]
             residuals[e] = data_echoes[e].to(denoised_e.device) - denoised_e
@@ -1733,6 +1864,19 @@ def run_nordic_multiecho(
         p.ksp2 = None
     if dev.type == "cuda":
         torch.cuda.empty_cache()
+
+    # Voxel-wise cross-echo residual correlation QC (algorithm space). Done
+    # before _finalize_echo applies per-echo inverse transforms to the residuals.
+    qc_summary: dict | None = None
+    if cfg.resid_qc and E >= 2:
+        max_r, tstat, dof = _residual_xcorr_qc([r for r in residuals if r is not None])
+        qc_summary = _save_residual_qc(max_r, tstat, dof, output_prefix, magnitude_files[0], cfg)
+        if cfg.verbose and qc_summary is not None:
+            print(
+                f"  Residual QC: {qc_summary['frac_q_lt_0.05'] * 100:.2f}% of voxels show "
+                f"cross-echo residual correlation at q<0.05 "
+                f"(max r {qc_summary['max_r']:.3f})"
+            )
 
     # 5. Finalize each echo (undo transforms + write outputs).
     outputs: list[NordicOutputs] = []
@@ -1759,12 +1903,14 @@ def run_nordic_multiecho(
                 "measured_noise": float(prepped[e].measured_noise),
             }
         }
+        if qc_summary is not None:
+            extra_meta["residual_qc"] = qc_summary
         outputs.append(
             _finalize_echo(
                 prepped[e],
                 denoised,
                 stats,
-                residuals[e],
+                residuals[e] if cfg.save_residual_map else None,
                 mean_removed,
                 f"{output_prefix}_echo-{e + 1:02d}",
                 cfg,
