@@ -86,6 +86,13 @@ where = ["."]
 include = ["fastfuncstuff*"]
 exclude = ["tests*", "examples*"]
 
+# Ship non-Python data files inside the package. Without this, a wheel /
+# non-editable install drops them and runtime loads fail (e.g. the canonical
+# HRF library .tsv); editable installs masked the bug by reading the source tree.
+[tool.setuptools.package-data]
+"fastfuncstuff.design" = ["*.tsv"]
+"fastfuncstuff.benchmark.configs" = ["*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
