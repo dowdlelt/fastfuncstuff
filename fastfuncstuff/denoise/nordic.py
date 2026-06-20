@@ -82,6 +82,13 @@ class NordicConfig:
     rescue: bool = True
     rescue_band: float = 0.25  # top fraction of each echo's kill set tested
     rescue_alpha: float = 0.05  # false-rescue rate = (1 - alpha) null quantile
+    # Multi-echo g-factor: default shares echo 1's map (TE-invariant geometry,
+    # cleanest where signal is strongest). When thermal sigma is not actually
+    # TE-invariant (per-echo bandwidth/partial-Fourier/scaling differences), set
+    # this to estimate each echo's own g-factor (and hence its own thermal sigma)
+    # via a per-echo MP pass — equivalent to NORDIC-normalizing each echo
+    # independently, with the joint rescue still applied. Costs E g-factor passes.
+    per_echo_gfactor: bool = False
 
 
 @dataclass
@@ -1030,17 +1037,17 @@ def _prepare_echo(
     dev: torch.device,
     *,
     gfactor_override: torch.Tensor | None = None,
-    measured_noise_override: float | None = None,
     echo_label: str = "",
 ) -> _PreppedEcho:
     """NORDIC preprocessing for one echo: load -> phase -> g-factor -> threshold.
 
-    ``gfactor_override`` / ``measured_noise_override`` let later echoes reuse
-    echo 1's g-factor map and noise scale so every echo is normalized
-    identically — the precondition for the cross-echo rescue guard to be valid
-    (g-factor is coil/acceleration geometry, TE-invariant; thermal sigma is
-    TE-invariant). When ``gfactor_override`` is given the MP g-factor pass is
-    skipped entirely.
+    ``gfactor_override`` lets later echoes reuse echo 1's g-factor map (estimated
+    where signal is strongest) instead of re-running the MP g-factor pass —
+    g-factor is coil/acceleration geometry and TE-invariant, so this is both a
+    speedup and the default for the multi-echo path. Thermal sigma is always
+    measured per echo (own noise volume, else 1.0): it is not shared, because
+    each echo's threshold is its own keep/kill decision and the cross-echo rescue
+    compares unit-norm temporal vectors (scale-invariant).
     """
     # ------------------------------------------------------------------
     # 1. Load data, form complex, apply ABSOLUTE_SCALE
@@ -1263,12 +1270,6 @@ def _prepare_echo(
     if not cfg.use_magn_for_gfactor and not cfg.magnitude_only:
         measured_noise /= math.sqrt(2.0)
     measured_noise = max(measured_noise, 1e-8)
-
-    if measured_noise_override is not None:
-        # Multi-echo: share a single thermal sigma across echoes (thermal noise
-        # is TE-invariant; this keeps every echo's NORDIC threshold on the same
-        # scale so the cross-echo comparison is apples-to-apples).
-        measured_noise = max(measured_noise_override, 1e-8)
 
     if cfg.verbose:
         print(f"  Measured noise sigma: {measured_noise:.6g}")
@@ -1632,11 +1633,15 @@ def run_nordic_multiecho(
     """Multi-echo NORDIC: denoise each echo independently, guarded by a
     cross-echo signal-rescue step (see ``_llr_denoise_multiecho``).
 
-    g-factor is estimated once on echo 1 and shared (it is TE-invariant); the
-    thermal sigma from echo 1 is shared too, so every echo's threshold sits on
-    the same scale. Outputs one denoised file per echo (``{prefix}_echo-NN``),
-    each with its own metadata + rescue-count map. Returns one ``NordicOutputs``
-    per echo, in input order.
+    By default the g-factor map is estimated once on echo 1 and shared (it is
+    TE-invariant coil/acceleration geometry, cleanest where signal is strongest);
+    ``cfg.per_echo_gfactor`` instead estimates each echo's own g-factor for the
+    case where thermal sigma is not TE-invariant. Thermal sigma is measured per
+    echo either way (own noise volume, else 1.0) — sharing it is unnecessary
+    because the cross-echo rescue compares scale-invariant unit temporal vectors.
+    Outputs one denoised file per echo (``{prefix}_echo-NN``), each with its own
+    metadata + rescue-count map. Returns one ``NordicOutputs`` per echo, in input
+    order.
     """
     cfg = config or NordicConfig()
     dev = (
@@ -1650,13 +1655,16 @@ def run_nordic_multiecho(
     if len(phase_files) != E:
         raise ValueError(f"got {E} magnitude files but {len(phase_files)} phase files")
 
-    # 1. Prep echo 1 fully → shared g-factor map + shared thermal sigma.
+    # 1. Prep echo 1 fully. Its g-factor map is the default shared map; sigma is
+    #    always per echo (echo 1's own here).
     p0 = _prepare_echo(magnitude_files[0], phase_files[0], cfg, dev, echo_label=" (echo 1)")
     prepped = [p0]
-    shared_gfactor = p0.gfactor
-    shared_sigma = p0.measured_noise
+    shared_gfactor = None if cfg.per_echo_gfactor else p0.gfactor
 
-    # 2. Prep echoes 2..E reusing echo 1's g-factor map and thermal sigma.
+    # 2. Prep echoes 2..E. Default: reuse echo 1's g-factor map (TE-invariant,
+    #    fast). With per_echo_gfactor: estimate each echo's own g-factor (and so
+    #    its own thermal sigma) for non-TE-invariant thermal noise. Sigma is
+    #    measured per echo regardless (own noise volume, else 1.0).
     for e in range(1, E):
         prepped.append(
             _prepare_echo(
@@ -1665,7 +1673,6 @@ def run_nordic_multiecho(
                 cfg,
                 dev,
                 gfactor_override=shared_gfactor,
-                measured_noise_override=shared_sigma,
                 echo_label=f" (echo {e + 1})",
             )
         )
@@ -1748,8 +1755,8 @@ def run_nordic_multiecho(
                 "rescue_band": cfg.rescue_band,
                 "rescue_alpha": cfg.rescue_alpha,
                 "mean_rescued_per_patch": mean_rescued,
-                "shared_gfactor_from": "echo-1",
-                "shared_sigma": float(shared_sigma),
+                "gfactor_mode": "per-echo" if cfg.per_echo_gfactor else "shared-echo1",
+                "measured_noise": float(prepped[e].measured_noise),
             }
         }
         outputs.append(

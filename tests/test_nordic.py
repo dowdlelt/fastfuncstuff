@@ -610,6 +610,9 @@ def test_run_nordic_multiecho_end_to_end(tmp_path):
         me = meta["multiecho"]
         assert me["echo_index"] == e + 1 and me["n_echoes"] == 3
         assert me["rescue_enabled"] is True
+        # Default shares echo 1's g-factor; sigma is measured per echo.
+        assert me["gfactor_mode"] == "shared-echo1"
+        assert me["measured_noise"] > 0.0
         assert out.gfactor_file is not None
         # Per-echo residual is produced on the multi-echo path (the cross-echo
         # over-removal check the user runs on whole-brain output).
@@ -628,6 +631,50 @@ def test_run_nordic_multiecho_end_to_end(tmp_path):
 
     # g-factor is estimated once on echo 1 and shared across echoes.
     assert np.allclose(gmaps[0], gmaps[1]) and np.allclose(gmaps[0], gmaps[2])
+
+
+def test_per_echo_gfactor_estimates_independently(tmp_path):
+    """With per_echo_gfactor, each echo gets its own g-factor map (not echo 1's),
+    so the maps differ; metadata records the per-echo mode. Sigma is per echo
+    either way (the clobber that forced echo 1's sigma onto all echoes is gone)."""
+    rng = np.random.default_rng(3)
+    nx, ny, nz, nt = 12, 12, 3, 40
+    m = nx * ny * nz
+    vt = np.linalg.qr(rng.standard_normal((nt, 2)) + 1j * rng.standard_normal((nt, 2)))[0]
+    usp = rng.standard_normal((m, 2)) + 1j * rng.standard_normal((m, 2))
+    sig = (usp @ vt.conj().T).reshape(nx, ny, nz, nt)
+
+    magn_files, phase_files = [], []
+    # Independent noise realizations per echo -> independent g-factor estimates.
+    for e, w in enumerate([1.0, 2.5, 4.0]):
+        cn = w * sig + (rng.standard_normal(sig.shape) + 1j * rng.standard_normal(sig.shape)) * 0.4
+        mf = tmp_path / f"magn_e{e}.nii.gz"
+        pf = tmp_path / f"phase_e{e}.nii.gz"
+        _write_nifti(mf, np.abs(cn))
+        _write_nifti(pf, np.angle(cn))
+        magn_files.append(str(mf))
+        phase_files.append(str(pf))
+
+    cfg = NordicConfig(
+        noise_volume_last=3,
+        factor_error=1.2,
+        save_gfactor_map=True,
+        per_echo_gfactor=True,
+        rescue=True,
+        verbose=False,
+    )
+    outs = run_nordic_multiecho(
+        magn_files, phase_files, str(tmp_path / "ME"), cfg, device=torch.device("cpu")
+    )
+    gmaps = []
+    for out in outs:
+        with open(out.metadata_file) as f:
+            meta = json.load(f)
+        assert meta["multiecho"]["gfactor_mode"] == "per-echo"
+        gmaps.append(nib.load(out.gfactor_file).get_fdata(dtype=np.float32))
+    # Independently estimated -> not the shared (identical) maps of the default.
+    assert not np.allclose(gmaps[0], gmaps[1])
+    assert not np.allclose(gmaps[0], gmaps[2])
 
 
 def test_rescue_is_all_pairs_not_anchored():

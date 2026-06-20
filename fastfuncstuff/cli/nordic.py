@@ -122,6 +122,16 @@ Examples:
         help="Ignore phase input and denoise magnitude as complex-with-zero-phase",
     )
     algo_group.add_argument(
+        "-per-echo-gfactor",
+        "-per_echo_gfactor",
+        action="store_true",
+        help=(
+            "Multi-echo: estimate each echo's own g-factor (and thermal sigma) "
+            "instead of sharing echo 1's. Use when thermal sigma is not "
+            "TE-invariant; costs one g-factor pass per echo (default: share echo 1)"
+        ),
+    )
+    algo_group.add_argument(
         "-kernel-size-pca",
         nargs=3,
         type=int,
@@ -270,6 +280,7 @@ def main(argv: list[str] | None = None) -> None:
         rescue=args.rescue,
         rescue_band=args.rescue_band,
         rescue_alpha=args.rescue_alpha,
+        per_echo_gfactor=args.per_echo_gfactor,
         verbose=args.verb >= 1,
     )
 
