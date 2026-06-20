@@ -104,6 +104,7 @@ class NordicOutputs:
     gfactor_file: Path | None
     residual_file: Path | None
     num_comps_file: Path | None
+    recfactor_file: Path | None
     metadata_file: Path
 
 
@@ -127,6 +128,11 @@ class _LLRStats:
     # Per-voxel count of components rescued from removal by the cross-echo
     # guard. Zero everywhere on the single-echo path. Diagnostic only.
     rescued_map: torch.Tensor | None = None
+    # Per-voxel recommended threshold-scale ratio in (0, 1]: the smallest factor
+    # multiplier that would have kept (without rescue) the deepest cross-echo-
+    # aligned component covering this voxel. 1.0 = no decrease suggested. Multi-
+    # echo + nordic threshold only; None otherwise. Decrease-only by construction.
+    recfactor_map: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +969,11 @@ def _llr_denoise_multiecho(
     weight = torch.zeros((nx, ny, nz), dtype=torch.float32, device=device)
     removed_map = [torch.zeros_like(weight) for _ in range(E)]
     rescued_map = [torch.zeros_like(weight) for _ in range(E)]
+    # Recommended-factor map: per voxel, the smallest threshold-scale ratio (in
+    # (0,1]) suggested by any covering patch. Init 1.0 (no decrease); reduced via
+    # amin so focal hotspots survive overlap averaging. Only for nordic threshold.
+    want_recfactor = threshold_mode == "nordic" and rescue and E >= 2
+    recfactor_map = [torch.ones_like(weight) for _ in range(E)] if want_recfactor else None
 
     # Per-patch voxel offsets (same machinery as _llr_denoise).
     _ox, _oy, _oz = torch.arange(wx), torch.arange(wy), torch.arange(wz)
@@ -978,6 +989,7 @@ def _llr_denoise_multiecho(
     weight_flat = weight.reshape(-1)
     removed_flat = [m.reshape(-1) for m in removed_map]
     rescued_flat = [m.reshape(-1) for m in rescued_map]
+    recfactor_flat = [m.reshape(-1) for m in recfactor_map] if recfactor_map is not None else None
     ones_BM = torch.ones(svd_batch_size * M, device=device)
 
     idx_arange = torch.arange(K, device=device)
@@ -998,6 +1010,7 @@ def _llr_denoise_multiecho(
         # ---- Pass 1: per-echo SVD → temporal vectors + base keep count ----
         vh_list: list[torch.Tensor] = []  # (B, K, N) rows = right singular vectors
         n_keep_list: list[torch.Tensor] = []  # (B,) base keep count (prefix)
+        s0_list: list[torch.Tensor] = []  # (B, K) singular values (recfactor only)
         for e in range(E):
             mats = data_echoes[e][xi, yi, zi, :]
             if cross_device:
@@ -1014,7 +1027,8 @@ def _llr_denoise_multiecho(
                 n_keep = (s0 >= threshold_values[e]).sum(dim=1).to(device)
             vh_list.append(vh)
             n_keep_list.append(n_keep.clamp(min=0, max=K))
-            del s, s0
+            s0_list.append(s0.to(device) if want_recfactor else None)
+            del s
 
         # ---- Base keep / marginal-band masks (B, K) ----
         keep_masks = [idx_arange[None, :] < nk[:, None] for nk in n_keep_list]
@@ -1028,6 +1042,7 @@ def _llr_denoise_multiecho(
         target_masks = [keep_masks[e] | band_masks[e] for e in range(E)]
         aug_masks = [keep_masks[e].clone() for e in range(E)]
         rescued_counts = [torch.zeros(B, device=device) for _ in range(E)]
+        patch_ratios = [torch.ones(B, device=device) for _ in range(E)]
 
         # ---- Pass 2: cross-echo rescue ----
         if rescue and E >= 2:
@@ -1059,6 +1074,13 @@ def _llr_denoise_multiecho(
                 resc = cand_e & (proj_best > thr)  # (B, K)
                 aug_masks[e] = aug_masks[e] | resc
                 rescued_counts[e] = resc.sum(dim=1).float()
+                if want_recfactor:
+                    # Smallest sigma among this echo's rescued comps / its lambda
+                    # = the factor multiplier that would keep them without rescue.
+                    lam = float(threshold_values[e])
+                    sig_resc = torch.where(resc, s0_list[e], torch.full_like(s0_list[e], lam))
+                    min_sig = sig_resc.amin(dim=1)  # (B,) = lam where none rescued
+                    patch_ratios[e] = (min_sig / max(lam, 1e-12)).clamp(0.0, 1.0)
 
         # ---- Pass 3: reconstruct each echo with its augmented mask ----
         weight_flat.index_add_(0, flat_b, ones_BM[: B * M])
@@ -1078,8 +1100,12 @@ def _llr_denoise_multiecho(
             n_removed = (K - aug_masks[e].sum(dim=1)).float()  # (B,)
             removed_flat[e].index_add_(0, flat_b, n_removed.repeat_interleave(M))
             rescued_flat[e].index_add_(0, flat_b, rescued_counts[e].repeat_interleave(M))
+            if recfactor_flat is not None:
+                recfactor_flat[e].index_reduce_(
+                    0, flat_b, patch_ratios[e].repeat_interleave(M), "amin", include_self=True
+                )
 
-        del vh_list
+        del vh_list, s0_list
         if pbar is not None:
             pbar.update(B)
 
@@ -1098,6 +1124,7 @@ def _llr_denoise_multiecho(
             energy_removed=zeros_w,
             snr_weight=zeros_w,
             rescued_map=rescued_map[e] / w,
+            recfactor_map=recfactor_map[e] if recfactor_map is not None else None,
         )
         results.append((recon_out, stats))
     return results
@@ -1598,6 +1625,18 @@ def _finalize_echo(
             reference_img=magnitude_file,
         )
 
+    # Per-voxel recommended factor_error: the threshold-scale ratio (decrease-
+    # only) that would have kept the cross-echo-aligned components rescue caught
+    # here, scaled by the factor actually used. = factor_error where no rescue.
+    recfactor_file: Path | None = None
+    if llr_stats.recfactor_map is not None and cfg.rescue:
+        recfactor_file = out_dir / f"{out_prefix.name}_recfactor{ext}"
+        save_nifti(
+            (cfg.factor_error * llr_stats.recfactor_map).detach().cpu().numpy().astype(np.float32),
+            output_path=recfactor_file,
+            reference_img=magnitude_file,
+        )
+
     meta = {
         "magnitude_file": str(magnitude_file),
         "phase_file": str(phase_file) if phase_file is not None else None,
@@ -1639,6 +1678,7 @@ def _finalize_echo(
             "residual": str(residual_file) if residual_file is not None else None,
             "rescued": str(rescued_file) if rescued_file is not None else None,
             "num_comps": str(num_comps_file) if num_comps_file is not None else None,
+            "recfactor": str(recfactor_file) if recfactor_file is not None else None,
         },
     }
     if extra_meta is not None:
@@ -1654,6 +1694,7 @@ def _finalize_echo(
         gfactor_file=gfactor_file,
         residual_file=residual_file,
         num_comps_file=num_comps_file,
+        recfactor_file=recfactor_file,
         metadata_file=meta_file,
     )
 
@@ -1878,6 +1919,22 @@ def run_nordic_multiecho(
                 f"(max r {qc_summary['max_r']:.3f})"
             )
 
+    # Global recommended factor_error (decrease-only): the 5th-percentile of the
+    # per-patch ratios where rescue fired, scaled by the factor used. Tells the
+    # user what single -factor-error would (without rescue) protect most of what
+    # rescue protected — a conservative tightening, not a per-voxel one.
+    rec_factor: float | None = None
+    rf_vals = [s.recfactor_map for _, s in results if s.recfactor_map is not None]
+    if rf_vals:
+        fired = torch.cat([m[m < 1.0].flatten() for m in rf_vals])
+        if fired.numel() > 0:
+            rec_factor = float(cfg.factor_error * torch.quantile(fired.float(), 0.05).item())
+            if cfg.verbose:
+                print(
+                    f"  Recommended factor_error (decrease-only): {rec_factor:.3f} "
+                    f"(current {cfg.factor_error:.3f}); per-echo _recfactor maps written."
+                )
+
     # 5. Finalize each echo (undo transforms + write outputs).
     outputs: list[NordicOutputs] = []
     for e in range(E):
@@ -1901,6 +1958,7 @@ def run_nordic_multiecho(
                 "mean_rescued_per_patch": mean_rescued,
                 "gfactor_mode": "per-echo" if cfg.per_echo_gfactor else "shared-echo1",
                 "measured_noise": float(prepped[e].measured_noise),
+                "recommended_factor_error": rec_factor,
             }
         }
         if qc_summary is not None:

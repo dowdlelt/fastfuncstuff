@@ -326,6 +326,8 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  Residual output: {outputs.residual_file}")
         if outputs.num_comps_file is not None:
             print(f"  Num-comps output: {outputs.num_comps_file}")
+        if outputs.recfactor_file is not None:
+            print(f"  Rec-factor output: {outputs.recfactor_file}")
         print(f"  Metadata: {outputs.metadata_file}")
     print(f"  Elapsed: {elapsed:.1f} s")
 

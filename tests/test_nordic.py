@@ -503,6 +503,15 @@ def test_rescue_recovers_buried_signal():
     assert float(res_on[0][1].rescued_map.mean()) > 0.0
     assert float(res_on[0][0].abs().mean()) > 2.0 * float(res_off[0][0].abs().mean())
 
+    # Where rescue fired, the recommended-factor map drops below 1 (a decrease):
+    # the buried component's sigma sits below the threshold, so the factor that
+    # would keep it is < the one used. rescue=False produces no recfactor map.
+    assert res_off[0][1].recfactor_map is None or float(res_off[0][1].recfactor_map.min()) == 1.0
+    rf = res_on[0][1].recfactor_map
+    assert rf is not None
+    assert float(rf.min()) < 1.0
+    assert float(rf.max()) <= 1.0
+
 
 def test_no_rescue_matches_independent_nordic():
     """rescue=False must reproduce plain per-echo NORDIC (the guard only ever
@@ -628,6 +637,13 @@ def test_run_nordic_multiecho_end_to_end(tmp_path):
         assert nc.shape == (nx, ny, nz)  # spatial map, one value per voxel
         assert np.all(nc >= 0) and np.any(nc > 0)
         assert meta["outputs"]["num_comps"] is not None
+        # Per-voxel recommended-factor map (decrease-only: <= factor_error).
+        assert out.recfactor_file is not None and out.recfactor_file.exists()
+        rf = nib.load(out.recfactor_file).get_fdata(dtype=np.float32)
+        assert rf.shape == (nx, ny, nz)
+        assert np.all(rf <= cfg.factor_error + 1e-5) and np.all(rf > 0)
+        # Global recommendation is recorded (None if rescue never fired).
+        assert "recommended_factor_error" in meta["multiecho"]
         gmaps.append(nib.load(out.gfactor_file).get_fdata(dtype=np.float32))
 
     # g-factor is estimated once on echo 1 and shared across echoes.
