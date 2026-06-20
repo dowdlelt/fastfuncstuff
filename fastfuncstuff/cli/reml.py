@@ -609,6 +609,56 @@ Examples:
         help="Print detailed memory profiling at every step (for debugging)",
     )
 
+    # Voxel-wise regressors (ANATICOR-style)
+    vox_opts = parser.add_argument_group("Voxel-wise Regressors (ANATICOR)")
+    vox_opts.add_argument(
+        "-dsort",
+        action="append",
+        metavar="DSET",
+        default=None,
+        help=(
+            "Voxel-wise baseline regressor dataset (like AFNI 3dREMLfit -dsort). "
+            "A 4D dataset giving a different baseline regressor for every voxel; "
+            "must match the (concatenated) input in time and voxel count. The ARMA "
+            "(a,b) is estimated WITHOUT it, then the final GLS is redone per voxel "
+            "WITH it. Repeatable; its beta is appended last in -Rbuck / -Rbeta."
+        ),
+    )
+    vox_opts.add_argument(
+        "-dsort_nods", "-dsort-nods",
+        dest="dsort_nods",
+        action="store_true",
+        help=(
+            "Also write the no-dsort results (base design only) to parallel outputs "
+            "with '_nods' appended to each prefix, for comparison."
+        ),
+    )
+    vox_opts.add_argument(
+        "-slibase",
+        action="append",
+        metavar="FILE.1D",
+        default=None,
+        help=(
+            "Slicewise baseline regressors (AFNI 3dREMLfit -slibase), e.g. physiological "
+            "noise. The .1D file has n_slices*m columns in slice-MINOR (cyclic) order: "
+            "bb[0]→slice0, bb[1]→slice1, ..., bb[n_slices]→slice0. Each slice gets its "
+            "own [design | slice_block] design, folded into the REML (a,b) estimate. "
+            "Columns are nuisance (surface via -Rnuisance). Repeatable. Use -slibase_sm "
+            "if your columns are in slice-MAJOR order."
+        ),
+    )
+    vox_opts.add_argument(
+        "-slibase_sm", "-slibase-sm",
+        dest="slibase_sm",
+        action="append",
+        metavar="FILE.1D",
+        default=None,
+        help=(
+            "Like -slibase but columns are in slice-MAJOR order (all of slice 0's "
+            "regressors first, then slice 1's, ...). Repeatable."
+        ),
+    )
+
     # Onset-based design (alternative to -matrix)
     onset_group = parser.add_argument_group("Onset-Based Design (alternative to -matrix)")
     onset_group.add_argument(
@@ -737,6 +787,19 @@ def _derive_rvar_path(rbuck_path: str) -> str:
             return str(p.with_name(name[: -len(suffix)] + "_ffsremlvar" + suffix))
     # Unknown extension: drop the single suffix and re-add it.
     return str(p.with_name(p.stem + "_ffsremlvar" + p.suffix))
+
+
+def _insert_path_suffix(path: str, suffix: str) -> str:
+    """Insert ``suffix`` before the (possibly multi-part) extension of ``path``.
+
+    Used for ``-dsort_nods`` parallel outputs: ``stats.nii.gz`` → ``stats_nods.nii.gz``.
+    """
+    p = Path(path)
+    name = p.name
+    for ext in (".nii.gz", ".nii.zst", ".nii"):
+        if name.endswith(ext):
+            return str(p.with_name(name[: -len(ext)] + suffix + ext))
+    return str(p.with_name(p.stem + suffix + p.suffix))
 
 
 def print_header(args):
@@ -2136,6 +2199,10 @@ def main():
             save_profile_likelihoods=bool(getattr(args, "Rlklhd", None)) and not _per_hrf,
             designs_by_hrf=locals().get("full_designs_by_hrf"),
             hrf_indices=locals().get("hrf_indices_obj"),
+            dsort_files=args.dsort,
+            want_dsort_nods=args.dsort_nods,
+            slibase_files=args.slibase,
+            slibase_files_sm=args.slibase_sm,
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
@@ -2188,6 +2255,31 @@ def main():
             else list(range(len(full_labels)))
         )
 
+    # Voxel-wise (-dsort) coefficients are appended as trailing beta/t-stat
+    # sub-bricks (AFNI places them last). The bucket/beta writers read
+    # results.betas/tstats directly, so we temporarily splice the dsort columns
+    # in around each write and restore afterwards (keeps r2_partial etc. aligned
+    # to the task columns).
+    import contextlib
+
+    @contextlib.contextmanager
+    def _spliced_dsort(res, base_labels):
+        d_betas = getattr(res, "dsort_betas", None)
+        if d_betas is None:
+            yield list(base_labels)
+            return
+        d_labels = getattr(res, "dsort_labels", None) or [
+            f"dsort#{k}" for k in range(d_betas.shape[1])
+        ]
+        saved_b, saved_t = res.betas, res.tstats
+        try:
+            res.betas = torch.cat([saved_b, d_betas], dim=1)
+            if saved_t is not None and getattr(res, "dsort_tstats", None) is not None:
+                res.tstats = torch.cat([saved_t, res.dsort_tstats], dim=1)
+            yield list(base_labels) + list(d_labels)
+        finally:
+            res.betas, res.tstats = saved_b, saved_t
+
     # REML outputs
     if args.Rbuck:
         print(f"  • Writing REML betas + stats (bucket): {args.Rbuck}")
@@ -2217,15 +2309,37 @@ def main():
                     results.contrast_r2_semipartial
                 )
 
-        write_glm_bucket_as_nifti(
-            results,
-            args.Rbuck,
-            condition_names=fitted_labels,
-            contrast_names=contrast_names,
-            contrast_results=contrast_results,
-            output_format="nifti_gz",  # Force NIfTI output
-            add_fdr=args.add_fdr,
-        )
+        with _spliced_dsort(results, fitted_labels) as _rbuck_labels:
+            write_glm_bucket_as_nifti(
+                results,
+                args.Rbuck,
+                condition_names=_rbuck_labels,
+                contrast_names=contrast_names,
+                contrast_results=contrast_results,
+                output_format="nifti_gz",  # Force NIfTI output
+                add_fdr=args.add_fdr,
+            )
+
+        # -dsort_nods: parallel no-dsort bucket for comparison.
+        if getattr(results, "nods_results", None) is not None:
+            nods_path = _insert_path_suffix(args.Rbuck, "_nods")
+            print(f"  • Writing no-dsort REML bucket: {nods_path}")
+            nods = results.nods_results
+            nods_contrasts = None
+            if getattr(nods, "contrast_betas", None) is not None:
+                nods_contrasts = {
+                    "contrast_betas": nods.contrast_betas,
+                    "contrast_tstats": nods.contrast_tstats,
+                }
+            write_glm_bucket_as_nifti(
+                nods,
+                nods_path,
+                condition_names=fitted_labels,
+                contrast_names=getattr(nods, "contrast_labels", None),
+                contrast_results=nods_contrasts,
+                output_format="nifti_gz",
+                add_fdr=args.add_fdr,
+            )
 
     # Single-trial REML output: chronologically ordered per-trial betas.
     if args.single_trials and getattr(results, "betas", None) is not None:
@@ -2269,11 +2383,29 @@ def main():
         voxel_mask = _get_voxel_mask(results)
 
         assert results.betas is not None, "Results must have betas"
-        betas_np = _ensure_numpy(results.betas)
+        # Append dsort coefficients last (AFNI: -Rbeta includes the dsort beta).
+        _rbeta_betas = results.betas
+        if getattr(results, "dsort_betas", None) is not None:
+            _rbeta_betas = torch.cat([_rbeta_betas, results.dsort_betas], dim=1)
+        betas_np = _ensure_numpy(_rbeta_betas)
         betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
         # Always write NIfTI .nii.gz regardless of input format
         save_nifti(betas_vol, output_path=replace_afni_extension(args.Rbeta, ".nii.gz"), affine=affine)
+
+        # -dsort_nods: parallel no-dsort betas.
+        if getattr(results, "nods_results", None) is not None:
+            nods_beta_path = _insert_path_suffix(args.Rbeta, "_nods")
+            print(f"  • Writing no-dsort REML betas only: {nods_beta_path}")
+            nods_betas_np = _ensure_numpy(results.nods_results.betas)
+            nods_betas_vol = _reshape_parameter_map(
+                nods_betas_np, volume_shape, voxel_mask
+            )
+            save_nifti(
+                nods_betas_vol,
+                output_path=replace_afni_extension(nods_beta_path, ".nii.gz"),
+                affine=affine,
+            )
 
     if args.Rnuisance:
         print(f"  • Writing REML nuisance betas + stats: {args.Rnuisance}")

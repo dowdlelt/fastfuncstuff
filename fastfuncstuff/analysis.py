@@ -396,6 +396,10 @@ def analyze_from_design_matrix(
     save_profile_likelihoods: bool = False,
     designs_by_hrf: dict[int, torch.Tensor] | None = None,
     hrf_indices: torch.Tensor | np.ndarray | None = None,
+    dsort_files: list[str | Path] | None = None,
+    want_dsort_nods: bool = False,
+    slibase_files: list[str | Path] | None = None,
+    slibase_files_sm: list[str | Path] | None = None,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -742,6 +746,99 @@ def analyze_from_design_matrix(
                 f"but data has {n_voxels:,} voxels"
             )
 
+    # 2b. Voxel-wise (-dsort / ANATICOR) regressor datasets. Each is a 4D dataset
+    # matching the (concatenated) input in time and voxel count; load, flatten, and
+    # apply the SAME mask so it shares `data`'s masked voxel axis. Stacked into
+    # (n_voxels, n_dsort, n_timepoints) on the CPU and streamed in the GLS pass.
+    dsort_tensor: torch.Tensor | None = None
+    dsort_labels: list[str] | None = None
+    if dsort_files:
+        if method != "arma11":
+            raise ValueError(
+                "-dsort (voxel-wise regressors) is only supported with the ARMA(1,1) "
+                "REML path. Re-run without -OLSQ / with the REML method."
+            )
+        n_time_data = data.shape[1]
+        dsort_cols = []
+        for di, dpath in enumerate(dsort_files):
+            dimg = load_nifti(dpath)
+            darr = np.asarray(dimg.get_fdata(dtype=np.float32))
+            if darr.ndim != 4:
+                raise ValueError(
+                    f"-dsort '{dpath}' must be 4D, got shape {darr.shape}"
+                )
+            d2d = darr.reshape(-1, darr.shape[-1])
+            if d2d.shape[1] != n_time_data:
+                raise ValueError(
+                    f"-dsort '{dpath}' has {d2d.shape[1]} timepoints but data has "
+                    f"{n_time_data}. Provide a dsort dataset matching the "
+                    "(concatenated) input length."
+                )
+            d_t = torch.from_numpy(d2d)
+            if mask_tensor is not None:
+                if d_t.shape[0] != mask_tensor.shape[0]:
+                    raise ValueError(
+                        f"-dsort '{dpath}' has {d_t.shape[0]} voxels but the mask "
+                        f"covers {mask_tensor.shape[0]}. They must align."
+                    )
+                d_t = d_t[mask_tensor, :]
+            if d_t.shape[0] != data.shape[0]:
+                raise ValueError(
+                    f"-dsort '{dpath}' has {d_t.shape[0]} voxels but data has "
+                    f"{data.shape[0]} after masking."
+                )
+            dsort_cols.append(d_t)
+            dsort_labels = (dsort_labels or [])
+            dsort_labels.append(f"dsort#{di}")
+        # (n_voxels, n_dsort, n_timepoints)
+        dsort_tensor = torch.stack(dsort_cols, dim=1).to(storage_device)
+        print(
+            f"🧩 -dsort: {len(dsort_cols)} voxel-wise regressor dataset(s) loaded "
+            f"({dsort_tensor.shape[0]:,} voxels × {dsort_tensor.shape[2]} TRs)"
+        )
+
+    # 2c. Slicewise (-slibase / -slibase_sm) regressors. Each .1D holds
+    # n_slices*m columns; de-interleave into per-slice blocks (n_slices, n_time, M)
+    # and record each analysis voxel's z-slice. Unlike dsort these fold INTO the
+    # REML (a,b) estimate (handled by giving each slice its own design downstream).
+    slice_blocks: torch.Tensor | None = None
+    slibase_labels: list[str] | None = None
+    slice_indices: torch.Tensor | None = None
+    if slibase_files or slibase_files_sm:
+        if method != "arma11":
+            raise ValueError(
+                "-slibase / -slibase_sm are only supported with the ARMA(1,1) REML "
+                "path. Re-run without -OLSQ / with the REML method."
+            )
+        if volume_shape is None:
+            raise ValueError(
+                "-slibase requires 4D input to determine the slice (z) axis."
+            )
+        from fastfuncstuff.design.slibase import (
+            build_slice_blocks,
+            voxel_slice_indices,
+        )
+
+        n_slices = int(volume_shape[2])
+        slice_blocks, slibase_labels = build_slice_blocks(
+            [str(f) for f in (slibase_files or [])],
+            [str(f) for f in (slibase_files_sm or [])],
+            n_slices,
+            data.shape[1],
+        )
+        n_total = mask_tensor.shape[0] if mask_tensor is not None else data.shape[0]
+        slice_indices = voxel_slice_indices(n_total, n_slices, mask_tensor)
+        # Slice regressors are nuisance — extend the design labels so the wider
+        # [base | slice_block] design stays labelled (they are NOT task columns).
+        if design_info.get("column_labels") is not None:
+            design_info["column_labels"] = (
+                list(design_info["column_labels"]) + slibase_labels
+            )
+        print(
+            f"🧠 -slibase: {slice_blocks.shape[2]} slice-wise regressor(s) across "
+            f"{n_slices} slices"
+        )
+
     # 3. Extract design matrix (already read above)
     if use_stimulus_only:
         # Extract only stimulus columns
@@ -1017,20 +1114,20 @@ def analyze_from_design_matrix(
         if affine is not None:
             spatial_metadata["affine"] = affine
 
-        # Per-voxel HRF mode: dispatch to perhrf orchestrator.
-        # designs_by_hrf must contain FULL designs (task+nuisance) per HRF index,
-        # all sharing the same column count/ordering. hrf_indices is aligned to
-        # the volume voxel axis; apply the same mask used on `data`.
-        if designs_by_hrf is not None and hrf_indices is not None:
-            from fastfuncstuff.glm.arma import fit_glm_arma11_perhrf
+        # Grouped designs: per-voxel HRF and/or slicewise (-slibase). Both assign a
+        # design to each voxel-group; combined, the group is (HRF, slice). Build
+        # designs_by_group + group_indices and dispatch to the shared orchestrator.
+        has_hrf = designs_by_hrf is not None and hrf_indices is not None
+        has_sli = slice_blocks is not None
 
+        hrf_idx_tensor = None
+        if has_hrf:
             hrf_idx_tensor = (
                 torch.as_tensor(hrf_indices)
                 if not isinstance(hrf_indices, torch.Tensor)
                 else hrf_indices
             ).long()
             if mask_tensor is not None and hrf_idx_tensor.numel() != data.shape[0]:
-                # Caller passed full-volume indices — align to mask
                 hrf_idx_tensor = hrf_idx_tensor.reshape(-1)[mask_tensor]
             if hrf_idx_tensor.numel() != data.shape[0]:
                 raise ValueError(
@@ -1038,17 +1135,44 @@ def analyze_from_design_matrix(
                     f"masked data voxels {data.shape[0]}"
                 )
 
-            unique_hrfs = sorted(int(h) for h in hrf_idx_tensor.unique().tolist())
+        if has_hrf or has_sli:
+            from fastfuncstuff.glm.arma import fit_glm_arma11_grouped
+
+            designs_by_group: dict[int, torch.Tensor] = {}
+            if has_hrf and has_sli:
+                ns = int(slice_blocks.shape[0])
+                sblk = slice_blocks.to(device)
+                group_indices = hrf_idx_tensor * ns + slice_indices.long()
+                for g in torch.unique(group_indices).tolist():
+                    h, s = divmod(int(g), ns)
+                    designs_by_group[int(g)] = torch.cat(
+                        [designs_by_hrf[h].to(device), sblk[s]], dim=1
+                    )
+                group_label = "HRF×slice"
+            elif has_sli:
+                sblk = slice_blocks.to(device)
+                group_indices = slice_indices.long()
+                for s in torch.unique(group_indices).tolist():
+                    designs_by_group[int(s)] = torch.cat(
+                        [design, sblk[int(s)]], dim=1
+                    )
+                group_label = "slice"
+            else:  # has_hrf only
+                designs_by_group = designs_by_hrf
+                group_indices = hrf_idx_tensor
+                group_label = "HRF"
+
             print(
-                f"\n🎚️  Per-voxel HRF mode: {len(unique_hrfs)} unique HRFs "
-                f"({len(designs_by_hrf)} designs available)"
+                f"\n🎚️  Grouped REML (per {group_label}): "
+                f"{len(designs_by_group)} design(s)"
             )
 
-            results = fit_glm_arma11_perhrf(
+            results = fit_glm_arma11_grouped(
                 data,
-                designs_by_hrf=designs_by_hrf,
-                hrf_indices=hrf_idx_tensor,
+                designs_by_group,
+                group_indices,
                 tr=tr,
+                group_label=group_label,
                 a_grid=arma_a_grid,
                 b_grid=arma_b_grid,
                 precomputed_arma_params=precomputed_arma_params,
@@ -1075,6 +1199,9 @@ def analyze_from_design_matrix(
                     if "actual_run_starts" in locals()
                     else design_info.get("run_starts", None)
                 ),
+                dsort=dsort_tensor,
+                dsort_labels=dsort_labels,
+                want_dsort_nods=want_dsort_nods,
             )
 
         else:
@@ -1109,10 +1236,16 @@ def analyze_from_design_matrix(
                     if "actual_run_starts" in locals()
                     else design_info.get("run_starts", None)
                 ),
+                dsort=dsort_tensor,
+                dsort_labels=dsort_labels,
+                want_dsort_nods=want_dsort_nods,
             )
 
     else:
         raise ValueError(f"Unknown method: {method}. Choose 'ols' or 'arma11'")
+
+    # The -dsort no-dsort snapshot needs the same spatial metadata to be written.
+    _nods = getattr(results, "nods_results", None)
 
     if volume_shape is not None:
         results.original_shape = volume_shape
@@ -1121,6 +1254,9 @@ def analyze_from_design_matrix(
         if hasattr(results, "ols_results") and results.ols_results is not None:
             results.ols_results.original_shape = volume_shape
             results.ols_results.full_shape = volume_shape
+        if _nods is not None:
+            _nods.original_shape = volume_shape
+            _nods.full_shape = volume_shape
 
     if mask_tensor is not None:
         results.voxel_mask = mask_tensor
@@ -1130,12 +1266,16 @@ def analyze_from_design_matrix(
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
             results.ols_results.voxel_mask = mask_tensor
+        if _nods is not None:
+            _nods.voxel_mask = mask_tensor
 
     if affine is not None:
         results.affine = affine
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
             results.ols_results.affine = affine
+        if _nods is not None:
+            _nods.affine = affine
 
     # CRITICAL: Attach NIfTI header for perfect output reconstruction
     if nifti_header is not None:
@@ -1143,6 +1283,8 @@ def analyze_from_design_matrix(
         # Also set on OLS results if present
         if hasattr(results, "ols_results") and results.ols_results is not None:
             results.ols_results.nifti_header = nifti_header
+        if _nods is not None:
+            _nods.nifti_header = nifti_header
 
     # Per-HRF mode defers the OLS write callback so it fires once on the
     # merged OLS result instead of partial per-HRF outputs. Fire it now that

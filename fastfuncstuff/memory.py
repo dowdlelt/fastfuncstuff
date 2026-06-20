@@ -593,6 +593,35 @@ def bytes_per_voxel_arma(
     return (8 * n_timepoints + 2 * n_regressors + max_lag) * 4
 
 
+def bytes_per_voxel_arma_dsort(
+    n_timepoints: int,
+    n_regressors: int,
+    n_dsort: int,
+) -> int:
+    """Memory per voxel for the ``-dsort`` (ANATICOR) GLS pass.
+
+    Unlike the shared-design GLS path, ``-dsort`` gives every voxel its own
+    ``q`` extra columns, so the design (and its X'X / inverse) cannot be shared
+    across the batch — each voxel carries its own extended-design workspace.
+    This is the "near duplication" the per-voxel solve costs.
+
+    Per voxel during a sub-batch (``p = n_regressors``, ``q = n_dsort``,
+    ``p_ext = p + q``):
+    - extended whitened design X_ext : n_timepoints * p_ext
+    - X'X, Cholesky factor, inverse  : 3 * p_ext^2
+    - whitened Y row + dsort cols    : (1 + q) * n_timepoints
+    - residual / prediction scratch  : 2 * n_timepoints
+
+    Returned in float32 bytes; ``estimate_chunk_size`` scales for float64.
+    """
+    p_ext = n_regressors + n_dsort
+    return (
+        n_timepoints * p_ext
+        + 3 * p_ext * p_ext
+        + (3 + n_dsort) * n_timepoints
+    ) * 4
+
+
 def compute_moco_resample_batch_size(
     nz: int,
     ny: int,
@@ -1094,6 +1123,12 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
     elif operation == "arma_search":
         bytes_per_voxel = bytes_per_voxel_arma_search(n_timepoints, n_regressors)
+    elif operation == "arma_dsort":
+        # n_trials carries the dsort regressor count q (per the lss precedent of
+        # overloading n_trials for an operation-specific multiplicity).
+        bytes_per_voxel = bytes_per_voxel_arma_dsort(
+            n_timepoints, n_regressors, n_dsort=n_trials
+        )
     elif operation == "lss":
         bytes_per_voxel = bytes_per_voxel_lss(
             n_timepoints, n_regressors, n_trials=n_trials,

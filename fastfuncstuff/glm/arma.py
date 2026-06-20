@@ -619,6 +619,19 @@ class ARMA11Results:
         self.affine: np.ndarray | None = None  # Spatial affine if available
         self.ols_results: Any | None = None  # Optional GLMResults for OLS comparison
 
+        # Voxel-wise (-dsort / ANATICOR) regressor results. The base task/nuisance
+        # betas above are recomputed with the extended per-voxel design; the dsort
+        # coefficients are kept separate (AFNI appends them last in -Rbeta).
+        self.dsort_betas: torch.Tensor | None = (
+            None  # (n_voxels, n_dsort) - per-voxel regressor coefficients
+        )
+        self.dsort_tstats: torch.Tensor | None = (
+            None  # (n_voxels, n_dsort) - t-statistics for dsort coefficients
+        )
+        self.dsort_labels: list[str] | None = None  # one label per dsort regressor
+        # When -dsort_nods is set, the no-dsort fit (base design only) is kept here.
+        self.nods_results: Any | None = None  # ARMA11Results without dsort regressors
+
         # Full REML likelihood surface over (a,b) grid (optional, see save_lklhd_surface)
         self.reml_lklhd_surface: torch.Tensor | None = None  # (n_voxels, n_valid_pairs) — L(a_k, b_k) per voxel
         self.reml_surface_params: list | None = None  # [(a_0,b_0), (a_1,b_1), ...] — grid points in column order
@@ -2824,76 +2837,87 @@ def reml_grid_search_batched(
     return best_params, best_likelihood
 
 
-def fit_glm_arma11_perhrf(
+def fit_glm_arma11_grouped(
     data: torch.Tensor | np.ndarray,
-    designs_by_hrf: dict[int, torch.Tensor],
-    hrf_indices: torch.Tensor | np.ndarray,
+    designs_by_group: dict[int, torch.Tensor],
+    group_indices: torch.Tensor | np.ndarray,
     tr: float,
+    group_label: str = "group",
     **fit_kwargs,
 ) -> ARMA11Results:
-    """REML on per-voxel HRF: loop fit_glm_arma11 per HRF subset, merge results.
+    """REML with a per-voxel-group design: loop fit_glm_arma11 per group, merge.
+
+    A "group" is any partition of voxels that share a design matrix — per-voxel HRF
+    (group = HRF index), slicewise -slibase (group = z-slice), or a composite of the
+    two. The design differs between groups but the noise-covariance grid does not (it
+    depends only on (a,b) and n_timepoints), so a single ``autocorr_cache`` is built
+    once and reused across all groups. This is NOT about convolution — each group is
+    just handed whatever design matrix the caller built for it.
 
     Parameters
     ----------
     data : (n_voxels, n_timepoints) tensor or ndarray
         fMRI data, already masked to the analysis voxel set.
-    designs_by_hrf : dict[int, (n_timepoints, n_regressors) tensor]
-        Full design matrix (task+nuisance) per HRF index. All designs MUST share
-        the same n_regressors and column ordering — only the task columns change.
-    hrf_indices : (n_voxels,) long tensor
-        HRF index per voxel, aligned to ``data``'s voxel axis.
+    designs_by_group : dict[int, (n_timepoints, n_regressors) tensor]
+        Full design matrix (task+nuisance) per group id. All designs MUST share
+        the same n_regressors and column ordering.
+    group_indices : (n_voxels,) long tensor
+        Group id per voxel, aligned to ``data``'s voxel axis.
     tr : float
         Repetition time.
+    group_label : str
+        Human-readable noun for the grouping ("HRF", "slice", ...), used in prints.
     **fit_kwargs
         Forwarded to each fit_glm_arma11 call. ``task_indices`` should reference
-        the shared task columns. ``run_starts`` propagated as-is.
+        the shared task columns. ``run_starts`` / ``dsort`` propagated as-is
+        (``dsort`` is sliced to each group's voxel subset).
 
     Returns
     -------
     ARMA11Results
         Voxel arrays sized to ``n_voxels`` of ``data``, scattered from each
-        per-HRF subset.
+        per-group subset.
     """
     import torch as _torch
 
-    if not isinstance(hrf_indices, _torch.Tensor):
-        hrf_indices = _torch.as_tensor(hrf_indices)
-    hrf_indices = hrf_indices.long().cpu()
+    if not isinstance(group_indices, _torch.Tensor):
+        group_indices = _torch.as_tensor(group_indices)
+    group_indices = group_indices.long().cpu()
 
     if isinstance(data, np.ndarray):
         data_t = _torch.from_numpy(data)
     else:
         data_t = data
     n_voxels = data_t.shape[0]
-    if hrf_indices.shape[0] != n_voxels:
+    if group_indices.shape[0] != n_voxels:
         raise ValueError(
-            f"hrf_indices length {hrf_indices.shape[0]} != data n_voxels {n_voxels}"
+            f"group_indices length {group_indices.shape[0]} != data n_voxels {n_voxels}"
         )
 
-    unique_hrfs = sorted(int(h) for h in hrf_indices.unique().tolist())
-    missing = [h for h in unique_hrfs if h not in designs_by_hrf]
+    unique_hrfs = sorted(int(h) for h in group_indices.unique().tolist())
+    missing = [h for h in unique_hrfs if h not in designs_by_group]
     if missing:
         raise KeyError(
-            f"HRF indices {missing} present in voxels but missing from designs_by_hrf "
-            f"(have {sorted(designs_by_hrf.keys())})"
+            f"{group_label} ids {missing} present in voxels but missing from "
+            f"designs_by_group (have {sorted(designs_by_group.keys())})"
         )
 
     # All designs must share shape — we allocate per-voxel arrays sized to the
     # canonical n_regressors. Verify upfront.
-    first_design = designs_by_hrf[unique_hrfs[0]]
+    first_design = designs_by_group[unique_hrfs[0]]
     n_timepoints, n_regressors = first_design.shape
     for h in unique_hrfs[1:]:
-        if designs_by_hrf[h].shape != (n_timepoints, n_regressors):
+        if designs_by_group[h].shape != (n_timepoints, n_regressors):
             raise ValueError(
-                f"designs_by_hrf[{h}] shape {tuple(designs_by_hrf[h].shape)} "
+                f"designs_by_group[{h}] shape {tuple(designs_by_group[h].shape)} "
                 f"!= {(n_timepoints, n_regressors)} — per-HRF designs must share dims"
             )
 
     verbose = fit_kwargs.get("verbose", True)
     if verbose:
         print(
-            f"\n🎚️  Per-voxel HRF REML: {len(unique_hrfs)} unique HRFs across "
-            f"{n_voxels:,} voxels"
+            f"\n🎚️  Grouped REML (per {group_label}): {len(unique_hrfs)} "
+            f"{group_label} group(s) across {n_voxels:,} voxels"
         )
 
     # Drop spatial_metadata from the inner calls — voxel_mask there refers to
@@ -2906,7 +2930,20 @@ def fit_glm_arma11_perhrf(
     # and re-fire later on the merged OLS result if want_ols is set.
     ols_write_callback = inner_kwargs.pop("ols_write_callback", None)
     if ols_write_callback is not None and verbose:
-        print("  (OLS write callback deferred until after per-HRF merge)")
+        print(f"  (OLS write callback deferred until after per-{group_label} merge)")
+
+    # Subset voxel-wise (-dsort) regressors per HRF, like the data and the
+    # precomputed (a,b). Passed whole, it would mismatch each HRF subset's voxels.
+    dsort_full = inner_kwargs.pop("dsort", None)
+    if dsort_full is not None:
+        if isinstance(dsort_full, np.ndarray):
+            dsort_full = _torch.from_numpy(dsort_full)
+        if dsort_full.ndim == 2:
+            dsort_full = dsort_full.unsqueeze(1)
+        if dsort_full.shape[0] != n_voxels:
+            raise ValueError(
+                f"dsort has {dsort_full.shape[0]} voxels but data has {n_voxels}"
+            )
 
     # Subset precomputed (a,b) per HRF — must align with masked voxel order.
     precomputed_arma_full = inner_kwargs.pop("precomputed_arma_params", None)
@@ -2939,7 +2976,7 @@ def fit_glm_arma11_perhrf(
 
     if precomputed_arma_full is None and inner_kwargs.get("estimate_per_voxel", True):
         if verbose:
-            print("\n🔁 Building autocorr grid (shared across all HRFs)...")
+            print(f"\n🔁 Building autocorr grid (shared across all {group_label} groups)...")
         use_double = inner_kwargs.get("use_double", False)
         cholesky_on_cpu = inner_kwargs.get("cholesky_on_cpu", True)
         autocorr_cache = precompute_autocorr_grid(
@@ -2960,15 +2997,15 @@ def fit_glm_arma11_perhrf(
     per_hrf_local_mask: dict[int, _torch.Tensor] = {}  # voxel positions in `data` axis
 
     for hrf_idx in unique_hrfs:
-        sub_mask = hrf_indices == hrf_idx
+        sub_mask = group_indices == hrf_idx
         n_sub = int(sub_mask.sum().item())
         if verbose:
             print(
-                f"\n  ─── HRF {hrf_idx}: {n_sub:,} voxels "
+                f"\n  ─── {group_label} {hrf_idx}: {n_sub:,} voxels "
                 f"({100.0 * n_sub / n_voxels:.1f}%) ───"
             )
         sub_data = data_t[sub_mask]
-        sub_design = designs_by_hrf[hrf_idx]
+        sub_design = designs_by_group[hrf_idx]
 
         # Pre-load the per-HRF voxel subset onto the GPU so every per-sub-batch
         # `data[indices]` inside fit_glm_arma11 becomes a GPU view instead of a
@@ -2987,6 +3024,8 @@ def fit_glm_arma11_perhrf(
         sub_kwargs = dict(inner_kwargs)
         if precomputed_arma_full is not None:
             sub_kwargs["precomputed_arma_params"] = precomputed_arma_full[sub_mask]
+        if dsort_full is not None:
+            sub_kwargs["dsort"] = dsort_full[sub_mask]
 
         results_h = fit_glm_arma11(
             sub_data,
@@ -3016,6 +3055,7 @@ def fit_glm_arma11_perhrf(
         "reml_likelihood", "sigma2", "fstats", "residuals", "residuals_whitened",
         "predicted", "contrast_betas", "contrast_tstats", "contrast_fstats",
         "contrast_r2_partial", "contrast_r2_semipartial",
+        "dsort_betas", "dsort_tstats",
     ]
 
     for attr in _scatter_attrs:
@@ -3039,6 +3079,35 @@ def fit_glm_arma11_perhrf(
 
     # Contrast labels (scalar metadata, same across HRFs)
     merged.contrast_labels = template.contrast_labels
+
+    # -dsort: scatter the no-dsort snapshot (if produced) and carry labels.
+    merged.dsort_labels = template.dsort_labels
+    if getattr(template, "nods_results", None) is not None:
+        nods_merged = ARMA11Results()
+        nods_merged.dof = template.nods_results.dof
+        nods_merged.tr = template.nods_results.tr
+        nods_merged.fitted_column_indices = template.nods_results.fitted_column_indices
+        nods_merged.n_regressors_full = template.nods_results.n_regressors_full
+        nods_merged.contrast_labels = template.nods_results.contrast_labels
+        for attr in _scatter_attrs:
+            ref = None
+            for h in unique_hrfs:
+                src = getattr(per_hrf_results[h], "nods_results", None)
+                v = getattr(src, attr, None) if src is not None else None
+                if v is not None:
+                    ref = v
+                    break
+            if ref is None:
+                continue
+            full = _torch.zeros((n_voxels,) + tuple(ref.shape[1:]), dtype=ref.dtype)
+            for h in unique_hrfs:
+                src = getattr(per_hrf_results[h], "nods_results", None)
+                v_h = getattr(src, attr, None) if src is not None else None
+                if v_h is None:
+                    continue
+                full[per_hrf_local_mask[h]] = v_h.cpu()
+            setattr(nods_merged, attr, full)
+        merged.nods_results = nods_merged
 
     # REML likelihood surface (-Rlklhd): each per-HRF call produced a
     # (n_sub, n_valid_pairs) surface. Scatter into a full (n_voxels, n_valid_pairs)
@@ -3117,6 +3186,360 @@ def fit_glm_arma11_perhrf(
     return merged
 
 
+def fit_glm_arma11_perhrf(
+    data: torch.Tensor | np.ndarray,
+    designs_by_hrf: dict[int, torch.Tensor],
+    hrf_indices: torch.Tensor | np.ndarray,
+    tr: float,
+    **fit_kwargs,
+) -> ARMA11Results:
+    """Per-voxel HRF REML — thin wrapper over :func:`fit_glm_arma11_grouped`.
+
+    The group is the HRF index; each HRF's design differs only in its task columns.
+    """
+    return fit_glm_arma11_grouped(
+        data,
+        designs_by_hrf,
+        hrf_indices,
+        tr,
+        group_label="HRF",
+        **fit_kwargs,
+    )
+
+
+def _dsort_constant_guard(dsort: torch.Tensor) -> torch.Tensor:
+    """Replace ~constant voxel timeseries in each dsort dataset with its mean.
+
+    Matches 3dREMLfit: a -dsort voxel that is constant through time is degenerate
+    (it collapses onto the baseline), so AFNI substitutes the dataset's mean
+    timeseries for that voxel. ``dsort`` is (n_voxels, n_dsort, n_timepoints).
+
+    Always warns when it fires (this is a data condition, not progress chatter).
+    """
+    # std over time, per (voxel, dsort dataset)
+    stds = dsort.std(dim=2)  # (n_voxels, n_dsort)
+    bad = stds < 1e-8  # (n_voxels, n_dsort)
+    n_bad = int(bad.sum().item())
+    if n_bad == 0:
+        return dsort
+    dsort = dsort.clone()
+    # Per-dataset mean timeseries computed over the non-degenerate voxels.
+    for d in range(dsort.shape[1]):
+        bad_d = bad[:, d]
+        if not bool(bad_d.any()):
+            continue
+        good_d = ~bad_d
+        if bool(good_d.any()):
+            mean_ts = dsort[good_d, d, :].mean(dim=0)  # (n_timepoints,)
+        else:
+            mean_ts = dsort[:, d, :].mean(dim=0)
+        dsort[bad_d, d, :] = mean_ts
+    warnings.warn(
+        f"-dsort: {n_bad} voxel timeseries were ~constant through time and "
+        "were replaced by their dataset mean (matches 3dREMLfit).",
+        stacklevel=2,
+    )
+    return dsort
+
+
+def _fit_dsort_gls_pass(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    dsort: torch.Tensor,
+    results: ARMA11Results,
+    *,
+    fitted_column_indices: list[int] | None,
+    glt_contrasts_tensor: torch.Tensor | None,
+    want_r2_partial: bool,
+    r2_partial_mode: str,
+    want_r2_semipartial: bool,
+    r2_semipartial_mode: str,
+    want_residuals: bool,
+    want_predicted: bool,
+    run_starts: list[int] | torch.Tensor | None,
+    device: torch.device,
+    dtype: torch.dtype,
+    accum_dtype: torch.dtype,
+    y_norm_scale: torch.Tensor | None,
+    batch_size: int,
+    verbose: bool,
+) -> None:
+    """Redo the final GLS per voxel with an extended ``[design | dsort_v]`` design.
+
+    ``(a, b)`` is taken from ``results.arma_params`` (estimated WITHOUT dsort, per
+    AFNI). Whitening ``L`` is constant within an ``(a, b)`` group, so we whiten the
+    base design once per group and whiten each voxel's dsort columns, then solve a
+    batched per-voxel GLS. Results overwrite ``results.betas/tstats/sigma2/r2/fstats``
+    and populate ``results.dsort_betas/dsort_tstats``. DoF drops by ``n_dsort``.
+
+    All betas are produced in the same per-voxel-normalized units as the main loop
+    (Y divided by its std when ``y_norm_scale`` is set); the caller's unscale block
+    restores physical units for both base and dsort betas.
+    """
+    n_voxels, n_dsort, n_timepoints = dsort.shape
+    p = design.shape[1]
+    p_ext = p + n_dsort
+    dof = max(1, n_timepoints - p_ext)
+    results.dof = dof
+
+    results.dsort_betas = torch.zeros(n_voxels, n_dsort, device="cpu", dtype=dtype)
+    results.dsort_tstats = torch.zeros(n_voxels, n_dsort, device="cpu", dtype=dtype)
+
+    fci = (
+        torch.as_tensor(fitted_column_indices, device=device, dtype=torch.long)
+        if fitted_column_indices is not None
+        else None
+    )
+
+    # Group voxels by optimal (a, b) so L (and whitened base design) is computed
+    # once per group, mirroring the main GLS loop's grouping.
+    ab_cpu = results.arma_params.cpu().contiguous()
+    unique_pairs, inverse_indices = torch.unique(ab_cpu, dim=0, return_inverse=True)
+    sort_keys, sort_perm = torch.sort(inverse_indices, stable=True)
+    group_starts = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long),
+            (sort_keys[1:] != sort_keys[:-1]).nonzero(as_tuple=True)[0] + 1,
+            torch.tensor([len(sort_keys)], dtype=torch.long),
+        ]
+    )
+
+    # The per-voxel extended solve carries a (B, p_ext, p_ext) X'X per sub-batch,
+    # so it needs a smaller chunk than the shared-design path. Size it through the
+    # memory module (operation="arma_dsort"; n_trials carries the dsort count).
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    sub_batch = estimate_chunk_size(
+        n_voxels=n_voxels,
+        n_timepoints=n_timepoints,
+        n_regressors=p,
+        device=device,
+        operation="arma_dsort",
+        use_double=(dtype == torch.float64),
+        n_trials=n_dsort,
+    )
+    sub_batch = max(1, min(sub_batch, batch_size, n_voxels))
+
+    if verbose:
+        print(
+            f"\n📦 -dsort: per-voxel GLS with {n_dsort} voxel-wise regressor(s) "
+            f"(DoF {n_timepoints} - {p} - {n_dsort} = {dof}); "
+            f"sub-batch {sub_batch:,} voxels"
+        )
+    pbar = (
+        tqdm(total=len(unique_pairs), desc="dsort GLS", unit="group")
+        if verbose and len(unique_pairs) > 1
+        else None
+    )
+
+    for g_idx in range(len(unique_pairs)):
+        a_opt = float(unique_pairs[g_idx, 0])
+        b_opt = float(unique_pairs[g_idx, 1])
+        voxel_indices = sort_perm[group_starts[g_idx] : group_starts[g_idx + 1]]
+
+        # Whiten the base design once for this (a, b); L is its Cholesky factor.
+        X_w, _, L_chol = prewhiten_with_arma11(
+            design, design[:, 0], a_opt, b_opt, run_starts=run_starts
+        )
+
+        n_group = voxel_indices.numel()
+        sub = max(1, min(sub_batch, n_group))
+        for s0 in range(0, n_group, sub):
+            idx = voxel_indices[s0 : s0 + sub]
+            B = idx.numel()
+
+            # Data (n_time, B), normalized to match the main loop's conditioning.
+            Y = data[idx].T.to(device)
+            if y_norm_scale is not None:
+                Y = Y / y_norm_scale[idx].to(device).unsqueeze(0)
+            Yw = torch.linalg.solve_triangular(L_chol, Y, upper=False)  # (n_time, B)
+
+            # Whiten this batch's dsort columns: (B, q, n_time) -> (n_time, B*q).
+            D = dsort[idx].to(device)  # (B, q, n_time)
+            Dmat = D.permute(2, 0, 1).reshape(n_timepoints, B * n_dsort)
+            Dw = torch.linalg.solve_triangular(L_chol, Dmat, upper=False)
+            Dw = Dw.reshape(n_timepoints, B, n_dsort).permute(1, 0, 2)  # (B,n_time,q)
+
+            # Extended whitened design per voxel: (B, n_time, p+q).
+            X_ext = torch.cat([X_w.unsqueeze(0).expand(B, -1, -1), Dw], dim=2)
+            Yw_b = Yw.T.unsqueeze(2)  # (B, n_time, 1)
+
+            XtX = X_ext.transpose(1, 2) @ X_ext  # (B, p_ext, p_ext)
+            Xty = X_ext.transpose(1, 2) @ Yw_b  # (B, p_ext, 1)
+            eye = torch.eye(p_ext, device=device, dtype=dtype)
+            try:
+                Lc = torch.linalg.cholesky(XtX + 1e-8 * eye)
+                betas = torch.cholesky_solve(Xty, Lc)  # (B, p_ext, 1)
+                XtX_inv = torch.cholesky_inverse(Lc)  # (B, p_ext, p_ext)
+            except torch.linalg.LinAlgError:
+                XtX_inv = torch.linalg.pinv(XtX)
+                betas = XtX_inv @ Xty
+            betas = betas.squeeze(2)  # (B, p_ext)
+
+            # Whitened residuals and noise variance (fp64 accumulation off MPS).
+            resid_w = (Yw_b - X_ext @ betas.unsqueeze(2)).squeeze(2)  # (B, n_time)
+            sigma2 = (resid_w.pow(2).sum(dim=1, dtype=accum_dtype) / dof).to(dtype)
+
+            diag_inv = torch.diagonal(XtX_inv, dim1=1, dim2=2)  # (B, p_ext)
+            se = torch.sqrt(sigma2.unsqueeze(1) * diag_inv)
+            tstats = betas / (se + 1e-10)
+
+            betas_base = betas[:, :p]
+            tstats_base = tstats[:, :p]
+
+            # Prediction / R² in original (un-whitened) space, normalized units.
+            pred = (design @ betas_base.T).T  # (B, n_time)
+            pred = pred + torch.einsum("bq,bqt->bt", betas[:, p:], D)
+            r2 = compute_r2_metric(Y.T, pred, metric="cod")
+
+            # Omnibus F over task columns (or all base columns), matching the
+            # main loop: F = β' A^{-1} β / (σ² p) with A = XtX_inv task sub-block.
+            if fci is not None:
+                A = XtX_inv.index_select(1, fci).index_select(2, fci)
+                beta_t = betas_base.index_select(1, fci)
+                p_f = fci.numel()
+            else:
+                A = XtX_inv[:, :p, :p]
+                beta_t = betas_base
+                p_f = p
+            A_inv = torch.linalg.inv(
+                A + 1e-8 * torch.eye(p_f, device=device, dtype=dtype)
+            )
+            quad = torch.einsum("bi,bij,bj->b", beta_t, A_inv, beta_t)
+            fstats = quad / (sigma2 * p_f + 1e-30)
+
+            # ---- store base + dsort results ----
+            if fci is not None:
+                results.betas[idx] = betas_base.index_select(1, fci).cpu()
+                results.tstats[idx] = tstats_base.index_select(1, fci).cpu()
+            else:
+                results.betas[idx] = betas_base.cpu()
+                results.tstats[idx] = tstats_base.cpu()
+            results.dsort_betas[idx] = betas[:, p:].cpu()
+            results.dsort_tstats[idx] = tstats[:, p:].cpu()
+            results.sigma2[idx] = sigma2.cpu()
+            results.fstats[idx] = fstats.cpu()
+            results.r2[idx] = r2.cpu()
+
+            # Partial / semi-partial R² per base regressor (from t and R²).
+            if want_r2_partial or want_r2_semipartial:
+                _store_partial_semipartial(
+                    results,
+                    idx,
+                    tstats_base=tstats_base,
+                    r2=r2,
+                    dof=dof,
+                    p=p,
+                    fitted_column_indices=fitted_column_indices,
+                    want_r2_partial=want_r2_partial,
+                    r2_partial_mode=r2_partial_mode,
+                    want_r2_semipartial=want_r2_semipartial,
+                    r2_semipartial_mode=r2_semipartial_mode,
+                    dtype=dtype,
+                )
+
+            # GLT contrasts use the base-design covariance block (dsort betas
+            # cannot enter a GLT, per AFNI).
+            if glt_contrasts_tensor is not None:
+                var_base = sigma2.unsqueeze(1).unsqueeze(2) * XtX_inv[:, :p, :p]
+                c_betas = betas_base @ glt_contrasts_tensor.T
+                c_vars = torch.einsum(
+                    "cr,brs,cs->bc",
+                    glt_contrasts_tensor,
+                    var_base,
+                    glt_contrasts_tensor,
+                )
+                c_se = torch.sqrt(torch.clamp(c_vars, min=0.0))
+                c_t = c_betas / (c_se + 1e-10)
+                results.contrast_betas[idx] = c_betas.cpu()
+                results.contrast_tstats[idx] = c_t.cpu()
+                if want_r2_partial and results.contrast_r2_partial is not None:
+                    ct2 = c_t**2
+                    results.contrast_r2_partial[idx] = (ct2 / (ct2 + dof)).cpu()
+                if (
+                    want_r2_semipartial
+                    and results.contrast_r2_semipartial is not None
+                ):
+                    ct2 = c_t**2
+                    var_rem = torch.clamp(1.0 - r2.to(dtype).unsqueeze(1), min=0.0)
+                    results.contrast_r2_semipartial[idx] = (
+                        (ct2 / (ct2 + dof)) * var_rem
+                    ).cpu()
+
+            if want_residuals:
+                results.residuals[idx] = (Y.T - pred).cpu()
+                results.residuals_whitened[idx] = resid_w.cpu()
+            if want_predicted:
+                results.predicted[idx] = pred.cpu()
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        if pbar is not None:
+            pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+
+
+def _store_partial_semipartial(
+    results: ARMA11Results,
+    idx: torch.Tensor,
+    *,
+    tstats_base: torch.Tensor,
+    r2: torch.Tensor,
+    dof: int,
+    p: int,
+    fitted_column_indices: list[int] | None,
+    want_r2_partial: bool,
+    r2_partial_mode: str,
+    want_r2_semipartial: bool,
+    r2_semipartial_mode: str,
+    dtype: torch.dtype,
+) -> None:
+    """Partial/semi-partial R² for a sub-batch, split into task vs nuisance.
+
+    Mirrors the main GLS loop's formulas (r²_partial = t²/(t²+df);
+    r²_semi = r²_partial · (1 - R²_full)) but operates on the dsort-extended fit's
+    base t-stats. Used only by the -dsort pass.
+    """
+    t2 = tstats_base**2
+    r2_partial_full = t2 / (t2 + dof)  # (B, p)
+
+    if fitted_column_indices is not None:
+        nuisance_indices = sorted(set(range(p)) - set(fitted_column_indices))
+        r2_partial_task = r2_partial_full[:, fitted_column_indices]
+        r2_partial_nuis = (
+            r2_partial_full[:, nuisance_indices] if nuisance_indices else None
+        )
+    else:
+        nuisance_indices = []
+        r2_partial_task = r2_partial_full
+        r2_partial_nuis = None
+
+    if want_r2_partial:
+        if r2_partial_mode == "task" and r2_partial_nuis is not None:
+            denom = torch.clamp(
+                1.0 - r2_partial_nuis.sum(dim=1, keepdim=True), min=0.01
+            )
+            results.r2_partial[idx] = (r2_partial_task / denom).cpu()
+        else:
+            results.r2_partial[idx] = r2_partial_task.cpu()
+        if r2_partial_nuis is not None and results.r2_partial_nuisance is not None:
+            results.r2_partial_nuisance[idx] = r2_partial_nuis.cpu()
+
+    if want_r2_semipartial:
+        var_rem = torch.clamp(1.0 - r2.to(dtype).unsqueeze(1), min=0.0)
+        r2_semi_task = r2_partial_task * var_rem
+        r2_semi_nuis = r2_partial_nuis * var_rem if r2_partial_nuis is not None else None
+        if r2_semipartial_mode == "task" and r2_semi_nuis is not None:
+            denom = torch.clamp(1.0 - r2_semi_nuis.sum(dim=1, keepdim=True), min=0.01)
+            results.r2_semipartial[idx] = (r2_semi_task / denom).cpu()
+        else:
+            results.r2_semipartial[idx] = r2_semi_task.cpu()
+        if r2_semi_nuis is not None and results.r2_semipartial_nuisance is not None:
+            results.r2_semipartial_nuisance[idx] = r2_semi_nuis.cpu()
+
+
 def fit_glm_arma11(
     data: torch.Tensor | np.ndarray,
     design: torch.Tensor | np.ndarray,
@@ -3151,6 +3574,9 @@ def fit_glm_arma11(
     save_profile_likelihoods: bool = False,
     run_starts: list[int] | torch.Tensor | None = None,
     autocorr_cache: dict | None = None,
+    dsort: torch.Tensor | np.ndarray | None = None,
+    dsort_labels: list[str] | None = None,
+    want_dsort_nods: bool = False,
 ) -> ARMA11Results:
     """
     Fit GLM with ARMA(1,1) prewhitening (AFNI 3dREMLfit style)
@@ -3376,6 +3802,22 @@ def fit_glm_arma11(
         raise ValueError(f"Data must be 2D or 4D, got {data.ndim}D")
 
     n_voxels, n_timepoints = data.shape
+
+    # Voxel-wise regressors (-dsort / ANATICOR). Already masked to the analysis
+    # voxels upstream. Keep on the CPU storage device and stream per sub-batch in
+    # the dsort GLS pass; (a, b) is still estimated on the base design only.
+    if dsort is not None:
+        dsort = to_tensor(dsort, device=None, dtype=dtype)
+        if dsort.device.type != "cpu":
+            dsort = dsort.to(storage_device)
+        if dsort.ndim == 2:
+            dsort = dsort.unsqueeze(1)  # (n_voxels, n_time) -> (n_voxels, 1, n_time)
+        if dsort.shape[0] != n_voxels or dsort.shape[2] != n_timepoints:
+            raise ValueError(
+                f"dsort must be (n_voxels={n_voxels}, n_dsort, n_timepoints="
+                f"{n_timepoints}); got {tuple(dsort.shape)}"
+            )
+        dsort = _dsort_constant_guard(dsort)
 
     # Per-voxel normalization for float32 numerical conditioning.
     # Dividing Y by its std before REML and GLS eliminates catastrophic cancellation
@@ -5214,6 +5656,45 @@ def fit_glm_arma11(
             if want_predicted:
                 results.predicted[v] = pred_orig_cpu
 
+    # Voxel-wise (-dsort / ANATICOR) regressors: the base GLS above is the
+    # no-dsort ("_nods") fit. Snapshot it if requested, then redo the final GLS
+    # per voxel with the extended design (a, b unchanged, per AFNI).
+    nods_results: ARMA11Results | None = None
+    if dsort is not None:
+        if want_dsort_nods:
+            nods_results = ARMA11Results()
+            for _attr, _val in vars(results).items():
+                if isinstance(_val, torch.Tensor):
+                    setattr(nods_results, _attr, _val.clone())
+                else:
+                    setattr(nods_results, _attr, _val)
+
+        _fit_dsort_gls_pass(
+            data,
+            design,
+            cast(torch.Tensor, dsort),
+            results,
+            fitted_column_indices=fitted_column_indices,
+            glt_contrasts_tensor=glt_contrasts_tensor,
+            want_r2_partial=want_r2_partial,
+            r2_partial_mode=r2_partial_mode,
+            want_r2_semipartial=want_r2_semipartial,
+            r2_semipartial_mode=r2_semipartial_mode,
+            want_residuals=want_residuals,
+            want_predicted=want_predicted,
+            run_starts=run_starts,
+            device=device,
+            dtype=dtype,
+            accum_dtype=_accum_dtype,
+            y_norm_scale=_y_norm_scale,
+            batch_size=batch_size,
+            verbose=verbose,
+        )
+        results.dsort_labels = dsort_labels or [
+            f"dsort#{k}" for k in range(int(dsort.shape[1]))
+        ]
+        results.nods_results = nods_results
+
     # Unscale results from per-voxel float32 conditioning.
     # t-stats, R², F-stats, partial R² are scale-invariant — no unscaling needed.
     # Betas, sigma2, residuals, and predicted must be scaled back to original units.
@@ -5229,6 +5710,22 @@ def fit_glm_arma11(
             results.residuals_whitened.mul_(scale_col)
         if results.predicted is not None:
             results.predicted.mul_(scale_col)
+        # dsort coefficients scale like any beta (Y was divided by its std).
+        if results.dsort_betas is not None:
+            results.dsort_betas.mul_(scale_col)
+        # The _nods snapshot was taken in normalized units — unscale it too.
+        if results.nods_results is not None:
+            _nods = results.nods_results
+            _nods.betas.mul_(scale_col)
+            _nods.sigma2.mul_(_y_norm_scale**2)
+            if _nods.contrast_betas is not None:
+                _nods.contrast_betas.mul_(scale_col)
+            if _nods.residuals is not None:
+                _nods.residuals.mul_(scale_col)
+            if _nods.residuals_whitened is not None:
+                _nods.residuals_whitened.mul_(scale_col)
+            if _nods.predicted is not None:
+                _nods.predicted.mul_(scale_col)
 
     # Restore TF32 setting
     if _saved_tf32 is not None:
