@@ -40,6 +40,7 @@ from fastfuncstuff.design.builder import (
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.design.hrf import get_spmg1_hrf
 from fastfuncstuff.utils import to_linalg_f64, to_tensor
+from fastfuncstuff._compile import safe_compile
 from .pca import PCA
 
 
@@ -1318,14 +1319,11 @@ def _ggm_em_step(
 # torch.compile here fuses ~30 elementwise + reduction kernels into 2-4
 # fused kernels, which on CPU mainly cuts memory bandwidth (each (K, V)
 # tensor allocated/freed inside the loop is reusing the same buffers).
-try:
-    _ggm_em_step_compiled = torch.compile(
-        _ggm_em_step, dynamic=True, fullgraph=False, mode="default"
-    )
-except Exception:
-    # If the installed PyTorch can't compile (e.g. inductor missing), the
-    # uncompiled function is still correct.
-    _ggm_em_step_compiled = _ggm_em_step
+# safe_compile applies the shared inductor policy (PCH disabled) and degrades to
+# the eager function if compilation fails at call time, rather than crashing.
+_ggm_em_step_compiled = safe_compile(
+    _ggm_em_step, dynamic=True, fullgraph=False, mode="default"
+)
 
 
 def _gamma_pdf_torch(x: torch.Tensor, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:

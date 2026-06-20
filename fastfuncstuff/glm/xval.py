@@ -13,6 +13,7 @@ from itertools import combinations
 import numpy as np
 import torch
 
+from fastfuncstuff._compile import safe_compile
 from fastfuncstuff.memory import estimate_chunk_size
 
 
@@ -548,10 +549,9 @@ def _cod_kernel(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     return torch.clamp(r2, max=1.0)
 
 
-try:
-    _cod_kernel_compiled = torch.compile(_cod_kernel, dynamic=True, fullgraph=True)
-except Exception:
-    _cod_kernel_compiled = _cod_kernel
+# Compile through the central policy: PCH disabled (no stale-cache crashes) plus a
+# permanent eager fallback if compilation ever fails for another reason. See _compile.py.
+_cod_kernel_compiled = safe_compile(_cod_kernel, dynamic=True, fullgraph=True)
 
 
 def compute_r2_metric(

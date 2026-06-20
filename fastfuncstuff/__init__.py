@@ -16,6 +16,10 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
+# Apply the central torch.compile policy (disable the fragile precompiled-header
+# cache) BEFORE any submodule defines/calls a compiled kernel. See _compile.py.
+from fastfuncstuff import _compile as _compile  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Core GLM
 # ---------------------------------------------------------------------------
