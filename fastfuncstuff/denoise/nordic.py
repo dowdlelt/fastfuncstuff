@@ -795,14 +795,21 @@ def _residual_xcorr_qc(
     (a vein, an edge), this shows up as focal single-voxel peaks, not whole
     patches, which is why the per-voxel view matters.
 
-    Computed in the g-factor-normalized algorithm space (cleanest null) on the
-    complex residuals. Returns ``(max_r, tstat, dof)``:
+    Correlation is on the **magnitude** of each residual time course, not the
+    complex residual. The shared signal NORDIC over-removes lives in the
+    magnitude ("same time course, different per-echo weight"); the complex
+    Hermitian correlation also fires on shared *phase* (B0/off-resonance evolves
+    coherently across echoes and survives dd-phase), which inflates the
+    correlation brain-wide even for independent thermal magnitude noise. Magnitude
+    targets the over-removal we care about and drops the phase confound.
 
-    - ``max_r`` (nx, ny, nz): max over echo pairs of the magnitude of the
-      Hermitian temporal correlation — raw r, for eyeballing peaks.
+    Computed in the g-factor-normalized algorithm space (cleanest null).
+    Returns ``(max_r, tstat, dof)``:
+
+    - ``max_r`` (nx, ny, nz): max over echo pairs of ``|Pearson r|`` of the
+      magnitude residuals — for eyeballing peaks.
     - ``tstat`` (nx, ny, nz): ``r`` mapped to a Student-t, ``t = r·√(dof/(1-r²))``
-      with ``dof = T - 2``, so it can be tagged ``fitt`` and FDR-thresholded
-      (AFNI computes q from this exactly as it does for correlation bricks).
+      with ``dof = T - 2``, so it can be tagged ``fitt`` and FDR-thresholded.
     - ``dof``: ``T - 2``.
 
     Voxels with ~zero residual energy in any echo (outside the brain / fully
@@ -811,12 +818,12 @@ def _residual_xcorr_qc(
     E = len(residuals)
     nx, ny, nz, nt = residuals[0].shape
     dev = residuals[0].device
-    # (E, V, T) complex, demeaned over time and unit-normalized per voxel.
+    # (E, V, T) magnitude residuals, demeaned over time and unit-normalized.
     flat = []
     for r in residuals:
-        a = r.reshape(-1, nt).to(torch.complex64)
+        a = r.reshape(-1, nt).abs()  # magnitude → real
         a = a - a.mean(dim=1, keepdim=True)
-        norm = a.abs().pow(2).sum(dim=1, keepdim=True).sqrt()
+        norm = a.pow(2).sum(dim=1, keepdim=True).sqrt()
         a = a / norm.clamp(min=1e-12)
         flat.append((a, norm.squeeze(1)))
     max_r = torch.zeros(nx * ny * nz, device=dev)
@@ -824,8 +831,8 @@ def _residual_xcorr_qc(
         ae, ne = flat[e]
         for ep in range(e + 1, E):
             aep, nep = flat[ep]
-            # Hermitian temporal correlation magnitude (scale-invariant).
-            r = (ae * aep.conj()).sum(dim=1).abs()
+            # |Pearson r| of the magnitude residuals (scale-invariant).
+            r = (ae * aep).sum(dim=1).abs()
             valid = (ne > 1e-12) & (nep > 1e-12)
             r = torch.where(valid, r, torch.zeros_like(r))
             max_r = torch.maximum(max_r, r)

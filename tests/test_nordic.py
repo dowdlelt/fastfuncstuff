@@ -723,6 +723,23 @@ def test_residual_xcorr_qc_detects_shared_voxel():
     assert torch.all(tstat >= 0)
 
 
+def test_residual_xcorr_qc_ignores_shared_phase():
+    """Magnitude-based correlation must NOT fire on shared temporal phase with
+    independent magnitudes (the B0/off-resonance confound that made the complex
+    Hermitian version read ~all-significant brain-wide)."""
+    nx, ny, nz, nt = 8, 8, 2, 150
+    torch.manual_seed(0)
+    phi = torch.randn(nt) * 2.0  # shared phase across echoes (B0-like)
+    res = []
+    for _ in range(3):
+        mag = torch.randn(nx, ny, nz, nt).abs()  # independent magnitude per echo
+        res.append((mag * torch.exp(1j * phi)).to(torch.complex64))
+    max_r, _, _ = _residual_xcorr_qc(res)
+    # Mean stays near the 1/sqrt(T) null; nothing like the ~0.66 the complex
+    # Hermitian correlation would give from the shared phase alone.
+    assert float(max_r.mean()) < 0.25, float(max_r.mean())
+
+
 def test_residual_qc_maps_written(tmp_path):
     """Multi-echo run writes one 4D QC map (r / tstat / 1-q sub-bricks), tags the
     t sub-brick as a stat in the AFNI header, and records the summary."""
