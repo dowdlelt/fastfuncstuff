@@ -35,7 +35,9 @@ def _afni_anat(ctx: BenchmarkContext) -> Path:
 
 
 def _ffs_anat(ctx: BenchmarkContext) -> Path:
-    return ctx.processing_dir / "ffs_warper" / f"anatFFS.{_subid(ctx)}.nii.gz"
+    # Tagged dir so CPU and GPU anat warps don't overwrite each other (matches
+    # the ffs_warper{tag} dir that run_ffs creates).
+    return ctx.processing_dir / f"ffs_warper{ctx.ffs_tag}" / f"anatFFS.{_subid(ctx)}.nii.gz"
 
 
 def _anat_input(ctx: BenchmarkContext) -> Path:
@@ -62,13 +64,15 @@ def _afni_ssw_template() -> str:
     return "MNI152_2009_template_SSW.nii.gz"
 
 
+def validation_inputs(ctx: BenchmarkContext) -> list[Path]:
+    """Files validate() reads: the two warped anatomicals being compared."""
+    return [_afni_anat(ctx), _ffs_anat(ctx)]
+
+
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     if ctx.validate_only:
-        if not _afni_anat(ctx).exists():
-            missing.append(str(_afni_anat(ctx)))
-        if not _ffs_anat(ctx).exists():
-            missing.append(str(_ffs_anat(ctx)))
+        missing.extend(str(p) for p in validation_inputs(ctx) if not p.exists())
     else:
         if not _anat_input(ctx).exists():
             missing.append(str(_anat_input(ctx)))

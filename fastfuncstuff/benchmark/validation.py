@@ -5,8 +5,11 @@ Thin wrappers around existing spatial correlation infrastructure.
 
 from __future__ import annotations
 
+import functools
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import nibabel as nib
 import numpy as np
@@ -19,6 +22,29 @@ from ..stats.spatial import (
     spatial_correlation,
     spatial_correlation_matrix,
 )
+
+
+def _guard_missing_inputs(*metric_keys: str) -> Callable[[Callable], Callable]:
+    """Short-circuit a compare_* helper when an input file is missing.
+
+    The first two positional args are the two paths being compared. If either
+    does not exist, return a structured ``{"error": "missing_input", "missing":
+    [...], <metric_keys>: nan}`` dict instead of letting nibabel raise. This lets
+    ``validate()`` degrade (score what it can, fail/skip the rest) rather than
+    blowing up the whole stage with a raw I/O error after the expensive run.
+    """
+    def decorator(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(a_path: Any, b_path: Any, *args: Any, **kwargs: Any) -> dict:
+            missing = [str(p) for p in (a_path, b_path) if not Path(p).exists()]
+            if missing:
+                out: dict[str, Any] = {k: float("nan") for k in metric_keys}
+                out["error"] = "missing_input"
+                out["missing"] = missing
+                return out
+            return fn(a_path, b_path, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
@@ -67,6 +93,7 @@ def _automask(vol: Tensor) -> Tensor:
     return vol > (robust_max * 0.1)
 
 
+@_guard_missing_inputs("r", "n_voxels")
 def compare_volumes(
     a_path: str | Path,
     b_path: str | Path,
@@ -95,6 +122,7 @@ def compare_volumes(
     return {"r": float(r), "n_voxels": int(mask.sum())}
 
 
+@_guard_missing_inputs("dice", "n_a", "n_b", "n_overlap")
 def compare_masks(
     a_path: str | Path,
     b_path: str | Path,
@@ -118,6 +146,7 @@ def compare_masks(
     return {"dice": float(dice), "n_a": n_a, "n_b": n_b, "n_overlap": n_overlap}
 
 
+@_guard_missing_inputs("median_r", "mean_r")
 def compare_timeseries_4d(
     a_path: str | Path,
     b_path: str | Path,
@@ -195,6 +224,7 @@ def compare_timeseries_4d(
     }
 
 
+@_guard_missing_inputs("mean_r", "min_r")
 def compare_1d_params(
     a_path: str | Path,
     b_path: str | Path,
@@ -233,6 +263,7 @@ def compare_1d_params(
     }
 
 
+@_guard_missing_inputs("mean_msd", "max_msd")
 def compare_moco_ssd(
     a_path: str | Path,
     b_path: str | Path,

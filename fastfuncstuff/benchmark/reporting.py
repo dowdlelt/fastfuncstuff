@@ -58,13 +58,16 @@ def print_validation_report(
 
     n_pass = 0
     n_fail = 0
+    n_incomplete = 0
     for r in results:
-        status = "PASS" if r.passed else "FAIL"
-        if r.passed:
+        status = r.status
+        if r.incomplete:
+            n_incomplete += 1
+        elif r.passed:
             n_pass += 1
         else:
             n_fail += 1
-        print(f"{r.stage_name:<16} {status:<8} {r.summary}")
+        print(f"{r.stage_name:<16} {status:<11} {r.summary}")
         for err in r.errors:
             print(f"  ERROR: {err}")
 
@@ -72,7 +75,8 @@ def print_validation_report(
             _print_moco_detail(r.validation)
 
     print("-" * 80)
-    print(f"Total: {n_pass} passed, {n_fail} failed out of {len(results)} stages")
+    tail = f", {n_incomplete} incomplete" if n_incomplete else ""
+    print(f"Total: {n_pass} passed, {n_fail} failed{tail} out of {len(results)} stages")
 
     # Timing comparison (Ref/FFS/Speedup) — only if any stage has timing data.
     # Mirrors the table in print_timing_report so users don't need to pass
@@ -287,7 +291,7 @@ def print_timing_report(
     any_other_arch_ref = False
 
     for r in results:
-        status = "PASS" if r.passed else "FAIL"
+        status = r.status
         ffs_t = r.ffs_time or 0.0
         ref_t = r.ref_time or 0.0
         ffs_str = f"{ffs_t:.1f}" if ffs_t > 0 else "-"
@@ -346,7 +350,7 @@ def print_timing_report(
     if any_cached_ref:
         print(f"  † cached ref timing (CPU arch: {my_ref_id})")
     if any_other_arch_ref:
-        print(f"  ‡ cached ref timing from a different CPU architecture")
+        print("  ‡ cached ref timing from a different CPU architecture")
 
     # Detailed metrics + historical comparison
     _print_stage_details(results)

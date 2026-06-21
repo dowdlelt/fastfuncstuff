@@ -21,6 +21,15 @@ def _ref_task_run(ctx: BenchmarkContext) -> tuple[str, int]:
     return params.get("reference_task", "localizer"), params.get("reference_run", 1)
 
 
+def _afni_anat(ctx: BenchmarkContext) -> Path:
+    return ctx.processing_dir / "sswarper_output" / f"anatQQ.sub-{ctx.subject}.nii"
+
+
+def _ffs_anat(ctx: BenchmarkContext) -> Path:
+    # Tagged to match what the align stage writes (CPU vs GPU separation).
+    return ctx.processing_dir / f"ffs_warper{ctx.ffs_tag}" / f"anatFFS.sub-{ctx.subject}.nii.gz"
+
+
 def _afni_mni(ctx: BenchmarkContext, task: str, run: int) -> Path:
     return ctx.processing_dir / f"afni_mni_task-{task}_run-{run}.nii.gz"
 
@@ -58,25 +67,27 @@ def _nwarp_chain(ctx: BenchmarkContext, task: str, run: int) -> str:
     return " ".join(parts)
 
 
+def validation_inputs(ctx: BenchmarkContext) -> list[Path]:
+    """Files validate() reads: warped anatomicals + all warped functionals.
+
+    ``anatFFS`` is produced by the *align* stage (ffs_qwarp), not by warp, so a
+    warp-only run with no prior align run will list it here -- surfaced as
+    INCOMPLETE rather than a raw I/O error mid-validation.
+    """
+    paths = [_afni_anat(ctx), _ffs_anat(ctx)]
+    for task, runs in ctx.all_task_run_pairs():
+        for run in runs:
+            paths.append(_afni_mni(ctx, task, run))
+            paths.append(_ffs_mni(ctx, task, run))
+    return paths
+
+
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     subid = f"sub-{ctx.subject}"
     ref_task, ref_run = _ref_task_run(ctx)
     if ctx.validate_only:
-        # Warped anatomicals
-        afni_anat = ctx.processing_dir / "sswarper_output" / f"anatQQ.{subid}.nii"
-        ffs_anat = ctx.processing_dir / "ffs_warper" / f"anatFFS.{subid}.nii.gz"
-        if not afni_anat.exists():
-            missing.append(str(afni_anat))
-        if not ffs_anat.exists():
-            missing.append(str(ffs_anat))
-
-        # Warped functionals
-        for task, runs in ctx.all_task_run_pairs():
-            for run in runs:
-                for p in [_afni_mni(ctx, task, run), _ffs_mni(ctx, task, run)]:
-                    if not p.exists():
-                        missing.append(str(p))
+        missing.extend(str(p) for p in validation_inputs(ctx) if not p.exists())
     else:
         # Need sswarper output (from align stage)
         ssw = ctx.processing_dir / "sswarper_output" / f"anatQQ.{subid}.nii"
@@ -197,10 +208,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     results = {}
 
     # 1. Compare warped anatomicals
-    subid = f"sub-{ctx.subject}"
-    afni_anat = ctx.processing_dir / "sswarper_output" / f"anatQQ.{subid}.nii"
-    ffs_anat = ctx.processing_dir / "ffs_warper" / f"anatFFS.{subid}.nii.gz"
-    anat_result = compare_volumes(afni_anat, ffs_anat)
+    anat_result = compare_volumes(_afni_anat(ctx), _ffs_anat(ctx))
     results["anat_r"] = anat_result["r"]
 
     # 2. Compare warped functionals (mean correlation across runs)

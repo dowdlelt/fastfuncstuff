@@ -218,6 +218,16 @@ class StageResult:
     passed: bool = True
     summary: str = ""
     errors: list[str] = field(default_factory=list)
+    # True when validation inputs were missing: the stage didn't fail its
+    # comparison, it just couldn't run a full comparison (e.g. an upstream stage
+    # hasn't produced its output yet). Reported as INCOMPLETE, not FAIL.
+    incomplete: bool = False
+
+    @property
+    def status(self) -> str:
+        if self.incomplete:
+            return "INCOMPLETE"
+        return "PASS" if self.passed else "FAIL"
 
 
 def run_timed(
@@ -402,6 +412,37 @@ def _ensure_glmsingle_niftis(ctx: BenchmarkContext) -> None:
     _glmsingle_exported = True
 
 
+def _missing_validation_inputs(stage: Any, ctx: BenchmarkContext) -> list[str]:
+    """Files a stage's validate() will read that don't exist yet.
+
+    A stage opts in by defining ``validation_inputs(ctx) -> list[str|Path]``.
+    Stages without it return [] (no preflight; the hardened compare_* helpers
+    still keep validate() from crashing on a missing file).
+    """
+    fn = getattr(stage, "validation_inputs", None)
+    if fn is None:
+        return []
+    try:
+        return [str(p) for p in fn(ctx) if not Path(p).exists()]
+    except Exception:
+        return []
+
+
+def _missing_input_hint(stage: Any, missing: list[str]) -> str:
+    """One-line actionable hint for missing validation inputs.
+
+    Names the upstream stage(s) that produce them when the stage declares
+    ``requires`` (see P1), else a generic pointer.
+    """
+    requires = getattr(stage, "requires", None)
+    if requires:
+        return (
+            f"INCOMPLETE: run upstream stage(s) first: "
+            f"{' '.join(requires)} (then '{stage.name}')"
+        )
+    return "INCOMPLETE: a needed input is missing (run the upstream stage that produces it)"
+
+
 def run_stages(
     stages: list,
     ctx: BenchmarkContext,
@@ -474,6 +515,13 @@ def run_stages(
         # (FFS outputs won't exist). Prep-only stages still validate so we
         # know the setup succeeded.
         if not (ctx.ref_only and has_ref):
+            # Preflight: which files validate() will read are missing? A stage
+            # declares these via validation_inputs(ctx). Missing inputs mean an
+            # upstream artifact isn't there (e.g. a stage wasn't run) -- that's
+            # INCOMPLETE, not a comparison FAIL, and we say so up front instead
+            # of letting a raw I/O error surface after the expensive run.
+            missing_inputs = _missing_validation_inputs(stage, ctx)
+
             try:
                 result.validation = stage.validate(ctx)
                 result.passed = result.validation.get("passed", True)
@@ -483,13 +531,24 @@ def run_stages(
                 result.errors.append(f"Validation: {e}")
                 result.summary = f"Validation error: {e}"
                 print(f"  Validation error: {e}")
+
+            if missing_inputs:
+                result.incomplete = True
+                result.passed = False
+                result.errors.extend(missing_inputs)
+                shown = ", ".join(Path(m).name for m in missing_inputs[:3])
+                more = f" (+{len(missing_inputs) - 3} more)" if len(missing_inputs) > 3 else ""
+                detail = f" | {result.summary}" if result.summary else ""
+                result.summary = f"missing {len(missing_inputs)} input(s): {shown}{more}{detail}"
+                hint = _missing_input_hint(stage, missing_inputs)
+                if hint:
+                    print(f"  {hint}")
         else:
             result.summary = "ref only"
 
         # Print result
-        status = "PASS" if result.passed else "FAIL"
         timing = _format_timing(result, name, ctx.data_dir)
-        print(f"  {status}: {result.summary}{timing}")
+        print(f"  {result.status}: {result.summary}{timing}")
 
         results.append(result)
 
