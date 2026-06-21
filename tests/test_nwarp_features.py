@@ -213,6 +213,31 @@ def test_autopad_grows_grid(tmp_path):
     assert padded.sum() > 1e3
 
 
+def test_autopad_noop_when_source_fits(tmp_path):
+    """No padding when the warped source stays within the output grid.
+
+    Regression: padding was driven by raw displacement, so a warp with a large
+    translation-like field grew the grid (and runtime) even though all data was
+    captured. Here a small in-FOV warp must leave the grid untouched.
+    """
+    n = 16
+    aff = _diag_affine(2.0)
+    src = np.zeros((n, n, n), dtype=np.float32)
+    src[4:12, 4:12, 4:12] = 30.0  # well inside the FOV, with margin
+    src_path = tmp_path / "src.nii"
+    nib.Nifti1Image(src, aff).to_filename(str(src_path))
+    warp_path = tmp_path / "warp.nii"
+    _write_mm_warp(warp_path, (n, n, n), aff, (0.0, 2.0, 0.0))  # 1-voxel pull, in-FOV
+
+    out = tmp_path / "out.nii"
+    nwarpforge(
+        source_path=str(src_path), nwarp_specs=[str(warp_path)],
+        prefix=str(out), interp="linear", device=DEV, verb=0, auto_pad=True,
+    )
+    got = np.asarray(nib.load(str(out)).dataobj)
+    assert got.shape[:3] == (n, n, n)  # grid unchanged: nothing was at risk
+
+
 def test_master_warp_uses_warp_grid(tmp_path):
     aff = _diag_affine(2.0)
     src = np.random.rand(8, 8, 8).astype(np.float32)

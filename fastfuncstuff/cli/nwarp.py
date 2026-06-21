@@ -132,9 +132,10 @@ Examples:
         "-no-autopad",
         dest="auto_pad",
         action="store_false",
-        help="Disable automatic output-grid padding. By default the grid is "
-        "grown to encompass the warped source so a large translation/warp "
-        "cannot clip data off the edge; disable for exact master-grid output.",
+        help="Disable automatic output-grid padding. By default the grid grows "
+        "only when a warp would clip real source signal off the edge (overlap + "
+        "clipped-mass test, not raw displacement); disable for exact master-grid "
+        "output.",
     )
     io_group.add_argument(
         "-expad",

@@ -1032,6 +1032,189 @@ def _pad_output_grid(
     return new_shape, new_affine
 
 
+def _output_to_source_voxel_coords(
+    warp: NonlinearWarp, source_affine: np.ndarray, output_affine: np.ndarray
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Source-voxel coordinates each output voxel samples (the same map apply uses)."""
+    nz, ny, nx = warp.shape
+    device = warp.xd.device
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(nz, dtype=torch.float32, device=device),
+        torch.arange(ny, dtype=torch.float32, device=device),
+        torch.arange(nx, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    M = np.linalg.inv(compute_cardinal_affine(source_affine)) @ compute_cardinal_affine(
+        output_affine
+    )
+    M_t = torch.from_numpy(M.astype(np.float32)).to(device)
+    coords = torch.stack(
+        [
+            (ii + warp.xd).reshape(-1),
+            (jj + warp.yd).reshape(-1),
+            (kk + warp.zd).reshape(-1),
+            torch.ones(nz * ny * nx, dtype=torch.float32, device=device),
+        ],
+        dim=0,
+    )
+    s = M_t @ coords
+    return (
+        s[0].reshape(nz, ny, nx),
+        s[1].reshape(nz, ny, nx),
+        s[2].reshape(nz, ny, nx),
+    )
+
+
+def _footprint_extent(
+    transforms: list[Transform],
+    grid_shape: tuple[int, ...],
+    grid_affine: np.ndarray,
+    source_shape: tuple[int, int, int],
+    source_affine: np.ndarray,
+    device: torch.device,
+    time_indices: list[int],
+) -> tuple[list[int], list[int]] | None:
+    """Index-space bounding box of the *in-source* footprint on a given grid.
+
+    Composes the warp on ``grid_shape`` for each representative frame and finds
+    which grid voxels actually pull real source data (sample inside the source
+    bounds). Returns ``(lo, hi)`` index bounds per (x, y, z) over all frames, or
+    ``None`` if no voxel samples source. This is the basis for *overlap-based*
+    padding: only the region that pulls real data matters, not the raw
+    displacement magnitude (a warp to a far-away template can have huge
+    displacements yet lose no data).
+    """
+    snz, sny, snx = source_shape
+    nz, ny, nx = grid_shape[-3:]
+    lo = [nx, ny, nz]
+    hi = [-1, -1, -1]
+    found = False
+    for t in time_indices:
+        comp = compose_chain(transforms, grid_shape, grid_affine, device, time_idx=t, verb=0)
+        sx, sy, sz = _output_to_source_voxel_coords(comp, source_affine, grid_affine)
+        in_src = (
+            (sx >= -0.5) & (sx <= snx - 0.5)
+            & (sy >= -0.5) & (sy <= sny - 0.5)
+            & (sz >= -0.5) & (sz <= snz - 0.5)
+        )
+        if not bool(in_src.any()):
+            continue
+        found = True
+        axes = [
+            in_src.any(dim=0).any(dim=0),  # x
+            in_src.any(dim=0).any(dim=1),  # y
+            in_src.any(dim=1).any(dim=1),  # z
+        ]
+        for a in range(3):
+            idx = axes[a].nonzero().flatten()
+            lo[a] = min(lo[a], int(idx[0].item()))
+            hi[a] = max(hi[a], int(idx[-1].item()))
+    return (lo, hi) if found else None
+
+
+def _needed_padding(
+    transforms: list[Transform],
+    output_shape: tuple[int, ...],
+    output_affine: np.ndarray,
+    source: Tensor,
+    source_affine: np.ndarray,
+    device: torch.device,
+    time_indices: list[int],
+    verb: int = 1,
+    mass_tol: float = 1e-3,
+) -> tuple[int, int, int]:
+    """Per-axis padding (x, y, z) needed so no meaningful source data is clipped.
+
+    Overlap- and mass-based, so a warp grows the grid only when it actually
+    drops real signal (not just a zero background edge, and not merely because
+    the displacement is large):
+
+      1. Compose on the nominal grid and find the in-source footprint. If it does
+         not touch any grid face, nothing is lost -> pad 0 (the common
+         warp-to-template-with-margin case; no slowdown).
+      2. If a face is touched, probe a grid grown on the touched axes (capped at
+         one FOV and the raw displacement bound). Sample the source over the
+         probe footprint and measure the fraction of source signal that falls
+         *outside* the nominal region. If that lost fraction is below
+         ``mass_tol`` the clipping is background-level -> pad 0; otherwise pad to
+         the foreground overshoot and warn.
+    """
+    snz, sny, snx = (source.shape[-3], source.shape[-2], source.shape[-1])
+    source_shape = (snz, sny, snx)
+    src3d = source[0] if source.ndim == 4 else source
+    nx, ny, nz = output_shape[-1], output_shape[-2], output_shape[-3]
+    dims = (nx, ny, nz)
+
+    ext = _footprint_extent(
+        transforms, output_shape, output_affine, source_shape, source_affine,
+        device, time_indices,
+    )
+    if ext is None:
+        return (0, 0, 0)
+    lo, hi = ext
+    touched = [lo[a] == 0 or hi[a] == dims[a] - 1 for a in range(3)]
+    if not any(touched):
+        return (0, 0, 0)
+
+    # Stage 2: grow a probe on the touched axes and weigh the clipped signal.
+    raw = _estimate_warp_padding(transforms, output_shape, output_affine)
+    probe = tuple(min(dims[a], raw[a] + 2) if touched[a] else 0 for a in range(3))
+    pshape, paffine = _pad_output_grid(output_shape, output_affine, probe)
+    pnz, pny, pnx = pshape
+
+    need = [0, 0, 0]
+    lost_frac = 0.0
+    probe_edge_hit = [False, False, False]
+    for t in time_indices:
+        comp = compose_chain(transforms, pshape, paffine, device, time_idx=t, verb=0)
+        sx, sy, sz = _output_to_source_voxel_coords(comp, source_affine, paffine)
+        in_src = (
+            (sx >= -0.5) & (sx <= snx - 0.5)
+            & (sy >= -0.5) & (sy <= sny - 0.5)
+            & (sz >= -0.5) & (sz <= snz - 0.5)
+        )
+        if not bool(in_src.any()):
+            continue
+        # |source| sampled over the probe footprint (the captured signal).
+        vals = trilinear_interpolate(
+            src3d, sx.reshape(-1), sy.reshape(-1), sz.reshape(-1)
+        ).reshape(pnz, pny, pnx).abs() * in_src.float()
+        total = float(vals.sum().item())
+        if total <= 0:
+            continue
+        # Mass outside the nominal region (the probe border) is what padding-less
+        # output would drop.
+        keep = torch.zeros_like(vals)
+        keep[probe[2]:probe[2] + nz, probe[1]:probe[1] + ny, probe[0]:probe[0] + nx] = 1.0
+        lost_frac = max(lost_frac, float((vals * (1.0 - keep)).sum().item()) / total)
+
+        # Foreground bbox (signal above a small fraction of its own max) so a
+        # noise edge doesn't drive the pad amount.
+        fg = vals > (0.02 * float(vals.max().item()))
+        if not bool(fg.any()):
+            continue
+        ax = [fg.any(dim=0).any(dim=0), fg.any(dim=0).any(dim=1), fg.any(dim=1).any(dim=1)]
+        pdims = (pnx, pny, pnz)
+        for a in range(3):
+            idx = ax[a].nonzero().flatten()
+            flo, fhi = int(idx[0].item()), int(idx[-1].item())
+            need[a] = max(0, need[a], probe[a] - flo, fhi - (probe[a] + dims[a] - 1))
+            if flo == 0 or fhi == pdims[a] - 1:
+                probe_edge_hit[a] = True
+
+    if lost_frac < mass_tol:
+        return (0, 0, 0)
+
+    if verb >= 1:
+        for a in range(3):
+            if probe_edge_hit[a]:
+                print(
+                    f"nwarpforge: source signal still reaches the grid edge on axis "
+                    f"{'xyz'[a]} at the padding cap; increase -expad if data is clipped"
+                )
+    return (need[0], need[1], need[2])
+
+
 def nwarpforge(
     source_path: str,
     nwarp_specs: list[str],
@@ -1092,10 +1275,11 @@ def nwarpforge(
         dxyz: If set, force isotropic output voxel size (mm)
         no_neg: Clamp warped output at 0 (suppress wsinc5/cubic ringing on
             non-negative data).
-        auto_pad: Grow the output grid to encompass the warped source so a large
-            translation / warp cannot push data off the edge (we never lose data
-            on a warp). Costs memory proportional to the padding. Disable for
-            exact master-grid output.
+        auto_pad: Grow the output grid only when a warp would clip real source
+            signal off the edge (decided from in-source footprint overlap and a
+            clipped-mass test, not raw displacement -- so a warp to a far-off
+            template with margin does not grow the grid). Disable for exact
+            master-grid output.
         expad: Extra padding voxels added on every side on top of the auto
             estimate (AFNI -expad analogue). Also forces padding when
             auto_pad is False.
@@ -1283,27 +1467,25 @@ def nwarpforge(
                     master_hdr_obj = warp_hdr
                     break
 
-    # Auto-pad the output grid so a large translation / warp can't push data off
-    # the edge. We estimate the worst-case displacement from the loaded
-    # transforms and grow the grid by that much (plus -expad). Affine matrices,
-    # already in output-voxel space, are conjugated by the index shift so the
-    # composed warp is correct on the padded grid; nonlinear warps re-resample to
-    # the padded grid automatically in compose_chain.
+    # Auto-pad the output grid so a warp can't push data off the edge -- but only
+    # where data is *actually* lost. Padding is decided from the in-source
+    # footprint overlap (see _needed_padding), not the raw displacement: a warp
+    # to a far-off template has huge displacements yet loses no data, so the
+    # common case returns pad 0 and the grid (and runtime) is unchanged. Affine
+    # matrices, already in output-voxel space, are conjugated by the index shift
+    # so composition stays correct on the padded grid; nonlinear warps re-resample
+    # to it automatically in compose_chain.
+    # Representative frames for the footprint probe: 0 and the last time-dependent
+    # index (covers motion drift; static template affines dominate either way).
+    reps = sorted({0, max(0, max_time_points - 1)})
     pad = (0, 0, 0)
     if auto_pad:
-        pad = _estimate_warp_padding(transforms, output_shape, output_affine)
+        pad = _needed_padding(
+            transforms, output_shape, output_affine, source,
+            source_header["affine"], device, reps, verb=verb,
+        )
     if expad > 0:
         pad = tuple(p + expad for p in pad)  # type: ignore[assignment]
-    # Cap runaway padding (likely a units/affine bug, not real data) but honor
-    # generous growth -- up to one full FOV per side.
-    cap = (output_shape[-1], output_shape[-2], output_shape[-3])  # (x, y, z) caps
-    capped = tuple(min(p, c) for p, c in zip(pad, cap, strict=True))
-    if capped != pad and verb >= 1:
-        print(
-            f"nwarpforge: estimated pad {pad} exceeds one-FOV cap {cap}; "
-            f"clamping to {capped} (check warp units if data is clipped)"
-        )
-    pad = capped
 
     if any(p > 0 for p in pad):
         shift = torch.tensor(
