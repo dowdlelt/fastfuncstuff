@@ -155,9 +155,11 @@ Examples:
     )
     interp_group.add_argument(
         "-ainterp",
-        choices=["linear"],
-        default="linear",
-        help="Warp interpolation during composition (default: linear)",
+        choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
+        default="cubic",
+        help="Kernel for warp-field interpolation during composition "
+        "(default: cubic). Higher order reduces the smoothing each composition "
+        "step adds to the warp; 'linear' is fastest.",
     )
     interp_group.add_argument(
         "-no_neg",
@@ -247,6 +249,7 @@ def main(argv: list[str] | None = None) -> None:
         no_neg=args.no_neg,
         auto_pad=args.auto_pad,
         expad=args.expad,
+        ainterp=args.ainterp,
     )
 
     if verb >= 1:

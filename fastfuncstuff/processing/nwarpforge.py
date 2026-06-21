@@ -24,8 +24,42 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from .interp import normalize_interp_mode, trilinear_interpolate, warp_image
+from .interp import (
+    _separable_resample_3d,
+    normalize_interp_mode,
+    trilinear_interpolate,
+    warp_image,
+)
 from .io import derive_mean_output_path, load_image, load_warp_field, save_image
+
+# Interpolation kernels usable for warp-field (displacement) interpolation during
+# composition. NN is excluded -- a nearest-sampled displacement field would be
+# piecewise-constant and tear the warp.
+WARP_COMPOSE_INTERP = ("linear", "cubic", "quintic", "heptic", "wsinc5")
+
+
+def _sample_field(
+    field: Tensor, x: Tensor, y: Tensor, z: Tensor, interp: str = "linear"
+) -> Tensor:
+    """Sample a displacement field at arbitrary coords with the given kernel.
+
+    ``linear`` keeps the fast grid_sample path (border-clamped). Higher-order
+    kernels reduce the smoothing each composition step adds to the warp -- the
+    whole point of composing the chain in one shot is to interpolate as little as
+    possible, so a sharper kernel here preserves warp detail (matches AFNI using
+    the interp kernel for the warp itself, not just the data).
+    """
+    if interp == "linear":
+        return trilinear_interpolate(field, x, y, z)
+    # Edge-extend out-of-bounds (clamp coords to the field) instead of the
+    # separable kernel's zero-fill: a displacement field must extrapolate its
+    # border value, matching grid_sample's border mode used by the linear path.
+    # Zero-filling would tear the warp where a composed coord leaves the grid.
+    nz, ny, nx = field.shape
+    xc = x.clamp(0, nx - 1)
+    yc = y.clamp(0, ny - 1)
+    zc = z.clamp(0, nz - 1)
+    return _separable_resample_3d(field, xc, yc, zc, interp)
 
 
 def derive_phase_output_path(prefix: str) -> str:
@@ -441,6 +475,7 @@ def prepare_warp_for_grid(
     target_affine: np.ndarray,
     device: torch.device,
     verb: int = 1,
+    interp: str = "linear",
 ) -> NonlinearWarp:
     """Resample a NIfTI-mm warp to the target grid and convert to voxel units.
 
@@ -519,17 +554,17 @@ def prepare_warp_for_grid(
 
         # Interpolate NIfTI mm displacements at warp grid locations
         mm_xd = (
-            trilinear_interpolate(warp.xd, flat_x, flat_y, flat_z)
+            _sample_field(warp.xd, flat_x, flat_y, flat_z, interp)
             .float()
             .reshape(tgt_nz, tgt_ny, tgt_nx)
         )
         mm_yd = (
-            trilinear_interpolate(warp.yd, flat_x, flat_y, flat_z)
+            _sample_field(warp.yd, flat_x, flat_y, flat_z, interp)
             .float()
             .reshape(tgt_nz, tgt_ny, tgt_nx)
         )
         mm_zd = (
-            trilinear_interpolate(warp.zd, flat_x, flat_y, flat_z)
+            _sample_field(warp.zd, flat_x, flat_y, flat_z, interp)
             .float()
             .reshape(tgt_nz, tgt_ny, tgt_nx)
         )
@@ -615,6 +650,7 @@ def compose_matrix_then_warp(
     matrix: Tensor,
     warp: NonlinearWarp,
     device: torch.device,
+    interp: str = "linear",
 ) -> NonlinearWarp:
     """Compose: output = warp(matrix @ x)
 
@@ -655,14 +691,14 @@ def compose_matrix_then_warp(
     tz = transformed[2].reshape(nz, ny, nx)
 
     _N = nz * ny * nx
-    warp_x_at_t = trilinear_interpolate(
-        warp.xd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1)
+    warp_x_at_t = _sample_field(
+        warp.xd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1), interp
     ).reshape(nz, ny, nx)
-    warp_y_at_t = trilinear_interpolate(
-        warp.yd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1)
+    warp_y_at_t = _sample_field(
+        warp.yd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1), interp
     ).reshape(nz, ny, nx)
-    warp_z_at_t = trilinear_interpolate(
-        warp.zd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1)
+    warp_z_at_t = _sample_field(
+        warp.zd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1), interp
     ).reshape(nz, ny, nx)
 
     new_xd = (tx + warp_x_at_t) - ii
@@ -680,6 +716,7 @@ def compose_matrix_then_warp(
 def compose_warp_then_warp(
     warp_a: NonlinearWarp,
     warp_b: NonlinearWarp,
+    interp: str = "linear",
 ) -> NonlinearWarp:
     """Compose: output = B(A(x))
 
@@ -708,14 +745,14 @@ def compose_warp_then_warp(
     z_after_a = kk + warp_a.zd
 
     _N = nz * ny * nx
-    bx_at_a = trilinear_interpolate(
-        warp_b.xd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1)
+    bx_at_a = _sample_field(
+        warp_b.xd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1), interp
     ).reshape(nz, ny, nx)
-    by_at_a = trilinear_interpolate(
-        warp_b.yd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1)
+    by_at_a = _sample_field(
+        warp_b.yd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1), interp
     ).reshape(nz, ny, nx)
-    bz_at_a = trilinear_interpolate(
-        warp_b.zd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1)
+    bz_at_a = _sample_field(
+        warp_b.zd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1), interp
     ).reshape(nz, ny, nx)
 
     new_xd = warp_a.xd + bx_at_a
@@ -737,6 +774,7 @@ def compose_chain(
     device: torch.device,
     time_idx: int = 0,
     verb: int = 1,
+    interp: str = "linear",
 ) -> NonlinearWarp:
     """Compose a chain of transforms: C(B(A(x))).
 
@@ -747,9 +785,14 @@ def compose_chain(
         device: Torch device
         time_idx: Which time point for time-dependent affines
         verb: Verbosity level
+        interp: Kernel for warp-field interpolation during composition.
 
     Returns:
         Single composed warp field on output grid
+
+    A ``NonlinearWarp`` already on the output grid (``units="voxels"``) is taken
+    as pre-prepared and used as-is -- this is what lets :func:`reduce_chain`
+    collapse static runs once and skip per-frame resampling.
     """
     if not transforms:
         raise ValueError("Empty transform chain")
@@ -775,12 +818,16 @@ def compose_chain(
                 print(f"  [compose] after affine [{i}]: warp shape = {result_warp.shape}")
 
         elif isinstance(xform, NonlinearWarp | TimeVaryingWarp):
-            # Resolve a time-varying warp to this frame's field, then convert the
-            # NIfTI mm warp to output-grid voxel units (composes to any -master).
+            # Resolve a time-varying warp to this frame's field. A static warp
+            # already prepared to the output grid (units="voxels") is reused
+            # as-is; an mm warp is resampled to output-grid voxel units now.
             frame_warp = xform.at_time(time_idx) if isinstance(xform, TimeVaryingWarp) else xform
-            prepared = prepare_warp_for_grid(
-                frame_warp, output_shape, output_affine, device, verb=verb
-            )
+            if isinstance(frame_warp, NonlinearWarp) and frame_warp.units == "voxels":
+                prepared = frame_warp
+            else:
+                prepared = prepare_warp_for_grid(
+                    frame_warp, output_shape, output_affine, device, verb=verb, interp=interp
+                )
             if result_warp is None:
                 result_warp = prepared
                 if verb >= 2:
@@ -788,7 +835,7 @@ def compose_chain(
             else:
                 if verb >= 2:
                     print(f"  [compose] composing warp [{i}] -> {output_shape}")
-                result_warp = compose_warp_then_warp(result_warp, prepared)
+                result_warp = compose_warp_then_warp(result_warp, prepared, interp=interp)
                 if verb >= 2:
                     print(f"  [compose] after compose: warp shape = {result_warp.shape}")
 
@@ -801,6 +848,59 @@ def compose_chain(
         )
 
     return result_warp
+
+
+def _is_time_dependent(xform: Transform) -> bool:
+    """True if a transform's mapping changes per frame (multi-row affine / per-frame warp)."""
+    if isinstance(xform, AffineTransform):
+        return xform.matrices.shape[0] > 1
+    return isinstance(xform, TimeVaryingWarp)
+
+
+def reduce_chain(
+    transforms: list[Transform],
+    output_shape: tuple[int, int, int],
+    output_affine: np.ndarray,
+    device: torch.device,
+    interp: str = "linear",
+    verb: int = 1,
+) -> list[Transform]:
+    """Collapse maximal runs of *static* transforms into single pre-prepared warps.
+
+    The per-frame warp loop otherwise re-resamples and re-composes every static
+    transform (distortion, cross-run, affine-to-anat, nonlinear-to-MNI) on each
+    volume, even though only the time-dependent pieces (per-volume motion, a
+    per-frame distortion field) actually change. This reduces the chain to an
+    alternating list of [pre-composed static warp | time-dependent transform],
+    where every static warp is already on the output grid (``units="voxels"``),
+    so :func:`compose_chain` skips its resampling on every subsequent frame.
+
+    Collapsing the statics into one warp also composes them in a single shot,
+    which minimises the interpolation smoothing those steps add.
+    """
+    reduced: list[Transform] = []
+    run: list[Transform] = []
+
+    def flush() -> None:
+        if not run:
+            return
+        reduced.append(
+            compose_chain(run, output_shape, output_affine, device, time_idx=0,
+                          interp=interp, verb=0)
+        )
+        run.clear()
+
+    for xform in transforms:
+        if _is_time_dependent(xform):
+            flush()
+            reduced.append(xform)
+        else:
+            run.append(xform)
+    flush()
+
+    if verb >= 2:
+        print(f"  [reduce] {len(transforms)} transforms -> {len(reduced)} reduced slots")
+    return reduced
 
 
 def apply_composed_warp(
@@ -1234,6 +1334,7 @@ def nwarpforge(
     no_neg: bool = False,
     auto_pad: bool = True,
     expad: int = 0,
+    ainterp: str = "cubic",
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1283,11 +1384,20 @@ def nwarpforge(
         expad: Extra padding voxels added on every side on top of the auto
             estimate (AFNI -expad analogue). Also forces padding when
             auto_pad is False.
+        ainterp: Kernel for warp-field interpolation during composition
+            ("linear", "cubic", "quintic", "heptic", "wsinc5"). Higher order
+            reduces the smoothing each composition step adds to the warp;
+            "cubic" is a good accuracy/cost default for smooth displacement
+            fields.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     interp = normalize_interp_mode(interp)
+    if ainterp not in WARP_COMPOSE_INTERP:
+        raise ValueError(
+            f"ainterp must be one of {WARP_COMPOSE_INTERP}, got {ainterp!r}"
+        )
 
     t0_load = __import__("time").time()
     source, source_header = load_image(source_path, device=device)
@@ -1522,18 +1632,33 @@ def nwarpforge(
     output_volumes = []
     phase_volumes: list[Tensor] = []
 
+    # Collapse static runs once: the per-frame loop then only recomposes the
+    # time-dependent pieces against pre-prepared static warps (no per-frame
+    # resampling of distortion/anat/MNI warps). If nothing is time-dependent,
+    # the whole chain composes a single time.
+    reduced = reduce_chain(
+        transforms, output_shape, output_affine, device, interp=ainterp, verb=verb
+    )
+    static_composed: NonlinearWarp | None = None
+    if not any(_is_time_dependent(x) for x in reduced):
+        static_composed = compose_chain(
+            reduced, output_shape, output_affine, device, time_idx=0,
+            interp=ainterp, verb=verb,
+        )
+
     time_iter = tqdm(
         range(t_start, t_end),
         desc="Warping volumes",
         disable=verb == 0 or (t_end - t_start) == 1,
     )
     for t in time_iter:
-        composed = compose_chain(
-            transforms,
+        composed = static_composed if static_composed is not None else compose_chain(
+            reduced,
             output_shape,
             output_affine,
             device,
             time_idx=t,
+            interp=ainterp,
             verb=0 if (t_end - t_start) > 1 else verb,
         )
 

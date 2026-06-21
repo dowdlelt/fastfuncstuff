@@ -336,3 +336,83 @@ def test_interleaved_chain_matches_sequential():
         ref = manual_N(pts, t)
         err = (nmap[:, interior] - ref[:, interior]).abs().max().item()
         assert err < 1e-4, (t, err)
+
+
+# --------------------------------------------------------------------------
+# static-tail pre-reduction + higher-order warp interpolation
+# --------------------------------------------------------------------------
+
+
+def _smooth_mm_warp(n, scale, aff, seed):
+    torch.manual_seed(seed)
+    d = torch.nn.functional.conv3d(
+        torch.randn(1, 3, n, n, n), torch.ones(3, 1, 3, 3, 3) / 27, padding=1, groups=3
+    )[0] * scale
+    return NonlinearWarp(
+        xd=d[0], yd=d[1], zd=d[2], header_info={"affine": aff}, units="nifti_mm"
+    )
+
+
+def test_reduce_chain_matches_full_per_frame():
+    """reduce_chain (collapse static runs) yields the same composed warp as the
+    full chain, frame by frame, with a time-dependent affine in the middle."""
+    from fastfuncstuff.processing.nwarpforge import (
+        AffineTransform,
+        compose_chain,
+        reduce_chain,
+    )
+
+    n = 16
+    aff = np.eye(4)
+    mats = torch.zeros(4, 4, 4)
+    for t in range(4):
+        m = torch.eye(4)
+        m[:3, :3] += 0.02 * torch.randn(3, 3)
+        m[:3, 3] = torch.tensor([t * 0.3, -0.2 * t, 0.1])
+        mats[t] = m
+    transforms = [
+        _smooth_mm_warp(n, 0.7, aff, 1),     # static distortion
+        AffineTransform(matrices=mats, base_affine=aff, source_affine=aff),  # motion
+        _smooth_mm_warp(n, 0.5, aff, 2),     # static nonlinear-to-template
+    ]
+    reduced = reduce_chain(transforms, (n, n, n), aff, DEV, interp="cubic", verb=0)
+    # one static warp on each side of the time-dependent affine -> 3 slots
+    assert len(reduced) == 3
+    for t in (0, 1, 3):
+        full = compose_chain(transforms, (n, n, n), aff, DEV, time_idx=t, interp="cubic", verb=0)
+        red = compose_chain(reduced, (n, n, n), aff, DEV, time_idx=t, interp="cubic", verb=0)
+        m = slice(3, -3)
+        assert torch.allclose(full.xd[m, m, m], red.xd[m, m, m], atol=1e-4)
+        assert torch.allclose(full.yd[m, m, m], red.yd[m, m, m], atol=1e-4)
+        assert torch.allclose(full.zd[m, m, m], red.zd[m, m, m], atol=1e-4)
+
+
+def test_reduce_chain_all_static_single_slot():
+    from fastfuncstuff.processing.nwarpforge import AffineTransform, reduce_chain
+
+    n = 12
+    aff = np.eye(4)
+    one = torch.eye(4)[None]
+    transforms = [
+        _smooth_mm_warp(n, 0.5, aff, 3),
+        AffineTransform(matrices=one, base_affine=aff, source_affine=aff),
+        _smooth_mm_warp(n, 0.4, aff, 4),
+    ]
+    reduced = reduce_chain(transforms, (n, n, n), aff, DEV, interp="cubic", verb=0)
+    assert len(reduced) == 1  # all static -> collapsed to one warp
+    assert isinstance(reduced[0], NonlinearWarp)
+
+
+def test_sample_field_edge_extends():
+    """Higher-order warp-field sampling edge-extends (no zero-fill tear) so a
+    constant displacement stays constant past the grid, like grid_sample border."""
+    from fastfuncstuff.processing.nwarpforge import _sample_field
+
+    field = torch.full((8, 8, 8), 3.0)
+    # coords that run off the high edge in x
+    x = torch.tensor([7.0, 8.5, 12.0])
+    y = torch.tensor([4.0, 4.0, 4.0])
+    z = torch.tensor([4.0, 4.0, 4.0])
+    for mode in ("cubic", "quintic", "wsinc5"):
+        out = _sample_field(field, x, y, z, mode)
+        assert torch.allclose(out, torch.full((3,), 3.0), atol=1e-4), mode
