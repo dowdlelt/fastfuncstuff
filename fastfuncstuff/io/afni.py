@@ -1974,6 +1974,94 @@ def _set_afni_brick_labels(header: object, labels: list[str]) -> None:
         extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, payload.encode("utf-8")))
 
 
+def _statsym_for(code: int, params: tuple[float, ...]) -> str:
+    """Symbolic AFNI stat label for one sub-brick (``Ttest(dof)`` / ``Ftest(n,d)`` /
+    ``Zscore()``). ``"none"`` for non-stat sub-bricks. Mirrors the parser in
+    ``cli/util_concalc.py`` so round-trips agree."""
+    if code == 3 and len(params) == 1:  # fitt
+        return f"Ttest({int(params[0])})"
+    if code == 4 and len(params) == 2:  # fift
+        return f"Ftest({int(params[0])},{int(params[1])})"
+    if code == 5:  # fizt
+        return "Zscore()"
+    return "none"
+
+
+def _set_afni_brick_stataux(
+    header: object,
+    stataux: dict[int, tuple[int, tuple[float, ...]]],
+    n_sub: int,
+) -> None:
+    """Tag sub-bricks as statistics (``BRICK_STATAUX`` + ``BRICK_STATSYM``) so AFNI
+    can threshold them and compute FDR. ``stataux`` maps ``sub_brick_index ->
+    (afni_stat_code, params)`` (e.g. ``{1: (3, (dof,))}`` for a t-stat). Mirrors
+    :func:`_set_afni_brick_labels`: reuses an existing AFNI extension or creates a
+    minimal one, replacing any stale STATAUX/STATSYM."""
+    import re
+
+    import nibabel as nib
+
+    try:
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return
+
+    stataux_floats: list[float] = []
+    for idx in sorted(stataux):
+        code, params = stataux[idx]
+        stataux_floats.extend([float(idx), float(code), float(len(params))])
+        stataux_floats.extend(float(p) for p in params)
+    syms = ";".join(
+        _statsym_for(*stataux[i]) if i in stataux else "none" for i in range(n_sub)
+    )
+    aux_body = " " + "\n ".join(f"{v:g}" for v in stataux_floats)
+    atr = (
+        "<AFNI_atr\n"
+        '  ni_type="float"\n'
+        f'  ni_dimen="{len(stataux_floats)}"\n'
+        '  atr_name="BRICK_STATAUX" >\n'
+        f"{aux_body}\n"
+        "</AFNI_atr>\n"
+        "<AFNI_atr\n"
+        '  ni_type="String"\n'
+        '  ni_dimen="1"\n'
+        '  atr_name="BRICK_STATSYM" >\n'
+        f' "{syms}"\n'
+        "</AFNI_atr>\n"
+    )
+
+    afni_idx = None
+    for i, ext in enumerate(extensions):
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            afni_idx = i
+            break
+    if afni_idx is not None:
+        xml = extensions[afni_idx].content.decode("utf-8", errors="replace")
+        for name in ("BRICK_STATAUX", "BRICK_STATSYM"):
+            xml = re.sub(
+                rf'<AFNI_atr\s[^>]*atr_name="{name}"[^>]*>.*?</AFNI_atr>\s*',
+                "",
+                xml,
+                flags=re.DOTALL,
+            )
+        if "</AFNI_attributes>" in xml:
+            xml = xml.replace("</AFNI_attributes>", atr + "</AFNI_attributes>", 1)
+        else:
+            xml = xml + atr
+        extensions[afni_idx] = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
+    else:
+        idc = _generate_afni_idcode()
+        payload = (
+            "<?xml version='1.0' ?>\n"
+            "<AFNI_attributes\n"
+            f'  self_idcode="{idc}"\n'
+            '  ni_form="ni_group" >\n'
+            f"{atr}"
+            "</AFNI_attributes>\n\x00"
+        )
+        extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, payload.encode("utf-8")))
+
+
 def save_nifti(
     data: np.ndarray,
     output_path: str | Path,
@@ -1982,6 +2070,7 @@ def save_nifti(
     tr: float | None = None,
     header: object | None = None,
     brick_labels: list[str] | None = None,
+    brick_stataux: dict[int, tuple[int, tuple[float, ...]]] | None = None,
 ):
     """Save data as a NIfTI file with efficient compression.
 
@@ -2051,6 +2140,11 @@ def save_nifti(
     # Per-sub-brick labels for AFNI viewers (NIfTI has no native equivalent).
     if brick_labels is not None:
         _set_afni_brick_labels(header, brick_labels)
+
+    # Per-sub-brick stat tagging so AFNI can threshold + FDR the sub-bricks.
+    if brick_stataux is not None:
+        n_sub = data.shape[3] if data.ndim == 4 else 1
+        _set_afni_brick_stataux(header, brick_stataux, n_sub)
 
     # Create NIfTI image
     img = nib.Nifti1Image(data, affine, header=header)

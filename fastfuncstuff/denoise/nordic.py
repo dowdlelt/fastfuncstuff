@@ -843,13 +843,14 @@ def _save_residual_qc(
     reference_img: str,
     cfg: NordicConfig,
 ) -> dict:
-    """Write the cross-echo residual QC maps and return a summary dict.
+    """Write the cross-echo residual QC as one 4-sub-brick file and return a summary.
 
-    Three small 3D maps (dataset-level, not per echo):
-      ``_resid_xcorr``        raw max-over-pairs r (eyeball the focal peaks),
-      ``_resid_xcorr_tstat``  r→t (``fitt``, dof) with an AFNI FDRCURVE injected
-                              so AFNI's GUI / ``fdrval`` read q natively,
-      ``_resid_xcorr_q``      ``1 - q`` (BH-FDR) for non-AFNI viewers.
+    Single dataset-level 4D map ``_resid_xcorr`` with sub-bricks:
+      0 ``xcorr_pearson_r``  max-over-pairs Pearson r (eyeball the focal peaks),
+      1 ``xcorr_tstat``      r→t (tagged ``Ttest(dof)`` so AFNI thresholds it),
+      2 ``xcorr_1minus_q``   ``1 - q`` (BH-FDR), high = significant.
+    The t-stat sub-brick carries an injected AFNI FDRCURVE, so AFNI's GUI /
+    ``fdrval`` read q from it directly; the ``1-q`` brick covers other viewers.
     """
     from fastfuncstuff.stats.fdr import (
         add_fdrcurves_to_nifti,
@@ -860,40 +861,44 @@ def _save_residual_qc(
     out_dir = Path(output_prefix).parent
     name = Path(output_prefix).name
     ext = ".nii.gz" if cfg.write_gzipped_niftis else ".nii"
-    # FDR runs through scipy on CPU; the QC maps are tiny 3D volumes, so move
-    # them off-device once here (avoids MPS/CUDA round-trip surprises downstream).
+    # FDR runs through scipy on CPU; the QC maps are tiny volumes, so move them
+    # off-device once here (avoids MPS/CUDA round-trip surprises downstream).
     max_r = max_r.cpu()
     tstat = tstat.cpu()
     mask = tstat > 0
     q = fdr_qvalues(tstat, stat_code="fitt", dof=float(dof), mask=mask)
     one_minus_q = torch.where(torch.isfinite(q), 1.0 - q, torch.zeros_like(q))
 
-    r_path = out_dir / f"{name}_resid_xcorr{ext}"
-    t_path = out_dir / f"{name}_resid_xcorr_tstat{ext}"
-    q_path = out_dir / f"{name}_resid_xcorr_q{ext}"
-    save_nifti(
-        max_r.cpu().numpy().astype(np.float32), output_path=r_path, reference_img=reference_img
+    # Stack into (X, Y, Z, 3); label + stat-tag the t sub-brick (AFNI code 3 =
+    # Ttest, one param = dof) so AFNI can threshold and FDR it.
+    vol = np.stack(
+        [
+            max_r.numpy().astype(np.float32),
+            tstat.numpy().astype(np.float32),
+            one_minus_q.numpy().astype(np.float32),
+        ],
+        axis=-1,
     )
+    xcorr_path = out_dir / f"{name}_resid_xcorr{ext}"
     save_nifti(
-        tstat.cpu().numpy().astype(np.float32), output_path=t_path, reference_img=reference_img
-    )
-    save_nifti(
-        one_minus_q.cpu().numpy().astype(np.float32),
-        output_path=q_path,
+        vol,
+        output_path=xcorr_path,
         reference_img=reference_img,
+        brick_labels=["xcorr_pearson_r", "xcorr_tstat", "xcorr_1minus_q"],
+        brick_stataux={1: (3, (float(dof),))},
     )
 
-    # AFNI-native q: build the FDR curve from the t-brick and inject it. Needs an
-    # AFNI extension on the file (present for AFNI output / AFNI-sourced NIfTI);
-    # the explicit _q map covers viewers that lack it, so failure is non-fatal.
+    # AFNI-native q on the t sub-brick (index 1). save_nifti created the AFNI
+    # extension via the labels/stataux, so injection works even for plain-NIfTI
+    # inputs; the 1-q brick is the fallback, so failure is non-fatal.
     fdr_in_header = False
     try:
         curve = compute_fdr_curve(tstat, "fitt", float(dof), mask=mask)
-        add_fdrcurves_to_nifti(t_path, {0: curve})
+        add_fdrcurves_to_nifti(xcorr_path, {1: curve})
         fdr_in_header = True
     except Exception as exc:  # noqa: BLE001 — QC is best-effort
         if cfg.verbose:
-            print(f"  Residual QC: FDR curve not injected into header ({exc}); _q map written.")
+            print(f"  Residual QC: FDR curve not injected into header ({exc}); 1-q brick written.")
 
     qf = q.flatten()
     qf = qf[torch.isfinite(qf)]
@@ -905,11 +910,8 @@ def _save_residual_qc(
         "n_valid_voxels": n_valid,
         "frac_q_lt_0.05": frac_q05,
         "fdr_in_header": fdr_in_header,
-        "maps": {
-            "raw_r": str(r_path),
-            "tstat": str(t_path),
-            "one_minus_q": str(q_path),
-        },
+        "map": str(xcorr_path),
+        "sub_bricks": ["xcorr_pearson_r", "xcorr_tstat", "xcorr_1minus_q"],
     }
 
 

@@ -717,7 +717,8 @@ def test_residual_xcorr_qc_detects_shared_voxel():
 
 
 def test_residual_qc_maps_written(tmp_path):
-    """Multi-echo run writes the three QC maps and records the summary."""
+    """Multi-echo run writes one 4D QC map (r / tstat / 1-q sub-bricks), tags the
+    t sub-brick as a stat in the AFNI header, and records the summary."""
     rng = np.random.default_rng(5)
     nx, ny, nz, nt = 12, 12, 3, 40
     m = nx * ny * nz
@@ -738,16 +739,29 @@ def test_residual_qc_maps_written(tmp_path):
     run_nordic_multiecho(
         magn_files, phase_files, str(tmp_path / "ME"), cfg, device=torch.device("cpu")
     )
-    for suffix in ("_resid_xcorr", "_resid_xcorr_tstat", "_resid_xcorr_q"):
-        f = tmp_path / f"ME{suffix}.nii.gz"
-        assert f.exists(), f"missing QC map {suffix}"
-        arr = nib.load(f).get_fdata(dtype=np.float32)
-        assert arr.shape == (nx, ny, nz) and np.all(np.isfinite(arr))
+    f = tmp_path / "ME_resid_xcorr.nii.gz"
+    assert f.exists(), "missing 4D QC map"
+    img = nib.load(f)
+    arr = img.get_fdata(dtype=np.float32)
+    assert arr.shape == (nx, ny, nz, 3) and np.all(np.isfinite(arr))
+    # r in [0,1]; t>=0; 1-q in [0,1].
+    assert arr[..., 0].max() <= 1.0 and arr[..., 0].min() >= 0.0
+    assert arr[..., 1].min() >= 0.0
     # Summary lands in each echo's metadata.
     with open(tmp_path / "ME_echo-01_metadata.json") as f:
         meta = json.load(f)
     assert "residual_qc" in meta
-    assert 0.0 <= meta["residual_qc"]["frac_q_lt_0.05"] <= 1.0
+    qc = meta["residual_qc"]
+    assert 0.0 <= qc["frac_q_lt_0.05"] <= 1.0
+    assert qc["map"].endswith("ME_resid_xcorr.nii.gz")
+    # AFNI header tags the t sub-brick (index 1) as a Ttest with dof = T_keep - 2.
+    afni_xml = b"".join(
+        e.get_content() if isinstance(e.get_content(), bytes) else e.get_content().encode()
+        for e in (img.header.extensions or [])
+        if e.get_code() == 4
+    ).decode("utf-8", "ignore")
+    assert "BRICK_STATAUX" in afni_xml and f"Ttest({qc['dof']})" in afni_xml
+    assert "xcorr_pearson_r" in afni_xml and "FDRCURVE" in afni_xml
 
 
 def test_resid_qc_can_be_disabled(tmp_path):

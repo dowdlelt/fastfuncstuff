@@ -211,6 +211,33 @@ class TestDataTypeHandling:
         nums = re.search(r'NIfTI_nums="([^"]*)"', ext.content.decode()).group(1)
         assert nums.endswith(",16"), f"NIfTI_nums datatype should match float32: {nums}"
 
+    def test_brick_labels_and_stataux(self, temp_output_dir):
+        """save_nifti tags sub-bricks: BRICK_LABS names them and BRICK_STATAUX /
+        BRICK_STATSYM mark the t sub-brick as a stat AFNI can threshold. Creates a
+        minimal AFNI extension for a plain (non-AFNI) input."""
+        from fastfuncstuff.io.afni import _NIFTI_ECODE_AFNI, save_nifti
+
+        data = np.random.rand(5, 5, 2, 3).astype(np.float32)
+        out = temp_output_dir / "tagged.nii.gz"
+        save_nifti(
+            data,
+            str(out),
+            affine=np.eye(4),
+            brick_labels=["r", "tstat", "1-q"],
+            brick_stataux={1: (3, (35.0,))},  # AFNI code 3 = Ttest, 1 param = dof
+        )
+        img = nib.load(str(out))
+        xml = "".join(
+            e.get_content().decode("utf-8", "ignore")
+            if isinstance(e.get_content(), bytes)
+            else e.get_content()
+            for e in (img.header.extensions or [])
+            if e.get_code() == _NIFTI_ECODE_AFNI
+        )
+        assert "BRICK_LABS" in xml and "r~tstat~1-q" in xml
+        assert "BRICK_STATAUX" in xml
+        assert "none;Ttest(35);none" in xml  # only sub-brick 1 is a stat
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""
