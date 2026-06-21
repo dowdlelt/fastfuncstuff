@@ -162,7 +162,45 @@ def warp_image_wsinc5(
 # Selectable warp interpolation kernels, in increasing cost order. "linear" is
 # the fast grid_sample path; the rest are AFNI's separable Lagrange / windowed-
 # sinc interpolants (see _KERNELS below).
-WARP_INTERP_MODES = ("linear", "cubic", "quintic", "heptic", "wsinc5")
+WARP_INTERP_MODES = ("nearest", "linear", "cubic", "quintic", "heptic", "wsinc5")
+
+# Accept AFNI's "NN" spelling for nearest-neighbor.
+_INTERP_ALIASES = {"nn": "nearest"}
+
+
+def normalize_interp_mode(mode: str) -> str:
+    """Canonicalize an interpolation-mode name (e.g. ``"NN"`` -> ``"nearest"``)."""
+    m = mode.lower()
+    m = _INTERP_ALIASES.get(m, m)
+    if m not in WARP_INTERP_MODES:
+        raise ValueError(f"unknown interp mode {mode!r}; choose from {WARP_INTERP_MODES}")
+    return m
+
+
+def nearest_resample_3d(
+    source: Tensor, x_coords: Tensor, y_coords: Tensor, z_coords: Tensor
+) -> Tensor:
+    """Nearest-neighbor resample (AFNI ``-interp NN``).
+
+    No interpolation: each output samples the single closest source voxel. The
+    only mode that preserves integer label values exactly, so it is the correct
+    choice for atlas / ROI datasets. Out-of-bounds samples are 0, matching the
+    other kernels.
+    """
+    nz, ny, nx = source.shape
+    out_shape = x_coords.shape
+    xf, yf, zf = x_coords.reshape(-1), y_coords.reshape(-1), z_coords.reshape(-1)
+    out_of_bounds = (
+        (xf < -0.5) | (xf > nx - 0.5) |
+        (yf < -0.5) | (yf > ny - 0.5) |
+        (zf < -0.5) | (zf > nz - 0.5)
+    )
+    xi = xf.round().long().clamp(0, nx - 1)
+    yi = yf.round().long().clamp(0, ny - 1)
+    zi = zf.round().long().clamp(0, nz - 1)
+    result = source[zi, yi, xi]
+    result[out_of_bounds] = 0.0
+    return result.reshape(out_shape)
 
 
 def warp_image(
@@ -176,14 +214,14 @@ def warp_image(
     """Apply a displacement warp to ``source`` with a selectable interpolation kernel.
 
     ``mode="linear"`` dispatches to :func:`warp_image_linear` (the fast estimation
-    path). Higher-order modes use the separable kernels for sharper output, as in
-    AFNI's ``-ainterp``/``-final``. Displacement convention matches
+    path); ``mode="nearest"`` to :func:`nearest_resample_3d`. Higher-order modes
+    use the separable kernels for sharper output, as in AFNI's
+    ``-ainterp``/``-final``. Displacement convention matches
     :func:`warp_image_linear`: output voxel (i,j,k) samples source at (i+xd,j+yd,k+zd).
     """
+    mode = normalize_interp_mode(mode)
     if mode == "linear":
         return warp_image_linear(source, warp_xd, warp_yd, warp_zd, mask=mask)
-    if mode not in _KERNELS:
-        raise ValueError(f"unknown interp mode {mode!r}; choose from {WARP_INTERP_MODES}")
 
     out_nz, out_ny, out_nx = warp_xd.shape
     device = source.device
@@ -193,7 +231,12 @@ def warp_image(
         torch.arange(out_nx, dtype=torch.float32, device=device),
         indexing="ij",
     )
-    result = _separable_resample_3d(source, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)
+    if mode == "nearest":
+        result = nearest_resample_3d(source, ii + warp_xd, jj + warp_yd, kk + warp_zd)
+    else:
+        result = _separable_resample_3d(
+            source, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode
+        )
     if mask is not None:
         result = result * mask.float()
     return result
@@ -203,42 +246,48 @@ def warp_image(
 # Interpolation kernels
 # ---------------------------------------------------------------------------
 
-_WSINC5_HALF = 5  # kernel half-width (full width = 11 taps)
+# AFNI wsinc5 constants (GA_interp_wsinc5p, the cubical/separable default).
+_WSINC5_IRAD = 5      # window radius -> 10 taps at floor offsets -4..+5
+_WSINC5_WRAD = 5.001  # AFNI WRAD = 0.001 + IRAD (float radius for the window arg)
+# M3(x) = minimum-sidelobe 3-term window (AFNI default, WFUN=0). Note M3(0)==1,
+# so applying it unconditionally matches AFNI's "if d/WRAD > WCUT" guard for the
+# default taper cut WCUT=0.
+_M3_A, _M3_B, _M3_C = 0.4243801, 0.4973406, 0.0782793
 
 
-def _wsinc5_kernel(frac: Tensor) -> Tensor:
-    """Build 11-tap wsinc5 weights for fractional offsets.
+def _wsinc5_kernel(fx: Tensor) -> Tensor:
+    """Build AFNI-faithful wsinc5 weights (10 taps, floor convention).
 
-    wsinc5 = sinc(x) * hanning(x/5) where hanning(t) = 0.5 + 0.5*cos(pi*t)
-    for |t| <= 1, else 0.
+    Mirrors ``GA_interp_wsinc5p`` in AFNI's ``mri_genalign_util.c`` (the cubical
+    tensor-product branch, which is the default -- ``AFNI_WSINC5_SPHERICAL`` is
+    off by default). For ``fx`` in [0, 1) the taps are at integer offsets
+    ``-4 .. +5`` from ``floor(x)`` and each weight is::
+
+        d  = |fx - offset|
+        w  = sinc(d) * M3(d / WRAD)
+
+    with ``sinc(t) = sin(pi t)/(pi t)`` and ``M3`` the minimum-sidelobe 3-term
+    window. This replaces the earlier Hanning/round-11 approximation so output
+    matches ``3dNwarpApply -interp wsinc5``.
 
     Args:
-        frac: (N,) fractional parts in (-0.5, 0.5] -- distance from nearest
-              integer sample.
+        fx: (N,) fractional position in [0, 1) past the floor integer.
 
     Returns:
-        (N, 11) kernel weights, normalized to sum to 1.
+        (N, 10) kernel weights, normalized to sum to 1.
     """
-    taps = torch.arange(
-        -_WSINC5_HALF, _WSINC5_HALF + 1, dtype=frac.dtype, device=frac.device
-    )  # (11,)
-    x = frac[:, None] - taps[None, :]  # (N, 11)
+    offsets = torch.arange(
+        -(_WSINC5_IRAD - 1), _WSINC5_IRAD + 1, dtype=fx.dtype, device=fx.device
+    )  # -4 .. +5  (10 taps)
+    d = (fx[:, None] - offsets[None, :]).abs()  # (N, 10)
 
-    pi_x = torch.pi * x
-    sinc = torch.where(
-        x.abs() < 1e-7,
-        torch.ones_like(x),
-        torch.sin(pi_x) / pi_x,
-    )
+    pid = torch.pi * d
+    sinc = torch.where(d < 1e-7, torch.ones_like(d), torch.sin(pid) / pid)
 
-    t = x / _WSINC5_HALF
-    hanning = torch.where(
-        t.abs() <= 1.0,
-        0.5 + 0.5 * torch.cos(torch.pi * t),
-        torch.zeros_like(t),
-    )
+    pit = torch.pi * (d / _WSINC5_WRAD)
+    m3 = _M3_A + _M3_B * torch.cos(pit) + _M3_C * torch.cos(2.0 * pit)
 
-    w = sinc * hanning  # (N, 11)
+    w = sinc * m3  # (N, 10)
     w = w / w.sum(dim=1, keepdim=True).clamp(min=1e-10)
     return w
 
@@ -333,11 +382,29 @@ def _heptic_kernel(fx: Tensor) -> Tensor:
 # Floor convention: fx in [0,1), taps offset from floor(x)
 # Round convention: frac in [-0.5,0.5], taps offset from round(x)
 _KERNELS = {
-    "wsinc5":  (_wsinc5_kernel,  5, False),  # round convention
+    "wsinc5":  (_wsinc5_kernel,  5, True),   # floor convention, 10 taps (-4..+5)
     "cubic":   (_cubic_kernel,   2, True),    # floor convention
     "quintic": (_quintic_kernel, 3, True),    # floor convention
     "heptic":  (_heptic_kernel,  4, True),    # floor convention
 }
+
+
+def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int:
+    """Voxels per chunk for the separable resampler.
+
+    The vectorized contraction gathers an ``ntaps**3`` neighborhood per output
+    sample (1000 floats for wsinc5), so peak memory scales with chunk size. Size
+    the chunk from the memory module's available-memory estimate (which already
+    applies the GPU 0.5 safety factor) instead of hardcoding, per the
+    [[Memory module]] rule.
+    """
+    from ..memory import get_available_memory
+
+    # Neighborhood gather + einsum scratch + per-axis weight tables + coords.
+    bytes_per_point = (2 * ntaps**3 + 4 * ntaps + 8) * 4
+    avail = get_available_memory(device)
+    chunk = int(avail // max(1, bytes_per_point))
+    return max(1, min(n_points, chunk))
 
 
 def _separable_resample_3d(
@@ -371,63 +438,47 @@ def _separable_resample_3d(
     N = x_flat.numel()
 
     if use_floor:
-        # Floor convention: fx in [0,1), taps offset from floor position
-        # cubic(H=2): 4 taps at [-1,0,+1,+2], quintic(H=3): 6 taps at [-2..+3],
-        # heptic(H=4): 8 taps at [-3..+4]
+        # Floor convention: fx in [0,1), taps offset from floor position.
+        # cubic(H=2): 4 taps [-1..+2], quintic(H=3): 6 [-2..+3],
+        # heptic(H=4): 8 [-3..+4], wsinc5(H=5): 10 [-4..+5].
         ntaps = H * 2
-        half_below = H - 1
-        offsets = torch.arange(-half_below, H + 1, device=device)  # (ntaps,)
-
-        x_base_i = x_flat.floor().long()
-        x_frac = x_flat - x_base_i.float()
-        y_base_i = y_flat.floor().long()
-        y_frac = y_flat - y_base_i.float()
-        z_base_i = z_flat.floor().long()
-        z_frac = z_flat - z_base_i.float()
-
-        wx = kernel_fn(x_frac)  # (N, ntaps)
-        wy = kernel_fn(y_frac)
-        wz = kernel_fn(z_frac)
-
-        x_idx = (x_base_i[:, None] + offsets[None, :]).clamp(0, nx - 1)
+        offsets = torch.arange(-(H - 1), H + 1, device=device)  # (ntaps,)
     else:
-        # Round convention (wsinc5): frac in [-0.5, 0.5], taps symmetric
+        # Round convention: frac in [-0.5, 0.5], symmetric taps [-H..+H].
         ntaps = 2 * H + 1
         offsets = torch.arange(-H, H + 1, device=device)
 
-        x_base_i = x_flat.round().long()
-        x_frac = x_flat - x_base_i.float()
-        y_base_i = y_flat.round().long()
-        y_frac = y_flat - y_base_i.float()
-        z_base_i = z_flat.round().long()
-        z_frac = z_flat - z_base_i.float()
+    result = torch.empty(N, dtype=dtype, device=device)
 
-        wx = kernel_fn(x_frac)  # (N, ntaps)
-        wy = kernel_fn(y_frac)
-        wz = kernel_fn(z_frac)
+    # Chunk over output voxels: the gather materializes an (chunk, ntaps**3)
+    # neighborhood, so chunking keeps peak memory bounded (and makes the kernel
+    # affordable on MPS/CPU and for the auto-padded grids).
+    chunk = _resample_chunk_size(N, ntaps, device)
+    for s in range(0, N, chunk):
+        e = min(N, s + chunk)
+        xf, yf, zf = x_flat[s:e], y_flat[s:e], z_flat[s:e]
 
-        x_idx = (x_base_i[:, None] + offsets[None, :]).clamp(0, nx - 1)
+        if use_floor:
+            xb, yb, zb = xf.floor(), yf.floor(), zf.floor()
+        else:
+            xb, yb, zb = xf.round(), yf.round(), zf.round()
 
-    # Separable 3D: nested Z/Y loops with (N, ntaps) gathers
-    # Memory per gather: (N, ntaps) instead of (N, ntaps, ntaps) — ntaps× smaller
-    z_results = torch.zeros(N, ntaps, dtype=dtype, device=device)
+        wx = kernel_fn(xf - xb)  # (c, ntaps)
+        wy = kernel_fn(yf - yb)
+        wz = kernel_fn(zf - zb)
 
-    for zi in range(ntaps):
-        z_idx_i = (z_base_i + offsets[zi]).clamp(0, nz - 1)  # (N,)
-        y_results = torch.zeros(N, ntaps, dtype=dtype, device=device)
-        for yi in range(ntaps):
-            y_idx_i = (y_base_i + offsets[yi]).clamp(0, ny - 1)  # (N,)
-            x_vals = source[
-                z_idx_i[:, None].expand(-1, ntaps),
-                y_idx_i[:, None].expand(-1, ntaps),
-                x_idx,
-            ]  # (N, ntaps)
-            y_results[:, yi] = (x_vals * wx).sum(dim=1)
-        z_results[:, zi] = (y_results * wy).sum(dim=1)
+        xi = (xb.long()[:, None] + offsets[None, :]).clamp(0, nx - 1)  # (c, ntaps)
+        yi = (yb.long()[:, None] + offsets[None, :]).clamp(0, ny - 1)
+        zi = (zb.long()[:, None] + offsets[None, :]).clamp(0, nz - 1)
 
-    result = (z_results * wz).sum(dim=1)
+        # Gather the (c, tz, ty, tx) neighborhood and contract against the three
+        # separable weight tables in one einsum -- no Python tap loops.
+        neigh = source[
+            zi[:, :, None, None], yi[:, None, :, None], xi[:, None, None, :]
+        ]  # (c, ntaps, ntaps, ntaps)
+        result[s:e] = torch.einsum("ctuv,ct,cu,cv->c", neigh, wz, wy, wx)
 
-    # Zero out-of-bounds
+    # Zero out-of-bounds (matches AFNI's outval=0 outside [-0.5, n-0.5]).
     out_of_bounds = (
         (x_flat < -0.5) | (x_flat > nx - 0.5) |
         (y_flat < -0.5) | (y_flat > ny - 0.5) |
