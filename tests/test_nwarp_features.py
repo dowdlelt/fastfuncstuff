@@ -230,3 +230,84 @@ def test_master_warp_uses_warp_grid(tmp_path):
     )
     got = np.asarray(nib.load(str(out)).dataobj)
     assert got.shape[:3] == (10, 10, 10)
+
+
+# --------------------------------------------------------------------------
+# interleaved warp/affine chain (distortion + motion + cross-run + anat + MNI)
+# --------------------------------------------------------------------------
+
+
+def test_interleaved_chain_matches_sequential():
+    """A mixed [warp, per-frame affine, warp, affine] chain composes to exactly
+    the sequential application of each transform's map.
+
+    Backs the realistic pipeline: distortion warp -> per-volume motion affine ->
+    cross-run nonlinear -> affine-to-anat, with one nonlinear-to-MNI on top. The
+    first-listed transform is innermost (applied first to the output coordinate),
+    matching 3dNwarpApply's N(x) = last(...first(x)). Uses a unit affine so the
+    stored NIfTI-mm warp equals the voxel displacement.
+    """
+    from fastfuncstuff.processing.interp import trilinear_interpolate
+    from fastfuncstuff.processing.nwarpforge import AffineTransform, compose_chain
+
+    torch.manual_seed(0)
+    nz = ny = nx = 16
+    aff = np.eye(4)
+
+    def smooth_warp(scale):
+        d = torch.randn(3, nz, ny, nx)
+        d = torch.nn.functional.conv3d(
+            d[None], torch.ones(3, 3, 3, 3, 3) / 81, padding=1
+        )[0] * scale
+        return NonlinearWarp(
+            xd=d[0], yd=d[1], zd=d[2], header_info={"affine": aff}, units="nifti_mm"
+        )
+
+    def rand_affine(T):
+        mats = torch.zeros(T, 4, 4)
+        for t in range(T):
+            m = torch.eye(4)
+            m[:3, :3] += 0.03 * torch.randn(3, 3)
+            m[:3, 3] = 0.5 * torch.randn(3) + torch.tensor([t * 0.2, 0.0, 0.0])
+            mats[t] = m
+        return AffineTransform(matrices=mats, base_affine=aff, source_affine=aff)
+
+    transforms = [smooth_warp(0.8), rand_affine(4), smooth_warp(0.6), rand_affine(1)]
+
+    def sample(w, p):
+        return torch.stack(
+            [trilinear_interpolate(w.xd, p[0], p[1], p[2]),
+             trilinear_interpolate(w.yd, p[0], p[1], p[2]),
+             trilinear_interpolate(w.zd, p[0], p[1], p[2])]
+        )
+
+    def manual_N(p, t):
+        for xf in transforms:
+            if isinstance(xf, AffineTransform):
+                ph = torch.cat([p, torch.ones(1, p.shape[1])])
+                p = (xf.at_time(t) @ ph)[:3]
+            else:
+                p = p + sample(xf, p)
+        return p
+
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(nz, dtype=torch.float32),
+        torch.arange(ny, dtype=torch.float32),
+        torch.arange(nx, dtype=torch.float32),
+        indexing="ij",
+    )
+    pts = torch.stack([ii.reshape(-1), jj.reshape(-1), kk.reshape(-1)])
+    interior = (
+        (pts[0] > 2) & (pts[0] < nx - 3)
+        & (pts[1] > 2) & (pts[1] < ny - 3)
+        & (pts[2] > 2) & (pts[2] < nz - 3)
+    )
+
+    for t in (0, 2, 3):  # 3 reuses the last (T=4) motion row; static affine fixed
+        comp = compose_chain(transforms, (nz, ny, nx), aff, DEV, time_idx=t, verb=0)
+        nmap = torch.stack(
+            [(ii + comp.xd).reshape(-1), (jj + comp.yd).reshape(-1), (kk + comp.zd).reshape(-1)]
+        )
+        ref = manual_N(pts, t)
+        err = (nmap[:, interior] - ref[:, interior]).abs().max().item()
+        assert err < 1e-4, (t, err)
