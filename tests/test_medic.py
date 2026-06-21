@@ -273,6 +273,7 @@ def test_medic_mm_warp_wildcard_matches_undistort(tmp_path):
         interp="linear",
         device=torch.device("cpu"),
         verb=0,
+        auto_pad=False,
     )
     out = np.asarray(nib.load(str(out_path)).dataobj, dtype=np.float32)
     assert np.allclose(out[:, 2:-2, :, :], ref.numpy()[:, 2:-2, :, :], atol=1e-3)
@@ -305,6 +306,7 @@ def test_medic_mm_warp_5d_matches_undistort(tmp_path):
         interp="linear",
         device=torch.device("cpu"),
         verb=0,
+        auto_pad=False,
     )
     out = np.asarray(nib.load(str(out_path)).dataobj, dtype=np.float32)
     assert np.allclose(out[:, 2:-2, :, :], ref.numpy()[:, 2:-2, :, :], atol=1e-3)
@@ -339,6 +341,7 @@ def test_medic_mm_warp_composes_to_master_grid(tmp_path):
         interp="linear",
         device=torch.device("cpu"),
         verb=0,
+        auto_pad=False,
     )
     out = np.asarray(nib.load(str(out_path)).dataobj, dtype=np.float32)
     assert out.shape[:3] == (10, 10, 10)
@@ -452,6 +455,7 @@ def test_convert_medic_fieldmap_to_warp(tmp_path):
         interp="linear",
         device=torch.device("cpu"),
         verb=0,
+        auto_pad=False,
     )
     out = np.asarray(nib.load(str(out_path)).dataobj, dtype=np.float32)
     assert np.allclose(out[:, 2:-2, :, :], ref.numpy()[:, 2:-2, :, :], atol=1e-2)

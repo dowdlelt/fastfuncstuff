@@ -24,7 +24,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from .interp import trilinear_interpolate, warp_image_wsinc5
+from .interp import normalize_interp_mode, trilinear_interpolate, warp_image
 from .io import derive_mean_output_path, load_image, load_warp_field, save_image
 
 
@@ -809,6 +809,7 @@ def apply_composed_warp(
     source_affine: np.ndarray,
     output_affine: np.ndarray,
     interp: str = "wsinc5",
+    no_neg: bool = False,
 ) -> Tensor:
     """Apply composed warp to source volume.
 
@@ -827,7 +828,10 @@ def apply_composed_warp(
         warp: Composed displacement field in output-voxel units
         source_affine: NIfTI affine of source image
         output_affine: NIfTI affine of output grid
-        interp: Interpolation method ("linear" or "wsinc5")
+        interp: Interpolation method ("nearest"/"NN", "linear", "cubic",
+            "quintic", "heptic", or "wsinc5")
+        no_neg: If True, clamp the warped output at 0 to suppress negative
+            ringing from wsinc5/cubic/quintic on non-negative data.
 
     Returns:
         Warped image on output grid
@@ -873,12 +877,10 @@ def apply_composed_warp(
     src_yd = src_coords[1].reshape(nz, ny, nx) - jj
     src_zd = src_coords[2].reshape(nz, ny, nx) - kk
 
-    if interp == "wsinc5":
-        return warp_image_wsinc5(source, src_xd, src_yd, src_zd)
-    else:
-        from .interp import warp_image_linear
-
-        return warp_image_linear(source, src_xd, src_yd, src_zd)
+    warped = warp_image(source, src_xd, src_yd, src_zd, mode=interp)
+    if no_neg:
+        warped = warped.clamp_min(0.0)
+    return warped
 
 
 def _regrid_to_dxyz(
@@ -926,6 +928,110 @@ def _regrid_to_dxyz(
     return new_shape, new_affine
 
 
+def _first_nonlinear_warp_grid(
+    nwarp_specs: list[str],
+) -> tuple[tuple[int, int, int], np.ndarray, object]:
+    """Grid (shape, cardinal affine, header) of the first nonlinear warp in the chain.
+
+    Backs ``-master WARP/NWARP``: the output is produced on the grid on which the
+    nonlinear warp is defined (which is usually the grid the warp pulls source
+    data onto). Only the header is read, not the displacement data.
+    """
+    import glob as _glob
+
+    import nibabel as nib
+
+    for spec in nwarp_specs:
+        s = spec
+        if any(c in s for c in "*?[") and not Path(s).exists():
+            matches = sorted(_glob.glob(s))
+            if not matches:
+                continue
+            s = matches[0]
+        try:
+            if identify_transform_type(s) != "nonlinear":
+                continue
+        except ValueError:
+            continue
+        img = nib.load(str(s))
+        shp = img.shape  # (nx, ny, nz, 3) or (nx, ny, nz, T, 3)
+        nx, ny, nz = int(shp[0]), int(shp[1]), int(shp[2])
+        return (nz, ny, nx), compute_cardinal_affine(np.asarray(img.affine)), img.header.copy()
+    raise ValueError(
+        "-master WARP/NWARP requires at least one nonlinear warp dataset in -nwarp"
+    )
+
+
+def _estimate_warp_padding(
+    transforms: list[Transform],
+    output_shape: tuple[int, ...],
+    output_affine: np.ndarray,
+) -> tuple[int, int, int]:
+    """Upper-bound the composed warp's displacement (output voxels) per (x,y,z) axis.
+
+    Returns ``(pad_x, pad_y, pad_z)``: how far, in output-grid voxels, the warp
+    can pull data. Padding the output grid by this guarantees the warped source
+    is fully captured (no data loss), at the cost of a larger grid. The bound is
+    deliberately conservative -- it sums each nonlinear warp's worst-case
+    displacement and adds the largest affine corner displacement -- so it may
+    over-pad (memory only), never under-pad.
+    """
+    nz, ny, nx = output_shape[-3:]
+    R = output_affine[:3, :3].astype(np.float64)
+    inv_r_abs = np.abs(np.linalg.inv(R))
+
+    # Output-grid corners in (i,j,k)=(x,y,z) index space, homogeneous.
+    corners = np.array(
+        [[i, j, k, 1.0] for i in (0, nx - 1) for j in (0, ny - 1) for k in (0, nz - 1)],
+        dtype=np.float64,
+    ).T  # (4, 8)
+
+    bound = np.zeros(3)  # (x, y, z) voxels
+    for xf in transforms:
+        if isinstance(xf, AffineTransform):
+            mats = xf.matrices.detach().cpu().numpy().astype(np.float64)  # (T,4,4)
+            # Worst case over time rows: only one row applies per frame, so take
+            # the max corner displacement rather than summing across time.
+            aff_bound = np.zeros(3)
+            for m in mats:
+                disp = (m @ corners)[:3] - corners[:3]  # (3, 8) in voxels
+                aff_bound = np.maximum(aff_bound, np.abs(disp).max(axis=1))
+            bound += aff_bound
+        else:  # NonlinearWarp / TimeVaryingWarp, displacements in NIfTI mm
+            mm_max = np.array(
+                [
+                    float(xf.xd.abs().max()),
+                    float(xf.yd.abs().max()),
+                    float(xf.zd.abs().max()),
+                ]
+            )
+            # mm -> |voxels| upper bound via |inv(R)| @ |disp_mm|.
+            bound += inv_r_abs @ mm_max
+
+    import math
+
+    return tuple(int(math.ceil(b)) for b in bound)  # type: ignore[return-value]
+
+
+def _pad_output_grid(
+    output_shape: tuple[int, ...],
+    output_affine: np.ndarray,
+    pad: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], np.ndarray]:
+    """Symmetrically grow the output grid by ``pad`` (pad_x, pad_y, pad_z) voxels.
+
+    Existing voxels keep their world coordinates -- only the origin shifts so the
+    added border surrounds the original FOV.
+    """
+    nz, ny, nx = output_shape[-3:]
+    pad_x, pad_y, pad_z = pad
+    new_shape = (nz + 2 * pad_z, ny + 2 * pad_y, nx + 2 * pad_x)
+    new_affine = output_affine.copy()
+    shift = output_affine[:3, :3] @ np.array([pad_x, pad_y, pad_z], dtype=np.float64)
+    new_affine[:3, 3] = output_affine[:3, 3] - shift
+    return new_shape, new_affine
+
+
 def nwarpforge(
     source_path: str,
     nwarp_specs: list[str],
@@ -942,6 +1048,9 @@ def nwarpforge(
     debug: bool = False,
     save_mean: bool = False,
     dxyz: float | None = None,
+    no_neg: bool = False,
+    auto_pad: bool = True,
+    expad: int = 0,
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -955,8 +1064,11 @@ def nwarpforge(
                     converted back to magnitude+phase for output.
         phase_prefix: Output path for warped phase.  Auto-derived from prefix
                       (e.g. out.nii.gz -> out_phase.nii.gz) when not given.
-        master_path: Path to master dataset for output grid (optional)
-        interp: Final interpolation method
+        master_path: Path to master dataset for output grid (optional). The
+            literal string "WARP"/"NWARP" uses the first nonlinear warp's grid
+            as the output master (matching 3dNwarpApply -master WARP).
+        interp: Final interpolation method ("nearest"/"NN", "linear", "cubic",
+            "quintic", "heptic", or "wsinc5")
         phase_warp: How to warp phase data when -phase is given:
             "complex" (default): convert mag+phase to real/imag, warp each,
                 convert back.  Magnitude is derived from warped real/imag
@@ -978,9 +1090,20 @@ def nwarpforge(
         time_range: If set, only process volumes in range [start, end)
         debug: Print detailed matrix/warp debug info
         dxyz: If set, force isotropic output voxel size (mm)
+        no_neg: Clamp warped output at 0 (suppress wsinc5/cubic ringing on
+            non-negative data).
+        auto_pad: Grow the output grid to encompass the warped source so a large
+            translation / warp cannot push data off the edge (we never lose data
+            on a warp). Costs memory proportional to the padding. Disable for
+            exact master-grid output.
+        expad: Extra padding voxels added on every side on top of the auto
+            estimate (AFNI -expad analogue). Also forces padding when
+            auto_pad is False.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    interp = normalize_interp_mode(interp)
 
     t0_load = __import__("time").time()
     source, source_header = load_image(source_path, device=device)
@@ -1032,7 +1155,18 @@ def nwarpforge(
     nt = source.shape[0] if is_4d else 1
 
     master_hdr_obj = None  # nibabel header for AFNI extension propagation
-    if master_path is not None:
+    # "-master WARP/NWARP": use the first nonlinear warp's grid. The warps
+    # aren't loaded yet, so defer the grid decision until after the chain loads.
+    use_warp_master = master_path is not None and master_path.upper() in ("WARP", "NWARP")
+    output_shape: tuple[int, ...] | None
+    output_affine: np.ndarray | None
+    if use_warp_master:
+        output_shape = None
+        output_affine = None
+        master_space_info = {"view": None, "space": None}
+        if verb >= 1:
+            print("nwarpforge: -master WARP -> output grid = first nonlinear warp")
+    elif master_path is not None:
         master, master_header = load_image(master_path, device=device)
         if master.ndim == 4:
             master = master[0]
@@ -1045,6 +1179,17 @@ def nwarpforge(
         output_shape = tuple(source.shape[-3:]) if is_4d else tuple(source.shape)
         output_affine = compute_cardinal_affine(source_header["affine"])
         master_space_info = get_afni_space_info(source_header.get("header"))
+
+    # Resolve "-master WARP": peek the first nonlinear warp's header for the grid
+    # (its affine is needed now to convert affine matrices into voxel space).
+    if use_warp_master:
+        output_shape, output_affine, warp_hdr = _first_nonlinear_warp_grid(nwarp_specs)
+        master_hdr_obj = warp_hdr
+        master_space_info = get_afni_space_info(warp_hdr)
+        if verb >= 1:
+            print(f"nwarpforge: -master WARP grid = {output_shape}")
+
+    assert output_shape is not None and output_affine is not None
 
     # Apply -dxyz: recompute grid for isotropic voxel size
     if dxyz is not None:
@@ -1138,6 +1283,48 @@ def nwarpforge(
                     master_hdr_obj = warp_hdr
                     break
 
+    # Auto-pad the output grid so a large translation / warp can't push data off
+    # the edge. We estimate the worst-case displacement from the loaded
+    # transforms and grow the grid by that much (plus -expad). Affine matrices,
+    # already in output-voxel space, are conjugated by the index shift so the
+    # composed warp is correct on the padded grid; nonlinear warps re-resample to
+    # the padded grid automatically in compose_chain.
+    pad = (0, 0, 0)
+    if auto_pad:
+        pad = _estimate_warp_padding(transforms, output_shape, output_affine)
+    if expad > 0:
+        pad = tuple(p + expad for p in pad)  # type: ignore[assignment]
+    # Cap runaway padding (likely a units/affine bug, not real data) but honor
+    # generous growth -- up to one full FOV per side.
+    cap = (output_shape[-1], output_shape[-2], output_shape[-3])  # (x, y, z) caps
+    capped = tuple(min(p, c) for p, c in zip(pad, cap, strict=True))
+    if capped != pad and verb >= 1:
+        print(
+            f"nwarpforge: estimated pad {pad} exceeds one-FOV cap {cap}; "
+            f"clamping to {capped} (check warp units if data is clipped)"
+        )
+    pad = capped
+
+    if any(p > 0 for p in pad):
+        shift = torch.tensor(
+            [pad[0], pad[1], pad[2]], dtype=torch.float32, device=device
+        )
+        t_mat = torch.eye(4, dtype=torch.float32, device=device)
+        t_mat[:3, 3] = shift
+        t_inv = torch.eye(4, dtype=torch.float32, device=device)
+        t_inv[:3, 3] = -shift
+        for xf in transforms:
+            if isinstance(xf, AffineTransform):
+                # M_pad = T(pad) @ M @ T(-pad), batched over time rows.
+                xf.matrices = t_mat @ xf.matrices @ t_inv
+        old_shape = output_shape
+        output_shape, output_affine = _pad_output_grid(output_shape, output_affine, pad)
+        if verb >= 1:
+            print(
+                f"nwarpforge: auto-pad +{pad} (x,y,z) voxels: "
+                f"{tuple(old_shape[-3:])} -> {tuple(output_shape[-3:])}"
+            )
+
     if is_4d and max_time_points > 1:
         nt = max(nt, max_time_points)
 
@@ -1185,6 +1372,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 warped_imag = apply_composed_warp(
                     imag_vol,
@@ -1192,6 +1380,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 warped = torch.sqrt(warped_real**2 + warped_imag**2)
                 warped_phase = torch.atan2(warped_imag, warped_real)
@@ -1206,6 +1395,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 real_vol = src_vol * torch.cos(ph_vol)
                 imag_vol = src_vol * torch.sin(ph_vol)
@@ -1215,6 +1405,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 warped_imag = apply_composed_warp(
                     imag_vol,
@@ -1222,6 +1413,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 warped_phase = torch.atan2(warped_imag, warped_real)
 
@@ -1235,6 +1427,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 warped_phase = apply_composed_warp(
                     ph_vol,
@@ -1242,6 +1435,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
 
             elif phase_warp == "circular":
@@ -1254,6 +1448,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 cos_ph = torch.cos(ph_vol)
                 sin_ph = torch.sin(ph_vol)
@@ -1263,6 +1458,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 warped_sin = apply_composed_warp(
                     sin_ph,
@@ -1270,6 +1466,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
+                    no_neg=no_neg,
                 )
                 warped_phase = torch.atan2(warped_sin, warped_cos)
 
@@ -1286,6 +1483,7 @@ def nwarpforge(
                 source_affine=source_header["affine"],
                 output_affine=output_affine,
                 interp=interp,
+                no_neg=no_neg,
             )
         output_volumes.append(warped)
 

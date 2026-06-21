@@ -114,7 +114,8 @@ Examples:
         "-master",
         default=None,
         help="Master dataset defining output grid. "
-        "If not specified, uses source grid or first warp grid.",
+        "If not specified, uses source grid. Use '-master WARP' (or NWARP) to "
+        "use the first nonlinear warp's grid as the output master.",
     )
 
     io_group.add_argument(
@@ -126,18 +127,44 @@ Examples:
         "E.g., -dxyz 3.0 for 3mm isotropic output.",
     )
 
+    io_group.add_argument(
+        "-no_autopad",
+        "-no-autopad",
+        dest="auto_pad",
+        action="store_false",
+        help="Disable automatic output-grid padding. By default the grid is "
+        "grown to encompass the warped source so a large translation/warp "
+        "cannot clip data off the edge; disable for exact master-grid output.",
+    )
+    io_group.add_argument(
+        "-expad",
+        type=int,
+        default=0,
+        help="Extra padding (voxels) added on every side, on top of the auto "
+        "estimate. Forces padding even with -no_autopad.",
+    )
+
     interp_group = parser.add_argument_group("Interpolation")
     interp_group.add_argument(
         "-interp",
-        choices=["linear", "wsinc5"],
+        choices=["NN", "nearest", "linear", "cubic", "quintic", "heptic", "wsinc5"],
         default="wsinc5",
-        help="Final interpolation for source data (default: wsinc5)",
+        help="Final interpolation for source data (default: wsinc5). Use NN for "
+        "atlas/label data (only mode that preserves integer labels).",
     )
     interp_group.add_argument(
         "-ainterp",
         choices=["linear"],
         default="linear",
         help="Warp interpolation during composition (default: linear)",
+    )
+    interp_group.add_argument(
+        "-no_neg",
+        "-no-neg",
+        dest="no_neg",
+        action="store_true",
+        help="Clamp warped output at 0 to suppress wsinc5/cubic negative ringing "
+        "on non-negative data (magnitude, masks, probability maps).",
     )
 
     hw_group = parser.add_argument_group("Hardware")
@@ -216,6 +243,9 @@ def main(argv: list[str] | None = None) -> None:
         debug=args.debug,
         save_mean=args.save_mean,
         dxyz=args.dxyz,
+        no_neg=args.no_neg,
+        auto_pad=args.auto_pad,
+        expad=args.expad,
     )
 
     if verb >= 1:

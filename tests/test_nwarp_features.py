@@ -1,0 +1,232 @@
+"""Tests for the AFNI-parity features of ffs_nwarp / nwarpforge.
+
+Covers: AFNI-faithful wsinc5 (M3 window, floor -4..+5 stencil), nearest-neighbor
+interpolation, exposed cubic/quintic, the -no_neg clamp, -master WARP grid
+selection, and the auto-pad that prevents data loss on a warp.
+"""
+
+from __future__ import annotations
+
+import nibabel as nib
+import numpy as np
+import torch
+
+from fastfuncstuff.processing import interp as I
+from fastfuncstuff.processing.nwarpforge import (
+    NonlinearWarp,
+    _estimate_warp_padding,
+    _pad_output_grid,
+    apply_composed_warp,
+    nwarpforge,
+)
+
+DEV = torch.device("cpu")
+
+
+def _diag_affine(vox: float = 2.0) -> np.ndarray:
+    a = np.eye(4, dtype=np.float64)
+    a[0, 0] = a[1, 1] = a[2, 2] = vox
+    return a
+
+
+# --------------------------------------------------------------------------
+# wsinc5: AFNI-faithful kernel
+# --------------------------------------------------------------------------
+
+
+def _afni_wsinc5_weights(fx: float) -> np.ndarray:
+    """Independent reimplementation of AFNI GA_interp_wsinc5p 1D weights."""
+    irad, wrad = 5, 5.001
+    offs = np.arange(-(irad - 1), irad + 1)  # -4..+5
+    d = np.abs(fx - offs)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sinc = np.where(d < 1e-7, 1.0, np.sin(np.pi * d) / (np.pi * d))
+    t = d / wrad
+    m3 = 0.4243801 + 0.4973406 * np.cos(np.pi * t) + 0.0782793 * np.cos(2 * np.pi * t)
+    w = sinc * m3
+    return w / w.sum()
+
+
+def test_wsinc5_kernel_matches_afni_formula():
+    for fx in (0.0, 0.1, 0.37, 0.5, 0.83, 0.999):
+        ours = I._wsinc5_kernel(torch.tensor([fx], dtype=torch.float32))[0].numpy()
+        ref = _afni_wsinc5_weights(fx)
+        assert ours.shape == (10,)
+        assert np.allclose(ours, ref, atol=1e-5), (fx, ours, ref)
+
+
+def test_wsinc5_partition_of_unity():
+    fx = torch.linspace(0, 0.999, 50)
+    w = I._wsinc5_kernel(fx)
+    assert torch.allclose(w.sum(dim=1), torch.ones(50), atol=1e-5)
+
+
+def test_wsinc5_resample_identity_at_integers():
+    vol = torch.rand(9, 9, 9)
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(9.0), torch.arange(9.0), torch.arange(9.0), indexing="ij"
+    )
+    out = I.wsinc5_resample_3d(vol, ii.reshape(-1), jj.reshape(-1), kk.reshape(-1))
+    # interior should reproduce source exactly (edges clamp)
+    out = out.reshape(9, 9, 9)
+    assert torch.allclose(out[2:-2, 2:-2, 2:-2], vol[2:-2, 2:-2, 2:-2], atol=1e-4)
+
+
+# --------------------------------------------------------------------------
+# nearest-neighbor + mode exposure
+# --------------------------------------------------------------------------
+
+
+def test_normalize_interp_mode():
+    assert I.normalize_interp_mode("NN") == "nearest"
+    assert I.normalize_interp_mode("WSINC5") == "wsinc5"
+    try:
+        I.normalize_interp_mode("bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_nearest_preserves_integer_labels():
+    labels = torch.randint(0, 5, (8, 8, 8)).float()
+    # half-voxel shift in every axis -> interpolating kernels would blend labels
+    xd = torch.full((8, 8, 8), 0.5)
+    out = I.warp_image(labels, xd, xd.clone(), xd.clone(), mode="NN")
+    uniq = set(out.unique().tolist())
+    assert uniq.issubset(set(range(5)) | {0.0}), uniq
+
+
+def test_all_modes_run_and_identity():
+    vol = torch.rand(10, 10, 10)
+    z = torch.zeros(10, 10, 10)
+    for mode in ("nearest", "linear", "cubic", "quintic", "heptic", "wsinc5"):
+        out = I.warp_image(vol, z, z.clone(), z.clone(), mode=mode)
+        assert out.shape == vol.shape
+        assert torch.allclose(out[3:-3, 3:-3, 3:-3], vol[3:-3, 3:-3, 3:-3], atol=1e-4), mode
+
+
+# --------------------------------------------------------------------------
+# -no_neg
+# --------------------------------------------------------------------------
+
+
+def _step_edge(n: int = 16) -> torch.Tensor:
+    v = torch.zeros(n, n, n)
+    v[:, :, n // 2 :] = 100.0
+    return v
+
+
+def test_no_neg_clamps_ringing():
+    src = _step_edge()
+    aff = _diag_affine()
+    # half-voxel constant shift -> wsinc5 rings (negative undershoot) at the edge
+    shift = torch.full_like(src, 0.5)
+    warp = NonlinearWarp(
+        xd=shift, yd=torch.zeros_like(src), zd=torch.zeros_like(src),
+        header_info={"affine": aff}, units="voxels",
+    )
+    plain = apply_composed_warp(src, warp, aff, aff, interp="wsinc5", no_neg=False)
+    clamped = apply_composed_warp(src, warp, aff, aff, interp="wsinc5", no_neg=True)
+    assert plain.min().item() < -1e-3, "expected wsinc5 undershoot to go negative"
+    assert clamped.min().item() >= 0.0
+    # clamp only touches the negatives; positive bulk unchanged
+    assert torch.allclose(clamped.clamp_min(0), plain.clamp_min(0), atol=1e-4)
+
+
+# --------------------------------------------------------------------------
+# auto-pad helpers + end-to-end
+# --------------------------------------------------------------------------
+
+
+def test_estimate_padding_zero_for_zero_warp():
+    zero = torch.zeros(6, 6, 6)
+    warp = NonlinearWarp(
+        xd=zero, yd=zero.clone(), zd=zero.clone(),
+        header_info={"affine": _diag_affine()}, units="nifti_mm",
+    )
+    pad = _estimate_warp_padding([warp], (6, 6, 6), _diag_affine())
+    assert pad == (0, 0, 0)
+
+
+def test_estimate_padding_translation():
+    # 8 mm constant displacement along y, 2 mm voxels -> 4 voxels of pad in y.
+    zero = torch.zeros(6, 6, 6)
+    warp = NonlinearWarp(
+        xd=zero, yd=torch.full((6, 6, 6), 8.0), zd=zero.clone(),
+        header_info={"affine": _diag_affine()}, units="nifti_mm",
+    )
+    pad = _estimate_warp_padding([warp], (6, 6, 6), _diag_affine())
+    assert pad == (0, 4, 0), pad
+
+
+def test_pad_output_grid_preserves_world_coords():
+    shape = (6, 6, 6)
+    aff = _diag_affine()
+    new_shape, new_aff = _pad_output_grid(shape, aff, (1, 2, 3))
+    assert new_shape == (6 + 6, 6 + 4, 6 + 2)  # (nz+2*pz, ny+2*py, nx+2*px)
+    # world coordinate of original voxel (0,0,0) == new voxel (px,py,pz)
+    old0 = aff @ np.array([0, 0, 0, 1.0])
+    new_idx = new_aff @ np.array([1, 2, 3, 1.0])  # (px,py,pz)
+    assert np.allclose(old0, new_idx)
+
+
+def _write_mm_warp(path, shape, affine, disp_mm):
+    """Write a constant-displacement warp in DICOM mm (nx,ny,nz,3)."""
+    nx, ny, nz = shape
+    data = np.zeros((nx, ny, nz, 3), dtype=np.float32)
+    data[..., 0] = disp_mm[0]
+    data[..., 1] = disp_mm[1]
+    data[..., 2] = disp_mm[2]
+    nib.Nifti1Image(data, affine).to_filename(str(path))
+
+
+def test_autopad_grows_grid(tmp_path):
+    n = 12
+    aff = _diag_affine(2.0)
+    src = np.zeros((n, n, n), dtype=np.float32)
+    src[:, n - 4 : n - 1, :] = 50.0  # bright slab near the high-y edge
+    src_path = tmp_path / "src.nii"
+    nib.Nifti1Image(src, aff).to_filename(str(src_path))
+
+    warp_path = tmp_path / "warp.nii"
+    # 10mm -> 5 vox pull in y: the high-y slab lands off the grid without padding.
+    _write_mm_warp(warp_path, (n, n, n), aff, (0.0, 10.0, 0.0))
+
+    out_pad = tmp_path / "out_pad.nii"
+    nwarpforge(
+        source_path=str(src_path), nwarp_specs=[str(warp_path)],
+        prefix=str(out_pad), interp="linear", device=DEV, verb=0, auto_pad=True,
+    )
+    out_nopad = tmp_path / "out_nopad.nii"
+    nwarpforge(
+        source_path=str(src_path), nwarp_specs=[str(warp_path)],
+        prefix=str(out_nopad), interp="linear", device=DEV, verb=0, auto_pad=False,
+    )
+    padded = np.asarray(nib.load(str(out_pad)).dataobj)
+    plain = np.asarray(nib.load(str(out_nopad)).dataobj)
+    # auto-pad grew the y dimension; no-pad kept the source grid
+    assert plain.shape == (n, n, n)
+    assert padded.shape[1] > n
+    # without padding the slab is pushed off the grid and lost; padding recovers it
+    assert plain.sum() < 1e-3
+    assert padded.sum() > 1e3
+
+
+def test_master_warp_uses_warp_grid(tmp_path):
+    aff = _diag_affine(2.0)
+    src = np.random.rand(8, 8, 8).astype(np.float32)
+    src_path = tmp_path / "src.nii"
+    nib.Nifti1Image(src, aff).to_filename(str(src_path))
+    # warp defined on a *different* grid (10^3)
+    warp_path = tmp_path / "warp.nii"
+    _write_mm_warp(warp_path, (10, 10, 10), aff, (0.0, 0.0, 0.0))
+
+    out = tmp_path / "out.nii"
+    nwarpforge(
+        source_path=str(src_path), nwarp_specs=[str(warp_path)],
+        prefix=str(out), master_path="WARP", interp="linear", device=DEV,
+        verb=0, auto_pad=False,
+    )
+    got = np.asarray(nib.load(str(out)).dataobj)
+    assert got.shape[:3] == (10, 10, 10)
