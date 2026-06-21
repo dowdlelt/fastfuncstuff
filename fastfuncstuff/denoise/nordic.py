@@ -842,6 +842,7 @@ def _save_residual_qc(
     output_prefix: str,
     reference_img: str,
     cfg: NordicConfig,
+    brain_mask: torch.Tensor | None = None,
 ) -> dict:
     """Write the cross-echo residual QC as one 4-sub-brick file and return a summary.
 
@@ -851,6 +852,10 @@ def _save_residual_qc(
       2 ``xcorr_1minus_q``   ``1 - q`` (BH-FDR), high = significant.
     The t-stat sub-brick carries an injected AFNI FDRCURVE, so AFNI's GUI /
     ``fdrval`` read q from it directly; the ``1-q`` brick covers other viewers.
+
+    ``brain_mask`` (if given) restricts the FDR multiple-comparison set and the
+    summary to in-brain voxels — out-of-head residual structure is artifact in
+    noise and would otherwise dominate the q-map and the reported fraction.
     """
     from fastfuncstuff.stats.fdr import (
         add_fdrcurves_to_nifti,
@@ -865,7 +870,10 @@ def _save_residual_qc(
     # off-device once here (avoids MPS/CUDA round-trip surprises downstream).
     max_r = max_r.cpu()
     tstat = tstat.cpu()
+    # FDR set: in-brain when available (the correct comparison set), else nonzero.
     mask = tstat > 0
+    if brain_mask is not None:
+        mask = mask & brain_mask.cpu()
     q = fdr_qvalues(tstat, stat_code="fitt", dof=float(dof), mask=mask)
     one_minus_q = torch.where(torch.isfinite(q), 1.0 - q, torch.zeros_like(q))
 
@@ -904,11 +912,16 @@ def _save_residual_qc(
     qf = qf[torch.isfinite(qf)]
     n_valid = int(qf.numel())
     frac_q05 = float((qf < 0.05).float().mean().item()) if n_valid else 0.0
+    # max_r reported over the same set as the FDR (in-brain when masked).
+    rsel = max_r[mask] if brain_mask is not None else max_r
+    max_r_report = float(rsel.max().item()) if rsel.numel() else 0.0
     return {
-        "max_r": float(max_r.max().item()),
+        "max_r": max_r_report,
+        "max_r_whole_volume": float(max_r.max().item()),
         "dof": int(dof),
         "n_valid_voxels": n_valid,
         "frac_q_lt_0.05": frac_q05,
+        "in_brain": brain_mask is not None,
         "fdr_in_header": fdr_in_header,
         "map": str(xcorr_path),
         "sub_bricks": ["xcorr_pearson_r", "xcorr_tstat", "xcorr_1minus_q"],
@@ -975,11 +988,12 @@ def _llr_denoise_multiecho(
     weight = torch.zeros((nx, ny, nz), dtype=torch.float32, device=device)
     removed_map = [torch.zeros_like(weight) for _ in range(E)]
     rescued_map = [torch.zeros_like(weight) for _ in range(E)]
-    # Recommended-factor map: per voxel, the smallest threshold-scale ratio (in
-    # (0,1]) suggested by any covering patch. Init 1.0 (no decrease); reduced via
-    # amin so focal hotspots survive overlap averaging. Only for nordic threshold.
+    # Recommended-factor map: per voxel, the patch-mean threshold-scale ratio
+    # (lowest cross-echo-aligned sigma / lambda). <1 suggests lowering the factor,
+    # >1 raising it, 1 no change. Accumulated as a sum here, divided by the patch
+    # weight at the end. Only meaningful for the nordic threshold + rescue.
     want_recfactor = threshold_mode == "nordic" and rescue and E >= 2
-    recfactor_map = [torch.ones_like(weight) for _ in range(E)] if want_recfactor else None
+    recfactor_map = [torch.zeros_like(weight) for _ in range(E)] if want_recfactor else None
 
     # Per-patch voxel offsets (same machinery as _llr_denoise).
     _ox, _oy, _oz = torch.arange(wx), torch.arange(wy), torch.arange(wz)
@@ -1081,12 +1095,23 @@ def _llr_denoise_multiecho(
                 aug_masks[e] = aug_masks[e] | resc
                 rescued_counts[e] = resc.sum(dim=1).float()
                 if want_recfactor:
-                    # Smallest sigma among this echo's rescued comps / its lambda
-                    # = the factor multiplier that would keep them without rescue.
+                    # Bidirectional suggested-threshold ratio per patch. Ideal cut =
+                    # sigma of the LOWEST cross-echo-aligned component within
+                    # kept∪band (deep-noise tail ignored): below lambda (an aligned
+                    # band comp) -> ratio<1, suggest decrease; above lambda (the
+                    # lowest kept comps are non-aligned, i.e. noise-like) -> ratio>1,
+                    # suggest increase. 1.0 = no change.
                     lam = float(threshold_values[e])
-                    sig_resc = torch.where(resc, s0_list[e], torch.full_like(s0_list[e], lam))
-                    min_sig = sig_resc.amin(dim=1)  # (B,) = lam where none rescued
-                    patch_ratios[e] = (min_sig / max(lam, 1e-12)).clamp(0.0, 1.0)
+                    consider = keep_masks[e] | band_masks[e]  # (B, K)
+                    aligned = consider & (proj_best > thr)
+                    big = torch.full_like(s0_list[e], float("inf"))
+                    min_aligned = torch.where(aligned, s0_list[e], big).amin(dim=1)  # (B,)
+                    ideal = torch.where(
+                        torch.isfinite(min_aligned),
+                        min_aligned,
+                        torch.full_like(min_aligned, lam),
+                    )
+                    patch_ratios[e] = ideal / max(lam, 1e-12)
 
         # ---- Pass 3: reconstruct each echo with its augmented mask ----
         weight_flat.index_add_(0, flat_b, ones_BM[: B * M])
@@ -1107,9 +1132,9 @@ def _llr_denoise_multiecho(
             removed_flat[e].index_add_(0, flat_b, n_removed.repeat_interleave(M))
             rescued_flat[e].index_add_(0, flat_b, rescued_counts[e].repeat_interleave(M))
             if recfactor_flat is not None:
-                recfactor_flat[e].index_reduce_(
-                    0, flat_b, patch_ratios[e].repeat_interleave(M), "amin", include_self=True
-                )
+                # Weighted mean over covering patches (bidirectional: decreases and
+                # increases both contribute; 1.0 = no suggestion).
+                recfactor_flat[e].index_add_(0, flat_b, patch_ratios[e].repeat_interleave(M))
 
         del vh_list, s0_list
         if pbar is not None:
@@ -1119,10 +1144,15 @@ def _llr_denoise_multiecho(
         pbar.close()
 
     w = torch.clamp(weight, min=1.0)
+    uncovered = weight == 0
     results: list[tuple[torch.Tensor, _LLRStats]] = []
     zeros_w = torch.zeros_like(w)
     for e in range(E):
         recon_out = recon_acc[e] / w[..., None]
+        rec_map = None
+        if recfactor_map is not None:
+            rec_map = recfactor_map[e] / w
+            rec_map[uncovered] = 1.0  # no patch covered → no suggestion
         stats = _LLRStats(
             weight=w,
             noise_map=zeros_w,
@@ -1130,7 +1160,7 @@ def _llr_denoise_multiecho(
             energy_removed=zeros_w,
             snr_weight=zeros_w,
             rescued_map=rescued_map[e] / w,
-            recfactor_map=recfactor_map[e] if recfactor_map is not None else None,
+            recfactor_map=rec_map,
         )
         results.append((recon_out, stats))
     return results
@@ -1631,9 +1661,10 @@ def _finalize_echo(
             reference_img=magnitude_file,
         )
 
-    # Per-voxel recommended factor_error: the threshold-scale ratio (decrease-
-    # only) that would have kept the cross-echo-aligned components rescue caught
-    # here, scaled by the factor actually used. = factor_error where no rescue.
+    # Per-voxel suggested factor_error: the threshold-scale ratio (the lowest
+    # cross-echo-aligned component's sigma / lambda) scaled by the factor used.
+    # < factor_error where signal sits below threshold (decrease); > where the
+    # lowest kept components are noise-like (increase); = factor_error for no change.
     recfactor_file: Path | None = None
     if llr_stats.recfactor_map is not None and cfg.rescue:
         recfactor_file = out_dir / f"{out_prefix.name}_recfactor{ext}"
@@ -1912,33 +1943,71 @@ def run_nordic_multiecho(
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 
+    # Brain mask (dilated automask on echo 1) so QC and the factor suggestion are
+    # reported over the head, not out-of-head voxels where residual structure is
+    # artifact-in-noise (a real effect, but not signal we removed and misleading
+    # if it dominates the summary). Best-effort: fall back to whole-volume.
+    brain_mask: torch.Tensor | None = None
+    if cfg.resid_qc and E >= 2:
+        try:
+            from fastfuncstuff.processing.mask import automask
+
+            mag0 = load_nifti(magnitude_files[0]).get_fdata(dtype=np.float32)
+            mag0 = np.abs(mag0)
+            mag0 = mag0.mean(-1) if mag0.ndim == 4 else mag0  # (nx, ny, nz)
+            bm = automask(torch.from_numpy(mag0).float(), dilate_extra=3, verbose=False)
+            brain_mask = bm.to(torch.bool).cpu()
+            if not bool(brain_mask.any()):
+                brain_mask = None
+        except Exception as exc:  # noqa: BLE001 — QC is best-effort
+            if cfg.verbose:
+                print(f"  Residual QC: automask failed ({exc}); reporting whole-volume.")
+            brain_mask = None
+
     # Voxel-wise cross-echo residual correlation QC (algorithm space). Done
     # before _finalize_echo applies per-echo inverse transforms to the residuals.
     qc_summary: dict | None = None
     if cfg.resid_qc and E >= 2:
         max_r, tstat, dof = _residual_xcorr_qc([r for r in residuals if r is not None])
-        qc_summary = _save_residual_qc(max_r, tstat, dof, output_prefix, magnitude_files[0], cfg)
+        qc_summary = _save_residual_qc(
+            max_r, tstat, dof, output_prefix, magnitude_files[0], cfg, brain_mask=brain_mask
+        )
         if cfg.verbose and qc_summary is not None:
+            where = "in-brain" if brain_mask is not None else "whole-volume"
             print(
-                f"  Residual QC: {qc_summary['frac_q_lt_0.05'] * 100:.2f}% of voxels show "
-                f"cross-echo residual correlation at q<0.05 "
-                f"(max r {qc_summary['max_r']:.3f})"
+                f"  Residual QC ({where}): {qc_summary['frac_q_lt_0.05'] * 100:.2f}% of voxels "
+                f"show cross-echo residual correlation at q<0.05 (max r {qc_summary['max_r']:.3f})"
             )
 
-    # Global recommended factor_error (decrease-only): the 5th-percentile of the
-    # per-patch ratios where rescue fired, scaled by the factor used. Tells the
-    # user what single -factor-error would (without rescue) protect most of what
-    # rescue protected — a conservative tightening, not a per-voxel one.
-    rec_factor: float | None = None
+    # Suggested factor_error from the per-voxel ratio maps, summarized in-brain.
+    # The ratio is bidirectional: <1 where signal sits below threshold (suggest
+    # lowering), >1 where the lowest kept components look like noise (suggest
+    # raising). A suggestion only — never auto-applied. Reported as the in-brain
+    # median with the P5..P95 spread, all scaled by the factor used.
+    rec_factor: dict | None = None
     rf_vals = [s.recfactor_map for _, s in results if s.recfactor_map is not None]
     if rf_vals:
-        fired = torch.cat([m[m < 1.0].flatten() for m in rf_vals])
-        if fired.numel() > 0:
-            rec_factor = float(cfg.factor_error * torch.quantile(fired.float(), 0.05).item())
+        if brain_mask is not None:
+            bm = brain_mask.to(rf_vals[0].device)
+            vals = torch.cat([m[bm].flatten() for m in rf_vals])
+        else:
+            vals = torch.cat([m.flatten() for m in rf_vals])
+        vals = vals[torch.isfinite(vals)].float()
+        if vals.numel() > 0:
+            fe = cfg.factor_error
+            qs = torch.quantile(vals, torch.tensor([0.05, 0.5, 0.95], device=vals.device))
+            rec_factor = {
+                "current": float(fe),
+                "suggested_median": float(fe * qs[1].item()),
+                "p5": float(fe * qs[0].item()),
+                "p95": float(fe * qs[2].item()),
+                "in_brain": brain_mask is not None,
+            }
             if cfg.verbose:
                 print(
-                    f"  Recommended factor_error (decrease-only): {rec_factor:.3f} "
-                    f"(current {cfg.factor_error:.3f}); per-echo _recfactor maps written."
+                    f"  Suggested factor_error: {rec_factor['suggested_median']:.3f} "
+                    f"(current {fe:.3f}; in-brain P5..P95 "
+                    f"{rec_factor['p5']:.3f}..{rec_factor['p95']:.3f}); _recfactor maps written."
                 )
 
     # 5. Finalize each echo (undo transforms + write outputs).
