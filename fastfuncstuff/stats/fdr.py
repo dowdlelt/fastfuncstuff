@@ -44,20 +44,19 @@ def _torch_t_sf(stat: torch.Tensor, dof: float) -> torch.Tensor:
     for FDR thresholds (~1e-15 floor anyway).
     """
     # Survival of |t| under H0: 2 * P(T > |t|).  Use scipy for correctness.
-    if stat.is_cuda:
-        # Move to CPU; FDR is run once per stat sub-brick — overhead tiny.
-        s_cpu = stat.detach().cpu().numpy()
-    else:
-        s_cpu = stat.detach().numpy()
+    # Always via CPU (.numpy() rejects non-CPU tensors — MPS as well as CUDA);
+    # FDR is run once per stat sub-brick, so the copy is negligible.
+    s_cpu = stat.detach().cpu().numpy()
     p = 2.0 * _scipy_t.sf(np.abs(s_cpu), df=dof)
-    return torch.from_numpy(np.ascontiguousarray(p)).to(stat.device).to(torch.float32)
+    # float32 before the device move: MPS rejects the float64 scipy output.
+    return torch.from_numpy(np.ascontiguousarray(p)).to(torch.float32).to(stat.device)
 
 
 def _torch_f_sf(stat: torch.Tensor, df_num: float, df_den: float) -> torch.Tensor:
-    s_cpu = stat.detach().cpu().numpy() if stat.is_cuda else stat.detach().numpy()
+    s_cpu = stat.detach().cpu().numpy()
     # F is one-sided (always positive).
     p = _scipy_f.sf(np.maximum(s_cpu, 0.0), dfn=df_num, dfd=df_den)
-    return torch.from_numpy(np.ascontiguousarray(p)).to(stat.device).to(torch.float32)
+    return torch.from_numpy(np.ascontiguousarray(p)).to(torch.float32).to(stat.device)
 
 
 def _torch_z_sf(stat: torch.Tensor) -> torch.Tensor:

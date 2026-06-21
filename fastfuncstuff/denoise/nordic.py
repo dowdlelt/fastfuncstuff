@@ -860,6 +860,10 @@ def _save_residual_qc(
     out_dir = Path(output_prefix).parent
     name = Path(output_prefix).name
     ext = ".nii.gz" if cfg.write_gzipped_niftis else ".nii"
+    # FDR runs through scipy on CPU; the QC maps are tiny 3D volumes, so move
+    # them off-device once here (avoids MPS/CUDA round-trip surprises downstream).
+    max_r = max_r.cpu()
+    tstat = tstat.cpu()
     mask = tstat > 0
     q = fdr_qvalues(tstat, stat_code="fitt", dof=float(dof), mask=mask)
     one_minus_q = torch.where(torch.isfinite(q), 1.0 - q, torch.zeros_like(q))
