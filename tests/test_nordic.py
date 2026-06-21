@@ -643,9 +643,14 @@ def test_run_nordic_multiecho_end_to_end(tmp_path):
         rf = nib.load(out.recfactor_file).get_fdata(dtype=np.float32)
         assert rf.shape == (nx, ny, nz)
         assert np.all(rf > 0) and np.all(np.isfinite(rf))
-        # Global recommendation recorded as a dict (current + median + P5/P95).
+        # Global recommendation recorded as a dict with the two-sided summary.
         rec = meta["multiecho"]["recommended_factor_error"]
-        assert rec is None or {"current", "suggested_median", "p5", "p95"} <= set(rec)
+        assert rec is None or {
+            "current",
+            "in_brain",
+            "frac_suggest_decrease",
+            "frac_suggest_increase",
+        } <= set(rec)
         gmaps.append(nib.load(out.gfactor_file).get_fdata(dtype=np.float32))
 
     # g-factor is estimated once on echo 1 and shared across echoes.

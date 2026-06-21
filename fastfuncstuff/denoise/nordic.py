@@ -1095,15 +1095,21 @@ def _llr_denoise_multiecho(
                 aug_masks[e] = aug_masks[e] | resc
                 rescued_counts[e] = resc.sum(dim=1).float()
                 if want_recfactor:
-                    # Bidirectional suggested-threshold ratio per patch. Ideal cut =
-                    # sigma of the LOWEST cross-echo-aligned component within
-                    # kept∪band (deep-noise tail ignored): below lambda (an aligned
-                    # band comp) -> ratio<1, suggest decrease; above lambda (the
-                    # lowest kept comps are non-aligned, i.e. noise-like) -> ratio>1,
-                    # suggest increase. 1.0 = no change.
+                    # Bidirectional suggested-threshold ratio per patch, BOUNDED to a
+                    # +/-band window around the current cut so it can't run away:
+                    # ideal cut = sigma of the lowest cross-echo-aligned component in
+                    # [n_keep - band, n_keep + band). An aligned band comp (below
+                    # lambda) -> ratio<1 (suggest lower); only the lowest *kept* comps
+                    # non-aligned (noise-like) -> ratio>1 (suggest raise), capped at
+                    # the window edge; 1.0 = no change. The window cap matters: without
+                    # it a near-rank-1 patch jumps ideal to the top sigma (huge ratio).
                     lam = float(threshold_values[e])
-                    consider = keep_masks[e] | band_masks[e]  # (B, K)
-                    aligned = consider & (proj_best > thr)
+                    lo = (n_keep_list[e] - band_counts[e]).clamp(min=0)  # (B,)
+                    hi = (n_keep_list[e] + band_counts[e]).clamp(max=K)  # (B,)
+                    window = (idx_arange[None, :] >= lo[:, None]) & (
+                        idx_arange[None, :] < hi[:, None]
+                    )
+                    aligned = window & (proj_best > thr)
                     big = torch.full_like(s0_list[e], float("inf"))
                     min_aligned = torch.where(aligned, s0_list[e], big).amin(dim=1)  # (B,)
                     ideal = torch.where(
@@ -1980,10 +1986,12 @@ def run_nordic_multiecho(
             )
 
     # Suggested factor_error from the per-voxel ratio maps, summarized in-brain.
-    # The ratio is bidirectional: <1 where signal sits below threshold (suggest
-    # lowering), >1 where the lowest kept components look like noise (suggest
-    # raising). A suggestion only — never auto-applied. Reported as the in-brain
-    # median with the P5..P95 spread, all scaled by the factor used.
+    # Bidirectional but a suggestion only (never auto-applied). A global factor
+    # can't be raised to satisfy the most-noise patch, so we report the two sides
+    # separately: a representative decrease among the over-removed voxels and a
+    # representative increase among the noise-like-kept voxels, with the fraction
+    # of voxels on each side. The per-voxel _recfactor map carries the spatial
+    # detail. A small deadband around 1.0 ignores no-change patches.
     rec_factor: dict | None = None
     rf_vals = [s.recfactor_map for _, s in results if s.recfactor_map is not None]
     if rf_vals:
@@ -1995,20 +2003,36 @@ def run_nordic_multiecho(
         vals = vals[torch.isfinite(vals)].float()
         if vals.numel() > 0:
             fe = cfg.factor_error
-            qs = torch.quantile(vals, torch.tensor([0.05, 0.5, 0.95], device=vals.device))
+            dec = vals[vals < 0.98]
+            inc = vals[vals > 1.02]
             rec_factor = {
                 "current": float(fe),
-                "suggested_median": float(fe * qs[1].item()),
-                "p5": float(fe * qs[0].item()),
-                "p95": float(fe * qs[2].item()),
                 "in_brain": brain_mask is not None,
+                "frac_suggest_decrease": float((vals < 0.98).float().mean().item()),
+                "frac_suggest_increase": float((vals > 1.02).float().mean().item()),
+                "decrease_to": (
+                    float(fe * torch.quantile(dec, 0.25).item()) if dec.numel() else None
+                ),
+                "increase_to": (
+                    float(fe * torch.quantile(inc, 0.75).item()) if inc.numel() else None
+                ),
             }
             if cfg.verbose:
-                print(
-                    f"  Suggested factor_error: {rec_factor['suggested_median']:.3f} "
-                    f"(current {fe:.3f}; in-brain P5..P95 "
-                    f"{rec_factor['p5']:.3f}..{rec_factor['p95']:.3f}); _recfactor maps written."
-                )
+                d, i = rec_factor["decrease_to"], rec_factor["increase_to"]
+                msg = f"  Suggested factor_error (current {fe:.3f}):"
+                if d is not None:
+                    msg += (
+                        f" lower to ~{d:.3f} over "
+                        f"{rec_factor['frac_suggest_decrease'] * 100:.0f}% (over-removed)"
+                    )
+                if i is not None:
+                    msg += (
+                        f"{';' if d else ''} raise to ~{i:.3f} over "
+                        f"{rec_factor['frac_suggest_increase'] * 100:.0f}% (noise-like kept)"
+                    )
+                if d is None and i is None:
+                    msg += " no change suggested"
+                print(msg)
 
     # 5. Finalize each echo (undo transforms + write outputs).
     outputs: list[NordicOutputs] = []
