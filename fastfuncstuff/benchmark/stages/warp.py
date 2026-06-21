@@ -180,7 +180,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             nwarp = _nwarp_chain(ctx, task, run)
             elapsed, _ = run_timed(
                 f'ffs_nwarp '
-                f'-master {master} -dxyz 3.0 -interp wsinc5 '
+                f'-master {master} -dxyz 3.0 -interp wsinc5 -no_autopad '
                 f'-nwarp "{nwarp}" '
                 f'-source {_input_path(ctx, task, run)} '
                 f'-prefix {out}'
