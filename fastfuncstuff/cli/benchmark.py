@@ -38,6 +38,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Comma-separated stage names ({_stage_names}). Default: all.",
     )
     parser.add_argument(
+        "-with-deps", "--with-deps", action="store_true",
+        help="Expand -stages to also run the upstream stages they depend on "
+        "(via each stage's 'requires'), in pipeline order.",
+    )
+    parser.add_argument(
         "-validate-only", action="store_true",
         help="Only validate existing outputs, don't run any tools.",
     )
@@ -202,6 +207,15 @@ def main(argv: list[str] | None = None) -> int:
         stage_names = [s.strip() for s in args.stages.split(",")]
     elif config.stages:
         stage_names = config.stages
+
+    if stage_names is not None and args.with_deps:
+        from ..benchmark.stages import expand_with_deps
+
+        expanded = expand_with_deps(stage_names)
+        added = [s for s in expanded if s not in stage_names]
+        if added:
+            print(f"--with-deps: adding upstream stages: {', '.join(added)}")
+        stage_names = expanded
 
     try:
         stages = get_stages(stage_names)

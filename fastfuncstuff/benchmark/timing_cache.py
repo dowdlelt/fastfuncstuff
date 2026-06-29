@@ -390,10 +390,13 @@ def get_ref_timings_all_archs(
         if dataset_id and run.get("dataset_id", "") != dataset_id:
             continue
         ref_id = run.get("ref_arch_id", "unknown")
-        seconds = run.get("stages", {}).get(stage_name, {}).get("ref_seconds")
+        stage = run.get("stages", {}).get(stage_name, {})
+        if stage.get("ref_partial"):
+            continue  # partial reruns aren't valid full-stage baselines
+        seconds = stage.get("ref_seconds")
         if seconds is None:
             # Support legacy key
-            seconds = run.get("stages", {}).get(stage_name, {}).get("afni_seconds")
+            seconds = stage.get("afni_seconds")
         if seconds is not None:
             # Later entries overwrite earlier — "latest" wins
             latest[ref_id] = float(seconds)
@@ -416,7 +419,10 @@ def get_ffs_timings_all_gpus(
         if dataset_id and run.get("dataset_id", "") != dataset_id:
             continue
         ffs_id = run.get("ffs_arch_id", "unknown")
-        seconds = run.get("stages", {}).get(stage_name, {}).get("ffs_seconds")
+        stage = run.get("stages", {}).get(stage_name, {})
+        if stage.get("ffs_partial"):
+            continue  # partial reruns aren't valid full-stage baselines
+        seconds = stage.get("ffs_seconds")
         if seconds is not None:
             latest[ffs_id] = float(seconds)
     return sorted(latest.items(), key=lambda x: x[1])

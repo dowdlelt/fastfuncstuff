@@ -106,11 +106,14 @@ def run_ref(ctx: BenchmarkContext) -> float:
     from pathlib import Path
 
     total = 0.0
+    n_total = n_ran = 0
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
+            n_total += 1
             out = _afni_moco_path(ctx, task, run)
             if Path(out).exists() and not ctx.force_ref:
                 continue
+            n_ran += 1
             elapsed, _ = run_timed(
                 f"3dvolreg -overwrite -heptic "
                 f"-prefix {out} "
@@ -129,6 +132,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
                 label=f"3dTstat mean {task} run-{run}",
                 cwd=ctx.processing_dir,
             )
+    ctx.note_items("ref", n_ran, n_total)
     return total
 
 
@@ -137,11 +141,14 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     from pathlib import Path
 
     total = 0.0
+    n_total = n_ran = 0
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
+            n_total += 1
             out = _ffs_moco_path(ctx, task, run)
             if Path(out).exists() and not ctx.force_ffs:
                 continue
+            n_ran += 1
             elapsed, _ = run_timed(
                 f"ffs_moco "
                 f"-input {_input_path(ctx, task, run)} "
@@ -161,6 +168,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             mean_dst = Path(_ffs_mean_path(ctx, task, run))
             if mean_src.exists() and not mean_dst.exists():
                 mean_src.rename(mean_dst)
+    ctx.note_items("ffs", n_ran, n_total)
     return total
 
 

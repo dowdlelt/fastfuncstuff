@@ -31,6 +31,21 @@ class BenchmarkContext:
     show_output: bool = False  # Stream subprocess stdout/stderr when True
     config: Any = None  # BenchmarkConfig — typed as Any to avoid circular import
 
+    # Per-stage scratch: how many items each role (ref/ffs) actually ran vs the
+    # full set. The runner resets this before each stage; stages fill it via
+    # note_items() so a partial rerun's timing can be flagged (and kept out of
+    # cached baselines). Not part of the public config surface.
+    _timing_meta: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def note_items(self, role: str, ran: int, total: int) -> None:
+        """Record items executed vs total for a role ("ref" or "ffs").
+
+        Lets the runner mark a stage's timing ``partial`` when some runs were
+        skipped because their outputs already existed -- a partial time must not
+        become the cached full-stage baseline.
+        """
+        self._timing_meta[role] = {"ran": int(ran), "total": int(total)}
+
     def ffs_device_flag(self) -> str:
         """Return ' -device <device>' for appending to FFS CLI command strings, or ''."""
         return f" -device {self.device}" if self.device else ""
@@ -222,6 +237,9 @@ class StageResult:
     # comparison, it just couldn't run a full comparison (e.g. an upstream stage
     # hasn't produced its output yet). Reported as INCOMPLETE, not FAIL.
     incomplete: bool = False
+    # {role: {"ran": n, "total": m}} for roles that ran only some items this
+    # invocation (partial timing). Excluded from cached baselines.
+    partial: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def status(self) -> str:
@@ -345,10 +363,17 @@ def _format_timing(result: StageResult, stage_name: str, data_dir: Path) -> str:
     ref_ran = ref_t is not None and ref_t > 0
     ffs_ran = ffs_t is not None and ffs_t > 0
 
+    def _partial(role: str) -> str:
+        m = result.partial.get(role)
+        return f" (partial {m['ran']}/{m['total']})" if m else ""
+
     if ref_ran and ffs_ran:
         # Both measured this run
         speedup = ref_t / ffs_t
-        return f" | Ref={ref_t:.1f}s FFS={ffs_t:.1f}s ({speedup:.1f}x)"
+        return (
+            f" | Ref={ref_t:.1f}s{_partial('ref')} "
+            f"FFS={ffs_t:.1f}s{_partial('ffs')} ({speedup:.1f}x)"
+        )
 
     if not ffs_ran:
         return ""
@@ -365,7 +390,7 @@ def _format_timing(result: StageResult, stage_name: str, data_dir: Path) -> str:
     local = next(((a, r) for a, r in all_refs if a == my_ref_id), None)
     others = [(a, r) for a, r in all_refs if a != my_ref_id]
 
-    parts = [f"FFS={ffs_t:.1f}s"]
+    parts = [f"FFS={ffs_t:.1f}s{_partial('ffs')}"]
     if local:
         _, lr = local
         parts.append(f"cached ref={lr:.1f}s ({lr / ffs_t:.1f}x) [this machine]")
@@ -461,6 +486,18 @@ def run_stages(
     results = []
     stage_timings = {}
 
+    # Up-front dependency advisory: if a requested stage depends on stages not in
+    # this run, its upstream outputs may be missing -> it'll come back INCOMPLETE.
+    # Say so now (0s) rather than after the expensive work.
+    from .stages import unsatisfied_deps
+
+    deps = unsatisfied_deps([s.name for s in stages])
+    if deps:
+        print("\nNote: some stages depend on stages not in this run:")
+        for sname, missing in deps.items():
+            print(f"  {sname} requires: {', '.join(missing)} "
+                  f"(run them first, or use --with-deps / -stages to include them)")
+
     for stage in stages:
         name = stage.name
         print(f"\n{'=' * 60}")
@@ -490,6 +527,7 @@ def run_stages(
             continue
 
         result = StageResult(stage_name=name)
+        ctx._timing_meta = {}  # stages fill via note_items(); read after run
 
         # Run reference tool (if not validate-only)
         if not ctx.validate_only and hasattr(stage, "run_ref"):
@@ -510,6 +548,14 @@ def run_stages(
             except Exception as e:
                 result.errors.append(f"FFS: {e}")
                 print(f"  FFS error: {e}")
+
+        # Snapshot which roles ran only part of their work (some outputs already
+        # existed) so the timing is flagged partial in display and cache.
+        result.partial = {
+            role: m
+            for role, m in ctx._timing_meta.items()
+            if m.get("total", 0) > 0 and m["ran"] < m["total"]
+        }
 
         # Validate: skip in ref_only mode for stages that have a ref tool
         # (FFS outputs won't exist). Prep-only stages still validate so we
@@ -552,12 +598,19 @@ def run_stages(
 
         results.append(result)
 
-        # Collect timings for cache (only non-zero real timings)
-        timing_entry = {}
+        # Collect timings for cache (only non-zero real timings). Flag a role as
+        # partial when the stage ran fewer than all its items this invocation
+        # (some outputs already existed) -- a partial time is not a valid
+        # full-stage baseline and is excluded from cached-ref lookups.
+        timing_entry: dict[str, Any] = {}
         if result.ref_time is not None and result.ref_time > 0:
             timing_entry["ref_seconds"] = result.ref_time
         if result.ffs_time is not None and result.ffs_time > 0:
             timing_entry["ffs_seconds"] = result.ffs_time
+        for role, m in result.partial.items():
+            timing_entry[f"{role}_partial"] = True
+            timing_entry[f"{role}_ran"] = m["ran"]
+            timing_entry[f"{role}_total"] = m["total"]
         if timing_entry:
             stage_timings[name] = timing_entry
 

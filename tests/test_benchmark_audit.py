@@ -126,3 +126,67 @@ def test_run_stages_passes_when_inputs_present(tmp_path):
     assert r.incomplete is False
     assert r.passed is True
     assert r.status == "PASS"
+
+
+# --------------------------------------------------------------------------
+# P1: dependency expansion + timing integrity
+# --------------------------------------------------------------------------
+
+
+def test_expand_with_deps_pulls_in_upstream():
+    from fastfuncstuff.benchmark.stages import expand_with_deps
+
+    expanded = expand_with_deps(["warp"])
+    # warp requires moco, crossalign, align -> all present, in pipeline order
+    for s in ("moco", "crossalign", "align", "warp"):
+        assert s in expanded
+    # ordered by ALL_STAGES: moco before warp
+    assert expanded.index("moco") < expanded.index("warp")
+
+
+def test_unsatisfied_deps_reports_missing():
+    from fastfuncstuff.benchmark.stages import unsatisfied_deps
+
+    deps = unsatisfied_deps(["warp"])  # warp alone -> all its requires unsatisfied
+    assert set(deps["warp"]) == {"moco", "crossalign", "align"}
+    # when the deps are included, nothing is unsatisfied
+    assert unsatisfied_deps(["moco", "crossalign", "align", "warp"]) == {}
+
+
+def test_partial_timing_flagged_and_excluded(tmp_path):
+    """A partial run flags its timing and that timing is kept out of cached refs."""
+    from fastfuncstuff.benchmark.timing_cache import (
+        append_run,
+        get_ref_timings_all_archs,
+    )
+
+    # full ref run -> baseline available
+    append_run(tmp_path, {"warp": {"ref_seconds": 800.0}}, dataset_id="ds")
+    assert get_ref_timings_all_archs(tmp_path, "warp")  # has a baseline
+
+    # later partial ref run must not become the baseline
+    append_run(
+        tmp_path,
+        {"warp": {"ref_seconds": 80.0, "ref_partial": True, "ref_ran": 1, "ref_total": 10}},
+        dataset_id="ds",
+    )
+    refs = get_ref_timings_all_archs(tmp_path, "warp")
+    secs = [s for _, s in refs]
+    assert 800.0 in secs
+    assert 80.0 not in secs  # partial excluded
+
+
+def test_note_items_marks_partial_result(tmp_path):
+    """A stage reporting ran<total via note_items surfaces as partial timing."""
+    def run_ffs(ctx):
+        ctx.note_items("ffs", 1, 10)
+        return 42.0
+
+    stage = types.SimpleNamespace(
+        name="fake",
+        check_prerequisites=lambda ctx: [],
+        run_ffs=run_ffs,
+        validate=lambda ctx: {"passed": True, "summary": "ok"},
+    )
+    r = run_stages([stage], _ctx(tmp_path))[0]
+    assert r.partial.get("ffs") == {"ran": 1, "total": 10}

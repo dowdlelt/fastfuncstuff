@@ -9,6 +9,10 @@ from ..validation import compare_timeseries_4d, compare_volumes
 
 name = "warp"
 description = "Warp apply (3dNwarpApply vs ffs_nwarp)"
+# Upstream stages whose outputs this stage consumes: moco (per-run motion
+# matrices + reference mean), crossalign (inter-run alignment matrices), align
+# (sswarper anatQQ/anatSS + the ffs_qwarp anatFFS that validate() compares).
+requires = ["moco", "crossalign", "align"]
 
 THRESHOLDS = {
     "warped_anat_r": 0.80,  # different warping algorithms, expect some disagreement
@@ -157,9 +161,11 @@ def run_ref(ctx: BenchmarkContext) -> float:
     subid = f"sub-{ctx.subject}"
     master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
     total = 0.0
+    n_total = n_ran = 0
 
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
+            n_total += 1
             out = _afni_mni(ctx, task, run)
             if out.exists() and not ctx.force_ref:
                 continue
@@ -174,6 +180,8 @@ def run_ref(ctx: BenchmarkContext) -> float:
                 cwd=ctx.processing_dir,
             )
             total += elapsed
+            n_ran += 1
+    ctx.note_items("ref", n_ran, n_total)
     return total
 
 
@@ -182,9 +190,11 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     subid = f"sub-{ctx.subject}"
     master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
     total = 0.0
+    n_total = n_ran = 0
 
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
+            n_total += 1
             out = _ffs_mni(ctx, task, run)
             if out.exists() and not ctx.force_ffs:
                 continue
@@ -200,6 +210,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 cwd=ctx.processing_dir,
             )
             total += elapsed
+            n_ran += 1
+    ctx.note_items("ffs", n_ran, n_total)
     return total
 
 
