@@ -360,7 +360,7 @@ Examples:
     reml_out = parser.add_argument_group("REML Output Options")
     reml_out.add_argument(
         "-Rvar",
-        help="Output REML variance parameters (up to 4 volumes: a, b, lambda, StDev)",
+        help="Output REML variance parameters (up to 5 volumes: a, b, lambda, StDev, -LogLik)",
     )
     reml_out.add_argument(
         "-Rlklhd",
@@ -2497,6 +2497,14 @@ def main():
         if results.sigma2 is not None:
             var_stack.append(torch.sqrt(results.sigma2))  # StDev
             var_labels.append("StDev")
+
+        # -LogLik: AFNI's Rvar[4] = the minimized REML criterion
+        # (n-m)log(RSS_w) + logdet(R) + logdet(X'R^-1 X) — the same value (and
+        # sign) we already track per voxel as reml_likelihood. Matches
+        # 3dREMLfit's "-LogLik" subbrik (remla.c:1014).
+        if getattr(results, "reml_likelihood", None) is not None:
+            var_stack.append(results.reml_likelihood)
+            var_labels.append("-LogLik")
 
         # Stack and write
         var_data = torch.stack(var_stack, dim=1)
