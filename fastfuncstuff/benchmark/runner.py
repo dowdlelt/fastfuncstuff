@@ -50,6 +50,16 @@ class BenchmarkContext:
         """Return ' -device <device>' for appending to FFS CLI command strings, or ''."""
         return f" -device {self.device}" if self.device else ""
 
+    def ffs_afni_mode_flag(self) -> str:
+        """Return ' -afni_mode' for ffs_reml REML/ARMA stages.
+
+        These stages exist to validate against AFNI 3dREMLfit, so the noise model
+        is run in AFNI-faithful mode (banded R, AFNI ltop, corcut grid filter) for
+        an apples-to-apples (a,b)/t-stat comparison. FFS's more-accurate defaults
+        would otherwise show small, expected divergences from the reference.
+        """
+        return " -afni_mode"
+
     @property
     def ffs_tag(self) -> str:
         """File/directory name tag identifying the FFS device variant.
