@@ -156,10 +156,12 @@ Examples:
     interp_group.add_argument(
         "-ainterp",
         choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
-        default="cubic",
-        help="Kernel for warp-field interpolation during composition "
-        "(default: cubic). Higher order reduces the smoothing each composition "
-        "step adds to the warp; 'linear' is fastest.",
+        default=None,
+        help="Kernel for warp-field interpolation during composition. Default "
+        "follows -interp (matching AFNI 3dNwarpApply: 'the same interpolation "
+        "mode is used for the warp itself and then for the data'); when -interp "
+        "is NN/nearest/linear it falls back to wsinc5. Higher order reduces the "
+        "smoothing each composition step adds to the warp; 'linear' is fastest.",
     )
     interp_group.add_argument(
         "-no_neg",
@@ -222,6 +224,14 @@ def main(argv: list[str] | None = None) -> None:
         if verb >= 1:
             print(f"ffs_nwarp: time_range={time_range}")
 
+    # AFNI: -ainterp defaults to -interp. NN/nearest/linear aren't valid warp
+    # composition kernels (WARP_COMPOSE_INTERP), so fall back to wsinc5 there.
+    ainterp = args.ainterp
+    if ainterp is None:
+        ainterp = args.interp if args.interp in ("cubic", "quintic", "heptic", "wsinc5") else "wsinc5"
+    if verb >= 1:
+        print(f"ffs_nwarp: ainterp={ainterp}")
+
     nwarp_specs = parse_nwarp_string(args.nwarp)
     if verb >= 1:
         print(f"ffs_nwarp: chain has {len(nwarp_specs)} transform(s)")
@@ -249,7 +259,7 @@ def main(argv: list[str] | None = None) -> None:
         no_neg=args.no_neg,
         auto_pad=args.auto_pad,
         expad=args.expad,
-        ainterp=args.ainterp,
+        ainterp=ainterp,
     )
 
     if verb >= 1:
