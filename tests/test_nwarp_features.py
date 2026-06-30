@@ -153,6 +153,30 @@ def test_separable_resample_matches_einsum(kernel):
     assert torch.allclose(ours, ref, atol=1e-5), (kernel, (ours - ref).abs().max())
 
 
+@pytest.mark.parametrize("kernel", ["wsinc5", "cubic", "quintic", "heptic"])
+def test_resample_istiny_matches_full_kernel(kernel):
+    """Grid-node (ISTINY) points return the source value, == the full kernel."""
+    torch.manual_seed(1)
+    vol = torch.rand(10, 10, 10)
+    # exact nodes + near-nodes (inside the 1e-4 band) in the interior
+    base = torch.tensor([3.0, 4.0, 5.0, 6.0])
+    x = base + torch.tensor([0.0, 1e-6, -2e-5, 5e-5])
+    y = base + torch.tensor([0.0, -1e-6, 3e-5, 2e-5])
+    z = base + torch.tensor([0.0, 2e-6, -4e-5, 1e-5])
+    out = I._separable_resample_3d(vol, x, y, z, kernel)
+    nodes = vol[base.long(), base.long(), base.long()]
+    assert torch.allclose(out, nodes, atol=1e-4), (kernel, out, nodes)
+
+
+def test_resample_all_out_of_bounds_returns_zero():
+    vol = torch.rand(8, 8, 8)
+    x = torch.tensor([-5.0, 20.0])
+    y = torch.tensor([-5.0, 20.0])
+    z = torch.tensor([-5.0, 20.0])
+    out = I._separable_resample_3d(vol, x, y, z, "wsinc5")
+    assert torch.all(out == 0.0)
+
+
 def test_wsinc5_resample_identity_at_integers():
     vol = torch.rand(9, 9, 9)
     kk, jj, ii = torch.meshgrid(

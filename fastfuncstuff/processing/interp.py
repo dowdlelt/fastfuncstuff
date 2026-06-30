@@ -531,15 +531,56 @@ def _separable_resample_3d(
         ntaps = 2 * H + 1
         offsets = torch.arange(-H, H + 1, device=device)
 
-    result = torch.empty(N, dtype=dtype, device=device)
+    result = torch.zeros(N, dtype=dtype, device=device)
 
-    # Chunk over output voxels: the gather materializes a (chunk, ntaps, ntaps)
-    # slab per z-tap, so chunking keeps peak memory bounded (and makes the kernel
-    # affordable on MPS/CPU and for the auto-padded grids).
-    chunk = _resample_chunk_size(N, ntaps, device)
-    for s in range(0, N, chunk):
-        e = min(N, s + chunk)
-        xf, yf, zf = x_flat[s:e], y_flat[s:e], z_flat[s:e]
+    # Per-point bases (cheap elementwise) for the OOB and grid-node masks below.
+    if use_floor:
+        xb_all, yb_all, zb_all = x_flat.floor(), y_flat.floor(), z_flat.floor()
+    else:
+        xb_all, yb_all, zb_all = x_flat.round(), y_flat.round(), z_flat.round()
+
+    # S2 (AFNI :630-632): out-of-bounds centers contribute nothing (outval=0).
+    # result starts at 0, so we simply never compute them. Bounds match the old
+    # end-zeroing window [-0.5, n-0.5], so in-bounds output is unchanged -- this
+    # just skips the kernel for voxels that would have been zeroed (often
+    # 30-50% of the grid for skull-stripped / cropped-FOV warps).
+    in_bounds = (
+        (x_flat >= -0.5) & (x_flat <= nx - 0.5) &
+        (y_flat >= -0.5) & (y_flat <= ny - 0.5) &
+        (z_flat >= -0.5) & (z_flat <= nz - 0.5)
+    )
+
+    # S3 (AFNI ISTINY, :638-641): a center sitting on a grid node (fractional
+    # part < 1e-4 on every axis) interpolates to that node's value for every
+    # kernel here, so take it directly and keep it out of the heavy gather.
+    tiny = (
+        in_bounds
+        & ((x_flat - xb_all).abs() < 1e-4)
+        & ((y_flat - yb_all).abs() < 1e-4)
+        & ((z_flat - zb_all).abs() < 1e-4)
+    )
+    if bool(tiny.any()):
+        ti = tiny.nonzero(as_tuple=True)[0]
+        result[ti] = source[
+            zb_all[ti].long().clamp(0, nz - 1),
+            yb_all[ti].long().clamp(0, ny - 1),
+            xb_all[ti].long().clamp(0, nx - 1),
+        ]
+
+    heavy = in_bounds & ~tiny
+    idx = heavy.nonzero(as_tuple=True)[0]
+    M = idx.numel()
+    if M == 0:
+        return result.reshape(out_shape)
+    xin, yin, zin = x_flat[idx], y_flat[idx], z_flat[idx]
+
+    # Chunk over the surviving voxels: the gather materializes a
+    # (chunk, ntaps, ntaps) slab per z-tap, so chunking keeps peak memory
+    # bounded (and makes the kernel affordable on MPS/CPU and auto-padded grids).
+    chunk = _resample_chunk_size(M, ntaps, device)
+    for s in range(0, M, chunk):
+        e = min(M, s + chunk)
+        xf, yf, zf = xin[s:e], yin[s:e], zin[s:e]
 
         if use_floor:
             xb, yb, zb = xf.floor(), yf.floor(), zf.floor()
@@ -565,15 +606,7 @@ def _separable_resample_3d(
             sx = (plane * wx[:, None, :]).sum(dim=2)  # (c, ty)  contract X
             sxy = (sx * wy).sum(dim=1)                # (c,)     contract Y
             acc = acc + sxy * wz[:, t]                # accumulate Z
-        result[s:e] = acc
-
-    # Zero out-of-bounds (matches AFNI's outval=0 outside [-0.5, n-0.5]).
-    out_of_bounds = (
-        (x_flat < -0.5) | (x_flat > nx - 0.5) |
-        (y_flat < -0.5) | (y_flat > ny - 0.5) |
-        (z_flat < -0.5) | (z_flat > nz - 0.5)
-    )
-    result[out_of_bounds] = 0.0
+        result[idx[s:e]] = acc
 
     return result.reshape(out_shape)
 
