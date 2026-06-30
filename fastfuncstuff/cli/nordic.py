@@ -7,8 +7,11 @@ import argparse
 import sys
 import time
 
+import numpy as np
+
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header
 from fastfuncstuff.denoise.nordic import NordicConfig, run_nordic, run_nordic_multiecho
+from fastfuncstuff.denoise.nordic_sweep import run_nordic_factor_sweep
 from fastfuncstuff.utils import configure_torch_backends, get_device
 
 
@@ -209,6 +212,40 @@ Examples:
         "(1 - alpha) quantile of the all-thermal-noise null.",
     )
 
+    sweep_group = parser.add_argument_group("Factor-sweep diagnostic (single-echo)")
+    sweep_group.add_argument(
+        "-factor-sweep",
+        "-factor_sweep",
+        action="store_true",
+        help="Sweep the threshold factor and emit residual voxel-to-voxel correlation "
+        "diagnostic plots/table (single-echo, NORDIC threshold). Off by default.",
+    )
+    sweep_group.add_argument(
+        "-factor-sweep-range",
+        "-factor_sweep_range",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("LO", "HI", "N"),
+        help="Factor window as LO HI N (e.g. 0.5 2.0 9). Default: 9 even steps over "
+        "0.75-1.25 (lands on 1.0). Overridden by -factor-sweep-values.",
+    )
+    sweep_group.add_argument(
+        "-factor-sweep-values",
+        "-factor_sweep_values",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Explicit factor values to sweep (overrides -factor-sweep-range).",
+    )
+    sweep_group.add_argument(
+        "-factor-sweep-max-voxels",
+        "-factor_sweep_max_voxels",
+        type=int,
+        default=40000,
+        help="Per-mask voxel cap for the correlation (random subsample). 0 = all voxels.",
+    )
+
     perf_group = parser.add_argument_group("Performance")
     perf_group.add_argument(
         "-device",
@@ -247,6 +284,21 @@ def main(argv: list[str] | None = None) -> None:
             f"ERROR: got {n_echoes} magnitude file(s) but {len(phase_files)} phase file(s) "
             "(need one phase per echo)"
         )
+        sys.exit(1)
+
+    # Resolve the factor-sweep window: explicit values win, else LO HI N range.
+    sweep_values: tuple[float, ...] | None = None
+    if args.factor_sweep_values is not None:
+        sweep_values = tuple(args.factor_sweep_values)
+    elif args.factor_sweep_range is not None:
+        lo, hi, n = args.factor_sweep_range
+        sweep_values = tuple(float(x) for x in np.linspace(lo, hi, int(n)))
+    sweep_max_voxels = (
+        None if args.factor_sweep_max_voxels in (0, None) else args.factor_sweep_max_voxels
+    )
+
+    if args.factor_sweep and n_echoes > 1:
+        print("ERROR: -factor-sweep is single-echo only (pass one -input-magn).")
         sys.exit(1)
 
     prefix_info = parse_prefix(args.prefix)
@@ -289,10 +341,30 @@ def main(argv: list[str] | None = None) -> None:
         rescue_alpha=args.rescue_alpha,
         per_echo_gfactor=args.per_echo_gfactor,
         resid_qc=args.resid_qc,
+        factor_sweep=args.factor_sweep,
+        factor_sweep_values=sweep_values,
+        factor_sweep_max_voxels=sweep_max_voxels,
         verbose=args.verb >= 1,
     )
 
     t0 = time.time()
+    if args.factor_sweep:
+        summary = run_nordic_factor_sweep(
+            magnitude_file=magn_files[0],
+            phase_file=phase_files[0] if phase_files is not None else None,
+            output_prefix=prefix,
+            config=cfg,
+            device=device,
+        )
+        elapsed = time.time() - t0
+        print("\nDone (factor sweep)")
+        sf = summary.get("suggested_factor", {})
+        print(f"  Liftoff factor (null held up to): {sf.get('liftoff_factor')}")
+        for key, path in summary.get("outputs", {}).items():
+            print(f"  {key}: {path}")
+        print(f"  Elapsed: {elapsed:.1f} s")
+        return
+
     if n_echoes > 1:
         all_outputs = run_nordic_multiecho(
             magnitude_files=magn_files,

@@ -94,6 +94,17 @@ class NordicConfig:
     # Cheap (reuses the residuals); on by default for the multi-echo path.
     resid_qc: bool = True
 
+    # Single-echo factor-sweep diagnostic (denoise/nordic_sweep.py). Opt-in: sweep
+    # the threshold factor, reconstruct the residual at each (SVD computed once),
+    # and summarize the residual-magnitude voxel-to-voxel correlation vs the
+    # timepoint null. Off by default; zero cost unless requested.
+    factor_sweep: bool = False
+    factor_sweep_values: tuple[float, ...] | None = None  # None -> _default_factors()
+    factor_sweep_masks: tuple[str, ...] = ("in_brain", "out_brain", "whole")
+    factor_sweep_max_voxels: int | None = 40000  # per-mask cap (None = all voxels)
+    factor_sweep_dist_bins: int = 24
+    factor_sweep_r_bins: int = 201
+
 
 @dataclass
 class NordicOutputs:
