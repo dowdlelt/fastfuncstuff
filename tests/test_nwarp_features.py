@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import nibabel as nib
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.processing import interp as I
@@ -59,6 +60,59 @@ def test_wsinc5_partition_of_unity():
     fx = torch.linspace(0, 0.999, 50)
     w = I._wsinc5_kernel(fx)
     assert torch.allclose(w.sum(dim=1), torch.ones(50), atol=1e-5)
+
+
+def _afni_wsinc5_weights_env(
+    fx: float, irad: int = 5, wcut: float = 0.0, hamming: bool = False
+) -> np.ndarray:
+    """AFNI 1D weights honoring IRAD/WCUT/TAPERFUN (mri_genalign_util.c)."""
+    wrad = 0.001 + irad
+    offs = np.arange(-(irad - 1), irad + 1)
+    d = np.abs(fx - offs)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sinc = np.where(d < 1e-7, 1.0, np.sin(np.pi * d) / (np.pi * d))
+    xw = d / wrad
+    arg = np.pi * (xw - wcut) / (1.0 - wcut)
+    if hamming:
+        win = 0.53836 + 0.46164 * np.cos(arg)
+    else:
+        win = 0.4243801 + 0.4973406 * np.cos(arg) + 0.0782793 * np.cos(2 * arg)
+    win = np.where(xw > wcut, win, 1.0)
+    w = sinc * win
+    return w / w.sum()
+
+
+@pytest.mark.parametrize(
+    "env,irad,wcut,hamming",
+    [
+        ({"AFNI_WSINC5_RADIUS": "9"}, 9, 0.0, False),
+        ({"AFNI_WSINC5_TAPERCUT": "0.5"}, 5, 0.5, False),
+        ({"AFNI_WSINC5_TAPERFUN": "H"}, 5, 0.0, True),
+        ({"AFNI_WSINC5_RADIUS": "3", "AFNI_WSINC5_TAPERCUT": "0.2"}, 3, 0.2, False),
+    ],
+)
+def test_wsinc5_kernel_honors_env(monkeypatch, env, irad, wcut, hamming):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    I._wsinc5_params.cache_clear()
+    try:
+        for fx in (0.0, 0.37, 0.83):
+            ours = I._wsinc5_kernel(torch.tensor([fx], dtype=torch.float32))[0].numpy()
+            ref = _afni_wsinc5_weights_env(fx, irad=irad, wcut=wcut, hamming=hamming)
+            assert ours.shape == (2 * irad,)
+            assert np.allclose(ours, ref, atol=1e-5), (env, fx, ours, ref)
+    finally:
+        I._wsinc5_params.cache_clear()
+
+
+def test_wsinc5_spherical_unsupported(monkeypatch):
+    monkeypatch.setenv("AFNI_WSINC5_SPHERICAL", "YES")
+    I._wsinc5_params.cache_clear()
+    try:
+        with pytest.raises(NotImplementedError):
+            I._wsinc5_kernel(torch.tensor([0.3], dtype=torch.float32))
+    finally:
+        I._wsinc5_params.cache_clear()
 
 
 def test_wsinc5_resample_identity_at_integers():

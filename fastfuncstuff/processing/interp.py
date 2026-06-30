@@ -12,6 +12,9 @@ Key functions:
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -246,48 +249,114 @@ def warp_image(
 # Interpolation kernels
 # ---------------------------------------------------------------------------
 
-# AFNI wsinc5 constants (GA_interp_wsinc5p, the cubical/separable default).
-_WSINC5_IRAD = 5      # window radius -> 10 taps at floor offsets -4..+5
-_WSINC5_WRAD = 5.001  # AFNI WRAD = 0.001 + IRAD (float radius for the window arg)
-# M3(x) = minimum-sidelobe 3-term window (AFNI default, WFUN=0). Note M3(0)==1,
-# so applying it unconditionally matches AFNI's "if d/WRAD > WCUT" guard for the
-# default taper cut WCUT=0.
+# M3(x) = minimum-sidelobe 3-term window (AFNI default, WFUN=0).
 _M3_A, _M3_B, _M3_C = 0.4243801, 0.4973406, 0.0782793
+# HW(x) = Hamming (minimum-sidelobe 2-term) window (AFNI AFNI_WSINC5_TAPERFUN=H).
+_HW_A, _HW_B = 0.53836, 0.46164
+
+
+@lru_cache(maxsize=1)
+def _wsinc5_params() -> tuple[int, float, float, bool]:
+    """Read the ``AFNI_WSINC5_*`` env vars once, mirroring AFNI ``setup_wsinc5``.
+
+    AFNI reads these at first wsinc5 use (``mri_genalign_util.c:setup_wsinc5``);
+    hardcoding the defaults silently diverges from any site that sets them (some
+    labs set ``AFNI_WSINC5_RADIUS=9`` globally). We honor the three that keep the
+    kernel separable and refuse the one that does not:
+
+      - ``AFNI_WSINC5_RADIUS``   -> IRAD (3..21), tap count = 2*IRAD
+      - ``AFNI_WSINC5_TAPERCUT`` -> WCUT (0..0.8), start of the taper region
+      - ``AFNI_WSINC5_TAPERFUN`` -> 'H' selects Hamming, else min-sidelobe 3-term
+      - ``AFNI_WSINC5_SPHERICAL``-> 'Y' selects AFNI's non-separable spherical
+        kernel, which this separable resampler cannot reproduce -> raise rather
+        than silently use the cubical/tensor kernel.
+
+    Cached (like AFNI's one-time setup); tests that toggle env must call
+    ``_wsinc5_params.cache_clear()``.
+
+    Returns:
+        (irad, wrad, wcut, wfun_hamming).
+    """
+    irad = 5
+    eee = os.environ.get("AFNI_WSINC5_RADIUS")
+    if eee is not None:
+        try:
+            val = float(eee)
+        except ValueError:
+            val = -1.0
+        if 3.0 <= val <= 21.9:
+            irad = int(val)
+
+    wcut = 0.0
+    eee = os.environ.get("AFNI_WSINC5_TAPERCUT")
+    if eee is not None:
+        try:
+            val = float(eee)
+        except ValueError:
+            val = -1.0
+        if 0.0 <= val <= 0.8:
+            wcut = val
+
+    eee = os.environ.get("AFNI_WSINC5_TAPERFUN")
+    wfun_hamming = eee is not None and eee[:1].upper() == "H"
+
+    eee = os.environ.get("AFNI_WSINC5_SPHERICAL")
+    if eee is not None and eee[:1].upper() == "Y":
+        raise NotImplementedError(
+            "AFNI_WSINC5_SPHERICAL=Y selects AFNI's non-separable spherical "
+            "wsinc5 kernel, which this separable resampler cannot reproduce. "
+            "Unset it for the default cubical/tensor kernel, or pick -interp "
+            "cubic/quintic/heptic."
+        )
+
+    wrad = 0.001 + float(irad)
+    return irad, wrad, wcut, wfun_hamming
 
 
 def _wsinc5_kernel(fx: Tensor) -> Tensor:
-    """Build AFNI-faithful wsinc5 weights (10 taps, floor convention).
+    """Build AFNI-faithful wsinc5 weights (floor convention).
 
     Mirrors ``GA_interp_wsinc5p`` in AFNI's ``mri_genalign_util.c`` (the cubical
-    tensor-product branch, which is the default -- ``AFNI_WSINC5_SPHERICAL`` is
-    off by default). For ``fx`` in [0, 1) the taps are at integer offsets
-    ``-4 .. +5`` from ``floor(x)`` and each weight is::
+    tensor-product branch). For ``fx`` in [0, 1) the taps are at integer offsets
+    ``-(IRAD-1) .. +IRAD`` from ``floor(x)`` (10 taps at the IRAD=5 default) and
+    each weight is::
 
         d  = |fx - offset|
-        w  = sinc(d) * M3(d / WRAD)
+        xw = d / WRAD
+        w  = sinc(d) * (xw > WCUT ? win((xw - WCUT) / (1 - WCUT)) : 1)
 
-    with ``sinc(t) = sin(pi t)/(pi t)`` and ``M3`` the minimum-sidelobe 3-term
-    window. This replaces the earlier Hanning/round-11 approximation so output
-    matches ``3dNwarpApply -interp wsinc5``.
+    with ``sinc(t) = sin(pi t)/(pi t)`` and ``win`` the min-sidelobe 3-term (or
+    Hamming) window. IRAD/WCUT/window follow the ``AFNI_WSINC5_*`` env vars via
+    :func:`_wsinc5_params`; the defaults (IRAD=5, WCUT=0, M3) reduce to the
+    unconditional-window form and match ``3dNwarpApply -interp wsinc5``.
 
     Args:
         fx: (N,) fractional position in [0, 1) past the floor integer.
 
     Returns:
-        (N, 10) kernel weights, normalized to sum to 1.
+        (N, 2*IRAD) kernel weights, normalized to sum to 1.
     """
+    irad, wrad, wcut, wfun_hamming = _wsinc5_params()
     offsets = torch.arange(
-        -(_WSINC5_IRAD - 1), _WSINC5_IRAD + 1, dtype=fx.dtype, device=fx.device
-    )  # -4 .. +5  (10 taps)
-    d = (fx[:, None] - offsets[None, :]).abs()  # (N, 10)
+        -(irad - 1), irad + 1, dtype=fx.dtype, device=fx.device
+    )  # -(IRAD-1) .. +IRAD  (2*IRAD taps)
+    d = (fx[:, None] - offsets[None, :]).abs()  # (N, ntaps)
 
     pid = torch.pi * d
     sinc = torch.where(d < 1e-7, torch.ones_like(d), torch.sin(pid) / pid)
 
-    pit = torch.pi * (d / _WSINC5_WRAD)
-    m3 = _M3_A + _M3_B * torch.cos(pit) + _M3_C * torch.cos(2.0 * pit)
+    # Window argument is remapped so win=1 at the taper start (xw==WCUT) and
+    # tapers to the edge (xw==1); no window inside the cut region. WCUT=0 ->
+    # arg == xw and the guard is always true (xw>0), i.e. unconditional window.
+    xw = d / wrad
+    arg = torch.pi * (xw - wcut) / (1.0 - wcut)
+    if wfun_hamming:
+        win = _HW_A + _HW_B * torch.cos(arg)
+    else:
+        win = _M3_A + _M3_B * torch.cos(arg) + _M3_C * torch.cos(2.0 * arg)
+    win = torch.where(xw > wcut, win, torch.ones_like(win))
 
-    w = sinc * m3  # (N, 10)
+    w = sinc * win  # (N, ntaps)
     w = w / w.sum(dim=1, keepdim=True).clamp(min=1e-10)
     return w
 
@@ -389,6 +458,14 @@ _KERNELS = {
 }
 
 
+def _kernel_half_width(name: str) -> int:
+    """Half-width (taps = 2*H) for a kernel. wsinc5 follows AFNI_WSINC5_RADIUS,
+    so the resampler must read it here rather than the static registry value."""
+    if name == "wsinc5":
+        return _wsinc5_params()[0]
+    return _KERNELS[name][1]
+
+
 def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int:
     """Voxels per chunk for the separable resampler.
 
@@ -427,7 +504,8 @@ def _separable_resample_3d(
     Returns:
         Resampled volume with same shape as coordinate arrays.
     """
-    kernel_fn, H, use_floor = _KERNELS[kernel_name]
+    kernel_fn, _, use_floor = _KERNELS[kernel_name]
+    H = _kernel_half_width(kernel_name)  # wsinc5 honors AFNI_WSINC5_RADIUS
     nz, ny, nx = source.shape
     out_shape = x_coords.shape
     device = source.device
