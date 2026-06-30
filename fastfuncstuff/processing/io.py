@@ -206,6 +206,22 @@ def save_warp_field(
         # the oblique rs here would rotate a single-grid-axis warp across components
         # and would NOT be undone on apply, which goes through compute_cardinal_affine
         # too. For axis-aligned data cardinal == oblique, so this is a no-op there.
+        #
+        # CONVENTION CONTRACT — do NOT "fix" the x/y sign here in isolation.
+        # The cardinal rs is RAS, so the values written here are RAS/NIfTI-mm, NOT
+        # AFNI DICOM-mm. nwarpforge.load_warp(units="mm") assumes its input IS
+        # DICOM-mm and negates x,y (DICOM->NIfTI). save_warp_field and load_warp are
+        # therefore a *matched pair*: the net effect of save->reload on the voxel
+        # displacement is exactly (-x, -y, +z) -- the rs/inv(rs) voxel-size factor
+        # cancels, so the flip is affine-independent. This is intentional and
+        # load-bearing: medic.save_medic_warp pre-negates x/y (its feed_sign) to
+        # cancel it, and the end-to-end roundtrip is verified by
+        # tests/test_medic.py::test_medic_mm_warp_{wildcard,5d}_matches_undistort.
+        # Adding a negation here without also dropping that feed_sign (and re-checking
+        # ffs_qwarp output) would flip every saved warp. Consequence to be aware of:
+        # because the on-disk values are RAS-mm, these files are NOT in AFNI's DICOM
+        # on-disk convention, so feeding an FFS-saved mm warp straight to AFNI
+        # 3dNwarpApply would come out x/y-flipped (re-apply through ffs_nwarp instead).
         from .nwarpforge import compute_cardinal_affine
 
         rs = compute_cardinal_affine(affine)[:3, :3]

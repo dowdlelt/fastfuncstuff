@@ -297,6 +297,12 @@ def load_warp(
     happens later in ``prepare_warp_for_grid`` using the *output* grid's
     affine, matching AFNI's ``THD_setup_nwarp`` approach.
 
+    Note this negation assumes the file is in AFNI's DICOM-mm convention, which
+    is true for 3dQwarp output. It is *not* true for FFS's own
+    ``io.save_warp_field(units="mm")`` output (which writes RAS-mm): the two form
+    a matched pair whose save->reload roundtrip nets a (-x, -y) voxel flip on
+    purpose. See the CONVENTION CONTRACT note in ``save_warp_field``.
+
     Args:
         path: Path to warp file
         device: Torch device
