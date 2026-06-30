@@ -506,6 +506,60 @@ def _axis_weights(kernel_fn, frac: Tensor) -> Tensor:
     return kernel_fn(frac)
 
 
+def _gather_contract(
+    source: Tensor, xi: Tensor, yi: Tensor, zi: Tensor,
+    wx: Tensor, wy: Tensor, wz: Tensor,
+) -> Tensor:
+    """Three-pass separable gather+contract for one chunk (AFNI wsinc5p order).
+
+    For each z-tap, gather that ``(c, ty, tx)`` plane, contract X then Y into a
+    scalar, accumulate over Z. ``xi/yi/zi`` are clamped ``(c, ntaps)`` index
+    tables; ``wx/wy/wz`` the ``(c, ntaps)`` weights. Pulled out as a standalone
+    function so the CPU path can hand it to ``torch.compile`` -- inductor fuses
+    the gather with the multiply-reduce and never materializes the ntaps planes,
+    ~10x over eager on CPU (measured). Eager and compiled share this one body.
+    """
+    ntaps = xi.shape[1]
+    acc = torch.zeros(xi.shape[0], dtype=source.dtype, device=source.device)
+    for t in range(ntaps):
+        plane = source[zi[:, t][:, None, None], yi[:, :, None], xi[:, None, :]]
+        sx = (plane * wx[:, None, :]).sum(dim=2)  # (c, ty)  contract X
+        sxy = (sx * wy).sum(dim=1)                # (c,)     contract Y
+        acc = acc + sxy * wz[:, t]                # accumulate Z
+    return acc
+
+
+# torch.compile pays a one-time ~1-3s compile, so only worth it for CPU
+# workloads that recur (4D series, moco): the compiled fn is cached process-wide
+# and amortizes across calls. The counter keeps a one-shot single apply on the
+# eager path (no compile penalty); once we've seen repeated large CPU work we
+# switch to compiled. Disable entirely with FFS_NWARP_NO_COMPILE=1.
+_COMPILE_MIN_VOXELS = 200_000
+_cpu_large_calls = 0
+_compiled_gather_contract = None
+
+
+def _get_gather_contract(device: torch.device, n_points: int):
+    """Return the compiled _gather_contract on CPU once a recurring large
+    workload is detected, else the eager function."""
+    global _cpu_large_calls, _compiled_gather_contract
+    if (
+        device.type != "cpu"
+        or n_points < _COMPILE_MIN_VOXELS
+        or os.environ.get("FFS_NWARP_NO_COMPILE") == "1"
+    ):
+        return _gather_contract
+    _cpu_large_calls += 1
+    if _cpu_large_calls < 2:  # let a one-shot apply stay eager
+        return _gather_contract
+    if _compiled_gather_contract is None:
+        try:
+            _compiled_gather_contract = torch.compile(_gather_contract, dynamic=False)
+        except Exception:
+            _compiled_gather_contract = _gather_contract  # compile unavailable
+    return _compiled_gather_contract
+
+
 def _separable_resample_3d(
     source: Tensor,
     x_coords: Tensor,
@@ -599,6 +653,7 @@ def _separable_resample_3d(
     # (chunk, ntaps, ntaps) slab per z-tap, so chunking keeps peak memory
     # bounded (and makes the kernel affordable on MPS/CPU and auto-padded grids).
     chunk = _resample_chunk_size(M, ntaps, device)
+    gather_contract = _get_gather_contract(device, M)  # compiled on recurring CPU work
     for s in range(0, M, chunk):
         e = min(M, s + chunk)
         xf, yf, zf = xin[s:e], yin[s:e], zin[s:e]
@@ -612,22 +667,13 @@ def _separable_resample_3d(
         wy = _axis_weights(kernel_fn, yf - yb)
         wz = _axis_weights(kernel_fn, zf - zb)
 
+        # Clamped (c, ntaps) index tables; the three-pass gather+contract is in
+        # _gather_contract so the CPU path can run it under torch.compile.
         xi = (xb.long()[:, None] + offsets[None, :]).clamp(0, nx - 1)  # (c, ntaps)
         yi = (yb.long()[:, None] + offsets[None, :]).clamp(0, ny - 1)
-        zb_long = zb.long()
+        zi = (zb.long()[:, None] + offsets[None, :]).clamp(0, nz - 1)
 
-        # Three-pass separable contraction (AFNI GA_interp_wsinc5p order): for
-        # each z-tap, gather only that (c, ty, tx) plane, contract X then Y, and
-        # accumulate weighted by wz. Peak memory is the ntaps**2 plane, not the
-        # full ntaps**3 neighborhood.
-        acc = torch.zeros(e - s, dtype=dtype, device=device)
-        for t in range(ntaps):
-            zk = (zb_long + int(offsets[t])).clamp(0, nz - 1)  # (c,)
-            plane = source[zk[:, None, None], yi[:, :, None], xi[:, None, :]]  # (c,ty,tx)
-            sx = (plane * wx[:, None, :]).sum(dim=2)  # (c, ty)  contract X
-            sxy = (sx * wy).sum(dim=1)                # (c,)     contract Y
-            acc = acc + sxy * wz[:, t]                # accumulate Z
-        result[idx[s:e]] = acc
+        result[idx[s:e]] = gather_contract(source, xi, yi, zi, wx, wy, wz)
 
     return result.reshape(out_shape)
 

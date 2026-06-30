@@ -182,6 +182,49 @@ def test_resample_commensurate_grid_matches_einsum(kernel):
     assert torch.allclose(ours, ref, atol=1e-6), (kernel, (ours - ref).abs().max())
 
 
+def test_gather_contract_dispatch_gating(monkeypatch):
+    """Eager for GPU / sub-threshold / disabled; warm-up keeps one-shot eager."""
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(I, "_cpu_large_calls", 0)
+    monkeypatch.setattr(I, "_compiled_gather_contract", None)
+    # below the voxel threshold -> eager
+    assert I._get_gather_contract(cpu, 100) is I._gather_contract
+    # disabled via env -> eager even when large
+    monkeypatch.setenv("FFS_NWARP_NO_COMPILE", "1")
+    assert I._get_gather_contract(cpu, 10_000_000) is I._gather_contract
+    monkeypatch.delenv("FFS_NWARP_NO_COMPILE")
+    # first large call stays eager (one-shot protection)
+    assert I._get_gather_contract(cpu, 10_000_000) is I._gather_contract
+
+
+def test_compiled_resample_matches_eager():
+    """The torch.compile CPU path must produce the same values as eager."""
+    try:
+        compiled = torch.compile(I._gather_contract, dynamic=False)
+    except Exception:
+        import pytest as _pytest
+
+        _pytest.skip("torch.compile unavailable")
+    torch.manual_seed(3)
+    vol = torch.rand(16, 16, 16)
+    n = 4000
+    x = torch.rand(n) * 12 + 1.5
+    y = torch.rand(n) * 12 + 1.5
+    z = torch.rand(n) * 12 + 1.5
+    H = I._kernel_half_width("wsinc5")
+    offs = torch.arange(-(H - 1), H + 1)
+    xb, yb, zb = x.floor(), y.floor(), z.floor()
+    wx = I._wsinc5_kernel(x - xb)
+    wy = I._wsinc5_kernel(y - yb)
+    wz = I._wsinc5_kernel(z - zb)
+    xi = (xb.long()[:, None] + offs).clamp(0, 15)
+    yi = (yb.long()[:, None] + offs).clamp(0, 15)
+    zi = (zb.long()[:, None] + offs).clamp(0, 15)
+    eager = I._gather_contract(vol, xi, yi, zi, wx, wy, wz)
+    comp = compiled(vol, xi, yi, zi, wx, wy, wz)
+    assert torch.allclose(eager, comp, atol=1e-5), (eager - comp).abs().max()
+
+
 def test_resample_all_out_of_bounds_returns_zero():
     vol = torch.rand(8, 8, 8)
     x = torch.tensor([-5.0, 20.0])
