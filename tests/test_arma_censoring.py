@@ -7,6 +7,8 @@ Two distinct concepts (see build_censor_run_info):
   weakened by the true time gap (lag-2 instead of lag-1 for the flanking pair).
 """
 
+import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.glm.arma import (
@@ -14,6 +16,7 @@ from fastfuncstuff.glm.arma import (
     build_arma11_covariance_batch,
     build_censor_run_info,
 )
+from fastfuncstuff.io.afni import read_censor_1d
 
 DEVICE = torch.device("cpu")
 
@@ -88,6 +91,28 @@ class TestBuildCensorRunInfo:
         assert starts == [0, 4]
         # tau = within-run original index. Run0: [0,1,3,4]; run1: [0,1,3,4].
         assert tau.tolist() == [0, 1, 3, 4, 0, 1, 3, 4]
+
+    def test_censor_1d_to_good_list(self, tmp_path):
+        # AFNI censor format: one row per concatenated TR, 1=keep, 0=censor.
+        mask = np.ones(10)
+        mask[[2, 7]] = 0
+        f = tmp_path / "censor.1D"
+        np.savetxt(f, mask, fmt="%d")
+        good = read_censor_1d(f)
+        assert good == [0, 1, 3, 4, 5, 6, 8, 9]
+
+    def test_censor_1d_length_validation(self, tmp_path):
+        f = tmp_path / "censor.1D"
+        np.savetxt(f, np.ones(10), fmt="%d")
+        read_censor_1d(f, n_expected=10)  # ok
+        with pytest.raises(ValueError, match="one row per"):
+            read_censor_1d(f, n_expected=12)
+
+    def test_censor_1d_rejects_non_binary(self, tmp_path):
+        f = tmp_path / "censor.1D"
+        np.savetxt(f, np.array([1, 0, 2, 1]), fmt="%d")
+        with pytest.raises(ValueError, match="only 0 and 1"):
+            read_censor_1d(f)
 
     def test_helper_drives_block_diagonal_with_censoring(self):
         """End-to-end: helper output must give exact block-diagonal R with

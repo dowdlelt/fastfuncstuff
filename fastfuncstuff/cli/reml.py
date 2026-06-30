@@ -565,6 +565,18 @@ Examples:
     )
     proc_opts.add_argument("-mask", help="Mask file to restrict analysis")
     proc_opts.add_argument(
+        "-censor",
+        metavar="FILE.1D",
+        help=(
+            "Censor file: one value per concatenated TR (1=keep, 0=censor), in "
+            "order across runs (e.g. 600 rows for 3×200-TR runs). Censored TRs "
+            "are dropped from data and design; the ARMA noise model steps across "
+            "each gap via tau (lag respects the true time distance), and run "
+            "boundaries stay a hard cut. Use with -onsets/-events; for -matrix "
+            "the xmat GoodList is honoured automatically (and -censor overrides)."
+        ),
+    )
+    proc_opts.add_argument(
         "-do_scale",
         action="store_true",
         help="Scale each voxel per run to mean=100 (percent signal change units). "
@@ -2223,6 +2235,7 @@ def main():
             want_dsort_nods=args.dsort_nods,
             slibase_files=args.slibase,
             slibase_files_sm=args.slibase_sm,
+            censor_file=args.censor,
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).

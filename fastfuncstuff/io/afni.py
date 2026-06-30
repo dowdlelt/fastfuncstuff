@@ -1280,6 +1280,59 @@ def select_regressors_by_group(
     return matrix[:, selected_cols]
 
 
+def read_censor_1d(
+    filepath: str | Path, n_expected: int | None = None
+) -> list[int]:
+    """Read an AFNI-style censor ``.1D`` file into a GoodList.
+
+    The file is one value per concatenated timepoint (length = total TRs across
+    all runs, in order): ``1`` = keep this TR, ``0`` = censor it. This is the
+    format ``3dDeconvolve``/``1d_tool.py`` write (e.g. ``-censor_motion`` output).
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the censor ``.1D`` (single column of 0/1).
+    n_expected : int, optional
+        Expected number of timepoints (total concatenated length). If given and
+        the file length differs, a ValueError is raised — a length mismatch
+        almost always means the censor file does not match the data/design.
+
+    Returns
+    -------
+    good_list : list[int]
+        Indices (0-based, into the concatenated timeline) of the kept TRs — the
+        same convention as the xmat ``GoodList`` header, so it can be dropped
+        straight into ``design_info["good_list"]``.
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"Censor file not found: {filepath}")
+
+    values = np.loadtxt(filepath).reshape(-1)
+    if values.ndim != 1:
+        raise ValueError(
+            f"Censor file {filepath} must be a single column; got shape "
+            f"{values.shape}"
+        )
+
+    uniq = set(np.unique(values).tolist())
+    if not uniq <= {0.0, 1.0}:
+        raise ValueError(
+            f"Censor file {filepath} must contain only 0 and 1; found "
+            f"values {sorted(uniq)}"
+        )
+
+    if n_expected is not None and len(values) != n_expected:
+        raise ValueError(
+            f"Censor file {filepath} has {len(values)} rows but the data/design "
+            f"has {n_expected} timepoints. The censor file must have one row per "
+            f"concatenated TR."
+        )
+
+    return np.nonzero(values > 0.5)[0].tolist()
+
+
 def get_censored_mask(design_info: dict) -> np.ndarray:
     """
     Get boolean mask indicating which timepoints were censored

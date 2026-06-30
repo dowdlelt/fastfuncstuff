@@ -400,6 +400,7 @@ def analyze_from_design_matrix(
     want_dsort_nods: bool = False,
     slibase_files: list[str | Path] | None = None,
     slibase_files_sm: list[str | Path] | None = None,
+    censor_file: str | Path | None = None,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -864,6 +865,15 @@ def analyze_from_design_matrix(
         else design_info.get("run_starts", None)
     )
     arma_tau = None
+    # An explicit -censor .1D overrides any xmat GoodList: 1=keep, 0=censor, one
+    # row per concatenated TR. This is how censoring reaches the -onsets/-events
+    # paths, whose in-CLI design_info has no GoodList header.
+    if censor_file is not None:
+        from fastfuncstuff.io.afni import read_censor_1d
+
+        n_expected = design_info.get("n_timepoints") or design.shape[0]
+        design_info["good_list"] = read_censor_1d(censor_file, n_expected=n_expected)
+
     good_list = design_info.get("good_list")
     # NRowFull (full, pre-censor TR count) is the reference length. AFNI xmats
     # store all rows; some pipelines pre-subset to good rows only — handle both
