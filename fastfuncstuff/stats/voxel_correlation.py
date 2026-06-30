@@ -68,6 +68,31 @@ def analytic_r_null(n_timepoints: int) -> dict[str, float]:
     }
 
 
+def voxel_corr_strength(
+    ts: torch.Tensor, *, block_size: int | None = None, eps: float = 1e-12
+) -> torch.Tensor:
+    """Per-voxel mean |r| to all other voxels (streamed, never forms V×V).
+
+    A scalar "how correlated is this voxel with the rest" score, used to pick the
+    danger zone — voxels carrying shared structure in the *input* are exactly the
+    pairs NORDIC over-removal would corrupt. Constant voxels score 0.
+    """
+    device = ts.device
+    x = ts.to(torch.float32)
+    x = x - x.mean(dim=1, keepdim=True)
+    norm = x.pow(2).sum(dim=1, keepdim=True).sqrt()
+    xn = x / norm.clamp(min=eps)
+    v = xn.shape[0]
+    acc = torch.zeros(v, dtype=torch.float32, device=device)
+    if block_size is None:
+        block_size = _row_block_size(v, device)
+    for r0 in range(0, v, block_size):
+        r1 = min(r0 + block_size, v)
+        c = (xn[r0:r1] @ xn.T).abs()  # (b, V)
+        acc[r0:r1] = c.sum(dim=1) - 1.0  # drop self (|r|=1)
+    return (acc / max(1, v - 1)).where(norm.squeeze(1) > eps, torch.zeros_like(acc))
+
+
 def _row_block_size(n_voxels: int, device: torch.device, safety: float = 0.4) -> int:
     """Rows of the ``(block, V)`` correlation tile that fit the memory budget.
 

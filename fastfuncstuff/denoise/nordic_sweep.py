@@ -37,6 +37,7 @@ from fastfuncstuff.stats.voxel_correlation import (
     CorrSummary,
     analytic_r_null,
     corr_histogram_distance,
+    voxel_corr_strength,
 )
 from fastfuncstuff.utils import get_device
 
@@ -183,26 +184,21 @@ def _build_masks(
     device: torch.device,
     verbose: bool,
 ) -> dict[str, torch.Tensor]:
-    """Flat boolean voxel masks: in-brain automask, out-of-brain, whole image."""
+    """Flat boolean voxel masks: in-brain automask, whole image. (top_pairs is
+    derived separately from the input correlation in run_nordic_factor_sweep.)"""
     nx, ny, nz, _ = shape
     masks: dict[str, torch.Tensor] = {}
-    brain: torch.Tensor | None = None
-    if "in_brain" in which or "out_brain" in which:
+    if "in_brain" in which or "top_pairs" in which:
         try:
             from fastfuncstuff.processing.mask import automask
 
             mag = np.abs(load_nifti(magnitude_file).get_fdata(dtype=np.float32))
             mag = mag.mean(-1) if mag.ndim == 4 else mag  # (nx, ny, nz)
             bm = automask(torch.from_numpy(mag).float(), dilate_extra=2, verbose=False)
-            brain = bm.to(torch.bool).reshape(-1).to(device)
+            masks["in_brain"] = bm.to(torch.bool).reshape(-1).to(device)
         except Exception as exc:  # noqa: BLE001 — diagnostic is best-effort
             if verbose:
                 print(f"  factor-sweep: automask failed ({exc}); using whole image only.")
-            brain = None
-    if "in_brain" in which and brain is not None:
-        masks["in_brain"] = brain
-    if "out_brain" in which and brain is not None:
-        masks["out_brain"] = ~brain
     if "whole" in which:
         masks["whole"] = torch.ones(nx * ny * nz, dtype=torch.bool, device=device)
     return masks
@@ -279,6 +275,26 @@ def run_nordic_factor_sweep(
         idx = torch.nonzero(mflat, as_tuple=False).squeeze(1)
         idx = _subsample_mask(idx, cfg.factor_sweep_max_voxels, seed=hash(name) & 0xFFFF)
         mask_idx[name] = idx
+
+    # top_pairs: the danger zone. Rank in-brain (else whole) voxels by their
+    # correlation strength in the *input* (pre-denoise, noise vols already trimmed),
+    # keep the top fraction — these are the shared-structure voxels whose pairs
+    # over-removal would corrupt. Inserted between in_brain and whole.
+    if "top_pairs" in cfg.factor_sweep_masks:
+        base = mask_idx.get("in_brain")
+        if base is None:
+            base = torch.arange(nx * ny * nz, device=dev)
+        strength = voxel_corr_strength(data.reshape(-1, nt)[base].abs())
+        k = min(base.numel(), max(2, int(round(cfg.factor_sweep_top_frac * base.numel()))))
+        if cfg.factor_sweep_max_voxels:
+            k = min(k, cfg.factor_sweep_max_voxels)
+        top = base[torch.topk(strength, k).indices]
+        mask_idx = {
+            "in_brain": mask_idx.get("in_brain"),
+            "top_pairs": top,
+            "whole": mask_idx.get("whole"),
+        }
+        mask_idx = {n: i for n, i in mask_idx.items() if i is not None}
 
     null = analytic_r_null(nt)
     results: dict[str, dict] = {name: {} for name in mask_idx}
@@ -454,7 +470,7 @@ def _make_plots(
     import matplotlib.pyplot as plt
 
     masks = summary["masks"]
-    colors = {"in_brain": "C0", "out_brain": "C1", "whole": "C2"}
+    colors = {"in_brain": "C0", "top_pairs": "C3", "whole": "C2"}
 
     # Null reported in the titles (text), not as an in-plot line: the residual
     # |r| hugs the null, so a null axhline sits right on the data and flattens the
@@ -485,8 +501,9 @@ def _make_plots(
     fig1.savefig(p1, dpi=120)
     plt.close(fig1)
 
-    # Fig 2: distributions — signed-r histogram + correlation-vs-distance, in-brain.
-    name = "in_brain" if "in_brain" in results else next(iter(results))
+    # Fig 2: distributions — signed-r histogram + correlation-vs-distance. Prefer
+    # top_pairs (the danger zone) so we zoom into where over-removal shows first.
+    name = next((m for m in ("top_pairs", "in_brain") if m in results), next(iter(results)))
     byf = results[name]
     cmap = plt.get_cmap("viridis")
     fig2, ax2 = plt.subplots(1, 2, figsize=(11, 4.2))

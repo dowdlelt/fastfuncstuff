@@ -100,8 +100,12 @@ class NordicConfig:
     # timepoint null. Off by default; zero cost unless requested.
     factor_sweep: bool = False
     factor_sweep_values: tuple[float, ...] | None = None  # None -> _default_factors()
-    factor_sweep_masks: tuple[str, ...] = ("in_brain", "out_brain", "whole")
+    # Masks: in_brain (automask), top_pairs (highest input-correlation voxels —
+    # the danger zone where over-removal would corrupt real shared structure),
+    # whole. top_pairs takes the top factor_sweep_top_frac of in-brain voxels.
+    factor_sweep_masks: tuple[str, ...] = ("in_brain", "top_pairs", "whole")
     factor_sweep_max_voxels: int | None = 40000  # per-mask cap (None = all voxels)
+    factor_sweep_top_frac: float = 0.30  # top_pairs: fraction of in-brain voxels kept
     factor_sweep_dist_bins: int = 24
     factor_sweep_r_bins: int = 201
 
