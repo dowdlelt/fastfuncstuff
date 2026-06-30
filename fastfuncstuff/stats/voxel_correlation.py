@@ -44,6 +44,11 @@ class CorrSummary:
     dist_mean_r: torch.Tensor  # (ndist,) mean signed r per distance bin
     dist_mean_abs_r: torch.Tensor  # (ndist,) mean |r| per distance bin
     dist_count: torch.Tensor  # (ndist,) pair count per distance bin
+    # Pearson r between this matrix's upper triangle and a reference matrix's
+    # (same voxels) — "does the residual share the input's global correlation
+    # structure". None unless ``ref_ts`` was given. Rises as over-removal drags
+    # input structure into the residual, even when the histogram barely moves.
+    struct_corr_to_ref: float | None = None
 
 
 def analytic_r_null(n_timepoints: int) -> dict[str, float]:
@@ -115,6 +120,7 @@ def corr_histogram_distance(
     dist_edges: torch.Tensor | None = None,
     n_dist_bins: int = 24,
     block_size: int | None = None,
+    ref_ts: torch.Tensor | None = None,
     eps: float = 1e-12,
 ) -> CorrSummary:
     """Histogram + distance profile of the voxel-to-voxel correlation matrix.
@@ -156,6 +162,14 @@ def corr_histogram_distance(
     if v < 2:
         raise ValueError(f"need >= 2 non-constant voxels to correlate, got {v}")
 
+    # Reference (input) timeseries, normalized over the SAME retained voxels, so
+    # its upper triangle pairs line up with the residual's for the structure r.
+    xr: torch.Tensor | None = None
+    if ref_ts is not None:
+        rr = ref_ts.to(torch.float32)
+        rr = rr - rr.mean(dim=1, keepdim=True)
+        xr = (rr / rr.pow(2).sum(dim=1, keepdim=True).sqrt().clamp(min=eps))[valid]
+
     # Distance bin edges from the bounding-box diagonal if not supplied.
     if dist_edges is None:
         extent = coords.amax(dim=0) - coords.amin(dim=0)
@@ -178,6 +192,7 @@ def corr_histogram_distance(
     dist_sum_abs = torch.zeros(n_dist, dtype=acc_dtype, device=device)
     dist_count = torch.zeros(n_dist, dtype=acc_dtype, device=device)
     tot = torch.zeros(4, dtype=acc_dtype, device=device)  # n, sum_r, sum_abs, sum_r2
+    jmom = torch.zeros(6, dtype=acc_dtype, device=device)  # n, Sx, Sy, Sxx, Syy, Sxy (vs ref)
 
     coord_sq = (coords**2).sum(dim=1)  # (V,)
     arange_v = torch.arange(v, device=device)
@@ -207,6 +222,23 @@ def corr_histogram_distance(
         cv = c[keep]  # (P,) selected correlations
         av = cv.abs()
         dv = dist[keep]
+
+        # Joint moments of (residual r, input r) over the same upper-triangle pairs,
+        # for the structure-similarity Pearson at the end (one extra input GEMM).
+        if xr is not None:
+            yv = (xr[r0:r1] @ xr.T).clamp(-1.0, 1.0)[keep].to(acc_dtype)
+            xv = cv.to(acc_dtype)
+            jmom += torch.stack(
+                [
+                    torch.tensor(float(cv.numel()), dtype=acc_dtype, device=device),
+                    xv.sum(),
+                    yv.sum(),
+                    (xv * xv).sum(),
+                    (yv * yv).sum(),
+                    (xv * yv).sum(),
+                ]
+            )
+            del yv, xv
         del c, dist, keep
 
         # Histograms via bucketize+index_add (device-safe; avoids histc on MPS).
@@ -232,6 +264,12 @@ def corr_histogram_distance(
     var_r = max(0.0, float(tot[3]) / total_n - mean_r**2) if total_n else 0.0
     std_r = math.sqrt(var_r)
 
+    struct = None
+    if xr is not None:
+        jn, sx, sy, sxx, syy, sxy = (float(z) for z in jmom.cpu())
+        vx, vy = jn * sxx - sx * sx, jn * syy - sy * sy
+        struct = (jn * sxy - sx * sy) / math.sqrt(vx * vy) if vx > 0 and vy > 0 else 0.0
+
     r_hist = r_hist.cpu().double()
     abs_r_hist = abs_r_hist.cpu().double()
     median_r, q25, q75 = _hist_quantiles(r_hist, r_edges.cpu(), (0.5, 0.25, 0.75))
@@ -254,6 +292,7 @@ def corr_histogram_distance(
         dist_mean_r=(dist_sum_r / cnt).cpu(),
         dist_mean_abs_r=(dist_sum_abs / cnt).cpu(),
         dist_count=dist_count.cpu(),
+        struct_corr_to_ref=struct,
     )
 
 

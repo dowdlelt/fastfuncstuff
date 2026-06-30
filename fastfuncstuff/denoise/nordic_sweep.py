@@ -296,6 +296,12 @@ def run_nordic_factor_sweep(
         }
         mask_idx = {n: i for n, i in mask_idx.items() if i is not None}
 
+    # Input (non-denoised) in-brain magnitude — fixed across factors. The residual
+    # correlation structure is compared to this each factor (struct_corr_to_ref);
+    # in-brain only (the global structure of interest, and one extra GEMM there).
+    data_flat = data.reshape(-1, nt)
+    ref_in_brain = data_flat[mask_idx["in_brain"]].abs() if "in_brain" in mask_idx else None
+
     null = analytic_r_null(nt)
     results: dict[str, dict] = {name: {} for name in mask_idx}
 
@@ -309,6 +315,7 @@ def run_nordic_factor_sweep(
                 coords_flat[idx],
                 cfg.factor_sweep_r_bins,
                 cfg.factor_sweep_dist_bins,
+                ref_ts=ref_in_brain if name == "in_brain" else None,
             )
         del resid_flat
 
@@ -321,7 +328,11 @@ def run_nordic_factor_sweep(
 
 
 def _corr_or_none(
-    ts: torch.Tensor, coords: torch.Tensor, r_bins: int, n_dist_bins: int
+    ts: torch.Tensor,
+    coords: torch.Tensor,
+    r_bins: int,
+    n_dist_bins: int,
+    ref_ts: torch.Tensor | None = None,
 ) -> CorrSummary | None:
     """Correlation summary, or None when the residual is degenerate.
 
@@ -334,7 +345,9 @@ def _corr_or_none(
     if ts.shape[0] < 2:
         return None
     try:
-        return corr_histogram_distance(ts, coords, r_bins=r_bins, n_dist_bins=n_dist_bins)
+        return corr_histogram_distance(
+            ts, coords, r_bins=r_bins, n_dist_bins=n_dist_bins, ref_ts=ref_ts
+        )
     except ValueError:
         return None
 
@@ -356,7 +369,8 @@ def _assemble_summary(
     nan = float("nan")
 
     def _g(s: CorrSummary | None, attr: str) -> float:
-        return nan if s is None else float(getattr(s, attr))
+        v = nan if s is None else getattr(s, attr)
+        return nan if v is None else float(v)
 
     per_mask: dict[str, dict] = {}
     for name, byf in results.items():
@@ -368,6 +382,7 @@ def _assemble_summary(
             "std_r": [_g(byf[f], "std_r") for f in factors],
             "n_voxels": [0 if byf[f] is None else byf[f].n_voxels for f in factors],
             "near_minus_far_abs_r": [_near_minus_far(byf[f]) for f in factors],
+            "struct_corr_to_input": [_g(byf[f], "struct_corr_to_ref") for f in factors],
         }
     summary = {
         "magnitude": None,
@@ -442,14 +457,16 @@ def _write_outputs(
     tsv_path = out_dir / f"{stem}_factorsweep.tsv"
     with open(tsv_path, "w", encoding="utf-8") as fh:
         fh.write(
-            "mask\tfactor\tmean_r\tmean_abs_r\tmedian_r\tstd_r\tnear_minus_far_abs_r\tn_voxels\n"
+            "mask\tfactor\tmean_r\tmean_abs_r\tmedian_r\tstd_r\t"
+            "near_minus_far_abs_r\tstruct_corr_to_input\tn_voxels\n"
         )
         for name, d in summary["masks"].items():
             for i, f in enumerate(d["factor"]):
                 fh.write(
                     f"{name}\t{f}\t{d['mean_r'][i]:.6f}\t{d['mean_abs_r'][i]:.6f}\t"
                     f"{d['median_r'][i]:.6f}\t{d['std_r'][i]:.6f}\t"
-                    f"{d['near_minus_far_abs_r'][i]:.6f}\t{d['n_voxels'][i]}\n"
+                    f"{d['near_minus_far_abs_r'][i]:.6f}\t{d['struct_corr_to_input'][i]:.6f}\t"
+                    f"{d['n_voxels'][i]}\n"
                 )
 
     fig_paths = _make_plots(summary, results, factors, null, out_dir, stem)
@@ -478,7 +495,7 @@ def _make_plots(
     nv = null["mean_abs_r"]
 
     # Fig 1: summary vs factor (the asymptote-then-liftoff curve).
-    fig1, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    fig1, axes = plt.subplots(1, 3, figsize=(15.5, 4.2))
     for name, d in masks.items():
         c = colors.get(name, None)
         axes[0].plot(d["factor"], d["mean_abs_r"], "-o", color=c, label=name)
@@ -496,6 +513,18 @@ def _make_plots(
         title="Distance interaction vs factor  (null = 0)",
     )
     axes[1].legend(fontsize=8)
+    # Panel 3: how much the in-brain residual's pairwise-correlation structure
+    # resembles the input's (one number per factor). Rises as over-removal drags
+    # global structure into the residual — a whole-matrix effect the histogram dilutes.
+    ib = masks.get("in_brain")
+    if ib is not None:
+        axes[2].plot(ib["factor"], ib["struct_corr_to_input"], "-o", color=colors["in_brain"])
+    axes[2].axhline(0.0, ls="--", color="k", lw=1)
+    axes[2].set(
+        xlabel="factor_error",
+        ylabel="Pearson r (residual △ vs input △)",
+        title="Residual-vs-input structure (in_brain)",
+    )
     fig1.tight_layout()
     p1 = out_dir / f"{stem}_factorsweep_summary.png"
     fig1.savefig(p1, dpi=120)
