@@ -64,16 +64,19 @@ into the RSS term, so only the correlation matrix appears in the logdets.
 ## 3. Default Grid (AFNI "Grid 3" — Medium Resolution)
 
 ```python
-a ∈ [0.0, 0.9]   in steps of 0.1  → 10 values
-b ∈ [-0.9, 0.9]  in steps of 0.1  → 19 values
+a ∈ [0.0, 0.8]   in steps of 0.1  → 9 values   (MAXa = 0.8)
+b ∈ [-0.8, 0.8]  in steps of 0.1  → 17 values  (MAXb = 0.8)
 ```
 
-After filtering by validity constraints, typically ~117–130 grid points survive.
-The point `(a=0, b=0)` (white noise) is always guaranteed to be in the grid.
+This is 9 × 17 = 153 raw pairs; after the validity constraints (`|a|<1`,
+`|b|<1`, `γ(0)>0`, `λ ≥ 0`) roughly half survive — the λ ≥ 0 filter removes the
+high-b / low-a anticorrelated corner. The point `(a=0, b=0)` (white noise) is
+always guaranteed to be in the grid.
 
-**AFNI's actual grid:** 3dREMLfit uses an identical grid by default (its "Grid 3").
-The grid can be extended with `-Grid <n>` in AFNI (denser), or via `--a-grid`
-and `--b-grid` in `ffs_reml`.
+**AFNI's actual grid:** 3dREMLfit uses an identical grid by default (its "Grid 3":
+`na = 1<<3 = 8` intervals on a, `nb = 1<<4 = 16` intervals on b, MAXa = MAXb =
+0.8 — see remla.c:1250-1258). The grid can be extended with `-Grid <n>` in AFNI
+(denser), or via `-a_grid` / `-b_grid` in `ffs_reml`.
 
 ---
 
@@ -293,7 +296,9 @@ have SCENE_DATA[1]=11 (fbuc) and TYPESTRING=3DIM_HEAD_FUNC set by
 
 | Feature | 3dREMLfit | ffs_reml |
 |---------|-----------|----------|
-| Grid | Grid 3: a∈[0,.9]×10, b∈[-.9,.9]×19 | Same default; configurable |
+| Grid | Grid 3: a∈[0,.8]×9, b∈[-.8,.8]×17 | Same default; configurable |
+| Covariance R | Banded (corcut=1e-4 truncation) | Exact dense Toeplitz (banded under `-afni_mode`) |
+| Within-run censoring | tau[] lag = TAU(i)−TAU(j) | tau-based (matches); see [[censoring]] |
 | Grid search | Hierarchical descent per voxel (sequential) | GPU: exhaustive batch; CPU: hierarchical |
 | Likelihood | log\|R\| + log\|X'R⁻¹X\| + (N-p)log(RSS_w) | Identical |
 | Whitening | Cholesky solve (DPOTRS-style) | L_inv GEMM (equivalent, avoids DLASWP) |
@@ -304,34 +309,45 @@ have SCENE_DATA[1]=11 (fbuc) and TYPESTRING=3DIM_HEAD_FUNC set by
 | GLS solve | Sequential per voxel | Batched by (a,b) group |
 | σ̂² accumulation | float64 | float64 (explicit cast before `.pow(2).sum()`) |
 
-### Potential Sources of Divergence from AFNI
+### Deliberate Divergences (FFS is at least as accurate; `-afni_mode` reverts each)
 
-1. **Float32 default:** `ffs_reml` uses float32 by default. The logdet
-   computations and RSS can differ from AFNI's float64. Use `-use_double`
-   for closest match. The `+1e-10` guards in logdet are float32-scale.
+These are intentional — FFS defaults to the more accurate choice and exposes a
+single `-afni_mode` flag for byte-for-byte AFNI parity when validating.
 
-2. **Grid search path (CPU):** The hierarchical descent uses window narrowing
-   that may miss the true global minimum on non-smooth likelihood surfaces.
-   The GPU exhaustive search avoids this, but if running on CPU you may get
-   a slightly different (a,b) per voxel than AFNI even with the same grid.
+1. **Dense vs banded R (the big one).** AFNI truncates the covariance to a band
+   of `bmax` off-diagonals so the last kept correlation is ~`corcut` (1e-4):
+   `bmax = 1 + ceil(log(corcut/|λ|)/log|a|)` (remla.c:692). FFS builds the
+   **exact** dense Toeplitz — the true ARMA(1,1) covariance. On near-white
+   (flat-likelihood) voxels the two R matrices give slightly different logdet(R)
+   and prewhitening, so adjacent grid points can flip. `-afni_mode` switches FFS
+   to the banded R for parity.
 
-3. **λ ≥ 0 filtering:** Both apply this, but floating-point equality on the
-   boundary may differ slightly. Check if any voxels have λ values near 0.
+2. **Hierarchical search top level (`ltop`).** AFNI sets
+   `ltop = min(log2(na), log2(nb)) − 2` on *interval* counts (remla.c:1444); for
+   the default grid that is `ltop = 1`. FFS defaults to one coarser level (an
+   extra `dab` pass) — strictly more thorough, never misses an AFNI minimum, but
+   may find a better one on flat surfaces. `-afni_mode` restores AFNI's `ltop`.
 
-4. **The `+1e-10` logdet guard:** If L has near-zero diagonal elements (near-
-   singular R), our logdet estimate is biased slightly. AFNI uses different
-   regularization. This should not matter for valid (a,b) pairs.
+3. **corcut grid filter.** AFNI drops grid points with `0 < λ < corcut`, folding
+   those near-white cases into the `a=b=0` point (remla.c:1355). FFS keeps them
+   by default; `-afni_mode` applies the filter.
 
-5. **Covariance matrix construction:** We build the Toeplitz matrix explicitly
-   as a dense matrix. AFNI uses the same structure but may handle edge cases
-   (short runs, boundary effects) slightly differently.
+### Other (non-toggled) sources of small numerical difference
 
-6. **Design matrix handling:** AFNI normalizes the design matrix before the
-   REML search. Check whether your design matrix is scaled comparably.
+- **Float32 default:** logdet/RSS differ from AFNI's float64. Use `-use_double`
+  for the closest match; the `+1e-10` logdet guards are float32-scale.
+- **λ ≥ 0 boundary:** both filter `λ ≥ 0`, but float equality at the boundary
+  can differ for voxels with λ ≈ 0.
+- **Design normalization / polort:** AFNI generates polynomials and normalizes
+  the design internally; `ffs_reml` reads an external `.xmat.1D`. Verify the
+  polynomial basis and scaling match what AFNI would generate.
 
-7. **Polort handling:** AFNI generates polynomial regressors directly as
-   part of its design. `ffs_reml` reads an external `.xmat.1D` file. Verify
-   that the polynomial basis in the file matches what AFNI would generate.
+### Faithful (matches AFNI by construction)
+
+- **Within-run censoring:** FFS now indexes correlation by `|tau[i]−tau[j]|`
+  (AFNI's tau[] mechanism), so censored timepoints leave a hole the correlation
+  steps across (lag-2, not lag-1). Run boundaries stay a hard cut. Previously
+  FFS ignored within-run censoring; this is fixed and **not** behind `-afni_mode`.
 
 ---
 

@@ -499,6 +499,19 @@ Examples:
         ),
     )
     arma_opts.add_argument(
+        "-afni_mode",
+        "-afni-mode",
+        action="store_true",
+        help=(
+            "Match AFNI 3dREMLfit byte-for-byte on the small (a,b) divergences "
+            "instead of FFS's more-accurate defaults. Switches three things to "
+            "AFNI's choices: banded covariance (corcut=1e-4 truncation) instead "
+            "of the exact dense Toeplitz; the coarser hierarchical search top "
+            "level; and dropping near-white grid points (0<lam<corcut). "
+            "Default OFF — FFS is at least as accurate. Use only for AFNI parity."
+        ),
+    )
+    arma_opts.add_argument(
         "-grid_batching",
         action="store_true",
         help=(
@@ -930,6 +943,13 @@ def main():
     if not filtered_argv:
         parser.print_help()
         sys.exit(0)
+
+    # -afni_mode: switch the REML noise model to AFNI-faithful behaviour for the
+    # whole run (banded R, AFNI ltop, corcut grid filter). Default is FFS-accurate.
+    if getattr(args, "afni_mode", False):
+        from fastfuncstuff.glm.arma import set_afni_mode
+
+        set_afni_mode(True)
 
     # Validate design input: exactly one of -matrix, -onsets, -events, -spec.
     _design_sources = [

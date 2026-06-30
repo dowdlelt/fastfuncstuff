@@ -36,6 +36,59 @@ from fastfuncstuff.memory import make_vram_debugger, bytes_per_voxel_arma
 from .xval import compute_r2_metric
 
 
+class _RemlMode:
+    """Run-wide REML mode, mirroring AFNI's ``static double corcut`` global.
+
+    By default FFS builds the *exact* dense ARMA(1,1) covariance and runs a
+    slightly more thorough hierarchical search than 3dREMLfit — more accurate,
+    but not byte-for-byte identical to AFNI. Enabling ``afni_faithful`` switches
+    the small divergences to AFNI's choices for parity validation:
+
+    - **Banded R**: truncate the covariance to AFNI's ``bmax`` off-diagonals,
+      where the last kept correlation is ~``corcut`` (remla.c:692).
+    - **Grid filter**: drop grid points with ``0 < lam < corcut`` — AFNI folds
+      these near-white cases into the ``a=b=0`` point (remla.c:1355).
+    - **Hierarchical ``ltop``**: use AFNI's coarser top level
+      (``min(log2(na), log2(nb)) - 2`` on *interval* counts; remla.c:1444).
+
+    This is a module-level singleton on purpose: corcut/mode are constants for a
+    whole run, exactly as in the C reference. Set via :func:`set_afni_mode`.
+    """
+
+    afni_faithful: bool = False
+    corcut: float = 1e-4  # CORCUT_default, remla.c:238
+
+
+_REML_MODE = _RemlMode()
+
+
+def set_afni_mode(enabled: bool, corcut: float = 1e-4) -> None:
+    """Toggle AFNI-faithful REML behaviour for the rest of the run.
+
+    See :class:`_RemlMode`. The CLI wires this from ``-afni_mode``; the default
+    (``enabled=False``) keeps FFS's more-accurate dense covariance and search.
+    """
+    _REML_MODE.afni_faithful = bool(enabled)
+    _REML_MODE.corcut = float(corcut)
+
+
+def _afni_bmax(a: float, lam: float, corcut: float) -> int:
+    """AFNI's banded bandwidth: last kept off-diagonal correlation ~= corcut.
+
+    Mirrors rcmat_arma11 (remla.c:687-699). ``rho`` (=a) is clamped to ±0.9 as
+    in the C source. Returns 0 for the identity (near-white) case.
+    """
+    rho = min(0.9, max(-0.9, a))
+    alam = abs(lam)
+    if alam < corcut:
+        return 0
+    if rho == 0.0:
+        return 1  # pure MA(1)
+    import math
+
+    return 1 + int(math.ceil(math.log(corcut / alam) / math.log(abs(rho))))
+
+
 def _debug_memory_snapshot(
     label: str, device: torch.device, tensors: dict[str, torch.Tensor] | None = None
 ) -> None:
@@ -833,6 +886,11 @@ def build_arma11_covariance(
     if rho1 < 0:
         return None
 
+    # AFNI-faithful grid filter: near-white points (0 < lam < corcut) are folded
+    # into the a=b=0 case, not evaluated separately (remla.c:1355).
+    if _REML_MODE.afni_faithful and 0 < rho1 < _REML_MODE.corcut:
+        return None
+
     # Lag = |tau[i] - tau[j]|. With tau=None this is the plain |i-j| Toeplitz;
     # with censoring tau carries the true time index so survivors flanking a
     # censored TR sit at their real distance (lag-2, not lag-1).
@@ -854,6 +912,16 @@ def build_arma11_covariance(
             corr[2:] = rho1 * powers
 
     R = corr[distance]
+
+    # AFNI-faithful banded R: keep only the nearest bmax off-diagonals, so the
+    # truncated correlation is ~corcut (remla.c:692). FFS default keeps the exact
+    # dense Toeplitz, which is the true ARMA(1,1) covariance.
+    if _REML_MODE.afni_faithful and rho1 > 0:
+        bmax = _afni_bmax(a, rho1, _REML_MODE.corcut)
+        if bmax == 0:
+            R = torch.eye(n, device=device, dtype=dtype)
+        else:
+            R = R * (distance <= bmax).to(dtype=dtype)
 
     # Block-diagonal across run boundaries (AFNI behaviour for concatenated runs)
     if run_starts is not None:
@@ -960,6 +1028,10 @@ def build_arma11_covariance_batch(
     # AFNI constraint: Only allow lambda >= 0 (unless -NEGcor is used)
     # Lambda=0 is valid (uncorrelated noise case)
     lambda_mask = rho1_valid >= 0
+    # AFNI-faithful grid filter: drop near-white points (0 < lam < corcut), which
+    # AFNI folds into the a=b=0 case (remla.c:1355). lam==0 is kept.
+    if _REML_MODE.afni_faithful:
+        lambda_mask &= (rho1_valid == 0) | (rho1_valid >= _REML_MODE.corcut)
     a_valid = a_valid[lambda_mask]
     b_valid = b_valid[lambda_mask]
     rho1_valid = rho1_valid[lambda_mask]
@@ -997,6 +1069,19 @@ def build_arma11_covariance_batch(
     # Broadcast: corr is (n_valid, max_lag+1), distance is (n, n)
     # Result: (n_valid, n, n) - all covariance matrices at once!
     R_batch = corr[:, distance]
+
+    # AFNI-faithful banded R: per-(a,b) bmax truncation (remla.c:692). Each matrix
+    # keeps only its own nearest bmax off-diagonals; the default keeps dense R.
+    if _REML_MODE.afni_faithful:
+        bmax = torch.tensor(
+            [_afni_bmax(a.item(), lam.item(), _REML_MODE.corcut)
+             for a, lam in zip(a_valid, rho1_valid, strict=True)],
+            device=device, dtype=torch.long,
+        )  # (n_valid,)
+        # The diagonal (distance 0) is always kept by `<=`, so bmax==0 correctly
+        # yields the identity (near-white) matrix.
+        band = distance.unsqueeze(0) <= bmax.view(-1, 1, 1)  # (n_valid, n, n)
+        R_batch = R_batch * band.to(dtype=dtype)
 
     # Block-diagonal across run boundaries (AFNI behaviour for concatenated runs)
     if run_starts is not None:
@@ -2291,9 +2376,17 @@ def search_voxels_precomputed_grid_hierarchical(
     best_b_idx = torch.full((n_voxels_batch,), zero_b_idx, dtype=torch.long, device=device)
     best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device, dtype=_dtype)
 
-    # Power-of-2 descent setup. ltop chosen so the coarsest step covers
-    # the grid: AFNI uses ltop = log2(min(na+1, nb+1)) - 2.
-    ltop = max(0, min(n_a, n_b).bit_length() - 2)
+    # Power-of-2 descent setup. AFNI computes ltop from *interval* counts:
+    # ltop = min(log2(na), log2(nb)) - 2 where na,nb are intervals = points-1
+    # (remla.c:1444). FFS defaults to one coarser top level (an extra dab pass) —
+    # strictly more thorough, never misses an AFNI minimum, but not byte-for-byte.
+    # -afni_mode restores AFNI's exact ltop for parity.
+    if _REML_MODE.afni_faithful:
+        pna = (n_a - 1).bit_length() - 1  # floor(log2(n_a - 1))
+        pnb = (n_b - 1).bit_length() - 1
+        ltop = max(0, min(pna, pnb) - 2)
+    else:
+        ltop = max(0, min(n_a, n_b).bit_length() - 2)
     levels = list(range(ltop, -1, -1))
 
     if verbose:
