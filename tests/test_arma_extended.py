@@ -31,6 +31,9 @@ from fastfuncstuff.glm.arma import (
     precompute_reml_grid,
     prewhiten_with_arma11,
     reml_grid_search,
+    search_voxels_precomputed_grid,
+    search_voxels_precomputed_grid_hierarchical,
+    select_arma_params_hierarchical_from_surface,
 )
 
 DEVICE = torch.device("cpu")
@@ -327,6 +330,82 @@ class TestPrecomputeRemlGrid:
             X, T, a_grid, b_grid, device=DEVICE, use_qr=True
         )
         assert len(grid) > 0
+
+
+class TestHierarchicalFromSurface:
+    """select_arma_params_hierarchical_from_surface must reproduce the
+    subset-GEMM hierarchical descent (the GPU-fast path that lets CUDA match
+    AFNI instead of taking the global grid argmin, which diverges along the
+    degenerate a≈b ridge).
+    """
+
+    @staticmethod
+    def _colored_voxels(seed, T=160, K=10, V=4000):
+        torch.manual_seed(seed)
+        X = torch.randn(T, K, device=DEVICE)
+        X[:, 0] = 1.0
+        e = torch.randn(V, T, device=DEVICE)
+        rho = torch.rand(V, 1, device=DEVICE) * 0.8  # per-voxel AR(1)
+        for t in range(1, T):
+            e[:, t : t + 1] = rho * e[:, t - 1 : t] + e[:, t : t + 1]
+        Y = torch.randn(V, K, device=DEVICE) @ X.T + e
+        a_grid = torch.linspace(0, 0.8, 9, device=DEVICE)
+        b_grid = torch.linspace(-0.8, 0.8, 17, device=DEVICE)
+        grid = precompute_reml_grid(X, T, a_grid, b_grid, device=DEVICE)
+        return X, Y, grid
+
+    @pytest.mark.parametrize("afni_faithful", [False, True])
+    def test_matches_subset_gemm_descent(self, afni_faithful):
+        from fastfuncstuff.glm.arma import _REML_MODE
+
+        prev = _REML_MODE.afni_faithful
+        _REML_MODE.afni_faithful = afni_faithful
+        try:
+            X, Y, grid = self._colored_voxels(seed=0)
+            bp_ref, bl_ref = search_voxels_precomputed_grid_hierarchical(
+                X, Y, grid, DEVICE
+            )
+            _, _, surface, plist = search_voxels_precomputed_grid(
+                X, Y, grid, DEVICE, return_profile=True
+            )
+            bp_surf, bl_surf = select_arma_params_hierarchical_from_surface(
+                surface, plist, DEVICE
+            )
+        finally:
+            _REML_MODE.afni_faithful = prev
+
+        # The two routes compute identical likelihoods up to float32 GEMM
+        # ordering; on the flat ridge that occasionally flips near-equal
+        # neighbours. Demand near-perfect agreement and negligible likelihood
+        # gaps where they differ (i.e. genuine ridge ties, never a wrong basin).
+        n = Y.shape[0]
+        differ = (bp_ref != bp_surf).any(dim=1)
+        assert int(differ.sum()) <= n // 500  # <0.2% wander on the ridge
+        assert float((bl_ref - bl_surf).abs().max()) < 1.0  # ~1e-3 in practice
+        # The selector never returns a worse optimum than the reference does.
+        assert torch.all(bl_surf <= bl_ref + 1e-2)
+
+    def test_zero_init_when_white_noise(self):
+        # White-noise data: the best (a,b) should sit at/near the (0,0) OLS
+        # init, and the selector must return valid in-grid parameters.
+        torch.manual_seed(3)
+        T, K, V = 120, 8, 200
+        X = torch.randn(T, K, device=DEVICE)
+        X[:, 0] = 1.0
+        Y = torch.randn(V, K, device=DEVICE) @ X.T + torch.randn(V, T, device=DEVICE)
+        a_grid = torch.linspace(0, 0.8, 9, device=DEVICE)
+        b_grid = torch.linspace(-0.8, 0.8, 17, device=DEVICE)
+        grid = precompute_reml_grid(X, T, a_grid, b_grid, device=DEVICE)
+        _, _, surface, plist = search_voxels_precomputed_grid(
+            X, Y, grid, DEVICE, return_profile=True
+        )
+        bp, bl = select_arma_params_hierarchical_from_surface(surface, plist, DEVICE)
+        assert bp.shape == (V, 2)
+        assert torch.isfinite(bl).all()
+        a_vals = {a for a, _ in plist}
+        b_vals = {b for _, b in plist}
+        assert all(float(a) in a_vals for a in bp[:, 0])
+        assert all(float(b) in b_vals for b in bp[:, 1])
 
 
 class TestARMA11Results:

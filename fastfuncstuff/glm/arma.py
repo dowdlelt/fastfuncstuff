@@ -2227,6 +2227,9 @@ def search_voxels_precomputed_grid(
 
     # Initialize results — match dtype of input data (important when use_double=True)
     _dtype = Y_batch.dtype
+    # float64 RSS accumulation guards the Pythagorean cancellation; MPS has no
+    # float64 so it keeps the input dtype there.
+    _acc_dtype = _dtype if device.type == "mps" else torch.float64
     best_params = torch.zeros(n_voxels_batch, 2, device=device, dtype=_dtype)
     best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device, dtype=_dtype)
 
@@ -2267,14 +2270,21 @@ def search_voxels_precomputed_grid(
             Y_w_batch = (L_inv @ Y_batch.T).T  # (n_voxels, n_timepoints)
 
         # Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²  (no betas, no residuals!)
+        # Accumulate in float64: for high-R² task voxels the two terms nearly
+        # cancel, and float32 cancellation corrupts the likelihood for exactly
+        # the voxels that drive the omnibus F.
         with profile_section("3_pythagorean_rss", enabled=enable_timing):
             Qt_Yw = Q.T @ Y_w_batch.T  # (n_reg, n_voxels)
-            rss_batch = Y_w_batch.pow(2).sum(dim=1) - Qt_Yw.pow(2).sum(dim=0)  # (n_voxels,)
+            rss_batch = Y_w_batch.pow(2).sum(dim=1, dtype=_acc_dtype) - Qt_Yw.pow(
+                2
+            ).sum(dim=0, dtype=_acc_dtype)  # (n_voxels,)
 
-        # Compute REML likelihood for this (a, b)
+        # Compute REML likelihood for this (a, b). rss is float64 (cancellation
+        # already handled); cast back to storage dtype — grid points differ by
+        # far more than float32 epsilon.
         with profile_section("4_compute_likelihood", enabled=enable_timing):
             term3 = (n_timepoints - n_regressors) * torch.log(rss_batch + 1e-10)
-            likelihoods = logdet_Rcorr + logdet_XwTXw + term3  # (n_voxels,)
+            likelihoods = (logdet_Rcorr + logdet_XwTXw + term3).to(_dtype)  # (n_voxels,)
 
         # Update best parameters where this (a, b) is better
         with profile_section("5_update_best", enabled=enable_timing):
@@ -2340,6 +2350,7 @@ def search_voxels_precomputed_grid_hierarchical(
     n_voxels_batch = Y_batch.shape[0]
     n_timepoints, n_regressors = X.shape
     _dtype = Y_batch.dtype
+    _acc_dtype = _dtype if device.type == "mps" else torch.float64
     T_minus_K = n_timepoints - n_regressors
 
     if Y_batch.device != device:
@@ -2420,8 +2431,14 @@ def search_voxels_precomputed_grid_hierarchical(
         Y_sub = Y_batch.index_select(0, active_idx)  # (n_active, T)
         Y_w = Y_sub @ L_inv.T                         # (n_active, T)
         Qt_Yw = Y_w @ Q                                # (n_active, K)
-        rss = Y_w.pow(2).sum(dim=1) - Qt_Yw.pow(2).sum(dim=1)  # (n_active,)
-        lik = logdet_Rcorr + logdet_XwTXw + T_minus_K * torch.log(rss + 1e-10)
+        # float64 accumulation — see search_voxels_precomputed_grid: the
+        # Pythagorean cancellation in float32 corrupts high-R² voxels.
+        rss = Y_w.pow(2).sum(dim=1, dtype=_acc_dtype) - Qt_Yw.pow(2).sum(
+            dim=1, dtype=_acc_dtype
+        )  # (n_active,)
+        lik = (logdet_Rcorr + logdet_XwTXw + T_minus_K * torch.log(rss + 1e-10)).to(
+            _dtype
+        )
 
         cur_best = best_likelihoods.index_select(0, active_idx)
         improve = lik < cur_best
@@ -2488,6 +2505,111 @@ def search_voxels_precomputed_grid_hierarchical(
     b_vals_t = torch.tensor(b_vals_sorted, dtype=_dtype, device=device)
     best_params = torch.stack([a_vals_t[best_a_idx], b_vals_t[best_b_idx]], dim=1)
     return best_params, best_likelihoods
+
+
+def select_arma_params_hierarchical_from_surface(
+    surface: torch.Tensor,
+    param_list: list[tuple[float, float]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AFNI's hierarchical (a,b) descent expressed as indexing on a precomputed
+    likelihood surface — no per-grid-point GEMMs.
+
+    ``search_voxels_precomputed_grid_hierarchical`` reproduces AFNI's
+    ``REML_find_best_case`` descent but pays for it with a sync-heavy storm of
+    small subset GEMMs (``.any()``/``.nonzero()`` per grid point), which is fine
+    on CPU but throttles CUDA. On GPU we already pay for the *full* surface
+    cheaply via the exhaustive batched GEMMs; this runs the identical power-of-2
+    descent as pure vectorised gather/argmin over that surface, so GPU keeps
+    exhaustive-grid speed while landing on AFNI's local optimum (not the global
+    grid argmin, which differs from AFNI along the degenerate a≈b ridge).
+
+    Parameters
+    ----------
+    surface : torch.Tensor, shape (n_voxels, n_pairs)
+        REML neg-log-likelihood per voxel per grid point; column k ↔ param_list[k].
+    param_list : list of (a, b)
+        Grid points in surface-column order (as returned by
+        ``search_voxels_precomputed_grid(return_profile=True)``).
+    device : torch.device
+
+    Returns
+    -------
+    best_params : torch.Tensor, shape (n_voxels, 2)
+    best_likelihoods : torch.Tensor, shape (n_voxels,)
+    """
+    _dtype = surface.dtype
+    n_voxels = surface.shape[0]
+
+    a_vals_sorted = sorted({a for (a, _) in param_list})
+    b_vals_sorted = sorted({b for (_, b) in param_list})
+    n_a, n_b = len(a_vals_sorted), len(b_vals_sorted)
+    a_to_i = {v: i for i, v in enumerate(a_vals_sorted)}
+    b_to_i = {v: i for i, v in enumerate(b_vals_sorted)}
+
+    # Scatter the (V, n_pairs) surface into a (V, n_a, n_b) lattice; grid points
+    # filtered out upstream (λ ≤ 0) stay +inf so argmin never selects them.
+    col_ai = torch.tensor(
+        [a_to_i[a] for (a, _) in param_list], device=device, dtype=torch.long
+    )
+    col_bi = torch.tensor(
+        [b_to_i[b] for (_, b) in param_list], device=device, dtype=torch.long
+    )
+    grid = torch.full((n_voxels, n_a, n_b), float("inf"), device=device, dtype=_dtype)
+    grid[:, col_ai, col_bi] = surface.to(device)
+
+    # ltop: same convention as search_voxels_precomputed_grid_hierarchical.
+    if _REML_MODE.afni_faithful:
+        pna = (n_a - 1).bit_length() - 1
+        pnb = (n_b - 1).bit_length() - 1
+        ltop = max(0, min(pna, pnb) - 2)
+    else:
+        ltop = max(0, min(n_a, n_b).bit_length() - 2)
+
+    zero_a_idx = next(i for i, v in enumerate(a_vals_sorted) if abs(v) < 1e-6)
+    zero_b_idx = next(i for i, v in enumerate(b_vals_sorted) if abs(v) < 1e-6)
+
+    vrange = torch.arange(n_voxels, device=device)
+    best_a = torch.full((n_voxels,), zero_a_idx, dtype=torch.long, device=device)
+    best_b = torch.full((n_voxels,), zero_b_idx, dtype=torch.long, device=device)
+    best_lik = grid[vrange, best_a, best_b].clone()  # OLS (0,0) init
+
+    # Tie-break must match search_voxels_precomputed_grid_hierarchical so the CPU
+    # and GPU paths land on the *same* point along the flat a≈b ridge: that
+    # function iterates b-outer/a-inner and keeps the first strict improvement,
+    # so we flatten candidates b-outer/a-inner and let argmin take the first min.
+    for lev in range(ltop, -1, -1):
+        step = 1 << lev
+        if lev == ltop:
+            # Coarsest pass: the fixed coarse lattice, identical for every voxel.
+            a_cand = torch.arange(0, n_a, step, device=device)
+            b_cand = torch.arange(0, n_b, step, device=device)
+            na_c = a_cand.numel()
+            sub = grid[:, a_cand][:, :, b_cand].transpose(1, 2)  # (V, Nb, Na)
+            mn, am = sub.reshape(n_voxels, -1).min(dim=1)
+            ai_sel = a_cand[am % na_c]
+            bi_sel = b_cand[am // na_c]
+        else:
+            # ±step window (3×3) around each voxel's current best.
+            offs = torch.tensor([-step, 0, step], device=device, dtype=torch.long)
+            a_cand = (best_a[:, None] + offs).clamp_(0, n_a - 1)  # (V, 3)
+            b_cand = (best_b[:, None] + offs).clamp_(0, n_b - 1)  # (V, 3)
+            vb = b_cand[:, :, None].expand(n_voxels, 3, 3)  # b outer
+            va = a_cand[:, None, :].expand(n_voxels, 3, 3)  # a inner
+            vi = vrange[:, None, None].expand(n_voxels, 3, 3)
+            sub = grid[vi, va, vb]  # (V, 3_b, 3_a)
+            mn, am = sub.reshape(n_voxels, -1).min(dim=1)
+            ai_sel = a_cand[vrange, am % 3]
+            bi_sel = b_cand[vrange, am // 3]
+        improve = mn < best_lik
+        best_lik = torch.where(improve, mn, best_lik)
+        best_a = torch.where(improve, ai_sel, best_a)
+        best_b = torch.where(improve, bi_sel, best_b)
+
+    a_vals_t = torch.tensor(a_vals_sorted, dtype=_dtype, device=device)
+    b_vals_t = torch.tensor(b_vals_sorted, dtype=_dtype, device=device)
+    best_params = torch.stack([a_vals_t[best_a], b_vals_t[best_b]], dim=1)
+    return best_params, best_lik
 
 
 @torch.inference_mode()
@@ -4707,17 +4829,22 @@ def fit_glm_arma11(
                     if _y_norm_scale is not None:
                         Y_batch = Y_batch / _y_norm_scale[batch_start:batch_end].unsqueeze(1)
 
-                    # Search against precomputed grid. CPU defaults to
-                    # AFNI-style hierarchical descent (matches 3dREMLfit's
-                    # REML_find_best_case). GPU and any caller asking for
-                    # the full likelihood surface (-Rlklhd) take the
-                    # exhaustive path. -exhaustive forces exhaustive on CPU.
-                    _use_hierarchical = (
-                        device.type == "cpu"
-                        and not force_exhaustive_search
+                    # Search against precomputed grid. AFNI's hierarchical
+                    # descent (3dREMLfit's REML_find_best_case) is the default
+                    # on BOTH devices — the exhaustive global argmin lands on a
+                    # different point along the degenerate ARMA(1,1) a≈b ridge
+                    # than AFNI, hurting AFNI parity (worst on the omnibus F).
+                    # CPU runs the work-eliminating subset-GEMM descent; GPU
+                    # builds the full surface (cheap, same cost as exhaustive)
+                    # then descends via vectorised indexing, dodging the
+                    # per-grid-point sync storm that throttled the subset path
+                    # on CUDA. -exhaustive forces the global argmin on either.
+                    _use_hierarchical = not force_exhaustive_search
+                    if (
+                        _use_hierarchical
+                        and device.type == "cpu"
                         and not save_profile_likelihoods
-                    )
-                    if _use_hierarchical:
+                    ):
                         best_params_batch, best_lik_batch = (
                             search_voxels_precomputed_grid_hierarchical(
                                 design,
@@ -4729,14 +4856,39 @@ def fit_glm_arma11(
                         )
                         search_result = (best_params_batch, best_lik_batch)
                     else:
-                        search_result = search_voxels_precomputed_grid(
+                        # Surface needed for: -Rlklhd save, or GPU hierarchical.
+                        _need_profile = save_profile_likelihoods or (
+                            _use_hierarchical and device.type != "cpu"
+                        )
+                        _res = search_voxels_precomputed_grid(
                             design,
                             Y_batch,
                             precomputed_grid,
                             device,
                             verbose=verbose and (batch_idx == 0),
-                            return_profile=save_profile_likelihoods,
+                            return_profile=_need_profile,
                         )
+                        if _need_profile:
+                            _bp_exh, _bl_exh, surface_batch, surf_params = _res
+                            if _use_hierarchical:
+                                best_params_batch, best_lik_batch = (
+                                    select_arma_params_hierarchical_from_surface(
+                                        surface_batch, surf_params, device
+                                    )
+                                )
+                            else:
+                                best_params_batch, best_lik_batch = _bp_exh, _bl_exh
+                            if save_profile_likelihoods:
+                                search_result = (
+                                    best_params_batch,
+                                    best_lik_batch,
+                                    surface_batch,
+                                    surf_params,
+                                )
+                            else:
+                                search_result = (best_params_batch, best_lik_batch)
+                        else:
+                            search_result = _res
 
                     if save_profile_likelihoods:
                         best_params_batch, best_lik_batch, surface_batch, surf_params = search_result
