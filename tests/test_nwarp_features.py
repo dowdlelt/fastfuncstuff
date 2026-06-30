@@ -168,6 +168,20 @@ def test_resample_istiny_matches_full_kernel(kernel):
     assert torch.allclose(out, nodes, atol=1e-4), (kernel, out, nodes)
 
 
+@pytest.mark.parametrize("kernel", ["wsinc5", "cubic", "quintic", "heptic"])
+def test_resample_commensurate_grid_matches_einsum(kernel):
+    """Regular (0.5-step) grid -> few unique fracs -> S1 weight-cache path is
+    taken; result must stay bit-identical to the one-shot einsum reference."""
+    torch.manual_seed(2)
+    vol = torch.rand(14, 14, 14)
+    g = torch.arange(1.0, 11.0, 0.5)  # 20 points/axis, frac in {0.0, 0.5}
+    zz, yy, xx = torch.meshgrid(g, g, g, indexing="ij")
+    x, y, z = xx.reshape(-1), yy.reshape(-1), zz.reshape(-1)
+    ours = I._separable_resample_3d(vol, x, y, z, kernel)
+    ref = _einsum_resample_reference(vol, x, y, z, kernel)
+    assert torch.allclose(ours, ref, atol=1e-6), (kernel, (ours - ref).abs().max())
+
+
 def test_resample_all_out_of_bounds_returns_zero():
     vol = torch.rand(8, 8, 8)
     x = torch.tensor([-5.0, 20.0])

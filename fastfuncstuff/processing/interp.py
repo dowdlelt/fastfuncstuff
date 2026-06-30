@@ -485,6 +485,27 @@ def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int
     return max(1, min(n_points, chunk))
 
 
+def _axis_weights(kernel_fn, frac: Tensor) -> Tensor:
+    """Per-axis kernel weights, reusing the kernel eval across repeated offsets.
+
+    S1: a regular output grid commensurate with the warp's grid produces only a
+    handful of distinct fractional offsets per axis (one, for an aligned grid),
+    so evaluating the kernel on the *unique* fracs and gathering is far cheaper
+    than the per-voxel eval AFNI does. A cheap probe (unique count on a 256-point
+    prefix) detects low repetition; on arbitrary per-voxel displacements -- the
+    common final-apply case -- it shows ~all-distinct and we skip straight to the
+    direct eval, so the unique sort never runs on the hot path. The unique match
+    is exact (no quantization), so the result is bit-identical to a direct eval.
+    """
+    c = frac.numel()
+    if c >= 64:
+        probe = frac[: min(256, c)]
+        if torch.unique(probe).numel() * 4 < probe.numel():
+            uniq, inv = torch.unique(frac, return_inverse=True)
+            return kernel_fn(uniq)[inv]
+    return kernel_fn(frac)
+
+
 def _separable_resample_3d(
     source: Tensor,
     x_coords: Tensor,
@@ -587,9 +608,9 @@ def _separable_resample_3d(
         else:
             xb, yb, zb = xf.round(), yf.round(), zf.round()
 
-        wx = kernel_fn(xf - xb)  # (c, ntaps)
-        wy = kernel_fn(yf - yb)
-        wz = kernel_fn(zf - zb)
+        wx = _axis_weights(kernel_fn, xf - xb)  # (c, ntaps)
+        wy = _axis_weights(kernel_fn, yf - yb)
+        wz = _axis_weights(kernel_fn, zf - zb)
 
         xi = (xb.long()[:, None] + offsets[None, :]).clamp(0, nx - 1)  # (c, ntaps)
         yi = (yb.long()[:, None] + offsets[None, :]).clamp(0, ny - 1)
