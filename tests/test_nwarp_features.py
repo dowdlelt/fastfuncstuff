@@ -115,6 +115,44 @@ def test_wsinc5_spherical_unsupported(monkeypatch):
         I._wsinc5_params.cache_clear()
 
 
+def _einsum_resample_reference(source, x, y, z, kernel_name):
+    """One-shot ntaps**3 einsum contraction -- the pre-S5 reference the
+    three-pass _separable_resample_3d must reproduce exactly."""
+    kernel_fn, _, _ = I._KERNELS[kernel_name]
+    H = I._kernel_half_width(kernel_name)
+    nz, ny, nx = source.shape
+    offsets = torch.arange(-(H - 1), H + 1)
+    xb, yb, zb = x.floor(), y.floor(), z.floor()
+    wx, wy, wz = kernel_fn(x - xb), kernel_fn(y - yb), kernel_fn(z - zb)
+    xi = (xb.long()[:, None] + offsets).clamp(0, nx - 1)
+    yi = (yb.long()[:, None] + offsets).clamp(0, ny - 1)
+    zi = (zb.long()[:, None] + offsets).clamp(0, nz - 1)
+    neigh = source[zi[:, :, None, None], yi[:, None, :, None], xi[:, None, None, :]]
+    out = torch.einsum("ctuv,ct,cu,cv->c", neigh, wz, wy, wx)
+    oob = (
+        (x < -0.5) | (x > nx - 0.5) | (y < -0.5)
+        | (y > ny - 0.5) | (z < -0.5) | (z > nz - 0.5)
+    )
+    out[oob] = 0.0
+    return out
+
+
+@pytest.mark.parametrize("kernel", ["wsinc5", "cubic", "quintic", "heptic"])
+def test_separable_resample_matches_einsum(kernel):
+    torch.manual_seed(0)
+    vol = torch.rand(12, 13, 11)
+    # random interior coords (avoid the <1e-4 ISTINY band so this stays a pure
+    # reassociation check) plus a few deliberately out-of-bounds points
+    n = 500
+    x = torch.rand(n) * 10.0 + 0.3
+    y = torch.rand(n) * 12.0 + 0.3
+    z = torch.rand(n) * 11.0 + 0.3
+    x[:5], y[:5], z[:5] = -3.0, 50.0, -1.0  # OOB
+    ours = I._separable_resample_3d(vol, x, y, z, kernel)
+    ref = _einsum_resample_reference(vol, x, y, z, kernel)
+    assert torch.allclose(ours, ref, atol=1e-5), (kernel, (ours - ref).abs().max())
+
+
 def test_wsinc5_resample_identity_at_integers():
     vol = torch.rand(9, 9, 9)
     kk, jj, ii = torch.meshgrid(

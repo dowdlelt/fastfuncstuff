@@ -469,16 +469,17 @@ def _kernel_half_width(name: str) -> int:
 def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int:
     """Voxels per chunk for the separable resampler.
 
-    The vectorized contraction gathers an ``ntaps**3`` neighborhood per output
-    sample (1000 floats for wsinc5), so peak memory scales with chunk size. Size
-    the chunk from the memory module's available-memory estimate (which already
-    applies the GPU 0.5 safety factor) instead of hardcoding, per the
-    [[Memory module]] rule.
+    The three-pass contraction materializes only an ``ntaps**2`` slab per output
+    sample (one z-plane at a time -- 100 floats for wsinc5, not the 1000 of a
+    full ``ntaps**3`` neighborhood), so peak memory scales with ``ntaps**2``.
+    Size the chunk from the memory module's available-memory estimate (which
+    already applies the GPU 0.5 safety factor), per the [[Memory module]] rule.
     """
     from ..memory import get_available_memory
 
-    # Neighborhood gather + einsum scratch + per-axis weight tables + coords.
-    bytes_per_point = (2 * ntaps**3 + 4 * ntaps + 8) * 4
+    # Per-point peak: the (ntaps, ntaps) slab + its x-contraction scratch, the
+    # three weight tables and three index tables (all ntaps), and the coords.
+    bytes_per_point = (2 * ntaps**2 + 8 * ntaps + 8) * 4
     avail = get_available_memory(device)
     chunk = int(avail // max(1, bytes_per_point))
     return max(1, min(n_points, chunk))
@@ -493,8 +494,12 @@ def _separable_resample_3d(
 ) -> Tensor:
     """Resample a 3D volume using separable 1D kernel interpolation.
 
-    Applied separably: for each Z-neighbor, for each Y-neighbor,
-    interpolate along X, then combine across Y, then across Z.
+    Applied separably in three passes per AFNI's ``GA_interp_wsinc5p``: for each
+    z-tap plane, contract along X then Y into a scalar, then accumulate across Z
+    weighted by the z kernel. This keeps only an ``(ntaps, ntaps)`` slab live at
+    a time instead of the full ``ntaps**3`` neighborhood -- ~10x less peak memory
+    for wsinc5, so chunks can be ~10x larger. The result is mathematically
+    identical to the one-shot ``einsum("ctuv,ct,cu,cv->c")`` contraction.
 
     Args:
         source: (nz, ny, nx) float tensor.
@@ -528,8 +533,8 @@ def _separable_resample_3d(
 
     result = torch.empty(N, dtype=dtype, device=device)
 
-    # Chunk over output voxels: the gather materializes an (chunk, ntaps**3)
-    # neighborhood, so chunking keeps peak memory bounded (and makes the kernel
+    # Chunk over output voxels: the gather materializes a (chunk, ntaps, ntaps)
+    # slab per z-tap, so chunking keeps peak memory bounded (and makes the kernel
     # affordable on MPS/CPU and for the auto-padded grids).
     chunk = _resample_chunk_size(N, ntaps, device)
     for s in range(0, N, chunk):
@@ -547,14 +552,20 @@ def _separable_resample_3d(
 
         xi = (xb.long()[:, None] + offsets[None, :]).clamp(0, nx - 1)  # (c, ntaps)
         yi = (yb.long()[:, None] + offsets[None, :]).clamp(0, ny - 1)
-        zi = (zb.long()[:, None] + offsets[None, :]).clamp(0, nz - 1)
+        zb_long = zb.long()
 
-        # Gather the (c, tz, ty, tx) neighborhood and contract against the three
-        # separable weight tables in one einsum -- no Python tap loops.
-        neigh = source[
-            zi[:, :, None, None], yi[:, None, :, None], xi[:, None, None, :]
-        ]  # (c, ntaps, ntaps, ntaps)
-        result[s:e] = torch.einsum("ctuv,ct,cu,cv->c", neigh, wz, wy, wx)
+        # Three-pass separable contraction (AFNI GA_interp_wsinc5p order): for
+        # each z-tap, gather only that (c, ty, tx) plane, contract X then Y, and
+        # accumulate weighted by wz. Peak memory is the ntaps**2 plane, not the
+        # full ntaps**3 neighborhood.
+        acc = torch.zeros(e - s, dtype=dtype, device=device)
+        for t in range(ntaps):
+            zk = (zb_long + int(offsets[t])).clamp(0, nz - 1)  # (c,)
+            plane = source[zk[:, None, None], yi[:, :, None], xi[:, None, :]]  # (c,ty,tx)
+            sx = (plane * wx[:, None, :]).sum(dim=2)  # (c, ty)  contract X
+            sxy = (sx * wy).sum(dim=1)                # (c,)     contract Y
+            acc = acc + sxy * wz[:, t]                # accumulate Z
+        result[s:e] = acc
 
     # Zero out-of-bounds (matches AFNI's outval=0 outside [-0.5, n-0.5]).
     out_of_bounds = (
