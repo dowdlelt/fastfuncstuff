@@ -20,6 +20,7 @@ References:
 - Woolrich et al. (2001): Temporal autocorrelation in univariate linear modeling
 - Worsley & Friston (1995): Analysis of fMRI time-series revisited
 """
+
 from __future__ import annotations
 
 import warnings
@@ -139,9 +140,7 @@ def _debug_memory_snapshot(
                 f"  {name:30s}: {str(tuple(tensor.shape)):20s} {dtype_str:10s} {device_str:10s} {size_mb:>8.1f} MiB"
             )
 
-        print(
-            f"  {'TOTAL':30s}: {'':<20s} {'':<10s} {'':<10s} {total_bytes / 1024**2:>8.1f} MiB"
-        )
+        print(f"  {'TOTAL':30s}: {'':<20s} {'':<10s} {'':<10s} {total_bytes / 1024**2:>8.1f} MiB")
         print()
 
     print(f"{'=' * 70}\n")
@@ -270,9 +269,7 @@ def check_cuda_memory_before_batch(
     if required_bytes > usable_mem:
         # Need to reduce batch size
         reduction_factor = usable_mem / required_bytes
-        new_batch = int(
-            batch_voxels * reduction_factor * 0.85
-        )  # Extra 15% safety for peak memory
+        new_batch = int(batch_voxels * reduction_factor * 0.85)  # Extra 15% safety for peak memory
         new_batch = max(new_batch, 100)  # Minimum batch (reduced from 500)
 
         if verbose:
@@ -284,9 +281,7 @@ def check_cuda_memory_before_batch(
                 f"  GPU: {allocated_mem / 1e9:.2f} GB allocated, {free_mem / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total"
             )
             print(f"  📉 Reducing batch: {batch_voxels:,} → {new_batch:,} voxels")
-            print(
-                "  ℹ️  Conservative: Accounts for peak memory during Cholesky/solve operations\n"
-            )
+            print("  ℹ️  Conservative: Accounts for peak memory during Cholesky/solve operations\n")
 
         return new_batch
     return batch_voxels
@@ -584,12 +579,8 @@ class ARMA11Results:
     """Container for ARMA(1,1) GLM results"""
 
     def __init__(self):
-        self.betas: torch.Tensor | None = (
-            None  # (n_voxels, n_regressors) GLS parameter estimates
-        )
-        self.tstats: torch.Tensor | None = (
-            None  # (n_voxels, n_regressors) t-statistics (corrected)
-        )
+        self.betas: torch.Tensor | None = None  # (n_voxels, n_regressors) GLS parameter estimates
+        self.tstats: torch.Tensor | None = None  # (n_voxels, n_regressors) t-statistics (corrected)
         self.r2: torch.Tensor | None = None  # (n_voxels,) R² values (total model)
         self.r2_partial: torch.Tensor | None = (
             None  # (n_voxels, n_task_regressors) partial R² per TASK condition
@@ -603,12 +594,8 @@ class ARMA11Results:
         self.r2_semipartial_nuisance: torch.Tensor | None = (
             None  # (n_voxels, n_nuisance_regressors) semi-partial R² per NUISANCE regressor
         )
-        self.arma_params: torch.Tensor | None = (
-            None  # (n_voxels, 2) - (a, b) per voxel
-        )
-        self.arma_lambda: torch.Tensor | None = (
-            None  # (n_voxels,) - lag-1 correlation
-        )
+        self.arma_params: torch.Tensor | None = None  # (n_voxels, 2) - (a, b) per voxel
+        self.arma_lambda: torch.Tensor | None = None  # (n_voxels,) - lag-1 correlation
         self.reml_likelihood: torch.Tensor | None = (
             None  # (n_voxels,) - optimized REML log-likelihood
         )
@@ -621,28 +608,18 @@ class ARMA11Results:
         self.residuals_whitened: torch.Tensor | None = (
             None  # (n_voxels, n_timepoints) - residuals after whitening
         )
-        self.sigma2: torch.Tensor | None = (
-            None  # (n_voxels,) - noise variance estimates
-        )
+        self.sigma2: torch.Tensor | None = None  # (n_voxels,) - noise variance estimates
         self.var_betas: torch.Tensor | None = (
             None  # (n_voxels, n_regressors, n_regressors) - covariance
         )
-        self.original_shape: tuple[int, int, int] | None = (
-            None  # Original spatial dimensions
-        )
+        self.original_shape: tuple[int, int, int] | None = None  # Original spatial dimensions
         self.fstats: torch.Tensor | None = (
             None  # (n_voxels,) - omnibus F-statistic across regressors
         )
-        self.dof: int | None = (
-            None  # Degrees of freedom (n_timepoints - n_regressors)
-        )
+        self.dof: int | None = None  # Degrees of freedom (n_timepoints - n_regressors)
         self.tr: float | None = None  # Repetition time
-        self.voxel_mask: torch.Tensor | None = (
-            None  # Optional boolean mask for sparse analyses
-        )
-        self.full_shape: tuple[int, int, int] | None = (
-            None  # Original spatial shape before masking
-        )
+        self.voxel_mask: torch.Tensor | None = None  # Optional boolean mask for sparse analyses
+        self.full_shape: tuple[int, int, int] | None = None  # Original spatial shape before masking
 
         # Design filtering metadata (tracks what was actually fitted)
         self.fitted_column_indices: list[int] | None = (
@@ -654,12 +631,8 @@ class ARMA11Results:
 
         # GLT contrast results (computed in-loop, not post-hoc)
         self.contrast_labels: list[str] | None = None  # List of contrast names
-        self.contrast_betas: torch.Tensor | None = (
-            None  # (n_voxels, n_contrasts) - c'β estimates
-        )
-        self.contrast_tstats: torch.Tensor | None = (
-            None  # (n_voxels, n_contrasts) - t-statistics
-        )
+        self.contrast_betas: torch.Tensor | None = None  # (n_voxels, n_contrasts) - c'β estimates
+        self.contrast_tstats: torch.Tensor | None = None  # (n_voxels, n_contrasts) - t-statistics
         self.contrast_fstats: torch.Tensor | None = (
             None  # (n_voxels, n_contrasts) - F-statistics (for multi-row GLTs)
         )
@@ -686,8 +659,12 @@ class ARMA11Results:
         self.nods_results: Any | None = None  # ARMA11Results without dsort regressors
 
         # Full REML likelihood surface over (a,b) grid (optional, see save_lklhd_surface)
-        self.reml_lklhd_surface: torch.Tensor | None = None  # (n_voxels, n_valid_pairs) — L(a_k, b_k) per voxel
-        self.reml_surface_params: list | None = None  # [(a_0,b_0), (a_1,b_1), ...] — grid points in column order
+        self.reml_lklhd_surface: torch.Tensor | None = (
+            None  # (n_voxels, n_valid_pairs) — L(a_k, b_k) per voxel
+        )
+        self.reml_surface_params: list | None = (
+            None  # [(a_0,b_0), (a_1,b_1), ...] — grid points in column order
+        )
 
 
 def _compute_arma11_lambda(
@@ -784,19 +761,19 @@ def build_censor_run_info(
     tau : torch.Tensor or None
         Within-run true time index of each retained point (None if no censoring).
     """
-    starts = (
-        run_starts.tolist()
-        if isinstance(run_starts, torch.Tensor)
-        else list(run_starts)
-    )
+    starts = run_starts.tolist() if isinstance(run_starts, torch.Tensor) else list(run_starts)
     if good_list is None:
         return [int(s) for s in starts], None
 
     retained = (
-        good_list
-        if isinstance(good_list, torch.Tensor)
-        else torch.tensor(list(good_list), dtype=torch.long)
-    ).to(dtype=torch.long).flatten()
+        (
+            good_list
+            if isinstance(good_list, torch.Tensor)
+            else torch.tensor(list(good_list), dtype=torch.long)
+        )
+        .to(dtype=torch.long)
+        .flatten()
+    )
 
     starts_t = torch.tensor(starts, dtype=torch.long)
     # Original run id of each retained point, and that run's original start.
@@ -1074,9 +1051,12 @@ def build_arma11_covariance_batch(
     # keeps only its own nearest bmax off-diagonals; the default keeps dense R.
     if _REML_MODE.afni_faithful:
         bmax = torch.tensor(
-            [_afni_bmax(a.item(), lam.item(), _REML_MODE.corcut)
-             for a, lam in zip(a_valid, rho1_valid, strict=True)],
-            device=device, dtype=torch.long,
+            [
+                _afni_bmax(a.item(), lam.item(), _REML_MODE.corcut)
+                for a, lam in zip(a_valid, rho1_valid, strict=True)
+            ],
+            device=device,
+            dtype=torch.long,
         )  # (n_valid,)
         # The diagonal (distance 0) is always kept by `<=`, so bmax==0 correctly
         # yields the identity (near-white) matrix.
@@ -1330,9 +1310,7 @@ def precompute_autocorr_grid(
     """
     import time as _time
 
-    build_device = (
-        torch.device("cpu") if (cholesky_on_cpu or device.type == "mps") else device
-    )
+    build_device = torch.device("cpu") if (cholesky_on_cpu or device.type == "mps") else device
     a_grid = a_grid.to(build_device)
     b_grid = b_grid.to(build_device)
     a_grid, b_grid = ensure_zero_in_grid(a_grid, b_grid)
@@ -1340,12 +1318,15 @@ def precompute_autocorr_grid(
     if verbose:
         n_total_grid = len(a_grid) * len(b_grid)
         print("  Building ALL covariance matrices (vectorized)...")
-        print(
-            f"    Initial grid: {len(a_grid)} a × {len(b_grid)} b = {n_total_grid} combinations"
-        )
+        print(f"    Initial grid: {len(a_grid)} a × {len(b_grid)} b = {n_total_grid} combinations")
 
     R_batch, _params_tensor, param_list = build_arma11_covariance_batch(
-        a_grid, b_grid, n_timepoints, build_device, dtype, run_starts=run_starts,
+        a_grid,
+        b_grid,
+        n_timepoints,
+        build_device,
+        dtype,
+        run_starts=run_starts,
         tau=tau,
     )
     n_valid = len(param_list)
@@ -1385,9 +1366,7 @@ def precompute_autocorr_grid(
 
         if verbose:
             n_filtered = len(a_grid) * len(b_grid) - n_valid
-            print(
-                f"  ✓ Built {n_valid} covariance matrices (filtered {n_filtered} with λ ≤ 0)"
-            )
+            print(f"  ✓ Built {n_valid} covariance matrices (filtered {n_filtered} with λ ≤ 0)")
             print(
                 f"  🚀 Streaming Cholesky on GPU in chunks of {chunk_size} "
                 f"(per-chunk peak ≈ {per_pair_bytes * chunk_size * 3 / 1e9:.2f} GB)..."
@@ -1419,9 +1398,7 @@ def precompute_autocorr_grid(
         except (torch.linalg.LinAlgError, RuntimeError) as _e:
             # GPU chunk failed — fall back to all-at-once CPU
             if verbose:
-                print(
-                    f"  ⚠️  GPU chunked Cholesky failed ({_e}); falling back to CPU."
-                )
+                print(f"  ⚠️  GPU chunked Cholesky failed ({_e}); falling back to CPU.")
             del L_inv_batch
             torch.cuda.empty_cache()
             L_batch_cpu = torch.linalg.cholesky(R_batch)
@@ -1437,9 +1414,7 @@ def precompute_autocorr_grid(
         if verbose:
             n_filtered = len(a_grid) * len(b_grid) - n_valid
             chol_location = "CPU" if cholesky_on_cpu else "GPU (all-at-once)"
-            print(
-                f"  ✓ Built {n_valid} covariance matrices (filtered {n_filtered} with λ ≤ 0)"
-            )
+            print(f"  ✓ Built {n_valid} covariance matrices (filtered {n_filtered} with λ ≤ 0)")
             print(f"  Computing ALL Cholesky factorizations (batched on {chol_location})...")
         L_batch = torch.linalg.cholesky(R_batch)
         logdet_Rcorr_batch = 2 * torch.sum(
@@ -1452,9 +1427,7 @@ def precompute_autocorr_grid(
         del L_batch, eye_n
 
     if verbose:
-        print(
-            f"  ✓ Computed {n_valid} Cholesky factorizations! ({_time.time() - chol_start:.1f}s)"
-        )
+        print(f"  ✓ Computed {n_valid} Cholesky factorizations! ({_time.time() - chol_start:.1f}s)")
     del R_batch
 
     return {
@@ -1571,9 +1544,7 @@ def precompute_reml_grid(
         # CPU for big n_t (the 16 s CPU usage you noticed). On GPU it's
         # milliseconds. Storage remains CPU to keep the policy unchanged.
         n_regressors_x = X.shape[1]
-        gpu_stream_design = (
-            L_inv_batch.device.type == "cpu" and device.type == "cuda"
-        )
+        gpu_stream_design = L_inv_batch.device.type == "cpu" and device.type == "cuda"
 
         if gpu_stream_design:
             bpe = dtype.itemsize if hasattr(dtype, "itemsize") else 4
@@ -1581,13 +1552,9 @@ def precompute_reml_grid(
             # Per-chunk peak ≈ L_inv (n_t²) + X_w (n_t · n_reg) + Q (n_t · n_reg)
             #                + XtX (n_reg²) + 2× workspace ≈ ~2× L_inv chunk.
             per_pair_bytes = n_timepoints * n_timepoints * bpe * 2
-            chunk_size = max(
-                1, min(32, int(free_bytes * 0.5 / per_pair_bytes))
-            )
+            chunk_size = max(1, min(32, int(free_bytes * 0.5 / per_pair_bytes)))
             if verbose:
-                print(
-                    f"  🚀 Streaming design prewhitening on GPU in chunks of {chunk_size}..."
-                )
+                print(f"  🚀 Streaming design prewhitening on GPU in chunks of {chunk_size}...")
 
             X_gpu = X.to(device=device, dtype=dtype)
             X_w_batch = torch.empty(
@@ -1600,9 +1567,7 @@ def precompute_reml_grid(
             for start in range(0, n_valid, chunk_size):
                 end = min(start + chunk_size, n_valid)
                 L_inv_chunk = L_inv_batch[start:end].to(device, non_blocking=True)
-                X_w_chunk = torch.bmm(
-                    L_inv_chunk, X_gpu.unsqueeze(0).expand(end - start, -1, -1)
-                )
+                X_w_chunk = torch.bmm(L_inv_chunk, X_gpu.unsqueeze(0).expand(end - start, -1, -1))
                 # Cholesky-of-XtX path for Q. If it fails, mark and fall back below.
                 try:
                     XtX_chunk = torch.bmm(X_w_chunk.transpose(1, 2), X_w_chunk)
@@ -1611,20 +1576,14 @@ def precompute_reml_grid(
                         L_xtx_chunk, X_w_chunk.transpose(1, 2), upper=False
                     ).transpose(1, 2)
                     logdet_chunk = 2 * torch.sum(
-                        torch.log(
-                            torch.abs(torch.diagonal(L_xtx_chunk, dim1=1, dim2=2))
-                            + 1e-10
-                        ),
+                        torch.log(torch.abs(torch.diagonal(L_xtx_chunk, dim1=1, dim2=2)) + 1e-10),
                         dim=1,
                     )
                     del XtX_chunk, L_xtx_chunk
                 except (torch.linalg.LinAlgError, RuntimeError):
                     Q_chunk, R_qr_chunk = torch.linalg.qr(X_w_chunk)
                     logdet_chunk = 2 * torch.sum(
-                        torch.log(
-                            torch.abs(torch.diagonal(R_qr_chunk, dim1=1, dim2=2))
-                            + 1e-10
-                        ),
+                        torch.log(torch.abs(torch.diagonal(R_qr_chunk, dim1=1, dim2=2)) + 1e-10),
                         dim=1,
                     )
                     del R_qr_chunk
@@ -1656,12 +1615,12 @@ def precompute_reml_grid(
                 XtX_batch = torch.bmm(X_w_batch.transpose(1, 2), X_w_batch)
                 L_xtx = torch.linalg.cholesky(XtX_batch)
                 Q_batch = torch.linalg.solve_triangular(
-                    L_xtx, X_w_batch.transpose(1, 2), upper=False,
+                    L_xtx,
+                    X_w_batch.transpose(1, 2),
+                    upper=False,
                 ).transpose(1, 2)
                 logdet_XwTXw_batch = 2 * torch.sum(
-                    torch.log(
-                        torch.abs(torch.diagonal(L_xtx, dim1=1, dim2=2)) + 1e-10
-                    ),
+                    torch.log(torch.abs(torch.diagonal(L_xtx, dim1=1, dim2=2)) + 1e-10),
                     dim=1,
                 )
                 del XtX_batch, L_xtx
@@ -1682,9 +1641,7 @@ def precompute_reml_grid(
                     torch.cuda.empty_cache()
                 Q_batch, R_qr_batch = torch.linalg.qr(X_w_batch)
                 logdet_XwTXw_batch = 2 * torch.sum(
-                    torch.log(
-                        torch.abs(torch.diagonal(R_qr_batch, dim1=1, dim2=2)) + 1e-10
-                    ),
+                    torch.log(torch.abs(torch.diagonal(R_qr_batch, dim1=1, dim2=2)) + 1e-10),
                     dim=1,
                 )
                 del R_qr_batch
@@ -1699,9 +1656,9 @@ def precompute_reml_grid(
         # Q: orthonormal cols for Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²
         for i, (a_val, b_val) in enumerate(param_list):
             precomputed[(a_val, b_val)] = {
-                "L_inv": L_inv_batch[i],          # (n, n) - lower Cholesky inverse
-                "X_w": X_w_batch[i],               # (n, n_reg) - prewhitened design
-                "Q": Q_batch[i],                   # (n, n_reg) - orthonormal cols for RSS
+                "L_inv": L_inv_batch[i],  # (n, n) - lower Cholesky inverse
+                "X_w": X_w_batch[i],  # (n, n_reg) - prewhitened design
+                "Q": Q_batch[i],  # (n, n_reg) - orthonormal cols for RSS
                 "logdet_Rcorr": logdet_Rcorr_batch[i],
                 "logdet_XwTXw": logdet_XwTXw_batch[i],
                 "a": a_val,
@@ -1711,7 +1668,9 @@ def precompute_reml_grid(
     except RuntimeError as e:
         # Fallback to sequential if batch fails
         if verbose:
-            warnings.warn(f"Batch Cholesky failed ({e}), falling back to sequential...", stacklevel=2)
+            warnings.warn(
+                f"Batch Cholesky failed ({e}), falling back to sequential...", stacklevel=2
+            )
 
         # CRITICAL: Clean up GPU memory from failed batch attempt!
         _local_names = locals()
@@ -1739,7 +1698,12 @@ def precompute_reml_grid(
 
         for a_val, b_val in grid_pairs:
             R = build_arma11_covariance(
-                a_val, b_val, n_timepoints, device, dtype, run_starts=run_starts,
+                a_val,
+                b_val,
+                n_timepoints,
+                device,
+                dtype,
+                run_starts=run_starts,
                 tau=tau,
             )
             if R is None:
@@ -1768,9 +1732,7 @@ def precompute_reml_grid(
 
                 # QR always — eliminates slogdet/DLASWP, enables Pythagorean RSS
                 Q, R_qr = torch.linalg.qr(X_w)
-                logdet_XwTXw = 2 * torch.sum(
-                    torch.log(torch.abs(torch.diag(R_qr)) + 1e-10)
-                )
+                logdet_XwTXw = 2 * torch.sum(torch.log(torch.abs(torch.diag(R_qr)) + 1e-10))
                 del R_qr  # Not stored; GLS path recomputes fresh QR from X_w
 
                 precomputed[(a_val, b_val)] = {
@@ -1845,9 +1807,7 @@ def precompute_reml_grid(
         del logdet_XwTXw_batch
 
     if debug_memory:
-        _debug_memory_snapshot(
-            "Grid: After deleting batch tensors (grid in dict only)", device, {}
-        )
+        _debug_memory_snapshot("Grid: After deleting batch tensors (grid in dict only)", device, {})
 
     return precomputed
 
@@ -1950,8 +1910,14 @@ def batch_reml_grid_search(
     # Pre-compute grid if not provided
     if precomputed is None:
         precomputed = precompute_reml_grid(
-            X, n_timepoints, a_grid, b_grid, device, dtype=dtype,
-            run_starts=run_starts, tau=tau,
+            X,
+            n_timepoints,
+            a_grid,
+            b_grid,
+            device,
+            dtype=dtype,
+            run_starts=run_starts,
+            tau=tau,
         )
 
     n_grid = len(precomputed)
@@ -1960,9 +1926,7 @@ def batch_reml_grid_search(
         best_params = torch.zeros(n_voxels_batch, 2, device=device, dtype=dtype)
         best_params[:, 0] = 0.5
         best_params[:, 1] = 0.0
-        best_likelihoods = torch.full(
-            (n_voxels_batch,), float("inf"), device=device, dtype=dtype
-        )
+        best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device, dtype=dtype)
         return best_params, best_likelihoods
 
     # EXHAUSTIVE GRID SEARCH - batch-parallel across all voxels.
@@ -2010,9 +1974,7 @@ def batch_reml_grid_search(
 
     # Track best params across all chunks
     best_params = torch.zeros(n_voxels_batch, 2, device=device, dtype=dtype)
-    best_likelihoods = torch.full(
-        (n_voxels_batch,), float("inf"), device=device, dtype=dtype
-    )
+    best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device, dtype=dtype)
 
     # Set background voxels to (0,0) immediately and mark as "done"
     if n_background > 0:
@@ -2059,8 +2021,7 @@ def batch_reml_grid_search(
         grid_chunks = [ordered_indices]
     else:
         grid_chunks = [
-            ordered_indices[i : i + max_grid_chunk]
-            for i in range(0, n_grid, max_grid_chunk)
+            ordered_indices[i : i + max_grid_chunk] for i in range(0, n_grid, max_grid_chunk)
         ]
 
     n_chunks_evaluated = 0
@@ -2069,6 +2030,7 @@ def batch_reml_grid_search(
     # happening. Single-chunk runs (typical small-voxel-batch case) skip
     # the bar to avoid clutter.
     from tqdm.auto import tqdm as _tqdm
+
     chunk_iter = (
         _tqdm(
             list(enumerate(grid_chunks)),
@@ -2088,12 +2050,12 @@ def batch_reml_grid_search(
         Q_stack = torch.stack([precomputed[k]["Q"] for k in chunk_keys]).to(
             device
         )  # (n_chunk, n_time, n_regressors) - orthonormal cols for RSS
-        logdet_Rcorr_stack = torch.stack(
-            [precomputed[k]["logdet_Rcorr"] for k in chunk_keys]
-        ).to(device)  # (n_chunk,)
-        logdet_XwTXw_stack = torch.stack(
-            [precomputed[k]["logdet_XwTXw"] for k in chunk_keys]
-        ).to(device)  # (n_chunk,)
+        logdet_Rcorr_stack = torch.stack([precomputed[k]["logdet_Rcorr"] for k in chunk_keys]).to(
+            device
+        )  # (n_chunk,)
+        logdet_XwTXw_stack = torch.stack([precomputed[k]["logdet_XwTXw"] for k in chunk_keys]).to(
+            device
+        )  # (n_chunk,)
 
         # PHASE 2: Prewhiten data via batched GEMM: Y_w = L_inv @ Y  (no triangular solve!)
         # Y_batch: (n_time, n_voxels)  →  expand to (n_chunk, n_time, n_voxels)
@@ -2137,7 +2099,8 @@ def batch_reml_grid_search(
         if improve_mask.any():
             chunk_params = torch.tensor(
                 [param_list[chunk_indices[i]] for i in range(len(chunk_indices))],
-                dtype=dtype, device=device,
+                dtype=dtype,
+                device=device,
             )  # (n_chunk, 2)
             best_params[improve_mask] = chunk_params[chunk_best_idx[improve_mask]]
 
@@ -2153,16 +2116,12 @@ def batch_reml_grid_search(
                 rel_improvement = improvement[searchable_mask] / (
                     torch.abs(best_likelihoods[searchable_mask]) + 1e-10
                 )
-                converged = (rel_improvement < 0.001) | (
-                    improvement[searchable_mask] == 0
-                )
+                converged = (rel_improvement < 0.001) | (improvement[searchable_mask] == 0)
                 convergence_rate = converged.float().mean().item()
 
                 # If >80% of searchable voxels converged, stop early
                 # With smart ordering, most voxels find optimal (a,b) in first 10-15 evals
-                if (
-                    convergence_rate > 0.80 and chunk_idx > 0
-                ):  # At least eval 2 chunks (20 params)
+                if convergence_rate > 0.80 and chunk_idx > 0:  # At least eval 2 chunks (20 params)
                     n_remaining = len(grid_chunks) - n_chunks_evaluated
                     # Note: Only stop if we have more chunks to skip
                     if n_remaining > 0:
@@ -2249,6 +2208,7 @@ def search_voxels_precomputed_grid(
     # surface progress when verbose; quiet otherwise.
     if verbose:
         from tqdm.auto import tqdm as _tqdm
+
         grid_iter = _tqdm(
             list(enumerate(param_list)),
             desc="REML grid search",
@@ -2259,8 +2219,8 @@ def search_voxels_precomputed_grid(
     for _grid_idx, (a, b) in grid_iter:
         with profile_section("1_get_grid_data", enabled=enable_timing):
             grid_data = precomputed_grid[(a, b)]
-            L_inv = grid_data["L_inv"].to(device)   # (n_time, n_time)
-            Q = grid_data["Q"].to(device)            # (n_time, n_reg) orthonormal
+            L_inv = grid_data["L_inv"].to(device)  # (n_time, n_time)
+            Q = grid_data["Q"].to(device)  # (n_time, n_reg) orthonormal
             logdet_Rcorr = grid_data["logdet_Rcorr"].item()
             logdet_XwTXw = grid_data["logdet_XwTXw"].item()
 
@@ -2275,9 +2235,9 @@ def search_voxels_precomputed_grid(
         # the voxels that drive the omnibus F.
         with profile_section("3_pythagorean_rss", enabled=enable_timing):
             Qt_Yw = Q.T @ Y_w_batch.T  # (n_reg, n_voxels)
-            rss_batch = Y_w_batch.pow(2).sum(dim=1, dtype=_acc_dtype) - Qt_Yw.pow(
-                2
-            ).sum(dim=0, dtype=_acc_dtype)  # (n_voxels,)
+            rss_batch = Y_w_batch.pow(2).sum(dim=1, dtype=_acc_dtype) - Qt_Yw.pow(2).sum(
+                dim=0, dtype=_acc_dtype
+            )  # (n_voxels,)
 
         # Compute REML likelihood for this (a, b). rss is float64 (cancellation
         # already handled); cast back to storage dtype — grid points differ by
@@ -2365,9 +2325,7 @@ def search_voxels_precomputed_grid_hierarchical(
 
     # Build a 2D table (ai, bi) -> precomputed dict key (or None). Cached so
     # we don't linear-scan param_list per evaluation.
-    key_table: list[list[tuple[float, float] | None]] = [
-        [None] * n_b for _ in range(n_a)
-    ]
+    key_table: list[list[tuple[float, float] | None]] = [[None] * n_b for _ in range(n_a)]
     for k in param_list:
         a_val, b_val = k
         for ai, av in enumerate(a_vals_sorted):
@@ -2402,6 +2360,7 @@ def search_voxels_precomputed_grid_hierarchical(
 
     if verbose:
         from tqdm.auto import tqdm as _tqdm
+
         _pair_pbar = _tqdm(
             total=len(param_list),
             desc="REML grid search (hierarchical)",
@@ -2429,16 +2388,14 @@ def search_voxels_precomputed_grid_hierarchical(
         logdet_XwTXw = gd["logdet_XwTXw"].item()
 
         Y_sub = Y_batch.index_select(0, active_idx)  # (n_active, T)
-        Y_w = Y_sub @ L_inv.T                         # (n_active, T)
-        Qt_Yw = Y_w @ Q                                # (n_active, K)
+        Y_w = Y_sub @ L_inv.T  # (n_active, T)
+        Qt_Yw = Y_w @ Q  # (n_active, K)
         # float64 accumulation — see search_voxels_precomputed_grid: the
         # Pythagorean cancellation in float32 corrupts high-R² voxels.
         rss = Y_w.pow(2).sum(dim=1, dtype=_acc_dtype) - Qt_Yw.pow(2).sum(
             dim=1, dtype=_acc_dtype
         )  # (n_active,)
-        lik = (logdet_Rcorr + logdet_XwTXw + T_minus_K * torch.log(rss + 1e-10)).to(
-            _dtype
-        )
+        lik = (logdet_Rcorr + logdet_XwTXw + T_minus_K * torch.log(rss + 1e-10)).to(_dtype)
 
         cur_best = best_likelihoods.index_select(0, active_idx)
         improve = lik < cur_best
@@ -2452,7 +2409,8 @@ def search_voxels_precomputed_grid_hierarchical(
 
     # Step 1: OLS init at (0, 0) for every voxel.
     _eval_subset(
-        zero_a_idx, zero_b_idx,
+        zero_a_idx,
+        zero_b_idx,
         torch.arange(n_voxels_batch, dtype=torch.long, device=device),
     )
 
@@ -2549,12 +2507,8 @@ def select_arma_params_hierarchical_from_surface(
 
     # Scatter the (V, n_pairs) surface into a (V, n_a, n_b) lattice; grid points
     # filtered out upstream (λ ≤ 0) stay +inf so argmin never selects them.
-    col_ai = torch.tensor(
-        [a_to_i[a] for (a, _) in param_list], device=device, dtype=torch.long
-    )
-    col_bi = torch.tensor(
-        [b_to_i[b] for (_, b) in param_list], device=device, dtype=torch.long
-    )
+    col_ai = torch.tensor([a_to_i[a] for (a, _) in param_list], device=device, dtype=torch.long)
+    col_bi = torch.tensor([b_to_i[b] for (_, b) in param_list], device=device, dtype=torch.long)
     grid = torch.full((n_voxels, n_a, n_b), float("inf"), device=device, dtype=_dtype)
     grid[:, col_ai, col_bi] = surface.to(device)
 
@@ -2670,8 +2624,13 @@ def prewhiten_with_arma11(
     # Build ARMA(1,1) covariance on CPU to save GPU memory and avoid fragmentation
     # Use X.dtype so precision matches the inputs (important when use_double=True)
     R = build_arma11_covariance(
-        a, b, n_timepoints, torch.device("cpu"), dtype=X.dtype,
-        run_starts=run_starts, tau=tau,
+        a,
+        b,
+        n_timepoints,
+        torch.device("cpu"),
+        dtype=X.dtype,
+        run_starts=run_starts,
+        tau=tau,
     )
 
     if R is None:
@@ -2786,9 +2745,7 @@ def determine_adaptive_batching_strategy(
     # Estimate per-voxel batch overhead (whitening, fitting, etc.)
     # Factor of 2-3x for intermediate computations
     batch_overhead_factor = 2.5
-    mem_per_voxel_batch = (
-        lambda n_v: n_v * n_timepoints * bytes_per_elem * batch_overhead_factor
-    )
+    mem_per_voxel_batch = lambda n_v: n_v * n_timepoints * bytes_per_elem * batch_overhead_factor
 
     if verbose:
         print(f"\n{'=' * 70}")
@@ -2797,9 +2754,7 @@ def determine_adaptive_batching_strategy(
         print(
             f"  Grid: {n_grid_points} points × {grid_mem_per_point / 1024**2:.1f} MB = {grid_mem_total / 1024**3:.2f} GB"
         )
-        print(
-            f"  Data: {n_voxels} voxels × {n_timepoints} TPs = {data_mem / 1024**3:.2f} GB"
-        )
+        print(f"  Data: {n_voxels} voxels × {n_timepoints} TPs = {data_mem / 1024**3:.2f} GB")
         print(f"  Available memory: {available / 1024**3:.2f} GB")
         print()
 
@@ -2974,9 +2929,7 @@ def reml_grid_search_batched(
     # Convention matches compute_reml_likelihood and batch_reml_grid_search:
     # REML neg-log-likelihood, smaller = better.
     best_params = torch.zeros(n_voxels, 2, dtype=dtype, device=torch.device("cpu"))
-    best_likelihood = torch.full(
-        (n_voxels,), float("inf"), dtype=dtype, device=torch.device("cpu")
-    )
+    best_likelihood = torch.full((n_voxels,), float("inf"), dtype=dtype, device=torch.device("cpu"))
 
     # Process grid in chunks for efficiency
     n_chunks = (n_valid + grid_chunk_size - 1) // grid_chunk_size
@@ -3022,9 +2975,7 @@ def reml_grid_search_batched(
                 # Prewhiten design via triangular solve (no explicit inverse!)
                 X_w = torch.linalg.solve_triangular(L_dev, design_dev, upper=False)  # (n_tp, n_reg)
                 XwTXw = X_w.T @ X_w
-                XwTXw_reg = XwTXw + 1e-6 * torch.eye(
-                    n_regressors, device=device, dtype=dtype
-                )
+                XwTXw_reg = XwTXw + 1e-6 * torch.eye(n_regressors, device=device, dtype=dtype)
 
                 # Log determinants for REML
                 logdet_R = 2.0 * torch.sum(torch.log(torch.diag(L)))
@@ -3055,8 +3006,7 @@ def reml_grid_search_batched(
                     likelihoods = (
                         logdet_R
                         + logdet_XwTXw
-                        + (n_timepoints - n_regressors)
-                        * torch.log(sse + 1e-10)
+                        + (n_timepoints - n_regressors) * torch.log(sse + 1e-10)
                     )
 
                     # Update best parameters (vectorized comparison; smaller = better)
@@ -3071,9 +3021,7 @@ def reml_grid_search_batched(
 
                 else:
                     # Process voxels in batches
-                    n_voxel_batches = (
-                        n_voxels + voxel_batch_size - 1
-                    ) // voxel_batch_size
+                    n_voxel_batches = (n_voxels + voxel_batch_size - 1) // voxel_batch_size
                     for voxel_batch_idx in range(n_voxel_batches):
                         voxel_start = voxel_batch_idx * voxel_batch_size
                         voxel_end = min(voxel_start + voxel_batch_size, n_voxels)
@@ -3081,7 +3029,9 @@ def reml_grid_search_batched(
                         # Move this batch to device
                         data_batch = data[voxel_start:voxel_end].to(device, dtype=dtype)
                         if y_scale is not None:
-                            data_batch = data_batch / y_scale[voxel_start:voxel_end].to(device=device, dtype=dtype).unsqueeze(1)
+                            data_batch = data_batch / y_scale[voxel_start:voxel_end].to(
+                                device=device, dtype=dtype
+                            ).unsqueeze(1)
 
                         # Prewhiten this batch via triangular solve
                         y_w = torch.linalg.solve_triangular(
@@ -3090,9 +3040,7 @@ def reml_grid_search_batched(
 
                         # Solve for this batch: beta = (X'X)^-1 X'y
                         XwTy_w = X_w.T @ y_w.T  # (n_reg, batch_voxels)
-                        betas = torch.linalg.solve(
-                            XwTXw_reg, XwTy_w
-                        ).T  # (batch_voxels, n_reg)
+                        betas = torch.linalg.solve(XwTXw_reg, XwTy_w).T  # (batch_voxels, n_reg)
 
                         # Compute residuals and SSE
                         resid_w = y_w - (betas @ X_w.T)  # (batch_voxels, n_tp)
@@ -3103,8 +3051,7 @@ def reml_grid_search_batched(
                         likelihoods = (
                             logdet_R
                             + logdet_XwTXw
-                            + (n_timepoints - n_regressors)
-                            * torch.log(sse + 1e-10)
+                            + (n_timepoints - n_regressors) * torch.log(sse + 1e-10)
                         )
 
                         # Update best parameters for this batch (smaller = better)
@@ -3120,9 +3067,7 @@ def reml_grid_search_batched(
                             best_params[voxel_start:voxel_end] = batch_params
 
                             batch_best_likelihood[mask] = likelihoods_cpu[mask]
-                            best_likelihood[voxel_start:voxel_end] = (
-                                batch_best_likelihood
-                            )
+                            best_likelihood[voxel_start:voxel_end] = batch_best_likelihood
 
                         # Free GPU memory for this batch
                         del data_batch, y_w, betas, resid_w, sse, likelihoods
@@ -3249,9 +3194,7 @@ def fit_glm_arma11_grouped(
         if dsort_full.ndim == 2:
             dsort_full = dsort_full.unsqueeze(1)
         if dsort_full.shape[0] != n_voxels:
-            raise ValueError(
-                f"dsort has {dsort_full.shape[0]} voxels but data has {n_voxels}"
-            )
+            raise ValueError(f"dsort has {dsort_full.shape[0]} voxels but data has {n_voxels}")
 
     # Subset precomputed (a,b) per HRF — must align with masked voxel order.
     precomputed_arma_full = inner_kwargs.pop("precomputed_arma_params", None)
@@ -3325,9 +3268,7 @@ def fit_glm_arma11_grouped(
                 sub_data = sub_data.to(device=fit_device, non_blocking=True)
             except _torch.cuda.OutOfMemoryError:
                 if verbose:
-                    print(
-                        "  ⚠️  HRF subset too large for GPU; falling back to CPU data"
-                    )
+                    print("  ⚠️  HRF subset too large for GPU; falling back to CPU data")
                 _torch.cuda.empty_cache()
 
         sub_kwargs = dict(inner_kwargs)
@@ -3359,12 +3300,28 @@ def fit_glm_arma11_grouped(
     merged.n_regressors_full = template.n_regressors_full
 
     _scatter_attrs = [
-        "betas", "tstats", "r2", "r2_partial", "r2_partial_nuisance",
-        "r2_semipartial", "r2_semipartial_nuisance", "arma_params", "arma_lambda",
-        "reml_likelihood", "sigma2", "fstats", "residuals", "residuals_whitened",
-        "predicted", "contrast_betas", "contrast_tstats", "contrast_fstats",
-        "contrast_r2_partial", "contrast_r2_semipartial",
-        "dsort_betas", "dsort_tstats",
+        "betas",
+        "tstats",
+        "r2",
+        "r2_partial",
+        "r2_partial_nuisance",
+        "r2_semipartial",
+        "r2_semipartial_nuisance",
+        "arma_params",
+        "arma_lambda",
+        "reml_likelihood",
+        "sigma2",
+        "fstats",
+        "residuals",
+        "residuals_whitened",
+        "predicted",
+        "contrast_betas",
+        "contrast_tstats",
+        "contrast_fstats",
+        "contrast_r2_partial",
+        "contrast_r2_semipartial",
+        "dsort_betas",
+        "dsort_tstats",
     ]
 
     for attr in _scatter_attrs:
@@ -3429,9 +3386,7 @@ def fit_glm_arma11_grouped(
             merged.reml_surface_params = per_hrf_results[h].reml_surface_params
             break
     if surf_ref is not None:
-        full_surf = _torch.zeros(
-            (n_voxels, surf_ref.shape[1]), dtype=surf_ref.dtype
-        )
+        full_surf = _torch.zeros((n_voxels, surf_ref.shape[1]), dtype=surf_ref.dtype)
         for h in unique_hrfs:
             s_h = getattr(per_hrf_results[h], "reml_lklhd_surface", None)
             if s_h is None:
@@ -3455,10 +3410,22 @@ def fit_glm_arma11_grouped(
         ols_merged.contrast_labels = getattr(ols_template, "contrast_labels", None)
 
         _ols_scatter_attrs = [
-            "betas", "r2", "r2_partial", "r2_partial_nuisance",
-            "r2_semipartial", "r2_semipartial_nuisance", "r2_run",
-            "residuals", "predicted", "meanvol", "tstats", "stderr",
-            "sigma2", "fstats", "contrast_betas", "contrast_tstats",
+            "betas",
+            "r2",
+            "r2_partial",
+            "r2_partial_nuisance",
+            "r2_semipartial",
+            "r2_semipartial_nuisance",
+            "r2_run",
+            "residuals",
+            "predicted",
+            "meanvol",
+            "tstats",
+            "stderr",
+            "sigma2",
+            "fstats",
+            "contrast_betas",
+            "contrast_tstats",
             "contrast_fstats",
         ]
         for attr in _ols_scatter_attrs:
@@ -3712,9 +3679,7 @@ def _fit_dsort_gls_pass(
                 A = XtX_inv[:, :p, :p]
                 beta_t = betas_base
                 p_f = p
-            A_inv = torch.linalg.inv(
-                A + 1e-8 * torch.eye(p_f, device=device, dtype=dtype)
-            )
+            A_inv = torch.linalg.inv(A + 1e-8 * torch.eye(p_f, device=device, dtype=dtype))
             quad = torch.einsum("bi,bij,bj->b", beta_t, A_inv, beta_t)
             fstats = quad / (sigma2 * p_f + 1e-30)
 
@@ -3766,15 +3731,10 @@ def _fit_dsort_gls_pass(
                 if want_r2_partial and results.contrast_r2_partial is not None:
                     ct2 = c_t**2
                     results.contrast_r2_partial[idx] = (ct2 / (ct2 + dof)).cpu()
-                if (
-                    want_r2_semipartial
-                    and results.contrast_r2_semipartial is not None
-                ):
+                if want_r2_semipartial and results.contrast_r2_semipartial is not None:
                     ct2 = c_t**2
                     var_rem = torch.clamp(1.0 - r2.to(dtype).unsqueeze(1), min=0.0)
-                    results.contrast_r2_semipartial[idx] = (
-                        (ct2 / (ct2 + dof)) * var_rem
-                    ).cpu()
+                    results.contrast_r2_semipartial[idx] = ((ct2 / (ct2 + dof)) * var_rem).cpu()
 
             if want_residuals:
                 results.residuals[idx] = (Y.T - pred).cpu()
@@ -3818,9 +3778,7 @@ def _store_partial_semipartial(
     if fitted_column_indices is not None:
         nuisance_indices = sorted(set(range(p)) - set(fitted_column_indices))
         r2_partial_task = r2_partial_full[:, fitted_column_indices]
-        r2_partial_nuis = (
-            r2_partial_full[:, nuisance_indices] if nuisance_indices else None
-        )
+        r2_partial_nuis = r2_partial_full[:, nuisance_indices] if nuisance_indices else None
     else:
         nuisance_indices = []
         r2_partial_task = r2_partial_full
@@ -3828,9 +3786,7 @@ def _store_partial_semipartial(
 
     if want_r2_partial:
         if r2_partial_mode == "task" and r2_partial_nuis is not None:
-            denom = torch.clamp(
-                1.0 - r2_partial_nuis.sum(dim=1, keepdim=True), min=0.01
-            )
+            denom = torch.clamp(1.0 - r2_partial_nuis.sum(dim=1, keepdim=True), min=0.01)
             results.r2_partial[idx] = (r2_partial_task / denom).cpu()
         else:
             results.r2_partial[idx] = r2_partial_task.cpu()
@@ -4142,8 +4098,7 @@ def fit_glm_arma11(
     # Validate design matrix
     if design.shape[0] != n_timepoints:
         raise ValueError(
-            f"Timepoints mismatch: Data has {n_timepoints}, "
-            f"Design has {design.shape[0]}"
+            f"Timepoints mismatch: Data has {n_timepoints}, Design has {design.shape[0]}"
         )
 
     n_regressors = design.shape[1]
@@ -4161,12 +4116,8 @@ def fit_glm_arma11(
             if a_grid is None and b_grid is None:
                 temp_a_grid, temp_b_grid = get_default_arma_grids(device)
             else:
-                temp_a_grid = (
-                    a_grid if a_grid is not None else get_default_arma_grids(device)[0]
-                )
-                temp_b_grid = (
-                    b_grid if b_grid is not None else get_default_arma_grids(device)[1]
-                )
+                temp_a_grid = a_grid if a_grid is not None else get_default_arma_grids(device)[0]
+                temp_b_grid = b_grid if b_grid is not None else get_default_arma_grids(device)[1]
 
             if not isinstance(temp_a_grid, torch.Tensor):
                 temp_a_grid = to_tensor(temp_a_grid, device=device)
@@ -4186,19 +4137,13 @@ def fit_glm_arma11(
             GRID_BATCHING_THRESHOLD_GB = 8.0
             if use_grid_batching is None:
                 # Auto-detect: use grid batching if grid > 8 GB
-                use_grid_batching = grid_memory_bytes > (
-                    GRID_BATCHING_THRESHOLD_GB * 1024**3
-                )
+                use_grid_batching = grid_memory_bytes > (GRID_BATCHING_THRESHOLD_GB * 1024**3)
                 if use_grid_batching and verbose:
                     print(
                         f"\n💡 Auto-enabling grid batching (grid: {grid_memory_bytes / 1024**3:.1f} GB > {GRID_BATCHING_THRESHOLD_GB} GB threshold)"
                     )
-                    print(
-                        "   This saves memory by processing one (a,b) pair at a time."
-                    )
-                    print(
-                        "   Use -no_grid_batching to force full grid precomputation.\n"
-                    )
+                    print("   This saves memory by processing one (a,b) pair at a time.")
+                    print("   Use -no_grid_batching to force full grid precomputation.\n")
 
             if debug_memory:
                 print(f"\n{'=' * 70}")
@@ -4224,9 +4169,7 @@ def fit_glm_arma11(
                 print(
                     f"    XwTXw:   {XwTXw_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} × {n_regressors} × {n_regressors})"
                 )
-                print(
-                    f"    scalars: {scalars_bytes / 1024**2:.1f} MiB  ({n_valid_pairs} × 2)"
-                )
+                print(f"    scalars: {scalars_bytes / 1024**2:.1f} MiB  ({n_valid_pairs} × 2)")
                 print(f"  TOTAL EXPECTED: {grid_memory_bytes / 1024**3:.3f} GiB")
                 print(f"{'=' * 70}\n")
 
@@ -4246,9 +4189,7 @@ def fit_glm_arma11(
             if memory_for_batches > 0:
                 bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
                 if use_double:
-                    bytes_per_voxel = int(
-                        bytes_per_voxel * _mem_cfg.double_precision_multiplier
-                    )
+                    bytes_per_voxel = int(bytes_per_voxel * _mem_cfg.double_precision_multiplier)
                 # estimate_chunk_size clamps to n_voxels, so the result is
                 # already the "fits everything in one batch" answer when
                 # memory allows.
@@ -4292,9 +4233,7 @@ def fit_glm_arma11(
                 grid_mb = grid_memory_bytes / (1024**2)
                 if use_grid_batching:
                     print(f"Grid size: {n_valid_pairs} (a,b) pairs")
-                    print(
-                        "Strategy: Grid batching (low memory, process all voxels per grid point)"
-                    )
+                    print("Strategy: Grid batching (low memory, process all voxels per grid point)")
                     print(
                         f"  Memory per grid point: ~{grid_memory_bytes / n_valid_pairs / 1024**2:.1f} MiB"
                     )
@@ -4302,15 +4241,11 @@ def fit_glm_arma11(
                 else:
                     print(f"Grid memory: {grid_mb:.1f} MiB ({n_valid_pairs} pairs)")
                     print("Strategy: Full grid precomputation (AFNI approach)")
-                    print(
-                        f"Adjusted batch size: {batch_size:,} voxels (grid + batches fit in GPU)"
-                    )
+                    print(f"Adjusted batch size: {batch_size:,} voxels (grid + batches fit in GPU)")
         else:
             batch_size = base_batch_size
             if verbose:
-                print(
-                    f"Auto-detected batch size: {batch_size:,} voxels (device={device.type})"
-                )
+                print(f"Auto-detected batch size: {batch_size:,} voxels (device={device.type})")
 
     if verbose:
         print("ARMA(1,1) GLM Fit")
@@ -4326,28 +4261,25 @@ def fit_glm_arma11(
     results.original_shape = original_shape
 
     # Track which columns were fitted (for proper labeling of outputs)
-    results.fitted_column_indices = (
-        fitted_column_indices  # None if all fitted, list if filtered
-    )
-    results.n_regressors_full = (
-        n_regressors_full  # Original design matrix width before filtering
-    )
+    results.fitted_column_indices = fitted_column_indices  # None if all fitted, list if filtered
+    results.n_regressors_full = n_regressors_full  # Original design matrix width before filtering
 
     raw_dof = n_timepoints - n_regressors
     if raw_dof <= 0:
         warnings.warn(
-            "Non-positive degrees of freedom detected in ARMA(1,1) fit; statistics may be unreliable", stacklevel=2
+            "Non-positive degrees of freedom detected in ARMA(1,1) fit; statistics may be unreliable",
+            stacklevel=2,
         )
 
     # Allocate storage for results
     # If task_indices specified, only store those columns (save memory)
     # Otherwise store all columns
-    n_output_regressors = (
-        len(fitted_column_indices) if fitted_column_indices else n_regressors
-    )
+    n_output_regressors = len(fitted_column_indices) if fitted_column_indices else n_regressors
     results.betas = torch.zeros(n_voxels, n_output_regressors, device=storage_device, dtype=dtype)
     results.tstats = torch.zeros(n_voxels, n_output_regressors, device=storage_device, dtype=dtype)
-    results.r2 = torch.zeros(n_voxels, device=storage_device)  # always float32 (compute_r2_metric returns float32)
+    results.r2 = torch.zeros(
+        n_voxels, device=storage_device
+    )  # always float32 (compute_r2_metric returns float32)
 
     # Allocate partial R² storage if requested
     if want_r2_partial:
@@ -4433,9 +4365,7 @@ def fit_glm_arma11(
                     f"Multi-row GLT contrasts (F-tests) not yet supported. "
                     f"Got shape {glt_tensor.shape}, expected (n_regressors,) or (1, n_regressors)"
                 )
-        glt_contrasts_tensor = torch.stack(
-            glt_contrasts_list
-        )  # (n_contrasts, n_regressors_full)
+        glt_contrasts_tensor = torch.stack(glt_contrasts_list)  # (n_contrasts, n_regressors_full)
 
         # NOTE: GLT contrasts use the FULL design (all 131 columns)
         # We fit the full design, so contrasts can involve any regressor
@@ -4521,9 +4451,7 @@ def fit_glm_arma11(
             if verbose:
                 print("  Moving OLS results to CPU to free GPU memory...")
             # Move all OLS result tensors from GPU to CPU
-            ols_cpu = type(
-                results.ols_results
-            )()  # Create new results object of same type
+            ols_cpu = type(results.ols_results)()  # Create new results object of same type
             for attr in dir(results.ols_results):
                 if not attr.startswith("_"):
                     val = getattr(results.ols_results, attr)
@@ -4556,9 +4484,7 @@ def fit_glm_arma11(
 
         if use_precomputed_arma:
             # Validate precomputed parameters
-            precomputed_arma_params = to_tensor(
-                precomputed_arma_params, device=storage_device
-            )
+            precomputed_arma_params = to_tensor(precomputed_arma_params, device=storage_device)
             if precomputed_arma_params.shape != (n_voxels, 2):
                 raise ValueError(
                     f"precomputed_arma_params must have shape ({n_voxels}, 2), "
@@ -4724,7 +4650,9 @@ def fit_glm_arma11(
                             print(
                                 f"  Using CPU Cholesky (Cholesky peak: {cholesky_peak_gb:.1f}GB > {available_gb:.1f}GB available)"
                             )
-                            print(f"  (Stored grid ~{cholesky_peak_gb/6:.1f}GB will be loaded to GPU after computation)")
+                            print(
+                                f"  (Stored grid ~{cholesky_peak_gb / 6:.1f}GB will be loaded to GPU after computation)"
+                            )
 
                 # Override cholesky_on_cpu if GPU is better
                 actual_cholesky_on_cpu = cholesky_on_cpu and not use_gpu_cholesky
@@ -4812,7 +4740,9 @@ def fit_glm_arma11(
 
                 _arma_grid_dbg = make_vram_debugger(
                     device,
-                    batch_size * bytes_per_voxel_arma(n_timepoints, n_regressors) * (dtype.itemsize // 4),
+                    batch_size
+                    * bytes_per_voxel_arma(n_timepoints, n_regressors)
+                    * (dtype.itemsize // 4),
                     operation="arma_grid_search",
                     chunk_size=batch_size,
                     enabled=debug_memory,
@@ -4823,9 +4753,7 @@ def fit_glm_arma11(
                     batch_end = min(batch_start + batch_size, n_voxels)
 
                     # Get voxel data for this batch
-                    Y_batch = data[
-                        batch_start:batch_end
-                    ]  # (batch_voxels, n_timepoints)
+                    Y_batch = data[batch_start:batch_end]  # (batch_voxels, n_timepoints)
                     if _y_norm_scale is not None:
                         Y_batch = Y_batch / _y_norm_scale[batch_start:batch_end].unsqueeze(1)
 
@@ -4840,11 +4768,7 @@ def fit_glm_arma11(
                     # per-grid-point sync storm that throttled the subset path
                     # on CUDA. -exhaustive forces the global argmin on either.
                     _use_hierarchical = not force_exhaustive_search
-                    if (
-                        _use_hierarchical
-                        and device.type == "cpu"
-                        and not save_profile_likelihoods
-                    ):
+                    if _use_hierarchical and device.type == "cpu" and not save_profile_likelihoods:
                         best_params_batch, best_lik_batch = (
                             search_voxels_precomputed_grid_hierarchical(
                                 design,
@@ -4891,7 +4815,9 @@ def fit_glm_arma11(
                             search_result = _res
 
                     if save_profile_likelihoods:
-                        best_params_batch, best_lik_batch, surface_batch, surf_params = search_result
+                        best_params_batch, best_lik_batch, surface_batch, surf_params = (
+                            search_result
+                        )
                         # Allocate full surface array on first batch
                         if _surface_accum is None:
                             _surface_params = surf_params
@@ -4904,9 +4830,7 @@ def fit_glm_arma11(
 
                     # Store results
                     results.arma_params[batch_start:batch_end] = best_params_batch.cpu()
-                    results.reml_likelihood[batch_start:batch_end] = (
-                        best_lik_batch.cpu()
-                    )
+                    results.reml_likelihood[batch_start:batch_end] = best_lik_batch.cpu()
                 _arma_grid_dbg.__exit__(None, None, None)
 
                 # Store likelihood surface in results if computed
@@ -4940,9 +4864,7 @@ def fit_glm_arma11(
         # set, and we pay it once per HRF in per-voxel HRF mode. torch.unique
         # does it in one tensor op.
         ab_cpu = results.arma_params.cpu().contiguous()
-        unique_pairs, inverse_indices = torch.unique(
-            ab_cpu, dim=0, return_inverse=True
-        )
+        unique_pairs, inverse_indices = torch.unique(ab_cpu, dim=0, return_inverse=True)
         # Sort voxel indices by group to find per-group slice boundaries fast.
         sort_keys, sort_perm = torch.sort(inverse_indices, stable=True)
         # Group boundaries: where the group id changes.
@@ -4976,9 +4898,7 @@ def fit_glm_arma11(
             pbar = None
 
         # Process each (a,b) group
-        for group_idx, ((a_opt, b_opt), voxel_indices) in enumerate(
-            voxel_groups.items()
-        ):
+        for group_idx, ((a_opt, b_opt), voxel_indices) in enumerate(voxel_groups.items()):
             n_group_voxels = len(voxel_indices)
 
             # Get L and X_w for this (a,b) pair
@@ -5005,9 +4925,7 @@ def fit_glm_arma11(
             t_qr_start = time.time()
             if use_qr:
                 # QR path: Precompute Q and R
-                Q_group, R_qr_group = torch.linalg.qr(
-                    X_w
-                )  # Q: (n_time, n_reg), R: (n_reg, n_reg)
+                Q_group, R_qr_group = torch.linalg.qr(X_w)  # Q: (n_time, n_reg), R: (n_reg, n_reg)
                 # Precompute R^{-1} for variance computation (same for all voxels)
                 eye = torch.eye(n_regressors, device=device, dtype=dtype)
                 R_inv_group = torch.linalg.solve_triangular(R_qr_group, eye, upper=True)
@@ -5016,9 +4934,7 @@ def fit_glm_arma11(
             else:
                 # X'X path: Precompute X'X and its inverse ONCE per group (HUGE SAVINGS!)
                 # This is the SAME for all voxels in the group - no need to recompute per batch!
-                XwTXw_group = (
-                    X_w.T @ X_w
-                )  # (n_reg, n_reg) - only 12.5 MB for 1771 regressors!
+                XwTXw_group = X_w.T @ X_w  # (n_reg, n_reg) - only 12.5 MB for 1771 regressors!
 
                 try:
                     L_group = torch.linalg.cholesky(XwTXw_group)
@@ -5046,12 +4962,8 @@ def fit_glm_arma11(
                 _fci_tensor = torch.as_tensor(
                     fitted_column_indices, device=device, dtype=torch.long
                 )
-                _A_task = XwTXw_inv_group.index_select(0, _fci_tensor).index_select(
-                    1, _fci_tensor
-                )
-                _eye_task = torch.eye(
-                    len(fitted_column_indices), device=device, dtype=dtype
-                )
+                _A_task = XwTXw_inv_group.index_select(0, _fci_tensor).index_select(1, _fci_tensor)
+                _eye_task = torch.eye(len(fitted_column_indices), device=device, dtype=dtype)
                 A_task_inv_group = torch.linalg.inv(_A_task + 1e-8 * _eye_task)
                 del _A_task, _eye_task
                 A_full_inv_group = None
@@ -5103,9 +5015,7 @@ def fit_glm_arma11(
             a_val = torch.tensor(a_opt, device=device, dtype=dtype)
             b_val = torch.tensor(b_opt, device=device, dtype=dtype)
             lambda_val = (
-                (b_val + a_val)
-                * (1 + a_val * b_val)
-                / (1 + 2 * a_val * b_val + b_val**2 + 1e-10)
+                (b_val + a_val) * (1 + a_val * b_val) / (1 + 2 * a_val * b_val + b_val**2 + 1e-10)
             )
             # Convert to CPU scalar once for reuse
             lambda_val_cpu = lambda_val.cpu().item()
@@ -5118,7 +5028,9 @@ def fit_glm_arma11(
             # Process each sub-batch within this (a,b) group
             _gls_dbg = make_vram_debugger(
                 device,
-                sub_batch_size * bytes_per_voxel_arma(n_timepoints, n_regressors) * (dtype.itemsize // 4),
+                sub_batch_size
+                * bytes_per_voxel_arma(n_timepoints, n_regressors)
+                * (dtype.itemsize // 4),
                 operation="gls_fitting",
                 chunk_size=sub_batch_size,
                 enabled=debug_memory and group_idx == 0,  # only report for first group
@@ -5134,7 +5046,9 @@ def fit_glm_arma11(
                 Y_batch = data[sub_voxel_indices].T  # (n_timepoints, batch_voxels)
                 Y_batch_dev = Y_batch.to(device)
                 if _y_norm_scale is not None:
-                    Y_batch_dev = Y_batch_dev / _y_norm_scale[sub_voxel_indices].to(device).unsqueeze(0)
+                    Y_batch_dev = Y_batch_dev / _y_norm_scale[sub_voxel_indices].to(
+                        device
+                    ).unsqueeze(0)
 
                 # Store λ for these voxels (pre-computed above, reuse for all sub-batches)
                 results.arma_lambda[sub_voxel_indices] = lambda_val_cpu
@@ -5169,9 +5083,7 @@ def fit_glm_arma11(
 
                     t_solve_start = time.time()
                     # Compute Q'y for each voxel: (n_reg, n_time) @ (n_time, batch) = (n_reg, batch)
-                    QTy_batch = (
-                        Q_group.T @ y_w_batch.T
-                    ).T  # (batch_voxels, n_regressors)
+                    QTy_batch = (Q_group.T @ y_w_batch.T).T  # (batch_voxels, n_regressors)
 
                     # Solve R β = Q'y using triangular solve
                     # Expand R_qr_group to batch for solve_triangular
@@ -5187,9 +5099,7 @@ def fit_glm_arma11(
                     # Statistics computation using precomputed matrices
                     t_stats_start = time.time()
                     # pred_w = X_w @ beta for each voxel
-                    pred_w_batch = (
-                        X_w @ betas_batch.T
-                    ).T  # (batch_voxels, n_timepoints)
+                    pred_w_batch = (X_w @ betas_batch.T).T  # (batch_voxels, n_timepoints)
                     resid_w_batch = y_w_batch - pred_w_batch
                     del X_w_batch
 
@@ -5199,9 +5109,9 @@ def fit_glm_arma11(
                     df = results.dof
                     # Double-precision accumulation for RSS: eliminates rounding in sum-of-squares
                     # fp64 accumulator avoids RSS rounding without materializing a fp64 copy
-                    sigma2_batch = (
-                        resid_w_batch.pow(2).sum(dim=1, dtype=_accum_dtype) / df
-                    ).to(dtype)
+                    sigma2_batch = (resid_w_batch.pow(2).sum(dim=1, dtype=_accum_dtype) / df).to(
+                        dtype
+                    )
 
                     if not want_residuals:
                         del resid_w_batch
@@ -5212,12 +5122,8 @@ def fit_glm_arma11(
                     )
                     # Only materialize var_beta_batch when GLTs need it (legacy contrast path)
                     if glt_contrasts_tensor is not None:
-                        XwTXw_inv_batch = XwTXw_inv_group.unsqueeze(0).expand(
-                            batch_voxels, -1, -1
-                        )
-                        var_beta_batch = (
-                            sigma2_batch.unsqueeze(1).unsqueeze(2) * XwTXw_inv_batch
-                        )
+                        XwTXw_inv_batch = XwTXw_inv_group.unsqueeze(0).expand(batch_voxels, -1, -1)
+                        var_beta_batch = sigma2_batch.unsqueeze(1).unsqueeze(2) * XwTXw_inv_batch
                     else:
                         var_beta_batch = None
                     tstats_batch = betas_batch / (se_beta_batch + 1e-10)
@@ -5241,13 +5147,9 @@ def fit_glm_arma11(
                         if fitted_column_indices is not None:
                             task_indices_set = set(fitted_column_indices)
                             all_indices = set(range(n_regressors))
-                            nuisance_indices = sorted(
-                                list(all_indices - task_indices_set)
-                            )
+                            nuisance_indices = sorted(list(all_indices - task_indices_set))
 
-                            r2_partial_task_batch = r2_partial_full_batch[
-                                :, fitted_column_indices
-                            ]
+                            r2_partial_task_batch = r2_partial_full_batch[:, fitted_column_indices]
                             # Always extract nuisance for storage (used for -bout output)
                             r2_partial_nuisance_batch = (
                                 r2_partial_full_batch[:, nuisance_indices]
@@ -5260,9 +5162,7 @@ def fit_glm_arma11(
                                 r2_nuisance_total = r2_partial_nuisance_batch.sum(
                                     dim=1, keepdim=True
                                 )
-                                denominator = torch.clamp(
-                                    1.0 - r2_nuisance_total, min=0.01
-                                )
+                                denominator = torch.clamp(1.0 - r2_nuisance_total, min=0.01)
                                 r2_partial_batch = r2_partial_task_batch / denominator
                             else:
                                 r2_partial_batch = r2_partial_task_batch
@@ -5282,17 +5182,13 @@ def fit_glm_arma11(
                         if not want_r2_partial:
                             df = results.dof
                             t_squared_batch = tstats_batch**2
-                            r2_partial_full_batch = t_squared_batch / (
-                                t_squared_batch + df
-                            )
+                            r2_partial_full_batch = t_squared_batch / (t_squared_batch + df)
 
                             # Split into task vs nuisance
                             if fitted_column_indices is not None:
                                 task_indices_set = set(fitted_column_indices)
                                 all_indices = set(range(n_regressors))
-                                nuisance_indices = sorted(
-                                    list(all_indices - task_indices_set)
-                                )
+                                nuisance_indices = sorted(list(all_indices - task_indices_set))
 
                                 r2_partial_task_batch = r2_partial_full_batch[
                                     :, fitted_column_indices
@@ -5307,9 +5203,7 @@ def fit_glm_arma11(
                                 r2_partial_nuisance_batch = None
 
                         # Compute semi-partial R² from partial R²
-                        r2_semipartial_task_batch = (
-                            r2_partial_task_batch * variance_remaining
-                        )
+                        r2_semipartial_task_batch = r2_partial_task_batch * variance_remaining
 
                         # Nuisance semi-partial R²
                         r2_semipartial_nuisance_batch = (
@@ -5327,12 +5221,8 @@ def fit_glm_arma11(
                             r2_semi_nuisance_total = r2_semipartial_nuisance_batch.sum(
                                 dim=1, keepdim=True
                             )
-                            denominator = torch.clamp(
-                                1.0 - r2_semi_nuisance_total, min=0.01
-                            )
-                            r2_semipartial_batch = (
-                                r2_semipartial_task_batch / denominator
-                            )
+                            denominator = torch.clamp(1.0 - r2_semi_nuisance_total, min=0.01)
+                            r2_semipartial_batch = r2_semipartial_task_batch / denominator
                         else:
                             # Full mode: use raw semi-partial R² values
                             r2_semipartial_batch = r2_semipartial_task_batch
@@ -5360,9 +5250,7 @@ def fit_glm_arma11(
                     # GLT CONTRASTS (QR path): Compute in-loop
                     if glt_contrasts_tensor is not None:
                         t_glt_start = time.time()
-                        contrast_betas_batch_qr = torch.mm(
-                            betas_batch, glt_contrasts_tensor.T
-                        )
+                        contrast_betas_batch_qr = torch.mm(betas_batch, glt_contrasts_tensor.T)
 
                         if legacy_contrasts:
                             # LEGACY: Loop-based computation (slow, for validation only)
@@ -5372,16 +5260,12 @@ def fit_glm_arma11(
                             for c_idx in range(n_contrasts):
                                 c = glt_contrasts_tensor[c_idx]
                                 c_var = torch.bmm(
-                                    c.unsqueeze(0)
-                                    .unsqueeze(1)
-                                    .expand(batch_voxels, 1, -1),
+                                    c.unsqueeze(0).unsqueeze(1).expand(batch_voxels, 1, -1),
                                     var_beta_batch,
                                 )
                                 contrast_vars_batch_qr[:, c_idx] = torch.bmm(
                                     c_var,
-                                    c.unsqueeze(0)
-                                    .unsqueeze(2)
-                                    .expand(batch_voxels, -1, 1),
+                                    c.unsqueeze(0).unsqueeze(2).expand(batch_voxels, -1, 1),
                                 ).squeeze()
                         else:
                             # OPTIMIZED: Vectorized einsum (10-50x faster!)
@@ -5412,12 +5296,8 @@ def fit_glm_arma11(
                             )
 
                         # Store immediately for QR path
-                        results.contrast_betas[sub_voxel_indices] = (
-                            contrast_betas_batch_qr.cpu()
-                        )
-                        results.contrast_tstats[sub_voxel_indices] = (
-                            contrast_tstats_batch_qr.cpu()
-                        )
+                        results.contrast_betas[sub_voxel_indices] = contrast_betas_batch_qr.cpu()
+                        results.contrast_tstats[sub_voxel_indices] = contrast_tstats_batch_qr.cpu()
                         if want_r2_partial:
                             results.contrast_r2_partial[sub_voxel_indices] = (
                                 contrast_r2_partial_batch.cpu()
@@ -5439,9 +5319,7 @@ def fit_glm_arma11(
 
                     # Solve: β = (X'X)^{-1} X'y using precomputed (X'X)^{-1}
                     # XwTXw_inv_group: (n_reg, n_reg), XwTy_batch: (batch, n_reg)
-                    betas_batch = torch.mm(
-                        XwTy_batch, XwTXw_inv_group.T
-                    )  # (batch, n_reg)
+                    betas_batch = torch.mm(XwTy_batch, XwTXw_inv_group.T)  # (batch, n_reg)
 
                     del XwTy_batch
                     if device.type == "cuda":
@@ -5461,9 +5339,9 @@ def fit_glm_arma11(
                     df = results.dof
                     # Double-precision accumulation for RSS: eliminates rounding in sum-of-squares
                     # fp64 accumulator avoids RSS rounding without materializing a fp64 copy
-                    sigma2_batch = (
-                        resid_w_batch.pow(2).sum(dim=1, dtype=_accum_dtype) / df
-                    ).to(dtype)
+                    sigma2_batch = (resid_w_batch.pow(2).sum(dim=1, dtype=_accum_dtype) / df).to(
+                        dtype
+                    )
 
                     if not want_residuals:
                         del resid_w_batch
@@ -5473,23 +5351,16 @@ def fit_glm_arma11(
                     if glt_contrasts_tensor is not None:
                         # Need full var_beta_batch for GLT contrast computation
                         # Expand precomputed inverse to batch dimension
-                        XwTXw_inv_batch = XwTXw_inv_group.unsqueeze(0).expand(
-                            batch_voxels, -1, -1
-                        )
+                        XwTXw_inv_batch = XwTXw_inv_group.unsqueeze(0).expand(batch_voxels, -1, -1)
 
-                        var_beta_batch = (
-                            sigma2_batch.unsqueeze(1).unsqueeze(2) * XwTXw_inv_batch
-                        )
-                        se_beta_batch = torch.sqrt(
-                            torch.diagonal(var_beta_batch, dim1=1, dim2=2)
-                        )
+                        var_beta_batch = sigma2_batch.unsqueeze(1).unsqueeze(2) * XwTXw_inv_batch
+                        se_beta_batch = torch.sqrt(torch.diagonal(var_beta_batch, dim1=1, dim2=2))
                     else:
                         # No GLTs - only need diagonal for standard errors (much faster!)
                         # Use precomputed diagonal from group level
                         # XwTXw_inv_diag_group: (n_reg,) - same for all voxels!
                         se_beta_batch = torch.sqrt(
-                            sigma2_batch.unsqueeze(1)
-                            * XwTXw_inv_diag_group.unsqueeze(0)
+                            sigma2_batch.unsqueeze(1) * XwTXw_inv_diag_group.unsqueeze(0)
                         )
                         var_beta_batch = None  # Not computed when no GLTs
 
@@ -5510,13 +5381,9 @@ def fit_glm_arma11(
                         if fitted_column_indices is not None:
                             task_indices_set = set(fitted_column_indices)
                             all_indices = set(range(n_regressors))
-                            nuisance_indices = sorted(
-                                list(all_indices - task_indices_set)
-                            )
+                            nuisance_indices = sorted(list(all_indices - task_indices_set))
 
-                            r2_partial_task_batch = r2_partial_full_batch[
-                                :, fitted_column_indices
-                            ]
+                            r2_partial_task_batch = r2_partial_full_batch[:, fitted_column_indices]
                             # Always extract nuisance for storage (used for -bout output)
                             r2_partial_nuisance_batch = (
                                 r2_partial_full_batch[:, nuisance_indices]
@@ -5529,9 +5396,7 @@ def fit_glm_arma11(
                                 r2_nuisance_total = r2_partial_nuisance_batch.sum(
                                     dim=1, keepdim=True
                                 )
-                                denominator = torch.clamp(
-                                    1.0 - r2_nuisance_total, min=0.01
-                                )
+                                denominator = torch.clamp(1.0 - r2_nuisance_total, min=0.01)
                                 r2_partial_batch = r2_partial_task_batch / denominator
                             else:
                                 r2_partial_batch = r2_partial_task_batch
@@ -5581,17 +5446,13 @@ def fit_glm_arma11(
                         if not want_r2_partial:
                             df = results.dof
                             t_squared_batch = tstats_batch**2
-                            r2_partial_full_batch = t_squared_batch / (
-                                t_squared_batch + df
-                            )
+                            r2_partial_full_batch = t_squared_batch / (t_squared_batch + df)
 
                             # Split into task vs nuisance
                             if fitted_column_indices is not None:
                                 task_indices_set = set(fitted_column_indices)
                                 all_indices = set(range(n_regressors))
-                                nuisance_indices = sorted(
-                                    list(all_indices - task_indices_set)
-                                )
+                                nuisance_indices = sorted(list(all_indices - task_indices_set))
 
                                 r2_partial_task_batch = r2_partial_full_batch[
                                     :, fitted_column_indices
@@ -5606,9 +5467,7 @@ def fit_glm_arma11(
                                 r2_partial_nuisance_batch = None
 
                         # Compute semi-partial R² from partial R²
-                        r2_semipartial_task_batch = (
-                            r2_partial_task_batch * variance_remaining
-                        )
+                        r2_semipartial_task_batch = r2_partial_task_batch * variance_remaining
 
                         # Nuisance semi-partial R²
                         r2_semipartial_nuisance_batch = (
@@ -5626,12 +5485,8 @@ def fit_glm_arma11(
                             r2_semi_nuisance_total = r2_semipartial_nuisance_batch.sum(
                                 dim=1, keepdim=True
                             )
-                            denominator = torch.clamp(
-                                1.0 - r2_semi_nuisance_total, min=0.01
-                            )
-                            r2_semipartial_batch = (
-                                r2_semipartial_task_batch / denominator
-                            )
+                            denominator = torch.clamp(1.0 - r2_semi_nuisance_total, min=0.01)
+                            r2_semipartial_batch = r2_semipartial_task_batch / denominator
                         else:
                             # Full mode: use raw semi-partial R² values
                             r2_semipartial_batch = r2_semipartial_task_batch
@@ -5683,12 +5538,8 @@ def fit_glm_arma11(
                         )
 
                     # Compute t-statistics for contrasts
-                    contrast_se_batch = torch.sqrt(
-                        torch.clamp(contrast_vars_batch, min=0.0)
-                    )
-                    contrast_tstats_batch = contrast_betas_batch / (
-                        contrast_se_batch + 1e-10
-                    )
+                    contrast_se_batch = torch.sqrt(torch.clamp(contrast_vars_batch, min=0.0))
+                    contrast_tstats_batch = contrast_betas_batch / (contrast_se_batch + 1e-10)
                     if device.type == "cuda":
                         torch.cuda.synchronize()
                     t_glt_total += time.time() - t_glt_start
@@ -5697,9 +5548,7 @@ def fit_glm_arma11(
                     if want_r2_partial:
                         df = results.dof
                         contrast_t_squared = contrast_tstats_batch**2
-                        contrast_r2_partial_batch = contrast_t_squared / (
-                            contrast_t_squared + df
-                        )
+                        contrast_r2_partial_batch = contrast_t_squared / (contrast_t_squared + df)
 
                     # Compute semi-partial R² for contrasts if requested
                     if want_r2_semipartial:
@@ -5717,17 +5566,12 @@ def fit_glm_arma11(
                             1.0 - r2_batch.to(dtype).unsqueeze(1), min=0.0
                         )
                         contrast_r2_semipartial_batch = (
-                            contrast_r2_partial_batch_temp
-                            * variance_remaining_contrasts
+                            contrast_r2_partial_batch_temp * variance_remaining_contrasts
                         )
 
                     # Store contrast results
-                    results.contrast_betas[sub_voxel_indices] = (
-                        contrast_betas_batch.cpu()
-                    )
-                    results.contrast_tstats[sub_voxel_indices] = (
-                        contrast_tstats_batch.cpu()
-                    )
+                    results.contrast_betas[sub_voxel_indices] = contrast_betas_batch.cpu()
+                    results.contrast_tstats[sub_voxel_indices] = contrast_tstats_batch.cpu()
                     if want_r2_partial:
                         results.contrast_r2_partial[sub_voxel_indices] = (
                             contrast_r2_partial_batch.cpu()
@@ -5740,12 +5584,8 @@ def fit_glm_arma11(
                 # Move to CPU and store
                 # Extract only task columns if filtering is requested
                 if fitted_column_indices is not None:
-                    results.betas[sub_voxel_indices] = betas_batch[
-                        :, fitted_column_indices
-                    ].cpu()
-                    results.tstats[sub_voxel_indices] = tstats_batch[
-                        :, fitted_column_indices
-                    ].cpu()
+                    results.betas[sub_voxel_indices] = betas_batch[:, fitted_column_indices].cpu()
+                    results.tstats[sub_voxel_indices] = tstats_batch[:, fitted_column_indices].cpu()
                 else:
                     results.betas[sub_voxel_indices] = betas_batch.cpu()
                     results.tstats[sub_voxel_indices] = tstats_batch.cpu()
@@ -5769,9 +5609,7 @@ def fit_glm_arma11(
                 # Store semi-partial R² if requested
                 # NOTE: r2_semipartial_batch is already filtered to task columns in the computation above
                 if want_r2_semipartial:
-                    results.r2_semipartial[sub_voxel_indices] = (
-                        r2_semipartial_batch.cpu()
-                    )
+                    results.r2_semipartial[sub_voxel_indices] = r2_semipartial_batch.cpu()
                     # Store nuisance semi-partial R² if we extracted it
                     if (
                         r2_semipartial_nuisance_batch is not None
@@ -5854,11 +5692,7 @@ def fit_glm_arma11(
         results.reml_likelihood[:] = likelihood_opt
 
         # Compute λ
-        lam = (
-            (b_opt + a_opt)
-            * (1 + a_opt * b_opt)
-            / (1 + 2 * a_opt * b_opt + b_opt**2 + 1e-10)
-        )
+        lam = (b_opt + a_opt) * (1 + a_opt * b_opt) / (1 + 2 * a_opt * b_opt + b_opt**2 + 1e-10)
         results.arma_lambda[:] = lam
 
         # Move design to device for prewhitening
@@ -5877,9 +5711,7 @@ def fit_glm_arma11(
 
         voxel_iterator = range(n_voxels)
         if verbose and n_voxels > 1000:
-            voxel_iterator = tqdm(
-                voxel_iterator, desc="Global ARMA fitting", unit="voxel"
-            )
+            voxel_iterator = tqdm(voxel_iterator, desc="Global ARMA fitting", unit="voxel")
 
         for v in voxel_iterator:
             y_v_cpu = data[v]
@@ -5934,9 +5766,7 @@ def fit_glm_arma11(
                     r2_partial_task = r2_partial_full[fitted_column_indices]
                     # Always extract nuisance for storage (used for -bout output)
                     r2_partial_nuisance = (
-                        r2_partial_full[nuisance_indices]
-                        if len(nuisance_indices) > 0
-                        else None
+                        r2_partial_full[nuisance_indices] if len(nuisance_indices) > 0 else None
                     )
 
                     if r2_partial_mode == "task" and len(nuisance_indices) > 0:
@@ -5949,10 +5779,7 @@ def fit_glm_arma11(
 
                     results.r2_partial[v] = r2_partial.cpu()
                     # Store nuisance partial R² if allocated
-                    if (
-                        r2_partial_nuisance is not None
-                        and results.r2_partial_nuisance is not None
-                    ):
+                    if r2_partial_nuisance is not None and results.r2_partial_nuisance is not None:
                         results.r2_partial_nuisance[v] = r2_partial_nuisance.cpu()
                 else:
                     # No filtering - use all
@@ -6034,9 +5861,7 @@ def fit_glm_arma11(
             batch_size=batch_size,
             verbose=verbose,
         )
-        results.dsort_labels = dsort_labels or [
-            f"dsort#{k}" for k in range(int(dsort.shape[1]))
-        ]
+        results.dsort_labels = dsort_labels or [f"dsort#{k}" for k in range(int(dsort.shape[1]))]
         results.nods_results = nods_results
 
     # Unscale results from per-voxel float32 conditioning.
@@ -6131,9 +5956,7 @@ def compare_ols_vs_arma11(
     arma_results = fit_glm_arma11(data, design, tr, device=device, verbose=True)
 
     # Compare t-statistics
-    tstat_ratio = arma_results.tstats.abs().mean() / (
-        ols_results.tstats.abs().mean() + 1e-10
-    )
+    tstat_ratio = arma_results.tstats.abs().mean() / (ols_results.tstats.abs().mean() + 1e-10)
 
     # R² improvement
     r2_improvement = arma_results.r2.mean() - ols_results.r2.mean()
@@ -6326,9 +6149,7 @@ def save_arma_rvar(
 
     # Compute Ljung-Box statistic
     if results.residuals_whitened is not None:
-        ljung_box = compute_ljung_box_statistic(
-            results.residuals_whitened, max_lag=max_lag
-        )
+        ljung_box = compute_ljung_box_statistic(results.residuals_whitened, max_lag=max_lag)
     else:
         # No residuals saved - set to zero
         assert arma_params is not None, "arma_params should not be None"
@@ -6456,9 +6277,7 @@ def load_arma_params(
         a_vol = arma_4d[..., 0]
         b_vol = arma_4d[..., 1]
     else:
-        raise ValueError(
-            f"Expected 4D NIfTI with at least 2 volumes, got shape {arma_4d.shape}"
-        )
+        raise ValueError(f"Expected 4D NIfTI with at least 2 volumes, got shape {arma_4d.shape}")
 
     # Apply mask if provided
     if voxel_mask is not None:
