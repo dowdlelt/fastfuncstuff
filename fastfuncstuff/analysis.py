@@ -400,6 +400,7 @@ def analyze_from_design_matrix(
     want_dsort_nods: bool = False,
     slibase_files: list[str | Path] | None = None,
     slibase_files_sm: list[str | Path] | None = None,
+    censor_file: str | Path | None = None,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -851,6 +852,55 @@ def analyze_from_design_matrix(
     if design.shape[0] != data.shape[1]:
         design = design.T
 
+    # ── Within-run censoring (AFNI GoodList) ──────────────────────────────
+    # A censored ("bad") timepoint is dropped from y and X (and dsort): it must
+    # not contribute. But its neighbours are fine, so noise correlation should
+    # reach *across* the hole — weakened by the true time gap (lag-2, not lag-1).
+    # We drop the bad rows here (helps OLS too) and hand the ARMA path a `tau`
+    # carrying each survivor's true within-run time index. Run boundaries stay a
+    # hard cut. See glm.arma.build_censor_run_info.
+    arma_run_starts = (
+        actual_run_starts
+        if "actual_run_starts" in locals()
+        else design_info.get("run_starts", None)
+    )
+    arma_tau = None
+    # An explicit -censor .1D overrides any xmat GoodList: 1=keep, 0=censor, one
+    # row per concatenated TR. This is how censoring reaches the -onsets/-events
+    # paths, whose in-CLI design_info has no GoodList header.
+    if censor_file is not None:
+        from fastfuncstuff.io.afni import read_censor_1d
+
+        n_expected = design_info.get("n_timepoints") or design.shape[0]
+        design_info["good_list"] = read_censor_1d(censor_file, n_expected=n_expected)
+
+    good_list = design_info.get("good_list")
+    # NRowFull (full, pre-censor TR count) is the reference length. AFNI xmats
+    # store all rows; some pipelines pre-subset to good rows only — handle both
+    # by reducing only the axes that are still full-length.
+    n_full = design_info.get("n_timepoints")
+    if (
+        good_list is not None
+        and n_full is not None
+        and len(good_list) < n_full
+    ):
+        from fastfuncstuff.glm.arma import build_censor_run_info
+
+        keep = torch.as_tensor(list(good_list), dtype=torch.long)
+        if design.shape[0] == n_full:
+            design = design[keep.to(design.device)]
+        if data.shape[1] == n_full:
+            data = data[:, keep.to(data.device)]
+        if dsort_tensor is not None and dsort_tensor.shape[-1] == n_full:
+            dsort_tensor = dsort_tensor[..., keep.to(dsort_tensor.device)]
+        arma_run_starts, arma_tau = build_censor_run_info(
+            arma_run_starts if arma_run_starts is not None else [0],
+            n_full,
+            good_list=good_list,
+        )
+        if arma_tau is not None:
+            arma_tau = arma_tau.to(design.device)
+
     # 4. Get TR from design info
     tr = design_info["tr"]
 
@@ -1194,11 +1244,8 @@ def analyze_from_design_matrix(
                 task_indices=stim_indices if stim_indices else None,
                 legacy_contrasts=legacy_contrasts,
                 save_profile_likelihoods=save_profile_likelihoods,
-                run_starts=(
-                    actual_run_starts
-                    if "actual_run_starts" in locals()
-                    else design_info.get("run_starts", None)
-                ),
+                run_starts=arma_run_starts,
+                tau=arma_tau,
                 dsort=dsort_tensor,
                 dsort_labels=dsort_labels,
                 want_dsort_nods=want_dsort_nods,
@@ -1231,11 +1278,8 @@ def analyze_from_design_matrix(
                 spatial_metadata=spatial_metadata if spatial_metadata else None,
                 legacy_contrasts=legacy_contrasts,
                 save_profile_likelihoods=save_profile_likelihoods,
-                run_starts=(
-                    actual_run_starts
-                    if "actual_run_starts" in locals()
-                    else design_info.get("run_starts", None)
-                ),
+                run_starts=arma_run_starts,
+                tau=arma_tau,
                 dsort=dsort_tensor,
                 dsort_labels=dsort_labels,
                 want_dsort_nods=want_dsort_nods,

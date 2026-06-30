@@ -499,6 +499,19 @@ Examples:
         ),
     )
     arma_opts.add_argument(
+        "-afni_mode",
+        "-afni-mode",
+        action="store_true",
+        help=(
+            "Match AFNI 3dREMLfit byte-for-byte on the small (a,b) divergences "
+            "instead of FFS's more-accurate defaults. Switches three things to "
+            "AFNI's choices: banded covariance (corcut=1e-4 truncation) instead "
+            "of the exact dense Toeplitz; the coarser hierarchical search top "
+            "level; and dropping near-white grid points (0<lam<corcut). "
+            "Default OFF — FFS is at least as accurate. Use only for AFNI parity."
+        ),
+    )
+    arma_opts.add_argument(
         "-grid_batching",
         action="store_true",
         help=(
@@ -551,6 +564,18 @@ Examples:
         help="Use double precision (float64) - matches AFNI exactly, ~2x memory, ~1.5x slower",
     )
     proc_opts.add_argument("-mask", help="Mask file to restrict analysis")
+    proc_opts.add_argument(
+        "-censor",
+        metavar="FILE.1D",
+        help=(
+            "Censor file: one value per concatenated TR (1=keep, 0=censor), in "
+            "order across runs (e.g. 600 rows for 3×200-TR runs). Censored TRs "
+            "are dropped from data and design; the ARMA noise model steps across "
+            "each gap via tau (lag respects the true time distance), and run "
+            "boundaries stay a hard cut. Use with -onsets/-events; for -matrix "
+            "the xmat GoodList is honoured automatically (and -censor overrides)."
+        ),
+    )
     proc_opts.add_argument(
         "-do_scale",
         action="store_true",
@@ -930,6 +955,13 @@ def main():
     if not filtered_argv:
         parser.print_help()
         sys.exit(0)
+
+    # -afni_mode: switch the REML noise model to AFNI-faithful behaviour for the
+    # whole run (banded R, AFNI ltop, corcut grid filter). Default is FFS-accurate.
+    if getattr(args, "afni_mode", False):
+        from fastfuncstuff.glm.arma import set_afni_mode
+
+        set_afni_mode(True)
 
     # Validate design input: exactly one of -matrix, -onsets, -events, -spec.
     _design_sources = [
@@ -2203,6 +2235,7 @@ def main():
             want_dsort_nods=args.dsort_nods,
             slibase_files=args.slibase,
             slibase_files_sm=args.slibase_sm,
+            censor_file=args.censor,
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).

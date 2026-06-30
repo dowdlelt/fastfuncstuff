@@ -340,7 +340,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     elapsed, _ = run_timed(
         f"ffs_reml -input {inputs} -matrix {xmat} "
         f"-Rbuck {out_path} -Rvar {out_var} -tout -add_fdr"
-        f"{ctx.ffs_device_flag()}",
+        f"{ctx.ffs_afni_mode_flag()}{ctx.ffs_device_flag()}",
         label="ffs_reml REML+FDR",
         cwd=ffs,
     )

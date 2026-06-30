@@ -146,7 +146,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-Rvar {_ffs_var(ctx)} "
         f"-mask {mask} "
         f"-tout"
-        f"{ctx.ffs_device_flag()}",
+        f"{ctx.ffs_afni_mode_flag()}{ctx.ffs_device_flag()}",
         label="ffs_reml IM REML",
         cwd=ffs,
     )

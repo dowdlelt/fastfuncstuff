@@ -222,7 +222,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     if not ffs_reml.exists() or ctx.force_ffs:
         elapsed, _ = run_timed(
             f"ffs_reml -input {inputs} -matrix {xmat} -Rbuck {ffs_reml} -Rvar {ffs_var} -tout"
-            f"{ctx.ffs_device_flag()}",
+            f"{ctx.ffs_afni_mode_flag()}{ctx.ffs_device_flag()}",
             label="ffs_reml REML",
             cwd=ffs,
         )
