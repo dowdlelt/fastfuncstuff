@@ -108,6 +108,14 @@ class NordicConfig:
     factor_sweep_top_frac: float = 0.30  # top_pairs: fraction of in-brain voxels kept
     factor_sweep_dist_bins: int = 24
     factor_sweep_r_bins: int = 201
+    # Extra diagnostic images (all reuse the SVD cache; no reconstruction):
+    #  save_imgs       -> automask + top_pairs voxel masks (3D)
+    #  save_factor_img -> 4D patch-averaged #components-removed, sub-bricks = factor
+    #                     (0.1..5.0 step 0.1); shows how the floor moves with factor
+    #  save_eigen_img  -> 4D patch-averaged singular-value spectrum, sub-bricks = rank
+    factor_sweep_save_imgs: bool = False
+    factor_sweep_save_factor_img: bool = False
+    factor_sweep_save_eigen_img: bool = False
 
 
 @dataclass

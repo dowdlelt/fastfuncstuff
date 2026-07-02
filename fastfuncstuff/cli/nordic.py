@@ -245,6 +245,26 @@ Examples:
         default=40000,
         help="Per-mask voxel cap for the correlation (random subsample). 0 = all voxels.",
     )
+    sweep_group.add_argument(
+        "-save-imgs",
+        "-save_imgs",
+        action="store_true",
+        help="Save the generated automask and the top_pairs voxel mask as NIfTIs.",
+    )
+    sweep_group.add_argument(
+        "-save-factor-img",
+        "-save_factor_img",
+        action="store_true",
+        help="Save a 4D patch-averaged #components-removed image; sub-bricks step the "
+        "factor 0.1..5.0 (shows how the keep/kill floor moves with factor).",
+    )
+    sweep_group.add_argument(
+        "-save-eigen-img",
+        "-save_eigen_img",
+        action="store_true",
+        help="Save a 4D patch-averaged singular-value spectrum image (sub-bricks = "
+        "component rank); shows where factor*lambda lands on each patch's spectrum.",
+    )
 
     perf_group = parser.add_argument_group("Performance")
     perf_group.add_argument(
@@ -297,8 +317,12 @@ def main(argv: list[str] | None = None) -> None:
         None if args.factor_sweep_max_voxels in (0, None) else args.factor_sweep_max_voxels
     )
 
-    if args.factor_sweep and n_echoes > 1:
-        print("ERROR: -factor-sweep is single-echo only (pass one -input-magn).")
+    # The sweep path also handles the cache-only diagnostic images.
+    run_sweep_path = (
+        args.factor_sweep or args.save_imgs or args.save_factor_img or args.save_eigen_img
+    )
+    if run_sweep_path and n_echoes > 1:
+        print("ERROR: -factor-sweep / -save-*-img are single-echo only (pass one -input-magn).")
         sys.exit(1)
 
     prefix_info = parse_prefix(args.prefix)
@@ -344,11 +368,14 @@ def main(argv: list[str] | None = None) -> None:
         factor_sweep=args.factor_sweep,
         factor_sweep_values=sweep_values,
         factor_sweep_max_voxels=sweep_max_voxels,
+        factor_sweep_save_imgs=args.save_imgs,
+        factor_sweep_save_factor_img=args.save_factor_img,
+        factor_sweep_save_eigen_img=args.save_eigen_img,
         verbose=args.verb >= 1,
     )
 
     t0 = time.time()
-    if args.factor_sweep:
+    if run_sweep_path:
         summary = run_nordic_factor_sweep(
             magnitude_file=magn_files[0],
             phase_file=phase_files[0] if phase_files is not None else None,
@@ -357,9 +384,10 @@ def main(argv: list[str] | None = None) -> None:
             device=device,
         )
         elapsed = time.time() - t0
-        print("\nDone (factor sweep)")
-        sf = summary.get("suggested_factor", {})
-        print(f"  Liftoff factor (null held up to): {sf.get('liftoff_factor')}")
+        print("\nDone (factor sweep)" if args.factor_sweep else "\nDone (diagnostic images)")
+        sf = summary.get("suggested_factor")
+        if sf is not None:
+            print(f"  Liftoff factor (null held up to): {sf.get('liftoff_factor')}")
         for key, path in summary.get("outputs", {}).items():
             print(f"  {key}: {path}")
         print(f"  Elapsed: {elapsed:.1f} s")

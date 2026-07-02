@@ -32,7 +32,7 @@ from fastfuncstuff.denoise.nordic import (
     _build_patch_starts,
     _prepare_echo,
 )
-from fastfuncstuff.io.afni import load_nifti
+from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.stats.voxel_correlation import (
     CorrSummary,
     analytic_r_null,
@@ -177,6 +177,78 @@ def _residual_magnitude_at_factor(
     return recon.abs()  # (nvox, nt) residual magnitude
 
 
+def _scatter_patch_to_voxels(
+    cache: _SVDCache, per_patch: torch.Tensor, batch: int, device: torch.device
+) -> torch.Tensor:
+    """Map a per-patch quantity ``(P, C)`` to voxels ``(nvox, C)``, patch-averaged
+    over overlapping patches. Same corner/offset machinery as the reconstruction."""
+    nx, ny, nz, _ = cache.shape
+    nvox = nx * ny * nz
+    c = per_patch.shape[1]
+    m = cache.dxyz_flat.numel()
+    acc = torch.zeros((nvox, c), dtype=torch.float32, device=device)
+    wt = torch.zeros(nvox, dtype=torch.float32, device=device)
+    total = per_patch.shape[0]
+    for b0 in range(0, total, batch):
+        b1 = min(b0 + batch, total)
+        flat_b = (cache.corners_flat[b0:b1][:, None] + cache.dxyz_flat[None, :]).reshape(-1)
+        acc.index_add_(0, flat_b, per_patch[b0:b1].repeat_interleave(m, dim=0))
+        wt.index_add_(0, flat_b, torch.ones(flat_b.numel(), device=device))
+    return acc / wt.clamp(min=1.0)[:, None]
+
+
+# Fixed factor grid for the -save_factor_img sub-bricks: 0.1..5.0 step 0.1.
+_FACTOR_IMG_GRID = [round(0.1 * i, 1) for i in range(1, 51)]
+
+
+def _save_diag_images(
+    cache: _SVDCache,
+    lambda_base: float,
+    brain_flat: torch.Tensor | None,
+    top_idx: torch.Tensor | None,
+    output_prefix: str,
+    magnitude_file: str,
+    cfg: NordicConfig,
+    dev: torch.device,
+) -> dict[str, str]:
+    """Write the requested SVD-cache diagnostic images. Returns {name: path}."""
+    nx, ny, nz, _ = cache.shape
+    ext = ".nii.gz" if cfg.write_gzipped_niftis else ".nii"
+    out = Path(output_prefix)
+    stem = out.name
+    out_dir = out.parent if out.parent != Path("") else Path(".")
+    paths: dict[str, str] = {}
+
+    def _save(arr: np.ndarray, suffix: str, labels: list[str] | None = None) -> None:
+        p = out_dir / f"{stem}_{suffix}{ext}"
+        save_nifti(arr, output_path=p, reference_img=magnitude_file, brick_labels=labels)
+        paths[suffix] = str(p)
+
+    if cfg.factor_sweep_save_imgs:
+        if brain_flat is not None:
+            _save(brain_flat.reshape(nx, ny, nz).float().cpu().numpy(), "automask")
+        if top_idx is not None:
+            tp = torch.zeros(nx * ny * nz, dtype=torch.float32, device=dev)
+            tp[top_idx] = 1.0
+            _save(tp.reshape(nx, ny, nz).cpu().numpy(), "toppairs")
+
+    if cfg.factor_sweep_save_factor_img:
+        grid = torch.tensor(_FACTOR_IMG_GRID, dtype=torch.float32, device=dev)
+        thr = lambda_base * grid  # (F,)
+        # #components removed per patch at each factor: (P, F).
+        removed = (cache.s.unsqueeze(2) < thr.view(1, 1, -1)).sum(dim=1).float()
+        vox = _scatter_patch_to_voxels(cache, removed, cfg.svd_batch_size, dev)
+        arr = vox.reshape(nx, ny, nz, len(_FACTOR_IMG_GRID)).cpu().numpy()
+        _save(arr, "factorimg", [f"f{g:.1f}" for g in _FACTOR_IMG_GRID])
+
+    if cfg.factor_sweep_save_eigen_img:
+        vox = _scatter_patch_to_voxels(cache, cache.s, cfg.svd_batch_size, dev)
+        arr = vox.reshape(nx, ny, nz, cache.k).cpu().numpy()
+        _save(arr, "eigenimg", [f"sv{r:02d}" for r in range(cache.k)])
+
+    return paths
+
+
 def _build_masks(
     magnitude_file: str,
     shape: tuple[int, int, int, int],
@@ -260,41 +332,63 @@ def run_nordic_factor_sweep(
         device=dev,
     )
 
-    masks = _build_masks(magnitude_file, shape, cfg.factor_sweep_masks, dev, cfg.verbose)
-    if not masks:
-        masks = {"whole": torch.ones(nx * ny * nz, dtype=torch.bool, device=dev)}
+    # Masks + top_pairs are needed for the correlation sweep and for -save_imgs.
+    need_masks = cfg.factor_sweep or cfg.factor_sweep_save_imgs
+    masks: dict[str, torch.Tensor] = {}
+    mask_idx: dict[str, torch.Tensor] = {}
+    top: torch.Tensor | None = None
+    if need_masks:
+        masks = _build_masks(magnitude_file, shape, cfg.factor_sweep_masks, dev, cfg.verbose)
+        if not masks:
+            masks = {"whole": torch.ones(nx * ny * nz, dtype=torch.bool, device=dev)}
+        # Fixed voxel index sets per mask (subsampled once, reused across factors so
+        # the curves are comparable point-to-point).
+        for name, mflat in masks.items():
+            idx = torch.nonzero(mflat, as_tuple=False).squeeze(1)
+            idx = _subsample_mask(idx, cfg.factor_sweep_max_voxels, seed=hash(name) & 0xFFFF)
+            mask_idx[name] = idx
+
+        # top_pairs: the danger zone. Rank in-brain (else whole) voxels by their
+        # correlation strength in the *input* (pre-denoise, noise vols already
+        # trimmed), keep the top fraction — the shared-structure voxels whose pairs
+        # over-removal would corrupt. Inserted between in_brain and whole.
+        if "top_pairs" in cfg.factor_sweep_masks:
+            base = mask_idx.get("in_brain")
+            if base is None:
+                base = torch.arange(nx * ny * nz, device=dev)
+            strength = voxel_corr_strength(data.reshape(-1, nt)[base].abs())
+            k = min(base.numel(), max(2, int(round(cfg.factor_sweep_top_frac * base.numel()))))
+            if cfg.factor_sweep_max_voxels:
+                k = min(k, cfg.factor_sweep_max_voxels)
+            top = base[torch.topk(strength, k).indices]
+            mask_idx = {
+                "in_brain": mask_idx.get("in_brain"),
+                "top_pairs": top,
+                "whole": mask_idx.get("whole"),
+            }
+            mask_idx = {n: i for n, i in mask_idx.items() if i is not None}
+
+    # Diagnostic images off the SVD cache (no reconstruction) — automask / top_pairs
+    # masks, the 4D factor->#comps image, the 4D patch eigen spectrum.
+    img_paths: dict[str, str] = {}
+    if (
+        cfg.factor_sweep_save_imgs
+        or cfg.factor_sweep_save_factor_img
+        or cfg.factor_sweep_save_eigen_img
+    ):
+        img_paths = _save_diag_images(
+            cache, lambda_base, masks.get("in_brain"), top, output_prefix, magnitude_file, cfg, dev
+        )
+        if cfg.verbose and img_paths:
+            print("  Saved diagnostic images: " + ", ".join(sorted(img_paths)))
+
+    # If only images were requested (no correlation sweep), we're done.
+    if not cfg.factor_sweep:
+        return {"factors": factors, "lambda_base": float(lambda_base), "outputs": img_paths}
 
     # Flat ijk coordinates for distance binning.
     ii, jj, kk = torch.meshgrid(torch.arange(nx), torch.arange(ny), torch.arange(nz), indexing="ij")
     coords_flat = torch.stack([ii.ravel(), jj.ravel(), kk.ravel()], dim=1).to(dev)
-
-    # Fixed voxel index sets per mask (subsampled once, reused across factors so
-    # the curves are comparable point-to-point).
-    mask_idx: dict[str, torch.Tensor] = {}
-    for name, mflat in masks.items():
-        idx = torch.nonzero(mflat, as_tuple=False).squeeze(1)
-        idx = _subsample_mask(idx, cfg.factor_sweep_max_voxels, seed=hash(name) & 0xFFFF)
-        mask_idx[name] = idx
-
-    # top_pairs: the danger zone. Rank in-brain (else whole) voxels by their
-    # correlation strength in the *input* (pre-denoise, noise vols already trimmed),
-    # keep the top fraction — these are the shared-structure voxels whose pairs
-    # over-removal would corrupt. Inserted between in_brain and whole.
-    if "top_pairs" in cfg.factor_sweep_masks:
-        base = mask_idx.get("in_brain")
-        if base is None:
-            base = torch.arange(nx * ny * nz, device=dev)
-        strength = voxel_corr_strength(data.reshape(-1, nt)[base].abs())
-        k = min(base.numel(), max(2, int(round(cfg.factor_sweep_top_frac * base.numel()))))
-        if cfg.factor_sweep_max_voxels:
-            k = min(k, cfg.factor_sweep_max_voxels)
-        top = base[torch.topk(strength, k).indices]
-        mask_idx = {
-            "in_brain": mask_idx.get("in_brain"),
-            "top_pairs": top,
-            "whole": mask_idx.get("whole"),
-        }
-        mask_idx = {n: i for n, i in mask_idx.items() if i is not None}
 
     # Input (non-denoised) in-brain magnitude — fixed across factors. The residual
     # correlation structure is compared to this each factor (struct_corr_to_ref);
@@ -321,7 +415,7 @@ def run_nordic_factor_sweep(
 
     summary = _assemble_summary(results, factors, null, nt, lambda_base, cfg)
     out_paths = _write_outputs(summary, results, factors, null, output_prefix, cfg)
-    summary["outputs"] = out_paths
+    summary["outputs"] = {**out_paths, **img_paths}
     if cfg.verbose:
         _print_liftoff(summary)
     return summary

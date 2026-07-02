@@ -132,6 +132,37 @@ def test_sweep_pure_noise_stays_near_null(tmp_path):
         assert Path(out[key]).exists()
 
 
+def test_diag_images(tmp_path):
+    """-save_*_img write cache-only diagnostics (no correlation sweep needed):
+    a 4D factor->#comps image (non-decreasing in factor) and a 4D eigen spectrum
+    (descending in rank), plus the automask/top_pairs masks."""
+    rng = np.random.default_rng(6)
+    data = rng.standard_normal((18, 18, 3, 50)).astype(np.float32) * 5.0 + 100.0
+    magn = tmp_path / "img_magn.nii.gz"
+    _write_nifti(magn, data)
+    cfg = NordicConfig(
+        magnitude_only=True,
+        nordic=True,
+        temporal_phase=0,
+        factor_sweep=False,  # images only
+        factor_sweep_save_imgs=True,
+        factor_sweep_save_factor_img=True,
+        factor_sweep_save_eigen_img=True,
+        verbose=False,
+    )
+    out = run_nordic_factor_sweep(str(magn), None, str(tmp_path / "im"), cfg, torch.device("cpu"))
+    paths = out["outputs"]
+    for key in ("automask", "toppairs", "factorimg", "eigenimg"):
+        assert Path(paths[key]).exists()
+
+    fi = nib.load(paths["factorimg"]).get_fdata()
+    ei = nib.load(paths["eigenimg"]).get_fdata()
+    assert fi.shape[3] == 50 and fi.min() >= 0  # 0.1..5.0 step 0.1
+    v = np.unravel_index(np.argmax(fi.sum(-1)), fi.shape[:3])
+    assert np.all(np.diff(fi[v]) >= -1e-4)  # more removed as the floor rises
+    assert np.all(np.diff(ei[v]) <= 1e-4)  # singular values descend
+
+
 def test_overremoval_puts_shared_signal_into_residual():
     """Drive the sweep engine directly: at a threshold above the whole spectrum
     NORDIC removes everything, so the residual equals the data. Where a shared
