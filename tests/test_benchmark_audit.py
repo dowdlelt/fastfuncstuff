@@ -63,6 +63,9 @@ def test_stage_result_status():
     assert StageResult("x", passed=True).status == "PASS"
     assert StageResult("x", passed=False).status == "FAIL"
     assert StageResult("x", passed=False, incomplete=True).status == "INCOMPLETE"
+    # A run-phase crash is FAIL even if validation (on stale output) "passed".
+    assert StageResult("x", passed=True, ffs_crashed=True).status == "FAIL"
+    assert StageResult("x", passed=True, incomplete=True, ffs_crashed=True).status == "FAIL"
 
 
 # --------------------------------------------------------------------------
@@ -111,6 +114,32 @@ def test_run_stages_marks_incomplete_not_fail(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "INCOMPLETE" in out
     assert "upstream" in out  # the requires-based hint named the producing stage
+
+
+def test_run_stages_crash_fails_over_stale_validation(tmp_path, capsys):
+    """If the FFS tool crashes but validation still 'passes' against stale output
+    from an earlier run, the stage must report FAIL -- not a misleading PASS."""
+    present = tmp_path / "stale.nii"
+    present.write_text("x")
+
+    def run_ffs(ctx):
+        raise RuntimeError("Command failed (fake tool): exit code 1")
+
+    stage = types.SimpleNamespace(
+        name="fake",
+        check_prerequisites=lambda ctx: [],
+        run_ffs=run_ffs,
+        # validate() succeeds against the leftover output -> would have said PASS
+        validate=lambda ctx: {"passed": True, "summary": "r=0.99"},
+        validation_inputs=lambda ctx: [present],
+    )
+    r = run_stages([stage], _ctx(tmp_path))[0]
+    assert r.ffs_crashed is True
+    assert r.passed is False
+    assert r.status == "FAIL"
+    assert "exit code 1" in r.summary
+    assert "stale" in r.summary  # names that the r=0.99 was on stale output
+    assert "FAIL" in capsys.readouterr().out
 
 
 def test_run_stages_passes_when_inputs_present(tmp_path):
@@ -178,6 +207,7 @@ def test_partial_timing_flagged_and_excluded(tmp_path):
 
 def test_note_items_marks_partial_result(tmp_path):
     """A stage reporting ran<total via note_items surfaces as partial timing."""
+
     def run_ffs(ctx):
         ctx.note_items("ffs", 1, 10)
         return 42.0

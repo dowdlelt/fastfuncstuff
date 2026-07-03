@@ -250,9 +250,16 @@ class StageResult:
     # {role: {"ran": n, "total": m}} for roles that ran only some items this
     # invocation (partial timing). Excluded from cached baselines.
     partial: dict[str, dict[str, int]] = field(default_factory=dict)
+    # True when the FFS tool (the thing under test) raised while running this
+    # invocation. Validation may still "pass" against stale outputs from an
+    # earlier run, so a run crash must hard-override to FAIL -- otherwise a
+    # command that never produced fresh output is silently reported PASS.
+    ffs_crashed: bool = False
 
     @property
     def status(self) -> str:
+        if self.ffs_crashed:
+            return "FAIL"
         if self.incomplete:
             return "INCOMPLETE"
         return "PASS" if self.passed else "FAIL"
@@ -297,6 +304,7 @@ def run_timed(
         # for minutes during slow CPU work. PYTHONUNBUFFERED forces every
         # write to flush immediately so tqdm + banners arrive in real time.
         import os
+
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 
         proc = subprocess.Popen(
@@ -311,6 +319,7 @@ def run_timed(
         )
 
         import selectors
+
         sel = selectors.DefaultSelector()
         sel.register(proc.stdout, selectors.EVENT_READ, ("stdout", sys.stdout, stdout_lines))
         sel.register(proc.stderr, selectors.EVENT_READ, ("stderr", sys.stderr, stderr_lines))
@@ -350,9 +359,7 @@ def run_timed(
 
     if returncode != 0:
         tail = stderr_tail[-500:] if stderr_tail else "(no stderr)"
-        raise RuntimeError(
-            f"Command failed ({label}): exit code {returncode}\n{tail}"
-        )
+        raise RuntimeError(f"Command failed ({label}): exit code {returncode}\n{tail}")
 
     if verbose:
         print(f"  Done: {label} ({elapsed:.1f}s)")
@@ -472,8 +479,7 @@ def _missing_input_hint(stage: Any, missing: list[str]) -> str:
     requires = getattr(stage, "requires", None)
     if requires:
         return (
-            f"INCOMPLETE: run upstream stage(s) first: "
-            f"{' '.join(requires)} (then '{stage.name}')"
+            f"INCOMPLETE: run upstream stage(s) first: {' '.join(requires)} (then '{stage.name}')"
         )
     return "INCOMPLETE: a needed input is missing (run the upstream stage that produces it)"
 
@@ -505,8 +511,10 @@ def run_stages(
     if deps:
         print("\nNote: some stages depend on stages not in this run:")
         for sname, missing in deps.items():
-            print(f"  {sname} requires: {', '.join(missing)} "
-                  f"(run them first, or use --with-deps / -stages to include them)")
+            print(
+                f"  {sname} requires: {', '.join(missing)} "
+                f"(run them first, or use --with-deps / -stages to include them)"
+            )
 
     for stage in stages:
         name = stage.name
@@ -557,6 +565,7 @@ def run_stages(
                 result.ffs_time = stage.run_ffs(ctx)
             except Exception as e:
                 result.errors.append(f"FFS: {e}")
+                result.ffs_crashed = True
                 print(f"  FFS error: {e}")
 
         # Snapshot which roles ran only part of their work (some outputs already
@@ -601,6 +610,19 @@ def run_stages(
                     print(f"  {hint}")
         else:
             result.summary = "ref only"
+
+        # A run-phase crash overrides any validation verdict: validation may have
+        # "passed" against stale outputs from an earlier run, but this invocation
+        # produced no fresh output, so the stage failed. Surface it plainly instead
+        # of a misleading PASS.
+        if result.ffs_crashed:
+            result.passed = False
+            result.incomplete = False
+            crash_detail = next(
+                (e for e in result.errors if e.startswith("FFS:")), "FFS tool crashed"
+            )
+            prior = f" (validation on stale output: {result.summary})" if result.summary else ""
+            result.summary = f"{crash_detail}{prior}"
 
         # Print result
         timing = _format_timing(result, name, ctx.data_dir)
