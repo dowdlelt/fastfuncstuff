@@ -22,21 +22,22 @@ from ..runner import BenchmarkContext, run_timed
 name = "nordic"
 description = "NORDIC denoising (MATLAB NIFTI_NORDIC vs ffs_nordic)"
 
-MAGN    = "sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii.gz"
-PHASE   = "sub-3003_ses-fine_task-expres_run-1_part-phase_bold.nii.gz"
-REF_OUT     = "NORDIC_sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii"
+MAGN = "sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii.gz"
+PHASE = "sub-3003_ses-fine_task-expres_run-1_part-phase_bold.nii.gz"
+REF_OUT = "NORDIC_sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii"
 REF_GFACTOR = "gfactor_NORDIC_sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii"
-FFS_PREFIX  = "ffs_nordic_defaults"
-NOISE_VOLS  = 3
+FFS_PREFIX = "ffs_nordic_defaults"
+NOISE_VOLS = 3
 
 THRESHOLDS = {
-    "ts_median_r":  0.95,
-    "gfactor_r":    0.99,
+    "ts_median_r": 0.95,
+    "gfactor_r": 0.99,
 }
 
 
 def _nordic_dir(ctx: BenchmarkContext) -> Path:
     from ..._paths import get_benchmark_data_dir
+
     return get_benchmark_data_dir() / "nordic_test_data"
 
 
@@ -90,7 +91,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
     ref = nd / REF_OUT
 
     if ref.exists() and not ctx.force_ref:
-        print(f"  Skipping MATLAB NORDIC (output exists, use -force-ref to re-run)")
+        print("  Skipping MATLAB NORDIC (output exists, use -force-ref to re-run)")
         return 0.0
 
     toolbox = _nordic_toolbox()
@@ -99,7 +100,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
     fn_out = REF_OUT[:-4]  # strip .nii — NIFTI_NORDIC appends it
     matlab_cmd = (
-        f"matlab -batch \""
+        f'matlab -batch "'
         f"cd('{nd}'); "
         f"addpath(genpath('{toolbox}')); "
         f"ARGA.temporal_phase = 1; "
@@ -120,7 +121,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     out = nd / f"{FFS_PREFIX}.nii.gz"
 
     if out.exists() and not ctx.force_ffs:
-        print(f"  Skipping ffs_nordic (output exists, use -force-ffs to re-run)")
+        print("  Skipping ffs_nordic (output exists, use -force-ffs to re-run)")
         return 0.0
 
     elapsed, _ = run_timed(
@@ -195,8 +196,8 @@ def _ts_corr_median(a4d: np.ndarray, b4d: np.ndarray, mask: np.ndarray, keep: in
             continue
         am = av - av.mean(axis=1, keepdims=True)
         bm = bv - bv.mean(axis=1, keepdims=True)
-        num   = (am * bm).sum(axis=1)
-        denom = np.sqrt((am ** 2).sum(axis=1) * (bm ** 2).sum(axis=1))
+        num = (am * bm).sum(axis=1)
+        denom = np.sqrt((am**2).sum(axis=1) * (bm**2).sum(axis=1))
         valid = denom > 0
         rs.extend((num[valid] / denom[valid]).tolist())
     return float(np.median(rs)) if rs else 0.0

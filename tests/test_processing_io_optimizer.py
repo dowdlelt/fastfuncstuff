@@ -1,7 +1,6 @@
 """Tests for processing/io.py and processing/optimizer.py."""
 
 import numpy as np
-import pytest
 import torch
 
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
@@ -94,19 +93,27 @@ class TestOptimizeWarpParamsTorch:
             return ((p - target) ** 2).sum().item()
 
         best_p, best_c = optimize_warp_params_torch(
-            cost_fn, n_params=3, param_max=2.0, device=DEVICE,
-            max_iter=100, tolerance=1e-6,
+            cost_fn,
+            n_params=3,
+            param_max=2.0,
+            device=DEVICE,
+            max_iter=100,
+            tolerance=1e-6,
         )
         assert best_c < 0.1
         torch.testing.assert_close(best_p, target, atol=0.2, rtol=0.2)
 
     def test_returns_zero_for_zero_min(self):
         """Minimum at origin should return near-zero params."""
+
         def cost_fn(p):
-            return (p ** 2).sum().item()
+            return (p**2).sum().item()
 
         best_p, best_c = optimize_warp_params_torch(
-            cost_fn, n_params=2, param_max=1.0, device=DEVICE,
+            cost_fn,
+            n_params=2,
+            param_max=1.0,
+            device=DEVICE,
         )
         assert best_c < 0.01
 
@@ -122,20 +129,29 @@ class TestCoordinateDescent:
             return ((p - target) ** 2).sum().item()
 
         best_p, best_c = _coordinate_descent(
-            cost_fn, n_params=2, param_max=1.0, device=DEVICE,
-            max_iter=50, prad=0.3,
+            cost_fn,
+            n_params=2,
+            param_max=1.0,
+            device=DEVICE,
+            max_iter=50,
+            prad=0.3,
         )
         assert best_c < 0.1
 
     def test_respects_param_max(self):
         """Should never exceed param_max."""
+
         def cost_fn(p):
             # Minimum is at p=5 but param_max=1
             return ((p - 5) ** 2).sum().item()
 
         best_p, _ = _coordinate_descent(
-            cost_fn, n_params=2, param_max=1.0, device=DEVICE,
-            max_iter=20, prad=0.3,
+            cost_fn,
+            n_params=2,
+            param_max=1.0,
+            device=DEVICE,
+            max_iter=20,
+            prad=0.3,
         )
         assert (best_p.abs() <= 1.0 + 1e-6).all()
 
@@ -153,8 +169,13 @@ class TestOptimizeWarpParamsBatched:
             return ((p - targets) ** 2).sum(dim=1)
 
         best_p, best_c, stats = optimize_warp_params_batched(
-            batched_cost, B=B, n_params=n_params,
-            param_max=1.0, device=DEVICE, max_iter=100, lr=0.05,
+            batched_cost,
+            B=B,
+            n_params=n_params,
+            param_max=1.0,
+            device=DEVICE,
+            max_iter=100,
+            lr=0.05,
         )
         assert best_p.shape == (B, n_params)
         assert best_c.shape == (B,)
@@ -167,11 +188,16 @@ class TestOptimizeWarpParamsBatched:
         B, n_params = 2, 2
 
         def cost_fn(p):
-            return (p ** 2).sum(dim=1)
+            return (p**2).sum(dim=1)
 
         best_p, best_c, stats = optimize_warp_params_batched(
-            cost_fn, B=B, n_params=n_params,
-            param_max=1.0, device=DEVICE, max_iter=500, tolerance=1e-6,
+            cost_fn,
+            B=B,
+            n_params=n_params,
+            param_max=1.0,
+            device=DEVICE,
+            max_iter=500,
+            tolerance=1e-6,
         )
         # Should have converged near zero, and stopped before the full budget
         assert (best_c < 0.01).all()

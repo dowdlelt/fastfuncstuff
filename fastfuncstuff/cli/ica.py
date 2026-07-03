@@ -41,14 +41,23 @@ from tqdm.auto import tqdm
 
 # fastfuncstuff imports
 try:
+    from fastfuncstuff.cli_utils import (
+        add_verbose_arg,
+        parse_input_files,
+        parse_prefix,
+        print_cli_header,
+    )
     from fastfuncstuff.decomposition import (
         io as decomposition_io,
+    )
+    from fastfuncstuff.decomposition import (
         postprocess as ica_postprocess,
+    )
+    from fastfuncstuff.decomposition import (
         workflow as ica_workflow,
     )
-    from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
-    from fastfuncstuff.cli_utils import add_verbose_arg, parse_input_files, parse_prefix, print_cli_header
     from fastfuncstuff.decomposition.ica import FastICA, InfoMaxICA, create_ica
+    from fastfuncstuff.decomposition.icasso import icasso
     from fastfuncstuff.decomposition.tools import (
         apply_high_pass_fft,
         apply_polort_projection,
@@ -58,7 +67,7 @@ try:
         estimate_ica_component_count,
         parse_num_comps_spec,
     )
-    from fastfuncstuff.decomposition.icasso import icasso
+    from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
     from fastfuncstuff.utils import (
         configure_torch_backends,
         gaussian_blur_3d,
@@ -87,9 +96,9 @@ def _run_single_ica(
     onsets_files: list[str] | None,
     durations: list[str] | None,
     ortvec_specs: list[list[str]] | None = None,
-    bids_task_onsets: "list[list[np.ndarray]] | None" = None,
-    bids_task_durations: "list[float] | None" = None,
-    bids_task_labels: "list[str] | None" = None,
+    bids_task_onsets: list[list[np.ndarray]] | None = None,
+    bids_task_durations: list[float] | None = None,
+    bids_task_labels: list[str] | None = None,
 ) -> dict:
     """Run the full ICA workflow for one input run and return run metadata."""
     t_total = time.time()
@@ -306,7 +315,9 @@ def _run_single_ica(
         _vsection(args.verb >= 1, "Scaling")
         t_step = time.time()
         _vprint(args.verb >= 1, "Percent-signal scaling ...")
-        data_vox_t, _, _ = scale_to_percent_signal(data_vox_t, run_starts=[0], verbose=args.verb >= 1)
+        data_vox_t, _, _ = scale_to_percent_signal(
+            data_vox_t, run_starts=[0], verbose=args.verb >= 1
+        )
         data_vox_t = _check_finite(data_vox_t, "post-scale", args.verb >= 1)
         _vprint(args.verb >= 1, "Scaling done", t_step)
 
@@ -370,6 +381,7 @@ def _run_single_ica(
         _trace_vn_dir = None
         if _trace_single_dir:
             from pathlib import Path as _Pvn
+
             _trace_vn_dir = _Pvn(_trace_single_dir) / run_tag
             _trace_vn_dir.mkdir(parents=True, exist_ok=True)
         data_vox_t, norm_msg = ica_workflow.apply_voxel_variance_normalization(
@@ -458,6 +470,7 @@ def _run_single_ica(
     _trace_eig_flag = getattr(args, "trace", None)
     if _trace_eig_flag is not None and "ppca_trace" in pca_diag:
         from pathlib import Path as _Peig
+
         _eig_td = _Peig(_trace_eig_flag) / run_tag
         _eig_td.mkdir(parents=True, exist_ok=True)
         _ppt = pca_diag["ppca_trace"]
@@ -527,6 +540,7 @@ def _run_single_ica(
         icasso_plot_path = f"{args.prefix}_run{run_idx + 1:02d}_icasso.png"
         try:
             from fastfuncstuff.decomposition.icasso import icasso_plot
+
             icasso_plot(icasso_res, output_path=icasso_plot_path)
             _vprint(args.verb >= 1, f"ICASSO plot: {icasso_plot_path}")
         except Exception as exc:
@@ -556,7 +570,7 @@ def _run_single_ica(
                 f"{method_name} did NOT converge after {args.ica_max_iter} iterations",
                 t_step,
             )
-            print(f"  ⚠ Consider increasing -ica_max_iter or checking data conditioning")
+            print("  ⚠ Consider increasing -ica_max_iter or checking data conditioning")
         else:
             _vprint(args.verb >= 1, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
 
@@ -568,11 +582,17 @@ def _run_single_ica(
             blk = diag["block_size"]
             n_blk = diag["n_blocks_per_epoch"]
             chg = diag["final_change"]
-            _vprint(True, f"  lr: {lr_i:.6f} → {lr_f:.6f}, block={blk}, "
-                    f"blocks/epoch={n_blk}, final_change={chg:.2e}")
+            _vprint(
+                True,
+                f"  lr: {lr_i:.6f} → {lr_f:.6f}, block={blk}, "
+                f"blocks/epoch={n_blk}, final_change={chg:.2e}",
+            )
             if diag.get("extended"):
-                _vprint(True, f"  sub-Gaussian: {diag['n_sub_gaussian']}, "
-                        f"super-Gaussian: {diag['n_super_gaussian']}")
+                _vprint(
+                    True,
+                    f"  sub-Gaussian: {diag['n_sub_gaussian']}, "
+                    f"super-Gaussian: {diag['n_super_gaussian']}",
+                )
 
         components = ica.components_.to(device)
         mixing = ica.mixing_.to(device)
@@ -591,7 +611,9 @@ def _run_single_ica(
         _trace_single_pca = getattr(args, "trace", None)
         if _trace_single_pca is not None and hasattr(ica, "pca_") and ica.pca_ is not None:
             from pathlib import Path as _Ptr
+
             import numpy as _np_trace
+
             _td = _Ptr(_trace_single_pca) / run_tag
             _td.mkdir(parents=True, exist_ok=True)
             _ev = ica.pca_.explained_variance_.detach().cpu().numpy()
@@ -603,7 +625,9 @@ def _run_single_ica(
             _np_trace.save(str(_td / "white_matrix.npy"), _WM)
             _np_trace.save(str(_td / "dewhite_matrix.npy"), _DWM)
             if hasattr(ica.pca_, "components_") and ica.pca_.components_ is not None:
-                _np_trace.save(str(_td / "pca_components.npy"), ica.pca_.components_.detach().cpu().numpy())
+                _np_trace.save(
+                    str(_td / "pca_components.npy"), ica.pca_.components_.detach().cpu().numpy()
+                )
             _vprint(args.verb >= 1, f"Trace: PCA whitening → {_td}")
 
         # Free the ICA object (holds full PCA state on GPU)
@@ -709,6 +733,7 @@ def _run_single_ica(
         _trace_nn_flag = getattr(args, "trace", None)
         if _trace_nn_flag is not None:
             from pathlib import Path as _Pnn
+
             _nn_trace_dir = _Pnn(_trace_nn_flag) / run_tag
         components, noise_norm_msg = ica_workflow.apply_melodic_noise_normalization(
             components=components,
@@ -745,12 +770,10 @@ def _run_single_ica(
             from fastfuncstuff.design.builder import create_onset_matrix_microtime
             from fastfuncstuff.design.hrf import get_spmg1_hrf
             from fastfuncstuff.design.matrices import convolve_hrf_microtime
+
             n_bids_conds = len(bids_task_onsets)
             # Extract this run's onsets (wrapped in list for single-run onset matrix)
-            onsets_this_run = [
-                [bids_task_onsets[cidx][run_idx]]
-                for cidx in range(n_bids_conds)
-            ]
+            onsets_this_run = [[bids_task_onsets[cidx][run_idx]] for cidx in range(n_bids_conds)]
             onset_mt = create_onset_matrix_microtime(
                 all_onsets=onsets_this_run,
                 run_starts=[0],
@@ -860,7 +883,10 @@ def _run_single_ica(
     _trace_single_ica = getattr(args, "trace", None)
     if _trace_single_ica is not None:
         from pathlib import Path as _Pica
-        from scipy.stats import kurtosis as _kurt_t, skew as _skew_t
+
+        from scipy.stats import kurtosis as _kurt_t
+        from scipy.stats import skew as _skew_t
+
         _td = _Pica(_trace_single_ica) / run_tag
         _td.mkdir(parents=True, exist_ok=True)
         np.save(str(_td / "ic_maps.npy"), comp_np)
@@ -868,11 +894,19 @@ def _run_single_ica(
             np.save(str(_td / "oic.npy"), raw_oic_np)
         np.savetxt(str(_td / "mix_matrix"), mixing_np, fmt="%.10g")
         if hasattr(explained_share, "tolist"):
-            _es = explained_share.tolist() if hasattr(explained_share, "tolist") else list(explained_share)
+            _es = (
+                explained_share.tolist()
+                if hasattr(explained_share, "tolist")
+                else list(explained_share)
+            )
         else:
             _es = list(explained_share)
         if hasattr(stdev_share_sorted, "tolist"):
-            _ss = stdev_share_sorted.tolist() if hasattr(stdev_share_sorted, "tolist") else list(stdev_share_sorted)
+            _ss = (
+                stdev_share_sorted.tolist()
+                if hasattr(stdev_share_sorted, "tolist")
+                else list(stdev_share_sorted)
+            )
         else:
             _ss = list(stdev_share_sorted)
         _ic_kurt = np.array([_kurt_t(c) for c in comp_np])
@@ -1004,13 +1038,19 @@ def _run_single_ica(
     _trace_mm_flag = getattr(args, "trace", None)
     if _trace_mm_flag is not None and mixture_meta:
         from pathlib import Path as _Pmm
+
         _mm_td = _Pmm(_trace_mm_flag) / run_tag
         _mm_td.mkdir(parents=True, exist_ok=True)
         _mm_keys = [
-            "mu_noise", "sigma_noise",
-            "mu_signal_pos", "sigma_signal_pos",
-            "mu_signal_neg", "sigma_signal_neg",
-            "pi_noise", "pi_pos", "pi_neg",
+            "mu_noise",
+            "sigma_noise",
+            "mu_signal_pos",
+            "sigma_signal_pos",
+            "mu_signal_neg",
+            "sigma_signal_neg",
+            "pi_noise",
+            "pi_pos",
+            "pi_neg",
             "mixing_signal",
         ]
         _mm_arr = np.array(
@@ -1435,7 +1475,7 @@ def _run_concat_ica(
                 verbose=False,
             )
             run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verb >= 1)
-            _vprint(args.verb >= 1, f"  Scaled to percent signal", t_step)
+            _vprint(args.verb >= 1, "  Scaled to percent signal", t_step)
 
         # --- Per-run polort (block-diag here = single-run) ---
         # Tcat default: -1 (off) to defer to high-pass; single-run default: 0.
@@ -1475,7 +1515,11 @@ def _run_concat_ica(
     # Average the mean images
     mean3d = mean3d_accum / n_runs
 
-    polort = -1 if (args.polort is None and n_runs > 1) else (0 if args.polort is None else int(args.polort))
+    polort = (
+        -1
+        if (args.polort is None and n_runs > 1)
+        else (0 if args.polort is None else int(args.polort))
+    )
 
     # run_starts / total_t
     run_starts = []
@@ -1546,6 +1590,7 @@ def _run_concat_ica(
         np.save(_td_pre / "migp_pre_varnorm.npy", data_tv.cpu().numpy())
         if mask3d is not None:
             import nibabel as _nib
+
             _nib.save(
                 _nib.Nifti1Image(mask3d.astype(np.uint8), affine),
                 str(_td_pre / "mask.nii.gz"),
@@ -1576,6 +1621,7 @@ def _run_concat_ica(
         _trace_dir_vn = getattr(args, "trace", None)
         if _trace_dir_vn:
             from pathlib import Path as _PathVN
+
             _td_vn = _PathVN(_trace_dir_vn)
             _td_vn.mkdir(parents=True, exist_ok=True)
             np.save(_td_vn / "ffs_noise_std.npy", noise_std_map.cpu().numpy())
@@ -1695,6 +1741,7 @@ def _run_concat_ica(
     trace_dir = getattr(args, "trace", None)
     if trace_dir:
         from pathlib import Path as _P
+
         _td = _P(trace_dir)
         _td.mkdir(parents=True, exist_ok=True)
         _evals_full = evals_t.cpu().numpy()
@@ -1731,7 +1778,9 @@ def _run_concat_ica(
     t_step = time.time()
     if args.icasso:
         method_name = getattr(args, "ica_method", "fastica")
-        _vprint(args.verb >= 1, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
+        _vprint(
+            args.verb >= 1, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}"
+        )
         icasso_res = icasso(
             X=x_t,
             n_components=n_components,
@@ -1762,6 +1811,7 @@ def _run_concat_ica(
         icasso_plot_path = f"{args.prefix}_tempconcat_icasso.png"
         try:
             from fastfuncstuff.decomposition.icasso import icasso_plot
+
             icasso_plot(icasso_res, output_path=icasso_plot_path)
             _vprint(args.verb >= 1, f"ICASSO plot: {icasso_plot_path}")
         except Exception as exc:
@@ -1785,7 +1835,8 @@ def _run_concat_ica(
         ica.fit(x_t)
         if ica.n_iter_ >= args.ica_max_iter:
             _vprint(
-                args.verb >= 1, f"{method_name} did NOT converge after {args.ica_max_iter} iterations"
+                args.verb >= 1,
+                f"{method_name} did NOT converge after {args.ica_max_iter} iterations",
             )
         else:
             _vprint(args.verb >= 1, f"{method_name} converged in {ica.n_iter_} iterations", t_step)
@@ -1798,11 +1849,17 @@ def _run_concat_ica(
             blk = diag["block_size"]
             n_blk = diag["n_blocks_per_epoch"]
             chg = diag["final_change"]
-            _vprint(True, f"  lr: {lr_i:.6f} → {lr_f:.6f}, block={blk}, "
-                    f"blocks/epoch={n_blk}, final_change={chg:.2e}")
+            _vprint(
+                True,
+                f"  lr: {lr_i:.6f} → {lr_f:.6f}, block={blk}, "
+                f"blocks/epoch={n_blk}, final_change={chg:.2e}",
+            )
             if diag.get("extended"):
-                _vprint(True, f"  sub-Gaussian: {diag['n_sub_gaussian']}, "
-                        f"super-Gaussian: {diag['n_super_gaussian']}")
+                _vprint(
+                    True,
+                    f"  sub-Gaussian: {diag['n_sub_gaussian']}, "
+                    f"super-Gaussian: {diag['n_super_gaussian']}",
+                )
 
         components = ica.components_.to(device)
         mixing = ica.mixing_.to(device)
@@ -1827,7 +1884,7 @@ def _run_concat_ica(
     offs = 0
     for ri in range(n_runs):
         T_r = run_lengths[ri]
-        block = mixing[offs:offs + T_r]
+        block = mixing[offs : offs + T_r]
         per_run_tcs.append(block.detach().cpu().numpy().astype(np.float32))
         offs += T_r
     # Swap x_t to the unwhitened concat so noise-norm residuals are in data space.
@@ -1903,7 +1960,10 @@ def _run_concat_ica(
     # --- Trace: dump ICA intermediates ---
     if trace_dir:
         from pathlib import Path as _P
-        from scipy.stats import kurtosis as _kurt, skew as _skew
+
+        from scipy.stats import kurtosis as _kurt
+        from scipy.stats import skew as _skew
+
         _td = _P(trace_dir)
         _td.mkdir(parents=True, exist_ok=True)
         comp_np = components.detach().cpu().numpy()
@@ -2022,10 +2082,15 @@ def _run_concat_ica(
 
     if trace_dir and mixture_meta:
         _mm_keys = [
-            "mu_noise", "sigma_noise",
-            "mu_signal_pos", "sigma_signal_pos",
-            "mu_signal_neg", "sigma_signal_neg",
-            "pi_noise", "pi_pos", "pi_neg",
+            "mu_noise",
+            "sigma_noise",
+            "mu_signal_pos",
+            "sigma_signal_pos",
+            "mu_signal_neg",
+            "sigma_signal_neg",
+            "pi_noise",
+            "pi_pos",
+            "pi_neg",
             "mixing_signal",
         ]
         _mm_arr = np.array(
@@ -2141,7 +2206,9 @@ def _run_tensorial_ica(
     n_runs = len(input_files)
 
     _vsection(args.verb >= 1, "Tensorial (spatial-concat) ICA")
-    _vprint(args.verb >= 1, f"Spatially concatenating {n_runs} runs → single shared temporal mixing")
+    _vprint(
+        args.verb >= 1, f"Spatially concatenating {n_runs} runs → single shared temporal mixing"
+    )
 
     # --- Per-run preprocessing (identical to concat path) -------------------
     run_data_list: list[torch.Tensor] = []  # each (V, T)
@@ -2298,8 +2365,7 @@ def _run_tensorial_ica(
     V_total = int(data_tv.shape[1])
     _vprint(
         args.verb >= 1,
-        f"Spatial concat: {tuple(data_tv.shape)} (T, n_runs*V) "
-        f"= ({T}, {n_runs} * {n_vox_masked})",
+        f"Spatial concat: {tuple(data_tv.shape)} (T, n_runs*V) = ({T}, {n_runs} * {n_vox_masked})",
         t_step,
     )
     if device.type == "cuda":
@@ -2365,9 +2431,7 @@ def _run_tensorial_ica(
             data_vox_t=data_tv.T
         )
         n_vox_model_order = int(data_for_model_order_vt.shape[0])
-        n_eff_for_model_order = max(
-            int(T), int(n_vox_model_order / (2.5 * max(resels, 1e-6)))
-        )
+        n_eff_for_model_order = max(int(T), int(n_vox_model_order / (2.5 * max(resels, 1e-6))))
         _vprint(
             args.verb >= 1,
             f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{V_total:,} columns; "
@@ -2428,7 +2492,9 @@ def _run_tensorial_ica(
     t_step = time.time()
     if args.icasso:
         method_name = getattr(args, "ica_method", "fastica")
-        _vprint(args.verb >= 1, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}")
+        _vprint(
+            args.verb >= 1, f"ICASSO ({method_name}): {args.icasso_runs} runs, k={n_components}"
+        )
         icasso_res = icasso(
             X=x_t,
             n_components=n_components,
@@ -2441,7 +2507,9 @@ def _run_tensorial_ica(
             ica_method=method_name,
             base_seed=args.seed,
         )
-        components = torch.as_tensor(icasso_res["all_centroids"], device=device, dtype=torch.float32)
+        components = torch.as_tensor(
+            icasso_res["all_centroids"], device=device, dtype=torch.float32
+        )
         mixing = torch.as_tensor(icasso_res["all_mixing"], device=device, dtype=torch.float32)
         stability = np.asarray(icasso_res["all_stability"], dtype=np.float32)
         icasso_meta = {
@@ -2560,7 +2628,7 @@ def _run_tensorial_ica(
     out_prefix = _ffs_dir / _basename
 
     comp_np = components.detach().cpu().numpy().astype(np.float32)  # (k, n_runs*V)
-    mixing_np = mixing.detach().cpu().numpy().astype(np.float32)    # (T, k) — shared
+    mixing_np = mixing.detach().cpu().numpy().astype(np.float32)  # (T, k) — shared
     del components, mixing
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -2595,9 +2663,7 @@ def _run_tensorial_ica(
     )
 
     # Shared timecourses
-    np.savetxt(
-        f"{out_prefix}_tensor_ica_timecourses.1D", mixing_np, fmt="%.6f", delimiter="\t"
-    )
+    np.savetxt(f"{out_prefix}_tensor_ica_timecourses.1D", mixing_np, fmt="%.6f", delimiter="\t")
     _vprint(args.verb >= 1, f"Shared timecourses: {out_prefix}_tensor_ica_timecourses.1D")
 
     # Scree plot
@@ -2878,7 +2944,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="FastICA contrast function (default: pow3, matching MELODIC)",
     )
     ica_opts.add_argument(
-        "-seed", type=int, default=0,
+        "-seed",
+        type=int,
+        default=0,
         help="Base random seed for ICA. Per-run seed = seed + run_idx. "
         "ICASSO increments from this base. (default: 0)",
     )
@@ -2898,7 +2966,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     task = parser.add_argument_group("Task annotation (optional)")
     task.add_argument(
-        "-onsets", nargs="+", default=None,
+        "-onsets",
+        nargs="+",
+        default=None,
         help="AFNI timing files (one per condition). Mutually exclusive with -events.",
     )
     task.add_argument(
@@ -3186,14 +3256,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     modes.add_argument(
-        "-migp_n", type=int, default=None,
+        "-migp_n",
+        type=int,
+        default=None,
         help=(
             "MIGP target dimensionality. Default (unset) → 2*T_first_run - 1 "
             "matching MELODIC's auto-pick."
         ),
     )
     modes.add_argument(
-        "-migp_factor", type=float, default=2.0,
+        "-migp_factor",
+        type=float,
+        default=2.0,
         help=(
             "MIGP reduction trigger: reduce when stack exceeds factor * migp_n rows. "
             "Default 2.0 matches MELODIC (--migp_factor). Larger values batch more "
@@ -3375,11 +3449,12 @@ def main() -> None:
         sys.exit(1)
 
     # Parse BIDS events (if provided) for task annotation
-    bids_task_onsets = None     # list[list[ndarray]] — all_onsets[cond][run]
+    bids_task_onsets = None  # list[list[ndarray]] — all_onsets[cond][run]
     bids_task_durations = None  # list[float]
-    bids_task_labels = None     # list[str]
+    bids_task_labels = None  # list[str]
     if _has_events:
         from fastfuncstuff.design.bids_events import parse_bids_events
+
         event_cols = tuple(args.event_cols) if getattr(args, "event_cols", None) else None
         bids_task_onsets, bids_task_durations, bids_task_labels = parse_bids_events(
             event_files=args.events,

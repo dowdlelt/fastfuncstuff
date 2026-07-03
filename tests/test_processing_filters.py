@@ -21,10 +21,10 @@ from fastfuncstuff.processing.filters import (
     savgol_filter_explore,
 )
 
-
 # ---------------------------------------------------------------------------
 # _sgf_coefficients
 # ---------------------------------------------------------------------------
+
 
 class TestSGFCoefficients:
     @pytest.mark.parametrize("window,order", [(5, 2), (7, 3), (11, 4), (21, 5)])
@@ -53,6 +53,7 @@ class TestSGFCoefficients:
 # ---------------------------------------------------------------------------
 # savgol_filter_1d — correctness against scipy + shape contracts
 # ---------------------------------------------------------------------------
+
 
 class TestSavgolFilter1D:
     @pytest.mark.parametrize("window,order", [(5, 2), (11, 3), (21, 4)])
@@ -92,9 +93,7 @@ class TestSavgolFilter1D:
         filtered = savgol_filter_1d(signal, 11, 3)
         # Interior region only (reflect padding can leak at edges)
         interior = slice(20, 180)
-        np.testing.assert_allclose(filtered[interior].numpy(),
-                                   signal[interior].numpy(),
-                                   atol=1e-6)
+        np.testing.assert_allclose(filtered[interior].numpy(), signal[interior].numpy(), atol=1e-6)
 
     def test_short_signal_passthrough(self):
         """If n_timepoints < window_length the filter returns a clone."""
@@ -122,6 +121,7 @@ class TestSavgolFilter1D:
 # savgol_filter_explore
 # ---------------------------------------------------------------------------
 
+
 class TestSavgolFilterExplore:
     def test_no_metric_returns_input_unchanged(self):
         x = torch.randn(5, 200)
@@ -136,10 +136,12 @@ class TestSavgolFilterExplore:
         t = torch.linspace(0, 10, 200)
         clean1 = torch.sin(t)
         clean2 = torch.sin(5.0 * t)  # higher freq
-        noisy = torch.stack([
-            clean1 + 0.5 * torch.randn(200),
-            clean2 + 0.5 * torch.randn(200),
-        ])
+        noisy = torch.stack(
+            [
+                clean1 + 0.5 * torch.randn(200),
+                clean2 + 0.5 * torch.randn(200),
+            ]
+        )
         clean = torch.stack([clean1, clean2])
 
         def metric(filtered):
@@ -147,9 +149,15 @@ class TestSavgolFilterExplore:
             return -((filtered - clean) ** 2).mean(dim=-1)
 
         out = savgol_filter_explore(
-            noisy, n_timepoints=200, device=torch.device("cpu"),
-            min_window=5, max_window=51, min_order=2, max_order=5,
-            step=4, metric_fn=metric,
+            noisy,
+            n_timepoints=200,
+            device=torch.device("cpu"),
+            min_window=5,
+            max_window=51,
+            min_order=2,
+            max_order=5,
+            step=4,
+            metric_fn=metric,
         )
         assert out.shape == noisy.shape
         # The explorer should improve on the noisy input on at least one voxel
@@ -167,7 +175,9 @@ class TestSavgolFilterExplore:
             return -filtered.std(dim=-1)  # arbitrary, just needs to be callable
 
         out = savgol_filter_explore(
-            x, n_timepoints=80, device=torch.device("cpu"),
+            x,
+            n_timepoints=80,
+            device=torch.device("cpu"),
             metric_fn=metric,
         )
         assert out.shape == x.shape

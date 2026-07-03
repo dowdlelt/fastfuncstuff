@@ -43,6 +43,7 @@ Per-condition TENT windows:
 For help:
     ffs_deconvolve.py -help
 """
+
 from __future__ import annotations
 
 import argparse
@@ -62,14 +63,11 @@ except ImportError:
 
 # Import fastfuncstuff modules
 try:
-    from fastfuncstuff.io.afni import (
-        get_tr_from_file,
-        load_afni_mask,
-        load_nifti,
-        onsets_to_tr_matrix,
-        save_nifti,
-    )
     from fastfuncstuff.cli_utils import add_verbose_arg, auto_polort, parse_device_arg, parse_prefix
+    from fastfuncstuff.design.builder import (
+        legendre_polynomials,
+        parse_afni_timing_file,
+    )
     from fastfuncstuff.design.matrices import (
         build_glm_design,
         is_tr_locked,
@@ -77,12 +75,15 @@ try:
         make_tent_design,
         save_iresp,
     )
-    from fastfuncstuff.design.builder import (
-        legendre_polynomials,
-        parse_afni_timing_file,
-    )
     from fastfuncstuff.glm.core import fit_glm
     from fastfuncstuff.glm.xval import compute_r2_metric
+    from fastfuncstuff.io.afni import (
+        get_tr_from_file,
+        load_afni_mask,
+        load_nifti,
+        onsets_to_tr_matrix,
+        save_nifti,
+    )
     from fastfuncstuff.utils import configure_torch_backends, get_device
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
@@ -299,21 +300,21 @@ def parse_args():
         default=0,
         metavar="N",
         help="Cross-validate the TENT window upper bound over ±N TRs around the -window "
-             "top, in steps of 1 TR, using leave-one-run-out CV. The top with the highest "
-             "mean held-out R² is used for the final fit. "
-             "E.g., '-window 0 15 -xval-tr-range 3' tries tops 12s..18s (default: 0 = disabled).",
+        "top, in steps of 1 TR, using leave-one-run-out CV. The top with the highest "
+        "mean held-out R² is used for the final fit. "
+        "E.g., '-window 0 15 -xval-tr-range 3' tries tops 12s..18s (default: 0 = disabled).",
     )
 
     model_opts.add_argument(
         "-per-voxel",
         action="store_true",
         help="When combined with -xval-tr-range, select the best window top *per voxel* "
-             "rather than a single shared top. Each voxel's HRF is estimated with its "
-             "individually optimal window; shorter windows are zero-padded on the right to "
-             "the longest candidate window. Saves additional maps: "
-             "{prefix}_windowsize.nii.gz (winning top in seconds) and "
-             "{prefix}_r2_by_window.nii.gz (LORO R² per candidate, 4D). "
-             "Requires -xval-tr-range > 0 and ≥2 runs.",
+        "rather than a single shared top. Each voxel's HRF is estimated with its "
+        "individually optimal window; shorter windows are zero-padded on the right to "
+        "the longest candidate window. Saves additional maps: "
+        "{prefix}_windowsize.nii.gz (winning top in seconds) and "
+        "{prefix}_r2_by_window.nii.gz (LORO R² per candidate, 4D). "
+        "Requires -xval-tr-range > 0 and ≥2 runs.",
     )
 
     model_opts.add_argument(
@@ -373,7 +374,7 @@ def parse_args():
         default="A",
         metavar="N",
         help="Polynomial drift order for detrending. 'A' (default) = auto (AFNI formula: "
-             "1 + floor(run_duration / 150)). Integer N for fixed order. -1 for none.",
+        "1 + floor(run_duration / 150)). Integer N for fixed order. -1 for none.",
     )
 
     proc_opts.add_argument(
@@ -435,7 +436,6 @@ def parse_args():
             "are degenerate when the fit unexpectedly fails)."
         ),
     )
-
 
     return parser
 
@@ -521,7 +521,9 @@ def parse_tent_windows(tent_window_args, n_conditions):
                 bot = float(parts[0])
                 top = float(parts[1])
             except ValueError:
-                raise ValueError(f"Invalid tent_window values in '{arg}'. Expected numeric values.") from None
+                raise ValueError(
+                    f"Invalid tent_window values in '{arg}'. Expected numeric values."
+                ) from None
             if bot >= top:
                 raise ValueError(f"Invalid tent_window '{arg}': bot ({bot}) must be < top ({top})")
             windows.append((bot, top))
@@ -612,9 +614,9 @@ def _loro_r2_per_voxel(
 
         r2_parts: list[torch.Tensor] = []
         for i in range(0, n_vox, chunk):
-            train_c = torch.cat(
-                [data_clean[r][i : i + chunk, :] for r in train_runs], dim=1
-            ).to(device)
+            train_c = torch.cat([data_clean[r][i : i + chunk, :] for r in train_runs], dim=1).to(
+                device
+            )
             XtY = train_design.T @ train_c.T  # (n_regs, chunk)
             if L_fold is not None:
                 betas = torch.cholesky_solve(XtY, L_fold)  # (n_regs, chunk)
@@ -716,8 +718,15 @@ def _compute_loro_r2_matrix(
             for c in range(n_conditions):
                 fn = make_csplin_design if use_csplin else make_tent_design
                 cond_parts.append(
-                    fn([onsets_per_condition[c][run_idx]], bot, top_val, tr, n_tp,
-                       zero_edges=zero_edges, device=device)
+                    fn(
+                        [onsets_per_condition[c][run_idx]],
+                        bot,
+                        top_val,
+                        tr,
+                        n_tp,
+                        zero_edges=zero_edges,
+                        device=device,
+                    )
                 )
             design_r = torch.cat(cond_parts, dim=1)
             Q = Q_per_run[run_idx]
@@ -759,8 +768,16 @@ def _xval_tent_top(
     Returns (best_top, best_median_r2_on_signal_voxels).
     """
     r2_matrix, vox_idx = _compute_loro_r2_matrix(
-        data_list, onsets_per_condition, model, bot, candidate_tops,
-        tr, n_conditions, polort, device, verbose,
+        data_list,
+        onsets_per_condition,
+        model,
+        bot,
+        candidate_tops,
+        tr,
+        n_conditions,
+        polort,
+        device,
+        verbose,
         max_voxels=50_000,
     )
     n_vox = len(vox_idx)
@@ -848,6 +865,7 @@ def main():
             )
             return 1
         from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
+
         event_cols = tuple(args.event_cols) if args.event_cols else None
         try:
             bids_onsets, bids_durations, bids_labels = parse_bids_events(
@@ -965,7 +983,9 @@ def main():
         try:
             args.polort = int(polort_str)
         except ValueError:
-            print(f"ERROR: -polort must be 'A' or an integer, got: {args.polort!r}", file=sys.stderr)
+            print(
+                f"ERROR: -polort must be 'A' or an integer, got: {args.polort!r}", file=sys.stderr
+            )
             return 1
 
     if args.verb >= 1:
@@ -1018,6 +1038,7 @@ def main():
         # Parse per-condition stimulus durations for auto-window estimation
         if args.durations:
             from fastfuncstuff.design.builder import parse_durations
+
             condition_durations = parse_durations(args.durations, n_conditions, condition_labels)
             if args.verb >= 1:
                 if len(set(condition_durations)) == 1:
@@ -1030,6 +1051,7 @@ def main():
         # BIDS path: onsets_per_condition already set above
         if args.verb >= 1:
             from fastfuncstuff.design.bids_events import sort_bids_event_files
+
             print("\nBIDS events files (sorted by run):")
             for ep in sort_bids_event_files(args.events):
                 print(f"  {ep}")
@@ -1041,6 +1063,7 @@ def main():
     # ── Optional onset / duration rounding ──────────────────────────────────
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets
+
         onsets_per_condition = round_onsets(onsets_per_condition, tr, threshold=args.round_onsets)
         if args.verb >= 1:
             print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
@@ -1050,8 +1073,10 @@ def main():
         dp = args.round_durations
         condition_durations = [round(d, dp) for d in condition_durations]
         if args.verb >= 1:
-            print(f"Durations rounded to {dp} decimal place(s): "
-                  f"{[f'{d:.{dp}f}' for d in condition_durations]}")
+            print(
+                f"Durations rounded to {dp} decimal place(s): "
+                f"{[f'{d:.{dp}f}' for d in condition_durations]}"
+            )
 
     # Flatten all onset times for TR-locking check
     all_onset_times = []
@@ -1090,6 +1115,7 @@ def main():
     # later release.
     if model == "FLOBS":
         import warnings as _warnings
+
         _warnings.warn(
             "ffs_deconvolve -model FLOBS is deprecated; use ffs_fitbasis "
             "(same FLOBS basis + constrained fit, plus SPMG1/2/3 bases and "
@@ -1111,12 +1137,12 @@ def main():
         # globals for the *entire* main() function (Python's lexical
         # scope), breaking the FIR/TENT save paths below.  So just
         # import the FLOBS-specific helpers here.
+        from fastfuncstuff.design.builder import pack_for_shared_task_glm
         from fastfuncstuff.design.flobs import (
-            generate_flobs_basis,
             fit_flobs_constrained,
+            generate_flobs_basis,
         )
         from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
-        from fastfuncstuff.design.builder import pack_for_shared_task_glm
 
         if args.verb >= 1:
             print(
@@ -1131,18 +1157,15 @@ def main():
             dt=args.flobs_dt,
             seed=args.flobs_seed,
         )
-        ev_frac = (basis.eigenvalues ** 2)
+        ev_frac = basis.eigenvalues**2
         ev_frac = ev_frac / max(ev_frac.sum(), 1e-30)
         if args.verb >= 1:
             print(
                 f"  Variance explained by top {args.flobs_n_basis}: "
-                f"{ev_frac[:args.flobs_n_basis].sum() * 100:.1f}%  "
+                f"{ev_frac[: args.flobs_n_basis].sum() * 100:.1f}%  "
                 f"(PC1 alone {ev_frac[0] * 100:.1f}%)"
             )
-            print(
-                f"  Prior MVN(m, C):  m = {basis.m}, "
-                f"σ_diag = {np.sqrt(np.diag(basis.C))}"
-            )
+            print(f"  Prior MVN(m, C):  m = {basis.m}, σ_diag = {np.sqrt(np.diag(basis.C))}")
 
         # Per-run task designs: each condition convolved with each
         # basis function.  ``build_pc_basis_design_per_run`` is what
@@ -1157,7 +1180,7 @@ def main():
             ]
             cond_designs = build_pc_basis_design_per_run(
                 onsets_per_run=cond_onsets_per_run,
-                pcs=basis.basis_functions,           # use basis as PCs
+                pcs=basis.basis_functions,  # use basis as PCs
                 lag_times=basis_lag_times,
                 tr=tr,
                 n_timepoints_per_run=n_tp_per_run_list,
@@ -1169,9 +1192,7 @@ def main():
         # (n_tp_run, n_conditions * n_basis) with condition-major order.
         per_run_task_designs = []
         for r in range(len(n_tp_per_run_list)):
-            cond_blocks = [
-                per_run_designs_per_cond[c][r] for c in range(n_conditions)
-            ]
+            cond_blocks = [per_run_designs_per_cond[c][r] for c in range(n_conditions)]
             per_run_task_designs.append(
                 torch.from_numpy(np.concatenate(cond_blocks, axis=1).astype(np.float32))
             )
@@ -1179,14 +1200,9 @@ def main():
         # Per-run data list
         if mask is not None:
             mask_flat = mask.flatten()
-            per_run_data = [
-                torch.from_numpy(d[mask_flat, :].astype(np.float32))
-                for d in data_list
-            ]
+            per_run_data = [torch.from_numpy(d[mask_flat, :].astype(np.float32)) for d in data_list]
         else:
-            per_run_data = [
-                torch.from_numpy(d.astype(np.float32)) for d in data_list
-            ]
+            per_run_data = [torch.from_numpy(d.astype(np.float32)) for d in data_list]
 
         # Canonical shared-task multi-run GLM packing (same helper the
         # FIR/TENT path uses) — task block shared across runs,
@@ -1213,7 +1229,7 @@ def main():
         # FLOBS prior ONLY to the task block (nuisance is unpenalized).
         task_design = packed.design_concat[:, : packed.n_task_cols]
         nuisance = (
-            packed.design_concat[:, packed.n_task_cols:]
+            packed.design_concat[:, packed.n_task_cols :]
             if packed.design_concat.shape[1] > packed.n_task_cols
             else None
         )
@@ -1262,18 +1278,15 @@ def main():
         # Most directly interpretable for 2nd-level analyses (it's the
         # "signal change" of the modelled response).  Computed for
         # both constrained and unconstrained fits.
-        amplitude = fit.hrfs.max(axis=2)            # (n_vox, n_cond)
-        amplitude_ols = fit.hrfs_ols.max(axis=2)    # (n_vox, n_cond)
+        amplitude = fit.hrfs.max(axis=2)  # (n_vox, n_cond)
+        amplitude_ols = fit.hrfs_ols.max(axis=2)  # (n_vox, n_cond)
 
         if args.verb >= 1:
             print(
                 f"  σ² mean = {fit.sigma2_mean:.4g}, "
                 f"effective prior weight = {fit.effective_prior_weight:.4g}"
             )
-            print(
-                f"  R² mean — OLS: {fit.r2_ols.mean():.3f}   "
-                f"constrained: {fit.r2.mean():.3f}"
-            )
+            print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}   constrained: {fit.r2.mean():.3f}")
 
         def _to_volume(masked_data: np.ndarray, ndim_extra: int) -> np.ndarray:
             """Place masked-voxel data back into the full volume."""
@@ -1288,7 +1301,10 @@ def main():
         # ── Save FLOBS basis (one TSV, shared across conditions) ────
         basis_path = f"{args.prefix}_flobs_basis.tsv"
         np.savetxt(
-            basis_path, basis.basis_functions.T, fmt="%.10g", delimiter="\t",
+            basis_path,
+            basis.basis_functions.T,
+            fmt="%.10g",
+            delimiter="\t",
         )
         if args.verb >= 1:
             print(f"  Wrote {basis_path}  (n_lags×K, dt={basis.dt}s)")
@@ -1323,9 +1339,7 @@ def main():
                 iresp_files = save_iresp(
                     iresp=iresp_vol,
                     output_prefix=f"{args.prefix}_flobs",
-                    condition_labels=[
-                        f"{lbl}{fit_suffix}" for lbl in condition_labels
-                    ],
+                    condition_labels=[f"{lbl}{fit_suffix}" for lbl in condition_labels],
                     tr=basis.dt,
                     bot=0.0,
                     top=basis.duration - basis.dt,
@@ -1343,14 +1357,10 @@ def main():
                 (task_betas_ols, amplitude_ols, "_unconstrained"),
             ):
                 weights_4d = _to_volume(tbetas[:, cond_idx, :], 1)
-                weights_path = (
-                    f"{args.prefix}_flobs_pcweights_{label}{suffix}{_nii_ext}"
-                )
+                weights_path = f"{args.prefix}_flobs_pcweights_{label}{suffix}{_nii_ext}"
                 save_nifti(weights_4d, output_path=weights_path, reference_img=args.input[0])
                 amp_3d = _to_volume(amps[:, cond_idx][:, None], 0).squeeze(-1)
-                amp_path = (
-                    f"{args.prefix}_flobs_amplitude_{label}{suffix}{_nii_ext}"
-                )
+                amp_path = f"{args.prefix}_flobs_amplitude_{label}{suffix}{_nii_ext}"
                 save_nifti(amp_3d, output_path=amp_path, reference_img=args.input[0])
                 if args.verb >= 1:
                     print(f"  Wrote {weights_path}")
@@ -1401,9 +1411,8 @@ def main():
 
     elif condition_durations is not None:
         from fastfuncstuff.design.hrf import compute_windows_from_durations
-        tent_windows = compute_windows_from_durations(
-            condition_durations, tr, add_lag=add_lag_list
-        )
+
+        tent_windows = compute_windows_from_durations(condition_durations, tr, add_lag=add_lag_list)
         window_source = "auto (HRF convolution)"
 
     elif args.duration is not None:
@@ -1439,15 +1448,25 @@ def main():
             basis_type = "cubic spline" if "CSPLIN" in model else "tent"
             if len(set(tent_windows)) == 1:
                 bot, top = tent_windows[0]
-                n_basis_calc = args.tent_n_basis if args.tent_n_basis else round((top - bot) / tr) + 1
+                n_basis_calc = (
+                    args.tent_n_basis if args.tent_n_basis else round((top - bot) / tr) + 1
+                )
                 n_actual = n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
-                print(f"  Window (all conditions): {bot}s–{top}s → {n_basis_calc} {basis_type} knots, {n_actual} regressors")
+                print(
+                    f"  Window (all conditions): {bot}s–{top}s → {n_basis_calc} {basis_type} knots, {n_actual} regressors"
+                )
             else:
                 print("  Windows (per condition):")
                 for lbl, (bot, top) in zip(condition_labels, tent_windows):
-                    n_basis_calc = args.tent_n_basis if args.tent_n_basis else round((top - bot) / tr) + 1
-                    n_actual = n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
-                    print(f"    {lbl}: {bot}s–{top}s → {n_basis_calc} {basis_type} knots, {n_actual} regressors")
+                    n_basis_calc = (
+                        args.tent_n_basis if args.tent_n_basis else round((top - bot) / tr) + 1
+                    )
+                    n_actual = (
+                        n_basis_calc - 2 if model in ("TENTzero", "CSPLINzero") else n_basis_calc
+                    )
+                    print(
+                        f"    {lbl}: {bot}s–{top}s → {n_basis_calc} {basis_type} knots, {n_actual} regressors"
+                    )
 
     # Cross-validate TENT window upper bound if requested
     # _pv_* variables carry per-voxel mode context into the block below.
@@ -1494,17 +1513,11 @@ def main():
                     _pv_tops = candidate_tops
                     if args.verb >= 1:
                         print(f"\nPer-voxel window mode (±{n_range} TRs)...")
-                        print(
-                            f"  Candidates: "
-                            f"{', '.join(f'{t:.2f}s' for t in candidate_tops)}"
-                        )
+                        print(f"  Candidates: {', '.join(f'{t:.2f}s' for t in candidate_tops)}")
                 else:
                     if args.verb >= 1:
                         print(f"\nCross-validating window top (±{n_range} TRs)...")
-                        print(
-                            f"  Candidates: "
-                            f"{', '.join(f'{t:.2f}s' for t in candidate_tops)}"
-                        )
+                        print(f"  Candidates: {', '.join(f'{t:.2f}s' for t in candidate_tops)}")
 
                     best_top, best_r2 = _xval_tent_top(
                         data_list=data_list,
@@ -1559,9 +1572,7 @@ def main():
 
         # 2. Per-voxel argmax → best candidate index → best top value
         best_cand_per_vox = np.argmax(r2_matrix, axis=0)  # (n_vox,)
-        best_top_per_vox = np.array(
-            [_pv_tops[i] for i in best_cand_per_vox], dtype=np.float32
-        )
+        best_top_per_vox = np.array([_pv_tops[i] for i in best_cand_per_vox], dtype=np.float32)
 
         # 3. Save r2_by_window map (4D: one volume per candidate)
         r2_bw_vol = np.zeros((n_all_voxels, len(_pv_tops)), dtype=np.float32)
@@ -1607,8 +1618,7 @@ def main():
 
         # 7. Assemble per-voxel betas: one (n_all_voxels, max_n_basis_out) array per condition
         assembled_betas = [
-            np.zeros((n_all_voxels, max_n_basis_out), dtype=np.float32)
-            for _ in range(n_conditions)
+            np.zeros((n_all_voxels, max_n_basis_out), dtype=np.float32) for _ in range(n_conditions)
         ]
 
         unique_tops_pv = sorted(set(full_best_top.tolist()))
@@ -1625,16 +1635,24 @@ def main():
                     if use_csplin_pv:
                         d_c = make_csplin_design(
                             onset_times_list=[onset_times],
-                            bot=_pv_bot, top=top_val, tr=tr, n_timepoints=n_tp,
+                            bot=_pv_bot,
+                            top=top_val,
+                            tr=tr,
+                            n_timepoints=n_tp,
                             n_basis=args.tent_n_basis,
-                            zero_edges=(model == "CSPLINzero"), device=device,
+                            zero_edges=(model == "CSPLINzero"),
+                            device=device,
                         )
                     else:
                         d_c = make_tent_design(
                             onset_times_list=[onset_times],
-                            bot=_pv_bot, top=top_val, tr=tr, n_timepoints=n_tp,
+                            bot=_pv_bot,
+                            top=top_val,
+                            tr=tr,
+                            n_timepoints=n_tp,
                             n_basis=args.tent_n_basis,
-                            zero_edges=(model == "TENTzero"), device=device,
+                            zero_edges=(model == "TENTzero"),
+                            device=device,
                         )
                     cond_parts.append(d_c)
                 stim_parts.append(torch.cat(cond_parts, dim=1))
@@ -1649,7 +1667,9 @@ def main():
             tr_start = col_start = 0
             for run_idx, n_tp in enumerate(n_timepoints_per_run):
                 poly_run = legendre_polynomials(n_tp, args.polort)
-                poly_full[tr_start:tr_start + n_tp, col_start:col_start + n_poly_per_run] = poly_run
+                poly_full[tr_start : tr_start + n_tp, col_start : col_start + n_poly_per_run] = (
+                    poly_run
+                )
                 tr_start += n_tp
                 col_start += n_poly_per_run
             poly_tensor = torch.tensor(poly_full, dtype=torch.float32, device=device)
@@ -1679,13 +1699,13 @@ def main():
 
             for cond_idx in range(n_conditions):
                 cond_start = cond_idx * n_regs_k
-                betas_cond_k = betas_stim_k[:, cond_start:cond_start + n_regs_k]
+                betas_cond_k = betas_stim_k[:, cond_start : cond_start + n_regs_k]
 
                 padded = np.zeros((len(vox_this_top), max_n_basis_out), dtype=np.float32)
                 if zero_edges_pv:
                     # slot 0 and slot n_knots_k-1 are forced zeros (edge constraints)
                     # inner betas at slots 1 … n_regs_k
-                    padded[:, 1:1 + n_regs_k] = betas_cond_k
+                    padded[:, 1 : 1 + n_regs_k] = betas_cond_k
                 else:
                     padded[:, :n_regs_k] = betas_cond_k
                 assembled_betas[cond_idx][vox_this_top] = padded
@@ -1805,14 +1825,18 @@ def main():
             print(f"  {design_file}")
 
         # Save as AFNI .1D format with header
-        with open(design_file, 'w') as f:
+        with open(design_file, "w") as f:
             # Write metadata header
             f.write("# Design matrix for ffs_deconvolve.py\n")
             f.write(f"# Model: {model}\n")
             f.write(f"# TR: {tr}s\n")
             f.write(f"# Runs: {len(n_timepoints_per_run)}\n")
-            f.write(f"# Timepoints: {design_np.shape[0]} ({', '.join(map(str, n_timepoints_per_run))})\n")
-            f.write(f"# Regressors: {design_np.shape[1]} ({n_stimulus_regressors} stimulus + {design_np.shape[1] - n_stimulus_regressors} nuisance)\n")
+            f.write(
+                f"# Timepoints: {design_np.shape[0]} ({', '.join(map(str, n_timepoints_per_run))})\n"
+            )
+            f.write(
+                f"# Regressors: {design_np.shape[1]} ({n_stimulus_regressors} stimulus + {design_np.shape[1] - n_stimulus_regressors} nuisance)\n"
+            )
 
             if model in ("TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
                 basis_type = "Cubic spline" if "CSPLIN" in model else "TENT"
@@ -1820,16 +1844,22 @@ def main():
                 for cond_idx in range(n_conditions):
                     if tent_windows is not None:
                         bot, top = tent_windows[cond_idx]
-                        f.write(f"#   {condition_labels[cond_idx]}: {bot}s to {top}s ({n_basis_per_condition_list[cond_idx]} basis)\n")
+                        f.write(
+                            f"#   {condition_labels[cond_idx]}: {bot}s to {top}s ({n_basis_per_condition_list[cond_idx]} basis)\n"
+                        )
             elif model == "FIR":
-                f.write(f"# FIR lags: {n_basis_per_condition_list[0]} (duration: {(n_basis_per_condition_list[0]-1)*tr}s)\n")
+                f.write(
+                    f"# FIR lags: {n_basis_per_condition_list[0]} (duration: {(n_basis_per_condition_list[0] - 1) * tr}s)\n"
+                )
 
             if args.polort >= 0:
                 f.write("#\n")
                 f.write("# Polynomial drift (zero-padded per run):\n")
                 f.write(f"#   Order: {args.polort}\n")
                 f.write(f"#   Regressors per run: {args.polort + 1}\n")
-                f.write(f"#   Total polynomial regressors: {len(n_timepoints_per_run) * (args.polort + 1)}\n")
+                f.write(
+                    f"#   Total polynomial regressors: {len(n_timepoints_per_run) * (args.polort + 1)}\n"
+                )
 
             f.write("#\n")
             f.write("# Column labels:\n")
@@ -1840,7 +1870,9 @@ def main():
                 f.write(" ".join(f"{val:.6f}" for val in row) + "\n")
 
         if args.verb >= 1:
-            print(f"  ✓ Design matrix saved ({design_np.shape[0]} rows x {design_np.shape[1]} cols)")
+            print(
+                f"  ✓ Design matrix saved ({design_np.shape[0]} rows x {design_np.shape[1]} cols)"
+            )
 
     # Save design matrix plot if requested
     if args.save_design_plot:
@@ -1856,7 +1888,8 @@ def main():
 
         try:
             import matplotlib
-            matplotlib.use('Agg')  # Non-interactive backend
+
+            matplotlib.use("Agg")  # Non-interactive backend
             import matplotlib.pyplot as plt
 
             # Create figure (time on vertical axis)
@@ -1864,33 +1897,44 @@ def main():
 
             # Plot design matrix (no interpolation!)
             # Rows = time, Columns = regressors
-            im = ax.imshow(design_np, aspect='auto', interpolation='none', cmap='RdBu_r')
+            im = ax.imshow(design_np, aspect="auto", interpolation="none", cmap="RdBu_r")
 
             # Add colorbar
-            plt.colorbar(im, ax=ax, label='Design value')
+            plt.colorbar(im, ax=ax, label="Design value")
 
             # Labels
-            ax.set_ylabel('Time (TRs)', fontsize=12)
-            ax.set_xlabel('Regressor', fontsize=12)
-            ax.set_title(f'Design Matrix: {model} model ({design_np.shape[0]} TRs x {design_np.shape[1]} regressors)', fontsize=14)
+            ax.set_ylabel("Time (TRs)", fontsize=12)
+            ax.set_xlabel("Regressor", fontsize=12)
+            ax.set_title(
+                f"Design Matrix: {model} model ({design_np.shape[0]} TRs x {design_np.shape[1]} regressors)",
+                fontsize=14,
+            )
 
             # Add grid lines between stimulus and nuisance
             if n_stimulus_regressors < design_np.shape[1]:
                 # Vertical line between stimulus and nuisance
-                ax.axvline(n_stimulus_regressors - 0.5, color='black', linewidth=2, linestyle='--', alpha=0.7)
+                ax.axvline(
+                    n_stimulus_regressors - 0.5,
+                    color="black",
+                    linewidth=2,
+                    linestyle="--",
+                    alpha=0.7,
+                )
 
             # Add horizontal lines for run boundaries
             tr_idx = 0
             for _run_idx, n_tp in enumerate(n_timepoints_per_run[:-1]):
                 tr_idx += n_tp
-                ax.axhline(tr_idx - 0.5, color='yellow', linewidth=1, linestyle='-', alpha=0.5)
+                ax.axhline(tr_idx - 0.5, color="yellow", linewidth=1, linestyle="-", alpha=0.5)
 
             # Add vertical lines between conditions (for TENT with different n_basis)
             if len(set(n_basis_per_condition_list)) > 1:
                 basis_idx = 0
                 for _cond_idx, n_basis in enumerate(n_basis_per_condition_list[:-1]):
                     basis_idx += n_basis
-                    ax.axvline(basis_idx - 0.5, color='green', linewidth=1, linestyle='-', alpha=0.5)
+                    ax.axvline(
+                        basis_idx - 0.5, color="green", linewidth=1, linestyle="-", alpha=0.5
+                    )
 
             # Set x-tick labels to show condition names
             # Show labels at the center of each condition's regressors
@@ -1906,7 +1950,7 @@ def main():
                 # Add label for polynomials
                 poly_n = design_np.shape[1] - n_stimulus_regressors
                 x_tick_positions.append(n_stimulus_regressors + poly_n / 2)
-                x_tick_labels.append('polort')
+                x_tick_labels.append("polort")
 
             ax.set_xticks(x_tick_positions)
             ax.set_xticklabels(x_tick_labels)
@@ -1915,7 +1959,7 @@ def main():
             plt.tight_layout()
 
             # Save
-            plt.savefig(design_plot_file, dpi=150, bbox_inches='tight')
+            plt.savefig(design_plot_file, dpi=150, bbox_inches="tight")
             plt.close()
 
             if args.verb >= 1:
@@ -1951,14 +1995,9 @@ def main():
 
     if mask is not None:
         mask_flat = mask.flatten()
-        per_run_data = [
-            torch.from_numpy(d[mask_flat, :].astype(np.float32))
-            for d in data_list
-        ]
+        per_run_data = [torch.from_numpy(d[mask_flat, :].astype(np.float32)) for d in data_list]
     else:
-        per_run_data = [
-            torch.from_numpy(d.astype(np.float32)) for d in data_list
-        ]
+        per_run_data = [torch.from_numpy(d.astype(np.float32)) for d in data_list]
     del data_list
 
     packed = pack_for_shared_task_glm(
@@ -1995,10 +2034,10 @@ def main():
         data=packed.data_concat,
         design=packed.design_concat,
         tr=tr,
-        max_poly_degree=-1,                       # polys already packed in
+        max_poly_degree=-1,  # polys already packed in
         device=device,
-        preload_data_to_device=False,             # stream chunks to GPU
-        chunk_size=None,                          # auto-estimate
+        preload_data_to_device=False,  # stream chunks to GPU
+        chunk_size=None,  # auto-estimate
         verbose=args.verb >= 1,
         debug_memory=args.debug_memory,
         debug_design=args.debug_design,
@@ -2106,4 +2145,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

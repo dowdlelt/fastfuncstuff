@@ -19,7 +19,6 @@ import torch
 
 from fastfuncstuff.denoise.sequential import (
     ComponentCountEstimate,
-    _compute_local_run_starts,
     compute_full_brain_pc_loadings,
     compute_noise_pool_pca_scree_per_run,
     estimate_noise_component_caps_per_run,
@@ -36,6 +35,7 @@ DEVICE = torch.device("cpu")
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def small_data():
@@ -59,12 +59,17 @@ def nuisance_per_run():
 # estimate_noise_component_caps_per_run  (lines 240-451)
 # ---------------------------------------------------------------------------
 
+
 class TestEstimateNoiseComponentCapsPerRun:
     def test_returns_component_count_estimate(self, small_data):
         data, run_starts, noise_mask = small_data
         result = estimate_noise_component_caps_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=10, min_components=2, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=10,
+            min_components=2,
+            device=DEVICE,
         )
         assert isinstance(result, ComponentCountEstimate)
         assert len(result.per_run_caps) == 3
@@ -73,16 +78,23 @@ class TestEstimateNoiseComponentCapsPerRun:
     def test_caps_bounded_by_max_components(self, small_data):
         data, run_starts, noise_mask = small_data
         result = estimate_noise_component_caps_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=5, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=5,
+            device=DEVICE,
         )
         assert all(c <= 5 for c in result.per_run_caps)
 
     def test_with_nuisance(self, small_data, nuisance_per_run):
         data, run_starts, noise_mask = small_data
         result = estimate_noise_component_caps_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=8, nuisance_per_run=nuisance_per_run, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=8,
+            nuisance_per_run=nuisance_per_run,
+            device=DEVICE,
         )
         assert len(result.per_run_caps) == 3
 
@@ -90,23 +102,33 @@ class TestEstimateNoiseComponentCapsPerRun:
         data, run_starts, noise_mask = small_data
         with pytest.raises(ValueError, match="max_components must be >= 1"):
             estimate_noise_component_caps_per_run(
-                data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-                max_components=0, device=DEVICE,
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_mask,
+                max_components=0,
+                device=DEVICE,
             )
 
     def test_mp_prior_disabled(self, small_data):
         data, run_starts, noise_mask = small_data
         result = estimate_noise_component_caps_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=8, use_mp_prior=False, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=8,
+            use_mp_prior=False,
+            device=DEVICE,
         )
         assert all(r == "disabled" for r in result.mp_reasons)
 
     def test_details_by_run_populated(self, small_data):
         data, run_starts, noise_mask = small_data
         result = estimate_noise_component_caps_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=8, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=8,
+            device=DEVICE,
         )
         assert len(result.details_by_run) == 3
         for d in result.details_by_run:
@@ -119,12 +141,16 @@ class TestEstimateNoiseComponentCapsPerRun:
 # compute_noise_pool_pca_scree_per_run  (lines 454-502)
 # ---------------------------------------------------------------------------
 
+
 class TestComputeNoisePoolPcaScreePerRun:
     def test_returns_per_run_scree(self, small_data):
         data, run_starts, noise_mask = small_data
         scree = compute_noise_pool_pca_scree_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=5, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=5,
+            device=DEVICE,
         )
         assert len(scree) == 3
         for s in scree:
@@ -134,8 +160,12 @@ class TestComputeNoisePoolPcaScreePerRun:
     def test_with_nuisance(self, small_data, nuisance_per_run):
         data, run_starts, noise_mask = small_data
         scree = compute_noise_pool_pca_scree_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=5, nuisance_per_run=nuisance_per_run, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=5,
+            nuisance_per_run=nuisance_per_run,
+            device=DEVICE,
         )
         assert len(scree) == 3
 
@@ -143,6 +173,7 @@ class TestComputeNoisePoolPcaScreePerRun:
 # ---------------------------------------------------------------------------
 # select_noise_pool_voxels edge cases  (lines 559-573)
 # ---------------------------------------------------------------------------
+
 
 class TestSelectNoisePoolEdgeCases:
     def test_too_large_noise_pool_triggers_adjustment(self):
@@ -177,12 +208,17 @@ class TestSelectNoisePoolEdgeCases:
 # extract_noise_pcs_per_run additional branches (lines 643, 701-750)
 # ---------------------------------------------------------------------------
 
+
 class TestExtractNoisePcsPerRunBranches:
     def test_component_caps_per_run(self, small_data):
         data, run_starts, noise_mask = small_data
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=5, component_caps_per_run=[2, 3, 2], device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=5,
+            component_caps_per_run=[2, 3, 2],
+            device=DEVICE,
         )
         assert pcs[0].shape[1] == 2
         assert pcs[1].shape[1] == 3
@@ -192,15 +228,23 @@ class TestExtractNoisePcsPerRunBranches:
         data, run_starts, noise_mask = small_data
         with pytest.raises(ValueError, match="component_caps_per_run has"):
             extract_noise_pcs_per_run(
-                data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-                max_components=5, component_caps_per_run=[2, 3], device=DEVICE,
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_mask,
+                max_components=5,
+                component_caps_per_run=[2, 3],
+                device=DEVICE,
             )
 
     def test_return_loadings(self, small_data):
         data, run_starts, noise_mask = small_data
         pcs, loadings = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, return_loadings=True, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            return_loadings=True,
+            device=DEVICE,
         )
         assert len(loadings) == 3
         n_noise = noise_mask.sum().item()
@@ -211,9 +255,13 @@ class TestExtractNoisePcsPerRunBranches:
     def test_verbose_with_nuisance(self, small_data, nuisance_per_run, capsys):
         data, run_starts, noise_mask = small_data
         extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, nuisance_per_run=nuisance_per_run,
-            device=DEVICE, verbose=True,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            nuisance_per_run=nuisance_per_run,
+            device=DEVICE,
+            verbose=True,
         )
         captured = capsys.readouterr()
         assert "PCs" in captured.out
@@ -223,8 +271,11 @@ class TestExtractNoisePcsPerRunBranches:
         """PCs should be normalized to approximately unit variance."""
         data, run_starts, noise_mask = small_data
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         for pc in pcs:
             stds = pc.std(dim=0)
@@ -235,12 +286,16 @@ class TestExtractNoisePcsPerRunBranches:
 # extract_noise_ics_per_run  (lines 776-886)
 # ---------------------------------------------------------------------------
 
+
 class TestExtractNoiseIcsPerRun:
     def test_basic_extraction(self, small_data):
         data, run_starts, noise_mask = small_data
         ics = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         assert len(ics) == 3
         for ic in ics:
@@ -249,8 +304,12 @@ class TestExtractNoiseIcsPerRun:
     def test_return_loadings(self, small_data):
         data, run_starts, noise_mask = small_data
         ics, loadings = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, return_loadings=True, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            return_loadings=True,
+            device=DEVICE,
         )
         assert len(loadings) == 3
         n_noise = noise_mask.sum().item()
@@ -260,8 +319,12 @@ class TestExtractNoiseIcsPerRun:
     def test_return_variance_ratio(self, small_data):
         data, run_starts, noise_mask = small_data
         ics, var_ratio = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, return_variance_ratio=True, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            return_variance_ratio=True,
+            device=DEVICE,
         )
         assert len(var_ratio) == 3
         for v in var_ratio:
@@ -272,8 +335,12 @@ class TestExtractNoiseIcsPerRun:
     def test_return_loadings_and_variance_ratio(self, small_data):
         data, run_starts, noise_mask = small_data
         ics, loadings, var_ratio = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, return_loadings=True, return_variance_ratio=True,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            return_loadings=True,
+            return_variance_ratio=True,
             device=DEVICE,
         )
         assert len(ics) == 3
@@ -283,8 +350,12 @@ class TestExtractNoiseIcsPerRun:
     def test_component_caps(self, small_data):
         data, run_starts, noise_mask = small_data
         ics = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=5, component_caps_per_run=[2, 3, 2], device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=5,
+            component_caps_per_run=[2, 3, 2],
+            device=DEVICE,
         )
         assert ics[0].shape[1] == 2
         assert ics[1].shape[1] == 3
@@ -294,16 +365,23 @@ class TestExtractNoiseIcsPerRun:
         data, run_starts, noise_mask = small_data
         with pytest.raises(ValueError, match="component_caps_per_run has"):
             extract_noise_ics_per_run(
-                data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-                max_components=5, component_caps_per_run=[2], device=DEVICE,
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_mask,
+                max_components=5,
+                component_caps_per_run=[2],
+                device=DEVICE,
             )
 
     def test_unit_variance(self, small_data):
         """IC timecourses should be unit-variance normalized."""
         data, run_starts, noise_mask = small_data
         ics = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         for ic in ics:
             stds = ic.std(dim=0)
@@ -312,16 +390,24 @@ class TestExtractNoiseIcsPerRun:
     def test_with_nuisance(self, small_data, nuisance_per_run):
         data, run_starts, noise_mask = small_data
         ics = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, nuisance_per_run=nuisance_per_run, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            nuisance_per_run=nuisance_per_run,
+            device=DEVICE,
         )
         assert len(ics) == 3
 
     def test_verbose(self, small_data, capsys):
         data, run_starts, noise_mask = small_data
         extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE, verbose=True,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
+            verbose=True,
         )
         captured = capsys.readouterr()
         assert "ICs" in captured.out
@@ -329,8 +415,12 @@ class TestExtractNoiseIcsPerRun:
     def test_multiple_restarts(self, small_data):
         data, run_starts, noise_mask = small_data
         ics = extract_noise_ics_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, ica_restarts=2, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            ica_restarts=2,
+            device=DEVICE,
         )
         assert len(ics) == 3
 
@@ -339,15 +429,21 @@ class TestExtractNoiseIcsPerRun:
 # compute_full_brain_pc_loadings  (lines 930-991)
 # ---------------------------------------------------------------------------
 
+
 class TestComputeFullBrainPcLoadings:
     def test_basic(self, small_data):
         data, run_starts, noise_mask = small_data
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         loadings = compute_full_brain_pc_loadings(
-            data=data, noise_pcs_per_run=pcs, run_starts=run_starts,
+            data=data,
+            noise_pcs_per_run=pcs,
+            run_starts=run_starts,
             device=DEVICE,
         )
         assert len(loadings) == 3
@@ -357,14 +453,20 @@ class TestComputeFullBrainPcLoadings:
     def test_with_brain_mask(self, small_data):
         data, run_starts, noise_mask = small_data
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         brain_mask = torch.zeros(120, dtype=torch.bool)
         brain_mask[:80] = True
         loadings = compute_full_brain_pc_loadings(
-            data=data, noise_pcs_per_run=pcs, run_starts=run_starts,
-            brain_mask=brain_mask, device=DEVICE,
+            data=data,
+            noise_pcs_per_run=pcs,
+            run_starts=run_starts,
+            brain_mask=brain_mask,
+            device=DEVICE,
         )
         # Non-brain voxels should be zero
         for L in loadings:
@@ -374,25 +476,37 @@ class TestComputeFullBrainPcLoadings:
     def test_brain_mask_size_mismatch_raises(self, small_data):
         data, run_starts, noise_mask = small_data
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         bad_mask = torch.ones(50, dtype=torch.bool)
         with pytest.raises(ValueError, match="Brain mask size"):
             compute_full_brain_pc_loadings(
-                data=data, noise_pcs_per_run=pcs, run_starts=run_starts,
-                brain_mask=bad_mask, device=DEVICE,
+                data=data,
+                noise_pcs_per_run=pcs,
+                run_starts=run_starts,
+                brain_mask=bad_mask,
+                device=DEVICE,
             )
 
     def test_verbose(self, small_data, capsys):
         data, run_starts, noise_mask = small_data
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         compute_full_brain_pc_loadings(
-            data=data, noise_pcs_per_run=pcs, run_starts=run_starts,
-            device=DEVICE, verbose=True,
+            data=data,
+            noise_pcs_per_run=pcs,
+            run_starts=run_starts,
+            device=DEVICE,
+            verbose=True,
         )
         captured = capsys.readouterr()
         assert "loadings" in captured.out.lower()
@@ -402,6 +516,7 @@ class TestComputeFullBrainPcLoadings:
 # fit_glm_with_noise_pcs  (lines 1050-1108)
 # ---------------------------------------------------------------------------
 
+
 class TestFitGlmWithNoisePcs:
     def test_basic_fit(self, small_data):
         torch.manual_seed(42)
@@ -409,12 +524,20 @@ class TestFitGlmWithNoisePcs:
         n_conds = 2
         design = torch.randn(90, n_conds)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         betas, r2 = fit_glm_with_noise_pcs(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, n_pcs_to_use=2, tr=2.0, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            n_pcs_to_use=2,
+            tr=2.0,
+            device=DEVICE,
         )
         assert betas.shape == (120, n_conds)
         assert r2.shape == (120,)
@@ -424,12 +547,20 @@ class TestFitGlmWithNoisePcs:
         data, run_starts, noise_mask = small_data
         design = torch.randn(90, 2)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         betas, r2 = fit_glm_with_noise_pcs(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, n_pcs_to_use=0, tr=2.0, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            n_pcs_to_use=0,
+            tr=2.0,
+            device=DEVICE,
         )
         assert betas.shape == (120, 2)
 
@@ -438,15 +569,23 @@ class TestFitGlmWithNoisePcs:
         data, run_starts, noise_mask = small_data
         design = torch.randn(90, 2)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         eval_mask = torch.zeros(120, dtype=torch.bool)
         eval_mask[:50] = True
         betas, r2 = fit_glm_with_noise_pcs(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, n_pcs_to_use=2, tr=2.0,
-            eval_mask=eval_mask, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            n_pcs_to_use=2,
+            tr=2.0,
+            eval_mask=eval_mask,
+            device=DEVICE,
         )
         # Non-eval voxels should be NaN
         assert torch.isnan(r2[50:]).all()
@@ -458,13 +597,21 @@ class TestFitGlmWithNoisePcs:
         design = torch.randn(90, 2)
         nuisance = torch.ones(90, 1)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         betas, r2 = fit_glm_with_noise_pcs(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, n_pcs_to_use=2, tr=2.0,
-            nuisance=nuisance, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            n_pcs_to_use=2,
+            tr=2.0,
+            nuisance=nuisance,
+            device=DEVICE,
         )
         assert betas.shape == (120, 2)
 
@@ -472,6 +619,7 @@ class TestFitGlmWithNoisePcs:
 # ---------------------------------------------------------------------------
 # select_optimal_pcs  (lines 1670-1724)
 # ---------------------------------------------------------------------------
+
 
 class TestSelectOptimalPcs:
     def test_basic_selection(self):
@@ -509,6 +657,7 @@ class TestSelectOptimalPcs:
 # compute_xval_r2_optimal_full  (lines 1755-1943)
 # ---------------------------------------------------------------------------
 
+
 class TestComputeXvalR2OptimalFull:
     """Test the full cross-validated R2 computation at optimal PC count."""
 
@@ -520,12 +669,19 @@ class TestComputeXvalR2OptimalFull:
         data, run_starts, noise_mask = small_data
         design = torch.randn(90, 2)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         r2_all, r2_per_fold = compute_xval_r2_optimal_full(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, optimal_n_components=2, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            optimal_n_components=2,
+            device=DEVICE,
         )
         assert r2_all.shape == (120,)
         assert r2_per_fold.shape[1] == 120
@@ -538,13 +694,20 @@ class TestComputeXvalR2OptimalFull:
         data, run_starts, noise_mask = small_data
         design = torch.randn(90, 2)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         r2_all, r2_per_fold = compute_xval_r2_optimal_full(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, optimal_n_components=2,
-            nuisance=nuisance_per_run, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            optimal_n_components=2,
+            nuisance=nuisance_per_run,
+            device=DEVICE,
         )
         assert r2_all.shape == (120,)
 
@@ -556,12 +719,19 @@ class TestComputeXvalR2OptimalFull:
         data, run_starts, noise_mask = small_data
         design = torch.randn(90, 2)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         r2_all, _ = compute_xval_r2_optimal_full(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, optimal_n_components=0, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            optimal_n_components=0,
+            device=DEVICE,
         )
         assert r2_all.shape == (120,)
 
@@ -574,12 +744,19 @@ class TestComputeXvalR2OptimalFull:
         design = torch.randn(90, 2)
         nuisance = torch.ones(90, 1)
         pcs = extract_noise_pcs_per_run(
-            data=data, run_starts=run_starts, noise_pool_mask=noise_mask,
-            max_components=3, device=DEVICE,
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_mask,
+            max_components=3,
+            device=DEVICE,
         )
         r2_all, _ = compute_xval_r2_optimal_full(
-            data=data, design_matrix=design, noise_pcs=pcs,
-            run_starts=run_starts, optimal_n_components=2,
-            nuisance=nuisance, device=DEVICE,
+            data=data,
+            design_matrix=design,
+            noise_pcs=pcs,
+            run_starts=run_starts,
+            optimal_n_components=2,
+            nuisance=nuisance,
+            device=DEVICE,
         )
         assert r2_all.shape == (120,)

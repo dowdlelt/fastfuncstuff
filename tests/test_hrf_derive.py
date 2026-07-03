@@ -16,6 +16,7 @@ pipeline using small synthetic datasets:
 
 Tests run in seconds; no GPU.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -33,7 +34,6 @@ from fastfuncstuff.design.hrf_derive import (
     trace_manifold_auto,
     trace_manifold_grid,
 )
-
 
 # ---------- helpers ----------------------------------------------------------
 
@@ -55,9 +55,7 @@ def synthetic_fir_dataset():
     tr = 1.0
     n_lags = 25
     lag_times = np.arange(n_lags) * tr
-    templates = np.stack(
-        [_double_gamma_curve(lag_times, a1) for a1 in (4.0, 5.5, 7.0)]
-    )
+    templates = np.stack([_double_gamma_curve(lag_times, a1) for a1 in (4.0, 5.5, 7.0)])
     n_voxels = 5_000
     weights = rng.dirichlet(np.ones(3), size=n_voxels)
     betas = weights @ templates + 0.05 * rng.standard_normal((n_voxels, n_lags))
@@ -263,7 +261,8 @@ def test_deconvolve_event_duration_recovers_impulse():
     t = np.arange(0, 30, dt)
     h_imp = _double_gamma_curve(t, a1=6.0)
     n_box = int(3.0 / dt)
-    box = np.zeros_like(t); box[:n_box] = 1.0
+    box = np.zeros_like(t)
+    box[:n_box] = 1.0
     h_obs = np.convolve(h_imp, box)[: len(t)]
     h_obs = h_obs / h_obs.max()
     lib = np.stack([h_obs, h_obs])
@@ -287,9 +286,15 @@ def test_deconvolve_short_duration_noop():
 def test_derive_library_with_deconvolution(synthetic_fir_dataset):
     betas, r2, lag_times, _ = synthetic_fir_dataset
     res = derive_library(
-        betas, r2, lag_times, n_hrfs=8, n_pcs=3,
-        r2_threshold=0.05, max_voxels=2000,
-        deconvolve_duration=2.0, deconv_snr=200.0,
+        betas,
+        r2,
+        lag_times,
+        n_hrfs=8,
+        n_pcs=3,
+        r2_threshold=0.05,
+        max_voxels=2000,
+        deconvolve_duration=2.0,
+        deconv_snr=200.0,
     )
     assert res.raw_deconvolved is not None
     assert res.raw_deconvolved.shape == res.raw.shape

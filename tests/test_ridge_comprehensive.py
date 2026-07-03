@@ -22,9 +22,9 @@ from fastfuncstuff.glm.ridge import (
     create_single_trial_design,
     fit_ridge_single_trial,
 )
+from fastfuncstuff.glm.xval import generate_cv_splits
 from fastfuncstuff.simulation.core import simulate_fmri_run
 from fastfuncstuff.utils import get_device
-from fastfuncstuff.glm.xval import generate_cv_splits
 
 
 @pytest.fixture

@@ -1,8 +1,8 @@
 """Tests for processing/motsim.py — motion simulation regressors."""
 
 import numpy as np
-import torch
 import pytest
+import torch
 
 from fastfuncstuff.processing.motsim import (
     automask_dilate,
@@ -24,11 +24,7 @@ DEV = torch.device("cpu")
 class TestLoadMotion1D:
     def test_basic_load(self, tmp_path):
         path = tmp_path / "motion.1D"
-        path.write_text(
-            "# comment line\n"
-            "0.1 0.2 0.3 0.4 0.5 0.6\n"
-            "0.0 0.0 0.0 0.0 0.0 0.0\n"
-        )
+        path.write_text("# comment line\n0.1 0.2 0.3 0.4 0.5 0.6\n0.0 0.0 0.0 0.0 0.0 0.0\n")
         params = load_motion_1d(str(path))
         assert params.shape == (2, 6)
         assert params.dtype == np.float64
@@ -36,11 +32,7 @@ class TestLoadMotion1D:
     def test_skips_comments_and_blanks(self, tmp_path):
         path = tmp_path / "motion.1D"
         path.write_text(
-            "# header\n"
-            "\n"
-            "0.1 0.2 0.3 0.4 0.5 0.6\n"
-            "# another comment\n"
-            "0.0 0.0 0.0 0.0 0.0 0.0\n"
+            "# header\n\n0.1 0.2 0.3 0.4 0.5 0.6\n# another comment\n0.0 0.0 0.0 0.0 0.0 0.0\n"
         )
         params = load_motion_1d(str(path))
         assert params.shape == (2, 6)
@@ -69,10 +61,7 @@ class TestLoadMotion1D:
 class TestLoadDfile:
     def test_basic_load(self, tmp_path):
         path = tmp_path / "dfile.1D"
-        path.write_text(
-            "0 0.1 0.2 0.3 0.4 0.5 0.6 1.0 0.9\n"
-            "1 0.0 0.0 0.0 0.0 0.0 0.0 0.5 0.4\n"
-        )
+        path.write_text("0 0.1 0.2 0.3 0.4 0.5 0.6 1.0 0.9\n1 0.0 0.0 0.0 0.0 0.0 0.0 0.5 0.4\n")
         params = load_dfile(str(path))
         assert params.shape == (2, 6)
 
@@ -106,7 +95,10 @@ class TestParamsToVoxelMatrices:
         # Zero params → identity matrix
         for t in range(2):
             torch.testing.assert_close(
-                matrices[t], torch.eye(4), atol=1e-5, rtol=1e-5,
+                matrices[t],
+                torch.eye(4),
+                atol=1e-5,
+                rtol=1e-5,
             )
 
     def test_output_shape(self):

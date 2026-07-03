@@ -11,8 +11,6 @@ Validation:
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
 from ..runner import BenchmarkContext, run_timed
@@ -25,7 +23,7 @@ FFS_PREFIX = "ffs_sauna"
 
 THRESHOLDS = {
     "ts_median_r": 0.90,
-    "gfactor_r":   0.97,
+    "gfactor_r": 0.97,
 }
 
 
@@ -57,7 +55,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     out = nd / f"{FFS_PREFIX}.nii.gz"
 
     if out.exists() and not ctx.force_ffs:
-        print(f"  Skipping ffs_sauna (output exists, use -force-ffs to re-run)")
+        print("  Skipping ffs_sauna (output exists, use -force-ffs to re-run)")
         return 0.0
 
     elapsed, _ = run_timed(

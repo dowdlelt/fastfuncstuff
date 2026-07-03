@@ -35,37 +35,33 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.io.afni import load_nifti, save_nifti
-from fastfuncstuff.memory import (
-    estimate_chunk_size,
-    estimate_nordic_llr_memory,
-    get_available_memory,
-)
-from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64, to_tensor
-
 # Reuse phase stabilization and LLR infrastructure from NORDIC
 from fastfuncstuff.denoise.nordic import (
+    _apply_temporal_phase_correction,
     _build_patch_starts,
     _compute_dd_phase,
     _compute_meanphase,
     _dd_phase_multiply_inplace,
     _default_kernel_size_pca,
-    _LLRStats,
     _llr_denoise,
     _meanphase_unit,
     _phase_to_radians,
     _remove_meanphase,
     _restore_meanphase,
-    _apply_temporal_phase_correction,
 )
-
+from fastfuncstuff.io.afni import load_nifti, save_nifti
+from fastfuncstuff.memory import (
+    estimate_nordic_llr_memory,
+    get_available_memory,
+)
+from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64, to_tensor
 
 # ---------------------------------------------------------------------------
 # Public dataclasses

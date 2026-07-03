@@ -79,16 +79,16 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
-from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
-from fastfuncstuff.decomposition.io import save_decomposition_results
 from fastfuncstuff.decomposition.ica import (
     FastICA,
     ica_stability_analysis,
     select_n_components_by_stability,
 )
-from fastfuncstuff.decomposition.tools import parse_num_comps_spec
 from fastfuncstuff.decomposition.icasso import icasso, icasso_auto_select
+from fastfuncstuff.decomposition.io import save_decomposition_results
 from fastfuncstuff.decomposition.pca import PCA
+from fastfuncstuff.decomposition.tools import parse_num_comps_spec
+from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
 from fastfuncstuff.utils import configure_torch_backends, get_device
 
 

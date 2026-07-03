@@ -20,10 +20,10 @@ from fastfuncstuff.design.bids_events import (
     sort_bids_event_files,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _write_tsv(path: Path, rows: list[dict], cols: list[str] | None = None) -> Path:
     """Write a TSV with the given rows. `cols` overrides column order/names."""
@@ -39,6 +39,7 @@ def _write_tsv(path: Path, rows: list[dict], cols: list[str] | None = None) -> P
 # ---------------------------------------------------------------------------
 # _run_number / sort_bids_event_files
 # ---------------------------------------------------------------------------
+
 
 class TestRunNumberSorting:
     def test_padded_and_unpadded_equivalent(self):
@@ -64,8 +65,10 @@ class TestRunNumberSorting:
         assert nums == [1, 2, 10]
 
     def test_sort_accepts_string_paths(self, tmp_path):
-        files = [str(tmp_path / "sub-01_run-2_events.tsv"),
-                 str(tmp_path / "sub-01_run-1_events.tsv")]
+        files = [
+            str(tmp_path / "sub-01_run-2_events.tsv"),
+            str(tmp_path / "sub-01_run-1_events.tsv"),
+        ]
         sorted_paths = sort_bids_event_files(files)
         assert all(isinstance(p, Path) for p in sorted_paths)
         assert [_run_number(p) for p in sorted_paths] == [1, 2]
@@ -75,13 +78,17 @@ class TestRunNumberSorting:
 # parse_bids_events — single run
 # ---------------------------------------------------------------------------
 
+
 class TestParseSingleRun:
     def test_basic_two_conditions(self, tmp_path):
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 2.0, "trial_type": "face"},
-            {"onset": 10.0, "duration": 2.0, "trial_type": "house"},
-            {"onset": 20.0, "duration": 2.0, "trial_type": "face"},
-        ])
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 2.0, "trial_type": "face"},
+                {"onset": 10.0, "duration": 2.0, "trial_type": "house"},
+                {"onset": 20.0, "duration": 2.0, "trial_type": "face"},
+            ],
+        )
         all_onsets, durations, labels = parse_bids_events([f])
         assert labels == ["face", "house"]  # sorted alphabetically
         assert durations == [2.0, 2.0]
@@ -91,46 +98,55 @@ class TestParseSingleRun:
 
     def test_onsets_sorted_within_condition(self, tmp_path):
         """parse must sort onsets ascending within each (condition, run)."""
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 30.0, "duration": 1.0, "trial_type": "A"},
-            {"onset": 5.0, "duration": 1.0, "trial_type": "A"},
-            {"onset": 15.0, "duration": 1.0, "trial_type": "A"},
-        ])
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 30.0, "duration": 1.0, "trial_type": "A"},
+                {"onset": 5.0, "duration": 1.0, "trial_type": "A"},
+                {"onset": 15.0, "duration": 1.0, "trial_type": "A"},
+            ],
+        )
         all_onsets, _, _ = parse_bids_events([f])
         np.testing.assert_array_equal(all_onsets[0][0], [5.0, 15.0, 30.0])
 
     def test_skips_na_and_empty_trial_types(self, tmp_path):
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
-            {"onset": 5.0, "duration": 1.0, "trial_type": "n/a"},
-            {"onset": 10.0, "duration": 1.0, "trial_type": ""},
-            {"onset": 15.0, "duration": 1.0, "trial_type": "N/A"},
-        ])
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
+                {"onset": 5.0, "duration": 1.0, "trial_type": "n/a"},
+                {"onset": 10.0, "duration": 1.0, "trial_type": ""},
+                {"onset": 15.0, "duration": 1.0, "trial_type": "N/A"},
+            ],
+        )
         all_onsets, _, labels = parse_bids_events([f])
         assert labels == ["A"]
         np.testing.assert_array_equal(all_onsets[0][0], [0.0])
 
     def test_event_ignore_filters_listed_conditions(self, tmp_path):
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
-            {"onset": 5.0, "duration": 1.0, "trial_type": "fixation"},
-            {"onset": 10.0, "duration": 1.0, "trial_type": "B"},
-        ])
-        all_onsets, _, labels = parse_bids_events(
-            [f], event_ignore=["fixation"]
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
+                {"onset": 5.0, "duration": 1.0, "trial_type": "fixation"},
+                {"onset": 10.0, "duration": 1.0, "trial_type": "B"},
+            ],
         )
+        all_onsets, _, labels = parse_bids_events([f], event_ignore=["fixation"])
         assert labels == ["A", "B"]
         assert all_onsets[0][0].tolist() == [0.0]
         assert all_onsets[1][0].tolist() == [10.0]
 
     def test_custom_column_names(self, tmp_path):
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"start": 0.0, "len": 2.0, "cond": "A"},
-            {"start": 10.0, "len": 2.0, "cond": "B"},
-        ], cols=["start", "len", "cond"])
-        all_onsets, _, labels = parse_bids_events(
-            [f], event_cols=("start", "len", "cond")
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"start": 0.0, "len": 2.0, "cond": "A"},
+                {"start": 10.0, "len": 2.0, "cond": "B"},
+            ],
+            cols=["start", "len", "cond"],
         )
+        all_onsets, _, labels = parse_bids_events([f], event_cols=("start", "len", "cond"))
         assert labels == ["A", "B"]
         assert all_onsets[0][0].tolist() == [0.0]
 
@@ -139,15 +155,22 @@ class TestParseSingleRun:
 # parse_bids_events — multi-run
 # ---------------------------------------------------------------------------
 
+
 class TestParseMultiRun:
     def test_per_run_onset_arrays(self, tmp_path):
-        f1 = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
-            {"onset": 10.0, "duration": 1.0, "trial_type": "B"},
-        ])
-        f2 = _write_tsv(tmp_path / "run-2_events.tsv", [
-            {"onset": 5.0, "duration": 1.0, "trial_type": "A"},
-        ])
+        f1 = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
+                {"onset": 10.0, "duration": 1.0, "trial_type": "B"},
+            ],
+        )
+        f2 = _write_tsv(
+            tmp_path / "run-2_events.tsv",
+            [
+                {"onset": 5.0, "duration": 1.0, "trial_type": "A"},
+            ],
+        )
         all_onsets, _, labels = parse_bids_events([f1, f2])
         assert labels == ["A", "B"]
         # A appears in both runs
@@ -160,12 +183,18 @@ class TestParseMultiRun:
     def test_runs_sorted_before_parsing(self, tmp_path):
         """If passed out of order, runs get re-sorted by run number — so
         all_onsets[c][0] corresponds to run-01, not the first file passed."""
-        f1 = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 1.1, "duration": 1.0, "trial_type": "A"},
-        ])
-        f2 = _write_tsv(tmp_path / "run-2_events.tsv", [
-            {"onset": 2.2, "duration": 1.0, "trial_type": "A"},
-        ])
+        f1 = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 1.1, "duration": 1.0, "trial_type": "A"},
+            ],
+        )
+        f2 = _write_tsv(
+            tmp_path / "run-2_events.tsv",
+            [
+                {"onset": 2.2, "duration": 1.0, "trial_type": "A"},
+            ],
+        )
         all_onsets, _, _ = parse_bids_events([f2, f1])  # reversed
         assert all_onsets[0][0].tolist() == [1.1]
         assert all_onsets[0][1].tolist() == [2.2]
@@ -173,12 +202,18 @@ class TestParseMultiRun:
     def test_condition_only_in_some_runs(self, tmp_path):
         """Condition present in run 2 but not run 1 still gets an entry,
         with an empty onset array for run 1."""
-        f1 = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
-        ])
-        f2 = _write_tsv(tmp_path / "run-2_events.tsv", [
-            {"onset": 5.0, "duration": 1.0, "trial_type": "rare"},
-        ])
+        f1 = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
+            ],
+        )
+        f2 = _write_tsv(
+            tmp_path / "run-2_events.tsv",
+            [
+                {"onset": 5.0, "duration": 1.0, "trial_type": "rare"},
+            ],
+        )
         all_onsets, _, labels = parse_bids_events([f1, f2])
         rare_idx = labels.index("rare")
         assert all_onsets[rare_idx][0].size == 0
@@ -189,21 +224,28 @@ class TestParseMultiRun:
 # Duration aggregation
 # ---------------------------------------------------------------------------
 
+
 class TestDurationAggregation:
     def test_uniform_durations_pass_through(self, tmp_path):
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 3.0, "trial_type": "A"},
-            {"onset": 10.0, "duration": 3.0, "trial_type": "A"},
-        ])
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 3.0, "trial_type": "A"},
+                {"onset": 10.0, "duration": 3.0, "trial_type": "A"},
+            ],
+        )
         _, durations, _ = parse_bids_events([f])
         assert durations == [3.0]
 
     def test_varied_durations_use_median_and_warn(self, tmp_path, capsys):
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 2.0, "trial_type": "A"},
-            {"onset": 10.0, "duration": 3.0, "trial_type": "A"},
-            {"onset": 20.0, "duration": 4.0, "trial_type": "A"},
-        ])
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 2.0, "trial_type": "A"},
+                {"onset": 10.0, "duration": 3.0, "trial_type": "A"},
+                {"onset": 20.0, "duration": 4.0, "trial_type": "A"},
+            ],
+        )
         _, durations, _ = parse_bids_events([f])
         assert durations == [3.0]  # median of {2,3,4}
         captured = capsys.readouterr()
@@ -214,11 +256,14 @@ class TestDurationAggregation:
         """Without rounding, 3.0/3.03/3.001 produce 3 distinct values and
         trip the multi-duration median path. With round_durations=1 they
         collapse to a single value."""
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 3.0, "trial_type": "A"},
-            {"onset": 10.0, "duration": 3.03, "trial_type": "A"},
-            {"onset": 20.0, "duration": 3.001, "trial_type": "A"},
-        ])
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 3.0, "trial_type": "A"},
+                {"onset": 10.0, "duration": 3.03, "trial_type": "A"},
+                {"onset": 20.0, "duration": 3.001, "trial_type": "A"},
+            ],
+        )
         _, durations_no_round, _ = parse_bids_events([f])
         _, durations_rounded, _ = parse_bids_events([f], round_durations=1)
         # Without rounding the medianization fires; with rounding all
@@ -233,29 +278,40 @@ class TestDurationAggregation:
 # Error handling
 # ---------------------------------------------------------------------------
 
+
 class TestErrors:
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             parse_bids_events([tmp_path / "does_not_exist.tsv"])
 
     def test_missing_required_column_raises(self, tmp_path):
-        f = _write_tsv(tmp_path / "bad.tsv", [
-            {"start": 0.0, "len": 1.0, "cond": "A"},
-        ], cols=["start", "len", "cond"])
+        f = _write_tsv(
+            tmp_path / "bad.tsv",
+            [
+                {"start": 0.0, "len": 1.0, "cond": "A"},
+            ],
+            cols=["start", "len", "cond"],
+        )
         # Default columns are onset/duration/trial_type — none present
         with pytest.raises(ValueError, match="not found"):
             parse_bids_events([f])
 
     def test_non_numeric_onset_raises(self, tmp_path):
-        f = _write_tsv(tmp_path / "bad.tsv", [
-            {"onset": "not_a_number", "duration": 1.0, "trial_type": "A"},
-        ])
+        f = _write_tsv(
+            tmp_path / "bad.tsv",
+            [
+                {"onset": "not_a_number", "duration": 1.0, "trial_type": "A"},
+            ],
+        )
         with pytest.raises(ValueError, match="numeric"):
             parse_bids_events([f])
 
     def test_all_filtered_raises(self, tmp_path):
-        f = _write_tsv(tmp_path / "run-1_events.tsv", [
-            {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
-        ])
+        f = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [
+                {"onset": 0.0, "duration": 1.0, "trial_type": "A"},
+            ],
+        )
         with pytest.raises(ValueError, match="No conditions remain"):
             parse_bids_events([f], event_ignore=["A"])

@@ -1,5 +1,5 @@
-from pathlib import Path
 import os
+from pathlib import Path
 
 _BENCHMARK_DATA_DIR: Path | None = None
 

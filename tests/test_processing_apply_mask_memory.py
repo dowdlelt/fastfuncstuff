@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import math
-
-import numpy as np
-import pytest
 import torch
 
 from fastfuncstuff.processing.apply import apply_warp, compose_warps, invert_warp

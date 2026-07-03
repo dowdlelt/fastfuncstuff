@@ -13,8 +13,8 @@ import pytest
 import torch
 
 from fastfuncstuff.glm.ridge import _fit_ridge_multiple_fracs
-from fastfuncstuff.utils import get_device
 from fastfuncstuff.glm.xval import generate_cv_splits, single_trial_cv_helper
+from fastfuncstuff.utils import get_device
 
 
 @pytest.fixture
@@ -25,6 +25,7 @@ def device():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_fracridge_variants(
     n_voxels: int = 80,
@@ -67,10 +68,12 @@ def _make_fracridge_variants(
     ols_betas = cond_effects[:, trial_cond_ids] + torch.randn(n_voxels, n_trials) * noise_scale
 
     # Simulate fracridge: frac × signal + frac × noise  (simplified linear model)
-    beta_variants = torch.stack([
-        cond_effects[:, trial_cond_ids] * f + torch.randn(n_voxels, n_trials) * noise_scale * f
-        for f in fracs_np
-    ])  # (n_fracs, n_voxels, n_trials)
+    beta_variants = torch.stack(
+        [
+            cond_effects[:, trial_cond_ids] * f + torch.randn(n_voxels, n_trials) * noise_scale * f
+            for f in fracs_np
+        ]
+    )  # (n_fracs, n_voxels, n_trials)
 
     # Override last variant with the proper OLS betas
     beta_variants[-1] = ols_betas
@@ -83,6 +86,7 @@ def _make_fracridge_variants(
 # test_variant_idx correctness
 # ---------------------------------------------------------------------------
 
+
 class TestTestVariantIdx:
     """Verify that test_variant_idx correctly routes test targets."""
 
@@ -92,7 +96,10 @@ class TestTestVariantIdx:
         n_fracs = len(fracs)
 
         result = single_trial_cv_helper(
-            bvars, cids, rids, splits,
+            bvars,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_fracs - 1,  # OLS as test target
             device=torch.device("cpu"),
             verbose=False,
@@ -119,7 +126,10 @@ class TestTestVariantIdx:
         n_fracs = len(fracs)
 
         result = single_trial_cv_helper(
-            bvars, cids, rids, splits,
+            bvars,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_fracs - 1,
             device=torch.device("cpu"),
             verbose=False,
@@ -155,7 +165,10 @@ class TestTestVariantIdx:
 
         # GLMsingle pattern: compare to OLS test betas
         res_glmsingle = single_trial_cv_helper(
-            bvars, cids, rids, splits,
+            bvars,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_fracs - 1,
             device=torch.device("cpu"),
             verbose=False,
@@ -163,7 +176,10 @@ class TestTestVariantIdx:
 
         # Broken pattern: each variant vs itself (no z-score)
         res_self = single_trial_cv_helper(
-            bvars, cids, rids, splits,
+            bvars,
+            cids,
+            rids,
+            splits,
             test_variant_idx=None,
             zscore_by_run=False,
             device=torch.device("cpu"),
@@ -174,7 +190,9 @@ class TestTestVariantIdx:
         r2_self = res_self["r2"]
 
         # GLMsingle: variance in R² across fracs should be substantial for high-SNR voxels
-        glmsingle_frac_spread = r2_glmsingle[:, :40].mean(dim=1).max() - r2_glmsingle[:, :40].mean(dim=1).min()
+        glmsingle_frac_spread = (
+            r2_glmsingle[:, :40].mean(dim=1).max() - r2_glmsingle[:, :40].mean(dim=1).min()
+        )
 
         # Self-comparison: COD is scale-invariant → all fracs get nearly the same score
         self_frac_spread = r2_self[:, :40].mean(dim=1).max() - r2_self[:, :40].mean(dim=1).min()
@@ -193,14 +211,20 @@ class TestTestVariantIdx:
         n_fracs = len(fracs)
 
         r_full = single_trial_cv_helper(
-            bvars, cids, rids, splits,
+            bvars,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_fracs - 1,
             chunk_size=None,
             device=torch.device("cpu"),
             verbose=False,
         )
         r_chunk = single_trial_cv_helper(
-            bvars, cids, rids, splits,
+            bvars,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_fracs - 1,
             chunk_size=13,
             device=torch.device("cpu"),
@@ -216,11 +240,15 @@ class TestTestVariantIdx:
         After excluding frac=1 from selection, frac=0.95 should be the runner-up.
         """
         bvars, cids, rids, splits, fracs = _make_fracridge_variants(
-            high_snr_signal=8.0, noise_scale=0.5)  # very high SNR
+            high_snr_signal=8.0, noise_scale=0.5
+        )  # very high SNR
         n_fracs = len(fracs)
 
         result = single_trial_cv_helper(
-            bvars, cids, rids, splits,
+            bvars,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_fracs - 1,
             device=torch.device("cpu"),
             verbose=False,
@@ -242,6 +270,7 @@ class TestTestVariantIdx:
 # _fit_ridge_multiple_fracs chunk_size path
 # ---------------------------------------------------------------------------
 
+
 class TestFitRidgeMultipleFracsChunking:
     """Verify chunk_size path of _fit_ridge_multiple_fracs."""
 
@@ -260,8 +289,7 @@ class TestFitRidgeMultipleFracsChunking:
         # Chunked pass (chunk_size=7, so 8 chunks)
         coefs_chunked = _fit_ridge_multiple_fracs(X, y.cpu(), fracs, device, chunk_size=7)
 
-        torch.testing.assert_close(
-            coefs_full.cpu(), coefs_chunked.cpu(), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(coefs_full.cpu(), coefs_chunked.cpu(), atol=1e-4, rtol=1e-4)
 
     def test_chunked_output_on_cpu(self, device):
         """chunk_size path returns a CPU tensor regardless of compute device."""
@@ -272,7 +300,8 @@ class TestFitRidgeMultipleFracsChunking:
 
         coefs = _fit_ridge_multiple_fracs(X, y, fracs, device, chunk_size=10)
         assert coefs.device.type == "cpu", (
-            f"chunk_size path should return CPU tensor, got {coefs.device}")
+            f"chunk_size path should return CPU tensor, got {coefs.device}"
+        )
 
     def test_single_pass_output_on_device(self, device):
         """No-chunk path returns tensor on compute device."""
@@ -282,7 +311,8 @@ class TestFitRidgeMultipleFracsChunking:
 
         coefs = _fit_ridge_multiple_fracs(X, y, fracs, device, chunk_size=None)
         assert coefs.device.type == device.type, (
-            f"Single-pass path should return tensor on {device}, got {coefs.device}")
+            f"Single-pass path should return tensor on {device}, got {coefs.device}"
+        )
 
     def test_frac_monotonicity_shrinkage(self, device):
         """Higher frac → larger coefficient norms (less shrinkage)."""
@@ -301,13 +331,14 @@ class TestFitRidgeMultipleFracsChunking:
         for i in range(len(fracs) - 1):
             assert norms[i] <= norms[i + 1] + 1e-4, (
                 f"frac={fracs[i]:.2f} norm ({norms[i]:.4f}) should be ≤ "
-                f"frac={fracs[i+1]:.2f} norm ({norms[i+1]:.4f})"
+                f"frac={fracs[i + 1]:.2f} norm ({norms[i + 1]:.4f})"
             )
 
 
 # ---------------------------------------------------------------------------
 # Integration: projection + fracridge + frac selection
 # ---------------------------------------------------------------------------
+
 
 class TestFracridgeIntegration:
     """End-to-end test: nuisance projection → fracridge → CV frac selection."""
@@ -324,7 +355,7 @@ class TestFracridgeIntegration:
         from fastfuncstuff.glm.xval import project_out_nuisance_per_run
 
         torch.manual_seed(99)
-        n_runs, n_tp_run = 4, 120       # 120 TPs per run gives ample spacing
+        n_runs, n_tp_run = 4, 120  # 120 TPs per run gives ample spacing
         n_tp_total = n_runs * n_tp_run
         n_conditions, trials_per_run = 4, 5
         n_voxels_high, n_voxels_low = 30, 30
@@ -361,7 +392,7 @@ class TestFracridgeIntegration:
         drift = torch.zeros(n_tp_total)
         for r in range(n_runs):
             t_run = torch.linspace(-1, 1, n_tp_run)
-            drift[r * n_tp_run:(r + 1) * n_tp_run] = t_run * 3.0
+            drift[r * n_tp_run : (r + 1) * n_tp_run] = t_run * 3.0
         data = true_betas @ design.T + drift.unsqueeze(0) + noise
 
         nuisance_per_run = [
@@ -369,16 +400,21 @@ class TestFracridgeIntegration:
             for _ in range(n_runs)
         ]
         data_clean, design_clean = project_out_nuisance_per_run(
-            data, design, nuisance_per_run, run_starts, device=device)
+            data, design, nuisance_per_run, run_starts, device=device
+        )
 
         fracs = np.arange(0.05, 1.01, 0.05, dtype=np.float32)
         coefs = _fit_ridge_multiple_fracs(
-            design_clean.to(device), data_clean.T, fracs, device, chunk_size=None)
+            design_clean.to(device), data_clean.T, fracs, device, chunk_size=None
+        )
         beta_variants = coefs.permute(1, 2, 0)  # (n_fracs, n_voxels, n_trials)
 
         cv_splits = generate_cv_splits(n_runs, strategy=1)
         xval = single_trial_cv_helper(
-            beta_variants, trial_cond_ids, trial_run_ids, cv_splits,
+            beta_variants,
+            trial_cond_ids,
+            trial_run_ids,
+            cv_splits,
             test_variant_idx=len(fracs) - 1,
             device=device,
             verbose=False,
@@ -440,7 +476,7 @@ class TestFracridgeIntegration:
         # Use condition-level betas (same per condition across trials) so the
         # condition-average training betas can predict test betas.
         true_cond_betas = torch.zeros(n_voxels, n_conditions)
-        true_cond_betas[:n_voxels // 2] = torch.randn(n_voxels // 2, n_conditions) * 3.0
+        true_cond_betas[: n_voxels // 2] = torch.randn(n_voxels // 2, n_conditions) * 3.0
         true_betas = true_cond_betas[:, trial_cond_ids]  # (n_voxels, n_trials)
         data = true_betas @ design.T + torch.randn(n_voxels, n_tp) * 0.5
 
@@ -449,16 +485,19 @@ class TestFracridgeIntegration:
             for _ in range(n_runs)
         ]
         data_clean, design_clean = project_out_nuisance_per_run(
-            data, design, nuisance_per_run, run_starts, device=device)
+            data, design, nuisance_per_run, run_starts, device=device
+        )
 
         fracs = np.array([0.05, 0.25, 0.50, 0.75, 0.95, 1.0], dtype=np.float32)
-        coefs = _fit_ridge_multiple_fracs(
-            design_clean.to(device), data_clean.T, fracs, device)
+        coefs = _fit_ridge_multiple_fracs(design_clean.to(device), data_clean.T, fracs, device)
         beta_variants = coefs.permute(1, 2, 0)  # (n_fracs, n_voxels, n_trials)
 
         cv_splits = generate_cv_splits(n_runs, strategy=1)
         xval = single_trial_cv_helper(
-            beta_variants, trial_cond_ids, trial_run_ids, cv_splits,
+            beta_variants,
+            trial_cond_ids,
+            trial_run_ids,
+            cv_splits,
             test_variant_idx=len(fracs) - 1,
             device=device,
             verbose=False,
@@ -477,8 +516,8 @@ class TestFracridgeIntegration:
         )
 
         # High-SNR voxels should prefer higher fracs than low-SNR voxels
-        high_snr_median = float(np.median(fracs[best_idx[:n_voxels // 2]]))
-        low_snr_median = float(np.median(fracs[best_idx[n_voxels // 2:]]))
+        high_snr_median = float(np.median(fracs[best_idx[: n_voxels // 2]]))
+        low_snr_median = float(np.median(fracs[best_idx[n_voxels // 2 :]]))
         print(f"  High-SNR median frac: {high_snr_median:.3f}, Low-SNR: {low_snr_median:.3f}")
         assert high_snr_median >= low_snr_median, (
             f"High-SNR voxels should prefer ≥ frac than low-SNR: "

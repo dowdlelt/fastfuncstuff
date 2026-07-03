@@ -51,35 +51,52 @@ def create_parser() -> argparse.ArgumentParser:
 
     req = parser.add_argument_group("Required Arguments")
     req.add_argument(
-        "-warp_dir", required=True, metavar="DIR",
+        "-warp_dir",
+        required=True,
+        metavar="DIR",
         help="Directory containing per-volume warp files (*_WARP_t*.nii.gz).",
     )
     req.add_argument(
-        "-n_pcs", type=int, required=True, metavar="N",
+        "-n_pcs",
+        type=int,
+        required=True,
+        metavar="N",
         help="Number of principal components to extract.",
     )
 
     opt = parser.add_argument_group("Options")
     opt.add_argument(
-        "-pattern", default="*_WARP_t*.nii.gz", metavar="GLOB",
+        "-pattern",
+        default="*_WARP_t*.nii.gz",
+        metavar="GLOB",
         help="Glob pattern for warp files [default: %(default)s].",
     )
     opt.add_argument(
-        "-prefix", dest="output", default=None, metavar="PATH",
+        "-prefix",
+        dest="output",
+        default=None,
+        metavar="PATH",
         help="Output .1D file path. Default: {warp_dir}/warpPCs.1D",
     )
     opt.add_argument(
-        "-output", dest="output", default=None, metavar="PATH",
+        "-output",
+        dest="output",
+        default=None,
+        metavar="PATH",
         help="Alias for -prefix.",
     )
     opt.add_argument(
-        "-axes", default=None, metavar="XYZ",
+        "-axes",
+        default=None,
+        metavar="XYZ",
         help="Force active axes (e.g. 'Y', 'XY', 'XYZ'). "
-             "By default, axes are auto-detected from the warp files by "
-             "checking which displacement components are non-zero.",
+        "By default, axes are auto-detected from the warp files by "
+        "checking which displacement components are non-zero.",
     )
     opt.add_argument(
-        "-device", default="cpu", metavar="DEV",
+        "-device",
+        default="cpu",
+        metavar="DEV",
         help="Torch device for PCA computation [default: %(default)s].",
     )
     add_verbose_arg(opt, default=1)
@@ -217,8 +234,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # --- Load warps and build matrix ---
-    from fastfuncstuff.processing.io import load_warp_field
     from fastfuncstuff.decomposition.pca import PCA
+    from fastfuncstuff.processing.io import load_warp_field
 
     if args.verb >= 1:
         print(f"\n  Loading {n_vols} warp files...")
@@ -286,8 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         f.write(f"# Source: {os.path.abspath(warp_dir)}\n")
         f.write(f"# Active axes: {'+'.join(axis_labels)}, {n_vols} volumes, {n_pcs} PCs\n")
         f.write(
-            f"# Variance explained: "
-            f"{' '.join(f'{v * 100:.2f}%' for v in var_explained.tolist())}\n"
+            f"# Variance explained: {' '.join(f'{v * 100:.2f}%' for v in var_explained.tolist())}\n"
         )
         for row in pcs_np:
             f.write("  ".join(f"{v: .6f}" for v in row) + "\n")

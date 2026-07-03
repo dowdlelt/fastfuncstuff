@@ -21,10 +21,10 @@ from fastfuncstuff.stats.cluster_fast import (
     precompile,
 )
 
-
 # ---------------------------------------------------------------------------
 # Oracle: scipy-based reference for max cluster extent above a threshold.
 # ---------------------------------------------------------------------------
+
 
 def _scipy_max_extent(stat3d: np.ndarray, tcrit: float, nn: int) -> int:
     above = stat3d > tcrit
@@ -42,6 +42,7 @@ def _scipy_max_extent(stat3d: np.ndarray, tcrit: float, nn: int) -> int:
 # ---------------------------------------------------------------------------
 # _offsets_for_nn
 # ---------------------------------------------------------------------------
+
 
 class TestOffsetsForNN:
     def test_nn1_face_count(self):
@@ -81,6 +82,7 @@ class TestOffsetsForNN:
 # _walk_dsu_extent vs scipy oracle on synthetic 3D volumes.
 # ---------------------------------------------------------------------------
 
+
 def _walk_for_test(stat3d: np.ndarray, tcrits_desc: np.ndarray, nn: int) -> np.ndarray:
     """Apply the kernel exactly like cluster_extent_one_perm's inner loop,
     but on a dense 3D array with all voxels in-mask."""
@@ -97,8 +99,14 @@ def _walk_for_test(stat3d: np.ndarray, tcrits_desc: np.ndarray, nn: int) -> np.n
     parent = np.full(nx * ny * nz, -1, dtype=np.int64)
     size = np.zeros(nx * ny * nz, dtype=np.int64)
     return _walk_dsu_extent(
-        idx_sorted, stat_sorted, parent, size,
-        _offsets_for_nn(nn), nx, ny, nz,
+        idx_sorted,
+        stat_sorted,
+        parent,
+        size,
+        _offsets_for_nn(nn),
+        nx,
+        ny,
+        nz,
         tcrits_desc.astype(np.float64),
     )
 
@@ -183,6 +191,7 @@ class TestWalkDSUExtent:
 # cluster_extent_one_perm — end-to-end including sidedness handling.
 # ---------------------------------------------------------------------------
 
+
 def _full_volume_setup(shape):
     nx, ny, nz = shape
     mask_flat_idx = np.arange(nx * ny * nz, dtype=np.int64)
@@ -220,8 +229,7 @@ class TestClusterExtentOnePerm:
 
         for nn in (1, 2, 3):
             expected = np.array([_scipy_max_extent(stat3d, t, nn) for t in tcrits_desc])
-            np.testing.assert_array_equal(out[("1-sided", nn)], expected,
-                                         err_msg=f"nn={nn}")
+            np.testing.assert_array_equal(out[("1-sided", nn)], expected, err_msg=f"nn={nn}")
 
     def test_two_sided_matches_scipy_on_abs(self, stat3d, shape):
         mask_flat_idx, parent, size = _full_volume_setup(shape)
@@ -349,6 +357,7 @@ class TestClusterExtentOnePerm:
 # ---------------------------------------------------------------------------
 # precompile — exercises the JIT warm-up path.
 # ---------------------------------------------------------------------------
+
 
 def test_precompile_runs():
     """precompile() should JIT-warm the kernel and not raise."""

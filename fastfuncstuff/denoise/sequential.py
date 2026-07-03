@@ -66,11 +66,9 @@ from typing import Literal
 import numpy as np
 import torch
 
-from fastfuncstuff.glm.core import fit_glm
 from fastfuncstuff.decomposition.ica import FastICA
-from fastfuncstuff.memory import dyn_chunk_estimator
 from fastfuncstuff.decomposition.pca import PCA
-from fastfuncstuff.utils import get_device, linalg_device
+from fastfuncstuff.glm.core import fit_glm
 from fastfuncstuff.glm.xval import (
     compute_r2_from_sufficient_stats,
     compute_r2_metric,
@@ -78,6 +76,8 @@ from fastfuncstuff.glm.xval import (
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
+from fastfuncstuff.memory import dyn_chunk_estimator
+from fastfuncstuff.utils import get_device, linalg_device
 
 
 def _compute_local_run_starts(
@@ -765,7 +765,12 @@ def extract_noise_ics_per_run(
     ica_tol: float = 1e-5,
     device: torch.device | None = None,
     verbose: bool = False,
-) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]] | tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]] | tuple[list[torch.Tensor], list[torch.Tensor]]:
+) -> (
+    list[torch.Tensor]
+    | tuple[list[torch.Tensor], list[torch.Tensor]]
+    | tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]
+    | tuple[list[torch.Tensor], list[torch.Tensor]]
+):
     """
     Extract independent components from noise pool for each run independently.
 
@@ -1255,9 +1260,8 @@ def cross_validate_noise_pcs(
     q_factors_all: list[torch.Tensor | None] | None = None
     if nuisance_per_run is not None:
         from fastfuncstuff.glm.xval import compute_qr_projectors
-        q_factors_all = compute_qr_projectors(
-            nuisance_per_run, run_starts, device=proj_device
-        )
+
+        q_factors_all = compute_qr_projectors(nuisance_per_run, run_starts, device=proj_device)
 
     # Generate CV splits based on strategy
     cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
@@ -1462,9 +1466,7 @@ def cross_validate_noise_pcs(
                 )
                 train_nuisance_per_run = [nuisance_per_run[i] for i in train_runs]
                 train_q_factors = (
-                    [q_factors_all[i] for i in train_runs]
-                    if q_factors_all is not None
-                    else None
+                    [q_factors_all[i] for i in train_runs] if q_factors_all is not None else None
                 )
 
                 data_train_projected, design_train_projected = project_out_nuisance_per_run(
@@ -1482,9 +1484,7 @@ def cross_validate_noise_pcs(
                 )
                 test_nuisance_per_run = [nuisance_per_run[i] for i in test_runs]
                 test_q_factors = (
-                    [q_factors_all[i] for i in test_runs]
-                    if q_factors_all is not None
-                    else None
+                    [q_factors_all[i] for i in test_runs] if q_factors_all is not None else None
                 )
 
                 data_test_projected, design_test_projected = project_out_nuisance_per_run(
@@ -2149,7 +2149,11 @@ def fit_denoising_model(
     # Auto-determine polort based on run length if not specified
     # Uses AFNI formula: 1 + floor(run_duration / 150)
     if polort is None:
-        from fastfuncstuff.cli_utils import auto_polort, compute_run_lengths, get_average_run_duration
+        from fastfuncstuff.cli_utils import (
+            auto_polort,
+            compute_run_lengths,
+            get_average_run_duration,
+        )
 
         run_lengths = compute_run_lengths(run_starts, n_timepoints)
         avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
@@ -2782,9 +2786,7 @@ def fit_denoising_model(
     # We already have full-brain R² maps from cross_validate_noise_pcs
     # No need for separate compute_xval_r2_optimal_full call
     xval_r2_optimal_full = xval_r2_optimal
-    xval_r2_optimal_per_fold: np.ndarray | None = (
-        None  # Not meaningful with concatenated approach
-    )
+    xval_r2_optimal_per_fold: np.ndarray | None = None  # Not meaningful with concatenated approach
 
     if verbose:
         print(f"\nFull-brain cross-validated R² at optimal PC count ({optimal_n_components} PCs):")

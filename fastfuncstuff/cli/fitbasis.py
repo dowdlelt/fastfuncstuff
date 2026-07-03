@@ -61,6 +61,7 @@ instead of ``_<cond>``, and amplitudes are stacked into a single 4-D
 volume per condition (time = trial number) — the GLMsingle-style
 output used for 2nd-level analyses across trials.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -88,8 +89,8 @@ try:
         parse_durations,
     )
     from fastfuncstuff.design.flobs import (
-        FLOBSBasis,
         ARMAWhitenCell,
+        FLOBSBasis,
         FLOBSFitResult,
         bin_and_whiten_arma11,
         compute_per_voxel_residuals,
@@ -102,12 +103,12 @@ try:
         fit_basis_constrained_ridge,
         fit_basis_fracridge,
         fit_basis_lss,
-        vb_update_beta_size,
         flobs_prior,
         generate_flobs_basis,
         generate_spmg_basis,
         ridge_prior,
         spmg_prior,
+        vb_update_beta_size,
     )
     from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
     from fastfuncstuff.design.matrices import save_iresp
@@ -143,40 +144,68 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     req = parser.add_argument_group("Required Arguments")
-    req.add_argument("-input", nargs="+", required=True,
-                     help="Input fMRI run files.")
-    req.add_argument("-prefix", required=True,
-                     help="Output prefix (e.g. out/sub01_fb).")
+    req.add_argument("-input", nargs="+", required=True, help="Input fMRI run files.")
+    req.add_argument("-prefix", required=True, help="Output prefix (e.g. out/sub01_fb).")
 
     onset_grp = parser.add_argument_group("Event timing (choose one)")
-    onset_grp.add_argument("-onsets", nargs="+", default=None,
-                           help="AFNI-format onset files, one per condition.")
-    onset_grp.add_argument("-durations", nargs="+", default=None,
-                           help="Stimulus durations (s); one per condition (or single value).")
-    onset_grp.add_argument("-events", nargs="+", default=None, metavar="TSV",
-                           help="BIDS *_events.tsv files, one per run.")
+    onset_grp.add_argument(
+        "-onsets", nargs="+", default=None, help="AFNI-format onset files, one per condition."
+    )
+    onset_grp.add_argument(
+        "-durations",
+        nargs="+",
+        default=None,
+        help="Stimulus durations (s); one per condition (or single value).",
+    )
+    onset_grp.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS *_events.tsv files, one per run.",
+    )
     # Each event-related flag accepts both hyphen and underscore forms
     # (``-event-cols`` and ``-event_cols``) so muscle memory from AFNI /
     # older ffs_* tools works.  argparse dispatches both to the same
     # ``args.event_cols`` attribute via the canonical dest.
-    onset_grp.add_argument("-event-ignore", "-event_ignore",
-                           dest="event_ignore",
-                           nargs="+", default=None, metavar="LABEL",
-                           help="trial_type values to drop from BIDS events.")
-    onset_grp.add_argument("-event-cols", "-event_cols",
-                           dest="event_cols",
-                           nargs=3, default=None,
-                           metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-                           help="Override BIDS column names (default: onset duration trial_type).")
-    onset_grp.add_argument("-round-onsets", "-round_onsets",
-                           dest="round_onsets",
-                           nargs="?", const=0.7, type=float,
-                           default=None, metavar="THRESHOLD",
-                           help="Snap onsets to nearest TR (default threshold 0.7).")
-    onset_grp.add_argument("-round-durations", "-round_durations",
-                           dest="round_durations",
-                           type=int, default=None, metavar="PLACES",
-                           help="Round event durations to N decimals before grouping.")
+    onset_grp.add_argument(
+        "-event-ignore",
+        "-event_ignore",
+        dest="event_ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to drop from BIDS events.",
+    )
+    onset_grp.add_argument(
+        "-event-cols",
+        "-event_cols",
+        dest="event_cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Override BIDS column names (default: onset duration trial_type).",
+    )
+    onset_grp.add_argument(
+        "-round-onsets",
+        "-round_onsets",
+        dest="round_onsets",
+        nargs="?",
+        const=0.7,
+        type=float,
+        default=None,
+        metavar="THRESHOLD",
+        help="Snap onsets to nearest TR (default threshold 0.7).",
+    )
+    onset_grp.add_argument(
+        "-round-durations",
+        "-round_durations",
+        dest="round_durations",
+        type=int,
+        default=None,
+        metavar="PLACES",
+        help="Round event durations to N decimals before grouping.",
+    )
 
     model_grp = parser.add_argument_group("Model + constraint")
     model_grp.add_argument(
@@ -213,7 +242,8 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     model_grp.add_argument(
-        "-single-trials", "-single_trials",
+        "-single-trials",
+        "-single_trials",
         dest="single_trials",
         action="store_true",
         help=(
@@ -227,46 +257,83 @@ def create_parser() -> argparse.ArgumentParser:
 
     # FLOBS-specific knobs (each flag accepts hyphen + underscore forms)
     flobs_opts = parser.add_argument_group("FLOBS Options (-model FLOBS)")
-    flobs_opts.add_argument("-flobs-n-basis", "-flobs_n_basis",
-                            dest="flobs_n_basis",
-                            type=int, default=3, metavar="K",
-                            help="Number of FLOBS eigenHRFs (TR04MW2 used 3).")
-    flobs_opts.add_argument("-flobs-n-samples", "-flobs_n_samples",
-                            dest="flobs_n_samples",
-                            type=int, default=1000, metavar="N",
-                            help="Number of half-cosine HRF samples for the basis SVD.")
-    flobs_opts.add_argument("-flobs-window", "-flobs_window",
-                            dest="flobs_window",
-                            type=float, default=32.0,
-                            metavar="SECONDS", help="FLOBS basis duration (s).")
-    flobs_opts.add_argument("-flobs-dt", "-flobs_dt",
-                            dest="flobs_dt",
-                            type=float, default=0.1,
-                            metavar="SECONDS", help="FLOBS basis sample spacing (s).")
-    flobs_opts.add_argument("-flobs-seed", "-flobs_seed",
-                            dest="flobs_seed",
-                            type=int, default=42,
-                            help="Seed for the half-cosine sampler.")
+    flobs_opts.add_argument(
+        "-flobs-n-basis",
+        "-flobs_n_basis",
+        dest="flobs_n_basis",
+        type=int,
+        default=3,
+        metavar="K",
+        help="Number of FLOBS eigenHRFs (TR04MW2 used 3).",
+    )
+    flobs_opts.add_argument(
+        "-flobs-n-samples",
+        "-flobs_n_samples",
+        dest="flobs_n_samples",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="Number of half-cosine HRF samples for the basis SVD.",
+    )
+    flobs_opts.add_argument(
+        "-flobs-window",
+        "-flobs_window",
+        dest="flobs_window",
+        type=float,
+        default=32.0,
+        metavar="SECONDS",
+        help="FLOBS basis duration (s).",
+    )
+    flobs_opts.add_argument(
+        "-flobs-dt",
+        "-flobs_dt",
+        dest="flobs_dt",
+        type=float,
+        default=0.1,
+        metavar="SECONDS",
+        help="FLOBS basis sample spacing (s).",
+    )
+    flobs_opts.add_argument(
+        "-flobs-seed",
+        "-flobs_seed",
+        dest="flobs_seed",
+        type=int,
+        default=42,
+        help="Seed for the half-cosine sampler.",
+    )
 
     # SPMG/ridge knobs (used when -reg ridge or -reg mvn with SPMG models)
     spmg_opts = parser.add_argument_group("SPMG Prior Options (-model SPMG*)")
-    spmg_opts.add_argument("-canonical-std", "-canonical_std",
-                           dest="canonical_std",
-                           type=float, default=5.0,
-                           help="Prior std on the canonical-amplitude coefficient (weak prior).")
-    spmg_opts.add_argument("-derivative-std", "-derivative_std",
-                           dest="derivative_std",
-                           type=float, default=0.3,
-                           help="Prior std on the temporal-derivative coefficient (tight).")
-    spmg_opts.add_argument("-dispersion-std", "-dispersion_std",
-                           dest="dispersion_std",
-                           type=float, default=0.2,
-                           help="Prior std on the dispersion-derivative coefficient (SPMG3).")
+    spmg_opts.add_argument(
+        "-canonical-std",
+        "-canonical_std",
+        dest="canonical_std",
+        type=float,
+        default=5.0,
+        help="Prior std on the canonical-amplitude coefficient (weak prior).",
+    )
+    spmg_opts.add_argument(
+        "-derivative-std",
+        "-derivative_std",
+        dest="derivative_std",
+        type=float,
+        default=0.3,
+        help="Prior std on the temporal-derivative coefficient (tight).",
+    )
+    spmg_opts.add_argument(
+        "-dispersion-std",
+        "-dispersion_std",
+        dest="dispersion_std",
+        type=float,
+        default=0.2,
+        help="Prior std on the dispersion-derivative coefficient (SPMG3).",
+    )
 
     # Cross-validation
     cv_opts = parser.add_argument_group("Cross-validation (regularization sanity check)")
     cv_opts.add_argument(
-        "-xval-r2", "-xval_r2",
+        "-xval-r2",
+        "-xval_r2",
         dest="xval_r2",
         action="store_true",
         help=(
@@ -287,7 +354,8 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     cv_opts.add_argument(
-        "-cv-runs", "-cv_runs",
+        "-cv-runs",
+        "-cv_runs",
         dest="cv_runs",
         action="store_true",
         help=(
@@ -302,23 +370,28 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     cv_opts.add_argument(
-        "-cv-grid", "-cv_grid",
+        "-cv-grid",
+        "-cv_grid",
         dest="cv_grid",
         default="0.1,0.3,1.0,3.0,10.0",
         metavar="W1,W2,...",
         help="Comma-separated grid of prior-weight multipliers to evaluate.",
     )
     cv_opts.add_argument(
-        "-cv-leave-n-out", "-cv_leave_n_out",
+        "-cv-leave-n-out",
+        "-cv_leave_n_out",
         dest="cv_leave_n_out",
-        type=int, default=1, metavar="N",
+        type=int,
+        default=1,
+        metavar="N",
         help="Number of runs left out per CV fold (1 = LORO).",
     )
 
     # Constraint strength
     reg_opts = parser.add_argument_group("Constraint strength")
     reg_opts.add_argument(
-        "-lambda-mode", "-lambda_mode",
+        "-lambda-mode",
+        "-lambda_mode",
         dest="lambda_mode",
         choices=["global", "voxelwise", "auto"],
         default="auto",
@@ -337,13 +410,17 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     reg_opts.add_argument(
-        "-lambda-n-bins", "-lambda_n_bins",
+        "-lambda-n-bins",
+        "-lambda_n_bins",
         dest="lambda_n_bins",
-        type=int, default=20, metavar="N",
+        type=int,
+        default=20,
+        metavar="N",
         help="σ² quantile bins for -lambda-mode voxelwise.",
     )
     reg_opts.add_argument(
-        "-prior-weight", "-prior_weight",
+        "-prior-weight",
+        "-prior_weight",
         dest="prior_weight",
         default="auto",
         metavar="VALUE",
@@ -374,9 +451,12 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     reg_opts.add_argument(
-        "-vb-iters", "-vb_iters",
+        "-vb-iters",
+        "-vb_iters",
         dest="vb_iters",
-        type=int, default=0, metavar="N",
+        type=int,
+        default=0,
+        metavar="N",
         help=(
             "Variational-Bayes iteration count for -prewhiten arma11-voxel "
             "(FSL filmbabe-style loop, TR04MW2 §3).  ``0`` (default) runs "
@@ -387,9 +467,12 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     reg_opts.add_argument(
-        "-vb-tol", "-vb_tol",
+        "-vb-tol",
+        "-vb_tol",
         dest="vb_tol",
-        type=float, default=0.05, metavar="FLOAT",
+        type=float,
+        default=0.05,
+        metavar="FLOAT",
         help=(
             "Convergence threshold on median |Δa| + |Δb| across voxels "
             "between successive VB iterations.  Default 0.05 (one grid "
@@ -415,7 +498,8 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     reg_opts.add_argument(
-        "-lss-exclude", "-lss_exclude",
+        "-lss-exclude",
+        "-lss_exclude",
         dest="lss_exclude",
         nargs="+",
         default=[],
@@ -429,7 +513,8 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     reg_opts.add_argument(
-        "-prior-from", "-prior_from",
+        "-prior-from",
+        "-prior_from",
         dest="prior_from",
         choices=["none", "per-condition"],
         default="none",
@@ -477,17 +562,24 @@ def create_parser() -> argparse.ArgumentParser:
 
     # Processing
     proc = parser.add_argument_group("Processing")
-    proc.add_argument("-tr", type=float, default=None,
-                      help="TR in seconds; read from header if omitted.")
+    proc.add_argument(
+        "-tr", type=float, default=None, help="TR in seconds; read from header if omitted."
+    )
     proc.add_argument("-mask", default=None, help="Brain mask NIfTI.")
-    proc.add_argument("-polort", type=int, default=None,
-                      help="Polynomial drift order (per run).  None → auto via run duration.")
-    proc.add_argument("-device", default="auto",
-                      help="Compute device: auto, cpu, cuda, mps.")
-    proc.add_argument("-debug-design", "-debug_design",
-                      dest="debug_design",
-                      action="store_true",
-                      help="Print design rank/conditioning before the fit.")
+    proc.add_argument(
+        "-polort",
+        type=int,
+        default=None,
+        help="Polynomial drift order (per run).  None → auto via run duration.",
+    )
+    proc.add_argument("-device", default="auto", help="Compute device: auto, cpu, cuda, mps.")
+    proc.add_argument(
+        "-debug-design",
+        "-debug_design",
+        dest="debug_design",
+        action="store_true",
+        help="Print design rank/conditioning before the fit.",
+    )
     add_verbose_arg(proc, default=1)
 
     # I/O extras
@@ -499,7 +591,8 @@ def create_parser() -> argparse.ArgumentParser:
     # flag (`save_iresp_explicit`) so the single-trial branch can
     # honour user intent vs the per-condition default.
     out.add_argument(
-        "-save-iresp", "-save_iresp",
+        "-save-iresp",
+        "-save_iresp",
         dest="save_iresp_explicit",
         action="store_true",
         default=False,
@@ -511,14 +604,16 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     out.add_argument(
-        "-no-iresp", "-no_iresp",
+        "-no-iresp",
+        "-no_iresp",
         dest="save_iresp_off",
         action="store_true",
         default=False,
         help="Force iresp save off (only PC weights + amplitude maps emitted).",
     )
     out.add_argument(
-        "-iresp-dt", "-iresp_dt",
+        "-iresp-dt",
+        "-iresp_dt",
         dest="iresp_dt",
         default=None,
         metavar="SECONDS",
@@ -570,18 +665,19 @@ def _build_prior(
     if model == "FLOBS":
         if reg in ("mvn", "mvn-shape"):
             base_m, base_C = flobs_prior(basis)
-        else:                                              # ridge
+        else:  # ridge
             std = float(np.sqrt(np.median(np.diag(basis.C))))
             base_m, base_C = ridge_prior(n_basis, coefficient_std=max(std, 1e-3))
     elif model == "SPMG1":
         base_m, base_C = ridge_prior(1, coefficient_std=canonical_std)
     elif model == "SPMG2":
-        base_m, base_C = spmg_prior(canonical_std=canonical_std,
-                                    derivative_std=derivative_std)
+        base_m, base_C = spmg_prior(canonical_std=canonical_std, derivative_std=derivative_std)
     elif model == "SPMG3":
-        base_m, base_C = spmg_prior(canonical_std=canonical_std,
-                                    derivative_std=derivative_std,
-                                    dispersion_std=dispersion_std)
+        base_m, base_C = spmg_prior(
+            canonical_std=canonical_std,
+            derivative_std=derivative_std,
+            dispersion_std=dispersion_std,
+        )
     else:
         raise ValueError(f"Unknown model {model}")
 
@@ -591,7 +687,7 @@ def _build_prior(
             # SPMG default has zero mean; pick the canonical-amplitude
             # axis (first basis function) as the amplitude direction.
             base_m = np.zeros(n_basis, dtype=np.float64)
-            base_m[0] = float(canonical_std)              # arbitrary positive direction
+            base_m[0] = float(canonical_std)  # arbitrary positive direction
         return decouple_amplitude_prior(base_m, base_C)
 
     return base_m, base_C
@@ -670,6 +766,7 @@ def main() -> int:
     if has_events:
         from fastfuncstuff.cli_utils import clean_condition_labels  # noqa: F401
         from fastfuncstuff.design.bids_events import parse_bids_events
+
         if len(args.events) != n_runs:
             print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs.")
             return 1
@@ -682,6 +779,7 @@ def main() -> int:
         )
     else:
         from fastfuncstuff.cli_utils import clean_condition_labels
+
         onset_files = args.onsets
         n_conditions = len(onset_files)
         condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
@@ -704,9 +802,9 @@ def main() -> int:
     n_conditions = len(condition_labels)
     print(f"  {n_conditions} conditions: {condition_labels}")
 
-    preflight_check(input_files=input_files,
-                    onset_files=args.onsets if has_onsets else None,
-                    ortvec_files=None)
+    preflight_check(
+        input_files=input_files, onset_files=args.onsets if has_onsets else None, ortvec_files=None
+    )
 
     # ── Load data ──────────────────────────────────────────────────
     device, _, _ = parse_device_arg(args.device)
@@ -714,9 +812,15 @@ def main() -> int:
     print(f"  Compute device: {device}")
 
     load_result = load_and_preprocess_runs(
-        input_files=input_files, tr=args.tr, mask_file=args.mask,
-        blur_fwhm=None, do_scale=True, device=device, force_cpu=True,
-        dry_run=False, verbose=True,
+        input_files=input_files,
+        tr=args.tr,
+        mask_file=args.mask,
+        blur_fwhm=None,
+        do_scale=True,
+        device=device,
+        force_cpu=True,
+        dry_run=False,
+        verbose=True,
     )
     data = load_result.data
     run_starts = load_result.run_starts
@@ -731,6 +835,7 @@ def main() -> int:
 
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
+
         all_onsets = _round_onsets(all_onsets, tr, threshold=args.round_onsets)
         print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f}).")
 
@@ -747,25 +852,33 @@ def main() -> int:
     # the prior is actually in play.
     if args.lambda_mode == "auto":
         if args.reg == "none":
-            args.lambda_mode = "global"     # placeholder; unused downstream
+            args.lambda_mode = "global"  # placeholder; unused downstream
         else:
             args.lambda_mode = "voxelwise" if args.single_trials else "global"
-            print(f"  Lambda mode auto → {args.lambda_mode} "
-                  f"({'single-trials' if args.single_trials else 'per-condition'})")
+            print(
+                f"  Lambda mode auto → {args.lambda_mode} "
+                f"({'single-trials' if args.single_trials else 'per-condition'})"
+            )
 
-    print(f"\n  Model: {args.model}    Regularisation: {args.reg}    "
-          f"Single-trials: {args.single_trials}")
+    print(
+        f"\n  Model: {args.model}    Regularisation: {args.reg}    "
+        f"Single-trials: {args.single_trials}"
+    )
     basis = _build_basis(args)
     n_basis = basis.basis_functions.shape[0]
     prior_m, prior_C = _build_prior(
-        model=args.model, reg=args.reg, basis=basis,
+        model=args.model,
+        reg=args.reg,
+        basis=basis,
         canonical_std=args.canonical_std,
         derivative_std=args.derivative_std,
         dispersion_std=args.dispersion_std,
     )
     pw = _resolve_prior_weight_arg(args.prior_weight, args.reg)
-    print(f"  Basis: {n_basis} fns × {basis.basis_functions.shape[1]} samples "
-          f"(dt={basis.dt}s, window={basis.duration:.1f}s)")
+    print(
+        f"  Basis: {n_basis} fns × {basis.basis_functions.shape[1]} samples "
+        f"(dt={basis.dt}s, window={basis.duration:.1f}s)"
+    )
     # Only print prior info when the prior is actually applied.  With
     # -reg none, m/C/λ are all zeros / unused — printing them is noise
     # that confuses users about whether the prior is active.
@@ -794,13 +907,20 @@ def main() -> int:
 
     # Auto-detect TR-lock vs sub-TR for the basis convolution path.
     all_onset_times = [
-        float(t) for cond_runs in all_onsets for run_onsets in cond_runs
+        float(t)
+        for cond_runs in all_onsets
+        for run_onsets in cond_runs
         for t in (run_onsets.tolist() if run_onsets.size else [])
     ]
     from fastfuncstuff.design.matrices import is_tr_locked
-    basis_mode = "FIR" if (all_onset_times and is_tr_locked(all_onset_times, tr, threshold=0.1)) else "TENT"
-    print(f"  Onset basis-convolution mode: {basis_mode} "
-          f"({'TR-locked' if basis_mode == 'FIR' else 'sub-TR onsets'})")
+
+    basis_mode = (
+        "FIR" if (all_onset_times and is_tr_locked(all_onset_times, tr, threshold=0.1)) else "TENT"
+    )
+    print(
+        f"  Onset basis-convolution mode: {basis_mode} "
+        f"({'TR-locked' if basis_mode == 'FIR' else 'sub-TR onsets'})"
+    )
 
     # Build "block list" — each block is one condition (default) or one
     # trial (single-trials mode).  For single-trial mode, expand each
@@ -816,12 +936,9 @@ def main() -> int:
                 for t_in_run in run_arr:
                     # build one-event onset list per run for this trial
                     per_run = [
-                        np.array([t_in_run]) if rr == r else np.array([])
-                        for rr in range(n_runs)
+                        np.array([t_in_run]) if rr == r else np.array([]) for rr in range(n_runs)
                     ]
-                    block_labels.append(
-                        f"{cond_label}_trial{trial_num_global:03d}_run{r + 1}"
-                    )
+                    block_labels.append(f"{cond_label}_trial{trial_num_global:03d}_run{r + 1}")
                     block_onsets_per_run.append(per_run)
                     trial_num_global += 1
     else:
@@ -830,7 +947,9 @@ def main() -> int:
             block_onsets_per_run.append(all_onsets[cond_idx])
 
     n_blocks = len(block_labels)
-    print(f"  Blocks to fit: {n_blocks}  ({'one per trial' if args.single_trials else 'one per condition'})")
+    print(
+        f"  Blocks to fit: {n_blocks}  ({'one per trial' if args.single_trials else 'one per condition'})"
+    )
 
     # Build per-run design with K basis cols per block
     per_run_designs: list[torch.Tensor] = []
@@ -855,7 +974,7 @@ def main() -> int:
     # one is supplied — its returned ``data`` tensor has shape
     # ``(n_voxels_in_mask, total_tp)``.  Just split by run boundary.
     per_run_data = [
-        data[:, run_starts_ext[r]:run_starts_ext[r + 1]].clone().detach().float()
+        data[:, run_starts_ext[r] : run_starts_ext[r + 1]].clone().detach().float()
         for r in range(n_runs)
     ]
 
@@ -924,15 +1043,15 @@ def main() -> int:
                 per_run_task_designs=pc_designs,
                 polort=polort_resolved,
                 task_column_labels=[
-                    f"{lbl}#PC{b}" for lbl in condition_labels
-                    for b in range(n_basis)
+                    f"{lbl}#PC{b}" for lbl in condition_labels for b in range(n_basis)
                 ],
                 device=device,
             )
             pc_task_design = packed_pc.design_concat[:, :n_pc_task_cols]
             pc_nuisance = (
                 packed_pc.design_concat[:, n_pc_task_cols:]
-                if packed_pc.design_concat.shape[1] > n_pc_task_cols else None
+                if packed_pc.design_concat.shape[1] > n_pc_task_cols
+                else None
             )
             # Inherit -lambda-mode and -prior-weight from the user.
             # The previous hard-coded ``global / auto`` combination
@@ -957,7 +1076,9 @@ def main() -> int:
                 lambda_n_bins=args.lambda_n_bins,
             )
             cond_betas = pc_fit.betas[:, :n_pc_task_cols].reshape(
-                -1, n_cond, n_basis,
+                -1,
+                n_cond,
+                n_basis,
             )
             print(
                 f"  ✓ Per-condition pre-fit complete.  "
@@ -968,29 +1089,29 @@ def main() -> int:
             # Map per-condition → per-trial prior mean using block_labels.
             n_vox_masked_pc = cond_betas.shape[0]
             empirical_prior_mean_full = np.zeros(
-                (n_vox_masked_pc, n_blocks * n_basis), dtype=np.float32,
+                (n_vox_masked_pc, n_blocks * n_basis),
+                dtype=np.float32,
             )
             cond_to_idx = {c: i for i, c in enumerate(condition_labels)}
             for b_idx, label in enumerate(block_labels):
                 cond_label = label.split("_trial")[0]
                 ci = cond_to_idx[cond_label]
-                empirical_prior_mean_full[
-                    :, b_idx * n_basis:(b_idx + 1) * n_basis
-                ] = cond_betas[:, ci, :]
+                empirical_prior_mean_full[:, b_idx * n_basis : (b_idx + 1) * n_basis] = cond_betas[
+                    :, ci, :
+                ]
 
             # Shift per_run_data: y → y − X · m_v in place per run.
             m_t = torch.from_numpy(empirical_prior_mean_full).to(
-                device=device, dtype=torch.float32,
-            )                                          # (n_vox, n_blocks*n_basis)
+                device=device,
+                dtype=torch.float32,
+            )  # (n_vox, n_blocks*n_basis)
             for r in range(n_runs):
-                X_r = per_run_designs[r].to(device).float()   # (n_tp_r, n_task)
-                shift_r = m_t @ X_r.T                          # (n_vox, n_tp_r)
-                per_run_data[r] = (
-                    per_run_data[r].to(device).float() - shift_r
-                )
+                X_r = per_run_designs[r].to(device).float()  # (n_tp_r, n_task)
+                shift_r = m_t @ X_r.T  # (n_vox, n_tp_r)
+                per_run_data[r] = per_run_data[r].to(device).float() - shift_r
             print(
-                f"  ✓ Data shifted; single-trial fit now solves "
-                f"β_centered = β_trial − β_cond per voxel."
+                "  ✓ Data shifted; single-trial fit now solves "
+                "β_centered = β_trial − β_cond per voxel."
             )
             del m_t
 
@@ -1014,14 +1135,12 @@ def main() -> int:
     arma_ab_per_voxel: np.ndarray | None = None
     arma_cells: list[ARMAWhitenCell] | None = None
     if args.prewhiten == "arma11":
-        per_run_data, per_run_designs, a_opt, b_opt = (
-            estimate_and_apply_arma11_prewhitening(
-                per_run_data=per_run_data,
-                per_run_task_designs=per_run_designs,
-                polort=polort_resolved,
-                device=device,
-                verbose=True,
-            )
+        per_run_data, per_run_designs, a_opt, b_opt = estimate_and_apply_arma11_prewhitening(
+            per_run_data=per_run_data,
+            per_run_task_designs=per_run_designs,
+            polort=polort_resolved,
+            device=device,
+            verbose=True,
         )
         arma_ab = (a_opt, b_opt)
     elif args.prewhiten == "arma11-voxel":
@@ -1058,9 +1177,7 @@ def main() -> int:
     # arma11-voxel skips this single packed-design path: each ARMA
     # cell has its own whitened design, so packing happens per cell
     # inside the dispatch block below.
-    task_column_labels = [
-        f"{lbl}#PC{b}" for lbl in block_labels for b in range(n_basis)
-    ]
+    task_column_labels = [f"{lbl}#PC{b}" for lbl in block_labels for b in range(n_basis)]
     if arma_cells is None:
         packed = pack_for_shared_task_glm(
             per_run_data=per_run_data,
@@ -1070,13 +1187,18 @@ def main() -> int:
             device=device,
         )
         n_task_cols = packed.n_task_cols
-        print(f"  Design: {packed.design_concat.shape}  "
-              f"({n_task_cols} task + "
-              f"{packed.design_concat.shape[1] - n_task_cols} nuisance)")
+        print(
+            f"  Design: {packed.design_concat.shape}  "
+            f"({n_task_cols} task + "
+            f"{packed.design_concat.shape[1] - n_task_cols} nuisance)"
+        )
 
         task_design = packed.design_concat[:, :n_task_cols]
-        nuisance = (packed.design_concat[:, n_task_cols:]
-                    if packed.design_concat.shape[1] > n_task_cols else None)
+        nuisance = (
+            packed.design_concat[:, n_task_cols:]
+            if packed.design_concat.shape[1] > n_task_cols
+            else None
+        )
     else:
         # n_task_cols is fixed by model; nuisance lives per cell.
         n_task_cols = n_blocks * n_basis
@@ -1132,13 +1254,15 @@ def main() -> int:
             block_labels=block_labels,
             condition_labels=list(condition_labels),
             basis_functions=basis.basis_functions,
-            prior_mean=prior_m, prior_cov=prior_C,
+            prior_mean=prior_m,
+            prior_cov=prior_C,
             polort=polort_resolved,
             prior_weight=pw,
             lambda_mode=args.lambda_mode,
             lambda_n_bins=args.lambda_n_bins,
             lss_exclude=args.lss_exclude,
-            device=device, verbose=True,
+            device=device,
+            verbose=True,
         )
         print(
             f"  ✓ LSS fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
@@ -1183,15 +1307,18 @@ def main() -> int:
             cell_packed_cache.clear()
 
             cell_iter = tqdm(
-                cells, total=len(cells),
-                desc="  Cells × constrained fit", unit="cell",
-                leave=False, disable=len(cells) <= 1,
+                cells,
+                total=len(cells),
+                desc="  Cells × constrained fit",
+                unit="cell",
+                leave=False,
+                disable=len(cells) <= 1,
             )
             for cell in cell_iter:
                 packed_cell = pack_for_shared_task_glm(
                     per_run_data=cell.per_run_data,
                     per_run_task_designs=cell.per_run_task_designs,
-                    polort=-1,                          # polys go via extra
+                    polort=-1,  # polys go via extra
                     task_column_labels=task_column_labels,
                     extra_regressors_per_run=cell.per_run_polys,
                     device=device,
@@ -1200,11 +1327,13 @@ def main() -> int:
                 task_design_cell = packed_cell.design_concat[:, :n_task_cols]
                 nuisance_cell = (
                     packed_cell.design_concat[:, n_task_cols:]
-                    if packed_cell.design_concat.shape[1] > n_task_cols else None
+                    if packed_cell.design_concat.shape[1] > n_task_cols
+                    else None
                 )
                 pw_cell = (
                     prior_weight_per_voxel[cell.voxel_indices]
-                    if prior_weight_per_voxel is not None else None
+                    if prior_weight_per_voxel is not None
+                    else None
                 )
                 cell_fit = fit_basis_constrained_ridge(
                     data=packed_cell.data_concat,
@@ -1236,10 +1365,10 @@ def main() -> int:
 
             return FLOBSFitResult(
                 betas=betas_all,
-                hrfs=None,                              # type: ignore[arg-type]
+                hrfs=None,  # type: ignore[arg-type]
                 r2=r2_all,
                 betas_ols=betas_ols_all,
-                hrfs_ols=None,                          # type: ignore[arg-type]
+                hrfs_ols=None,  # type: ignore[arg-type]
                 r2_ols=r2_ols_all,
                 sigma2_mean=sigma2_sum / max(1, n_voxels_total),
                 effective_prior_weight=eff_pw_sum / max(1, n_voxels_total),
@@ -1249,11 +1378,12 @@ def main() -> int:
             )
 
         fit = _run_cell_fit(arma_cells)
-        print(f"  ✓ Per-voxel ARMA fit complete (iter 0).  "
-              f"σ²_mean={fit.sigma2_mean:.4g}, "
-              f"effective λ_mean={fit.effective_prior_weight:.4g}")
-        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
-              f"constrained: {fit.r2.mean():.3f}")
+        print(
+            f"  ✓ Per-voxel ARMA fit complete (iter 0).  "
+            f"σ²_mean={fit.sigma2_mean:.4g}, "
+            f"effective λ_mean={fit.effective_prior_weight:.4g}"
+        )
+        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  constrained: {fit.r2.mean():.3f}")
 
         # ── VB iterative loop (filmbabe §3) ────────────────────────
         # Each iteration:
@@ -1273,12 +1403,11 @@ def main() -> int:
             # Starts at the user's -prior-weight (1.0 for auto).  Updated
             # each iteration when -vb-update-prior is on, following
             # filmbabe's gamma posterior (TR04MW2 §3).
-            user_mult = (
-                1.0 if isinstance(pw, str)
-                else float(pw)
-            )
+            user_mult = 1.0 if isinstance(pw, str) else float(pw)
             beta_size_per_voxel = np.full(
-                n_voxels_total, float(user_mult), dtype=np.float32,
+                n_voxels_total,
+                float(user_mult),
+                dtype=np.float32,
             )
             prior_pw_per_voxel: np.ndarray | None = None
             if args.vb_update_prior and args.reg in {"ridge", "mvn", "mvn-shape"}:
@@ -1300,9 +1429,8 @@ def main() -> int:
                         n_bins=args.lambda_n_bins,
                         verbose=False,
                     )
-                task_betas_3d = (
-                    fit.betas[:, :n_task_cols]
-                    .reshape(n_voxels_total, n_blocks, n_basis)
+                task_betas_3d = fit.betas[:, :n_task_cols].reshape(
+                    n_voxels_total, n_blocks, n_basis
                 )
                 beta_size_per_voxel = vb_update_beta_size(
                     task_betas=task_betas_3d,
@@ -1311,9 +1439,7 @@ def main() -> int:
                     block_trace_summed=block_trace_summed,
                 )
                 # Translate to per-voxel λ: λ_v = β_size_v · σ²_v.
-                prior_pw_per_voxel = (
-                    beta_size_per_voxel * sigma2_per_voxel_all
-                )
+                prior_pw_per_voxel = beta_size_per_voxel * sigma2_per_voxel_all
                 print(
                     f"  VB β_size update (iter 0): median={float(np.median(beta_size_per_voxel)):.3f}, "
                     f"5–95% [{float(np.percentile(beta_size_per_voxel, 5)):.3f}, "
@@ -1337,8 +1463,7 @@ def main() -> int:
 
                 # 1. Residuals in original space.
                 nuis_betas_arr = (
-                    fit.betas[:, n_task_cols:]
-                    if fit.betas.shape[1] > n_task_cols else None
+                    fit.betas[:, n_task_cols:] if fit.betas.shape[1] > n_task_cols else None
                 )
                 residuals_per_run = compute_per_voxel_residuals(
                     per_run_data=per_run_data,
@@ -1354,7 +1479,8 @@ def main() -> int:
                     per_run_data=residuals_per_run,
                     per_run_task_designs=per_run_designs,
                     polort=-1,
-                    device=device, verbose=True,
+                    device=device,
+                    verbose=True,
                 )
                 # Free residuals before re-binning + re-fit, which
                 # will allocate new cells.
@@ -1379,10 +1505,12 @@ def main() -> int:
                     per_run_task_designs=per_run_designs,
                     arma_per_voxel=arma_ab_per_voxel,
                     polort=polort_resolved,
-                    device=device, verbose=True,
+                    device=device,
+                    verbose=True,
                 )
                 fit = _run_cell_fit(
-                    arma_cells, prior_weight_per_voxel=prior_pw_per_voxel,
+                    arma_cells,
+                    prior_weight_per_voxel=prior_pw_per_voxel,
                 )
                 print(
                     f"  VB iter {vb_iter} fit: σ²_mean={fit.sigma2_mean:.4g}, "
@@ -1404,9 +1532,8 @@ def main() -> int:
                             n_bins=args.lambda_n_bins,
                             verbose=False,
                         )
-                    task_betas_3d = (
-                        fit.betas[:, :n_task_cols]
-                        .reshape(n_voxels_total, n_blocks, n_basis)
+                    task_betas_3d = fit.betas[:, :n_task_cols].reshape(
+                        n_voxels_total, n_blocks, n_basis
                     )
                     new_beta_size = vb_update_beta_size(
                         task_betas=task_betas_3d,
@@ -1414,13 +1541,9 @@ def main() -> int:
                         prior_cov=prior_C,
                         block_trace_summed=block_trace_summed,
                     )
-                    bs_change = float(np.median(
-                        np.abs(new_beta_size - beta_size_per_voxel)
-                    ))
+                    bs_change = float(np.median(np.abs(new_beta_size - beta_size_per_voxel)))
                     beta_size_per_voxel = new_beta_size
-                    prior_pw_per_voxel = (
-                        beta_size_per_voxel * sigma2_per_voxel_all
-                    )
+                    prior_pw_per_voxel = beta_size_per_voxel * sigma2_per_voxel_all
                     print(
                         f"  VB β_size iter {vb_iter}: "
                         f"median={float(np.median(beta_size_per_voxel)):.3f}, "
@@ -1473,10 +1596,14 @@ def main() -> int:
             device=device,
             verbose=True,
         )
-        print(f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
-              f"median optimal frac = {float(np.median(fit.optimal_fracs)):.2f}")
-        print(f"  Held-out R² mean — OLS (frac=1.0): {fit.r2_ols.mean():.3f}  "
-              f"fracridge optimal: {fit.r2.mean():.3f}")
+        print(
+            f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+            f"median optimal frac = {float(np.median(fit.optimal_fracs)):.2f}"
+        )
+        print(
+            f"  Held-out R² mean — OLS (frac=1.0): {fit.r2_ols.mean():.3f}  "
+            f"fracridge optimal: {fit.r2.mean():.3f}"
+        )
     else:
         fit = fit_basis_constrained_ridge(
             data=packed.data_concat,
@@ -1492,10 +1619,11 @@ def main() -> int:
             lambda_mode=args.lambda_mode,
             lambda_n_bins=args.lambda_n_bins,
         )
-        print(f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
-              f"effective λ={fit.effective_prior_weight:.4g}")
-        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  "
-              f"constrained: {fit.r2.mean():.3f}")
+        print(
+            f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+            f"effective λ={fit.effective_prior_weight:.4g}"
+        )
+        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  constrained: {fit.r2.mean():.3f}")
 
     # ── Stage cleanup: release fit-stage GPU tensors ───────────────
     # Everything downstream (amplitude / iresp reconstruction,
@@ -1540,12 +1668,8 @@ def main() -> int:
     # facing output should be the full β_trial = β_centered + β_cond).
     # Both the constrained and the OLS betas need the same restoration.
     if empirical_prior_mean_full is not None:
-        fit.betas[:, :n_task_cols] = (
-            fit.betas[:, :n_task_cols] + empirical_prior_mean_full
-        )
-        fit.betas_ols[:, :n_task_cols] = (
-            fit.betas_ols[:, :n_task_cols] + empirical_prior_mean_full
-        )
+        fit.betas[:, :n_task_cols] = fit.betas[:, :n_task_cols] + empirical_prior_mean_full
+        fit.betas_ols[:, :n_task_cols] = fit.betas_ols[:, :n_task_cols] + empirical_prior_mean_full
         print(
             "  Restored per-condition empirical prior into single-trial "
             "betas; output reflects β_trial in original signal units."
@@ -1566,6 +1690,7 @@ def main() -> int:
     #                     Iresp NIfTIs are resampled to this grid
     #                     before writing — typical 10-20× size reduction.
     from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
+
     n_t_basis = basis.basis_functions.shape[1]
 
     # Resolve -iresp-dt: default to TR.
@@ -1582,8 +1707,7 @@ def main() -> int:
     n_t_iresp = max(1, int(np.floor((basis.duration - basis.dt) / iresp_dt)) + 1)
     dst_times = np.arange(n_t_iresp) * iresp_dt
     basis_iresp = np.stack(
-        [np.interp(dst_times, src_times, basis.basis_functions[k])
-         for k in range(n_basis)],
+        [np.interp(dst_times, src_times, basis.basis_functions[k]) for k in range(n_basis)],
         axis=0,
     ).astype(np.float64)  # (K, n_t_iresp)
     print(
@@ -1611,10 +1735,7 @@ def main() -> int:
     avail_bytes = get_available_memory(torch.device("cpu"))
     chunk_from_hrf = max(1, int(avail_bytes * 0.25 / max(bytes_per_vox, 1)))
     chunk_size = min(chunk_size, chunk_from_hrf)
-    print(
-        f"  Amplitude/iresp chunking: {chunk_size:,} voxels per chunk "
-        f"(n_blocks={n_blocks})"
-    )
+    print(f"  Amplitude/iresp chunking: {chunk_size:,} voxels per chunk (n_blocks={n_blocks})")
 
     amplitude = np.zeros((n_vox_masked, n_blocks), dtype=np.float32)
     amplitude_ols = np.zeros_like(amplitude)
@@ -1641,7 +1762,7 @@ def main() -> int:
                 "maps still emitted."
             )
     else:
-        save_full_iresp = True   # per-condition default
+        save_full_iresp = True  # per-condition default
     if save_full_iresp:
         # Memory estimate for the full iresp tensor at the resampled grid:
         full_iresp_bytes = 2 * n_vox_masked * n_blocks * n_t_iresp * 4  # float32
@@ -1656,12 +1777,10 @@ def main() -> int:
         else:
             print(f"  Per-block iresp save: ~{full_iresp_gb:.2f} GB in memory.")
     iresp_buf = (
-        np.zeros((n_vox_masked, n_blocks, n_t_iresp), dtype=np.float32)
-        if save_full_iresp else None
+        np.zeros((n_vox_masked, n_blocks, n_t_iresp), dtype=np.float32) if save_full_iresp else None
     )
     iresp_buf_ols = (
-        np.zeros((n_vox_masked, n_blocks, n_t_iresp), dtype=np.float32)
-        if save_full_iresp else None
+        np.zeros((n_vox_masked, n_blocks, n_t_iresp), dtype=np.float32) if save_full_iresp else None
     )
 
     def _signed_peak(hrfs: np.ndarray) -> np.ndarray:
@@ -1683,8 +1802,10 @@ def main() -> int:
     for start in tqdm(
         range(0, n_vox_masked, chunk_size),
         total=n_amp_chunks,
-        desc="  Amplitude/iresp", unit="chunk",
-        leave=False, disable=n_amp_chunks <= 1,
+        desc="  Amplitude/iresp",
+        unit="chunk",
+        leave=False,
+        disable=n_amp_chunks <= 1,
     ):
         end = min(start + chunk_size, n_vox_masked)
         # Amplitude and iresp share a single HRF reconstruction at
@@ -1709,8 +1830,9 @@ def main() -> int:
     # R² volumes (constrained + unconstrained)
     for arr, sfx in ((fit.r2, ""), (fit.r2_ols, "_unconstrained")):
         path = f"{args.prefix}_fitbasis_r2{sfx}{nii_ext}"
-        save_nifti(_to_volume(arr[:, None]).squeeze(-1),
-                   output_path=path, reference_img=args.input[0])
+        save_nifti(
+            _to_volume(arr[:, None]).squeeze(-1), output_path=path, reference_img=args.input[0]
+        )
         print(f"  Wrote {path}")
 
     # ── Cross-validated R² (held-out) ──────────────────────────────
@@ -1722,17 +1844,11 @@ def main() -> int:
     # generalization, not the noise-model layer.
     if args.xval_r2:
         if args.reg in {"fracridge", "mvn-shape"}:
-            print(
-                f"  -xval-r2 not yet supported with -reg {args.reg}; "
-                "skipping."
-            )
+            print(f"  -xval-r2 not yet supported with -reg {args.reg}; skipping.")
         elif n_runs < 2:
             print("  -xval-r2 needs ≥2 runs; skipping.")
         elif per_run_data_orig is None:
-            print(
-                "  -xval-r2 requested but per_run_data_orig was not "
-                "saved (internal); skipping."
-            )
+            print("  -xval-r2 requested but per_run_data_orig was not saved (internal); skipping.")
         else:
             xval_r2 = compute_xval_r2_per_voxel(
                 per_run_data=per_run_data_orig,
@@ -1755,8 +1871,11 @@ def main() -> int:
                 verbose=args.verb >= 1,
             )
             xval_path = f"{args.prefix}_fitbasis_xvalr2{nii_ext}"
-            save_nifti(_to_volume(xval_r2[:, None]).squeeze(-1),
-                       output_path=xval_path, reference_img=args.input[0])
+            save_nifti(
+                _to_volume(xval_r2[:, None]).squeeze(-1),
+                output_path=xval_path,
+                reference_img=args.input[0],
+            )
             print(
                 f"  Wrote {xval_path}  "
                 f"(median={float(np.median(xval_r2)):.3f}, "
@@ -1780,12 +1899,14 @@ def main() -> int:
         # Per-condition amplitude 4D (last axis = trial number)
         for cond, idxs in tqdm(
             per_cond_trial_idx.items(),
-            desc="  Single-trial amplitudes", unit="cond",
-            leave=False, disable=len(per_cond_trial_idx) <= 1,
+            desc="  Single-trial amplitudes",
+            unit="cond",
+            leave=False,
+            disable=len(per_cond_trial_idx) <= 1,
         ):
             for amps, sfx in ((amplitude, ""), (amplitude_ols, "_unconstrained")):
-                amp_stack = amps[:, idxs]              # (n_vox, n_trials_for_cond)
-                amp_vol = _to_volume(amp_stack)         # (nx, ny, nz, n_trials)
+                amp_stack = amps[:, idxs]  # (n_vox, n_trials_for_cond)
+                amp_vol = _to_volume(amp_stack)  # (nx, ny, nz, n_trials)
                 path = f"{args.prefix}_fitbasis_amplitude_{cond}{sfx}{nii_ext}"
                 save_nifti(amp_vol, output_path=path, reference_img=args.input[0])
                 print(f"  Wrote {path}  (n_trials={len(idxs)})")
@@ -1799,8 +1920,11 @@ def main() -> int:
                     iresp=iresp_vol,
                     output_prefix=f"{args.prefix}_fitbasis",
                     condition_labels=[f"{lbl}{sfx}" for lbl in block_labels],
-                    tr=iresp_dt, bot=0.0, top=iresp_dt * (n_t_iresp - 1),
-                    reference_img=args.input[0], nii_ext=nii_ext,
+                    tr=iresp_dt,
+                    bot=0.0,
+                    top=iresp_dt * (n_t_iresp - 1),
+                    reference_img=args.input[0],
+                    nii_ext=nii_ext,
                 )
             print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
 
@@ -1813,24 +1937,20 @@ def main() -> int:
         # for different basis functions were mixed.
         for cond, idxs in tqdm(
             per_cond_trial_idx.items(),
-            desc="  Single-trial basis weights", unit="cond",
-            leave=False, disable=len(per_cond_trial_idx) <= 1,
+            desc="  Single-trial basis weights",
+            unit="cond",
+            leave=False,
+            disable=len(per_cond_trial_idx) <= 1,
         ):
-            stack = task_betas[:, idxs, :]            # (n_vox, n_trials, K)
+            stack = task_betas[:, idxs, :]  # (n_vox, n_trials, K)
             stack_ols = task_betas_ols[:, idxs, :]
             for arr, sfx in ((stack, ""), (stack_ols, "_unconstrained")):
                 for b in range(n_basis):
                     # (n_vox, n_trials) → (nx, ny, nz, n_trials)
                     vol_4d = _to_volume(arr[:, :, b])
-                    path = (
-                        f"{args.prefix}_fitbasis_basisweight{b + 1:02d}_"
-                        f"{cond}{sfx}{nii_ext}"
-                    )
+                    path = f"{args.prefix}_fitbasis_basisweight{b + 1:02d}_{cond}{sfx}{nii_ext}"
                     save_nifti(vol_4d, output_path=path, reference_img=args.input[0])
-            print(
-                f"  Wrote basisweight01..{n_basis:02d} for {cond} "
-                f"(n_trials={len(idxs)})"
-            )
+            print(f"  Wrote basisweight01..{n_basis:02d} for {cond} (n_trials={len(idxs)})")
 
     else:
         # Per-condition outputs (the simple case)
@@ -1841,8 +1961,11 @@ def main() -> int:
                     iresp=iresp_vol,
                     output_prefix=f"{args.prefix}_fitbasis",
                     condition_labels=[f"{lbl}{sfx}" for lbl in block_labels],
-                    tr=iresp_dt, bot=0.0, top=iresp_dt * (n_t_iresp - 1),
-                    reference_img=args.input[0], nii_ext=nii_ext,
+                    tr=iresp_dt,
+                    bot=0.0,
+                    top=iresp_dt * (n_t_iresp - 1),
+                    reference_img=args.input[0],
+                    nii_ext=nii_ext,
                 )
             print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
 
@@ -1876,7 +1999,8 @@ def main() -> int:
     # outputs).
     if args.reg == "fracridge":
         from fastfuncstuff.design.flobs import FracRidgeFitResult
-        assert isinstance(fit, FracRidgeFitResult)            # narrow for type checker
+
+        assert isinstance(fit, FracRidgeFitResult)  # narrow for type checker
         fr: FracRidgeFitResult = fit
         frac_tsv = f"{args.prefix}_fitbasis_cv_r2.tsv"
         with open(frac_tsv, "w") as fh:
@@ -1914,9 +2038,7 @@ def main() -> int:
 
     if args.cv_runs and args.reg != "fracridge":
         if n_runs < 2:
-            print(
-                f"  WARNING: -cv-runs requires ≥2 runs (got {n_runs}); skipping CV."
-            )
+            print(f"  WARNING: -cv-runs requires ≥2 runs (got {n_runs}); skipping CV.")
         else:
             try:
                 grid = [float(x) for x in str(args.cv_grid).split(",") if x.strip()]
@@ -1967,17 +2089,23 @@ def main() -> int:
             #   "average" voxel, the second is dominated by noise
             #   voxels where any small bias wins.
             medians_arr = np.array(
-                [float(np.median(cv_result.r2_per_weight[:, i]))
-                 for i in range(len(cv_result.weights))]
+                [
+                    float(np.median(cv_result.r2_per_weight[:, i]))
+                    for i in range(len(cv_result.weights))
+                ]
             )
             n_best_arr = np.array(
-                [int((cv_result.argmax_weight_idx == i).sum())
-                 for i in range(len(cv_result.weights))]
+                [
+                    int((cv_result.argmax_weight_idx == i).sum())
+                    for i in range(len(cv_result.weights))
+                ]
             )
             best_median_i = int(np.argmax(medians_arr))
             best_count_i = int(np.argmax(n_best_arr))
             print("  Held-out R² summary:")
-            print(f"    {'weight':>8}  {'median':>9}  {'mean':>9}  {'max':>9}  {'n_best_voxels':>14}")
+            print(
+                f"    {'weight':>8}  {'median':>9}  {'mean':>9}  {'max':>9}  {'n_best_voxels':>14}"
+            )
             for i, w in enumerate(cv_result.weights):
                 col = cv_result.r2_per_weight[:, i]
                 tags = []
@@ -1999,8 +2127,9 @@ def main() -> int:
             else:
                 argmax_3d = cv_result.argmax_weight_idx.reshape(volume_shape)
             argmax_path = f"{args.prefix}_fitbasis_cv_argmax{nii_ext}"
-            save_nifti(argmax_3d.astype(np.float32),
-                       output_path=argmax_path, reference_img=args.input[0])
+            save_nifti(
+                argmax_3d.astype(np.float32), output_path=argmax_path, reference_img=args.input[0]
+            )
             print(f"  Wrote {argmax_path}  (int → index into weights list above)")
 
             # Per-weight R² 4-D NIfTI (one volume per weight in the grid).
@@ -2068,8 +2197,7 @@ def main() -> int:
                 for i in range(len(cv_result.weights))
             ],
             "n_voxels_best_per_weight": [
-                int((cv_result.argmax_weight_idx == i).sum())
-                for i in range(len(cv_result.weights))
+                int((cv_result.argmax_weight_idx == i).sum()) for i in range(len(cv_result.weights))
             ],
         }
     meta_path = f"{args.prefix}_fitbasis_metadata.json"

@@ -13,6 +13,7 @@ parse_bids_events(event_files, event_ignore, event_cols)
 sort_bids_event_files(paths)
     → list[Path] sorted by run number
 """
+
 from __future__ import annotations
 
 import csv
@@ -22,10 +23,10 @@ from pathlib import Path
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Run-number sorting
 # ---------------------------------------------------------------------------
+
 
 def _run_number(path: Path) -> int:
     """
@@ -34,7 +35,7 @@ def _run_number(path: Path) -> int:
     Handles both zero-padded (run-01) and non-padded (run-1) forms.
     Files with no run entity sort to position 0 (single-run datasets).
     """
-    m = re.search(r'run-(\d+)', path.name, re.IGNORECASE)
+    m = re.search(r"run-(\d+)", path.name, re.IGNORECASE)
     return int(m.group(1)) if m else 0
 
 
@@ -52,6 +53,7 @@ def sort_bids_event_files(paths: list[str | Path]) -> list[Path]:
 # ---------------------------------------------------------------------------
 # Low-level TSV reader
 # ---------------------------------------------------------------------------
+
 
 def _read_tsv(
     path: Path,
@@ -111,6 +113,7 @@ def _read_tsv(
 # ---------------------------------------------------------------------------
 # Main parser
 # ---------------------------------------------------------------------------
+
 
 def parse_bids_events(
     event_files: list[str | Path],
@@ -207,8 +210,7 @@ def parse_bids_events(
 
     # ── Populate all_onsets and collect durations ────────────────────────────
     all_onsets: list[list[np.ndarray]] = [
-        [np.array([], dtype=np.float64) for _ in range(n_runs)]
-        for _ in range(n_conditions)
+        [np.array([], dtype=np.float64) for _ in range(n_runs)] for _ in range(n_conditions)
     ]
     # cond_dur_sets[cond_idx] collects all observed durations for that condition
     cond_dur_sets: list[set[float]] = [set() for _ in range(n_conditions)]
@@ -219,9 +221,7 @@ def parse_bids_events(
             cidx = cond_to_idx[cond]
             cond_onset_lists[cidx].append(onset)
             effective_dur = (
-                round(float(dur), round_durations)
-                if round_durations is not None
-                else float(dur)
+                round(float(dur), round_durations) if round_durations is not None else float(dur)
             )
             cond_dur_sets[cidx].add(effective_dur)
 

@@ -18,11 +18,10 @@ Requires MELODIC --debug --Oall outputs.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
-
-import time
 
 from ..runner import BenchmarkContext
 
@@ -60,14 +59,14 @@ def run_ref(ctx: BenchmarkContext) -> float:
 def _run_solver(mel_dir: Path, out_dir: Path, seed: int = 1) -> None:
     """Apply MELODIC whitening, run FFS FastICA from two inits:
 
-      random_init/  : random seed, tests solver basin from cold start.
-      mel_init/     : initial W = melodic_unmix, tests whether MELODIC's
-                      converged solution is also a fixed point of FFS's
-                      pow3 update + symmetric decorrelation. If FFS stays
-                      there (n_iter≈1, mean_matched_r≈1.0) the solvers are
-                      mathematically equivalent and the only thing that
-                      caused divergence in the random-init case was pow3's
-                      multi-modal landscape.
+    random_init/  : random seed, tests solver basin from cold start.
+    mel_init/     : initial W = melodic_unmix, tests whether MELODIC's
+                    converged solution is also a fixed point of FFS's
+                    pow3 update + symmetric decorrelation. If FFS stays
+                    there (n_iter≈1, mean_matched_r≈1.0) the solvers are
+                    mathematically equivalent and the only thing that
+                    caused divergence in the random-init case was pow3's
+                    multi-modal landscape.
     """
     import nibabel as nib
     import torch
@@ -85,9 +84,7 @@ def _run_solver(mel_dir: Path, out_dir: Path, seed: int = 1) -> None:
         raise ValueError(f"concat_data not 4D: shape={concat_4d.shape}")
     concat_tv = concat_4d[mask].astype(np.float64).T  # (T, V)
     if concat_tv.shape[0] != white.shape[1]:
-        raise ValueError(
-            f"shape mismatch: white={white.shape}, concat_TV={concat_tv.shape}"
-        )
+        raise ValueError(f"shape mismatch: white={white.shape}, concat_TV={concat_tv.shape}")
 
     k = white.shape[0]
     whitened = (white @ concat_tv).astype(np.float32)  # (k, V)
@@ -143,7 +140,7 @@ def _run_solver(mel_dir: Path, out_dir: Path, seed: int = 1) -> None:
     print(f"  [random_init] FastICA from random seed={seed}...")
     _run_one("random_init", None)
     if mel_W is not None:
-        print(f"  [mel_init] FastICA from MELODIC's melodic_unmix...")
+        print("  [mel_init] FastICA from MELODIC's melodic_unmix...")
         _run_one("mel_init", mel_W)
 
 
@@ -168,7 +165,7 @@ def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
     b = np.asarray(b, dtype=np.float64).ravel()
     a_c = a - a.mean()
     b_c = b - b.mean()
-    denom = float(np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum()))
+    denom = float(np.sqrt((a_c**2).sum() * (b_c**2).sum()))
     if denom < 1e-15:
         return 0.0
     return float((a_c * b_c).sum() / denom)
@@ -235,17 +232,25 @@ def _compare(mel_dir: Path, out_dir: Path) -> dict:
 def validate(ctx: BenchmarkContext) -> dict:
     results = {}
     for dataset in _ica_tasks(ctx):
-        results[dataset] = _compare(
-            _melodic_dir(ctx, dataset), _solver_dir(ctx, dataset)
-        )
+        results[dataset] = _compare(_melodic_dir(ctx, dataset), _solver_dir(ctx, dataset))
 
     # Pull out per-init means for the headline.
-    rand_rs = [r["random_init"]["mean_matched_r"] for r in results.values()
-               if "random_init" in r and "mean_matched_r" in r["random_init"]]
-    mel_rs = [r["mel_init"]["mean_matched_r"] for r in results.values()
-              if "mel_init" in r and "mean_matched_r" in r["mel_init"]]
+    rand_rs = [
+        r["random_init"]["mean_matched_r"]
+        for r in results.values()
+        if "random_init" in r and "mean_matched_r" in r["random_init"]
+    ]
+    mel_rs = [
+        r["mel_init"]["mean_matched_r"]
+        for r in results.values()
+        if "mel_init" in r and "mean_matched_r" in r["mel_init"]
+    ]
     if not rand_rs:
-        return {"passed": False, "summary": "no datasets produced solver output", "per_dataset": results}
+        return {
+            "passed": False,
+            "summary": "no datasets produced solver output",
+            "per_dataset": results,
+        }
 
     rand_mean = float(np.mean(rand_rs))
     mel_mean = float(np.mean(mel_rs)) if mel_rs else float("nan")

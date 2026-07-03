@@ -53,12 +53,6 @@ except ImportError:
 
 # Import fastfuncstuff modules
 try:
-    from fastfuncstuff.io.afni import (
-        load_afni_mask,
-        load_and_concatenate_runs,
-        load_nifti,
-        save_nifti,
-    )
     from fastfuncstuff.cli_utils import (
         add_ortvec_arguments,
         add_verbose_arg,
@@ -74,22 +68,28 @@ try:
         extract_noise_pcs_per_run,
         select_noise_pool_voxels,
     )
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
-    from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
-    from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
+    from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
+    from fastfuncstuff.glm.xval import (
+        compute_xval_r2,
+        generate_cv_splits,
+        project_out_nuisance_per_run,
+    )
+    from fastfuncstuff.io.afni import (
+        load_afni_mask,
+        load_and_concatenate_runs,
+        load_nifti,
+        save_nifti,
+    )
     from fastfuncstuff.utils import (
         configure_torch_backends,
         gaussian_blur_3d,
         get_device,
         scale_to_percent_signal,
-    )
-    from fastfuncstuff.glm.xval import (
-        compute_xval_r2,
-        generate_cv_splits,
-        project_out_nuisance_per_run,
     )
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
@@ -397,7 +397,6 @@ Notes:
         action="store_true",
         help="Save denoised xval R² for ALL HRFs (4D volume)",
     )
-
 
     return parser
 
@@ -1126,7 +1125,9 @@ def save_pathfinder_results(
     if results.initial_xval_r2 is not None:
         initial_xval_r2_vol = to_volume(results.initial_xval_r2.numpy())
         initial_xval_r2_path = f"{output_prefix}_initial_xval_r2{nii_ext}"
-        save_nifti(initial_xval_r2_vol.astype(np.float32), output_path=initial_xval_r2_path, affine=affine)
+        save_nifti(
+            initial_xval_r2_vol.astype(np.float32), output_path=initial_xval_r2_path, affine=affine
+        )
         output_files["initial_xval_r2"] = initial_xval_r2_path
 
     # Initial stats (betas, t-stats) with AFNI-style labels
@@ -1326,6 +1327,7 @@ def main():
     onset_files = args.onsets
     n_conditions = len(onset_files)
     from fastfuncstuff.cli_utils import clean_condition_labels
+
     condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
 
     for f in onset_files:
@@ -1518,11 +1520,10 @@ def main():
             if np.max(np.abs(col_mean)) > 1e-4:
                 m = m - col_mean
             run_nuisance = torch.from_numpy(m).to(
-                device=device, dtype=nuisance_per_run[run_idx].dtype,
+                device=device,
+                dtype=nuisance_per_run[run_idx].dtype,
             )
-            nuisance_per_run[run_idx] = torch.cat(
-                [nuisance_per_run[run_idx], run_nuisance], dim=1
-            )
+            nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], run_nuisance], dim=1)
 
     print(f"  Nuisance per run: {nuisance_per_run[0].shape[1]} columns (polort={polort})")
 

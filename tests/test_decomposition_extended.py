@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -36,19 +34,25 @@ class TestPreprocessDesignForCorrelation:
     def test_basic_shape(self):
         """Output shape matches input shape."""
         design = torch.randn(20, 3, device=DEVICE)
-        out = preprocess_design_for_correlation(design, tr=2.0, polort=2, high_pass_hz=None, device=DEVICE)
+        out = preprocess_design_for_correlation(
+            design, tr=2.0, polort=2, high_pass_hz=None, device=DEVICE
+        )
         assert out.shape == design.shape
 
     def test_empty_input(self):
         """Empty tensor returns empty."""
         design = torch.empty(0, device=DEVICE)
-        out = preprocess_design_for_correlation(design, tr=2.0, polort=2, high_pass_hz=0.01, device=DEVICE)
+        out = preprocess_design_for_correlation(
+            design, tr=2.0, polort=2, high_pass_hz=0.01, device=DEVICE
+        )
         assert out.numel() == 0
 
     def test_polort_removes_mean(self):
         """With polort>=0, output columns should be roughly zero-mean."""
         design = torch.randn(30, 2, device=DEVICE) + 5.0
-        out = preprocess_design_for_correlation(design, tr=1.0, polort=0, high_pass_hz=None, device=DEVICE)
+        out = preprocess_design_for_correlation(
+            design, tr=1.0, polort=0, high_pass_hz=None, device=DEVICE
+        )
         col_means = out.mean(dim=0)
         assert torch.allclose(col_means, torch.zeros_like(col_means), atol=1e-4)
 
@@ -59,7 +63,9 @@ class TestPreprocessDesignForCorrelation:
         slow = torch.sin(2 * np.pi * 0.005 * t)
         fast = torch.sin(2 * np.pi * 0.2 * t)
         design = (slow + fast).unsqueeze(1)
-        out = preprocess_design_for_correlation(design, tr=0.1, polort=-1, high_pass_hz=0.05, device=DEVICE)
+        out = preprocess_design_for_correlation(
+            design, tr=0.1, polort=-1, high_pass_hz=0.05, device=DEVICE
+        )
         # Slow component should be attenuated
         assert out.abs().mean() < design.abs().mean()
 
@@ -346,40 +352,70 @@ class TestEstimateICAComponentCount:
 
     def test_fixed_int(self, fake_data):
         k, diag, info = estimate_ica_component_count(
-            fake_data, method=5, max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=False,
+            fake_data,
+            method=5,
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=False,
         )
         assert k == 5
         assert info["mode"] == "fixed_int"
 
     def test_float_variance(self, fake_data):
         k, diag, info = estimate_ica_component_count(
-            fake_data, method=0.9, max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=False,
+            fake_data,
+            method=0.9,
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=False,
         )
         assert 1 <= k <= 30
         assert info["mode"] == "pca_variance_fraction"
 
     def test_melodic_mode(self, fake_data):
         k, diag, info = estimate_ica_component_count(
-            fake_data, method="melodic", max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=False,
+            fake_data,
+            method="melodic",
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=False,
         )
         assert 1 <= k <= 20
         assert info["mode"] == "melodic_laplace"
 
     def test_erank_mode(self, fake_data):
         k, diag, info = estimate_ica_component_count(
-            fake_data, method="erank", max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=False,
+            fake_data,
+            method="erank",
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=False,
         )
         assert k >= 1
         assert info["mode"] == "effective_rank"
 
     def test_mp_mode(self, fake_data):
         k, diag, info = estimate_ica_component_count(
-            fake_data, method="mp", max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=False,
+            fake_data,
+            method="mp",
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=False,
         )
         assert k >= 1
         assert "mp" in info["mode"]
@@ -387,23 +423,39 @@ class TestEstimateICAComponentCount:
     def test_invalid_mode_raises(self, fake_data):
         with pytest.raises(ValueError, match="Unsupported"):
             estimate_ica_component_count(
-                fake_data, method="nonsense", max_auto_components=20,
-                auto_min_components=2, auto_var_threshold=0.95,
-                use_mp_prior=False, device=DEVICE, verbose=False,
+                fake_data,
+                method="nonsense",
+                max_auto_components=20,
+                auto_min_components=2,
+                auto_var_threshold=0.95,
+                use_mp_prior=False,
+                device=DEVICE,
+                verbose=False,
             )
 
     def test_invalid_float_raises(self, fake_data):
         with pytest.raises(ValueError, match="Float"):
             estimate_ica_component_count(
-                fake_data, method=1.5, max_auto_components=20,
-                auto_min_components=2, auto_var_threshold=0.95,
-                use_mp_prior=False, device=DEVICE, verbose=False,
+                fake_data,
+                method=1.5,
+                max_auto_components=20,
+                auto_min_components=2,
+                auto_var_threshold=0.95,
+                use_mp_prior=False,
+                device=DEVICE,
+                verbose=False,
             )
 
     def test_verbose_output(self, fake_data, capsys):
         estimate_ica_component_count(
-            fake_data, method=5, max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=True,
+            fake_data,
+            method=5,
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=True,
         )
         captured = capsys.readouterr()
         assert "Component estimation" in captured.out
@@ -411,16 +463,28 @@ class TestEstimateICAComponentCount:
     def test_with_n_eff(self, fake_data):
         """n_eff parameter should not crash."""
         k, diag, info = estimate_ica_component_count(
-            fake_data, method="melodic", max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=False,
+            fake_data,
+            method="melodic",
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=False,
             n_eff=50,
         )
         assert k >= 1
 
     def test_capture_ppca_trace(self, fake_data):
         k, diag, info = estimate_ica_component_count(
-            fake_data, method="melodic", max_auto_components=20, auto_min_components=2,
-            auto_var_threshold=0.95, use_mp_prior=False, device=DEVICE, verbose=False,
+            fake_data,
+            method="melodic",
+            max_auto_components=20,
+            auto_min_components=2,
+            auto_var_threshold=0.95,
+            use_mp_prior=False,
+            device=DEVICE,
+            verbose=False,
             capture_ppca_trace=True,
         )
         assert "ppca_trace" in diag

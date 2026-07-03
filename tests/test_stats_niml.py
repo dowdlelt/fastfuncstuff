@@ -23,10 +23,10 @@ from fastfuncstuff.stats.niml import (
     write_mask_b64,
 )
 
-
 # ---------------------------------------------------------------------------
 # write_clustsim_niml — file format pinning
 # ---------------------------------------------------------------------------
+
 
 def _make_table(npthr: int = 3, nathr: int = 4) -> np.ndarray:
     rng = np.random.default_rng(0)
@@ -38,10 +38,13 @@ class TestWriteClustsimNiml:
         out = tmp_path / "n1.niml"
         table = _make_table(3, 4)
         write_clustsim_niml(
-            out, table,
-            nn=1, sidedness="1-sided",
+            out,
+            table,
+            nn=1,
+            sidedness="1-sided",
             commandline="ffs_perm -in x.nii.gz",
-            nxyz=(64, 64, 32), dxyz=(2.5, 2.5, 3.0),
+            nxyz=(64, 64, 32),
+            dxyz=(2.5, 2.5, 3.0),
             pthr=(0.05, 0.02, 0.01),
             athr=(0.10, 0.05, 0.02, 0.01),
             n_perms=1000,
@@ -66,11 +69,15 @@ class TestWriteClustsimNiml:
     def test_pthr_athr_format_six_decimals(self, tmp_path):
         out = tmp_path / "n1.niml"
         write_clustsim_niml(
-            out, _make_table(2, 2),
-            nn=1, sidedness="2-sided",
+            out,
+            _make_table(2, 2),
+            nn=1,
+            sidedness="2-sided",
             commandline="cmd",
-            nxyz=(1, 1, 1), dxyz=(1.0, 1.0, 1.0),
-            pthr=(0.05, 0.01), athr=(0.05, 0.01),
+            nxyz=(1, 1, 1),
+            dxyz=(1.0, 1.0, 1.0),
+            pthr=(0.05, 0.01),
+            athr=(0.05, 0.01),
             n_perms=10,
         )
         text = out.read_text()
@@ -83,11 +90,15 @@ class TestWriteClustsimNiml:
         With mask_count, it goes on the mask_count line."""
         out = tmp_path / "n1.niml"
         write_clustsim_niml(
-            out, _make_table(1, 1),
-            nn=1, sidedness="1-sided",
+            out,
+            _make_table(1, 1),
+            nn=1,
+            sidedness="1-sided",
             commandline="cmd",
-            nxyz=(1, 1, 1), dxyz=(1.0, 1.0, 1.0),
-            pthr=(0.05,), athr=(0.05,),
+            nxyz=(1, 1, 1),
+            dxyz=(1.0, 1.0, 1.0),
+            pthr=(0.05,),
+            athr=(0.05,),
             n_perms=1,
         )
         text = out.read_text()
@@ -100,12 +111,17 @@ class TestWriteClustsimNiml:
     def test_closing_bracket_with_mask_count(self, tmp_path):
         out = tmp_path / "n1.niml"
         write_clustsim_niml(
-            out, _make_table(1, 1),
-            nn=1, sidedness="1-sided",
+            out,
+            _make_table(1, 1),
+            nn=1,
+            sidedness="1-sided",
             commandline="cmd",
-            nxyz=(1, 1, 1), dxyz=(1.0, 1.0, 1.0),
-            pthr=(0.05,), athr=(0.05,),
-            n_perms=1, mask_count=42,
+            nxyz=(1, 1, 1),
+            dxyz=(1.0, 1.0, 1.0),
+            pthr=(0.05,),
+            athr=(0.05,),
+            n_perms=1,
+            mask_count=42,
         )
         text = out.read_text()
         lines = text.splitlines()
@@ -120,11 +136,15 @@ class TestWriteClustsimNiml:
         # Choose integer values so the _fmt path that emits int(v) fires.
         table = np.array([[1.0, 2.0], [3.0, 4.5]], dtype=np.float32)
         write_clustsim_niml(
-            out, table,
-            nn=2, sidedness="bi-sided",
+            out,
+            table,
+            nn=2,
+            sidedness="bi-sided",
             commandline="cmd",
-            nxyz=(1, 1, 1), dxyz=(1.0, 1.0, 1.0),
-            pthr=(0.05, 0.01), athr=(0.10, 0.05),
+            nxyz=(1, 1, 1),
+            dxyz=(1.0, 1.0, 1.0),
+            pthr=(0.05, 0.01),
+            athr=(0.10, 0.05),
             n_perms=1,
         )
         text = out.read_text()
@@ -137,11 +157,16 @@ class TestWriteClustsimNiml:
         for nn in (1, 2, 3):
             out = tmp_path / f"n{nn}.niml"
             write_clustsim_niml(
-                out, _make_table(1, 1),
-                nn=nn, sidedness="1-sided",
+                out,
+                _make_table(1, 1),
+                nn=nn,
+                sidedness="1-sided",
                 commandline="cmd",
-                nxyz=(1, 1, 1), dxyz=(1.0, 1.0, 1.0),
-                pthr=(0.05,), athr=(0.05,), n_perms=1,
+                nxyz=(1, 1, 1),
+                dxyz=(1.0, 1.0, 1.0),
+                pthr=(0.05,),
+                athr=(0.05,),
+                n_perms=1,
             )
             text = out.read_text()
             assert text.startswith(f"<3dClustSim_NN{nn}")
@@ -150,11 +175,16 @@ class TestWriteClustsimNiml:
     def test_optional_mask_attrs_emitted_when_present(self, tmp_path):
         out = tmp_path / "n1.niml"
         write_clustsim_niml(
-            out, _make_table(1, 1),
-            nn=1, sidedness="1-sided",
+            out,
+            _make_table(1, 1),
+            nn=1,
+            sidedness="1-sided",
             commandline="cmd",
-            nxyz=(1, 1, 1), dxyz=(1.0, 1.0, 1.0),
-            pthr=(0.05,), athr=(0.05,), n_perms=1,
+            nxyz=(1, 1, 1),
+            dxyz=(1.0, 1.0, 1.0),
+            pthr=(0.05,),
+            athr=(0.05,),
+            n_perms=1,
             mask_idcode="AFN_ABCDEFGH",
             mask_name="brain_mask.nii.gz",
         )
@@ -167,16 +197,23 @@ class TestWriteClustsimNiml:
         # Table is (3,4) but pthr/athr declare (2,3)
         with pytest.raises(ValueError, match="table shape"):
             write_clustsim_niml(
-                out, _make_table(3, 4),
-                nn=1, sidedness="1-sided", commandline="cmd",
-                nxyz=(1, 1, 1), dxyz=(1.0, 1.0, 1.0),
-                pthr=(0.05, 0.01), athr=(0.10, 0.05, 0.02), n_perms=1,
+                out,
+                _make_table(3, 4),
+                nn=1,
+                sidedness="1-sided",
+                commandline="cmd",
+                nxyz=(1, 1, 1),
+                dxyz=(1.0, 1.0, 1.0),
+                pthr=(0.05, 0.01),
+                athr=(0.10, 0.05, 0.02),
+                n_perms=1,
             )
 
 
 # ---------------------------------------------------------------------------
 # write_mask_b64 — round-trip AFNI's mask_to_b64string
 # ---------------------------------------------------------------------------
+
 
 def _decode_mask_b64(path: Path) -> tuple[np.ndarray, int]:
     """Invert write_mask_b64 to recover the bitmask and declared nvox."""
@@ -235,6 +272,7 @@ class TestWriteMaskB64:
 # resolve_mask_idcode — deterministic fallback when 3dinfo absent
 # ---------------------------------------------------------------------------
 
+
 class TestResolveMaskIdcode:
     def test_none_returns_stable_fallback(self):
         a = resolve_mask_idcode(None)
@@ -262,6 +300,7 @@ class TestResolveMaskIdcode:
 # ---------------------------------------------------------------------------
 # build_refit_commands — dispatch logic
 # ---------------------------------------------------------------------------
+
 
 class TestBuildRefitCommands:
     def test_atrstring_cmd_built_for_niml_files(self, tmp_path):

@@ -24,9 +24,9 @@ from fastfuncstuff.denoise.sequential import (
     fit_denoising_model,
     select_noise_pool_voxels,
 )
+from fastfuncstuff.design.hrf import get_canonical_hrf
 from fastfuncstuff.design.matrices import build_glm_design
 from fastfuncstuff.glm.core import construct_polynomial_matrix, fit_glm
-from fastfuncstuff.design.hrf import get_canonical_hrf
 from fastfuncstuff.simulation.core import simulate_fmri_run
 from fastfuncstuff.utils import get_device, scale_to_percent_signal
 
@@ -353,14 +353,18 @@ class TestCLIUtilityFunctions:
             expected = nuisance[start:end, :]
             expected = expected - expected.mean(dim=0, keepdim=True)
             assert torch.allclose(
-                run_nuisance, expected.to(run_nuisance.dtype), atol=1e-5,
+                run_nuisance,
+                expected.to(run_nuisance.dtype),
+                atol=1e-5,
             ), f"Run {i} not demeaned-equivalent to input slice"
 
         # Per-run output should be zero-mean (the whole point of the demean).
         for i, run_nuisance in enumerate(nuisance_per_run):
             col_means = run_nuisance.mean(dim=0)
             assert torch.allclose(
-                col_means, torch.zeros_like(col_means), atol=1e-5,
+                col_means,
+                torch.zeros_like(col_means),
+                atol=1e-5,
             ), f"Run {i} not zero-mean after build_nuisance_per_run"
 
     def test_select_noise_pool_with_ground_truth(self, device):

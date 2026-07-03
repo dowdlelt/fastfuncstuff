@@ -4,8 +4,8 @@ import torch
 
 from fastfuncstuff.stats.spatial import (
     consistency_report,
-    optimal_matching,
     one_to_many_correlation,
+    optimal_matching,
     spatial_correlation,
     spatial_correlation_matrix,
 )

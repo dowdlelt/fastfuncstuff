@@ -23,17 +23,17 @@ from fastfuncstuff.data_cache import (
     save_cache,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def dummy_inputs(tmp_path):
     """Create two dummy input files representing 'NIfTI runs'."""
     files = []
     for i in range(2):
-        p = tmp_path / f"run-{i+1}.nii.gz"
+        p = tmp_path / f"run-{i + 1}.nii.gz"
         p.write_bytes(b"fake nifti content " + bytes([i]))
         files.append(p)
     return files
@@ -53,6 +53,7 @@ def small_data():
 # ---------------------------------------------------------------------------
 # _compute_file_hash
 # ---------------------------------------------------------------------------
+
 
 class TestComputeFileHash:
     def test_deterministic_for_same_inputs(self, dummy_inputs):
@@ -75,6 +76,7 @@ class TestComputeFileHash:
         # Ensure mtime is actually different — some filesystems have coarse
         # mtime granularity, so force it.
         import os
+
         new_mtime = dummy_inputs[0].stat().st_mtime + 1
         os.utime(dummy_inputs[0], (new_mtime, new_mtime))
         h2 = _compute_file_hash(dummy_inputs)
@@ -98,6 +100,7 @@ class TestComputeFileHash:
 # save_cache / load_cache round-trip
 # ---------------------------------------------------------------------------
 
+
 class TestRoundTrip:
     def test_data_round_trip_exact(self, cache_file, dummy_inputs, small_data):
         save_cache(cache_file, small_data, dummy_inputs)
@@ -113,7 +116,9 @@ class TestRoundTrip:
         volume_shape = (5, 5, 2)
 
         save_cache(
-            cache_file, small_data, dummy_inputs,
+            cache_file,
+            small_data,
+            dummy_inputs,
             run_starts=run_starts,
             affine=affine,
             volume_shape=volume_shape,
@@ -159,11 +164,13 @@ class TestRoundTrip:
 # Invalidation
 # ---------------------------------------------------------------------------
 
+
 class TestInvalidation:
     def test_load_raises_when_inputs_changed(self, cache_file, dummy_inputs, small_data):
         save_cache(cache_file, small_data, dummy_inputs)
         # Bump mtime
         import os
+
         new_mtime = dummy_inputs[0].stat().st_mtime + 100
         os.utime(dummy_inputs[0], (new_mtime, new_mtime))
         with pytest.raises(ValueError, match="stale"):
@@ -172,6 +179,7 @@ class TestInvalidation:
     def test_load_validate_false_skips_check(self, cache_file, dummy_inputs, small_data):
         save_cache(cache_file, small_data, dummy_inputs)
         import os
+
         new_mtime = dummy_inputs[0].stat().st_mtime + 100
         os.utime(dummy_inputs[0], (new_mtime, new_mtime))
         # Should load successfully because validation is disabled
@@ -182,7 +190,9 @@ class TestInvalidation:
         with pytest.raises(FileNotFoundError):
             load_cache(cache_file)
 
-    def test_load_skips_validation_when_input_files_none(self, cache_file, dummy_inputs, small_data):
+    def test_load_skips_validation_when_input_files_none(
+        self, cache_file, dummy_inputs, small_data
+    ):
         save_cache(cache_file, small_data, dummy_inputs)
         # No input_files passed → validation skipped even if validate=True
         loaded, _ = load_cache(cache_file, input_files=None, validate=True)
@@ -192,6 +202,7 @@ class TestInvalidation:
 # ---------------------------------------------------------------------------
 # check_cache_valid
 # ---------------------------------------------------------------------------
+
 
 class TestCheckCacheValid:
     def test_returns_true_for_fresh_cache(self, cache_file, dummy_inputs, small_data):
@@ -204,6 +215,7 @@ class TestCheckCacheValid:
     def test_returns_false_for_stale_cache(self, cache_file, dummy_inputs, small_data):
         save_cache(cache_file, small_data, dummy_inputs)
         import os
+
         new_mtime = dummy_inputs[0].stat().st_mtime + 100
         os.utime(dummy_inputs[0], (new_mtime, new_mtime))
         assert check_cache_valid(cache_file, dummy_inputs) is False

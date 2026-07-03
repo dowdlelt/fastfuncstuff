@@ -6,8 +6,8 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-import torch
 import pytest
+import torch
 
 from fastfuncstuff.denoise.nordic import _optimal_shrinkage_weights
 from fastfuncstuff.denoise.sauna import (

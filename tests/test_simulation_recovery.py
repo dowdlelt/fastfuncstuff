@@ -155,8 +155,8 @@ def _build_design_and_signal(
 
     Returns (onset_matrix, design) where design is (n_tp_total, n_conditions).
     """
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
     from fastfuncstuff.design.builder import create_onset_matrix_microtime
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
 
     n_conditions = len(all_onsets)
     stim_durations = [stim_duration] * n_conditions
@@ -180,8 +180,8 @@ def _build_design_and_signal(
 
 def test_microtime_convolution_clips_hrf_at_run_boundaries():
     """HRF tails from one run must not bleed into the next when run_starts is provided."""
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
     from fastfuncstuff.design.builder import create_onset_matrix_microtime
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
 
     tr = 1.0
     microtime_dt = 0.1
@@ -387,9 +387,9 @@ class TestHRFRecovery:
         With 1 event the design is very sparse; with 20 events it may be dense.
         We only check that the function returns plausible outputs, not accuracy.
         """
-        from fastfuncstuff.design.matrices import convolve_hrf_microtime
         from fastfuncstuff.design.builder import create_onset_matrix_microtime
         from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
+        from fastfuncstuff.design.matrices import convolve_hrf_microtime
 
         n_runs = 4
         n_tp_run = 100
@@ -832,8 +832,8 @@ class TestDenoiseRecovery:
         Task voxels: strong task response + weak independent noise + weak shared PCs.
         Noise voxels: no task response + strong shared PCs + weak independent noise.
         """
-        from fastfuncstuff.design.matrices import convolve_hrf_microtime
         from fastfuncstuff.design.builder import create_onset_matrix_microtime
+        from fastfuncstuff.design.matrices import convolve_hrf_microtime
 
         rng = np.random.default_rng(seed)
         torch.manual_seed(seed)

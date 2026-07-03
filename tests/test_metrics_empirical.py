@@ -23,8 +23,8 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.design.matrices import convolve_hrf
 from fastfuncstuff.design.hrf import get_canonical_hrf
+from fastfuncstuff.design.matrices import convolve_hrf
 from fastfuncstuff.simulation.metrics_empirical import (
     build_ar1_covariance_matrix,
     compute_detection_power_empirical,

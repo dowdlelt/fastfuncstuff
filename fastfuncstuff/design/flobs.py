@@ -30,9 +30,10 @@ References
   Mirrored in this repo at raw_sources/FLOBS_filmbabe_tr04mw2.{pdf,txt}.
 - FSL FLOBS web tool: https://fsl.fmrib.ox.ac.uk/fsl/docs/task_fmri/flobs.html
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -232,31 +233,33 @@ def generate_flobs_basis(
     n_t = int(np.ceil(duration / dt))
     W = np.zeros((n_t, n_samples), dtype=np.float64)
     for i in range(n_samples):
-        h = pighs_halfcos(
-            m1=float(m1_vals[i]),
-            m2=float(m2_vals[i]),
-            m3=float(m3_vals[i]),
-            m4=float(m4_vals[i]),
-            c2=float(c2_vals[i]),
-            duration=duration,
-            sample_rate=dt,
-            device=torch.device("cpu"),
-        ).cpu().numpy()
+        h = (
+            pighs_halfcos(
+                m1=float(m1_vals[i]),
+                m2=float(m2_vals[i]),
+                m3=float(m3_vals[i]),
+                m4=float(m4_vals[i]),
+                c2=float(c2_vals[i]),
+                duration=duration,
+                sample_rate=dt,
+                device=torch.device("cpu"),
+            )
+            .cpu()
+            .numpy()
+        )
         # Truncate / pad to exactly n_t (pighs_halfcos uses arange
         # which can produce one fewer or more sample depending on
         # rounding).
         if h.size >= n_t:
             W[:, i] = h[:n_t]
         else:
-            W[:h.size, i] = h
+            W[: h.size, i] = h
 
     # SVD on the sample matrix.  full_matrices=False keeps U as
     # (n_t, min(n_t, n_s)); we just need the first n_basis columns.
     U, S, _ = np.linalg.svd(W, full_matrices=False)
     if n_basis > U.shape[1]:
-        raise ValueError(
-            f"n_basis={n_basis} exceeds available {U.shape[1]} singular vectors."
-        )
+        raise ValueError(f"n_basis={n_basis} exceeds available {U.shape[1]} singular vectors.")
 
     # Sign-align: each basis function should have a positive dominant
     # extremum.  Cosmetic but makes downstream plots / interpretation
@@ -269,14 +272,14 @@ def generate_flobs_basis(
     # come out scaled by σ_i (the singular value), and the prior
     # weight in :func:`fit_flobs_constrained` would need to absorb
     # that — much cleaner to fix it here.
-    G = U[:, :n_basis].copy()                # (n_t, n_basis), L2-unit cols
+    G = U[:, :n_basis].copy()  # (n_t, n_basis), L2-unit cols
     sign_flip = np.sign(G[np.argmax(np.abs(G), axis=0), np.arange(n_basis)])
     sign_flip = np.where(sign_flip == 0, 1.0, sign_flip)
     G = G * sign_flip[np.newaxis, :]
 
     # R = (G' G)^-1 G' W.  Since U is orthonormal, (G'G)^-1 = I and
     # R = G' W (cheaper, numerically cleaner).
-    R = G.T @ W                              # (n_basis, n_samples)
+    R = G.T @ W  # (n_basis, n_samples)
 
     # MVN(m, C) on the columns of R (each column is one sample's
     # basis-coefficient vector).
@@ -288,7 +291,7 @@ def generate_flobs_basis(
     C_mat = C_mat + 1e-12 * np.eye(n_basis)
 
     return FLOBSBasis(
-        basis_functions=G.T,                 # (n_basis, n_t) — row per basis
+        basis_functions=G.T,  # (n_basis, n_t) — row per basis
         eigenvalues=S,
         m=m_vec,
         C=C_mat,
@@ -343,7 +346,7 @@ def generate_spmg_basis(
         hrf_duration=duration,
         n_basis=n_basis,
         device=torch.device("cpu"),
-    )                                               # (n_basis, n_t)
+    )  # (n_basis, n_t)
     G = basis_set.cpu().numpy().astype(np.float64)
 
     # L2-normalize each row so the (m, C) numerics interoperate with
@@ -422,8 +425,8 @@ class FLOBSFitResult:
     n_iter: int = 1
     # Optional VB diagnostics — populated when the caller asks for them
     # via ``return_vb_diagnostics`` in :func:`fit_basis_constrained_ridge`.
-    sigma2_per_voxel: np.ndarray | None = None      # (n_vox,)
-    lambda_per_voxel: np.ndarray | None = None      # (n_vox,) effective λ used
+    sigma2_per_voxel: np.ndarray | None = None  # (n_vox,)
+    lambda_per_voxel: np.ndarray | None = None  # (n_vox,) effective λ used
 
 
 def fit_basis_constrained_ridge(
@@ -587,9 +590,7 @@ def fit_basis_constrained_ridge(
     # run the whole solver on CPU there (full-precision, just not accelerated).
     if device.type == "mps":
         warn_mps_cpu_fallback("FLOBS constrained-ridge")
-    device, data, design_task, nuisance = _cpu_if_mps(
-        device, data, design_task, nuisance
-    )
+    device, data, design_task, nuisance = _cpu_if_mps(device, data, design_task, nuisance)
 
     # Respect the caller's device choice.  Data on cuda stays on
     # cuda; data on CPU stays on CPU.  The chunked solver below
@@ -606,11 +607,7 @@ def fit_basis_constrained_ridge(
     # with ``.to(device=device, dtype=torch.float64)``, so the math
     # remains float64 where it matters; only the storage stays in
     # its original precision.
-    y = (
-        torch.as_tensor(data)
-        if not isinstance(data, torch.Tensor)
-        else data
-    )
+    y = torch.as_tensor(data) if not isinstance(data, torch.Tensor) else data
     X = (
         torch.as_tensor(design_task, dtype=torch.float64, device=device)
         if not isinstance(design_task, torch.Tensor)
@@ -622,9 +619,7 @@ def fit_basis_constrained_ridge(
         raise ValueError(f"design_task must be 2-D (n_t, n_cols); got {X.shape}")
     n_voxels, n_t = y.shape
     if X.shape[0] != n_t:
-        raise ValueError(
-            f"design_task has {X.shape[0]} rows but data has {n_t} timepoints"
-        )
+        raise ValueError(f"design_task has {X.shape[0]} rows but data has {n_t} timepoints")
 
     n_basis = basis_functions.shape[0]
     if X.shape[1] != n_blocks * n_basis:
@@ -634,13 +629,9 @@ def fit_basis_constrained_ridge(
             f"{n_blocks * n_basis}"
         )
     if prior_mean.shape != (n_basis,):
-        raise ValueError(
-            f"prior_mean must have shape ({n_basis},); got {prior_mean.shape}"
-        )
+        raise ValueError(f"prior_mean must have shape ({n_basis},); got {prior_mean.shape}")
     if prior_cov.shape != (n_basis, n_basis):
-        raise ValueError(
-            f"prior_cov must have shape ({n_basis}, {n_basis}); got {prior_cov.shape}"
-        )
+        raise ValueError(f"prior_cov must have shape ({n_basis}, {n_basis}); got {prior_cov.shape}")
 
     if nuisance is not None:
         Z = (
@@ -649,10 +640,7 @@ def fit_basis_constrained_ridge(
             else nuisance.to(device=device, dtype=torch.float64)
         )
         if Z.ndim != 2 or Z.shape[0] != n_t:
-            raise ValueError(
-                f"nuisance must be (n_t, n_nuisance) with n_t={n_t}; "
-                f"got {Z.shape}"
-            )
+            raise ValueError(f"nuisance must be (n_t, n_nuisance) with n_t={n_t}; got {Z.shape}")
         X_full = torch.cat([X, Z], dim=1)
     else:
         X_full = X
@@ -669,14 +657,14 @@ def fit_basis_constrained_ridge(
     P = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=device)
     for c in range(n_blocks):
         s = c * n_basis
-        P[s:s + n_basis, s:s + n_basis] = C_inv
+        P[s : s + n_basis, s : s + n_basis] = C_inv
 
     # Prior mean vector m̄ (size n_cols): stacked ``prior_mean`` for
     # each block (condition/trial), zeros for nuisance.
     m_torch = torch.from_numpy(prior_mean).to(device=device, dtype=torch.float64)
     m_bar = torch.zeros(n_cols, dtype=torch.float64, device=device)
     for c in range(n_blocks):
-        m_bar[c * n_basis:(c + 1) * n_basis] = m_torch
+        m_bar[c * n_basis : (c + 1) * n_basis] = m_torch
 
     # ---------------------------------------------------------------
     # Voxel-chunked two-pass solver.  We never materialise the full
@@ -706,6 +694,7 @@ def fit_basis_constrained_ridge(
         # predicted, float64) + n_cols × chunk × 8 (per-voxel betas).
         # ``estimate_chunk_size`` handles the per-device defaults.
         from fastfuncstuff.memory import estimate_chunk_size
+
         chunk_size = estimate_chunk_size(
             n_voxels=n_voxels,
             n_timepoints=n_t,
@@ -726,21 +715,26 @@ def fit_basis_constrained_ridge(
     n_chunks_p1 = (n_voxels + chunk_size - 1) // chunk_size
     for start in tqdm(
         range(0, n_voxels, chunk_size),
-        total=n_chunks_p1, desc="  Pass 1 (OLS)", unit="chunk",
-        leave=False, disable=n_chunks_p1 <= 1,
+        total=n_chunks_p1,
+        desc="  Pass 1 (OLS)",
+        unit="chunk",
+        leave=False,
+        disable=n_chunks_p1 <= 1,
     ):
         end = min(start + chunk_size, n_voxels)
         y_chunk = y[start:end].to(
-            device=device, dtype=torch.float64, non_blocking=True,
-        )                                                            # (chunk, n_t)
-        Xty_chunk = X_full.T @ y_chunk.T                          # (n_cols, chunk)
+            device=device,
+            dtype=torch.float64,
+            non_blocking=True,
+        )  # (chunk, n_t)
+        Xty_chunk = X_full.T @ y_chunk.T  # (n_cols, chunk)
         if use_chol_ols:
             beta_chunk = torch.cholesky_solve(Xty_chunk, L0)
         else:
             beta_chunk = torch.linalg.lstsq(X_full, y_chunk.T).solution
-        pred = (X_full @ beta_chunk).T                            # (chunk, n_t)
+        pred = (X_full @ beta_chunk).T  # (chunk, n_t)
         resid = y_chunk - pred
-        ss_res_chunk = (resid ** 2).sum(dim=1)
+        ss_res_chunk = (resid**2).sum(dim=1)
         y_mean = y_chunk.mean(dim=1, keepdim=True)
         ss_tot_chunk = ((y_chunk - y_mean) ** 2).sum(dim=1)
 
@@ -777,9 +771,7 @@ def fit_basis_constrained_ridge(
     # a global MULTIPLIER applied on top of σ²_v.  The CV grid still
     # works — it sweeps that multiplier.
     if lambda_mode not in ("global", "voxelwise"):
-        raise ValueError(
-            f"lambda_mode must be 'global' or 'voxelwise'; got {lambda_mode!r}"
-        )
+        raise ValueError(f"lambda_mode must be 'global' or 'voxelwise'; got {lambda_mode!r}")
 
     # prior_weight_per_voxel forces voxelwise mode regardless of caller
     # preference — the override is intrinsically per-voxel.
@@ -793,10 +785,8 @@ def fit_basis_constrained_ridge(
     # it: betas = beta_ols, ss_res = ss_res_ols.  Halves the per-call
     # work — which matters for LSS where we make N_trials such calls.
     # Also avoids the voxelwise σ²-binning machinery in that case.
-    _prior_is_zero = (
-        (not isinstance(prior_weight, str) and float(prior_weight) == 0.0)
-        or (prior_weight_per_voxel is not None
-            and not np.any(np.asarray(prior_weight_per_voxel)))
+    _prior_is_zero = (not isinstance(prior_weight, str) and float(prior_weight) == 0.0) or (
+        prior_weight_per_voxel is not None and not np.any(np.asarray(prior_weight_per_voxel))
     )
     if _prior_is_zero:
         betas_full.copy_(beta_ols_full)
@@ -811,7 +801,7 @@ def fit_basis_constrained_ridge(
     else:
         _skip_pass2 = False
 
-    Pm_unit = P @ m_bar                                            # (n_cols,)
+    Pm_unit = P @ m_bar  # (n_cols,)
 
     if _skip_pass2:
         # Fast path took it; betas / ss_res already populated above.
@@ -830,12 +820,17 @@ def fit_basis_constrained_ridge(
         n_chunks_p2 = (n_voxels + chunk_size - 1) // chunk_size
         for start in tqdm(
             range(0, n_voxels, chunk_size),
-            total=n_chunks_p2, desc="  Pass 2 (constrained)", unit="chunk",
-            leave=False, disable=n_chunks_p2 <= 1,
+            total=n_chunks_p2,
+            desc="  Pass 2 (constrained)",
+            unit="chunk",
+            leave=False,
+            disable=n_chunks_p2 <= 1,
         ):
             end = min(start + chunk_size, n_voxels)
             y_chunk = y[start:end].to(
-                device=device, dtype=torch.float64, non_blocking=True,
+                device=device,
+                dtype=torch.float64,
+                non_blocking=True,
             )
             Xty_chunk = X_full.T @ y_chunk.T
             rhs_chunk = Xty_chunk + Pm[:, None]
@@ -845,7 +840,7 @@ def fit_basis_constrained_ridge(
                 beta_chunk = torch.linalg.solve(A, rhs_chunk)
             pred = (X_full @ beta_chunk).T
             resid = y_chunk - pred
-            ss_res_chunk = (resid ** 2).sum(dim=1)
+            ss_res_chunk = (resid**2).sum(dim=1)
 
             betas_full[start:end] = beta_chunk.T.cpu()
             ss_res_constrained_full[start:end] = ss_res_chunk.cpu()
@@ -876,7 +871,7 @@ def fit_basis_constrained_ridge(
                 user_mult = 1.0
             else:
                 user_mult = float(prior_weight)
-            lambda_per_voxel_cpu = user_mult * sigma2_per_voxel        # (n_voxels,)
+            lambda_per_voxel_cpu = user_mult * sigma2_per_voxel  # (n_voxels,)
 
         # Quantile-bin: assign each voxel to one of ``lambda_n_bins``
         # bins by σ² quantile.  Within a bin use the bin's median λ
@@ -918,14 +913,19 @@ def fit_basis_constrained_ridge(
         n_chunks_p2v = (n_voxels + chunk_size - 1) // chunk_size
         for start in tqdm(
             range(0, n_voxels, chunk_size),
-            total=n_chunks_p2v, desc="  Pass 2 (voxelwise λ)", unit="chunk",
-            leave=False, disable=n_chunks_p2v <= 1,
+            total=n_chunks_p2v,
+            desc="  Pass 2 (voxelwise λ)",
+            unit="chunk",
+            leave=False,
+            disable=n_chunks_p2v <= 1,
         ):
             end = min(start + chunk_size, n_voxels)
             y_chunk = y[start:end].to(
-                device=device, dtype=torch.float64, non_blocking=True,
+                device=device,
+                dtype=torch.float64,
+                non_blocking=True,
             )
-            Xty_chunk = X_full.T @ y_chunk.T                       # (n_cols, chunk)
+            Xty_chunk = X_full.T @ y_chunk.T  # (n_cols, chunk)
             chunk_bins = voxel_bin[start:end].to(device)
             # Per-voxel Pm: lookup from Pm_per_bin via the bin index.
             # Shape: (n_cols, chunk).
@@ -948,7 +948,7 @@ def fit_basis_constrained_ridge(
                 beta_chunk[:, idx_in_chunk] = beta_b
             pred = (X_full @ beta_chunk).T
             resid = y_chunk - pred
-            ss_res_chunk = (resid ** 2).sum(dim=1)
+            ss_res_chunk = (resid**2).sum(dim=1)
 
             betas_full[start:end] = beta_chunk.T.cpu()
             ss_res_constrained_full[start:end] = ss_res_chunk.cpu()
@@ -965,7 +965,7 @@ def fit_basis_constrained_ridge(
     # mean R² printed downstream.  Detect them and report R² = 0
     # (uninformative); a downstream user-visible mask should drop
     # these voxels anyway.
-    _SS_TOT_MIN = 1e-6                     # well above float32 floor; well below real-data ss_tot
+    _SS_TOT_MIN = 1e-6  # well above float32 floor; well below real-data ss_tot
     _valid_mask = ss_tot_full > _SS_TOT_MIN
     r2 = torch.where(
         _valid_mask,
@@ -1001,16 +1001,16 @@ def fit_basis_constrained_ridge(
     # mode each voxel sees its bin's median λ (or, with the
     # ``prior_weight_per_voxel`` override, the exact value passed in).
     if return_vb_diagnostics:
-        sigma2_pv_np = (
-            (ss_res_ols_full / dof).clamp_min(1e-30).numpy().astype(np.float32)
-        )
+        sigma2_pv_np = (ss_res_ols_full / dof).clamp_min(1e-30).numpy().astype(np.float32)
         if lambda_mode == "voxelwise":
             # ``voxel_bin`` and ``bin_lambda`` are set in the voxelwise
             # branch above.  Map back: λ_v = bin_lambda[voxel_bin[v]].
             lambda_pv_np = bin_lambda[voxel_bin].numpy().astype(np.float32)
         else:
             lambda_pv_np = np.full(
-                (n_voxels,), float(effective_weight), dtype=np.float32,
+                (n_voxels,),
+                float(effective_weight),
+                dtype=np.float32,
             )
     else:
         sigma2_pv_np = None
@@ -1147,11 +1147,11 @@ def cv_basis_constrained_ridge(
     -------
     FLOBSCVResult
     """
+    from fastfuncstuff.design.builder import legendre_polynomials
     from fastfuncstuff.glm.xval import (
         generate_cv_splits,
         project_out_nuisance_per_run,
     )
-    from fastfuncstuff.design.builder import legendre_polynomials
 
     if device is None:
         device = get_device()
@@ -1179,9 +1179,7 @@ def cv_basis_constrained_ridge(
     # data_full:   (n_voxels, total_tp)
     data_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)
     n_voxels = data_full.shape[0]
-    design_full = torch.cat(
-        [t.to(device).float() for t in per_run_task_designs], dim=0
-    )
+    design_full = torch.cat([t.to(device).float() for t in per_run_task_designs], dim=0)
 
     # Per-run nuisance (polynomial detrend).  Project out from BOTH
     # data and task design once, up front — after this the design is
@@ -1189,8 +1187,7 @@ def cv_basis_constrained_ridge(
     # solve on the task block.
     if polort >= 0:
         nuisance_per_run = [
-            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort))
-            .to(device).float()
+            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(device).float()
             for r in range(n_runs)
         ]
         if verbose:
@@ -1224,8 +1221,7 @@ def cv_basis_constrained_ridge(
     if verbose:
         print(
             f"  CV: {n_splits} splits (leave-{leave_n_out}-out), "
-            f"{len(weight_grid)} prior weights"
-            + (" + OLS baseline" if include_ols else "") + "."
+            f"{len(weight_grid)} prior weights" + (" + OLS baseline" if include_ols else "") + "."
         )
 
     # Per-run boundary tensor for slicing.
@@ -1248,29 +1244,34 @@ def cv_basis_constrained_ridge(
     # folds in a single (n_voxels,) tensor — no full-prediction buffer
     # needed when LORO (each timepoint appears in exactly one fold).
     weights_iter = tqdm(
-        list(enumerate(weights_to_run)), total=n_weights,
-        desc="  CV weights", unit="weight",
-        leave=False, disable=(not verbose) or n_weights <= 1,
+        list(enumerate(weights_to_run)),
+        total=n_weights,
+        desc="  CV weights",
+        unit="weight",
+        leave=False,
+        disable=(not verbose) or n_weights <= 1,
     )
     for wi, w in weights_iter:
         ss_res_accum = torch.zeros(n_voxels, dtype=torch.float64, device=device)
         weights_iter.set_postfix_str("OLS" if w == "OLS" else f"λ×σ²={w}")
         for train_runs, test_runs in tqdm(
-            splits, total=n_splits, desc="    folds", unit="fold",
-            leave=False, disable=(not verbose) or n_splits <= 1,
+            splits,
+            total=n_splits,
+            desc="    folds",
+            unit="fold",
+            leave=False,
+            disable=(not verbose) or n_splits <= 1,
         ):
             # Build train / test row-index lists from run boundaries.
-            train_rows = torch.cat([
-                torch.arange(run_starts[r], run_ends[r], device=device)
-                for r in train_runs
-            ])
-            test_rows = torch.cat([
-                torch.arange(run_starts[r], run_ends[r], device=device)
-                for r in test_runs
-            ])
-            X_train = design_clean[train_rows]                 # (n_tp_train, n_task)
+            train_rows = torch.cat(
+                [torch.arange(run_starts[r], run_ends[r], device=device) for r in train_runs]
+            )
+            test_rows = torch.cat(
+                [torch.arange(run_starts[r], run_ends[r], device=device) for r in test_runs]
+            )
+            X_train = design_clean[train_rows]  # (n_tp_train, n_task)
             X_test = design_clean[test_rows]
-            y_train = data_clean[:, train_rows]                # (n_voxels, n_tp_train)
+            y_train = data_clean[:, train_rows]  # (n_voxels, n_tp_train)
             y_test = data_clean[:, test_rows]
 
             # Fit on train.  We treat the cleaned design as a single
@@ -1299,7 +1300,7 @@ def cv_basis_constrained_ridge(
                     prior_mean=prior_mean,
                     prior_cov=prior_cov,
                     n_blocks=n_blocks,
-                    nuisance=None,                         # already projected
+                    nuisance=None,  # already projected
                     prior_weight=float(w),
                     device=device,
                     reconstruct_hrfs=False,
@@ -1308,12 +1309,12 @@ def cv_basis_constrained_ridge(
                 )
                 # fit.betas is numpy float64 — cast to match X_test
                 # dtype so the matmul below works.
-                task_betas = torch.from_numpy(
-                    fit.betas[:, :n_task_cols]
-                ).to(device=device, dtype=X_test.dtype)
+                task_betas = torch.from_numpy(fit.betas[:, :n_task_cols]).to(
+                    device=device, dtype=X_test.dtype
+                )
 
             # Predict cleaned test data using TASK betas only.
-            y_test_pred = task_betas @ X_test.T              # (n_voxels, n_tp_test)
+            y_test_pred = task_betas @ X_test.T  # (n_voxels, n_tp_test)
             ss_res_split = ((y_test - y_test_pred) ** 2).sum(dim=1)
             ss_res_accum += ss_res_split.double()
             del X_train, X_test, y_train, y_test, task_betas, y_test_pred, ss_res_split
@@ -1397,10 +1398,10 @@ def fit_basis_lss(
     lambda_mode: str = "global",
     lambda_n_bins: int = 20,
     lss_exclude: list[str] | None = None,
-    lsa_fit: "FLOBSFitResult | None" = None,
+    lsa_fit: FLOBSFitResult | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
-) -> "FLOBSFitResult":
+) -> FLOBSFitResult:
     """Least-Squares-Separate single-trial fit (LSS).
 
     Per-trial estimator commonly used in single-trial fMRI work
@@ -1439,16 +1440,14 @@ def fit_basis_lss(
     entries are the per-trial task betas (LSS for non-excluded
     trials, LSA for excluded), then per-run polynomial nuisance.
     """
-    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
     from fastfuncstuff.design.builder import legendre_polynomials
+    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
 
     if device is None:
         device = get_device()
     if device.type == "mps":
         warn_mps_cpu_fallback("FLOBS LSS")
-    device, per_run_data, per_run_designs = _cpu_if_mps(
-        device, per_run_data, per_run_designs
-    )
+    device, per_run_data, per_run_designs = _cpu_if_mps(device, per_run_data, per_run_designs)
     if lss_exclude is None:
         lss_exclude = []
     excluded_set = set(lss_exclude)
@@ -1483,28 +1482,35 @@ def fit_basis_lss(
     # to avoid redundant work; otherwise we run it here.
     if lsa_fit is None:
         if verbose:
-            print("  LSS: running LSA pre-fit (provides σ²_v, excluded "
-                  "conditions' main betas, and unconstrained baseline)…")
+            print(
+                "  LSS: running LSA pre-fit (provides σ²_v, excluded "
+                "conditions' main betas, and unconstrained baseline)…"
+            )
         from fastfuncstuff.design.builder import pack_for_shared_task_glm
+
         packed_lsa = pack_for_shared_task_glm(
             per_run_data=per_run_data,
             per_run_task_designs=per_run_designs,
-            polort=polort, device=device,
+            polort=polort,
+            device=device,
         )
         lsa_fit = fit_basis_constrained_ridge(
             data=packed_lsa.data_concat,
             design_task=packed_lsa.design_concat[:, :n_task_cols_full],
             basis_functions=basis_functions,
-            prior_mean=prior_mean, prior_cov=prior_cov,
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
             n_blocks=n_blocks,
             nuisance=(
                 packed_lsa.design_concat[:, n_task_cols_full:]
                 if packed_lsa.design_concat.shape[1] > n_task_cols_full
                 else None
             ),
-            prior_weight=prior_weight, device=device,
+            prior_weight=prior_weight,
+            device=device,
             reconstruct_hrfs=False,
-            lambda_mode=lambda_mode, lambda_n_bins=lambda_n_bins,
+            lambda_mode=lambda_mode,
+            lambda_n_bins=lambda_n_bins,
             return_vb_diagnostics=True,
         )
         del packed_lsa
@@ -1521,7 +1527,9 @@ def fit_basis_lss(
             # Caller passed an lsa_fit without diagnostics — fall back to a
             # uniform σ²_mean.  Less Bayesian-honest but won't crash.
             sigma2_per_voxel = np.full(
-                n_voxels, float(lsa_fit.sigma2_mean), dtype=np.float32,
+                n_voxels,
+                float(lsa_fit.sigma2_mean),
+                dtype=np.float32,
             )
 
     # ── Project per-run polys out of data + per-trial designs ───────
@@ -1530,16 +1538,18 @@ def fit_basis_lss(
     # per-trial task block as ``task`` and the rest of the trial's
     # design as ``nuisance`` (un-penalised).
     data_full = torch.cat(
-        [d.to(device).float() for d in per_run_data], dim=1,
-    )                                                            # (n_vox, total_tp)
+        [d.to(device).float() for d in per_run_data],
+        dim=1,
+    )  # (n_vox, total_tp)
     design_full = torch.cat(
-        [d.to(device).float() for d in per_run_designs], dim=0,
-    )                                                            # (total_tp, n_blocks*K)
+        [d.to(device).float() for d in per_run_designs],
+        dim=0,
+    )  # (total_tp, n_blocks*K)
     if polort >= 0:
         nuisance_per_run = [
-            torch.from_numpy(
-                legendre_polynomials(n_tp_per_run[r], polort)
-            ).to(device=device, dtype=torch.float32)
+            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
+                device=device, dtype=torch.float32
+            )
             for r in range(n_runs)
         ]
         if verbose:
@@ -1548,9 +1558,12 @@ def fit_basis_lss(
                 f"(polort={polort}, {polort + 1} cols × {n_runs} runs)…"
             )
         data_clean, design_clean = project_out_nuisance_per_run(
-            data=data_full, design=design_full,
+            data=data_full,
+            design=design_full,
             nuisance_per_run=nuisance_per_run,
-            run_starts=run_starts, device=device, verbose=False,
+            run_starts=run_starts,
+            device=device,
+            verbose=False,
         )
         if data_clean.device != device:
             data_clean = data_clean.to(device)
@@ -1567,15 +1580,21 @@ def fit_basis_lss(
         block_ids = cond_to_blocks[c]
         if not block_ids:
             cond_full_designs[c] = torch.zeros(
-                total_tp, n_basis, device=device, dtype=torch.float32,
+                total_tp,
+                n_basis,
+                device=device,
+                dtype=torch.float32,
             )
             continue
         # Slice design_clean columns for this cond's blocks and sum.
         accum = torch.zeros(
-            total_tp, n_basis, device=device, dtype=torch.float32,
+            total_tp,
+            n_basis,
+            device=device,
+            dtype=torch.float32,
         )
         for b in block_ids:
-            accum = accum + design_clean[:, b * n_basis:(b + 1) * n_basis]
+            accum = accum + design_clean[:, b * n_basis : (b + 1) * n_basis]
         cond_full_designs[c] = accum
 
     # Initialize result betas from LSA — excluded conds keep their LSA
@@ -1598,8 +1617,7 @@ def fit_basis_lss(
     if verbose:
         n_excluded_blocks = n_blocks - len(non_excluded_blocks)
         excluded_str = (
-            f"; {n_excluded_blocks} excluded-cond blocks keep LSA betas"
-            if excluded_set else ""
+            f"; {n_excluded_blocks} excluded-cond blocks keep LSA betas" if excluded_set else ""
         )
         print(
             f"  LSS: fitting {len(non_excluded_blocks)} trials "
@@ -1627,16 +1645,19 @@ def fit_basis_lss(
     # Prior tensors on device when needed.
     if user_mult > 0:
         C_inv_t = torch.from_numpy(np.linalg.inv(prior_cov)).to(
-            device=device, dtype=torch.float32,
+            device=device,
+            dtype=torch.float32,
         )
         m_t = torch.from_numpy(prior_mean).to(
-            device=device, dtype=torch.float32,
+            device=device,
+            dtype=torch.float32,
         )
         # Per-voxel λ_v and quantile bins (same as voxelwise solver).
         # Used only when the caller asked for voxelwise mode; in
         # global mode we use a single bin with σ²_mean as λ.
         sigma2_v_t = torch.from_numpy(sigma2_per_voxel).to(
-            device=device, dtype=torch.float32,
+            device=device,
+            dtype=torch.float32,
         )
         lambda_per_voxel = (user_mult * sigma2_v_t).clamp_min(0.0)
         if lambda_mode == "voxelwise":
@@ -1644,7 +1665,8 @@ def fit_basis_lss(
             if n_bins_eff > 1:
                 qs = torch.linspace(0.0, 1.0, n_bins_eff + 1)[1:-1]
                 edges = torch.quantile(
-                    lambda_per_voxel, qs.to(lambda_per_voxel.dtype),
+                    lambda_per_voxel,
+                    qs.to(lambda_per_voxel.dtype),
                 )
                 voxel_bin = torch.bucketize(lambda_per_voxel, edges)
             else:
@@ -1653,15 +1675,15 @@ def fit_basis_lss(
             for b_idx in range(n_bins_eff):
                 mask_b = voxel_bin == b_idx
                 bin_lambdas[b_idx] = (
-                    lambda_per_voxel[mask_b].median()
-                    if mask_b.any() else torch.tensor(0.0)
+                    lambda_per_voxel[mask_b].median() if mask_b.any() else torch.tensor(0.0)
                 )
         else:
             n_bins_eff = 1
             voxel_bin = torch.zeros(n_voxels, dtype=torch.long, device=device)
             bin_lambdas = torch.tensor(
                 [float(lambda_per_voxel.mean().item())],
-                device=device, dtype=torch.float32,
+                device=device,
+                dtype=torch.float32,
             )
     else:
         C_inv_t = None
@@ -1672,12 +1694,13 @@ def fit_basis_lss(
 
     # Group blocks by their parent condition for the outer loop.
     non_excluded_conds: list[str] = [
-        c for c in condition_labels
-        if c not in excluded_set and cond_to_blocks[c]
+        c for c in condition_labels if c not in excluded_set and cond_to_blocks[c]
     ]
     cond_iter = tqdm(
-        non_excluded_conds, total=len(non_excluded_conds),
-        desc="  LSS conds × batched solve", unit="cond",
+        non_excluded_conds,
+        total=len(non_excluded_conds),
+        desc="  LSS conds × batched solve",
+        unit="cond",
         leave=False,
         disable=(not verbose) or len(non_excluded_conds) <= 1,
     )
@@ -1688,29 +1711,29 @@ def fit_basis_lss(
             continue
         other_conds = [c for c in condition_labels if c != cond_label]
         n_other = len(other_conds)
-        K_total = n_basis * (2 + n_other)               # trial + rest + per-other-cond
+        K_total = n_basis * (2 + n_other)  # trial + rest + per-other-cond
 
         # Build the batched design ``X_batch`` on device:
         #   cols [0:K]   = this trial's K cols (per-trial slice)
         #   cols [K:2K]  = cond_full − trial            (per-trial)
         #   cols [2K:]   = per-other-cond aggregates    (CONSTANT across trials)
         X_batch = torch.empty(
-            N_c, total_tp, K_total,
-            device=device, dtype=torch.float32,
+            N_c,
+            total_tp,
+            K_total,
+            device=device,
+            dtype=torch.float32,
         )
         for n, b in enumerate(cond_blocks):
             X_batch[n, :, :n_basis] = design_clean[
-                :, b * n_basis:(b + 1) * n_basis,
+                :,
+                b * n_basis : (b + 1) * n_basis,
             ]
-        cond_full_c = cond_full_designs[cond_label]      # (T, K)
-        X_batch[:, :, n_basis:2 * n_basis] = (
-            cond_full_c.unsqueeze(0) - X_batch[:, :, :n_basis]
-        )
+        cond_full_c = cond_full_designs[cond_label]  # (T, K)
+        X_batch[:, :, n_basis : 2 * n_basis] = cond_full_c.unsqueeze(0) - X_batch[:, :, :n_basis]
         offset = 2 * n_basis
         for other_c in other_conds:
-            X_batch[:, :, offset:offset + n_basis] = (
-                cond_full_designs[other_c]
-            )
+            X_batch[:, :, offset : offset + n_basis] = cond_full_designs[other_c]
             offset += n_basis
 
         # Batched A = X.T X (shared across voxels — depends only on
@@ -1720,7 +1743,10 @@ def fit_basis_lss(
         # Per-bin: A_bin = A_batch_base + λ_b · P_trial (penalty on
         # first K rows/cols only).  Pre-factor one Cholesky per bin.
         P_trial = torch.zeros(
-            K_total, K_total, device=device, dtype=torch.float32,
+            K_total,
+            K_total,
+            device=device,
+            dtype=torch.float32,
         )
         if C_inv_t is not None:
             P_trial[:n_basis, :n_basis] = C_inv_t
@@ -1728,7 +1754,7 @@ def fit_basis_lss(
         if C_inv_t is not None and m_t is not None:
             # λ_b · (C⁻¹ · m) for the prior-mean contribution to
             # the RHS, broadcast per bin.  (n_bins, K)
-            Pm_unit = C_inv_t @ m_t                            # (K,)
+            Pm_unit = C_inv_t @ m_t  # (K,)
             Pm_first_K_per_bin = bin_lambdas.unsqueeze(-1) * Pm_unit.unsqueeze(0)
 
         L_per_bin: list[torch.Tensor] = []
@@ -1741,7 +1767,7 @@ def fit_basis_lss(
                 # any positive λ; possible for -reg none + degenerate
                 # design.  Synthesize a "Cholesky" by computing
                 # solve directly later via torch.linalg.solve.
-                L_per_bin.append(None)                          # type: ignore[arg-type]
+                L_per_bin.append(None)  # type: ignore[arg-type]
 
         # ── Voxel-chunked batched solve ──────────────────────────
         # Per-voxel memory cost during the batched solve:
@@ -1758,6 +1784,7 @@ def fit_basis_lss(
         # all scaled by N_c).  Captures T (timepoints), K_total
         # (regressors per trial), and N_c (trials in this condition).
         from fastfuncstuff.memory import estimate_chunk_size
+
         chunk_size_lss = estimate_chunk_size(
             n_voxels=n_voxels,
             n_timepoints=total_tp,
@@ -1780,7 +1807,7 @@ def fit_basis_lss(
                 vox_local = torch.where(in_bin_mask)[0]
                 vox_global = vox_local + v0
                 # Slice this bin's voxels (data on device).
-                y_chunk_b = data_clean[vox_global]                   # (V_b, T)
+                y_chunk_b = data_clean[vox_global]  # (V_b, T)
                 # Batched RHS: (N_c, K_total, V_b).  Cast to float64
                 # only for the BLAS-3 step that needs it.
                 Xty = torch.einsum(
@@ -1798,9 +1825,9 @@ def fit_basis_lss(
                     beta_batch = torch.cholesky_solve(Xty, L_b.to(torch.float64))
                 else:
                     # Fall back to direct solve (slower; only on singular A).
-                    A_bin_64 = (
-                        A_batch_base + float(bin_lambdas[b_idx]) * P_trial
-                    ).to(torch.float64)
+                    A_bin_64 = (A_batch_base + float(bin_lambdas[b_idx]) * P_trial).to(
+                        torch.float64
+                    )
                     beta_batch = torch.linalg.solve(A_bin_64, Xty)
                 # Extract trial betas (first K rows): (N_c, K, V_b).
                 trial_betas = beta_batch[:, :n_basis, :].cpu().numpy()
@@ -1810,7 +1837,8 @@ def fit_basis_lss(
                     # trial_betas[n] is (K, V_b) → write transpose into
                     # betas_full[vox_global, b_global*K:(b_global+1)*K].
                     betas_full[
-                        vox_global_np, b_global * n_basis:(b_global + 1) * n_basis,
+                        vox_global_np,
+                        b_global * n_basis : (b_global + 1) * n_basis,
                     ] = trial_betas[n].T
                 del Xty, beta_batch, trial_betas, y_chunk_b
 
@@ -1828,10 +1856,10 @@ def fit_basis_lss(
     # out comparison the caller should use -xval-r2.
     return FLOBSFitResult(
         betas=betas_full,
-        hrfs=None,                                  # type: ignore[arg-type]
-        r2=lsa_fit.r2,                               # see above
+        hrfs=None,  # type: ignore[arg-type]
+        r2=lsa_fit.r2,  # see above
         betas_ols=betas_ols_full,
-        hrfs_ols=None,                              # type: ignore[arg-type]
+        hrfs_ols=None,  # type: ignore[arg-type]
         r2_ols=lsa_fit.r2_ols,
         sigma2_mean=lsa_fit.sigma2_mean,
         effective_prior_weight=lsa_fit.effective_prior_weight,
@@ -1876,12 +1904,12 @@ def fit_basis_fracridge(
     -------
     FracRidgeFitResult
     """
+    from fastfuncstuff.design.builder import legendre_polynomials
     from fastfuncstuff.glm.ridge import _fit_ridge_multiple_fracs
     from fastfuncstuff.glm.xval import (
         generate_cv_splits,
         project_out_nuisance_per_run,
     )
-    from fastfuncstuff.design.builder import legendre_polynomials
 
     if device is None:
         device = get_device()
@@ -1908,14 +1936,11 @@ def fit_basis_fracridge(
 
     data_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)
     n_voxels = data_full.shape[0]
-    design_full = torch.cat(
-        [t.to(device).float() for t in per_run_task_designs], dim=0
-    )
+    design_full = torch.cat([t.to(device).float() for t in per_run_task_designs], dim=0)
 
     if polort >= 0:
         nuisance_per_run = [
-            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort))
-            .to(device).float()
+            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(device).float()
             for r in range(n_runs)
         ]
         if verbose:
@@ -1985,6 +2010,7 @@ def fit_basis_fracridge(
     # captures both the SVD-pass coefs tensor and the prediction
     # pass's per-frac materialisation.
     from fastfuncstuff.memory import estimate_chunk_size
+
     v_chunk = estimate_chunk_size(
         n_voxels=n_voxels,
         n_timepoints=n_tp_test_max,
@@ -2002,23 +2028,24 @@ def fit_basis_fracridge(
         )
 
     splits_iter = tqdm(
-        splits, total=n_splits,
-        desc="  fracridge LORO", unit="fold",
-        leave=False, disable=(not verbose) or n_splits <= 1,
+        splits,
+        total=n_splits,
+        desc="  fracridge LORO",
+        unit="fold",
+        leave=False,
+        disable=(not verbose) or n_splits <= 1,
     )
     for train_runs, test_runs in splits_iter:
-        train_rows = torch.cat([
-            torch.arange(run_starts[r], run_ends[r], device=device)
-            for r in train_runs
-        ])
-        test_rows = torch.cat([
-            torch.arange(run_starts[r], run_ends[r], device=device)
-            for r in test_runs
-        ])
-        X_train = design_clean[train_rows]                  # (n_tp_tr, n_task)
-        X_test = design_clean[test_rows]                    # (n_tp_te, n_task)
-        y_train = data_clean[:, train_rows]                 # (n_voxels, n_tp_tr)
-        y_test = data_clean[:, test_rows]                   # (n_voxels, n_tp_te)
+        train_rows = torch.cat(
+            [torch.arange(run_starts[r], run_ends[r], device=device) for r in train_runs]
+        )
+        test_rows = torch.cat(
+            [torch.arange(run_starts[r], run_ends[r], device=device) for r in test_runs]
+        )
+        X_train = design_clean[train_rows]  # (n_tp_tr, n_task)
+        X_test = design_clean[test_rows]  # (n_tp_te, n_task)
+        y_train = data_clean[:, train_rows]  # (n_voxels, n_tp_tr)
+        y_test = data_clean[:, test_rows]  # (n_voxels, n_tp_te)
 
         # _fit_ridge_multiple_fracs expects y as (n_samples, n_targets).
         # On cuda we pass chunk_size to keep ``Vt.T @ ridge_flat``
@@ -2027,10 +2054,13 @@ def fit_basis_fracridge(
         # on CPU; we move slices to device during prediction.
         use_chunked = device.type == "cuda" and v_chunk < n_voxels
         coefs = _fit_ridge_multiple_fracs(
-            X=X_train, y=y_train.T, fracs=fracs, device=device,
+            X=X_train,
+            y=y_train.T,
+            fracs=fracs,
+            device=device,
             chunk_size=(v_chunk if use_chunked else None),
-        )                                                   # (n_task, n_fracs, n_voxels)
-        coefs_on_cpu = use_chunked                          # tracks where coefs live
+        )  # (n_task, n_fracs, n_voxels)
+        coefs_on_cpu = use_chunked  # tracks where coefs live
 
         # Chunked prediction: einsum materialises a (T, F, V) tensor
         # which is ~3.5 GB for 9.4T-scale data and 10 fracs.  Loop
@@ -2039,14 +2069,16 @@ def fit_basis_fracridge(
         # before the einsum.
         for v0 in range(0, n_voxels, v_chunk):
             v1 = min(v0 + v_chunk, n_voxels)
-            coefs_chunk = coefs[:, :, v0:v1]                # (n_task, n_fracs, V_c)
+            coefs_chunk = coefs[:, :, v0:v1]  # (n_task, n_fracs, V_c)
             if coefs_on_cpu:
                 coefs_chunk = coefs_chunk.to(device, non_blocking=True)
             y_pred = torch.einsum(
-                "tf,fkv->tkv", X_test, coefs_chunk,
-            )                                               # (T, n_fracs, V_c)
+                "tf,fkv->tkv",
+                X_test,
+                coefs_chunk,
+            )  # (T, n_fracs, V_c)
             resid = y_test[v0:v1].T.unsqueeze(1) - y_pred
-            ss_res_accum[:, v0:v1] += (resid ** 2).sum(dim=0).double()
+            ss_res_accum[:, v0:v1] += (resid**2).sum(dim=0).double()
             del coefs_chunk, y_pred, resid
 
         del X_train, X_test, y_train, y_test, coefs
@@ -2057,24 +2089,24 @@ def fit_basis_fracridge(
     r2_by_frac_t = 1.0 - ss_res_accum / torch.clamp(ss_tot_full.unsqueeze(0), min=1e-30)
     r2_by_frac = r2_by_frac_t.cpu().numpy().T.astype(np.float32)  # (V, n_fracs)
 
-    optimal_fracs_idx = np.argmax(r2_by_frac, axis=1)               # (V,)
+    optimal_fracs_idx = np.argmax(r2_by_frac, axis=1)  # (V,)
     optimal_fracs = fracs[optimal_fracs_idx].astype(np.float32)
     r2_optimal = r2_by_frac[np.arange(n_voxels), optimal_fracs_idx]
 
     # ── Final fit on full cleaned data, all fracs ────────────────────
     if verbose:
-        print(
-            f"  fracridge: final SVD fit on full data ({n_voxels:,} "
-            f"voxels × {n_fracs} fracs)…"
-        )
+        print(f"  fracridge: final SVD fit on full data ({n_voxels:,} voxels × {n_fracs} fracs)…")
     # Same VRAM constraint as the LORO fit — use the chunked path on
     # cuda.  Result is on CPU, so the gather + numpy-cast at the end
     # happens on host (no extra D→H transfer beyond the final betas).
     use_chunked_final = device.type == "cuda" and v_chunk < n_voxels
     final_coefs = _fit_ridge_multiple_fracs(
-        X=design_clean, y=data_clean.T, fracs=fracs, device=device,
+        X=design_clean,
+        y=data_clean.T,
+        fracs=fracs,
+        device=device,
         chunk_size=(v_chunk if use_chunked_final else None),
-    )                                                       # (n_task, n_fracs, n_voxels)
+    )  # (n_task, n_fracs, n_voxels)
 
     # Gather per-voxel optimal frac.  When the SVD path was chunked,
     # final_coefs lives on CPU; do gather on CPU too.
@@ -2082,12 +2114,16 @@ def fit_basis_fracridge(
         opt_idx_t = torch.from_numpy(optimal_fracs_idx).long()
     else:
         opt_idx_t = torch.from_numpy(optimal_fracs_idx).to(
-            device=device, dtype=torch.long,
+            device=device,
+            dtype=torch.long,
         )
     gather_idx = opt_idx_t.view(1, 1, -1).expand(n_task_cols, 1, -1)
     betas_opt = final_coefs.gather(1, gather_idx).squeeze(1)  # (n_task, n_voxels)
-    betas = betas_opt.T.cpu().numpy().astype(np.float64) if betas_opt.is_cuda \
-        else betas_opt.T.numpy().astype(np.float64)           # (n_voxels, n_task)
+    betas = (
+        betas_opt.T.cpu().numpy().astype(np.float64)
+        if betas_opt.is_cuda
+        else betas_opt.T.numpy().astype(np.float64)
+    )  # (n_voxels, n_task)
 
     # OLS baseline = frac=1.0 coefficients (last entry if grid ends at 1.0).
     if np.isclose(fracs[-1], 1.0):
@@ -2116,14 +2152,15 @@ def fit_basis_fracridge(
     dof = max(1, n_total_tp - n_task_cols)
     sigma2_sum = 0.0
     betas_ols_t = torch.from_numpy(betas_ols).to(
-        device=device, dtype=design_clean.dtype,
+        device=device,
+        dtype=design_clean.dtype,
     )
-    Xt = design_clean.T                                     # (n_task, n_t)
+    Xt = design_clean.T  # (n_task, n_t)
     for v0 in range(0, n_voxels, v_chunk):
         v1 = min(v0 + v_chunk, n_voxels)
-        y_pred_chunk = betas_ols_t[v0:v1] @ Xt              # (V_c, n_t)
+        y_pred_chunk = betas_ols_t[v0:v1] @ Xt  # (V_c, n_t)
         resid_chunk = data_clean[v0:v1] - y_pred_chunk
-        sigma2_sum += float((resid_chunk ** 2).sum().item()) / dof
+        sigma2_sum += float((resid_chunk**2).sum().item()) / dof
         del y_pred_chunk, resid_chunk
     sigma2_mean = sigma2_sum / max(1, n_voxels)
     del betas_ols_t, Xt
@@ -2208,12 +2245,12 @@ def estimate_arma11_per_voxel(
     Returns ``(n_voxels, 2)`` of grid-snapped ``(a, b)`` per voxel —
     suitable as input to :func:`bin_and_whiten_arma11`.
     """
+    from fastfuncstuff.design.builder import legendre_polynomials
     from fastfuncstuff.glm.arma import (
         get_default_arma_grids,
         precompute_reml_grid,
         search_voxels_precomputed_grid,
     )
-    from fastfuncstuff.design.builder import legendre_polynomials
 
     if device is None:
         device = get_device()
@@ -2228,29 +2265,30 @@ def estimate_arma11_per_voxel(
     # Concat task design row-wise (shared task across runs).
     design_task = torch.cat(
         [t.to(device).float() for t in per_run_task_designs], dim=0
-    )                                                          # (total_tp, n_task)
+    )  # (total_tp, n_task)
 
     # Build block-diagonal polynomial nuisance and concatenate.
     if polort >= 0:
         n_poly = polort + 1
         Z_full = torch.zeros(
-            total_tp, n_runs * n_poly, device=device, dtype=torch.float32,
+            total_tp,
+            n_runs * n_poly,
+            device=device,
+            dtype=torch.float32,
         )
         for r in range(n_runs):
-            Z_r = torch.from_numpy(
-                legendre_polynomials(n_tp_per_run[r], polort)
-            ).to(device=device, dtype=torch.float32)
+            Z_r = torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
+                device=device, dtype=torch.float32
+            )
             Z_full[
-                run_starts[r]:run_starts[r] + n_tp_per_run[r],
-                r * n_poly:(r + 1) * n_poly,
+                run_starts[r] : run_starts[r] + n_tp_per_run[r],
+                r * n_poly : (r + 1) * n_poly,
             ] = Z_r
         X_full = torch.cat([design_task, Z_full], dim=1)
     else:
         X_full = design_task
 
-    Y_full = torch.cat(
-        [d.to(device).float() for d in per_run_data], dim=1
-    )                                                          # (n_vox, total_tp)
+    Y_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)  # (n_vox, total_tp)
     n_voxels = Y_full.shape[0]
 
     a_grid, b_grid = get_default_arma_grids(device)
@@ -2281,8 +2319,9 @@ def estimate_arma11_per_voxel(
     except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
         # OOM on GPU — fall back to CPU precompute, then move per-cell
         # entries to device inside the search loop.
-        if grid_on_gpu and ("out of memory" in str(e).lower() or
-                            isinstance(e, torch.cuda.OutOfMemoryError)):
+        if grid_on_gpu and (
+            "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError)
+        ):
             if verbose:
                 print(
                     "  per-voxel ARMA: GPU precompute OOM; falling back "
@@ -2335,6 +2374,7 @@ def estimate_arma11_per_voxel(
     # CPU/GPU thresholds, safety factors, and per-op memory models
     # are all in one place.  See bytes_per_voxel_arma_search.
     from fastfuncstuff.memory import estimate_chunk_size
+
     n_vox_batch = estimate_chunk_size(
         n_voxels=n_voxels,
         n_timepoints=total_tp,
@@ -2355,9 +2395,12 @@ def estimate_arma11_per_voxel(
 
     best_params = torch.empty(n_voxels, 2, dtype=Y_search.dtype)
     batch_iter = tqdm(
-        range(n_batches), total=n_batches,
-        desc="  REML search batches", unit="batch",
-        leave=False, disable=(not verbose) or n_batches <= 1,
+        range(n_batches),
+        total=n_batches,
+        desc="  REML search batches",
+        unit="batch",
+        leave=False,
+        disable=(not verbose) or n_batches <= 1,
     )
     for batch_idx in batch_iter:
         b0 = batch_idx * n_vox_batch
@@ -2399,11 +2442,11 @@ def bin_and_whiten_arma11(
     n_t))`` launch on GPU instead of ``n_cells × n_runs`` separate
     CPU calls.
     """
+    from fastfuncstuff.design.builder import legendre_polynomials
     from fastfuncstuff.glm.arma import (
         build_arma11_covariance,
         build_arma11_covariance_batch,
     )
-    from fastfuncstuff.design.builder import legendre_polynomials
 
     if device is None:
         device = get_device()
@@ -2411,25 +2454,21 @@ def bin_and_whiten_arma11(
     n_runs = len(per_run_data)
     n_tp_per_run = [d.shape[1] for d in per_run_data]
     if arma_per_voxel.shape[1] != 2:
-        raise ValueError(
-            f"arma_per_voxel must be (n_voxels, 2); got {arma_per_voxel.shape}"
-        )
+        raise ValueError(f"arma_per_voxel must be (n_voxels, 2); got {arma_per_voxel.shape}")
 
     # Pre-build per-run polynomials (un-whitened, on device) — shared
     # across cells; only the L_r⁻¹ application differs per cell.
     if polort >= 0:
         polys_raw_per_run = [
-            torch.from_numpy(
-                legendre_polynomials(n_tp_per_run[r], polort)
-            ).to(device=device, dtype=torch.float32)
+            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
+                device=device, dtype=torch.float32
+            )
             for r in range(n_runs)
         ]
     else:
         polys_raw_per_run = None
 
-    design_task_per_run_dev = [
-        t.to(device).float() for t in per_run_task_designs
-    ]
+    design_task_per_run_dev = [t.to(device).float() for t in per_run_task_designs]
 
     # Unique (a, b) cells (rounded to 6 decimals to avoid float noise).
     rounded = np.round(arma_per_voxel.astype(np.float64), 6)
@@ -2450,10 +2489,8 @@ def bin_and_whiten_arma11(
     unique_run_lengths = sorted(set(n_tp_per_run))
     # Build R_batch for each (a, b) at each unique length once.
     R_by_length: dict[int, tuple[torch.Tensor, list[tuple[float, float]]]] = {}
-    a_tensor = torch.tensor([k[0] for k in unique_keys],
-                            dtype=torch.float32, device=device)
-    b_tensor = torch.tensor([k[1] for k in unique_keys],
-                            dtype=torch.float32, device=device)
+    a_tensor = torch.tensor([k[0] for k in unique_keys], dtype=torch.float32, device=device)
+    b_tensor = torch.tensor([k[1] for k in unique_keys], dtype=torch.float32, device=device)
     if verbose:
         print(
             f"  ARMA whiten: batched Cholesky for {len(unique_keys)} cells "
@@ -2466,7 +2503,11 @@ def bin_and_whiten_arma11(
         # subset we asked for.  In practice the valid set drops some
         # pairs (λ ≤ 0), so we fall back to per-cell on misses.
         R_one_grid, _, param_list_one = build_arma11_covariance_batch(
-            a_tensor, b_tensor, n_t, device, dtype=torch.float32,
+            a_tensor,
+            b_tensor,
+            n_t,
+            device,
+            dtype=torch.float32,
         )
         # param_list_one is the Cartesian product, not the diagonal.
         # Map (a, b) → index into the returned batch.
@@ -2484,17 +2525,24 @@ def bin_and_whiten_arma11(
         # Build the per-cell stack via index_select where valid, else
         # fall back to the scalar call (rare; happens at λ <= 0 corners).
         R_stack = torch.empty(
-            (len(unique_keys), n_t, n_t), dtype=torch.float32, device=device,
+            (len(unique_keys), n_t, n_t),
+            dtype=torch.float32,
+            device=device,
         )
         valid_mask = R_select_idx_t >= 0
         if valid_mask.any():
             R_stack[valid_mask] = R_one_grid.index_select(
-                0, R_select_idx_t[valid_mask],
+                0,
+                R_select_idx_t[valid_mask],
             )
         for ci in missing:
             a, b = unique_keys[ci]
             R_r = build_arma11_covariance(
-                float(a), float(b), n_t, device, dtype=torch.float32,
+                float(a),
+                float(b),
+                n_t,
+                device,
+                dtype=torch.float32,
             )
             if R_r is None:
                 raise ValueError(
@@ -2516,14 +2564,15 @@ def bin_and_whiten_arma11(
 
     cells: list[ARMAWhitenCell] = []
     cell_iter = tqdm(
-        unique_keys, total=len(unique_keys),
-        desc="  ARMA whiten cells", unit="cell",
-        leave=False, disable=(not verbose) or len(unique_keys) <= 1,
+        unique_keys,
+        total=len(unique_keys),
+        desc="  ARMA whiten cells",
+        unit="cell",
+        leave=False,
+        disable=(not verbose) or len(unique_keys) <= 1,
     )
     for a, b in cell_iter:
-        cell_vox = np.where(
-            (rounded[:, 0] == a) & (rounded[:, 1] == b)
-        )[0].astype(np.int64)
+        cell_vox = np.where((rounded[:, 0] == a) & (rounded[:, 1] == b))[0].astype(np.int64)
         if cell_vox.size == 0:
             continue
 
@@ -2535,34 +2584,37 @@ def bin_and_whiten_arma11(
 
             # Whiten task design (shared across all voxels in cell).
             X_task_r = design_task_per_run_dev[r]
-            task_w_runs.append(
-                torch.linalg.solve_triangular(L_r, X_task_r, upper=False)
-            )
+            task_w_runs.append(torch.linalg.solve_triangular(L_r, X_task_r, upper=False))
 
             # Whiten polynomial nuisance (shared too).
             if polys_raw_per_run is not None:
                 Z_w = torch.linalg.solve_triangular(
-                    L_r, polys_raw_per_run[r], upper=False,
+                    L_r,
+                    polys_raw_per_run[r],
+                    upper=False,
                 )
                 poly_w_runs.append(Z_w)
 
             # Whiten this cell's voxels' data.
-            y_cell_r = (
-                per_run_data[r][cell_vox].to(device).float()
-            )                                                  # (n_vox_cell, n_tp_r)
+            y_cell_r = per_run_data[r][cell_vox].to(device).float()  # (n_vox_cell, n_tp_r)
             y_cell_w = torch.linalg.solve_triangular(
-                L_r, y_cell_r.T, upper=False,
+                L_r,
+                y_cell_r.T,
+                upper=False,
             ).T
             data_w_runs.append(y_cell_w)
             del y_cell_r, y_cell_w
 
-        cells.append(ARMAWhitenCell(
-            a=float(a), b=float(b),
-            voxel_indices=cell_vox,
-            per_run_data=data_w_runs,
-            per_run_task_designs=task_w_runs,
-            per_run_polys=poly_w_runs,
-        ))
+        cells.append(
+            ARMAWhitenCell(
+                a=float(a),
+                b=float(b),
+                voxel_indices=cell_vox,
+                per_run_data=data_w_runs,
+                per_run_task_designs=task_w_runs,
+                per_run_polys=poly_w_runs,
+            )
+        )
 
     return cells
 
@@ -2614,8 +2666,7 @@ def compute_vb_block_trace(
     n_task_cols = n_blocks * n_basis
     if n_task_cols > n_cols:
         raise ValueError(
-            f"design has {n_cols} cols but n_blocks × n_basis = "
-            f"{n_task_cols} task cols expected"
+            f"design has {n_cols} cols but n_blocks × n_basis = {n_task_cols} task cols expected"
         )
 
     n_voxels = lambda_per_voxel.shape[0]
@@ -2627,12 +2678,13 @@ def compute_vb_block_trace(
 
     # Build P matching the solver: block-diag(C⁻¹) on task cols.
     C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(
-        device=device, dtype=torch.float64,
+        device=device,
+        dtype=torch.float64,
     )
     P = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=device)
     for c in range(n_blocks):
         s = c * n_basis
-        P[s:s + n_basis, s:s + n_basis] = C_inv
+        P[s : s + n_basis, s : s + n_basis] = C_inv
     XtX = X.T @ X
 
     # Quantile-bin λ_v.
@@ -2650,8 +2702,11 @@ def compute_vb_block_trace(
     bins_iter = range(n_bins_eff)
     if verbose:
         bins_iter = tqdm(
-            bins_iter, total=n_bins_eff,
-            desc="  VB block-trace bins", unit="bin", leave=False,
+            bins_iter,
+            total=n_bins_eff,
+            desc="  VB block-trace bins",
+            unit="bin",
+            leave=False,
             disable=n_bins_eff <= 1,
         )
     for b in bins_iter:
@@ -2659,7 +2714,7 @@ def compute_vb_block_trace(
         if not mask_b.any():
             continue
         lam_b = float(lambda_t[mask_b].median().item())
-        A_b = XtX + lam_b * P                              # (n_cols, n_cols)
+        A_b = XtX + lam_b * P  # (n_cols, n_cols)
         # A⁻¹ via Cholesky; fall back to direct inverse on failure
         # (only happens at λ=0 + rank-deficient X — vanishingly rare
         # in the VB path because λ_v > 0 after the first iter).
@@ -2673,16 +2728,14 @@ def compute_vb_block_trace(
         t_sum = 0.0
         for c in range(n_blocks):
             s = c * n_basis
-            block = A_inv_b[s:s + n_basis, s:s + n_basis]
-            t_sum += float((C_inv * block).sum().item())   # tr(C⁻¹ · block)
+            block = A_inv_b[s : s + n_basis, s : s + n_basis]
+            t_sum += float((C_inv * block).sum().item())  # tr(C⁻¹ · block)
         bin_trace_summed[b] = t_sum
         del A_b, A_inv_b
 
     # Broadcast per voxel: σ²_v · bin_trace_summed[bin_of_v].
     voxel_bin_np = voxel_bin.numpy()
-    return (
-        sigma2_per_voxel.astype(np.float64) * bin_trace_summed[voxel_bin_np]
-    ).astype(np.float32)
+    return (sigma2_per_voxel.astype(np.float64) * bin_trace_summed[voxel_bin_np]).astype(np.float32)
 
 
 def vb_update_beta_size(
@@ -2739,13 +2792,10 @@ def vb_update_beta_size(
     K = prior_mean.size
     n_voxels, n_blocks, K_check = task_betas.shape
     if K_check != K:
-        raise ValueError(
-            f"task_betas last dim is {K_check} but prior_mean has {K} elements"
-        )
+        raise ValueError(f"task_betas last dim is {K_check} but prior_mean has {K} elements")
     if block_trace_summed.shape != (n_voxels,):
         raise ValueError(
-            f"block_trace_summed must have shape ({n_voxels},); "
-            f"got {block_trace_summed.shape}"
+            f"block_trace_summed must have shape ({n_voxels},); got {block_trace_summed.shape}"
         )
 
     C_inv = np.linalg.inv(prior_cov).astype(np.float64)
@@ -2810,11 +2860,12 @@ def compute_xval_r2_per_voxel(
 
     Returns ``(n_voxels,)`` of held-out R² values.
     """
-    from fastfuncstuff.glm.xval import generate_cv_splits
     from fastfuncstuff.design.builder import (
-        legendre_polynomials, pack_for_shared_task_glm,
+        legendre_polynomials,
+        pack_for_shared_task_glm,
     )
     from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
+    from fastfuncstuff.glm.xval import generate_cv_splits
 
     if device is None:
         device = get_device()
@@ -2837,15 +2888,15 @@ def compute_xval_r2_per_voxel(
         for c in range(n_cond):
             bd = build_pc_basis_design_per_run(
                 onsets_per_run=[all_onsets[c][r]],
-                pcs=basis_functions, lag_times=basis_lag_times,
-                tr=tr, n_timepoints_per_run=[n_tp_per_run[r]],
+                pcs=basis_functions,
+                lag_times=basis_lag_times,
+                tr=tr,
+                n_timepoints_per_run=[n_tp_per_run[r]],
                 basis=basis_mode,
             )
             cond_blocks.append(bd[0])
         cond_designs_per_run.append(
-            torch.from_numpy(
-                np.concatenate(cond_blocks, axis=1).astype(np.float32)
-            ).to(device)
+            torch.from_numpy(np.concatenate(cond_blocks, axis=1).astype(np.float32)).to(device)
         )
 
     splits = generate_cv_splits(n_runs, strategy=1)
@@ -2860,8 +2911,12 @@ def compute_xval_r2_per_voxel(
     ss_tot_accum = torch.zeros(n_voxels, dtype=torch.float64, device=device)
 
     fold_iter = tqdm(
-        splits, total=n_splits, desc="  xval R² folds", unit="fold",
-        leave=False, disable=(not verbose) or n_splits <= 1,
+        splits,
+        total=n_splits,
+        desc="  xval R² folds",
+        unit="fold",
+        leave=False,
+        disable=(not verbose) or n_splits <= 1,
     )
     for train_runs, test_runs in fold_iter:
         # ── Train fit ────────────────────────────────────────────────
@@ -2874,7 +2929,8 @@ def compute_xval_r2_per_voxel(
             # parameter — each label is "{cond}_trial{NNN}_run{R}",
             # where R is 1-indexed.
             cond_betas_train = np.zeros(
-                (n_voxels, n_cond, n_basis), dtype=np.float64,
+                (n_voxels, n_cond, n_basis),
+                dtype=np.float64,
             )
             counts = np.zeros(n_cond, dtype=np.int64)
             test_run_set = set(test_runs)
@@ -2887,7 +2943,7 @@ def compute_xval_r2_per_voxel(
                 run_part = tail.split("_run", 1)[1]
                 home_run = int(run_part) - 1
                 if home_run in test_run_set:
-                    continue                                # exclude test trials
+                    continue  # exclude test trials
                 c = cond_label_to_idx[cond_name]
                 cond_betas_train[:, c, :] += single_trial_betas[:, b_idx, :]
                 counts[c] += 1
@@ -2896,7 +2952,8 @@ def compute_xval_r2_per_voxel(
             # that condition in this fold).  Avoid div-by-zero.
             cond_betas_train /= np.maximum(counts[None, :, None], 1)
             cond_betas_train_t = torch.from_numpy(cond_betas_train).to(
-                device=device, dtype=torch.float32,
+                device=device,
+                dtype=torch.float32,
             )
         else:
             # Per-condition train fit.
@@ -2904,51 +2961,57 @@ def compute_xval_r2_per_voxel(
             packed_train = pack_for_shared_task_glm(
                 per_run_data=per_run_data_train,
                 per_run_task_designs=train_designs,
-                polort=polort, device=device,
+                polort=polort,
+                device=device,
             )
             n_task_cols_train = packed_train.n_task_cols
             train_fit = fit_basis_constrained_ridge(
                 data=packed_train.data_concat,
                 design_task=packed_train.design_concat[:, :n_task_cols_train],
                 basis_functions=basis_functions,
-                prior_mean=prior_mean, prior_cov=prior_cov,
+                prior_mean=prior_mean,
+                prior_cov=prior_cov,
                 n_blocks=n_cond,
                 nuisance=(
                     packed_train.design_concat[:, n_task_cols_train:]
                     if packed_train.design_concat.shape[1] > n_task_cols_train
                     else None
                 ),
-                prior_weight=prior_weight, device=device,
-                reconstruct_hrfs=False, lambda_mode="global",
+                prior_weight=prior_weight,
+                device=device,
+                reconstruct_hrfs=False,
+                lambda_mode="global",
             )
             cond_betas_train_t = torch.from_numpy(
                 train_fit.betas[:, :n_task_cols_train].reshape(
-                    n_voxels, n_cond, n_basis,
+                    n_voxels,
+                    n_cond,
+                    n_basis,
                 )
             ).to(device=device, dtype=torch.float32)
 
         # ── Predict test runs ────────────────────────────────────────
         cond_betas_flat = cond_betas_train_t.reshape(n_voxels, n_cond * n_basis)
         for r in test_runs:
-            X_test_cond = cond_designs_per_run[r]                    # (n_tp_r, n_cond*K)
-            test_data = per_run_data[r].to(device).float()           # (n_vox, n_tp_r)
+            X_test_cond = cond_designs_per_run[r]  # (n_tp_r, n_cond*K)
+            test_data = per_run_data[r].to(device).float()  # (n_vox, n_tp_r)
             # Project out polys per-run from BOTH data and design
             # so the prediction is comparable on the same residual
             # subspace the fit operates in.
             if polort >= 0:
-                Z_r = torch.from_numpy(
-                    legendre_polynomials(n_tp_per_run[r], polort)
-                ).to(device=device, dtype=torch.float32)
+                Z_r = torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
+                    device=device, dtype=torch.float32
+                )
                 Q_z, _ = torch.linalg.qr(Z_r)
                 test_data_proj = test_data - (test_data @ Q_z) @ Q_z.T
                 X_test_proj = X_test_cond - Q_z @ (Q_z.T @ X_test_cond)
             else:
                 test_data_proj = test_data
                 X_test_proj = X_test_cond
-            y_pred = cond_betas_flat @ X_test_proj.T                 # (n_vox, n_tp_r)
+            y_pred = cond_betas_flat @ X_test_proj.T  # (n_vox, n_tp_r)
             resid = test_data_proj - y_pred
             mean_test = test_data_proj.mean(dim=1, keepdim=True)
-            ss_res_accum += (resid ** 2).sum(dim=1).double()
+            ss_res_accum += (resid**2).sum(dim=1).double()
             ss_tot_accum += ((test_data_proj - mean_test) ** 2).sum(dim=1).double()
             del test_data, test_data_proj, X_test_proj, y_pred, resid
 
@@ -3015,18 +3078,18 @@ def compute_per_voxel_residuals(
     residuals: list[torch.Tensor] = []
     for r in range(n_runs):
         n_tp_r = per_run_data[r].shape[1]
-        X_task_r = per_run_task_designs[r].to(device).float()    # (n_tp_r, n_task)
-        y_r = per_run_data[r].to(device).float()                 # (n_vox, n_tp_r)
+        X_task_r = per_run_task_designs[r].to(device).float()  # (n_tp_r, n_task)
+        y_r = per_run_data[r].to(device).float()  # (n_vox, n_tp_r)
 
         # Task prediction: (n_vox, n_task) @ (n_task, n_tp_r) → (n_vox, n_tp_r)
         y_pred = task_betas_t @ X_task_r.T
 
         # Nuisance prediction (run r's slice of the block-diag betas).
         if nuis_betas_t is not None and n_poly > 0:
-            Z_r = torch.from_numpy(
-                legendre_polynomials(n_tp_r, polort)
-            ).to(device=device, dtype=torch.float32)             # (n_tp_r, n_poly)
-            nuis_beta_r = nuis_betas_t[:, r * n_poly:(r + 1) * n_poly]
+            Z_r = torch.from_numpy(legendre_polynomials(n_tp_r, polort)).to(
+                device=device, dtype=torch.float32
+            )  # (n_tp_r, n_poly)
+            nuis_beta_r = nuis_betas_t[:, r * n_poly : (r + 1) * n_poly]
             y_pred = y_pred + nuis_beta_r @ Z_r.T
 
         residuals.append(y_r - y_pred)
@@ -3080,11 +3143,11 @@ def estimate_and_apply_arma11_prewhitening(
         the returned prewhitened designs do *not* have polys
         embedded — callers add them downstream as usual.
     """
+    from fastfuncstuff.design.builder import legendre_polynomials
     from fastfuncstuff.glm.arma import (
         build_arma11_covariance,
         reml_grid_search,
     )
-    from fastfuncstuff.design.builder import legendre_polynomials
 
     if device is None:
         device = get_device()
@@ -3104,14 +3167,14 @@ def estimate_and_apply_arma11_prewhitening(
 
     residual_mean_per_run: list[np.ndarray] = []
     for y_r, X_task_r in zip(per_run_data, per_run_task_designs):
-        y_dev = y_r.to(device).float()              # (n_voxels, n_tp_r)
-        X_task_dev = X_task_r.to(device).float()    # (n_tp_r, n_task)
+        y_dev = y_r.to(device).float()  # (n_voxels, n_tp_r)
+        X_task_dev = X_task_r.to(device).float()  # (n_tp_r, n_task)
         n_tp_r = X_task_dev.shape[0]
 
         if polort >= 0:
-            Z_r = torch.from_numpy(
-                legendre_polynomials(n_tp_r, polort)
-            ).to(device=device, dtype=torch.float32)
+            Z_r = torch.from_numpy(legendre_polynomials(n_tp_r, polort)).to(
+                device=device, dtype=torch.float32
+            )
             X_full = torch.cat([X_task_dev, Z_r], dim=1)
         else:
             X_full = X_task_dev
@@ -3127,7 +3190,7 @@ def estimate_and_apply_arma11_prewhitening(
         except torch.linalg.LinAlgError:
             beta = torch.linalg.lstsq(X_full, y_dev.T).solution
 
-        resid = y_dev - (X_full @ beta).T            # (n_voxels, n_tp_r)
+        resid = y_dev - (X_full @ beta).T  # (n_voxels, n_tp_r)
         residual_mean_per_run.append(resid.mean(dim=0).detach().cpu().numpy())
         del y_dev, X_task_dev, X_full, XtX, Xty, beta, resid
 
@@ -3144,7 +3207,10 @@ def estimate_and_apply_arma11_prewhitening(
     Y_resid = torch.from_numpy(residual_concat).to(device=device, dtype=torch.float32)
 
     a_opt, b_opt, _ = reml_grid_search(
-        X=X_const, Y=Y_resid, run_starts=run_starts, device=device,
+        X=X_const,
+        Y=Y_resid,
+        run_starts=run_starts,
+        device=device,
     )
     if verbose:
         print(f"  prewhiten: global ARMA(1,1) → a={a_opt:.3f}, b={b_opt:.3f}")
@@ -3155,13 +3221,16 @@ def estimate_and_apply_arma11_prewhitening(
     for r in range(n_runs):
         n_tp_r = per_run_task_designs[r].shape[0]
         R_r = build_arma11_covariance(
-            a_opt, b_opt, n_tp_r, torch.device("cpu"),
-            dtype=torch.float32, run_starts=None,
+            a_opt,
+            b_opt,
+            n_tp_r,
+            torch.device("cpu"),
+            dtype=torch.float32,
+            run_starts=None,
         )
         if R_r is None:
             raise ValueError(
-                f"build_arma11_covariance returned None for run {r} "
-                f"with a={a_opt}, b={b_opt}"
+                f"build_arma11_covariance returned None for run {r} with a={a_opt}, b={b_opt}"
             )
         L_r = torch.linalg.cholesky(R_r).to(device)
 
@@ -3288,9 +3357,7 @@ def spmg_prior(
         C = np.diag([canonical_std**2, derivative_std**2]).astype(np.float64)
     else:
         m = np.array([canonical_mean, 0.0, 0.0], dtype=np.float64)
-        C = np.diag(
-            [canonical_std**2, derivative_std**2, dispersion_std**2]
-        ).astype(np.float64)
+        C = np.diag([canonical_std**2, derivative_std**2, dispersion_std**2]).astype(np.float64)
     return m, C
 
 
@@ -3374,7 +3441,8 @@ def decouple_amplitude_prior(
     for k in range(K):
         if fill_idx == K:
             break
-        e_k = np.zeros(K); e_k[k] = 1.0
+        e_k = np.zeros(K)
+        e_k[k] = 1.0
         # Project off all previously-collected R columns.
         v = e_k - R[:, :fill_idx] @ (R[:, :fill_idx].T @ e_k)
         nv = np.linalg.norm(v)
@@ -3393,7 +3461,7 @@ def decouple_amplitude_prior(
     # Shape block in rotated frame.
     C_r = R.T @ prior_cov @ R
     C_shape = C_r[1:, 1:]
-    P_shape = np.linalg.inv(C_shape)                   # (K-1, K-1)
+    P_shape = np.linalg.inv(C_shape)  # (K-1, K-1)
 
     # Build rotated precision: amplitude precision = 0, shape = P_shape.
     P_r = np.zeros((K, K), dtype=np.float64)
@@ -3407,8 +3475,8 @@ def decouple_amplitude_prior(
     # invertible (the solver inverts C internally to get P).  The
     # effective precision in the amplitude direction is then
     # 1/(1e12) = ~0, exactly what we want.
-    amp_proj = np.outer(u, u)                          # rank-1 amplitude
-    C_decoupled = P_decoupled + 1e-12 * amp_proj       # ensure full rank
+    amp_proj = np.outer(u, u)  # rank-1 amplitude
+    C_decoupled = P_decoupled + 1e-12 * amp_proj  # ensure full rank
     C_decoupled = np.linalg.inv(C_decoupled)
     # Symmetrize.
     C_decoupled = 0.5 * (C_decoupled + C_decoupled.T)

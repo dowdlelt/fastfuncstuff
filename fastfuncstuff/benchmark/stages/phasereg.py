@@ -60,6 +60,7 @@ THRESHOLDS = {
 
 def _data_dir(ctx: BenchmarkContext) -> Path:
     from ..._paths import get_benchmark_data_dir
+
     return get_benchmark_data_dir() / DATASET_DIR
 
 
@@ -93,10 +94,7 @@ def _ensure_ref_script(pd: Path) -> None:
 
 
 def _prep_needed(pd: Path) -> bool:
-    return not all(
-        (pd / f).exists()
-        for f in (MAG_FILE, PHA_FILE, MASK_FILE)
-    )
+    return not all((pd / f).exists() for f in (MAG_FILE, PHA_FILE, MASK_FILE))
 
 
 def _run_prep(ctx: BenchmarkContext) -> None:
@@ -118,9 +116,13 @@ def _run_prep(ctx: BenchmarkContext) -> None:
         print("  Running 3dvolreg (motion correction)...")
         subprocess.run(
             [
-                "3dvolreg", "-overwrite", "-heptic",
-                "-prefix", str(pd / "ignore_moco.nii.gz"),
-                "-1Dmatrix_save", str(moco_params),
+                "3dvolreg",
+                "-overwrite",
+                "-heptic",
+                "-prefix",
+                str(pd / "ignore_moco.nii.gz"),
+                "-1Dmatrix_save",
+                str(moco_params),
                 str(bold),
             ],
             check=True,
@@ -133,10 +135,14 @@ def _run_prep(ctx: BenchmarkContext) -> None:
         subprocess.run(
             [
                 romeo,
-                "-p", str(phase),
-                "-m", str(bold),
-                "-t", "epi",
-                "-o", str(unwrapped),
+                "-p",
+                str(phase),
+                "-m",
+                str(bold),
+                "-t",
+                "epi",
+                "-o",
+                str(unwrapped),
                 "-v",
             ],
             check=True,
@@ -147,12 +153,18 @@ def _run_prep(ctx: BenchmarkContext) -> None:
         subprocess.run(
             [
                 "ffs_nwarp",
-                "-source", str(bold),
-                "-phase", str(unwrapped),
-                "-nwarp", str(moco_params),
-                "-phase_warp", "direct",
-                "-prefix", str(pd / "method_direct_aligned"),
-                "-phase_units", "rad",
+                "-source",
+                str(bold),
+                "-phase",
+                str(unwrapped),
+                "-nwarp",
+                str(moco_params),
+                "-phase_warp",
+                "direct",
+                "-prefix",
+                str(pd / "method_direct_aligned"),
+                "-phase_units",
+                "rad",
             ],
             check=True,
         )
@@ -161,8 +173,10 @@ def _run_prep(ctx: BenchmarkContext) -> None:
         print("  Running 3dAutomask...")
         subprocess.run(
             [
-                "3dAutomask", "-overwrite",
-                "-prefix", str(pd / MASK_FILE),
+                "3dAutomask",
+                "-overwrite",
+                "-prefix",
+                str(pd / MASK_FILE),
                 str(bold),
             ],
             check=True,
@@ -220,7 +234,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
     ref_slope = pd / f"{REF_PREFIX}_slope.nii.gz"
     if ref_slope.exists() and not ctx.force_ref:
-        print(f"  Skipping phaseprep ref (output exists, use -force-ref to re-run)")
+        print("  Skipping phaseprep ref (output exists, use -force-ref to re-run)")
         return 0.0
 
     n_workers = ctx.get_stage_params("phasereg").get("ref_n_workers", 8)
@@ -244,7 +258,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
     out_corr = pd / f"{FFS_PREFIX}_corrected.nii.gz"
     if out_corr.exists() and not ctx.force_ffs:
-        print(f"  Skipping ffs_phasereg (output exists, use -force-ffs to re-run)")
+        print("  Skipping ffs_phasereg (output exists, use -force-ffs to re-run)")
         return 0.0
 
     cmd = (
@@ -268,11 +282,13 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 def _load_vol(path: Path) -> np.ndarray:
     import nibabel as nib
+
     return np.asarray(nib.load(str(path)).dataobj, dtype=np.float32)
 
 
 def _load_4d(path: Path) -> np.ndarray:
     import nibabel as nib
+
     return np.asarray(nib.load(str(path)).dataobj, dtype=np.float32)
 
 
@@ -283,7 +299,7 @@ def _ts_corr_median(a4d: np.ndarray, b4d: np.ndarray, mask3d: np.ndarray) -> flo
     a, b = a[m], b[m]
     am = a - a.mean(axis=1, keepdims=True)
     bm = b - b.mean(axis=1, keepdims=True)
-    denom = np.sqrt((am ** 2).sum(axis=1) * (bm ** 2).sum(axis=1))
+    denom = np.sqrt((am**2).sum(axis=1) * (bm**2).sum(axis=1))
     ok = denom > 0
     if not ok.any():
         return 0.0

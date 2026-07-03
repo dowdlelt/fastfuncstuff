@@ -12,9 +12,6 @@ analyses; bugs here corrupt the design matrix or the reuse path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -25,10 +22,10 @@ from fastfuncstuff.design.hrf_selection import (
     load_nuisance_file,
 )
 
-
 # ---------------------------------------------------------------------------
 # load_nuisance_file
 # ---------------------------------------------------------------------------
+
 
 class TestLoadNuisanceFile:
     def test_afni_1d_whitespace(self, tmp_path):
@@ -77,14 +74,7 @@ class TestLoadNuisanceFile:
 
     def test_skips_blank_and_comment_lines(self, tmp_path):
         p = tmp_path / "motion.1D"
-        p.write_text(
-            "# header\n"
-            "\n"
-            "0.1 0.2\n"
-            "  \n"
-            "# inline header\n"
-            "0.3 0.4\n"
-        )
+        p.write_text("# header\n\n0.1 0.2\n  \n# inline header\n0.3 0.4\n")
         data = load_nuisance_file(p)
         assert data.shape == (2, 2)
 
@@ -109,13 +99,15 @@ class TestLoadNuisanceFile:
 # _write_afni_xmat
 # ---------------------------------------------------------------------------
 
+
 class TestWriteAfniXmat:
     def test_basic_header_attrs(self, tmp_path):
         T, n_stim, n_poly_total = 20, 2, 6
         X = np.random.default_rng(0).standard_normal((T, n_stim + n_poly_total)).astype(np.float32)
         out = tmp_path / "design.xmat.1D"
         _write_afni_xmat(
-            X, str(out),
+            X,
+            str(out),
             n_stim_cols=n_stim,
             condition_labels=["A", "B"],
             run_starts=[0, 10],
@@ -138,7 +130,8 @@ class TestWriteAfniXmat:
         X = np.zeros((T, n_stim + n_poly_total))
         out = tmp_path / "design.xmat.1D"
         _write_afni_xmat(
-            X, str(out),
+            X,
+            str(out),
             n_stim_cols=n_stim,
             condition_labels=["A", "B"],
             run_starts=[0, 10],
@@ -158,7 +151,8 @@ class TestWriteAfniXmat:
         out = tmp_path / "design.xmat.1D"
         motion_labels = [f"motion_{i}" for i in range(6)]
         _write_afni_xmat(
-            X, str(out),
+            X,
+            str(out),
             n_stim_cols=n_stim,
             condition_labels=["face"],
             run_starts=[0],
@@ -175,7 +169,8 @@ class TestWriteAfniXmat:
         X = np.zeros((T, 3))  # 2 stim + 1 nuisance
         out = tmp_path / "design.xmat.1D"
         _write_afni_xmat(
-            X, str(out),
+            X,
+            str(out),
             n_stim_cols=2,
             condition_labels=None,
             run_starts=[0],
@@ -191,7 +186,8 @@ class TestWriteAfniXmat:
         X = np.arange(T * 3, dtype=np.float32).reshape(T, 3)
         out = tmp_path / "design.xmat.1D"
         _write_afni_xmat(
-            X, str(out),
+            X,
+            str(out),
             n_stim_cols=1,
             condition_labels=["A"],
             run_starts=[0],
@@ -209,6 +205,7 @@ class TestWriteAfniXmat:
 # ---------------------------------------------------------------------------
 # load_hrf_selection_for_arma
 # ---------------------------------------------------------------------------
+
 
 class TestLoadHrfSelectionForArma:
     def test_round_trip_of_full_payload(self, tmp_path):

@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from ..runner import BenchmarkContext, run_timed
-from ..validation import _pearson_r, _load_vol, compare_prob_maps
+from ..validation import _pearson_r, compare_prob_maps
 
 name = "ica_single_trace"
 description = "ICA single-run step-by-step parity (MELODIC debug vs ffs_ica -trace)"
@@ -46,6 +46,7 @@ def _mni_input(ctx: BenchmarkContext, dataset: str, run: int) -> Path:
 # Comparisons
 # ---------------------------------------------------------------------------
 
+
 def _compare_eigenvalues(mel_dir: Path, trace_dir: Path) -> dict:
     mel_eig = np.loadtxt(str(mel_dir / "pcaD"))
     ffs_p = trace_dir / "pca_eigenvalues.npy"
@@ -70,7 +71,7 @@ def _compare_eigenvalues(mel_dir: Path, trace_dir: Path) -> dict:
         "ffs_n": len(ffs_eig),
         "n_positive_overlap": n,
         "full_spectrum_r": _pearson_r(mel_eig_pos[:n], ffs_pos[:n]),
-        "top20_r": _pearson_r(mel_eig_pos[:min(20, n)], ffs_pos[:min(20, n)]),
+        "top20_r": _pearson_r(mel_eig_pos[: min(20, n)], ffs_pos[: min(20, n)]),
         "scale_ratio": scale,
         "melodic_first5": mel_eig_pos[:5].tolist(),
         "ffs_first5": ffs_pos[:5].tolist(),
@@ -99,10 +100,7 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
     sample_size = min(V, 10000)
     rng = np.random.default_rng(42)
     sample = rng.choice(V, sample_size, replace=False)
-    corrs = np.array([
-        _pearson_r(ffs_post[:, v], mel_post[:, v])
-        for v in sample
-    ])
+    corrs = np.array([_pearson_r(ffs_post[:, v], mel_post[:, v]) for v in sample])
     corrs = corrs[np.isfinite(corrs)]
 
     def _topk_evals(X, k=50):
@@ -127,13 +125,8 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
     offset_diff_valid = offset_diff[valid_mask]
 
     sample_idx = rng.choice(V, min(V, 2000), replace=False)
-    rmses = np.array([
-        np.sqrt(np.mean((ffs_post[:, v] - mel_post[:, v]) ** 2))
-        for v in sample_idx
-    ])
-    scales = np.array([
-        np.std(mel_post[:, v]) for v in sample_idx
-    ])
+    rmses = np.array([np.sqrt(np.mean((ffs_post[:, v] - mel_post[:, v]) ** 2)) for v in sample_idx])
+    scales = np.array([np.std(mel_post[:, v]) for v in sample_idx])
     nrmse = rmses / np.where(scales > 1e-8, scales, 1.0)
 
     return {
@@ -209,6 +202,7 @@ def _compare_mixing(mel_dir: Path, trace_dir: Path) -> dict:
     k = n_k
     cross_block = cross[:k, k:]
     from scipy.optimize import linear_sum_assignment
+
     row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
     corrs = cross_block[row_ind, col_ind]
     return {
@@ -254,6 +248,7 @@ def _compare_ic_maps(mel_dir: Path, trace_dir: Path, mask_path: Path) -> dict:
     cross = np.abs(np.corrcoef(mel_k, ffs_k))
     cross_block = cross[:n_k, n_k:]
     from scipy.optimize import linear_sum_assignment
+
     row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
     corrs = cross_block[row_ind, col_ind]
 
@@ -272,8 +267,9 @@ def _compare_noise_norm(mel_dir: Path, trace_dir: Path) -> dict:
     ffs_noise_p = trace_dir / "noise_inv.npy"
     ffs_resid_p = trace_dir / "resid_std.npy"
     ffs_diag_p = trace_dir / "diagvals.npy"
-    missing = [n for n, p in [("mel_noise", mel_noise_p), ("ffs_noise", ffs_noise_p)]
-               if not p.exists()]
+    missing = [
+        n for n, p in [("mel_noise", mel_noise_p), ("ffs_noise", ffs_noise_p)] if not p.exists()
+    ]
     if missing:
         return {"error": f"missing: {', '.join(missing)}"}
 
@@ -330,6 +326,7 @@ def _compare_raw_oic(mel_dir: Path, trace_dir: Path) -> dict:
     cross = np.abs(np.corrcoef(mel_maps[:n_k], ffs_maps[:n_k]))
     cross_block = cross[:n_k, n_k:]
     from scipy.optimize import linear_sum_assignment
+
     row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
     corrs = cross_block[row_ind, col_ind]
 
@@ -358,6 +355,7 @@ def _compare_unmix(mel_dir: Path, trace_dir: Path) -> dict:
     cross = np.abs(np.corrcoef(mel_unmix[:n_k, :n_t], ffs_unmix[:n_k, :n_t]))
     cross_block = cross[:n_k, n_k:]
     from scipy.optimize import linear_sum_assignment
+
     row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
     corrs = cross_block[row_ind, col_ind]
 
@@ -409,13 +407,21 @@ def _safe(fn, *args, **kwargs):
 # Stage interface
 # ---------------------------------------------------------------------------
 
+
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     for dataset in _ica_tasks(ctx):
         for run in ctx.runs_for_task(dataset):
             md = _melodic_dir(ctx, dataset, run)
-            for f in ["pcaD", "whiteMatrix", "melodic_mix", "melodic_ICstats",
-                       "concat_data.nii.gz", "melodic_oIC.nii.gz", "mask.nii.gz"]:
+            for f in [
+                "pcaD",
+                "whiteMatrix",
+                "melodic_mix",
+                "melodic_ICstats",
+                "concat_data.nii.gz",
+                "melodic_oIC.nii.gz",
+                "mask.nii.gz",
+            ]:
                 if not (md / f).exists():
                     missing.append(str(md / f))
     return missing
@@ -466,13 +472,17 @@ def validate(ctx: BenchmarkContext) -> dict:
             mask_path = mel_dir / "mask.nii.gz"
 
             if not td.exists():
-                per_run_results.append({
-                    "dataset": dataset, "run": run, "error": "trace dir missing"
-                })
+                per_run_results.append(
+                    {"dataset": dataset, "run": run, "error": "trace dir missing"}
+                )
                 continue
 
-            ffs_zp = (ctx.ffs_ica_dir / f"{dataset}_single_trace_run{run:02d}.ica"
-                      / "stats" / "z_prob.nii.gz")
+            ffs_zp = (
+                ctx.ffs_ica_dir
+                / f"{dataset}_single_trace_run{run:02d}.ica"
+                / "stats"
+                / "z_prob.nii.gz"
+            )
             run_result = {
                 "dataset": dataset,
                 "run": run,
@@ -498,19 +508,23 @@ def validate(ctx: BenchmarkContext) -> dict:
             "per_run": per_run_results,
         }
 
-    eig_rs = [r["eigenvalues"]["full_spectrum_r"] for r in valid
-              if "error" not in r.get("eigenvalues", {})]
-    varnorm_eig_rs = [r["varnorm"]["post_vn_eig_r"] for r in valid
-                      if "error" not in r.get("varnorm", {})]
-    maps_rs = [r["ic_maps"]["mean_matched_r"] for r in valid
-               if "error" not in r.get("ic_maps", {})]
-    mix_rs = [r["mixing"]["mean_matched_r"] for r in valid
-              if "error" not in r.get("mixing", {})]
-    white_cos = [r["whitening"]["mean_principal_cos"] for r in valid
-                 if "error" not in r.get("whitening", {})]
+    eig_rs = [
+        r["eigenvalues"]["full_spectrum_r"]
+        for r in valid
+        if "error" not in r.get("eigenvalues", {})
+    ]
+    varnorm_eig_rs = [
+        r["varnorm"]["post_vn_eig_r"] for r in valid if "error" not in r.get("varnorm", {})
+    ]
+    maps_rs = [r["ic_maps"]["mean_matched_r"] for r in valid if "error" not in r.get("ic_maps", {})]
+    mix_rs = [r["mixing"]["mean_matched_r"] for r in valid if "error" not in r.get("mixing", {})]
+    white_cos = [
+        r["whitening"]["mean_principal_cos"] for r in valid if "error" not in r.get("whitening", {})
+    ]
 
-    prob_rs = [r["prob_maps"]["mean_matched_r"] for r in valid
-               if "error" not in r.get("prob_maps", {})]
+    prob_rs = [
+        r["prob_maps"]["mean_matched_r"] for r in valid if "error" not in r.get("prob_maps", {})
+    ]
 
     mean_eig = float(np.mean(eig_rs)) if eig_rs else 0.0
     mean_vn_eig = float(np.mean(varnorm_eig_rs)) if varnorm_eig_rs else 0.0
@@ -519,10 +533,10 @@ def validate(ctx: BenchmarkContext) -> dict:
     mean_white = float(np.mean(white_cos)) if white_cos else 0.0
     mean_prob = float(np.mean(prob_rs)) if prob_rs else 0.0
 
-    vn_scales = [r["varnorm"]["scale_ratio_mean"] for r in valid
-                 if "error" not in r.get("varnorm", {})]
-    vn_nrmses = [r["varnorm"]["nrmse_mean"] for r in valid
-                 if "error" not in r.get("varnorm", {})]
+    vn_scales = [
+        r["varnorm"]["scale_ratio_mean"] for r in valid if "error" not in r.get("varnorm", {})
+    ]
+    vn_nrmses = [r["varnorm"]["nrmse_mean"] for r in valid if "error" not in r.get("varnorm", {})]
     mean_vn_scale = float(np.mean(vn_scales)) if vn_scales else 0.0
     mean_vn_nrmse = float(np.mean(vn_nrmses)) if vn_nrmses else 0.0
 

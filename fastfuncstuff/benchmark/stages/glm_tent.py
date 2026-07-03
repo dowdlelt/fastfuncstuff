@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import nibabel as nib
 import numpy as np
 import torch
 
 from ..runner import BenchmarkContext, run_timed
-from ..validation import _automask, _load_vol, _pearson_r, compare_volumes
+from ..validation import _automask, _load_vol, _pearson_r
 
 name = "glm_tent"
 description = "TENT deconvolution (3dDeconvolve TENT(0,15,11) vs ffs_deconvolve)"

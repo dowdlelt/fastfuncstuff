@@ -22,92 +22,131 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "-config", type=str, default=None, metavar="YAML",
+        "-config",
+        type=str,
+        default=None,
+        metavar="YAML",
         help="Path to benchmark config YAML. Defines dataset, subject, session, "
-             "tasks, runs, stages, and stage-specific params. "
-             "Default: auto-detect from data directory or use built-in ds005165 config.",
+        "tasks, runs, stages, and stage-specific params. "
+        "Default: auto-detect from data directory or use built-in ds005165 config.",
     )
     parser.add_argument(
-        "-data-dir", type=str, default=None,
+        "-data-dir",
+        type=str,
+        default=None,
         help="Path to BIDS dataset directory. Default: auto-detect.",
     )
     from ..benchmark.stages import STAGE_MAP as _STAGE_MAP
+
     _stage_names = ",".join(_STAGE_MAP)
     parser.add_argument(
-        "-stages", type=str, default=None,
+        "-stages",
+        type=str,
+        default=None,
         help=f"Comma-separated stage names ({_stage_names}). Default: all.",
     )
     parser.add_argument(
-        "-with-deps", "--with-deps", action="store_true",
+        "-with-deps",
+        "--with-deps",
+        action="store_true",
         help="Expand -stages to also run the upstream stages they depend on "
         "(via each stage's 'requires'), in pipeline order.",
     )
     parser.add_argument(
-        "-validate-only", action="store_true",
+        "-validate-only",
+        action="store_true",
         help="Only validate existing outputs, don't run any tools.",
     )
     parser.add_argument(
-        "-force-ffs", action="store_true",
+        "-force-ffs",
+        action="store_true",
         help="Re-run FFS tools even if outputs exist.",
     )
     parser.add_argument(
-        "-force-ref", "-force-afni", action="store_true", dest="force_ref",
+        "-force-ref",
+        "-force-afni",
+        action="store_true",
+        dest="force_ref",
         help="Re-run reference tools (AFNI/melodic/MATLAB) even if outputs exist.",
     )
     parser.add_argument(
-        "-force-all", action="store_true",
+        "-force-all",
+        action="store_true",
         help="Re-run everything.",
     )
     parser.add_argument(
-        "-ref-only", action="store_true",
+        "-ref-only",
+        action="store_true",
         help="Run reference tools only (AFNI/melodic/MATLAB). "
-             "Skip FFS and validation. Useful for collecting ref timings "
-             "on machines without GPU support (e.g. Mac).",
+        "Skip FFS and validation. Useful for collecting ref timings "
+        "on machines without GPU support (e.g. Mac).",
     )
     parser.add_argument(
-        "-json", type=str, default=None, metavar="PATH",
+        "-json",
+        type=str,
+        default=None,
+        metavar="PATH",
         help="Save results as JSON to this path.",
     )
     parser.add_argument(
-        "-report", action="store_true",
+        "-report",
+        action="store_true",
         help="Print detailed timing report (requires timing data).",
     )
     parser.add_argument(
-        "-plot", type=str, default=None, metavar="DIR",
+        "-plot",
+        type=str,
+        default=None,
+        metavar="DIR",
         help="Save benchmark plots (timing bars, speedup chart) to this directory.",
     )
     parser.add_argument(
-        "-download", action="store_true",
+        "-download",
+        action="store_true",
         help="Download raw data for all benchmark datasets defined in built-in configs "
-             "(ds005165, ds003427, etc.). Safe to re-run — skips datasets already present. "
-             "Requires awscli (pip install awscli  or  brew install awscli).",
+        "(ds005165, ds003427, etc.). Safe to re-run — skips datasets already present. "
+        "Requires awscli (pip install awscli  or  brew install awscli).",
     )
     parser.add_argument(
-        "-plot-from-cache", type=str, nargs="*", default=None,
+        "-plot-from-cache",
+        type=str,
+        nargs="*",
+        default=None,
         metavar="CACHE_JSON",
         help="Generate plots from one or more benchmark_cache.json files. "
-             "No stages are run. Multiple files are merged for cross-arch comparison.",
+        "No stages are run. Multiple files are merged for cross-arch comparison.",
     )
     parser.add_argument(
-        "-list-cache", action="store_true",
+        "-list-cache",
+        action="store_true",
         help="List all entries in benchmark_cache.json and exit.",
     )
     parser.add_argument(
-        "-remove-cache", type=str, nargs="+", default=None, metavar="IDX_OR_ID",
+        "-remove-cache",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="IDX_OR_ID",
         help="Remove cache entries by 1-based index (e.g. 3) or UUID prefix "
-             "(e.g. a1b2c3d4). Use -list-cache first to see indices.",
+        "(e.g. a1b2c3d4). Use -list-cache first to see indices.",
     )
     parser.add_argument(
-        "-import-cache", type=str, default=None, metavar="CACHE_JSON",
+        "-import-cache",
+        type=str,
+        default=None,
+        metavar="CACHE_JSON",
         help="Import runs from another benchmark_cache.json into the local cache. "
-             "Deduplicates by UUID.",
+        "Deduplicates by UUID.",
     )
     parser.add_argument(
-        "-dry_run", action="store_true",
+        "-dry_run",
+        action="store_true",
         help="Preview -import-cache or -remove-cache without writing changes.",
     )
     parser.add_argument(
-        "-device", type=str, default=None,
+        "-device",
+        type=str,
+        default=None,
         help="PyTorch device passed to FFS tools: cpu, cuda, mps (default: auto-detect).",
     )
     add_verbose_arg(parser, default=0)
@@ -122,6 +161,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _default_data_dir() -> Path:
     from .._paths import get_benchmark_data_dir
+
     return get_benchmark_data_dir() / "ds005165-download"
 
 
@@ -237,9 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # Print dataset header
-    tasks_summary = ", ".join(
-        f"{t}({len(r)} runs)" for t, r in ctx.all_task_run_pairs()
-    )
+    tasks_summary = ", ".join(f"{t}({len(r)} runs)" for t, r in ctx.all_task_run_pairs())
     print(f"Dataset: {ctx.dataset_id}  sub-{ctx.subject}/ses-{ctx.session}  {tasks_summary}")
     print(f"Data directory: {data_dir}")
     print(f"Stages: {', '.join(s.name for s in stages)}")
@@ -433,14 +471,15 @@ def _ensure_data() -> None:
             continue
 
         if not shutil.which("aws"):
-            print("ERROR: awscli not found. Install with:  pip install awscli  or  brew install awscli")
+            print(
+                "ERROR: awscli not found. Install with:  pip install awscli  or  brew install awscli"
+            )
             sys.exit(1)
 
         data_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[{cfg.dataset_id}] Downloading to {data_dir} ...")
 
-        cmd = ["aws", "s3", "sync", "--no-sign-request", dl.s3_url, str(data_dir),
-               "--exclude", "*"]
+        cmd = ["aws", "s3", "sync", "--no-sign-request", dl.s3_url, str(data_dir), "--exclude", "*"]
         for pattern in dl.include:
             cmd += ["--include", pattern]
 
@@ -448,7 +487,7 @@ def _ensure_data() -> None:
         if result.returncode != 0:
             print(f"  Download failed:\n{result.stderr[-500:]}")
             sys.exit(1)
-        print(f"  Done.")
+        print("  Done.")
 
 
 if __name__ == "__main__":

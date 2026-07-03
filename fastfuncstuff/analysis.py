@@ -11,6 +11,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.design.hrf import get_hrf_library
+from fastfuncstuff.design.matrices import build_glm_design, convolve_hrf_microtime
+from fastfuncstuff.glm.arma import ARMA11Results, fit_glm_arma11, get_default_arma_grids
+from fastfuncstuff.glm.core import GLMResults, fit_glm, fit_glm_hrf_library
 from fastfuncstuff.io.afni import (
     extract_stimulus_columns,
     get_run_lengths,
@@ -21,10 +25,7 @@ from fastfuncstuff.io.afni import (
     read_afni_design_matrix,
     read_afni_onset_files,
 )
-from fastfuncstuff.glm.arma import ARMA11Results, fit_glm_arma11, get_default_arma_grids
-from fastfuncstuff.design.matrices import build_glm_design, convolve_hrf_microtime
-from fastfuncstuff.glm.core import GLMResults, fit_glm, fit_glm_hrf_library
-from fastfuncstuff.design.hrf import get_hrf_library
+
 from .utils import get_device, to_tensor
 
 
@@ -490,9 +491,7 @@ def analyze_from_design_matrix(
     # 1. Read design matrix first to get run_starts
     if design_info is None:
         if design_matrix_file is None:
-            raise ValueError(
-                "Either design_matrix_file or design_info must be provided"
-            )
+            raise ValueError("Either design_matrix_file or design_info must be provided")
         design_info = read_afni_design_matrix(design_matrix_file)
     expected_run_starts = design_info.get("run_starts", None)
 
@@ -765,9 +764,7 @@ def analyze_from_design_matrix(
             dimg = load_nifti(dpath)
             darr = np.asarray(dimg.get_fdata(dtype=np.float32))
             if darr.ndim != 4:
-                raise ValueError(
-                    f"-dsort '{dpath}' must be 4D, got shape {darr.shape}"
-                )
+                raise ValueError(f"-dsort '{dpath}' must be 4D, got shape {darr.shape}")
             d2d = darr.reshape(-1, darr.shape[-1])
             if d2d.shape[1] != n_time_data:
                 raise ValueError(
@@ -789,7 +786,7 @@ def analyze_from_design_matrix(
                     f"{data.shape[0]} after masking."
                 )
             dsort_cols.append(d_t)
-            dsort_labels = (dsort_labels or [])
+            dsort_labels = dsort_labels or []
             dsort_labels.append(f"dsort#{di}")
         # (n_voxels, n_dsort, n_timepoints)
         dsort_tensor = torch.stack(dsort_cols, dim=1).to(storage_device)
@@ -812,9 +809,7 @@ def analyze_from_design_matrix(
                 "path. Re-run without -OLSQ / with the REML method."
             )
         if volume_shape is None:
-            raise ValueError(
-                "-slibase requires 4D input to determine the slice (z) axis."
-            )
+            raise ValueError("-slibase requires 4D input to determine the slice (z) axis.")
         from fastfuncstuff.design.slibase import (
             build_slice_blocks,
             voxel_slice_indices,
@@ -832,12 +827,9 @@ def analyze_from_design_matrix(
         # Slice regressors are nuisance — extend the design labels so the wider
         # [base | slice_block] design stays labelled (they are NOT task columns).
         if design_info.get("column_labels") is not None:
-            design_info["column_labels"] = (
-                list(design_info["column_labels"]) + slibase_labels
-            )
+            design_info["column_labels"] = list(design_info["column_labels"]) + slibase_labels
         print(
-            f"🧠 -slibase: {slice_blocks.shape[2]} slice-wise regressor(s) across "
-            f"{n_slices} slices"
+            f"🧠 -slibase: {slice_blocks.shape[2]} slice-wise regressor(s) across {n_slices} slices"
         )
 
     # 3. Extract design matrix (already read above)
@@ -879,11 +871,7 @@ def analyze_from_design_matrix(
     # store all rows; some pipelines pre-subset to good rows only — handle both
     # by reducing only the axes that are still full-length.
     n_full = design_info.get("n_timepoints")
-    if (
-        good_list is not None
-        and n_full is not None
-        and len(good_list) < n_full
-    ):
+    if good_list is not None and n_full is not None and len(good_list) < n_full:
         from fastfuncstuff.glm.arma import build_censor_run_info
 
         keep = torch.as_tensor(list(good_list), dtype=torch.long)
@@ -1203,19 +1191,14 @@ def analyze_from_design_matrix(
                 sblk = slice_blocks.to(device)
                 group_indices = slice_indices.long()
                 for s in torch.unique(group_indices).tolist():
-                    designs_by_group[int(s)] = torch.cat(
-                        [design, sblk[int(s)]], dim=1
-                    )
+                    designs_by_group[int(s)] = torch.cat([design, sblk[int(s)]], dim=1)
                 group_label = "slice"
             else:  # has_hrf only
                 designs_by_group = designs_by_hrf
                 group_indices = hrf_idx_tensor
                 group_label = "HRF"
 
-            print(
-                f"\n🎚️  Grouped REML (per {group_label}): "
-                f"{len(designs_by_group)} design(s)"
-            )
+            print(f"\n🎚️  Grouped REML (per {group_label}): {len(designs_by_group)} design(s)")
 
             results = fit_glm_arma11_grouped(
                 data,
@@ -1457,8 +1440,8 @@ def analyze_with_cross_validation(
     - Nuisance regressors are projected out before computing R²
     - Results are CPU tensors for easy saving/analysis
     """
-    from fastfuncstuff.io.afni import extract_design_metadata, read_afni_design_matrix
     from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
+    from fastfuncstuff.io.afni import extract_design_metadata, read_afni_design_matrix
 
     # Auto-detect device
     if device is None:

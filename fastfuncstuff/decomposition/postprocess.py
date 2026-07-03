@@ -12,9 +12,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .tools import apply_high_pass_fft, apply_polort_projection
-
 from fastfuncstuff.io.afni import load_nifti
+
+from .tools import apply_high_pass_fft, apply_polort_projection
 
 try:
     import matplotlib

@@ -18,16 +18,17 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from .matrices import convolve_hrf_microtime
 from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
-from .hrf import get_hrf_library
-from fastfuncstuff.memory import dyn_chunk_estimator, estimate_chunk_size, estimate_keep_on_cpu
-from fastfuncstuff.utils import get_device, to_tensor
 from fastfuncstuff.glm.xval import (
     compute_xval_r2,
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
+from fastfuncstuff.memory import dyn_chunk_estimator, estimate_chunk_size, estimate_keep_on_cpu
+from fastfuncstuff.utils import get_device, to_tensor
+
+from .hrf import get_hrf_library
+from .matrices import convolve_hrf_microtime
 
 
 def load_nuisance_file(
@@ -569,6 +570,7 @@ def _evaluate_hrfs_insample(
     chunk_iter = range(0, n_voxels, chunk_size)
     if verbose:
         from tqdm.auto import tqdm as _tqdm
+
         chunk_iter = _tqdm(list(chunk_iter), desc="Voxel chunks (in-sample)")
 
     for cs in chunk_iter:
@@ -580,8 +582,8 @@ def _evaluate_hrfs_insample(
         ss_tot_chunk = ss_tot[cs:ce].to(device)
 
         for d_idx in range(n_designs):
-            betas = pinvs[d_idx] @ data_chunk.T          # (n_reg, chunk)
-            yhat = (designs_gpu[d_idx] @ betas).T         # (chunk, n_timepoints)
+            betas = pinvs[d_idx] @ data_chunk.T  # (n_reg, chunk)
+            yhat = (designs_gpu[d_idx] @ betas).T  # (chunk, n_timepoints)
             ss_res = ((data_chunk - yhat) ** 2).sum(dim=1)
             r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).cpu()
 
@@ -736,7 +738,7 @@ def fit_glm_hrf_library_with_xval(
         if verbose:
             print(
                 f"  Zero-variance voxels skipped: {_n_zero:,}/{_n_voxels_orig:,} "
-                f"({100*_n_zero/_n_voxels_orig:.1f}%)"
+                f"({100 * _n_zero / _n_voxels_orig:.1f}%)"
             )
     n_voxels = data.shape[0]
 
@@ -746,6 +748,7 @@ def fit_glm_hrf_library_with_xval(
     # Auto-fallback: CV requires ≥ 2 runs
     if select_mode == "xval" and n_runs < 2:
         import warnings
+
         warnings.warn(
             "select_mode='xval' requires ≥ 2 runs for cross-validation; "
             "falling back to select_mode='full' (in-sample R²).",
@@ -836,10 +839,9 @@ def fit_glm_hrf_library_with_xval(
     if ortvec_files:
         for path, label in ortvec_files:
             from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
             ncols = load_nuisance_file(path).shape[1]
-            extra_nuisance_labels.extend(
-                f"{label}_{i:02d}" for i in range(ncols)
-            )
+            extra_nuisance_labels.extend(f"{label}_{i:02d}" for i in range(ncols))
 
     nuisance_blocks_per_run = build_nuisance_per_run(
         run_starts=run_starts,
@@ -1487,7 +1489,7 @@ def _fit_voxelwise_hrf(
     stored_dof = None
 
     for hrf_idx in hrf_iterator:
-        hrf_idx_int = hrf_idx.item() if hasattr(hrf_idx, 'item') else int(hrf_idx)
+        hrf_idx_int = hrf_idx.item() if hasattr(hrf_idx, "item") else int(hrf_idx)
 
         # Get voxels using this HRF
         voxel_mask = hrf_index == hrf_idx
@@ -1516,7 +1518,9 @@ def _fit_voxelwise_hrf(
         max_voxels_per_chunk = 50000 if device.type == "cuda" else 100000
         n_chunks = (n_group_voxels + max_voxels_per_chunk - 1) // max_voxels_per_chunk
 
-        def _fit_and_store(voxel_idx: torch.Tensor, label: str, _stim_design: torch.Tensor = stim_design) -> None:
+        def _fit_and_store(
+            voxel_idx: torch.Tensor, label: str, _stim_design: torch.Tensor = stim_design
+        ) -> None:
             """Fit GLM for a subset of voxels and store results."""
             nonlocal stored_dof
 
@@ -1796,7 +1800,7 @@ def _fit_voxelwise_hrf_single_trial(
         tqdm(unique_hrfs, desc="Refitting HRF groups") if verbose else unique_hrfs.tolist()
     )
     for hrf_idx in hrf_iterator:
-        hrf_idx_int = hrf_idx.item() if hasattr(hrf_idx, 'item') else int(hrf_idx)
+        hrf_idx_int = hrf_idx.item() if hasattr(hrf_idx, "item") else int(hrf_idx)
 
         # Get voxels using this HRF
         voxel_mask = hrf_index == hrf_idx
@@ -2286,9 +2290,9 @@ def save_hrf_selection_results(
     # 4c. Save selected HRF per voxel as 4D volume (x, y, z, n_hrf_timepoints)
     if results.hrf_library is not None and results.hrf_index is not None:
         selected_hrfs_file = f"{output_prefix}_selected_hrfs{nii_ext}"
-        hrf_lib = results.hrf_library.cpu()          # (n_hrfs, n_hrf_timepoints)
-        idx = results.hrf_index.cpu().long()          # (n_voxels,) 0-based
-        selected = hrf_lib[idx, :]                    # (n_voxels, n_hrf_timepoints)
+        hrf_lib = results.hrf_library.cpu()  # (n_hrfs, n_hrf_timepoints)
+        idx = results.hrf_index.cpu().long()  # (n_voxels,) 0-based
+        selected = hrf_lib[idx, :]  # (n_voxels, n_hrf_timepoints)
         _save_volume_4d(selected, selected_hrfs_file, volume_shape, affine, voxel_mask)
         output_files["selected_hrfs"] = selected_hrfs_file
 
@@ -2395,7 +2399,8 @@ def save_hrf_selection_results(
 
             warnings.warn(
                 "save_all_hrf_designs=True but onsets not provided. "
-                "Cannot generate individual HRF design matrices.", stacklevel=2
+                "Cannot generate individual HRF design matrices.",
+                stacklevel=2,
             )
         else:
             # Get parameters from metadata

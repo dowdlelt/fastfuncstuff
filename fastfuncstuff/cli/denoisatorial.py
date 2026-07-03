@@ -52,7 +52,6 @@ try:
         parse_prefix,
         print_cli_header,
     )
-    from fastfuncstuff.denoise.sequential import select_noise_pool_voxels
     from fastfuncstuff.denoise.combinatorial import (
         CombinatorialDenoiseResults,
         compute_initial_xval_r2,
@@ -63,13 +62,19 @@ try:
         plot_plateau_curves,
         plot_singleton_contributions,
     )
+    from fastfuncstuff.denoise.sequential import select_noise_pool_voxels
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
-    from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.glm.ridge import load_hrf_indices
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.utils import configure_torch_backends, get_device, scale_to_percent_signal, to_tensor
+    from fastfuncstuff.utils import (
+        configure_torch_backends,
+        get_device,
+        scale_to_percent_signal,
+        to_tensor,
+    )
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -238,8 +243,7 @@ Notes:
         type=float,
         metavar=("PERCENTILE", "FRACTION"),
         default=None,
-        help="Signal intensity threshold for noise pool selection. "
-        "Example: -brainthresh 99 0.5",
+        help="Signal intensity threshold for noise pool selection. Example: -brainthresh 99 0.5",
     )
     combo_opts.add_argument(
         "-min_noise_voxels",
@@ -332,8 +336,7 @@ Notes:
         type=str,
         choices=["no", "yes", "full"],
         default="no",
-        help="Save diagnostic plots: 'no' (none), 'yes' (scatter only), "
-        "'full' (scatter + heatmap)",
+        help="Save diagnostic plots: 'no' (none), 'yes' (scatter only), 'full' (scatter + heatmap)",
     )
     out_opts.add_argument(
         "-save_pcs",
@@ -447,7 +450,9 @@ def save_combinatorial_results(
             with open(pc_txt_path, "w") as f:
                 f.write(f"# Selected noise PCs for run {run_idx}\n")
                 f.write(f"# Selected PC indices: {selected_idx}\n")
-                f.write(f"# Shape: {selected_pcs.shape[0]} timepoints x {selected_pcs.shape[1]} PCs\n")
+                f.write(
+                    f"# Shape: {selected_pcs.shape[0]} timepoints x {selected_pcs.shape[1]} PCs\n"
+                )
                 if selected_pcs.shape[1] > 0:
                     np.savetxt(f, selected_pcs, fmt="%.6f", delimiter="\t")
             output_files[f"run{run_idx:02d}_selected_pcs_txt"] = pc_txt_path
@@ -464,9 +469,7 @@ def save_combinatorial_results(
                     r.optimal_combination for r in results.per_run_results
                 ],
                 "per_run_all_cod": [r.all_cod for r in results.per_run_results],
-                "per_run_all_var_explained": [
-                    r.all_var_explained for r in results.per_run_results
-                ],
+                "per_run_all_var_explained": [r.all_var_explained for r in results.per_run_results],
                 "per_run_variance_ratios": [
                     r.explained_variance_ratios for r in results.per_run_results
                 ],
@@ -481,12 +484,10 @@ def save_combinatorial_results(
     metadata = {
         **results.metadata,
         "per_run_optimal_combinations": {
-            f"run{r.run_idx:02d}": list(r.optimal_combination)
-            for r in results.per_run_results
+            f"run{r.run_idx:02d}": list(r.optimal_combination) for r in results.per_run_results
         },
         "per_run_optimal_cod": {
-            f"run{r.run_idx:02d}": float(r.optimal_cod)
-            for r in results.per_run_results
+            f"run{r.run_idx:02d}": float(r.optimal_cod) for r in results.per_run_results
         },
         "condition_labels": condition_labels,
         "volume_shape": list(volume_shape),
@@ -504,6 +505,7 @@ def save_combinatorial_results(
     if plots_mode in ["yes", "full"]:
         try:
             import matplotlib
+
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
@@ -571,6 +573,7 @@ def main():
     onset_files = args.onsets
     n_conditions = len(onset_files)
     from fastfuncstuff.cli_utils import clean_condition_labels
+
     condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
 
     for f in onset_files:
@@ -614,7 +617,7 @@ def main():
         print(f"  WARNING: max_pcs={args.max_pcs} gives {2**args.max_pcs} combinations.")
         print("  This may be slow and memory-intensive. Consider max_pcs <= 10.")
 
-    n_combos = 2 ** args.max_pcs
+    n_combos = 2**args.max_pcs
     print(f"  Max PCs: {args.max_pcs} -> {n_combos} combinations per run")
 
     # Setup device
@@ -698,7 +701,10 @@ def main():
     if args.do_scale:
         print()
         data, _, _ = scale_to_percent_signal(
-            data=data, run_starts=run_starts, max_scale=200.0, verbose=True,
+            data=data,
+            run_starts=run_starts,
+            max_scale=200.0,
+            verbose=True,
         )
 
     print(f"\n  Data shape: {data.shape} ({n_voxels:,} voxels x {n_timepoints} timepoints)")
@@ -715,7 +721,9 @@ def main():
     for onset_file in onset_files:
         onsets_by_run = parse_afni_timing_file(onset_file)
         if len(onsets_by_run) != n_runs:
-            print(f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}")
+            print(
+                f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}"
+            )
             sys.exit(1)
         all_onsets.append(onsets_by_run)
 
@@ -734,7 +742,7 @@ def main():
                 onset_bin = run_start_micro + int(np.round(onset_time / args.microtime_dt))
                 if onset_bin < n_microtime:
                     onset_matrix_micro[
-                        onset_bin: min(onset_bin + duration_bins, n_microtime),
+                        onset_bin : min(onset_bin + duration_bins, n_microtime),
                         cond_idx,
                     ] = 1.0
 
@@ -767,8 +775,11 @@ def main():
             # Determine n_hrfs from the unique indices
             n_hrfs = int(hrf_indices.max().item()) + 1
             hrf_library = get_hrf_library(
-                mode="library", tr=args.tr, n_hrfs=n_hrfs,
-                microtime_dt=args.microtime_dt, device=device,
+                mode="library",
+                tr=args.tr,
+                n_hrfs=n_hrfs,
+                microtime_dt=args.microtime_dt,
+                device=device,
             )
             print(f"  Using default HRF library with {hrf_library.shape[0]} HRFs")
 
@@ -782,6 +793,7 @@ def main():
 
         # Build per-HRF design matrices using refactored function
         from fastfuncstuff.cli_utils import build_task_design_from_args
+
         task_design, designs_by_hrf = build_task_design_from_args(
             hrf_model_name=hrf_model_name,
             is_fir_model=is_fir_model,
@@ -804,6 +816,7 @@ def main():
     else:
         # Single HRF model for all voxels - use refactored function
         from fastfuncstuff.cli_utils import build_task_design_from_args
+
         task_design, designs_by_hrf = build_task_design_from_args(
             hrf_model_name=hrf_model_name,
             is_fir_model=is_fir_model,
@@ -849,7 +862,10 @@ def main():
 
     # Add user nuisance blocks (-ortvec / -ortvec_run / -ortvec_glob).
     user_blocks = collect_nuisance_blocks(
-        args, run_starts, n_timepoints, verbose=(args.verb >= 1),
+        args,
+        run_starts,
+        n_timepoints,
+        verbose=(args.verb >= 1),
     )
     if user_blocks:
         for run_idx in range(n_runs):
@@ -864,14 +880,14 @@ def main():
                 if np.max(np.abs(col_mean)) > 1e-4:
                     m = m - col_mean
                 ortvec_run = torch.from_numpy(m).to(
-                    device=device, dtype=nuisance_per_run[run_idx].dtype,
+                    device=device,
+                    dtype=nuisance_per_run[run_idx].dtype,
                 )
                 nuisance_per_run[run_idx] = torch.cat(
-                    [nuisance_per_run[run_idx], ortvec_run], dim=1,
+                    [nuisance_per_run[run_idx], ortvec_run],
+                    dim=1,
                 )
-            max_nuisance_cols = max(
-                max_nuisance_cols, nuisance_per_run[run_idx].shape[1]
-            )
+            max_nuisance_cols = max(max_nuisance_cols, nuisance_per_run[run_idx].shape[1])
 
     # Pad nuisance to same columns
     for run_idx in range(n_runs):
@@ -882,11 +898,14 @@ def main():
                 device=device,
             )
             nuisance_per_run[run_idx] = torch.cat(
-                [nuisance_per_run[run_idx], padding], dim=1,
+                [nuisance_per_run[run_idx], padding],
+                dim=1,
             )
 
-    print(f"  Nuisance per run: {nuisance_per_run[0].shape[1]} cols "
-          f"(polort{'+ortvec' if user_blocks else ''})")
+    print(
+        f"  Nuisance per run: {nuisance_per_run[0].shape[1]} cols "
+        f"(polort{'+ortvec' if user_blocks else ''})"
+    )
 
     # ======================================================================
     # Step 1: Compute initial cross-validated R2 (task-only, for noise pool)
@@ -907,8 +926,10 @@ def main():
         verbose=args.verb >= 1,
     )
 
-    print(f"  Initial R2: median={initial_r2.median().item():.4f}, "
-          f"mean={initial_r2.mean().item():.4f}")
+    print(
+        f"  Initial R2: median={initial_r2.median().item():.4f}, "
+        f"mean={initial_r2.mean().item():.4f}"
+    )
 
     # ======================================================================
     # Step 2: Select noise pool
@@ -981,8 +1002,10 @@ def main():
         verbose=True,
     )
 
-    print(f"  Optimized R2: median={optimized_r2.median().item():.4f}, "
-          f"mean={optimized_r2.mean().item():.4f}")
+    print(
+        f"  Optimized R2: median={optimized_r2.median().item():.4f}, "
+        f"mean={optimized_r2.mean().item():.4f}"
+    )
 
     improvement = optimized_r2.median().item() - initial_r2.median().item()
     print(f"  Improvement: {improvement:+.4f} (median)")
@@ -1059,7 +1082,7 @@ def main():
             f"  Baseline R²: median={float(baseline_r2_t.median()):.4f}, "
             f"mean={float(baseline_r2_t.mean()):.4f}"
         )
-        print(f"  Δ R² (combinatorial − baseline):")
+        print("  Δ R² (combinatorial − baseline):")
         print(
             f"    Mean:    {float(delta_r2_t.mean()):+.4f}    "
             f"Median: {float(delta_r2_t.median()):+.4f}"
@@ -1107,6 +1130,7 @@ def main():
 
     # Save -compare outputs alongside the standard ones.
     if args.compare and baseline_r2_t is not None and delta_r2_t is not None:
+
         def _flat_to_vol(flat_t: torch.Tensor) -> np.ndarray:
             flat_np = flat_t.detach().cpu().numpy().astype(np.float32)
             if mask_flat is not None:
@@ -1141,8 +1165,10 @@ def main():
     print()
     print("  Per-run selections:")
     for run_res in results.per_run_results:
-        print(f"    Run {run_res.run_idx}: PCs {run_res.optimal_combination} "
-              f"(CoD={run_res.optimal_cod:.4f})")
+        print(
+            f"    Run {run_res.run_idx}: PCs {run_res.optimal_combination} "
+            f"(CoD={run_res.optimal_cod:.4f})"
+        )
     print()
     print(f"  Outputs: {len(output_files)} files saved with prefix '{args.prefix}'")
     print(f"  Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

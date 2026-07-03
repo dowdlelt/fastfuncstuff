@@ -1,19 +1,18 @@
-import torch
-import numpy as np
 import pytest
+import torch
 
 from fastfuncstuff.processing.cost import (
-    pearson_correlation,
+    IncrementalCorrelation,
     clipped_pearson_correlation,
     lpa_correlation,
-    IncrementalCorrelation,
+    pearson_correlation,
 )
-from fastfuncstuff.processing.weight import compute_weight_image
 from fastfuncstuff.processing.penalty import (
     compute_jacobian_energy,
     compute_penalty,
     compute_penalty_batched,
 )
+from fastfuncstuff.processing.weight import compute_weight_image
 
 
 class TestCostPearson:

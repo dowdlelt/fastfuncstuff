@@ -19,7 +19,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-
 _NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii")
 
 
@@ -130,7 +129,7 @@ def clean_condition_labels(raw_labels: list[str]) -> list[str]:
     for lab in raw_labels:
         s = lab
         if prefix:
-            s = s[len(prefix):]
+            s = s[len(prefix) :]
         if suffix:
             s = s[: -len(suffix)]
         cleaned.append(s if s else lab)
@@ -935,9 +934,7 @@ def _infer_run_indices_from_filenames(
             failures.append(f"{desc}: duplicate run numbers {sorted(dups)}")
             continue
         if any(n < 1 or n > n_runs for n in nums):
-            failures.append(
-                f"{desc}: out-of-range run numbers {sorted(nums)} for n_runs={n_runs}"
-            )
+            failures.append(f"{desc}: out-of-range run numbers {sorted(nums)} for n_runs={n_runs}")
             continue
         return [n - 1 for n in nums]
     raise ValueError(
@@ -950,13 +947,15 @@ def _infer_run_indices_from_filenames(
 
 
 def _slice_full_length_per_run(
-    arr: np.ndarray, run_starts: list[int], n_timepoints: int,
+    arr: np.ndarray,
+    run_starts: list[int],
+    n_timepoints: int,
 ) -> list[np.ndarray]:
     n_runs = len(run_starts)
     out = []
     for i in range(n_runs):
         end = run_starts[i + 1] if i < n_runs - 1 else n_timepoints
-        out.append(arr[run_starts[i]:end])
+        out.append(arr[run_starts[i] : end])
     return out
 
 
@@ -972,8 +971,7 @@ def make_nuisance_block_from_full_length(
     arr = load_nuisance_file(path)
     if arr.shape[0] != n_timepoints:
         raise ValueError(
-            f"{path}: has {arr.shape[0]} rows, design has "
-            f"{n_timepoints} total timepoints"
+            f"{path}: has {arr.shape[0]} rows, design has {n_timepoints} total timepoints"
         )
     per_run = _slice_full_length_per_run(arr, run_starts, n_timepoints)
     return NuisanceBlock(
@@ -996,17 +994,14 @@ def make_nuisance_block_from_per_run_file(
     n_runs = len(run_starts)
     run_idx = run_idx_1based - 1
     if not (0 <= run_idx < n_runs):
-        raise ValueError(
-            f"run index {run_idx_1based} out of range [1, {n_runs}] for {path}"
-        )
-    expected = (
-        run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-    ) - run_starts[run_idx]
+        raise ValueError(f"run index {run_idx_1based} out of range [1, {n_runs}] for {path}")
+    expected = (run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints) - run_starts[
+        run_idx
+    ]
     arr = load_nuisance_file(path)
     if arr.shape[0] != expected:
         raise ValueError(
-            f"{path}: has {arr.shape[0]} rows, run {run_idx_1based} has "
-            f"{expected} timepoints"
+            f"{path}: has {arr.shape[0]} rows, run {run_idx_1based} has {expected} timepoints"
         )
     per_run: list[np.ndarray | None] = [None] * n_runs
     per_run[run_idx] = arr
@@ -1033,20 +1028,20 @@ def make_nuisance_block_from_glob(
 
     n_runs = len(run_starts)
     run_indices_0 = _infer_run_indices_from_filenames(
-        [p.name for p in matched], n_runs=n_runs,
+        [p.name for p in matched],
+        n_runs=n_runs,
     )
 
     per_run: list[np.ndarray | None] = [None] * n_runs
     source: list[str | None] = [None] * n_runs
     for path, run_idx in zip(matched, run_indices_0):
-        expected = (
-            run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        ) - run_starts[run_idx]
+        expected = (run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints) - run_starts[
+            run_idx
+        ]
         arr = load_nuisance_file(path)
         if arr.shape[0] != expected:
             raise ValueError(
-                f"{path}: has {arr.shape[0]} rows, run {run_idx + 1} has "
-                f"{expected} timepoints"
+                f"{path}: has {arr.shape[0]} rows, run {run_idx + 1} has {expected} timepoints"
             )
         per_run[run_idx] = arr
         source[run_idx] = str(path)
@@ -1111,7 +1106,9 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
 
 
 def expand_ortvec_concat(
-    pattern: str, label: str, n_runs: int,
+    pattern: str,
+    label: str,
+    n_runs: int,
 ) -> list[tuple[Path, str]]:
     """Expand a ``-ortvec_concat PATTERN LABEL`` invocation into a list of
     ``(file, suffixed_label)`` pairs, ordered by inferred run index.
@@ -1125,14 +1122,18 @@ def expand_ortvec_concat(
     if not matched:
         raise ValueError(f"-ortvec_concat {pattern!r}: matched no files")
     run_indices_1 = [
-        i + 1 for i in _infer_run_indices_from_filenames(
-            [p.name for p in matched], n_runs=n_runs,
+        i + 1
+        for i in _infer_run_indices_from_filenames(
+            [p.name for p in matched],
+            n_runs=n_runs,
         )
     ]
     width = max(2, len(str(n_runs)))
     return sorted(
-        ((path, f"{label}{idx:0{width}d}") for path, idx in
-         zip(matched, run_indices_1, strict=True)),
+        (
+            (path, f"{label}{idx:0{width}d}")
+            for path, idx in zip(matched, run_indices_1, strict=True)
+        ),
         key=lambda t: t[1],
     )
 
@@ -1154,7 +1155,10 @@ def collect_nuisance_blocks(
     for path, label in getattr(args, "ortvec", None) or []:
         blocks.append(
             make_nuisance_block_from_full_length(
-                path, label, run_starts, n_timepoints,
+                path,
+                label,
+                run_starts,
+                n_timepoints,
             )
         )
         if verbose:
@@ -1163,28 +1167,30 @@ def collect_nuisance_blocks(
         try:
             run_idx = int(run_str)
         except ValueError:
-            print(
-                f"ERROR: -ortvec_run RUN must be a 1-based integer, got {run_str!r}"
-            )
+            print(f"ERROR: -ortvec_run RUN must be a 1-based integer, got {run_str!r}")
             sys.exit(1)
         blocks.append(
             make_nuisance_block_from_per_run_file(
-                path, label, run_idx, run_starts, n_timepoints,
+                path,
+                label,
+                run_idx,
+                run_starts,
+                n_timepoints,
             )
         )
         if verbose:
             print(f"  -ortvec_run: {path} (label={label}, run={run_idx})")
     for pattern, label in getattr(args, "ortvec_glob", None) or []:
         block = make_nuisance_block_from_glob(
-            pattern, label, run_starts, n_timepoints,
+            pattern,
+            label,
+            run_starts,
+            n_timepoints,
         )
         blocks.append(block)
         if verbose:
             matched = [s for s in block.source if s]
-            print(
-                f"  -ortvec_glob: {pattern} (label={label}) → "
-                f"{len(matched)} run(s) assigned"
-            )
+            print(f"  -ortvec_glob: {pattern} (label={label}) → {len(matched)} run(s) assigned")
     # -ortvec_concat: glob over already-full-length per-run files; each becomes
     # its own full-length NuisanceBlock with an auto-suffixed label. Equivalent
     # to writing N -ortvec calls.
@@ -1193,13 +1199,14 @@ def collect_nuisance_blocks(
         for path, suffixed_label in expand_ortvec_concat(pattern, label, n_runs):
             blocks.append(
                 make_nuisance_block_from_full_length(
-                    path, suffixed_label, run_starts, n_timepoints,
+                    path,
+                    suffixed_label,
+                    run_starts,
+                    n_timepoints,
                 )
             )
             if verbose:
-                print(
-                    f"  -ortvec_concat: {path} (label={suffixed_label})"
-                )
+                print(f"  -ortvec_concat: {path} (label={suffixed_label})")
     return blocks
 
 
@@ -1259,8 +1266,7 @@ def assemble_per_run_nuisance(
             per_run_names[run_idx].extend(block_col_names)
         if block_demeaned_any_run and verbose:
             print(
-                f"  Demeaned nuisance block {block.label!r} per-run "
-                "(was not zero-mean as supplied)"
+                f"  Demeaned nuisance block {block.label!r} per-run (was not zero-mean as supplied)"
             )
 
     # Optional already-loaded per-run noise PCs (legacy path, e.g. ffs_denoise).
@@ -1270,9 +1276,7 @@ def assemble_per_run_nuisance(
                 continue
             pcs = pcs.to(device=device, dtype=per_run_t[run_idx].dtype)
             per_run_t[run_idx] = torch.cat([per_run_t[run_idx], pcs], dim=1)
-            per_run_names[run_idx].extend(
-                f"noisepc_{c:02d}" for c in range(pcs.shape[1])
-            )
+            per_run_names[run_idx].extend(f"noisepc_{c:02d}" for c in range(pcs.shape[1]))
 
     if verbose:
         for run_idx, m in enumerate(per_run_t):
@@ -1293,7 +1297,7 @@ def build_nuisance_per_run(
     ortvec_files: list[tuple[str, str]] | None = None,
     ortvec_data: torch.Tensor | None = None,
     noise_pcs: list[torch.Tensor] | None = None,
-    blocks: list["NuisanceBlock"] | None = None,
+    blocks: list[NuisanceBlock] | None = None,
     verbose: bool = False,
 ) -> list[torch.Tensor]:
     """
@@ -1355,7 +1359,10 @@ def build_nuisance_per_run(
         for filepath, label in ortvec_files:
             all_blocks.append(
                 make_nuisance_block_from_full_length(
-                    filepath, label, run_starts, n_timepoints,
+                    filepath,
+                    label,
+                    run_starts,
+                    n_timepoints,
                 )
             )
             if verbose:
@@ -1368,9 +1375,7 @@ def build_nuisance_per_run(
             else np.asarray(ortvec_data)
         )
         if arr.shape[0] != n_timepoints:
-            print(
-                f"ERROR: ortvec_data has {arr.shape[0]} rows, expected {n_timepoints}"
-            )
+            print(f"ERROR: ortvec_data has {arr.shape[0]} rows, expected {n_timepoints}")
             sys.exit(1)
         all_blocks.append(
             NuisanceBlock(
@@ -1398,7 +1403,7 @@ def build_nuisance_block_diag(
     polort: int,
     device: torch.device,
     ortvec_files: list[tuple[str, str]] | None = None,
-    blocks: list["NuisanceBlock"] | None = None,
+    blocks: list[NuisanceBlock] | None = None,
     verbose: bool = False,
 ) -> torch.Tensor:
     """
@@ -1458,8 +1463,7 @@ def build_nuisance_block_diag(
 
     n_runs = len(run_starts)
     run_lengths = [
-        run_starts[i + 1] - run_starts[i] if i < n_runs - 1
-        else n_timepoints - run_starts[i]
+        run_starts[i + 1] - run_starts[i] if i < n_runs - 1 else n_timepoints - run_starts[i]
         for i in range(n_runs)
     ]
 
@@ -1480,7 +1484,10 @@ def build_nuisance_block_diag(
         for filepath, label in ortvec_files:
             all_blocks.append(
                 make_nuisance_block_from_full_length(
-                    filepath, label, run_starts, n_timepoints,
+                    filepath,
+                    label,
+                    run_starts,
+                    n_timepoints,
                 )
             )
 
@@ -1495,16 +1502,17 @@ def build_nuisance_block_diag(
         # Stack per-run matrices into full-length columns. For full-length
         # files this recovers the SHARED ortvec layout. For per-run files
         # missing runs come out as zeros — natural per-run nuisance.
-        full = np.vstack([
-            block.get_run(i, run_lengths[i]) for i in range(n_runs)
-        ]).astype(np.float32)
+        full = np.vstack([block.get_run(i, run_lengths[i]) for i in range(n_runs)]).astype(
+            np.float32
+        )
         col_mean = full.mean(axis=0, keepdims=True)
         if np.max(np.abs(col_mean)) > 1e-4:
             full = full - col_mean
             if verbose:
                 print(f"    Demeaned ortvec {block.label!r} (was not zero-mean)")
         ortvec_tensor = torch.from_numpy(full).to(
-            device=device, dtype=nuisance_design.dtype,
+            device=device,
+            dtype=nuisance_design.dtype,
         )
         nuisance_design = torch.cat([nuisance_design, ortvec_tensor], dim=1)
         if verbose:
@@ -1976,8 +1984,12 @@ def build_task_design_from_args(
     """
     import sys
 
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime, make_fir_design, make_tent_design
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
+    from fastfuncstuff.design.matrices import (
+        convolve_hrf_microtime,
+        make_fir_design,
+        make_tent_design,
+    )
 
     if hrf_opt:
         # Per-voxel HRF mode: build designs_by_hrf dict

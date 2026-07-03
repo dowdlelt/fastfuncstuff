@@ -9,11 +9,12 @@ Covers:
   beats unconstrained OLS at low SNR and reduces to OLS at high SNR.
 - Determinism: re-running with the same seed gives identical output.
 """
+
 from __future__ import annotations
 
 import numpy as np
-import torch
 import pytest
+import torch
 
 from fastfuncstuff.design.flobs import (
     FLOBSBasis,
@@ -56,7 +57,7 @@ def test_basis_l2_unit_columns(basis):
 
 
 def test_basis_top3_explain_most_variance(basis):
-    ev = basis.eigenvalues ** 2
+    ev = basis.eigenvalues**2
     frac = ev / ev.sum()
     # TR04MW2 fig 3 shows the top 3 dominate; sharp elbow at K=3
     assert frac[:3].sum() > 0.90
@@ -92,7 +93,9 @@ def test_basis_custom_parametrization():
     # the basis shape responds — e.g. m4 push to longer tails should
     # make PC1 peak slightly later).
     long_tails = generate_flobs_basis(
-        n_basis=3, n_samples=500, seed=1,
+        n_basis=3,
+        n_samples=500,
+        seed=1,
         parametrization={"m4": (8.0, 14.0)},
     )
     default = generate_flobs_basis(n_basis=3, n_samples=500, seed=1)
@@ -115,7 +118,8 @@ def _build_test_data(basis, n_vox=80, n_t=200, tr=1.0, noise_sigma=0.5, seed=7):
     onset_idx = np.array([10, 35, 60, 90, 115, 150, 180])
     basis_tr = basis.basis_functions[:, :: int(round(tr / basis.dt))]
     X = np.zeros((n_t, 3))
-    onsets = np.zeros(n_t); onsets[onset_idx] = 1.0
+    onsets = np.zeros(n_t)
+    onsets[onset_idx] = 1.0
     for b in range(3):
         X[:, b] = np.convolve(onsets, basis_tr[b])[:n_t]
     y_clean = (X @ true_coefs.T).T
@@ -131,7 +135,9 @@ def test_constrained_fit_high_snr_matches_ols(basis):
     fit = fit_flobs_constrained(
         data=torch.from_numpy(y).double(),
         design_task=torch.from_numpy(X).double(),
-        basis=basis, n_conditions=1, prior_weight="auto",
+        basis=basis,
+        n_conditions=1,
+        prior_weight="auto",
         device=torch.device("cpu"),
     )
     err_ols = np.linalg.norm(beta_ols - true_coefs, axis=1).mean()
@@ -148,7 +154,9 @@ def test_constrained_fit_low_snr_beats_ols(basis):
     fit = fit_flobs_constrained(
         data=torch.from_numpy(y).double(),
         design_task=torch.from_numpy(X).double(),
-        basis=basis, n_conditions=1, prior_weight="auto",
+        basis=basis,
+        n_conditions=1,
+        prior_weight="auto",
         device=torch.device("cpu"),
     )
     err_ols = np.linalg.norm(beta_ols - true_coefs, axis=1).mean()
@@ -164,7 +172,9 @@ def test_constrained_fit_prior_weight_zero_equals_ols(basis):
     fit = fit_flobs_constrained(
         data=torch.from_numpy(y).double(),
         design_task=torch.from_numpy(X).double(),
-        basis=basis, n_conditions=1, prior_weight=0.0,
+        basis=basis,
+        n_conditions=1,
+        prior_weight=0.0,
         device=torch.device("cpu"),
     )
     np.testing.assert_allclose(fit.betas, beta_ols, atol=1e-6)
@@ -175,7 +185,8 @@ def test_constrained_fit_returns_correct_shapes(basis):
     fit = fit_flobs_constrained(
         data=torch.from_numpy(y).double(),
         design_task=torch.from_numpy(X).double(),
-        basis=basis, n_conditions=1,
+        basis=basis,
+        n_conditions=1,
         device=torch.device("cpu"),
     )
     assert isinstance(fit, FLOBSFitResult)
@@ -198,7 +209,8 @@ def test_constrained_fit_with_nuisance(basis):
     fit = fit_flobs_constrained(
         data=torch.from_numpy(y_drift).double(),
         design_task=torch.from_numpy(X).double(),
-        basis=basis, n_conditions=1,
+        basis=basis,
+        n_conditions=1,
         nuisance=torch.from_numpy(Z).double(),
         device=torch.device("cpu"),
     )
@@ -289,7 +301,8 @@ def test_renamed_primitive_matches_old_alias(basis):
     fit_old = fit_flobs_constrained(
         data=torch.from_numpy(y).double(),
         design_task=torch.from_numpy(X).double(),
-        basis=basis, n_conditions=1,
+        basis=basis,
+        n_conditions=1,
         device=torch.device("cpu"),
     )
     fit_new = fit_basis_constrained_ridge(
@@ -318,13 +331,14 @@ def test_spmg2_constrained_fit_beats_ols_at_low_snr():
 
     # True coefs: real amplitude, small-to-zero derivative
     true_canon = rng.uniform(0.5, 3.0, size=n_vox)
-    true_deriv = rng.normal(0.0, 0.05, size=n_vox)            # tiny
-    true_coefs = np.column_stack([true_canon, true_deriv])    # (n_vox, 2)
+    true_deriv = rng.normal(0.0, 0.05, size=n_vox)  # tiny
+    true_coefs = np.column_stack([true_canon, true_deriv])  # (n_vox, 2)
 
     # Design at TR resolution
     sb_tr = sb.basis_functions[:, :: int(round(tr / sb.dt))]
     X = np.zeros((n_t, 2))
-    onsets = np.zeros(n_t); onsets[[15, 45, 80, 120, 165]] = 1.0
+    onsets = np.zeros(n_t)
+    onsets[[15, 45, 80, 120, 165]] = 1.0
     for b in range(2):
         X[:, b] = np.convolve(onsets, sb_tr[b])[:n_t]
     y_clean = (X @ true_coefs.T).T
@@ -355,8 +369,9 @@ def test_spmg2_constrained_fit_beats_ols_at_low_snr():
 # ---------- cv_basis_constrained_ridge --------------------------------------
 
 
-def _build_multirun_synth(basis, n_runs=4, n_tp_run=120, n_vox=60, noise_sigma=1.0,
-                          tr=1.0, seed=11):
+def _build_multirun_synth(
+    basis, n_runs=4, n_tp_run=120, n_vox=60, noise_sigma=1.0, tr=1.0, seed=11
+):
     """Build per-run (data, task design) lists for CV tests.
 
     Same true coefficient vector for every voxel, drawn from the
@@ -373,10 +388,11 @@ def _build_multirun_synth(basis, n_runs=4, n_tp_run=120, n_vox=60, noise_sigma=1
     for r in range(n_runs):
         onset_idx = np.sort(rng.choice(np.arange(8, n_tp_run - 30), size=7, replace=False))
         X = np.zeros((n_tp_run, K))
-        on = np.zeros(n_tp_run); on[onset_idx] = 1.0
+        on = np.zeros(n_tp_run)
+        on[onset_idx] = 1.0
         for b in range(K):
             X[:, b] = np.convolve(on, basis_tr[b])[:n_tp_run]
-        y_clean = (X @ true_coefs.T).T                                 # (n_vox, n_tp)
+        y_clean = (X @ true_coefs.T).T  # (n_vox, n_tp)
         y = y_clean + noise_sigma * y_clean.std() * rng.standard_normal((n_vox, n_tp_run))
         per_run_data.append(torch.from_numpy(y).float())
         per_run_task.append(torch.from_numpy(X).float())
@@ -399,17 +415,20 @@ def test_cv_returns_correct_shapes(basis):
         verbose=False,
     )
     assert isinstance(cv, FLOBSCVResult)
-    assert cv.r2_per_weight.shape == (20, 4)             # OLS + 3 weights
+    assert cv.r2_per_weight.shape == (20, 4)  # OLS + 3 weights
     assert cv.argmax_weight_idx.shape == (20,)
     assert cv.weights[0] == "OLS"
-    assert cv.n_splits == 4                              # LORO with 4 runs
+    assert cv.n_splits == 4  # LORO with 4 runs
 
 
 def test_cv_high_snr_prefers_ols(basis):
     """At high SNR, OLS should win held-out R² since the prior is
     unnecessary; constraint at strong weights should hurt."""
     per_run_data, per_run_task, _ = _build_multirun_synth(
-        basis, n_runs=4, n_vox=40, noise_sigma=0.05,
+        basis,
+        n_runs=4,
+        n_vox=40,
+        noise_sigma=0.05,
     )
     cv = cv_basis_constrained_ridge(
         per_run_data=per_run_data,
@@ -438,7 +457,10 @@ def test_cv_low_snr_prefers_constrained(basis):
     """At low SNR, OLS overfits → held-out R² lower than a sensible
     constraint."""
     per_run_data, per_run_task, _ = _build_multirun_synth(
-        basis, n_runs=4, n_vox=40, noise_sigma=4.0,
+        basis,
+        n_runs=4,
+        n_vox=40,
+        noise_sigma=4.0,
     )
     cv = cv_basis_constrained_ridge(
         per_run_data=per_run_data,
@@ -456,9 +478,10 @@ def test_cv_low_snr_prefers_constrained(basis):
     medians = np.median(cv.r2_per_weight, axis=0)
     ols_idx = cv.weights.index("OLS")
     # Best constrained should beat OLS at low SNR
-    best_constrained_idx = int(np.argmax([medians[i] for i in range(len(cv.weights))
-                                          if cv.weights[i] != "OLS"]))
-    best_constrained_idx += 1 if ols_idx == 0 else 0     # skip OLS slot
+    best_constrained_idx = int(
+        np.argmax([medians[i] for i in range(len(cv.weights)) if cv.weights[i] != "OLS"])
+    )
+    best_constrained_idx += 1 if ols_idx == 0 else 0  # skip OLS slot
     assert medians[best_constrained_idx] > medians[ols_idx]
 
 
@@ -467,25 +490,28 @@ def test_voxelwise_lambda_runs_and_differs_from_global(basis):
     heterogeneous-SNR data, and ought to shrink high-SNR voxels less
     than the global path does."""
     rng = np.random.default_rng(31)
-    n_t = 200; tr = 1.0
+    n_t = 200
+    tr = 1.0
     sb = generate_spmg_basis(n_basis=2, duration=32.0, dt=0.1)
     sb_tr = sb.basis_functions[:, :: int(round(tr / sb.dt))]
     X = np.zeros((n_t, 2))
-    on = np.zeros(n_t); on[[15, 45, 80, 120, 165]] = 1.0
+    on = np.zeros(n_t)
+    on[[15, 45, 80, 120, 165]] = 1.0
     for b in range(2):
         X[:, b] = np.convolve(on, sb_tr[b])[:n_t]
 
     # Make voxels with VERY heterogeneous SNR — first half low-noise,
     # second half high-noise — so per-voxel σ² differs by 100×.
     n_vox = 40
-    true_coefs = np.column_stack([
-        rng.uniform(0.5, 2.0, size=n_vox),
-        rng.normal(0.0, 0.05, size=n_vox),
-    ])
-    y_clean = (X @ true_coefs.T).T                                # (n_vox, n_t)
+    true_coefs = np.column_stack(
+        [
+            rng.uniform(0.5, 2.0, size=n_vox),
+            rng.normal(0.0, 0.05, size=n_vox),
+        ]
+    )
+    y_clean = (X @ true_coefs.T).T  # (n_vox, n_t)
     noise = rng.standard_normal((n_vox, n_t))
-    sigma_per_vox = np.concatenate([np.full(n_vox // 2, 0.1),
-                                     np.full(n_vox - n_vox // 2, 5.0)])
+    sigma_per_vox = np.concatenate([np.full(n_vox // 2, 0.1), np.full(n_vox - n_vox // 2, 5.0)])
     y = y_clean + sigma_per_vox[:, None] * y_clean.std() * noise
 
     pm, pc = spmg_prior(canonical_std=5.0, derivative_std=0.3)
@@ -493,12 +519,13 @@ def test_voxelwise_lambda_runs_and_differs_from_global(basis):
         data=torch.from_numpy(y).double(),
         design_task=torch.from_numpy(X).double(),
         basis_functions=sb.basis_functions,
-        prior_mean=pm, prior_cov=pc, n_blocks=1,
+        prior_mean=pm,
+        prior_cov=pc,
+        n_blocks=1,
         device=torch.device("cpu"),
     )
     fit_global = fit_basis_constrained_ridge(**common, lambda_mode="global")
-    fit_voxel = fit_basis_constrained_ridge(**common, lambda_mode="voxelwise",
-                                            lambda_n_bins=8)
+    fit_voxel = fit_basis_constrained_ridge(**common, lambda_mode="voxelwise", lambda_n_bins=8)
 
     # Different mode → different betas
     assert not np.allclose(fit_global.betas, fit_voxel.betas, atol=1e-6)
@@ -511,9 +538,7 @@ def test_voxelwise_lambda_runs_and_differs_from_global(basis):
     diff_to_ols_global = np.abs(
         fit_global.betas[low_idx, 0] - fit_global.betas_ols[low_idx, 0]
     ).mean()
-    diff_to_ols_voxel = np.abs(
-        fit_voxel.betas[low_idx, 0] - fit_voxel.betas_ols[low_idx, 0]
-    ).mean()
+    diff_to_ols_voxel = np.abs(fit_voxel.betas[low_idx, 0] - fit_voxel.betas_ols[low_idx, 0]).mean()
     assert diff_to_ols_voxel < diff_to_ols_global
 
 
@@ -524,7 +549,9 @@ def test_voxelwise_lambda_invalid_mode(basis):
             data=torch.from_numpy(y).double(),
             design_task=torch.from_numpy(X).double(),
             basis_functions=basis.basis_functions,
-            prior_mean=basis.m, prior_cov=basis.C, n_blocks=1,
+            prior_mean=basis.m,
+            prior_cov=basis.C,
+            n_blocks=1,
             lambda_mode="nonsense",
             device=torch.device("cpu"),
         )
@@ -550,14 +577,15 @@ def test_decouple_amplitude_prior_preserves_amplitude(basis):
     sb = generate_spmg_basis(n_basis=2, duration=32.0, dt=0.1)
     sb_tr = sb.basis_functions[:, :: int(round(tr / sb.dt))]
     X = np.zeros((n_t, 2))
-    on = np.zeros(n_t); on[[15, 45, 80, 120, 165]] = 1.0
+    on = np.zeros(n_t)
+    on[[15, 45, 80, 120, 165]] = 1.0
     for b in range(2):
         X[:, b] = np.convolve(on, sb_tr[b])[:n_t]
 
     # 30 voxels with LARGE amplitudes (we want to see if the prior
     # over-shrinks them).
     n_vox = 30
-    true_canon = rng.uniform(2.0, 5.0, size=n_vox)               # strong signal
+    true_canon = rng.uniform(2.0, 5.0, size=n_vox)  # strong signal
     true_deriv = rng.normal(0.0, 0.05, size=n_vox)
     true_coefs = np.column_stack([true_canon, true_deriv])
     y_clean = (X @ true_coefs.T).T
@@ -574,14 +602,12 @@ def test_decouple_amplitude_prior_preserves_amplitude(basis):
         design_task=torch.from_numpy(X).double(),
         basis_functions=sb.basis_functions,
         n_blocks=1,
-        prior_weight=5.0,                                # strong prior
+        prior_weight=5.0,  # strong prior
         device=torch.device("cpu"),
     )
-    fit_mvn = fit_basis_constrained_ridge(prior_mean=base_m, prior_cov=base_C,
-                                          **common)
+    fit_mvn = fit_basis_constrained_ridge(prior_mean=base_m, prior_cov=base_C, **common)
     m_dec, C_dec = decouple_amplitude_prior(base_m, base_C)
-    fit_dec = fit_basis_constrained_ridge(prior_mean=m_dec, prior_cov=C_dec,
-                                          **common)
+    fit_dec = fit_basis_constrained_ridge(prior_mean=m_dec, prior_cov=C_dec, **common)
 
     # On the amplitude (col 0) coefficient: decoupled fit should be
     # CLOSER to OLS than plain mvn (which shrinks it toward base_m[0]=3,
@@ -597,7 +623,11 @@ def test_decouple_amplitude_prior_preserves_amplitude(basis):
     # should shrink it; the decoupled prior shouldn't undo the shape
     # constraint.  Check that decoupled derivative magnitude isn't
     # dramatically larger than mvn's.
-    deriv_mvn = np.abs(fit_mvn.betas[:, 1]).median() if hasattr(np.abs(fit_mvn.betas[:, 1]), 'median') else float(np.median(np.abs(fit_mvn.betas[:, 1])))
+    deriv_mvn = (
+        np.abs(fit_mvn.betas[:, 1]).median()
+        if hasattr(np.abs(fit_mvn.betas[:, 1]), "median")
+        else float(np.median(np.abs(fit_mvn.betas[:, 1])))
+    )
     deriv_dec = float(np.median(np.abs(fit_dec.betas[:, 1])))
     deriv_ols = float(np.median(np.abs(fit_mvn.betas_ols[:, 1])))
     # Decoupled should still shrink derivative — it should be closer
@@ -612,8 +642,10 @@ def test_constrained_fit_two_conditions(basis):
     n_b = 3
     basis_tr = basis.basis_functions[:, :: int(round(tr / basis.dt))]
     X = np.zeros((n_t, 2 * n_b))
-    on0 = np.zeros(n_t); on0[[15, 60, 130]] = 1.0
-    on1 = np.zeros(n_t); on1[[40, 90, 170]] = 1.0
+    on0 = np.zeros(n_t)
+    on0[[15, 60, 130]] = 1.0
+    on1 = np.zeros(n_t)
+    on1[[40, 90, 170]] = 1.0
     for b in range(n_b):
         X[:, b] = np.convolve(on0, basis_tr[b])[:n_t]
         X[:, n_b + b] = np.convolve(on1, basis_tr[b])[:n_t]
@@ -626,14 +658,15 @@ def test_constrained_fit_two_conditions(basis):
     fit = fit_flobs_constrained(
         data=torch.from_numpy(y).double(),
         design_task=torch.from_numpy(X).double(),
-        basis=basis, n_conditions=2,
+        basis=basis,
+        n_conditions=2,
         device=torch.device("cpu"),
     )
     assert fit.betas.shape == (n_vox, 6)
     assert fit.hrfs.shape == (n_vox, 2, basis.basis_functions.shape[1])
     # Each condition's recovery should be sensible
     for c in range(2):
-        beta_c = fit.betas[:, c * n_b:(c + 1) * n_b]
+        beta_c = fit.betas[:, c * n_b : (c + 1) * n_b]
         err = np.linalg.norm(beta_c - coefs[:, c], axis=1).mean()
         assert err < 1.5  # generous, just a sanity check
 
@@ -672,7 +705,10 @@ def test_fracridge_low_snr_prefers_shrinkage(basis):
     """At low SNR, lots of voxels should pick a frac < 1.0 (some shrinkage)
     rather than frac=1.0 (OLS).  Pure OLS overfits the held-out data."""
     per_run_data, per_run_task, _ = _build_multirun_synth(
-        basis, n_runs=4, n_vox=80, noise_sigma=4.0,
+        basis,
+        n_runs=4,
+        n_vox=80,
+        noise_sigma=4.0,
     )
     fit = fit_basis_fracridge(
         per_run_data=per_run_data,
@@ -708,9 +744,7 @@ def test_arma11_prewhiten_recovers_known_ar_coefficient(basis):
     for _ in range(n_runs):
         on = np.zeros(n_tp)
         on[rng.choice(np.arange(8, n_tp - 30), 7, replace=False)] = 1.0
-        X = np.stack(
-            [np.convolve(on, basis_tr[b])[:n_tp] for b in range(K)], axis=1
-        )
+        X = np.stack([np.convolve(on, basis_tr[b])[:n_tp] for b in range(K)], axis=1)
         y_clean = (X @ true_coefs.T).T
         eps = rng.standard_normal((n_vox, n_tp))
         noise = np.zeros_like(eps)
@@ -722,8 +756,11 @@ def test_arma11_prewhiten_recovers_known_ar_coefficient(basis):
         per_run_designs.append(torch.from_numpy(X).float())
 
     pwd, pwds, a_opt, b_opt = estimate_and_apply_arma11_prewhitening(
-        per_run_data, per_run_designs, polort=2,
-        device=torch.device("cpu"), verbose=False,
+        per_run_data,
+        per_run_designs,
+        polort=2,
+        device=torch.device("cpu"),
+        verbose=False,
     )
     # Default grid step is 0.1, so accept |a - target| ≤ 0.1.
     assert abs(a_opt - target_rho) <= 0.1, f"got a={a_opt}, expected ~{target_rho}"
@@ -749,9 +786,7 @@ def test_per_voxel_arma_recovers_two_groups(basis):
     for _ in range(n_runs):
         on = np.zeros(n_tp)
         on[rng.choice(np.arange(8, n_tp - 30), 7, replace=False)] = 1.0
-        X = np.stack(
-            [np.convolve(on, basis_tr[b])[:n_tp] for b in range(K)], axis=1
-        )
+        X = np.stack([np.convolve(on, basis_tr[b])[:n_tp] for b in range(K)], axis=1)
         y_clean = (X @ true_coefs.T).T
         eps = rng.standard_normal((n_vox, n_tp))
         noise = np.zeros_like(eps)
@@ -766,17 +801,25 @@ def test_per_voxel_arma_recovers_two_groups(basis):
         bin_and_whiten_arma11,
         estimate_arma11_per_voxel,
     )
+
     ab = estimate_arma11_per_voxel(
-        per_run_data, per_run_designs, polort=2,
-        device=torch.device("cpu"), verbose=False,
+        per_run_data,
+        per_run_designs,
+        polort=2,
+        device=torch.device("cpu"),
+        verbose=False,
     )
     assert ab.shape == (n_vox, 2)
     assert abs(np.median(ab[: n_vox // 2, 0]) - 0.3) <= 0.1
     assert abs(np.median(ab[n_vox // 2 :, 0]) - 0.7) <= 0.1
 
     cells = bin_and_whiten_arma11(
-        per_run_data, per_run_designs, ab, polort=2,
-        device=torch.device("cpu"), verbose=False,
+        per_run_data,
+        per_run_designs,
+        ab,
+        polort=2,
+        device=torch.device("cpu"),
+        verbose=False,
     )
     # Sum of cell voxel counts == n_vox; each cell has the right shapes.
     total = sum(c.voxel_indices.size for c in cells)
@@ -785,4 +828,4 @@ def test_per_voxel_arma_recovers_two_groups(basis):
     assert cell.per_run_data[0].shape == (cell.voxel_indices.size, n_tp)
     assert cell.per_run_task_designs[0].shape == (n_tp, K)
     assert cell.per_run_polys is not None
-    assert cell.per_run_polys[0].shape == (n_tp, 3)         # polort=2 → 3 cols
+    assert cell.per_run_polys[0].shape == (n_tp, 3)  # polort=2 → 3 cols

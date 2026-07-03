@@ -30,18 +30,17 @@ import torch
 from scipy.special import gammaln as scipy_gammaln
 from tqdm.auto import tqdm
 
+from fastfuncstuff._compile import safe_compile
 from fastfuncstuff.denoise.sequential import estimate_noise_component_caps_per_run
-from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.design.builder import (
     create_onset_matrix_microtime,
     parse_afni_timing_file,
     parse_durations,
 )
-from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.design.hrf import get_spmg1_hrf
+from fastfuncstuff.design.matrices import convolve_hrf_microtime
+from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.utils import to_linalg_f64, to_tensor
-from fastfuncstuff._compile import safe_compile
-from .pca import PCA
 
 
 def parse_num_comps_spec(spec: str) -> int | float | str:
@@ -118,8 +117,7 @@ def apply_polort_projection(
                 dtype=data_vox_t.dtype,
             )
             # Zero-pad into full timeseries length
-            padded = torch.zeros(n_t, run_poly.shape[1], device=device,
-                                 dtype=data_vox_t.dtype)
+            padded = torch.zeros(n_t, run_poly.shape[1], device=device, dtype=data_vox_t.dtype)
             padded[rs:re, :] = run_poly
             poly = torch.cat([poly, padded], dim=1)
     else:
@@ -194,7 +192,10 @@ def apply_high_pass_fft(
         run_ends = list(run_starts[1:]) + [n_t]
         for rs, re in zip(run_starts, run_ends):
             data_vox_t[:, rs:re] = _apply_high_pass_single(
-                data_vox_t[:, rs:re], tr, high_pass_hz, transition_width,
+                data_vox_t[:, rs:re],
+                tr,
+                high_pass_hz,
+                transition_width,
             )
         return data_vox_t
 
@@ -1200,18 +1201,28 @@ def _ggm_em_step(
     x_neg_w: torch.Tensor,
     x_pos_mask_f: torch.Tensor,
     x_neg_mask_f: torch.Tensor,
-    mu_n: torch.Tensor, var_n: torch.Tensor,
-    mu_p: torch.Tensor, var_p: torch.Tensor,
-    mu_ng: torch.Tensor, var_ng: torch.Tensor,
-    pi_n: torch.Tensor, pi_p: torch.Tensor, pi_ng: torch.Tensor,
+    mu_n: torch.Tensor,
+    var_n: torch.Tensor,
+    mu_p: torch.Tensor,
+    var_p: torch.Tensor,
+    mu_ng: torch.Tensor,
+    var_ng: torch.Tensor,
+    pi_n: torch.Tensor,
+    pi_p: torch.Tensor,
+    pi_ng: torch.Tensor,
     active_mask_2d: torch.Tensor,
     n_scalar: float,
     min_mode_offset: float,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
     torch.Tensor,  # total (kept for optional convergence check)
 ]:
     """One E+M iteration of the Gaussian-Gamma mixture EM.
@@ -1227,15 +1238,15 @@ def _ggm_em_step(
     """
     # ----- E-step -----
     # Gaussian PDF inlined to keep this body a single graph.
-    p_noise = pi_n * torch.exp(-0.5 * (x - mu_n) ** 2 / var_n) / torch.sqrt(
-        2.0 * torch.pi * var_n
-    )
+    p_noise = pi_n * torch.exp(-0.5 * (x - mu_n) ** 2 / var_n) / torch.sqrt(2.0 * torch.pi * var_n)
     # Gamma PDF (positive tail), parameterised by mean & variance.
     a_p = mu_p * mu_p / var_p
     b_p = mu_p / var_p
     log_pdf_p = (
-        a_p * torch.log(b_p) - torch.lgamma(a_p)
-        + (a_p - 1.0) * torch.log(x.clamp(min=1e-30)) - b_p * x
+        a_p * torch.log(b_p)
+        - torch.lgamma(a_p)
+        + (a_p - 1.0) * torch.log(x.clamp(min=1e-30))
+        - b_p * x
     )
     p_pos = pi_p * torch.where(
         x > 0,
@@ -1246,8 +1257,10 @@ def _ggm_em_step(
     a_ng = mu_ng * mu_ng / var_ng
     b_ng = mu_ng / var_ng
     log_pdf_ng = (
-        a_ng * torch.log(b_ng) - torch.lgamma(a_ng)
-        + (a_ng - 1.0) * torch.log(neg_x.clamp(min=1e-30)) - b_ng * neg_x
+        a_ng * torch.log(b_ng)
+        - torch.lgamma(a_ng)
+        + (a_ng - 1.0) * torch.log(neg_x.clamp(min=1e-30))
+        - b_ng * neg_x
     )
     p_neg = pi_ng * torch.where(
         neg_x > 0,
@@ -1275,11 +1288,11 @@ def _ggm_em_step(
     mu_p_cand = (r_pos * x_pos_w).sum(dim=1, keepdim=True) / x_pos_cnt
     const2_p = (2.6 - new_pi_n_now) * sqrt_var_n + new_mu_n
     var_p_cand = ((r_pos * (x - mu_p_cand) ** 2).sum(dim=1, keepdim=True) / w_p).clamp(min=1e-4)
-    floor_p = (
-        0.5 * (const2_p + torch.sqrt(const2_p ** 2 + 4.0 * var_p_cand))
-    ).clamp(min=min_mode_offset)
+    floor_p = (0.5 * (const2_p + torch.sqrt(const2_p**2 + 4.0 * var_p_cand))).clamp(
+        min=min_mode_offset
+    )
     new_mu_p = torch.maximum(mu_p_cand, floor_p)
-    new_var_p = torch.minimum(var_p_cand, 0.5 * new_mu_p ** 2).clamp(min=1e-4)
+    new_var_p = torch.minimum(var_p_cand, 0.5 * new_mu_p**2).clamp(min=1e-4)
 
     x_neg_cnt = (r_neg * x_neg_mask_f).sum(dim=1, keepdim=True).clamp(min=1e-8)
     mu_ng_cand = (r_neg * x_neg_w).sum(dim=1, keepdim=True) / x_neg_cnt
@@ -1287,11 +1300,11 @@ def _ggm_em_step(
     var_ng_cand = ((r_neg * (neg_x - mu_ng_cand) ** 2).sum(dim=1, keepdim=True) / w_ng).clamp(
         min=1e-4
     )
-    floor_ng = (
-        0.5 * (const2_ng + torch.sqrt(const2_ng ** 2 + 4.0 * var_ng_cand))
-    ).clamp(min=min_mode_offset)
+    floor_ng = (0.5 * (const2_ng + torch.sqrt(const2_ng**2 + 4.0 * var_ng_cand))).clamp(
+        min=min_mode_offset
+    )
     new_mu_ng = torch.maximum(mu_ng_cand, floor_ng)
-    new_var_ng = torch.minimum(var_ng_cand, 0.5 * new_mu_ng ** 2).clamp(min=1e-4)
+    new_var_ng = torch.minimum(var_ng_cand, 0.5 * new_mu_ng**2).clamp(min=1e-4)
 
     new_pi_n = (w_n / n_scalar).clamp(1e-4, 1 - 2e-4)
     new_pi_p = (w_p / n_scalar).clamp(1e-4, 1 - 2e-4)
@@ -1321,9 +1334,7 @@ def _ggm_em_step(
 # tensor allocated/freed inside the loop is reusing the same buffers).
 # safe_compile applies the shared inductor policy (PCH disabled) and degrades to
 # the eager function if compilation fails at call time, rather than crashing.
-_ggm_em_step_compiled = safe_compile(
-    _ggm_em_step, dynamic=True, fullgraph=False, mode="default"
-)
+_ggm_em_step_compiled = safe_compile(_ggm_em_step, dynamic=True, fullgraph=False, mode="default")
 
 
 def _gamma_pdf_torch(x: torch.Tensor, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
@@ -1458,13 +1469,25 @@ def batch_fit_ggm(
         active_mask_2d = active.unsqueeze(1)
 
         # One full E+M step in a single fused (when compiled) graph.
-        mu_n, var_n, mu_p, var_p, mu_ng, var_ng, pi_n, pi_p, pi_ng, total = (
-            _ggm_em_step_compiled(
-                x, neg_x, x_pos_w, x_neg_w, x_pos_mask_f, x_neg_mask_f,
-                mu_n, var_n, mu_p, var_p, mu_ng, var_ng,
-                pi_n, pi_p, pi_ng,
-                active_mask_2d, float(n), float(min_mode_offset),
-            )
+        mu_n, var_n, mu_p, var_p, mu_ng, var_ng, pi_n, pi_p, pi_ng, total = _ggm_em_step_compiled(
+            x,
+            neg_x,
+            x_pos_w,
+            x_neg_w,
+            x_pos_mask_f,
+            x_neg_mask_f,
+            mu_n,
+            var_n,
+            mu_p,
+            var_p,
+            mu_ng,
+            var_ng,
+            pi_n,
+            pi_p,
+            pi_ng,
+            active_mask_2d,
+            float(n),
+            float(min_mode_offset),
         )
 
         # Log-likelihood convergence check (less frequent for less sync).
@@ -1485,7 +1508,7 @@ def batch_fit_ggm(
     # MELODIC switches to a 3-Gaussian mixture when the noise proportion is
     # small, since a noise-Gaussian + signal-Gammas model is inappropriate
     # for near-uniform distributions.
-    fb_mask = (pi_n.squeeze(1) < 0.4)  # (K,)
+    fb_mask = pi_n.squeeze(1) < 0.4  # (K,)
     if fb_mask.any():
         fb_idx = fb_mask.nonzero(as_tuple=True)[0]
         gmm = _batch_gmm_3comp(x[fb_idx], n_iter=n_iter)
@@ -1635,9 +1658,15 @@ def _batch_gmm_3comp(x: torch.Tensor, n_iter: int = 200) -> dict:
         pi3 = torch.where(a, new_pi3, pi3)
 
     return {
-        "mu1": m1, "var1": v1, "pi1": pi1,
-        "mu2": m2, "var2": v2, "pi2": pi2,
-        "mu3": m3, "var3": v3, "pi3": pi3,
+        "mu1": m1,
+        "var1": v1,
+        "pi1": pi1,
+        "mu2": m2,
+        "var2": v2,
+        "pi2": pi2,
+        "mu3": m3,
+        "var3": v3,
+        "pi3": pi3,
     }
 
 

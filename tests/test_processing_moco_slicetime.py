@@ -1,6 +1,3 @@
-import tempfile
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -8,8 +5,7 @@ import torch
 from fastfuncstuff.processing.affine import (
     _build_homo_coords,
     identity_params,
-    params_to_matrix,
-    resample_affine_fast,
+    save_matrix_1D,
 )
 from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
@@ -17,11 +13,10 @@ from fastfuncstuff.processing.ffs_moco import (
     compute_derivative_images,
     compute_max_displacement,
     gauss_newton_rigid,
+    save_maxdisp_1D,
     save_moco_1D,
     save_moco_dfile,
-    save_maxdisp_1D,
 )
-from fastfuncstuff.processing.affine import save_matrix_1D
 from fastfuncstuff.processing.slicetime import (
     load_slice_timing,
     shift_timeseries,

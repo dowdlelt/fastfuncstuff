@@ -43,6 +43,7 @@ def _ffs_prefix(ctx: BenchmarkContext, dataset: str) -> Path:
 # MELODIC log parsing
 # ---------------------------------------------------------------------------
 
+
 def _parse_melodic_file_order(log_path: Path) -> list[int]:
     """Extract the randomized file order from MELODIC's setup_migp log.
 
@@ -74,6 +75,7 @@ def _parse_melodic_file_order(log_path: Path) -> list[int]:
 # Comparisons
 # ---------------------------------------------------------------------------
 
+
 def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
@@ -83,7 +85,7 @@ def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
     a, b = a[valid], b[valid]
     a_c = a - a.mean()
     b_c = b - b.mean()
-    denom = np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())
+    denom = np.sqrt((a_c**2).sum() * (b_c**2).sum())
     if denom < 1e-15:
         return 0.0
     return float((a_c * b_c).sum() / denom)
@@ -103,7 +105,7 @@ def _compare_eigenvalues(mel_dir: Path, trace_dir: Path) -> dict:
         "melodic_n": len(mel_eig),
         "ffs_n": len(ffs_eig),
         "full_spectrum_r": _pearson_r(mel_eig[:n], ffs_eig[:n]),
-        "top20_r": _pearson_r(mel_eig[:min(20, n)], ffs_eig[:min(20, n)]),
+        "top20_r": _pearson_r(mel_eig[: min(20, n)], ffs_eig[: min(20, n)]),
         "melodic_first5": mel_eig[:5].tolist(),
         "ffs_first5": ffs_eig[:5].tolist(),
     }
@@ -135,6 +137,7 @@ def _compare_mixing(mel_dir: Path, trace_dir: Path) -> dict:
     k = n_k
     cross_block = cross[:k, k:]
     from scipy.optimize import linear_sum_assignment
+
     row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
     corrs = cross_block[row_ind, col_ind]
     return {
@@ -199,6 +202,7 @@ def _compare_subspace(mel_dir: Path, trace_dir: Path) -> dict:
     # cos(principal angles) = singular values of Bf @ Bm.T  (k, k)
     cos_angles = np.linalg.svd(Bf @ Bm.T, compute_uv=False)
     cos_angles = np.clip(cos_angles, 0.0, 1.0)
+
     # Principal angles are returned in *descending* cosine order (best-aligned
     # direction first). Index where the cosine drops below 0.99 / 0.95 / 0.50
     # tells us where in the subspace the agreement breaks down. Low index
@@ -214,11 +218,13 @@ def _compare_subspace(mel_dir: Path, trace_dir: Path) -> dict:
     # Compare cosines against the FFS singular value spectrum to gauge whether
     # mismatched directions correspond to high-variance or noise-floor PCs.
     sv_f = _s_f[:k]
-    var_frac = (sv_f ** 2).cumsum() / (sv_f ** 2).sum()
+    var_frac = (sv_f**2).cumsum() / (sv_f**2).sum()
     weak_mask = cos_angles < 0.95
     if weak_mask.any():
         weak_idx = np.where(weak_mask)[0]
-        weak_var_share = float(var_frac[weak_idx].max() - (var_frac[weak_idx[0] - 1] if weak_idx[0] > 0 else 0.0))
+        weak_var_share = float(
+            var_frac[weak_idx].max() - (var_frac[weak_idx[0] - 1] if weak_idx[0] > 0 else 0.0)
+        )
     else:
         weak_var_share = 0.0
 
@@ -259,9 +265,11 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
     mel_post_p = mel_dir / "concat_data.nii.gz"
     mask_p = trace_dir / "mask.nii.gz"
     ffs_std_p = trace_dir / "ffs_noise_std.npy"
-    missing = [n for n, p in [("post", post_p), ("mel_post", mel_post_p),
-                               ("ffs_std", ffs_std_p)]
-               if not p.exists()]
+    missing = [
+        n
+        for n, p in [("post", post_p), ("mel_post", mel_post_p), ("ffs_std", ffs_std_p)]
+        if not p.exists()
+    ]
     if missing:
         return {"error": f"missing: {', '.join(missing)}"}
 
@@ -285,10 +293,7 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
     # Per-voxel temporal r
     sample_size = min(V, 10000)
     sample = np.random.choice(V, sample_size, replace=False)
-    corrs = np.array([
-        _pearson_r(ffs_post[:, v], mel_post[:, v])
-        for v in sample
-    ])
+    corrs = np.array([_pearson_r(ffs_post[:, v], mel_post[:, v]) for v in sample])
     corrs = corrs[np.isfinite(corrs)]
 
     # Post-varnorm eigenvalue spectrum comparison (ground truth)
@@ -326,14 +331,10 @@ def _compare_ic_maps(mel_dir: Path, ffs_prefix: Path, mask_path: Path) -> dict:
     # actual file at <compat>/ffs_outputs/<basename>_concat_ica_maps.nii.gz.
     base = ffs_prefix.name
     ffs_ic = (
-        ffs_prefix.parent
-        / f"{base}_concat.ica"
-        / "ffs_outputs"
-        / f"{base}_concat_ica_maps.nii.gz"
+        ffs_prefix.parent / f"{base}_concat.ica" / "ffs_outputs" / f"{base}_concat_ica_maps.nii.gz"
     )
     if not mel_ic.exists() or not ffs_ic.exists():
         return {"error": "IC map files not found"}
-    import torch
     mel_vol, _ = _load_vol(mel_ic)
     ffs_vol, _ = _load_vol(ffs_ic)
     if mel_vol.dim() == 4:
@@ -343,6 +344,7 @@ def _compare_ic_maps(mel_dir: Path, ffs_prefix: Path, mask_path: Path) -> dict:
     mask_vol, _ = _load_vol(mask_path) if mask_path.exists() else (None, None)
     mask = mask_vol > 0.5 if mask_vol is not None else mel_vol.abs().sum(0) > 1e-8
     from ...stats.spatial import optimal_matching, spatial_correlation_matrix
+
     corr_matrix = spatial_correlation_matrix(mel_vol, ffs_vol, mask=mask)
     abs_corr = np.abs(corr_matrix)
     _, _, matched_corrs = optimal_matching(abs_corr)
@@ -359,8 +361,9 @@ def _compare_noise_norm(mel_dir: Path, trace_dir: Path) -> dict:
     ffs_noise_p = trace_dir / "noise_inv.npy"
     ffs_resid_p = trace_dir / "resid_std.npy"
     ffs_diag_p = trace_dir / "diagvals.npy"
-    missing = [n for n, p in [("mel_noise", mel_noise_p), ("ffs_noise", ffs_noise_p)]
-               if not p.exists()]
+    missing = [
+        n for n, p in [("mel_noise", mel_noise_p), ("ffs_noise", ffs_noise_p)] if not p.exists()
+    ]
     if missing:
         return {"error": f"missing: {', '.join(missing)}"}
 
@@ -413,6 +416,7 @@ def _compare_unmix(mel_dir: Path, trace_dir: Path) -> dict:
     cross = np.abs(np.corrcoef(mel_unmix[:n_k, :n_t], ffs_unmix[:n_k, :n_t]))
     cross_block = cross[:n_k, n_k:]
     from scipy.optimize import linear_sum_assignment
+
     row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
     corrs = cross_block[row_ind, col_ind]
 
@@ -434,6 +438,7 @@ def _safe(fn, *args, **kwargs):
 # ---------------------------------------------------------------------------
 # Stage interface
 # ---------------------------------------------------------------------------
+
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
@@ -513,13 +518,18 @@ def validate(ctx: BenchmarkContext) -> dict:
         }
 
     eig_r = np.mean([r["eigenvalues"]["full_spectrum_r"] for r in results.values()])
-    maps_r = np.mean(
-        [r["ic_maps"].get("mean_matched_r", 0) for r in results.values()]
+    maps_r = np.mean([r["ic_maps"].get("mean_matched_r", 0) for r in results.values()])
+    prob_r = (
+        np.mean(
+            [
+                r["prob_maps"].get("mean_matched_r", 0)
+                for r in results.values()
+                if "error" not in r.get("prob_maps", {})
+            ]
+        )
+        if any("error" not in r.get("prob_maps", {}) for r in results.values())
+        else 0.0
     )
-    prob_r = np.mean(
-        [r["prob_maps"].get("mean_matched_r", 0) for r in results.values()
-         if "error" not in r.get("prob_maps", {})]
-    ) if any("error" not in r.get("prob_maps", {}) for r in results.values()) else 0.0
     passed = eig_r >= 0.95 and maps_r >= 0.60
 
     header = [f"eig_r={eig_r:.4f}", f"maps_r={maps_r:.4f}", f"prob_r={prob_r:.4f}"]

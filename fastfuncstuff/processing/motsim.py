@@ -19,8 +19,6 @@ import torch
 from torch import Tensor
 
 from .affine import apply_affine_interp, dicom_matrix_to_voxel, params_to_matrix
-from .io import load_image, save_image
-from .nwarpforge import load_affine_1D
 
 
 def load_motion_1d(path: str) -> np.ndarray:
@@ -107,7 +105,9 @@ def automask_dilate(vol: Tensor, dilate_voxels: int = 2) -> Tensor:
         m = mask.float()[None, None]  # (1,1,D,H,W)
         kernel = 2 * dilate_voxels + 1
         m = torch.nn.functional.max_pool3d(
-            m, kernel_size=kernel, stride=1,
+            m,
+            kernel_size=kernel,
+            stride=1,
             padding=dilate_voxels,
         )
         mask = m[0, 0] > 0.5
@@ -247,21 +247,23 @@ def extract_pcs(
 
     if verb >= 2:
         cumvar = var_explained.cumsum(0)
-        print(f"  PC variance explained (cumulative): "
-              f"{', '.join(f'{v*100:.1f}%' for v in cumvar.tolist())}")
+        print(
+            f"  PC variance explained (cumulative): "
+            f"{', '.join(f'{v * 100:.1f}%' for v in cumvar.tolist())}"
+        )
 
     return pcs, var_explained
 
 
-def save_1d(pcs: Tensor, var_explained: Tensor, path: str,
-            variant: str, n_vols: int) -> None:
+def save_1d(pcs: Tensor, var_explained: Tensor, path: str, variant: str, n_vols: int) -> None:
     """Write PCs as AFNI-style .1D file."""
     n_pcs = pcs.shape[1]
     with open(path, "w") as f:
         f.write("# MotSim regressors (Patriat et al. 2017, PMC5533292)\n")
         f.write(f"# Variant: {variant}, {n_vols} volumes, {n_pcs} PCs\n")
-        f.write(f"# Variance explained: "
-                f"{' '.join(f'{v*100:.2f}%' for v in var_explained.tolist())}\n")
+        f.write(
+            f"# Variance explained: {' '.join(f'{v * 100:.2f}%' for v in var_explained.tolist())}\n"
+        )
         for row in pcs.cpu().numpy():
             f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
 

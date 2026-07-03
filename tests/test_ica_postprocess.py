@@ -8,8 +8,6 @@ Tests cover:
 - Depth mask handling (prepare_depth_mask)
 """
 
-from unittest.mock import MagicMock, patch
-
 import numpy as np
 import pytest
 
@@ -76,11 +74,13 @@ class TestMeanAbsBySelector:
     def test_basic_selection(self):
         """Test basic voxel selection."""
         # 3 components, 10 voxels
-        comp_kv = np.array([
-            [1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [-1.0, -2.0, -3.0, -4.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [2.0, 4.0, 6.0, 8.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ])
+        comp_kv = np.array(
+            [
+                [1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [-1.0, -2.0, -3.0, -4.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [2.0, 4.0, 6.0, 8.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        )
         selector = np.array([True, True, True, True, True, False, False, False, False, False])
 
         result = mean_abs_by_selector(comp_kv, selector)
@@ -99,10 +99,12 @@ class TestMeanAbsBySelector:
 
     def test_all_selected(self):
         """Test when all voxels are selected."""
-        comp_kv = np.array([
-            [1.0, 2.0, 3.0],
-            [-1.0, -2.0, -3.0],
-        ])
+        comp_kv = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [-1.0, -2.0, -3.0],
+            ]
+        )
         selector = np.array([True, True, True])
 
         result = mean_abs_by_selector(comp_kv, selector)
@@ -122,10 +124,12 @@ class TestMeanZExcessBySelector:
 
     def test_basic_thresholding(self):
         """Test z-score thresholding."""
-        z_kv = np.array([
-            [1.0, 2.0, 3.0, 4.0, 5.0],
-            [0.5, 1.0, 1.5, 2.0, 2.5],
-        ])
+        z_kv = np.array(
+            [
+                [1.0, 2.0, 3.0, 4.0, 5.0],
+                [0.5, 1.0, 1.5, 2.0, 2.5],
+            ]
+        )
         selector = np.array([True] * 5)
         z_thresh = 2.0
 
@@ -159,7 +163,7 @@ class TestMeanZExcessBySelector:
 
         result = mean_z_excess_by_selector(z_kv, selector, z_thresh)
         # |z|: [3, 2, 1, 1, 2, 3], excess over 2: [1, 0, 0, 0, 0, 1], mean = 2/6 = 1/3
-        np.testing.assert_allclose(result, np.array([1.0/3.0]), atol=0.01)
+        np.testing.assert_allclose(result, np.array([1.0 / 3.0]), atol=0.01)
 
 
 class TestBestLagAndR:
@@ -225,13 +229,15 @@ class TestWeightedDepthTimeseries:
     def test_basic_weighted_average(self):
         """Test basic weighted averaging."""
         # 5 voxels, 3 timepoints
-        source_vox_t = np.array([
-            [1.0, 2.0, 3.0],
-            [2.0, 4.0, 6.0],
-            [3.0, 6.0, 9.0],
-            [4.0, 8.0, 12.0],
-            [5.0, 10.0, 15.0],
-        ])
+        source_vox_t = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [2.0, 4.0, 6.0],
+                [3.0, 6.0, 9.0],
+                [4.0, 8.0, 12.0],
+                [5.0, 10.0, 15.0],
+            ]
+        )
         selector = np.array([True, True, True, False, False])
         weight_v = np.array([1.0, 2.0, 0.5, 0.0, 0.0])
         min_voxels = 2
@@ -274,12 +280,14 @@ class TestWeightedDepthTimeseries:
 
     def test_filters_by_selector_and_finite_and_positive_weights(self):
         """Test that selector, finite, and positive weight conditions are all applied."""
-        source_vox_t = np.array([
-            [1.0, 2.0],
-            [3.0, 4.0],
-            [5.0, 6.0],
-            [7.0, 8.0],
-        ])
+        source_vox_t = np.array(
+            [
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [5.0, 6.0],
+                [7.0, 8.0],
+            ]
+        )
         selector = np.array([True, True, False, True])  # Voxel 2 excluded
         weight_v = np.array([1.0, np.nan, 0.0, -1.0])  # Voxel 1: nan, Voxel 3: negative
         min_voxels = 1

@@ -19,14 +19,13 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import pytest
-import torch
 
 from fastfuncstuff.cli import hrfopt as hrfopt_cli
-
 
 # ---------------------------------------------------------------------------
 # Argument validation (cheap, no GLM fit)
 # ---------------------------------------------------------------------------
+
 
 def _base_argv(prefix: str) -> list[str]:
     """A minimum-required argv that parser.parse_args accepts before any
@@ -34,11 +33,17 @@ def _base_argv(prefix: str) -> list[str]:
     after parse_args, so we only need the parser to succeed."""
     return [
         "ffs_hrfopt",
-        "-input", "r1.nii.gz", "r2.nii.gz",
-        "-onsets", "c1.txt",
-        "-durations", "2.0",
-        "-tr", "2.0",
-        "-prefix", prefix,
+        "-input",
+        "r1.nii.gz",
+        "r2.nii.gz",
+        "-onsets",
+        "c1.txt",
+        "-durations",
+        "2.0",
+        "-tr",
+        "2.0",
+        "-prefix",
+        prefix,
     ]
 
 
@@ -54,10 +59,14 @@ class TestArgValidation:
 
     def test_delta_denoise_with_single_trials_exits(self, monkeypatch, tmp_path, capsys):
         ortvec_path = tmp_path / "motion.1D"
-        ortvec_path.write_text("0.0\n0.1\n0.2\n")  # content doesn't matter; arg validation happens first
+        ortvec_path.write_text(
+            "0.0\n0.1\n0.2\n"
+        )  # content doesn't matter; arg validation happens first
         argv = _base_argv(str(tmp_path / "out")) + [
             "-delta_denoise",
-            "-ortvec", str(ortvec_path), "motion",
+            "-ortvec",
+            str(ortvec_path),
+            "motion",
             "-single_trials",
         ]
         monkeypatch.setattr(sys, "argv", argv)
@@ -71,6 +80,7 @@ class TestArgValidation:
 # ---------------------------------------------------------------------------
 # Functional smoke test: full pipeline with a tiny dataset
 # ---------------------------------------------------------------------------
+
 
 def _write_run(path: Path, data: np.ndarray, tr: float, affine: np.ndarray) -> None:
     """Save a (X, Y, Z, T) numpy array as a NIfTI with the right pixdim[4]."""
@@ -102,8 +112,10 @@ def _make_synthetic_dataset(tmp_path: Path):
     # AFNI-style two-row onsets file (one row per run)
     onsets_file = tmp_path / "cond1.txt"
     onsets_file.write_text(
-        " ".join(f"{t:.1f}" for t in onset_times_per_run[0]) + "\n"
-        + " ".join(f"{t:.1f}" for t in onset_times_per_run[0]) + "\n"
+        " ".join(f"{t:.1f}" for t in onset_times_per_run[0])
+        + "\n"
+        + " ".join(f"{t:.1f}" for t in onset_times_per_run[0])
+        + "\n"
     )
 
     # Make two runs of synthetic data with mild task-like fluctuation +
@@ -113,7 +125,9 @@ def _make_synthetic_dataset(tmp_path: Path):
     for run_idx in range(2):
         # Motion: smooth low-frequency signal, different per run
         t = np.arange(n_timepoints_per_run)
-        motion = 0.4 * np.sin(2 * np.pi * t / 30.0 + run_idx) + 0.1 * rng.standard_normal(n_timepoints_per_run)
+        motion = 0.4 * np.sin(2 * np.pi * t / 30.0 + run_idx) + 0.1 * rng.standard_normal(
+            n_timepoints_per_run
+        )
         motion_per_run.append(motion)
 
         # Build a simple task signal at the onset times (TR-aligned)
@@ -122,7 +136,7 @@ def _make_synthetic_dataset(tmp_path: Path):
             tp = int(round(onset_s / tr))
             if 0 <= tp < n_timepoints_per_run - 3:
                 # Quick "HRF-ish" bump
-                task[tp:tp + 4] += np.array([0.2, 0.6, 0.5, 0.3])
+                task[tp : tp + 4] += np.array([0.2, 0.6, 0.5, 0.3])
 
         # Voxel-level data: most voxels get task + motion + noise, scaled to ~100
         data = np.empty((nx, ny, nz, n_timepoints_per_run), dtype=np.float32)
@@ -155,14 +169,22 @@ def _make_synthetic_dataset(tmp_path: Path):
 def _run_hrfopt(monkeypatch, prefix: str, extra_args: list[str], ds: dict) -> None:
     argv = [
         "ffs_hrfopt",
-        "-input", *[str(p) for p in ds["runs"]],
-        "-onsets", str(ds["onsets"]),
-        "-durations", "2.0",
-        "-tr", str(ds["tr"]),
-        "-prefix", prefix,
-        "-n_hrfs", "5",  # small library for speed
-        "-device", "cpu",
-        "-cv_strategy", "loro",
+        "-input",
+        *[str(p) for p in ds["runs"]],
+        "-onsets",
+        str(ds["onsets"]),
+        "-durations",
+        "2.0",
+        "-tr",
+        str(ds["tr"]),
+        "-prefix",
+        prefix,
+        "-n_hrfs",
+        "5",  # small library for speed
+        "-device",
+        "cpu",
+        "-cv_strategy",
+        "loro",
     ] + extra_args
     monkeypatch.setattr(sys, "argv", argv)
     hrfopt_cli.main()
@@ -174,7 +196,8 @@ class TestDeltaDenoiseSmoke:
         ds = _make_synthetic_dataset(tmp_path)
         prefix = str(tmp_path / "out")
         _run_hrfopt(
-            monkeypatch, prefix,
+            monkeypatch,
+            prefix,
             ["-delta_denoise", "-ortvec", str(ds["ortvec"]), "motion"],
             ds,
         )

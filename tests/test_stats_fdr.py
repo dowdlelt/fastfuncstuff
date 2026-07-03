@@ -1,4 +1,5 @@
 """Tests for fastfuncstuff.stats.fdr (BH q-values, FDRCURVE)."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -14,6 +15,7 @@ from fastfuncstuff.stats.fdr import (
 
 def test_stat_to_pvalue_t_matches_scipy():
     from scipy.stats import t as scipy_t
+
     rng = np.random.default_rng(0)
     stats = rng.standard_normal(500) * 2.0
     p = stat_to_pvalue(torch.from_numpy(stats), "fitt", dof=30.0).numpy()
@@ -71,18 +73,13 @@ def test_compute_fdr_curve_shape_and_monotone():
 def test_fdr_addfdr_writer_roundtrip(tmp_path):
     """Synthetic NIfTI + AFNI extension round-trip."""
     import nibabel as nib
+
     from fastfuncstuff.stats.fdr import add_fdrcurves_to_nifti
 
     data = np.zeros((4, 4, 4, 2), dtype=np.float32)
     img = nib.Nifti1Image(data, affine=np.eye(4))
-    afni_xml = (
-        '<?xml version="1.0" ?>\n'
-        '<AFNI_attributes self_idcode="ABC">\n'
-        '</AFNI_attributes>\n'
-    )
-    img.header.extensions.append(
-        nib.nifti1.Nifti1Extension(4, afni_xml.encode("utf-8"))
-    )
+    afni_xml = '<?xml version="1.0" ?>\n<AFNI_attributes self_idcode="ABC">\n</AFNI_attributes>\n'
+    img.header.extensions.append(nib.nifti1.Nifti1Extension(4, afni_xml.encode("utf-8")))
     out = tmp_path / "test.nii.gz"
     nib.save(img, str(out))
 

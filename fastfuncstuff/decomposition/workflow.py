@@ -94,7 +94,13 @@ def estimate_spatial_smoothness_resels(
     s2 = [0.0, 0.0, 0.0]
 
     n_chunks = (n_t + chunk_size - 1) // chunk_size
-    for t_start in tqdm(range(0, n_t, chunk_size), total=n_chunks, desc="  FWHM estimate", leave=True, disable=n_chunks <= 1):
+    for t_start in tqdm(
+        range(0, n_t, chunk_size),
+        total=n_chunks,
+        desc="  FWHM estimate",
+        leave=True,
+        disable=n_chunks <= 1,
+    ):
         t_end = min(t_start + chunk_size, n_t)
         chunk_np = np.empty((t_end - t_start, *shape3d), dtype=np.float32)
         for i, ti in enumerate(range(t_start, t_end)):
@@ -153,7 +159,7 @@ def apply_voxel_variance_normalization(
     num_spec: int | float | str,
     n_t: int,
     n_vox_masked: int,
-    trace_dir: "Path | None" = None,
+    trace_dir: Path | None = None,
 ) -> tuple[torch.Tensor, str]:
     """Apply voxel variance normalization with MELODIC-compatible path when requested."""
     if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
@@ -169,6 +175,7 @@ def apply_voxel_variance_normalization(
         )
         if trace_dir is not None:
             import numpy as _np
+
             trace_dir.mkdir(parents=True, exist_ok=True)
             _np.save(str(trace_dir / "migp_post_varnorm.npy"), data_vox_t.T.cpu().numpy())
         return data_vox_t, norm_msg
@@ -181,6 +188,7 @@ def apply_voxel_variance_normalization(
     data_vox_t[const_mask] = 0.0
     if trace_dir is not None:
         import numpy as _np
+
         trace_dir.mkdir(parents=True, exist_ok=True)
         _np.save(str(trace_dir / "migp_post_varnorm.npy"), data_vox_t.T.cpu().numpy())
         _np.save(str(trace_dir / "ffs_noise_std.npy"), safe_std.squeeze(1).cpu().numpy())
@@ -262,7 +270,13 @@ def apply_melodic_noise_normalization(
         )
         resid_std = torch.empty(n_vox, device=x_t.device)
         n_chunks = (n_vox + chunk_size - 1) // chunk_size
-        for v0 in tqdm(range(0, n_vox, chunk_size), total=n_chunks, desc="  Noise norm", leave=True, disable=n_chunks <= 1):
+        for v0 in tqdm(
+            range(0, n_vox, chunk_size),
+            total=n_chunks,
+            desc="  Noise norm",
+            leave=True,
+            disable=n_chunks <= 1,
+        ):
             v1 = min(v0 + chunk_size, n_vox)
             resid_chunk = x_t[:, v0:v1] - mixing @ components[:, v0:v1]
             resid_std[v0:v1] = torch.std(resid_chunk, dim=0)

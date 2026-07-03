@@ -16,10 +16,11 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.design.builder import legendre_polynomials
-from fastfuncstuff.memory import estimate_chunk_size, make_vram_debugger, bytes_per_voxel_glm
+from fastfuncstuff.design.matrices import convolve_hrf_microtime
+from fastfuncstuff.memory import bytes_per_voxel_glm, estimate_chunk_size, make_vram_debugger
 from fastfuncstuff.utils import get_device, linalg_device, to_tensor
+
 from .xval import compute_r2_metric
 
 # MPS's only hard gap is float64 (the Metal backend has no float64 support at
@@ -236,7 +237,7 @@ def fit_glm_chunk(
     if cholesky_L is not None:
         # Fast path: X'X = L L' already factored — one matmul + triangular solve.
         # Compute xty on ld directly to avoid an extra MPS→CPU transfer when ld=cpu.
-        xty = design.to(ld).T @ data.to(ld).T   # (n_regressors, n_voxels)
+        xty = design.to(ld).T @ data.to(ld).T  # (n_regressors, n_voxels)
         betas = torch.cholesky_solve(xty, cholesky_L.to(ld)).to(device).T
     else:
         try:
@@ -312,6 +313,7 @@ def inspect_design(
     to programmatically check rank deficiency.
     """
     import sys
+
     if file is None:
         file = sys.stdout
     # .cpu() before float64: MPS cannot hold float64, so move off-device first.
@@ -327,15 +329,17 @@ def inspect_design(
     col_vars = ((X - col_means) ** 2).sum(dim=0)
     near_zero = (col_norms < near_zero_eps).nonzero(as_tuple=True)[0].tolist()
     near_constant = [
-        i for i in range(p)
-        if i not in near_zero and float(col_vars[i]) < near_zero_eps * float(col_norms[i] ** 2 + 1e-30)
+        i
+        for i in range(p)
+        if i not in near_zero
+        and float(col_vars[i]) < near_zero_eps * float(col_norms[i] ** 2 + 1e-30)
     ]
 
     # SVD of X is cheaper than eigendecomp of X.T @ X and gives us
     # both singular values and right-singular vectors in one call.
     try:
         U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-    except Exception as e:                              # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         print(f"  inspect_design: SVD failed: {e}", file=file)
         return {"rank": None, "error": str(e)}
 
@@ -358,7 +362,9 @@ def inspect_design(
             file=file,
         )
         for i in near_zero[:5]:
-            print(f"      [{i:3d}] '{column_labels[i]}' — norm {float(col_norms[i]):.3g}", file=file)
+            print(
+                f"      [{i:3d}] '{column_labels[i]}' — norm {float(col_norms[i]):.3g}", file=file
+            )
     if near_constant:
         print(
             f"    constant cols : {len(near_constant)} columns at indices "
@@ -703,7 +709,8 @@ def fit_glm(
     dof = design_concat.shape[0] - design_concat.shape[1]
     if dof <= 0:
         warnings.warn(
-            "Non-positive degrees of freedom detected in GLM fit; statistics may be invalid", stacklevel=2
+            "Non-positive degrees of freedom detected in GLM fit; statistics may be invalid",
+            stacklevel=2,
         )
         dof = max(1, dof)
 
@@ -781,7 +788,9 @@ def fit_glm(
 
     _ols_dbg = make_vram_debugger(
         device,
-        chunk_size * bytes_per_voxel_glm(total_timepoints, design_concat.shape[1]) * (dtype.itemsize // 4),
+        chunk_size
+        * bytes_per_voxel_glm(total_timepoints, design_concat.shape[1])
+        * (dtype.itemsize // 4),
         operation="ols_fit",
         chunk_size=chunk_size,
         enabled=debug_memory,

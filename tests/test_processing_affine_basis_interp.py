@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 import torch
 
 from fastfuncstuff.processing.affine import (
@@ -21,7 +20,6 @@ from fastfuncstuff.processing.basis import (
     build_3d_basis_quintic,
     compute_basis_coords,
     compute_half_widths_cubic,
-    compute_half_widths_quintic,
     evaluate_patch_warp,
     evaluate_patch_warp_batched,
 )

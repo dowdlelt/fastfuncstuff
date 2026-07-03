@@ -9,8 +9,6 @@ Tests for uncovered functions in cli_utils.py:
 - parse_input_files
 """
 
-import numpy as np
-import pytest
 import torch
 
 from fastfuncstuff.cli_utils import (
@@ -123,23 +121,28 @@ class TestEstimateDeviceStrategy:
     def test_small_data_fits(self):
         """Small data should not need CPU offloading."""
         keep_on_cpu = estimate_device_strategy(
-            n_voxels=1000, n_timepoints_total=100,
+            n_voxels=1000,
+            n_timepoints_total=100,
             device=torch.device("cpu"),
         )
         assert isinstance(keep_on_cpu, bool)
 
     def test_force_cpu(self):
         keep_on_cpu = estimate_device_strategy(
-            n_voxels=10000, n_timepoints_total=100,
-            device=torch.device("cpu"), force_cpu=True,
+            n_voxels=10000,
+            n_timepoints_total=100,
+            device=torch.device("cpu"),
+            force_cpu=True,
         )
         assert keep_on_cpu is True
 
     def test_large_data_on_cpu(self):
         """Very large data exceeding threshold should stay on CPU."""
         keep_on_cpu = estimate_device_strategy(
-            n_voxels=5000000, n_timepoints_total=10000,
-            device=torch.device("cpu"), gpu_threshold_gb=0.001,
+            n_voxels=5000000,
+            n_timepoints_total=10000,
+            device=torch.device("cpu"),
+            gpu_threshold_gb=0.001,
         )
         assert keep_on_cpu is True
 

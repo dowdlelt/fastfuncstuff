@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fastfuncstuff.io.afni import read_afni_design_matrix
 from fastfuncstuff.design.builder import (
     build_design_matrix,
     create_onset_regressors,
@@ -17,6 +16,7 @@ from fastfuncstuff.design.builder import (
     parse_afni_timing_file,
     spm_canonical_hrf,
 )
+from fastfuncstuff.io.afni import read_afni_design_matrix
 
 # Test data directory
 TEST_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
@@ -53,7 +53,9 @@ def test_legendre_polynomials():
     polys = legendre_polynomials(n_tp, order, normalize=False)
 
     # Check shape
-    assert polys.shape == (n_tp, order + 1), f"Expected shape ({n_tp}, {order+1}), got {polys.shape}"
+    assert polys.shape == (n_tp, order + 1), (
+        f"Expected shape ({n_tp}, {order + 1}), got {polys.shape}"
+    )
 
     # Check orthogonality (but NOT orthonormality)
     # Note: Legendre polynomials are orthogonal on continuous interval [-1, 1],
@@ -84,8 +86,12 @@ def test_legendre_polynomials():
     polys_norm = legendre_polynomials(n_tp, order, normalize=True)
     gram_norm = polys_norm.T @ polys_norm
     # Normalization helps but doesn't eliminate discretization error
-    np.testing.assert_allclose(gram_norm, np.eye(order + 1), atol=0.05,
-                               err_msg="Normalized polynomials should be nearly orthonormal")
+    np.testing.assert_allclose(
+        gram_norm,
+        np.eye(order + 1),
+        atol=0.05,
+        err_msg="Normalized polynomials should be nearly orthonormal",
+    )
 
     # Test polort -1 (no polynomials)
     polys_none = legendre_polynomials(n_tp, -1)
@@ -149,7 +155,7 @@ def test_create_onset_regressors():
 
     # Peak should be after onset (due to HRF delay)
     first_onset_tr = 5
-    peak_after_first = np.argmax(regressor_hrf[first_onset_tr:first_onset_tr+10])
+    peak_after_first = np.argmax(regressor_hrf[first_onset_tr : first_onset_tr + 10])
     assert peak_after_first > 0, "HRF peak should be delayed after onset"
 
 
@@ -162,7 +168,7 @@ def test_build_design_matrix_basic():
     # Parameters from make_small_model.sh
     # Based on AFNI X.xmat.1D: 720 timepoints total, 2 runs, TR=1.0s
     timing_files = [movie_file, prompt_file]
-    stim_labels = ['movie', 'prompt']
+    stim_labels = ["movie", "prompt"]
     n_timepoints_per_run = [360, 360]  # From AFNI design matrix
     tr = 1.0  # TR is 1 second for this dataset
     polort = 3
@@ -174,7 +180,7 @@ def test_build_design_matrix_basic():
         n_timepoints_per_run=n_timepoints_per_run,
         tr=tr,
         polort=polort,
-        hrf_models='SPMG1(5)',
+        hrf_models="SPMG1(5)",
     )
 
     # Check shape
@@ -184,24 +190,25 @@ def test_build_design_matrix_basic():
     expected_cols = n_polort_per_run * n_runs + n_stim  # Polynomials first, then stimuli
     expected_rows = sum(n_timepoints_per_run)
 
-    assert design.shape == (expected_rows, expected_cols), \
+    assert design.shape == (expected_rows, expected_cols), (
         f"Expected shape ({expected_rows}, {expected_cols}), got {design.shape}"
+    )
 
     # Check labels - polynomials come first in AFNI
     assert len(labels) == expected_cols
-    assert labels[0] == 'Run#1Pol#0'
-    assert labels[7] == 'Run#2Pol#3'
-    assert labels[8] == 'movie#0'  # Standard mode: label#0
-    assert labels[9] == 'prompt#0'  # Standard mode: label#0
+    assert labels[0] == "Run#1Pol#0"
+    assert labels[7] == "Run#2Pol#3"
+    assert labels[8] == "movie#0"  # Standard mode: label#0
+    assert labels[9] == "prompt#0"  # Standard mode: label#0
 
     # Check run starts
     assert run_starts == [0, 360]
 
     # Check metadata
-    assert metadata['stim_indices'] == [8, 9]  # Last 2 columns
-    assert metadata['n_runs'] == 2
-    assert metadata['tr'] == tr
-    assert metadata['polort'] == polort
+    assert metadata["stim_indices"] == [8, 9]  # Last 2 columns
+    assert metadata["n_runs"] == 2
+    assert metadata["tr"] == tr
+    assert metadata["polort"] == polort
 
     print(f"\nDesign matrix shape: {design.shape}")
     print(f"Labels: {labels}")
@@ -210,13 +217,14 @@ def test_build_design_matrix_basic():
     print(f"Nuisance indices: {metadata['nuisance_indices']}")
 
 
-@pytest.mark.skipif(not (TEST_DATA_DIR / "X.xmat.1D").exists(),
-                    reason="AFNI reference design matrix not found")
+@pytest.mark.skipif(
+    not (TEST_DATA_DIR / "X.xmat.1D").exists(), reason="AFNI reference design matrix not found"
+)
 def test_compare_with_afni():
     """Compare our design matrix with AFNI's X.xmat.1D"""
     # Load AFNI design matrix
     afni_design = read_afni_design_matrix(TEST_DATA_DIR / "X.xmat.1D")
-    afni_matrix = afni_design['matrix']
+    afni_matrix = afni_design["matrix"]
 
     print(f"\nAFNI design matrix shape: {afni_matrix.shape}")
     print(f"AFNI run starts: {afni_design.get('run_starts', 'Not found')}")
@@ -228,15 +236,15 @@ def test_compare_with_afni():
 
     # Get actual n_timepoints from AFNI matrix
     total_tps = afni_matrix.shape[0]
-    _n_runs = len(afni_design.get('run_starts', [0]))
+    _n_runs = len(afni_design.get("run_starts", [0]))
 
     # Infer timepoints per run from run_starts
-    run_starts_afni = afni_design.get('run_starts', [0])
+    run_starts_afni = afni_design.get("run_starts", [0])
     if len(run_starts_afni) >= 2:
         n_timepoints_per_run = []
         for i in range(len(run_starts_afni)):
             if i < len(run_starts_afni) - 1:
-                n_timepoints_per_run.append(run_starts_afni[i+1] - run_starts_afni[i])
+                n_timepoints_per_run.append(run_starts_afni[i + 1] - run_starts_afni[i])
             else:
                 n_timepoints_per_run.append(total_tps - run_starts_afni[i])
     else:
@@ -247,19 +255,20 @@ def test_compare_with_afni():
     # Build our design
     design, labels, run_starts, metadata = build_design_matrix(
         timing_files=[movie_file, prompt_file],
-        stim_labels=['movie', 'prompt'],
+        stim_labels=["movie", "prompt"],
         n_timepoints_per_run=n_timepoints_per_run,
         tr=1.0,  # TR from AFNI design
         polort=3,
-        hrf_models='SPMG1(5)',
+        hrf_models="SPMG1(5)",
     )
 
     print(f"Our design matrix shape: {design.shape}")
     print(f"Our labels: {labels}")
 
     # Compare shapes
-    assert design.shape[0] == afni_matrix.shape[0], \
+    assert design.shape[0] == afni_matrix.shape[0], (
         f"Row count mismatch: ours={design.shape[0]}, AFNI={afni_matrix.shape[0]}"
+    )
 
     # Note: Column count might differ if AFNI includes extra regressors (motion, etc.)
     # For now, just compare stimulus columns
@@ -299,20 +308,20 @@ def test_write_afni_xmat():
 
     design, labels, run_starts, metadata = build_design_matrix(
         timing_files=[movie_file, prompt_file],
-        stim_labels=['movie', 'prompt'],
+        stim_labels=["movie", "prompt"],
         n_timepoints_per_run=[360, 360],
         tr=1.0,
         polort=3,
-        hrf_models='SPMG1(5)',
+        hrf_models="SPMG1(5)",
     )
 
     # Write to temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".1D", delete=False) as f:
         output_path = f.name
 
     try:
         # Write with GLT contrast
-        glt_contrasts = [('SYM: +1*movie -1*prompt', 'movieVprompt')]
+        glt_contrasts = [("SYM: +1*movie -1*prompt", "movieVprompt")]
         write_afni_xmat(
             output_path,
             design,
@@ -327,23 +336,23 @@ def test_write_afni_xmat():
             content = f.read()
 
         # Check header elements
-        assert '# <matrix' in content, "Missing matrix header"
+        assert "# <matrix" in content, "Missing matrix header"
         assert 'ni_type = "10*double"' in content, "Wrong ni_type"
         assert 'ni_dimen = "720"' in content, "Wrong ni_dimen"
-        assert 'ColumnLabels' in content, "Missing ColumnLabels"
-        assert 'Run#1Pol#0' in content, "Missing polynomial labels"
-        assert 'movie' in content, "Missing movie label"
-        assert 'prompt' in content, "Missing prompt label"
+        assert "ColumnLabels" in content, "Missing ColumnLabels"
+        assert "Run#1Pol#0" in content, "Missing polynomial labels"
+        assert "movie" in content, "Missing movie label"
+        assert "prompt" in content, "Missing prompt label"
         assert 'RunStart = "0,360"' in content, "Wrong RunStart"
         assert 'Nstim = "2"' in content, "Wrong Nstim"
         assert 'Nglt = "1"' in content, "Wrong Nglt"
-        assert 'movieVprompt' in content, "Missing GLT label"
-        assert 'SPMG1' in content, "Missing HRF model"
-        assert '# >' in content, "Missing header end"
+        assert "movieVprompt" in content, "Missing GLT label"
+        assert "SPMG1" in content, "Missing HRF model"
+        assert "# >" in content, "Missing header end"
 
         # Check data rows
-        lines = content.split('\n')
-        data_lines = [l for l in lines if l and not l.startswith('#')]
+        lines = content.split("\n")
+        data_lines = [l for l in lines if l and not l.startswith("#")]
         assert len(data_lines) == 720, f"Expected 720 data rows, got {len(data_lines)}"
 
         # Check first data row has correct number of columns
@@ -356,6 +365,7 @@ def test_write_afni_xmat():
     finally:
         # Clean up
         import os
+
         if os.path.exists(output_path):
             os.remove(output_path)
 
@@ -365,7 +375,7 @@ def test_im_mode():
     import tempfile
 
     # Create simple timing file with known events
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         timing_file = Path(f.name)
         # Run 1: 3 events at 10s, 20s, 30s
         # Run 2: 2 events at 5s, 15s
@@ -376,11 +386,11 @@ def test_im_mode():
         # Build with IM mode
         design, labels, run_starts, metadata = build_design_matrix(
             timing_files=[timing_file],
-            stim_labels=['condition'],
+            stim_labels=["condition"],
             n_timepoints_per_run=[50, 50],  # 100s total at TR=2s
             tr=2.0,
             polort=1,  # Keep simple
-            hrf_models='SPMG1(0)',  # Delta function (no duration)
+            hrf_models="SPMG1(0)",  # Delta function (no duration)
             im_mode=True,
         )
 
@@ -391,22 +401,22 @@ def test_im_mode():
         assert design.shape == (100, 9), f"Expected (100, 9), got {design.shape}"
 
         # Check labels
-        assert labels[0] == 'Run#1Pol#0'
-        assert labels[3] == 'Run#2Pol#1'
-        assert labels[4] == 'condition#0'  # IM mode: label#0, label#1, ...
-        assert labels[5] == 'condition#1'
-        assert labels[6] == 'condition#2'
-        assert labels[7] == 'condition#3'
-        assert labels[8] == 'condition#4'
+        assert labels[0] == "Run#1Pol#0"
+        assert labels[3] == "Run#2Pol#1"
+        assert labels[4] == "condition#0"  # IM mode: label#0, label#1, ...
+        assert labels[5] == "condition#1"
+        assert labels[6] == "condition#2"
+        assert labels[7] == "condition#3"
+        assert labels[8] == "condition#4"
 
         # Check metadata
-        assert len(metadata['stim_indices']) == 5, "Should have 5 IM columns"
-        assert metadata['stim_indices'] == [4, 5, 6, 7, 8]
+        assert len(metadata["stim_indices"]) == 5, "Should have 5 IM columns"
+        assert metadata["stim_indices"] == [4, 5, 6, 7, 8]
 
         # Each IM column should be independent (non-zero at different times)
         # Run 1 events: TR 5, 10, 15 (at 10s, 20s, 30s with TR=2s)
         # Run 2 events: TR 52, 57 (at 5s, 15s in run 2, offset by 50 TRs)
-        stim_cols = design[:, metadata['stim_indices']]
+        stim_cols = design[:, metadata["stim_indices"]]
 
         # Count non-zero timepoints per column
         nonzero_counts = np.sum(stim_cols > 0, axis=0)
@@ -423,6 +433,7 @@ def test_im_mode():
     finally:
         # Clean up
         import os
+
         if timing_file.exists():
             os.remove(timing_file)
 
@@ -465,7 +476,8 @@ def test_columngroups_matches_afni_layout(tmp_path):
     stim_idx = list(range(12, 19))
     nuis_idx = list(range(19, 37))
     metadata = {
-        "n_runs": 3, "tr": 1.2,
+        "n_runs": 3,
+        "tr": 1.2,
         "polort_indices": polort_idx,
         "stim_indices": stim_idx,
         "padortvec_indices": [],
@@ -477,8 +489,7 @@ def test_columngroups_matches_afni_layout(tmp_path):
     }
 
     out = tmp_path / "X.xmat.1D"
-    write_afni_xmat(out, design, labels, run_starts=[0, 20, 40],
-                    metadata=metadata)
+    write_afni_xmat(out, design, labels, run_starts=[0, 20, 40], metadata=metadata)
 
     text = out.read_text()
     assert 'ColumnGroups = "12@-1,1..7,18@0"' in text
@@ -497,31 +508,32 @@ def test_glt_parsing():
     from fastfuncstuff.design.builder import glt_weights_to_vector, parse_glt_string
 
     # Difference (sum to 0).
-    rows, valid = parse_glt_string('SYM: +1*A -1*B')
+    rows, valid = parse_glt_string("SYM: +1*A -1*B")
     assert valid
     assert len(rows) == 1
-    assert rows[0] == {'A': (1.0, None), 'B': (-1.0, None)}
+    assert rows[0] == {"A": (1.0, None), "B": (-1.0, None)}
 
     # Average (sum to 1).
-    rows, valid = parse_glt_string('SYM: +0.5*A +0.5*B')
+    rows, valid = parse_glt_string("SYM: +0.5*A +0.5*B")
     assert valid
-    assert rows[0] == {'A': (0.5, None), 'B': (0.5, None)}
+    assert rows[0] == {"A": (0.5, None), "B": (0.5, None)}
 
     # Invalid sum warns and reports invalid.
     import warnings
+
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        rows, valid = parse_glt_string('SYM: +1*A +1*B')
+        rows, valid = parse_glt_string("SYM: +1*A +1*B")
         assert any("sum to" in str(item.message).lower() for item in w)
         assert not valid
 
     # Vector conversion (scalar back-compat dict).
-    labels = ['Poly0', 'Poly1', 'A', 'B', 'C']
-    vec = glt_weights_to_vector({'A': 1.0, 'B': -1.0}, labels)
+    labels = ["Poly0", "Poly1", "A", "B", "C"]
+    vec = glt_weights_to_vector({"A": 1.0, "B": -1.0}, labels)
     np.testing.assert_array_equal(vec, np.array([0, 0, 1, -1, 0]))
 
     # Vector conversion via the new (weight, range) value form.
-    vec2 = glt_weights_to_vector(rows[0] | {'B': (-1.0, None)}, labels)
+    vec2 = glt_weights_to_vector(rows[0] | {"B": (-1.0, None)}, labels)
     # rows[0] from the warning case had A=+1, B=+1; override B to -1.
     np.testing.assert_array_equal(vec2, np.array([0, 0, 1, -1, 0]))
 
@@ -534,31 +546,33 @@ def test_glt_multirow_f_test():
     )
 
     # Pipe-separated F-test: 3 single-coefficient rows.
-    rows, _ = parse_glt_string('SYM: +1*A | +1*B | +1*C')
+    rows, _ = parse_glt_string("SYM: +1*A | +1*B | +1*C")
     assert len(rows) == 3
-    assert rows[0] == {'A': (1.0, None)}
-    assert rows[2] == {'C': (1.0, None)}
+    assert rows[0] == {"A": (1.0, None)}
+    assert rows[2] == {"C": (1.0, None)}
 
     # Newline separator.
-    rows, _ = parse_glt_string('SYM: +1*A\n+1*B')
+    rows, _ = parse_glt_string("SYM: +1*A\n+1*B")
     assert len(rows) == 2
 
     # List-of-strings form (machine-generated specs).
-    rows, _ = parse_glt_string(['SYM: +1*A', 'SYM: +1*B'])
+    rows, _ = parse_glt_string(["SYM: +1*A", "SYM: +1*B"])
     assert len(rows) == 2
 
     # F-test matrix shape — 3 rows, n_regressors cols.
-    labels = ['p0', 'A', 'B', 'C', 'D']
-    rows, _ = parse_glt_string('SYM: +1*A | +1*B | +1*C')
+    labels = ["p0", "A", "B", "C", "D"]
+    rows, _ = parse_glt_string("SYM: +1*A | +1*B | +1*C")
     mat = glt_rows_to_matrix(rows, labels)
     assert mat.shape == (3, 5)
     np.testing.assert_array_equal(
         mat,
-        np.array([
-            [0, 1, 0, 0, 0],
-            [0, 0, 1, 0, 0],
-            [0, 0, 0, 1, 0],
-        ]),
+        np.array(
+            [
+                [0, 1, 0, 0, 0],
+                [0, 0, 1, 0, 0],
+                [0, 0, 0, 1, 0],
+            ]
+        ),
     )
 
 
@@ -567,29 +581,25 @@ def test_glt_sub_range_and_broadcast():
     from fastfuncstuff.design.builder import glt_weights_to_vector, parse_glt_string
 
     # TENT(0,20,6) on TaskA spanning columns 12..17 (6 basis cols).
-    labels = (
-        [f'pol{i}' for i in range(12)]
-        + [f'TaskA#{i}' for i in range(6)]
-        + ['nuis']
-    )
-    stim_ranges = {'TaskA': (12, 17)}
+    labels = [f"pol{i}" for i in range(12)] + [f"TaskA#{i}" for i in range(6)] + ["nuis"]
+    stim_ranges = {"TaskA": (12, 17)}
 
     # Sub-range [2..4] -> weight on columns 14, 15, 16.
-    rows, _ = parse_glt_string('SYM: +1*TaskA[2..4]')
+    rows, _ = parse_glt_string("SYM: +1*TaskA[2..4]")
     vec = glt_weights_to_vector(rows[0], labels, stim_ranges=stim_ranges)
     expected = np.zeros(len(labels))
     expected[14:17] = 1.0
     np.testing.assert_array_equal(vec, expected)
 
     # No range -> full-width broadcast (cols 12..17 all weight 1).
-    rows, _ = parse_glt_string('SYM: +1*TaskA')
+    rows, _ = parse_glt_string("SYM: +1*TaskA")
     vec = glt_weights_to_vector(rows[0], labels, stim_ranges=stim_ranges)
     expected = np.zeros(len(labels))
     expected[12:18] = 1.0
     np.testing.assert_array_equal(vec, expected)
 
     # Out-of-range sub-index raises.
-    rows, _ = parse_glt_string('SYM: +1*TaskA[2..8]')
+    rows, _ = parse_glt_string("SYM: +1*TaskA[2..8]")
     with pytest.raises(ValueError, match="exceeds basis count"):
         glt_weights_to_vector(rows[0], labels, stim_ranges=stim_ranges)
 
@@ -610,24 +620,30 @@ def test_goodlist_censor_round_trip(tmp_path):
 
     n_kept = len(good_indices)
     design = np.random.RandomState(0).randn(n_kept, 3).astype(np.float64)
-    labels = ['Pol0', 'taskA#0', 'taskB#0']
+    labels = ["Pol0", "taskA#0", "taskB#0"]
     metadata = {
-        'n_runs': 1, 'tr': 2.0,
-        'stim_indices': [1, 2],
-        'hrf_types': ['SPMG1', 'SPMG1'],
-        'stim_durations': [4.0, 4.0],
-        'nuisance_indices': [0],
+        "n_runs": 1,
+        "tr": 2.0,
+        "stim_indices": [1, 2],
+        "hrf_types": ["SPMG1", "SPMG1"],
+        "stim_durations": [4.0, 4.0],
+        "nuisance_indices": [0],
     }
 
-    out = tmp_path / 'X.xmat.1D'
+    out = tmp_path / "X.xmat.1D"
     write_afni_xmat(
-        out, design, labels, run_starts=[0], metadata=metadata,
-        good_list=good_indices, n_row_full=n_full,
+        out,
+        design,
+        labels,
+        run_starts=[0],
+        metadata=metadata,
+        good_list=good_indices,
+        n_row_full=n_full,
     )
 
     info = read_afni_design_matrix(str(out))
-    assert info['n_timepoints'] == 10  # NRowFull, after censor accounting
-    assert list(info['good_list']) == good_indices
+    assert info["n_timepoints"] == 10  # NRowFull, after censor accounting
+    assert list(info["good_list"]) == good_indices
 
 
 def test_f_test_glt_matrix_round_trip(tmp_path):
@@ -637,42 +653,44 @@ def test_f_test_glt_matrix_round_trip(tmp_path):
 
     n_tp, n_reg = 12, 4
     design = np.random.RandomState(1).randn(n_tp, n_reg).astype(np.float64)
-    labels = ['Pol0', 'A#0', 'B#0', 'C#0']
+    labels = ["Pol0", "A#0", "B#0", "C#0"]
     metadata = {
-        'n_runs': 1, 'tr': 2.0,
-        'stim_indices': [1, 2, 3],
-        'hrf_types': ['SPMG1', 'SPMG1', 'SPMG1'],
-        'stim_durations': [4.0, 4.0, 4.0],
-        'nuisance_indices': [0],
+        "n_runs": 1,
+        "tr": 2.0,
+        "stim_indices": [1, 2, 3],
+        "hrf_types": ["SPMG1", "SPMG1", "SPMG1"],
+        "stim_durations": [4.0, 4.0, 4.0],
+        "nuisance_indices": [0],
     }
 
     # One t-test (1 row) + one F-test (3 rows).
     glts = [
-        ('SYM: +1*A -1*B', 'A_vs_B'),
-        ('SYM: +1*A | +1*B | +1*C', 'AnyOfABC_F'),
+        ("SYM: +1*A -1*B", "A_vs_B"),
+        ("SYM: +1*A | +1*B | +1*C", "AnyOfABC_F"),
     ]
 
-    out = tmp_path / 'X.xmat.1D'
-    write_afni_xmat(out, design, labels, run_starts=[0],
-                    metadata=metadata, glt_contrasts=glts)
+    out = tmp_path / "X.xmat.1D"
+    write_afni_xmat(out, design, labels, run_starts=[0], metadata=metadata, glt_contrasts=glts)
 
     info = read_afni_design_matrix(str(out))
-    assert info['n_glt'] == 2
-    assert info['glt_labels'] == ['A_vs_B', 'AnyOfABC_F']
+    assert info["n_glt"] == 2
+    assert info["glt_labels"] == ["A_vs_B", "AnyOfABC_F"]
 
-    t_mat = info['glt_matrices'][0]
+    t_mat = info["glt_matrices"][0]
     assert t_mat.shape == (1, n_reg)
     np.testing.assert_array_equal(t_mat, np.array([[0, 1, -1, 0]]))
 
-    f_mat = info['glt_matrices'][1]
+    f_mat = info["glt_matrices"][1]
     assert f_mat.shape == (3, n_reg)
     np.testing.assert_array_equal(
         f_mat,
-        np.array([
-            [0, 1, 0, 0],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1],
-        ]),
+        np.array(
+            [
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ]
+        ),
     )
 
 
@@ -691,8 +709,8 @@ def test_goodlist_utilities():
     design = read_afni_design_matrix(xmat_path)
 
     # Check that GoodList was parsed
-    assert design['good_list'] is not None, "GoodList should be parsed"
-    assert len(design['good_list']) == 720, "Should have 720 uncensored timepoints"
+    assert design["good_list"] is not None, "GoodList should be parsed"
+    assert len(design["good_list"]) == 720, "Should have 720 uncensored timepoints"
 
     # Test censored mask (no censoring in this dataset)
     censored = get_censored_mask(design)
@@ -701,7 +719,7 @@ def test_goodlist_utilities():
 
     # Test selecting uncensored timepoints
     X_unc = select_uncensored_timepoints(design)
-    assert X_unc.shape == design['matrix'].shape, "No censoring, shapes should match"
+    assert X_unc.shape == design["matrix"].shape, "No censoring, shapes should match"
 
     # Test with data
     fake_data = np.random.randn(720, 100)
@@ -711,8 +729,8 @@ def test_goodlist_utilities():
 
     # Simulate censored data
     design_censored = design.copy()
-    design_censored['good_list'] = list(range(0, 100)) + list(range(102, 720))  # Remove TRs 100-101
-    design_censored['n_timepoints'] = 720
+    design_censored["good_list"] = list(range(0, 100)) + list(range(102, 720))  # Remove TRs 100-101
+    design_censored["n_timepoints"] = 720
 
     censored = get_censored_mask(design_censored)
     assert censored.sum() == 2, "Should have 2 censored timepoints"
@@ -738,7 +756,7 @@ class TestDesignBuilderEdgeCases:
         from fastfuncstuff.design.builder import load_and_pad_ortvec
 
         # Create dummy ortvec file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".1D", delete=False) as f:
             f.write("1.0 2.0\n3.0 4.0\n")
             filepath = f.name
 
@@ -750,13 +768,13 @@ class TestDesignBuilderEdgeCases:
             # Test invalid run number
             with pytest.raises(ValueError, match="Invalid run_number"):
                 load_and_pad_ortvec(filepath, 0, [2, 2])
-            
+
             with pytest.raises(ValueError, match="Invalid run_number"):
                 load_and_pad_ortvec(filepath, 3, [2, 2])
 
             # Test length mismatch (file has 2 rows, run has 10)
             with pytest.raises(ValueError, match="has 2 rows"):
-                load_and_pad_ortvec(filepath, 1, [10, 2]) # Run 1 has 10 timepoints
+                load_and_pad_ortvec(filepath, 1, [10, 2])  # Run 1 has 10 timepoints
 
         finally:
             if os.path.exists(filepath):
@@ -771,7 +789,7 @@ class TestDesignBuilderEdgeCases:
 
         # Create dummy ortvec file (5 timepoints, 2 regressors)
         data = np.random.randn(5, 2)
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.1D', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".1D", delete=False) as f:
             for row in data:
                 f.write(f"{row[0]} {row[1]}\n")
             filepath = f.name
@@ -779,19 +797,19 @@ class TestDesignBuilderEdgeCases:
         try:
             # 3 runs: 5, 5, 5 timepoints
             n_timepoints_per_run = [5, 5, 5]
-            
+
             # Load for run 2
             padded = load_and_pad_ortvec(filepath, 2, n_timepoints_per_run)
-            
+
             # Check shape: total timepoints x regressors
             assert padded.shape == (15, 2)
-            
+
             # Check run 1 is zero
             assert np.allclose(padded[:5], 0)
-            
+
             # Check run 2 matches data
             assert np.allclose(padded[5:10], data)
-            
+
             # Check run 3 is zero
             assert np.allclose(padded[10:], 0)
 
@@ -806,14 +824,14 @@ class TestDesignBuilderEdgeCases:
         # Valid cases
         name, dur = parse_hrf_model("SPMG1(5)")
         assert name == "SPMG1" and dur == 5.0
-        
+
         name, dur = parse_hrf_model("BLOCK(20.5)")
         assert name == "BLOCK" and dur == 20.5
 
         # Invalid format
         with pytest.raises(ValueError, match="Invalid HRF model string"):
             parse_hrf_model("InvalidFormat")
-            
+
         with pytest.raises(ValueError, match="Invalid HRF model string"):
             parse_hrf_model("SPMG1[5]")
 
@@ -837,9 +855,9 @@ class TestDesignBuilderEdgeCases:
         import tempfile
 
         from fastfuncstuff.design.builder import build_design_matrix
-        
+
         # Create dummy timing file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("10 20\n")
             timing_file = f.name
 
@@ -848,9 +866,9 @@ class TestDesignBuilderEdgeCases:
             with pytest.raises(ValueError, match="stim_labels length"):
                 build_design_matrix(
                     timing_files=[timing_file],
-                    stim_labels=["A", "B"], # 2 labels
+                    stim_labels=["A", "B"],  # 2 labels
                     n_timepoints_per_run=[100],
-                    tr=1.0
+                    tr=1.0,
                 )
 
             # Mismatched HRF models
@@ -860,7 +878,7 @@ class TestDesignBuilderEdgeCases:
                     stim_labels=["A"],
                     n_timepoints_per_run=[100],
                     tr=1.0,
-                    hrf_models=["SPMG1(5)", "BLOCK(10)"] # 2 models
+                    hrf_models=["SPMG1(5)", "BLOCK(10)"],  # 2 models
                 )
 
             # Mismatched IM mode
@@ -870,16 +888,16 @@ class TestDesignBuilderEdgeCases:
                     stim_labels=["A"],
                     n_timepoints_per_run=[100],
                     tr=1.0,
-                    im_mode=[True, False] # 2 modes
+                    im_mode=[True, False],  # 2 modes
                 )
-                
+
             # Mismatched runs in timing file
             with pytest.raises(ValueError, match="has 1 runs, but expected 2"):
                 build_design_matrix(
-                    timing_files=[timing_file], # Has 1 line (1 run)
+                    timing_files=[timing_file],  # Has 1 line (1 run)
                     stim_labels=["A"],
-                    n_timepoints_per_run=[100, 100], # Expects 2 runs
-                    tr=1.0
+                    n_timepoints_per_run=[100, 100],  # Expects 2 runs
+                    tr=1.0,
                 )
 
         finally:
@@ -892,15 +910,15 @@ class TestDesignBuilderEdgeCases:
         import tempfile
 
         from fastfuncstuff.design.builder import build_design_matrix
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("10 20\n")
             timing_file = f.name
-            
+
         try:
             n_tps = 100
             extra = np.random.randn(n_tps, 2)
-            
+
             design, labels, _, metadata = build_design_matrix(
                 timing_files=[timing_file],
                 stim_labels=["stim"],
@@ -908,19 +926,19 @@ class TestDesignBuilderEdgeCases:
                 tr=1.0,
                 hrf_models="SPMG1(0)",
                 polort=0,
-                extra_regressors=[extra]
+                extra_regressors=[extra],
             )
-            
+
             # Expected columns: 1 polort + 1 stim + 2 extra = 4
             assert design.shape == (n_tps, 4)
             assert design.shape[1] == 4
-            
+
             # Check last 2 columns are extra
             assert np.allclose(design[:, -2:], extra)
-            
+
             # Check metadata
-            assert len(metadata['extra_indices']) == 2
-            
+            assert len(metadata["extra_indices"]) == 2
+
         finally:
             if os.path.exists(timing_file):
                 os.remove(timing_file)
@@ -932,8 +950,8 @@ class TestDesignBuilderEdgeCases:
 
 import torch
 
-from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.design.hrf import get_canonical_hrf
+from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.utils import get_device
 
 
@@ -968,7 +986,9 @@ class TestDesignHrfConvolution:
         )
 
         # Check shape
-        assert design.shape == (n_timepoints, 1), f"Expected shape ({n_timepoints}, 1), got {design.shape}"
+        assert design.shape == (n_timepoints, 1), (
+            f"Expected shape ({n_timepoints}, 1), got {design.shape}"
+        )
 
         # Peak should occur after the event (HRF delay)
         peak_idx = torch.argmax(design).item()
@@ -1010,6 +1030,7 @@ class TestDesignHrfConvolution:
         # Should have three peaks
         # Find local maxima
         from scipy.signal import find_peaks
+
         peaks, _ = find_peaks(design[:, 0].cpu().numpy(), height=0.1)
         assert len(peaks) == 3, f"Should have 3 peaks for 3 events, got {len(peaks)}"
 
@@ -1063,7 +1084,7 @@ class TestDesignHrfConvolution:
 
         start_bin = int(round(10 * tr / microtime_dt))
         duration_bins = int(round(10.0 / microtime_dt))  # 10 second duration
-        onsets_microtime[start_bin:start_bin + duration_bins, 0] = 1.0
+        onsets_microtime[start_bin : start_bin + duration_bins, 0] = 1.0
 
         hrf = get_canonical_hrf(stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device)
 
@@ -1082,7 +1103,9 @@ class TestDesignHrfConvolution:
 
         # Response should be > 0 during much of the stimulus period
         mid_stimulus_response = design[12:15, 0].mean().item()  # TR 12-15 (during stimulus)
-        assert mid_stimulus_response > 0.3, f"Response should be elevated during stimulus, got {mid_stimulus_response}"
+        assert mid_stimulus_response > 0.3, (
+            f"Response should be elevated during stimulus, got {mid_stimulus_response}"
+        )
 
     def test_convolve_hrf_microtime_empty_onsets(self):
         """Test convolution with no events"""
@@ -1156,8 +1179,9 @@ class TestDesignConvolveHrfBasic:
         design = convolve_hrf(onsets, hrf, n_timepoints, device=device)
 
         # Check shape
-        assert design.shape == (n_timepoints, n_conditions), \
+        assert design.shape == (n_timepoints, n_conditions), (
             f"Expected shape ({n_timepoints}, {n_conditions}), got {design.shape}"
+        )
 
         # Peak should occur after the event
         peak_cond0 = torch.argmax(design[:, 0]).item()
@@ -1236,8 +1260,7 @@ class TestDesignIsTrLocked:
         tr = 2.0
 
         # Exact TR multiples should be TR-locked
-        assert is_tr_locked([0.0, 2.0, 4.0, 10.0], tr), \
-            "TR multiples should be TR-locked"
+        assert is_tr_locked([0.0, 2.0, 4.0, 10.0], tr), "TR multiples should be TR-locked"
 
     def test_is_tr_locked_not_locked(self):
         """Test is_tr_locked with non-TR multiples"""
@@ -1246,8 +1269,7 @@ class TestDesignIsTrLocked:
         tr = 2.0
 
         # Non-multiples should not be TR-locked
-        assert not is_tr_locked([1.0, 3.0, 5.0], tr), \
-            "Non-TR multiples should not be TR-locked"
+        assert not is_tr_locked([1.0, 3.0, 5.0], tr), "Non-TR multiples should not be TR-locked"
 
     def test_is_tr_locked_tolerance(self):
         """Test is_tr_locked with floating point tolerance"""
@@ -1257,12 +1279,10 @@ class TestDesignIsTrLocked:
 
         # Should handle small floating point errors (within 10% threshold)
         # 2.001 is 0.001/2.0 = 0.05% error - well within 10%
-        assert is_tr_locked([2.001, 4.001], tr), \
-            "Should tolerate small FP errors within threshold"
+        assert is_tr_locked([2.001, 4.001], tr), "Should tolerate small FP errors within threshold"
         # 2.2 is 0.2/2.0 = 10% error - at the threshold boundary
         # The function uses < threshold, so 10% exactly should fail
-        assert not is_tr_locked([2.2, 4.2], tr), \
-            "Larger errors should not be TR-locked"
+        assert not is_tr_locked([2.2, 4.2], tr), "Larger errors should not be TR-locked"
 
 
 class TestDesignGenerateRandomOnsets:
@@ -1282,12 +1302,13 @@ class TestDesignGenerateRandomOnsets:
             n_conditions=n_conditions,
             isi_mean=isi_mean,
             tr=tr,
-            device=torch.device("cpu")
+            device=torch.device("cpu"),
         )
 
         # Check shape
-        assert onsets.shape == (n_timepoints, n_conditions), \
+        assert onsets.shape == (n_timepoints, n_conditions), (
             f"Expected shape ({n_timepoints}, {n_conditions}), got {onsets.shape}"
+        )
 
         # Check that we have some events (should be sparse)
         n_events_cond0 = onsets[:, 0].sum().item()
@@ -1314,7 +1335,7 @@ class TestDesignGenerateRandomOnsets:
             n_conditions=n_conditions,
             isi_mean=isi_mean,
             tr=tr,
-            device=torch.device("cpu")
+            device=torch.device("cpu"),
         )
 
         # Check shape
@@ -1340,7 +1361,7 @@ class TestDesignGenerateRandomOnsets:
             isi_mean=isi_mean,
             isi_range=(8, 12),  # Narrow range
             tr=tr,
-            device=torch.device("cpu")
+            device=torch.device("cpu"),
         )
 
         # Wide ISI range
@@ -1350,7 +1371,7 @@ class TestDesignGenerateRandomOnsets:
             isi_mean=isi_mean,
             isi_range=(2, 18),  # Wide range
             tr=tr,
-            device=torch.device("cpu")
+            device=torch.device("cpu"),
         )
 
         # Both should produce valid onset matrices
@@ -1376,4 +1397,3 @@ if __name__ == "__main__":
 
     # Run new tests
     pytest.main([__file__, "-v"])
-

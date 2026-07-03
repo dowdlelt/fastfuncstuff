@@ -18,7 +18,6 @@ from fastfuncstuff.processing.ffs_moco import (
     _unweighted_rms,
     _weighted_rms,
     compute_derivative_images,
-    compute_max_displacement,
     gauss_newton_rigid,
     gauss_newton_rigid_fixed,
     gauss_newton_rigid_fixed_masked,
@@ -34,6 +33,7 @@ DEV = torch.device("cpu")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_gaussian_blob(shape=(12, 12, 12)):
     """Create a 3D Gaussian blob centered in volume."""
     nz, ny, nx = shape
@@ -45,7 +45,7 @@ def _make_gaussian_blob(shape=(12, 12, 12)):
     )
     cx, cy, cz = (nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0
     r2 = (xx - cx) ** 2 + (yy - cy) ** 2 + (zz - cz) ** 2
-    return torch.exp(-r2 / (2 * 3.0 ** 2))
+    return torch.exp(-r2 / (2 * 3.0**2))
 
 
 def _make_shifted_timeseries(base, n_vols=5, max_shift=0.5):
@@ -70,6 +70,7 @@ def _make_shifted_timeseries(base, n_vols=5, max_shift=0.5):
 # ---------------------------------------------------------------------------
 # _weighted_rms and _unweighted_rms  (lines 178-181, 186-188)
 # ---------------------------------------------------------------------------
+
 
 class TestRMSFunctions:
     def test_weighted_rms_identical(self):
@@ -101,6 +102,7 @@ class TestRMSFunctions:
 # compute_derivative_images - verb>=2 path (line 153)
 # ---------------------------------------------------------------------------
 
+
 class TestDerivativeImagesVerbose:
     def test_derivative_images_verbose(self, capsys):
         vol = _make_gaussian_blob((8, 8, 8)).to(DEV)
@@ -113,6 +115,7 @@ class TestDerivativeImagesVerbose:
 # ---------------------------------------------------------------------------
 # gauss_newton_rigid - convergence and max_iter paths (lines 228, 258)
 # ---------------------------------------------------------------------------
+
 
 class TestGaussNewtonRigidConvergence:
     def test_gn_rigid_max_iter_reached(self):
@@ -133,12 +136,19 @@ class TestGaussNewtonRigidConvergence:
         JtWJ = WJ @ WJ.t()
         weight_flat_1d = weight.reshape(-1)
 
-        cfg = MocoConfig(max_iter=2, device="cpu", verb=0, compile=False,
-                         dxy_thresh=1e-10, dph_thresh=1e-10)
+        cfg = MocoConfig(
+            max_iter=2, device="cpu", verb=0, compile=False, dxy_thresh=1e-10, dph_thresh=1e-10
+        )
         init_params = identity_params(device=DEV, dtype=torch.float32)
 
         params, n_iter = gauss_newton_rigid(
-            base_flat, source, weight_flat_1d, WJ, JtWJ, init_params, cfg,
+            base_flat,
+            source,
+            weight_flat_1d,
+            WJ,
+            JtWJ,
+            init_params,
+            cfg,
             coords=coords,
         )
         # Should hit max_iter since thresholds are tiny
@@ -148,6 +158,7 @@ class TestGaussNewtonRigidConvergence:
 # ---------------------------------------------------------------------------
 # gauss_newton_rigid_masked (lines 273-299)
 # ---------------------------------------------------------------------------
+
 
 class TestGaussNewtonRigidMasked:
     def test_gn_rigid_masked_identical(self):
@@ -175,8 +186,13 @@ class TestGaussNewtonRigidMasked:
         init_params = identity_params(device=DEV, dtype=torch.float32)
 
         params, n_iter = gauss_newton_rigid_masked(
-            base_flat_masked, source, weight_flat_masked,
-            WJ_masked, JtWJ, init_params, cfg,
+            base_flat_masked,
+            source,
+            weight_flat_masked,
+            WJ_masked,
+            JtWJ,
+            init_params,
+            cfg,
             coords_masked=coords_masked,
         )
         # Identical volumes should converge quickly
@@ -205,13 +221,19 @@ class TestGaussNewtonRigidMasked:
         WJ_masked = WJ_full[:, mask_idx]
         JtWJ = WJ_masked @ WJ_masked.t()
 
-        cfg = MocoConfig(max_iter=2, device="cpu", verb=0, compile=False,
-                         dxy_thresh=1e-10, dph_thresh=1e-10)
+        cfg = MocoConfig(
+            max_iter=2, device="cpu", verb=0, compile=False, dxy_thresh=1e-10, dph_thresh=1e-10
+        )
         init_params = identity_params(device=DEV, dtype=torch.float32)
 
         params, n_iter = gauss_newton_rigid_masked(
-            base_flat_masked, source, weight_flat_masked,
-            WJ_masked, JtWJ, init_params, cfg,
+            base_flat_masked,
+            source,
+            weight_flat_masked,
+            WJ_masked,
+            JtWJ,
+            init_params,
+            cfg,
             coords_masked=coords_masked,
         )
         assert n_iter == cfg.max_iter
@@ -220,6 +242,7 @@ class TestGaussNewtonRigidMasked:
 # ---------------------------------------------------------------------------
 # gauss_newton_rigid_fixed (lines 313-332)
 # ---------------------------------------------------------------------------
+
 
 class TestGaussNewtonRigidFixed:
     def test_gn_rigid_fixed_identical(self):
@@ -237,8 +260,15 @@ class TestGaussNewtonRigidFixed:
         init_params = identity_params(device=DEV, dtype=torch.float32)
 
         params = gauss_newton_rigid_fixed(
-            base_flat, source, weight_flat_1d, WJ, JtWJ,
-            init_params, coords, max_iter=3, interp="heptic",
+            base_flat,
+            source,
+            weight_flat_1d,
+            WJ,
+            JtWJ,
+            init_params,
+            coords,
+            max_iter=3,
+            interp="heptic",
         )
         # Returns params tensor (no n_iter)
         assert params.shape == (12,)
@@ -248,6 +278,7 @@ class TestGaussNewtonRigidFixed:
 # ---------------------------------------------------------------------------
 # gauss_newton_rigid_fixed_masked (lines 350-371)
 # ---------------------------------------------------------------------------
+
 
 class TestGaussNewtonRigidFixedMasked:
     def test_gn_rigid_fixed_masked_identical(self):
@@ -271,9 +302,15 @@ class TestGaussNewtonRigidFixedMasked:
         init_params = identity_params(device=DEV, dtype=torch.float32)
 
         params = gauss_newton_rigid_fixed_masked(
-            base_flat_masked, source, weight_flat_masked,
-            WJ_masked, JtWJ, init_params,
-            coords_masked, max_iter=3, interp="heptic",
+            base_flat_masked,
+            source,
+            weight_flat_masked,
+            WJ_masked,
+            JtWJ,
+            init_params,
+            coords_masked,
+            max_iter=3,
+            interp="heptic",
         )
         assert params.shape == (12,)
         assert torch.allclose(params[:3], torch.zeros(3), atol=0.1)
@@ -282,6 +319,7 @@ class TestGaussNewtonRigidFixedMasked:
 # ---------------------------------------------------------------------------
 # gn_lpa_rigid (lines 398-433)
 # ---------------------------------------------------------------------------
+
 
 class TestGnLpaRigid:
     def test_lpa_rigid_identical(self):
@@ -293,8 +331,13 @@ class TestGnLpaRigid:
         init_params = identity_params(device=DEV, dtype=torch.float32)
 
         cfg = MocoConfig(
-            cost="lpa", max_iter=5, device="cpu", verb=0, compile=False,
-            powell_maxfev=20, interp="linear",
+            cost="lpa",
+            max_iter=5,
+            device="cpu",
+            verb=0,
+            compile=False,
+            powell_maxfev=20,
+            interp="linear",
         )
         params, n_evals = gn_lpa_rigid(base, source, weight, init_params, cfg)
         assert params.shape == (12,)
@@ -306,6 +349,7 @@ class TestGnLpaRigid:
 # ---------------------------------------------------------------------------
 # _get_voxel_sizes (line 495)
 # ---------------------------------------------------------------------------
+
 
 class TestGetVoxelSizes:
     def test_identity_affine(self):
@@ -322,6 +366,7 @@ class TestGetVoxelSizes:
 # ---------------------------------------------------------------------------
 # _blur_volume (lines 599-602)
 # ---------------------------------------------------------------------------
+
 
 class TestBlurVolume:
     def test_blur_zero_fwhm_returns_unchanged(self):
@@ -346,6 +391,7 @@ class TestBlurVolume:
 # moco() integration (lines 629-1117)
 # ---------------------------------------------------------------------------
 
+
 class TestMocoIntegration:
     def test_moco_identity_timeseries(self):
         """All volumes identical -- params should be near zero."""
@@ -354,8 +400,13 @@ class TestMocoIntegration:
         ts = base.unsqueeze(0).repeat(nt, 1, 1, 1)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=3, device="cpu",
-            verb=0, compile=False, chain_init=False,
+            base_index=0,
+            cost="wls",
+            max_iter=3,
+            device="cpu",
+            verb=0,
+            compile=False,
+            chain_init=False,
         )
         result = moco(ts, cfg)
 
@@ -372,8 +423,13 @@ class TestMocoIntegration:
         ts = _make_shifted_timeseries(base, n_vols=4, max_shift=0.4)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=5, device="cpu",
-            verb=0, compile=False, chain_init=True,
+            base_index=0,
+            cost="wls",
+            max_iter=5,
+            device="cpu",
+            verb=0,
+            compile=False,
+            chain_init=True,
         )
         result = moco(ts, cfg)
 
@@ -394,8 +450,13 @@ class TestMocoIntegration:
         ts = _make_shifted_timeseries(base, n_vols=3, max_shift=0.3)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=3, device="cpu",
-            verb=0, compile=False, chain_init=False,
+            base_index=0,
+            cost="wls",
+            max_iter=3,
+            device="cpu",
+            verb=0,
+            compile=False,
+            chain_init=False,
         )
         result = moco(ts, cfg)
         assert result.aligned.shape == ts.shape
@@ -409,8 +470,12 @@ class TestMocoIntegration:
         header_info = {"affine": affine}
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=2, device="cpu",
-            verb=0, compile=False,
+            base_index=0,
+            cost="wls",
+            max_iter=2,
+            device="cpu",
+            verb=0,
+            compile=False,
         )
         result = moco(ts, cfg, header_info=header_info)
         assert result.matrices_dicom.shape == (2, 4, 4)
@@ -421,8 +486,14 @@ class TestMocoIntegration:
         ts = _make_shifted_timeseries(base, n_vols=3, max_shift=0.3)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=3, device="cpu",
-            verb=0, compile=False, fixed_iter=True, chain_init=False,
+            base_index=0,
+            cost="wls",
+            max_iter=3,
+            device="cpu",
+            verb=0,
+            compile=False,
+            fixed_iter=True,
+            chain_init=False,
         )
         result = moco(ts, cfg)
         assert result.aligned.shape == ts.shape
@@ -436,8 +507,12 @@ class TestMocoIntegration:
         ts = _make_shifted_timeseries(base, n_vols=3, max_shift=0.2)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=3, device="cpu",
-            verb=0, compile=False,
+            base_index=0,
+            cost="wls",
+            max_iter=3,
+            device="cpu",
+            verb=0,
+            compile=False,
         )
         result = moco(ts, cfg, base_vol=base)
         assert result.aligned.shape == ts.shape
@@ -450,8 +525,14 @@ class TestMocoIntegration:
         ts = _make_shifted_timeseries(base, n_vols=3, max_shift=0.3)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=3, device="cpu",
-            verb=0, compile=False, twopass=True, chain_init=False,
+            base_index=0,
+            cost="wls",
+            max_iter=3,
+            device="cpu",
+            verb=0,
+            compile=False,
+            twopass=True,
+            chain_init=False,
         )
         result = moco(ts, cfg)
         assert result.aligned.shape == ts.shape
@@ -462,8 +543,13 @@ class TestMocoIntegration:
         ts = _make_shifted_timeseries(base, n_vols=3, max_shift=0.3)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=3, device="cpu",
-            verb=0, compile=False, blur_fwhm=2.0,
+            base_index=0,
+            cost="wls",
+            max_iter=3,
+            device="cpu",
+            verb=0,
+            compile=False,
+            blur_fwhm=2.0,
         )
         result = moco(ts, cfg)
         assert result.aligned.shape == ts.shape
@@ -474,8 +560,12 @@ class TestMocoIntegration:
         ts = base.unsqueeze(0).repeat(2, 1, 1, 1)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=2, device="cpu",
-            verb=1, compile=False,
+            base_index=0,
+            cost="wls",
+            max_iter=2,
+            device="cpu",
+            verb=1,
+            compile=False,
         )
         result = moco(ts, cfg)
         captured = capsys.readouterr()
@@ -487,8 +577,12 @@ class TestMocoIntegration:
         ts = base.unsqueeze(0).repeat(2, 1, 1, 1)
 
         cfg = MocoConfig(
-            base_index=0, cost="wls", max_iter=2, device=None,
-            verb=0, compile=False,
+            base_index=0,
+            cost="wls",
+            max_iter=2,
+            device=None,
+            verb=0,
+            compile=False,
         )
         result = moco(ts, cfg)
         assert result.aligned.shape == ts.shape

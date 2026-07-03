@@ -7,11 +7,21 @@ from typing import Any
 
 import numpy as np
 
-
 # Ordered stage names for consistent plot layout
-STAGE_ORDER = ["moco", "slicetime", "crossalign", "align", "warp", "glm", "ica",
-               "ica_single",
-               "glmsingle_prep", "glmsingle_hrf", "glmsingle_denoise", "glmsingle_ridge"]
+STAGE_ORDER = [
+    "moco",
+    "slicetime",
+    "crossalign",
+    "align",
+    "warp",
+    "glm",
+    "ica",
+    "ica_single",
+    "glmsingle_prep",
+    "glmsingle_hrf",
+    "glmsingle_denoise",
+    "glmsingle_ridge",
+]
 
 STAGE_LABELS = {
     "moco": "Motion\nCorrection",
@@ -28,6 +38,7 @@ STAGE_LABELS = {
     "glmsingle_ridge": "GLMsingle\nRidge (D)",
 }
 
+
 # Short arch labels for plot legends
 def _short_arch(arch_id: str) -> str:
     """Convert an arch_id to a short label for plots.
@@ -37,14 +48,14 @@ def _short_arch(arch_id: str) -> str:
     """
     for prefix in ("cuda-NVIDIA_GeForce_", "cuda-NVIDIA_", "cuda-", "mps-Apple_", "mps-"):
         if arch_id.startswith(prefix):
-            return arch_id[len(prefix):].replace("_", " ")
+            return arch_id[len(prefix) :].replace("_", " ")
     # Legacy: linux-x86_64-cuda-NVIDIA_GeForce_RTX_5070_Ti
     parts = arch_id.split("-", 3)
     if len(parts) >= 4:
         accel = parts[3]
         for prefix in ("NVIDIA_GeForce_", "NVIDIA_", "Apple_"):
             if accel.startswith(prefix):
-                accel = accel[len(prefix):]
+                accel = accel[len(prefix) :]
         return accel.replace("_", " ")
     # ref_arch_id style: linux-x86_64
     if len(parts) == 2:
@@ -71,14 +82,16 @@ def _extract_plot_data(cache: dict[str, Any]) -> list[dict]:
         short = _short_arch(ffs_id)
         if dataset_id:
             short = f"{short} ({dataset_id})"
-        entries.append({
-            "arch_id": run.get("arch_id", ffs_id),
-            "ref_arch_id": run.get("ref_arch_id", ""),
-            "ffs_arch_id": ffs_id,
-            "dataset_id": dataset_id,
-            "short_label": short,
-            "stages": stages,
-        })
+        entries.append(
+            {
+                "arch_id": run.get("arch_id", ffs_id),
+                "ref_arch_id": run.get("ref_arch_id", ""),
+                "ffs_arch_id": ffs_id,
+                "dataset_id": dataset_id,
+                "short_label": short,
+                "stages": stages,
+            }
+        )
     return entries
 
 
@@ -132,12 +145,24 @@ def plot_timing_bars(
         x = np.arange(n_stages) * group_width
         offset = arch_idx * (2 * bar_width + 0.05)
 
-        ax.bar(x + offset, ref_times, bar_width,
-               label=label_ref, color=colors_ref[arch_idx],
-               edgecolor="black", linewidth=0.5)
-        ax.bar(x + offset + bar_width, ffs_times, bar_width,
-               label=label_ffs, color=colors_ffs[arch_idx],
-               edgecolor="black", linewidth=0.5)
+        ax.bar(
+            x + offset,
+            ref_times,
+            bar_width,
+            label=label_ref,
+            color=colors_ref[arch_idx],
+            edgecolor="black",
+            linewidth=0.5,
+        )
+        ax.bar(
+            x + offset + bar_width,
+            ffs_times,
+            bar_width,
+            label=label_ffs,
+            color=colors_ffs[arch_idx],
+            edgecolor="black",
+            linewidth=0.5,
+        )
 
     # Labels
     center_offset = (n_archs - 1) * (2 * bar_width + 0.05) / 2 + bar_width / 2
@@ -195,16 +220,26 @@ def plot_speedup_bars(
                 speedups.append(0.0)
 
         y = np.arange(n_stages) + arch_idx * bar_height
-        bars = ax.barh(y, speedups, bar_height,
-                       label=entry["short_label"],
-                       color=colors[arch_idx],
-                       edgecolor="black", linewidth=0.5)
+        bars = ax.barh(
+            y,
+            speedups,
+            bar_height,
+            label=entry["short_label"],
+            color=colors[arch_idx],
+            edgecolor="black",
+            linewidth=0.5,
+        )
 
         # Value labels on bars
         for bar, sp in zip(bars, speedups):
             if sp > 0:
-                ax.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
-                        f"{sp:.1f}x", va="center", fontsize=8)
+                ax.text(
+                    bar.get_width() + 0.05,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{sp:.1f}x",
+                    va="center",
+                    fontsize=8,
+                )
 
     # Reference line at 1.0x
     ax.axvline(x=1.0, color="red", linestyle="--", alpha=0.5, linewidth=1)

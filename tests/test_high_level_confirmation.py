@@ -9,17 +9,11 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.analysis import (
-    analyze_from_onsets,
-    analyze_with_cross_validation,
-)
-from fastfuncstuff.glm.core import fit_glm_hrf_library
 from fastfuncstuff.design.hrf import get_hrf_library
+from fastfuncstuff.glm.core import fit_glm_hrf_library
 
 # Test data directory
-TEST_DATA_DIR = (
-    Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
-)
+TEST_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
 
 
 @pytest.fixture
@@ -44,6 +38,7 @@ def simulated_data():
     # Also create microtime-resolution onset matrix for HRF library tests
     # onsets_to_binary_matrix expects list of lists of arrays per condition per run
     from fastfuncstuff.io.afni import onsets_to_binary_matrix
+
     onsets_per_condition = [[stim_onsets[0]], [stim_onsets[1]]]  # 2 conditions, 1 run each
     onsets_matrix_microtime = onsets_to_binary_matrix(
         onsets_per_condition, n_timepoints, tr, microtime_dt=0.1
@@ -92,9 +87,7 @@ def test_hrf_library_creation():
     n_hrfs = 10
 
     # Test library mode - always returns 20 HRFs (fixed library from file)
-    lib_library = get_hrf_library(
-        mode="library", stim_duration=stim_duration, tr=tr, n_hrfs=n_hrfs
-    )
+    lib_library = get_hrf_library(mode="library", stim_duration=stim_duration, tr=tr, n_hrfs=n_hrfs)
     assert lib_library.shape[0] == 20  # Library has fixed 20 HRFs
     assert lib_library.shape[1] > 0
     # At TR resolution, peaks may not hit exactly 1.0 due to sampling
@@ -109,9 +102,7 @@ def test_hrf_library_creation():
         n_hrfs=n_hrfs,
     )
     # At native resolution, peaks should be very close to 1.0
-    assert torch.all(lib_microtime.max(dim=1)[0] > 0.95), (
-        "Microtime HRFs should peak near 1.0"
-    )
+    assert torch.all(lib_microtime.max(dim=1)[0] > 0.95), "Microtime HRFs should peak near 1.0"
 
     # Test PIGHS library - respects n_hrfs (tests backwards compatibility with 'flobs' mode too)
     lib_pighs = get_hrf_library(
@@ -126,9 +117,7 @@ def test_hrf_library_creation():
     assert lib_flobs.shape[0] == n_hrfs
 
     # Check that they are different
-    assert not torch.allclose(lib_library[0], lib_library[1]), (
-        "HRFs in library should vary"
-    )
+    assert not torch.allclose(lib_library[0], lib_library[1]), "HRFs in library should vary"
 
 
 def test_fit_glm_hrf_library_logic(simulated_data):
@@ -158,9 +147,9 @@ def test_fit_glm_hrf_library_logic(simulated_data):
 
 def test_microtime_resolution(simulated_data):
     """Confirm sub-TR timing (microtime resolution) works correctly."""
-    from fastfuncstuff.io.afni import onsets_to_binary_matrix
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
     from fastfuncstuff.design.hrf import get_canonical_hrf
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.io.afni import onsets_to_binary_matrix
 
     tr = simulated_data["tr"]
     n_timepoints = simulated_data["n_timepoints"]
@@ -173,9 +162,7 @@ def test_microtime_resolution(simulated_data):
     ]
 
     # Test with TR-locked (legacy) - onsets get rounded
-    onsets_tr = onsets_to_binary_matrix(
-        onsets_per_condition, n_timepoints, tr, microtime_dt=tr
-    )
+    onsets_tr = onsets_to_binary_matrix(onsets_per_condition, n_timepoints, tr, microtime_dt=tr)
     assert onsets_tr.shape == (n_timepoints, 2)
     # At TR=2.0, onset at 0.5s rounds to TR 0, onset at 10.5s rounds to TR 5
     assert onsets_tr[0, 0] == 1  # 0.5s -> TR 0
@@ -204,9 +191,7 @@ def test_microtime_resolution(simulated_data):
         microtime_dt=tr / microtime_res,
         microtime_onset=microtime_res // 2 + 1,  # Middle of TR
     )
-    assert design.shape == (n_timepoints, 2), (
-        f"Expected ({n_timepoints}, 2), got {design.shape}"
-    )
+    assert design.shape == (n_timepoints, 2), f"Expected ({n_timepoints}, 2), got {design.shape}"
 
     # Verify convolved design has reasonable values (not all zeros)
     assert design.abs().sum() > 0, "Convolved design should have non-zero values"
@@ -214,9 +199,9 @@ def test_microtime_resolution(simulated_data):
 
 def test_microtime_vs_tr_locked():
     """Confirm microtime produces different results than TR-locked for sub-TR onsets."""
-    from fastfuncstuff.io.afni import onsets_to_binary_matrix
-    from fastfuncstuff.design.matrices import convolve_hrf, convolve_hrf_microtime
     from fastfuncstuff.design.hrf import get_canonical_hrf
+    from fastfuncstuff.design.matrices import convolve_hrf, convolve_hrf_microtime
+    from fastfuncstuff.io.afni import onsets_to_binary_matrix
 
     tr = 2.0
     n_timepoints = 100
@@ -261,12 +246,8 @@ def test_microtime_vs_tr_locked():
     )
 
     # TR-locked designs would be identical (both round to TR 0)
-    onsets_early_tr = onsets_to_binary_matrix(
-        onsets_early, n_timepoints, tr, microtime_dt=tr
-    )
-    onsets_late_tr = onsets_to_binary_matrix(
-        onsets_late, n_timepoints, tr, microtime_dt=tr
-    )
+    onsets_early_tr = onsets_to_binary_matrix(onsets_early, n_timepoints, tr, microtime_dt=tr)
+    onsets_late_tr = onsets_to_binary_matrix(onsets_late, n_timepoints, tr, microtime_dt=tr)
 
     # Verify both round to TR 0
     assert onsets_early_tr[0, 0] == 1, "0.2s should round to TR 0"

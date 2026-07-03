@@ -33,13 +33,6 @@ except ImportError:
 
 # Import fastfuncstuff modules
 try:
-    from fastfuncstuff.io.afni import (
-        get_tr_from_file,
-        load_nifti,
-        read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
-        replace_afni_extension,
-        save_nifti,
-    )
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
         add_ortvec_arguments,
@@ -62,6 +55,13 @@ try:
         slice_glm_results,
         write_glm_bucket_as_nifti,
         write_single_trials_output,
+    )
+    from fastfuncstuff.io.afni import (
+        get_tr_from_file,
+        load_nifti,
+        read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
+        replace_afni_extension,
+        save_nifti,
     )
     from fastfuncstuff.utils import (
         configure_torch_backends,
@@ -919,6 +919,8 @@ def main():
     if args.spec:
         from fastfuncstuff.cli.design_spec import (
             _do_compile as _design_spec_compile,
+        )
+        from fastfuncstuff.cli.design_spec import (
             _resolve_spec_path as _design_spec_resolve,
         )
 
@@ -1785,7 +1787,6 @@ def main():
                 print(f"  • Writing OLS betas only: {args.Obeta}")
                 # Write only betas using the write_glm_results_nifti function correctly
                 # Create a temporary results-like object with only betas
-                import nibabel as nib
 
                 from fastfuncstuff.glm.outputs import (
                     _ensure_numpy,
@@ -2495,7 +2496,6 @@ def main():
         # Save in requested format using helper
         # IMPORTANT: nibabel cannot convert NIfTI headers to AFNI headers
         # So we always save variance files as NIfTI (even if user requested AFNI)
-        import shutil
         import subprocess
 
         from fastfuncstuff.glm.outputs import _save_nifti_with_format
@@ -2535,7 +2535,7 @@ def main():
         if str(rvar_output_path).endswith(".nii.gz"):
             from fastfuncstuff.io.afni import compress_nifti
 
-            print(f"  • Compressing Rvar output...")
+            print("  • Compressing Rvar output...")
             compress_nifti(temp_nii_path, rvar_output_path, remove_original=True)
 
     # Write full REML likelihood surface if requested (-Rlklhd)
@@ -2546,7 +2546,9 @@ def main():
     if _rlklhd and _has_surface:
         import copy
         import subprocess
+
         import nibabel as nib
+
         from fastfuncstuff.glm.outputs import _save_nifti_with_format
 
         print(f"  • Writing REML likelihood surface: {_rlklhd}")
@@ -2606,7 +2608,7 @@ def main():
         if str(lklhd_path).endswith(".nii.gz"):
             from fastfuncstuff.io.afni import compress_nifti
 
-            print(f"  • Compressing Rlklhd output...")
+            print("  • Compressing Rlklhd output...")
             compress_nifti(temp_lklhd, lklhd_path, remove_original=True)
 
     elif _rlklhd and not _has_surface:

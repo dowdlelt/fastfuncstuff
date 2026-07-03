@@ -13,8 +13,8 @@ from fastfuncstuff.design.matrices import (
     make_singletrialdesign,
 )
 from fastfuncstuff.design.optimization import (
-    ISIConstraints,
     DesignCandidate,
+    ISIConstraints,
     compare_designs_summary,
     create_onset_matrix,
     find_optimal_designs,

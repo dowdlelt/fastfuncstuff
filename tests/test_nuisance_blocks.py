@@ -9,14 +9,13 @@ contract, and back-compat for callers still passing the legacy
 
 from __future__ import annotations
 
+import argparse
+
 import numpy as np
 import pytest
 import torch
 
-import argparse
-
 from fastfuncstuff.cli_utils import (
-    NuisanceAssembly,
     NuisanceBlock,
     _infer_run_indices_from_filenames,
     add_ortvec_arguments,
@@ -29,7 +28,6 @@ from fastfuncstuff.cli_utils import (
     make_nuisance_block_from_per_run_file,
 )
 
-
 CPU = torch.device("cpu")
 
 
@@ -40,6 +38,7 @@ def _write_1d(path, arr: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 # NuisanceBlock semantics
 # ---------------------------------------------------------------------------
+
 
 class TestNuisanceBlock:
     def test_n_columns_uses_widest_run(self):
@@ -97,13 +96,17 @@ class TestNuisanceBlock:
 # Factory: full-length
 # ---------------------------------------------------------------------------
 
+
 class TestMakeBlockFullLength:
     def test_slices_into_runs(self, tmp_path):
         arr = np.arange(20, dtype=np.float32).reshape(20, 1)
         p = tmp_path / "ortvec.1D"
         _write_1d(p, arr)
         b = make_nuisance_block_from_full_length(
-            p, "x", run_starts=[0, 10], n_timepoints=20,
+            p,
+            "x",
+            run_starts=[0, 10],
+            n_timepoints=20,
         )
         assert b.label == "x"
         assert b.per_run[0].shape == (10, 1)
@@ -117,7 +120,10 @@ class TestMakeBlockFullLength:
         _write_1d(p, np.zeros((15, 1)))
         with pytest.raises(ValueError, match="total timepoints"):
             make_nuisance_block_from_full_length(
-                p, "x", run_starts=[0, 10], n_timepoints=20,
+                p,
+                "x",
+                run_starts=[0, 10],
+                n_timepoints=20,
             )
 
 
@@ -125,12 +131,17 @@ class TestMakeBlockFullLength:
 # Factory: per-run file
 # ---------------------------------------------------------------------------
 
+
 class TestMakeBlockPerRunFile:
     def test_lands_in_correct_slot_others_none(self, tmp_path):
         p = tmp_path / "run2.1D"
         _write_1d(p, np.full((10, 2), 7.0))
         b = make_nuisance_block_from_per_run_file(
-            p, "motion", run_idx_1based=2, run_starts=[0, 10], n_timepoints=20,
+            p,
+            "motion",
+            run_idx_1based=2,
+            run_starts=[0, 10],
+            n_timepoints=20,
         )
         assert b.per_run[0] is None
         assert b.per_run[1].shape == (10, 2)
@@ -147,8 +158,11 @@ class TestMakeBlockPerRunFile:
         _write_1d(p, np.zeros((10, 1)))
         with pytest.raises(ValueError, match="out of range"):
             make_nuisance_block_from_per_run_file(
-                p, "x", run_idx_1based=5,
-                run_starts=[0, 10], n_timepoints=20,
+                p,
+                "x",
+                run_idx_1based=5,
+                run_starts=[0, 10],
+                n_timepoints=20,
             )
 
     def test_wrong_row_count_raises(self, tmp_path):
@@ -156,14 +170,18 @@ class TestMakeBlockPerRunFile:
         _write_1d(p, np.zeros((7, 1)))  # run 1 has 10 rows, file has 7
         with pytest.raises(ValueError, match="run 1 has"):
             make_nuisance_block_from_per_run_file(
-                p, "x", run_idx_1based=1,
-                run_starts=[0, 10], n_timepoints=20,
+                p,
+                "x",
+                run_idx_1based=1,
+                run_starts=[0, 10],
+                n_timepoints=20,
             )
 
 
 # ---------------------------------------------------------------------------
 # _infer_run_indices_from_filenames — priority + ambiguity
 # ---------------------------------------------------------------------------
+
 
 class TestRunIndexInference:
     def test_bids_pattern_with_underscore(self):
@@ -231,6 +249,7 @@ class TestRunIndexInference:
 # Factory: glob
 # ---------------------------------------------------------------------------
 
+
 class TestMakeBlockFromGlob:
     def test_glob_assembles_block_with_zero_runs_in_between(self, tmp_path):
         # 3 runs but only files for runs 1 and 3
@@ -238,11 +257,13 @@ class TestMakeBlockFromGlob:
             _write_1d(tmp_path / f"noise_run-{r:02d}.1D", np.full((10, 2), float(r)))
         pattern = str(tmp_path / "noise_run-*.1D")
         b = make_nuisance_block_from_glob(
-            pattern, "noisepcs",
-            run_starts=[0, 10, 20], n_timepoints=30,
+            pattern,
+            "noisepcs",
+            run_starts=[0, 10, 20],
+            n_timepoints=30,
         )
         assert b.per_run[0] is not None
-        assert b.per_run[1] is None     # run 2 absent → None → zero-padded at use
+        assert b.per_run[1] is None  # run 2 absent → None → zero-padded at use
         assert b.per_run[2] is not None
         # And the contents are right.
         assert (b.per_run[0] == 1.0).all()
@@ -255,22 +276,27 @@ class TestMakeBlockFromGlob:
     def test_glob_with_no_matches_errors(self, tmp_path):
         with pytest.raises(ValueError, match="matched no files"):
             make_nuisance_block_from_glob(
-                str(tmp_path / "nothing_*.1D"), "x",
-                run_starts=[0, 10], n_timepoints=20,
+                str(tmp_path / "nothing_*.1D"),
+                "x",
+                run_starts=[0, 10],
+                n_timepoints=20,
             )
 
     def test_glob_with_mismatched_length_errors(self, tmp_path):
         _write_1d(tmp_path / "noise_run-1.1D", np.zeros((7, 1)))  # should be 10
         with pytest.raises(ValueError, match="run 1 has"):
             make_nuisance_block_from_glob(
-                str(tmp_path / "noise_run-*.1D"), "x",
-                run_starts=[0, 10], n_timepoints=20,
+                str(tmp_path / "noise_run-*.1D"),
+                "x",
+                run_starts=[0, 10],
+                n_timepoints=20,
             )
 
 
 # ---------------------------------------------------------------------------
 # Assembler: demean contract + variable-cols handling + noise_pcs path
 # ---------------------------------------------------------------------------
+
 
 class TestAssemble:
     def test_polort_only_no_blocks(self):
@@ -288,8 +314,10 @@ class TestAssemble:
 
     def test_demeans_per_run(self):
         # Block whose per-run matrices have nonzero per-run mean.
-        per_run = [np.full((10, 2), 5.0, dtype=np.float32),
-                   np.full((10, 2), -3.0, dtype=np.float32)]
+        per_run = [
+            np.full((10, 2), 5.0, dtype=np.float32),
+            np.full((10, 2), -3.0, dtype=np.float32),
+        ]
         block = NuisanceBlock(label="motion", per_run=per_run)
         a = assemble_per_run_nuisance(
             blocks=[block],
@@ -302,15 +330,16 @@ class TestAssemble:
         for run_tensor in a.per_run:
             col_means = run_tensor.mean(dim=0)
             np.testing.assert_allclose(
-                col_means.numpy(), np.zeros_like(col_means.numpy()), atol=1e-6,
+                col_means.numpy(),
+                np.zeros_like(col_means.numpy()),
+                atol=1e-6,
             )
 
     def test_variable_cols_per_run(self):
         # Run 1 has 3 cols, run 2 has 5 — block has n_columns=5 and pads run 1.
         block = NuisanceBlock(
             label="pcs",
-            per_run=[np.ones((10, 3), dtype=np.float32),
-                     np.full((10, 5), 2.0, dtype=np.float32)],
+            per_run=[np.ones((10, 3), dtype=np.float32), np.full((10, 5), 2.0, dtype=np.float32)],
         )
         a = assemble_per_run_nuisance(
             blocks=[block],
@@ -350,6 +379,7 @@ class TestAssemble:
 # Back-compat: legacy ortvec_files / ortvec_data arguments
 # ---------------------------------------------------------------------------
 
+
 class TestBackCompatLegacyArgs:
     def test_build_nuisance_per_run_ortvec_files(self, tmp_path):
         # Same shape as a real user-supplied full-length motion file.
@@ -367,7 +397,7 @@ class TestBackCompatLegacyArgs:
         # Demean contract: each per-run output equals input slice minus its mean.
         for i, m in enumerate(nuisance_per_run):
             start = i * 10
-            expected = arr[start:start + 10]
+            expected = arr[start : start + 10]
             expected = expected - expected.mean(axis=0, keepdims=True)
             np.testing.assert_allclose(m.numpy(), expected, atol=1e-5)
 
@@ -398,6 +428,7 @@ class TestBackCompatLegacyArgs:
 # CLI surface: add_ortvec_arguments + collect_nuisance_blocks
 # ---------------------------------------------------------------------------
 
+
 class TestCliSurface:
     def _parser(self):
         p = argparse.ArgumentParser()
@@ -406,11 +437,20 @@ class TestCliSurface:
 
     def test_parser_registers_three_flags(self):
         p = self._parser()
-        args = p.parse_args([
-            "-ortvec", "a.1D", "phys",
-            "-ortvec_run", "b.1D", "motion", "1",
-            "-ortvec_glob", "mot_run-*.1D", "motion",
-        ])
+        args = p.parse_args(
+            [
+                "-ortvec",
+                "a.1D",
+                "phys",
+                "-ortvec_run",
+                "b.1D",
+                "motion",
+                "1",
+                "-ortvec_glob",
+                "mot_run-*.1D",
+                "motion",
+            ]
+        )
         assert args.ortvec == [["a.1D", "phys"]]
         assert args.ortvec_run == [["b.1D", "motion", "1"]]
         assert args.ortvec_glob == [["mot_run-*.1D", "motion"]]
@@ -438,11 +478,20 @@ class TestCliSurface:
             np.savetxt(tmp_path / f"mot_run-0{i}_motion.1D", arr)
 
         p = self._parser()
-        args = p.parse_args([
-            "-ortvec", str(full_path), "phys_full",
-            "-ortvec_run", str(per_run_path), "phys_r1", "1",
-            "-ortvec_glob", str(tmp_path / "mot_run-*_motion.1D"), "mot",
-        ])
+        args = p.parse_args(
+            [
+                "-ortvec",
+                str(full_path),
+                "phys_full",
+                "-ortvec_run",
+                str(per_run_path),
+                "phys_r1",
+                "1",
+                "-ortvec_glob",
+                str(tmp_path / "mot_run-*_motion.1D"),
+                "mot",
+            ]
+        )
         blocks = collect_nuisance_blocks(args, run_starts=[0, 10], n_timepoints=20)
         assert [b.label for b in blocks] == ["phys_full", "phys_r1", "mot"]
         assert blocks[0].n_columns == 2  # full-length 2-col
@@ -474,17 +523,24 @@ class TestCliSurface:
 # blocks= passthrough through the two builders
 # ---------------------------------------------------------------------------
 
+
 class TestBuilderBlocksKwarg:
     def test_build_per_run_with_blocks(self, tmp_path):
         arr = np.random.default_rng(0).standard_normal((20, 2)).astype(np.float32)
         p = tmp_path / "motion.1D"
         np.savetxt(p, arr)
         block = make_nuisance_block_from_full_length(
-            str(p), "motion", run_starts=[0, 10], n_timepoints=20,
+            str(p),
+            "motion",
+            run_starts=[0, 10],
+            n_timepoints=20,
         )
         out = build_nuisance_per_run(
-            run_starts=[0, 10], n_timepoints=20, polort=0,
-            device=CPU, blocks=[block],
+            run_starts=[0, 10],
+            n_timepoints=20,
+            polort=0,
+            device=CPU,
+            blocks=[block],
         )
         # polort=0 → 1 column per run + 2 motion → 3 total per run
         assert all(m.shape[1] == 3 for m in out)
@@ -496,11 +552,18 @@ class TestBuilderBlocksKwarg:
         path = tmp_path / "r1.1D"
         np.savetxt(path, arr)
         block = make_nuisance_block_from_per_run_file(
-            str(path), "mot", run_idx_1based=1, run_starts=[0, 10], n_timepoints=20,
+            str(path),
+            "mot",
+            run_idx_1based=1,
+            run_starts=[0, 10],
+            n_timepoints=20,
         )
         out = build_nuisance_block_diag(
-            run_starts=[0, 10], n_timepoints=20, polort=-1,
-            device=CPU, blocks=[block],
+            run_starts=[0, 10],
+            n_timepoints=20,
+            polort=-1,
+            device=CPU,
+            blocks=[block],
         )
         # No polys; just one column from the block. Demeaned globally → mean is 0.
         assert out.shape == (20, 1)

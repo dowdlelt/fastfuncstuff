@@ -21,42 +21,25 @@ __version__ = "0.1.0"
 from fastfuncstuff import _compile as _compile  # noqa: F401
 
 # ---------------------------------------------------------------------------
-# Core GLM
+# Analysis workflows
 # ---------------------------------------------------------------------------
-from fastfuncstuff.glm.core import GLMResults, fit_glm, fit_glm_hrf_library, percent_bold_change
-from fastfuncstuff.glm.outputs import (
-    slice_glm_results,
-    write_afni_bucket,
-    write_glm_bucket_as_nifti,
-    write_glm_results_nifti,
-    write_ols_arma_comparison,
+from fastfuncstuff.analysis import (
+    analyze_from_design_matrix,
+    analyze_from_onsets,
+    compute_contrasts,
+    compute_contrasts_from_design,
 )
 
 # ---------------------------------------------------------------------------
-# ARMA(1,1)
+# Denoising
 # ---------------------------------------------------------------------------
-from fastfuncstuff.glm.arma import (
-    ARMA11Results,
-    batch_reml_grid_search,
-    build_arma11_covariance,
-    compare_ols_vs_arma11,
-    compute_arma_lambda,
-    fit_glm_arma11,
-    load_arma_params,
-    prewhiten_with_arma11,
-    reml_grid_search,
-    save_arma_rvar,
-)
-
-# ---------------------------------------------------------------------------
-# Design matrices and HRF
-# ---------------------------------------------------------------------------
-from fastfuncstuff.design.matrices import (
-    build_glm_design,
-    convolve_hrf,
-    generate_random_onsets,
-    make_fir_design,
-    make_singletrialdesign,
+from fastfuncstuff.denoise.sequential import (
+    DenoiseResults,
+    compute_full_brain_pc_loadings,
+    cross_validate_noise_pcs,
+    extract_noise_pcs_per_run,
+    fit_denoising_model,
+    select_noise_pool_voxels,
 )
 from fastfuncstuff.design.hrf import (
     create_flobs_library,
@@ -72,6 +55,17 @@ from fastfuncstuff.design.hrf_selection import (
     fit_glm_hrf_library_with_xval,
     load_hrf_selection_for_arma,
     save_hrf_selection_results,
+)
+
+# ---------------------------------------------------------------------------
+# Design matrices and HRF
+# ---------------------------------------------------------------------------
+from fastfuncstuff.design.matrices import (
+    build_glm_design,
+    convolve_hrf,
+    generate_random_onsets,
+    make_fir_design,
+    make_singletrialdesign,
 )
 from fastfuncstuff.design.optimization import (
     DesignCandidate,
@@ -93,15 +87,31 @@ from fastfuncstuff.design.optimization import (
 )
 
 # ---------------------------------------------------------------------------
-# Denoising
+# ARMA(1,1)
 # ---------------------------------------------------------------------------
-from fastfuncstuff.denoise.sequential import (
-    DenoiseResults,
-    compute_full_brain_pc_loadings,
-    cross_validate_noise_pcs,
-    extract_noise_pcs_per_run,
-    fit_denoising_model,
-    select_noise_pool_voxels,
+from fastfuncstuff.glm.arma import (
+    ARMA11Results,
+    batch_reml_grid_search,
+    build_arma11_covariance,
+    compare_ols_vs_arma11,
+    compute_arma_lambda,
+    fit_glm_arma11,
+    load_arma_params,
+    prewhiten_with_arma11,
+    reml_grid_search,
+    save_arma_rvar,
+)
+
+# ---------------------------------------------------------------------------
+# Core GLM
+# ---------------------------------------------------------------------------
+from fastfuncstuff.glm.core import GLMResults, fit_glm, fit_glm_hrf_library, percent_bold_change
+from fastfuncstuff.glm.outputs import (
+    slice_glm_results,
+    write_afni_bucket,
+    write_glm_bucket_as_nifti,
+    write_glm_results_nifti,
+    write_ols_arma_comparison,
 )
 
 # ---------------------------------------------------------------------------
@@ -119,31 +129,6 @@ from fastfuncstuff.io.afni import (
     read_afni_design_matrix,
     read_afni_onset_file,
     read_afni_onset_files,
-)
-
-# ---------------------------------------------------------------------------
-# Analysis workflows
-# ---------------------------------------------------------------------------
-from fastfuncstuff.analysis import (
-    analyze_from_design_matrix,
-    analyze_from_onsets,
-    compute_contrasts,
-    compute_contrasts_from_design,
-)
-
-# ---------------------------------------------------------------------------
-# Simulation and noise
-# ---------------------------------------------------------------------------
-from fastfuncstuff.simulation.noise import (
-    add_drift,
-    add_motion_artifacts,
-    estimate_noise_parameters_from_data,
-    estimate_sfnr,
-    generate_ar1_noise,
-    generate_ar_noise,
-    generate_arma_noise,
-    generate_fmri_noise,
-    generate_fmri_noise_batch,
 )
 from fastfuncstuff.simulation.core import (
     create_parametric_voxels,
@@ -165,6 +150,21 @@ from fastfuncstuff.simulation.metrics_empirical import (
     estimate_ar1_coefficient,
     evaluate_design_empirical,
     gls_fit,
+)
+
+# ---------------------------------------------------------------------------
+# Simulation and noise
+# ---------------------------------------------------------------------------
+from fastfuncstuff.simulation.noise import (
+    add_drift,
+    add_motion_artifacts,
+    estimate_noise_parameters_from_data,
+    estimate_sfnr,
+    generate_ar1_noise,
+    generate_ar_noise,
+    generate_arma_noise,
+    generate_fmri_noise,
+    generate_fmri_noise_batch,
 )
 
 # ---------------------------------------------------------------------------

@@ -1,20 +1,19 @@
 """Tests for processing/cost.py — cost functions for image matching."""
 
 import torch
-import pytest
 
 from fastfuncstuff.processing.cost import (
+    BatchedIncrementalCorrelation,
+    IncrementalCorrelation,
     _auto_clip,
-    _box_kernel_1d,
     _batched_separable_smooth_3d,
+    _box_kernel_1d,
     _gauss_kernel_1d,
     _make_kernel_1d,
     _separable_smooth_3d,
     auto_box_radius,
     batched_lpa_cost,
-    BatchedIncrementalCorrelation,
     clipped_pearson_correlation,
-    IncrementalCorrelation,
     lpa_correlation,
     lpa_cost_patch,
     lpc_correlation,
@@ -78,8 +77,7 @@ class TestClippedPearsonCorrelation:
     def test_manual_clips(self):
         x = torch.randn(100, device=DEV)
         y = x + 0.01 * torch.randn(100, device=DEV)
-        r = clipped_pearson_correlation(x, y, base_clip=(-2.0, 2.0),
-                                        source_clip=(-2.0, 2.0))
+        r = clipped_pearson_correlation(x, y, base_clip=(-2.0, 2.0), source_clip=(-2.0, 2.0))
         assert r.item() > 0.9
 
 
@@ -150,7 +148,7 @@ class TestAutoBoxRadius:
     def test_default_500(self):
         r = auto_box_radius(500)
         side = 2 * r + 1
-        assert side ** 3 >= 500
+        assert side**3 >= 500
 
     def test_small_target(self):
         r = auto_box_radius(8)
@@ -326,8 +324,7 @@ class TestBatchedLPACost:
         V = nzh * nyh * nxh
         patches = torch.randn(B, V, device=DEV) + 5.0
         w = torch.ones(B, V, device=DEV)
-        costs = batched_lpa_cost(patches, patches, w, nzh, nyh, nxh,
-                                 sigma=2.0, kernel_type="box")
+        costs = batched_lpa_cost(patches, patches, w, nzh, nyh, nxh, sigma=2.0, kernel_type="box")
         assert costs.shape == (B,)
         assert (costs > 0).all()
 
@@ -424,18 +421,24 @@ class TestBatchedIncrementalCorrelation:
         bic.precompute_fixed_parts(base, source, weight, patch_slices)
 
         # Extract patches
-        base_patches = torch.stack([
-            base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
-        source_patches = torch.stack([
-            source[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
-        weight_patches = torch.stack([
-            weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        base_patches = torch.stack(
+            [
+                base[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
+        source_patches = torch.stack(
+            [
+                source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
+        weight_patches = torch.stack(
+            [
+                weight[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
 
         corrs = bic.evaluate(base_patches, source_patches, weight_patches)
         assert corrs.shape == (B,)
@@ -451,18 +454,24 @@ class TestBatchedIncrementalCorrelation:
         )
         bic.precompute_fixed_parts(base, source, weight, patch_slices)
 
-        base_patches = torch.stack([
-            base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
-        source_patches = torch.stack([
-            source[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
-        weight_patches = torch.stack([
-            weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        base_patches = torch.stack(
+            [
+                base[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
+        source_patches = torch.stack(
+            [
+                source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
+        weight_patches = torch.stack(
+            [
+                weight[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
 
         corrs = bic.evaluate(base_patches, source_patches, weight_patches)
         assert corrs.shape == (len(patch_slices),)
@@ -470,26 +479,35 @@ class TestBatchedIncrementalCorrelation:
     def test_with_pre_extracted_patches(self):
         base, source, weight, patch_slices = self._make_test_data()
 
-        base_patches = torch.stack([
-            base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
-        weight_patches = torch.stack([
-            weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        base_patches = torch.stack(
+            [
+                base[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
+        weight_patches = torch.stack(
+            [
+                weight[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
 
         bic = BatchedIncrementalCorrelation()
         bic.precompute_fixed_parts(
-            base, source, weight, patch_slices,
+            base,
+            source,
+            weight,
+            patch_slices,
             base_patches=base_patches,
             weight_patches=weight_patches,
         )
 
-        source_patches = torch.stack([
-            source[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        source_patches = torch.stack(
+            [
+                source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
 
         corrs = bic.evaluate(base_patches, source_patches, weight_patches)
         assert corrs.shape == (len(patch_slices),)
@@ -502,18 +520,24 @@ class TestBatchedIncrementalCorrelation:
         bic = BatchedIncrementalCorrelation()
         bic.precompute_fixed_parts(base, source, weight, patch_slices)
 
-        base_patches = torch.stack([
-            base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
-        source_patches = torch.stack([
-            source[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ]).requires_grad_(True)
-        weight_patches = torch.stack([
-            weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        base_patches = torch.stack(
+            [
+                base[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
+        source_patches = torch.stack(
+            [
+                source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        ).requires_grad_(True)
+        weight_patches = torch.stack(
+            [
+                weight[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
 
         corrs = bic.evaluate(base_patches, source_patches, weight_patches)
         corrs.sum().backward()

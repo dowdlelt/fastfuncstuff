@@ -13,8 +13,6 @@ diagnostic that tells users whether prewhitening worked.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import nibabel as nib
 import numpy as np
 import pytest
@@ -29,13 +27,13 @@ from fastfuncstuff.glm.arma import (
     save_arma_rvar,
 )
 
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _synthetic_fmri(seed=0, n_voxels=20, n_timepoints=150, n_regs=3):
     """Generate (data, design) where the GLM is identifiable."""
@@ -51,6 +49,7 @@ def _synthetic_fmri(seed=0, n_voxels=20, n_timepoints=150, n_regs=3):
 # ---------------------------------------------------------------------------
 # compute_ljung_box_statistic
 # ---------------------------------------------------------------------------
+
 
 class TestComputeLjungBox:
     def test_white_noise_yields_small_statistic(self):
@@ -99,11 +98,16 @@ class TestComputeLjungBox:
 # save_arma_rvar / load_arma_params round-trip
 # ---------------------------------------------------------------------------
 
+
 def _fit_arma_for_save(want_residuals: bool = True) -> ARMA11Results:
     """Fit ARMA(1,1) on synthetic data so we have a real ARMA11Results."""
     data, X = _synthetic_fmri(seed=10, n_voxels=12, n_timepoints=180)
     return fit_glm_arma11(
-        data, X, tr=2.0, device=DEVICE, verbose=False,
+        data,
+        X,
+        tr=2.0,
+        device=DEVICE,
+        verbose=False,
         want_residuals=want_residuals,
     )
 
@@ -130,8 +134,10 @@ class TestSaveArmaRvar:
         mask[:n_voxels] = True
 
         out = save_arma_rvar(
-            results, tmp_path / "rvar.nii.gz",
-            volume_shape=volume_shape, voxel_mask=mask,
+            results,
+            tmp_path / "rvar.nii.gz",
+            volume_shape=volume_shape,
+            voxel_mask=mask,
         )
         img = nib.load(str(out))
         data = img.get_fdata()
@@ -144,7 +150,8 @@ class TestSaveArmaRvar:
         results = _fit_arma_for_save()
         # 12 voxels → 3x2x2 = 12
         out = save_arma_rvar(
-            results, tmp_path / "rvar.nii.gz",
+            results,
+            tmp_path / "rvar.nii.gz",
             volume_shape=(3, 2, 2),
         )
         img = nib.load(str(out))
@@ -189,8 +196,10 @@ class TestLoadArmaParamsRoundTrip:
 
         out_path = tmp_path / "rvar.nii.gz"
         save_arma_rvar(
-            results, out_path,
-            volume_shape=volume_shape, voxel_mask=mask,
+            results,
+            out_path,
+            volume_shape=volume_shape,
+            voxel_mask=mask,
         )
         loaded = load_arma_params(out_path, voxel_mask=mask)
         assert loaded.shape == (n_voxels, 2)
@@ -215,6 +224,7 @@ class TestLoadArmaParamsRoundTrip:
 # ---------------------------------------------------------------------------
 # compare_ols_vs_arma11
 # ---------------------------------------------------------------------------
+
 
 class TestCompareOlsVsArma:
     def test_returns_expected_keys(self):

@@ -40,11 +40,6 @@ except ImportError:
 
 # Import fastfuncstuff modules
 try:
-    from fastfuncstuff.io.afni import (
-        load_afni_mask,  # noqa: F401 — availability check
-        load_nifti,  # noqa: F401 — availability check
-        save_nifti,
-    )
     from fastfuncstuff.cli_utils import (
         LoadResult,
         add_ortvec_arguments,
@@ -69,11 +64,21 @@ try:
         parse_afni_timing_file,
         parse_durations,
     )
-    from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.glm.ridge import load_hrf_indices
-    from fastfuncstuff.utils import configure_torch_backends, get_device, scale_to_percent_signal, to_tensor
+    from fastfuncstuff.io.afni import (
+        load_afni_mask,  # noqa: F401 — availability check
+        load_nifti,  # noqa: F401 — availability check
+        save_nifti,
+    )
+    from fastfuncstuff.utils import (
+        configure_torch_backends,
+        get_device,
+        scale_to_percent_signal,
+        to_tensor,
+    )
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -810,7 +815,9 @@ def save_denoising_results(
     if results.xval_r2_optimal_full is not None:
         xval_opt_full_vol = to_volume(results.xval_r2_optimal_full.cpu().numpy().astype(np.float32))
         xval_opt_full_path = f"{output_prefix}_xval_r2_optimal_full{nii_ext}"
-        save_nifti(xval_opt_full_vol, output_path=xval_opt_full_path, affine=affine, header=nifti_header)
+        save_nifti(
+            xval_opt_full_vol, output_path=xval_opt_full_path, affine=affine, header=nifti_header
+        )
         output_files["xval_r2_optimal_full"] = xval_opt_full_path
 
     # 3d. Per-fold xval R² at optimal PCs (4D)
@@ -1459,6 +1466,7 @@ def save_model_fit_outputs(
 
     # Compress with pigz/zstd
     from fastfuncstuff.io.afni import compress_nifti
+
     compress_nifti(bucket_path_nii, bucket_path, remove_original=True)
 
     return output_files
@@ -1508,14 +1516,14 @@ def main():
 
     # Parse onset metadata (condition labels and durations)
     from fastfuncstuff.cli_utils import clean_condition_labels
+
     all_onsets_bids = None  # populated here for BIDS path; AFNI path populates later
 
     if _has_events:
         from fastfuncstuff.design.bids_events import parse_bids_events
+
         if len(args.events) != n_runs:
-            print(
-                f"ERROR: -events: {len(args.events)} files but {n_runs} input runs"
-            )
+            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs")
             sys.exit(1)
         event_cols = tuple(args.event_cols) if args.event_cols else None
         all_onsets_bids, durations, condition_labels = parse_bids_events(
@@ -1662,8 +1670,10 @@ def main():
         if mask_flat is not None:
             auto_mask_flat = auto_mask_flat & mask_flat
         n_automask = auto_mask_flat.sum()
-        print(f"  Automask: {n_automask:,} / {int(np.prod(volume_shape)):,} voxels "
-              f"({100 * n_automask / np.prod(volume_shape):.1f}%)")
+        print(
+            f"  Automask: {n_automask:,} / {int(np.prod(volume_shape)):,} voxels "
+            f"({100 * n_automask / np.prod(volume_shape):.1f}%)"
+        )
 
         # Apply automask to data
         auto_mask_flat_t = torch.from_numpy(auto_mask_flat)
@@ -1682,8 +1692,12 @@ def main():
 
         # Save automask for reference
         automask_vol = auto_mask_3d.numpy().astype(np.float32)
-        save_nifti(automask_vol, output_path=f"{args.prefix}_automask{_nii_ext}",
-                   affine=affine, header=nifti_header)
+        save_nifti(
+            automask_vol,
+            output_path=f"{args.prefix}_automask{_nii_ext}",
+            affine=affine,
+            header=nifti_header,
+        )
         print(f"  Saved: {args.prefix}_automask{_nii_ext}")
 
     print()
@@ -1829,6 +1843,7 @@ def main():
     # Apply onset rounding (after TR is known from data load)
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
+
         all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
 
     # Build onset matrix at microtime resolution (shared function ensures
@@ -1897,7 +1912,10 @@ def main():
 
     # Add user-supplied nuisance blocks (any of -ortvec / -ortvec_run / -ortvec_glob).
     nuisance_blocks_user = collect_nuisance_blocks(
-        args, run_starts, n_timepoints, verbose=(args.verb >= 1),
+        args,
+        run_starts,
+        n_timepoints,
+        verbose=(args.verb >= 1),
     )
     if nuisance_blocks_user:
         for run_idx in range(n_runs):
@@ -1912,14 +1930,14 @@ def main():
                 if np.max(np.abs(col_mean)) > 1e-4:
                     m = m - col_mean
                 m_t = torch.from_numpy(m).to(
-                    device=device, dtype=nuisance_per_run[run_idx].dtype,
+                    device=device,
+                    dtype=nuisance_per_run[run_idx].dtype,
                 )
                 nuisance_per_run[run_idx] = torch.cat(
-                    [nuisance_per_run[run_idx], m_t], dim=1,
+                    [nuisance_per_run[run_idx], m_t],
+                    dim=1,
                 )
-            max_nuisance_cols = max(
-                max_nuisance_cols, nuisance_per_run[run_idx].shape[1]
-            )
+            max_nuisance_cols = max(max_nuisance_cols, nuisance_per_run[run_idx].shape[1])
 
     # Pad all runs to have same number of columns (for CV concatenation compatibility)
     # -------------------------------------------
@@ -2012,7 +2030,10 @@ def main():
     # Fit denoising model
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-        from fastfuncstuff.denoise.sequential import extract_noise_ics_per_run, extract_noise_pcs_per_run
+        from fastfuncstuff.denoise.sequential import (
+            extract_noise_ics_per_run,
+            extract_noise_pcs_per_run,
+        )
         from fastfuncstuff.glm.core import fit_glm
         from fastfuncstuff.glm.outputs import save_single_trial_results
         from fastfuncstuff.glm.ridge import create_single_trial_design
@@ -2487,7 +2508,9 @@ def main():
             print(f"  Fitting {len(unique_hrfs)} HRF groups...")
             final_betas = torch.zeros(n_voxels_st, n_trials, device=data.device)
             task_indices_final = list(range(n_trials))
-            for i_hrf, hrf_idx in enumerate(tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verb >= 1)):
+            for i_hrf, hrf_idx in enumerate(
+                tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verb >= 1)
+            ):
                 voxel_mask = hrf_indices_dev == hrf_idx
                 group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
                 full_design_final = torch.cat([group_design_2d, nuisance_design_final], dim=1)
@@ -2497,8 +2520,10 @@ def main():
                     cond_num = torch.linalg.cond(full_design_final).item()
                     print(f"  Design: {full_design_final.shape}, cond#={cond_num:.1f}")
                     # Per-run nuisance shape (verify polynomials present)
-                    print(f"  Nuisance per-run shape: {nuisance_per_run[0].shape} "
-                          f"(block-diag total: {nuisance_design_final.shape})")
+                    print(
+                        f"  Nuisance per-run shape: {nuisance_per_run[0].shape} "
+                        f"(block-diag total: {nuisance_design_final.shape})"
+                    )
                     # Check per-run design energy
                     for run_idx in range(n_runs):
                         start_tp = run_starts[run_idx]
@@ -2508,9 +2533,11 @@ def main():
                         design_energy = run_design.abs().sum().item()
                         n_nonzero = (run_design.abs() > 1e-6).sum().item()
                         data_run = data[voxel_mask][:, start_tp:end_tp]
-                        print(f"    Run {run_idx+1}: trials={run_trial_mask.sum()}, "
-                              f"design energy={design_energy:.1f}, nonzero={n_nonzero}, "
-                              f"data std={data_run.std().item():.2f}")
+                        print(
+                            f"    Run {run_idx + 1}: trials={run_trial_mask.sum()}, "
+                            f"design energy={design_energy:.1f}, nonzero={n_nonzero}, "
+                            f"data std={data_run.std().item():.2f}"
+                        )
 
                 glm_results_final = fit_glm(
                     data[voxel_mask],
@@ -2534,8 +2561,10 @@ def main():
             run_mean = run_betas.mean().item()
             run_std = run_betas.std().item()
             run_absmax = run_betas.abs().max().item()
-            print(f"    Run {run_idx + 1}: {n_run_trials} trials, "
-                  f"mean={run_mean:.4f}, std={run_std:.4f}, |max|={run_absmax:.2f}")
+            print(
+                f"    Run {run_idx + 1}: {n_run_trials} trials, "
+                f"mean={run_mean:.4f}, std={run_std:.4f}, |max|={run_absmax:.2f}"
+            )
 
         # Compute final beta-space cross-validation
         # Always compute COD R² for interpretability. If optimization metric
@@ -2630,19 +2659,34 @@ def main():
 
         # Save noise pool mask (low R² voxels used for PC extraction)
         noise_pool_vol = _to_vol(noise_pool_mask.cpu().numpy().astype(np.float32))
-        save_nifti(noise_pool_vol, output_path=f"{args.prefix}_noise_pool_mask{_nii_ext}", affine=affine, header=nifti_header)
+        save_nifti(
+            noise_pool_vol,
+            output_path=f"{args.prefix}_noise_pool_mask{_nii_ext}",
+            affine=affine,
+            header=nifti_header,
+        )
         output_files["noise_pool_mask"] = f"{args.prefix}_noise_pool_mask{_nii_ext}"
         print(f"  Saved: noise pool mask ({noise_pool_mask.sum().item():,} voxels)")
 
         # Save initial criteria mask (voxels above R² threshold in any PC count)
         initial_criteria_vol = _to_vol(criteria_mask.cpu().numpy().astype(np.float32))
-        save_nifti(initial_criteria_vol, output_path=f"{args.prefix}_initial_criteria_mask{_nii_ext}", affine=affine, header=nifti_header)
+        save_nifti(
+            initial_criteria_vol,
+            output_path=f"{args.prefix}_initial_criteria_mask{_nii_ext}",
+            affine=affine,
+            header=nifti_header,
+        )
         output_files["initial_criteria_mask"] = f"{args.prefix}_initial_criteria_mask{_nii_ext}"
         print(f"  Saved: initial criteria mask ({criteria_mask.sum().item():,} voxels)")
 
         # Save initial cross-validated R² (before denoising)
         initial_r2_vol = _to_vol(initial_r2.cpu().numpy())
-        save_nifti(initial_r2_vol, output_path=f"{args.prefix}_initial_xval_r2{_nii_ext}", affine=affine, header=nifti_header)
+        save_nifti(
+            initial_r2_vol,
+            output_path=f"{args.prefix}_initial_xval_r2{_nii_ext}",
+            affine=affine,
+            header=nifti_header,
+        )
         output_files["initial_xval_r2"] = f"{args.prefix}_initial_xval_r2{_nii_ext}"
         print("  Saved: initial cross-validated R²")
 
@@ -2665,7 +2709,9 @@ def main():
             with open(pc_txt_path, "w") as f:
                 f.write(f"# Selected noise PCs for run {run_idx + 1}\n")
                 f.write(f"# n_components: {n_selected}\n")
-                f.write(f"# Shape: {selected_pcs.shape[0]} timepoints x {selected_pcs.shape[1]} PCs\n")
+                f.write(
+                    f"# Shape: {selected_pcs.shape[0]} timepoints x {selected_pcs.shape[1]} PCs\n"
+                )
                 np.savetxt(f, selected_pcs, fmt="%.6f", delimiter="\t")
             output_files[f"run{run_idx + 1}_selected_pcs_txt"] = pc_txt_path
         print(f"  Saved: per-run selected PCs ({optimal_pcs} PCs) for {n_runs} runs")

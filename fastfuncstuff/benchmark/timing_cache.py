@@ -26,12 +26,11 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .arch import get_ffs_arch_id, get_hardware_info, get_ref_arch_id
-
 
 SCHEMA_VERSION = 3
 
@@ -39,6 +38,7 @@ SCHEMA_VERSION = 3
 # ---------------------------------------------------------------------------
 # Cache I/O
 # ---------------------------------------------------------------------------
+
 
 def _cache_path(data_dir: Path) -> Path:
     return data_dir / "benchmark_cache.json"
@@ -71,6 +71,7 @@ def save_cache(data_dir: Path, cache: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # Schema migration
 # ---------------------------------------------------------------------------
+
 
 def _migrate_v1(v1: dict[str, Any]) -> dict[str, Any]:
     """Convert a v1 cache (one-entry-per-arch, mutable) to v2 (append-only)."""
@@ -109,15 +110,17 @@ def _migrate_v1(v1: dict[str, Any]) -> dict[str, Any]:
             if ffs is not None:
                 stages[sname]["ffs_seconds"] = ffs
 
-        runs.append({
-            "id": str(uuid.uuid4()),
-            "timestamp": old.get("timestamp", datetime.now(timezone.utc).isoformat()),
-            "ref_arch_id": f"{os_part}-{machine}",
-            "ffs_arch_id": accel,
-            "hardware": hardware,
-            "dataset_id": old.get("dataset_id", ""),
-            "stages": stages,
-        })
+        runs.append(
+            {
+                "id": str(uuid.uuid4()),
+                "timestamp": old.get("timestamp", datetime.now(UTC).isoformat()),
+                "ref_arch_id": f"{os_part}-{machine}",
+                "ffs_arch_id": accel,
+                "hardware": hardware,
+                "dataset_id": old.get("dataset_id", ""),
+                "stages": stages,
+            }
+        )
 
     return {"schema_version": SCHEMA_VERSION, "runs": runs}
 
@@ -126,6 +129,7 @@ def _migrate_v1(v1: dict[str, Any]) -> dict[str, Any]:
 # Git info
 # ---------------------------------------------------------------------------
 
+
 def _get_git_info() -> dict[str, Any]:
     """Capture current git state: commit, branch, message, dirty flag."""
     import subprocess
@@ -133,7 +137,10 @@ def _get_git_info() -> dict[str, Any]:
     def _run(args: list[str]) -> str:
         try:
             return subprocess.run(
-                args, capture_output=True, text=True, timeout=5,
+                args,
+                capture_output=True,
+                text=True,
+                timeout=5,
             ).stdout.strip()
         except Exception:
             return ""
@@ -157,6 +164,7 @@ def _get_git_info() -> dict[str, Any]:
 # Metric sanitization
 # ---------------------------------------------------------------------------
 
+
 def _sanitize_for_cache(obj: Any) -> Any:
     """Make a validation dict JSON-serializable and compact.
 
@@ -165,6 +173,7 @@ def _sanitize_for_cache(obj: Any) -> Any:
     """
     try:
         import numpy as np
+
         _has_numpy = True
     except ImportError:
         _has_numpy = False
@@ -201,7 +210,8 @@ def _sanitize_for_cache(obj: Any) -> Any:
 
 
 def extract_scalar_metrics(
-    validation: dict[str, Any], prefix: str = "",
+    validation: dict[str, Any],
+    prefix: str = "",
 ) -> dict[str, float]:
     """Recursively extract all scalar numeric values from a validation dict.
 
@@ -210,8 +220,20 @@ def extract_scalar_metrics(
 
     Skips non-numeric values, large arrays, and metadata keys.
     """
-    _SKIP_KEYS = {"passed", "summary", "error", "errors", "label", "dataset",
-                  "task", "run", "shape", "_type", "n_components_a", "n_components_b"}
+    _SKIP_KEYS = {
+        "passed",
+        "summary",
+        "error",
+        "errors",
+        "label",
+        "dataset",
+        "task",
+        "run",
+        "shape",
+        "_type",
+        "n_components_a",
+        "n_components_b",
+    }
     metrics: dict[str, float] = {}
 
     for key, val in validation.items():
@@ -239,6 +261,7 @@ def extract_scalar_metrics(
 # ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
+
 
 def append_run(
     data_dir: Path,
@@ -306,7 +329,7 @@ def append_run(
 
     run: dict[str, Any] = {
         "id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "ref_arch_id": get_ref_arch_id(),
         "ffs_arch_id": get_ffs_arch_id(),
         "hardware": hw,
@@ -334,6 +357,7 @@ def update_cache(
 # ---------------------------------------------------------------------------
 # Querying
 # ---------------------------------------------------------------------------
+
 
 def query_runs(
     cache: dict[str, Any],
@@ -429,7 +453,9 @@ def get_ffs_timings_all_gpus(
 
 
 def get_cached_timing(
-    data_dir: Path, stage_name: str, dataset_id: str = "",
+    data_dir: Path,
+    stage_name: str,
+    dataset_id: str = "",
 ) -> tuple[float | None, float | None]:
     """Get latest (ref_seconds, ffs_seconds) for current machine's archs.
 
@@ -487,7 +513,7 @@ def print_cache(data_dir: Path, stage_filter: str | None = None) -> None:
 
     print()
     print(f"  {'#':>3}  {'ID':8}  {'Timestamp':19}  {'ref_arch':14}  {'ffs_arch':36}  Stages")
-    print(f"  {'-'*3}  {'-'*8}  {'-'*19}  {'-'*14}  {'-'*36}  {'-'*32}")
+    print(f"  {'-' * 3}  {'-' * 8}  {'-' * 19}  {'-' * 14}  {'-' * 36}  {'-' * 32}")
 
     for e in entries:
         idx = e["index"]
@@ -555,7 +581,9 @@ def remove_cache_entries(
         print("  Nothing to remove.")
         return 0
 
-    print(f"  {'Would remove' if dry_run else 'Removing'} {len(to_remove)} entr{'y' if len(to_remove) == 1 else 'ies'}:")
+    print(
+        f"  {'Would remove' if dry_run else 'Removing'} {len(to_remove)} entr{'y' if len(to_remove) == 1 else 'ies'}:"
+    )
     for pos in sorted(to_remove):
         run = runs[pos]
         ts = run.get("timestamp", "")[:19].replace("T", " ")
@@ -573,7 +601,9 @@ def remove_cache_entries(
 
     cache["runs"] = [r for i, r in enumerate(runs) if i not in to_remove]
     save_cache(data_dir, cache)
-    print(f"  Saved. Cache now has {len(cache['runs'])} entr{'y' if len(cache['runs']) == 1 else 'ies'}.")
+    print(
+        f"  Saved. Cache now has {len(cache['runs'])} entr{'y' if len(cache['runs']) == 1 else 'ies'}."
+    )
     return len(to_remove)
 
 
@@ -697,6 +727,7 @@ def get_latest_per_arch(cache: dict[str, Any]) -> list[dict[str, Any]]:
 # Historical comparison
 # ---------------------------------------------------------------------------
 
+
 def get_recent_runs(
     data_dir: Path,
     ffs_arch_id: str | None = None,
@@ -742,10 +773,7 @@ def get_previous_run(
         if current_commit and run_commit == current_commit:
             continue
         # Return the first (most recent) run that has metrics
-        if any(
-            run.get("stages", {}).get(s, {}).get("metrics")
-            for s in run.get("stages", {})
-        ):
+        if any(run.get("stages", {}).get(s, {}).get("metrics") for s in run.get("stages", {})):
             return run
     return None
 
@@ -753,6 +781,7 @@ def get_previous_run(
 @dataclass
 class MetricDelta:
     """Change in a single metric between two runs."""
+
     name: str
     current: float
     previous: float
@@ -805,15 +834,17 @@ def compare_stage_metrics(
         else:
             is_regression = delta < 0  # got smaller = worse
 
-        deltas.append(MetricDelta(
-            name=key,
-            current=cur,
-            previous=prev,
-            delta=delta,
-            pct_change=pct,
-            is_regression=is_regression,
-            higher_is_better=not lower_better,
-        ))
+        deltas.append(
+            MetricDelta(
+                name=key,
+                current=cur,
+                previous=prev,
+                delta=delta,
+                pct_change=pct,
+                is_regression=is_regression,
+                higher_is_better=not lower_better,
+            )
+        )
 
     return deltas
 
@@ -838,12 +869,14 @@ def get_metric_history(
         metrics = stage.get("metrics", {})
         if metric_name in metrics:
             git = run.get("git", {})
-            history.append({
-                "commit_short": git.get("commit_short", "?"),
-                "commit": git.get("commit", ""),
-                "branch": git.get("branch", ""),
-                "timestamp": run.get("timestamp", "")[:19],
-                "value": metrics[metric_name],
-                "passed": stage.get("passed"),
-            })
+            history.append(
+                {
+                    "commit_short": git.get("commit_short", "?"),
+                    "commit": git.get("commit", ""),
+                    "branch": git.get("branch", ""),
+                    "timestamp": run.get("timestamp", "")[:19],
+                    "value": metrics[metric_name],
+                    "passed": stage.get("passed"),
+                }
+            )
     return history

@@ -3,8 +3,8 @@
 import math
 
 import torch
-import pytest
 
+from fastfuncstuff.processing.affine import identity_params
 from fastfuncstuff.processing.quadrature import (
     apply_quadrature_filters_fft,
     build_phase_normal_equations,
@@ -15,7 +15,6 @@ from fastfuncstuff.processing.quadrature import (
     quadrature_gn_rigid_fixed,
     quadrature_phase_cost,
 )
-from fastfuncstuff.processing.affine import identity_params
 
 DEV = torch.device("cpu")
 
@@ -30,10 +29,14 @@ def _make_coords(vol_shape):
         indexing="ij",
     )
     N = nz * ny * nx
-    coords = torch.stack([
-        ii.reshape(-1), jj.reshape(-1), kk.reshape(-1),
-        torch.ones(N, device=DEV),
-    ])
+    coords = torch.stack(
+        [
+            ii.reshape(-1),
+            jj.reshape(-1),
+            kk.reshape(-1),
+            torch.ones(N, device=DEV),
+        ]
+    )
     return coords
 
 
@@ -60,7 +63,10 @@ class TestDesignQuadratureFilters:
 
     def test_custom_params(self):
         f = design_quadrature_filters(
-            size=7, center_freq=math.pi / 4.0, bandwidth=1.5, device=DEV,
+            size=7,
+            center_freq=math.pi / 4.0,
+            bandwidth=1.5,
+            device=DEV,
         )
         assert f.shape == (3, 7, 7, 7)
 
@@ -214,7 +220,13 @@ class TestQuadratureGNRigid:
         vol, q_base, spectra, coords, init_p = self._setup()
         vol_shape = vol.shape
         params, n_iters = quadrature_gn_rigid(
-            vol, vol, q_base, spectra, init_p, coords, vol_shape,
+            vol,
+            vol,
+            q_base,
+            spectra,
+            init_p,
+            coords,
+            vol_shape,
             max_iter=5,
         )
         assert params.shape == (12,)
@@ -226,8 +238,15 @@ class TestQuadratureGNRigid:
         vol_shape = vol.shape
         weight = torch.ones(vol_shape, device=DEV)
         params, n_iters = quadrature_gn_rigid(
-            vol, vol, q_base, spectra, init_p, coords, vol_shape,
-            max_iter=3, weight=weight,
+            vol,
+            vol,
+            q_base,
+            spectra,
+            init_p,
+            coords,
+            vol_shape,
+            max_iter=3,
+            weight=weight,
         )
         assert params.shape == (12,)
 
@@ -237,8 +256,16 @@ class TestQuadratureGNRigid:
         # Use a different source so it doesn't converge in 1 iter
         source = torch.randn(*vol_shape, device=DEV)
         _, n_iters = quadrature_gn_rigid(
-            vol, source, q_base, spectra, init_p, coords, vol_shape,
-            max_iter=2, dxy_thresh=1e-10, dph_thresh=1e-10,
+            vol,
+            source,
+            q_base,
+            spectra,
+            init_p,
+            coords,
+            vol_shape,
+            max_iter=2,
+            dxy_thresh=1e-10,
+            dph_thresh=1e-10,
         )
         assert n_iters == 2
 
@@ -258,8 +285,15 @@ class TestQuadratureGNRigidFixed:
         init_p = identity_params(device=DEV)
 
         params = quadrature_gn_rigid_fixed(
-            vol, q_base, spectra, init_p, coords, vol_shape,
-            max_iter=3, interp="heptic", weight_flat=None,
+            vol,
+            q_base,
+            spectra,
+            init_p,
+            coords,
+            vol_shape,
+            max_iter=3,
+            interp="heptic",
+            weight_flat=None,
         )
         assert params.shape == (12,)
 
@@ -276,8 +310,15 @@ class TestQuadratureGNRigidFixed:
         weight_flat = torch.ones(1, N, device=DEV)
 
         params = quadrature_gn_rigid_fixed(
-            vol, q_base, spectra, init_p, coords, vol_shape,
-            max_iter=2, interp="heptic", weight_flat=weight_flat,
+            vol,
+            q_base,
+            spectra,
+            init_p,
+            coords,
+            vol_shape,
+            max_iter=2,
+            interp="heptic",
+            weight_flat=weight_flat,
         )
         assert params.shape == (12,)
 

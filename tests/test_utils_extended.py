@@ -8,18 +8,15 @@ Tests for uncovered functions in fastfuncstuff/utils.py:
 - compute_power_spectrum / compute_power_spectra
 """
 
-import os
-import tempfile
-
 import numpy as np
 import pytest
 import torch
 
 from fastfuncstuff.utils import (
     calc_memory_usage,
-    configure_torch_backends,
-    compute_power_spectrum,
     compute_power_spectra,
+    compute_power_spectrum,
+    configure_torch_backends,
     gaussian_blur_3d,
     generate_synthetic_runs,
     load_per_run_nuisance_files,
@@ -45,14 +42,10 @@ class TestScaleToPercentSignal:
         data = torch.randn(n_voxels, n_tp) + 1000.0  # positive signal
         run_starts = [0, 100]
 
-        scaled, violations, info = scale_to_percent_signal(
-            data.clone(), run_starts, verbose=False
-        )
+        scaled, violations, info = scale_to_percent_signal(data.clone(), run_starts, verbose=False)
 
         # Mean of each run should be ~100 (within tolerance for clipping)
-        for run_idx, (start, end) in enumerate(
-            zip(run_starts, run_starts[1:] + [n_tp])
-        ):
+        for run_idx, (start, end) in enumerate(zip(run_starts, run_starts[1:] + [n_tp])):
             run_mean = scaled[:, start:end].mean(dim=1)
             # Most voxels should have mean ~100
             assert torch.abs(run_mean.mean() - 100.0) < 5.0
@@ -60,9 +53,7 @@ class TestScaleToPercentSignal:
     def test_no_violations_for_stable_signal(self):
         """Stable signal (low variance) should have no ceiling violations."""
         data = torch.ones(10, 100) * 500.0 + torch.randn(10, 100) * 0.1
-        _, violations, info = scale_to_percent_signal(
-            data, [0], max_scale=200.0, verbose=False
-        )
+        _, violations, info = scale_to_percent_signal(data, [0], max_scale=200.0, verbose=False)
         assert info["n_violations"] == 0
 
     def test_violations_for_extreme_signal(self):
@@ -90,9 +81,7 @@ class TestScaleToPercentSignal:
         data = torch.ones(5, 200)
         data[:, :100] *= 500.0  # run 1 mean=500
         data[:, 100:] *= 1000.0  # run 2 mean=1000
-        scaled, _, info = scale_to_percent_signal(
-            data.clone(), [0, 100], verbose=False
-        )
+        scaled, _, info = scale_to_percent_signal(data.clone(), [0, 100], verbose=False)
         assert info["scale_factors"].shape == (5, 2)
         assert info["mean_per_run"].shape == (5, 2)
 
@@ -129,8 +118,11 @@ class TestGaussianBlur3D:
         rng = np.random.default_rng(0)
         data = rng.standard_normal((8, 8, 8, 5)).astype(np.float32)
         blurred = gaussian_blur_3d(
-            data, fwhm_mm=4.0, voxel_sizes=(2.0, 2.0, 2.0),
-            device=torch.device("cpu"), verbose=False,
+            data,
+            fwhm_mm=4.0,
+            voxel_sizes=(2.0, 2.0, 2.0),
+            device=torch.device("cpu"),
+            verbose=False,
         )
         assert blurred.shape == data.shape
         assert blurred.dtype == data.dtype
@@ -139,8 +131,11 @@ class TestGaussianBlur3D:
         data = np.ones((10, 10), dtype=np.float32)
         with pytest.raises(ValueError, match="Expected 4D data"):
             gaussian_blur_3d(
-                data, fwhm_mm=4.0, voxel_sizes=(2.0, 2.0, 2.0),
-                device=torch.device("cpu"), verbose=False,
+                data,
+                fwhm_mm=4.0,
+                voxel_sizes=(2.0, 2.0, 2.0),
+                device=torch.device("cpu"),
+                verbose=False,
             )
 
     def test_anisotropic_voxels(self):
@@ -148,8 +143,11 @@ class TestGaussianBlur3D:
         rng = np.random.default_rng(0)
         data = rng.standard_normal((6, 8, 10, 2)).astype(np.float32)
         blurred = gaussian_blur_3d(
-            data, fwhm_mm=6.0, voxel_sizes=(1.0, 1.5, 3.0),
-            device=torch.device("cpu"), verbose=False,
+            data,
+            fwhm_mm=6.0,
+            voxel_sizes=(1.0, 1.5, 3.0),
+            device=torch.device("cpu"),
+            verbose=False,
         )
         assert blurred.shape == data.shape
 
@@ -184,13 +182,9 @@ class TestGenerateSyntheticRuns:
 
     def test_reproducible_with_generator(self):
         gen1 = torch.Generator().manual_seed(123)
-        r1 = generate_synthetic_runs(
-            None, 2, 30, n_voxels=10, generator=gen1, verbose=False
-        )
+        r1 = generate_synthetic_runs(None, 2, 30, n_voxels=10, generator=gen1, verbose=False)
         gen2 = torch.Generator().manual_seed(123)
-        r2 = generate_synthetic_runs(
-            None, 2, 30, n_voxels=10, generator=gen2, verbose=False
-        )
+        r2 = generate_synthetic_runs(None, 2, 30, n_voxels=10, generator=gen2, verbose=False)
         torch.testing.assert_close(r1, r2)
 
     def test_raises_without_n_voxels(self):
@@ -217,9 +211,7 @@ class TestLoadPerRunNuisanceFiles:
         # Only create run 1
         np.savetxt(tmp_path / "test_run01_PCs.txt", np.random.randn(50, 2))
 
-        result = load_per_run_nuisance_files(
-            str(tmp_path / "test"), 2, suffix="_PCs.txt"
-        )
+        result = load_per_run_nuisance_files(str(tmp_path / "test"), 2, suffix="_PCs.txt")
         assert len(result) == 2
         assert result[0] is not None
         assert result[1] is None
@@ -227,17 +219,13 @@ class TestLoadPerRunNuisanceFiles:
     def test_empty_file_returns_none(self, tmp_path):
         """Empty files should return None."""
         (tmp_path / "test_run01_PCs.txt").write_text("")
-        result = load_per_run_nuisance_files(
-            str(tmp_path / "test"), 1, suffix="_PCs.txt"
-        )
+        result = load_per_run_nuisance_files(str(tmp_path / "test"), 1, suffix="_PCs.txt")
         assert result[0] is None
 
     def test_single_column_reshaped(self, tmp_path):
         """Single-column file should be reshaped to (n, 1)."""
         np.savetxt(tmp_path / "test_run01_PCs.txt", np.random.randn(50))
-        result = load_per_run_nuisance_files(
-            str(tmp_path / "test"), 1, suffix="_PCs.txt"
-        )
+        result = load_per_run_nuisance_files(str(tmp_path / "test"), 1, suffix="_PCs.txt")
         assert result[0].ndim == 2
         assert result[0].shape[1] == 1
 

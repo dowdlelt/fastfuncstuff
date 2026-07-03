@@ -2,32 +2,35 @@
 fMRI simulation pipeline
 Single and batch simulation modes
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-import nibabel as nib
 import numpy as np
 import torch
 
 from fastfuncstuff.design.matrices import build_glm_design
 from fastfuncstuff.io.afni import save_nifti
-from .noise import add_drift, generate_fmri_noise
 from fastfuncstuff.utils import get_device, print_device_info, to_tensor
 
+from .noise import add_drift, generate_fmri_noise
 
-def simulate_fmri_run(onsets: torch.Tensor,
-                     betas: torch.Tensor | list[float],
-                     hrf: torch.Tensor,
-                     tr: float,
-                     n_timepoints: int,
-                     matrix_size: tuple[int, int, int] = (100, 100, 10),
-                     noise_level: float = 1.0,
-                     baseline: float = 100.0,
-                     add_scanner_drift: bool = True,
-                     drift_amplitude: float = 0.5,
-                     device: torch.device | None = None) -> torch.Tensor:
+
+def simulate_fmri_run(
+    onsets: torch.Tensor,
+    betas: torch.Tensor | list[float],
+    hrf: torch.Tensor,
+    tr: float,
+    n_timepoints: int,
+    matrix_size: tuple[int, int, int] = (100, 100, 10),
+    noise_level: float = 1.0,
+    baseline: float = 100.0,
+    add_scanner_drift: bool = True,
+    drift_amplitude: float = 0.5,
+    device: torch.device | None = None,
+) -> torch.Tensor:
     """
     Simulate a single fMRI run
 
@@ -85,7 +88,7 @@ def simulate_fmri_run(onsets: torch.Tensor,
         raise ValueError(f"Betas shape {betas.shape} doesn't match n_voxels {n_voxels}")
 
     # Build design matrix
-    design = build_glm_design(onsets, hrf, n_timepoints, mode='assumed', device=device)
+    design = build_glm_design(onsets, hrf, n_timepoints, mode="assumed", device=device)
 
     # Generate signal: data = design @ betas.T
     # design: (n_timepoints, n_conditions)
@@ -102,10 +105,7 @@ def simulate_fmri_run(onsets: torch.Tensor,
     # Generate noise per slice (more efficient than per voxel)
     for slice_idx in range(nz):
         slice_noise = generate_fmri_noise(
-            tr, n_timepoints * tr,
-            matrix_size=(nx, ny),
-            normalize=True,
-            device=device
+            tr, n_timepoints * tr, matrix_size=(nx, ny), normalize=True, device=device
         )
         # Reshape and assign
         slice_start = slice_idx * nx * ny
@@ -124,16 +124,18 @@ def simulate_fmri_run(onsets: torch.Tensor,
     return data
 
 
-def simulate_fmri_experiment(n_runs: int,
-                            onsets: torch.Tensor | list[torch.Tensor],
-                            betas: torch.Tensor | list[float],
-                            hrf: torch.Tensor,
-                            tr: float,
-                            n_timepoints: int | list[int],
-                            matrix_size: tuple[int, int, int] = (100, 100, 10),
-                            device: torch.device | None = None,
-                            verbose: bool = True,
-                            **kwargs) -> list[torch.Tensor]:
+def simulate_fmri_experiment(
+    n_runs: int,
+    onsets: torch.Tensor | list[torch.Tensor],
+    betas: torch.Tensor | list[float],
+    hrf: torch.Tensor,
+    tr: float,
+    n_timepoints: int | list[int],
+    matrix_size: tuple[int, int, int] = (100, 100, 10),
+    device: torch.device | None = None,
+    verbose: bool = True,
+    **kwargs,
+) -> list[torch.Tensor]:
     """
     Simulate a multi-run fMRI experiment
 
@@ -183,11 +185,17 @@ def simulate_fmri_experiment(n_runs: int,
 
     for run_idx in range(n_runs):
         if verbose:
-            print(f"  Run {run_idx+1}/{n_runs}...")
+            print(f"  Run {run_idx + 1}/{n_runs}...")
 
         data = simulate_fmri_run(
-            onsets[run_idx], betas, hrf, tr, n_timepoints[run_idx],
-            matrix_size=matrix_size, device=device, **kwargs
+            onsets[run_idx],
+            betas,
+            hrf,
+            tr,
+            n_timepoints[run_idx],
+            matrix_size=matrix_size,
+            device=device,
+            **kwargs,
         )
 
         data_list.append(data)
@@ -198,11 +206,13 @@ def simulate_fmri_experiment(n_runs: int,
     return data_list
 
 
-def create_parametric_voxels(matrix_size: tuple[int, int, int],
-                            n_conditions: int,
-                            hrf_library: torch.Tensor | None = None,
-                            beta_ranges: list[tuple[float, float]] | None = None,
-                            device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def create_parametric_voxels(
+    matrix_size: tuple[int, int, int],
+    n_conditions: int,
+    hrf_library: torch.Tensor | None = None,
+    beta_ranges: list[tuple[float, float]] | None = None,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create spatially organized voxels with varying betas and HRFs
 
@@ -276,7 +286,9 @@ def create_parametric_voxels(matrix_size: tuple[int, int, int],
                 for cond_idx in range(n_conditions):
                     beta_min, beta_max = beta_ranges[cond_idx]
                     # Vary betas across Y dimension
-                    beta_val = beta_min + (beta_max - beta_min) * (beta_pattern_idx / n_beta_patterns)
+                    beta_val = beta_min + (beta_max - beta_min) * (
+                        beta_pattern_idx / n_beta_patterns
+                    )
                     betas[voxel_idx, cond_idx] = beta_val
 
                 hrf_indices[voxel_idx] = hrf_idx
@@ -287,10 +299,9 @@ def create_parametric_voxels(matrix_size: tuple[int, int, int],
     return betas, hrf_indices, noise_levels
 
 
-def simulate_batch_experiments(n_experiments: int,
-                              sim_config: dict,
-                              device: torch.device | None = None,
-                              verbose: bool = True) -> list[dict]:
+def simulate_batch_experiments(
+    n_experiments: int, sim_config: dict, device: torch.device | None = None, verbose: bool = True
+) -> list[dict]:
     """
     Simulate multiple experiments in batch (for statistical power analysis, etc.)
 
@@ -326,14 +337,14 @@ def simulate_batch_experiments(n_experiments: int,
 
     for exp_idx in range(n_experiments):
         if verbose and exp_idx % max(1, n_experiments // 10) == 0:
-            print(f"  Experiment {exp_idx+1}/{n_experiments}...")
+            print(f"  Experiment {exp_idx + 1}/{n_experiments}...")
 
         # Generate this experiment
         # (Implementation would extract from sim_config and call simulate_fmri_experiment)
         # This is a template - full implementation depends on specific needs
 
         exp_data = {
-            'id': exp_idx,
+            "id": exp_idx,
             # Add simulated data here
         }
 
@@ -345,10 +356,12 @@ def simulate_batch_experiments(n_experiments: int,
     return experiments
 
 
-def write_afni_onset_files(onsets_list: list[torch.Tensor] | torch.Tensor,
-                           tr: float,
-                           output_dir: Path,
-                           prefix: str = "onsets") -> list[Path]:
+def write_afni_onset_files(
+    onsets_list: list[torch.Tensor] | torch.Tensor,
+    tr: float,
+    output_dir: Path,
+    prefix: str = "onsets",
+) -> list[Path]:
     """
     Write AFNI-compatible onset timing files
 
@@ -381,8 +394,7 @@ def write_afni_onset_files(onsets_list: list[torch.Tensor] | torch.Tensor,
         onsets_list = [onsets_list]
 
     # Convert to numpy
-    onsets_np_list = [o.cpu().numpy() if isinstance(o, torch.Tensor) else o
-                      for o in onsets_list]
+    onsets_np_list = [o.cpu().numpy() if isinstance(o, torch.Tensor) else o for o in onsets_list]
 
     n_runs = len(onsets_np_list)
     n_conditions = onsets_np_list[0].shape[1] if onsets_np_list[0].ndim > 1 else 1
@@ -391,9 +403,9 @@ def write_afni_onset_files(onsets_list: list[torch.Tensor] | torch.Tensor,
 
     # Write one file per condition
     for cond_idx in range(n_conditions):
-        filename = output_dir / f"{prefix}_condition{cond_idx+1}.txt"
+        filename = output_dir / f"{prefix}_condition{cond_idx + 1}.txt"
 
-        with open(filename, 'w') as f:
+        with open(filename, "w") as f:
             for run_idx, onsets in enumerate(onsets_np_list):
                 # Extract onsets for this condition (binary onset matrix)
                 if onsets.ndim > 1:
@@ -406,25 +418,27 @@ def write_afni_onset_files(onsets_list: list[torch.Tensor] | torch.Tensor,
 
                 # Write space-separated
                 if len(onset_seconds) > 0:
-                    onset_str = ' '.join([f"{t:.2f}" for t in onset_seconds])
+                    onset_str = " ".join([f"{t:.2f}" for t in onset_seconds])
                 else:
-                    onset_str = '*'  # AFNI convention for no events
+                    onset_str = "*"  # AFNI convention for no events
 
                 f.write(onset_str)
                 if run_idx < n_runs - 1:
-                    f.write('\n')
+                    f.write("\n")
 
         onset_files.append(filename)
 
     return onset_files
 
 
-def write_nifti_files(data_list: list[torch.Tensor],
-                      tr: float,
-                      output_dir: Path,
-                      prefix: str = "run",
-                      affine: np.ndarray | None = None,
-                      voxel_size: tuple[float, float, float] = (2.0, 2.0, 2.0)) -> list[Path]:
+def write_nifti_files(
+    data_list: list[torch.Tensor],
+    tr: float,
+    output_dir: Path,
+    prefix: str = "run",
+    affine: np.ndarray | None = None,
+    voxel_size: tuple[float, float, float] = (2.0, 2.0, 2.0),
+) -> list[Path]:
     """
     Write fMRI data as nii.gz files using nibabel
 
@@ -465,22 +479,24 @@ def write_nifti_files(data_list: list[torch.Tensor],
         data_np = data.cpu().numpy() if isinstance(data, torch.Tensor) else data
 
         # Save nifti with TR in header
-        filename = output_dir / f"{prefix}{run_idx+1:02d}.nii.gz"
+        filename = output_dir / f"{prefix}{run_idx + 1:02d}.nii.gz"
         save_nifti(data_np.astype(np.float32), output_path=filename, affine=affine, tr=tr)
         nifti_files.append(filename)
 
     return nifti_files
 
 
-def save_simulation_outputs(data_list: list[torch.Tensor],
-                            onsets_list: list[torch.Tensor] | torch.Tensor,
-                            tr: float,
-                            output_dir: str | Path,
-                            label: str,
-                            metadata: dict[str, Any] | None = None,
-                            affine: np.ndarray | None = None,
-                            voxel_size: tuple[float, float, float] = (2.0, 2.0, 2.0),
-                            verbose: bool = True) -> dict[str, Any]:
+def save_simulation_outputs(
+    data_list: list[torch.Tensor],
+    onsets_list: list[torch.Tensor] | torch.Tensor,
+    tr: float,
+    output_dir: str | Path,
+    label: str,
+    metadata: dict[str, Any] | None = None,
+    affine: np.ndarray | None = None,
+    voxel_size: tuple[float, float, float] = (2.0, 2.0, 2.0),
+    verbose: bool = True,
+) -> dict[str, Any]:
     """
     Save all simulation outputs to organized folder structure
 
@@ -536,15 +552,16 @@ def save_simulation_outputs(data_list: list[torch.Tensor],
     # Write nifti files
     if verbose:
         print("  Writing nifti files...")
-    nifti_files = write_nifti_files(data_list, tr, sim_dir, prefix="run",
-                                    affine=affine, voxel_size=voxel_size)
+    nifti_files = write_nifti_files(
+        data_list, tr, sim_dir, prefix="run", affine=affine, voxel_size=voxel_size
+    )
 
     # Write metadata
     metadata_file = sim_dir / "metadata.txt"
     if verbose:
         print("  Writing metadata...")
 
-    with open(metadata_file, 'w') as f:
+    with open(metadata_file, "w") as f:
         f.write(f"Simulation Label: {label}\n")
         f.write(f"TR: {tr} sec\n")
         f.write(f"Number of runs: {len(data_list)}\n")
@@ -574,8 +591,8 @@ def save_simulation_outputs(data_list: list[torch.Tensor],
         print("\nSimulation outputs saved successfully!")
 
     return {
-        'output_dir': sim_dir,
-        'onset_files': onset_files,
-        'nifti_files': nifti_files,
-        'metadata_file': metadata_file
+        "output_dir": sim_dir,
+        "onset_files": onset_files,
+        "nifti_files": nifti_files,
+        "metadata_file": metadata_file,
     }

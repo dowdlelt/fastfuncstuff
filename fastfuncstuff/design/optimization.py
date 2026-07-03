@@ -25,11 +25,11 @@ import numpy as np
 import torch
 from scipy.stats import expon, poisson, truncexpon
 
-from .matrices import convolve_hrf
-from .hrf import get_canonical_hrf
-
 # Import our metrics
 from fastfuncstuff.simulation.metrics_empirical import evaluate_design_empirical
+
+from .hrf import get_canonical_hrf
+from .matrices import convolve_hrf
 
 
 @dataclass
@@ -284,7 +284,10 @@ def generate_isi_sequence(
 
     # Select exactly n_isis
     if len(isis) < n_isis:
-        warnings.warn(f"Only generated {len(isis)} valid ISIs, need {n_isis}. Padding with mean.", stacklevel=2)
+        warnings.warn(
+            f"Only generated {len(isis)} valid ISIs, need {n_isis}. Padding with mean.",
+            stacklevel=2,
+        )
         isis = np.concatenate([isis, np.full(n_isis - len(isis), target_mean)])
     else:
         isis = isis[:n_isis]

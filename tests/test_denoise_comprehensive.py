@@ -33,6 +33,7 @@ def device():
 # Layer 1: Small Tests - Unit tests for core functions
 # ============================================================================
 
+
 class TestDenoiseCoreFunctions:
     """Test core denoising functions."""
 
@@ -70,10 +71,12 @@ class TestDenoiseCoreFunctions:
 
         # Create R² values where first 50 have high R² (signal)
         # and last 50 have low R² (noise pool)
-        r2 = torch.cat([
-            torch.ones(50, device=device) * 0.5,  # High R² voxels
-            torch.ones(50, device=device) * 0.05,  # Low R² voxels
-        ])
+        r2 = torch.cat(
+            [
+                torch.ones(50, device=device) * 0.5,  # High R² voxels
+                torch.ones(50, device=device) * 0.05,  # Low R² voxels
+            ]
+        )
 
         noise_mask, criteria_mask = select_noise_pool_voxels(
             r2=r2,
@@ -90,8 +93,9 @@ class TestDenoiseCoreFunctions:
         r2_noise = r2[noise_mask].mean().item()
         r2_criteria = r2[criteria_mask].mean().item()
 
-        assert r2_noise < r2_criteria, \
+        assert r2_noise < r2_criteria, (
             f"Noise pool R² ({r2_noise:.3f}) should be less than criteria R² ({r2_criteria:.3f})"
+        )
 
     def test_select_noise_pool_voxels_min_constraint_error(self, device):
         """Test that noise pool selection raises error when min constraint can't be met."""
@@ -124,13 +128,14 @@ class TestDenoiseCoreFunctions:
         run_starts = [i * n_tp_run for i in range(n_runs)]
 
         pcs_per_run = extract_noise_pcs_per_run(
-            data, run_starts, noise_pool_mask,
-            max_components=5, device=device, verbose=False)
+            data, run_starts, noise_pool_mask, max_components=5, device=device, verbose=False
+        )
 
         assert len(pcs_per_run) == n_runs, "One PC tensor per run expected"
         for r, pcs in enumerate(pcs_per_run):
             assert pcs.shape[0] == n_tp_run, (
-                f"Run {r}: expected {n_tp_run} timepoints, got {pcs.shape[0]}")
+                f"Run {r}: expected {n_tp_run} timepoints, got {pcs.shape[0]}"
+            )
             assert pcs.shape[1] <= 5, "At most max_components PCs"
             assert torch.all(torch.isfinite(pcs)), f"Run {r} PCs must be finite"
 
@@ -138,6 +143,7 @@ class TestDenoiseCoreFunctions:
 # ============================================================================
 # Layer 2: Medium Tests - Sub-workflow tests
 # ============================================================================
+
 
 class TestDenoiseSubWorkflows:
     """Test denoising sub-workflows."""
@@ -147,7 +153,10 @@ class TestDenoiseSubWorkflows:
         cross_validate_noise_pcs returns an (n_voxels, n_pc_counts) R² map
         and an aggregated (n_pc_counts,) array.  All values should be finite.
         """
-        from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncstuff.denoise.sequential import (
+            cross_validate_noise_pcs,
+            extract_noise_pcs_per_run,
+        )
 
         torch.manual_seed(0)
         n_runs, n_tp_run, tr = 3, 60, 2.0
@@ -160,12 +169,15 @@ class TestDenoiseSubWorkflows:
         noise_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
         noise_mask[:n_noise] = True
         noise_pcs_out = extract_noise_pcs_per_run(
-            data, run_starts, noise_mask, max_components=5, device=device, verbose=False)
+            data, run_starts, noise_mask, max_components=5, device=device, verbose=False
+        )
         assert isinstance(noise_pcs_out, list)
         noise_pcs = noise_pcs_out
 
-        nuisance = [construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
-                    for _ in range(n_runs)]
+        nuisance = [
+            construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
+            for _ in range(n_runs)
+        ]
 
         r2_maps, r2_agg = cross_validate_noise_pcs(
             data=data,
@@ -180,7 +192,8 @@ class TestDenoiseSubWorkflows:
         )
 
         assert r2_maps.shape == (n_voxels, 4), (
-            f"Expected (n_voxels, max_components+1) = ({n_voxels}, 4), got {r2_maps.shape}")
+            f"Expected (n_voxels, max_components+1) = ({n_voxels}, 4), got {r2_maps.shape}"
+        )
         assert r2_agg.shape == (4,)
         assert np.all(np.isfinite(r2_maps)), "R² maps must be finite"
         assert np.all(np.isfinite(r2_agg)), "Aggregated R² must be finite"
@@ -203,7 +216,8 @@ class TestDenoiseSubWorkflows:
 
         assert optimal == 0, f"Expected 0 PCs to be optimal, got {optimal}"
         assert criteria_mask.sum() == 100, (
-            f"Expected 100 criteria voxels, got {criteria_mask.sum()}")
+            f"Expected 100 criteria voxels, got {criteria_mask.sum()}"
+        )
 
     def test_criteria_voxel_selection(self, device):
         """
@@ -215,16 +229,17 @@ class TestDenoiseSubWorkflows:
         n_voxels, n_pc_counts = 100, 4
         # Only voxels 0..19 exceed 0.1 in at least one PC count
         r2_maps = np.zeros((n_voxels, n_pc_counts))
-        r2_maps[:20, 2] = 0.3   # these 20 have R² > 0.1 at PC count 2
-        r2_maps[20:, :] = 0.0   # remaining 80 voxels never exceed threshold
+        r2_maps[:20, 2] = 0.3  # these 20 have R² > 0.1 at PC count 2
+        r2_maps[20:, :] = 0.0  # remaining 80 voxels never exceed threshold
 
         optimal, criteria_mask = select_optimal_pcs(r2_maps, threshold=0.1)
 
         assert criteria_mask.sum() == 20, (
-            f"Expected 20 criteria voxels (R²>0.1), got {criteria_mask.sum()}")
+            f"Expected 20 criteria voxels (R²>0.1), got {criteria_mask.sum()}"
+        )
         assert optimal == 2, (
-            f"Expected PC count 2 to be selected (highest median for criteria), "
-            f"got {optimal}")
+            f"Expected PC count 2 to be selected (highest median for criteria), got {optimal}"
+        )
 
 
 class TestExtractNoisePCs:
@@ -258,7 +273,7 @@ class TestExtractNoisePCs:
             noise_pool_mask=noise_mask,
             max_components=5,
             variance_threshold=0.95,
-            device=device
+            device=device,
         )
 
         # Should return list of PCs (one per run)
@@ -292,7 +307,7 @@ class TestExtractNoisePCs:
                 run_starts=run_starts_full,
                 noise_pool_mask=noise_mask,
                 max_components=5,
-                device=device
+                device=device,
             )
             # If it succeeds, should have empty PCs for the run
             assert len(pcs_per_run) == 1
@@ -336,7 +351,7 @@ class TestCrossValidateNoisePCs:
             tr=2.0,
             max_components=max_components,
             device=device,
-            verbose=False
+            verbose=False,
         )
 
         # Check return types
@@ -344,10 +359,12 @@ class TestCrossValidateNoisePCs:
         assert isinstance(r2_summary, np.ndarray), "r2_summary should be numpy array"
 
         # Check shapes
-        assert r2_maps.shape == (n_voxels, max_components + 1), \
+        assert r2_maps.shape == (n_voxels, max_components + 1), (
             f"r2_maps should be ({n_voxels}, {max_components + 1})"
-        assert r2_summary.shape == (max_components + 1,), \
+        )
+        assert r2_summary.shape == (max_components + 1,), (
             f"r2_summary should have {max_components + 1} elements"
+        )
 
     def test_cross_validate_noise_pcs_with_design_matrix(self, device):
         """Test CV with explicit design matrix"""
@@ -380,7 +397,7 @@ class TestCrossValidateNoisePCs:
             tr=2.0,
             max_components=max_components,
             device=device,
-            verbose=False
+            verbose=False,
         )
 
         # Should return valid R² values
@@ -407,9 +424,7 @@ class TestSelectOptimalPCs:
 
         # Select optimal
         optimal_n_pcs, criteria_mask = select_optimal_pcs(
-            r2_maps=r2_maps,
-            threshold=0.0,
-            metric="median"
+            r2_maps=r2_maps, threshold=0.0, metric="median"
         )
 
         assert isinstance(optimal_n_pcs, (int, np.integer)), "Should return integer"
@@ -433,9 +448,7 @@ class TestSelectOptimalPCs:
         r2_maps[:, 6:] = 0.25  # 6+ PCs - worse
 
         optimal_n_pcs, criteria_mask = select_optimal_pcs(
-            r2_maps=r2_maps,
-            threshold=0.0,
-            metric="median"
+            r2_maps=r2_maps, threshold=0.0, metric="median"
         )
 
         assert optimal_n_pcs == 5, f"Should select 5 PCs (best R²), got {optimal_n_pcs}"
@@ -455,23 +468,25 @@ class TestSelectOptimalPCs:
         _, criteria_high = select_optimal_pcs(
             r2_maps=r2_maps,
             threshold=0.4,  # High threshold
-            metric="median"
+            metric="median",
         )
 
         _, criteria_low = select_optimal_pcs(
             r2_maps=r2_maps,
             threshold=0.0,  # Low threshold
-            metric="median"
+            metric="median",
         )
 
         # High threshold should have fewer criteria voxels
-        assert criteria_high.sum() <= criteria_low.sum(), \
+        assert criteria_high.sum() <= criteria_low.sum(), (
             "Higher threshold should select fewer criteria voxels"
+        )
 
 
 # ============================================================================
 # Layer 3: Large/E2E Tests - Full pipeline with ground truth
 # ============================================================================
+
 
 class TestDenoiseFullPipeline:
     """Test full denoising pipeline."""
@@ -482,7 +497,10 @@ class TestDenoiseFullPipeline:
         compared to no PCs.  We synthesize data with a strong shared noise
         component and verify that denoising with 1 PC is better than 0 PCs.
         """
-        from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncstuff.denoise.sequential import (
+            cross_validate_noise_pcs,
+            extract_noise_pcs_per_run,
+        )
 
         torch.manual_seed(42)
         n_runs, n_tp_run, tr = 4, 80, 2.0
@@ -498,7 +516,7 @@ class TestDenoiseFullPipeline:
         task_tc = torch.zeros(n_tp_total, device=device)
         for r in range(n_runs):
             t = torch.linspace(0, 2 * 3.14159, n_tp_run, device=device)
-            task_tc[r * n_tp_run:(r + 1) * n_tp_run] = torch.cos(t)
+            task_tc[r * n_tp_run : (r + 1) * n_tp_run] = torch.cos(t)
 
         # Signal voxels: task signal + shared noise
         signal_betas = torch.randn(n_signal_voxels, 1, device=device) * 2.0
@@ -517,10 +535,13 @@ class TestDenoiseFullPipeline:
         noise_mask[n_signal_voxels:] = True
 
         noise_pcs_raw = extract_noise_pcs_per_run(
-            data, run_starts, noise_mask, max_components=3, device=device, verbose=False)
+            data, run_starts, noise_mask, max_components=3, device=device, verbose=False
+        )
         assert isinstance(noise_pcs_raw, list)  # return_loadings=False -> list, not tuple
-        nuisance = [construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
-                    for _ in range(n_runs)]
+        nuisance = [
+            construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
+            for _ in range(n_runs)
+        ]
 
         _, r2_agg = cross_validate_noise_pcs(
             data=data,
@@ -537,7 +558,8 @@ class TestDenoiseFullPipeline:
         # With structured noise, using 1 PC should be better than 0 PCs
         assert r2_agg[1] > r2_agg[0], (
             f"Adding 1 noise PC should improve median R² "
-            f"(0 PCs: {r2_agg[0]:.4f}, 1 PC: {r2_agg[1]:.4f})")
+            f"(0 PCs: {r2_agg[0]:.4f}, 1 PC: {r2_agg[1]:.4f})"
+        )
 
     def test_cv_prevents_overfitting(self, device):
         """
@@ -546,7 +568,10 @@ class TestDenoiseFullPipeline:
         PCs (no structured noise), adding more PCs should not substantially
         improve cross-validated R² vs baseline.
         """
-        from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs, extract_noise_pcs_per_run
+        from fastfuncstuff.denoise.sequential import (
+            cross_validate_noise_pcs,
+            extract_noise_pcs_per_run,
+        )
 
         torch.manual_seed(99)
         n_runs, n_tp_run, tr = 3, 60, 2.0
@@ -561,10 +586,13 @@ class TestDenoiseFullPipeline:
         noise_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
         noise_mask[:n_noise] = True
         noise_pcs_raw = extract_noise_pcs_per_run(
-            data, run_starts, noise_mask, max_components=5, device=device, verbose=False)
+            data, run_starts, noise_mask, max_components=5, device=device, verbose=False
+        )
         assert isinstance(noise_pcs_raw, list)  # return_loadings=False -> list
-        nuisance = [construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
-                    for _ in range(n_runs)]
+        nuisance = [
+            construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
+            for _ in range(n_runs)
+        ]
 
         _, r2_agg = cross_validate_noise_pcs(
             data=data,
@@ -586,4 +614,5 @@ class TestDenoiseFullPipeline:
         max_idx = int(np.argmax(r2_agg))
         assert max_idx < len(r2_agg) - 1 or r2_agg[-1] - r2_agg[0] < 0.02, (
             "For pure noise data, CV R² should not substantially increase with "
-            f"PC count (r2_agg={r2_agg})")
+            f"PC count (r2_agg={r2_agg})"
+        )

@@ -1476,7 +1476,7 @@ class VRAMDebugger:
             "n_samples": self._n_samples,
         }
 
-    def __enter__(self) -> "VRAMDebugger":
+    def __enter__(self) -> VRAMDebugger:
         self.start()
         return self
 
@@ -1491,7 +1491,7 @@ def make_vram_debugger(
     chunk_size: int = 0,
     enabled: bool | None = None,
     sample_ms: float = 25.0,
-) -> "VRAMDebugger | contextlib.AbstractContextManager[None]":
+) -> VRAMDebugger | contextlib.AbstractContextManager[None]:
     """
     Return a :class:`VRAMDebugger` when debug mode is active, otherwise a
     no-op context manager.  Use this so a single code path handles both modes.

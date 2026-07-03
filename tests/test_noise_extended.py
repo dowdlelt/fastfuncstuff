@@ -21,10 +21,8 @@ from fastfuncstuff.simulation.noise import (
     generate_ar1_noise,
     generate_ar_noise,
     generate_arma_noise,
-    generate_fmri_noise,
     generate_fmri_noise_batch,
 )
-
 
 DEVICE = torch.device("cpu")
 
@@ -32,23 +30,32 @@ DEVICE = torch.device("cpu")
 class TestGenerateFmriNoiseBatch:
     def test_shape_single_voxel(self):
         result = generate_fmri_noise_batch(
-            tr=2.0, duration_s=10.0, n_batches=3,
-            matrix_size=(1, 1), device=DEVICE,
+            tr=2.0,
+            duration_s=10.0,
+            n_batches=3,
+            matrix_size=(1, 1),
+            device=DEVICE,
         )
         # 10s / 2s TR = 5 timepoints, single voxel
         assert result.shape == (3, 5)
 
     def test_shape_multi_voxel(self):
         result = generate_fmri_noise_batch(
-            tr=1.0, duration_s=5.0, n_batches=2,
-            matrix_size=(3, 4), device=DEVICE,
+            tr=1.0,
+            duration_s=5.0,
+            n_batches=2,
+            matrix_size=(3, 4),
+            device=DEVICE,
         )
         assert result.shape == (2, 5, 3, 4)
 
     def test_batches_are_independent(self):
         result = generate_fmri_noise_batch(
-            tr=2.0, duration_s=20.0, n_batches=2,
-            matrix_size=(1, 1), device=DEVICE,
+            tr=2.0,
+            duration_s=20.0,
+            n_batches=2,
+            matrix_size=(1, 1),
+            device=DEVICE,
         )
         # Two different realizations should not be identical
         assert not torch.allclose(result[0], result[1])
@@ -91,9 +98,7 @@ class TestAddMotionArtifacts:
 
     def test_modifies_data(self):
         data = torch.zeros(100, device=DEVICE)
-        result, _ = add_motion_artifacts(
-            data, max_displacement=10.0, n_spikes=5, device=DEVICE
-        )
+        result, _ = add_motion_artifacts(data, max_displacement=10.0, n_spikes=5, device=DEVICE)
         assert not torch.allclose(result, data)
 
     def test_multidimensional(self):
@@ -113,46 +118,45 @@ class TestGenerateArNoise:
 
     def test_normalized_unit_variance(self):
         noise = generate_ar_noise(
-            [0.5, 0.1], n_timepoints=1000, n_voxels=5,
-            normalize=True, device=DEVICE,
+            [0.5, 0.1],
+            n_timepoints=1000,
+            n_voxels=5,
+            normalize=True,
+            device=DEVICE,
         )
         # Should have approximately unit variance
         assert abs(noise.std().item() - 1.0) < 0.15
 
     def test_accepts_list_and_tensor(self):
         n1 = generate_ar_noise([0.5], n_timepoints=50, device=DEVICE)
-        n2 = generate_ar_noise(
-            torch.tensor([0.5]), n_timepoints=50, device=DEVICE
-        )
+        n2 = generate_ar_noise(torch.tensor([0.5]), n_timepoints=50, device=DEVICE)
         assert n1.shape == n2.shape
 
 
 class TestGenerateArmaNoise:
     def test_arma11_shape(self):
-        noise = generate_arma_noise(
-            [0.3], [0.2], n_timepoints=100, n_voxels=5, device=DEVICE
-        )
+        noise = generate_arma_noise([0.3], [0.2], n_timepoints=100, n_voxels=5, device=DEVICE)
         assert noise.shape == (100, 5)
 
     def test_arma_normalized(self):
         noise = generate_arma_noise(
-            [0.4], [0.3], n_timepoints=1000, n_voxels=10,
-            normalize=True, device=DEVICE,
+            [0.4],
+            [0.3],
+            n_timepoints=1000,
+            n_voxels=10,
+            normalize=True,
+            device=DEVICE,
         )
         assert abs(noise.std().item() - 1.0) < 0.15
 
     def test_pure_ma(self):
         """AR part empty, only MA."""
-        noise = generate_arma_noise(
-            [], [0.5, 0.3], n_timepoints=100, n_voxels=3, device=DEVICE
-        )
+        noise = generate_arma_noise([], [0.5, 0.3], n_timepoints=100, n_voxels=3, device=DEVICE)
         assert noise.shape == (100, 3)
 
     def test_pure_ar(self):
         """MA part empty, only AR."""
-        noise = generate_arma_noise(
-            [0.5], [], n_timepoints=100, n_voxels=3, device=DEVICE
-        )
+        noise = generate_arma_noise([0.5], [], n_timepoints=100, n_voxels=3, device=DEVICE)
         assert noise.shape == (100, 3)
 
     def test_invalid_ar_coeff_raises(self):
@@ -165,12 +169,8 @@ class TestEstimateNoiseParametersFromData:
         """Estimate AR(1) from synthetic AR(1) data."""
         torch.manual_seed(42)
         true_rho = 0.4
-        noise = generate_ar1_noise(
-            true_rho, n_timepoints=500, n_voxels=50, device=DEVICE
-        )
-        params = estimate_noise_parameters_from_data(
-            noise, ar_order=1, device=DEVICE
-        )
+        noise = generate_ar1_noise(true_rho, n_timepoints=500, n_voxels=50, device=DEVICE)
+        params = estimate_noise_parameters_from_data(noise, ar_order=1, device=DEVICE)
         # Should estimate close to true_rho
         estimated_rho = params["ar_coefficients"][0]
         assert abs(estimated_rho - true_rho) < 0.15
@@ -184,9 +184,7 @@ class TestEstimateNoiseParametersFromData:
         noise = torch.randn(n_tp, 20, device=DEVICE) * 0.5
         data = design @ betas + noise
 
-        params = estimate_noise_parameters_from_data(
-            data, design=design, ar_order=1, device=DEVICE
-        )
+        params = estimate_noise_parameters_from_data(data, design=design, ar_order=1, device=DEVICE)
         assert "ar_coefficients" in params
         assert "sfnr" in params
         assert "noise_std" in params
@@ -208,16 +206,15 @@ class TestEstimateNoiseParametersFromData:
         data = torch.randn(10, 100, device=DEVICE) + 50.0
         mask = torch.zeros(10, dtype=torch.bool)
         mask[:5] = True
-        params = estimate_noise_parameters_from_data(
-            data.T, mask=mask, device=DEVICE
-        )
+        params = estimate_noise_parameters_from_data(data.T, mask=mask, device=DEVICE)
         # Only masked voxels analyzed
         assert params["n_voxels"] == 5
 
     def test_ar2_estimation(self):
         params = estimate_noise_parameters_from_data(
             torch.randn(200, 10, device=DEVICE),
-            ar_order=2, device=DEVICE,
+            ar_order=2,
+            device=DEVICE,
         )
         assert len(params["ar_coefficients"]) == 2
 
@@ -226,9 +223,16 @@ class TestEstimateNoiseParametersFromData:
             torch.randn(100, 5, device=DEVICE), device=DEVICE
         )
         expected_keys = [
-            "ar_coefficients", "ar_coefficients_std", "ar_coefficients_all",
-            "sfnr", "sfnr_std", "sfnr_all", "noise_std",
-            "n_voxels", "n_timepoints", "summary",
+            "ar_coefficients",
+            "ar_coefficients_std",
+            "ar_coefficients_all",
+            "sfnr",
+            "sfnr_std",
+            "sfnr_all",
+            "noise_std",
+            "n_voxels",
+            "n_timepoints",
+            "summary",
         ]
         for key in expected_keys:
             assert key in params, f"Missing key: {key}"

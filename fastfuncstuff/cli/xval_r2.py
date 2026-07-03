@@ -20,10 +20,10 @@ import numpy as np
 import torch
 
 try:
-    from fastfuncstuff.io.afni import extract_design_metadata, load_nifti, read_afni_design_matrix
     from fastfuncstuff.cli_utils import parse_input_files, parse_prefix
-    from fastfuncstuff.utils import configure_torch_backends, get_device
     from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
+    from fastfuncstuff.io.afni import extract_design_metadata, load_nifti, read_afni_design_matrix
+    from fastfuncstuff.utils import configure_torch_backends, get_device
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")

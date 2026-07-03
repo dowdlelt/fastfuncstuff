@@ -1,5 +1,7 @@
 """Denoising: sequential PC selection and combinatorial subset evaluation."""
 
+from fastfuncstuff.denoise.nordic import NordicConfig, NordicOutputs, run_nordic
+from fastfuncstuff.denoise.sauna import SaunaConfig, SaunaOutputs, run_sauna
 from fastfuncstuff.denoise.sequential import (
     DenoiseResults,
     compute_full_brain_pc_loadings,
@@ -8,8 +10,6 @@ from fastfuncstuff.denoise.sequential import (
     fit_denoising_model,
     select_noise_pool_voxels,
 )
-from fastfuncstuff.denoise.nordic import NordicConfig, NordicOutputs, run_nordic
-from fastfuncstuff.denoise.sauna import SaunaConfig, SaunaOutputs, run_sauna
 
 __all__ = [
     "DenoiseResults",

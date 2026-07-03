@@ -87,6 +87,7 @@ pipeline with :func:`deconvolve_event_duration` (raises
 lives.  The library sidecar JSON should record the per-group event
 durations so a future stage can apply the deconvolution after the fact.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -96,7 +97,6 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 from scipy.optimize import curve_fit
 from scipy.stats import gamma as _gamma
-
 
 # ----------------------------------------------------------------------------
 # Voxel selection
@@ -246,9 +246,7 @@ def svd_decompose(
         raise ValueError(f"betas must be 2D (n_voxels, n_lags); got shape {betas.shape}")
     n_voxels, n_lags = betas.shape
     if n_pcs > min(n_voxels, n_lags):
-        raise ValueError(
-            f"n_pcs={n_pcs} exceeds min(n_voxels={n_voxels}, n_lags={n_lags})"
-        )
+        raise ValueError(f"n_pcs={n_pcs} exceeds min(n_voxels={n_voxels}, n_lags={n_lags})")
 
     if unit_normalize:
         norms = np.linalg.norm(betas, axis=1, keepdims=True)
@@ -258,7 +256,7 @@ def svd_decompose(
         # numerical sinks and would otherwise contribute a 0-vector
         # row that biases SVD's right-singular vectors by nothing
         # but also wastes a left-singular slot.
-        keep = (norms.squeeze() > 1e-12)
+        keep = norms.squeeze() > 1e-12
         work = work[keep]
     else:
         work = betas
@@ -267,7 +265,7 @@ def svd_decompose(
     # full_matrices=False keeps U as (n_voxels, k) with k=min(n_voxels,n_lags);
     # we do not need the full (n_voxels, n_voxels) left-singular basis.
     U, S, Vt = np.linalg.svd(work, full_matrices=False)
-    pcs = Vt[:n_pcs]                                   # (n_pcs, n_lags)
+    pcs = Vt[:n_pcs]  # (n_pcs, n_lags)
 
     if sign_align:
         # Flip each PC so the largest-magnitude sample is positive.
@@ -391,11 +389,9 @@ def _fibonacci_sphere(n: int) -> np.ndarray:
     Uses the golden-angle spiral.  Returns shape ``(n, 3)``.
     """
     indices = np.arange(n, dtype=np.float64) + 0.5
-    phi = np.arccos(1 - 2 * indices / n)              # polar angle in [0, π]
-    theta = np.pi * (1 + 5**0.5) * indices            # golden-angle azimuth
-    return np.column_stack(
-        [np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)]
-    )
+    phi = np.arccos(1 - 2 * indices / n)  # polar angle in [0, π]
+    theta = np.pi * (1 + 5**0.5) * indices  # golden-angle azimuth
+    return np.column_stack([np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)])
 
 
 def trace_manifold_auto(
@@ -475,15 +471,15 @@ def trace_manifold_auto(
     if data.size == 0:
         raise ValueError("No non-zero unit vectors to trace.")
 
-    grid = _fibonacci_sphere(n_grid)                  # (n_grid, 3)
+    grid = _fibonacci_sphere(n_grid)  # (n_grid, 3)
     bw = np.deg2rad(bandwidth_deg)
-    density = _spherical_kde(grid, data, bw)          # (n_grid,)
+    density = _spherical_kde(grid, data, bw)  # (n_grid,)
 
     # Cosines for angular-distance comparisons.
     step_rad = np.deg2rad(angular_step_deg)
-    step_lo = np.cos(step_rad * 1.2)                  # widest accepted distance
-    step_hi = np.cos(step_rad * 0.8)                  # narrowest accepted distance
-    back_cos = np.cos(step_rad * 0.7)                 # min distance from prior points
+    step_lo = np.cos(step_rad * 1.2)  # widest accepted distance
+    step_hi = np.cos(step_rad * 0.8)  # narrowest accepted distance
+    back_cos = np.cos(step_rad * 0.7)  # min distance from prior points
 
     peak_idx = int(density.argmax())
     peak_dens = float(density[peak_idx])
@@ -501,8 +497,8 @@ def trace_manifold_auto(
             break
 
         # Forbid points too close to *any* prior visited point (no backtrack).
-        visited_arr = np.stack(visited)               # (k, 3)
-        cos_to_prior = grid @ visited_arr.T           # (n_grid, k)
+        visited_arr = np.stack(visited)  # (k, 3)
+        cos_to_prior = grid @ visited_arr.T  # (n_grid, k)
         not_too_close = (cos_to_prior <= back_cos).all(axis=1)
 
         valid = annulus & not_too_close
@@ -562,12 +558,10 @@ def trace_manifold_grid(unit_vectors: np.ndarray, n_points: int = 20) -> np.ndar
     nz = np.linalg.norm(unit_vectors, axis=1) > 0.5
     data = unit_vectors[nz]
     if data.shape[0] < n_points:
-        raise ValueError(
-            f"Need at least n_points={n_points} unit vectors; got {data.shape[0]}"
-        )
+        raise ValueError(f"Need at least n_points={n_points} unit vectors; got {data.shape[0]}")
     mean = data.mean(axis=0, keepdims=True)
     _, _, vt = np.linalg.svd(data - mean, full_matrices=False)
-    axis = vt[0]                                      # primary direction (K,)
+    axis = vt[0]  # primary direction (K,)
     proj = data @ axis
     order = np.argsort(proj)
     pct = np.linspace(0, len(order) - 1, n_points).astype(int)
@@ -812,9 +806,7 @@ def deconvolve_event_duration(
         If ``method`` is anything other than ``"wiener"``.
     """
     if method != "wiener":
-        raise NotImplementedError(
-            f"Only method='wiener' is implemented; got {method!r}"
-        )
+        raise NotImplementedError(f"Only method='wiener' is implemented; got {method!r}")
     if duration <= dt:
         # Impulse-like — convolving with a 1-sample boxcar is a no-op,
         # and dividing by its spectrum (≈ flat) would just amplify noise.
@@ -836,7 +828,7 @@ def deconvolve_event_duration(
     box = np.zeros(n_fft, dtype=np.float64)
     box[:n_box] = 1.0
     BOX = np.fft.rfft(box)
-    BOX_mag_sq = (BOX.real**2 + BOX.imag**2)
+    BOX_mag_sq = BOX.real**2 + BOX.imag**2
     # Wiener filter kernel in frequency domain.  Computed once, reused
     # for every library row.
     wiener_kernel = np.conj(BOX) / (BOX_mag_sq + 1.0 / snr)
@@ -923,16 +915,14 @@ def reconstruct_timecourses(
     oscillating tails that early versions of ``ffs_librarian`` emitted.
     """
     if pcs.shape[0] != manifold.shape[1]:
-        raise ValueError(
-            f"manifold K ({manifold.shape[1]}) does not match pcs K ({pcs.shape[0]})"
-        )
+        raise ValueError(f"manifold K ({manifold.shape[1]}) does not match pcs K ({pcs.shape[0]})")
     if pcs.shape[1] != lag_times.shape[0]:
         raise ValueError(
             f"pcs has {pcs.shape[1]} lags but lag_times has {lag_times.shape[0]} entries"
         )
 
     # Reconstruct at the original FIR/TENT grid first.
-    waveforms_coarse = manifold @ pcs                 # (n_points, n_lags)
+    waveforms_coarse = manifold @ pcs  # (n_points, n_lags)
 
     if target_duration is None:
         target_duration = float(lag_times[-1])
@@ -1048,15 +1038,13 @@ def fit_double_gamma(
     """
     if bounds is None:
         bounds = (
-            (2.0, 0.3, 6.0, 0.3, 0.0),                # lower
-            (12.0, 5.0, 30.0, 5.0, 1.0),              # upper
+            (2.0, 0.3, 6.0, 0.3, 0.0),  # lower
+            (12.0, 5.0, 30.0, 5.0, 1.0),  # upper
         )
     t = np.arange(timecourse.size) * dt
 
     try:
-        popt, _ = curve_fit(
-            _double_gamma, t, timecourse, p0=p0, bounds=bounds, maxfev=maxfev
-        )
+        popt, _ = curve_fit(_double_gamma, t, timecourse, p0=p0, bounds=bounds, maxfev=maxfev)
         fitted = _double_gamma(t, *popt)
         if normalize_peak:
             peak = float(np.max(fitted))
@@ -1072,7 +1060,7 @@ def fit_double_gamma(
             "fit_ok": True,
             "residual_rms": residual,
         }
-    except Exception as exc:                          # noqa: BLE001 — silent fallback
+    except Exception as exc:  # noqa: BLE001 — silent fallback
         return timecourse.copy(), {
             "a1": float("nan"),
             "b1": float("nan"),
@@ -1098,14 +1086,18 @@ class LibraryResult:
     pieces to TSV/JSON.
     """
 
-    raw: np.ndarray                  # (n_hrfs, n_target) — pchip recon BEFORE deconv
-    target_times: np.ndarray         # (n_target,)
-    manifold: np.ndarray             # (n_hrfs, n_pcs) — points on the unit sphere
+    raw: np.ndarray  # (n_hrfs, n_target) — pchip recon BEFORE deconv
+    target_times: np.ndarray  # (n_target,)
+    manifold: np.ndarray  # (n_hrfs, n_pcs) — points on the unit sphere
     svd: SVDResult
-    selected_voxels: np.ndarray      # indices into the original FIR betas
-    fitted: np.ndarray | None = None        # (n_hrfs, n_target) — double-gamma fits, or None
-    raw_deconvolved: np.ndarray | None = None  # (n_hrfs, n_target) — pchip recon AFTER duration deconv (impulse)
-    fitted_deconvolved: np.ndarray | None = None  # (n_hrfs, n_target) — double-gamma fit OF the impulse curves
+    selected_voxels: np.ndarray  # indices into the original FIR betas
+    fitted: np.ndarray | None = None  # (n_hrfs, n_target) — double-gamma fits, or None
+    raw_deconvolved: np.ndarray | None = (
+        None  # (n_hrfs, n_target) — pchip recon AFTER duration deconv (impulse)
+    )
+    fitted_deconvolved: np.ndarray | None = (
+        None  # (n_hrfs, n_target) — double-gamma fit OF the impulse curves
+    )
     gamma_params: list[dict] = field(default_factory=list)
     gamma_params_deconvolved: list[dict] = field(default_factory=list)
     # Provenance for the future deconvolution step (see module docstring).
@@ -1117,9 +1109,9 @@ class LibraryResult:
     duration_convolved: bool = True
     # QC artifacts.  These exist so the caller can write inspection
     # plots and TSVs without re-running the SVD or the projection.
-    mean_fir_hrf: np.ndarray | None = None     # (n_lags,) — pooled task HRF
+    mean_fir_hrf: np.ndarray | None = None  # (n_lags,) — pooled task HRF
     unit_sphere_points: np.ndarray | None = None  # (n_selected, n_pcs)
-    sphere_hist2d: np.ndarray | None = None    # (n_bins, n_bins) if n_pcs=3
+    sphere_hist2d: np.ndarray | None = None  # (n_bins, n_bins) if n_pcs=3
     sphere_hist_edges: np.ndarray | None = None  # (n_bins+1,) for both axes
 
 
@@ -1227,7 +1219,9 @@ def derive_library(
     # any other "constant signal, high R²" failure mode.
     selected_betas = betas[sel]
     fir_norms = np.linalg.norm(selected_betas, axis=1)
-    norm_floor = 1e-8 * max(float(np.median(fir_norms[fir_norms > 0])) if (fir_norms > 0).any() else 1.0, 1.0)
+    norm_floor = 1e-8 * max(
+        float(np.median(fir_norms[fir_norms > 0])) if (fir_norms > 0).any() else 1.0, 1.0
+    )
     alive = fir_norms > norm_floor
     n_dropped = int((~alive).sum())
     if n_dropped > 0:
@@ -1245,6 +1239,7 @@ def derive_library(
         # Massive air-voxel contamination — the FIR fit may not be
         # capturing real signal anywhere either.  Tell the user.
         import warnings
+
         warnings.warn(
             f"derive_library: {n_dropped} of {sel.size + n_dropped} selected "
             f"voxels had zero-norm FIR betas (constant/air signal with R²=1). "
@@ -1288,9 +1283,7 @@ def derive_library(
     if n_pcs == 3:
         # Match NSD's bin grid (loadings ∈ [-1.5, 1.5], step 0.02).
         edges = np.arange(-1.5, 1.5 + 0.02, 0.02)
-        sphere_hist2d, _, _ = np.histogram2d(
-            unit[:, 1], unit[:, 2], bins=(edges, edges)
-        )
+        sphere_hist2d, _, _ = np.histogram2d(unit[:, 1], unit[:, 2], bins=(edges, edges))
         sphere_hist_edges = edges
 
     if manifold_mode == "auto":
@@ -1342,8 +1335,11 @@ def derive_library(
     duration_convolved_flag = True
     if deconvolve_duration is not None and deconvolve_duration > target_dt:
         raw_deconvolved = deconvolve_event_duration(
-            raw, duration=float(deconvolve_duration), dt=target_dt,
-            snr=deconv_snr, normalize_peak=True,
+            raw,
+            duration=float(deconvolve_duration),
+            dt=target_dt,
+            snr=deconv_snr,
+            normalize_peak=True,
         )
         if fit_gamma:
             # Re-fit the gamma family AGAINST the deconvolved curve, so

@@ -5,8 +5,6 @@ mapping as resample_affine_fast for small rigid rotations + shifts, which is
 the regime motion correction operates in.
 """
 
-import math
-
 import torch
 
 from fastfuncstuff.processing.affine import (

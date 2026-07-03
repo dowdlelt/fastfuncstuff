@@ -32,8 +32,9 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff.memory import bytes_per_voxel_arma, make_vram_debugger
 from fastfuncstuff.utils import get_device, to_tensor, warn_mps_float32_precision
-from fastfuncstuff.memory import make_vram_debugger, bytes_per_voxel_arma
+
 from .xval import compute_r2_metric
 
 
@@ -6122,7 +6123,6 @@ def save_arma_rvar(
     ----------
     AFNI 3dREMLfit: https://afni.nimh.nih.gov/pub/dist/doc/program_help/3dREMLfit.html
     """
-    import nibabel as nib
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

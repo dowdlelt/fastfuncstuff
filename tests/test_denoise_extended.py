@@ -5,11 +5,9 @@ Tests for uncovered functions in denoise/ modules:
 """
 
 import numpy as np
-import pytest
 import torch
 
 from fastfuncstuff.denoise.combinatorial import (
-    CombinatorialDenoiseRunResult,
     evaluate_all_combinations_for_run,
     extract_pcs_single_run_with_variance,
     generate_all_pc_combinations,
@@ -40,8 +38,14 @@ class TestEvaluateAllCombinationsForRun:
         var_ratios = np.array([0.3, 0.2, 0.1])
 
         median_cod, var_explained = evaluate_all_combinations_for_run(
-            run_data, design, betas, poly_nuis, noise_pcs,
-            combos, var_ratios, device=DEVICE,
+            run_data,
+            design,
+            betas,
+            poly_nuis,
+            noise_pcs,
+            combos,
+            var_ratios,
+            device=DEVICE,
         )
 
         assert median_cod.shape == (len(combos),)
@@ -97,9 +101,7 @@ class TestSelectOptimalCombination:
         combos = [(), (0,), (1,), (0, 1)]
         median_cod = np.array([0.1, 0.5, 0.3, 0.45])
 
-        best_idx, best_combo = select_optimal_combination(
-            median_cod, combos, strategy="argmax"
-        )
+        best_idx, best_combo = select_optimal_combination(median_cod, combos, strategy="argmax")
         assert best_idx == 1  # (0,) has highest CoD=0.5
         assert best_combo == (0,)
 
@@ -126,7 +128,11 @@ class TestExtractPcsSingleRunWithVariance:
         nuisance = torch.ones(T, 1)
 
         pcs, var_ratios = extract_pcs_single_run_with_variance(
-            data, mask, nuisance, max_components=5, device=DEVICE,
+            data,
+            mask,
+            nuisance,
+            max_components=5,
+            device=DEVICE,
         )
         assert pcs.shape == (T, 5)
         assert var_ratios.shape == (5,)
@@ -142,7 +148,11 @@ class TestExtractPcsSingleRunWithVariance:
         nuisance = torch.ones(60, 1)
 
         pcs, _ = extract_pcs_single_run_with_variance(
-            data, mask, nuisance, max_components=3, device=DEVICE,
+            data,
+            mask,
+            nuisance,
+            max_components=3,
+            device=DEVICE,
         )
         for i in range(3):
             assert abs(pcs[:, i].std().item() - 1.0) < 0.15
@@ -158,7 +168,8 @@ class TestSelectNoisePoolVoxels:
         r2[50:] = -0.1
 
         noise_mask, criteria_mask = select_noise_pool_voxels(
-            r2, threshold=0.0,
+            r2,
+            threshold=0.0,
         )
         assert noise_mask.shape == (n_voxels,)
         assert noise_mask.dtype == torch.bool
@@ -194,8 +205,12 @@ class TestExtractNoisePcsPerRun:
         noise_mask[:40] = True
 
         pcs = extract_noise_pcs_per_run(
-            data, run_starts, noise_mask, max_components=3,
-            device=DEVICE, verbose=False,
+            data,
+            run_starts,
+            noise_mask,
+            max_components=3,
+            device=DEVICE,
+            verbose=False,
         )
         assert len(pcs) == 3  # One per run
         for pc in pcs:
