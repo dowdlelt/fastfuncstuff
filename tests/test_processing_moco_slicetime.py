@@ -171,7 +171,6 @@ class TestGaussNewtonRigid:
         weight = compute_weight_image(base).to(DEV)
         derivs = compute_derivative_images(base, DEV)
 
-        N = base.numel()
         base_flat = base.reshape(-1)
         weight_flat = weight.reshape(-1)
 

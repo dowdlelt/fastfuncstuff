@@ -435,7 +435,6 @@ class TestMocoIntegration:
 
         assert result.aligned.shape == ts.shape
         # After correction, aligned volumes should be closer to base
-        base_flat = base.reshape(-1)
         for t in range(1, 4):
             rms_before = float(torch.sqrt(((ts[t] - base) ** 2).mean()))
             rms_after = float(torch.sqrt(((result.aligned[t] - base) ** 2).mean()))
@@ -567,7 +566,7 @@ class TestMocoIntegration:
             verb=1,
             compile=False,
         )
-        result = moco(ts, cfg)
+        moco(ts, cfg)
         captured = capsys.readouterr()
         assert "ffs_moco" in captured.out
 

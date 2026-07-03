@@ -41,6 +41,7 @@ def _interp_dtype(device: torch.device) -> torch.dtype:
 # Slice timing loading
 # ---------------------------------------------------------------------------
 
+
 def load_slice_timing(path: str | Path) -> list[float]:
     """Load slice timing from a text file or BIDS sidecar JSON.
 
@@ -74,6 +75,7 @@ def load_slice_timing(path: str | Path) -> list[float]:
 # Linear detrend / retrend  (batched, works on any (N, nt) tensor)
 # ---------------------------------------------------------------------------
 
+
 def _linear_detrend(ts: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     """Remove mean + linear trend from (n_vox, nt) time series."""
     nt = ts.shape[1]
@@ -102,6 +104,7 @@ def _linear_retrend(ts: Tensor, intercepts: Tensor, slopes: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 # Interpolation kernels — all operate on (n_vox, nt) batches
 # ---------------------------------------------------------------------------
+
 
 def _next_fft_size(n: int) -> int:
     """Next integer >= n that is a product of 2, 3, and 5 only."""
@@ -206,9 +209,9 @@ def _sinc(x: Tensor) -> Tensor:
 
 def _m3_window(x: Tensor) -> Tensor:
     """Minimum-sidelobe 3-term window.  Zero for |x| > 1."""
-    result = (0.4243801
-              + 0.4973406 * torch.cos(math.pi * x)
-              + 0.0782793 * torch.cos(2.0 * math.pi * x))
+    result = (
+        0.4243801 + 0.4973406 * torch.cos(math.pi * x) + 0.0782793 * torch.cos(2.0 * math.pi * x)
+    )
     result[x.abs() > 1.0] = 0.0
     return result
 
@@ -225,8 +228,7 @@ def _shift_wsinc(ts: Tensor, frac_shift: float, half_width: int) -> Tensor:
     aa = af - ia
 
     n_pts = 2 * half_width
-    offsets = torch.arange(-(half_width - 1), half_width + 1,
-                           dtype=dtype, device=ts.device)
+    offsets = torch.arange(-(half_width - 1), half_width + 1, dtype=dtype, device=ts.device)
     dist = aa - offsets
     weights = _sinc(dist) * _m3_window(dist / half_width)
     wsum = weights.sum()
@@ -250,6 +252,7 @@ def _shift_wsinc(ts: Tensor, frac_shift: float, half_width: int) -> Tensor:
 # ---------------------------------------------------------------------------
 # Shift dispatcher
 # ---------------------------------------------------------------------------
+
 
 def shift_timeseries(ts: Tensor, frac_shift: float, method: str = "fourier") -> Tensor:
     """Shift a batch of time series by frac_shift samples.
@@ -289,6 +292,7 @@ def shift_timeseries(ts: Tensor, frac_shift: float, method: str = "fourier") -> 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def slicetime_correct(
     vol4d: Tensor,
@@ -332,20 +336,18 @@ def slicetime_correct(
         vol4d = vol4d.to(device)
 
     nt, nz, ny, nx = vol4d.shape
-    n_vox_per_slice = ny * nx
 
     if len(slice_timing) != nz:
-        raise ValueError(
-            f"slice_timing has {len(slice_timing)} entries but volume has "
-            f"{nz} slices"
-        )
+        raise ValueError(f"slice_timing has {len(slice_timing)} entries but volume has {nz} slices")
 
     if tzero is None:
         tzero = sum(slice_timing) / len(slice_timing)
 
     if verbose:
-        print(f"  slicetime: {nz} slices, TR={tr:.4f}s, tzero={tzero:.4f}s, "
-              f"method={method}, device={vol4d.device}")
+        print(
+            f"  slicetime: {nz} slices, TR={tr:.4f}s, tzero={tzero:.4f}s, "
+            f"method={method}, device={vol4d.device}"
+        )
 
     nt_shift = nt - ignore
     out = vol4d.clone()
@@ -398,7 +400,8 @@ def slicetime_correct(
         # 6. Retrend (float64 for accumulation precision; float32 on MPS)
         ts_shifted = _linear_retrend(
             ts_shifted.to(_interp_dtype(ts.device)),
-            intercepts, slopes,
+            intercepts,
+            slopes,
         ).to(ts.dtype)
 
         # 7. Clip to original range
@@ -413,8 +416,10 @@ def slicetime_correct(
     pbar.close()
 
     if verbose:
-        print(f"  slicetime: {nz} slices done, {len(shift_groups)} unique shifts "
-              f"({n_skip} at tzero, skipped)")
+        print(
+            f"  slicetime: {nz} slices done, {len(shift_groups)} unique shifts "
+            f"({n_skip} at tzero, skipped)"
+        )
 
     return out
 
@@ -477,7 +482,6 @@ def temporal_resample(
     for kk in range(nz):
         # (ny*nx, nt_old) — each voxel's time series as a row
         ts = vol4d[:, kk, :, :].reshape(nt_old, -1).T.to(grid_dtype)
-        n_vox = ts.shape[0]
 
         if method == "linear":
             # Find insertion indices for t_new in t_old

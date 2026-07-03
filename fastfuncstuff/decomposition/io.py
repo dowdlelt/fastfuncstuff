@@ -103,7 +103,7 @@ def _compute_psc(
         mix_std = np.asarray(mixing_amplitude_k, dtype=np.float64).ravel()  # (K,)
     else:
         mix_std = np.asarray(mixing_tk, dtype=np.float64).std(axis=0)  # (K,)
-    comp = np.asarray(raw_components_kv, dtype=np.float64)          # (K, V)
+    comp = np.asarray(raw_components_kv, dtype=np.float64)  # (K, V)
     mean_v = np.asarray(masked_mean_v, dtype=np.float64)
 
     pos = mean_v[mean_v > 0]
@@ -112,7 +112,9 @@ def _compute_psc(
 
     if varnorm_std_v is not None:
         std_v = np.asarray(varnorm_std_v, dtype=np.float64).ravel()
-        psc = (100.0 * mix_std[:, None] * comp * std_v[None, :] / safe_mean[None, :]).astype(np.float32)
+        psc = (100.0 * mix_std[:, None] * comp * std_v[None, :] / safe_mean[None, :]).astype(
+            np.float32
+        )
     else:
         psc = (100.0 * mix_std[:, None] * comp / safe_mean[None, :]).astype(np.float32)
 
@@ -143,7 +145,6 @@ def _write_interleaved_stat_bucket(
     import subprocess
 
     k = vol1_kv.shape[0]
-    n_vox = vol1_kv.shape[1]
     n_digits = len(str(k))
 
     out_4d = np.zeros((*shape3d, 2 * k), dtype=np.float32)
@@ -199,6 +200,7 @@ def _write_interleaved_stat_bucket(
 
     if tmp_path != out_file:
         from fastfuncstuff.io.afni import compress_nifti
+
         compress_nifti(str(tmp_path), str(out_file), remove_original=True)
 
     return out_file
@@ -342,6 +344,7 @@ def write_melodic_compat_outputs(
     n_k = component_explained_share_pct.shape[0]
     if comp_kv_for_stats is not None and comp_kv_for_stats.shape[0] >= n_k:
         from scipy.stats import kurtosis as _kurt
+
         ic_kurt = np.asarray([_kurt(comp_kv_for_stats[i]) for i in range(n_k)], dtype=np.float64)
     else:
         ic_kurt = np.zeros(n_k, dtype=np.float64)
@@ -349,12 +352,14 @@ def write_melodic_compat_outputs(
         ic_signal = np.asarray([float(np.mean(p_maps[i])) for i in range(n_k)], dtype=np.float64)
     else:
         ic_signal = np.zeros(n_k, dtype=np.float64)
-    icstats = np.column_stack([
-        component_explained_share_pct,
-        component_total_share_pct,
-        ic_kurt,
-        ic_signal,
-    ])
+    icstats = np.column_stack(
+        [
+            component_explained_share_pct,
+            component_total_share_pct,
+            ic_kurt,
+            ic_signal,
+        ]
+    )
     np.savetxt(compat / "melodic_ICstats", icstats, fmt="%.8f")
     np.savetxt(compat / "eigenvalues_percent", pca_scree_ratio * 100.0, fmt="%.8f")
 
@@ -383,7 +388,9 @@ def write_melodic_compat_outputs(
         # Pre-compute masked mean for PSC (needed for both psc_prob bucket and
         # per-component stats when oic is available).
         flat_mean = np.asarray(mean3d, dtype=np.float64).reshape(-1)
-        masked_mean_v = flat_mean[mask3d.reshape(-1).astype(bool)] if mask3d is not None else flat_mean
+        masked_mean_v = (
+            flat_mean[mask3d.reshape(-1).astype(bool)] if mask3d is not None else flat_mean
+        )
 
         if write_per_comp_stats and z_maps is not None and p_maps is not None:
             n_comp = z_maps.shape[0]
@@ -392,13 +399,17 @@ def write_melodic_compat_outputs(
                 tag = str(i + 1).zfill(n_digits)
                 save_masked_component_map_3d(
                     component_v=p_maps[i],
-                    mask3d=mask3d, shape3d=shape3d, affine=affine,
+                    mask3d=mask3d,
+                    shape3d=shape3d,
+                    affine=affine,
                     out_file=stats_dir / f"probmap_{tag}.nii.gz",
                 )
                 if thresh_z_maps is not None:
                     save_masked_component_map_3d(
                         component_v=thresh_z_maps[i],
-                        mask3d=mask3d, shape3d=shape3d, affine=affine,
+                        mask3d=mask3d,
+                        shape3d=shape3d,
+                        affine=affine,
                         out_file=stats_dir / f"thresh_zstat{tag}.nii.gz",
                     )
 
@@ -406,7 +417,9 @@ def write_melodic_compat_outputs(
             n_k = min(oic_components_kv.shape[0], p_maps.shape[0])
             amp_k = mixing_amplitude_k[:n_k] if mixing_amplitude_k is not None else None
             psc_kv = _compute_psc(
-                oic_components_kv[:n_k], mixing_np[:, :n_k], masked_mean_v,
+                oic_components_kv[:n_k],
+                mixing_np[:, :n_k],
+                masked_mean_v,
                 varnorm_std_v=varnorm_std_v,
                 mixing_amplitude_k=amp_k,
                 psc_clip=psc_clip,
@@ -417,7 +430,9 @@ def write_melodic_compat_outputs(
                 label1="PSC",
                 label2="Prob",
                 out_file=stats_dir / "psc_prob.nii.gz",
-                mask3d=mask3d, shape3d=shape3d, affine=affine,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
             )
 
         if write_zp and z_maps is not None and p_maps is not None:
@@ -428,7 +443,9 @@ def write_melodic_compat_outputs(
                 label1="Z",
                 label2="Prob",
                 out_file=stats_dir / "z_prob.nii.gz",
-                mask3d=mask3d, shape3d=shape3d, affine=affine,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
                 stat1_type="fizt",
             )
 

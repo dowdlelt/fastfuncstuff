@@ -227,7 +227,6 @@ class FastICA:
         # X_pca = X @ (white @ X)^T... but simpler: X_pca = dewhite scaled)
         # Actually: X_pca_i = U_i * sqrt(lambda_i) for whitened PCA
         # The mixing matrix needs projected timeseries, compute directly:
-        X_pca = X @ pca_components_all.T  # (T, k)
 
         # Determine number of ICA components
         n_comp_req = self.n_components
@@ -383,9 +382,7 @@ class FastICA:
         if w_init is not None:
             W = w_init.to(device=self.device, dtype=orig_dtype)
         else:
-            W = torch.randn(
-                n_components, n_features, device=self.device, dtype=orig_dtype
-            )
+            W = torch.randn(n_components, n_features, device=self.device, dtype=orig_dtype)
 
         # Initial symmetric decorrelation
         W = self._symmetric_decorrelation(W)
@@ -405,8 +402,12 @@ class FastICA:
             torch.backends.cuda.matmul.allow_tf32 = False
 
         # FastICA iterations
-        pbar = tqdm(range(self.max_iter), desc="FastICA", leave=True,
-                    disable=not getattr(self, 'verbose', True))
+        pbar = tqdm(
+            range(self.max_iter),
+            desc="FastICA",
+            leave=True,
+            disable=not getattr(self, "verbose", True),
+        )
         for n_iter in pbar:  # noqa: B007
             W_old = W.clone()
 
@@ -538,8 +539,7 @@ class FastICA:
 
         else:
             raise ValueError(
-                f"Unknown nonlinearity: '{fun}'. "
-                "Use 'logcosh', 'exp', 'cube', or 'pow3'"
+                f"Unknown nonlinearity: '{fun}'. Use 'logcosh', 'exp', 'cube', or 'pow3'"
             )
 
     @staticmethod
@@ -624,8 +624,7 @@ class FastICA:
 
         else:
             raise ValueError(
-                f"Unknown nonlinearity: '{fun}'. "
-                "Use 'logcosh', 'exp', 'cube', or 'pow3'"
+                f"Unknown nonlinearity: '{fun}'. Use 'logcosh', 'exp', 'cube', or 'pow3'"
             )
 
     @torch.inference_mode()
@@ -842,7 +841,6 @@ class InfoMaxICA:
         white = torch.diag(1.0 / torch.sqrt(evals_k + 1e-12)) @ evecs_k.T
         dewhite = evecs_k @ torch.diag(torch.sqrt(evals_k))
         pca_components_all = white @ X  # (k, V)
-        X_pca = X @ pca_components_all.T  # (T, k)
 
         n_comp_req = self.n_components
         if n_comp_req is None:
@@ -951,8 +949,12 @@ class InfoMaxICA:
             torch.backends.cuda.matmul.allow_tf32 = False
 
         n_iter = 0
-        pbar = tqdm(range(self.max_iter), desc="InfoMax ICA", leave=True,
-                    disable=not getattr(self, 'verbose', True))
+        pbar = tqdm(
+            range(self.max_iter),
+            desc="InfoMax ICA",
+            leave=True,
+            disable=not getattr(self, "verbose", True),
+        )
         for step in pbar:
             n_iter = step
 
@@ -1040,7 +1042,9 @@ class InfoMaxICA:
         n_super = int((signs > 0).sum().item())
 
         diagnostics = {
-            "learning_rate_initial": 0.015 / math.log(max(n_comp, 2)) if self.learning_rate is None else self.learning_rate,
+            "learning_rate_initial": 0.015 / math.log(max(n_comp, 2))
+            if self.learning_rate is None
+            else self.learning_rate,
             "learning_rate_final": lr,
             "block_size": block,
             "n_blocks_per_epoch": n_vox // block,

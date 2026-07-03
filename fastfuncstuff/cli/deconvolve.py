@@ -453,7 +453,6 @@ def _labels_from_timing_files(timing_files: list[str]) -> list[str]:
 
     sep = "." if "." in stems[0] else "_"
     parts_list = [s.split(sep) for s in stems]
-    max_len = max(len(p) for p in parts_list)
     min_len = min(len(p) for p in parts_list)
 
     # Find common prefix length

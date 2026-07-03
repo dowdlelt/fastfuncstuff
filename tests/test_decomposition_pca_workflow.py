@@ -295,7 +295,6 @@ class TestExplainedVarianceAnalysis:
 
 class TestFilterVoxelsForMelodicModelOrder:
     def test_basic_filtering(self):
-        rng = np.random.default_rng(0)
         # Normal voxels + some low-variance voxels
         data = torch.randn(50, 30)
         data[:5, :] *= 1e-8  # very low variance

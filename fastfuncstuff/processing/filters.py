@@ -91,8 +91,10 @@ def savgol_filter_1d(
         return data.clone()
 
     kernel = _sgf_coefficients(
-        window_length, poly_order,
-        device=data.device, dtype=data.dtype,
+        window_length,
+        poly_order,
+        device=data.device,
+        dtype=data.dtype,
     )
 
     original_shape = data.shape
@@ -101,7 +103,6 @@ def savgol_filter_1d(
     elif data.dim() == 2:
         data = data.unsqueeze(1)
     else:
-        leading = data.shape[:-1]
         data = data.reshape(-1, 1, data.shape[-1])
 
     pad = window_length // 2
@@ -184,8 +185,6 @@ def savgol_filter_explore(
             score = metric_fn(filt)
             improved = score > best_score
             best_score = torch.where(improved, score, best_score)
-            best_filtered = torch.where(
-                improved.unsqueeze(-1), filt, best_filtered
-            )
+            best_filtered = torch.where(improved.unsqueeze(-1), filt, best_filtered)
 
     return best_filtered

@@ -1097,6 +1097,7 @@ def write_glm_bucket_as_nifti(
     # GLM output is a stats bucket, not an EPI timeseries — update AFNI type
     # so AFNI sees fbuc/3DIM_HEAD_FUNC rather than the inherited epan/3DIM_HEAD_ANAT
     from fastfuncstuff.io.afni import set_afni_func_type
+
     set_afni_func_type(bucket_img.header, func_code=11)
 
     # Normalize output path and detect format
@@ -1555,7 +1556,6 @@ def write_partial_r2_with_labels(
     # Create NIfTI
     if affine is None:
         affine = np.eye(4)
-    r2_img = nib.Nifti1Image(r2_partial_vol.astype(np.float32), affine)
 
     # Ensure output path is .nii (uncompressed for 3drefit)
     output_path = Path(output_path)
@@ -1788,7 +1788,6 @@ def save_single_trial_results(
 
     # 5. Plain text trial order (one line per trial: index condition run)
     order_path = f"{output_prefix}_single_trial_order.txt"
-    cond_ids = trial_condition_ids.cpu().tolist()
     run_ids = trial_run_ids.cpu().tolist()
     with open(order_path, "w") as f:
         f.write("# trial_index  condition  run\n")

@@ -22,7 +22,7 @@ _DEFAULT_STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
 _DEFAULT_HRF_MODEL = "SPMG1(3)"
 _DEFAULT_GLTS = [
     ("faces_vs_objects", "SYM: +1*faces -1*objects"),
-    ("faces_vs_scenes",  "SYM: +1*faces -1*scenes"),
+    ("faces_vs_scenes", "SYM: +1*faces -1*scenes"),
     ("faces_vs_scrambled", "SYM: +1*faces -1*scrambled"),
 ]
 
@@ -73,9 +73,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 
     afni_xmat = _afni_xmat(ctx)
     if not afni_xmat.exists():
-        missing.append(
-            f"{afni_xmat}  (run the 'glm' stage first to produce X.xmat.1D)"
-        )
+        missing.append(f"{afni_xmat}  (run the 'glm' stage first to produce X.xmat.1D)")
 
     timing_dir = ctx.timing_dir
     for label in _stim_labels(ctx):
@@ -125,10 +123,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         for label in _stim_labels(ctx)
     )
 
-    glt_args = " ".join(
-        f"-gltsym '{sym}' {label}"
-        for label, sym in _glts(ctx)
-    )
+    glt_args = " ".join(f"-gltsym '{sym}' {label}" for label, sym in _glts(ctx))
 
     elapsed, _ = run_timed(
         f"ffs_build_design "
@@ -155,32 +150,30 @@ def validate(ctx: BenchmarkContext) -> dict:
         return {"passed": False, "summary": "ffs_X.xmat.1D not found"}
 
     afni = read_afni_design_matrix(afni_xmat)
-    ffs  = read_afni_design_matrix(ffs_xmat)
+    ffs = read_afni_design_matrix(ffs_xmat)
 
     afni_mat = afni["matrix"]  # (n_tp, n_cols)
-    ffs_mat  = ffs["matrix"]
+    ffs_mat = ffs["matrix"]
 
     # Sanity: same shape
     if afni_mat.shape[0] != ffs_mat.shape[0]:
         return {
             "passed": False,
-            "summary": (
-                f"Timepoint mismatch: AFNI={afni_mat.shape[0]} FFS={ffs_mat.shape[0]}"
-            ),
+            "summary": (f"Timepoint mismatch: AFNI={afni_mat.shape[0]} FFS={ffs_mat.shape[0]}"),
         }
 
     # Extract stimulus columns by label from each xmat
     def _stim_cols(info: dict, mat: np.ndarray) -> dict[str, np.ndarray]:
         cols = {}
-        labels  = info.get("stim_labels") or []
-        bots    = info.get("stim_bots")   or []
-        tops    = info.get("stim_tops")   or []
+        labels = info.get("stim_labels") or []
+        bots = info.get("stim_bots") or []
+        tops = info.get("stim_tops") or []
         for label, bot, top in zip(labels, bots, tops, strict=False):
             cols[label] = mat[:, bot : top + 1]
         return cols
 
     afni_stims = _stim_cols(afni, afni_mat)
-    ffs_stims  = _stim_cols(ffs,  ffs_mat)
+    ffs_stims = _stim_cols(ffs, ffs_mat)
 
     common = sorted(set(afni_stims) & set(ffs_stims))
     if not common:
@@ -198,7 +191,7 @@ def validate(ctx: BenchmarkContext) -> dict:
         a_col = afni_stims[label]  # (n_tp, n_basis)
         f_col = ffs_stims[label]
         run_rs = []
-        for run_idx, (rstart, rend) in enumerate(zip(run_starts, run_ends, strict=False)):
+        for _run_idx, (rstart, rend) in enumerate(zip(run_starts, run_ends, strict=False)):
             a_seg = a_col[rstart:rend].ravel()
             f_seg = f_col[rstart:rend].ravel()
             # Skip runs where both sides are essentially flat (no events in this run)
@@ -210,15 +203,12 @@ def validate(ctx: BenchmarkContext) -> dict:
                 r = float(np.corrcoef(a_seg, f_seg)[0, 1])
             run_rs.append(r)
             rs.append(r)
-        per_label[label] = {
-            f"run{run_idx + 1}": round(r, 6)
-            for run_idx, r in enumerate(run_rs)
-        }
+        per_label[label] = {f"run{run_idx + 1}": round(r, 6) for run_idx, r in enumerate(run_rs)}
 
     if not rs:
         return {"passed": False, "summary": "No within-run variance found in any stim column"}
 
-    min_r  = float(np.min(rs))
+    min_r = float(np.min(rs))
     mean_r = float(np.mean(rs))
     passed = min_r >= THRESHOLD_MIN_R
 

@@ -660,7 +660,6 @@ def apply_affine_interp_batched(
     dtype = sources.dtype
     snz, sny, snx = sources.shape[1:]
     onz, ony, onx = output_shape if output_shape is not None else (snz, sny, snx)
-    N = onz * ony * onx
 
     # Build output coord grid once: (4, N)
     coords = _build_homo_coords((onz, ony, onx), device, dtype)

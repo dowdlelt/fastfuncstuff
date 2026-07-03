@@ -134,7 +134,6 @@ def _prepare_timing_files(ctx: BenchmarkContext) -> None:
 
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run 3dDeconvolve + 3dREMLfit."""
-    p = ctx.processing_dir
     afni = ctx.afni_glm_dir
     afni.mkdir(parents=True, exist_ok=True)
 
@@ -267,10 +266,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     for entry, name in zip(per_brick, _var_names):
         entry["name"] = name
         by_name[name] = entry["r"]
-    var_per = " ".join(
-        f"{name}={entry['r']:.3f}"
-        for entry, name in zip(per_brick, _var_names)
-    )
+    var_per = " ".join(f"{name}={entry['r']:.3f}" for entry, name in zip(per_brick, _var_names))
 
     passed = (
         ols_result["min_r"] >= THRESHOLDS["ols_beta_min_r"]

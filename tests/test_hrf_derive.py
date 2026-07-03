@@ -73,7 +73,6 @@ def test_select_voxels_threshold():
 
 
 def test_select_voxels_caps_at_max():
-    rng = np.random.default_rng(1)
     r2 = np.full(100, 0.5)
     sel = select_voxels(r2, threshold=0.1, max_voxels=20, seed=1)
     assert sel.size == 20

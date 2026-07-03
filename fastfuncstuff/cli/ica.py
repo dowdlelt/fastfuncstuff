@@ -927,7 +927,7 @@ def _run_single_ica(
     save_items = [
         (comp_np, f"{out_prefix}_{run_tag}_ica_maps{nii_ext}", "maps"),
     ]
-    for data_arr, fname, label in tqdm(
+    for data_arr, fname, _label in tqdm(
         save_items, desc="  Saving NIfTI", leave=False, disable=not args.verb >= 1
     ):
         decomposition_io.save_masked_component_maps_4d(

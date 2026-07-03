@@ -385,7 +385,7 @@ def _build_multirun_synth(
     basis_tr = basis.basis_functions[:, :: max(int(round(tr / basis.dt)), 1)]
     per_run_data: list = []
     per_run_task: list = []
-    for r in range(n_runs):
+    for _r in range(n_runs):
         onset_idx = np.sort(rng.choice(np.arange(8, n_tp_run - 30), size=7, replace=False))
         X = np.zeros((n_tp_run, K))
         on = np.zeros(n_tp_run)

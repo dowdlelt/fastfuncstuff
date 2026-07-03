@@ -984,8 +984,6 @@ def run_sauna(
     else:
         ii_np = mag_np.astype(np.complex64)
 
-    is_complex = not cfg.magnitude_only and phase_np is not None
-
     # ABSOLUTE_SCALE normalization (same as NORDIC)
     tempvol = np.abs(ii_np[..., 0])
     nonzero = tempvol[tempvol != 0]

@@ -824,7 +824,6 @@ def main() -> int:
     )
     data = load_result.data
     run_starts = load_result.run_starts
-    affine = load_result.affine
     volume_shape = load_result.volume_shape
     tr = load_result.tr
     mask = load_result.mask
