@@ -952,6 +952,17 @@ def load_and_concatenate_runs(
         del data_np, img
         gc.collect()
 
+        # All runs must share the voxel dimension to concatenate along time.
+        # A mismatch means the runs are on different spatial grids (e.g. resampled
+        # to a template without a shared -master), which torch.cat only reports as
+        # an opaque size error -- name the offending run and grids instead.
+        if torch_runs and data_torch.shape[0] != torch_runs[0].shape[0]:
+            raise ValueError(
+                f"Run {i} ({run_file}) has {data_torch.shape[0]} voxels but run 0 "
+                f"({run_files[0]}) has {torch_runs[0].shape[0]}. All runs must be on "
+                f"the same spatial grid; resample every run to a shared -master."
+            )
+
         torch_runs.append(data_torch)
 
         # Track run start for next run
@@ -1280,9 +1291,7 @@ def select_regressors_by_group(
     return matrix[:, selected_cols]
 
 
-def read_censor_1d(
-    filepath: str | Path, n_expected: int | None = None
-) -> list[int]:
+def read_censor_1d(filepath: str | Path, n_expected: int | None = None) -> list[int]:
     """Read an AFNI-style censor ``.1D`` file into a GoodList.
 
     The file is one value per concatenated timepoint (length = total TRs across
@@ -1312,15 +1321,13 @@ def read_censor_1d(
     values = np.loadtxt(filepath).reshape(-1)
     if values.ndim != 1:
         raise ValueError(
-            f"Censor file {filepath} must be a single column; got shape "
-            f"{values.shape}"
+            f"Censor file {filepath} must be a single column; got shape {values.shape}"
         )
 
     uniq = set(np.unique(values).tolist())
     if not uniq <= {0.0, 1.0}:
         raise ValueError(
-            f"Censor file {filepath} must contain only 0 and 1; found "
-            f"values {sorted(uniq)}"
+            f"Censor file {filepath} must contain only 0 and 1; found values {sorted(uniq)}"
         )
 
     if n_expected is not None and len(values) != n_expected:
@@ -2064,9 +2071,7 @@ def _set_afni_brick_stataux(
         code, params = stataux[idx]
         stataux_floats.extend([float(idx), float(code), float(len(params))])
         stataux_floats.extend(float(p) for p in params)
-    syms = ";".join(
-        _statsym_for(*stataux[i]) if i in stataux else "none" for i in range(n_sub)
-    )
+    syms = ";".join(_statsym_for(*stataux[i]) if i in stataux else "none" for i in range(n_sub))
     aux_body = " " + "\n ".join(f"{v:g}" for v in stataux_floats)
     atr = (
         "<AFNI_atr\n"
