@@ -43,7 +43,6 @@ except ImportError:
 
 # Import for R² metric computation
 from fastfuncstuff.glm.xval import compute_r2_metric
-from fastfuncstuff.utils import accum_dtype
 
 
 def _gpu_interp_fracs(
@@ -60,16 +59,16 @@ def _gpu_interp_fracs(
     Returns (n_fracs, n_targets) log-alpha values on the same device.
     """
     n_alphas, n_targets = newlen_flipped.shape
-    xp = newlen_flipped.T.contiguous()                        # (n_targets, n_alphas)
-    xi = fracs.unsqueeze(0).expand(n_targets, -1)             # (n_targets, n_fracs)
+    xp = newlen_flipped.T.contiguous()  # (n_targets, n_alphas)
+    xi = fracs.unsqueeze(0).expand(n_targets, -1)  # (n_targets, n_fracs)
     idx = torch.searchsorted(xp, xi.contiguous()).clamp(1, n_alphas - 1)
     idx0 = idx - 1
-    x0 = xp.gather(1, idx0)                                   # (n_targets, n_fracs)
+    x0 = xp.gather(1, idx0)  # (n_targets, n_fracs)
     x1 = xp.gather(1, idx)
-    y0 = log_alphagrid[idx0]                                  # (n_targets, n_fracs)
+    y0 = log_alphagrid[idx0]  # (n_targets, n_fracs)
     y1 = log_alphagrid[idx]
     t = ((xi - x0) / (x1 - x0 + 1e-30)).clamp(0.0, 1.0)
-    return (y0 + t * (y1 - y0)).T                             # (n_fracs, n_targets)
+    return (y0 + t * (y1 - y0)).T  # (n_fracs, n_targets)
 
 
 @torch.inference_mode()
@@ -195,7 +194,7 @@ def _fit_ridge_multiple_fracs(
     _ALPHA_FLOOR = 1e-30  # tiny constant so log10(0) stays finite
     # Keep log-alpha grid on device — no CPU roundtrip needed
     log_alphagrid_dev = torch.log10(alphagrid.flip(0) + _ALPHA_FLOOR)  # (n_alphas,)
-    fracs_dev = torch.tensor(fracs, device=device, dtype=X.dtype)      # (n_fracs,)
+    fracs_dev = torch.tensor(fracs, device=device, dtype=X.dtype)  # (n_fracs,)
 
     if not chunk_mode:
         # ====================================================================
@@ -217,7 +216,7 @@ def _fit_ridge_multiple_fracs(
             newlen.flip(0), log_alphagrid_dev, fracs_dev
         )  # (n_fracs, n_targets) on device
 
-        targetalphas_all = (10.0 ** log_target_alphas_all - _ALPHA_FLOOR).clamp(min=0.0)
+        targetalphas_all = (10.0**log_target_alphas_all - _ALPHA_FLOOR).clamp(min=0.0)
 
         if torch.isnan(targetalphas_all).any() or torch.isinf(targetalphas_all).any():
             targetalphas_all = torch.nan_to_num(targetalphas_all, nan=0.0, posinf=1e10, neginf=0.0)
@@ -263,7 +262,7 @@ def _fit_ridge_multiple_fracs(
                 newlen_chunk.flip(0), log_alphagrid_dev, fracs_dev
             )  # (n_fracs, chunk) on device
 
-            targetalphas = (10.0 ** log_target_alphas - _ALPHA_FLOOR).clamp(min=0.0)
+            targetalphas = (10.0**log_target_alphas - _ALPHA_FLOOR).clamp(min=0.0)
             if torch.isnan(targetalphas).any() or torch.isinf(targetalphas).any():
                 targetalphas = torch.nan_to_num(targetalphas, nan=0.0, posinf=1e10, neginf=0.0)
 
@@ -382,8 +381,8 @@ def create_single_trial_design(
     condition_design : torch.Tensor, shape (n_timepoints, n_conditions * n_basis)
         Condition-level design (sum of trials per condition, with basis functions)
     """
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
     from fastfuncstuff.design.hrf import get_canonical_hrf
+    from fastfuncstuff.design.matrices import convolve_hrf_microtime
 
     device = device or torch.device("cpu")
     n_conditions = len(onsets_by_condition)
@@ -1028,8 +1027,9 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     r2_initial_all = torch.zeros(chunk_voxels, device=device)
     r2_final_all = torch.zeros(chunk_voxels, device=device)
     xval_r2_all = torch.zeros(chunk_voxels, device=device)
-    # float64 on CUDA/CPU; MPS has no float64 so f32 (a fraction in [0,1]).
-    optimal_fracs_all = torch.zeros(chunk_voxels, device=device, dtype=accum_dtype(device))
+    # A selected fraction in [0,1], not an accumulator: float32 like its source
+    # (optimal_fracs is forced f32 for MPS) so the index_put scatter dtypes match.
+    optimal_fracs_all = torch.zeros(chunk_voxels, device=device)
     r2_by_frac_all = torch.zeros(chunk_voxels, n_fracs, device=device)
 
     # Process each group
