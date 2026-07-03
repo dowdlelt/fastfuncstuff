@@ -51,3 +51,24 @@ def reset_random_seed():
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
+
+
+@pytest.fixture(autouse=True)
+def isolate_float32_matmul_precision():
+    """Contain the global float32 matmul precision within each test.
+
+    CLI entry points call ``utils.configure_torch_backends``, which runs
+    ``torch.set_float32_matmul_precision("high")`` — a good default that
+    enables TF32 on CUDA for GLM/registration-style workloads. But it is a
+    *global, persistent* switch: once a CLI-exercising test flips it, every
+    later test inherits TF32's ~1e-3 matmul error. Precision-sensitive tests
+    (e.g. permutation t-stats validated against scipy at 1e-4) then pass or
+    fail purely on collection order. Snapshot before / restore after so no
+    test leaks the setting into the next; the chain keeps every test at the
+    import-time default unless it opts in explicitly.
+    """
+    prev = torch.get_float32_matmul_precision()
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev)
