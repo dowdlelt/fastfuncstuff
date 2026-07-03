@@ -69,8 +69,7 @@ Examples:
     io_group.add_argument(
         "-nwarp",
         required=True,
-        help="Warp chain (quoted, space-separated). "
-        "E.g., 'warp1.nii matrix.1D warp2.nii'",
+        help="Warp chain (quoted, space-separated). E.g., 'warp1.nii matrix.1D warp2.nii'",
     )
     io_group.add_argument(
         "-prefix", required=True, help="Output path for magnitude (or only output)"
@@ -132,10 +131,10 @@ Examples:
         "-no-autopad",
         dest="auto_pad",
         action="store_false",
-        help="Disable automatic output-grid padding. By default the grid grows "
-        "only when a warp would clip real source signal off the edge (overlap + "
-        "clipped-mass test, not raw displacement); disable for exact master-grid "
-        "output.",
+        help="Disable automatic output-grid padding. By default (master-less "
+        "case only) the grid grows when a warp would clip real source signal off "
+        "the edge (overlap + clipped-mass test, not raw displacement). An explicit "
+        "-master always fixes the output grid exactly, regardless of this flag.",
     )
     io_group.add_argument(
         "-expad",
@@ -228,7 +227,9 @@ def main(argv: list[str] | None = None) -> None:
     # composition kernels (WARP_COMPOSE_INTERP), so fall back to wsinc5 there.
     ainterp = args.ainterp
     if ainterp is None:
-        ainterp = args.interp if args.interp in ("cubic", "quintic", "heptic", "wsinc5") else "wsinc5"
+        ainterp = (
+            args.interp if args.interp in ("cubic", "quintic", "heptic", "wsinc5") else "wsinc5"
+        )
     if verb >= 1:
         print(f"ffs_nwarp: ainterp={ainterp}")
 

@@ -1396,8 +1396,9 @@ def nwarpforge(
         auto_pad: Grow the output grid only when a warp would clip real source
             signal off the edge (decided from in-source footprint overlap and a
             clipped-mass test, not raw displacement -- so a warp to a far-off
-            template with margin does not grow the grid). Disable for exact
-            master-grid output.
+            template with margin does not grow the grid). Ignored when an explicit
+            -master is given: the master grid is always honoured exactly. Only
+            affects the master-less case (grid derived from the source).
         expad: Extra padding voxels added on every side on top of the auto
             estimate (AFNI -expad analogue). Also forces padding when
             auto_pad is False.
@@ -1602,9 +1603,20 @@ def nwarpforge(
     # to it automatically in compose_chain.
     # Representative frames for the footprint probe: 0 and the last time-dependent
     # index (covers motion drift; static template affines dominate either way).
+    # An explicit -master (a file, or WARP/NWARP) is a hard contract: the output
+    # grid IS the master grid, full stop. Auto-pad must never grow it -- otherwise
+    # each run's grid depends on its own warped-source footprint and independently
+    # warped runs land on mismatched grids (the exact failure that breaks
+    # concatenating multi-run data onto a shared MNI template). Padding then
+    # cropping back to master is a no-op for the master-region values anyway, so we
+    # simply skip it. Matches AFNI 3dNwarpApply -master (no autopad). expad stays an
+    # explicit opt-in below.
+    explicit_master = master_path is not None
     reps = sorted({0, max(0, max_time_points - 1)})
     pad = (0, 0, 0)
-    if auto_pad:
+    if auto_pad and explicit_master and verb >= 1:
+        print("nwarpforge: -master given -> output grid fixed to master (auto-pad skipped)")
+    if auto_pad and not explicit_master:
         pad = _needed_padding(
             transforms,
             output_shape,
