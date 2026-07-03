@@ -18,8 +18,10 @@ from fastfuncstuff.memory import (
     dyn_chunk_estimator,
     estimate_chunk_size,
     estimate_keep_on_cpu,
+    estimate_nordic_llr_memory,
     get_available_memory,
     get_memory_config,
+    plan_nordic_llr_memory,
     reset_memory_config,
     set_memory_config,
 )
@@ -483,3 +485,88 @@ class TestIntegration:
 
         results = [estimate_chunk_size(**params) for _ in range(5)]
         assert len(set(results)) == 1
+
+
+class TestPlanNordicLLRMemory:
+    """Fitting a NORDIC LLR pass into a GPU memory budget."""
+
+    # Shape / kernel from the OHBM pilot case that OOMed: complex64, 14^3 patch.
+    SHAPE = (160, 160, 114, 225)
+    KERNEL = (14, 14, 14)
+    DTYPE_BYTES = 8  # complex64
+
+    def _est(self, batch, n_echoes=1):
+        return estimate_nordic_llr_memory(
+            self.SHAPE,
+            self.KERNEL,
+            batch,
+            self.DTYPE_BYTES,
+            return_recon=True,
+            n_echoes=n_echoes,
+        )
+
+    def test_fits_leaves_everything_resident(self):
+        """When the full estimate fits, don't offload or shrink the batch."""
+        est = self._est(512)
+        plan = plan_nordic_llr_memory(
+            self.SHAPE,
+            self.KERNEL,
+            512,
+            self.DTYPE_BYTES,
+            avail_bytes=est["total"] + 1,
+        )
+        assert plan["offload_data"] is False
+        assert plan["svd_batch_size"] == 512
+        assert plan["fits"] is True
+
+    def test_working_set_overflow_shrinks_batch(self):
+        """The OOM regression: input offload alone can't fit the working set,
+        so the batch must come down to fit the post-offload budget."""
+        est = self._est(512)
+        # Budget that admits the accumulators but only a fraction of the B=512
+        # working set — offloading the 4.9 GiB input does not rescue this.
+        avail = est["recon_acc"] + est["diag_maps"] + est["batch_working"] // 8
+        plan = plan_nordic_llr_memory(
+            self.SHAPE,
+            self.KERNEL,
+            512,
+            self.DTYPE_BYTES,
+            avail_bytes=avail,
+        )
+        assert plan["offload_data"] is True
+        assert plan["fits"] is True
+        assert 1 <= plan["svd_batch_size"] < 512
+        # The chosen batch's working set must actually fit the remaining budget.
+        chosen = self._est(plan["svd_batch_size"])
+        resident = chosen["recon_acc"] + chosen["diag_maps"] + chosen["batch_working"]
+        assert resident <= avail
+
+    def test_accumulators_alone_overflow_flags_not_fits(self):
+        """If the resident accumulators exceed the budget, report fits=False
+        and fall back to the minimum batch rather than a bogus large one."""
+        est = self._est(512)
+        avail = est["recon_acc"] // 2  # can't even hold the recon accumulator
+        plan = plan_nordic_llr_memory(
+            self.SHAPE,
+            self.KERNEL,
+            512,
+            self.DTYPE_BYTES,
+            avail_bytes=avail,
+        )
+        assert plan["offload_data"] is True
+        assert plan["fits"] is False
+        assert plan["svd_batch_size"] == 1
+
+    def test_batch_never_exceeds_request(self):
+        """A generous-but-not-full budget never inflates the batch past the
+        requested size."""
+        est = self._est(256)
+        avail = est["recon_acc"] + est["diag_maps"] + est["batch_working"] // 2
+        plan = plan_nordic_llr_memory(
+            self.SHAPE,
+            self.KERNEL,
+            256,
+            self.DTYPE_BYTES,
+            avail_bytes=avail,
+        )
+        assert plan["svd_batch_size"] <= 256

@@ -36,8 +36,8 @@ from tqdm.auto import tqdm
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import (
     estimate_chunk_size,
-    estimate_nordic_llr_memory,
     get_available_memory,
+    plan_nordic_llr_memory,
 )
 from fastfuncstuff.utils import get_device, to_tensor
 
@@ -735,7 +735,14 @@ def _llr_denoise(
 
     w = torch.clamp(weight, min=1.0)
     if return_recon:
-        recon_out = recon_acc / w[..., None]
+        # Reclaim the batch loop's cached blocks before the weight-normalisation,
+        # then divide in place. recon_acc is a private accumulator (never aliases
+        # the input), so mutating it is safe and avoids a second full 4-D volume
+        # — the difference between fitting and OOM on a memory-tight GPU.
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        recon_acc /= w[..., None]
+        recon_out = recon_acc
     else:
         recon_out = torch.empty((0,), dtype=data.dtype, device=device)
 
@@ -1179,12 +1186,17 @@ def _llr_denoise_multiecho(
     if pbar is not None:
         pbar.close()
 
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     w = torch.clamp(weight, min=1.0)
     uncovered = weight == 0
     results: list[tuple[torch.Tensor, _LLRStats]] = []
     zeros_w = torch.zeros_like(w)
     for e in range(E):
-        recon_out = recon_acc[e] / w[..., None]
+        # In-place: recon_acc[e] is a private per-echo accumulator, so this
+        # avoids a second full 4-D volume per echo during normalisation.
+        recon_acc[e] /= w[..., None]
+        recon_out = recon_acc[e]
         rec_map = None
         if recfactor_map is not None:
             rec_map = recfactor_map[e] / w
@@ -1783,19 +1795,24 @@ def _llr_main_pass(
     assert KSP2 is not None
     kernel_pca = prepped.kernel_pca
 
-    # Memory check: if data + accumulators + working set exceeds available
-    # GPU memory, offload data to CPU and stream patches to GPU per batch.
+    # Memory check: if data + accumulators + working set exceeds available GPU
+    # memory, offload data to CPU and stream patches per batch. Offloading the
+    # input alone is not enough when the per-batch working set is what overflows,
+    # so also shrink svd_batch_size to fit the remaining budget.
+    svd_batch_size = cfg.svd_batch_size
     if dev.type == "cuda":
-        mem_est = estimate_nordic_llr_memory(
+        avail = get_available_memory(dev)
+        plan = plan_nordic_llr_memory(
             shape=KSP2.shape,
             kernel_size=kernel_pca,
             svd_batch_size=cfg.svd_batch_size,
             dtype_bytes=KSP2.element_size(),
+            avail_bytes=avail,
             return_recon=True,
         )
-        avail = get_available_memory(dev)
-        gpu_without_data = mem_est["total"] - mem_est["data"]
-        if mem_est["total"] > avail:
+        mem_est = plan["est"]
+        if plan["offload_data"]:
+            svd_batch_size = int(plan["svd_batch_size"])
             if cfg.verbose:
                 print(
                     f"  Memory guard: LLR needs ~{mem_est['total'] / 1024**3:.2f} GiB "
@@ -1803,8 +1820,13 @@ def _llr_main_pass(
                 )
                 print(
                     f"  Offloading input ({mem_est['data'] / 1024**3:.2f} GiB) to CPU; "
-                    f"accumulators + working set = {gpu_without_data / 1024**3:.2f} GiB stay on GPU."
+                    f"reducing svd_batch_size {cfg.svd_batch_size} -> {svd_batch_size}."
                 )
+                if not plan["fits"]:
+                    print(
+                        "  WARNING: resident accumulators alone exceed the memory "
+                        "budget; running at minimum batch — may still OOM."
+                    )
             KSP2 = KSP2.cpu()
             torch.cuda.empty_cache()
 
@@ -1815,14 +1837,18 @@ def _llr_main_pass(
         threshold_mode=prepped.threshold_mode,
         threshold_value=prepped.threshold_value,
         verbose=cfg.verbose,
-        svd_batch_size=cfg.svd_batch_size,
+        svd_batch_size=svd_batch_size,
         decomp_method=cfg.decomp_method,
         device=dev,
     )
 
     residual: torch.Tensor | None = None
     if cfg.save_residual_map:
-        residual = KSP2.to(denoised.device) - denoised
+        # Compute on the input's device. When KSP2 was offloaded to CPU, this
+        # keeps the residual (another full 4-D volume) off the GPU rather than
+        # staging KSP2 back on alongside denoised — _finalize_echo handles a
+        # residual that lives on a different device than denoised.
+        residual = KSP2 - denoised.to(KSP2.device)
     del KSP2
     prepped.ksp2 = None
     if dev.type == "cuda":
@@ -1927,23 +1953,33 @@ def run_nordic_multiecho(
     #    estimated GPU footprint exceeds what's available (accumulators stay on
     #    GPU; the LLR's cross-device path transfers patches per batch).
     data_echoes: list[torch.Tensor] = [p.ksp2 for p in prepped]  # type: ignore[misc]
+    svd_batch_size = cfg.svd_batch_size
     if dev.type == "cuda":
-        mem_est = estimate_nordic_llr_memory(
+        avail = get_available_memory(dev)
+        plan = plan_nordic_llr_memory(
             shape=data_echoes[0].shape,
             kernel_size=prepped[0].kernel_pca,
             svd_batch_size=cfg.svd_batch_size,
             dtype_bytes=data_echoes[0].element_size(),
+            avail_bytes=avail,
             return_recon=True,
             n_echoes=E,
         )
-        avail = get_available_memory(dev)
-        if mem_est["total"] > avail:
+        mem_est = plan["est"]
+        if plan["offload_data"]:
+            svd_batch_size = int(plan["svd_batch_size"])
             if cfg.verbose:
                 print(
                     f"  Memory guard: {E}-echo LLR estimate ~"
                     f"{mem_est['total'] / 1024**3:.2f} GiB > {avail / 1024**3:.2f} GiB; "
-                    "offloading echo data to CPU."
+                    f"offloading echo data to CPU, svd_batch_size "
+                    f"{cfg.svd_batch_size} -> {svd_batch_size}."
                 )
+                if not plan["fits"]:
+                    print(
+                        "  WARNING: resident accumulators alone exceed the memory "
+                        "budget; running at minimum batch — may still OOM."
+                    )
             data_echoes = [d.cpu() for d in data_echoes]
             for p in prepped:
                 p.ksp2 = None
@@ -1960,7 +1996,7 @@ def run_nordic_multiecho(
         rescue_band=cfg.rescue_band,
         rescue_alpha=cfg.rescue_alpha,
         verbose=cfg.verbose,
-        svd_batch_size=cfg.svd_batch_size,
+        svd_batch_size=svd_batch_size,
         device=dev,
     )
     # Per-echo residual = original − denoised, computed before the echo data is
@@ -1972,7 +2008,10 @@ def run_nordic_multiecho(
     if cfg.save_residual_map or cfg.resid_qc:
         for e in range(E):
             denoised_e = results[e][0]
-            residuals[e] = data_echoes[e].to(denoised_e.device) - denoised_e
+            # Compute on the echo's own device: when the echoes were offloaded to
+            # CPU this keeps E residual volumes off the GPU (the cross-echo QC and
+            # _finalize_echo both follow the residual's device).
+            residuals[e] = data_echoes[e] - denoised_e.to(data_echoes[e].device)
     del data_echoes
     for p in prepped:
         p.ksp2 = None

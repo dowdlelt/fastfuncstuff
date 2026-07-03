@@ -746,6 +746,76 @@ def estimate_nordic_llr_memory(
     }
 
 
+def plan_nordic_llr_memory(
+    shape: tuple[int, int, int, int],
+    kernel_size: tuple[int, int, int],
+    svd_batch_size: int,
+    dtype_bytes: int,
+    avail_bytes: int,
+    return_recon: bool = True,
+    n_echoes: int = 1,
+    min_batch: int = 1,
+) -> dict[str, object]:
+    """Fit a NORDIC LLR pass into ``avail_bytes`` of GPU memory.
+
+    The recon accumulator and diagnostic maps must stay resident on the GPU for
+    the whole pass (they receive scattered per-batch reconstructions), so the
+    only two knobs are: keep vs. offload the input volume, and how many patches
+    to decompose per batch. The per-batch working set scales linearly with the
+    batch size, so once the input is offloaded we can always shrink the batch to
+    fit whatever budget remains after the fixed accumulators.
+
+    Offloading the input is *not* sufficient on its own: when the working set —
+    not the input — is what overflows (large patch M×N, big batch), the batch
+    size must come down too. Callers that only offload the input will OOM in
+    that regime.
+
+    Returns
+    -------
+    dict with keys:
+        offload_data : bool  — move the input volume to CPU and stream patches.
+        svd_batch_size : int — batch size that fits the budget (>= ``min_batch``).
+        fits : bool          — False if even ``min_batch`` overruns the budget
+                               (the resident accumulators alone exceed ``avail``);
+                               caller should proceed as best-effort and expect
+                               memory pressure.
+        est : dict           — the estimate at the *original* batch size.
+    """
+    est = estimate_nordic_llr_memory(
+        shape, kernel_size, svd_batch_size, dtype_bytes, return_recon, n_echoes
+    )
+    # Everything fits at the requested batch size — no changes needed.
+    if est["total"] <= avail_bytes:
+        return {
+            "offload_data": False,
+            "svd_batch_size": svd_batch_size,
+            "fits": True,
+            "est": est,
+        }
+
+    # Doesn't fit: offload the input and size the batch to the remaining budget.
+    per_batch = est["batch_working"] / max(1, svd_batch_size)  # bytes / batch-unit
+    fixed_resident = est["recon_acc"] + est["diag_maps"]  # must stay on GPU
+    budget = avail_bytes - fixed_resident
+    if budget <= 0 or per_batch <= 0:
+        # Even the accumulators don't fit; run at min_batch and warn upstream.
+        return {
+            "offload_data": True,
+            "svd_batch_size": max(1, min_batch),
+            "fits": False,
+            "est": est,
+        }
+
+    fitted = int(budget // per_batch)
+    fitted = max(min_batch, min(svd_batch_size, fitted))
+    return {
+        "offload_data": True,
+        "svd_batch_size": fitted,
+        "fits": fitted >= min_batch and budget > 0,
+        "est": est,
+    }
+
+
 def dyn_chunk_estimator(
     n_voxels: int,
     n_timepoints: int,
