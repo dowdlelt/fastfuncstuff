@@ -71,12 +71,8 @@ Output:
 """,
     )
 
-    parser.add_argument(
-        "-a", required=True, help="First 4D NIfTI dataset (or 3D for one-to-many)"
-    )
-    parser.add_argument(
-        "-b", required=True, help="Second 4D NIfTI dataset (or 3D for one-to-many)"
-    )
+    parser.add_argument("-a", required=True, help="First 4D NIfTI dataset (or 3D for one-to-many)")
+    parser.add_argument("-b", required=True, help="Second 4D NIfTI dataset (or 3D for one-to-many)")
 
     mask_group = parser.add_argument_group("Masking")
     mask_group.add_argument(
@@ -113,9 +109,7 @@ Output:
         help="Save full correlation matrix to text file",
     )
     parser.add_argument("-plot", default=None, help="Save heatmap plot to file (PNG/PDF/SVG)")
-    parser.add_argument(
-        "-plot_dpi", type=int, default=150, help="Plot DPI (default: 150)"
-    )
+    parser.add_argument("-plot_dpi", type=int, default=150, help="Plot DPI (default: 150)")
     parser.add_argument(
         "-device",
         default=None,
@@ -245,9 +239,17 @@ def _make_plot(
     )
 
     # Mark optimal matching with green squares
-    for r, c in zip(matched_rows, matched_cols):
-        ax_heat.plot(c, r, "s", color="lime", markersize=max(3, min(8, 100 / max(n1, n2))),
-                     markeredgecolor="black", markeredgewidth=0.5, alpha=0.8)
+    for r, c in zip(matched_rows, matched_cols, strict=False):
+        ax_heat.plot(
+            c,
+            r,
+            "s",
+            color="lime",
+            markersize=max(3, min(8, 100 / max(n1, n2))),
+            markeredgecolor="black",
+            markeredgewidth=0.5,
+            alpha=0.8,
+        )
 
     ax_heat.set_xlabel("Dataset B volume")
     ax_heat.set_ylabel("Dataset A volume")
@@ -282,8 +284,9 @@ def _make_plot(
         ax_bar.set_xlim(min(0, matched_corrs.min() - 0.05), 1.05)
 
     mean_r = matched_corrs.mean()
-    ax_bar.axvline(mean_r, color="blue", linestyle="-", alpha=0.6, linewidth=1.2,
-                   label=f"mean={mean_r:.3f}")
+    ax_bar.axvline(
+        mean_r, color="blue", linestyle="-", alpha=0.6, linewidth=1.2, label=f"mean={mean_r:.3f}"
+    )
     ax_bar.legend(fontsize=8, loc="lower right")
 
     plt.tight_layout()

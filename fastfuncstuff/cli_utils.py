@@ -924,7 +924,7 @@ def _infer_run_indices_from_filenames(
     for pat, desc in _RUN_INDEX_PATTERNS:
         matches = [re.search(pat, n, re.IGNORECASE) for n in names]
         if not all(matches):
-            unmatched = [n for n, m in zip(names, matches) if not m]
+            unmatched = [n for n, m in zip(names, matches, strict=False) if not m]
             failures.append(f"{desc}: did not match {unmatched[:3]}")
             continue
         nums = [int(m.group(1)) for m in matches]
@@ -1034,7 +1034,7 @@ def make_nuisance_block_from_glob(
 
     per_run: list[np.ndarray | None] = [None] * n_runs
     source: list[str | None] = [None] * n_runs
-    for path, run_idx in zip(matched, run_indices_0):
+    for path, run_idx in zip(matched, run_indices_0, strict=False):
         expected = (run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints) - run_starts[
             run_idx
         ]

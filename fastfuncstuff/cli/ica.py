@@ -56,7 +56,7 @@ try:
     from fastfuncstuff.decomposition import (
         workflow as ica_workflow,
     )
-    from fastfuncstuff.decomposition.ica import FastICA, InfoMaxICA, create_ica
+    from fastfuncstuff.decomposition.ica import FastICA, InfoMaxICA, create_ica  # noqa: F401
     from fastfuncstuff.decomposition.icasso import icasso
     from fastfuncstuff.decomposition.tools import (
         apply_high_pass_fft,
@@ -1740,7 +1740,7 @@ def _run_concat_ica(
     # --- Trace: dump PCA intermediates ---
     trace_dir = getattr(args, "trace", None)
     if trace_dir:
-        from pathlib import Path as _P
+        from pathlib import Path as _P  # noqa: N814
 
         _td = _P(trace_dir)
         _td.mkdir(parents=True, exist_ok=True)
@@ -1959,7 +1959,7 @@ def _run_concat_ica(
 
     # --- Trace: dump ICA intermediates ---
     if trace_dir:
-        from pathlib import Path as _P
+        from pathlib import Path as _P  # noqa: N814
 
         from scipy.stats import kurtosis as _kurt
         from scipy.stats import skew as _skew

@@ -231,7 +231,7 @@ def plot_speedup_bars(
         )
 
         # Value labels on bars
-        for bar, sp in zip(bars, speedups):
+        for bar, sp in zip(bars, speedups, strict=False):
             if sp > 0:
                 ax.text(
                     bar.get_width() + 0.05,

@@ -263,10 +263,12 @@ def validate(ctx: BenchmarkContext) -> dict:
     _var_names = ("a", "b", "lambda", "stdev")
     per_brick = var_result.get("per_brick", [])
     by_name = {}
-    for entry, name in zip(per_brick, _var_names):
+    for entry, name in zip(per_brick, _var_names, strict=False):
         entry["name"] = name
         by_name[name] = entry["r"]
-    var_per = " ".join(f"{name}={entry['r']:.3f}" for entry, name in zip(per_brick, _var_names))
+    var_per = " ".join(
+        f"{name}={entry['r']:.3f}" for entry, name in zip(per_brick, _var_names, strict=False)
+    )
 
     passed = (
         ols_result["min_r"] >= THRESHOLDS["ols_beta_min_r"]

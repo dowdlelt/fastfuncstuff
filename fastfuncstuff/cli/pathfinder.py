@@ -46,7 +46,7 @@ import torch
 from tqdm.auto import tqdm
 
 try:
-    import nibabel as nib
+    import nibabel as nib  # noqa: F401
 except ImportError:
     print("ERROR: nibabel is required. Install with: pip install nibabel")
     sys.exit(1)
@@ -70,7 +70,7 @@ try:
     )
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
-    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
     from fastfuncstuff.design.matrices import convolve_hrf_microtime
     from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
     from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti

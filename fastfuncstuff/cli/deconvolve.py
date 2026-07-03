@@ -69,7 +69,7 @@ try:
         parse_afni_timing_file,
     )
     from fastfuncstuff.design.matrices import (
-        build_glm_design,
+        build_glm_design,  # noqa: F401
         is_tr_locked,
         make_csplin_design,
         make_tent_design,
@@ -81,10 +81,10 @@ try:
         get_tr_from_file,
         load_afni_mask,
         load_nifti,
-        onsets_to_tr_matrix,
+        onsets_to_tr_matrix,  # noqa: F401
         save_nifti,
     )
-    from fastfuncstuff.utils import configure_torch_backends, get_device
+    from fastfuncstuff.utils import configure_torch_backends, get_device  # noqa: F401
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -817,7 +817,7 @@ def _xval_tent_top(
 
     if verbose:
         print("  LORO R² on signal voxels (median) by window top:")
-        cv_log = sorted(zip(candidate_tops, scores.tolist()), key=lambda x: x[0])
+        cv_log = sorted(zip(candidate_tops, scores.tolist(), strict=False), key=lambda x: x[0])
         for top_k, r2_k in cv_log:
             marker = " ← selected" if abs(top_k - best_top) < 1e-6 else ""
             print(f"    {bot:.1f}–{top_k:.2f}s  R²={r2_k:.4f}{marker}")
@@ -927,7 +927,7 @@ def main():
     tr_values = []
     nx = ny = nz = None
 
-    for i, input_file in enumerate(tqdm(args.input, desc="Loading runs", unit="run")):
+    for i, input_file in enumerate(tqdm(args.input, desc="Loading runs", unit="run")):  # noqa: B007
         if not Path(input_file).exists():
             print(f"ERROR: Input file not found: {input_file}", file=sys.stderr)
             return 1
@@ -1043,7 +1043,7 @@ def main():
                 if len(set(condition_durations)) == 1:
                     print(f"  Stimulus duration (all conditions): {condition_durations[0]:.3f}s")
                 else:
-                    for lbl, dur in zip(condition_labels, condition_durations):
+                    for lbl, dur in zip(condition_labels, condition_durations, strict=False):
                         print(f"  {lbl}: {dur:.3f}s")
 
     else:
@@ -1392,7 +1392,7 @@ def main():
     def _apply_add_lag(windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
         """Adjust per-condition (bot, top) windows by add_lag (TR units)."""
         result = []
-        for (bot, top), lag in zip(windows, add_lag_list):
+        for (bot, top), lag in zip(windows, add_lag_list, strict=False):
             n_trs = max(1, round(top / tr) + lag)
             result.append((bot, float(n_trs) * tr))
         return result
@@ -1441,7 +1441,9 @@ def main():
                 )
             else:
                 print("  Windows (per condition):")
-                for lbl, n_l, (_, top) in zip(condition_labels, n_lags_per_cond, tent_windows):
+                for lbl, n_l, (_, top) in zip(
+                    condition_labels, n_lags_per_cond, tent_windows, strict=False
+                ):
                     print(f"    {lbl}: {n_l} TRs ({top:.1f}s)")
         else:
             basis_type = "cubic spline" if "CSPLIN" in model else "tent"
@@ -1456,7 +1458,7 @@ def main():
                 )
             else:
                 print("  Windows (per condition):")
-                for lbl, (bot, top) in zip(condition_labels, tent_windows):
+                for lbl, (bot, top) in zip(condition_labels, tent_windows, strict=False):
                     n_basis_calc = (
                         args.tent_n_basis if args.tent_n_basis else round((top - bot) / tr) + 1
                     )
@@ -1664,7 +1666,7 @@ def main():
             total_poly_cols = len(n_timepoints_per_run) * n_poly_per_run
             poly_full = np.zeros((sum(n_timepoints_per_run), total_poly_cols))
             tr_start = col_start = 0
-            for run_idx, n_tp in enumerate(n_timepoints_per_run):
+            for run_idx, n_tp in enumerate(n_timepoints_per_run):  # noqa: B007
                 poly_run = legendre_polynomials(n_tp, args.polort)
                 poly_full[tr_start : tr_start + n_tp, col_start : col_start + n_poly_per_run] = (
                     poly_run

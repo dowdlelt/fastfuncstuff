@@ -204,7 +204,7 @@ class TestLoadSliceTiming:
         fpath.write_text("\n".join(str(t) for t in timings))
         loaded = load_slice_timing(fpath)
         assert len(loaded) == len(timings)
-        for a, b in zip(loaded, timings):
+        for a, b in zip(loaded, timings, strict=False):
             assert a == pytest.approx(b)
 
     def test_load_slice_timing_json(self, tmp_path):

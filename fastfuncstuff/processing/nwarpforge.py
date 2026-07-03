@@ -38,9 +38,7 @@ from .io import derive_mean_output_path, load_image, load_warp_field, save_image
 WARP_COMPOSE_INTERP = ("linear", "cubic", "quintic", "heptic", "wsinc5")
 
 
-def _sample_field(
-    field: Tensor, x: Tensor, y: Tensor, z: Tensor, interp: str = "linear"
-) -> Tensor:
+def _sample_field(field: Tensor, x: Tensor, y: Tensor, z: Tensor, interp: str = "linear") -> Tensor:
     """Sample a displacement field at arbitrary coords with the given kernel.
 
     ``linear`` keeps the fast grid_sample path (border-clamped). Higher-order
@@ -82,7 +80,7 @@ def derive_phase_output_path(prefix: str) -> str:
         return str(p.parent / f"{p.stem}_phase{p.suffix}")
 
 
-from ..io.afni import get_afni_space_info, set_afni_space_info
+from ..io.afni import get_afni_space_info, set_afni_space_info  # noqa: E402
 
 
 def compute_cardinal_affine(oblique_aff: np.ndarray) -> np.ndarray:
@@ -891,8 +889,9 @@ def reduce_chain(
         if not run:
             return
         reduced.append(
-            compose_chain(run, output_shape, output_affine, device, time_idx=0,
-                          interp=interp, verb=0)
+            compose_chain(
+                run, output_shape, output_affine, device, time_idx=0, interp=interp, verb=0
+            )
         )
         run.clear()
 
@@ -1063,9 +1062,7 @@ def _first_nonlinear_warp_grid(
         shp = img.shape  # (nx, ny, nz, 3) or (nx, ny, nz, T, 3)
         nx, ny, nz = int(shp[0]), int(shp[1]), int(shp[2])
         return (nz, ny, nx), compute_cardinal_affine(np.asarray(img.affine)), img.header.copy()
-    raise ValueError(
-        "-master WARP/NWARP requires at least one nonlinear warp dataset in -nwarp"
-    )
+    raise ValueError("-master WARP/NWARP requires at least one nonlinear warp dataset in -nwarp")
 
 
 def _estimate_warp_padding(
@@ -1199,9 +1196,12 @@ def _footprint_extent(
         comp = compose_chain(transforms, grid_shape, grid_affine, device, time_idx=t, verb=0)
         sx, sy, sz = _output_to_source_voxel_coords(comp, source_affine, grid_affine)
         in_src = (
-            (sx >= -0.5) & (sx <= snx - 0.5)
-            & (sy >= -0.5) & (sy <= sny - 0.5)
-            & (sz >= -0.5) & (sz <= snz - 0.5)
+            (sx >= -0.5)
+            & (sx <= snx - 0.5)
+            & (sy >= -0.5)
+            & (sy <= sny - 0.5)
+            & (sz >= -0.5)
+            & (sz <= snz - 0.5)
         )
         if not bool(in_src.any()):
             continue
@@ -1252,8 +1252,13 @@ def _needed_padding(
     dims = (nx, ny, nz)
 
     ext = _footprint_extent(
-        transforms, output_shape, output_affine, source_shape, source_affine,
-        device, time_indices,
+        transforms,
+        output_shape,
+        output_affine,
+        source_shape,
+        source_affine,
+        device,
+        time_indices,
     )
     if ext is None:
         return (0, 0, 0)
@@ -1275,23 +1280,29 @@ def _needed_padding(
         comp = compose_chain(transforms, pshape, paffine, device, time_idx=t, verb=0)
         sx, sy, sz = _output_to_source_voxel_coords(comp, source_affine, paffine)
         in_src = (
-            (sx >= -0.5) & (sx <= snx - 0.5)
-            & (sy >= -0.5) & (sy <= sny - 0.5)
-            & (sz >= -0.5) & (sz <= snz - 0.5)
+            (sx >= -0.5)
+            & (sx <= snx - 0.5)
+            & (sy >= -0.5)
+            & (sy <= sny - 0.5)
+            & (sz >= -0.5)
+            & (sz <= snz - 0.5)
         )
         if not bool(in_src.any()):
             continue
         # |source| sampled over the probe footprint (the captured signal).
-        vals = trilinear_interpolate(
-            src3d, sx.reshape(-1), sy.reshape(-1), sz.reshape(-1)
-        ).reshape(pnz, pny, pnx).abs() * in_src.float()
+        vals = (
+            trilinear_interpolate(src3d, sx.reshape(-1), sy.reshape(-1), sz.reshape(-1))
+            .reshape(pnz, pny, pnx)
+            .abs()
+            * in_src.float()
+        )
         total = float(vals.sum().item())
         if total <= 0:
             continue
         # Mass outside the nominal region (the probe border) is what padding-less
         # output would drop.
         keep = torch.zeros_like(vals)
-        keep[probe[2]:probe[2] + nz, probe[1]:probe[1] + ny, probe[0]:probe[0] + nx] = 1.0
+        keep[probe[2] : probe[2] + nz, probe[1] : probe[1] + ny, probe[0] : probe[0] + nx] = 1.0
         lost_frac = max(lost_frac, float((vals * (1.0 - keep)).sum().item()) / total)
 
         # Foreground bbox (signal above a small fraction of its own max) so a
@@ -1401,9 +1412,7 @@ def nwarpforge(
 
     interp = normalize_interp_mode(interp)
     if ainterp not in WARP_COMPOSE_INTERP:
-        raise ValueError(
-            f"ainterp must be one of {WARP_COMPOSE_INTERP}, got {ainterp!r}"
-        )
+        raise ValueError(f"ainterp must be one of {WARP_COMPOSE_INTERP}, got {ainterp!r}")
 
     t0_load = __import__("time").time()
     source, source_header = load_image(source_path, device=device)
@@ -1597,16 +1606,20 @@ def nwarpforge(
     pad = (0, 0, 0)
     if auto_pad:
         pad = _needed_padding(
-            transforms, output_shape, output_affine, source,
-            source_header["affine"], device, reps, verb=verb,
+            transforms,
+            output_shape,
+            output_affine,
+            source,
+            source_header["affine"],
+            device,
+            reps,
+            verb=verb,
         )
     if expad > 0:
         pad = tuple(p + expad for p in pad)  # type: ignore[assignment]
 
     if any(p > 0 for p in pad):
-        shift = torch.tensor(
-            [pad[0], pad[1], pad[2]], dtype=torch.float32, device=device
-        )
+        shift = torch.tensor([pad[0], pad[1], pad[2]], dtype=torch.float32, device=device)
         t_mat = torch.eye(4, dtype=torch.float32, device=device)
         t_mat[:3, 3] = shift
         t_inv = torch.eye(4, dtype=torch.float32, device=device)
@@ -1648,8 +1661,13 @@ def nwarpforge(
     static_composed: NonlinearWarp | None = None
     if not any(_is_time_dependent(x) for x in reduced):
         static_composed = compose_chain(
-            reduced, output_shape, output_affine, device, time_idx=0,
-            interp=ainterp, verb=verb,
+            reduced,
+            output_shape,
+            output_affine,
+            device,
+            time_idx=0,
+            interp=ainterp,
+            verb=verb,
         )
 
     time_iter = tqdm(
@@ -1658,14 +1676,18 @@ def nwarpforge(
         disable=verb == 0 or (t_end - t_start) == 1,
     )
     for t in time_iter:
-        composed = static_composed if static_composed is not None else compose_chain(
-            reduced,
-            output_shape,
-            output_affine,
-            device,
-            time_idx=t,
-            interp=ainterp,
-            verb=0 if (t_end - t_start) > 1 else verb,
+        composed = (
+            static_composed
+            if static_composed is not None
+            else compose_chain(
+                reduced,
+                output_shape,
+                output_affine,
+                device,
+                time_idx=t,
+                interp=ainterp,
+                verb=0 if (t_end - t_start) > 1 else verb,
+            )
         )
 
         src_vol = source[t] if is_4d else source

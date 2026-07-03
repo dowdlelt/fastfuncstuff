@@ -114,218 +114,272 @@ def create_parser() -> argparse.ArgumentParser:
     # ── Required ─────────────────────────────────────────────────────────
     req = parser.add_argument_group("Required Arguments")
     req.add_argument(
-        "-magnitude", nargs="+", metavar="FILE", required=True,
+        "-magnitude",
+        nargs="+",
+        metavar="FILE",
+        required=True,
         help="Magnitude fMRI data files (one per run). Supports wildcards.",
     )
     req.add_argument(
-        "-phase", nargs="+", metavar="FILE", required=True,
+        "-phase",
+        nargs="+",
+        metavar="FILE",
+        required=True,
         help="Phase fMRI data files (radians, unwrapped, one per run). "
-             "Must match magnitude files in order and dimensions.",
+        "Must match magnitude files in order and dimensions.",
     )
     req.add_argument(
-        "-prefix", required=True, metavar="OUTPUT",
+        "-prefix",
+        required=True,
+        metavar="OUTPUT",
         help="Output file prefix (e.g. results/epi_pr).",
     )
 
     # ── Task removal ─────────────────────────────────────────────────────
     task = parser.add_argument_group("Task Removal Options")
     task.add_argument(
-        "-task_removal", choices=["none", "tent", "canonical"],
+        "-task_removal",
+        choices=["none", "tent", "canonical"],
         default="none",
         help="Task removal before slope estimation: "
-             "'none' (direct regression, OK after NORDIC or for RS), "
-             "'tent' (TENT/FIR basis - model-free, recommended), "
-             "'canonical' (SPM HRF convolution).",
+        "'none' (direct regression, OK after NORDIC or for RS), "
+        "'tent' (TENT/FIR basis - model-free, recommended), "
+        "'canonical' (SPM HRF convolution).",
     )
     task.add_argument(
-        "-onsets", nargs="+", metavar="FILE",
+        "-onsets",
+        nargs="+",
+        metavar="FILE",
         help="AFNI-format onset timing files (one per condition, "
-             "each with one row per run). Mutually exclusive with -events.",
+        "each with one row per run). Mutually exclusive with -events.",
     )
     task.add_argument(
-        "-events", nargs="+", metavar="TSV",
-        help="BIDS events TSV files (one per run). "
-             "Mutually exclusive with -onsets.",
+        "-events",
+        nargs="+",
+        metavar="TSV",
+        help="BIDS events TSV files (one per run). Mutually exclusive with -onsets.",
     )
     task.add_argument(
-        "-event_ignore", nargs="+", metavar="CONDITION",
+        "-event_ignore",
+        nargs="+",
+        metavar="CONDITION",
         help="trial_type values to skip when using -events.",
     )
     task.add_argument(
-        "-event_cols", nargs=3, metavar=("ONSET", "DUR", "TYPE"),
+        "-event_cols",
+        nargs=3,
+        metavar=("ONSET", "DUR", "TYPE"),
         help="Custom column names for -events (default: onset, duration, trial_type).",
     )
     task.add_argument(
-        "-tent_window", type=float, default=20.0, metavar="SECONDS",
+        "-tent_window",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
         help="TENT window duration in seconds (for -task_removal tent).",
     )
     task.add_argument(
-        "-durations", nargs="+", metavar="SECONDS",
+        "-durations",
+        nargs="+",
+        metavar="SECONDS",
         help="Per-condition stimulus durations for auto window estimation "
-             "(with -onsets). With -events, durations come from the TSV.",
+        "(with -onsets). With -events, durations come from the TSV.",
     )
 
     # ── Regression options ───────────────────────────────────────────────
     reg = parser.add_argument_group("Regression Options")
     reg.add_argument(
-        "-regression", choices=["deming", "ols"], default="deming",
+        "-regression",
+        choices=["deming", "ols"],
+        default="deming",
         help="Regression method. 'deming' is the closed-form Deming/ODR "
-             "(equivalent to scipy.odr at fMRI φ scales — see Menon 2002, "
-             "Curtis 2014, Stanley 2021, phaseprep). 'ols' regresses mag on "
-             "phase without errors-in-variables correction (Chang & "
-             "Giovanello 2026 use OLS at 3T after NORDIC).",
+        "(equivalent to scipy.odr at fMRI φ scales — see Menon 2002, "
+        "Curtis 2014, Stanley 2021, phaseprep). 'ols' regresses mag on "
+        "phase without errors-in-variables correction (Chang & "
+        "Giovanello 2026 use OLS at 3T after NORDIC).",
     )
     reg.add_argument(
-        "-phi", type=float, default=None, metavar="VALUE",
+        "-phi",
+        type=float,
+        default=None,
+        metavar="VALUE",
         help="Fixed variance ratio for Deming regression. "
-             "If not set, estimated automatically per voxel via -phi_method.",
+        "If not set, estimated automatically per voxel via -phi_method.",
     )
     reg.add_argument(
-        "-phi_method", choices=["fft", "residual"], default="fft",
+        "-phi_method",
+        choices=["fft", "residual"],
+        default="fft",
         help="How to estimate phi (Var(eps_mag)/Var(eps_phase)): "
-             "'fft' uses out-of-band spectral power above -freq_range "
-             "(Curtis 2014, phaseprep default; works for task and rest). "
-             "'residual' uses temporal variance of (poly+task+nuisance)-"
-             "projected residuals (Knudsen 2023). "
-             "WARNING: 'residual' without -task_removal on task data will "
-             "include task variance in the noise estimate and inflate phi. "
-             "Pair 'residual' with -task_removal {tent,canonical} for "
-             "task data; 'fft' is safe for both.",
+        "'fft' uses out-of-band spectral power above -freq_range "
+        "(Curtis 2014, phaseprep default; works for task and rest). "
+        "'residual' uses temporal variance of (poly+task+nuisance)-"
+        "projected residuals (Knudsen 2023). "
+        "WARNING: 'residual' without -task_removal on task data will "
+        "include task variance in the noise estimate and inflate phi. "
+        "Pair 'residual' with -task_removal {tent,canonical} for "
+        "task data; 'fft' is safe for both.",
     )
     reg.add_argument(
-        "-freq_range", nargs="+", type=float, default=[0.15],
+        "-freq_range",
+        nargs="+",
+        type=float,
+        default=[0.15],
         metavar="HZ",
         help="Frequency range for FFT noise estimation. "
-             "One value = lower bound (upper = Nyquist). "
-             "Two values = lower and upper bounds. "
-             "Default 0.15 Hz matches Stanley 2021 §2.2.3 and phaseprep "
-             "(noise_lb=0.15). Curtis 2014 used 0.1 Hz; either is reasonable.",
+        "One value = lower bound (upper = Nyquist). "
+        "Two values = lower and upper bounds. "
+        "Default 0.15 Hz matches Stanley 2021 §2.2.3 and phaseprep "
+        "(noise_lb=0.15). Curtis 2014 used 0.1 Hz; either is reasonable.",
     )
 
     # ── Phase filtering ──────────────────────────────────────────────────
-    pfilt = parser.add_argument_group(
-        "Phase Filtering Options (Barry & Gore 2014)"
-    )
+    pfilt = parser.add_argument_group("Phase Filtering Options (Barry & Gore 2014)")
     pfilt.add_argument(
-        "-phase_filter", choices=["none", "sgf", "explore"],
+        "-phase_filter",
+        choices=["none", "sgf", "explore"],
         default="none",
         help="Pre-filter phase time series before regression. "
-             "'none': no filtering (Stanley/phaseprep default). "
-             "'sgf': Savitzky-Golay with -sgf_window/-sgf_order — same fit "
-             "behaviour as 'none' but on a smoother phase, which acts as a "
-             "phase-noise regulariser and typically tightens R² by reducing "
-             "high-frequency phase contribution to the residual. "
-             "'explore': per-voxel data-driven parameter search "
-             "optimising |Pearson r(filtered_phase, mag_dt)| (Barry & Gore "
-             "2014's phase-magnitude correlation criterion — NOT our ODR-"
-             "shrinkage R², which is dominated by 1/(1+A²/φ) and would be a "
-             "poor filter-quality metric). Computationally expensive. "
-             "Recommended at 7T where phase SNR is low (Hagberg et al 2008 "
-             "found k_phi >> k_mag).",
+        "'none': no filtering (Stanley/phaseprep default). "
+        "'sgf': Savitzky-Golay with -sgf_window/-sgf_order — same fit "
+        "behaviour as 'none' but on a smoother phase, which acts as a "
+        "phase-noise regulariser and typically tightens R² by reducing "
+        "high-frequency phase contribution to the residual. "
+        "'explore': per-voxel data-driven parameter search "
+        "optimising |Pearson r(filtered_phase, mag_dt)| (Barry & Gore "
+        "2014's phase-magnitude correlation criterion — NOT our ODR-"
+        "shrinkage R², which is dominated by 1/(1+A²/φ) and would be a "
+        "poor filter-quality metric). Computationally expensive. "
+        "Recommended at 7T where phase SNR is low (Hagberg et al 2008 "
+        "found k_phi >> k_mag).",
     )
     pfilt.add_argument(
-        "-sgf_window", type=int, default=None, metavar="N",
+        "-sgf_window",
+        type=int,
+        default=None,
+        metavar="N",
         help="SGF window length in TRs (must be odd; auto-incremented if "
-             "even). Default: auto = round(20s / TR), floored at 5. Larger "
-             "= more smoothing. Only used with -phase_filter sgf.",
+        "even). Default: auto = round(20s / TR), floored at 5. Larger "
+        "= more smoothing. Only used with -phase_filter sgf.",
     )
     pfilt.add_argument(
-        "-sgf_order", type=int, default=3, metavar="P",
+        "-sgf_order",
+        type=int,
+        default=3,
+        metavar="P",
         help="SGF polynomial order (must be < window length). Lower = "
-             "more smoothing. Only used with -phase_filter sgf.",
+        "more smoothing. Only used with -phase_filter sgf.",
     )
 
     # ── Processing options ───────────────────────────────────────────────
     proc = parser.add_argument_group("Processing Options")
     proc.add_argument(
-        "-polort", type=str, default="A", metavar="N",
+        "-polort",
+        type=str,
+        default="A",
+        metavar="N",
         help="Polynomial drift order (Legendre, per run). 'A' = auto "
-             "(AFNI formula based on run duration). Integer for fixed "
-             "order. -1 for none. Use -polort 1 for exact phaseprep parity "
-             "(linear-only detrend, what PreprocessPhase + DetrendMag do). "
-             "Higher orders remove more drift before the fit but can absorb "
-             "shared low-frequency mag-phase content that you may want to "
-             "keep — there's a tradeoff.",
+        "(AFNI formula based on run duration). Integer for fixed "
+        "order. -1 for none. Use -polort 1 for exact phaseprep parity "
+        "(linear-only detrend, what PreprocessPhase + DetrendMag do). "
+        "Higher orders remove more drift before the fit but can absorb "
+        "shared low-frequency mag-phase content that you may want to "
+        "keep — there's a tradeoff.",
     )
     proc.add_argument(
-        "-tr", type=float, metavar="SECONDS",
+        "-tr",
+        type=float,
+        metavar="SECONDS",
         help="Repetition time. Default: read from NIfTI pixdim/zooms. "
-             "Override here if your header is wrong.",
+        "Override here if your header is wrong.",
     )
     proc.add_argument(
-        "-mask", metavar="FILE",
+        "-mask",
+        metavar="FILE",
         help="Brain mask (restricts analysis to mask voxels). "
-             "If not provided, voxels are filtered by -signal_thresh.",
+        "If not provided, voxels are filtered by -signal_thresh.",
     )
     proc.add_argument(
-        "-signal_thresh", type=float, default=0.03, metavar="FRAC",
+        "-signal_thresh",
+        type=float,
+        default=0.03,
+        metavar="FRAC",
         help="Minimum mean-signal fraction to include a voxel in "
-             "regression (default 0.03 = 3%% of max, matching phaseprep). "
-             "Voxels below this have slope=0 and R²=0. "
-             "Set to 0 to disable: corrected output stays clean (ODR "
-             "shrinkage caps every voxel), but R² map shows bright noise "
-             "voxels because ODR-style R² reads unfittable data as "
-             "'perfect within noise budget' — visual artifact, not a bug.",
+        "regression (default 0.03 = 3%% of max, matching phaseprep). "
+        "Voxels below this have slope=0 and R²=0. "
+        "Set to 0 to disable: corrected output stays clean (ODR "
+        "shrinkage caps every voxel), but R² map shows bright noise "
+        "voxels because ODR-style R² reads unfittable data as "
+        "'perfect within noise budget' — visual artifact, not a bug.",
     )
     proc.add_argument(
-        "-no_auto_mask", action="store_true",
+        "-no_auto_mask",
+        action="store_true",
         help="Disable automatic brain masking when -mask is not provided. "
-             "By default, ffs_phasereg computes a brain mask from the mean "
-             "magnitude (using AFNI-compatible automask) to exclude air, "
-             "skull, and non-brain tissue before regression.",
+        "By default, ffs_phasereg computes a brain mask from the mean "
+        "magnitude (using AFNI-compatible automask) to exclude air, "
+        "skull, and non-brain tissue before regression.",
     )
     proc.add_argument(
-        "-keep_drift", action="store_true",
+        "-keep_drift",
+        action="store_true",
         help="GLM-friendly output mode. Default (off) is phaseprep parity: "
-             "corrected = mean + shrunk_residual, drift dropped, ill-"
-             "conditioned voxels collapse to per-voxel mean. With this flag "
-             "ON, corrected = mag_orig - A_eff·(phase_dt - mean), where "
-             "A_eff = A/(1 + A²/φ) is the shrunken slope. Polynomial drift "
-             "is preserved (your downstream GLM models it), and A_eff is "
-             "naturally bounded by √φ/2 so high-Deming-slope voxels still "
-             "produce a clean correction instead of speckle. "
-             "Recommended when the corrected mag is the input to a GLM "
-             "rather than the analysis endpoint.",
+        "corrected = mean + shrunk_residual, drift dropped, ill-"
+        "conditioned voxels collapse to per-voxel mean. With this flag "
+        "ON, corrected = mag_orig - A_eff·(phase_dt - mean), where "
+        "A_eff = A/(1 + A²/φ) is the shrunken slope. Polynomial drift "
+        "is preserved (your downstream GLM models it), and A_eff is "
+        "naturally bounded by √φ/2 so high-Deming-slope voxels still "
+        "produce a clean correction instead of speckle. "
+        "Recommended when the corrected mag is the input to a GLM "
+        "rather than the analysis endpoint.",
     )
     proc.add_argument(
-        "-motion", nargs="+", metavar="FILE",
+        "-motion",
+        nargs="+",
+        metavar="FILE",
         help="(DEPRECATED — use -ortvec_run instead.) "
-             "Motion parameter files, one per run (AFNI dfile format). "
-             "Equivalent to passing each as -ortvec_run FILE motion RUN. "
-             "Added as nuisance regressors.",
+        "Motion parameter files, one per run (AFNI dfile format). "
+        "Equivalent to passing each as -ortvec_run FILE motion RUN. "
+        "Added as nuisance regressors.",
     )
     add_ortvec_arguments(proc)
 
     # ── Hardware ─────────────────────────────────────────────────────────
     hw = parser.add_argument_group("Hardware Options")
     hw.add_argument(
-        "-device", type=str, default=None,
+        "-device",
+        type=str,
+        default=None,
         help="PyTorch device: cpu, cuda, mps (default: auto-detect).",
     )
 
     # ── Output ───────────────────────────────────────────────────────────
     out = parser.add_argument_group("Output Options")
     out.add_argument(
-        "-r2_mode", choices=["odr", "naive", "both"], default="odr",
+        "-r2_mode",
+        choices=["odr", "naive", "both"],
+        default="odr",
         help="Which R² map(s) to write. 'odr' (default): ODR-shrinkage R² "
-             "matching phaseprep / Stanley 2021 — the canonical metric. "
-             "'naive': 1 - SS_res(observed) / SS_tot without shrinkage — "
-             "highlights voxels with the largest raw phase-regression effect, "
-             "useful for spotting which voxels were most changed even when "
-             "ODR inflation makes the canonical R² appear small. "
-             "'both': write prefix_r2.nii.gz (ODR) and prefix_r2_naive.nii.gz.",
+        "matching phaseprep / Stanley 2021 — the canonical metric. "
+        "'naive': 1 - SS_res(observed) / SS_tot without shrinkage — "
+        "highlights voxels with the largest raw phase-regression effect, "
+        "useful for spotting which voxels were most changed even when "
+        "ODR inflation makes the canonical R² appear small. "
+        "'both': write prefix_r2.nii.gz (ODR) and prefix_r2_naive.nii.gz.",
     )
     out.add_argument(
-        "-save_intermediates", action="store_true",
+        "-save_intermediates",
+        action="store_true",
         help="Write intermediate time-series volumes for step-by-step inspection: "
-             "prefix_mag_dt (poly-detrended magnitude), "
-             "prefix_pha_dt (poly-detrended phase), "
-             "prefix_pha_dt_filt (detrended + SGF-filtered phase, differs from "
-             "prefix_pha_dt only when -phase_filter sgf|explore is active), "
-             "prefix_mag_res (magnitude after poly + task removal, used for "
-             "slope estimation), and "
-             "prefix_pha_res_filt (phase after poly + task + SGF, used for phi "
-             "estimation and slope estimation).",
+        "prefix_mag_dt (poly-detrended magnitude), "
+        "prefix_pha_dt (poly-detrended phase), "
+        "prefix_pha_dt_filt (detrended + SGF-filtered phase, differs from "
+        "prefix_pha_dt only when -phase_filter sgf|explore is active), "
+        "prefix_mag_res (magnitude after poly + task removal, used for "
+        "slope estimation), and "
+        "prefix_pha_res_filt (phase after poly + task + SGF, used for phi "
+        "estimation and slope estimation).",
     )
     add_verbose_arg(out, default=0)
 
@@ -351,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
             save_nifti,
         )
         from fastfuncstuff.phasereg.core import phase_regress
-        from fastfuncstuff.utils import configure_torch_backends, get_device
+        from fastfuncstuff.utils import configure_torch_backends, get_device  # noqa: F401
     except ImportError as e:
         print(f"ERROR: Could not import fastfuncstuff: {e}", file=sys.stderr)
         return 1
@@ -427,12 +481,13 @@ def main(argv: list[str] | None = None) -> int:
         pha_data = pha_img.get_fdata(dtype=np.float32)
 
         if mag_data.ndim != 4:
-            print(f"ERROR: Expected 4D data, got {mag_data.ndim}D: {mag_path}",
-                  file=sys.stderr)
+            print(f"ERROR: Expected 4D data, got {mag_data.ndim}D: {mag_path}", file=sys.stderr)
             return 1
         if pha_data.shape != mag_data.shape:
-            print(f"ERROR: Phase shape {pha_data.shape} != magnitude shape "
-                  f"{mag_data.shape}", file=sys.stderr)
+            print(
+                f"ERROR: Phase shape {pha_data.shape} != magnitude shape {mag_data.shape}",
+                file=sys.stderr,
+            )
             return 1
 
         if nx is None:
@@ -482,8 +537,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mask:
         mask = load_afni_mask(args.mask)
         if mask.shape != (nx, ny, nz):
-            print(f"ERROR: Mask shape {mask.shape} != data shape {(nx, ny, nz)}",
-                  file=sys.stderr)
+            print(f"ERROR: Mask shape {mask.shape} != data shape {(nx, ny, nz)}", file=sys.stderr)
             return 1
         mask_flat = mask.flatten()
         n_voxels = int(mask_flat.sum())
@@ -493,10 +547,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Mask (provided): {n_voxels:,} / {n_all_voxels:,} voxels")
     elif not args.no_auto_mask:
         from fastfuncstuff.processing.mask import automask
+
         mean_mag = torch.stack([m.mean(dim=1) for m in mag_list]).mean(dim=0)
         mean3d = mean_mag.reshape(nx, ny, nz)
-        mask3d = automask(mean3d, dilate_extra=2, device=device,
-                          verbose=args.verb >= 1)
+        mask3d = automask(mean3d, dilate_extra=2, device=device, verbose=args.verb >= 1)
         mask_flat = mask3d.flatten().cpu()
         n_voxels = int(mask_flat.sum().item())
         mask_bool = mask_flat.bool()
@@ -524,13 +578,13 @@ def main(argv: list[str] | None = None) -> int:
     onsets_per_condition = None
     if args.onsets:
         from fastfuncstuff.design.builder import parse_afni_timing_file
+
         onsets_per_condition = []
         for onset_file in args.onsets:
             onsets_by_run = parse_afni_timing_file(onset_file)
             if len(onsets_by_run) != n_runs:
                 print(
-                    f"ERROR: {onset_file} has {len(onsets_by_run)} runs, "
-                    f"expected {n_runs}",
+                    f"ERROR: {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}",
                     file=sys.stderr,
                 )
                 return 1
@@ -540,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
 
     elif args.events:
         from fastfuncstuff.design.bids_events import parse_bids_events
+
         if len(args.events) != n_runs:
             print(
                 f"ERROR: {len(args.events)} events files but {n_runs} runs.",
@@ -565,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.task_removal == "tent" and args.durations and onsets_per_condition is not None:
         from fastfuncstuff.design.builder import parse_durations
         from fastfuncstuff.design.hrf import compute_windows_from_durations
+
         n_conds = len(onsets_per_condition)
         cond_labels = [f"cond{i}" for i in range(n_conds)]
         condition_durations = parse_durations(args.durations, n_conds, cond_labels)
@@ -604,7 +660,10 @@ def main(argv: list[str] | None = None) -> int:
         n_timepoints = sum(run_lengths)
 
         blocks = collect_nuisance_blocks(
-            args, run_starts, n_timepoints, verbose=(args.verb >= 1),
+            args,
+            run_starts,
+            n_timepoints,
+            verbose=(args.verb >= 1),
         )
         nuisance_per_run = []
         for run_idx, run_length in enumerate(run_lengths):
@@ -619,9 +678,7 @@ def main(argv: list[str] | None = None) -> int:
                 cols.append(m)
             if cols:
                 arr = np.concatenate(cols, axis=1).astype(np.float32)
-                nuisance_per_run.append(
-                    torch.tensor(arr, dtype=torch.float32, device=device)
-                )
+                nuisance_per_run.append(torch.tensor(arr, dtype=torch.float32, device=device))
             else:
                 nuisance_per_run.append(
                     torch.zeros((run_length, 0), dtype=torch.float32, device=device)
@@ -712,16 +769,18 @@ def main(argv: list[str] | None = None) -> int:
     outputs["phi"] = fname
 
     fname = f"{args.prefix}_mask{nii_ext}"
-    save_nifti(_to_volume(result.voxel_mask.numpy().astype(np.float32)), fname, reference_img=ref_img_path)
+    save_nifti(
+        _to_volume(result.voxel_mask.numpy().astype(np.float32)), fname, reference_img=ref_img_path
+    )
     outputs["mask"] = fname
 
     if args.save_intermediates:
         interm_specs = [
-            ("mag_dt",       result.mag_detrended,      True,  "poly-detrended magnitude"),
-            ("pha_dt",       result.pha_detrended,       True,  "poly-detrended phase"),
-            ("pha_dt_filt",  result.pha_detrended_filt,  True,  "detrended + filtered phase"),
-            ("mag_res",      result.mag_residual,        True,  "magnitude task-residual"),
-            ("pha_res_filt", result.pha_residual_filt,   True,  "phase task-residual + filtered"),
+            ("mag_dt", result.mag_detrended, True, "poly-detrended magnitude"),
+            ("pha_dt", result.pha_detrended, True, "poly-detrended phase"),
+            ("pha_dt_filt", result.pha_detrended_filt, True, "detrended + filtered phase"),
+            ("mag_res", result.mag_residual, True, "magnitude task-residual"),
+            ("pha_res_filt", result.pha_residual_filt, True, "phase task-residual + filtered"),
         ]
         for key, data, is_4d, label in interm_specs:
             if data is None:

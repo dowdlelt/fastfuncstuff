@@ -40,6 +40,7 @@ The ``-split`` flag enables per-group libraries — see the flag's help.
 CLI conventions follow the AFNI-style single-dash flags used elsewhere
 in ``ffs_*`` (e.g. ``-input`` not ``--input``).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -61,13 +62,13 @@ try:
         preflight_check,
     )
     from fastfuncstuff.design.builder import (
-        create_onset_matrix_microtime,
+        create_onset_matrix_microtime,  # noqa: F401
         parse_afni_timing_file,
         parse_durations,
     )
     from fastfuncstuff.design.hrf import (
-        compute_windows_from_durations,
-        estimate_hrf_window,
+        compute_windows_from_durations,  # noqa: F401
+        estimate_hrf_window,  # noqa: F401
     )
     from fastfuncstuff.design.hrf_derive import (
         build_pc_basis_design_per_run,
@@ -75,7 +76,7 @@ try:
         svd_decompose,
     )
     from fastfuncstuff.design.matrices import (
-        is_tr_locked,
+        is_tr_locked,  # noqa: F401
         make_fir_design,
         make_tent_design,
     )
@@ -515,8 +516,7 @@ def resolve_split(
         parts = [int(p.strip()) for p in split_arg.split(",")]
         if len(parts) != n_conditions:
             raise ValueError(
-                f"-split vector has {len(parts)} entries but there are "
-                f"{n_conditions} conditions."
+                f"-split vector has {len(parts)} entries but there are {n_conditions} conditions."
             )
         unique_groups = sorted(set(parts))
         remap = {g: i for i, g in enumerate(unique_groups)}
@@ -528,8 +528,7 @@ def resolve_split(
     group_per_cond = list(range(n_conditions))
     # Sanitize labels for filenames.
     safe = [
-        "".join(c if c.isalnum() or c in "-_" else "_" for c in lbl)
-        for lbl in condition_labels
+        "".join(c if c.isalnum() or c in "-_" else "_" for c in lbl) for lbl in condition_labels
     ]
     return group_per_cond, safe
 
@@ -613,10 +612,12 @@ def build_per_run_designs(
     # keeps working.  All ffs_* CLIs route through
     # fastfuncstuff.design.builder.build_per_run_task_designs now.
     import warnings as _warnings
+
     _warnings.warn(
         "cli.librarian.build_per_run_designs is deprecated; use "
         "fastfuncstuff.design.builder.build_per_run_task_designs instead.",
-        DeprecationWarning, stacklevel=2,
+        DeprecationWarning,
+        stacklevel=2,
     )
     """Construct one design matrix per run containing all groups' lag blocks.
 
@@ -705,7 +706,8 @@ def build_per_run_designs(
     if basis == "TENTzero":
         n_lags_actual = n_lags - 2
         lag_times = np.linspace(
-            (fir_window_s) / (n_lags - 1), fir_window_s - (fir_window_s) / (n_lags - 1),
+            (fir_window_s) / (n_lags - 1),
+            fir_window_s - (fir_window_s) / (n_lags - 1),
             n_lags_actual,
         )
     else:
@@ -751,7 +753,7 @@ def write_r2_volume(
 
 
 def write_qc_artifacts(
-    lib,                                      # LibraryResult from hrf_derive
+    lib,  # LibraryResult from hrf_derive
     lag_times: np.ndarray,
     group_label: str,
     prefix: str,
@@ -792,8 +794,12 @@ def write_qc_artifacts(
     mean_path = Path(f"{prefix}{gtag}_qc_mean_fir.tsv")
     arr = np.column_stack([lag_times, lib.mean_fir_hrf])
     np.savetxt(
-        mean_path, arr, fmt="%.10g", delimiter="\t",
-        header="lag_time_s\tmean_fir_beta", comments="",
+        mean_path,
+        arr,
+        fmt="%.10g",
+        delimiter="\t",
+        header="lag_time_s\tmean_fir_beta",
+        comments="",
     )
     artifacts["mean_fir_tsv"] = str(mean_path)
 
@@ -819,6 +825,7 @@ def write_qc_artifacts(
     # failing the run (TSV artifacts already provide the raw data).
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -857,8 +864,12 @@ def write_qc_artifacts(
         # in cyan; also draw the unit circle to make orientation obvious.
         if lib.manifold.shape[1] == 3:
             ax.scatter(
-                lib.manifold[:, 1], lib.manifold[:, 2],
-                marker="o", facecolors="none", edgecolors="cyan", s=40,
+                lib.manifold[:, 1],
+                lib.manifold[:, 2],
+                marker="o",
+                facecolors="none",
+                edgecolors="cyan",
+                s=40,
                 label="library samples",
             )
         theta = np.linspace(0, 2 * np.pi, 200)
@@ -891,22 +902,35 @@ def write_qc_artifacts(
         ("gamma fit — impulse (final library)", lib.fitted_deconvolved, "--"),
     ]
     fig, axes = plt.subplots(
-        len(panels), 1, figsize=(8, 1.9 * len(panels)),
-        sharex=True, sharey=True,
+        len(panels),
+        1,
+        figsize=(8, 1.9 * len(panels)),
+        sharex=True,
+        sharey=True,
     )
     for ax, (title, data, linestyle) in zip(axes, panels, strict=False):
         ax.axhline(0, color="0.6", lw=0.5)
         if data is None:
             ax.text(
-                0.5, 0.5, "not computed", ha="center", va="center",
-                transform=ax.transAxes, color="0.6", fontsize=10,
+                0.5,
+                0.5,
+                "not computed",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color="0.6",
+                fontsize=10,
             )
             ax.set_title(title, fontsize=10, loc="left")
             continue
         for i in range(data.shape[0]):
             ax.plot(
-                lib.target_times, data[i],
-                color=colors[i], lw=1.1, linestyle=linestyle, alpha=0.85,
+                lib.target_times,
+                data[i],
+                color=colors[i],
+                lw=1.1,
+                linestyle=linestyle,
+                alpha=0.85,
             )
         ax.set_title(title, fontsize=10, loc="left")
         ax.set_ylabel("peak=1")
@@ -979,9 +1003,8 @@ def main() -> None:
     # -split COLUMN mode requires BIDS events — detect it here so we can
     # adjust the events-parse to make COLUMN the trial_type.
     split_arg = args.split
-    split_column_mode = (
-        split_arg is not None
-        and not all(p.strip().lstrip("-").isdigit() for p in split_arg.split(","))
+    split_column_mode = split_arg is not None and not all(
+        p.strip().lstrip("-").isdigit() for p in split_arg.split(",")
     )
 
     if has_events:
@@ -989,9 +1012,7 @@ def main() -> None:
         from fastfuncstuff.design.bids_events import parse_bids_events
 
         if len(args.events) != n_runs:
-            print(
-                f"ERROR: -events: {len(args.events)} files but {n_runs} runs."
-            )
+            print(f"ERROR: -events: {len(args.events)} files but {n_runs} runs.")
             sys.exit(1)
         # Resolve event_cols: -event-cols takes precedence; split-column
         # mode overlays the split column as the trial_type axis.  Falls
@@ -1023,9 +1044,7 @@ def main() -> None:
 
         onset_files = args.onsets
         n_conditions = len(onset_files)
-        condition_labels = clean_condition_labels(
-            [Path(f).stem for f in onset_files]
-        )
+        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
         for f in onset_files:
             if not Path(f).exists():
                 print(f"ERROR: Onset file not found: {f}")
@@ -1050,9 +1069,7 @@ def main() -> None:
         split_for_resolver = split_arg
 
     # --- Resolve grouping -----------------------------------------------------
-    group_per_cond, group_labels = resolve_split(
-        split_for_resolver, n_conditions, condition_labels
-    )
+    group_per_cond, group_labels = resolve_split(split_for_resolver, n_conditions, condition_labels)
     n_groups = len(group_labels)
     print(f"  Groups ({n_groups}): {group_labels}")
     if args.verb >= 1:
@@ -1096,10 +1113,7 @@ def main() -> None:
     n_timepoints = load_result.n_timepoints
     if args.tr is None:
         args.tr = tr
-    print(
-        f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, "
-        f"TR={tr}s)"
-    )
+    print(f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, TR={tr}s)")
 
     # Snap onsets to TR boundaries (now that TR is known).  Applies to
     # both BIDS and AFNI paths.  Helpful when events are jittered around
@@ -1107,11 +1121,9 @@ def main() -> None:
     # than auto-falling back to TENT).
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
+
         all_onsets = _round_onsets(all_onsets, tr, threshold=args.round_onsets)
-        print(
-            f"  Rounded onsets to nearest TR "
-            f"(threshold={args.round_onsets:.2f} of TR)."
-        )
+        print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f} of TR).")
 
     # --- Pool onsets per group ------------------------------------------------
     pooled_onsets, pooled_durations = pool_onsets_by_group(
@@ -1135,6 +1147,7 @@ def main() -> None:
     # double-counting, off-by-one in TENTzero) are the same code path
     # used by ffs_deconvolve and any other CLI doing FIR/TENT modelling.
     from fastfuncstuff.design.builder import build_per_run_task_designs
+
     run_starts_ext = list(run_starts) + [n_timepoints]
     n_tp_per_run = [run_starts_ext[r + 1] - run_starts_ext[r] for r in range(n_runs)]
 
@@ -1161,10 +1174,7 @@ def main() -> None:
     lag_times = design_result.lag_times_s[0] if design_result.lag_times_s else np.array([])
     fir_window_s = design_result.fir_window_s[0][1] if design_result.fir_window_s else 0.0
     n_task_cols = n_groups * n_lags
-    print(
-        f"  Basis: {args.basis}, window: {fir_window_s:.2f}s "
-        f"({n_lags} {args.basis} basis fns)"
-    )
+    print(f"  Basis: {args.basis}, window: {fir_window_s:.2f}s ({n_lags} {args.basis} basis fns)")
     print(f"  Design: {n_task_cols} task cols ({n_groups} groups × {n_lags} lags)")
 
     # --- Split data per run, then pack into canonical shared-task GLM ------
@@ -1175,21 +1185,15 @@ def main() -> None:
     # block too, giving per-run task betas (1/n_runs of the data per
     # estimate, much noisier).  We want the shared form.
     from fastfuncstuff.design.builder import pack_for_shared_task_glm
-    per_run_data = [
-        data[:, run_starts_ext[r] : run_starts_ext[r + 1]] for r in range(n_runs)
-    ]
+
+    per_run_data = [data[:, run_starts_ext[r] : run_starts_ext[r + 1]] for r in range(n_runs)]
     # Resolve polort: None (auto) → ~run_duration_min/2 per run.  fit_glm
     # used to do this automatically when handed a per-run list; we
     # replicate it here so the packed-design path matches.
     if args.max_poly_degree is None:
-        run_duration_min = (
-            per_run_data[0].shape[1] * tr / 60.0 if per_run_data else 1.0
-        )
+        run_duration_min = per_run_data[0].shape[1] * tr / 60.0 if per_run_data else 1.0
         polort_resolved = max(0, round(run_duration_min / 2))
-        print(
-            f"  Polort auto: {polort_resolved} "
-            f"(run duration ≈ {run_duration_min:.1f} min)"
-        )
+        print(f"  Polort auto: {polort_resolved} (run duration ≈ {run_duration_min:.1f} min)")
     else:
         polort_resolved = int(args.max_poly_degree)
 
@@ -1268,9 +1272,7 @@ def main() -> None:
     uniform_duration = True
     if n_groups > 1:
         ref_dur = round(float(pooled_durations[0]), 6)
-        uniform_duration = all(
-            round(float(d), 6) == ref_dur for d in pooled_durations
-        )
+        uniform_duration = all(round(float(d), 6) == ref_dur for d in pooled_durations)
 
     if use_stacking and not uniform_duration:
         if args.deconvolve_duration == "on":
@@ -1295,10 +1297,7 @@ def main() -> None:
             "shared library (-split-separate to disable)."
         )
     elif n_groups > 1:
-        print(
-            f"\n  Per-group mode: one library per group "
-            f"({n_groups} libraries, -split-separate)."
-        )
+        print(f"\n  Per-group mode: one library per group ({n_groups} libraries, -split-separate).")
 
     metadata: dict = {
         "tool": "ffs_librarian",
@@ -1330,9 +1329,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     def _compute_refit_weights(group_idx: int, shared_pcs: np.ndarray) -> np.ndarray:
         onsets_per_run_g = pooled_onsets[group_idx]
-        n_tp_per_run_local = [
-            run_starts_ext[r + 1] - run_starts_ext[r] for r in range(n_runs)
-        ]
+        n_tp_per_run_local = [run_starts_ext[r + 1] - run_starts_ext[r] for r in range(n_runs)]
         pc_designs_np = build_pc_basis_design_per_run(
             onsets_per_run=onsets_per_run_g,
             pcs=shared_pcs,
@@ -1382,8 +1379,7 @@ def main() -> None:
     ):
         if deconv_duration is not None:
             print(
-                f"    Wiener deconvolving {deconv_duration:.2f}s "
-                f"boxcar (SNR={args.deconv_snr:g})"
+                f"    Wiener deconvolving {deconv_duration:.2f}s boxcar (SNR={args.deconv_snr:g})"
             )
         lib = derive_library(
             betas_in,
@@ -1479,14 +1475,10 @@ def main() -> None:
         # betas_full[:, :n_groups*n_lags] is the task block; reshape to
         # (n_voxels, n_groups, n_lags) and stack groups along the voxel
         # axis → (n_voxels * n_groups, n_lags).
-        task_betas_3d = betas_full[:, : n_groups * n_lags].reshape(
-            n_voxels, n_groups, n_lags
-        )
+        task_betas_3d = betas_full[:, : n_groups * n_lags].reshape(n_voxels, n_groups, n_lags)
         # Order: all of group 0 first, then group 1, ... — matches the
         # per-group order so refit_weights stacks line up.
-        stacked_betas = np.concatenate(
-            [task_betas_3d[:, g, :] for g in range(n_groups)], axis=0
-        )
+        stacked_betas = np.concatenate([task_betas_3d[:, g, :] for g in range(n_groups)], axis=0)
         stacked_r2 = np.tile(r2, n_groups)
 
         # Compute shared PCs (one SVD on the stacked betas, same voxel
@@ -1494,20 +1486,27 @@ def main() -> None:
         refit_weights_stacked = None
         if args.refit_pcs == "on":
             from fastfuncstuff.design.hrf_derive import select_voxels as _sel_fn
+
             sel_s = _sel_fn(
-                stacked_r2, threshold=args.r2_threshold,
-                max_voxels=args.max_voxels, seed=args.seed,
+                stacked_r2,
+                threshold=args.r2_threshold,
+                max_voxels=args.max_voxels,
+                seed=args.seed,
             )
             sel_betas_s = stacked_betas[sel_s]
             sel_norms_s = np.linalg.norm(sel_betas_s, axis=1)
             sel_alive_s = sel_norms_s > 1e-8 * max(
-                float(np.median(sel_norms_s[sel_norms_s > 0])) if (sel_norms_s > 0).any() else 1.0, 1.0,
+                float(np.median(sel_norms_s[sel_norms_s > 0])) if (sel_norms_s > 0).any() else 1.0,
+                1.0,
             )
             sel_s = sel_s[sel_alive_s]
             sel_betas_s = stacked_betas[sel_s]
 
             svd_shared = svd_decompose(
-                sel_betas_s, n_pcs=args.n_pcs, unit_normalize=True, sign_align=True,
+                sel_betas_s,
+                n_pcs=args.n_pcs,
+                unit_normalize=True,
+                sign_align=True,
             )
             print(
                 f"\n  --- stacked SVD: {sel_s.size} voxel-group rows; "
@@ -1527,7 +1526,9 @@ def main() -> None:
         # (deconvolution gets skipped, see check above).
         stacked_duration = float(pooled_durations[0]) if uniform_duration else None
         if args.deconvolve_duration == "on":
-            deconv_for_stack = stacked_duration if stacked_duration and stacked_duration > 0 else None
+            deconv_for_stack = (
+                stacked_duration if stacked_duration and stacked_duration > 0 else None
+            )
         elif args.deconvolve_duration == "off":
             deconv_for_stack = None
         else:  # "auto"
@@ -1556,29 +1557,32 @@ def main() -> None:
         for g in range(n_groups):
             col_lo, col_hi = g * n_lags, (g + 1) * n_lags
             betas_g = betas_full[:, col_lo:col_hi]
-            print(
-                f"\n  --- group '{group_labels[g]}' "
-                f"({col_lo}-{col_hi - 1}) ---"
-            )
+            print(f"\n  --- group '{group_labels[g]}' ({col_lo}-{col_hi - 1}) ---")
 
             # NSD refinement using PCs derived FROM THIS GROUP only.
             refit_weights_g = None
             if args.refit_pcs == "on":
                 from fastfuncstuff.design.hrf_derive import select_voxels as _sel_fn
+
                 sel_g = _sel_fn(
-                    r2, threshold=args.r2_threshold,
-                    max_voxels=args.max_voxels, seed=args.seed,
+                    r2,
+                    threshold=args.r2_threshold,
+                    max_voxels=args.max_voxels,
+                    seed=args.seed,
                 )
                 sel_betas = betas_g[sel_g]
                 sel_norms = np.linalg.norm(sel_betas, axis=1)
                 sel_alive = sel_norms > 1e-8 * max(
-                    float(np.median(sel_norms[sel_norms > 0])) if (sel_norms > 0).any() else 1.0, 1.0,
+                    float(np.median(sel_norms[sel_norms > 0])) if (sel_norms > 0).any() else 1.0,
+                    1.0,
                 )
                 sel_g = sel_g[sel_alive]
                 sel_betas = betas_g[sel_g]
                 svd_pre = svd_decompose(
-                    sel_betas, n_pcs=args.n_pcs,
-                    unit_normalize=True, sign_align=True,
+                    sel_betas,
+                    n_pcs=args.n_pcs,
+                    unit_normalize=True,
+                    sign_align=True,
                 )
                 print(
                     f"    NSD refinement: refitting with {args.n_pcs} PC-basis "
@@ -1596,9 +1600,7 @@ def main() -> None:
             elif args.deconvolve_duration == "off":
                 deconv_for_g = None
             else:  # "auto"
-                deconv_for_g = (
-                    group_duration if group_duration > 1.5 * 0.1 else None
-                )
+                deconv_for_g = group_duration if group_duration > 1.5 * 0.1 else None
 
             gtag = "" if n_groups == 1 else f"_group_{group_labels[g]}"
             _derive_and_write_one_library(

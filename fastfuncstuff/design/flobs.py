@@ -3166,7 +3166,7 @@ def estimate_and_apply_arma11_prewhitening(
         print(f"  prewhiten: OLS pre-pass on {n_runs} runs to estimate ARMA(1,1)…")
 
     residual_mean_per_run: list[np.ndarray] = []
-    for y_r, X_task_r in zip(per_run_data, per_run_task_designs):
+    for y_r, X_task_r in zip(per_run_data, per_run_task_designs, strict=False):
         y_dev = y_r.to(device).float()  # (n_voxels, n_tp_r)
         X_task_dev = X_task_r.to(device).float()  # (n_tp_r, n_task)
         n_tp_r = X_task_dev.shape[0]

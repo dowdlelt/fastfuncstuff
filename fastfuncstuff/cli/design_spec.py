@@ -13,6 +13,7 @@ The TOML schema lives in :mod:`fastfuncstuff.design.spec`. ``hrfopt:<lib>``
 event models are deliberately rejected at compile time — they require
 per-voxel design selection, which only ``ffs_reml -spec`` can consume.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -59,76 +60,116 @@ def _build_parser() -> argparse.ArgumentParser:
         "stub",
         help="Scan events + BOLD headers and write a design.spec skeleton.",
     )
-    p_stub.add_argument("-input", nargs="+", required=True, metavar="FILE",
-                        dest="input",
-                        help="BOLD images, one per run (header read only).")
-    p_stub.add_argument("-events", nargs="+", required=True, metavar="TSV",
-                        help="BIDS events.tsv, one per run, same order as -input.")
-    p_stub.add_argument("-out", required=True, metavar="SPEC",
-                        help="Output design.spec path.")
-    p_stub.add_argument("-TR", type=float, default=None,
-                        help="Override TR (otherwise read from input headers).")
-    p_stub.add_argument("-event-cols", nargs=3,
-                        metavar=("ONSET", "DURATION", "TRIAL_TYPE"),
-                        help="Non-BIDS column names for the events.tsv files.")
-    p_stub.add_argument("-drop-trial-types", nargs="*",
-                        default=["rest", "Rest", "REST", "baseline"],
-                        help="Trial types to exclude from the spec.")
-    p_stub.add_argument("-default-hrf", default="SPMG1",
-                        help="HRF model used for every event in the stub. The "
-                             "duration is taken from the [[events]] 'duration' "
-                             "field, so the bare model name is what you want here.")
+    p_stub.add_argument(
+        "-input",
+        nargs="+",
+        required=True,
+        metavar="FILE",
+        dest="input",
+        help="BOLD images, one per run (header read only).",
+    )
+    p_stub.add_argument(
+        "-events",
+        nargs="+",
+        required=True,
+        metavar="TSV",
+        help="BIDS events.tsv, one per run, same order as -input.",
+    )
+    p_stub.add_argument("-out", required=True, metavar="SPEC", help="Output design.spec path.")
+    p_stub.add_argument(
+        "-TR", type=float, default=None, help="Override TR (otherwise read from input headers)."
+    )
+    p_stub.add_argument(
+        "-event-cols",
+        nargs=3,
+        metavar=("ONSET", "DURATION", "TRIAL_TYPE"),
+        help="Non-BIDS column names for the events.tsv files.",
+    )
+    p_stub.add_argument(
+        "-drop-trial-types",
+        nargs="*",
+        default=["rest", "Rest", "REST", "baseline"],
+        help="Trial types to exclude from the spec.",
+    )
+    p_stub.add_argument(
+        "-default-hrf",
+        default="SPMG1",
+        help="HRF model used for every event in the stub. The "
+        "duration is taken from the [[events]] 'duration' "
+        "field, so the bare model name is what you want here.",
+    )
     # Nuisance regressors — three input modes, matching ffs_reml. See the
     # generated [[nuisance]] section header in design.toml for the full
     # padding-semantics writeup.
-    p_stub.add_argument("-ortvec", action="append", nargs=2,
-                        metavar=("FILE", "LABEL"),
-                        help="Full-length nuisance (already concatenated across "
-                             "all runs, used as-is). Repeatable. Use this for "
-                             "AFNI mot_demean.r0N.1D files — each is already "
-                             "full-length and block-diagonal.")
-    p_stub.add_argument("-ortvec_run", "-ortvec-run",
-                        action="append", nargs=3,
-                        metavar=("FILE", "LABEL", "RUN"),
-                        dest="ortvec_run",
-                        help="Per-run nuisance (file is one run long, "
-                             "zero-padded into the full grid). RUN is 1-indexed. "
-                             "Repeatable.")
-    p_stub.add_argument("-ortvec_glob", "-ortvec-glob",
-                        action="append", nargs=2,
-                        metavar=("PATTERN", "LABEL"),
-                        dest="ortvec_glob",
-                        help="Glob matching per-run nuisance files; run index "
-                             "inferred from filename. Stored in the spec verbatim, "
-                             "re-resolved at compile time. Repeatable.")
-    p_stub.add_argument("-ortvec_concat", "-ortvec-concat",
-                        action="append", nargs=2,
-                        metavar=("PATTERN", "LABEL"),
-                        dest="ortvec_concat",
-                        help="Glob matching N already-full-length per-run files "
-                             "(e.g. AFNI mot_demean.r0N.1D — each spans every run "
-                             "with zeros outside its own). Expanded into N "
-                             "scope='full' entries labelled LABEL01, LABEL02, … "
-                             "(width auto-padded from n_runs). Repeatable.")
-    p_stub.add_argument("-overwrite", action="store_true",
-                        help="Overwrite -out if it already exists "
-                             "(no interactive prompt).")
+    p_stub.add_argument(
+        "-ortvec",
+        action="append",
+        nargs=2,
+        metavar=("FILE", "LABEL"),
+        help="Full-length nuisance (already concatenated across "
+        "all runs, used as-is). Repeatable. Use this for "
+        "AFNI mot_demean.r0N.1D files — each is already "
+        "full-length and block-diagonal.",
+    )
+    p_stub.add_argument(
+        "-ortvec_run",
+        "-ortvec-run",
+        action="append",
+        nargs=3,
+        metavar=("FILE", "LABEL", "RUN"),
+        dest="ortvec_run",
+        help="Per-run nuisance (file is one run long, "
+        "zero-padded into the full grid). RUN is 1-indexed. "
+        "Repeatable.",
+    )
+    p_stub.add_argument(
+        "-ortvec_glob",
+        "-ortvec-glob",
+        action="append",
+        nargs=2,
+        metavar=("PATTERN", "LABEL"),
+        dest="ortvec_glob",
+        help="Glob matching per-run nuisance files; run index "
+        "inferred from filename. Stored in the spec verbatim, "
+        "re-resolved at compile time. Repeatable.",
+    )
+    p_stub.add_argument(
+        "-ortvec_concat",
+        "-ortvec-concat",
+        action="append",
+        nargs=2,
+        metavar=("PATTERN", "LABEL"),
+        dest="ortvec_concat",
+        help="Glob matching N already-full-length per-run files "
+        "(e.g. AFNI mot_demean.r0N.1D — each spans every run "
+        "with zeros outside its own). Expanded into N "
+        "scope='full' entries labelled LABEL01, LABEL02, … "
+        "(width auto-padded from n_runs). Repeatable.",
+    )
+    p_stub.add_argument(
+        "-overwrite",
+        action="store_true",
+        help="Overwrite -out if it already exists (no interactive prompt).",
+    )
 
     # compile
     p_comp = sub.add_parser(
         "compile",
         help="Read a design.spec and emit an AFNI .xmat.1D.",
     )
-    p_comp.add_argument("-spec", required=True, metavar="SPEC",
-                        help="Input design TOML file. Extension auto-appended "
-                             "(.toml) if missing.")
-    p_comp.add_argument("-xmat", required=True, metavar="FILE",
-                        help="Output .xmat.1D path.")
-    p_comp.add_argument("-overwrite", action="store_true",
-                        help="Overwrite -xmat if it already exists "
-                             "(no interactive prompt).")
-    p_comp.add_argument("-verb", type=int, default=0,
-                        help="Verbosity level (0=quiet, 1=summary).")
+    p_comp.add_argument(
+        "-spec",
+        required=True,
+        metavar="SPEC",
+        help="Input design TOML file. Extension auto-appended (.toml) if missing.",
+    )
+    p_comp.add_argument("-xmat", required=True, metavar="FILE", help="Output .xmat.1D path.")
+    p_comp.add_argument(
+        "-overwrite",
+        action="store_true",
+        help="Overwrite -xmat if it already exists (no interactive prompt).",
+    )
+    p_comp.add_argument("-verb", type=int, default=0, help="Verbosity level (0=quiet, 1=summary).")
 
     return parser
 
@@ -193,14 +234,9 @@ def _duration_stats_comment(durations: list[float]) -> str:
     lo, hi = min(valid), max(valid)
     mean = sum(valid) / n
     sorted_vals = sorted(valid)
-    median = sorted_vals[n // 2] if n % 2 else 0.5 * (
-        sorted_vals[n // 2 - 1] + sorted_vals[n // 2]
-    )
+    median = sorted_vals[n // 2] if n % 2 else 0.5 * (sorted_vals[n // 2 - 1] + sorted_vals[n // 2])
     uniq = sorted(set(round(d, 4) for d in valid))
-    uniq_str = (
-        ", ".join(f"{u:g}" for u in uniq) if len(uniq) <= 5
-        else f"{len(uniq)} unique values"
-    )
+    uniq_str = ", ".join(f"{u:g}" for u in uniq) if len(uniq) <= 5 else f"{len(uniq)} unique values"
     return (
         f"n={n}, range=[{lo:g}, {hi:g}], "
         f"mean={mean:.3g}, median={median:.3g}, unique={{{uniq_str}}}"
@@ -208,7 +244,8 @@ def _duration_stats_comment(durations: list[float]) -> str:
 
 
 def _build_nuisance_from_cli_args(
-    args: argparse.Namespace, n_runs: int,
+    args: argparse.Namespace,
+    n_runs: int,
 ) -> list[NuisanceSpec]:
     """Turn -ortvec / -ortvec_run / -ortvec_glob / -ortvec_concat into
     NuisanceSpec rows. All four flags mirror ffs_reml's add_ortvec_arguments
@@ -219,24 +256,31 @@ def _build_nuisance_from_cli_args(
 
     out: list[NuisanceSpec] = []
 
-    for file, label in (getattr(args, "ortvec", None) or []):
+    for file, label in getattr(args, "ortvec", None) or []:
         out.append(NuisanceSpec(file=str(file), label=label, scope="full"))
 
-    for file, label, run in (getattr(args, "ortvec_run", None) or []):
+    for file, label, run in getattr(args, "ortvec_run", None) or []:
+        out.append(NuisanceSpec(file=str(file), label=label, scope=f"run:{int(run)}"))
+
+    for pattern, label in getattr(args, "ortvec_glob", None) or []:
         out.append(
-            NuisanceSpec(file=str(file), label=label, scope=f"run:{int(run)}")
+            NuisanceSpec(
+                file=None,
+                label=label,
+                scope="glob",
+                pattern=str(pattern),
+            )
         )
 
-    for pattern, label in (getattr(args, "ortvec_glob", None) or []):
-        out.append(NuisanceSpec(
-            file=None, label=label, scope="glob", pattern=str(pattern),
-        ))
-
-    for pattern, label in (getattr(args, "ortvec_concat", None) or []):
+    for pattern, label in getattr(args, "ortvec_concat", None) or []:
         for path, suffixed_label in expand_ortvec_concat(pattern, label, n_runs):
-            out.append(NuisanceSpec(
-                file=str(path), label=suffixed_label, scope="full",
-            ))
+            out.append(
+                NuisanceSpec(
+                    file=str(path),
+                    label=suffixed_label,
+                    scope="full",
+                )
+            )
 
     return out
 
@@ -320,13 +364,11 @@ def _do_stub(args: argparse.Namespace) -> int:
     # Don't overwrite events_columns with defaults; only set if user customised.
     if args.event_cols:
         from fastfuncstuff.design.spec import EventsColumns
-        meta.events_columns = EventsColumns(
-            onset=cols[0], duration=cols[1], trial_type=cols[2]
-        )
+
+        meta.events_columns = EventsColumns(onset=cols[0], duration=cols[1], trial_type=cols[2])
 
     events = [
-        EventSpec(trial_type=tt, duration="from_events", hrf=args.default_hrf,
-                  mode="condition")
+        EventSpec(trial_type=tt, duration="from_events", hrf=args.default_hrf, mode="condition")
         for tt in trial_types
     ]
 
@@ -406,9 +448,7 @@ def _read_events_for_condition(
                 onset = float(row[onset_col])
                 duration = float(row[dur_col])
             except (KeyError, ValueError) as exc:
-                raise ValueError(
-                    f"Could not parse onset/duration in {events_path}: {exc}"
-                ) from exc
+                raise ValueError(f"Could not parse onset/duration in {events_path}: {exc}") from exc
             onset = _round_value(onset, round_onset, tr)
             duration = _round_value(duration, round_duration, tr)
             out.append((onset, duration))
@@ -451,8 +491,12 @@ def _expand_event_to_stims(
     # Per-run (onset, duration) lists.
     per_run = [
         _read_events_for_condition(
-            ef, event.trial_type, cols,
-            event.round_onset, event.round_duration, tr,
+            ef,
+            event.trial_type,
+            cols,
+            event.round_onset,
+            event.round_duration,
+            tr,
         )
         for ef in events_files
     ]
@@ -461,9 +505,7 @@ def _expand_event_to_stims(
     if event.duration == "from_events":
         unique_durs = sorted({d for run in per_run for _, d in run})
         if not unique_durs:
-            raise ValueError(
-                f"Event '{event.trial_type}': no events found in any run."
-            )
+            raise ValueError(f"Event '{event.trial_type}': no events found in any run.")
         if event.mode == "im" or len(unique_durs) == 1:
             # Single stim, single duration (median if im-mode and they differ).
             dur_value = unique_durs[0] if len(unique_durs) == 1 else float(np.median(unique_durs))
@@ -475,9 +517,7 @@ def _expand_event_to_stims(
         # condition mode + multiple durations -> split per duration.
         out: list[tuple[Path, str, str, bool]] = []
         for d in unique_durs:
-            per_run_onsets = [
-                [o for o, dd in run if dd == d] for run in per_run
-            ]
+            per_run_onsets = [[o for o, dd in run if dd == d] for run in per_run]
             label = f"{event.trial_type}_dur{_fmt_dur(d)}"
             timing_path = tmpdir / f"{label}.1D"
             _write_afni_timing(timing_path, per_run_onsets)
@@ -569,39 +609,28 @@ def _resolve_nuisance_for_compile(
         if n_spec.rescale == "demean":
             if tmpdir is None:
                 raise RuntimeError(
-                    "rescale='demean' requires a tmpdir to write the "
-                    "preprocessed file to"
+                    "rescale='demean' requires a tmpdir to write the preprocessed file to"
                 )
             return _maybe_demean_to_tempdir(src, tmpdir)
         return src
 
     for n in nuisance:
         if n.scope == "full":
-            ortvec_files.append(
-                (_maybe_rescale(Path(n.file or ""), n), n.label)
-            )
+            ortvec_files.append((_maybe_rescale(Path(n.file or ""), n), n.label))
         elif n.scope.startswith("run:"):
             run_idx = int(n.scope.split(":", 1)[1])
             if run_idx < 1 or run_idx > n_runs:
-                raise ValueError(
-                    f"nuisance '{n.label}': run {run_idx} out of range "
-                    f"[1, {n_runs}]"
-                )
-            padortvec_files.append(
-                (_maybe_rescale(Path(n.file or ""), n), n.label, run_idx)
-            )
+                raise ValueError(f"nuisance '{n.label}': run {run_idx} out of range [1, {n_runs}]")
+            padortvec_files.append((_maybe_rescale(Path(n.file or ""), n), n.label, run_idx))
         elif n.scope == "glob":
             if not n.pattern:
-                raise ValueError(
-                    f"nuisance '{n.label}': scope='glob' but no pattern"
-                )
+                raise ValueError(f"nuisance '{n.label}': scope='glob' but no pattern")
             matched = sorted(Path(p) for p in glob_module.glob(n.pattern))
             if not matched:
-                raise ValueError(
-                    f"nuisance '{n.label}': glob {n.pattern!r} matched no files"
-                )
+                raise ValueError(f"nuisance '{n.label}': glob {n.pattern!r} matched no files")
             run_indices_0 = _infer_run_indices_from_filenames(
-                [p.name for p in matched], n_runs=n_runs,
+                [p.name for p in matched],
+                n_runs=n_runs,
             )
             # Pre-validate row counts so failures point at the glob source.
             for path, run_idx0 in zip(matched, run_indices_0, strict=True):
@@ -613,13 +642,9 @@ def _resolve_nuisance_for_compile(
                         f"but run {run_idx0 + 1} expects {expected} "
                         "(glob mode requires one-run-length files)"
                     )
-                padortvec_files.append(
-                    (_maybe_rescale(path, n), n.label, run_idx0 + 1)
-                )
+                padortvec_files.append((_maybe_rescale(path, n), n.label, run_idx0 + 1))
         else:
-            raise ValueError(
-                f"nuisance '{n.label}': unknown scope {n.scope!r}"
-            )
+            raise ValueError(f"nuisance '{n.label}': unknown scope {n.scope!r}")
 
     return ortvec_files, padortvec_files
 
@@ -667,8 +692,10 @@ def _reorder_columns_afni_style(
     new_polort = list(range(len(polort)))
     new_stim = list(range(len(polort), len(polort) + len(stim)))
     start = len(polort) + len(stim)
-    new_padort = list(range(start, start + len(padort))); start += len(padort)
-    new_ort = list(range(start, start + len(ort))); start += len(ort)
+    new_padort = list(range(start, start + len(padort)))
+    start += len(padort)  # noqa: E702
+    new_ort = list(range(start, start + len(ort)))
+    start += len(ort)  # noqa: E702
     new_extra = list(range(start, start + len(extra)))
 
     metadata = dict(metadata)
@@ -718,19 +745,14 @@ def _do_compile(args: argparse.Namespace) -> int:
         )
     elif spec.meta.polort == "auto":
         polort_scalar = max(
-            int(1 + math.floor(n * spec.meta.tr / 150.0))
-            for n in spec.meta.n_timepoints_per_run
+            int(1 + math.floor(n * spec.meta.tr / 150.0)) for n in spec.meta.n_timepoints_per_run
         )
     else:
         polort_scalar = int(spec.meta.polort)
 
-    events_files = [
-        Path(r.events) if r.events else None for r in spec.meta.runs
-    ]
+    events_files = [Path(r.events) if r.events else None for r in spec.meta.runs]
     if any(ef is None for ef in events_files):
-        raise ValueError(
-            "Every [meta].runs entry must have an 'events' field for compile."
-        )
+        raise ValueError("Every [meta].runs entry must have an 'events' field for compile.")
 
     # Expand events → AFNI timing files in a tempdir.
     tmpdir = Path(tempfile.mkdtemp(prefix="ffs_design_spec_"))
@@ -775,7 +797,9 @@ def _do_compile(args: argparse.Namespace) -> int:
     # diff against AFNI's X.xmat.1D unreadable. Permute back here so downstream
     # tools / human inspection match the AFNI convention.
     design, regressor_labels, metadata = _reorder_columns_afni_style(
-        design, regressor_labels, metadata,
+        design,
+        regressor_labels,
+        metadata,
     )
 
     # Resolve contrasts against stim_labels (the expanded labels we actually
@@ -786,9 +810,7 @@ def _do_compile(args: argparse.Namespace) -> int:
         if len(rows) == 1:
             glt_contrasts.append((_resolved_row_to_sym(rows[0]), c.label))
         else:
-            glt_contrasts.append(
-                ([_resolved_row_to_sym(r) for r in rows], c.label)
-            )
+            glt_contrasts.append(([_resolved_row_to_sym(r) for r in rows], c.label))
 
     # Censor.
     good_list_arg: list[int] | None = None

@@ -108,7 +108,7 @@ def apply_polort_projection(
         # zero-padded so they don't affect other runs' timepoints.
         poly = torch.zeros(n_t, 0, device=device, dtype=data_vox_t.dtype)
         run_ends = list(run_starts[1:]) + [n_t]
-        for rs, re in zip(run_starts, run_ends):
+        for rs, re in zip(run_starts, run_ends, strict=False):
             run_len = re - rs
             run_poly = construct_polynomial_matrix(
                 n_timepoints=run_len,
@@ -190,7 +190,7 @@ def apply_high_pass_fft(
     if run_starts is not None and len(run_starts) > 1:
         n_t = data_vox_t.shape[1]
         run_ends = list(run_starts[1:]) + [n_t]
-        for rs, re in zip(run_starts, run_ends):
+        for rs, re in zip(run_starts, run_ends, strict=False):
             data_vox_t[:, rs:re] = _apply_high_pass_single(
                 data_vox_t[:, rs:re],
                 tr,

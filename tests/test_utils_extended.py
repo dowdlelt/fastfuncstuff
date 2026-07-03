@@ -45,7 +45,9 @@ class TestScaleToPercentSignal:
         scaled, violations, info = scale_to_percent_signal(data.clone(), run_starts, verbose=False)
 
         # Mean of each run should be ~100 (within tolerance for clipping)
-        for _run_idx, (start, end) in enumerate(zip(run_starts, run_starts[1:] + [n_tp])):
+        for _run_idx, (start, end) in enumerate(
+            zip(run_starts, run_starts[1:] + [n_tp], strict=False)
+        ):
             run_mean = scaled[:, start:end].mean(dim=1)
             # Most voxels should have mean ~100
             assert torch.abs(run_mean.mean() - 100.0) < 5.0

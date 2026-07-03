@@ -1212,7 +1212,9 @@ def main():
             if len(set(durations)) == 1:
                 print(f"\n  Single duration for all conditions: {durations[0]:.3f}s")
             else:
-                print(f"\n  Per-condition durations: {dict(zip(condition_labels, durations))}")
+                print(
+                    f"\n  Per-condition durations: {dict(zip(condition_labels, durations, strict=False))}"
+                )
 
         else:
             # ── AFNI timing files path ───────────────────────────────────────
@@ -1727,7 +1729,7 @@ def main():
             stim_tops: list = callback_design_info.get("stim_tops", [])
             stim_indices = []
             if stim_bots and stim_tops:
-                for bot, top in zip(stim_bots, stim_tops):
+                for bot, top in zip(stim_bots, stim_tops, strict=False):
                     stim_indices.extend(range(bot, top + 1))
 
             # Extract labels for stimulus columns only (not all 322 columns!)

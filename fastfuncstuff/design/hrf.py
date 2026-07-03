@@ -10,6 +10,7 @@ Both files are at 0.1s temporal resolution and must be:
 1. Normalized to peak amplitude = 1.0
 2. Resampled to the target microtime/TR grid
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -93,9 +94,7 @@ def _resample_hrf(
 
     # Interpolate (clip to source duration to avoid extrapolation issues)
     target_times_clipped = np.clip(target_times, 0, source_times[-1])
-    interpolator = interp1d(
-        source_times, hrf, kind="linear", fill_value=0, bounds_error=False
-    )
+    interpolator = interp1d(source_times, hrf, kind="linear", fill_value=0, bounds_error=False)
     hrf_resampled = interpolator(target_times_clipped)
 
     return hrf_resampled
@@ -441,8 +440,10 @@ def get_spmg1_hrf(
 
     # AFNI SPMG1 formula: exp(-t) * (A1*t^P1 - A2*t^P2)
     # Note: t=0 gives 0, which is correct (HRF starts at 0)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        hrf_highres = np.exp(-t_highres) * (A1 * np.power(t_highres, P1) - A2 * np.power(t_highres, P2))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        hrf_highres = np.exp(-t_highres) * (
+            A1 * np.power(t_highres, P1) - A2 * np.power(t_highres, P2)
+        )
     hrf_highres[0] = 0  # Ensure h(0) = 0
 
     # Convolve with stimulus duration if specified
@@ -451,11 +452,11 @@ def get_spmg1_hrf(
         stim_samples = max(1, int(stim_duration / compute_dt))
         boxcar = np.ones(stim_samples)
         # Convolve (this extends the signal, then truncate)
-        hrf_convolved = np.convolve(hrf_highres, boxcar, mode='full')
+        hrf_convolved = np.convolve(hrf_highres, boxcar, mode="full")
         # Scale by dt to get proper integral (like AFNI does)
         hrf_convolved = hrf_convolved * compute_dt
         # Truncate to original duration
-        hrf_highres = hrf_convolved[:len(t_highres)]
+        hrf_highres = hrf_convolved[: len(t_highres)]
 
     # Normalize to peak = 1.0 if requested
     if normalize_peak:
@@ -468,7 +469,9 @@ def get_spmg1_hrf(
         n_target = int(np.ceil(hrf_duration / microtime_dt))
         target_times = np.arange(n_target) * microtime_dt
         target_times_clipped = np.clip(target_times, 0, t_highres[-1])
-        interpolator = interp1d(t_highres, hrf_highres, kind='linear', fill_value=0, bounds_error=False)
+        interpolator = interp1d(
+            t_highres, hrf_highres, kind="linear", fill_value=0, bounds_error=False
+        )
         hrf_final = interpolator(target_times_clipped)
     else:
         hrf_final = hrf_highres
@@ -573,13 +576,12 @@ def compute_windows_from_durations(
     else:
         if len(add_lag) != n:
             raise ValueError(
-                f"add_lag length ({len(add_lag)}) must be 1 or match "
-                f"number of conditions ({n})"
+                f"add_lag length ({len(add_lag)}) must be 1 or match number of conditions ({n})"
             )
         lags = list(add_lag)
 
     windows: list[tuple[float, float]] = []
-    for dur, lag in zip(durations, lags):
+    for dur, lag in zip(durations, lags, strict=False):
         n_lags = estimate_hrf_window(dur, tr, threshold)
         n_lags = max(1, n_lags + lag)
         windows.append((0.0, float(n_lags) * tr))
@@ -843,15 +845,11 @@ def create_pighs_library(
     m1_vals = np.maximum(m1_vals, 0.0)  # delay can't be negative
 
     # Sample other parameters from LHS (indices 1, 2, 3 since rise_fraction is 0)
-    m3_vals = fall_time_range[0] + samples[:, 1] * (
-        fall_time_range[1] - fall_time_range[0]
-    )
+    m3_vals = fall_time_range[0] + samples[:, 1] * (fall_time_range[1] - fall_time_range[0])
     m4_vals = recovery_time_range[0] + samples[:, 2] * (
         recovery_time_range[1] - recovery_time_range[0]
     )
-    c2_vals = undershoot_range[0] + samples[:, 3] * (
-        undershoot_range[1] - undershoot_range[0]
-    )
+    c2_vals = undershoot_range[0] + samples[:, 3] * (undershoot_range[1] - undershoot_range[0])
 
     # Generate HRFs at high resolution
     t_highres = np.arange(0, duration, gen_dt)
@@ -910,9 +908,7 @@ def create_pighs_library(
     # Measured from the final resampled waveforms (robust to stim_duration shifts).
     t_axis = np.arange(hrfs_resampled.shape[1]) * microtime_dt
 
-    emp_peak_time = np.array([
-        t_axis[np.argmax(h)] for h in hrfs_resampled
-    ])
+    emp_peak_time = np.array([t_axis[np.argmax(h)] for h in hrfs_resampled])
 
     def _fwhm(h: np.ndarray) -> float:
         peak_val = h.max()
@@ -931,7 +927,7 @@ def create_pighs_library(
         neg = np.where(tail < 0)[0]
         if not len(neg):
             return float("inf")
-        return t_axis[peak_idx + int(tail[neg[0]:].argmin() + neg[0])]
+        return t_axis[peak_idx + int(tail[neg[0] :].argmin() + neg[0])]
 
     emp_undershoot_time = np.array([_undershoot_peak_time(h) for h in hrfs_resampled])
 

@@ -207,7 +207,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
         if not _ref_script_source().exists() and not (pd / REF_SCRIPT).exists():
             missing.append(f"{_ref_script_source()}  (ref script not found)")
         try:
-            import scipy
+            import scipy  # noqa: F401
         except ImportError:
             missing.append("scipy (needed for phaseprep reference)")
         for tool in ("3dvolreg", "3dAutomask", "ffs_nwarp"):

@@ -135,7 +135,7 @@ class TestRoundTrip:
     def test_input_files_stored_as_absolute_paths(self, cache_file, dummy_inputs, small_data):
         save_cache(cache_file, small_data, dummy_inputs)
         _, meta = load_cache(cache_file, dummy_inputs)
-        for stored, original in zip(meta["input_files"], dummy_inputs):
+        for stored, original in zip(meta["input_files"], dummy_inputs, strict=False):
             assert Path(stored).is_absolute()
             assert Path(stored) == original.absolute()
 

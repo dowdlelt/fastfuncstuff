@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 try:
-    import nibabel as nib
+    import nibabel as nib  # noqa: F401
 except ImportError:
     print("ERROR: nibabel is required. Install with: pip install nibabel")
     sys.exit(1)
@@ -619,14 +619,14 @@ def main():
 
     # Parse onset files / BIDS events (early pass for condition metadata)
     from fastfuncstuff.cli_utils import clean_condition_labels
+
     all_onsets_bids = None  # populated here for BIDS path; AFNI path populates later
 
     if _has_events:
         from fastfuncstuff.design.bids_events import parse_bids_events
+
         if len(args.events) != n_runs:
-            print(
-                f"ERROR: -events: {len(args.events)} files but {n_runs} input runs"
-            )
+            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs")
             sys.exit(1)
         event_cols = tuple(args.event_cols) if args.event_cols else None
         all_onsets_bids, durations, condition_labels = parse_bids_events(
@@ -751,6 +751,7 @@ def main():
     # Apply onset rounding (after TR is known from data load)
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
+
         all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
 
     # Build microtime onset matrix
@@ -813,12 +814,13 @@ def main():
 
     # Collect user-supplied nuisance regressors into NuisanceBlock list.
     nuisance_blocks = collect_nuisance_blocks(
-        args, run_starts, n_timepoints, verbose=(args.verb >= 1),
+        args,
+        run_starts,
+        n_timepoints,
+        verbose=(args.verb >= 1),
     )
     # Legacy variable retained for back-compat fields (metadata + delta-denoise label).
-    ortvec_files = (
-        [(f, label) for f, label in args.ortvec] if args.ortvec else None
-    )
+    ortvec_files = [(f, label) for f, label in args.ortvec] if args.ortvec else None
 
     results_nodenoise = None  # populated only when -delta_denoise is set
     if args.single_trials:
@@ -1304,7 +1306,9 @@ def main():
         _save_volume(
             delta_xval,
             f"{args.prefix}_delta_xval_r2{_nii_ext}",
-            volume_shape, affine, voxel_mask,
+            volume_shape,
+            affine,
+            voxel_mask,
         )
 
         # In-sample (HRFopt) R² delta — the headline "fit looks better" number.
@@ -1320,7 +1324,9 @@ def main():
             _save_volume(
                 delta_hrfopt,
                 f"{args.prefix}_delta_hrfopt_r2{_nii_ext}",
-                volume_shape, affine, voxel_mask,
+                volume_shape,
+                affine,
+                voxel_mask,
             )
 
         # HRF index: whether selection changed (uint-style mask) and signed shift.
@@ -1331,12 +1337,16 @@ def main():
         _save_volume(
             changed,
             f"{args.prefix}_delta_hrf_changed{_nii_ext}",
-            volume_shape, affine, voxel_mask,
+            volume_shape,
+            affine,
+            voxel_mask,
         )
         _save_volume(
             shift,
             f"{args.prefix}_delta_hrf_index{_nii_ext}",
-            volume_shape, affine, voxel_mask,
+            volume_shape,
+            affine,
+            voxel_mask,
         )
 
         # Summary block — keep it the one piece the user actually reads.
@@ -1345,12 +1355,10 @@ def main():
         pct_changed = 100.0 * n_changed / max(n_voxels, 1)
         med_dxval = float(delta_xval.median().item())
         med_dxval_changed = (
-            float(delta_xval[changed.bool()].median().item())
-            if n_changed > 0 else float("nan")
+            float(delta_xval[changed.bool()].median().item()) if n_changed > 0 else float("nan")
         )
         med_abs_shift_changed = (
-            float(shift[changed.bool()].abs().median().item())
-            if n_changed > 0 else float("nan")
+            float(shift[changed.bool()].abs().median().item()) if n_changed > 0 else float("nan")
         )
 
         print()
@@ -1363,7 +1371,9 @@ def main():
             print(f"  Median Δ xval R² (HRF-changed voxels):   {med_dxval_changed:+.4f}")
             print(f"  Median |Δ HRF index| (changed voxels):   {med_abs_shift_changed:.1f}")
         if delta_hrfopt is not None:
-            print(f"  Median Δ in-sample R²:                   {float(delta_hrfopt.median().item()):+.4f}")
+            print(
+                f"  Median Δ in-sample R²:                   {float(delta_hrfopt.median().item()):+.4f}"
+            )
         print()
 
     # ==========================================================================

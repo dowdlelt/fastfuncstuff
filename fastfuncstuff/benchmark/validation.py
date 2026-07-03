@@ -33,6 +33,7 @@ def _guard_missing_inputs(*metric_keys: str) -> Callable[[Callable], Callable]:
     ``validate()`` degrade (score what it can, fail/skip the rest) rather than
     blowing up the whole stage with a raw I/O error after the expensive run.
     """
+
     def decorator(fn: Callable) -> Callable:
         @functools.wraps(fn)
         def wrapper(a_path: Any, b_path: Any, *args: Any, **kwargs: Any) -> dict:
@@ -43,7 +44,9 @@ def _guard_missing_inputs(*metric_keys: str) -> Callable[[Callable], Callable]:
                 out["missing"] = missing
                 return out
             return fn(a_path, b_path, *args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
@@ -57,7 +60,7 @@ def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
     a, b = a[valid], b[valid]
     a_c = a - a.mean()
     b_c = b - b.mean()
-    denom = np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())
+    denom = np.sqrt((a_c**2).sum() * (b_c**2).sum())
     if denom < 1e-15:
         return 0.0
     return float((a_c * b_c).sum() / denom)
@@ -303,7 +306,7 @@ def compare_moco_ssd(
     per_vol_msd = []
     for t in range(nt):
         diff = a[t].reshape(-1)[mask_flat] - b[t].reshape(-1)[mask_flat]
-        msd = float((diff ** 2).mean())
+        msd = float((diff**2).mean())
         per_vol_msd.append(msd)
 
     per_vol_msd_arr = np.array(per_vol_msd)
@@ -363,7 +366,9 @@ def compare_ica_components(
     row_idx, col_idx, matched_corrs = optimal_matching(abs_corr)
     report = consistency_report(abs_corr)
 
-    matches = [(int(r), int(c), float(v)) for r, c, v in zip(row_idx, col_idx, matched_corrs)]
+    matches = [
+        (int(r), int(c), float(v)) for r, c, v in zip(row_idx, col_idx, matched_corrs, strict=False)
+    ]
     return {
         "mean_matched_r": float(matched_corrs.mean()),
         "median_matched_r": float(np.median(matched_corrs)),
@@ -389,6 +394,7 @@ def compare_aff12(
         dict with rotation_diff_deg (3,), translation_diff_mm (3,),
         max_angle_diff, max_trans_diff, frobenius_norm.
     """
+
     def _load_aff12(path: str | Path) -> np.ndarray:
         """Load an AFNI .aff12.1D file as a 3×4 matrix."""
         raw = np.loadtxt(str(path), comments="#")
@@ -412,7 +418,7 @@ def compare_aff12(
         t = mat[:3, 3]
 
         # Euler angles (xyz convention, same as AFNI)
-        sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
         singular = sy < 1e-6
         if not singular:
             rx = np.arctan2(R[2, 1], R[2, 2])
@@ -470,9 +476,7 @@ def compare_aff12_series(
     if b.ndim == 1:
         b = b.reshape(1, -1)
     if a.shape != b.shape or a.shape[1] != 12:
-        return {
-            "error": f"shape mismatch or wrong width: a={a.shape} b={b.shape}"
-        }
+        return {"error": f"shape mismatch or wrong width: a={a.shape} b={b.shape}"}
 
     diff = np.abs(a - b)
     trans_cols = [3, 7, 11]
@@ -572,7 +576,7 @@ def compare_im_bucket(
     b, _ = _load_vol(b_path)
 
     if a.dim() == 4:
-        a = a.permute(3, 0, 1, 2)   # (n_bricks, x, y, z)
+        a = a.permute(3, 0, 1, 2)  # (n_bricks, x, y, z)
     elif a.dim() == 3:
         a = a.unsqueeze(0)
     if b.dim() == 4:
@@ -590,6 +594,7 @@ def compare_im_bucket(
 
     def _spatial_r(vol_a: Tensor, vol_b: Tensor) -> float:
         from ..stats.spatial import spatial_correlation
+
         return float(spatial_correlation(vol_a, vol_b, mask=mask, method="pearson"))
 
     def _temporal_r(vols_a: Tensor, vols_b: Tensor) -> float:
@@ -613,8 +618,8 @@ def compare_im_bucket(
     fstat = {"r": _spatial_r(a[0], b[0])}
 
     # Separate even/odd sub-bricks (starting from vol 1)
-    beta_idx  = list(range(1, n, 2))   # 1, 3, 5, ...
-    tstat_idx = list(range(2, n, 2))   # 2, 4, 6, ...
+    beta_idx = list(range(1, n, 2))  # 1, 3, 5, ...
+    tstat_idx = list(range(2, n, 2))  # 2, 4, 6, ...
 
     def _brick_stats(indices: list[int]) -> dict:
         if not indices:
@@ -624,12 +629,12 @@ def compare_im_bucket(
         vols_b = torch.stack([b[i] for i in indices])
         return {
             "mean_r": float(np.mean(r_vals)),
-            "min_r":  float(np.min(r_vals)),
+            "min_r": float(np.min(r_vals)),
             "temporal_median_r": _temporal_r(vols_a, vols_b),
             "n": len(indices),
         }
 
-    beta_stats  = _brick_stats(beta_idx)
+    beta_stats = _brick_stats(beta_idx)
     tstat_stats = _brick_stats(tstat_idx)
 
     return {
@@ -687,6 +692,7 @@ def compare_prob_maps(
     cross_block = cross[:k, k:]  # (k, k) cross-correlation block
 
     from scipy.optimize import linear_sum_assignment
+
     row_ind, col_ind = linear_sum_assignment(1.0 - cross_block)
     corrs = cross_block[row_ind, col_ind]
 

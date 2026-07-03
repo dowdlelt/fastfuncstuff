@@ -1597,7 +1597,7 @@ def single_trial_cv_helper(
         sse_accum = torch.zeros(n_variants, n_voxels, device="cpu")
         total_test_trials = 0
 
-        for fold_idx, (train_mask, test_indices, test_conditions, cond_train_masks) in enumerate(
+        for fold_idx, (train_mask, test_indices, test_conditions, cond_train_masks) in enumerate(  # noqa: B007
             fold_info
         ):
             if verbose:
@@ -1635,8 +1635,8 @@ def single_trial_cv_helper(
                     # (n_variants, n_chunk, n_train_cond)
                     train_betas = betas_chunk[:, :, cm]
                     n_train = train_betas.shape[-1]
-                    sum_train = train_betas.sum(dim=-1)           # (n_variants, n_chunk)
-                    sum_sq_train = (train_betas ** 2).sum(dim=-1) # (n_variants, n_chunk)
+                    sum_train = train_betas.sum(dim=-1)  # (n_variants, n_chunk)
+                    sum_sq_train = (train_betas**2).sum(dim=-1)  # (n_variants, n_chunk)
 
                     # (n_chunk, n_cond_test) — test betas for this condition
                     test_betas = test_betas_ref[:, test_cond_mask]

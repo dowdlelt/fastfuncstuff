@@ -341,7 +341,7 @@ class TestCLIUtilityFunctions:
 
         # Structure unchanged.
         assert len(nuisance_per_run) == n_runs
-        for i, run_nuisance in enumerate(nuisance_per_run):
+        for i, run_nuisance in enumerate(nuisance_per_run):  # noqa: B007
             expected_shape = (n_timepoints, n_nuisance)
             assert run_nuisance.shape == expected_shape
 

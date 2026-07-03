@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 try:
-    import nibabel as nib
+    import nibabel as nib  # noqa: F401
 except ImportError:
     print("ERROR: nibabel is required. Install with: pip install nibabel")
     sys.exit(1)
@@ -65,7 +65,7 @@ try:
     from fastfuncstuff.denoise.sequential import select_noise_pool_voxels
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
     from fastfuncstuff.design.hrf import get_hrf_library
-    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.glm.ridge import load_hrf_indices
     from fastfuncstuff.io.afni import save_nifti
@@ -73,7 +73,7 @@ try:
         configure_torch_backends,
         get_device,
         scale_to_percent_signal,
-        to_tensor,
+        to_tensor,  # noqa: F401
     )
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")

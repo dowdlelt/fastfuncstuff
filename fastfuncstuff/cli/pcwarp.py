@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         ax = args.axes.upper()
         do_x, do_y, do_z = "X" in ax, "Y" in ax, "Z" in ax
         if args.verb >= 1:
-            labels = [a for a, active in zip("XYZ", [do_x, do_y, do_z]) if active]
+            labels = [a for a, active in zip("XYZ", [do_x, do_y, do_z], strict=False) if active]
             print(f"  Forced axes    : {'+'.join(labels)}")
     else:
         if args.verb >= 1:

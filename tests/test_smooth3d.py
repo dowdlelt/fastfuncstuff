@@ -1,4 +1,5 @@
 """Correctness for fastfuncstuff.stats.smooth3d (variance smoothing)."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -56,12 +57,11 @@ def test_mask_aware_constant_variance_stays_constant():
 
 def test_smooth_var_per_perm_preserves_shape():
     rng = np.random.default_rng(1)
-    mask = np.zeros((10, 10, 6), dtype=bool); mask[1:9, 1:9, 1:5] = True
+    mask = np.zeros((10, 10, 6), dtype=bool)
+    mask[1:9, 1:9, 1:5] = True  # noqa: E702
     V = int(mask.sum())
     P = 7
-    var_pv = torch.from_numpy(
-        rng.uniform(0.5, 2.0, size=(P, V)).astype(np.float32)
-    )
+    var_pv = torch.from_numpy(rng.uniform(0.5, 2.0, size=(P, V)).astype(np.float32))
     out = smooth_var_per_perm(var_pv, mask, sigma_vox=(1.0, 1.0, 1.0), device="cpu")
     assert out.shape == var_pv.shape
     # Smoothed variance stays positive

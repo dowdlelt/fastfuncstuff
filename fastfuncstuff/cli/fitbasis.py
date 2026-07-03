@@ -1415,7 +1415,7 @@ def main() -> int:
                 # Block-trace per voxel: σ²_v · Σ_b tr(C⁻¹ · (A⁻¹)_b)
                 # via per-cell packed designs cached in _run_cell_fit.
                 block_trace_summed = np.zeros(n_voxels_total, dtype=np.float32)
-                for cell, packed_cell in zip(arma_cells, cell_packed_cache):
+                for cell, packed_cell in zip(arma_cells, cell_packed_cache, strict=False):
                     idx = cell.voxel_indices
                     block_trace_summed[idx] = compute_vb_block_trace(
                         design=packed_cell.design_concat,
@@ -1518,7 +1518,7 @@ def main() -> int:
                 # 5. VB β_size update from new posterior.
                 if args.vb_update_prior and args.reg in {"ridge", "mvn", "mvn-shape"}:
                     block_trace_summed = np.zeros(n_voxels_total, dtype=np.float32)
-                    for cell, packed_cell in zip(arma_cells, cell_packed_cache):
+                    for cell, packed_cell in zip(arma_cells, cell_packed_cache, strict=False):
                         idx = cell.voxel_indices
                         block_trace_summed[idx] = compute_vb_block_trace(
                             design=packed_cell.design_concat,

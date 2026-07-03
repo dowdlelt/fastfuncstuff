@@ -723,6 +723,7 @@ def _llr_denoise(
         for vals, target in zip(
             [idx_removed_vec.float(), local_noise_vec, e_rem_vec, snr_w_vec],
             [threshold_flat, noise_flat, energy_flat, snr_flat],
+            strict=False,
         ):
             target.index_add_(0, flat_b, vals.repeat_interleave(M))
         del idx_removed_vec, local_noise_vec, e_rem_vec, snr_w_vec, flat_b

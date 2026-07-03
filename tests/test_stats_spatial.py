@@ -69,7 +69,7 @@ class TestOptimalMatching:
     def test_optimal_matching_identity_matrix(self):
         corr = np.eye(4, dtype=np.float64)
         rows, cols, corrs = optimal_matching(corr)
-        pairs = sorted(zip(rows.tolist(), cols.tolist()))
+        pairs = sorted(zip(rows.tolist(), cols.tolist(), strict=False))
         expected = [(i, i) for i in range(4)]
         assert pairs == expected
         np.testing.assert_allclose(corrs, np.ones(4), atol=1e-12)
