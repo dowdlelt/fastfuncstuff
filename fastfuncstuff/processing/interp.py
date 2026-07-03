@@ -109,9 +109,12 @@ def warp_image_linear(
 
     # Zero outside source bounds
     out_of_bounds = (
-        (x_coords < -0.5) | (x_coords > src_nx - 0.5) |
-        (y_coords < -0.5) | (y_coords > src_ny - 0.5) |
-        (z_coords < -0.5) | (z_coords > src_nz - 0.5)
+        (x_coords < -0.5)
+        | (x_coords > src_nx - 0.5)
+        | (y_coords < -0.5)
+        | (y_coords > src_ny - 0.5)
+        | (z_coords < -0.5)
+        | (z_coords > src_nz - 0.5)
     )
 
     x_coords = x_coords.clamp(-0.499, src_nx - 0.501)
@@ -194,9 +197,12 @@ def nearest_resample_3d(
     out_shape = x_coords.shape
     xf, yf, zf = x_coords.reshape(-1), y_coords.reshape(-1), z_coords.reshape(-1)
     out_of_bounds = (
-        (xf < -0.5) | (xf > nx - 0.5) |
-        (yf < -0.5) | (yf > ny - 0.5) |
-        (zf < -0.5) | (zf > nz - 0.5)
+        (xf < -0.5)
+        | (xf > nx - 0.5)
+        | (yf < -0.5)
+        | (yf > ny - 0.5)
+        | (zf < -0.5)
+        | (zf > nz - 0.5)
     )
     xi = xf.round().long().clamp(0, nx - 1)
     yi = yf.round().long().clamp(0, ny - 1)
@@ -237,9 +243,7 @@ def warp_image(
     if mode == "nearest":
         result = nearest_resample_3d(source, ii + warp_xd, jj + warp_yd, kk + warp_zd)
     else:
-        result = _separable_resample_3d(
-            source, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode
-        )
+        result = _separable_resample_3d(source, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)
     if mask is not None:
         result = result * mask.float()
     return result
@@ -368,9 +372,9 @@ def _wsinc5_kernel(fx: Tensor) -> Tensor:
 # past the floor integer.  Taps are at offsets from the floor position.
 # ---------------------------------------------------------------------------
 
-_CUBIC_HALF = 2       # 4 taps: floor-1 .. floor+2
-_QUINTIC_HALF = 3     # 6 taps: floor-2 .. floor+3
-_HEPTIC_HALF = 4      # 8 taps: floor-3 .. floor+4
+_CUBIC_HALF = 2  # 4 taps: floor-1 .. floor+2
+_QUINTIC_HALF = 3  # 6 taps: floor-2 .. floor+3
+_HEPTIC_HALF = 4  # 8 taps: floor-3 .. floor+4
 
 
 def _cubic_kernel(fx: Tensor) -> Tensor:
@@ -451,10 +455,10 @@ def _heptic_kernel(fx: Tensor) -> Tensor:
 # Floor convention: fx in [0,1), taps offset from floor(x)
 # Round convention: frac in [-0.5,0.5], taps offset from round(x)
 _KERNELS = {
-    "wsinc5":  (_wsinc5_kernel,  5, True),   # floor convention, 10 taps (-4..+5)
-    "cubic":   (_cubic_kernel,   2, True),    # floor convention
-    "quintic": (_quintic_kernel, 3, True),    # floor convention
-    "heptic":  (_heptic_kernel,  4, True),    # floor convention
+    "wsinc5": (_wsinc5_kernel, 5, True),  # floor convention, 10 taps (-4..+5)
+    "cubic": (_cubic_kernel, 2, True),  # floor convention
+    "quintic": (_quintic_kernel, 3, True),  # floor convention
+    "heptic": (_heptic_kernel, 4, True),  # floor convention
 }
 
 
@@ -477,9 +481,19 @@ def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int
     """
     from ..memory import get_available_memory
 
-    # Per-point peak: the (ntaps, ntaps) slab + its x-contraction scratch, the
-    # three weight tables and three index tables (all ntaps), and the coords.
-    bytes_per_point = (2 * ntaps**2 + 8 * ntaps + 8) * 4
+    # Per-point peak of _gather_contract, in float32-equivalent (4-byte) units.
+    # The dominant cost is *not* the float slab: advanced indexing
+    # ``source[zi[:,t][:,None,None], yi[:,:,None], xi[:,None,:]]`` makes PyTorch
+    # materialize three broadcasted (c, ntaps, ntaps) INT64 index grids (8 bytes
+    # each) before the gather -- 6*ntaps**2 in 4-byte units, three times the whole
+    # float slab. Omitting them (the old 2*ntaps**2 model) undersized the chunk ~3x
+    # and OOM'd on large padded grids. Terms:
+    #   6*ntaps**2 : 3 broadcasted int64 index grids (the real peak)
+    #   2*ntaps**2 : the gathered slab + its (slab * wx) product
+    #   6*ntaps    : xi/yi/zi int64 tap tables (3 * ntaps * 2)
+    #   3*ntaps    : wx/wy/wz float tap tables
+    #   8          : per-point coord/base scratch
+    bytes_per_point = (8 * ntaps**2 + 9 * ntaps + 8) * 4
     avail = get_available_memory(device)
     chunk = int(avail // max(1, bytes_per_point))
     return max(1, min(n_points, chunk))
@@ -507,8 +521,13 @@ def _axis_weights(kernel_fn, frac: Tensor) -> Tensor:
 
 
 def _gather_contract(
-    source: Tensor, xi: Tensor, yi: Tensor, zi: Tensor,
-    wx: Tensor, wy: Tensor, wz: Tensor,
+    source: Tensor,
+    xi: Tensor,
+    yi: Tensor,
+    zi: Tensor,
+    wx: Tensor,
+    wy: Tensor,
+    wz: Tensor,
 ) -> Tensor:
     """Three-pass separable gather+contract for one chunk (AFNI wsinc5p order).
 
@@ -524,8 +543,8 @@ def _gather_contract(
     for t in range(ntaps):
         plane = source[zi[:, t][:, None, None], yi[:, :, None], xi[:, None, :]]
         sx = (plane * wx[:, None, :]).sum(dim=2)  # (c, ty)  contract X
-        sxy = (sx * wy).sum(dim=1)                # (c,)     contract Y
-        acc = acc + sxy * wz[:, t]                # accumulate Z
+        sxy = (sx * wy).sum(dim=1)  # (c,)     contract Y
+        acc = acc + sxy * wz[:, t]  # accumulate Z
     return acc
 
 
@@ -620,9 +639,12 @@ def _separable_resample_3d(
     # just skips the kernel for voxels that would have been zeroed (often
     # 30-50% of the grid for skull-stripped / cropped-FOV warps).
     in_bounds = (
-        (x_flat >= -0.5) & (x_flat <= nx - 0.5) &
-        (y_flat >= -0.5) & (y_flat <= ny - 0.5) &
-        (z_flat >= -0.5) & (z_flat <= nz - 0.5)
+        (x_flat >= -0.5)
+        & (x_flat <= nx - 0.5)
+        & (y_flat >= -0.5)
+        & (y_flat <= ny - 0.5)
+        & (z_flat >= -0.5)
+        & (z_flat <= nz - 0.5)
     )
 
     # S3 (AFNI ISTINY, :638-641): a center sitting on a grid node (fractional
