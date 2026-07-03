@@ -9,7 +9,10 @@ import pytest
 import torch
 
 from fastfuncstuff.memory import (
+    NORDIC_GPU_MAX_FRACTION,
+    NORDIC_GPU_RESERVE_BYTES,
     MemoryConfig,
+    _nordic_budget_from_free,
     bytes_per_voxel_arma,
     bytes_per_voxel_denoise,
     bytes_per_voxel_glm,
@@ -570,3 +573,34 @@ class TestPlanNordicLLRMemory:
             avail_bytes=avail,
         )
         assert plan["svd_batch_size"] <= 256
+
+
+class TestNordicBudgetFromFree:
+    """The fixed-reserve / fraction-cap GPU budget policy for NORDIC LLR."""
+
+    GiB = 1024**3
+
+    def test_large_idle_card_fraction_binds(self):
+        """On a big idle card the fraction cap limits the grab (courtesy)."""
+        free = 30 * self.GiB
+        budget = _nordic_budget_from_free(free)
+        assert budget == int(free * NORDIC_GPU_MAX_FRACTION)
+        assert budget < free - NORDIC_GPU_RESERVE_BYTES
+
+    def test_nearly_full_card_reserve_binds(self):
+        """On a nearly-full card the fixed reserve limits the grab (allocator
+        headroom + protecting other tenants)."""
+        free = 6 * self.GiB
+        budget = _nordic_budget_from_free(free)
+        assert budget == free - NORDIC_GPU_RESERVE_BYTES
+        assert budget < int(free * NORDIC_GPU_MAX_FRACTION)
+
+    def test_free_below_reserve_is_nonnegative(self):
+        """Free smaller than the reserve yields a floored-at-zero budget."""
+        assert _nordic_budget_from_free(self.GiB) == 0
+
+    def test_looser_than_half_for_this_data(self):
+        """Regression intent: the policy leaves materially more than the old flat
+        0.5x free, so the LLR batch is not starved."""
+        free = 10 * self.GiB
+        assert _nordic_budget_from_free(free) > free // 2

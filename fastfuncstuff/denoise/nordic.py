@@ -36,7 +36,7 @@ from tqdm.auto import tqdm
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import (
     estimate_chunk_size,
-    get_available_memory,
+    nordic_llr_gpu_budget,
     plan_nordic_llr_memory,
 )
 from fastfuncstuff.utils import get_device, to_tensor
@@ -1801,7 +1801,7 @@ def _llr_main_pass(
     # so also shrink svd_batch_size to fit the remaining budget.
     svd_batch_size = cfg.svd_batch_size
     if dev.type == "cuda":
-        avail = get_available_memory(dev)
+        avail = nordic_llr_gpu_budget(dev)
         plan = plan_nordic_llr_memory(
             shape=KSP2.shape,
             kernel_size=kernel_pca,
@@ -1955,7 +1955,7 @@ def run_nordic_multiecho(
     data_echoes: list[torch.Tensor] = [p.ksp2 for p in prepped]  # type: ignore[misc]
     svd_batch_size = cfg.svd_batch_size
     if dev.type == "cuda":
-        avail = get_available_memory(dev)
+        avail = nordic_llr_gpu_budget(dev)
         plan = plan_nordic_llr_memory(
             shape=data_echoes[0].shape,
             kernel_size=prepped[0].kernel_pca,

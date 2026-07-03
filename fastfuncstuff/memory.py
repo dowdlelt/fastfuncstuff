@@ -816,6 +816,49 @@ def plan_nordic_llr_memory(
     }
 
 
+# NORDIC LLR budgets an *itemized* footprint (estimate_nordic_llr_memory counts
+# every large tensor explicitly), so it does not need the blanket multiplicative
+# model-error cushion the per-voxel chunk estimators rely on. It needs only slack
+# for the caching allocator's reservation/fragmentation, plus courtesy on a
+# shared card. A fixed reserve protects other tenants when the card is nearly
+# full; a fraction cap avoids hogging a big idle card.
+NORDIC_GPU_RESERVE_BYTES = 2 * 1024**3  # allocator + fragmentation headroom
+NORDIC_GPU_MAX_FRACTION = 0.8  # never grab more than this share of free memory
+
+
+def _nordic_budget_from_free(free_bytes: int) -> int:
+    """Policy: bytes usable for a NORDIC LLR pass given ``free_bytes`` free.
+
+    ``free - reserve`` floored against ``fraction * free`` — the reserve binds on
+    a nearly-full card, the fraction binds on a large idle one.
+    """
+    return max(
+        0,
+        min(free_bytes - NORDIC_GPU_RESERVE_BYTES, int(free_bytes * NORDIC_GPU_MAX_FRACTION)),
+    )
+
+
+def nordic_llr_gpu_budget(device: torch.device) -> int:
+    """GPU memory budget (bytes) for a NORDIC LLR pass.
+
+    Unlike :func:`get_available_memory`'s flat multiplicative safety factor, this
+    uses a fixed reserve floored against a fraction of free memory, which suits
+    the itemized LLR estimate (see :func:`estimate_nordic_llr_memory`). An
+    explicit ``FFS_GPU_SAFETY_FACTOR`` override still wins, and non-CUDA devices
+    or query failures fall back to :func:`get_available_memory`.
+    """
+    if device.type != "cuda" or "FFS_GPU_SAFETY_FACTOR" in os.environ:
+        return get_available_memory(device)
+    try:
+        torch.cuda.empty_cache()
+        reserved = torch.cuda.memory_reserved(device)
+        total = torch.cuda.get_device_properties(device).total_memory
+        free = total - reserved
+    except Exception:
+        return get_available_memory(device)
+    return _nordic_budget_from_free(free)
+
+
 def dyn_chunk_estimator(
     n_voxels: int,
     n_timepoints: int,
