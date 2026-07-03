@@ -619,19 +619,12 @@ def test_decouple_amplitude_prior_preserves_amplitude(basis):
         f"({err_dec_amp:.3f}) than full-mvn ({err_mvn_amp:.3f})."
     )
 
-    # On the shape (derivative, col 1) coefficient: BOTH priors
-    # should shrink it; the decoupled prior shouldn't undo the shape
-    # constraint.  Check that decoupled derivative magnitude isn't
-    # dramatically larger than mvn's.
-    deriv_mvn = (
-        np.abs(fit_mvn.betas[:, 1]).median()
-        if hasattr(np.abs(fit_mvn.betas[:, 1]), "median")
-        else float(np.median(np.abs(fit_mvn.betas[:, 1])))
-    )
+    # On the shape (derivative, col 1) coefficient: the decoupled prior should
+    # still shrink it and not undo the shape constraint. Concretely we check the
+    # decoupled derivative magnitude sits well below OLS (this assertion checks
+    # shrinkage vs OLS only; it does not compare against full-mvn).
     deriv_dec = float(np.median(np.abs(fit_dec.betas[:, 1])))
     deriv_ols = float(np.median(np.abs(fit_mvn.betas_ols[:, 1])))
-    # Decoupled should still shrink derivative — it should be closer
-    # to mvn than to OLS.
     assert deriv_dec < deriv_ols * 0.8
 
 
