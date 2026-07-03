@@ -2662,6 +2662,15 @@ def _run_tensorial_ica(
         out_file=Path(f"{out_prefix}_tensor_ica_maps_mean{nii_ext}"),
     )
 
+    # Temporal mean image (cross-run mean underlay), the same full-volume mean
+    # the temp_concat path emits via its MELODIC-compat output. Distinct from
+    # ica_maps_mean above, which is the run-averaged component maps.
+    from fastfuncstuff.io.afni import save_nifti
+
+    mean_image_path = f"{out_prefix}_tensor_mean{nii_ext}"
+    save_nifti(mean3d.astype(np.float32), output_path=Path(mean_image_path), affine=affine)
+    _vprint(args.verb >= 1, f"Mean image: {mean_image_path}")
+
     # Shared timecourses
     np.savetxt(f"{out_prefix}_tensor_ica_timecourses.1D", mixing_np, fmt="%.6f", delimiter="\t")
     _vprint(args.verb >= 1, f"Shared timecourses: {out_prefix}_tensor_ica_timecourses.1D")
@@ -2742,6 +2751,7 @@ def _run_tensorial_ica(
         "outputs": {
             "ica_maps_per_run": per_run_map_paths,
             "ica_maps_mean": f"{out_prefix}_tensor_ica_maps_mean{nii_ext}",
+            "mean_image": mean_image_path,
             "ica_timecourses_shared": f"{out_prefix}_tensor_ica_timecourses.1D",
             "pca_scree_plot": f"{out_prefix}_tensor_pca_scree.png",
             "ica_zmaps": f"{out_prefix}_tensor_ica_zmaps{nii_ext}" if args.save_mixture_z else None,
