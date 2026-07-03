@@ -61,8 +61,13 @@ try:
     from fastfuncstuff.glm.outputs import (
         slice_glm_results,
         write_glm_bucket_as_nifti,
+        write_single_trials_output,
     )
-    from fastfuncstuff.utils import configure_torch_backends, gaussian_blur_3d, scale_to_percent_signal
+    from fastfuncstuff.utils import (
+        configure_torch_backends,
+        gaussian_blur_3d,
+        scale_to_percent_signal,
+    )
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -132,17 +137,24 @@ def _extract_grid_args(argv: list[str]) -> tuple[list[str], str | None, str | No
     while i < len(argv):
         tok = argv[i]
         if tok in ("-a_grid", "--a_grid") and i + 1 < len(argv):
-            a_grid_str = argv[i + 1]; i += 2; continue
+            a_grid_str = argv[i + 1]
+            i += 2
+            continue
         if tok in ("-b_grid", "--b_grid") and i + 1 < len(argv):
-            b_grid_str = argv[i + 1]; i += 2; continue
+            b_grid_str = argv[i + 1]
+            i += 2
+            continue
         if tok.startswith(("-a_grid=", "--a_grid=")):
-            a_grid_str = tok.split("=", 1)[1]; i += 1; continue
+            a_grid_str = tok.split("=", 1)[1]
+            i += 1
+            continue
         if tok.startswith(("-b_grid=", "--b_grid=")):
-            b_grid_str = tok.split("=", 1)[1]; i += 1; continue
+            b_grid_str = tok.split("=", 1)[1]
+            i += 1
+            continue
         new_argv.append(tok)
         i += 1
     return new_argv, a_grid_str, b_grid_str
-
 
 
 def detect_format(filepath: str) -> str:
@@ -159,9 +171,7 @@ def detect_format(filepath: str) -> str:
         return "nii.gz"
 
 
-def extract_onset_times_from_design(
-    design_matrix: np.ndarray, column_indices: list
-) -> list:
+def extract_onset_times_from_design(design_matrix: np.ndarray, column_indices: list) -> list:
     """
     Extract onset times for stimulus columns from design matrix.
 
@@ -197,82 +207,6 @@ def extract_onset_times_from_design(
         onset_times.append(onset_time)
 
     return onset_times
-
-
-def write_single_trials_output(
-    results,
-    output_path: str,
-    design_matrix: np.ndarray,
-    stim_indices: list,
-    stim_labels: list,
-):
-    """
-    Write single-trial betas reordered by presentation time.
-
-    Parameters
-    ----------
-    results : GLMResults or ARMA11Results
-        Results object with betas attribute
-    output_path : str
-        Output file path (e.g., "ols_single.nii.gz")
-    design_matrix : np.ndarray
-        Full design matrix (n_timepoints, n_regressors)
-    stim_indices : list of int
-        Column indices for stimulus regressors
-    stim_labels : list of str
-        Labels for stimulus regressors
-    """
-    import nibabel as nib
-
-    from fastfuncstuff.glm.outputs import (
-        _ensure_numpy,
-        _get_voxel_mask,
-        _reshape_parameter_map,
-        _resolve_shape,
-    )
-
-    # Extract onset times for each stimulus column
-    onset_times = extract_onset_times_from_design(design_matrix, stim_indices)
-
-    # Create sort order (sorts by onset time, maintaining stable order for ties)
-    sort_indices = sorted(range(len(onset_times)), key=lambda i: (onset_times[i], i))
-
-    # Reorder betas by onset time
-    betas_np = _ensure_numpy(results.betas)
-    betas_reordered = betas_np[:, sort_indices]  # (n_voxels, n_stimuli)
-
-    # Reorder labels
-    labels_reordered = [stim_labels[i] for i in sort_indices] if stim_labels else None
-
-    # Reshape to volume
-    affine = getattr(results, "affine", np.eye(4))
-    volume_shape = _resolve_shape(results, None)
-    voxel_mask = _get_voxel_mask(results)
-    betas_vol = _reshape_parameter_map(betas_reordered, volume_shape, voxel_mask)
-
-    # Write NIfTI file
-    output_path_clean = replace_afni_extension(output_path, ".nii.gz")
-    save_nifti(betas_vol, output_path=output_path_clean, affine=affine)
-
-    # Write labels as JSON sidecar
-    if labels_reordered:
-        import json
-        from pathlib import Path
-
-        json_path = Path(output_path_clean).with_suffix(".json")
-        with json_path.open("w") as f:
-            json.dump(
-                {
-                    "Description": "Single-trial betas reordered by presentation time (onset order)",
-                    "Labels": labels_reordered,
-                    "OnsetTimes": [onset_times[i] for i in sort_indices],
-                    "OriginalColumnIndices": [stim_indices[i] for i in sort_indices],
-                },
-                f,
-                indent=2,
-            )
-
-    return output_path_clean
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -340,15 +274,15 @@ Examples:
         "-spec",
         required=False,
         help="ffs_design_spec TOML file. Compiled to <specname>.xmat.1D before "
-             "the GLM runs (so REML errors out fast on a bad spec rather than "
-             "after a long data load). Mutually exclusive with -matrix / -onsets / -events.",
+        "the GLM runs (so REML errors out fast on a bad spec rather than "
+        "after a long data load). Mutually exclusive with -matrix / -onsets / -events.",
     )
     required.add_argument(
         "-xmat",
         required=False,
         help="When using -spec, override the auto-derived output xmat path "
-             "(default: <specname>.xmat.1D in the spec's directory). Ignored "
-             "without -spec.",
+        "(default: <specname>.xmat.1D in the spec's directory). Ignored "
+        "without -spec.",
     )
     required.add_argument(
         "-overwrite",
@@ -367,19 +301,17 @@ Examples:
         dest="Rlklhd",
         metavar="PREFIX",
         help="Output full REML likelihood surface: 4D NIfTI with one sub-brik per valid "
-             "(a,b) grid point (~117 sub-briks). Sub-brik k = L(a_k, b_k) per voxel. "
-             "Sub-briks are labeled 'a=0.00_b=0.30' etc. Argmin sub-brik identifies "
-             "the selected (a,b) pair for each voxel.",
+        "(a,b) grid point (~117 sub-briks). Sub-brik k = L(a_k, b_k) per voxel. "
+        "Sub-briks are labeled 'a=0.00_b=0.30' etc. Argmin sub-brik identifies "
+        "the selected (a,b) pair for each voxel.",
     )
     reml_out.add_argument(
         "-load_Rvar",
         help="Load precomputed ARMA parameters from this file to skip the grid search "
-             "(saves ~80%% compute time on re-runs). Must be a -Rvar output from a "
-             "previous run. If not specified, the grid search always runs from scratch.",
+        "(saves ~80%% compute time on re-runs). Must be a -Rvar output from a "
+        "previous run. If not specified, the grid search always runs from scratch.",
     )
-    reml_out.add_argument(
-        "-Rbuck", help="Output REML betas + statistics (main bucket output)"
-    )
+    reml_out.add_argument("-Rbuck", help="Output REML betas + statistics (main bucket output)")
     reml_out.add_argument("-Rbeta", help="Output REML betas only (no statistics)")
     reml_out.add_argument(
         "-Rnuisance", help="Output REML betas + statistics for NUISANCE regressors only"
@@ -390,9 +322,7 @@ Examples:
 
     # Output arguments - OLS
     ols_out = parser.add_argument_group("OLS Output Options (for comparison)")
-    ols_out.add_argument(
-        "-Obuck", help="Output OLS betas + statistics (main bucket output)"
-    )
+    ols_out.add_argument("-Obuck", help="Output OLS betas + statistics (main bucket output)")
     ols_out.add_argument("-Obeta", help="Output OLS betas only (no statistics)")
     ols_out.add_argument(
         "-Onuisance", help="Output OLS betas + statistics for NUISANCE regressors only"
@@ -414,7 +344,8 @@ Examples:
     # Special output options
     special_out = parser.add_argument_group("Special Output Options")
     special_out.add_argument(
-        "-single_trials", "-single-trials",
+        "-single_trials",
+        "-single-trials",
         dest="single_trials",
         type=str,
         default=None,
@@ -650,7 +581,8 @@ Examples:
         ),
     )
     vox_opts.add_argument(
-        "-dsort_nods", "-dsort-nods",
+        "-dsort_nods",
+        "-dsort-nods",
         dest="dsort_nods",
         action="store_true",
         help=(
@@ -673,7 +605,8 @@ Examples:
         ),
     )
     vox_opts.add_argument(
-        "-slibase_sm", "-slibase-sm",
+        "-slibase_sm",
+        "-slibase-sm",
         dest="slibase_sm",
         action="append",
         metavar="FILE.1D",
@@ -775,12 +708,14 @@ Examples:
         type=str,
         default="spmg1",
         help="HRF model: 'spmg1' (default), 'spmg2', 'spmg3', 'glmsingle', 'FIR', 'TENT', or 'TENT(bot,top,n)'. "
-             "SPMG2 = canonical + temporal derivative. SPMG3 = canonical + time + dispersion derivatives. "
-             "FIR/TENT use durations to set window (default: 0 to max(durations)). "
-             "Example: 'TENT(0,15,6)' for 6 tent basis functions from 0-15s",
+        "SPMG2 = canonical + temporal derivative. SPMG3 = canonical + time + dispersion derivatives. "
+        "FIR/TENT use durations to set window (default: 0 to max(durations)). "
+        "Example: 'TENT(0,15,6)' for 6 tent basis functions from 0-15s",
     )
     onset_group.add_argument(
-        "-hrfopt_prefix", "-hrf-opt", "-hrf_opt",
+        "-hrfopt_prefix",
+        "-hrf-opt",
+        "-hrf_opt",
         dest="hrfopt_prefix",
         type=str,
         default=None,
@@ -965,8 +900,10 @@ def main():
 
     # Validate design input: exactly one of -matrix, -onsets, -events, -spec.
     _design_sources = [
-        bool(args.matrix), bool(args.onsets),
-        bool(args.events), bool(args.spec),
+        bool(args.matrix),
+        bool(args.onsets),
+        bool(args.events),
+        bool(args.spec),
     ]
     if sum(_design_sources) > 1:
         print("ERROR: Specify only one of -matrix, -onsets, -events, or -spec")
@@ -1062,9 +999,7 @@ def main():
     ]
     if not any(outputs):
         print("ERROR: At least one output option must be specified")
-        print(
-            "       Use -Rbuck, -Rbeta, -Rnuisance, -Rvar, -Rfitts, -Rerrts, -Rwherr,"
-        )
+        print("       Use -Rbuck, -Rbeta, -Rnuisance, -Rvar, -Rfitts, -Rerrts, -Rwherr,")
         print("       -Obuck, -Obeta, or -Onuisance")
         sys.exit(1)
 
@@ -1090,9 +1025,7 @@ def main():
     else:
         output_format = detect_format(input_files[0])
     print(f"📥 Input format detected: {output_format}")
-    print(
-        "📤 Output format: NIfTI (.nii.gz) - all outputs written as compressed NIfTI"
-    )
+    print("📤 Output format: NIfTI (.nii.gz) - all outputs written as compressed NIfTI")
     print()
 
     # Print summary of requested outputs
@@ -1107,6 +1040,7 @@ def main():
     # stability (see CLAUDE.md §8), so fall back to CPU automatically.
     if device.type == "mps" and args.use_double:
         import warnings
+
         warnings.warn(
             "MPS does not support float64. -use_double requires CPU; "
             "switching to device=cpu. Use -device cpu to suppress this warning.",
@@ -1132,9 +1066,7 @@ def main():
             else:
                 # Auto-detect: use physical cores for compute efficiency
                 num_threads = physical_cores or logical_cores
-                thread_source = (
-                    f"physical cores ({logical_cores} logical with hyperthreading)"
-                )
+                thread_source = f"physical cores ({logical_cores} logical with hyperthreading)"
 
             torch.set_num_threads(num_threads)
             # set_num_interop_threads is one-shot and must run before any
@@ -1154,9 +1086,7 @@ def main():
         except ImportError:
             # Fallback if psutil not available
             num_threads = (
-                cpu_threads_override
-                if cpu_threads_override is not None
-                else (os.cpu_count() or 12)
+                cpu_threads_override if cpu_threads_override is not None else (os.cpu_count() or 12)
             )
             torch.set_num_threads(num_threads)
             # One-shot and must precede any parallel work; configure_torch_backends
@@ -1178,17 +1108,25 @@ def main():
     b_grid = None
     if a_grid_str:
         a_grid = parse_grid_arg(a_grid_str).to(device)
-        print(f"🔢 Custom a_grid: {a_grid.numel()} points [{a_grid[0].item():.4g}, {a_grid[-1].item():.4g}]")
+        print(
+            f"🔢 Custom a_grid: {a_grid.numel()} points [{a_grid[0].item():.4g}, {a_grid[-1].item():.4g}]"
+        )
     elif args.a_grid:
         # Fallback: value didn't need pre-extraction (no leading '-')
         a_grid = parse_grid_arg(args.a_grid).to(device)
-        print(f"🔢 Custom a_grid: {a_grid.numel()} points [{a_grid[0].item():.4g}, {a_grid[-1].item():.4g}]")
+        print(
+            f"🔢 Custom a_grid: {a_grid.numel()} points [{a_grid[0].item():.4g}, {a_grid[-1].item():.4g}]"
+        )
     if b_grid_str:
         b_grid = parse_grid_arg(b_grid_str).to(device)
-        print(f"🔢 Custom b_grid: {b_grid.numel()} points [{b_grid[0].item():.4g}, {b_grid[-1].item():.4g}]")
+        print(
+            f"🔢 Custom b_grid: {b_grid.numel()} points [{b_grid[0].item():.4g}, {b_grid[-1].item():.4g}]"
+        )
     elif args.b_grid:
         b_grid = parse_grid_arg(args.b_grid).to(device)
-        print(f"🔢 Custom b_grid: {b_grid.numel()} points [{b_grid[0].item():.4g}, {b_grid[-1].item():.4g}]")
+        print(
+            f"🔢 Custom b_grid: {b_grid.numel()} points [{b_grid[0].item():.4g}, {b_grid[-1].item():.4g}]"
+        )
     if a_grid_str or b_grid_str or args.a_grid or args.b_grid:
         print()
 
@@ -1198,9 +1136,7 @@ def main():
         print()
 
     # Determine requested output families
-    want_ols = (
-        args.Obuck is not None or args.Obeta is not None or args.Onuisance is not None
-    )
+    want_ols = args.Obuck is not None or args.Obeta is not None or args.Onuisance is not None
     want_reml = any(
         x is not None
         for x in [
@@ -1267,7 +1203,9 @@ def main():
             print()
             for cidx, label in enumerate(condition_labels):
                 n_events = sum(len(all_onsets[cidx][r]) for r in range(n_runs))
-                print(f"  {label}: {n_events} events across {n_runs} runs  (duration={durations[cidx]:.3f}s)")
+                print(
+                    f"  {label}: {n_events} events across {n_runs} runs  (duration={durations[cidx]:.3f}s)"
+                )
 
             if len(set(durations)) == 1:
                 print(f"\n  Single duration for all conditions: {durations[0]:.3f}s")
@@ -1294,7 +1232,7 @@ def main():
             print()
             print("Parsing durations...")
             durations = parse_durations(args.durations, n_conditions, condition_labels)
-            if len(args.durations) == 1 and ',' not in args.durations[0]:
+            if len(args.durations) == 1 and "," not in args.durations[0]:
                 print(f"  Using {durations[0]}s for all {n_conditions} conditions")
             else:
                 print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
@@ -1302,6 +1240,7 @@ def main():
         # ── Optional onset / duration rounding ──────────────────────────
         if args.round_onsets is not None:
             from fastfuncstuff.design.builder import round_onsets
+
             all_onsets = round_onsets(all_onsets, tr, threshold=args.round_onsets)
             print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
 
@@ -1355,7 +1294,7 @@ def main():
             run_lengths = compute_run_lengths(run_starts, n_timepoints)
             avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
             polort = auto_polort(avg_run_duration_sec, formula="afni")
-            print(f"  Auto polort: {polort} (based on {avg_run_duration_sec/60:.1f} min avg run)")
+            print(f"  Auto polort: {polort} (based on {avg_run_duration_sec / 60:.1f} min avg run)")
         else:
             polort = args.polort
             print(f"  Polort: {polort}")
@@ -1364,8 +1303,8 @@ def main():
         print()
         print("Building onset matrix at microtime resolution...")
         onset_matrix_micro = create_onset_matrix_microtime(
-            all_onsets, run_starts, tr, n_timepoints,
-            args.microtime_dt, durations, device)
+            all_onsets, run_starts, tr, n_timepoints, args.microtime_dt, durations, device
+        )
         print(f"  Onset matrix shape: {onset_matrix_micro.shape}")
 
         # Per-voxel HRF: load assignments + library if -hrfopt_prefix set
@@ -1456,9 +1395,11 @@ def main():
             from fastfuncstuff.glm.ridge import create_single_trial_design
 
             print()
-            print(f"🎯 Single-trial mode (label: {args.single_trials}) — "
-                  "rebuilding design with one regressor per event"
-                  + (" × per-voxel HRF" if per_voxel_hrf_mode else ""))
+            print(
+                f"🎯 Single-trial mode (label: {args.single_trials}) — "
+                "rebuilding design with one regressor per event"
+                + (" × per-voxel HRF" if per_voxel_hrf_mode else "")
+            )
 
             st_design_out, trial_labels, trial_cond_ids, trial_run_ids, _cond_design = (
                 create_single_trial_design(
@@ -1483,9 +1424,7 @@ def main():
                 assert st_design_out.dim() == 3, (
                     f"Expected 3D stacked design, got {st_design_out.shape}"
                 )
-                designs_by_hrf = {
-                    int(i): st_design_out[i] for i in range(st_design_out.shape[0])
-                }
+                designs_by_hrf = {int(i): st_design_out[i] for i in range(st_design_out.shape[0])}
                 task_design = designs_by_hrf[next(iter(designs_by_hrf.keys()))]
                 print(
                     f"  Single-trial × HRF designs: {len(designs_by_hrf)} HRFs, "
@@ -1509,7 +1448,10 @@ def main():
         print()
         print("Building nuisance regressors...")
         nuisance_blocks = collect_nuisance_blocks(
-            args, run_starts, n_timepoints, verbose=True,
+            args,
+            run_starts,
+            n_timepoints,
+            verbose=True,
         )
         nuisance_design = build_nuisance_block_diag(
             run_starts=run_starts,
@@ -1556,7 +1498,7 @@ def main():
         _nuisance_label_offset = len(column_labels)
         for run_idx in range(n_runs):
             for p in range(polort + 1):
-                column_labels.append(f"Run#{run_idx+1}Pol#{p}")
+                column_labels.append(f"Run#{run_idx + 1}Pol#{p}")
 
         # Nuisance block labels (one entry per column; widest column count
         # per block when per-run widths differ).
@@ -1599,7 +1541,6 @@ def main():
         print("=" * 70)
         print()
 
-
     # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
     if args.beta_cv:
         from fastfuncstuff.glm.outputs import save_single_trial_results
@@ -1619,15 +1560,17 @@ def main():
 
         # 1. Build single-trial design
         print("Building single-trial design...")
-        st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = create_single_trial_design(
-            onsets_by_condition=all_onsets,
-            durations=durations,
-            run_starts=run_starts,
-            tr=args.tr,
-            n_timepoints=n_timepoints,
-            microtime_dt=args.microtime_dt,
-            condition_labels=condition_labels,
-            device=device,
+        st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = (
+            create_single_trial_design(
+                onsets_by_condition=all_onsets,
+                durations=durations,
+                run_starts=run_starts,
+                tr=args.tr,
+                n_timepoints=n_timepoints,
+                microtime_dt=args.microtime_dt,
+                condition_labels=condition_labels,
+                device=device,
+            )
         )
         print(f"  Single-trial design: {st_design.shape}")
         n_trials = st_design.shape[1]
@@ -1637,7 +1580,10 @@ def main():
         # We need to rebuild it with single-trial design
         print("Building nuisance regressors for single-trial design...")
         nuisance_blocks_st = collect_nuisance_blocks(
-            args, run_starts, n_timepoints, verbose=False,
+            args,
+            run_starts,
+            n_timepoints,
+            verbose=False,
         )
         nuisance_design_st = build_nuisance_block_diag(
             run_starts=run_starts,
@@ -1712,8 +1658,14 @@ def main():
         print("Computing beta-space cross-validated R²...")
         cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
         xval = compute_xval_r2_single_trials(
-            st_betas, trial_cond_ids, trial_run_ids, cv_splits,
-            metric="cod", device=device, verbose=True)
+            st_betas,
+            trial_cond_ids,
+            trial_run_ids,
+            cv_splits,
+            metric="cod",
+            device=device,
+            verbose=True,
+        )
 
         # 6. Save outputs
         print()
@@ -1722,11 +1674,11 @@ def main():
         # Get spatial metadata
         volume_shape = results_st.original_shape
         affine = results_st.affine
-        voxel_mask = getattr(results_st, 'voxel_mask', None)
+        voxel_mask = getattr(results_st, "voxel_mask", None)
 
         output_files = save_single_trial_results(
             betas=st_betas,
-            xval_r2=xval['r2'],
+            xval_r2=xval["r2"],
             trial_labels=trial_labels,
             trial_condition_ids=trial_cond_ids,
             trial_run_ids=trial_run_ids,
@@ -1778,9 +1730,7 @@ def main():
 
             # Extract labels for stimulus columns only (not all 322 columns!)
             if stim_indices and "column_labels" in callback_design_info:
-                stim_labels = [
-                    callback_design_info["column_labels"][i] for i in stim_indices
-                ]
+                stim_labels = [callback_design_info["column_labels"][i] for i in stim_indices]
             else:
                 stim_labels = callback_design_info.get("column_labels")
 
@@ -1852,7 +1802,11 @@ def main():
                 betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
                 # Always write NIfTI .nii.gz regardless of input format
-                save_nifti(betas_vol, output_path=replace_afni_extension(args.Obeta, ".nii.gz"), affine=affine)
+                save_nifti(
+                    betas_vol,
+                    output_path=replace_afni_extension(args.Obeta, ".nii.gz"),
+                    affine=affine,
+                )
 
             if args.Onuisance:
                 # NOTE: When task_indices is provided, OLS results contain only stimulus columns.
@@ -1879,9 +1833,7 @@ def main():
             if want_single_trials:
                 if stim_indices:
                     ols_single_path = f"ols_{want_single_trials}_single.nii.gz"
-                    print(
-                        f"  • Writing OLS single-trial betas (onset order): {ols_single_path}"
-                    )
+                    print(f"  • Writing OLS single-trial betas (onset order): {ols_single_path}")
                     if "matrix" in callback_design_info:
                         write_single_trials_output(
                             ols_results,
@@ -1908,13 +1860,9 @@ def main():
                 # Generate output path by inserting _partialR2 before extension
                 if args.Obuck:
                     if args.Obuck.endswith(".nii.gz"):
-                        partial_r2_path = args.Obuck.replace(
-                            ".nii.gz", "_partialR2.nii.gz"
-                        )
+                        partial_r2_path = args.Obuck.replace(".nii.gz", "_partialR2.nii.gz")
                     elif args.Obuck.endswith(".nii"):
-                        partial_r2_path = args.Obuck.replace(
-                            ".nii", "_partialR2.nii.gz"
-                        )
+                        partial_r2_path = args.Obuck.replace(".nii", "_partialR2.nii.gz")
                     else:
                         partial_r2_path = args.Obuck + "_partialR2.nii.gz"
                 else:
@@ -2089,8 +2037,8 @@ def main():
             cached_data, cache_metadata = load_cache(args.cache, input_files, validate=True)
 
             # Reshape to 4D if volume_shape available (needed for test mode and output writing)
-            if 'volume_shape' in cache_metadata:
-                vol_shape = cache_metadata['volume_shape']
+            if "volume_shape" in cache_metadata:
+                vol_shape = cache_metadata["volume_shape"]
                 n_timepoints = cached_data.shape[1]
                 # Reshape from (n_voxels, n_timepoints) to (x, y, z, n_timepoints)
                 cached_data = cached_data.reshape(*vol_shape, n_timepoints)
@@ -2138,9 +2086,11 @@ def main():
             # Try with automatic extension detection
             rvar_base = Path(args.load_Rvar)
             rvar_path = None
-            for candidate in [rvar_base,
-                               Path(str(rvar_base) + '.nii.gz'),
-                               Path(str(rvar_base) + '.nii')]:
+            for candidate in [
+                rvar_base,
+                Path(str(rvar_base) + ".nii.gz"),
+                Path(str(rvar_base) + ".nii"),
+            ]:
                 if candidate.exists():
                     rvar_path = candidate
                     break
@@ -2163,11 +2113,15 @@ def main():
                     rvar_data = rvar_data[..., 0, :]  # drop singleton dim
 
                 if rvar_data.ndim != 4:
-                    raise ValueError(f"Expected 4D Rvar file, got {rvar_data.ndim}D "
-                                     f"(shape {rvar_img.shape}). "
-                                     "Cannot reduce to (x, y, z, n_params).")
+                    raise ValueError(
+                        f"Expected 4D Rvar file, got {rvar_data.ndim}D "
+                        f"(shape {rvar_img.shape}). "
+                        "Cannot reduce to (x, y, z, n_params)."
+                    )
                 if rvar_data.shape[3] < 2:
-                    raise ValueError(f"Rvar file must have at least 2 sub-briks (a, b), found {rvar_data.shape[3]}")
+                    raise ValueError(
+                        f"Rvar file must have at least 2 sub-briks (a, b), found {rvar_data.shape[3]}"
+                    )
 
                 precomputed_arma = rvar_data[..., :2]  # (x, y, z, 2) — only a and b needed
                 n_voxels_total = np.prod(precomputed_arma.shape[:3])
@@ -2185,12 +2139,16 @@ def main():
         # Warn if the Rvar output file already exists (user may want -load_Rvar instead)
         if analysis_method == "arma11" and args.Rvar and not args.load_Rvar:
             rvar_out_base = Path(args.Rvar)
-            for candidate in [rvar_out_base,
-                               Path(str(rvar_out_base) + '.nii.gz'),
-                               Path(str(rvar_out_base) + '.nii')]:
+            for candidate in [
+                rvar_out_base,
+                Path(str(rvar_out_base) + ".nii.gz"),
+                Path(str(rvar_out_base) + ".nii"),
+            ]:
                 if candidate.exists():
                     print(f"\n⚠️  Note: {candidate} already exists and will be overwritten.")
-                    print("   To reuse precomputed ARMA params instead, pass: -load_Rvar {candidate}")
+                    print(
+                        "   To reuse precomputed ARMA params instead, pass: -load_Rvar {candidate}"
+                    )
                     break
 
         _per_hrf = locals().get("full_designs_by_hrf") is not None
@@ -2218,12 +2176,8 @@ def main():
             force_exhaustive_search=args.exhaustive,
             use_grid_batching=use_grid_batching,
             want_r2_partial=bool(args.rpartial),  # True if flag is set (any mode)
-            r2_partial_mode=args.rpartial
-            if args.rpartial
-            else "full",  # "full" or "task"
-            want_r2_semipartial=bool(
-                args.r2semipartial
-            ),  # True if flag is set (any mode)
+            r2_partial_mode=args.rpartial if args.rpartial else "full",  # "full" or "task"
+            want_r2_semipartial=bool(args.r2semipartial),  # True if flag is set (any mode)
             r2_semipartial_mode=args.r2semipartial
             if args.r2semipartial
             else "full",  # "full" or "task"
@@ -2282,11 +2236,7 @@ def main():
     else:
         # All columns were fitted
         fitted_labels = full_labels
-        stim_indices = (
-            stim_column_indices
-            if stim_column_indices
-            else list(range(len(full_labels)))
-        )
+        stim_indices = stim_column_indices if stim_column_indices else list(range(len(full_labels)))
 
     # Voxel-wise (-dsort) coefficients are appended as trailing beta/t-stat
     # sub-bricks (AFNI places them last). The bucket/beta writers read
@@ -2328,19 +2278,14 @@ def main():
                 "contrast_tstats": results.contrast_tstats,
             }
             # Add partial R² if available and requested
-            if (
-                hasattr(results, "contrast_r2_partial")
-                and results.contrast_r2_partial is not None
-            ):
+            if hasattr(results, "contrast_r2_partial") and results.contrast_r2_partial is not None:
                 contrast_results["contrast_r2_partial"] = results.contrast_r2_partial
             # Add semi-partial R² if available and requested
             if (
                 hasattr(results, "contrast_r2_semipartial")
                 and results.contrast_r2_semipartial is not None
             ):
-                contrast_results["contrast_r2_semipartial"] = (
-                    results.contrast_r2_semipartial
-                )
+                contrast_results["contrast_r2_semipartial"] = results.contrast_r2_semipartial
 
         with _spliced_dsort(results, fitted_labels) as _rbuck_labels:
             write_glm_bucket_as_nifti(
@@ -2384,9 +2329,7 @@ def main():
         )
         if stim_idx:
             reml_single_path = f"reml_{args.single_trials}_single.nii.gz"
-            print(
-                f"  • Writing REML single-trial betas (onset order): {reml_single_path}"
-            )
+            print(f"  • Writing REML single-trial betas (onset order): {reml_single_path}")
             write_single_trials_output(
                 results,
                 reml_single_path,
@@ -2395,9 +2338,7 @@ def main():
                 stim_lbls,
             )
         else:
-            print(
-                "  ⚠️  Skipping REML single-trial output: no stimulus columns in design"
-            )
+            print("  ⚠️  Skipping REML single-trial output: no stimulus columns in design")
 
     if args.Rbeta:
         print(f"  • Writing REML betas only: {args.Rbeta}")
@@ -2424,16 +2365,16 @@ def main():
         betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
         # Always write NIfTI .nii.gz regardless of input format
-        save_nifti(betas_vol, output_path=replace_afni_extension(args.Rbeta, ".nii.gz"), affine=affine)
+        save_nifti(
+            betas_vol, output_path=replace_afni_extension(args.Rbeta, ".nii.gz"), affine=affine
+        )
 
         # -dsort_nods: parallel no-dsort betas.
         if getattr(results, "nods_results", None) is not None:
             nods_beta_path = _insert_path_suffix(args.Rbeta, "_nods")
             print(f"  • Writing no-dsort REML betas only: {nods_beta_path}")
             nods_betas_np = _ensure_numpy(results.nods_results.betas)
-            nods_betas_vol = _reshape_parameter_map(
-                nods_betas_np, volume_shape, voxel_mask
-            )
+            nods_betas_vol = _reshape_parameter_map(nods_betas_np, volume_shape, voxel_mask)
             save_nifti(
                 nods_betas_vol,
                 output_path=replace_afni_extension(nods_beta_path, ".nii.gz"),
@@ -2477,8 +2418,10 @@ def main():
     if args.Rvar:
         # Ensure Rvar output path has .nii.gz extension
         rvar_output_path = Path(args.Rvar)
-        if not (str(rvar_output_path).endswith('.nii.gz') or str(rvar_output_path).endswith('.nii')):
-            rvar_output_path = Path(str(rvar_output_path) + '.nii.gz')
+        if not (
+            str(rvar_output_path).endswith(".nii.gz") or str(rvar_output_path).endswith(".nii")
+        ):
+            rvar_output_path = Path(str(rvar_output_path) + ".nii.gz")
 
         print(f"  • Writing REML variance parameters: {rvar_output_path}")
         # Stack variance parameters: a, b, lambda, StDev (all reliably computed)
@@ -2516,24 +2459,18 @@ def main():
         voxel_mask = getattr(results, "voxel_mask", None)
 
         # Reshape var_data to 4D volume (convert to numpy first!)
-        var_data_np = (
-            var_data.cpu().numpy() if isinstance(var_data, torch.Tensor) else var_data
-        )
+        var_data_np = var_data.cpu().numpy() if isinstance(var_data, torch.Tensor) else var_data
 
         if volume_shape is not None and voxel_mask is not None:
             n_params = var_data_np.shape[1]
             var_vol = np.zeros((*volume_shape, n_params), dtype=np.float32)
             voxel_mask_np = (
-                voxel_mask.cpu().numpy()
-                if isinstance(voxel_mask, torch.Tensor)
-                else voxel_mask
+                voxel_mask.cpu().numpy() if isinstance(voxel_mask, torch.Tensor) else voxel_mask
             )
             var_vol[voxel_mask_np.reshape(volume_shape)] = var_data_np
         else:
             # Assume already in volume shape
-            var_vol = (
-                var_data_np.reshape(*volume_shape, -1) if volume_shape else var_data_np
-            )
+            var_vol = var_data_np.reshape(*volume_shape, -1) if volume_shape else var_data_np
 
         # Inherit AFNI header from source data so SCENE_DATA[0] (view) and
         # TEMPLATE_SPACE carry forward correctly (e.g. TLRC + MNI_2009c_asym).
@@ -2542,13 +2479,17 @@ def main():
         nifti_header_rvar = getattr(results, "nifti_header", None)
         if nifti_header_rvar is not None:
             import copy
+
             var_header = copy.deepcopy(nifti_header_rvar)
             var_header.set_data_shape(var_vol.shape)
-            var_header.set_data_dtype(var_vol.dtype)  # don't quantize float stats to an int source dtype
+            var_header.set_data_dtype(
+                var_vol.dtype
+            )  # don't quantize float stats to an int source dtype
             var_img = nib.Nifti1Image(var_vol, affine, header=var_header)
         else:
             var_img = nib.Nifti1Image(var_vol, affine)
         from fastfuncstuff.io.afni import set_afni_func_type
+
         set_afni_func_type(var_img.header, func_code=11)  # fbuc / 3DIM_HEAD_FUNC
 
         # Save in requested format using helper
@@ -2564,7 +2505,11 @@ def main():
         # For 870k voxels, this saves significant time
 
         # Write uncompressed .nii first
-        temp_nii_path = rvar_output_path.with_suffix('.nii') if str(rvar_output_path).endswith('.nii.gz') else rvar_output_path
+        temp_nii_path = (
+            rvar_output_path.with_suffix(".nii")
+            if str(rvar_output_path).endswith(".nii.gz")
+            else rvar_output_path
+        )
         _save_nifti_with_format(var_img, temp_nii_path, "nifti")
 
         # Label sub-briks using AFNI's 3drefit (fast on uncompressed file)
@@ -2587,16 +2532,16 @@ def main():
             print("    (File was written successfully, but lacks sub-brik labels)")
 
         # Compress with pigz/zstd if output is compressed format
-        if str(rvar_output_path).endswith('.nii.gz'):
+        if str(rvar_output_path).endswith(".nii.gz"):
             from fastfuncstuff.io.afni import compress_nifti
+
             print(f"  • Compressing Rvar output...")
             compress_nifti(temp_nii_path, rvar_output_path, remove_original=True)
 
     # Write full REML likelihood surface if requested (-Rlklhd)
     _rlklhd = getattr(args, "Rlklhd", None)
     _has_surface = (
-        hasattr(results, "reml_lklhd_surface")
-        and results.reml_lklhd_surface is not None  # type: ignore[union-attr]
+        hasattr(results, "reml_lklhd_surface") and results.reml_lklhd_surface is not None  # type: ignore[union-attr]
     )
     if _rlklhd and _has_surface:
         import copy
@@ -2617,8 +2562,7 @@ def main():
 
         if volume_shape_lk is not None and voxel_mask_lk is not None:
             voxel_mask_np = (
-                voxel_mask_lk.cpu().numpy()
-                if hasattr(voxel_mask_lk, "cpu") else voxel_mask_lk
+                voxel_mask_lk.cpu().numpy() if hasattr(voxel_mask_lk, "cpu") else voxel_mask_lk
             )
             vol_4d = np.zeros((*volume_shape_lk, n_pairs), dtype=np.float32)
             vol_4d[voxel_mask_np.reshape(volume_shape_lk)] = surface_np
@@ -2635,6 +2579,7 @@ def main():
         else:
             lklhd_img = nib.Nifti1Image(vol_4d, affine_lk)
         from fastfuncstuff.io.afni import set_afni_func_type
+
         set_afni_func_type(lklhd_img.header, func_code=11)
 
         # Normalise output path
@@ -2642,7 +2587,9 @@ def main():
         if not (lklhd_out.endswith(".nii.gz") or lklhd_out.endswith(".nii")):
             lklhd_out = lklhd_out + ".nii.gz"
         lklhd_path = Path(lklhd_out)
-        temp_lklhd = lklhd_path.with_suffix(".nii") if str(lklhd_path).endswith(".nii.gz") else lklhd_path
+        temp_lklhd = (
+            lklhd_path.with_suffix(".nii") if str(lklhd_path).endswith(".nii.gz") else lklhd_path
+        )
         _save_nifti_with_format(lklhd_img, temp_lklhd, "nifti")
 
         # Label each sub-brik with its (a, b) pair
@@ -2658,18 +2605,17 @@ def main():
 
         if str(lklhd_path).endswith(".nii.gz"):
             from fastfuncstuff.io.afni import compress_nifti
+
             print(f"  • Compressing Rlklhd output...")
             compress_nifti(temp_lklhd, lklhd_path, remove_original=True)
 
     elif _rlklhd and not _has_surface:
-        print("  ⚠️  Likelihood surface requested but not available (OLS mode or precomputed ARMA params?)")
+        print(
+            "  ⚠️  Likelihood surface requested but not available (OLS mode or precomputed ARMA params?)"
+        )
 
     # Write partial R² if requested and available
-    if (
-        want_r2_partial
-        and hasattr(results, "r2_partial")
-        and results.r2_partial is not None
-    ):
+    if want_r2_partial and hasattr(results, "r2_partial") and results.r2_partial is not None:
         # Generate output path by inserting _partialR2 before extension
         if args.Rbuck:
             if args.Rbuck.endswith(".nii.gz"):
@@ -2722,13 +2668,9 @@ def main():
         # Generate output path
         if args.Rbuck:
             if args.Rbuck.endswith(".nii.gz"):
-                nuisance_r2_path = args.Rbuck.replace(
-                    ".nii.gz", "_nuisance_partialR2.nii.gz"
-                )
+                nuisance_r2_path = args.Rbuck.replace(".nii.gz", "_nuisance_partialR2.nii.gz")
             elif args.Rbuck.endswith(".nii"):
-                nuisance_r2_path = args.Rbuck.replace(
-                    ".nii", "_nuisance_partialR2.nii.gz"
-                )
+                nuisance_r2_path = args.Rbuck.replace(".nii", "_nuisance_partialR2.nii.gz")
             else:
                 nuisance_r2_path = args.Rbuck + "_nuisance_partialR2.nii.gz"
         else:
@@ -2779,13 +2721,9 @@ def main():
         # Generate output path by inserting _semipartialR2 before extension
         if args.Rbuck:
             if args.Rbuck.endswith(".nii.gz"):
-                semipartial_r2_path = args.Rbuck.replace(
-                    ".nii.gz", "_semipartialR2.nii.gz"
-                )
+                semipartial_r2_path = args.Rbuck.replace(".nii.gz", "_semipartialR2.nii.gz")
             elif args.Rbuck.endswith(".nii"):
-                semipartial_r2_path = args.Rbuck.replace(
-                    ".nii", "_semipartialR2.nii.gz"
-                )
+                semipartial_r2_path = args.Rbuck.replace(".nii", "_semipartialR2.nii.gz")
             else:
                 semipartial_r2_path = args.Rbuck + "_semipartialR2.nii.gz"
         else:
@@ -2836,17 +2774,13 @@ def main():
                     ".nii.gz", "_nuisance_semipartialR2.nii.gz"
                 )
             elif args.Rbuck.endswith(".nii"):
-                nuisance_semi_r2_path = args.Rbuck.replace(
-                    ".nii", "_nuisance_semipartialR2.nii.gz"
-                )
+                nuisance_semi_r2_path = args.Rbuck.replace(".nii", "_nuisance_semipartialR2.nii.gz")
             else:
                 nuisance_semi_r2_path = args.Rbuck + "_nuisance_semipartialR2.nii.gz"
         else:
             nuisance_semi_r2_path = "REML_nuisance_semipartialR2.nii.gz"
 
-        print(
-            f"  • Writing REML nuisance semi-partial R² per regressor: {nuisance_semi_r2_path}"
-        )
+        print(f"  • Writing REML nuisance semi-partial R² per regressor: {nuisance_semi_r2_path}")
 
         from fastfuncstuff.glm.outputs import (
             _get_voxel_mask,
@@ -2898,15 +2832,17 @@ def main():
             # Reshape to 4D volume (x, y, z, timepoints)
             if volume_shape is not None and voxel_mask is not None:
                 n_timepoints = predicted_np.shape[1]
-                predicted_vol = np.zeros(
-                    (*volume_shape, n_timepoints), dtype=np.float32
-                )
+                predicted_vol = np.zeros((*volume_shape, n_timepoints), dtype=np.float32)
                 predicted_vol[voxel_mask.reshape(volume_shape)] = predicted_np
             else:
                 predicted_vol = predicted_np
 
             # Always write NIfTI .nii.gz regardless of input format
-            save_nifti(predicted_vol, output_path=replace_afni_extension(args.Rfitts, ".nii.gz"), affine=affine)
+            save_nifti(
+                predicted_vol,
+                output_path=replace_afni_extension(args.Rfitts, ".nii.gz"),
+                affine=affine,
+            )
         else:
             print("    ⚠️  Warning: Fitted values not available (predicted=None)")
 
@@ -2927,15 +2863,17 @@ def main():
             # Reshape to 4D volume (x, y, z, timepoints)
             if volume_shape is not None and voxel_mask is not None:
                 n_timepoints = residuals_np.shape[1]
-                residuals_vol = np.zeros(
-                    (*volume_shape, n_timepoints), dtype=np.float32
-                )
+                residuals_vol = np.zeros((*volume_shape, n_timepoints), dtype=np.float32)
                 residuals_vol[voxel_mask.reshape(volume_shape)] = residuals_np
             else:
                 residuals_vol = residuals_np
 
             # Always write NIfTI .nii.gz regardless of input format
-            save_nifti(residuals_vol, output_path=replace_afni_extension(args.Rerrts, ".nii.gz"), affine=affine)
+            save_nifti(
+                residuals_vol,
+                output_path=replace_afni_extension(args.Rerrts, ".nii.gz"),
+                affine=affine,
+            )
         else:
             print("    ⚠️  Warning: Residuals not available")
 
@@ -2950,8 +2888,6 @@ def main():
         output_filename = f"reml_{label}_single.nii.gz"
         print(f"  • Writing REML single-trial betas (onset order): {output_filename}")
         if "matrix" in design_info:
-            from fastfuncstuff.glm.outputs import write_single_trials_output
-
             write_single_trials_output(
                 results,
                 output_filename,
@@ -2960,9 +2896,7 @@ def main():
                 fitted_labels,  # Labels matching results.betas shape
             )
         else:
-            print(
-                "      ⚠️  Warning: Design matrix not available, cannot determine onset times"
-            )
+            print("      ⚠️  Warning: Design matrix not available, cannot determine onset times")
 
     # OLS outputs - already written by callback during analysis!
     # The callback writes OLS results immediately after OLS completion,

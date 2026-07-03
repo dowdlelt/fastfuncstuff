@@ -2646,12 +2646,12 @@ def prewhiten_with_arma11(
         # Move R to GPU temporarily for fast Cholesky
         R_gpu = R.to(device)
         L = torch.linalg.cholesky(R_gpu)
-        del R_gpu, R
+        del R_gpu
 
     except (RuntimeError, torch.cuda.OutOfMemoryError):
         # GPU OOM - fall back to CPU (slower but safe)
         try:
-            del L  # noqa: F821
+            del L  # noqa: F821 — L may be unbound if the try failed before assignment
         except NameError:
             pass
 
@@ -2659,7 +2659,9 @@ def prewhiten_with_arma11(
             torch.cuda.empty_cache()
 
         L = torch.linalg.cholesky(R).to(device)
-        del R  # noqa: F821
+
+    # R is bound on both branches here; free the CPU covariance before the solves.
+    del R
 
     if Y.ndim == 1:
         Y = Y.unsqueeze(1)

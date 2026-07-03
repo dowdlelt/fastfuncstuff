@@ -242,19 +242,25 @@ def _apply_sgf(
             if mag_detrended is not None:
                 mag_chunk = mag_detrended[:, start:end].T.to(device)
                 mag_c = mag_chunk - mag_chunk.mean(dim=-1, keepdim=True)
-                mag_ss = (mag_c ** 2).sum(dim=-1).clamp(min=1e-30)
+                mag_ss = (mag_c**2).sum(dim=-1).clamp(min=1e-30)
 
-                def _metric(filt: torch.Tensor) -> torch.Tensor:
+                # mag_c/mag_ss bound as defaults: the closure is consumed within
+                # this iteration (passed to savgol_filter_explore below), and the
+                # binding makes that capture explicit rather than late.
+                def _metric(filt: torch.Tensor, mag_c=mag_c, mag_ss=mag_ss) -> torch.Tensor:
                     f_c = filt - filt.mean(dim=-1, keepdim=True)
                     cross = (f_c * mag_c).sum(dim=-1)
-                    f_ss = (f_c ** 2).sum(dim=-1).clamp(min=1e-30)
+                    f_ss = (f_c**2).sum(dim=-1).clamp(min=1e-30)
                     return (cross / torch.sqrt(f_ss * mag_ss)).abs()
             else:
+
                 def _metric(filt: torch.Tensor) -> torch.Tensor:
                     return -filt.var(dim=-1)
 
             filtered = savgol_filter_explore(
-                chunk, n_timepoints=n_tp, device=device,
+                chunk,
+                n_timepoints=n_tp,
+                device=device,
                 metric_fn=_metric,
             )
             result[:, start:end] = filtered.T.cpu()
@@ -377,19 +383,19 @@ def phase_regress(
     n_voxels = magnitude[0].shape[0]
 
     if verbose:
-        print(f"Phase regression: {n_runs} run(s), {n_voxels:,} voxels, "
-              f"{sum(n_tp_per_run)} total timepoints")
+        print(
+            f"Phase regression: {n_runs} run(s), {n_voxels:,} voxels, "
+            f"{sum(n_tp_per_run)} total timepoints"
+        )
         print(f"  Task removal: {task_removal}")
         print(f"  Regression: {regression}")
         print(f"  Phi method: {phi_method}")
         print(f"  Phase filter: {phase_filter}")
 
         sample = magnitude[0][0]
-        print(f"  Magnitude scale: mean={sample.mean().item():.1f}, "
-              f"std={sample.std().item():.1f}")
+        print(f"  Magnitude scale: mean={sample.mean().item():.1f}, std={sample.std().item():.1f}")
         sample_p = phase[0][0]
-        print(f"  Phase scale: mean={sample_p.mean().item():.4f}, "
-              f"std={sample_p.std().item():.4f}")
+        print(f"  Phase scale: mean={sample_p.mean().item():.4f}, std={sample_p.std().item():.4f}")
 
     # ── 1. Keep magnitude in raw scanner units ───────────────────────────
     # phaseprep and Stanley fit ODR on raw-unit magnitude. With raw mag and
@@ -400,9 +406,11 @@ def phase_regress(
     # regression and produced exploding slopes / negative R² that the
     # downstream `r2 < 0` filter zeroed across the brain.
     mag_original_list = [magnitude[r].clone() for r in range(n_runs)]
-    orig_mean = torch.cat(
-        [m.mean(dim=1) for m in mag_original_list], dim=0
-    ).reshape(n_runs, n_voxels).mean(dim=0)
+    orig_mean = (
+        torch.cat([m.mean(dim=1) for m in mag_original_list], dim=0)
+        .reshape(n_runs, n_voxels)
+        .mean(dim=0)
+    )
 
     # ── 2. Build per-run polynomial + nuisance regressors ────────────────
     from fastfuncstuff.design.builder import legendre_polynomials
@@ -429,18 +437,24 @@ def phase_regress(
         if onsets_per_condition is None:
             raise ValueError("task_removal='tent' requires onsets_per_condition")
         task_per_run = _build_task_design_tent(
-            onsets_per_condition, tr, n_tp_per_run, tent_window, device,
+            onsets_per_condition,
+            tr,
+            n_tp_per_run,
+            tent_window,
+            device,
         )
     elif task_removal == "canonical":
         if onsets_per_condition is None:
             raise ValueError("task_removal='canonical' requires onsets_per_condition")
         task_per_run = _build_task_design_canonical(
-            onsets_per_condition, tr, n_tp_per_run, device,
+            onsets_per_condition,
+            tr,
+            n_tp_per_run,
+            device,
         )
     elif task_removal != "none":
         raise ValueError(
-            f"Unknown task_removal: {task_removal!r}. "
-            "Use 'none', 'tent', or 'canonical'."
+            f"Unknown task_removal: {task_removal!r}. Use 'none', 'tent', or 'canonical'."
         )
 
     # ── 3. Detrend per run, concatenate ──────────────────────────────────
@@ -486,12 +500,16 @@ def phase_regress(
     n_good = int(vox_mask.sum().item())
     if verbose:
         n_bad = n_voxels - n_good
-        print(f"  Voxel mask: {n_good:,} / {n_voxels:,} voxels above "
-              f"{signal_thresh:.0%} signal threshold ({n_bad:,} excluded)")
+        print(
+            f"  Voxel mask: {n_good:,} / {n_voxels:,} voxels above "
+            f"{signal_thresh:.0%} signal threshold ({n_bad:,} excluded)"
+        )
         if signal_thresh == 0:
-            print("  WARNING: signal_thresh=0 → no signal-based gating. "
-                  "Output is safe (ODR shrinkage caps all voxels), but the "
-                  "R² map will show bright air/noise voxels.")
+            print(
+                "  WARNING: signal_thresh=0 → no signal-based gating. "
+                "Output is safe (ODR shrinkage caps all voxels), but the "
+                "R² map will show bright air/noise voxels."
+            )
 
     # ── 5. Optional Savitzky-Golay filtering on phase ────────────────────
     # Applied to detrended phase (used for correction) AND to the residual
@@ -502,12 +520,24 @@ def phase_regress(
             sgf_window += 1
         sgf_window = max(sgf_window, 5)
     pha_detrended_filt = _apply_sgf(
-        pha_detrended, phase_filter, sgf_window, sgf_order,
-        device, chunk_size, verbose, mag_detrended=mag_detrended,
+        pha_detrended,
+        phase_filter,
+        sgf_window,
+        sgf_order,
+        device,
+        chunk_size,
+        verbose,
+        mag_detrended=mag_detrended,
     )
     pha_residual_filt = _apply_sgf(
-        pha_residual, phase_filter, sgf_window, sgf_order,
-        device, chunk_size, verbose=False, mag_detrended=mag_residual,
+        pha_residual,
+        phase_filter,
+        sgf_window,
+        sgf_order,
+        device,
+        chunk_size,
+        verbose=False,
+        mag_detrended=mag_residual,
     )
 
     # ── 6. Estimate phi (if not provided) ────────────────────────────────
@@ -515,8 +545,11 @@ def phase_regress(
         if verbose:
             print("  Estimating variance ratio phi...")
         phi_tensor = estimate_variance_ratio(
-            mag_residual, pha_residual_filt, tr,
-            method=phi_method, freq_range=phi_freq_range,
+            mag_residual,
+            pha_residual_filt,
+            tr,
+            method=phi_method,
+            freq_range=phi_freq_range,
         )
     elif isinstance(phi, (int, float)):
         phi_tensor = torch.full((n_voxels,), float(phi))
@@ -526,8 +559,10 @@ def phase_regress(
     if verbose:
         phi_good = phi_tensor[vox_mask]
         phi_med = phi_good.median().item()
-        print(f"  Phi: median={phi_med:.2f}, "
-              f"range=[{phi_good.min().item():.2f}, {phi_good.max().item():.2f}]")
+        print(
+            f"  Phi: median={phi_med:.2f}, "
+            f"range=[{phi_good.min().item():.2f}, {phi_good.max().item():.2f}]"
+        )
 
     # ── 7. Regression (chunked for memory) ───────────────────────────────
     slope_all = torch.zeros(n_voxels)
@@ -544,8 +579,10 @@ def phase_regress(
     pha_var_floor = 1e-6
     unstable = (pha_var < pha_var_floor) & vox_mask
     if verbose and unstable.sum().item() > 0:
-        print(f"  Phase variance floor: {unstable.sum().item():,} voxels with "
-              f"Var(phase) < {pha_var_floor:.0e} (slopes zeroed)")
+        print(
+            f"  Phase variance floor: {unstable.sum().item():,} voxels with "
+            f"Var(phase) < {pha_var_floor:.0e} (slopes zeroed)"
+        )
 
     for start in range(0, n_voxels, chunk_size):
         end = min(start + chunk_size, n_voxels)
@@ -574,8 +611,10 @@ def phase_regress(
 
     if verbose:
         n_sig = (slope_all[vox_mask].abs() > 0.01).sum().item()
-        print(f"  Slope: median={slope_all[vox_mask].median().item():.4f}, "
-              f"{n_sig:,} voxels with |slope| > 0.01")
+        print(
+            f"  Slope: median={slope_all[vox_mask].median().item():.4f}, "
+            f"{n_sig:,} voxels with |slope| > 0.01"
+        )
 
     # ── 8. Compute detrended macro component (for diagnostics) ────────────
     # R2 and diagnostics use detrended data so the fit quality is measured
@@ -603,13 +642,13 @@ def phase_regress(
     # voxelwise with phaseprep.
 
     inflation = 1.0 + (slope_all * slope_all) / phi_tensor.clamp(min=1e-12)
-    shrink = 1.0 / inflation                                  # (n_voxels,)
+    shrink = 1.0 / inflation  # (n_voxels,)
 
-    mag_mean_dt = mag_detrended.mean(dim=0)                   # ≈ 0 with Legendre
+    mag_mean_dt = mag_detrended.mean(dim=0)  # ≈ 0 with Legendre
     ss_total = ((mag_detrended - mag_mean_dt) ** 2).sum(dim=0)
     r_obs = mag_detrended - (intercept_all.unsqueeze(0) + macro_detrended)
-    eps = r_obs * shrink.unsqueeze(0)                         # ODR residual
-    ss_residual = (eps ** 2).sum(dim=0)
+    eps = r_obs * shrink.unsqueeze(0)  # ODR residual
+    ss_residual = (eps**2).sum(dim=0)
     r2 = torch.where(
         ss_total > 1e-30,
         1.0 - ss_residual / ss_total,
@@ -621,7 +660,7 @@ def phase_regress(
     # useful for finding which voxels were most changed, not for reporting.
     r2_naive: torch.Tensor | None = None
     if r2_mode in ("naive", "both"):
-        ss_res_naive = (r_obs ** 2).sum(dim=0)
+        ss_res_naive = (r_obs**2).sum(dim=0)
         r2_naive = torch.where(
             ss_total > 1e-30,
             1.0 - ss_res_naive / ss_total,
@@ -630,19 +669,25 @@ def phase_regress(
 
     if verbose:
         r2_good = r2[vox_mask]
-        print(f"  R2 (phase, ODR-style): median={r2_good.median().item():.4f}, "
-              f"mean={r2_good.mean().item():.4f}, "
-              f"max={r2_good.max().item():.4f}")
+        print(
+            f"  R2 (phase, ODR-style): median={r2_good.median().item():.4f}, "
+            f"mean={r2_good.mean().item():.4f}, "
+            f"max={r2_good.max().item():.4f}"
+        )
         if r2_naive is not None:
             r2n_good = r2_naive[vox_mask]
-            print(f"  R2 (naive, no shrinkage): median={r2n_good.median().item():.4f}, "
-                  f"mean={r2n_good.mean().item():.4f}, "
-                  f"max={r2n_good.max().item():.4f}")
+            print(
+                f"  R2 (naive, no shrinkage): median={r2n_good.median().item():.4f}, "
+                f"mean={r2n_good.mean().item():.4f}, "
+                f"max={r2n_good.max().item():.4f}"
+            )
         infl_good = inflation[vox_mask]
-        print(f"  ODR inflation (1 + A²/φ): median={infl_good.median().item():.3f}, "
-              f"max={infl_good.max().item():.3f}, "
-              f">2: {int((infl_good > 2).sum().item()):,} voxels, "
-              f">10: {int((infl_good > 10).sum().item()):,} voxels")
+        print(
+            f"  ODR inflation (1 + A²/φ): median={infl_good.median().item():.3f}, "
+            f"max={infl_good.max().item():.3f}, "
+            f">2: {int((infl_good > 2).sum().item()):,} voxels, "
+            f">10: {int((infl_good > 10).sum().item()):,} voxels"
+        )
         n_total = int(vox_mask.sum().item())
         print(f"  R2 distribution over {n_total:,} masked voxels:")
         for thresh in (0.01, 0.05, 0.10, 0.20, 0.30, 0.50):
@@ -672,12 +717,10 @@ def phase_regress(
     #
     # The saved macro output is whatever was actually subtracted in the
     # active mode, so `mag_orig − corrected ≡ macro` in both.
-    mag_orig_per_voxel = torch.cat(
-        [m.T for m in mag_original_list], dim=0
-    )
-    mag_orig_mean = mag_orig_per_voxel.mean(dim=0)            # (n_voxels,)
+    mag_orig_per_voxel = torch.cat([m.T for m in mag_original_list], dim=0)
+    mag_orig_mean = mag_orig_per_voxel.mean(dim=0)  # (n_voxels,)
     if keep_drift:
-        slope_eff = slope_all * shrink                        # A / (1 + A²/φ)
+        slope_eff = slope_all * shrink  # A / (1 + A²/φ)
         pha_centered = pha_detrended_filt - pha_mean.unsqueeze(0)
         macro_detrended = slope_eff.unsqueeze(0) * pha_centered
         mag_corrected = mag_orig_per_voxel - macro_detrended
