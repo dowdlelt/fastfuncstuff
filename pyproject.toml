@@ -42,6 +42,7 @@ dev = [
 
 [project.scripts]
 # Analysis tools
+ffs_bsds = "fastfuncstuff.cli.bsds:main"
 ffs_build_design = "fastfuncstuff.cli.build_design:main"
 ffs_design_spec = "fastfuncstuff.cli.design_spec:main"
 ffs_decompose = "fastfuncstuff.cli.decompose:main"
