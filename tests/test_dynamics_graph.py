@@ -67,7 +67,6 @@ def test_complete_graph_efficiency_is_one():
 
 
 def test_state_graph_metrics_shapes_and_types():
-    rng = np.random.default_rng(0)
     fc = torch.tensor(np.stack([_triangle(), _star(3)]))  # (2, 3, 3)
     gm = state_graph_metrics(fc)
     assert gm.strength.shape == (2, 3)
