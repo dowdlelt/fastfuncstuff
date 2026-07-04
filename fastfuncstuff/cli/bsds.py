@@ -39,6 +39,7 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, print_cli_header
 from fastfuncstuff.dynamics.bsds.model import fit_bsds
+from fastfuncstuff.dynamics.graph import state_graph_metrics
 from fastfuncstuff.dynamics.parcellate import (
     parcellate_atlas,
     parcellate_voronoi,
@@ -46,6 +47,7 @@ from fastfuncstuff.dynamics.parcellate import (
 )
 from fastfuncstuff.dynamics.preprocess import preprocess_sessions
 from fastfuncstuff.dynamics.states import compute_state_stats
+from fastfuncstuff.dynamics.switching import compute_switch_stats
 from fastfuncstuff.utils import get_device
 
 
@@ -196,8 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _make_plots(stem: str, model, stats, args) -> None:
-    """Render QC and (optionally) publication figures; matplotlib is a core dep."""
+def _make_plots(stem: str, model, stats, args, graph_metrics, switch_stats) -> None:
+    """Render QC, analysis, and (optionally) publication figures; matplotlib is core."""
     import matplotlib
 
     matplotlib.use("Agg")  # headless: write files, never open a window
@@ -205,15 +207,25 @@ def _make_plots(stem: str, model, stats, args) -> None:
 
     qc_path = f"{stem}_qc.png"
     plots.qc_report(model, stats, qc_path, tr=args.tr)
-    print(f"  wrote {qc_path}")
+    analysis_path = f"{stem}_analysis.png"
+    plots.analysis_report(model, graph_metrics, switch_stats, analysis_path, tr=args.tr)
+    print(f"  wrote {qc_path}, {analysis_path}")
     if args.plots == "all":
         written = plots.save_publication_figures(
-            model, stats, stem, fmt=args.plot_format, tr=args.tr
+            model,
+            stats,
+            stem,
+            fmt=args.plot_format,
+            tr=args.tr,
+            graph_metrics=graph_metrics,
+            switch_stats=switch_stats,
         )
         print(f"  wrote {len(written)} publication figures ({args.plot_format} + png)")
 
 
-def _save_outputs(stem: str, model, stats, args, labels, elapsed: float, directed=None) -> None:
+def _save_outputs(
+    stem: str, model, stats, args, labels, elapsed: float, directed=None, graph=None, switch=None
+) -> None:
     base = Path(stem)
     base.parent.mkdir(parents=True, exist_ok=True)
     k = model.n_states
@@ -236,8 +248,20 @@ def _save_outputs(stem: str, model, stats, args, labels, elapsed: float, directe
         group_lifetime=stats.group_lifetime,
         subject_occupancy=stats.subject_occupancy,
         subject_lifetime=stats.subject_lifetime,
+        graph_strength=np.array([]) if graph is None else graph.strength,
+        graph_clustering=np.array([]) if graph is None else graph.clustering,
+        graph_betweenness=np.array([]) if graph is None else graph.betweenness,
+        graph_nodal_efficiency=np.array([]) if graph is None else graph.nodal_efficiency,
+        graph_global_efficiency=np.array([]) if graph is None else graph.global_efficiency,
+        switch_rate_group=np.array([]) if switch is None else np.array(switch.group_switch_rate),
+        switch_rate_subject=np.array([]) if switch is None else switch.subject_switch_rate,
         parcel_labels=np.array([]) if labels is None else np.asarray(labels),
     )
+    if switch is not None:
+        with open(f"{stem}_switch_paths.txt", "w") as fh:
+            fh.write("# count\tpath\n")
+            for path, count in switch.top_paths:
+                fh.write(f"{count}\t{'->'.join(f'S{s}' for s in path)}\n")
     np.savetxt(f"{stem}_transition.txt", model.transition.numpy(), fmt="%.6f")
     np.savetxt(f"{stem}_state_means.txt", model.state_means.numpy(), fmt="%.6f")
     for s in range(k):
@@ -265,6 +289,15 @@ def _save_outputs(stem: str, model, stats, args, labels, elapsed: float, directe
         "elapsed_sec": round(elapsed, 2),
         "parcellation": args.parcellation,
     }
+    if graph is not None:
+        summary["global_efficiency"] = graph.global_efficiency.tolist()
+        summary["mean_clustering"] = graph.mean_clustering.tolist()
+    if switch is not None:
+        summary["group_switch_rate"] = switch.group_switch_rate
+        summary["switch_rate_per_minute"] = switch.switch_rate_per_minute
+        summary["top_switch_paths"] = [
+            ["->".join(f"S{s}" for s in path), count] for path, count in switch.top_paths
+        ]
     with open(f"{stem}_summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
 
@@ -305,11 +338,23 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.dynamics.connectivity import per_state_directed_connectivity
 
     directed, _ = per_state_directed_connectivity(model, sessions)
+    graph = state_graph_metrics(stats.state_fc)
+    switch = compute_switch_stats(model, tr=args.tr)
 
     pfx = parse_prefix(str(args.prefix))
-    _save_outputs(pfx.stem, model, stats, args, labels, elapsed, directed=directed)
+    _save_outputs(
+        pfx.stem,
+        model,
+        stats,
+        args,
+        labels,
+        elapsed,
+        directed=directed,
+        graph=graph,
+        switch=switch,
+    )
     if args.plots != "none":
-        _make_plots(pfx.stem, model, stats, args)
+        _make_plots(pfx.stem, model, stats, args, graph, switch)
     print(
         f"  done in {elapsed:.1f}s — {model.n_states} states, "
         f"converged={model.converged}, occupancy={np.round(stats.group_occupancy, 3).tolist()}"

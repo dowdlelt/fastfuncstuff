@@ -272,6 +272,100 @@ def plot_state_fc(stats, fig=None):
     return fig
 
 
+def plot_graph_metrics(gm, fig=None):
+    """Per-state graph-theoretic summary: integration, segregation, node strength."""
+    k = gm.n_states
+    colors = state_colors(k)
+    if fig is None:
+        fig = plt.figure(figsize=(10, 3.2), facecolor=_SURFACE)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.4], wspace=0.42)
+    a0, a1, a2 = (fig.add_subplot(gs[0, i]) for i in range(3))
+    a0.bar(range(k), gm.global_efficiency, color=colors, width=0.72)
+    a0.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    a0.set_ylabel("global efficiency")
+    a0.set_title("Integration")
+    _style_axes(a0)
+    a1.bar(range(k), gm.mean_clustering, color=colors, width=0.72)
+    a1.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    a1.set_ylabel("mean clustering")
+    a1.set_title("Segregation")
+    _style_axes(a1)
+    im = a2.imshow(gm.strength, cmap=SEQUENTIAL, aspect="auto")
+    a2.set_yticks(range(k), [f"S{s}" for s in range(k)])
+    a2.set_xlabel("ROI")
+    a2.set_title("Node strength")
+    a2.title.set_color(_INK)
+    a2.tick_params(colors=_INK2, labelsize=8, length=0)
+    cb = fig.colorbar(im, ax=a2, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=7, colors=_INK2)
+    fig.suptitle("Per-state network metrics", color=_INK, fontsize=11)
+    return fig
+
+
+def plot_switch_rate_over_time(model, ax, run_idx: int = 0, window: int = 20, tr: float = 1.0):
+    """Windowed switch density within one run — bursts vs stable epochs."""
+    from fastfuncstuff.dynamics.switching import windowed_switch_rate
+
+    rate = windowed_switch_rate(model.viterbi_states[run_idx], window)
+    t, xlabel = _run_time_axis(rate.shape[0], tr)
+    ax.plot(t, rate, color="#256abf", linewidth=1.6)
+    ax.fill_between(t, rate, color="#256abf", alpha=0.12, linewidth=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("switch rate")
+    ax.set_title(f"Switching over time — run {run_idx} ({window}-frame window)")
+    _style_axes(ax)
+
+
+def plot_switch_paths(switch_stats, ax, top: int = 8):
+    """Most frequent multi-step switch paths as a horizontal bar chart."""
+    paths = switch_stats.top_paths[:top]
+    labels = ["→".join(f"S{s}" for s in p) for p, _ in paths]
+    counts = [c for _, c in paths]
+    y = np.arange(len(paths))[::-1]  # most frequent on top
+    ax.barh(y, counts, color="#256abf", height=0.7)
+    ax.set_yticks(y, labels)
+    ax.set_xlabel("count")
+    ax.set_title("Most frequent switch paths")
+    _style_axes(ax)
+
+
+def plot_prediction(pred, ax):
+    """Held-out predicted vs actual behaviour, with the identity line and CV score."""
+    actual, predicted = np.asarray(pred.actual), np.asarray(pred.predicted)
+    lo = float(min(actual.min(), predicted.min()))
+    hi = float(max(actual.max(), predicted.max()))
+    pad = 0.05 * (hi - lo or 1.0)
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color=_INK2, linewidth=1, linestyle="--")
+    ax.scatter(actual, predicted, s=28, color="#256abf", zorder=3, linewidths=0)
+    ax.set_xlabel("actual behaviour")
+    ax.set_ylabel("predicted (held-out)")
+    ax.set_title("LOSO prediction")
+    ax.text(
+        0.04,
+        0.96,
+        f"R²={pred.r2:.2f}\nr={pred.correlation:.2f}",
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        color=_INK,
+    )
+    _style_axes(ax)
+
+
+def plot_behavior_correlation(corrs, ax):
+    """Per-state correlation of a state feature (e.g. occupancy) with behaviour."""
+    corrs = np.asarray(corrs)
+    k = len(corrs)
+    ax.axhline(0, color=_INK2, linewidth=0.8)
+    ax.bar(range(k), corrs, color=state_colors(k), width=0.72)
+    ax.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    ax.set_ylabel("corr with behaviour")
+    ax.set_title("State feature ↔ behaviour")
+    _style_axes(ax)
+
+
 # --------------------------------------------------------------------------- #
 # Composite entry points.                                                      #
 # --------------------------------------------------------------------------- #
@@ -299,8 +393,54 @@ def qc_report(model, stats, path: str | Path, run_idx: int = 0, tr: float = 1.0)
     return path
 
 
+def analysis_report(
+    model, graph_metrics, switch_stats, path: str | Path, run_idx: int = 0, tr: float = 1.0
+):
+    """One figure for the post-hoc analyses: network metrics + switching dynamics."""
+    fig = plt.figure(figsize=(13, 8), facecolor=_SURFACE)
+    outer = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.42)
+    top = outer[0, 0].subgridspec(1, 3, width_ratios=[1, 1, 1.4], wspace=0.42)
+    a0 = fig.add_subplot(top[0, 0])
+    a1 = fig.add_subplot(top[0, 1])
+    a2 = fig.add_subplot(top[0, 2])
+    k = model.n_states
+    colors = state_colors(k)
+    a0.bar(range(k), graph_metrics.global_efficiency, color=colors, width=0.72)
+    a0.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    a0.set_ylabel("global efficiency")
+    a0.set_title("Integration")
+    _style_axes(a0)
+    a1.bar(range(k), graph_metrics.mean_clustering, color=colors, width=0.72)
+    a1.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    a1.set_ylabel("mean clustering")
+    a1.set_title("Segregation")
+    _style_axes(a1)
+    im = a2.imshow(graph_metrics.strength, cmap=SEQUENTIAL, aspect="auto")
+    a2.set_yticks(range(k), [f"S{s}" for s in range(k)])
+    a2.set_xlabel("ROI")
+    a2.set_title("Node strength")
+    a2.title.set_color(_INK)
+    a2.tick_params(colors=_INK2, labelsize=8, length=0)
+    cb = fig.colorbar(im, ax=a2, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=7, colors=_INK2)
+    bot = outer[1, 0].subgridspec(1, 2, width_ratios=[1.6, 1], wspace=0.3)
+    plot_switch_rate_over_time(model, fig.add_subplot(bot[0, 0]), run_idx=run_idx, tr=tr)
+    plot_switch_paths(switch_stats, fig.add_subplot(bot[0, 1]))
+    fig.suptitle("ffs_bsds analysis — network metrics & switching", color=_INK, fontsize=13)
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
+    plt.close(fig)
+    return path
+
+
 def save_publication_figures(
-    model, stats, stem: str | Path, *, fmt: str = "pdf", tr: float = 1.0
+    model,
+    stats,
+    stem: str | Path,
+    *,
+    fmt: str = "pdf",
+    tr: float = 1.0,
+    graph_metrics=None,
+    switch_stats=None,
 ) -> list[str]:
     """Save each key figure individually (vector ``fmt`` + PNG), paper-ready."""
     stem = str(stem)
@@ -333,4 +473,15 @@ def save_publication_figures(
     _save(fig, "state_means")
 
     _save(plot_state_fc(stats), "state_fc")
+
+    if graph_metrics is not None:
+        _save(plot_graph_metrics(graph_metrics), "graph_metrics")
+    if switch_stats is not None:
+        fig, (a0, a1) = plt.subplots(
+            1, 2, figsize=(10, 3), facecolor=_SURFACE, width_ratios=[1.6, 1]
+        )
+        plot_switch_rate_over_time(model, a0, tr=tr)
+        plot_switch_paths(switch_stats, a1)
+        fig.tight_layout()
+        _save(fig, "switching")
     return written
