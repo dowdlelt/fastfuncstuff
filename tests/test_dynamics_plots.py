@@ -1,0 +1,58 @@
+"""Smoke tests for BSDS figures (headless Agg backend)."""
+
+from __future__ import annotations
+
+import sys
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+from fastfuncstuff.dynamics.bsds.model import fit_bsds  # noqa: E402
+from fastfuncstuff.dynamics.plots import (  # noqa: E402
+    qc_report,
+    save_publication_figures,
+    state_colors,
+)
+from fastfuncstuff.dynamics.states import compute_state_stats  # noqa: E402
+
+sys.path.insert(0, "tests")
+from test_bsds_model import _simulate  # noqa: E402
+
+
+def _fit(k=3, d=6, seed=1):
+    sessions, _, _, _ = _simulate(k=k, d=d, n_sessions=2, seed=seed)
+    model = fit_bsds(sessions, n_states=k, max_ldim=3, n_init=2, n_init_iter=10, n_iter=50)
+    return model, compute_state_stats(model, tr=0.72)
+
+
+def test_state_colors_fixed_order_and_extension():
+    assert state_colors(3) == ["#2a78d6", "#1baf7a", "#eda100"]
+    # 8 states use the full palette; asking for more warns but still returns K.
+    import pytest
+
+    assert len(state_colors(8)) == 8
+    with pytest.warns(UserWarning):
+        cols = state_colors(10)
+    assert len(cols) == 10
+
+
+def test_qc_report_writes_png(tmp_path):
+    model, stats = _fit()
+    out = tmp_path / "sub_qc.png"
+    qc_report(model, stats, out, tr=0.72)
+    assert out.exists() and out.stat().st_size > 5000  # a real image, not empty
+
+
+def test_publication_figures_written(tmp_path):
+    model, stats = _fit()
+    stem = str(tmp_path / "sub")
+    written = save_publication_figures(model, stats, stem, fmt="svg", tr=0.72)
+    # Each figure saved as both svg and png; timecourse per run.
+    assert any(w.endswith("_transition.svg") for w in written)
+    assert any(w.endswith("_state_fc.png") for w in written)
+    assert sum(w.endswith(".svg") for w in written) == sum(w.endswith(".png") for w in written)
+    for w in written:
+        import os
+
+        assert os.path.getsize(w) > 0

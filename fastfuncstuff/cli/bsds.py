@@ -171,7 +171,37 @@ def build_parser() -> argparse.ArgumentParser:
         default="zscore",
         help="Per-ROI standardisation.",
     )
+    p.add_argument(
+        "-plots",
+        choices=["none", "qc", "all"],
+        default="qc",
+        help="qc: one multi-panel QC PNG; all: also per-figure publication files.",
+    )
+    p.add_argument(
+        "-plot_format",
+        "-plot-format",
+        choices=["pdf", "svg", "png"],
+        default="pdf",
+        help="Vector format for -plots all publication figures.",
+    )
     return p
+
+
+def _make_plots(stem: str, model, stats, args) -> None:
+    """Render QC and (optionally) publication figures; matplotlib is a core dep."""
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless: write files, never open a window
+    from fastfuncstuff.dynamics import plots
+
+    qc_path = f"{stem}_qc.png"
+    plots.qc_report(model, stats, qc_path, tr=args.tr)
+    print(f"  wrote {qc_path}")
+    if args.plots == "all":
+        written = plots.save_publication_figures(
+            model, stats, stem, fmt=args.plot_format, tr=args.tr
+        )
+        print(f"  wrote {len(written)} publication figures ({args.plot_format} + png)")
 
 
 def _save_outputs(stem: str, model, stats, args, labels, elapsed: float) -> None:
@@ -262,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
 
     pfx = parse_prefix(str(args.prefix))
     _save_outputs(pfx.stem, model, stats, args, labels, elapsed)
+    if args.plots != "none":
+        _make_plots(pfx.stem, model, stats, args)
     print(
         f"  done in {elapsed:.1f}s — {model.n_states} states, "
         f"converged={model.converged}, occupancy={np.round(stats.group_occupancy, 3).tolist()}"
