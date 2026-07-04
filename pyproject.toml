@@ -39,6 +39,15 @@ dev = [
     "scikit-learn>=1.2",
     "ruff>=0.9",
 ]
+# Optional extras for ffs_bsds: data-driven parcellation (ward/rena), alternate
+# dynamic-state backends (osl-dynamics), and the CEBRA embedding bridge. The
+# native BSDS path needs none of these.
+dynamics = [
+    "scikit-learn>=1.2",
+    "nilearn>=0.10",
+    "osl-dynamics>=1.2",
+    "cebra>=0.4",
+]
 
 [project.scripts]
 # Analysis tools
