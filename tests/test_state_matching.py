@@ -92,3 +92,8 @@ def test_two_fits_agree_on_parameter_and_temporal_matching():
     param_map = by_param.col_ind[np.argsort(by_param.row_ind)]
     time_map = by_time.col_ind[np.argsort(by_time.row_ind)]
     np.testing.assert_array_equal(param_map, time_map)
+
+    # The cross-task path: decode both models onto shared sessions internally.
+    by_sessions = match_states(a, b, method="temporal", sessions=sessions)
+    sess_map = by_sessions.col_ind[np.argsort(by_sessions.row_ind)]
+    np.testing.assert_array_equal(sess_map, param_map)

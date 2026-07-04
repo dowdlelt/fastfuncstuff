@@ -9,6 +9,7 @@ import torch
 from fastfuncstuff.dynamics.preprocess import (
     concat_sessions,
     detrend_session,
+    estimate_latent_dim,
     preprocess_sessions,
     standardize_session,
 )
@@ -72,3 +73,15 @@ def test_concat_sessions():
     cat, lengths = concat_sessions([a, b])
     assert cat.shape == (3, 25)
     assert lengths == [10, 15]
+
+
+def test_estimate_latent_dim_low_rank():
+    rng = np.random.default_rng(0)
+    d, n, r = 8, 500, 2
+    load = rng.standard_normal((d, r))
+    y = load @ rng.standard_normal((r, n)) + rng.standard_normal((d, n)) * 0.01
+    dim = estimate_latent_dim([torch.tensor(y)], energy=0.9)
+    assert 2 <= dim <= 3  # rank-2 structure -> ~2 components carry 90% variance
+    # Capped at D-1 for full-rank noise.
+    full = estimate_latent_dim([torch.tensor(rng.standard_normal((5, 400)))], energy=0.99)
+    assert full <= 4

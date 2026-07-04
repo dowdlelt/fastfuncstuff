@@ -28,6 +28,7 @@ from fastfuncstuff.dynamics.preprocess import (
     Sessions,
     concat_sessions,
     detrend_session,
+    estimate_latent_dim,
     preprocess_sessions,
     standardize_session,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "Sessions",
     "concat_sessions",
     "detrend_session",
+    "estimate_latent_dim",
     "preprocess_sessions",
     "standardize_session",
 ]

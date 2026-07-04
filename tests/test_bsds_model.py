@@ -114,3 +114,28 @@ def test_subject_fit_stays_in_register_with_group():
     agree = (group_path == subj_path).mean()
     assert agree > 0.8, f"subject fit drifted from group states: {agree:.3f}"
     assert subj.state_covs.shape == (k, 6, 6)
+
+
+def test_decode_reproduces_training_and_generalizes():
+    from fastfuncstuff.dynamics.bsds.model import decode
+
+    k = 3
+    sessions, true_states, _, _ = _simulate(k=k, d=6, n_sessions=3, seed=1)
+    model = fit_bsds(sessions[:2], n_states=k, max_ldim=3, n_init=3, n_init_iter=12, n_iter=60)
+
+    # Decoding the training runs (fixed params, E-step only) reproduces the fit.
+    dec = decode(model, sessions[:2])
+    for fit_path, dec_path in zip(model.viterbi_states, dec.viterbi_states, strict=True):
+        assert (fit_path.numpy() == dec_path.numpy()).mean() > 0.99
+
+    # A held-out run: right shapes and it still recovers the ground truth.
+    dec_h = decode(model, [sessions[2]])
+    assert dec_h.responsibilities[0].shape == (sessions[2].shape[1], k)
+    acc, _ = _best_accuracy(dec_h.viterbi_states[0].numpy(), true_states[2], k)
+    assert acc > 0.8, f"held-out decode accuracy too low: {acc:.3f}"
+
+
+def test_fit_bsds_auto_ldim():
+    sessions, _, _, _ = _simulate(k=2, d=8, r=2, n_sessions=1, seed=0)
+    model = fit_bsds(sessions, n_states=2, max_ldim="auto", n_init=1, n_init_iter=5, n_iter=20)
+    assert 1 <= model.ldim <= 7

@@ -161,7 +161,7 @@ def fit_bsds(
     sessions: list[torch.Tensor],
     n_states: int,
     *,
-    max_ldim: int | None = None,
+    max_ldim: int | str | None = None,
     n_iter: int = 100,
     n_init: int = 10,
     n_init_iter: int = 10,
@@ -181,9 +181,13 @@ def fit_bsds(
     device = sessions[0].device if device is None else device
     sessions = [s.to(device=device, dtype=_DTYPE) for s in sessions]
     d = sessions[0].shape[0]
-    if max_ldim is None:
+    if max_ldim == "auto":
+        from fastfuncstuff.dynamics.preprocess import estimate_latent_dim
+
+        max_ldim = estimate_latent_dim(sessions)
+    elif max_ldim is None:
         max_ldim = d - 1
-    ldim = min(max_ldim, d - 1)
+    ldim = min(int(max_ldim), d - 1)
     lengths = [int(s.shape[1]) for s in sessions]
     y = torch.cat(sessions, dim=1)
     if show_progress is None:
@@ -257,3 +261,70 @@ def fit_subject(
     model.objective_history = history
     model.converged = converged
     return model
+
+
+@dataclass
+class DecodeResult:
+    """State time courses from applying a fitted model to new data (no refit)."""
+
+    n_states: int
+    responsibilities: list[torch.Tensor]  # per session (T_i, K)
+    viterbi_states: list[torch.Tensor]  # per session (T_i,) MAP path
+    loglik: float
+
+
+def decode(
+    model: BSDSModel,
+    sessions: list[torch.Tensor],
+    *,
+    device: torch.device | None = None,
+) -> DecodeResult:
+    """Apply a fitted model to new sessions with parameters held fixed.
+
+    Runs only the inference E-step — recompute the latent for the new data given
+    the fixed loadings, then the emissions and HMM forward-backward — so it yields
+    state responsibilities and a MAP path on data the model was never fit on. This
+    is how you apply a trained model to held-out runs, and how cross-fit temporal
+    matching gets both models onto the same time axis (reference
+    ``computeQnsFromGivenNetForNewData``).
+    """
+    g = model.state
+    device = g.lm.device if device is None else device
+    sessions = [s.to(device=device, dtype=_DTYPE) for s in sessions]
+    if sessions[0].shape[0] != g.n_roi:
+        raise ValueError(f"new data has D={sessions[0].shape[0]} but the model expects D={g.n_roi}")
+    lengths = [int(s.shape[1]) for s in sessions]
+    y = torch.cat(sessions, dim=1)
+
+    # A state carrying the fitted parameters but the new data's time axis.
+    state = VBState(
+        n_states=g.n_states,
+        n_roi=g.n_roi,
+        ldim=g.ldim,
+        n_time=int(y.shape[1]),
+        session_lengths=lengths,
+        lm=g.lm,
+        lcov=g.lcov,
+        xm=torch.ones(g.n_states, g.kt, y.shape[1], dtype=_DTYPE, device=device),
+        xcov=torch.zeros(g.n_states, g.kt, g.kt, dtype=_DTYPE, device=device),
+        psii=g.psii,
+        a=g.a,
+        b=g.b,
+        mean_mcl=g.mean_mcl,
+        nu_mcl=g.nu_mcl,
+        wa=g.wa,
+        wpi=g.wpi,
+        qns=torch.zeros(int(y.shape[1]), g.n_states, dtype=_DTYPE, device=device),
+    )
+    vb.update_qx(state, y)  # latent posterior for the new data under fixed loadings
+    log_obs = vb.compute_log_out_probs(state, sessions)
+    gammas, _xi, _g0, loglik = hmm.estep(log_obs, state.wa, state.wpi)
+    trans = state.wa / state.wa.sum(dim=1, keepdim=True)
+    init = state.wpi / state.wpi.sum()
+    viterbi = [hmm.viterbi(lo, trans, init) for lo in log_obs]
+    return DecodeResult(
+        n_states=g.n_states,
+        responsibilities=gammas,
+        viterbi_states=viterbi,
+        loglik=float(loglik),
+    )

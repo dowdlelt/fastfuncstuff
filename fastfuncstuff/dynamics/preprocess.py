@@ -153,6 +153,37 @@ def preprocess_sessions(
     return out
 
 
+def estimate_latent_dim(
+    sessions: Sessions,
+    energy: float = 0.9,
+    *,
+    min_dim: int = 1,
+) -> int:
+    """Auto-select the latent-factor bound from PCA energy of the data.
+
+    Mirrors the reference ``decideOnLocalComplexityBasedOnEnergy``: per session,
+    count the ROI-space principal components needed to reach ``energy`` fraction
+    of the variance, and take the max across sessions (capped at ``D - 1``). ARD
+    then prunes further per state, so this only sets the upper bound.
+    """
+    if not 0 < energy <= 1:
+        raise ValueError("energy must be in (0, 1]")
+    d = int(sessions[0].shape[0])
+    dims: list[int] = []
+    for s in sessions:
+        y = s.detach().cpu().numpy() if isinstance(s, torch.Tensor) else np.asarray(s)
+        y = y - y.mean(axis=1, keepdims=True)
+        sv = np.linalg.svd(y, compute_uv=False)  # (min(D, N),)
+        ev = sv**2
+        total = ev.sum()
+        if total <= 0:
+            dims.append(min_dim)
+            continue
+        cum = np.cumsum(ev) / total
+        dims.append(int(np.searchsorted(cum, energy) + 1))
+    return int(min(max(max(dims), min_dim), d - 1))
+
+
 def concat_sessions(
     sessions: list[torch.Tensor],
 ) -> tuple[torch.Tensor, list[int]]:

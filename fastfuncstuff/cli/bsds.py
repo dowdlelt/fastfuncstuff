@@ -49,6 +49,11 @@ from fastfuncstuff.dynamics.states import compute_state_stats
 from fastfuncstuff.utils import get_device
 
 
+def _ldim(value: str):
+    """argparse type for -max_ldim: the string 'auto' or an int bound."""
+    return "auto" if value == "auto" else int(value)
+
+
 def _load_2d_timeseries(path: str, time_axis: str) -> np.ndarray:
     """Load a 2-D ROI time series and orient it to ``(D, N)`` (ROIs by time)."""
     if path.endswith(".npy"):
@@ -132,7 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-n_states", "-n-states", type=int, default=6, help="Max number of states (ARD prunes)."
     )
     p.add_argument(
-        "-max_ldim", "-max-ldim", type=int, default=None, help="Max latent factors (default D-1)."
+        "-max_ldim",
+        "-max-ldim",
+        type=_ldim,
+        default=None,
+        help="Max latent factors: an int, or 'auto' (PCA-energy heuristic). Default D-1.",
     )
     p.add_argument("-n_init", "-n-init", type=int, default=10, help="Random restarts.")
     p.add_argument("-n_iter", "-n-iter", type=int, default=100, help="Max VB iterations.")
@@ -204,7 +213,7 @@ def _make_plots(stem: str, model, stats, args) -> None:
         print(f"  wrote {len(written)} publication figures ({args.plot_format} + png)")
 
 
-def _save_outputs(stem: str, model, stats, args, labels, elapsed: float) -> None:
+def _save_outputs(stem: str, model, stats, args, labels, elapsed: float, directed=None) -> None:
     base = Path(stem)
     base.parent.mkdir(parents=True, exist_ok=True)
     k = model.n_states
@@ -220,6 +229,7 @@ def _save_outputs(stem: str, model, stats, args, labels, elapsed: float) -> None
         psii=model.psii.numpy(),
         ar_transitions=model.ar_transitions.numpy(),
         ar_noise_cov=model.ar_noise_cov.numpy(),
+        directed_connectivity=(np.array([]) if directed is None else directed.cpu().numpy()),
         effective_dim=model.effective_dim.numpy(),
         session_lengths=np.array(model.session_lengths),
         group_occupancy=stats.group_occupancy,
@@ -232,6 +242,8 @@ def _save_outputs(stem: str, model, stats, args, labels, elapsed: float) -> None
     np.savetxt(f"{stem}_state_means.txt", model.state_means.numpy(), fmt="%.6f")
     for s in range(k):
         np.savetxt(f"{stem}_fc_state-{s:02d}.txt", stats.state_fc[s].numpy(), fmt="%.6f")
+        if directed is not None:
+            np.savetxt(f"{stem}_directed_state-{s:02d}.txt", directed[s].cpu().numpy(), fmt="%.6f")
     for r, (path_prob, path_map) in enumerate(
         zip(model.responsibilities, model.viterbi_states, strict=True)
     ):
@@ -290,8 +302,12 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.time() - t0
     stats = compute_state_stats(model, tr=args.tr)
 
+    from fastfuncstuff.dynamics.connectivity import per_state_directed_connectivity
+
+    directed, _ = per_state_directed_connectivity(model, sessions)
+
     pfx = parse_prefix(str(args.prefix))
-    _save_outputs(pfx.stem, model, stats, args, labels, elapsed)
+    _save_outputs(pfx.stem, model, stats, args, labels, elapsed, directed=directed)
     if args.plots != "none":
         _make_plots(pfx.stem, model, stats, args)
     print(

@@ -43,13 +43,9 @@ def gaussian_symmetric_kl(
     inv_a = torch.linalg.inv(cov_a)
     inv_b = torch.linalg.inv(cov_b)
     diff = (mean_b - mean_a).unsqueeze(1)  # (D, 1)
-    kl_ab = 0.5 * (
-        torch.trace(inv_b @ cov_a) + (diff.T @ inv_b @ diff).squeeze() - d
-    )
+    kl_ab = 0.5 * (torch.trace(inv_b @ cov_a) + (diff.T @ inv_b @ diff).squeeze() - d)
     diff2 = (mean_a - mean_b).unsqueeze(1)
-    kl_ba = 0.5 * (
-        torch.trace(inv_a @ cov_b) + (diff2.T @ inv_a @ diff2).squeeze() - d
-    )
+    kl_ba = 0.5 * (torch.trace(inv_a @ cov_b) + (diff2.T @ inv_a @ diff2).squeeze() - d)
     # The log-det terms cancel in the symmetric sum.
     return kl_ab + kl_ba
 
@@ -114,19 +110,27 @@ def match_states(
     method: str = "state_space",
     resp_a: list[torch.Tensor] | None = None,
     resp_b: list[torch.Tensor] | None = None,
+    sessions: list[torch.Tensor] | None = None,
 ) -> StateMatch:
     """Optimally match A's states to B's states (Hungarian assignment).
 
-    ``method="state_space"`` uses symmetric-KL distance (minimised);
-    ``method="temporal"`` uses responsibility correlation (maximised) and requires
-    ``resp_a``/``resp_b`` for the same sessions.
+    ``method="state_space"`` uses symmetric-KL distance (minimised).
+    ``method="temporal"`` uses responsibility correlation (maximised): pass either
+    ``resp_a``/``resp_b`` (both models already decoded on the same sessions) or
+    ``sessions`` (both models are decoded onto it here — the cross-task path,
+    since two fits of different tasks share no native time axis).
     """
     if method == "state_space":
         score = state_space_distance_matrix(model_a, model_b)
         row_ind, col_ind = linear_sum_assignment(score.numpy())
     elif method == "temporal":
+        if sessions is not None:
+            from fastfuncstuff.dynamics.bsds.model import decode
+
+            resp_a = decode(model_a, sessions).responsibilities
+            resp_b = decode(model_b, sessions).responsibilities
         if resp_a is None or resp_b is None:
-            raise ValueError("temporal matching requires resp_a and resp_b")
+            raise ValueError("temporal matching requires resp_a/resp_b or sessions")
         score = temporal_similarity_matrix(resp_a, resp_b)
         row_ind, col_ind = linear_sum_assignment(-score.numpy())  # maximise
     else:
