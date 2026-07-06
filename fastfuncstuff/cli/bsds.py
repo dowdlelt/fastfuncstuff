@@ -38,7 +38,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, print_cli_header
-from fastfuncstuff.dynamics.bsds.model import fit_bsds
+from fastfuncstuff.dynamics.bsds.model import fit_bsds, posterior_arrays
 from fastfuncstuff.dynamics.graph import state_graph_metrics
 from fastfuncstuff.dynamics.parcellate import (
     parcellate_atlas,
@@ -498,19 +498,10 @@ def _save_outputs(
 
     np.savez(
         f"{stem}_model.npz",
-        state_means=model.state_means.numpy(),
-        state_covs=model.state_covs.numpy(),
+        # Model + variational posterior (decode-ready; read back by load_bsds_model).
+        **posterior_arrays(model),
         state_fc=stats.state_fc.numpy(),
-        transition=model.transition.numpy(),
-        init_probs=model.init_probs.numpy(),
-        loadings=model.loadings.numpy(),
-        psii=model.psii.numpy(),
-        ar_transitions=model.ar_transitions.numpy(),
-        ar_noise_cov=model.ar_noise_cov.numpy(),
         directed_connectivity=(np.array([]) if directed is None else directed.cpu().numpy()),
-        effective_dim=model.effective_dim.numpy(),
-        ard_precision=model.ard_precision.numpy(),
-        session_lengths=np.array(model.session_lengths),
         group_occupancy=stats.group_occupancy,
         group_lifetime=stats.group_lifetime,
         subject_occupancy=stats.subject_occupancy,

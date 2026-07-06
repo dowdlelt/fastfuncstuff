@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 from tqdm.auto import tqdm
 
@@ -157,6 +158,115 @@ def _finalize(state: VBState, y: torch.Tensor, sessions: list[torch.Tensor]) -> 
         ard_precision=ard_precision.cpu(),
         loadings=lam.cpu(),
         psii=state.psii.cpu(),
+        objective_history=[],
+        converged=False,
+        state=state,
+    )
+
+
+def posterior_arrays(model: BSDSModel) -> dict:
+    """The arrays needed to persist a fit and later reconstruct it for :func:`decode`.
+
+    Includes the reportable fields (means/covs/loadings/transition/AR/ARD) plus the
+    variational-posterior pieces the reportable set drops — ``lcov``, the ARD
+    ``a``/``b``, the mean hyperprior, and the *unnormalised* Dirichlet ``wa``/``wpi``
+    (``transition`` alone loses the concentration magnitude). :func:`load_bsds_model`
+    reads exactly these keys.
+    """
+    s = model.state
+
+    def np_(t):
+        return t.detach().cpu().numpy()
+
+    return {
+        "n_states": np.array(model.n_states),
+        "ldim": np.array(model.ldim),
+        "session_lengths": np.array(model.session_lengths),
+        "state_means": np_(model.state_means),
+        "state_covs": np_(model.state_covs),
+        "loadings": np_(model.loadings),
+        "transition": np_(model.transition),
+        "init_probs": np_(model.init_probs),
+        "ar_transitions": np_(model.ar_transitions),
+        "ar_noise_cov": np_(model.ar_noise_cov),
+        "effective_dim": np_(model.effective_dim),
+        "ard_precision": np_(model.ard_precision),
+        "psii": np_(model.psii),
+        "post_lcov": np_(s.lcov),
+        "post_a": np.array(float(s.a)),
+        "post_b": np_(s.b),
+        "post_mean_mcl": np_(s.mean_mcl),
+        "post_nu_mcl": np_(s.nu_mcl),
+        "post_wa": np_(s.wa),
+        "post_wpi": np_(s.wpi),
+    }
+
+
+def save_bsds_model(model: BSDSModel, path: str) -> str:
+    """Write a fit to ``path`` (``.npz``) so it can be reloaded and applied to new data."""
+    np.savez(path, **posterior_arrays(model))
+    return path
+
+
+def load_bsds_model(path: str, *, device: torch.device | str | None = None) -> BSDSModel:
+    """Reconstruct a :class:`BSDSModel` from :func:`save_bsds_model` (or the run's
+    ``*_model.npz``), sufficient for :func:`decode` and inspecting the fitted
+    parameters. The training responsibilities/Viterbi paths are not restored (a
+    loaded model is for decoding new data, not re-QC-ing the training runs).
+    """
+    z = np.load(path)
+    dev = torch.device("cpu") if device is None else torch.device(device)
+    k = int(z["n_states"])
+    ldim = int(z["ldim"])
+    lengths = [int(x) for x in z["session_lengths"]]
+    d = int(z["psii"].shape[0])
+    kt = ldim + 1
+
+    def t(name):
+        return torch.tensor(z[name], dtype=_DTYPE, device=dev)
+
+    state_means = t("state_means")  # (K, D)
+    loadings = t("loadings")  # (K, D, ldim)
+    lm = torch.zeros(k, d, kt, dtype=_DTYPE, device=dev)
+    lm[:, :, 0] = state_means
+    if ldim > 0:
+        lm[:, :, 1:] = loadings
+    n_time = max(int(sum(lengths)), 1)
+    state = VBState(
+        n_states=k,
+        n_roi=d,
+        ldim=ldim,
+        n_time=n_time,
+        session_lengths=list(lengths),
+        lm=lm,
+        lcov=t("post_lcov"),
+        xm=torch.ones(k, kt, n_time, dtype=_DTYPE, device=dev),
+        xcov=torch.zeros(k, kt, kt, dtype=_DTYPE, device=dev),
+        psii=t("psii"),
+        a=float(z["post_a"]),
+        b=t("post_b"),
+        mean_mcl=t("post_mean_mcl"),
+        nu_mcl=t("post_nu_mcl"),
+        wa=t("post_wa"),
+        wpi=t("post_wpi"),
+        qns=torch.zeros(n_time, k, dtype=_DTYPE, device=dev),
+    )
+    return BSDSModel(
+        n_states=k,
+        ldim=ldim,
+        session_lengths=list(lengths),
+        state_means=state_means.cpu(),
+        state_covs=t("state_covs").cpu(),
+        transition=t("transition").cpu(),
+        init_probs=t("init_probs").cpu(),
+        responsibilities=[],
+        viterbi_states=[],
+        ar_transitions=t("ar_transitions").cpu(),
+        ar_noise_cov=t("ar_noise_cov").cpu(),
+        effective_dim=t("effective_dim").cpu(),
+        ard_precision=t("ard_precision").cpu(),
+        loadings=loadings.cpu(),
+        psii=t("psii").cpu(),
         objective_history=[],
         converged=False,
         state=state,
