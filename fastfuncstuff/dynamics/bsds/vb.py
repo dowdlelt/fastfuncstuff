@@ -92,27 +92,32 @@ def update_qx(state: VBState, y: torch.Tensor) -> None:
 
 
 def update_ql(state: VBState, y: torch.Tensor) -> None:
-    """Loading posterior given latent, data and ARD priors (``inferQL``)."""
+    """Loading posterior given latent, data and ARD priors (``inferQL``).
+
+    Batched over states — the reference ``inferQL`` loops the same per-state
+    normal-equation solve; here it is one set of ops over the ``K`` axis (the
+    peak intermediate is ``(K, D, kt, kt)`` with ``kt`` tiny, so cheap).
+    """
     psii = state.psii
     qns = state.qns  # (N, K)
     a_over_b = state.a / state.b  # (K, ldim)
-    # num[t] is (D, kt): column 0 = nu_mcl (per ROI), columns 1: = a/b (per state)
-    for t in range(state.n_states):
-        n_eff = qns[:, t].sum()
-        temp = state.xm[t] * qns[:, t]  # (kt, N)
-        t2 = state.xcov[t] * n_eff + state.xm[t] @ temp.T  # (kt, kt)
-        t3 = psii.unsqueeze(1) * (y @ temp.T)  # (D, kt)
-        num = torch.empty(state.n_roi, state.kt, dtype=_DTYPE, device=y.device)
-        num[:, 0] = state.nu_mcl
-        num[:, 1:] = a_over_b[t].unsqueeze(0)
-        # A_q = diag(num_q) + psii_q * T2  ->  (D, kt, kt)
-        a_q = torch.diag_embed(num) + psii.view(-1, 1, 1) * t2.unsqueeze(0)
-        lcov_t = torch.linalg.inv(a_q)  # (D, kt, kt)
-        rhs = t3.clone()  # (D, kt)
-        rhs[:, 0] = rhs[:, 0] + state.mean_mcl * state.nu_mcl
-        lm_t = torch.einsum("qk,qkl->ql", rhs, lcov_t)  # (D, kt)
-        state.lcov[t] = lcov_t
-        state.lm[t] = lm_t
+    n_eff = qns.sum(dim=0)  # (K,)
+    temp = state.xm * qns.T.unsqueeze(1)  # (K, kt, N) responsibility-weighted latent
+    t2 = state.xcov * n_eff.view(-1, 1, 1) + torch.einsum(
+        "kin,kjn->kij", state.xm, temp
+    )  # (K, kt, kt)
+    t3 = psii.view(1, -1, 1) * torch.einsum("dn,kjn->kdj", y, temp)  # (K, D, kt)
+    # num[k] is (D, kt): column 0 = nu_mcl (per ROI), columns 1: = a/b (per state).
+    num = torch.empty(state.n_states, state.n_roi, state.kt, dtype=_DTYPE, device=y.device)
+    num[:, :, 0] = state.nu_mcl.unsqueeze(0)
+    num[:, :, 1:] = a_over_b.unsqueeze(1)
+    # A_q = diag(num) + psii * T2  ->  (K, D, kt, kt)
+    a_q = torch.diag_embed(num) + psii.view(1, -1, 1, 1) * t2.unsqueeze(1)
+    lcov = torch.linalg.inv(a_q)  # (K, D, kt, kt)
+    rhs = t3.clone()  # (K, D, kt)
+    rhs[:, :, 0] = rhs[:, :, 0] + (state.mean_mcl * state.nu_mcl).unsqueeze(0)
+    state.lm = torch.einsum("kdi,kdij->kdj", rhs, lcov)  # (K, D, kt)
+    state.lcov = lcov
 
 
 def update_mcl(state: VBState) -> None:
