@@ -41,6 +41,7 @@ class BSDSModel:
     ar_transitions: torch.Tensor  # (K, ldim, ldim) — per-state AR(1) transition
     ar_noise_cov: torch.Tensor  # (K, ldim, ldim)
     effective_dim: torch.Tensor  # (K,) — ARD-active factor count per state
+    ard_precision: torch.Tensor  # (K, ldim) — ARD precision a/b per factor (>~10 = pruned)
     loadings: torch.Tensor  # (K, D, ldim) — factor loadings (no mean column)
     psii: torch.Tensor  # (D,) — noise precision
     objective_history: list[float]
@@ -135,6 +136,7 @@ def _finalize(state: VBState, y: torch.Tensor, sessions: list[torch.Tensor]) -> 
     # posterior precision a/b is not driven far above the prior (=1).
     a_over_b = state.a / state.b  # (K, ldim)
     effective_dim = (a_over_b < 10.0).sum(dim=1).to(_DTYPE)
+    ard_precision = a_over_b.clone()
 
     return BSDSModel(
         n_states=k,
@@ -149,6 +151,7 @@ def _finalize(state: VBState, y: torch.Tensor, sessions: list[torch.Tensor]) -> 
         ar_transitions=b_all,
         ar_noise_cov=nc_all,
         effective_dim=effective_dim,
+        ard_precision=ard_precision,
         loadings=lam.clone(),
         psii=state.psii.clone(),
         objective_history=[],

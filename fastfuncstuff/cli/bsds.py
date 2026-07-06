@@ -168,8 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-kmeans-pca-dim",
         type=int,
         default=20,
-        help="Cluster each session's top-N PCs for init instead of raw ROI space "
-        "(0 disables the projection). Matters once ROI count is more than a couple dozen.",
+        help="Cluster each session's top-N PCs for init instead of raw ROI space. "
+        "0 = the reference 'legacy' init (per-run k-means in raw ROI space, exactly "
+        "like the MATLAB initPoteriors 'subject' default) — use it to remove the "
+        "init as a confound when comparing to MATLAB. The PCA projection (default) "
+        "guards against k-means collapse once ROI count is more than a couple dozen.",
     )
     p.add_argument("-tr", type=float, default=1.0, help="TR in seconds (for lifetimes).")
     p.add_argument("-seed", type=int, default=0, help="Random seed.")
@@ -367,6 +370,7 @@ def _save_outputs(
         ar_noise_cov=model.ar_noise_cov.numpy(),
         directed_connectivity=(np.array([]) if directed is None else directed.cpu().numpy()),
         effective_dim=model.effective_dim.numpy(),
+        ard_precision=model.ard_precision.numpy(),
         session_lengths=np.array(model.session_lengths),
         group_occupancy=stats.group_occupancy,
         group_lifetime=stats.group_lifetime,

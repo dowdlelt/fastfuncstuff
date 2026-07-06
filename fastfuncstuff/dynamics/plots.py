@@ -11,8 +11,10 @@ color-alone (legends + labels), and text wears ink colors, not the series color.
 Two entry points:
 
 - :func:`qc_report` — one multi-panel PNG answering "did it fit, does it make
-  sense?" (convergence, occupancy, lifetime, transition matrix, effective
-  dimensionality, and the state probability time course + MAP ribbon for a run).
+  sense?" (convergence, occupancy, lifetime, transition matrix, state means, the
+  ARD saturation pair — effective dim vs the ``max_ldim`` ceiling and the exact
+  per-factor precisions — the all-runs MAP ribbon, and one run's state
+  probabilities).
 - :func:`save_publication_figures` — each key figure saved individually as a
   vector file (PDF/SVG) plus PNG, paper-ready.
 """
@@ -213,6 +215,84 @@ def plot_state_ribbon(model, run_idx, ax, tr: float = 1.0) -> None:
     ax.title.set_color(_INK)
 
 
+def plot_state_ribbon_stack(
+    model, ax, *, max_runs: int | None = None, tr: float = 1.0, colorbar: bool = False
+) -> None:
+    """All runs' MAP paths as stacked colored ribbons — one row per run.
+
+    Replaces looping :func:`plot_state_ribbon` over runs: a single image where
+    row *i* is run *i*'s Viterbi state sequence. Unequal run lengths are
+    right-padded with transparent cells (so a one-TR difference is just a
+    ragged edge, not a crash). Row thickness is set by the axes height / run
+    count, so size the figure — or use :func:`plot_state_ribbons` — to make thin
+    rows thicker. ``max_runs`` caps how many runs are drawn.
+    """
+    paths = [
+        (p.cpu().numpy() if hasattr(p, "cpu") else np.asarray(p)) for p in model.viterbi_states
+    ]
+    if max_runs is not None:
+        paths = paths[:max_runs]
+    n_runs = len(paths)
+    max_t = max(len(p) for p in paths)
+    grid = np.full((n_runs, max_t), np.nan)  # NaN = transparent (ragged tails)
+    for i, p in enumerate(paths):
+        grid[i, : len(p)] = p
+
+    cmap = ListedColormap(state_colors(model.n_states))
+    cmap.set_bad(alpha=0.0)  # unequal-length padding renders transparent
+    im = ax.imshow(
+        grid,
+        aspect="auto",
+        cmap=cmap,
+        extent=(0, max_t * (tr if tr else 1.0), n_runs, 0),
+        vmin=-0.5,
+        vmax=model.n_states - 0.5,
+        interpolation="nearest",
+    )
+    ax.set_xlabel("time (s)" if tr and tr != 1.0 else "TR")
+    ax.set_ylabel("run")
+    ax.set_title(f"MAP state — all {n_runs} runs")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_INK2)
+    ax.tick_params(colors=_INK2, labelsize=8, length=3)
+    ax.title.set_color(_INK)
+    if colorbar:
+        idx, labels = _thinned_state_labels(model.n_states)
+        cb = ax.figure.colorbar(im, ax=ax, fraction=0.03, pad=0.02, ticks=idx)
+        cb.ax.set_yticklabels(labels, fontsize=7)
+        cb.ax.tick_params(colors=_INK2, length=0)
+        cb.set_label("state", color=_INK2, fontsize=8)
+
+
+def plot_state_ribbons(
+    model,
+    path: str | Path | None = None,
+    *,
+    max_runs: int | None = None,
+    tr: float = 1.0,
+    per_run_height: float = 0.16,
+    width: float = 11.0,
+):
+    """Figure wrapper around :func:`plot_state_ribbon_stack`, sized to the run count.
+
+    ``per_run_height`` (inches per run) is the row-thickness knob — bump it if
+    30-odd runs render as hairlines. Saves to ``path`` (returns the path) or
+    returns the Figure for a notebook to display.
+    """
+    n = len(model.viterbi_states) if max_runs is None else min(max_runs, len(model.viterbi_states))
+    height = max(1.6, n * per_run_height + 0.9)
+    fig, ax = plt.subplots(figsize=(width, height), facecolor=_SURFACE)
+    plot_state_ribbon_stack(model, ax, max_runs=max_runs, tr=tr, colorbar=True)
+    fig.tight_layout()
+    if path is not None:
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
+        plt.close(fig)
+        return str(path)
+    return fig
+
+
 def plot_transition_matrix(model, ax) -> None:
     """Transition-probability heatmap (sequential; diagonal is dominant)."""
     trans = model.transition
@@ -282,15 +362,55 @@ def plot_lifetime(stats, ax) -> None:
 
 
 def plot_effective_dim(model, ax) -> None:
-    """ARD effective factor count per state (a complexity diagnostic)."""
+    """ARD effective factor count per state against the ``max_ldim`` ceiling.
+
+    Red bars are *saturated* (pinned at the ceiling → capacity-limited, the model
+    wants a higher ``max_ldim``); blue bars have ARD slack (the ceiling isn't
+    binding). The dashed line is the ceiling. This is the "are my states maxed
+    out or spread" diagnostic.
+    """
     eff = model.effective_dim
     eff = eff.cpu().numpy() if hasattr(eff, "cpu") else np.asarray(eff)
     k = len(eff)
-    ax.bar(range(k), eff, color=state_colors(k), width=0.72)
+    ceiling = int(model.ldim)
+    saturated = eff >= ceiling
+    colors = np.where(saturated, "#d64545", "#2a78d6")
+    ax.bar(range(k), eff, color=list(colors), width=0.72)
+    ax.axhline(ceiling, ls="--", color=_INK2, lw=1.2)
+    ax.set_ylim(0, ceiling * 1.18 + 0.5)
+    ax.annotate(
+        f"max_ldim = {ceiling}",
+        xy=(0, ceiling),
+        xytext=(0, 2),
+        textcoords="offset points",
+        fontsize=6,
+        color=_INK2,
+    )
     _set_state_xticks(ax, k)
     ax.set_ylabel("active factors")
-    ax.set_title("ARD effective dim")
+    ax.set_title(f"ARD dim ({int(saturated.sum())}/{k} at ceiling)")
     _style_axes(ax)
+
+
+def plot_ard_precisions(model, ax) -> None:
+    """Per-factor ARD precision ``a/b`` (K x ldim), the exact pruning pattern.
+
+    Each row is a state, each column a latent factor. Bright = high precision =
+    the factor was *pruned* (its loading column shrunk to ~0); dark = an active
+    factor carrying real network signal. A ragged bright edge means ARD pruned
+    different amounts per state; a solid dark block to the ceiling is saturation.
+    """
+    prec = model.ard_precision
+    prec = prec.cpu().numpy() if hasattr(prec, "cpu") else np.asarray(prec)
+    k = prec.shape[0]
+    im = ax.imshow(np.log10(prec + 1e-8), aspect="auto", cmap=SEQUENTIAL)
+    ax.set_xlabel("latent factor")
+    ax.set_yticks(*_thinned_state_labels(k), fontsize=6 if k > 12 else 8)
+    ax.set_title("ARD precision  log$_{10}$(a/b)  (bright = pruned)")
+    ax.title.set_color(_INK)
+    ax.tick_params(colors=_INK2, labelsize=7, length=0)
+    cb = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=7, colors=_INK2)
 
 
 def plot_state_means(model, ax) -> None:
@@ -439,15 +559,17 @@ def plot_behavior_correlation(corrs, ax):
 
 def qc_report(model, stats, path: str | Path, run_idx: int = 0, tr: float = 1.0):
     """One multi-panel QC figure: did it fit, do the states make sense?"""
-    fig = plt.figure(figsize=(13, 9), facecolor=_SURFACE)
-    gs = fig.add_gridspec(3, 3, height_ratios=[1, 1, 0.9], hspace=0.45, wspace=0.32)
+    fig = plt.figure(figsize=(13, 12), facecolor=_SURFACE)
+    gs = fig.add_gridspec(4, 3, height_ratios=[1, 1, 1.1, 0.9], hspace=0.5, wspace=0.32)
     plot_convergence(model, fig.add_subplot(gs[0, 0]))
     plot_occupancy(stats, fig.add_subplot(gs[0, 1]))
     plot_lifetime(stats, fig.add_subplot(gs[0, 2]))
     plot_transition_matrix(model, fig.add_subplot(gs[1, 0]))
     plot_state_means(model, fig.add_subplot(gs[1, 1]))
     plot_effective_dim(model, fig.add_subplot(gs[1, 2]))
-    plot_state_timecourses(model, run_idx, fig.add_subplot(gs[2, :]), tr=tr)
+    plot_ard_precisions(model, fig.add_subplot(gs[2, 0]))
+    plot_state_ribbon_stack(model, fig.add_subplot(gs[2, 1:]), tr=tr, colorbar=True)
+    plot_state_timecourses(model, run_idx, fig.add_subplot(gs[3, :]), tr=tr)
     fig.suptitle(
         f"ffs_bsds QC — {model.n_states} states, {len(model.session_lengths)} session(s)",
         color=_INK,
@@ -537,6 +659,14 @@ def save_publication_figures(
     fig, ax = plt.subplots(figsize=(7, 2.8), facecolor=_SURFACE)
     plot_state_means(model, ax)
     _save(fig, "state_means")
+
+    # All-runs MAP ribbon (sized to run count) + the ARD saturation pair.
+    _save(plot_state_ribbons(model, tr=tr), "state_ribbons")
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(9, 3.2), facecolor=_SURFACE, width_ratios=[1, 1.2])
+    plot_effective_dim(model, a0)
+    plot_ard_precisions(model, a1)
+    fig.tight_layout()
+    _save(fig, "ard_saturation")
 
     _save(plot_state_fc(stats), "state_fc")
 
