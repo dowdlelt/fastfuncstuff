@@ -17,6 +17,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from fastfuncstuff.dynamics.bsds.fc_match import (
+    fc_similarity_matrix as _fc_similarity_matrix,
+)
+from fastfuncstuff.dynamics.bsds.fc_match import (
+    occupancy_from_viterbi as _occupancy_from_viterbi,
+)
+
 
 @dataclass
 class MatlabBSDS:
@@ -70,39 +77,6 @@ def load_matlab_bsds(path: str) -> MatlabBSDS:
         transition=trans,
         viterbi_states=viterbi,
     )
-
-
-def _cov_to_corr_utri(cov: np.ndarray) -> np.ndarray:
-    """Upper-triangle (excl. diagonal) of the correlation matrix from a covariance."""
-    d = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
-    corr = cov / np.outer(d, d)
-    iu = np.triu_indices(cov.shape[0], k=1)
-    return corr[iu]
-
-
-def _fc_similarity_matrix(covs_a: np.ndarray, covs_b: np.ndarray) -> np.ndarray:
-    """``(Ka, Kb)`` Pearson correlation between the FC patterns of every state pair."""
-    ua = np.stack([_cov_to_corr_utri(c) for c in covs_a])  # (Ka, P)
-    ub = np.stack([_cov_to_corr_utri(c) for c in covs_b])  # (Kb, P)
-    ua = ua - ua.mean(axis=1, keepdims=True)
-    ub = ub - ub.mean(axis=1, keepdims=True)
-    na = np.linalg.norm(ua, axis=1)
-    nb = np.linalg.norm(ub, axis=1)
-    na[na == 0] = 1.0
-    nb[nb == 0] = 1.0
-    return (ua @ ub.T) / np.outer(na, nb)
-
-
-def _occupancy_from_viterbi(viterbi_states, n_states: int) -> np.ndarray:
-    import torch
-
-    total = np.zeros(n_states)
-    n = 0
-    for v in viterbi_states:
-        z = v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
-        total += np.bincount(z.astype(np.int64), minlength=n_states)[:n_states]
-        n += z.size
-    return total / max(n, 1)
 
 
 @dataclass

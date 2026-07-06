@@ -648,6 +648,54 @@ def plot_selection_surface(results, path: str | Path | None = None):
     return fig
 
 
+def plot_state_stability(result, path: str | Path | None = None, *, occ_threshold: float = 1e-3):
+    """Per-state FC reproducibility across random-init refits.
+
+    ``result`` is a
+    :class:`~fastfuncstuff.dynamics.stability.StateStabilityResult`. Each bar is a
+    reference state's mean matched-FC similarity across repeats (whisker down to
+    the worst repeat); states are ordered by reference occupancy and greyed if
+    unoccupied. Tall, tight bars are reproducible states you can trust; short or
+    long-whiskered bars are init-dependent.
+    """
+    occ = np.asarray(result.reference_occupancy)
+    order = np.argsort(-occ)
+    fc = np.asarray(result.per_state_fc)[order]
+    fc_min = np.asarray(result.per_state_fc_min)[order]
+    occupied = occ[order] > occ_threshold
+    k = len(order)
+
+    fig, ax = plt.subplots(figsize=(max(6, 0.45 * k + 2), 3.6), facecolor=_SURFACE)
+    x = np.arange(k)
+    colors = np.where(occupied, "#1baf7a", "#cccccc")
+    ax.bar(x, fc, color=list(colors), width=0.72, zorder=2)
+    lower = np.clip(fc - fc_min, 0, None)
+    ax.errorbar(
+        x[occupied],
+        fc[occupied],
+        yerr=[lower[occupied], np.zeros(int(occupied.sum()))],
+        fmt="none",
+        ecolor=_INK2,
+        elinewidth=1,
+        capsize=2,
+        zorder=3,
+    )
+    ax.axhline(result.mean_fc, ls="--", color="#52514e", lw=1)
+    ax.set_xticks(x, [f"S{s}" for s in order], fontsize=6 if k > 12 else 8, rotation=90)
+    ax.set_ylim(0, 1.02)
+    ax.set_ylabel("matched-FC similarity")
+    ax.set_title(
+        f"State stability over {result.n_repeats} refits "
+        f"(mean={result.mean_fc:.2f}, occ r={result.occupancy_correlation:.2f})"
+    )
+    _style_axes(ax)
+    if path is not None:
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
+        plt.close(fig)
+        return str(path)
+    return fig
+
+
 # --------------------------------------------------------------------------- #
 # Composite entry points.                                                      #
 # --------------------------------------------------------------------------- #

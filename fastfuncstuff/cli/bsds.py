@@ -192,6 +192,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restarts per fit during -select (kept modest; the final fit uses -n_init).",
     )
     p.add_argument(
+        "-stability",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Refit the data N times from different seeds and report how reproducibly "
+        "each state's FC is recovered (Hungarian-matched). Writes *_stability.png/json. "
+        "0 disables; N is that many extra full fits, so keep it small (e.g. 4).",
+    )
+    p.add_argument(
         "-tol", type=float, default=1e-4, help="Relative free-energy convergence tolerance."
     )
     p.add_argument(
@@ -384,6 +393,48 @@ def _run_selection(sessions, args, device, stem: str):
     return best.n_states, best.max_ldim
 
 
+def _run_stability(sessions, args, device, stem: str, n_states: int, max_ldim) -> None:
+    """Refit N times from different seeds; write the state-reproducibility figure/JSON."""
+    from fastfuncstuff.dynamics import plots
+    from fastfuncstuff.dynamics.stability import state_stability
+
+    if len(sessions) < 2:
+        raise SystemExit("-stability needs at least 2 runs.")
+    ldim = max_ldim if isinstance(max_ldim, int) else 5
+    result = state_stability(
+        sessions,
+        n_states=n_states,
+        max_ldim=ldim,
+        n_repeats=args.stability,
+        n_init=max(2, args.n_init // 2),
+        n_iter=args.n_iter,
+        tol=args.tol,
+        device=device,
+        show_progress=True,
+    )
+    with open(f"{stem}_stability.json", "w") as fh:
+        json.dump(
+            {
+                "n_repeats": result.n_repeats,
+                "mean_matched_fc": result.mean_fc,
+                "occupancy_correlation": result.occupancy_correlation,
+                "reference_occupancy": result.reference_occupancy.tolist(),
+                "per_state_fc": result.per_state_fc.tolist(),
+                "per_state_fc_min": result.per_state_fc_min.tolist(),
+            },
+            fh,
+            indent=2,
+        )
+    import matplotlib
+
+    matplotlib.use("Agg")
+    plots.plot_state_stability(result, f"{stem}_stability.png")
+    print(
+        f"  stability ({result.n_repeats} refits): mean matched-FC={result.mean_fc:.3f}, "
+        f"occ r={result.occupancy_correlation:.3f}; wrote {stem}_stability.png/json"
+    )
+
+
 def _compute_task_alignment(model, args, device):
     """Parse -events and relate the fit to task conditions; None if no -events."""
     if not args.events:
@@ -542,6 +593,8 @@ def main(argv: list[str] | None = None) -> int:
     n_states, max_ldim = args.n_states, args.max_ldim
     if args.select:
         n_states, max_ldim = _run_selection(sessions, args, device, pfx.stem)
+    if args.stability:
+        _run_stability(sessions, args, device, pfx.stem, n_states, max_ldim)
 
     t0 = time.time()
     model = fit_bsds(
