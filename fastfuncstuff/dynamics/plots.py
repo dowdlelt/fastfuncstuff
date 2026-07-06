@@ -344,7 +344,8 @@ def plot_occupancy(stats, ax) -> None:
             )
     _set_state_xticks(ax, k)
     ax.set_ylabel("fractional occupancy")
-    ax.set_title("Occupancy")
+    eff = getattr(stats, "effective_state_count", None)
+    ax.set_title("Occupancy" if eff is None else f"Occupancy (effective {eff:.1f} states)")
     _style_axes(ax)
 
 

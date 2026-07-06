@@ -541,6 +541,7 @@ def _save_outputs(
         "n_iter": len(model.objective_history),
         "final_free_energy": model.objective_history[-1] if model.objective_history else None,
         "effective_dim": model.effective_dim.tolist(),
+        "effective_state_count": stats.effective_state_count,
         "tr": args.tr,
         "group_occupancy": stats.group_occupancy.tolist(),
         "group_lifetime_sec": stats.group_lifetime.tolist(),
@@ -627,7 +628,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.plots != "none":
         _make_plots(pfx.stem, model, stats, args, graph, switch, align=align)
     print(
-        f"  done in {elapsed:.1f}s — {model.n_states} states, "
+        f"  done in {elapsed:.1f}s — {model.n_states} states "
+        f"(effective {stats.effective_state_count:.1f}), "
         f"converged={model.converged}, occupancy={np.round(stats.group_occupancy, 3).tolist()}"
     )
     print(f"  wrote {pfx.stem}_model.npz and companion files")

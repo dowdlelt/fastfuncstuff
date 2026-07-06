@@ -8,10 +8,23 @@ import torch
 from fastfuncstuff.dynamics.states import (
     covariance_to_correlation,
     dwell_times,
+    effective_state_count,
     empirical_transition_matrix,
     fractional_occupancy,
     mean_lifetime,
 )
+
+
+def test_effective_state_count_participation_ratio():
+    # Even split over m states -> exactly m; a single dominant state -> ~1.
+    np.testing.assert_allclose(effective_state_count(np.full(4, 0.25)), 4.0)
+    np.testing.assert_allclose(effective_state_count([0.5, 0.5]), 2.0)
+    assert effective_state_count([0.98, 0.02]) < 1.2
+    # Empty states (zeros) don't count; padding with zeros changes nothing.
+    np.testing.assert_allclose(
+        effective_state_count([0.5, 0.5, 0.0, 0.0]), effective_state_count([0.5, 0.5])
+    )
+    assert effective_state_count(np.zeros(3)) == 0.0
 
 
 def test_occupancy_and_lifetime_known_sequence():

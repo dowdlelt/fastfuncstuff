@@ -85,6 +85,24 @@ def empirical_transition_matrix(states, n_states: int) -> np.ndarray:
     return counts / row
 
 
+def effective_state_count(occupancy) -> float:
+    """Participation ratio of occupancy: ``exp(entropy)`` = effective # of states used.
+
+    A one-number answer to "how many states are *really* in play". If mass is
+    split evenly over ``m`` states it returns ``m``; if one state dominates it
+    tends to 1, regardless of how many states were fit or nominally occupied. A
+    better headline than the raw occupied count, which weights a 0.001-occupancy
+    state the same as a 0.3 one.
+    """
+    p = np.asarray(occupancy, dtype=float)
+    p = p[p > 0]
+    if p.size == 0:
+        return 0.0
+    p = p / p.sum()
+    entropy = -np.sum(p * np.log(p))
+    return float(np.exp(entropy))
+
+
 def covariance_to_correlation(cov: torch.Tensor) -> torch.Tensor:
     """Normalise a covariance to a correlation matrix (dynamic FC), batched over states."""
     diag = torch.diagonal(cov, dim1=-2, dim2=-1)  # (..., D)
@@ -98,6 +116,7 @@ class StateStats:
 
     n_states: int
     tr: float
+    effective_state_count: float  # exp(entropy(group_occupancy)) — states really in play
     group_occupancy: np.ndarray  # (K,)
     group_lifetime: np.ndarray  # (K,)
     group_transition: np.ndarray  # (K, K)
@@ -117,11 +136,13 @@ def compute_state_stats(model, tr: float = 1.0) -> StateStats:
     subj_occ = np.stack([fractional_occupancy(s, k) for s in seqs])
     subj_life = np.stack([mean_lifetime(s, k, tr) for s in seqs])
     subj_trans = np.stack([empirical_transition_matrix(s, k) for s in seqs])
+    group_occ = fractional_occupancy(group, k)
 
     return StateStats(
         n_states=k,
         tr=tr,
-        group_occupancy=fractional_occupancy(group, k),
+        effective_state_count=effective_state_count(group_occ),
+        group_occupancy=group_occ,
         group_lifetime=mean_lifetime(group, k, tr),
         group_transition=empirical_transition_matrix(group, k),
         group_dwell_times=dwell_times(group, k, tr),
