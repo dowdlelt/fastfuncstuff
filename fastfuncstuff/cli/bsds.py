@@ -136,7 +136,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-prefix", required=True, help="Output prefix.")
     p.add_argument(
-        "-n_states", "-n-states", type=int, default=6, help="Max number of states (ARD prunes)."
+        "-n_states",
+        "-n-states",
+        type=int,
+        default=6,
+        help="Number of states fit (this many are always returned; ARD only prunes "
+        "each state's latent factor count, not the state count itself — read "
+        "occupancy/effective_dim to see which states are actually used).",
     )
     p.add_argument(
         "-max_ldim",
@@ -149,6 +155,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n_iter", "-n-iter", type=int, default=100, help="Max VB iterations.")
     p.add_argument(
         "-tol", type=float, default=1e-4, help="Relative free-energy convergence tolerance."
+    )
+    p.add_argument(
+        "-n_kmeans_replicates",
+        "-n-kmeans-replicates",
+        type=int,
+        default=10,
+        help="k-means restarts per session for initialisation (kept by inertia).",
+    )
+    p.add_argument(
+        "-kmeans_pca_dim",
+        "-kmeans-pca-dim",
+        type=int,
+        default=20,
+        help="Cluster each session's top-N PCs for init instead of raw ROI space "
+        "(0 disables the projection). Matters once ROI count is more than a couple dozen.",
     )
     p.add_argument("-tr", type=float, default=1.0, help="TR in seconds (for lifetimes).")
     p.add_argument("-seed", type=int, default=0, help="Random seed.")
@@ -195,10 +216,55 @@ def build_parser() -> argparse.ArgumentParser:
         default="pdf",
         help="Vector format for -plots all publication figures.",
     )
+    p.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        help="BIDS *_events.tsv, one per run (same order/count as -input). Enables "
+        "state<->task alignment (correlation + contingency + NMI, and a QC figure).",
+    )
+    p.add_argument(
+        "-event_ignore",
+        "-event-ignore",
+        nargs="+",
+        default=None,
+        help="trial_type values to exclude from the task alignment (e.g. fixation rest).",
+    )
+    p.add_argument(
+        "-event_cols",
+        "-event-cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET", "DURATION", "TRIAL_TYPE"),
+        help="Custom events.tsv column names (default: onset duration trial_type).",
+    )
+    p.add_argument(
+        "-hrf_delay",
+        "-hrf-delay",
+        type=float,
+        default=5.0,
+        help="HRF delay (s) for the condition-label contingency view (default 5).",
+    )
+    p.add_argument(
+        "-label_mode",
+        "-label-mode",
+        choices=["duration", "persist"],
+        default="duration",
+        help="Condition-label view: 'duration' (on for each event's duration, "
+        "unmarked rest becomes baseline — right for designs with ITI/rest) or "
+        "'persist' (a condition stays on until the next event).",
+    )
+    p.add_argument(
+        "-include_rest",
+        "-include-rest",
+        action="store_true",
+        help="Add a synthetic 'rest' condition for unmodelled null periods, so the "
+        "task alignment shows whether a state owns rest (only with -label_mode duration).",
+    )
     return p
 
 
-def _make_plots(stem: str, model, stats, args, graph_metrics, switch_stats) -> None:
+def _make_plots(stem: str, model, stats, args, graph_metrics, switch_stats, align=None) -> None:
     """Render QC, analysis, and (optionally) publication figures; matplotlib is core."""
     import matplotlib
 
@@ -210,6 +276,10 @@ def _make_plots(stem: str, model, stats, args, graph_metrics, switch_stats) -> N
     analysis_path = f"{stem}_analysis.png"
     plots.analysis_report(model, graph_metrics, switch_stats, analysis_path, tr=args.tr)
     print(f"  wrote {qc_path}, {analysis_path}")
+    if align is not None:
+        task_path = f"{stem}_task_alignment.png"
+        plots.task_alignment_report(model, align, task_path, tr=args.tr)
+        print(f"  wrote {task_path}")
     if args.plots == "all":
         written = plots.save_publication_figures(
             model,
@@ -221,6 +291,60 @@ def _make_plots(stem: str, model, stats, args, graph_metrics, switch_stats) -> N
             switch_stats=switch_stats,
         )
         print(f"  wrote {len(written)} publication figures ({args.plot_format} + png)")
+
+
+def _compute_task_alignment(model, args, device):
+    """Parse -events and relate the fit to task conditions; None if no -events."""
+    if not args.events:
+        return None
+    from fastfuncstuff.design.bids_events import parse_bids_events
+    from fastfuncstuff.dynamics.task import align_states_to_task
+
+    n_runs = len(model.responsibilities)
+    if len(args.events) != n_runs:
+        raise SystemExit(
+            f"-events has {len(args.events)} file(s) but the model has {n_runs} run(s); "
+            "pass one events.tsv per -input run, in the same order."
+        )
+    all_onsets, durations, condition_labels = parse_bids_events(
+        args.events,
+        event_ignore=args.event_ignore,
+        event_cols=tuple(args.event_cols) if args.event_cols else None,
+    )
+    align = align_states_to_task(
+        model,
+        all_onsets,
+        durations,
+        condition_labels,
+        tr=args.tr,
+        hrf_delay=args.hrf_delay,
+        respect_duration=(args.label_mode == "duration"),
+        include_rest=args.include_rest,
+        device=device,
+    )
+    print(
+        f"  task alignment: {len(condition_labels)} conditions, "
+        f"NMI={align.normalized_mutual_info:.3f}, mean state purity={align.state_purity.mean():.2f}"
+    )
+    return align
+
+
+def _save_task_alignment(stem: str, align) -> None:
+    """Write the state<->task alignment matrices and a JSON summary."""
+    np.savetxt(f"{stem}_task_correlation.txt", align.correlation, fmt="%.5f")
+    np.savetxt(f"{stem}_task_contingency.txt", align.contingency, fmt="%.5f")
+    summary = {
+        "condition_labels": align.condition_labels,
+        "normalized_mutual_info": align.normalized_mutual_info,
+        "state_purity": align.state_purity.tolist(),
+        "dominant_condition_idx": align.dominant_condition.tolist(),
+        "dominant_condition": [
+            align.condition_labels[c] if c >= 0 else "baseline"
+            for c in align.dominant_condition.tolist()
+        ],
+    }
+    with open(f"{stem}_task_alignment.json", "w") as fh:
+        json.dump(summary, fh, indent=2)
 
 
 def _save_outputs(
@@ -331,6 +455,8 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         device=device,
         show_progress=True,
+        n_kmeans_replicates=args.n_kmeans_replicates,
+        kmeans_pca_dim=args.kmeans_pca_dim or None,
     )
     elapsed = time.time() - t0
     stats = compute_state_stats(model, tr=args.tr)
@@ -340,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     directed, _ = per_state_directed_connectivity(model, sessions)
     graph = state_graph_metrics(stats.state_fc)
     switch = compute_switch_stats(model, tr=args.tr)
+    align = _compute_task_alignment(model, args, device)
 
     pfx = parse_prefix(str(args.prefix))
     _save_outputs(
@@ -353,8 +480,10 @@ def main(argv: list[str] | None = None) -> int:
         graph=graph,
         switch=switch,
     )
+    if align is not None:
+        _save_task_alignment(pfx.stem, align)
     if args.plots != "none":
-        _make_plots(pfx.stem, model, stats, args, graph, switch)
+        _make_plots(pfx.stem, model, stats, args, graph, switch, align=align)
     print(
         f"  done in {elapsed:.1f}s — {model.n_states} states, "
         f"converged={model.converged}, occupancy={np.round(stats.group_occupancy, 3).tolist()}"
