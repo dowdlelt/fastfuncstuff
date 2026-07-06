@@ -2184,6 +2184,481 @@ def _run_concat_ica(
     return concat_meta
 
 
+def _temporal_ica_preprocess_runs(
+    input_files: list[str],
+    args,
+    device: torch.device,
+    shared_mask: np.ndarray | None,
+) -> dict:
+    """Load + preprocess each run for temporal ICA (mirrors the concat per-run loop).
+
+    Returns processed per-run (V, T_i) tensors kept on CPU (dual regression moves
+    them to `device` one at a time to bound VRAM), plus the shared mask/grid and
+    smoothness diagnostics. Preprocessing order per run:
+    load → blur → mask → scale → polort → high-pass → temporal mean-center.
+    """
+    n_runs = len(input_files)
+    run_data_list: list[torch.Tensor] = []  # each (V, T_i) on CPU
+    run_lengths: list[int] = []
+    mask3d: np.ndarray | None = None
+    shape3d: tuple[int, ...] | None = None
+    affine: np.ndarray | None = None
+    mean3d_accum: np.ndarray | None = None
+    tr: float | None = None
+    resels: float = 0.0
+    fwhm_geo: float = 0.0
+    n_vox_masked: int = 0
+
+    polort_default = -1 if n_runs > 1 else 0
+    polort = polort_default if args.polort is None else int(args.polort)
+
+    for ri, run_file in enumerate(
+        tqdm(input_files, desc="Preprocessing runs", disable=n_runs < 3, leave=True)
+    ):
+        img = load_nifti(run_file)
+        data = img.get_fdata(dtype=np.float32)
+        run_shape3d = data.shape[:3]
+        n_t_run = data.shape[3]
+        voxel_sizes = tuple(float(v) for v in img.header.get_zooms()[:3])
+
+        run_tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
+        if tr is None:
+            tr = run_tr
+        elif abs(run_tr - tr) > 1e-4:
+            print(f"  WARNING: Run {ri + 1} TR={run_tr:.4f}s differs from run 1 TR={tr:.4f}s")
+
+        if shape3d is None:
+            shape3d = run_shape3d
+            affine = img.affine
+        elif run_shape3d != shape3d:
+            raise ValueError(f"Run {ri + 1} spatial shape {run_shape3d} != run 1 shape {shape3d}")
+
+        if args.do_blur is not None and args.do_blur > 0:
+            data = gaussian_blur_3d(
+                data=data,
+                fwhm_mm=float(args.do_blur),
+                voxel_sizes=voxel_sizes,
+                device=device,
+                verbose=False,
+            )
+
+        run_mean3d = data.mean(axis=-1).astype(np.float32)
+        mean3d_accum = run_mean3d.copy() if mean3d_accum is None else mean3d_accum + run_mean3d
+
+        if ri == 0:
+            if shared_mask is not None:
+                mask3d = shared_mask
+            elif not args.no_auto_mask:
+                from fastfuncstuff.processing.mask import automask
+
+                mask3d = (
+                    automask(
+                        torch.as_tensor(run_mean3d),
+                        dilate_extra=2,
+                        device=device,
+                        verbose=args.verb >= 1,
+                    )
+                    .cpu()
+                    .numpy()
+                )
+            if mask3d is not None and mask3d.shape != shape3d:
+                raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
+            resels, fwhm_geo = _estimate_spatial_smoothness_resels(
+                data, mask=mask3d, device=device, verbose=args.verb >= 1
+            )
+
+        if mask3d is not None:
+            run_vox_np = data[mask3d].astype(np.float32)
+        else:
+            run_vox_np = data.reshape(-1, n_t_run).astype(np.float32)
+        del data
+
+        if ri == 0:
+            n_vox_masked = run_vox_np.shape[0]
+        elif run_vox_np.shape[0] != n_vox_masked:
+            raise ValueError(
+                f"Run {ri + 1} has {run_vox_np.shape[0]} masked voxels, expected {n_vox_masked}"
+            )
+
+        run_vox = to_tensor(run_vox_np, device=device)
+        del run_vox_np
+
+        if args.do_scale:
+            run_vox, _, _ = scale_to_percent_signal(run_vox, run_starts=[0], verbose=False)
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verb >= 1)
+
+        if polort >= 0:
+            run_vox = apply_polort_projection(
+                run_vox, polort=polort, device=device, run_starts=[0]
+            )
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verb >= 1)
+
+        if args.high_pass is not None and args.high_pass > 0:
+            nyquist = 0.5 / float(tr)
+            if args.high_pass >= nyquist:
+                raise ValueError(
+                    f"High-pass cutoff ({args.high_pass:.4f} Hz) >= Nyquist ({nyquist:.4f} Hz)"
+                )
+            run_vox = apply_high_pass_fft(
+                run_vox, tr=float(tr), high_pass_hz=float(args.high_pass), run_starts=[0]
+            )
+            run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verb >= 1)
+
+        # Per-run temporal mean-center (MELODIC remmean); dual regression demeans
+        # again defensively but this keeps the stage-1 concat consistent.
+        run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
+
+        run_data_list.append(run_vox.cpu())
+        run_lengths.append(n_t_run)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    assert mean3d_accum is not None and tr is not None
+    return {
+        "run_data_list": run_data_list,
+        "run_lengths": run_lengths,
+        "mask3d": mask3d,
+        "shape3d": shape3d,
+        "affine": affine,
+        "mean3d": mean3d_accum / n_runs,
+        "tr": float(tr),
+        "resels": float(resels),
+        "fwhm_geo": float(fwhm_geo),
+        "n_vox_masked": int(n_vox_masked),
+        "polort": polort,
+    }
+
+
+def _run_temporal_ica(
+    input_files: list[str],
+    args,
+    device: torch.device,
+    shared_mask: np.ndarray | None,
+) -> dict:
+    """Two-stage temporal ICA (Glasser 2018): spatial reduction → dual regression
+    → temporal ICA. Outputs mirror the single-run/concat layout so results are
+    viewable with the existing maps+timecourses machinery: a group `.ica` folder
+    plus per-run `.ica` folders (shared tICA maps + that run's timecourses)."""
+    import shutil
+
+    from fastfuncstuff.decomposition.migp import _reduce_to_topk, migp_reduce
+    from fastfuncstuff.decomposition.temporal import (
+        group_spatial_ica,
+        spatial_regression,
+        temporal_ica,
+    )
+
+    t_total = time.time()
+    n_runs = len(input_files)
+    _vsection(args.verb >= 1, "Temporal ICA (two-stage)")
+
+    # --- Stage 0: per-run preprocessing ------------------------------------
+    pre = _temporal_ica_preprocess_runs(input_files, args, device, shared_mask)
+    run_data_list: list[torch.Tensor] = pre["run_data_list"]  # (V, T_i) on CPU
+    run_lengths: list[int] = pre["run_lengths"]
+    mask3d = pre["mask3d"]
+    shape3d = pre["shape3d"]
+    affine = pre["affine"]
+    tr = pre["tr"]
+    resels = pre["resels"]
+    n_vox_masked = pre["n_vox_masked"]
+    total_t = int(sum(run_lengths))
+
+    # --- Stage 1: group spatial reduction basis ----------------------------
+    _vsection(args.verb >= 1, f"Stage 1: spatial reduction ({args.tica_reducer})")
+    t_step = time.time()
+    scale = 1.0 / float(n_runs)
+    runs_tv = [run_data_list[ri].to(device).T for ri in range(n_runs)]  # (T_i, V)
+    if args.migp:
+        concat_tv = migp_reduce(
+            runs_tv,
+            migp_n=args.migp_n,
+            migp_factor=args.migp_factor,
+            scale_by_n=True,
+            device=device,
+            verbose=args.verb >= 1,
+        ).contiguous()
+    else:
+        concat_tv = torch.cat([t * scale for t in runs_tv], dim=0).contiguous()
+    del runs_tv
+    concat_tv = _check_finite(concat_tv, "concat_tv", args.verb >= 1)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Number of spatial components K_sica (reuse -num_comps).
+    num_spec = parse_num_comps_spec(args.num_comps)
+    stack_t = int(concat_tv.shape[0])
+    if isinstance(num_spec, int):
+        k_sica = min(num_spec, stack_t, int(concat_tv.shape[1]))
+    else:
+        if args.max_auto_components <= 1.0:
+            max_auto_k = max(5, int((stack_t - 2) * args.max_auto_components))
+        else:
+            max_auto_k = int(args.max_auto_components)
+        n_eff = max(stack_t, int(n_vox_masked / (2.5 * max(resels, 1e-6))))
+        k_sica, _, _ = estimate_ica_component_count(
+            data_vox_t=concat_tv.T,
+            method=num_spec,
+            max_auto_components=max_auto_k,
+            auto_min_components=args.auto_min_components,
+            auto_var_threshold=args.auto_var_threshold,
+            use_mp_prior=not args.auto_no_mp,
+            n_eff=n_eff,
+            device=device,
+            verbose=args.verb >= 1,
+        )
+        k_sica = int(k_sica)
+    # tICA needs T_total large relative to K_sica or the temporal decomposition
+    # is unstable (few reproducible components). Warn — but don't override the
+    # user; the temporal-stage ICASSO Iq is the empirical referee.
+    tica_ratio = total_t / max(k_sica, 1)
+    _vprint(args.verb >= 1, f"K_sica = {k_sica}  (T_total/K_sica = {tica_ratio:.0f})")
+    if tica_ratio < 50:
+        print(
+            f"⚠ K_sica={k_sica} is large for T_total={total_t} "
+            f"(ratio {tica_ratio:.0f} < 50). Temporal ICA may be unstable — "
+            f"consider a smaller -num_comps. Check the ICASSO Iq values."
+        )
+
+    if args.tica_reducer == "pca":
+        group_maps = _reduce_to_topk(concat_tv, k_sica)  # (K_sica, V)
+        sica_iters = 0
+    else:
+        method_sica = args.tica_method or getattr(args, "ica_method", "fastica")
+        group_maps, sica_iters = group_spatial_ica(
+            concat_tv,
+            n_components=k_sica,
+            method=method_sica,
+            max_iter=args.ica_max_iter,
+            tol=args.ica_tol,
+            fun=args.ica_nonlinearity,
+            seed=args.seed,
+            device=device,
+        )
+    del concat_tv
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    _vprint(args.verb >= 1, f"Group maps: {tuple(group_maps.shape)} (K_sica, V)", t_step)
+
+    # --- Stage 2: dual-regression back-projection per run ------------------
+    _vsection(args.verb >= 1, "Stage 2: dual regression (spatial back-projection)")
+    t_step = time.time()
+    tc_blocks: list[torch.Tensor] = []
+    for ri in tqdm(range(n_runs), desc="Dual regression", disable=n_runs < 3, leave=True):
+        run_dev = run_data_list[ri].to(device)  # (V, T_i)
+        tc = spatial_regression(group_maps, run_dev)  # (T_i, K_sica)
+        tc_blocks.append(tc.cpu())
+        del run_dev
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    del run_data_list
+    concat_tcs = torch.cat(tc_blocks, dim=0)  # (T_total, K_sica) on CPU
+    del tc_blocks
+    _vprint(args.verb >= 1, f"Concatenated timecourses: {tuple(concat_tcs.shape)}", t_step)
+
+    # Number of temporal components K_tica.
+    # 'auto' uses ICASSO reproducibility (HCP's method): decompose at the full
+    # K_sica and keep the components whose Iq clears -tica_iq_thresh. An int/float
+    # requests exactly that many; ICASSO (if enabled) still reports each Iq.
+    icasso_runs = int(args.tica_icasso_runs)
+    iq_thresh = float(args.tica_iq_thresh)
+    tica_spec = parse_num_comps_spec(args.n_temporal_comps)
+    auto_tica = isinstance(tica_spec, str)
+    if isinstance(tica_spec, int):
+        k_tica_req = min(tica_spec, k_sica)
+    elif isinstance(tica_spec, float):
+        k_tica_req = max(1, min(int(round(tica_spec * k_sica)), k_sica))
+    else:
+        k_tica_req = k_sica  # decompose at full rank, then keep reproducible
+        if icasso_runs <= 1:
+            icasso_runs = 25
+            _vprint(
+                args.verb >= 1,
+                "auto K_tica needs ICASSO to judge reproducibility → using 25 runs",
+            )
+
+    # --- Stage 3: temporal ICA ---------------------------------------------
+    _vsection(args.verb >= 1, "Stage 3: temporal ICA")
+    t_step = time.time()
+    method_tica = args.tica_method or getattr(args, "ica_method", "fastica")
+    _vprint(
+        args.verb >= 1,
+        f"{method_tica}: K_tica={'auto' if auto_tica else k_tica_req} "
+        f"over T_total={total_t}, icasso_runs={icasso_runs}",
+    )
+    # Temporal stage uses logcosh (general contrast): temporal sources are often
+    # symmetric, which the spatial default pow3 (skewness) cannot separate.
+    result = temporal_ica(
+        concat_tcs.to(device),
+        group_maps,
+        n_components=k_tica_req,
+        run_lengths=run_lengths,
+        method=method_tica,
+        max_iter=args.ica_max_iter,
+        tol=args.ica_tol,
+        fun="logcosh",
+        seed=args.seed,
+        variance_normalize=args.tica_varnorm,
+        icasso_runs=icasso_runs,
+        device=device,
+        verbose=args.verb >= 1,
+    )
+    result.reducer = args.tica_reducer
+    del concat_tcs, group_maps
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Auto K_tica: keep only reproducible components (Iq > threshold).
+    if auto_tica and result.stability is not None:
+        keep = result.stability > iq_thresh
+        if int(keep.sum()) < 1:
+            keep = np.zeros_like(result.stability, dtype=bool)
+            keep[int(np.argmax(result.stability))] = True
+        _vprint(
+            args.verb >= 1,
+            f"auto K_tica: {int(keep.sum())}/{k_tica_req} components with Iq>{iq_thresh}",
+        )
+        result = result.subset(keep)
+    k_tica = int(result.diagnostics["k_tica"])
+    if result.stability is not None:
+        _vprint(
+            args.verb >= 1,
+            f"ICASSO Iq range: {result.stability.min():.2f}–{result.stability.max():.2f}",
+        )
+    _vprint(args.verb >= 1, f"Temporal ICA done ({k_tica} components)", t_step)
+
+    # --- Save outputs (group folder + per-run folders) ---------------------
+    _vsection(args.verb >= 1, "Save Outputs")
+    t_step = time.time()
+    pfx = parse_prefix(str(args.prefix))
+    nii_ext = pfx.nifti_ext
+    _basename = Path(pfx.stem).name
+    _parent_dir = Path(pfx.stem).parent
+
+    group_dir = _parent_dir / f"{_basename}_temporalica.ica"
+    _gffs = group_dir / "ffs_outputs"
+    _gffs.mkdir(parents=True, exist_ok=True)
+    out_prefix = _gffs / _basename
+    labels = [f"tIC_{i + 1}" for i in range(k_tica)]
+
+    # Group tICA spatial maps (shared across runs) + concatenated timecourses.
+    maps_file = Path(f"{out_prefix}_temporalica_maps{nii_ext}")
+    decomposition_io.save_masked_component_maps_4d(
+        components_kv=result.spatial_maps,
+        mask3d=mask3d,
+        shape3d=shape3d,
+        affine=affine,
+        out_file=maps_file,
+    )
+    decomposition_io.save_timeseries(
+        result.temporal_sources.T,  # (T_total, K_tica)
+        f"{out_prefix}_temporalica_timecourses.1D",
+        tr=tr,
+        labels=labels,
+    )
+    # Stage-1 spatial basis, saved for inspection.
+    decomposition_io.save_masked_component_maps_4d(
+        components_kv=result.group_spatial_maps,
+        mask3d=mask3d,
+        shape3d=shape3d,
+        affine=affine,
+        out_file=Path(f"{out_prefix}_temporalica_sica_maps{nii_ext}"),
+    )
+
+    # Optional GGM z-maps so thresholded viewing matches the single-run tool.
+    z_maps = None
+    if args.save_mixture_z:
+        comp_tensor = torch.as_tensor(result.spatial_maps, device=device)
+        z_tensor, p_tensor, _ = batch_mixture_zscores(
+            comp_tensor, device=device, verbose=args.verb >= 1
+        )
+        z_maps = z_tensor.cpu().numpy().astype(np.float32)
+        p_maps = p_tensor.cpu().numpy().astype(np.float32)
+        del comp_tensor, z_tensor, p_tensor
+        for arr, fname in [
+            (z_maps, f"{out_prefix}_temporalica_zmaps{nii_ext}"),
+            (p_maps, f"{out_prefix}_temporalica_signalprob{nii_ext}"),
+        ]:
+            decomposition_io.save_masked_component_maps_4d(
+                components_kv=arr,
+                mask3d=mask3d,
+                shape3d=shape3d,
+                affine=affine,
+                out_file=Path(fname),
+            )
+
+    # Per-run folders: symlink the (shared) group maps in + that run's timecourses.
+    per_run_dirs: list[str] = []
+    for ri in range(n_runs):
+        rdir = _parent_dir / f"{_basename}_temporalica_run{ri + 1:02d}.ica"
+        rffs = rdir / "ffs_outputs"
+        rffs.mkdir(parents=True, exist_ok=True)
+        rprefix = rffs / _basename
+        run_maps = Path(f"{rprefix}_temporalica_maps{nii_ext}")
+        try:
+            if run_maps.exists() or run_maps.is_symlink():
+                run_maps.unlink()
+            run_maps.symlink_to(maps_file.resolve())
+        except OSError:
+            shutil.copy2(maps_file, run_maps)
+        decomposition_io.save_timeseries(
+            result.per_run_sources[ri].T,  # (T_i, K_tica)
+            f"{rprefix}_temporalica_timecourses.1D",
+            tr=tr,
+            labels=labels,
+        )
+        per_run_dirs.append(str(rdir))
+    _vprint(
+        args.verb >= 1,
+        f"Saved group + {n_runs} per-run folders under {_parent_dir}",
+        t_step,
+    )
+
+    mask_type = (
+        "provided" if shared_mask is not None else ("auto" if mask3d is not None else "none")
+    )
+    elapsed_total = time.time() - t_total
+    meta = {
+        "mode": "temporal_ica",
+        "reducer": args.tica_reducer,
+        "n_runs": n_runs,
+        "input_files": input_files,
+        "tr": float(tr),
+        "run_lengths": run_lengths,
+        "total_timepoints": total_t,
+        "n_voxels": n_vox_masked,
+        "mask_type": mask_type,
+        "n_spatial_components": int(k_sica),
+        "tica_timepoints_per_component": round(tica_ratio, 1),
+        "n_temporal_components": int(k_tica),
+        "n_temporal_comps_request": args.n_temporal_comps,
+        "variance_normalized": bool(args.tica_varnorm),
+        "tica_method": method_tica,
+        "icasso_runs": int(icasso_runs),
+        "iq_threshold": float(iq_thresh),
+        "component_stability_iq": (
+            None if result.stability is None else [round(float(v), 3) for v in result.stability]
+        ),
+        "sica_iterations": int(sica_iters),
+        "tica_iterations": int(result.n_iter),
+        "component_variance_share": result.explained_share.tolist(),
+        "group_dir": str(group_dir),
+        "per_run_dirs": per_run_dirs,
+        "outputs": {
+            "ica_maps": str(maps_file),
+            "ica_timecourses": f"{out_prefix}_temporalica_timecourses.1D",
+            "sica_maps": f"{out_prefix}_temporalica_sica_maps{nii_ext}",
+            "ica_zmaps": (
+                f"{out_prefix}_temporalica_zmaps{nii_ext}" if z_maps is not None else None
+            ),
+        },
+        "elapsed_seconds": round(elapsed_total, 2),
+    }
+    with open(f"{out_prefix}_temporalica_metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta
+
+
 def _run_tensorial_ica(
     input_files: list[str],
     args,
@@ -3257,6 +3732,90 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     modes.add_argument(
+        "-temporal_ica",
+        "-tica",
+        dest="temporal_ica",
+        action="store_true",
+        help=(
+            "Two-stage temporal ICA (Glasser 2018 / HCP): reduce the spatial "
+            "dimension with a group spatial ICA (or PCA), dual-regress the group "
+            "maps onto each run to recover per-run component timecourses, then run "
+            "temporal ICA on the concatenation. -num_comps sets K_sica; "
+            "-n_temporal_comps sets K_tica. Requires >= 2 input runs."
+        ),
+    )
+    modes.add_argument(
+        "-tica_reducer",
+        "-tica-reducer",
+        dest="tica_reducer",
+        choices=["sica", "pca"],
+        default="sica",
+        help=(
+            "Stage-1 spatial reducer for -temporal_ica: 'sica' (group spatial "
+            "ICA, HCP-faithful, default) or 'pca' (MIGP top-K principal maps, "
+            "lighter/faster)."
+        ),
+    )
+    modes.add_argument(
+        "-n_temporal_comps",
+        "-n-temporal-comps",
+        dest="n_temporal_comps",
+        type=str,
+        default="30",
+        help=(
+            "Number of temporal ICA components K_tica for -temporal_ica. Int, "
+            "float in (0,1) as a fraction of K_sica, or 'auto' to estimate. "
+            "Default: 30."
+        ),
+    )
+    modes.add_argument(
+        "-tica_method",
+        "-tica-method",
+        dest="tica_method",
+        choices=["fastica", "infomax"],
+        default=None,
+        help=(
+            "ICA solver for the temporal stage. Defaults to -ica_method. "
+            "FastICA (default) is fine for the small (K_sica x T_total) matrix."
+        ),
+    )
+    modes.add_argument(
+        "-no_tica_varnorm",
+        "-no-tica-varnorm",
+        dest="tica_varnorm",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable per-component variance normalization of the sICA "
+            "timecourses before the temporal stage (HCP normalizes by default)."
+        ),
+    )
+    modes.add_argument(
+        "-tica_icasso_runs",
+        "-tica-icasso-runs",
+        dest="tica_icasso_runs",
+        type=int,
+        default=25,
+        help=(
+            "ICASSO repetitions to stabilize the temporal ICA and estimate "
+            "per-component reproducibility (Iq). 0/1 = single FastICA (no "
+            "stability). HCP uses 100; 25 is a good default. Required (auto-set "
+            "to 25) when -n_temporal_comps auto."
+        ),
+    )
+    modes.add_argument(
+        "-tica_iq_thresh",
+        "-tica-iq-thresh",
+        dest="tica_iq_thresh",
+        type=float,
+        default=0.5,
+        help=(
+            "ICASSO Iq threshold. With -n_temporal_comps auto, keep only "
+            "temporal components with Iq above this (HCP uses 0.5). The Iq of "
+            "every component is written to the metadata regardless."
+        ),
+    )
+    modes.add_argument(
         "-migp",
         action="store_true",
         help=(
@@ -3340,8 +3899,9 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.tensor and args.temp_concat:
-        raise ValueError("-tensor and -temp_concat are mutually exclusive")
+    _n_modes = int(bool(args.tensor)) + int(bool(args.temp_concat)) + int(bool(args.temporal_ica))
+    if _n_modes > 1:
+        raise ValueError("-tensor, -temp_concat, and -temporal_ica are mutually exclusive")
 
     if (args.onsets is None) ^ (args.durations is None):
         raise ValueError("Use -onsets and -durations together for task correlation annotation")
@@ -3502,6 +4062,35 @@ def main() -> None:
         print("\n" + "=" * 70)
         elapsed_pipeline = time.time() - t_pipeline
         print(f"ffs_ica tensor complete ({elapsed_pipeline:.1f}s)")
+        print(f"Summary: {summary_path}")
+        print("=" * 70)
+    elif args.temporal_ica:
+        # --- Two-stage temporal ICA mode ---
+        if len(input_files) < 2:
+            raise ValueError("-temporal_ica requires at least 2 input runs")
+        print(
+            f"\nMode: temporal ICA ({len(input_files)} runs → "
+            f"{args.tica_reducer} reduction → temporal ICA)"
+        )
+        tica_meta = _run_temporal_ica(
+            input_files=input_files,
+            args=args,
+            device=device,
+            shared_mask=shared_mask,
+        )
+        print(
+            f"  Temporal components: {tica_meta['n_temporal_components']} "
+            f"(from {tica_meta['n_spatial_components']} spatial comps, "
+            f"{tica_meta['n_voxels']:,} vox, {tica_meta['total_timepoints']:,} TRs) | "
+            f"tIC1 share: {tica_meta['component_variance_share'][0] * 100:.2f}%"
+        )
+        pfx = parse_prefix(str(args.prefix))
+        summary_path = f"{pfx.stem}_ica_summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(tica_meta, f, indent=2)
+        print("\n" + "=" * 70)
+        elapsed_pipeline = time.time() - t_pipeline
+        print(f"ffs_ica temporal_ica complete ({elapsed_pipeline:.1f}s)")
         print(f"Summary: {summary_path}")
         print("=" * 70)
     elif args.temp_concat:
