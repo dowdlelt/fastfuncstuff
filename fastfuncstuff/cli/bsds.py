@@ -154,6 +154,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n_init", "-n-init", type=int, default=10, help="Random restarts.")
     p.add_argument("-n_iter", "-n-iter", type=int, default=100, help="Max VB iterations.")
     p.add_argument(
+        "-select",
+        action="store_true",
+        help="Pick n_states/max_ldim by held-out (leave-runs-out) log-likelihood over a "
+        "grid before the final fit. Emits *_selection.png and *_selection.json; the "
+        "final model is fit at the winning config. Training free energy is not a "
+        "selection criterion — this is the empirical referee.",
+    )
+    p.add_argument(
+        "-n_states_grid",
+        "-n-states-grid",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Candidate n_states for -select (default: a small grid around -n_states).",
+    )
+    p.add_argument(
+        "-max_ldim_grid",
+        "-max-ldim-grid",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Candidate max_ldim for -select (default: 3 5 8).",
+    )
+    p.add_argument(
+        "-select_folds",
+        "-select-folds",
+        type=int,
+        default=None,
+        help="Leave-runs-out folds for -select (default: one run per fold).",
+    )
+    p.add_argument(
+        "-select_n_init",
+        "-select-n-init",
+        type=int,
+        default=4,
+        help="Restarts per fit during -select (kept modest; the final fit uses -n_init).",
+    )
+    p.add_argument(
         "-tol", type=float, default=1e-4, help="Relative free-energy convergence tolerance."
     )
     p.add_argument(
@@ -294,6 +332,56 @@ def _make_plots(stem: str, model, stats, args, graph_metrics, switch_stats, alig
             switch_stats=switch_stats,
         )
         print(f"  wrote {len(written)} publication figures ({args.plot_format} + png)")
+
+
+def _run_selection(sessions, args, device, stem: str):
+    """Grid-search n_states/max_ldim by held-out LL; return the winning (n_states, ldim)."""
+    from fastfuncstuff.dynamics import plots
+    from fastfuncstuff.dynamics.model_selection import grid_search_bsds
+
+    n_grid = args.n_states_grid or sorted(
+        {max(2, args.n_states - 6), args.n_states, args.n_states + 6}
+    )
+    default_ldim = args.max_ldim if isinstance(args.max_ldim, int) else 5
+    l_grid = args.max_ldim_grid or sorted(
+        {max(1, default_ldim - 2), default_ldim, default_ldim + 3}
+    )
+    if len(sessions) < 2:
+        raise SystemExit("-select needs at least 2 runs (leave-runs-out cross-validation).")
+    print(f"  selection grid: n_states={n_grid} x max_ldim={l_grid} (held-out LL, leave-runs-out)")
+    results = grid_search_bsds(
+        sessions,
+        n_grid,
+        l_grid,
+        n_folds=args.select_folds,
+        n_init=args.select_n_init,
+        device=device,
+        show_progress=True,
+    )
+    best = results[0]
+    with open(f"{stem}_selection.json", "w") as fh:
+        json.dump(
+            [
+                {
+                    "n_states": r.n_states,
+                    "max_ldim": r.max_ldim,
+                    "held_out_loglik": r.held_out_loglik,
+                    "per_timepoint_loglik": r.per_timepoint_loglik,
+                }
+                for r in results
+            ],
+            fh,
+            indent=2,
+        )
+    import matplotlib
+
+    matplotlib.use("Agg")
+    plots.plot_selection_surface(results, f"{stem}_selection.png")
+    print(
+        f"  selection: best n_states={best.n_states}, max_ldim={best.max_ldim} "
+        f"(held-out LL/TR={best.per_timepoint_loglik:.4f}); wrote {stem}_selection.png/json"
+    )
+    return best.n_states, best.max_ldim
 
 
 def _compute_task_alignment(model, args, device):
@@ -448,11 +536,18 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
     )
 
+    pfx = parse_prefix(str(args.prefix))
+    Path(pfx.stem).parent.mkdir(parents=True, exist_ok=True)
+
+    n_states, max_ldim = args.n_states, args.max_ldim
+    if args.select:
+        n_states, max_ldim = _run_selection(sessions, args, device, pfx.stem)
+
     t0 = time.time()
     model = fit_bsds(
         sessions,
-        n_states=args.n_states,
-        max_ldim=args.max_ldim,
+        n_states=n_states,
+        max_ldim=max_ldim,
         n_iter=args.n_iter,
         n_init=args.n_init,
         tol=args.tol,
@@ -472,7 +567,6 @@ def main(argv: list[str] | None = None) -> int:
     switch = compute_switch_stats(model, tr=args.tr)
     align = _compute_task_alignment(model, args, device)
 
-    pfx = parse_prefix(str(args.prefix))
     _save_outputs(
         pfx.stem,
         model,

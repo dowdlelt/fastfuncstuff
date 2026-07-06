@@ -138,22 +138,25 @@ def _finalize(state: VBState, y: torch.Tensor, sessions: list[torch.Tensor]) -> 
     effective_dim = (a_over_b < 10.0).sum(dim=1).to(_DTYPE)
     ard_precision = a_over_b.clone()
 
+    # Reportable tensors go to CPU so downstream save/stats/plots never touch a
+    # device tensor (raw .numpy() would crash on GPU). The variational `state`
+    # stays on its compute device so decode() can still run on the GPU.
     return BSDSModel(
         n_states=k,
         ldim=state.ldim,
         session_lengths=list(state.session_lengths),
-        state_means=state.lm[:, :, 0].clone(),
-        state_covs=covs,
-        transition=trans,
-        init_probs=init_probs,
-        responsibilities=responsibilities,
-        viterbi_states=viterbi_states,
-        ar_transitions=b_all,
-        ar_noise_cov=nc_all,
-        effective_dim=effective_dim,
-        ard_precision=ard_precision,
-        loadings=lam.clone(),
-        psii=state.psii.clone(),
+        state_means=state.lm[:, :, 0].cpu(),
+        state_covs=covs.cpu(),
+        transition=trans.cpu(),
+        init_probs=init_probs.cpu(),
+        responsibilities=[r.cpu() for r in responsibilities],
+        viterbi_states=[v.cpu() for v in viterbi_states],
+        ar_transitions=b_all.cpu(),
+        ar_noise_cov=nc_all.cpu(),
+        effective_dim=effective_dim.cpu(),
+        ard_precision=ard_precision.cpu(),
+        loadings=lam.cpu(),
+        psii=state.psii.cpu(),
         objective_history=[],
         converged=False,
         state=state,

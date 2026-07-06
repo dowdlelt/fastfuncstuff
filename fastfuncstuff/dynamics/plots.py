@@ -578,6 +578,76 @@ def plot_behavior_correlation(corrs, ax):
     _style_axes(ax)
 
 
+def plot_selection_surface(results, path: str | Path | None = None):
+    """Held-out log-likelihood over the ``(n_states, max_ldim)`` grid.
+
+    ``results`` is a list of :class:`~fastfuncstuff.dynamics.model_selection.GridResult`.
+    A 2-D grid renders as a heatmap (per-timepoint held-out LL, higher = better)
+    with the best cell starred; a 1-D sweep renders as a line. This is the model
+    picker — training free energy always improves with capacity, so the turnover
+    in *held-out* LL is the honest choice.
+    """
+    ns = sorted({r.n_states for r in results})
+    ld = sorted({r.max_ldim for r in results})
+    lut = {(r.n_states, r.max_ldim): r.per_timepoint_loglik for r in results}
+    best = max(results, key=lambda r: r.per_timepoint_loglik)
+
+    if len(ns) > 1 and len(ld) > 1:
+        fig, ax = plt.subplots(
+            figsize=(2.5 + 1.0 * len(ld), 1.8 + 0.55 * len(ns)), facecolor=_SURFACE
+        )
+        grid = np.full((len(ns), len(ld)), np.nan)
+        for i, n in enumerate(ns):
+            for j, l in enumerate(ld):
+                if (n, l) in lut:
+                    grid[i, j] = lut[(n, l)]
+        im = ax.imshow(grid, aspect="auto", cmap=SEQUENTIAL, origin="lower")
+        ax.set_xticks(range(len(ld)), ld)
+        ax.set_yticks(range(len(ns)), ns)
+        ax.set_xlabel("max_ldim")
+        ax.set_ylabel("n_states")
+        for i in range(len(ns)):
+            for j in range(len(ld)):
+                if not np.isnan(grid[i, j]):
+                    ax.text(j, i, f"{grid[i, j]:.3f}", ha="center", va="center", fontsize=7)
+        ax.scatter(
+            ld.index(best.max_ldim),
+            ns.index(best.n_states),
+            marker="*",
+            s=240,
+            c="#e34948",
+            edgecolors="k",
+            linewidths=0.8,
+            zorder=3,
+        )
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cb.set_label("held-out LL / TR", color=_INK2, fontsize=8)
+        cb.ax.tick_params(labelsize=7, colors=_INK2)
+    else:
+        fig, ax = plt.subplots(figsize=(6, 3.4), facecolor=_SURFACE)
+        if len(ld) == 1:
+            xs, xlab = ns, "n_states"
+            ys = [lut[(n, ld[0])] for n in ns]
+            bx = best.n_states
+        else:
+            xs, xlab = ld, "max_ldim"
+            ys = [lut[(ns[0], l)] for l in ld]
+            bx = best.max_ldim
+        ax.plot(xs, ys, "-o", color="#2a78d6", zorder=2)
+        ax.scatter([bx], [best.per_timepoint_loglik], marker="*", s=240, c="#e34948", zorder=3)
+        ax.set_xlabel(xlab)
+        ax.set_ylabel("held-out LL / TR")
+        _style_axes(ax)
+
+    ax.set_title(f"Model selection — best n_states={best.n_states}, max_ldim={best.max_ldim}")
+    ax.title.set_color(_INK)
+    if path is not None:
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
+        plt.close(fig)
+        return str(path)
+    return fig
+
+
 # --------------------------------------------------------------------------- #
 # Composite entry points.                                                      #
 # --------------------------------------------------------------------------- #
