@@ -13,8 +13,8 @@ Two entry points:
 - :func:`qc_report` — one multi-panel PNG answering "did it fit, does it make
   sense?" (convergence, occupancy, lifetime, transition matrix, state means, the
   ARD saturation pair — effective dim vs the ``max_ldim`` ceiling and the exact
-  per-factor precisions — the all-runs MAP ribbon, and one run's state
-  probabilities).
+  per-factor precisions — the per-run occupancy heatmap, the all-runs MAP
+  ribbon, and one run's state probabilities).
 - :func:`save_publication_figures` — each key figure saved individually as a
   vector file (PDF/SVG) plus PNG, paper-ready.
 """
@@ -348,6 +348,32 @@ def plot_occupancy(stats, ax) -> None:
     _style_axes(ax)
 
 
+def plot_subject_occupancy(stats, ax) -> None:
+    """Per-run occupancy heatmap (runs x states) — which states each run visits.
+
+    States shared across runs are a repertoire, not a per-run checklist: a run
+    visits only the subset its data supports, so white (never-visited) cells are
+    expected. States are ordered by overall occupancy; a column bright in only a
+    few rows is a rarely-visited state (its FC rests on little data — read with
+    care).
+    """
+    occ = np.asarray(stats.subject_occupancy)  # (n_runs, K)
+    k = occ.shape[1]
+    order = np.argsort(-np.asarray(stats.group_occupancy))
+    im = ax.imshow(occ[:, order], aspect="auto", cmap=SEQUENTIAL, vmin=0)
+    idx, labels = _thinned_state_labels(k)
+    # x positions are columns in the reordered matrix; map thinned state ids back.
+    pos = {int(s): i for i, s in enumerate(order)}
+    ax.set_xticks([pos[s] for s in idx], labels, fontsize=6 if k > 12 else 8, rotation=90)
+    ax.set_xlabel("state (occupancy order)")
+    ax.set_ylabel("run")
+    ax.set_title("Per-run occupancy (white = never visited)")
+    ax.title.set_color(_INK)
+    ax.tick_params(colors=_INK2, labelsize=8, length=0)
+    cb = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=7, colors=_INK2)
+
+
 def plot_lifetime(stats, ax) -> None:
     """Group mean lifetime (dwell time) per state."""
     life = stats.group_lifetime
@@ -559,8 +585,8 @@ def plot_behavior_correlation(corrs, ax):
 
 def qc_report(model, stats, path: str | Path, run_idx: int = 0, tr: float = 1.0):
     """One multi-panel QC figure: did it fit, do the states make sense?"""
-    fig = plt.figure(figsize=(13, 12), facecolor=_SURFACE)
-    gs = fig.add_gridspec(4, 3, height_ratios=[1, 1, 1.1, 0.9], hspace=0.5, wspace=0.32)
+    fig = plt.figure(figsize=(13, 15), facecolor=_SURFACE)
+    gs = fig.add_gridspec(5, 3, height_ratios=[1, 1, 1.1, 1.1, 0.9], hspace=0.55, wspace=0.32)
     plot_convergence(model, fig.add_subplot(gs[0, 0]))
     plot_occupancy(stats, fig.add_subplot(gs[0, 1]))
     plot_lifetime(stats, fig.add_subplot(gs[0, 2]))
@@ -568,8 +594,9 @@ def qc_report(model, stats, path: str | Path, run_idx: int = 0, tr: float = 1.0)
     plot_state_means(model, fig.add_subplot(gs[1, 1]))
     plot_effective_dim(model, fig.add_subplot(gs[1, 2]))
     plot_ard_precisions(model, fig.add_subplot(gs[2, 0]))
-    plot_state_ribbon_stack(model, fig.add_subplot(gs[2, 1:]), tr=tr, colorbar=True)
-    plot_state_timecourses(model, run_idx, fig.add_subplot(gs[3, :]), tr=tr)
+    plot_subject_occupancy(stats, fig.add_subplot(gs[2, 1:]))
+    plot_state_ribbon_stack(model, fig.add_subplot(gs[3, :]), tr=tr, colorbar=True)
+    plot_state_timecourses(model, run_idx, fig.add_subplot(gs[4, :]), tr=tr)
     fig.suptitle(
         f"ffs_bsds QC — {model.n_states} states, {len(model.session_lengths)} session(s)",
         color=_INK,
@@ -655,6 +682,11 @@ def save_publication_figures(
     plot_occupancy(stats, a0)
     plot_lifetime(stats, a1)
     _save(fig, "occupancy_lifetime")
+
+    fig, ax = plt.subplots(figsize=(7, 4), facecolor=_SURFACE)
+    plot_subject_occupancy(stats, ax)
+    fig.tight_layout()
+    _save(fig, "occupancy_per_run")
 
     fig, ax = plt.subplots(figsize=(7, 2.8), facecolor=_SURFACE)
     plot_state_means(model, ax)
