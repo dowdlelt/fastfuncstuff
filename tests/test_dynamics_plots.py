@@ -31,13 +31,22 @@ def _fit(k=3, d=6, seed=1):
 
 def test_state_colors_fixed_order_and_extension():
     assert state_colors(3) == ["#2a78d6", "#1baf7a", "#eda100"]
-    # 8 states use the full palette; asking for more warns but still returns K.
-    import pytest
-
     assert len(state_colors(8)) == 8
-    with pytest.warns(UserWarning):
-        cols = state_colors(10)
-    assert len(cols) == 10
+    # Beyond 8 we switch to a golden-angle palette: K distinct colors, no cycling
+    # (state 0 must not equal state 8), no warning.
+    cols = state_colors(26)
+    assert len(cols) == 26
+    assert len(set(cols)) == 26  # all distinct — the whole point
+    assert cols[0] != cols[8]
+
+    from fastfuncstuff.dynamics.plots import condition_colors, golden_palette
+
+    # 48 conditions (24 tasks + 24 instructions) must all be distinct.
+    conds = condition_colors(48)
+    assert len(conds) == 48 and len(set(conds)) == 48
+    # Deterministic and valid hex.
+    assert golden_palette(5) == golden_palette(5)
+    assert all(c.startswith("#") and len(c) == 7 for c in golden_palette(30))
 
 
 def test_qc_report_writes_png(tmp_path):

@@ -53,19 +53,57 @@ DIVERGING = LinearSegmentedColormap.from_list(
 )
 
 
+def golden_palette(n: int, *, start: float = 0.055) -> list[str]:
+    """``n`` maximally-spread categorical hex colors via the golden angle.
+
+    Stepping hue by the golden-ratio conjugate (~137.5° per index) keeps *any*
+    number of successive colors well separated with no cycling — the standard
+    trick for large categorical sets. Saturation and value are dithered over a
+    few levels so same-family hues (the unavoidable blues/greens once you have
+    dozens) still separate by lightness. Colors stay in a mid-saturation,
+    mid-value band so every entry reads on the near-white surface. ``start``
+    shifts the whole ramp so distinct categorical sets (states vs task
+    conditions) don't come out looking identical.
+    """
+    import colorsys
+
+    golden = 0.618033988749895  # golden-ratio conjugate; hue step in [0, 1)
+    sats = (0.82, 0.58, 0.70)
+    vals = (0.78, 0.62, 0.90)
+    colors: list[str] = []
+    h = start % 1.0  # fixed start -> deterministic palette
+    for i in range(n):
+        h = (h + golden) % 1.0
+        s = sats[i % len(sats)]
+        v = vals[(i // len(sats)) % len(vals)]
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        colors.append(f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}")
+    return colors
+
+
 def state_colors(n_states: int) -> list[str]:
-    """Categorical colors for ``n_states`` states, in fixed order."""
+    """Categorical colors for ``n_states`` states, in fixed order.
+
+    Up to 8 states use the curated, validated palette. Beyond that (e.g. BSDS
+    fit with a generous ``n_states``), switch to a golden-angle palette that
+    yields ``n_states`` distinct hues rather than recycling the eight — so a
+    26-state ribbon is legible instead of aliasing state 0 with state 8.
+    """
     if n_states <= len(STATE_COLORS):
         return STATE_COLORS[:n_states]
-    import warnings
+    return golden_palette(n_states)
 
-    warnings.warn(
-        f"{n_states} states exceeds the 8-color categorical palette; "
-        "extra states reuse hues — prefer <=8 for legibility.",
-        stacklevel=2,
-    )
-    reps = (n_states // len(STATE_COLORS)) + 1
-    return (STATE_COLORS * reps)[:n_states]
+
+def condition_colors(n_conditions: int) -> list[str]:
+    """Categorical colors for task conditions (distinct ramp from the states).
+
+    Uses the curated palette for small sets and a golden-angle palette shifted
+    to a different starting hue for large ones — so a 48-condition strip is
+    legible and doesn't read as the same colors as the state ribbon above it.
+    """
+    if n_conditions <= len(STATE_COLORS):
+        return STATE_COLORS[:n_conditions]
+    return golden_palette(n_conditions, start=0.5)
 
 
 def _style_axes(ax) -> None:
@@ -79,6 +117,30 @@ def _style_axes(ax) -> None:
     ax.title.set_color(_INK)
     ax.xaxis.label.set_color(_INK2)
     ax.yaxis.label.set_color(_INK2)
+
+
+def _thinned_state_labels(k: int) -> tuple[list[int], list[str]]:
+    """Tick positions + ``S#`` labels, thinned so dozens of states stay readable."""
+    if k <= 12:
+        idx = list(range(k))
+    else:
+        step = 2 if k <= 26 else max(1, k // 13)
+        idx = list(range(0, k, step))
+    return idx, [f"S{s}" for s in idx]
+
+
+def _set_state_xticks(ax, k: int) -> None:
+    """State labels on a per-state bar/heatmap axis, thinned + rotated for large K.
+
+    With a generous BSDS ``n_states`` (dozens), labelling every state overlaps
+    into an unreadable smear — so beyond 12 states we show every other (or
+    sparser) label, rotated and smaller.
+    """
+    idx, lab = _thinned_state_labels(k)
+    if k <= 12:
+        ax.set_xticks(idx, lab, fontsize=8)
+    else:
+        ax.set_xticks(idx, lab, fontsize=6, rotation=90)
 
 
 def _run_time_axis(n: int, tr: float) -> tuple[np.ndarray, str]:
@@ -157,19 +219,22 @@ def plot_transition_matrix(model, ax) -> None:
     trans = trans.cpu().numpy() if hasattr(trans, "cpu") else np.asarray(trans)
     k = trans.shape[0]
     im = ax.imshow(trans, cmap=SEQUENTIAL, vmin=0, vmax=1, aspect="equal")
-    for i in range(k):
-        for j in range(k):
-            ax.text(
-                j,
-                i,
-                f"{trans[i, j]:.2f}",
-                ha="center",
-                va="center",
-                fontsize=7,
-                color=_INK if trans[i, j] < 0.6 else _SURFACE,
-            )
-    ax.set_xticks(range(k), [f"S{j}" for j in range(k)])
-    ax.set_yticks(range(k), [f"S{i}" for i in range(k)])
+    # Per-cell probability text only when the grid is small enough to read; at
+    # dozens of states it turns into unreadable overlap, so let the heatmap speak.
+    if k <= 12:
+        for i in range(k):
+            for j in range(k):
+                ax.text(
+                    j,
+                    i,
+                    f"{trans[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color=_INK if trans[i, j] < 0.6 else _SURFACE,
+                )
+    _set_state_xticks(ax, k)
+    ax.set_yticks(*_thinned_state_labels(k))
     ax.set_xlabel("to state")
     ax.set_ylabel("from state")
     ax.set_title("Transition matrix")
@@ -197,7 +262,7 @@ def plot_occupancy(stats, ax) -> None:
                 zorder=3,
                 linewidths=0,
             )
-    ax.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(ax, k)
     ax.set_ylabel("fractional occupancy")
     ax.set_title("Occupancy")
     _style_axes(ax)
@@ -210,7 +275,7 @@ def plot_lifetime(stats, ax) -> None:
     colors = state_colors(k)
     ax.bar(range(k), life, color=colors, width=0.72)
     unit = "s" if stats.tr and stats.tr != 1.0 else "TR"
-    ax.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(ax, k)
     ax.set_ylabel(f"mean lifetime ({unit})")
     ax.set_title("Mean lifetime")
     _style_axes(ax)
@@ -222,7 +287,7 @@ def plot_effective_dim(model, ax) -> None:
     eff = eff.cpu().numpy() if hasattr(eff, "cpu") else np.asarray(eff)
     k = len(eff)
     ax.bar(range(k), eff, color=state_colors(k), width=0.72)
-    ax.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(ax, k)
     ax.set_ylabel("active factors")
     ax.set_title("ARD effective dim")
     _style_axes(ax)
@@ -255,11 +320,12 @@ def plot_state_fc(stats, fig=None):
     else:
         axes = fig.subplots(nrow, ncol)
     axes = np.atleast_1d(axes).ravel()
+    colors = state_colors(k)
     im = None
     for s in range(k):
         ax = axes[s]
         im = ax.imshow(fc[s], cmap=DIVERGING, vmin=-1, vmax=1, aspect="equal")
-        ax.set_title(f"S{s}", color=STATE_COLORS[s % len(STATE_COLORS)], fontsize=10)
+        ax.set_title(f"S{s}", color=colors[s], fontsize=10)
         ax.set_xticks([])
         ax.set_yticks([])
     for s in range(k, len(axes)):
@@ -281,12 +347,12 @@ def plot_graph_metrics(gm, fig=None):
     gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.4], wspace=0.42)
     a0, a1, a2 = (fig.add_subplot(gs[0, i]) for i in range(3))
     a0.bar(range(k), gm.global_efficiency, color=colors, width=0.72)
-    a0.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(a0, k)
     a0.set_ylabel("global efficiency")
     a0.set_title("Integration")
     _style_axes(a0)
     a1.bar(range(k), gm.mean_clustering, color=colors, width=0.72)
-    a1.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(a1, k)
     a1.set_ylabel("mean clustering")
     a1.set_title("Segregation")
     _style_axes(a1)
@@ -360,7 +426,7 @@ def plot_behavior_correlation(corrs, ax):
     k = len(corrs)
     ax.axhline(0, color=_INK2, linewidth=0.8)
     ax.bar(range(k), corrs, color=state_colors(k), width=0.72)
-    ax.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(ax, k)
     ax.set_ylabel("corr with behaviour")
     ax.set_title("State feature ↔ behaviour")
     _style_axes(ax)
@@ -406,12 +472,12 @@ def analysis_report(
     k = model.n_states
     colors = state_colors(k)
     a0.bar(range(k), graph_metrics.global_efficiency, color=colors, width=0.72)
-    a0.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(a0, k)
     a0.set_ylabel("global efficiency")
     a0.set_title("Integration")
     _style_axes(a0)
     a1.bar(range(k), graph_metrics.mean_clustering, color=colors, width=0.72)
-    a1.set_xticks(range(k), [f"S{s}" for s in range(k)])
+    _set_state_xticks(a1, k)
     a1.set_ylabel("mean clustering")
     a1.set_title("Segregation")
     _style_axes(a1)
@@ -485,3 +551,116 @@ def save_publication_figures(
         fig.tight_layout()
         _save(fig, "switching")
     return written
+
+
+def _condition_ticks(labels: list[str]) -> list[str]:
+    """Truncate long condition names for axis ticks."""
+    return [ln if len(ln) <= 12 else ln[:11] + "…" for ln in labels]
+
+
+def _cat_fontsize(n: int) -> float:
+    """Axis-tick font size that shrinks as the number of categories grows."""
+    if n <= 12:
+        return 7.0
+    if n <= 24:
+        return 5.5
+    if n <= 40:
+        return 4.5
+    return 3.5
+
+
+def plot_state_condition_correlation(align, ax) -> None:
+    """Heatmap: correlation of each state's probability with each condition's design."""
+    corr = np.asarray(align.correlation)  # (K, C)
+    k, c = corr.shape
+    vmax = float(np.abs(corr).max()) if corr.size else 1.0
+    vmax = max(vmax, 1e-6)
+    im = ax.imshow(corr, cmap=DIVERGING, vmin=-vmax, vmax=vmax, aspect="auto")
+    ax.set_yticks(range(k), [f"S{s}" for s in range(k)], fontsize=_cat_fontsize(k))
+    ax.set_xticks(
+        range(c),
+        _condition_ticks(align.condition_labels),
+        rotation=90,
+        fontsize=_cat_fontsize(c),
+    )
+    ax.set_title("State × condition correlation")
+    ax.title.set_color(_INK)
+    ax.tick_params(colors=_INK2, length=0)
+    cb = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=7, colors=_INK2)
+
+
+def plot_state_condition_contingency(align, ax) -> None:
+    """Heatmap: P(state active | condition), from the label-contingency view."""
+    cont = np.asarray(align.contingency)  # (K, C)
+    k, c = cont.shape
+    im = ax.imshow(cont, cmap=SEQUENTIAL, vmin=0, vmax=1, aspect="auto")
+    ax.set_yticks(range(k), [f"S{s}" for s in range(k)], fontsize=_cat_fontsize(k))
+    ax.set_xticks(
+        range(c),
+        _condition_ticks(align.condition_labels),
+        rotation=90,
+        fontsize=_cat_fontsize(c),
+    )
+    ax.set_title(f"P(state | condition)   NMI={align.normalized_mutual_info:.2f}")
+    ax.title.set_color(_INK)
+    ax.tick_params(colors=_INK2, length=0)
+    cb = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=7, colors=_INK2)
+
+
+def plot_task_state_overlay(model, align, ax, run_idx: int = 0, tr: float = 1.0) -> None:
+    """State ribbon with the condition-label timecourse drawn beneath it."""
+    seq = model.viterbi_states[run_idx]
+    seq = seq.cpu().numpy() if hasattr(seq, "cpu") else np.asarray(seq)
+    labels = np.asarray(align.labels[run_idx])
+    t, unit = _run_time_axis(len(seq), tr)
+    state_cmap = ListedColormap(state_colors(model.n_states))
+    ax.imshow(
+        seq[np.newaxis, :],
+        aspect="auto",
+        cmap=state_cmap,
+        vmin=0,
+        vmax=model.n_states - 1,
+        extent=(float(t[0]), float(t[-1]), 0.55, 1.45),
+        interpolation="nearest",
+    )
+    # Condition label strip (baseline -1 rendered as blank). Golden-angle
+    # condition palette so 48 conditions stay distinct (tab20 would alias).
+    c = len(align.condition_labels)
+    disp = np.where(labels < 0, np.nan, labels).astype(float)
+    cond_cmap = ListedColormap(condition_colors(max(c, 1)))
+    ax.imshow(
+        disp[np.newaxis, :],
+        aspect="auto",
+        cmap=cond_cmap,
+        vmin=0,
+        vmax=max(c - 1, 1),
+        extent=(float(t[0]), float(t[-1]), -0.45, 0.45),
+        interpolation="nearest",
+    )
+    ax.set_yticks([1.0, 0.0], ["state", "condition"])
+    ax.set_ylim(-0.5, 1.5)
+    ax.set_xlabel(unit)
+    ax.set_title(f"State vs task — run {run_idx}")
+    ax.title.set_color(_INK)
+    ax.tick_params(colors=_INK2, labelsize=8, length=0)
+
+
+def task_alignment_report(model, align, path: str | Path, run_idx: int = 0, tr: float = 1.0):
+    """One figure: correlation + contingency heatmaps and a state-vs-task overlay."""
+    fig = plt.figure(figsize=(13, 6.5), facecolor=_SURFACE)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 0.8], hspace=0.55, wspace=0.3)
+    plot_state_condition_correlation(align, fig.add_subplot(gs[0, 0]))
+    plot_state_condition_contingency(align, fig.add_subplot(gs[0, 1]))
+    plot_task_state_overlay(model, align, fig.add_subplot(gs[1, :]), run_idx=run_idx, tr=tr)
+    fig.suptitle(
+        f"ffs_bsds task alignment — {len(align.condition_labels)} conditions, "
+        f"NMI={align.normalized_mutual_info:.2f}",
+        color=_INK,
+        fontsize=13,
+        y=0.99,
+    )
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
+    plt.close(fig)
+    return path
