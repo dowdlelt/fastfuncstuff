@@ -132,19 +132,42 @@ def update_mcl(state: VBState) -> None:
     state.nu_mcl = s / denom
 
 
+def _weighted_latent_moment(state: VBState) -> torch.Tensor:
+    """``temp[k] = Xcov[k]*sum(Qns[:,k]) + Xm[k] (Qns[:,k]*Xm[k])'`` for all states.
+
+    The responsibility-weighted second moment of the augmented latent, batched
+    over states — shared by :func:`update_psi` and the free energy.
+    Returns ``(K, kt, kt)``.
+    """
+    qns = state.qns  # (N, K)
+    neff = qns.sum(dim=0)  # (K,)
+    temp_alt = state.xm * qns.T.unsqueeze(1)  # (K, kt, N)
+    return state.xcov * neff.view(-1, 1, 1) + torch.einsum(
+        "kin,kjn->kij", state.xm, temp_alt
+    )  # (K, kt, kt)
+
+
 def update_psi(state: VBState, y: torch.Tensor) -> None:
-    """Diagonal noise precision (``inferpsii2``, per-dimension variance branch)."""
-    qns = state.qns
-    psi2_diag = torch.zeros(state.n_roi, dtype=_DTYPE, device=y.device)
-    for t in range(state.n_states):
-        temp_alt = state.xm[t] * qns[:, t]  # (kt, N)
-        temp = state.xcov[t] * qns[:, t].sum() + state.xm[t] @ temp_alt.T  # (kt, kt)
-        lm_xm = state.lm[t] @ state.xm[t]  # (D, N)
-        term1 = (qns[:, t] * y * (y - 2 * lm_xm)).sum(dim=1)  # (D,)
-        term2 = torch.einsum("qi,ij,qj->q", state.lm[t], temp, state.lm[t])  # (D,)
-        term3 = (state.lcov[t] * temp.T.unsqueeze(0)).sum(dim=(1, 2))  # trace(Lcov_q temp)
-        psi2_diag = psi2_diag + term1 + term2 + term3
-    psi2_diag = psi2_diag / state.n_time
+    """Diagonal noise precision (``inferpsii2``, per-dimension variance branch).
+
+    Batched over states — the reference ``inferpsii2`` accumulates the same
+    per-state terms in a Python loop; here they are one set of batched ops.
+    """
+    qns = state.qns  # (N, K)
+    temp = _weighted_latent_moment(state)  # (K, kt, kt)
+    # term1: sum_{n,k} Qns[n,k] y_d (y_d - 2 (Lm_k Xm_k)_d). Contract the D axis
+    # last so no (K, D, N) tensor is ever formed (that is the memory-bandwidth
+    # trap): the responsibility-weighted latent cross-moment is (K, kt, N).
+    qns_sum = qns.sum(dim=1)  # (N,) == 1 up to rounding; kept explicit for exactness
+    term1_data = (y * y) @ qns_sum  # (D,)
+    tmp = state.xm * qns.T.unsqueeze(1)  # (K, kt, N)
+    cross = torch.einsum("kin,dn->kid", tmp, y)  # (K, kt, D)
+    term1 = term1_data - 2.0 * torch.einsum("kdi,kid->d", state.lm, cross)  # (D,)
+    # term2: diag(Lm temp Lm') per ROI, summed over states.
+    term2 = torch.einsum("kqi,kij,kqj->q", state.lm, temp, state.lm)  # (D,)
+    # term3: trace(Lcov_q temp) per ROI, summed over states.
+    term3 = torch.einsum("kqij,kij->q", state.lcov, temp)  # (D,)
+    psi2_diag = (term1 + term2 + term3) / state.n_time
     # Floor the variance so the emission log-density stays finite.
     psi2_diag = psi2_diag.clamp_min(PSI_MIN)
     state.psii = 1.0 / psi2_diag
@@ -165,38 +188,31 @@ def compute_log_out_probs(state: VBState, sessions: list[torch.Tensor]) -> list[
     were concatenated into the model's time axis.
     """
     psii = state.psii
-    # Per-state constants that don't depend on time.
-    temp_all = torch.empty(state.n_states, state.kt, state.kt, dtype=_DTYPE, device=psii.device)
-    scalar_bd = torch.empty(state.n_states, dtype=_DTYPE, device=psii.device)
+    ldim = state.ldim
     eye_eps = 1e-12
-    for t in range(state.n_states):
-        lm_psii_lm = state.lm[t].T @ (psii.unsqueeze(1) * state.lm[t])  # (kt, kt)
-        temp = lm_psii_lm + torch.einsum("q,qij->ij", psii, state.lcov[t])
-        temp_all[t] = temp
-        # <temp, Xcov> + trace(Xcov[1:,1:]) - 2*sum(log diag chol(Xcov[1:,1:]))
-        b_term = (temp * state.xcov[t]).sum()
-        d_term = torch.diagonal(state.xcov[t][1:, 1:]).sum()
-        chol = torch.linalg.cholesky(
-            state.xcov[t][1:, 1:]
-            + eye_eps * torch.eye(state.ldim, dtype=_DTYPE, device=psii.device)
-        )
-        f_term = -2.0 * torch.log(torch.diagonal(chol)).sum()
-        scalar_bd[t] = b_term + d_term + f_term
+    # Per-state time-independent constants, batched over states.
+    lm_psii_lm = torch.einsum("kqi,q,kqj->kij", state.lm, psii, state.lm)  # (K, kt, kt)
+    temp_all = lm_psii_lm + torch.einsum("q,kqij->kij", psii, state.lcov)  # (K, kt, kt)
+    b_term = (temp_all * state.xcov).sum(dim=(1, 2))  # (K,)
+    xcov_lat = state.xcov[:, 1:, 1:]  # (K, ldim, ldim)
+    d_term = torch.diagonal(xcov_lat, dim1=1, dim2=2).sum(dim=1)  # (K,)
+    chol = torch.linalg.cholesky(
+        xcov_lat + eye_eps * torch.eye(ldim, dtype=_DTYPE, device=psii.device)
+    )  # (K, ldim, ldim)
+    f_term = -2.0 * torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)  # (K,)
+    scalar_bd = b_term + d_term + f_term  # (K,)
 
     out: list[torch.Tensor] = []
     col = 0
     for sess in sessions:
         ti = sess.shape[1]
         yblk = sess.to(_DTYPE)  # (D, Ti)
-        log_obs = torch.empty(ti, state.n_states, dtype=_DTYPE, device=psii.device)
-        for t in range(state.n_states):
-            xm_blk = state.xm[t][:, col : col + ti]  # (kt, Ti)
-            lm_xm = state.lm[t] @ xm_blk  # (D, Ti)
-            a_term = (psii.unsqueeze(1) * yblk * (yblk - 2 * lm_xm)).sum(dim=0)  # (Ti,)
-            temp = temp_all[t]
-            c_term = (xm_blk * (temp @ xm_blk)).sum(dim=0)  # (Ti,)
-            e_term = (xm_blk[1:] * xm_blk[1:]).sum(dim=0)  # (Ti,)
-            log_obs[:, t] = -0.5 * (a_term + scalar_bd[t] + c_term + e_term)
-        out.append(log_obs)
+        xm_blk = state.xm[:, :, col : col + ti]  # (K, kt, Ti)
+        lm_xm = torch.einsum("kdi,kin->kdn", state.lm, xm_blk)  # (K, D, Ti)
+        a_term = torch.einsum("d,dn,kdn->kn", psii, yblk, yblk.unsqueeze(0) - 2 * lm_xm)  # (K, Ti)
+        c_term = (xm_blk * torch.einsum("kij,kjn->kin", temp_all, xm_blk)).sum(dim=1)  # (K, Ti)
+        e_term = (xm_blk[:, 1:, :] ** 2).sum(dim=1)  # (K, Ti)
+        log_obs = -0.5 * (a_term + scalar_bd.unsqueeze(1) + c_term + e_term)  # (K, Ti)
+        out.append(log_obs.T.contiguous())
         col += ti
     return out

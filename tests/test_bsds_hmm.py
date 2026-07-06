@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.dynamics.bsds.hmm import (
+    estep,
     expected_log_init,
     expected_log_transition,
     forward_backward,
@@ -64,6 +65,34 @@ def test_viterbi_matches_brute_force():
 
     path = viterbi(torch.tensor(np.log(b)), torch.tensor(a), torch.tensor(pi))
     assert np.array_equal(path.numpy(), path_bf)
+
+
+def test_estep_batched_matches_per_session():
+    """Grouped/batched E-step must match summing single-session forward-backward."""
+    rng = np.random.default_rng(3)
+    k = 4
+    wa = torch.tensor(np.stack([rng.uniform(1, 5, size=k) for _ in range(k)]), dtype=torch.float64)
+    wpi = torch.tensor(rng.uniform(1, 5, size=k), dtype=torch.float64)
+    # Mixed lengths, including a duplicate length so a group has >1 session.
+    lengths = [17, 17, 23, 5, 17]
+    sessions = [torch.tensor(rng.standard_normal((t, k)), dtype=torch.float64) for t in lengths]
+
+    gammas, xi_sum, gamma0, loglik = estep(sessions, wa, wpi)
+
+    log_a = expected_log_transition(wa)
+    log_pi = expected_log_init(wpi)
+    ref_xi = torch.zeros(k, k, dtype=torch.float64)
+    ref_g0 = torch.zeros(k, dtype=torch.float64)
+    ref_ll = torch.zeros((), dtype=torch.float64)
+    for i, lo in enumerate(sessions):
+        g, xi, ll = forward_backward(lo, log_a, log_pi)
+        torch.testing.assert_close(gammas[i], g)
+        ref_xi += xi
+        ref_g0 += g[0]
+        ref_ll += ll
+    torch.testing.assert_close(xi_sum, ref_xi)
+    torch.testing.assert_close(gamma0, ref_g0)
+    torch.testing.assert_close(loglik, ref_ll)
 
 
 def test_single_timepoint_no_xi():

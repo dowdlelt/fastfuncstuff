@@ -169,12 +169,22 @@ def fit_bsds(
     seed: int = 0,
     device: torch.device | None = None,
     show_progress: bool | None = None,
+    n_kmeans_replicates: int = 10,
+    kmeans_pca_dim: int | None = 20,
 ) -> BSDSModel:
     """Fit a group-level BSDS model to a list of preprocessed ``(D, N)`` sessions.
 
     ``max_ldim`` bounds the latent factor dimensionality (defaults to ``D - 1``);
-    ARD prunes it per state. ``n_init`` short restarts are run and the best by
-    free energy is continued to convergence.
+    ARD prunes it per state (this bounds the number of *states* returned only in
+    that ``n_states`` is itself an upper bound you choose — ARD never drops
+    states from the output, only shrinks each state's active factor count; see
+    ``[[BSDS]]``). ``n_init`` short restarts are run and the best by free energy
+    is continued to convergence.
+
+    ``n_kmeans_replicates`` and ``kmeans_pca_dim`` control the k-means
+    initialisation (per-session clustering, pooled — see
+    :mod:`fastfuncstuff.dynamics.bsds.init`); the PCA projection matters once
+    ``D`` is more than a couple dozen ROIs.
     """
     if len(sessions) == 0:
         raise ValueError("sessions is empty")
@@ -200,7 +210,16 @@ def fit_bsds(
         range(n_init), desc="bsds restarts", leave=True, disable=not show_progress or n_init == 1
     )
     for r in restart_bar:
-        state = init_state(y, lengths, n_states, ldim, seed=seed + r, device=device)
+        state = init_state(
+            y,
+            lengths,
+            n_states,
+            ldim,
+            seed=seed + r,
+            device=device,
+            n_kmeans_replicates=n_kmeans_replicates,
+            kmeans_pca_dim=kmeans_pca_dim,
+        )
         state, hist, _ = _run_vb(
             state, y, sessions, n_init_iter, tol, show_progress=False, desc="init"
         )
@@ -253,6 +272,17 @@ def fit_subject(
     state.nu_mcl = g.nu_mcl.clone()
     state.wa = g.wa.clone()
     state.wpi = g.wpi.clone()
+
+    # Seed responsibilities from the *group* emissions, not k-means: the point of
+    # warm-starting is that this session's states are already identified by the
+    # group loadings, and the first coordinate-ascent step (update_ql) reads
+    # state.qns before the first E-step would otherwise get to run. Using a
+    # k-means partition here can pull the warm-started loadings away from the
+    # group before the informative prior gets a chance to matter.
+    vb.update_qx(state, y)
+    log_obs = vb.compute_log_out_probs(state, [sess])
+    gammas, _xi, _g0, _ll = hmm.estep(log_obs, state.wa, state.wpi)
+    state.qns = torch.cat(gammas, dim=0)
 
     state, history, converged = _run_vb(
         state, y, [sess], n_iter, tol, show_progress, desc="bsds subject"

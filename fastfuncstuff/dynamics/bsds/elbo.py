@@ -56,50 +56,60 @@ def lower_bound(state: VBState, y: torch.Tensor) -> torch.Tensor:
     log_det_psi = torch.log(psii).sum()
     two_pi = torch.log(torch.tensor(2 * torch.pi, dtype=_DTYPE, device=y.device))
 
-    f_total = torch.zeros((), dtype=_DTYPE, device=y.device)
-    for t in range(s):
-        qn = state.qns[:, t]
-        neff = qn.sum()
-        temp_alt = state.xm[t] * qn  # (kt, N)
-        xcor = state.xcov[t] * neff + state.xm[t] @ temp_alt.T  # (kt, kt)
+    qns = state.qns  # (N, K)
+    neff = qns.sum(dim=0)  # (K,)
+    temp_alt = state.xm * qns.T.unsqueeze(1)  # (K, kt, N)
+    xcor = state.xcov * neff.view(-1, 1, 1) + torch.einsum(
+        "kin,kjn->kij", state.xm, temp_alt
+    )  # (K, kt, kt)
 
-        # Row 3: latent entropy / prior cross term.
-        chol = torch.linalg.cholesky(state.xcov[t][1:, 1:])
-        logdet_half = torch.log(torch.diagonal(chol)).sum()
-        f3 = 0.5 * neff * (kt - 1) - 0.5 * torch.diagonal(xcor[1:, 1:]).sum() + neff * logdet_half
+    # Row 3: latent entropy / prior cross term (batched over states).
+    xcov_lat = state.xcov[:, 1:, 1:]  # (K, ldim, ldim)
+    chol = torch.linalg.cholesky(xcov_lat)  # (K, ldim, ldim)
+    logdet_half = torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)  # (K,)
+    f3 = (
+        0.5 * neff * (kt - 1)
+        - 0.5 * torch.diagonal(xcor[:, 1:, 1:], dim1=1, dim2=2).sum(dim=1)
+        + neff * logdet_half
+    )  # (K,)
 
-        # Row 4: expected log-likelihood of the observations under state t.
-        lm_psii_lm = state.lm[t].T @ (psii.unsqueeze(1) * state.lm[t])  # (kt, kt)
-        sum_psii_lcov = torch.einsum("q,qij->ij", psii, state.lcov[t])  # (kt, kt)
-        lm_xm = state.lm[t] @ state.xm[t]  # (D, N)
-        data_quad = (psii * (qn * y * (y - 2 * lm_xm)).sum(dim=1)).sum()
-        f4 = (
-            -0.5 * neff * (-log_det_psi + p * two_pi)
-            - 0.5 * (lm_psii_lm * xcor.T).sum()
-            - 0.5 * (sum_psii_lcov * xcor.T).sum()
-            - 0.5 * data_quad
-        )
+    # Row 4: expected log-likelihood of the observations (batched over states).
+    lm_psii_lm = torch.einsum("kqi,q,kqj->kij", state.lm, psii, state.lm)  # (K, kt, kt)
+    sum_psii_lcov = torch.einsum("q,kqij->kij", psii, state.lcov)  # (K, kt, kt)
+    # data_quad[k] = sum_{d,n} psii_d Qns[n,k] y_dn (y_dn - 2 (Lm_k Xm_k)_dn).
+    # Contract D before N so the peak intermediate is (K, kt, N), never (K, D, N).
+    g = torch.einsum("q,qn->n", psii, y * y)  # (N,)
+    data_first = qns.T @ g  # (K,)
+    q_ = torch.einsum("q,qn,kqi->kin", psii, y, state.lm)  # (K, kt, N)
+    data_second = 2.0 * torch.einsum("nk,kin,kin->k", qns, state.xm, q_)  # (K,)
+    data_quad = data_first - data_second  # (K,)
+    xcor_t = xcor.transpose(1, 2)  # (K, kt, kt)
+    f4 = (
+        -0.5 * neff * (-log_det_psi + p * two_pi)
+        - 0.5 * (lm_psii_lm * xcor_t).sum(dim=(1, 2))
+        - 0.5 * (sum_psii_lcov * xcor_t).sum(dim=(1, 2))
+        - 0.5 * data_quad
+    )  # (K,)
 
-        # Row 6: -KL of the loading-precision ARD Gamma posterior.
-        f6 = -kl_gamma(state.a, state.b[t], PA, PB)
+    # Row 6: -KL of the loading-precision ARD Gamma posterior (per state).
+    f6 = -torch.stack([kl_gamma(state.a, state.b[t], PA, PB) for t in range(s)])  # (K,)
 
-        # Row 1: loading posterior entropy + ARD / mean-hyperprior cross terms.
-        priorln = torch.log(state.nu_mcl).sum() + p * (dig_a - torch.log(state.b[t])).sum()
-        a_over_b = state.a / state.b[t]  # (ldim,)
-        priornum = torch.empty(p, kt, dtype=_DTYPE, device=y.device)
-        priornum[:, 0] = state.nu_mcl
-        priornum[:, 1:] = a_over_b.unsqueeze(0)
-        sign, logabsdet = torch.linalg.slogdet(state.lcov[t])  # (D,) each
-        f1 = priorln + (logabsdet - kt).sum()
-        diag_lcov = torch.diagonal(state.lcov[t], dim1=1, dim2=2)  # (D, kt)
-        f1 = f1 - ((diag_lcov + state.lm[t] ** 2) * priornum).sum()
-        f1 = (
-            f1
-            - (state.nu_mcl * (-2 * state.lm[t][:, 0] * state.mean_mcl + state.mean_mcl**2)).sum()
-        )
-        f1 = 0.5 * f1
+    # Row 1: loading posterior entropy + ARD / mean-hyperprior cross terms.
+    priorln = torch.log(state.nu_mcl).sum() + p * (dig_a - torch.log(state.b)).sum(dim=1)  # (K,)
+    a_over_b = state.a / state.b  # (K, ldim)
+    priornum = torch.empty(s, p, kt, dtype=_DTYPE, device=y.device)
+    priornum[:, :, 0] = state.nu_mcl
+    priornum[:, :, 1:] = a_over_b.unsqueeze(1)
+    _sign, logabsdet = torch.linalg.slogdet(state.lcov)  # (K, D)
+    diag_lcov = torch.diagonal(state.lcov, dim1=2, dim2=3)  # (K, D, kt)
+    f1 = priorln + (logabsdet - kt).sum(dim=1)  # (K,)
+    f1 = f1 - ((diag_lcov + state.lm**2) * priornum).sum(dim=(1, 2))
+    f1 = f1 - (state.nu_mcl * (-2 * state.lm[:, :, 0] * state.mean_mcl + state.mean_mcl**2)).sum(
+        dim=1
+    )
+    f1 = 0.5 * f1  # (K,)
 
-        f_total = f_total + f1 + f3 + f4 + f6
+    f_total = (f1 + f3 + f4 + f6).sum()
 
     # Dirichlet HMM-parameter KL penalties.
     ua = torch.full((s,), ALPHA_A / s, dtype=_DTYPE, device=y.device)

@@ -88,6 +88,53 @@ def forward_backward(
     return gamma, xi_sum, loglik
 
 
+def forward_backward_batched(
+    log_obs: torch.Tensor,
+    log_a: torch.Tensor,
+    log_pi: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward-backward for a batch of equal-length sessions in one pass.
+
+    ``log_obs`` is ``(B, T, K)`` (``B`` sessions of the same length ``T``). This
+    is the identical recursion as :func:`forward_backward`, vectorised over the
+    session axis so the sequential time loop runs once for the whole batch
+    instead of once per session — the sequential-tiny-op dispatch overhead
+    (dominant on CPU) is amortised across all sessions.
+
+    Returns ``(gamma (B, T, K), xi_sum (K, K), loglik_sum scalar,
+    gamma0_sum (K,))`` — the pairwise/initial statistics already summed over the
+    batch (their consumers only need the totals).
+    """
+    b, t_len, k = log_obs.shape
+    log_alpha = torch.empty_like(log_obs)
+    log_alpha[:, 0] = log_pi + log_obs[:, 0]
+    for t in range(1, t_len):
+        # alpha[b, t, j] = obs[b, t, j] + logsumexp_i(alpha[b, t-1, i] + A[i, j])
+        prev = log_alpha[:, t - 1].unsqueeze(2) + log_a  # (B, K_i, K_j)
+        log_alpha[:, t] = log_obs[:, t] + torch.logsumexp(prev, dim=1)
+    loglik = torch.logsumexp(log_alpha[:, -1], dim=1)  # (B,)
+
+    log_beta = torch.zeros_like(log_obs)
+    for t in range(t_len - 2, -1, -1):
+        # beta[b, t, i] = logsumexp_j(A[i, j] + obs[b, t+1, j] + beta[b, t+1, j])
+        nxt = log_a + (log_obs[:, t + 1] + log_beta[:, t + 1]).unsqueeze(1)  # (B, K_i, K_j)
+        log_beta[:, t] = torch.logsumexp(nxt, dim=2)
+
+    gamma = torch.softmax(log_alpha + log_beta, dim=2)  # (B, T, K)
+
+    if t_len > 1:
+        log_xi = (
+            log_alpha[:, :-1].unsqueeze(3) + log_a + (log_obs[:, 1:] + log_beta[:, 1:]).unsqueeze(2)
+        )  # (B, T-1, K_i, K_j)
+        log_xi = log_xi - torch.logsumexp(log_xi.reshape(b, t_len - 1, -1), dim=2).view(
+            b, t_len - 1, 1, 1
+        )
+        xi_sum = log_xi.exp().sum(dim=(0, 1))  # (K, K)
+    else:
+        xi_sum = torch.zeros(k, k, dtype=log_obs.dtype, device=log_obs.device)
+    return gamma, xi_sum, loglik.sum(), gamma[:, 0].sum(dim=0)
+
+
 def estep(
     session_log_obs: list[torch.Tensor],
     wa: torch.Tensor,
@@ -98,19 +145,34 @@ def estep(
     Returns per-session ``gamma`` responsibilities, the transition and initial
     sufficient statistics ``(xi_sum (K,K), gamma0_sum (K,))`` needed to update
     the Dirichlet posteriors, and the total evidence ``loglik``.
+
+    Sessions are grouped by length and each length-group is run as one batched
+    forward-backward pass (see :func:`forward_backward_batched`); with fMRI runs
+    that are nearly all the same length this collapses ~N sequential time-loops
+    into one or two, the single biggest CPU speedup in the VB iteration.
     """
     log_a = expected_log_transition(wa)
     log_pi = expected_log_init(wpi)
     k = wa.shape[0]
-    gammas: list[torch.Tensor] = []
-    xi_total = torch.zeros(k, k, dtype=wa.dtype, device=wa.device)
-    gamma0_total = torch.zeros(k, dtype=wa.dtype, device=wa.device)
-    loglik = torch.zeros((), dtype=wa.dtype, device=wa.device)
-    for log_obs in session_log_obs:
-        gamma, xi_sum, ll = forward_backward(log_obs.to(wa.dtype), log_a, log_pi)
-        gammas.append(gamma)
+    dtype, device = wa.dtype, wa.device
+
+    groups: dict[int, list[int]] = {}
+    for i, lo in enumerate(session_log_obs):
+        groups.setdefault(int(lo.shape[0]), []).append(i)
+
+    n = len(session_log_obs)
+    zero_gamma = torch.zeros(0, k, dtype=dtype, device=device)
+    gammas: list[torch.Tensor] = [zero_gamma] * n
+    xi_total = torch.zeros(k, k, dtype=dtype, device=device)
+    gamma0_total = torch.zeros(k, dtype=dtype, device=device)
+    loglik = torch.zeros((), dtype=dtype, device=device)
+    for idxs in groups.values():
+        stack = torch.stack([session_log_obs[i].to(dtype) for i in idxs], dim=0)  # (B, T, K)
+        gamma, xi_sum, ll, gamma0 = forward_backward_batched(stack, log_a, log_pi)
+        for pos, i in enumerate(idxs):
+            gammas[i] = gamma[pos]
         xi_total = xi_total + xi_sum
-        gamma0_total = gamma0_total + gamma[0]
+        gamma0_total = gamma0_total + gamma0
         loglik = loglik + ll
     return gammas, xi_total, gamma0_total, loglik
 
