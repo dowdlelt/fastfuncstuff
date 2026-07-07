@@ -205,3 +205,33 @@ def test_temporal_diagnostics_flags_run_mispairing():
     assert diag.identity_agreement < 0.6
     assert diag.run_permuted_agreement > 0.999
     assert list(diag.run_permutation) == list(run_perm)
+
+
+def test_plot_map_comparison_writes_file(tmp_path):
+    from fastfuncstuff.dynamics.bsds.matlab_compare import plot_map_comparison
+
+    rng = np.random.default_rng(7)
+    k, d = 4, 6
+    covs = np.stack([_spd(rng, d) for _ in range(k)])
+    vit = np.concatenate([np.full(n, s) for s, n in zip(range(k), [30, 25, 20, 15], strict=True)])
+    occ = np.bincount(vit, minlength=k) / vit.size
+    perm = np.array([1, 0, 3, 2])
+    inv = np.array([int(np.where(perm == s)[0][0]) for s in range(k)])
+    mat = MatlabBSDS(
+        occupancy=occ[perm],
+        lifetime=np.ones(k),
+        state_covs=covs[perm],
+        state_means=np.zeros((k, d)),
+        transition=np.eye(k),
+        viterbi_states=[np.array([inv[s] for s in vit])],
+    )
+    ffs = SimpleNamespace(
+        state_covs=torch.tensor(covs),
+        state_means=torch.tensor(np.zeros((k, d))),
+        transition=torch.tensor(np.eye(k)),
+        viterbi_states=[torch.tensor(vit)],
+    )
+    res = compare_to_matlab(ffs, mat)
+    out = plot_map_comparison(ffs, mat, res, str(tmp_path / "map.png"))
+    assert (tmp_path / "map.png").exists() and (tmp_path / "map.png").stat().st_size > 0
+    assert out == str(tmp_path / "map.png")

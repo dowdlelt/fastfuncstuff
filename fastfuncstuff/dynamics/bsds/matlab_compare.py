@@ -333,6 +333,90 @@ def temporal_diagnostics(
     )
 
 
+def plot_map_comparison(
+    ffs_model,
+    matlab: MatlabBSDS,
+    result: ComparisonResult,
+    path: str | None = None,
+    *,
+    tr: float = 1.0,
+    max_runs: int | None = None,
+):
+    """Stacked MAP ribbons for both fits, relabelled into shared (ffs) colors.
+
+    Left = ffs, middle = MATLAB (states recolored to their matched ffs state via
+    ``result``), right = per-frame agreement (green=same, red=differ). Runs share
+    rows and the time axis, so you can read the failure mode directly: matching
+    block structure but different *rows* means mis-paired runs; a diagonal streak
+    in the agreement strip means a frame offset; similar blocks that simply
+    disagree frame-to-frame means genuine temporal non-identifiability.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.colors import ListedColormap
+
+    from fastfuncstuff.dynamics.plots import _thinned_state_labels, state_colors
+
+    k = _to_np(ffs_model.state_covs).shape[0]
+    mat2ffs = np.full(matlab.state_covs.shape[0], -1, dtype=np.int64)
+    mat2ffs[result.matlab_state] = result.ffs_state
+    ffs_paths = [_to_np(v).astype(np.int64) for v in ffs_model.viterbi_states]
+    mat_paths = [mat2ffs[np.asarray(v, dtype=np.int64)] for v in matlab.viterbi_states]
+    n = min(len(ffs_paths), len(mat_paths))
+    if max_runs is not None:
+        n = min(n, max_runs)
+    ffs_paths, mat_paths = ffs_paths[:n], mat_paths[:n]
+    max_t = max(max(p.shape[0] for p in ffs_paths), max(p.shape[0] for p in mat_paths))
+
+    ffs_grid = np.full((n, max_t), np.nan)
+    mat_grid = np.full((n, max_t), np.nan)
+    agree_grid = np.full((n, max_t), np.nan)
+    for i in range(n):
+        fp, mp = ffs_paths[i], mat_paths[i]
+        ffs_grid[i, : fp.shape[0]] = fp
+        mat_grid[i, : mp.shape[0]] = np.where(mp >= 0, mp, np.nan)
+        t = min(fp.shape[0], mp.shape[0])
+        valid = mp[:t] >= 0
+        agree_grid[i, :t] = np.where(valid, (fp[:t] == mp[:t]).astype(float), np.nan)
+
+    state_cmap = ListedColormap(state_colors(k))
+    state_cmap.set_bad(alpha=0.0)
+    agree_cmap = ListedColormap(["#d64545", "#1baf7a"])  # differ / agree
+    agree_cmap.set_bad(alpha=0.0)
+    extent = (0, max_t * (tr if tr else 1.0), n, 0)
+    kw = dict(aspect="auto", extent=extent, interpolation="nearest")
+
+    fig = plt.figure(figsize=(15, max(3, 0.18 * n + 1.2)), facecolor="#fcfcfb")
+    gs = fig.add_gridspec(1, 3, wspace=0.18)
+    a0 = fig.add_subplot(gs[0, 0])
+    im0 = a0.imshow(ffs_grid, cmap=state_cmap, vmin=-0.5, vmax=k - 0.5, **kw)
+    a0.set_title("ffs MAP")
+    a0.set_ylabel("run")
+    a1 = fig.add_subplot(gs[0, 1])
+    a1.imshow(mat_grid, cmap=state_cmap, vmin=-0.5, vmax=k - 0.5, **kw)
+    a1.set_title("MATLAB MAP (matched colors)")
+    a2 = fig.add_subplot(gs[0, 2])
+    a2.imshow(agree_grid, cmap=agree_cmap, vmin=-0.5, vmax=1.5, **kw)
+    frac = float(np.nanmean(agree_grid)) if np.isfinite(agree_grid).any() else float("nan")
+    a2.set_title(f"agreement (green={frac:.2f})")
+    for ax in (a0, a1, a2):
+        ax.set_xlabel("time (s)" if tr and tr != 1.0 else "TR")
+
+    idx, labels = _thinned_state_labels(k)
+    cb = fig.colorbar(im0, ax=a1, fraction=0.03, pad=0.02, ticks=idx)
+    cb.ax.set_yticklabels(labels, fontsize=7)
+    cb.set_label("state", fontsize=8)
+
+    fig.suptitle("ffs vs MATLAB — MAP state per run", fontsize=13, y=1.04)
+    if path:
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#fcfcfb")
+        plt.close(fig)
+        return path
+    return fig
+
+
 def plot_comparison(
     result: ComparisonResult, path: str | None = None, *, occ_threshold: float = 1e-3
 ):
