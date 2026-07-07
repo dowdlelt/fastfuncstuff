@@ -39,3 +39,28 @@ def test_save_load_roundtrip_decodes_identically(tmp_path):
     assert abs(dec_ref.loglik - dec_loaded.loglik) < 1e-6
     for a, b in zip(dec_ref.viterbi_states, dec_loaded.viterbi_states, strict=True):
         assert torch.equal(a, b)
+
+
+def test_loaded_model_is_full_standin_for_qc(tmp_path):
+    # A reloaded model must feed compute_state_stats/QC without refitting: the
+    # training Viterbi/responsibilities and convergence info round-trip too.
+    from fastfuncstuff.dynamics.states import compute_state_stats
+
+    train = _make_sessions(1)
+    model = fit_bsds(train, n_states=4, max_ldim=3, n_init=2, n_iter=25, seed=0)
+    path = str(tmp_path / "m.npz")
+    save_bsds_model(model, path)
+    loaded = load_bsds_model(path)
+
+    assert len(loaded.viterbi_states) == len(model.viterbi_states)
+    for a, b in zip(loaded.viterbi_states, model.viterbi_states, strict=True):
+        assert torch.equal(a, b)
+    assert loaded.converged == model.converged
+    assert len(loaded.objective_history) == len(model.objective_history)
+
+    s_ref = compute_state_stats(model, tr=1.0)
+    s_load = compute_state_stats(loaded, tr=1.0)
+    import numpy as np
+
+    np.testing.assert_allclose(s_load.group_occupancy, s_ref.group_occupancy)
+    assert s_load.effective_state_count == s_ref.effective_state_count

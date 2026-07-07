@@ -167,10 +167,13 @@ def _finalize(state: VBState, y: torch.Tensor, sessions: list[torch.Tensor]) -> 
 def posterior_arrays(model: BSDSModel) -> dict:
     """The arrays needed to persist a fit and later reconstruct it for :func:`decode`.
 
-    Includes the reportable fields (means/covs/loadings/transition/AR/ARD) plus the
+    Includes the reportable fields (means/covs/loadings/transition/AR/ARD), the
     variational-posterior pieces the reportable set drops — ``lcov``, the ARD
     ``a``/``b``, the mean hyperprior, and the *unnormalised* Dirichlet ``wa``/``wpi``
-    (``transition`` alone loses the concentration magnitude). :func:`load_bsds_model`
+    (``transition`` alone loses the concentration magnitude) — and the training
+    decode (concatenated responsibilities + Viterbi paths, split back per run on
+    load) plus convergence info, so a reloaded model is a full stand-in for the
+    original (QC, stats, comparisons) and not just decode-ready. :func:`load_bsds_model`
     reads exactly these keys.
     """
     s = model.state
@@ -178,6 +181,16 @@ def posterior_arrays(model: BSDSModel) -> dict:
     def np_(t):
         return t.detach().cpu().numpy()
 
+    resp = (
+        torch.cat(model.responsibilities).detach().cpu().numpy()
+        if model.responsibilities
+        else np.zeros((0, model.n_states))
+    )
+    vit = (
+        torch.cat(model.viterbi_states).detach().cpu().numpy().astype(np.int64)
+        if model.viterbi_states
+        else np.zeros((0,), dtype=np.int64)
+    )
     return {
         "n_states": np.array(model.n_states),
         "ldim": np.array(model.ldim),
@@ -199,6 +212,10 @@ def posterior_arrays(model: BSDSModel) -> dict:
         "post_nu_mcl": np_(s.nu_mcl),
         "post_wa": np_(s.wa),
         "post_wpi": np_(s.wpi),
+        "responsibilities": resp,
+        "viterbi": vit,
+        "converged": np.array(bool(model.converged)),
+        "objective_history": np.array(model.objective_history, dtype=float),
     }
 
 
@@ -210,9 +227,11 @@ def save_bsds_model(model: BSDSModel, path: str) -> str:
 
 def load_bsds_model(path: str, *, device: torch.device | str | None = None) -> BSDSModel:
     """Reconstruct a :class:`BSDSModel` from :func:`save_bsds_model` (or the run's
-    ``*_model.npz``), sufficient for :func:`decode` and inspecting the fitted
-    parameters. The training responsibilities/Viterbi paths are not restored (a
-    loaded model is for decoding new data, not re-QC-ing the training runs).
+    ``*_model.npz``) as a full stand-in for the original fit: usable for
+    :func:`decode`, :func:`~fastfuncstuff.dynamics.states.compute_state_stats`, QC
+    plots, and the MATLAB cross-check, without refitting. The training
+    responsibilities and Viterbi paths are restored (split per run), as are the
+    convergence flag and free-energy history.
     """
     z = np.load(path)
     dev = torch.device("cpu") if device is None else torch.device(device)
@@ -224,6 +243,19 @@ def load_bsds_model(path: str, *, device: torch.device | str | None = None) -> B
 
     def t(name):
         return torch.tensor(z[name], dtype=_DTYPE, device=dev)
+
+    # Split the concatenated training decode back into per-run tensors (CPU, like
+    # the reportable fields). Older files without these keys load as empty lists.
+    responsibilities: list[torch.Tensor] = []
+    viterbi_states: list[torch.Tensor] = []
+    resp_all = z["responsibilities"] if "responsibilities" in z else np.zeros((0, k))
+    vit_all = z["viterbi"] if "viterbi" in z else np.zeros((0,), dtype=np.int64)
+    if resp_all.shape[0] == sum(lengths) and resp_all.shape[0] > 0:
+        col = 0
+        for length in lengths:
+            responsibilities.append(torch.tensor(resp_all[col : col + length], dtype=_DTYPE))
+            viterbi_states.append(torch.tensor(vit_all[col : col + length], dtype=torch.long))
+            col += length
 
     state_means = t("state_means")  # (K, D)
     loadings = t("loadings")  # (K, D, ldim)
@@ -259,16 +291,16 @@ def load_bsds_model(path: str, *, device: torch.device | str | None = None) -> B
         state_covs=t("state_covs").cpu(),
         transition=t("transition").cpu(),
         init_probs=t("init_probs").cpu(),
-        responsibilities=[],
-        viterbi_states=[],
+        responsibilities=responsibilities,
+        viterbi_states=viterbi_states,
         ar_transitions=t("ar_transitions").cpu(),
         ar_noise_cov=t("ar_noise_cov").cpu(),
         effective_dim=t("effective_dim").cpu(),
         ard_precision=t("ard_precision").cpu(),
         loadings=loadings.cpu(),
         psii=t("psii").cpu(),
-        objective_history=[],
-        converged=False,
+        objective_history=(z["objective_history"].tolist() if "objective_history" in z else []),
+        converged=bool(z["converged"]) if "converged" in z else False,
         state=state,
     )
 
