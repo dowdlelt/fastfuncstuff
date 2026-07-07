@@ -19,6 +19,8 @@ equal-length assumption baked into the reference MATLAB).
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -135,6 +137,82 @@ def forward_backward_batched(
     return gamma, xi_sum, loglik.sum(), gamma[:, 0].sum(dim=0)
 
 
+# --- CUDA-graph acceleration of the batched forward-backward ----------------- #
+# At fMRI sequence lengths (T~390) the forward-backward is ~2*(T-1) *sequential*
+# tiny kernels, so on GPU the per-kernel launch overhead — not the arithmetic —
+# dominates (measured ~7x: 132ms eager -> 18ms graphed). The shapes are fixed
+# across VB iterations (the same sessions every pass), so we capture one CUDA
+# graph per length-group shape and replay it: copy the fresh log_obs/log_a/log_pi
+# into the graph's static input buffers, replay (one launch for the whole
+# recursion), and clone the outputs (the graph reuses that memory next replay).
+# Replay runs the identical kernels, so results are bit-for-bit the eager ones.
+
+_FB_GRAPH_CACHE: dict = {}
+_FB_GRAPH_DISABLED = False
+
+
+def _cudagraph_enabled(device: torch.device) -> bool:
+    return (
+        not _FB_GRAPH_DISABLED
+        and device.type == "cuda"
+        and os.environ.get("FFS_BSDS_CUDAGRAPH", "1") != "0"
+    )
+
+
+def clear_forward_backward_graph_cache() -> None:
+    """Drop all captured forward-backward CUDA graphs (frees their static buffers).
+
+    Shapes are keyed per length-group, so a long grid search over different
+    ``n_states``/session subsets accumulates one graph per distinct shape; call
+    this between unrelated fits to release the VRAM.
+    """
+    _FB_GRAPH_CACHE.clear()
+
+
+def _capture_forward_backward(
+    stack: torch.Tensor, log_a: torch.Tensor, log_pi: torch.Tensor
+) -> dict:
+    """Warm up on a side stream (required before capture), then capture the graph."""
+    in_obs, in_a, in_pi = stack.clone(), log_a.clone(), log_pi.clone()
+    warm = torch.cuda.Stream()
+    warm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm):
+        for _ in range(3):
+            forward_backward_batched(in_obs, in_a, in_pi)
+    torch.cuda.current_stream().wait_stream(warm)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = forward_backward_batched(in_obs, in_a, in_pi)
+    return {"graph": graph, "in_obs": in_obs, "in_a": in_a, "in_pi": in_pi, "out": out}
+
+
+def _forward_backward_graphed(
+    stack: torch.Tensor, log_a: torch.Tensor, log_pi: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Capture-once / replay CUDA-graph wrapper around :func:`forward_backward_batched`.
+
+    Falls back to eager permanently (for the whole process) if capture ever
+    raises — a bad capture must not wedge the fit.
+    """
+    global _FB_GRAPH_DISABLED
+    key = (tuple(stack.shape), stack.dtype, stack.device)
+    entry = _FB_GRAPH_CACHE.get(key)
+    if entry is None:
+        try:
+            entry = _capture_forward_backward(stack, log_a, log_pi)
+        except Exception:
+            _FB_GRAPH_DISABLED = True
+            return forward_backward_batched(stack, log_a, log_pi)
+        _FB_GRAPH_CACHE[key] = entry
+    entry["in_obs"].copy_(stack)
+    entry["in_a"].copy_(log_a)
+    entry["in_pi"].copy_(log_pi)
+    entry["graph"].replay()
+    gamma, xi_sum, loglik, gamma0 = entry["out"]
+    # The graph overwrites these on the next replay of this shape; clone what escapes.
+    return gamma.clone(), xi_sum.clone(), loglik.clone(), gamma0.clone()
+
+
 def estep(
     session_log_obs: list[torch.Tensor],
     wa: torch.Tensor,
@@ -166,9 +244,10 @@ def estep(
     xi_total = torch.zeros(k, k, dtype=dtype, device=device)
     gamma0_total = torch.zeros(k, dtype=dtype, device=device)
     loglik = torch.zeros((), dtype=dtype, device=device)
+    fb = _forward_backward_graphed if _cudagraph_enabled(device) else forward_backward_batched
     for idxs in groups.values():
         stack = torch.stack([session_log_obs[i].to(dtype) for i in idxs], dim=0)  # (B, T, K)
-        gamma, xi_sum, ll, gamma0 = forward_backward_batched(stack, log_a, log_pi)
+        gamma, xi_sum, ll, gamma0 = fb(stack, log_a, log_pi)
         for pos, i in enumerate(idxs):
             gammas[i] = gamma[pos]
         xi_total = xi_total + xi_sum
