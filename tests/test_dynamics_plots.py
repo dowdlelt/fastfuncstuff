@@ -83,3 +83,26 @@ def test_analysis_report_writes_png(tmp_path):
     out = tmp_path / "sub_analysis.png"
     analysis_report(model, gm, ss, out, tr=0.72)
     assert out.exists() and out.stat().st_size > 5000
+
+
+def test_display_helpers_do_not_leak_open_figures(tmp_path):
+    # Figure-returning helpers must close the pyplot-managed figure before
+    # returning it, or %matplotlib inline renders it twice (repr + post-cell
+    # auto-flush) — the "two images per cell" / slow-scroll bug. We assert the
+    # returned Figure is not left in pyplot's registry (so inline can't
+    # double-show it) while still being renderable.
+    from io import BytesIO
+
+    import matplotlib.pyplot as plt
+    from matplotlib._pylab_helpers import Gcf
+
+    from fastfuncstuff.dynamics.plots import plot_state_fc, plot_state_ribbons
+
+    model, stats = _fit()
+    for make in (lambda: plot_state_ribbons(model), lambda: plot_state_fc(stats)):
+        plt.close("all")
+        fig = make()
+        assert fig not in [m.canvas.figure for m in Gcf.get_all_fig_managers()]
+        buf = BytesIO()
+        fig.savefig(buf, format="png")  # closed figure still renders once
+        assert buf.getbuffer().nbytes > 1000

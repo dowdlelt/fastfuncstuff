@@ -156,15 +156,57 @@ def _run_time_axis(n: int, tr: float) -> tuple[np.ndarray, str]:
 # --------------------------------------------------------------------------- #
 
 
+def _display_fig(fig):
+    """Return a figure for notebook display without the ``%matplotlib inline``
+    double-render.
+
+    A figure created via pyplot lives in pyplot's registry, so the inline
+    backend auto-displays it in the post-cell flush. If the same figure is also
+    the cell's return value it renders a second time via its repr — two
+    identical images, and double the scroll/render cost. Closing it drops it
+    from the registry (killing the auto-flush copy) while the returned Figure
+    still renders once via its repr (a closed Figure is fully renderable). Only
+    call this on figures the helper created, never on a caller-supplied one.
+    """
+    plt.close(fig)
+    return fig
+
+
 def plot_convergence(model, ax) -> None:
-    """Free-energy trace over VB iterations (a single series — no legend)."""
+    """Free-energy trace over VB iterations, with the weights-change signal.
+
+    Left axis: free energy F (the restart-selection objective). Right axis (log
+    scale, when available): the reference's weights convergence signal — the L1
+    change in per-state responsibility mass per iteration, ``sum(|Δ occupancy|)``
+    — which is what the ``weights`` ``-criterion`` actually stops on. F can
+    plateau (looks converged) while occupancy is still migrating out of
+    redundant states, so the weights curve is the more honest read on whether the
+    state configuration has settled. The weights series is omitted for models
+    loaded from disk that were saved without it.
+    """
     hist = np.asarray(model.objective_history, dtype=float)
-    ax.plot(np.arange(1, len(hist) + 1), hist, color="#0d366b", linewidth=2)
+    ax.plot(np.arange(1, len(hist) + 1), hist, color="#0d366b", linewidth=2, label="free energy F")
     ax.set_xlabel("VB iteration")
-    ax.set_ylabel("free energy F")
+    ax.set_ylabel("free energy F", color="#0d366b")
+    ax.tick_params(axis="y", colors="#0d366b")
     status = "converged" if getattr(model, "converged", False) else "max-iter"
     ax.set_title(f"Convergence ({status}, {len(hist)} iters)")
     _style_axes(ax)
+
+    dw = np.asarray(getattr(model, "weights_history", []) or [], dtype=float)
+    # Iteration 0 is nan (no predecessor); plot from iteration 2 onward.
+    if dw.size > 1 and np.isfinite(dw[1:]).any():
+        ax2 = ax.twinx()
+        it = np.arange(1, dw.size + 1)
+        ax2.plot(it[1:], dw[1:], color="#e07a33", linewidth=1.6, alpha=0.9, label="Δ weights")
+        ax2.set_yscale("log")
+        ax2.set_ylabel("Σ|Δ occupancy|", color="#e07a33")
+        ax2.tick_params(axis="y", colors="#e07a33")
+        for side in ("top",):
+            ax2.spines[side].set_visible(False)
+        # One combined legend for the two axes.
+        lines = ax.get_lines() + ax2.get_lines()
+        ax.legend(lines, [ln.get_label() for ln in lines], frameon=False, fontsize=8, loc="best")
 
 
 def plot_state_timecourses(model, run_idx, ax, tr: float = 1.0) -> None:
@@ -290,7 +332,7 @@ def plot_state_ribbons(
         fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
         plt.close(fig)
         return str(path)
-    return fig
+    return _display_fig(fig)
 
 
 def plot_transition_matrix(model, ax) -> None:
@@ -462,6 +504,7 @@ def plot_state_fc(stats, fig=None):
     k = fc.shape[0]
     ncol = min(k, 4)
     nrow = (k + ncol - 1) // ncol
+    created = fig is None
     if fig is None:
         fig, axes = plt.subplots(nrow, ncol, figsize=(3 * ncol, 3 * nrow))
     else:
@@ -482,13 +525,14 @@ def plot_state_fc(stats, fig=None):
         cb.ax.tick_params(labelsize=7, colors=_INK2)
         cb.set_label("correlation", color=_INK2, fontsize=8)
     fig.suptitle("Per-state functional connectivity", color=_INK, fontsize=11)
-    return fig
+    return _display_fig(fig) if created else fig
 
 
 def plot_graph_metrics(gm, fig=None):
     """Per-state graph-theoretic summary: integration, segregation, node strength."""
     k = gm.n_states
     colors = state_colors(k)
+    created = fig is None
     if fig is None:
         fig = plt.figure(figsize=(10, 3.2), facecolor=_SURFACE)
     gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.4], wspace=0.42)
@@ -512,7 +556,7 @@ def plot_graph_metrics(gm, fig=None):
     cb = fig.colorbar(im, ax=a2, fraction=0.046, pad=0.04)
     cb.ax.tick_params(labelsize=7, colors=_INK2)
     fig.suptitle("Per-state network metrics", color=_INK, fontsize=11)
-    return fig
+    return _display_fig(fig) if created else fig
 
 
 def plot_switch_rate_over_time(model, ax, run_idx: int = 0, window: int = 20, tr: float = 1.0):
@@ -646,7 +690,7 @@ def plot_selection_surface(results, path: str | Path | None = None):
         fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
         plt.close(fig)
         return str(path)
-    return fig
+    return _display_fig(fig)
 
 
 def plot_state_stability(result, path: str | Path | None = None, *, occ_threshold: float = 1e-3):
@@ -694,7 +738,7 @@ def plot_state_stability(result, path: str | Path | None = None, *, occ_threshol
         fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=_SURFACE)
         plt.close(fig)
         return str(path)
-    return fig
+    return _display_fig(fig)
 
 
 # --------------------------------------------------------------------------- #
