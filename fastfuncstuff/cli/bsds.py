@@ -192,6 +192,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restarts per fit during -select (kept modest; the final fit uses -n_init).",
     )
     p.add_argument(
+        "-select_jobs",
+        "-select-jobs",
+        type=int,
+        default=1,
+        help="Parallel grid-point fits during -select (spawn process pool). >1 time-slices "
+        "one GPU or splits CPU cores across workers; results are identical to serial.",
+    )
+    p.add_argument(
         "-stability",
         type=int,
         default=0,
@@ -388,6 +396,7 @@ def _run_selection(sessions, args, device, stem: str):
         l_grid,
         n_folds=args.select_folds,
         n_init=args.select_n_init,
+        n_jobs=args.select_jobs,
         device=device,
         show_progress=True,
     )

@@ -18,6 +18,7 @@ guess for the other can pick a spuriously bad value for the one held fixed.
 from __future__ import annotations
 
 import itertools
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -93,12 +94,31 @@ def loro_held_out_loglik(
     )
 
 
+# Set once per worker process (via the pool initializer) so the sessions payload
+# is pickled to each worker a single time, not re-shipped for every grid point.
+_WORKER_SESSIONS: list[torch.Tensor] | None = None
+
+
+def _grid_worker_init(sessions: list[torch.Tensor], num_threads: int | None) -> None:
+    global _WORKER_SESSIONS
+    if num_threads is not None and num_threads >= 1:
+        torch.set_num_threads(num_threads)
+    _WORKER_SESSIONS = sessions
+
+
+def _grid_worker(task: tuple[int, int, dict]) -> GridResult:
+    n_states, max_ldim, kwargs = task
+    assert _WORKER_SESSIONS is not None  # set by _grid_worker_init
+    return loro_held_out_loglik(_WORKER_SESSIONS, n_states, max_ldim, **kwargs)
+
+
 def grid_search_bsds(
     sessions: list[torch.Tensor],
     n_states_grid: list[int],
     max_ldim_grid: list[int],
     *,
     show_progress: bool = True,
+    n_jobs: int = 1,
     **kwargs,
 ) -> list[GridResult]:
     """Held-out log-likelihood over a ``(n_states, max_ldim)`` grid, best first.
@@ -107,12 +127,57 @@ def grid_search_bsds(
     ``n_init``, ``n_iter``, ``device``, ...). Keep ``n_folds`` and ``n_init``
     modest for the initial coarse pass — this is ``len(grid) * n_folds`` full
     fits — then re-run the top candidates with a larger budget to confirm.
+
+    ``n_jobs > 1`` runs grid points concurrently in a ``spawn`` process pool
+    (``fork`` cannot carry a live CUDA context). The grid points are independent
+    fits, so this is embarrassingly parallel. On a single GPU the workers
+    time-slice the card — worthwhile when one fit leaves it underused; on CPU
+    each worker gets ``cpu_count // n_jobs`` threads. Results are identical to
+    the sequential path (each grid point is deterministic in its seed); only the
+    completion order differs, and the final list is sorted regardless.
     """
     from tqdm.auto import tqdm
 
     combos = list(itertools.product(n_states_grid, max_ldim_grid))
+    n_jobs = max(1, min(n_jobs, len(combos)))
+
+    if n_jobs == 1:
+        results = [
+            loro_held_out_loglik(sessions, n_states, max_ldim, **kwargs)
+            for n_states, max_ldim in tqdm(
+                combos, desc="bsds grid search", disable=not show_progress
+            )
+        ]
+        results.sort(key=lambda r: r.per_timepoint_loglik, reverse=True)
+        return results
+
+    # Parallel: ship sessions on CPU (CUDA tensors don't pickle across spawn;
+    # fit_bsds/decode move to `device` internally), one copy per worker.
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    cpu_sessions = [s.detach().to("cpu") for s in sessions]
+    device = kwargs.get("device")
+    on_gpu = device is not None and str(device) != "cpu"
+    # GPU workers: keep host dispatch lean (1 thread) so they don't oversubscribe
+    # cores fighting to launch kernels. CPU workers: split the cores evenly.
+    num_threads = 1 if on_gpu else max(1, (os.cpu_count() or 1) // n_jobs)
+
+    tasks = [(n_states, max_ldim, kwargs) for n_states, max_ldim in combos]
     results = []
-    for n_states, max_ldim in tqdm(combos, desc="bsds grid search", disable=not show_progress):
-        results.append(loro_held_out_loglik(sessions, n_states, max_ldim, **kwargs))
+    with ProcessPoolExecutor(
+        max_workers=n_jobs,
+        mp_context=mp.get_context("spawn"),
+        initializer=_grid_worker_init,
+        initargs=(cpu_sessions, num_threads),
+    ) as pool:
+        futures = [pool.submit(_grid_worker, t) for t in tasks]
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="bsds grid search",
+            disable=not show_progress,
+        ):
+            results.append(fut.result())
     results.sort(key=lambda r: r.per_timepoint_loglik, reverse=True)
     return results
