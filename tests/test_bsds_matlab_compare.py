@@ -80,17 +80,30 @@ def test_compare_recovers_permutation():
     vit = np.concatenate([np.full(n, s) for s, n in zip(range(k), [40, 30, 20, 10], strict=True)])
     ffs_occ = np.bincount(vit, minlength=k) / vit.size
 
+    # A distinctive per-state activation profile and transition matrix so the
+    # matched activation/transition correlations are meaningful.
+    means = rng.standard_normal((k, d))
+    trans = np.full((k, k), 0.1) + 0.6 * np.eye(k)
+    trans /= trans.sum(1, keepdims=True)
+    lifetime = np.array([4.0, 3.0, 2.0, 1.0])
+
     # MATLAB fit = a relabelling of the same states by perm (state j = ffs perm[j]).
     perm = np.array([2, 0, 3, 1])
+    inv = np.array([int(np.where(perm == s)[0][0]) for s in range(k)])  # ffs state -> mat label
     mat = MatlabBSDS(
         occupancy=ffs_occ[perm],
-        lifetime=np.zeros(k),
+        lifetime=lifetime[perm],
         state_covs=covs[perm],
-        state_means=np.zeros((k, d)),
-        transition=np.eye(k),
-        viterbi_states=[np.array([int(np.where(perm == s)[0][0]) for s in vit])],
+        state_means=means[perm],
+        transition=trans[np.ix_(perm, perm)],
+        viterbi_states=[np.array([inv[s] for s in vit])],
     )
-    ffs = SimpleNamespace(state_covs=torch.tensor(covs), viterbi_states=[torch.tensor(vit)])
+    ffs = SimpleNamespace(
+        state_covs=torch.tensor(covs),
+        state_means=torch.tensor(means),
+        transition=torch.tensor(trans),
+        viterbi_states=[torch.tensor(vit)],
+    )
 
     res = compare_to_matlab(ffs, mat)
     # ffs state i should match the MATLAB state carrying the same covariance.
@@ -98,3 +111,11 @@ def test_compare_recovers_permutation():
         assert res.ffs_to_matlab[i] == int(np.where(perm == i)[0][0])
     assert res.mean_matched_fc > 0.999
     assert res.occupancy_correlation > 0.999
+    # The relabelling is exact, so every structural check should be near-perfect.
+    assert res.transition_correlation > 0.999
+    assert res.activation_correlation > 0.999
+    assert res.n_occupied_ffs == k and res.n_occupied_matlab == k
+    # Same runs + exact relabelling -> frame-by-frame MAP agreement is total.
+    assert res.temporal_agreement == 1.0
+    assert res.temporal_kappa > 0.999
+    assert res.temporal_frames == vit.size

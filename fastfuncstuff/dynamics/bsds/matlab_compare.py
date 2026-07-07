@@ -79,6 +79,61 @@ def load_matlab_bsds(path: str) -> MatlabBSDS:
     )
 
 
+def _to_np(x):
+    import torch
+
+    return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+
+
+def _cohen_kappa(a: np.ndarray, b: np.ndarray, k: int) -> float:
+    """Chance-corrected agreement between two integer labellings over ``k`` classes."""
+    conf = np.zeros((k, k))
+    np.add.at(conf, (a, b), 1)
+    n = conf.sum()
+    if n == 0:
+        return float("nan")
+    po = np.trace(conf) / n
+    pe = (conf.sum(0) * conf.sum(1)).sum() / n**2
+    return float((po - pe) / (1 - pe)) if pe < 1 else 1.0
+
+
+def _temporal_agreement(ffs_viterbi, mat_viterbi, mat2ffs: np.ndarray, k: int):
+    """Frame-wise MAP agreement after relabelling MATLAB states into ffs labels.
+
+    Both fits decoded the *same* runs, so once states are matched the two Viterbi
+    paths are directly comparable frame by frame — a far stronger check than
+    aggregate occupancy. Returns ``(accuracy, kappa, n_frames)``; ``nan`` if the
+    runs don't line up (different count or per-run length, e.g. one side was
+    length-equalised for the MATLAB export).
+    """
+    if len(ffs_viterbi) != len(mat_viterbi):
+        return float("nan"), float("nan"), 0
+    ffs_all, mat_all = [], []
+    for fv, mv in zip(ffs_viterbi, mat_viterbi, strict=False):
+        fv = _to_np(fv).astype(np.int64)
+        mv = np.asarray(mv, dtype=np.int64)
+        if fv.shape[0] != mv.shape[0]:
+            return float("nan"), float("nan"), 0
+        remapped = mat2ffs[mv]  # MATLAB label -> matched ffs label
+        ok = remapped >= 0
+        ffs_all.append(fv[ok])
+        mat_all.append(remapped[ok])
+    fa = np.concatenate(ffs_all)
+    ma = np.concatenate(mat_all)
+    if fa.size == 0:
+        return float("nan"), float("nan"), 0
+    return float((fa == ma).mean()), _cohen_kappa(fa, ma, k), int(fa.size)
+
+
+def _matched_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation of two flattened vectors, nan-safe."""
+    a = np.asarray(a, float).ravel()
+    b = np.asarray(b, float).ravel()
+    if a.size < 2 or np.std(a) == 0 or np.std(b) == 0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
 @dataclass
 class ComparisonResult:
     """Hungarian-matched comparison between an ffs fit and a MATLAB fit."""
@@ -92,30 +147,36 @@ class ComparisonResult:
     similarity_matrix: np.ndarray  # (Kffs, Kmat) full FC-similarity matrix
     mean_matched_fc: float  # mean FC similarity over pairs occupied in both
     occupancy_correlation: float  # corr of matched occupancy vectors (both-occupied)
+    # Extra structural checks over both-occupied matched states:
+    n_occupied_ffs: int
+    n_occupied_matlab: int
+    transition_correlation: float  # matched transition submatrices, flattened
+    lifetime_correlation: float  # matched mean-lifetimes
+    activation_correlation: float  # mean per-state corr of activation profiles
+    temporal_agreement: float  # frame-wise MAP agreement (same runs), or nan
+    temporal_kappa: float  # chance-corrected version of the above
+    temporal_frames: int  # frames the temporal metrics used (0 if unalignable)
 
 
 def compare_to_matlab(ffs_model, matlab: MatlabBSDS, *, occ_threshold: float = 1e-3):
     """Hungarian-match an ``ffs_bsds`` model to a :class:`MatlabBSDS` by FC pattern.
 
-    Returns a :class:`ComparisonResult`. The match maximises total FC similarity
-    over the (arbitrary) state labels; summary metrics (``mean_matched_fc``,
-    ``occupancy_correlation``) are computed only over pairs that are occupied in
-    **both** fits, since empty states have degenerate FC.
+    Returns a :class:`ComparisonResult`. States are matched by FC pattern (labels
+    are arbitrary), then compared on several axes the reference also produces —
+    occupancy, per-state FC, the transition matrix, mean lifetime, activation
+    profiles, and (the strongest, since both fits decoded the same runs) the
+    frame-by-frame MAP state sequence. Aggregate metrics use only pairs occupied
+    in **both** fits, since empty states have degenerate parameters.
     """
-    import torch
     from scipy.optimize import linear_sum_assignment
 
-    ffs_covs = ffs_model.state_covs
-    ffs_covs = (
-        ffs_covs.detach().cpu().numpy()
-        if isinstance(ffs_covs, torch.Tensor)
-        else np.asarray(ffs_covs)
-    )
+    ffs_covs = _to_np(ffs_model.state_covs)
+    k_ffs = ffs_covs.shape[0]
     sim = _fc_similarity_matrix(ffs_covs, matlab.state_covs)  # (Kffs, Kmat)
     cost = -np.nan_to_num(sim, nan=-1.0)
     row_ind, col_ind = linear_sum_assignment(cost)
 
-    ffs_occ_all = _occupancy_from_viterbi(ffs_model.viterbi_states, ffs_covs.shape[0])
+    ffs_occ_all = _occupancy_from_viterbi(ffs_model.viterbi_states, k_ffs)
     mat_occ_all = matlab.occupancy
 
     ffs_occ = ffs_occ_all[row_ind]
@@ -130,6 +191,38 @@ def compare_to_matlab(ffs_model, matlab: MatlabBSDS, *, occ_threshold: float = 1
         else float("nan")
     )
 
+    # State ids (in each fit's own labelling) for the both-occupied matched pairs.
+    ffs_idx = row_ind[both]
+    mat_idx = col_ind[both]
+
+    # Transition matrix: compare the matched submatrices (from->to over shared states).
+    ffs_trans = _to_np(ffs_model.transition)
+    trans_corr = _matched_corr(
+        ffs_trans[np.ix_(ffs_idx, ffs_idx)], matlab.transition[np.ix_(mat_idx, mat_idx)]
+    )
+
+    # Mean lifetime (ffs computed from the MAP paths, TR units, matching MATLAB).
+    from fastfuncstuff.dynamics.states import mean_lifetime
+
+    pooled = np.concatenate([_to_np(v).astype(np.int64) for v in ffs_model.viterbi_states])
+    ffs_life_all = mean_lifetime(pooled, k_ffs, tr=1.0)
+    life_corr = _matched_corr(ffs_life_all[ffs_idx], matlab.lifetime[mat_idx])
+
+    # Activation profiles: mean per-state correlation of the D-length mean vectors.
+    ffs_means = _to_np(ffs_model.state_means)  # (Kffs, D)
+    act = [
+        _matched_corr(ffs_means[i], matlab.state_means[j])
+        for i, j in zip(ffs_idx, mat_idx, strict=True)
+    ]
+    act_corr = float(np.nanmean(act)) if act else float("nan")
+
+    # Temporal MAP agreement (same runs): relabel MATLAB Viterbi into ffs labels.
+    mat2ffs = np.full(matlab.state_covs.shape[0], -1, dtype=np.int64)
+    mat2ffs[col_ind] = row_ind
+    temp_acc, temp_kappa, temp_frames = _temporal_agreement(
+        ffs_model.viterbi_states, matlab.viterbi_states, mat2ffs, k_ffs
+    )
+
     return ComparisonResult(
         ffs_to_matlab={int(i): int(j) for i, j in zip(row_ind, col_ind, strict=True)},
         fc_similarity=fc_sim,
@@ -140,6 +233,14 @@ def compare_to_matlab(ffs_model, matlab: MatlabBSDS, *, occ_threshold: float = 1
         similarity_matrix=sim,
         mean_matched_fc=mean_fc,
         occupancy_correlation=occ_corr,
+        n_occupied_ffs=int((ffs_occ_all > occ_threshold).sum()),
+        n_occupied_matlab=int((mat_occ_all > occ_threshold).sum()),
+        transition_correlation=trans_corr,
+        lifetime_correlation=life_corr,
+        activation_correlation=act_corr,
+        temporal_agreement=temp_acc,
+        temporal_kappa=temp_kappa,
+        temporal_frames=temp_frames,
     )
 
 
@@ -160,8 +261,8 @@ def plot_comparison(
     fc = result.fc_similarity[keep][order]
     labels = [f"ffs{result.ffs_state[keep][i]}\nmat{result.matlab_state[keep][i]}" for i in order]
 
-    fig = plt.figure(figsize=(14, 4.5), facecolor="#fcfcfb")
-    gs = fig.add_gridspec(1, 3, width_ratios=[1.5, 1.2, 1], wspace=0.3)
+    fig = plt.figure(figsize=(17, 4.5), facecolor="#fcfcfb")
+    gs = fig.add_gridspec(1, 4, width_ratios=[1.5, 1.2, 1, 0.9], wspace=0.32)
 
     ax0 = fig.add_subplot(gs[0, 0])
     x = np.arange(len(fo))
@@ -187,6 +288,30 @@ def plot_comparison(
     ax2.set_ylabel("ffs state")
     ax2.set_title("FC similarity + assignment")
     fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+
+    # Structural-agreement scorecard.
+    ax3 = fig.add_subplot(gs[0, 3])
+    ax3.axis("off")
+    temporal = (
+        "n/a (runs differ)"
+        if not np.isfinite(result.temporal_agreement)
+        else f"{result.temporal_agreement:.2f}  (κ={result.temporal_kappa:.2f})"
+    )
+    rows = [
+        ("occupied states", f"{result.n_occupied_ffs} vs {result.n_occupied_matlab}"),
+        ("mean matched FC", f"{result.mean_matched_fc:.3f}"),
+        ("occupancy r", f"{result.occupancy_correlation:.3f}"),
+        ("transition r", f"{result.transition_correlation:.3f}"),
+        ("lifetime r", f"{result.lifetime_correlation:.3f}"),
+        ("activation r", f"{result.activation_correlation:.3f}"),
+        ("MAP agreement", temporal),
+    ]
+    ax3.set_title("Structural agreement", fontsize=11)
+    y = 0.92
+    for name, val in rows:
+        ax3.text(0.02, y, name, fontsize=9, va="top", color="#52514e")
+        ax3.text(0.98, y, val, fontsize=9, va="top", ha="right", color="#0b0b0b")
+        y -= 0.13
 
     fig.suptitle("ffs_bsds vs reference MATLAB — state match", fontsize=13)
     if path:
