@@ -239,7 +239,16 @@ def init_state(
         lcov=lcov,
         xm=xm,
         xcov=xcov,
-        psii=1.0 / var,
+        # Noise precision starts at ones, matching the reference (vbhafa.m:
+        # psii=ones(p,1)). A data-variance seed (1/var) is scale-fragile: on
+        # un-standardised data with large between-state spread it seeds a tiny
+        # precision (huge assumed noise) and systematically steers restart
+        # selection into an over-segmented, higher-free-energy basin (an extra
+        # state that splits a true one). psii=ones is scale-robust and is
+        # ~identical to 1/var on standardised input (var~1) anyway. Scale is
+        # instead carried by the mean-loading prior nu_mcl (=1/std(Y)^2 below),
+        # exactly as the reference does. See the over-segmentation note in the wiki.
+        psii=torch.ones(d, dtype=_DTYPE, device=device),
         a=PA + 0.5 * d,
         b=torch.ones(n_states, ldim, dtype=_DTYPE, device=device),
         mean_mcl=y.mean(dim=1),
