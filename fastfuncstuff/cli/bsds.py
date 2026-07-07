@@ -200,8 +200,17 @@ def build_parser() -> argparse.ArgumentParser:
         "each state's FC is recovered (Hungarian-matched). Writes *_stability.png/json. "
         "0 disables; N is that many extra full fits, so keep it small (e.g. 4).",
     )
+    p.add_argument("-tol", type=float, default=1e-4, help="Convergence tolerance (see -criterion).")
     p.add_argument(
-        "-tol", type=float, default=1e-4, help="Relative free-energy convergence tolerance."
+        "-criterion",
+        choices=("free_energy", "weights"),
+        default="free_energy",
+        help="Convergence test. 'free_energy' (default): relative free-energy change "
+        "|dF|/|F| < -tol. 'weights': the reference vbhafa.m state-mass criterion "
+        "sum(|d occupancy|) < -tol, which keeps iterating while states are still "
+        "draining (better pruning of redundant states) but is an absolute quantity "
+        "that scales with #timepoints, so use a larger -tol (e.g. ~1e-2 to 1) or it "
+        "runs to -n_iter. Restart selection uses free energy either way.",
     )
     p.add_argument(
         "-n_kmeans_replicates",
@@ -251,7 +260,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-standardize",
         choices=["zscore", "varnorm", "demean", "none"],
         default="zscore",
-        help="Per-ROI standardisation.",
+        help="Per-ROI standardisation. 'zscore' (default): state covariance reads as "
+        "correlation, and puts heterogeneous BOLD scales on equal footing. 'none' "
+        "matches the reference MATLAB, which does not standardise its input (it "
+        "carries scale via the mean-loading prior instead) — use it for a faithful "
+        "reference comparison.",
     )
     p.add_argument(
         "-plots",
@@ -409,6 +422,7 @@ def _run_stability(sessions, args, device, stem: str, n_states: int, max_ldim) -
         n_init=max(2, args.n_init // 2),
         n_iter=args.n_iter,
         tol=args.tol,
+        criterion=args.criterion,
         device=device,
         show_progress=True,
     )
@@ -601,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         show_progress=True,
         n_kmeans_replicates=args.n_kmeans_replicates,
         kmeans_pca_dim=args.kmeans_pca_dim or None,
+        criterion=args.criterion,
     )
     elapsed = time.time() - t0
     stats = compute_state_stats(model, tr=args.tr)

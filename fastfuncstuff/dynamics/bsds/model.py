@@ -48,6 +48,10 @@ class BSDSModel:
     objective_history: list[float]
     converged: bool
     state: VBState = field(repr=False)
+    # Per-iteration L1 change in per-state responsibility mass (the reference's
+    # weights convergence signal); iteration 0 is nan. Empty on models loaded
+    # from disk that predate this field or were saved without it.
+    weights_history: list[float] = field(default_factory=list)
 
 
 def _one_pass(
@@ -71,6 +75,26 @@ def _one_pass(
     return xi_sum, gamma0_sum, loglik
 
 
+# Convergence criteria, plus the natural singular spellings as aliases. An
+# unrecognised value must error, never silently fall back to free energy.
+_CRITERION_ALIASES = {
+    "free_energy": "free_energy",
+    "free-energy": "free_energy",
+    "fe": "free_energy",
+    "weights": "weights",
+    "weight": "weights",
+}
+
+
+def _normalize_criterion(criterion: str) -> str:
+    try:
+        return _CRITERION_ALIASES[criterion]
+    except KeyError:
+        raise ValueError(
+            f"unknown criterion {criterion!r}; expected 'free_energy' or 'weights'"
+        ) from None
+
+
 def _run_vb(
     state: VBState,
     y: torch.Tensor,
@@ -79,12 +103,35 @@ def _run_vb(
     tol: float,
     show_progress: bool,
     desc: str,
-) -> tuple[VBState, list[float], bool]:
-    """Run the VB loop to convergence; returns state, objective history, converged."""
+    criterion: str = "free_energy",
+) -> tuple[VBState, list[float], bool, list[float]]:
+    """Run the VB loop to convergence; returns state, objective history, converged.
+
+    ``criterion`` picks the stopping test (restart selection always uses the
+    free-energy ``history``, matching the reference's ``Fhist`` selection):
+
+    - ``"free_energy"`` (default): relative free-energy change
+      ``|ΔF|/|F| < tol``.
+    - ``"weights"``: the reference ``vbhafa.m`` criterion —
+      ``sum(|Σ_n q(z_n) - previous|) < tol``, the L1 change in per-state
+      responsibility mass. This is an **absolute** quantity that scales with the
+      number of time points N (unlike the relative free-energy tol), so it wants
+      a larger tol; at large N it may never fire and simply runs ``n_iter``. It
+      keeps iterating while state occupancy is still migrating, so it does not
+      stop early with responsibility mass still draining out of redundant states
+      (see the over-segmentation note in the wiki / auto-memory).
+    """
+    criterion = _normalize_criterion(criterion)
     history: list[float] = []
+    # Per-iteration L1 change in per-state responsibility mass — the reference's
+    # weights convergence signal. Recorded regardless of `criterion` so it is
+    # always available as a diagnostic (plot_convergence); iteration 0 has no
+    # predecessor and is nan.
+    weights_history: list[float] = []
     xi_sum: torch.Tensor | None = None
     gamma0_sum: torch.Tensor | None = None
     converged = False
+    prev_weights: torch.Tensor | None = None
     bar = tqdm(range(n_iter), desc=desc, leave=True, disable=not show_progress)
     for it in bar:
         xi_sum, gamma0_sum, _loglik = _one_pass(state, y, sessions, xi_sum, gamma0_sum)
@@ -93,16 +140,30 @@ def _run_vb(
         # selection criterion. Adding loglik would double-count the emission.
         obj = float(lower_bound(state, y))
         history.append(obj)
-        if it > 0:
+        weights = state.qns.sum(dim=0)  # (K,) per-state responsibility mass
+        improvement = (
+            float((weights - prev_weights).abs().sum())
+            if prev_weights is not None
+            else float("nan")
+        )
+        weights_history.append(improvement)
+        if criterion == "weights":
+            if prev_weights is not None and improvement < tol:
+                converged = True
+                if show_progress:
+                    bar.set_postfix(dW=f"{improvement:.3g}", converged=True)
+                break
+        elif it > 0:
             denom = max(abs(history[-2]), 1.0)
             if abs(history[-1] - history[-2]) / denom < tol:
                 converged = True
                 if show_progress:
                     bar.set_postfix(obj=f"{obj:.3f}", converged=True)
                 break
+        prev_weights = weights
         if show_progress:
             bar.set_postfix(obj=f"{obj:.3f}")
-    return state, history, converged
+    return state, history, converged, weights_history
 
 
 def _finalize(state: VBState, y: torch.Tensor, sessions: list[torch.Tensor]) -> BSDSModel:
@@ -216,6 +277,7 @@ def posterior_arrays(model: BSDSModel) -> dict:
         "viterbi": vit,
         "converged": np.array(bool(model.converged)),
         "objective_history": np.array(model.objective_history, dtype=float),
+        "weights_history": np.array(model.weights_history, dtype=float),
     }
 
 
@@ -302,6 +364,7 @@ def load_bsds_model(path: str, *, device: torch.device | str | None = None) -> B
         objective_history=(z["objective_history"].tolist() if "objective_history" in z else []),
         converged=bool(z["converged"]) if "converged" in z else False,
         state=state,
+        weights_history=(z["weights_history"].tolist() if "weights_history" in z else []),
     )
 
 
@@ -319,6 +382,7 @@ def fit_bsds(
     show_progress: bool | None = None,
     n_kmeans_replicates: int = 10,
     kmeans_pca_dim: int | None = 20,
+    criterion: str = "free_energy",
 ) -> BSDSModel:
     """Fit a group-level BSDS model to a list of preprocessed ``(D, N)`` sessions.
 
@@ -329,6 +393,14 @@ def fit_bsds(
     ``[[BSDS]]``). ``n_init`` short restarts are run and the best by free energy
     is continued to convergence.
 
+    ``criterion`` selects the convergence test (see :func:`_run_vb`):
+    ``"free_energy"`` (default) stops on relative free-energy change;
+    ``"weights"`` ports the reference ``vbhafa.m`` state-mass criterion, which
+    keeps iterating while occupancy is still migrating (recommended when you
+    care about pruning redundant states rather than stopping as soon as F
+    plateaus). Restart *selection* always uses free energy either way, matching
+    the reference's ``Fhist`` selection.
+
     ``n_kmeans_replicates`` and ``kmeans_pca_dim`` control the k-means
     initialisation (per-session clustering, pooled — see
     :mod:`fastfuncstuff.dynamics.bsds.init`); the PCA projection matters once
@@ -336,6 +408,7 @@ def fit_bsds(
     """
     if len(sessions) == 0:
         raise ValueError("sessions is empty")
+    criterion = _normalize_criterion(criterion)
     device = sessions[0].device if device is None else device
     sessions = [s.to(device=device, dtype=_DTYPE) for s in sessions]
     d = sessions[0].shape[0]
@@ -368,8 +441,15 @@ def fit_bsds(
             n_kmeans_replicates=n_kmeans_replicates,
             kmeans_pca_dim=kmeans_pca_dim,
         )
-        state, hist, _ = _run_vb(
-            state, y, sessions, n_init_iter, tol, show_progress=False, desc="init"
+        state, hist, _, _ = _run_vb(
+            state,
+            y,
+            sessions,
+            n_init_iter,
+            tol,
+            show_progress=False,
+            desc="init",
+            criterion=criterion,
         )
         if hist[-1] > best_obj:
             best_obj = hist[-1]
@@ -379,11 +459,19 @@ def fit_bsds(
     assert best_state is not None
 
     # Continue the best restart to convergence.
-    state, history, converged = _run_vb(
-        best_state, y, sessions, n_iter, tol, show_progress, desc="bsds fit"
+    state, history, converged, weights_history = _run_vb(
+        best_state,
+        y,
+        sessions,
+        n_iter,
+        tol,
+        show_progress,
+        desc="bsds fit",
+        criterion=criterion,
     )
     model = _finalize(state, y, sessions)
     model.objective_history = history
+    model.weights_history = weights_history
     model.converged = converged
     return model
 
@@ -432,11 +520,12 @@ def fit_subject(
     gammas, _xi, _g0, _ll = hmm.estep(log_obs, state.wa, state.wpi)
     state.qns = torch.cat(gammas, dim=0)
 
-    state, history, converged = _run_vb(
+    state, history, converged, weights_history = _run_vb(
         state, y, [sess], n_iter, tol, show_progress, desc="bsds subject"
     )
     model = _finalize(state, y, [sess])
     model.objective_history = history
+    model.weights_history = weights_history
     model.converged = converged
     return model
 

@@ -86,6 +86,68 @@ def test_objective_monotonic_and_converges():
     assert model.converged
 
 
+def test_init_noise_precision_is_ones():
+    # Regression: the init noise precision must be ones, matching the reference
+    # (vbhafa.m: psii=ones(p,1)). A data-variance seed (psii=1/var) is
+    # scale-fragile — on un-standardised, well-separated data it seeds a tiny
+    # precision and systematically steers best-of-N restart selection into a
+    # higher-free-energy basin with a spurious extra state, so ffs over-segments
+    # relative to the reference. psii=ones is scale-robust (and ~identical to
+    # 1/var on standardised input where var~1). Scale is instead carried by the
+    # mean-loading prior nu_mcl. This deterministic check pins the fix; the
+    # behavioural payoff (recovering the true state count in data-rich regimes)
+    # is regime-dependent and lives in the scratch/notebook validation.
+    from fastfuncstuff.dynamics.bsds.init import init_state
+
+    d = 6
+    rng = np.random.default_rng(3)
+    # Deliberately non-unit, heterogeneous per-ROI variance so 1/var != ones.
+    y = torch.tensor(rng.standard_normal((d, 400)) * rng.uniform(2, 8, (d, 1)), dtype=torch.float64)
+    state = init_state(y, [400], n_states=4, ldim=3, seed=0, kmeans_pca_dim=None)
+    torch.testing.assert_close(state.psii, torch.ones(d, dtype=torch.float64))
+    # nu_mcl (mean-loading prior) still carries scale as 1/var, per the reference.
+    assert (state.nu_mcl < 1.0).all()
+
+
+def test_criterion_free_energy_is_default():
+    # Passing criterion="free_energy" explicitly must reproduce the default fit
+    # bit-for-bit (the default path is unchanged by the option).
+    sessions, _, _, _ = _simulate(k=2, d=5, r=2, t=300, n_sessions=2, seed=2)
+    kw = dict(n_states=2, max_ldim=3, n_init=2, n_init_iter=10, n_iter=60, seed=0)
+    a = fit_bsds(sessions, **kw)
+    b = fit_bsds(sessions, criterion="free_energy", **kw)
+    torch.testing.assert_close(a.state_means, b.state_means)
+    torch.testing.assert_close(a.transition, b.transition)
+    assert a.objective_history == b.objective_history
+
+
+def test_criterion_weights_converges_and_selects_on_free_energy():
+    # The reference vbhafa.m state-mass criterion: stop when per-state occupancy
+    # stops moving. On well-separated states with a loose tol it must fire, and
+    # the recorded objective history is still the (monotone) free energy used for
+    # restart selection.
+    sessions, true_states, _, _ = _simulate(k=3, d=6, t=400, n_sessions=2, seed=1)
+    model = fit_bsds(
+        sessions,
+        n_states=3,
+        max_ldim=3,
+        n_init=3,
+        n_init_iter=12,
+        n_iter=200,
+        tol=0.5,  # absolute L1 occupancy change (scales with #frames)
+        criterion="weights",
+        seed=0,
+    )
+    assert model.converged
+    hist = np.array(model.objective_history)
+    scale = max(abs(hist[-1]), 1.0)
+    # Selection/history is free energy regardless of the stopping criterion.
+    assert (np.diff(hist) > -1e-5 * scale).all()
+    pred = torch.cat(model.viterbi_states).numpy()
+    acc, _ = _best_accuracy(pred, np.concatenate(true_states), 3)
+    assert acc > 0.85, f"weights-criterion state recovery too low: {acc:.3f}"
+
+
 def test_shapes_and_symmetry():
     sessions, _, _, _ = _simulate(k=2, d=4, r=1, t=150, n_sessions=1, seed=3)
     model = fit_bsds(sessions, n_states=2, max_ldim=2, n_init=2, n_init_iter=8, n_iter=40)
