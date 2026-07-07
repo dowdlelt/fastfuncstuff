@@ -89,6 +89,15 @@ def write_matlab_bsds_input(
 % fit options. Point BSDS_REPO at a checkout of
 % https://github.com/scsnl/Cai_Multiple_Demand_System_2023 (the BSDS/ folder),
 % then run this script in MATLAB or Octave.
+%
+% IMPORTANT: `clear all` below is required, not cosmetic. The reference stores
+% Lm/Lcov/Xm/Xcov/Qns/... as GLOBALS and only overwrites cells 1:nStates each
+% run -- it never clears leftover cells. Running a model after a previous fit
+% with more states (or a different ldim/D) in the same MATLAB session leaves
+% stale cells that corrupt the next fit (inferQX "Number of elements must not
+% change" / inferQL "Index exceeds ..."). A plain `clear` does NOT clear
+% function-scope globals; `clear all` (or `clear global`) does.
+clear all;
 BSDS_REPO = '/path/to/Cai_Multiple_Demand_System_2023/BSDS';
 addpath(genpath(BSDS_REPO));
 

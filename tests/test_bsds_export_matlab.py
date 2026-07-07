@@ -20,7 +20,11 @@ def test_write_matlab_bsds_input_roundtrip(tmp_path):
     )
 
     assert Path(m_path).exists()
-    assert "BayesianSwitchingDynamicalSystems" in Path(m_path).read_text()
+    script = Path(m_path).read_text()
+    assert "BayesianSwitchingDynamicalSystems" in script
+    # The reference uses globals it never clears between runs; the generated
+    # script must reset them or a smaller/second fit in one session corrupts.
+    assert "clear all" in script
 
     loaded = loadmat(str(mat_path))
     assert loaded["data"].shape == (1, 3)
