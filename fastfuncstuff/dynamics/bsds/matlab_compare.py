@@ -102,9 +102,11 @@ def _temporal_agreement(ffs_viterbi, mat_viterbi, mat2ffs: np.ndarray, k: int):
 
     Both fits decoded the *same* runs, so once states are matched the two Viterbi
     paths are directly comparable frame by frame — a far stronger check than
-    aggregate occupancy. Returns ``(accuracy, kappa, n_frames)``; ``nan`` if the
-    runs don't line up (different count or per-run length, e.g. one side was
-    length-equalised for the MATLAB export).
+    aggregate occupancy. Runs are compared on their common leading length: the
+    MATLAB export length-equalises (truncates to the global min), so ffs runs are
+    often a frame or two longer; the paths still align from the start, and the
+    extra tail is simply dropped. Returns ``(accuracy, kappa, n_frames)``;
+    ``nan`` only if the two fits have a different *number* of runs (unalignable).
     """
     if len(ffs_viterbi) != len(mat_viterbi):
         return float("nan"), float("nan"), 0
@@ -112,11 +114,10 @@ def _temporal_agreement(ffs_viterbi, mat_viterbi, mat2ffs: np.ndarray, k: int):
     for fv, mv in zip(ffs_viterbi, mat_viterbi, strict=False):
         fv = _to_np(fv).astype(np.int64)
         mv = np.asarray(mv, dtype=np.int64)
-        if fv.shape[0] != mv.shape[0]:
-            return float("nan"), float("nan"), 0
-        remapped = mat2ffs[mv]  # MATLAB label -> matched ffs label
+        t = min(fv.shape[0], mv.shape[0])  # align on the common leading frames
+        remapped = mat2ffs[mv[:t]]  # MATLAB label -> matched ffs label
         ok = remapped >= 0
-        ffs_all.append(fv[ok])
+        ffs_all.append(fv[:t][ok])
         mat_all.append(remapped[ok])
     fa = np.concatenate(ffs_all)
     ma = np.concatenate(mat_all)
@@ -293,7 +294,7 @@ def plot_comparison(
     ax3 = fig.add_subplot(gs[0, 3])
     ax3.axis("off")
     temporal = (
-        "n/a (runs differ)"
+        "n/a (run count differs)"
         if not np.isfinite(result.temporal_agreement)
         else f"{result.temporal_agreement:.2f}  (κ={result.temporal_kappa:.2f})"
     )

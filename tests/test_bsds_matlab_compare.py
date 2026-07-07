@@ -119,3 +119,36 @@ def test_compare_recovers_permutation():
     assert res.temporal_agreement == 1.0
     assert res.temporal_kappa > 0.999
     assert res.temporal_frames == vit.size
+
+
+def test_temporal_agreement_tolerates_length_equalised_export():
+    # The MATLAB export truncates runs to the global min, so ffs paths are often a
+    # frame or two longer. The comparison must align on the common leading frames,
+    # not bail. Here ffs has one extra trailing frame vs MATLAB.
+    rng = np.random.default_rng(5)
+    k, d = 3, 5
+    covs = np.stack([_spd(rng, d) for _ in range(k)])
+    means = rng.standard_normal((k, d))
+    trans = np.full((k, k), 0.1) + 0.6 * np.eye(k)
+    trans /= trans.sum(1, keepdims=True)
+    ffs_vit = np.concatenate([np.full(n, s) for s, n in zip(range(k), [20, 15, 11], strict=True)])
+    mat_vit = ffs_vit[:-1].copy()  # MATLAB run is one frame shorter (equalised)
+    occ = np.bincount(ffs_vit, minlength=k) / ffs_vit.size
+
+    mat = MatlabBSDS(
+        occupancy=occ,
+        lifetime=np.arange(k) + 1.0,
+        state_covs=covs,
+        state_means=means,
+        transition=trans,
+        viterbi_states=[mat_vit],
+    )
+    ffs = SimpleNamespace(
+        state_covs=torch.tensor(covs),
+        state_means=torch.tensor(means),
+        transition=torch.tensor(trans),
+        viterbi_states=[torch.tensor(ffs_vit)],
+    )
+    res = compare_to_matlab(ffs, mat)
+    assert res.temporal_frames == mat_vit.size  # compared on the shorter (common) length
+    assert res.temporal_agreement == 1.0
