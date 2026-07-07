@@ -53,3 +53,48 @@ def test_kmeans_pca_dim_none_matches_raw_space_at_low_d():
     occ_pca = state_pca.qns.sum(dim=0).numpy()
     occ_raw = state_raw.qns.sum(dim=0).numpy()
     assert np.allclose(np.sort(occ_pca), np.sort(occ_raw))
+
+
+def test_kmeans_batched_recovers_clusters_and_matches_loop_quality():
+    # The batched k-means (used by init to collapse n_sessions*n_replicates
+    # sequential k-means into one launch-cheap batched call) must recover
+    # well-separated clusters, and its inertia must be on par with the
+    # per-session loop's (kmeans_best_of) — it is not bit-identical (different
+    # shared RNG stream) but must be equivalent quality.
+    from fastfuncstuff.dynamics.bsds.init import kmeans_batched, kmeans_best_of
+
+    rng = np.random.default_rng(0)
+    k, d, n_per = 4, 6, 80
+    centers = rng.standard_normal((k, d)) * 6.0
+    # Two independent datasets (batch of 2), each k well-separated blobs.
+    datasets = []
+    truth = []
+    for _ in range(2):
+        z = rng.integers(0, k, size=k * n_per)
+        datasets.append(centers[z] + 0.3 * rng.standard_normal((k * n_per, d)))
+        truth.append(z)
+    x = torch.tensor(np.stack(datasets), dtype=torch.float64)  # (2, N, D)
+
+    # Actual usage: tile n_replicates along the batch, keep the lowest-inertia
+    # replicate per dataset (this is what _per_session_labels does).
+    reps = 10
+    gen = torch.Generator().manual_seed(0)
+    lab, inertia = kmeans_batched(x.repeat(reps, 1, 1), k, generator=gen)  # (reps*2, N)
+    lab = lab.view(reps, 2, k * n_per)
+    best = inertia.view(reps, 2).argmin(dim=0)  # (2,)
+    labels = torch.stack([lab[best[b], b] for b in range(2)])  # (2, N) best replicate
+
+    for b in range(2):
+        assert labels[b].unique().numel() == k  # every cluster used
+        purity = 0.0
+        for c in range(k):
+            lab_c = labels[b][truth[b] == c]
+            purity += (lab_c == lab_c.mode().values).float().mean().item()
+        assert purity / k > 0.98, f"batched k-means impure: {purity / k:.3f}"
+
+        # Inertia on par with the per-session best-of loop.
+        gl = torch.Generator().manual_seed(0)
+        loop_labels = kmeans_best_of(x[b], k, n_replicates=reps, generator=gl)
+        cen = torch.stack([x[b][loop_labels == c].mean(0) for c in range(k)])
+        loop_inertia = (torch.cdist(x[b], cen).amin(1) ** 2).sum().item()
+        assert inertia.view(reps, 2)[best[b], b].item() < 1.2 * loop_inertia + 1e-6

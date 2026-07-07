@@ -114,6 +114,70 @@ def _project_top_pcs(x: torch.Tensor, n_components: int) -> torch.Tensor:
     return centered @ vh[:n_components].T
 
 
+def _project_top_pcs_batched(x: torch.Tensor, n_components: int) -> torch.Tensor:
+    """Project each ``(N, D)`` slice of ``(B, N, D)`` onto *its own* top PCs (batched SVD)."""
+    _, n, d = x.shape
+    n_components = min(n_components, n - 1, d)
+    if n_components < 1:
+        return x
+    centered = x - x.mean(dim=1, keepdim=True)
+    _, _, vh = torch.linalg.svd(centered, full_matrices=False)  # vh: (B, min(N,D), D)
+    return centered @ vh[:, :n_components].transpose(1, 2)  # (B, N, n_components)
+
+
+def kmeans_batched(
+    x: torch.Tensor,
+    k: int,
+    *,
+    n_iter: int = 25,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched k-means++ Lloyd over ``B`` independent datasets at once.
+
+    ``x`` is ``(B, N, D)``. Runs one k-means per batch element, but everything is
+    vectorised over ``B`` — the k-means++ seeding is still sequential over the
+    ``k`` centers and Lloyd over ``n_iter`` steps, yet each of those steps is a
+    single batched kernel across all ``B`` datasets. So ``n_sessions ×
+    n_replicates`` independent k-means cost ~one k-means worth of kernel launches
+    instead of ``B`` of them — the launch-bound win (a single small k-means is
+    dominated by per-op dispatch, not arithmetic, on GPU). Returns
+    ``(labels (B, N), inertia (B,))``.
+
+    Unlike :func:`kmeans`, Lloyd runs a fixed ``n_iter`` with no early stop:
+    batch elements converge at different rates, and an all-converged check would
+    force a host sync every step, defeating the purpose.
+    """
+    b, n, d = x.shape
+    device = x.device
+    k = min(k, n)
+    arange_b = torch.arange(b, device=device)
+    # k-means++ seeding, batched over B (sequential over the k centers).
+    first = torch.randint(n, (b,), generator=generator, device=device)
+    centers = x[arange_b, first].unsqueeze(1)  # (B, 1, D)
+    for _ in range(1, k):
+        d2 = torch.cdist(x, centers).amin(dim=2) ** 2  # (B, N)
+        probs = d2 / d2.sum(dim=1, keepdim=True).clamp_min(1e-300)
+        nxt = torch.multinomial(probs, 1, generator=generator)  # (B, 1)
+        chosen = x.gather(1, nxt.unsqueeze(2).expand(b, 1, d))  # (B, 1, D)
+        centers = torch.cat([centers, chosen], dim=1)
+
+    labels = torch.zeros(b, n, dtype=torch.long, device=device)
+    for _ in range(n_iter):
+        dist = torch.cdist(x, centers)  # (B, N, k)
+        labels = dist.argmin(dim=2)  # (B, N)
+        # Vectorised centroid update via one-hot matmul (no per-cluster loop):
+        # counts and sums fall out of onehot^T, empty clusters keep their center.
+        onehot = torch.zeros(b, n, centers.shape[1], dtype=x.dtype, device=device)
+        onehot.scatter_(2, labels.unsqueeze(2), 1.0)
+        counts = onehot.sum(dim=1).unsqueeze(2)  # (B, k, 1)
+        sums = torch.bmm(onehot.transpose(1, 2), x)  # (B, k, D)
+        centers = torch.where(counts > 0, sums / counts.clamp_min(1.0), centers)
+
+    dist = torch.cdist(x, centers)
+    inertia = (dist.gather(2, labels.unsqueeze(2)).squeeze(2) ** 2).sum(dim=1)  # (B,)
+    return labels, inertia
+
+
 def _transition_counts(
     labels: torch.Tensor, session_lengths: list[int], k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -145,24 +209,41 @@ def _per_session_labels(
     """K-means labels, clustered independently within each session then pooled.
 
     See the module docstring: this matches the reference's per-subject k-means
-    default and avoids the joint-clustering collapse at high ``D``. Each
-    session gets its own generator (derived from ``seed``) so results are
-    reproducible but sessions don't share k-means++ seeding draws.
+    default and avoids the joint-clustering collapse at high ``D``. Sessions of
+    equal length are stacked (with ``n_replicates`` copies) into a single
+    :func:`kmeans_batched` call and the lowest-inertia replicate is kept per
+    session — so the whole init is a handful of batched k-means instead of
+    ``n_sessions * n_replicates`` sequential ones, which otherwise dominates GPU
+    time (k-means is launch-bound). One RNG stream is shared across the batch, so
+    the seeded init differs from the old per-session loop (equivalent quality,
+    not bit-identical to fits made before this change).
     """
     device = y.device
     n = y.shape[1]
     labels = torch.zeros(n, dtype=torch.long, device=device)
-    col = 0
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+
+    offsets = [0]
+    for ti in session_lengths:
+        offsets.append(offsets[-1] + ti)
+
+    groups: dict[int, list[int]] = {}
     for i, ti in enumerate(session_lengths):
-        block = y[:, col : col + ti].T  # (Ti, D)
-        if pca_dim is not None:
-            block = _project_top_pcs(block, pca_dim)
-        gen = torch.Generator(device=device)
-        gen.manual_seed(seed + i)
-        labels[col : col + ti] = kmeans_best_of(
-            block, n_states, n_replicates=n_replicates, generator=gen
-        )
-        col += ti
+        groups.setdefault(ti, []).append(i)
+
+    for ti, idxs in groups.items():
+        # (S, Ti, D): the equal-length sessions in this group, transposed to time-major.
+        raw = torch.stack([y[:, offsets[i] : offsets[i] + ti].T for i in idxs], dim=0)
+        block = _project_top_pcs_batched(raw, pca_dim) if pca_dim is not None else raw
+        s = block.shape[0]
+        # Tile replicates along the batch: index r*S + s (so .view(R, S, ...) below).
+        rep = block.repeat(n_replicates, 1, 1)  # (R*S, Ti, d')
+        lab, inertia = kmeans_batched(rep, n_states, generator=gen)
+        lab = lab.view(n_replicates, s, ti)
+        best = inertia.view(n_replicates, s).argmin(dim=0)  # (S,) lowest-inertia replicate
+        for pos, i in enumerate(idxs):
+            labels[offsets[i] : offsets[i] + ti] = lab[best[pos], pos]
     return labels
 
 
