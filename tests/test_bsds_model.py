@@ -148,6 +148,36 @@ def test_criterion_weights_converges_and_selects_on_free_energy():
     assert acc > 0.85, f"weights-criterion state recovery too low: {acc:.3f}"
 
 
+def test_obj_every_does_not_change_the_fit():
+    # lower_bound is a pure read of the state, so evaluating F less often (to skip
+    # the ELBO cholesky/slogdet and its GPU sync) must leave the fit bit-identical.
+    # Under the weights criterion F is not the stop signal, only the
+    # restart-selection value (final iter) and the diagnostic curve.
+    sessions, _, _, _ = _simulate(k=3, d=6, t=400, n_sessions=3, seed=1)
+    kw = dict(
+        n_states=4,
+        max_ldim=3,
+        n_init=3,
+        n_init_iter=10,
+        n_iter=80,
+        seed=0,
+        criterion="weights",
+        tol=0.5,
+    )
+    dense = fit_bsds(sessions, obj_every=1, **kw)
+    sparse = fit_bsds(sessions, obj_every=10, **kw)
+    torch.testing.assert_close(dense.state_means, sparse.state_means)
+    torch.testing.assert_close(dense.transition, sparse.transition)
+    for a, b in zip(dense.viterbi_states, sparse.viterbi_states, strict=True):
+        assert torch.equal(a, b)
+    # The final F — used for restart selection — is always computed (never nan),
+    # even when intermediate iterations are skipped.
+    assert np.isfinite(np.array(sparse.objective_history)[-1])
+    # The default resolves to the weights downsample (== obj_every=10).
+    default = fit_bsds(sessions, **kw)
+    torch.testing.assert_close(default.state_means, sparse.state_means)
+
+
 def test_shapes_and_symmetry():
     sessions, _, _, _ = _simulate(k=2, d=4, r=1, t=150, n_sessions=1, seed=3)
     model = fit_bsds(sessions, n_states=2, max_ldim=2, n_init=2, n_init_iter=8, n_iter=40)

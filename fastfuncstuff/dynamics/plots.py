@@ -185,7 +185,11 @@ def plot_convergence(model, ax) -> None:
     loaded from disk that were saved without it.
     """
     hist = np.asarray(model.objective_history, dtype=float)
-    ax.plot(np.arange(1, len(hist) + 1), hist, color="#0d366b", linewidth=2, label="free energy F")
+    # F may be evaluated only every obj_every iters (weights criterion), leaving
+    # nan gaps; plot the computed points connected rather than as broken segments.
+    it_f = np.arange(1, len(hist) + 1)
+    finite = np.isfinite(hist)
+    ax.plot(it_f[finite], hist[finite], color="#0d366b", linewidth=2, label="free energy F")
     ax.set_xlabel("VB iteration")
     ax.set_ylabel("free energy F", color="#0d366b")
     ax.tick_params(axis="y", colors="#0d366b")

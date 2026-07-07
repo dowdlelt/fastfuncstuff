@@ -213,6 +213,17 @@ def build_parser() -> argparse.ArgumentParser:
         "runs to -n_iter. Restart selection uses free energy either way.",
     )
     p.add_argument(
+        "-obj_every",
+        "-obj-every",
+        type=int,
+        default=None,
+        help="Evaluate the free energy only every N VB iterations (default: every "
+        "iteration for -criterion free_energy, every 10th for weights, where F is "
+        "only a diagnostic). A free speedup under the weights criterion — it skips "
+        "the per-iteration ELBO cholesky/slogdet and its GPU sync without changing "
+        "the fit. Pass 1 for a dense free-energy curve.",
+    )
+    p.add_argument(
         "-n_kmeans_replicates",
         "-n-kmeans-replicates",
         type=int,
@@ -616,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
         n_kmeans_replicates=args.n_kmeans_replicates,
         kmeans_pca_dim=args.kmeans_pca_dim or None,
         criterion=args.criterion,
+        obj_every=args.obj_every,
     )
     elapsed = time.time() - t0
     stats = compute_state_stats(model, tr=args.tr)

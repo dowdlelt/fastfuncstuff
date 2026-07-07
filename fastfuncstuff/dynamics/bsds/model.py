@@ -104,6 +104,7 @@ def _run_vb(
     show_progress: bool,
     desc: str,
     criterion: str = "free_energy",
+    obj_every: int = 1,
 ) -> tuple[VBState, list[float], bool, list[float]]:
     """Run the VB loop to convergence; returns state, objective history, converged.
 
@@ -120,8 +121,19 @@ def _run_vb(
       keeps iterating while state occupancy is still migrating, so it does not
       stop early with responsibility mass still draining out of redundant states
       (see the over-segmentation note in the wiki / auto-memory).
+
+    ``obj_every`` computes the free energy only every ``obj_every`` iterations
+    (plus always on the final/converged iteration). ``lower_bound`` is a pure
+    read of the state — skipping it never changes the fit — and under the
+    ``weights`` criterion it is not the stop signal, only the restart-selection
+    value (final iteration) and the diagnostic curve. So ``obj_every > 1`` is a
+    free speedup there: it drops the per-iteration cholesky/slogdet of the ELBO
+    and, on GPU, the host↔device sync it forces. Ignored for ``free_energy``,
+    which needs F every iteration. Skipped iterations record ``nan`` in
+    ``history`` (the F curve just plots the computed points).
     """
     criterion = _normalize_criterion(criterion)
+    obj_every = max(1, obj_every)
     history: list[float] = []
     # Per-iteration L1 change in per-state responsibility mass — the reference's
     # weights convergence signal. Recorded regardless of `criterion` so it is
@@ -135,11 +147,6 @@ def _run_vb(
     bar = tqdm(range(n_iter), desc=desc, leave=True, disable=not show_progress)
     for it in bar:
         xi_sum, gamma0_sum, _loglik = _one_pass(state, y, sessions, xi_sum, gamma0_sum)
-        # Free energy F (excluding the HMM data term, which the emissions already
-        # carry): this is the monotone VB objective and the reference's restart
-        # selection criterion. Adding loglik would double-count the emission.
-        obj = float(lower_bound(state, y))
-        history.append(obj)
         weights = state.qns.sum(dim=0)  # (K,) per-state responsibility mass
         improvement = (
             float((weights - prev_weights).abs().sum())
@@ -147,8 +154,26 @@ def _run_vb(
             else float("nan")
         )
         weights_history.append(improvement)
+        # Weights convergence is decided on the responsibility mass, not F.
+        weights_converged = (
+            criterion == "weights" and prev_weights is not None and improvement < tol
+        )
+        # Free energy F (excluding the HMM data term, which the emissions already
+        # carry): the monotone VB objective and the reference's restart-selection
+        # criterion. free_energy needs it every iteration to test |ΔF|; weights
+        # needs it only on the final/converged iteration (restart selection) and
+        # every `obj_every` for the curve. `lower_bound` never mutates `state`,
+        # so skipping it leaves the fit bit-identical.
+        need_obj = (
+            criterion == "free_energy"
+            or weights_converged
+            or it == n_iter - 1
+            or it % obj_every == 0
+        )
+        obj = float(lower_bound(state, y)) if need_obj else float("nan")
+        history.append(obj)
         if criterion == "weights":
-            if prev_weights is not None and improvement < tol:
+            if weights_converged:
                 converged = True
                 if show_progress:
                     bar.set_postfix(dW=f"{improvement:.3g}", converged=True)
@@ -162,7 +187,7 @@ def _run_vb(
                 break
         prev_weights = weights
         if show_progress:
-            bar.set_postfix(obj=f"{obj:.3f}")
+            bar.set_postfix(obj=f"{obj:.3f}" if need_obj else f"dW={improvement:.3g}")
     return state, history, converged, weights_history
 
 
@@ -383,6 +408,7 @@ def fit_bsds(
     n_kmeans_replicates: int = 10,
     kmeans_pca_dim: int | None = 20,
     criterion: str = "free_energy",
+    obj_every: int | None = None,
 ) -> BSDSModel:
     """Fit a group-level BSDS model to a list of preprocessed ``(D, N)`` sessions.
 
@@ -405,10 +431,17 @@ def fit_bsds(
     initialisation (per-session clustering, pooled — see
     :mod:`fastfuncstuff.dynamics.bsds.init`); the PCA projection matters once
     ``D`` is more than a couple dozen ROIs.
+
+    ``obj_every`` controls how often the (read-only) free energy is evaluated
+    inside the VB loop (see :func:`_run_vb`); ``None`` (default) evaluates every
+    iteration for ``free_energy`` and every 10th for ``weights``, where F is only
+    a diagnostic — a free speedup that skips the ELBO cholesky/slogdet and its
+    GPU sync without changing the fit. Pass ``1`` to force a dense F curve.
     """
     if len(sessions) == 0:
         raise ValueError("sessions is empty")
     criterion = _normalize_criterion(criterion)
+    obj_every = obj_every if obj_every is not None else (10 if criterion == "weights" else 1)
     device = sessions[0].device if device is None else device
     sessions = [s.to(device=device, dtype=_DTYPE) for s in sessions]
     d = sessions[0].shape[0]
@@ -450,6 +483,7 @@ def fit_bsds(
             show_progress=False,
             desc="init",
             criterion=criterion,
+            obj_every=obj_every,
         )
         if hist[-1] > best_obj:
             best_obj = hist[-1]
@@ -468,6 +502,7 @@ def fit_bsds(
         show_progress,
         desc="bsds fit",
         criterion=criterion,
+        obj_every=obj_every,
     )
     model = _finalize(state, y, sessions)
     model.objective_history = history
