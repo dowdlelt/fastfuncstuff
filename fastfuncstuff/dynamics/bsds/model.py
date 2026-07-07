@@ -52,6 +52,11 @@ class BSDSModel:
     # weights convergence signal); iteration 0 is nan. Empty on models loaded
     # from disk that predate this field or were saved without it.
     weights_history: list[float] = field(default_factory=list)
+    # Free energy of each short restart (the value best-of selection ranks on),
+    # in restart order. A tight spread means restarts land in similar-quality
+    # basins; the running max updating only ~H_n times over n restarts is
+    # expected record statistics, not a stuck fit. Empty on older saved models.
+    restart_scores: list[float] = field(default_factory=list)
 
 
 def _one_pass(
@@ -303,6 +308,7 @@ def posterior_arrays(model: BSDSModel) -> dict:
         "converged": np.array(bool(model.converged)),
         "objective_history": np.array(model.objective_history, dtype=float),
         "weights_history": np.array(model.weights_history, dtype=float),
+        "restart_scores": np.array(model.restart_scores, dtype=float),
     }
 
 
@@ -390,6 +396,7 @@ def load_bsds_model(path: str, *, device: torch.device | str | None = None) -> B
         converged=bool(z["converged"]) if "converged" in z else False,
         state=state,
         weights_history=(z["weights_history"].tolist() if "weights_history" in z else []),
+        restart_scores=(z["restart_scores"].tolist() if "restart_scores" in z else []),
     )
 
 
@@ -460,6 +467,7 @@ def fit_bsds(
     # Restarts: short VB from each seed, keep the best free energy.
     best_state: VBState | None = None
     best_obj = -float("inf")
+    restart_scores: list[float] = []
     restart_bar = tqdm(
         range(n_init), desc="bsds restarts", leave=True, disable=not show_progress or n_init == 1
     )
@@ -485,6 +493,7 @@ def fit_bsds(
             criterion=criterion,
             obj_every=obj_every,
         )
+        restart_scores.append(hist[-1])
         if hist[-1] > best_obj:
             best_obj = hist[-1]
             best_state = state
@@ -507,6 +516,7 @@ def fit_bsds(
     model = _finalize(state, y, sessions)
     model.objective_history = history
     model.weights_history = weights_history
+    model.restart_scores = restart_scores
     model.converged = converged
     return model
 

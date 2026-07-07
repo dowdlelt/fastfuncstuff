@@ -85,6 +85,38 @@ def test_analysis_report_writes_png(tmp_path):
     assert out.exists() and out.stat().st_size > 5000
 
 
+def test_plot_restart_scores_renders_and_handles_empty():
+    import matplotlib.pyplot as plt
+
+    from fastfuncstuff.dynamics.plots import plot_restart_scores
+
+    model, _ = _fit()
+    # n_init=2 restarts -> two recorded scores, ranked-on free energy.
+    assert len(model.restart_scores) == 2
+    fig, ax = plt.subplots()
+    plot_restart_scores(model, ax)
+    assert ax.collections and ax.lines  # scatter + running-best step drawn
+    plt.close(fig)
+
+    # Models loaded from disk without the field must degrade gracefully.
+    class _Empty:
+        restart_scores: list[float] = []
+
+    fig, ax = plt.subplots()
+    plot_restart_scores(_Empty(), ax)
+    plt.close(fig)
+
+
+def test_restart_scores_round_trip(tmp_path):
+    from fastfuncstuff.dynamics.bsds.model import load_bsds_model, save_bsds_model
+
+    model, _ = _fit()
+    p = str(tmp_path / "m.npz")
+    save_bsds_model(model, p)
+    reloaded = load_bsds_model(p)
+    assert reloaded.restart_scores == model.restart_scores
+
+
 def test_display_helpers_do_not_leak_open_figures(tmp_path):
     # Figure-returning helpers must close the pyplot-managed figure before
     # returning it, or %matplotlib inline renders it twice (repr + post-cell

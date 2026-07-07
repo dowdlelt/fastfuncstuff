@@ -213,6 +213,48 @@ def plot_convergence(model, ax) -> None:
         ax.legend(lines, [ln.get_label() for ln in lines], frameon=False, fontsize=8, loc="best")
 
 
+def plot_restart_scores(model, ax) -> None:
+    """Free energy of each short restart, with the running best it is selected on.
+
+    Restart selection keeps the highest-free-energy short run (never a weights
+    measure). This shows the spread of those per-restart scores in restart order:
+    a tight cluster means the init lands in similar-quality basins (a reliable
+    init), while a few high outliers mean restarts are earning their keep. The
+    running-max step (orange) is what ``best=`` in the tqdm bar tracks — it
+    updates only ~H_n times over n restarts (record statistics), so seeing it
+    move a handful of times across many restarts is expected, not a stuck fit.
+    Empty for models loaded from disk that were saved without it.
+    """
+    scores = np.asarray(getattr(model, "restart_scores", []) or [], dtype=float)
+    if scores.size == 0:
+        ax.text(0.5, 0.5, "no restart scores recorded", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    r = np.arange(1, scores.size + 1)
+    running = np.maximum.accumulate(scores)
+    n_updates = int((np.diff(running) > 0).sum())  # times the best improved
+    best_i = int(np.argmax(scores))
+
+    ax.scatter(r, scores, s=18, color="#0d366b", alpha=0.7, label="restart F", zorder=3)
+    ax.step(r, running, where="post", color="#e07a33", linewidth=1.6, label="running best")
+    ax.scatter(
+        [best_i + 1],
+        [scores[best_i]],
+        s=90,
+        facecolors="none",
+        edgecolors="#c0392b",
+        linewidths=1.8,
+        zorder=4,
+        label="selected",
+    )
+    ax.set_xlabel("restart")
+    ax.set_ylabel("free energy F")
+    spread = float(scores.max() - scores.min())
+    ax.set_title(f"Restarts (n={scores.size}, best improved {n_updates}×, spread {spread:.3g})")
+    ax.legend(frameon=False, fontsize=8, loc="best")
+    _style_axes(ax)
+
+
 def plot_state_timecourses(model, run_idx, ax, tr: float = 1.0) -> None:
     """Posterior state probabilities over time for one run (the core QC view)."""
     resp = model.responsibilities[run_idx]
