@@ -45,3 +45,16 @@ def test_state_stability_on_structured_data():
     occupied = result.reference_occupancy > 1e-3
     assert np.nanmin(result.per_state_fc[occupied]) > 0.5
     assert -1.0 <= result.mean_fc <= 1.0
+
+
+def test_repeats_are_genuinely_different_inits():
+    # Guards the overlapping-restart-seed bug: with n_init>1, consecutive fit seeds
+    # would share restart pools and every repeat could return the identical fit
+    # (spurious perfect agreement). On ambiguous data, strided seeds must produce
+    # non-identical fits, so matched-FC is not exactly 1.
+    rng = np.random.default_rng(2)
+    sessions = [torch.tensor(rng.standard_normal((10, 80)), dtype=torch.float64) for _ in range(3)]
+    result = state_stability(
+        sessions, n_states=4, max_ldim=3, n_repeats=3, n_init=3, n_iter=20, show_progress=False
+    )
+    assert result.mean_fc < 0.999

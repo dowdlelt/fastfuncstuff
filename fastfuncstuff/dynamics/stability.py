@@ -27,6 +27,11 @@ from fastfuncstuff.dynamics.bsds.fc_match import (
 )
 from fastfuncstuff.dynamics.bsds.model import fit_bsds
 
+# Stride between repeat seeds. fit_bsds consumes seeds fit_seed + [0, n_init) for
+# its restarts (plus a few more for per-session k-means), so any stride comfortably
+# larger than a realistic n_init + n_sessions keeps repeats' restart pools disjoint.
+_SEED_STRIDE = 100003
+
 
 @dataclass
 class StateStabilityResult:
@@ -54,19 +59,31 @@ def state_stability(
 ) -> StateStabilityResult:
     """Refit ``sessions`` ``n_repeats`` times and score state reproducibility.
 
-    Each repeat uses a different ``seed`` (so the k-means init differs); repeat 0
-    is the reference. Every other repeat is Hungarian-matched to the reference by
-    FC pattern, and the matched similarity per reference state is collected.
-    ``**fit_kwargs`` (e.g. ``n_init``, ``n_iter``, ``device``) pass through to
-    :func:`~fastfuncstuff.dynamics.bsds.model.fit_bsds`; keep the per-fit budget
-    modest since this is ``n_repeats`` full fits.
+    Each repeat uses a well-separated ``seed`` (so the k-means init genuinely
+    differs); repeat 0 is the reference. Every other repeat is Hungarian-matched
+    to the reference by FC pattern, and the matched similarity per reference
+    state is collected. ``**fit_kwargs`` (e.g. ``n_init``, ``n_iter``, ``device``)
+    pass through to :func:`~fastfuncstuff.dynamics.bsds.model.fit_bsds`; keep the
+    per-fit budget modest since this is ``n_repeats`` full fits.
+
+    The repeat seeds are strided by a large constant rather than ``+1``: ``fit_bsds``
+    uses restart seeds ``fit_seed + 0..n_init-1`` internally, so consecutive
+    ``fit_seed`` values would overlap those windows and every repeat could pick the
+    *same* best restart — reporting a spurious perfect agreement. The stride keeps
+    each repeat's restart pool disjoint.
     """
     from tqdm.auto import tqdm
 
     if n_repeats < 2:
         raise ValueError("n_repeats must be >= 2 to compare fits")
     models = [
-        fit_bsds(sessions, n_states=n_states, max_ldim=max_ldim, seed=seed + r, **fit_kwargs)
+        fit_bsds(
+            sessions,
+            n_states=n_states,
+            max_ldim=max_ldim,
+            seed=seed + r * _SEED_STRIDE,
+            **fit_kwargs,
+        )
         for r in tqdm(range(n_repeats), desc="stability refits", disable=not show_progress)
     ]
 
