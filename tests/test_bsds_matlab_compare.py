@@ -152,3 +152,56 @@ def test_temporal_agreement_tolerates_length_equalised_export():
     res = compare_to_matlab(ffs, mat)
     assert res.temporal_frames == mat_vit.size  # compared on the shorter (common) length
     assert res.temporal_agreement == 1.0
+
+
+def test_temporal_diagnostics_flags_run_mispairing():
+    from types import SimpleNamespace
+
+    from fastfuncstuff.dynamics.bsds.matlab_compare import (
+        ComparisonResult,
+        MatlabBSDS,
+        temporal_diagnostics,
+    )
+
+    rng = np.random.default_rng(6)
+    k, d, n_runs = 5, 4, 4
+    # Distinct MAP path per run (same states, different sequences).
+    ffs_paths = [rng.integers(0, k, size=60) for _ in range(n_runs)]
+    run_perm = np.array([2, 3, 0, 1])  # MATLAB runs are the ffs runs, permuted
+    mat_paths = [ffs_paths[i].copy() for i in run_perm]
+
+    # Identity state mapping (labels already aligned) so mat2ffs is identity.
+    result = ComparisonResult(
+        ffs_to_matlab={i: i for i in range(k)},
+        fc_similarity=np.ones(k),
+        ffs_occ=np.ones(k),
+        matlab_occ=np.ones(k),
+        ffs_state=np.arange(k),
+        matlab_state=np.arange(k),
+        similarity_matrix=np.eye(k),
+        mean_matched_fc=1.0,
+        occupancy_correlation=1.0,
+        n_occupied_ffs=k,
+        n_occupied_matlab=k,
+        transition_correlation=1.0,
+        lifetime_correlation=1.0,
+        activation_correlation=1.0,
+        temporal_agreement=0.0,
+        temporal_kappa=0.0,
+        temporal_frames=0,
+    )
+    ffs = SimpleNamespace(viterbi_states=[torch.tensor(p) for p in ffs_paths])
+    mat = MatlabBSDS(
+        occupancy=np.ones(k),
+        lifetime=np.ones(k),
+        state_covs=np.stack([np.eye(d) for _ in range(k)]),
+        state_means=np.zeros((k, d)),
+        transition=np.eye(k),
+        viterbi_states=mat_paths,
+    )
+
+    diag = temporal_diagnostics(ffs, mat, result)
+    # Identity pairing is near chance; re-pairing recovers the permutation perfectly.
+    assert diag.identity_agreement < 0.6
+    assert diag.run_permuted_agreement > 0.999
+    assert list(diag.run_permutation) == list(run_perm)

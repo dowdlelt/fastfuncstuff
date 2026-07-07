@@ -245,6 +245,94 @@ def compare_to_matlab(ffs_model, matlab: MatlabBSDS, *, occ_threshold: float = 1
     )
 
 
+@dataclass
+class TemporalDiagnostics:
+    """Why is frame-wise MAP agreement low? Separate the candidate causes."""
+
+    identity_agreement: float  # runs paired i<->i, no shift (what compare_to_matlab reports)
+    per_run_agreement: np.ndarray  # (n_runs,) agreement of each identity-paired run
+    run_permuted_agreement: float  # agreement if runs are optimally re-paired
+    run_permutation: np.ndarray  # ffs run -> matlab run under the best pairing
+    best_shift: int  # global frame shift (TRs) maximising identity-paired agreement
+    shift_agreement: float  # agreement at best_shift
+
+
+def temporal_diagnostics(
+    ffs_model, matlab: MatlabBSDS, result: ComparisonResult, *, max_shift: int = 5
+) -> TemporalDiagnostics:
+    """Diagnose a low frame-wise MAP agreement between an ffs and a MATLAB fit.
+
+    Reuses the FC-matched state assignment in ``result`` to relabel the MATLAB
+    Viterbi paths into ffs labels, then asks three questions:
+
+    - **Run pairing** — if ``run_permuted_agreement`` is much higher than
+      ``identity_agreement``, the runs are mis-paired (ffs run *i* is not MATLAB
+      run *i*): a run-order bug, not a modelling disagreement.
+    - **Frame offset** — if ``best_shift`` is nonzero and lifts agreement, the two
+      paths are time-shifted (a truncation-from-the-wrong-end or off-by-one).
+    - **Genuine disagreement** — if neither re-pairing nor shifting helps, the two
+      fits really do segment the timeseries differently (BSDS states are only
+      weakly identifiable in time; expected between independent local optima).
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    mat2ffs = np.full(matlab.state_covs.shape[0], -1, dtype=np.int64)
+    mat2ffs[result.matlab_state] = result.ffs_state
+    ffs_paths = [_to_np(v).astype(np.int64) for v in ffs_model.viterbi_states]
+    mat_paths = [mat2ffs[np.asarray(v, dtype=np.int64)] for v in matlab.viterbi_states]
+    n = min(len(ffs_paths), len(mat_paths))
+    ffs_paths, mat_paths = ffs_paths[:n], mat_paths[:n]
+
+    def agree(a: np.ndarray, b: np.ndarray) -> tuple[float, int]:
+        t = min(a.shape[0], b.shape[0])
+        a, b = a[:t], b[:t]
+        ok = b >= 0
+        return (float((a[ok] == b[ok]).mean()) if ok.any() else 0.0), int(ok.sum())
+
+    per_run = np.array([agree(ffs_paths[i], mat_paths[i])[0] for i in range(n)])
+
+    # Identity pairing, weighted by frames.
+    def weighted(pairs) -> float:
+        match = tot = 0.0
+        for i, j in pairs:
+            acc, w = agree(ffs_paths[i], mat_paths[j])
+            match += acc * w
+            tot += w
+        return match / max(tot, 1)
+
+    identity = weighted([(i, i) for i in range(n)])
+
+    # Best run re-pairing (Hungarian over the run x run agreement matrix).
+    a_mat = np.array([[agree(ffs_paths[i], mat_paths[j])[0] for j in range(n)] for i in range(n)])
+    row, col = linear_sum_assignment(-a_mat)
+    perm_agree = weighted(list(zip(row, col, strict=True)))
+
+    # Best global frame shift on the identity pairing.
+    def shifted(s: int) -> float:
+        match = tot = 0.0
+        for a, b in zip(ffs_paths, mat_paths, strict=True):
+            t = min(a.shape[0], b.shape[0])
+            a, b = a[:t], b[:t]
+            aa, bb = (a[s:], b[: t - s]) if s > 0 else ((a[: t + s], b[-s:]) if s < 0 else (a, b))
+            ok = bb >= 0
+            match += float((aa[ok] == bb[ok]).sum())
+            tot += int(ok.sum())
+        return match / max(tot, 1)
+
+    shifts = range(-max_shift, max_shift + 1)
+    shift_vals = {s: shifted(s) for s in shifts}
+    best_shift = max(shift_vals, key=lambda s: shift_vals[s])
+
+    return TemporalDiagnostics(
+        identity_agreement=identity,
+        per_run_agreement=per_run,
+        run_permuted_agreement=perm_agree,
+        run_permutation=col,
+        best_shift=int(best_shift),
+        shift_agreement=float(shift_vals[best_shift]),
+    )
+
+
 def plot_comparison(
     result: ComparisonResult, path: str | None = None, *, occ_threshold: float = 1e-3
 ):
