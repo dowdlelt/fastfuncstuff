@@ -5,7 +5,10 @@ import torch
 
 from fastfuncstuff.glm.reml_diagnostics import (
     DatasetDiagnostics,
+    blur_est_1D,
+    fwhmx_report_text,
     global_acf_fit,
+    per_run_acf,
     resolve_mask,
     temporal_mean,
     temporal_std,
@@ -94,7 +97,7 @@ def test_collector_end_to_end():
         "ols": 2.0 * torch.randn(n_masked, nt),
         "reml": 1.0 * torch.randn(n_masked, nt),
     }
-    diag.observe_residuals(resid, mask, want_tsnr=True, want_fwhmx=False)
+    diag.observe_residuals(resid, mask, want_tsnr=True, want_fwhmx=True)
     assert "resid_tsnr_ols" in diag.maps
     assert "resid_tsnr_reml" in diag.maps
     # reml residuals have smaller std -> higher tsnr where masked
@@ -102,3 +105,20 @@ def test_collector_end_to_end():
     assert diag.maps["resid_tsnr_reml"][mv].mean() > diag.maps["resid_tsnr_ols"][mv].mean()
     # outside the mask stays zero
     assert diag.maps["resid_tsnr_ols"][~mv].sum() == 0.0
+    # per-run detail + run-averaged .1D, per label
+    assert "fwhmx_ols" in diag.tables and "blur_est_ols" in diag.tables
+    assert "fwhmx_reml" in diag.tables and "blur_est_reml" in diag.tables
+    # blur_est .1D last line parses to 4 numbers (a b c FWHM)
+    data_line = [ln for ln in diag.tables["blur_est_ols"].splitlines() if not ln.startswith("#")][-1]
+    assert len(data_line.split()) == 4
+
+
+def test_blur_est_is_run_mean():
+    rows = [(1, 0.5, 2.0, 3.0, 8.0), (2, 0.7, 3.0, 5.0, 10.0)]
+    txt = fwhmx_report_text(rows)
+    assert "avg" in txt
+    one_d = blur_est_1D(rows)
+    a, b, c, fwhm = (float(x) for x in one_d.splitlines()[-1].split())
+    assert abs(a - 0.6) < 1e-6 and abs(b - 2.5) < 1e-6 and abs(c - 4.0) < 1e-6 and abs(fwhm - 9.0) < 1e-6
+    # per_run_acf is exercised end-to-end in test_collector_end_to_end
+    assert callable(per_run_acf)

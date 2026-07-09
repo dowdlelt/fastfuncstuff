@@ -2345,6 +2345,7 @@ def main():
                 )
             if args.save_acf:
                 diag.save_table(f"fwhmx_{_label}", f"{args.save_acf}.fwhmx_{_label}.txt")
+                diag.save_table(f"blur_est_{_label}", f"{args.save_acf}.blur_est_{_label}.1D")
         except Exception as _diag_err:  # diagnostics must never break the fit output
             import traceback as _tb
 

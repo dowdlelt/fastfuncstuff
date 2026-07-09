@@ -158,7 +158,7 @@ def global_acf_fit(
     return float(a.item()), float(b.item()), float(c.item()), float(fwhm.item())
 
 
-def fwhmx_report(
+def per_run_acf(
     residuals_2d: Tensor,
     voxel_mask: Tensor,
     run_starts: list[int],
@@ -166,12 +166,14 @@ def fwhmx_report(
     voxdims: tuple[float, float, float],
     nbhd: str = "SPHERE(-9.666)",
     device: torch.device | None = None,
-) -> str:
-    """Per-run ACF fit over the residuals → an AFNI-3dFWHMx-style text report.
+) -> list[tuple[int, float, float, float, float]]:
+    """Fit the ACF model over the residuals once per run.
 
     ``residuals_2d`` is (n_masked_voxels, n_time); ``voxel_mask`` places them back
     on the ``volume_shape`` grid. ``run_starts`` are time indices where each run
-    begins (the last run runs to the end). One ACF fit per run plus a mean row.
+    begins (the last run runs to the end).
+
+    Returns a list of ``(run_number_1based, a, b, c, fwhm_mm)``.
     """
     if device is None:
         device = residuals_2d.device
@@ -180,11 +182,7 @@ def fwhmx_report(
     n_time = residuals_2d.shape[1]
     bounds = list(run_starts) + [n_time]
 
-    lines = [
-        "# 3dFWHMx-style ACF: a*exp(-r*r/(2*b*b)) + (1-a)*exp(-r/c); FWHM in mm",
-        "# run        a        b        c     FWHM",
-    ]
-    rows = []
+    rows: list[tuple[int, float, float, float, float]] = []
     for r in range(len(run_starts)):
         t0, t1 = bounds[r], bounds[r + 1]
         if t1 <= t0:
@@ -194,14 +192,39 @@ def fwhmx_report(
         vol = torch.zeros((t1 - t0, nz, ny, nx), dtype=torch.float32, device=device)
         vol[:, vmask] = run_res.T.float()
         a, b, c, fwhm = global_acf_fit(vol, vmask, voxdims, nbhd=nbhd, device=device)
-        rows.append((a, b, c, fwhm))
-        lines.append(f"  {r + 1:>3}  {a:7.4f}  {b:7.4f}  {c:7.4f}  {fwhm:7.3f}")
+        rows.append((r + 1, a, b, c, fwhm))
+    return rows
 
+
+def fwhmx_report_text(rows: list[tuple[int, float, float, float, float]]) -> str:
+    """Human-readable per-run ACF table (a, b, c, FWHM) with a trailing avg row."""
+    lines = [
+        "# 3dFWHMx-style ACF: a*exp(-r*r/(2*b*b)) + (1-a)*exp(-r/c); FWHM in mm",
+        "# run        a        b        c     FWHM",
+    ]
+    for run, a, b, c, fwhm in rows:
+        lines.append(f"  {run:>3}  {a:7.4f}  {b:7.4f}  {c:7.4f}  {fwhm:7.3f}")
     if rows:
-        arr = np.array(rows)
-        m = arr.mean(0)
+        m = np.array([r[1:] for r in rows]).mean(0)
         lines.append(f"  avg  {m[0]:7.4f}  {m[1]:7.4f}  {m[2]:7.4f}  {m[3]:7.3f}")
     return "\n".join(lines) + "\n"
+
+
+def blur_est_1D(rows: list[tuple[int, float, float, float, float]]) -> str:
+    """Run-averaged ACF params + FWHM as a 1-line .1D (AFNI blur-estimate style).
+
+    One data line ``a b c FWHM`` (the mean over runs), ready to feed the ACF
+    triple to ``3dClustSim -acf a b c``. Empty runs are skipped in the mean.
+    """
+    a = b = c = fwhm = 0.0
+    if rows:
+        m = np.array([r[1:] for r in rows]).mean(0)
+        a, b, c, fwhm = (float(v) for v in m)
+    return (
+        "# run-averaged spatial ACF of the residuals (3dFWHMx -ACF)\n"
+        "# a b c FWHM   (feed 'a b c' to 3dClustSim -acf; FWHM in mm)\n"
+        f"{a:.5f} {b:.5f} {c:.5f} {fwhm:.5f}\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +297,7 @@ class DatasetDiagnostics:
                 vol[np.asarray(vm.cpu())] = tvals
                 self.maps[f"resid_tsnr_{label}"] = vol
             if want_fwhmx:
-                self.tables[f"fwhmx_{label}"] = fwhmx_report(
+                rows = per_run_acf(
                     resid,
                     voxel_mask,
                     self.run_starts,
@@ -283,6 +306,9 @@ class DatasetDiagnostics:
                     nbhd=nbhd,
                     device=self.device,
                 )
+                # Per-run detail (matches the current .txt) + run-averaged .1D.
+                self.tables[f"fwhmx_{label}"] = fwhmx_report_text(rows)
+                self.tables[f"blur_est_{label}"] = blur_est_1D(rows)
 
     # -- saving --------------------------------------------------------------
     def save_map(self, name: str, path, affine: np.ndarray | None = None, header=None) -> bool:
