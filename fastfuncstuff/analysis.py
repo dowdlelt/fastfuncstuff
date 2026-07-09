@@ -402,6 +402,7 @@ def analyze_from_design_matrix(
     slibase_files: list[str | Path] | None = None,
     slibase_files_sm: list[str | Path] | None = None,
     censor_file: str | Path | None = None,
+    want_residuals: bool = False,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -918,6 +919,7 @@ def analyze_from_design_matrix(
             want_r2_semipartial=want_r2_semipartial,
             r2_semipartial_mode=r2_semipartial_mode,
             debug_memory=debug_memory,
+            want_residuals=want_residuals,
         )
 
     elif method == "arma11":
@@ -1266,6 +1268,7 @@ def analyze_from_design_matrix(
                 dsort=dsort_tensor,
                 dsort_labels=dsort_labels,
                 want_dsort_nods=want_dsort_nods,
+                want_residuals=want_residuals,
             )
 
     else:

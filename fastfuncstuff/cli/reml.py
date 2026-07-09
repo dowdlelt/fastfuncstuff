@@ -2264,6 +2264,8 @@ def main():
             slibase_files=args.slibase,
             slibase_files_sm=args.slibase_sm,
             censor_file=args.censor,
+            want_residuals=bool(args.Rerrts)
+            or (want_diag and bool(args.save_tsnr or args.save_acf)),
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
@@ -2283,16 +2285,49 @@ def main():
     print("✅ Analysis complete!")
     print()
 
-    # ── Whole-dataset diagnostics (grand mean / raw tSNR) ───────────────────
+    # ── Whole-dataset diagnostics (grand mean / tSNR / FWHMx) ───────────────
     # Bonus maps from data that was resident for the fit; never fatal to the
-    # main analysis. Residual-derived maps (resid tSNR, FWHMx) are wired in a
-    # follow-up once want_residuals is plumbed through the fit.
+    # main analysis (wrapped so a diagnostics bug can't lose the GLM output).
     if diag is not None:
         try:
             _diag_meta = preproc_cached_metadata or {}
             _diag_affine = _diag_meta.get("affine")
             _diag_header = _diag_meta.get("nifti_header")
             print("🧪 Writing whole-dataset diagnostics...")
+
+            # Residual-derived maps: label by the model that ran (OLS residuals
+            # in OLS mode, REML/GLS residuals under -reml). residuals are
+            # (n_fit_voxels, n_time); place them onto the full grid, then extract
+            # at the diagnostics mask (the -mask, else an automask of the grand
+            # mean) for resid tSNR + per-run FWHMx.
+            _resid = getattr(results, "residuals", None)
+            _label = "ols" if analysis_method == "ols" else "reml"
+            if _resid is not None and (args.save_tsnr or args.save_acf):
+                from fastfuncstuff.glm.reml_diagnostics import resolve_mask
+
+                _nvox = int(np.prod(diag.volume_shape))
+                _rt = _resid.detach().cpu().float() if hasattr(_resid, "detach") else torch.as_tensor(np.asarray(_resid), dtype=torch.float32)
+                _nt = _rt.shape[1]
+                _fit_vm = getattr(results, "voxel_mask", None)
+                if _fit_vm is not None:
+                    _vmf = torch.as_tensor(np.asarray(_fit_vm)).reshape(-1).bool()
+                    _full = torch.zeros(_nvox, _nt)
+                    _full[_vmf] = _rt
+                else:
+                    _full = _rt  # fit used all voxels
+                _gm = torch.from_numpy(diag.maps["grandmean"])
+                _user_mask = None
+                if args.mask:
+                    _user_mask = torch.from_numpy(
+                        (load_nifti(args.mask).get_fdata() > 0).astype("float32")
+                    )
+                _dmask = resolve_mask(_user_mask, _gm)
+                _dmf = _dmask.reshape(-1).bool()
+                diag.observe_residuals(
+                    {_label: _full[_dmf]}, _dmask,
+                    want_tsnr=bool(args.save_tsnr), want_fwhmx=bool(args.save_acf),
+                )
+
             if args.save_grandmean:
                 diag.save_map(
                     "grandmean",
@@ -2301,14 +2336,20 @@ def main():
                     _diag_header,
                 )
             if args.save_tsnr:
+                diag.save_map("raw_tsnr", f"{args.save_tsnr}.raw_tsnr.nii.gz", _diag_affine, _diag_header)
                 diag.save_map(
-                    "raw_tsnr",
-                    f"{args.save_tsnr}.raw_tsnr.nii.gz",
+                    f"resid_tsnr_{_label}",
+                    f"{args.save_tsnr}.resid_tsnr_{_label}.nii.gz",
                     _diag_affine,
                     _diag_header,
                 )
+            if args.save_acf:
+                diag.save_table(f"fwhmx_{_label}", f"{args.save_acf}.fwhmx_{_label}.txt")
         except Exception as _diag_err:  # diagnostics must never break the fit output
+            import traceback as _tb
+
             print(f"  ⚠️  diagnostics failed (continuing): {_diag_err}")
+            _tb.print_exc()
         print()
 
     # Write outputs
