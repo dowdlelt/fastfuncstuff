@@ -85,3 +85,47 @@ def test_estimate_latent_dim_low_rank():
     # Capped at D-1 for full-rank noise.
     full = estimate_latent_dim([torch.tensor(rng.standard_normal((5, 400)))], energy=0.99)
     assert full <= 4
+
+
+def test_detrend_projects_out_motion_per_session():
+    """Motion columns are removed; a signal orthogonal to motion survives."""
+    rng = np.random.default_rng(3)
+    n, d = 150, 4
+    motion = rng.standard_normal((n, 6)).astype(np.float32)  # (N, 6)
+    betas = rng.standard_normal((d, 6)).astype(np.float32)
+    # Each ROI = a motion-driven part + a signal orthogonal to the motion basis.
+    signal = rng.standard_normal((d, n)).astype(np.float32)
+    # Orthogonalise the signal against motion so it should survive projection.
+    q, _ = np.linalg.qr(motion)  # (N, 6)
+    signal = signal - (signal @ q) @ q.T
+    y = torch.tensor(signal + betas @ motion.T, dtype=torch.float32)  # (D, N)
+
+    out = detrend_session(y, degree=-1, motion=motion)  # motion only, no poly
+    # Motion component removed: residual is ~orthogonal to every motion column.
+    resid = out.numpy()
+    proj = resid @ q  # (D, 6) coordinates along the motion basis
+    assert np.abs(proj).max() < 1e-3
+    # The orthogonal signal is preserved.
+    np.testing.assert_allclose(resid, signal, atol=1e-3)
+
+
+def test_detrend_motion_transpose_and_length_check():
+    y = torch.randn(3, 40)
+    # (K, N) is accepted (auto-transposed).
+    m_kn = torch.randn(6, 40)
+    out = detrend_session(y, degree=0, motion=m_kn)
+    assert out.shape == (3, 40)
+    # Wrong length raises.
+    with pytest.raises(ValueError):
+        detrend_session(y, degree=0, motion=torch.randn(39, 6))
+
+
+def test_preprocess_sessions_motion_list_and_count_check():
+    rng = np.random.default_rng(5)
+    sessions = [rng.standard_normal((3, 30)).astype(np.float32) for _ in range(2)]
+    motion = [rng.standard_normal((30, 6)).astype(np.float32) for _ in range(2)]
+    out = preprocess_sessions(sessions, detrend_degree=1, standardize=None, motion=motion)
+    assert len(out) == 2 and out[0].shape == (3, 30)
+    # Mismatched motion count is rejected.
+    with pytest.raises(ValueError):
+        preprocess_sessions(sessions, motion=motion[:1])

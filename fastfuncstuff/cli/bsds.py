@@ -276,6 +276,16 @@ def build_parser() -> argparse.ArgumentParser:
         "-detrend_degree", "-detrend-degree", type=int, default=1, help="Legendre drift degree."
     )
     p.add_argument(
+        "-motion",
+        "-motion_files",
+        "-motion-files",
+        nargs="+",
+        default=None,
+        help="Motion-parameter files (whitespace-delimited, one row per timepoint, e.g. 6 "
+        "rigid-body columns), one file per run in the same order as -input. Projected out "
+        "per run alongside the drift (block-diagonal), not across run boundaries.",
+    )
+    p.add_argument(
         "-standardize",
         choices=["zscore", "varnorm", "demean", "none"],
         default="zscore",
@@ -606,10 +616,30 @@ def main(argv: list[str] | None = None) -> int:
         f"D={sessions_np[0].shape[0]} ROIs, "
         f"N={[s.shape[1] for s in sessions_np]} timepoints"
     )
+    motion = None
+    if args.motion:
+        if len(args.motion) != len(sessions_np):
+            raise SystemExit(
+                f"-motion has {len(args.motion)} file(s) but there are {len(sessions_np)} "
+                "run(s); pass one motion file per -input run, in the same order"
+            )
+        motion = []
+        for mp, s in zip(args.motion, sessions_np, strict=True):
+            m = np.loadtxt(mp)
+            if m.ndim == 1:
+                m = m[:, None]
+            if m.shape[0] != s.shape[1]:
+                raise SystemExit(
+                    f"{mp}: {m.shape[0]} motion rows but the run has {s.shape[1]} timepoints"
+                )
+            motion.append(m)
+        print(f"  projecting out motion: {motion[0].shape[1]} column(s)/run, per-run (block-diagonal)")
+
     sessions = preprocess_sessions(
         sessions_np,
         detrend_degree=args.detrend_degree,
         standardize=None if args.standardize == "none" else args.standardize,
+        motion=motion,
         device=device,
     )
 

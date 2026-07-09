@@ -30,10 +30,18 @@ def detrend_session(
     y: torch.Tensor,
     degree: int,
     *,
+    motion: torch.Tensor | np.ndarray | None = None,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Remove Legendre-polynomial drift from each ROI of one ``(D, N)`` session.
+    """Project Legendre drift (and optional motion nuisance) out of one session.
+
+    Both the polynomial drift and the motion regressors are projected out **per
+    session** in a single orthogonalised pass, so a run's nuisance never leaks
+    across a run boundary — the block-diagonal-nuisance discipline, achieved by
+    processing one run at a time rather than materialising a big block-diagonal
+    matrix. Projecting the combined ``[poly | motion]`` basis (not sequentially)
+    handles collinearity between drift and slow motion correctly.
 
     Parameters
     ----------
@@ -41,26 +49,49 @@ def detrend_session(
         ``(D, N)`` ROI-by-time session.
     degree : int
         Maximum Legendre degree to project out (0 = constant/demean, 1 = linear,
-        ...). ``degree < 0`` returns ``y`` unchanged (no detrend, no demean).
+        ...). ``degree < 0`` skips the polynomial basis (motion may still apply).
+    motion : array-like, optional
+        This run's motion parameters, ``(N, K)`` (or ``(K, N)`` — auto-transposed),
+        e.g. K=6 rigid-body columns. Columns are used as-is; add derivatives/squares
+        upstream if wanted. ``None`` = no motion projection.
     device, dtype
         Where/what to compute in. Defaults to ``y``'s device and float32.
 
     Returns
     -------
     torch.Tensor
-        ``(D, N)`` detrended session (residual after projecting out the basis).
+        ``(D, N)`` residual after projecting out the combined nuisance basis.
     """
     if device is None:
         device = y.device
     y = to_tensor(y, dtype=dtype, device=device)
-    if degree < 0:
-        return y
-
     n = y.shape[1]
-    # (N, degree+1) orthogonal Legendre basis; QR guarantees an orthonormal Q so
-    # the projection is numerically clean regardless of degree.
-    poly = construct_polynomial_matrix(n, degree, device=device, dtype=dtype)
-    q, _ = torch.linalg.qr(poly, mode="reduced")  # (N, degree+1)
+
+    cols: list[torch.Tensor] = []
+    if degree >= 0:
+        # (N, degree+1) orthogonal Legendre basis (never raw monomials).
+        cols.append(construct_polynomial_matrix(n, degree, device=device, dtype=dtype))
+    if motion is not None:
+        m = to_tensor(motion, dtype=dtype, device=device)
+        if m.ndim != 2:
+            raise ValueError(f"motion must be 2-D (N, K); got shape {tuple(m.shape)}")
+        if m.shape[0] != n:
+            # Accept (K, N) by transposing; otherwise it's a length mismatch.
+            if m.shape[1] == n:
+                m = m.transpose(0, 1).contiguous()
+            else:
+                raise ValueError(
+                    f"motion has {m.shape[0]} rows but the session has N={n} timepoints"
+                )
+        cols.append(m)
+
+    if not cols:
+        return y  # degree < 0 and no motion: nothing to remove
+
+    basis = torch.cat(cols, dim=1)  # (N, degree+1+K)
+    # QR gives an orthonormal Q so the projection is numerically clean even when
+    # drift and motion columns are correlated.
+    q, _ = torch.linalg.qr(basis, mode="reduced")
     yt = y.transpose(0, 1)  # (N, D)
     resid = yt - q @ (q.transpose(0, 1) @ yt)
     return resid.transpose(0, 1).contiguous()
@@ -98,11 +129,12 @@ def preprocess_sessions(
     *,
     detrend_degree: int = 1,
     standardize: str | None = "zscore",
+    motion: Sessions | None = None,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     show_progress: bool | None = None,
 ) -> list[torch.Tensor]:
-    """Detrend + standardise a list of ``(D, N)`` sessions for BSDS.
+    """Detrend (+ optional motion) + standardise a list of ``(D, N)`` sessions.
 
     Every session must share the same ROI count ``D`` (the model learns one
     observation model across all of them); ``N`` may differ per session.
@@ -115,6 +147,11 @@ def preprocess_sessions(
         Legendre drift degree removed per session (see :func:`detrend_session`).
     standardize : str or None, default ``"zscore"``
         Per-ROI standardisation (see :func:`standardize_session`).
+    motion : list of ``(N, K)`` array-like, optional
+        One motion-parameter array per session (same order/count as ``sessions``),
+        projected out per run together with the drift (block-diagonal by
+        construction). Each must have ``N`` rows matching its session. ``None`` =
+        no motion projection.
     device, dtype
         Output device/dtype. ``device=None`` keeps the current device.
     show_progress : bool or None
@@ -136,18 +173,26 @@ def preprocess_sessions(
                 f"session {i} has D={s.shape[0]} but session 0 has D={d0}; "
                 "all sessions must share the same ROI count"
             )
+    if motion is not None and len(motion) != len(sessions):
+        raise ValueError(
+            f"motion has {len(motion)} entries but there are {len(sessions)} sessions; "
+            "pass one motion array per run (same order)"
+        )
 
     if show_progress is None:
         show_progress = len(sessions) >= 8
     out: list[torch.Tensor] = []
-    for s in tqdm(
-        sessions,
-        desc="preprocess sessions",
-        leave=True,
-        disable=not show_progress,
+    for i, s in enumerate(
+        tqdm(sessions, desc="preprocess sessions", leave=True, disable=not show_progress)
     ):
         y = to_tensor(s, dtype=dtype, device=device)
-        y = detrend_session(y, detrend_degree, device=device, dtype=dtype)
+        y = detrend_session(
+            y,
+            detrend_degree,
+            motion=None if motion is None else motion[i],
+            device=device,
+            dtype=dtype,
+        )
         y = standardize_session(y, standardize)
         out.append(y)
     return out
