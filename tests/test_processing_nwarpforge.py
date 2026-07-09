@@ -27,6 +27,7 @@ from fastfuncstuff.processing.nwarpforge import (
     compute_cardinal_affine,
     identify_transform_type,
     load_affine_1D,
+    load_warp,
     parse_nwarp_string,
     prepare_warp_for_grid,
 )
@@ -731,3 +732,57 @@ class TestAffineFastPath:
         assert len(sub) == 3
         for k, t in enumerate(range(2, 5)):
             assert torch.allclose(sub[k], full[t], atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Warp mm round-trip convention (DICOM on disk; save<->load is identity)
+# ---------------------------------------------------------------------------
+
+
+class TestWarpMmRoundtrip:
+    """save_warp_field(units='mm') writes AFNI DICOM-mm and round-trips cleanly.
+
+    Regression for the bug where FFS wrote RAS-mm while load_warp assumed
+    DICOM-mm, double-flipping x,y (3dQwarp on the same data showed inverted x,y).
+    """
+
+    def _aff(self):
+        # Radiological-ish cardinal affine (negative x,y diagonal), like an EPI.
+        return np.array(
+            [[-3.0, 0, 0, 90.0], [0, -3.0, 0, 90.0], [0, 0, 3.0, -40.0], [0, 0, 0, 1.0]]
+        )
+
+    def test_save_load_roundtrip_is_identity(self):
+        from fastfuncstuff.processing.io import save_warp_field
+
+        aff = self._aff()
+        xd = torch.full((6, 7, 8), 2.0)
+        yd = torch.full((6, 7, 8), 1.0)
+        zd = torch.full((6, 7, 8), 0.5)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "w.nii.gz")
+            save_warp_field(xd, yd, zd, p, header_info={"affine": aff}, units="mm")
+            w = load_warp(p, units="mm")
+            vx, vy, vz = _nifti_mm_to_voxels(w.xd, w.yd, w.zd, aff)
+        assert torch.allclose(vx, xd, atol=1e-4)
+        assert torch.allclose(vy, yd, atol=1e-4)
+        assert torch.allclose(vz, zd, atol=1e-4)
+
+    def test_on_disk_is_dicom_mm(self):
+        """On disk x,y are DICOM (negated vs RAS); z matches RAS."""
+        import nibabel as nib
+
+        from fastfuncstuff.processing.io import save_warp_field
+
+        aff = self._aff()  # rs diag = (-3, -3, 3)
+        xd = torch.full((6, 7, 8), 2.0)  # +2 vox
+        yd = torch.full((6, 7, 8), 1.0)
+        zd = torch.full((6, 7, 8), 0.5)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "w.nii.gz")
+            save_warp_field(xd, yd, zd, p, header_info={"affine": aff}, units="mm")
+            arr = np.asarray(nib.load(p).dataobj)  # (nx,ny,nz,3)
+        # RAS-mm would be (-6, -3, 1.5); DICOM negates x,y -> (+6, +3, 1.5).
+        assert np.allclose(arr[..., 0], 6.0, atol=1e-3)
+        assert np.allclose(arr[..., 1], 3.0, atol=1e-3)
+        assert np.allclose(arr[..., 2], 1.5, atol=1e-3)

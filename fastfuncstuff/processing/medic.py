@@ -450,10 +450,11 @@ def save_medic_warp(
     ffs_nwarp then composes it (with ``-master``) into a final single-resample
     chain to atlas, exactly like a static warp.
 
-    ``save_warp_field(units="mm")`` + ``load_warp(units="mm")`` apply a net x/y
-    sign flip (the DICOM<->NIfTI convention), so we feed the negated displacement
-    for i/j phase encoding; the cardinal voxel-size factor cancels, so this is
-    affine-independent. Verified against :func:`undistort_series` in tests.
+    On-disk convention is AFNI DICOM-mm. The per-frame path routes through
+    ``save_warp_field(units="mm")``, which now does the RAS->DICOM x,y negation
+    itself, so we feed the raw pull displacement. The 5D path bypasses
+    save_warp_field (it writes one 5D file directly), so it applies the RAS->DICOM
+    negation inline via ``feed_sign``. Verified against :func:`undistort_series`.
 
     Returns the path/glob to pass to ``ffs_nwarp -nwarp`` (a ``warp_*`` wildcard
     for the default per-frame files, or the single 5D file when ``as_5d``).
@@ -465,14 +466,16 @@ def save_medic_warp(
     from .nwarpforge import compute_cardinal_affine
 
     cardinal = compute_cardinal_affine(affine)
-    feed_sign = -1.0 if pe_nifti_axis in (0, 1) else 1.0
-    disp_feed = (feed_sign * disp_pull).detach().cpu().numpy()  # (nx,ny,nz,T)
-    nx, ny, nz, nt = disp_feed.shape
+    disp_np = disp_pull.detach().cpu().numpy()  # (nx,ny,nz,T) raw pull, voxels
+    nx, ny, nz, nt = disp_np.shape
 
     if as_5d:
+        # Direct 5D write (no save_warp_field): convert RAS-mm -> DICOM-mm inline.
+        # RAS-mm = cardinal[pe,pe]*disp; DICOM negates x,y (feed_sign).
+        feed_sign = -1.0 if pe_nifti_axis in (0, 1) else 1.0
         rpp = float(cardinal[pe_nifti_axis, pe_nifti_axis])  # signed PE voxel mm
         warp = np.zeros((nx, ny, nz, nt, 3), dtype=np.float32)
-        warp[..., pe_nifti_axis] = rpp * disp_feed
+        warp[..., pe_nifti_axis] = rpp * feed_sign * disp_np
         path = f"{prefix_stem}_warp{nii_ext}"
         save_nifti(warp, path, affine=cardinal)
         return path
@@ -480,7 +483,7 @@ def save_medic_warp(
     warp_dir = f"{prefix_stem}_warp"
     os.makedirs(warp_dir, exist_ok=True)
     for t in range(nt):
-        comp = torch.from_numpy(disp_feed[:, :, :, t]).permute(2, 1, 0).contiguous()
+        comp = torch.from_numpy(disp_np[:, :, :, t]).permute(2, 1, 0).contiguous()
         zeros = torch.zeros_like(comp)
         xyz = [zeros, zeros, zeros]
         xyz[pe_nifti_axis] = comp  # (nz,ny,nx) voxel disp on the PE axis
