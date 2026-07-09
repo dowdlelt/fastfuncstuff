@@ -1036,6 +1036,14 @@ def voxel_matrix_to_dicom(
       1. M_ras = source_ijk2ras @ M_ijk @ inv(base_ijk2ras)
       2. M_dicom = D @ M_ras @ D  where D = diag(-1,-1,1,1)
 
+    The ijk→ras matrices use the CARDINAL (deobliqued) affine, matching AFNI's
+    ``ijk_to_dicom`` (axis-snapped), which every AFNI matrix conversion uses —
+    NOT the raw oblique sform. For cardinal data the two coincide; for oblique
+    data, using the raw sform here silently rotated cross-modal matrices by the
+    obliquity angle, so ffs's own ``.aff12.1D`` matrices disagreed with
+    ``3dNwarpApply`` / ``ffs_nwarp`` (which are cardinal). See
+    [[project_nwarp_oblique_matrix_interop]].
+
     Args:
         M_ijk: (4, 4) matrix mapping base voxels to source voxels.
         base_affine: NIfTI affine for the base image.
@@ -1044,7 +1052,11 @@ def voxel_matrix_to_dicom(
     Returns:
         (4, 4) matrix in DICOM mm coordinates (AFNI convention).
     """
+    from .nwarpforge import compute_cardinal_affine
+
     device = M_ijk.device
+    base_affine = compute_cardinal_affine(np.asarray(base_affine, dtype=np.float64))
+    source_affine = compute_cardinal_affine(np.asarray(source_affine, dtype=np.float64))
     base_ijk2ras = _ijk2ras_matrix(base_affine).to(device)
     source_ijk2ras = _ijk2ras_matrix(source_affine).to(device)
     base_ras2ijk = torch.linalg.inv(base_ijk2ras)
@@ -1068,6 +1080,10 @@ def dicom_matrix_to_voxel(
       1. M_ras = D @ M_dicom @ D  where D = diag(-1,-1,1,1)
       2. M_ijk = inv(source_ijk2ras) @ M_ras @ base_ijk2ras
 
+    Uses the CARDINAL (deobliqued) affine to match AFNI's ``ijk_to_dicom``; the
+    exact inverse of :func:`voxel_matrix_to_dicom`. See
+    [[project_nwarp_oblique_matrix_interop]].
+
     Args:
         M_dicom: (4, 4) or (T, 4, 4) matrix/matrices in DICOM mm coordinates.
         base_affine: NIfTI affine for the base image.
@@ -1076,8 +1092,12 @@ def dicom_matrix_to_voxel(
     Returns:
         (4, 4) or (T, 4, 4) matrix/matrices mapping base voxels to source voxels.
     """
+    from .nwarpforge import compute_cardinal_affine
+
     device = M_dicom.device
     D = _RAS_TO_DICOM.to(device)
+    base_affine = compute_cardinal_affine(np.asarray(base_affine, dtype=np.float64))
+    source_affine = compute_cardinal_affine(np.asarray(source_affine, dtype=np.float64))
     base_ijk2ras = _ijk2ras_matrix(base_affine).to(device)
     source_ijk2ras = _ijk2ras_matrix(source_affine).to(device)
     source_ras2ijk = torch.linalg.inv(source_ijk2ras)
