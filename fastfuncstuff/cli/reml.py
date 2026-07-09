@@ -691,6 +691,14 @@ Examples:
         help="Microtime resolution (seconds, default: 0.1)",
     )
     onset_group.add_argument(
+        "-tr",
+        "-TR",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Override TR from input files (seconds). Default: read from the header.",
+    )
+    onset_group.add_argument(
         "-polort",
         type=int,
         default=None,
@@ -1014,10 +1022,15 @@ def main():
         print(f"   • {f}")
     print()
 
-    # Get TR from first file
-    tr = get_tr_from_file(input_files[0])
-    args.tr = tr
-    print(f"⏱️  TR: {tr:.3f} seconds")
+    # Get TR: an explicit -tr overrides whatever is in the header (headers get
+    # mangled by upstream tools, so being explicit at the modeling stage is safer).
+    if args.tr is not None:
+        tr = args.tr
+        print(f"⏱️  TR: {tr:.3f} seconds (specified)")
+    else:
+        tr = get_tr_from_file(input_files[0])
+        args.tr = tr
+        print(f"⏱️  TR: {tr:.3f} seconds (from header)")
     print()
 
     # Detect input format (for informational purposes only)
@@ -1171,10 +1184,11 @@ def main():
             # ── BIDS events TSV path ─────────────────────────────────────────
             from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
 
-            # Validate: one TSV per input run
-            if len(args.events) != len(input_files):
+            # Validate: one TSV per input run, OR a single shared TSV to
+            # broadcast across all runs (identical timing every run).
+            if len(args.events) not in (1, len(input_files)):
                 print(
-                    f"ERROR: -events requires one TSV per run: "
+                    f"ERROR: -events requires one TSV per run or a single shared TSV: "
                     f"got {len(args.events)} events files but {len(input_files)} input datasets."
                 )
                 sys.exit(1)
@@ -1182,7 +1196,13 @@ def main():
             # Custom column mapping
             event_cols = tuple(args.event_cols) if args.event_cols else None
 
-            print("Parsing BIDS events files...")
+            if len(args.events) == 1 and len(input_files) > 1:
+                print(
+                    f"Parsing BIDS events file (broadcasting 1 events file across "
+                    f"{len(input_files)} runs)..."
+                )
+            else:
+                print("Parsing BIDS events files...")
             # Show the sorted order so the user can confirm alignment
             sorted_event_paths = sort_bids_event_files(args.events)
             for ep in sorted_event_paths:
@@ -1194,6 +1214,7 @@ def main():
                     event_ignore=args.event_ignore,
                     event_cols=event_cols,
                     round_durations=args.round_durations,
+                    n_runs=len(input_files),
                 )
             except (FileNotFoundError, ValueError) as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)

@@ -120,6 +120,7 @@ def parse_bids_events(
     event_ignore: list[str] | None = None,
     event_cols: tuple[str, str, str] | None = None,
     round_durations: int | None = None,
+    n_runs: int | None = None,
 ) -> tuple[list[list[np.ndarray]], list[float], list[str]]:
     """
     Parse BIDS *_events.tsv files into onset/duration/label structures.
@@ -148,6 +149,13 @@ def parse_bids_events(
         vs ``3.0``) from being treated as distinct durations.
         ``0`` rounds to integers, ``1`` to tenths, etc.
         Default: ``('onset', 'duration', 'trial_type')``.
+    n_runs : int or None, optional
+        Number of runs to produce.  When a **single** events file is passed and
+        ``n_runs > 1``, the parsed onsets are broadcast (replicated) across all
+        ``n_runs`` runs.  This supports datasets where every run shares the same
+        stimulus timing and therefore ships one BIDS ``*_events.tsv`` for the
+        whole task (a valid BIDS pattern).  When more than one file is given,
+        ``n_runs`` (if set) must equal the file count; otherwise it is ignored.
 
     Returns
     -------
@@ -182,7 +190,13 @@ def parse_bids_events(
 
     # ── Sort files by run number ─────────────────────────────────────────────
     sorted_files = sort_bids_event_files(event_files)
-    n_runs = len(sorted_files)
+    n_files = len(sorted_files)
+
+    if n_runs is not None and n_files > 1 and n_runs != n_files:
+        raise ValueError(
+            f"n_runs={n_runs} but {n_files} events files were given; broadcasting "
+            "is only supported from a single shared events file."
+        )
 
     # ── Read every TSV ───────────────────────────────────────────────────────
     # run_events[run_idx] = list of (onset, duration, trial_type)
@@ -210,7 +224,7 @@ def parse_bids_events(
 
     # ── Populate all_onsets and collect durations ────────────────────────────
     all_onsets: list[list[np.ndarray]] = [
-        [np.array([], dtype=np.float64) for _ in range(n_runs)] for _ in range(n_conditions)
+        [np.array([], dtype=np.float64) for _ in range(n_files)] for _ in range(n_conditions)
     ]
     # cond_dur_sets[cond_idx] collects all observed durations for that condition
     cond_dur_sets: list[set[float]] = [set() for _ in range(n_conditions)]
@@ -248,5 +262,11 @@ def parse_bids_events(
                 file=sys.stderr,
             )
             durations.append(median_dur)
+
+    # ── Broadcast a single shared events file across all runs ─────────────────
+    # A dataset with identical timing every run may ship one *_events.tsv for the
+    # whole task; replicate its onsets so downstream code sees one run each.
+    if n_runs is not None and n_files == 1 and n_runs > 1:
+        all_onsets = [[run_onsets[0].copy() for _ in range(n_runs)] for run_onsets in all_onsets]
 
     return all_onsets, durations, condition_labels

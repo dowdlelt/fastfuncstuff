@@ -221,6 +221,86 @@ class TestParseMultiRun:
 
 
 # ---------------------------------------------------------------------------
+# parse_bids_events — single shared file broadcast across runs
+# ---------------------------------------------------------------------------
+
+
+class TestBroadcastSharedFile:
+    """A dataset with identical timing every run may ship one *_events.tsv for
+    the whole task. n_runs broadcasts that single file across all runs."""
+
+    def test_single_file_broadcasts_to_n_runs(self, tmp_path):
+        f = _write_tsv(
+            tmp_path / "task-foo_events.tsv",
+            [
+                {"onset": 10.0, "duration": 20.0, "trial_type": "block"},
+                {"onset": 70.0, "duration": 20.0, "trial_type": "block"},
+            ],
+        )
+        all_onsets, durations, labels = parse_bids_events([f], n_runs=5)
+        assert labels == ["block"]
+        assert durations == [20.0]
+        # One condition, five runs, each identical to the parsed onsets.
+        assert len(all_onsets[0]) == 5
+        for run_idx in range(5):
+            np.testing.assert_array_equal(all_onsets[0][run_idx], [10.0, 70.0])
+
+    def test_broadcast_runs_are_independent_copies(self, tmp_path):
+        """Mutating one run's onset array must not touch the others (no aliasing)."""
+        f = _write_tsv(
+            tmp_path / "task-foo_events.tsv",
+            [{"onset": 0.0, "duration": 1.0, "trial_type": "A"}],
+        )
+        all_onsets, _, _ = parse_bids_events([f], n_runs=3)
+        all_onsets[0][0][0] = 999.0
+        assert all_onsets[0][1].tolist() == [0.0]
+        assert all_onsets[0][2].tolist() == [0.0]
+
+    def test_n_runs_one_is_noop(self, tmp_path):
+        f = _write_tsv(
+            tmp_path / "task-foo_events.tsv",
+            [{"onset": 0.0, "duration": 1.0, "trial_type": "A"}],
+        )
+        all_onsets, _, _ = parse_bids_events([f], n_runs=1)
+        assert len(all_onsets[0]) == 1
+
+    def test_default_no_broadcast(self, tmp_path):
+        """Without n_runs, a single file yields a single run (unchanged behavior)."""
+        f = _write_tsv(
+            tmp_path / "task-foo_events.tsv",
+            [{"onset": 0.0, "duration": 1.0, "trial_type": "A"}],
+        )
+        all_onsets, _, _ = parse_bids_events([f])
+        assert len(all_onsets[0]) == 1
+
+    def test_multi_file_with_mismatched_n_runs_raises(self, tmp_path):
+        f1 = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [{"onset": 0.0, "duration": 1.0, "trial_type": "A"}],
+        )
+        f2 = _write_tsv(
+            tmp_path / "run-2_events.tsv",
+            [{"onset": 5.0, "duration": 1.0, "trial_type": "A"}],
+        )
+        with pytest.raises(ValueError, match="broadcasting"):
+            parse_bids_events([f1, f2], n_runs=5)
+
+    def test_multi_file_matching_n_runs_ok(self, tmp_path):
+        """n_runs equal to the file count is accepted and does not broadcast."""
+        f1 = _write_tsv(
+            tmp_path / "run-1_events.tsv",
+            [{"onset": 0.0, "duration": 1.0, "trial_type": "A"}],
+        )
+        f2 = _write_tsv(
+            tmp_path / "run-2_events.tsv",
+            [{"onset": 5.0, "duration": 1.0, "trial_type": "A"}],
+        )
+        all_onsets, _, _ = parse_bids_events([f1, f2], n_runs=2)
+        assert all_onsets[0][0].tolist() == [0.0]
+        assert all_onsets[0][1].tolist() == [5.0]
+
+
+# ---------------------------------------------------------------------------
 # Duration aggregation
 # ---------------------------------------------------------------------------
 
