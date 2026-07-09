@@ -168,6 +168,7 @@ def optimize_warp_params_batched(
     lr: float = 0.005,
     tolerance: float = 1e-4,
     patience: int = 5,
+    clip_group_size: int | None = None,
 ) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Optimize parameters for B patches simultaneously using autograd.
 
@@ -185,6 +186,14 @@ def optimize_warp_params_batched(
         tolerance: Per-patch relative-improvement threshold for "stalled".
         patience: Consecutive stalled steps before a patch is considered
             converged. The loop stops only once ALL patches have converged.
+        clip_group_size: If set, clip the gradient norm independently over
+            consecutive groups of this many rows (to ``max_norm=1.0`` each),
+            instead of one global norm over the whole batch. Used by the
+            source-batched qwarp so a batch of ``N`` volumes clips exactly as
+            the ``N`` single-volume runs would (each volume is its own group);
+            without it, stacking volumes inflates the shared norm and shrinks
+            every step. ``None`` (default) keeps the original global clip so the
+            single-volume path is byte-for-byte unchanged.
 
     Returns:
         (best_params, best_costs, stats): (B, n_params), (B,), and budget stats.
@@ -221,8 +230,16 @@ def optimize_warp_params_batched(
         loss = costs.sum()
         loss.backward()
 
-        # Gradient clipping to prevent explosion
-        torch.nn.utils.clip_grad_norm_([params], max_norm=1.0)
+        # Gradient clipping to prevent explosion. Grouped clipping keeps each
+        # group's step size identical to running that group as its own batch
+        # (matches clip_grad_norm_'s max_norm/(norm+1e-6) rescale, per group).
+        if clip_group_size is not None and clip_group_size > 0 and params.grad is not None:
+            with torch.no_grad():
+                g = params.grad.view(B // clip_group_size, clip_group_size * n_params)
+                norms = g.norm(dim=1, keepdim=True)
+                g.mul_((1.0 / (norms + 1e-6)).clamp(max=1.0))
+        else:
+            torch.nn.utils.clip_grad_norm_([params], max_norm=1.0)
 
         optimizer.step()
         scheduler.step()

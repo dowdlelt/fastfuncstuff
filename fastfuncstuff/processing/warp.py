@@ -54,6 +54,7 @@ from .cost_blok import (
 )
 from .interp import (
     batched_compose_and_interpolate,
+    batched_compose_and_interpolate_multi,
     trilinear_interpolate,
     warp_image,
 )
@@ -196,12 +197,14 @@ class QwarpConfig:
     refining further. 0 = disabled (default). E.g. 0.0001 stops when improvement
     drops below 0.01% of current cost."""
 
-    reject_worse_levels: bool = True
+    reject_worse_levels: bool = False
     """If a refinement level makes the global cost worse, restore the previous
     level's warp and stop refining. The finest levels over-warp first, so once a
-    level degrades the fit, going finer rarely recovers it -- this both improves
-    the result and skips the most expensive (counterproductive) level. Set False
-    for AFNI-style 'always run every level'."""
+    level degrades the fit, going finer rarely recovers it. Off by default
+    (AFNI-style 'always run every level'); the global-cost readout it keys on is
+    a coarse proxy that can trip on volumes near the threshold, and in the
+    source-batched path that made a couple of volumes bifurcate to a different
+    (whole-level) warp than their solo qwarp run. Set True to re-enable."""
 
     compile: bool = False
     """Use torch.compile for building-block functions (CUDA only).
@@ -1357,6 +1360,645 @@ def _improve_warp_batched(
             _tqdm.write(msg)
         else:
             print(msg)
+
+
+# ---------------------------------------------------------------------------
+# Source-batched (many-to-one) qwarp: N sources sharing one reference
+# ---------------------------------------------------------------------------
+#
+# The single-volume path above batches over the PATCHES of one volume. When the
+# volumes are small, one volume's patch count doesn't fill the GPU (measured:
+# ~21% util, 2 GB on 100 small EPI volumes). Since all N volumes register to the
+# SAME base, they share the patch lattice, weight, mask and blok assignment; only
+# the source and the per-volume warp differ. So we can stack N volumes into one
+# batch of size N*P and optimize them together, N× the arithmetic per launch.
+#
+# Correctness contract: qwarp_batch reproduces N independent qwarp() calls to
+# sub-voxel. The only thing that couples the batch is gradient clipping, which is
+# made per-volume-group in the optimizer (clip_group_size=P); everything else
+# (Adam, per-patch convergence, penalty, smoothing, reject-worse-levels) is
+# per-volume, with a per-volume active mask so a volume that would stop early in
+# the single path stops here too.
+
+
+@dataclass
+class MultiWarpState:
+    """Per-volume warp state for the source-batched path.
+
+    Holds N stacked displacement fields and warped sources on the padded grid.
+    Mirrors WarpState but with a leading volume axis; per-volume scalars are
+    tensors/lists of length N.
+    """
+
+    xd_all: Tensor  # (N, nz, ny, nx)
+    yd_all: Tensor
+    zd_all: Tensor
+    warped_all: Tensor  # (N, nz, ny, nx)
+
+    nx: int = 0
+    ny: int = 0
+    nz: int = 0
+
+    # Per-level optimizer-budget telemetry (summed across volumes).
+    opt_steps_weighted: int = 0
+    opt_patches_counted: int = 0
+    opt_hit_budget: int = 0
+    patches_done: int = 0
+    patches_skipped: int = 0
+
+
+def _improve_warp_batched_multi(
+    base: Tensor, sources_all: Tensor, weight: Tensor, mask: Tensor,
+    mstate: MultiWarpState, config: QwarpConfig, device: torch.device,
+    active_idx: Tensor,
+    patches: list[PatchSpec],
+    basis: Tensor,
+    half_widths: tuple[float, float, float],
+    param_max: float,
+    ii_flat: Tensor, jj_flat: Tensor, kk_flat: Tensor,
+    nxh: int, nyh: int, nzh: int,
+    do_xyz: tuple[bool, bool, bool] = (True, True, True),
+    axis_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    use_penalty: bool = False,
+    pen_fac: float = 0.033333,
+    base_clip: tuple[float, float] | None = None,
+    source_clip: tuple[float, float] | None = None,
+    max_iter: int | None = None,
+    blok_index_vol: Tensor | None = None,
+    nblok: int = 0,
+) -> None:
+    """Optimize one checkerboard phase across ALL active volumes at once.
+
+    Batch layout is row-major (volume, patch): rows [v0p0..v0pP, v1p0..v1pP, ...].
+    Base/weight/mask/blok are shared (one reference), so they are built once for
+    the P patches and tiled over the N active volumes. The source and warp state
+    are per-volume via the ``_multi`` compose primitive.
+    """
+    P = len(patches)
+    if P == 0:
+        return
+    Na = int(active_idx.numel())
+    if Na == 0:
+        return
+
+    nx, ny, nz = mstate.nx, mstate.ny, mstate.nz
+    n_basis = basis.shape[0]
+
+    active_dims = [d for d in range(3) if do_xyz[d]]
+    n_active = len(active_dims) * n_basis
+    n_total = 3 * n_basis
+    if n_active == 0:
+        return
+
+    B = Na * P  # flat optimizer batch
+
+    # Shared patch geometry (one reference grid for all volumes). All patches are
+    # the same size on a regular lattice, so build a single (P, V) flat gather
+    # index and pull base/weight/mask/blok in ONE op each -- the per-patch Python
+    # stack() loops were launching hundreds of tiny kernels per phase (P up to a
+    # few hundred at fine levels) and starving the GPU (launch-bound, not
+    # compute-bound). Same trick vectorizes the penalty and write-back below.
+    ibots = torch.tensor([p.ibot for p in patches], device=device, dtype=torch.float32)
+    jbots = torch.tensor([p.jbot for p in patches], device=device, dtype=torch.float32)
+    kbots = torch.tensor([p.kbot for p in patches], device=device, dtype=torch.float32)
+    base_i = ibots[:, None] + ii_flat[None, :]  # (P, V)
+    base_j = jbots[:, None] + jj_flat[None, :]
+    base_k = kbots[:, None] + kk_flat[None, :]
+
+    # Flat row-major index of every patch voxel into a (nz,ny,nx) volume. Matches
+    # the reshape(-1) order of base[kslice, jslice, islice] (k slowest, i fastest).
+    flat_idx = (base_k.long() * ny + base_j.long()) * nx + base_i.long()  # (P, V)
+    flat_all = flat_idx.reshape(-1)  # (P*V,)
+
+    base_patches = base.reshape(-1)[flat_idx]        # (P, V)
+    weight_patches = weight.reshape(-1)[flat_idx]
+    mask_patches = mask.reshape(-1)[flat_idx].float()
+    base_rep = base_patches.repeat(Na, 1)      # (B, V)
+    weight_rep = weight_patches.repeat(Na, 1)  # (B, V)
+
+    # Only the *local* costs (within-patch) are shareable across volumes here:
+    # lpc/lpa are scored over the shared blok lattice, lpa_alt is a separable
+    # convolution over the patch. INCOR (pearson/pearclp) carries per-volume
+    # "outside-patch" fixed statistics, so it can't be tiled -- qwarp_batch
+    # guards against those methods before reaching this point.
+    use_blok = config.cost_method in ("lpc", "lpa")
+    use_conv_lpa = config.cost_method == "lpa_alt"
+    blok_prep = None
+    _blok_value = None
+    if use_blok:
+        assert blok_index_vol is not None
+        # (B, V); blok assignment identical per volume, so gather once and tile.
+        blok_idx_patches = blok_index_vol.reshape(-1)[flat_idx].repeat(Na, 1)
+        blok_prep = prepare_blok_pairs(blok_idx_patches, nblok)
+        _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
+
+    # Per-volume source + warp for the active subset.
+    src = sources_all[active_idx]                     # (Na, nz, ny, nx)
+    xd_a = mstate.xd_all[active_idx]
+    yd_a = mstate.yd_all[active_idx]
+    zd_a = mstate.zd_all[active_idx]
+    global_warp_3ch = torch.stack([xd_a, yd_a, zd_a], dim=1)  # (Na, 3, nz, ny, nx)
+
+    # External penalty (energy of the rest of each volume's warp), per (vol, patch).
+    # Per-volume total energy needs the full-volume jacobian (loop over the few
+    # active volumes); the per-patch energy is one gather+sum, not a P loop.
+    external_pen = torch.zeros(B, device=device)
+    if use_penalty:
+        with torch.no_grad():
+            for a in range(Na):
+                v = int(active_idx[a])
+                je, se = compute_jacobian_energy(
+                    mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v]
+                )
+                energy = (je + se).reshape(-1)
+                patch_e = energy[flat_idx].sum(dim=1)  # (P,)
+                external_pen[a * P:(a + 1) * P] = energy.sum() - patch_e
+
+    # Active-param -> full-param expansion with axis weights (shared).
+    expand_mat = torch.zeros(n_active, n_total, device=device)
+    idx = 0
+    for dim_i in active_dims:
+        offset = dim_i * n_basis
+        scale = axis_weights[dim_i]
+        expand_mat[idx:idx+n_basis, offset:offset+n_basis] = scale * torch.eye(n_basis, device=device)
+        idx += n_basis
+
+    def batched_cost(active_params: Tensor) -> Tensor:
+        """(B, n_active) -> (B,) costs, row-major (volume, patch). Differentiable."""
+        full_params = active_params @ expand_mat  # (B, n_total)
+        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
+        # (B, V) -> (Na, P, V) for the source-batched compose
+        hxd = hxd.reshape(Na, P, -1)
+        hyd = hyd.reshape(Na, P, -1)
+        hzd = hzd.reshape(Na, P, -1)
+        warped_vals, ah_xd, ah_yd, ah_zd = batched_compose_and_interpolate_multi(
+            src, global_warp_3ch, hxd, hyd, hzd, base_i, base_j, base_k, nx, ny, nz,
+        )
+        warped_vals = warped_vals * mask_patches[None]   # (Na, P, V)
+        warped_flat = warped_vals.reshape(B, -1)
+
+        if use_blok:
+            assert _blok_value is not None
+            corr = _blok_value(base_rep, warped_flat, weight_rep, blok_prep, config.lpc_ppow)
+        else:  # use_conv_lpa
+            corr = batched_lpa_cost(
+                base_rep, warped_flat, weight_rep, nzh, nyh, nxh,
+                sigma=config.lpa_sigma, kernel_type=config.lpa_kernel,
+            )
+        cost = -corr
+
+        if use_penalty and pen_fac > 0:
+            ah_x3d = ah_xd.reshape(B, nzh, nyh, nxh)
+            ah_y3d = ah_yd.reshape(B, nzh, nyh, nxh)
+            ah_z3d = ah_zd.reshape(B, nzh, nyh, nxh)
+            cost = cost + compute_penalty_batched(ah_x3d, ah_y3d, ah_z3d, pen_fac, external_pen)
+        return cost
+
+    best_params, _best_costs, opt_stats = optimize_warp_params_batched(
+        batched_cost, B, n_active, param_max, device,
+        max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
+        lr=config.batch_optimizer_lr,
+        tolerance=config.batch_optimizer_tol,
+        patience=config.batch_optimizer_patience,
+        clip_group_size=P,  # each volume clips exactly as its own single-volume run
+    )
+    mstate.opt_steps_weighted += opt_stats.steps_run * opt_stats.n_patches
+    mstate.opt_patches_counted += opt_stats.n_patches
+    mstate.opt_hit_budget += opt_stats.hit_budget
+
+    with torch.no_grad():
+        full_params = best_params @ expand_mat
+        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
+        hxd = hxd.reshape(Na, P, -1)
+        hyd = hyd.reshape(Na, P, -1)
+        hzd = hzd.reshape(Na, P, -1)
+        warped_vals, ah_xd, ah_yd, ah_zd = batched_compose_and_interpolate_multi(
+            src, global_warp_3ch, hxd, hyd, hzd, base_i, base_j, base_k, nx, ny, nz,
+        )
+        # Scatter all patches of all active volumes in one indexed assignment per
+        # field. Patches within a phase are non-overlapping, so flat_all has no
+        # duplicate voxel per volume -- the write is well-defined. (Replaces an
+        # Na*P Python loop that fired a tiny kernel per patch.)
+        rows = active_idx.unsqueeze(1)      # (Na, 1)
+        cols = flat_all.unsqueeze(0)        # (1, P*V)
+        mstate.xd_all.view(mstate.xd_all.shape[0], -1)[rows, cols] = ah_xd.reshape(Na, -1)
+        mstate.yd_all.view(mstate.yd_all.shape[0], -1)[rows, cols] = ah_yd.reshape(Na, -1)
+        mstate.zd_all.view(mstate.zd_all.shape[0], -1)[rows, cols] = ah_zd.reshape(Na, -1)
+        mstate.warped_all.view(mstate.warped_all.shape[0], -1)[rows, cols] = warped_vals.reshape(Na, -1)
+
+    mstate.patches_done += B
+
+
+def _warpomatic_multi(
+    base: Tensor, sources_all: Tensor, weight: Tensor, mask: Tensor,
+    mstate: MultiWarpState, config: QwarpConfig, device: torch.device,
+) -> None:
+    """Source-batched multi-level loop; N volumes share one reference.
+
+    Structurally identical to :func:`_warpomatic` but every per-volume decision
+    (cost readout, penalty, level smoothing, reject-worse-levels, early stop) is
+    made per volume via an ``active`` mask, so each volume follows the same level
+    schedule it would under a solo :func:`qwarp` call.
+    """
+    N = mstate.xd_all.shape[0]
+    nx, ny, nz = mstate.nx, mstate.ny, mstate.nz
+    t0 = time.time()
+    from .weight import _gaussian_smooth_3d
+
+    do_x = not (config.warp_flags & 1)
+    do_y = not (config.warp_flags & 2)
+    do_z = not (config.warp_flags & 4)
+    do_xyz = (do_x, do_y, do_z)
+    axis_w = config.axis_weights
+
+    imin, imax, jmin, jmax, kmin, kmax = _autobox(weight)
+    base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
+    # Source clip is per-volume in the single path; use each volume's own but a
+    # shared base clip. Compute per-volume source clips up front.
+    source_clips = [
+        _auto_clip(sources_all[v].reshape(-1), weight.reshape(-1)) for v in range(N)
+    ]
+
+    blok_index_vol = None
+    nblok = 0
+    if config.cost_method in ("lpc", "lpa"):
+        bs = assign_bloks(
+            (nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0)
+        )
+        blok_index_vol = bs.index.reshape(nz, ny, nx)
+        nblok = bs.nblok
+
+    # Per-volume global cost (negated correlation).
+    def _vol_cost(v: int) -> float:
+        with torch.no_grad():
+            return _global_correlation(
+                base, mstate.warped_all[v], weight, base_clip, source_clips[v]
+            )
+
+    costs = [_vol_cost(v) for v in range(N)]
+    active = torch.ones(N, dtype=torch.bool, device=device)
+
+    # --- Level 0 bounds (also used to size level 1+) ---
+    xwid = (imax - imin) // 8
+    ywid = (jmax - jmin) // 8
+    zwid = (kmax - kmin) // 8
+    ibbb = max(1, imin - xwid)
+    jbbb = max(1, jmin - ywid)
+    kbbb = max(1, kmin - zwid)
+    ittt = min(nx - 2, imax + xwid)
+    jttt = min(ny - 2, jmax + ywid)
+    kttt = min(nz - 2, kmax + zwid)
+    if nz == 1:
+        kbbb = kttt = 0
+
+    # --- Level 0: global warp (single patch), all volumes ---
+    if config.start_level == 0:
+        lev0_patch = PatchSpec(
+            ibot=ibbb, itop=ittt, jbot=jbbb, jtop=jttt, kbot=kbbb, ktop=kttt,
+            gi=0, gj=0, gk=0,
+        )
+        nxh0, nyh0, nzh0 = ittt - ibbb + 1, jttt - jbbb + 1, kttt - kbbb + 1
+        kk0, jj0, ii0 = torch.meshgrid(
+            torch.arange(nzh0, dtype=torch.float32, device=device),
+            torch.arange(nyh0, dtype=torch.float32, device=device),
+            torch.arange(nxh0, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+        ii0f, jj0f, kk0f = ii0.reshape(-1), jj0.reshape(-1), kk0.reshape(-1)
+        all_idx = torch.arange(N, device=device)
+
+        lev0_iter = ["cubic_lite", "cubic", "quintic_lite"]
+        if config.verb >= 1 and _tqdm is not None:
+            lev0_iter = _tqdm(
+                lev0_iter, desc=f"batch[{N}] lev=0", leave=True,
+                bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]{postfix}",
+            )
+        for basis_type in lev0_iter:
+            basis0, hw0, pmax0 = _get_basis_config(basis_type, nxh0, nyh0, nzh0, device, hfactor=1.0)
+            _improve_warp_batched_multi(
+                base, sources_all, weight, mask, mstate, config, device,
+                all_idx, [lev0_patch], basis0, hw0, pmax0, ii0f, jj0f, kk0f,
+                nxh0, nyh0, nzh0, do_xyz=do_xyz, axis_weights=axis_w,
+                use_penalty=False, pen_fac=0.0,
+                base_clip=base_clip, source_clip=None,
+                max_iter=config.batch_optimizer_iters_lev0,
+                blok_index_vol=blok_index_vol, nblok=nblok,
+            )
+        costs = [_vol_cost(v) for v in range(N)]
+        if config.verb >= 1 and _tqdm is not None and isinstance(lev0_iter, _tqdm):
+            lev0_iter.set_postfix_str(f"cost~{sum(costs)/N:.5f} {time.time()-t0:.1f}s")
+            lev0_iter.close()
+
+    # --- Levels 1..N ---
+    xwid0, ywid0, zwid0 = ittt - ibbb + 1, jttt - jbbb + 1, kttt - kbbb + 1
+    max_patch_lev1 = max(1, int(max(xwid0, ywid0, zwid0) * config.shrink))
+    ngmin = max(config.minpatch, 5)
+    if ngmin % 2 == 0:
+        ngmin -= 1
+
+    levdone = False
+    lev_start = max(1, config.start_level)
+    for lev in range(lev_start, config.max_level + 1):
+        if levdone or not bool(active.any()):
+            break
+
+        flev = config.shrink ** lev
+        xwid = int(xwid0 * flev)
+        ywid = int(ywid0 * flev)
+        zwid = int(zwid0 * flev)
+        if xwid % 2 == 0:
+            xwid += 1
+        if ywid % 2 == 0:
+            ywid += 1
+        if zwid % 2 == 0:
+            zwid += 1
+
+        dox = xwid >= ngmin and do_x
+        doy = ywid >= ngmin and do_y
+        doz = zwid >= ngmin and do_z
+        if not (dox or doy or doz):
+            break
+
+        if xwid < ngmin:
+            xwid = min(nx, ngmin)
+        if ywid < ngmin:
+            ywid = min(ny, ngmin)
+        if zwid < ngmin:
+            zwid = min(nz, ngmin)
+
+        ftest = max(xwid, ywid, zwid) / ngmin
+        if ftest <= 1.0 / config.shrink + 0.0001:
+            xwid = min(xwid, ngmin)
+            ywid = min(ywid, ngmin)
+            zwid = min(zwid, ngmin)
+            levdone = True
+
+        xdel = max(1, (xwid - 1) // 2)
+        ydel = max(1, (ywid - 1) // 2)
+        zdel = max(1, (zwid - 1) // 2)
+        ibbb = max(1, imin - xdel // 4 - 1)
+        jbbb = max(1, jmin - ydel // 4 - 1)
+        kbbb = max(1, kmin - zdel // 4 - 1)
+        ittt = min(nx - 2, imax + xdel // 4 + 1)
+        jttt = min(ny - 2, jmax + ydel // 4 + 1)
+        kttt = min(nz - 2, kmax + zdel // 4 + 1)
+        if nz == 1:
+            kbbb = kttt = 0
+
+        pen_lev = lev ** 0.333
+        pen_fff = config.penalty_factor * min(3.21, pen_lev)
+        use_pen = pen_fff > 0 and lev >= config.penalty_first_level
+        if lev == config.penalty_first_level:
+            pen_fff *= 0.5
+
+        basis_type = "cubic_lite" if config.use_lite else "cubic"
+        if levdone and config.use_quintic:
+            basis_type = "quintic_lite" if config.use_lite else "quintic"
+
+        nlevr = 1
+        if config.workhard is not None:
+            wh1, wh2 = config.workhard
+            if wh2 < 0:
+                wh2 = config.max_level
+            if wh1 <= lev <= wh2:
+                nlevr = 2
+
+        all_patches = _generate_patch_grid(
+            ibbb, ittt, jbbb, jttt, kbbb, kttt, xwid, ywid, zwid, xdel, ydel, zdel,
+        )
+        valid_patches = _filter_patches(all_patches, weight, mask, nx, ny, nz)
+        phases = _checkerboard_phases(valid_patches)
+
+        nxh, nyh, nzh = xwid, ywid, zwid
+        max_patch = max(nxh, nyh, nzh)
+        hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
+        basis, half_widths, param_max = _get_basis_config(
+            basis_type, nxh, nyh, nzh, device, hfactor=hfactor,
+        )
+        kk_p, jj_p, ii_p = torch.meshgrid(
+            torch.arange(nzh, dtype=torch.float32, device=device),
+            torch.arange(nyh, dtype=torch.float32, device=device),
+            torch.arange(nxh, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+        ii_flat, jj_flat, kk_flat = ii_p.reshape(-1), jj_p.reshape(-1), kk_p.reshape(-1)
+
+        active_idx = torch.nonzero(active, as_tuple=False).flatten()
+        # Snapshot for per-volume reject-worse-levels rollback.
+        cost_at_start = list(costs)
+        saved = None
+        if config.reject_worse_levels:
+            saved = (
+                mstate.xd_all[active_idx].clone(),
+                mstate.yd_all[active_idx].clone(),
+                mstate.zd_all[active_idx].clone(),
+            )
+
+        n_valid = sum(len(ph) for ph in phases)
+        lev_pbar = None
+        if config.verb >= 1 and _tqdm is not None:
+            lev_pbar = _tqdm(
+                total=n_valid * nlevr * int(active_idx.numel()),
+                desc=f"batch[{int(active_idx.numel())}] lev={lev} {xwid}x{ywid}x{zwid}",
+                bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]{postfix}",
+                leave=True,
+            )
+
+        for _pass in range(nlevr):
+            phase_order = list(range(8))
+            if (lev + _pass) % 2 == 1:
+                phase_order = phase_order[::-1]
+            for phase_idx in phase_order:
+                phase_patches = phases[phase_idx]
+                if not phase_patches:
+                    continue
+                good = [p for p in phase_patches
+                        if (p.itop - p.ibot + 1 == nxh and
+                            p.jtop - p.jbot + 1 == nyh and
+                            p.ktop - p.kbot + 1 == nzh)]
+                if good:
+                    _improve_warp_batched_multi(
+                        base, sources_all, weight, mask, mstate, config, device,
+                        active_idx, good, basis, half_widths, param_max,
+                        ii_flat, jj_flat, kk_flat, nxh, nyh, nzh,
+                        do_xyz=do_xyz, axis_weights=axis_w,
+                        use_penalty=use_pen, pen_fac=pen_fff,
+                        base_clip=base_clip, source_clip=None,
+                        blok_index_vol=blok_index_vol, nblok=nblok,
+                    )
+                # Odd boundary patches (different size) don't batch cleanly across
+                # volumes; fall back to per-volume serial for just those.
+                odd = [p for p in phase_patches if p not in good]
+                for v in active_idx.tolist():
+                    svd = _single_state_view(mstate, v)
+                    for p in odd:
+                        _improve_warp_serial(
+                            base, sources_all[v], weight, mask, svd, config, device,
+                            p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop,
+                            basis_type=basis_type, do_xyz=do_xyz, axis_weights=axis_w,
+                            use_penalty=use_pen, pen_fac=pen_fff,
+                            base_clip=base_clip, source_clip=source_clips[v],
+                            blok_index_vol=blok_index_vol, nblok=nblok,
+                        )
+                if lev_pbar is not None:
+                    lev_pbar.update(len(phase_patches) * int(active_idx.numel()))
+
+        # Per-volume level smoothing + cost + reject/early-stop.
+        newly_inactive = []
+        with torch.no_grad():
+            for ai, v in enumerate(active_idx.tolist()):
+                mstate.xd_all[v] = _gaussian_smooth_3d(mstate.xd_all[v], 1.5)
+                mstate.yd_all[v] = _gaussian_smooth_3d(mstate.yd_all[v], 1.5)
+                mstate.zd_all[v] = _gaussian_smooth_3d(mstate.zd_all[v], 1.5)
+                if config.maxdisp > 0:
+                    mstate.xd_all[v].clamp_(-config.maxdisp, config.maxdisp)
+                    mstate.yd_all[v].clamp_(-config.maxdisp, config.maxdisp)
+                    mstate.zd_all[v].clamp_(-config.maxdisp, config.maxdisp)
+                mstate.warped_all[v] = warp_image(
+                    sources_all[v], mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v],
+                    mode=config.interp,
+                )
+                new_cost = _vol_cost(v)
+                if config.reject_worse_levels and new_cost > cost_at_start[v] + 1e-4:
+                    mstate.xd_all[v] = saved[0][ai]
+                    mstate.yd_all[v] = saved[1][ai]
+                    mstate.zd_all[v] = saved[2][ai]
+                    mstate.warped_all[v] = warp_image(
+                        sources_all[v], mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v],
+                        mode=config.interp,
+                    )
+                    costs[v] = cost_at_start[v]
+                    newly_inactive.append(v)
+                    continue
+                costs[v] = new_cost
+                if config.level_stop_tol > 0 and cost_at_start[v] < 0:
+                    improvement = abs(new_cost - cost_at_start[v])
+                    if improvement < config.level_stop_tol * abs(cost_at_start[v]):
+                        newly_inactive.append(v)
+
+        for v in newly_inactive:
+            active[v] = False
+
+        if lev_pbar is not None:
+            avg = sum(costs) / N
+            lev_pbar.set_postfix_str(
+                f"cost~{avg:.5f} active={int(active.sum())}/{N} {time.time()-t0:.1f}s"
+            )
+            lev_pbar.close()
+
+
+def _single_state_view(mstate: MultiWarpState, v: int) -> WarpState:
+    """Wrap one volume's tensors as a WarpState for the serial odd-patch path."""
+    s = WarpState(nx=mstate.nx, ny=mstate.ny, nz=mstate.nz)
+    s.xd = mstate.xd_all[v]
+    s.yd = mstate.yd_all[v]
+    s.zd = mstate.zd_all[v]
+    s.warped_source = mstate.warped_all[v]
+    return s
+
+
+def qwarp_batch(
+    base: Tensor,
+    sources: Tensor,
+    weight: Tensor | None = None,
+    mask: Tensor | None = None,
+    config: QwarpConfig | None = None,
+    device: torch.device | None = None,
+    pad: bool = True,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Nonlinear-warp a batch of sources onto ONE shared base (many-to-one).
+
+    Equivalent to calling :func:`qwarp` once per source volume against the same
+    ``base`` (verified to sub-voxel), but all volumes are optimized together so a
+    batch of small volumes fills the GPU instead of running one-at-a-time at low
+    utilization. Base-derived quantities (padding, weight, mask, blok lattice)
+    are computed once and shared.
+
+    Args:
+        base: (nz, ny, nx) shared reference image.
+        sources: (N, nz, ny, nx) source volumes to warp to ``base``.
+        weight, mask: optional shared (nz, ny, nx) weight/mask (auto if None).
+        config: QwarpConfig (defaults if None). ``initial_warp`` / pyramid are
+            not supported here; use per-volume :func:`qwarp` for those.
+        device: torch device (inferred from base if None).
+        pad: AFNI-style internal zero-padding (default True).
+
+    Returns:
+        (warped, xd, yd, zd):
+          - warped: (N, nz, ny, nx) each source warped to base (original size).
+          - xd/yd/zd: (N, nz_pad, ny_pad, nx_pad) displacement fields (voxels).
+    """
+    if config is None:
+        config = QwarpConfig()
+    if device is None:
+        device = base.device
+    if sources.dim() != 4:
+        raise ValueError(f"sources must be (N, nz, ny, nx); got {tuple(sources.shape)}")
+    if config.cost_method not in ("lpc", "lpa", "lpa_alt"):
+        # INCOR (pearson/pearclp) uses per-volume outside-patch statistics that
+        # can't be shared across the batch. Those are cheap per-volume anyway.
+        raise NotImplementedError(
+            f"qwarp_batch supports local costs (lpc/lpa/lpa_alt); "
+            f"cost_method={config.cost_method!r} needs per-volume qwarp()."
+        )
+    if config.pyramid_factor > 1:
+        raise NotImplementedError("qwarp_batch does not support the resolution pyramid; use qwarp() per volume.")
+
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
+    base = base.float().to(device)
+    sources = sources.float().to(device)
+    N = sources.shape[0]
+    nz_orig, ny_orig, nx_orig = base.shape
+
+    if pad:
+        pad_x, pad_y, pad_z = _compute_padding(nx_orig, ny_orig, nz_orig)
+    else:
+        pad_x, pad_y, pad_z = 0, 0, 0
+
+    do_pad = pad_x > 0 or pad_y > 0 or pad_z > 0
+    if do_pad:
+        base_p = _pad_volume(base, pad_x, pad_y, pad_z)
+        sources_p = torch.stack([
+            _pad_volume(sources[v], pad_x, pad_y, pad_z) for v in range(N)
+        ])
+    else:
+        base_p = base
+        sources_p = sources
+    nz, ny, nx = base_p.shape
+
+    if weight is None:
+        weight_p = compute_weight_image(base_p)
+    else:
+        w = weight.float().to(device)
+        weight_p = _pad_volume(w, pad_x, pad_y, pad_z) if do_pad else w
+    if mask is None:
+        mask_p = (weight_p > 0).byte()
+    else:
+        m = mask.byte().to(device)
+        mask_p = _pad_volume(m.float(), pad_x, pad_y, pad_z).byte() if do_pad else m
+
+    mstate = MultiWarpState(
+        xd_all=torch.zeros(N, nz, ny, nx, device=device),
+        yd_all=torch.zeros(N, nz, ny, nx, device=device),
+        zd_all=torch.zeros(N, nz, ny, nx, device=device),
+        warped_all=sources_p.clone(),
+        nx=nx, ny=ny, nz=nz,
+    )
+
+    _warpomatic_multi(base_p, sources_p, weight_p, mask_p, mstate, config, device)
+
+    # Final warped images: single pass through each total warp with final_interp.
+    warped = torch.empty(N, nz_orig, ny_orig, nx_orig, device=device)
+    for v in range(N):
+        wf = warp_image(
+            sources_p[v], mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v],
+            mode=config.final_interp,
+        )
+        warped[v] = wf[pad_z:pad_z+nz_orig, pad_y:pad_y+ny_orig, pad_x:pad_x+nx_orig]
+
+    return warped, mstate.xd_all, mstate.yd_all, mstate.zd_all
 
 
 # ---------------------------------------------------------------------------
