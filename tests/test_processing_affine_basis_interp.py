@@ -133,6 +133,29 @@ class TestAffine:
         M_back = dicom_matrix_to_voxel(M_dicom, base_aff, src_aff)
         assert torch.allclose(M_back, M_ijk, atol=1e-4)
 
+    def test_dicom_uses_cardinal_frame_for_oblique(self):
+        # AFNI's ijk_to_dicom is the CARDINAL (axis-snapped) affine. The DICOM
+        # conversion must therefore ignore a source/base's obliquity: an oblique
+        # affine and its deobliqued twin must produce the *same* DICOM matrix.
+        # (Regression for the cross-modal .aff12.1D ↔ ffs_nwarp frame mismatch.)
+        from fastfuncstuff.processing.nwarpforge import compute_cardinal_affine
+
+        theta = np.deg2rad(9.3)
+        c, s = np.cos(theta), np.sin(theta)
+        oblique = np.eye(4)
+        oblique[:3, :3] = np.array([[3.0, 0, 0], [0, 3.0 * c, -3.0 * s], [0, 3.0 * s, 3.0 * c]])
+        oblique[:3, 3] = [10.0, -5.0, 2.0]
+        cardinal = compute_cardinal_affine(oblique)
+
+        M_ijk = torch.eye(4)
+        M_ijk[0, 3] = 1.5
+        d_obl = voxel_matrix_to_dicom(M_ijk, oblique, oblique)
+        d_car = voxel_matrix_to_dicom(M_ijk, cardinal, cardinal)
+        assert torch.allclose(d_obl, d_car, atol=1e-4)
+        # and the inverse recovers M_ijk from the oblique-tagged DICOM matrix
+        M_back = dicom_matrix_to_voxel(d_obl, oblique, oblique)
+        assert torch.allclose(M_back, M_ijk, atol=1e-4)
+
     def test_save_load_matrix_1D(self, tmp_path):
         M_ijk = torch.eye(4)
         M_ijk[0, 3] = 2.5
@@ -259,3 +282,52 @@ class TestInterp:
         out = quintic_resample_3d(vol, x_c, y_c, z_c)
         expected = vol[2:6, 2:6, 2:6]
         assert torch.allclose(out, expected, atol=1e-4)
+
+
+class TestSourceBatchedCompose:
+    """The source-batched (multi-volume) compose primitive must equal N
+    sequential single-volume calls to the byte — the Stage-0 gate for batching
+    qwarp over many volumes that share one base. See [[Outstanding issues]]."""
+
+    def test_multi_equals_sequential(self):
+        from fastfuncstuff.processing.interp import (
+            batched_compose_and_interpolate,
+            batched_compose_and_interpolate_multi,
+        )
+
+        torch.manual_seed(0)
+        N, nz, ny, nx = 5, 16, 18, 20
+        ph = pw = pd = 5
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(pd), torch.arange(pw), torch.arange(ph), indexing="ij"
+        )
+        ii_p, jj_p, kk_p = (t.reshape(-1).float() for t in (ii, jj, kk))
+        V = ii_p.numel()
+        P = 6
+        ibots = torch.randint(0, nx - ph, (P,)).float()
+        jbots = torch.randint(0, ny - pw, (P,)).float()
+        kbots = torch.randint(0, nz - pd, (P,)).float()
+        base_i = ibots[:, None] + ii_p[None, :]
+        base_j = jbots[:, None] + jj_p[None, :]
+        base_k = kbots[:, None] + kk_p[None, :]
+        source = torch.randn(N, nz, ny, nx)
+        gw = torch.randn(N, 3, nz, ny, nx) * 0.5
+        pxd, pyd, pzd = (torch.randn(N, P, V) * 0.3 for _ in range(3))
+
+        seq = [[] for _ in range(4)]
+        for n in range(N):
+            outs = batched_compose_and_interpolate(
+                source[n], gw[n, 0], gw[n, 1], gw[n, 2], pxd[n], pyd[n], pzd[n],
+                ii_p, jj_p, kk_p, ibots, jbots, kbots, nx, ny, nz,
+                global_warp_3ch=gw[n], base_i=base_i, base_j=base_j, base_k=base_k,
+            )
+            for s, o in zip(seq, outs, strict=True):
+                s.append(o)
+        seq = [torch.stack(s) for s in seq]
+
+        multi = batched_compose_and_interpolate_multi(
+            source, gw, pxd, pyd, pzd, base_i, base_j, base_k, nx, ny, nz
+        )
+        for a, b in zip(seq, multi, strict=True):
+            assert b.shape == (N, P, V)
+            assert torch.allclose(a, b, atol=1e-5)

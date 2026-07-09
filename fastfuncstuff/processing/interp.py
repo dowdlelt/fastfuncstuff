@@ -892,3 +892,94 @@ def batched_compose_and_interpolate(
     warped_vals = batched_trilinear_interpolate(source, src_x, src_y, src_z)
 
     return warped_vals, ah_xd, ah_yd, ah_zd
+
+
+# ---------------------------------------------------------------------------
+# Source-batched (multi-volume) variants — for batching qwarp over N volumes
+# that share one base (and thus one patch lattice). The batch is arranged as
+# grid_sample's N dim with (P, V) in the spatial dims, so the N source/warp
+# volumes are indexed natively with no per-patch copies. See
+# [[Outstanding issues]] "Batched many-to-one nonlinear warp".
+# ---------------------------------------------------------------------------
+
+
+def batched_interp_3ch_multi(
+    vol_3ch: Tensor, x: Tensor, y: Tensor, z: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Per-volume 3-channel interpolation: sample volume n at its own coords.
+
+    Args:
+        vol_3ch: (N, 3, nz, ny, nx) - N stacked [xd, yd, zd] fields.
+        x, y, z: each (N, P, V) - P patches x V voxels, per volume.
+
+    Returns:
+        Three (N, P, V) tensors.
+    """
+    N, P, V = x.shape
+    _, _, nz, ny, nx = vol_3ch.shape
+    gx = 2.0 * x / (nx - 1) - 1.0 if nx > 1 else x * 0.0
+    gy = 2.0 * y / (ny - 1) - 1.0 if ny > 1 else y * 0.0
+    gz = 2.0 * z / (nz - 1) - 1.0 if nz > 1 else z * 0.0
+    grid = torch.stack([gx, gy, gz], dim=-1).reshape(N, 1, P, V, 3)
+    result = _grid_sample_3d(vol_3ch, grid)  # (N, 3, 1, P, V)
+    result = result.reshape(N, 3, P, V)
+    return result[:, 0], result[:, 1], result[:, 2]
+
+
+def batched_trilinear_interpolate_multi(volumes: Tensor, x: Tensor, y: Tensor, z: Tensor) -> Tensor:
+    """Per-volume trilinear interpolation: sample volume n at its own coords.
+
+    Args:
+        volumes: (N, nz, ny, nx) - N source volumes.
+        x, y, z: each (N, P, V).
+
+    Returns:
+        (N, P, V) interpolated values.
+    """
+    N, P, V = x.shape
+    nz, ny, nx = volumes.shape[1:]
+    gx = 2.0 * x / (nx - 1) - 1.0 if nx > 1 else x * 0.0
+    gy = 2.0 * y / (ny - 1) - 1.0 if ny > 1 else y * 0.0
+    gz = 2.0 * z / (nz - 1) - 1.0 if nz > 1 else z * 0.0
+    grid = torch.stack([gx, gy, gz], dim=-1).reshape(N, 1, P, V, 3)
+    result = _grid_sample_3d(volumes[:, None], grid)  # (N, 1, 1, P, V)
+    return result.reshape(N, P, V)
+
+
+def batched_compose_and_interpolate_multi(
+    source: Tensor,  # (N, nz, ny, nx)
+    global_warp_3ch: Tensor,  # (N, 3, nz, ny, nx)
+    patch_xd: Tensor,  # (N, P, V)
+    patch_yd: Tensor,
+    patch_zd: Tensor,
+    base_i: Tensor,  # (P, V) shared patch lattice (ibots[:,None] + ii_p[None,:])
+    base_j: Tensor,
+    base_k: Tensor,
+    nx: int,
+    ny: int,
+    nz: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Source-batched analogue of :func:`batched_compose_and_interpolate`.
+
+    N volumes sharing one base (one patch lattice, so ``base_i/j/k`` are (P, V)
+    and broadcast over N). For each volume it composes the P patch warps with
+    that volume's global warp and samples that volume's source. Equivalent to
+    calling the single-volume version once per volume; verified to sub-voxel.
+
+    Returns warped_vals, ah_xd, ah_yd, ah_zd — each (N, P, V).
+    """
+    xq = (base_i[None] + patch_xd).clamp(0, nx - 1)
+    yq = (base_j[None] + patch_yd).clamp(0, ny - 1)
+    zq = (base_k[None] + patch_zd).clamp(0, nz - 1)
+
+    axd, ayd, azd = batched_interp_3ch_multi(global_warp_3ch, xq, yq, zq)
+    ah_xd = patch_xd + axd
+    ah_yd = patch_yd + ayd
+    ah_zd = patch_zd + azd
+
+    src_x = (ah_xd + base_i[None]).clamp(-0.499, nx - 0.501)
+    src_y = (ah_yd + base_j[None]).clamp(-0.499, ny - 0.501)
+    src_z = (ah_zd + base_k[None]).clamp(-0.499, nz - 0.501)
+
+    warped_vals = batched_trilinear_interpolate_multi(source, src_x, src_y, src_z)
+    return warped_vals, ah_xd, ah_yd, ah_zd
