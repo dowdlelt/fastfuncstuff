@@ -320,6 +320,35 @@ Examples:
     reml_out.add_argument("-Rerrts", help="Output REML residuals")
     reml_out.add_argument("-Rwherr", help="Output REML whitened residuals")
 
+    # Whole-dataset diagnostics: cheap maps that fall out of data already resident
+    # during the fit (the one point the entire timeseries is in RAM). See
+    # glm/reml_diagnostics.py. Any of these forces the manual load path.
+    diag_out = parser.add_argument_group("Whole-dataset Diagnostics")
+    diag_out.add_argument(
+        "-save_grandmean",
+        "-save-grandmean",
+        dest="save_grandmean",
+        metavar="PATH",
+        help="Save the grand mean (per-voxel temporal mean, BEFORE scaling) as NIfTI.",
+    )
+    diag_out.add_argument(
+        "-save_tsnr",
+        "-save-tsnr",
+        dest="save_tsnr",
+        metavar="PREFIX",
+        help="Save temporal-SNR maps: PREFIX.raw_tsnr (mean/std of the scaled data; "
+        "requires -do_scale) and, when residuals are available, PREFIX.resid_tsnr_ols "
+        "/ PREFIX.resid_tsnr_reml (scaled mean / residual std).",
+    )
+    diag_out.add_argument(
+        "-save_acf",
+        "-save-acf",
+        dest="save_acf",
+        metavar="PREFIX",
+        help="Save per-run spatial ACF / effective FWHM of the residuals (3dFWHMx-style, "
+        "a*exp(-r^2/2b^2)+(1-a)*exp(-r/c)) as PREFIX.fwhmx_ols.txt / .fwhmx_reml.txt.",
+    )
+
     # Output arguments - OLS
     ols_out = parser.add_argument_group("OLS Output Options (for comparison)")
     ols_out.add_argument("-Obuck", help="Output OLS betas + statistics (main bucket output)")
@@ -1944,8 +1973,11 @@ def main():
     # ==========================================================================
     # Preprocessing: Blur and/or Scale if requested
     # ==========================================================================
-    preprocessing_applied = args.do_blur is not None or args.do_scale
+    # Whole-dataset diagnostics need the manual load path (data resident in RAM).
+    want_diag = bool(args.save_grandmean or args.save_tsnr or args.save_acf)
+    preprocessing_applied = args.do_blur is not None or args.do_scale or want_diag
     preproc_cached_metadata = None
+    diag = None
 
     if preprocessing_applied:
         print()
@@ -2016,6 +2048,18 @@ def main():
         fmri_data_preprocessed = np.concatenate(run_data_list, axis=1)
         del run_data_list
 
+        # Diagnostics hook 1: grand mean, computed on the un-scaled data.
+        if want_diag:
+            from fastfuncstuff.glm.reml_diagnostics import DatasetDiagnostics
+
+            diag = DatasetDiagnostics(
+                volume_shape=tuple(volume_shape),
+                run_starts=[int(rs) for rs in run_starts],
+                voxdims=tuple(float(v) for v in voxel_sizes),
+                device=device,
+            )
+            diag.observe_raw(torch.from_numpy(fmri_data_preprocessed))
+
         # Apply scaling if requested (on concatenated 2D data)
         if args.do_scale:
             print("  Applying scaling (mean=100 per run)...")
@@ -2031,6 +2075,12 @@ def main():
 
             if scale_info["n_violations"] > 0:
                 print(f"  ⚠️  {scale_info['n_violations']:,} ceiling violations")
+
+            # Diagnostics hook 2: raw tSNR on the scaled data.
+            if diag is not None:
+                diag.observe_scaled(torch.from_numpy(fmri_data_preprocessed))
+        elif want_diag and (args.save_tsnr):
+            print("  ⚠️  -save_tsnr needs -do_scale for raw/resid tSNR; skipping tSNR maps.")
 
         # Reshape back to 4D for analyze_from_design_matrix
         total_tps = fmri_data_preprocessed.shape[1]
@@ -2232,6 +2282,34 @@ def main():
 
     print("✅ Analysis complete!")
     print()
+
+    # ── Whole-dataset diagnostics (grand mean / raw tSNR) ───────────────────
+    # Bonus maps from data that was resident for the fit; never fatal to the
+    # main analysis. Residual-derived maps (resid tSNR, FWHMx) are wired in a
+    # follow-up once want_residuals is plumbed through the fit.
+    if diag is not None:
+        try:
+            _diag_meta = preproc_cached_metadata or {}
+            _diag_affine = _diag_meta.get("affine")
+            _diag_header = _diag_meta.get("nifti_header")
+            print("🧪 Writing whole-dataset diagnostics...")
+            if args.save_grandmean:
+                diag.save_map(
+                    "grandmean",
+                    replace_afni_extension(args.save_grandmean, ".nii.gz"),
+                    _diag_affine,
+                    _diag_header,
+                )
+            if args.save_tsnr:
+                diag.save_map(
+                    "raw_tsnr",
+                    f"{args.save_tsnr}.raw_tsnr.nii.gz",
+                    _diag_affine,
+                    _diag_header,
+                )
+        except Exception as _diag_err:  # diagnostics must never break the fit output
+            print(f"  ⚠️  diagnostics failed (continuing): {_diag_err}")
+        print()
 
     # Write outputs
     print("💾 Writing outputs...")
