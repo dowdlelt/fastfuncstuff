@@ -16,6 +16,7 @@ import torch
 from fastfuncstuff.processing.nwarpforge import (
     AffineTransform,
     NonlinearWarp,
+    _apply_affine_chain_batched,
     _nifti_mm_to_voxels,
     _regrid_to_dxyz,
     apply_composed_warp,
@@ -37,6 +38,7 @@ SHAPE = (8, 8, 8)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _identity_affine(voxel_size: float = 2.0, origin: tuple = (-7.0, -7.0, -7.0)) -> np.ndarray:
     """Create a simple diagonal NIfTI affine."""
@@ -72,7 +74,9 @@ def _make_small_warp(shape=SHAPE, scale=0.5, affine=None, units="voxels") -> Non
     yd = torch.randn(shape, dtype=torch.float32, device=DEVICE) * scale
     zd = torch.randn(shape, dtype=torch.float32, device=DEVICE) * scale
     return NonlinearWarp(
-        xd=xd, yd=yd, zd=zd,
+        xd=xd,
+        yd=yd,
+        zd=zd,
         header_info={"affine": affine.copy()},
         units=units,
     )
@@ -92,6 +96,7 @@ def _make_affine_transform(matrix_4x4: torch.Tensor | None = None) -> AffineTran
 # ---------------------------------------------------------------------------
 # Tests: compute_cardinal_affine
 # ---------------------------------------------------------------------------
+
 
 class TestComputeCardinalAffine:
     def test_diagonal_affine_unchanged(self):
@@ -140,6 +145,7 @@ class TestComputeCardinalAffine:
 # Tests: AffineTransform dataclass
 # ---------------------------------------------------------------------------
 
+
 class TestAffineTransform:
     def test_single_time_point(self):
         xform = _make_affine_transform()
@@ -166,6 +172,7 @@ class TestAffineTransform:
 # Tests: NonlinearWarp dataclass
 # ---------------------------------------------------------------------------
 
+
 class TestNonlinearWarp:
     def test_shape_property(self):
         warp = _make_zero_warp(shape=(10, 12, 14))
@@ -179,6 +186,7 @@ class TestNonlinearWarp:
 # ---------------------------------------------------------------------------
 # Tests: parse_nwarp_string
 # ---------------------------------------------------------------------------
+
 
 class TestParseNwarpString:
     def test_single_path(self):
@@ -196,6 +204,7 @@ class TestParseNwarpString:
 # ---------------------------------------------------------------------------
 # Tests: identify_transform_type
 # ---------------------------------------------------------------------------
+
 
 class TestIdentifyTransformType:
     def test_1d_file(self):
@@ -220,6 +229,7 @@ class TestIdentifyTransformType:
 # ---------------------------------------------------------------------------
 # Tests: _nifti_mm_to_voxels
 # ---------------------------------------------------------------------------
+
 
 class TestNiftiMmToVoxels:
     def test_identity_affine(self):
@@ -258,6 +268,7 @@ class TestNiftiMmToVoxels:
 # Tests: compose_warp_then_matrix
 # ---------------------------------------------------------------------------
 
+
 class TestComposeWarpThenMatrix:
     def test_identity_matrix_preserves_warp(self):
         warp = _make_small_warp()
@@ -277,18 +288,21 @@ class TestComposeWarpThenMatrix:
         torch.testing.assert_close(
             result.xd,
             torch.full(SHAPE, 3.0, device=DEVICE),
-            atol=1e-5, rtol=1e-5,
+            atol=1e-5,
+            rtol=1e-5,
         )
         torch.testing.assert_close(
             result.yd,
             torch.zeros(SHAPE, device=DEVICE),
-            atol=1e-5, rtol=1e-5,
+            atol=1e-5,
+            rtol=1e-5,
         )
 
 
 # ---------------------------------------------------------------------------
 # Tests: compose_matrix_then_warp
 # ---------------------------------------------------------------------------
+
 
 class TestComposeMatrixThenWarp:
     def test_identity_matrix_preserves_warp(self):
@@ -310,13 +324,15 @@ class TestComposeMatrixThenWarp:
         torch.testing.assert_close(
             result.yd,
             torch.full(SHAPE, 2.0, device=DEVICE),
-            atol=1e-5, rtol=1e-5,
+            atol=1e-5,
+            rtol=1e-5,
         )
 
 
 # ---------------------------------------------------------------------------
 # Tests: compose_warp_then_warp
 # ---------------------------------------------------------------------------
+
 
 class TestComposeWarpThenWarp:
     def test_identity_warp_composition(self):
@@ -335,7 +351,10 @@ class TestComposeWarpThenWarp:
         warp_b = _make_zero_warp()
         result = compose_warp_then_warp(warp_a, warp_b)
         torch.testing.assert_close(
-            result.xd, torch.zeros(SHAPE, device=DEVICE), atol=1e-6, rtol=0,
+            result.xd,
+            torch.zeros(SHAPE, device=DEVICE),
+            atol=1e-6,
+            rtol=0,
         )
 
     def test_composition_not_commutative(self):
@@ -358,6 +377,7 @@ class TestComposeWarpThenWarp:
 # Tests: compose_chain
 # ---------------------------------------------------------------------------
 
+
 class TestComposeChain:
     def test_empty_chain_raises(self):
         with pytest.raises(ValueError, match="Empty transform chain"):
@@ -369,7 +389,10 @@ class TestComposeChain:
         assert result.shape == SHAPE
         # Identity affine -> zero displacement
         torch.testing.assert_close(
-            result.xd, torch.zeros(SHAPE, device=DEVICE), atol=1e-5, rtol=0,
+            result.xd,
+            torch.zeros(SHAPE, device=DEVICE),
+            atol=1e-5,
+            rtol=0,
         )
 
     def test_single_zero_warp(self):
@@ -424,6 +447,7 @@ class TestComposeChain:
 # Tests: prepare_warp_for_grid
 # ---------------------------------------------------------------------------
 
+
 class TestPrepareWarpForGrid:
     def test_same_grid_no_resample(self):
         """When warp and target grids match, warp values are converted but not resampled."""
@@ -454,6 +478,7 @@ class TestPrepareWarpForGrid:
 # Tests: apply_composed_warp
 # ---------------------------------------------------------------------------
 
+
 class TestApplyComposedWarp:
     def test_identity_warp_preserves_volume(self):
         """Zero displacement should return the source volume (approximately)."""
@@ -469,7 +494,8 @@ class TestApplyComposedWarp:
         torch.testing.assert_close(
             result[interior, interior, interior],
             source[interior, interior, interior],
-            atol=1e-4, rtol=1e-4,
+            atol=1e-4,
+            rtol=1e-4,
         )
 
     def test_wsinc5_interp_runs(self):
@@ -503,6 +529,7 @@ class TestApplyComposedWarp:
 # ---------------------------------------------------------------------------
 # Tests: _regrid_to_dxyz
 # ---------------------------------------------------------------------------
+
 
 class TestRegridToDxyz:
     def test_same_voxel_size(self):
@@ -544,6 +571,7 @@ class TestRegridToDxyz:
 # Tests: load_affine_1D
 # ---------------------------------------------------------------------------
 
+
 class TestLoadAffine1D:
     def test_load_identity(self):
         """Loading an identity matrix from a .1D file."""
@@ -559,7 +587,10 @@ class TestLoadAffine1D:
             assert result.matrices.shape == (1, 4, 4)
             # Identity DICOM matrix -> identity voxel matrix
             torch.testing.assert_close(
-                result.matrices[0], torch.eye(4, dtype=torch.float32), atol=1e-5, rtol=1e-5,
+                result.matrices[0],
+                torch.eye(4, dtype=torch.float32),
+                atol=1e-5,
+                rtol=1e-5,
             )
         finally:
             os.unlink(path)
@@ -609,6 +640,7 @@ class TestLoadAffine1D:
 # Tests: compose_chain with time-dependent affines
 # ---------------------------------------------------------------------------
 
+
 class TestComposeChainTimeDep:
     def test_time_dependent_affine(self):
         """Time-dependent affine should use the correct time index."""
@@ -623,3 +655,79 @@ class TestComposeChainTimeDep:
         mid = SHAPE[0] // 2
         assert abs(r0.xd[mid, mid, mid].item() - 1.0) < 1e-4
         assert abs(r1.xd[mid, mid, mid].item() - 5.0) < 1e-4
+
+
+class TestAffineFastPath:
+    """The affine-only fast path must reproduce the field path (compose_chain +
+    apply_composed_warp) it replaces, including cross-grid (oblique↔cardinal) and
+    per-volume (time-dependent) affine chains."""
+
+    def _chain(self, device, T):
+        def rot(ang_deg, tx):
+            a = np.deg2rad(ang_deg)
+            c, s = np.cos(a), np.sin(a)
+            M = torch.eye(4)
+            M[1, 1] = c
+            M[1, 2] = -s
+            M[2, 1] = s
+            M[2, 2] = c
+            M[0, 3] = tx
+            return M
+
+        static = AffineTransform(matrices=rot(7.0, 0.6)[None].to(device))  # 1 matrix
+        pervol = AffineTransform(
+            matrices=torch.stack([rot(0.5 * t, 0.1 * t) for t in range(T)]).to(device)
+        )  # T matrices → time-dependent
+        return [static, pervol]
+
+    def test_matches_field_path_4d_cross_grid(self):
+        dev = DEVICE
+        torch.manual_seed(0)
+        nz, ny, nx = 10, 12, 11
+        T = 4
+        src4d = torch.stack([torch.randn(nz, ny, nx) for _ in range(T)]).to(dev)
+        out_shape = (nz, ny, nx)
+        # oblique source, cardinal output → exercises the cardinal grid conversion
+        src_aff = np.eye(4)
+        src_aff[:3, :3] = np.array([[2.0, 0, 0], [0, 2.0, -0.3], [0, 0.3, 2.0]])
+        out_aff = np.diag([2.0, 2.0, 2.0, 1.0])
+        tf = self._chain(dev, T)
+
+        field = torch.stack(
+            [
+                apply_composed_warp(
+                    src4d[t],
+                    compose_chain(tf, out_shape, out_aff, dev, time_idx=t, interp="wsinc5", verb=0),
+                    src_aff,
+                    out_aff,
+                    interp="wsinc5",
+                )
+                for t in range(T)
+            ]
+        )
+        fast = torch.stack(
+            _apply_affine_chain_batched(
+                tf, src4d, True, 0, T, src_aff, out_aff, out_shape, "wsinc5", False, dev
+            )
+        )
+        assert fast.shape == field.shape
+        assert torch.allclose(fast, field, atol=1e-4)
+
+    def test_time_range_subset(self):
+        dev = DEVICE
+        torch.manual_seed(1)
+        nz, ny, nx = 8, 8, 8
+        T = 6
+        src4d = torch.randn(T, nz, ny, nx).to(dev)
+        aff = np.diag([2.0, 2.0, 2.0, 1.0])
+        tf = self._chain(dev, T)
+        # frames 2..4 only; result must equal the full-run frames 2..4
+        sub = _apply_affine_chain_batched(
+            tf, src4d, True, 2, 5, aff, aff, (nz, ny, nx), "cubic", False, dev
+        )
+        full = _apply_affine_chain_batched(
+            tf, src4d, True, 0, T, aff, aff, (nz, ny, nx), "cubic", False, dev
+        )
+        assert len(sub) == 3
+        for k, t in enumerate(range(2, 5)):
+            assert torch.allclose(sub[k], full[t], atol=1e-5)

@@ -988,6 +988,74 @@ def apply_composed_warp(
     return warped
 
 
+def _apply_affine_chain_batched(
+    transforms: list[AffineTransform],
+    source: Tensor,
+    is_4d: bool,
+    t_start: int,
+    t_end: int,
+    source_affine: np.ndarray,
+    output_affine: np.ndarray,
+    output_shape: tuple[int, int, int],
+    interp: str,
+    no_neg: bool,
+    device: torch.device,
+) -> list[Tensor]:
+    """Fast path for an all-affine chain: compose to one pull matrix per frame
+    and resample batched, skipping dense displacement-field materialization.
+
+    For a chain ``[M0, M1, ..., Mk]`` (pull order ``C(B(A(x)))``), the composed
+    output-voxel map is ``A_c = Mk @ ... @ M0`` and the source-sample location is
+    ``inv(src_card) @ out_card @ A_c @ x`` — exactly what :func:`compose_chain` +
+    :func:`apply_composed_warp` produce, but as a single 4x4 matmul per frame
+    instead of a per-frame ``(nz,ny,nx,3)`` field build + meshgrid + coord matmul.
+    Batched over time via :func:`apply_affine_interp_batched` (shared coord grid,
+    one batched matmul), time-chunked per the [[Memory module]].
+    """
+    from fastfuncstuff.memory import compute_moco_resample_batch_size
+
+    from .affine import apply_affine_interp_batched
+
+    # Fixed output-voxel -> source-voxel grid conversion (AFNI cardinal frames,
+    # same as apply_composed_warp).
+    src_card = compute_cardinal_affine(source_affine)
+    out_card = compute_cardinal_affine(output_affine)
+    M_grid = torch.from_numpy((np.linalg.inv(src_card) @ out_card).astype(np.float32)).to(device)
+
+    onz, ony, onx = output_shape
+    # apply_affine_interp_batched supports linear/cubic/quintic/heptic/wsinc5.
+    interp_k = interp if interp in ("cubic", "quintic", "heptic", "wsinc5") else "linear"
+
+    def compose_at(t: int) -> Tensor:
+        A_c = torch.eye(4, device=device)
+        for xf in transforms:  # A_c = Mk @ ... @ M0 (matches compose_chain order)
+            A_c = xf.at_time(t) @ A_c
+        return M_grid @ A_c
+
+    times = list(range(t_start, t_end))
+    bs = (
+        compute_moco_resample_batch_size(onz, ony, onx, len(times), device, interp=interp_k)
+        if is_4d
+        else 1
+    )
+    bs = max(1, min(bs, len(times)))
+
+    out: list[Tensor] = []
+    for i in range(0, len(times), bs):
+        chunk = times[i : i + bs]
+        mats = torch.stack([compose_at(t) for t in chunk])  # (b, 4, 4)
+        srcs = (
+            torch.stack([(source[t] if is_4d else source) for t in chunk]).to(device).float()
+        )  # (b, snz, sny, snx)
+        warped = apply_affine_interp_batched(
+            srcs, mats, interp=interp_k, output_shape=(onz, ony, onx), zero_outside=True
+        )
+        if no_neg:
+            warped = warped.clamp_min(0.0)
+        out.extend(warped[j] for j in range(warped.shape[0]))
+    return out
+
+
 def _regrid_to_dxyz(
     output_shape: tuple[int, ...],
     output_affine: np.ndarray,
@@ -1663,15 +1731,46 @@ def nwarpforge(
     output_volumes = []
     phase_volumes: list[Tensor] = []
 
+    # Affine-only fast path: a chain with no nonlinear warp is a pure per-frame
+    # 4x4 map. Composing it as matrices + a single batched resample is far
+    # cheaper than materializing a displacement field per frame (the general
+    # path below). NN falls through (batched sampler is interp-only); phase
+    # warping keeps the field path.
+    affine_only = (
+        phase_data is None
+        and interp not in ("NN", "nearest")
+        and all(isinstance(x, AffineTransform) for x in transforms)
+    )
+    if affine_only:
+        if verb >= 1:
+            print("nwarpforge: affine-only chain -> batched affine fast path (no field build)")
+        output_volumes = _apply_affine_chain_batched(
+            transforms,
+            source,
+            is_4d,
+            t_start,
+            t_end,
+            source_header["affine"],
+            output_affine,
+            output_shape,
+            interp,
+            no_neg,
+            device,
+        )
+
     # Collapse static runs once: the per-frame loop then only recomposes the
     # time-dependent pieces against pre-prepared static warps (no per-frame
     # resampling of distortion/anat/MNI warps). If nothing is time-dependent,
     # the whole chain composes a single time.
-    reduced = reduce_chain(
-        transforms, output_shape, output_affine, device, interp=ainterp, verb=verb
+    reduced = (
+        None
+        if affine_only
+        else reduce_chain(
+            transforms, output_shape, output_affine, device, interp=ainterp, verb=verb
+        )
     )
     static_composed: NonlinearWarp | None = None
-    if not any(_is_time_dependent(x) for x in reduced):
+    if reduced is not None and not any(_is_time_dependent(x) for x in reduced):
         static_composed = compose_chain(
             reduced,
             output_shape,
@@ -1683,7 +1782,7 @@ def nwarpforge(
         )
 
     time_iter = tqdm(
-        range(t_start, t_end),
+        range(t_start, t_end) if not affine_only else range(0),
         desc="Warping volumes",
         disable=verb == 0 or (t_end - t_start) == 1,
     )
