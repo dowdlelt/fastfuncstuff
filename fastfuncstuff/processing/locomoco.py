@@ -186,6 +186,155 @@ def optical_flow_lk_2d(
     return u, v
 
 
+def xcorr_search_flow_2d(
+    fixed: torch.Tensor,
+    moving: torch.Tensor,
+    *,
+    pe_is_u: bool,
+    max_shift: float = 3.0,
+    window_sigma: float = 2.0,
+    eps: float = 1e-4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dense local cross-correlation searchlight for the PE-axis shift.
+
+    The alternative backend to :func:`optical_flow_lk_2d`, same ``(fixed, moving)
+    -> (u, v)`` contract, so it drops into the same slice/frame loop. Residual EPI
+    motion is a small local translation *along the phase-encode axis*, so we do the
+    literal thing: slide ``moving`` along PE by a set of trial offsets spanning
+    ``±max_shift``, and at each offset measure the *local* normalized correlation
+    with ``fixed`` — the "searchlight" is a Gaussian window of radius
+    ``window_sigma`` (a soft square of voxels on the slice). Per voxel, the offset
+    with the highest windowed correlation is where that spot lines up; a parabolic
+    fit across the three offsets around the peak gives the sub-voxel value. That
+    winning offset *is* the pull displacement (``moving(x+u) ≈ fixed(x)``), so no
+    sign flip. It matches or beats the phase-correlation route (FFT phase-ramp) —
+    same shift, but immune to the leakage bias a windowed FFT suffers on small
+    patches — and needs no warping iterations because it is a true alignment search.
+
+    Only the PE component is estimated; the orthogonal output is zero. ``pe_is_u``
+    selects which carries it (u = W/columns, v = H/rows).
+    """
+    import math
+
+    r = max(1, int(math.ceil(max_shift)))  # integer trial radius; parabola gets sub-voxel
+
+    def _win(x: torch.Tensor) -> torch.Tensor:
+        return _blur2d(x, window_sigma)
+
+    def _shift_pe(img: torch.Tensor, d: float) -> torch.Tensor:
+        off = torch.full_like(img, float(d))
+        zero = torch.zeros_like(img)
+        return _warp2d(img, off, zero) if pe_is_u else _warp2d(img, zero, off)
+
+    # Fixed-image local moments precomputed once (the search only moves `moving`).
+    mean_f = _win(fixed)
+    var_f = (_win(fixed * fixed) - mean_f * mean_f).clamp_min(eps)
+
+    cc = []
+    for d in range(-r, r + 1):
+        mw = _shift_pe(moving, float(d))
+        mean_m = _win(mw)
+        var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
+        cov = _win(fixed * mw) - mean_f * mean_m
+        cc.append(cov / torch.sqrt(var_f * var_m))
+    corr = torch.stack(cc, dim=0)  # (2r+1, B, H, W); index i is offset i-r
+
+    idx = corr.argmax(dim=0)  # integer best offset (as index into the trial stack)
+    pc = idx.clamp(1, corr.shape[0] - 2)  # keep a neighbour on each side for the parabola
+    c0 = torch.gather(corr, 0, pc[None]).squeeze(0)
+    cm = torch.gather(corr, 0, (pc - 1)[None]).squeeze(0)
+    cp = torch.gather(corr, 0, (pc + 1)[None]).squeeze(0)
+    denom = cm - 2.0 * c0 + cp
+    sub = torch.where(denom.abs() > 1e-6, 0.5 * (cm - cp) / denom, torch.zeros_like(denom))
+    sub = sub.clamp(-1.0, 1.0)
+    shift = (pc.float() - r) + sub  # best PE offset = pull displacement
+
+    zeros = torch.zeros_like(shift)
+    return (shift, zeros) if pe_is_u else (zeros, shift)
+
+
+def _phase_slope_dense(
+    fixed: torch.Tensor,
+    moving: torch.Tensor,
+    pe_is_u: bool,
+    patch: int,
+    stride: int,
+    max_shift: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """One-shot dense PE shift from the FFT phase ramp of overlapping patches.
+
+    Tiles the slice into ``patch``×``patch`` squares (stride ``stride``), 1-D FFTs
+    each *along PE*, and reads the shift off the slope of the cross-power-spectrum
+    phase (summed over the perpendicular lines, fit over low-k bins so it never
+    wraps for ``|shift| <= max_shift``). Returns the dense pull field ``(B, H, W)``
+    (patch-centre values bilinearly interpolated up). Biased low on its own — a
+    local patch's shift isn't circular — so callers wrap it in warping iterations.
+    """
+    import math
+
+    b, h, w = fixed.shape
+    device, dtype = fixed.device, fixed.dtype
+    p = patch
+    pad = p // 2
+    fpad = F.pad(fixed[:, None], (pad, pad, pad, pad), mode="reflect")
+    mpad = F.pad(moving[:, None], (pad, pad, pad, pad), mode="reflect")
+    lh = (fpad.shape[2] - p) // stride + 1
+    lw = (fpad.shape[3] - p) // stride + 1
+
+    def _patches(x: torch.Tensor) -> torch.Tensor:
+        cols = F.unfold(x, kernel_size=p, stride=stride)  # (B, p*p, L)
+        return cols.transpose(1, 2).reshape(b * lh * lw, p, p)
+
+    fp, mp = _patches(fpad), _patches(mpad)
+    if pe_is_u:  # PE along W (dim=2) -> move it to dim=1 for the FFT
+        fp, mp = fp.transpose(1, 2), mp.transpose(1, 2)
+    fp = fp - fp.mean(dim=(1, 2), keepdim=True)
+    mp = mp - mp.mean(dim=(1, 2), keepdim=True)
+    ppe = fp.shape[1]
+
+    cross = (torch.fft.fft(fp, dim=1) * torch.fft.fft(mp, dim=1).conj()).sum(dim=2)  # (N, ppe)
+    kmax = max(1, min(ppe // 2 - 1, int(ppe / (2.0 * max_shift))))
+    ks = torch.arange(1, kmax + 1, device=device, dtype=dtype)
+    ang = torch.angle(cross[:, 1 : kmax + 1])
+    wts = cross[:, 1 : kmax + 1].abs()
+    slope = (wts * ks * ang).sum(dim=1) / (wts * ks * ks).sum(dim=1).clamp_min(eps)
+    # slope*ppe/2π is already the pull displacement (−Δ for moving=fixed(x+Δ)).
+    shift = (slope * ppe / (2.0 * math.pi)).clamp(-max_shift, max_shift).reshape(b, lh, lw)
+    return F.interpolate(shift[:, None], size=(h, w), mode="bilinear", align_corners=True)[:, 0]
+
+
+def phase_correlation_flow_2d(
+    fixed: torch.Tensor,
+    moving: torch.Tensor,
+    *,
+    pe_is_u: bool,
+    patch: int = 16,
+    stride: int = 8,
+    max_shift: float = 3.0,
+    n_iters: int = 5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Phase-correlation searchlight backend (FFT phase ramp along PE).
+
+    An alternative to :func:`optical_flow_lk_2d` / :func:`xcorr_search_flow_2d`,
+    same ``(fixed, moving) -> (u, v)`` contract. A translation along PE is a linear
+    phase ramp of the FFT along PE (the shift theorem), so the local shift reads
+    straight off the cross-spectrum phase — the clean, "treat it as a vector" route.
+    A single windowed patch reads the shift low (its content isn't circular), so we
+    warp ``moving`` by the running estimate and re-read the residual, ``n_iters``
+    times: each pass shrinks the residual until the leakage bias vanishes. The
+    accumulated field is the pull displacement (``moving(x+u) ≈ fixed(x)``).
+
+    Only the PE component is estimated; ``pe_is_u`` selects which output carries it.
+    """
+    u = torch.zeros_like(fixed)
+    zero = torch.zeros_like(fixed)
+    for _ in range(n_iters):
+        mw = _warp2d(moving, u, zero) if pe_is_u else _warp2d(moving, zero, u)
+        u = u + _phase_slope_dense(fixed, mw, pe_is_u, patch, stride, max_shift)
+    return (u, zero) if pe_is_u else (zero, u)
+
+
 def resolve_pe_axis(pe_dir: str) -> int:
     """Map a PE-direction token (AP/PA/LR/RL/IS/SI or x/y/z) to a NIfTI axis."""
     key = pe_dir.strip()
@@ -364,7 +513,7 @@ def _correct_pe(
     return _warp2d(moving_raw, uc, vc)
 
 
-def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device):
+def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device):
     """Fixed reference: batch the flow over ALL frames at once, looping slices."""
     nt, ns, hh, ww = vol.shape
     if ref_mode == "mean":
@@ -389,14 +538,14 @@ def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device)
         fixed_raw = ref[s].to(device).unsqueeze(0).expand(nt, hh, ww).contiguous().float()
         fixed = _blur2d(fixed_raw, smooth_sigma) if smooth_sigma > 0 else fixed_raw
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
-        u, v = optical_flow_lk_2d(fixed, moving, **flow_kw)
+        u, v = flow_fn(fixed, moving)
         corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u).cpu()
         u_all[:, s] = u.cpu()
         v_all[:, s] = v.cpu()
     return u_all, v_all, corrected
 
 
-def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device):
+def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device):
     """Progressive reference: frame t registers to the running mean/median of the
     already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
     time, so batched over SLICES per frame instead of over time.
@@ -424,7 +573,7 @@ def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, dev
         moving_raw = vol[t].to(device).float()
         fixed = _blur2d(ref, smooth_sigma) if smooth_sigma > 0 else ref
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
-        u, v = optical_flow_lk_2d(fixed, moving, **flow_kw)
+        u, v = flow_fn(fixed, moving)
         corr = _correct_pe(moving_raw, u, v, pe_flow_is_u)
         corrected[t] = corr.cpu()
         u_all[t] = u.cpu()
@@ -441,26 +590,44 @@ def estimate_residual_flow(
     slice_axis: int,
     *,
     ref_mode: str = "mean",
+    backend: str = "flow",
     smooth_sigma: float = 0.0,
     n_levels: int = 3,
     n_iters: int = 4,
     window_sigma: float = 2.0,
     pe_only: bool = True,
+    max_shift: float = 3.0,
+    patch: int = 16,
+    stride: int = 8,
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
-    """Estimate per-frame residual motion of a 4-D series via slicewise optical flow.
+    """Estimate per-frame residual PE-axis motion of a 4-D series, slicewise.
 
     ``data`` is ``(nx, ny, nz, T)`` (already motion-corrected). Slices are taken
     orthogonal to ``slice_axis`` (so PE lies in-plane); each slice's time course is
-    a 2-D movie. Optical flow of every frame against a reference gives the in-plane
-    displacement; the WARP/correction/flow-map use only the ``pe_axis`` component
-    (residual EPI motion is a PE-axis displacement, MEDIC-style). ``pe_only``
-    (default) constrains the flow itself to the PE axis (1 DOF, more robust); set
-    it False for full 2-D flow (e.g. a richer direction movie).
+    a 2-D movie registered frame-by-frame to a reference. The WARP/correction/flow-
+    map use only the ``pe_axis`` component (residual EPI motion is a PE-axis
+    displacement, MEDIC-style).
+
+    ``backend`` picks the per-frame estimator, all three measuring the same PE
+    displacement by different routes:
+
+    - ``flow`` (default): pyramidal Lucas-Kanade optical flow. ``pe_only`` (default)
+      constrains it to 1 DOF along PE; False gives full 2-D flow (richer direction
+      movie). ``n_levels`` / ``n_iters`` / ``window_sigma`` tune it.
+    - ``phase``: phase-correlation searchlight — the shift read off the FFT phase
+      ramp along PE over ``patch``×``patch`` squares (stride ``stride``), refined by
+      ``n_iters`` warping passes. The clean "shift = phase vector" route.
+    - ``xcorr``: magnitude cross-correlation searchlight — slide ``moving`` along PE
+      over ``±max_shift`` and take the per-voxel offset of peak local (``window_sigma``
+      Gaussian) correlation, sub-voxel by parabolic fit. Robust, single-shot.
+
+    ``max_shift`` bounds the phase/xcorr search (residual motion is sub- to a few
+    voxels).
 
     ``ref_mode``: static ``mean`` | ``median`` | ``first`` | ``<int>``, or a
     PROGRESSIVE ``first_mean`` / ``first_median`` — frame t registers to the
@@ -491,12 +658,44 @@ def estimate_residual_flow(
     vol = torch.from_numpy(np.ascontiguousarray(data)).permute(perm).contiguous()
     nt, ns = vol.shape[0], vol.shape[1]
 
-    pe_only_axis = (0 if pe_flow_is_u else 1) if pe_only else None
-    flow_kw = dict(
-        n_levels=n_levels, n_iters=n_iters, window_sigma=window_sigma, pe_only_axis=pe_only_axis
-    )
+    # Backend: a per-pair (fixed, moving) -> (u, v) estimator plugged into the same
+    # slice/frame machinery. Optical flow (default), phase-correlation, or magnitude
+    # cross-correlation — all return only the PE component.
+    if backend == "flow":
+        pe_only_axis = (0 if pe_flow_is_u else 1) if pe_only else None
+
+        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return optical_flow_lk_2d(
+                fx,
+                mv,
+                n_levels=n_levels,
+                n_iters=n_iters,
+                window_sigma=window_sigma,
+                pe_only_axis=pe_only_axis,
+            )
+    elif backend == "phase":
+
+        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return phase_correlation_flow_2d(
+                fx,
+                mv,
+                pe_is_u=pe_flow_is_u,
+                patch=patch,
+                stride=stride,
+                max_shift=max_shift,
+                n_iters=n_iters,
+            )
+    elif backend == "xcorr":
+
+        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return xcorr_search_flow_2d(
+                fx, mv, pe_is_u=pe_flow_is_u, max_shift=max_shift, window_sigma=window_sigma
+            )
+    else:
+        raise ValueError(f"Unknown backend {backend!r}; expected flow | phase | xcorr.")
+
     est = _estimate_cumulative if ref_mode in ("first_mean", "first_median") else _estimate_static
-    u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device)
+    u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device)
 
     soft = None
     if automask:

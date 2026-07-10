@@ -80,6 +80,47 @@ def test_recovers_per_frame_pe_shift(known_shift_series):
     assert np.abs(est + shifts).max() < 0.3
 
 
+@pytest.mark.parametrize("backend", ["phase", "xcorr"])
+def test_alt_backends_recover_pe_shift(known_shift_series, backend):
+    # The phase-correlation and cross-correlation searchlights must recover the same
+    # per-frame PE shift as optical flow, to sub-voxel accuracy.
+    data, shifts = known_shift_series
+    res = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        backend=backend,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    pe = res.pe_displacement().numpy()
+    est = np.median(pe.reshape(-1, pe.shape[-1]), axis=0)
+    assert np.corrcoef(est, -shifts)[0, 1] > 0.99
+    assert np.abs(est + shifts).max() < 0.3
+
+
+def test_xcorr_search_matches_translation():
+    # Direct check of the cross-correlation searchlight primitive: a +1.2 shift along
+    # W(u) must come back as a -1.2 pull, with no spurious H(v) component.
+    from fastfuncstuff.processing.locomoco import xcorr_search_flow_2d
+
+    base = _phantom(40, 40, 1)[:, :, 0]
+    fixed = torch.from_numpy(base)[None]
+    moving = torch.from_numpy(_shift_along_y(base[:, :, None], 1.2)[:, :, 0])[None]
+    u, v = xcorr_search_flow_2d(fixed, moving, pe_is_u=True, max_shift=3.0)
+    assert abs(float(u[0, 6:-6, 6:-6].median()) + 1.2) < 0.15
+    assert float(v.abs().max()) == 0.0  # PE-only: orthogonal component is exactly zero
+
+
+def test_unknown_backend_raises(known_shift_series):
+    data, _ = known_shift_series
+    with pytest.raises(ValueError, match="Unknown backend"):
+        estimate_residual_flow(
+            data, pe_axis=1, slice_axis=2, backend="bogus", device=torch.device("cpu")
+        )
+
+
 def test_correction_reduces_frame_to_ref_error(known_shift_series):
     data, _ = known_shift_series
     res = estimate_residual_flow(

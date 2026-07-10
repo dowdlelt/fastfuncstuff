@@ -71,7 +71,16 @@ def create_parser() -> argparse.ArgumentParser:
         help="Through-plane (slice-select) axis to cut the movie along (x/y/z). "
         "Must differ from the PE axis; default z suits axial EPI.",
     )
-    flow = p.add_argument_group("Optical flow")
+    flow = p.add_argument_group("Estimation")
+    flow.add_argument(
+        "-backend",
+        default="flow",
+        choices=("flow", "phase", "xcorr"),
+        help="Displacement estimator (all measure the same PE shift): 'flow' "
+        "(default) pyramidal Lucas-Kanade optical flow; 'phase' phase-correlation "
+        "searchlight (shift off the FFT phase ramp along PE); 'xcorr' magnitude "
+        "cross-correlation searchlight (slide along PE, peak local correlation).",
+    )
     flow.add_argument(
         "-ref",
         default="mean",
@@ -117,9 +126,34 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         metavar="SIGMA",
-        help="Lucas-Kanade neighbourhood: gradients are pooled over a Gaussian of "
-        "this sigma (voxels), assuming locally-constant flow. Larger = smoother, "
-        "better-conditioned warp but blurs fine detail; smaller = sharper, noisier.",
+        help="Neighbourhood Gaussian sigma (voxels). flow: the Lucas-Kanade "
+        "gradient-pooling window (locally-constant-flow assumption). xcorr: the "
+        "searchlight radius the local correlation is measured over. Larger = "
+        "smoother, better-conditioned but blurs detail; smaller = sharper, noisier.",
+    )
+    search = p.add_argument_group("Searchlight backends (phase / xcorr)")
+    search.add_argument(
+        "-max_shift",
+        type=float,
+        default=3.0,
+        metavar="VOX",
+        help="Largest PE shift to search for (voxels). Residual motion is sub- to a "
+        "few voxels, so keep this small — it bounds the xcorr trial range and the "
+        "phase no-wrap frequency band.",
+    )
+    search.add_argument(
+        "-patch",
+        type=int,
+        default=16,
+        help="phase backend: side (voxels) of the square searchlight FFT'd along PE. "
+        "Bigger = less boundary leakage per pass, coarser field.",
+    )
+    search.add_argument(
+        "-stride",
+        type=int,
+        default=8,
+        help="phase backend: spacing (voxels) between patch centres; < patch gives "
+        "NORDIC-style overlap. Smaller = denser field, more FFTs.",
     )
 
     mask = p.add_argument_group("Masking")
@@ -292,11 +326,12 @@ def main(argv: list[str] | None = None) -> int:
         if automask
         else "off"
     )
+    mode = f"{'1-D PE' if pe_only else '2-D'} flow" if args.backend == "flow" else args.backend
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
     print(
-        f"   PE axis={pe_axis} ({args.pe_dir}), slice axis={slice_axis}, ref={args.ref}, "
-        f"do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
-        f"{'1-D PE' if pe_only else '2-D'} flow, automask={mask_desc}"
+        f"   PE axis={pe_axis} ({args.pe_dir}), slice axis={slice_axis}, backend={args.backend}, "
+        f"ref={args.ref}, do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
+        f"{mode}, automask={mask_desc}"
     )
 
     result = estimate_residual_flow(
@@ -304,11 +339,15 @@ def main(argv: list[str] | None = None) -> int:
         pe_axis,
         slice_axis,
         ref_mode=args.ref,
+        backend=args.backend,
         smooth_sigma=smooth_sigma,
         n_levels=args.levels,
         n_iters=args.iters,
         window_sigma=args.window,
         pe_only=pe_only,
+        max_shift=args.max_shift,
+        patch=args.patch,
+        stride=args.stride,
         automask=automask,
         automask_dilate=args.automask_dilate,
         automask_sigma=args.automask_sigma,
