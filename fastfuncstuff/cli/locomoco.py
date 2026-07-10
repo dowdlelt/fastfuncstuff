@@ -56,7 +56,7 @@ numbers are mean |err| recovering known shifts on a 0.8 mm real brain):
          reads: -patch -stride -iters -max_shift
   xcorr  magnitude cross-correlation searchlight — slide along PE, peak local corr.
          Robust, single-shot (~0.028 vox).
-         reads: -window -max_shift
+         reads: -window -max_shift -xcorr_step
 
 which flag feeds which backend:
 
@@ -68,6 +68,7 @@ which flag feeds which backend:
   -iters          ·      ·      -       flow: LK passes / phase: warp-refine passes
   -window         ·      -      ·       flow: LK window / xcorr: searchlight radius
   -max_shift      -      ·      ·       search bound (voxels)
+  -xcorr_step     -      -      ·       xcorr trial spacing (sub-voxel knob)
   -patch          -      ·      -       phase FFT patch side
   -stride         -      ·      -       phase patch spacing
 
@@ -84,6 +85,8 @@ tuning (turning the knobs):
               overlap. 8 default.
   -iters      more = better convergence for larger motion (flow AND phase), linear
               cost; xcorr ignores it (single-shot).
+  -xcorr_step xcorr's sub-voxel knob (its answer to -iters): 0.5 default; 0.25 doubles
+              the trials for a bit more precision. Peak is always 5-point-parabola fit.
   -levels     more pyramid levels handle bigger motion but risk aliasing on thin
               slices.
 
@@ -234,6 +237,16 @@ def create_parser() -> argparse.ArgumentParser:
         "the biggest residual shift you expect (sub- to a few voxels here). Smaller = "
         "faster xcorr (fewer trial offsets) and a tighter phase no-wrap band; too "
         "small clips real motion. flow ignores it (pyramid handles range).",
+    )
+    search.add_argument(
+        "-xcorr_step",
+        type=float,
+        default=0.5,
+        metavar="VOX",
+        help="[xcorr only] Trial-offset spacing (voxels) of the correlation search — "
+        "xcorr's sub-voxel knob, like -iters is for the others. The peak is fit by a "
+        "5-point parabola either way; a finer step (e.g. 0.25) samples the curve more "
+        "densely for a touch more accuracy at ~2× the trials. 0.5 is the sweet spot.",
     )
     search.add_argument(
         "-patch",
@@ -466,6 +479,7 @@ def main(argv: list[str] | None = None) -> int:
         pe_only=pe_only,
         dual=dual,
         max_shift=args.max_shift,
+        trial_step=args.xcorr_step,
         patch=args.patch,
         stride=args.stride,
         automask=automask,

@@ -201,8 +201,9 @@ def _xcorr_shift_1d(
     Slide ``moving`` along the axis (``pe_is_u`` → W/columns, else H/rows) over trial
     offsets spanning ``±max_shift`` in ``trial_step`` steps; at each, measure local
     normalized correlation with ``fixed`` under a ``window_sigma`` Gaussian searchlight.
-    Per voxel the peak offset (parabola-refined) is the pull displacement. Trials are
-    swept with a streaming running-peak, so memory is O(frame×slice), not O(trials×…).
+    Per voxel the peak offset, refined by a 5-point least-squares parabola (peak ±2,
+    robust to a noisy correlation curve), is the pull displacement. Trials are swept
+    with a streaming running-peak, so memory is O(frame×slice), not O(trials×…).
     """
     import math
 
@@ -237,34 +238,46 @@ def _xcorr_shift_1d(
     offsets = torch.arange(-r, r + 1e-6, trial_step, device=device, dtype=dtype)
     nd = int(offsets.numel())
 
+    # Streaming running-peak keeping the FOUR neighbours (±2) needed for a 5-point
+    # least-squares parabola — more robust than the 3-point analytic vertex and free
+    # (no extra trials). `need` counts how many right neighbours a fresh peak still
+    # awaits; prev1/prev2 are the trailing two correlations for its left neighbours.
+    z = torch.zeros((b, h, w), device=device, dtype=dtype)
     best_val = torch.full((b, h, w), float("-inf"), device=device, dtype=dtype)
     best_i = torch.zeros((b, h, w), device=device, dtype=torch.long)
-    best_left = torch.zeros((b, h, w), device=device, dtype=dtype)
-    best_right = torch.zeros((b, h, w), device=device, dtype=dtype)
-    pending = torch.zeros((b, h, w), device=device, dtype=torch.bool)  # peak awaiting its right nb
-    prev: torch.Tensor | None = None
+    ym2, ym1, y0, yp1, yp2 = z.clone(), z.clone(), z.clone(), z.clone(), z.clone()
+    need = torch.zeros((b, h, w), device=device, dtype=torch.long)
+    prev1: torch.Tensor | None = None
+    prev2: torch.Tensor | None = None
     for i in range(nd):
         mw = _shift(moving, float(offsets[i]))
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
         corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
-        if prev is not None:  # resolve the previous iteration's peaks with their right nb
-            best_right = torch.where(pending, corr, best_right)
+        # Capture right neighbours (first the +1, then the +2) for awaiting peaks.
+        yp1 = torch.where(need == 2, corr, yp1)
+        yp2 = torch.where(need == 1, corr, yp2)
+        need = torch.where(need > 0, need - 1, need)
         newp = corr > best_val
-        best_left = torch.where(newp, prev if prev is not None else corr, best_left)
+        ym2 = torch.where(newp, prev2 if prev2 is not None else corr, ym2)
+        ym1 = torch.where(newp, prev1 if prev1 is not None else corr, ym1)
+        y0 = torch.where(newp, corr, y0)
         best_val = torch.where(newp, corr, best_val)
         best_i = torch.where(newp, torch.full_like(best_i, i), best_i)
-        pending = newp  # these peaks capture their right neighbour next iteration
-        prev = corr
+        need = torch.where(newp, torch.full_like(need, 2), need)  # await this peak's ±1,±2
+        prev2 = prev1
+        prev1 = corr
 
-    denom = best_left - 2.0 * best_val + best_right
-    sub = torch.where(
-        denom.abs() > 1e-6, 0.5 * (best_left - best_right) / denom, torch.zeros_like(denom)
-    )
-    sub = sub.clamp(-1.0, 1.0)
-    # A peak at either end has no bracketing neighbour; leave it on the integer node.
-    edge = (best_i == 0) | (best_i == nd - 1)
-    sub = torch.where(edge, torch.zeros_like(sub), sub)
+    # 5-point LS quadratic (x=-2..2) vertex; fall back to 3-point near an edge.
+    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
+    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
+    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
+    den3 = ym1 - 2.0 * y0 + yp1
+    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3))
+    vtx3 = vtx3.clamp(-1.0, 1.0)
+    can5 = (best_i >= 2) & (best_i <= nd - 3)
+    can3 = (best_i >= 1) & (best_i <= nd - 2)
+    sub = torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
     return (-r + best_i.to(dtype) * trial_step) + sub * trial_step
 
 
@@ -701,6 +714,7 @@ def estimate_residual_flow(
     pe_only: bool = True,
     dual: bool = False,
     max_shift: float = 3.0,
+    trial_step: float = 0.5,
     patch: int = 16,
     stride: int = 8,
     automask: bool = False,
@@ -807,6 +821,7 @@ def estimate_residual_flow(
                 pe_is_u=pe_flow_is_u,
                 max_shift=max_shift,
                 window_sigma=window_sigma,
+                trial_step=trial_step,
                 dual=dual,
             )
     else:
