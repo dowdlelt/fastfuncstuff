@@ -13,33 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.analysis import _dsort_block_diagonalize, analyze_from_design_matrix
-
-
-def test_block_diagonalize_zero_pads_per_run():
-    n_vox, n_time = 5, 100
-    run_starts = [0, 40]
-    reg = torch.arange(n_vox * n_time, dtype=torch.float32).reshape(n_vox, n_time) + 1.0
-    block, labels = _dsort_block_diagonalize(reg, 0, run_starts, n_time)
-
-    assert block.shape == (n_vox, 2, n_time)
-    assert labels == ["dsort0_run1", "dsort0_run2"]
-    # Column 0 carries run 1 (frames 0:40) and is zero afterwards.
-    assert torch.all(block[:, 0, 40:] == 0)
-    assert torch.all(block[:, 0, :40] == reg[:, :40])
-    # Column 1 carries run 2 (frames 40:100) and is zero before.
-    assert torch.all(block[:, 1, :40] == 0)
-    assert torch.all(block[:, 1, 40:] == reg[:, 40:])
-    # The two columns partition the regressor with no overlap or loss.
-    assert torch.allclose(block.sum(dim=1), reg)
-
-
-def test_block_diagonalize_single_run_is_one_column():
-    reg = torch.randn(3, 50)
-    block, labels = _dsort_block_diagonalize(reg, 2, [0], 50)
-    assert block.shape == (3, 1, 50)
-    assert labels == ["dsort2"]  # no run suffix for a single-run design
-    assert torch.allclose(block[:, 0, :], reg)
+from fastfuncstuff.analysis import analyze_from_design_matrix
 
 
 def _write_two_run_design(tmp_path, n_time=100, split=50):

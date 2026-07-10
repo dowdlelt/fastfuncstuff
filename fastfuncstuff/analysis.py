@@ -30,27 +30,6 @@ from fastfuncstuff.io.afni import (
 from .utils import get_device, to_tensor
 
 
-def _dsort_block_diagonalize(
-    reg: torch.Tensor, set_index: int, run_starts: list[int], n_time: int
-) -> tuple[torch.Tensor, list[str]]:
-    """Make one -dsort set's regressor per-run block-diagonal.
-
-    ``reg`` is (n_vox, n_time) for a single -dsort set (already
-    constant-guarded). Each run's samples are placed in their own zero-padded
-    column, so the regressor is fit per run — exactly like block-diagonal
-    polynomials / motion. Returns (n_vox, n_runs, n_time) plus one label per run.
-    """
-    n_runs = len(run_starts)
-    bounds = list(run_starts) + [n_time]
-    block = torch.zeros(reg.shape[0], n_runs, n_time, dtype=reg.dtype)
-    labels: list[str] = []
-    for r in range(n_runs):
-        t0, t1 = bounds[r], bounds[r + 1]
-        block[:, r, t0:t1] = reg[:, t0:t1]
-        labels.append(f"dsort{set_index}_run{r + 1}" if n_runs > 1 else f"dsort{set_index}")
-    return block, labels
-
-
 def analyze_from_onsets(
     fmri_data: str | Path | list[str | Path] | np.ndarray | torch.Tensor,
     onset_files: list[str | Path],
@@ -770,13 +749,15 @@ def analyze_from_design_matrix(
             )
 
     # 2b. Voxel-wise (-dsort / ANATICOR) regressors. Each -dsort is a SET of one or
-    # more 4D files, concatenated in time to the (concatenated) input length, then
-    # made BLOCK-DIAGONAL by run: each run's regressor lands in its own zero-padded
-    # column (like polynomials / motion), so it is fit per run. Multiple -dsort
-    # flags => multiple sets. Stacked into (n_voxels, n_sets*n_runs, n_timepoints)
-    # on the CPU and streamed in the GLS pass.
+    # more 4D files, concatenated in time to the (concatenated) input length. The
+    # regressor is fit PER RUN — each run lands in its own zero-padded block-diagonal
+    # column (like polynomials / motion). Multiple -dsort flags => multiple sets.
+    # Stored COMPACT as (n_voxels, n_sets, n_timepoints) on the CPU; the per-run
+    # expansion (×n_runs columns) is done lazily per sub-batch in the GLS pass so the
+    # dense (n_voxels, n_sets*n_runs, n_timepoints) tensor never exists whole.
     dsort_tensor: torch.Tensor | None = None
     dsort_labels: list[str] | None = None
+    dsort_run_bounds: list[int] | None = None
     if dsort_files:
         # dsort works for both OLS and ARMA — it is just a per-voxel regressor.
         # (OLS routes through the ARMA GLS pass with (a,b) pinned to (0,0), i.e.
@@ -799,7 +780,11 @@ def analyze_from_design_matrix(
             f"(voxel-wise regressors)..."
         )
 
-        blocks: list[torch.Tensor] = []
+        # Stored COMPACT: one run-concatenated column per set, (n_vox, n_sets,
+        # n_time). The per-run block-diagonal expansion (×n_runs columns) is done
+        # lazily per voxel sub-batch inside the GLS pass — materializing the dense
+        # (n_vox, n_sets*n_runs, n_time) tensor here OOMs at whole-brain scale.
+        set_cols: list[torch.Tensor] = []
         dsort_labels = []
         for si, file_list in enumerate(sets):
             segs = []
@@ -841,19 +826,21 @@ def analyze_from_design_matrix(
                     f"-dsort set {si}: {d_t.shape[0]} voxels but data has "
                     f"{data.shape[0]} after masking."
                 )
-            # 3dREMLfit constant-voxel guard on the FULL regressor: after
-            # block-diagonalization a constant-nonzero voxel hides behind the 0->c
-            # jump, so it must be caught here.
+            # 3dREMLfit constant-voxel guard on the FULL (run-concatenated) column;
+            # a constant-nonzero voxel would otherwise hide behind the 0->c jump
+            # once the per-run block columns are formed.
             d_t = _dsort_constant_guard(d_t.unsqueeze(1)).squeeze(1)
-            block, labels = _dsort_block_diagonalize(d_t, si, blk_run_starts, n_time_data)
-            blocks.append(block)
-            dsort_labels.extend(labels)
-        # (n_voxels, n_sets*n_runs, n_timepoints)
-        dsort_tensor = torch.cat(blocks, dim=1).to(storage_device)
+            set_cols.append(d_t)
+            for r in range(n_runs):
+                dsort_labels.append(f"dsort{si}_run{r + 1}" if n_runs > 1 else f"dsort{si}")
+        # Compact (n_voxels, n_sets, n_timepoints); expanded to n_sets*n_runs in GLS.
+        dsort_tensor = torch.stack(set_cols, dim=1).to(storage_device)
+        # Only pass run bounds (→ trigger per-run expansion) for multi-run designs.
+        dsort_run_bounds = (blk_run_starts + [n_time_data]) if n_runs > 1 else None
         print(
             f"🧩 -dsort: {len(sets)} set(s) × {n_runs} run-block(s) = "
-            f"{dsort_tensor.shape[1]} voxel-wise column(s) "
-            f"({dsort_tensor.shape[0]:,} voxels × {n_time_data} TRs)"
+            f"{len(sets) * n_runs} voxel-wise column(s) "
+            f"({dsort_tensor.shape[0]:,} voxels × {n_time_data} TRs, compact in RAM)"
         )
 
     # 2c. Slicewise (-slibase / -slibase_sm) regressors. Each .1D holds
@@ -991,6 +978,7 @@ def analyze_from_design_matrix(
             tau=arma_tau,
             dsort=dsort_tensor,
             dsort_labels=dsort_labels,
+            dsort_run_bounds=dsort_run_bounds,
         )
 
     elif method == "ols":
@@ -1325,6 +1313,7 @@ def analyze_from_design_matrix(
                 tau=arma_tau,
                 dsort=dsort_tensor,
                 dsort_labels=dsort_labels,
+                dsort_run_bounds=dsort_run_bounds,
                 want_dsort_nods=want_dsort_nods,
             )
 
@@ -1359,6 +1348,7 @@ def analyze_from_design_matrix(
                 tau=arma_tau,
                 dsort=dsort_tensor,
                 dsort_labels=dsort_labels,
+                dsort_run_bounds=dsort_run_bounds,
                 want_dsort_nods=want_dsort_nods,
                 want_residuals=want_residuals,
             )

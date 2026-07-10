@@ -95,6 +95,45 @@ def synthetic(rng=np.random.default_rng(0)):
     )
 
 
+def test_compact_run_bounds_matches_dense_block_diagonal():
+    """Lazy per-run expansion (compact dsort + run_bounds) must equal the explicit
+    dense (n_vox, n_sets*n_runs, n_time) block-diagonal form — the memory rework
+    keeps the ×n_runs tensor from ever being materialized for the whole brain.
+    """
+    device = torch.device("cpu")
+    rng = np.random.default_rng(7)
+    n_time, n_vox, split = 100, 30, 50
+    X = _make_design(n_time)
+    reg = rng.standard_normal((n_vox, n_time)).astype(np.float32)  # one -dsort set
+    beta = rng.standard_normal((n_vox, X.shape[1])).astype(np.float32) * 2.0
+    # Data carries per-run dsort signal so the two runs' betas differ.
+    dense = np.zeros((n_vox, 2, n_time), np.float32)
+    dense[:, 0, :split] = reg[:, :split]
+    dense[:, 1, split:] = reg[:, split:]
+    gamma = rng.standard_normal((n_vox, 2)).astype(np.float32) * 3.0
+    data = beta @ X.T + np.einsum("vr,vrt->vt", gamma, dense)
+    data += 0.01 * rng.standard_normal((n_vox, n_time)).astype(np.float32)
+
+    common = dict(tr=2.0, device=device, verbose=False, use_double=True, run_starts=[0, split])
+    compact = fit_glm_arma11(
+        torch.from_numpy(data),
+        torch.from_numpy(X),
+        dsort=torch.from_numpy(reg[:, None, :]),  # (n_vox, 1 set, n_time)
+        dsort_run_bounds=[0, split, n_time],
+        **common,
+    )
+    explicit = fit_glm_arma11(
+        torch.from_numpy(data),
+        torch.from_numpy(X),
+        dsort=torch.from_numpy(dense),  # pre-expanded (n_vox, 2, n_time)
+        **common,
+    )
+    assert compact.dsort_betas.shape == (n_vox, 2)
+    assert compact.dof == explicit.dof == n_time - X.shape[1] - 2
+    assert np.allclose(compact.dsort_betas.numpy(), explicit.dsort_betas.numpy(), atol=1e-8)
+    assert np.allclose(compact.betas.numpy(), explicit.betas.numpy(), atol=1e-8)
+
+
 def test_recovers_task_and_voxelwise_coefficients(synthetic):
     s = synthetic
     res = fit_glm_arma11(

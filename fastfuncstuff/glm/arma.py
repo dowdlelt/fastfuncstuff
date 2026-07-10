@@ -3549,6 +3549,7 @@ def _fit_dsort_gls_pass(
     y_norm_scale: torch.Tensor | None,
     batch_size: int,
     verbose: bool,
+    run_bounds: list[int] | None = None,
 ) -> None:
     """Redo the final GLS per voxel with an extended ``[design | dsort_v]`` design.
 
@@ -3558,11 +3559,26 @@ def _fit_dsort_gls_pass(
     batched per-voxel GLS. Results overwrite ``results.betas/tstats/sigma2/r2/fstats``
     and populate ``results.dsort_betas/dsort_tstats``. DoF drops by ``n_dsort``.
 
+    ``run_bounds`` (``[t0, t1, ..., n_time]``) turns on lazy per-run block-diagonal
+    expansion: ``dsort`` is then the COMPACT ``(n_vox, n_sets, n_time)`` form (one
+    run-concatenated column per -dsort set) and each set is expanded into one
+    zero-padded column per run *inside* each voxel sub-batch. This keeps the full
+    dense ``(n_vox, n_sets*n_runs, n_time)`` block tensor from ever being
+    materialized — at whole-brain voxel counts that ×n_runs blow-up OOMs.
+
     All betas are produced in the same per-voxel-normalized units as the main loop
     (Y divided by its std when ``y_norm_scale`` is set); the caller's unscale block
     restores physical units for both base and dsort betas.
     """
-    n_voxels, n_dsort, n_timepoints = dsort.shape
+    n_voxels, n_cols, n_timepoints = dsort.shape
+    if run_bounds is not None:
+        n_runs = len(run_bounds) - 1
+        n_sets = n_cols
+        n_dsort = n_sets * n_runs  # expanded per-run column count
+    else:
+        n_runs = 1
+        n_sets = n_cols
+        n_dsort = n_cols
     p = design.shape[1]
     p_ext = p + n_dsort
     dof = max(1, n_timepoints - p_ext)
@@ -3640,8 +3656,20 @@ def _fit_dsort_gls_pass(
                 Y = Y / y_norm_scale[idx].to(device).unsqueeze(0)
             Yw = torch.linalg.solve_triangular(L_chol, Y, upper=False)  # (n_time, B)
 
-            # Whiten this batch's dsort columns: (B, q, n_time) -> (n_time, B*q).
-            D = dsort[idx].to(device)  # (B, q, n_time)
+            # This batch's dsort columns (B, n_dsort, n_time). With run_bounds the
+            # stored form is compact (B, n_sets, n_time); expand each set into one
+            # zero-padded column per run HERE, so the dense ×n_runs tensor only ever
+            # exists for B voxels at a time (never the whole brain).
+            if run_bounds is not None:
+                Dc = dsort[idx].to(device)  # (B, n_sets, n_time)
+                D = torch.zeros(B, n_dsort, n_timepoints, device=device, dtype=Dc.dtype)
+                for si in range(n_sets):
+                    for r in range(n_runs):
+                        t0, t1 = run_bounds[r], run_bounds[r + 1]
+                        D[:, si * n_runs + r, t0:t1] = Dc[:, si, t0:t1]
+            else:
+                D = dsort[idx].to(device)  # (B, n_dsort, n_time)
+            # Whiten: (B, n_dsort, n_time) -> (n_time, B*n_dsort).
             Dmat = D.permute(2, 0, 1).reshape(n_timepoints, B * n_dsort)
             Dw = torch.linalg.solve_triangular(L_chol, Dmat, upper=False)
             Dw = Dw.reshape(n_timepoints, B, n_dsort).permute(1, 0, 2)  # (B,n_time,q)
@@ -3851,6 +3879,7 @@ def fit_glm_arma11(
     autocorr_cache: dict | None = None,
     dsort: torch.Tensor | np.ndarray | None = None,
     dsort_labels: list[str] | None = None,
+    dsort_run_bounds: list[int] | None = None,
     want_dsort_nods: bool = False,
     tau: torch.Tensor | None = None,
 ) -> ARMA11Results:
@@ -5870,8 +5899,12 @@ def fit_glm_arma11(
             y_norm_scale=_y_norm_scale,
             batch_size=batch_size,
             verbose=verbose,
+            run_bounds=dsort_run_bounds,
         )
-        results.dsort_labels = dsort_labels or [f"dsort#{k}" for k in range(int(dsort.shape[1]))]
+        _n_dsort_cols = int(dsort.shape[1]) * (
+            (len(dsort_run_bounds) - 1) if dsort_run_bounds is not None else 1
+        )
+        results.dsort_labels = dsort_labels or [f"dsort#{k}" for k in range(_n_dsort_cols)]
         results.nods_results = nods_results
 
     # Unscale results from per-voxel float32 conditioning.
