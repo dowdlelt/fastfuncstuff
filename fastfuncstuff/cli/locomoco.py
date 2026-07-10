@@ -41,11 +41,76 @@ def _split_prefix(prefix: str) -> tuple[str, str]:
     return prefix, ".nii.gz"
 
 
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    """Show each arg's default AND keep the epilog's hand-formatted layout."""
+
+
+_EPILOG = """\
+backends (all estimate the SAME residual PE-axis shift — pick on speed/quality;
+numbers are mean |err| recovering known shifts on a 0.8 mm real brain):
+
+  flow   pyramidal Lucas-Kanade optical flow. Most precise (~0.006 vox), slowest.
+         reads: -full_2d -levels -iters -window
+  phase  phase-correlation searchlight — shift from the FFT phase-ramp along PE.
+         Fastest, near-flow accuracy on real tissue (~0.013 vox).
+         reads: -patch -stride -iters -max_shift
+  xcorr  magnitude cross-correlation searchlight — slide along PE, peak local corr.
+         Robust, single-shot (~0.028 vox).
+         reads: -window -max_shift
+
+which flag feeds which backend:
+
+  flag           flow   phase  xcorr   meaning
+  -ref            ·      ·      ·       reference frame (all)
+  -do_blur        ·      ·      ·       pre-blur noisy frames (all)
+  -full_2d        ·      -      -       2-D vs PE-only flow
+  -levels         ·      -      -       optical-flow pyramid levels
+  -iters          ·      ·      -       flow: LK passes / phase: warp-refine passes
+  -window         ·      -      ·       flow: LK window / xcorr: searchlight radius
+  -max_shift      -      ·      ·       search bound (voxels)
+  -patch          -      ·      -       phase FFT patch side
+  -stride         -      ·      -       phase patch spacing
+
+tuning (turning the knobs):
+
+  -window     up = smoother, more robust, but blurs fine local shifts; down =
+              sharper, follows small structure, noisier. 2 is a good middle.
+  -max_shift  set just above the biggest residual shift you expect (this data is
+              sub- to a few voxels). Smaller = faster xcorr (fewer trials) + a
+              tighter phase no-wrap band; too small clips real motion.
+  -patch      bigger = less phase leakage per pass (needs fewer -iters), coarser
+              field; smaller = finer field but wants more -iters. 16 default.
+  -stride     smaller = denser, smoother field, more FFTs; ~patch/2 = NORDIC-style
+              overlap. 8 default.
+  -iters      more = better convergence for larger motion (flow AND phase), linear
+              cost; xcorr ignores it (single-shot).
+  -levels     more pyramid levels handle bigger motion but risk aliasing on thin
+              slices.
+
+examples:
+
+  # default: optical flow, PE-only, automask on
+  ffs_locomoco -input moco.nii.gz -prefix sub -pe_dir AP
+
+  # phase backend, denser field + more refine passes
+  ffs_locomoco -i moco.nii.gz -o sub -pe AP -backend phase -patch 12 -stride 4 -iters 6
+
+  # xcorr, tighter search + smaller searchlight for sharp local distortion
+  ffs_locomoco -i moco.nii.gz -o sub -pe AP -backend xcorr -max_shift 2 -window 1.5
+
+  # progressive reference + blur first for noisy data
+  ffs_locomoco -i moco.nii.gz -o sub -pe AP -ref first_mean -do_blur 2
+"""
+
+
 def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_locomoco",
-        description="Residual non-linear (PE-axis) motion correction via GPU optical flow.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Residual non-linear (PE-axis) motion correction via GPU optical "
+        "flow, phase-correlation, or cross-correlation searchlights. See the bottom of "
+        "this help for which -flag applies to which -backend and how to tune each.",
+        formatter_class=_HelpFormatter,
+        epilog=_EPILOG,
     )
     io = p.add_argument_group("Input/Output")
     io.add_argument("-input", "-i", required=True, help="4D motion-corrected NIfTI series")
@@ -71,89 +136,102 @@ def create_parser() -> argparse.ArgumentParser:
         help="Through-plane (slice-select) axis to cut the movie along (x/y/z). "
         "Must differ from the PE axis; default z suits axial EPI.",
     )
-    flow = p.add_argument_group("Estimation")
-    flow.add_argument(
+    est = p.add_argument_group("Estimation — all backends")
+    est.add_argument(
         "-backend",
         default="flow",
         choices=("flow", "phase", "xcorr"),
         help="Displacement estimator (all measure the same PE shift): 'flow' "
-        "(default) pyramidal Lucas-Kanade optical flow; 'phase' phase-correlation "
-        "searchlight (shift off the FFT phase ramp along PE); 'xcorr' magnitude "
-        "cross-correlation searchlight (slide along PE, peak local correlation).",
+        "(default) pyramidal Lucas-Kanade optical flow — most precise, slowest; "
+        "'phase' phase-correlation searchlight (FFT phase-ramp along PE) — fastest, "
+        "near-flow accuracy; 'xcorr' magnitude cross-correlation searchlight (slide "
+        "along PE, peak local correlation) — robust, single-shot. See epilog for the "
+        "flag→backend map and tuning.",
     )
-    flow.add_argument(
+    est.add_argument(
         "-ref",
         default="mean",
-        help="Reference: static mean | median | first | <frame index>, or PROGRESSIVE "
-        "first_mean / first_median — frame t registers to the running mean/median of "
-        "the already-corrected earlier frames (a bootstrapped template; frame 0 is the "
-        "seed). Progressive modes are sequential and slower.",
+        help="[all] Reference: static mean | median | first | <frame index>, or "
+        "PROGRESSIVE first_mean / first_median — frame t registers to the running "
+        "mean/median of the already-corrected earlier frames (a bootstrapped template; "
+        "frame 0 is the seed). Progressive modes are sequential and slower.",
     )
-    flow.add_argument(
+    est.add_argument(
         "-do_blur",
         type=float,
         default=0.0,
         metavar="FWHM_MM",
-        help="In-plane Gaussian blur (FWHM mm) applied to frames BEFORE flow only, "
-        "for robustness on noisy data; 0 = off. Does not blur the corrected output.",
+        help="[all] In-plane Gaussian blur (FWHM mm) applied to frames BEFORE "
+        "estimation only, for robustness on noisy data; 0 = off. All three backends "
+        "tested noise-robust to ~15%%, so usually leave at 0. Never blurs the output.",
     )
+
+    flow = p.add_argument_group("Optical-flow backend (-backend flow)")
     flow.add_argument(
         "-full_2d",
         action="store_true",
-        help="Estimate full 2-D flow. Default is PE-only (1 DOF along the PE axis, "
-        "more robust) — the correction and warp use only the PE component either way, "
-        "so 2-D mainly enriches the direction movie.",
+        help="[flow only] Estimate full 2-D flow. Default is PE-only (1 DOF along the "
+        "PE axis, more robust) — the correction and warp use only the PE component "
+        "either way, so 2-D mainly enriches the direction movie.",
     )
     flow.add_argument(
         "-levels",
         type=int,
         default=3,
-        help="Coarse-to-fine pyramid levels. The flow is solved on a stack of "
-        "images each halved in size; the coarsest catches large displacements "
-        "(1 px there = 2^(levels-1) px full-res), finer levels refine. More = "
-        "handles bigger motion, but risks aliasing on small slices.",
+        help="[flow only] Coarse-to-fine pyramid levels. The flow is solved on a stack "
+        "of images each halved in size; the coarsest catches large displacements "
+        "(1 px there = 2^(levels-1) px full-res), finer levels refine. More = handles "
+        "bigger motion, but risks aliasing on thin slices.",
     )
-    flow.add_argument(
+
+    tune = p.add_argument_group("Shared tuning (applies to the backends tagged below)")
+    tune.add_argument(
         "-iters",
         type=int,
         default=4,
-        help="Refinement iterations per pyramid level: warp by the current flow, "
-        "recompute the update, add it, repeat. More = better convergence for "
-        "larger motion, at linear cost. 4 suits sub-voxel residual motion.",
+        help="[flow, phase] Refinement iterations. flow: LK warp-and-update passes per "
+        "pyramid level. phase: whole-field warp-and-re-read passes that cancel the "
+        "single-patch leakage bias. More = better convergence for larger motion, "
+        "linear cost. xcorr ignores it (single-shot).",
     )
-    flow.add_argument(
+    tune.add_argument(
         "-window",
         type=float,
         default=2.0,
         metavar="SIGMA",
-        help="Neighbourhood Gaussian sigma (voxels). flow: the Lucas-Kanade "
+        help="[flow, xcorr] Neighbourhood Gaussian sigma (voxels). flow: the LK "
         "gradient-pooling window (locally-constant-flow assumption). xcorr: the "
-        "searchlight radius the local correlation is measured over. Larger = "
-        "smoother, better-conditioned but blurs detail; smaller = sharper, noisier.",
+        "searchlight radius the local correlation is measured over. Larger = smoother, "
+        "more robust, blurs fine local shifts; smaller = sharper, noisier. phase "
+        "ignores it (its window is -patch).",
     )
-    search = p.add_argument_group("Searchlight backends (phase / xcorr)")
+
+    search = p.add_argument_group("Searchlight backends (-backend phase / xcorr)")
     search.add_argument(
         "-max_shift",
         type=float,
         default=3.0,
         metavar="VOX",
-        help="Largest PE shift to search for (voxels). Residual motion is sub- to a "
-        "few voxels, so keep this small — it bounds the xcorr trial range and the "
-        "phase no-wrap frequency band.",
+        help="[phase, xcorr] Largest PE shift to search for (voxels). Set just above "
+        "the biggest residual shift you expect (sub- to a few voxels here). Smaller = "
+        "faster xcorr (fewer trial offsets) and a tighter phase no-wrap band; too "
+        "small clips real motion. flow ignores it (pyramid handles range).",
     )
     search.add_argument(
         "-patch",
         type=int,
         default=16,
-        help="phase backend: side (voxels) of the square searchlight FFT'd along PE. "
-        "Bigger = less boundary leakage per pass, coarser field.",
+        help="[phase only] Side (voxels) of the square searchlight FFT'd along PE. "
+        "Bigger = less boundary leakage per pass (needs fewer -iters), coarser field; "
+        "smaller = finer field but wants more -iters.",
     )
     search.add_argument(
         "-stride",
         type=int,
         default=8,
-        help="phase backend: spacing (voxels) between patch centres; < patch gives "
-        "NORDIC-style overlap. Smaller = denser field, more FFTs.",
+        help="[phase only] Spacing (voxels) between patch centres; < patch gives "
+        "NORDIC-style overlap. Smaller = denser, smoother field, more FFTs (slower); "
+        "~patch/2 is a good overlap.",
     )
 
     mask = p.add_argument_group("Masking")
