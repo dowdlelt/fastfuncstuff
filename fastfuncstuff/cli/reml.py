@@ -348,6 +348,19 @@ Examples:
         help="Save per-run spatial ACF / effective FWHM of the residuals (3dFWHMx-style, "
         "a*exp(-r^2/2b^2)+(1-a)*exp(-r/c)) as PREFIX.fwhmx_ols.txt / .fwhmx_reml.txt.",
     )
+    diag_out.add_argument(
+        "-adjust_dof",
+        "-adjust-dof",
+        dest="adjust_dof",
+        metavar="MAP|N",
+        default=None,
+        help="After writing the stat buckets, correct their degrees of freedom "
+        "(e.g. for NORDIC component removal): subtract N (a number) or a per-voxel "
+        "map of lost dof, convert each t/F sub-brick to a z-score at the new dof, "
+        "and insert it (Coef,Tstat -> Coef,Tstat,Zstat). Applies to -Obuck/-Rbuck. "
+        "Voxels with new dof<=0 are flagged in a *_invalid_dof map. Same as "
+        "running ffs_util_updatedof on the outputs.",
+    )
 
     # Output arguments - OLS
     ols_out = parser.add_argument_group("OLS Output Options (for comparison)")
@@ -3056,6 +3069,44 @@ def main():
     # OLS outputs - already written by callback during analysis!
     # The callback writes OLS results immediately after OLS completion,
     # freeing memory before the ARMA loop starts.
+
+    # DoF adjustment (e.g. post-NORDIC): rewrite the stat buckets with a reduced
+    # dof and inserted z-scores. Done as a post-pass on the finished files so it
+    # is identical to running ffs_util_updatedof, regardless of which internal
+    # write path produced them.
+    if args.adjust_dof:
+        from fastfuncstuff.stats.dof_adjust import (
+            resolve_dof_adjust_arg,
+            update_dof_in_file,
+        )
+
+        print()
+        print("=" * 70)
+        print("🔧 Adjusting statistics for lost degrees of freedom (-adjust_dof)")
+        print("=" * 70)
+        adjust = resolve_dof_adjust_arg(args.adjust_dof)
+        for buck in (args.Obuck, args.Rbuck):
+            if not buck:
+                continue
+            # write_glm_bucket_as_nifti compresses, so a requested ".nii" lands
+            # as ".nii.gz"; resolve to whatever was actually written.
+            actual = buck if Path(buck).exists() else None
+            if actual is None:
+                stem = buck
+                for ext in (".nii.gz", ".nii.zst", ".nii"):
+                    if stem.endswith(ext):
+                        stem = stem[: -len(ext)]
+                        break
+                if Path(stem + ".nii.gz").exists():
+                    actual = stem + ".nii.gz"
+            if actual is None:
+                continue
+            print(f"  • {actual}")
+            try:
+                update_dof_in_file(actual, adjust, actual)
+            except ValueError as e:
+                # Most likely: no AFNI stat metadata (needs 3drefit at write time).
+                print(f"  ⚠️  skipped {actual}: {e}")
 
     print()
     print("=" * 70)

@@ -44,6 +44,7 @@ Examples
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -2032,6 +2033,67 @@ def _set_afni_brick_labels(header: object, labels: list[str]) -> None:
             "</AFNI_attributes>\n\x00"
         )
         extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, payload.encode("utf-8")))
+
+
+_XML_LABS_RE = re.compile(r'atr_name\s*=\s*"BRICK_LABS"[^>]*>\s*"([^"]+)"', re.S)
+_XML_STATAUX_RE = re.compile(
+    r'<AFNI_atr[^>]*atr_name\s*=\s*"BRICK_STATAUX"[^>]*>\s*([0-9eE.+\-\s]+?)\s*</AFNI_atr>',
+    re.S,
+)
+
+
+def _afni_ext_text(img) -> str:
+    """Concatenated text of the AFNI NIfTI extension(s), or ``""`` if absent.
+
+    Handles both plain-text (``BRICK_LABS=…\\x00``) and AFNI-XML payloads; the
+    read-side counterpart to :func:`_set_afni_brick_stataux` /
+    :func:`_set_afni_brick_labels`.
+    """
+    header = getattr(img, "header", img)
+    out = []
+    for ext in getattr(header, "extensions", None) or []:
+        if ext.get_code() != _NIFTI_ECODE_AFNI:
+            continue
+        content = ext.get_content()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="ignore")
+        out.append(content)
+    return "\n".join(out)
+
+
+def read_brick_stataux(img) -> dict[int, tuple[int, tuple[float, ...]]]:
+    """Parse ``BRICK_STATAUX`` from a NIfTI image → ``{idx: (code, params)}``.
+
+    Empty dict when the bucket carries no per-sub-brick stat metadata. Inverse of
+    :func:`_set_afni_brick_stataux`.
+    """
+    m = _XML_STATAUX_RE.search(_afni_ext_text(img))
+    if not m:
+        return {}
+    floats = [float(x) for x in m.group(1).split()]
+    out: dict[int, tuple[int, tuple[float, ...]]] = {}
+    i = 0
+    while i + 3 <= len(floats):
+        idx = int(floats[i])
+        code = int(floats[i + 1])
+        n_par = int(floats[i + 2])
+        out[idx] = (code, tuple(floats[i + 3 : i + 3 + n_par]))
+        i += 3 + n_par
+    return out
+
+
+def read_brick_labels(img) -> list[str]:
+    """Pull sub-brick labels out of an AFNI NIfTI extension (``[]`` if absent).
+
+    Accepts legacy plain-text (``BRICK_LABS=a~b~…``) and AFNI-XML payloads.
+    """
+    txt = _afni_ext_text(img)
+    if "BRICK_LABS=" in txt and 'atr_name="BRICK_LABS"' not in txt:
+        return txt.split("BRICK_LABS=")[1].split("\x00")[0].split("~")
+    m = _XML_LABS_RE.search(txt)
+    if m:
+        return [s.strip() for s in m.group(1).split("~") if s.strip()]
+    return []
 
 
 def _statsym_for(code: int, params: tuple[float, ...]) -> str:
