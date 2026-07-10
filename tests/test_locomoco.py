@@ -184,7 +184,7 @@ def test_strip_imaging_extension_handles_zst():
     assert _strip_imaging_extension("errts.sub-01.nii.gz") == "errts.sub-01"
 
 
-def test_flow_direction_and_magnitude_maps(known_shift_series):
+def test_signed_flow_map(known_shift_series):
     data, shifts = known_shift_series
     res = estimate_residual_flow(
         data,
@@ -195,18 +195,33 @@ def test_flow_direction_and_magnitude_maps(known_shift_series):
         device=torch.device("cpu"),
         verbose=False,
     )
-    ang = res.flow_direction_deg().numpy()
-    mag = res.flow_magnitude().numpy()
-    assert ang.shape == data.shape and mag.shape == data.shape
-    assert ang.min() >= 0.0 and ang.max() < 360.0
-    assert mag.min() >= 0.0
-    # For slice_axis=z the PE (y) axis maps to the u/W (column) flow component, so
-    # a pure PE shift produces a HORIZONTAL flow direction (~0° or ~180°), never
-    # vertical. Check the frame with the biggest shift where there is signal.
-    t = int(np.argmax(np.abs(shifts)))
-    strong = mag[..., t] > np.percentile(mag[..., t], 90)
-    med_dir = float(np.median(ang[..., t][strong]))
-    assert min(abs(med_dir - h) for h in (0.0, 180.0, 360.0)) < 30.0
+    flow = res.pe_displacement().numpy()  # signed, (nx,ny,nz,T)
+    assert flow.shape == data.shape
+    est = np.median(flow.reshape(-1, flow.shape[-1]), axis=0)
+    # Signed: recovers -shift (pull), so sign flips with motion direction.
+    assert np.corrcoef(est, -shifts)[0, 1] > 0.99
+    assert (est < 0).any() and (est > 0).any()
+
+
+@pytest.mark.parametrize("ref_mode", ["first_mean", "first_median"])
+def test_progressive_reference_recovers_shift(known_shift_series, ref_mode):
+    data, shifts = known_shift_series
+    res = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode=ref_mode,
+        n_iters=6,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    flow = res.pe_displacement().numpy()
+    est = np.median(flow.reshape(-1, flow.shape[-1]), axis=0)
+    # Frame 0 is the seed (zero warp); the rest register to the running template,
+    # which stays ~frame 0 (all corrected frames are aligned back to it), so the
+    # recovered pull flow tracks -shift like the static "first" reference.
+    assert abs(est[0]) < 0.1
+    assert np.corrcoef(est[1:], -shifts[1:])[0, 1] > 0.95
 
 
 def test_flow_movie_shape(known_shift_series):

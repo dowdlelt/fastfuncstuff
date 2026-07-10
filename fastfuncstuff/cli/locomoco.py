@@ -7,9 +7,8 @@ reference frame. Writes:
 
   * ``{prefix}_warp.nii.gz``      — per-frame 5-D DICOM-mm warp for ``ffs_nwarp``
   * ``{prefix}_locomoco.nii.gz``  — the non-linear-motion-corrected series
-  * ``{prefix}_flowdir.nii.gz``   — 4-D per-voxel flow direction (deg 0–360),
-                                    scrub it like a timeseries with a cyclic LUT
-  * ``{prefix}_flowmag.nii.gz``   — 4-D per-voxel flow magnitude (voxels)
+  * ``{prefix}_flow.nii.gz``      — 4-D signed PE flow (voxels; sign = direction),
+                                    scrub it like a timeseries
   * ``{prefix}_flow.mp4``         — a contact-sheet movie of the flow, colored by
                                     the circular-phase wheel (hue = direction).
                                     mp4 via system ffmpeg if present, else gif.
@@ -76,7 +75,10 @@ def create_parser() -> argparse.ArgumentParser:
     flow.add_argument(
         "-ref",
         default="mean",
-        help="Reference frame: mean | median | first | <frame index>.",
+        help="Reference: static mean | median | first | <frame index>, or PROGRESSIVE "
+        "first_mean / first_median — frame t registers to the running mean/median of "
+        "the already-corrected earlier frames (a bootstrapped template; frame 0 is the "
+        "seed). Progressive modes are sequential and slower.",
     )
     flow.add_argument(
         "-do_blur",
@@ -87,9 +89,11 @@ def create_parser() -> argparse.ArgumentParser:
         "for robustness on noisy data; 0 = off. Does not blur the corrected output.",
     )
     flow.add_argument(
-        "-pe_only",
+        "-full_2d",
         action="store_true",
-        help="Constrain the flow to the PE axis (1 DOF, more robust) instead of full 2-D.",
+        help="Estimate full 2-D flow. Default is PE-only (1 DOF along the PE axis, "
+        "more robust) — the correction and warp use only the PE component either way, "
+        "so 2-D mainly enriches the direction movie.",
     )
     flow.add_argument(
         "-levels",
@@ -123,9 +127,9 @@ def create_parser() -> argparse.ArgumentParser:
     out.add_argument("-no_corrected", action="store_true", help="Skip the corrected series.")
     out.add_argument("-no_movie", action="store_true", help="Skip the flow movie.")
     out.add_argument(
-        "-no_flowmap",
+        "-no_flow",
         action="store_true",
-        help="Skip the 4-D flow direction (deg) + magnitude (vox) NIfTIs.",
+        help="Skip the 4-D signed PE flow map (voxels; sign = direction).",
     )
     out.add_argument(
         "-movie_format",
@@ -252,11 +256,12 @@ def main(argv: list[str] | None = None) -> int:
         inplane_mm = float(np.mean([vox[in_plane[0]], vox[in_plane[1]]]))
         smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
 
+    pe_only = not args.full_2d
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
     print(
         f"   PE axis={pe_axis} ({args.pe_dir}), slice axis={slice_axis}, ref={args.ref}, "
         f"do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
-        f"{'1-D PE' if args.pe_only else '2-D'} flow"
+        f"{'1-D PE' if pe_only else '2-D'} flow"
     )
 
     result = estimate_residual_flow(
@@ -268,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         n_levels=args.levels,
         n_iters=args.iters,
         window_sigma=args.window,
-        pe_only=args.pe_only,
+        pe_only=pe_only,
         device=device,
     )
 
@@ -286,13 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         save_nifti(result.corrected_series().numpy(), corr_path, affine=affine)
         print(f"  • corrected series: {corr_path}")
 
-    if not args.no_flowmap:
-        dir_path = f"{stem}_flowdir{ext}"
-        save_nifti(result.flow_direction_deg().numpy(), dir_path, affine=affine)
-        print(f"  • flow direction 4D (deg 0–360, scrub like a timeseries): {dir_path}")
-        mag_path = f"{stem}_flowmag{ext}"
-        save_nifti(result.flow_magnitude().numpy(), mag_path, affine=affine)
-        print(f"  • flow magnitude 4D (voxels): {mag_path}")
+    if not args.no_flow:
+        flow_path = f"{stem}_flow{ext}"
+        save_nifti(result.pe_displacement().numpy(), flow_path, affine=affine)
+        print(
+            f"  • signed PE flow 4D (voxels, ± = direction; scrub like a timeseries): {flow_path}"
+        )
 
     if not args.no_movie:
         fmt = args.movie_format or ("mp4" if _find_ffmpeg() else "gif")

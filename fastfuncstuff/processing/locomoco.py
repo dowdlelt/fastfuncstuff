@@ -254,27 +254,18 @@ class LocomocoResult:
         return canon.permute(inv).contiguous()
 
     def pe_displacement(self) -> torch.Tensor:
-        """Per-frame PE displacement ``(nx, ny, nz, T)`` in voxel units."""
+        """Per-frame SIGNED PE displacement ``(nx, ny, nz, T)`` in voxel units.
+
+        This is the single flow map: one signed scalar per voxel per frame — the
+        sign is the direction of residual motion along the PE axis, the magnitude
+        is how far. Scrub it like a timeseries (a diverging +/- colormap). Also the
+        content of the saved warp (before mm conversion).
+        """
         return self._to_nifti(self.u_canon if self.pe_flow_is_u else self.v_canon)
 
     def corrected_series(self) -> torch.Tensor:
         """PE-corrected 4-D series ``(nx, ny, nz, T)``."""
         return self._to_nifti(self.corrected_canon)
-
-    def flow_direction_deg(self) -> torch.Tensor:
-        """Per-voxel in-plane flow direction ``(nx, ny, nz, T)`` in degrees [0, 360).
-
-        The circular-phase companion to the flow movie: load it and apply a
-        cyclic colormap to see displacement directions volume-by-volume. Direction
-        is meaningless where the magnitude is ~0 (window by :meth:`flow_magnitude`).
-        """
-        ang = torch.rad2deg(torch.atan2(self.v_canon, self.u_canon)) % 360.0
-        return self._to_nifti(ang)
-
-    def flow_magnitude(self) -> torch.Tensor:
-        """Per-voxel in-plane flow magnitude ``(nx, ny, nz, T)`` in voxel units."""
-        mag = torch.sqrt(self.u_canon**2 + self.v_canon**2)
-        return self._to_nifti(mag)
 
     def flow_movie(
         self, max_mag: float | None = None, add_legend: bool = True, max_tile: int = 64
@@ -321,6 +312,86 @@ class LocomocoResult:
         return np.stack(frames, 0)
 
 
+def _correct_pe(
+    moving_raw: torch.Tensor, u: torch.Tensor, v: torch.Tensor, pe_flow_is_u: bool
+) -> torch.Tensor:
+    """Warp ``moving_raw`` along the PE axis only (the single-axis warp we save)."""
+    uc = u if pe_flow_is_u else torch.zeros_like(u)
+    vc = torch.zeros_like(v) if pe_flow_is_u else v
+    return _warp2d(moving_raw, uc, vc)
+
+
+def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device):
+    """Fixed reference: batch the flow over ALL frames at once, looping slices."""
+    nt, ns, hh, ww = vol.shape
+    if ref_mode == "mean":
+        ref = vol.mean(dim=0)
+    elif ref_mode == "median":
+        ref = vol.median(dim=0).values
+    elif ref_mode == "first":
+        ref = vol[0]
+    else:
+        try:
+            ref = vol[int(ref_mode)]
+        except ValueError as e:
+            raise ValueError(
+                f"-ref must be mean|median|first|first_mean|first_median|<index>, got '{ref_mode}'"
+            ) from e
+
+    u_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
+    v_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
+    corrected = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
+    for s in tqdm(range(ns), desc="locomoco slices", unit="slice", leave=True, disable=ns < 2):
+        moving_raw = vol[:, s].to(device).float()
+        fixed_raw = ref[s].to(device).unsqueeze(0).expand(nt, hh, ww).contiguous().float()
+        fixed = _blur2d(fixed_raw, smooth_sigma) if smooth_sigma > 0 else fixed_raw
+        moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
+        u, v = optical_flow_lk_2d(fixed, moving, **flow_kw)
+        corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u).cpu()
+        u_all[:, s] = u.cpu()
+        v_all[:, s] = v.cpu()
+    return u_all, v_all, corrected
+
+
+def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device):
+    """Progressive reference: frame t registers to the running mean/median of the
+    already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
+    time, so batched over SLICES per frame instead of over time.
+    """
+    nt, ns, hh, ww = vol.shape
+    u_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
+    v_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
+    corrected = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
+
+    f0 = vol[0].to(device).float()  # (ns, hh, ww)
+    corrected[0] = f0.cpu()
+    running_sum = f0.clone()  # running Σ of corrected frames (for the mean)
+    # The median needs every corrected frame; keep them on the GPU (same footprint
+    # as the input). The mean only needs the running sum.
+    buf = None
+    if ref_mode == "first_median":
+        buf = torch.zeros(nt, ns, hh, ww, dtype=torch.float32, device=device)
+        buf[0] = f0
+
+    for t in tqdm(range(1, nt), desc="locomoco frames", unit="frame", leave=True, disable=nt < 3):
+        if ref_mode == "first_median":
+            ref = buf[:t].median(dim=0).values
+        else:  # first_mean
+            ref = running_sum / t
+        moving_raw = vol[t].to(device).float()
+        fixed = _blur2d(ref, smooth_sigma) if smooth_sigma > 0 else ref
+        moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
+        u, v = optical_flow_lk_2d(fixed, moving, **flow_kw)
+        corr = _correct_pe(moving_raw, u, v, pe_flow_is_u)
+        corrected[t] = corr.cpu()
+        u_all[t] = u.cpu()
+        v_all[t] = v.cpu()
+        running_sum = running_sum + corr
+        if buf is not None:
+            buf[t] = corr
+    return u_all, v_all, corrected
+
+
 def estimate_residual_flow(
     data: np.ndarray,
     pe_axis: int,
@@ -331,7 +402,7 @@ def estimate_residual_flow(
     n_levels: int = 3,
     n_iters: int = 4,
     window_sigma: float = 2.0,
-    pe_only: bool = False,
+    pe_only: bool = True,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -339,10 +410,17 @@ def estimate_residual_flow(
 
     ``data`` is ``(nx, ny, nz, T)`` (already motion-corrected). Slices are taken
     orthogonal to ``slice_axis`` (so PE lies in-plane); each slice's time course is
-    a 2-D movie. Full 2-D flow of every frame against a reference is computed (for
-    the movie + robustness), while the WARP/correction use only the ``pe_axis``
-    component (residual EPI motion is a PE-axis displacement, MEDIC-style). With
-    ``pe_only`` the flow itself is constrained to the PE axis (1 DOF).
+    a 2-D movie. Optical flow of every frame against a reference gives the in-plane
+    displacement; the WARP/correction/flow-map use only the ``pe_axis`` component
+    (residual EPI motion is a PE-axis displacement, MEDIC-style). ``pe_only``
+    (default) constrains the flow itself to the PE axis (1 DOF, more robust); set
+    it False for full 2-D flow (e.g. a richer direction movie).
+
+    ``ref_mode``: static ``mean`` | ``median`` | ``first`` | ``<int>``, or a
+    PROGRESSIVE ``first_mean`` / ``first_median`` — frame t registers to the
+    running mean/median of the already-corrected frames before it (a bootstrapped
+    template; frame 0 is the seed). Progressive modes are sequential and slower;
+    ``first_median`` also holds the corrected series on the GPU.
     """
     if pe_axis == slice_axis:
         raise ValueError(
@@ -359,45 +437,14 @@ def estimate_residual_flow(
 
     perm = [3, slice_axis, a0, a1]
     vol = torch.from_numpy(np.ascontiguousarray(data)).permute(perm).contiguous()
-    nt, ns, hh, ww = vol.shape
-
-    if ref_mode == "mean":
-        ref = vol.mean(dim=0)
-    elif ref_mode == "median":
-        ref = vol.median(dim=0).values
-    elif ref_mode == "first":
-        ref = vol[0]
-    else:
-        try:
-            ref = vol[int(ref_mode)]
-        except ValueError as e:
-            raise ValueError(f"-ref must be mean|median|first|<index>, got '{ref_mode}'") from e
+    nt, ns = vol.shape[0], vol.shape[1]
 
     pe_only_axis = (0 if pe_flow_is_u else 1) if pe_only else None
-    u_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
-    v_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
-    corrected = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
-
-    for s in tqdm(range(ns), desc="locomoco slices", unit="slice", leave=True, disable=ns < 2):
-        moving_raw = vol[:, s].to(device).float()
-        fixed_raw = ref[s].to(device).unsqueeze(0).expand(nt, hh, ww).contiguous().float()
-        fixed = _blur2d(fixed_raw, smooth_sigma) if smooth_sigma > 0 else fixed_raw
-        moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
-        u, v = optical_flow_lk_2d(
-            fixed,
-            moving,
-            n_levels=n_levels,
-            n_iters=n_iters,
-            window_sigma=window_sigma,
-            pe_only_axis=pe_only_axis,
-        )
-        # Correct along PE only (matches the single-axis warp we save), warping the
-        # UNblurred data so the corrected series keeps full resolution.
-        uc = u if pe_flow_is_u else torch.zeros_like(u)
-        vc = torch.zeros_like(v) if pe_flow_is_u else v
-        corrected[:, s] = _warp2d(moving_raw, uc, vc).cpu()
-        u_all[:, s] = u.cpu()
-        v_all[:, s] = v.cpu()
+    flow_kw = dict(
+        n_levels=n_levels, n_iters=n_iters, window_sigma=window_sigma, pe_only_axis=pe_only_axis
+    )
+    est = _estimate_cumulative if ref_mode in ("first_mean", "first_median") else _estimate_static
+    u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device)
 
     result = LocomocoResult(
         u_canon=u_all,
@@ -412,7 +459,7 @@ def estimate_residual_flow(
     if verbose:
         pe = result.pe_displacement()
         print(
-            f"🌀 locomoco: {nt} frames × {ns} slices, PE axis {pe_axis} "
+            f"🌀 locomoco: {nt} frames × {ns} slices, PE axis {pe_axis}, ref={ref_mode} "
             f"({'1-D PE' if pe_only else '2-D'} flow); "
             f"|PE disp| median {pe.abs().median():.3f} vox, max {pe.abs().max():.3f} vox"
         )
