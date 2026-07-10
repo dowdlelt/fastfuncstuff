@@ -1991,7 +1991,14 @@ def main():
         affine = first_img.affine
         nifti_header = first_img.header.copy()
         volume_shape = first_img.shape[:3]
-        voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
+        # Voxel sizes from pixdim (get_zooms), which is orientation-independent.
+        # The affine diagonal is wrong for permuted/oblique grids (e.g. an RSP/LIA
+        # FreeSurfer master): the size sits off-diagonal, so np.diag reads 0 mm and
+        # divide-by-zeros the blur. Fall back to the affine column norms (never the
+        # diagonal) if pixdim is unset.
+        voxel_sizes = tuple(float(z) for z in nifti_header.get_zooms()[:3])
+        if any(v == 0 for v in voxel_sizes):
+            voxel_sizes = tuple(np.sqrt((affine[:3, :3] ** 2).sum(axis=0)))
 
         # Preserve geometry/header metadata so ndarray-based analysis keeps
         # the same spatial orientation and voxel sizes as the original input.
@@ -2079,8 +2086,11 @@ def main():
             # Diagnostics hook 2: raw tSNR on the scaled data.
             if diag is not None:
                 diag.observe_scaled(torch.from_numpy(fmri_data_preprocessed))
-        elif want_diag and (args.save_tsnr):
-            print("  ⚠️  -save_tsnr needs -do_scale for raw/resid tSNR; skipping tSNR maps.")
+        elif want_diag and args.save_tsnr and diag is not None:
+            # tSNR = mean/std is invariant to per-voxel scaling (the mean just
+            # isn't ~100), so unscaled data gives the same tSNR -- don't block it
+            # on -do_scale.
+            diag.observe_scaled(torch.from_numpy(fmri_data_preprocessed))
 
         # Reshape back to 4D for analyze_from_design_matrix
         total_tps = fmri_data_preprocessed.shape[1]

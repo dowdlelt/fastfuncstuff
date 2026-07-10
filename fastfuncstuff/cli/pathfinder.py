@@ -1360,7 +1360,15 @@ def main():
     first_img = load_nifti(input_files[0])
     affine = np.array(first_img.affine) if hasattr(first_img, "affine") else np.eye(4)
     volume_shape = tuple(first_img.shape[:3])
-    voxel_sizes = tuple(np.abs(np.diag(affine)[:3]))
+    # Voxel sizes from pixdim (get_zooms), orientation-independent. The affine
+    # diagonal is wrong for permuted/oblique grids (e.g. RSP/LIA) where the size
+    # sits off-diagonal; fall back to affine column norms if pixdim is unset.
+    if hasattr(first_img, "header"):
+        voxel_sizes = tuple(float(z) for z in first_img.header.get_zooms()[:3])
+    else:
+        voxel_sizes = (0.0, 0.0, 0.0)
+    if any(v == 0 for v in voxel_sizes):
+        voxel_sizes = tuple(np.sqrt((affine[:3, :3] ** 2).sum(axis=0)))
 
     # Determine memory strategy
     if hasattr(first_img, "shape"):

@@ -7,13 +7,13 @@ from fastfuncstuff.glm.reml_diagnostics import (
     DatasetDiagnostics,
     blur_est_1D,
     fwhmx_report_text,
-    global_acf_fit,
-    per_run_acf,
+    per_run_fwhmx,
     resolve_mask,
     temporal_mean,
     temporal_std,
     tsnr,
 )
+from fastfuncstuff.stats.fwhmx import FWHMxResult
 
 
 def test_temporal_mean_std_tsnr():
@@ -52,22 +52,27 @@ def _smooth_time_vol(vol4d, sigma):
     return torch.stack([_separable_smooth_3d(vol4d[t], sigma) for t in range(vol4d.shape[0])])
 
 
-def test_global_acf_recovers_known_fwhm():
+def test_per_run_fwhmx_recovers_known_fwhm():
+    # Two-run smoothed noise; the per-run 3dFWHMx estimate should recover the
+    # applied Gaussian width. (Deep AFNI parity lives in test_fwhmx.py; this just
+    # checks the per-run wiring + FWHMxResult plumbing in the diagnostics layer.)
     torch.manual_seed(0)
-    nt, nz, ny, nx = 40, 28, 32, 32
+    nt, nz, ny, nx = 60, 28, 32, 32
     vox = 2.0  # mm isotropic
     sigma_vox = 1.8
-    noise = torch.randn(nt, nz, ny, nx)
-    sm = _smooth_time_vol(noise, sigma_vox)
+    sm = _smooth_time_vol(torch.randn(nt, nz, ny, nx), sigma_vox)  # (nt, nz, ny, nx)
     mask = torch.zeros(nz, ny, nx, dtype=torch.bool)
     mask[4:24, 5:27, 5:27] = True  # interior, avoid edge roll-off
+    resid_2d = sm.reshape(nt, -1)[:, mask.reshape(-1)].T.contiguous()  # (n_masked, nt)
 
-    a, b, c, fwhm = global_acf_fit(sm, mask, (vox, vox, vox), nbhd="SPHERE(-9.666)")
+    rows = per_run_fwhmx(resid_2d, mask, [0, 30], (nz, ny, nx), (vox, vox, vox), verbose=False)
+    assert len(rows) == 2
     expected = 2.3548 * sigma_vox * vox  # FWHM (mm) of the applied Gaussian
-    # Single global curve on modest nt is noisier than the per-voxel path; a
-    # generous band still catches a broken pipeline (wrong units, no decay, etc.)
-    assert 0.6 * expected < fwhm < 1.5 * expected, (fwhm, expected)
-    assert 0.0 <= a <= 1.0
+    for _run, res in rows:
+        assert isinstance(res, FWHMxResult)
+        for f in res.classic_fwhm:
+            assert 0.7 * expected < f < 1.4 * expected, (f, expected)
+        assert 0.0 <= res.a <= 1.0 and res.b > 0 and res.c > 0
 
 
 def test_collector_end_to_end():
@@ -109,16 +114,39 @@ def test_collector_end_to_end():
     assert "fwhmx_ols" in diag.tables and "blur_est_ols" in diag.tables
     assert "fwhmx_reml" in diag.tables and "blur_est_reml" in diag.tables
     # blur_est .1D last line parses to 4 numbers (a b c FWHM)
-    data_line = [ln for ln in diag.tables["blur_est_ols"].splitlines() if not ln.startswith("#")][-1]
+    data_line = [ln for ln in diag.tables["blur_est_ols"].splitlines() if not ln.startswith("#")][
+        -1
+    ]
     assert len(data_line.split()) == 4
 
 
+def _fwhmx_row(run, a, b, c, fwhm):
+    return (
+        run,
+        FWHMxResult(
+            a=a,
+            b=b,
+            c=c,
+            fwhm=fwhm,
+            radius=15.0,
+            classic_fwhm=(a, b, c),
+            classic_combined=b,
+            n_subbricks=30,
+        ),
+    )
+
+
 def test_blur_est_is_run_mean():
-    rows = [(1, 0.5, 2.0, 3.0, 8.0), (2, 0.7, 3.0, 5.0, 10.0)]
+    rows = [_fwhmx_row(1, 0.5, 2.0, 3.0, 8.0), _fwhmx_row(2, 0.7, 3.0, 5.0, 10.0)]
     txt = fwhmx_report_text(rows)
     assert "avg" in txt
     one_d = blur_est_1D(rows)
     a, b, c, fwhm = (float(x) for x in one_d.splitlines()[-1].split())
-    assert abs(a - 0.6) < 1e-6 and abs(b - 2.5) < 1e-6 and abs(c - 4.0) < 1e-6 and abs(fwhm - 9.0) < 1e-6
-    # per_run_acf is exercised end-to-end in test_collector_end_to_end
-    assert callable(per_run_acf)
+    assert (
+        abs(a - 0.6) < 1e-6
+        and abs(b - 2.5) < 1e-6
+        and abs(c - 4.0) < 1e-6
+        and abs(fwhm - 9.0) < 1e-6
+    )
+    # per_run_fwhmx is exercised end-to-end in test_per_run_fwhmx_recovers_known_fwhm
+    assert callable(per_run_fwhmx)

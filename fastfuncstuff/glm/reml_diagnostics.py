@@ -96,121 +96,97 @@ def resolve_mask(
 
 
 # ---------------------------------------------------------------------------
-# Per-run spatial ACF / FWHMx (3dFWHMx -ACF), reusing the localstat fitters
+# Per-run whole-volume smoothness (3dFWHMx classic + ACF)
 # ---------------------------------------------------------------------------
+#
+# This measures the OVERALL spatial blurring of the residual field per run, the
+# way ``3dFWHMx`` does (spatial ACF within each sub-brick, averaged over
+# sub-bricks). It is NOT ``stats.localstat`` / ``3dLocalACF``, which correlates
+# neighbours across time to make a spatially-varying map -- the wrong tool for a
+# single per-run blur estimate. See :mod:`fastfuncstuff.stats.fwhmx`.
 
 
-def global_acf_fit(
-    resid_vol: Tensor,
-    mask: Tensor,
-    voxdims: tuple[float, float, float],
-    nbhd: str = "SPHERE(-9.666)",
-    device: torch.device | None = None,
-) -> tuple[float, float, float, float]:
-    """Fit the AFNI ACF model to the whole-mask spatial autocorrelation.
-
-    Global analogue of ``stats.localstat.local_acf``: instead of a per-voxel
-    neighborhood curve, it sums the binned correlations over every masked voxel
-    to get one empirical ACF(r) for the volume, then fits
-    ``a·exp(-r²/2b²)+(1-a)·exp(-r/c)`` and reports the effective FWHM — i.e.
-    3dFWHMx's ``-ACF`` output.
-
-    Args:
-        resid_vol: (nt, nz, ny, nx) residual timeseries for one run (time is the
-            replicate dimension the correlation is computed over).
-        mask: (nz, ny, nx) bool mask.
-        voxdims: (dx, dy, dz) mm.
-        nbhd: AFNI ``-nbhd`` string setting the ACF radius.
-
-    Returns:
-        (a, b, c, fwhm) — model params and effective FWHM (mm).
-    """
-    from fastfuncstuff.stats.localstat import (
-        _accumulate_bins,
-        acf_fwhm_batched,
-        build_neighborhood,
-        fit_acf_batched,
-    )
-
-    if device is None:
-        device = resid_vol.device
-    resid_vol = resid_vol.to(device).float()
-    mask = mask.to(device).to(torch.bool)
-    nz = resid_vol.shape[1]
-
-    nb = build_neighborhood(nbhd, voxdims)
-    n_bins = int(nb.bin_radius.shape[0])
-    nrm = torch.sqrt((resid_vol * resid_vol).sum(0))  # (nz,ny,nx)
-
-    # One slab over the whole volume; per-voxel bins, then reduce over the mask.
-    bin_sum, bin_cnt = _accumulate_bins(
-        resid_vol, nrm, mask, nb, 0, 0, nz, n_bins, None
-    )  # (K, nz, ny, nx)
-    m = mask[None].float()
-    gsum = (bin_sum * m).sum(dim=(1, 2, 3))  # (K,)
-    gcnt = (bin_cnt * m).sum(dim=(1, 2, 3))
-    y = (gsum / gcnt.clamp_min(1.0)).view(1, -1).double()
-    w = (gcnt > 0).view(1, -1).double()
-
-    radii = nb.bin_radius.to(device=device, dtype=torch.float64)
-    a, b, c, _ok = fit_acf_batched(radii, y, w)
-    fwhm = acf_fwhm_batched(a, b, c, 0.5)
-    return float(a.item()), float(b.item()), float(c.item()), float(fwhm.item())
-
-
-def per_run_acf(
+def per_run_fwhmx(
     residuals_2d: Tensor,
     voxel_mask: Tensor,
     run_starts: list[int],
     volume_shape: tuple[int, int, int],
     voxdims: tuple[float, float, float],
-    nbhd: str = "SPHERE(-9.666)",
     device: torch.device | None = None,
-) -> list[tuple[int, float, float, float, float]]:
-    """Fit the ACF model over the residuals once per run.
+    *,
+    verbose: bool = True,
+):
+    """3dFWHMx classic + ACF estimate of the residual smoothness, once per run.
 
-    ``residuals_2d`` is (n_masked_voxels, n_time); ``voxel_mask`` places them back
-    on the ``volume_shape`` grid. ``run_starts`` are time indices where each run
-    begins (the last run runs to the end).
+    ``residuals_2d`` is (n_masked_voxels, n_time); ``voxel_mask`` places them on
+    the ``volume_shape`` grid. ``run_starts`` are the time indices where each run
+    begins (the last run runs to the end). Streams the sub-bricks in
+    memory-model-sized chunks (never materialises the full 4-D stack).
 
-    Returns a list of ``(run_number_1based, a, b, c, fwhm_mm)``.
+    Returns a list of ``(run_number_1based, FWHMxResult)``.
     """
-    if device is None:
-        device = residuals_2d.device
-    nz, ny, nx = volume_shape
-    vmask = voxel_mask.reshape(volume_shape).to(device).to(torch.bool)
+    from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
+
     n_time = residuals_2d.shape[1]
     bounds = list(run_starts) + [n_time]
 
-    rows: list[tuple[int, float, float, float, float]] = []
-    for r in range(len(run_starts)):
+    rows = []
+    n_runs = len(run_starts)
+    for r in range(n_runs):
         t0, t1 = bounds[r], bounds[r + 1]
         if t1 <= t0:
             continue
-        # Scatter the run's residual timepoints back into the volume grid.
-        run_res = residuals_2d[:, t0:t1].to(device)
-        vol = torch.zeros((t1 - t0, nz, ny, nx), dtype=torch.float32, device=device)
-        vol[:, vmask] = run_res.T.float()
-        a, b, c, fwhm = global_acf_fit(vol, vmask, voxdims, nbhd=nbhd, device=device)
-        rows.append((r + 1, a, b, c, fwhm))
+        if verbose:
+            print(f"    run {r + 1}/{n_runs}: FWHMx over {t1 - t0} sub-bricks...")
+        res = estimate_fwhmx_run(
+            residuals_2d[:, t0:t1],
+            voxel_mask,
+            volume_shape,
+            voxdims,
+            device=device,
+            progress=verbose,
+            progress_desc=f"    run {r + 1} FWHMx",
+        )
+        if verbose:
+            fx, fy, fz = res.classic_fwhm
+            print(
+                f"      classic FWHM x/y/z = {fx:.2f}/{fy:.2f}/{fz:.2f} mm; "
+                f"ACF a={res.a:.3f} b={res.b:.3f} c={res.c:.3f} FWHM={res.fwhm:.2f} mm "
+                f"(radius {res.radius:.1f} mm)"
+            )
+        rows.append((r + 1, res))
     return rows
 
 
-def fwhmx_report_text(rows: list[tuple[int, float, float, float, float]]) -> str:
-    """Human-readable per-run ACF table (a, b, c, FWHM) with a trailing avg row."""
+def fwhmx_report_text(rows) -> str:
+    """Human-readable per-run table: classic FWHM x/y/z + ACF a/b/c/FWHM.
+
+    Trailing ``avg`` row averages each column over runs (matches how AFNI's
+    blur-estimate table is consumed downstream).
+    """
     lines = [
-        "# 3dFWHMx-style ACF: a*exp(-r*r/(2*b*b)) + (1-a)*exp(-r/c); FWHM in mm",
-        "# run        a        b        c     FWHM",
+        "# 3dFWHMx per run: classic Forman FWHM (x,y,z) + ACF model",
+        "#   ACF(r) = a*exp(-r*r/(2*b*b)) + (1-a)*exp(-r/c);  all FWHM in mm",
+        "# run     FWHMx    FWHMy    FWHMz        a        b        c  ACF_FWHM",
     ]
-    for run, a, b, c, fwhm in rows:
-        lines.append(f"  {run:>3}  {a:7.4f}  {b:7.4f}  {c:7.4f}  {fwhm:7.3f}")
-    if rows:
-        m = np.array([r[1:] for r in rows]).mean(0)
-        lines.append(f"  avg  {m[0]:7.4f}  {m[1]:7.4f}  {m[2]:7.4f}  {m[3]:7.3f}")
+    acc = []
+    for run, res in rows:
+        fx, fy, fz = res.classic_fwhm
+        acc.append((fx, fy, fz, res.a, res.b, res.c, res.fwhm))
+        lines.append(
+            f"  {run:>3}  {fx:7.3f}  {fy:7.3f}  {fz:7.3f}  "
+            f"{res.a:7.4f}  {res.b:7.4f}  {res.c:7.4f}  {res.fwhm:8.3f}"
+        )
+    if acc:
+        m = np.array(acc).mean(0)
+        lines.append(
+            f"  avg  {m[0]:7.3f}  {m[1]:7.3f}  {m[2]:7.3f}  "
+            f"{m[3]:7.4f}  {m[4]:7.4f}  {m[5]:7.4f}  {m[6]:8.3f}"
+        )
     return "\n".join(lines) + "\n"
 
 
-def blur_est_1D(rows: list[tuple[int, float, float, float, float]]) -> str:
+def blur_est_1D(rows) -> str:
     """Run-averaged ACF params + FWHM as a 1-line .1D (AFNI blur-estimate style).
 
     One data line ``a b c FWHM`` (the mean over runs), ready to feed the ACF
@@ -218,7 +194,7 @@ def blur_est_1D(rows: list[tuple[int, float, float, float, float]]) -> str:
     """
     a = b = c = fwhm = 0.0
     if rows:
-        m = np.array([r[1:] for r in rows]).mean(0)
+        m = np.array([(res.a, res.b, res.c, res.fwhm) for _run, res in rows]).mean(0)
         a, b, c, fwhm = (float(v) for v in m)
     return (
         "# run-averaged spatial ACF of the residuals (3dFWHMx -ACF)\n"
@@ -259,11 +235,20 @@ class DatasetDiagnostics:
     # -- hook 1: raw data, before scaling -----------------------------------
     def observe_raw(self, data_2d: Tensor) -> None:
         """Grand mean (per-voxel temporal mean) of the un-scaled data."""
+        if self.verbose:
+            print("  diagnostics: grand mean (per-voxel temporal mean)...")
         self.maps["grandmean"] = self._to_vol(temporal_mean(data_2d))
 
-    # -- hook 2: scaled data -------------------------------------------------
+    # -- hook 2: scaled (or unscaled) data -----------------------------------
     def observe_scaled(self, data_2d: Tensor) -> None:
-        """Raw tSNR = mean / std of the scaled timeseries (mean ≈ 100)."""
+        """Raw tSNR = mean / std of the timeseries.
+
+        tSNR is invariant to per-voxel scaling, so this is valid whether or not
+        the data was scaled to mean 100; the cached mean is reused as the signal
+        for residual tSNR.
+        """
+        if self.verbose:
+            print("  diagnostics: raw tSNR (mean/std of the timeseries)...")
         mean = temporal_mean(data_2d)
         self._scaled_mean = mean
         self.maps["raw_tsnr"] = self._to_vol(tsnr(mean, temporal_std(data_2d)))
@@ -276,7 +261,6 @@ class DatasetDiagnostics:
         *,
         want_tsnr: bool = True,
         want_fwhmx: bool = False,
-        nbhd: str = "SPHERE(-9.666)",
     ) -> None:
         """Residual-derived maps, once per label (``resid_tsnr_ols`` etc.).
 
@@ -289,6 +273,8 @@ class DatasetDiagnostics:
             if resid is None:
                 continue
             if want_tsnr and self._scaled_mean is not None:
+                if self.verbose:
+                    print(f"  diagnostics: residual tSNR [{label}]...")
                 std_resid = temporal_std(resid)  # (n_masked,)
                 sig = self._scaled_mean.detach().cpu().float().numpy()[vm_flat]
                 sig_t = torch.from_numpy(sig).to(std_resid.device)
@@ -297,16 +283,18 @@ class DatasetDiagnostics:
                 vol[np.asarray(vm.cpu())] = tvals
                 self.maps[f"resid_tsnr_{label}"] = vol
             if want_fwhmx:
-                rows = per_run_acf(
+                if self.verbose:
+                    print(f"  diagnostics: 3dFWHMx residual smoothness [{label}]...")
+                rows = per_run_fwhmx(
                     resid,
                     voxel_mask,
                     self.run_starts,
                     self.volume_shape,
                     self.voxdims,
-                    nbhd=nbhd,
                     device=self.device,
+                    verbose=self.verbose,
                 )
-                # Per-run detail (matches the current .txt) + run-averaged .1D.
+                # Per-run detail (classic + ACF) + run-averaged .1D.
                 self.tables[f"fwhmx_{label}"] = fwhmx_report_text(rows)
                 self.tables[f"blur_est_{label}"] = blur_est_1D(rows)
 
