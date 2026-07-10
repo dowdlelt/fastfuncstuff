@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from fastfuncstuff.design.hrf import get_hrf_library
 from fastfuncstuff.design.matrices import build_glm_design, convolve_hrf_microtime
@@ -27,6 +28,27 @@ from fastfuncstuff.io.afni import (
 )
 
 from .utils import get_device, to_tensor
+
+
+def _dsort_block_diagonalize(
+    reg: torch.Tensor, set_index: int, run_starts: list[int], n_time: int
+) -> tuple[torch.Tensor, list[str]]:
+    """Make one -dsort set's regressor per-run block-diagonal.
+
+    ``reg`` is (n_vox, n_time) for a single -dsort set (already
+    constant-guarded). Each run's samples are placed in their own zero-padded
+    column, so the regressor is fit per run — exactly like block-diagonal
+    polynomials / motion. Returns (n_vox, n_runs, n_time) plus one label per run.
+    """
+    n_runs = len(run_starts)
+    bounds = list(run_starts) + [n_time]
+    block = torch.zeros(reg.shape[0], n_runs, n_time, dtype=reg.dtype)
+    labels: list[str] = []
+    for r in range(n_runs):
+        t0, t1 = bounds[r], bounds[r + 1]
+        block[:, r, t0:t1] = reg[:, t0:t1]
+        labels.append(f"dsort{set_index}_run{r + 1}" if n_runs > 1 else f"dsort{set_index}")
+    return block, labels
 
 
 def analyze_from_onsets(
@@ -747,53 +769,91 @@ def analyze_from_design_matrix(
                 f"but data has {n_voxels:,} voxels"
             )
 
-    # 2b. Voxel-wise (-dsort / ANATICOR) regressor datasets. Each is a 4D dataset
-    # matching the (concatenated) input in time and voxel count; load, flatten, and
-    # apply the SAME mask so it shares `data`'s masked voxel axis. Stacked into
-    # (n_voxels, n_dsort, n_timepoints) on the CPU and streamed in the GLS pass.
+    # 2b. Voxel-wise (-dsort / ANATICOR) regressors. Each -dsort is a SET of one or
+    # more 4D files, concatenated in time to the (concatenated) input length, then
+    # made BLOCK-DIAGONAL by run: each run's regressor lands in its own zero-padded
+    # column (like polynomials / motion), so it is fit per run. Multiple -dsort
+    # flags => multiple sets. Stacked into (n_voxels, n_sets*n_runs, n_timepoints)
+    # on the CPU and streamed in the GLS pass.
     dsort_tensor: torch.Tensor | None = None
     dsort_labels: list[str] | None = None
     if dsort_files:
-        if method != "arma11":
-            raise ValueError(
-                "-dsort (voxel-wise regressors) is only supported with the ARMA(1,1) "
-                "REML path. Re-run without -OLSQ / with the REML method."
-            )
+        # dsort works for both OLS and ARMA — it is just a per-voxel regressor.
+        # (OLS routes through the ARMA GLS pass with (a,b) pinned to (0,0), i.e.
+        # identity whitening == exact OLS; see the method=="ols" branch below.)
+        from fastfuncstuff.glm.arma import _dsort_constant_guard
+
         n_time_data = data.shape[1]
-        dsort_cols = []
-        for di, dpath in enumerate(dsort_files):
-            dimg = load_nifti(dpath)
-            darr = np.asarray(dimg.get_fdata(dtype=np.float32))
-            if darr.ndim != 4:
-                raise ValueError(f"-dsort '{dpath}' must be 4D, got shape {darr.shape}")
-            d2d = darr.reshape(-1, darr.shape[-1])
-            if d2d.shape[1] != n_time_data:
+        # Normalize to a list of sets; each set is a list of files to concatenate.
+        raw_sets = dsort_files if isinstance(dsort_files, (list, tuple)) else [dsort_files]
+        sets = [list(s) if isinstance(s, (list, tuple)) else [s] for s in raw_sets]
+
+        # Block structure comes from the design's run boundaries (full, pre-censor
+        # frame); the file list just has to concatenate to the full length.
+        blk_run_starts = list((design_info or {}).get("run_starts") or [0])
+        n_runs = len(blk_run_starts)
+
+        n_files_total = sum(len(s) for s in sets)
+        print(
+            f"📥 Loading -dsort: {len(sets)} set(s), {n_files_total} file(s) total "
+            f"(voxel-wise regressors)..."
+        )
+
+        blocks: list[torch.Tensor] = []
+        dsort_labels = []
+        for si, file_list in enumerate(sets):
+            segs = []
+            for dpath in tqdm(
+                file_list,
+                desc=f"  dsort set {si}",
+                unit="file",
+                leave=True,
+                disable=len(file_list) < 2,
+            ):
+                darr = np.asarray(load_nifti(dpath).get_fdata(dtype=np.float32))
+                if darr.ndim != 4:
+                    raise ValueError(f"-dsort '{dpath}' must be 4D, got shape {darr.shape}")
+                segs.append(darr.reshape(-1, darr.shape[-1]))
+            nvox0 = segs[0].shape[0]
+            for seg, dpath in zip(segs, file_list, strict=True):
+                if seg.shape[0] != nvox0:
+                    raise ValueError(
+                        f"-dsort set {si}: files disagree on voxel count "
+                        f"({seg.shape[0]} vs {nvox0} in '{dpath}')."
+                    )
+            reg = np.concatenate(segs, axis=1) if len(segs) > 1 else segs[0]
+            if reg.shape[1] != n_time_data:
                 raise ValueError(
-                    f"-dsort '{dpath}' has {d2d.shape[1]} timepoints but data has "
-                    f"{n_time_data}. Provide a dsort dataset matching the "
-                    "(concatenated) input length."
+                    f"-dsort set {si}: {len(file_list)} file(s) concatenate to "
+                    f"{reg.shape[1]} TRs but data has {n_time_data}. The files' time "
+                    "lengths must sum to the (concatenated) input length."
                 )
-            d_t = torch.from_numpy(d2d)
+            d_t = torch.from_numpy(reg)
             if mask_tensor is not None:
                 if d_t.shape[0] != mask_tensor.shape[0]:
                     raise ValueError(
-                        f"-dsort '{dpath}' has {d_t.shape[0]} voxels but the mask "
-                        f"covers {mask_tensor.shape[0]}. They must align."
+                        f"-dsort set {si}: {d_t.shape[0]} voxels but the mask covers "
+                        f"{mask_tensor.shape[0]}. They must align."
                     )
                 d_t = d_t[mask_tensor, :]
             if d_t.shape[0] != data.shape[0]:
                 raise ValueError(
-                    f"-dsort '{dpath}' has {d_t.shape[0]} voxels but data has "
+                    f"-dsort set {si}: {d_t.shape[0]} voxels but data has "
                     f"{data.shape[0]} after masking."
                 )
-            dsort_cols.append(d_t)
-            dsort_labels = dsort_labels or []
-            dsort_labels.append(f"dsort#{di}")
-        # (n_voxels, n_dsort, n_timepoints)
-        dsort_tensor = torch.stack(dsort_cols, dim=1).to(storage_device)
+            # 3dREMLfit constant-voxel guard on the FULL regressor: after
+            # block-diagonalization a constant-nonzero voxel hides behind the 0->c
+            # jump, so it must be caught here.
+            d_t = _dsort_constant_guard(d_t.unsqueeze(1)).squeeze(1)
+            block, labels = _dsort_block_diagonalize(d_t, si, blk_run_starts, n_time_data)
+            blocks.append(block)
+            dsort_labels.extend(labels)
+        # (n_voxels, n_sets*n_runs, n_timepoints)
+        dsort_tensor = torch.cat(blocks, dim=1).to(storage_device)
         print(
-            f"🧩 -dsort: {len(dsort_cols)} voxel-wise regressor dataset(s) loaded "
-            f"({dsort_tensor.shape[0]:,} voxels × {dsort_tensor.shape[2]} TRs)"
+            f"🧩 -dsort: {len(sets)} set(s) × {n_runs} run-block(s) = "
+            f"{dsort_tensor.shape[1]} voxel-wise column(s) "
+            f"({dsort_tensor.shape[0]:,} voxels × {n_time_data} TRs)"
         )
 
     # 2c. Slicewise (-slibase / -slibase_sm) regressors. Each .1D holds
@@ -901,7 +961,39 @@ def analyze_from_design_matrix(
     # 5. Fit GLM
     glm_poly = None if use_stimulus_only else -1
 
-    if method == "ols":
+    if method == "ols" and dsort_tensor is not None:
+        # OLS + per-voxel dsort is a per-voxel *augmented* least-squares, which the
+        # shared-design fit_glm() can't express. Reuse the ARMA GLS machinery with
+        # (a, b) pinned to (0, 0): an ARMA(1,1) with a=b=0 is white noise, so the
+        # whitening factor L = I and the GLS reduces to exact OLS — while we inherit
+        # the block-diagonal dsort plumbing (per-run betas, tstats, dof, labels).
+        zero_ab = torch.zeros(
+            data.shape[0], 2, dtype=(torch.float64 if use_double else torch.float32)
+        )
+        results = fit_glm_arma11(
+            data,
+            design,
+            tr=tr,
+            precomputed_arma_params=zero_ab,
+            device=device,
+            batch_size=voxel_chunk_size,
+            use_double=use_double,
+            glt_labels=design_info.get("glt_labels", None),
+            glt_matrices=design_info.get("glt_matrices", None),
+            task_indices=stim_indices if stim_indices else None,
+            want_r2_partial=want_r2_partial,
+            r2_partial_mode=r2_partial_mode,
+            want_r2_semipartial=want_r2_semipartial,
+            r2_semipartial_mode=r2_semipartial_mode,
+            debug_memory=debug_memory,
+            want_residuals=want_residuals,
+            run_starts=arma_run_starts,
+            tau=arma_tau,
+            dsort=dsort_tensor,
+            dsort_labels=dsort_labels,
+        )
+
+    elif method == "ols":
         results = fit_glm(
             data,
             design,

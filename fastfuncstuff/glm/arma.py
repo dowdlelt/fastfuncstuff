@@ -3493,11 +3493,17 @@ def _dsort_constant_guard(dsort: torch.Tensor) -> torch.Tensor:
     (it collapses onto the baseline), so AFNI substitutes the dataset's mean
     timeseries for that voxel. ``dsort`` is (n_voxels, n_dsort, n_timepoints).
 
+    Block-safe: a block-diagonal (per-run) column is legitimately zero outside its
+    run, which reads as low variance but is NOT a collapse-onto-baseline. Only a
+    genuinely CONSTANT-NONZERO column is substituted; all-zero (zero-padded)
+    columns are left untouched.
+
     Always warns when it fires (this is a data condition, not progress chatter).
     """
     # std over time, per (voxel, dsort dataset)
     stds = dsort.std(dim=2)  # (n_voxels, n_dsort)
-    bad = stds < 1e-8  # (n_voxels, n_dsort)
+    means = dsort.abs().mean(dim=2)  # (n_voxels, n_dsort)
+    bad = (stds < 1e-8) & (means > 1e-8)  # constant-nonzero only
     n_bad = int(bad.sum().item())
     if n_bad == 0:
         return dsort
@@ -4908,11 +4914,12 @@ def fit_glm_arma11(
             # If precomputed_grid exists (from precomputed ARMA params or non-batched grid search),
             # reuse cached values. Otherwise compute on-demand.
             if use_precomputed_arma and (a_opt, b_opt) in precomputed_grid:
-                # Reuse cached L_inv and X_w (stored on CPU to save GPU memory)
-                # Move to GPU only when needed for this group
-                L_chol = precomputed_grid[(a_opt, b_opt)]["L_inv"].to(device)
+                # Reuse the cached Cholesky factor L and X_w (stored on CPU to save
+                # GPU memory); move to GPU only when needed for this group. The cache
+                # holds L (not its inverse), so whiten via triangular solve.
+                L_chol = precomputed_grid[(a_opt, b_opt)]["L"].to(device)
                 X_w = precomputed_grid[(a_opt, b_opt)]["X_w"].to(device)
-                _using_l_inv = True  # flag: whitening is matmul, not triangular solve
+                _using_l_inv = False  # L_chol is the lower-triangular Cholesky factor
             else:
                 # Compute L ONCE for this (a,b) group, keep on GPU
                 y_dummy = data[voxel_indices[0]].to(device)

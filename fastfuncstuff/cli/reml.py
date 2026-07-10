@@ -13,6 +13,7 @@ For help:
 """
 
 import argparse
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -612,14 +613,29 @@ Examples:
     vox_opts.add_argument(
         "-dsort",
         action="append",
+        nargs="+",
         metavar="DSET",
         default=None,
         help=(
-            "Voxel-wise baseline regressor dataset (like AFNI 3dREMLfit -dsort). "
-            "A 4D dataset giving a different baseline regressor for every voxel; "
-            "must match the (concatenated) input in time and voxel count. The ARMA "
-            "(a,b) is estimated WITHOUT it, then the final GLS is redone per voxel "
-            "WITH it. Repeatable; its beta is appended last in -Rbuck / -Rbeta."
+            "Voxel-wise baseline regressor(s) (like AFNI 3dREMLfit -dsort), a 4D "
+            "dataset giving a different baseline for every voxel. Pass ONE OR MORE "
+            "files after -dsort; they are concatenated in time to the (concatenated) "
+            "input length. The regressor is fit PER RUN (block-diagonal, one column "
+            "per run, like polynomials/motion). Repeatable: each -dsort is a separate "
+            "block-diagonal set. The ARMA (a,b) is estimated WITHOUT dsort, then the "
+            "final GLS is redone per voxel WITH it. See -dsort_betas to output betas."
+        ),
+    )
+    vox_opts.add_argument(
+        "-dsort_betas",
+        "-dsort-betas",
+        dest="dsort_betas",
+        choices=("yes", "no"),
+        default="no",
+        help=(
+            "Write the per-run -dsort coefficients (and t-stats) as trailing "
+            "sub-bricks in -Rbuck / -Rbeta. Default 'no' (dsort is fit as a nuisance "
+            "but its betas are not reported)."
         ),
     )
     vox_opts.add_argument(
@@ -1805,6 +1821,32 @@ def main():
             ols_results.original_shape = original_shape
             ols_results.affine = affine
 
+            # Voxel-wise (-dsort) coefficients: appended as trailing beta/t-stat
+            # sub-bricks only on -dsort_betas yes (default: dsort is a nuisance whose
+            # per-run betas aren't reported). Mirrors the REML -Rbuck path.
+            _want_dsort_betas = getattr(args, "dsort_betas", "no") == "yes"
+            _ols_dsort_betas = getattr(ols_results, "dsort_betas", None)
+
+            @contextlib.contextmanager
+            def _spliced_ols_dsort(base_labels):
+                if _ols_dsort_betas is None or not _want_dsort_betas:
+                    yield list(base_labels) if base_labels is not None else base_labels
+                    return
+                d_labels = getattr(ols_results, "dsort_labels", None) or [
+                    f"dsort#{k}" for k in range(_ols_dsort_betas.shape[1])
+                ]
+                saved_b, saved_t = ols_results.betas, ols_results.tstats
+                try:
+                    ols_results.betas = torch.cat([saved_b, _ols_dsort_betas], dim=1)
+                    if (
+                        saved_t is not None
+                        and getattr(ols_results, "dsort_tstats", None) is not None
+                    ):
+                        ols_results.tstats = torch.cat([saved_t, ols_results.dsort_tstats], dim=1)
+                    yield (list(base_labels) if base_labels is not None else []) + list(d_labels)
+                finally:
+                    ols_results.betas, ols_results.tstats = saved_b, saved_t
+
             if args.Obuck:
                 print(f"  • Writing OLS betas + stats (bucket): {args.Obuck}")
                 # Always write NIfTI .nii.gz regardless of input format
@@ -1838,15 +1880,16 @@ def main():
                             ols_results.contrast_r2_semipartial
                         )
 
-                write_glm_bucket_as_nifti(
-                    ols_results,
-                    args.Obuck,
-                    condition_names=stim_labels,  # Use stimulus labels, not all labels
-                    contrast_names=contrast_names,
-                    contrast_results=ols_contrast_results,
-                    output_format="nifti_gz",  # Force NIfTI output
-                    add_fdr=args.add_fdr,
-                )
+                with _spliced_ols_dsort(stim_labels) as _obuck_labels:
+                    write_glm_bucket_as_nifti(
+                        ols_results,
+                        args.Obuck,
+                        condition_names=_obuck_labels,  # stim labels (+ dsort on -dsort_betas yes)
+                        contrast_names=contrast_names,
+                        contrast_results=ols_contrast_results,
+                        output_format="nifti_gz",  # Force NIfTI output
+                        add_fdr=args.add_fdr,
+                    )
 
             if args.Obeta:
                 print(f"  • Writing OLS betas only: {args.Obeta}")
@@ -1864,7 +1907,11 @@ def main():
                 volume_shape = _resolve_shape(ols_results, None)
                 voxel_mask = _get_voxel_mask(ols_results)
 
-                betas_np = _ensure_numpy(ols_results.betas)
+                # Append dsort coefficients last only on -dsort_betas yes.
+                _obeta_betas = ols_results.betas
+                if _want_dsort_betas and _ols_dsort_betas is not None:
+                    _obeta_betas = torch.cat([_obeta_betas, _ols_dsort_betas], dim=1)
+                betas_np = _ensure_numpy(_obeta_betas)
                 betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
                 # Always write NIfTI .nii.gz regardless of input format
@@ -2329,7 +2376,11 @@ def main():
                 from fastfuncstuff.glm.reml_diagnostics import resolve_mask
 
                 _nvox = int(np.prod(diag.volume_shape))
-                _rt = _resid.detach().cpu().float() if hasattr(_resid, "detach") else torch.as_tensor(np.asarray(_resid), dtype=torch.float32)
+                _rt = (
+                    _resid.detach().cpu().float()
+                    if hasattr(_resid, "detach")
+                    else torch.as_tensor(np.asarray(_resid), dtype=torch.float32)
+                )
                 _nt = _rt.shape[1]
                 _fit_vm = getattr(results, "voxel_mask", None)
                 if _fit_vm is not None:
@@ -2347,8 +2398,10 @@ def main():
                 _dmask = resolve_mask(_user_mask, _gm)
                 _dmf = _dmask.reshape(-1).bool()
                 diag.observe_residuals(
-                    {_label: _full[_dmf]}, _dmask,
-                    want_tsnr=bool(args.save_tsnr), want_fwhmx=bool(args.save_acf),
+                    {_label: _full[_dmf]},
+                    _dmask,
+                    want_tsnr=bool(args.save_tsnr),
+                    want_fwhmx=bool(args.save_acf),
                 )
 
             if args.save_grandmean:
@@ -2359,7 +2412,9 @@ def main():
                     _diag_header,
                 )
             if args.save_tsnr:
-                diag.save_map("raw_tsnr", f"{args.save_tsnr}.raw_tsnr.nii.gz", _diag_affine, _diag_header)
+                diag.save_map(
+                    "raw_tsnr", f"{args.save_tsnr}.raw_tsnr.nii.gz", _diag_affine, _diag_header
+                )
                 diag.save_map(
                     f"resid_tsnr_{_label}",
                     f"{args.save_tsnr}.resid_tsnr_{_label}.nii.gz",
@@ -2410,12 +2465,13 @@ def main():
     # results.betas/tstats directly, so we temporarily splice the dsort columns
     # in around each write and restore afterwards (keeps r2_partial etc. aligned
     # to the task columns).
-    import contextlib
+    _want_dsort_betas = getattr(args, "dsort_betas", "no") == "yes"
 
     @contextlib.contextmanager
     def _spliced_dsort(res, base_labels):
         d_betas = getattr(res, "dsort_betas", None)
-        if d_betas is None:
+        # dsort is always fit as a nuisance; only report its betas on -dsort_betas yes.
+        if d_betas is None or not _want_dsort_betas:
             yield list(base_labels)
             return
         d_labels = getattr(res, "dsort_labels", None) or [
@@ -2524,9 +2580,10 @@ def main():
         voxel_mask = _get_voxel_mask(results)
 
         assert results.betas is not None, "Results must have betas"
-        # Append dsort coefficients last (AFNI: -Rbeta includes the dsort beta).
+        # Append dsort coefficients last, only on -dsort_betas yes (else dsort is a
+        # nuisance whose per-run betas aren't reported).
         _rbeta_betas = results.betas
-        if getattr(results, "dsort_betas", None) is not None:
+        if _want_dsort_betas and getattr(results, "dsort_betas", None) is not None:
             _rbeta_betas = torch.cat([_rbeta_betas, results.dsort_betas], dim=1)
         betas_np = _ensure_numpy(_rbeta_betas)
         betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
