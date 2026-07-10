@@ -193,6 +193,8 @@ def xcorr_search_flow_2d(
     pe_is_u: bool,
     max_shift: float = 3.0,
     window_sigma: float = 2.0,
+    trial_step: float = 0.5,
+    interp: str = "bicubic",
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense local cross-correlation searchlight for the PE-axis shift.
@@ -200,54 +202,89 @@ def xcorr_search_flow_2d(
     The alternative backend to :func:`optical_flow_lk_2d`, same ``(fixed, moving)
     -> (u, v)`` contract, so it drops into the same slice/frame loop. Residual EPI
     motion is a small local translation *along the phase-encode axis*, so we do the
-    literal thing: slide ``moving`` along PE by a set of trial offsets spanning
-    ``±max_shift``, and at each offset measure the *local* normalized correlation
-    with ``fixed`` — the "searchlight" is a Gaussian window of radius
+    literal thing: slide ``moving`` along PE by trial offsets spanning ``±max_shift``
+    in ``trial_step`` increments, and at each offset measure the *local* normalized
+    correlation with ``fixed`` — the "searchlight" is a Gaussian window of radius
     ``window_sigma`` (a soft square of voxels on the slice). Per voxel, the offset
-    with the highest windowed correlation is where that spot lines up; a parabolic
-    fit across the three offsets around the peak gives the sub-voxel value. That
-    winning offset *is* the pull displacement (``moving(x+u) ≈ fixed(x)``), so no
-    sign flip. It matches or beats the phase-correlation route (FFT phase-ramp) —
-    same shift, but immune to the leakage bias a windowed FFT suffers on small
-    patches — and needs no warping iterations because it is a true alignment search.
+    of peak windowed correlation is where that spot lines up; a parabolic fit across
+    the three offsets around the peak gives the sub-voxel value. That winning offset
+    *is* the pull displacement (``moving(x+u) ≈ fixed(x)``), so no sign flip. A true
+    alignment search, so accurate single-shot (no warping iterations).
+
+    Sub-integer ``trial_step`` needs faithful resampling to pay off — ``interp``
+    defaults to ``bicubic`` (bilinear at fractional offsets blunts the correlation
+    peak and *loses* accuracy). The trials are swept with a streaming running-peak
+    (only the current offset's tensors are resident), so halving the step does not
+    scale memory with the trial count — it stays flat in the frame×slice size.
 
     Only the PE component is estimated; the orthogonal output is zero. ``pe_is_u``
     selects which carries it (u = W/columns, v = H/rows).
     """
     import math
 
-    r = max(1, int(math.ceil(max_shift)))  # integer trial radius; parabola gets sub-voxel
+    r = float(max(1, int(math.ceil(max_shift))))
+    device, dtype = fixed.device, fixed.dtype
+    b, h, w = fixed.shape
 
     def _win(x: torch.Tensor) -> torch.Tensor:
         return _blur2d(x, window_sigma)
 
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+
     def _shift_pe(img: torch.Tensor, d: float) -> torch.Tensor:
-        off = torch.full_like(img, float(d))
-        zero = torch.zeros_like(img)
-        return _warp2d(img, off, zero) if pe_is_u else _warp2d(img, zero, off)
+        if pe_is_u:
+            gx = 2.0 * (xs + d) / max(w - 1, 1) - 1.0
+            gy = 2.0 * ys / max(h - 1, 1) - 1.0
+        else:
+            gx = 2.0 * xs / max(w - 1, 1) - 1.0
+            gy = 2.0 * (ys + d) / max(h - 1, 1) - 1.0
+        grid = torch.stack([gx, gy], dim=-1)[None].expand(b, h, w, 2)
+        return F.grid_sample(
+            img[:, None], grid, mode=interp, padding_mode="border", align_corners=True
+        )[:, 0]
 
     # Fixed-image local moments precomputed once (the search only moves `moving`).
     mean_f = _win(fixed)
     var_f = (_win(fixed * fixed) - mean_f * mean_f).clamp_min(eps)
 
-    cc = []
-    for d in range(-r, r + 1):
-        mw = _shift_pe(moving, float(d))
+    offsets = torch.arange(-r, r + 1e-6, trial_step, device=device, dtype=dtype)
+    nd = int(offsets.numel())
+
+    # Streaming running-peak with the two neighbours needed for the parabola, so
+    # memory is O(frame×slice), not O(trials × frame×slice).
+    best_val = torch.full((b, h, w), float("-inf"), device=device, dtype=dtype)
+    best_i = torch.zeros((b, h, w), device=device, dtype=torch.long)
+    best_left = torch.zeros((b, h, w), device=device, dtype=dtype)
+    best_right = torch.zeros((b, h, w), device=device, dtype=dtype)
+    pending = torch.zeros((b, h, w), device=device, dtype=torch.bool)  # peak awaiting its right nb
+    prev: torch.Tensor | None = None
+    for i in range(nd):
+        mw = _shift_pe(moving, float(offsets[i]))
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
-        cov = _win(fixed * mw) - mean_f * mean_m
-        cc.append(cov / torch.sqrt(var_f * var_m))
-    corr = torch.stack(cc, dim=0)  # (2r+1, B, H, W); index i is offset i-r
+        corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+        if prev is not None:  # resolve the previous iteration's peaks with their right nb
+            best_right = torch.where(pending, corr, best_right)
+        newp = corr > best_val
+        best_left = torch.where(newp, prev if prev is not None else corr, best_left)
+        best_val = torch.where(newp, corr, best_val)
+        best_i = torch.where(newp, torch.full_like(best_i, i), best_i)
+        pending = newp  # these peaks capture their right neighbour next iteration
+        prev = corr
 
-    idx = corr.argmax(dim=0)  # integer best offset (as index into the trial stack)
-    pc = idx.clamp(1, corr.shape[0] - 2)  # keep a neighbour on each side for the parabola
-    c0 = torch.gather(corr, 0, pc[None]).squeeze(0)
-    cm = torch.gather(corr, 0, (pc - 1)[None]).squeeze(0)
-    cp = torch.gather(corr, 0, (pc + 1)[None]).squeeze(0)
-    denom = cm - 2.0 * c0 + cp
-    sub = torch.where(denom.abs() > 1e-6, 0.5 * (cm - cp) / denom, torch.zeros_like(denom))
+    denom = best_left - 2.0 * best_val + best_right
+    sub = torch.where(
+        denom.abs() > 1e-6, 0.5 * (best_left - best_right) / denom, torch.zeros_like(denom)
+    )
     sub = sub.clamp(-1.0, 1.0)
-    shift = (pc.float() - r) + sub  # best PE offset = pull displacement
+    # A peak at either end has no bracketing neighbour; leave it on the integer node.
+    edge = (best_i == 0) | (best_i == nd - 1)
+    sub = torch.where(edge, torch.zeros_like(sub), sub)
+    shift = (-r + best_i.to(dtype) * trial_step) + sub * trial_step
 
     zeros = torch.zeros_like(shift)
     return (shift, zeros) if pe_is_u else (zeros, shift)
