@@ -113,6 +113,52 @@ def test_xcorr_search_matches_translation():
     assert float(v.abs().max()) == 0.0  # PE-only: orthogonal component is exactly zero
 
 
+def _shift_xy(base, sx, sy):
+    """Shift a (nx,ny,nz) volume by sx along x(axis0=H) and sy along y(axis1=W)."""
+    nx, ny, nz = base.shape
+    out = np.zeros_like(base)
+    hh, ww = torch.meshgrid(
+        torch.arange(nx, dtype=torch.float32),
+        torch.arange(ny, dtype=torch.float32),
+        indexing="ij",
+    )
+    gx = 2 * (ww + sy) / (ny - 1) - 1
+    gy = 2 * (hh + sx) / (nx - 1) - 1
+    grid = torch.stack([gx, gy], -1)[None]
+    for z in range(nz):
+        sl = torch.from_numpy(base[:, :, z])[None, None]
+        out[:, :, z] = F.grid_sample(sl, grid, align_corners=True, padding_mode="border")[0, 0]
+    return out
+
+
+@pytest.mark.parametrize("backend", ["flow", "phase", "xcorr"])
+def test_dual_pe_recovers_both_axes(backend):
+    # Two in-plane PE axes (x and y), slice along z. Each frame is shifted by a known
+    # amount on BOTH axes; dual mode must recover both pull components (-shift each).
+    base = _phantom(44, 44, 4)
+    sx = np.array([0.0, 0.8, -0.6, 1.1, -0.9, 0.5], np.float32)  # along x (v / axis 0)
+    sy = np.array([0.0, -0.5, 1.0, -0.8, 0.6, -1.1], np.float32)  # along y (u / axis 1)
+    data = np.stack([_shift_xy(base, float(a), float(b)) for a, b in zip(sx, sy, strict=True)], -1)
+    res = estimate_residual_flow(
+        data,
+        pe_axis=0,
+        slice_axis=2,
+        backend=backend,
+        dual=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert res.dual
+    comps = dict(res.warp_components())  # {axis: (nx,ny,nz,T)}
+    assert set(comps) == {0, 1}  # both in-plane axes carried
+    core = (slice(8, -8), slice(8, -8), slice(None))
+    est_u = np.median(comps[1][core].reshape(-1, len(sy)), axis=0)  # y = W = u
+    est_v = np.median(comps[0][core].reshape(-1, len(sx)), axis=0)  # x = H = v
+    assert np.corrcoef(est_u, -sy)[0, 1] > 0.95
+    assert np.corrcoef(est_v, -sx)[0, 1] > 0.95
+    assert np.abs(est_u + sy).max() < 0.4 and np.abs(est_v + sx).max() < 0.4
+
+
 def test_unknown_backend_raises(known_shift_series):
     data, _ = known_shift_series
     with pytest.raises(ValueError, match="Unknown backend"):

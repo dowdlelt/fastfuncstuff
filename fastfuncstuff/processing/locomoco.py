@@ -186,39 +186,23 @@ def optical_flow_lk_2d(
     return u, v
 
 
-def xcorr_search_flow_2d(
+def _xcorr_shift_1d(
     fixed: torch.Tensor,
     moving: torch.Tensor,
-    *,
     pe_is_u: bool,
-    max_shift: float = 3.0,
-    window_sigma: float = 2.0,
-    trial_step: float = 0.5,
-    interp: str = "bicubic",
+    max_shift: float,
+    window_sigma: float,
+    trial_step: float,
+    interp: str,
     eps: float = 1e-4,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dense local cross-correlation searchlight for the PE-axis shift.
+) -> torch.Tensor:
+    """Sub-voxel pull shift along ONE in-plane axis by local correlation search.
 
-    The alternative backend to :func:`optical_flow_lk_2d`, same ``(fixed, moving)
-    -> (u, v)`` contract, so it drops into the same slice/frame loop. Residual EPI
-    motion is a small local translation *along the phase-encode axis*, so we do the
-    literal thing: slide ``moving`` along PE by trial offsets spanning ``±max_shift``
-    in ``trial_step`` increments, and at each offset measure the *local* normalized
-    correlation with ``fixed`` — the "searchlight" is a Gaussian window of radius
-    ``window_sigma`` (a soft square of voxels on the slice). Per voxel, the offset
-    of peak windowed correlation is where that spot lines up; a parabolic fit across
-    the three offsets around the peak gives the sub-voxel value. That winning offset
-    *is* the pull displacement (``moving(x+u) ≈ fixed(x)``), so no sign flip. A true
-    alignment search, so accurate single-shot (no warping iterations).
-
-    Sub-integer ``trial_step`` needs faithful resampling to pay off — ``interp``
-    defaults to ``bicubic`` (bilinear at fractional offsets blunts the correlation
-    peak and *loses* accuracy). The trials are swept with a streaming running-peak
-    (only the current offset's tensors are resident), so halving the step does not
-    scale memory with the trial count — it stays flat in the frame×slice size.
-
-    Only the PE component is estimated; the orthogonal output is zero. ``pe_is_u``
-    selects which carries it (u = W/columns, v = H/rows).
+    Slide ``moving`` along the axis (``pe_is_u`` → W/columns, else H/rows) over trial
+    offsets spanning ``±max_shift`` in ``trial_step`` steps; at each, measure local
+    normalized correlation with ``fixed`` under a ``window_sigma`` Gaussian searchlight.
+    Per voxel the peak offset (parabola-refined) is the pull displacement. Trials are
+    swept with a streaming running-peak, so memory is O(frame×slice), not O(trials×…).
     """
     import math
 
@@ -235,7 +219,7 @@ def xcorr_search_flow_2d(
         indexing="ij",
     )
 
-    def _shift_pe(img: torch.Tensor, d: float) -> torch.Tensor:
+    def _shift(img: torch.Tensor, d: float) -> torch.Tensor:
         if pe_is_u:
             gx = 2.0 * (xs + d) / max(w - 1, 1) - 1.0
             gy = 2.0 * ys / max(h - 1, 1) - 1.0
@@ -247,15 +231,12 @@ def xcorr_search_flow_2d(
             img[:, None], grid, mode=interp, padding_mode="border", align_corners=True
         )[:, 0]
 
-    # Fixed-image local moments precomputed once (the search only moves `moving`).
-    mean_f = _win(fixed)
+    mean_f = _win(fixed)  # fixed moments precomputed once (only `moving` slides)
     var_f = (_win(fixed * fixed) - mean_f * mean_f).clamp_min(eps)
 
     offsets = torch.arange(-r, r + 1e-6, trial_step, device=device, dtype=dtype)
     nd = int(offsets.numel())
 
-    # Streaming running-peak with the two neighbours needed for the parabola, so
-    # memory is O(frame×slice), not O(trials × frame×slice).
     best_val = torch.full((b, h, w), float("-inf"), device=device, dtype=dtype)
     best_i = torch.zeros((b, h, w), device=device, dtype=torch.long)
     best_left = torch.zeros((b, h, w), device=device, dtype=dtype)
@@ -263,7 +244,7 @@ def xcorr_search_flow_2d(
     pending = torch.zeros((b, h, w), device=device, dtype=torch.bool)  # peak awaiting its right nb
     prev: torch.Tensor | None = None
     for i in range(nd):
-        mw = _shift_pe(moving, float(offsets[i]))
+        mw = _shift(moving, float(offsets[i]))
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
         corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
@@ -284,10 +265,50 @@ def xcorr_search_flow_2d(
     # A peak at either end has no bracketing neighbour; leave it on the integer node.
     edge = (best_i == 0) | (best_i == nd - 1)
     sub = torch.where(edge, torch.zeros_like(sub), sub)
-    shift = (-r + best_i.to(dtype) * trial_step) + sub * trial_step
+    return (-r + best_i.to(dtype) * trial_step) + sub * trial_step
 
-    zeros = torch.zeros_like(shift)
-    return (shift, zeros) if pe_is_u else (zeros, shift)
+
+def xcorr_search_flow_2d(
+    fixed: torch.Tensor,
+    moving: torch.Tensor,
+    *,
+    pe_is_u: bool,
+    max_shift: float = 3.0,
+    window_sigma: float = 2.0,
+    trial_step: float = 0.5,
+    interp: str = "bicubic",
+    eps: float = 1e-4,
+    dual: bool = False,
+    n_passes: int = 3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Local cross-correlation searchlight backend, same ``(fixed, moving) -> (u, v)``.
+
+    Residual EPI motion is a small local translation; we do the literal thing —
+    slide ``moving`` and take the per-voxel offset of peak local correlation (a true
+    alignment search, so accurate single-shot). See :func:`_xcorr_shift_1d`.
+
+    Single-PE searches one axis (``pe_is_u`` selects it). ``dual`` (two PE axes)
+    searches BOTH, but *separably* — a 1-D search along each axis, alternating and
+    warping by the running estimate for ``n_passes`` (converges in ~3) — to avoid the
+    O(trials²) blow-up of a joint 2-D offset grid.
+    """
+    if not dual:
+        s = _xcorr_shift_1d(
+            fixed, moving, pe_is_u, max_shift, window_sigma, trial_step, interp, eps
+        )
+        z = torch.zeros_like(s)
+        return (s, z) if pe_is_u else (z, s)
+
+    u = torch.zeros_like(fixed)
+    v = torch.zeros_like(fixed)
+    for _ in range(n_passes):
+        u = u + _xcorr_shift_1d(
+            fixed, _warp2d(moving, u, v), True, max_shift, window_sigma, trial_step, interp, eps
+        )
+        v = v + _xcorr_shift_1d(
+            fixed, _warp2d(moving, u, v), False, max_shift, window_sigma, trial_step, interp, eps
+        )
+    return u, v
 
 
 def _phase_slope_dense(
@@ -350,26 +371,34 @@ def phase_correlation_flow_2d(
     stride: int = 8,
     max_shift: float = 3.0,
     n_iters: int = 5,
+    dual: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Phase-correlation searchlight backend (FFT phase ramp along PE).
 
     An alternative to :func:`optical_flow_lk_2d` / :func:`xcorr_search_flow_2d`,
-    same ``(fixed, moving) -> (u, v)`` contract. A translation along PE is a linear
-    phase ramp of the FFT along PE (the shift theorem), so the local shift reads
-    straight off the cross-spectrum phase — the clean, "treat it as a vector" route.
-    A single windowed patch reads the shift low (its content isn't circular), so we
-    warp ``moving`` by the running estimate and re-read the residual, ``n_iters``
-    times: each pass shrinks the residual until the leakage bias vanishes. The
-    accumulated field is the pull displacement (``moving(x+u) ≈ fixed(x)``).
+    same ``(fixed, moving) -> (u, v)`` contract. A translation along an axis is a
+    linear phase ramp of the FFT along that axis (the shift theorem), so the local
+    shift reads straight off the cross-spectrum phase — the clean, "treat it as a
+    vector" route. A single windowed patch reads the shift low (its content isn't
+    circular), so we warp ``moving`` by the running estimate and re-read the
+    residual, ``n_iters`` times, until the leakage bias vanishes. The accumulated
+    field is the pull displacement (``moving(x+flow) ≈ fixed(x)``).
 
-    Only the PE component is estimated; ``pe_is_u`` selects which output carries it.
+    Single-PE estimates one component (``pe_is_u`` selects it). ``dual`` (two PE
+    axes) estimates BOTH u and v — one phase-ramp per axis inside the same warping
+    loop; the FFT route makes this near-free (no combinatorial search).
     """
+    want_u = dual or pe_is_u
+    want_v = dual or not pe_is_u
     u = torch.zeros_like(fixed)
-    zero = torch.zeros_like(fixed)
+    v = torch.zeros_like(fixed)
     for _ in range(n_iters):
-        mw = _warp2d(moving, u, zero) if pe_is_u else _warp2d(moving, zero, u)
-        u = u + _phase_slope_dense(fixed, mw, pe_is_u, patch, stride, max_shift)
-    return (u, zero) if pe_is_u else (zero, u)
+        mw = _warp2d(moving, u, v)
+        if want_u:
+            u = u + _phase_slope_dense(fixed, mw, True, patch, stride, max_shift)
+        if want_v:
+            v = v + _phase_slope_dense(fixed, mw, False, patch, stride, max_shift)
+    return u, v
 
 
 def resolve_pe_axis(pe_dir: str) -> int:
@@ -447,6 +476,9 @@ class LocomocoResult:
     pe_axis: int
     slice_axis: int
     orig_shape: tuple[int, int, int, int]
+    a0: int = 0  # in-plane NIfTI axis carrying v (rows/H)
+    a1: int = 1  # in-plane NIfTI axis carrying u (cols/W)
+    dual: bool = False  # two PE axes: both u and v are real displacements
 
     def _to_nifti(self, canon: torch.Tensor) -> torch.Tensor:
         inv = [0, 0, 0, 0]
@@ -457,15 +489,40 @@ class LocomocoResult:
     def pe_displacement(self) -> torch.Tensor:
         """Per-frame SIGNED PE displacement ``(nx, ny, nz, T)`` in voxel units.
 
-        This is the single flow map: one signed scalar per voxel per frame — the
-        sign is the direction of residual motion along the PE axis, the magnitude
-        is how far. Scrub it like a timeseries (a diverging +/- colormap). Also the
-        content of the saved warp (before mm conversion).
+        The single-PE flow map: one signed scalar per voxel per frame — sign is the
+        direction of residual motion along the PE axis, magnitude is how far. Scrub
+        it like a timeseries. Also the content of the saved warp (before mm). For a
+        dual-PE run use :meth:`warp_components` / :meth:`flow_magnitude` instead.
         """
         return self._to_nifti(self.u_canon if self.pe_flow_is_u else self.v_canon)
 
+    def warp_components(self) -> list[tuple[int, torch.Tensor]]:
+        """``(nifti_axis, signed_displacement)`` pairs to write into the warp.
+
+        Single-PE: one entry on the PE axis. Dual-PE: two — u on ``a1``, v on ``a0``.
+        """
+        if self.dual:
+            return [
+                (self.a1, self._to_nifti(self.u_canon)),
+                (self.a0, self._to_nifti(self.v_canon)),
+            ]
+        return [(self.pe_axis, self.pe_displacement())]
+
+    def flow_magnitude(self) -> torch.Tensor:
+        """Per-frame displacement magnitude ``sqrt(u²+v²)`` ``(nx,ny,nz,T)`` (voxels)."""
+        return self._to_nifti((self.u_canon**2 + self.v_canon**2).sqrt())
+
+    def flow_angle(self) -> torch.Tensor:
+        """Per-frame displacement direction in degrees [0,360) ``(nx,ny,nz,T)``.
+
+        The dual-PE companion to the magnitude map (no single signed scalar can hold
+        a 2-D vector): scrub the two together, or feed the direction to a movie.
+        """
+        ang = torch.atan2(self.v_canon, self.u_canon) * (180.0 / np.pi)
+        return self._to_nifti(ang % 360.0)
+
     def corrected_series(self) -> torch.Tensor:
-        """PE-corrected 4-D series ``(nx, ny, nz, T)``."""
+        """Motion-corrected 4-D series ``(nx, ny, nz, T)``."""
         return self._to_nifti(self.corrected_canon)
 
     def flow_movie(
@@ -542,15 +599,24 @@ def _build_soft_mask(
 
 
 def _correct_pe(
-    moving_raw: torch.Tensor, u: torch.Tensor, v: torch.Tensor, pe_flow_is_u: bool
+    moving_raw: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    pe_flow_is_u: bool,
+    dual: bool = False,
 ) -> torch.Tensor:
-    """Warp ``moving_raw`` along the PE axis only (the single-axis warp we save)."""
+    """Warp ``moving_raw`` by the estimated displacement (the warp we save).
+
+    Single-PE keeps only the PE-axis component; ``dual`` (two PE axes) uses both.
+    """
+    if dual:
+        return _warp2d(moving_raw, u, v)
     uc = u if pe_flow_is_u else torch.zeros_like(u)
     vc = torch.zeros_like(v) if pe_flow_is_u else v
     return _warp2d(moving_raw, uc, vc)
 
 
-def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device):
+def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual=False):
     """Fixed reference: batch the flow over ALL frames at once, looping slices."""
     nt, ns, hh, ww = vol.shape
     if ref_mode == "mean":
@@ -576,13 +642,13 @@ def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device)
         fixed = _blur2d(fixed_raw, smooth_sigma) if smooth_sigma > 0 else fixed_raw
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
         u, v = flow_fn(fixed, moving)
-        corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u).cpu()
+        corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual).cpu()
         u_all[:, s] = u.cpu()
         v_all[:, s] = v.cpu()
     return u_all, v_all, corrected
 
 
-def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device):
+def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual=False):
     """Progressive reference: frame t registers to the running mean/median of the
     already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
     time, so batched over SLICES per frame instead of over time.
@@ -611,7 +677,7 @@ def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, dev
         fixed = _blur2d(ref, smooth_sigma) if smooth_sigma > 0 else ref
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
         u, v = flow_fn(fixed, moving)
-        corr = _correct_pe(moving_raw, u, v, pe_flow_is_u)
+        corr = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual)
         corrected[t] = corr.cpu()
         u_all[t] = u.cpu()
         v_all[t] = v.cpu()
@@ -633,6 +699,7 @@ def estimate_residual_flow(
     n_iters: int = 4,
     window_sigma: float = 2.0,
     pe_only: bool = True,
+    dual: bool = False,
     max_shift: float = 3.0,
     patch: int = 16,
     stride: int = 8,
@@ -666,6 +733,13 @@ def estimate_residual_flow(
     ``max_shift`` bounds the phase/xcorr search (residual motion is sub- to a few
     voxels).
 
+    ``dual`` (two PE axes, e.g. a 3-D-EPI acquisition phase-encoded on both in-plane
+    axes) estimates BOTH in-plane components and warps/saves both — ``slice_axis``
+    must be the third axis so both PE axes lie in the slice plane. flow does this
+    natively (full 2-D), phase reads one phase-ramp per axis, xcorr searches the two
+    axes separably (no O(n²) grid). The single signed PE map is then replaced by a
+    magnitude + angle pair.
+
     ``ref_mode``: static ``mean`` | ``median`` | ``first`` | ``<int>``, or a
     PROGRESSIVE ``first_mean`` / ``first_median`` — frame t registers to the
     running mean/median of the already-corrected frames before it (a bootstrapped
@@ -697,9 +771,10 @@ def estimate_residual_flow(
 
     # Backend: a per-pair (fixed, moving) -> (u, v) estimator plugged into the same
     # slice/frame machinery. Optical flow (default), phase-correlation, or magnitude
-    # cross-correlation — all return only the PE component.
+    # cross-correlation. Single-PE returns just the PE component; dual returns both.
     if backend == "flow":
-        pe_only_axis = (0 if pe_flow_is_u else 1) if pe_only else None
+        # dual (both axes) = full 2-D flow; single respects pe_only.
+        pe_only_axis = None if dual else ((0 if pe_flow_is_u else 1) if pe_only else None)
 
         def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             return optical_flow_lk_2d(
@@ -721,18 +796,24 @@ def estimate_residual_flow(
                 stride=stride,
                 max_shift=max_shift,
                 n_iters=n_iters,
+                dual=dual,
             )
     elif backend == "xcorr":
 
         def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             return xcorr_search_flow_2d(
-                fx, mv, pe_is_u=pe_flow_is_u, max_shift=max_shift, window_sigma=window_sigma
+                fx,
+                mv,
+                pe_is_u=pe_flow_is_u,
+                max_shift=max_shift,
+                window_sigma=window_sigma,
+                dual=dual,
             )
     else:
         raise ValueError(f"Unknown backend {backend!r}; expected flow | phase | xcorr.")
 
     est = _estimate_cumulative if ref_mode in ("first_mean", "first_median") else _estimate_static
-    u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device)
+    u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual)
 
     soft = None
     if automask:
@@ -745,7 +826,7 @@ def estimate_residual_flow(
         for s in range(ns):
             moving_raw = vol[:, s].to(device).float()
             corrected[:, s] = _correct_pe(
-                moving_raw, u_all[:, s].to(device), v_all[:, s].to(device), pe_flow_is_u
+                moving_raw, u_all[:, s].to(device), v_all[:, s].to(device), pe_flow_is_u, dual
             ).cpu()
 
     result = LocomocoResult(
@@ -757,13 +838,17 @@ def estimate_residual_flow(
         pe_axis=pe_axis,
         slice_axis=slice_axis,
         orig_shape=orig_shape,
+        a0=a0,
+        a1=a1,
+        dual=dual,
     )
     if verbose:
         # Restrict the median to the moving voxels so it stays meaningful: the
         # masked-out background is exact zero and the feather ramp is near-zero —
         # both would drag a whole-volume median to ~0 and hide the real motion.
         # Prefer the brain core (mask weight ~1); fall back to nonzero when unmasked.
-        ap = (u_all if pe_flow_is_u else v_all).abs()  # canonical (T, nSlice, H, W)
+        # dual: report vector magnitude; single: the PE component.
+        ap = (u_all**2 + v_all**2).sqrt() if dual else (u_all if pe_flow_is_u else v_all).abs()
         if soft is not None:
             sel = ap[:, soft > 0.5]
             region = "in-brain"
@@ -771,9 +856,10 @@ def estimate_residual_flow(
             sel = ap[ap > 0]
             region = "nonzero"
         med = float(sel.median()) if sel.numel() else 0.0
+        axes = f"axes {a0},{a1}" if dual else f"axis {pe_axis}"
         print(
-            f"🌀 locomoco: {nt} frames × {ns} slices, PE axis {pe_axis}, ref={ref_mode} "
-            f"({'1-D PE' if pe_only else '2-D'} flow); "
-            f"|PE disp| median {med:.3f} vox ({region}), max {float(ap.max()):.3f} vox"
+            f"🌀 locomoco: {nt} frames × {ns} slices, PE {axes}, ref={ref_mode} "
+            f"({'2-D dual-PE' if dual else '1-D PE' if pe_only else '2-D'} flow); "
+            f"|disp| median {med:.3f} vox ({region}), max {float(ap.max()):.3f} vox"
         )
     return result

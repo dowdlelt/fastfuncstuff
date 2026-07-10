@@ -444,6 +444,7 @@ def save_medic_warp(
     prefix_stem: str,
     nii_ext: str = ".nii.gz",
     as_5d: bool = False,
+    extra_components: list[tuple[Tensor, int]] | None = None,
 ) -> str:
     """Write the per-frame distortion warp as an ffs_qwarp-compatible mm warp.
 
@@ -455,6 +456,10 @@ def save_medic_warp(
     itself, so we feed the raw pull displacement. The 5D path bypasses
     save_warp_field (it writes one 5D file directly), so it applies the RAS->DICOM
     negation inline via ``feed_sign``. Verified against :func:`undistort_series`.
+
+    ``extra_components`` (5D path only) adds further ``(disp_pull, nifti_axis)``
+    displacements on other axes — e.g. a dual-phase-encode acquisition warped on
+    two in-plane axes at once. Each is converted with its own axis sign/scale.
 
     Returns the path/glob to pass to ``ffs_nwarp -nwarp`` (a ``warp_*`` wildcard
     for the default per-frame files, or the single 5D file when ``as_5d``).
@@ -472,10 +477,14 @@ def save_medic_warp(
     if as_5d:
         # Direct 5D write (no save_warp_field): convert RAS-mm -> DICOM-mm inline.
         # RAS-mm = cardinal[pe,pe]*disp; DICOM negates x,y (feed_sign).
-        feed_sign = -1.0 if pe_nifti_axis in (0, 1) else 1.0
-        rpp = float(cardinal[pe_nifti_axis, pe_nifti_axis])  # signed PE voxel mm
         warp = np.zeros((nx, ny, nz, nt, 3), dtype=np.float32)
-        warp[..., pe_nifti_axis] = rpp * feed_sign * disp_np
+        for comp, axis in [
+            (disp_np, pe_nifti_axis),
+            *[(c.detach().cpu().numpy(), a) for c, a in (extra_components or [])],
+        ]:
+            feed_sign = -1.0 if axis in (0, 1) else 1.0
+            rpp = float(cardinal[axis, axis])  # signed voxel mm on this axis
+            warp[..., axis] = rpp * feed_sign * comp
         path = f"{prefix_stem}_warp{nii_ext}"
         save_nifti(warp, path, affine=cardinal)
         return path

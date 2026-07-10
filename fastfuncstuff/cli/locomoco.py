@@ -87,10 +87,23 @@ tuning (turning the knobs):
   -levels     more pyramid levels handle bigger motion but risk aliasing on thin
               slices.
 
+dual phase-encode (rare — e.g. 3-D EPI encoded on two in-plane axes):
+
+  Give two -pe_dir (e.g. -pe_dir AP IS). Both in-plane axes are estimated and BOTH
+  warp components saved; -slice_axis is forced to the third (un-encoded) axis so
+  both PE axes lie in the slice plane (AP+IS -> slice on L-R). flow does this
+  natively; phase reads one phase-ramp per axis; xcorr searches the axes separably
+  (no O(trials²) grid). The single signed flow map splits into a magnitude
+  (_flowmag) + angle (_flowang, degrees) pair, since a 2-D vector has no single
+  signed scalar.
+
 examples:
 
   # default: optical flow, PE-only, automask on
   ffs_locomoco -input moco.nii.gz -prefix sub -pe_dir AP
+
+  # dual phase-encode: both AP and IS, slice forced to L-R
+  ffs_locomoco -i moco.nii.gz -o sub -pe_dir AP IS -backend phase
 
   # phase backend, denser field + more refine passes
   ffs_locomoco -i moco.nii.gz -o sub -pe AP -backend phase -patch 12 -stride 4 -iters 6
@@ -125,16 +138,21 @@ def create_parser() -> argparse.ArgumentParser:
         "-pe_dir",
         "-pe",
         required=True,
-        help="Phase-encode direction: AP/PA/LR/RL/IS/SI, or an axis letter x/y/z. "
-        "The residual motion is corrected along this axis.",
+        nargs="+",
+        metavar="DIR",
+        help="Phase-encode direction(s): AP/PA/LR/RL/IS/SI or an axis letter x/y/z. "
+        "Motion is corrected along this axis. Give TWO (e.g. -pe_dir AP IS) for a "
+        "dual-phase-encode acquisition — both in-plane axes are estimated and both "
+        "warps saved (-slice_axis is then forced to the remaining, third axis).",
     )
     io.add_argument(
         "-slice_axis",
         "-slice",
         default="z",
         type=_axis_from_token,
-        help="Through-plane (slice-select) axis to cut the movie along (x/y/z). "
-        "Must differ from the PE axis; default z suits axial EPI.",
+        help="Through-plane (slice-select) axis to cut the movie along (x/y/z). Must "
+        "differ from the PE axis; default z suits axial EPI. Ignored for dual -pe_dir "
+        "(the slice axis is fixed to the one axis not phase-encoded).",
     )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
@@ -361,15 +379,33 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.processing.locomoco import estimate_residual_flow, resolve_pe_axis
 
-    pe_axis = resolve_pe_axis(args.pe_dir)
-    slice_axis = args.slice_axis
-    if pe_axis == slice_axis:
-        print(
-            f"❌ PE axis ({pe_axis}) and -slice_axis ({slice_axis}) coincide. The PE "
-            "direction must lie in the slice plane — pick a different -slice_axis.",
-            file=sys.stderr,
-        )
+    pe_axes = [resolve_pe_axis(d) for d in args.pe_dir]
+    if len(pe_axes) > 2:
+        print(f"❌ -pe_dir takes 1 or 2 directions, got {len(pe_axes)}.", file=sys.stderr)
         return 2
+    dual = len(pe_axes) == 2
+    slice_axis = args.slice_axis
+    if dual:
+        if pe_axes[0] == pe_axes[1]:
+            print(f"❌ the two -pe_dir must be different axes, got {args.pe_dir}.", file=sys.stderr)
+            return 2
+        third = next(a for a in (0, 1, 2) if a not in pe_axes)  # the un-encoded axis
+        if slice_axis != third:
+            print(
+                f"ℹ️  dual -pe_dir: forcing -slice_axis to {third} (the axis not phase-"
+                f"encoded) so both PE axes lie in the slice plane.",
+            )
+        slice_axis = third
+        pe_axis = pe_axes[0]  # representative; dual estimates both in-plane axes
+    else:
+        pe_axis = pe_axes[0]
+        if pe_axis == slice_axis:
+            print(
+                f"❌ PE axis ({pe_axis}) and -slice_axis ({slice_axis}) coincide. The PE "
+                "direction must lie in the slice plane — pick a different -slice_axis.",
+                file=sys.stderr,
+            )
+            return 2
 
     if args.device:
         device = torch.device(args.device)
@@ -404,10 +440,15 @@ def main(argv: list[str] | None = None) -> int:
         if automask
         else "off"
     )
-    mode = f"{'1-D PE' if pe_only else '2-D'} flow" if args.backend == "flow" else args.backend
+    if dual:
+        mode = "2-D dual-PE"
+    elif args.backend == "flow":
+        mode = f"{'1-D PE' if pe_only else '2-D'} flow"
+    else:
+        mode = args.backend
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
     print(
-        f"   PE axis={pe_axis} ({args.pe_dir}), slice axis={slice_axis}, backend={args.backend}, "
+        f"   PE {args.pe_dir} (axes {pe_axes}), slice axis={slice_axis}, backend={args.backend}, "
         f"ref={args.ref}, do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
         f"{mode}, automask={mask_desc}"
     )
@@ -423,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         n_iters=args.iters,
         window_sigma=args.window,
         pe_only=pe_only,
+        dual=dual,
         max_shift=args.max_shift,
         patch=args.patch,
         stride=args.stride,
@@ -436,11 +478,20 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
 
+        comps = result.warp_components()  # [(nifti_axis, disp), ...]
+        (primary_axis, primary_disp), *rest = comps
         with spinner(f"Writing {Path(stem).name}_warp{ext}"):
             warp_path = save_medic_warp(
-                result.pe_displacement(), pe_axis, affine, stem, nii_ext=ext, as_5d=True
+                primary_disp,
+                primary_axis,
+                affine,
+                stem,
+                nii_ext=ext,
+                as_5d=True,
+                extra_components=[(d, a) for a, d in rest],
             )
-        print(f"  • warp (5D DICOM-mm, ffs_nwarp): {warp_path}")
+        axes_note = f"axes {[a for a, _ in comps]}" if dual else f"axis {primary_axis}"
+        print(f"  • warp (5D DICOM-mm, ffs_nwarp, {axes_note}): {warp_path}")
 
     if not args.no_corrected:
         corr_path = f"{stem}_locomoco{ext}"
@@ -449,12 +500,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  • corrected series: {corr_path}")
 
     if not args.no_flow:
-        flow_path = f"{stem}_flow{ext}"
-        with spinner(f"Writing {Path(flow_path).name}"):
-            save_nifti(result.pe_displacement().numpy(), flow_path, affine=affine)
-        print(
-            f"  • signed PE flow 4D (voxels, ± = direction; scrub like a timeseries): {flow_path}"
-        )
+        if dual:
+            # No single signed scalar holds a 2-D vector — split into magnitude + angle.
+            mag_path, ang_path = f"{stem}_flowmag{ext}", f"{stem}_flowang{ext}"
+            with spinner(f"Writing {Path(mag_path).name}"):
+                save_nifti(result.flow_magnitude().numpy(), mag_path, affine=affine)
+            with spinner(f"Writing {Path(ang_path).name}"):
+                save_nifti(result.flow_angle().numpy(), ang_path, affine=affine)
+            print(f"  • flow magnitude 4D (voxels): {mag_path}")
+            print(f"  • flow angle 4D (degrees 0–360; direction of motion): {ang_path}")
+        else:
+            flow_path = f"{stem}_flow{ext}"
+            with spinner(f"Writing {Path(flow_path).name}"):
+                save_nifti(result.pe_displacement().numpy(), flow_path, affine=affine)
+            print(
+                f"  • signed PE flow 4D (voxels, ± = direction; scrub like a series): {flow_path}"
+            )
 
     if not args.no_movie:
         fmt = args.movie_format or ("mp4" if _find_ffmpeg() else "gif")
