@@ -252,6 +252,19 @@ def test_automask_gates_flow_outside_brain():
     assert np.abs(inside).max() > 0.3
 
 
+def test_spinner_silent_when_not_a_tty():
+    import io
+
+    from fastfuncstuff.cli_utils import spinner
+
+    buf = io.StringIO()  # StringIO.isatty() is False -> no animation, no output
+    ran = []
+    with spinner("loading", stream=buf, interval=0.001):
+        ran.append(True)
+    assert ran == [True]
+    assert buf.getvalue() == ""
+
+
 def test_flow_movie_shape(known_shift_series):
     data, _ = known_shift_series
     res = estimate_residual_flow(

@@ -266,8 +266,11 @@ def main(argv: list[str] | None = None) -> int:
 
     stem, ext = _split_prefix(args.prefix)
 
-    img = load_nifti(args.input)
-    data = np.asarray(img.get_fdata(dtype=np.float32))
+    from fastfuncstuff.cli_utils import spinner
+
+    with spinner(f"Loading {Path(args.input).name}"):
+        img = load_nifti(args.input)
+        data = np.asarray(img.get_fdata(dtype=np.float32))
     if data.ndim != 4:
         print(f"❌ -input must be 4D, got shape {data.shape}", file=sys.stderr)
         return 2
@@ -316,19 +319,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
 
-        warp_path = save_medic_warp(
-            result.pe_displacement(), pe_axis, affine, stem, nii_ext=ext, as_5d=True
-        )
+        with spinner(f"Writing {Path(stem).name}_warp{ext}"):
+            warp_path = save_medic_warp(
+                result.pe_displacement(), pe_axis, affine, stem, nii_ext=ext, as_5d=True
+            )
         print(f"  • warp (5D DICOM-mm, ffs_nwarp): {warp_path}")
 
     if not args.no_corrected:
         corr_path = f"{stem}_locomoco{ext}"
-        save_nifti(result.corrected_series().numpy(), corr_path, affine=affine)
+        with spinner(f"Writing {Path(corr_path).name}"):
+            save_nifti(result.corrected_series().numpy(), corr_path, affine=affine)
         print(f"  • corrected series: {corr_path}")
 
     if not args.no_flow:
         flow_path = f"{stem}_flow{ext}"
-        save_nifti(result.pe_displacement().numpy(), flow_path, affine=affine)
+        with spinner(f"Writing {Path(flow_path).name}"):
+            save_nifti(result.pe_displacement().numpy(), flow_path, affine=affine)
         print(
             f"  • signed PE flow 4D (voxels, ± = direction; scrub like a timeseries): {flow_path}"
         )

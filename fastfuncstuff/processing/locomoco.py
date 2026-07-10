@@ -498,6 +498,7 @@ def estimate_residual_flow(
     est = _estimate_cumulative if ref_mode in ("first_mean", "first_median") else _estimate_static
     u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device)
 
+    soft = None
     if automask:
         soft = _build_soft_mask(data, slice_axis, a0, a1, automask_dilate, automask_sigma, device)
         u_all = u_all * soft[None]
@@ -522,10 +523,21 @@ def estimate_residual_flow(
         orig_shape=orig_shape,
     )
     if verbose:
-        pe = result.pe_displacement()
+        # Restrict the median to the moving voxels so it stays meaningful: the
+        # masked-out background is exact zero and the feather ramp is near-zero —
+        # both would drag a whole-volume median to ~0 and hide the real motion.
+        # Prefer the brain core (mask weight ~1); fall back to nonzero when unmasked.
+        ap = (u_all if pe_flow_is_u else v_all).abs()  # canonical (T, nSlice, H, W)
+        if soft is not None:
+            sel = ap[:, soft > 0.5]
+            region = "in-brain"
+        else:
+            sel = ap[ap > 0]
+            region = "nonzero"
+        med = float(sel.median()) if sel.numel() else 0.0
         print(
             f"🌀 locomoco: {nt} frames × {ns} slices, PE axis {pe_axis}, ref={ref_mode} "
             f"({'1-D PE' if pe_only else '2-D'} flow); "
-            f"|PE disp| median {pe.abs().median():.3f} vox, max {pe.abs().max():.3f} vox"
+            f"|PE disp| median {med:.3f} vox ({region}), max {float(ap.max()):.3f} vox"
         )
     return result

@@ -8,10 +8,15 @@ data loading, and output formatting.
 
 from __future__ import annotations
 
+import contextlib
 import glob as glob_module
+import itertools
 import re
 import sys
+import threading
+import time
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +25,43 @@ import numpy as np
 import torch
 
 _NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii")
+
+
+@contextlib.contextmanager
+def spinner(message: str, stream=None, interval: float = 0.1) -> Iterator[None]:
+    """Show a braille spinner next to ``message`` while the ``with`` block runs.
+
+    For opaque single-shot work a progress bar can't measure — reading one big
+    run off disk, a slow decompress — where the only honest signal is "still
+    going". Animates on a background thread so the wrapped call is unblocked, and
+    only when ``stream`` is a real terminal: piped/redirected output gets nothing
+    (no ``\\r`` spam in logs). The line is cleared on exit, so the caller's own
+    result line (shape, timing) reads as the completion notice.
+    """
+    stream = stream or sys.stderr
+    if not getattr(stream, "isatty", lambda: False)():
+        yield  # non-interactive: stay silent, let the caller's prints speak
+        return
+
+    stop = threading.Event()
+
+    def _spin() -> None:
+        for ch in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
+            if stop.is_set():
+                break
+            stream.write(f"\r{ch} {message}")
+            stream.flush()
+            time.sleep(interval)
+
+    thread = threading.Thread(target=_spin, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+        stream.write("\r\033[K")  # carriage return + clear-to-end-of-line
+        stream.flush()
 
 
 @dataclass
