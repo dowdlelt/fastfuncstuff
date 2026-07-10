@@ -157,11 +157,15 @@ class TimeVaryingWarp:
     (a ``warp_*`` wildcard) or one 5D ``(nx, ny, nz, T, 3)`` file.
     """
 
-    xd: Tensor  # (T, nz, ny, nx)
+    xd: Tensor  # (T, nz, ny, nx) — kept on CPU; only the active frame goes to GPU
     yd: Tensor
     zd: Tensor
     header_info: dict
     units: str = "nifti_mm"
+    # Compute device that at_time() moves the selected frame onto. The full 5-D
+    # field stays on CPU (it is T× a single-frame warp — resident on the GPU it
+    # dwarfs the data and OOMs); only one frame is on the GPU at a time.
+    device: torch.device | None = None
 
     @property
     def n_time(self) -> int:
@@ -174,10 +178,15 @@ class TimeVaryingWarp:
 
     def at_time(self, t: int) -> NonlinearWarp:
         idx = min(t, self.xd.shape[0] - 1)
+        xd, yd, zd = self.xd[idx], self.yd[idx], self.zd[idx]
+        if self.device is not None:
+            xd = xd.to(self.device)
+            yd = yd.to(self.device)
+            zd = zd.to(self.device)
         return NonlinearWarp(
-            xd=self.xd[idx],
-            yd=self.yd[idx],
-            zd=self.zd[idx],
+            xd=xd,
+            yd=yd,
+            zd=zd,
             header_info=self.header_info,
             units=self.units,
         )
@@ -1606,7 +1615,11 @@ def nwarpforge(
             if not matches:
                 raise FileNotFoundError(f"-nwarp pattern matched no files: {spec}")
             if len(matches) > 1:
-                tv = load_time_varying_warp_from_files(matches, device=device, debug=debug)
+                # Keep the 5-D field on CPU; at_time() streams each frame to GPU.
+                tv = load_time_varying_warp_from_files(
+                    matches, device=torch.device("cpu"), debug=debug
+                )
+                tv.device = device
                 transforms.append(tv)
                 max_time_points = max(max_time_points, tv.n_time)
                 if verb >= 1:
@@ -1635,7 +1648,9 @@ def nwarpforge(
                 print(f"    [{m[2, 0]:9.5f} {m[2, 1]:9.5f} {m[2, 2]:9.5f} {m[2, 3]:9.5f}]")
                 print(f"    [{m[3, 0]:9.5f} {m[3, 1]:9.5f} {m[3, 2]:9.5f} {m[3, 3]:9.5f}]")
         elif _is_time_varying_warp(spec):
-            tv = load_time_varying_warp(spec, device=device, debug=debug)
+            # Keep the 5-D field on CPU; at_time() streams each frame to GPU.
+            tv = load_time_varying_warp(spec, device=torch.device("cpu"), debug=debug)
+            tv.device = device
             transforms.append(tv)
             max_time_points = max(max_time_points, tv.n_time)
             if verb >= 1:
