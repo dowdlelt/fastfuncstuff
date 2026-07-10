@@ -74,6 +74,7 @@ ffs_xval_r2 = "fastfuncstuff.cli.xval_r2:main"
 # Image processing tools
 ffs_allineate = "fastfuncstuff.cli.allineate:main"
 ffs_medic = "fastfuncstuff.cli.medic:main"
+ffs_locomoco = "fastfuncstuff.cli.locomoco:main"
 ffs_moco = "fastfuncstuff.cli.moco:main"
 ffs_formwarp = "fastfuncstuff.cli.formwarp:main"
 ffs_motsim = "fastfuncstuff.cli.motsim:main"
