@@ -122,6 +122,32 @@ def create_parser() -> argparse.ArgumentParser:
         "better-conditioned warp but blurs fine detail; smaller = sharper, noisier.",
     )
 
+    mask = p.add_argument_group("Masking")
+    mask.add_argument(
+        "-no_automask",
+        action="store_true",
+        help="Disable brain-mask soft-gating of the flow. By default the flow is "
+        "multiplied by a dilated, feathered automask of the time-mean so optical "
+        "flow's wild guesses in the pure-noise air outside the head fade to zero "
+        "(they don't corrupt the data, they just look bad and jump around).",
+    )
+    mask.add_argument(
+        "-automask_dilate",
+        type=int,
+        default=4,
+        metavar="VOX",
+        help="Dilate the automask by this many voxels before feathering — a safety "
+        "margin so real motion at the brain edge is kept.",
+    )
+    mask.add_argument(
+        "-automask_sigma",
+        type=float,
+        default=3.0,
+        metavar="SIGMA_VOX",
+        help="Gaussian feather (voxels) on the dilated mask, so the flow decays "
+        "smoothly to zero near the edge instead of at a hard boundary; 0 = hard edge.",
+    )
+
     out = p.add_argument_group("Outputs")
     out.add_argument("-no_warp", action="store_true", help="Skip the per-frame warp file.")
     out.add_argument("-no_corrected", action="store_true", help="Skip the corrected series.")
@@ -257,11 +283,17 @@ def main(argv: list[str] | None = None) -> int:
         smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
 
     pe_only = not args.full_2d
+    automask = not args.no_automask
+    mask_desc = (
+        f"on (dilate {args.automask_dilate}, σ {args.automask_sigma:.1f} vox)"
+        if automask
+        else "off"
+    )
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
     print(
         f"   PE axis={pe_axis} ({args.pe_dir}), slice axis={slice_axis}, ref={args.ref}, "
         f"do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
-        f"{'1-D PE' if pe_only else '2-D'} flow"
+        f"{'1-D PE' if pe_only else '2-D'} flow, automask={mask_desc}"
     )
 
     result = estimate_residual_flow(
@@ -274,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
         n_iters=args.iters,
         window_sigma=args.window,
         pe_only=pe_only,
+        automask=automask,
+        automask_dilate=args.automask_dilate,
+        automask_sigma=args.automask_sigma,
         device=device,
     )
 

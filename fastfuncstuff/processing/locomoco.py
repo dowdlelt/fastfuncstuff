@@ -16,10 +16,12 @@ writes for ``ffs_nwarp`` (5-D DICOM-mm), so the correction composes into the sam
 single-resample chain as MEDIC / qwarp. Frame == reference gets a zero warp.
 
 Outputs: the per-frame **warp**, a **nonlinear-motion-corrected** series (the
-flow applied along PE), 4-D **flow direction (deg)** and **magnitude (vox)** maps
-(scrub like a timeseries), and a **flow movie** — a per-frame contact sheet of all
-slices, colored by the classic optical-flow / circular-phase wheel (hue =
-displacement direction, saturation = magnitude) so residual motion is eyeballable.
+flow applied along PE), a 4-D **signed PE-flow** map (one scalar per voxel per
+frame; sign = motion direction, scrub like a timeseries), and a **flow movie** —
+a per-frame contact sheet of all slices, colored by the classic optical-flow /
+circular-phase wheel (hue = direction, saturation = magnitude) so residual motion
+is eyeballable. Optical flow invents wild displacements in the pure-noise air
+outside the head; a feathered brain **automask** soft-gates the flow to zero there.
 
 The optical-flow backend here is a dependency-free, batched, pyramidal
 Lucas-Kanade solver (pure Torch, runs on the GPU), well suited to the
@@ -71,6 +73,19 @@ def _blur2d(img: torch.Tensor, sigma: float) -> torch.Tensor:
     x = F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), k.view(1, 1, -1, 1))
     x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="reflect"), k.view(1, 1, 1, -1))
     return x.squeeze(1)
+
+
+def _gaussian_blur3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable 3-D Gaussian blur of a single ``(D, H, W)`` volume."""
+    if sigma <= 0:
+        return vol
+    k = _gaussian_kernel1d(sigma, vol.device, vol.dtype)
+    r = (k.numel() - 1) // 2
+    x = vol[None, None]
+    x = F.conv3d(F.pad(x, (0, 0, 0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1, 1))
+    x = F.conv3d(F.pad(x, (0, 0, r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1, 1))
+    x = F.conv3d(F.pad(x, (r, r, 0, 0, 0, 0), mode="replicate"), k.view(1, 1, 1, 1, -1))
+    return x[0, 0]
 
 
 def _spatial_gradients(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -312,6 +327,34 @@ class LocomocoResult:
         return np.stack(frames, 0)
 
 
+def _build_soft_mask(
+    data: np.ndarray,
+    slice_axis: int,
+    a0: int,
+    a1: int,
+    dilate: int,
+    sigma: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Feathered brain mask in canonical ``(nSlice, H, W)`` layout, values in [0, 1].
+
+    A 3dAutomask on the time-mean, dilated by ``dilate`` voxels (safety margin so
+    real brain-edge motion survives) and Gaussian-feathered by ``sigma`` voxels so
+    the flow decays smoothly to zero instead of at a hard edge. Multiplying the
+    flow by this kills the wild displacements optical flow invents in the pure-noise
+    air outside the head, without clipping a hard boundary through the brain.
+    """
+    from .mask import automask
+
+    ref = torch.from_numpy(np.ascontiguousarray(data.mean(axis=3)))  # (nx, ny, nz)
+    vol_zyx = ref.permute(2, 1, 0).contiguous().to(device).float()  # automask wants (nz,ny,nx)
+    m = automask(vol_zyx, dilate_extra=dilate, device=device).float()
+    m = _gaussian_blur3d(m, sigma)
+    mask_nifti = m.permute(2, 1, 0)  # back to (nx, ny, nz)
+    # Reorder to the canonical spatial layout used for the flow (slice, H=a0, W=a1).
+    return mask_nifti.permute(slice_axis, a0, a1).contiguous().cpu()
+
+
 def _correct_pe(
     moving_raw: torch.Tensor, u: torch.Tensor, v: torch.Tensor, pe_flow_is_u: bool
 ) -> torch.Tensor:
@@ -403,6 +446,9 @@ def estimate_residual_flow(
     n_iters: int = 4,
     window_sigma: float = 2.0,
     pe_only: bool = True,
+    automask: bool = False,
+    automask_dilate: int = 4,
+    automask_sigma: float = 3.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -421,6 +467,12 @@ def estimate_residual_flow(
     running mean/median of the already-corrected frames before it (a bootstrapped
     template; frame 0 is the seed). Progressive modes are sequential and slower;
     ``first_median`` also holds the corrected series on the GPU.
+
+    ``automask`` (off here; on by the CLI) soft-gates the flow by a feathered brain
+    mask — a dilated 3dAutomask of the time-mean, Gaussian-blurred by
+    ``automask_sigma`` voxels — so optical flow's wild guesses in the pure-noise air
+    outside the head fade to zero instead of showing up as huge displacements. The
+    corrected series is rebuilt from the masked flow (so it stays consistent).
     """
     if pe_axis == slice_axis:
         raise ValueError(
@@ -445,6 +497,19 @@ def estimate_residual_flow(
     )
     est = _estimate_cumulative if ref_mode in ("first_mean", "first_median") else _estimate_static
     u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_kw, device)
+
+    if automask:
+        soft = _build_soft_mask(data, slice_axis, a0, a1, automask_dilate, automask_sigma, device)
+        u_all = u_all * soft[None]
+        v_all = v_all * soft[None]
+        # Rebuild the corrected series from the masked flow: outside the head the
+        # displacement is now ~0, so the resample is identity and the noise passes
+        # through untouched instead of getting yanked by a phantom warp.
+        for s in range(ns):
+            moving_raw = vol[:, s].to(device).float()
+            corrected[:, s] = _correct_pe(
+                moving_raw, u_all[:, s].to(device), v_all[:, s].to(device), pe_flow_is_u
+            ).cpu()
 
     result = LocomocoResult(
         u_canon=u_all,

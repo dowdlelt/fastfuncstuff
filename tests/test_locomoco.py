@@ -224,6 +224,34 @@ def test_progressive_reference_recovers_shift(known_shift_series, ref_mode):
     assert np.corrcoef(est[1:], -shifts[1:])[0, 1] > 0.95
 
 
+def test_automask_gates_flow_outside_brain():
+    # A compact bright blob (the "brain") in a field of pure noise. Optical flow
+    # invents large displacements in the noise; the automask must feather those to
+    # ~0 outside the blob while preserving the recovered shift inside it.
+    rng = np.random.default_rng(0)
+    nx, ny, nz, T = 40, 40, 4, 6
+    xx, yy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    blob = np.exp(-(((xx - 20) / 6.0) ** 2 + ((yy - 20) / 6.0) ** 2)).astype(np.float32)
+    brain = (blob[:, :, None] * (5.0 + np.sin(xx / 3.0)[:, :, None])).astype(np.float32)
+    shifts = np.array([0.0, 1.0, -1.0, 1.5, -0.8, 0.6], np.float32)
+    data = np.zeros((nx, ny, nz, T), np.float32)
+    for t, sh in enumerate(shifts):
+        shifted = _shift_along_y(np.repeat(brain, nz, axis=2), float(sh))
+        noise = 0.3 * rng.standard_normal((nx, ny, nz)).astype(np.float32)
+        data[..., t] = shifted + noise
+
+    common = dict(pe_axis=1, slice_axis=2, ref_mode="first", n_iters=6, verbose=False)
+    res = estimate_residual_flow(
+        data, automask=True, automask_dilate=3, automask_sigma=2.0, **common
+    )
+    flow = res.pe_displacement().numpy()  # (nx,ny,nz,T)
+    inside = flow[17:23, 17:23]  # within the blob
+    outside = flow[:5, :5]  # far corner, pure noise
+    # The mask crushes the noisy corner flow but leaves the in-brain shift intact.
+    assert np.abs(outside).max() < 0.1
+    assert np.abs(inside).max() > 0.3
+
+
 def test_flow_movie_shape(known_shift_series):
     data, _ = known_shift_series
     res = estimate_residual_flow(
