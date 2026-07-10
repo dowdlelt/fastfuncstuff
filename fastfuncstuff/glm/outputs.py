@@ -417,7 +417,11 @@ def _strip_imaging_extension(filepath: str) -> str:
     'stats.blur.2mm'
     >>> _strip_imaging_extension("errts.sub-01.nii.gz")
     'errts.sub-01'
+    >>> _strip_imaging_extension("errts.sub-01.nii.zst")
+    'errts.sub-01'
     """
+    # Longest first so ".nii.zst"/".nii.gz" win over ".nii". Mirrors
+    # replace_afni_extension so zstd intermediates strip like gzip ones.
     EXTENSIONS = [
         "+orig.BRIK.gz",
         "+tlrc.BRIK.gz",
@@ -425,6 +429,7 @@ def _strip_imaging_extension(filepath: str) -> str:
         "+tlrc.BRIK",
         "+orig.HEAD",
         "+tlrc.HEAD",
+        ".nii.zst",
         ".nii.gz",
         ".nii",
     ]

@@ -166,6 +166,24 @@ def test_resolve_pe_axis():
         resolve_pe_axis("QQ")
 
 
+def test_split_prefix_strips_extensions():
+    from fastfuncstuff.cli.locomoco import _split_prefix
+
+    assert _split_prefix("sub") == ("sub", ".nii.gz")
+    assert _split_prefix("sub.nii.gz") == ("sub", ".nii.gz")
+    assert _split_prefix("sub.nii.zst") == ("sub", ".nii.zst")
+    assert _split_prefix("sub.nii") == ("sub", ".nii")
+    # Periods in the stem are preserved; only the imaging extension is stripped.
+    assert _split_prefix("a/b.blur.2mm") == ("a/b.blur.2mm", ".nii.gz")
+
+
+def test_strip_imaging_extension_handles_zst():
+    from fastfuncstuff.glm.outputs import _strip_imaging_extension
+
+    assert _strip_imaging_extension("errts.sub-01.nii.zst") == "errts.sub-01"
+    assert _strip_imaging_extension("errts.sub-01.nii.gz") == "errts.sub-01"
+
+
 def test_flow_direction_and_magnitude_maps(known_shift_series):
     data, shifts = known_shift_series
     res = estimate_residual_flow(

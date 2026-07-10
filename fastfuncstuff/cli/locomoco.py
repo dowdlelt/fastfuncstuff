@@ -34,6 +34,14 @@ def _axis_from_token(tok: str) -> int:
     return m[tok]
 
 
+def _split_prefix(prefix: str) -> tuple[str, str]:
+    """Split an output prefix into (stem, nii_ext); default .nii.gz if none given."""
+    for ext in (".nii.gz", ".nii.zst", ".nii"):
+        if prefix.endswith(ext):
+            return prefix[: -len(ext)], ext
+    return prefix, ".nii.gz"
+
+
 def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_locomoco",
@@ -42,7 +50,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
     io = p.add_argument_group("Input/Output")
     io.add_argument("-input", "-i", required=True, help="4D motion-corrected NIfTI series")
-    io.add_argument("-prefix", "-o", required=True, help="Output stem (no extension)")
+    io.add_argument(
+        "-prefix",
+        "-o",
+        required=True,
+        help="Output stem. A trailing .nii.gz/.nii.zst/.nii is stripped and sets the "
+        "output format for the NIfTI outputs (default .nii.gz).",
+    )
     io.add_argument(
         "-pe_dir",
         "-pe",
@@ -58,8 +72,6 @@ def create_parser() -> argparse.ArgumentParser:
         help="Through-plane (slice-select) axis to cut the movie along (x/y/z). "
         "Must differ from the PE axis; default z suits axial EPI.",
     )
-    io.add_argument("-ext", default=".nii.gz", choices=(".nii.gz", ".nii"), help="Output extension")
-
     flow = p.add_argument_group("Optical flow")
     flow.add_argument(
         "-ref",
@@ -67,25 +79,43 @@ def create_parser() -> argparse.ArgumentParser:
         help="Reference frame: mean | median | first | <frame index>.",
     )
     flow.add_argument(
-        "-smooth",
+        "-do_blur",
         type=float,
         default=0.0,
-        metavar="SIGMA",
-        help="Gaussian blur (voxels) applied before flow only (robustness); 0 = off.",
+        metavar="FWHM_MM",
+        help="In-plane Gaussian blur (FWHM mm) applied to frames BEFORE flow only, "
+        "for robustness on noisy data; 0 = off. Does not blur the corrected output.",
     )
     flow.add_argument(
         "-pe_only",
         action="store_true",
         help="Constrain the flow to the PE axis (1 DOF, more robust) instead of full 2-D.",
     )
-    flow.add_argument("-levels", type=int, default=3, help="Pyramid levels.")
-    flow.add_argument("-iters", type=int, default=4, help="Warping iterations per level.")
+    flow.add_argument(
+        "-levels",
+        type=int,
+        default=3,
+        help="Coarse-to-fine pyramid levels. The flow is solved on a stack of "
+        "images each halved in size; the coarsest catches large displacements "
+        "(1 px there = 2^(levels-1) px full-res), finer levels refine. More = "
+        "handles bigger motion, but risks aliasing on small slices.",
+    )
+    flow.add_argument(
+        "-iters",
+        type=int,
+        default=4,
+        help="Refinement iterations per pyramid level: warp by the current flow, "
+        "recompute the update, add it, repeat. More = better convergence for "
+        "larger motion, at linear cost. 4 suits sub-voxel residual motion.",
+    )
     flow.add_argument(
         "-window",
         type=float,
         default=2.0,
         metavar="SIGMA",
-        help="Gaussian window sigma (voxels) for the Lucas-Kanade normal equations.",
+        help="Lucas-Kanade neighbourhood: gradients are pooled over a Gaussian of "
+        "this sigma (voxels), assuming locally-constant flow. Larger = smoother, "
+        "better-conditioned warp but blurs fine detail; smaller = sharper, noisier.",
     )
 
     out = p.add_argument_group("Outputs")
@@ -204,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    stem, ext = _split_prefix(args.prefix)
+
     img = load_nifti(args.input)
     data = np.asarray(img.get_fdata(dtype=np.float32))
     if data.ndim != 4:
@@ -211,10 +243,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     affine = img.affine.copy()
 
+    # -do_blur is FWHM in mm (repo convention); convert to an in-plane voxel sigma
+    # for the pre-flow Gaussian. In-plane voxel size = mean of the two non-slice axes.
+    smooth_sigma = 0.0
+    if args.do_blur > 0:
+        vox = np.linalg.norm(affine[:3, :3], axis=0)  # per-axis mm
+        in_plane = [a for a in (0, 1, 2) if a != slice_axis]
+        inplane_mm = float(np.mean([vox[in_plane[0]], vox[in_plane[1]]]))
+        smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
+
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
     print(
-        f"   PE axis={pe_axis} ({args.pe_dir}), slice axis={slice_axis}, "
-        f"ref={args.ref}, smooth={args.smooth}, {'1-D PE' if args.pe_only else '2-D'} flow"
+        f"   PE axis={pe_axis} ({args.pe_dir}), slice axis={slice_axis}, ref={args.ref}, "
+        f"do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
+        f"{'1-D PE' if args.pe_only else '2-D'} flow"
     )
 
     result = estimate_residual_flow(
@@ -222,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         pe_axis,
         slice_axis,
         ref_mode=args.ref,
-        smooth_sigma=args.smooth,
+        smooth_sigma=smooth_sigma,
         n_levels=args.levels,
         n_iters=args.iters,
         window_sigma=args.window,
@@ -230,33 +272,32 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
     )
 
-    ext = args.ext
     print("💾 Writing outputs...")
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
 
         warp_path = save_medic_warp(
-            result.pe_displacement(), pe_axis, affine, args.prefix, nii_ext=ext, as_5d=True
+            result.pe_displacement(), pe_axis, affine, stem, nii_ext=ext, as_5d=True
         )
         print(f"  • warp (5D DICOM-mm, ffs_nwarp): {warp_path}")
 
     if not args.no_corrected:
-        corr_path = f"{args.prefix}_locomoco{ext}"
+        corr_path = f"{stem}_locomoco{ext}"
         save_nifti(result.corrected_series().numpy(), corr_path, affine=affine)
         print(f"  • corrected series: {corr_path}")
 
     if not args.no_flowmap:
-        dir_path = f"{args.prefix}_flowdir{ext}"
+        dir_path = f"{stem}_flowdir{ext}"
         save_nifti(result.flow_direction_deg().numpy(), dir_path, affine=affine)
         print(f"  • flow direction 4D (deg 0–360, scrub like a timeseries): {dir_path}")
-        mag_path = f"{args.prefix}_flowmag{ext}"
+        mag_path = f"{stem}_flowmag{ext}"
         save_nifti(result.flow_magnitude().numpy(), mag_path, affine=affine)
         print(f"  • flow magnitude 4D (voxels): {mag_path}")
 
     if not args.no_movie:
         fmt = args.movie_format or ("mp4" if _find_ffmpeg() else "gif")
         frames = result.flow_movie(max_mag=args.flow_max)
-        movie_path = f"{args.prefix}_flow.{fmt}"
+        movie_path = f"{stem}_flow.{fmt}"
         actual = _write_movie(frames, movie_path, args.fps, fmt)
         print(f"  • flow movie (circular-phase wheel): {actual}")
 
