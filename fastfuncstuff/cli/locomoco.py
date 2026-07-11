@@ -5,7 +5,9 @@ leaves behind in single-echo EPI (mostly along the phase-encode axis) by treatin
 each slice's time course as a movie and running batched optical flow against a
 reference frame. Writes:
 
-  * ``{prefix}_warp.nii.gz``      — per-frame 5-D DICOM-mm warp for ``ffs_nwarp``
+  * ``{prefix}_warp``             — per-frame DICOM-mm warp for ``ffs_nwarp``; a
+                                    5-D ``.nii.gz`` file (default) or a folder of
+                                    numbered 4-D frames (``-warp_format folder``)
   * ``{prefix}_locomoco.nii.gz``  — the non-linear-motion-corrected series
   * ``{prefix}_locomoco_mean.nii.gz`` — temporal mean of the corrected series
                                     (with ``-save_mean``); a registration target
@@ -349,6 +351,15 @@ def create_parser() -> argparse.ArgumentParser:
 
     out = p.add_argument_group("Outputs")
     out.add_argument("-no_warp", action="store_true", help="Skip the per-frame warp file.")
+    out.add_argument(
+        "-warp_format",
+        "-warp-format",
+        choices=["5d", "folder"],
+        default="5d",
+        help="Warp on-disk format: '5d' = one {prefix}_warp file (nx,ny,nz,T,3); "
+        "'folder' = a {prefix}_warp/ directory of per-frame 4D files. Both are "
+        "consumed by ffs_nwarp -nwarp. [default: %(default)s]",
+    )
     out.add_argument("-no_corrected", action="store_true", help="Skip the corrected series.")
     out.add_argument(
         "-save_mean",
@@ -612,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
 
         comps = result.warp_components()  # [(nifti_axis, disp), ...]
         (primary_axis, primary_disp), *rest = comps
+        as_5d = args.warp_format == "5d"
         with spinner(f"Writing {Path(stem).name}_warp{ext}"):
             warp_path = save_medic_warp(
                 primary_disp,
@@ -619,11 +631,12 @@ def main(argv: list[str] | None = None) -> int:
                 affine,
                 stem,
                 nii_ext=ext,
-                as_5d=True,
+                as_5d=as_5d,
                 extra_components=[(d, a) for a, d in rest],
             )
         axes_note = f"axes {[a for a, _ in comps]}" if dual else f"axis {primary_axis}"
-        print(f"  • warp (5D DICOM-mm, ffs_nwarp, {axes_note}): {warp_path}")
+        fmt_note = "5D DICOM-mm" if as_5d else "folder of 4D frames, DICOM-mm"
+        print(f"  • warp ({fmt_note}, ffs_nwarp, {axes_note}): {warp_path}")
 
     if not args.no_corrected:
         corr_path = f"{stem}_locomoco{ext}"
