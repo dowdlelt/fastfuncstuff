@@ -70,8 +70,11 @@ def _blur2d(img: torch.Tensor, sigma: float) -> torch.Tensor:
     k = _gaussian_kernel1d(sigma, img.device, img.dtype)
     r = (k.numel() - 1) // 2
     x = img.unsqueeze(1)
-    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), k.view(1, 1, -1, 1))
-    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="reflect"), k.view(1, 1, 1, -1))
+    # ``replicate`` (not ``reflect``) so a blur radius larger than the plane still
+    # pads: automask crops edge slices to tiny in-brain bounding boxes (e.g. 10x7),
+    # and reflect requires pad < dim. Matches _gaussian_blur3d.
+    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1))
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
     return x.squeeze(1)
 
 
