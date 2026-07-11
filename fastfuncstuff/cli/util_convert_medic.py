@@ -132,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         import torch
 
         from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix, spinner
+        from fastfuncstuff.io.afni import load_nifti
         from fastfuncstuff.processing.medic import (
             PE_AXIS_MAP,
             field_to_displacement_pe,
@@ -141,8 +142,6 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError as e:
         print(f"ERROR: could not import fastfuncstuff: {e}", file=sys.stderr)
         return 1
-
-    from typing import cast
 
     import nibabel as nib
 
@@ -164,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     pe_axis = PE_AXIS_MAP[args.pe_dir]
 
     with spinner(f"Loading {Path(in_path).name}"):
-        img = cast(nib.Nifti1Image, nib.load(in_path))
+        img = load_nifti(in_path)
         affine = img.affine
         data = np.asarray(img.dataobj, dtype=np.float32)
     if data.ndim == 3:

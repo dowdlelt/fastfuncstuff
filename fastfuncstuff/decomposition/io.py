@@ -165,8 +165,10 @@ def _write_interleaved_stat_bucket(
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     out_str = str(out_file)
-    if out_str.endswith(".nii.gz"):
-        tmp_path = Path(out_str[:-7] + ".nii")
+    if out_str.endswith(".nii.gz") or out_str.endswith(".nii.zst"):
+        from fastfuncstuff.io.afni import replace_afni_extension
+
+        tmp_path = Path(replace_afni_extension(out_str, ".nii"))
     else:
         tmp_path = out_file
     save_nifti(out_4d, output_path=tmp_path, affine=affine)

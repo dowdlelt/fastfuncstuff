@@ -16,6 +16,7 @@ References
 - AFNI `mri_fdrize.c` / `thd_dsetatr.c` (FDRCURVE storage layout)
 - Benjamini & Hochberg 1995; Storey 2002 (pi0 estimator)
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -36,6 +37,7 @@ except ImportError as _err:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Stat → p-value
 # ---------------------------------------------------------------------------
+
 
 def _torch_t_sf(stat: torch.Tensor, dof: float) -> torch.Tensor:
     """Two-sided survival function for Student-t. CPU fallback to scipy.
@@ -98,6 +100,7 @@ def stat_to_pvalue(
 # BH q-values
 # ---------------------------------------------------------------------------
 
+
 def _storey_pi0(p_sorted: torch.Tensor, lambda_: float = 0.5) -> float:
     """Storey 2002 pi0 estimator at fixed lambda.
 
@@ -131,9 +134,10 @@ def _afni_qfac(p_sorted: torch.Tensor) -> float:
     hist = np.bincount(bins, minlength=16).astype(np.float64)
     hist.sort()
     ma = nq - 20.0 * (hist[6] + 2 * hist[7] + 2 * hist[8] + hist[9]) / 6.0
-    mb = nq - 20.0 * (
-        hist[5] + 2 * hist[6] + 2 * hist[7] + 2 * hist[8] + 2 * hist[9] + hist[10]
-    ) / 10.0
+    mb = (
+        nq
+        - 20.0 * (hist[5] + 2 * hist[6] + 2 * hist[7] + 2 * hist[8] + 2 * hist[9] + hist[10]) / 10.0
+    )
     mone = float(min(ma, mb))
     if mone <= 0.0:
         return 1.0
@@ -232,6 +236,7 @@ def fdr_qvalues(
 # ---------------------------------------------------------------------------
 # AFNI-format FDR curve
 # ---------------------------------------------------------------------------
+
 
 def _q_to_z(q: np.ndarray) -> np.ndarray:
     """AFNI z(q) = qginv(q/2): inverse upper-tail Gaussian of q/2.
@@ -346,6 +351,7 @@ def compute_fdr_curve(
 # AFNI XML extension writer
 # ---------------------------------------------------------------------------
 
+
 def add_fdrcurves_to_nifti(
     nifti_path: str | Path,
     curves_by_brick: dict[int, dict],
@@ -364,11 +370,17 @@ def add_fdrcurves_to_nifti(
 
     import nibabel as nib
 
+    from fastfuncstuff.io.afni import load_nifti
+
     path = Path(nifti_path)
     # Fully materialize the data into memory and rebuild a fresh image so
-    # nib.save below can rewrite `path` without racing a memory map / lazy
-    # ArrayProxy still pointing at the on-disk file (caused SIGBUS).
-    src = nib.load(str(path), mmap=False)
+    # the save below can rewrite `path` without racing a memory map / lazy
+    # ArrayProxy still pointing at the on-disk file (caused SIGBUS). load_nifti
+    # always fully materializes .nii.zst (via decompress-to-temp); for plain
+    # .nii/.nii.gz we still pass mmap=False explicitly for the same reason.
+    src = (
+        load_nifti(str(path)) if str(path).endswith(".nii.zst") else nib.load(str(path), mmap=False)
+    )
     data = np.asarray(src.dataobj)
     header = src.header.copy()
     affine = src.affine
@@ -377,9 +389,7 @@ def add_fdrcurves_to_nifti(
         raise ValueError(f"{path}: no NIfTI extensions present")
 
     AFNI_ECODE = 4
-    afni_idx = next(
-        (i for i, ext in enumerate(extensions) if ext.get_code() == AFNI_ECODE), None
-    )
+    afni_idx = next((i for i, ext in enumerate(extensions) if ext.get_code() == AFNI_ECODE), None)
     if afni_idx is None:
         raise ValueError(f"{path}: no AFNI extension (ecode=4)")
     afni_xml = extensions[afni_idx].content.decode("utf-8", errors="replace")
@@ -412,7 +422,17 @@ def add_fdrcurves_to_nifti(
     out_img = nib.Nifti1Image(data, affine, header)
     # Drop the source handle before overwriting the on-disk file.
     del src
-    nib.save(out_img, str(path))
+
+    path_str = str(path)
+    if path_str.endswith(".nii.zst"):
+        # nib.save doesn't know .zst; write plain .nii, then zstd-compress in place.
+        from fastfuncstuff.io.afni import compress_nifti, replace_afni_extension
+
+        tmp_nii = replace_afni_extension(path_str, ".nii")
+        nib.save(out_img, tmp_nii)
+        compress_nifti(tmp_nii, path_str, remove_original=True)
+    else:
+        nib.save(out_img, path_str)
 
 
 __all__ = [

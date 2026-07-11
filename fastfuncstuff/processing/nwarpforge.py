@@ -372,11 +372,9 @@ def _nifti_mm_to_voxels(
 
 def _is_time_varying_warp(path: str | Path) -> bool:
     """True if ``path`` is a 5D ``(nx, ny, nz, T, 3)`` per-frame warp (T > 1)."""
-    from typing import cast
+    from fastfuncstuff.io.afni import load_nifti
 
-    import nibabel as nib
-
-    shape = cast(nib.Nifti1Image, nib.load(str(path))).shape
+    shape = load_nifti(str(path)).shape
     return len(shape) == 5 and shape[-1] == 3 and shape[3] > 1
 
 
@@ -392,11 +390,9 @@ def load_time_varying_warp(
     with ``units="mm"``) so the warp composes to any ``-master`` grid via
     :func:`prepare_warp_for_grid`.
     """
-    from typing import cast
+    from fastfuncstuff.io.afni import load_nifti
 
-    import nibabel as nib
-
-    img = cast(nib.Nifti1Image, nib.load(str(path)))
+    img = load_nifti(str(path))
     data = np.asarray(img.dataobj, dtype=np.float32)  # (nx, ny, nz, T, 3)
     if data.ndim != 5 or data.shape[-1] != 3:
         raise ValueError(f"Expected 5D (nx,ny,nz,T,3) warp, got shape {data.shape}: {path}")
@@ -1121,7 +1117,7 @@ def _first_nonlinear_warp_grid(
     """
     import glob as _glob
 
-    import nibabel as nib
+    from fastfuncstuff.io.afni import load_nifti
 
     for spec in nwarp_specs:
         s = spec
@@ -1135,7 +1131,7 @@ def _first_nonlinear_warp_grid(
                 continue
         except ValueError:
             continue
-        img = nib.load(str(s))
+        img = load_nifti(str(s))
         shp = img.shape  # (nx, ny, nz, 3) or (nx, ny, nz, T, 3)
         nx, ny, nz = int(shp[0]), int(shp[1]), int(shp[2])
         return (nz, ny, nx), compute_cardinal_affine(np.asarray(img.affine)), img.header.copy()

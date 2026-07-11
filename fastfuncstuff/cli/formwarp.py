@@ -26,7 +26,7 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
 from fastfuncstuff.processing.formwarp import (
     METRICS,
     NO_X_DISP,
@@ -196,14 +196,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _strip_ext(prefix: str) -> str:
-    if prefix.endswith(".nii.gz"):
-        return prefix[:-7]
-    if prefix.endswith(".nii"):
-        return prefix[:-4]
-    return prefix
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -289,8 +281,9 @@ def main(argv: list[str] | None = None) -> int:
 
     res = formwarp(base, source, weight=weight, mask=mask, config=config, device=device)
 
-    prefix = _strip_ext(args.prefix)
-    warped_path = args.prefix if args.prefix.endswith((".nii", ".nii.gz")) else f"{prefix}.nii.gz"
+    pfx = parse_prefix(args.prefix)
+    prefix, nii_ext = pfx.stem, pfx.nifti_ext
+    warped_path = pfx.as_file()
     with spinner(f"Writing {Path(warped_path).name}"):
         save_image(res.warped, warped_path, header_info=base_info)
     if args.verb >= 1:
@@ -312,14 +305,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Saved {label}: {path}")
 
     if args.save_warp:
-        _save_warp(res.fwd, f"{prefix}_WARP.nii.gz", "moving->fixed warp")
+        _save_warp(res.fwd, f"{prefix}_WARP{nii_ext}", "moving->fixed warp")
     if args.save_inverse:
-        _save_warp(res.inv, f"{prefix}_WARPINV.nii.gz", "fixed->moving inverse warp")
+        _save_warp(res.inv, f"{prefix}_WARPINV{nii_ext}", "fixed->moving inverse warp")
     if args.save_halfway:
-        _save_warp(res.fixed_to_mid, f"{prefix}_HALF_mid2fixed.nii.gz", "mid->fixed half-warp")
-        _save_warp(res.moving_to_mid, f"{prefix}_HALF_mid2moving.nii.gz", "mid->moving half-warp")
-        _save_warp(res.mid_to_fixed, f"{prefix}_HALF_fixed2mid.nii.gz", "fixed->mid half-warp")
-        _save_warp(res.mid_to_moving, f"{prefix}_HALF_moving2mid.nii.gz", "moving->mid half-warp")
+        _save_warp(res.fixed_to_mid, f"{prefix}_HALF_mid2fixed{nii_ext}", "mid->fixed half-warp")
+        _save_warp(res.moving_to_mid, f"{prefix}_HALF_mid2moving{nii_ext}", "mid->moving half-warp")
+        _save_warp(res.mid_to_fixed, f"{prefix}_HALF_fixed2mid{nii_ext}", "fixed->mid half-warp")
+        _save_warp(res.mid_to_moving, f"{prefix}_HALF_moving2mid{nii_ext}", "moving->mid half-warp")
 
     if args.verb >= 1:
         print(f"Done in {time.time() - t0:.1f}s")

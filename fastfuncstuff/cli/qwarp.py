@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from fastfuncstuff.cli_utils import add_verbose_arg, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
 from fastfuncstuff.processing.affine import resample_to_base_grid
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES, warp_image, warp_image_linear
 from fastfuncstuff.processing.io import load_image, load_warp_field, save_image, save_warp_field
@@ -1538,12 +1538,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb >= 1:
             print(f"Loaded initial warp: {args.iniwarp}")
 
-    # Output prefix (strip extension)
-    prefix = args.prefix
-    if prefix.endswith(".nii.gz"):
-        prefix = prefix[:-7]
-    elif prefix.endswith(".nii"):
-        prefix = prefix[:-4]
+    # Output prefix (strip extension; -prefix out.nii.zst requests zstd-compressed output)
+    pfx = parse_prefix(args.prefix)
+    prefix, nii_ext = pfx.stem, pfx.nifti_ext
 
     # Compute padding for warp field header
     use_pad = not args.nopad
@@ -1793,10 +1790,10 @@ def main(argv: list[str] | None = None) -> int:
 
         # Save original (unsmoothed) 4D warped timeseries
         warped_4d = torch.stack(all_warped, dim=0)
-        with spinner(f"Writing {Path(prefix).name}.nii.gz"):
-            save_image(warped_4d, f"{prefix}.nii.gz", header_info=base_info)
+        with spinner(f"Writing {Path(prefix).name}{nii_ext}"):
+            save_image(warped_4d, f"{prefix}{nii_ext}", header_info=base_info)
         if args.verb >= 1:
-            print(f"\nSaved: {prefix}.nii.gz ({warped_4d.shape[0]} volumes)")
+            print(f"\nSaved: {prefix}{nii_ext} ({warped_4d.shape[0]} volumes)")
 
         # --- Temporal warp smoothing ---
         if do_tsmooth and all_warps_raw:
@@ -1853,11 +1850,11 @@ def main(argv: list[str] | None = None) -> int:
 
             # Save temporally smoothed 4D
             warped_4d_smooth = torch.stack(all_warped_smooth, dim=0)
-            with spinner(f"Writing {Path(prefix).name}_tsmooth.nii.gz"):
-                save_image(warped_4d_smooth, f"{prefix}_tsmooth.nii.gz", header_info=base_info)
+            with spinner(f"Writing {Path(prefix).name}_tsmooth{nii_ext}"):
+                save_image(warped_4d_smooth, f"{prefix}_tsmooth{nii_ext}", header_info=base_info)
             if args.verb >= 1:
                 print(
-                    f"Saved: {prefix}_tsmooth.nii.gz ({warped_4d_smooth.shape[0]} volumes, smoothed)"
+                    f"Saved: {prefix}_tsmooth{nii_ext} ({warped_4d_smooth.shape[0]} volumes, smoothed)"
                 )
 
         # --- Extract warp PCs as regressors of no interest ---
@@ -1922,8 +1919,8 @@ def main(argv: list[str] | None = None) -> int:
         # Save results
         if nt > 1:
             warped_4d = torch.stack(all_warped, dim=0)
-            with spinner(f"Writing {Path(prefix).name}.nii.gz"):
-                save_image(warped_4d, f"{prefix}.nii.gz", header_info=base_info)
+            with spinner(f"Writing {Path(prefix).name}{nii_ext}"):
+                save_image(warped_4d, f"{prefix}{nii_ext}", header_info=base_info)
             if not args.no_save_warp:
                 warp_dir = f"{prefix}_warps"
                 os.makedirs(warp_dir, exist_ok=True)
@@ -1964,8 +1961,8 @@ def main(argv: list[str] | None = None) -> int:
                     verb=args.verb,
                 )
         else:
-            with spinner(f"Writing {Path(prefix).name}.nii.gz"):
-                save_image(all_warped[0], f"{prefix}.nii.gz", header_info=base_info)
+            with spinner(f"Writing {Path(prefix).name}{nii_ext}"):
+                save_image(all_warped[0], f"{prefix}{nii_ext}", header_info=base_info)
             if not args.no_save_warp:
                 save_warp_field(
                     all_xd[0],
@@ -1990,7 +1987,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"{old_vox[0]:.2f}mm -> {new_shape} @ {args.dxyz:.2f}mm"
             )
         dxyz_info = {"affine": new_affine, "header": base_info["header"].copy()}
-        out_path = f"{prefix}.nii.gz"
+        out_path = f"{prefix}{nii_ext}"
         with spinner(f"Loading {Path(out_path).name}"):
             warped_data, _ = load_image(out_path, device=torch.device("cpu"))
         if warped_data.dim() == 4:
@@ -2019,7 +2016,7 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.time() - t0
     if args.verb >= 1:
         print(f"\nDone. Total time: {elapsed:.1f}s")
-        print(f"Output: {prefix}.nii.gz")
+        print(f"Output: {prefix}{nii_ext}")
 
     return 0
 

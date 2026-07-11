@@ -357,14 +357,14 @@ def _load_cached_volume(path: str, expected_shape: tuple[int, ...], device):
     if the file is missing or its shape disagrees with the current frame selection.
     """
     import os
-    from typing import cast
 
-    import nibabel as nib
     import torch
+
+    from fastfuncstuff.io.afni import load_nifti
 
     if not os.path.exists(path):
         return None
-    img = cast(nib.Nifti1Image, nib.load(path))
+    img = load_nifti(path)
     arr = np.asarray(img.dataobj, dtype=np.float32)
     if arr.shape != tuple(expected_shape):
         return None
@@ -373,9 +373,7 @@ def _load_cached_volume(path: str, expected_shape: tuple[int, ...], device):
 
 def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
     """Load per-echo 4D files into (nx, ny, nz, ne, t); return data + affine + header."""
-    from typing import cast
-
-    import nibabel as nib
+    from fastfuncstuff.io.afni import load_nifti
 
     vols = []
     affine = np.eye(4)
@@ -383,7 +381,7 @@ def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
     for i, p in enumerate(paths):
         if not Path(p).exists():
             raise FileNotFoundError(f"File not found: {p}")
-        img = cast(nib.Nifti1Image, nib.load(p))
+        img = load_nifti(p)
         data = np.asarray(img.dataobj, dtype=np.float32)
         if data.ndim == 3:
             data = data[..., None]

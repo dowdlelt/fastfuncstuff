@@ -44,9 +44,7 @@ class TestNIfTIReading:
         affine = img.affine
 
         # Check shape
-        assert data.shape == EXPECTED_SHAPE, (
-            f"Expected shape {EXPECTED_SHAPE}, got {data.shape}"
-        )
+        assert data.shape == EXPECTED_SHAPE, f"Expected shape {EXPECTED_SHAPE}, got {data.shape}"
 
         # Check values (all should be 1.0)
         assert np.allclose(data, EXPECTED_VALUE), "Expected all values to be 1.0"
@@ -80,16 +78,16 @@ class TestAFNIReading:
         data = img.get_fdata()
 
         # Check shape
-        assert data.shape == EXPECTED_SHAPE, (
-            f"Expected shape {EXPECTED_SHAPE}, got {data.shape}"
-        )
+        assert data.shape == EXPECTED_SHAPE, f"Expected shape {EXPECTED_SHAPE}, got {data.shape}"
 
         # Check values (all should be 1.0)
         assert np.allclose(data, EXPECTED_VALUE), "Expected all values to be 1.0"
 
     def test_afni_nifti_equivalence(self):
         """Test that AFNI and NIfTI versions have same data."""
-        if not (AFNI_ALL_ONES_HEAD.exists() and AFNI_ALL_ONES_BRIK.exists() and NIFTI_ALL_ONES.exists()):
+        if not (
+            AFNI_ALL_ONES_HEAD.exists() and AFNI_ALL_ONES_BRIK.exists() and NIFTI_ALL_ONES.exists()
+        ):
             pytest.skip("Synthetic data not found")
 
         afni_img = nib.load(str(AFNI_ALL_ONES_HEAD))
@@ -99,12 +97,8 @@ class TestAFNIReading:
         nifti_data = nifti_img.get_fdata()
 
         # Data should be identical
-        assert afni_data.shape == nifti_data.shape, (
-            "AFNI and NIfTI data shapes should match"
-        )
-        assert np.allclose(afni_data, nifti_data), (
-            "AFNI and NIfTI data values should match"
-        )
+        assert afni_data.shape == nifti_data.shape, "AFNI and NIfTI data shapes should match"
+        assert np.allclose(afni_data, nifti_data), "AFNI and NIfTI data values should match"
 
 
 class TestNIfTIWriting:
@@ -144,14 +138,50 @@ class TestNIfTIWriting:
         assert read_data.shape == original_data.shape, "Shape should be preserved"
 
         # Check values preserved
-        assert np.allclose(read_data, original_data, rtol=1e-5), (
-            "Values should be preserved"
-        )
+        assert np.allclose(read_data, original_data, rtol=1e-5), "Values should be preserved"
 
         # Check affine preserved
-        assert np.allclose(read_affine, original_affine, rtol=1e-5), (
-            "Affine should be preserved"
-        )
+        assert np.allclose(read_affine, original_affine, rtol=1e-5), "Affine should be preserved"
+
+
+class TestZstRoundtrip:
+    """`.nii.zst` (zstd-compressed) is a third supported format alongside
+    `.nii`/`.nii.gz` — big intermediates read many times use it instead of gzip.
+    Must round-trip through the shared save_nifti/load_nifti, same as gzip."""
+
+    def test_save_load_roundtrip(self, temp_output_dir):
+        import shutil
+
+        if shutil.which("zstd") is None:
+            pytest.skip("zstd not on PATH")
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        np.random.seed(0)
+        data = np.random.randn(6, 6, 4, 5).astype(np.float32)
+        affine = np.eye(4)
+        affine[:3, 3] = [1, 2, 3]
+
+        out_path = temp_output_dir / "roundtrip.nii.zst"
+        save_nifti(data, str(out_path), affine=affine)
+        assert out_path.exists()
+
+        img = load_nifti(str(out_path))
+        assert np.allclose(img.get_fdata(), data, rtol=1e-5)
+        assert np.allclose(img.affine, affine)
+
+    def test_replace_afni_extension_roundtrips_zst(self):
+        from fastfuncstuff.io.afni import replace_afni_extension
+
+        assert replace_afni_extension("stats.nii.zst", ".nii.gz") == "stats.nii.gz"
+        assert replace_afni_extension("stats", ".nii.zst") == "stats.nii.zst"
+
+    def test_parse_prefix_recognizes_zst(self):
+        from fastfuncstuff.cli_utils import parse_prefix
+
+        pfx = parse_prefix("out.nii.zst")
+        assert pfx.stem == "out"
+        assert pfx.nifti_ext == ".nii.zst"
+        assert pfx.as_file() == "out.nii.zst"
 
 
 class TestDataTypeHandling:
@@ -272,9 +302,7 @@ class TestEdgeCases:
 
         read_img = nib.load(str(output_path))
         read_data = read_img.get_fdata()
-        assert read_data.shape == data.shape, (
-            "Long time series shape should be preserved"
-        )
+        assert read_data.shape == data.shape, "Long time series shape should be preserved"
         assert np.allclose(read_data, data, rtol=1e-5), (
             "Long time series values should be preserved"
         )
@@ -331,9 +359,7 @@ class TestSyntheticDataProperties:
 
         data_2d = data.reshape(-1, n_timepoints).T
 
-        assert data_2d.shape == (n_timepoints, n_voxels), (
-            "Should reshape correctly for GLM"
-        )
+        assert data_2d.shape == (n_timepoints, n_voxels), "Should reshape correctly for GLM"
         assert data_2d.dtype in [np.float32, np.float64], "Should be float type for GLM"
         assert not np.any(np.isnan(data_2d)), "Should not contain NaN values"
         assert not np.any(np.isinf(data_2d)), "Should not contain inf values"

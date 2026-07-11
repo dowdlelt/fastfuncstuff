@@ -860,8 +860,7 @@ def _inject_fdr_curves(
     fdr_specs: iterable of (brick_idx, stat_code, dof_or_dof_pair).
     """
     try:
-        import nibabel as nib
-
+        from fastfuncstuff.io.afni import load_nifti
         from fastfuncstuff.stats.fdr import (
             add_fdrcurves_to_nifti,
             compute_fdr_curve,
@@ -870,7 +869,7 @@ def _inject_fdr_curves(
         print(f"  ⚠ Warning: FDR curves skipped (missing dep: {e})")
         return
 
-    img = nib.load(str(nifti_path))
+    img = load_nifti(str(nifti_path))
     # Read data into memory (not memory-mapped) so that
     # add_fdrcurves_to_nifti can safely overwrite the file.
     data = img.get_fdata()
