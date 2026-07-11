@@ -11,10 +11,11 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
 from fastfuncstuff.processing.affine import save_matrix_1D
 from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
@@ -374,7 +375,8 @@ def _parse_base(args: argparse.Namespace, verb: int) -> tuple[torch.Tensor | Non
     except ValueError:
         if verb >= 1:
             print(f"Loading external base: {args.base}")
-        base_vol, _ = load_image(args.base)
+        with spinner(f"Loading {Path(args.base).name}"):
+            base_vol, _ = load_image(args.base)
         if base_vol.ndim == 4:
             base_vol = base_vol[0]
         return base_vol, 0
@@ -382,7 +384,8 @@ def _parse_base(args: argparse.Namespace, verb: int) -> tuple[torch.Tensor | Non
 
 def _load_trimmed(path: str, skip_first: int, skip_last: int, verb: int):
     """Load a 4D series and drop -skip_first / -skip_last volumes from the ends."""
-    data, header_info = load_image(path)
+    with spinner(f"Loading {Path(path).name}"):
+        data, header_info = load_image(path)
     if data.ndim != 4:
         print(f"Error: input must be 4D, got {data.ndim}D ({path})", file=sys.stderr)
         sys.exit(1)
@@ -561,9 +564,10 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
             w_orig = pfx.with_suffix("weight_orig")
             w_new = pfx.with_suffix("weight_reweight")
             w_patch = pfx.with_suffix("patches")
-            save_image(result.weight_orig, w_orig, header_info=header_info)
-            save_image(result.weight_refined, w_new, header_info=header_info)
-            save_image(result.patch_labels.float(), w_patch, header_info=header_info)
+            with spinner("Writing weight/patch maps"):
+                save_image(result.weight_orig, w_orig, header_info=header_info)
+                save_image(result.weight_refined, w_new, header_info=header_info)
+                save_image(result.patch_labels.float(), w_patch, header_info=header_info)
             if verb >= 1:
                 print(f"Saved weights: {w_orig}, {w_new}, {w_patch}")
 
@@ -664,7 +668,8 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
     # Corrected timeseries (skipped when -prefix is omitted).
     if args.prefix is not None:
         out_path = parse_prefix(args.prefix).as_file()
-        save_image(result.aligned, out_path, header_info=header_info)
+        with spinner(f"Writing {Path(out_path).name}"):
+            save_image(result.aligned, out_path, header_info=header_info)
         if verb >= 1:
             print(f"Saved: {out_path}")
 
@@ -681,7 +686,8 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
             mean_path = derive_mean_output_path(parse_prefix(args.prefix).as_file())
         else:
             mean_path = parse_prefix(args.save_mean).as_file()
-        save_image(result.aligned.mean(dim=0), mean_path, header_info=header_info)
+        with spinner(f"Writing {Path(mean_path).name}"):
+            save_image(result.aligned.mean(dim=0), mean_path, header_info=header_info)
         if verb >= 1:
             print(f"Saved mean: {mean_path}")
 

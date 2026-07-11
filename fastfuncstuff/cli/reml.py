@@ -1410,7 +1410,10 @@ def main():
             print(f"Loading per-voxel HRF assignments from {args.hrfopt_prefix}...")
             # Volume-aligned (no mask) — analyze_from_design_matrix masks alongside data
             hrf_indices_obj = load_hrf_indices(hrf_index_file, mask=None)
-            hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
+            from fastfuncstuff.cli_utils import spinner
+
+            with spinner(f"Loading {Path(hrf_lib_file).name}"):
+                hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
             hrf_library_obj = hrf_lib_data["hrf_library"].to(device)
             unique_hrfs, counts = torch.unique(hrf_indices_obj, return_counts=True)
             print(f"  HRF library shape: {tuple(hrf_library_obj.shape)}")
@@ -1915,11 +1918,15 @@ def main():
                 betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
                 # Always write NIfTI .nii.gz regardless of input format
-                save_nifti(
-                    betas_vol,
-                    output_path=replace_afni_extension(args.Obeta, ".nii.gz"),
-                    affine=affine,
-                )
+                from fastfuncstuff.cli_utils import spinner
+
+                _obeta_path = replace_afni_extension(args.Obeta, ".nii.gz")
+                with spinner(f"Writing {Path(_obeta_path).name}"):
+                    save_nifti(
+                        betas_vol,
+                        output_path=_obeta_path,
+                        affine=affine,
+                    )
 
             if args.Onuisance:
                 # NOTE: When task_indices is provided, OLS results contain only stimulus columns.
@@ -2247,8 +2254,11 @@ def main():
             print("   (Skipping grid search - saves ~80% compute time)")
 
             try:
-                rvar_img = load_nifti(rvar_path)
-                rvar_data = rvar_img.get_fdata()  # (x, y, z[, 1], n_params)
+                from fastfuncstuff.cli_utils import spinner
+
+                with spinner(f"Loading {Path(rvar_path).name}"):
+                    rvar_img = load_nifti(rvar_path)
+                    rvar_data = rvar_img.get_fdata()  # (x, y, z[, 1], n_params)
 
                 # AFNI bucket files sometimes store sub-briks in the 5th dimension
                 # with a singleton 4th dimension (e.g. shape (x, y, z, 1, n)).
@@ -2392,9 +2402,12 @@ def main():
                 _gm = torch.from_numpy(diag.maps["grandmean"])
                 _user_mask = None
                 if args.mask:
-                    _user_mask = torch.from_numpy(
-                        (load_nifti(args.mask).get_fdata() > 0).astype("float32")
-                    )
+                    from fastfuncstuff.cli_utils import spinner
+
+                    with spinner(f"Loading {Path(args.mask).name}"):
+                        _user_mask = torch.from_numpy(
+                            (load_nifti(args.mask).get_fdata() > 0).astype("float32")
+                        )
                 _dmask = resolve_mask(_user_mask, _gm)
                 _dmf = _dmask.reshape(-1).bool()
                 diag.observe_residuals(
@@ -2589,9 +2602,11 @@ def main():
         betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
         # Always write NIfTI .nii.gz regardless of input format
-        save_nifti(
-            betas_vol, output_path=replace_afni_extension(args.Rbeta, ".nii.gz"), affine=affine
-        )
+        from fastfuncstuff.cli_utils import spinner
+
+        _rbeta_path = replace_afni_extension(args.Rbeta, ".nii.gz")
+        with spinner(f"Writing {Path(_rbeta_path).name}"):
+            save_nifti(betas_vol, output_path=_rbeta_path, affine=affine)
 
         # -dsort_nods: parallel no-dsort betas.
         if getattr(results, "nods_results", None) is not None:
@@ -2599,11 +2614,13 @@ def main():
             print(f"  • Writing no-dsort REML betas only: {nods_beta_path}")
             nods_betas_np = _ensure_numpy(results.nods_results.betas)
             nods_betas_vol = _reshape_parameter_map(nods_betas_np, volume_shape, voxel_mask)
-            save_nifti(
-                nods_betas_vol,
-                output_path=replace_afni_extension(nods_beta_path, ".nii.gz"),
-                affine=affine,
-            )
+            _nods_beta_path = replace_afni_extension(nods_beta_path, ".nii.gz")
+            with spinner(f"Writing {Path(_nods_beta_path).name}"):
+                save_nifti(
+                    nods_betas_vol,
+                    output_path=_nods_beta_path,
+                    affine=affine,
+                )
 
     if args.Rnuisance:
         print(f"  • Writing REML nuisance betas + stats: {args.Rnuisance}")
@@ -2733,7 +2750,10 @@ def main():
             if str(rvar_output_path).endswith(".nii.gz")
             else rvar_output_path
         )
-        _save_nifti_with_format(var_img, temp_nii_path, "nifti")
+        from fastfuncstuff.cli_utils import spinner
+
+        with spinner(f"Writing {Path(temp_nii_path).name}"):
+            _save_nifti_with_format(var_img, temp_nii_path, "nifti")
 
         # Label sub-briks using AFNI's 3drefit (fast on uncompressed file)
         print("  • Labeling Rvar sub-briks with 3drefit...")
@@ -2815,7 +2835,10 @@ def main():
         temp_lklhd = (
             lklhd_path.with_suffix(".nii") if str(lklhd_path).endswith(".nii.gz") else lklhd_path
         )
-        _save_nifti_with_format(lklhd_img, temp_lklhd, "nifti")
+        from fastfuncstuff.cli_utils import spinner
+
+        with spinner(f"Writing {Path(temp_lklhd).name}"):
+            _save_nifti_with_format(lklhd_img, temp_lklhd, "nifti")
 
         # Label each sub-brik with its (a, b) pair
         refit_cmd = ["3drefit"]

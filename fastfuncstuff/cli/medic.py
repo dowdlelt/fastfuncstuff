@@ -405,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import torch
 
-        from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix
+        from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix, spinner
         from fastfuncstuff.io.afni import save_nifti
         from fastfuncstuff.processing.medic import (
             PE_AXIS_MAP,
@@ -479,8 +479,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Start: {datetime.now():%Y-%m-%d %H:%M:%S}   Device: {device}")
         print("\nLoading echoes...")
 
-    mag, affine, _ = _load_echoes(args.magnitude)
-    phase, _, _ = _load_echoes(args.phase)
+    with spinner(f"Loading {Path(args.magnitude).name}"):
+        mag, affine, _ = _load_echoes(args.magnitude)
+    with spinner(f"Loading {Path(args.phase).name}"):
+        phase, _, _ = _load_echoes(args.phase)
     if mag.shape != phase.shape:
         print(f"ERROR: magnitude shape {mag.shape} != phase shape {phase.shape}", file=sys.stderr)
         return 1
@@ -582,7 +584,8 @@ def main(argv: list[str] | None = None) -> int:
         field_undist = result.field_undistorted
         # Cache the pull warp so any later re-run is instant; the field map cache is
         # written below (the "field map (Hz, native) QC" output).
-        save_nifti(disp_pull.cpu().numpy(), disp_cache, affine=affine)
+        with spinner(f"Writing {Path(disp_cache).name}"):
+            save_nifti(disp_pull.cpu().numpy(), disp_cache, affine=affine)
 
     # In -debug_3d mode the standard per-echo undistortion is redundant with the
     # 3ddebug outputs, and the whole point is to iterate fast, so skip it.
@@ -640,7 +643,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         dt_path = f"{prefix_stem}_fieldmap_detrend{nii_ext}"
         if processed:
-            save_nifti(field_dt.cpu().numpy(), dt_path, affine=affine)
+            with spinner(f"Writing {Path(dt_path).name}"):
+                save_nifti(field_dt.cpu().numpy(), dt_path, affine=affine)
         echo_list = range(ne) if args.debug3d_echo is None else [args.debug3d_echo - 1]
         signs = {
             "neg": [(-1.0, "neg")],
@@ -740,7 +744,8 @@ def main(argv: list[str] | None = None) -> int:
     # (result is None) it already exists on disk — don't rewrite it.
     if result is not None:
         fmap_path = f"{prefix_stem}_fieldmap{nii_ext}"
-        save_nifti(field_native.cpu().numpy(), fmap_path, affine=affine)
+        with spinner(f"Writing {Path(fmap_path).name}"):
+            save_nifti(field_native.cpu().numpy(), fmap_path, affine=affine)
         if args.verb >= 1:
             print(f"\n  field map (Hz, native): {fmap_path}")
 
@@ -750,7 +755,8 @@ def main(argv: list[str] | None = None) -> int:
         if field_undist is None:
             field_undist = displacement_pe_to_field(disp_pull, total_readout_time, pe_dir)
         undist_path = f"{prefix_stem}_fieldmap_undistorted{nii_ext}"
-        save_nifti(field_undist.cpu().numpy(), undist_path, affine=affine)
+        with spinner(f"Writing {Path(undist_path).name}"):
+            save_nifti(field_undist.cpu().numpy(), undist_path, affine=affine)
         if args.verb >= 1:
             print(f"  field map (Hz, undistorted): {undist_path}")
 

@@ -19,6 +19,7 @@ This is v1.  Paired tests, TFCE, Freedman-Lane covariates, and Welch
 unequal-variance are punted to v2; pooled-variance is the conservative
 choice for unequal-N ``-onevsall`` designs in the meantime.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,6 +35,7 @@ try:
         add_verbose_arg,
         parse_device_arg,
         parse_prefix,
+        spinner,
     )
     from fastfuncstuff.io.afni import load_afni_mask, load_nifti, save_nifti
     from fastfuncstuff.stats.cluster import (
@@ -73,6 +75,7 @@ except ImportError as e:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 class _CleanHelpFormatter(argparse.RawDescriptionHelpFormatter):
     """Hide ``-foo_bar`` aliases when a ``-foo-bar`` form exists.
 
@@ -111,148 +114,183 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_perm",
         description="GPU-accelerated nonparametric permutation testing with "
-                    "AFNI-style cluster correction.",
+        "AFNI-style cluster correction.",
         formatter_class=_CleanHelpFormatter,
     )
 
     inp = p.add_argument_group("Inputs")
     inp.add_argument(
-        "-input", "-i",
-        help="Single 4D NIfTI of single-trial (or any-trial) betas, "
-             "concatenated in run order.",
+        "-input",
+        "-i",
+        help="Single 4D NIfTI of single-trial (or any-trial) betas, concatenated in run order.",
     )
     inp.add_argument(
-        "-input-a", "-input_a",
-        nargs="+", default=None,
+        "-input-a",
+        "-input_a",
+        nargs="+",
+        default=None,
         help="(Group/2-file mode) 4D inputs for group A.",
     )
     inp.add_argument(
-        "-input-b", "-input_b",
-        nargs="+", default=None,
+        "-input-b",
+        "-input_b",
+        nargs="+",
+        default=None,
         help="(Group/2-file mode) 4D inputs for group B. If omitted, "
-             "-input-a alone is a 1-sample test against zero.",
+        "-input-a alone is a 1-sample test against zero.",
     )
     inp.add_argument(
-        "-events", nargs="+", default=None,
+        "-events",
+        nargs="+",
+        default=None,
         help="BIDS *_events.tsv files, one per run, in the same order as "
-             "the trials concatenated in -input.",
+        "the trials concatenated in -input.",
     )
     inp.add_argument(
         "-mask",
-        help="3D mask NIfTI (or AFNI HEAD/BRIK).  Voxels outside the mask "
-             "are not tested.",
+        help="3D mask NIfTI (or AFNI HEAD/BRIK).  Voxels outside the mask are not tested.",
     )
 
     sel = p.add_argument_group("Selection (events mode)")
     sel.add_argument(
         "-col",
-        help="Events column to read.  Use with -test for 1- or 2-sample "
-             "selection.",
+        help="Events column to read.  Use with -test for 1- or 2-sample selection.",
     )
     sel.add_argument(
-        "-test", nargs="+", default=None,
+        "-test",
+        nargs="+",
+        default=None,
         metavar="LABEL",
         help="Label(s) in -col to test.  One label = 1-sample test on those "
-             "trials.  Two labels = 2-sample test between them.",
+        "trials.  Two labels = 2-sample test between them.",
     )
     sel.add_argument(
-        "-onevsall", "-one_vs_all",
-        nargs=2, metavar=("COL", "LABEL"), default=None,
+        "-onevsall",
+        "-one_vs_all",
+        nargs=2,
+        metavar=("COL", "LABEL"),
+        default=None,
         help="2-sample: trials with COL==LABEL vs all other trials.",
     )
     sel.add_argument(
-        "-drop-values", "-drop_values",
-        nargs="+", default=(),
+        "-drop-values",
+        "-drop_values",
+        nargs="+",
+        default=(),
         metavar="VAL",
-        help="Values in the selection column to exclude entirely "
-             "(e.g. 'fixation' 'baseline').",
+        help="Values in the selection column to exclude entirely (e.g. 'fixation' 'baseline').",
     )
 
     perm = p.add_argument_group("Permutation")
     perm.add_argument(
-        "-n-perms", "-n_perms",
-        type=int, default=1000,
+        "-n-perms",
+        "-n_perms",
+        type=int,
+        default=1000,
         help="Number of permutations including the identity (default 1000). "
-             "Set higher with GPU to push uncorrected p resolution.",
+        "Set higher with GPU to push uncorrected p resolution.",
     )
     perm.add_argument(
-        "-seed", type=int, default=0,
+        "-seed",
+        type=int,
+        default=0,
         help="RNG seed for reproducibility (default 0).",
     )
     perm.add_argument(
-        "-no-blocks", "-no_blocks",
-        dest="use_blocks", action="store_false", default=True,
-        help="Disable within-run exchangeability (default: ON when events "
-             "are provided).",
+        "-no-blocks",
+        "-no_blocks",
+        dest="use_blocks",
+        action="store_false",
+        default=True,
+        help="Disable within-run exchangeability (default: ON when events are provided).",
     )
     perm.add_argument(
-        "-welch", action="store_true", default=False,
+        "-welch",
+        action="store_true",
+        default=False,
         help="(2-sample only) Use Welch's unequal-variance t. Recommended "
-             "when group sizes or variances differ (notably -onevsall).",
+        "when group sizes or variances differ (notably -onevsall).",
     )
     perm.add_argument(
-        "-vsmooth", "-vsmooth_mm", "-vsmooth-mm",
-        type=float, default=0.0,
+        "-vsmooth",
+        "-vsmooth_mm",
+        "-vsmooth-mm",
+        type=float,
+        default=0.0,
         metavar="FWHM_MM",
         help="Variance smoothing: Gaussian-smooth the per-perm variance "
-             "estimate at this FWHM (mm) and emit pseudo-t bricks "
-             "(t_unc_pseudo, t_fwe_pseudo) alongside the regular ones. "
-             "Cluster table for the pseudo branch uses empirical tcrits "
-             "from the permutation null (pseudo-t is not Student-t). "
-             "0 disables.  Matches randomise -v in spirit.",
+        "estimate at this FWHM (mm) and emit pseudo-t bricks "
+        "(t_unc_pseudo, t_fwe_pseudo) alongside the regular ones. "
+        "Cluster table for the pseudo branch uses empirical tcrits "
+        "from the permutation null (pseudo-t is not Student-t). "
+        "0 disables.  Matches randomise -v in spirit.",
     )
 
     clust = p.add_argument_group("Clustering")
     clust.add_argument(
-        "-nn", type=int, choices=(1, 2, 3), default=None,
+        "-nn",
+        type=int,
+        choices=(1, 2, 3),
+        default=None,
         help="Restrict cluster tables to one NN connectivity.  Default: "
-             "compute all of NN1/NN2/NN3.",
+        "compute all of NN1/NN2/NN3.",
     )
     clust.add_argument(
         "-sided",
         choices=("1-sided", "2-sided", "bi-sided", "all"),
         default="all",
         help="Cluster-table sidedness; 'all' = emit tables for 1-sided, "
-             "2-sided, and bi-sided.  (Default 'all'; matches 3dClustSim "
-             "-both -bisided.)",
+        "2-sided, and bi-sided.  (Default 'all'; matches 3dClustSim "
+        "-both -bisided.)",
     )
     clust.add_argument(
-        "-with-mass", "-with_mass",
-        dest="with_mass", action="store_true", default=False,
+        "-with-mass",
+        "-with_mass",
+        dest="with_mass",
+        action="store_true",
+        default=False,
         help="Also compute cluster-mass tables (slower path: cc3d per "
-             "threshold).  Default off — fast single-pass DSU computes "
-             "extent only.  AFNI's viewer only uses extent anyway.",
+        "threshold).  Default off — fast single-pass DSU computes "
+        "extent only.  AFNI's viewer only uses extent anyway.",
     )
 
     out = p.add_argument_group("Output")
     out.add_argument(
-        "-prefix", required=True,
+        "-prefix",
+        required=True,
         help="Output prefix (extension optional; .nii.gz is default).",
     )
     out.add_argument(
-        "-save-clust-masks", "-save_clust_masks",
+        "-save-clust-masks",
+        "-save_clust_masks",
         action="store_true",
         help="Also write the per-(NN,pthr,metric,sided) surviving-cluster "
-             "label maps as <prefix>_clust_masks.nii.gz.  Useful to compare "
-             "extent vs mass thresholding.",
+        "label maps as <prefix>_clust_masks.nii.gz.  Useful to compare "
+        "extent vs mass thresholding.",
     )
     out.add_argument(
-        "-no-refit", "-no_refit",
-        dest="run_refit", action="store_false", default=True,
+        "-no-refit",
+        "-no_refit",
+        dest="run_refit",
+        action="store_false",
+        default=True,
         help="Do not call 3drefit even if available.  Still writes the "
-             "NIML files and a refit.sh script.",
+        "NIML files and a refit.sh script.",
     )
 
     misc = p.add_argument_group("Misc")
     misc.add_argument(
-        "-device", default="cuda",
+        "-device",
+        default="cuda",
         help="Compute device (cuda / cpu / mps).  Default cuda.",
     )
     misc.add_argument(
-        "-jobs", "-j",
-        type=int, default=None,
+        "-jobs",
+        "-j",
+        type=int,
+        default=None,
         help="Process-pool workers for the cluster null pass.  "
-             "Default: os.cpu_count() - 1.  Set 1 to disable parallelism.",
+        "Default: os.cpu_count() - 1.  Set 1 to disable parallelism.",
     )
     add_verbose_arg(misc)
 
@@ -262,6 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+
 
 def _load_4d(path: str | Path) -> tuple[np.ndarray, object]:
     """Load a 4D NIfTI; return ``(data[X,Y,Z,T], img)``."""
@@ -290,13 +329,15 @@ def _load_mask(path: str | Path | None, shape3d: tuple[int, int, int]) -> np.nda
 
 def _resolve_selection(args, events):
     """Return ('one', OneSampleSelection) or ('two', TwoSampleSelection)."""
-    n_modes = sum(x is not None for x in (
-        args.test, args.onevsall,
-    ))
-    if n_modes != 1:
-        raise SystemExit(
-            "Specify exactly one of: -col/-test or -onevsall.  See -h."
+    n_modes = sum(
+        x is not None
+        for x in (
+            args.test,
+            args.onevsall,
         )
+    )
+    if n_modes != 1:
+        raise SystemExit("Specify exactly one of: -col/-test or -onevsall.  See -h.")
 
     if args.onevsall is not None:
         col, label = args.onevsall
@@ -331,7 +372,10 @@ def _run_perm_one_sample(y_nv, n_perms, seed, args):
     rng = np.random.default_rng(seed)
     signs = generate_sign_flips(y_nv.shape[0], n_perms, rng)
     return signs, one_sample_t_perm(
-        y_nv, signs, device=args.device, show_progress=args.verb >= 1,
+        y_nv,
+        signs,
+        device=args.device,
+        show_progress=args.verb >= 1,
         keep_perm_data=args.vsmooth > 0,
     )
 
@@ -341,7 +385,10 @@ def _run_perm_two_sample(y_nv, group, blocks, n_perms, seed, args):  # noqa: D40
     block_arg = blocks if args.use_blocks else None
     swaps = generate_label_swaps(group, n_perms, rng, blocks=block_arg)
     return swaps, two_sample_t_perm(
-        y_nv, swaps, device=args.device, show_progress=args.verb >= 1,
+        y_nv,
+        swaps,
+        device=args.device,
+        show_progress=args.verb >= 1,
         welch=args.welch,
         keep_perm_data=args.vsmooth > 0,
     )
@@ -362,8 +409,8 @@ def _compute_pseudo_t(pstats, test_kind: str, args, mask, voxel_size_mm) -> torc
     extras = pstats.extras
     if test_kind == "one":
         n = pstats.dof + 1  # one-sample N = dof + 1
-        m = extras["perm_means"]                          # [P, V] cpu
-        sum_y2 = extras["sum_y2"]                         # [V] cpu
+        m = extras["perm_means"]  # [P, V] cpu
+        sum_y2 = extras["sum_y2"]  # [V] cpu
         var = (sum_y2[None, :] - n * m * m) / (n - 1)
         var = var.clamp_min(1e-30)
         var_smooth = smooth_var_per_perm(var, mask, sigma_vox, device=args.device)
@@ -456,7 +503,10 @@ def _build_stat_dataset(
 
 
 def _accumulate_cluster_null(
-    pstats, mask: np.ndarray, args, save_masks: bool,
+    pstats,
+    mask: np.ndarray,
+    args,
+    save_masks: bool,
     pseudo_t_pv: torch.Tensor | None = None,
     tcrits_override: dict[str, np.ndarray] | None = None,
 ) -> tuple[ClusterNull, dict | None]:
@@ -468,13 +518,16 @@ def _accumulate_cluster_null(
     """
     nns = (args.nn,) if args.nn else DEFAULT_NN
     sideds = DEFAULT_SIDED if args.sided == "all" else (args.sided,)
-    t_for_cluster = (pseudo_t_pv.numpy() if pseudo_t_pv is not None
-                     else pstats.t.numpy())
+    t_for_cluster = pseudo_t_pv.numpy() if pseudo_t_pv is not None else pstats.t.numpy()
 
     obs_masks: dict | None = None
     if save_masks:
         obs_masks = compute_observed_cluster_masks(
-            t_for_cluster[0], mask, pstats.dof, nns=nns, sideds=sideds,
+            t_for_cluster[0],
+            mask,
+            pstats.dof,
+            nns=nns,
+            sideds=sideds,
         )
 
     null = accumulate_cluster_null(
@@ -499,17 +552,21 @@ def main() -> None:
 
     # ── Inputs ─────────────────────────────────────────────────────────────
     if args.input is not None and (args.input_a is not None or args.input_b is not None):
-        raise SystemExit("Use either -input (events mode) or -input-a/-input-b (group mode), not both.")
+        raise SystemExit(
+            "Use either -input (events mode) or -input-a/-input-b (group mode), not both."
+        )
 
     test_kind: str
 
     if args.input is not None:
-        data4d, _ = _load_4d(args.input)
+        with spinner(f"Loading {Path(args.input).name}"):
+            data4d, _ = _load_4d(args.input)
         # No events / no selection → default 1-sample test on every trial.
         # Run-block exchangeability is moot for sign flips, so this is well-defined
         # even without events.
         if not args.events and args.test is None and args.onevsall is None:
             import types
+
             n = data4d.shape[3]
             test_kind = "one"
             selection = types.SimpleNamespace(
@@ -535,6 +592,7 @@ def main() -> None:
                 # trials, with run-blocks (harmless for sign-flip but kept for
                 # documentation consistency).
                 import types
+
                 n = data4d.shape[3]
                 test_kind = "one"
                 selection = types.SimpleNamespace(
@@ -549,6 +607,7 @@ def main() -> None:
         if args.input_a is None:
             raise SystemExit("Specify -input or -input-a.")
         import types
+
         data_a, _ = _stack_inputs(args.input_a)
         if args.input_b is None:
             data4d = data_a
@@ -564,32 +623,38 @@ def main() -> None:
             data4d = np.concatenate([data_a, data_b], axis=3)
             n_a = data_a.shape[3]
             n_b = data_b.shape[3]
-            group = np.concatenate([
-                np.ones(n_a, dtype=np.int8), np.zeros(n_b, dtype=np.int8),
-            ])
+            group = np.concatenate(
+                [
+                    np.ones(n_a, dtype=np.int8),
+                    np.zeros(n_b, dtype=np.int8),
+                ]
+            )
             test_kind = "two"
             selection = types.SimpleNamespace(
                 indices=np.arange(n_a + n_b, dtype=np.int64),
                 group=group,
                 blocks=np.zeros(n_a + n_b, dtype=np.int64),  # no run info → single block
-                label_a="A", label_b="B",
+                label_a="A",
+                label_b="B",
             )
 
     # ── Mask ───────────────────────────────────────────────────────────────
-    mask = _load_mask(args.mask, data4d.shape[:3])
+    with spinner(f"Loading {Path(args.mask).name}"):
+        mask = _load_mask(args.mask, data4d.shape[:3])
     v_in_mask = int(mask.sum())
     if v_in_mask == 0:
         raise SystemExit("Mask is empty.")
 
     # ── Subset trials, reshape to [N, V] ───────────────────────────────────
-    sel = data4d[..., selection.indices]   # [X,Y,Z,N_sel]
+    sel = data4d[..., selection.indices]  # [X,Y,Z,N_sel]
     y_nv = sel.reshape(-1, sel.shape[-1])[mask.ravel()].T.astype(np.float32, copy=False)
     # y_nv is [N_sel, V_in_mask]
     n_trials = y_nv.shape[0]
 
     if args.verb >= 1:
-        print(f"[ffs_perm] trials selected: {n_trials}, voxels in mask: {v_in_mask}",
-              file=sys.stderr)
+        print(
+            f"[ffs_perm] trials selected: {n_trials}, voxels in mask: {v_in_mask}", file=sys.stderr
+        )
 
     # ── Permutation pass ───────────────────────────────────────────────────
     t0 = time.time()
@@ -598,11 +663,16 @@ def main() -> None:
         sidedness_fwe = "2-sided"
     else:
         _, pstats = _run_perm_two_sample(
-            y_nv, selection.group, selection.blocks, args.n_perms, args.seed, args,
+            y_nv,
+            selection.group,
+            selection.blocks,
+            args.n_perms,
+            args.seed,
+            args,
         )
         sidedness_fwe = "2-sided"
     if args.verb >= 1:
-        print(f"[ffs_perm] perm stat pass: {time.time()-t0:.2f}s", file=sys.stderr)
+        print(f"[ffs_perm] perm stat pass: {time.time() - t0:.2f}s", file=sys.stderr)
 
     # ── (Optional) variance smoothing → pseudo-t per perm ─────────────────
     pseudo_t_pv: torch.Tensor | None = None
@@ -619,24 +689,25 @@ def main() -> None:
             DEFAULT_SIDED,
             empirical_tcrits,
         )
-        sideds_for_pseudo = (
-            DEFAULT_SIDED if args.sided == "all" else (args.sided,)
-        )
+
+        sideds_for_pseudo = DEFAULT_SIDED if args.sided == "all" else (args.sided,)
         pseudo_tcrits = {
-            s: empirical_tcrits(pseudo_t_pv.numpy(), DEFAULT_PTHR, s)
-            for s in sideds_for_pseudo
+            s: empirical_tcrits(pseudo_t_pv.numpy(), DEFAULT_PTHR, s) for s in sideds_for_pseudo
         }
         if args.verb >= 1:
-            print(f"[ffs_perm] vsmooth + pseudo-t pass: {time.time()-t0:.2f}s",
-                  file=sys.stderr)
+            print(f"[ffs_perm] vsmooth + pseudo-t pass: {time.time() - t0:.2f}s", file=sys.stderr)
 
     # ── Build stat dataset ─────────────────────────────────────────────────
     vol4d, labels, stat_brick_indices, dof = _build_stat_dataset(
-        test_kind, pstats, mask, sidedness_fwe,
+        test_kind,
+        pstats,
+        mask,
+        sidedness_fwe,
         pseudo_t_pv=pseudo_t_pv,
     )
     stat_path = Path(prefix.with_suffix("stats"))
-    save_nifti(vol4d, stat_path, reference_img=args.input or args.input_a[0])
+    with spinner(f"Writing {stat_path.name}"):
+        save_nifti(vol4d, stat_path, reference_img=args.input or args.input_a[0])
 
     # ── Cluster null + observed masks ──────────────────────────────────────
     # When pseudo-t is available, cluster correction is built from the
@@ -645,12 +716,15 @@ def main() -> None:
     # the one driving the AFNI viewer's cluster panel.
     t0 = time.time()
     null, obs_masks = _accumulate_cluster_null(
-        pstats, mask, args, save_masks=args.save_clust_masks,
+        pstats,
+        mask,
+        args,
+        save_masks=args.save_clust_masks,
         pseudo_t_pv=pseudo_t_pv,
         tcrits_override=pseudo_tcrits,
     )
     if args.verb >= 1:
-        print(f"[ffs_perm] cluster null pass: {time.time()-t0:.2f}s", file=sys.stderr)
+        print(f"[ffs_perm] cluster null pass: {time.time() - t0:.2f}s", file=sys.stderr)
 
     # ── Write NIML tables + mask blob ──────────────────────────────────────
     niml_dir = stat_path.parent
@@ -680,22 +754,38 @@ def main() -> None:
             sided_attr = _attr_name[sided]
             ext_path = niml_dir / f"{prefix_base}.NN{nn}_{sided_attr}.niml"
             write_clustsim_niml(
-                ext_path, ext_table,
-                nn=nn, sidedness=sided, commandline=cmd_line,
-                nxyz=nxyz, dxyz=dxyz, pthr=null.pthr, athr=null.athr,
-                n_perms=null.n_perms, mask_count=mask_count,
-                mask_idcode=mask_idcode, mask_name=mask_name,
+                ext_path,
+                ext_table,
+                nn=nn,
+                sidedness=sided,
+                commandline=cmd_line,
+                nxyz=nxyz,
+                dxyz=dxyz,
+                pthr=null.pthr,
+                athr=null.athr,
+                n_perms=null.n_perms,
+                mask_count=mask_count,
+                mask_idcode=mask_idcode,
+                mask_name=mask_name,
             )
             niml_files_extent[(nn, sided_attr)] = ext_path
             if args.with_mass:
                 mass_table = null.mass_table(sided, nn)
                 mass_path = niml_dir / f"{prefix_base}.NN{nn}_{sided_attr}_mass.niml"
                 write_clustsim_niml(
-                    mass_path, mass_table,
-                    nn=nn, sidedness=sided, commandline=cmd_line + "  [mass]",
-                    nxyz=nxyz, dxyz=dxyz, pthr=null.pthr, athr=null.athr,
-                    n_perms=null.n_perms, mask_count=mask_count,
-                    mask_idcode=mask_idcode, mask_name=mask_name,
+                    mass_path,
+                    mass_table,
+                    nn=nn,
+                    sidedness=sided,
+                    commandline=cmd_line + "  [mass]",
+                    nxyz=nxyz,
+                    dxyz=dxyz,
+                    pthr=null.pthr,
+                    athr=null.athr,
+                    n_perms=null.n_perms,
+                    mask_count=mask_count,
+                    mask_idcode=mask_idcode,
+                    mask_name=mask_name,
                 )
 
     # ── Optional: save observed cluster-label masks 4D ────────────────────
@@ -703,11 +793,9 @@ def main() -> None:
         masks_path = niml_dir / f"{prefix_base}_clust_masks{prefix.nifti_ext}"
         keys = sorted(obs_masks.keys(), key=lambda k: (k[3], k[0], k[1]))
         stack = np.stack([obs_masks[k] for k in keys], axis=-1).astype(np.int32)
-        save_nifti(stack, masks_path, reference_img=args.input or args.input_a[0])
-        labels_mask = [
-            f"NN{nn}_p{pth:g}_{metric}_{sided}"
-            for (nn, pth, metric, sided) in keys
-        ]
+        with spinner(f"Writing {masks_path.name}"):
+            save_nifti(stack, masks_path, reference_img=args.input or args.input_a[0])
+        labels_mask = [f"NN{nn}_p{pth:g}_{metric}_{sided}" for (nn, pth, metric, sided) in keys]
         labels_path = masks_path.with_suffix(".labels.txt")
         labels_path.write_text("\n".join(labels_mask) + "\n")
         if args.verb >= 1:
@@ -718,17 +806,22 @@ def main() -> None:
 
     refit_script = niml_dir / f"{prefix_base}_refit.sh"
     _cmds = build_refit_commands(
-        stat_path, niml_files_extent, mask_b64,
+        stat_path,
+        niml_files_extent,
+        mask_b64,
         brick_labels=labels,
         stat_brick_indices=stat_brick_indices,
         dof=dof,
     )
     _script_body = "#!/usr/bin/env bash\nset -e\n"
     for _c in _cmds:
-        _script_body += " ".join(
-            ("'" + a.replace("'", "'\\''") + "'") if any(ch in a for ch in " \t\"'$`\\") else a
-            for a in _c
-        ) + "\n"
+        _script_body += (
+            " ".join(
+                ("'" + a.replace("'", "'\\''") + "'") if any(ch in a for ch in " \t\"'$`\\") else a
+                for a in _c
+            )
+            + "\n"
+        )
     refit_script.write_text(_script_body)
     refit_script.chmod(0o755)
 
@@ -745,8 +838,9 @@ def main() -> None:
         )
 
     if args.verb >= 1:
-        print(f"[ffs_perm] done in {time.time()-t_start:.1f}s. Output: {stat_path}",
-              file=sys.stderr)
+        print(
+            f"[ffs_perm] done in {time.time() - t_start:.1f}s. Output: {stat_path}", file=sys.stderr
+        )
 
 
 if __name__ == "__main__":

@@ -51,11 +51,12 @@ Date: 2026-01-27
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
 from fastfuncstuff.design.builder import legendre_polynomials, parse_afni_timing_file
 from fastfuncstuff.design.matrices import (
     fit_penalized_glm,
@@ -315,8 +316,9 @@ def main():
         print(f"\nLoading data: {args.input}")
 
     # Load NIfTI data
-    img = load_nifti(args.input)
-    data_full = np.array(img.dataobj)
+    with spinner(f"Loading {Path(args.input).name}"):
+        img = load_nifti(args.input)
+        data_full = np.array(img.dataobj)
     affine = img.affine
     header = img.header
 
@@ -339,7 +341,8 @@ def main():
     if args.mask:
         if args.verb >= 1:
             print(f"\nLoading mask: {args.mask}")
-        mask_3d = load_nifti(args.mask)
+        with spinner(f"Loading {Path(args.mask).name}"):
+            mask_3d = load_nifti(args.mask)
         if mask_3d.shape != (nx, ny, nz):
             raise ValueError(f"Mask shape {mask_3d.shape} doesn't match data {(nx, ny, nz)}")
         mask = mask_3d.astype(bool)
@@ -734,7 +737,8 @@ def main():
         lambda_volume[mask] = lambda_map
 
         lambda_file = f"{args.output_prefix}_lambda{_nii_ext}"
-        save_nifti(lambda_volume, lambda_file, affine=affine)
+        with spinner(f"Writing {Path(lambda_file).name}"):
+            save_nifti(lambda_volume, lambda_file, affine=affine)
 
         if args.verb >= 1:
             print(f"  ✓ Saved: {lambda_file}")

@@ -392,24 +392,29 @@ def save_combinatorial_results(
     if prefix_dir != Path("."):
         prefix_dir.mkdir(parents=True, exist_ok=True)
 
+    from fastfuncstuff.cli_utils import spinner
+
     # 1. Initial R2 volume
     initial_r2_vol = to_volume(initial_r2_full)
     initial_r2_path = f"{output_prefix}_initial_r2{nii_ext}"
-    save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine)
+    with spinner(f"Writing {Path(initial_r2_path).name}"):
+        save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine)
     output_files["initial_r2"] = initial_r2_path
     print(f"  Saved: {initial_r2_path}")
 
     # 2. Optimized R2 volume
     opt_r2_vol = to_volume(optimized_r2_full)
     opt_r2_path = f"{output_prefix}_optimized_xval_r2{nii_ext}"
-    save_nifti(opt_r2_vol, output_path=opt_r2_path, affine=affine)
+    with spinner(f"Writing {Path(opt_r2_path).name}"):
+        save_nifti(opt_r2_vol, output_path=opt_r2_path, affine=affine)
     output_files["optimized_xval_r2"] = opt_r2_path
     print(f"  Saved: {opt_r2_path}")
 
     # 3. Noise pool mask
     noise_pool_vol = to_volume(results.noise_pool_mask)
     noise_pool_path = f"{output_prefix}_noise_pool_mask{nii_ext}"
-    save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
+    with spinner(f"Writing {Path(noise_pool_path).name}"):
+        save_nifti(noise_pool_vol, output_path=noise_pool_path, affine=affine)
     output_files["noise_pool_mask"] = noise_pool_path
     print(f"  Saved: {noise_pool_path}")
 
@@ -462,21 +467,24 @@ def save_combinatorial_results(
     # 6. Full results as PyTorch file
     if save_pcs_mode == "both":
         results_path = f"{output_prefix}_combinatorial_results.pt"
-        torch.save(
-            {
-                "noise_pcs_per_run": results.noise_pcs_per_run,
-                "per_run_optimal_combinations": [
-                    r.optimal_combination for r in results.per_run_results
-                ],
-                "per_run_all_cod": [r.all_cod for r in results.per_run_results],
-                "per_run_all_var_explained": [r.all_var_explained for r in results.per_run_results],
-                "per_run_variance_ratios": [
-                    r.explained_variance_ratios for r in results.per_run_results
-                ],
-                "metadata": results.metadata,
-            },
-            results_path,
-        )
+        with spinner(f"Writing {Path(results_path).name}"):
+            torch.save(
+                {
+                    "noise_pcs_per_run": results.noise_pcs_per_run,
+                    "per_run_optimal_combinations": [
+                        r.optimal_combination for r in results.per_run_results
+                    ],
+                    "per_run_all_cod": [r.all_cod for r in results.per_run_results],
+                    "per_run_all_var_explained": [
+                        r.all_var_explained for r in results.per_run_results
+                    ],
+                    "per_run_variance_ratios": [
+                        r.explained_variance_ratios for r in results.per_run_results
+                    ],
+                    "metadata": results.metadata,
+                },
+                results_path,
+            )
         output_files["combinatorial_results"] = results_path
         print(f"  Saved: {results_path}")
 
@@ -768,7 +776,10 @@ def main():
         # Load or reconstruct HRF library
         hrf_lib_file = f"{args.hrf_opt}_hrf_library.pt"
         if Path(hrf_lib_file).exists():
-            hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
+            from fastfuncstuff.cli_utils import spinner
+
+            with spinner(f"Loading {Path(hrf_lib_file).name}"):
+                hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
             hrf_library = hrf_lib_data["hrf_library"]
             print(f"  Loaded HRF library from {hrf_lib_file}: {hrf_library.shape}")
         else:
@@ -1140,10 +1151,13 @@ def main():
                 vol = flat_np
             return vol.reshape(volume_shape)
 
+        from fastfuncstuff.cli_utils import spinner
+
         baseline_path = f"{args.prefix}_r2_glmdenoise{_nii_ext}"
         delta_path = f"{args.prefix}_r2_delta{_nii_ext}"
-        save_nifti(_flat_to_vol(baseline_r2_t), output_path=baseline_path, affine=affine)
-        save_nifti(_flat_to_vol(delta_r2_t), output_path=delta_path, affine=affine)
+        with spinner("Writing comparison results"):
+            save_nifti(_flat_to_vol(baseline_r2_t), output_path=baseline_path, affine=affine)
+            save_nifti(_flat_to_vol(delta_r2_t), output_path=delta_path, affine=affine)
         output_files["r2_glmdenoise"] = baseline_path
         output_files["r2_delta"] = delta_path
         print(f"  Saved: {baseline_path}")

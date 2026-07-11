@@ -643,7 +643,8 @@ def main(argv: list[str] | None = None) -> int:
         fmt = args.movie_format or ("mp4" if _find_ffmpeg() else "gif")
         frames = result.flow_movie(max_mag=args.flow_max)
         movie_path = f"{stem}_flow.{fmt}"
-        actual = _write_movie(frames, movie_path, args.fps, fmt)
+        with spinner(f"Writing {Path(movie_path).name}"):
+            actual = _write_movie(frames, movie_path, args.fps, fmt)
         print(f"  • flow movie (circular-phase wheel): {actual}")
 
     print("✅ ffs_locomoco complete.")

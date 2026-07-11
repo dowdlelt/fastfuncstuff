@@ -38,6 +38,7 @@ import torch
 
 from fastfuncstuff.cli.design_spec import _do_compile as _design_spec_compile
 from fastfuncstuff.cli.design_spec import _resolve_spec_path
+from fastfuncstuff.cli_utils import spinner
 from fastfuncstuff.design.spec import load_spec, resolve_contrast
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.io.afni import load_nifti, read_afni_design_matrix
@@ -579,7 +580,8 @@ def _save_bucket(
         if ext.get_code() != 4
     ]
     new_img.header.extensions.append(_afni_bucket_extension(labels, stataux))
-    nib.save(new_img, str(out_path))
+    with spinner(f"Writing {out_path.name}"):
+        nib.save(new_img, str(out_path))
 
 
 def main() -> int:
@@ -681,7 +683,8 @@ def main() -> int:
     else:
         if args.verb >= 1:
             print(f"📥 Reading Rvar : {args.rvar}", flush=True)
-        rvar = load_nifti(args.rvar).get_fdata(dtype=np.float32)
+        with spinner(f"Loading {Path(args.rvar).name}"):
+            rvar = load_nifti(args.rvar).get_fdata(dtype=np.float32)
         if rvar.shape[-1] < 4:
             print(f"ERROR: Rvar has {rvar.shape[-1]} sub-bricks; expected ≥4 "
                   "(a, b, lambda, StDev).", file=sys.stderr)
@@ -692,8 +695,9 @@ def main() -> int:
 
     if args.verb >= 1:
         print(f"📥 Reading stats: {args.stats}", flush=True)
-    stats_img = load_nifti(args.stats)
-    stats_data = stats_img.get_fdata(dtype=np.float32)
+    with spinner(f"Loading {Path(args.stats).name}"):
+        stats_img = load_nifti(args.stats)
+        stats_data = stats_img.get_fdata(dtype=np.float32)
     stats_labels = _read_brick_labels(stats_img)
     if not stats_labels:
         print("ERROR: stats bucket has no AFNI sub-brick labels; "
@@ -720,7 +724,8 @@ def main() -> int:
 
     # ── 5) Mask ─────────────────────────────────────────────────────────
     if args.mask:
-        mask = load_nifti(args.mask).get_fdata().astype(bool)
+        with spinner(f"Loading {Path(args.mask).name}"):
+            mask = load_nifti(args.mask).get_fdata().astype(bool)
     elif args.ols:
         # OLS: any voxel with at least one finite β / t pair we can derive
         # σ² from. Refined further below once we pick a reference stim.

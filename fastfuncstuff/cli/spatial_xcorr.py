@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -297,6 +298,7 @@ def _make_plot(
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
+    from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.processing.io import load_image
     from fastfuncstuff.stats.spatial import (
         consistency_report,
@@ -317,8 +319,10 @@ def main(argv: list[str] | None = None) -> None:
     thresholds = tuple(float(x) for x in args.thresholds.split(","))
 
     # Load inputs
-    images_a, _ = load_image(args.a, device=torch.device("cpu"))
-    images_b, _ = load_image(args.b, device=torch.device("cpu"))
+    with spinner(f"Loading {Path(args.a).name}"):
+        images_a, _ = load_image(args.a, device=torch.device("cpu"))
+    with spinner(f"Loading {Path(args.b).name}"):
+        images_b, _ = load_image(args.b, device=torch.device("cpu"))
 
     if images_a.ndim == 3:
         images_a = images_a.unsqueeze(0)
@@ -365,7 +369,8 @@ def main(argv: list[str] | None = None) -> None:
 
     # Save matrix
     if args.save_matrix:
-        np.savetxt(args.save_matrix, corr_matrix, fmt="%.6f", delimiter="\t")
+        with spinner(f"Writing {Path(args.save_matrix).name}"):
+            np.savetxt(args.save_matrix, corr_matrix, fmt="%.6f", delimiter="\t")
         print(f"\nMatrix saved: {args.save_matrix}")
 
     # Plot

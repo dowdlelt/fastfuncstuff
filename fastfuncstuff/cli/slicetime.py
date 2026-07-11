@@ -16,7 +16,7 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.io.afni import get_tr_from_file
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.slicetime import (
@@ -204,7 +204,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"slicetime: device={device}, method={args.method}")
 
     t0 = time.time()
-    vol, header = load_image(args.input, device=device)
+    with spinner(f"Loading {Path(args.input).name}"):
+        vol, header = load_image(args.input, device=device)
 
     if vol.ndim != 4:
         raise ValueError(f"Expected 4D input, got {vol.ndim}D with shape {vol.shape}")
@@ -266,7 +267,8 @@ def main(argv: list[str] | None = None) -> None:
         header["header"]["pixdim"][4] = output_tr
 
     # Save
-    save_image(corrected, args.prefix, header_info=header)
+    with spinner(f"Writing {Path(args.prefix).name}"):
+        save_image(corrected, args.prefix, header_info=header)
 
     if verb >= 1:
         print(f"Saved: {args.prefix}")

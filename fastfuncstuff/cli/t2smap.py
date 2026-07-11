@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, spinner
 from fastfuncstuff.processing import multiecho as me
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.utils import configure_torch_backends
@@ -170,7 +171,8 @@ def main(argv: list[str] | None = None) -> None:
 
     # Mask -> boolean (nz, ny, nx).
     if args.mask is not None:
-        mvol, _ = load_image(args.mask, device=device)
+        with spinner(f"Loading {Path(args.mask).name}"):
+            mvol, _ = load_image(args.mask, device=device)
         if mvol.ndim == 4:
             mvol = mvol[0]
         if tuple(mvol.shape) != tuple(spatial):
@@ -238,28 +240,29 @@ def main(argv: list[str] | None = None) -> None:
             brick_labels=labels,
         )
 
-    save(t2s_full / 1000.0, "T2starmap")  # ms -> seconds for storage
-    save(s0_full, "S0map")
-    save(t2s_lim / 1000.0, "desc-limited_T2starmap")
-    save(s0_lim, "desc-limited_S0map")
-    save(adaptive.to(torch.float32), "adaptive_mask")
+    with spinner("Writing core maps"):
+        save(t2s_full / 1000.0, "T2starmap")  # ms -> seconds for storage
+        save(s0_full, "S0map")
+        save(t2s_lim / 1000.0, "desc-limited_T2starmap")
+        save(s0_lim, "desc-limited_S0map")
+        save(adaptive.to(torch.float32), "adaptive_mask")
 
-    rmse = me.rmse_of_fit(data_cat, tes, adaptive, t2s_full, s0_full)
-    rmse = torch.nan_to_num(rmse, nan=0.0)
-    save(rmse, "rmse")
+        rmse = me.rmse_of_fit(data_cat, tes, adaptive, t2s_full, s0_full)
+        rmse = torch.nan_to_num(rmse, nan=0.0)
+        save(rmse, "rmse")
 
-    optcom = me.make_optcom(data_cat, tes, adaptive, t2s=t2s_full, combmode=args.combmode)
-    save(optcom, "desc-optcom_bold")
+        optcom = me.make_optcom(data_cat, tes, adaptive, t2s=t2s_full, combmode=args.combmode)
+        save(optcom, "desc-optcom_bold")
 
-    echo_labels = [f"echo-{i + 1}" for i in range(n_echos)]
-    if args.fittype == "curvefit" or args.fittype == "robust":
-        save(fit["failures"].to(torch.float32), "fit_failures")
-        if args.verbose_out:
-            save(fit["t2s_var"], "T2starvar")
-            save(fit["s0_var"], "S0var")
-            save(fit["t2s_s0_covar"], "T2star_S0_covar")
-    if args.fittype == "robust":
-        save(fit["echo_weight"], "echo_weight", labels=echo_labels)
+        echo_labels = [f"echo-{i + 1}" for i in range(n_echos)]
+        if args.fittype == "curvefit" or args.fittype == "robust":
+            save(fit["failures"].to(torch.float32), "fit_failures")
+            if args.verbose_out:
+                save(fit["t2s_var"], "T2starvar")
+                save(fit["s0_var"], "S0var")
+                save(fit["t2s_s0_covar"], "T2star_S0_covar")
+        if args.fittype == "robust":
+            save(fit["echo_weight"], "echo_weight", labels=echo_labels)
 
     # --- Leave-one-echo-out QC ---
     if not args.no_qc:

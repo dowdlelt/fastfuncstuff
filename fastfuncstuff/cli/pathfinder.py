@@ -63,6 +63,7 @@ try:
         parse_cv_strategy,
         parse_input_files,
         parse_prefix,
+        spinner,
     )
     from fastfuncstuff.denoise.sequential import (
         extract_noise_pcs_per_run,
@@ -1138,14 +1139,15 @@ def save_pathfinder_results(
             results.initial_results.voxel_mask = voxel_mask
 
         initial_stats_path = f"{output_prefix}_initial_stats{nii_ext}"
-        write_glm_bucket_as_nifti(
-            results.initial_results,
-            initial_stats_path,
-            condition_names=condition_labels,
-            volume_shape=volume_shape,
-            affine=affine,
-            apply_afni_metadata=True,
-        )
+        with spinner(f"Writing {Path(initial_stats_path).name}"):
+            write_glm_bucket_as_nifti(
+                results.initial_results,
+                initial_stats_path,
+                condition_names=condition_labels,
+                volume_shape=volume_shape,
+                affine=affine,
+                apply_afni_metadata=True,
+            )
         output_files["initial_stats"] = initial_stats_path
 
         # Also save initial R² (full-fit, not xval)
@@ -1166,14 +1168,15 @@ def save_pathfinder_results(
             results.final_results.voxel_mask = voxel_mask
 
         final_stats_path = f"{output_prefix}_final_stats{nii_ext}"
-        write_glm_bucket_as_nifti(
-            results.final_results,
-            final_stats_path,
-            condition_names=condition_labels,
-            volume_shape=volume_shape,
-            affine=affine,
-            apply_afni_metadata=True,
-        )
+        with spinner(f"Writing {Path(final_stats_path).name}"):
+            write_glm_bucket_as_nifti(
+                results.final_results,
+                final_stats_path,
+                condition_names=condition_labels,
+                volume_shape=volume_shape,
+                affine=affine,
+                apply_afni_metadata=True,
+            )
         output_files["final_stats"] = final_stats_path
 
         # Also save final R² (full-fit, not xval)
@@ -1221,19 +1224,21 @@ def save_pathfinder_results(
             all_hrfs_vols.append(vol)
         all_hrfs_4d = np.stack(all_hrfs_vols, axis=-1)
         all_hrfs_path = f"{output_prefix}_xval_r2_all_hrfs{nii_ext}"
-        save_nifti(all_hrfs_4d.astype(np.float32), output_path=all_hrfs_path, affine=affine)
+        with spinner(f"Writing {Path(all_hrfs_path).name}"):
+            save_nifti(all_hrfs_4d.astype(np.float32), output_path=all_hrfs_path, affine=affine)
         output_files["xval_r2_all_hrfs"] = all_hrfs_path
 
     # 6. Noise PCs
     if results.noise_pcs_per_run:
         pcs_path = f"{output_prefix}_noise_pcs.pt"
-        torch.save(
-            {
-                "noise_pcs_per_run": results.noise_pcs_per_run,
-                "optimal_n_pcs": results.optimal_n_pcs,
-            },
-            pcs_path,
-        )
+        with spinner(f"Writing {Path(pcs_path).name}"):
+            torch.save(
+                {
+                    "noise_pcs_per_run": results.noise_pcs_per_run,
+                    "optimal_n_pcs": results.optimal_n_pcs,
+                },
+                pcs_path,
+            )
         output_files["noise_pcs"] = pcs_path
 
     # 7. Optimization curve (HRF x PC)

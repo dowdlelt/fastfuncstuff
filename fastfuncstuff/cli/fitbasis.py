@@ -1827,12 +1827,17 @@ def main() -> int:
     print(f"  Wrote {basis_path}")
 
     # R² volumes (constrained + unconstrained)
-    for arr, sfx in ((fit.r2, ""), (fit.r2_ols, "_unconstrained")):
-        path = f"{args.prefix}_fitbasis_r2{sfx}{nii_ext}"
-        save_nifti(
-            _to_volume(arr[:, None]).squeeze(-1), output_path=path, reference_img=args.input[0]
-        )
-        print(f"  Wrote {path}")
+    from fastfuncstuff.cli_utils import spinner
+
+    with spinner("Writing R² maps"):
+        for arr, sfx in ((fit.r2, ""), (fit.r2_ols, "_unconstrained")):
+            path = f"{args.prefix}_fitbasis_r2{sfx}{nii_ext}"
+            save_nifti(
+                _to_volume(arr[:, None]).squeeze(-1),
+                output_path=path,
+                reference_img=args.input[0],
+            )
+            print(f"  Wrote {path}")
 
     # ── Cross-validated R² (held-out) ──────────────────────────────
     # Per the user's choice of -reg + -prior-weight, do LORO with
@@ -1870,11 +1875,12 @@ def main() -> int:
                 verbose=args.verb >= 1,
             )
             xval_path = f"{args.prefix}_fitbasis_xvalr2{nii_ext}"
-            save_nifti(
-                _to_volume(xval_r2[:, None]).squeeze(-1),
-                output_path=xval_path,
-                reference_img=args.input[0],
-            )
+            with spinner(f"Writing {Path(xval_path).name}"):
+                save_nifti(
+                    _to_volume(xval_r2[:, None]).squeeze(-1),
+                    output_path=xval_path,
+                    reference_img=args.input[0],
+                )
             print(
                 f"  Wrote {xval_path}  "
                 f"(median={float(np.median(xval_r2)):.3f}, "
@@ -2021,7 +2027,8 @@ def main() -> int:
         else:
             optfrac_3d = fr.optimal_fracs.reshape(volume_shape)
         of_path = f"{args.prefix}_fitbasis_optimal_frac{nii_ext}"
-        save_nifti(optfrac_3d, output_path=of_path, reference_img=args.input[0])
+        with spinner(f"Writing {Path(of_path).name}"):
+            save_nifti(optfrac_3d, output_path=of_path, reference_img=args.input[0])
         print(f"  Wrote {of_path}")
 
         if args.cv_runs:
@@ -2032,7 +2039,8 @@ def main() -> int:
             else:
                 r2_4d = fr.r2_by_frac.reshape(r2_4d_shape)
             r2_path = f"{args.prefix}_fitbasis_cv_r2_per_frac{nii_ext}"
-            save_nifti(r2_4d, output_path=r2_path, reference_img=args.input[0])
+            with spinner(f"Writing {Path(r2_path).name}"):
+                save_nifti(r2_4d, output_path=r2_path, reference_img=args.input[0])
             print(f"  Wrote {r2_path}  (4-D; volume k = held-out R² at fracs[k])")
 
     if args.cv_runs and args.reg != "fracridge":
@@ -2126,9 +2134,12 @@ def main() -> int:
             else:
                 argmax_3d = cv_result.argmax_weight_idx.reshape(volume_shape)
             argmax_path = f"{args.prefix}_fitbasis_cv_argmax{nii_ext}"
-            save_nifti(
-                argmax_3d.astype(np.float32), output_path=argmax_path, reference_img=args.input[0]
-            )
+            with spinner(f"Writing {Path(argmax_path).name}"):
+                save_nifti(
+                    argmax_3d.astype(np.float32),
+                    output_path=argmax_path,
+                    reference_img=args.input[0],
+                )
             print(f"  Wrote {argmax_path}  (int → index into weights list above)")
 
             # Per-weight R² 4-D NIfTI (one volume per weight in the grid).
@@ -2139,7 +2150,8 @@ def main() -> int:
             else:
                 r2_4d = cv_result.r2_per_weight.reshape(r2_4d_shape)
             r2_4d_path = f"{args.prefix}_fitbasis_cv_r2_per_weight{nii_ext}"
-            save_nifti(r2_4d, output_path=r2_4d_path, reference_img=args.input[0])
+            with spinner(f"Writing {Path(r2_4d_path).name}"):
+                save_nifti(r2_4d, output_path=r2_4d_path, reference_img=args.input[0])
             print(f"  Wrote {r2_4d_path}  (4-D; volume k = held-out R² at weights[k])")
 
     # ── Metadata sidecar ────────────────────────────────────────────
@@ -2179,7 +2191,8 @@ def main() -> int:
         else:
             ab_vol = arma_ab_per_voxel.reshape(volume_shape + (2,))
         ab_path = f"{args.prefix}_fitbasis_arma_ab{nii_ext}"
-        save_nifti(ab_vol, output_path=ab_path, reference_img=args.input[0])
+        with spinner(f"Writing {Path(ab_path).name}"):
+            save_nifti(ab_vol, output_path=ab_path, reference_img=args.input[0])
         print(f"  Wrote {ab_path}  (4-D: sub-brick 0=a, 1=b)")
         metadata["arma11_per_voxel"] = {
             "median_a": float(np.median(arma_ab_per_voxel[:, 0])),

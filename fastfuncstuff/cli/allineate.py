@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.processing.affine import (
     apply_affine,
     apply_affine_wsinc5,
@@ -333,8 +334,10 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Load images ---
     t0 = time.time()
-    base, base_header = load_image(args.base, device=device)
-    source, source_header = load_image(args.source, device=device)
+    with spinner(f"Loading {Path(args.base).name}"):
+        base, base_header = load_image(args.base, device=device)
+    with spinner(f"Loading {Path(args.source).name}"):
+        source, source_header = load_image(args.source, device=device)
 
     # Handle 4D base
     if base.ndim == 4:
@@ -372,7 +375,8 @@ def main(argv: list[str] | None = None) -> None:
             warped = apply_affine_wsinc5(source, matrix, base.shape)
         else:
             warped = apply_affine(source, matrix, base.shape, zero_outside=True)
-        save_image(warped, args.prefix, header_info=base_header)
+        with spinner(f"Writing {Path(args.prefix).name}"):
+            save_image(warped, args.prefix, header_info=base_header)
         if verb >= 1:
             print(f"Saved: {args.prefix}")
         return
@@ -471,7 +475,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Alignment time: {time.time() - t1:.2f}s")
 
     # --- Save outputs ---
-    save_image(warped, args.prefix, header_info=base_header)
+    with spinner(f"Writing {Path(args.prefix).name}"):
+        save_image(warped, args.prefix, header_info=base_header)
     if verb >= 1:
         print(f"Saved: {args.prefix}")
 
@@ -498,14 +503,16 @@ def main(argv: list[str] | None = None) -> None:
                 vol = apply_affine(source_4d[t], matrix, base.shape, zero_outside=True)
             aligned_vols.append(vol)
         result_4d = torch.stack(aligned_vols)
-        save_image(result_4d, args.prefix, header_info=base_header)
+        with spinner(f"Writing {Path(args.prefix).name}"):
+            save_image(result_4d, args.prefix, header_info=base_header)
         if verb >= 1:
             print(f"Saved 4D result: {args.prefix}")
 
         if args.save_mean:
             mean_path = derive_mean_output_path(args.prefix)
             mean_image = result_4d.mean(dim=0)
-            save_image(mean_image, mean_path, header_info=base_header)
+            with spinner(f"Writing {Path(mean_path).name}"):
+                save_image(mean_image, mean_path, header_info=base_header)
             if verb >= 1:
                 print(f"Saved mean: {mean_path}")
     elif args.save_mean and verb >= 1:

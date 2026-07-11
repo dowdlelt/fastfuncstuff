@@ -1315,18 +1315,21 @@ def main():
         # ── Save R² volumes ─────────────────────────────────────────
         # Two maps: constrained (the published one) and unconstrained
         # (so the user can see *where the prior changed the fit*).
-        for r2_arr, suffix in (
-            (fit.r2, ""),
-            (fit.r2_ols, "_unconstrained"),
-        ):
-            r2_path = f"{args.prefix}_flobs_r2{suffix}{_nii_ext}"
-            save_nifti(
-                _to_volume(r2_arr[:, None], 0).squeeze(-1),
-                output_path=r2_path,
-                reference_img=args.input[0],
-            )
-            if args.verb >= 1:
-                print(f"  Wrote {r2_path}")
+        from fastfuncstuff.cli_utils import spinner
+
+        with spinner("Writing FLOBS R² maps"):
+            for r2_arr, suffix in (
+                (fit.r2, ""),
+                (fit.r2_ols, "_unconstrained"),
+            ):
+                r2_path = f"{args.prefix}_flobs_r2{suffix}{_nii_ext}"
+                save_nifti(
+                    _to_volume(r2_arr[:, None], 0).squeeze(-1),
+                    output_path=r2_path,
+                    reference_img=args.input[0],
+                )
+                if args.verb >= 1:
+                    print(f"  Wrote {r2_path}")
 
         # ── Per-condition iresp (reconstructed HRF) — BOTH fits ────
         if args.flobs_save_iresp:
@@ -1584,7 +1587,10 @@ def main():
         r2_bw_vol[vox_idx] = r2_matrix.T
         r2_bw_vol = r2_bw_vol.reshape(nx, ny, nz, len(_pv_tops))
         r2_bw_file = f"{args.prefix}_r2_by_window{_nii_ext}"
-        save_nifti(r2_bw_vol, r2_bw_file, reference_img=args.input[0])
+        from fastfuncstuff.cli_utils import spinner
+
+        with spinner(f"Writing {Path(r2_bw_file).name}"):
+            save_nifti(r2_bw_vol, r2_bw_file, reference_img=args.input[0])
         del r2_bw_vol
         if args.verb >= 1:
             print(f"  Saved: {r2_bw_file}")
@@ -1594,7 +1600,8 @@ def main():
         ws_vol[vox_idx] = best_top_per_vox
         ws_vol = ws_vol.reshape(nx, ny, nz)
         ws_file = f"{args.prefix}_windowsize{_nii_ext}"
-        save_nifti(ws_vol, ws_file, reference_img=args.input[0])
+        with spinner(f"Writing {Path(ws_file).name}"):
+            save_nifti(ws_vol, ws_file, reference_img=args.input[0])
         del ws_vol
         if args.verb >= 1:
             print(f"  Saved: {ws_file}")
@@ -2133,7 +2140,10 @@ def main():
 
         # Save as 4D NIfTI
         beta_file = f"{args.prefix}_betas{_nii_ext}"
-        save_nifti(betas_4d, beta_file, reference_img=args.input[0])
+        from fastfuncstuff.cli_utils import spinner
+
+        with spinner(f"Writing {Path(beta_file).name}"):
+            save_nifti(betas_4d, beta_file, reference_img=args.input[0])
 
         if args.verb >= 1:
             print(f"  ✓ {beta_file}")

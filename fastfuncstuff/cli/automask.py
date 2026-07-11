@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.mask import automask
 
@@ -72,7 +73,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"automask: device={device}")
 
     t0 = time.time()
-    vol, header = load_image(args.input, device=device)
+    with spinner(f"Loading {Path(args.input).name}"):
+        vol, header = load_image(args.input, device=device)
 
     # Handle 4D: use first volume
     if vol.ndim == 4:
@@ -95,7 +97,8 @@ def main(argv: list[str] | None = None) -> None:
 
     # Save as short integer (0/1)
     mask_out = mask.short()
-    save_image(mask_out, args.prefix, header_info=header)
+    with spinner(f"Writing {Path(args.prefix).name}"):
+        save_image(mask_out, args.prefix, header_info=header)
 
     if verb >= 1:
         n_vox = int(mask.sum().item())

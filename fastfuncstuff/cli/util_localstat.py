@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.stats.localstat import (
     ACF_LABELS,
@@ -100,7 +101,8 @@ def main(argv: list[str] | None = None) -> None:
     verb = args.verb
     t0 = time.time()
 
-    data, header = load_image(args.input, device=device)
+    with spinner(f"Loading {Path(args.input).name}"):
+        data, header = load_image(args.input, device=device)
     if stat == "ACF" and data.ndim != 4:
         raise SystemExit(f"ACF needs a 4D time series; got shape {tuple(data.shape)}.")
     if data.ndim not in (3, 4):
@@ -113,7 +115,8 @@ def main(argv: list[str] | None = None) -> None:
 
     mask = None
     if args.mask is not None:
-        mvol, _ = load_image(args.mask, device=device)
+        with spinner(f"Loading {Path(args.mask).name}"):
+            mvol, _ = load_image(args.mask, device=device)
         if mvol.ndim == 4:
             mvol = mvol[0]
         if tuple(mvol.shape) != (nz, ny, nx):
@@ -155,7 +158,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         labels = FWHM_LABELS
 
-    save_image(out, args.prefix, header_info=header, brick_labels=list(labels))
+    with spinner(f"Writing {Path(args.prefix).name}"):
+        save_image(out, args.prefix, header_info=header, brick_labels=list(labels))
 
     if verb >= 1:
         print(f"  brick labels: {', '.join(labels)}")

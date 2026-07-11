@@ -58,6 +58,7 @@ try:
         preflight_check,
         save_4d_nifti,
         save_volume_nifti,
+        spinner,
     )
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
     from fastfuncstuff.design.hrf import get_hrf_library
@@ -395,6 +396,7 @@ def main():
         sys.exit(1)
 
     from fastfuncstuff.cli_utils import clean_condition_labels
+
     print("Parsing onset metadata...")
     all_onsets_bids = None  # populated for BIDS path; AFNI path populates later
     condition_labels = []
@@ -402,10 +404,9 @@ def main():
 
     if _has_events:
         from fastfuncstuff.design.bids_events import parse_bids_events
+
         if len(args.events) != n_runs:
-            print(
-                f"ERROR: -events: {len(args.events)} files but {n_runs} input runs"
-            )
+            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs")
             sys.exit(1)
         event_cols = tuple(args.event_cols) if args.event_cols else None
         all_onsets_bids, durations, condition_labels = parse_bids_events(
@@ -522,6 +523,7 @@ def main():
     # Apply onset rounding (TR is now known from data load)
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
+
         all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
 
     # ========================================================================
@@ -917,11 +919,11 @@ def main():
 
                     # Linear voxel indices for this chunk — use directly, no 167k-element
                     # bool mask clone/zero/scatter/transfer needed
-                    chunk_voxel_idx = group_voxel_indices[gc0:gc1]          # CPU, (chunk,)
-                    chunk_voxel_idx_dev = chunk_voxel_idx.to(device)         # GPU, small
+                    chunk_voxel_idx = group_voxel_indices[gc0:gc1]  # CPU, (chunk,)
+                    chunk_voxel_idx_dev = chunk_voxel_idx.to(device)  # GPU, small
 
                     # Extract data using integer indexing
-                    chunk_data_clean = data_clean[chunk_voxel_idx]           # (chunk, n_timepoints)
+                    chunk_data_clean = data_clean[chunk_voxel_idx]  # (chunk, n_timepoints)
 
                     # Fit ridge for all fractions
                     chunk_coefs = _fit_ridge_multiple_fracs(
@@ -946,7 +948,7 @@ def main():
                         device=device,
                         verbose=False,
                     )
-                    r2_chunk = xval["r2"].T.to(device)               # (chunk, n_fracs)
+                    r2_chunk = xval["r2"].T.to(device)  # (chunk, n_fracs)
                     r2_by_frac[chunk_voxel_idx_dev] = r2_chunk
 
                     # Select best frac excluding frac=1.0 (last column)
@@ -1024,19 +1026,20 @@ def main():
         # Use save_single_trial_results for single-trial mode
         voxel_mask_tensor = torch.from_numpy(mask_flat) if mask is not None else None
 
-        save_single_trial_results(
-            betas=final_betas,
-            xval_r2=xval_r2,
-            trial_labels=trial_labels,
-            trial_condition_ids=trial_condition_ids,
-            trial_run_ids=trial_run_ids,
-            condition_labels=condition_labels,
-            output_prefix=str(args.prefix),
-            volume_shape=vol_shape,
-            affine=affine,
-            voxel_mask=voxel_mask_tensor,
-            xval_metric_name=cv_metric_token,
-        )
+        with spinner("Writing single-trial results"):
+            save_single_trial_results(
+                betas=final_betas,
+                xval_r2=xval_r2,
+                trial_labels=trial_labels,
+                trial_condition_ids=trial_condition_ids,
+                trial_run_ids=trial_run_ids,
+                condition_labels=condition_labels,
+                output_prefix=str(args.prefix),
+                volume_shape=vol_shape,
+                affine=affine,
+                voxel_mask=voxel_mask_tensor,
+                xval_metric_name=cv_metric_token,
+            )
 
         # Also save ridge-specific outputs
         voxel_mask_np = mask_flat if mask is not None else None

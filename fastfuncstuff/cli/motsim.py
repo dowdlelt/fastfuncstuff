@@ -8,10 +8,11 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.motsim import (
     automask_dilate,
@@ -110,7 +111,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ffs_motsim: device={device}")
 
     # Load reference
-    ref_data, header_info = load_image(args.base, device=torch.device("cpu"))
+    with spinner(f"Loading {Path(args.base).name}"):
+        ref_data, header_info = load_image(args.base, device=torch.device("cpu"))
     if ref_data.ndim == 4:
         if args.verb >= 1:
             print(f"Reference is 4D ({ref_data.shape[0]} vols), using mean")
@@ -143,7 +145,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Mask
     if args.mask:
-        mask_data, _ = load_image(args.mask, device=torch.device("cpu"))
+        with spinner(f"Loading {Path(args.mask).name}"):
+            mask_data, _ = load_image(args.mask, device=torch.device("cpu"))
         mask = mask_data > 0.5
     else:
         mask = automask_dilate(reference, dilate_voxels=args.dilate)
@@ -162,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
                                   interp=args.interp, verb=args.verb)
 
     if args.save_sim:
-        save_image(forward_sim, f"{prefix}_forward.nii.gz", header_info=header_info)
+        with spinner(f"Writing {Path(prefix).name}_forward.nii.gz"):
+            save_image(forward_sim, f"{prefix}_forward.nii.gz", header_info=header_info)
         if args.verb >= 1:
             print(f"Saved: {prefix}_forward.nii.gz")
 
@@ -174,8 +178,9 @@ def main(argv: list[str] | None = None) -> int:
             interp=args.interp, verb=args.verb,
         )
         if args.save_sim:
-            save_image(backward_sim, f"{prefix}_backward.nii.gz",
-                       header_info=header_info)
+            with spinner(f"Writing {Path(prefix).name}_backward.nii.gz"):
+                save_image(backward_sim, f"{prefix}_backward.nii.gz",
+                           header_info=header_info)
             if args.verb >= 1:
                 print(f"Saved: {prefix}_backward.nii.gz")
 

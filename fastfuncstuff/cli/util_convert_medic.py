@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import torch
 
-        from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix
+        from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix, spinner
         from fastfuncstuff.processing.medic import (
             PE_AXIS_MAP,
             field_to_displacement_pe,
@@ -163,9 +163,10 @@ def main(argv: list[str] | None = None) -> int:
     prefix_stem, nii_ext = pfx.stem, pfx.nifti_ext
     pe_axis = PE_AXIS_MAP[args.pe_dir]
 
-    img = cast(nib.Nifti1Image, nib.load(in_path))
-    affine = img.affine
-    data = np.asarray(img.dataobj, dtype=np.float32)
+    with spinner(f"Loading {Path(in_path).name}"):
+        img = cast(nib.Nifti1Image, nib.load(in_path))
+        affine = img.affine
+        data = np.asarray(img.dataobj, dtype=np.float32)
     if data.ndim == 3:
         data = data[..., None]
     if data.ndim != 4:

@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.processing.formwarp import (
     METRICS,
     NO_X_DISP,
@@ -60,47 +61,114 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-base", required=True, help="Fixed/target image (3D).")
     p.add_argument("-source", required=True, help="Moving image to deform (3D).")
     p.add_argument("-prefix", required=True, help="Output path for the warped image.")
-    p.add_argument("-save_warp", action="store_true",
-                   help="Save the moving->fixed warp ({prefix}_WARP.nii.gz).")
-    p.add_argument("-save_inverse", action="store_true",
-                   help="Save the fixed->moving inverse warp ({prefix}_WARPINV.nii.gz).")
-    p.add_argument("-save_halfway", action="store_true",
-                   help="Save the four SyN half-warps (mid<->fixed, mid<->moving).")
+    p.add_argument(
+        "-save_warp",
+        action="store_true",
+        help="Save the moving->fixed warp ({prefix}_WARP.nii.gz).",
+    )
+    p.add_argument(
+        "-save_inverse",
+        action="store_true",
+        help="Save the fixed->moving inverse warp ({prefix}_WARPINV.nii.gz).",
+    )
+    p.add_argument(
+        "-save_halfway",
+        action="store_true",
+        help="Save the four SyN half-warps (mid<->fixed, mid<->moving).",
+    )
 
     # Metric
-    p.add_argument("-metric", choices=METRICS, default="cc",
-                   help="Image metric (cc=neighborhood cross-correlation, the SyN default).")
-    p.add_argument("-cc_radius", "-cc-radius", type=int, default=4,
-                   help="CC neighborhood half-width in voxels (window (2r+1)^3).")
-    p.add_argument("-lpa_sigma", "-lpa-sigma", type=float, default=4.0,
-                   help="Neighborhood size (voxels) for the lpa/lpc metrics.")
-    p.add_argument("-lpa_kernel", "-lpa-kernel", choices=("gauss", "box"), default="gauss",
-                   help="Neighborhood kernel for lpa/lpc.")
+    p.add_argument(
+        "-metric",
+        choices=METRICS,
+        default="cc",
+        help="Image metric (cc=neighborhood cross-correlation, the SyN default).",
+    )
+    p.add_argument(
+        "-cc_radius",
+        "-cc-radius",
+        type=int,
+        default=4,
+        help="CC neighborhood half-width in voxels (window (2r+1)^3).",
+    )
+    p.add_argument(
+        "-lpa_sigma",
+        "-lpa-sigma",
+        type=float,
+        default=4.0,
+        help="Neighborhood size (voxels) for the lpa/lpc metrics.",
+    )
+    p.add_argument(
+        "-lpa_kernel",
+        "-lpa-kernel",
+        choices=("gauss", "box"),
+        default="gauss",
+        help="Neighborhood kernel for lpa/lpc.",
+    )
 
     # SyN regularization
-    p.add_argument("-grad_step", "-grad-step", type=float, default=0.25,
-                   help="Max per-iteration displacement in voxels (SyN gradientStep).")
-    p.add_argument("-update_var", "-update-var", type=float, default=3.0,
-                   help="Fluid regularization: update-field Gaussian sigma (voxels).")
-    p.add_argument("-total_var", "-total-var", type=float, default=0.0,
-                   help="Elastic regularization: total-field Gaussian sigma (voxels; 0=off).")
-    p.add_argument("-invert_iters", "-invert-iters", type=int, default=8,
-                   help="Fixed-point iterations for displacement-field inversion.")
+    p.add_argument(
+        "-grad_step",
+        "-grad-step",
+        type=float,
+        default=0.25,
+        help="Max per-iteration displacement in voxels (SyN gradientStep).",
+    )
+    p.add_argument(
+        "-update_var",
+        "-update-var",
+        type=float,
+        default=3.0,
+        help="Fluid regularization: update-field Gaussian sigma (voxels).",
+    )
+    p.add_argument(
+        "-total_var",
+        "-total-var",
+        type=float,
+        default=0.0,
+        help="Elastic regularization: total-field Gaussian sigma (voxels; 0=off).",
+    )
+    p.add_argument(
+        "-invert_iters",
+        "-invert-iters",
+        type=int,
+        default=8,
+        help="Fixed-point iterations for displacement-field inversion.",
+    )
 
     # Multiresolution (ANTs -f / -s / -c)
-    p.add_argument("-shrink", type=str, default="4x2x1",
-                   help="Per-level isotropic shrink factors, e.g. 4x2x1.")
-    p.add_argument("-smooth", type=str, default="2x1x0",
-                   help="Per-level Gaussian pre-smoothing sigmas in voxels, e.g. 2x1x0.")
-    p.add_argument("-iters", type=str, default="100x70x40",
-                   help="Per-level max iteration counts, e.g. 100x70x40 (an upper bound; "
-                        "a level usually stops earlier via convergence).")
-    p.add_argument("-conv_window", "-conv-window", type=int, default=10,
-                   help="Trailing-window size for convergence/early-stopping. <=0 disables "
-                        "early stopping (run the full -iters). The best-cost warp is always "
-                        "returned, so running to exhaustion never over-warps.")
-    p.add_argument("-conv_thresh", "-conv-thresh", type=float, default=1e-6,
-                   help="Convergence slope threshold; larger stops sooner.")
+    p.add_argument(
+        "-shrink", type=str, default="4x2x1", help="Per-level isotropic shrink factors, e.g. 4x2x1."
+    )
+    p.add_argument(
+        "-smooth",
+        type=str,
+        default="2x1x0",
+        help="Per-level Gaussian pre-smoothing sigmas in voxels, e.g. 2x1x0.",
+    )
+    p.add_argument(
+        "-iters",
+        type=str,
+        default="100x70x40",
+        help="Per-level max iteration counts, e.g. 100x70x40 (an upper bound; "
+        "a level usually stops earlier via convergence).",
+    )
+    p.add_argument(
+        "-conv_window",
+        "-conv-window",
+        type=int,
+        default=10,
+        help="Trailing-window size for convergence/early-stopping. <=0 disables "
+        "early stopping (run the full -iters). The best-cost warp is always "
+        "returned, so running to exhaustion never over-warps.",
+    )
+    p.add_argument(
+        "-conv_thresh",
+        "-conv-thresh",
+        type=float,
+        default=1e-6,
+        help="Convergence slope threshold; larger stops sooner.",
+    )
 
     # Axis constraints (match qwarp)
     p.add_argument("-noXdis", "-noxdis", action="store_true", help="No x-displacement.")
@@ -109,12 +177,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Weight / mask
     p.add_argument("-weight", help="Weight image emphasizing the metric (overrides automask).")
-    p.add_argument("-automask", action="store_true",
-                   help="Restrict the metric to an automask of the base.")
+    p.add_argument(
+        "-automask", action="store_true", help="Restrict the metric to an automask of the base."
+    )
 
     # Output interpolation
-    p.add_argument("-final_interp", "-final-interp", choices=WARP_INTERP_MODES,
-                   default="wsinc5", help="Interpolation for the final warped image.")
+    p.add_argument(
+        "-final_interp",
+        "-final-interp",
+        choices=WARP_INTERP_MODES,
+        default="wsinc5",
+        help="Interpolation for the final warped image.",
+    )
 
     # Device
     p.add_argument("-device", default=None, help="torch device (cuda/cpu/mps). Auto if unset.")
@@ -149,8 +223,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ffs_formwarp: device={device}")
 
     t0 = time.time()
-    base, base_info = load_image(args.base, device=torch.device("cpu"))
-    source, _ = load_image(args.source, device=torch.device("cpu"))
+    with spinner(f"Loading {Path(args.base).name}"):
+        base, base_info = load_image(args.base, device=torch.device("cpu"))
+    with spinner(f"Loading {Path(args.source).name}"):
+        source, _ = load_image(args.source, device=torch.device("cpu"))
 
     if base.ndim == 4:
         if args.verb >= 1:
@@ -162,8 +238,10 @@ def main(argv: list[str] | None = None) -> int:
         source = source[0]
 
     if tuple(base.shape) != tuple(source.shape):
-        print(f"ERROR: base {tuple(base.shape)} and source {tuple(source.shape)} "
-              "must be on the same grid (resample first, e.g. ffs_allineate).")
+        print(
+            f"ERROR: base {tuple(base.shape)} and source {tuple(source.shape)} "
+            "must be on the same grid (resample first, e.g. ffs_allineate)."
+        )
         return 1
 
     nz, ny, nx = base.shape
@@ -174,7 +252,8 @@ def main(argv: list[str] | None = None) -> int:
     weight = None
     mask = None
     if args.weight is not None:
-        weight, _ = load_image(args.weight, device=torch.device("cpu"))
+        with spinner(f"Loading {Path(args.weight).name}"):
+            weight, _ = load_image(args.weight, device=torch.device("cpu"))
     elif args.automask:
         mask = automask(base.float().to(device), device=device).float()
         if args.verb >= 1:
@@ -212,13 +291,23 @@ def main(argv: list[str] | None = None) -> int:
 
     prefix = _strip_ext(args.prefix)
     warped_path = args.prefix if args.prefix.endswith((".nii", ".nii.gz")) else f"{prefix}.nii.gz"
-    save_image(res.warped, warped_path, header_info=base_info)
+    with spinner(f"Writing {Path(warped_path).name}"):
+        save_image(res.warped, warped_path, header_info=base_info)
     if args.verb >= 1:
         print(f"Saved warped image: {warped_path}")
 
-    def _save_warp(triple: tuple[torch.Tensor, torch.Tensor, torch.Tensor], path: str, label: str) -> None:
-        save_warp_field(triple[0].cpu(), triple[1].cpu(), triple[2].cpu(),
-                        path, header_info=base_info, units="mm")
+    def _save_warp(
+        triple: tuple[torch.Tensor, torch.Tensor, torch.Tensor], path: str, label: str
+    ) -> None:
+        with spinner(f"Writing {Path(path).name}"):
+            save_warp_field(
+                triple[0].cpu(),
+                triple[1].cpu(),
+                triple[2].cpu(),
+                path,
+                header_info=base_info,
+                units="mm",
+            )
         if args.verb >= 1:
             print(f"Saved {label}: {path}")
 

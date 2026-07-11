@@ -78,7 +78,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
 from fastfuncstuff.decomposition.ica import (
     FastICA,
     ica_stability_analysis,
@@ -360,7 +360,8 @@ def main():
         print(f"Loading mask from: {args.mask}")
 
     try:
-        data = load_fmri_data(args.input, args.mask)
+        with spinner(f"Loading {Path(args.input).name}"):
+            data = load_fmri_data(args.input, args.mask)
         tr = get_tr_from_file(args.input)
     except Exception as e:
         print(f"Error loading data: {e}", file=sys.stderr)
@@ -396,16 +397,17 @@ def main():
         pca_labels = [f"PC_{i:03d}" for i in range(pca.n_components_)]
 
         try:
-            pca_files = save_decomposition_results(
-                components=pca.components_,
-                timeseries=pca_scores,
-                mask_file=args.mask,
-                output_prefix=f"{args.output}_pca",
-                reference_file=args.input,
-                labels=pca_labels,
-                method="PCA",
-                nii_ext=_nii_ext,
-            )
+            with spinner("Writing PCA results"):
+                pca_files = save_decomposition_results(
+                    components=pca.components_,
+                    timeseries=pca_scores,
+                    mask_file=args.mask,
+                    output_prefix=f"{args.output}_pca",
+                    reference_file=args.input,
+                    labels=pca_labels,
+                    method="PCA",
+                    nii_ext=_nii_ext,
+                )
 
             if args.verb >= 1:
                 print(f"    Maps: {pca_files['maps']}")
@@ -549,16 +551,17 @@ def main():
         ica_labels = [f"IC_{i:03d}" for i in range(ica.components_.shape[0])]
 
         try:
-            ica_files = save_decomposition_results(
-                components=ica.components_,
-                timeseries=ica_timeseries,
-                mask_file=args.mask,
-                output_prefix=f"{args.output}_ica",
-                reference_file=args.input,
-                labels=ica_labels,
-                method="ICA",
-                nii_ext=_nii_ext,
-            )
+            with spinner("Writing ICA results"):
+                ica_files = save_decomposition_results(
+                    components=ica.components_,
+                    timeseries=ica_timeseries,
+                    mask_file=args.mask,
+                    output_prefix=f"{args.output}_ica",
+                    reference_file=args.input,
+                    labels=ica_labels,
+                    method="ICA",
+                    nii_ext=_nii_ext,
+                )
 
             if args.verb >= 1:
                 print(f"    Maps: {ica_files['maps']}")
@@ -840,16 +843,17 @@ def main():
         icasso_labels = [f"ICASSO_{i:03d}" for i in range(n_stable)]
 
         try:
-            icasso_files = save_decomposition_results(
-                components=stable_components,
-                timeseries=stable_mixing,
-                mask_file=args.mask,
-                output_prefix=f"{args.output}_icasso",
-                reference_file=args.input,
-                labels=icasso_labels,
-                method="ICASSO",
-                nii_ext=_nii_ext,
-            )
+            with spinner("Writing ICASSO results"):
+                icasso_files = save_decomposition_results(
+                    components=stable_components,
+                    timeseries=stable_mixing,
+                    mask_file=args.mask,
+                    output_prefix=f"{args.output}_icasso",
+                    reference_file=args.input,
+                    labels=icasso_labels,
+                    method="ICASSO",
+                    nii_ext=_nii_ext,
+                )
 
             # Determine how many actually met threshold
             n_met_threshold = (all_stability >= args.min_stability).sum()

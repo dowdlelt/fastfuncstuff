@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 try:
-    from fastfuncstuff.cli_utils import parse_input_files, parse_prefix
+    from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, spinner
     from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
     from fastfuncstuff.io.afni import extract_design_metadata, load_nifti, read_afni_design_matrix
     from fastfuncstuff.utils import configure_torch_backends, get_device
@@ -303,11 +303,12 @@ def main():
     affine = first_img.affine  # type: ignore[attr-defined]
 
     if len(input_files) == 1:
-        data_np = first_img.get_fdata()  # type: ignore[attr-defined]
+        with spinner(f"Loading {Path(input_files[0]).name}"):
+            data_np = first_img.get_fdata()  # type: ignore[attr-defined]
 
-        # Reshape to (n_voxels, n_timepoints)
-        data_np = data_np.reshape(-1, data_np.shape[-1])
-        data = torch.from_numpy(data_np).float()
+            # Reshape to (n_voxels, n_timepoints)
+            data_np = data_np.reshape(-1, data_np.shape[-1])
+            data = torch.from_numpy(data_np).float()
     else:
         # Multiple runs - use existing loader
         from fastfuncstuff.io.afni import load_and_concatenate_runs as load_runs
@@ -389,7 +390,8 @@ def main():
         else:
             data_vol = data_1d.cpu().numpy().reshape(volume_shape)
 
-        save_nifti(data_vol, output_path=filename, affine=affine)
+        with spinner(f"Writing {Path(filename).name}"):
+            save_nifti(data_vol, output_path=filename, affine=affine)
         print(f"  • {description}: {filename}")
 
     # Save single R² map (GLMdenoise-style: from concatenated predictions)

@@ -46,6 +46,7 @@ try:
         parse_input_files,
         parse_prefix,
         print_cli_header,
+        spinner,
     )
     from fastfuncstuff.decomposition import (
         io as decomposition_io,
@@ -2010,13 +2011,15 @@ def _run_concat_ica(
         torch.cuda.empty_cache()
 
     # Spatial maps
-    decomposition_io.save_masked_component_maps_4d(
-        components_kv=comp_np,
-        mask3d=mask3d,
-        shape3d=shape3d,
-        affine=affine,
-        out_file=Path(f"{out_prefix}_concat_ica_maps{nii_ext}"),
-    )
+    _maps_out_file = Path(f"{out_prefix}_concat_ica_maps{nii_ext}")
+    with spinner(f"Writing {_maps_out_file.name}"):
+        decomposition_io.save_masked_component_maps_4d(
+            components_kv=comp_np,
+            mask3d=mask3d,
+            shape3d=shape3d,
+            affine=affine,
+            out_file=_maps_out_file,
+        )
     _vprint(args.verb >= 1, f"Maps: {out_prefix}_concat_ica_maps{nii_ext}", t_step)
 
     # Timecourses (concatenated, (T_total, k))
@@ -2543,13 +2546,14 @@ def _run_temporal_ica(
 
     # Group tICA spatial maps (shared across runs) + concatenated timecourses.
     maps_file = Path(f"{out_prefix}_temporalica_maps{nii_ext}")
-    decomposition_io.save_masked_component_maps_4d(
-        components_kv=result.spatial_maps,
-        mask3d=mask3d,
-        shape3d=shape3d,
-        affine=affine,
-        out_file=maps_file,
-    )
+    with spinner(f"Writing {maps_file.name}"):
+        decomposition_io.save_masked_component_maps_4d(
+            components_kv=result.spatial_maps,
+            mask3d=mask3d,
+            shape3d=shape3d,
+            affine=affine,
+            out_file=maps_file,
+        )
     decomposition_io.save_timeseries(
         result.temporal_sources.T,  # (T_total, K_tica)
         f"{out_prefix}_temporalica_timecourses.1D",
@@ -2557,13 +2561,15 @@ def _run_temporal_ica(
         labels=labels,
     )
     # Stage-1 spatial basis, saved for inspection.
-    decomposition_io.save_masked_component_maps_4d(
-        components_kv=result.group_spatial_maps,
-        mask3d=mask3d,
-        shape3d=shape3d,
-        affine=affine,
-        out_file=Path(f"{out_prefix}_temporalica_sica_maps{nii_ext}"),
-    )
+    _sica_maps_file = Path(f"{out_prefix}_temporalica_sica_maps{nii_ext}")
+    with spinner(f"Writing {_sica_maps_file.name}"):
+        decomposition_io.save_masked_component_maps_4d(
+            components_kv=result.group_spatial_maps,
+            mask3d=mask3d,
+            shape3d=shape3d,
+            affine=affine,
+            out_file=_sica_maps_file,
+        )
 
     # Optional GGM z-maps so thresholded viewing matches the single-run tool.
     z_maps = None
@@ -3129,13 +3135,15 @@ def _run_tensorial_ica(
         [comp_np[:, ri * n_vox_masked : (ri + 1) * n_vox_masked] for ri in range(n_runs)],
         axis=0,
     ).mean(axis=0)
-    decomposition_io.save_masked_component_maps_4d(
-        components_kv=avg_maps,
-        mask3d=mask3d,
-        shape3d=shape3d,
-        affine=affine,
-        out_file=Path(f"{out_prefix}_tensor_ica_maps_mean{nii_ext}"),
-    )
+    _avg_maps_out_file = Path(f"{out_prefix}_tensor_ica_maps_mean{nii_ext}")
+    with spinner(f"Writing {_avg_maps_out_file.name}"):
+        decomposition_io.save_masked_component_maps_4d(
+            components_kv=avg_maps,
+            mask3d=mask3d,
+            shape3d=shape3d,
+            affine=affine,
+            out_file=_avg_maps_out_file,
+        )
 
     # Temporal mean image (cross-run mean underlay), the same full-volume mean
     # the temp_concat path emits via its MELODIC-compat output. Distinct from
@@ -3143,7 +3151,8 @@ def _run_tensorial_ica(
     from fastfuncstuff.io.afni import save_nifti
 
     mean_image_path = f"{out_prefix}_tensor_mean{nii_ext}"
-    save_nifti(mean3d.astype(np.float32), output_path=Path(mean_image_path), affine=affine)
+    with spinner(f"Writing {Path(mean_image_path).name}"):
+        save_nifti(mean3d.astype(np.float32), output_path=Path(mean_image_path), affine=affine)
     _vprint(args.verb >= 1, f"Mean image: {mean_image_path}")
 
     # Shared timecourses

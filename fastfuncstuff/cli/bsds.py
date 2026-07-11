@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
 
-from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, print_cli_header
+from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, print_cli_header, spinner
 from fastfuncstuff.dynamics.bsds.model import fit_bsds, posterior_arrays
 from fastfuncstuff.dynamics.graph import state_graph_metrics
 from fastfuncstuff.dynamics.parcellate import (
@@ -99,10 +99,12 @@ def _load_sessions(args) -> tuple[list[np.ndarray], np.ndarray | None]:
     if args.parcellation == "atlas":
         if not args.atlas:
             raise SystemExit("-parcellation atlas requires -atlas LABEL_IMAGE")
-        atlas_vol = _load_volume(args.atlas)
+        with spinner(f"Loading {Path(args.atlas).name}"):
+            atlas_vol = _load_volume(args.atlas)
         atlas3d = (atlas_vol[..., 0] if atlas_vol.ndim == 4 else atlas_vol).astype(np.int64)
     if args.mask:
-        mask_vol = _load_volume(args.mask)
+        with spinner(f"Loading {Path(args.mask).name}"):
+            mask_vol = _load_volume(args.mask)
         mask3d = (mask_vol[..., 0] if mask_vol.ndim == 4 else mask_vol) > 0
 
     for path in tqdm(paths, desc="load runs", leave=True, disable=len(paths) < 4):
@@ -540,25 +542,28 @@ def _save_outputs(
     base.parent.mkdir(parents=True, exist_ok=True)
     k = model.n_states
 
-    np.savez(
-        f"{stem}_model.npz",
-        # Model + variational posterior (decode-ready; read back by load_bsds_model).
-        **posterior_arrays(model),
-        state_fc=stats.state_fc.numpy(),
-        directed_connectivity=(np.array([]) if directed is None else directed.cpu().numpy()),
-        group_occupancy=stats.group_occupancy,
-        group_lifetime=stats.group_lifetime,
-        subject_occupancy=stats.subject_occupancy,
-        subject_lifetime=stats.subject_lifetime,
-        graph_strength=np.array([]) if graph is None else graph.strength,
-        graph_clustering=np.array([]) if graph is None else graph.clustering,
-        graph_betweenness=np.array([]) if graph is None else graph.betweenness,
-        graph_nodal_efficiency=np.array([]) if graph is None else graph.nodal_efficiency,
-        graph_global_efficiency=np.array([]) if graph is None else graph.global_efficiency,
-        switch_rate_group=np.array([]) if switch is None else np.array(switch.group_switch_rate),
-        switch_rate_subject=np.array([]) if switch is None else switch.subject_switch_rate,
-        parcel_labels=np.array([]) if labels is None else np.asarray(labels),
-    )
+    with spinner(f"Writing {stem}_model.npz"):
+        np.savez(
+            f"{stem}_model.npz",
+            # Model + variational posterior (decode-ready; read back by load_bsds_model).
+            **posterior_arrays(model),
+            state_fc=stats.state_fc.numpy(),
+            directed_connectivity=(np.array([]) if directed is None else directed.cpu().numpy()),
+            group_occupancy=stats.group_occupancy,
+            group_lifetime=stats.group_lifetime,
+            subject_occupancy=stats.subject_occupancy,
+            subject_lifetime=stats.subject_lifetime,
+            graph_strength=np.array([]) if graph is None else graph.strength,
+            graph_clustering=np.array([]) if graph is None else graph.clustering,
+            graph_betweenness=np.array([]) if graph is None else graph.betweenness,
+            graph_nodal_efficiency=np.array([]) if graph is None else graph.nodal_efficiency,
+            graph_global_efficiency=np.array([]) if graph is None else graph.global_efficiency,
+            switch_rate_group=np.array([])
+            if switch is None
+            else np.array(switch.group_switch_rate),
+            switch_rate_subject=np.array([]) if switch is None else switch.subject_switch_rate,
+            parcel_labels=np.array([]) if labels is None else np.asarray(labels),
+        )
     if switch is not None:
         with open(f"{stem}_switch_paths.txt", "w") as fh:
             fh.write("# count\tpath\n")
@@ -633,7 +638,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"{mp}: {m.shape[0]} motion rows but the run has {s.shape[1]} timepoints"
                 )
             motion.append(m)
-        print(f"  projecting out motion: {motion[0].shape[1]} column(s)/run, per-run (block-diagonal)")
+        print(
+            f"  projecting out motion: {motion[0].shape[1]} column(s)/run, per-run (block-diagonal)"
+        )
 
     sessions = preprocess_sessions(
         sessions_np,

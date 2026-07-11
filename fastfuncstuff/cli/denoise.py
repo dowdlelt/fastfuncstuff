@@ -51,6 +51,7 @@ try:
         parse_input_files,
         parse_prefix,
         preflight_check,
+        spinner,
     )
     from fastfuncstuff.denoise.sequential import (
         DenoiseResults,
@@ -3038,25 +3039,26 @@ def main():
     if mask is not None:
         voxel_mask = torch.from_numpy(mask.flatten().astype(bool))
 
-    output_files = save_denoising_results(
-        results=results,
-        output_prefix=args.prefix,
-        volume_shape=volume_shape,
-        affine=affine,
-        run_starts=run_starts,
-        tr=args.tr,
-        data_for_component_maps=data,
-        voxel_mask=voxel_mask,
-        plots_mode=args.plots,
-        slice_axis=args.plot_ax,
-        component_map_space=args.component_map_space,
-        noise_method=args.noise,
-        save_pcs_mode=args.save_pcs,
-        condition_labels=condition_labels,
-        save_scree_plot=args.scree_plot,
-        nii_ext=_nii_ext,
-        nifti_header=nifti_header,
-    )
+    with spinner("Writing denoising results"):
+        output_files = save_denoising_results(
+            results=results,
+            output_prefix=args.prefix,
+            volume_shape=volume_shape,
+            affine=affine,
+            run_starts=run_starts,
+            tr=args.tr,
+            data_for_component_maps=data,
+            voxel_mask=voxel_mask,
+            plots_mode=args.plots,
+            slice_axis=args.plot_ax,
+            component_map_space=args.component_map_space,
+            noise_method=args.noise,
+            save_pcs_mode=args.save_pcs,
+            condition_labels=condition_labels,
+            save_scree_plot=args.scree_plot,
+            nii_ext=_nii_ext,
+            nifti_header=nifti_header,
+        )
 
     if design_plot_path is not None:
         output_files["final_design_matrix_plot"] = design_plot_path
@@ -3153,20 +3155,21 @@ def main():
             )
 
         if args.save_model_fit:
-            initial_files = save_model_fit_outputs(
-                results=initial_results,
-                output_prefix=args.prefix,
-                volume_shape=volume_shape,
-                affine=affine,
-                model_type="initial",
-                condition_labels=condition_labels,
-                voxel_mask=voxel_mask,
-                n_timepoints=n_timepoints,
-                n_regressors=n_total_regs_initial,
-                bootstrap_se=initial_bootstrap_se,
-                nii_ext=_nii_ext,
-                nifti_header=nifti_header,
-            )
+            with spinner("Writing initial model-fit outputs"):
+                initial_files = save_model_fit_outputs(
+                    results=initial_results,
+                    output_prefix=args.prefix,
+                    volume_shape=volume_shape,
+                    affine=affine,
+                    model_type="initial",
+                    condition_labels=condition_labels,
+                    voxel_mask=voxel_mask,
+                    n_timepoints=n_timepoints,
+                    n_regressors=n_total_regs_initial,
+                    bootstrap_se=initial_bootstrap_se,
+                    nii_ext=_nii_ext,
+                    nifti_header=nifti_header,
+                )
             output_files.update(initial_files)
 
         # Final fit (with optimal denoising)
@@ -3226,20 +3229,21 @@ def main():
             )
 
         if args.save_model_fit:
-            final_files = save_model_fit_outputs(
-                results=final_results,
-                output_prefix=args.prefix,
-                volume_shape=volume_shape,
-                affine=affine,
-                model_type="denoised",
-                condition_labels=condition_labels,
-                voxel_mask=voxel_mask,
-                n_timepoints=n_timepoints,
-                n_regressors=n_total_regs_final,
-                bootstrap_se=final_bootstrap_se,
-                nifti_header=nifti_header,
-                nii_ext=_nii_ext,
-            )
+            with spinner("Writing final model-fit outputs"):
+                final_files = save_model_fit_outputs(
+                    results=final_results,
+                    output_prefix=args.prefix,
+                    volume_shape=volume_shape,
+                    affine=affine,
+                    model_type="denoised",
+                    condition_labels=condition_labels,
+                    voxel_mask=voxel_mask,
+                    n_timepoints=n_timepoints,
+                    n_regressors=n_total_regs_final,
+                    bootstrap_se=final_bootstrap_se,
+                    nifti_header=nifti_header,
+                    nii_ext=_nii_ext,
+                )
             output_files.update(final_files)
 
     # ==========================================================================
@@ -3300,17 +3304,18 @@ def main():
             )
 
         # Save SNR outputs
-        snr_files = save_snr_outputs(
-            snr_initial=snr_initial,
-            snr_denoised=snr_denoised,
-            output_prefix=args.prefix,
-            volume_shape=volume_shape,
-            affine=affine,
-            voxel_mask=voxel_mask,
-            create_plots=True,
-            nii_ext=_nii_ext,
-            nifti_header=nifti_header,
-        )
+        with spinner("Writing SNR outputs"):
+            snr_files = save_snr_outputs(
+                snr_initial=snr_initial,
+                snr_denoised=snr_denoised,
+                output_prefix=args.prefix,
+                volume_shape=volume_shape,
+                affine=affine,
+                voxel_mask=voxel_mask,
+                create_plots=True,
+                nii_ext=_nii_ext,
+                nifti_header=nifti_header,
+            )
         output_files.update(snr_files)
 
     print()

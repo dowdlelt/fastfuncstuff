@@ -95,7 +95,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_ortvec_arguments, add_verbose_arg
+from fastfuncstuff.cli_utils import add_ortvec_arguments, add_verbose_arg, spinner
 
 
 class _HelpFormatter(
@@ -740,56 +740,59 @@ def main(argv: list[str] | None = None) -> int:
 
     outputs = {}
 
-    corrected_np = result.magnitude_corrected.numpy()
-    fname = f"{args.prefix}_corrected{nii_ext}"
-    save_nifti(_to_volume(corrected_np, is_4d=True), fname, reference_img=ref_img_path)
-    outputs["corrected"] = fname
+    with spinner("Writing outputs"):
+        corrected_np = result.magnitude_corrected.numpy()
+        fname = f"{args.prefix}_corrected{nii_ext}"
+        save_nifti(_to_volume(corrected_np, is_4d=True), fname, reference_img=ref_img_path)
+        outputs["corrected"] = fname
 
-    macro_np = result.macrovascular_component.numpy()
-    fname = f"{args.prefix}_macro{nii_ext}"
-    save_nifti(_to_volume(macro_np, is_4d=True), fname, reference_img=ref_img_path)
-    outputs["macro"] = fname
+        macro_np = result.macrovascular_component.numpy()
+        fname = f"{args.prefix}_macro{nii_ext}"
+        save_nifti(_to_volume(macro_np, is_4d=True), fname, reference_img=ref_img_path)
+        outputs["macro"] = fname
 
-    fname = f"{args.prefix}_slope{nii_ext}"
-    save_nifti(_to_volume(result.slope.numpy()), fname, reference_img=ref_img_path)
-    outputs["slope"] = fname
+        fname = f"{args.prefix}_slope{nii_ext}"
+        save_nifti(_to_volume(result.slope.numpy()), fname, reference_img=ref_img_path)
+        outputs["slope"] = fname
 
-    if args.r2_mode in ("odr", "both"):
-        fname = f"{args.prefix}_r2{nii_ext}"
-        save_nifti(_to_volume(result.r2_phase.numpy()), fname, reference_img=ref_img_path)
-        outputs["r2"] = fname
+        if args.r2_mode in ("odr", "both"):
+            fname = f"{args.prefix}_r2{nii_ext}"
+            save_nifti(_to_volume(result.r2_phase.numpy()), fname, reference_img=ref_img_path)
+            outputs["r2"] = fname
 
-    if args.r2_mode in ("naive", "both") and result.r2_naive is not None:
-        fname = f"{args.prefix}_r2_naive{nii_ext}"
-        save_nifti(_to_volume(result.r2_naive.numpy()), fname, reference_img=ref_img_path)
-        outputs["r2_naive"] = fname
+        if args.r2_mode in ("naive", "both") and result.r2_naive is not None:
+            fname = f"{args.prefix}_r2_naive{nii_ext}"
+            save_nifti(_to_volume(result.r2_naive.numpy()), fname, reference_img=ref_img_path)
+            outputs["r2_naive"] = fname
 
-    fname = f"{args.prefix}_phi{nii_ext}"
-    save_nifti(_to_volume(result.phi.numpy()), fname, reference_img=ref_img_path)
-    outputs["phi"] = fname
+        fname = f"{args.prefix}_phi{nii_ext}"
+        save_nifti(_to_volume(result.phi.numpy()), fname, reference_img=ref_img_path)
+        outputs["phi"] = fname
 
-    fname = f"{args.prefix}_mask{nii_ext}"
-    save_nifti(
-        _to_volume(result.voxel_mask.numpy().astype(np.float32)), fname, reference_img=ref_img_path
-    )
-    outputs["mask"] = fname
+        fname = f"{args.prefix}_mask{nii_ext}"
+        save_nifti(
+            _to_volume(result.voxel_mask.numpy().astype(np.float32)),
+            fname,
+            reference_img=ref_img_path,
+        )
+        outputs["mask"] = fname
 
-    if args.save_intermediates:
-        interm_specs = [
-            ("mag_dt", result.mag_detrended, True, "poly-detrended magnitude"),
-            ("pha_dt", result.pha_detrended, True, "poly-detrended phase"),
-            ("pha_dt_filt", result.pha_detrended_filt, True, "detrended + filtered phase"),
-            ("mag_res", result.mag_residual, True, "magnitude task-residual"),
-            ("pha_res_filt", result.pha_residual_filt, True, "phase task-residual + filtered"),
-        ]
-        for key, data, is_4d, label in interm_specs:
-            if data is None:
-                continue
-            fname = f"{args.prefix}_{key}{nii_ext}"
-            save_nifti(_to_volume(data.numpy(), is_4d=is_4d), fname, reference_img=ref_img_path)
-            outputs[key] = fname
-            if args.verb >= 1:
-                print(f"  {key} ({label}): {fname}")
+        if args.save_intermediates:
+            interm_specs = [
+                ("mag_dt", result.mag_detrended, True, "poly-detrended magnitude"),
+                ("pha_dt", result.pha_detrended, True, "poly-detrended phase"),
+                ("pha_dt_filt", result.pha_detrended_filt, True, "detrended + filtered phase"),
+                ("mag_res", result.mag_residual, True, "magnitude task-residual"),
+                ("pha_res_filt", result.pha_residual_filt, True, "phase task-residual + filtered"),
+            ]
+            for key, data, is_4d, label in interm_specs:
+                if data is None:
+                    continue
+                fname = f"{args.prefix}_{key}{nii_ext}"
+                save_nifti(_to_volume(data.numpy(), is_4d=is_4d), fname, reference_img=ref_img_path)
+                outputs[key] = fname
+                if args.verb >= 1:
+                    print(f"  {key} ({label}): {fname}")
 
     if args.verb >= 1:
         for name, path in outputs.items():

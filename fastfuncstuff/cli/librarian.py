@@ -60,6 +60,7 @@ try:
         parse_input_files,
         parse_prefix,
         preflight_check,
+        spinner,
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,  # noqa: F401
@@ -749,7 +750,8 @@ def write_r2_volume(
     vol = np.zeros(volume_shape, dtype=np.float32)
     flat = vol.reshape(-1)
     flat[mask_flat] = r2.astype(np.float32)
-    save_nifti(vol.reshape(volume_shape), output_path=str(path), affine=affine)
+    with spinner(f"Writing {Path(path).name}"):
+        save_nifti(vol.reshape(volume_shape), output_path=str(path), affine=affine)
 
 
 def write_qc_artifacts(

@@ -25,6 +25,7 @@ import sys
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_utils import spinner
 from fastfuncstuff.processing.io import load_image, save_image
 
 # Expression helpers exposed to -expr (3dcalc-style), kept intentionally small.
@@ -133,10 +134,12 @@ def main() -> int:
             out = out.expand(vols[0].shape).clone()
 
     if args.mask:
-        m, _ = load_image(args.mask)
+        with spinner(f"Loading {Path(args.mask).name}"):
+            m, _ = load_image(args.mask)
         out = out * (m.to(dev).float() > 0)
 
-    save_image(out.cpu(), args.prefix, header_info=hdr0)
+    with spinner(f"Writing {Path(args.prefix).name}"):
+        save_image(out.cpu(), args.prefix, header_info=hdr0)
     print(f"ffs_util_3dmath: wrote {args.prefix}  ({tuple(out.shape)})")
     return 0
 
