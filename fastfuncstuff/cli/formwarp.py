@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -36,7 +37,7 @@ from fastfuncstuff.processing.formwarp import (
     formwarp,
 )
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
-from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
+from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
 from fastfuncstuff.processing.mask import automask
 
 
@@ -74,7 +75,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "-save_halfway",
         action="store_true",
-        help="Save the four SyN half-warps (mid<->fixed, mid<->moving).",
+        help="Save the four SyN half-warps (mid<->fixed, mid<->moving). Single-pair only.",
+    )
+    p.add_argument(
+        "-warp_format",
+        "-warp-format",
+        choices=["5d", "folder"],
+        default="5d",
+        help="Timeseries mode only (4D -source): warp on-disk format. '5d' = one "
+        "{prefix}_WARP file (nx,ny,nz,T,3, default); 'folder' = {prefix}_WARP/ of "
+        "numbered 4D frames. Both are consumed by ffs_nwarp -nwarp / ffs_util_pcwarp.",
     )
 
     # Metric
@@ -222,14 +232,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if base.ndim == 4:
         if args.verb >= 1:
-            print("WARNING: 4D -base; using vol[0]")
+            print("WARNING: 4D -base; using vol[0] as the fixed target")
         base = base[0]
-    if source.ndim == 4:
-        if args.verb >= 1:
-            print("WARNING: 4D -source; using vol[0]")
-        source = source[0]
 
-    if tuple(base.shape) != tuple(source.shape):
+    # Timeseries mode: a 4D -source registers every volume to the (3D) base and
+    # writes a 4D warped series + a per-volume warp series (5D file or folder).
+    timeseries = source.ndim == 4
+    if timeseries and tuple(source.shape[1:]) != tuple(base.shape):
+        print(
+            f"ERROR: source volumes {tuple(source.shape[1:])} and base {tuple(base.shape)} "
+            "must be on the same grid (resample first, e.g. ffs_allineate)."
+        )
+        return 1
+    if not timeseries and tuple(base.shape) != tuple(source.shape):
         print(
             f"ERROR: base {tuple(base.shape)} and source {tuple(source.shape)} "
             "must be on the same grid (resample first, e.g. ffs_allineate)."
@@ -279,10 +294,16 @@ def main(argv: list[str] | None = None) -> int:
         verb=args.verb,
     )
 
-    res = formwarp(base, source, weight=weight, mask=mask, config=config, device=device)
-
     pfx = parse_prefix(args.prefix)
     prefix, nii_ext = pfx.stem, pfx.nifti_ext
+
+    if timeseries:
+        return _run_timeseries(
+            args, base, source, weight, mask, config, base_info, prefix, nii_ext, device, t0
+        )
+
+    res = formwarp(base, source, weight=weight, mask=mask, config=config, device=device)
+
     warped_path = pfx.as_file()
     with spinner(f"Writing {Path(warped_path).name}"):
         save_image(res.warped, warped_path, header_info=base_info)
@@ -313,6 +334,71 @@ def main(argv: list[str] | None = None) -> int:
         _save_warp(res.moving_to_mid, f"{prefix}_HALF_mid2moving{nii_ext}", "mid->moving half-warp")
         _save_warp(res.mid_to_fixed, f"{prefix}_HALF_fixed2mid{nii_ext}", "fixed->mid half-warp")
         _save_warp(res.mid_to_moving, f"{prefix}_HALF_moving2mid{nii_ext}", "moving->mid half-warp")
+
+    if args.verb >= 1:
+        print(f"Done in {time.time() - t0:.1f}s")
+    return 0
+
+
+def _run_timeseries(
+    args, base, source, weight, mask, config, base_info, prefix, nii_ext, device, t0
+) -> int:
+    """Register every volume of a 4D source to the 3D base (per-volume SyN).
+
+    Writes the 4D warped series and, with -save_warp/-save_inverse, a per-volume
+    warp series in the chosen -warp_format (one 5D file or a folder of 4D frames).
+    -save_halfway is single-pair only and is ignored here.
+    """
+    from tqdm import tqdm
+
+    n_t = source.shape[0]
+    if args.save_halfway and args.verb >= 1:
+        print("NOTE: -save_halfway is ignored in timeseries mode.")
+    if args.verb >= 1:
+        print(f"Timeseries mode: {n_t} volumes -> base (per-volume SyN)")
+
+    warped_frames: list[torch.Tensor] = []
+    fwd_frames: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    inv_frames: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    quiet = config.verb
+    for t in tqdm(range(n_t), desc="formwarp", disable=args.verb < 1, leave=True):
+        # Silence per-volume SyN chatter; the bar is the progress signal.
+        res = formwarp(
+            base,
+            source[t],
+            weight=weight,
+            mask=mask,
+            config=replace(config, verb=0) if quiet else config,
+            device=device,
+        )
+        warped_frames.append(res.warped.cpu())
+        if args.save_warp:
+            fwd_frames.append(tuple(c.cpu() for c in res.fwd))
+        if args.save_inverse:
+            inv_frames.append(tuple(c.cpu() for c in res.inv))
+
+    warped_path = f"{prefix}{nii_ext}"
+    with spinner(f"Writing {Path(warped_path).name}"):
+        save_image(torch.stack(warped_frames), warped_path, header_info=base_info)
+    if args.verb >= 1:
+        print(f"Saved warped series: {warped_path} ({n_t} volumes)")
+
+    def _save_series(frames, tag: str, label: str) -> None:
+        as_5d = args.warp_format == "5d"
+        xs = torch.stack([f[0] for f in frames])
+        ys = torch.stack([f[1] for f in frames])
+        zs = torch.stack([f[2] for f in frames])
+        dest = f"{prefix}_{tag}{nii_ext}" if as_5d else f"{prefix}_{tag}"
+        with spinner(f"Writing {Path(dest).name}"):
+            out = save_warp_series(xs, ys, zs, dest, as_5d=as_5d, header_info=base_info, units="mm")
+        if args.verb >= 1:
+            fmt = "5D" if as_5d else "folder"
+            print(f"Saved {label} ({fmt}): {out}")
+
+    if args.save_warp:
+        _save_series(fwd_frames, "WARP", "moving->fixed warp series")
+    if args.save_inverse:
+        _save_series(inv_frames, "WARPINV", "fixed->moving inverse warp series")
 
     if args.verb >= 1:
         print(f"Done in {time.time() - t0:.1f}s")
