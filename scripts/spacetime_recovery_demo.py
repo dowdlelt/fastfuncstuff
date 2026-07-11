@@ -24,19 +24,22 @@ used to *make* the data, so the only errors ffs_nwarp can be blamed for are its
 own (spatial + temporal interpolation, and the paper's slow-motion assumption).
 
 Target: I(u, j*TR + tzero) -- every anatomical voxel, all slices realigned to a
-common within-TR reference time. Three corrections are scored against it:
-  * joint   -- ffs_nwarp -tpattern (motion + slice timing in one resample)
+common within-TR reference time. Four corrections are scored against it:
+  * follow  -- ffs_nwarp -tpattern -tfollow (tissue-following joint: each temporal
+               tap sampled at its own frame's pose)
+  * joint   -- ffs_nwarp -tpattern (frozen-pose joint: one pose per output frame)
   * tshift  -- ffs_slicetime (static 3dTshift) THEN ffs_nwarp motion-only
   * moco    -- ffs_nwarp, motion only (no slice-timing correction)
 run for two motion regimes: in-plane and (harder) through-plane.
 
-What it establishes: the joint one-pass reproduces the established two-step
-(tshift-then-motion) to ~1% while both crush motion-only -- a correctness
-validation of the joint path. In this apply-only mode (motion already known) joint
-and tshift agree, since a sample's acquisition time is a property of the scanner
-slice that both assign correctly; joint's edge over the two-step is a single
-interpolation (an SNR/blur win a noise-free synthetic can't show) and the fact it
-generalises to *jointly estimating* motion+timing.
+What it establishes: for slow/moderate motion the frozen-pose joint reproduces the
+correct two-step (tshift-then-motion) to ~1% while both crush motion-only -- a
+correctness validation. They agree because a sample's acquisition time is a
+property of the scanner slice both assign correctly. But when motion sweeps tissue
+between scanner locations within the temporal window (see the oscillating-edge
+experiment; -tfollow), the frozen-pose joint and tshift both mix the WRONG tissue
+into the temporal interpolation, and only the tissue-following joint recovers the
+signal.
 
 Substituting real data: struct() is a callable -- swap it for an interpolator over
 a cropped real volume. make_motion() returns 4x4 voxel-space matrices -- swap it
@@ -343,37 +346,37 @@ def run_scenario(through_plane, work, device="cpu", shape=(48, 48, 20), nframes=
     np.savetxt(st_p, slice_times)
 
     joint_p = os.path.join(work, f"joint_{tag}.nii.gz")
+    follow_p = os.path.join(work, f"follow_{tag}.nii.gz")
     moco_p = os.path.join(work, f"moco_{tag}.nii.gz")
     tshift_p = os.path.join(work, f"tshift_{tag}.nii.gz")
     tshiftmoco_p = os.path.join(work, f"tshiftmoco_{tag}.nii.gz")
 
-    print(f"[{tag}] joint space-time ...")
-    nwarp_main(
-        [
-            "-source",
-            src,
-            "-nwarp",
-            chain,
-            "-prefix",
-            joint_p,
-            "-tpattern",
-            st_p,
-            "-TR",
-            str(tr),
-            "-tzero",
-            str(tzero),
-            "-tinterp",
-            "wsinc5",
-            "-interp",
-            "wsinc5",
-            "-master",
-            src,
-            "-device",
-            device,
-            "-verb",
-            "0",
-        ]
-    )
+    joint_args = [
+        "-source",
+        src,
+        "-nwarp",
+        chain,
+        "-tpattern",
+        st_p,
+        "-TR",
+        str(tr),
+        "-tzero",
+        str(tzero),
+        "-tinterp",
+        "wsinc5",
+        "-interp",
+        "wsinc5",
+        "-master",
+        src,
+        "-device",
+        device,
+        "-verb",
+        "0",
+    ]
+    print(f"[{tag}] joint space-time (frozen pose) ...")
+    nwarp_main([*joint_args, "-prefix", joint_p])
+    print(f"[{tag}] joint space-time (tissue-following) ...")
+    nwarp_main([*joint_args, "-prefix", follow_p, "-tfollow"])
     print(f"[{tag}] motion-only ...")
     nwarp_main(
         [
@@ -431,6 +434,7 @@ def run_scenario(through_plane, work, device="cpu", shape=(48, 48, 20), nframes=
     )
 
     rec = {
+        "follow": np.asarray(nib.load(follow_p).dataobj).astype(np.float32),
         "joint": np.asarray(nib.load(joint_p).dataobj).astype(np.float32),
         "tshift": np.asarray(nib.load(tshiftmoco_p).dataobj).astype(np.float32),
         "moco": np.asarray(nib.load(moco_p).dataobj).astype(np.float32),
@@ -444,9 +448,10 @@ def run_scenario(through_plane, work, device="cpu", shape=(48, 48, 20), nframes=
     corr = {m: temporal_corr(v, ideal, mask) for m, v in rec.items()}
     ampl = {m: amplitude_slope(v, ideal, mask) for m, v in rec.items()}
 
+    methods = ["follow", "joint", "tshift", "moco"]
     print(f"\n=== {tag} motion | MB2 interleaved | {int(mask.sum())} interior voxels ===")
-    print("  band              |  joint  tshift   moco   (corr with truth)")
-    print("  ------------------+--------------------------------")
+    print("  band              | " + " ".join(f"{m:>7}" for m in methods) + "   (corr)")
+    print("  ------------------+" + "-" * 34)
     edges = np.quantile(freq, [0, 1 / 3, 2 / 3, 1.0])
     for lo, hi, name in [
         (edges[0], edges[1], "slow"),
@@ -455,17 +460,11 @@ def run_scenario(through_plane, work, device="cpu", shape=(48, 48, 20), nframes=
     ]:
         s = (freq >= lo) & (freq < hi)
         print(
-            f"  {name} {lo:.2f}-{hi:.2f} Hz    | {corr['joint'][s].mean():.3f}  "
-            f"{corr['tshift'][s].mean():.3f}  {corr['moco'][s].mean():.3f}"
+            f"  {name} {lo:.2f}-{hi:.2f} Hz    | "
+            + " ".join(f"{corr[m][s].mean():7.3f}" for m in methods)
         )
-    print(
-        f"  OVERALL           | {corr['joint'].mean():.3f}  "
-        f"{corr['tshift'].mean():.3f}  {corr['moco'].mean():.3f}"
-    )
-    print(
-        f"  amplitude (mean)  | {ampl['joint'].mean():.3f}  "
-        f"{ampl['tshift'].mean():.3f}  {ampl['moco'].mean():.3f}"
-    )
+    print("  OVERALL           | " + " ".join(f"{corr[m].mean():7.3f}" for m in methods))
+    print("  amplitude (mean)  | " + " ".join(f"{ampl[m].mean():7.3f}" for m in methods))
 
     return dict(
         tag=tag,
@@ -496,7 +495,8 @@ def run(outdir, device="cpu", nframes=64, tr=1.0):
 
 
 _STYLE = {
-    "joint": ("C0", "o-", "joint space-time"),
+    "follow": ("C4", "D-", "joint (tissue-following)"),
+    "joint": ("C0", "o-", "joint (frozen pose)"),
     "tshift": ("C2", "^-", "tshift-then-motion"),
     "moco": ("C3", "s--", "motion-only"),
 }
