@@ -71,6 +71,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "max(2.999*FWHM, 3.999*cbrt(voxel volume))).",
     )
     parser.add_argument(
+        "-unif",
+        action="store_true",
+        help="Uniformize spatial variance: divide each voxel by its temporal MAD "
+        "(subtracting the temporal median first) before estimating. Matches "
+        "3dFWHMx, which enables this automatically with -detrend; it changes the "
+        "ACF on data with non-uniform variance (high-res / anisotropic).",
+    )
+    parser.add_argument(
+        "-demed",
+        action="store_true",
+        help="Subtract each voxel's temporal median before estimating "
+        "(3dFWHMx -demed). Implied by -unif.",
+    )
+    parser.add_argument(
+        "-nounif",
+        "-no_unif",
+        "-no-unif",
+        action="store_true",
+        help="Do not uniformize even when -detrend is given (overrides the "
+        "AFNI-matching default that -detrend implies -unif).",
+    )
+    parser.add_argument(
         "-keep_const",
         "-keep-const",
         action="store_true",
@@ -175,12 +197,21 @@ def main(argv: list[str] | None = None) -> None:
             f"{int(mask.sum())}/{n_in} mask voxels, voxdims {voxdims}, device={device}"
         )
 
+    # AFNI enables -unif automatically when -detrend is used; mirror that unless
+    # -nounif is given. -unif implies -demed.
+    unif = args.unif or (args.detrend is not None and not args.nounif)
+    demed = args.demed or unif
+    if verb >= 1 and (unif or demed):
+        print(f"  {'uniformizing (median + MAD)' if unif else 'de-medianing'} per voxel")
+
     res = estimate_fwhmx_run(
         resid,
         mask,
         volume_shape,
         voxdims,
         radius_mm=args.acf_radius,
+        demed=demed,
+        unif=unif,
         device=device,
         progress=verb >= 1,
     )

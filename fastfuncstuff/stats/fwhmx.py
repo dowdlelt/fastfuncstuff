@@ -41,7 +41,6 @@ from tqdm import tqdm
 
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.stats.localstat import (
-    acf_fwhm_batched,
     build_neighborhood,
     fit_acf_batched,
 )
@@ -196,6 +195,8 @@ def estimate_fwhmx_run(
     voxdims: tuple[float, float, float],
     *,
     radius_mm: float | None = None,
+    demed: bool = False,
+    unif: bool = False,
     device: torch.device | None = None,
     progress: bool = True,
     progress_desc: str = "FWHMx",
@@ -212,6 +213,14 @@ def estimate_fwhmx_run(
         voxdims: per-axis voxel widths (mm), aligned to ``volume_shape`` —
             ``voxdims[i]`` is the width of ``volume_shape[i]``.
         radius_mm: ACF radius; None → AFNI's data-driven default.
+        demed: subtract each voxel's temporal median before estimating
+            (``3dFWHMx -demed``).
+        unif: divide each voxel by its temporal MAD after de-medianing, so the
+            spatial variance is uniform (``3dFWHMx -unif``; implies ``demed``).
+            AFNI turns this on automatically whenever ``-detrend`` is used — it
+            markedly changes the ACF on data with spatially non-uniform variance
+            (high-res, anisotropic), and removes a spurious non-monotonic bump
+            at larger lags. Applied to both the classic and ACF passes.
         progress: show a tqdm bar over timepoint chunks and the offset loop.
 
     Returns:
@@ -220,6 +229,17 @@ def estimate_fwhmx_run(
     """
     if device is None:
         device = resid_2d.device if resid_2d.is_cuda else torch.device("cpu")
+
+    # AFNI de-median / uniformize (THD_estimate_ACF's demed/unif). Scale is
+    # irrelevant to the ACF, but dividing each voxel by its temporal MAD makes
+    # the per-voxel variance uniform, which is what actually changes the spatial
+    # correlation on non-stationary data. Done once here so both passes see it.
+    if demed or unif:
+        med = resid_2d.median(dim=1, keepdim=True).values
+        resid_2d = resid_2d - med
+        if unif:
+            mad = resid_2d.abs().median(dim=1, keepdim=True).values
+            resid_2d = resid_2d / torch.where(mad > 0, mad, torch.ones_like(mad))
     s0, s1, s2 = (int(s) for s in volume_shape)
     v0, v1, v2 = (abs(float(v)) for v in voxdims)  # widths aligned to axes 0,1,2
     mask = voxel_mask.reshape(volume_shape).to(device).to(torch.bool)
@@ -368,6 +388,31 @@ def _geom_combine(cx: float, cy: float, cz: float) -> float:
     return float(np.exp(np.mean(np.log(vals))))
 
 
+def _afni_model_fwhm(a: float, b: float, c: float, bin_r: Tensor) -> float:
+    """AFNI-faithful FWHM from a fitted ACF model (``ACF_cluster_to_modelE``).
+
+    3dFWHMx does NOT report the analytic half-max of ``a e^{-r²/2b²}+(1-a)e^{-r/c}``.
+    It evaluates the *fitted model* at the discrete ACF radius bins (including
+    r=0) and linearly interpolates where that sampled curve crosses 0.5, then
+    doubles the radius (``interp_inverse_floatvec`` + ``interp_floatvec``,
+    mri_fwhm.c:1211-1218). On coarsely-sampled high-res data this sits a few
+    percent below the analytic value, so we replicate it for drop-in parity;
+    ``a, b, c`` (what 3dClustSim consumes) come straight from the fit.
+    """
+    r = bin_r.to(torch.float64)
+    model = a * torch.exp(-0.5 * r * r / (b * b)) + (1.0 - a) * torch.exp(-r / c)
+    below = (model < 0.5).nonzero(as_tuple=False)
+    if below.numel() == 0:  # never crosses 0.5 within the sampled radii
+        return -1.0
+    i = int(below[0].item())
+    if i == 0:
+        return 0.0
+    m0, m1 = float(model[i - 1]), float(model[i])
+    r0, r1 = float(r[i - 1]), float(r[i])
+    t = (m0 - 0.5) / (m0 - m1) if m0 != m1 else 0.0
+    return 2.0 * (r0 + t * (r1 - r0))
+
+
 def _fit_model(bin_r: Tensor, bin_y: Tensor, device) -> tuple[float, float, float, float]:
     """Fit ACF(r)=a e^{-r²/2b²}+(1-a)e^{-r/c} and return (a, b, c, FWHM)."""
     if bin_r.numel() < 5:
@@ -376,5 +421,5 @@ def _fit_model(bin_r: Tensor, bin_y: Tensor, device) -> tuple[float, float, floa
     y = bin_y.to(device=device, dtype=torch.float64).view(1, -1)
     w = torch.ones_like(y)
     a, b, c, _ok = fit_acf_batched(radii, y, w)
-    fwhm = acf_fwhm_batched(a, b, c, 0.5)
-    return float(a.item()), float(b.item()), float(c.item()), float(fwhm.item())
+    af, bf, cf = float(a.item()), float(b.item()), float(c.item())
+    return af, bf, cf, _afni_model_fwhm(af, bf, cf, bin_r)
