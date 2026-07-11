@@ -35,9 +35,8 @@ def _blobs(nz: int, ny: int, nx: int, shift=(0.0, 0.0, 0.0)) -> torch.Tensor:
     def blob(cx, cy, cz, sx=6.0, sy=6.0, sz=5.0):
         return torch.exp(-(((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2 + ((zz - cz) / sz) ** 2))
 
-    return (
-        blob(nx / 2 + dx, ny / 2 + dy, nz / 2 + dz)
-        + 0.5 * blob(nx / 2 + 5 + dx, ny / 2 + 4 + dy, nz / 2 + 2 + dz)
+    return blob(nx / 2 + dx, ny / 2 + dy, nz / 2 + dz) + 0.5 * blob(
+        nx / 2 + 5 + dx, ny / 2 + 4 + dy, nz / 2 + 2 + dz
     )
 
 
@@ -95,8 +94,12 @@ def test_formwarp_recovers_known_shift():
     moving = _blobs(nz, ny, nx, shift=(2.5, -1.5, 1.0))
 
     cfg = SynConfig(
-        metric="cc", cc_radius=3, grad_step=0.4,
-        shrink_factors=(2, 1), smoothing_sigmas=(1.0, 0.0), iterations=(25, 25),
+        metric="cc",
+        cc_radius=3,
+        grad_step=0.4,
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(1.0, 0.0),
+        iterations=(25, 25),
         verb=0,
     )
     res = formwarp(fixed, moving, config=cfg, device=DEVICE)
@@ -116,9 +119,9 @@ def test_convergence_value_trend():
     falling = [-(0.1 * i) for i in range(10)]  # strictly decreasing
     flat = [-1.0] * 10
     rising = [-1.0 + 0.05 * i for i in range(10)]
-    assert _convergence_value(falling, 10) > 1e-3       # still improving
-    assert abs(_convergence_value(flat, 10)) < 1e-9     # converged
-    assert _convergence_value(rising, 10) < 0.0         # cost going up -> stop
+    assert _convergence_value(falling, 10) > 1e-3  # still improving
+    assert abs(_convergence_value(flat, 10)) < 1e-9  # converged
+    assert _convergence_value(rising, 10) < 0.0  # cost going up -> stop
 
 
 def test_formwarp_exhaustion_returns_best_not_last():
@@ -133,8 +136,12 @@ def test_formwarp_exhaustion_returns_best_not_last():
     moving = _blobs(nz, ny, nx, shift=(2.5, -1.5, 1.0))
 
     cfg = SynConfig(
-        metric="cc", cc_radius=3, grad_step=0.8,  # deliberately large -> overshoot
-        shrink_factors=(1,), smoothing_sigmas=(0.0,), iterations=(120,),
+        metric="cc",
+        cc_radius=3,
+        grad_step=0.8,  # deliberately large -> overshoot
+        shrink_factors=(1,),
+        smoothing_sigmas=(0.0,),
+        iterations=(120,),
         convergence_window=0,  # no early stop: run to exhaustion
         verb=0,
     )
@@ -151,9 +158,14 @@ def test_formwarp_noxdis_zeros_x_component():
     moving = _blobs(nz, ny, nx, shift=(0.0, 2.0, 0.0))
 
     cfg = SynConfig(
-        metric="cc", cc_radius=3, grad_step=0.4,
-        shrink_factors=(2, 1), smoothing_sigmas=(1.0, 0.0), iterations=(15, 15),
-        warp_flags=NO_X_DISP, verb=0,
+        metric="cc",
+        cc_radius=3,
+        grad_step=0.4,
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(1.0, 0.0),
+        iterations=(15, 15),
+        warp_flags=NO_X_DISP,
+        verb=0,
     )
     res = formwarp(fixed, moving, config=cfg, device=DEVICE)
 
@@ -162,3 +174,59 @@ def test_formwarp_noxdis_zeros_x_component():
     assert res.moving_to_mid[0].abs().max().item() == 0.0
     # The Y half-warp should carry real deformation (the mismatch was along Y).
     assert res.moving_to_mid[1].abs().max().item() > 0.1
+
+
+def test_cli_timeseries_5d_and_folder_match(tmp_path):
+    """CLI timeseries mode (4D -source): per-volume SyN writes a 4D warped series
+    plus a warp series in both -warp_format modes, and the two formats agree."""
+    import numpy as np
+    import pytest
+
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.cli.formwarp import main as fmain
+    from fastfuncstuff.processing.io import load_warp_series
+
+    nz, ny, nx = 16, 18, 14
+    base = _blobs(nz, ny, nx)
+    src = torch.stack(
+        [_blobs(nz, ny, nx, shift=(0.0, s, 0.0)) for s in (0.0, 1.5, -1.0)], dim=-1
+    )  # (nz,ny,nx,T)
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    bpath = tmp_path / "base.nii.gz"
+    spath = tmp_path / "src.nii.gz"
+    # save_image wants (nz,ny,nx[,T]); NIfTI on-disk is (nx,ny,nz[,T]).
+    nib.save(nib.Nifti1Image(base.permute(2, 1, 0).numpy(), affine), bpath)
+    nib.save(nib.Nifti1Image(src.permute(2, 1, 0, 3).numpy(), affine), spath)
+
+    common = [
+        "-base",
+        str(bpath),
+        "-source",
+        str(spath),
+        "-metric",
+        "cc",
+        "-shrink",
+        "2x1",
+        "-smooth",
+        "1x0",
+        "-iters",
+        "4x3",
+        "-save_warp",
+        "-device",
+        "cpu",
+        "-verb",
+        "0",
+    ]
+    assert fmain([*common, "-prefix", str(tmp_path / "out5.nii.gz"), "-warp_format", "5d"]) == 0
+    assert fmain([*common, "-prefix", str(tmp_path / "outF.nii.gz"), "-warp_format", "folder"]) == 0
+
+    f5 = tmp_path / "out5_WARP.nii.gz"
+    assert f5.exists()
+    # 4D warped series was written.
+    assert nib.load(str(tmp_path / "out5.nii.gz")).shape == (nx, ny, nz, 3)
+
+    x5, y5, z5, _, n5 = load_warp_series(f5)
+    xf, yf, zf, _, nf = load_warp_series(str(tmp_path / "outF_WARP"))
+    assert n5 == nf == 3
+    torch.testing.assert_close(y5, yf)
+    torch.testing.assert_close(x5, xf)
