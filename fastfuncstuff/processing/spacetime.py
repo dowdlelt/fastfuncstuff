@@ -181,3 +181,76 @@ def apply_spacetime_sample(
         wsum += w
 
     return acc / wsum.clamp_min(1e-8)
+
+
+def apply_spacetime_sample_following(
+    source: Tensor,
+    frame_coords: list[tuple[Tensor, Tensor, Tensor]],
+    frame_idx: int,
+    tr: float,
+    tzero: float,
+    slice_times: Tensor,
+    device: torch.device,
+    tinterp: str = "cubic",
+    interp: str = "wsinc5",
+    no_neg: bool = False,
+) -> Tensor:
+    """Tissue-following joint sample: drop the slow-motion assumption.
+
+    :func:`apply_spacetime_sample` freezes a single pose (the output frame's) and
+    samples every temporal neighbour at those *same* scanner coordinates. Under
+    motion that fixed location holds *different tissue* each frame, so the temporal
+    interpolation mixes tissue (the same failure a fixed-scanner-slice ``3dTshift``
+    has). This variant instead follows the tissue: for output voxel ``u`` it samples
+    each neighbour frame ``f`` at *that frame's own pose* ``T_f(u)`` -- so every tap
+    is the same anatomy -- and reads the acquisition offset from the scanner slice
+    ``u`` actually lands in *in frame f*. The temporal tap distance is therefore
+    per frame:
+
+        dist_f(u) = (j - f) + (tzero - Delta(sz_f(u))) / TR
+
+    with ``sz_f`` the scanner slice of ``T_f(u)``. It reduces exactly to the
+    frozen-pose version when the motion is static (all poses equal).
+
+    Parameters
+    ----------
+    frame_coords : list of (sx, sy, sz), one per input frame
+        Absolute source-voxel coordinates each output voxel samples *in that
+        frame's pose* (as from ``_output_to_source_voxel_coords`` composed at
+        ``time_idx=f``). Kept on CPU by the caller; moved to ``device`` per tap so
+        a long series never sits on the GPU in full.
+    frame_idx : int
+        Output frame ``j`` (aligned to ``tzero``).
+    Other parameters match :func:`apply_spacetime_sample`.
+    """
+    nt = source.shape[0]
+    onz, ony, onx = frame_coords[frame_idx][2].shape
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(onz, dtype=torch.float32, device=device),
+        torch.arange(ony, dtype=torch.float32, device=device),
+        torch.arange(onx, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+
+    # The per-voxel timing shift (tzero - Delta)/TR lies in (-1, 1), so a kernel of
+    # half-width H reaches at most H+1 frames each side of j.
+    half = _KERNEL_HALFWIDTH[tinterp]
+    f_lo, f_hi = frame_idx - (half + 1), frame_idx + (half + 1)
+
+    acc = torch.zeros((onz, ony, onx), dtype=torch.float32, device=device)
+    wsum = torch.zeros_like(acc)
+    for f in range(f_lo, f_hi + 1):
+        fc = min(max(f, 0), nt - 1)  # edge-extend pose + data past the series ends
+        sx, sy, sz = (c.to(device=device, dtype=torch.float32) for c in frame_coords[fc])
+        delta = interp_slice_times(sz, slice_times)
+        w = temporal_kernel_weights((frame_idx - f) + (tzero - delta) / tr, tinterp)
+        if not bool(torch.any(w != 0.0)):
+            continue
+        frame = source[fc].to(device=device, dtype=acc.dtype)
+        s_f = warp_image(frame, sx - ii, sy - jj, sz - kk, mode=interp)
+        if no_neg:
+            s_f = s_f.clamp_min(0.0)
+        acc += w * s_f
+        wsum += w
+
+    return acc / wsum.clamp_min(1e-8)

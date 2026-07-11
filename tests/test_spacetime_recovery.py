@@ -217,3 +217,107 @@ def test_joint_spacetime_recovers_and_beats_motion_only():
         f"joint should beat motion-only on fast band: "
         f"{cj[fast].mean():.3f} vs {cm[fast].mean():.3f}"
     )
+
+
+def _edge_struct(coords, shape, R=15.0, taper=2.0):
+    """A disk with a sharp-ish brain/air edge (smoothstep over `taper` voxels)."""
+    cx, cy = (shape[0] - 1) / 2, (shape[1] - 1) / 2
+    r = np.sqrt((coords[0] - cx) ** 2 + (coords[1] - cy) ** 2)
+    t = np.clip((R - r) / taper, 0, 1)
+    return 1.0 + 0.2 * np.cos(2 * np.pi * coords[0] / 8.0) * np.cos(
+        2 * np.pi * coords[1] / 8.0
+    ), t * t * (3 - 2 * t)
+
+
+def test_tissue_following_beats_frozen_pose_on_fast_motion():
+    """The whole reason -tfollow exists: when motion sweeps tissue between scanner
+    locations frame to frame (here +/-A vox every frame, a brain edge going in and
+    out of a voxel), the frozen-pose joint mixes the wrong tissue across the
+    temporal window -- exactly like a static 3dTshift. Following the tissue (sample
+    each neighbour at its own pose) recovers it. Guard both facts: following is
+    near-perfect AND clearly beats the frozen-pose joint."""
+    from fastfuncstuff.cli.nwarp import main as nwarp_main
+
+    shape = (32, 32, 12)
+    nf, tr, A = 40, 1.0, 4.0
+    nz = shape[2]
+    aff = np.diag([-1.0, -1.0, 1.0, 1.0])
+    nu, mod = _temporal(nz)
+    st = _slice_times(nz, tr, mb=2)
+    tzero = float(st.mean())
+    g = _grid(shape)
+    kidx = g[2].astype(int)
+
+    def sedge(c):
+        checker, env = _edge_struct(c, shape)
+        return checker * env
+
+    mats = []
+    for f in range(nf):
+        M = np.eye(4)
+        M[0, 3] = A * (-1) ** f  # alternate +/-A in x every frame
+        mats.append(M)
+    S = np.eye(4)
+
+    acquired = np.zeros((*shape, nf), np.float32)
+    ideal = np.zeros((*shape, nf), np.float32)
+    base = sedge(g)
+    for f in range(nf):
+        x = np.linalg.inv(mats[f] @ S) @ g
+        acquired[..., f] = (sedge(x) * mod(x, f * tr + st[kidx])).reshape(shape)
+        ideal[..., f] = (base * mod(g, f * tr + tzero)).reshape(shape)
+
+    work = tempfile.mkdtemp()
+    src = os.path.join(work, "acq.nii.gz")
+    nib.save(nib.Nifti1Image(acquired, aff), src)
+    sp, mp, stp = (os.path.join(work, n) for n in ("s.1D", "m.1D", "st.1D"))
+    with open(sp, "w") as f:
+        f.write(" ".join(f"{v:.8f}" for v in S[:3, :].reshape(-1)) + "\n")
+    with open(mp, "w") as f:
+        for M in mats:
+            f.write(" ".join(f"{v:.8f}" for v in M[:3, :].reshape(-1)) + "\n")
+    np.savetxt(stp, st)
+    chain = f"{sp} {mp}"
+    base_args = [
+        "-source",
+        src,
+        "-nwarp",
+        chain,
+        "-tpattern",
+        stp,
+        "-TR",
+        str(tr),
+        "-tzero",
+        str(tzero),
+        "-tinterp",
+        "wsinc5",
+        "-interp",
+        "wsinc5",
+        "-master",
+        src,
+        "-device",
+        "cpu",
+        "-verb",
+        "0",
+    ]
+    frozen_p = os.path.join(work, "frozen.nii.gz")
+    follow_p = os.path.join(work, "follow.nii.gz")
+    nwarp_main([*base_args, "-prefix", frozen_p])
+    nwarp_main([*base_args, "-prefix", follow_p, "-tfollow"])
+
+    frozen = np.asarray(nib.load(frozen_p).dataobj).astype(np.float32)
+    follow = np.asarray(nib.load(follow_p).dataobj).astype(np.float32)
+
+    from scipy.ndimage import binary_erosion
+
+    fp = np.zeros((3, 3, 1), bool)
+    fp[:, 1, 0] = fp[1, :, 0] = True
+    mask = binary_erosion(sedge(g).reshape(shape) > 0.3, structure=fp, iterations=2)
+
+    cfrozen = _tcorr(frozen, ideal, mask).mean()
+    cfollow = _tcorr(follow, ideal, mask).mean()
+    assert cfollow > 0.97, f"tissue-following should be near-perfect: {cfollow:.3f}"
+    assert cfollow - cfrozen > 0.03, (
+        f"tissue-following should clearly beat frozen-pose under fast motion: "
+        f"follow={cfollow:.3f} frozen={cfrozen:.3f}"
+    )

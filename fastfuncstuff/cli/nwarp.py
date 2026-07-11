@@ -204,6 +204,18 @@ Examples:
         "Fourier is unavailable on the joint path (the per-voxel shift is not "
         "a single per-slice phase rotation).",
     )
+    st_group.add_argument(
+        "-tfollow",
+        "-follow_tissue",
+        "-follow-tissue",
+        dest="follow_tissue",
+        action="store_true",
+        help="Tissue-following joint resample: sample each temporal neighbour at "
+        "its own frame's pose instead of freezing the output frame's pose (the "
+        "slow-motion assumption). Recovers the right signal when motion sweeps "
+        "tissue between scanner locations frame to frame (e.g. a brain edge "
+        "moving in and out of a voxel). Costs one composition per input frame.",
+    )
 
     hw_group = parser.add_argument_group("Hardware")
     hw_group.add_argument(
@@ -327,6 +339,7 @@ def main(argv: list[str] | None = None) -> None:
         tr=tr,
         tzero=args.tzero,
         tinterp=args.tinterp,
+        follow_tissue=args.follow_tissue,
     )
 
     if verb >= 1:

@@ -31,7 +31,7 @@ from .interp import (
     warp_image,
 )
 from .io import derive_mean_output_path, load_image, load_warp_field, save_image
-from .spacetime import apply_spacetime_sample
+from .spacetime import apply_spacetime_sample, apply_spacetime_sample_following
 
 # Interpolation kernels usable for warp-field (displacement) interpolation during
 # composition. NN is excluded -- a nearest-sampled displacement field would be
@@ -1430,6 +1430,7 @@ def nwarpforge(
     tr: float | None = None,
     tzero: float | None = None,
     tinterp: str = "cubic",
+    follow_tissue: bool = False,
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1497,6 +1498,13 @@ def nwarpforge(
             "cubic", "wsinc5", "wsinc9"; default "cubic"). Fourier is not
             available here -- the per-voxel continuous shift is not a single
             per-slice phase rotation.
+        follow_tissue: On the joint slice-timing path, sample each temporal
+            neighbour at *its own* pose (tissue-following) instead of freezing the
+            output frame's pose (the slow-motion assumption). Recovers the right
+            signal when motion moves tissue between scanner locations frame to
+            frame (e.g. a brain edge sweeping in and out of a voxel). Costs one
+            chain composition per input frame. See
+            processing/spacetime.py:apply_spacetime_sample_following.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1836,12 +1844,48 @@ def nwarpforge(
             verb=verb,
         )
 
+    # Tissue-following joint path: precompute, once, the source-voxel coordinates
+    # each output voxel samples *in every input frame's own pose*. Stored on CPU so
+    # a long series never sits on the GPU; each tap is moved to device on demand.
+    # These are independent of the output frame (T_f(u) is just where tissue u is in
+    # frame f), so this is one composition per input frame -- no window blow-up.
+    frame_coords: list[tuple[Tensor, Tensor, Tensor]] | None = None
+    if slice_times_t is not None and follow_tissue and reduced is not None:
+        if verb >= 1:
+            print(f"nwarpforge: tissue-following joint path ({nt} per-frame poses)")
+        frame_coords = []
+        for f in range(nt):
+            comp_f = (
+                static_composed
+                if static_composed is not None
+                else compose_chain(
+                    reduced, output_shape, output_affine, device,
+                    time_idx=f, interp=ainterp, verb=0,
+                )
+            )
+            sxf, syf, szf = _output_to_source_voxel_coords(
+                comp_f, source_header["affine"], output_affine
+            )
+            frame_coords.append((sxf.cpu(), syf.cpu(), szf.cpu()))
+
     time_iter = tqdm(
         range(t_start, t_end) if not affine_only else range(0),
         desc="Warping volumes",
         disable=verb == 0 or (t_end - t_start) == 1,
     )
     for t in time_iter:
+        if frame_coords is not None:
+            # Tissue-following joint: no single "this frame's pose" -- each temporal
+            # tap uses its own frame's precomputed coords (skip the compose here).
+            assert tr is not None and tzero is not None
+            output_volumes.append(
+                apply_spacetime_sample_following(
+                    source, frame_coords, t, tr, tzero, slice_times_t, device,
+                    tinterp=tinterp, interp=interp, no_neg=no_neg,
+                )
+            )
+            continue
+
         composed = (
             static_composed
             if static_composed is not None
