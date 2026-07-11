@@ -423,6 +423,53 @@ class TestBackCompatLegacyArgs:
             atol=1e-5,
         )
 
+    def test_block_diagonal_glob_expands_per_run(self):
+        """A per-run (block_diagonal) block must get its OWN columns per run
+        (zero outside that run), not collapse to shared columns."""
+        rng = np.random.default_rng(2)
+        r0 = rng.standard_normal((10, 3)).astype(np.float32) + 5.0  # non-zero mean
+        r1 = rng.standard_normal((10, 3)).astype(np.float32) - 2.0
+        block = NuisanceBlock(
+            label="locomoco",
+            per_run=[r0, r1],
+            source=["r0.1D", "r1.1D"],
+            block_diagonal=True,
+        )
+        out = build_nuisance_block_diag(
+            run_starts=[0, 10],
+            n_timepoints=20,
+            polort=1,
+            device=CPU,
+            blocks=[block],
+        )
+        # polort=1 → 2 cols/run (block-diag) = 4, plus 2 runs × 3 = 6 block-diag ortvec.
+        assert out.shape == (20, 4 + 6)
+        ov = out[:, 4:].numpy()  # (20, 6): cols 0-2 = run0's block, 3-5 = run1's block
+        # Run 0's columns are zero during run 1 and vice versa (block-diagonal).
+        np.testing.assert_allclose(ov[10:, 0:3], 0.0, atol=1e-6)
+        np.testing.assert_allclose(ov[:10, 3:6], 0.0, atol=1e-6)
+        # Each run's block is per-run demeaned within its own rows.
+        np.testing.assert_allclose(ov[:10, 0:3].mean(axis=0), np.zeros(3), atol=1e-5)
+        np.testing.assert_allclose(ov[10:, 3:6].mean(axis=0), np.zeros(3), atol=1e-5)
+
+    def test_block_diagonal_per_run_files_are_block_diag(self, tmp_path):
+        """Two -ortvec_run-style single-run blocks land in disjoint run columns."""
+        a = np.random.default_rng(3).standard_normal((10, 2)).astype(np.float32)
+        b = np.random.default_rng(4).standard_normal((10, 2)).astype(np.float32)
+        pa, pb = tmp_path / "a.1D", tmp_path / "b.1D"
+        np.savetxt(pa, a)
+        np.savetxt(pb, b)
+        blk_a = make_nuisance_block_from_per_run_file(str(pa), "mot", 1, [0, 10], 20)
+        blk_b = make_nuisance_block_from_per_run_file(str(pb), "mot", 2, [0, 10], 20)
+        assert blk_a.block_diagonal and blk_b.block_diagonal
+        out = build_nuisance_block_diag(
+            run_starts=[0, 10], n_timepoints=20, polort=-1, device=CPU, blocks=[blk_a, blk_b]
+        )
+        # polort=-1 → no poly; 2 blocks × 2 cols = 4, each zero outside its run.
+        assert out.shape == (20, 4)
+        np.testing.assert_allclose(out[10:, 0:2].numpy(), 0.0, atol=1e-6)  # block a: run1 zero
+        np.testing.assert_allclose(out[:10, 2:4].numpy(), 0.0, atol=1e-6)  # block b: run0 zero
+
 
 # ---------------------------------------------------------------------------
 # CLI surface: add_ortvec_arguments + collect_nuisance_blocks
@@ -546,9 +593,9 @@ class TestBuilderBlocksKwarg:
         assert all(m.shape[1] == 3 for m in out)
 
     def test_build_block_diag_per_run_block_zero_pads_missing(self, tmp_path):
-        # Per-run block for run 1 only — should appear as nonzero in run 1,
-        # zeros in run 2's rows of that column (block_diag layout).
-        arr = np.ones((10, 1), dtype=np.float32)
+        # Per-run block for run 1 only → block-diagonal: nonzero in run 1's rows,
+        # exactly zero in run 2's rows (and per-run demeaned within run 1).
+        arr = np.arange(10, dtype=np.float32).reshape(10, 1)  # non-constant
         path = tmp_path / "r1.1D"
         np.savetxt(path, arr)
         block = make_nuisance_block_from_per_run_file(
@@ -565,11 +612,10 @@ class TestBuilderBlocksKwarg:
             device=CPU,
             blocks=[block],
         )
-        # No polys; just one column from the block. Demeaned globally → mean is 0.
+        # No polys; one column from the block, occupying only run 1 (block-diag).
         assert out.shape == (20, 1)
         col = out[:, 0].numpy()
-        # Row 0-9 has the (demeaned) value, rows 10-19 are zero before demean
-        # → after global demean, all 20 values shift by the mean.
-        np.testing.assert_allclose(col.mean(), 0.0, atol=1e-6)
-        # The two halves still differ by 1.0 (the original value gap).
-        np.testing.assert_allclose(col[:10] - col[10:], np.ones(10), atol=1e-6)
+        np.testing.assert_allclose(col[10:], 0.0, atol=1e-6)  # run 2 rows are zero
+        np.testing.assert_allclose(col[:10].mean(), 0.0, atol=1e-6)  # per-run demeaned
+        # Shape preserved within run 1 (demean is just a constant shift).
+        np.testing.assert_allclose(col[:10], arr[:, 0] - arr[:, 0].mean(), atol=1e-5)

@@ -870,6 +870,11 @@ class NuisanceBlock:
     column_names: list[str] | None = None
     # Provenance: filename that fed each run (None where the block is empty).
     source: list[str | None] = field(default_factory=list)
+    # True → per-run regressors that must be expanded BLOCK-DIAGONALLY (each run
+    # gets its own columns, zero outside that run), like the polynomials — this is
+    # the -ortvec_run / -ortvec_glob case (distinct per-run files). False → a single
+    # full-length regressor SHARED across runs (AFNI -ortvec semantics).
+    block_diagonal: bool = False
 
     def __post_init__(self):
         if not self.source:
@@ -1049,7 +1054,7 @@ def make_nuisance_block_from_per_run_file(
     per_run[run_idx] = arr
     source: list[str | None] = [None] * n_runs
     source[run_idx] = str(path)
-    return NuisanceBlock(label=label, per_run=per_run, source=source)
+    return NuisanceBlock(label=label, per_run=per_run, source=source, block_diagonal=True)
 
 
 def make_nuisance_block_from_glob(
@@ -1088,7 +1093,7 @@ def make_nuisance_block_from_glob(
         per_run[run_idx] = arr
         source[run_idx] = str(path)
 
-    return NuisanceBlock(label=label, per_run=per_run, source=source)
+    return NuisanceBlock(label=label, per_run=per_run, source=source, block_diagonal=True)
 
 
 def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
@@ -1495,11 +1500,14 @@ def build_nuisance_block_diag(
     ...     device=torch.device("cuda"),
     ... )
 
-    Internal: this is now a thin shim. Polynomials still go block-diag.
-    Ortvec is treated as SHARED across runs (AFNI ``-ortvec`` semantics):
-    each block's full-length vertical concatenation is appended on the
-    right. A non-zero global mean is detected and subtracted (so it does
-    not fight the per-run polort intercepts).
+    Ortvec handling depends on the block's ``block_diagonal`` flag:
+      * ``block_diagonal=False`` (full-length ``-ortvec``, AFNI semantics) —
+        SHARED across runs: the block's vertical concatenation is appended on
+        the right as one set of columns, globally demeaned.
+      * ``block_diagonal=True`` (``-ortvec_run`` / ``-ortvec_glob``, distinct
+        per-run files) — each populated run gets its OWN columns (zero outside
+        that run), per-run demeaned. So 6 runs × 3 PCs → 18 block-diagonal
+        columns, not 3 shared ones.
     """
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
@@ -1539,11 +1547,46 @@ def build_nuisance_block_diag(
         return nuisance_design
 
     for block in all_blocks:
-        if block.n_columns == 0:
+        ncols = block.n_columns
+        if ncols == 0:
             continue
-        # Stack per-run matrices into full-length columns. For full-length
-        # files this recovers the SHARED ortvec layout. For per-run files
-        # missing runs come out as zeros — natural per-run nuisance.
+
+        if block.block_diagonal:
+            # Per-run regressors (-ortvec_run / -ortvec_glob): each populated run
+            # gets its OWN ncols columns, zero outside that run — block-diagonal,
+            # like the polynomials. So 6 runs × 3 PCs -> 18 columns, not 3 shared.
+            # Demean each run's block independently (per-run, so it doesn't fight
+            # that run's polort intercept).
+            col_groups: list[np.ndarray] = []
+            demeaned = False
+            for i in range(n_runs):
+                m = block.per_run[i]
+                if m is None:
+                    continue
+                m = np.asarray(m, dtype=np.float32).copy()
+                col_mean = m.mean(axis=0, keepdims=True)
+                if np.max(np.abs(col_mean)) > 1e-4:
+                    m = m - col_mean
+                    demeaned = True
+                full = np.zeros((n_timepoints, m.shape[1]), dtype=np.float32)
+                full[run_starts[i] : run_starts[i] + run_lengths[i]] = m
+                col_groups.append(full)
+            if not col_groups:
+                continue
+            stacked = np.concatenate(col_groups, axis=1)
+            ortvec_tensor = torch.from_numpy(stacked).to(device=device, dtype=nuisance_design.dtype)
+            nuisance_design = torch.cat([nuisance_design, ortvec_tensor], dim=1)
+            if verbose:
+                if demeaned:
+                    print(f"    Demeaned ortvec {block.label!r} per-run (was not zero-mean)")
+                print(
+                    f"    {block.label}: {ortvec_tensor.shape[1]} regressor(s) "
+                    f"(block-diagonal, {len(col_groups)} run(s) × {ncols})"
+                )
+            continue
+
+        # Shared full-length regressor (AFNI -ortvec): stack per-run matrices into
+        # one set of columns spanning all runs. Missing runs come out as zeros.
         full = np.vstack([block.get_run(i, run_lengths[i]) for i in range(n_runs)]).astype(
             np.float32
         )
