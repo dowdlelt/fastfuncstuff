@@ -36,7 +36,7 @@ from .affine import (  # noqa: E402
     voxel_matrix_to_dicom,
 )
 from .cost import _separable_smooth_3d, lpa_correlation  # noqa: E402
-from .interp import _separable_resample_3d  # noqa: E402
+from .interp import _separable_resample_3d, warp_image  # noqa: E402
 from .shear import shear_resample  # noqa: E402
 
 try:  # Triton kernel is CUDA-only; absence must not break CPU/MPS installs
@@ -96,6 +96,16 @@ class MocoConfig:
     # rebuilding the weight or the expensive derivative images).
     weight_override: Tensor | None = None
     derivs_override: Tensor | None = None
+
+    # Slice-timing-aware estimation (space-time realignment, application-loop 1a).
+    # When slice_times is set, moco_spacetime() alternates joint slice-timing +
+    # motion correction with re-estimation, so motion is estimated on data with
+    # the slice-timing-vs-BOLD confound removed. See [[Space-time realignment]].
+    slice_times: list[float] | None = None
+    st_tr: float | None = None  # TR (seconds); required with slice_times
+    st_tzero: float | None = None  # reference time; default = mean(slice_times)
+    st_tinterp: str = "cubic"  # temporal kernel: linear|cubic|wsinc5|wsinc9
+    st_iters: int = 2  # outer refinement iterations (1 == tshift-then-moco)
 
 
 @dataclass
@@ -860,7 +870,9 @@ def resample_timeseries(
     aligned = torch.zeros_like(timeseries)
     rms_after = np.zeros(nt, dtype=np.float64)
 
-    batch_size = compute_moco_resample_batch_size(nz, ny, nx, nt, device, interp=config.final_interp)
+    batch_size = compute_moco_resample_batch_size(
+        nz, ny, nx, nt, device, interp=config.final_interp
+    )
     if config.verb >= 1:
         print(f"  Resampling batch size: {batch_size} volumes")
 
@@ -1602,4 +1614,251 @@ def moco(
         patch_labels=patch_labels,
         params_preweight=params_preweight,
         reweight_applied=applied,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Slice-timing-aware estimation (space-time realignment, application-loop 1a)
+# ---------------------------------------------------------------------------
+
+
+def _homo_grid(nz: int, ny: int, nx: int, device: torch.device):
+    """Index meshgrid (kk,jj,ii) and homogeneous (4,N) coords on ``device``."""
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(nz, dtype=torch.float32, device=device),
+        torch.arange(ny, dtype=torch.float32, device=device),
+        torch.arange(nx, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    homo = torch.stack(
+        [
+            ii.reshape(-1),
+            jj.reshape(-1),
+            kk.reshape(-1),
+            torch.ones(nz * ny * nx, dtype=torch.float32, device=device),
+        ],
+        dim=0,
+    )
+    return kk, jj, ii, homo
+
+
+def _motion_correct_series(
+    timeseries: Tensor,
+    matrices_vox: Tensor,
+    interp: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    disable_pbar: bool,
+) -> Tensor:
+    """Spatially motion-correct every frame by its own pose. Returns CPU (nt,…)."""
+    nt, nz, ny, nx = timeseries.shape
+    kk, jj, ii, homo = _homo_grid(nz, ny, nx, device)
+    aligned = torch.empty((nt, nz, ny, nx), dtype=dtype, device="cpu")
+    for f in tqdm(range(nt), desc="  Motion correct", disable=disable_pbar, unit="vol", ncols=80):
+        s = matrices_vox[f].to(device=device, dtype=torch.float32) @ homo
+        xd = s[0].reshape(nz, ny, nx) - ii
+        yd = s[1].reshape(nz, ny, nx) - jj
+        zd = s[2].reshape(nz, ny, nx) - kk
+        frame = timeseries[f].to(device=device, dtype=dtype)
+        aligned[f] = warp_image(frame, xd, yd, zd, mode=interp).cpu()
+    return aligned
+
+
+def _time_correct_aligned(
+    aligned: Tensor,
+    matrices_vox: Tensor,
+    slice_times_t: Tensor,
+    tr: float,
+    tzero: float,
+    tinterp: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    disable_pbar: bool,
+) -> Tensor:
+    """Temporally realign an already motion-corrected series to ``tzero``.
+
+    ``aligned`` is in base space, so blending its frames at a fixed voxel combines
+    the *same tissue* across time (no motion mixing). The offset is taken at the
+    scanner slice the tissue occupied in frame ``j``:
+    ``T_j(x) = j + (tzero - Δ((pose_j·x)_z)) / TR``.
+    """
+    from .spacetime import _KERNEL_HALFWIDTH, interp_slice_times, temporal_kernel_weights
+
+    nt, nz, ny, nx = aligned.shape
+    _, _, _, homo = _homo_grid(nz, ny, nx, device)
+    half = _KERNEL_HALFWIDTH[tinterp]
+    out = torch.empty((nt, nz, ny, nx), dtype=dtype, device="cpu")
+    for j in tqdm(range(nt), desc="  Time correct", disable=disable_pbar, unit="vol", ncols=80):
+        Mj = matrices_vox[j].to(device=device, dtype=torch.float32)
+        szj = (Mj @ homo)[2].reshape(nz, ny, nx)
+        delta = interp_slice_times(szj, slice_times_t)
+        tcoord = j + (tzero - delta) / tr  # (nz, ny, nx)
+        f_lo = int(math.floor(float(tcoord.min()))) - (half - 1)
+        f_hi = int(math.floor(float(tcoord.max()))) + half
+        acc = torch.zeros((nz, ny, nx), dtype=dtype, device=device)
+        wsum = torch.zeros_like(acc)
+        for f in range(f_lo, f_hi + 1):
+            w = temporal_kernel_weights(tcoord - f, tinterp)
+            if not bool(torch.any(w != 0.0)):
+                continue
+            fc = min(max(f, 0), nt - 1)
+            acc += w * aligned[fc].to(device=device, dtype=dtype)
+            wsum += w
+        out[j] = (acc / wsum.clamp_min(1e-8)).cpu()
+    return out
+
+
+def _motion_time_correct(
+    timeseries: Tensor,
+    matrices_vox: Tensor,
+    slice_times_t: Tensor,
+    tr: float,
+    tzero: float,
+    tinterp: str,
+    interp: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    disable_pbar: bool,
+) -> Tensor:
+    """Motion-correct then slice-timing-correct (the joint final output)."""
+    aligned = _motion_correct_series(timeseries, matrices_vox, interp, device, dtype, disable_pbar)
+    return _time_correct_aligned(
+        aligned, matrices_vox, slice_times_t, tr, tzero, tinterp, device, dtype, disable_pbar
+    )
+
+
+def moco_spacetime(
+    timeseries: Tensor,
+    config: MocoConfig,
+    header_info: dict | None = None,
+    base_vol: Tensor | None = None,
+) -> MocoResult:
+    """Slice-timing-aware motion correction (space-time realignment, loop 1a).
+
+    Alternates joint slice-timing + motion correction (via the ``ffs_nwarp``
+    space-time applicator) with re-estimation (the standard batched ``moco``
+    estimator, unchanged): motion is estimated on data whose slice-timing-vs-BOLD
+    confound has been removed by the previous pass's timing correction, which
+    reduces stimulus-correlated motion. See [[Space-time realignment]].
+
+    Each outer iteration: (1) motion-correct every frame by the accumulated pose;
+    (2) register against the *mean* of those motion-corrected frames — an online
+    template (Roche), robust to the single-frame reference corruption that a
+    time-blended base frame would suffer under motion; (3) temporally realign the
+    motion-corrected series to ``tzero`` and re-estimate the residual against the
+    template, composing it in. ``st_iters=1`` is one pass; the default 2 adds a
+    refinement. The final output applies motion + slice timing in one resample.
+    """
+    if config.slice_times is None:
+        raise ValueError("moco_spacetime requires config.slice_times")
+    if config.st_tr is None or config.st_tr <= 0:
+        raise ValueError("moco_spacetime requires a positive config.st_tr (TR)")
+    if timeseries.ndim != 4:
+        raise ValueError(f"expected 4-D timeseries, got {timeseries.ndim}-D")
+
+    nt, nz, ny, nx = timeseries.shape
+    if len(config.slice_times) != nz:
+        raise ValueError(
+            f"slice timing has {len(config.slice_times)} entries but series has {nz} slices"
+        )
+
+    if config.device:
+        device = torch.device(config.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    dtype = torch.float32
+
+    tr = float(config.st_tr)
+    tzero = (
+        config.st_tzero
+        if config.st_tzero is not None
+        else sum(config.slice_times) / len(config.slice_times)
+    )
+    slice_times_t = torch.tensor(config.slice_times, dtype=dtype, device=device)
+    disable_pbar = config.verb == 0
+    n_iters = max(1, config.st_iters)
+
+    if config.verb >= 1:
+        print(
+            f"ffs_moco: slice-timing-aware (space-time), {n_iters} outer iter(s), "
+            f"TR={tr:.4f}s, tzero={tzero:.4f}s, tinterp={config.st_tinterp}"
+        )
+
+    # Accumulated raw->reference voxel pull matrices; identity to start.
+    poses = torch.eye(4, dtype=dtype).unsqueeze(0).repeat(nt, 1, 1)  # (nt, 4, 4) on CPU
+
+    # Estimate-only config: reuse the full (batched) estimator, no Pass-2 resample
+    # and no nested slice-timing (avoid recursion).
+    from dataclasses import replace
+
+    est_cfg = replace(config, slice_times=None, skip_resample=True, verb=max(0, config.verb - 1))
+
+    result: MocoResult | None = None
+    for it in range(n_iters):
+        if config.verb >= 1:
+            print(f"  [space-time] outer iter {it + 1}/{n_iters}")
+        # (1) motion-correct every frame by the current pose (base space).
+        aligned = _motion_correct_series(
+            timeseries, poses, config.interp, device, dtype, disable_pbar
+        )
+        # (2) temporally realign the motion-corrected series to tzero. The
+        # reference (corrected[base_index]) is now clean: its neighbours were
+        # motion-corrected *before* the temporal blend, so it is no longer
+        # corrupted by blending moving frames (the two-stage order is what makes
+        # the base-frame reference — and the accumulation — stable).
+        corrected = _time_correct_aligned(
+            aligned, poses, slice_times_t, tr, tzero, config.st_tinterp, device, dtype, disable_pbar
+        )
+        # (3) re-estimate the residual against the base (corrected[base_index]
+        # when base_vol is None), then compose it in.
+        result = moco(corrected, est_cfg, header_info=header_info, base_vol=base_vol)
+        dposes = result.matrices_vox  # (nt, 4, 4) residual, aligns corrected -> base
+        # Compose: total_pull[j] = poses[j] @ dposes[j] (pull convention).
+        poses = torch.bmm(poses, dposes.to(dtype))
+
+    # Final aligned output: joint correction from raw with the final pose, using
+    # the final (high-quality) interpolation kernel.
+    aligned = timeseries.new_empty(0)
+    if not config.skip_resample:
+        aligned = _motion_time_correct(
+            timeseries,
+            poses,
+            slice_times_t,
+            tr,
+            tzero,
+            config.st_tinterp,
+            config.final_interp,
+            device,
+            dtype,
+            disable_pbar,
+        )
+
+    # Derive DICOM matrices, params, and max displacement from the final poses.
+    affine = header_info["affine"] if header_info else np.eye(4)
+    voxel_sizes = _get_voxel_sizes(affine)
+    vol_shape = (nz, ny, nx)
+    matrices_dicom_np = np.zeros((nt, 4, 4), dtype=np.float64)
+    params_dicom = np.zeros((nt, 6), dtype=np.float64)
+    max_disp = np.zeros(nt, dtype=np.float64)
+    for t in range(nt):
+        M_vox = poses[t]
+        M_dicom = voxel_matrix_to_dicom(M_vox, affine, affine)
+        matrices_dicom_np[t] = M_dicom.numpy()
+        params_dicom[t] = matrix_to_params(M_dicom)[:6].numpy()
+        max_disp[t] = compute_max_displacement(M_vox, vol_shape, voxel_sizes)
+
+    assert result is not None
+    return MocoResult(
+        aligned=aligned,
+        params=params_dicom,
+        matrices_vox=poses,
+        matrices_dicom=matrices_dicom_np,
+        max_displacement=max_disp,
+        rms_before=result.rms_before,
+        rms_after=result.rms_after,
+        n_iters=result.n_iters,
     )

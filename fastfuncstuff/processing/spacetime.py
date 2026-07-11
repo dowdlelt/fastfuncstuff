@@ -140,7 +140,10 @@ def apply_spacetime_sample(
     (onz, ony, onx) warped, slice-timing-corrected volume.
     """
     nt = source.shape[0]
-    device = source.device
+    # Compute on the coords' device; ``source`` may live on CPU and stream frame
+    # by frame (the temporal window is only ~4-6 frames), so a large 4-D series
+    # never needs to sit on the GPU in full.
+    device = sx.device
 
     # Per-voxel acquisition offset and the fractional input-frame coordinate.
     delta = interp_slice_times(sz, slice_times)
@@ -170,7 +173,8 @@ def apply_spacetime_sample(
         # Edge-extend past the series ends (nipy uses reflect; clamp is adequate
         # and never invents structure -- the weights there are already tiny).
         fc = min(max(f, 0), nt - 1)
-        s_f = warp_image(source[fc], xd, yd, zd, mode=interp)
+        frame = source[fc].to(device=device, dtype=acc.dtype)  # streams from CPU if needed
+        s_f = warp_image(frame, xd, yd, zd, mode=interp)
         if no_neg:
             s_f = s_f.clamp_min(0.0)
         acc += w * s_f

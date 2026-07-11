@@ -21,6 +21,7 @@ from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
     _blur_volume,
     moco,
+    moco_spacetime,
     resample_timeseries,
     save_maxdisp_1D,
     save_moco_1D,
@@ -45,6 +46,45 @@ def _sibling(path: str, prefix: str) -> str:
 
     d, base = os.path.split(path)
     return os.path.join(d, prefix + base)
+
+
+def _run_estimation(args, data, config, header_info, base_vol, input_file, verb):
+    """Dispatch to slice-timing-aware moco (space-time) or plain moco.
+
+    When -tpattern is given, resolve the TR (flag > JSON RepetitionTime > header)
+    and run the alternating joint slice-timing + motion estimator; otherwise the
+    standard estimator.
+    """
+    if config.slice_times is None:
+        return moco(data, config, header_info=header_info, base_vol=base_vol)
+
+    tr = config.st_tr
+    if tr is None and args.tpattern.endswith(".json"):
+        import json
+
+        jdata = json.loads(Path(args.tpattern).read_text())
+        if "RepetitionTime" in jdata:
+            tr = float(jdata["RepetitionTime"])
+    if tr is None:
+        from fastfuncstuff.io.afni import get_tr_from_file
+
+        hdr_tr = get_tr_from_file(input_file)
+        if hdr_tr and hdr_tr > 0:
+            tr = hdr_tr
+    if tr is None:
+        print(
+            "Error: -tpattern needs a TR; none in JSON/header, pass -TR.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    from dataclasses import replace as _replace
+
+    if config.st_tr != tr:
+        config = _replace(config, st_tr=tr)
+    if verb >= 1:
+        print(f"Slice-timing-aware moco: {len(config.slice_times)} slices, TR={tr:.4f}s")
+    return moco_spacetime(data, config, header_info=header_info, base_vol=base_vol)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -317,6 +357,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-no-shear", dest="no_shear", action="store_true", help=argparse.SUPPRESS
     )
 
+    st_group = parser.add_argument_group("Slice timing (space-time realignment)")
+    st_group.add_argument(
+        "-tpattern",
+        default=None,
+        help="Per-slice acquisition timing (text: one time/line in seconds, or "
+        "BIDS JSON with SliceTiming). Enables slice-timing-AWARE motion "
+        "correction: motion is estimated on data with the slice-timing-vs-BOLD "
+        "confound removed (reduces stimulus-correlated motion), and the aligned "
+        "output applies motion+slice-timing in one interpolation. Requires a TR.",
+    )
+    st_group.add_argument(
+        "-TR",
+        type=float,
+        default=None,
+        help="Repetition time (seconds) for -tpattern; read from the NIfTI "
+        "header (or JSON RepetitionTime) when omitted.",
+    )
+    st_group.add_argument(
+        "-tzero",
+        type=float,
+        default=None,
+        help="Reference time within the TR to align slices to (seconds). "
+        "Default: mean of slice times.",
+    )
+    st_group.add_argument(
+        "-tinterp",
+        choices=["linear", "cubic", "wsinc5", "wsinc9"],
+        default="cubic",
+        help="Temporal interpolation kernel for -tpattern (default cubic).",
+    )
+    st_group.add_argument(
+        "-st_iters",
+        "-st-iters",
+        type=int,
+        default=2,
+        dest="st_iters",
+        help="Space-time outer refinement iterations (default 2; 1 == "
+        "tshift-then-moco, each extra iter re-estimates motion on freshly "
+        "joint-corrected data).",
+    )
+
     # --- Output files ---
     out_group = parser.add_argument_group("Output files")
     out_group.add_argument("-1Dfile", default=None, help="Save 6-column motion parameters (.1D)")
@@ -403,8 +484,10 @@ def _load_trimmed(path: str, skip_first: int, skip_last: int, verb: int):
     if skip_first or skip_last:
         data = data[skip_first : nt - skip_last]
         if verb >= 1:
-            print(f"  Trimmed {path}: {nt} -> {data.shape[0]} volumes "
-                  f"(-skip_first {skip_first}, -skip_last {skip_last})")
+            print(
+                f"  Trimmed {path}: {nt} -> {data.shape[0]} volumes "
+                f"(-skip_first {skip_first}, -skip_last {skip_last})"
+            )
     return data, header_info
 
 
@@ -453,10 +536,21 @@ def _build_config(
     if args.workhard and verb >= 1:
         print(f"  -workhard: max_iter={max_iter}, dxy={dxy_thresh:g}, dph={dph_thresh:g}")
 
+    slice_times = None
+    if getattr(args, "tpattern", None) is not None:
+        from fastfuncstuff.processing.slicetime import load_slice_timing
+
+        slice_times = load_slice_timing(args.tpattern)
+
     return MocoConfig(
         skip_resample=skip_resample,
         base_index=base_index,
         cost=args.cost,
+        slice_times=slice_times,
+        st_tr=args.TR,
+        st_tzero=args.tzero,
+        st_tinterp=args.tinterp,
+        st_iters=args.st_iters,
         interp=args.interp,
         final_interp=args.final_interp,
         max_iter=max_iter,
@@ -585,8 +679,10 @@ def _parse_reg_echo(reg_echo: str | None, n_echoes: int) -> tuple[bool, int]:
     try:
         r = int(reg_echo)
     except ValueError:
-        print(f"Error: -reg_echo must be an integer (1-based) or 'mean', got {reg_echo!r}.",
-              file=sys.stderr)
+        print(
+            f"Error: -reg_echo must be an integer (1-based) or 'mean', got {reg_echo!r}.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if not (1 <= r <= n_echoes):
         print(f"Error: -reg_echo {r} out of range for {n_echoes} echo(es).", file=sys.stderr)
@@ -658,10 +754,12 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
 
     # Resampling is only needed if we will emit a corrected series or its mean.
     need_aligned = args.prefix is not None or args.save_mean is not None
-    config = _build_config(args, device, verb, skip_resample=not need_aligned, base_index=base_index)
+    config = _build_config(
+        args, device, verb, skip_resample=not need_aligned, base_index=base_index
+    )
 
     t1 = time.time()
-    result = moco(data, config, header_info=header_info, base_vol=base_vol)
+    result = _run_estimation(args, data, config, header_info, base_vol, input_file, verb)
     if verb >= 1:
         print(f"Total registration: {time.time() - t1:.2f}s")
 
@@ -704,6 +802,13 @@ def _run_multi_echo(
 ) -> None:
     """Multi-echo: estimate motion from one echo (or the cross-echo mean), then
     apply the same transforms to every echo, writing eN_ prefixed outputs."""
+    if getattr(args, "tpattern", None) is not None:
+        print(
+            "Error: -tpattern (slice-timing-aware moco) is single-echo only for now.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     n_echoes = len(input_files)
     if verb >= 1:
         which = "mean" if reg_mean else f"echo {reg_index + 1}"
@@ -713,9 +818,7 @@ def _run_multi_echo(
 
     # Build the estimation source (one echo, or the per-timepoint mean).
     if reg_mean:
-        reg_data, header_info = _load_echo_mean(
-            input_files, args.skip_first, args.skip_last, verb
-        )
+        reg_data, header_info = _load_echo_mean(input_files, args.skip_first, args.skip_last, verb)
     else:
         reg_data, header_info = _load_trimmed(
             input_files[reg_index], args.skip_first, args.skip_last, verb
