@@ -125,30 +125,30 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 | `ffs_reml` | OLS / ARMA(1,1) prewhitened GLM with REML grid search over (a, b). AFNI `3dREMLfit`-style bucket output, FDR curves attached. Accepts per-voxel HRF assignments via `-hrfopt_prefix`, and `-single_trials LABEL` rebuilds the design with one regressor per event. Can take `-spec design.spec` to compile the whole design itself. |
 | `ffs_design_spec` | Compile a single `design.spec` TOML (runs, events, per-task HRF, nuisance, contrasts with wildcards/F-tests) into an AFNI `.xmat.1D`. `stub` writes a skeleton from `events.tsv` + NIfTI headers. |
 | `ffs_util_concalc` | Recompute or add GLM contrasts (t and F) on an existing REML bucket without rerunning the GLM — reuses the per-(a,b) ARMA inverse so it's near-free. |
-| `ffs_ridge` | Fractional ridge regression for single-trial betas (GLMsingle Type D). Per-voxel optimal fraction by cross-validation. |
-| `ffs_deconvolve` | FIR / event-related deconvolution without an assumed HRF shape. |
-| `ffs_perm` *(beta)* | GPU-batched non-parametric permutation testing (ex. for single trials or group statistics). ~5,000 permutations / 2 minutes for a full brain. Writes AFNI-compatible corrected t-stats and attacheds cluster tables (for max cluster size correction). |
+| `ffs_ridge` | Fractional ridge regression for single-trial betas (GLMsingle Type D; Prince et al. 2022). Per-voxel optimal fraction by cross-validation. |
+| `ffs_deconvolve` | FIR / event-related deconvolution without an assumed HRF shape (Glover 1999). |
+| `ffs_perm` *(beta)* | GPU-batched non-parametric permutation testing (ex. for single trials or group statistics; Nichols & Holmes 2002). ~5,000 permutations / 2 minutes for a full brain. Writes AFNI-compatible corrected t-stats and attacheds cluster tables (for max cluster size correction). |
 
 
 ### HRF and denoising
 
 | command | description |
 |---|---|
-| `ffs_hrfopt` | Per-voxel HRF library selection. Tests each HRF in a library by LORO CV; refits with the winner. Canonical or PIGHS libraries. |
-| `ffs_librarian` | Derive a custom HRF library from a subject's own data, for use with `ffs_hrfopt`. |
-| `ffs_fitbasis` | Constrained basis-set HRF fits (SPMG1/2/3, FLOBS). |
+| `ffs_hrfopt` | Per-voxel HRF library selection (as in GLMsingle; Prince et al. 2022). Tests each HRF in a library by LORO CV; refits with the winner. Canonical or PIGHS libraries. |
+| `ffs_librarian` | Derive a custom HRF library from a subject's own data, for use with `ffs_hrfopt` (cf. the NSD library; Allen et al. 2022). |
+| `ffs_fitbasis` | Constrained basis-set HRF fits (SPMG1/2/3, FLOBS; Woolrich, Behrens & Smith 2004). |
 | `ffs_denoise` | GLMdenoise-style noise-PC denoising (Kay et al. 2013). Identifies a noise pool, extracts PCs, picks the count by LORO CV. |
 | `ffs_denoisatorial` | Exhaustive 2^k subset evaluation of noise PCs, when you want the best non-contiguous combination rather than a prefix. |
 | `ffs_phasereg` | Magnitude-on-phase Deming regression for macrovascular BOLD suppression (Menon 2002, Curtis 2014, Stanley 2021; phaseprep parity). |
-| `ffs_nordic` | NORDIC-style patch-SVD denoising. Magnitude-only or complex (mag + phase), with optional g-factor map. |
+| `ffs_nordic` | NORDIC-style patch-SVD denoising (Moeller et al. 2021). Magnitude-only or complex (mag + phase), with optional g-factor map. |
 | `ffs_sauna` *(beta)*  | NORDIC-adjacent denoiser. g-factor from trailing noise volumes + Gavish–Donoho optimal singular-value shrinkage. VERY experimental, was an exploration, not vetted (but produces very similar timeseries) |
 
 ### Decomposition
 
 | command | description |
 |---|---|
-| `ffs_ica` | MELODIC-style probabilistic ICA. Auto component count, GGM mixture-model thresholding, MIGP for temporal concat, optional ICASSO and *(beta)* depth-lag/mask/nuisance component classification (on TODO list for testing). |
-| `ffs_decompose` | ICA with an emphasis on stability via ICASSO clustering. |
+| `ffs_ica` | MELODIC-style probabilistic ICA (Beckmann & Smith 2004). Auto component count, GGM mixture-model thresholding, MIGP for temporal concat, optional ICASSO and *(beta)* depth-lag/mask/nuisance component classification (on TODO list for testing). |
+| `ffs_decompose` | ICA with an emphasis on stability via ICASSO clustering (Himberg et al. 2004). |
 | `ffs_bsds` | Bayesian switching dynamical systems on ROI time series (dynamic brain states; Taghia 2018 / Cai 2024). |
 
 ### Image processing and registration
@@ -157,13 +157,13 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 |---|---|
 | `ffs_moco` | Rigid-body motion correction (Gauss–Newton, wsinc5/heptic resampling). Writes AFNI-compatible motion files. Estimation and resampling for ~300 volume 2D data is ~3 seconds, time dominated by I/O. |
 | `ffs_locomoco` | Residual non-linear motion correction for single-echo EPI via optical flow (mostly the phase-encode axis, after rigid moco). Writes a per-frame warp for `ffs_nwarp`. |
-| `ffs_allineate` | ~100x faster 6/9/12-parameter affine alignment with `3dAllineate`-style cost functions: `lpa`/`lpc` local Pearson (same- and cross-modal), `ls`, `mi`/`nmi`, Hellinger, and correlation ratio. Use `lpa` for same-contrast (e.g. anat→MNI) and `lpc` for cross-modal (EPI→anat).|
+| `ffs_allineate` | ~100x faster 6/9/12-parameter affine alignment with `3dAllineate`-style cost functions: `lpa`/`lpc` local Pearson (same- and cross-modal; Saad et al. 2009), `ls`, `mi`/`nmi`, Hellinger, and correlation ratio. Use `lpa` for same-contrast (e.g. anat→MNI) and `lpc` for cross-modal (EPI→anat).|
 | `ffs_qwarp` | Iterative nonlinear warp estimation (`3dQwarp`-style). |
-| `ffs_formwarp` | SyN nonlinear registration (ANTs-style symmetric normalization); an alternative backend to `ffs_qwarp`. Single-pair or per-volume timeseries; writes `ffs_nwarp`-compatible warps. |
+| `ffs_formwarp` | SyN nonlinear registration (ANTs-style symmetric normalization; Avants et al. 2008); an alternative backend to `ffs_qwarp`. Single-pair or per-volume timeseries; writes `ffs_nwarp`-compatible warps. |
 | `ffs_nwarp` | Apply a warp to a volume or 4D timeseries. Supports complex (mag + phase) warping. |
-| `ffs_medic` | Multi-echo distortion correction (MEDIC): frame-wise B0 field maps from phase, for dynamic distortion under motion. |
+| `ffs_medic` | Multi-echo distortion correction (MEDIC; Van et al. 2026): frame-wise B0 field maps from phase, for dynamic distortion under motion. |
 | `ffs_slicetime` | Slice-timing correction (`3dTshift`-style), Fourier or sinc. |
-| `ffs_t2smap` | Multi-echo T2*/S0 estimation and optimal echo combination. |
+| `ffs_t2smap` | Multi-echo T2*/S0 estimation and optimal echo combination (Posse et al. 1999). |
 | `ffs_motsim` | Motion-simulation nuisance regressors (Patriat, Reynolds & Birn 2017). |
 | `ffs_util_automask` | Automatic brain mask from EPI. |
 | `ffs_util_pcwarp` | Extract PCs from a warp-field timeseries (folder of 4D frames or a 5D file) as nuisance regressors. |
@@ -185,7 +185,7 @@ These are either WIP CLI tools, things that I am tinkering with or ones that I j
 | `ffs_tps` *(beta)*  | Thin-plate-spline HRF estimation with cross-validated smoothness. Global or per-voxel λ. Further work required here |
 | `ffs_xval_r2` | Cross-validated R² maps (LORO or split-half) with proper nuisance projection. |
 | `ffs_pathfinder` | Joint HRF + denoising optimisation. Picks the HRF that works best with the denoising level chosen for that voxel. |
-| `ffs_util_fwhm` | Whole-volume spatial smoothness of a residual dataset (`3dFWHMx`-style: classic FWHM + ACF a/b/c). |
+| `ffs_util_fwhm` | Whole-volume spatial smoothness of a residual dataset (`3dFWHMx`-style: classic FWHM + mixed ACF a/b/c; Cox et al. 2017). |
 | `ffs_util_localstat` | Local spatial statistics over a neighborhood (`3dLocalstat` / `3dLocalACF`-style). |
 | `ffs_util_3dmath` | Voxelwise math over one or more datasets (`3dcalc` / `3dMean`-style). |
 | `ffs_util_updatedof` | Adjust the degrees of freedom of a stat bucket (e.g. after NORDIC) and convert t/F to z. |
