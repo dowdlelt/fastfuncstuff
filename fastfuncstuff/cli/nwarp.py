@@ -210,11 +210,22 @@ Examples:
         "-follow-tissue",
         dest="follow_tissue",
         action="store_true",
-        help="Tissue-following joint resample: sample each temporal neighbour at "
-        "its own frame's pose instead of freezing the output frame's pose (the "
-        "slow-motion assumption). Recovers the right signal when motion sweeps "
-        "tissue between scanner locations frame to frame (e.g. a brain edge "
-        "moving in and out of a voxel). Costs one composition per input frame.",
+        default=True,
+        help="(default) Tissue-following joint resample: sample each temporal "
+        "neighbour at its own frame's pose instead of freezing the output frame's "
+        "pose (the slow-motion assumption). Recovers the right signal when motion "
+        "sweeps tissue between scanner locations frame to frame (e.g. a brain edge "
+        "moving in and out of a voxel). GPU cost is ~1% over the frozen path.",
+    )
+    st_group.add_argument(
+        "-frozen",
+        "-no_tfollow",
+        "-no-tfollow",
+        dest="follow_tissue",
+        action="store_false",
+        help="Force the frozen-pose (slow-motion-assumption) joint path instead of "
+        "the default tissue-following resample. Matches the pre-2026 behaviour and "
+        "a static 3dTshift-then-motion two-step.",
     )
 
     hw_group = parser.add_argument_group("Hardware")

@@ -1430,7 +1430,7 @@ def nwarpforge(
     tr: float | None = None,
     tzero: float | None = None,
     tinterp: str = "cubic",
-    follow_tissue: bool = False,
+    follow_tissue: bool = True,
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1499,12 +1499,12 @@ def nwarpforge(
             available here -- the per-voxel continuous shift is not a single
             per-slice phase rotation.
         follow_tissue: On the joint slice-timing path, sample each temporal
-            neighbour at *its own* pose (tissue-following) instead of freezing the
-            output frame's pose (the slow-motion assumption). Recovers the right
-            signal when motion moves tissue between scanner locations frame to
-            frame (e.g. a brain edge sweeping in and out of a voxel). Costs one
-            chain composition per input frame. See
-            processing/spacetime.py:apply_spacetime_sample_following.
+            neighbour at *its own* pose (tissue-following, the default) instead of
+            freezing the output frame's pose (the slow-motion assumption). Recovers
+            the right signal when motion moves tissue between scanner locations
+            frame to frame (e.g. a brain edge sweeping in and out of a voxel), at
+            ~1% GPU cost over the frozen path. Set False for the frozen-pose
+            behaviour. See processing/spacetime.py:TissueFollowingSampler.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

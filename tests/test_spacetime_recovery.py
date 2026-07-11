@@ -302,7 +302,8 @@ def test_tissue_following_beats_frozen_pose_on_fast_motion():
     ]
     frozen_p = os.path.join(work, "frozen.nii.gz")
     follow_p = os.path.join(work, "follow.nii.gz")
-    nwarp_main([*base_args, "-prefix", frozen_p])
+    # Tissue-following is the default now, so force the frozen path explicitly.
+    nwarp_main([*base_args, "-prefix", frozen_p, "-frozen"])
     nwarp_main([*base_args, "-prefix", follow_p, "-tfollow"])
 
     frozen = np.asarray(nib.load(frozen_p).dataobj).astype(np.float32)

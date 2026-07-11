@@ -25,9 +25,9 @@ own (spatial + temporal interpolation, and the paper's slow-motion assumption).
 
 Target: I(u, j*TR + tzero) -- every anatomical voxel, all slices realigned to a
 common within-TR reference time. Four corrections are scored against it:
-  * follow  -- ffs_nwarp -tpattern -tfollow (tissue-following joint: each temporal
-               tap sampled at its own frame's pose)
-  * joint   -- ffs_nwarp -tpattern (frozen-pose joint: one pose per output frame)
+  * follow  -- ffs_nwarp -tpattern (tissue-following joint, the DEFAULT: each
+               temporal tap sampled at its own frame's pose)
+  * joint   -- ffs_nwarp -tpattern -frozen (frozen-pose joint: one pose per frame)
   * tshift  -- ffs_slicetime (static 3dTshift) THEN ffs_nwarp motion-only
   * moco    -- ffs_nwarp, motion only (no slice-timing correction)
 run for two motion regimes: in-plane and (harder) through-plane.
@@ -373,8 +373,9 @@ def run_scenario(through_plane, work, device="cpu", shape=(48, 48, 20), nframes=
         "-verb",
         "0",
     ]
+    # Tissue-following is the default; -frozen forces the old slow-motion path.
     print(f"[{tag}] joint space-time (frozen pose) ...")
-    nwarp_main([*joint_args, "-prefix", joint_p])
+    nwarp_main([*joint_args, "-prefix", joint_p, "-frozen"])
     print(f"[{tag}] joint space-time (tissue-following) ...")
     nwarp_main([*joint_args, "-prefix", follow_p, "-tfollow"])
     print(f"[{tag}] motion-only ...")

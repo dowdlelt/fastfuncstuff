@@ -16,21 +16,31 @@ Why this is not just ``3dTshift`` then motion-correct:
     slice ``k'`` each output voxel came from, and you sample the raw 4-D data at
     the temporal coordinate ``t' = t - Delta(k')``.
 
-Operational form used here (separable, per output frame ``j``):
-    Delta(v)  = interp(slice_times, sz(v))           # per-voxel acquisition offset
-    T(v)      = j + (tzero - Delta(v)) / TR           # fractional input-frame coord
-    S_f       = spatial_warp(source[f]) with pose j   # same spatial map for all f
-    warped(v) = sum_f K(T(v) - f) * S_f(v) / sum_f K  # per-voxel temporal kernel
+Two samplers live here:
 
-``sz`` (the source-voxel k index each output voxel samples) is exactly the
-scanner slice ``k'`` because we sample the *raw* source there -- whatever the rest
-of the chain does downstream.  All temporal neighbours reuse pose ``j`` (the slow-
-motion assumption the paper makes explicit): the raw data is sampled at
-scanner coordinates derived from a single pose per output frame.
+* :func:`apply_spacetime_sample` -- the *frozen-pose* form (separable, per output
+  frame ``j``):
+      Delta(v)  = interp(slice_times, sz(v))          # per-voxel acquisition offset
+      T(v)      = j + (tzero - Delta(v)) / TR          # fractional input-frame coord
+      S_f       = spatial_warp(source[f]) with pose j  # same spatial map for all f
+      warped(v) = sum_f K(T(v) - f) * S_f(v) / sum_f K # per-voxel temporal kernel
+  Every temporal neighbour reuses pose ``j`` -- the slow-motion assumption the
+  paper makes explicit. Cheap, but under motion that fixed location holds different
+  tissue each frame, so the temporal interpolation mixes tissue (the same failure a
+  fixed-scanner-slice ``3dTshift`` has). Selectable with ``-frozen``.
 
-Temporal kernels are convolution kernels (functions of distance), so the per-voxel
-continuous shift ``T`` is handled without a per-slice uniform-shift assumption --
-which is why Fourier (a whole-slice phase rotation) has no place on this path.
+* :class:`TissueFollowingSampler` -- the **default**. It drops the slow-motion
+  assumption: each neighbour frame ``f`` is sampled at *its own* pose ``T_f(u)``,
+  so every temporal tap is the same anatomy, and the acquisition offset is read
+  from the scanner slice ``u`` lands in *in frame f*. Recovers the signal where the
+  frozen form (and a two-step tshift-then-motion) smear the wrong tissue -- e.g. a
+  brain edge sweeping in and out of a voxel -- at ~1% GPU cost.
+
+``sz`` (the source-voxel k index each output voxel samples) is exactly the scanner
+slice ``k'`` because we sample the *raw* source there. Temporal kernels are
+convolution kernels (functions of distance), so the per-voxel continuous shift is
+handled without a per-slice uniform-shift assumption -- which is why Fourier (a
+whole-slice phase rotation) has no place on this path.
 """
 
 from __future__ import annotations
