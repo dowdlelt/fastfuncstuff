@@ -90,6 +90,20 @@ tuning (turning the knobs):
   -levels     more pyramid levels handle bigger motion but risk aliasing on thin
               slices.
 
+accuracy (trade time for exactness — all backends):
+
+  -warp_interp bicubic   faithful resampler for the estimation iterations (removes
+                         bilinear damping); helped flow on local-field tests, neutral
+                         for phase/xcorr. Final warp is wsinc5 via ffs_nwarp regardless.
+  -refine N              rebuild the reference from the corrected series (sharp, motion
+                         removed) and re-register N more times; converges the template
+                         out of its bias (measurably tighter frame alignment).
+  -jacobian              conserve PE signal — stretched regions dim, compressed brighten
+                         (J = det(I+∇disp)). Off by default; for data with real B0
+                         pile-up, not a purely geometric shift.
+  -workhard / -superhard presets over the above + more iters + denser search
+                         (~3-5× / ~15-30× time). Explicit flags override the preset.
+
 dual phase-encode (rare — e.g. 3-D EPI encoded on two in-plane axes):
 
   Give two -pe_dir (e.g. -pe_dir AP IS). Both in-plane axes are estimated and BOTH
@@ -265,6 +279,46 @@ def create_parser() -> argparse.ArgumentParser:
         "~patch/2 is a good overlap.",
     )
 
+    acc = p.add_argument_group("Accuracy (trade time for exactness)")
+    acc.add_argument(
+        "-warp_interp",
+        default="bilinear",
+        choices=("bilinear", "bicubic"),
+        help="[all] Resampler for the estimation iterations and the correction. "
+        "'bicubic' removes the bilinear damping bias so the iterations converge to the "
+        "true shift (biggest gain on smooth data); costs a little more per warp.",
+    )
+    acc.add_argument(
+        "-refine",
+        type=int,
+        default=0,
+        metavar="ROUNDS",
+        help="[all] Outer reference-refinement rounds. After the first estimate, "
+        "rebuild the reference from the corrected series (motion removed → sharp) and "
+        "re-register the original frames against it, converging the template out of "
+        "its bias. 1–3 tightens the recovered values; 0 = off.",
+    )
+    acc.add_argument(
+        "-jacobian",
+        action="store_true",
+        help="[all] Modulate the corrected series by the PE Jacobian to conserve "
+        "signal: where distortion stacked voxels (compression) the correction stretches "
+        "them and dims accordingly, and vice-versa. Off by default (pure geometric "
+        "correction); affects the corrected image, not the saved warp geometry.",
+    )
+    acc.add_argument(
+        "-workhard",
+        action="store_true",
+        help="Preset: crank the accuracy knobs (bicubic warp, more iters, 1 refine "
+        "round, denser search) for ~3–5× the time. Explicit flags still override.",
+    )
+    acc.add_argument(
+        "-superhard",
+        action="store_true",
+        help="Preset: maximum accuracy (bicubic warp, many iters, 3 refine rounds, "
+        "finest search) for ~15–30× the time. Explicit flags still override.",
+    )
+
     mask = p.add_argument_group("Masking")
     mask.add_argument(
         "-no_automask",
@@ -386,8 +440,55 @@ def _write_movie(frames: np.ndarray, path: str, fps: int, fmt: str) -> str:
     return path
 
 
+# Presets bump the levers that helped on spatially-varying (local stretch/squish)
+# field tests: bicubic warp (better for flow, neutral elsewhere), more convergence
+# iterations, reference-refinement rounds, and denser search.
+_PRESET_DEFAULTS = {
+    "iters": 4,
+    "levels": 3,
+    "stride": 8,
+    "xcorr_step": 0.5,
+    "warp_interp": "bilinear",
+    "refine": 0,
+}
+_PRESETS = {
+    "workhard": {
+        "iters": 8,
+        "levels": 4,
+        "stride": 4,
+        "xcorr_step": 0.25,
+        "warp_interp": "bicubic",
+        "refine": 1,
+    },
+    "superhard": {
+        "iters": 16,
+        "levels": 5,
+        "stride": 2,
+        "xcorr_step": 0.25,
+        "warp_interp": "bicubic",
+        "refine": 3,
+    },
+}
+
+
+def _apply_preset(args) -> str | None:
+    """Fill accuracy knobs from -workhard/-superhard, but let explicit flags win.
+
+    A knob still sitting at its documented default is taken from the preset; a knob
+    the user set to a non-default value is left alone. Returns the preset name (or None).
+    """
+    name = "superhard" if args.superhard else "workhard" if args.workhard else None
+    if name is None:
+        return None
+    for knob, val in _PRESETS[name].items():
+        if getattr(args, knob) == _PRESET_DEFAULTS[knob]:  # user left it default → preset sets it
+            setattr(args, knob, val)
+    return name
+
+
 def main(argv: list[str] | None = None) -> int:
     args = create_parser().parse_args(argv)
+    preset = _apply_preset(args)
 
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.processing.locomoco import estimate_residual_flow, resolve_pe_axis
@@ -459,12 +560,16 @@ def main(argv: list[str] | None = None) -> int:
         mode = f"{'1-D PE' if pe_only else '2-D'} flow"
     else:
         mode = args.backend
+    acc_desc = f"warp={args.warp_interp}, refine={args.refine}, jacobian={'on' if args.jacobian else 'off'}"
+    if preset:
+        acc_desc = f"[{preset}] " + acc_desc
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
     print(
         f"   PE {args.pe_dir} (axes {pe_axes}), slice axis={slice_axis}, backend={args.backend}, "
         f"ref={args.ref}, do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
         f"{mode}, automask={mask_desc}"
     )
+    print(f"   accuracy: {acc_desc}")
 
     result = estimate_residual_flow(
         data,
@@ -482,6 +587,9 @@ def main(argv: list[str] | None = None) -> int:
         trial_step=args.xcorr_step,
         patch=args.patch,
         stride=args.stride,
+        warp_interp=args.warp_interp,
+        refine_rounds=args.refine,
+        jacobian=args.jacobian,
         automask=automask,
         automask_dilate=args.automask_dilate,
         automask_sigma=args.automask_sigma,

@@ -97,8 +97,16 @@ def _spatial_gradients(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return gx, gy
 
 
-def _warp2d(img: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Sample ``img`` at ``(x + u, y + v)`` (u along W, v along H). ``(B, H, W)``."""
+def _warp2d(
+    img: torch.Tensor, u: torch.Tensor, v: torch.Tensor, mode: str = "bilinear"
+) -> torch.Tensor:
+    """Sample ``img`` at ``(x + u, y + v)`` (u along W, v along H). ``(B, H, W)``.
+
+    ``mode`` is the grid_sample interpolator (``bilinear`` or ``bicubic``). Bilinear
+    damps a fractionally-shifted image, which biases the fixed point the estimation
+    iterations converge to; ``bicubic`` resamples faithfully so they land on the true
+    displacement — the accuracy win is largest on smooth data.
+    """
     _, h, w = img.shape
     ys, xs = torch.meshgrid(
         torch.arange(h, device=img.device, dtype=img.dtype),
@@ -109,7 +117,7 @@ def _warp2d(img: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     gyn = 2.0 * (ys.unsqueeze(0) + v) / max(h - 1, 1) - 1.0
     grid = torch.stack([gxn, gyn], dim=-1)
     out = F.grid_sample(
-        img.unsqueeze(1), grid, mode="bilinear", padding_mode="border", align_corners=True
+        img.unsqueeze(1), grid, mode=mode, padding_mode="border", align_corners=True
     )
     return out.squeeze(1)
 
@@ -123,6 +131,7 @@ def optical_flow_lk_2d(
     window_sigma: float = 2.0,
     reg: float = 1e-3,
     pe_only_axis: int | None = None,
+    warp_interp: str = "bilinear",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense pyramidal Lucas-Kanade optical flow for a batch of 2-D image pairs.
 
@@ -163,7 +172,7 @@ def optical_flow_lk_2d(
             )
 
         for _ in range(n_iters):
-            mv_w = _warp2d(mv_l, u, v)
+            mv_w = _warp2d(mv_l, u, v, warp_interp)
             it = mv_w - fx_l
             ix, iy = _spatial_gradients(mv_w)
             if pe_only_axis is not None:
@@ -293,6 +302,7 @@ def xcorr_search_flow_2d(
     eps: float = 1e-4,
     dual: bool = False,
     n_passes: int = 3,
+    warp_interp: str = "bilinear",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Local cross-correlation searchlight backend, same ``(fixed, moving) -> (u, v)``.
 
@@ -315,12 +325,10 @@ def xcorr_search_flow_2d(
     u = torch.zeros_like(fixed)
     v = torch.zeros_like(fixed)
     for _ in range(n_passes):
-        u = u + _xcorr_shift_1d(
-            fixed, _warp2d(moving, u, v), True, max_shift, window_sigma, trial_step, interp, eps
-        )
-        v = v + _xcorr_shift_1d(
-            fixed, _warp2d(moving, u, v), False, max_shift, window_sigma, trial_step, interp, eps
-        )
+        mw = _warp2d(moving, u, v, warp_interp)
+        u = u + _xcorr_shift_1d(fixed, mw, True, max_shift, window_sigma, trial_step, interp, eps)
+        mw = _warp2d(moving, u, v, warp_interp)
+        v = v + _xcorr_shift_1d(fixed, mw, False, max_shift, window_sigma, trial_step, interp, eps)
     return u, v
 
 
@@ -385,6 +393,7 @@ def phase_correlation_flow_2d(
     max_shift: float = 3.0,
     n_iters: int = 5,
     dual: bool = False,
+    warp_interp: str = "bilinear",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Phase-correlation searchlight backend (FFT phase ramp along PE).
 
@@ -406,7 +415,7 @@ def phase_correlation_flow_2d(
     u = torch.zeros_like(fixed)
     v = torch.zeros_like(fixed)
     for _ in range(n_iters):
-        mw = _warp2d(moving, u, v)
+        mw = _warp2d(moving, u, v, warp_interp)
         if want_u:
             u = u + _phase_slope_dense(fixed, mw, True, patch, stride, max_shift)
         if want_v:
@@ -611,28 +620,68 @@ def _build_soft_mask(
     return mask_nifti.permute(slice_axis, a0, a1).contiguous().cpu()
 
 
+def _jacobian_det(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Jacobian determinant of the pull map ``(row,col) → (row+v, col+u)``.
+
+    ``u`` (along W/col), ``v`` (along H/row) are canonical ``(T, nS, H, W)`` fields.
+    ``J = (1 + ∂v/∂H)(1 + ∂u/∂W) − (∂v/∂W)(∂u/∂H)`` by central differences. Multiplying
+    the corrected series by J conserves PE signal: stretched regions (J>1) brighten,
+    compressed regions (J<1) dim. Clamped positive to keep folds from exploding.
+    """
+
+    def d_w(x: torch.Tensor) -> torch.Tensor:  # ∂/∂W (columns, last axis)
+        d = torch.zeros_like(x)
+        d[..., 1:-1] = 0.5 * (x[..., 2:] - x[..., :-2])
+        return d
+
+    def d_h(x: torch.Tensor) -> torch.Tensor:  # ∂/∂H (rows, second-to-last axis)
+        d = torch.zeros_like(x)
+        d[..., 1:-1, :] = 0.5 * (x[..., 2:, :] - x[..., :-2, :])
+        return d
+
+    j = (1.0 + d_h(v)) * (1.0 + d_w(u)) - d_w(v) * d_h(u)
+    return j.clamp_min(0.1)
+
+
 def _correct_pe(
     moving_raw: torch.Tensor,
     u: torch.Tensor,
     v: torch.Tensor,
     pe_flow_is_u: bool,
     dual: bool = False,
+    warp_interp: str = "bilinear",
 ) -> torch.Tensor:
     """Warp ``moving_raw`` by the estimated displacement (the warp we save).
 
     Single-PE keeps only the PE-axis component; ``dual`` (two PE axes) uses both.
     """
     if dual:
-        return _warp2d(moving_raw, u, v)
+        return _warp2d(moving_raw, u, v, warp_interp)
     uc = u if pe_flow_is_u else torch.zeros_like(u)
     vc = torch.zeros_like(v) if pe_flow_is_u else v
-    return _warp2d(moving_raw, uc, vc)
+    return _warp2d(moving_raw, uc, vc, warp_interp)
 
 
-def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual=False):
-    """Fixed reference: batch the flow over ALL frames at once, looping slices."""
+def _estimate_static(
+    vol,
+    ref_mode,
+    pe_flow_is_u,
+    smooth_sigma,
+    flow_fn,
+    device,
+    dual=False,
+    warp_interp="bilinear",
+    ref_override=None,
+):
+    """Fixed reference: batch the flow over ALL frames at once, looping slices.
+
+    ``ref_override`` (``(nS, H, W)``) bypasses ``ref_mode`` — used by the outer
+    reference-refinement loop, which re-registers against the corrected-data mean.
+    """
     nt, ns, hh, ww = vol.shape
-    if ref_mode == "mean":
+    if ref_override is not None:
+        ref = ref_override
+    elif ref_mode == "mean":
         ref = vol.mean(dim=0)
     elif ref_mode == "median":
         ref = vol.median(dim=0).values
@@ -655,13 +704,15 @@ def _estimate_static(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device,
         fixed = _blur2d(fixed_raw, smooth_sigma) if smooth_sigma > 0 else fixed_raw
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
         u, v = flow_fn(fixed, moving)
-        corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual).cpu()
+        corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp).cpu()
         u_all[:, s] = u.cpu()
         v_all[:, s] = v.cpu()
     return u_all, v_all, corrected
 
 
-def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual=False):
+def _estimate_cumulative(
+    vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual=False, warp_interp="bilinear"
+):
     """Progressive reference: frame t registers to the running mean/median of the
     already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
     time, so batched over SLICES per frame instead of over time.
@@ -690,7 +741,7 @@ def _estimate_cumulative(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, dev
         fixed = _blur2d(ref, smooth_sigma) if smooth_sigma > 0 else ref
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
         u, v = flow_fn(fixed, moving)
-        corr = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual)
+        corr = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp)
         corrected[t] = corr.cpu()
         u_all[t] = u.cpu()
         v_all[t] = v.cpu()
@@ -717,6 +768,9 @@ def estimate_residual_flow(
     trial_step: float = 0.5,
     patch: int = 16,
     stride: int = 8,
+    warp_interp: str = "bilinear",
+    refine_rounds: int = 0,
+    jacobian: bool = False,
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
@@ -760,6 +814,14 @@ def estimate_residual_flow(
     template; frame 0 is the seed). Progressive modes are sequential and slower;
     ``first_median`` also holds the corrected series on the GPU.
 
+    Accuracy levers (trade time for exactness of the recovered value):
+    ``warp_interp`` (``bilinear`` | ``bicubic``) is the resampler for the estimation
+    iterations and the correction — ``bicubic`` removes the bilinear damping bias so
+    iterations converge to the true shift. ``refine_rounds`` re-registers against the
+    corrected-data mean that many extra times, converging the reference template out
+    of its bias. ``jacobian`` scales the corrected series by the PE Jacobian so signal
+    is conserved (stretched regions dim, compressed regions brighten).
+
     ``automask`` (off here; on by the CLI) soft-gates the flow by a feathered brain
     mask — a dilated 3dAutomask of the time-mean, Gaussian-blurred by
     ``automask_sigma`` voxels — so optical flow's wild guesses in the pure-noise air
@@ -798,6 +860,7 @@ def estimate_residual_flow(
                 n_iters=n_iters,
                 window_sigma=window_sigma,
                 pe_only_axis=pe_only_axis,
+                warp_interp=warp_interp,
             )
     elif backend == "phase":
 
@@ -811,6 +874,7 @@ def estimate_residual_flow(
                 max_shift=max_shift,
                 n_iters=n_iters,
                 dual=dual,
+                warp_interp=warp_interp,
             )
     elif backend == "xcorr":
 
@@ -823,12 +887,33 @@ def estimate_residual_flow(
                 window_sigma=window_sigma,
                 trial_step=trial_step,
                 dual=dual,
+                warp_interp=warp_interp,
             )
     else:
         raise ValueError(f"Unknown backend {backend!r}; expected flow | phase | xcorr.")
 
-    est = _estimate_cumulative if ref_mode in ("first_mean", "first_median") else _estimate_static
-    u_all, v_all, corrected = est(vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual)
+    progressive = ref_mode in ("first_mean", "first_median")
+    est = _estimate_cumulative if progressive else _estimate_static
+    u_all, v_all, corrected = est(
+        vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual, warp_interp
+    )
+    # Outer reference-refinement: the reference defines "zero", so a blurred/biased
+    # one biases every shift. Rebuild it from the corrected series (motion removed →
+    # sharp template) and re-register the ORIGINAL frames against it, converging the
+    # template. Progressive refs already self-refine over time, so start them there.
+    for _ in range(max(0, refine_rounds)):
+        new_ref = corrected.mean(dim=0)  # (nS, H, W) sharpened template
+        u_all, v_all, corrected = _estimate_static(
+            vol,
+            ref_mode,
+            pe_flow_is_u,
+            smooth_sigma,
+            flow_fn,
+            device,
+            dual,
+            warp_interp,
+            ref_override=new_ref,
+        )
 
     soft = None
     if automask:
@@ -841,8 +926,19 @@ def estimate_residual_flow(
         for s in range(ns):
             moving_raw = vol[:, s].to(device).float()
             corrected[:, s] = _correct_pe(
-                moving_raw, u_all[:, s].to(device), v_all[:, s].to(device), pe_flow_is_u, dual
+                moving_raw,
+                u_all[:, s].to(device),
+                v_all[:, s].to(device),
+                pe_flow_is_u,
+                dual,
+                warp_interp,
             ).cpu()
+
+    if jacobian:
+        # Conserve signal along PE: where the unwarp stretches a region (Jacobian > 1)
+        # scale intensity up, where it compresses (< 1) scale down. J = det(I + ∇disp)
+        # over the in-plane (H, W) axes; single-PE reduces to 1 + ∂PE-disp/∂PE.
+        corrected = corrected * _jacobian_det(u_all, v_all)
 
     result = LocomocoResult(
         u_canon=u_all,

@@ -159,6 +159,65 @@ def test_dual_pe_recovers_both_axes(backend):
     assert np.abs(est_u + sy).max() < 0.4 and np.abs(est_v + sx).max() < 0.4
 
 
+def test_jacobian_det_linear_ramp():
+    from fastfuncstuff.processing.locomoco import _jacobian_det
+
+    # u = a*x along W → J = 1 + a everywhere (interior); v=0.
+    nx = ny = 24
+    xs = torch.arange(ny, dtype=torch.float32)
+    for a in (0.2, -0.3):
+        u = (a * xs)[None, None, None, :].expand(1, 1, nx, ny).contiguous()
+        j = _jacobian_det(u, torch.zeros_like(u))
+        assert abs(float(j[..., 2:-2].median()) - (1.0 + a)) < 1e-3
+
+
+def test_local_field_recovers_spatial_variation():
+    # A SMOOTH spatially-varying PE field (stretch where df/dy>0, squish where <0),
+    # not a global shift: the estimate must track the field's spatial variation.
+    rng = np.random.default_rng(0)
+    nx, ny, nz = 40, 60, 3
+    xx, yy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    base = (np.sin(xx / 4.0) * np.cos(yy / 5.0) + 0.6 * rng.standard_normal((nx, ny))).astype(
+        np.float32
+    )
+    base = np.repeat(base[:, :, None], nz, axis=2)
+    yline = np.arange(ny, dtype=np.float32)
+
+    def distort(vol, f):  # moving(y) = base(y + f(y)), f varies along y (PE=axis1)
+        out = np.empty_like(vol)
+        hh, ww = torch.meshgrid(
+            torch.arange(nx, dtype=torch.float32),
+            torch.arange(ny, dtype=torch.float32),
+            indexing="ij",
+        )
+        gx = 2 * (ww + torch.from_numpy(f)[None, :]) / (ny - 1) - 1
+        gy = 2 * hh / (nx - 1) - 1
+        grid = torch.stack([gx, gy], -1)[None]
+        for z in range(nz):
+            sl = torch.from_numpy(vol[:, :, z])[None, None]
+            out[:, :, z] = F.grid_sample(sl, grid, align_corners=True, padding_mode="border")[0, 0]
+        return out
+
+    amps = [0.0, 1.0, -0.8, 1.3]
+    fields = [(a * np.sin(2 * np.pi * 1.5 * yline / ny)).astype(np.float32) for a in amps]
+    data = np.stack([distort(base, f) for f in fields], -1)
+    res = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        n_iters=6,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    est = res.pe_displacement().numpy()  # ~ -f(y)
+    interior = (slice(8, -8), slice(8, -8), slice(None))
+    for t in range(1, len(amps)):
+        true = np.broadcast_to(-fields[t][None, :, None], (nx, ny, nz))
+        # The recovered field tracks the true spatial variation (correlated, not flat).
+        assert np.corrcoef(est[..., t][interior].ravel(), true[interior].ravel())[0, 1] > 0.9
+
+
 def test_unknown_backend_raises(known_shift_series):
     data, _ = known_shift_series
     with pytest.raises(ValueError, match="Unknown backend"):
