@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> None:
         rd = resid.to(device)
         resid = (rd - (rd @ Q) @ Q.T).cpu()
         if verb >= 1:
-            print(f"  detrended to polynomial order {q}")
+            print(f"  detrending: {q + 1} baseline funcs (polort {q}), {nt} time points")
 
     # Drop constant-in-time voxels (3dFWHMx does this; they have no ACF signal
     # and would divide by ~0 in the temporal demeaning).
