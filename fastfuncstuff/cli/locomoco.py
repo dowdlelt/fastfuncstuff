@@ -7,6 +7,8 @@ reference frame. Writes:
 
   * ``{prefix}_warp.nii.gz``      — per-frame 5-D DICOM-mm warp for ``ffs_nwarp``
   * ``{prefix}_locomoco.nii.gz``  — the non-linear-motion-corrected series
+  * ``{prefix}_locomoco_mean.nii.gz`` — temporal mean of the corrected series
+                                    (with ``-save_mean``); a registration target
   * ``{prefix}_flow.nii.gz``      — 4-D signed PE flow (voxels; sign = direction),
                                     scrub it like a timeseries
   * ``{prefix}_flow.mp4``         — a contact-sheet movie of the flow, colored by
@@ -348,6 +350,14 @@ def create_parser() -> argparse.ArgumentParser:
     out = p.add_argument_group("Outputs")
     out.add_argument("-no_warp", action="store_true", help="Skip the per-frame warp file.")
     out.add_argument("-no_corrected", action="store_true", help="Skip the corrected series.")
+    out.add_argument(
+        "-save_mean",
+        "-save-mean",
+        action="store_true",
+        help="Also write the temporal mean of the corrected series "
+        "({prefix}_locomoco_mean), e.g. for use as a registration target. "
+        "Independent of -no_corrected.",
+    )
     out.add_argument("-no_movie", action="store_true", help="Skip the flow movie.")
     out.add_argument(
         "-no_flow",
@@ -620,6 +630,13 @@ def main(argv: list[str] | None = None) -> int:
         with spinner(f"Writing {Path(corr_path).name}"):
             save_nifti(result.corrected_series().numpy(), corr_path, affine=affine)
         print(f"  • corrected series: {corr_path}")
+
+    if args.save_mean:
+        mean_path = f"{stem}_locomoco_mean{ext}"
+        # Temporal mean of the corrected series ((nx, ny, nz, T) -> mean over T).
+        with spinner(f"Writing {Path(mean_path).name}"):
+            save_nifti(result.corrected_series().mean(dim=-1).numpy(), mean_path, affine=affine)
+        print(f"  • corrected mean: {mean_path}")
 
     if not args.no_flow:
         if dual:
