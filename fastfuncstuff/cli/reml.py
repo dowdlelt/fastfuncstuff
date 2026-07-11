@@ -350,6 +350,15 @@ Examples:
         "a*exp(-r^2/2b^2)+(1-a)*exp(-r/c)) as PREFIX.fwhmx_ols.txt / .fwhmx_reml.txt.",
     )
     diag_out.add_argument(
+        "-save_mask",
+        "-save-mask",
+        dest="save_mask",
+        metavar="PATH",
+        help="Save the diagnostics brain mask as NIfTI. When no -mask is given, this "
+        "is the automask computed from the grand mean (the same mask -save_acf / "
+        "-save_tsnr use). No-op if -mask was supplied (that mask is already on disk).",
+    )
+    diag_out.add_argument(
         "-adjust_dof",
         "-adjust-dof",
         dest="adjust_dof",
@@ -370,6 +379,8 @@ Examples:
     ols_out.add_argument(
         "-Onuisance", help="Output OLS betas + statistics for NUISANCE regressors only"
     )
+    ols_out.add_argument("-Oerrts", help="Output OLS residuals (the OLS-baseline errts)")
+    ols_out.add_argument("-Ofitts", help="Output OLS fitted model time series")
 
     # FDR options
     fdr_group = parser.add_argument_group("FDR Options")
@@ -795,6 +806,26 @@ Examples:
     return parser
 
 
+def _voxels_to_4d_volume(data_2d, volume_shape, voxel_mask) -> np.ndarray:
+    """Reshape a ``(n_voxels, n_timepoints)`` array to a 4D ``(nx, ny, nz, T)`` volume.
+
+    ``results.residuals`` / ``results.predicted`` are stored ``(n_voxels, n_time)``
+    (see fit_glm_arma11). With a ``voxel_mask`` the fitted rows are scattered onto
+    the full grid; without one (whole-brain fit) every voxel is present and the rows
+    reshape directly. ``volume_shape`` is ``(nx, ny, nz)`` matching the C-order voxel
+    flattening used by the fitter. Shared by -Rfitts / -Rerrts / -Oerrts so the
+    no-mask case can't fall through to a 2D array (which nibabel rejects).
+    """
+    arr = np.ascontiguousarray(data_2d)
+    n_time = arr.shape[1]
+    vol = np.zeros((*volume_shape, n_time), dtype=np.float32)
+    if voxel_mask is not None:
+        vol[np.asarray(voxel_mask).reshape(volume_shape)] = arr
+    else:
+        vol[...] = arr.reshape(*volume_shape, n_time)
+    return vol
+
+
 def _derive_rvar_path(rbuck_path: str) -> str:
     """Append ``_ffsremlvar`` to the Rbuck stem, preserving its multi-suffix
     extension (``.nii.gz`` / ``.nii.zst`` / ``.nii``). Mirrors AFNI's
@@ -1209,7 +1240,13 @@ def main():
         print()
 
     # Determine requested output families
-    want_ols = args.Obuck is not None or args.Obeta is not None or args.Onuisance is not None
+    want_ols = (
+        args.Obuck is not None
+        or args.Obeta is not None
+        or args.Onuisance is not None
+        or args.Oerrts is not None
+        or args.Ofitts is not None
+    )
     want_reml = any(
         x is not None
         for x in [
@@ -1804,6 +1841,37 @@ def main():
             """Write OLS results immediately after computation"""
             print("\n💾 Writing OLS outputs (before ARMA)...")
 
+            # OLS residuals / fitted series (full-model), if requested. Written
+            # here while ols_results is still in memory (it's cleared afterward).
+            if args.Oerrts or args.Ofitts:
+                from fastfuncstuff.glm.outputs import (
+                    _ensure_numpy,
+                    _get_voxel_mask,
+                    _resolve_shape,
+                )
+
+                _ols_vm = _get_voxel_mask(ols_results)
+                _ols_shape = _resolve_shape(ols_results, original_shape)
+                _ols_aff = affine if affine is not None else np.eye(4)
+                if args.Oerrts and getattr(ols_results, "residuals", None) is not None:
+                    print(f"  • Writing OLS residuals: {args.Oerrts}")
+                    save_nifti(
+                        _voxels_to_4d_volume(
+                            _ensure_numpy(ols_results.residuals), _ols_shape, _ols_vm
+                        ),
+                        output_path=replace_afni_extension(args.Oerrts, ".nii.gz"),
+                        affine=_ols_aff,
+                    )
+                if args.Ofitts and getattr(ols_results, "predicted", None) is not None:
+                    print(f"  • Writing OLS fitted model: {args.Ofitts}")
+                    save_nifti(
+                        _voxels_to_4d_volume(
+                            _ensure_numpy(ols_results.predicted), _ols_shape, _ols_vm
+                        ),
+                        output_path=replace_afni_extension(args.Ofitts, ".nii.gz"),
+                        affine=_ols_aff,
+                    )
+
             # IMPORTANT: When task_indices is passed to fit_glm(), the OLS results
             # already contain ONLY the task regressors (stimulus columns).
             # Extract stimulus labels for proper labeling
@@ -2041,7 +2109,7 @@ def main():
     # Preprocessing: Blur and/or Scale if requested
     # ==========================================================================
     # Whole-dataset diagnostics need the manual load path (data resident in RAM).
-    want_diag = bool(args.save_grandmean or args.save_tsnr or args.save_acf)
+    want_diag = bool(args.save_grandmean or args.save_tsnr or args.save_acf or args.save_mask)
     preprocessing_applied = args.do_blur is not None or args.do_scale or want_diag
     preproc_cached_metadata = None
     diag = None
@@ -2316,6 +2384,8 @@ def main():
             arma_b_grid=b_grid,
             precomputed_arma_params=precomputed_arma,
             want_ols=(want_ols and analysis_method == "arma11"),
+            want_ols_residuals=bool(args.Oerrts),
+            want_ols_predicted=bool(args.Ofitts),
             ols_output_path=ols_output_path,
             ols_output_format=output_format,
             device=device,
@@ -2382,23 +2452,10 @@ def main():
             # mean) for resid tSNR + per-run FWHMx.
             _resid = getattr(results, "residuals", None)
             _label = "ols" if analysis_method == "ols" else "reml"
-            if _resid is not None and (args.save_tsnr or args.save_acf):
+            _want_resid_obs = _resid is not None and (args.save_tsnr or args.save_acf)
+            if _want_resid_obs or args.save_mask:
                 from fastfuncstuff.glm.reml_diagnostics import resolve_mask
 
-                _nvox = int(np.prod(diag.volume_shape))
-                _rt = (
-                    _resid.detach().cpu().float()
-                    if hasattr(_resid, "detach")
-                    else torch.as_tensor(np.asarray(_resid), dtype=torch.float32)
-                )
-                _nt = _rt.shape[1]
-                _fit_vm = getattr(results, "voxel_mask", None)
-                if _fit_vm is not None:
-                    _vmf = torch.as_tensor(np.asarray(_fit_vm)).reshape(-1).bool()
-                    _full = torch.zeros(_nvox, _nt)
-                    _full[_vmf] = _rt
-                else:
-                    _full = _rt  # fit used all voxels
                 _gm = torch.from_numpy(diag.maps["grandmean"])
                 _user_mask = None
                 if args.mask:
@@ -2408,14 +2465,43 @@ def main():
                         _user_mask = torch.from_numpy(
                             (load_nifti(args.mask).get_fdata() > 0).astype("float32")
                         )
-                _dmask = resolve_mask(_user_mask, _gm)
-                _dmf = _dmask.reshape(-1).bool()
-                diag.observe_residuals(
-                    {_label: _full[_dmf]},
-                    _dmask,
-                    want_tsnr=bool(args.save_tsnr),
-                    want_fwhmx=bool(args.save_acf),
-                )
+                # Run the automask on the GPU (device=device); without it the
+                # 3dAutomask dilation/fill ran on the CPU grand mean (millions of
+                # voxels) — a big CPU spike right before the GPU ACF.
+                _dmask = resolve_mask(_user_mask, _gm, device=device)
+
+                # -save_mask: persist the diagnostics automask (only when we made
+                # one — a user-supplied -mask is already on disk). Route through
+                # diag.save_map so it gets the same grid/header handling as the
+                # grand-mean map.
+                if args.save_mask and _user_mask is None:
+                    mask_path = replace_afni_extension(args.save_mask, ".nii.gz")
+                    diag.maps["automask"] = _dmask.cpu().numpy().astype(np.float32)
+                    diag.save_map("automask", mask_path, _diag_affine, _diag_header)
+                    print(f"  • diagnostics automask: {mask_path}")
+
+                if _want_resid_obs:
+                    _nvox = int(np.prod(diag.volume_shape))
+                    _rt = (
+                        _resid.detach().cpu().float()
+                        if hasattr(_resid, "detach")
+                        else torch.as_tensor(np.asarray(_resid), dtype=torch.float32)
+                    )
+                    _nt = _rt.shape[1]
+                    _fit_vm = getattr(results, "voxel_mask", None)
+                    if _fit_vm is not None:
+                        _vmf = torch.as_tensor(np.asarray(_fit_vm)).reshape(-1).bool()
+                        _full = torch.zeros(_nvox, _nt)
+                        _full[_vmf] = _rt
+                    else:
+                        _full = _rt  # fit used all voxels
+                    _dmf = _dmask.reshape(-1).bool()
+                    diag.observe_residuals(
+                        {_label: _full[_dmf]},
+                        _dmask,
+                        want_tsnr=bool(args.save_tsnr),
+                        want_fwhmx=bool(args.save_acf),
+                    )
 
             if args.save_grandmean:
                 diag.save_map(
@@ -3066,26 +3152,15 @@ def main():
     if args.Rfitts:
         print(f"  • Writing REML fitted model: {args.Rfitts}")
         if results.predicted is not None:
-            import nibabel as nib
-
-            from fastfuncstuff.glm.outputs import _ensure_numpy, _get_voxel_mask
+            from fastfuncstuff.glm.outputs import _ensure_numpy, _get_voxel_mask, _resolve_shape
 
             affine = getattr(results, "affine", np.eye(4))
-            volume_shape = getattr(results, "original_shape", None)
+            volume_shape = _resolve_shape(results, None)
             voxel_mask = _get_voxel_mask(results)
-
-            # Predicted is (n_timepoints, n_voxels), need (n_voxels, n_timepoints)
-            predicted_np = _ensure_numpy(results.predicted.T)
-
-            # Reshape to 4D volume (x, y, z, timepoints)
-            if volume_shape is not None and voxel_mask is not None:
-                n_timepoints = predicted_np.shape[1]
-                predicted_vol = np.zeros((*volume_shape, n_timepoints), dtype=np.float32)
-                predicted_vol[voxel_mask.reshape(volume_shape)] = predicted_np
-            else:
-                predicted_vol = predicted_np
-
-            # Always write NIfTI .nii.gz regardless of input format
+            # predicted is (n_voxels, n_timepoints); scatter/reshape to 4D.
+            predicted_vol = _voxels_to_4d_volume(
+                _ensure_numpy(results.predicted), volume_shape, voxel_mask
+            )
             save_nifti(
                 predicted_vol,
                 output_path=replace_afni_extension(args.Rfitts, ".nii.gz"),
@@ -3097,25 +3172,15 @@ def main():
     if args.Rerrts:
         print(f"  • Writing REML residuals: {args.Rerrts}")
         if results.residuals is not None:
-            import nibabel as nib
-
-            from fastfuncstuff.glm.outputs import _ensure_numpy, _get_voxel_mask
+            from fastfuncstuff.glm.outputs import _ensure_numpy, _get_voxel_mask, _resolve_shape
 
             affine = getattr(results, "affine", np.eye(4))
-            volume_shape = getattr(results, "original_shape", None)
+            volume_shape = _resolve_shape(results, None)
             voxel_mask = _get_voxel_mask(results)
-
-            # Residuals is (n_timepoints, n_voxels), need (n_voxels, n_timepoints)
-            residuals_np = _ensure_numpy(results.residuals.T)
-
-            # Reshape to 4D volume (x, y, z, timepoints)
-            if volume_shape is not None and voxel_mask is not None:
-                n_timepoints = residuals_np.shape[1]
-                residuals_vol = np.zeros((*volume_shape, n_timepoints), dtype=np.float32)
-                residuals_vol[voxel_mask.reshape(volume_shape)] = residuals_np
-            else:
-                residuals_vol = residuals_np
-
+            # residuals is (n_voxels, n_timepoints); scatter/reshape to 4D.
+            residuals_vol = _voxels_to_4d_volume(
+                _ensure_numpy(results.residuals), volume_shape, voxel_mask
+            )
             # Always write NIfTI .nii.gz regardless of input format
             save_nifti(
                 residuals_vol,

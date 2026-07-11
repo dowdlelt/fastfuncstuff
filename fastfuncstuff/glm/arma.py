@@ -3858,6 +3858,8 @@ def fit_glm_arma11(
     want_r2_semipartial: bool = False,
     r2_semipartial_mode: str = "full",  # "full" or "task" - how to compute semi-partial R²
     want_ols: bool = False,
+    want_ols_residuals: bool = False,
+    want_ols_predicted: bool = False,
     ols_write_callback: Callable | None = None,
     precomputed_arma_params: torch.Tensor | np.ndarray | None = None,
     device: torch.device | None = None,
@@ -4444,6 +4446,8 @@ def fit_glm_arma11(
             verbose=verbose,  # Show progress bar for OLS chunks
             preload_data_to_device=False,
             use_double=use_double,
+            want_residuals=want_ols_residuals,  # OLS errts (-Oerrts)
+            want_predicted=want_ols_predicted,  # OLS fitts (-Ofitts)
             max_poly_degree=-1,  # Design matrix is complete - don't add ANYTHING!
             want_r2_partial=want_r2_partial,  # Compute partial R² for OLS if requested
             r2_partial_mode=r2_partial_mode,  # "full" or "task" mode
