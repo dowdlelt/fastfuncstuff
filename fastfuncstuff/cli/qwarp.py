@@ -32,7 +32,13 @@ from torch import Tensor
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
 from fastfuncstuff.processing.affine import resample_to_base_grid
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES, warp_image, warp_image_linear
-from fastfuncstuff.processing.io import load_image, load_warp_field, save_image, save_warp_field
+from fastfuncstuff.processing.io import (
+    load_image,
+    load_warp_field,
+    save_image,
+    save_warp_field,
+    save_warp_series,
+)
 from fastfuncstuff.processing.mask import automask
 from fastfuncstuff.processing.memory import estimate_gpu_memory_gb, print_memory_report
 from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz
@@ -108,6 +114,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     g_io.add_argument(
         "-no_save_warp", action="store_true", help="Do not save displacement warp field(s)"
+    )
+    g_io.add_argument(
+        "-warp_format",
+        "-warp-format",
+        choices=["5d", "folder"],
+        default="folder",
+        help="Timeseries warp on-disk format: 'folder' = {prefix}_warps/ of numbered "
+        "4D files (default, unchanged); '5d' = one {prefix}_WARP file (nx,ny,nz,T,3). "
+        "Both are consumed by ffs_nwarp -nwarp and ffs_util_pcwarp. (5d holds the "
+        "whole series in RAM before writing.)",
     )
     add_verbose_arg(g_io, default=1)
 
@@ -683,6 +699,54 @@ def _zeropad_width(n: int) -> int:
     if n <= 0:
         return 3
     return max(3, int(math.log10(n)) + 1)
+
+
+def _write_warp_timeseries(
+    warps: list[tuple[Tensor, Tensor, Tensor]],
+    *,
+    as_5d: bool,
+    prefix: str,
+    warp_dir: str,
+    warp_basename: str,
+    indices: list[int],
+    zpad: int,
+    base_info: dict,
+    warp_padding: tuple[int, int, int] | None,
+    tag: str = "WARP",
+    verb: int = 1,
+) -> str:
+    """Write a per-volume warp series as one 5D file or a folder of 4D frames.
+
+    ``warps`` is frame-ordered ``(xd, yd, zd)`` padded-grid displacements; ``indices``
+    are the per-frame source indices used to name the folder files. Returns the path
+    (5D file) or ``{warp_dir}/`` (folder). Both are consumed by ffs_nwarp / pcwarp.
+    """
+    if as_5d:
+        xs = torch.stack([w[0] for w in warps])
+        ys = torch.stack([w[1] for w in warps])
+        zs = torch.stack([w[2] for w in warps])
+        out = f"{prefix}_{tag}.nii.gz"
+        save_warp_series(
+            xs, ys, zs, out, as_5d=True, header_info=base_info, padding=warp_padding, units="mm"
+        )
+        if verb >= 1:
+            print(f"Saved {len(warps)} warps -> {out} (5D)")
+        return out
+
+    os.makedirs(warp_dir, exist_ok=True)
+    for (xd, yd, zd), idx in zip(warps, indices, strict=True):
+        save_warp_field(
+            xd,
+            yd,
+            zd,
+            os.path.join(warp_dir, f"{warp_basename}_{tag}_t{idx:0{zpad}d}.nii.gz"),
+            header_info=base_info,
+            padding=warp_padding,
+            units="mm",
+        )
+    if verb >= 1:
+        print(f"Saved {len(warps)} warps to {warp_dir}/")
+    return f"{warp_dir}/"
 
 
 def _read_motion_params(filepath: str) -> list[tuple[float, float, float, float, float, float]]:
@@ -1597,18 +1661,27 @@ def main(argv: list[str] | None = None) -> int:
         zpad = _zeropad_width(nt_full)
         do_tsmooth = args.tsmooth > 0
         do_warp_pcs = args.n_pcs > 0
+        as_5d = args.warp_format == "5d"
+        # 5D output writes one file after the loop, so it must hold every frame's
+        # warp in RAM (like tsmooth/PC extraction already do). Folder mode streams
+        # each warp to disk and only retains them when tsmooth/PCs need them.
+        collect_warps = do_tsmooth or do_warp_pcs or as_5d
+        # In 5D mode the per-frame files aren't written (one 5D file instead), and
+        # the warp indices are recorded so the 5D frames stay in timeseries order.
+        stream_files = not args.no_save_warp and not as_5d
 
-        # Create warp output directory
+        # Create warp output directory (folder mode, or for the PC .1D output).
         warp_dir = f"{prefix}_warps"
-        if not args.no_save_warp or do_warp_pcs:
+        if (not args.no_save_warp and not as_5d) or do_warp_pcs:
             os.makedirs(warp_dir, exist_ok=True)
-            if args.verb >= 1:
+            if args.verb >= 1 and not as_5d:
                 print(f"Warp output directory: {warp_dir}/")
         # Base name for warp files inside the directory
         warp_basename = os.path.basename(prefix)
 
-        # Keep raw voxel-unit warps in CPU RAM when temporal smoothing is needed
+        # Keep raw voxel-unit warps in CPU RAM when temporal smoothing / PCs / 5D need them.
         all_warps_raw: list[tuple[Tensor, Tensor, Tensor]] = []
+        warp_indices: list[int] = []  # per-frame source index, parallel to all_warps_raw
 
         # For 'first' base method (internal base only): write an identity (zero) warp for vol 0
         # so the warp file count matches the timeseries length.
@@ -1617,7 +1690,7 @@ def main(argv: list[str] | None = None) -> int:
             zero_xd = torch.zeros(padded_shape)
             zero_yd = torch.zeros(padded_shape)
             zero_zd = torch.zeros(padded_shape)
-            if not args.no_save_warp:
+            if stream_files:
                 save_warp_field(
                     zero_xd,
                     zero_yd,
@@ -1627,8 +1700,9 @@ def main(argv: list[str] | None = None) -> int:
                     padding=warp_padding,
                     units="mm",
                 )
-            if do_tsmooth or do_warp_pcs:
+            if collect_warps:
                 all_warps_raw.append((zero_xd, zero_yd, zero_zd))
+                warp_indices.append(0)
             del zero_xd, zero_yd, zero_zd
 
         # Track previous warps for chaining (-chainwarp / -lookback)
@@ -1755,8 +1829,9 @@ def main(argv: list[str] | None = None) -> int:
             # Move warps to CPU
             xd_cpu, yd_cpu, zd_cpu = xd.cpu(), yd.cpu(), zd.cpu()
 
-            # Save per-volume warp (original, unsmoothed)
-            if not args.no_save_warp:
+            # Save per-volume warp (original, unsmoothed) — folder mode streams to
+            # disk here; 5D mode collects and writes one file after the loop.
+            if stream_files:
                 save_warp_field(
                     xd_cpu,
                     yd_cpu,
@@ -1767,9 +1842,10 @@ def main(argv: list[str] | None = None) -> int:
                     units="mm",
                 )
 
-            # Keep raw warps for temporal smoothing or PC extraction
-            if do_tsmooth or do_warp_pcs:
+            # Keep raw warps for temporal smoothing, PC extraction, or 5D output.
+            if collect_warps:
                 all_warps_raw.append((xd_cpu, yd_cpu, zd_cpu))
+                warp_indices.append(src_idx)
 
             # Chain: crop padded warp back to unpadded size, add to buffer
             if chain_warps:
@@ -1782,7 +1858,7 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     unpadded_warp = (xd_cpu, yd_cpu, zd_cpu)
                 warp_buffer.append((unpadded_warp, src_idx))
-            elif not (do_tsmooth or do_warp_pcs):
+            elif not collect_warps:
                 del xd_cpu, yd_cpu, zd_cpu
 
             # Free GPU tensors (caching allocator reuses memory for next volume)
@@ -1795,6 +1871,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb >= 1:
             print(f"\nSaved: {prefix}{nii_ext} ({warped_4d.shape[0]} volumes)")
 
+        # 5D warp output (folder mode already streamed the per-frame files above).
+        if as_5d and not args.no_save_warp and all_warps_raw:
+            _write_warp_timeseries(
+                all_warps_raw,
+                as_5d=True,
+                prefix=prefix,
+                warp_dir=warp_dir,
+                warp_basename=warp_basename,
+                indices=warp_indices,
+                zpad=zpad,
+                base_info=base_info,
+                warp_padding=warp_padding,
+                verb=args.verb,
+            )
+
         # --- Temporal warp smoothing ---
         if do_tsmooth and all_warps_raw:
             smoothed_warps = _temporal_smooth_warps(
@@ -1802,6 +1893,22 @@ def main(argv: list[str] | None = None) -> int:
                 args.tsmooth,
                 args.verb,
             )
+
+            # 5D smoothed-warp output (smoothed_warps is frame-ordered like all_warps_raw).
+            if as_5d and not args.no_save_warp and smoothed_warps:
+                _write_warp_timeseries(
+                    smoothed_warps,
+                    as_5d=True,
+                    prefix=prefix,
+                    warp_dir=warp_dir,
+                    warp_basename=warp_basename,
+                    indices=warp_indices,
+                    zpad=zpad,
+                    base_info=base_info,
+                    warp_padding=warp_padding,
+                    tag="WARPsmooth",
+                    verb=args.verb,
+                )
 
             # Save smoothed warps and recompute warped 4D
             all_warped_smooth = []
@@ -1816,8 +1923,8 @@ def main(argv: list[str] | None = None) -> int:
             for i, src_idx in enumerate(source_indices):
                 sxd, syd, szd = smoothed_warps[i + warp_offset]
 
-                # Save smoothed warp
-                if not args.no_save_warp:
+                # Save smoothed warp (folder mode; 5D was written above in one file).
+                if stream_files:
                     save_warp_field(
                         sxd,
                         syd,
@@ -1922,22 +2029,18 @@ def main(argv: list[str] | None = None) -> int:
             with spinner(f"Writing {Path(prefix).name}{nii_ext}"):
                 save_image(warped_4d, f"{prefix}{nii_ext}", header_info=base_info)
             if not args.no_save_warp:
-                warp_dir = f"{prefix}_warps"
-                os.makedirs(warp_dir, exist_ok=True)
-                warp_basename = os.path.basename(prefix)
-                zpad = _zeropad_width(nt)
-                for t in range(nt):
-                    save_warp_field(
-                        all_xd[t],
-                        all_yd[t],
-                        all_zd[t],
-                        os.path.join(warp_dir, f"{warp_basename}_WARP_t{t:0{zpad}d}.nii.gz"),
-                        header_info=base_info,
-                        padding=warp_padding,
-                        units="mm",
-                    )
-                if args.verb >= 1:
-                    print(f"Saved {nt} warps to {warp_dir}/")
+                _write_warp_timeseries(
+                    [(all_xd[t], all_yd[t], all_zd[t]) for t in range(nt)],
+                    as_5d=args.warp_format == "5d",
+                    prefix=prefix,
+                    warp_dir=f"{prefix}_warps",
+                    warp_basename=os.path.basename(prefix),
+                    indices=list(range(nt)),
+                    zpad=_zeropad_width(nt),
+                    base_info=base_info,
+                    warp_padding=warp_padding,
+                    verb=args.verb,
+                )
 
             # Extract warp PCs if requested
             if args.n_pcs > 0 and nt > 1:
