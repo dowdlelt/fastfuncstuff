@@ -171,6 +171,40 @@ Examples:
         "on non-negative data (magnitude, masks, probability maps).",
     )
 
+    st_group = parser.add_argument_group("Slice timing (joint space-time)")
+    st_group.add_argument(
+        "-tpattern",
+        default=None,
+        help="Per-slice acquisition timing: text file (one time per line, "
+        "seconds) or BIDS JSON with SliceTiming. When given, slice-timing "
+        "correction is folded into the SAME resample as the warp chain "
+        "(Roche 2011 joint space-time) -- the data is interpolated once, and "
+        "the temporal shift follows the scanner slice each voxel lands in "
+        "after motion. Requires a 4-D -source and a TR; not usable with -phase.",
+    )
+    st_group.add_argument(
+        "-TR",
+        type=float,
+        default=None,
+        help="Repetition time (seconds) for -tpattern. Read from the NIfTI "
+        "header (or JSON RepetitionTime) when omitted.",
+    )
+    st_group.add_argument(
+        "-tzero",
+        type=float,
+        default=None,
+        help="Reference time within the TR to align all slices to (seconds). "
+        "Default: mean of slice times (matches 3dTshift).",
+    )
+    st_group.add_argument(
+        "-tinterp",
+        choices=["linear", "cubic", "wsinc5", "wsinc9"],
+        default="cubic",
+        help="Temporal interpolation kernel for -tpattern (default cubic). "
+        "Fourier is unavailable on the joint path (the per-voxel shift is not "
+        "a single per-slice phase rotation).",
+    )
+
     hw_group = parser.add_argument_group("Hardware")
     hw_group.add_argument(
         "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
@@ -239,6 +273,34 @@ def main(argv: list[str] | None = None) -> None:
         for i, spec in enumerate(nwarp_specs):
             print(f"  [{i}] {spec}")
 
+    # Slice timing: load per-slice offsets and resolve TR (header when not given).
+    slice_times = None
+    tr = args.TR
+    if args.tpattern is not None:
+        from fastfuncstuff.io.afni import get_tr_from_file
+        from fastfuncstuff.processing.slicetime import load_slice_timing
+
+        slice_times = load_slice_timing(args.tpattern)
+        if tr is None:
+            if args.tpattern.endswith(".json"):
+                import json
+                from pathlib import Path as _Path
+
+                data = json.loads(_Path(args.tpattern).read_text())
+                if "RepetitionTime" in data:
+                    tr = float(data["RepetitionTime"])
+            if tr is None:
+                hdr_tr = get_tr_from_file(args.source)
+                if hdr_tr and hdr_tr > 0:
+                    tr = hdr_tr
+        if tr is None:
+            raise SystemExit("ffs_nwarp: -tpattern needs a TR; none in header, pass -TR.")
+        if verb >= 1:
+            print(
+                f"ffs_nwarp: slice timing {len(slice_times)} slices from "
+                f"{args.tpattern}, TR={tr:.4f}s, tinterp={args.tinterp}"
+            )
+
     t0 = time.time()
 
     nwarpforge(
@@ -261,6 +323,10 @@ def main(argv: list[str] | None = None) -> None:
         auto_pad=args.auto_pad,
         expad=args.expad,
         ainterp=ainterp,
+        slice_times=slice_times,
+        tr=tr,
+        tzero=args.tzero,
+        tinterp=args.tinterp,
     )
 
     if verb >= 1:

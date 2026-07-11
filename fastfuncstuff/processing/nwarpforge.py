@@ -31,6 +31,7 @@ from .interp import (
     warp_image,
 )
 from .io import derive_mean_output_path, load_image, load_warp_field, save_image
+from .spacetime import apply_spacetime_sample
 
 # Interpolation kernels usable for warp-field (displacement) interpolation during
 # composition. NN is excluded -- a nearest-sampled displacement field would be
@@ -1425,6 +1426,10 @@ def nwarpforge(
     auto_pad: bool = True,
     expad: int = 0,
     ainterp: str = "cubic",
+    slice_times: list[float] | None = None,
+    tr: float | None = None,
+    tzero: float | None = None,
+    tinterp: str = "cubic",
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1480,6 +1485,18 @@ def nwarpforge(
             reduces the smoothing each composition step adds to the warp;
             "cubic" is a good accuracy/cost default for smooth displacement
             fields.
+        slice_times: Per-slice acquisition offsets (seconds), length == source
+            slices. When given, slice-timing correction is folded into the same
+            resample as the warp chain (Roche 2011 joint space-time). Requires a
+            4-D source and a real TR; incompatible with -phase. See
+            processing/spacetime.py.
+        tr: Repetition time (seconds), required with slice_times.
+        tzero: Reference time within the TR all slices align to (seconds).
+            Defaults to the mean of slice_times (matches 3dTshift).
+        tinterp: Temporal interpolation kernel for the joint path ("linear",
+            "cubic", "wsinc5", "wsinc9"; default "cubic"). Fourier is not
+            available here -- the per-voxel continuous shift is not a single
+            per-slice phase rotation.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1536,6 +1553,32 @@ def nwarpforge(
 
     is_4d = source.ndim == 4
     nt = source.shape[0] if is_4d else 1
+
+    # Joint space-time (slice-timing) resampling: fold slice-timing correction
+    # into the same interpolation as the warp chain (Roche 2011). Requires a 4-D
+    # series and a real TR; incompatible with phase warping (complex data has no
+    # slice-timing model here). See processing/spacetime.py.
+    slice_times_t: Tensor | None = None
+    if slice_times is not None:
+        if not is_4d:
+            raise ValueError("slice-timing (-tpattern) requires a 4-D source")
+        if phase_data is not None:
+            raise ValueError("slice-timing (-tpattern) is not supported with -phase")
+        if tr is None or tr <= 0:
+            raise ValueError("slice-timing (-tpattern) requires a positive TR (-TR or header)")
+        snz = source.shape[1]
+        if len(slice_times) != snz:
+            raise ValueError(
+                f"slice timing has {len(slice_times)} entries but source has {snz} slices"
+            )
+        if tzero is None:
+            tzero = sum(slice_times) / len(slice_times)
+        slice_times_t = torch.tensor(slice_times, dtype=torch.float32, device=device)
+        if verb >= 1:
+            print(
+                f"nwarpforge: joint slice-timing on ({snz} slices, TR={tr:.4f}s, "
+                f"tzero={tzero:.4f}s, tinterp={tinterp})"
+            )
 
     master_hdr_obj = None  # nibabel header for AFNI extension propagation
     # "-master WARP/NWARP": use the first nonlinear warp's grid. The warps
@@ -1749,6 +1792,7 @@ def nwarpforge(
     # warping keeps the field path.
     affine_only = (
         phase_data is None
+        and slice_times_t is None
         and interp not in ("NN", "nearest")
         and all(isinstance(x, AffineTransform) for x in transforms)
     )
@@ -1813,6 +1857,30 @@ def nwarpforge(
         )
 
         src_vol = source[t] if is_4d else source
+
+        if slice_times_t is not None:
+            # Joint slice-timing: sample the raw 4-D series at this frame's pose,
+            # letting the temporal coordinate vary per voxel by the scanner slice
+            # each output voxel lands in. sz is that scanner slice index.
+            sx, sy, sz = _output_to_source_voxel_coords(
+                composed, source_header["affine"], output_affine
+            )
+            assert tr is not None and tzero is not None
+            warped = apply_spacetime_sample(
+                source,
+                sx,
+                sy,
+                sz,
+                t,
+                tr,
+                tzero,
+                slice_times_t,
+                tinterp=tinterp,
+                interp=interp,
+                no_neg=no_neg,
+            )
+            output_volumes.append(warped)
+            continue
 
         if phase_data is not None:
             ph_vol = phase_data[t] if is_4d else phase_data
