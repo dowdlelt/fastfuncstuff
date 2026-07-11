@@ -7,6 +7,9 @@ components along the 4th dimension.
 
 from __future__ import annotations
 
+import glob as _glob
+import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -198,44 +201,52 @@ def save_warp_field(
     zd_np = zd.detach().cpu().numpy()
 
     if units == "mm":
-        # Convert voxel displacements to mm with the CARDINAL (deobliqued) affine,
-        # not the raw oblique one. AFNI does every warp conversion through
-        # ijk_to_dicom (the cardinal version), carrying obliquity separately rather
-        # than folding it into the displacement values (3dQwarp -help: "(xd,yd,zd)
-        # are stored in DICOM order"; ijk_to_dicom aligns grid axes to x/y/z). Using
-        # the oblique rs here would rotate a single-grid-axis warp across components
-        # and would NOT be undone on apply, which goes through compute_cardinal_affine
-        # too. For axis-aligned data cardinal == oblique, so this is a no-op there.
-        #
-        # On-disk convention is AFNI DICOM-mm (matches 3dQwarp), so the file is
-        # directly consumable by AFNI 3dNwarpApply AND round-trips cleanly through
-        # nwarpforge.load_warp (which negates x,y DICOM->NIfTI on load). Two steps:
-        #   1. voxel -> RAS/NIfTI-mm via the CARDINAL (deobliqued) rs. AFNI does
-        #      every warp conversion through ijk_to_dicom (cardinal), carrying
-        #      obliquity separately rather than folding it into the displacement
-        #      values; for axis-aligned data cardinal == oblique so it's a no-op.
-        #   2. RAS-mm -> DICOM-mm: negate x,y (DICOM = diag(-1,-1,1) @ RAS).
-        # History: this used to stop at step 1 (RAS-mm on disk), which double-
-        # flipped x,y on reload (load_warp assumes DICOM) -- 3dQwarp on the same
-        # data showed inverted x,y. medic worked around it by pre-negating x,y at
-        # its save site; that compensation was removed from the per-frame path when
-        # this negation was added here (medic's 5d path still writes DICOM inline).
-        from .nwarpforge import compute_cardinal_affine
-
-        rs = compute_cardinal_affine(affine)[:3, :3]
-        # Apply scale (cardinal rs is diagonal up to axis permutation/sign) to the
-        # displacement vectors. Shape: each is (nz, ny, nx), stack to (..., 3).
         disp_vox = np.stack([xd_np, yd_np, zd_np], axis=-1)  # (nz, ny, nx, 3)
-        disp_mm = np.einsum("ij,...j->...i", rs, disp_vox)  # RAS-mm
-        xd_np = -disp_mm[..., 0]  # RAS -> DICOM: negate x
-        yd_np = -disp_mm[..., 1]  # RAS -> DICOM: negate y
-        zd_np = disp_mm[..., 2]
+        disp = _disp_vox_to_dicom_mm(disp_vox, affine)
+        xd_np, yd_np, zd_np = disp[..., 0], disp[..., 1], disp[..., 2]
 
     # Stack: (nz, ny, nx, 3), transpose to NIfTI (nx, ny, nz, 3)
     arr = np.stack([xd_np, yd_np, zd_np], axis=-1)
     arr = arr.transpose(2, 1, 0, 3).astype(np.float32)
 
     save_nifti(arr, output_path=path, affine=affine)
+
+
+def _disp_vox_to_dicom_mm(disp_vox: np.ndarray, affine: np.ndarray) -> np.ndarray:
+    """Convert voxel-index displacement vectors to AFNI DICOM-mm.
+
+    ``disp_vox`` is ``(..., 3)`` in voxel-index units; returns the same shape in
+    DICOM-mm. Used by :func:`save_warp_field` (units="mm") and
+    :func:`save_warp_series` so single and time-varying warps share one convention.
+
+    Converts with the CARDINAL (deobliqued) affine, not the raw oblique one. AFNI
+    does every warp conversion through ijk_to_dicom (cardinal), carrying obliquity
+    separately rather than folding it into the displacement values (3dQwarp -help:
+    "(xd,yd,zd) are stored in DICOM order"; ijk_to_dicom aligns grid axes to x/y/z).
+    Using the oblique rs here would rotate a single-grid-axis warp across components
+    and would NOT be undone on apply (which goes through compute_cardinal_affine too).
+    For axis-aligned data cardinal == oblique, so this is a no-op there.
+
+    On-disk convention is AFNI DICOM-mm (matches 3dQwarp), so the file is directly
+    consumable by AFNI 3dNwarpApply AND round-trips cleanly through
+    nwarpforge.load_warp (which negates x,y DICOM->NIfTI on load). Two steps:
+      1. voxel -> RAS/NIfTI-mm via the CARDINAL (deobliqued) rs.
+      2. RAS-mm -> DICOM-mm: negate x,y (DICOM = diag(-1,-1,1) @ RAS).
+    History: this used to stop at step 1 (RAS-mm on disk), which double-flipped x,y
+    on reload (load_warp assumes DICOM) -- 3dQwarp on the same data showed inverted
+    x,y. medic worked around it by pre-negating x,y at its save site; that
+    compensation was removed from the per-frame path when this negation was added
+    (medic's own 5d path still writes DICOM inline).
+    """
+    from .nwarpforge import compute_cardinal_affine
+
+    rs = compute_cardinal_affine(affine)[:3, :3]
+    disp_mm = np.einsum("ij,...j->...i", rs, disp_vox)  # RAS-mm
+    out = np.empty_like(disp_mm)
+    out[..., 0] = -disp_mm[..., 0]  # RAS -> DICOM: negate x
+    out[..., 1] = -disp_mm[..., 1]  # RAS -> DICOM: negate y
+    out[..., 2] = disp_mm[..., 2]
+    return out
 
 
 def load_warp_field(
@@ -278,3 +289,145 @@ def load_warp_field(
         zd = zd.to(device)
 
     return xd, yd, zd, header_info
+
+
+# ---------------------------------------------------------------------------
+# Time-varying (per-frame) warp series — one 5D file OR a folder of 4D frames
+# ---------------------------------------------------------------------------
+#
+# A time-series of warps (one displacement field per fMRI volume) is stored one
+# of two interchangeable ways, and every ffs tool that reads/writes warp series
+# goes through this pair so the two formats stay in lock-step:
+#   * 5D  : a single NIfTI ``(nx, ny, nz, T, 3)`` — compact, "much better".
+#   * folder: a directory of numbered 4D ``(nx, ny, nz, 3)`` files — every tool
+#             (AFNI included) plays nice with these.
+# On disk both are AFNI DICOM-mm (units="mm"), matching save_warp_field, so
+# ffs_nwarp -nwarp consumes either (a 5D file, or a ``warp_*`` glob).
+
+
+def _natural_key(s: str) -> list:
+    """Sort key that orders embedded integers numerically (t2 < t10)."""
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", s)]
+
+
+def save_warp_series(
+    xd: Tensor,
+    yd: Tensor,
+    zd: Tensor,
+    dest: str | Path,
+    *,
+    as_5d: bool,
+    header_info: dict | None = None,
+    affine: np.ndarray | None = None,
+    units: str = "mm",
+    padding: tuple[int, int, int] | None = None,
+    frame_prefix: str = "warp",
+    frame_ext: str = ".nii.gz",
+) -> str:
+    """Write a time-varying warp as one 5D file or a folder of numbered 4D frames.
+
+    ``xd, yd, zd`` are ``(T, nz, ny, nx)`` voxel-index displacement fields (the
+    same internal convention as :func:`save_warp_field`, with a leading time axis).
+
+    Args:
+        dest: 5D → the output file path (``.nii``/``.nii.gz``); folder → the output
+            directory (created; frames written as ``{frame_prefix}_{t:05d}{ext}``).
+        as_5d: True → single 5D ``(nx, ny, nz, T, 3)`` file; False → per-frame folder.
+        units: "mm" (AFNI DICOM-mm on disk, default) or "voxels".
+        padding: (pad_x, pad_y, pad_z) if the warp is on a padded grid; the affine
+            origin is shifted once, up front, exactly like :func:`save_warp_field`.
+
+    Returns:
+        The path to hand ``ffs_nwarp -nwarp``: the 5D file, or a ``{prefix}_*{ext}``
+        glob for the folder.
+    """
+    _require_nibabel()
+
+    if affine is None:
+        affine = header_info["affine"].copy() if header_info is not None else np.eye(4)
+    else:
+        affine = affine.copy()
+    if padding is not None:
+        pad_x, pad_y, pad_z = padding
+        if pad_x > 0 or pad_y > 0 or pad_z > 0:
+            affine[:3, 3] += affine[:3, :3] @ np.array([-pad_x, -pad_y, -pad_z], dtype=np.float64)
+
+    disp = np.stack(
+        [t.detach().cpu().numpy() for t in (xd, yd, zd)], axis=-1
+    )  # (T, nz, ny, nx, 3), voxels
+    if disp.ndim != 5:
+        raise ValueError(f"save_warp_series expects (T,nz,ny,nx) components, got {tuple(xd.shape)}")
+    if units == "mm":
+        disp = _disp_vox_to_dicom_mm(disp, affine)  # einsum broadcasts over (T,nz,ny,nx)
+    elif units != "voxels":
+        raise ValueError(f"units must be 'mm' or 'voxels', got {units!r}")
+
+    if as_5d:
+        # (T, nz, ny, nx, 3) -> NIfTI (nx, ny, nz, T, 3)
+        arr = np.ascontiguousarray(disp.transpose(3, 2, 1, 0, 4), dtype=np.float32)
+        save_nifti(arr, output_path=str(dest), affine=affine)
+        return str(dest)
+
+    os.makedirs(dest, exist_ok=True)
+    n_t = disp.shape[0]
+    for t in range(n_t):
+        frame = np.ascontiguousarray(
+            disp[t].transpose(2, 1, 0, 3), dtype=np.float32
+        )  # (nx,ny,nz,3)
+        save_nifti(
+            frame,
+            output_path=os.path.join(str(dest), f"{frame_prefix}_{t:05d}{frame_ext}"),
+            affine=affine,
+        )
+    return os.path.join(str(dest), f"{frame_prefix}_*{frame_ext}")
+
+
+def load_warp_series(
+    source: str | Path,
+    *,
+    pattern: str = "warp_*.nii.gz",
+    device: torch.device | None = None,
+) -> tuple[Tensor, Tensor, Tensor, dict, int]:
+    """Load a time-varying warp from a 5D file OR a folder of numbered 4D frames.
+
+    Returns displacement components ``(xd, yd, zd)`` each ``(T, nz, ny, nx)`` in
+    the file's on-disk values — NO DICOM↔NIfTI sign conversion (callers that need
+    it, e.g. warp composition, apply it themselves; PCA/analysis callers don't care
+    about global sign). ``source`` may be:
+
+      * a directory — globbed with ``pattern``, natural-sorted into frame order;
+      * a 5D ``(nx, ny, nz, T, 3)`` file — split into T frames;
+      * a 4D ``(nx, ny, nz, 3)`` file — a single frame (T=1).
+
+    Returns ``(xd, yd, zd, header_info, n_frames)``.
+    """
+    if os.path.isdir(source):
+        files = sorted(_glob.glob(os.path.join(str(source), pattern)), key=_natural_key)
+        if not files:
+            raise FileNotFoundError(f"No files matching {pattern!r} in {source}")
+        xs, ys, zs, header_info = [], [], [], {}
+        for f in files:
+            x, y, z, hdr = load_warp_field(f)
+            xs.append(x)
+            ys.append(y)
+            zs.append(z)
+            header_info = hdr
+        xd, yd, zd = torch.stack(xs), torch.stack(ys), torch.stack(zs)
+    else:
+        img = load_nifti(str(source))
+        data = np.asarray(img.dataobj, dtype=np.float32)
+        header_info = {"affine": img.affine.copy(), "header": img.header.copy()}
+        if data.ndim == 4 and data.shape[3] == 3:
+            data = data[:, :, :, None, :]  # (nx,ny,nz,1,3)
+        if data.ndim != 5 or data.shape[-1] != 3:
+            raise ValueError(
+                f"Expected 5D (nx,ny,nz,T,3) or 4D (nx,ny,nz,3) warp, got {data.shape}: {source}"
+            )
+        # (nx, ny, nz, T, c) -> per component (T, nz, ny, nx)
+        xd = torch.from_numpy(np.ascontiguousarray(data[..., 0].transpose(3, 2, 1, 0)))
+        yd = torch.from_numpy(np.ascontiguousarray(data[..., 1].transpose(3, 2, 1, 0)))
+        zd = torch.from_numpy(np.ascontiguousarray(data[..., 2].transpose(3, 2, 1, 0)))
+
+    if device is not None:
+        xd, yd, zd = xd.to(device), yd.to(device), zd.to(device)
+    return xd, yd, zd, header_info, int(xd.shape[0])

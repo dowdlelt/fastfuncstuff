@@ -26,9 +26,7 @@ Examples
 from __future__ import annotations
 
 import argparse
-import glob
 import os
-import re
 import sys
 
 import torch
@@ -49,12 +47,19 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    req = parser.add_argument_group("Required Arguments")
+    req = parser.add_argument_group("Required Arguments (give -warp_dir OR -warp)")
     req.add_argument(
         "-warp_dir",
-        required=True,
+        default=None,
         metavar="DIR",
-        help="Directory containing per-volume warp files (*_WARP_t*.nii.gz).",
+        help="Directory of per-volume 4D warp files (glob -pattern).",
+    )
+    req.add_argument(
+        "-warp",
+        default=None,
+        metavar="FILE",
+        help="A single 5D (nx,ny,nz,T,3) warp file (e.g. ffs_locomoco/qwarp/medic "
+        "output). Alternative to -warp_dir.",
     )
     req.add_argument(
         "-n_pcs",
@@ -104,39 +109,23 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _natural_sort_key(s: str):
-    """Sort key that handles embedded numbers naturally (t2 < t10)."""
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", s)]
-
-
 def _detect_active_axes(
-    warp_dir: str,
-    warp_files: list[str],
+    xd: torch.Tensor,
+    yd: torch.Tensor,
+    zd: torch.Tensor,
     verb: int,
 ) -> tuple[bool, bool, bool]:
     """Auto-detect which displacement axes are non-zero.
 
-    Skips the first file (volume 0 may be identity / base-to-base).
-    Samples a few files to determine which axes carry displacement.
+    ``xd/yd/zd`` are ``(T, nz, ny, nx)``. Skips frame 0 (volume 0 may be identity
+    / base-to-base) and samples a few frames to see which axes carry displacement.
     """
-    from fastfuncstuff.processing.io import load_warp_field
-
-    # Sample up to 3 non-first files
-    candidates = warp_files[1:4] if len(warp_files) > 1 else warp_files[:1]
-
-    has_x, has_y, has_z = False, False, False
-    for fname in candidates:
-        path = os.path.join(warp_dir, fname)
-        xd, yd, zd, _ = load_warp_field(path)
-        if xd.abs().max().item() > 1e-8:
-            has_x = True
-        if yd.abs().max().item() > 1e-8:
-            has_y = True
-        if zd.abs().max().item() > 1e-8:
-            has_z = True
-        # Early exit if all active
-        if has_x and has_y and has_z:
-            break
+    # Sample up to 3 non-first frames.
+    hi = min(4, xd.shape[0])
+    sl = slice(1, hi) if xd.shape[0] > 1 else slice(0, 1)
+    has_x = xd[sl].abs().max().item() > 1e-8
+    has_y = yd[sl].abs().max().item() > 1e-8
+    has_z = zd[sl].abs().max().item() > 1e-8
 
     if verb >= 1:
         labels = []
@@ -165,10 +154,17 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    # --- Validate inputs ---
-    warp_dir = args.warp_dir
-    if not os.path.isdir(warp_dir):
-        print(f"ERROR: warp directory does not exist: {warp_dir}", file=sys.stderr)
+    # --- Validate inputs: exactly one of -warp_dir / -warp ---
+    if bool(args.warp_dir) == bool(args.warp):
+        print("ERROR: give exactly one of -warp_dir (folder) or -warp (5D file).", file=sys.stderr)
+        return 1
+    source = args.warp_dir if args.warp_dir else args.warp
+    is_dir = bool(args.warp_dir)
+    if is_dir and not os.path.isdir(source):
+        print(f"ERROR: warp directory does not exist: {source}", file=sys.stderr)
+        return 1
+    if not is_dir and not os.path.isfile(source):
+        print(f"ERROR: warp file does not exist: {source}", file=sys.stderr)
         return 1
 
     n_pcs = args.n_pcs
@@ -176,26 +172,18 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: -n_pcs must be >= 1", file=sys.stderr)
         return 1
 
-    # --- Discover warp files ---
-    matched = glob.glob(os.path.join(warp_dir, args.pattern))
-    warp_files = sorted(
-        [os.path.basename(f) for f in matched],
-        key=_natural_sort_key,
-    )
-    n_vols = len(warp_files)
+    # --- Load the warp series (folder of 4D frames OR a single 5D file) ---
+    from fastfuncstuff.decomposition.pca import PCA
+    from fastfuncstuff.processing.io import load_warp_series
 
-    if n_vols == 0:
-        print(
-            f"ERROR: No files matching '{args.pattern}' in {warp_dir}",
-            file=sys.stderr,
-        )
+    try:
+        xd, yd, zd, _hdr, n_vols = load_warp_series(source, pattern=args.pattern)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
     if n_vols < 3:
-        print(
-            f"ERROR: Only {n_vols} warp files found — need at least 3 for PCA.",
-            file=sys.stderr,
-        )
+        print(f"ERROR: Only {n_vols} warp frames found — need at least 3 for PCA.", file=sys.stderr)
         return 1
 
     n_pcs = min(n_pcs, n_vols - 1)
@@ -203,15 +191,17 @@ def main(argv: list[str] | None = None) -> int:
     # --- Output path ---
     out_path = args.output
     if out_path is None:
-        out_path = os.path.join(warp_dir, "warpPCs.1D")
+        out_dir = source if is_dir else os.path.dirname(os.path.abspath(source))
+        out_path = os.path.join(out_dir, "warpPCs.1D")
 
     # --- Banner ---
     if args.verb >= 1:
         print("=" * 70)
         print("ffs_util_pcwarp — Warp displacement PC extraction")
         print("=" * 70)
-        print(f"  Warp directory : {os.path.abspath(warp_dir)}")
-        print(f"  Pattern        : {args.pattern}")
+        print(f"  Warp source    : {os.path.abspath(source)} ({'folder' if is_dir else '5D file'})")
+        if is_dir:
+            print(f"  Pattern        : {args.pattern}")
         print(f"  Volumes found  : {n_vols}")
         print(f"  PCs requested  : {n_pcs}")
         print(f"  Output         : {out_path}")
@@ -227,55 +217,23 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if args.verb >= 1:
             print("  Detecting active axes...")
-        do_x, do_y, do_z = _detect_active_axes(warp_dir, warp_files, args.verb)
+        do_x, do_y, do_z = _detect_active_axes(xd, yd, zd, args.verb)
 
     if not (do_x or do_y or do_z):
         print("ERROR: No active displacement axes — nothing to compute.", file=sys.stderr)
         return 1
 
-    # --- Load warps and build matrix ---
-    from fastfuncstuff.decomposition.pca import PCA
-    from fastfuncstuff.processing.io import load_warp_field
-
-    if args.verb >= 1:
-        print(f"\n  Loading {n_vols} warp files...")
-
-    axis_labels = []
-    if do_x:
-        axis_labels.append("X")
-    if do_y:
-        axis_labels.append("Y")
-    if do_z:
-        axis_labels.append("Z")
-
-    vol_vecs: list[torch.Tensor] = []
-    for i, fname in enumerate(warp_files):
-        path = os.path.join(warp_dir, fname)
-        xd, yd, zd, _ = load_warp_field(path)
-
-        parts = []
-        if do_x:
-            parts.append(xd.reshape(-1))
-        if do_y:
-            parts.append(yd.reshape(-1))
-        if do_z:
-            parts.append(zd.reshape(-1))
-        vol_vecs.append(torch.cat(parts))
-
-        if args.verb >= 2 and (i + 1) % 50 == 0:
-            print(f"    loaded {i + 1}/{n_vols}")
-
-    if args.verb >= 1:
-        print(f"  Loaded all {n_vols} volumes.")
+    # --- Build the (n_vols, n_active_vox) matrix from the loaded series ---
+    axis_labels = [a for a, on in zip("XYZ", (do_x, do_y, do_z), strict=False) if on]
+    comps = [c for c, on in zip((xd, yd, zd), (do_x, do_y, do_z), strict=False) if on]
+    # Each component is (T, nz, ny, nx) -> flatten spatial, concat active axes.
+    mat = torch.cat([c.reshape(n_vols, -1) for c in comps], dim=1).float()
+    del xd, yd, zd, comps
 
     # --- PCA ---
     if args.verb >= 1:
-        n_vox = vol_vecs[0].numel()
-        print(f"  Matrix shape: ({n_vols}, {n_vox})  [{'+'.join(axis_labels)}]")
+        print(f"  Matrix shape: ({n_vols}, {mat.shape[1]})  [{'+'.join(axis_labels)}]")
         print(f"  Running PCA for {n_pcs} components on {args.device}...")
-
-    mat = torch.stack(vol_vecs).float()
-    del vol_vecs
 
     if args.device != "cpu":
         mat = mat.to(args.device)
@@ -300,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     pcs_np = pcs.numpy()
     with open(out_path, "w") as f:
         f.write("# Warp displacement PCs from ffs_util_pcwarp\n")
-        f.write(f"# Source: {os.path.abspath(warp_dir)}\n")
+        f.write(f"# Source: {os.path.abspath(source)}\n")
         f.write(f"# Active axes: {'+'.join(axis_labels)}, {n_vols} volumes, {n_pcs} PCs\n")
         f.write(
             f"# Variance explained: {' '.join(f'{v * 100:.2f}%' for v in var_explained.tolist())}\n"
