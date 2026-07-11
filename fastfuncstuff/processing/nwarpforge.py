@@ -31,7 +31,7 @@ from .interp import (
     warp_image,
 )
 from .io import derive_mean_output_path, load_image, load_warp_field, save_image
-from .spacetime import apply_spacetime_sample, apply_spacetime_sample_following
+from .spacetime import TissueFollowingSampler, apply_spacetime_sample
 
 # Interpolation kernels usable for warp-field (displacement) interpolation during
 # composition. NN is excluded -- a nearest-sampled displacement field would be
@@ -1844,17 +1844,15 @@ def nwarpforge(
             verb=verb,
         )
 
-    # Tissue-following joint path: precompute, once, the source-voxel coordinates
-    # each output voxel samples *in every input frame's own pose*. Stored on CPU so
-    # a long series never sits on the GPU; each tap is moved to device on demand.
-    # These are independent of the output frame (T_f(u) is just where tissue u is in
-    # frame f), so this is one composition per input frame -- no window blow-up.
-    frame_coords: list[tuple[Tensor, Tensor, Tensor]] | None = None
+    # Tissue-following joint path: a sliding-window sampler that keeps only the
+    # ~2*half+2 frames it needs resident on-device, composing each frame's pose once
+    # as the window advances (O(nt) work, O(window) memory). See
+    # spacetime.py:TissueFollowingSampler.
+    follow_sampler: TissueFollowingSampler | None = None
     if slice_times_t is not None and follow_tissue and reduced is not None:
-        if verb >= 1:
-            print(f"nwarpforge: tissue-following joint path ({nt} per-frame poses)")
-        frame_coords = []
-        for f in range(nt):
+        assert tr is not None and tzero is not None
+
+        def _coords_for_frame(f: int) -> tuple[Tensor, Tensor, Tensor]:
             comp_f = (
                 static_composed
                 if static_composed is not None
@@ -1863,10 +1861,14 @@ def nwarpforge(
                     time_idx=f, interp=ainterp, verb=0,
                 )
             )
-            sxf, syf, szf = _output_to_source_voxel_coords(
+            return _output_to_source_voxel_coords(
                 comp_f, source_header["affine"], output_affine
             )
-            frame_coords.append((sxf.cpu(), syf.cpu(), szf.cpu()))
+
+        follow_sampler = TissueFollowingSampler(
+            source, _coords_for_frame, output_shape, tr, tzero, slice_times_t, device,
+            tinterp=tinterp, interp=interp, no_neg=no_neg, n_out=t_end - t_start, verb=verb,
+        )
 
     time_iter = tqdm(
         range(t_start, t_end) if not affine_only else range(0),
@@ -1874,16 +1876,10 @@ def nwarpforge(
         disable=verb == 0 or (t_end - t_start) == 1,
     )
     for t in time_iter:
-        if frame_coords is not None:
-            # Tissue-following joint: no single "this frame's pose" -- each temporal
-            # tap uses its own frame's precomputed coords (skip the compose here).
-            assert tr is not None and tzero is not None
-            output_volumes.append(
-                apply_spacetime_sample_following(
-                    source, frame_coords, t, tr, tzero, slice_times_t, device,
-                    tinterp=tinterp, interp=interp, no_neg=no_neg,
-                )
-            )
+        if follow_sampler is not None:
+            # Tissue-following joint: each temporal tap uses its own frame's pose,
+            # served from the sampler's sliding window (skip the compose here).
+            output_volumes.append(follow_sampler.sample(t))
             continue
 
         composed = (

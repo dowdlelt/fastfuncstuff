@@ -40,6 +40,7 @@ import math
 import torch
 from torch import Tensor
 
+from ..memory import get_available_memory
 from .interp import warp_image
 from .slicetime import _m3_window, _sinc
 
@@ -183,74 +184,130 @@ def apply_spacetime_sample(
     return acc / wsum.clamp_min(1e-8)
 
 
-def apply_spacetime_sample_following(
-    source: Tensor,
-    frame_coords: list[tuple[Tensor, Tensor, Tensor]],
-    frame_idx: int,
-    tr: float,
-    tzero: float,
-    slice_times: Tensor,
-    device: torch.device,
-    tinterp: str = "cubic",
-    interp: str = "wsinc5",
-    no_neg: bool = False,
-) -> Tensor:
-    """Tissue-following joint sample: drop the slow-motion assumption.
+class TissueFollowingSampler:
+    """Sliding-window tissue-following joint sampler (drops the slow-motion assumption).
 
     :func:`apply_spacetime_sample` freezes a single pose (the output frame's) and
     samples every temporal neighbour at those *same* scanner coordinates. Under
     motion that fixed location holds *different tissue* each frame, so the temporal
     interpolation mixes tissue (the same failure a fixed-scanner-slice ``3dTshift``
-    has). This variant instead follows the tissue: for output voxel ``u`` it samples
-    each neighbour frame ``f`` at *that frame's own pose* ``T_f(u)`` -- so every tap
-    is the same anatomy -- and reads the acquisition offset from the scanner slice
-    ``u`` actually lands in *in frame f*. The temporal tap distance is therefore
-    per frame:
+    has). This sampler follows the tissue: for output voxel ``u`` it samples each
+    neighbour frame ``f`` at *that frame's own pose* ``T_f(u)`` -- so every tap is
+    the same anatomy -- and reads the acquisition offset from the scanner slice
+    ``u`` actually lands in *in frame f*. The per-frame temporal tap distance is
 
         dist_f(u) = (j - f) + (tzero - Delta(sz_f(u))) / TR
 
     with ``sz_f`` the scanner slice of ``T_f(u)``. It reduces exactly to the
-    frozen-pose version when the motion is static (all poses equal).
+    frozen-pose result when motion within the window is sub-voxel.
 
-    Parameters
-    ----------
-    frame_coords : list of (sx, sy, sz), one per input frame
-        Absolute source-voxel coordinates each output voxel samples *in that
-        frame's pose* (as from ``_output_to_source_voxel_coords`` composed at
-        ``time_idx=f``). Kept on CPU by the caller; moved to ``device`` per tap so
-        a long series never sits on the GPU in full.
-    frame_idx : int
-        Output frame ``j`` (aligned to ``tzero``).
-    Other parameters match :func:`apply_spacetime_sample`.
+    GPU discipline. Only a *window* of ``2*half + 2`` frames is ever touched per
+    output frame, so we keep exactly that window resident on ``device`` (per-frame
+    source coordinates, and the source frames themselves), advancing one frame per
+    :meth:`sample` call. Each input frame's coordinates are composed once and each
+    source frame is copied to the device once as the window slides -- O(nt) work at
+    O(window) memory, versus precomputing all ``nt`` coordinate fields. When the
+    driver's free VRAM cannot hold the window's source frames (very large grids /
+    small GPUs), source frames are streamed per tap instead (coordinates, which are
+    what the algorithm needs resident, stay cached); the coordinate cache alone is
+    ``3 * window`` planes -- negligible beside the ``nt`` output volumes the caller
+    already accumulates.
     """
-    nt = source.shape[0]
-    onz, ony, onx = frame_coords[frame_idx][2].shape
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(onz, dtype=torch.float32, device=device),
-        torch.arange(ony, dtype=torch.float32, device=device),
-        torch.arange(onx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
 
-    # The per-voxel timing shift (tzero - Delta)/TR lies in (-1, 1), so a kernel of
-    # half-width H reaches at most H+1 frames each side of j.
-    half = _KERNEL_HALFWIDTH[tinterp]
-    f_lo, f_hi = frame_idx - (half + 1), frame_idx + (half + 1)
+    def __init__(
+        self,
+        source: Tensor,
+        coords_fn,
+        output_shape: tuple[int, int, int],
+        tr: float,
+        tzero: float,
+        slice_times: Tensor,
+        device: torch.device,
+        tinterp: str = "cubic",
+        interp: str = "wsinc5",
+        no_neg: bool = False,
+        n_out: int | None = None,
+        verb: int = 0,
+    ) -> None:
+        self.source = source
+        self.coords_fn = coords_fn  # f -> (sx, sy, sz) on ``device``
+        self.tr = tr
+        self.tzero = tzero
+        self.slice_times = slice_times
+        self.device = device
+        self.tinterp = tinterp
+        self.interp = interp
+        self.no_neg = no_neg
+        self.nt = source.shape[0]
+        self.half = _KERNEL_HALFWIDTH[tinterp]
 
-    acc = torch.zeros((onz, ony, onx), dtype=torch.float32, device=device)
-    wsum = torch.zeros_like(acc)
-    for f in range(f_lo, f_hi + 1):
-        fc = min(max(f, 0), nt - 1)  # edge-extend pose + data past the series ends
-        sx, sy, sz = (c.to(device=device, dtype=torch.float32) for c in frame_coords[fc])
-        delta = interp_slice_times(sz, slice_times)
-        w = temporal_kernel_weights((frame_idx - f) + (tzero - delta) / tr, tinterp)
-        if not bool(torch.any(w != 0.0)):
-            continue
-        frame = source[fc].to(device=device, dtype=acc.dtype)
-        s_f = warp_image(frame, sx - ii, sy - jj, sz - kk, mode=interp)
-        if no_neg:
-            s_f = s_f.clamp_min(0.0)
-        acc += w * s_f
-        wsum += w
+        onz, ony, onx = output_shape
+        self.kk, self.jj, self.ii = torch.meshgrid(
+            torch.arange(onz, dtype=torch.float32, device=device),
+            torch.arange(ony, dtype=torch.float32, device=device),
+            torch.arange(onx, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+        self._coords: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
+        self._srcs: dict[int, Tensor] = {}
 
-    return acc / wsum.clamp_min(1e-8)
+        # Decide whether the window's source frames fit device memory. The caller
+        # accumulates all ``n_out`` output volumes on device, so reserve for those
+        # first, then see if a window of source frames fits what remains.
+        window = 2 * self.half + 2
+        plane = onz * ony * onx * 4
+        if device.type == "cuda":
+            avail = get_available_memory(device)  # free * safety_factor
+            reserve_out = (n_out or self.nt) * plane
+            self.cache_source = (avail - reserve_out) > window * plane * 2
+        else:
+            self.cache_source = True  # CPU/MPS: source already in host RAM
+        if verb >= 1:
+            where = "device-cached" if self.cache_source else "streamed"
+            print(f"nwarpforge: tissue-following window={window} frames, source {where}")
+
+    def _clamp(self, f: int) -> int:
+        return min(max(f, 0), self.nt - 1)
+
+    def _ensure(self, fcs: set[int]) -> None:
+        """Compose/load the given (clamped) frames; evict everything else."""
+        for fc in list(self._coords):
+            if fc not in fcs:
+                del self._coords[fc]
+                self._srcs.pop(fc, None)
+        for fc in fcs:
+            if fc not in self._coords:
+                self._coords[fc] = self.coords_fn(fc)
+                if self.cache_source:
+                    self._srcs[fc] = self.source[fc].to(self.device, dtype=torch.float32)
+
+    def sample(self, frame_idx: int) -> Tensor:
+        """The tissue-following, slice-timing-corrected output volume at ``frame_idx``."""
+        # The per-voxel timing shift (tzero - Delta)/TR lies in (-1, 1), so a kernel
+        # of half-width H reaches at most H+1 frames each side of j.
+        f_lo, f_hi = frame_idx - (self.half + 1), frame_idx + (self.half + 1)
+        self._ensure({self._clamp(f) for f in range(f_lo, f_hi + 1)})
+
+        acc = torch.zeros_like(self.ii)
+        wsum = torch.zeros_like(self.ii)
+        for f in range(f_lo, f_hi + 1):
+            fc = self._clamp(f)  # edge-extend pose + data past the series ends
+            sx, sy, sz = self._coords[fc]
+            delta = interp_slice_times(sz, self.slice_times)
+            w = temporal_kernel_weights(
+                (frame_idx - f) + (self.tzero - delta) / self.tr, self.tinterp
+            )
+            if not bool(torch.any(w != 0.0)):
+                continue
+            frame = (
+                self._srcs[fc]
+                if self.cache_source
+                else self.source[fc].to(self.device, dtype=torch.float32)
+            )
+            s_f = warp_image(frame, sx - self.ii, sy - self.jj, sz - self.kk, mode=self.interp)
+            if self.no_neg:
+                s_f = s_f.clamp_min(0.0)
+            acc = acc + w * s_f
+            wsum = wsum + w
+
+        return acc / wsum.clamp_min(1e-8)
