@@ -149,6 +149,24 @@ def create_parser() -> argparse.ArgumentParser:
     io = p.add_argument_group("Input/Output")
     io.add_argument("-input", "-i", required=True, help="4D motion-corrected NIfTI series")
     io.add_argument(
+        "-raw_input",
+        "-raw",
+        default=None,
+        help="Pre-moco RAW 4D series (same grid as -input). Giving this AND -moco_matrix "
+        "switches on the rotation-aware estimator: residual distortion is measured in "
+        "each frame's native orientation (PE genuinely axis-aligned) and reprojected to "
+        "the reference frame by the head rotation, so a head tilt's off-PE-axis leakage "
+        "is recovered. -input is still the moco'd series (used for the drift anchor, "
+        "reusing moco's resample). Without these two flags the plain estimator runs.",
+    )
+    io.add_argument(
+        "-moco_matrix",
+        "-moco_mat",
+        default=None,
+        help="Per-volume moco matrices (.aff12.1D, one 12-value row per frame, DICOM — "
+        "e.g. ffs_moco -1Dmatrix_save). Required with -raw_input for rotation-aware mode.",
+    )
+    io.add_argument(
         "-prefix",
         "-o",
         required=True,
@@ -189,11 +207,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
     est.add_argument(
         "-ref",
-        default="mean",
-        help="[all] Reference: static mean | median | first | <frame index>, or "
+        default=None,
+        help="[all] Reference: static mean | median | max | first | <frame index>, or "
         "PROGRESSIVE first_mean / first_median — frame t registers to the running "
         "mean/median of the already-corrected earlier frames (a bootstrapped template; "
-        "frame 0 is the seed). Progressive modes are sequential and slower.",
+        "frame 0 is the seed). Progressive modes are sequential and slower. 'max' takes "
+        "the temporal maximum, which fills slices later frames rotate out of the FoV and "
+        "is a high-signal target. Default: max for rotation-aware mode, mean otherwise.",
     )
     est.add_argument(
         "-do_blur",
@@ -297,7 +317,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         metavar="ROUNDS",
-        help="[all] Outer reference-refinement rounds. After the first estimate, "
+        help="[plain path only] Outer reference-refinement rounds. After the first estimate, "
         "rebuild the reference from the corrected series (motion removed → sharp) and "
         "re-register the original frames against it, converging the template out of "
         "its bias. 1–3 tightens the recovered values; 0 = off.",
@@ -305,7 +325,7 @@ def create_parser() -> argparse.ArgumentParser:
     acc.add_argument(
         "-jacobian",
         action="store_true",
-        help="[all] Modulate the corrected series by the PE Jacobian to conserve "
+        help="[plain path only] Modulate the corrected series by the PE Jacobian to conserve "
         "signal: where distortion stacked voxels (compression) the correction stretches "
         "them and dims accordingly, and vice-versa. Off by default (pure geometric "
         "correction); affects the corrected image, not the saved warp geometry.",
@@ -321,6 +341,33 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Preset: maximum accuracy (bicubic warp, many iters, 3 refine rounds, "
         "finest search) for ~15–30× the time. Explicit flags still override.",
+    )
+
+    rot = p.add_argument_group("Rotation-aware residual motion (needs -raw_input + -moco_matrix)")
+    rot.add_argument(
+        "-fuse",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="How the absolute per-frame anchor pins the neighbour-differential chain: "
+        "'auto' engages the per-voxel smoother only when the measured chain-vs-anchor "
+        "drift exceeds -fuse_thresh; 'on' always; 'off' uses the chain alone (the anchor "
+        "just fixes its per-voxel DC level). The drift is always printed as a diagnostic.",
+    )
+    rot.add_argument(
+        "-fuse_thresh",
+        type=float,
+        default=0.05,
+        metavar="VOX",
+        help="Drift (RMS chain−anchor, in-brain, voxels) above which -fuse auto engages "
+        "the smoother. Below it the sequential chain is trusted on its own.",
+    )
+    rot.add_argument(
+        "-fuse_weight",
+        type=float,
+        default=1.0,
+        metavar="W",
+        help="Anchor weight in the smoother when engaged (relative to the unit-weighted "
+        "differentials): higher = trust the absolute anchor more, less high-frequency detail.",
     )
 
     mask = p.add_argument_group("Masking")
@@ -511,6 +558,12 @@ def main(argv: list[str] | None = None) -> int:
     args = create_parser().parse_args(argv)
     preset = _apply_preset(args)
 
+    # Rotation-aware mode (both raw + matrices) defaults its reference to the temporal
+    # MAX (fills FoV dropout, high-signal anchor); the plain path stays on the mean.
+    rotaware = args.raw_input is not None or args.moco_matrix is not None
+    if args.ref is None:
+        args.ref = "max" if rotaware else "mean"
+
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.processing.locomoco import estimate_residual_flow, resolve_pe_axis
 
@@ -592,30 +645,111 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"   accuracy: {acc_desc}")
 
-    result = estimate_residual_flow(
-        data,
-        pe_axis,
-        slice_axis,
-        ref_mode=args.ref,
-        backend=args.backend,
-        smooth_sigma=smooth_sigma,
-        n_levels=args.levels,
-        n_iters=args.iters,
-        window_sigma=args.window,
-        pe_only=pe_only,
-        dual=dual,
-        max_shift=args.max_shift,
-        trial_step=args.xcorr_step,
-        patch=args.patch,
-        stride=args.stride,
-        warp_interp=args.warp_interp,
-        refine_rounds=args.refine,
-        jacobian=args.jacobian,
-        automask=automask,
-        automask_dilate=args.automask_dilate,
-        automask_sigma=args.automask_sigma,
-        device=device,
-    )
+    if rotaware:
+        if args.raw_input is None or args.moco_matrix is None:
+            print(
+                "❌ rotation-aware mode needs BOTH -raw_input and -moco_matrix.",
+                file=sys.stderr,
+            )
+            return 2
+        if dual:
+            print(
+                "❌ rotation-aware mode is single phase-encode only (one -pe_dir).", file=sys.stderr
+            )
+            return 2
+        # The idea-1 accuracy knobs live on the moco-frame estimator; rotation-aware has
+        # its own convergence path (neighbour differential + anchor smoother, tuned by
+        # -fuse and -iters), so these are inert here. Warn rather than silently ignore.
+        if args.refine or args.jacobian or preset:
+            print(
+                "ℹ️  rotation-aware: -refine, -jacobian, and the -workhard/-superhard "
+                "reference-refinement rounds are moco-frame (idea-1) knobs and do NOT apply "
+                "here — use -fuse / -fuse_weight and -iters to tune this path."
+            )
+        from fastfuncstuff.processing.affine import dicom_matrix_to_voxel
+        from fastfuncstuff.processing.locomoco import estimate_residual_flow_rotaware
+
+        with spinner(f"Loading raw {Path(args.raw_input).name}"):
+            raw = np.asarray(load_nifti(args.raw_input).get_fdata(dtype=np.float32))
+        if raw.shape != data.shape:
+            print(
+                f"❌ -raw_input {raw.shape} must match -input {data.shape} (same grid, same T).",
+                file=sys.stderr,
+            )
+            return 2
+        # Load per-volume DICOM matrices (reference→raw), derive the voxel-space stack.
+        lines = [
+            l.strip()
+            for l in Path(args.moco_matrix).read_text().splitlines()
+            if l.strip() and not l.startswith("#")
+        ]
+        m12 = np.array([[float(x) for x in ln.split()[:12]] for ln in lines], dtype=np.float32)
+        if m12.shape != (data.shape[3], 12):
+            print(
+                f"❌ -moco_matrix has {m12.shape[0]} rows of {m12.shape[1] if m12.ndim > 1 else '?'}; "
+                f"expected {data.shape[3]} rows of 12.",
+                file=sys.stderr,
+            )
+            return 2
+        mats_dicom = torch.eye(4).repeat(data.shape[3], 1, 1)
+        mats_dicom[:, :3, :] = torch.from_numpy(m12.reshape(-1, 3, 4))
+        mats_vox = dicom_matrix_to_voxel(mats_dicom, affine, affine)
+        print(
+            f"   rotation-aware: raw={args.raw_input}, fuse={args.fuse} (thresh {args.fuse_thresh} vox)"
+        )
+        result = estimate_residual_flow_rotaware(
+            raw,
+            data,
+            mats_vox,
+            mats_dicom,
+            affine,
+            pe_axis,
+            slice_axis,
+            ref_mode=args.ref,
+            backend=args.backend,
+            smooth_sigma=smooth_sigma,
+            n_levels=args.levels,
+            n_iters=args.iters,
+            window_sigma=args.window,
+            pe_only=pe_only,
+            max_shift=args.max_shift,
+            trial_step=args.xcorr_step,
+            patch=args.patch,
+            stride=args.stride,
+            warp_interp=args.warp_interp,
+            fuse=args.fuse,
+            fuse_thresh=args.fuse_thresh,
+            fuse_weight=args.fuse_weight,
+            automask=automask,
+            automask_dilate=args.automask_dilate,
+            automask_sigma=args.automask_sigma,
+            device=device,
+        )
+    else:
+        result = estimate_residual_flow(
+            data,
+            pe_axis,
+            slice_axis,
+            ref_mode=args.ref,
+            backend=args.backend,
+            smooth_sigma=smooth_sigma,
+            n_levels=args.levels,
+            n_iters=args.iters,
+            window_sigma=args.window,
+            pe_only=pe_only,
+            dual=dual,
+            max_shift=args.max_shift,
+            trial_step=args.xcorr_step,
+            patch=args.patch,
+            stride=args.stride,
+            warp_interp=args.warp_interp,
+            refine_rounds=args.refine,
+            jacobian=args.jacobian,
+            automask=automask,
+            automask_dilate=args.automask_dilate,
+            automask_sigma=args.automask_sigma,
+            device=device,
+        )
 
     print("💾 Writing outputs...")
     if not args.no_warp:

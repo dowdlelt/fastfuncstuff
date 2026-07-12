@@ -504,6 +504,12 @@ class LocomocoResult:
     a0: int = 0  # in-plane NIfTI axis carrying v (rows/H)
     a1: int = 1  # in-plane NIfTI axis carrying u (cols/W)
     dual: bool = False  # two PE axes: both u and v are real displacements
+    # ── rotation-aware (idea 2) extras — None for the plain idea-1 path ──
+    reproject_weights: torch.Tensor | None = None  # (T, 3) per-frame axis weights
+    corrected_nifti: torch.Tensor | None = None  # precomputed (nx,ny,nz,T) 3-D-warp series
+    drift_rms: float | None = None  # chain-vs-anchor drift (in-brain), voxels
+    drift_max: float | None = None
+    fused: bool = False  # whether the anchor smoother was engaged
 
     def _to_nifti(self, canon: torch.Tensor) -> torch.Tensor:
         inv = [0, 0, 0, 0]
@@ -525,7 +531,17 @@ class LocomocoResult:
         """``(nifti_axis, signed_displacement)`` pairs to write into the warp.
 
         Single-PE: one entry on the PE axis. Dual-PE: two — u on ``a1``, v on ``a0``.
+        Rotation-aware (idea 2): the reference-frame PE magnitude ``p`` reprojected
+        onto all three axes by the per-frame head rotation — mostly PE, with the
+        small IS/LR leakage a head tilt throws off-axis. Each axis component is
+        ``p * reproject_weights[:, axis]`` (already in voxel-pull units, so it feeds
+        :func:`save_medic_warp` exactly like the single-PE case). Reduces to the
+        single-PE entry when the rotation is identity (weight 1 on PE, 0 elsewhere).
         """
+        if self.reproject_weights is not None:
+            p = self.pe_displacement()  # (nx, ny, nz, T) ref-frame PE magnitude
+            w = self.reproject_weights.to(p.dtype)  # (T, 3)
+            return [(a, p * w[:, a]) for a in (0, 1, 2)]
         if self.dual:
             return [
                 (self.a1, self._to_nifti(self.u_canon)),
@@ -547,7 +563,14 @@ class LocomocoResult:
         return self._to_nifti(ang % 360.0)
 
     def corrected_series(self) -> torch.Tensor:
-        """Motion-corrected 4-D series ``(nx, ny, nz, T)``."""
+        """Motion-corrected 4-D series ``(nx, ny, nz, T)``.
+
+        Rotation-aware runs precompute a genuine 3-D warp of the moco'd series (the
+        correction has a through-plane component a per-slice 2-D warp can't hold), so
+        return that directly; the idea-1 path maps its canonical 2-D-warp series back.
+        """
+        if self.corrected_nifti is not None:
+            return self.corrected_nifti
         return self._to_nifti(self.corrected_canon)
 
     def flow_movie(
@@ -688,6 +711,10 @@ def _estimate_static(
         ref = vol.mean(dim=0)
     elif ref_mode == "median":
         ref = vol.median(dim=0).values
+    elif ref_mode == "max":
+        # Temporal max fills slices that later drop out of the FoV (head moved out)
+        # and is a high-signal target; brighter/noisier per voxel than the mean.
+        ref = vol.max(dim=0).values
     elif ref_mode == "first":
         ref = vol[0]
     else:
@@ -695,7 +722,7 @@ def _estimate_static(
             ref = vol[int(ref_mode)]
         except ValueError as e:
             raise ValueError(
-                f"-ref must be mean|median|first|first_mean|first_median|<index>, got '{ref_mode}'"
+                f"-ref must be mean|median|max|first|first_mean|first_median|<index>, got '{ref_mode}'"
             ) from e
 
     u_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
@@ -752,6 +779,73 @@ def _estimate_cumulative(
         if buf is not None:
             buf[t] = corr
     return u_all, v_all, corrected
+
+
+def _build_flow_fn(
+    backend: str,
+    *,
+    pe_flow_is_u: bool,
+    dual: bool,
+    pe_only: bool,
+    n_levels: int,
+    n_iters: int,
+    window_sigma: float,
+    warp_interp: str,
+    patch: int,
+    stride: int,
+    max_shift: float,
+    trial_step: float,
+):
+    """Build the per-pair ``(fixed, moving) -> (u, v)`` estimator for a backend.
+
+    A single place mapping ``-backend`` to a closure over its tuning knobs, shared
+    by the plain (idea-1) and rotation-aware (idea-2) orchestrators so they can never
+    drift apart. Single-PE returns just the PE component; ``dual`` returns both.
+    """
+    if backend == "flow":
+        # dual (both axes) = full 2-D flow; single respects pe_only.
+        pe_only_axis = None if dual else ((0 if pe_flow_is_u else 1) if pe_only else None)
+
+        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return optical_flow_lk_2d(
+                fx,
+                mv,
+                n_levels=n_levels,
+                n_iters=n_iters,
+                window_sigma=window_sigma,
+                pe_only_axis=pe_only_axis,
+                warp_interp=warp_interp,
+            )
+    elif backend == "phase":
+
+        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return phase_correlation_flow_2d(
+                fx,
+                mv,
+                pe_is_u=pe_flow_is_u,
+                patch=patch,
+                stride=stride,
+                max_shift=max_shift,
+                n_iters=n_iters,
+                dual=dual,
+                warp_interp=warp_interp,
+            )
+    elif backend == "xcorr":
+
+        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return xcorr_search_flow_2d(
+                fx,
+                mv,
+                pe_is_u=pe_flow_is_u,
+                max_shift=max_shift,
+                window_sigma=window_sigma,
+                trial_step=trial_step,
+                dual=dual,
+                warp_interp=warp_interp,
+            )
+    else:
+        raise ValueError(f"Unknown backend {backend!r}; expected flow | phase | xcorr.")
+    return flow_fn
 
 
 def estimate_residual_flow(
@@ -848,52 +942,20 @@ def estimate_residual_flow(
     vol = torch.from_numpy(np.ascontiguousarray(data)).permute(perm).contiguous()
     nt, ns = vol.shape[0], vol.shape[1]
 
-    # Backend: a per-pair (fixed, moving) -> (u, v) estimator plugged into the same
-    # slice/frame machinery. Optical flow (default), phase-correlation, or magnitude
-    # cross-correlation. Single-PE returns just the PE component; dual returns both.
-    if backend == "flow":
-        # dual (both axes) = full 2-D flow; single respects pe_only.
-        pe_only_axis = None if dual else ((0 if pe_flow_is_u else 1) if pe_only else None)
-
-        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return optical_flow_lk_2d(
-                fx,
-                mv,
-                n_levels=n_levels,
-                n_iters=n_iters,
-                window_sigma=window_sigma,
-                pe_only_axis=pe_only_axis,
-                warp_interp=warp_interp,
-            )
-    elif backend == "phase":
-
-        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return phase_correlation_flow_2d(
-                fx,
-                mv,
-                pe_is_u=pe_flow_is_u,
-                patch=patch,
-                stride=stride,
-                max_shift=max_shift,
-                n_iters=n_iters,
-                dual=dual,
-                warp_interp=warp_interp,
-            )
-    elif backend == "xcorr":
-
-        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return xcorr_search_flow_2d(
-                fx,
-                mv,
-                pe_is_u=pe_flow_is_u,
-                max_shift=max_shift,
-                window_sigma=window_sigma,
-                trial_step=trial_step,
-                dual=dual,
-                warp_interp=warp_interp,
-            )
-    else:
-        raise ValueError(f"Unknown backend {backend!r}; expected flow | phase | xcorr.")
+    flow_fn = _build_flow_fn(
+        backend,
+        pe_flow_is_u=pe_flow_is_u,
+        dual=dual,
+        pe_only=pe_only,
+        n_levels=n_levels,
+        n_iters=n_iters,
+        window_sigma=window_sigma,
+        warp_interp=warp_interp,
+        patch=patch,
+        stride=stride,
+        max_shift=max_shift,
+        trial_step=trial_step,
+    )
 
     progressive = ref_mode in ("first_mean", "first_median")
     est = _estimate_cumulative if progressive else _estimate_static
@@ -977,3 +1039,368 @@ def estimate_residual_flow(
             f"|disp| median {med:.3f} vox ({region}), max {float(ap.max()):.3f} vox"
         )
     return result
+
+
+# ── rotation-aware residual motion (idea 2) ───────────────────────────────────
+# The plain path above estimates residual PE motion in the moco'd (reference) frame
+# and constrains it to the PE axis. That is only exact when the head did not rotate:
+# rigid moco resamples every volume by R_t, so the physical distortion — fixed along
+# SCANNER phase-encode — points along ``R_t · PE`` in the reference frame, not PE. A
+# head tilt (nod) throws part of it out of the acquired slice plane, invisible to a
+# 2-D slice movie. This path removes that assumption:
+#
+#   1. Estimate the DIFFERENTIAL distortion between neighbouring frames, with the
+#      target left in its NATIVE orientation (PE genuinely axis-aligned, δR tiny so
+#      2-D flow is valid), forward and backward, averaged on the reference grid.
+#   2. Anchor to an ABSOLUTE per-frame estimate (each raw frame vs the reference
+#      template, registered in the frame's native orientation) via a per-voxel
+#      smoother, so the differential chain cannot drift (see the drift diagnostic).
+#   3. Reproject the reference-frame PE magnitude by ``R_t`` — a per-frame, per-axis
+#      scalar reweight — so the saved 5-D warp lives in the reference frame and
+#      composes as ``moco-then-nonlinear`` in ffs_nwarp, exactly like the plain path
+#      (to which it reduces when R_t = I). The IS/LR leakage of a tilt is SYNTHESISED
+#      from the known rotation, not measured by the (2-D) flow.
+#
+# Inputs: the RAW (pre-moco) series for the native-frame estimation, the moco'd
+# series for the anchor (reuses moco's existing resample — no extra interpolation),
+# and the per-volume moco matrices (voxel + DICOM).
+
+
+def _inv_perm(perm: list[int]) -> list[int]:
+    inv = [0] * len(perm)
+    for i, p in enumerate(perm):
+        inv[p] = i
+    return inv
+
+
+def compute_reproject_weights(
+    matrices_dicom: torch.Tensor, affine: np.ndarray, pe_axis: int
+) -> torch.Tensor:
+    """Per-frame, per-axis weights that reproject the PE magnitude to reference space.
+
+    The reference-frame displacement of a ``p``-voxel scanner-PE distortion is
+    ``R_t⁻¹ · (p · e_pe)`` in mm (a rotation, so done in metric space, not voxels).
+    Written per NIfTI axis in the voxel-pull units :func:`save_medic_warp` expects,
+    that is ``p * w[t, a]`` with ``w[t, a] = (R_tᵀ · e_pe_dicom)[a] / ijk2dicom[a, a]``,
+    where ``R_t`` is the DICOM rotation of the moco pull matrix (reference→raw) and
+    ``e_pe_dicom`` the raw PE axis in DICOM mm. Reduces to ``w[:, pe]=1`` and ``0``
+    elsewhere when ``R_t = I`` — i.e. exactly the plain single-PE warp.
+    """
+    from .nwarpforge import compute_cardinal_affine
+
+    cardinal = compute_cardinal_affine(np.asarray(affine, dtype=np.float64))  # ijk→RAS
+    dsign = np.array([-1.0, -1.0, 1.0])  # RAS→DICOM negates x, y
+    ijk2dicom = cardinal[:3, :3] * dsign[:, None]  # ijk→DICOM linear part
+    e_pe = ijk2dicom[:, pe_axis]  # (3,) raw PE direction in DICOM mm (incl. voxel size)
+    diag = np.array([ijk2dicom[a, a] for a in range(3)])  # (3,)
+    R = matrices_dicom[:, :3, :3].detach().cpu().numpy().astype(np.float64)  # (T,3,3)
+    c = np.einsum("tji,j->ti", R, e_pe)  # R_tᵀ @ e_pe → ref-frame DICOM direction
+    w = c / diag[None, :]
+    return torch.from_numpy(w).float()
+
+
+def pe_tilt_degrees(matrices_dicom: torch.Tensor, affine: np.ndarray, pe_axis: int) -> torch.Tensor:
+    """Per-frame angle (deg) the reference PE axis is tilted by each head rotation.
+
+    The distortion is off-axis exactly insofar as ``R_t`` rotates the PE unit vector
+    away from itself: ``θ_t = arccos(êᵀ R_t ê)``. This is the "does idea 2 matter for
+    this ``pe_dir`` and this subject" readout — rotation ABOUT PE leaves ``ê`` fixed
+    (θ≈0), rotations perpendicular to PE tilt it. Axis-general: which physical
+    rotations count depends on ``pe_axis``, and this measures the net effect directly.
+    """
+    from .nwarpforge import compute_cardinal_affine
+
+    cardinal = compute_cardinal_affine(np.asarray(affine, dtype=np.float64))
+    dsign = np.array([-1.0, -1.0, 1.0])
+    ijk2dicom = cardinal[:3, :3] * dsign[:, None]
+    e = ijk2dicom[:, pe_axis]
+    e = e / np.linalg.norm(e)
+    R = matrices_dicom[:, :3, :3].detach().cpu().numpy().astype(np.float64)
+    cos = np.clip(np.einsum("i,tij,j->t", e, R, e), -1.0, 1.0)
+    return torch.from_numpy(np.degrees(np.arccos(cos))).float()
+
+
+def _fuse_tridiag(
+    fd: torch.Tensor, anchor: torch.Tensor, w_anchor: float, w_diff: float = 1.0
+) -> torch.Tensor:
+    """Per-voxel least-squares fuse of a differential chain and absolute anchors.
+
+    Minimise ``Σ_t w_diff (p_t − p_{t−1} − fd_t)² + Σ_t w_anchor (p_t − anchor_t)²``
+    for each voxel — a symmetric tridiagonal system, identical across voxels (only
+    the RHS differs), solved by a batched Thomas sweep. ``w_anchor`` sets how hard
+    the absolute estimate pins the level and kills accumulated drift; ``fd_t`` is the
+    forward difference into frame ``t`` (``fd[0]`` unused). ``fd``/``anchor`` are
+    ``(T, ...)``; returns ``p`` ``(T, ...)``.
+    """
+    T = fd.shape[0]
+    shape = fd.shape[1:]
+    fdf = fd.reshape(T, -1).double()  # (T, N)
+    af = anchor.reshape(T, -1).double()
+    wa, wd = float(w_anchor), float(w_diff)
+
+    # Constant tridiagonal: diag b_k = wa + wd*(#adjacent steps); off-diag = -wd.
+    b = torch.full((T,), wa + 2.0 * wd, dtype=torch.float64, device=fd.device)
+    b[0] = wa + wd
+    b[-1] = wa + wd
+    # RHS: wa*anchor_k + wd*(fd_k − fd_{k+1}); boundaries drop the missing step term.
+    rhs = wa * af
+    rhs[:-1] = rhs[:-1] - wd * fdf[1:]  # − wd * fd_{k+1}
+    rhs[1:] = rhs[1:] + wd * fdf[1:]  # + wd * fd_k
+
+    # Thomas sweep (sub/super diagonals are the constant −wd).
+    cp = torch.zeros(T, dtype=torch.float64, device=fd.device)
+    dp = torch.zeros_like(rhs)
+    cp[0] = -wd / b[0]
+    dp[0] = rhs[0] / b[0]
+    for k in range(1, T):
+        m = b[k] - (-wd) * cp[k - 1]
+        cp[k] = -wd / m
+        dp[k] = (rhs[k] - (-wd) * dp[k - 1]) / m
+    p = torch.zeros_like(rhs)
+    p[-1] = dp[-1]
+    for k in range(T - 2, -1, -1):
+        p[k] = dp[k] - cp[k] * p[k + 1]
+    return p.reshape(T, *shape).float()
+
+
+def _warp3d_pull(vol: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor, dz: torch.Tensor):
+    """Sample ``vol`` (nx,ny,nz) at ``(x+dx, y+dy, z+dz)`` — a voxel-space pull warp."""
+    nx, ny, nz = vol.shape
+    xs, ys, zs = torch.meshgrid(
+        torch.arange(nx, device=vol.device, dtype=vol.dtype),
+        torch.arange(ny, device=vol.device, dtype=vol.dtype),
+        torch.arange(nz, device=vol.device, dtype=vol.dtype),
+        indexing="ij",
+    )
+    gx = 2.0 * (xs + dx) / max(nx - 1, 1) - 1.0
+    gy = 2.0 * (ys + dy) / max(ny - 1, 1) - 1.0
+    gz = 2.0 * (zs + dz) / max(nz - 1, 1) - 1.0
+    # grid_sample wants (N,D,H,W,3) with the last-axis order (x_w, y_h, z_d); our
+    # (nx,ny,nz) maps to (W=nx, H=ny, D=nz), so permute to (nz,ny,nx) and stack (gx,gy,gz).
+    grid = torch.stack([gx, gy, gz], dim=-1).permute(2, 1, 0, 3).unsqueeze(0)
+    out = F.grid_sample(
+        vol.permute(2, 1, 0)[None, None],
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
+    return out[0, 0].permute(2, 1, 0).contiguous()
+
+
+def estimate_residual_flow_rotaware(
+    raw_data: np.ndarray,
+    moco_data: np.ndarray,
+    matrices_vox: torch.Tensor,
+    matrices_dicom: torch.Tensor,
+    affine: np.ndarray,
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    ref_mode: str = "max",
+    backend: str = "flow",
+    smooth_sigma: float = 0.0,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    pe_only: bool = True,
+    max_shift: float = 3.0,
+    trial_step: float = 0.5,
+    patch: int = 16,
+    stride: int = 8,
+    warp_interp: str = "bilinear",
+    fuse: str = "auto",
+    fuse_thresh: float = 0.05,
+    fuse_weight: float = 1.0,
+    automask: bool = False,
+    automask_dilate: int = 4,
+    automask_sigma: float = 3.0,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> LocomocoResult:
+    """Rotation-aware residual PE motion: neighbour-differential + anchor, in ref space.
+
+    ``raw_data`` (pre-moco) and ``moco_data`` (its motion-corrected series) are both
+    ``(nx, ny, nz, T)`` on the same grid; ``matrices_vox``/``matrices_dicom`` are the
+    per-volume moco pull matrices (reference→raw) in voxel and DICOM space. Returns a
+    :class:`LocomocoResult` whose warp is a reference-frame 5-D field (mostly PE, with
+    the rotation-synthesised IS/LR leakage), reducing to the plain path at zero rotation.
+
+    ``fuse`` — ``auto`` (engage the anchor smoother only if the measured chain-vs-anchor
+    drift exceeds ``fuse_thresh`` voxels), ``on`` (always), or ``off`` (chain only, the
+    anchor just fixes the per-voxel DC offset). ``fuse_weight`` is the anchor weight
+    when engaged.
+    """
+    from .affine import apply_affine
+
+    if pe_axis == slice_axis:
+        raise ValueError(f"-pe_axis ({pe_axis}) must differ from -slice_axis ({slice_axis}).")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    nx, ny, nz, nt = raw_data.shape
+    in_plane = sorted(a for a in (0, 1, 2) if a != slice_axis)
+    a0, a1 = in_plane
+    pe_flow_is_u = pe_axis == a1
+    perm_sp = [slice_axis, a0, a1]  # (nx,ny,nz) → canonical (nS, H, W)
+    inv_sp = _inv_perm(perm_sp)
+    perm4 = [3, slice_axis, a0, a1]
+
+    Mv = matrices_vox.to(device=device, dtype=torch.float32)  # (T,4,4) ref→raw
+    Mv_inv = torch.linalg.inv(Mv.double()).float()  # raw→ref
+
+    flow_fn = _build_flow_fn(
+        backend,
+        pe_flow_is_u=pe_flow_is_u,
+        dual=False,
+        pe_only=pe_only,
+        n_levels=n_levels,
+        n_iters=n_iters,
+        window_sigma=window_sigma,
+        warp_interp=warp_interp,
+        patch=patch,
+        stride=stride,
+        max_shift=max_shift,
+        trial_step=trial_step,
+    )
+
+    raw = torch.from_numpy(np.ascontiguousarray(raw_data)).float()  # (nx,ny,nz,T) on CPU
+    moco = torch.from_numpy(np.ascontiguousarray(moco_data)).float()
+    out_shape = (nz, ny, nx)  # apply_affine works in (nz,ny,nx)
+
+    def _to_src(v_xyz: torch.Tensor) -> torch.Tensor:
+        return v_xyz.permute(2, 1, 0).contiguous()  # (nx,ny,nz)→(nz,ny,nx)
+
+    def _from_src(v_zyx: torch.Tensor) -> torch.Tensor:
+        return v_zyx.permute(2, 1, 0).contiguous()  # (nz,ny,nx)→(nx,ny,nz)
+
+    def _pe_flow(fixed_xyz: torch.Tensor, moving_xyz: torch.Tensor) -> torch.Tensor:
+        """PE-component flow (fixed vs moving), both (nx,ny,nz) → (nx,ny,nz) on ref/native grid."""
+        fc = fixed_xyz.permute(perm_sp).contiguous()  # (nS,H,W)
+        mc = moving_xyz.permute(perm_sp).contiguous()
+        if smooth_sigma > 0:
+            fc, mc = _blur2d(fc, smooth_sigma), _blur2d(mc, smooth_sigma)
+        u, v = flow_fn(fc, mc)
+        pe = u if pe_flow_is_u else v
+        return pe.permute(inv_sp).contiguous()
+
+    def _resample(v_xyz: torch.Tensor, mat: torch.Tensor) -> torch.Tensor:
+        """Resample a (nx,ny,nz) volume by a voxel matrix (base→source) onto the same grid."""
+        return _from_src(apply_affine(_to_src(v_xyz), mat, output_shape=out_shape))
+
+    # ── 1. bidirectional differential chain, accumulated on the reference grid ──
+    g_ref = torch.zeros(nt, nx, ny, nz)  # forward differences D_t − D_{t-1}, ref grid
+    for t in tqdm(
+        range(1, nt), desc="locomoco neighbour", unit="frame", leave=True, disable=nt < 3
+    ):
+        rt = raw[..., t].to(device)
+        rtm = raw[..., t - 1].to(device)
+        # Both passes estimate the forward difference p_t − p_{t-1} (= −(s_t − s_{t-1}),
+        # since the stored p = −distortion, matching the anchor/plain convention where
+        # _pe_flow(fixed, moving) ≈ shift(fixed) − shift(moving)).
+        # forward: target = frame t native; bring t-1 into t's frame (M_{t-1}∘M_t⁻¹).
+        mv_fwd = _resample(rtm, Mv[t - 1] @ Mv_inv[t])
+        gA = -_pe_flow(rt, mv_fwd)  # _pe_flow = s_t − s_{t-1} → negate; on t's grid
+        # backward: target = frame t-1 native; bring t into (t-1)'s frame.
+        mv_bwd = _resample(rt, Mv[t] @ Mv_inv[t - 1])
+        gB = _pe_flow(rtm, mv_bwd)  # _pe_flow = s_{t-1} − s_t = p_t − p_{t-1}; on (t-1)'s grid
+        gA_ref = _resample(gA, Mv[t])  # t-grid → ref grid
+        gB_ref = _resample(gB, Mv[t - 1])  # (t-1)-grid → ref grid
+        g_ref[t] = (0.5 * (gA_ref + gB_ref)).cpu()
+
+    # ── 2. absolute anchor: each raw frame vs the reference template, native frame ──
+    # Temporal MAX is the rotation-aware default: it fills slices that later frames
+    # rotate/translate out of the FoV (blank in the mean, biasing the anchor) and is a
+    # high-signal registration target — worth the brighter/noisier per-voxel estimate.
+    if ref_mode in ("mean", "first_mean"):
+        ref_moco = moco.mean(dim=3)
+    elif ref_mode in ("median", "first_median"):
+        ref_moco = moco.median(dim=3).values
+    elif ref_mode == "max":
+        ref_moco = moco.max(dim=3).values
+    elif ref_mode == "first":
+        ref_moco = moco[..., 0]
+    else:
+        ref_moco = moco[..., int(ref_mode)]
+    templ_src = _to_src(ref_moco.to(device))
+    anchor = torch.zeros(nt, nx, ny, nz)
+    for t in tqdm(range(nt), desc="locomoco anchor", unit="frame", leave=True, disable=nt < 3):
+        templ_t = _from_src(
+            apply_affine(templ_src, Mv_inv[t], output_shape=out_shape)
+        )  # ref→t frame
+        a_t = _pe_flow(templ_t, raw[..., t].to(device))  # raw_t → template : D_t (on t grid)
+        anchor[t] = _resample(a_t, Mv[t]).cpu()  # t-grid → ref grid
+
+    # ── 3. drift diagnostic + fuse ──
+    chain = torch.cumsum(g_ref, dim=0)  # p_chain, DC arbitrary
+    chain = chain - chain.mean(0, keepdim=True) + anchor.mean(0, keepdim=True)  # match anchor DC
+    resid = chain - anchor
+    brain = ref_moco.abs().cpu() > (0.1 * float(ref_moco.abs().max()))
+    sel = resid[:, brain] if brain.any() else resid
+    drift_rms = float(sel.pow(2).mean().sqrt()) if sel.numel() else 0.0
+    drift_max = float(sel.abs().max()) if sel.numel() else 0.0
+
+    engage = fuse == "on" or (fuse == "auto" and drift_rms > fuse_thresh)
+    if engage:
+        p = _fuse_tridiag(g_ref, anchor, w_anchor=fuse_weight)
+    else:
+        p = chain  # chain, DC-pinned to the anchor
+    p = p.permute(1, 2, 3, 0).contiguous()  # (nx,ny,nz,T)
+
+    # ── automask soft-gate (same feathered brain mask as the plain path) ──
+    if automask:
+        soft = _build_soft_mask(
+            moco_data, slice_axis, a0, a1, automask_dilate, automask_sigma, device
+        )
+        soft_xyz = soft.permute(_inv_perm(perm_sp)).contiguous()  # canonical→(nx,ny,nz)
+        p = p * soft_xyz[..., None]
+
+    # ── reproject to reference-frame warp components + build corrected series ──
+    weights = compute_reproject_weights(matrices_dicom, affine, pe_axis)  # (T,3)
+    corrected = torch.zeros(nx, ny, nz, nt)
+    for t in range(nt):
+        pf = p[..., t].to(device)
+        dcomp = [pf * float(weights[t, a]) for a in range(3)]  # voxel-pull disp per axis
+        corrected[..., t] = _warp3d_pull(
+            moco[..., t].to(device), dcomp[0], dcomp[1], dcomp[2]
+        ).cpu()
+
+    # Pack into a LocomocoResult: store p as the PE flow so the flow map / movie work;
+    # warp_components() reprojects it via the weights; corrected is precomputed 3-D.
+    p_canon = p.permute(perm4).contiguous()  # (T,nS,H,W)
+    u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
+    v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+
+    if verbose:
+        tilt = pe_tilt_degrees(matrices_dicom, affine, pe_axis)
+        print(
+            f"🌀 locomoco rot-aware: {nt} frames, PE axis {pe_axis}, backend={backend}, "
+            f"ref={ref_mode}"
+        )
+        print(
+            f"   PE-axis tilt from head rotation: median {float(tilt.median()):.2f}° / "
+            f"max {float(tilt.max()):.2f}° (≈0 ⇒ off-axis correction is negligible for this pe_dir)"
+        )
+        print(
+            f"   drift(chain−anchor): rms {drift_rms:.3f} / max {drift_max:.3f} vox → "
+            f"{'FUSED (anchor smoother)' if engage else 'chain (drift below threshold)'}"
+        )
+
+    return LocomocoResult(
+        u_canon=u_canon,
+        v_canon=v_canon,
+        corrected_canon=torch.zeros_like(p_canon),  # unused; corrected_nifti takes over
+        perm=perm4,
+        pe_flow_is_u=pe_flow_is_u,
+        pe_axis=pe_axis,
+        slice_axis=slice_axis,
+        orig_shape=(nx, ny, nz, nt),
+        a0=a0,
+        a1=a1,
+        dual=False,
+        reproject_weights=weights,
+        corrected_nifti=corrected,
+        drift_rms=drift_rms,
+        drift_max=drift_max,
+        fused=engage,
+    )

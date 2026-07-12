@@ -425,3 +425,145 @@ def test_flow_movie_shape(known_shift_series):
     movie = res.flow_movie()
     assert movie.ndim == 4 and movie.shape[0] == data.shape[-1] and movie.shape[-1] == 3
     assert movie.dtype == np.uint8
+
+
+# ── rotation-aware (idea 2) ───────────────────────────────────────────────────
+from fastfuncstuff.processing.locomoco import (  # noqa: E402
+    compute_reproject_weights,
+    estimate_residual_flow_rotaware,
+    pe_tilt_degrees,
+    _fuse_tridiag,
+)
+
+
+def _rotz(theta_deg):
+    c, s = np.cos(np.radians(theta_deg)), np.sin(np.radians(theta_deg))
+    M = np.eye(4, dtype=np.float32)
+    M[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    return M
+
+
+def test_reproject_weights_identity_reduces_to_pe():
+    """Identity motion → all energy on the PE axis, zero leak, zero tilt."""
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    M = torch.eye(4).repeat(4, 1, 1)  # (T,4,4) identity
+    for pe in (0, 1, 2):
+        w = compute_reproject_weights(M, aff, pe_axis=pe)
+        assert w.shape == (4, 3)
+        assert abs(float(w[0, pe]) - 1.0) < 1e-5
+        for a in (0, 1, 2):
+            if a != pe:
+                assert abs(float(w[0, a])) < 1e-5
+        assert float(pe_tilt_degrees(M, aff, pe).max()) < 1e-3
+
+
+def test_reproject_weights_known_rotation():
+    """10° roll about z, isotropic voxels, PE=AP(y): PE→cosθ, leak onto x→sinθ, z→0."""
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    theta = 10.0
+    M = torch.from_numpy(_rotz(theta)).repeat(3, 1, 1)
+    w = compute_reproject_weights(M, aff, pe_axis=1)
+    assert abs(float(w[0, 1]) - np.cos(np.radians(theta))) < 1e-4  # PE component
+    assert abs(abs(float(w[0, 0])) - np.sin(np.radians(theta))) < 1e-4  # LR leak
+    assert abs(float(w[0, 2])) < 1e-5  # no IS leak (roll is about z)
+    assert abs(float(pe_tilt_degrees(M, aff, 1)[0]) - theta) < 1e-3
+
+
+def test_reproject_leak_axis_depends_on_pe_dir():
+    """A rotation about z leaks off PE differently for PE=x vs PE=y; PE=z is inert."""
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    M = torch.from_numpy(_rotz(12.0)).repeat(2, 1, 1)
+    # PE=z is the rotation axis → no tilt, no leak.
+    assert float(pe_tilt_degrees(M, aff, 2).max()) < 1e-3
+    # PE=x and PE=y both tilt by 12°, leaking onto the other in-plane axis.
+    assert abs(float(pe_tilt_degrees(M, aff, 0)[0]) - 12.0) < 1e-3
+    assert abs(float(pe_tilt_degrees(M, aff, 1)[0]) - 12.0) < 1e-3
+
+
+def test_fuse_tridiag_recovers_known_sequence():
+    """Anchor + exact differentials of a known p(t) recover p(t) up to fit weights."""
+    T = 20
+    true_p = np.cumsum(np.random.RandomState(0).randn(T)) * 0.1
+    fd = np.zeros((T, 1))
+    fd[1:, 0] = np.diff(true_p)
+    anchor = true_p[:, None].astype(np.float32)
+    out = _fuse_tridiag(
+        torch.from_numpy(fd).float(), torch.from_numpy(anchor).float(), w_anchor=1.0
+    )
+    assert np.corrcoef(out.numpy().ravel(), true_p)[0, 1] > 0.999
+
+
+def test_rotaware_reduces_to_plain_at_zero_motion(known_shift_series):
+    """With identity moco (raw==moco, no rotation) the rotation-aware warp must put all
+    energy on the PE axis (leak ≈ 0) and its PE component must track the plain path."""
+    data, _ = known_shift_series  # (nx,ny,nz,T), known PE shifts along axis 1
+    T = data.shape[-1]
+    M = torch.eye(4).repeat(T, 1, 1)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    res = estimate_residual_flow_rotaware(
+        data,
+        data,
+        M,
+        M,
+        aff,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="mean",
+        fuse="off",
+        automask=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    comps = dict((a, d) for a, d in res.warp_components())
+    pe = comps[1].abs()
+    leak = comps[0].abs().max() + comps[2].abs().max()
+    assert float(pe.max()) > float(leak) * 5  # PE axis dominates
+    assert float(leak) < 0.05  # near-zero off-axis at zero rotation
+    # PE component agrees in sign/scale with the plain estimator.
+    plain = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="mean",
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    corr = np.corrcoef(comps[1].numpy().ravel(), plain.pe_displacement().numpy().ravel())[0, 1]
+    assert corr > 0.9
+
+
+def test_max_reference_accepted_by_both_paths(known_shift_series):
+    """'max' is a valid reference for the plain path and the rotation-aware default."""
+    data, _ = known_shift_series
+    T = data.shape[-1]
+    plain = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="max",
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert np.isfinite(plain.pe_displacement().numpy()).all()
+    M = torch.eye(4).repeat(T, 1, 1)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    import inspect
+
+    # Rotation-aware default reference is temporal max.
+    assert (
+        inspect.signature(estimate_residual_flow_rotaware).parameters["ref_mode"].default == "max"
+    )
+    res = estimate_residual_flow_rotaware(
+        data,
+        data,
+        M,
+        M,
+        aff,
+        pe_axis=1,
+        slice_axis=2,  # ref_mode defaults to max
+        fuse="off",
+        automask=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert np.isfinite(res.corrected_series().numpy()).all()
