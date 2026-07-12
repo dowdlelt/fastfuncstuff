@@ -7,7 +7,7 @@ For Mac, use of cpu is recommended. CUDA is preferred, where possible.
 ## Why this exists
 
 I have a slow CPU but I was able to get my hands on a reasonble GPU. 
-The tools I like to use, namely AFNI are great, but they are really built to take advantage of server CPU setups.
+The tools I like to use, namely AFNI, are great, but they are really built to take advantage of server CPU setups.
 This project is an ongoing experiment - how well can current models port good code to a pytorch like set up.
 Python chosen not because of speed, of course, but because I can at least review the code for sanity.
 It also makes installion much easier - sure, pure CUDA/C++ would be faster but what a nightmare...
@@ -23,7 +23,7 @@ uv, or a conda env + pip will work. There is no conda-forge package; the
 "conda" path means "make the env with conda, then `pip install -e .`".
 
 Python: `>=3.11` is required, **3.13 advised** (latest with broad PyTorch
-wheel coverage). 3.14 may work but is gated on whether your chosen PyTorch
+wheel coverage). 3.14 should work but is gated on whether your chosen PyTorch
 build has wheels for it.
 
 ```bash
@@ -97,6 +97,8 @@ ffs_nwarp -interp wsinc5 \
 ```
 What is also very fun is that this supports phase input and you can choose to warp directly (assume phase is unwrapped/interpolatable) or internally convert to real/imag, apply warps, and save phase out from that. This is useful for `ffs_phasereg`, for example. In other words, once you have magnitude processed its very easy to have the phase tag along. 
 
+Also fun is that it supports slice-timing correction at warp time - that is, a full 4D interpolation - apply slice timing as part of the warp process - one single interpolation for both space and time (as in Roche 2011).
+
 ### ffs_reml with per-voxel HRFs
 `ffs_reml` can take the output of `ffs_hrfopt` and fit ARMA(1,1) REML using each voxel's best-fitting HRF. Pass `-hrfopt_prefix PREFIX` (the same prefix you gave to `ffs_hrfopt`) and the design is rebuilt per HRF group. Pairs naturally with `-single_trials LABEL`, which rebuilds the design with one regressor per event (GLMsingle-style) and writes chronologically ordered betas.
 
@@ -111,6 +113,13 @@ This can be edited and compiled to a design matrix (fully AFNI compatable).
 Contrast can easily be added and - this part I really do love - you can run `ffs_util_concalc` to add those contrasts to an existing OLS or REML stats dataset.
 No need to rerun the GLM! 
 Also permits correcting a contrast mistake and doing an inplace update of the stats. 
+
+### ffs_locomoco
+After motion correction there can still be nonlinear displacements due to changes in the B0 field from changes in head position. 
+This tool can *very* quickly estimate these nonlinear shifts, either via optical flow methods, or local crosscorrelation focused on shifts in a provided phase encoding direction.
+On a 5070Ti, this can be done for hundreds of volumes, at 1.6mm resoluation, in about 30 seconds. 
+Writes out a 4D warp file (a 5D nii, with warps isolated to the phase encoding direction), that can be applied with `ffs_nwarp`.
+The residual effects of this can also be reduced by using PCs from the 4D warp, extracted via `ffs_util_pcwarp`, conceptually similar to using motion parameters in the GLM. 
 
 
 ## Command-line tool listing
@@ -156,12 +165,12 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 | command | description |
 |---|---|
 | `ffs_moco` | Rigid-body motion correction (Gauss–Newton, wsinc5/heptic resampling). Writes AFNI-compatible motion files. Estimation and resampling for ~300 volume 2D data is ~3 seconds, time dominated by I/O. |
-| `ffs_locomoco` | Residual non-linear motion correction for single-echo EPI via optical flow (mostly the phase-encode axis, after rigid moco). Writes a per-frame warp for `ffs_nwarp`. |
+| `ffs_locomoco` | Residual non-linear motion correction for single-echo EPI via optical flow, local crosscorrelation, or local phase. The purpose is to reduce time-varying nonlinear displacements due to changes in the B0 field. Writes a per-frame warp for `ffs_nwarp`. |
 | `ffs_allineate` | ~100x faster 6/9/12-parameter affine alignment with `3dAllineate`-style cost functions: `lpa`/`lpc` local Pearson (same- and cross-modal; Saad et al. 2009), `ls`, `mi`/`nmi`, Hellinger, and correlation ratio. Use `lpa` for same-contrast (e.g. anat→MNI) and `lpc` for cross-modal (EPI→anat).|
 | `ffs_qwarp` | Iterative nonlinear warp estimation (`3dQwarp`-style). |
 | `ffs_formwarp` | SyN nonlinear registration (ANTs-style symmetric normalization; Avants et al. 2008); an alternative backend to `ffs_qwarp`. Single-pair or per-volume timeseries; writes `ffs_nwarp`-compatible warps. |
 | `ffs_nwarp` | Apply a warp to a volume or 4D timeseries. Supports complex (mag + phase) warping. Optional joint slice-timing correction (`-tpattern`, Roche 2011 space-time) folds slice timing into the same resample; tissue-following by default (`-frozen` for the slow-motion-assumption path). |
-| `ffs_medic` | Multi-echo distortion correction (MEDIC; Van et al. 2026): frame-wise B0 field maps from phase, for dynamic distortion under motion. |
+| `ffs_medic` | Multi-echo distortion correction (MEDIC; Van et al. 2026): frame-wise B0 field maps from phase, for dynamic distortion under motion. GPU application for speed. |
 | `ffs_slicetime` | Slice-timing correction (`3dTshift`-style), Fourier or sinc. |
 | `ffs_t2smap` | Multi-echo T2*/S0 estimation and optimal echo combination (Posse et al. 1999). |
 | `ffs_motsim` | Motion-simulation nuisance regressors (Patriat, Reynolds & Birn 2017). |
@@ -188,10 +197,10 @@ These are either WIP CLI tools, things that I am tinkering with or ones that I j
 | `ffs_util_fwhm` | Whole-volume spatial smoothness of a residual dataset (`3dFWHMx`-style: classic FWHM + mixed ACF a/b/c; Cox et al. 2017). |
 | `ffs_util_localstat` | Local spatial statistics over a neighborhood (`3dLocalstat` / `3dLocalACF`-style). |
 | `ffs_util_3dmath` | Voxelwise math over one or more datasets (`3dcalc` / `3dMean`-style). |
-| `ffs_util_updatedof` | Adjust the degrees of freedom of a stat bucket (e.g. after NORDIC) and convert t/F to z. |
+| `ffs_util_updatedof` | Adjust the degrees of freedom of a stat bucket (e.g. after NORDIC) and convert t/F to z (for viewing in AFNI). |
 | `ffs_util_convert_medic` | Convert warpkit MEDIC output into `ffs_nwarp` warps. |
 
-## A typical pipeline
+## A typical pipeline for denoising
 
 GLMsingle-style single-trial analysis:
 
@@ -239,7 +248,7 @@ Frank efficiency). See `docs/` for details.
 
 ## Status
 
-Active, single-author, very much a research codebase. 
+Active, single (agent assisted) author, very much a research codebase. 
 
 ## License
 
