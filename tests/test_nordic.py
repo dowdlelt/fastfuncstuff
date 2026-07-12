@@ -107,6 +107,112 @@ def test_run_nordic_magnitude_only(tmp_path):
     # After absolute_scale normalization, exact equality is extremely unlikely.
 
 
+def test_add_mean_lifts_residual_to_raw_temporal_mean_floor(tmp_path):
+    """-add_mean adds the raw magnitude's per-voxel temporal mean onto the saved
+    residual. Since |residual| >= 0, the raw temporal mean becomes an exact
+    per-voxel floor; without it the residual is tiny next to the ~100 baseline.
+
+    (NORDIC is not run-to-run deterministic even on CPU, so this is a single-run
+    invariant rather than a with/without difference.)
+    """
+    rng = np.random.default_rng(2024)
+    magn = np.abs(rng.normal(loc=100.0, scale=5.0, size=(9, 8, 5, 14))).astype(np.float32)
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+    raw_mean = magn.mean(axis=-1)  # (9, 8, 5)
+
+    shared = dict(
+        temporal_phase=0,
+        magnitude_only=True,
+        kernel_size_pca=(3, 3, 3),
+        kernel_size_gfactor=(3, 3, 1),
+        gfactor_nvols=8,
+        patch_overlap=2,
+        gfactor_patch_overlap=2,
+        save_residual_map=True,
+        verbose=False,
+    )
+    out_no = run_nordic(
+        magnitude_file=str(magn_file),
+        phase_file=None,
+        output_prefix=str(tmp_path / "no_mean"),
+        config=NordicConfig(**shared, add_mean=False),
+    )
+    out_yes = run_nordic(
+        magnitude_file=str(magn_file),
+        phase_file=None,
+        output_prefix=str(tmp_path / "with_mean"),
+        config=NordicConfig(**shared, add_mean=True),
+    )
+    assert out_no.residual_file is not None and out_yes.residual_file is not None
+    resid_no = nib.load(out_no.residual_file).get_fdata(dtype=np.float32)
+    resid_yes = nib.load(out_yes.residual_file).get_fdata(dtype=np.float32)
+
+    # Baseline residual is small next to the ~100 mean; with -add_mean it is not.
+    assert resid_no.max() < raw_mean.min()
+    # raw_mean is an exact per-voxel floor of the mean-added residual (|r| >= 0).
+    assert np.all(resid_yes >= raw_mean[..., None] - 1e-2)
+    # And the added baseline equals the raw temporal mean (per-voxel time mean of
+    # the mean-added residual = raw_mean + mean_t|r|, so it exceeds raw_mean).
+    assert np.all(resid_yes.mean(axis=-1) >= raw_mean - 1e-2)
+
+
+def test_retain_dof_caps_components_removed(tmp_path):
+    """-retain_dof forces each patch to keep >= floor components, so the numcomps
+    map never exceeds nt - floor, and the cap actually binds on noisy data."""
+    rng = np.random.default_rng(99)
+    nt = 24
+    magn = np.abs(rng.normal(size=(12, 10, 6, nt))).astype(np.float32)  # ~pure noise
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    shared = dict(
+        temporal_phase=0,
+        magnitude_only=True,
+        kernel_size_pca=(3, 3, 3),
+        kernel_size_gfactor=(3, 3, 1),
+        gfactor_nvols=8,
+        save_num_comps=True,
+        verbose=False,
+    )
+
+    # Without a floor, near-pure noise makes NORDIC remove most components.
+    out_free = run_nordic(
+        magnitude_file=str(magn_file),
+        phase_file=None,
+        output_prefix=str(tmp_path / "free"),
+        config=NordicConfig(**shared),
+    )
+    removed_free = nib.load(out_free.num_comps_file).get_fdata(dtype=np.float32)
+    assert removed_free.max() > nt - 18  # the cap would bind
+
+    floor = 18
+    out = run_nordic(
+        magnitude_file=str(magn_file),
+        phase_file=None,
+        output_prefix=str(tmp_path / "capped"),
+        config=NordicConfig(**shared, retain_dof=float(floor)),
+    )
+    removed = nib.load(out.num_comps_file).get_fdata(dtype=np.float32)
+    # Patch-averaged removed count never exceeds nt - floor anywhere.
+    assert removed.max() <= (nt - floor) + 1e-3
+
+    meta = json.loads(out.metadata_file.read_text())
+    assert meta["config"]["retain_dof"] == float(floor)
+    assert meta["diagnostics"]["retain_dof_floor"] == floor
+    assert meta["diagnostics"]["retain_dof_patches_capped"] > 0
+
+    # Fractional floor: keep >= 50% of nt -> remove at most nt/2.
+    out_frac = run_nordic(
+        magnitude_file=str(magn_file),
+        phase_file=None,
+        output_prefix=str(tmp_path / "frac"),
+        config=NordicConfig(**shared, retain_dof=0.5),
+    )
+    removed_frac = nib.load(out_frac.num_comps_file).get_fdata(dtype=np.float32)
+    assert removed_frac.max() <= (nt - nt // 2) + 1e-3
+
+
 def test_run_nordic_complex_outputs(tmp_path):
     rng = np.random.default_rng(456)
     magn = np.abs(rng.normal(size=(10, 8, 5, 14))).astype(np.float32)
