@@ -81,6 +81,14 @@ Examples:
         help="Save per-voxel count of components removed (patch-averaged, fractional)",
     )
     io_group.add_argument(
+        "-add-mean",
+        "-add_mean",
+        action="store_true",
+        help="Add the raw magnitude's per-voxel temporal mean onto the saved residual "
+        "(mean + removed noise), so it survives downstream resampling like real data. "
+        "Requires -save-residual-map.",
+    )
+    io_group.add_argument(
         "-no-resid-qc",
         "-no_resid_qc",
         dest="resid_qc",
@@ -113,6 +121,17 @@ Examples:
         type=float,
         default=1.0,
         help="NORDIC threshold scaling (>1 higher floor, <1 lower floor)",
+    )
+    algo_group.add_argument(
+        "-retain-dof",
+        "-retain_dof",
+        type=float,
+        default=None,
+        metavar="N|FRAC",
+        help="Cap denoising to preserve degrees of freedom: keep at least this many "
+        "components per patch (remove at most K-N). Integer (>=1) = absolute min kept; "
+        "float in (0,1) = fraction of timepoints kept. Bounds the numcomps map so the "
+        "GLM keeps >= N residual DoF and stats stay valid without a post-hoc adjustment.",
     )
     algo_group.add_argument(
         "-nordic",
@@ -305,6 +324,12 @@ def main(argv: list[str] | None = None) -> None:
             "(need one phase per echo)"
         )
         sys.exit(1)
+    if args.add_mean and not args.save_residual_map:
+        print("ERROR: -add-mean only affects the residual map; also pass -save-residual-map")
+        sys.exit(1)
+    if args.retain_dof is not None and args.retain_dof <= 0:
+        print("ERROR: -retain-dof must be positive (integer components or a fraction in (0,1))")
+        sys.exit(1)
 
     # Resolve the factor-sweep window: explicit values win, else LO HI N range.
     sweep_values: tuple[float, ...] | None = None
@@ -356,6 +381,8 @@ def main(argv: list[str] | None = None) -> None:
         phase_slice_average=args.phase_slice_average,
         save_gfactor_map=args.save_gfactor_map,
         save_residual_map=args.save_residual_map,
+        add_mean=args.add_mean,
+        retain_dof=args.retain_dof,
         save_num_comps=args.save_num_comps,
         make_complex_nii=args.make_complex_nii,
         svd_batch_size=args.svd_batch_size,

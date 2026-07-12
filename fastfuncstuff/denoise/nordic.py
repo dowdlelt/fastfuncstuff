@@ -65,7 +65,20 @@ class NordicConfig:
     use_magn_for_gfactor: bool = False
     phase_slice_average: bool = False
     save_gfactor_map: bool = False
+    # Cap denoising to preserve residual degrees of freedom. Force each patch to
+    # keep at least this many components (remove at most K-floor), so the numcomps
+    # map — and hence the DoF a NORDIC-aware GLM loses — is bounded and the
+    # statistics stay valid without a post-hoc dof adjustment. int (>=1) = absolute
+    # min components kept; float in (0,1) = fraction of timepoints kept. None = off.
+    retain_dof: float | None = None
     save_residual_map: bool = False
+    # Add the per-voxel temporal mean of the raw input magnitude back onto the
+    # saved magnitude residual, so the residual reads as a data-scaled 4-D series
+    # (mean + removed noise) rather than a zero-baseline noise field. Off by
+    # default; only useful when the residual is carried through the same
+    # resampling/interpolation as the data (see ffs_pcpatch), where a realistic
+    # baseline makes interpolation/masking behave like the real series.
+    add_mean: bool = False
     save_num_comps: bool = False
     make_complex_nii: bool = False
     full_dynamic_range: bool = False
@@ -156,6 +169,10 @@ class _LLRStats:
     # aligned component covering this voxel. 1.0 = no decrease suggested. Multi-
     # echo + nordic threshold only; None otherwise. Decrease-only by construction.
     recfactor_map: torch.Tensor | None = None
+    # -retain_dof bookkeeping: number of patches whose keep-count was raised to the
+    # DoF floor (denoising capped to preserve degrees of freedom), and the floor.
+    n_dof_capped: int = 0
+    dof_floor: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +502,7 @@ def _llr_denoise(
     decomp_method: str = "auto",
     device: torch.device | None = None,
     noise_sigma: float = 0.0,
+    retain_dof: float | None = None,
 ) -> tuple[torch.Tensor, _LLRStats]:
     """Patch-based local low-rank denoising with batched decomposition.
 
@@ -546,6 +564,16 @@ def _llr_denoise(
 
     K = min(n_patch_voxels, nt)
     M, N = n_patch_voxels, nt
+
+    # -retain_dof: minimum components each patch must keep (remove at most K-floor).
+    # int (>=1) = absolute; float in (0,1) = fraction of timepoints. Bounds the
+    # per-voxel components-removed map so downstream stats keep >= floor DoF.
+    dof_floor = 0
+    if retain_dof is not None:
+        dof_floor = int(round(retain_dof)) if retain_dof >= 1.0 else int(math.ceil(retain_dof * nt))
+        dof_floor = max(1, min(dof_floor, K))
+    idx_arange_K = torch.arange(K, device=device)
+    n_dof_capped = 0
 
     # Choose decomposition method
     if decomp_method == "auto":
@@ -663,6 +691,18 @@ def _llr_denoise(
 
         n_kept = (weights > 0).sum(dim=1)  # (B,) — number of non-zero weight components
 
+        # -retain_dof: force-keep the top `dof_floor` components on any patch that
+        # would keep fewer (the kept set is a descending prefix, so extending it
+        # stays a prefix — compatible with the truncated reconstruction below).
+        if dof_floor > 0:
+            below = n_kept < dof_floor  # (B,)
+            n_dof_capped += int(below.sum().item())
+            if bool(below.any()):
+                force = (idx_arange_K[None, :] < dof_floor) & below[:, None]  # (B, K)
+                weights = torch.maximum(weights, force.to(weights.dtype))
+                n_kept = (weights > 0).sum(dim=1)
+                idx_removed_vec = (K - n_kept).float()  # keep the numcomps map in sync
+
         if return_recon:
             max_k = max(1, int(n_kept.max().item()))
 
@@ -747,12 +787,20 @@ def _llr_denoise(
     else:
         recon_out = torch.empty((0,), dtype=data.dtype, device=device)
 
+    if dof_floor > 0 and verbose:
+        print(
+            f"  retain_dof: kept >= {dof_floor} of {nt} comps; floor was binding on "
+            f"{n_dof_capped}/{total} patches"
+        )
+
     stats = _LLRStats(
         weight=w,
         noise_map=noise_map / w,
         threshold_map=threshold_map / w,
         energy_removed=energy_removed / w,
         snr_weight=snr_weight / w,
+        n_dof_capped=n_dof_capped,
+        dof_floor=dof_floor,
     )
     return recon_out, stats
 
@@ -979,6 +1027,7 @@ def _llr_denoise_multiecho(
     verbose: bool,
     svd_batch_size: int = 512,
     device: torch.device | None = None,
+    retain_dof: float | None = None,
 ) -> list[tuple[torch.Tensor, _LLRStats]]:
     """Per-echo NORDIC LLR with a cross-echo signal-rescue guard.
 
@@ -1009,6 +1058,13 @@ def _llr_denoise_multiecho(
     M = wx * wy * wz
     N = nt
     K = min(M, N)
+
+    # -retain_dof: per-echo minimum kept components (see single-echo path).
+    dof_floor = 0
+    if retain_dof is not None:
+        dof_floor = int(round(retain_dof)) if retain_dof >= 1.0 else int(math.ceil(retain_dof * nt))
+        dof_floor = max(1, min(dof_floor, K))
+    n_dof_capped = [0 for _ in range(E)]
 
     sx = max(1, wx // max(1, patch_overlap))
     sy = max(1, wy // max(1, patch_overlap))
@@ -1083,8 +1139,13 @@ def _llr_denoise_multiecho(
                 n_keep = cuts.to(device)
             else:
                 n_keep = (s0 >= threshold_values[e]).sum(dim=1).to(device)
+            n_keep = n_keep.clamp(min=0, max=K)
+            if dof_floor > 0:
+                below = n_keep < dof_floor
+                n_dof_capped[e] += int(below.sum().item())
+                n_keep = torch.clamp(n_keep, min=dof_floor)
             vh_list.append(vh)
-            n_keep_list.append(n_keep.clamp(min=0, max=K))
+            n_keep_list.append(n_keep)
             s0_list.append(s0.to(device) if want_recfactor else None)
             del s
 
@@ -1210,7 +1271,14 @@ def _llr_denoise_multiecho(
             snr_weight=zeros_w,
             rescued_map=rescued_map[e] / w,
             recfactor_map=rec_map,
+            n_dof_capped=n_dof_capped[e],
+            dof_floor=dof_floor,
         )
+        if dof_floor > 0 and verbose:
+            print(
+                f"  retain_dof (echo {e}): kept >= {dof_floor} of {nt} comps; floor was "
+                f"binding on {n_dof_capped[e]}/{total} patches"
+            )
         results.append((recon_out, stats))
     return results
 
@@ -1271,6 +1339,10 @@ class _PreppedEcho:
     n_noise_vols: int
     orig_shape: tuple[int, int, int, int]  # nx, ny, nz, nt (pre-trim)
     nt_keep: int
+    # Per-voxel temporal mean of the raw input magnitude over the kept volumes,
+    # in original data units. Populated only when cfg.add_mean; added onto the
+    # magnitude residual at save time. None otherwise.
+    raw_temporal_mean: np.ndarray | None = None
 
 
 def _prepare_echo(
@@ -1341,6 +1413,13 @@ def _prepare_echo(
         cfg.noise_volume_last if (cfg.noise_volume_last > 0 and nt > cfg.noise_volume_last) else 0
     )
     nt_keep = nt - n_noise_vols
+
+    # -add_mean: capture the raw magnitude's temporal mean over the kept volumes
+    # (original data units, before ABSOLUTE_SCALE) to add onto the magnitude
+    # residual at save time. Cheap 3-D map; only when requested.
+    raw_temporal_mean = (
+        mag_np[..., :nt_keep].mean(axis=-1).astype(np.float32) if cfg.add_mean else None
+    )
 
     # Kernel sizes
     if cfg.kernel_size_pca is None:
@@ -1564,6 +1643,7 @@ def _prepare_echo(
         n_noise_vols=n_noise_vols,
         orig_shape=(nx, ny, nz, nt),
         nt_keep=nt_keep,
+        raw_temporal_mean=raw_temporal_mean,
     )
 
 
@@ -1682,12 +1762,19 @@ def _finalize_echo(
     residual_file: Path | None = None
     if residual is not None:
         residual_file = out_dir / f"{out_prefix.name}_residual{ext}"
+        residual_np = torch.abs(residual).cpu().numpy().astype(np.float32)
+        del residual
+        if cfg.add_mean and prepped.raw_temporal_mean is not None:
+            # Baseline restored so the residual survives downstream resampling
+            # like a real magnitude series (mean + removed noise). Broadcast the
+            # 3-D temporal mean over time.
+            residual_np += prepped.raw_temporal_mean[..., None]
         save_nifti(
-            torch.abs(residual).cpu().numpy().astype(np.float32),
+            residual_np,
             output_path=residual_file,
             reference_img=magnitude_file,
         )
-        del residual
+        del residual_np
 
     rescued_file: Path | None = None
     if llr_stats.rescued_map is not None and cfg.rescue:
@@ -1745,6 +1832,8 @@ def _finalize_echo(
             "patch_overlap": cfg.patch_overlap,
             "gfactor_patch_overlap": cfg.gfactor_patch_overlap,
             "phase_slice_average": cfg.phase_slice_average,
+            "add_mean": cfg.add_mean,
+            "retain_dof": cfg.retain_dof,
         },
         "threshold": {
             "mode": threshold_mode,
@@ -1756,6 +1845,8 @@ def _finalize_echo(
             "mean_energy_removed": float(torch.mean(llr_stats.energy_removed).item()),
             "mean_snr_weight": float(torch.mean(llr_stats.snr_weight).item()),
             "near_noop": bool(mean_removed < 0.1),
+            "retain_dof_floor": int(llr_stats.dof_floor),
+            "retain_dof_patches_capped": int(llr_stats.n_dof_capped),
         },
         "outputs": {
             "magnitude": str(magn_path),
@@ -1841,6 +1932,7 @@ def _llr_main_pass(
         svd_batch_size=svd_batch_size,
         decomp_method=cfg.decomp_method,
         device=dev,
+        retain_dof=cfg.retain_dof,
     )
 
     residual: torch.Tensor | None = None
@@ -1999,6 +2091,7 @@ def run_nordic_multiecho(
         verbose=cfg.verbose,
         svd_batch_size=svd_batch_size,
         device=dev,
+        retain_dof=cfg.retain_dof,
     )
     # Per-echo residual = original − denoised, computed before the echo data is
     # freed. Each residual goes through the same inverse transforms as the
