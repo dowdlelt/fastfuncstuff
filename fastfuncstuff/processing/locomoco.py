@@ -359,31 +359,53 @@ def _phase_slope_dense(
     device, dtype = fixed.device, fixed.dtype
     p = patch
     pad = p // 2
-    fpad = F.pad(fixed[:, None], (pad, pad, pad, pad), mode="reflect")
-    mpad = F.pad(moving[:, None], (pad, pad, pad, pad), mode="reflect")
-    lh = (fpad.shape[2] - p) // stride + 1
-    lw = (fpad.shape[3] - p) // stride + 1
+    lh = (h + 2 * pad - p) // stride + 1
+    lw = (w + 2 * pad - p) // stride + 1
+    ppe = p  # patch extent along PE (patches are p×p; PE axis moved to dim=1 below)
 
-    def _patches(x: torch.Tensor) -> torch.Tensor:
-        cols = F.unfold(x, kernel_size=p, stride=stride)  # (B, p*p, L)
-        return cols.transpose(1, 2).reshape(b * lh * lw, p, p)
+    # The cross-power spectrum holds several (frames·lh·lw, p, p) complex/real
+    # tensors at once; at dense settings (small stride) that is many GiB for the
+    # whole time series. Process the frame batch in chunks sized to fit — the
+    # per-patch estimate is independent across frames, so this is exact.
+    per_frame = lh * lw * p * p * 40  # ~5 working tensors (real+complex) per patch elt
+    if device.type == "cuda":
+        free_b, _ = torch.cuda.mem_get_info(device)
+        budget = int(0.4 * free_b)
+    else:
+        budget = 2 * 1024**3
+    chunk = max(1, min(b, budget // max(1, per_frame)))
 
-    fp, mp = _patches(fpad), _patches(mpad)
-    if pe_is_u:  # PE along W (dim=2) -> move it to dim=1 for the FFT
-        fp, mp = fp.transpose(1, 2), mp.transpose(1, 2)
-    fp = fp - fp.mean(dim=(1, 2), keepdim=True)
-    mp = mp - mp.mean(dim=(1, 2), keepdim=True)
-    ppe = fp.shape[1]
-
-    cross = (torch.fft.fft(fp, dim=1) * torch.fft.fft(mp, dim=1).conj()).sum(dim=2)  # (N, ppe)
-    kmax = max(1, min(ppe // 2 - 1, int(ppe / (2.0 * max_shift))))
+    out = torch.empty(b, h, w, device=device, dtype=dtype)
+    kmax = max(1, min(p // 2 - 1, int(p / (2.0 * max_shift))))
     ks = torch.arange(1, kmax + 1, device=device, dtype=dtype)
-    ang = torch.angle(cross[:, 1 : kmax + 1])
-    wts = cross[:, 1 : kmax + 1].abs()
-    slope = (wts * ks * ang).sum(dim=1) / (wts * ks * ks).sum(dim=1).clamp_min(eps)
-    # slope*ppe/2π is already the pull displacement (−Δ for moving=fixed(x+Δ)).
-    shift = (slope * ppe / (2.0 * math.pi)).clamp(-max_shift, max_shift).reshape(b, lh, lw)
-    return F.interpolate(shift[:, None], size=(h, w), mode="bilinear", align_corners=True)[:, 0]
+
+    def _patches(x: torch.Tensor, n: int) -> torch.Tensor:
+        cols = F.unfold(x, kernel_size=p, stride=stride)  # (n, p*p, L)
+        return cols.transpose(1, 2).reshape(n * lh * lw, p, p)
+
+    for b0 in range(0, b, chunk):
+        b1 = min(b0 + chunk, b)
+        cb = b1 - b0
+        fpad = F.pad(fixed[b0:b1, None], (pad, pad, pad, pad), mode="reflect")
+        mpad = F.pad(moving[b0:b1, None], (pad, pad, pad, pad), mode="reflect")
+        fp, mp = _patches(fpad, cb), _patches(mpad, cb)
+        if pe_is_u:  # PE along W (dim=2) -> move it to dim=1 for the FFT
+            fp, mp = fp.transpose(1, 2), mp.transpose(1, 2)
+        fp = fp - fp.mean(dim=(1, 2), keepdim=True)
+        mp = mp - mp.mean(dim=(1, 2), keepdim=True)
+
+        cross = (torch.fft.fft(fp, dim=1) * torch.fft.fft(mp, dim=1).conj()).sum(dim=2)  # (N, ppe)
+        del fp, mp
+        ang = torch.angle(cross[:, 1 : kmax + 1])
+        wts = cross[:, 1 : kmax + 1].abs()
+        slope = (wts * ks * ang).sum(dim=1) / (wts * ks * ks).sum(dim=1).clamp_min(eps)
+        # slope*ppe/2π is already the pull displacement (−Δ for moving=fixed(x+Δ)).
+        shift = (slope * ppe / (2.0 * math.pi)).clamp(-max_shift, max_shift).reshape(cb, lh, lw)
+        out[b0:b1] = F.interpolate(
+            shift[:, None], size=(h, w), mode="bilinear", align_corners=True
+        )[:, 0]
+        del cross, ang, wts, slope, shift
+    return out
 
 
 def phase_correlation_flow_2d(
@@ -419,10 +441,19 @@ def phase_correlation_flow_2d(
     v = torch.zeros_like(fixed)
     for _ in range(n_iters):
         mw = _warp2d(moving, u, v, warp_interp)
+        # Clamp the ACCUMULATED field, not just each increment: this is residual
+        # motion (small), so max_shift bounds the total displacement. Otherwise n_iters
+        # increments each capped at max_shift let low-signal patches random-walk to
+        # n_iters·max_shift — the "enormous displacement" blow-up, which the refine
+        # loop then compounds by rebuilding its reference from the over-warped series.
         if want_u:
-            u = u + _phase_slope_dense(fixed, mw, True, patch, stride, max_shift)
+            u = (u + _phase_slope_dense(fixed, mw, True, patch, stride, max_shift)).clamp(
+                -max_shift, max_shift
+            )
         if want_v:
-            v = v + _phase_slope_dense(fixed, mw, False, patch, stride, max_shift)
+            v = (v + _phase_slope_dense(fixed, mw, False, patch, stride, max_shift)).clamp(
+                -max_shift, max_shift
+            )
     return u, v
 
 
@@ -1020,6 +1051,8 @@ def estimate_residual_flow(
         prev = torch.stack([u_all, v_all])
         prev_step: float | None = None
     for i in range(max(0, refine_rounds)):
+        # Snapshot the pre-pass estimate so a diverging pass can be rolled back.
+        saved = (u_all, v_all, corrected)
         new_ref = _refine_reduce(corrected, ref_mode, 0, first_n)  # (nS, H, W) sharp template
         u_all, v_all, corrected = _estimate_static(
             vol,
@@ -1035,9 +1068,23 @@ def estimate_residual_flow(
         cur = torch.stack([u_all, v_all])
         d = (cur - prev)[:, :, brain]
         step = float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
-        prev = cur
         if verbose:
             print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
+        # Divergence guard: a healthy refinement's step shrinks. A pass that moves
+        # the field markedly MORE than the previous one (or by more than a whole
+        # max_shift — not a refinement) is rebuilding its reference from an over-warped
+        # series; roll back to the pre-pass estimate and stop rather than compound it.
+        # The 1.5× margin tolerates minor pass-to-pass fluctuation on real data.
+        diverged = step > max_shift or (prev_step is not None and step > 1.5 * prev_step)
+        if diverged:
+            u_all, v_all, corrected = saved
+            if verbose:
+                print(
+                    f"   ⚠ refine pass {i + 1} diverged (Δ {step:.4f} vox) — "
+                    f"reverting to pass {i} and stopping."
+                )
+            break
+        prev = cur
         reason = _refine_converged(step, prev_step, converge, converge_rel)
         prev_step = step
         if reason is not None:
@@ -1838,11 +1885,24 @@ def _run_3dacq_plain(
         prev = disp
         prev_step: float | None = None
     for i in range(max(0, refine_rounds)):
+        saved = (disp, corrected)  # roll back to here if this pass diverges
         disp, corrected = _estimate(_refine_reduce(corrected, ref_mode, 3, first_n).to(device))
         step = float((disp - prev)[brain].pow(2).mean().sqrt())
-        prev = disp
         if verbose:
             print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
+        # Divergence guard (see the 2-D path): a pass that changes the field markedly
+        # more than the previous one (or by > max_shift) is compounding an over-warped
+        # reference. The 1.5× margin tolerates minor fluctuation on real data.
+        diverged = step > max_shift or (prev_step is not None and step > 1.5 * prev_step)
+        if diverged:
+            disp, corrected = saved
+            if verbose:
+                print(
+                    f"   ⚠ refine pass {i + 1} diverged (Δ {step:.4f} vox) — "
+                    f"reverting to pass {i} and stopping."
+                )
+            break
+        prev = disp
         reason = _refine_converged(step, prev_step, converge, converge_rel)
         prev_step = step
         if reason is not None:

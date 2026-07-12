@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from fastfuncstuff.processing.locomoco import (
     estimate_residual_flow,
     optical_flow_lk_2d,
+    phase_correlation_flow_2d,
     resolve_pe_axis,
 )
 
@@ -98,6 +99,53 @@ def test_alt_backends_recover_pe_shift(known_shift_series, backend):
     est = np.median(pe.reshape(-1, pe.shape[-1]), axis=0)
     assert np.corrcoef(est, -shifts)[0, 1] > 0.99
     assert np.abs(est + shifts).max() < 0.3
+
+
+def test_phase_flow_total_displacement_bounded_by_max_shift():
+    """Many warping iterations must not let the accumulated phase field random-walk
+    past max_shift: a shift LARGER than max_shift (and noisy content) is clamped to
+    the total bound, not n_iters·max_shift. Guards the refine-overshoot blow-up."""
+    rng = np.random.default_rng(0)
+    base = _phantom(nx=40, ny=40, nz=1)[:, :, 0]
+    fixed = torch.from_numpy(base)[None]  # (1, H, W)
+    # A large true shift (6 vox) along W plus noise — the estimator would chase it.
+    moving = torch.from_numpy(_shift_along_y(base[:, :, None], 6.0)[:, :, 0])[None]
+    moving = moving + torch.from_numpy(rng.normal(scale=0.05, size=moving.shape).astype("float32"))
+
+    max_shift = 3.0
+    u, v = phase_correlation_flow_2d(
+        fixed, moving, pe_is_u=True, patch=16, stride=8, max_shift=max_shift, n_iters=16
+    )
+    # Accumulated field is bounded by max_shift everywhere (pre-clamp it could reach
+    # ~16·3 = 48 vox in ill-conditioned patches).
+    assert float(u.abs().max()) <= max_shift + 1e-4
+    assert float(v.abs().max()) <= max_shift + 1e-4
+
+
+def test_phase_flow_batch_chunking_matches_across_batch_sizes():
+    """The frame-batch chunking in the phase FFT is exact: a stack of frames gives
+    the same per-frame field as estimating each frame alone."""
+    base = _phantom(nx=36, ny=36, nz=1)[:, :, 0]
+    frames = [
+        torch.from_numpy(_shift_along_y(base[:, :, None], s)[:, :, 0])[None]
+        for s in (0.7, -1.1, 1.4)
+    ]
+    fixed1 = torch.from_numpy(base)[None]
+    # Batched (3 frames at once) vs one at a time — chunking must not change results.
+    batched_u, _ = phase_correlation_flow_2d(
+        fixed1.expand(3, *fixed1.shape[1:]).contiguous(),
+        torch.cat(frames, 0),
+        pe_is_u=True,
+        patch=12,
+        stride=6,
+        max_shift=3.0,
+        n_iters=4,
+    )
+    for i, mv in enumerate(frames):
+        solo_u, _ = phase_correlation_flow_2d(
+            fixed1, mv, pe_is_u=True, patch=12, stride=6, max_shift=3.0, n_iters=4
+        )
+        assert torch.allclose(batched_u[i], solo_u[0], atol=1e-5)
 
 
 def test_xcorr_search_matches_translation():
