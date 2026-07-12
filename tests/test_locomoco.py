@@ -691,3 +691,109 @@ def test_warp_time_pcs(known_shift_series):
     assert var.shape == (3,) and 0.0 <= float(var.sum()) <= 1.0001
     empty, _ = warp_time_pcs([(1, torch.zeros(4, 4, 2, T))], n_pcs=3)
     assert empty is None
+
+
+def test_refine_reduce_honors_ref_mode():
+    """Refine reference aggregate respects -ref (max→max, median→median); first/index→mean."""
+    from fastfuncstuff.processing.locomoco import _refine_reduce
+
+    x = torch.rand(4, 4, 2, 6)  # (nx,ny,nz,T)
+    assert torch.allclose(_refine_reduce(x, "max", 3), x.max(dim=3).values)
+    assert torch.allclose(_refine_reduce(x, "median", 3), x.median(dim=3).values)
+    assert torch.allclose(_refine_reduce(x, "mean", 3), x.mean(dim=3))
+    assert torch.allclose(_refine_reduce(x, "first", 3), x.mean(dim=3))  # single-frame → mean
+    assert torch.allclose(_refine_reduce(x, "2", 3), x.mean(dim=3))  # index → mean
+
+
+def test_converge_stops_refine_early(known_shift_series, capsys):
+    """A huge -converge threshold halts the refine loop after the first pass."""
+    data, _ = known_shift_series
+    estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="mean",
+        refine_rounds=5,
+        converge=999.0,
+        device=torch.device("cpu"),
+        verbose=True,
+    )
+    out = capsys.readouterr().out
+    assert out.count("refine pass") == 1 and "converged" in out
+
+
+def test_no_converge_runs_all_refine_rounds(known_shift_series, capsys):
+    """With -converge off, every -refine round runs and reports its step size."""
+    data, _ = known_shift_series
+    estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="mean",
+        refine_rounds=2,
+        converge=0.0,
+        device=torch.device("cpu"),
+        verbose=True,
+    )
+    assert capsys.readouterr().out.count("refine pass") == 2
+
+
+def test_refine_max_ref_3d_runs(known_shift_series):
+    """3-D plain path with -ref max + refine stays finite (max honoured through refine)."""
+    data, _ = known_shift_series
+    res = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="max",
+        refine_rounds=1,
+        is_3dacq=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert np.isfinite(res.pe_displacement().numpy()).all()
+
+
+def test_first_n_windows_the_aggregate():
+    """-first_n restricts mean/max/median to the first N frames; index unaffected."""
+    from fastfuncstuff.processing.locomoco import _select_ref_vol, _refine_reduce
+
+    x = torch.arange(2 * 2 * 1 * 8).float().reshape(2, 2, 1, 8)  # (nx,ny,nz,T), rising in T
+    assert torch.allclose(_select_ref_vol(x, "mean", first_n=4), x[..., :4].mean(dim=3))
+    assert torch.allclose(_select_ref_vol(x, "max", first_n=3), x[..., :3].max(dim=3).values)
+    assert torch.allclose(_select_ref_vol(x, "mean", first_n=None), x.mean(dim=3))
+    assert torch.allclose(_select_ref_vol(x, "mean", first_n=99), x.mean(dim=3))  # clamp to T
+    # refine aggregate (canonical dim=0) windows the same way
+    c = torch.arange(6 * 2 * 2).float().reshape(6, 2, 2)  # (T,H,W)
+    assert torch.allclose(_refine_reduce(c, "max", 0, first_n=2), c[:2].max(dim=0).values)
+
+
+def test_relative_convergence_stops_when_step_plateaus():
+    """_refine_converged: relative criterion fires when a pass barely improves the step."""
+    from fastfuncstuff.processing.locomoco import _refine_converged
+
+    # step decreasing 8% then 3%; converge_rel=0.05 → continue at 8%, stop at 3%.
+    assert _refine_converged(0.0580, 0.0631, converge=0.0, converge_rel=0.05) is None
+    assert _refine_converged(0.0563, 0.0580, converge=0.0, converge_rel=0.05) is not None
+    # absolute still works; no prev_step → relative can't fire.
+    assert _refine_converged(0.01, None, converge=0.02, converge_rel=0.05) is not None
+    assert _refine_converged(0.05, None, converge=0.0, converge_rel=0.05) is None
+
+
+def test_converge_rel_early_stop_integration(known_shift_series, capsys):
+    """A large converge_rel stops refine as soon as it has two passes to compare."""
+    data, _ = known_shift_series
+    estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="mean",
+        refine_rounds=5,
+        converge_rel=0.9,
+        device=torch.device("cpu"),
+        verbose=True,
+    )
+    out = capsys.readouterr().out
+    assert (
+        out.count("refine pass") == 2 and "converged" in out
+    )  # stops after 2nd (first comparison)

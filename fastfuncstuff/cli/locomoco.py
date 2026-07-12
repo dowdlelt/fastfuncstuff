@@ -227,6 +227,18 @@ def create_parser() -> argparse.ArgumentParser:
         "is a high-signal target. Default: max for rotation-aware mode, mean otherwise.",
     )
     est.add_argument(
+        "-first_n",
+        "-first-n",
+        type=int,
+        default=None,
+        metavar="N",
+        help="[all] Build the -ref aggregate (mean/median/max) from only the FIRST N "
+        "frames, not the whole run. The best-of-both for a run whose later frames drift "
+        "(e.g. a slow time-stretch): the SNR/FoV-fill of an aggregate without the bad late "
+        "frames polluting the template. Honoured for the initial AND every refine "
+        "reference. Default: all frames.",
+    )
+    est.add_argument(
         "-do_blur",
         type=float,
         default=0.0,
@@ -328,10 +340,33 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         metavar="ROUNDS",
-        help="[plain path only] Outer reference-refinement rounds. After the first estimate, "
-        "rebuild the reference from the corrected series (motion removed → sharp) and "
-        "re-register the original frames against it, converging the template out of "
-        "its bias. 1–3 tightens the recovered values; 0 = off.",
+        help="[plain path only] Outer reference-refinement rounds (the max cap when "
+        "-converge is set). After the first estimate, rebuild the reference from the "
+        "corrected series (motion removed → sharp, and aggregated per -ref: a max stays "
+        "FoV-filled) and re-register the original frames against it. Each pass prints its "
+        "step size (RMS displacement change, in-brain). 1–3 tightens the values; 0 = off.",
+    )
+    acc.add_argument(
+        "-converge",
+        type=float,
+        default=0.0,
+        metavar="VOX",
+        help="[plain path only] Stop the -refine loop early once a pass's step size (RMS "
+        "displacement change vs the previous pass, in-brain voxels) falls below this — so "
+        "you spend passes only while they still move the estimate. 0 = off (run all "
+        "-refine rounds). Try ~0.02; the printed per-pass Δ tells you where it plateaus.",
+    )
+    acc.add_argument(
+        "-converge_rel",
+        "-converge-rel",
+        type=float,
+        default=0.0,
+        metavar="FRAC",
+        help="[plain path only] RELATIVE convergence: stop the -refine loop once a pass "
+        "shrinks the step by less than this fraction of the previous pass (the improvement "
+        "itself has plateaued — 'changing by about the same amount each time'), even if the "
+        "absolute step is still non-trivial. e.g. 0.05 = stop when a pass gains <5%% over "
+        "the last. Either -converge or -converge_rel can fire. 0 = off.",
     )
     acc.add_argument(
         "-jacobian",
@@ -753,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
             fuse=args.fuse,
             fuse_thresh=args.fuse_thresh,
             fuse_weight=args.fuse_weight,
+            first_n=args.first_n,
             is_3dacq=args.is_3dacq,
             automask=automask,
             automask_dilate=args.automask_dilate,
@@ -778,6 +814,9 @@ def main(argv: list[str] | None = None) -> int:
             stride=args.stride,
             warp_interp=args.warp_interp,
             refine_rounds=args.refine,
+            converge=args.converge,
+            converge_rel=args.converge_rel,
+            first_n=args.first_n,
             jacobian=args.jacobian,
             is_3dacq=args.is_3dacq,
             automask=automask,

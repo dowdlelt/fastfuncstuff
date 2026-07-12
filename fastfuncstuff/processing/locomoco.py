@@ -698,23 +698,26 @@ def _estimate_static(
     dual=False,
     warp_interp="bilinear",
     ref_override=None,
+    first_n=None,
 ):
     """Fixed reference: batch the flow over ALL frames at once, looping slices.
 
     ``ref_override`` (``(nS, H, W)``) bypasses ``ref_mode`` — used by the outer
     reference-refinement loop, which re-registers against the corrected-data mean.
+    ``first_n`` windows the reference aggregate to the early frames.
     """
     nt, ns, hh, ww = vol.shape
+    win = _time_window(vol, 0, first_n)
     if ref_override is not None:
         ref = ref_override
     elif ref_mode == "mean":
-        ref = vol.mean(dim=0)
+        ref = win.mean(dim=0)
     elif ref_mode == "median":
-        ref = vol.median(dim=0).values
+        ref = win.median(dim=0).values
     elif ref_mode == "max":
         # Temporal max fills slices that later drop out of the FoV (head moved out)
         # and is a high-signal target; brighter/noisier per voxel than the mean.
-        ref = vol.max(dim=0).values
+        ref = win.max(dim=0).values
     elif ref_mode == "first":
         ref = vol[0]
     else:
@@ -867,6 +870,9 @@ def estimate_residual_flow(
     stride: int = 8,
     warp_interp: str = "bilinear",
     refine_rounds: int = 0,
+    converge: float = 0.0,
+    converge_rel: float = 0.0,
+    first_n: int | None = None,
     jacobian: bool = False,
     automask: bool = False,
     automask_dilate: int = 4,
@@ -945,6 +951,9 @@ def estimate_residual_flow(
             max_shift=max_shift,
             trial_step=trial_step,
             refine_rounds=refine_rounds,
+            converge=converge,
+            converge_rel=converge_rel,
+            first_n=first_n,
             automask=automask,
             automask_dilate=automask_dilate,
             automask_sigma=automask_sigma,
@@ -983,16 +992,35 @@ def estimate_residual_flow(
     )
 
     progressive = ref_mode in ("first_mean", "first_median")
-    est = _estimate_cumulative if progressive else _estimate_static
-    u_all, v_all, corrected = est(
-        vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual, warp_interp
-    )
+    if progressive:
+        u_all, v_all, corrected = _estimate_cumulative(
+            vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual, warp_interp
+        )
+    else:
+        u_all, v_all, corrected = _estimate_static(
+            vol,
+            ref_mode,
+            pe_flow_is_u,
+            smooth_sigma,
+            flow_fn,
+            device,
+            dual,
+            warp_interp,
+            first_n=first_n,
+        )
     # Outer reference-refinement: the reference defines "zero", so a blurred/biased
     # one biases every shift. Rebuild it from the corrected series (motion removed →
     # sharp template) and re-register the ORIGINAL frames against it, converging the
-    # template. Progressive refs already self-refine over time, so start them there.
-    for _ in range(max(0, refine_rounds)):
-        new_ref = corrected.mean(dim=0)  # (nS, H, W) sharpened template
+    # template. The reference AGGREGATE honours -ref and -first_n (a max/first_n
+    # reference stays FoV-filled / stretch-free through refinement). Each pass prints
+    # its step size (RMS displacement change, in-brain); -converge / -converge_rel stop
+    # early once the step (or its improvement) plateaus.
+    if refine_rounds > 0:
+        brain = _brain_mask_from(corrected.abs().mean(dim=0))  # (nS, H, W)
+        prev = torch.stack([u_all, v_all])
+        prev_step: float | None = None
+    for i in range(max(0, refine_rounds)):
+        new_ref = _refine_reduce(corrected, ref_mode, 0, first_n)  # (nS, H, W) sharp template
         u_all, v_all, corrected = _estimate_static(
             vol,
             ref_mode,
@@ -1004,6 +1032,18 @@ def estimate_residual_flow(
             warp_interp,
             ref_override=new_ref,
         )
+        cur = torch.stack([u_all, v_all])
+        d = (cur - prev)[:, :, brain]
+        step = float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
+        prev = cur
+        if verbose:
+            print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
+        reason = _refine_converged(step, prev_step, converge, converge_rel)
+        prev_step = step
+        if reason is not None:
+            if verbose:
+                print(f"   ✓ converged ({reason}) — stopping refine at pass {i + 1}.")
+            break
 
     soft = None
     if automask:
@@ -1237,6 +1277,7 @@ def estimate_residual_flow_rotaware(
     fuse: str = "auto",
     fuse_thresh: float = 0.05,
     fuse_weight: float = 1.0,
+    first_n: int | None = None,
     is_3dacq: bool = False,
     automask: bool = False,
     automask_dilate: int = 4,
@@ -1362,7 +1403,7 @@ def estimate_residual_flow_rotaware(
     # Temporal MAX is the rotation-aware default: it fills slices that later frames
     # rotate/translate out of the FoV (blank in the mean, biasing the anchor) and is a
     # high-signal registration target — worth the brighter/noisier per-voxel estimate.
-    ref_moco = _select_ref_vol(moco, ref_mode)
+    ref_moco = _select_ref_vol(moco, ref_mode, first_n)
     templ_src = _to_src(ref_moco.to(device))
     anchor = torch.zeros(nt, nx, ny, nz)
     for t in tqdm(range(nt), desc="locomoco anchor", unit="frame", leave=True, disable=nt < 3):
@@ -1664,17 +1705,72 @@ def _build_flow3d_fn(
     return f
 
 
-def _select_ref_vol(vol4d: torch.Tensor, ref_mode: str) -> torch.Tensor:
+def _time_window(series: torch.Tensor, dim: int, first_n: int | None) -> torch.Tensor:
+    """Restrict ``series`` to its first ``first_n`` frames along ``dim`` (None = all).
+
+    Lets a ``mean``/``max`` reference be built from just the early frames — the win for a
+    run whose later frames drift (e.g. a slow time-stretch) that would otherwise pollute
+    the aggregate, without giving up the SNR/FoV-fill of aggregating over many frames.
+    """
+    if first_n and first_n < series.shape[dim]:
+        return series.narrow(dim, 0, max(1, first_n))
+    return series
+
+
+def _select_ref_vol(vol4d: torch.Tensor, ref_mode: str, first_n: int | None = None) -> torch.Tensor:
     """Reduce a ``(nx,ny,nz,T)`` series to a single reference volume per ``ref_mode``."""
+    v = _time_window(vol4d, 3, first_n)
     if ref_mode in ("mean", "first_mean"):
-        return vol4d.mean(dim=3)
+        return v.mean(dim=3)
     if ref_mode in ("median", "first_median"):
-        return vol4d.median(dim=3).values
+        return v.median(dim=3).values
     if ref_mode == "max":
-        return vol4d.max(dim=3).values
+        return v.max(dim=3).values
     if ref_mode == "first":
-        return vol4d[..., 0]
-    return vol4d[..., int(ref_mode)]
+        return v[..., 0]
+    return vol4d[..., int(ref_mode)]  # explicit index ignores first_n
+
+
+def _refine_reduce(
+    corrected: torch.Tensor, ref_mode: str, dim: int, first_n: int | None = None
+) -> torch.Tensor:
+    """Aggregate the corrected series into a refine reference, HONOURING ``-ref``.
+
+    ``mean`` / ``median`` / ``max`` are respected (so a ``max`` reference stays FoV-filled
+    through refinement, not silently reverted to the mean); ``first`` / ``<index>`` /
+    progressive fall back to the mean — a single frame is a poor, noisy refine template.
+    ``first_n`` windows the aggregate to the early frames, same as the initial reference.
+    """
+    c = _time_window(corrected, dim, first_n)
+    if ref_mode in ("median", "first_median"):
+        return c.median(dim=dim).values
+    if ref_mode == "max":
+        return c.max(dim=dim).values
+    return c.mean(dim=dim)
+
+
+def _brain_mask_from(ref_mag: torch.Tensor, thresh_frac: float = 0.1) -> torch.Tensor:
+    """Coarse brain mask (``|ref| > frac·max``) so the refine step size ignores air noise."""
+    m = ref_mag > thresh_frac * float(ref_mag.max())
+    return m if bool(m.any()) else torch.ones_like(ref_mag, dtype=torch.bool)
+
+
+def _refine_converged(
+    step: float, prev_step: float | None, converge: float, converge_rel: float
+) -> str | None:
+    """Should the refine loop stop after this pass? Return the reason, or None to continue.
+
+    ``converge`` is an ABSOLUTE floor on the per-pass step (voxels). ``converge_rel`` is a
+    RELATIVE floor: stop once a pass shrinks the step by less than this fraction of the
+    previous pass — i.e. the improvement itself has plateaued ("changing by about the same
+    amount each time"), even if the absolute step is still non-trivial. Either can fire.
+    """
+    if converge > 0 and step < converge:
+        return f"Δ {step:.4f} < {converge} vox"
+    if converge_rel > 0 and prev_step is not None and prev_step > 0:
+        if (prev_step - step) / prev_step < converge_rel:
+            return f"step shrank <{converge_rel * 100:.0f}%/pass ({prev_step:.4f}→{step:.4f})"
+    return None
 
 
 def _run_3dacq_plain(
@@ -1691,6 +1787,9 @@ def _run_3dacq_plain(
     max_shift: float,
     trial_step: float,
     refine_rounds: int,
+    converge: float,
+    converge_rel: float,
+    first_n: int | None,
     automask: bool,
     automask_dilate: int,
     automask_sigma: float,
@@ -1729,12 +1828,27 @@ def _run_3dacq_plain(
             disp[..., t] = d.cpu()
         return disp, corrected
 
-    disp, corrected = _estimate(_select_ref_vol(vol4d, ref_mode).to(device))
+    disp, corrected = _estimate(_select_ref_vol(vol4d, ref_mode, first_n).to(device))
     # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D): rebuild
     # the reference from the corrected series (motion removed → sharp) and re-register,
-    # converging the template out of its bias.
-    for _ in range(max(0, refine_rounds)):
-        disp, corrected = _estimate(corrected.mean(dim=3).to(device))
+    # converging the template out of its bias. The aggregate honours -ref and -first_n;
+    # each pass prints its step size and -converge / -converge_rel can stop it early.
+    if refine_rounds > 0:
+        brain = _brain_mask_from(corrected.abs().mean(dim=3))  # (nx, ny, nz)
+        prev = disp
+        prev_step: float | None = None
+    for i in range(max(0, refine_rounds)):
+        disp, corrected = _estimate(_refine_reduce(corrected, ref_mode, 3, first_n).to(device))
+        step = float((disp - prev)[brain].pow(2).mean().sqrt())
+        prev = disp
+        if verbose:
+            print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
+        reason = _refine_converged(step, prev_step, converge, converge_rel)
+        prev_step = step
+        if reason is not None:
+            if verbose:
+                print(f"   ✓ converged ({reason}) — stopping refine at pass {i + 1}.")
+            break
 
     if automask:
         soft = _build_soft_mask(data, disp_slice, a0, a1, automask_dilate, automask_sigma, device)
