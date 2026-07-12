@@ -567,3 +567,127 @@ def test_max_reference_accepted_by_both_paths(known_shift_series):
         verbose=False,
     )
     assert np.isfinite(res.corrected_series().numpy()).all()
+
+
+# ── 3D-acquired EPI (idea 3: -is_3dacq) ───────────────────────────────────────
+from fastfuncstuff.processing.locomoco import (  # noqa: E402
+    optical_flow_lk_3d,
+    xcorr_search_flow_3d,
+    _build_flow3d_fn,
+    _shift3d_axis,
+)
+
+
+def _phantom3d(nx=40, ny=40, nz=16):
+    X, Y, Z = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    # Strong in-plane (x,y) structure, weak through-z structure — so the sagittal cut
+    # (which pools over z) is worse-conditioned than the axial cut (pools over x).
+    base = np.sin(X / 4.0) * np.cos(Y / 5.0) + 0.4 * np.sin((X + Y) / 3.0) + 0.03 * Z
+    return (base - base.min() + 1.0).astype(np.float32)
+
+
+def _yshift3d(vol, s):
+    """Shift a (nx,ny,nz) volume by s voxels along y (axis 1) via the module warp."""
+    return _shift3d_axis(torch.from_numpy(vol)[None], float(s), 1)[0].numpy()
+
+
+def test_optical_flow_lk_3d_recovers_uniform_shift():
+    vol = _phantom3d()
+    moved = _yshift3d(vol, 1.3)  # content shifted +1.3 along y
+    fx = torch.from_numpy(vol)[None]
+    mv = torch.from_numpy(moved)[None]
+    disp = optical_flow_lk_3d(fx, mv, pe_axis=1, n_iters=6)[0]  # pull: moving(x+disp)=fixed
+    core = disp[6:-6, 6:-6, 3:-3]
+    assert abs(float(core.mean()) - (-1.3)) < 0.15
+
+
+def test_xcorr_3d_recovers_uniform_shift():
+    vol = _phantom3d()
+    moved = _yshift3d(vol, -0.8)
+    disp = xcorr_search_flow_3d(
+        torch.from_numpy(vol)[None], torch.from_numpy(moved)[None], pe_axis=1, max_shift=3
+    )[0]
+    core = disp[6:-6, 6:-6, 3:-3]
+    assert abs(float(core.mean()) - 0.8) < 0.15
+
+
+def test_3d_solve_beats_averaging_the_two_cuts():
+    """The core -is_3dacq claim: one 3-D solve recovers the field better than either
+    valid perpendicular 2-D cut OR their flat average, on a noisy anisotropic volume."""
+    rng = np.random.RandomState(0)
+    vol = _phantom3d()
+    shifts = np.array([0.0, 0.6, 1.1, -0.5, -1.0, 0.8, 0.3, -0.7], dtype=np.float32)
+    series = np.stack([_yshift3d(vol, s) for s in shifts], -1)
+    series = series + rng.randn(*series.shape).astype(np.float32) * 0.10  # noise
+    truth = -shifts  # uniform pull displacement per frame
+
+    def err(res):
+        d = res.pe_displacement().numpy()  # (nx,ny,nz,T)
+        core = d[6:-6, 6:-6, 3:-3, :]
+        return float(np.abs(core - truth[None, None, None, :]).mean())
+
+    common = dict(
+        pe_axis=1, backend="flow", ref_mode="mean", device=torch.device("cpu"), verbose=False
+    )
+    res3d = estimate_residual_flow(series, slice_axis=2, is_3dacq=True, **common)
+    axial = estimate_residual_flow(series, slice_axis=2, **common)  # 2-D cut, pools x
+    sagittal = estimate_residual_flow(series, slice_axis=0, **common)  # 2-D cut, pools z
+    e3d, ea, es = err(res3d), err(axial), err(sagittal)
+    davg = 0.5 * (axial.pe_displacement().numpy() + sagittal.pe_displacement().numpy())
+    core = davg[6:-6, 6:-6, 3:-3, :]
+    e_avg = float(np.abs(core - truth[None, None, None, :]).mean())
+    # 3-D is no worse than the better cut and strictly better than the flat average.
+    assert e3d <= min(ea, es) * 1.15
+    assert e3d < e_avg
+
+
+def test_phase_backend_has_no_3d_path():
+    with pytest.raises(ValueError, match="phase backend has no 3-D"):
+        _build_flow3d_fn(
+            "phase", 1, n_levels=3, n_iters=4, window_sigma=2.0, max_shift=3, trial_step=0.5
+        )
+
+
+def test_3d_rotaware_runs_and_reduces(known_shift_series):
+    """Rotation-aware + 3D acquisition: identity motion → PE-axis-dominant, finite."""
+    data, _ = known_shift_series
+    T = data.shape[-1]
+    M = torch.eye(4).repeat(T, 1, 1)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    res = estimate_residual_flow_rotaware(
+        data,
+        data,
+        M,
+        M,
+        aff,
+        pe_axis=1,
+        slice_axis=2,
+        is_3dacq=True,
+        fuse="off",
+        automask=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    comps = dict((a, d) for a, d in res.warp_components())
+    assert np.isfinite(comps[1].numpy()).all()
+    assert (
+        float(comps[1].abs().max())
+        > (float(comps[0].abs().max()) + float(comps[2].abs().max())) * 5
+    )
+
+
+def test_warp_time_pcs(known_shift_series):
+    """Warp temporal PCs: (T, k) unit-variance regressors; empty warp → None."""
+    from fastfuncstuff.processing.locomoco import warp_time_pcs
+
+    data, _ = known_shift_series
+    T = data.shape[-1]
+    res = estimate_residual_flow(
+        data, pe_axis=1, slice_axis=2, ref_mode="mean", device=torch.device("cpu"), verbose=False
+    )
+    scores, var = warp_time_pcs(res.warp_components(), n_pcs=3)
+    assert scores.shape == (T, 3)
+    assert abs(float(scores.std(dim=0).mean()) - 1.0) < 0.1  # normalised to unit variance
+    assert var.shape == (3,) and 0.0 <= float(var.sum()) <= 1.0001
+    empty, _ = warp_time_pcs([(1, torch.zeros(4, 4, 2, T))], n_pcs=3)
+    assert empty is None

@@ -871,6 +871,7 @@ def estimate_residual_flow(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    is_3dacq: bool = False,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -925,13 +926,37 @@ def estimate_residual_flow(
     outside the head fade to zero instead of showing up as huge displacements. The
     corrected series is rebuilt from the masked flow (so it stays consistent).
     """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if is_3dacq:
+        # 3-D acquisition: no per-slice fields, so estimate the whole 3-D PE field at
+        # once (slice_axis is only a display hint for the movie/flow-map layout).
+        return _run_3dacq_plain(
+            data,
+            pe_axis,
+            slice_axis,
+            ref_mode=ref_mode,
+            backend=backend,
+            smooth_sigma=smooth_sigma,
+            n_levels=n_levels,
+            n_iters=n_iters,
+            window_sigma=window_sigma,
+            max_shift=max_shift,
+            trial_step=trial_step,
+            refine_rounds=refine_rounds,
+            automask=automask,
+            automask_dilate=automask_dilate,
+            automask_sigma=automask_sigma,
+            device=device,
+            verbose=verbose,
+        )
+
     if pe_axis == slice_axis:
         raise ValueError(
             f"-pe_axis ({pe_axis}) must differ from -slice_axis ({slice_axis}): PE must "
             "lie inside the slice plane to be visible to 2-D flow."
         )
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     orig_shape = (data.shape[0], data.shape[1], data.shape[2], data.shape[3])
     in_plane = sorted(a for a in (0, 1, 2) if a != slice_axis)
@@ -1212,6 +1237,7 @@ def estimate_residual_flow_rotaware(
     fuse: str = "auto",
     fuse_thresh: float = 0.05,
     fuse_weight: float = 1.0,
+    is_3dacq: bool = False,
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
@@ -1233,7 +1259,11 @@ def estimate_residual_flow_rotaware(
     """
     from .affine import apply_affine
 
-    if pe_axis == slice_axis:
+    # 3-D acquisition ignores the slice decomposition (slice_axis is only a display hint);
+    # otherwise PE must lie in the slice plane to be visible to the 2-D flow.
+    if is_3dacq and pe_axis == slice_axis:
+        slice_axis = next(a for a in (0, 1, 2) if a != pe_axis)
+    elif pe_axis == slice_axis:
         raise ValueError(f"-pe_axis ({pe_axis}) must differ from -slice_axis ({slice_axis}).")
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1274,8 +1304,28 @@ def estimate_residual_flow_rotaware(
     def _from_src(v_zyx: torch.Tensor) -> torch.Tensor:
         return v_zyx.permute(2, 1, 0).contiguous()  # (nz,ny,nx)→(nx,ny,nz)
 
+    # 3-D-acquired EPI: estimate the PE field on the whole volume (no slice movie), so
+    # the same neighbour/anchor machinery below works unchanged — only _pe_flow differs.
+    flow3d = (
+        _build_flow3d_fn(
+            backend,
+            pe_axis,
+            n_levels=n_levels,
+            n_iters=n_iters,
+            window_sigma=window_sigma,
+            max_shift=max_shift,
+            trial_step=trial_step,
+        )
+        if is_3dacq
+        else None
+    )
+
     def _pe_flow(fixed_xyz: torch.Tensor, moving_xyz: torch.Tensor) -> torch.Tensor:
         """PE-component flow (fixed vs moving), both (nx,ny,nz) → (nx,ny,nz) on ref/native grid."""
+        if flow3d is not None:
+            fx = _blur3d_b(fixed_xyz[None], smooth_sigma)[0] if smooth_sigma > 0 else fixed_xyz
+            mv = _blur3d_b(moving_xyz[None], smooth_sigma)[0] if smooth_sigma > 0 else moving_xyz
+            return flow3d(fx[None], mv[None])[0]
         fc = fixed_xyz.permute(perm_sp).contiguous()  # (nS,H,W)
         mc = moving_xyz.permute(perm_sp).contiguous()
         if smooth_sigma > 0:
@@ -1312,16 +1362,7 @@ def estimate_residual_flow_rotaware(
     # Temporal MAX is the rotation-aware default: it fills slices that later frames
     # rotate/translate out of the FoV (blank in the mean, biasing the anchor) and is a
     # high-signal registration target — worth the brighter/noisier per-voxel estimate.
-    if ref_mode in ("mean", "first_mean"):
-        ref_moco = moco.mean(dim=3)
-    elif ref_mode in ("median", "first_median"):
-        ref_moco = moco.median(dim=3).values
-    elif ref_mode == "max":
-        ref_moco = moco.max(dim=3).values
-    elif ref_mode == "first":
-        ref_moco = moco[..., 0]
-    else:
-        ref_moco = moco[..., int(ref_mode)]
+    ref_moco = _select_ref_vol(moco, ref_mode)
     templ_src = _to_src(ref_moco.to(device))
     anchor = torch.zeros(nt, nx, ny, nz)
     for t in tqdm(range(nt), desc="locomoco anchor", unit="frame", leave=True, disable=nt < 3):
@@ -1404,3 +1445,363 @@ def estimate_residual_flow_rotaware(
         drift_max=drift_max,
         fused=engage,
     )
+
+
+# ── 3D-acquired EPI (idea 3: -is_3dacq) ───────────────────────────────────────
+# 2-D multi-slice EPI acquires each slice at its own instant with its own field, so
+# residual distortion MUST be estimated slice-by-slice (each slice an independent 2-D
+# movie). 3-D EPI acquires the whole volume at once: one coherent field, smooth through
+# the partition direction. So the slice decomposition isn't just unnecessary — it throws
+# away real 3-D coupling. Estimate the single 3-D PE-displacement field directly, with
+# 3-D pooling and through-plane regularisation. This also dissolves the "which of the two
+# valid perpendicular cuts do I use" question: the 3-D solve uses all axes at once
+# (strictly better than running the two cuts and averaging their 2-D marginals).
+
+
+def _blur3d_b(vol: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable 3-D Gaussian blur of a batch of volumes ``(B, X, Y, Z)``."""
+    if sigma <= 0:
+        return vol
+    k = _gaussian_kernel1d(sigma, vol.device, vol.dtype)
+    r = (k.numel() - 1) // 2
+    x = vol.unsqueeze(1)
+    x = F.conv3d(F.pad(x, (0, 0, 0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1, 1))
+    x = F.conv3d(F.pad(x, (0, 0, r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1, 1))
+    x = F.conv3d(F.pad(x, (r, r, 0, 0, 0, 0), mode="replicate"), k.view(1, 1, 1, 1, -1))
+    return x.squeeze(1)
+
+
+def _grad_axis_3d(vol: torch.Tensor, axis: int) -> torch.Tensor:
+    """Central-difference gradient of ``(B, X, Y, Z)`` along spatial ``axis`` (0/1/2)."""
+    dim = axis + 1
+    n = vol.shape[dim]
+    d = torch.zeros_like(vol)
+    if n >= 3:
+        upper = vol.narrow(dim, 2, n - 2)
+        lower = vol.narrow(dim, 0, n - 2)
+        d.narrow(dim, 1, n - 2).copy_(0.5 * (upper - lower))
+    return d
+
+
+def _shift3d_axis(vol: torch.Tensor, shift, axis: int, mode: str = "bilinear") -> torch.Tensor:
+    """Sample ``(B,X,Y,Z)`` at ``coord + shift`` along ``axis`` ONLY (PE pull warp).
+
+    ``shift`` is a scalar or a ``(B,X,Y,Z)`` field. grid_sample's 3-D mode is trilinear
+    (``bilinear``) or nearest — no bicubic in 3-D — so a bicubic request degrades here.
+    """
+    b, X, Y, Z = vol.shape
+    dev, dt = vol.device, vol.dtype
+    xs, ys, zs = torch.meshgrid(
+        torch.arange(X, device=dev, dtype=dt),
+        torch.arange(Y, device=dev, dtype=dt),
+        torch.arange(Z, device=dev, dtype=dt),
+        indexing="ij",
+    )
+    n = (X, Y, Z)[axis]
+    comps = [
+        (2.0 * xs / max(X - 1, 1) - 1.0)[None].expand(b, X, Y, Z),
+        (2.0 * ys / max(Y - 1, 1) - 1.0)[None].expand(b, X, Y, Z),
+        (2.0 * zs / max(Z - 1, 1) - 1.0)[None].expand(b, X, Y, Z),
+    ]
+    comps[axis] = comps[axis] + shift * (2.0 / max(n - 1, 1))
+    grid = torch.stack([comps[2], comps[1], comps[0]], dim=-1)  # (B,X,Y,Z,3): last = (W=Z,H=Y,D=X)
+    if mode == "bicubic":
+        mode = "bilinear"
+    out = F.grid_sample(
+        vol.unsqueeze(1), grid, mode=mode, padding_mode="border", align_corners=True
+    )
+    return out.squeeze(1)
+
+
+def optical_flow_lk_3d(
+    fixed: torch.Tensor,
+    moving: torch.Tensor,
+    pe_axis: int,
+    *,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    reg: float = 1e-3,
+) -> torch.Tensor:
+    """1-DOF (PE-axis) pyramidal Lucas-Kanade on 3-D volumes ``(B, X, Y, Z)``.
+
+    The 3-D analogue of :func:`optical_flow_lk_2d` with ``pe_only``: only the PE-axis
+    gradient enters, the pooling window is a 3-D Gaussian, and warping/pyramids are
+    volumetric. Returns the PE-axis pull displacement ``(B, X, Y, Z)``.
+    """
+    fpyr, mpyr = [fixed], [moving]
+    for _ in range(n_levels - 1):
+        if min(fpyr[-1].shape[1:]) < 8:
+            break
+        fpyr.append(F.avg_pool3d(_blur3d_b(fpyr[-1], 1.0).unsqueeze(1), 2).squeeze(1))
+        mpyr.append(F.avg_pool3d(_blur3d_b(mpyr[-1], 1.0).unsqueeze(1), 2).squeeze(1))
+
+    disp = torch.zeros_like(fpyr[-1])
+    for lvl in range(len(fpyr) - 1, -1, -1):
+        fx, mv = fpyr[lvl], mpyr[lvl]
+        if disp.shape[1:] != fx.shape[1:]:
+            scale = fx.shape[pe_axis + 1] / disp.shape[pe_axis + 1]
+            disp = (
+                F.interpolate(
+                    disp.unsqueeze(1),
+                    size=tuple(fx.shape[1:]),
+                    mode="trilinear",
+                    align_corners=True,
+                ).squeeze(1)
+                * scale
+            )
+        for _ in range(n_iters):
+            mw = _shift3d_axis(mv, disp, pe_axis)
+            it = mw - fx
+            ip = _grad_axis_3d(mw, pe_axis)
+            step = -_blur3d_b(ip * it, window_sigma) / (_blur3d_b(ip * ip, window_sigma) + reg)
+            disp = disp + step
+    return disp
+
+
+def xcorr_search_flow_3d(
+    fixed: torch.Tensor,
+    moving: torch.Tensor,
+    pe_axis: int,
+    *,
+    max_shift: float = 3.0,
+    window_sigma: float = 2.0,
+    trial_step: float = 0.5,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """3-D cross-correlation searchlight along PE — the "big block" xcorr for 3-D EPI.
+
+    Slide the whole ``moving`` volume along the PE axis over ``±max_shift`` and take the
+    per-voxel offset of peak local correlation under a 3-D Gaussian searchlight
+    (``window_sigma``), sub-voxel by a 5-point parabola. A direct 3-D lift of
+    :func:`_xcorr_shift_1d`: same streaming running-peak, 3-D window and 3-D shift.
+    """
+    import math
+
+    r = float(max(1, int(math.ceil(max_shift))))
+
+    def _win(x: torch.Tensor) -> torch.Tensor:
+        return _blur3d_b(x, window_sigma)
+
+    mean_f = _win(fixed)
+    var_f = (_win(fixed * fixed) - mean_f * mean_f).clamp_min(eps)
+    offsets = torch.arange(-r, r + 1e-6, trial_step, device=fixed.device, dtype=fixed.dtype)
+    nd = int(offsets.numel())
+
+    z = torch.zeros_like(fixed)
+    best_val = torch.full_like(fixed, float("-inf"))
+    best_i = torch.zeros_like(fixed, dtype=torch.long)
+    ym2, ym1, y0, yp1, yp2 = z.clone(), z.clone(), z.clone(), z.clone(), z.clone()
+    need = torch.zeros_like(fixed, dtype=torch.long)
+    prev1: torch.Tensor | None = None
+    prev2: torch.Tensor | None = None
+    for i in range(nd):
+        mw = _shift3d_axis(moving, float(offsets[i]), pe_axis)
+        mean_m = _win(mw)
+        var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
+        corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+        yp1 = torch.where(need == 2, corr, yp1)
+        yp2 = torch.where(need == 1, corr, yp2)
+        need = torch.where(need > 0, need - 1, need)
+        newp = corr > best_val
+        ym2 = torch.where(newp, prev2 if prev2 is not None else corr, ym2)
+        ym1 = torch.where(newp, prev1 if prev1 is not None else corr, ym1)
+        y0 = torch.where(newp, corr, y0)
+        best_val = torch.where(newp, corr, best_val)
+        best_i = torch.where(newp, torch.full_like(best_i, i), best_i)
+        need = torch.where(newp, torch.full_like(need, 2), need)
+        prev2 = prev1
+        prev1 = corr
+
+    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
+    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
+    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
+    den3 = ym1 - 2.0 * y0 + yp1
+    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3))
+    vtx3 = vtx3.clamp(-1.0, 1.0)
+    can5 = (best_i >= 2) & (best_i <= nd - 3)
+    can3 = (best_i >= 1) & (best_i <= nd - 2)
+    sub = torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
+    return (-r + best_i.to(fixed.dtype) * trial_step) + sub * trial_step
+
+
+def _build_flow3d_fn(
+    backend: str,
+    pe_axis: int,
+    *,
+    n_levels: int,
+    n_iters: int,
+    window_sigma: float,
+    max_shift: float,
+    trial_step: float,
+):
+    """Build a 3-D ``(fixed, moving) -> disp`` PE estimator, ``(B,X,Y,Z)`` in and out."""
+    if backend == "flow":
+
+        def f(fx: torch.Tensor, mv: torch.Tensor) -> torch.Tensor:
+            return optical_flow_lk_3d(
+                fx, mv, pe_axis, n_levels=n_levels, n_iters=n_iters, window_sigma=window_sigma
+            )
+    elif backend == "xcorr":
+
+        def f(fx: torch.Tensor, mv: torch.Tensor) -> torch.Tensor:
+            return xcorr_search_flow_3d(
+                fx,
+                mv,
+                pe_axis,
+                max_shift=max_shift,
+                window_sigma=window_sigma,
+                trial_step=trial_step,
+            )
+    elif backend == "phase":
+        raise ValueError(
+            "phase backend has no 3-D (-is_3dacq) path yet; use -backend flow or xcorr."
+        )
+    else:
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected flow | xcorr (phase: no 3-D path)."
+        )
+    return f
+
+
+def _select_ref_vol(vol4d: torch.Tensor, ref_mode: str) -> torch.Tensor:
+    """Reduce a ``(nx,ny,nz,T)`` series to a single reference volume per ``ref_mode``."""
+    if ref_mode in ("mean", "first_mean"):
+        return vol4d.mean(dim=3)
+    if ref_mode in ("median", "first_median"):
+        return vol4d.median(dim=3).values
+    if ref_mode == "max":
+        return vol4d.max(dim=3).values
+    if ref_mode == "first":
+        return vol4d[..., 0]
+    return vol4d[..., int(ref_mode)]
+
+
+def _run_3dacq_plain(
+    data: np.ndarray,
+    pe_axis: int,
+    display_slice: int,
+    *,
+    ref_mode: str,
+    backend: str,
+    smooth_sigma: float,
+    n_levels: int,
+    n_iters: int,
+    window_sigma: float,
+    max_shift: float,
+    trial_step: float,
+    refine_rounds: int,
+    automask: bool,
+    automask_dilate: int,
+    automask_sigma: float,
+    device: torch.device,
+    verbose: bool,
+) -> LocomocoResult:
+    """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
+    nx, ny, nz, nt = data.shape
+    disp_slice = (
+        display_slice if display_slice != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
+    )
+    a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
+    pe_flow_is_u = pe_axis == a1
+    perm4 = [3, disp_slice, a0, a1]
+
+    vol4d = torch.from_numpy(np.ascontiguousarray(data)).float()
+    flow3d = _build_flow3d_fn(
+        backend,
+        pe_axis,
+        n_levels=n_levels,
+        n_iters=n_iters,
+        window_sigma=window_sigma,
+        max_shift=max_shift,
+        trial_step=trial_step,
+    )
+
+    def _estimate(ref_vol: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        fxb = _blur3d_b(ref_vol[None], smooth_sigma)[0] if smooth_sigma > 0 else ref_vol
+        disp = torch.zeros(nx, ny, nz, nt)
+        corrected = torch.zeros(nx, ny, nz, nt)
+        for t in tqdm(range(nt), desc="locomoco 3D", unit="frame", leave=True, disable=nt < 3):
+            mv = vol4d[..., t].to(device)
+            mvb = _blur3d_b(mv[None], smooth_sigma)[0] if smooth_sigma > 0 else mv
+            d = flow3d(fxb[None], mvb[None])[0]
+            corrected[..., t] = _shift3d_axis(mv[None], d[None], pe_axis)[0].cpu()
+            disp[..., t] = d.cpu()
+        return disp, corrected
+
+    disp, corrected = _estimate(_select_ref_vol(vol4d, ref_mode).to(device))
+    # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D): rebuild
+    # the reference from the corrected series (motion removed → sharp) and re-register,
+    # converging the template out of its bias.
+    for _ in range(max(0, refine_rounds)):
+        disp, corrected = _estimate(corrected.mean(dim=3).to(device))
+
+    if automask:
+        soft = _build_soft_mask(data, disp_slice, a0, a1, automask_dilate, automask_sigma, device)
+        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
+        disp = disp * soft_xyz[..., None]
+        for t in range(nt):
+            corrected[..., t] = _shift3d_axis(
+                vol4d[..., t].to(device)[None], disp[..., t].to(device)[None], pe_axis
+            )[0].cpu()
+
+    p_canon = disp.permute(perm4).contiguous()
+    u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
+    v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+    if verbose:
+        ap = disp.abs()
+        sel = ap[ap > 0]
+        med = float(sel.median()) if sel.numel() else 0.0
+        print(
+            f"🌀 locomoco 3D-acq: {nt} frames, PE axis {pe_axis}, backend={backend}, "
+            f"ref={ref_mode} (single 3-D solve, no slicing); |disp| median {med:.3f} vox, "
+            f"max {float(ap.max()):.3f} vox"
+        )
+    return LocomocoResult(
+        u_canon=u_canon,
+        v_canon=v_canon,
+        corrected_canon=torch.zeros_like(p_canon),
+        perm=perm4,
+        pe_flow_is_u=pe_flow_is_u,
+        pe_axis=pe_axis,
+        slice_axis=disp_slice,
+        orig_shape=(nx, ny, nz, nt),
+        a0=a0,
+        a1=a1,
+        dual=False,
+        corrected_nifti=corrected,
+    )
+
+
+def warp_time_pcs(
+    components: list[tuple[int, torch.Tensor]],
+    n_pcs: int = 5,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Temporal principal components of a per-frame warp — nuisance regressors.
+
+    The residual-motion warp is a structured spatiotemporal field; its dominant
+    temporal patterns make excellent denoising regressors (the same thing
+    :mod:`ffs_util_pcwarp` extracts post-hoc, computed here in-line from the warp we
+    already have). ``components`` is the ``[(nifti_axis, disp(nx,ny,nz,T))]`` list from
+    :meth:`LocomocoResult.warp_components`; all-zero axes are dropped. Returns
+    ``(scores (T, k), explained_variance_ratio (k,))`` — scores normalised to unit
+    variance for direct use as .1D regressors — or ``(None, None)`` if the warp is empty.
+    """
+    from ..decomposition.pca import PCA
+
+    mats = []
+    for _axis, disp in components:
+        if float(disp.abs().max()) == 0.0:
+            continue
+        t = disp.shape[-1]
+        mats.append(disp.contiguous().reshape(-1, t).T.contiguous())  # (T, spatial)
+    if not mats:
+        return None, None
+    mat = torch.cat(mats, dim=1).float()
+    nt, nfeat = mat.shape
+    k = max(1, min(n_pcs, nt - 1, nfeat))
+    pca = PCA(n_components=k, device=device)
+    scores = pca.fit_transform(mat.to(device) if device is not None else mat)
+    sc_std = scores.std(dim=0, keepdim=True).clamp(min=1e-10)
+    return (scores / sc_std).cpu(), pca.explained_variance_ratio_[:k].cpu()

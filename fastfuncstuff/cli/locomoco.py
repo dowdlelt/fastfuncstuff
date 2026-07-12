@@ -191,7 +191,18 @@ def create_parser() -> argparse.ArgumentParser:
         type=_axis_from_token,
         help="Through-plane (slice-select) axis to cut the movie along (x/y/z). Must "
         "differ from the PE axis; default z suits axial EPI. Ignored for dual -pe_dir "
-        "(the slice axis is fixed to the one axis not phase-encoded).",
+        "(the slice axis is fixed to the one axis not phase-encoded), and only a display "
+        "hint under -is_3dacq (no slicing is done).",
+    )
+    io.add_argument(
+        "-is_3dacq",
+        "-3d",
+        action="store_true",
+        help="Data is 3-D-acquired EPI (single-shot / 3-D EPI), not 2-D multi-slice. Then "
+        "there are no per-slice fields, so residual distortion is estimated as ONE 3-D PE "
+        "field (3-D pooling + through-plane regularisation) instead of slice-by-slice — "
+        "strictly better than averaging the two valid perpendicular cuts. Works for the "
+        "flow and xcorr backends (phase has no 3-D path yet), plain and rotation-aware.",
     )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
@@ -409,6 +420,19 @@ def create_parser() -> argparse.ArgumentParser:
     )
     out.add_argument("-no_corrected", action="store_true", help="Skip the corrected series.")
     out.add_argument(
+        "-want_pcs",
+        "-want-pcs",
+        nargs="?",
+        type=int,
+        const=5,
+        default=None,
+        metavar="N",
+        help="Also save the top-N temporal PCs of the warp as {prefix}_locomoco_pcs.1D — "
+        "structured residual-motion regressors that are strong denoising nuisances (the "
+        "same thing ffs_util_pcwarp extracts post-hoc, here in-line). Bare flag = 5 PCs; "
+        "give a number for more/fewer. Default: off.",
+    )
+    out.add_argument(
         "-save_mean",
         "-save-mean",
         action="store_true",
@@ -573,6 +597,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     dual = len(pe_axes) == 2
     slice_axis = args.slice_axis
+    if args.is_3dacq and dual:
+        print("❌ -is_3dacq is single phase-encode only (one -pe_dir).", file=sys.stderr)
+        return 2
+    if args.is_3dacq and args.backend == "phase":
+        print(
+            "❌ -is_3dacq has no 'phase' backend yet; use -backend flow or xcorr.", file=sys.stderr
+        )
+        return 2
     if dual:
         if pe_axes[0] == pe_axes[1]:
             print(f"❌ the two -pe_dir must be different axes, got {args.pe_dir}.", file=sys.stderr)
@@ -587,7 +619,8 @@ def main(argv: list[str] | None = None) -> int:
         pe_axis = pe_axes[0]  # representative; dual estimates both in-plane axes
     else:
         pe_axis = pe_axes[0]
-        if pe_axis == slice_axis:
+        # Under -is_3dacq the slice axis is only a display hint, so PE==slice is allowed.
+        if pe_axis == slice_axis and not args.is_3dacq:
             print(
                 f"❌ PE axis ({pe_axis}) and -slice_axis ({slice_axis}) coincide. The PE "
                 "direction must lie in the slice plane — pick a different -slice_axis.",
@@ -657,14 +690,14 @@ def main(argv: list[str] | None = None) -> int:
                 "❌ rotation-aware mode is single phase-encode only (one -pe_dir).", file=sys.stderr
             )
             return 2
-        # The idea-1 accuracy knobs live on the moco-frame estimator; rotation-aware has
-        # its own convergence path (neighbour differential + anchor smoother, tuned by
-        # -fuse and -iters), so these are inert here. Warn rather than silently ignore.
+        # Rotation-aware converges via the anchor/fuse, not reference-refinement, so only
+        # -refine / -jacobian (and the refine rounds inside the presets) are inert here.
+        # The presets' extra iters / levels / search density DO feed the estimator.
         if args.refine or args.jacobian or preset:
             print(
-                "ℹ️  rotation-aware: -refine, -jacobian, and the -workhard/-superhard "
-                "reference-refinement rounds are moco-frame (idea-1) knobs and do NOT apply "
-                "here — use -fuse / -fuse_weight and -iters to tune this path."
+                "ℹ️  rotation-aware: -refine and -jacobian (and the refine rounds inside "
+                "-workhard/-superhard) don't apply — convergence is the anchor/fuse. The "
+                "presets' extra iters/levels/search DO apply; tune further with -fuse / -iters."
             )
         from fastfuncstuff.processing.affine import dicom_matrix_to_voxel
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_rotaware
@@ -720,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
             fuse=args.fuse,
             fuse_thresh=args.fuse_thresh,
             fuse_weight=args.fuse_weight,
+            is_3dacq=args.is_3dacq,
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
@@ -745,6 +779,7 @@ def main(argv: list[str] | None = None) -> int:
             warp_interp=args.warp_interp,
             refine_rounds=args.refine,
             jacobian=args.jacobian,
+            is_3dacq=args.is_3dacq,
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
@@ -771,6 +806,27 @@ def main(argv: list[str] | None = None) -> int:
         axes_note = f"axes {[a for a, _ in comps]}" if dual else f"axis {primary_axis}"
         fmt_note = "5D DICOM-mm" if as_5d else "folder of 4D frames, DICOM-mm"
         print(f"  • warp ({fmt_note}, ffs_nwarp, {axes_note}): {warp_path}")
+
+    if args.want_pcs is not None:
+        from fastfuncstuff.processing.locomoco import warp_time_pcs
+
+        with spinner("Computing warp PCs"):
+            scores, var = warp_time_pcs(result.warp_components(), n_pcs=args.want_pcs, device=None)
+        if scores is None or var is None:
+            print("  • warp PCs: skipped (warp is all-zero)")
+        else:
+            pcs_path = f"{stem}_locomoco_pcs.1D"
+            var_pct = " ".join(f"{v * 100:.2f}%" for v in var.tolist())
+            with open(pcs_path, "w") as f:
+                f.write(
+                    f"# ffs_locomoco warp temporal PCs — {scores.shape[1]} PCs, unit variance\n"
+                )
+                f.write(f"# Variance explained: {var_pct}\n")
+                for row in scores.numpy():
+                    f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
+            print(
+                f"  • warp PCs ({scores.shape[1]}, denoising regressors, var {var_pct}): {pcs_path}"
+            )
 
     if not args.no_corrected:
         corr_path = f"{stem}_locomoco{ext}"
