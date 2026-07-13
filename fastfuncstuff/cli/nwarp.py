@@ -215,7 +215,7 @@ Examples:
         "neighbour at its own frame's pose instead of freezing the output frame's "
         "pose (the slow-motion assumption). Recovers the right signal when motion "
         "sweeps tissue between scanner locations frame to frame (e.g. a brain edge "
-        "moving in and out of a voxel). GPU cost is ~1% over the frozen path.",
+        "moving in and out of a voxel). GPU cost is ~1%% over the frozen path.",
     )
     st_group.add_argument(
         "-frozen",
