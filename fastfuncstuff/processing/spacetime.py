@@ -46,6 +46,7 @@ whole-slice phase rotation) has no place on this path.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 from torch import Tensor
@@ -106,7 +107,7 @@ def interp_slice_times(sz: Tensor, slice_times: Tensor) -> Tensor:
 
 
 def apply_spacetime_sample(
-    source: Tensor,
+    source: Tensor | Sequence[Tensor],
     sx: Tensor,
     sy: Tensor,
     sz: Tensor,
@@ -116,14 +117,18 @@ def apply_spacetime_sample(
     slice_times: Tensor,
     tinterp: str = "cubic",
     interp: str = "wsinc5",
-    no_neg: bool = False,
-) -> Tensor:
+    no_neg: bool | Sequence[bool] = False,
+) -> Tensor | list[Tensor]:
     """Sample the 4-D ``source`` at output frame ``frame_idx`` with joint slice-timing.
 
     Parameters
     ----------
-    source : (nt, snz, sny, snx)
-        Raw (un-slice-timed) 4-D series in internal ``(t, k, j, i)`` order.
+    source : (nt, snz, sny, snx) or a sequence of such tensors
+        Raw (un-slice-timed) 4-D series in internal ``(t, k, j, i)`` order. Pass a
+        sequence to sample several co-registered channels (e.g. the real/imag parts
+        of complex phase data) through the *same* space-time map in one pass; the
+        return type mirrors the input (a list when a sequence is given). ``no_neg``
+        may then be a per-channel sequence.
     sx, sy, sz : (onz, ony, onx)
         Absolute source-voxel coordinates each output voxel samples, already
         carrying this frame's pose + the rest of the warp chain (as produced by
@@ -148,9 +153,13 @@ def apply_spacetime_sample(
 
     Returns
     -------
-    (onz, ony, onx) warped, slice-timing-corrected volume.
+    (onz, ony, onx) warped, slice-timing-corrected volume -- or a list of them, one
+    per input channel, when ``source`` is a sequence.
     """
-    nt = source.shape[0]
+    multi = not isinstance(source, Tensor)
+    sources: tuple[Tensor, ...] = tuple(source) if multi else (source,)  # type: ignore[arg-type]
+    no_neg_ch = list(no_neg) if isinstance(no_neg, (list, tuple)) else [bool(no_neg)] * len(sources)
+    nt = sources[0].shape[0]
     # Compute on the coords' device; ``source`` may live on CPU and stream frame
     # by frame (the temporal window is only ~4-6 frames), so a large 4-D series
     # never needs to sit on the GPU in full.
@@ -175,8 +184,8 @@ def apply_spacetime_sample(
     f_lo = int(math.floor(tcoord.min().item())) - (half - 1)
     f_hi = int(math.floor(tcoord.max().item())) + half
 
-    acc = torch.zeros((onz, ony, onx), dtype=torch.float32, device=device)
-    wsum = torch.zeros_like(acc)
+    accs = [torch.zeros((onz, ony, onx), dtype=torch.float32, device=device) for _ in sources]
+    wsum = torch.zeros((onz, ony, onx), dtype=torch.float32, device=device)
     for f in range(f_lo, f_hi + 1):
         w = temporal_kernel_weights(tcoord - f, tinterp)
         if not bool(torch.any(w != 0.0)):
@@ -184,14 +193,16 @@ def apply_spacetime_sample(
         # Edge-extend past the series ends (nipy uses reflect; clamp is adequate
         # and never invents structure -- the weights there are already tiny).
         fc = min(max(f, 0), nt - 1)
-        frame = source[fc].to(device=device, dtype=acc.dtype)  # streams from CPU if needed
-        s_f = warp_image(frame, xd, yd, zd, mode=interp)
-        if no_neg:
-            s_f = s_f.clamp_min(0.0)
-        acc += w * s_f
+        for c, src in enumerate(sources):
+            frame = src[fc].to(device=device, dtype=accs[c].dtype)  # streams from CPU if needed
+            s_f = warp_image(frame, xd, yd, zd, mode=interp)
+            if no_neg_ch[c]:
+                s_f = s_f.clamp_min(0.0)
+            accs[c] += w * s_f
         wsum += w
 
-    return acc / wsum.clamp_min(1e-8)
+    outs = [acc / wsum.clamp_min(1e-8) for acc in accs]
+    return outs if multi else outs[0]
 
 
 class TissueFollowingSampler:
@@ -226,7 +237,7 @@ class TissueFollowingSampler:
 
     def __init__(
         self,
-        source: Tensor,
+        source: Tensor | Sequence[Tensor],
         coords_fn,
         output_shape: tuple[int, int, int],
         tr: float,
@@ -235,11 +246,20 @@ class TissueFollowingSampler:
         device: torch.device,
         tinterp: str = "cubic",
         interp: str = "wsinc5",
-        no_neg: bool = False,
+        no_neg: bool | Sequence[bool] = False,
         n_out: int | None = None,
         verb: int = 0,
     ) -> None:
-        self.source = source
+        # ``source`` may be several co-registered channels (e.g. real/imag of complex
+        # phase data): the pose and temporal weights are shared, so we warp each
+        # channel with the same per-frame map and return one volume per channel.
+        self.multi = not isinstance(source, Tensor)
+        self.sources: tuple[Tensor, ...] = tuple(source) if self.multi else (source,)  # type: ignore[arg-type]
+        self.no_neg_ch = (
+            list(no_neg)
+            if isinstance(no_neg, (list, tuple))
+            else [bool(no_neg)] * len(self.sources)
+        )
         self.coords_fn = coords_fn  # f -> (sx, sy, sz) on ``device``
         self.tr = tr
         self.tzero = tzero
@@ -247,8 +267,7 @@ class TissueFollowingSampler:
         self.device = device
         self.tinterp = tinterp
         self.interp = interp
-        self.no_neg = no_neg
-        self.nt = source.shape[0]
+        self.nt = self.sources[0].shape[0]
         self.half = _KERNEL_HALFWIDTH[tinterp]
 
         onz, ony, onx = output_shape
@@ -259,17 +278,27 @@ class TissueFollowingSampler:
             indexing="ij",
         )
         self._coords: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
-        self._srcs: dict[int, Tensor] = {}
+        self._srcs: dict[int, tuple[Tensor, ...]] = {}
 
-        # Decide whether the window's source frames fit device memory. The caller
-        # accumulates all ``n_out`` output volumes on device, so reserve for those
-        # first, then see if a window of source frames fits what remains.
+        # Decide whether the window's source frames fit alongside the coordinate
+        # cache and the transient warp-composition workspace. Completed output
+        # frames are stashed on the host by nwarpforge, so reserving ``n_out``
+        # output planes here would both understate the available cache budget and
+        # obscure the memory that composition actually needs.
         window = 2 * self.half + 2
-        plane = onz * ony * onx * 4
+        output_plane = onz * ony * onx * 4
+        source_frame_bytes = sum(source[0].numel() * source.element_size() for source in self.sources)
+        coord_cache_bytes = window * 3 * output_plane
+        source_cache_bytes = window * source_frame_bytes
+        # A high-order warp composition temporarily holds several output-grid
+        # fields and interpolation buffers. Keep a deliberately conservative
+        # reserve so caching source frames never crowds that peak.
+        compose_workspace_bytes = 16 * output_plane
         if device.type == "cuda":
             avail = get_available_memory(device)  # free * safety_factor
-            reserve_out = (n_out or self.nt) * plane
-            self.cache_source = (avail - reserve_out) > window * plane * 2
+            self.cache_source = avail > (
+                source_cache_bytes + coord_cache_bytes + compose_workspace_bytes
+            )
         else:
             self.cache_source = True  # CPU/MPS: source already in host RAM
         if verb >= 1:
@@ -289,16 +318,22 @@ class TissueFollowingSampler:
             if fc not in self._coords:
                 self._coords[fc] = self.coords_fn(fc)
                 if self.cache_source:
-                    self._srcs[fc] = self.source[fc].to(self.device, dtype=torch.float32)
+                    self._srcs[fc] = tuple(
+                        src[fc].to(self.device, dtype=torch.float32) for src in self.sources
+                    )
 
-    def sample(self, frame_idx: int) -> Tensor:
-        """The tissue-following, slice-timing-corrected output volume at ``frame_idx``."""
+    def sample(self, frame_idx: int) -> Tensor | list[Tensor]:
+        """The tissue-following, slice-timing-corrected output volume at ``frame_idx``.
+
+        Returns one volume per channel (a list) when constructed with multiple
+        source channels, else a single tensor.
+        """
         # The per-voxel timing shift (tzero - Delta)/TR lies in (-1, 1), so a kernel
         # of half-width H reaches at most H+1 frames each side of j.
         f_lo, f_hi = frame_idx - (self.half + 1), frame_idx + (self.half + 1)
         self._ensure({self._clamp(f) for f in range(f_lo, f_hi + 1)})
 
-        acc = torch.zeros_like(self.ii)
+        accs = [torch.zeros_like(self.ii) for _ in self.sources]
         wsum = torch.zeros_like(self.ii)
         for f in range(f_lo, f_hi + 1):
             fc = self._clamp(f)  # edge-extend pose + data past the series ends
@@ -309,15 +344,18 @@ class TissueFollowingSampler:
             )
             if not bool(torch.any(w != 0.0)):
                 continue
-            frame = (
+            frames = (
                 self._srcs[fc]
                 if self.cache_source
-                else self.source[fc].to(self.device, dtype=torch.float32)
+                else tuple(src[fc].to(self.device, dtype=torch.float32) for src in self.sources)
             )
-            s_f = warp_image(frame, sx - self.ii, sy - self.jj, sz - self.kk, mode=self.interp)
-            if self.no_neg:
-                s_f = s_f.clamp_min(0.0)
-            acc = acc + w * s_f
+            xd, yd, zd = sx - self.ii, sy - self.jj, sz - self.kk
+            for c, frame in enumerate(frames):
+                s_f = warp_image(frame, xd, yd, zd, mode=self.interp)
+                if self.no_neg_ch[c]:
+                    s_f = s_f.clamp_min(0.0)
+                accs[c] = accs[c] + w * s_f
             wsum = wsum + w
 
-        return acc / wsum.clamp_min(1e-8)
+        outs = [acc / wsum.clamp_min(1e-8) for acc in accs]
+        return outs if self.multi else outs[0]

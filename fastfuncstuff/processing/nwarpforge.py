@@ -1406,6 +1406,64 @@ def _needed_padding(
     return (need[0], need[1], need[2])
 
 
+def _phase_spacetime_channels(
+    mag_series: Tensor,
+    phase_series: Tensor,
+    phase_warp: str,
+    base_no_neg: bool,
+):
+    """Complex channels + recombine for joint slice-timing of phase data.
+
+    The space-time sampler is linear in source values, so warping the complex
+    channels and recombining reproduces the per-frame ``phase_warp`` modes (see
+    the non-slice-timing loop). Returns ``(channels, no_neg_per_channel,
+    recombine)`` where ``recombine`` maps the sampled channel volumes to
+    ``(magnitude, phase)``. ``no_neg`` is applied only to a true magnitude channel;
+    real/imag/cos/sin legitimately go negative and must never be clamped.
+    """
+    cos_p = torch.cos(phase_series)
+    sin_p = torch.sin(phase_series)
+    if phase_warp == "complex":
+        # Magnitude derived from the warped complex parts (can blur across wraps).
+        channels = [mag_series * cos_p, mag_series * sin_p]
+        no_neg = [False, False]
+
+        def recombine(w: list[Tensor]) -> tuple[Tensor, Tensor]:
+            wr, wi = w
+            return torch.sqrt(wr**2 + wi**2), torch.atan2(wi, wr)
+
+    elif phase_warp == "split":
+        channels = [mag_series, mag_series * cos_p, mag_series * sin_p]
+        no_neg = [bool(base_no_neg), False, False]
+
+        def recombine(w: list[Tensor]) -> tuple[Tensor, Tensor]:
+            wm, wr, wi = w
+            return wm, torch.atan2(wi, wr)
+
+    elif phase_warp == "direct":
+        # Phase interpolated directly; assumes it is already unwrapped.
+        channels = [mag_series, phase_series]
+        no_neg = [bool(base_no_neg), False]
+
+        def recombine(w: list[Tensor]) -> tuple[Tensor, Tensor]:
+            wm, wp = w
+            return wm, wp
+
+    elif phase_warp == "circular":
+        channels = [mag_series, cos_p, sin_p]
+        no_neg = [bool(base_no_neg), False, False]
+
+        def recombine(w: list[Tensor]) -> tuple[Tensor, Tensor]:
+            wm, wc, ws = w
+            return wm, torch.atan2(ws, wc)
+
+    else:
+        raise ValueError(
+            f"Unknown phase_warp: {phase_warp!r}. Use 'complex', 'split', 'direct', or 'circular'."
+        )
+    return channels, no_neg, recombine
+
+
 def nwarpforge(
     source_path: str,
     nwarp_specs: list[str],
@@ -1564,14 +1622,14 @@ def nwarpforge(
 
     # Joint space-time (slice-timing) resampling: fold slice-timing correction
     # into the same interpolation as the warp chain (Roche 2011). Requires a 4-D
-    # series and a real TR; incompatible with phase warping (complex data has no
-    # slice-timing model here). See processing/spacetime.py.
+    # series and a real TR. Phase data rides along: the space-time sampler is
+    # linear in source values, so we run it over the complex channels (real/imag
+    # or cos/sin) and recombine, exactly as the per-frame phase path does. See
+    # processing/spacetime.py and _phase_spacetime_channels below.
     slice_times_t: Tensor | None = None
     if slice_times is not None:
         if not is_4d:
             raise ValueError("slice-timing (-tpattern) requires a 4-D source")
-        if phase_data is not None:
-            raise ValueError("slice-timing (-tpattern) is not supported with -phase")
         if tr is None or tr <= 0:
             raise ValueError("slice-timing (-tpattern) requires a positive TR (-TR or header)")
         snz = source.shape[1]
@@ -1587,6 +1645,33 @@ def nwarpforge(
                 f"nwarpforge: joint slice-timing on ({snz} slices, TR={tr:.4f}s, "
                 f"tzero={tzero:.4f}s, tinterp={tinterp})"
             )
+
+    # Phase + slice-timing: sample the complex channels through the same space-time
+    # map and recombine (see _phase_spacetime_channels). Both samplers below drive
+    # off ``st_channels``/``st_recombine`` when set.
+    st_channels: list[Tensor] | None = None
+    st_channel_no_neg: bool | list[bool] = no_neg
+    st_recombine = None
+    if slice_times_t is not None and phase_data is not None:
+        # Build the complex channels on the HOST. They are several full 4-D series
+        # and the space-time samplers stream frames to the device one tap at a time,
+        # so the channels never need to sit on the GPU in full -- doing so OOMs on
+        # real EPI (2+ extra copies of a multi-GiB series beside source/phase). The
+        # phase+slice-timing loop reads only these channels, so free the GPU copies
+        # of source/phase_data once they exist.
+        st_channels, st_channel_no_neg, st_recombine = _phase_spacetime_channels(
+            source.detach().to("cpu"), phase_data.detach().to("cpu"), phase_warp, no_neg
+        )
+        # The loop samples only the host channels; drop the GPU phase copy. source
+        # stays on-device (still needed by padding/coord math below).
+        phase_data = None
+        # ``phase_raw`` otherwise remains a function-local reference to the
+        # original GPU-sized series after its host channels have been built.
+        del phase_raw
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        if verb >= 1:
+            print(f"nwarpforge: joint slice-timing carries phase (phase_warp={phase_warp})")
 
     master_hdr_obj = None  # nibabel header for AFNI extension propagation
     # "-master WARP/NWARP": use the first nonlinear warp's grid. The warps
@@ -1778,6 +1863,14 @@ def nwarpforge(
                 f"{tuple(old_shape[-3:])} -> {tuple(output_shape[-3:])}"
             )
 
+    # The phase slice-timing path now samples only ``st_channels``, which live
+    # on the host and are streamed by TissueFollowingSampler. At this point the
+    # source was only needed for padding, so retaining its full 4-D GPU copy
+    # would needlessly compete with per-frame composition.
+    if st_channels is not None and source.device.type == "cuda":
+        del source
+        torch.cuda.empty_cache()
+
     if is_4d and max_time_points > 1:
         nt = max(nt, max_time_points)
 
@@ -1792,6 +1885,15 @@ def nwarpforge(
 
     output_volumes = []
     phase_volumes: list[Tensor] = []
+
+    # Accumulate finished volumes on the HOST. The caller stacks the whole series at
+    # the end, so holding every warped frame on the GPU grows without bound (doubly
+    # so when phase adds a second series) and starves the per-frame compose/resample
+    # -- the failure mode on large master grids. stack/save_image/mean all accept CPU
+    # tensors; on a CPU device this is a no-op. The affine-only fast path below keeps
+    # its own (already bounded) batched output and is exempt.
+    def _stash(vol: Tensor) -> Tensor:
+        return vol.to("cpu")
 
     # Affine-only fast path: a chain with no nonlinear warp is a pure per-frame
     # 4x4 map. Composing it as matrices + a single batched resample is far
@@ -1869,7 +1971,7 @@ def nwarpforge(
             return _output_to_source_voxel_coords(comp_f, source_header["affine"], output_affine)
 
         follow_sampler = TissueFollowingSampler(
-            source,
+            st_channels if st_channels is not None else source,
             _coords_for_frame,
             output_shape,
             tr,
@@ -1878,7 +1980,7 @@ def nwarpforge(
             device,
             tinterp=tinterp,
             interp=interp,
-            no_neg=no_neg,
+            no_neg=st_channel_no_neg,
             n_out=t_end - t_start,
             verb=verb,
         )
@@ -1892,7 +1994,13 @@ def nwarpforge(
         if follow_sampler is not None:
             # Tissue-following joint: each temporal tap uses its own frame's pose,
             # served from the sampler's sliding window (skip the compose here).
-            output_volumes.append(follow_sampler.sample(t))
+            sampled = follow_sampler.sample(t)
+            if st_recombine is not None:
+                mag_vol, phase_vol = st_recombine(sampled)
+                output_volumes.append(_stash(mag_vol))
+                phase_volumes.append(_stash(phase_vol))
+            else:
+                output_volumes.append(_stash(sampled))
             continue
 
         composed = (
@@ -1909,8 +2017,6 @@ def nwarpforge(
             )
         )
 
-        src_vol = source[t] if is_4d else source
-
         if slice_times_t is not None:
             # Joint slice-timing: sample the raw 4-D series at this frame's pose,
             # letting the temporal coordinate vary per voxel by the scanner slice
@@ -1920,7 +2026,7 @@ def nwarpforge(
             )
             assert tr is not None and tzero is not None
             warped = apply_spacetime_sample(
-                source,
+                st_channels if st_channels is not None else source,
                 sx,
                 sy,
                 sz,
@@ -1930,10 +2036,17 @@ def nwarpforge(
                 slice_times_t,
                 tinterp=tinterp,
                 interp=interp,
-                no_neg=no_neg,
+                no_neg=st_channel_no_neg,
             )
-            output_volumes.append(warped)
+            if st_recombine is not None:
+                mag_vol, phase_vol = st_recombine(warped)
+                output_volumes.append(_stash(mag_vol))
+                phase_volumes.append(_stash(phase_vol))
+            else:
+                output_volumes.append(_stash(warped))
             continue
+
+        src_vol = source[t] if is_4d else source
 
         if phase_data is not None:
             ph_vol = phase_data[t] if is_4d else phase_data
@@ -2053,7 +2166,7 @@ def nwarpforge(
                     f"Unknown phase_warp: {phase_warp!r}. "
                     "Use 'complex', 'split', 'direct', or 'circular'."
                 )
-            phase_volumes.append(warped_phase)
+            phase_volumes.append(_stash(warped_phase))
         else:
             warped = apply_composed_warp(
                 src_vol,
@@ -2063,7 +2176,7 @@ def nwarpforge(
                 interp=interp,
                 no_neg=no_neg,
             )
-        output_volumes.append(warped)
+        output_volumes.append(_stash(warped))
 
     if is_4d or len(output_volumes) > 1:
         output = torch.stack(output_volumes)
