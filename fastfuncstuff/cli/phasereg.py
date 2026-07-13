@@ -61,11 +61,14 @@ RECOMMENDED PIPELINES
 OUTPUTS
   prefix_corrected.nii.gz   M_micro time series (4D)
   prefix_macro.nii.gz       what was subtracted (4D)
+  prefix_macro_std.nii.gz   temporal std of the macro (3D, QC overlay)
   prefix_slope.nii.gz       per-voxel A (3D, raw Deming slope)
   prefix_phi.nii.gz         per-voxel variance ratio used (3D)
   prefix_r2.nii.gz          ODR-style R² matching phaseprep (3D) [-r2_mode odr|both]
   prefix_r2_naive.nii.gz    naive R² (voxels most affected) (3D) [-r2_mode naive|both]
   prefix_mask.nii.gz        analysis mask (3D)
+  prefix_sgf_window.nii.gz  per-voxel SGF window chosen (3D) [-phase_filter explore]
+  prefix_sgf_order.nii.gz   per-voxel SGF order chosen (3D) [-phase_filter explore]
 
   Intermediates (written with -save_intermediates):
   prefix_mag_dt.nii.gz      magnitude after poly detrending (4D)
@@ -130,12 +133,22 @@ Every run writes these (3D = one value per voxel, 4D = a time series):
       — vessel-shaped, not a diffuse whole-brain haze. Diffuse structure means
       the fit is capturing noise (check phase preprocessing / phi / polort).
 
-  prefix_r2.nii.gz         (3D)  ODR-shrinkage R^2 — the canonical suppression
-      map, matching phaseprep / Stanley 2021. Fraction of magnitude variance
-      that phase could explain (and that was therefore removed). THIS IS THE
-      MAP TO THRESHOLD AND REPORT: high R^2 = strongly macrovascular voxel
-      that got a real correction; ~0 = little phase coupling, left essentially
-      untouched. High R^2 tracks large-vessel anatomy.
+  prefix_macro_std.nii.gz  (3D)  Temporal std of prefix_macro, i.e. the QC
+      overlay described above precomputed for you. THIS is the map to overlay
+      on anatomy to see WHERE suppression acted — bright on veins/sinuses when
+      the fit is good. Prefer it over prefix_r2, which saturates (see below).
+
+  prefix_r2.nii.gz         (3D)  ODR-shrinkage R^2 — the phaseprep / Stanley
+      2021 parity metric: fraction of magnitude variance explained once the
+      1/(1 + A^2/phi) shrinkage is folded in. Report it for parity, but DO NOT
+      read it as a "where did the correction act" map. The shrinkage factor
+      also multiplies the residual, which puts a floor under R^2 (~ 1 -
+      shrink^2). When magnitude is in raw scanner units phi is large and
+      A^2/phi sits near 1, so shrink ~ 0.5 and R^2 saturates high (~0.5-0.8)
+      across the WHOLE brain — it does NOT fall to ~0 in weakly-coupled voxels,
+      so a bright R^2 does not mean that voxel was actually changed. To see
+      where suppression genuinely happened, use prefix_macro_std or
+      prefix_r2_naive instead.
 
   prefix_slope.nii.gz      (3D)  Per-voxel regression slope A (magnitude units
       per radian). Larger |A| = stronger magnitude<->phase coupling. Read it
@@ -154,12 +167,21 @@ Every run writes these (3D = one value per voxel, 4D = a time series):
   prefix_r2_naive.nii.gz   (3D)  [only with -r2_mode naive|both] Raw R^2 with
       NO shrinkage. A QC/where-did-it-act map, NOT a metric to report: it is
       bright wherever phase regression had the largest raw effect, including
-      ill-conditioned noise voxels. Use it to see which voxels changed most;
-      use prefix_r2 to quantify.
+      ill-conditioned noise voxels. Use it (or macro variance) to see which
+      voxels changed most; prefix_r2 is the phaseprep-parity number to report.
 
-QC in one pass: overlay prefix_r2 (or macro variance) on anatomy and confirm
-the bright voxels sit on veins/sinuses. If suppression looks diffuse or noisy,
-suspect phase preprocessing (unwrap / coil combine), then phi, then polort.
+  prefix_sgf_window.nii.gz / prefix_sgf_order.nii.gz  (3D)  [only with
+      -phase_filter explore] The window length and polynomial order the
+      per-voxel search picked. Read them together: large window + low order =
+      the search wanted heavy smoothing there (noisy phase); small window =
+      it left the phase nearly untouched (already clean). A useful sanity
+      check that explore is adapting sensibly and not smoothing signal away.
+
+QC in one pass: overlay prefix_macro_std (or prefix_r2_naive) on anatomy and
+confirm the bright voxels sit on veins/sinuses. Prefer macro_std over prefix_r2
+here — the ODR R^2 saturates in raw-unit runs (see above) and makes a poor QC
+overlay. If suppression looks diffuse or noisy, suspect phase preprocessing
+(unwrap / coil combine), then phi, then polort.
 
 NUISANCE REGRESSORS & EVENTS
 ----------------------------
@@ -204,10 +226,20 @@ HOW THE FLAGS CHANGE WHAT YOU GET
                      (no errors-in-variables term) instead of Deming. phi is
                      still estimated and still governs the shrinkage/R^2.
 
-  -phase_filter sgf  Fits and corrects on a Savitzky-Golay-smoothed phase.
-                     Typically tightens prefix_r2 by removing high-frequency
-                     phase noise from the residual; recommended at 7T. 'explore'
-                     searches SGF parameters per voxel (expensive).
+  -phase_filter sgf  Fits and corrects on a Savitzky-Golay-smoothed phase,
+                     suppressing high-frequency phase noise before the slope
+                     fit; recommended at 7T. Changes slope/macro (and r2). Was
+                     a silent no-op prior to this build — verify your output
+                     differs from -phase_filter none. Tune with -sgf_window /
+                     -sgf_order.
+
+  -phase_filter explore
+                     Searches SGF parameters PER VOXEL, keeping the window/
+                     order that maximises |corr(smoothed phase, mag)| (Barry &
+                     Gore 2014). Adaptive but expensive. -sgf_window/-sgf_order
+                     are IGNORED here; tune the search grid with -sgf_window_max
+                     / -sgf_order_max / -sgf_step. Writes prefix_sgf_window and
+                     prefix_sgf_order so you can see what it chose per voxel.
 
   -polort N          Higher order removes more drift from both series before
                      the fit. Removes more nuisance low-frequency content but
@@ -372,8 +404,8 @@ def create_parser() -> argparse.ArgumentParser:
         "'none': no filtering (Stanley/phaseprep default). "
         "'sgf': Savitzky-Golay with -sgf_window/-sgf_order — same fit "
         "behaviour as 'none' but on a smoother phase, which acts as a "
-        "phase-noise regulariser and typically tightens R² by reducing "
-        "high-frequency phase contribution to the residual. "
+        "phase-noise regulariser: it removes high-frequency phase content "
+        "before the slope fit, changing slope/macro (and r2). "
         "'explore': per-voxel data-driven parameter search "
         "optimising |Pearson r(filtered_phase, mag_dt)| (Barry & Gore "
         "2014's phase-magnitude correlation criterion — NOT our ODR-"
@@ -398,6 +430,31 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="P",
         help="SGF polynomial order (must be < window length). Lower = "
         "more smoothing. Only used with -phase_filter sgf.",
+    )
+    pfilt.add_argument(
+        "-sgf_window_max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="EXPLORE grid: largest window (odd) searched per voxel. "
+        "Default: min(n_TRs, 97). Only used with -phase_filter explore.",
+    )
+    pfilt.add_argument(
+        "-sgf_order_max",
+        type=int,
+        default=None,
+        metavar="P",
+        help="EXPLORE grid: largest polynomial order searched per voxel "
+        "(min is 2). Default: 5. Only used with -phase_filter explore.",
+    )
+    pfilt.add_argument(
+        "-sgf_step",
+        type=int,
+        default=4,
+        metavar="N",
+        help="EXPLORE grid: window step (odd-ified) between candidate "
+        "windows. Smaller = finer, slower search. Default: 4. Only used "
+        "with -phase_filter explore.",
     )
 
     # ── Processing options ───────────────────────────────────────────────
@@ -838,6 +895,9 @@ def main(argv: list[str] | None = None) -> int:
         phase_filter=args.phase_filter,
         sgf_window=sgf_window,
         sgf_order=args.sgf_order,
+        sgf_window_max=args.sgf_window_max,
+        sgf_order_max=args.sgf_order_max,
+        sgf_step=args.sgf_step,
         signal_thresh=args.signal_thresh,
         keep_drift=args.keep_drift,
         device=str(device),
@@ -880,6 +940,13 @@ def main(argv: list[str] | None = None) -> int:
         save_nifti(_to_volume(macro_np, is_4d=True), fname, reference_img=ref_img_path)
         outputs["macro"] = fname
 
+        # Temporal std of what was subtracted: the recommended QC overlay for
+        # localising suppression (vessel-shaped), since the ODR R² saturates.
+        macro_std_np = result.macrovascular_component.std(dim=1).numpy()
+        fname = f"{args.prefix}_macro_std{nii_ext}"
+        save_nifti(_to_volume(macro_std_np), fname, reference_img=ref_img_path)
+        outputs["macro_std"] = fname
+
         fname = f"{args.prefix}_slope{nii_ext}"
         save_nifti(_to_volume(result.slope.numpy()), fname, reference_img=ref_img_path)
         outputs["slope"] = fname
@@ -905,6 +972,24 @@ def main(argv: list[str] | None = None) -> int:
             reference_img=ref_img_path,
         )
         outputs["mask"] = fname
+
+        # Explore-mode diagnostic: the per-voxel window/order the search chose.
+        if result.sgf_window_map is not None and result.sgf_order_map is not None:
+            fname = f"{args.prefix}_sgf_window{nii_ext}"
+            save_nifti(
+                _to_volume(result.sgf_window_map.numpy().astype(np.float32)),
+                fname,
+                reference_img=ref_img_path,
+            )
+            outputs["sgf_window"] = fname
+
+            fname = f"{args.prefix}_sgf_order{nii_ext}"
+            save_nifti(
+                _to_volume(result.sgf_order_map.numpy().astype(np.float32)),
+                fname,
+                reference_img=ref_img_path,
+            )
+            outputs["sgf_order"] = fname
 
         if args.save_intermediates:
             interm_specs = [

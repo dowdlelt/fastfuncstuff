@@ -73,6 +73,9 @@ class PhaseRegResult:
     pha_residual_filt : Tensor (n_voxels, n_timepoints) or None
         Phase after polynomial + task removal + SGF (used for phi estimation
         and slope fit).  None unless save_intermediates=True.
+    sgf_window_map, sgf_order_map : Tensor (n_voxels,) or None
+        Per-voxel SGF window length and polynomial order chosen by the
+        data-driven search.  Only populated when phase_filter='explore'.
     """
 
     magnitude_corrected: torch.Tensor
@@ -88,6 +91,8 @@ class PhaseRegResult:
     pha_detrended_filt: torch.Tensor | None = None
     mag_residual: torch.Tensor | None = None
     pha_residual_filt: torch.Tensor | None = None
+    sgf_window_map: torch.Tensor | None = None
+    sgf_order_map: torch.Tensor | None = None
 
 
 def _project_out(data: torch.Tensor, design: torch.Tensor) -> torch.Tensor:
@@ -199,31 +204,39 @@ def _apply_sgf(
     chunk_size: int = 50000,
     verbose: bool = False,
     mag_detrended: torch.Tensor | None = None,
-) -> torch.Tensor:
+    sgf_window_max: int | None = None,
+    sgf_order_max: int | None = None,
+    sgf_step: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Apply Savitzky-Golay filtering to phase on GPU, chunked.
 
     Parameters
     ----------
     phase_detrended : Tensor (n_timepoints, n_voxels)
-    sgf_mode : {"none", "fixed", "explore"}
+    sgf_mode : {"none", "sgf", "explore"}
     sgf_window, sgf_order : int
-        Parameters for fixed mode.
+        Parameters for fixed-window ("sgf") mode.
     device : torch.device
     chunk_size : int
     verbose : bool
+    sgf_window_max, sgf_order_max, sgf_step : int or None
+        Explore-mode grid bounds (max window, max order, window step).
+        None = library defaults (min(n_tp, 97), 5, 4).
 
     Returns
     -------
     filtered : Tensor (n_timepoints, n_voxels)
+    window_map, order_map : Tensor (n_voxels,) or None
+        Per-voxel chosen (window, order) in "explore" mode; None otherwise.
     """
     if sgf_mode == "none":
-        return phase_detrended
+        return phase_detrended, None, None
 
     n_tp = phase_detrended.shape[0]
     n_vox = phase_detrended.shape[1]
     result = phase_detrended.clone()
 
-    if sgf_mode == "fixed":
+    if sgf_mode == "sgf":
         if verbose:
             print(f"  SGF: window={sgf_window}, order={sgf_order}")
         for start in range(0, n_vox, chunk_size):
@@ -231,10 +244,13 @@ def _apply_sgf(
             chunk = phase_detrended[:, start:end].to(device)
             filtered = savgol_filter_1d(chunk.T, sgf_window, sgf_order).T
             result[:, start:end] = filtered.cpu()
+        return result, None, None
 
-    elif sgf_mode == "explore":
+    if sgf_mode == "explore":
         if verbose:
             print("  SGF: data-driven per-voxel parameter search (Barry & Gore 2014)...")
+        window_map = torch.zeros(n_vox, dtype=torch.int64)
+        order_map = torch.zeros(n_vox, dtype=torch.int64)
         for start in range(0, n_vox, chunk_size):
             end = min(start + chunk_size, n_vox)
             chunk = phase_detrended[:, start:end].T.to(device)
@@ -257,15 +273,24 @@ def _apply_sgf(
                 def _metric(filt: torch.Tensor) -> torch.Tensor:
                     return -filt.var(dim=-1)
 
-            filtered = savgol_filter_explore(
+            filtered, win_c, ord_c = savgol_filter_explore(
                 chunk,
                 n_timepoints=n_tp,
                 device=device,
                 metric_fn=_metric,
+                max_window=sgf_window_max,
+                max_order=sgf_order_max,
+                step=sgf_step,
+                return_params=True,
             )
             result[:, start:end] = filtered.T.cpu()
+            window_map[start:end] = win_c.cpu()
+            order_map[start:end] = ord_c.cpu()
+        return result, window_map, order_map
 
-    return result
+    raise ValueError(
+        f"Unknown phase_filter/sgf_mode: {sgf_mode!r}. Use 'none', 'sgf', or 'explore'."
+    )
 
 
 def phase_regress(
@@ -284,6 +309,9 @@ def phase_regress(
     phase_filter: str = "none",
     sgf_window: int | None = None,
     sgf_order: int = 3,
+    sgf_window_max: int | None = None,
+    sgf_order_max: int | None = None,
+    sgf_step: int = 4,
     signal_thresh: float = 0.03,
     keep_drift: bool = False,
     device: str | torch.device = "cpu",
@@ -324,16 +352,19 @@ def phase_regress(
         Regression method.
     tent_window : float
         TENT window duration in seconds.
-    phase_filter : {"none", "fixed", "explore"}
+    phase_filter : {"none", "sgf", "explore"}
         Phase filtering before regression:
         - "none": no filtering.
-        - "fixed": Savitzky-Golay with sgf_window/sgf_order.
+        - "sgf": Savitzky-Golay with sgf_window/sgf_order.
         - "explore": per-voxel data-driven SGF search (Barry & Gore 2014).
     sgf_window : int or None
         SGF window length (odd) for phase_filter="sgf".
         None = auto: ~20s of TRs (HRF-duration based), rounded to odd.
     sgf_order : int
-        SGF polynomial order for phase_filter="fixed".
+        SGF polynomial order for phase_filter="sgf".
+    sgf_window_max, sgf_order_max, sgf_step : int or None
+        Grid bounds for phase_filter="explore" (max window, max order, and
+        window step). None = library defaults (min(n_tp, 97), 5, 4).
     signal_thresh : float
         Minimum mean-signal fraction to include a voxel (default 0.03,
         matching phaseprep). Voxels below this have their slope and
@@ -519,7 +550,7 @@ def phase_regress(
         if sgf_window % 2 == 0:
             sgf_window += 1
         sgf_window = max(sgf_window, 5)
-    pha_detrended_filt = _apply_sgf(
+    pha_detrended_filt, sgf_window_map, sgf_order_map = _apply_sgf(
         pha_detrended,
         phase_filter,
         sgf_window,
@@ -528,8 +559,11 @@ def phase_regress(
         chunk_size,
         verbose,
         mag_detrended=mag_detrended,
+        sgf_window_max=sgf_window_max,
+        sgf_order_max=sgf_order_max,
+        sgf_step=sgf_step,
     )
-    pha_residual_filt = _apply_sgf(
+    pha_residual_filt, _, _ = _apply_sgf(
         pha_residual,
         phase_filter,
         sgf_window,
@@ -538,7 +572,19 @@ def phase_regress(
         chunk_size,
         verbose=False,
         mag_detrended=mag_residual,
+        sgf_window_max=sgf_window_max,
+        sgf_order_max=sgf_order_max,
+        sgf_step=sgf_step,
     )
+
+    if verbose and sgf_window_map is not None:
+        wm = sgf_window_map[vox_mask]
+        om = sgf_order_map[vox_mask]
+        print(
+            f"  SGF explore (per voxel): window median={int(wm.median())} "
+            f"[{int(wm.min())}, {int(wm.max())}], "
+            f"order median={int(om.median())} [{int(om.min())}, {int(om.max())}]"
+        )
 
     # ── 6. Estimate phi (if not provided) ────────────────────────────────
     if phi is None:
@@ -750,4 +796,6 @@ def phase_regress(
         pha_detrended_filt=interm_pha_dt_filt,
         mag_residual=interm_mag_res,
         pha_residual_filt=interm_pha_res_filt,
+        sgf_window_map=sgf_window_map,
+        sgf_order_map=sgf_order_map,
     )

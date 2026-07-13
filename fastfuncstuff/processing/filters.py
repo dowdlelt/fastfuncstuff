@@ -124,7 +124,8 @@ def savgol_filter_explore(
     max_order: int | None = None,
     step: int = 4,
     metric_fn=None,
-) -> Tensor:
+    return_params: bool = False,
+) -> Tensor | tuple[Tensor, Tensor, Tensor]:
     """Data-driven SGF parameter search per voxel (Barry & Gore 2014).
 
     For each voxel, tries multiple (window, order) combinations and
@@ -151,13 +152,23 @@ def savgol_filter_explore(
     metric_fn : callable or None
         Function(filtered_data) -> Tensor (n_voxels,) to maximise.
         If None, returns unfiltered data.
+    return_params : bool
+        If True, also return the per-voxel chosen (window, order) as two
+        int tensors of shape (n_voxels,).  Voxels never filtered (empty grid)
+        report window=0, order=0.
 
     Returns
     -------
     best_filtered : Tensor, shape (n_voxels, n_timepoints)
         Filtered data using per-voxel optimal parameters.
+    best_window, best_order : Tensor, shape (n_voxels,)
+        Only returned when return_params=True.  The window length and
+        polynomial order selected per voxel.
     """
     if metric_fn is None:
+        if return_params:
+            zeros = torch.zeros(data.shape[0], dtype=torch.int64, device=device)
+            return data, zeros, zeros.clone()
         return data
 
     if max_window is None:
@@ -175,6 +186,8 @@ def savgol_filter_explore(
 
     best_score = torch.full((data.shape[0],), float("-inf"), device=device)
     best_filtered = data.clone()
+    best_window = torch.zeros(data.shape[0], dtype=torch.int64, device=device)
+    best_order = torch.zeros(data.shape[0], dtype=torch.int64, device=device)
 
     for w in windows:
         for p in range(min_order, min(max_order, w - 1) + 1):
@@ -186,5 +199,9 @@ def savgol_filter_explore(
             improved = score > best_score
             best_score = torch.where(improved, score, best_score)
             best_filtered = torch.where(improved.unsqueeze(-1), filt, best_filtered)
+            best_window = torch.where(improved, w, best_window)
+            best_order = torch.where(improved, p, best_order)
 
+    if return_params:
+        return best_filtered, best_window, best_order
     return best_filtered
