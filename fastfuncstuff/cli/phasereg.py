@@ -105,9 +105,136 @@ class _HelpFormatter(
     pass
 
 
+# Printed at the end of -h. Kept self-contained (no wiki required): it tells a
+# first-time user what each file is FOR and how to read it, then how the flags
+# reshape those files. Any literal percent sign must be doubled (%%) — argparse
+# runs this text through %-formatting.
+_EPILOG = """\
+READING THE OUTPUTS
+-------------------
+Every run writes these (3D = one value per voxel, 4D = a time series):
+
+  prefix_corrected.nii.gz  (4D)  THE DELIVERABLE. Magnitude with the phase-
+      correlated (macrovascular) fluctuations removed; what you feed to your
+      GLM or connectivity analysis. In the default mode it is re-centered on
+      each voxel's mean and polynomial drift is dropped; with -keep_drift the
+      drift is preserved (see below). Voxels the fit could not constrain fall
+      back to their mean (default) or to no correction (-keep_drift) rather
+      than being corrupted — so a "flat" voxel here means "nothing removed",
+      not "broken".
+
+  prefix_macro.nii.gz      (4D)  What was subtracted, exactly
+      (mag_orig - corrected). This is your estimate of the macrovascular
+      signal. QC LOOK: the temporal std / variance of this map should light
+      up pial veins, the sagittal/transverse sinuses and other large vessels
+      — vessel-shaped, not a diffuse whole-brain haze. Diffuse structure means
+      the fit is capturing noise (check phase preprocessing / phi / polort).
+
+  prefix_r2.nii.gz         (3D)  ODR-shrinkage R^2 — the canonical suppression
+      map, matching phaseprep / Stanley 2021. Fraction of magnitude variance
+      that phase could explain (and that was therefore removed). THIS IS THE
+      MAP TO THRESHOLD AND REPORT: high R^2 = strongly macrovascular voxel
+      that got a real correction; ~0 = little phase coupling, left essentially
+      untouched. High R^2 tracks large-vessel anatomy.
+
+  prefix_slope.nii.gz      (3D)  Per-voxel regression slope A (magnitude units
+      per radian). Larger |A| = stronger magnitude<->phase coupling. Read it
+      WITH phi and R^2, never alone: a large A on low-quality data is an
+      ill-conditioned noise fit, not strong signal — which is exactly why the
+      correction is shrunk by 1/(1 + A^2/phi) before it is applied.
+
+  prefix_phi.nii.gz        (3D)  Variance ratio phi = Var(mag noise)/Var(phase
+      noise) used by the Deming fit. Mostly a diagnostic: it sets how much the
+      errors-in-variables fit trusts phase vs magnitude, and it drives the
+      shrinkage above. Constant across the brain only if you passed -phi.
+
+  prefix_mask.nii.gz       (3D)  Which voxels were actually fit (1) vs skipped
+      as air/skull/low-SNR (0). Everything outside it is zero in the 3D maps.
+
+  prefix_r2_naive.nii.gz   (3D)  [only with -r2_mode naive|both] Raw R^2 with
+      NO shrinkage. A QC/where-did-it-act map, NOT a metric to report: it is
+      bright wherever phase regression had the largest raw effect, including
+      ill-conditioned noise voxels. Use it to see which voxels changed most;
+      use prefix_r2 to quantify.
+
+QC in one pass: overlay prefix_r2 (or macro variance) on anatomy and confirm
+the bright voxels sit on veins/sinuses. If suppression looks diffuse or noisy,
+suspect phase preprocessing (unwrap / coil combine), then phi, then polort.
+
+NUISANCE REGRESSORS & EVENTS
+----------------------------
+  -ortvec (and -ortvec_run / -ortvec_glob / -ortvec_concat) are all REPEATABLE
+      and STACK: pass one file per source and every column is concatenated into
+      that run's nuisance design, then projected out before the slope fit. A file
+      can have any number of columns. Give each a distinct LABEL:
+        -ortvec motion.1D motion -ortvec physio.1D physio -ortvec extra.1D extra
+      -ortvec expects FULL-LENGTH files (rows = total TRs across all runs);
+      -ortvec_run FILE LABEL RUN is the per-run form (zero-padded elsewhere);
+      -ortvec_glob / -ortvec_concat are convenience globs over per-run file sets.
+      Mix freely in one call.
+
+  -event_cols ONSET DUR TYPE selects columns BY NAME, mapping your TSV's headers
+      to the three roles (onset, duration, trial_type); default names are
+      onset / duration / trial_type. ONLY these three columns are read — every
+      other column in the TSV is ignored. The trial_type column defines the
+      conditions (one TENT/canonical set per unique value); use -event_ignore to
+      drop specific values. Durations come from the TSV, so -durations is not
+      needed with -events. (No parametric-modulation column is supported — only
+      the three roles.)
+
+HOW THE FLAGS CHANGE WHAT YOU GET
+---------------------------------
+  -keep_drift        Rewrites prefix_corrected AND prefix_macro. Default:
+                     drift dropped, output = mean + shrunk residual. On:
+                     drift kept, output = mag_orig - A_eff*(phase-mean) with
+                     A_eff = A/(1+A^2/phi). slope/phi/r2 are unchanged; only
+                     the two 4D files differ. Use it when a GLM downstream
+                     will model the drift; use default for an analysis
+                     endpoint.
+
+  -task_removal / -onsets / -events
+                     Estimates slope and phi on TASK-RESIDUAL data, so A
+                     reflects vessel coupling rather than a shared task
+                     response. Changes slope, phi and r2 (and therefore the
+                     correction). The correction is still applied to the full
+                     detrended series. Pair with -phi_method residual on task
+                     data; 'fft' is safe either way.
+
+  -regression ols    Fills prefix_slope with an ordinary least-squares slope
+                     (no errors-in-variables term) instead of Deming. phi is
+                     still estimated and still governs the shrinkage/R^2.
+
+  -phase_filter sgf  Fits and corrects on a Savitzky-Golay-smoothed phase.
+                     Typically tightens prefix_r2 by removing high-frequency
+                     phase noise from the residual; recommended at 7T. 'explore'
+                     searches SGF parameters per voxel (expensive).
+
+  -polort N          Higher order removes more drift from both series before
+                     the fit. Removes more nuisance low-frequency content but
+                     can also absorb shared low-frequency mag/phase you may
+                     want to keep. -polort 1 = exact phaseprep parity.
+
+  -phi VALUE         Pins prefix_phi to a constant (no per-voxel estimation).
+
+  -signal_thresh 0   Disables signal gating. prefix_corrected stays clean
+                     (shrinkage caps every voxel), but prefix_r2 will show
+                     bright values in air/noise — the ODR metric reads
+                     unfittable voxels as "perfect within the noise budget".
+                     A visual artifact, not a bug.
+
+  -r2_mode           Selects which R^2 map(s) are written (odr / naive / both).
+
+  -save_intermediates
+                     Adds prefix_mag_dt, _pha_dt, _pha_dt_filt, _mag_res,
+                     _pha_res_filt (4D) for step-by-step inspection of the
+                     detrend -> filter -> task-removal chain.
+"""
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Phase regression for macrovascular BOLD suppression",
+        epilog=_EPILOG,
         formatter_class=_HelpFormatter,
     )
 
@@ -169,7 +296,9 @@ def create_parser() -> argparse.ArgumentParser:
         "-event_cols",
         nargs=3,
         metavar=("ONSET", "DUR", "TYPE"),
-        help="Custom column names for -events (default: onset, duration, trial_type).",
+        help="Custom column names for -events, mapping to (onset, duration, "
+        "trial_type) by name (default: onset, duration, trial_type). Only these "
+        "three columns are read; any others in the TSV are ignored.",
     )
     task.add_argument(
         "-tent_window",

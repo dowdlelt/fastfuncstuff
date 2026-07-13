@@ -50,6 +50,55 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
 
 
 _EPILOG = """\
+reading the outputs (3D = one value/voxel, 4D = a time series):
+
+  _locomoco.nii.gz   (4D)  THE CORRECTED SERIES — your cleaned data. The residual
+      non-linear PE-axis motion that rigid moco left behind is resampled out. This
+      is the deliverable if you just want corrected images. With -jacobian its
+      intensities are also signal-conserved (stretched regions dim, compressed
+      brighten); without it, geometry only. Skip with -no_corrected.
+
+  _warp / _warp.nii.gz     THE TRANSFORM — the SAME correction as a per-frame
+      DICOM-mm displacement field for ffs_nwarp, instead of pre-resampled data.
+      Use it to fold this step into ONE interpolation with your other transforms,
+      e.g. ffs_nwarp -nwarp 'sub_warp moco.aff12.1D' = rigid-then-nonlinear in a
+      single resample (less blur than applying _locomoco on already-resampled
+      data). 5-D (nx,ny,nz,T,3) by default, or a folder of per-frame 4D files with
+      -warp_format folder. You want EITHER this or _locomoco, rarely both. Skip
+      with -no_warp.
+
+  _flow.nii.gz       (4D)  THE DIAGNOSTIC — signed residual PE displacement per
+      frame, in VOXELS; sign = direction along the PE axis. This is literally how
+      much motion rigid moco MISSED, per voxel per frame. Scrub it like a series.
+      QC: it should be spatially STRUCTURED (largest at tissue/air boundaries and
+      where PE distortion lives), coherent frame-to-frame, and ~0 in static tissue
+      — not salt-and-pepper. Big coherent values = real residual motion caught;
+      noise-like everywhere = little to correct (or phase/tissue SNR too low to
+      trust). It is NOT the warp (voxels vs DICOM-mm) — don't feed it to ffs_nwarp.
+      Skip with -no_flow.
+
+  _flow.mp4 / .gif         THE QUICK-LOOK — a contact-sheet movie of _flow, colored
+      by a circular-phase wheel (hue = direction, brightness = magnitude). Fastest
+      QC there is: look for coherent within-brain flow that pulses with the time
+      course, vs. random speckle (= nothing real to correct). mp4 via system
+      ffmpeg if present, else gif. Skip with -no_movie.
+
+  _locomoco_pcs.1D   [with -want_pcs N]  DENOISING REGRESSORS — the top-N temporal
+      PCs of the warp (unit variance; variance-explained in the header). A handful
+      of timecourses that summarize the structured residual motion; add them as
+      nuisance columns in your GLM.
+
+  _locomoco_mean.nii.gz  [with -save_mean]  Temporal mean of the corrected series
+      — a sharp, motion-reduced registration target.
+
+  dual -pe_dir: _flow has no single signed scalar (the shift is a 2-D vector), so
+      it is written as _flowmag.nii.gz (magnitude, voxels) + _flowang.nii.gz
+      (direction, degrees 0-360) instead.
+
+  Note: -backend flow/phase/xcorr changes precision and speed, not WHICH files you
+      get — all three write the same set. -jacobian only changes _locomoco
+      intensities, never the warp/flow geometry.
+
 backends (all estimate the SAME residual PE-axis shift — pick on speed/quality;
 numbers are mean |err| recovering known shifts on a 0.8 mm real brain):
 
@@ -141,8 +190,9 @@ def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_locomoco",
         description="Residual non-linear (PE-axis) motion correction via GPU optical "
-        "flow, phase-correlation, or cross-correlation searchlights. See the bottom of "
-        "this help for which -flag applies to which -backend and how to tune each.",
+        "flow, phase-correlation, or cross-correlation searchlights. See the notes below "
+        "for how to read each output, which -flag applies to which -backend, and how to "
+        "tune each.",
         formatter_class=_HelpFormatter,
         epilog=_EPILOG,
     )
