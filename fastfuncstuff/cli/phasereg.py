@@ -650,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
 
     nuisance_per_run = None
-    if args.ortvec or args.ortvec_run or args.ortvec_glob:
+    if args.ortvec or args.ortvec_run or args.ortvec_glob or args.ortvec_concat:
         from fastfuncstuff.cli_utils import collect_nuisance_blocks
 
         run_lengths = [int(m.shape[1]) for m in mag_list]

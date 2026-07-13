@@ -569,14 +569,14 @@ def main():
     # ==========================================================================
     # 0. Validate flag combinations that don't depend on input files
     # ==========================================================================
-    any_ortvec = bool(args.ortvec or args.ortvec_run or args.ortvec_glob)
+    any_ortvec = bool(args.ortvec or args.ortvec_run or args.ortvec_glob or args.ortvec_concat)
     if args.delta_denoise:
         if not any_ortvec:
             print(
                 "ERROR: -delta_denoise requires at least one -ortvec / "
-                "-ortvec_run / -ortvec_glob. It compares HRF selection with "
-                "vs. without user-supplied nuisance; without any, there is "
-                "nothing to compare."
+                "-ortvec_run / -ortvec_glob / -ortvec_concat. It compares HRF "
+                "selection with vs. without user-supplied nuisance; without any, "
+                "there is nothing to compare."
             )
             sys.exit(1)
         if args.single_trials or args.save_single_trial_betas:

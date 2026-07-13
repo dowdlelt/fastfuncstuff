@@ -1097,10 +1097,12 @@ def make_nuisance_block_from_glob(
 
 
 def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
-    """Register `-ortvec`, `-ortvec_run`, `-ortvec_glob` on a parser/group.
+    """Register `-ortvec`, `-ortvec_run`, `-ortvec_glob`, `-ortvec_concat` on a parser/group.
 
-    All three are repeatable. The CLI then funnels them through
+    All four are repeatable. The CLI then funnels them through
     `collect_nuisance_blocks(args, ...)` to get a `list[NuisanceBlock]`.
+    Any per-CLI guard in front of that call must test all four flags
+    (a subset guard silently drops the omitted mode).
     """
     if include_legacy:
         parser_or_group.add_argument(
