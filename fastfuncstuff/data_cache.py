@@ -4,6 +4,7 @@ HDF5 data caching for fast loading of fMRI data.
 Provides ~10x speedup by caching preprocessed (scaled) data in HDF5 format
 instead of loading multiple compressed NIfTI files on each run.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -68,47 +69,53 @@ def save_cache(
 
     start_time = time.time()
 
-    with h5py.File(cache_path, 'w') as f:
+    with h5py.File(cache_path, "w") as f:
         # Store data with compression
         f.create_dataset(
-            'data',
+            "data",
             data=data,
-            compression='gzip',
+            compression="gzip",
             compression_opts=4,  # Balance speed vs compression
-            chunks=(min(1000, data.shape[0]), data.shape[1])  # Chunk by voxels
+            chunks=(min(1000, data.shape[0]), data.shape[1]),  # Chunk by voxels
         )
 
         # Store metadata
-        meta = f.create_group('metadata')
-        meta.attrs['file_hash'] = _compute_file_hash(input_files)
-        meta.attrs['n_voxels'] = data.shape[0]
-        meta.attrs['n_timepoints'] = data.shape[1]
-        meta.attrs['was_scaled'] = was_scaled
+        meta = f.create_group("metadata")
+        meta.attrs["file_hash"] = _compute_file_hash(input_files)
+        meta.attrs["n_voxels"] = data.shape[0]
+        meta.attrs["n_timepoints"] = data.shape[1]
+        meta.attrs["was_scaled"] = was_scaled
 
         if original_mean is not None:
-            meta.attrs['original_mean'] = original_mean
+            meta.attrs["original_mean"] = original_mean
 
         # Store input file list
-        meta.create_dataset('input_files', data=np.array([str(Path(f).absolute()) for f in input_files], dtype=h5py.string_dtype()))
+        meta.create_dataset(
+            "input_files",
+            data=np.array(
+                [str(Path(f).absolute()) for f in input_files], dtype=h5py.string_dtype()
+            ),
+        )
 
         if run_starts is not None:
-            meta.create_dataset('run_starts', data=np.array(run_starts, dtype=np.int32))
+            meta.create_dataset("run_starts", data=np.array(run_starts, dtype=np.int32))
 
         if affine is not None:
-            meta.create_dataset('affine', data=affine)
+            meta.create_dataset("affine", data=affine)
 
         if volume_shape is not None:
-            meta.attrs['volume_shape'] = volume_shape
+            meta.attrs["volume_shape"] = volume_shape
 
     # Save NIfTI header as separate pickle file (simpler and cleaner!)
     if nifti_header is not None:
         import pickle
-        header_pickle_path = Path(str(cache_path) + '.header.pkl')
-        with open(header_pickle_path, 'wb') as f:
+
+        header_pickle_path = Path(str(cache_path) + ".header.pkl")
+        with open(header_pickle_path, "wb") as f:
             pickle.dump(nifti_header, f)
 
     elapsed = time.time() - start_time
-    size_mb = cache_path.stat().st_size / (1024 ** 2)
+    size_mb = cache_path.stat().st_size / (1024**2)
 
     print(f"   Saved: {size_mb:.1f} MB in {elapsed:.1f}s")
     if was_scaled:
@@ -152,11 +159,11 @@ def load_cache(
     print(f"\n📦 Loading from HDF5 cache: {cache_path.name}")
     start_time = time.time()
 
-    with h5py.File(cache_path, 'r') as f:
+    with h5py.File(cache_path, "r") as f:
         # Validate cache if requested
         if validate and input_files is not None:
             expected_hash = _compute_file_hash(input_files)
-            cached_hash = f['metadata'].attrs.get('file_hash', '')
+            cached_hash = f["metadata"].attrs.get("file_hash", "")
 
             if expected_hash != cached_hash:
                 raise ValueError(
@@ -165,42 +172,46 @@ def load_cache(
                 )
 
         # Load data (this is fast due to HDF5's efficient chunking)
-        data = f['data'][:]
+        data = f["data"][:]
 
         # Load metadata
-        meta = f['metadata']
+        meta = f["metadata"]
         metadata = {
-            'n_voxels': meta.attrs['n_voxels'],
-            'n_timepoints': meta.attrs['n_timepoints'],
-            'was_scaled': meta.attrs.get('was_scaled', False),
-            'original_mean': meta.attrs.get('original_mean', None),
+            "n_voxels": meta.attrs["n_voxels"],
+            "n_timepoints": meta.attrs["n_timepoints"],
+            "was_scaled": meta.attrs.get("was_scaled", False),
+            "original_mean": meta.attrs.get("original_mean", None),
         }
 
         # Load optional metadata
-        if 'run_starts' in meta:
-            metadata['run_starts'] = meta['run_starts'][:]
+        if "run_starts" in meta:
+            metadata["run_starts"] = meta["run_starts"][:]
 
-        if 'affine' in meta:
-            metadata['affine'] = meta['affine'][:]
+        if "affine" in meta:
+            metadata["affine"] = meta["affine"][:]
 
-        if 'volume_shape' in meta.attrs:
-            metadata['volume_shape'] = tuple(meta.attrs['volume_shape'])
+        if "volume_shape" in meta.attrs:
+            metadata["volume_shape"] = tuple(meta.attrs["volume_shape"])
 
-        if 'input_files' in meta:
-            metadata['input_files'] = [s.decode() if isinstance(s, bytes) else s
-                                      for s in meta['input_files'][:]]
+        if "input_files" in meta:
+            metadata["input_files"] = [
+                s.decode() if isinstance(s, bytes) else s for s in meta["input_files"][:]
+            ]
 
     # Load NIfTI header from separate pickle file if it exists
-    header_pickle_path = Path(str(cache_path) + '.header.pkl')
+    header_pickle_path = Path(str(cache_path) + ".header.pkl")
     if header_pickle_path.exists():
         import pickle
-        with open(header_pickle_path, 'rb') as f:
-            metadata['nifti_header'] = pickle.load(f)
+
+        with open(header_pickle_path, "rb") as f:
+            metadata["nifti_header"] = pickle.load(f)
 
     elapsed = time.time() - start_time
 
-    print(f"   ✓ Loaded: {metadata['n_voxels']:,} voxels × {metadata['n_timepoints']:,} TPs in {elapsed:.1f}s")
-    if metadata['was_scaled']:
+    print(
+        f"   ✓ Loaded: {metadata['n_voxels']:,} voxels × {metadata['n_timepoints']:,} TPs in {elapsed:.1f}s"
+    )
+    if metadata["was_scaled"]:
         print("   ℹ️  Data was pre-scaled to mean=100")
 
     return data, metadata
@@ -231,9 +242,9 @@ def check_cache_valid(
         return False
 
     try:
-        with h5py.File(cache_path, 'r') as f:
+        with h5py.File(cache_path, "r") as f:
             expected_hash = _compute_file_hash(input_files)
-            cached_hash = f['metadata'].attrs.get('file_hash', '')
+            cached_hash = f["metadata"].attrs.get("file_hash", "")
             return expected_hash == cached_hash
     except (OSError, KeyError):
         return False

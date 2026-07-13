@@ -133,15 +133,15 @@ def invert_warp(
         yq = (jj + inv_yd).clamp(0, ny - 1)
         zq = (kk + inv_zd).clamp(0, nz - 1)
 
-        fx = trilinear_interpolate(
-            warp_xd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
-        ).reshape(nz, ny, nx)
-        fy = trilinear_interpolate(
-            warp_yd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
-        ).reshape(nz, ny, nx)
-        fz = trilinear_interpolate(
-            warp_zd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
-        ).reshape(nz, ny, nx)
+        fx = trilinear_interpolate(warp_xd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(
+            nz, ny, nx
+        )
+        fy = trilinear_interpolate(warp_yd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(
+            nz, ny, nx
+        )
+        fz = trilinear_interpolate(warp_zd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(
+            nz, ny, nx
+        )
 
         inv_xd = -fx
         inv_yd = -fy

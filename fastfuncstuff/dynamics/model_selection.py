@@ -119,6 +119,7 @@ def grid_search_bsds(
     *,
     show_progress: bool = True,
     n_jobs: int = 1,
+    worker_threads: int | None = None,
     **kwargs,
 ) -> list[GridResult]:
     """Held-out log-likelihood over a ``(n_states, max_ldim)`` grid, best first.
@@ -132,7 +133,8 @@ def grid_search_bsds(
     (``fork`` cannot carry a live CUDA context). The grid points are independent
     fits, so this is embarrassingly parallel. On a single GPU the workers
     time-slice the card — worthwhile when one fit leaves it underused; on CPU
-    each worker gets ``cpu_count // n_jobs`` threads. Results are identical to
+    each worker gets ``cpu_count // n_jobs`` threads (override with
+    ``worker_threads`` to bound the total CPU footprint). Results are identical to
     the sequential path (each grid point is deterministic in its seed); only the
     completion order differs, and the final list is sorted regardless.
     """
@@ -161,7 +163,11 @@ def grid_search_bsds(
     on_gpu = device is not None and str(device) != "cpu"
     # GPU workers: keep host dispatch lean (1 thread) so they don't oversubscribe
     # cores fighting to launch kernels. CPU workers: split the cores evenly.
-    num_threads = 1 if on_gpu else max(1, (os.cpu_count() or 1) // n_jobs)
+    # ``worker_threads`` overrides both (tests pass a small value to stay light).
+    if worker_threads is not None:
+        num_threads = max(1, worker_threads)
+    else:
+        num_threads = 1 if on_gpu else max(1, (os.cpu_count() or 1) // n_jobs)
 
     tasks = [(n_states, max_ldim, kwargs) for n_states, max_ldim in combos]
     results = []

@@ -1,4 +1,5 @@
 """Smoke tests for -add_fdr plumbing in glm/outputs.py."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -14,22 +15,20 @@ def test_inject_fdr_curves_writes_attrs(tmp_path):
     # 10×10×10×3 bucket: brick0 = beta, brick1 = t-stat, brick2 = F-stat
     nx, ny, nz = 10, 10, 10
     data = np.zeros((nx, ny, nz, 3), dtype=np.float32)
-    data[..., 0] = rng.standard_normal((nx, ny, nz))         # beta
-    data[..., 1] = rng.standard_normal((nx, ny, nz)) * 2.0   # t
+    data[..., 0] = rng.standard_normal((nx, ny, nz))  # beta
+    data[..., 1] = rng.standard_normal((nx, ny, nz)) * 2.0  # t
     # Add some "signal" voxels
     data[2:5, 2:5, 2:5, 1] += 4.0
-    data[..., 2] = rng.chisquare(2, (nx, ny, nz)) + 0.5      # F-ish
+    data[..., 2] = rng.chisquare(2, (nx, ny, nz)) + 0.5  # F-ish
 
     img = nib.Nifti1Image(data, affine=np.eye(4))
-    afni_xml = (
-        '<?xml version="1.0" ?>\n<AFNI_attributes self_idcode="X">\n</AFNI_attributes>\n'
-    )
+    afni_xml = '<?xml version="1.0" ?>\n<AFNI_attributes self_idcode="X">\n</AFNI_attributes>\n'
     img.header.extensions.append(nib.nifti1.Nifti1Extension(4, afni_xml.encode("utf-8")))
     bucket = tmp_path / "bucket.nii.gz"
     nib.save(img, str(bucket))
 
     fdr_specs = [
-        (1, "fitt", 50.0),         # t-stat sub-brick
+        (1, "fitt", 50.0),  # t-stat sub-brick
         (2, "fift", (3.0, 50.0)),  # F-stat sub-brick
     ]
     _inject_fdr_curves(bucket, fdr_specs)

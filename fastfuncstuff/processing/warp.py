@@ -66,7 +66,9 @@ from .weight import compute_weight_image
 _compile_cache: dict[str, Callable[..., Any]] = {}
 
 
-def _maybe_compile(fn: Callable[..., Any], name: str, device: torch.device, do_compile: bool) -> Callable[..., Any]:
+def _maybe_compile(
+    fn: Callable[..., Any], name: str, device: torch.device, do_compile: bool
+) -> Callable[..., Any]:
     """Return a compiled version of fn for CUDA, caching by name."""
     if device.type != "cuda" or not do_compile:
         return fn
@@ -246,14 +248,15 @@ class WarpState:
     last_level: int = 0  # highest refinement level executed (for pyramid hand-off)
 
     # Per-level optimizer-budget telemetry (batched path only); reset each level.
-    opt_steps_weighted: int = 0   # sum over batches of steps_run * B
+    opt_steps_weighted: int = 0  # sum over batches of steps_run * B
     opt_patches_counted: int = 0  # patches that went through the batched optimizer
-    opt_hit_budget: int = 0       # patches still improving at the iteration cap
+    opt_hit_budget: int = 0  # patches still improving at the iteration cap
 
 
 @dataclass
 class PatchSpec:
     """Specification for one patch in the grid."""
+
     ibot: int
     itop: int
     jbot: int
@@ -271,6 +274,7 @@ def _compute_padding(nx: int, ny: int, nz: int) -> tuple[int, int, int]:
     Uses ~12.34% of each dimension + 1, with minimum of 3 voxels per side.
     """
     import math
+
     pad_x = max(3, int(math.ceil(0.1234 * nx)) + 1)
     pad_y = max(3, int(math.ceil(0.1234 * ny)) + 1)
     pad_z = max(3, int(math.ceil(0.1234 * nz)) + 1)
@@ -281,7 +285,8 @@ def _pad_volume(vol: Tensor, pad_x: int, pad_y: int, pad_z: int) -> Tensor:
     """Zero-pad a 3D volume symmetrically."""
     # F.pad order: (x_left, x_right, y_left, y_right, z_left, z_right)
     import torch.nn.functional as F
-    return F.pad(vol, (pad_x, pad_x, pad_y, pad_y, pad_z, pad_z), mode='constant', value=0)
+
+    return F.pad(vol, (pad_x, pad_x, pad_y, pad_y, pad_z, pad_z), mode="constant", value=0)
 
 
 def qwarp(
@@ -341,8 +346,10 @@ def qwarp(
         base_p = _pad_volume(base, pad_x, pad_y, pad_z)
         source_p = _pad_volume(source, pad_x, pad_y, pad_z)
         if config.verb >= 1:
-            print(f"qwarp_torch: padding +{pad_x},{pad_y},{pad_z} => "
-                  f"{base_p.shape[2]}x{base_p.shape[1]}x{base_p.shape[0]}")
+            print(
+                f"qwarp_torch: padding +{pad_x},{pad_y},{pad_z} => "
+                f"{base_p.shape[2]}x{base_p.shape[1]}x{base_p.shape[0]}"
+            )
     else:
         base_p = base
         source_p = source
@@ -352,12 +359,20 @@ def qwarp(
     if weight is None:
         weight_p = compute_weight_image(base_p)
     else:
-        weight_p = _pad_volume(weight.float().to(device), pad_x, pad_y, pad_z) if (pad_x > 0 or pad_y > 0 or pad_z > 0) else weight.float().to(device)
+        weight_p = (
+            _pad_volume(weight.float().to(device), pad_x, pad_y, pad_z)
+            if (pad_x > 0 or pad_y > 0 or pad_z > 0)
+            else weight.float().to(device)
+        )
 
     if mask is None:
         mask_p = (weight_p > 0).byte()
     else:
-        mask_p = _pad_volume(mask.byte().to(device).float(), pad_x, pad_y, pad_z).byte() if (pad_x > 0 or pad_y > 0 or pad_z > 0) else mask.byte().to(device)
+        mask_p = (
+            _pad_volume(mask.byte().to(device).float(), pad_x, pad_y, pad_z).byte()
+            if (pad_x > 0 or pad_y > 0 or pad_z > 0)
+            else mask.byte().to(device)
+        )
 
     state = WarpState(nx=nx, ny=ny, nz=nz)
 
@@ -371,9 +386,7 @@ def qwarp(
             state.xd = initial_warp[0].float().to(device)
             state.yd = initial_warp[1].float().to(device)
             state.zd = initial_warp[2].float().to(device)
-        state.warped_source = warp_image(
-            source_p, state.xd, state.yd, state.zd, mode=config.interp
-        )
+        state.warped_source = warp_image(source_p, state.xd, state.yd, state.zd, mode=config.interp)
     else:
         state.xd = torch.zeros(nz, ny, nx, device=device)
         state.yd = torch.zeros(nz, ny, nx, device=device)
@@ -389,7 +402,7 @@ def qwarp(
     # Single pass through the total warp; final_interp (wsinc5 by default, like
     # 3dQwarp) is where output sharpness comes from.
     warped_full = warp_image(source_p, state.xd, state.yd, state.zd, mode=config.final_interp)
-    warped = warped_full[pad_z:pad_z+nz_orig, pad_y:pad_y+ny_orig, pad_x:pad_x+nx_orig]
+    warped = warped_full[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
 
     # Return full padded warp field (caller/io.py handles grid info)
     return warped, state.xd, state.yd, state.zd
@@ -399,10 +412,20 @@ def qwarp(
 # Patch grid and checkerboard decomposition
 # ---------------------------------------------------------------------------
 
+
 def _generate_patch_grid(
-    ibbb: int, ittt: int, jbbb: int, jttt: int, kbbb: int, kttt: int,
-    xwid: int, ywid: int, zwid: int,
-    xdel: int, ydel: int, zdel: int,
+    ibbb: int,
+    ittt: int,
+    jbbb: int,
+    jttt: int,
+    kbbb: int,
+    kttt: int,
+    xwid: int,
+    ywid: int,
+    zwid: int,
+    xdel: int,
+    ydel: int,
+    zdel: int,
 ) -> list[PatchSpec]:
     """Enumerate all patch positions in the sweep grid."""
     patches = []
@@ -427,12 +450,19 @@ def _generate_patch_grid(
                 if ktop >= kttt:
                     kbot = ktop + 1 - zwid
 
-                patches.append(PatchSpec(
-                    ibot=ibot, itop=itop,
-                    jbot=jbot, jtop=jtop,
-                    kbot=kbot, ktop=ktop,
-                    gi=gi, gj=gj, gk=gk,
-                ))
+                patches.append(
+                    PatchSpec(
+                        ibot=ibot,
+                        itop=itop,
+                        jbot=jbot,
+                        jtop=jtop,
+                        kbot=kbot,
+                        ktop=ktop,
+                        gi=gi,
+                        gj=gj,
+                        gk=gk,
+                    )
+                )
 
                 if ktop >= kttt:
                     break
@@ -465,8 +495,11 @@ def _checkerboard_phases(
 
 def _filter_patches(
     patches: list[PatchSpec],
-    weight: Tensor, mask: Tensor,
-    nx: int, ny: int, nz: int,
+    weight: Tensor,
+    mask: Tensor,
+    nx: int,
+    ny: int,
+    nz: int,
 ) -> list[PatchSpec]:
     """Filter out patches with insufficient weight/mask coverage."""
     w_avg = float(weight[mask > 0].mean().item()) if (mask > 0).any() else 1.0
@@ -480,8 +513,8 @@ def _filter_patches(
         if nxh < 5 and nyh < 5 and nzh < 5:
             continue
 
-        m_patch = mask[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1]
-        w_patch = weight[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1]
+        m_patch = mask[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1]
+        w_patch = weight[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1]
         n_masked = int(m_patch.sum().item())
         w_sum = float(w_patch.sum().item())
 
@@ -498,8 +531,13 @@ def _filter_patches(
 # Basis type configuration
 # ---------------------------------------------------------------------------
 
+
 def _get_basis_config(
-    basis_type: str, nxh: int, nyh: int, nzh: int, device: torch.device,
+    basis_type: str,
+    nxh: int,
+    nyh: int,
+    nzh: int,
+    device: torch.device,
     hfactor: float = 1.0,
 ):
     """Get basis functions and parameters for a given type.
@@ -540,13 +578,14 @@ def _compute_hfactor(patch_size: int, patch_size_lev1: int, hfactor_q: float = 0
     alpha = log(hfactor_q) / log(0.1).
     """
     import math
+
     if hfactor_q >= 1.0 or hfactor_q < 0.1 or patch_size_lev1 <= 0:
         return 1.0
     if patch_size >= patch_size_lev1:
         return 1.0
     prat = patch_size / patch_size_lev1
     alpha = math.log(hfactor_q) / math.log(0.1)
-    return prat ** alpha
+    return prat**alpha
 
 
 def _global_correlation(
@@ -581,8 +620,13 @@ def _global_correlation(
 
 
 def _warpomatic_pyramid(
-    base: Tensor, source: Tensor, weight: Tensor, mask: Tensor,
-    state: WarpState, config: QwarpConfig, device: torch.device,
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    mask: Tensor,
+    state: WarpState,
+    config: QwarpConfig,
+    device: torch.device,
 ) -> None:
     """Multi-octave coarse-to-fine resolution pyramid (opt-in, pyramid_factor>1).
 
@@ -656,7 +700,9 @@ def _warpomatic_pyramid(
             start_level = max(1, plast - 1)
             if config.verb >= 1:
                 tag = "full res" if scale == 1 else f"1/{scale}"
-                print(f"qwarp_torch: pyramid {tag} at {gx}x{gy}x{gz}, refine from lev={start_level}")
+                print(
+                    f"qwarp_torch: pyramid {tag} at {gx}x{gy}x{gz}, refine from lev={start_level}"
+                )
 
         # Recurse with pyramid off. Per-level dumps (-partials/-partial_warps)
         # only fire at full resolution, not on the downsampled octaves.
@@ -682,9 +728,15 @@ def _warpomatic_pyramid(
 # Main warpomatic loop
 # ---------------------------------------------------------------------------
 
+
 def _warpomatic(
-    base: Tensor, source: Tensor, weight: Tensor, mask: Tensor,
-    state: WarpState, config: QwarpConfig, device: torch.device,
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    mask: Tensor,
+    state: WarpState,
+    config: QwarpConfig,
+    device: torch.device,
 ) -> None:
     """Main multi-level patch optimization loop (batched GPU version).
 
@@ -716,17 +768,13 @@ def _warpomatic(
     blok_index_vol = None
     nblok = 0
     if config.cost_method in ("lpc", "lpa"):
-        bs = assign_bloks(
-            (nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0)
-        )
+        bs = assign_bloks((nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0))
         blok_index_vol = bs.index.reshape(nz, ny, nx)
         nblok = bs.nblok
 
     # Compute initial cost so it's never the 666.666 sentinel
     with torch.no_grad():
-        state.cost = _global_correlation(
-            base, state.warped_source, weight, base_clip, source_clip
-        )
+        state.cost = _global_correlation(base, state.warped_source, weight, base_clip, source_clip)
 
     # --- Level 0 bounds (always computed for level 1+ patch sizing) ---
     xwid = (imax - imin) // 8
@@ -756,8 +804,15 @@ def _warpomatic(
 
         if use_gpu_lev0:
             lev0_patch = PatchSpec(
-                ibot=ibbb, itop=ittt, jbot=jbbb, jtop=jttt, kbot=kbbb, ktop=kttt,
-                gi=0, gj=0, gk=0,
+                ibot=ibbb,
+                itop=ittt,
+                jbot=jbbb,
+                jtop=jttt,
+                kbot=kbbb,
+                ktop=kttt,
+                gi=0,
+                gj=0,
+                gk=0,
             )
             nxh0 = ittt - ibbb + 1
             nyh0 = jttt - jbbb + 1
@@ -785,13 +840,31 @@ def _warpomatic(
         for basis_type in pbar:
             if use_gpu_lev0:
                 basis0, half_widths0, param_max0 = _get_basis_config(
-                    basis_type, nxh0, nyh0, nzh0, device, hfactor=1.0,
+                    basis_type,
+                    nxh0,
+                    nyh0,
+                    nzh0,
+                    device,
+                    hfactor=1.0,
                 )
                 _improve_warp_batched(
-                    base, source, weight, mask, state, config, device,
-                    [lev0_patch], basis0, half_widths0, param_max0,
-                    ii0_flat, jj0_flat, kk0_flat,
-                    nxh0, nyh0, nzh0,
+                    base,
+                    source,
+                    weight,
+                    mask,
+                    state,
+                    config,
+                    device,
+                    [lev0_patch],
+                    basis0,
+                    half_widths0,
+                    param_max0,
+                    ii0_flat,
+                    jj0_flat,
+                    kk0_flat,
+                    nxh0,
+                    nyh0,
+                    nzh0,
                     do_xyz=do_xyz,
                     axis_weights=axis_w,
                     use_penalty=False,
@@ -804,8 +877,19 @@ def _warpomatic(
                 )
             else:
                 _improve_warp_serial(
-                    base, source, weight, mask, state, config, device,
-                    ibbb, ittt, jbbb, jttt, kbbb, kttt,
+                    base,
+                    source,
+                    weight,
+                    mask,
+                    state,
+                    config,
+                    device,
+                    ibbb,
+                    ittt,
+                    jbbb,
+                    jttt,
+                    kbbb,
+                    kttt,
                     basis_type=basis_type,
                     do_xyz=do_xyz,
                     axis_weights=axis_w,
@@ -828,9 +912,7 @@ def _warpomatic(
         if config.verb >= 1:
             elapsed = time.time() - t0
             if _tqdm is not None and isinstance(pbar, _tqdm):
-                pbar.set_postfix_str(
-                    f"cost={first_cost:.5f}=>{state.cost:.5f} {elapsed:.1f}s"
-                )
+                pbar.set_postfix_str(f"cost={first_cost:.5f}=>{state.cost:.5f} {elapsed:.1f}s")
                 pbar.close()
             else:
                 print(f" done [cost:{first_cost:.5f}==>{state.cost:.5f}] ({elapsed:.1f}s)")
@@ -859,7 +941,7 @@ def _warpomatic(
 
         state.last_level = lev
 
-        flev = config.shrink ** lev
+        flev = config.shrink**lev
         xwid = int(xwid0 * flev)
         ywid = int(ywid0 * flev)
         zwid = int(zwid0 * flev)
@@ -911,7 +993,7 @@ def _warpomatic(
         # -inilev run resumes at a high lev_start, and the old (lev-lev_start+1)
         # reset the ramp there, under-penalizing the fine levels and letting
         # them over-warp. For a full run (lev_start=1) this is identical.
-        pen_lev = lev ** 0.333
+        pen_lev = lev**0.333
         pen_fff = config.penalty_factor * min(3.21, pen_lev)
         use_pen = pen_fff > 0 and lev >= config.penalty_first_level
         if lev == config.penalty_first_level:
@@ -935,8 +1017,18 @@ def _warpomatic(
 
         # Generate patch grid and filter
         all_patches = _generate_patch_grid(
-            ibbb, ittt, jbbb, jttt, kbbb, kttt,
-            xwid, ywid, zwid, xdel, ydel, zdel,
+            ibbb,
+            ittt,
+            jbbb,
+            jttt,
+            kbbb,
+            kttt,
+            xwid,
+            ywid,
+            zwid,
+            xdel,
+            ydel,
+            zdel,
         )
         valid_patches = _filter_patches(all_patches, weight, mask, nx, ny, nz)
         phases = _checkerboard_phases(valid_patches)
@@ -948,7 +1040,12 @@ def _warpomatic(
         max_patch = max(nxh, nyh, nzh)
         hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
-            basis_type, nxh, nyh, nzh, device, hfactor=hfactor,
+            basis_type,
+            nxh,
+            nyh,
+            nzh,
+            device,
+            hfactor=hfactor,
         )
 
         # Pre-compute shared coordinate grids
@@ -988,9 +1085,9 @@ def _warpomatic(
             lev_pbar.set_postfix_str(f"cost={state.cost:.5f}")
         elif config.verb >= 1:
             print(
-                f"lev={lev} patch={xwid}x{ywid}x{zwid} "
-                f"patches={n_valid} [{time.time()-t0:.0f}s]",
-                end="", flush=True,
+                f"lev={lev} patch={xwid}x{ywid}x{zwid} patches={n_valid} [{time.time() - t0:.0f}s]",
+                end="",
+                flush=True,
             )
 
         for _pass in range(nlevr):
@@ -1004,22 +1101,45 @@ def _warpomatic(
                     continue
 
                 # Split into same-size (batchable) and odd-size patches
-                good = [p for p in phase_patches
-                        if (p.itop - p.ibot + 1 == nxh and
-                            p.jtop - p.jbot + 1 == nyh and
-                            p.ktop - p.kbot + 1 == nzh)]
-                odd = [p for p in phase_patches
-                       if (p.itop - p.ibot + 1 != nxh or
-                           p.jtop - p.jbot + 1 != nyh or
-                           p.ktop - p.kbot + 1 != nzh)]
+                good = [
+                    p
+                    for p in phase_patches
+                    if (
+                        p.itop - p.ibot + 1 == nxh
+                        and p.jtop - p.jbot + 1 == nyh
+                        and p.ktop - p.kbot + 1 == nzh
+                    )
+                ]
+                odd = [
+                    p
+                    for p in phase_patches
+                    if (
+                        p.itop - p.ibot + 1 != nxh
+                        or p.jtop - p.jbot + 1 != nyh
+                        or p.ktop - p.kbot + 1 != nzh
+                    )
+                ]
 
                 if good:
                     # BATCHED GPU path (works for B>=1)
                     _improve_warp_batched(
-                        base, source, weight, mask, state, config, device,
-                        good, basis, half_widths, param_max,
-                        ii_flat, jj_flat, kk_flat,
-                        nxh, nyh, nzh,
+                        base,
+                        source,
+                        weight,
+                        mask,
+                        state,
+                        config,
+                        device,
+                        good,
+                        basis,
+                        half_widths,
+                        param_max,
+                        ii_flat,
+                        jj_flat,
+                        kk_flat,
+                        nxh,
+                        nyh,
+                        nzh,
                         do_xyz=do_xyz,
                         axis_weights=axis_w,
                         use_penalty=use_pen,
@@ -1033,8 +1153,19 @@ def _warpomatic(
                 # Serial fallback for odd-sized boundary patches
                 for p in odd:
                     _improve_warp_serial(
-                        base, source, weight, mask, state, config, device,
-                        p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop,
+                        base,
+                        source,
+                        weight,
+                        mask,
+                        state,
+                        config,
+                        device,
+                        p.ibot,
+                        p.itop,
+                        p.jbot,
+                        p.jtop,
+                        p.kbot,
+                        p.ktop,
                         basis_type=basis_type,
                         do_xyz=do_xyz,
                         axis_weights=axis_w,
@@ -1059,6 +1190,7 @@ def _warpomatic(
         smooth_sigma = 1.5
         with torch.no_grad():
             from .weight import _gaussian_smooth_3d
+
             state.xd = _gaussian_smooth_3d(state.xd, smooth_sigma)
             state.yd = _gaussian_smooth_3d(state.yd, smooth_sigma)
             state.zd = _gaussian_smooth_3d(state.zd, smooth_sigma)
@@ -1068,7 +1200,9 @@ def _warpomatic(
                 state.yd.clamp_(-config.maxdisp, config.maxdisp)
                 state.zd.clamp_(-config.maxdisp, config.maxdisp)
             # Refresh warped_source with smoothed warp
-            state.warped_source = warp_image(source, state.xd, state.yd, state.zd, mode=config.interp)
+            state.warped_source = warp_image(
+                source, state.xd, state.yd, state.zd, mode=config.interp
+            )
 
         # Compute actual global correlation after this level
         with torch.no_grad():
@@ -1083,7 +1217,9 @@ def _warpomatic(
             worsened = state.cost
             with torch.no_grad():
                 state.xd, state.yd, state.zd = saved_xd, saved_yd, saved_zd
-                state.warped_source = warp_image(source, state.xd, state.yd, state.zd, mode=config.interp)
+                state.warped_source = warp_image(
+                    source, state.xd, state.yd, state.zd, mode=config.interp
+                )
             state.cost = cost_at_start
             if config.verb >= 1:
                 msg = (
@@ -1129,8 +1265,10 @@ def _warpomatic(
             threshold = config.level_stop_tol * abs(cost_at_start)
             if improvement < threshold:
                 if config.verb >= 1:
-                    print(f"  Early stop: improvement {improvement:.6f} < "
-                          f"threshold {threshold:.6f} ({config.level_stop_tol:.1e})")
+                    print(
+                        f"  Early stop: improvement {improvement:.6f} < "
+                        f"threshold {threshold:.6f} ({config.level_stop_tol:.1e})"
+                    )
                 break
 
 
@@ -1138,15 +1276,25 @@ def _warpomatic(
 # Batched GPU patch optimization (the fast path)
 # ---------------------------------------------------------------------------
 
+
 def _improve_warp_batched(
-    base: Tensor, source: Tensor, weight: Tensor, mask: Tensor,
-    state: WarpState, config: QwarpConfig, device: torch.device,
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    mask: Tensor,
+    state: WarpState,
+    config: QwarpConfig,
+    device: torch.device,
     patches: list[PatchSpec],
     basis: Tensor,
     half_widths: tuple[float, float, float],
     param_max: float,
-    ii_flat: Tensor, jj_flat: Tensor, kk_flat: Tensor,
-    nxh: int, nyh: int, nzh: int,
+    ii_flat: Tensor,
+    jj_flat: Tensor,
+    kk_flat: Tensor,
+    nxh: int,
+    nyh: int,
+    nzh: int,
     do_xyz: tuple[bool, bool, bool] = (True, True, True),
     axis_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
     use_penalty: bool = False,
@@ -1184,18 +1332,24 @@ def _improve_warp_batched(
     kbots = torch.tensor([p.kbot for p in patches], device=device, dtype=torch.float32)
 
     # Gather fixed data: base, weight, mask as (B, V) tensors
-    base_patches = torch.stack([
-        base[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1].reshape(-1)
-        for p in patches
-    ])
-    weight_patches = torch.stack([
-        weight[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1].reshape(-1)
-        for p in patches
-    ])
-    mask_patches = torch.stack([
-        mask[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1].reshape(-1).float()
-        for p in patches
-    ])
+    base_patches = torch.stack(
+        [
+            base[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1)
+            for p in patches
+        ]
+    )
+    weight_patches = torch.stack(
+        [
+            weight[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1)
+            for p in patches
+        ]
+    )
+    mask_patches = torch.stack(
+        [
+            mask[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1).float()
+            for p in patches
+        ]
+    )
 
     # Cost selection: blok-based local Pearson (lpc/lpa, AFNI-faithful),
     # the older convolution LPA (lpa_alt), or INCOR (pearson/pearclp).
@@ -1203,10 +1357,14 @@ def _improve_warp_batched(
     use_conv_lpa = config.cost_method == "lpa_alt"
     blok_prep = None
     if use_blok:
-        blok_idx_patches = torch.stack([
-            blok_index_vol[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1].reshape(-1)
-            for p in patches
-        ])
+        blok_idx_patches = torch.stack(
+            [
+                blok_index_vol[
+                    p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1
+                ].reshape(-1)
+                for p in patches
+            ]
+        )
         blok_prep = prepare_blok_pairs(blok_idx_patches, nblok)
         _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
     batch_incor = None
@@ -1216,12 +1374,14 @@ def _improve_warp_batched(
             base_clip=base_clip,
             source_clip=source_clip,
         )
-        patch_slices = [
-            (p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop) for p in patches
-        ]
+        patch_slices = [(p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop) for p in patches]
         batch_incor.precompute_fixed_parts(
-            base, state.warped_source, weight, patch_slices,
-            base_patches=base_patches, weight_patches=weight_patches,
+            base,
+            state.warped_source,
+            weight,
+            patch_slices,
+            base_patches=base_patches,
+            weight_patches=weight_patches,
         )
 
     # Pre-compute external penalty if needed (vectorized: global sum minus each patch)
@@ -1232,15 +1392,20 @@ def _improve_warp_batched(
             energy_global = je_global + se_global
             global_energy_sum = energy_global.sum()
             # Gather patch energies as (B,) via stacking
-            patch_energies = torch.stack([
-                energy_global[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1].sum()
-                for p in patches
-            ])
+            patch_energies = torch.stack(
+                [
+                    energy_global[
+                        p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1
+                    ].sum()
+                    for p in patches
+                ]
+            )
             external_pen = global_energy_sum - patch_energies
 
     # Axis weight scales
-    _ax_scales = torch.tensor([axis_weights[d] for d in active_dims],
-                              device=device, dtype=torch.float32)
+    _ax_scales = torch.tensor(
+        [axis_weights[d] for d in active_dims], device=device, dtype=torch.float32
+    )
 
     # Pre-stack global warp as 3-channel volume ONCE (avoids re-stacking
     # every optimizer iteration -- saves ~45 MB of memory copies per iter)
@@ -1254,7 +1419,9 @@ def _improve_warp_batched(
     for dim_i in active_dims:
         offset = dim_i * n_basis
         scale = axis_weights[dim_i]
-        expand_mat[idx:idx+n_basis, offset:offset+n_basis] = scale * torch.eye(n_basis, device=device)
+        expand_mat[idx : idx + n_basis, offset : offset + n_basis] = scale * torch.eye(
+            n_basis, device=device
+        )
         idx += n_basis
 
     # Pre-compute coordinate base offsets: (B, V), constant per phase
@@ -1270,31 +1437,53 @@ def _improve_warp_batched(
     def batched_cost(active_params: Tensor) -> Tensor:
         """(B, n_active) -> (B,) costs. Differentiable."""
         # Expand active params to full params with axis weights
-        full_params = active_params @ expand_mat  # (B, n_active) @ (n_active, n_total) → (B, n_total)
+        full_params = (
+            active_params @ expand_mat
+        )  # (B, n_active) @ (n_active, n_total) → (B, n_total)
 
         # Batched basis evaluation: (B, V) displacements
         hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
 
         # Batched compose + interpolate (fused 4-ch: source + warp in one grid_sample)
         warped_vals, ah_xd, ah_yd, ah_zd = _compose(
-            source, state.xd, state.yd, state.zd,
-            hxd, hyd, hzd,
-            ii_flat, jj_flat, kk_flat,
-            ibots, jbots, kbots,
-            nx, ny, nz,
+            source,
+            state.xd,
+            state.yd,
+            state.zd,
+            hxd,
+            hyd,
+            hzd,
+            ii_flat,
+            jj_flat,
+            kk_flat,
+            ibots,
+            jbots,
+            kbots,
+            nx,
+            ny,
+            nz,
             global_warp_3ch=global_warp_3ch,
-            base_i=base_i, base_j=base_j, base_k=base_k,
+            base_i=base_i,
+            base_j=base_j,
+            base_k=base_k,
         )
 
         warped_vals = warped_vals * mask_patches
 
         # Batched cost: (B,) (all conventions are higher == better here)
         if use_blok:
-            corr = _blok_value(base_patches, warped_vals, weight_patches, blok_prep, config.lpc_ppow)
+            corr = _blok_value(
+                base_patches, warped_vals, weight_patches, blok_prep, config.lpc_ppow
+            )
         elif use_conv_lpa:
             corr = batched_lpa_cost(
-                base_patches, warped_vals, weight_patches,
-                nzh, nyh, nxh, sigma=config.lpa_sigma,
+                base_patches,
+                warped_vals,
+                weight_patches,
+                nzh,
+                nyh,
+                nxh,
+                sigma=config.lpa_sigma,
                 kernel_type=config.lpa_kernel,
             )
         else:
@@ -1314,7 +1503,11 @@ def _improve_warp_batched(
 
     # Run batched Adam optimizer
     best_params, _best_costs, opt_stats = optimize_warp_params_batched(
-        batched_cost, B, n_active, param_max, device,
+        batched_cost,
+        B,
+        n_active,
+        param_max,
+        device,
         max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
         lr=config.batch_optimizer_lr,
         tolerance=config.batch_optimizer_tol,
@@ -1331,25 +1524,42 @@ def _improve_warp_batched(
 
         hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
         warped_vals, ah_xd, ah_yd, ah_zd = _compose(
-            source, state.xd, state.yd, state.zd,
-            hxd, hyd, hzd,
-            ii_flat, jj_flat, kk_flat,
-            ibots, jbots, kbots,
-            nx, ny, nz,
+            source,
+            state.xd,
+            state.yd,
+            state.zd,
+            hxd,
+            hyd,
+            hzd,
+            ii_flat,
+            jj_flat,
+            kk_flat,
+            ibots,
+            jbots,
+            kbots,
+            nx,
+            ny,
+            nz,
             global_warp_3ch=global_warp_3ch,
-            base_i=base_i, base_j=base_j, base_k=base_k,
+            base_i=base_i,
+            base_j=base_j,
+            base_k=base_k,
         )
 
         # Write back warp AND warped_source (non-overlapping patches, safe)
         for idx_p, p in enumerate(patches):
-            state.xd[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1] = \
-                ah_xd[idx_p].reshape(nzh, nyh, nxh)
-            state.yd[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1] = \
-                ah_yd[idx_p].reshape(nzh, nyh, nxh)
-            state.zd[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1] = \
-                ah_zd[idx_p].reshape(nzh, nyh, nxh)
-            state.warped_source[p.kbot:p.ktop+1, p.jbot:p.jtop+1, p.ibot:p.itop+1] = \
+            state.xd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_xd[
+                idx_p
+            ].reshape(nzh, nyh, nxh)
+            state.yd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_yd[
+                idx_p
+            ].reshape(nzh, nyh, nxh)
+            state.zd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_zd[
+                idx_p
+            ].reshape(nzh, nyh, nxh)
+            state.warped_source[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = (
                 warped_vals[idx_p].reshape(nzh, nyh, nxh)
+            )
 
     state.patches_done += B
 
@@ -1408,15 +1618,24 @@ class MultiWarpState:
 
 
 def _improve_warp_batched_multi(
-    base: Tensor, sources_all: Tensor, weight: Tensor, mask: Tensor,
-    mstate: MultiWarpState, config: QwarpConfig, device: torch.device,
+    base: Tensor,
+    sources_all: Tensor,
+    weight: Tensor,
+    mask: Tensor,
+    mstate: MultiWarpState,
+    config: QwarpConfig,
+    device: torch.device,
     active_idx: Tensor,
     patches: list[PatchSpec],
     basis: Tensor,
     half_widths: tuple[float, float, float],
     param_max: float,
-    ii_flat: Tensor, jj_flat: Tensor, kk_flat: Tensor,
-    nxh: int, nyh: int, nzh: int,
+    ii_flat: Tensor,
+    jj_flat: Tensor,
+    kk_flat: Tensor,
+    nxh: int,
+    nyh: int,
+    nzh: int,
     do_xyz: tuple[bool, bool, bool] = (True, True, True),
     axis_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
     use_penalty: bool = False,
@@ -1470,10 +1689,10 @@ def _improve_warp_batched_multi(
     flat_idx = (base_k.long() * ny + base_j.long()) * nx + base_i.long()  # (P, V)
     flat_all = flat_idx.reshape(-1)  # (P*V,)
 
-    base_patches = base.reshape(-1)[flat_idx]        # (P, V)
+    base_patches = base.reshape(-1)[flat_idx]  # (P, V)
     weight_patches = weight.reshape(-1)[flat_idx]
     mask_patches = mask.reshape(-1)[flat_idx].float()
-    base_rep = base_patches.repeat(Na, 1)      # (B, V)
+    base_rep = base_patches.repeat(Na, 1)  # (B, V)
     weight_rep = weight_patches.repeat(Na, 1)  # (B, V)
 
     # Only the *local* costs (within-patch) are shareable across volumes here:
@@ -1482,7 +1701,6 @@ def _improve_warp_batched_multi(
     # "outside-patch" fixed statistics, so it can't be tiled -- qwarp_batch
     # guards against those methods before reaching this point.
     use_blok = config.cost_method in ("lpc", "lpa")
-    use_conv_lpa = config.cost_method == "lpa_alt"
     blok_prep = None
     _blok_value = None
     if use_blok:
@@ -1493,7 +1711,7 @@ def _improve_warp_batched_multi(
         _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
 
     # Per-volume source + warp for the active subset.
-    src = sources_all[active_idx]                     # (Na, nz, ny, nx)
+    src = sources_all[active_idx]  # (Na, nz, ny, nx)
     xd_a = mstate.xd_all[active_idx]
     yd_a = mstate.yd_all[active_idx]
     zd_a = mstate.zd_all[active_idx]
@@ -1512,7 +1730,7 @@ def _improve_warp_batched_multi(
                 )
                 energy = (je + se).reshape(-1)
                 patch_e = energy[flat_idx].sum(dim=1)  # (P,)
-                external_pen[a * P:(a + 1) * P] = energy.sum() - patch_e
+                external_pen[a * P : (a + 1) * P] = energy.sum() - patch_e
 
     # Active-param -> full-param expansion with axis weights (shared).
     expand_mat = torch.zeros(n_active, n_total, device=device)
@@ -1520,7 +1738,9 @@ def _improve_warp_batched_multi(
     for dim_i in active_dims:
         offset = dim_i * n_basis
         scale = axis_weights[dim_i]
-        expand_mat[idx:idx+n_basis, offset:offset+n_basis] = scale * torch.eye(n_basis, device=device)
+        expand_mat[idx : idx + n_basis, offset : offset + n_basis] = scale * torch.eye(
+            n_basis, device=device
+        )
         idx += n_basis
 
     def batched_cost(active_params: Tensor) -> Tensor:
@@ -1532,9 +1752,19 @@ def _improve_warp_batched_multi(
         hyd = hyd.reshape(Na, P, -1)
         hzd = hzd.reshape(Na, P, -1)
         warped_vals, ah_xd, ah_yd, ah_zd = batched_compose_and_interpolate_multi(
-            src, global_warp_3ch, hxd, hyd, hzd, base_i, base_j, base_k, nx, ny, nz,
+            src,
+            global_warp_3ch,
+            hxd,
+            hyd,
+            hzd,
+            base_i,
+            base_j,
+            base_k,
+            nx,
+            ny,
+            nz,
         )
-        warped_vals = warped_vals * mask_patches[None]   # (Na, P, V)
+        warped_vals = warped_vals * mask_patches[None]  # (Na, P, V)
         warped_flat = warped_vals.reshape(B, -1)
 
         if use_blok:
@@ -1542,8 +1772,14 @@ def _improve_warp_batched_multi(
             corr = _blok_value(base_rep, warped_flat, weight_rep, blok_prep, config.lpc_ppow)
         else:  # use_conv_lpa
             corr = batched_lpa_cost(
-                base_rep, warped_flat, weight_rep, nzh, nyh, nxh,
-                sigma=config.lpa_sigma, kernel_type=config.lpa_kernel,
+                base_rep,
+                warped_flat,
+                weight_rep,
+                nzh,
+                nyh,
+                nxh,
+                sigma=config.lpa_sigma,
+                kernel_type=config.lpa_kernel,
             )
         cost = -corr
 
@@ -1555,7 +1791,11 @@ def _improve_warp_batched_multi(
         return cost
 
     best_params, _best_costs, opt_stats = optimize_warp_params_batched(
-        batched_cost, B, n_active, param_max, device,
+        batched_cost,
+        B,
+        n_active,
+        param_max,
+        device,
         max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
         lr=config.batch_optimizer_lr,
         tolerance=config.batch_optimizer_tol,
@@ -1573,25 +1813,42 @@ def _improve_warp_batched_multi(
         hyd = hyd.reshape(Na, P, -1)
         hzd = hzd.reshape(Na, P, -1)
         warped_vals, ah_xd, ah_yd, ah_zd = batched_compose_and_interpolate_multi(
-            src, global_warp_3ch, hxd, hyd, hzd, base_i, base_j, base_k, nx, ny, nz,
+            src,
+            global_warp_3ch,
+            hxd,
+            hyd,
+            hzd,
+            base_i,
+            base_j,
+            base_k,
+            nx,
+            ny,
+            nz,
         )
         # Scatter all patches of all active volumes in one indexed assignment per
         # field. Patches within a phase are non-overlapping, so flat_all has no
         # duplicate voxel per volume -- the write is well-defined. (Replaces an
         # Na*P Python loop that fired a tiny kernel per patch.)
-        rows = active_idx.unsqueeze(1)      # (Na, 1)
-        cols = flat_all.unsqueeze(0)        # (1, P*V)
+        rows = active_idx.unsqueeze(1)  # (Na, 1)
+        cols = flat_all.unsqueeze(0)  # (1, P*V)
         mstate.xd_all.view(mstate.xd_all.shape[0], -1)[rows, cols] = ah_xd.reshape(Na, -1)
         mstate.yd_all.view(mstate.yd_all.shape[0], -1)[rows, cols] = ah_yd.reshape(Na, -1)
         mstate.zd_all.view(mstate.zd_all.shape[0], -1)[rows, cols] = ah_zd.reshape(Na, -1)
-        mstate.warped_all.view(mstate.warped_all.shape[0], -1)[rows, cols] = warped_vals.reshape(Na, -1)
+        mstate.warped_all.view(mstate.warped_all.shape[0], -1)[rows, cols] = warped_vals.reshape(
+            Na, -1
+        )
 
     mstate.patches_done += B
 
 
 def _warpomatic_multi(
-    base: Tensor, sources_all: Tensor, weight: Tensor, mask: Tensor,
-    mstate: MultiWarpState, config: QwarpConfig, device: torch.device,
+    base: Tensor,
+    sources_all: Tensor,
+    weight: Tensor,
+    mask: Tensor,
+    mstate: MultiWarpState,
+    config: QwarpConfig,
+    device: torch.device,
 ) -> None:
     """Source-batched multi-level loop; N volumes share one reference.
 
@@ -1615,16 +1872,12 @@ def _warpomatic_multi(
     base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
     # Source clip is per-volume in the single path; use each volume's own but a
     # shared base clip. Compute per-volume source clips up front.
-    source_clips = [
-        _auto_clip(sources_all[v].reshape(-1), weight.reshape(-1)) for v in range(N)
-    ]
+    source_clips = [_auto_clip(sources_all[v].reshape(-1), weight.reshape(-1)) for v in range(N)]
 
     blok_index_vol = None
     nblok = 0
     if config.cost_method in ("lpc", "lpa"):
-        bs = assign_bloks(
-            (nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0)
-        )
+        bs = assign_bloks((nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0))
         blok_index_vol = bs.index.reshape(nz, ny, nx)
         nblok = bs.nblok
 
@@ -1654,8 +1907,15 @@ def _warpomatic_multi(
     # --- Level 0: global warp (single patch), all volumes ---
     if config.start_level == 0:
         lev0_patch = PatchSpec(
-            ibot=ibbb, itop=ittt, jbot=jbbb, jtop=jttt, kbot=kbbb, ktop=kttt,
-            gi=0, gj=0, gk=0,
+            ibot=ibbb,
+            itop=ittt,
+            jbot=jbbb,
+            jtop=jttt,
+            kbot=kbbb,
+            ktop=kttt,
+            gi=0,
+            gj=0,
+            gk=0,
         )
         nxh0, nyh0, nzh0 = ittt - ibbb + 1, jttt - jbbb + 1, kttt - kbbb + 1
         kk0, jj0, ii0 = torch.meshgrid(
@@ -1670,23 +1930,47 @@ def _warpomatic_multi(
         lev0_iter = ["cubic_lite", "cubic", "quintic_lite"]
         if config.verb >= 1 and _tqdm is not None:
             lev0_iter = _tqdm(
-                lev0_iter, desc=f"batch[{N}] lev=0", leave=True,
+                lev0_iter,
+                desc=f"batch[{N}] lev=0",
+                leave=True,
                 bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]{postfix}",
             )
         for basis_type in lev0_iter:
-            basis0, hw0, pmax0 = _get_basis_config(basis_type, nxh0, nyh0, nzh0, device, hfactor=1.0)
+            basis0, hw0, pmax0 = _get_basis_config(
+                basis_type, nxh0, nyh0, nzh0, device, hfactor=1.0
+            )
             _improve_warp_batched_multi(
-                base, sources_all, weight, mask, mstate, config, device,
-                all_idx, [lev0_patch], basis0, hw0, pmax0, ii0f, jj0f, kk0f,
-                nxh0, nyh0, nzh0, do_xyz=do_xyz, axis_weights=axis_w,
-                use_penalty=False, pen_fac=0.0,
-                base_clip=base_clip, source_clip=None,
+                base,
+                sources_all,
+                weight,
+                mask,
+                mstate,
+                config,
+                device,
+                all_idx,
+                [lev0_patch],
+                basis0,
+                hw0,
+                pmax0,
+                ii0f,
+                jj0f,
+                kk0f,
+                nxh0,
+                nyh0,
+                nzh0,
+                do_xyz=do_xyz,
+                axis_weights=axis_w,
+                use_penalty=False,
+                pen_fac=0.0,
+                base_clip=base_clip,
+                source_clip=None,
                 max_iter=config.batch_optimizer_iters_lev0,
-                blok_index_vol=blok_index_vol, nblok=nblok,
+                blok_index_vol=blok_index_vol,
+                nblok=nblok,
             )
         costs = [_vol_cost(v) for v in range(N)]
         if config.verb >= 1 and _tqdm is not None and isinstance(lev0_iter, _tqdm):
-            lev0_iter.set_postfix_str(f"cost~{sum(costs)/N:.5f} {time.time()-t0:.1f}s")
+            lev0_iter.set_postfix_str(f"cost~{sum(costs) / N:.5f} {time.time() - t0:.1f}s")
             lev0_iter.close()
 
     # --- Levels 1..N ---
@@ -1702,7 +1986,7 @@ def _warpomatic_multi(
         if levdone or not bool(active.any()):
             break
 
-        flev = config.shrink ** lev
+        flev = config.shrink**lev
         xwid = int(xwid0 * flev)
         ywid = int(ywid0 * flev)
         zwid = int(zwid0 * flev)
@@ -1745,7 +2029,7 @@ def _warpomatic_multi(
         if nz == 1:
             kbbb = kttt = 0
 
-        pen_lev = lev ** 0.333
+        pen_lev = lev**0.333
         pen_fff = config.penalty_factor * min(3.21, pen_lev)
         use_pen = pen_fff > 0 and lev >= config.penalty_first_level
         if lev == config.penalty_first_level:
@@ -1764,7 +2048,18 @@ def _warpomatic_multi(
                 nlevr = 2
 
         all_patches = _generate_patch_grid(
-            ibbb, ittt, jbbb, jttt, kbbb, kttt, xwid, ywid, zwid, xdel, ydel, zdel,
+            ibbb,
+            ittt,
+            jbbb,
+            jttt,
+            kbbb,
+            kttt,
+            xwid,
+            ywid,
+            zwid,
+            xdel,
+            ydel,
+            zdel,
         )
         valid_patches = _filter_patches(all_patches, weight, mask, nx, ny, nz)
         phases = _checkerboard_phases(valid_patches)
@@ -1773,7 +2068,12 @@ def _warpomatic_multi(
         max_patch = max(nxh, nyh, nzh)
         hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
-            basis_type, nxh, nyh, nzh, device, hfactor=hfactor,
+            basis_type,
+            nxh,
+            nyh,
+            nzh,
+            device,
+            hfactor=hfactor,
         )
         kk_p, jj_p, ii_p = torch.meshgrid(
             torch.arange(nzh, dtype=torch.float32, device=device),
@@ -1812,19 +2112,43 @@ def _warpomatic_multi(
                 phase_patches = phases[phase_idx]
                 if not phase_patches:
                     continue
-                good = [p for p in phase_patches
-                        if (p.itop - p.ibot + 1 == nxh and
-                            p.jtop - p.jbot + 1 == nyh and
-                            p.ktop - p.kbot + 1 == nzh)]
+                good = [
+                    p
+                    for p in phase_patches
+                    if (
+                        p.itop - p.ibot + 1 == nxh
+                        and p.jtop - p.jbot + 1 == nyh
+                        and p.ktop - p.kbot + 1 == nzh
+                    )
+                ]
                 if good:
                     _improve_warp_batched_multi(
-                        base, sources_all, weight, mask, mstate, config, device,
-                        active_idx, good, basis, half_widths, param_max,
-                        ii_flat, jj_flat, kk_flat, nxh, nyh, nzh,
-                        do_xyz=do_xyz, axis_weights=axis_w,
-                        use_penalty=use_pen, pen_fac=pen_fff,
-                        base_clip=base_clip, source_clip=None,
-                        blok_index_vol=blok_index_vol, nblok=nblok,
+                        base,
+                        sources_all,
+                        weight,
+                        mask,
+                        mstate,
+                        config,
+                        device,
+                        active_idx,
+                        good,
+                        basis,
+                        half_widths,
+                        param_max,
+                        ii_flat,
+                        jj_flat,
+                        kk_flat,
+                        nxh,
+                        nyh,
+                        nzh,
+                        do_xyz=do_xyz,
+                        axis_weights=axis_w,
+                        use_penalty=use_pen,
+                        pen_fac=pen_fff,
+                        base_clip=base_clip,
+                        source_clip=None,
+                        blok_index_vol=blok_index_vol,
+                        nblok=nblok,
                     )
                 # Odd boundary patches (different size) don't batch cleanly across
                 # volumes; fall back to per-volume serial for just those.
@@ -1833,12 +2157,28 @@ def _warpomatic_multi(
                     svd = _single_state_view(mstate, v)
                     for p in odd:
                         _improve_warp_serial(
-                            base, sources_all[v], weight, mask, svd, config, device,
-                            p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop,
-                            basis_type=basis_type, do_xyz=do_xyz, axis_weights=axis_w,
-                            use_penalty=use_pen, pen_fac=pen_fff,
-                            base_clip=base_clip, source_clip=source_clips[v],
-                            blok_index_vol=blok_index_vol, nblok=nblok,
+                            base,
+                            sources_all[v],
+                            weight,
+                            mask,
+                            svd,
+                            config,
+                            device,
+                            p.ibot,
+                            p.itop,
+                            p.jbot,
+                            p.jtop,
+                            p.kbot,
+                            p.ktop,
+                            basis_type=basis_type,
+                            do_xyz=do_xyz,
+                            axis_weights=axis_w,
+                            use_penalty=use_pen,
+                            pen_fac=pen_fff,
+                            base_clip=base_clip,
+                            source_clip=source_clips[v],
+                            blok_index_vol=blok_index_vol,
+                            nblok=nblok,
                         )
                 if lev_pbar is not None:
                     lev_pbar.update(len(phase_patches) * int(active_idx.numel()))
@@ -1855,7 +2195,10 @@ def _warpomatic_multi(
                     mstate.yd_all[v].clamp_(-config.maxdisp, config.maxdisp)
                     mstate.zd_all[v].clamp_(-config.maxdisp, config.maxdisp)
                 mstate.warped_all[v] = warp_image(
-                    sources_all[v], mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v],
+                    sources_all[v],
+                    mstate.xd_all[v],
+                    mstate.yd_all[v],
+                    mstate.zd_all[v],
                     mode=config.interp,
                 )
                 new_cost = _vol_cost(v)
@@ -1864,7 +2207,10 @@ def _warpomatic_multi(
                     mstate.yd_all[v] = saved[1][ai]
                     mstate.zd_all[v] = saved[2][ai]
                     mstate.warped_all[v] = warp_image(
-                        sources_all[v], mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v],
+                        sources_all[v],
+                        mstate.xd_all[v],
+                        mstate.yd_all[v],
+                        mstate.zd_all[v],
                         mode=config.interp,
                     )
                     costs[v] = cost_at_start[v]
@@ -1882,7 +2228,7 @@ def _warpomatic_multi(
         if lev_pbar is not None:
             avg = sum(costs) / N
             lev_pbar.set_postfix_str(
-                f"cost~{avg:.5f} active={int(active.sum())}/{N} {time.time()-t0:.1f}s"
+                f"cost~{avg:.5f} active={int(active.sum())}/{N} {time.time() - t0:.1f}s"
             )
             lev_pbar.close()
 
@@ -1942,7 +2288,9 @@ def qwarp_batch(
             f"cost_method={config.cost_method!r} needs per-volume qwarp()."
         )
     if config.pyramid_factor > 1:
-        raise NotImplementedError("qwarp_batch does not support the resolution pyramid; use qwarp() per volume.")
+        raise NotImplementedError(
+            "qwarp_batch does not support the resolution pyramid; use qwarp() per volume."
+        )
 
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -1960,9 +2308,7 @@ def qwarp_batch(
     do_pad = pad_x > 0 or pad_y > 0 or pad_z > 0
     if do_pad:
         base_p = _pad_volume(base, pad_x, pad_y, pad_z)
-        sources_p = torch.stack([
-            _pad_volume(sources[v], pad_x, pad_y, pad_z) for v in range(N)
-        ])
+        sources_p = torch.stack([_pad_volume(sources[v], pad_x, pad_y, pad_z) for v in range(N)])
     else:
         base_p = base
         sources_p = sources
@@ -1984,7 +2330,9 @@ def qwarp_batch(
         yd_all=torch.zeros(N, nz, ny, nx, device=device),
         zd_all=torch.zeros(N, nz, ny, nx, device=device),
         warped_all=sources_p.clone(),
-        nx=nx, ny=ny, nz=nz,
+        nx=nx,
+        ny=ny,
+        nz=nz,
     )
 
     _warpomatic_multi(base_p, sources_p, weight_p, mask_p, mstate, config, device)
@@ -1993,10 +2341,13 @@ def qwarp_batch(
     warped = torch.empty(N, nz_orig, ny_orig, nx_orig, device=device)
     for v in range(N):
         wf = warp_image(
-            sources_p[v], mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v],
+            sources_p[v],
+            mstate.xd_all[v],
+            mstate.yd_all[v],
+            mstate.zd_all[v],
             mode=config.final_interp,
         )
-        warped[v] = wf[pad_z:pad_z+nz_orig, pad_y:pad_y+ny_orig, pad_x:pad_x+nx_orig]
+        warped[v] = wf[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
 
     return warped, mstate.xd_all, mstate.yd_all, mstate.zd_all
 
@@ -2005,10 +2356,21 @@ def qwarp_batch(
 # Serial patch optimization (for level 0 and edge cases)
 # ---------------------------------------------------------------------------
 
+
 def _improve_warp_serial(
-    base: Tensor, source: Tensor, weight: Tensor, mask: Tensor,
-    state: WarpState, config: QwarpConfig, device: torch.device,
-    ibot: int, itop: int, jbot: int, jtop: int, kbot: int, ktop: int,
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    mask: Tensor,
+    state: WarpState,
+    config: QwarpConfig,
+    device: torch.device,
+    ibot: int,
+    itop: int,
+    jbot: int,
+    jtop: int,
+    kbot: int,
+    ktop: int,
     basis_type: str = "cubic_lite",
     do_xyz: tuple[bool, bool, bool] = (True, True, True),
     axis_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
@@ -2038,8 +2400,8 @@ def _improve_warp_serial(
         state.patches_skipped += 1
         return False
 
-    w_patch = weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1]
-    m_patch = mask[kbot:ktop+1, jbot:jtop+1, ibot:itop+1]
+    w_patch = weight[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1]
+    m_patch = mask[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1]
     n_masked = int(m_patch.sum().item())
     w_sum = float(w_patch.sum().item())
     w_avg = float(weight[mask > 0].mean().item()) if (mask > 0).any() else 1.0
@@ -2059,8 +2421,8 @@ def _improve_warp_serial(
         state.patches_skipped += 1
         return False
 
-    b_local = base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-    w_local = weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
+    b_local = base[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+    w_local = weight[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
 
     if b_local.max() == b_local.min():
         state.patches_skipped += 1
@@ -2072,7 +2434,9 @@ def _improve_warp_serial(
     incor = None
     blok_prep_s = None
     if use_blok_serial:
-        blok_idx_s = blok_index_vol[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)[None, :]
+        blok_idx_s = blok_index_vol[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)[
+            None, :
+        ]
         blok_prep_s = prepare_blok_pairs(blok_idx_s, nblok)
         _blok_value_s = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
     else:
@@ -2080,7 +2444,7 @@ def _improve_warp_serial(
         if base_clip is not None and source_clip is not None:
             incor.set_clips(base_clip, source_clip)
         weight_for_fixed = weight.clone()
-        weight_for_fixed[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = 0.0
+        weight_for_fixed[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = 0.0
         incor.add_fixed(
             base.reshape(-1),
             state.warped_source.reshape(-1),
@@ -2092,8 +2456,8 @@ def _improve_warp_serial(
         je_global, se_global = compute_jacobian_energy(state.xd, state.yd, state.zd)
         je_ext = je_global.clone()
         se_ext = se_global.clone()
-        je_ext[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = 0.0
-        se_ext[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = 0.0
+        je_ext[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = 0.0
+        se_ext[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = 0.0
         pen_external = float((je_ext + se_ext).sum().item())
 
     global_xd = state.xd
@@ -2114,7 +2478,9 @@ def _improve_warp_serial(
         for dim_i in active_dims:
             offset = dim_i * n_basis_per_dim
             scale = axis_weights[dim_i]
-            full_params[offset:offset + n_basis_per_dim] = params[idx:idx + n_basis_per_dim] * scale
+            full_params[offset : offset + n_basis_per_dim] = (
+                params[idx : idx + n_basis_per_dim] * scale
+            )
             idx += n_basis_per_dim
 
         hxd, hyd, hzd = evaluate_patch_warp(basis, full_params, half_widths, do_xyz)
@@ -2126,9 +2492,15 @@ def _improve_warp_serial(
         yq = (jbot + jj_p + hyd_3d).clamp(0, ny - 1)
         zq = (kbot + kk_p + hzd_3d).clamp(0, nz - 1)
 
-        axd_interp = trilinear_interpolate(global_xd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(nzh, nyh, nxh)
-        ayd_interp = trilinear_interpolate(global_yd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(nzh, nyh, nxh)
-        azd_interp = trilinear_interpolate(global_zd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(nzh, nyh, nxh)
+        axd_interp = trilinear_interpolate(
+            global_xd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
+        ).reshape(nzh, nyh, nxh)
+        ayd_interp = trilinear_interpolate(
+            global_yd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
+        ).reshape(nzh, nyh, nxh)
+        azd_interp = trilinear_interpolate(
+            global_zd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
+        ).reshape(nzh, nyh, nxh)
 
         ah_xd = hxd_3d + axd_interp
         ah_yd = hyd_3d + ayd_interp
@@ -2147,8 +2519,9 @@ def _improve_warp_serial(
 
         if use_blok_serial:
             corr = float(
-                _blok_value_s(b_local[None], warped_vals[None], w_local[None],
-                              blok_prep_s, config.lpc_ppow)[0]
+                _blok_value_s(
+                    b_local[None], warped_vals[None], w_local[None], blok_prep_s, config.lpc_ppow
+                )[0]
             )
         else:
             corr = incor.evaluate(b_local, warped_vals, w_local)
@@ -2156,6 +2529,7 @@ def _improve_warp_serial(
 
         if use_penalty:
             from .penalty import compute_penalty
+
             pen = compute_penalty(ah_xd, ah_yd, ah_zd, pen_fac, pen_external)
             cost += pen
 
@@ -2175,7 +2549,9 @@ def _improve_warp_serial(
     for dim_i in active_dims:
         offset = dim_i * n_basis_per_dim
         scale = axis_weights[dim_i]
-        full_params[offset:offset + n_basis_per_dim] = best_params[idx:idx + n_basis_per_dim] * scale
+        full_params[offset : offset + n_basis_per_dim] = (
+            best_params[idx : idx + n_basis_per_dim] * scale
+        )
         idx += n_basis_per_dim
 
     hxd, hyd, hzd = evaluate_patch_warp(basis, full_params, half_widths, do_xyz)
@@ -2187,17 +2563,23 @@ def _improve_warp_serial(
     yq = (jbot + jj_p + hyd_3d).clamp(0, ny - 1)
     zq = (kbot + kk_p + hzd_3d).clamp(0, nz - 1)
 
-    axd_interp = trilinear_interpolate(global_xd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(nzh, nyh, nxh)
-    ayd_interp = trilinear_interpolate(global_yd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(nzh, nyh, nxh)
-    azd_interp = trilinear_interpolate(global_zd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)).reshape(nzh, nyh, nxh)
+    axd_interp = trilinear_interpolate(
+        global_xd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
+    ).reshape(nzh, nyh, nxh)
+    ayd_interp = trilinear_interpolate(
+        global_yd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
+    ).reshape(nzh, nyh, nxh)
+    azd_interp = trilinear_interpolate(
+        global_zd, xq.reshape(-1), yq.reshape(-1), zq.reshape(-1)
+    ).reshape(nzh, nyh, nxh)
 
     ah_xd = hxd_3d + axd_interp
     ah_yd = hyd_3d + ayd_interp
     ah_zd = hzd_3d + azd_interp
 
-    state.xd[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = ah_xd
-    state.yd[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = ah_yd
-    state.zd[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = ah_zd
+    state.xd[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = ah_xd
+    state.yd[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = ah_yd
+    state.zd[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = ah_zd
 
     src_x = (ah_xd + ii_p + ibot).clamp(-0.499, nx - 0.501)
     src_y = (ah_yd + jj_p + jbot).clamp(-0.499, ny - 0.501)
@@ -2207,7 +2589,7 @@ def _improve_warp_serial(
         source, src_x.reshape(-1), src_y.reshape(-1), src_z.reshape(-1)
     ).reshape(nzh, nyh, nxh)
 
-    state.warped_source[kbot:ktop+1, jbot:jtop+1, ibot:itop+1] = warped_patch
+    state.warped_source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = warped_patch
     state.cost = best_cost
     state.patches_done += 1
 

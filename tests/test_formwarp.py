@@ -7,6 +7,7 @@ and that ``-noXdis`` zeros the X displacement end to end.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from fastfuncstuff.processing.formwarp import (
@@ -124,6 +125,7 @@ def test_convergence_value_trend():
     assert _convergence_value(rising, 10) < 0.0  # cost going up -> stop
 
 
+@pytest.mark.slow
 def test_formwarp_exhaustion_returns_best_not_last():
     """An aggressive step that overshoots must still return a good (best) warp.
 
@@ -180,7 +182,6 @@ def test_cli_timeseries_5d_and_folder_match(tmp_path):
     """CLI timeseries mode (4D -source): per-volume SyN writes a 4D warped series
     plus a warp series in both -warp_format modes, and the two formats agree."""
     import numpy as np
-    import pytest
 
     nib = pytest.importorskip("nibabel")
     from fastfuncstuff.cli.formwarp import main as fmain

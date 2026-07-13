@@ -76,7 +76,8 @@ def get_device(prefer_device: str | None = None) -> torch.device:
         return torch.device("mps")
 
     warnings.warn(
-        "No GPU backend detected; falling back to CPU execution. Performance will be limited.", stacklevel=2
+        "No GPU backend detected; falling back to CPU execution. Performance will be limited.",
+        stacklevel=2,
     )
     return torch.device("cpu")
 

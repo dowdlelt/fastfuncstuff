@@ -59,15 +59,60 @@ def test_cli_unif_runs_and_nounif_disables(tmp_path):
     inp, mask = _smoothed_noise_nii(tmp_path, vox_mm=2.0, fwhm_mm=6.0)
 
     o_unif = tmp_path / "u.1D"
-    main(["-input", inp, "-mask", mask, "-unif", "-acf1D", str(o_unif), "-device", "cpu", "-verb", "0"])
+    main(
+        [
+            "-input",
+            inp,
+            "-mask",
+            mask,
+            "-unif",
+            "-acf1D",
+            str(o_unif),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
+        ]
+    )
     fu = float(o_unif.read_text().splitlines()[-1].split()[3])
     assert np.isfinite(fu) and fu > 0.0
 
     # -detrend implies unif; -nounif turns it back off -> a different estimate.
     o_det = tmp_path / "d.1D"
     o_no = tmp_path / "n.1D"
-    main(["-input", inp, "-mask", mask, "-detrend", "2", "-acf1D", str(o_det), "-device", "cpu", "-verb", "0"])
-    main(["-input", inp, "-mask", mask, "-detrend", "2", "-nounif", "-acf1D", str(o_no), "-device", "cpu", "-verb", "0"])
+    main(
+        [
+            "-input",
+            inp,
+            "-mask",
+            mask,
+            "-detrend",
+            "2",
+            "-acf1D",
+            str(o_det),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
+        ]
+    )
+    main(
+        [
+            "-input",
+            inp,
+            "-mask",
+            mask,
+            "-detrend",
+            "2",
+            "-nounif",
+            "-acf1D",
+            str(o_no),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
+        ]
+    )
     fd = float(o_det.read_text().splitlines()[-1].split()[3])
     fn = float(o_no.read_text().splitlines()[-1].split()[3])
     assert np.isfinite(fd) and np.isfinite(fn)

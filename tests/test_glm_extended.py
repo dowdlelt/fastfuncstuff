@@ -92,9 +92,7 @@ class TestComputeR2Metric:
         assert sse.shape == (50,)
         assert (sse >= 0).all()
         # Better predictions should have lower SSE
-        sse_bad = compute_r2_metric(
-            y_true, torch.zeros_like(y_true), metric="sse"
-        )
+        sse_bad = compute_r2_metric(y_true, torch.zeros_like(y_true), metric="sse")
         assert (sse < sse_bad).all()
 
     def test_unknown_metric_raises(self, data):
@@ -104,9 +102,7 @@ class TestComputeR2Metric:
 
     def test_shape_mismatch_raises(self):
         with pytest.raises(ValueError, match="Shape mismatch"):
-            compute_r2_metric(
-                torch.randn(10, 50), torch.randn(10, 60)
-            )
+            compute_r2_metric(torch.randn(10, 50), torch.randn(10, 60))
 
     def test_perfect_prediction(self):
         y = torch.randn(5, 100, device=DEVICE)
@@ -135,6 +131,7 @@ class TestMetricHigherIsBetter:
 class TestEnsureNumpy:
     def test_torch_to_numpy(self):
         from fastfuncstuff.glm.outputs import _ensure_numpy
+
         t = torch.randn(10, 5)
         arr = _ensure_numpy(t)
         assert isinstance(arr, np.ndarray)
@@ -142,12 +139,14 @@ class TestEnsureNumpy:
 
     def test_numpy_passthrough(self):
         from fastfuncstuff.glm.outputs import _ensure_numpy
+
         arr = np.ones((5, 3), dtype=np.float32)
         result = _ensure_numpy(arr)
         assert result is arr  # Should be same object
 
     def test_dtype_conversion(self):
         from fastfuncstuff.glm.outputs import _ensure_numpy
+
         arr = np.ones((5, 3), dtype=np.float64)
         result = _ensure_numpy(arr)
         assert result.dtype == np.float32
@@ -156,6 +155,7 @@ class TestEnsureNumpy:
 class TestReshapeParameterMap:
     def test_basic_reshape(self):
         from fastfuncstuff.glm.outputs import _reshape_parameter_map
+
         # 100 voxels, 3 parameters -> (10,10,3) volume
         data = np.random.randn(100, 3).astype(np.float32)
         vol = _reshape_parameter_map(data, volume_shape=(10, 10, 1), voxel_mask=None)
@@ -163,6 +163,7 @@ class TestReshapeParameterMap:
 
     def test_with_mask(self):
         from fastfuncstuff.glm.outputs import _reshape_parameter_map
+
         mask = np.zeros((5, 5, 1), dtype=bool)
         mask[:3, :3, 0] = True  # 9 voxels
         data = np.random.randn(9, 2).astype(np.float32)
@@ -173,6 +174,7 @@ class TestReshapeParameterMap:
 
     def test_1d_data(self):
         from fastfuncstuff.glm.outputs import _reshape_parameter_map
+
         data = np.random.randn(27).astype(np.float32)
         vol = _reshape_parameter_map(data, volume_shape=(3, 3, 3), voxel_mask=None)
         assert vol.shape == (3, 3, 3)

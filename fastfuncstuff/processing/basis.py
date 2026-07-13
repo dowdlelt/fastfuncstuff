@@ -120,24 +120,28 @@ def build_3d_basis_cubic(
     if lite:
         # Lite mode: only products where (iz + iy + ix) <= 1
         # That gives us: (0,0,0), (1,0,0), (0,1,0), (0,0,1) = 4 basis funcs
-        basis = torch.stack([
-            (b0z_3d * b0y_3d * b0x_3d).reshape(-1),  # 000
-            (b1z_3d * b0y_3d * b0x_3d).reshape(-1),  # 100 (z)
-            (b0z_3d * b1y_3d * b0x_3d).reshape(-1),  # 010 (y)
-            (b0z_3d * b0y_3d * b1x_3d).reshape(-1),  # 001 (x)
-        ])
+        basis = torch.stack(
+            [
+                (b0z_3d * b0y_3d * b0x_3d).reshape(-1),  # 000
+                (b1z_3d * b0y_3d * b0x_3d).reshape(-1),  # 100 (z)
+                (b0z_3d * b1y_3d * b0x_3d).reshape(-1),  # 010 (y)
+                (b0z_3d * b0y_3d * b1x_3d).reshape(-1),  # 001 (x)
+            ]
+        )
     else:
         # Full mode: all 2x2x2 = 8 tensor products
-        basis = torch.stack([
-            (b0z_3d * b0y_3d * b0x_3d).reshape(-1),  # 000
-            (b1z_3d * b0y_3d * b0x_3d).reshape(-1),  # 100
-            (b0z_3d * b1y_3d * b0x_3d).reshape(-1),  # 010
-            (b1z_3d * b1y_3d * b0x_3d).reshape(-1),  # 110
-            (b0z_3d * b0y_3d * b1x_3d).reshape(-1),  # 001
-            (b1z_3d * b0y_3d * b1x_3d).reshape(-1),  # 101
-            (b0z_3d * b1y_3d * b1x_3d).reshape(-1),  # 011
-            (b1z_3d * b1y_3d * b1x_3d).reshape(-1),  # 111
-        ])
+        basis = torch.stack(
+            [
+                (b0z_3d * b0y_3d * b0x_3d).reshape(-1),  # 000
+                (b1z_3d * b0y_3d * b0x_3d).reshape(-1),  # 100
+                (b0z_3d * b1y_3d * b0x_3d).reshape(-1),  # 010
+                (b1z_3d * b1y_3d * b0x_3d).reshape(-1),  # 110
+                (b0z_3d * b0y_3d * b1x_3d).reshape(-1),  # 001
+                (b1z_3d * b0y_3d * b1x_3d).reshape(-1),  # 101
+                (b0z_3d * b1y_3d * b1x_3d).reshape(-1),  # 011
+                (b1z_3d * b1y_3d * b1x_3d).reshape(-1),  # 111
+            ]
+        )
 
     return basis
 
@@ -174,24 +178,19 @@ def build_3d_basis_quintic(
             for iz in range(3):
                 if lite and (ix + iy + iz) > 2:
                     continue
-                prod = (
-                    bz[iz][:, None, None]
-                    * by[iy][None, :, None]
-                    * bx[ix][None, None, :]
-                )
+                prod = bz[iz][:, None, None] * by[iy][None, :, None] * bx[ix][None, None, :]
                 bases.append(prod.reshape(-1))
 
     return torch.stack(bases)
 
 
-def compute_half_widths_cubic(
-    nx: int, ny: int, nz: int
-) -> tuple[float, float, float]:
+def compute_half_widths_cubic(nx: int, ny: int, nz: int) -> tuple[float, float, float]:
     """Compute the half-width scaling factors (dxci, dyci, dzci) for cubic basis.
 
     These scale the displacement parameters to physical displacement magnitudes.
     dxci = 1/cb where cb = 2/(IRGHT - ILEFT).
     """
+
     def _half_width(n: int) -> float:
         ileft = -0.5
         irght = n - 0.5
@@ -201,9 +200,7 @@ def compute_half_widths_cubic(
     return _half_width(nx), _half_width(ny), _half_width(nz)
 
 
-def compute_half_widths_quintic(
-    nx: int, ny: int, nz: int
-) -> tuple[float, float, float]:
+def compute_half_widths_quintic(nx: int, ny: int, nz: int) -> tuple[float, float, float]:
     """Compute half-width scaling factors for quintic basis (same formula)."""
     return compute_half_widths_cubic(nx, ny, nz)
 
@@ -285,9 +282,9 @@ def evaluate_patch_warp_batched(
 
     dxci, dyci, dzci = half_widths
 
-    x_params = params[:, :n_basis]              # (B, n_basis)
-    y_params = params[:, n_basis:2*n_basis]     # (B, n_basis)
-    z_params = params[:, 2*n_basis:]            # (B, n_basis)
+    x_params = params[:, :n_basis]  # (B, n_basis)
+    y_params = params[:, n_basis : 2 * n_basis]  # (B, n_basis)
+    z_params = params[:, 2 * n_basis :]  # (B, n_basis)
 
     # Batched matmul: (B, n_basis) @ (n_basis, V) -> (B, V)
     if do_xyz[0]:

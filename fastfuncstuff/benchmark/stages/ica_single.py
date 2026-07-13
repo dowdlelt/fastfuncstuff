@@ -17,7 +17,7 @@ name = "ica_single"
 description = "ICA single-run (melodic vs ffs_ica per run)"
 
 THRESHOLDS = {
-    "mean_matched_r": 0.60,   # per-run ICA is noisier than concat
+    "mean_matched_r": 0.60,  # per-run ICA is noisier than concat
     "coverage_0.5": 0.60,
 }
 
@@ -68,8 +68,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     if ctx.validate_only:
         for dataset in _ica_tasks(ctx):
             for run in ctx.runs_for_task(dataset):
-                for path in [_melodic_ic(ctx, dataset, run),
-                             _ffs_ic(ctx, dataset, run)]:
+                for path in [_melodic_ic(ctx, dataset, run), _ffs_ic(ctx, dataset, run)]:
                     if not path.exists():
                         missing.append(str(path))
     else:
@@ -110,9 +109,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     for dataset in _ica_tasks(ctx):
         # Check if all runs already exist
         runs = ctx.runs_for_task(dataset)
-        all_exist = all(
-            _ffs_ic(ctx, dataset, run).exists() for run in runs
-        )
+        all_exist = all(_ffs_ic(ctx, dataset, run).exists() for run in runs)
         if all_exist and not ctx.force_ffs:
             continue
 
@@ -144,10 +141,13 @@ def validate(ctx: BenchmarkContext) -> dict:
             mask_path = _melodic_mask(ctx, dataset, run)
 
             if not melodic_path.exists() or not ffs_path.exists():
-                per_run_results.append({
-                    "dataset": dataset, "run": run,
-                    "error": "missing output",
-                })
+                per_run_results.append(
+                    {
+                        "dataset": dataset,
+                        "run": run,
+                        "error": "missing output",
+                    }
+                )
                 continue
 
             mask_arg = mask_path if mask_path.exists() else None
@@ -174,15 +174,18 @@ def validate(ctx: BenchmarkContext) -> dict:
     overall_cov = sum(cov_05) / len(cov_05)
 
     passed = (
-        overall_mean_r >= THRESHOLDS["mean_matched_r"]
-        and overall_cov >= THRESHOLDS["coverage_0.5"]
+        overall_mean_r >= THRESHOLDS["mean_matched_r"] and overall_cov >= THRESHOLDS["coverage_0.5"]
     )
 
     # Component count summary
     n_comps_str = (
-        f"melodic={min(comp_counts_melodic)}-{max(comp_counts_melodic)}, "
-        f"ffs={min(comp_counts_ffs)}-{max(comp_counts_ffs)}"
-    ) if comp_counts_melodic else "n/a"
+        (
+            f"melodic={min(comp_counts_melodic)}-{max(comp_counts_melodic)}, "
+            f"ffs={min(comp_counts_ffs)}-{max(comp_counts_ffs)}"
+        )
+        if comp_counts_melodic
+        else "n/a"
+    )
 
     return {
         "passed": passed,

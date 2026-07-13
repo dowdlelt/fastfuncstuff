@@ -39,7 +39,6 @@ def test_unknown_backend_raises():
 
 def test_osl_backend_missing_dependency_message():
     # osl-dynamics is not a core dependency; the adapter must fail cleanly.
-    pytest.importorskip  # keep import used
     try:
         import osl_dynamics  # noqa: F401
 

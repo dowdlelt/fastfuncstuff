@@ -64,9 +64,7 @@ class TestOLSContrasts:
         data = signal + noise + 100.0  # Add baseline (like real BOLD signal)
 
         # Fit OLS (will add constant term)
-        results = ffs.fit_glm(
-            data, block_design, tr=2.0, verbose=False, max_poly_degree=0
-        )
+        results = ffs.fit_glm(data, block_design, tr=2.0, verbose=False, max_poly_degree=0)
 
         return results
 
@@ -140,9 +138,7 @@ class TestOLSContrasts:
         contrast[0] = 1.0
 
         # Should work even if results are on GPU
-        results = ffs.compute_contrasts(
-            ols_results, contrast, device=torch.device("cpu")
-        )
+        results = ffs.compute_contrasts(ols_results, contrast, device=torch.device("cpu"))
 
         assert results["contrast_betas"].device.type == "cpu"
         assert results["contrast_tstats"].device.type == "cpu"
@@ -304,8 +300,9 @@ class TestARMAContrasts:
         ), f"arma_params should be ({n_voxels}, 2), got {arma_results.arma_params.shape}"
 
         # arma_lambda should be 1D with n_voxels entries
-        assert arma_results.arma_lambda.shape == (n_voxels,), \
+        assert arma_results.arma_lambda.shape == (n_voxels,), (
             f"arma_lambda should be ({n_voxels},), got {arma_results.arma_lambda.shape}"
+        )
 
     def test_arma_params_in_valid_range(self, arma_results):
         """Test that ARMA parameters are in valid ranges."""
@@ -321,13 +318,16 @@ class TestARMAContrasts:
         assert torch.all(b_params <= 1.0), "b should be <= 1"
 
         # lambda should be in (-1, 1) for stationarity
-        assert torch.all(torch.abs(arma_results.arma_lambda) < 1.0), \
+        assert torch.all(torch.abs(arma_results.arma_lambda) < 1.0), (
             "lambda should be in (-1, 1) for stationarity"
+        )
 
     def test_arma_ols_results_available_for_contrasts(self, arma_results, device):
         """Test that OLS results are available for contrast computation."""
         # When want_ols=True, we can use OLS results for contrasts
-        assert hasattr(arma_results, "ols_results"), "ARMA should have ols_results when want_ols=True"
+        assert hasattr(arma_results, "ols_results"), (
+            "ARMA should have ols_results when want_ols=True"
+        )
         assert arma_results.ols_results is not None, "ols_results should not be None"
 
         # OLS results should have xtx_inv for contrast computation
@@ -417,9 +417,7 @@ class TestContrastFromDesign:
         # Design info without contrasts
         design_info = {"n_regressors": 3}
 
-        contrast_results = ffs.compute_contrasts_from_design(
-            results, design_info, device=device
-        )
+        contrast_results = ffs.compute_contrasts_from_design(results, design_info, device=device)
 
         assert contrast_results is None
 
@@ -552,8 +550,9 @@ class TestContrastIntegration:
         arma_mean = arma_contrast_betas.cpu().mean().item()
         # ARMA's autocorrelation correction biases beta magnitudes vs OLS on
         # block designs; 1.0 keeps this a "not catastrophically different" check.
-        assert abs(ols_mean - arma_mean) < 1.0, \
+        assert abs(ols_mean - arma_mean) < 1.0, (
             f"OLS ({ols_mean:.2f}) and ARMA ({arma_mean:.2f}) should be similar"
+        )
 
     def test_contrast_with_multirun_data(self, device):
         """Test contrasts with multi-run GLM."""

@@ -1,4 +1,5 @@
 """Tests for the design.spec TOML schema, contrast resolver, and CLI."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -35,15 +36,18 @@ def _make_spec(tmp_path: Path) -> Spec:
             drop_trial_types=["rest"],
         ),
         events=[
-            EventSpec(trial_type="face", duration="from_events",
-                      hrf="SPMG1(0)", mode="condition", round_onset="TR"),
-            EventSpec(trial_type="house", duration=2.0,
-                      hrf="SPMG1(2)", mode="condition"),
+            EventSpec(
+                trial_type="face",
+                duration="from_events",
+                hrf="SPMG1(0)",
+                mode="condition",
+                round_onset="TR",
+            ),
+            EventSpec(trial_type="house", duration=2.0, hrf="SPMG1(2)", mode="condition"),
         ],
         nuisance=[NuisanceSpec(file="motion.1D", label="motion", scope="full")],
         contrasts=[
-            ContrastSpec(label="FaceVHouse", sym="SYM: +1*face -1*house",
-                         balance="zero"),
+            ContrastSpec(label="FaceVHouse", sym="SYM: +1*face -1*house", balance="zero"),
         ],
     )
 
@@ -71,8 +75,8 @@ def test_spec_round_trip(tmp_path):
 def test_load_spec_validates_enums(tmp_path):
     bad = tmp_path / "bad.spec"
     bad.write_text(
-        '[meta]\n'
-        'tr = 1.5\nn_timepoints_per_run=[100]\n'
+        "[meta]\n"
+        "tr = 1.5\nn_timepoints_per_run=[100]\n"
         'runs=[{bold="x.nii.gz",events="x.tsv"}]\n'
         '[[events]]\ntrial_type="a"\nmode="weird"\n'
     )
@@ -164,14 +168,23 @@ def test_compile_end_to_end(tmp_path):
     tr = 2.0
     events_a = tmp_path / "r01_events.tsv"
     events_b = tmp_path / "r02_events.tsv"
-    _write_events_tsv(events_a, [
-        (10.0, 2.0, "face"), (40.0, 2.0, "face"),
-        (20.0, 2.0, "house"), (80.0, 2.0, "house"),
-    ])
-    _write_events_tsv(events_b, [
-        (5.0, 2.0, "face"), (90.0, 2.0, "face"),
-        (30.0, 2.0, "house"),
-    ])
+    _write_events_tsv(
+        events_a,
+        [
+            (10.0, 2.0, "face"),
+            (40.0, 2.0, "face"),
+            (20.0, 2.0, "house"),
+            (80.0, 2.0, "house"),
+        ],
+    )
+    _write_events_tsv(
+        events_b,
+        [
+            (5.0, 2.0, "face"),
+            (90.0, 2.0, "face"),
+            (30.0, 2.0, "house"),
+        ],
+    )
 
     spec = Spec(
         meta=MetaSpec(
@@ -184,10 +197,8 @@ def test_compile_end_to_end(tmp_path):
             polort=2,
         ),
         events=[
-            EventSpec(trial_type="face", duration=2.0, hrf="SPMG1(2)",
-                      mode="condition"),
-            EventSpec(trial_type="house", duration=2.0, hrf="SPMG1(2)",
-                      mode="condition"),
+            EventSpec(trial_type="face", duration=2.0, hrf="SPMG1(2)", mode="condition"),
+            EventSpec(trial_type="house", duration=2.0, hrf="SPMG1(2)", mode="condition"),
         ],
         contrasts=[
             ContrastSpec(label="F_vs_H", sym="SYM: +1*face -1*house"),
@@ -197,7 +208,9 @@ def test_compile_end_to_end(tmp_path):
     write_spec(spec, spec_path)
 
     xmat_path = tmp_path / "X.xmat.1D"
-    args = type("A", (), {"spec": str(spec_path), "xmat": str(xmat_path), "verb": 0, "overwrite": True})()
+    args = type(
+        "A", (), {"spec": str(spec_path), "xmat": str(xmat_path), "verb": 0, "overwrite": True}
+    )()
     rc = _do_compile(args)
     assert rc == 0
     assert xmat_path.exists()
@@ -251,7 +264,9 @@ def test_ortvec_concat_expands_to_full_length_entries(tmp_path):
         (tmp_path / f"mot_demean.r{i:02d}.1D").write_text("0\n")
 
     args = Namespace(
-        ortvec=None, ortvec_run=None, ortvec_glob=None,
+        ortvec=None,
+        ortvec_run=None,
+        ortvec_glob=None,
         ortvec_concat=[(str(tmp_path / "mot_demean.r*.1D"), "motion")],
     )
     n = _build_nuisance_from_cli_args(args, n_runs=3)
@@ -275,13 +290,19 @@ def test_nuisance_glob_resolves_to_padortvec_at_compile(tmp_path):
         (tmp_path / f"motion_run-{i:02d}.1D").write_text(
             "\n".join("0.1 0.2 0.3" for _ in range(20)) + "\n"
         )
-    nuisance = [NuisanceSpec(
-        file=None, label="motion", scope="glob",
-        pattern=str(tmp_path / "motion_run-*.1D"),
-    )]
+    nuisance = [
+        NuisanceSpec(
+            file=None,
+            label="motion",
+            scope="glob",
+            pattern=str(tmp_path / "motion_run-*.1D"),
+        )
+    ]
 
     ortvec, padortvec = _resolve_nuisance_for_compile(
-        nuisance, n_runs=3, n_timepoints_per_run=[20, 20, 20],
+        nuisance,
+        n_runs=3,
+        n_timepoints_per_run=[20, 20, 20],
     )
     assert ortvec == []
     assert len(padortvec) == 3
@@ -297,16 +318,20 @@ def test_nuisance_glob_rejects_full_length_files(tmp_path):
     # 60 rows = full length (3 runs × 20). Glob mode should refuse this and
     # tell the user to use scope='full' instead.
     for i in (1, 2, 3):
-        (tmp_path / f"motion_run-{i:02d}.1D").write_text(
-            "\n".join("0.1" for _ in range(60)) + "\n"
+        (tmp_path / f"motion_run-{i:02d}.1D").write_text("\n".join("0.1" for _ in range(60)) + "\n")
+    nuisance = [
+        NuisanceSpec(
+            file=None,
+            label="motion",
+            scope="glob",
+            pattern=str(tmp_path / "motion_run-*.1D"),
         )
-    nuisance = [NuisanceSpec(
-        file=None, label="motion", scope="glob",
-        pattern=str(tmp_path / "motion_run-*.1D"),
-    )]
+    ]
     with pytest.raises(ValueError, match="one-run-length"):
         _resolve_nuisance_for_compile(
-            nuisance, n_runs=3, n_timepoints_per_run=[20, 20, 20],
+            nuisance,
+            n_runs=3,
+            n_timepoints_per_run=[20, 20, 20],
         )
 
 
@@ -324,14 +349,18 @@ def test_bare_hrf_compiles_with_duration_from_events(tmp_path):
     spec = Spec(
         meta=MetaSpec(
             runs=[RunSpec(bold="x.nii.gz", events=str(ev))],
-            tr=2.0, n_timepoints_per_run=[60], polort=2,
+            tr=2.0,
+            n_timepoints_per_run=[60],
+            polort=2,
         ),
         events=[EventSpec(trial_type="task", duration=3.0, hrf="SPMG1")],
     )
     spec_path = tmp_path / "design.toml"
     write_spec(spec, spec_path)
     xmat = tmp_path / "X.xmat.1D"
-    args = type("A", (), {"spec": str(spec_path), "xmat": str(xmat), "verb": 0, "overwrite": True})()
+    args = type(
+        "A", (), {"spec": str(spec_path), "xmat": str(xmat), "verb": 0, "overwrite": True}
+    )()
     assert _do_compile(args) == 0
     info = read_afni_design_matrix(str(xmat))
     assert "task#0" in info["column_labels"]
@@ -344,12 +373,18 @@ def test_stub_writes_examples_and_duration_stats(tmp_path):
     from fastfuncstuff.cli.design_spec import _do_stub
 
     ev = tmp_path / "r01.tsv"
-    _write_events_tsv(ev, [
-        (5.0, 2.0, "stimA"), (15.0, 2.5, "stimA"), (25.0, 2.0, "stimA"),
-        (35.0, 4.0, "stimB"),
-    ])
+    _write_events_tsv(
+        ev,
+        [
+            (5.0, 2.0, "stimA"),
+            (15.0, 2.5, "stimA"),
+            (25.0, 2.0, "stimA"),
+            (35.0, 4.0, "stimB"),
+        ],
+    )
     # Tiny synthetic NIfTI for the header scan.
     import nibabel as nib
+
     nii = nib.Nifti1Image(np.zeros((2, 2, 2, 60), dtype=np.float32), np.eye(4))
     nii.header.set_zooms((1.0, 1.0, 1.0, 2.0))
     bold = tmp_path / "r01.nii.gz"
@@ -357,11 +392,17 @@ def test_stub_writes_examples_and_duration_stats(tmp_path):
 
     out_prefix = tmp_path / "stub_out"  # no extension; .toml should be appended
     args = Namespace(
-        input=[str(bold)], events=[str(ev)], out=str(out_prefix),
-        TR=None, event_cols=None,
+        input=[str(bold)],
+        events=[str(ev)],
+        out=str(out_prefix),
+        TR=None,
+        event_cols=None,
         drop_trial_types=["rest", "Rest", "REST", "baseline"],
         default_hrf="SPMG1",
-        ortvec=None, ortvec_run=None, ortvec_glob=None, ortvec_concat=None,
+        ortvec=None,
+        ortvec_run=None,
+        ortvec_glob=None,
+        ortvec_concat=None,
         overwrite=True,
     )
     rc = _do_stub(args)
@@ -407,7 +448,9 @@ def test_compile_refuses_to_overwrite_xmat(tmp_path):
     spec = Spec(
         meta=MetaSpec(
             runs=[RunSpec(bold="x.nii.gz", events=str(ev))],
-            tr=2.0, n_timepoints_per_run=[60], polort=2,
+            tr=2.0,
+            n_timepoints_per_run=[60],
+            polort=2,
         ),
         events=[EventSpec(trial_type="task", duration=2.0, hrf="SPMG1")],
     )
@@ -417,10 +460,16 @@ def test_compile_refuses_to_overwrite_xmat(tmp_path):
     xmat = tmp_path / "stale.xmat.1D"
     xmat.write_text("this is stale content\n")
 
-    args = type("A", (), {
-        "spec": str(spec_path), "xmat": str(xmat),
-        "verb": 0, "overwrite": False,
-    })()
+    args = type(
+        "A",
+        (),
+        {
+            "spec": str(spec_path),
+            "xmat": str(xmat),
+            "verb": 0,
+            "overwrite": False,
+        },
+    )()
     rc = _do_compile(args)
     assert rc == 1, "Should refuse without -overwrite"
     # Stale content untouched.
@@ -440,18 +489,25 @@ def test_compile_reorders_columns_to_afni_layout(tmp_path):
     spec = Spec(
         meta=MetaSpec(
             runs=[RunSpec(bold="x.nii.gz", events=str(ev))],
-            tr=2.0, n_timepoints_per_run=[60], polort=2,
+            tr=2.0,
+            n_timepoints_per_run=[60],
+            polort=2,
         ),
         events=[EventSpec(trial_type="task", duration=2.0, hrf="SPMG1")],
-        nuisance=[NuisanceSpec(
-            file=str(tmp_path / "motion.1D"), label="mot", scope="full",
-        )],
+        nuisance=[
+            NuisanceSpec(
+                file=str(tmp_path / "motion.1D"),
+                label="mot",
+                scope="full",
+            )
+        ],
     )
     spec_path = tmp_path / "design.toml"
     write_spec(spec, spec_path)
     xmat = tmp_path / "X.xmat.1D"
-    args = type("A", (), {"spec": str(spec_path), "xmat": str(xmat),
-                          "verb": 0, "overwrite": True})()
+    args = type(
+        "A", (), {"spec": str(spec_path), "xmat": str(xmat), "verb": 0, "overwrite": True}
+    )()
     assert _do_compile(args) == 0
 
     info = read_afni_design_matrix(str(xmat))
@@ -478,19 +534,26 @@ def test_demean_rescale_subtracts_column_mean(tmp_path):
     spec = Spec(
         meta=MetaSpec(
             runs=[RunSpec(bold="x.nii.gz", events=str(ev))],
-            tr=2.0, n_timepoints_per_run=[60], polort=2,
+            tr=2.0,
+            n_timepoints_per_run=[60],
+            polort=2,
         ),
         events=[EventSpec(trial_type="task", duration=2.0, hrf="SPMG1")],
-        nuisance=[NuisanceSpec(
-            file=str(tmp_path / "motion.1D"), label="mot",
-            scope="full", rescale="demean",
-        )],
+        nuisance=[
+            NuisanceSpec(
+                file=str(tmp_path / "motion.1D"),
+                label="mot",
+                scope="full",
+                rescale="demean",
+            )
+        ],
     )
     spec_path = tmp_path / "design.toml"
     write_spec(spec, spec_path)
     xmat = tmp_path / "X.xmat.1D"
-    args = type("A", (), {"spec": str(spec_path), "xmat": str(xmat),
-                          "verb": 0, "overwrite": True})()
+    args = type(
+        "A", (), {"spec": str(spec_path), "xmat": str(xmat), "verb": 0, "overwrite": True}
+    )()
     assert _do_compile(args) == 0
 
     info = read_afni_design_matrix(str(xmat))
@@ -504,7 +567,9 @@ def test_demean_round_trips_through_spec(tmp_path):
     spec = Spec(
         meta=MetaSpec(
             runs=[RunSpec(bold="x.nii.gz", events="x.tsv")],
-            tr=2.0, n_timepoints_per_run=[10], polort=2,
+            tr=2.0,
+            n_timepoints_per_run=[10],
+            polort=2,
         ),
         events=[],
         nuisance=[
@@ -536,7 +601,10 @@ def test_compile_refuses_hrfopt(tmp_path):
     )
     spec_path = tmp_path / "design.spec"
     write_spec(spec, spec_path)
-    args = type("A", (), {"spec": str(spec_path), "xmat": str(tmp_path/"X.xmat.1D"),
-                          "verb": 0, "overwrite": True})()
+    args = type(
+        "A",
+        (),
+        {"spec": str(spec_path), "xmat": str(tmp_path / "X.xmat.1D"), "verb": 0, "overwrite": True},
+    )()
     with pytest.raises(ValueError, match="hrfopt"):
         _do_compile(args)

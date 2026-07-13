@@ -81,7 +81,10 @@ class TestSliceByRuns:
         run_starts = [0, 200, 400, 600]
 
         data_sub, design_sub, tps = slice_by_runs(
-            data, design, run_starts, [1]  # Second run only
+            data,
+            design,
+            run_starts,
+            [1],  # Second run only
         )
 
         assert data_sub.shape == (100, 200)  # 1 run × 200 TRs
@@ -95,7 +98,10 @@ class TestSliceByRuns:
         run_starts = [0, 200, 400, 600]
 
         data_sub, design_sub, tps = slice_by_runs(
-            data, design, run_starts, [0, 2]  # First and third runs
+            data,
+            design,
+            run_starts,
+            [0, 2],  # First and third runs
         )
 
         assert data_sub.shape == (100, 400)  # 2 runs × 200 TRs
@@ -109,9 +115,7 @@ class TestSliceByRuns:
         design = torch.randn(800, 50)
         run_starts = [0, 200, 400, 600]
 
-        data_sub, design_sub, tps = slice_by_runs(
-            data, design, run_starts, [0, 1, 2, 3]
-        )
+        data_sub, design_sub, tps = slice_by_runs(data, design, run_starts, [0, 1, 2, 3])
 
         assert data_sub.shape == data.shape
         assert design_sub.shape == design.shape
@@ -130,9 +134,7 @@ class TestProjectOutNuisance:
         # Last 10 columns are nuisance
         nuisance_indices = list(range(40, 50))
 
-        data_clean, design_clean = project_out_nuisance(
-            data, design, nuisance_indices
-        )
+        data_clean, design_clean = project_out_nuisance(data, design, nuisance_indices)
 
         # Check shapes
         assert data_clean.shape == data.shape
@@ -154,9 +156,7 @@ class TestProjectOutNuisance:
         nuisance_indices = list(range(40, 50))
 
         # Should not crash despite zero columns
-        data_clean, design_clean = project_out_nuisance(
-            data, design, nuisance_indices
-        )
+        data_clean, design_clean = project_out_nuisance(data, design, nuisance_indices)
 
         assert data_clean.shape == data.shape
         assert design_clean.shape == design.shape
@@ -287,13 +287,25 @@ class TestComputeXvalR2:
         cv_splits = generate_cv_splits(n_runs=4, strategy=1, n_perms=10)
 
         results_cod = compute_xval_r2(
-            data, design.numpy(), run_starts, stim_indices, nuisance_indices,
-            cv_splits, metric="cod", verbose=False
+            data,
+            design.numpy(),
+            run_starts,
+            stim_indices,
+            nuisance_indices,
+            cv_splits,
+            metric="cod",
+            verbose=False,
         )
 
         results_corr2 = compute_xval_r2(
-            data, design.numpy(), run_starts, stim_indices, nuisance_indices,
-            cv_splits, metric="corr2", verbose=False
+            data,
+            design.numpy(),
+            run_starts,
+            stim_indices,
+            nuisance_indices,
+            cv_splits,
+            metric="corr2",
+            verbose=False,
         )
 
         # CoD and corr² should be reasonably similar
@@ -333,7 +345,9 @@ def test_end_to_end_workflow():
 
     # Validate results structure
     assert isinstance(results, dict)
-    assert all(key in results for key in ["r2", "r2_median", "r2_mean", "r2_std", "r2_min", "r2_max"])
+    assert all(
+        key in results for key in ["r2", "r2_median", "r2_mean", "r2_std", "r2_min", "r2_max"]
+    )
 
     # Validate statistics make sense (scalar stats in new GLMdenoise-style API)
     # r2_median is same as r2 (misleading name for backward compat)
@@ -401,7 +415,7 @@ class TestGenerateCVSplitsEdgeCases:
         # But n_perms=5 should sample only 5
         splits = generate_cv_splits(n_runs=10, strategy=0.5, n_perms=5)
         assert len(splits) == 5
-        
+
         # Each split should still be valid
         for train, test in splits:
             assert len(train) == 5
@@ -414,7 +428,7 @@ class TestGenerateCVSplitsEdgeCases:
         # But n_perms=5 should sample only 5
         splits = generate_cv_splits(n_runs=10, strategy=2, n_perms=5)
         assert len(splits) == 5
-        
+
         # Each split should be valid
         for train, test in splits:
             assert len(train) == 8
@@ -429,7 +443,7 @@ class TestComputeR2MetricEdgeCases:
         """Test that shape mismatch raises ValueError"""
         y_true = torch.randn(100, 200)
         y_pred = torch.randn(100, 150)  # Different timepoints
-        
+
         with pytest.raises(ValueError, match="Shape mismatch"):
             compute_r2_metric(y_true, y_pred)
 
@@ -437,7 +451,7 @@ class TestComputeR2MetricEdgeCases:
         """Test that unknown metric raises ValueError"""
         y_true = torch.randn(100, 200)
         y_pred = torch.randn(100, 200)
-        
+
         with pytest.raises(ValueError, match="Unknown metric"):
             compute_r2_metric(y_true, y_pred, metric="unknown")
 
@@ -449,13 +463,13 @@ class TestProjectOutNuisanceEdgeCases:
         """Test when ALL nuisance columns are zero (returns original)"""
         data = torch.randn(100, 200)
         design = torch.randn(200, 50)
-        
+
         # Make all nuisance columns zero
         design[:, 40:] = 0
         nuisance_indices = list(range(40, 50))
-        
+
         data_clean, design_clean = project_out_nuisance(data, design, nuisance_indices)
-        
+
         # Should return original since nothing to project
         torch.testing.assert_close(data_clean, data)
         torch.testing.assert_close(design_clean, design)
@@ -476,8 +490,13 @@ class TestComputeXvalR2EdgeCases:
         cv_splits = generate_cv_splits(n_runs=4, strategy=1)
 
         results = compute_xval_r2(
-            data, design.numpy(), run_starts, stim_indices, nuisance_indices,
-            cv_splits, verbose=False
+            data,
+            design.numpy(),
+            run_starts,
+            stim_indices,
+            nuisance_indices,
+            cv_splits,
+            verbose=False,
         )
 
         assert "r2_median" in results
@@ -488,10 +507,10 @@ class TestComputeXvalR2EdgeCases:
         n_voxels, n_timepoints = 50, 200
         data = torch.randn(n_voxels, n_timepoints)
         design = torch.randn(n_timepoints, 30)
-        
+
         # Make some events missing to trigger the strategy code
         design[:100, 5] = 0  # Event 5 missing in first half
-        
+
         run_starts = [0, 100]
         stim_indices = list(range(20))
         nuisance_indices = list(range(20, 30))
@@ -499,8 +518,14 @@ class TestComputeXvalR2EdgeCases:
 
         with pytest.raises(ValueError, match="Unknown zero_event_strategy"):
             compute_xval_r2(
-                data, design.numpy(), run_starts, stim_indices, nuisance_indices,
-                cv_splits, zero_event_strategy="invalid", verbose=False
+                data,
+                design.numpy(),
+                run_starts,
+                stim_indices,
+                nuisance_indices,
+                cv_splits,
+                zero_event_strategy="invalid",
+                verbose=False,
             )
 
     def test_no_overlapping_events_error(self):
@@ -508,13 +533,13 @@ class TestComputeXvalR2EdgeCases:
         n_voxels, n_timepoints = 50, 200
         data = torch.randn(n_voxels, n_timepoints)
         design = torch.randn(n_timepoints, 30)
-        
+
         # Zero out ALL stim events in run 1
         design[:100, :20] = 0
         # Zero out ALL stim events in run 2 (different columns would cause no overlap)
         # Actually, zero them all in both runs to ensure no overlap
         design[100:, :20] = 0
-        
+
         run_starts = [0, 100]
         stim_indices = list(range(20))
         nuisance_indices = list(range(20, 30))
@@ -522,8 +547,13 @@ class TestComputeXvalR2EdgeCases:
 
         with pytest.raises(ValueError, match="No overlapping events"):
             compute_xval_r2(
-                data, design.numpy(), run_starts, stim_indices, nuisance_indices,
-                cv_splits, verbose=False
+                data,
+                design.numpy(),
+                run_starts,
+                stim_indices,
+                nuisance_indices,
+                cv_splits,
+                verbose=False,
             )
 
 
@@ -550,9 +580,7 @@ class TestQRProjectors:
 
         # Compute QR projectors
         q_factors = compute_qr_projectors(
-            nuisance_per_run=nuisance_per_run,
-            run_starts=run_starts,
-            device=torch.device("cpu")
+            nuisance_per_run=nuisance_per_run, run_starts=run_starts, device=torch.device("cpu")
         )
 
         # Should return list of Q factors
@@ -560,16 +588,18 @@ class TestQRProjectors:
         for i, Q in enumerate(q_factors):
             expected_length = run_lengths[i]
             expected_cols = n_nuisance
-            assert Q.shape == (expected_length, expected_cols), \
+            assert Q.shape == (expected_length, expected_cols), (
                 f"Q[{i}] should have shape ({expected_length}, {expected_cols}), got {Q.shape}"
+            )
 
         # Q should have orthonormal columns
         for i, Q in enumerate(q_factors):
             if Q is not None and Q.shape[1] > 0:  # Check if non-empty
                 # Q.T @ Q should be identity
                 identity = Q.T @ Q
-                assert torch.allclose(identity, torch.eye(Q.shape[1]), atol=1e-4), \
+                assert torch.allclose(identity, torch.eye(Q.shape[1]), atol=1e-4), (
                     f"Q[{i}] columns should be orthonormal"
+                )
 
     def test_compute_qr_projectors_empty_nuisance(self):
         """Test QR projectors with no nuisance regressors"""
@@ -589,9 +619,7 @@ class TestQRProjectors:
         run_starts = [0, 30, 70]
 
         q_factors = compute_qr_projectors(
-            nuisance_per_run=nuisance_per_run,
-            run_starts=run_starts,
-            device=torch.device("cpu")
+            nuisance_per_run=nuisance_per_run, run_starts=run_starts, device=torch.device("cpu")
         )
 
         # Should return list of None (one per run)
@@ -614,9 +642,7 @@ class TestQRProjectors:
 
         # QR should handle rank-deficient case - Q has at most n_timepoints columns
         q_factors = compute_qr_projectors(
-            nuisance_per_run=nuisance_per_run,
-            run_starts=run_starts,
-            device=torch.device("cpu")
+            nuisance_per_run=nuisance_per_run, run_starts=run_starts, device=torch.device("cpu")
         )
 
         # First run should have Q with rank ≤ n_timepoints
@@ -660,7 +686,7 @@ class TestProjectOutNuisancePerRun:
             design=design,
             nuisance_per_run=nuisance_per_run,
             run_starts=run_starts,
-            device=torch.device("cpu")
+            device=torch.device("cpu"),
         )
 
         # Check shapes
@@ -701,7 +727,7 @@ class TestProjectOutNuisancePerRun:
             design=design,
             nuisance_per_run=nuisance_per_run,
             run_starts=run_starts,
-            device=torch.device("cpu")
+            device=torch.device("cpu"),
         )
 
         # Check that linear trend was reduced
@@ -709,8 +735,9 @@ class TestProjectOutNuisancePerRun:
         corr_before = (data * time.unsqueeze(0)).sum() / (data.norm() * time.norm())
         corr_after = (data_clean * time.unsqueeze(0)).sum() / (data_clean.norm() * time.norm())
 
-        assert abs(corr_after) < abs(corr_before), \
+        assert abs(corr_after) < abs(corr_before), (
             f"Linear trend should be reduced: before={corr_before:.3f}, after={corr_after:.3f}"
+        )
 
     def test_project_out_nuisance_per_run_empty_nuisance(self):
         """Test per-run projection with no nuisance"""
@@ -735,7 +762,7 @@ class TestProjectOutNuisancePerRun:
             design=design,
             nuisance_per_run=nuisance_per_run,
             run_starts=run_starts,
-            device=torch.device("cpu")
+            device=torch.device("cpu"),
         )
 
         # Should be unchanged (no nuisance to project out)
@@ -764,8 +791,9 @@ class TestComputeR2MetricAdvanced:
         assert r2.shape == (n_voxels,)
 
         # Most voxels should have positive R² (prediction is close to true)
-        assert (r2 > 0.5).sum().item() > n_voxels / 2, \
+        assert (r2 > 0.5).sum().item() > n_voxels / 2, (
             "Most voxels should have R² > 0.5 with small noise"
+        )
 
     def test_r2_metric_corr(self):
         """Test correlation metric"""
@@ -782,8 +810,9 @@ class TestComputeR2MetricAdvanced:
 
         # Correlation should be high (close to 1.0)
         assert r2.shape == (n_voxels,)
-        assert (r2 > 0.8).sum().item() > n_voxels / 2, \
+        assert (r2 > 0.8).sum().item() > n_voxels / 2, (
             "Most voxels should have high correlation with small noise"
+        )
 
     def test_r2_metric_corr2(self):
         """Test squared correlation metric"""
@@ -800,8 +829,9 @@ class TestComputeR2MetricAdvanced:
 
         # Squared correlation should be very high
         assert r2.shape == (n_voxels,)
-        assert (r2 > 0.6).sum().item() > n_voxels / 2, \
+        assert (r2 > 0.6).sum().item() > n_voxels / 2, (
             "Most voxels should have high squared correlation with small noise"
+        )
 
     def test_r2_metric_perfect_prediction(self):
         """Test R² with perfect prediction"""
@@ -856,11 +886,16 @@ class TestSingleTrialCVHelper:
 
         # Ground truth: each condition has a stable pattern across voxels
         true_patterns = torch.randn(n_voxels, n_conditions)
-        betas = true_patterns[:, trial_condition_ids] + (1.0 / snr) * torch.randn(n_voxels, n_trials)
-        cv_splits = [(
-            [r for r in range(n_runs) if r != held],
-            [held],
-        ) for held in range(n_runs)]
+        betas = true_patterns[:, trial_condition_ids] + (1.0 / snr) * torch.randn(
+            n_voxels, n_trials
+        )
+        cv_splits = [
+            (
+                [r for r in range(n_runs) if r != held],
+                [held],
+            )
+            for held in range(n_runs)
+        ]
         return betas, trial_condition_ids, trial_run_ids, cv_splits
 
     def test_single_variant_equivalence(self):
@@ -870,11 +905,18 @@ class TestSingleTrialCVHelper:
         betas, cids, rids, splits = self._make_betas()
 
         old = compute_xval_r2_single_trials(
-            betas, cids, rids, splits, device=torch.device("cpu"), verbose=False)
+            betas, cids, rids, splits, device=torch.device("cpu"), verbose=False
+        )
 
         new = single_trial_cv_helper(
-            betas.unsqueeze(0), cids, rids, splits,
-            zscore_by_run=False, device=torch.device("cpu"), verbose=False)
+            betas.unsqueeze(0),
+            cids,
+            rids,
+            splits,
+            zscore_by_run=False,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         torch.testing.assert_close(old["r2"], new["r2"].squeeze(0), atol=1e-5, rtol=1e-5)
         assert old["n_splits"] == new["n_splits"]
@@ -890,8 +932,8 @@ class TestSingleTrialCVHelper:
         multi = betas.unsqueeze(0).expand(n_variants, -1, -1).clone()
 
         result = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            device=torch.device("cpu"), verbose=False)
+            multi, cids, rids, splits, device=torch.device("cpu"), verbose=False
+        )
 
         assert result["r2"].shape == (n_variants, betas.shape[0])
         assert result["r2_mean"].shape == (n_variants,)
@@ -905,8 +947,14 @@ class TestSingleTrialCVHelper:
         multi = betas.unsqueeze(0).expand(n_variants, -1, -1).clone()
 
         result = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            zscore_by_run=False, device=torch.device("cpu"), verbose=False)
+            multi,
+            cids,
+            rids,
+            splits,
+            zscore_by_run=False,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         # All variants should produce identical R²
         for v in range(1, n_variants):
@@ -926,14 +974,26 @@ class TestSingleTrialCVHelper:
         # Without z-scoring: both should get same R² (CoD is scale-invariant for
         # condition-average predictions, since both prediction and actual scale)
         result_no_z = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            zscore_by_run=False, device=torch.device("cpu"), verbose=False)
+            multi,
+            cids,
+            rids,
+            splits,
+            zscore_by_run=False,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         # With z-scoring from reference (variant 0): variant 1 gets normalized
         result_z = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            zscore_by_run=True, reference_variant_idx=0,
-            device=torch.device("cpu"), verbose=False)
+            multi,
+            cids,
+            rids,
+            splits,
+            zscore_by_run=True,
+            reference_variant_idx=0,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         # Both variants should have valid R² in both cases
         assert result_no_z["r2"].shape == (2, betas.shape[0])
@@ -957,14 +1017,26 @@ class TestSingleTrialCVHelper:
         multi = torch.stack([betas, shifted], dim=0)
 
         r_ref0 = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            zscore_by_run=True, reference_variant_idx=0,
-            device=torch.device("cpu"), verbose=False)
+            multi,
+            cids,
+            rids,
+            splits,
+            zscore_by_run=True,
+            reference_variant_idx=0,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         r_ref1 = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            zscore_by_run=True, reference_variant_idx=1,
-            device=torch.device("cpu"), verbose=False)
+            multi,
+            cids,
+            rids,
+            splits,
+            zscore_by_run=True,
+            reference_variant_idx=1,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         # Results should differ because normalization stats come from different variants
         assert not torch.allclose(r_ref0["r2"], r_ref1["r2"], atol=1e-3)
@@ -981,8 +1053,8 @@ class TestSingleTrialCVHelper:
         splits = [([r for r in range(n_runs) if r != h], [h]) for h in range(n_runs)]
 
         result = single_trial_cv_helper(
-            betas, cids, rids, splits,
-            device=torch.device("cpu"), verbose=False)
+            betas, cids, rids, splits, device=torch.device("cpu"), verbose=False
+        )
 
         assert result["r2"].shape == (1, n_voxels)
         # Single condition: prediction = grand mean of train → should be mediocre
@@ -1000,8 +1072,8 @@ class TestSingleTrialCVHelper:
         multi = betas_mod.unsqueeze(0)
 
         result = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            device=torch.device("cpu"), verbose=False)
+            multi, cids, rids, splits, device=torch.device("cpu"), verbose=False
+        )
 
         assert result["r2"].shape == (1, betas.shape[0])
         assert torch.all(torch.isfinite(result["r2"]))
@@ -1014,12 +1086,12 @@ class TestSingleTrialCVHelper:
         multi = betas.unsqueeze(0)
 
         r_full = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            chunk_size=None, device=torch.device("cpu"), verbose=False)
+            multi, cids, rids, splits, chunk_size=None, device=torch.device("cpu"), verbose=False
+        )
 
         r_chunked = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            chunk_size=17, device=torch.device("cpu"), verbose=False)
+            multi, cids, rids, splits, chunk_size=17, device=torch.device("cpu"), verbose=False
+        )
 
         torch.testing.assert_close(r_full["r2"], r_chunked["r2"], atol=1e-5, rtol=1e-5)
 
@@ -1041,12 +1113,12 @@ class TestSingleTrialCVHelper:
         multi = torch.stack([betas * s for s in [0.2, 0.4, 0.6, 0.8, 1.0]])
 
         r_full = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            chunk_size=None, device=torch.device("cpu"), verbose=False)
+            multi, cids, rids, splits, chunk_size=None, device=torch.device("cpu"), verbose=False
+        )
 
         r_chunked = single_trial_cv_helper(
-            multi, cids, rids, splits,
-            chunk_size=17, device=torch.device("cpu"), verbose=False)
+            multi, cids, rids, splits, chunk_size=17, device=torch.device("cpu"), verbose=False
+        )
 
         assert r_full["r2"].shape == (n_variants, 100)
         assert r_chunked["r2"].shape == (n_variants, 100)
@@ -1066,18 +1138,29 @@ class TestSingleTrialCVHelper:
 
         # Use last variant (frac=1.0 / OLS) as test target
         r_full = single_trial_cv_helper(
-            multi, cids, rids, splits,
+            multi,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_variants - 1,
-            chunk_size=None, device=torch.device("cpu"), verbose=False)
+            chunk_size=None,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         r_chunked = single_trial_cv_helper(
-            multi, cids, rids, splits,
+            multi,
+            cids,
+            rids,
+            splits,
             test_variant_idx=n_variants - 1,
-            chunk_size=11, device=torch.device("cpu"), verbose=False)
+            chunk_size=11,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
 
         torch.testing.assert_close(r_full["r2"], r_chunked["r2"], atol=1e-5, rtol=1e-5)
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

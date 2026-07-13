@@ -7,6 +7,7 @@ with ``ffs_reml -add_fdr``.
 
 Validation compares AFNI FDRCURVE z(q) curves for every stat sub-brick.
 """
+
 from __future__ import annotations
 
 import re
@@ -84,6 +85,7 @@ def _ffs_reml_fdr(ctx: BenchmarkContext) -> Path:
 # AFNI HEAD FDRCURVE parser
 # ---------------------------------------------------------------------------
 
+
 def _read_afni_head_fdrcurves(head_path: Path) -> dict[int, dict]:
     """Parse FDRCURVE_NNNNNN float-attrs from an AFNI .HEAD file.
 
@@ -99,7 +101,7 @@ def _read_afni_head_fdrcurves(head_path: Path) -> dict[int, dict]:
         r"name\s*=\s*FDRCURVE_(\d+)\s*\n"
         r"count\s*=\s*(\d+)\s*\n"
         r"((?:[^\n]*\n)+?)"  # one-or-more value lines (non-greedy)
-        r"(?:\n|\Z)",        # terminated by blank line or EOF
+        r"(?:\n|\Z)",  # terminated by blank line or EOF
         re.MULTILINE,
     )
     for m in pattern.finditer(text):
@@ -163,6 +165,7 @@ def _read_nifti_fdrcurves(nifti_path: Path) -> dict[int, dict]:
 # FDR curve comparison
 # ---------------------------------------------------------------------------
 
+
 def _compare_fdr_curves(
     ref_curves: dict[int, dict],
     ffs_curves: dict[int, dict],
@@ -201,15 +204,17 @@ def _compare_fdr_curves(
             if np.std(z_ref_i) > 0 and np.std(z_ffs_i) > 0
             else 0.0
         )
-        per_brick.append({
-            "brick_idx": idx,
-            "mae": mae,
-            "max_ae": max_ae,
-            "r": corr,
-            "n_points": int(grid.size),
-            "stat_lo": float(lo),
-            "stat_hi": float(hi),
-        })
+        per_brick.append(
+            {
+                "brick_idx": idx,
+                "mae": mae,
+                "max_ae": max_ae,
+                "r": corr,
+                "n_points": int(grid.size),
+                "stat_lo": float(lo),
+                "stat_hi": float(hi),
+            }
+        )
 
     if not per_brick:
         return {"error": "no valid curve comparisons", "n_compared": 0}
@@ -229,6 +234,7 @@ def _compare_fdr_curves(
 # ---------------------------------------------------------------------------
 # Stage interface
 # ---------------------------------------------------------------------------
+
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
@@ -359,7 +365,10 @@ def validate(ctx: BenchmarkContext) -> dict:
 
     reml_result = compare_bucket_volumes(ref_head, ffs_path)
 
-    fdr_passed = "error" not in fdr_result and fdr_result.get("max_mae", 999) < THRESHOLDS["fdr_curve_max_mae"]
+    fdr_passed = (
+        "error" not in fdr_result
+        and fdr_result.get("max_mae", 999) < THRESHOLDS["fdr_curve_max_mae"]
+    )
     reml_passed = reml_result["min_r"] >= THRESHOLDS["reml_beta_min_r"]
     passed = fdr_passed and reml_passed
 

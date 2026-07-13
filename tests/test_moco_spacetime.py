@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.processing.affine import (
@@ -117,6 +118,7 @@ def test_zero_motion_zero_signal_is_identity():
     assert float((res.aligned - ts).abs().max()) < 0.05
 
 
+@pytest.mark.slow
 def test_reduces_stimulus_correlated_motion():
     """Timing-blind moco attributes slice-timing-staggered BOLD to motion; the
     space-time estimator removes that component and reports less spurious motion.

@@ -21,7 +21,7 @@ description = "HRF selection (GLMsingle Type B vs ffs_hrfopt -single_trials)"
 # so we use agreement percentage rather than correlation
 THRESHOLDS = {
     "hrf_index_agreement": 0.70,  # fraction of voxels with same HRF index
-    "r2_spatial_corr": 0.90,      # spatial correlation of R² maps
+    "r2_spatial_corr": 0.90,  # spatial correlation of R² maps
 }
 
 _DEFAULT_STIM_LABELS = ["faces", "bodies", "objects", "scenes", "scrambled"]
@@ -63,8 +63,7 @@ def _onset_files(ctx: BenchmarkContext) -> list[Path]:
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     gs = ctx.glmsingle_dir
-    for f in ["glmsingle_hrf_index.nii.gz", "glmsingle_r2_B.nii.gz",
-              "glmsingle_mask.nii.gz"]:
+    for f in ["glmsingle_hrf_index.nii.gz", "glmsingle_r2_B.nii.gz", "glmsingle_mask.nii.gz"]:
         p = gs / f
         if not p.exists():
             missing.append(f"GLMsingle: {p}")
@@ -99,6 +98,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
     timing" and falls back to cached arches.
     """
     from . import glmsingle_matlab
+
     return float(glmsingle_matlab.load_timings(ctx).get("type_b", 0.0))
 
 
@@ -140,15 +140,11 @@ def validate(ctx: BenchmarkContext) -> dict:
     ffs = ctx.ffs_hrfopt_dir
 
     # Load GLMsingle results
-    matlab_hrf_index = np.array(
-        nib.load(str(gs / "glmsingle_hrf_index.nii.gz")).dataobj
-    ).flatten()
-    matlab_r2 = np.array(
-        nib.load(str(gs / "glmsingle_r2_B.nii.gz")).dataobj
-    ).flatten()
-    matlab_mask = np.array(
-        nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj
-    ).flatten().astype(bool)
+    matlab_hrf_index = np.array(nib.load(str(gs / "glmsingle_hrf_index.nii.gz")).dataobj).flatten()
+    matlab_r2 = np.array(nib.load(str(gs / "glmsingle_r2_B.nii.gz")).dataobj).flatten()
+    matlab_mask = (
+        np.array(nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj).flatten().astype(bool)
+    )
 
     # Load FFS results. ffs_hrfopt writes hrf_index as 4D with 2 sub-briks:
     # [0] = chosen HRF index (1..N_HRFS), [1] = per-voxel quality/score.
@@ -175,11 +171,11 @@ def validate(ctx: BenchmarkContext) -> dict:
 
     # R² spatial correlation
     from ..validation import _pearson_r
+
     r2_corr = _pearson_r(matlab_r2[mask], ffs_r2[mask])
 
     passed = (
-        agreement >= THRESHOLDS["hrf_index_agreement"]
-        and r2_corr >= THRESHOLDS["r2_spatial_corr"]
+        agreement >= THRESHOLDS["hrf_index_agreement"] and r2_corr >= THRESHOLDS["r2_spatial_corr"]
     )
 
     summary = f"HRF agree={agreement:.1%}, R² r={r2_corr:.4f}"

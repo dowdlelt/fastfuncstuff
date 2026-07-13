@@ -41,54 +41,91 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # ── I/O ──
     g_io = p.add_argument_group("Input / Output")
-    g_io.add_argument("-base", required=True, metavar="MEAN.nii.gz",
-                      help="Reference EPI volume (3D). Typically the mean or "
-                           "base volume from motion correction")
+    g_io.add_argument(
+        "-base",
+        required=True,
+        metavar="MEAN.nii.gz",
+        help="Reference EPI volume (3D). Typically the mean or base volume from motion correction",
+    )
     g_mot = p.add_mutually_exclusive_group(required=True)
-    g_mot.add_argument("-aff12", metavar="MOCO.aff12.1D",
-                       help="AFNI-format .aff12.1D matrix file from ffs_moco "
-                            "(-1Dmatrix_save output, one 3x4 matrix per volume)")
-    g_mot.add_argument("-1Dfile", dest="onedfile", metavar="MOTION.1D",
-                       help="6-column motion parameter file from ffs_moco "
-                            "(-1Dfile output: roll pitch yaw dS dL dP)")
-    g_mot.add_argument("-dfile", metavar="DFILE.1D",
-                       help="9-column diagnostic file from ffs_moco "
-                            "(-dfile output: vol# roll pitch yaw dI dS dL rms_bef rms_aft)")
-    g_io.add_argument("-prefix", required=True, metavar="PREFIX",
-                      help="Output prefix. Produces PREFIX_motsim.1D (regressors)")
+    g_mot.add_argument(
+        "-aff12",
+        metavar="MOCO.aff12.1D",
+        help="AFNI-format .aff12.1D matrix file from ffs_moco "
+        "(-1Dmatrix_save output, one 3x4 matrix per volume)",
+    )
+    g_mot.add_argument(
+        "-1Dfile",
+        dest="onedfile",
+        metavar="MOTION.1D",
+        help="6-column motion parameter file from ffs_moco "
+        "(-1Dfile output: roll pitch yaw dS dL dP)",
+    )
+    g_mot.add_argument(
+        "-dfile",
+        metavar="DFILE.1D",
+        help="9-column diagnostic file from ffs_moco "
+        "(-dfile output: vol# roll pitch yaw dI dS dL rms_bef rms_aft)",
+    )
+    g_io.add_argument(
+        "-prefix",
+        required=True,
+        metavar="PREFIX",
+        help="Output prefix. Produces PREFIX_motsim.1D (regressors)",
+    )
     add_verbose_arg(g_io, default=1)
 
     # ── PCA options ──
     g_pca = p.add_argument_group("PCA Options")
-    g_pca.add_argument("-n_pcs", type=int, default=12, metavar="N",
-                       help="Number of PCs to extract [default: %(default)s]")
-    g_pca.add_argument("-variant", choices=["forward", "backward", "both"],
-                       default="both",
-                       help="Which simulation(s) to use: 'forward' = inverse-motion "
-                            "simulation only, 'backward' = re-registered simulation only, "
-                            "'both' = spatial concatenation (recommended, Patriat et al.) "
-                            "[default: %(default)s]")
+    g_pca.add_argument(
+        "-n_pcs",
+        type=int,
+        default=12,
+        metavar="N",
+        help="Number of PCs to extract [default: %(default)s]",
+    )
+    g_pca.add_argument(
+        "-variant",
+        choices=["forward", "backward", "both"],
+        default="both",
+        help="Which simulation(s) to use: 'forward' = inverse-motion "
+        "simulation only, 'backward' = re-registered simulation only, "
+        "'both' = spatial concatenation (recommended, Patriat et al.) "
+        "[default: %(default)s]",
+    )
 
     # ── Mask ──
     g_mask = p.add_argument_group("Masking")
-    g_mask.add_argument("-mask", default=None, metavar="MASK.nii.gz",
-                        help="Brain mask. If not provided, auto-generated from "
-                             "the reference via intensity thresholding")
-    g_mask.add_argument("-dilate", type=int, default=2, metavar="N",
-                        help="Dilate mask by N voxels to capture edge effects "
-                             "[default: %(default)s]")
+    g_mask.add_argument(
+        "-mask",
+        default=None,
+        metavar="MASK.nii.gz",
+        help="Brain mask. If not provided, auto-generated from "
+        "the reference via intensity thresholding",
+    )
+    g_mask.add_argument(
+        "-dilate",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Dilate mask by N voxels to capture edge effects [default: %(default)s]",
+    )
 
     # ── Processing ──
     g_proc = p.add_argument_group("Processing")
-    g_proc.add_argument("-interp", default="cubic",
-                        choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
-                        help="Interpolation method for resampling "
-                             "[default: %(default)s]")
-    g_proc.add_argument("-save_sim", action="store_true",
-                        help="Also save the simulated 4D volumes as NIfTI "
-                             "(PREFIX_forward.nii.gz, PREFIX_backward.nii.gz)")
-    g_proc.add_argument("-device", type=str, default=None,
-                        help="Force device: 'cuda', 'cpu', etc.")
+    g_proc.add_argument(
+        "-interp",
+        default="cubic",
+        choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
+        help="Interpolation method for resampling [default: %(default)s]",
+    )
+    g_proc.add_argument(
+        "-save_sim",
+        action="store_true",
+        help="Also save the simulated 4D volumes as NIfTI "
+        "(PREFIX_forward.nii.gz, PREFIX_backward.nii.gz)",
+    )
+    g_proc.add_argument("-device", type=str, default=None, help="Force device: 'cuda', 'cpu', etc.")
 
     return p.parse_args(argv)
 
@@ -126,8 +163,10 @@ def main(argv: list[str] | None = None) -> int:
     nifti_affine = header_info["affine"]
     if args.aff12:
         aff_xform = load_affine_1D(
-            args.aff12, output_affine=nifti_affine,
-            device=torch.device("cpu"), debug=(args.verb >= 2),
+            args.aff12,
+            output_affine=nifti_affine,
+            device=torch.device("cpu"),
+            debug=(args.verb >= 2),
         )
         matrices_vox = aff_xform.matrices  # (nt, 4, 4) in voxel space
         src_label = args.aff12
@@ -158,11 +197,12 @@ def main(argv: list[str] | None = None) -> int:
     prefix = args.prefix
     for ext in (".nii.gz", ".nii"):
         if prefix.endswith(ext):
-            prefix = prefix[:-len(ext)]
+            prefix = prefix[: -len(ext)]
 
     # --- Forward simulation ---
-    forward_sim = run_forward_sim(reference, matrices_vox, device,
-                                  interp=args.interp, verb=args.verb)
+    forward_sim = run_forward_sim(
+        reference, matrices_vox, device, interp=args.interp, verb=args.verb
+    )
 
     if args.save_sim:
         with spinner(f"Writing {Path(prefix).name}_forward.nii.gz"):
@@ -174,13 +214,15 @@ def main(argv: list[str] | None = None) -> int:
     backward_sim = None
     if args.variant in ("backward", "both"):
         backward_sim = run_backward_sim(
-            forward_sim, reference, device,
-            interp=args.interp, verb=args.verb,
+            forward_sim,
+            reference,
+            device,
+            interp=args.interp,
+            verb=args.verb,
         )
         if args.save_sim:
             with spinner(f"Writing {Path(prefix).name}_backward.nii.gz"):
-                save_image(backward_sim, f"{prefix}_backward.nii.gz",
-                           header_info=header_info)
+                save_image(backward_sim, f"{prefix}_backward.nii.gz", header_info=header_info)
             if args.verb >= 1:
                 print(f"Saved: {prefix}_backward.nii.gz")
 
@@ -193,8 +235,10 @@ def main(argv: list[str] | None = None) -> int:
         pca_input = torch.cat([forward_sim, backward_sim], dim=1)
 
     pcs, var_explained = extract_pcs(
-        pca_input, mask if args.variant != "both" else expand_mask_both(mask),
-        args.n_pcs, args.verb,
+        pca_input,
+        mask if args.variant != "both" else expand_mask_both(mask),
+        args.n_pcs,
+        args.verb,
     )
 
     # Save
@@ -203,9 +247,11 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = time.time() - t0
     if args.verb >= 1:
-        var_pct = [f"{v*100:.1f}%" for v in var_explained.tolist()]
-        print(f"Extracted {args.n_pcs} MotSim PCs ({args.variant}), "
-              f"var explained: {', '.join(var_pct)}")
+        var_pct = [f"{v * 100:.1f}%" for v in var_explained.tolist()]
+        print(
+            f"Extracted {args.n_pcs} MotSim PCs ({args.variant}), "
+            f"var explained: {', '.join(var_pct)}"
+        )
         print(f"Saved: {out_path}")
         print(f"Done. ({elapsed:.1f}s)")
 

@@ -117,7 +117,7 @@ class TestPrintDeviceInfo:
         """Test printing CUDA device info"""
         mock_props = mock.MagicMock()
         mock_props.total_memory = 16e9  # 16 GB
-        
+
         with mock.patch("torch.cuda.get_device_name", return_value="NVIDIA RTX 4090"):
             with mock.patch("torch.cuda.get_device_properties", return_value=mock_props):
                 print_device_info(torch.device("cuda"))

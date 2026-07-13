@@ -8,7 +8,9 @@ from __future__ import annotations
 
 
 def estimate_gpu_memory_bytes(
-    nx: int, ny: int, nz: int,
+    nx: int,
+    ny: int,
+    nz: int,
     n_basis_max: int = 30,
 ) -> dict[str, int]:
     """Estimate GPU memory usage for a qwarp run on a single 3D volume.
@@ -68,11 +70,14 @@ def estimate_gpu_memory_bytes(
 def estimate_gpu_memory_gb(nx: int, ny: int, nz: int) -> float:
     """Quick estimate of GPU memory needed in GB."""
     usage = estimate_gpu_memory_bytes(nx, ny, nz)
-    return usage["total"] / (1024 ** 3)
+    return usage["total"] / (1024**3)
 
 
 def compute_chunk_plan(
-    nx: int, ny: int, nz: int, nt: int,
+    nx: int,
+    ny: int,
+    nz: int,
+    nt: int,
     gpu_memory_gb: float = 15.0,
     safety_factor: float = 0.85,
 ) -> list[tuple[int, int]]:
@@ -90,7 +95,7 @@ def compute_chunk_plan(
     Returns:
         List of (start_t, end_t) tuples for each chunk. end_t is exclusive.
     """
-    available_bytes = int(gpu_memory_gb * (1024 ** 3) * safety_factor)
+    available_bytes = int(gpu_memory_gb * (1024**3) * safety_factor)
     per_volume = estimate_gpu_memory_bytes(nx, ny, nz)
 
     # Memory for one qwarp run: the full working set

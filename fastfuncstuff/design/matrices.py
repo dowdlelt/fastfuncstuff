@@ -874,9 +874,7 @@ def convolve_design_hrf(
     hrf_kernel = hrf.flip(0).unsqueeze(0).unsqueeze(0).expand(n_regressors, 1, -1)
 
     # Depthwise convolution: each regressor convolved independently
-    conv_result = F.conv1d(
-        design_batch, hrf_kernel, padding=len(hrf) // 2, groups=n_regressors
-    )
+    conv_result = F.conv1d(design_batch, hrf_kernel, padding=len(hrf) // 2, groups=n_regressors)
     convolved = conv_result.squeeze(0).T[:n_timepoints]
 
     return convolved
@@ -1295,8 +1293,11 @@ def save_iresp(
         # Save file
         output_file = f"{output_prefix}_iresp_{label}{nii_ext}"
         save_nifti(
-            cond_hrf, output_path=output_file,
-            reference_img=reference_img, affine=affine, tr=tr,
+            cond_hrf,
+            output_path=output_file,
+            reference_img=reference_img,
+            affine=affine,
+            tr=tr,
         )
         output_files.append(output_file)
 

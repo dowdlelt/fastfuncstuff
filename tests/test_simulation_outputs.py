@@ -57,7 +57,9 @@ def test_write_nifti_files_roundtrip_metadata(tmp_path):
     run1 = torch.arange(int(np.prod(run_shape)), dtype=torch.float32).reshape(run_shape)
     run2 = torch.full(run_shape, 7.0, dtype=torch.float32)
 
-    files = write_nifti_files([run1, run2], tr=tr, output_dir=tmp_path, prefix="run", voxel_size=voxel_size)
+    files = write_nifti_files(
+        [run1, run2], tr=tr, output_dir=tmp_path, prefix="run", voxel_size=voxel_size
+    )
 
     assert len(files) == 2
     first_img = nib.load(str(files[0]))

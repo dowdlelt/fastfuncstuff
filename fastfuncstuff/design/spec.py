@@ -9,6 +9,7 @@ which contrasts (with wildcards, ALLOTHERS, balancing, F-tests).
 
 Format reference: see ``../fmri_wiki/notes/design contrast rebuild.md``.
 """
+
 from __future__ import annotations
 
 import fnmatch
@@ -40,7 +41,7 @@ class MetaSpec:
     runs: list[RunSpec]
     tr: float
     n_timepoints_per_run: list[int]
-    polort: int | list[int] | Literal['auto'] = "auto"
+    polort: int | list[int] | Literal["auto"] = "auto"
     events_columns: EventsColumns = field(default_factory=EventsColumns)
     drop_trial_types: list[str] = field(
         default_factory=lambda: ["rest", "Rest", "REST", "baseline"]
@@ -51,10 +52,10 @@ class MetaSpec:
 @dataclass
 class EventSpec:
     trial_type: str
-    duration: float | Literal['from_events'] = "from_events"
+    duration: float | Literal["from_events"] = "from_events"
     hrf: str = "SPMG1(0)"
     mode: Literal["condition", "im"] = "condition"
-    round_onset: float | Literal['TR'] | None = None
+    round_onset: float | Literal["TR"] | None = None
     round_duration: float | None = None
 
 
@@ -87,7 +88,7 @@ class NuisanceSpec:
 @dataclass
 class ContrastSpec:
     label: str
-    sym: str | list[str]   # str = t-test, list = F-test rows
+    sym: str | list[str]  # str = t-test, list = F-test rows
     balance: Literal["none", "sum1", "zero"] = "none"
 
 
@@ -127,9 +128,9 @@ def load_spec(path: str | Path) -> Spec:
         n_timepoints_per_run=[int(x) for x in meta_raw["n_timepoints_per_run"]],
         polort=meta_raw.get("polort", "auto"),
         events_columns=events_columns,
-        drop_trial_types=list(meta_raw.get(
-            "drop_trial_types", ["rest", "Rest", "REST", "baseline"]
-        )),
+        drop_trial_types=list(
+            meta_raw.get("drop_trial_types", ["rest", "Rest", "REST", "baseline"])
+        ),
         censor=meta_raw.get("censor"),
     )
 
@@ -142,14 +143,10 @@ def load_spec(path: str | Path) -> Spec:
             raise ValueError(f"{path}: [[nuisance]] block missing 'label'")
         if n.scope == "glob":
             if not n.pattern:
-                raise ValueError(
-                    f"{path}: nuisance '{n.label}' has scope='glob' but no pattern"
-                )
+                raise ValueError(f"{path}: nuisance '{n.label}' has scope='glob' but no pattern")
         else:
             if not n.file:
-                raise ValueError(
-                    f"{path}: nuisance '{n.label}' (scope={n.scope!r}) needs 'file'"
-                )
+                raise ValueError(f"{path}: nuisance '{n.label}' (scope={n.scope!r}) needs 'file'")
             if n.scope != "full" and not n.scope.startswith("run:"):
                 raise ValueError(
                     f"{path}: nuisance '{n.label}': scope must be "
@@ -233,14 +230,15 @@ def write_spec(
     lines.append("")
     lines.append("# trial_type values to silently drop from the events TSVs before modelling.")
     lines.append("# Edit to add anything you treat as implicit baseline (e.g. 'iti', 'null').")
-    lines.append(
-        "drop_trial_types = "
-        + _toml_value(spec.meta.drop_trial_types)
-    )
+    lines.append("drop_trial_types = " + _toml_value(spec.meta.drop_trial_types))
     if spec.meta.censor:
         lines.append("")
-        lines.append("# AFNI-style outcount.1D keep mask (one value per *full* TR, nonzero = keep).")
-        lines.append("# Drives GoodList / NRowFull in the output xmat. Remove this line for no censoring.")
+        lines.append(
+            "# AFNI-style outcount.1D keep mask (one value per *full* TR, nonzero = keep)."
+        )
+        lines.append(
+            "# Drives GoodList / NRowFull in the output xmat. Remove this line for no censoring."
+        )
         lines.append(f'censor = "{spec.meta.censor}"')
     ec = spec.meta.events_columns
     lines.append("")
@@ -292,12 +290,12 @@ def write_spec(
     lines.append("#                duration field is ignored for this event.")
     lines.append("#")
     lines.append('# mode           "condition" — one regressor column for the whole condition (the')
-    lines.append('#                              normal first-level GLM column).')
+    lines.append("#                              normal first-level GLM column).")
     lines.append('#                "im"        — one column per event (AFNI -stim_times_IM), for')
     lines.append("#                              single-trial / amplitude-modulation analyses.")
     lines.append("#")
     lines.append("# round_onset    Pre-convolution onset rounding (applied before grouping).")
-    lines.append('#                  <number>  — round to this many decimal places (0 = integers)')
+    lines.append("#                  <number>  — round to this many decimal places (0 = integers)")
     lines.append('#                  "TR"      — snap to the nearest TR boundary')
     lines.append("#                  omitted   — no rounding")
     lines.append("#")
@@ -331,7 +329,7 @@ def write_spec(
     lines.append("# Fields:")
     lines.append("#")
     lines.append("# file     Path to a 1D file (one column per regressor, one row per TR).")
-    lines.append("#          Ignored when scope = \"glob\"; required otherwise.")
+    lines.append('#          Ignored when scope = "glob"; required otherwise.')
     lines.append("#")
     lines.append("# label    Name written into the xmat column header. Multi-column files get")
     lines.append("#          '#0', '#1', … suffixes automatically.")
@@ -348,7 +346,9 @@ def write_spec(
     lines.append("#                    rows). The other runs are zero-padded at compile time, so")
     lines.append("#                    the regressor only acts inside run N. RUN is 1-indexed.")
     lines.append("#                    Use one [[nuisance]] block per run when you have separate")
-    lines.append("#                    *un-padded* per-run files. ffs_reml's -ortvec_run does this.")
+    lines.append(
+        "#                    *un-padded* per-run files. ffs_reml's -ortvec_run does this."
+    )
     lines.append("#")
     lines.append('#          "glob"   The pattern field is a shell glob matching one file per')
     lines.append("#                    run. Each file must be one run long; the run index is")
@@ -356,7 +356,7 @@ def write_spec(
     lines.append("#                    falling back to trailing digits). Missing runs are")
     lines.append("#                    zero-padded. The convenience over many run:N blocks.")
     lines.append("#")
-    lines.append("# pattern  Shell glob — only set this when scope = \"glob\".")
+    lines.append('# pattern  Shell glob — only set this when scope = "glob".')
     lines.append("#")
     lines.append("# rescale  Per-column preprocessing applied before the regressor enters the")
     lines.append("#          design matrix.")
@@ -375,24 +375,24 @@ def write_spec(
         lines.append("# Examples:")
         lines.append("#")
         lines.append("# [[nuisance]]                        # full-length motion (sum of all runs)")
-        lines.append("# file = \"motion_demean.1D\"")
-        lines.append("# label = \"motion\"")
-        lines.append("# scope = \"full\"")
+        lines.append('# file = "motion_demean.1D"')
+        lines.append('# label = "motion"')
+        lines.append('# scope = "full"')
         lines.append("#")
         lines.append("# [[nuisance]]                        # AFNI-style block-diagonal demean")
-        lines.append("# file = \"mot_demean.r01.1D\"")
-        lines.append("# label = \"motion_r01\"")
-        lines.append("# scope = \"full\"")
+        lines.append('# file = "mot_demean.r01.1D"')
+        lines.append('# label = "motion_r01"')
+        lines.append('# scope = "full"')
         lines.append("#")
         lines.append("# [[nuisance]]                        # un-padded per-run file, zero-padded")
-        lines.append("# file = \"motion_run01.1D\"")
-        lines.append("# label = \"motion\"")
-        lines.append("# scope = \"run:1\"")
+        lines.append('# file = "motion_run01.1D"')
+        lines.append('# label = "motion"')
+        lines.append('# scope = "run:1"')
         lines.append("#")
         lines.append("# [[nuisance]]                        # glob over per-run files")
-        lines.append("# pattern = \"motion_run-*.1D\"")
-        lines.append("# label = \"motion\"")
-        lines.append("# scope = \"glob\"")
+        lines.append('# pattern = "motion_run-*.1D"')
+        lines.append('# label = "motion"')
+        lines.append('# scope = "glob"')
     for n in spec.nuisance:
         lines.append("")
         lines.append("[[nuisance]]")
@@ -418,7 +418,7 @@ def write_spec(
     lines.append("#")
     lines.append("# label    Short name written into the output bucket sub-brick(s).")
     lines.append("#")
-    lines.append('# sym      Either a SYM: string (t-test, one row) or an array of SYM: strings')
+    lines.append("# sym      Either a SYM: string (t-test, one row) or an array of SYM: strings")
     lines.append("#          (F-test, one row per array element). Token grammar:")
     lines.append("#            +w*label         coefficient w on `label`")
     lines.append("#            -w*label         coefficient -w on `label`")
@@ -435,7 +435,9 @@ def write_spec(
     lines.append("# balance  Post-resolution rescaling of the row weights:")
     lines.append('#            "none"  — leave weights as written.')
     lines.append('#            "sum1"  — divide every weight so they sum to 1 (an "average").')
-    lines.append('#            "zero"  — shift every weight by mean so they sum to 0 (a "contrast")')
+    lines.append(
+        '#            "zero"  — shift every weight by mean so they sum to 0 (a "contrast")'
+    )
     lines.append("#                      — useful for clean one-vs-rest tests where you do not")
     lines.append("#                      want to hand-balance the signs.")
     if include_contrast_examples:
@@ -443,19 +445,19 @@ def write_spec(
         lines.append("# Examples — uncomment and edit (replace stimA/stimB with your trial_types):")
         lines.append("#")
         lines.append("# [[contrasts]]                       # t-test, classic A minus B")
-        lines.append("# label = \"stimA_vs_stimB\"")
-        lines.append("# sym = \"SYM: +1*stimA -1*stimB\"")
-        lines.append("# balance = \"none\"")
+        lines.append('# label = "stimA_vs_stimB"')
+        lines.append('# sym = "SYM: +1*stimA -1*stimB"')
+        lines.append('# balance = "none"')
         lines.append("#")
         lines.append("# [[contrasts]]                       # t-test, one-vs-rest (auto-balanced)")
-        lines.append("# label = \"stimA_vs_rest\"")
-        lines.append("# sym = \"SYM: +1*stimA -ALLOTHERS\"")
-        lines.append("# balance = \"zero\"")
+        lines.append('# label = "stimA_vs_rest"')
+        lines.append('# sym = "SYM: +1*stimA -ALLOTHERS"')
+        lines.append('# balance = "zero"')
         lines.append("#")
         lines.append("# [[contrasts]]                       # F-test, any-of-N (multi-row sym)")
-        lines.append("# label = \"any_stim_F\"")
-        lines.append("# sym = [\"SYM: +1*stimA\", \"SYM: +1*stimB\"]")
-        lines.append("# balance = \"none\"")
+        lines.append('# label = "any_stim_F"')
+        lines.append('# sym = ["SYM: +1*stimA", "SYM: +1*stimB"]')
+        lines.append('# balance = "none"')
     for c in spec.contrasts:
         lines.append("")
         lines.append("[[contrasts]]")
@@ -534,7 +536,7 @@ def resolve_contrast_row(
             others_weight = 1.0 if w_str != "-" else -1.0
         else:
             others_weight = float(w_str)
-        s = (s[: m.start()] + s[m.end():]).strip()
+        s = (s[: m.start()] + s[m.end() :]).strip()
 
     # 2) Walk explicit tokens (including globs).
     explicit_labels: set[str] = set()
@@ -547,22 +549,16 @@ def resolve_contrast_row(
         if "*" in label:
             matches = [lbl for lbl in stim_labels if fnmatch.fnmatchcase(lbl, label)]
             if not matches:
-                raise ValueError(
-                    f"Glob '{label}' matched no stim labels. Available: {stim_labels}"
-                )
+                raise ValueError(f"Glob '{label}' matched no stim labels. Available: {stim_labels}")
             if rng is not None:
-                raise ValueError(
-                    f"Sub-range on a glob pattern '{label}{rng}' is not supported."
-                )
+                raise ValueError(f"Sub-range on a glob pattern '{label}{rng}' is not supported.")
             share = weight / len(matches)
             for lbl in matches:
                 resolved[lbl] = (resolved.get(lbl, (0.0, None))[0] + share, None)
                 explicit_labels.add(lbl)
         else:
             if label not in stim_labels:
-                raise ValueError(
-                    f"Contrast label '{label}' not in stim labels: {stim_labels}"
-                )
+                raise ValueError(f"Contrast label '{label}' not in stim labels: {stim_labels}")
             # Accumulate so '+1*A +1*A' sums (rare but well-defined).
             prev = resolved.get(label, (0.0, None))
             resolved[label] = (prev[0] + weight, rng)
@@ -572,9 +568,7 @@ def resolve_contrast_row(
     if others_weight is not None:
         others = [lbl for lbl in stim_labels if lbl not in explicit_labels]
         if not others:
-            raise ValueError(
-                "ALLOTHERS used but every stim label was already named explicitly."
-            )
+            raise ValueError("ALLOTHERS used but every stim label was already named explicitly.")
         share = others_weight / len(others)
         for lbl in others:
             resolved[lbl] = (share, None)
@@ -587,8 +581,7 @@ def resolve_contrast_row(
         total = sum(w for w, _ in resolved.values())
         if abs(total) < 1e-12:
             raise ValueError(
-                f"balance='sum1' on row '{sym}' but weights sum to 0; "
-                "cannot rescale to sum=1."
+                f"balance='sum1' on row '{sym}' but weights sum to 0; cannot rescale to sum=1."
             )
         resolved = {k: (w / total, r) for k, (w, r) in resolved.items()}
     elif balance == "zero":

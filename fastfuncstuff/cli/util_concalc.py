@@ -26,6 +26,7 @@ Outputs:
   -inplace    overwrite -stats (existing contrast sub-bricks are stripped
               and replaced; β / σ² / F sub-bricks are preserved).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -54,40 +55,69 @@ def _build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("-stats", required=True, metavar="FILE",
-                   help="Original Rbuck output (NIfTI). Read for β.")
-    p.add_argument("-rvar", required=False, metavar="FILE",
-                   help="Companion *_ffsremlvar file from ffs_reml. "
-                        "Sub-bricks 0/1/3 are a, b, StDev. Required for REML "
-                        "buckets; pass -ols for OLS buckets instead.")
-    p.add_argument("-ols", action="store_true",
-                   help="Treat -stats as an OLS bucket (no Rvar): "
-                        "one global (XᵀX)⁻¹, σ² derived per voxel from any "
-                        "existing β/t pair. Mutually exclusive with -rvar.")
-    p.add_argument("-fout", action="store_true",
-                   help="Also emit a <contrast>_Fstat sub-brick for every "
-                        "t-test contrast (F = t², dof=(1, residual)). F-test "
-                        "contrasts always emit Fstat regardless.")
-    p.add_argument("-spec", required=True, metavar="FILE",
-                   help="design.spec TOML. Every [[contrasts]] entry is "
-                        "recomputed. Extension auto-appended (.toml).")
-    p.add_argument("-out", metavar="FILE", default=None,
-                   help="Output path. Default: <stats stem>_concalc<ext>.")
-    p.add_argument("-inplace", action="store_true",
-                   help="Rewrite -stats in place, replacing all contrast "
-                        "sub-bricks. β / σ² / F sub-bricks are kept.")
-    p.add_argument("-mask", metavar="FILE",
-                   help="Optional brain mask. If absent, voxels with "
-                        "non-finite or all-zero (a, b) are skipped.")
-    p.add_argument("-matrix", metavar="FILE",
-                   help="Use an existing xmat instead of compiling -spec. "
-                        "Must match the original design column order.")
-    p.add_argument("-overwrite", action="store_true",
-                   help="Allow overwriting an existing output file.")
-    p.add_argument("-device", default=None,
-                   help="torch device override (cpu / cuda / mps).")
-    p.add_argument("-verb", type=int, default=1,
-                   help="0 = quiet, 1 = summary, 2 = per-bin progress.")
+    p.add_argument(
+        "-stats", required=True, metavar="FILE", help="Original Rbuck output (NIfTI). Read for β."
+    )
+    p.add_argument(
+        "-rvar",
+        required=False,
+        metavar="FILE",
+        help="Companion *_ffsremlvar file from ffs_reml. "
+        "Sub-bricks 0/1/3 are a, b, StDev. Required for REML "
+        "buckets; pass -ols for OLS buckets instead.",
+    )
+    p.add_argument(
+        "-ols",
+        action="store_true",
+        help="Treat -stats as an OLS bucket (no Rvar): "
+        "one global (XᵀX)⁻¹, σ² derived per voxel from any "
+        "existing β/t pair. Mutually exclusive with -rvar.",
+    )
+    p.add_argument(
+        "-fout",
+        action="store_true",
+        help="Also emit a <contrast>_Fstat sub-brick for every "
+        "t-test contrast (F = t², dof=(1, residual)). F-test "
+        "contrasts always emit Fstat regardless.",
+    )
+    p.add_argument(
+        "-spec",
+        required=True,
+        metavar="FILE",
+        help="design.spec TOML. Every [[contrasts]] entry is "
+        "recomputed. Extension auto-appended (.toml).",
+    )
+    p.add_argument(
+        "-out",
+        metavar="FILE",
+        default=None,
+        help="Output path. Default: <stats stem>_concalc<ext>.",
+    )
+    p.add_argument(
+        "-inplace",
+        action="store_true",
+        help="Rewrite -stats in place, replacing all contrast "
+        "sub-bricks. β / σ² / F sub-bricks are kept.",
+    )
+    p.add_argument(
+        "-mask",
+        metavar="FILE",
+        help="Optional brain mask. If absent, voxels with "
+        "non-finite or all-zero (a, b) are skipped.",
+    )
+    p.add_argument(
+        "-matrix",
+        metavar="FILE",
+        help="Use an existing xmat instead of compiling -spec. "
+        "Must match the original design column order.",
+    )
+    p.add_argument(
+        "-overwrite", action="store_true", help="Allow overwriting an existing output file."
+    )
+    p.add_argument("-device", default=None, help="torch device override (cpu / cuda / mps).")
+    p.add_argument(
+        "-verb", type=int, default=1, help="0 = quiet, 1 = summary, 2 = per-bin progress."
+    )
     return p
 
 
@@ -107,8 +137,8 @@ _XML_STATAUX_RE = re.compile(
 
 
 # AFNI numeric stat codes (a subset — what fitt/fift map to in BRICK_STATAUX).
-_STAT_CODE_TTEST = 3   # `fitt`
-_STAT_CODE_FTEST = 4   # `fift`
+_STAT_CODE_TTEST = 3  # `fitt`
+_STAT_CODE_FTEST = 4  # `fift`
 
 
 def _parse_stataux(xml_text: str) -> dict[int, tuple[int, tuple[float, ...]]]:
@@ -158,8 +188,7 @@ def _format_stataux_block(
         stataux_floats.extend([float(idx), float(code), float(len(params))])
         stataux_floats.extend(float(p) for p in params)
     # STATSYM: one entry per sub-brick, "none" for non-stat sub-bricks.
-    syms = [_statsym_for(*stataux[i]) if i in stataux else "none"
-            for i in range(n_sub)]
+    syms = [_statsym_for(*stataux[i]) if i in stataux else "none" for i in range(n_sub)]
     return (
         " " + "\n ".join(f"{v:g}" for v in stataux_floats),
         ";".join(syms),
@@ -178,7 +207,7 @@ def _read_brick_labels(img) -> list[str]:
 
     We check both, in that order.
     """
-    for ext in (img.header.extensions or []):
+    for ext in img.header.extensions or []:
         if ext.get_code() != 4:
             continue
         content = ext.get_content()
@@ -219,32 +248,32 @@ def _afni_bucket_extension(
         "<AFNI_attributes\n"
         f'  self_idcode="{idc}"\n'
         '  ni_form="ni_group" >\n',
-        '<AFNI_atr\n'
+        "<AFNI_atr\n"
         '  ni_type="String"\n'
         '  ni_dimen="1"\n'
         '  atr_name="BRICK_LABS" >\n'
         f' "{labs}"\n'
-        '</AFNI_atr>\n',
+        "</AFNI_atr>\n",
     ]
 
     if stataux:
         floats_str, sym_str = _format_stataux_block(stataux, len(labels))
         n_floats = sum(3 + len(p) for _, p in stataux.values())
         parts.append(
-            '<AFNI_atr\n'
+            "<AFNI_atr\n"
             '  ni_type="float"\n'
             f'  ni_dimen="{n_floats}"\n'
             '  atr_name="BRICK_STATAUX" >\n'
-            f'{floats_str}\n'
-            '</AFNI_atr>\n'
+            f"{floats_str}\n"
+            "</AFNI_atr>\n"
         )
         parts.append(
-            '<AFNI_atr\n'
+            "<AFNI_atr\n"
             '  ni_type="String"\n'
             '  ni_dimen="1"\n'
             '  atr_name="BRICK_STATSYM" >\n'
             f' "{sym_str}"\n'
-            '</AFNI_atr>\n'
+            "</AFNI_atr>\n"
         )
 
     parts.append("</AFNI_attributes>\n\x00")
@@ -271,18 +300,18 @@ def _afni_brick_labels_extension(labels: list[str], idcode: str | None = None):
     labs = "~".join(labels)
     idc = idcode or _generate_afni_idcode()
     payload = (
-        '<?xml version=\'1.0\' ?>\n'
-        '<AFNI_attributes\n'
+        "<?xml version='1.0' ?>\n"
+        "<AFNI_attributes\n"
         f'  self_idcode="{idc}"\n'
         '  ni_form="ni_group" >\n'
-        '<AFNI_atr\n'
+        "<AFNI_atr\n"
         '  ni_type="String"\n'
         '  ni_dimen="1"\n'
         '  atr_name="BRICK_LABS" >\n'
         f' "{labs}"\n'
-        '</AFNI_atr>\n'
-        '</AFNI_attributes>\n'
-        '\x00'
+        "</AFNI_atr>\n"
+        "</AFNI_attributes>\n"
+        "\x00"
     )
     return nib.nifti1.Nifti1Extension(4, payload.encode("utf-8"))
 
@@ -304,15 +333,14 @@ def _bin_index(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np
     valid : np.ndarray, shape (n_voxels,) bool
         Voxels with finite, in-range parameters.
     """
-    valid = (
-        np.isfinite(a) & np.isfinite(b)
-        & (np.abs(a) < 1.0) & (np.abs(b) < 1.0)
-    )
+    valid = np.isfinite(a) & np.isfinite(b) & (np.abs(a) < 1.0) & (np.abs(b) < 1.0)
     # Round to 3 dp so floating-point jitter doesn't fragment bins.
     ar = np.round(a, 3)
     br = np.round(b, 3)
     unique_ab, inverse = np.unique(
-        np.stack([ar, br], axis=1)[valid], axis=0, return_inverse=True,
+        np.stack([ar, br], axis=1)[valid],
+        axis=0,
+        return_inverse=True,
     )
     bin_idx = np.full(a.shape, -1, dtype=np.int64)
     bin_idx[valid] = inverse
@@ -342,8 +370,12 @@ def _xtxinv_per_bin(
     keep = np.zeros(n_bins, dtype=bool)
     for i, (a, b) in enumerate(unique_ab):
         R = build_arma11_covariance(
-            float(a), float(b), n_tp, device=device,
-            dtype=torch.float32, run_starts=run_starts,
+            float(a),
+            float(b),
+            n_tp,
+            device=device,
+            dtype=torch.float32,
+            run_starts=run_starts,
         )
         if R is None:
             continue
@@ -360,8 +392,7 @@ def _xtxinv_per_bin(
             continue
         keep[i] = True
         if verbose >= 2 and (i % 20 == 0 or i == n_bins - 1):
-            print(f"   bin {i + 1}/{n_bins}  (a={a:+.3f}, b={b:+.3f})",
-                  flush=True)
+            print(f"   bin {i + 1}/{n_bins}  (a={a:+.3f}, b={b:+.3f})", flush=True)
     return M_inv, keep
 
 
@@ -380,7 +411,8 @@ _CONTRAST_FSTAT_RE = re.compile(r"^(?P<name>.+?)_Fstat$")
 
 
 def _select_non_contrast_subbricks(
-    stats_labels: list[str], stim_base_labels: list[str],
+    stats_labels: list[str],
+    stim_base_labels: list[str],
 ) -> list[int]:
     """Return the indices of sub-bricks to *keep* when rewriting the bucket.
 
@@ -427,7 +459,10 @@ def _identify_subbricks(labels: list[str]) -> dict[str, list[int]]:
     - ``other``     overall Full_Fstat, partial R² etc. (kept verbatim)
     """
     groups: dict[str, list[int]] = {
-        "coef": [], "tstat": [], "contrast": [], "other": [],
+        "coef": [],
+        "tstat": [],
+        "contrast": [],
+        "other": [],
     }
     # Contrasts are anything whose Coef/Tstat label *doesn't* match a #0
     # suffix on a stim — but in practice everything in the bucket today is
@@ -569,6 +604,7 @@ def _save_bucket(
 ) -> None:
     """Write a 4D NIfTI with AFNI BRICK_LABS + BRICK_STATAUX + BRICK_STATSYM."""
     import nibabel as nib
+
     affine = reference_img.affine
     header = reference_img.header.copy()
     header.set_data_dtype(np.float32)
@@ -576,8 +612,7 @@ def _save_bucket(
     new_img = nib.Nifti1Image(data_4d.astype(np.float32), affine, header)
     # Strip pre-existing AFNI extensions; we re-add ours.
     new_img.header.extensions[:] = [
-        ext for ext in (new_img.header.extensions or [])
-        if ext.get_code() != 4
+        ext for ext in (new_img.header.extensions or []) if ext.get_code() != 4
     ]
     new_img.header.extensions.append(_afni_bucket_extension(labels, stataux))
     with spinner(f"Writing {out_path.name}"):
@@ -592,16 +627,14 @@ def main() -> int:
         print("ERROR: -rvar and -ols are mutually exclusive.", file=sys.stderr)
         return 1
     if not args.ols and not args.rvar:
-        print("ERROR: pass -rvar FILE (REML bucket) or -ols (OLS bucket).",
-              file=sys.stderr)
+        print("ERROR: pass -rvar FILE (REML bucket) or -ols (OLS bucket).", file=sys.stderr)
         return 1
 
     # ── 1) Resolve and compile the spec to get X + column labels ──────────
     spec_path = _resolve_spec_path(args.spec)
     spec = load_spec(spec_path)
     if not spec.contrasts:
-        print("ERROR: spec has no [[contrasts]] entries to compute.",
-              file=sys.stderr)
+        print("ERROR: spec has no [[contrasts]] entries to compute.", file=sys.stderr)
         return 1
 
     if args.matrix:
@@ -613,8 +646,10 @@ def main() -> int:
         if args.verb >= 1:
             print(f"📐 Compiling spec → {xmat_path}", flush=True)
         compile_ns = argparse.Namespace(
-            spec=str(spec_path), xmat=str(xmat_path),
-            verb=0, overwrite=True,
+            spec=str(spec_path),
+            xmat=str(xmat_path),
+            verb=0,
+            overwrite=True,
         )
         rc = _design_spec_compile(compile_ns)
         if rc != 0:
@@ -638,8 +673,7 @@ def main() -> int:
         else:
             base = lbl.split("#")[0] if "#" in lbl else lbl
             base_to_full.setdefault(base, lbl)
-    stim_base_labels = sorted({k for k in base_to_full.keys()
-                               if not k.startswith("Run#")})
+    stim_base_labels = sorted({k for k in base_to_full.keys() if not k.startswith("Run#")})
 
     resolved_rows_per_contrast = []
     for c in spec.contrasts:
@@ -647,14 +681,13 @@ def main() -> int:
         # Translate base labels back to the actual column names (face → face#0)
         translated = []
         for row in rows:
-            translated.append({
-                base_to_full.get(name, name): val for name, val in row.items()
-            })
+            translated.append({base_to_full.get(name, name): val for name, val in row.items()})
         resolved_rows_per_contrast.append((c.label, translated))
 
     # Resolve each contrast to an (n_rows, n_reg) matrix. n_rows == 1 → t-test,
     # n_rows > 1 → F-test (joint null on all rows).
     from fastfuncstuff.design.builder import glt_rows_to_matrix
+
     contrast_matrices: list[tuple[str, np.ndarray]] = []
     for label, rows in resolved_rows_per_contrast:
         mat = glt_rows_to_matrix(rows, column_labels, stim_ranges=None)
@@ -666,9 +699,11 @@ def main() -> int:
     # ── 3) Output path / overwrite guard ────────────────────────────────
     out_path = _resolve_output_path(args)
     if out_path.exists() and not args.overwrite and not args.inplace:
-        print(f"ERROR: output {out_path} already exists. "
-              "Pass -overwrite to replace, or -inplace to modify the input.",
-              file=sys.stderr)
+        print(
+            f"ERROR: output {out_path} already exists. "
+            "Pass -overwrite to replace, or -inplace to modify the input.",
+            file=sys.stderr,
+        )
         return 1
 
     # ── 4) Load Rvar and stats bucket ───────────────────────────────────
@@ -686,8 +721,10 @@ def main() -> int:
         with spinner(f"Loading {Path(args.rvar).name}"):
             rvar = load_nifti(args.rvar).get_fdata(dtype=np.float32)
         if rvar.shape[-1] < 4:
-            print(f"ERROR: Rvar has {rvar.shape[-1]} sub-bricks; expected ≥4 "
-                  "(a, b, lambda, StDev).", file=sys.stderr)
+            print(
+                f"ERROR: Rvar has {rvar.shape[-1]} sub-bricks; expected ≥4 (a, b, lambda, StDev).",
+                file=sys.stderr,
+            )
             return 1
         a_map = rvar[..., 0]
         b_map = rvar[..., 1]
@@ -700,15 +737,17 @@ def main() -> int:
         stats_data = stats_img.get_fdata(dtype=np.float32)
     stats_labels = _read_brick_labels(stats_img)
     if not stats_labels:
-        print("ERROR: stats bucket has no AFNI sub-brick labels; "
-              "cannot identify β columns.", file=sys.stderr)
+        print(
+            "ERROR: stats bucket has no AFNI sub-brick labels; cannot identify β columns.",
+            file=sys.stderr,
+        )
         return 1
 
     # Parse the input bucket's stat metadata so we can preserve per-sub-brick
     # dof info on the kept sub-bricks. Empty dict if absent — concalc still
     # writes correct STATAUX for the new contrast sub-bricks below.
     input_stataux: dict[int, tuple[int, tuple[float, ...]]] = {}
-    for ext in (stats_img.header.extensions or []):
+    for ext in stats_img.header.extensions or []:
         if ext.get_code() == 4:
             txt = ext.get_content()
             if isinstance(txt, bytes):
@@ -718,8 +757,11 @@ def main() -> int:
 
     vol_shape = stats_data.shape[:3] if args.ols else a_map.shape
     if not args.ols and stats_data.shape[:3] != vol_shape:
-        print(f"ERROR: stats and rvar volume shapes disagree "
-              f"({stats_data.shape[:3]} vs {vol_shape}).", file=sys.stderr)
+        print(
+            f"ERROR: stats and rvar volume shapes disagree "
+            f"({stats_data.shape[:3]} vs {vol_shape}).",
+            file=sys.stderr,
+        )
         return 1
 
     # ── 5) Mask ─────────────────────────────────────────────────────────
@@ -733,13 +775,17 @@ def main() -> int:
     else:
         # REML: voxels with non-finite or trivially-zero (a, b) get skipped.
         mask = (
-            np.isfinite(a_map) & np.isfinite(b_map)
-            & np.isfinite(stdev_map) & (stdev_map > 0)
+            np.isfinite(a_map)
+            & np.isfinite(b_map)
+            & np.isfinite(stdev_map)
+            & (stdev_map > 0)
             & ((a_map != 0) | (b_map != 0))
         )
 
-    device = torch.device(args.device) if args.device else (
-        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = (
+        torch.device(args.device)
+        if args.device
+        else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     )
     if args.verb >= 1:
         print(f"🖥️  Device: {device}")
@@ -750,7 +796,7 @@ def main() -> int:
     if args.ols:
         # OLS: covariance is I, so M = XᵀX and M_inv applies to every voxel.
         XtX_inv_global = torch.linalg.inv(X.T @ X)  # (n_reg, n_reg)
-        M_inv = XtX_inv_global.unsqueeze(0)         # (1, n_reg, n_reg)
+        M_inv = XtX_inv_global.unsqueeze(0)  # (1, n_reg, n_reg)
         bin_keep = np.array([True])
 
         # Derive σ² per voxel from any existing β/t pair. For OLS:
@@ -758,7 +804,10 @@ def main() -> int:
         # so σ² = (β/t)² / [(XᵀX)⁻¹]ᵢᵢ. Average across stims for robustness.
         XtX_inv_np = XtX_inv_global.cpu().numpy()
         sigma2_volume, deriv_mask = _derive_ols_sigma2(
-            stats_data, stats_labels, column_labels, XtX_inv_np,
+            stats_data,
+            stats_labels,
+            column_labels,
+            XtX_inv_np,
         )
         mask &= deriv_mask
         sigma2_vox = sigma2_volume[mask].astype(np.float32)
@@ -769,15 +818,16 @@ def main() -> int:
         n_bins = 1
         if args.verb >= 1:
             total = int(np.prod(vol_shape))
-            print(f"   Valid voxels: {n_vox}/{total} "
-                  f"({100.0 * n_vox / total:.1f}%) — σ² derived from "
-                  f"existing β/t pairs")
+            print(
+                f"   Valid voxels: {n_vox}/{total} "
+                f"({100.0 * n_vox / total:.1f}%) — σ² derived from "
+                f"existing β/t pairs"
+            )
     else:
         n_vox = int(mask.sum())
         if args.verb >= 1:
             total = int(np.prod(vol_shape))
-            print(f"   Valid voxels: {n_vox}/{total} "
-                  f"({100.0 * n_vox / total:.1f}%)")
+            print(f"   Valid voxels: {n_vox}/{total} ({100.0 * n_vox / total:.1f}%)")
         a_vox = a_map[mask]
         b_vox = b_map[mask]
         sigma2_vox = (stdev_map[mask].astype(np.float32)) ** 2
@@ -786,7 +836,11 @@ def main() -> int:
         if args.verb >= 1:
             print(f"🧮 Unique (a, b) bins: {n_bins}")
         M_inv, bin_keep = _xtxinv_per_bin(
-            X, unique_ab, run_starts, device, verbose=args.verb,
+            X,
+            unique_ab,
+            run_starts,
+            device,
+            verbose=args.verb,
         )
 
     # ── 7) Compute β per voxel by matching design columns to bucket β────
@@ -815,28 +869,41 @@ def main() -> int:
             var = cMc_vox * sigma2_vox
             cb = Cb[:, 0]
             tstat = np.where(
-                var > 0, cb / np.sqrt(np.clip(var, 1e-20, None)), 0.0,
+                var > 0,
+                cb / np.sqrt(np.clip(var, 1e-20, None)),
+                0.0,
             )
             cb[invalid_voxel] = 0.0
             tstat[invalid_voxel] = 0.0
-            contrast_results.append((
-                label, "t",
-                cb.astype(np.float32), tstat.astype(np.float32),
-            ))
+            contrast_results.append(
+                (
+                    label,
+                    "t",
+                    cb.astype(np.float32),
+                    tstat.astype(np.float32),
+                )
+            )
             if args.verb >= 1:
-                print(f"   {label} (t): cᵀβ peak={np.nanmax(np.abs(cb)):.3f}, "
-                      f"|t| peak={np.nanmax(np.abs(tstat)):.3f}")
+                print(
+                    f"   {label} (t): cᵀβ peak={np.nanmax(np.abs(cb)):.3f}, "
+                    f"|t| peak={np.nanmax(np.abs(tstat)):.3f}"
+                )
         else:
             # F-test: q = (Cβ)ᵀ (C M⁻¹ Cᵀ)⁻¹ (Cβ); F = q / (r · σ²).
             # CMC[bin] is (r, r); invert per-bin then apply per voxel.
             CMC_bins = torch.einsum(
-                "ir,brs,js->bij", C, M_inv, C,
+                "ir,brs,js->bij",
+                C,
+                M_inv,
+                C,
             )  # (n_bins, r, r)
             try:
                 CMC_bins_inv = torch.linalg.inv(CMC_bins)
             except RuntimeError as exc:
-                print(f"WARN: contrast {label!r}: CMᵢⱼC inversion failed "
-                      f"({exc}). Skipping.", file=sys.stderr)
+                print(
+                    f"WARN: contrast {label!r}: CMᵢⱼC inversion failed ({exc}). Skipping.",
+                    file=sys.stderr,
+                )
                 continue
             CMC_inv_np = CMC_bins_inv.cpu().numpy()  # (n_bins, r, r)
             # Per voxel: q = Cb[v]ᵀ · CMC_inv[bin[v]] · Cb[v]
@@ -898,12 +965,14 @@ def main() -> int:
                 out_subs.append(fstat_vol)
                 out_labels.append(f"{label}_Fstat")
                 out_stataux[len(out_labels) - 1] = (
-                    _STAT_CODE_FTEST, (1.0, float(dof_residual)),
+                    _STAT_CODE_FTEST,
+                    (1.0, float(dof_residual)),
                 )
                 n_new_subs += 1
             # Coef brick has no stat metadata; Tstat brick gets fitt(dof).
             out_stataux[len(out_labels) - 1] = (
-                _STAT_CODE_TTEST, (float(dof_residual),),
+                _STAT_CODE_TTEST,
+                (float(dof_residual),),
             )
             n_new_subs += 2
         else:  # "F"
@@ -919,7 +988,8 @@ def main() -> int:
                 1,
             )
             out_stataux[len(out_labels) - 1] = (
-                _STAT_CODE_FTEST, (float(f_n_rows), float(dof_residual)),
+                _STAT_CODE_FTEST,
+                (float(f_n_rows), float(dof_residual)),
             )
             del n_rows
             n_new_subs += 1
@@ -927,9 +997,10 @@ def main() -> int:
     out_4d = np.stack(out_subs, axis=-1)
 
     if args.verb >= 1:
-        print(f"💾 Writing {out_path} "
-              f"({out_4d.shape[-1]} sub-bricks, "
-              f"+{n_new_subs} new contrast)", flush=True)
+        print(
+            f"💾 Writing {out_path} ({out_4d.shape[-1]} sub-bricks, +{n_new_subs} new contrast)",
+            flush=True,
+        )
     _save_bucket(out_path, out_4d, out_labels, stats_img, stataux=out_stataux)
     return 0
 

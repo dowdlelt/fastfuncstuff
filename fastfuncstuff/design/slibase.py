@@ -12,6 +12,7 @@ physiological noise) that differ per imaging slice. A single ``.1D`` file holds
 
 Slices are the 3rd spatial (z) axis, matching AFNI's storage-order convention.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -29,9 +30,7 @@ def load_1d_matrix(path: str | Path) -> torch.Tensor:
     return torch.from_numpy(arr)
 
 
-def deinterleave_slibase(
-    mat: torch.Tensor, n_slices: int, slice_major: bool
-) -> torch.Tensor:
+def deinterleave_slibase(mat: torch.Tensor, n_slices: int, slice_major: bool) -> torch.Tensor:
     """De-interleave a ``(n_time, n_slices*m)`` matrix into ``(n_slices, n_time, m)``.
 
     Parameters
@@ -47,8 +46,7 @@ def deinterleave_slibase(
     n_time, n_cols = mat.shape
     if n_cols % n_slices != 0:
         raise ValueError(
-            f"slibase file has {n_cols} columns, not an integer multiple of "
-            f"n_slices={n_slices}"
+            f"slibase file has {n_cols} columns, not an integer multiple of n_slices={n_slices}"
         )
     m = n_cols // n_slices
     if slice_major:
@@ -83,14 +81,11 @@ def build_slice_blocks(
     return slice_blocks, labels
 
 
-def _one_file_block(
-    path: str, n_slices: int, n_timepoints: int, slice_major: bool
-) -> torch.Tensor:
+def _one_file_block(path: str, n_slices: int, n_timepoints: int, slice_major: bool) -> torch.Tensor:
     mat = load_1d_matrix(path)
     if mat.shape[0] != n_timepoints:
         raise ValueError(
-            f"slibase file '{path}' has {mat.shape[0]} rows but data has "
-            f"{n_timepoints} timepoints"
+            f"slibase file '{path}' has {mat.shape[0]} rows but data has {n_timepoints} timepoints"
         )
     return deinterleave_slibase(mat, n_slices, slice_major)
 

@@ -22,6 +22,7 @@ Theory:
 
 Both computed with AR(1) correction for realistic fMRI temporal autocorrelation.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -30,8 +31,7 @@ from scipy.linalg import toeplitz
 
 
 def estimate_ar1_coefficient(
-    residuals: torch.Tensor | np.ndarray,
-    device: torch.device | None = None
+    residuals: torch.Tensor | np.ndarray, device: torch.device | None = None
 ) -> float:
     """
     Estimate AR(1) coefficient from residuals
@@ -53,7 +53,7 @@ def estimate_ar1_coefficient(
         AR(1) coefficient (typically 0.2-0.4 for fMRI)
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Convert to numpy for scipy compatibility
     if torch.is_tensor(residuals):
@@ -76,9 +76,7 @@ def estimate_ar1_coefficient(
 
 
 def build_ar1_covariance_matrix(
-    n_timepoints: int,
-    rho: float,
-    device: torch.device | None = None
+    n_timepoints: int, rho: float, device: torch.device | None = None
 ) -> torch.Tensor:
     """
     Build AR(1) covariance matrix
@@ -100,12 +98,12 @@ def build_ar1_covariance_matrix(
         AR(1) covariance matrix
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Build Toeplitz matrix: Σ[i,j] = ρ^|i-j|
     order = np.arange(n_timepoints)
     sigma_np = toeplitz(order)
-    sigma_np = rho ** sigma_np
+    sigma_np = rho**sigma_np
 
     sigma = torch.tensor(sigma_np, dtype=torch.float32, device=device)
     return sigma
@@ -115,7 +113,7 @@ def gls_fit(
     Y: torch.Tensor | np.ndarray,
     X: torch.Tensor | np.ndarray,
     sigma: torch.Tensor | np.ndarray,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Generalized Least Squares (GLS) with known covariance
@@ -143,7 +141,7 @@ def gls_fit(
         'sigma_inv_sqrt': Cholesky factor of Sigma^(-1) for whitening
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Convert to tensors
     if not torch.is_tensor(Y):
@@ -196,11 +194,11 @@ def gls_fit(
     residuals = Y - X @ betas
 
     return {
-        'betas': betas,
-        'var_betas': var_betas,
-        'residuals': residuals,
-        'sigma_inv_sqrt': sigma_inv_sqrt,
-        'sigma_inv': sigma_inv,
+        "betas": betas,
+        "var_betas": var_betas,
+        "residuals": residuals,
+        "sigma_inv_sqrt": sigma_inv_sqrt,
+        "sigma_inv": sigma_inv,
     }
 
 
@@ -210,7 +208,7 @@ def compute_detection_power_empirical(
     contrast: torch.Tensor | np.ndarray | None = None,
     estimate_ar1: bool = True,
     rho: float | None = None,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, float | torch.Tensor]:
     """
     Compute detection power using GLS with AR(1) correction
@@ -250,7 +248,7 @@ def compute_detection_power_empirical(
         'var_contrast': float, variance of contrast estimate
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Convert to tensors
     if not torch.is_tensor(data):
@@ -300,7 +298,7 @@ def compute_detection_power_empirical(
 
     # Step 4: Compute detection power
     # Fd = 1 / trace(C * Var(β) * C')
-    var_betas = gls_results['var_betas']
+    var_betas = gls_results["var_betas"]
 
     # C * Var(β) * C' = scalar for 1D contrast
     var_contrast = contrast @ var_betas @ contrast
@@ -309,11 +307,11 @@ def compute_detection_power_empirical(
     detection_power = 1.0 / var_contrast.item()
 
     return {
-        'detection_power': detection_power,
-        'rho': rho,
-        'betas': gls_results['betas'],
-        'var_contrast': var_contrast.item(),
-        'var_betas': var_betas,
+        "detection_power": detection_power,
+        "rho": rho,
+        "betas": gls_results["betas"],
+        "var_contrast": var_contrast.item(),
+        "var_betas": var_betas,
     }
 
 
@@ -326,7 +324,7 @@ def compute_estimation_efficiency_empirical(
     estimate_ar1: bool = True,
     rho: float | None = None,
     tr: float = 1.0,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, float | torch.Tensor]:
     """
     Compute estimation efficiency using FIR design with GLS
@@ -373,7 +371,7 @@ def compute_estimation_efficiency_empirical(
         'var_contrast_fir': float, variance of contrast HRF estimate
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Convert to tensors
     if not torch.is_tensor(data):
@@ -441,18 +439,18 @@ def compute_estimation_efficiency_empirical(
     contrast_fir = torch.kron(contrast_cond, I_hrf)
 
     # Var(contrast_fir' * β_FIR) = contrast_fir' * Var(β_FIR) * contrast_fir
-    var_betas_fir = gls_results['var_betas']
+    var_betas_fir = gls_results["var_betas"]
     var_contrast_fir = contrast_fir @ var_betas_fir @ contrast_fir.T
 
     # Fe = 1 / trace(Var(HRF))
     estimation_efficiency = 1.0 / torch.trace(var_contrast_fir).item()
 
     return {
-        'estimation_efficiency': estimation_efficiency,
-        'rho': rho,
-        'betas_fir': gls_results['betas'],
-        'var_contrast_fir': torch.trace(var_contrast_fir).item(),
-        'hrf_estimate': gls_results['betas'][:hrf_length] if n_conditions == 1 else None,
+        "estimation_efficiency": estimation_efficiency,
+        "rho": rho,
+        "betas_fir": gls_results["betas"],
+        "var_contrast_fir": torch.trace(var_contrast_fir).item(),
+        "hrf_estimate": gls_results["betas"][:hrf_length] if n_conditions == 1 else None,
     }
 
 
@@ -464,7 +462,7 @@ def evaluate_design_empirical(
     hrf_length: int = 30,
     contrast: torch.Tensor | np.ndarray | None = None,
     tr: float = 1.0,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, float | torch.Tensor]:
     """
     Complete design evaluation: detection power + estimation efficiency
@@ -499,7 +497,7 @@ def evaluate_design_empirical(
         'summary': dict with key metrics
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Compute detection power
     power_results = compute_detection_power_empirical(
@@ -508,21 +506,28 @@ def evaluate_design_empirical(
 
     # Compute estimation efficiency (reuse AR(1) estimate)
     efficiency_results = compute_estimation_efficiency_empirical(
-        data, onsets, n_conditions, hrf_length, contrast,
-        estimate_ar1=False, rho=power_results['rho'], tr=tr, device=device
+        data,
+        onsets,
+        n_conditions,
+        hrf_length,
+        contrast,
+        estimate_ar1=False,
+        rho=power_results["rho"],
+        tr=tr,
+        device=device,
     )
 
     return {
-        'detection_power': power_results['detection_power'],
-        'estimation_efficiency': efficiency_results['estimation_efficiency'],
-        'rho': power_results['rho'],
-        'summary': {
-            'Fd': power_results['detection_power'],
-            'Fe': efficiency_results['estimation_efficiency'],
-            'rho_ar1': power_results['rho'],
+        "detection_power": power_results["detection_power"],
+        "estimation_efficiency": efficiency_results["estimation_efficiency"],
+        "rho": power_results["rho"],
+        "summary": {
+            "Fd": power_results["detection_power"],
+            "Fe": efficiency_results["estimation_efficiency"],
+            "rho_ar1": power_results["rho"],
         },
-        'details': {
-            'power': power_results,
-            'efficiency': efficiency_results,
-        }
+        "details": {
+            "power": power_results,
+            "efficiency": efficiency_results,
+        },
     }

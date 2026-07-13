@@ -186,15 +186,20 @@ def _print_moco_detail(validation: dict) -> None:
     msd_data = validation.get("timeseries_msd", {})
     msd_runs = msd_data.get("per_run", [])
     if msd_runs:
-        print(f"  Timeseries MSD (nrmsd: mean={msd_data.get('mean_nrmsd', 0):.4f}, "
-              f"max={msd_data.get('max_nrmsd', 0):.4f}):")
+        print(
+            f"  Timeseries MSD (nrmsd: mean={msd_data.get('mean_nrmsd', 0):.4f}, "
+            f"max={msd_data.get('max_nrmsd', 0):.4f}):"
+        )
         for entry in msd_runs:
             if "error" in entry:
-                print(f"    {entry.get('task', '?')} run-{entry.get('run', '?')}: ERROR {entry['error']}")
+                print(
+                    f"    {entry.get('task', '?')} run-{entry.get('run', '?')}: ERROR {entry['error']}"
+                )
             else:
                 task, run = entry.get("task", "?"), entry.get("run", "?")
-                print(f"    {task} run-{run}: msd={entry['mean_msd']:.2f}, "
-                      f"nrmsd={entry['nrmsd']:.4f}")
+                print(
+                    f"    {task} run-{run}: msd={entry['mean_msd']:.2f}, nrmsd={entry['nrmsd']:.4f}"
+                )
 
 
 _GLMSINGLE_FFS_STAGES = ("glmsingle_hrf", "glmsingle_denoise", "glmsingle_ridge")
@@ -247,7 +252,9 @@ def _glmsingle_aggregate(
 
 
 def print_timing_report(
-    results: list[StageResult], data_dir: Path | None = None, config: Any = None,
+    results: list[StageResult],
+    data_dir: Path | None = None,
+    config: Any = None,
 ) -> None:
     """Print a full timing + validation report table.
 
@@ -324,7 +331,9 @@ def print_timing_report(
             speedup_str = "-"
 
         summary_short = r.summary[:28] if r.summary else ""
-        print(f"{r.stage_name:<16} {ref_str:>12} {ffs_str:>10} {speedup_str:>10} {status}  {summary_short}")
+        print(
+            f"{r.stage_name:<16} {ref_str:>12} {ffs_str:>10} {speedup_str:>10} {status}  {summary_short}"
+        )
 
         # After the last GLMsingle FFS stage, print the pipeline aggregate row
         if r.stage_name == _GLMSINGLE_FFS_STAGES[-1]:
@@ -341,7 +350,9 @@ def print_timing_report(
                 else:
                     agg_ref_str = f"{agg_ref:.1f}"
                 agg_ffs_str = f"{agg_ffs:.1f}"
-                print(f"{'glmsingle(tot)':<16} {agg_ref_str:>12} {agg_ffs_str:>10} {agg_speedup:>10}        (hrf+denoise+ridge vs matlab)")
+                print(
+                    f"{'glmsingle(tot)':<16} {agg_ref_str:>12} {agg_ffs_str:>10} {agg_speedup:>10}        (hrf+denoise+ridge vs matlab)"
+                )
 
     print("-" * 80)
     if total_ffs > 0:
@@ -367,35 +378,35 @@ def print_timing_report(
 # If a stage has metrics matching these patterns, they're shown.
 _METRIC_DISPLAY = [
     # Correlations / R²
-    ("min_r",           "min r",         ".4f"),
-    ("mean_r",          "mean r",        ".4f"),
-    ("median_r",        "median r",      ".4f"),
-    ("overall_mean_r",  "overall mean r",".4f"),
-    ("r2_spatial_corr", "R² spatial r",  ".4f"),
+    ("min_r", "min r", ".4f"),
+    ("mean_r", "mean r", ".4f"),
+    ("median_r", "median r", ".4f"),
+    ("overall_mean_r", "overall mean r", ".4f"),
+    ("r2_spatial_corr", "R² spatial r", ".4f"),
     ("hrf_index_agreement", "HRF agree", ".1%"),
-    ("fracvalue_corr",  "frac r",        ".4f"),
-    ("beta_spatial_corr", "beta r",      ".4f"),
+    ("fracvalue_corr", "frac r", ".4f"),
+    ("beta_spatial_corr", "beta r", ".4f"),
     ("beta_timeseries_corr", "beta ts r", ".4f"),
     ("noisepool_jaccard", "noise Jaccard", ".3f"),
-    ("xvaltrend_corr",  "xval r",        ".3f"),
+    ("xvaltrend_corr", "xval r", ".3f"),
     # Differences
-    ("max_angle_diff",  "max angle diff",".3f"),
-    ("max_trans_diff",  "max trans diff", ".3f"),
-    ("mean_angle_diff", "mean angle diff",".3f"),
-    ("mean_trans_diff", "mean trans diff",".3f"),
+    ("max_angle_diff", "max angle diff", ".3f"),
+    ("max_trans_diff", "max trans diff", ".3f"),
+    ("mean_angle_diff", "mean angle diff", ".3f"),
+    ("mean_trans_diff", "mean trans diff", ".3f"),
     # Counts
-    ("pcnum_diff",      "PC num diff",   ".0f"),
-    ("n_valid_runs",    "valid runs",    ".0f"),
-    ("n_voxels",        "voxels",        "d"),
+    ("pcnum_diff", "PC num diff", ".0f"),
+    ("n_valid_runs", "valid runs", ".0f"),
+    ("n_voxels", "voxels", "d"),
     # Coverage
-    ("coverage_0.5",    "cov@0.5",       ".2f"),
+    ("coverage_0.5", "cov@0.5", ".2f"),
     ("overall_coverage_0.5", "overall cov@0.5", ".2f"),
     # MSD
-    ("mean_nrmsd",      "mean nrmsd",    ".4f"),
-    ("max_nrmsd",       "max nrmsd",     ".4f"),
+    ("mean_nrmsd", "mean nrmsd", ".4f"),
+    ("max_nrmsd", "max nrmsd", ".4f"),
     # ICA varnorm scale/offset
-    ("vn_scale",        "vn scale",      ".4f"),
-    ("vn_nrmse",        "vn nrmse",      ".4f"),
+    ("vn_scale", "vn scale", ".4f"),
+    ("vn_nrmse", "vn nrmse", ".4f"),
 ]
 
 
@@ -453,9 +464,11 @@ def _print_stage_details(results: list[StageResult]) -> None:
             if len(items) > 8:
                 # Summarize large groups (e.g. per-run arrays)
                 vals = [v for _, v in items]
-                print(f"    {group:<30} [{len(items)} values] "
-                      f"mean={sum(vals)/len(vals):.4f} "
-                      f"range=[{min(vals):.4f}, {max(vals):.4f}]")
+                print(
+                    f"    {group:<30} [{len(items)} values] "
+                    f"mean={sum(vals) / len(vals):.4f} "
+                    f"range=[{min(vals):.4f}, {max(vals):.4f}]"
+                )
             else:
                 for key, val in items:
                     # Use full dotted key for disambiguation
@@ -465,6 +478,7 @@ def _print_stage_details(results: list[StageResult]) -> None:
 # ---------------------------------------------------------------------------
 # Regression analysis
 # ---------------------------------------------------------------------------
+
 
 def _print_regression_analysis(
     results: list[StageResult],
@@ -539,14 +553,18 @@ def _print_regression_analysis(
         if regressions:
             for d in sorted(regressions, key=lambda x: abs(x.pct_change), reverse=True)[:5]:
                 arrow = "v" if d.higher_is_better else "^"
-                print(f"    {arrow} {d.name:<30} {d.previous:.4f} -> {d.current:.4f}  "
-                      f"({d.pct_change:+.1f}%)")
+                print(
+                    f"    {arrow} {d.name:<30} {d.previous:.4f} -> {d.current:.4f}  "
+                    f"({d.pct_change:+.1f}%)"
+                )
 
         if improvements:
             for d in sorted(improvements, key=lambda x: abs(x.pct_change), reverse=True)[:5]:
                 arrow = "^" if d.higher_is_better else "v"
-                print(f"    {arrow} {d.name:<30} {d.previous:.4f} -> {d.current:.4f}  "
-                      f"({d.pct_change:+.1f}%)")
+                print(
+                    f"    {arrow} {d.name:<30} {d.previous:.4f} -> {d.current:.4f}  "
+                    f"({d.pct_change:+.1f}%)"
+                )
 
     if n_stages_compared == 0:
         print("  No previous metrics to compare against.")
@@ -583,11 +601,9 @@ def _print_ffs_timing_trend(
     max_cols = 9
     raw_recent = get_recent_runs(data_dir, max_runs=50)
     recent = [
-        run for run in raw_recent
-        if any(
-            run.get("stages", {}).get(s, {}).get("ffs_seconds") is not None
-            for s in stage_names
-        )
+        run
+        for run in raw_recent
+        if any(run.get("stages", {}).get(s, {}).get("ffs_seconds") is not None for s in stage_names)
     ][:max_cols]
     if len(recent) < 2:
         return
@@ -624,7 +640,7 @@ def _short_arch(arch_id: str) -> str:
     """
     for prefix in ("cuda-NVIDIA_GeForce_", "cuda-NVIDIA_", "cuda-", "mps-Apple_", "mps-"):
         if arch_id.startswith(prefix):
-            return arch_id[len(prefix):].replace("_", " ")
+            return arch_id[len(prefix) :].replace("_", " ")
     # linux-x86_64 or darwin-arm64 style
     parts = arch_id.split("-", 1)
     if len(parts) == 2:

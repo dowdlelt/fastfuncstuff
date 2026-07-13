@@ -26,6 +26,7 @@ References:
 - Worsley & Friston (1995): Analysis of fMRI time-series revisited
 - Woolrich et al. (2001): Temporal autocorrelation in SPM
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -34,19 +35,21 @@ import torch
 from fastfuncstuff.utils import get_device, to_tensor
 
 
-def generate_fmri_noise(tr: float,
-                       duration_s: float,
-                       matrix_size: tuple[int, int] = (1, 1),
-                       fs_high: float = 10.0,
-                       resp_freq: float = 0.35,
-                       resp_width: float = 0.1,
-                       resp_strength: float = 3.0,
-                       cardiac_freq: float = 1.0,
-                       cardiac_width: float = 0.05,
-                       cardiac_strength: float = 5.0,
-                       pink_exp: float = 1.0,
-                       normalize: bool = True,
-                       device: torch.device | None = None) -> torch.Tensor:
+def generate_fmri_noise(
+    tr: float,
+    duration_s: float,
+    matrix_size: tuple[int, int] = (1, 1),
+    fs_high: float = 10.0,
+    resp_freq: float = 0.35,
+    resp_width: float = 0.1,
+    resp_strength: float = 3.0,
+    cardiac_freq: float = 1.0,
+    cardiac_width: float = 0.05,
+    cardiac_strength: float = 5.0,
+    pink_exp: float = 1.0,
+    normalize: bool = True,
+    device: torch.device | None = None,
+) -> torch.Tensor:
     """
     Generate realistic fMRI noise with 1/f spectrum and physiological components
 
@@ -108,14 +111,12 @@ def generate_fmri_noise(tr: float,
     power_spectrum = 1 / (freqs + 0.01) ** pink_exp
 
     # Respiratory component (broad Gaussian peak)
-    resp_component = resp_strength * torch.exp(
-        -((freqs - resp_freq) ** 2) / (2 * resp_width ** 2)
-    )
+    resp_component = resp_strength * torch.exp(-((freqs - resp_freq) ** 2) / (2 * resp_width**2))
     power_spectrum = power_spectrum + resp_component
 
     # Cardiac component (narrow Gaussian peak)
     cardiac_component = cardiac_strength * torch.exp(
-        -((freqs - cardiac_freq) ** 2) / (2 * cardiac_width ** 2)
+        -((freqs - cardiac_freq) ** 2) / (2 * cardiac_width**2)
     )
     power_spectrum = power_spectrum + cardiac_component
 
@@ -171,12 +172,14 @@ def generate_fmri_noise(tr: float,
     return noise_ts
 
 
-def generate_fmri_noise_batch(tr: float,
-                              duration_s: float,
-                              n_batches: int,
-                              matrix_size: tuple[int, int] = (1, 1),
-                              device: torch.device | None = None,
-                              **kwargs) -> torch.Tensor:
+def generate_fmri_noise_batch(
+    tr: float,
+    duration_s: float,
+    n_batches: int,
+    matrix_size: tuple[int, int] = (1, 1),
+    device: torch.device | None = None,
+    **kwargs,
+) -> torch.Tensor:
     """
     Generate multiple noise realizations in batch (for simulation studies)
 
@@ -211,10 +214,9 @@ def generate_fmri_noise_batch(tr: float,
     return torch.stack(noise_list, dim=0)
 
 
-def add_drift(data: torch.Tensor,
-              amplitude: float = 0.5,
-              n_modes: int = 3,
-              device: torch.device | None = None) -> torch.Tensor:
+def add_drift(
+    data: torch.Tensor, amplitude: float = 0.5, n_modes: int = 3, device: torch.device | None = None
+) -> torch.Tensor:
     """
     Add low-frequency drift to fMRI data (simulates scanner drift)
 
@@ -272,10 +274,12 @@ def add_drift(data: torch.Tensor,
     return data_with_drift.reshape(original_shape)
 
 
-def add_motion_artifacts(data: torch.Tensor,
-                        max_displacement: float = 2.0,
-                        n_spikes: int = 3,
-                        device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def add_motion_artifacts(
+    data: torch.Tensor,
+    max_displacement: float = 2.0,
+    n_spikes: int = 3,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Add motion spikes to fMRI data
 
@@ -326,11 +330,13 @@ def add_motion_artifacts(data: torch.Tensor,
     return data_with_motion, spike_times
 
 
-def generate_ar1_noise(rho: float,
-                       n_timepoints: int,
-                       n_voxels: int = 1,
-                       normalize: bool = True,
-                       device: torch.device | None = None) -> torch.Tensor:
+def generate_ar1_noise(
+    rho: float,
+    n_timepoints: int,
+    n_voxels: int = 1,
+    normalize: bool = True,
+    device: torch.device | None = None,
+) -> torch.Tensor:
     """
     Generate AR(1) temporally autocorrelated noise
 
@@ -393,7 +399,7 @@ def generate_ar1_noise(rho: float,
     # Sequential generation (vectorized across voxels)
     # This is fast enough for typical use cases
     for t in range(1, n_timepoints):
-        y[t] = rho * y[t-1] + epsilon[t]
+        y[t] = rho * y[t - 1] + epsilon[t]
 
     # First timepoint from stationary distribution
     y[0] = epsilon[0] / np.sqrt(1 - rho**2)
@@ -409,11 +415,13 @@ def generate_ar1_noise(rho: float,
         return y
 
 
-def generate_ar_noise(rho_coeffs: torch.Tensor | np.ndarray | list,
-                      n_timepoints: int,
-                      n_voxels: int = 1,
-                      normalize: bool = True,
-                      device: torch.device | None = None) -> torch.Tensor:
+def generate_ar_noise(
+    rho_coeffs: torch.Tensor | np.ndarray | list,
+    n_timepoints: int,
+    n_voxels: int = 1,
+    normalize: bool = True,
+    device: torch.device | None = None,
+) -> torch.Tensor:
     """
     Generate AR(p) temporally autocorrelated noise
 
@@ -478,7 +486,7 @@ def generate_ar_noise(rho_coeffs: torch.Tensor | np.ndarray | list,
     for t in range(p, n_timepoints):
         # Dot product with past p values
         # y[t] = sum(rho_coeffs * y[t-p:t].flip())
-        past_values = y[t-p:t].flip(0)  # Reverse to align with coefficients
+        past_values = y[t - p : t].flip(0)  # Reverse to align with coefficients
         y[t] = (rho_coeffs.unsqueeze(1) * past_values).sum(dim=0) + epsilon[t]
 
     # Initialize first p timepoints from innovations
@@ -495,12 +503,14 @@ def generate_ar_noise(rho_coeffs: torch.Tensor | np.ndarray | list,
         return y
 
 
-def generate_arma_noise(ar_coeffs: torch.Tensor | np.ndarray | list,
-                        ma_coeffs: torch.Tensor | np.ndarray | list,
-                        n_timepoints: int,
-                        n_voxels: int = 1,
-                        normalize: bool = True,
-                        device: torch.device | None = None) -> torch.Tensor:
+def generate_arma_noise(
+    ar_coeffs: torch.Tensor | np.ndarray | list,
+    ma_coeffs: torch.Tensor | np.ndarray | list,
+    n_timepoints: int,
+    n_voxels: int = 1,
+    normalize: bool = True,
+    device: torch.device | None = None,
+) -> torch.Tensor:
     """
     Generate ARMA(p,q) temporally autocorrelated noise
 
@@ -573,14 +583,14 @@ def generate_arma_noise(ar_coeffs: torch.Tensor | np.ndarray | list,
     for t in range(max_order, n_timepoints):
         # AR part: sum of past y values
         if p > 0:
-            past_y = y[t-p:t].flip(0)
+            past_y = y[t - p : t].flip(0)
             ar_part = (ar_coeffs.unsqueeze(1) * past_y).sum(dim=0)
         else:
             ar_part = 0
 
         # MA part: sum of past innovations
         if q > 0:
-            past_epsilon = epsilon[t-q:t].flip(0)
+            past_epsilon = epsilon[t - q : t].flip(0)
             ma_part = (ma_coeffs.unsqueeze(1) * past_epsilon).sum(dim=0)
         else:
             ma_part = 0
@@ -604,7 +614,7 @@ def estimate_noise_parameters_from_data(
     design: torch.Tensor | np.ndarray | None = None,
     mask: torch.Tensor | np.ndarray | None = None,
     ar_order: int = 1,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict:
     """
     Estimate noise parameters from real fMRI data
@@ -763,9 +773,10 @@ def estimate_noise_parameters_from_data(
                     acf.append(corr.item())
 
             # Build Toeplitz matrix R from acf[0:p]
-            R = torch.tensor([acf[abs(i-j)] for i in range(ar_order) for j in range(ar_order)],
-                           device=device).reshape(ar_order, ar_order)
-            r = torch.tensor(acf[1:ar_order+1], device=device)
+            R = torch.tensor(
+                [acf[abs(i - j)] for i in range(ar_order) for j in range(ar_order)], device=device
+            ).reshape(ar_order, ar_order)
+            r = torch.tensor(acf[1 : ar_order + 1], device=device)
 
             # Solve R * φ = r
             try:
@@ -784,22 +795,24 @@ def estimate_noise_parameters_from_data(
     noise_std = residuals.std().item()
 
     return {
-        'ar_coefficients': ar_coeffs_mean,  # Mean coefficients across voxels
-        'ar_coefficients_std': ar_coeffs_std,  # Std of coefficients
-        'ar_coefficients_all': ar_coeffs_per_voxel,  # All voxels (for distribution)
-        'sfnr': sfnr_mean,
-        'sfnr_std': sfnr_std,
-        'sfnr_all': sfnr_per_voxel.cpu().numpy().tolist(),
-        'noise_std': noise_std,
-        'n_voxels': n_voxels,
-        'n_timepoints': n_timepoints,
-        'summary': f"AR({ar_order}) = {ar_coeffs_mean}, SFNR = {sfnr_mean:.1f} ± {sfnr_std:.1f}"
+        "ar_coefficients": ar_coeffs_mean,  # Mean coefficients across voxels
+        "ar_coefficients_std": ar_coeffs_std,  # Std of coefficients
+        "ar_coefficients_all": ar_coeffs_per_voxel,  # All voxels (for distribution)
+        "sfnr": sfnr_mean,
+        "sfnr_std": sfnr_std,
+        "sfnr_all": sfnr_per_voxel.cpu().numpy().tolist(),
+        "noise_std": noise_std,
+        "n_voxels": n_voxels,
+        "n_timepoints": n_timepoints,
+        "summary": f"AR({ar_order}) = {ar_coeffs_mean}, SFNR = {sfnr_mean:.1f} ± {sfnr_std:.1f}",
     }
 
 
-def estimate_sfnr(data: torch.Tensor | np.ndarray,
-                  mask: torch.Tensor | np.ndarray | None = None,
-                  device: torch.device | None = None) -> dict:
+def estimate_sfnr(
+    data: torch.Tensor | np.ndarray,
+    mask: torch.Tensor | np.ndarray | None = None,
+    device: torch.device | None = None,
+) -> dict:
     """
     Estimate temporal Signal Fluctuation to Noise Ratio (SFNR)
 
@@ -880,9 +893,9 @@ def estimate_sfnr(data: torch.Tensor | np.ndarray,
         sfnr_map = sfnr.reshape(original_shape)
 
     return {
-        'sfnr_mean': sfnr_mean,
-        'sfnr_median': sfnr_median,
-        'sfnr_std': sfnr_std,
-        'sfnr_map': sfnr_map,
-        'summary': f"SFNR = {sfnr_mean:.1f} ± {sfnr_std:.1f} (median={sfnr_median:.1f})"
+        "sfnr_mean": sfnr_mean,
+        "sfnr_median": sfnr_median,
+        "sfnr_std": sfnr_std,
+        "sfnr_map": sfnr_map,
+        "summary": f"SFNR = {sfnr_mean:.1f} ± {sfnr_std:.1f} (median={sfnr_median:.1f})",
     }

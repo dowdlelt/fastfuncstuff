@@ -14,6 +14,7 @@ extract the maximum cluster size (voxel count) and maximum cluster mass
 null distribution; the cluster-size threshold at false-positive rate
 ``alpha`` is the ``(1 - alpha)`` quantile.
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -32,9 +33,35 @@ NN_TO_CONN = {1: 6, 2: 18, 3: 26}
 
 # 3dClustSim defaults: 29 pthr × 10 athr × {1-sided, 2-sided, bi-sided} × NN1/2/3.
 DEFAULT_PTHR = (
-    0.10, 0.09, 0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02, 0.015,
-    0.01, 0.007, 0.005, 0.003, 0.002, 0.0015, 0.001, 0.0007, 0.0005, 0.0003,
-    0.0002, 0.00015, 0.0001, 7e-5, 5e-5, 3e-5, 2e-5, 1.5e-5, 1e-5,
+    0.10,
+    0.09,
+    0.08,
+    0.07,
+    0.06,
+    0.05,
+    0.04,
+    0.03,
+    0.02,
+    0.015,
+    0.01,
+    0.007,
+    0.005,
+    0.003,
+    0.002,
+    0.0015,
+    0.001,
+    0.0007,
+    0.0005,
+    0.0003,
+    0.0002,
+    0.00015,
+    0.0001,
+    7e-5,
+    5e-5,
+    3e-5,
+    2e-5,
+    1.5e-5,
+    1e-5,
 )
 DEFAULT_ATHR = (0.10, 0.09, 0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01)
 DEFAULT_SIDED = ("1-sided", "2-sided", "bi-sided")
@@ -109,7 +136,8 @@ def _cluster_extent_mass_one(
                 continue
             sizes = np.bincount(lab.ravel(), minlength=n_lab + 1)[1:]
             masses = np.bincount(
-                lab.ravel(), weights=stat_for_mass.ravel(),
+                lab.ravel(),
+                weights=stat_for_mass.ravel(),
                 minlength=n_lab + 1,
             )[1:]
             all_sizes.append(sizes)
@@ -149,6 +177,7 @@ def _cluster_extent_mass_one(
 # Null distribution accumulator across (NN, sided, pthr)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ClusterNull:
     """Accumulates per-permutation max extent/mass for each (sided, NN, pthr).
@@ -168,6 +197,7 @@ class ClusterNull:
         Sidednesses to record.
     n_perms : int
     """
+
     pthr: tuple[float, ...] = DEFAULT_PTHR
     athr: tuple[float, ...] = DEFAULT_ATHR
     nns: tuple[int, ...] = DEFAULT_NN
@@ -181,12 +211,8 @@ class ClusterNull:
         self.n_perms = n_perms
         for sided in self.sideds:
             for nn in self.nns:
-                self.max_extent[(sided, nn)] = np.zeros(
-                    (n_perms, len(self.pthr)), dtype=np.int64
-                )
-                self.max_mass[(sided, nn)] = np.zeros(
-                    (n_perms, len(self.pthr)), dtype=np.float64
-                )
+                self.max_extent[(sided, nn)] = np.zeros((n_perms, len(self.pthr)), dtype=np.int64)
+                self.max_mass[(sided, nn)] = np.zeros((n_perms, len(self.pthr)), dtype=np.float64)
 
     def record(self, perm_idx: int, stat3d: np.ndarray, dof: int) -> None:
         """Record max extent/mass at every (sided, NN, pthr) for one perm."""
@@ -197,9 +223,7 @@ class ClusterNull:
                 # dependent splits otherwise) — same binary mask is fine, but
                 # cc3d label assignment depends on connectivity.
                 for nn in self.nns:
-                    ext, mass, _, _, _ = _cluster_extent_mass_one(
-                        stat3d, tcrit, sided, nn
-                    )
+                    ext, mass, _, _, _ = _cluster_extent_mass_one(stat3d, tcrit, sided, nn)
                     self.max_extent[(sided, nn)][perm_idx, ip] = ext
                     self.max_mass[(sided, nn)][perm_idx, ip] = mass
 
@@ -236,6 +260,7 @@ def _quantile_table(nulls: np.ndarray, athr: tuple[float, ...]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Per-permutation utility: max stat for voxelwise FWE
 # ---------------------------------------------------------------------------
+
 
 def max_abs_t_per_perm(t_pv: torch.Tensor, sidedness: str) -> np.ndarray:
     """Return ``[P]`` of per-permutation peak stat for voxelwise FWE.
@@ -348,14 +373,11 @@ def _null_worker_init(
     _NULL_WORKER_STATE["fast"] = fast
     if tcrits_override is not None:
         _NULL_WORKER_STATE["tcrits"] = {
-            (s, ip): float(tcrits_override[s][ip])
-            for s in sideds for ip in range(len(pthr))
+            (s, ip): float(tcrits_override[s][ip]) for s in sideds for ip in range(len(pthr))
         }
     else:
         _NULL_WORKER_STATE["tcrits"] = {
-            (s, ip): _t_critical(p, dof, s)
-            for s in sideds
-            for ip, p in enumerate(pthr)
+            (s, ip): _t_critical(p, dof, s) for s in sideds for ip, p in enumerate(pthr)
         }
 
     if fast:
@@ -376,7 +398,8 @@ def _null_worker_init(
                 arr = np.asarray(tcrits_override[s], dtype=np.float64)
             else:
                 arr = np.array(
-                    [_t_critical(p, dof, s) for p in pthr], dtype=np.float64,
+                    [_t_critical(p, dof, s) for p in pthr],
+                    dtype=np.float64,
                 )
             # Sort descending by tcrit (stricter pthr → larger tcrit).
             order = np.argsort(-arr)
@@ -422,9 +445,15 @@ def _null_worker_chunk(
             stat3d[:] = 0.0
             stat3d[mask] = t_chunk[i]
             res = cluster_extent_one_perm(
-                stat3d, mask_flat_idx, mask.shape, nns, sideds,
-                tcrits_by_sided, offsets_by_nn,
-                parent, size,
+                stat3d,
+                mask_flat_idx,
+                mask.shape,
+                nns,
+                sideds,
+                tcrits_by_sided,
+                offsets_by_nn,
+                parent,
+                size,
             )
             # Map descending-order results back into original pthr column order
             for s in sideds:
@@ -490,11 +519,11 @@ def accumulate_cluster_null(
         _null_worker_init(mask, dof, pthr, nns, sideds, fast, tcrits_override)
         bar = tqdm(total=n_perms, desc="cluster null", leave=True, disable=not verbose)
         for p in range(n_perms):
-            _, me, mm = _null_worker_chunk((p, t[p:p + 1]))
+            _, me, mm = _null_worker_chunk((p, t[p : p + 1]))
             for k, v in me.items():
-                null.max_extent[k][p:p + 1] = v
+                null.max_extent[k][p : p + 1] = v
             for k, v in mm.items():
-                null.max_mass[k][p:p + 1] = v
+                null.max_mass[k][p : p + 1] = v
             bar.update(1)
         bar.close()
         return null
@@ -522,9 +551,9 @@ def accumulate_cluster_null(
             perm_start, me, mm = fut.result()
             pc = next(iter(me.values())).shape[0]
             for k, v in me.items():
-                null.max_extent[k][perm_start:perm_start + pc] = v
+                null.max_extent[k][perm_start : perm_start + pc] = v
             for k, v in mm.items():
-                null.max_mass[k][perm_start:perm_start + pc] = v
+                null.max_mass[k][perm_start : perm_start + pc] = v
             bar.update(pc)
     finally:
         bar.close()

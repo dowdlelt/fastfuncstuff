@@ -48,9 +48,7 @@ class TestBasicGLM:
 
         # Check beta recovery
         assert results.betas.shape == (n_voxels, n_regressors)
-        assert torch.allclose(
-            results.betas, true_betas, atol=0.3
-        )  # Allow some noise tolerance
+        assert torch.allclose(results.betas, true_betas, atol=0.3)  # Allow some noise tolerance
 
         # Check R² is high (low noise)
         assert torch.all(results.r2 > 0.9)
@@ -396,9 +394,7 @@ class TestGLMBatchProcessing:
         # Sequential process
         betas_seq = []
         for v in range(n_voxels):
-            results_single = fit_glm(
-                data[v : v + 1], X, tr=1.0, verbose=False, device=device
-            )
+            results_single = fit_glm(data[v : v + 1], X, tr=1.0, verbose=False, device=device)
             betas_seq.append(results_single.betas)
 
         betas_seq = torch.cat(betas_seq, dim=0)
@@ -416,7 +412,7 @@ class TestGLMResultsToSpatial:
 
     def test_to_spatial_3d(self, device):
         """Test reshaping results back to 3D spatial format."""
-        
+
         torch.manual_seed(42)
         nx, ny, nz = 5, 6, 4
         n_voxels = nx * ny * nz
@@ -429,7 +425,7 @@ class TestGLMResultsToSpatial:
         data = signal.T
 
         results = fit_glm(data, X, tr=1.0, verbose=False, device=device)
-        
+
         # Store original shape and call to_spatial
         results.original_shape = (nx, ny, nz)
         results = results.to_spatial()
@@ -445,11 +441,11 @@ class TestGLMResultsToSpatial:
         import warnings
 
         from fastfuncstuff.glm.core import GLMResults
-        
+
         results = GLMResults()
         results.betas = torch.randn(100, 3)
         results.r2 = torch.randn(100)
-        
+
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             results.to_spatial()
@@ -508,15 +504,14 @@ class TestGLMMultiRun:
         n_runs = 2
 
         # Create data and design for each run
-        data_list = [torch.randn(n_voxels, n_timepoints_per_run, device=device)
-                     for _ in range(n_runs)]
-        design_list = [torch.randn(n_timepoints_per_run, n_regressors, device=device)
-                       for _ in range(n_runs)]
+        data_list = [
+            torch.randn(n_voxels, n_timepoints_per_run, device=device) for _ in range(n_runs)
+        ]
+        design_list = [
+            torch.randn(n_timepoints_per_run, n_regressors, device=device) for _ in range(n_runs)
+        ]
 
-        results = fit_glm(
-            data_list, design_list, tr=1.0,
-            verbose=False, device=device
-        )
+        results = fit_glm(data_list, design_list, tr=1.0, verbose=False, device=device)
 
         # Betas should have task regressors from all runs
         # Default behavior: n_runs * n_regressors task betas
@@ -533,17 +528,17 @@ class TestGLMMultiRun:
         n_extra = 3
         n_runs = 2
 
-        data_list = [torch.randn(n_voxels, n_timepoints, device=device)
-                     for _ in range(n_runs)]
-        design_list = [torch.randn(n_timepoints, n_task, device=device)
-                       for _ in range(n_runs)]
-        extra_list = [torch.randn(n_timepoints, n_extra, device=device)
-                      for _ in range(n_runs)]
+        data_list = [torch.randn(n_voxels, n_timepoints, device=device) for _ in range(n_runs)]
+        design_list = [torch.randn(n_timepoints, n_task, device=device) for _ in range(n_runs)]
+        extra_list = [torch.randn(n_timepoints, n_extra, device=device) for _ in range(n_runs)]
 
         results = fit_glm(
-            data_list, design_list, tr=1.0,
+            data_list,
+            design_list,
+            tr=1.0,
             extra_regressors=extra_list,
-            verbose=False, device=device
+            verbose=False,
+            device=device,
         )
 
         assert results.betas.shape[0] == n_voxels
@@ -568,11 +563,7 @@ class TestGLMAdvancedFeatures:
         X = torch.randn(n_timepoints, n_regressors, device=device)
         data = torch.randn(n_voxels, n_timepoints, device=device)
 
-        results = fit_glm(
-            data, X, tr=1.0,
-            use_double=True,
-            verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=1.0, use_double=True, verbose=False, device=device)
 
         # Results should be in float64. On MPS (no float64) fit_glm honours the
         # request by transparently running the fit on CPU, so betas are still
@@ -594,9 +585,7 @@ class TestGLMAdvancedFeatures:
         data_cpu = data.cpu()
 
         results = fit_glm(
-            data_cpu, X, tr=1.0,
-            preload_data_to_device=False,
-            verbose=False, device=device
+            data_cpu, X, tr=1.0, preload_data_to_device=False, verbose=False, device=device
         )
 
         assert results.betas.shape == (n_voxels, n_regressors)
@@ -616,10 +605,7 @@ class TestGLMAdvancedFeatures:
         data = signal.T + 0.1 * torch.randn(n_voxels, n_timepoints, device=device)
 
         results = fit_glm(
-            data, X, tr=1.0,
-            want_residuals=True,
-            want_predicted=True,
-            verbose=False, device=device
+            data, X, tr=1.0, want_residuals=True, want_predicted=True, verbose=False, device=device
         )
 
         # Should have residuals and predicted
@@ -639,11 +625,7 @@ class TestGLMAdvancedFeatures:
         X = torch.randn(n_timepoints, n_regressors, device=device)
         data = torch.randn(n_voxels, n_timepoints, device=device)
 
-        results = fit_glm(
-            data, X, tr=1.0,
-            want_r2_partial=True,
-            verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=1.0, want_r2_partial=True, verbose=False, device=device)
 
         # Should have partial R²
         assert results.r2_partial is not None
@@ -662,11 +644,7 @@ class TestGLMAdvancedFeatures:
         X = torch.randn(n_timepoints, n_regressors, device=device)
         data = torch.randn(n_voxels, n_timepoints, device=device)
 
-        results = fit_glm(
-            data, X, tr=1.0,
-            want_r2_semipartial=True,
-            verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=1.0, want_r2_semipartial=True, verbose=False, device=device)
 
         # Should have semi-partial R²
         assert results.r2_semipartial is not None
@@ -696,11 +674,14 @@ class TestGLMContrasts:
         glt_matrices = [np.array([1.0, 0.0, 0.0])]
 
         results = fit_glm(
-            data, X, tr=1.0,
+            data,
+            X,
+            tr=1.0,
             max_poly_degree=-1,  # No polynomial to keep regressor count simple
             glt_labels=glt_labels,
             glt_matrices=glt_matrices,
-            verbose=False, device=device
+            verbose=False,
+            device=device,
         )
 
         assert results.contrast_labels == glt_labels
@@ -726,11 +707,14 @@ class TestGLMContrasts:
         glt_matrices = [np.array([1.0, -1.0])]
 
         results = fit_glm(
-            data, X, tr=1.0,
+            data,
+            X,
+            tr=1.0,
             max_poly_degree=-1,
             glt_labels=glt_labels,
             glt_matrices=glt_matrices,
-            verbose=False, device=device
+            verbose=False,
+            device=device,
         )
 
         # Contrast beta should be approximately 5 - 1 = 4
@@ -740,4 +724,3 @@ class TestGLMContrasts:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

@@ -10,6 +10,7 @@ because it collapses to per-condition onset arrays and loses the
 row-by-row context (custom column values, run-of-origin) we need for
 arbitrary column selection and run-block exchangeability.
 """
+
 from __future__ import annotations
 
 import csv
@@ -34,6 +35,7 @@ class EventsTable:
     columns : list[str]
         Union of column names seen across files (preserves first-seen order).
     """
+
     rows: list[dict[str, str]]
     run_idx: np.ndarray
     columns: list[str]
@@ -44,10 +46,7 @@ class EventsTable:
     def column(self, name: str) -> np.ndarray:
         """Return column values as a length-N string ndarray."""
         if name not in self.columns:
-            raise KeyError(
-                f"Column '{name}' not found in events.\n"
-                f"  Available: {self.columns}"
-            )
+            raise KeyError(f"Column '{name}' not found in events.\n  Available: {self.columns}")
         return np.array([r.get(name, "") for r in self.rows], dtype=object)
 
 
@@ -90,19 +89,21 @@ def load_events(paths: list[str | Path], drop_na: bool = True) -> EventsTable:
 # Selection
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class OneSampleSelection:
     """Indices of trials to test, plus run-block labels for those trials."""
-    indices: np.ndarray   # int64, into the full N
-    blocks: np.ndarray    # int64, run index per selected trial
-    label: str            # condition name used (for output naming)
+
+    indices: np.ndarray  # int64, into the full N
+    blocks: np.ndarray  # int64, run index per selected trial
+    label: str  # condition name used (for output naming)
 
 
 @dataclass
 class TwoSampleSelection:
-    indices: np.ndarray   # int64, concatenated [A, B]
-    group: np.ndarray     # int8, 1 for A, 0 for B
-    blocks: np.ndarray    # int64, run index per selected trial
+    indices: np.ndarray  # int64, concatenated [A, B]
+    group: np.ndarray  # int8, 1 for A, 0 for B
+    blocks: np.ndarray  # int64, run index per selected trial
     label_a: str
     label_b: str
 
@@ -110,12 +111,11 @@ class TwoSampleSelection:
 def select_one_sample(events: EventsTable, col: str, label: str) -> OneSampleSelection:
     """Pick trials where ``events[col] == label``."""
     vals = events.column(col)
-    mask = (vals == label)
+    mask = vals == label
     idx = np.where(mask)[0]
     if idx.size < 3:
         raise ValueError(
-            f"Only {idx.size} trial(s) matched {col}={label!r}; need ≥ 3 for a "
-            "1-sample test."
+            f"Only {idx.size} trial(s) matched {col}={label!r}; need ≥ 3 for a 1-sample test."
         )
     return OneSampleSelection(
         indices=idx.astype(np.int64),
@@ -125,7 +125,10 @@ def select_one_sample(events: EventsTable, col: str, label: str) -> OneSampleSel
 
 
 def select_two_sample(
-    events: EventsTable, col: str, label_a: str, label_b: str,
+    events: EventsTable,
+    col: str,
+    label_a: str,
+    label_b: str,
 ) -> TwoSampleSelection:
     """Pick two distinct labels in the same column for a 2-sample test."""
     if label_a == label_b:
@@ -139,10 +142,12 @@ def select_two_sample(
             f"{idx_b.size} for {label_b!r}."
         )
     idx = np.concatenate([idx_a, idx_b]).astype(np.int64)
-    group = np.concatenate([
-        np.ones(idx_a.size, dtype=np.int8),
-        np.zeros(idx_b.size, dtype=np.int8),
-    ])
+    group = np.concatenate(
+        [
+            np.ones(idx_a.size, dtype=np.int8),
+            np.zeros(idx_b.size, dtype=np.int8),
+        ]
+    )
     return TwoSampleSelection(
         indices=idx,
         group=group,
@@ -153,7 +158,10 @@ def select_two_sample(
 
 
 def select_one_vs_all(
-    events: EventsTable, col: str, label: str, drop_values: tuple[str, ...] = (),
+    events: EventsTable,
+    col: str,
+    label: str,
+    drop_values: tuple[str, ...] = (),
 ) -> TwoSampleSelection:
     """Group A = trials with ``col == label``; group B = all other trials.
 
@@ -170,10 +178,12 @@ def select_one_vs_all(
             "others; need ≥ 2 of each."
         )
     idx = np.concatenate([idx_a, idx_b]).astype(np.int64)
-    group = np.concatenate([
-        np.ones(idx_a.size, dtype=np.int8),
-        np.zeros(idx_b.size, dtype=np.int8),
-    ])
+    group = np.concatenate(
+        [
+            np.ones(idx_a.size, dtype=np.int8),
+            np.zeros(idx_b.size, dtype=np.int8),
+        ]
+    )
     other_label = f"not-{label}"
     return TwoSampleSelection(
         indices=idx,

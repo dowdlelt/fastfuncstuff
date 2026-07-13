@@ -6,6 +6,7 @@ then runs `concalc` to add contrasts to that bucket. It compares the concalc
 output against a second `ffs_reml` run *with* the same contrasts baked into
 the spec — they should agree to within float32 round-off.
 """
+
 from __future__ import annotations
 
 import nibabel as nib
@@ -21,20 +22,24 @@ def test_select_non_contrast_subbricks_keeps_stim_drops_contrast():
     from fastfuncstuff.cli.util_concalc import _select_non_contrast_subbricks
 
     labels = [
-        "Full_Fstat",        # keep (overall F)
-        "DI#0_Coef",         # keep (stim coef)
-        "DI#0_Tstat",        # keep (stim t)
-        "PI#0_Coef",         # keep
-        "PI#0_Tstat",        # keep
-        "FvH_Coef",          # drop (old contrast)
-        "FvH_Tstat",         # drop
-        "anyOf_Fstat",       # drop (old F-test contrast)
-        "Mask",              # keep (unknown shape, preserved)
+        "Full_Fstat",  # keep (overall F)
+        "DI#0_Coef",  # keep (stim coef)
+        "DI#0_Tstat",  # keep (stim t)
+        "PI#0_Coef",  # keep
+        "PI#0_Tstat",  # keep
+        "FvH_Coef",  # drop (old contrast)
+        "FvH_Tstat",  # drop
+        "anyOf_Fstat",  # drop (old F-test contrast)
+        "Mask",  # keep (unknown shape, preserved)
     ]
     keep = _select_non_contrast_subbricks(labels, stim_base_labels=["DI", "PI"])
     assert [labels[i] for i in keep] == [
-        "Full_Fstat", "DI#0_Coef", "DI#0_Tstat",
-        "PI#0_Coef", "PI#0_Tstat", "Mask",
+        "Full_Fstat",
+        "DI#0_Coef",
+        "DI#0_Tstat",
+        "PI#0_Coef",
+        "PI#0_Tstat",
+        "Mask",
     ]
 
 
@@ -46,8 +51,7 @@ def test_brick_labels_extension_round_trip(tmp_path):
         _read_brick_labels,
     )
 
-    labels_in = ["Full_Fstat", "DI#0_Coef", "DI#0_Tstat",
-                 "FvH_Coef", "FvH_Tstat", "any_Fstat"]
+    labels_in = ["Full_Fstat", "DI#0_Coef", "DI#0_Tstat", "FvH_Coef", "FvH_Tstat", "any_Fstat"]
     arr = np.zeros((4, 4, 4, len(labels_in)), dtype=np.float32)
     img = nib.Nifti1Image(arr, np.eye(4))
     img.header.extensions.append(_afni_brick_labels_extension(labels_in))
@@ -67,14 +71,18 @@ def test_stataux_parses_and_round_trips(tmp_path):
     )
 
     labels = [
-        "Full_Fstat", "DI#0_Coef", "DI#0_Tstat", "FvH_Coef", "FvH_Tstat",
+        "Full_Fstat",
+        "DI#0_Coef",
+        "DI#0_Tstat",
+        "FvH_Coef",
+        "FvH_Tstat",
         "anyOf_Fstat",
     ]
     stataux = {
-        0: (4, (7.0, 1052.0)),    # Full_Fstat: Ftest(7,1052)
-        2: (3, (1052.0,)),        # DI#0_Tstat: Ttest(1052)
-        4: (3, (1052.0,)),        # FvH_Tstat
-        5: (4, (4.0, 1052.0)),    # anyOf_Fstat
+        0: (4, (7.0, 1052.0)),  # Full_Fstat: Ftest(7,1052)
+        2: (3, (1052.0,)),  # DI#0_Tstat: Ttest(1052)
+        4: (3, (1052.0,)),  # FvH_Tstat
+        5: (4, (4.0, 1052.0)),  # anyOf_Fstat
     }
 
     arr = np.zeros((2, 2, 2, len(labels)), dtype=np.float32)
@@ -105,9 +113,7 @@ def test_legacy_brick_labs_form_still_readable(tmp_path):
     arr = np.zeros((2, 2, 2, 3), dtype=np.float32)
     img = nib.Nifti1Image(arr, np.eye(4))
     payload = b"BRICK_LABS=alpha~beta~gamma\x00"
-    img.header.extensions.append(
-        nib.nifti1.Nifti1Extension(4, payload)
-    )
+    img.header.extensions.append(nib.nifti1.Nifti1Extension(4, payload))
     p = tmp_path / "legacy.nii.gz"
     nib.save(img, p)
     assert _read_brick_labels(nib.load(p)) == ["alpha", "beta", "gamma"]

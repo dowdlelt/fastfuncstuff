@@ -414,8 +414,6 @@ def temporal_ica(
             "k_sica": int(k_sica),
             "k_tica": int(n_components),
             "icasso_runs": int(icasso_runs),
-            "n_stable_iq0.5": (
-                int((stability > 0.5).sum()) if stability is not None else None
-            ),
+            "n_stable_iq0.5": (int((stability > 0.5).sum()) if stability is not None else None),
         },
     )

@@ -356,8 +356,7 @@ def parse_glt_string(
         matches = token_pattern.findall(row_clean)
         if not matches:
             raise ValueError(
-                f"Could not parse GLT row: '{row_str}'. "
-                "Expected format: '+1*label1 -1*label2'"
+                f"Could not parse GLT row: '{row_str}'. Expected format: '+1*label1 -1*label2'"
             )
 
         row_weights: dict[str, _LabelWeight] = {}
@@ -367,9 +366,7 @@ def parse_glt_string(
             if range_lo and range_hi:
                 lo, hi = int(range_lo), int(range_hi)
                 if hi < lo:
-                    raise ValueError(
-                        f"GLT sub-range for '{label}' has hi < lo: [{lo}..{hi}]"
-                    )
+                    raise ValueError(f"GLT sub-range for '{label}' has hi < lo: [{lo}..{hi}]")
                 rng = (lo, hi)
             row_weights[label] = (weight, rng)
 
@@ -382,8 +379,7 @@ def parse_glt_string(
             import warnings
 
             warnings.warn(
-                f"GLT row weights sum to {weight_sum:.6f}, expected 0 or 1. "
-                f"Row: '{row_str}'",
+                f"GLT row weights sum to {weight_sum:.6f}, expected 0 or 1. Row: '{row_str}'",
                 stacklevel=2,
             )
             overall_valid = False
@@ -470,8 +466,7 @@ def glt_weights_to_vector(
         if label in regressor_labels:
             if sub_range is not None:
                 raise ValueError(
-                    f"GLT label '{label}' is a single column but a sub-range "
-                    f"{sub_range} was given."
+                    f"GLT label '{label}' is a single column but a sub-range {sub_range} was given."
                 )
             idx = regressor_labels.index(label)
             contrast_vector[idx] = weight
@@ -496,8 +491,7 @@ def glt_weights_to_vector(
 
         # 3) Base-label scan for IM-style `label#N` columns.
         matches = [
-            i for i, l in enumerate(regressor_labels)
-            if l.split("#")[0] == label and "#" in l
+            i for i, l in enumerate(regressor_labels) if l.split("#")[0] == label and "#" in l
         ]
         if matches:
             if sub_range is not None:
@@ -734,7 +728,9 @@ def parse_hrf_model(hrf_string: str) -> tuple[str, float | dict]:
             top = float(params_parts[1].strip())
             n_basis = int(params_parts[2].strip())
         except ValueError as e:
-            raise ValueError(f"Invalid parameters in '{hrf_string}'. Expected numeric values: {e}") from e
+            raise ValueError(
+                f"Invalid parameters in '{hrf_string}'. Expected numeric values: {e}"
+            ) from e
 
         if bot >= top:
             raise ValueError(f"In '{hrf_string}': bot ({bot}) must be < top ({top})")
@@ -1158,9 +1154,7 @@ def build_design_matrix(
     for stim_idx in range(n_stim):
         hrf_type = hrf_types[stim_idx]
         if hrf_type not in ("SPMG1", "BLOCK"):
-            raise ValueError(
-                f"Unknown HRF type: {hrf_type}. Supported: SPMG1, BLOCK"
-            )
+            raise ValueError(f"Unknown HRF type: {hrf_type}. Supported: SPMG1, BLOCK")
 
         duration = stim_durations[stim_idx]
         if im_mode[stim_idx]:
@@ -1169,7 +1163,8 @@ def build_design_matrix(
             for run_idx in range(n_runs):
                 for onset in all_onsets[stim_idx][run_idx]:
                     per_run = [
-                        np.array([onset], dtype=np.float64) if r == run_idx
+                        np.array([onset], dtype=np.float64)
+                        if r == run_idx
                         else np.array([], dtype=np.float64)
                         for r in range(n_runs)
                     ]
@@ -1180,8 +1175,7 @@ def build_design_matrix(
                     event_idx += 1
         else:
             expanded_onsets.append(
-                [np.asarray(all_onsets[stim_idx][r], dtype=np.float64)
-                 for r in range(n_runs)]
+                [np.asarray(all_onsets[stim_idx][r], dtype=np.float64) for r in range(n_runs)]
             )
             expanded_durations.append(duration)
             expanded_labels.append(f"{stim_labels[stim_idx]}#0")
@@ -1227,10 +1221,7 @@ def build_design_matrix(
         # BLOCK path — no HRF convolution. Sample the boxcar at TR grid.
         if (~spmg_mask).any():
             bins_per_tr = int(round(tr / microtime_dt))
-            block_cols = (
-                onset_matrix[:, ~spmg_mask][::bins_per_tr][:total_timepoints]
-                .cpu().numpy()
-            )
+            block_cols = onset_matrix[:, ~spmg_mask][::bins_per_tr][:total_timepoints].cpu().numpy()
         else:
             block_cols = None
 
@@ -1389,10 +1380,7 @@ def write_afni_xmat(
     # Map each stim column to its 1-indexed stim group (by stim_labels_list order).
     stim_col_to_group: dict[int, int] = {}
     for stim_idx, base_label in enumerate(stim_labels_list):
-        cols = [
-            i for i in stim_indices
-            if regressor_labels[i].split("#")[0] == base_label
-        ]
+        cols = [i for i in stim_indices if regressor_labels[i].split("#")[0] == base_label]
         for c in cols:
             stim_col_to_group[c] = stim_idx + 1
 
@@ -1886,11 +1874,7 @@ def _resolve_windows(
     from fastfuncstuff.design.hrf import estimate_hrf_window  # local: avoid cycle
 
     # Form 1: user supplied per-cond (bot, top) tuples
-    if (
-        isinstance(fir_window_s, list)
-        and fir_window_s
-        and isinstance(fir_window_s[0], tuple)
-    ):
+    if isinstance(fir_window_s, list) and fir_window_s and isinstance(fir_window_s[0], tuple):
         if len(fir_window_s) != n_conditions:
             raise ValueError(
                 f"fir_window_s as list of tuples must have {n_conditions} "
@@ -1919,8 +1903,7 @@ def _resolve_windows(
         return [(0.0, float(top))] * n_conditions
 
     per_cond_top = [
-        max(1, estimate_hrf_window(d, tr, threshold=0.10)) * tr
-        for d in durations_per_condition
+        max(1, estimate_hrf_window(d, tr, threshold=0.10)) * tr for d in durations_per_condition
     ]
     # Apply the floor at the *maximum* across conditions — we want a
     # consistent FIR/TENT length to keep the design rectangular, and
@@ -1951,9 +1934,7 @@ def build_per_run_task_designs(
     n_timepoints_per_run: list[int],
     tr: float,
     *,
-    basis: Literal[
-        "auto", "FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero", "assumed"
-    ] = "auto",
+    basis: Literal["auto", "FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero", "assumed"] = "auto",
     condition_labels: list[str] | None = None,
     durations_per_condition: list[float] | None = None,
     fir_window_s: float | list[float] | list[tuple[float, float]] | None = None,
@@ -2046,9 +2027,7 @@ def build_per_run_task_designs(
     "one right way".
     """
     if basis not in _BASIS_CHOICES:
-        raise ValueError(
-            f"basis must be one of {_BASIS_CHOICES}; got {basis!r}"
-        )
+        raise ValueError(f"basis must be one of {_BASIS_CHOICES}; got {basis!r}")
 
     n_conditions = len(onsets_per_cond_per_run)
     if n_conditions == 0:
@@ -2059,8 +2038,7 @@ def build_per_run_task_designs(
     for c, cond_runs in enumerate(onsets_per_cond_per_run):
         if len(cond_runs) != n_runs:
             raise ValueError(
-                f"Condition {c} has {len(cond_runs)} runs but "
-                f"n_timepoints_per_run has {n_runs}."
+                f"Condition {c} has {len(cond_runs)} runs but n_timepoints_per_run has {n_runs}."
             )
 
     if condition_labels is None:
@@ -2079,9 +2057,7 @@ def build_per_run_task_designs(
     # ----- Resolve basis ('auto' → FIR/TENT) ----------------------------
     resolved = basis
     if basis == "auto":
-        resolved = _resolve_basis_auto(
-            onsets_per_cond_per_run, tr, tr_locked_threshold
-        )
+        resolved = _resolve_basis_auto(onsets_per_cond_per_run, tr, tr_locked_threshold)
         notes.append(
             f"Auto-resolved basis to {resolved} "
             f"(TR-lock tolerance {tr_locked_threshold:.2f} of TR={tr}s)."
@@ -2091,8 +2067,12 @@ def build_per_run_task_designs(
         if hrf is None:
             raise ValueError("basis='assumed' requires the `hrf` argument.")
         return _build_assumed_designs(
-            onsets_per_cond_per_run, n_timepoints_per_run, tr,
-            condition_labels=condition_labels, hrf=hrf, device=device,
+            onsets_per_cond_per_run,
+            n_timepoints_per_run,
+            tr,
+            condition_labels=condition_labels,
+            hrf=hrf,
+            device=device,
             notes=notes,
         )
 
@@ -2112,9 +2092,7 @@ def build_per_run_task_designs(
             tent_n_basis_list = [tent_n_basis] * n_conditions
         else:
             if len(tent_n_basis) != n_conditions:
-                raise ValueError(
-                    f"tent_n_basis as list must have {n_conditions} entries"
-                )
+                raise ValueError(f"tent_n_basis as list must have {n_conditions} entries")
             tent_n_basis_list = list(tent_n_basis)
     else:
         tent_n_basis_list = [None] * n_conditions  # auto
@@ -2141,9 +2119,7 @@ def build_per_run_task_designs(
     for r, n_run_tp in enumerate(n_timepoints_per_run):
         cond_blocks: list[torch.Tensor] = []
         for c in range(n_conditions):
-            onset_times = np.asarray(
-                onsets_per_cond_per_run[c][r], dtype=np.float64
-            )
+            onset_times = np.asarray(onsets_per_cond_per_run[c][r], dtype=np.float64)
             bot, top = windows[c]
             if resolved == "FIR":
                 # Quantize to nearest TR; build (n_run_tp, 1) onset
@@ -2153,18 +2129,14 @@ def build_per_run_task_designs(
                     idx = np.round(onset_times / tr).astype(int)
                     idx = idx[(idx >= 0) & (idx < n_run_tp)]
                     onset_vec[idx, 0] = 1.0
-                block = make_fir_design(
-                    onset_vec, n_basis_per_cond[c], n_run_tp, device=device
-                )
+                block = make_fir_design(onset_vec, n_basis_per_cond[c], n_run_tp, device=device)
             elif resolved in ("TENT", "TENTzero"):
-                n_knots = (
-                    n_basis_per_cond[c] + 2
-                    if resolved == "TENTzero"
-                    else n_basis_per_cond[c]
-                )
+                n_knots = n_basis_per_cond[c] + 2 if resolved == "TENTzero" else n_basis_per_cond[c]
                 block = make_tent_design(
                     [onset_times],
-                    bot=bot, top=top, tr=tr,
+                    bot=bot,
+                    top=top,
+                    tr=tr,
                     n_timepoints=n_run_tp,
                     n_basis=n_knots,
                     zero_edges=(resolved == "TENTzero"),
@@ -2172,13 +2144,13 @@ def build_per_run_task_designs(
                 )
             elif resolved in ("CSPLIN", "CSPLINzero"):
                 n_knots = (
-                    n_basis_per_cond[c] + 2
-                    if resolved == "CSPLINzero"
-                    else n_basis_per_cond[c]
+                    n_basis_per_cond[c] + 2 if resolved == "CSPLINzero" else n_basis_per_cond[c]
                 )
                 block = make_csplin_design(
                     [onset_times],
-                    bot=bot, top=top, tr=tr,
+                    bot=bot,
+                    top=top,
+                    tr=tr,
                     n_timepoints=n_run_tp,
                     n_basis=n_knots,
                     zero_edges=(resolved == "CSPLINzero"),
@@ -2186,8 +2158,7 @@ def build_per_run_task_designs(
                 )
             else:
                 raise ValueError(
-                    f"unreachable: basis '{resolved}' not handled "
-                    "(should have been caught earlier)"
+                    f"unreachable: basis '{resolved}' not handled (should have been caught earlier)"
                 )
             cond_blocks.append(block)
         # Condition-major concatenation along regressor axis.
@@ -2351,8 +2322,7 @@ def pack_for_shared_task_glm(
     for r in range(1, n_runs):
         if per_run_data[r].shape[0] != n_voxels:
             raise ValueError(
-                f"per_run_data[{r}] has {per_run_data[r].shape[0]} voxels "
-                f"but run 0 has {n_voxels}."
+                f"per_run_data[{r}] has {per_run_data[r].shape[0]} voxels but run 0 has {n_voxels}."
             )
         if per_run_task_designs[r].shape[1] != n_task:
             raise ValueError(
@@ -2366,30 +2336,29 @@ def pack_for_shared_task_glm(
                 f"extra_regressors_per_run has {len(extra_regressors_per_run)} "
                 f"runs but data has {n_runs}."
             )
-        n_extra = extra_regressors_per_run[0].shape[1] if extra_regressors_per_run[0].ndim > 1 else 1
+        n_extra = (
+            extra_regressors_per_run[0].shape[1] if extra_regressors_per_run[0].ndim > 1 else 1
+        )
         for r in range(1, n_runs):
             x = extra_regressors_per_run[r]
             n_e_r = x.shape[1] if x.ndim > 1 else 1
             if n_e_r != n_extra:
                 raise ValueError(
-                    f"extra_regressors_per_run[{r}] has {n_e_r} columns; "
-                    f"run 0 has {n_extra}."
+                    f"extra_regressors_per_run[{r}] has {n_e_r} columns; run 0 has {n_extra}."
                 )
     else:
         n_extra = 0
 
     if device is None:
-        device = per_run_data[0].device if per_run_data[0].is_floating_point() else torch.device("cpu")
+        device = (
+            per_run_data[0].device if per_run_data[0].is_floating_point() else torch.device("cpu")
+        )
 
     # --- Row-concat task across runs (this is the "shared task" trick) -----
-    task_concat = torch.cat(
-        [d.to(device).to(torch.float32) for d in per_run_task_designs], dim=0
-    )
+    task_concat = torch.cat([d.to(device).to(torch.float32) for d in per_run_task_designs], dim=0)
 
     # --- Row-concat data --------------------------------------------------
-    data_concat = torch.cat(
-        [d.to(device).to(torch.float32) for d in per_run_data], dim=1
-    )
+    data_concat = torch.cat([d.to(device).to(torch.float32) for d in per_run_data], dim=1)
 
     # --- Build block-diagonal nuisance (poly + optional extras) per run ---
     n_tp_per_run = [d.shape[1] for d in per_run_data]
@@ -2397,7 +2366,9 @@ def pack_for_shared_task_glm(
     n_nuisance_per_run = (polort + 1 if polort >= 0 else 0) + n_extra
     if n_nuisance_per_run > 0:
         nuisance_full = torch.zeros(
-            (total_tp, n_runs * n_nuisance_per_run), dtype=torch.float32, device=device,
+            (total_tp, n_runs * n_nuisance_per_run),
+            dtype=torch.float32,
+            device=device,
         )
         tr_start = 0
         col_start = 0
@@ -2412,7 +2383,9 @@ def pack_for_shared_task_glm(
                     x = x.unsqueeze(1)
                 run_blocks.append(x)
             run_block = torch.cat(run_blocks, dim=1)
-            nuisance_full[tr_start:tr_start + n_tp, col_start:col_start + run_block.shape[1]] = run_block
+            nuisance_full[
+                tr_start : tr_start + n_tp, col_start : col_start + run_block.shape[1]
+            ] = run_block
             tr_start += n_tp
             col_start += run_block.shape[1]
         design_concat = torch.cat([task_concat, nuisance_full], dim=1)
@@ -2470,9 +2443,7 @@ def _build_assumed_designs(
     for r, n_run_tp in enumerate(n_timepoints_per_run):
         cond_cols: list[torch.Tensor] = []
         for c in range(n_conditions):
-            onset_times = np.asarray(
-                onsets_per_cond_per_run[c][r], dtype=np.float64
-            )
+            onset_times = np.asarray(onsets_per_cond_per_run[c][r], dtype=np.float64)
             onset_vec = torch.zeros(n_run_tp, 1, device=device)
             if onset_times.size > 0:
                 idx = np.round(onset_times / tr).astype(int)

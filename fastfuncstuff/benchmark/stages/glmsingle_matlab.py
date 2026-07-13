@@ -213,12 +213,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
         if not (gs / "glmsingle_hrf_index.nii.gz").exists():
             flags = "reexport = true; "
 
-    matlab_cmd = (
-        f"matlab -batch \""
-        f"cd('{ctx.data_dir}'); "
-        f"{flags}"
-        f"run('{script}');\""
-    )
+    matlab_cmd = f"matlab -batch \"cd('{ctx.data_dir}'); {flags}run('{script}');\""
 
     log_file = gs / "matlab_run.log"
     elapsed = _run_matlab_with_log(matlab_cmd, log_file, ctx.data_dir)

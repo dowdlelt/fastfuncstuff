@@ -52,6 +52,7 @@ def _coord_dtype(device: torch.device) -> torch.dtype:
     """
     return torch.float32 if device.type == "mps" else torch.float64
 
+
 # volume(blok) / siz**3 for each shape — used by the auto-radius formula
 # (GA_BLOK_VOLFAC + the inside-test comments in mri_genalign_util.c).
 _VOLFAC = {"ball": 4.18879, "cube": 8.0, "rhdd": 2.0, "tohd": 4.0}

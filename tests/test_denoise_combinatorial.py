@@ -181,10 +181,15 @@ def multi_run_setup():
     run_starts = [i * run_len for i in range(n_runs)]
     nuisance_per_run = [torch.ones(run_len, 1) for _ in range(n_runs)]
     return dict(
-        data=data, design=design, run_starts=run_starts,
+        data=data,
+        design=design,
+        run_starts=run_starts,
         nuisance_per_run=nuisance_per_run,
-        n_voxels=n_voxels, n_tp=n_tp, n_conds=n_conds,
-        n_runs=n_runs, run_len=run_len,
+        n_voxels=n_voxels,
+        n_tp=n_tp,
+        n_conds=n_conds,
+        n_runs=n_runs,
+        run_len=run_len,
     )
 
 
@@ -205,9 +210,7 @@ def _make_run_results(n_runs, run_len, max_pcs=3, combos=None):
                 optimal_combination=(0,) if r % 2 == 0 else (0, 1),
                 optimal_cod=0.1 + r * 0.05,
                 all_cod=rng.random(len(combos)),
-                all_var_explained=np.array(
-                    [sum(0.1 / (i + 1) for i in combo) for combo in combos]
-                ),
+                all_var_explained=np.array([sum(0.1 / (i + 1) for i in combo) for combo in combos]),
                 all_combinations=combos,
                 explained_variance_ratios=np.array([0.3, 0.2, 0.1]),
                 n_criteria_voxels=20,
@@ -225,7 +228,8 @@ def _make_full_results(n_runs, run_len, n_voxels, max_pcs=3, singleton_only=Fals
         initial_r2=torch.randn(n_voxels),
         noise_pcs_per_run=noise_pcs_per_run,
         metadata={
-            "max_pcs": max_pcs, "n_combinations": 2 ** max_pcs,
+            "max_pcs": max_pcs,
+            "n_combinations": 2**max_pcs,
             "singleton_only": singleton_only,
         },
     )
@@ -243,8 +247,10 @@ class TestEvaluateCombinationsExplicitChunk:
             torch.randn(n_criteria, 2),
             torch.ones(T, 1),
             torch.randn(T, k),
-            combos, np.array([0.4, 0.2]),
-            device=CPU, criteria_chunk_size=10,
+            combos,
+            np.array([0.4, 0.2]),
+            device=CPU,
+            criteria_chunk_size=10,
         )
         assert median_cod.shape == (len(combos),)
         assert var_exp.shape == (len(combos),)
@@ -255,12 +261,14 @@ class TestComputeOptimizedXvalR2:
         s = multi_run_setup
         per_run_results, noise_pcs = _make_run_results(s["n_runs"], s["run_len"])
         r2 = compute_optimized_xval_r2(
-            data=s["data"], design=s["design"],
+            data=s["data"],
+            design=s["design"],
             run_starts=s["run_starts"],
             nuisance_per_run=s["nuisance_per_run"],
             noise_pcs_per_run=noise_pcs,
             per_run_results=per_run_results,
-            device=CPU, verbose=False,
+            device=CPU,
+            verbose=False,
         )
         assert r2.shape == (s["n_voxels"],)
         assert torch.isfinite(r2).all()
@@ -275,7 +283,9 @@ class TestComputeOptimizedXvalR2:
             noise_pcs.append(torch.randn(s["run_len"], 2))
             per_run_results.append(
                 CombinatorialDenoiseRunResult(
-                    run_idx=r, optimal_combination=(), optimal_cod=0.0,
+                    run_idx=r,
+                    optimal_combination=(),
+                    optimal_cod=0.0,
                     all_cod=np.zeros(len(combos)),
                     all_var_explained=np.zeros(len(combos)),
                     all_combinations=combos,
@@ -284,12 +294,14 @@ class TestComputeOptimizedXvalR2:
                 )
             )
         r2 = compute_optimized_xval_r2(
-            data=s["data"], design=s["design"],
+            data=s["data"],
+            design=s["design"],
             run_starts=s["run_starts"],
             nuisance_per_run=s["nuisance_per_run"],
             noise_pcs_per_run=noise_pcs,
             per_run_results=per_run_results,
-            device=CPU, verbose=False,
+            device=CPU,
+            verbose=False,
         )
         assert r2.shape == (s["n_voxels"],)
 
@@ -299,12 +311,14 @@ class TestComputeOptimizedXvalR2DenoiseStyle:
         s = multi_run_setup
         per_run_results, noise_pcs = _make_run_results(s["n_runs"], s["run_len"])
         r2 = compute_optimized_xval_r2_3dDenoise_style(
-            data=s["data"], design=s["design"],
+            data=s["data"],
+            design=s["design"],
             run_starts=s["run_starts"],
             nuisance_per_run=s["nuisance_per_run"],
             noise_pcs_per_run=noise_pcs,
             per_run_results=per_run_results,
-            device=CPU, verbose=False,
+            device=CPU,
+            verbose=False,
         )
         assert r2.shape == (s["n_voxels"],)
 
@@ -312,21 +326,23 @@ class TestComputeOptimizedXvalR2DenoiseStyle:
         s = multi_run_setup
         torch.manual_seed(77)
         hrf_indices = torch.zeros(s["n_voxels"], dtype=torch.long)
-        hrf_indices[s["n_voxels"] // 2:] = 1
+        hrf_indices[s["n_voxels"] // 2 :] = 1
         designs_by_hrf = {
             0: torch.randn(s["n_tp"], s["n_conds"]),
             1: torch.randn(s["n_tp"], s["n_conds"]),
         }
         per_run_results, noise_pcs = _make_run_results(s["n_runs"], s["run_len"], max_pcs=2)
         r2 = compute_optimized_xval_r2_3dDenoise_style(
-            data=s["data"], design=None,
+            data=s["data"],
+            design=None,
             run_starts=s["run_starts"],
             nuisance_per_run=s["nuisance_per_run"],
             noise_pcs_per_run=noise_pcs,
             per_run_results=per_run_results,
             designs_by_hrf=designs_by_hrf,
             hrf_indices=hrf_indices,
-            device=CPU, verbose=False,
+            device=CPU,
+            verbose=False,
         )
         assert r2.shape == (s["n_voxels"],)
 
@@ -335,10 +351,12 @@ class TestComputeInitialXvalR2:
     def test_single_design(self, multi_run_setup):
         s = multi_run_setup
         r2 = compute_initial_xval_r2(
-            data=s["data"], design=s["design"],
+            data=s["data"],
+            design=s["design"],
             run_starts=s["run_starts"],
             nuisance_per_run=s["nuisance_per_run"],
-            device=CPU, verbose=False,
+            device=CPU,
+            verbose=False,
         )
         assert r2.shape == (s["n_voxels"],)
         assert torch.isfinite(r2).all()
@@ -347,18 +365,20 @@ class TestComputeInitialXvalR2:
         s = multi_run_setup
         torch.manual_seed(55)
         hrf_indices = torch.zeros(s["n_voxels"], dtype=torch.long)
-        hrf_indices[s["n_voxels"] // 2:] = 1
+        hrf_indices[s["n_voxels"] // 2 :] = 1
         designs_by_hrf = {
             0: torch.randn(s["n_tp"], s["n_conds"]),
             1: torch.randn(s["n_tp"], s["n_conds"]),
         }
         r2 = compute_initial_xval_r2(
-            data=s["data"], design=None,
+            data=s["data"],
+            design=None,
             run_starts=s["run_starts"],
             nuisance_per_run=s["nuisance_per_run"],
             designs_by_hrf=designs_by_hrf,
             hrf_indices=hrf_indices,
-            device=CPU, verbose=False,
+            device=CPU,
+            verbose=False,
         )
         assert r2.shape == (s["n_voxels"],)
 
@@ -369,6 +389,7 @@ class TestPlotSingletonContributions:
         figs = plot_singleton_contributions(results, str(tmp_path / "test"))
         assert len(figs) == 3
         import matplotlib.pyplot as plt
+
         for f in figs:
             plt.close(f)
 
@@ -379,6 +400,7 @@ class TestPlotPlateauCurves:
         figs = plot_plateau_curves(results, str(tmp_path / "test"))
         assert len(figs) == 3
         import matplotlib.pyplot as plt
+
         for f in figs:
             plt.close(f)
 
@@ -394,6 +416,7 @@ class TestPlotInclusionHeatmap:
         figs = plot_inclusion_heatmap(results, str(tmp_path / "test"))
         assert len(figs) == 1
         import matplotlib.pyplot as plt
+
         plt.close(figs[0])
 
 
@@ -403,6 +426,7 @@ class TestPlotCombinatorialResults:
         figs = plot_combinatorial_results(results, str(tmp_path / "test"))
         assert len(figs) >= 1
         import matplotlib.pyplot as plt
+
         for f in figs:
             plt.close(f)
 

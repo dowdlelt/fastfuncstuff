@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.dynamics.model_selection import grid_search_bsds, loro_held_out_loglik
@@ -59,6 +60,7 @@ def test_grid_search_bsds_sorted_best_first():
     assert combos == {(2, 1), (2, 2), (3, 1), (3, 2)}
 
 
+@pytest.mark.slow
 def test_grid_search_parallel_matches_serial():
     # n_jobs>1 fans grid points across a spawn process pool. Each grid point is
     # deterministic in its seed, so the parallel result set must match the serial
@@ -74,7 +76,9 @@ def test_grid_search_parallel_matches_serial():
         show_progress=False,
     )
     serial = grid_search_bsds(sessions, n_jobs=1, **kw)
-    parallel = grid_search_bsds(sessions, n_jobs=3, **kw)
+    # worker_threads=1 keeps the 3-worker pool from fanning across all cores — the
+    # test verifies parallel==serial correctness, not CPU saturation.
+    parallel = grid_search_bsds(sessions, n_jobs=3, worker_threads=1, **kw)
     serial_map = {(r.n_states, r.max_ldim): r.per_timepoint_loglik for r in serial}
     parallel_map = {(r.n_states, r.max_ldim): r.per_timepoint_loglik for r in parallel}
     assert serial_map.keys() == parallel_map.keys()

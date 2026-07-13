@@ -477,10 +477,10 @@ def test_flow_movie_shape(known_shift_series):
 
 # ── rotation-aware (idea 2) ───────────────────────────────────────────────────
 from fastfuncstuff.processing.locomoco import (  # noqa: E402
+    _fuse_tridiag,
     compute_reproject_weights,
     estimate_residual_flow_rotaware,
     pe_tilt_degrees,
-    _fuse_tridiag,
 )
 
 
@@ -619,10 +619,10 @@ def test_max_reference_accepted_by_both_paths(known_shift_series):
 
 # ── 3D-acquired EPI (idea 3: -is_3dacq) ───────────────────────────────────────
 from fastfuncstuff.processing.locomoco import (  # noqa: E402
-    optical_flow_lk_3d,
-    xcorr_search_flow_3d,
     _build_flow3d_fn,
     _shift3d_axis,
+    optical_flow_lk_3d,
+    xcorr_search_flow_3d,
 )
 
 
@@ -804,7 +804,7 @@ def test_refine_max_ref_3d_runs(known_shift_series):
 
 def test_first_n_windows_the_aggregate():
     """-first_n restricts mean/max/median to the first N frames; index unaffected."""
-    from fastfuncstuff.processing.locomoco import _select_ref_vol, _refine_reduce
+    from fastfuncstuff.processing.locomoco import _refine_reduce, _select_ref_vol
 
     x = torch.arange(2 * 2 * 1 * 8).float().reshape(2, 2, 1, 8)  # (nx,ny,nz,T), rising in T
     assert torch.allclose(_select_ref_vol(x, "mean", first_n=4), x[..., :4].mean(dim=3))

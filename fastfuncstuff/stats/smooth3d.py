@@ -13,6 +13,7 @@ treats P as the batch dim (channel = 1).  On GPU at 200 k mask voxels
 and 1000 perms, ~ 0.5–1 s including scatter/gather; CPU is ~ 10× slower
 but still adds only seconds to a full ffs_perm run.
 """
+
 from __future__ import annotations
 
 import math
@@ -38,7 +39,9 @@ def fwhm_mm_to_sigma_vox(
 
 
 def _gaussian_kernel_1d(
-    sigma: float, dtype: torch.dtype, device: torch.device,
+    sigma: float,
+    dtype: torch.dtype,
+    device: torch.device,
 ) -> torch.Tensor:
     """Truncated 1-D Gaussian kernel, normalised to sum to 1.
 
@@ -78,7 +81,7 @@ def _smooth_along_axis(
 
 
 def gaussian3d_batched(
-    vol: torch.Tensor,         # [P, X, Y, Z]
+    vol: torch.Tensor,  # [P, X, Y, Z]
     sigma_vox: tuple[float, float, float],
 ) -> torch.Tensor:
     """Separable 3-D Gaussian, batched over the leading dim."""
@@ -89,8 +92,8 @@ def gaussian3d_batched(
 
 
 def smooth_var_per_perm(
-    var_pv: torch.Tensor,         # [P, V_in_mask], float32
-    mask: np.ndarray,             # [X, Y, Z] bool
+    var_pv: torch.Tensor,  # [P, V_in_mask], float32
+    mask: np.ndarray,  # [X, Y, Z] bool
     sigma_vox: tuple[float, float, float],
     perm_chunk: int = 256,
     device: str | torch.device = "cpu",
@@ -124,8 +127,8 @@ def smooth_var_per_perm(
         vol_flat = torch.zeros((pc, n_total), dtype=chunk.dtype, device=dev)
         vol_flat[:, flat_idx] = chunk
         vol = vol_flat.view(pc, nx, ny, nz)
-        smoothed = gaussian3d_batched(vol, sigma_vox)         # [Pc, X, Y, Z]
-        smoothed = smoothed / mask_smooth                      # mask-aware
+        smoothed = gaussian3d_batched(vol, sigma_vox)  # [Pc, X, Y, Z]
+        smoothed = smoothed / mask_smooth  # mask-aware
         gathered = smoothed.view(pc, -1)[:, flat_idx]
         out[p0:p1] = gathered.cpu() if dev.type != "cpu" else gathered
     return out

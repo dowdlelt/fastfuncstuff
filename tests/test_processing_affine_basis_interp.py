@@ -317,9 +317,26 @@ class TestSourceBatchedCompose:
         seq = [[] for _ in range(4)]
         for n in range(N):
             outs = batched_compose_and_interpolate(
-                source[n], gw[n, 0], gw[n, 1], gw[n, 2], pxd[n], pyd[n], pzd[n],
-                ii_p, jj_p, kk_p, ibots, jbots, kbots, nx, ny, nz,
-                global_warp_3ch=gw[n], base_i=base_i, base_j=base_j, base_k=base_k,
+                source[n],
+                gw[n, 0],
+                gw[n, 1],
+                gw[n, 2],
+                pxd[n],
+                pyd[n],
+                pzd[n],
+                ii_p,
+                jj_p,
+                kk_p,
+                ibots,
+                jbots,
+                kbots,
+                nx,
+                ny,
+                nz,
+                global_warp_3ch=gw[n],
+                base_i=base_i,
+                base_j=base_j,
+                base_k=base_k,
             )
             for s, o in zip(seq, outs, strict=True):
                 s.append(o)

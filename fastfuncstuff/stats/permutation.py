@@ -24,6 +24,7 @@ on a single trial are unaffected by block structure (a per-trial flip
 preserves any partition), so :func:`generate_sign_flips` ignores blocks
 unless ``flip_whole_block=True`` (the paired-style case, punted to v2).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ def _voxel_chunk(n_voxels: int, bytes_per_vox: int, device: torch.device) -> int
 # ---------------------------------------------------------------------------
 # Permutation generators
 # ---------------------------------------------------------------------------
+
 
 def generate_sign_flips(
     n_trials: int,
@@ -166,6 +168,7 @@ def count_unique_label_perms(group: np.ndarray, blocks: np.ndarray | None) -> in
 # Batched statistic kernels
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PermStats:
     """Result of a permutation pass.
@@ -183,6 +186,7 @@ class PermStats:
         Degrees of freedom of the t distribution (N-1 for 1-sample,
         nA + nB - 2 for 2-sample).
     """
+
     t: torch.Tensor
     mean: torch.Tensor
     extras: dict
@@ -251,8 +255,13 @@ def one_sample_t_perm(
 
     try:
         from tqdm.auto import tqdm
-        bar = tqdm(total=(v + voxel_chunk - 1) // voxel_chunk,
-                   desc="1-samp perm", leave=True, disable=not show_progress)
+
+        bar = tqdm(
+            total=(v + voxel_chunk - 1) // voxel_chunk,
+            desc="1-samp perm",
+            leave=True,
+            disable=not show_progress,
+        )
     except ImportError:
         bar = None
 
@@ -347,14 +356,8 @@ def two_sample_t_perm(
     perm_mA = torch.empty((p, v), dtype=torch.float32) if keep_perm_data else None
     perm_mB = torch.empty((p, v), dtype=torch.float32) if keep_perm_data else None
     perm_var = torch.empty((p, v), dtype=torch.float32) if keep_perm_data else None
-    perm_varA = (
-        torch.empty((p, v), dtype=torch.float32)
-        if (keep_perm_data and welch) else None
-    )
-    perm_varB = (
-        torch.empty((p, v), dtype=torch.float32)
-        if (keep_perm_data and welch) else None
-    )
+    perm_varA = torch.empty((p, v), dtype=torch.float32) if (keep_perm_data and welch) else None
+    perm_varB = torch.empty((p, v), dtype=torch.float32) if (keep_perm_data and welch) else None
 
     pool_denom = float(nA + nB - 2)
     pool_factor = float(1.0 / nA + 1.0 / nB)
@@ -362,8 +365,13 @@ def two_sample_t_perm(
 
     try:
         from tqdm.auto import tqdm
-        bar = tqdm(total=(v + voxel_chunk - 1) // voxel_chunk,
-                   desc="2-samp perm", leave=True, disable=not show_progress)
+
+        bar = tqdm(
+            total=(v + voxel_chunk - 1) // voxel_chunk,
+            desc="2-samp perm",
+            leave=True,
+            disable=not show_progress,
+        )
     except ImportError:
         bar = None
 
@@ -371,10 +379,10 @@ def two_sample_t_perm(
 
     for v0 in range(0, v, voxel_chunk):
         v1 = min(v0 + voxel_chunk, v)
-        y_chunk = y_t[:, v0:v1].to(dev, non_blocking=True)   # [N, Vc]
-        y2_chunk = y2_t[:, v0:v1].to(dev, non_blocking=True) # [N, Vc]
-        sum_y_chunk = y_chunk.sum(dim=0)                      # [Vc]
-        sum_y2_chunk = y2_chunk.sum(dim=0)                    # [Vc]
+        y_chunk = y_t[:, v0:v1].to(dev, non_blocking=True)  # [N, Vc]
+        y2_chunk = y2_t[:, v0:v1].to(dev, non_blocking=True)  # [N, Vc]
+        sum_y_chunk = y_chunk.sum(dim=0)  # [Vc]
+        sum_y2_chunk = y2_chunk.sum(dim=0)  # [Vc]
 
         # Observed group means (for the meanA/meanB output sub-bricks).
         g_obs = torch.from_numpy(g_obs_np).to(dev)
@@ -385,7 +393,7 @@ def two_sample_t_perm(
         for p0 in range(0, p, perm_chunk):
             p1 = min(p0 + perm_chunk, p)
             g = torch.from_numpy(group_swaps[p0:p1]).to(dev, dtype=torch.float32)
-            sumA = g @ y_chunk           # [Pc, Vc]
+            sumA = g @ y_chunk  # [Pc, Vc]
             ssqA = g @ y2_chunk
             sumB = sum_y_chunk[None, :] - sumA
             ssqB = sum_y2_chunk[None, :] - ssqA

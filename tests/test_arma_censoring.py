@@ -30,9 +30,7 @@ class TestTauCensoring:
         """tau=None must reproduce the original |i-j| Toeplitz exactly."""
         a, b, n = 0.5, 0.2, 30
         R_default = build_arma11_covariance(a, b, n, DEVICE)
-        R_tau = build_arma11_covariance(
-            a, b, n, DEVICE, tau=torch.arange(n)
-        )
+        R_tau = build_arma11_covariance(a, b, n, DEVICE, tau=torch.arange(n))
         assert torch.allclose(R_default, R_tau, atol=1e-7)
 
     def test_censored_point_creates_lag2_gap(self):
@@ -122,9 +120,7 @@ class TestBuildCensorRunInfo:
         good = [0, 1, 3, 4, 5, 6, 8, 9]
         starts, tau = build_censor_run_info([0, 5], n_total=10, good_list=good)
         n = len(good)
-        R = build_arma11_covariance(
-            a, b, n, DEVICE, run_starts=starts, tau=tau
-        )
+        R = build_arma11_covariance(a, b, n, DEVICE, run_starts=starts, tau=tau)
         # Cross-run exactly zero (rows 0:4 vs 4:8).
         assert torch.count_nonzero(R[:4, 4:]).item() == 0
         # Within run0: survivors at tau=1,3 (indices 1,2) → lag-2.

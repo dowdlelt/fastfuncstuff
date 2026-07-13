@@ -130,7 +130,7 @@ class TestSingleTrialsOutput:
         stim_indices = list(range(20, 50))  # 30 stimulus columns
         for i, col_idx in enumerate(stim_indices):
             onset_time = 10 + i * 5  # Staggered onsets
-            design_matrix[onset_time:onset_time+3, col_idx] = 1.0
+            design_matrix[onset_time : onset_time + 3, col_idx] = 1.0
 
         # Extract onset times
         onset_times = extract_onset_times_from_design(design_matrix, stim_indices)
@@ -166,9 +166,9 @@ class TestDesignMetadata:
         # Simulate design_info from AFNI .xmat.1D
         design_info = {
             "n_regressors": 322,
-            "column_labels": [f"stim_{i}" for i in range(252)] +
-                            [f"mot_{i}" for i in range(6)] +
-                            [f"poly_{i}" for i in range(64)],
+            "column_labels": [f"stim_{i}" for i in range(252)]
+            + [f"mot_{i}" for i in range(6)]
+            + [f"poly_{i}" for i in range(64)],
             "stim_bots": [0, 126],  # Two stimulus groups
             "stim_tops": [125, 251],
         }
@@ -247,9 +247,9 @@ def test_extract_design_metadata_helper():
     design_info = {
         "n_regressors": 322,
         "column_labels": (
-            [f"stim_{i}" for i in range(252)] +
-            [f"mot_{i}" for i in range(6)] +
-            [f"poly_{i}" for i in range(64)]
+            [f"stim_{i}" for i in range(252)]
+            + [f"mot_{i}" for i in range(6)]
+            + [f"poly_{i}" for i in range(64)]
         ),
         "stim_bots": [0],
         "stim_tops": [251],

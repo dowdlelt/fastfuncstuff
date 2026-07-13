@@ -1,4 +1,5 @@
 """Correctness tests for fastfuncstuff.stats.cluster."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -18,7 +19,10 @@ def test_cluster_extent_mass_simple_cube():
     stat = np.zeros(shape, dtype=np.float32)
     stat[4:7, 4:7, 4:7] = 5.0
     ext, mass, labels, sizes, masses = _cluster_extent_mass_one(
-        stat, tcrit=3.0, sidedness="1-sided", nn=1,
+        stat,
+        tcrit=3.0,
+        sidedness="1-sided",
+        nn=1,
     )
     assert ext == 27
     np.testing.assert_allclose(mass, 27 * 5.0)
@@ -29,8 +33,8 @@ def test_cluster_nn_differentiates_diagonal_touch():
     """Two cubes touching at a single corner: NN1 splits, NN3 merges."""
     shape = (10, 10, 10)
     stat = np.zeros(shape, dtype=np.float32)
-    stat[2:4, 2:4, 2:4] = 4.0   # cube A
-    stat[4:6, 4:6, 4:6] = 4.0   # cube B, shares one corner voxel boundary
+    stat[2:4, 2:4, 2:4] = 4.0  # cube A
+    stat[4:6, 4:6, 4:6] = 4.0  # cube B, shares one corner voxel boundary
     ext1, _, lab1, sizes1, _ = _cluster_extent_mass_one(stat, 3.0, "1-sided", 1)
     ext3, _, lab3, sizes3, _ = _cluster_extent_mass_one(stat, 3.0, "1-sided", 3)
     # NN1: two separate 8-voxel cubes; NN3 merges them through the corner.

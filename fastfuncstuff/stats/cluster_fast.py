@@ -29,6 +29,7 @@ Performance budget (≈381 k mask voxels):
 * 1000 perms / 8 workers: ≈ 15 s
 * 10 000 perms / 8 workers: ≈ 150 s
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -39,14 +40,13 @@ from numba.typed import List as TypedList  # noqa: F401  (kept for future mass e
 # Neighbour offset tables
 # ---------------------------------------------------------------------------
 
+
 def _offsets_for_nn(nn: int) -> np.ndarray:
     """``[K, 3]`` int8 array of (dx, dy, dz) offsets, K = 6/18/26."""
     if nn == 1:
         # 6 face neighbours
         return np.array(
-            [(-1, 0, 0), (1, 0, 0),
-             (0, -1, 0), (0, 1, 0),
-             (0, 0, -1), (0, 0, 1)],
+            [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)],
             dtype=np.int8,
         )
     if nn == 2:
@@ -77,15 +77,18 @@ def _offsets_for_nn(nn: int) -> np.ndarray:
 # Numba kernel
 # ---------------------------------------------------------------------------
 
+
 @njit(cache=True, boundscheck=False, fastmath=True)
 def _walk_dsu_extent(
-    sorted_voxel_idx: np.ndarray,   # int64[n], flat indices, stat-descending
+    sorted_voxel_idx: np.ndarray,  # int64[n], flat indices, stat-descending
     sorted_voxel_stat: np.ndarray,  # float32[n], effective stat (signed/abs), descending
-    parent: np.ndarray,             # int64[V_total], scratch, init = -1
-    size: np.ndarray,               # int64[V_total], scratch
-    offsets: np.ndarray,            # int8[K, 3] neighbour offsets
-    nx: int, ny: int, nz: int,
-    tcrits_desc: np.ndarray,        # float64[npthr], sorted *descending*
+    parent: np.ndarray,  # int64[V_total], scratch, init = -1
+    size: np.ndarray,  # int64[V_total], scratch
+    offsets: np.ndarray,  # int8[K, 3] neighbour offsets
+    nx: int,
+    ny: int,
+    nz: int,
+    tcrits_desc: np.ndarray,  # float64[npthr], sorted *descending*
 ) -> np.ndarray:
     """Single-pass DSU; returns ``max_extent[npthr]`` int64."""
     n = sorted_voxel_idx.shape[0]
@@ -170,6 +173,7 @@ def _walk_dsu_extent(
 # Top-level helper: one perm, all (NN, sided)
 # ---------------------------------------------------------------------------
 
+
 def cluster_extent_one_perm(
     stat3d: np.ndarray,
     mask_flat_idx: np.ndarray,
@@ -224,13 +228,19 @@ def cluster_extent_one_perm(
                 idx_sorted = np.ascontiguousarray(idx_above[order])
                 stat_sorted = np.ascontiguousarray(stat_above[order].astype(np.float32))
                 parent_scratch.fill(-1)
-                per_pass_extents.append(_walk_dsu_extent(
-                    idx_sorted, stat_sorted,
-                    parent_scratch, size_scratch,
-                    offsets_by_nn[nn],
-                    nx, ny, nz,
-                    tcrits_desc,
-                ))
+                per_pass_extents.append(
+                    _walk_dsu_extent(
+                        idx_sorted,
+                        stat_sorted,
+                        parent_scratch,
+                        size_scratch,
+                        offsets_by_nn[nn],
+                        nx,
+                        ny,
+                        nz,
+                        tcrits_desc,
+                    )
+                )
             # Bi-sided: elementwise max over the +/- passes.  1-/2-sided
             # have a single pass so this is a no-op.
             stacked = np.stack(per_pass_extents, axis=0)
@@ -242,6 +252,7 @@ def cluster_extent_one_perm(
 # ---------------------------------------------------------------------------
 # Numba warm-up (compile cache hit on import)
 # ---------------------------------------------------------------------------
+
 
 def precompile() -> None:
     """Trigger Numba JIT once so the first real call isn't slow."""

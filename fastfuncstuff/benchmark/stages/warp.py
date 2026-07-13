@@ -106,7 +106,10 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
             for run in runs:
                 if task == ref_task and run == ref_run:
                     continue
-                mat = ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
+                mat = (
+                    ctx.processing_dir
+                    / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
+                )
                 if not mat.exists():
                     missing.append(str(mat))
     return missing
@@ -133,6 +136,7 @@ def _prepare_warp_prerequisites(ctx: BenchmarkContext) -> None:
             cwd=p,
         )
         import shutil as sh
+
         sh.copy2(ssw / f"autobox_anatQQ.{subid}.nii", autobox)
 
     # 2. EPI-to-anat alignment matrix (align_epi_anat.py + cat_matvec)
@@ -171,11 +175,11 @@ def run_ref(ctx: BenchmarkContext) -> float:
                 continue
             nwarp = _nwarp_chain(ctx, task, run)
             elapsed, _ = run_timed(
-                f'3dNwarpApply -overwrite '
-                f'-master {master} -dxyz 3.0 -wsinc5 '
+                f"3dNwarpApply -overwrite "
+                f"-master {master} -dxyz 3.0 -wsinc5 "
                 f'-nwarp "{nwarp}" '
-                f'-source {_input_path(ctx, task, run)} '
-                f'-prefix {out}',
+                f"-source {_input_path(ctx, task, run)} "
+                f"-prefix {out}",
                 label=f"3dNwarpApply {task} run-{run}",
                 cwd=ctx.processing_dir,
             )
@@ -200,12 +204,12 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 continue
             nwarp = _nwarp_chain(ctx, task, run)
             elapsed, _ = run_timed(
-                f'ffs_nwarp '
-                f'-master {master} -dxyz 3.0 -interp wsinc5 -no_autopad '
+                f"ffs_nwarp "
+                f"-master {master} -dxyz 3.0 -interp wsinc5 -no_autopad "
                 f'-nwarp "{nwarp}" '
-                f'-source {_input_path(ctx, task, run)} '
-                f'-prefix {out}'
-                f'{ctx.ffs_device_flag()}',
+                f"-source {_input_path(ctx, task, run)} "
+                f"-prefix {out}"
+                f"{ctx.ffs_device_flag()}",
                 label=f"ffs_nwarp {task} run-{run}",
                 cwd=ctx.processing_dir,
             )
@@ -228,7 +232,8 @@ def validate(ctx: BenchmarkContext) -> dict:
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             ts = compare_timeseries_4d(
-                _afni_mni(ctx, task, run), _ffs_mni(ctx, task, run),
+                _afni_mni(ctx, task, run),
+                _ffs_mni(ctx, task, run),
                 sample_frac=0.05,
             )
             ts["task"] = task
@@ -246,10 +251,7 @@ def validate(ctx: BenchmarkContext) -> dict:
 
     return {
         "passed": passed,
-        "summary": (
-            f"anat r={anat_result['r']:.4f}, "
-            f"func min median_r={func_min_r:.4f}"
-        ),
+        "summary": (f"anat r={anat_result['r']:.4f}, func min median_r={func_min_r:.4f}"),
         "anat": anat_result,
         "func_min_r": func_min_r,
         "func_mean_r": func_mean_r,

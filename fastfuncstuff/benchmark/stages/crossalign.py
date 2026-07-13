@@ -23,8 +23,8 @@ description = "Cross-run EPI alignment (3dAllineate vs ffs_allineate)"
 
 THRESHOLDS = {
     "aligned_image_min_r": 0.98,  # aligned images should be nearly identical
-    "max_angle_diff_deg": 0.5,    # rotation must agree within 0.5 degrees
-    "max_trans_diff_mm": 0.5,     # translation must agree within 0.5 mm
+    "max_angle_diff_deg": 0.5,  # rotation must agree within 0.5 degrees
+    "max_trans_diff_mm": 0.5,  # translation must agree within 0.5 mm
 }
 
 
@@ -58,7 +58,9 @@ def _src_mean(ctx: BenchmarkContext, task: str, run: int) -> Path:
 
 def _afni_mat(ctx: BenchmarkContext, task: str, run: int) -> Path:
     ref_task, ref_run = _ref_task_run(ctx)
-    return ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
+    return (
+        ctx.processing_dir / f"afni_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
+    )
 
 
 def _afni_aligned(ctx: BenchmarkContext, task: str, run: int) -> Path:
@@ -67,7 +69,9 @@ def _afni_aligned(ctx: BenchmarkContext, task: str, run: int) -> Path:
 
 def _ffs_mat(ctx: BenchmarkContext, task: str, run: int) -> Path:
     ref_task, ref_run = _ref_task_run(ctx)
-    return ctx.processing_dir / f"ffs_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
+    return (
+        ctx.processing_dir / f"ffs_mean_{task}_run-{run}_to_{ref_task}_run-{ref_run}_mat.aff12.1D"
+    )
 
 
 def _ffs_aligned(ctx: BenchmarkContext, task: str, run: int) -> Path:

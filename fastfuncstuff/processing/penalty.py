@@ -42,21 +42,15 @@ def _central_diff_batched(vol: Tensor, dim: int) -> Tensor:
     )
 
     # Boundary: forward difference at start
-    result.narrow(tdim, 0, 1).copy_(
-        vol.narrow(tdim, 1, 1) - vol.narrow(tdim, 0, 1)
-    )
+    result.narrow(tdim, 0, 1).copy_(vol.narrow(tdim, 1, 1) - vol.narrow(tdim, 0, 1))
 
     # Boundary: backward difference at end
-    result.narrow(tdim, n - 1, 1).copy_(
-        vol.narrow(tdim, n - 1, 1) - vol.narrow(tdim, n - 2, 1)
-    )
+    result.narrow(tdim, n - 1, 1).copy_(vol.narrow(tdim, n - 1, 1) - vol.narrow(tdim, n - 2, 1))
 
     return result
 
 
-def compute_jacobian_energy(
-    xd: Tensor, yd: Tensor, zd: Tensor
-) -> tuple[Tensor, Tensor]:
+def compute_jacobian_energy(xd: Tensor, yd: Tensor, zd: Tensor) -> tuple[Tensor, Tensor]:
     """Compute Jacobian-based energy fields for a displacement warp.
 
     Works for both single volumes (nz, ny, nx) and batched (B, nz, ny, nx).
@@ -108,8 +102,12 @@ def compute_jacobian_energy(
     e33 = a33 - 1.0
 
     se = (
-        e12 * e12 + e13 * e13 + e23 * e23
-        + w12 * w12 + w13 * w13 + w23 * w23
+        e12 * e12
+        + e13 * e13
+        + e23 * e23
+        + w12 * w12
+        + w13 * w13
+        + w23 * w23
         + 0.5 * (e11 * e11 + e22 * e22 + e33 * e33)
     )
 
@@ -117,7 +115,9 @@ def compute_jacobian_energy(
 
 
 def compute_penalty(
-    xd: Tensor, yd: Tensor, zd: Tensor,
+    xd: Tensor,
+    yd: Tensor,
+    zd: Tensor,
     pen_fac: float = 0.033333,
     external_sum: float = 0.0,
 ) -> float:
@@ -125,12 +125,14 @@ def compute_penalty(
     je, se = compute_jacobian_energy(xd, yd, zd)
     hsum = external_sum + float((je + se).sum().item())
     if hsum > 0:
-        return pen_fac * (hsum ** 0.25)
+        return pen_fac * (hsum**0.25)
     return 0.0
 
 
 def compute_penalty_batched(
-    xd: Tensor, yd: Tensor, zd: Tensor,
+    xd: Tensor,
+    yd: Tensor,
+    zd: Tensor,
     pen_fac: float,
     external_sums: Tensor,
 ) -> Tensor:

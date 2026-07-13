@@ -18,9 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def pearson_correlation(
-    base: Tensor, source: Tensor, weight: Tensor | None = None
-) -> Tensor:
+def pearson_correlation(base: Tensor, source: Tensor, weight: Tensor | None = None) -> Tensor:
     """Compute weighted Pearson correlation between two images.
 
     Args:
@@ -56,7 +54,9 @@ def pearson_correlation(
 
 
 def clipped_pearson_correlation(
-    base: Tensor, source: Tensor, weight: Tensor | None = None,
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor | None = None,
     base_clip: tuple[float, float] | None = None,
     source_clip: tuple[float, float] | None = None,
 ) -> Tensor:
@@ -93,6 +93,7 @@ def _auto_clip(data: Tensor, weight: Tensor | None = None) -> tuple[float, float
 # LPA: Local Pearson Absolute correlation
 # ---------------------------------------------------------------------------
 
+
 def _gauss_kernel_1d(sigma: float, device: torch.device) -> Tensor:
     """Create a 1D Gaussian kernel."""
     radius = int(3.0 * sigma + 0.5)
@@ -117,7 +118,9 @@ def _box_kernel_1d(radius: int, device: torch.device) -> Tensor:
 
 
 def _make_kernel_1d(
-    kernel_type: str, param: float, device: torch.device,
+    kernel_type: str,
+    param: float,
+    device: torch.device,
 ) -> Tensor:
     """Create a 1D kernel from a type string and parameter.
 
@@ -144,8 +147,7 @@ def auto_box_radius(n_voxels_target: int = 500) -> int:
     return max(r, 1)
 
 
-def _separable_smooth_3d(vol: Tensor, sigma: float,
-                         kernel_type: str = "gauss") -> Tensor:
+def _separable_smooth_3d(vol: Tensor, sigma: float, kernel_type: str = "gauss") -> Tensor:
     """Apply 3D smoothing using separable convolution.
 
     Args:
@@ -166,17 +168,17 @@ def _separable_smooth_3d(vol: Tensor, sigma: float,
     # Z
     if vol.shape[2] > 1:
         k = kernel[None, None, :, None, None]
-        vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode='replicate')
+        vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode="replicate")
         vol = F.conv3d(vol, k)
     # Y
     if vol.shape[3] > 1:
         k = kernel[None, None, None, :, None]
-        vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode='replicate')
+        vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode="replicate")
         vol = F.conv3d(vol, k)
     # X
     if vol.shape[4] > 1:
         k = kernel[None, None, None, None, :]
-        vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode='replicate')
+        vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode="replicate")
         vol = F.conv3d(vol, k)
 
     if squeeze:
@@ -185,8 +187,11 @@ def _separable_smooth_3d(vol: Tensor, sigma: float,
 
 
 def lpa_correlation(
-    base: Tensor, source: Tensor, weight: Tensor | None = None,
-    sigma: float = 4.0, kernel_type: str = "gauss",
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor | None = None,
+    sigma: float = 4.0,
+    kernel_type: str = "gauss",
 ) -> Tensor:
     """Compute Local Pearson Absolute (LPA) correlation.
 
@@ -256,8 +261,11 @@ def lpa_correlation(
 
 
 def lpc_correlation(
-    base: Tensor, source: Tensor, weight: Tensor | None = None,
-    sigma: float = 4.0, kernel_type: str = "gauss",
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor | None = None,
+    sigma: float = 4.0,
+    kernel_type: str = "gauss",
 ) -> Tensor:
     """Compute Local Pearson Correlation (LPC) for cross-modality alignment.
 
@@ -322,17 +330,22 @@ def lpc_correlation(
 
 
 def lpa_cost_patch(
-    base_patch: Tensor, source_patch: Tensor, weight_patch: Tensor,
-    sigma: float = 2.5, kernel_type: str = "gauss",
+    base_patch: Tensor,
+    source_patch: Tensor,
+    weight_patch: Tensor,
+    sigma: float = 2.5,
+    kernel_type: str = "gauss",
 ) -> Tensor:
     """LPA correlation on a single patch (3D). Returns scalar, differentiable."""
-    return lpa_correlation(base_patch, source_patch, weight_patch,
-                           sigma=sigma, kernel_type=kernel_type)
+    return lpa_correlation(
+        base_patch, source_patch, weight_patch, sigma=sigma, kernel_type=kernel_type
+    )
 
 
 # ---------------------------------------------------------------------------
 # Batched LPA for GPU-parallel patch processing
 # ---------------------------------------------------------------------------
+
 
 def _batched_separable_smooth_3d(vol: Tensor, kernel: Tensor) -> Tensor:
     """Apply separable 3D Gaussian smoothing to batched volumes.
@@ -355,17 +368,17 @@ def _batched_separable_smooth_3d(vol: Tensor, kernel: Tensor) -> Tensor:
     # Z axis
     if vol.shape[2] > 1:
         k = kernel[None, None, :, None, None].expand(B, 1, -1, 1, 1)  # (B, 1, K, 1, 1)
-        vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode='replicate')
+        vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode="replicate")
         vol = F.conv3d(vol, k, groups=B)
     # Y axis
     if vol.shape[3] > 1:
         k = kernel[None, None, None, :, None].expand(B, 1, 1, -1, 1)
-        vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode='replicate')
+        vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode="replicate")
         vol = F.conv3d(vol, k, groups=B)
     # X axis
     if vol.shape[4] > 1:
         k = kernel[None, None, None, None, :].expand(B, 1, 1, 1, -1)
-        vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode='replicate')
+        vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode="replicate")
         vol = F.conv3d(vol, k, groups=B)
 
     # Back to (B, 1, D, H, W)
@@ -376,7 +389,9 @@ def batched_lpa_cost(
     base_patches: Tensor,
     source_patches: Tensor,
     weight_patches: Tensor,
-    nzh: int, nyh: int, nxh: int,
+    nzh: int,
+    nyh: int,
+    nxh: int,
     sigma: float = 4.0,
     kernel_type: str = "gauss",
 ) -> Tensor:
@@ -450,6 +465,7 @@ def batched_lpa_cost(
 # Incremental correlation (original serial version, kept for compatibility)
 # ---------------------------------------------------------------------------
 
+
 class IncrementalCorrelation:
     """Incremental correlation calculator matching AFNI's INCOR framework."""
 
@@ -473,9 +489,7 @@ class IncrementalCorrelation:
         self._base_clip = base_clip
         self._source_clip = source_clip
 
-    def add_fixed(
-        self, base: Tensor, source: Tensor, weight: Tensor
-    ) -> None:
+    def add_fixed(self, base: Tensor, source: Tensor, weight: Tensor) -> None:
         mask = weight > 0
         if not mask.any():
             return
@@ -497,9 +511,7 @@ class IncrementalCorrelation:
         self._swyy_fixed = float((w * y * y).sum().item())
         self._swxy_fixed = float((w * x * y).sum().item())
 
-    def evaluate(
-        self, base_patch: Tensor, source_patch: Tensor, weight_patch: Tensor
-    ) -> float:
+    def evaluate(self, base_patch: Tensor, source_patch: Tensor, weight_patch: Tensor) -> float:
         mask = weight_patch > 0
         if not mask.any():
             return 0.0
@@ -533,12 +545,13 @@ class IncrementalCorrelation:
         if denom <= 0:
             return 0.0
 
-        return vxy / (denom ** 0.5)
+        return vxy / (denom**0.5)
 
 
 # ---------------------------------------------------------------------------
 # Batched GPU-native correlation for parallel patch processing
 # ---------------------------------------------------------------------------
+
 
 class BatchedIncrementalCorrelation:
     """Batched incremental correlation for B patches simultaneously.
@@ -612,22 +625,28 @@ class BatchedIncrementalCorrelation:
         if base_patches is not None:
             bp_all = base_patches
         else:
-            bp_all = torch.stack([
-                base[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-            ])
+            bp_all = torch.stack(
+                [
+                    base[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                    for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+                ]
+            )
         # warped_source patches always extracted fresh (warped_source changes between phases)
-        sp_all = torch.stack([
-            warped_source[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-            for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-        ])
+        sp_all = torch.stack(
+            [
+                warped_source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+            ]
+        )
         if weight_patches is not None:
             wp_all = weight_patches
         else:
-            wp_all = torch.stack([
-                weight[kbot:ktop+1, jbot:jtop+1, ibot:itop+1].reshape(-1)
-                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-            ])
+            wp_all = torch.stack(
+                [
+                    weight[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                    for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+                ]
+            )
 
         if self.base_clip:
             bp_all = bp_all.clamp(self.base_clip[0], self.base_clip[1])

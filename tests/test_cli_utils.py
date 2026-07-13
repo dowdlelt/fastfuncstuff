@@ -30,6 +30,7 @@ from fastfuncstuff.cli_utils import (
 # Layer 1: Small Tests - Unit tests for core utility functions
 # ============================================================================
 
+
 class TestCliUtilsCoreFunctions:
     """Test core CLI utility functions."""
 
@@ -210,6 +211,7 @@ class TestCliUtilsCoreFunctions:
 # Layer 2: Medium Tests - Integration tests
 # ============================================================================
 
+
 class TestCliUtilsIntegration:
     """Test CLI utility integration scenarios."""
 
@@ -237,6 +239,7 @@ class TestCliUtilsIntegration:
 # ============================================================================
 # Layer 3: Large Tests - E2E tests
 # ============================================================================
+
 
 class TestCliUtilsE2E:
     """Test end-to-end CLI utility scenarios."""

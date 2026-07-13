@@ -19,10 +19,11 @@ class DownloadConfig:
     For S3-hosted datasets (OpenNeuro): set s3_url and include patterns.
     For manually-supplied data: leave s3_url empty and set instructions.
     """
-    data_dir_name: str = ""             # subdirectory under get_benchmark_data_dir()
-    s3_url: str = ""                    # e.g. "s3://openneuro.org/ds005165"
+
+    data_dir_name: str = ""  # subdirectory under get_benchmark_data_dir()
+    s3_url: str = ""  # e.g. "s3://openneuro.org/ds005165"
     include: list[str] = field(default_factory=list)  # aws --include patterns; empty = all
-    instructions: str = ""              # shown when source is manual
+    instructions: str = ""  # shown when source is manual
 
 
 @dataclass
@@ -117,11 +118,24 @@ def default_config() -> BenchmarkConfig:
             "rest": [1, 2, 3, 4, 5],
         },
         stages=[
-            "moco", "slicetime", "crossalign", "align", "warp",
-            "glm", "build_design", "ica", "ica_single", "automask",
-            "glmsingle_prep", "glmsingle_matlab",
-            "glmsingle_hrf", "glmsingle_denoise", "glmsingle_ridge",
-            "glm_tent", "glm_im", "glm_im_reml",
+            "moco",
+            "slicetime",
+            "crossalign",
+            "align",
+            "warp",
+            "glm",
+            "build_design",
+            "ica",
+            "ica_single",
+            "automask",
+            "glmsingle_prep",
+            "glmsingle_matlab",
+            "glmsingle_hrf",
+            "glmsingle_denoise",
+            "glmsingle_ridge",
+            "glm_tent",
+            "glm_im",
+            "glm_im_reml",
             "phasereg",
         ],
         stage_params={

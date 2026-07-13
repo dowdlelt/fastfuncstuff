@@ -43,6 +43,7 @@ from .ica import create_ica
 # Similarity matrix — GIFT corrw (default)
 # ---------------------------------------------------------------------------
 
+
 def _recover_W_and_D(
     ica,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -53,9 +54,9 @@ def _recover_W_and_D(
 
     This avoids storing extra attributes on the ICA classes.
     """
-    comp = ica.components_                                # (k, V)
-    pca_comp = ica.pca_.components_[:comp.shape[0]]      # (k, V)
-    W = comp @ torch.linalg.pinv(pca_comp)                # (k, k)
+    comp = ica.components_  # (k, V)
+    pca_comp = ica.pca_.components_[: comp.shape[0]]  # (k, V)
+    W = comp @ torch.linalg.pinv(pca_comp)  # (k, k)
     return W, pca_comp
 
 
@@ -92,17 +93,17 @@ def compute_similarity_corrw(
     for W, D in wd_pairs:
         W = W.to(device=device, dtype=torch.float32)
         D = D.to(device=device, dtype=torch.float32)
-        B = W @ D                                     # (k, V)
+        B = W @ D  # (k, V)
         norms = B.norm(dim=1, keepdim=True).clamp(min=1e-12)
-        B = B / norms                                  # row-normalise
+        B = B / norms  # row-normalise
         rows.append(B)
 
-    all_B = torch.cat(rows, dim=0)                     # (N, V)
+    all_B = torch.cat(rows, dim=0)  # (N, V)
     N = all_B.shape[0]
     del rows
 
     avail = get_available_memory(device, safety_factor=0.4)
-    chunk_bytes_full = N * all_B.shape[1] * 4          # (N_chunk, V) @ (V, N)
+    chunk_bytes_full = N * all_B.shape[1] * 4  # (N_chunk, V) @ (V, N)
     max_chunk_rows = max(1, int(avail // chunk_bytes_full)) if chunk_bytes_full > 0 else N
     max_chunk_rows = min(max_chunk_rows, N)
 
@@ -121,6 +122,7 @@ def compute_similarity_corrw(
 # ---------------------------------------------------------------------------
 # Similarity matrix — spatial-map Pearson correlation (fallback)
 # ---------------------------------------------------------------------------
+
 
 def compute_similarity_matrix(
     components_list: list[np.ndarray],
@@ -161,9 +163,7 @@ def compute_similarity_matrix(
         similarity = np.empty((n_total, n_total), dtype=np.float32)
         for i in range(0, n_total, batch_size):
             end_i = min(i + batch_size, n_total)
-            similarity[i:end_i, :] = np.abs(
-                standardized[i:end_i] @ standardized.T
-            )
+            similarity[i:end_i, :] = np.abs(standardized[i:end_i] @ standardized.T)
 
     np.clip(similarity, 0.0, 1.0, out=similarity)
     return similarity
@@ -172,6 +172,7 @@ def compute_similarity_matrix(
 # ---------------------------------------------------------------------------
 # Clustering
 # ---------------------------------------------------------------------------
+
 
 def cluster_components(
     similarity: np.ndarray,
@@ -207,6 +208,7 @@ def cluster_components(
 # ---------------------------------------------------------------------------
 # Quality index  (Iq)
 # ---------------------------------------------------------------------------
+
 
 def compute_cluster_quality(
     labels: np.ndarray,
@@ -272,6 +274,7 @@ def compute_cluster_quality(
 # ---------------------------------------------------------------------------
 # R-index  (Davies-Bouldin validity, GIFT rindex.m)
 # ---------------------------------------------------------------------------
+
 
 def _clusterstat(
     mat: np.ndarray,
@@ -393,6 +396,7 @@ def compute_rindex(
 # Centrotype selection  (GIFT convention)
 # ---------------------------------------------------------------------------
 
+
 def select_centrotypes(
     labels: np.ndarray,
     similarity: np.ndarray,
@@ -433,6 +437,7 @@ def select_centrotypes(
 # ---------------------------------------------------------------------------
 # Mixing matrix extraction
 # ---------------------------------------------------------------------------
+
 
 def _extract_mixing_for_centrotypes(
     centrotype_indices: np.ndarray,
@@ -477,13 +482,13 @@ def _extract_mixing_for_centrotypes(
     if reproject:
         if X is None:
             raise ValueError("X required when reproject=True")
-        S = all_components[centrotype_indices]              # (k, V)
+        S = all_components[centrotype_indices]  # (k, V)
         if isinstance(X, torch.Tensor):
             X_np = X.cpu().numpy()
         else:
             X_np = np.asarray(X)
-        StS = S @ S.T                                      # (k, k)
-        mixing = X_np @ S.T @ np.linalg.inv(StS)           # (T, k)
+        StS = S @ S.T  # (k, k)
+        mixing = X_np @ S.T @ np.linalg.inv(StS)  # (T, k)
         return mixing.astype(np.float64)
 
     n_samples = mixing_list[0].shape[0]
@@ -500,6 +505,7 @@ def _extract_mixing_for_centrotypes(
 # ---------------------------------------------------------------------------
 # Main ICASSO function
 # ---------------------------------------------------------------------------
+
 
 def icasso(
     X: np.ndarray | torch.Tensor,
@@ -576,19 +582,22 @@ def icasso(
 
     # Auto batch size for spatial-map path
     if batch_size is None and not use_corrw:
-        matrix_bytes = n_total ** 2 * 4
-        if matrix_bytes > 1024 ** 3:
-            batch_size = max(100, int(np.sqrt(500 * 1024 ** 3 / 4)))
+        matrix_bytes = n_total**2 * 4
+        if matrix_bytes > 1024**3:
+            batch_size = max(100, int(np.sqrt(500 * 1024**3 / 4)))
             if verbose:
-                print(f"  Auto batch_size={batch_size} "
-                      f"(similarity matrix ~{matrix_bytes / 1024**3:.1f} GB)")
+                print(
+                    f"  Auto batch_size={batch_size} "
+                    f"(similarity matrix ~{matrix_bytes / 1024**3:.1f} GB)"
+                )
 
     if verbose:
-        print(f"ICASSO: {n_runs} runs × {n_components} components "
-              f"= {n_total} estimates")
-        print(f"  mode={mode}, linkage={linkage_method}, "
-              f"ica={ica_method}, seed={base_seed}, "
-              f"similarity={similarity_method}")
+        print(f"ICASSO: {n_runs} runs × {n_components} components = {n_total} estimates")
+        print(
+            f"  mode={mode}, linkage={linkage_method}, "
+            f"ica={ica_method}, seed={base_seed}, "
+            f"similarity={similarity_method}"
+        )
 
     # ------------------------------------------------------------------
     # Step 1: Run ICA multiple times
@@ -657,8 +666,7 @@ def icasso(
     # Step 2: Similarity matrix
     # ------------------------------------------------------------------
     if verbose:
-        print(f"Computing {n_total}×{n_total} similarity matrix "
-              f"(method={similarity_method}) ...")
+        print(f"Computing {n_total}×{n_total} similarity matrix (method={similarity_method}) ...")
 
     if use_corrw:
         similarity = compute_similarity_corrw(wd_pairs)
@@ -673,7 +681,9 @@ def icasso(
         print(f"Clustering ({linkage_method} linkage) ...")
 
     labels, linkage_matrix = cluster_components(
-        similarity, n_clusters=n_components, method=linkage_method,
+        similarity,
+        n_clusters=n_components,
+        method=linkage_method,
     )
 
     # ------------------------------------------------------------------
@@ -686,8 +696,7 @@ def icasso(
     # Step 4b: R-index (Davies-Bouldin validity)
     # ------------------------------------------------------------------
     distance_matrix = 1.0 - similarity
-    r_index = compute_rindex(distance_matrix, linkage_matrix,
-                             max_clusters=n_total)
+    r_index = compute_rindex(distance_matrix, linkage_matrix, max_clusters=n_total)
     r_max = np.nanmax(r_index) if np.any(np.isfinite(r_index)) else np.nan
     if np.isfinite(r_max) and r_max > 0:
         r_index_normalized = r_index / r_max
@@ -705,8 +714,11 @@ def icasso(
     # Bootstrap mode: each run saw resampled data, so reproject original X.
     needs_reproject = mode in ("bootstrap", "both")
     all_mixing = _extract_mixing_for_centrotypes(
-        centrotype_indices, n_components, mixing_list,
-        components_list, all_components,
+        centrotype_indices,
+        n_components,
+        mixing_list,
+        components_list,
+        all_components,
         X=X if needs_reproject else None,
         reproject=needs_reproject,
     )
@@ -736,11 +748,12 @@ def icasso(
 
     if verbose:
         iq_valid = iq[~np.isnan(iq)]
-        print(f"Stability (Iq): mean={np.mean(iq_valid):.3f}, "
-              f"median={np.median(iq_valid):.3f}, "
-              f"range=[{np.min(iq_valid):.3f}, {np.max(iq_valid):.3f}]")
-        print(f"Stable components (Iq >= {min_stability:.2f}): "
-              f"{n_stable}/{n_components}")
+        print(
+            f"Stability (Iq): mean={np.mean(iq_valid):.3f}, "
+            f"median={np.median(iq_valid):.3f}, "
+            f"range=[{np.min(iq_valid):.3f}, {np.max(iq_valid):.3f}]"
+        )
+        print(f"Stable components (Iq >= {min_stability:.2f}): {n_stable}/{n_components}")
 
     return {
         # Stable subset
@@ -769,9 +782,7 @@ def icasso(
         "pca_components": pca_components_arr,
         "pca_variance_explained": pca_variance_explained,
         "pca_variance_cumsum": (
-            pca_variance_explained.cumsum()
-            if pca_variance_explained is not None
-            else None
+            pca_variance_explained.cumsum() if pca_variance_explained is not None else None
         ),
         # For compatibility
         "all_components": components_list,
@@ -782,6 +793,7 @@ def icasso(
 # ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
+
 
 def icasso_plot(
     results: dict,
@@ -809,6 +821,7 @@ def icasso_plot(
         Call plt.show() (for interactive use).
     """
     import matplotlib
+
     if output_path and not show:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -825,9 +838,9 @@ def icasso_plot(
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        f"ICASSO: {n_runs} runs × {n_components} components "
-        f"({results.get('mode', 'randinit')})",
-        fontsize=13, fontweight="bold",
+        f"ICASSO: {n_runs} runs × {n_components} components ({results.get('mode', 'randinit')})",
+        fontsize=13,
+        fontweight="bold",
     )
 
     # --- Panel 1: Iq bar chart ---
@@ -845,8 +858,9 @@ def icasso_plot(
             colors.append("#e67e22")
         else:
             colors.append("#e74c3c")
-    ax.bar(range(n_c), np.where(np.isnan(iq), 0, iq), color=colors,
-           edgecolor="black", linewidth=0.3)
+    ax.bar(
+        range(n_c), np.where(np.isnan(iq), 0, iq), color=colors, edgecolor="black", linewidth=0.3
+    )
     ax.set_xlabel("Component (sorted by Iq)")
     ax.set_ylabel("Stability index (Iq)")
     ax.set_title("Cluster stability")
@@ -855,15 +869,24 @@ def icasso_plot(
     ax.axhline(0.9, color="gray", linestyle="--", alpha=0.5, linewidth=0.8)
     ax.axhline(0.7, color="gray", linestyle=":", alpha=0.5, linewidth=0.8)
     if n_stable > 0 and n_stable < n_c:
-        ax.axvline(n_stable - 0.5, color="blue", linestyle="-", alpha=0.5,
-                   linewidth=1.2, label=f"stable cutoff ({n_stable})")
+        ax.axvline(
+            n_stable - 0.5,
+            color="blue",
+            linestyle="-",
+            alpha=0.5,
+            linewidth=1.2,
+            label=f"stable cutoff ({n_stable})",
+        )
         ax.legend(fontsize=8)
 
     # --- Panel 2: Dendrogram ---
     ax = axes[0, 1]
     dendrogram(
-        linkage_mat, ax=ax, truncate_mode="lastp",
-        p=min(n_components, 50), color_threshold=0,
+        linkage_mat,
+        ax=ax,
+        truncate_mode="lastp",
+        p=min(n_components, 50),
+        color_threshold=0,
         above_threshold_color="steelblue",
         no_labels=True,
     )
@@ -876,8 +899,7 @@ def icasso_plot(
     # Sort by cluster label for visual grouping
     sort_idx = np.argsort(labels)
     sorted_sim = similarity[np.ix_(sort_idx, sort_idx)]
-    im = ax.imshow(sorted_sim, cmap="hot", vmin=0, vmax=1, aspect="auto",
-                   interpolation="nearest")
+    im = ax.imshow(sorted_sim, cmap="hot", vmin=0, vmax=1, aspect="auto", interpolation="nearest")
     ax.set_title("Similarity matrix (sorted by cluster)")
     ax.set_xlabel("Component estimate")
     ax.set_ylabel("Component estimate")
@@ -897,16 +919,25 @@ def icasso_plot(
     ax = axes[1, 1]
     sizes = quality["size"]
     iq_plot = np.where(np.isnan(iq), 0, iq)
-    scatter = ax.scatter(sizes, iq_plot, c=iq_plot, cmap="RdYlGn",
-                         vmin=0, vmax=1, edgecolors="black", linewidth=0.5,
-                         s=60)
+    scatter = ax.scatter(
+        sizes,
+        iq_plot,
+        c=iq_plot,
+        cmap="RdYlGn",
+        vmin=0,
+        vmax=1,
+        edgecolors="black",
+        linewidth=0.5,
+        s=60,
+    )
     ax.set_xlabel("Cluster size (n estimates)")
     ax.set_ylabel("Stability index (Iq)")
     ax.set_title("Size vs stability")
     ax.axhline(0.7, color="gray", linestyle=":", alpha=0.5)
     expected_size = n_runs
-    ax.axvline(expected_size, color="blue", linestyle="--", alpha=0.3,
-               label=f"expected={expected_size}")
+    ax.axvline(
+        expected_size, color="blue", linestyle="--", alpha=0.3, label=f"expected={expected_size}"
+    )
     ax.legend(fontsize=8)
     fig.colorbar(scatter, ax=ax, shrink=0.8, label="Iq")
 
@@ -923,6 +954,7 @@ def icasso_plot(
 # ---------------------------------------------------------------------------
 # Auto component selection
 # ---------------------------------------------------------------------------
+
 
 def icasso_auto_select(
     X: np.ndarray | torch.Tensor,
@@ -964,8 +996,9 @@ def icasso_auto_select(
     n_stable_by_n = {}
 
     if verbose:
-        print(f"Testing {len(list(n_components_range))} component counts: "
-              f"{list(n_components_range)}")
+        print(
+            f"Testing {len(list(n_components_range))} component counts: {list(n_components_range)}"
+        )
 
     # PCA once for variance curve
     if verbose:
@@ -977,8 +1010,10 @@ def icasso_auto_select(
     pca_cumsum_curve = pca_variance_curve.cumsum()
 
     if verbose:
-        print(f"  PCA: {len(pca_variance_curve)} components, "
-              f"total variance: {pca_cumsum_curve[-1]:.1%}")
+        print(
+            f"  PCA: {len(pca_variance_curve)} components, "
+            f"total variance: {pca_cumsum_curve[-1]:.1%}"
+        )
         print()
 
     for n_comp in n_components_range:
@@ -1022,15 +1057,9 @@ def icasso_auto_select(
         for n in sorted(n_stable_by_n.keys()):
             ratio = stability_ratios[n]
             marker = " ←" if n == optimal_n else ""
-            pca_var_str = (
-                f"{pca_cumsum_curve[n - 1]:.1%}"
-                if n <= len(pca_cumsum_curve)
-                else "N/A"
-            )
-            print(f"{n:6d} | {n_stable_by_n[n]:6d} | {ratio:5.2f} | "
-                  f"{pca_var_str:>7}{marker}")
-        print(f"\nSelected n_components = {optimal_n} "
-              f"({n_stable_by_n[optimal_n]} stable)")
+            pca_var_str = f"{pca_cumsum_curve[n - 1]:.1%}" if n <= len(pca_cumsum_curve) else "N/A"
+            print(f"{n:6d} | {n_stable_by_n[n]:6d} | {ratio:5.2f} | {pca_var_str:>7}{marker}")
+        print(f"\nSelected n_components = {optimal_n} ({n_stable_by_n[optimal_n]} stable)")
 
     return {
         "optimal_n_components": optimal_n,

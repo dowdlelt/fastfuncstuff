@@ -23,6 +23,7 @@ The element is attached to the stat dataset's AFNI extension via
 A base64-encoded byte mask is written and attached as
 ``AFNI_CLUSTSIM_MASK`` so AFNI knows which voxels were eligible.
 """
+
 from __future__ import annotations
 
 import base64
@@ -38,6 +39,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # NIML serialisation
 # ---------------------------------------------------------------------------
+
 
 def write_clustsim_niml(
     out_path: Path,
@@ -61,9 +63,7 @@ def write_clustsim_niml(
     one float column per athr (the second index), with rows indexed by pthr.
     """
     if table.shape != (len(pthr), len(athr)):
-        raise ValueError(
-            f"table shape {table.shape} != (npthr={len(pthr)}, nathr={len(athr)})"
-        )
+        raise ValueError(f"table shape {table.shape} != (npthr={len(pthr)}, nathr={len(athr)})")
 
     pthr_csv = ",".join(f"{p:.6f}" for p in pthr)
     athr_csv = ",".join(f"{a:.6f}" for a in athr)
@@ -117,6 +117,7 @@ def write_clustsim_niml(
 # Base64 mask blob (matches AFNI's mask_to_b64string)
 # ---------------------------------------------------------------------------
 
+
 def resolve_mask_idcode(mask_path: Path | str | None) -> str:
     """Return an AFNI-style ``AFN_<22 base64 chars>`` IDCODE for the mask.
 
@@ -140,7 +141,9 @@ def resolve_mask_idcode(mask_path: Path | str | None) -> str:
         try:
             r = _subprocess.run(
                 ["3dinfo", "-id", str(p)],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             idc = r.stdout.strip()
             if idc and idc.startswith("AFN_"):
@@ -190,6 +193,7 @@ def write_mask_b64(out_path: Path, mask: np.ndarray) -> int:
 # ---------------------------------------------------------------------------
 # 3drefit dispatch
 # ---------------------------------------------------------------------------
+
 
 def build_refit_commands(
     stat_path: Path,
@@ -251,7 +255,9 @@ def run_refit(
     returned.
     """
     cmds = build_refit_commands(
-        stat_path, niml_files, mask_b64_path,
+        stat_path,
+        niml_files,
+        mask_b64_path,
         brick_labels=brick_labels,
         stat_brick_indices=stat_brick_indices,
         dof=dof,

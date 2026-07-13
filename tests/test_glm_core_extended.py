@@ -58,7 +58,9 @@ class TestPolynomialMatrix:
         t = torch.linspace(-1, 1, n_timepoints, dtype=torch.float64)
 
         # First column: constant (P0)
-        assert torch.allclose(poly2_cpu[:, 0], torch.ones(n_timepoints, dtype=torch.float64), atol=1e-5)
+        assert torch.allclose(
+            poly2_cpu[:, 0], torch.ones(n_timepoints, dtype=torch.float64), atol=1e-5
+        )
 
         # Second column: linear (P1 = t)
         assert torch.allclose(poly2_cpu[:, 1], t, atol=1e-5)
@@ -157,17 +159,13 @@ class TestOrthogonalizeDesign:
 
         # Before orthogonalization, should be correlated
         corr_before = (X.T @ Z)[0, 0] / (X.norm() * Z.norm())
-        assert corr_before.abs() > 0.3, (
-            "Should have correlation before orthogonalization"
-        )
+        assert corr_before.abs() > 0.3, "Should have correlation before orthogonalization"
 
         # After orthogonalization
         X_orth = orthogonalize_design(X, Z)
         corr_after = (X_orth.T @ Z).abs().max()
 
-        assert corr_after < 1e-4, (
-            "Should have minimal correlation after orthogonalization"
-        )
+        assert corr_after < 1e-4, "Should have minimal correlation after orthogonalization"
 
     def test_orthogonalize_preserves_independent_variance(self, device):
         """Test that independent variance is largely preserved."""
@@ -204,9 +202,7 @@ class TestOrthogonalizeDesign:
         X_orth = orthogonalize_design(X, Z)
 
         # Should be mean-centered
-        assert torch.allclose(
-            X_orth.mean(dim=0), torch.tensor([0.0], device=device), atol=1e-5
-        )
+        assert torch.allclose(X_orth.mean(dim=0), torch.tensor([0.0], device=device), atol=1e-5)
 
 
 class TestPercentBoldChange:
@@ -305,19 +301,13 @@ class TestGLMChunkSize:
 
         X = torch.randn(n_timepoints, n_regressors, device=device)
         true_betas = torch.randn(n_voxels, n_regressors, device=device)
-        data = (X @ true_betas.T).T + 0.1 * torch.randn(
-            n_voxels, n_timepoints, device=device
-        )
+        data = (X @ true_betas.T).T + 0.1 * torch.randn(n_voxels, n_timepoints, device=device)
 
         # Fit with small chunks
-        results_chunked = fit_glm(
-            data, X, tr=2.0, chunk_size=10, verbose=False, device=device
-        )
+        results_chunked = fit_glm(data, X, tr=2.0, chunk_size=10, verbose=False, device=device)
 
         # Fit without chunking
-        results_full = fit_glm(
-            data, X, tr=2.0, chunk_size=None, verbose=False, device=device
-        )
+        results_full = fit_glm(data, X, tr=2.0, chunk_size=None, verbose=False, device=device)
 
         # Results should be identical regardless of chunk size
         assert torch.allclose(results_chunked.betas, results_full.betas, rtol=1e-4)
@@ -335,9 +325,7 @@ class TestGLMChunkSize:
         data = torch.randn(n_voxels, n_timepoints, device=device)
 
         # Chunk size larger than data
-        results = fit_glm(
-            data, X, tr=2.0, chunk_size=1000, verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=2.0, chunk_size=1000, verbose=False, device=device)
 
         # Should still work
         assert results.betas.shape == (n_voxels, n_regressors)
@@ -361,9 +349,7 @@ class TestGLMResidualsAndPredicted:
         X = torch.randn(n_timepoints, n_regressors, device=device)
         data = torch.randn(n_voxels, n_timepoints, device=device)
 
-        results = fit_glm(
-            data, X, tr=2.0, want_residuals=True, verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=2.0, want_residuals=True, verbose=False, device=device)
 
         assert results.residuals is not None
         assert results.residuals.shape == data.shape
@@ -382,9 +368,7 @@ class TestGLMResidualsAndPredicted:
         X = torch.randn(n_timepoints, n_regressors, device=device)
         data = torch.randn(n_voxels, n_timepoints, device=device)
 
-        results = fit_glm(
-            data, X, tr=2.0, want_predicted=True, verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=2.0, want_predicted=True, verbose=False, device=device)
 
         assert results.predicted is not None
         assert results.predicted.shape == data.shape
@@ -425,19 +409,13 @@ class TestGLMResidualsAndPredicted:
         X = torch.randn(n_timepoints, n_regressors, device=device)
         data = torch.randn(n_voxels, n_timepoints, device=device)
 
-        results = fit_glm(
-            data, X, tr=2.0, want_residuals=True, verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=2.0, want_residuals=True, verbose=False, device=device)
 
         # Compute correlation between residuals and design
         for i in range(n_regressors):
             for j in range(n_voxels):
-                corr = torch.corrcoef(torch.stack([results.residuals[j], X[:, i]]))[
-                    0, 1
-                ]
-                assert torch.abs(corr) < 0.1, (
-                    "Residuals should be uncorrelated with design"
-                )
+                corr = torch.corrcoef(torch.stack([results.residuals[j], X[:, i]]))[0, 1]
+                assert torch.abs(corr) < 0.1, "Residuals should be uncorrelated with design"
 
 
 class TestGLMPolynomialRegressors:
@@ -498,9 +476,7 @@ class TestGLMPolynomialRegressors:
         X = torch.randn(n_timepoints, 1, device=device)
 
         # Fit with quadratic detrending
-        results = fit_glm(
-            data, X, tr=2.0, max_poly_degree=2, verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=2.0, max_poly_degree=2, verbose=False, device=device)
 
         # Should successfully fit
         assert results.betas.shape == (n_voxels, 1)
@@ -532,9 +508,7 @@ class TestGLMExtraRegressors:
         motion_effect = X_motion @ torch.randn(n_motion, n_voxels, device=device)
         task_effect = X_task @ torch.randn(n_task, n_voxels, device=device)
         data = (
-            motion_effect
-            + task_effect
-            + 0.1 * torch.randn(n_timepoints, n_voxels, device=device)
+            motion_effect + task_effect + 0.1 * torch.randn(n_timepoints, n_voxels, device=device)
         ).T
 
         # Fit with motion regressors
@@ -566,9 +540,7 @@ class TestGLMExtraRegressors:
         # Extra regressors as single concatenated array
         extra = torch.randn(n_timepoints, 3, device=device)
 
-        results = fit_glm(
-            data, X, tr=2.0, extra_regressors=extra, verbose=False, device=device
-        )
+        results = fit_glm(data, X, tr=2.0, extra_regressors=extra, verbose=False, device=device)
 
         assert results.betas.shape == (n_voxels, 2)
 

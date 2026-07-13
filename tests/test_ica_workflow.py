@@ -8,7 +8,6 @@ Tests cover:
 - Spatial smoothness estimation (basic checks)
 """
 
-
 import numpy as np
 import torch
 
@@ -41,7 +40,7 @@ class TestVerboseSection:
         verbose_section(True, "X" * 20)
         captured = capsys.readouterr()
         # Should contain header and dashes
-        lines = captured.out.strip().split('\n')
+        lines = captured.out.strip().split("\n")
         assert len(lines) == 1
 
 
@@ -63,6 +62,7 @@ class TestVerbosePrint:
     def test_verbose_print_with_timing(self, capsys):
         """Test timing annotation in verbose print."""
         import time
+
         start = time.time()
         time.sleep(0.01)  # Small delay
         verbose_print(True, "Processing", t0=start)
@@ -82,28 +82,28 @@ class TestSanitizeFiniteTensor:
 
     def test_replaces_nan_with_zero(self):
         """Test that NaN values are replaced with zero."""
-        t = torch.tensor([1.0, float('nan'), 3.0])
+        t = torch.tensor([1.0, float("nan"), 3.0])
         result = sanitize_finite_tensor(t, "test", verbose=False)
         expected = torch.tensor([1.0, 0.0, 3.0])
         assert torch.equal(result, expected)
 
     def test_replaces_inf_with_zero(self):
         """Test that Inf values are replaced with zero."""
-        t = torch.tensor([1.0, float('inf'), 3.0])
+        t = torch.tensor([1.0, float("inf"), 3.0])
         result = sanitize_finite_tensor(t, "test", verbose=False)
         expected = torch.tensor([1.0, 0.0, 3.0])
         assert torch.equal(result, expected)
 
     def test_replaces_neg_inf_with_zero(self):
         """Test that -Inf values are replaced with zero."""
-        t = torch.tensor([1.0, float('-inf'), 3.0])
+        t = torch.tensor([1.0, float("-inf"), 3.0])
         result = sanitize_finite_tensor(t, "test", verbose=False)
         expected = torch.tensor([1.0, 0.0, 3.0])
         assert torch.equal(result, expected)
 
     def test_warns_about_bad_values(self, capsys):
         """Test that warnings are printed for bad values."""
-        t = torch.tensor([1.0, float('nan'), float('inf')])
+        t = torch.tensor([1.0, float("nan"), float("inf")])
         _ = sanitize_finite_tensor(t, "test_label", verbose=True)
         captured = capsys.readouterr()
         # Should print a warning about NaN/Inf values
@@ -130,7 +130,7 @@ class TestSanitizeFiniteTensor:
         _result = sanitize_finite_tensor(t, "test")
         # When there are no bad values, it should return the original
         # When there are bad values, it should be a clone
-        t_with_nan = torch.tensor([1.0, float('nan'), 3.0])
+        t_with_nan = torch.tensor([1.0, float("nan"), 3.0])
         _result_nan = sanitize_finite_tensor(t_with_nan, "test")
         # Original should be unchanged
         assert torch.isnan(t_with_nan[1])
@@ -142,9 +142,7 @@ class TestApplyVoxelVarianceNormalization:
     def test_integer_num_spec_legacy_path(self):
         """Test integer num_spec uses legacy path."""
         data = torch.randn(10, 50)  # 10 voxels, 50 timepoints
-        result, msg = apply_voxel_variance_normalization(
-            data, num_spec=20, n_t=50, n_vox_masked=10
-        )
+        result, msg = apply_voxel_variance_normalization(data, num_spec=20, n_t=50, n_vox_masked=10)
         assert "legacy path" in msg
         assert result.shape == data.shape
 
@@ -182,9 +180,7 @@ class TestApplyVoxelVarianceNormalization:
         scales = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]).unsqueeze(1)
         data = data * scales
 
-        result, msg = apply_voxel_variance_normalization(
-            data, num_spec=10, n_t=100, n_vox_masked=5
-        )
+        result, msg = apply_voxel_variance_normalization(data, num_spec=10, n_t=100, n_vox_masked=5)
 
         # Check that variances are more similar after normalization
         input_vars = data.var(dim=1)
@@ -198,9 +194,7 @@ class TestApplyVoxelVarianceNormalization:
         data = torch.randn(5, 100)
         data[2, :] = 5.0  # Make voxel 2 constant
 
-        result, msg = apply_voxel_variance_normalization(
-            data, num_spec=10, n_t=100, n_vox_masked=5
-        )
+        result, msg = apply_voxel_variance_normalization(data, num_spec=10, n_t=100, n_vox_masked=5)
 
         # Voxel 2 should be zeroed
         assert torch.all(result[2, :] == 0)
@@ -209,9 +203,7 @@ class TestApplyVoxelVarianceNormalization:
     def test_returns_tuple(self):
         """Test that function returns (tensor, message) tuple."""
         data = torch.randn(5, 50)
-        result = apply_voxel_variance_normalization(
-            data, num_spec=10, n_t=50, n_vox_masked=5
-        )
+        result = apply_voxel_variance_normalization(data, num_spec=10, n_t=50, n_vox_masked=5)
         assert isinstance(result, tuple)
         assert len(result) == 2
         assert isinstance(result[0], torch.Tensor)
@@ -227,6 +219,7 @@ class TestEstimateSpatialSmoothnessResels:
         data_4d = np.random.randn(10, 10, 5, 20)  # Small for speed
 
         from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
+
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d)
 
         assert isinstance(resels, float)
@@ -241,6 +234,7 @@ class TestEstimateSpatialSmoothnessResels:
         mask[:2, :2, :] = False  # Exclude some voxels
 
         from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
+
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d, mask=mask)
 
         assert resels > 0
@@ -252,6 +246,7 @@ class TestEstimateSpatialSmoothnessResels:
         data_4d = np.ones((10, 10, 5, 10))
 
         from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
+
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d)
 
         # Should still return valid values (uses minimum FWHM of 1.0)
@@ -264,6 +259,7 @@ class TestEstimateSpatialSmoothnessResels:
         device = torch.device("cpu")
 
         from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
+
         resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d, device=device)
 
         # Just check it doesn't crash

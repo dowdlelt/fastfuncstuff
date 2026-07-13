@@ -103,9 +103,7 @@ def simple_arma_results(device):
     # Also add to OLS results
     if results.ols_results is not None:
         results.ols_results.full_shape = (10, 10, 5)
-        results.ols_results.voxel_mask = torch.ones(
-            n_voxels, dtype=torch.bool, device=device
-        )
+        results.ols_results.voxel_mask = torch.ones(n_voxels, dtype=torch.bool, device=device)
         results.ols_results.affine = np.eye(4)
 
     return results
@@ -166,10 +164,7 @@ class TestSliceGLMResults:
         # OLS uses xtx_inv
         sliced = slice_glm_results(simple_glm_results, [0, 2])
 
-        if (
-            hasattr(simple_glm_results, "xtx_inv")
-            and simple_glm_results.xtx_inv is not None
-        ):
+        if hasattr(simple_glm_results, "xtx_inv") and simple_glm_results.xtx_inv is not None:
             assert sliced.xtx_inv.shape[-2:] == (2, 2), "xtx_inv should be 2x2"
 
     def test_slice_arma_results(self, simple_arma_results):
@@ -245,9 +240,7 @@ class TestWriteAFNIBucket:
             data = img.get_fdata()
 
             # Should have: F-stat + 4 conditions × 2 (beta, tstat) = 9 volumes
-            assert data.shape == (10, 10, 10, 9), (
-                f"Expected 9 volumes, got {data.shape}"
-            )
+            assert data.shape == (10, 10, 10, 9), f"Expected 9 volumes, got {data.shape}"
 
     def test_write_with_contrasts(self, simple_glm_results, sample_contrasts):
         """Test writing with contrast results."""
@@ -328,9 +321,7 @@ class TestWriteAFNIBucket:
             )
 
             img = nib.load(result_path)
-            assert img.shape[:3] == (5, 5, 4), (
-                f"Should have correct shape, got {img.shape[:3]}"
-            )
+            assert img.shape[:3] == (5, 5, 4), f"Should have correct shape, got {img.shape[:3]}"
 
     def test_write_with_custom_affine(self, simple_glm_results):
         """Test writing with custom affine matrix."""
@@ -434,9 +425,7 @@ class TestWriteAFNIBucket:
             original_betas = simple_glm_results.betas[:, 0].cpu().numpy()
 
             # Should match (within floating point tolerance)
-            assert np.allclose(
-                beta_vol[: len(original_betas)], original_betas, rtol=1e-5
-            )
+            assert np.allclose(beta_vol[: len(original_betas)], original_betas, rtol=1e-5)
 
 
 # =============================================================================
@@ -514,9 +503,7 @@ class TestWriteOLSARMAComparison:
             ols_img = nib.load(outputs["ols"])
             arma_img = nib.load(outputs["arma"])
 
-            assert ols_img.shape == arma_img.shape, (
-                "OLS and ARMA should have same shape"
-            )
+            assert ols_img.shape == arma_img.shape, "OLS and ARMA should have same shape"
 
     def test_comparison_json_content(self, simple_arma_results):
         """Test that JSON comparison summary contains expected fields."""
@@ -629,9 +616,7 @@ class TestSaveARMARvar:
             data = img.get_fdata()
 
             # Should have 6 volumes: a, b, lambda, StDev, -LogLik, LjungBox
-            assert data.shape == (*simple_arma_results.full_shape, 6), (
-                "Should have 6 volumes"
-            )
+            assert data.shape == (*simple_arma_results.full_shape, 6), "Should have 6 volumes"
 
     def test_save_volumes_content(self, simple_arma_results):
         """Test that saved volumes contain expected values."""
@@ -818,9 +803,7 @@ class TestFullWorkflow:
         results.voxel_mask = torch.ones(n_voxels, dtype=torch.bool, device=device)
         results.affine = np.eye(4)
         results.ols_results.full_shape = (10, 10, 5)
-        results.ols_results.voxel_mask = torch.ones(
-            n_voxels, dtype=torch.bool, device=device
-        )
+        results.ols_results.voxel_mask = torch.ones(n_voxels, dtype=torch.bool, device=device)
         results.ols_results.affine = np.eye(4)
 
         # Step 3: Compute contrasts using OLS results
@@ -921,9 +904,7 @@ class TestFullWorkflow:
         results.voxel_mask = torch.ones(200, dtype=torch.bool, device=device)
         results.affine = np.eye(4)
         results.ols_results.full_shape = (10, 10, 2)
-        results.ols_results.voxel_mask = torch.ones(
-            200, dtype=torch.bool, device=device
-        )
+        results.ols_results.voxel_mask = torch.ones(200, dtype=torch.bool, device=device)
         results.ols_results.affine = np.eye(4)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -996,24 +977,18 @@ class TestFullWorkflow:
 
             # 1. ARMA results should have spatial metadata
             assert hasattr(results, "full_shape"), "ARMA results missing full_shape"
-            assert results.full_shape == (10, 10, 5), (
-                f"Wrong ARMA shape: {results.full_shape}"
-            )
+            assert results.full_shape == (10, 10, 5), f"Wrong ARMA shape: {results.full_shape}"
             assert hasattr(results, "voxel_mask"), "ARMA results missing voxel_mask"
             assert hasattr(results, "affine"), "ARMA results missing affine"
 
             # 2. OLS results should ALSO have spatial metadata (THIS WAS THE BUG!)
             assert hasattr(results, "ols_results"), "No OLS results"
             assert results.ols_results is not None, "OLS results is None"
-            assert hasattr(results.ols_results, "full_shape"), (
-                "OLS results missing full_shape"
-            )
+            assert hasattr(results.ols_results, "full_shape"), "OLS results missing full_shape"
             assert results.ols_results.full_shape == (10, 10, 5), (
                 f"Wrong OLS shape: {results.ols_results.full_shape}"
             )
-            assert hasattr(results.ols_results, "voxel_mask"), (
-                "OLS results missing voxel_mask"
-            )
+            assert hasattr(results.ols_results, "voxel_mask"), "OLS results missing voxel_mask"
             assert hasattr(results.ols_results, "affine"), "OLS results missing affine"
 
             # 3. Test the actual bug scenario: slice then write
@@ -1045,9 +1020,7 @@ class TestFullWorkflow:
                 else:
                     raise
 
-            print(
-                "\n✓ Regression test passed: spatial metadata propagated to OLS results"
-            )
+            print("\n✓ Regression test passed: spatial metadata propagated to OLS results")
 
 
 # =============================================================================

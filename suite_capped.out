@@ -1,0 +1,90 @@
+ssss............sss..................................................... [  3%]
+........................................................................ [  6%]
+......................................................sss............... [  9%]
+........................................................................ [ 12%]
+........................................................................ [ 16%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 25%]
+........................................................................ [ 28%]
+........................................................................ [ 32%]
+........................................................................ [ 35%]
+........................................................................ [ 38%]
+........................................................................ [ 41%]
+........................................................................ [ 45%]
+........................................................................ [ 48%]
+........................................................................ [ 51%]
+........................................................................ [ 54%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+....................................s................................... [ 64%]
+...................................................................s.... [ 67%]
+........................................................................ [ 70%]
+........................................................................ [ 74%]
+........................................................................ [ 77%]
+........................................................................ [ 80%]
+........................................................................ [ 83%]
+........................................................................ [ 86%]
+........................................................................ [ 90%]
+...............................................................s........ [ 93%]
+........................................................................ [ 96%]
+........................................................................ [ 99%]
+.....                                                                    [100%]
+=============================== warnings summary ===============================
+tests/test_arma_dsort.py::test_dsort_constant_guard_replaces_with_mean
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/tests/test_arma_dsort.py:213: UserWarning: -dsort: 1 voxel timeseries were ~constant through time and were replaced by their dataset mean (matches 3dREMLfit).
+    out = _dsort_constant_guard(dsort.clone())
+
+tests/test_bsds_matlab_compare.py::test_plot_map_comparison_writes_file
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/dynamics/bsds/matlab_compare.py:218: RuntimeWarning: Mean of empty slice
+    act_corr = float(np.nanmean(act)) if act else float("nan")
+
+tests/test_denoise_combinatorial.py::TestExtractPcsSingleRun::test_empty_noise_pool
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/denoise/combinatorial.py:166: UserWarning: std(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel). (Triggered internally at /pytorch/aten/src/ATen/native/ReduceOps.cpp:1839.)
+    pc_std = scores.std(dim=0, keepdim=True).clamp(min=1e-10)
+
+tests/test_metrics_empirical.py::TestEstimateAR1Coefficient::test_constant_series_returns_nan
+  /home/logan/miniconda3/envs/py312_movie_tasks/lib/python3.12/site-packages/numpy/lib/_function_base_impl.py:3065: RuntimeWarning: invalid value encountered in divide
+    c /= stddev[:, None]
+
+tests/test_noise_extended.py::TestEstimateNoiseParametersFromData::test_1d_input
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/simulation/noise.py:711: UserWarning: std(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel). (Triggered internally at /pytorch/aten/src/ATen/native/ReduceOps.cpp:1839.)
+    sfnr_std = sfnr_per_voxel.std().item()
+
+tests/test_noise_extended.py::TestEstimateSfnr::test_output_keys
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/simulation/noise.py:871: UserWarning: std(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel). (Triggered internally at /pytorch/aten/src/ATen/native/ReduceOps.cpp:1839.)
+    sfnr_std = sfnr.std().item()
+
+tests/test_processing_allineate.py::TestAllineate::test_cross_grid_far_apart_brains_align
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/processing/cost.py:89: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+  Consider using tensor.detach() first. (Triggered internally at /pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:835.)
+    return (float(sorted_d[i_lo]), float(sorted_d[i_hi]))
+
+tests/test_utils_extended.py::TestLoadPerRunNuisanceFiles::test_empty_file_returns_none
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/utils.py:754: UserWarning: loadtxt: input contained no data: "/tmp/pytest-of-logan/pytest-149/test_empty_file_returns_none0/test_run01_PCs.txt"
+    data = np.loadtxt(run_file)
+
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_write_comparison_basic
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_filenames
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_with_contrasts
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_json_content
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_files_are_independent
+tests/test_write_functions.py::TestFullWorkflow::test_full_analysis_workflow
+tests/test_write_functions.py::TestFullWorkflow::test_workflow_without_contrasts
+tests/test_write_functions.py::TestFullWorkflow::test_analyze_from_design_matrix_sets_metadata
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/glm/outputs.py:1381: DeprecationWarning: `write_afni_bucket` is deprecated and renamed to `write_glm_bucket_as_nifti`. It writes NIfTI files (.nii.gz) which AFNI supports. Please update your code.
+    ols_file = write_afni_bucket(
+
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_write_comparison_basic
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_filenames
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_with_contrasts
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_json_content
+tests/test_write_functions.py::TestWriteOLSARMAComparison::test_comparison_files_are_independent
+tests/test_write_functions.py::TestFullWorkflow::test_full_analysis_workflow
+tests/test_write_functions.py::TestFullWorkflow::test_workflow_without_contrasts
+tests/test_write_functions.py::TestFullWorkflow::test_analyze_from_design_matrix_sets_metadata
+  /home/logan/Dropbox/Resources/code/fastfuncstuff/fastfuncstuff/glm/outputs.py:1392: DeprecationWarning: `write_afni_bucket` is deprecated and renamed to `write_glm_bucket_as_nifti`. It writes NIfTI files (.nii.gz) which AFNI supports. Please update your code.
+    arma_file = write_afni_bucket(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2224 passed, 13 skipped, 24 warnings in 271.19s (0:04:31)

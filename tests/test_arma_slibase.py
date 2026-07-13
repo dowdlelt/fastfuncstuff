@@ -77,8 +77,7 @@ def test_recovers_task_and_per_slice_nuisance():
     # Distinct slice regressor blocks per slice.
     slice_blocks = rng.standard_normal((n_slices, n_time, m)).astype(np.float32)
     designs_by_group = {
-        s: torch.from_numpy(np.concatenate([X, slice_blocks[s]], axis=1))
-        for s in range(n_slices)
+        s: torch.from_numpy(np.concatenate([X, slice_blocks[s]], axis=1)) for s in range(n_slices)
     }
     # Two slices must get genuinely different designs.
     assert not torch.allclose(designs_by_group[0], designs_by_group[1])
@@ -100,8 +99,14 @@ def test_recovers_task_and_per_slice_nuisance():
     phi_true = np.concatenate(phi_true, axis=0)
 
     res = fit_glm_arma11_grouped(
-        data, designs_by_group, group_indices, tr=2.0,
-        group_label="slice", device=device, verbose=False, use_double=True,
+        data,
+        designs_by_group,
+        group_indices,
+        tr=2.0,
+        group_label="slice",
+        device=device,
+        verbose=False,
+        use_double=True,
     )
     # No task_indices filter -> betas are all p+m columns.
     betas = res.betas.numpy()
@@ -120,8 +125,7 @@ def test_slibase_composes_with_dsort():
     p = X.shape[1]
     slice_blocks = rng.standard_normal((n_slices, n_time, m)).astype(np.float32)
     designs_by_group = {
-        s: torch.from_numpy(np.concatenate([X, slice_blocks[s]], axis=1))
-        for s in range(n_slices)
+        s: torch.from_numpy(np.concatenate([X, slice_blocks[s]], axis=1)) for s in range(n_slices)
     }
     n_vox = n_slices * per_slice
     dsort = rng.standard_normal((n_vox, 1, n_time)).astype(np.float32)
@@ -142,8 +146,14 @@ def test_slibase_composes_with_dsort():
     group_indices = torch.tensor(group_idx).long()
 
     res = fit_glm_arma11_grouped(
-        data, designs_by_group, group_indices, tr=2.0,
-        group_label="slice", device=device, verbose=False, use_double=True,
+        data,
+        designs_by_group,
+        group_indices,
+        tr=2.0,
+        group_label="slice",
+        device=device,
+        verbose=False,
+        use_double=True,
         dsort=torch.from_numpy(dsort),
     )
     # dsort coefficient recovered alongside the slicewise nuisance.

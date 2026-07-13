@@ -107,6 +107,7 @@ def _tcorr(a, b, mask):
     return (A * B).sum(1) / (np.sqrt((A**2).sum(1) * (B**2).sum(1)) + 1e-12)
 
 
+@pytest.mark.slow
 def test_joint_spacetime_recovers_and_beats_motion_only():
     from fastfuncstuff.cli.nwarp import main as nwarp_main
 

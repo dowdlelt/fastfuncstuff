@@ -1,4 +1,5 @@
 """Correctness tests for fastfuncstuff.stats.permutation."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -21,6 +22,7 @@ def _device():
 # ---------------------------------------------------------------------------
 # Observed t matches scipy
 # ---------------------------------------------------------------------------
+
 
 def test_one_sample_observed_t_matches_scipy():
     rng = np.random.default_rng(0)
@@ -53,6 +55,7 @@ def test_two_sample_observed_t_matches_scipy():
 # Exhaustive sign-flip enumeration
 # ---------------------------------------------------------------------------
 
+
 def test_generate_sign_flips_exhaustive():
     """For small N, the generator returns the full 2**N enumeration."""
     rng = np.random.default_rng(0)
@@ -67,6 +70,7 @@ def test_generate_sign_flips_exhaustive():
 # ---------------------------------------------------------------------------
 # Run-block label swaps stay within blocks
 # ---------------------------------------------------------------------------
+
 
 def test_label_swaps_respect_blocks():
     rng = np.random.default_rng(42)
@@ -92,6 +96,7 @@ def test_count_unique_label_perms_blocked():
 # Under H0, the rank of the observed t is approximately uniform
 # ---------------------------------------------------------------------------
 
+
 def test_null_distribution_uniform_one_sample():
     """When the data are null (mean 0), observed-vs-permuted ranks are uniform."""
     rng = np.random.default_rng(7)
@@ -113,7 +118,7 @@ def test_two_sample_welch_matches_scipy():
     """Welch path returns scipy.ttest_ind(equal_var=False) for the observed row."""
     rng = np.random.default_rng(11)
     nA, nB, v = 30, 20, 60
-    yA = rng.normal(size=(nA, v)).astype(np.float32) * 1.5     # higher variance
+    yA = rng.normal(size=(nA, v)).astype(np.float32) * 1.5  # higher variance
     yB = rng.normal(size=(nB, v)).astype(np.float32) * 0.5 + 0.3
     y = np.concatenate([yA, yB], axis=0)
     group = np.concatenate([np.ones(nA, dtype=np.int8), np.zeros(nB, dtype=np.int8)])
@@ -134,8 +139,7 @@ def test_keep_perm_data_one_sample():
     n, v = 25, 40
     y = rng.normal(size=(n, v)).astype(np.float32) + 0.2
     signs = generate_sign_flips(n, n_perms=8, rng=rng)
-    out = one_sample_t_perm(y, signs, device=_device(),
-                            show_progress=False, keep_perm_data=True)
+    out = one_sample_t_perm(y, signs, device=_device(), show_progress=False, keep_perm_data=True)
     m = out.extras["perm_means"].numpy()
     sum_y2 = out.extras["sum_y2"].numpy()
     var = (sum_y2[None, :] - n * m * m) / (n - 1)

@@ -13,7 +13,6 @@ Test cases:
 6. Multiple runs (4 runs): Missing events across subsets of runs
 """
 
-
 import numpy as np
 import pytest
 import torch
@@ -159,12 +158,24 @@ def test_xval_baseline_all_events():
 
     # Create data for 2 runs (different design/noise, same betas)
     data1, stim1, nuisance1 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=100
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=100,
     )
     data2, stim2, nuisance2 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=101
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=101,
     )
 
     # Concatenate runs
@@ -239,12 +250,24 @@ def test_xval_train_missing_events():
 
     # Create data for 2 runs
     data1, stim1, nuisance1 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=100
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=100,
     )
     data2, stim2, nuisance2 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=101
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=101,
     )
 
     # Zero out event 2 in run 2 (train will be missing this event)
@@ -314,12 +337,24 @@ def test_xval_test_missing_events():
 
     # Create data for 2 runs
     data1, stim1, nuisance1 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=100
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=100,
     )
     data2, stim2, nuisance2 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=101
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=101,
     )
 
     # Zero out event 2 in run 1 (test will be missing this event)
@@ -327,7 +362,10 @@ def test_xval_test_missing_events():
 
     # Also zero out in the DATA for run 1 (no signal for this event)
     # This simulates the event truly not happening in this run
-    data1_signal = true_stim_betas[:, missing_event:missing_event+1] @ stim1[:, missing_event:missing_event+1].T
+    data1_signal = (
+        true_stim_betas[:, missing_event : missing_event + 1]
+        @ stim1[:, missing_event : missing_event + 1].T
+    )
     data1 = data1 - data1_signal  # Remove signal for event 2
 
     # Concatenate runs
@@ -371,7 +409,9 @@ def test_xval_test_missing_events():
     # Nuisance strategy should perform better (projects out unpredictable event)
     # Zero strategy has beta for missing event which adds unexplained variance
     print("\nComparison:")
-    print(f"  Nuisance improvement: {results_by_strategy['nuisance'] - results_by_strategy['zero']:.4f}")
+    print(
+        f"  Nuisance improvement: {results_by_strategy['nuisance'] - results_by_strategy['zero']:.4f}"
+    )
 
     # Both should be reasonable
     assert results_by_strategy["zero"] > -1.0
@@ -402,12 +442,24 @@ def test_xval_both_missing_same_events():
 
     # Create data for 2 runs
     data1, stim1, nuisance1 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=100
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=100,
     )
     data2, stim2, nuisance2 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=101
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=101,
     )
 
     # Zero out event 2 in both runs
@@ -415,8 +467,14 @@ def test_xval_both_missing_same_events():
     stim2 = zero_out_events(stim2, [missing_event], [(0, n_timepoints_per_run)])
 
     # Remove signal from data
-    data1 = data1 - (true_stim_betas[:, missing_event:missing_event+1] @ stim1[:, missing_event:missing_event+1].T)
-    data2 = data2 - (true_stim_betas[:, missing_event:missing_event+1] @ stim2[:, missing_event:missing_event+1].T)
+    data1 = data1 - (
+        true_stim_betas[:, missing_event : missing_event + 1]
+        @ stim1[:, missing_event : missing_event + 1].T
+    )
+    data2 = data2 - (
+        true_stim_betas[:, missing_event : missing_event + 1]
+        @ stim2[:, missing_event : missing_event + 1].T
+    )
 
     # Concatenate runs
     data = torch.cat([data1, data2], dim=1)
@@ -484,12 +542,24 @@ def test_xval_both_missing_different_events():
 
     # Create data for 2 runs
     data1, stim1, nuisance1 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=100
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=100,
     )
     data2, stim2, nuisance2 = create_synthetic_fmri_data(
-        n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-        true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=101
+        n_voxels,
+        n_timepoints_per_run,
+        n_stim,
+        n_nuisance,
+        true_stim_betas,
+        true_nuisance_betas,
+        noise_std=1.0,
+        seed=101,
     )
 
     # Zero out event 1 in run 1 (test missing)
@@ -576,8 +646,14 @@ def test_xval_multiple_runs_missing_events():
 
     for i in range(4):
         data, stim, nuisance = create_synthetic_fmri_data(
-            n_voxels, n_timepoints_per_run, n_stim, n_nuisance,
-            true_stim_betas, true_nuisance_betas, noise_std=1.0, seed=100+i
+            n_voxels,
+            n_timepoints_per_run,
+            n_stim,
+            n_nuisance,
+            true_stim_betas,
+            true_nuisance_betas,
+            noise_std=1.0,
+            seed=100 + i,
         )
         runs_data.append(data)
         runs_stim.append(stim)

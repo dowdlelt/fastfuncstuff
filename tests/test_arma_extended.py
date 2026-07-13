@@ -195,18 +195,14 @@ class TestBuildArma11CovarianceBatch:
         """Batch version should match scalar build_arma11_covariance."""
         a_grid = torch.tensor([0.3], device=DEVICE)
         b_grid = torch.tensor([0.1], device=DEVICE)
-        R_batch, params, _ = build_arma11_covariance_batch(
-            a_grid, b_grid, n=20, device=DEVICE
-        )
+        R_batch, params, _ = build_arma11_covariance_batch(a_grid, b_grid, n=20, device=DEVICE)
         R_scalar = build_arma11_covariance(0.3, 0.1, 20, DEVICE)
         torch.testing.assert_close(R_batch[0], R_scalar, atol=1e-5, rtol=1e-5)
 
     def test_symmetry(self):
         a_grid = torch.tensor([0.4], device=DEVICE)
         b_grid = torch.tensor([0.2], device=DEVICE)
-        R_batch, _, _ = build_arma11_covariance_batch(
-            a_grid, b_grid, n=15, device=DEVICE
-        )
+        R_batch, _, _ = build_arma11_covariance_batch(a_grid, b_grid, n=15, device=DEVICE)
         torch.testing.assert_close(R_batch[0], R_batch[0].T)
 
     def test_invalid_all(self):
@@ -309,9 +305,7 @@ class TestPrecomputeRemlGrid:
         X = torch.randn(T, p, device=DEVICE)
         a_grid = torch.tensor([0.2, 0.5], device=DEVICE)
         b_grid = torch.tensor([0.0, 0.1], device=DEVICE)
-        grid = precompute_reml_grid(
-            X, T, a_grid, b_grid, device=DEVICE, verbose=False
-        )
+        grid = precompute_reml_grid(X, T, a_grid, b_grid, device=DEVICE, verbose=False)
         # Grid is a dict keyed by (a,b) tuples
         assert isinstance(grid, dict)
         assert len(grid) > 0
@@ -326,9 +320,7 @@ class TestPrecomputeRemlGrid:
         X = torch.randn(T, p, device=DEVICE)
         a_grid = torch.tensor([0.3], device=DEVICE)
         b_grid = torch.tensor([0.0], device=DEVICE)
-        grid = precompute_reml_grid(
-            X, T, a_grid, b_grid, device=DEVICE, use_qr=True
-        )
+        grid = precompute_reml_grid(X, T, a_grid, b_grid, device=DEVICE, use_qr=True)
         assert len(grid) > 0
 
 
@@ -362,15 +354,11 @@ class TestHierarchicalFromSurface:
         _REML_MODE.afni_faithful = afni_faithful
         try:
             X, Y, grid = self._colored_voxels(seed=0)
-            bp_ref, bl_ref = search_voxels_precomputed_grid_hierarchical(
-                X, Y, grid, DEVICE
-            )
+            bp_ref, bl_ref = search_voxels_precomputed_grid_hierarchical(X, Y, grid, DEVICE)
             _, _, surface, plist = search_voxels_precomputed_grid(
                 X, Y, grid, DEVICE, return_profile=True
             )
-            bp_surf, bl_surf = select_arma_params_hierarchical_from_surface(
-                surface, plist, DEVICE
-            )
+            bp_surf, bl_surf = select_arma_params_hierarchical_from_surface(surface, plist, DEVICE)
         finally:
             _REML_MODE.afni_faithful = prev
 

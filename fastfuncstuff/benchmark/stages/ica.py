@@ -45,10 +45,7 @@ def _ffs_ic(ctx: BenchmarkContext, dataset: str) -> Path:
     """
     base = f"all_{dataset}"
     return (
-        ctx.ffs_ica_dir
-        / f"{base}_concat.ica"
-        / "ffs_outputs"
-        / f"{base}_concat_ica_zmaps.nii.gz"
+        ctx.ffs_ica_dir / f"{base}_concat.ica" / "ffs_outputs" / f"{base}_concat_ica_zmaps.nii.gz"
     )
 
 

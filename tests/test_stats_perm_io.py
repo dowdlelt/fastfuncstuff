@@ -36,14 +36,17 @@ def _write_tsv(path: Path, header: list[str], rows: list[list[str]]) -> Path:
 # load_events
 # ---------------------------------------------------------------------------
 
+
 class TestLoadEvents:
     def test_preserves_row_order_within_run(self, tmp_path):
         f = _write_tsv(
             tmp_path / "run-1_events.tsv",
             ["onset", "duration", "trial_type", "rt"],
-            [["0.0", "1.0", "A", "0.41"],
-             ["10.0", "1.0", "B", "0.55"],
-             ["20.0", "1.0", "A", "0.39"]],
+            [
+                ["0.0", "1.0", "A", "0.41"],
+                ["10.0", "1.0", "B", "0.55"],
+                ["20.0", "1.0", "A", "0.39"],
+            ],
         )
         ev = load_events([f])
         assert len(ev) == 3
@@ -89,10 +92,7 @@ class TestLoadEvents:
         f = _write_tsv(
             tmp_path / "run-1_events.tsv",
             ["onset", "duration", "trial_type"],
-            [["0.0", "1.0", "A"],
-             ["5.0", "1.0", "n/a"],
-             ["10.0", "1.0", ""],
-             ["15.0", "1.0", "B"]],
+            [["0.0", "1.0", "A"], ["5.0", "1.0", "n/a"], ["10.0", "1.0", ""], ["15.0", "1.0", "B"]],
         )
         ev = load_events([f])
         assert [r["trial_type"] for r in ev.rows] == ["A", "B"]
@@ -101,8 +101,7 @@ class TestLoadEvents:
         f = _write_tsv(
             tmp_path / "run-1_events.tsv",
             ["onset", "duration", "trial_type"],
-            [["0.0", "1.0", "A"],
-             ["5.0", "1.0", "n/a"]],
+            [["0.0", "1.0", "A"], ["5.0", "1.0", "n/a"]],
         )
         ev = load_events([f], drop_na=False)
         assert len(ev) == 2
@@ -166,15 +165,13 @@ class TestEventsTableColumn:
 # select_one_sample
 # ---------------------------------------------------------------------------
 
+
 def _three_run_events(tmp_path: Path) -> EventsTable:
     """Build a 3-run events table: A appears in runs 0,1,2; B in 0,1; rare in 2."""
     runs = [
-        (tmp_path / "run-1_events.tsv",
-         [["0.0", "1", "A"], ["5.0", "1", "A"], ["10.0", "1", "B"]]),
-        (tmp_path / "run-2_events.tsv",
-         [["0.0", "1", "B"], ["5.0", "1", "A"]]),
-        (tmp_path / "run-3_events.tsv",
-         [["0.0", "1", "A"], ["5.0", "1", "rare"]]),
+        (tmp_path / "run-1_events.tsv", [["0.0", "1", "A"], ["5.0", "1", "A"], ["10.0", "1", "B"]]),
+        (tmp_path / "run-2_events.tsv", [["0.0", "1", "B"], ["5.0", "1", "A"]]),
+        (tmp_path / "run-3_events.tsv", [["0.0", "1", "A"], ["5.0", "1", "rare"]]),
     ]
     files = []
     for path, rows in runs:
@@ -206,6 +203,7 @@ class TestSelectOneSample:
 # select_two_sample
 # ---------------------------------------------------------------------------
 
+
 class TestSelectTwoSample:
     def test_basic_group_assignment(self, tmp_path):
         ev = _three_run_events(tmp_path)
@@ -236,6 +234,7 @@ class TestSelectTwoSample:
 # ---------------------------------------------------------------------------
 # select_one_vs_all
 # ---------------------------------------------------------------------------
+
 
 class TestSelectOneVsAll:
     def test_group_a_is_label_group_b_is_everything_else(self, tmp_path):

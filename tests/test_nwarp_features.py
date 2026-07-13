@@ -129,10 +129,7 @@ def _einsum_resample_reference(source, x, y, z, kernel_name):
     zi = (zb.long()[:, None] + offsets).clamp(0, nz - 1)
     neigh = source[zi[:, :, None, None], yi[:, None, :, None], xi[:, None, None, :]]
     out = torch.einsum("ctuv,ct,cu,cv->c", neigh, wz, wy, wx)
-    oob = (
-        (x < -0.5) | (x > nx - 0.5) | (y < -0.5)
-        | (y > ny - 0.5) | (z < -0.5) | (z > nz - 0.5)
-    )
+    oob = (x < -0.5) | (x > nx - 0.5) | (y < -0.5) | (y > ny - 0.5) | (z < -0.5) | (z > nz - 0.5)
     out[oob] = 0.0
     return out
 
@@ -296,8 +293,11 @@ def test_no_neg_clamps_ringing():
     # half-voxel constant shift -> wsinc5 rings (negative undershoot) at the edge
     shift = torch.full_like(src, 0.5)
     warp = NonlinearWarp(
-        xd=shift, yd=torch.zeros_like(src), zd=torch.zeros_like(src),
-        header_info={"affine": aff}, units="voxels",
+        xd=shift,
+        yd=torch.zeros_like(src),
+        zd=torch.zeros_like(src),
+        header_info={"affine": aff},
+        units="voxels",
     )
     plain = apply_composed_warp(src, warp, aff, aff, interp="wsinc5", no_neg=False)
     clamped = apply_composed_warp(src, warp, aff, aff, interp="wsinc5", no_neg=True)
@@ -315,8 +315,11 @@ def test_no_neg_clamps_ringing():
 def test_estimate_padding_zero_for_zero_warp():
     zero = torch.zeros(6, 6, 6)
     warp = NonlinearWarp(
-        xd=zero, yd=zero.clone(), zd=zero.clone(),
-        header_info={"affine": _diag_affine()}, units="nifti_mm",
+        xd=zero,
+        yd=zero.clone(),
+        zd=zero.clone(),
+        header_info={"affine": _diag_affine()},
+        units="nifti_mm",
     )
     pad = _estimate_warp_padding([warp], (6, 6, 6), _diag_affine())
     assert pad == (0, 0, 0)
@@ -326,8 +329,11 @@ def test_estimate_padding_translation():
     # 8 mm constant displacement along y, 2 mm voxels -> 4 voxels of pad in y.
     zero = torch.zeros(6, 6, 6)
     warp = NonlinearWarp(
-        xd=zero, yd=torch.full((6, 6, 6), 8.0), zd=zero.clone(),
-        header_info={"affine": _diag_affine()}, units="nifti_mm",
+        xd=zero,
+        yd=torch.full((6, 6, 6), 8.0),
+        zd=zero.clone(),
+        header_info={"affine": _diag_affine()},
+        units="nifti_mm",
     )
     pad = _estimate_warp_padding([warp], (6, 6, 6), _diag_affine())
     assert pad == (0, 4, 0), pad
@@ -368,13 +374,23 @@ def test_autopad_grows_grid(tmp_path):
 
     out_pad = tmp_path / "out_pad.nii"
     nwarpforge(
-        source_path=str(src_path), nwarp_specs=[str(warp_path)],
-        prefix=str(out_pad), interp="linear", device=DEV, verb=0, auto_pad=True,
+        source_path=str(src_path),
+        nwarp_specs=[str(warp_path)],
+        prefix=str(out_pad),
+        interp="linear",
+        device=DEV,
+        verb=0,
+        auto_pad=True,
     )
     out_nopad = tmp_path / "out_nopad.nii"
     nwarpforge(
-        source_path=str(src_path), nwarp_specs=[str(warp_path)],
-        prefix=str(out_nopad), interp="linear", device=DEV, verb=0, auto_pad=False,
+        source_path=str(src_path),
+        nwarp_specs=[str(warp_path)],
+        prefix=str(out_nopad),
+        interp="linear",
+        device=DEV,
+        verb=0,
+        auto_pad=False,
     )
     padded = np.asarray(nib.load(str(out_pad)).dataobj)
     plain = np.asarray(nib.load(str(out_nopad)).dataobj)
@@ -404,8 +420,13 @@ def test_autopad_noop_when_source_fits(tmp_path):
 
     out = tmp_path / "out.nii"
     nwarpforge(
-        source_path=str(src_path), nwarp_specs=[str(warp_path)],
-        prefix=str(out), interp="linear", device=DEV, verb=0, auto_pad=True,
+        source_path=str(src_path),
+        nwarp_specs=[str(warp_path)],
+        prefix=str(out),
+        interp="linear",
+        device=DEV,
+        verb=0,
+        auto_pad=True,
     )
     got = np.asarray(nib.load(str(out)).dataobj)
     assert got.shape[:3] == (n, n, n)  # grid unchanged: nothing was at risk
@@ -422,9 +443,14 @@ def test_master_warp_uses_warp_grid(tmp_path):
 
     out = tmp_path / "out.nii"
     nwarpforge(
-        source_path=str(src_path), nwarp_specs=[str(warp_path)],
-        prefix=str(out), master_path="WARP", interp="linear", device=DEV,
-        verb=0, auto_pad=False,
+        source_path=str(src_path),
+        nwarp_specs=[str(warp_path)],
+        prefix=str(out),
+        master_path="WARP",
+        interp="linear",
+        device=DEV,
+        verb=0,
+        auto_pad=False,
     )
     got = np.asarray(nib.load(str(out)).dataobj)
     assert got.shape[:3] == (10, 10, 10)
@@ -454,9 +480,10 @@ def test_interleaved_chain_matches_sequential():
 
     def smooth_warp(scale):
         d = torch.randn(3, nz, ny, nx)
-        d = torch.nn.functional.conv3d(
-            d[None], torch.ones(3, 3, 3, 3, 3) / 81, padding=1
-        )[0] * scale
+        d = (
+            torch.nn.functional.conv3d(d[None], torch.ones(3, 3, 3, 3, 3) / 81, padding=1)[0]
+            * scale
+        )
         return NonlinearWarp(
             xd=d[0], yd=d[1], zd=d[2], header_info={"affine": aff}, units="nifti_mm"
         )
@@ -474,9 +501,11 @@ def test_interleaved_chain_matches_sequential():
 
     def sample(w, p):
         return torch.stack(
-            [trilinear_interpolate(w.xd, p[0], p[1], p[2]),
-             trilinear_interpolate(w.yd, p[0], p[1], p[2]),
-             trilinear_interpolate(w.zd, p[0], p[1], p[2])]
+            [
+                trilinear_interpolate(w.xd, p[0], p[1], p[2]),
+                trilinear_interpolate(w.yd, p[0], p[1], p[2]),
+                trilinear_interpolate(w.zd, p[0], p[1], p[2]),
+            ]
         )
 
     def manual_N(p, t):
@@ -496,9 +525,12 @@ def test_interleaved_chain_matches_sequential():
     )
     pts = torch.stack([ii.reshape(-1), jj.reshape(-1), kk.reshape(-1)])
     interior = (
-        (pts[0] > 2) & (pts[0] < nx - 3)
-        & (pts[1] > 2) & (pts[1] < ny - 3)
-        & (pts[2] > 2) & (pts[2] < nz - 3)
+        (pts[0] > 2)
+        & (pts[0] < nx - 3)
+        & (pts[1] > 2)
+        & (pts[1] < ny - 3)
+        & (pts[2] > 2)
+        & (pts[2] < nz - 3)
     )
 
     for t in (0, 2, 3):  # 3 reuses the last (T=4) motion row; static affine fixed
@@ -518,12 +550,13 @@ def test_interleaved_chain_matches_sequential():
 
 def _smooth_mm_warp(n, scale, aff, seed):
     torch.manual_seed(seed)
-    d = torch.nn.functional.conv3d(
-        torch.randn(1, 3, n, n, n), torch.ones(3, 1, 3, 3, 3) / 27, padding=1, groups=3
-    )[0] * scale
-    return NonlinearWarp(
-        xd=d[0], yd=d[1], zd=d[2], header_info={"affine": aff}, units="nifti_mm"
+    d = (
+        torch.nn.functional.conv3d(
+            torch.randn(1, 3, n, n, n), torch.ones(3, 1, 3, 3, 3) / 27, padding=1, groups=3
+        )[0]
+        * scale
     )
+    return NonlinearWarp(xd=d[0], yd=d[1], zd=d[2], header_info={"affine": aff}, units="nifti_mm")
 
 
 def test_reduce_chain_matches_full_per_frame():
@@ -544,9 +577,9 @@ def test_reduce_chain_matches_full_per_frame():
         m[:3, 3] = torch.tensor([t * 0.3, -0.2 * t, 0.1])
         mats[t] = m
     transforms = [
-        _smooth_mm_warp(n, 0.7, aff, 1),     # static distortion
+        _smooth_mm_warp(n, 0.7, aff, 1),  # static distortion
         AffineTransform(matrices=mats, base_affine=aff, source_affine=aff),  # motion
-        _smooth_mm_warp(n, 0.5, aff, 2),     # static nonlinear-to-template
+        _smooth_mm_warp(n, 0.5, aff, 2),  # static nonlinear-to-template
     ]
     reduced = reduce_chain(transforms, (n, n, n), aff, DEV, interp="cubic", verb=0)
     # one static warp on each side of the time-dependent affine -> 3 slots

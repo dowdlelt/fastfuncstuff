@@ -61,6 +61,7 @@ def get_hardware_info() -> dict:
     n_logical = os.cpu_count() or 1
     try:
         import psutil
+
         n_physical = psutil.cpu_count(logical=False) or n_logical
     except ImportError:
         n_physical = n_logical

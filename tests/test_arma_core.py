@@ -157,10 +157,13 @@ class TestARMA11Covariance:
     def test_covariance_positive_definite(self, device):
         """Test that covariance matrix is positive definite."""
         import warnings
+
         R = build_arma11_covariance(a=0.4, b=0.1, n=50, device=device)
         # Suppress MPS backend fallback warning (expected for linalg.eigvals)
         with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*not currently supported on the MPS backend.*")
+            warnings.filterwarnings(
+                "ignore", message=".*not currently supported on the MPS backend.*"
+            )
             eigenvalues = torch.linalg.eigvals(R).real
         assert torch.all(eigenvalues > 0)
 
@@ -216,9 +219,7 @@ class TestARMA11Covariance:
     def test_unit_variance(self, device):
         """Test that diagonal is 1 (unit variance)."""
         R = build_arma11_covariance(a=0.3, b=0.2, n=50, device=device)
-        assert torch.allclose(
-            torch.diagonal(R), torch.ones(50, device=device), atol=1e-6
-        )
+        assert torch.allclose(torch.diagonal(R), torch.ones(50, device=device), atol=1e-6)
 
 
 class TestARMAParameterValidation:

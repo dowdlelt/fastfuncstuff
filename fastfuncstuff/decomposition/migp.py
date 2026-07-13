@@ -10,6 +10,7 @@ Reference
 Smith S et al., NeuroImage 2014 — "Group-PCA for very large fMRI datasets"
 MELODIC source: `meldata.cc::setup_migp` (FSL 6+).
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -78,7 +79,7 @@ def migp_reduce(
         if scale_by_n:
             x = x * scale
         stack = x if stack is None else torch.cat([stack, x], dim=0)
-        is_last = (i == n_runs_total - 1)
+        is_last = i == n_runs_total - 1
         # Reduce when stack outgrows the trigger, or after the last run.
         if stack.shape[0] > migp_factor * migp_n or is_last:
             stack = _reduce_to_topk(stack, k=migp_n)

@@ -15,6 +15,7 @@ Liu, T. T., & Frank, L. R. (2004). Efficiency, power, and entropy in
 event-related fMRI with multiple trial types. Part I: Theory.
 NeuroImage, 21(1), 387-400.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -27,8 +28,8 @@ def compute_design_matrix_for_condition(
     onsets: torch.Tensor,
     condition_idx: int,
     n_timepoints: int,
-    mode: str = 'onoff',
-    device: torch.device | None = None
+    mode: str = "onoff",
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Extract design matrix for a single condition
@@ -55,13 +56,13 @@ def compute_design_matrix_for_condition(
     if device is None:
         device = onsets.device
 
-    if mode == 'onoff':
+    if mode == "onoff":
         # Just the onsets for this condition
-        return onsets[:, condition_idx:condition_idx+1]
-    elif mode == 'fir':
+        return onsets[:, condition_idx : condition_idx + 1]
+    elif mode == "fir":
         # For FIR, design is just indicator of which timepoints had events
         # The "design matrix" for FIR efficiency is the onset pattern itself
-        return onsets[:, condition_idx:condition_idx+1]
+        return onsets[:, condition_idx : condition_idx + 1]
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -72,7 +73,7 @@ def compute_estimation_efficiency(
     hrf_length: int,
     tr: float = 1.0,
     normalize: bool = True,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> torch.Tensor | dict[str, torch.Tensor]:
     """
     Compute estimation efficiency for HRF shape estimation
@@ -120,7 +121,7 @@ def compute_estimation_efficiency(
             Normalized efficiency (divided by theoretical max)
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Convert to tensor
     if not torch.is_tensor(design):
@@ -148,7 +149,9 @@ def compute_estimation_efficiency(
             onsets_k = design[:, k * hrf_length]
         else:
             # Assume design is onset matrix with potential extra regressors
-            onsets_k = design[:, k] if k < design.shape[1] else torch.zeros(n_timepoints, device=device)
+            onsets_k = (
+                design[:, k] if k < design.shape[1] else torch.zeros(n_timepoints, device=device)
+            )
 
         # Build X_k: FIR design matrix for condition k
         # X_k[t, lag] = 1 if event at time (t - lag), 0 otherwise
@@ -198,15 +201,15 @@ def compute_estimation_efficiency(
     efficiencies = torch.stack(efficiencies)
 
     result = {
-        'per_condition': efficiencies,
-        'total': efficiencies.sum().item(),
-        'mean': efficiencies.mean().item(),
+        "per_condition": efficiencies,
+        "total": efficiencies.sum().item(),
+        "mean": efficiencies.mean().item(),
     }
 
     if normalize:
         efficiencies_norm = torch.stack(efficiencies_norm)
-        result['normalized'] = efficiencies_norm
-        result['mean_normalized'] = efficiencies_norm.mean().item()
+        result["normalized"] = efficiencies_norm
+        result["mean_normalized"] = efficiencies_norm.mean().item()
 
     return result
 
@@ -218,7 +221,7 @@ def compute_detection_power(
     effect_size: float = 1.0,
     noise_std: float = 1.0,
     tr: float = 1.0,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, torch.Tensor | float]:
     """
     Compute detection power for activation detection
@@ -268,7 +271,7 @@ def compute_detection_power(
             SNR for each condition (effect_size * sqrt(power) / noise_std)
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Convert to tensors
     if not torch.is_tensor(design):
@@ -285,7 +288,7 @@ def compute_detection_power(
     hrf_length = len(hrf_assumed)
 
     # Normalize HRF
-    h0 = hrf_assumed / torch.sqrt(torch.sum(hrf_assumed ** 2))
+    h0 = hrf_assumed / torch.sqrt(torch.sum(hrf_assumed**2))
 
     powers = []
 
@@ -296,7 +299,9 @@ def compute_detection_power(
         elif design.shape[1] >= n_conditions * hrf_length:
             onsets_k = design[:, k * hrf_length]
         else:
-            onsets_k = design[:, k] if k < design.shape[1] else torch.zeros(n_timepoints, device=device)
+            onsets_k = (
+                design[:, k] if k < design.shape[1] else torch.zeros(n_timepoints, device=device)
+            )
 
         # Build X_k (same as in efficiency computation)
         X_k = torch.zeros((n_timepoints, hrf_length), device=device)
@@ -326,11 +331,11 @@ def compute_detection_power(
     snr = effect_size * torch.sqrt(powers) / noise_std
 
     result = {
-        'per_condition': powers,
-        'total': powers.sum().item(),
-        'mean': powers.mean().item(),
-        'snr': snr,
-        'mean_snr': snr.mean().item(),
+        "per_condition": powers,
+        "total": powers.sum().item(),
+        "mean": powers.mean().item(),
+        "snr": snr,
+        "mean_snr": snr.mean().item(),
     }
 
     return result
@@ -340,7 +345,7 @@ def compute_conditional_entropy(
     onsets: torch.Tensor | np.ndarray,
     n_conditions: int,
     tr: float = 1.0,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, float]:
     """
     Compute conditional entropy (randomness) of design
@@ -388,7 +393,7 @@ def compute_conditional_entropy(
             ISI histogram for each condition
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Convert to tensor
     if not torch.is_tensor(onsets):
@@ -436,22 +441,22 @@ def compute_conditional_entropy(
 
             # Store ISI distribution
             isi_distributions[k] = {
-                'isis': isis_array,
-                'min': isis_array.min(),
-                'max': isis_array.max(),
-                'mean': isis_array.mean(),
-                'std': isis_array.std(),
-                'histogram': (counts, bins),
+                "isis": isis_array,
+                "min": isis_array.min(),
+                "max": isis_array.max(),
+                "mean": isis_array.mean(),
+                "std": isis_array.std(),
+                "histogram": (counts, bins),
             }
         else:
             entropies.append(0.0)
             isi_distributions[k] = {}
 
     result = {
-        'total': sum(entropies),
-        'mean': np.mean(entropies),
-        'per_condition': {k: entropies[k] for k in range(n_conditions)},
-        'isi_distribution': isi_distributions,
+        "total": sum(entropies),
+        "mean": np.mean(entropies),
+        "per_condition": {k: entropies[k] for k in range(n_conditions)},
+        "isi_distribution": isi_distributions,
     }
 
     return result
@@ -462,7 +467,7 @@ def compute_efficiency_power_tradeoff(
     n_conditions: int = 1,
     alpha_range: tuple[float, float] = (0.0, 1.0),
     n_points: int = 100,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, np.ndarray]:
     """
     Compute theoretical efficiency-power trade-off curve
@@ -505,7 +510,7 @@ def compute_efficiency_power_tradeoff(
             Alpha that balances efficiency and power (α ≈ 0.5)
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     alphas = np.linspace(alpha_range[0], alpha_range[1], n_points)
 
@@ -518,7 +523,7 @@ def compute_efficiency_power_tradeoff(
     #   ξ(α) ∝ 1 / (1 + (1-α)²)
     #   R(α) ∝ 1 / (1 + α²)
 
-    efficiency = 1.0 / (1.0 + (1.0 - alphas)**2)
+    efficiency = 1.0 / (1.0 + (1.0 - alphas) ** 2)
     power = 1.0 / (1.0 + alphas**2)
 
     # Normalize to [0, 1]
@@ -530,12 +535,12 @@ def compute_efficiency_power_tradeoff(
     optimal_idx = np.argmax(balance_score)
 
     result = {
-        'alpha': alphas,
-        'efficiency': efficiency,
-        'power': power,
-        'optimal_balanced': alphas[optimal_idx],
-        'efficiency_at_optimal': efficiency[optimal_idx],
-        'power_at_optimal': power[optimal_idx],
+        "alpha": alphas,
+        "efficiency": efficiency,
+        "power": power,
+        "optimal_balanced": alphas[optimal_idx],
+        "efficiency_at_optimal": efficiency[optimal_idx],
+        "power_at_optimal": power[optimal_idx],
     }
 
     return result
@@ -548,7 +553,7 @@ def evaluate_design(
     tr: float = 1.0,
     effect_size: float = 1.0,
     noise_std: float = 1.0,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, Any]:
     """
     Complete design evaluation: efficiency + power + entropy
@@ -581,7 +586,7 @@ def evaluate_design(
         'summary': dict with key metrics for quick comparison
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     # Ensure tensors
     if not torch.is_tensor(design):
@@ -600,27 +605,25 @@ def evaluate_design(
         design, hrf_assumed, n_conditions, effect_size, noise_std, tr, device
     )
 
-    entropy = compute_conditional_entropy(
-        design, n_conditions, tr, device
-    )
+    entropy = compute_conditional_entropy(design, n_conditions, tr, device)
 
     # Summary for quick comparison
     summary = {
-        'efficiency_mean': efficiency['mean'],
-        'power_mean': power['mean'],
-        'entropy_total': entropy['total'],
-        'snr_mean': power['mean_snr'],
+        "efficiency_mean": efficiency["mean"],
+        "power_mean": power["mean"],
+        "entropy_total": entropy["total"],
+        "snr_mean": power["mean_snr"],
     }
 
     # Add efficiency-normalized if available
-    if 'mean_normalized' in efficiency:
-        summary['efficiency_normalized'] = efficiency['mean_normalized']
+    if "mean_normalized" in efficiency:
+        summary["efficiency_normalized"] = efficiency["mean_normalized"]
 
     result = {
-        'efficiency': efficiency,
-        'power': power,
-        'entropy': entropy,
-        'summary': summary,
+        "efficiency": efficiency,
+        "power": power,
+        "entropy": entropy,
+        "summary": summary,
     }
 
     return result
@@ -633,7 +636,7 @@ def compare_designs(
     tr: float = 1.0,
     effect_size: float = 1.0,
     noise_std: float = 1.0,
-    device: torch.device | None = None
+    device: torch.device | None = None,
 ) -> dict[str, dict]:
     """
     Compare multiple designs on efficiency, power, entropy
@@ -662,23 +665,22 @@ def compare_designs(
         Plus 'summary_table' with key metrics for all designs
     """
     if device is None:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
 
     results = {}
     summary_table = []
 
     for design_name, design in designs_dict.items():
         metrics = evaluate_design(
-            design, hrf_assumed, n_conditions, tr,
-            effect_size, noise_std, device
+            design, hrf_assumed, n_conditions, tr, effect_size, noise_std, device
         )
         results[design_name] = metrics
 
         # Add to summary table
-        summary_row = {'design': design_name}
-        summary_row.update(metrics['summary'])
+        summary_row = {"design": design_name}
+        summary_row.update(metrics["summary"])
         summary_table.append(summary_row)
 
-    results['summary_table'] = summary_table
+    results["summary_table"] = summary_table
 
     return results

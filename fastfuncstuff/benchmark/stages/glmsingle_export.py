@@ -73,7 +73,9 @@ def export_glmsingle_niftis(
             elif raw.shape[1] == n_vox:
                 data_2d = raw.T  # transpose to (n_vox, n_cols)
             else:
-                raise ValueError(f"Shape mismatch for {key}: {raw.shape}, expected one dim = {n_vox}")
+                raise ValueError(
+                    f"Shape mismatch for {key}: {raw.shape}, expected one dim = {n_vox}"
+                )
             n_cols = data_2d.shape[1]
             # Reorder each column from Fortran to C
             vol4d = np.zeros((nx, ny, nz, n_cols), dtype=np.float32)

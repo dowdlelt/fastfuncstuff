@@ -61,8 +61,12 @@ class TestMakeTentDesign:
         """TENT design matrix should have correct shape."""
         onsets = [np.array([2.0, 6.0, 10.0])]
         design = make_tent_design(
-            onsets, bot=0.0, top=10.0, tr=2.0,
-            n_timepoints=20, device=DEVICE,
+            onsets,
+            bot=0.0,
+            top=10.0,
+            tr=2.0,
+            n_timepoints=20,
+            device=DEVICE,
         )
         # n_basis = round(10/2) + 1 = 6
         assert design.shape == (20, 6)
@@ -72,30 +76,45 @@ class TestMakeTentDesign:
         """TENTzero should have 2 fewer basis functions."""
         onsets = [np.array([2.0, 6.0])]
         design = make_tent_design(
-            onsets, bot=0.0, top=10.0, tr=2.0,
-            n_timepoints=20, n_basis=6, zero_edges=True,
+            onsets,
+            bot=0.0,
+            top=10.0,
+            tr=2.0,
+            n_timepoints=20,
+            n_basis=6,
+            zero_edges=True,
             device=DEVICE,
         )
         assert design.shape == (20, 4)  # 6 - 2 = 4
 
     def test_bot_ge_top_raises(self):
         with pytest.raises(ValueError, match="bot.*must be < top"):
-            make_tent_design([np.array([1.0])], bot=10.0, top=5.0,
-                           tr=1.0, n_timepoints=20, device=DEVICE)
+            make_tent_design(
+                [np.array([1.0])], bot=10.0, top=5.0, tr=1.0, n_timepoints=20, device=DEVICE
+            )
 
     def test_empty_onsets(self):
         """Empty onset list should return zero design."""
         design = make_tent_design(
-            [np.array([])], bot=0.0, top=10.0, tr=2.0,
-            n_timepoints=20, device=DEVICE,
+            [np.array([])],
+            bot=0.0,
+            top=10.0,
+            tr=2.0,
+            n_timepoints=20,
+            device=DEVICE,
         )
         assert design.sum().item() == 0.0
 
     def test_custom_n_basis(self):
         onsets = [np.array([3.0])]
         design = make_tent_design(
-            onsets, bot=0.0, top=12.0, tr=2.0,
-            n_timepoints=20, n_basis=7, device=DEVICE,
+            onsets,
+            bot=0.0,
+            top=12.0,
+            tr=2.0,
+            n_timepoints=20,
+            n_basis=7,
+            device=DEVICE,
         )
         assert design.shape[1] == 7
 
@@ -105,8 +124,13 @@ class TestMakeCsplinDesign:
         """CSPLIN design should have correct shape."""
         onsets = [np.array([2.0, 8.0])]
         design = make_csplin_design(
-            onsets, bot=0.0, top=12.0, tr=2.0,
-            n_timepoints=20, n_basis=7, device=DEVICE,
+            onsets,
+            bot=0.0,
+            top=12.0,
+            tr=2.0,
+            n_timepoints=20,
+            n_basis=7,
+            device=DEVICE,
         )
         assert design.shape == (20, 7)
         assert design.sum() > 0
@@ -114,8 +138,13 @@ class TestMakeCsplinDesign:
     def test_csplin_zero_edges(self):
         onsets = [np.array([2.0])]
         design = make_csplin_design(
-            onsets, bot=0.0, top=12.0, tr=2.0,
-            n_timepoints=20, n_basis=7, zero_edges=True,
+            onsets,
+            bot=0.0,
+            top=12.0,
+            tr=2.0,
+            n_timepoints=20,
+            n_basis=7,
+            zero_edges=True,
             device=DEVICE,
         )
         assert design.shape == (20, 5)  # 7 - 2
@@ -123,8 +152,13 @@ class TestMakeCsplinDesign:
     def test_too_few_basis_raises(self):
         with pytest.raises(ValueError, match="n_basis must be >= 4"):
             make_csplin_design(
-                [np.array([1.0])], bot=0.0, top=5.0, tr=1.0,
-                n_timepoints=10, n_basis=3, device=DEVICE,
+                [np.array([1.0])],
+                bot=0.0,
+                top=5.0,
+                tr=1.0,
+                n_timepoints=10,
+                n_basis=3,
+                device=DEVICE,
             )
 
 
@@ -171,7 +205,7 @@ class TestMakeSingleTrialDesign:
         """Trials should be sorted by onset time."""
         onsets = torch.zeros(20, 2)
         onsets[10, 1] = 1  # Later time, condition 1
-        onsets[3, 0] = 1   # Earlier time, condition 0
+        onsets[3, 0] = 1  # Earlier time, condition 0
         design, conditions = make_singletrialdesign(onsets, device=DEVICE)
         # First trial should be at time 3 (condition 0)
         assert conditions[0].item() == 0
@@ -211,29 +245,21 @@ class TestBuildGlmDesign:
 
     @pytest.fixture
     def hrf(self):
-        return torch.tensor(
-            [0.0, 0.2, 0.8, 1.0, 0.7, 0.3, 0.1, 0.0], device=DEVICE
-        )
+        return torch.tensor([0.0, 0.2, 0.8, 1.0, 0.7, 0.3, 0.1, 0.0], device=DEVICE)
 
     def test_assumed_mode(self, simple_onsets, hrf):
-        design = build_glm_design(
-            simple_onsets, hrf=hrf, mode="assumed", device=DEVICE
-        )
+        design = build_glm_design(simple_onsets, hrf=hrf, mode="assumed", device=DEVICE)
         assert design.shape[0] == 50
         assert design.shape[1] == 2
 
     def test_fir_mode(self, simple_onsets):
-        design = build_glm_design(
-            simple_onsets, mode="fir", n_fir_lags=10, device=DEVICE
-        )
+        design = build_glm_design(simple_onsets, mode="fir", n_fir_lags=10, device=DEVICE)
         assert design.shape[0] == 50
         # FIR: n_conditions * n_lags
         assert design.shape[1] == 20
 
     def test_onoff_mode(self, simple_onsets, hrf):
-        design = build_glm_design(
-            simple_onsets, hrf=hrf, mode="onoff", device=DEVICE
-        )
+        design = build_glm_design(simple_onsets, hrf=hrf, mode="onoff", device=DEVICE)
         assert design.shape[0] == 50
         assert design.shape[1] == 1  # summed across conditions
 
@@ -254,8 +280,11 @@ class TestBuildGlmDesign:
 
     def test_single_trial_assumed(self, simple_onsets, hrf):
         design = build_glm_design(
-            simple_onsets, hrf=hrf, mode="assumed",
-            single_trial=True, device=DEVICE,
+            simple_onsets,
+            hrf=hrf,
+            mode="assumed",
+            single_trial=True,
+            device=DEVICE,
         )
         # 4 trials total
         assert design.shape == (50, 4)
@@ -264,8 +293,11 @@ class TestBuildGlmDesign:
 class TestGenerateRandomOnsets:
     def test_basic_generation(self):
         onsets = generate_random_onsets(
-            n_timepoints=100, n_conditions=2,
-            isi_mean=5.0, tr=2.0, device=DEVICE,
+            n_timepoints=100,
+            n_conditions=2,
+            isi_mean=5.0,
+            tr=2.0,
+            device=DEVICE,
         )
         assert onsets.shape[0] == 100
         assert onsets.shape[1] == 2
@@ -274,16 +306,22 @@ class TestGenerateRandomOnsets:
 
     def test_alternating_conditions(self):
         onsets = generate_random_onsets(
-            n_timepoints=200, n_conditions=3,
-            isi_mean=4.0, tr=1.0,
-            alternate_conditions=True, device=DEVICE,
+            n_timepoints=200,
+            n_conditions=3,
+            isi_mean=4.0,
+            tr=1.0,
+            alternate_conditions=True,
+            device=DEVICE,
         )
         assert onsets.shape[1] == 3
 
     def test_random_conditions(self):
         onsets = generate_random_onsets(
-            n_timepoints=200, n_conditions=2,
-            isi_mean=4.0, tr=1.0,
-            alternate_conditions=False, device=DEVICE,
+            n_timepoints=200,
+            n_conditions=2,
+            isi_mean=4.0,
+            tr=1.0,
+            alternate_conditions=False,
+            device=DEVICE,
         )
         assert onsets.shape[1] == 2

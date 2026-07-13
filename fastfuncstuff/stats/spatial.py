@@ -33,6 +33,7 @@ from torch import Tensor
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _to_masked_flat(vol: Tensor, mask: Tensor | None) -> Tensor:
     """Flatten a 3D volume to 1D, applying mask if provided.
 
@@ -80,7 +81,9 @@ def _rank_rows(mat: Tensor) -> Tensor:
     sorted_indices = mat.argsort(dim=1)
     ranks = torch.empty_like(mat)
     rows = torch.arange(n, device=mat.device).unsqueeze(1).expand_as(sorted_indices)
-    ranks[rows, sorted_indices] = torch.arange(p, device=mat.device, dtype=mat.dtype).unsqueeze(0).expand(n, -1)
+    ranks[rows, sorted_indices] = (
+        torch.arange(p, device=mat.device, dtype=mat.dtype).unsqueeze(0).expand(n, -1)
+    )
 
     # Handle ties: average rank for tied values
     # Sort values, find ties, compute average ranks
@@ -106,9 +109,7 @@ def _rank_rows(mat: Tensor) -> Tensor:
     return ranks + 1  # 1-based
 
 
-def _prepare_volumes(
-    images: Tensor, mask: Tensor | None, device: torch.device
-) -> Tensor:
+def _prepare_volumes(images: Tensor, mask: Tensor | None, device: torch.device) -> Tensor:
     """Extract masked voxels from a batch of volumes.
 
     Args:
@@ -134,6 +135,7 @@ def _prepare_volumes(
 # ---------------------------------------------------------------------------
 # Core correlation functions
 # ---------------------------------------------------------------------------
+
 
 def _pearson_matrix(a_vecs: Tensor, b_vecs: Tensor) -> Tensor:
     """Pearson correlation matrix via standardized matmul.
@@ -222,8 +224,12 @@ def spatial_correlation(
     if device is None:
         device = a.device
 
-    a_vec = _to_masked_flat(a.to(device, dtype=torch.float32), mask.to(device) if mask is not None else None).unsqueeze(0)
-    b_vec = _to_masked_flat(b.to(device, dtype=torch.float32), mask.to(device) if mask is not None else None).unsqueeze(0)
+    a_vec = _to_masked_flat(
+        a.to(device, dtype=torch.float32), mask.to(device) if mask is not None else None
+    ).unsqueeze(0)
+    b_vec = _to_masked_flat(
+        b.to(device, dtype=torch.float32), mask.to(device) if mask is not None else None
+    ).unsqueeze(0)
 
     if method == "pearson":
         return _pearson_matrix(a_vec, b_vec).item()
@@ -303,6 +309,7 @@ def one_to_many_correlation(
 # ---------------------------------------------------------------------------
 # Matching & consistency
 # ---------------------------------------------------------------------------
+
 
 def optimal_matching(
     corr_matrix: np.ndarray,

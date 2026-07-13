@@ -15,7 +15,9 @@ def _brain_with_background(seed=0):
         torch.arange(nx, dtype=torch.float32),
         indexing="ij",
     )
-    brain = torch.clamp(1 - ((ii - 24) ** 2 + (jj - 24) ** 2 + (kk - 20) ** 2) / 100.0, min=0) * 1000
+    brain = (
+        torch.clamp(1 - ((ii - 24) ** 2 + (jj - 24) ** 2 + (kk - 20) ** 2) / 100.0, min=0) * 1000
+    )
     brain += torch.exp(-((ii - 24) ** 2 + (jj - 34) ** 2 + (kk - 20) ** 2) / (2 * 25)) * 150
     return brain + torch.rand(nz, ny, nx) * 40  # background everywhere
 

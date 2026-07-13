@@ -84,4 +84,6 @@ def test_mask_zeros_outside(tmp_path, monkeypatch):
 def test_reduction_and_expr_mutually_exclusive(tmp_path, monkeypatch):
     a = _write(tmp_path / "a.nii.gz", np.ones((2, 2, 2)))
     with pytest.raises(SystemExit):
-        _run(["-input", a, "-mean", "-expr", "a", "-prefix", str(tmp_path / "o.nii.gz")], monkeypatch)
+        _run(
+            ["-input", a, "-mean", "-expr", "a", "-prefix", str(tmp_path / "o.nii.gz")], monkeypatch
+        )

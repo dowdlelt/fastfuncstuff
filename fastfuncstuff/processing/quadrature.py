@@ -266,20 +266,20 @@ def build_phase_normal_equations(
 
     # For X direction: t = [1, 0, 0, -y*s, 0, z*s] where s = deg2rad
     # Non-zero entries: param 0 (=1), param 3 (=-y*s), param 5 (=z*s)
-    _tx_0 = torch.ones_like(x)          # param 0: 1
-    tx_3 = -y * deg2rad                 # param 3: -(y-cy) * deg2rad
-    tx_5 = z * deg2rad                  # param 5: (z-cz) * deg2rad
+    _tx_0 = torch.ones_like(x)  # param 0: 1
+    tx_3 = -y * deg2rad  # param 3: -(y-cy) * deg2rad
+    tx_5 = z * deg2rad  # param 5: (z-cz) * deg2rad
 
     # For Y direction: t = [0, 1, 0, x*s, 0, 0] -> params 1, 3, (4 = -z*s)
     # Actually: [0, 1, 0, x*s, -z*s, 0]
-    _ty_1 = torch.ones_like(x)          # param 1: 1
-    ty_3 = x * deg2rad                  # param 3: (x-cx) * deg2rad
-    ty_4 = -z * deg2rad                 # param 4: -(z-cz) * deg2rad
+    _ty_1 = torch.ones_like(x)  # param 1: 1
+    ty_3 = x * deg2rad  # param 3: (x-cx) * deg2rad
+    ty_4 = -z * deg2rad  # param 4: -(z-cz) * deg2rad
 
     # For Z direction: t = [0, 0, 1, 0, y*s, -x*s]
-    _tz_2 = torch.ones_like(x)          # param 2: 1
-    tz_4 = y * deg2rad                  # param 4: (y-cy) * deg2rad
-    tz_5 = -x * deg2rad                # param 5: -(x-cx) * deg2rad
+    _tz_2 = torch.ones_like(x)  # param 2: 1
+    tz_4 = y * deg2rad  # param 4: (y-cy) * deg2rad
+    tz_5 = -x * deg2rad  # param 5: -(x-cx) * deg2rad
 
     # Build A[i,j] = sum_d sum_x certainty_d * t_i^d * t_j^d
     # Build h[i]   = sum_d sum_x certainty_d * phase_diff_d * t_i^d
@@ -291,19 +291,19 @@ def build_phase_normal_equations(
     c_dp_x = c_x * dp_x  # certainty * phase_diff for X
 
     # Diagonal
-    A[0, 0] += c_x.sum()                              # t0*t0 = 1*1
-    A[3, 3] += (c_x * tx_3 * tx_3).sum()              # t3*t3
-    A[5, 5] += (c_x * tx_5 * tx_5).sum()              # t5*t5
+    A[0, 0] += c_x.sum()  # t0*t0 = 1*1
+    A[3, 3] += (c_x * tx_3 * tx_3).sum()  # t3*t3
+    A[5, 5] += (c_x * tx_5 * tx_5).sum()  # t5*t5
 
     # Off-diagonal (symmetric)
-    A[0, 3] += (c_x * tx_3).sum()                     # t0*t3
-    A[0, 5] += (c_x * tx_5).sum()                     # t0*t5
-    A[3, 5] += (c_x * tx_3 * tx_5).sum()              # t3*t5
+    A[0, 3] += (c_x * tx_3).sum()  # t0*t3
+    A[0, 5] += (c_x * tx_5).sum()  # t0*t5
+    A[3, 5] += (c_x * tx_3 * tx_5).sum()  # t3*t5
 
     # RHS
-    h[0] += c_dp_x.sum()                              # t0 * c*dp
-    h[3] += (c_dp_x * tx_3).sum()                     # t3 * c*dp
-    h[5] += (c_dp_x * tx_5).sum()                     # t5 * c*dp
+    h[0] += c_dp_x.sum()  # t0 * c*dp
+    h[3] += (c_dp_x * tx_3).sum()  # t3 * c*dp
+    h[5] += (c_dp_x * tx_5).sum()  # t5 * c*dp
 
     # --- Y direction contributions ---
     c_dp_y = c_y * dp_y
@@ -450,9 +450,7 @@ def quadrature_gn_rigid_fixed(
 
     for _ in range(max_iter):
         matrix = params_to_matrix(params)
-        warped = resample_affine_fast(
-            source, matrix, coords, interp, tuple(vol_shape)
-        )
+        warped = resample_affine_fast(source, matrix, coords, interp, tuple(vol_shape))
 
         q_source = apply_quadrature_filters_fft(warped, filter_spectra)
         phase_diff, certainty = compute_phase_diff_and_certainty(q_base, q_source)

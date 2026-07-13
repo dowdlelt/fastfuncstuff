@@ -1,4 +1,3 @@
-
 """
 Comprehensive tests for arma_glm.py coverage.
 Targets: internal helpers, memory management, I/O, and error handling.
@@ -31,7 +30,7 @@ class TestARMAHelpers:
         """Test lambda calculation logic."""
         # a=0, b=0 -> lambda=0
         assert _compute_arma11_lambda(0.0, 0.0) == 0.0
-        
+
         # Test with tensor inputs
         a = torch.tensor([0.0, 0.5])
         b = torch.tensor([0.0, 0.2])
@@ -67,13 +66,13 @@ class TestARMAHelpers:
         """Test estimation of valid (a,b) pairs."""
         # Create grids where some combinations are invalid
         # condition: |lam| < 1 (usually safe) AND invertible covariance
-        
+
         # Valid: a=0, b=0
         a = torch.tensor([0.0])
         b = torch.tensor([0.0])
         count = estimate_valid_grid_pairs(a, b)
         assert count == 1
-        
+
         # All valid
         a = torch.tensor([0.0, 0.1])
         b = torch.tensor([0.0, 0.1])
@@ -88,10 +87,7 @@ class TestARMAHelpers:
         # x_w:   10 * 100 * 2 * 4   =   8,000 bytes
         # Total: 408,000
         bytes_req = calculate_grid_memory_footprint(
-            n_valid_ab_pairs=10,
-            n_timepoints=100,
-            n_regressors=2,
-            use_double=False
+            n_valid_ab_pairs=10, n_timepoints=100, n_regressors=2, use_double=False
         )
         # L_inv: 400,000
         # X_w: 8,000
@@ -99,23 +95,20 @@ class TestARMAHelpers:
         # scalars: 80 (10 * 2 * 4)
         # Total: 408,240
         assert bytes_req == 408240
-        
+
         # Double precision
         bytes_req_d = calculate_grid_memory_footprint(
-            n_valid_ab_pairs=10,
-            n_timepoints=100,
-            n_regressors=2,
-            use_double=True
+            n_valid_ab_pairs=10, n_timepoints=100, n_regressors=2, use_double=True
         )
         assert bytes_req_d == 408240 * 2
 
 
 class TestMemoryManagement:
     """Test memory heuristics and batch sizing."""
-    
-    @patch('torch.cuda.get_device_properties')
-    @patch('torch.cuda.memory_reserved')
-    @patch('torch.cuda.memory_allocated')
+
+    @patch("torch.cuda.get_device_properties")
+    @patch("torch.cuda.memory_reserved")
+    @patch("torch.cuda.memory_allocated")
     def test_get_adaptive_batch_size_cuda(self, mock_alloc, mock_reserved, mock_props):
         """Test batch sizing on CUDA."""
         # Mock a small GPU so the memory budget — not the placeholder cap — limits the batch.
@@ -123,27 +116,21 @@ class TestMemoryManagement:
         mock_reserved.return_value = 0
         mock_alloc.return_value = 0
 
-        device = torch.device('cuda:0')
+        device = torch.device("cuda:0")
 
         # Case 1: Small problem
-        batch_size = get_adaptive_batch_size(
-            device=device,
-            n_timepoints=100,
-            n_regressors=2
-        )
+        batch_size = get_adaptive_batch_size(device=device, n_timepoints=100, n_regressors=2)
         assert batch_size > 0
 
         # Case 2: Large problem (longer TR, many regressors) → smaller batch
         batch_size_large = get_adaptive_batch_size(
-            device=device,
-            n_timepoints=2000,
-            n_regressors=100
+            device=device, n_timepoints=2000, n_regressors=100
         )
         assert batch_size_large < batch_size
-        
+
     def test_get_adaptive_batch_size_cpu(self):
         """Test batch sizing on CPU."""
-        device = torch.device('cpu')
+        device = torch.device("cpu")
         batch = get_adaptive_batch_size(device, 100, 2)
         # Should return default or based on RAM (psutil)
         # Logic sets a reasonable default for CPU
@@ -156,49 +143,44 @@ class TestMemoryManagement:
 
 class TestIOAndComparisons:
     """Test I/O and comparison functions."""
-    
+
     def test_save_and_load_arma_params(self):
         """Test saving and loading ARMA parameters."""
-        arma_params = torch.tensor([
-            [0.5, 0.1],
-            [0.4, 0.2],
-            [0.3, 0.0]
-        ]) # 3 voxels, (a,b)
+        arma_params = torch.tensor([[0.5, 0.1], [0.4, 0.2], [0.3, 0.0]])  # 3 voxels, (a,b)
         arma_lambda = torch.tensor([0.6, 0.5, 0.3])
-        
+
         # Create mock results
         results = ARMA11Results()
         results.arma_params = arma_params
         results.arma_lambda = arma_lambda
-        results.reml_likelihood = torch.randn(3) # add missing attr
+        results.reml_likelihood = torch.randn(3)  # add missing attr
         # Mock other needed attributes
         results.betas = torch.zeros(3, 2)
         results.r2 = torch.zeros(3)
         results.sigma2 = torch.ones(3)
-        results.full_shape = (3, 1, 1) # matches 3 voxels
+        results.full_shape = (3, 1, 1)  # matches 3 voxels
         # Initialize residuals_whitened
         results.residuals_whitened = None
-        
+
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "arma_params.nii.gz"
-            
+
             # Save
-            save_arma_rvar(
-                results=results,
-                output_path=out_path
-            )
-            
+            save_arma_rvar(results=results, output_path=out_path)
+
             # save_arma_rvar adds .nii.gz extension if creating NIfTI
-            _expected_path = out_path if str(out_path).endswith('.nii.gz') else out_path.with_suffix('.nii.gz')
+            _expected_path = (
+                out_path if str(out_path).endswith(".nii.gz") else out_path.with_suffix(".nii.gz")
+            )
             # But the function returns the path used.
             # Let's check if file exists.
             # save_arma_rvar uses nibabel which writes NIfTI.
             # It blindly writes to output_path if it has extension?
             # Outline said: creates 4D NIfTI.
-            
+
             # Actually, let's just assert something existed.
             # The test failure earlier was TypeError, so we fix that.
-            
+
     def test_compare_ols_vs_arma11(self):
         """Test comparison function."""
         # Create small random data
@@ -207,15 +189,15 @@ class TestIOAndComparisons:
         n_reg = 2
         data = torch.randn(n_vox, n_tp)
         design = torch.randn(n_tp, n_reg)
-        
+
         # Compare
         # This runs actual GLM fit, so it tests integration
         try:
             comparison = compare_ols_vs_arma11(data, design, tr=2.0)
             assert comparison is not None
-            assert 'ols' in comparison
-            assert 'arma11' in comparison
-            assert 'r2_improvement' in comparison
+            assert "ols" in comparison
+            assert "arma11" in comparison
+            assert "r2_improvement" in comparison
         except Exception as e:
             # If we don't have enough data for ARMA, it might fail?
             # 30 TP is small but should work.
@@ -225,22 +207,22 @@ class TestIOAndComparisons:
 
 class TestErrorHandling:
     """Test error cases."""
-    
+
     def test_fit_glm_arma11_errors(self):
         """Test invalid inputs to fit_glm_arma11."""
-        device = torch.device('cpu')
-        data = torch.randn(20, 100) # (voxels, time)
+        device = torch.device("cpu")
+        data = torch.randn(20, 100)  # (voxels, time)
         design = torch.randn(100, 2)
-        
+
         # Mismatched timepoints
         design_bad = torch.randn(90, 2)
         with pytest.raises(ValueError, match="Timepoints mismatch"):
             fit_glm_arma11(data, design_bad, tr=1.0, device=device)
-            
+
         # Invalid data dimension
-        data_bad = torch.randn(100) # 1D
+        data_bad = torch.randn(100)  # 1D
         with pytest.raises(ValueError):
-           fit_glm_arma11(data_bad, design, tr=1.0, device=device) 
+            fit_glm_arma11(data_bad, design, tr=1.0, device=device)
 
     def test_arma11_results_init(self):
         res = ARMA11Results()

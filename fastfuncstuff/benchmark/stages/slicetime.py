@@ -31,11 +31,16 @@ def _input_path(ctx: BenchmarkContext) -> Path:
 
 
 def _afni_out(ctx: BenchmarkContext) -> Path:
-    return ctx.processing_dir / f"afni_tshift_{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.nii"
+    return (
+        ctx.processing_dir
+        / f"afni_tshift_{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.nii"
+    )
 
 
 def _ffs_out(ctx: BenchmarkContext) -> Path:
-    return ctx.processing_dir / f"ffs_tshift_{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.nii"
+    return (
+        ctx.processing_dir / f"ffs_tshift_{ctx.bids_prefix(_ref_task(ctx), _ref_run(ctx))}_bold.nii"
+    )
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
@@ -65,12 +70,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
     tp = ctx.tpattern_file("localizer", 1)
     elapsed, _ = run_timed(
-        f"3dTshift -overwrite "
-        f"-prefix {out} "
-        f"-tzero 0 "
-        f"-tpattern @{tp} "
-        f"-wsinc9 "
-        f"{_input_path(ctx)}",
+        f"3dTshift -overwrite -prefix {out} -tzero 0 -tpattern @{tp} -wsinc9 {_input_path(ctx)}",
         label="3dTshift localizer run-1",
         cwd=ctx.processing_dir,
     )
@@ -118,8 +118,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     return {
         "passed": passed,
         "summary": (
-            f"median_r={result['median_r']:.4f}, "
-            f"frac>0.95={result['frac_above_0.95']:.3f}"
+            f"median_r={result['median_r']:.4f}, frac>0.95={result['frac_above_0.95']:.3f}"
         ),
         **result,
     }

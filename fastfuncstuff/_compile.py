@@ -26,6 +26,7 @@ Policy
 
 Use ``safe_compile`` everywhere instead of calling ``torch.compile`` directly.
 """
+
 from __future__ import annotations
 
 import functools
@@ -57,9 +58,7 @@ def configure_inductor() -> None:
         if hasattr(ind, "cpp_cache_precompile_headers"):
             ind.cpp_cache_precompile_headers = False
         # AOT path (used by some export/inductor flows) has its own flag.
-        if hasattr(ind, "aot_inductor") and hasattr(
-            ind.aot_inductor, "precompile_headers"
-        ):
+        if hasattr(ind, "aot_inductor") and hasattr(ind.aot_inductor, "precompile_headers"):
             ind.aot_inductor.precompile_headers = False
     except Exception:
         # Never let compile configuration break import — worst case we keep defaults

@@ -62,9 +62,7 @@ def test_resample_timeseries_matches_moco():
     # Re-estimate only, then resample with the standalone helper.
     cfg_est = MocoConfig(device="cpu", verb=0, compile=False, skip_resample=True)
     est = moco(ts, cfg_est)
-    aligned, _ = resample_timeseries(
-        ts, est.matrices_vox, cfg, DEV, base_copy_idx=cfg.base_index
-    )
+    aligned, _ = resample_timeseries(ts, est.matrices_vox, cfg, DEV, base_copy_idx=cfg.base_index)
 
     assert torch.allclose(aligned, full.aligned, atol=1e-5)
 
@@ -93,11 +91,17 @@ def test_multiecho_applies_shared_transforms(tmp_path):
     prefix = tmp_path / "mc.nii.gz"
     main(
         [
-            "-input", str(e1_in), str(e2_in),
-            "-reg_echo", "1",
-            "-prefix", str(prefix),
-            "-device", "cpu",
-            "-verb", "0",
+            "-input",
+            str(e1_in),
+            str(e2_in),
+            "-reg_echo",
+            "1",
+            "-prefix",
+            str(prefix),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
         ]
     )
 
@@ -127,13 +131,20 @@ def test_multiecho_mean_and_params(tmp_path):
     oned = tmp_path / "motion.1D"
     main(
         [
-            "-input", str(e1_in), str(e2_in),
-            "-reg_echo", "mean",
-            "-prefix", str(prefix),
+            "-input",
+            str(e1_in),
+            str(e2_in),
+            "-reg_echo",
+            "mean",
+            "-prefix",
+            str(prefix),
             "-save_mean",
-            "-1Dfile", str(oned),
-            "-device", "cpu",
-            "-verb", "0",
+            "-1Dfile",
+            str(oned),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
         ]
     )
 
@@ -159,10 +170,15 @@ def test_multiecho_requires_reg_echo(tmp_path):
     with pytest.raises(SystemExit):
         main(
             [
-                "-input", str(e1_in), str(e2_in),
-                "-prefix", str(tmp_path / "mc.nii.gz"),
-                "-device", "cpu",
-                "-verb", "0",
+                "-input",
+                str(e1_in),
+                str(e2_in),
+                "-prefix",
+                str(tmp_path / "mc.nii.gz"),
+                "-device",
+                "cpu",
+                "-verb",
+                "0",
             ]
         )
 
@@ -181,12 +197,18 @@ def test_skip_first_last_trims_volumes(tmp_path):
     out = tmp_path / "epi_mc.nii.gz"
     main(
         [
-            "-input", str(in_path),
-            "-prefix", str(out),
-            "-skip_first", "1",
-            "-skip_last", "2",
-            "-device", "cpu",
-            "-verb", "0",
+            "-input",
+            str(in_path),
+            "-prefix",
+            str(out),
+            "-skip_first",
+            "1",
+            "-skip_last",
+            "2",
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
         ]
     )
 

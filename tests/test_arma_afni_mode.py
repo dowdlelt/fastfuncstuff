@@ -67,9 +67,7 @@ class TestBandedR:
         a_grid = torch.tensor([0.3, 0.7])
         b_grid = torch.tensor([0.0, 0.2])
         set_afni_mode(True)
-        R_batch, params, _ = build_arma11_covariance_batch(
-            a_grid, b_grid, n=50, device=DEVICE
-        )
+        R_batch, params, _ = build_arma11_covariance_batch(a_grid, b_grid, n=50, device=DEVICE)
         for k in range(params.shape[0]):
             a, b = params[k, 0].item(), params[k, 1].item()
             R_scalar = build_arma11_covariance(a, b, n=50, device=DEVICE)

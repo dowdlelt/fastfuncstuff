@@ -191,9 +191,7 @@ def _local_cc_cost(a: Tensor, b: Tensor, radius: int, weight: Tensor) -> Tensor:
     return -(weight * cc).sum() / weight.sum().clamp(min=_EPS)
 
 
-def _metric_cost(
-    a: Tensor, b: Tensor, weight: Tensor, config: SynConfig
-) -> Tensor:
+def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Tensor:
     """Scalar image metric (lower = better) between middle-grid images ``a`` and ``b``.
 
     All metrics route through autograd, so the project's existing cost primitives
@@ -205,11 +203,9 @@ def _metric_cost(
     if m == "mse":
         return (weight * (a - b) ** 2).sum() / weight.sum().clamp(min=_EPS)
     if m == "lpa":
-        return -lpa_correlation(a, b, weight, sigma=config.lpa_sigma,
-                                kernel_type=config.lpa_kernel)
+        return -lpa_correlation(a, b, weight, sigma=config.lpa_sigma, kernel_type=config.lpa_kernel)
     if m == "lpc":
-        return -lpc_correlation(a, b, weight, sigma=config.lpa_sigma,
-                                kernel_type=config.lpa_kernel)
+        return -lpc_correlation(a, b, weight, sigma=config.lpa_sigma, kernel_type=config.lpa_kernel)
     if m == "pearson":
         w = weight.reshape(-1)
         return -pearson_correlation(a.reshape(-1), b.reshape(-1), w)
@@ -289,15 +285,11 @@ def _resize_volume(vol: Tensor, target: tuple[int, int, int]) -> Tensor:
     """Trilinear-resample a (nz,ny,nx) volume to ``target`` shape."""
     if tuple(vol.shape) == target:
         return vol
-    out = F.interpolate(
-        vol[None, None], size=target, mode="trilinear", align_corners=True
-    )
+    out = F.interpolate(vol[None, None], size=target, mode="trilinear", align_corners=True)
     return out[0, 0]
 
 
-def _resize_field(
-    xd: Tensor, yd: Tensor, zd: Tensor, target: tuple[int, int, int]
-) -> Field:
+def _resize_field(xd: Tensor, yd: Tensor, zd: Tensor, target: tuple[int, int, int]) -> Field:
     """Resample a displacement field to ``target`` and rescale displacements.
 
     Displacements are in voxel units, so a change of grid spacing scales each
@@ -527,9 +519,7 @@ def formwarp(
 
     n_levels = len(config.shrink_factors)
     if not (len(config.smoothing_sigmas) == len(config.iterations) == n_levels):
-        raise ValueError(
-            "shrink_factors, smoothing_sigmas and iterations must have equal length"
-        )
+        raise ValueError("shrink_factors, smoothing_sigmas and iterations must have equal length")
 
     # Half-fields on the full grid, refined coarse-to-fine. zero == identity.
     zeros = lambda: torch.zeros(full_shape, device=device)  # noqa: E731
@@ -569,9 +559,13 @@ def formwarp(
             )
 
         phi_f, inv_f, phi_m, inv_m = _syn_level(
-            f_lvl, m_lvl, w_lvl,
+            f_lvl,
+            m_lvl,
+            w_lvl,
             (phi_f, inv_f, phi_m, inv_m),
-            n_iter, config, level_tag=f"L{lev + 1}",
+            n_iter,
+            config,
+            level_tag=f"L{lev + 1}",
         )
 
     # Restore to full resolution if the finest level was still shrunk.
@@ -585,12 +579,8 @@ def formwarp(
     #     then phi_m (middle->moving).
     #   fixed->moving (inverse): apply inv_m (moving->middle) then phi_f (middle->fixed).
     dummy_hdr: dict = {}
-    fwd = compose_warp_then_warp(
-        NonlinearWarp(*inv_f, dummy_hdr), NonlinearWarp(*phi_m, dummy_hdr)
-    )
-    inv = compose_warp_then_warp(
-        NonlinearWarp(*inv_m, dummy_hdr), NonlinearWarp(*phi_f, dummy_hdr)
-    )
+    fwd = compose_warp_then_warp(NonlinearWarp(*inv_f, dummy_hdr), NonlinearWarp(*phi_m, dummy_hdr))
+    inv = compose_warp_then_warp(NonlinearWarp(*inv_m, dummy_hdr), NonlinearWarp(*phi_f, dummy_hdr))
     fwd_t = (fwd.xd, fwd.yd, fwd.zd)
     inv_t = (inv.xd, inv.yd, inv.zd)
 

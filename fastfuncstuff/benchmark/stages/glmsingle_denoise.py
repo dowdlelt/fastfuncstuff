@@ -109,6 +109,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
     ``glmsingle/glmsingle_timings.json``. Returns 0.0 when not available.
     """
     from . import glmsingle_matlab
+
     return float(glmsingle_matlab.load_timings(ctx).get("type_c", 0.0))
 
 

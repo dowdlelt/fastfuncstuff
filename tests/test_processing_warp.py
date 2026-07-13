@@ -31,6 +31,7 @@ DEVICE = torch.device("cpu")
 # QwarpConfig dataclass
 # ---------------------------------------------------------------------------
 
+
 class TestQwarpConfig:
     def test_defaults(self):
         cfg = QwarpConfig()
@@ -78,6 +79,7 @@ class TestQwarpConfig:
 # WarpState dataclass
 # ---------------------------------------------------------------------------
 
+
 class TestWarpState:
     def test_defaults(self):
         ws = WarpState()
@@ -102,6 +104,7 @@ class TestWarpState:
 # PatchSpec dataclass
 # ---------------------------------------------------------------------------
 
+
 class TestPatchSpec:
     def test_creation(self):
         p = PatchSpec(ibot=0, itop=10, jbot=5, jtop=15, kbot=2, ktop=8, gi=1, gj=0, gk=1)
@@ -113,6 +116,7 @@ class TestPatchSpec:
 # ---------------------------------------------------------------------------
 # _compute_padding
 # ---------------------------------------------------------------------------
+
 
 class TestComputePadding:
     def test_small_volume(self):
@@ -147,6 +151,7 @@ class TestComputePadding:
 # _pad_volume / _unpad_volume
 # ---------------------------------------------------------------------------
 
+
 class TestPadVolume:
     def test_shape(self):
         vol = torch.randn(8, 10, 12)
@@ -166,7 +171,7 @@ class TestPadVolume:
         vol = torch.randn(5, 6, 7)
         px, py, pz = 3, 2, 4
         padded = _pad_volume(vol, px, py, pz)
-        interior = padded[pz:pz + 5, py:py + 6, px:px + 7]
+        interior = padded[pz : pz + 5, py : py + 6, px : px + 7]
         assert torch.allclose(interior, vol)
 
     def test_zero_padding(self):
@@ -181,7 +186,7 @@ class TestPadVolume:
         vol = torch.randn(8, 10, 12)
         px, py, pz = 3, 4, 5
         padded = _pad_volume(vol, px, py, pz)
-        recovered = padded[pz:pz + 8, py:py + 10, px:px + 12]
+        recovered = padded[pz : pz + 8, py : py + 10, px : px + 12]
         assert torch.allclose(recovered, vol)
 
 
@@ -189,13 +194,23 @@ class TestPadVolume:
 # _generate_patch_grid
 # ---------------------------------------------------------------------------
 
+
 class TestGeneratePatchGrid:
     def test_single_patch(self):
         """When window covers the entire range, should produce one patch."""
         patches = _generate_patch_grid(
-            ibbb=0, ittt=9, jbbb=0, jttt=9, kbbb=0, kttt=9,
-            xwid=10, ywid=10, zwid=10,
-            xdel=5, ydel=5, zdel=5,
+            ibbb=0,
+            ittt=9,
+            jbbb=0,
+            jttt=9,
+            kbbb=0,
+            kttt=9,
+            xwid=10,
+            ywid=10,
+            zwid=10,
+            xdel=5,
+            ydel=5,
+            zdel=5,
         )
         assert len(patches) == 1
         p = patches[0]
@@ -209,9 +224,18 @@ class TestGeneratePatchGrid:
     def test_multiple_patches(self):
         """Multiple patches with 50% overlap."""
         patches = _generate_patch_grid(
-            ibbb=0, ittt=19, jbbb=0, jttt=19, kbbb=0, kttt=19,
-            xwid=11, ywid=11, zwid=11,
-            xdel=5, ydel=5, zdel=5,
+            ibbb=0,
+            ittt=19,
+            jbbb=0,
+            jttt=19,
+            kbbb=0,
+            kttt=19,
+            xwid=11,
+            ywid=11,
+            zwid=11,
+            xdel=5,
+            ydel=5,
+            zdel=5,
         )
         assert len(patches) > 1
         # All patches should be within bounds
@@ -226,9 +250,18 @@ class TestGeneratePatchGrid:
     def test_patch_width(self):
         """Each patch should have the specified width."""
         patches = _generate_patch_grid(
-            ibbb=0, ittt=29, jbbb=0, jttt=29, kbbb=0, kttt=29,
-            xwid=9, ywid=9, zwid=9,
-            xdel=4, ydel=4, zdel=4,
+            ibbb=0,
+            ittt=29,
+            jbbb=0,
+            jttt=29,
+            kbbb=0,
+            kttt=29,
+            xwid=9,
+            ywid=9,
+            zwid=9,
+            xdel=4,
+            ydel=4,
+            zdel=4,
         )
         for p in patches:
             assert p.itop - p.ibot + 1 == 9
@@ -238,9 +271,18 @@ class TestGeneratePatchGrid:
     def test_grid_indices_increment(self):
         """Grid indices (gi, gj, gk) should form a 3D grid."""
         patches = _generate_patch_grid(
-            ibbb=0, ittt=29, jbbb=0, jttt=29, kbbb=0, kttt=29,
-            xwid=9, ywid=9, zwid=9,
-            xdel=4, ydel=4, zdel=4,
+            ibbb=0,
+            ittt=29,
+            jbbb=0,
+            jttt=29,
+            kbbb=0,
+            kttt=29,
+            xwid=9,
+            ywid=9,
+            zwid=9,
+            xdel=4,
+            ydel=4,
+            zdel=4,
         )
         gi_vals = sorted(set(p.gi for p in patches))
         gj_vals = sorted(set(p.gj for p in patches))
@@ -255,13 +297,23 @@ class TestGeneratePatchGrid:
 # _checkerboard_phases
 # ---------------------------------------------------------------------------
 
+
 class TestCheckerboardPhases:
     def test_eight_phases(self):
         """Should produce exactly 8 phases."""
         patches = _generate_patch_grid(
-            ibbb=0, ittt=29, jbbb=0, jttt=29, kbbb=0, kttt=29,
-            xwid=9, ywid=9, zwid=9,
-            xdel=4, ydel=4, zdel=4,
+            ibbb=0,
+            ittt=29,
+            jbbb=0,
+            jttt=29,
+            kbbb=0,
+            kttt=29,
+            xwid=9,
+            ywid=9,
+            zwid=9,
+            xdel=4,
+            ydel=4,
+            zdel=4,
         )
         phases = _checkerboard_phases(patches)
         assert len(phases) == 8
@@ -269,9 +321,18 @@ class TestCheckerboardPhases:
     def test_all_patches_assigned(self):
         """Every patch should appear in exactly one phase."""
         patches = _generate_patch_grid(
-            ibbb=0, ittt=29, jbbb=0, jttt=29, kbbb=0, kttt=29,
-            xwid=9, ywid=9, zwid=9,
-            xdel=4, ydel=4, zdel=4,
+            ibbb=0,
+            ittt=29,
+            jbbb=0,
+            jttt=29,
+            kbbb=0,
+            kttt=29,
+            xwid=9,
+            ywid=9,
+            zwid=9,
+            xdel=4,
+            ydel=4,
+            zdel=4,
         )
         phases = _checkerboard_phases(patches)
         total = sum(len(ph) for ph in phases)
@@ -307,6 +368,7 @@ class TestCheckerboardPhases:
 # ---------------------------------------------------------------------------
 # _filter_patches
 # ---------------------------------------------------------------------------
+
 
 class TestFilterPatches:
     def test_all_valid(self):
@@ -380,6 +442,7 @@ class TestFilterPatches:
 # _compute_hfactor
 # ---------------------------------------------------------------------------
 
+
 class TestComputeHfactor:
     # Signature: _compute_hfactor(patch_size, patch_size_lev1, hfactor_q).
     # patch_size_lev1 is the COARSEST (level-1) patch size; finer levels
@@ -415,13 +478,14 @@ class TestComputeHfactor:
         hfactor_q = 0.5
         prat = patch_size / patch_size_lev1
         alpha = math.log(hfactor_q) / math.log(0.1)
-        expected = prat ** alpha
+        expected = prat**alpha
         assert _compute_hfactor(patch_size, patch_size_lev1, hfactor_q) == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
 # _get_basis_config
 # ---------------------------------------------------------------------------
+
 
 class TestGetBasisConfig:
     def test_cubic_lite(self):
@@ -465,6 +529,7 @@ class TestGetBasisConfig:
 # _maybe_compile
 # ---------------------------------------------------------------------------
 
+
 class TestMaybeCompile:
     def test_cpu_returns_original(self):
         """On CPU, should always return the original function."""
@@ -481,6 +546,7 @@ class TestMaybeCompile:
 # ---------------------------------------------------------------------------
 # _autobox
 # ---------------------------------------------------------------------------
+
 
 class TestAutobox:
     def test_all_nonzero(self):
@@ -532,13 +598,23 @@ class TestAutobox:
 # Integration-style: patch grid + checkerboard + filter pipeline
 # ---------------------------------------------------------------------------
 
+
 class TestPatchPipeline:
     def test_grid_to_phases_roundtrip(self):
         """Generate patches, assign to phases, verify count matches."""
         patches = _generate_patch_grid(
-            ibbb=1, ittt=30, jbbb=1, jttt=30, kbbb=1, kttt=30,
-            xwid=11, ywid=11, zwid=11,
-            xdel=5, ydel=5, zdel=5,
+            ibbb=1,
+            ittt=30,
+            jbbb=1,
+            jttt=30,
+            kbbb=1,
+            kttt=30,
+            xwid=11,
+            ywid=11,
+            zwid=11,
+            xdel=5,
+            ydel=5,
+            zdel=5,
         )
         phases = _checkerboard_phases(patches)
         total_in_phases = sum(len(ph) for ph in phases)
@@ -547,9 +623,18 @@ class TestPatchPipeline:
     def test_checkerboard_separates_adjacent(self):
         """Adjacent patches (step=xdel) should land in different phases."""
         patches = _generate_patch_grid(
-            ibbb=0, ittt=31, jbbb=0, jttt=31, kbbb=0, kttt=31,
-            xwid=9, ywid=9, zwid=9,
-            xdel=4, ydel=4, zdel=4,
+            ibbb=0,
+            ittt=31,
+            jbbb=0,
+            jttt=31,
+            kbbb=0,
+            kttt=31,
+            xwid=9,
+            ywid=9,
+            zwid=9,
+            xdel=4,
+            ydel=4,
+            zdel=4,
         )
         phases = _checkerboard_phases(patches)
         # Build lookup: grid index -> phase
@@ -574,9 +659,18 @@ class TestPatchPipeline:
         weight = torch.ones(nz, ny, nx)
         mask = torch.ones(nz, ny, nx, dtype=torch.uint8)
         patches = _generate_patch_grid(
-            ibbb=1, ittt=30, jbbb=1, jttt=30, kbbb=1, kttt=30,
-            xwid=9, ywid=9, zwid=9,
-            xdel=4, ydel=4, zdel=4,
+            ibbb=1,
+            ittt=30,
+            jbbb=1,
+            jttt=30,
+            kbbb=1,
+            kttt=30,
+            xwid=9,
+            ywid=9,
+            zwid=9,
+            xdel=4,
+            ydel=4,
+            zdel=4,
         )
         valid = _filter_patches(patches, weight, mask, nx, ny, nz)
         phases = _checkerboard_phases(valid)
@@ -589,6 +683,7 @@ class TestPatchPipeline:
 # WarpState mutation patterns
 # ---------------------------------------------------------------------------
 
+
 class TestPyramid:
     """Opt-in coarse-to-fine resolution pyramid (config.pyramid_factor)."""
 
@@ -600,9 +695,12 @@ class TestPyramid:
         for _ in range(4):
             b = (
                 b
-                + torch.roll(b, 1, 0) + torch.roll(b, -1, 0)
-                + torch.roll(b, 1, 1) + torch.roll(b, -1, 1)
-                + torch.roll(b, 1, 2) + torch.roll(b, -1, 2)
+                + torch.roll(b, 1, 0)
+                + torch.roll(b, -1, 0)
+                + torch.roll(b, 1, 1)
+                + torch.roll(b, -1, 1)
+                + torch.roll(b, 1, 2)
+                + torch.roll(b, -1, 2)
             ) / 7.0
         zz, yy, xx = torch.meshgrid(
             *[torch.arange(n, dtype=torch.float32) for n in b.shape], indexing="ij"
@@ -618,6 +716,7 @@ class TestPyramid:
     def test_default_off(self):
         assert QwarpConfig().pyramid_factor == 1
 
+    @pytest.mark.slow
     def test_pyramid_runs_and_improves(self):
         # GPU-first project: exercise the full multi-level path on CUDA (fast),
         # and only a tiny smoke on CPU so the suite isn't pegged for seconds.
@@ -665,8 +764,13 @@ class TestLevelDumper:
 
         d = self._dumper(tmp_path, folder=False, warp_files=False, movie=True)
         for lev in range(3):
-            d(lev, torch.zeros(8, 8, 8), torch.zeros(8, 8, 8), torch.zeros(8, 8, 8),
-              torch.full((8, 8, 8), float(lev)))
+            d(
+                lev,
+                torch.zeros(8, 8, 8),
+                torch.zeros(8, 8, 8),
+                torch.zeros(8, 8, 8),
+                torch.full((8, 8, 8), float(lev)),
+            )
         d.finalize()
         out = tmp_path / "p_partials.nii.gz"
         assert out.exists()

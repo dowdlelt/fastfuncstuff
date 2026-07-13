@@ -1857,17 +1857,30 @@ def nwarpforge(
                 static_composed
                 if static_composed is not None
                 else compose_chain(
-                    reduced, output_shape, output_affine, device,
-                    time_idx=f, interp=ainterp, verb=0,
+                    reduced,
+                    output_shape,
+                    output_affine,
+                    device,
+                    time_idx=f,
+                    interp=ainterp,
+                    verb=0,
                 )
             )
-            return _output_to_source_voxel_coords(
-                comp_f, source_header["affine"], output_affine
-            )
+            return _output_to_source_voxel_coords(comp_f, source_header["affine"], output_affine)
 
         follow_sampler = TissueFollowingSampler(
-            source, _coords_for_frame, output_shape, tr, tzero, slice_times_t, device,
-            tinterp=tinterp, interp=interp, no_neg=no_neg, n_out=t_end - t_start, verb=verb,
+            source,
+            _coords_for_frame,
+            output_shape,
+            tr,
+            tzero,
+            slice_times_t,
+            device,
+            tinterp=tinterp,
+            interp=interp,
+            no_neg=no_neg,
+            n_out=t_end - t_start,
+            verb=verb,
         )
 
     time_iter = tqdm(

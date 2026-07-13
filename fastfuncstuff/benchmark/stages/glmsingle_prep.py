@@ -168,11 +168,11 @@ def run_ref(ctx: BenchmarkContext) -> float:
         nwarp = _nwarp_chain(ctx, run)
         task = _primary_task(ctx)
         elapsed, _ = run_timed(
-            f'3dNwarpApply -overwrite '
-            f'-master {master} -dxyz 3.0 -wsinc5 '
+            f"3dNwarpApply -overwrite "
+            f"-master {master} -dxyz 3.0 -wsinc5 "
             f'-nwarp "{nwarp}" '
-            f'-source {st} '
-            f'-prefix {out}',
+            f"-source {st} "
+            f"-prefix {out}",
             label=f"3dNwarpApply resampled {task} run-{run}",
             cwd=ctx.processing_dir,
         )
@@ -201,11 +201,11 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
         nwarp = _nwarp_chain(ctx, run)
         elapsed, _ = run_timed(
-            f'ffs_nwarp '
-            f'-master {master} -dxyz 3.0 -interp wsinc5 '
+            f"ffs_nwarp "
+            f"-master {master} -dxyz 3.0 -interp wsinc5 "
             f'-nwarp "{nwarp}" '
-            f'-source {_st_path(ctx, run)} '
-            f'-prefix {out}',
+            f"-source {_st_path(ctx, run)} "
+            f"-prefix {out}",
             label=f"ffs_nwarp resampled {task} run-{run}",
             cwd=ctx.processing_dir,
         )

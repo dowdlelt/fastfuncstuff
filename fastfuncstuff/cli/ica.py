@@ -2291,9 +2291,7 @@ def _temporal_ica_preprocess_runs(
             run_vox = _check_finite(run_vox, f"run{ri + 1}-post-scale", args.verb >= 1)
 
         if polort >= 0:
-            run_vox = apply_polort_projection(
-                run_vox, polort=polort, device=device, run_starts=[0]
-            )
+            run_vox = apply_polort_projection(run_vox, polort=polort, device=device, run_starts=[0])
             run_vox = _check_finite(run_vox, f"run{ri + 1}-post-polort", args.verb >= 1)
 
         if args.high_pass is not None and args.high_pass > 0:

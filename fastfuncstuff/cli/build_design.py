@@ -35,6 +35,7 @@ Individual modulation (IM):
         -stim_IM times.events.txt 'SPMG1(0)' events \\
         -xmat X.xmat.1D
 """
+
 from __future__ import annotations
 
 import argparse
@@ -63,97 +64,97 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefa
 def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
-        description='Build fMRI design matrix with simplified syntax',
+        description="Build fMRI design matrix with simplified syntax",
         formatter_class=_HelpFormatter,
         epilog=__doc__,
     )
 
     # Input data (for metadata only)
     parser.add_argument(
-        '-input',
-        nargs='+',
-        metavar='FILE',
+        "-input",
+        nargs="+",
+        metavar="FILE",
         required=True,
-        help='Input fMRI data files (one per run). Used only for TR and run length metadata.',
+        help="Input fMRI data files (one per run). Used only for TR and run length metadata.",
     )
 
     # Polynomial drift
     parser.add_argument(
-        '-polort',
+        "-polort",
         type=int,
         default=3,
-        metavar='N',
-        help='Polynomial drift order (default: 3). Use -1 for no polynomials.',
+        metavar="N",
+        help="Polynomial drift order (default: 3). Use -1 for no polynomials.",
     )
 
     # Stimulus regressors
     parser.add_argument(
-        '-stim',
-        action='append',
+        "-stim",
+        action="append",
         nargs=3,
-        metavar=('TIMING_FILE', 'HRF_MODEL', 'LABEL'),
-        dest='stims',
+        metavar=("TIMING_FILE", "HRF_MODEL", "LABEL"),
+        dest="stims",
         help="Add stimulus regressor. HRF_MODEL examples: 'SPMG1(5)', 'BLOCK(10)'. "
-             "Can be used multiple times.",
+        "Can be used multiple times.",
     )
 
     # Individual modulation stimuli
     parser.add_argument(
-        '-stim_IM',
-        action='append',
+        "-stim_IM",
+        action="append",
         nargs=3,
-        metavar=('TIMING_FILE', 'HRF_MODEL', 'LABEL'),
-        dest='stims_im',
+        metavar=("TIMING_FILE", "HRF_MODEL", "LABEL"),
+        dest="stims_im",
         help="Add stimulus with Individual Modulation (one column per event). "
-             "Can be used multiple times.",
+        "Can be used multiple times.",
     )
 
     # Nuisance regressors (full length)
     parser.add_argument(
-        '-ortvec',
-        action='append',
+        "-ortvec",
+        action="append",
         nargs=2,
-        metavar=('FILE', 'LABEL'),
-        dest='ortvecs',
-        help='Add nuisance regressor (full concatenated length). Can be used multiple times.',
+        metavar=("FILE", "LABEL"),
+        dest="ortvecs",
+        help="Add nuisance regressor (full concatenated length). Can be used multiple times.",
     )
 
     # Nuisance regressors (per-run with auto-padding)
     parser.add_argument(
-        '-padortvec',
-        action='append',
+        "-padortvec",
+        action="append",
         nargs=3,
-        metavar=('FILE', 'LABEL', 'RUN'),
-        dest='padortvecs',
-        help='Add per-run nuisance regressor with auto zero-padding. '
-             'RUN is 1-indexed. Can be used multiple times.',
+        metavar=("FILE", "LABEL", "RUN"),
+        dest="padortvecs",
+        help="Add per-run nuisance regressor with auto zero-padding. "
+        "RUN is 1-indexed. Can be used multiple times.",
     )
 
     # GLT contrasts
     parser.add_argument(
-        '-gltsym',
-        action='append',
+        "-gltsym",
+        action="append",
         nargs=2,
-        metavar=('CONTRAST', 'LABEL'),
-        dest='glts',
+        metavar=("CONTRAST", "LABEL"),
+        dest="glts",
         help="Add GLT contrast. CONTRAST format: 'SYM: +1*labelA -1*labelB'. "
-             "Can be used multiple times.",
+        "Can be used multiple times.",
     )
 
     # Output
     parser.add_argument(
-        '-xmat',
+        "-xmat",
         required=True,
-        metavar='FILE',
-        help='Output design matrix file (.xmat.1D format)',
+        metavar="FILE",
+        help="Output design matrix file (.xmat.1D format)",
     )
 
     # Optional flags
     parser.add_argument(
-        '-TR',
+        "-TR",
         type=float,
-        metavar='SECONDS',
-        help='Override TR from input files',
+        metavar="SECONDS",
+        help="Override TR from input files",
     )
 
     add_verbose_arg(parser, default=0)
@@ -161,7 +162,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_input_metadata(input_files: list[str], tr_override: float | None = None) -> tuple[float, list[int]]:
+def get_input_metadata(
+    input_files: list[str], tr_override: float | None = None
+) -> tuple[float, list[int]]:
     """
     Extract TR and run lengths from input files
 
@@ -252,7 +255,7 @@ def main():
         print(f"\nStimuli: {len(timing_files)}")
         for i, (label, hrf, im) in enumerate(zip(stim_labels, hrf_models, im_modes, strict=False)):
             mode_str = " (IM)" if im else ""
-            print(f"  {i+1}. {label}: {hrf}{mode_str}")
+            print(f"  {i + 1}. {label}: {hrf}{mode_str}")
 
     # Prepare nuisance regressors
     padortvec_files = []
@@ -324,7 +327,7 @@ def main():
             glt_contrasts.append((contrast_str, label))
 
     # Build command line string for metadata
-    command_line = ' '.join(sys.argv)
+    command_line = " ".join(sys.argv)
 
     # Write output
     if args.verb >= 1:
@@ -352,6 +355,5 @@ def main():
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
-

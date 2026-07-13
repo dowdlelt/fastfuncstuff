@@ -23,9 +23,9 @@ from torch import Tensor
 class BatchOptStats(NamedTuple):
     """Optimizer-budget telemetry for one batched-patch optimization call."""
 
-    steps_run: int       # Adam steps actually executed (<= max_iter)
-    n_patches: int       # number of patches in the batch
-    hit_budget: int      # patches still improving when the loop hit max_iter
+    steps_run: int  # Adam steps actually executed (<= max_iter)
+    n_patches: int  # number of patches in the batch
+    hit_budget: int  # patches still improving when the loop hit max_iter
 
 
 def optimize_warp_params_torch(
@@ -84,13 +84,14 @@ def optimize_warp_params_torch(
         ftol = tolerance * max(abs(best_cost), 1e-6)
 
         result = scipy_minimize(
-            scipy_cost, x0,
-            method='Powell',
+            scipy_cost,
+            x0,
+            method="Powell",
             options={
-                'maxiter': max_iter,
-                'maxfev': maxfev,
-                'ftol': ftol,
-                'direc': direc,
+                "maxiter": max_iter,
+                "maxfev": maxfev,
+                "ftol": ftol,
+                "direc": direc,
             },
         )
 
@@ -106,9 +107,7 @@ def optimize_warp_params_torch(
 
     except ImportError:
         # Fallback: coordinate descent with quadratic interpolation
-        return _coordinate_descent(
-            cost_fn, n_params, param_max, device, max_iter, prad
-        )
+        return _coordinate_descent(cost_fn, n_params, param_max, device, max_iter, prad)
 
 
 def _coordinate_descent(
@@ -198,8 +197,7 @@ def optimize_warp_params_batched(
     Returns:
         (best_params, best_costs, stats): (B, n_params), (B,), and budget stats.
     """
-    params = torch.zeros(B, n_params, device=device, dtype=torch.float32,
-                         requires_grad=True)
+    params = torch.zeros(B, n_params, device=device, dtype=torch.float32, requires_grad=True)
 
     optimizer = torch.optim.Adam([params], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iter)
@@ -264,7 +262,5 @@ def optimize_warp_params_batched(
                 break
 
     # Patches still improving (not yet stalled) when we ran out of budget.
-    hit_budget = (
-        int((no_improve < patience).sum().item()) if steps_run >= max_iter else 0
-    )
+    hit_budget = int((no_improve < patience).sum().item()) if steps_run >= max_iter else 0
     return best_params, best_costs, BatchOptStats(steps_run, B, hit_budget)

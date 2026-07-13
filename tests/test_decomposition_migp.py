@@ -1,4 +1,5 @@
 """Tests for fastfuncstuff.decomposition.migp."""
+
 from __future__ import annotations
 
 import torch
@@ -71,4 +72,5 @@ def test_migp_reduces_when_threshold_exceeded():
 
 if __name__ == "__main__":
     import pytest
+
     pytest.main([__file__, "-x", "-v"])
