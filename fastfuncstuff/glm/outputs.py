@@ -193,6 +193,30 @@ def _resolve_shape(results: ResultsLike, volume_shape: Sequence[int] | None) -> 
     return tuple(int(dim) for dim in volume_shape)
 
 
+def reconstruct_partial_timeseries(
+    betas: np.ndarray | torch.Tensor,
+    design: np.ndarray | torch.Tensor,
+    column_indices: Sequence[int] | np.ndarray | torch.Tensor,
+) -> np.ndarray:
+    """Reconstruct the fitted signal explained by a subset of design columns.
+
+    Returns ``betas[:, column_indices] @ design[:, column_indices].T`` as a
+    ``(n_voxels, n_timepoints)`` float32 array — the timeseries the model
+    attributes to those columns alone. Splitting the design into nuisance and
+    task columns lets a caller rebuild the nuisance-only fit (for -save_nuisance)
+    or the task-only fit (the task half of -save_clean) without re-running the
+    GLM. ``betas`` is ``(n_voxels, n_regressors)`` and ``design`` is
+    ``(n_timepoints, n_regressors)`` over the *full* fitted design.
+    """
+    b = _ensure_numpy(betas)
+    x = _ensure_numpy(design)
+    idx = np.asarray(
+        column_indices.tolist() if isinstance(column_indices, torch.Tensor) else column_indices,
+        dtype=np.int64,
+    )
+    return b[:, idx] @ x[:, idx].T
+
+
 def slice_glm_results(
     results: ResultsLike,
     indices: list[int] | np.ndarray | torch.Tensor,

@@ -320,6 +320,27 @@ Examples:
     reml_out.add_argument("-Rfitts", help="Output REML fitted model time series")
     reml_out.add_argument("-Rerrts", help="Output REML residuals")
     reml_out.add_argument("-Rwherr", help="Output REML whitened residuals")
+    reml_out.add_argument(
+        "-save_clean",
+        "-save-clean",
+        dest="save_clean",
+        metavar="PATH",
+        help="Save a nuisance-removed ('clean') timeseries: the raw data minus the "
+        "fitted nuisance signal (everything NOT a stimulus column — polynomials, "
+        "motion, etc.), with the per-voxel temporal mean added back so the series "
+        "sits at the original signal level. Equals task_fit + residuals + mean. "
+        "Because the GLM fits task and nuisance jointly, the task keeps variance a "
+        "plain projection would leak into nuisance. Off by default; requires the full "
+        "design (not StimBots/StimTops-filtered).",
+    )
+    reml_out.add_argument(
+        "-save_nuisance",
+        "-save-nuisance",
+        dest="save_nuisance",
+        metavar="PATH",
+        help="Save the reconstructed nuisance-only timeseries (fitted nuisance "
+        "regressors × their betas) — the signal -save_clean removes. Off by default.",
+    )
 
     # Whole-dataset diagnostics: cheap maps that fall out of data already resident
     # during the fit (the one point the entire timeseries is in RAM). See
@@ -897,6 +918,10 @@ def print_output_summary(args):
         arma_outputs.append(f"  • Rerrts (residuals): {args.Rerrts}")
     if args.Rwherr:
         arma_outputs.append(f"  • Rwherr (whitened residuals): {args.Rwherr}")
+    if args.save_clean:
+        arma_outputs.append(f"  • save_clean (nuisance-removed timeseries): {args.save_clean}")
+    if args.save_nuisance:
+        arma_outputs.append(f"  • save_nuisance (nuisance-only timeseries): {args.save_nuisance}")
     if getattr(args, "Rlklhd", None):
         arma_outputs.append(f"  • Rlklhd (full likelihood surface): {args.Rlklhd}")
 
@@ -1091,6 +1116,8 @@ def main():
         args.Rfitts,
         args.Rerrts,
         args.Rwherr,
+        args.save_clean,
+        args.save_nuisance,
         args.Obuck,
         args.Obeta,
         args.Onuisance,
@@ -1257,6 +1284,8 @@ def main():
             args.Rfitts,
             args.Rerrts,
             args.Rwherr,
+            args.save_clean,
+            args.save_nuisance,
         ]
     )
     ols_output_path = args.Obuck if args.Obuck else None
@@ -2415,6 +2444,7 @@ def main():
             slibase_files_sm=args.slibase_sm,
             censor_file=args.censor,
             want_residuals=bool(args.Rerrts)
+            or bool(args.save_clean)
             or (want_diag and bool(args.save_tsnr or args.save_acf)),
         )
 
@@ -3189,6 +3219,67 @@ def main():
             )
         else:
             print("    ⚠️  Warning: Residuals not available")
+
+    if args.save_clean or args.save_nuisance:
+        from fastfuncstuff.glm.outputs import (
+            _ensure_numpy,
+            _get_voxel_mask,
+            _resolve_shape,
+            reconstruct_partial_timeseries,
+        )
+
+        # Both need nuisance betas, which only exist when the WHOLE design was
+        # fitted. StimBots/StimTops filtering keeps stimulus columns only, so there
+        # is nothing to reconstruct the nuisance signal from — bail like -Rnuisance.
+        design_mat = design_info.get("matrix", design_info.get("design_matrix"))
+        if fitted_column_indices is not None or design_mat is None:
+            print(
+                "  ⚠️  Skipping -save_clean/-save_nuisance: needs the full design "
+                "(fit was filtered to stimulus columns, or design matrix unavailable)."
+            )
+        else:
+            all_indices = list(range(len(full_labels)))
+            task_idx = list(stim_indices) if stim_indices else []
+            nuisance_idx = [i for i in all_indices if i not in task_idx]
+            affine = getattr(results, "affine", np.eye(4))
+            volume_shape = _resolve_shape(results, None)
+            voxel_mask = _get_voxel_mask(results)
+            betas_np = _ensure_numpy(results.betas)
+            design_np = _ensure_numpy(design_mat)
+
+            if args.save_nuisance:
+                print(f"  • Writing REML nuisance-only timeseries: {args.save_nuisance}")
+                if not nuisance_idx:
+                    print("    ⚠️  Warning: no nuisance columns in design; output is all zeros")
+                nuis_ts = reconstruct_partial_timeseries(betas_np, design_np, nuisance_idx)
+                save_nifti(
+                    _voxels_to_4d_volume(nuis_ts, volume_shape, voxel_mask),
+                    output_path=replace_afni_extension(args.save_nuisance, ".nii.gz"),
+                    affine=affine,
+                )
+                del nuis_ts
+
+            if args.save_clean:
+                print(f"  • Writing REML nuisance-removed (clean) timeseries: {args.save_clean}")
+                if results.residuals is None:
+                    print("    ⚠️  Warning: residuals unavailable; cannot build clean timeseries")
+                else:
+                    resid_np = _ensure_numpy(results.residuals)
+                    # clean = data - nuisance_fit + per-voxel temporal mean
+                    #       = task_fit + residuals + mean_t(data).
+                    # mean_t(data) = betas @ mean_t(X) + mean_t(residuals), so the raw
+                    # data need not be resident — every term comes from the fit. Build
+                    # in place (task_fit → clean) to avoid a third (n_vox, n_time) copy.
+                    grand_mean = betas_np @ design_np.mean(axis=0) + resid_np.mean(axis=1)
+                    clean_ts = reconstruct_partial_timeseries(betas_np, design_np, task_idx)
+                    clean_ts += resid_np
+                    clean_ts += grand_mean[:, None]
+                    save_nifti(
+                        _voxels_to_4d_volume(clean_ts, volume_shape, voxel_mask),
+                        output_path=replace_afni_extension(args.save_clean, ".nii.gz"),
+                        affine=affine,
+                    )
+                    del clean_ts
 
     if args.Rwherr:
         print(f"  • Writing REML whitened residuals: {args.Rwherr}")

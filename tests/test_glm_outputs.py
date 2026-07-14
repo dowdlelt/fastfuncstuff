@@ -108,6 +108,39 @@ class TestGLMOutputsComprehensive:
         assert isinstance(sliced_np.betas, np.ndarray)
         assert sliced_np.betas.shape == (10, 2)
 
+    def test_reconstruct_partial_timeseries(self):
+        """betas × selected columns reproduces that part of the fitted signal, and
+        the -save_clean identity (data - nuisance_fit + mean == task_fit + resid + mean)
+        holds exactly."""
+        from fastfuncstuff.glm.outputs import reconstruct_partial_timeseries
+
+        rng = np.random.default_rng(0)
+        n_time, n_reg, n_vox = 40, 5, 12
+        design = rng.standard_normal((n_time, n_reg)).astype(np.float32)
+        design[:, 0] = 1.0  # constant (baseline / mean nuisance column)
+        betas = rng.standard_normal((n_vox, n_reg)).astype(np.float32)
+        resid = rng.standard_normal((n_vox, n_time)).astype(np.float32)
+
+        task_idx = [3, 4]
+        nuis_idx = [0, 1, 2]
+        data = betas @ design.T + resid  # (n_vox, n_time)
+
+        task_fit = reconstruct_partial_timeseries(betas, design, task_idx)
+        nuis_fit = reconstruct_partial_timeseries(betas, design, nuis_idx)
+
+        # Partitioning the columns partitions the fitted signal.
+        assert np.allclose(task_fit + nuis_fit, betas @ design.T, atol=1e-4)
+
+        # Clean built from the fit equals data minus nuisance plus per-voxel mean.
+        grand_mean = betas @ design.mean(axis=0) + resid.mean(axis=1)
+        clean = task_fit + resid + grand_mean[:, None]
+        assert np.allclose(clean, data - nuis_fit + data.mean(axis=1)[:, None], atol=1e-3)
+
+        # Empty selection yields an all-zero (n_vox, n_time) block, not an error.
+        empty = reconstruct_partial_timeseries(betas, design, [])
+        assert empty.shape == (n_vox, n_time)
+        assert np.all(empty == 0.0)
+
     def test_extract_onset_times(self):
         """Test extracting onset times from design matrix."""
         from fastfuncstuff.glm.outputs import extract_onset_times_from_design
