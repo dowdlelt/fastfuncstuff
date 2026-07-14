@@ -217,6 +217,33 @@ def reconstruct_partial_timeseries(
     return b[:, idx] @ x[:, idx].T
 
 
+def find_baseline_columns(
+    design: np.ndarray | torch.Tensor,
+    candidate_indices: Sequence[int] | np.ndarray | torch.Tensor,
+) -> list[int]:
+    """Return the candidate columns that are per-run baselines (polort degree 0).
+
+    A degree-0 polynomial is constant over the run it spans and zero elsewhere
+    (block-diagonal), so it is detected numerically as "constant wherever it is
+    nonzero". Doing it by value rather than by label keeps it robust to the
+    differing polort label conventions across design paths (``Run#kPol#0`` vs
+    ``rNN_polyP`` vs ``polyNN``). Used by ffs_reml -save_per_run_polort to keep
+    the per-run baselines in the clean timeseries instead of a single grand mean.
+    """
+    x = _ensure_numpy(design)
+    out: list[int] = []
+    for i in (
+        candidate_indices.tolist()
+        if isinstance(candidate_indices, torch.Tensor)
+        else list(candidate_indices)
+    ):
+        col = x[:, i]
+        nz = col[col != 0.0]
+        if nz.size > 0 and np.allclose(nz, nz[0]):
+            out.append(int(i))
+    return out
+
+
 def slice_glm_results(
     results: ResultsLike,
     indices: list[int] | np.ndarray | torch.Tensor,

@@ -341,6 +341,28 @@ Examples:
         help="Save the reconstructed nuisance-only timeseries (fitted nuisance "
         "regressors × their betas) — the signal -save_clean removes. Off by default.",
     )
+    reml_out.add_argument(
+        "-save_taskfit",
+        "-save-taskfit",
+        dest="save_taskfit",
+        metavar="PATH",
+        help="Save the pure task fit (stimulus columns × their betas), with NO "
+        "residual and NO mean. This is the smooth model signal; -save_clean is the "
+        "same task fit PLUS the residual (and baseline). Comparing the two shows what "
+        "the model explains vs. what it leaves as noise. Off by default. Together with "
+        "-save_nuisance and -Rerrts it gives the exact partition data = taskfit + "
+        "nuisance + residual.",
+    )
+    reml_out.add_argument(
+        "-save_per_run_polort",
+        "-save-per-run-polort",
+        dest="save_per_run_polort",
+        action="store_true",
+        help="Modifier for -save_clean: instead of adding back one per-voxel grand "
+        "mean, keep each run's fitted polort-0 baseline (the per-run means). Preserves "
+        "run-to-run offsets rather than collapsing them to a common level. No effect "
+        "without -save_clean.",
+    )
 
     # Whole-dataset diagnostics: cheap maps that fall out of data already resident
     # during the fit (the one point the entire timeseries is in RAM). See
@@ -922,6 +944,8 @@ def print_output_summary(args):
         arma_outputs.append(f"  • save_clean (nuisance-removed timeseries): {args.save_clean}")
     if args.save_nuisance:
         arma_outputs.append(f"  • save_nuisance (nuisance-only timeseries): {args.save_nuisance}")
+    if args.save_taskfit:
+        arma_outputs.append(f"  • save_taskfit (task-only fit): {args.save_taskfit}")
     if getattr(args, "Rlklhd", None):
         arma_outputs.append(f"  • Rlklhd (full likelihood surface): {args.Rlklhd}")
 
@@ -1118,11 +1142,15 @@ def main():
         args.Rwherr,
         args.save_clean,
         args.save_nuisance,
+        args.save_taskfit,
         args.Obuck,
         args.Obeta,
         args.Onuisance,
         getattr(args, "Rlklhd", None),
     ]
+    if args.save_per_run_polort and not args.save_clean:
+        print("⚠️  -save_per_run_polort has no effect without -save_clean; ignoring.")
+
     if not any(outputs):
         print("ERROR: At least one output option must be specified")
         print("       Use -Rbuck, -Rbeta, -Rnuisance, -Rvar, -Rfitts, -Rerrts, -Rwherr,")
@@ -1286,6 +1314,7 @@ def main():
             args.Rwherr,
             args.save_clean,
             args.save_nuisance,
+            args.save_taskfit,
         ]
     )
     ols_output_path = args.Obuck if args.Obuck else None
@@ -3220,22 +3249,24 @@ def main():
         else:
             print("    ⚠️  Warning: Residuals not available")
 
-    if args.save_clean or args.save_nuisance:
+    if args.save_clean or args.save_nuisance or args.save_taskfit:
         from fastfuncstuff.glm.outputs import (
             _ensure_numpy,
             _get_voxel_mask,
             _resolve_shape,
+            find_baseline_columns,
             reconstruct_partial_timeseries,
         )
 
-        # Both need nuisance betas, which only exist when the WHOLE design was
-        # fitted. StimBots/StimTops filtering keeps stimulus columns only, so there
-        # is nothing to reconstruct the nuisance signal from — bail like -Rnuisance.
+        # All three reconstruct from the full-design betas. StimBots/StimTops
+        # filtering keeps stimulus columns only, so results.betas no longer aligns
+        # with the full design's columns and there are no nuisance betas — bail like
+        # -Rnuisance.
         design_mat = design_info.get("matrix", design_info.get("design_matrix"))
         if fitted_column_indices is not None or design_mat is None:
             print(
-                "  ⚠️  Skipping -save_clean/-save_nuisance: needs the full design "
-                "(fit was filtered to stimulus columns, or design matrix unavailable)."
+                "  ⚠️  Skipping -save_clean/-save_nuisance/-save_taskfit: needs the full "
+                "design (fit was filtered to stimulus columns, or design matrix unavailable)."
             )
         else:
             all_indices = list(range(len(full_labels)))
@@ -3259,21 +3290,53 @@ def main():
                 )
                 del nuis_ts
 
+            if args.save_taskfit:
+                # Pure task fit: X_task·β_task, no residual, no mean. With -save_nuisance
+                # and -Rerrts this is the exact partition data = taskfit + nuisance + resid.
+                print(f"  • Writing REML task-only fit: {args.save_taskfit}")
+                if not task_idx:
+                    print("    ⚠️  Warning: no stimulus columns identified; output is all zeros")
+                task_only = reconstruct_partial_timeseries(betas_np, design_np, task_idx)
+                save_nifti(
+                    _voxels_to_4d_volume(task_only, volume_shape, voxel_mask),
+                    output_path=replace_afni_extension(args.save_taskfit, ".nii.gz"),
+                    affine=affine,
+                )
+                del task_only
+
             if args.save_clean:
                 print(f"  • Writing REML nuisance-removed (clean) timeseries: {args.save_clean}")
                 if results.residuals is None:
                     print("    ⚠️  Warning: residuals unavailable; cannot build clean timeseries")
                 else:
                     resid_np = _ensure_numpy(results.residuals)
-                    # clean = data - nuisance_fit + per-voxel temporal mean
-                    #       = task_fit + residuals + mean_t(data).
-                    # mean_t(data) = betas @ mean_t(X) + mean_t(residuals), so the raw
-                    # data need not be resident — every term comes from the fit. Build
-                    # in place (task_fit → clean) to avoid a third (n_vox, n_time) copy.
-                    grand_mean = betas_np @ design_np.mean(axis=0) + resid_np.mean(axis=1)
-                    clean_ts = reconstruct_partial_timeseries(betas_np, design_np, task_idx)
+                    # clean = data - removed_nuisance_fit + baseline
+                    #       = task_fit + residuals + baseline.
+                    # Default baseline is one per-voxel grand mean; -save_per_run_polort
+                    # instead keeps each run's fitted polort-0 column so run offsets
+                    # survive. mean_t(data) = betas @ mean_t(X) + mean_t(residuals), so
+                    # the raw data need not be resident — every term comes from the fit.
+                    # keep_idx = task columns that stay in the clean signal (task, plus
+                    # the per-run baselines when -save_per_run_polort).
+                    keep_idx = list(task_idx)
+                    baseline = None
+                    if args.save_per_run_polort:
+                        pol0_idx = find_baseline_columns(design_np, nuisance_idx)
+                        if pol0_idx:
+                            keep_idx = keep_idx + pol0_idx
+                        else:
+                            print(
+                                "    ⚠️  -save_per_run_polort: no polort-0 columns found; "
+                                "falling back to grand mean"
+                            )
+                            baseline = betas_np @ design_np.mean(axis=0) + resid_np.mean(axis=1)
+                    else:
+                        baseline = betas_np @ design_np.mean(axis=0) + resid_np.mean(axis=1)
+                    # Build in place (keep_fit → clean) to avoid a third (n_vox, n_time) copy.
+                    clean_ts = reconstruct_partial_timeseries(betas_np, design_np, keep_idx)
                     clean_ts += resid_np
-                    clean_ts += grand_mean[:, None]
+                    if baseline is not None:
+                        clean_ts += baseline[:, None]
                     save_nifti(
                         _voxels_to_4d_volume(clean_ts, volume_shape, voxel_mask),
                         output_path=replace_afni_extension(args.save_clean, ".nii.gz"),

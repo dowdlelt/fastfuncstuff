@@ -141,6 +141,33 @@ class TestGLMOutputsComprehensive:
         assert empty.shape == (n_vox, n_time)
         assert np.all(empty == 0.0)
 
+        # Exact 3-way partition: data = taskfit + nuisance_fit + residual.
+        assert np.allclose(task_fit + nuis_fit + resid, data, atol=1e-4)
+
+    def test_find_baseline_columns(self):
+        """Per-run polort-0 (constant-over-support) columns are detected numerically,
+        motion/higher-degree columns are not."""
+        from fastfuncstuff.glm.outputs import find_baseline_columns
+
+        n_time = 30
+        design = np.zeros((n_time, 5), dtype=np.float32)
+        # col 0: run-1 constant (first half), col 1: run-2 constant (second half)
+        design[: n_time // 2, 0] = 1.0
+        design[n_time // 2 :, 1] = 1.0
+        # col 2: linear ramp (polort-1) — not constant
+        design[:, 2] = np.linspace(-1, 1, n_time)
+        # col 3: motion-like — not constant
+        design[:, 3] = np.random.default_rng(1).standard_normal(n_time)
+        # col 4: a task column (also varies)
+        design[:, 4] = np.sin(np.arange(n_time))
+
+        # Restrict the search to the nuisance candidates (0-3); task col 4 excluded.
+        found = find_baseline_columns(design, [0, 1, 2, 3])
+        assert found == [0, 1]
+
+        # Per-run baseline keeps run offsets; grand mean would not.
+        assert design[: n_time // 2, 0].std() == 0.0
+
     def test_extract_onset_times(self):
         """Test extracting onset times from design matrix."""
         from fastfuncstuff.glm.outputs import extract_onset_times_from_design
