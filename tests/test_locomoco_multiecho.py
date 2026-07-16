@@ -141,7 +141,10 @@ def test_pooled_xcorr_kernel_recovers_shared_shift():
         _shift3d_axis(torch.from_numpy(c * base)[None], float(a * 0.35), PE)
         for a, c in zip(alpha, contrast, strict=True)
     ]
-    w = xcorr_search_flow_3d_multiecho(fixed, moving, alpha, PE, max_shift=3.0, trial_step=0.05)[0]
+    w_be, _conf = xcorr_search_flow_3d_multiecho(
+        fixed, moving, alpha, PE, max_shift=3.0, trial_step=0.05
+    )
+    w = w_be[0]
     core = base > np.percentile(base, 40)
     # Correcting shift is -0.35 (echo-1 scale); pooled search should recover it.
     assert abs(float(w[core].median()) + 0.35) < 0.1

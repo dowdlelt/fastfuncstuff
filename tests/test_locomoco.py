@@ -652,11 +652,67 @@ def test_optical_flow_lk_3d_recovers_uniform_shift():
 def test_xcorr_3d_recovers_uniform_shift():
     vol = _phantom3d()
     moved = _yshift3d(vol, -0.8)
-    disp = xcorr_search_flow_3d(
+    field, _conf = xcorr_search_flow_3d(
         torch.from_numpy(vol)[None], torch.from_numpy(moved)[None], pe_axis=1, max_shift=3
-    )[0]
+    )
+    disp = field[0]
     core = disp[6:-6, 6:-6, 3:-3]
     assert abs(float(core.mean()) - 0.8) < 0.15
+
+
+def test_xcorr_3d_returns_nonneg_confidence_matching_shape():
+    """The searchlight returns a (field, conf) pair; conf is non-negative, finite, matches
+    the field shape, and is positive over the well-textured region where the shift is
+    determined (the map the -reg_sigma smoother trusts as its weight)."""
+    vol = _phantom3d()
+    moved = _yshift3d(vol, -0.8)
+    field, conf = xcorr_search_flow_3d(
+        torch.from_numpy(vol)[None], torch.from_numpy(moved)[None], pe_axis=1, max_shift=3
+    )
+    assert conf.shape == field.shape
+    assert float(conf.min()) >= 0.0
+    assert torch.isfinite(conf).all()
+    assert float(conf[0, 8:-8, 8:-8, 4:-4].mean()) > 0.0
+
+
+def test_xcorr_reg_sigma_suppresses_dropout_rail():
+    """Confidence-weighted smoothing (reg_sigma>0) fills a signal-void patch — where the
+    search rails at ±max_shift — from its confident neighbours, instead of leaving the
+    rail. This is the robustness the user asked for: 'voxels resemble their neighbours'."""
+    rng = np.random.default_rng(0)
+    vol = _phantom3d()
+    moved = _yshift3d(vol, -0.8)
+    # Punch a signal-void cube into the moving volume: the searchlight there has nothing
+    # to lock onto and rails to the search boundary.
+    void = (slice(16, 24), slice(16, 24), slice(6, 10))
+    moved = moved.copy()
+    moved[void] = 0.01 * rng.standard_normal(moved[void].shape).astype(np.float32)
+    fx = torch.from_numpy(vol)[None]
+    mv = torch.from_numpy(moved)[None]
+    raw, _ = xcorr_search_flow_3d(fx, mv, pe_axis=1, max_shift=3, reg_sigma=0.0)
+    reg, _ = xcorr_search_flow_3d(fx, mv, pe_axis=1, max_shift=3, reg_sigma=1.5)
+    # In the void, the un-regularised field rails far from the true 0.8; regularisation
+    # pulls it back toward the surrounding consensus.
+    err_raw = (raw[0][void] - 0.8).abs().mean()
+    err_reg = (reg[0][void] - 0.8).abs().mean()
+    assert float(err_reg) < float(err_raw)
+    assert float((reg[0][void]).abs().max()) < 3.0  # no longer railed at the boundary
+
+
+def test_noshift_hard_guard_zeros_low_prominence():
+    """The opt-in hard guard (noshift_margin>0) zeros a voxel whose peak barely beats the
+    zero-shift correlation. With a large margin the whole (small-shift) field collapses to
+    ~0; the default (margin 0) leaves it intact — proving the guard is off by default."""
+    vol = _phantom3d()
+    moved = _yshift3d(vol, -0.5)
+    fx = torch.from_numpy(vol)[None]
+    mv = torch.from_numpy(moved)[None]
+    default_field, _ = xcorr_search_flow_3d(fx, mv, pe_axis=1, max_shift=3, reg_sigma=0.0)
+    guarded_field, _ = xcorr_search_flow_3d(
+        fx, mv, pe_axis=1, max_shift=3, reg_sigma=0.0, noshift_margin=0.9
+    )
+    assert float(default_field[0][6:-6, 6:-6, 3:-3].mean().abs()) > 0.3  # recovers the shift
+    assert float(guarded_field.abs().mean()) < float(default_field.abs().mean())
 
 
 def test_3d_solve_beats_averaging_the_two_cuts():

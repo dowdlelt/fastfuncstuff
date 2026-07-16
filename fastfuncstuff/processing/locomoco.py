@@ -198,6 +198,82 @@ def optical_flow_lk_2d(
     return u, v
 
 
+def _searchlight_field_and_conf(
+    best_i: torch.Tensor,
+    best_val: torch.Tensor,
+    zero_val: torch.Tensor,
+    ym2: torch.Tensor,
+    ym1: torch.Tensor,
+    y0: torch.Tensor,
+    yp1: torch.Tensor,
+    yp2: torch.Tensor,
+    *,
+    nd: int,
+    r: float,
+    trial_step: float,
+    noshift_margin: float,
+    reg_sigma: float,
+    blur,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Turn a searchlight's running-peak state into a regularised field + confidence.
+
+    The shared tail of every xcorr searchlight (:func:`_xcorr_shift_1d`,
+    :func:`xcorr_search_flow_3d`, :func:`xcorr_search_flow_3d_multiecho`). A bare
+    per-voxel argmax of a noisy correlation curve is fragile: it can latch onto a
+    spurious far peak, and it treats every voxel as independent even though the true
+    displacement field is spatially smooth. Four steps harden it:
+
+    1. **Sub-voxel peak** by a 5-point least-squares parabola (3-point near an edge) —
+       the original behaviour.
+    2. **Confidence** per voxel = peak quality (``best_val``) × prominence over the
+       no-shift correlation (``best_val − zero_val``), knocked down ×0.1 where the peak
+       railed at the ``±max_shift`` search boundary (a railed peak is almost always
+       dropout/noise, not real motion — residual shifts are small by construction). This
+       is the *soft* no-shift prior: a peak barely above no-shift earns little trust and
+       is out-voted by its neighbours in step 4, without being destroyed.
+    3. **Optional hard no-shift guard** (``noshift_margin > 0``, OFF by default): a peak
+       beating the zero-shift correlation by less than ``noshift_margin`` is zeroed
+       (displacement and confidence) so a neighbour fills it in. Off by default because
+       residual motion is itself small — its prominence is small, so a hard threshold
+       risks zeroing real sub-voxel shifts. Enable only on very noisy data.
+    4. **Confidence-weighted smoothing**: ``blur(c·field)/blur(c)`` with a small
+       relative floor on ``c`` — high-confidence voxels flow into ambiguous ones (the
+       field is physically smooth, so we *borrow from trustworthy neighbours* rather
+       than blur the data itself), and it degrades gracefully to a plain blur where
+       confidence is uniform. This is the workhorse. ``reg_sigma <= 0`` disables it.
+
+    Returns ``(field, conf)`` — ``conf`` doubles as the saved diagnostic quality map.
+    """
+    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
+    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
+    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
+    den3 = ym1 - 2.0 * y0 + yp1
+    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3))
+    vtx3 = vtx3.clamp(-1.0, 1.0)
+    can5 = (best_i >= 2) & (best_i <= nd - 3)
+    can3 = (best_i >= 1) & (best_i <= nd - 2)
+    sub = torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
+    field = (-r + best_i.to(best_val.dtype) * trial_step) + sub * trial_step
+
+    prominence = (best_val - zero_val).clamp_min(0.0)
+    at_edge = (best_i <= 0) | (best_i >= nd - 1)
+    conf = best_val.clamp_min(0.0) * prominence
+    conf = torch.where(at_edge, conf * 0.1, conf)
+
+    if noshift_margin > 0.0:
+        keep = prominence >= noshift_margin
+        field = torch.where(keep, field, torch.zeros_like(field))
+        conf = torch.where(keep, conf, torch.zeros_like(conf))
+
+    if reg_sigma > 0.0:
+        # Relative floor: keeps blur(c) well clear of 0 (no magnitude shrinkage) and
+        # makes the smoother fall back to a plain Gaussian where confidence is flat.
+        cw = conf + 1e-3 * conf.amax()
+        field = blur(cw * field) / blur(cw).clamp_min(1e-12)
+
+    return field, conf
+
+
 def _xcorr_shift_1d(
     fixed: torch.Tensor,
     moving: torch.Tensor,
@@ -207,7 +283,9 @@ def _xcorr_shift_1d(
     trial_step: float,
     interp: str,
     eps: float = 1e-4,
-) -> torch.Tensor:
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Sub-voxel pull shift along ONE in-plane axis by local correlation search.
 
     Slide ``moving`` along the axis (``pe_is_u`` → W/columns, else H/rows) over trial
@@ -216,6 +294,10 @@ def _xcorr_shift_1d(
     Per voxel the peak offset, refined by a 5-point least-squares parabola (peak ±2,
     robust to a noisy correlation curve), is the pull displacement. Trials are swept
     with a streaming running-peak, so memory is O(frame×slice), not O(trials×…).
+
+    Returns ``(field, conf)``; ``noshift_margin`` / ``reg_sigma`` are the searchlight
+    robustness knobs and ``conf`` the quality map — see
+    :func:`_searchlight_field_and_conf`.
     """
     import math
 
@@ -257,15 +339,19 @@ def _xcorr_shift_1d(
     z = torch.zeros((b, h, w), device=device, dtype=dtype)
     best_val = torch.full((b, h, w), float("-inf"), device=device, dtype=dtype)
     best_i = torch.zeros((b, h, w), device=device, dtype=torch.long)
+    zero_val = z.clone()  # correlation at no-shift (s≈0) — the no-shift-guard reference
     ym2, ym1, y0, yp1, yp2 = z.clone(), z.clone(), z.clone(), z.clone(), z.clone()
     need = torch.zeros((b, h, w), device=device, dtype=torch.long)
     prev1: torch.Tensor | None = None
     prev2: torch.Tensor | None = None
     for i in range(nd):
-        mw = _shift(moving, float(offsets[i]))
+        s = float(offsets[i])
+        mw = _shift(moving, s)
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
         corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+        if abs(s) < trial_step * 0.5 + 1e-6:
+            zero_val = corr
         # Capture right neighbours (first the +1, then the +2) for awaiting peaks.
         yp1 = torch.where(need == 2, corr, yp1)
         yp2 = torch.where(need == 1, corr, yp2)
@@ -280,17 +366,12 @@ def _xcorr_shift_1d(
         prev2 = prev1
         prev1 = corr
 
-    # 5-point LS quadratic (x=-2..2) vertex; fall back to 3-point near an edge.
-    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
-    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
-    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
-    den3 = ym1 - 2.0 * y0 + yp1
-    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3))
-    vtx3 = vtx3.clamp(-1.0, 1.0)
-    can5 = (best_i >= 2) & (best_i <= nd - 3)
-    can3 = (best_i >= 1) & (best_i <= nd - 2)
-    sub = torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
-    return (-r + best_i.to(dtype) * trial_step) + sub * trial_step
+    field, conf = _searchlight_field_and_conf(
+        best_i, best_val, zero_val, ym2, ym1, y0, yp1, yp2,
+        nd=nd, r=r, trial_step=trial_step, noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma, blur=lambda x: _blur2d(x, reg_sigma),
+    )
+    return field, conf
 
 
 def xcorr_search_flow_2d(
@@ -306,6 +387,8 @@ def xcorr_search_flow_2d(
     dual: bool = False,
     n_passes: int = 3,
     warp_interp: str = "bilinear",
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Local cross-correlation searchlight backend, same ``(fixed, moving) -> (u, v)``.
 
@@ -319,8 +402,9 @@ def xcorr_search_flow_2d(
     O(trials²) blow-up of a joint 2-D offset grid.
     """
     if not dual:
-        s = _xcorr_shift_1d(
-            fixed, moving, pe_is_u, max_shift, window_sigma, trial_step, interp, eps
+        s, _ = _xcorr_shift_1d(
+            fixed, moving, pe_is_u, max_shift, window_sigma, trial_step, interp, eps,
+            noshift_margin, reg_sigma,
         )
         z = torch.zeros_like(s)
         return (s, z) if pe_is_u else (z, s)
@@ -329,9 +413,17 @@ def xcorr_search_flow_2d(
     v = torch.zeros_like(fixed)
     for _ in range(n_passes):
         mw = _warp2d(moving, u, v, warp_interp)
-        u = u + _xcorr_shift_1d(fixed, mw, True, max_shift, window_sigma, trial_step, interp, eps)
+        du, _ = _xcorr_shift_1d(
+            fixed, mw, True, max_shift, window_sigma, trial_step, interp, eps,
+            noshift_margin, reg_sigma,
+        )
+        u = u + du
         mw = _warp2d(moving, u, v, warp_interp)
-        v = v + _xcorr_shift_1d(fixed, mw, False, max_shift, window_sigma, trial_step, interp, eps)
+        dv, _ = _xcorr_shift_1d(
+            fixed, mw, False, max_shift, window_sigma, trial_step, interp, eps,
+            noshift_margin, reg_sigma,
+        )
+        v = v + dv
     return u, v
 
 
@@ -829,6 +921,8 @@ def _build_flow_fn(
     stride: int,
     max_shift: float,
     trial_step: float,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
 ):
     """Build the per-pair ``(fixed, moving) -> (u, v)`` estimator for a backend.
 
@@ -876,6 +970,8 @@ def _build_flow_fn(
                 trial_step=trial_step,
                 dual=dual,
                 warp_interp=warp_interp,
+                noshift_margin=noshift_margin,
+                reg_sigma=reg_sigma,
             )
     else:
         raise ValueError(f"Unknown backend {backend!r}; expected flow | phase | xcorr.")
@@ -909,6 +1005,8 @@ def estimate_residual_flow(
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
     is_3dacq: bool = False,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -988,6 +1086,8 @@ def estimate_residual_flow(
             automask=automask,
             automask_dilate=automask_dilate,
             automask_sigma=automask_sigma,
+            noshift_margin=noshift_margin,
+            reg_sigma=reg_sigma,
             device=device,
             verbose=verbose,
         )
@@ -1020,6 +1120,8 @@ def estimate_residual_flow(
         stride=stride,
         max_shift=max_shift,
         trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
     )
 
     progressive = ref_mode in ("first_mean", "first_median")
@@ -1329,6 +1431,8 @@ def estimate_residual_flow_rotaware(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -1380,6 +1484,8 @@ def estimate_residual_flow_rotaware(
         stride=stride,
         max_shift=max_shift,
         trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
     )
 
     raw = torch.from_numpy(np.ascontiguousarray(raw_data)).float()  # (nx,ny,nz,T) on CPU
@@ -1403,6 +1509,8 @@ def estimate_residual_flow_rotaware(
             window_sigma=window_sigma,
             max_shift=max_shift,
             trial_step=trial_step,
+            noshift_margin=noshift_margin,
+            reg_sigma=reg_sigma,
         )
         if is_3dacq
         else None
@@ -1656,13 +1764,19 @@ def xcorr_search_flow_3d(
     window_sigma: float = 2.0,
     trial_step: float = 0.5,
     eps: float = 1e-4,
-) -> torch.Tensor:
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """3-D cross-correlation searchlight along PE — the "big block" xcorr for 3-D EPI.
 
     Slide the whole ``moving`` volume along the PE axis over ``±max_shift`` and take the
     per-voxel offset of peak local correlation under a 3-D Gaussian searchlight
     (``window_sigma``), sub-voxel by a 5-point parabola. A direct 3-D lift of
     :func:`_xcorr_shift_1d`: same streaming running-peak, 3-D window and 3-D shift.
+
+    Returns ``(field, conf)``; ``noshift_margin`` / ``reg_sigma`` are the searchlight
+    robustness knobs and ``conf`` the quality map — see
+    :func:`_searchlight_field_and_conf`.
     """
     import math
 
@@ -1679,15 +1793,19 @@ def xcorr_search_flow_3d(
     z = torch.zeros_like(fixed)
     best_val = torch.full_like(fixed, float("-inf"))
     best_i = torch.zeros_like(fixed, dtype=torch.long)
+    zero_val = z.clone()
     ym2, ym1, y0, yp1, yp2 = z.clone(), z.clone(), z.clone(), z.clone(), z.clone()
     need = torch.zeros_like(fixed, dtype=torch.long)
     prev1: torch.Tensor | None = None
     prev2: torch.Tensor | None = None
     for i in range(nd):
-        mw = _shift3d_axis(moving, float(offsets[i]), pe_axis)
+        s = float(offsets[i])
+        mw = _shift3d_axis(moving, s, pe_axis)
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
         corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+        if abs(s) < trial_step * 0.5 + 1e-6:
+            zero_val = corr
         yp1 = torch.where(need == 2, corr, yp1)
         yp2 = torch.where(need == 1, corr, yp2)
         need = torch.where(need > 0, need - 1, need)
@@ -1701,16 +1819,12 @@ def xcorr_search_flow_3d(
         prev2 = prev1
         prev1 = corr
 
-    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
-    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
-    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
-    den3 = ym1 - 2.0 * y0 + yp1
-    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3))
-    vtx3 = vtx3.clamp(-1.0, 1.0)
-    can5 = (best_i >= 2) & (best_i <= nd - 3)
-    can3 = (best_i >= 1) & (best_i <= nd - 2)
-    sub = torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
-    return (-r + best_i.to(fixed.dtype) * trial_step) + sub * trial_step
+    field, conf = _searchlight_field_and_conf(
+        best_i, best_val, zero_val, ym2, ym1, y0, yp1, yp2,
+        nd=nd, r=r, trial_step=trial_step, noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma, blur=lambda x: _blur3d_b(x, reg_sigma),
+    )
+    return field, conf
 
 
 def _build_flow3d_fn(
@@ -1722,6 +1836,8 @@ def _build_flow3d_fn(
     window_sigma: float,
     max_shift: float,
     trial_step: float,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
 ):
     """Build a 3-D ``(fixed, moving) -> disp`` PE estimator, ``(B,X,Y,Z)`` in and out."""
     if backend == "flow":
@@ -1733,14 +1849,17 @@ def _build_flow3d_fn(
     elif backend == "xcorr":
 
         def f(fx: torch.Tensor, mv: torch.Tensor) -> torch.Tensor:
-            return xcorr_search_flow_3d(
+            field, _conf = xcorr_search_flow_3d(
                 fx,
                 mv,
                 pe_axis,
                 max_shift=max_shift,
                 window_sigma=window_sigma,
                 trial_step=trial_step,
+                noshift_margin=noshift_margin,
+                reg_sigma=reg_sigma,
             )
+            return field
     elif backend == "phase":
         raise ValueError(
             "phase backend has no 3-D (-is_3dacq) path yet; use -backend flow or xcorr."
@@ -1842,6 +1961,8 @@ def _run_3dacq_plain(
     automask_sigma: float,
     device: torch.device,
     verbose: bool,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
 ) -> LocomocoResult:
     """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
     nx, ny, nz, nt = data.shape
@@ -1861,6 +1982,8 @@ def _run_3dacq_plain(
         window_sigma=window_sigma,
         max_shift=max_shift,
         trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
     )
 
     def _estimate(ref_vol: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2042,7 +2165,9 @@ def xcorr_search_flow_3d_multiecho(
     trial_step: float = 0.5,
     weights: list[torch.Tensor] | None = None,
     eps: float = 1e-4,
-) -> torch.Tensor:
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Shared-parameter 3-D xcorr searchlight across echoes — TE-linearity enforced.
 
     ONE displacement is searched for all echoes at once under the hard constraint
@@ -2057,8 +2182,10 @@ def xcorr_search_flow_3d_multiecho(
 
     ``weights`` are per-echo pooling weights ``(B,X,Y,Z)`` (default: each echo's local
     signal energy ``var_f`` — a per-voxel SNR proxy that fades out dropout regions in the
-    late echoes). Returns the ECHO-1-scaled shared displacement ``w = s/alpha_m``
-    ``(B,X,Y,Z)`` (so ``alpha_e·w`` recovers each echo's shift), matching the joint path.
+    late echoes). Returns ``(w, conf)``: the ECHO-1-scaled shared displacement
+    ``w = s/alpha_m`` ``(B,X,Y,Z)`` (so ``alpha_e·w`` recovers each echo's shift, matching
+    the joint path) and the pooled searchlight quality map. ``noshift_margin`` /
+    ``reg_sigma`` are the robustness knobs — see :func:`_searchlight_field_and_conf`.
     """
     import math
 
@@ -2084,6 +2211,7 @@ def xcorr_search_flow_3d_multiecho(
     z = torch.zeros_like(fixed_list[0])
     best_val = torch.full_like(z, float("-inf"))
     best_i = torch.zeros_like(z, dtype=torch.long)
+    zero_val = z.clone()
     ym2, ym1, y0, yp1, yp2 = z.clone(), z.clone(), z.clone(), z.clone(), z.clone()
     need = torch.zeros_like(z, dtype=torch.long)
     prev1: torch.Tensor | None = None
@@ -2098,6 +2226,8 @@ def xcorr_search_flow_3d_multiecho(
             corr = (_win(fixed_list[j] * mw) - mean_f[j] * mean_m) / torch.sqrt(var_f[j] * var_m)
             pooled = pooled + wgt[j] * corr
         pooled = pooled / wsum
+        if abs(s) < trial_step * 0.5 + 1e-6:
+            zero_val = pooled
         yp1 = torch.where(need == 2, pooled, yp1)
         yp2 = torch.where(need == 1, pooled, yp2)
         need = torch.where(need > 0, need - 1, need)
@@ -2111,17 +2241,14 @@ def xcorr_search_flow_3d_multiecho(
         prev2 = prev1
         prev1 = pooled
 
-    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
-    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
-    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
-    den3 = ym1 - 2.0 * y0 + yp1
-    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3))
-    vtx3 = vtx3.clamp(-1.0, 1.0)
-    can5 = (best_i >= 2) & (best_i <= nd - 3)
-    can3 = (best_i >= 1) & (best_i <= nd - 2)
-    sub = torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
-    s_field = (-r + best_i.to(z.dtype) * trial_step) + sub * trial_step
-    return s_field / float(alpha[m])  # echo-1 scale (alpha_1 = 1)
+    # The shared search variable is echo m's shift; regularise/guard it, then rescale
+    # to echo-1 units. conf is the pooled (SNR-weighted) searchlight quality map.
+    s_field, conf = _searchlight_field_and_conf(
+        best_i, best_val, zero_val, ym2, ym1, y0, yp1, yp2,
+        nd=nd, r=r, trial_step=trial_step, noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma, blur=lambda x: _blur3d_b(x, reg_sigma),
+    )
+    return s_field / float(alpha[m]), conf  # echo-1 scale (alpha_1 = 1)
 
 
 @dataclass
@@ -2141,6 +2268,7 @@ class MultiEchoLocomocoResult:
     w_field: torch.Tensor  # (nx,ny,nz,T) shared canonical PE displacement (voxels)
     pe_axis: int
     linearity_r2: float
+    confidence: torch.Tensor | None = None  # (nx,ny,nz,T) searchlight quality map, if xcorr
 
 
 def _rank1_factor_echoes(disps: torch.Tensor, alpha_init: torch.Tensor, n_iter: int = 8):
@@ -2188,6 +2316,8 @@ def estimate_residual_flow_multiecho(
     automask_sigma: float = 3.0,
     learn_scaling: bool = True,
     flat_scaling: bool = False,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2260,7 +2390,15 @@ def estimate_residual_flow_multiecho(
         window_sigma=window_sigma,
         max_shift=max_shift,
         trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
     )
+
+    # Confidence map from the pooled searchlight (fixed/flat-scaling xcorr path only — the
+    # LK and learn-alpha paths have no single per-voxel searchlight quality). Filled by the
+    # final _pooled_xcorr call and surfaced on the result for a `-save_confidence` diag.
+    pooled_conf = torch.zeros(nx, ny, nz, nt)
+    have_pooled_conf = False
 
     def _per_echo_estimate(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
         out = torch.zeros(e, nx, ny, nz, nt)
@@ -2295,12 +2433,13 @@ def estimate_residual_flow_multiecho(
         return out
 
     def _pooled_xcorr(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
+        nonlocal have_pooled_conf
         out = torch.zeros(nx, ny, nz, nt)
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
             movs = [vols[j][..., t].to(device) for j in range(e)]
             if smooth_sigma > 0:
                 movs = [_blur3d_b(m[None], smooth_sigma)[0] for m in movs]
-            out[..., t] = xcorr_search_flow_3d_multiecho(
+            w_be, c_be = xcorr_search_flow_3d_multiecho(
                 [r[None] for r in cur_refs],
                 [m[None] for m in movs],
                 alpha,
@@ -2308,7 +2447,12 @@ def estimate_residual_flow_multiecho(
                 max_shift=max_shift,
                 window_sigma=window_sigma,
                 trial_step=trial_step,
-            )[0].cpu()
+                noshift_margin=noshift_margin,
+                reg_sigma=reg_sigma,
+            )
+            out[..., t] = w_be[0].cpu()
+            pooled_conf[..., t] = c_be[0].cpu()
+        have_pooled_conf = True
         return out
 
     def _solve_w(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
@@ -2454,6 +2598,7 @@ def estimate_residual_flow_multiecho(
         w_field=w,
         pe_axis=pe_axis,
         linearity_r2=r2,
+        confidence=pooled_conf if have_pooled_conf else None,
     )
 
 
@@ -2480,6 +2625,8 @@ def estimate_residual_flow_me_scaled(
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
     flat_scaling: bool = False,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2529,6 +2676,8 @@ def estimate_residual_flow_me_scaled(
         automask_dilate=automask_dilate,
         automask_sigma=automask_sigma,
         is_3dacq=True,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
         device=device,
         verbose=verbose,
     )
@@ -2616,6 +2765,8 @@ def estimate_residual_flow_me_interecho(
     trial_step: float = 0.5,
     automask: bool = False,
     automask_sigma: float = 3.0,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2709,6 +2860,7 @@ def estimate_residual_flow_me_interecho(
             )
 
     w = torch.zeros(nx, ny, nz, nt)
+    conf = torch.zeros(nx, ny, nz, nt) if backend == "xcorr" else None
     for t in tqdm(range(nt), desc="me interecho", unit="frame", leave=True, disable=nt < 3):
         ims = [vols[j][..., t].to(device) for j in range(e)]
         if smooth_sigma > 0:
@@ -2728,7 +2880,7 @@ def estimate_residual_flow_me_interecho(
             )[0]
         else:
             weights = [pm[None] for pm in pair_masks] if pair_masks is not None else None
-            g = xcorr_search_flow_3d_multiecho(
+            g_be, c_be = xcorr_search_flow_3d_multiecho(
                 fixed_list,
                 moving_list,
                 dte,
@@ -2737,7 +2889,12 @@ def estimate_residual_flow_me_interecho(
                 window_sigma=window_sigma,
                 trial_step=trial_step,
                 weights=weights,
-            )[0]
+                noshift_margin=noshift_margin,
+                reg_sigma=reg_sigma,
+            )
+            g = g_be[0]
+            if conf is not None:
+                conf[..., t] = c_be[0].cpu()
         # g is the per-ms field (both kernels return s/alpha_max = per-unit-alpha);
         # store w at the echo1→echo2 step so |w| is an interpretable inter-echo shift.
         w[..., t] = (denom * g).cpu()
@@ -2746,6 +2903,8 @@ def estimate_residual_flow_me_interecho(
         # Zero (feathered) the warp outside the signal region so masked-out dropout
         # voxels — where the search railed — carry no correction.
         w = w * gate[..., None]
+        if conf is not None:
+            conf = conf * gate[..., None]
 
     # alpha counts echo1→echo2 steps: (TE_e − TE_1)/(TE_2 − TE_1). alpha_1 = 0 (anchor).
     alpha = (te - float(te[0])) / denom
@@ -2802,6 +2961,7 @@ def estimate_residual_flow_me_interecho(
         w_field=w,
         pe_axis=pe_axis,
         linearity_r2=1.0,
+        confidence=conf,
     )
 
 

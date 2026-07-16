@@ -432,6 +432,32 @@ def create_parser() -> argparse.ArgumentParser:
         "densely for a touch more accuracy at ~2× the trials. 0.5 is the sweet spot.",
     )
     search.add_argument(
+        "-reg_sigma",
+        "-reg-sigma",
+        type=float,
+        default=1.5,
+        metavar="VOX",
+        help="[xcorr] Confidence-weighted spatial smoothing of the searchlight field "
+        "(Gaussian sigma, voxels). The displacement field is physically smooth, so each "
+        "voxel borrows from its high-confidence neighbours (peak quality × prominence "
+        "over no-shift); high-confidence voxels keep their own estimate. Fixes lone "
+        "railed/spurious peaks without blurring real structure. 0 = off. Default 1.5.",
+    )
+    search.add_argument(
+        "-noshift_margin",
+        "-noshift-margin",
+        type=float,
+        default=0.0,
+        metavar="CORR",
+        help="[xcorr] Optional HARD no-shift guard: a peak beating the zero-shift "
+        "correlation by less than this (normalised-corr units) is zeroed outright and "
+        "filled from neighbours via -reg_sigma. OFF by default (0), because residual "
+        "motion is itself small — its prominence over no-shift is small, so a hard guard "
+        "risks zeroing real sub-voxel shifts. The no-shift prior is already applied SOFTLY "
+        "(confidence ∝ prominence weights the -reg_sigma smoother). Enable (e.g. 0.03) "
+        "only on very noisy data where you would rather drop uncertain voxels.",
+    )
+    search.add_argument(
         "-patch",
         type=int,
         default=16,
@@ -596,6 +622,15 @@ def create_parser() -> argparse.ArgumentParser:
         help="Also write the temporal mean of the corrected series "
         "({prefix}_locomoco_mean), e.g. for use as a registration target. "
         "Independent of -no_corrected.",
+    )
+    out.add_argument(
+        "-save_confidence",
+        "-save-confidence",
+        action="store_true",
+        help="[xcorr multi-echo] Also write the searchlight confidence map "
+        "({prefix}_locomoco_confidence, 4-D) — per-voxel peak quality × prominence, the "
+        "weight the field-regularizer (-reg_sigma) trusts. High where the shift is "
+        "well-determined, ~0 in dropout/noise. A diagnostic for where the warp is real.",
     )
     out.add_argument("-no_movie", action="store_true", help="Skip the flow movie.")
     out.add_argument(
@@ -880,6 +915,8 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             trial_step=args.xcorr_step,
             automask=automask,
             automask_sigma=args.automask_sigma,
+            noshift_margin=args.noshift_margin,
+            reg_sigma=args.reg_sigma,
             device=device,
         )
     elif est_idx is not None:
@@ -907,6 +944,8 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
             flat_scaling=args.me_flat_scaling,
+            noshift_margin=args.noshift_margin,
+            reg_sigma=args.reg_sigma,
             device=device,
         )
     else:
@@ -932,6 +971,8 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask_sigma=args.automask_sigma,
             learn_scaling=not args.me_fixed_scaling,
             flat_scaling=args.me_flat_scaling,
+            noshift_margin=args.noshift_margin,
+            reg_sigma=args.reg_sigma,
             device=device,
         )
 
@@ -966,6 +1007,20 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         for te_v, a_v in zip(result.echo_times.tolist(), result.alpha.tolist(), strict=True):
             f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
     print(f"  • per-echo scaling + linearity: {alpha_path}")
+
+    if args.save_confidence:
+        if result.confidence is not None:
+            conf_path = f"{stem}_locomoco_confidence{ext}"
+            with spinner(f"Writing {Path(conf_path).name}"):
+                save_nifti(result.confidence.numpy(), conf_path, affine=affine)
+            print(f"  • searchlight confidence map 4D: {conf_path}")
+        else:
+            print(
+                "  • -save_confidence: no map (only the xcorr searchlight paths produce "
+                "one — the flow backend and learn-alpha joint solve have no per-voxel "
+                "quality; use -backend xcorr with -me_fixed_scaling / -me_flat_scaling / "
+                "-me_interecho)."
+            )
 
     print("✅ ffs_locomoco -me_3depi complete.")
     return 0
@@ -1167,6 +1222,8 @@ def main(argv: list[str] | None = None) -> int:
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
+            noshift_margin=args.noshift_margin,
+            reg_sigma=args.reg_sigma,
             device=device,
         )
     else:
@@ -1196,6 +1253,8 @@ def main(argv: list[str] | None = None) -> int:
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
+            noshift_margin=args.noshift_margin,
+            reg_sigma=args.reg_sigma,
             device=device,
         )
 
