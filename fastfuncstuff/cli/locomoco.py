@@ -311,7 +311,9 @@ def create_parser() -> argparse.ArgumentParser:
         "short ΔTE-sized reach — no temporal template), pools all adjacent pairs per TR under the "
         "linear-in-TE scaling, and corrects each echo onto echo 1's frame. Echo 1 (shortest TE) is "
         "the assumed-undistorted anchor. Does NOT remove echo 1's own residual wiggle — follow "
-        "with a temporal pass if needed. Ignores the -me_*_scaling / -me_estimate_from flags.",
+        "with a temporal pass if needed. Ignores the -me_*_scaling / -me_estimate_from flags. "
+        "Registers echoes to each other WITHIN a TR, so it needs no temporal template and can run "
+        "BEFORE motion correction (unlike the temporal modes, which require moco'd input).",
     )
     me.add_argument(
         "-me_estimate_from",

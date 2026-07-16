@@ -2631,6 +2631,10 @@ def estimate_residual_flow_me_interecho(
     1's frame by ``(TE_n − TE_1) · g``. Echo 1 (shortest TE, assumed ~undistorted) is the
     anchor, left unchanged.
 
+    Because it registers echoes to each other *within* a TR, it needs no temporal
+    template and can run BEFORE motion correction — unlike the temporal modes, which
+    register each frame to a moco'd template and so require motion-corrected input.
+
     Needs no temporal averaging and exploits the strong same-TR inter-echo correlation
     (two real volumes per estimate), but it does NOT remove echo 1's own (small) wiggle
     that is common to every echo — follow with a temporal pass (the joint / scaled modes)
