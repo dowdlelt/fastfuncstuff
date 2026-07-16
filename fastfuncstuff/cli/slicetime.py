@@ -23,6 +23,7 @@ from fastfuncstuff.processing.slicetime import (
     load_slice_timing,
     slicetime_correct,
     temporal_resample,
+    tween_midpoints,
 )
 
 
@@ -95,8 +96,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-prefix", required=True, help="Output file")
     parser.add_argument(
         "-tpattern",
-        required=True,
-        help="Slice timing: text file (one time per line, seconds) or BIDS JSON",
+        required=False,
+        default=None,
+        help="Slice timing: text file (one time per line, seconds) or BIDS JSON. "
+        "Required for slice-timing correction; ignored (and not needed) with -tween.",
+    )
+    parser.add_argument(
+        "-tween",
+        action="store_true",
+        help="Temporal midpoint resample: ignore slice timing entirely and resample the "
+        "series onto the points BETWEEN consecutive frames (output frame k = the sample "
+        "halfway between input frames k and k+1). Yields nt-1 frames at the same TR. "
+        "Defaults to -linear (each output frame is the average of its two neighbours — "
+        "the literal in-between sample, no ringing); pick another interp to override.",
     )
     parser.add_argument(
         "-TR",
@@ -178,7 +190,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="method",
         help="Windowed sinc (18-point)",
     )
-    parser.set_defaults(method="fourier")
+    # Leave method unset so we can pick the right default per mode (linear for -tween,
+    # fourier otherwise) while still letting an explicit interp flag win.
+    parser.set_defaults(method=None)
 
     parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
     add_verbose_arg(parser, default=1)
@@ -200,6 +214,11 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("cpu")
 
     verb = args.verb
+    # Pick the interpolation default per mode: -tween wants a plain neighbour average
+    # (linear), the correction path wants fourier. An explicit interp flag overrides both.
+    if args.method is None:
+        args.method = "linear" if args.tween else "fourier"
+
     if verb >= 1:
         print(f"slicetime: device={device}, method={args.method}")
 
@@ -213,6 +232,23 @@ def main(argv: list[str] | None = None) -> None:
     nt, nz, ny, nx = vol.shape
     if verb >= 1:
         print(f"Input: {args.input} ({nt} volumes, {nz} slices, {ny}x{nx})")
+
+    # ── -tween: slice-timing-agnostic midpoint resample (its own short path) ──
+    if args.tween:
+        if args.tpattern is not None and verb >= 1:
+            print("  note: -tween ignores slice timing; -tpattern is not used.")
+        if verb >= 1:
+            print(f"Tween: resampling to {nt - 1} inter-frame midpoints (method={args.method})")
+        tweened = tween_midpoints(vol, method=args.method, device=device, verbose=verb >= 1)
+        with spinner(f"Writing {Path(args.prefix).name}"):
+            save_image(tweened, args.prefix, header_info=header)  # TR unchanged
+        if verb >= 1:
+            print(f"Saved: {args.prefix} ({tweened.shape[0]} volumes)")
+            print(f"Time: {time.time() - t0:.2f}s")
+        return
+
+    if args.tpattern is None:
+        raise ValueError("-tpattern is required for slice-timing correction (or use -tween).")
 
     # Resolve TR: CLI flag > JSON > header
     tr = _resolve_tr(args.TR, args.tpattern, args.input, verb)

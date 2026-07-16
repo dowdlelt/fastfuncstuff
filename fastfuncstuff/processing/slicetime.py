@@ -533,3 +533,64 @@ def temporal_resample(
         print(f"  resample: done ({nt_new} output volumes)")
 
     return out
+
+
+def tween_midpoints(
+    vol4d: Tensor,
+    method: str = "linear",
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> Tensor:
+    """Resample a 4D series onto the MIDPOINTS between consecutive frames.
+
+    Slice-timing-agnostic: ignores any timing table and applies a single uniform
+    half-TR shift to every voxel, so output frame ``k`` is the interpolated value at
+    continuous time ``k + 0.5`` — the midpoint of input frames ``k`` and ``k + 1``.
+    Returns ``nt - 1`` frames (the ``k = nt-1`` midpoint would fall past the last
+    acquired sample and is dropped). The TR is unchanged — the midpoints are still one
+    TR apart, just offset by half a TR.
+
+    ``method='linear'`` (the default for this operation) makes each output frame the
+    plain average of its two bracketing frames — literally "the sample in between",
+    with no sinc ringing or leakage from distant samples. Higher-order methods
+    (``cubic``/``fourier``/``wsinc*`` …) are selectable but reach beyond the two
+    neighbours, which is usually not what a midpoint tween wants.
+
+    Parameters
+    ----------
+    vol4d : (nt, nz, ny, nx) float tensor
+    method : str — interpolation method (default 'linear' = neighbour average)
+
+    Returns
+    -------
+    (nt - 1, nz, ny, nx) float tensor at the inter-frame midpoints.
+    """
+    if vol4d.ndim != 4:
+        raise ValueError(f"tween expects a 4D series, got {vol4d.ndim}D")
+    if device is not None:
+        vol4d = vol4d.to(device)
+    nt, nz, ny, nx = vol4d.shape
+    if nt < 2:
+        raise ValueError(f"tween needs ≥2 frames, got {nt}")
+
+    # out[i] = ts_cont(i + 0.5): a -0.5-sample shift (shift_timeseries: out[i] = ts(i - s)).
+    frac = -0.5
+    ts = vol4d.reshape(nt, -1).T  # (n_vox, nt)
+
+    # Detrend → shift residual → RE-add the trend at the SHIFTED grid (t = i - frac). This
+    # keeps a linear trend exact at the midpoints — so 'linear' stays the plain neighbour
+    # average — while sparing the Fourier/sinc methods the ringing a non-periodic drift
+    # would otherwise cause. (The usual same-grid retrend would bias every frame by
+    # slope·0.5.)
+    dtype = _interp_dtype(ts.device)
+    detr, intercepts, slopes = _linear_detrend(ts.to(dtype))
+    shifted = shift_timeseries(detr.to(ts.dtype), frac, method=method).to(dtype)
+    t_shift = (torch.arange(nt, device=ts.device, dtype=dtype) - frac) - (nt - 1) / 2.0
+    retr = shifted + intercepts[:, None] + slopes[:, None] * t_shift[None, :]
+
+    # Drop the trailing frame, whose midpoint falls past the last acquired sample.
+    out = retr[:, : nt - 1].to(vol4d.dtype).T.reshape(nt - 1, nz, ny, nx)
+
+    if verbose:
+        print(f"  tween: {nt} -> {nt - 1} midpoint frames (method={method})")
+    return out
