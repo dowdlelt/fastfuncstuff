@@ -21,6 +21,9 @@ Examples
 
   # Use GPU for PCA
   ffs_util_pcwarp -warp_dir sub01_warps -n_pcs 5 -device cuda
+
+  # Also write a low-rank (denoised) warp reconstructed from the first 2 PCs
+  ffs_util_pcwarp -warp warps5d.nii.gz -n_pcs 10 -warp_pc_recon 2
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ def create_parser() -> argparse.ArgumentParser:
             "  ffs_util_pcwarp -warp_dir sub01_warps -n_pcs 10 -output warpPCs.1D\n"
             "  ffs_util_pcwarp -warp_dir sub01_warps -n_pcs 5 -axes Y\n"
             "  ffs_util_pcwarp -warp_dir sub01_warps -n_pcs 5 -device cuda\n"
+            "  ffs_util_pcwarp -warp warps5d.nii.gz -n_pcs 10 -warp_pc_recon 2\n"
         ),
     )
 
@@ -66,7 +70,36 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         metavar="N",
-        help="Number of principal components to extract.",
+        help="Number of principal components to extract (written to the .1D).",
+    )
+
+    recon = parser.add_argument_group("Low-rank reconstruction (optional)")
+    recon.add_argument(
+        "-warp_pc_recon",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Also write a warp series reconstructed from only the first K PCs — a "
+        "low-rank, temporally denoised warp (keeps the dominant shared/smooth motion, "
+        "drops high-order per-frame noise). K=all PCs reproduces the input; smaller K = "
+        "smoother. Output mirrors the input format (5D file for -warp, folder for "
+        "-warp_dir) and is a drop-in replacement for ffs_nwarp.",
+    )
+    recon.add_argument(
+        "-recon_prefix",
+        default=None,
+        metavar="PATH",
+        help="Output path for the reconstructed warp (5D file) or directory (folder "
+        "input). Default: {source stem}_pcrecon{K}.",
+    )
+    recon.add_argument(
+        "-diag_frame",
+        type=int,
+        default=10,
+        metavar="N",
+        help="With -warp_pc_recon, also save the Nth frame (1-based, default 10) of "
+        "BOTH the original and the reconstructed warp as single 4D NIfTIs "
+        "(easier to eyeball than a 5D stack). 0 disables. Clamped to the last frame.",
     )
 
     opt = parser.add_argument_group("Options")
@@ -100,9 +133,10 @@ def create_parser() -> argparse.ArgumentParser:
     )
     opt.add_argument(
         "-device",
-        default="cpu",
+        default=None,
         metavar="DEV",
-        help="Torch device for PCA computation [default: %(default)s].",
+        help="Torch device for PCA computation: cuda / mps / cpu "
+        "[default: auto-detect — cuda if available, else cpu].",
     )
     add_verbose_arg(opt, default=1)
 
@@ -143,6 +177,89 @@ def _detect_active_axes(
     return has_x, has_y, has_z
 
 
+def _write_recon(
+    scores: torch.Tensor,
+    pca,
+    k: int,
+    spatial: tuple[int, int, int],
+    active_flags: tuple[bool, bool, bool],
+    n_vols: int,
+    source: str,
+    is_dir: bool,
+    recon_prefix: str | None,
+    hdr: dict,
+    verb: int,
+    diag_idx: int | None = None,
+    orig_frame: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> str:
+    """Reconstruct the warp series from the first ``k`` PCs and write it to disk.
+
+    Low-rank reconstruction ``X_k = scores[:, :k] · components[:k] + mean`` (exact
+    for whiten=False). The columns are split back into the active x/y/z components
+    (zeros on inactive axes), un-flattened to ``(T, nz, ny, nx)``, and written in
+    the input's format (5D file for a single-file input, per-frame folder otherwise).
+
+    If ``diag_idx`` is given, also write frame ``diag_idx`` of both the original
+    (``orig_frame``) and the reconstruction as single 4D warp NIfTIs for eyeballing.
+    """
+    from fastfuncstuff.processing.io import save_warp_field, save_warp_series
+
+    nz, ny, nx = spatial
+    n_vox = nz * ny * nx
+    recon = (scores[:, :k] @ pca.components_[:k] + pca.mean_).cpu()  # (T, n_active_vox)
+
+    fields: dict[str, torch.Tensor] = {}
+    col = 0
+    for axis, on in zip("xyz", active_flags, strict=True):
+        if on:
+            fields[axis] = recon[:, col : col + n_vox].reshape(n_vols, nz, ny, nx)
+            col += n_vox
+        else:
+            fields[axis] = torch.zeros(n_vols, nz, ny, nx)
+
+    if recon_prefix is not None:
+        dest = recon_prefix
+    elif is_dir:
+        dest = f"{source.rstrip(os.sep)}_pcrecon{k}"
+    else:
+        stem = source[:-7] if source.endswith(".nii.gz") else os.path.splitext(source)[0]
+        dest = f"{stem}_pcrecon{k}.nii.gz"
+
+    # units="voxels": load_warp_series returned the on-disk (DICOM-mm) numbers
+    # verbatim, so write them back unchanged — a full-rank recon reproduces the
+    # input and ffs_nwarp consumes the result identically.
+    out = save_warp_series(
+        fields["x"],
+        fields["y"],
+        fields["z"],
+        dest,
+        as_5d=not is_dir,
+        affine=hdr["affine"],
+        units="voxels",
+    )
+    if verb >= 1:
+        print(f"  Reconstructed warp (first {k} PC{'s' if k > 1 else ''}) → {out}")
+
+    # --- Single-frame diagnostics (4D warps, one per side) ---
+    if diag_idx is not None and orig_frame is not None:
+        base = (
+            dest[:-7]
+            if dest.endswith(".nii.gz")
+            else (dest[:-4] if dest.endswith(".nii") else dest)
+        )
+        n1 = diag_idx + 1  # 1-based label in the filename
+        for tag, (xf, yf, zf) in (
+            ("orig", (orig_frame[0].cpu(), orig_frame[1].cpu(), orig_frame[2].cpu())),
+            ("recon", (fields["x"][diag_idx], fields["y"][diag_idx], fields["z"][diag_idx])),
+        ):
+            dpath = f"{base}_frame{n1}_{tag}.nii.gz"
+            save_warp_field(xf, yf, zf, dpath, affine=hdr["affine"], units="voxels")
+            if verb >= 1:
+                print(f"  Diagnostic frame {n1} ({tag}) → {dpath}")
+
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
 
@@ -153,6 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     args = parser.parse_args(argv)
+
+    # Auto-detect device unless the user forced one (cuda if available, else cpu).
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- Validate inputs: exactly one of -warp_dir / -warp ---
     if bool(args.warp_dir) == bool(args.warp):
@@ -172,12 +293,17 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: -n_pcs must be >= 1", file=sys.stderr)
         return 1
 
+    recon_k = args.warp_pc_recon
+    if recon_k is not None and recon_k < 1:
+        print("ERROR: -warp_pc_recon must be >= 1", file=sys.stderr)
+        return 1
+
     # --- Load the warp series (folder of 4D frames OR a single 5D file) ---
     from fastfuncstuff.decomposition.pca import PCA
     from fastfuncstuff.processing.io import load_warp_series
 
     try:
-        xd, yd, zd, _hdr, n_vols = load_warp_series(source, pattern=args.pattern)
+        xd, yd, zd, hdr, n_vols = load_warp_series(source, pattern=args.pattern)
     except (FileNotFoundError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
@@ -187,6 +313,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     n_pcs = min(n_pcs, n_vols - 1)
+    # Fit enough components to cover both the .1D request and any reconstruction.
+    n_fit = min(max(n_pcs, recon_k or 0), n_vols - 1)
+    if recon_k is not None:
+        recon_k = min(recon_k, n_fit)
 
     # --- Output path ---
     out_path = args.output
@@ -204,6 +334,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Pattern        : {args.pattern}")
         print(f"  Volumes found  : {n_vols}")
         print(f"  PCs requested  : {n_pcs}")
+        if recon_k is not None:
+            print(f"  Warp recon     : first {recon_k} PC(s)")
         print(f"  Output         : {out_path}")
         print(f"  Device         : {args.device}")
 
@@ -225,7 +357,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Build the (n_vols, n_active_vox) matrix from the loaded series ---
     axis_labels = [a for a, on in zip("XYZ", (do_x, do_y, do_z), strict=False) if on]
-    comps = [c for c, on in zip((xd, yd, zd), (do_x, do_y, do_z), strict=False) if on]
+    active_flags = (do_x, do_y, do_z)
+    spatial = tuple(xd.shape[1:])  # (nz, ny, nx) — needed to un-flatten a reconstruction
+
+    # Grab the original diagnostic frame (all 3 components) before freeing the series.
+    diag_idx = None
+    orig_frame = None
+    if recon_k is not None and args.diag_frame > 0:
+        diag_idx = min(args.diag_frame - 1, n_vols - 1)
+        orig_frame = (xd[diag_idx].clone(), yd[diag_idx].clone(), zd[diag_idx].clone())
+
+    comps = [c for c, on in zip((xd, yd, zd), active_flags, strict=False) if on]
     # Each component is (T, nz, ny, nx) -> flatten spatial, concat active axes.
     mat = torch.cat([c.reshape(n_vols, -1) for c in comps], dim=1).float()
     del xd, yd, zd, comps
@@ -235,14 +377,35 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Matrix shape: ({n_vols}, {mat.shape[1]})  [{'+'.join(axis_labels)}]")
         print(f"  Running PCA for {n_pcs} components on {args.device}...")
 
-    if args.device != "cpu":
-        mat = mat.to(args.device)
-
-    pca = PCA(n_components=n_pcs, device=args.device if args.device != "cpu" else None)
-    scores = pca.fit_transform(mat)  # (n_vols, n_pcs)
+    # Keep the data and the PCA on the SAME device: PCA.fit centers X in place and
+    # fit_transform relies on that, so a device mismatch (e.g. cpu data but PCA
+    # defaulting to cuda) would project uncentered data and corrupt the scores.
+    pca_device = torch.device(args.device)
+    mat = mat.to(pca_device)
+    pca = PCA(n_components=n_fit, device=pca_device)
+    scores = pca.fit_transform(mat)  # (n_vols, n_fit)
     del mat
 
+    # --- Optional low-rank reconstruction (before we normalize scores) ---
+    if recon_k is not None:
+        _write_recon(
+            scores,
+            pca,
+            recon_k,
+            spatial,
+            active_flags,
+            n_vols,
+            source,
+            is_dir,
+            args.recon_prefix,
+            hdr,
+            args.verb,
+            diag_idx,
+            orig_frame,
+        )
+
     # Normalize to unit variance for use as regressors
+    scores = scores[:, :n_pcs]
     sc_std = scores.std(dim=0, keepdim=True).clamp(min=1e-10)
     pcs = (scores / sc_std).cpu()
 
@@ -271,3 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 70)
 
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
