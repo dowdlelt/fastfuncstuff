@@ -1209,6 +1209,46 @@ def load_matrix_1D(
     return M
 
 
+def load_matrix_chain(
+    paths: list[str] | str,
+    base_affine: np.ndarray,
+    source_affine: np.ndarray,
+) -> Tensor:
+    """Load and compose a stack of ``.aff12.1D`` affines into one voxel matrix.
+
+    The stack order matches AFNI's ``-nwarp`` / ``3dNwarpCat`` catenation: the
+    list runs **base-side → source-side** (leftmost closest to the output/base
+    space, rightmost closest to the source). For example an ``epi → ref → anat``
+    alignment is passed as ``["ref2anat.aff12.1D", "epi2ref.aff12.1D"]`` and
+    yields the single ``anat → epi`` voxel map (base = anat, source = epi).
+
+    Because the files are in DICOM mm (a physical space), the catenation is a
+    plain matrix product there — the *intermediate* grids (e.g. the reference
+    image) are never needed, so no reference dataset has to be supplied. Only the
+    final ``base_affine`` (output grid) and ``source_affine`` (the volume the
+    composite maps *into*) are used, to convert the composite to voxel indices.
+
+    A single-element list reproduces ``load_matrix_1D(path, base, source)``.
+
+    Args:
+        paths: one ``.aff12.1D`` path or a base-side→source-side list of them.
+        base_affine: NIfTI affine of the final base (output) grid.
+        source_affine: NIfTI affine of the final source grid.
+
+    Returns:
+        (4, 4) voxel-index matrix mapping base voxels → source voxels.
+    """
+    if isinstance(paths, str):
+        paths = [paths]
+    if not paths:
+        raise ValueError("load_matrix_chain: empty matrix list")
+    # Compose in DICOM mm: C = M_last @ … @ M_first (each new file left-multiplies).
+    c = torch.eye(4, dtype=torch.float64)
+    for p in paths:
+        c = load_matrix_1D(p).to(torch.float64) @ c
+    return dicom_matrix_to_voxel(c.to(torch.float32), base_affine, source_affine)
+
+
 # ---------------------------------------------------------------------------
 # Utility: resample source to base grid
 # ---------------------------------------------------------------------------
