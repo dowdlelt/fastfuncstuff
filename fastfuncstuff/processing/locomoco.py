@@ -2601,6 +2601,164 @@ def estimate_residual_flow_me_scaled(
     )
 
 
+def estimate_residual_flow_me_interecho(
+    datas: list[np.ndarray],
+    echo_times: list[float],
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    backend: str = "xcorr",
+    smooth_sigma: float = 0.0,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    max_shift: float = 3.0,
+    trial_step: float = 0.5,
+    automask: bool = False,
+    automask_dilate: int = 4,
+    automask_sigma: float = 3.0,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> MultiEchoLocomocoResult:
+    """Inter-echo per-TR alignment — align the echo stack, not each echo across time.
+
+    The temporal modes reach across *time*: each echo's frame is registered to that
+    echo's own temporal template. This one reaches across *TE* instead — a shorter,
+    easier reach. Within each TR, register every echo ``n`` to its lower-TE neighbour
+    ``n-1``: same brain, nearest contrast, and only a ``ΔTE``-sized partition shift
+    between them. Because that shift is ``ΔTE_n · g(r,t)`` (the same linear-in-TE field),
+    all consecutive pairs are POOLED per TR into one per-ms field ``g`` (the shared-field
+    kernels, with each pair scaled by its ``ΔTE``), and echo ``n`` is corrected onto echo
+    1's frame by ``(TE_n − TE_1) · g``. Echo 1 (shortest TE, assumed ~undistorted) is the
+    anchor, left unchanged.
+
+    Needs no temporal averaging and exploits the strong same-TR inter-echo correlation
+    (two real volumes per estimate), but it does NOT remove echo 1's own (small) wiggle
+    that is common to every echo — follow with a temporal pass (the joint / scaled modes)
+    if that residual matters. ``w`` is stored at the echo1→echo2 step scale and ``alpha``
+    counts steps from echo 1 (``alpha_1 = 0``); ``linearity_r2`` is 1.0 (imposed).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    e = len(datas)
+    if e < 2:
+        raise ValueError(f"inter-echo needs ≥2 echoes, got {e}.")
+    if len(echo_times) != e:
+        raise ValueError(f"-echo_times has {len(echo_times)} values but there are {e} inputs.")
+    shp = datas[0].shape
+    for k, d in enumerate(datas):
+        if d.shape != shp:
+            raise ValueError(f"echo {k} shape {d.shape} != echo 0 shape {shp}.")
+    if len(shp) != 4:
+        raise ValueError(f"each -input must be 4D, got {shp}.")
+    if backend not in ("flow", "xcorr"):
+        raise ValueError(f"inter-echo backend must be flow | xcorr, got {backend!r}.")
+    nx, ny, nz, nt = shp
+
+    te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
+    dte = te[1:] - te[:-1]  # (E-1,) consecutive-pair gaps = per-pair scaling
+    if float(dte.min()) <= 0:
+        raise ValueError("-echo_times must be strictly increasing for inter-echo mode.")
+    denom = float(te[1] - te[0])  # echo1→echo2 gap: the unit w is stored in
+
+    disp_slice = slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
+    a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
+    pe_flow_is_u = pe_axis == a1
+    perm4 = [3, disp_slice, a0, a1]
+
+    vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
+    w = torch.zeros(nx, ny, nz, nt)
+    for t in tqdm(range(nt), desc="me interecho", unit="frame", leave=True, disable=nt < 3):
+        ims = [vols[j][..., t].to(device) for j in range(e)]
+        if smooth_sigma > 0:
+            ims = [_blur3d_b(im[None], smooth_sigma)[0] for im in ims]
+        fixed_list = [ims[j][None] for j in range(e - 1)]  # echo n-1 (lower TE)
+        moving_list = [ims[j + 1][None] for j in range(e - 1)]  # echo n
+        if backend == "flow":
+            g = optical_flow_lk_3d_multiecho(
+                fixed_list,
+                moving_list,
+                dte,
+                pe_axis,
+                n_levels=n_levels,
+                n_iters=n_iters,
+                window_sigma=window_sigma,
+            )[0]
+        else:
+            g = xcorr_search_flow_3d_multiecho(
+                fixed_list,
+                moving_list,
+                dte,
+                pe_axis,
+                max_shift=max_shift,
+                window_sigma=window_sigma,
+                trial_step=trial_step,
+            )[0]
+        # g is the per-ms field (both kernels return s/alpha_max = per-unit-alpha);
+        # store w at the echo1→echo2 step so |w| is an interpretable inter-echo shift.
+        w[..., t] = (denom * g).cpu()
+
+    if automask:
+        mean_series = np.mean(np.stack([np.asarray(d) for d in datas], 0), 0)
+        soft = _build_soft_mask(
+            mean_series, disp_slice, a0, a1, automask_dilate, automask_sigma, device
+        )
+        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
+        w = w * soft_xyz[..., None]
+
+    # alpha counts echo1→echo2 steps: (TE_e − TE_1)/(TE_2 − TE_1). alpha_1 = 0 (anchor).
+    alpha = (te - float(te[0])) / denom
+    per_echo: list[LocomocoResult] = []
+    for j in range(e):
+        disp_e = (alpha[j] * w).contiguous()
+        corrected = torch.zeros(nx, ny, nz, nt)
+        for t in range(nt):
+            corrected[..., t] = _shift3d_axis(
+                vols[j][..., t].to(device)[None], disp_e[..., t].to(device)[None], pe_axis
+            )[0].cpu()
+        p_canon = disp_e.permute(perm4).contiguous()
+        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
+        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        per_echo.append(
+            LocomocoResult(
+                u_canon=u_canon,
+                v_canon=v_canon,
+                corrected_canon=torch.zeros_like(p_canon),
+                perm=perm4,
+                pe_flow_is_u=pe_flow_is_u,
+                pe_axis=pe_axis,
+                slice_axis=disp_slice,
+                orig_shape=(nx, ny, nz, nt),
+                a0=a0,
+                a1=a1,
+                dual=False,
+                corrected_nifti=corrected,
+            )
+        )
+
+    if verbose:
+        ap = w.abs()
+        sel = ap[ap > 0]
+        med = float(sel.median()) if sel.numel() else 0.0
+        te_str = ", ".join(f"{float(x):.0f}" for x in te)
+        a_str = ", ".join(f"{float(x):.2f}" for x in alpha)
+        print(
+            f"🌀 locomoco ME-3D inter-echo: {e} echoes (TE {te_str} ms), {nt} frames, "
+            f"PE axis {pe_axis}, backend={backend}; echo1→echo2 step |w| median {med:.3f} vox, "
+            f"max {float(ap.max()):.3f} vox (echo 1 = anchor, uncorrected)"
+        )
+        print(f"   alpha (echo1→echo2 steps) = [{a_str}]  ·  pooled {e - 1} adjacent-echo pairs/TR")
+
+    return MultiEchoLocomocoResult(
+        per_echo=per_echo,
+        alpha=alpha,
+        echo_times=te,
+        w_field=w,
+        pe_axis=pe_axis,
+        linearity_r2=1.0,
+    )
+
+
 def warp_time_pcs(
     components: list[tuple[int, torch.Tensor]],
     n_pcs: int = 5,

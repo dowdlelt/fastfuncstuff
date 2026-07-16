@@ -12,6 +12,7 @@ import torch
 
 from fastfuncstuff.processing.locomoco import (
     _shift3d_axis,
+    estimate_residual_flow_me_interecho,
     estimate_residual_flow_me_scaled,
     estimate_residual_flow_multiecho,
     optical_flow_lk_3d_multiecho,
@@ -171,6 +172,50 @@ def test_fixed_scaling_xcorr_pools_all_echoes():
         before = float(np.asarray(datas[j])[brain].std(axis=-1).mean())
         after = float(corr.corrected_series().numpy()[brain].std(axis=-1).mean())
         assert after < 0.6 * before, (j, before, after)
+
+
+def test_interecho_aligns_stack_to_anchor():
+    """Inter-echo mode: echo n shifted by (n-1)·h_t from echo 1; recover & align to echo 1."""
+    tes = [10.0, 20.0, 30.0]  # equal ΔTE → alpha steps [0, 1, 2]
+    base = _phantom()
+    contrast = [float(np.exp(-t / 40.0)) for t in tes]
+    # Per-TR true echo1→echo2 shift h_t; echo n shifted by (n-1)·h_t (linear in TE).
+    hs = [0.0, 0.6, -0.5, 0.4, -0.6, 0.3, -0.4, 0.5]
+    datas = []
+    for step, c in enumerate(contrast):
+        series = np.zeros((*base.shape, len(hs)), np.float32)
+        for t, h in enumerate(hs):
+            series[..., t] = c * _shift3d_axis(
+                torch.from_numpy(base)[None], float(step * h), PE
+            )[0].numpy()
+        datas.append(series)
+
+    res = estimate_residual_flow_me_interecho(
+        datas,
+        tes,
+        pe_axis=PE,
+        slice_axis=PE,
+        backend="xcorr",
+        trial_step=0.1,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    # alpha counts steps from echo 1: [0, 1, 2]; echo 1 is the untouched anchor.
+    assert np.allclose(res.alpha.numpy(), [0.0, 1.0, 2.0], atol=1e-6)
+    assert np.allclose(res.per_echo[0].pe_displacement().numpy(), 0.0, atol=1e-6)
+    # w[...,t] recovers the echo1→echo2 step h_t (median over brain core).
+    core = base > np.percentile(base, 40)
+    for t in (1, 2, 4):
+        rec = float(np.median(res.w_field.numpy()[core, t]))
+        assert abs(rec - (-hs[t])) < 0.15, (t, rec, -hs[t])
+    # Corrected later echoes land on echo 1's frame: cross-echo disagreement drops.
+    def _spread(series_list, t):  # std across echoes (contrast-normalised) at frame t
+        fr = np.stack([s[core, t] / np.mean(np.abs(s[core, t])) for s in series_list], 0)
+        return float(fr.std(0).mean())
+
+    corr_list = [r.corrected_series().numpy() for r in res.per_echo]
+    for t in (2, 4):
+        assert _spread(corr_list, t) < _spread(datas, t)
 
 
 def test_flat_scaling_shifts_all_echoes_equally():

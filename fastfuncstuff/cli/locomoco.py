@@ -303,6 +303,17 @@ def create_parser() -> argparse.ArgumentParser:
         "Combine with -me_estimate_from to apply one echo's field unchanged to the rest.",
     )
     me.add_argument(
+        "-me_interecho",
+        "-me_ie",
+        action="store_true",
+        help="Inter-echo mode: align the echo STACK within each TR instead of aligning each "
+        "echo across time. Registers every echo to its lower-TE neighbour (nearest contrast, a "
+        "short ΔTE-sized reach — no temporal template), pools all adjacent pairs per TR under the "
+        "linear-in-TE scaling, and corrects each echo onto echo 1's frame. Echo 1 (shortest TE) is "
+        "the assumed-undistorted anchor. Does NOT remove echo 1's own residual wiggle — follow "
+        "with a temporal pass if needed. Ignores the -me_*_scaling / -me_estimate_from flags.",
+    )
+    me.add_argument(
         "-me_estimate_from",
         "-me_from",
         default=None,
@@ -806,30 +817,62 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             )
             return 2
 
+    if args.me_interecho and (est_idx is not None or args.me_fixed_scaling or args.me_flat_scaling):
+        print(
+            "❌ -me_interecho is its own estimation — don't combine it with -me_estimate_from / "
+            "-me_fixed_scaling / -me_flat_scaling.",
+            file=sys.stderr,
+        )
+        return 2
+
     print(
         f"🌀 ffs_locomoco -me_3depi: {len(datas)} echoes  shape={datas[0].shape}  device={device}"
     )
-    mode = f"scaled from echo {est_idx + 1}" if est_idx is not None else "joint solve"
-    if args.me_flat_scaling:
-        scaling = "flat(alpha=1)"
-    elif args.me_fixed_scaling or est_idx is not None:
-        scaling = "fixed(TE)"
+    if args.me_interecho:
+        mode, scaling = "inter-echo (align stack per TR)", "linear-in-TE (anchor=echo1)"
     else:
-        scaling = "learned"
+        mode = f"scaled from echo {est_idx + 1}" if est_idx is not None else "joint solve"
+        if args.me_flat_scaling:
+            scaling = "flat(alpha=1)"
+        elif args.me_fixed_scaling or est_idx is not None:
+            scaling = "fixed(TE)"
+        else:
+            scaling = "learned"
     print(
         f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend={args.backend}, "
         f"ref={args.ref}, mode={mode}, scaling={scaling}, "
         f"levels={args.levels}, iters={args.iters}, refine={args.refine}, "
         f"automask={'on' if automask else 'off'}"
     )
-    if args.refine == 0:
+    # The inter-echo mode has no temporal reference, so the refine bias warning is moot.
+    if args.refine == 0 and not args.me_interecho:
         print(
             f"   ℹ️  refine=0: the reference ('{args.ref}') is built from the un-corrected "
             "frames, so it still carries the wiggle and biases displacement LOW — add "
             "-refine 2/-workhard/-superhard for full magnitude."
         )
 
-    if est_idx is not None:
+    if args.me_interecho:
+        from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_interecho
+
+        result = estimate_residual_flow_me_interecho(
+            datas,
+            args.echo_times,
+            pe_axis,
+            slice_axis,
+            backend=args.backend,
+            smooth_sigma=smooth_sigma,
+            n_levels=args.levels,
+            n_iters=args.iters,
+            window_sigma=args.window,
+            max_shift=args.max_shift,
+            trial_step=args.xcorr_step,
+            automask=automask,
+            automask_dilate=args.automask_dilate,
+            automask_sigma=args.automask_sigma,
+            device=device,
+        )
+    elif est_idx is not None:
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_scaled
 
         result = estimate_residual_flow_me_scaled(
