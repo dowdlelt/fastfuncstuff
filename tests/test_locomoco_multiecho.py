@@ -173,6 +173,40 @@ def test_fixed_scaling_xcorr_pools_all_echoes():
         assert after < 0.6 * before, (j, before, after)
 
 
+def test_flat_scaling_shifts_all_echoes_equally():
+    """-me_flat_scaling: alpha=1 for all echoes (TE-independent), still pooled."""
+    tes = [12.0, 30.0, 48.0]
+    # Build echoes that all shift by the SAME amount (flat, not TE-scaled).
+    base = _phantom()
+    shifts = [0.0, 0.6, -0.5, 0.4, -0.6, 0.3]
+    contrast = [float(np.exp(-t / 40.0)) for t in tes]
+    datas = []
+    for c in contrast:
+        series = np.zeros((*base.shape, len(shifts)), np.float32)
+        for t, s in enumerate(shifts):
+            series[..., t] = c * _shift3d_axis(torch.from_numpy(base)[None], float(s), PE)[0].numpy()
+        datas.append(series)
+    res = estimate_residual_flow_multiecho(
+        datas,
+        tes,
+        pe_axis=PE,
+        slice_axis=PE,
+        backend="xcorr",
+        ref_mode="median",
+        trial_step=0.1,
+        refine_rounds=2,
+        flat_scaling=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert np.allclose(res.alpha.numpy(), [1.0, 1.0, 1.0], atol=1e-6)
+    brain = datas[0][..., 0] > np.percentile(datas[0][..., 0], 50)
+    for j, corr in enumerate(res.per_echo):
+        before = float(np.asarray(datas[j])[brain].std(axis=-1).mean())
+        after = float(corr.corrected_series().numpy()[brain].std(axis=-1).mean())
+        assert after < 0.6 * before, (j, before, after)
+
+
 def test_scaled_from_one_echo_matches_te_ratio():
     """Estimate on the LAST echo, scale to the rest by TE ratio — alpha is exact, all corrected."""
     tes = [12.0, 30.0, 48.0]

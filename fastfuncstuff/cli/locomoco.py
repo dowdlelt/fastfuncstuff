@@ -294,6 +294,15 @@ def create_parser() -> argparse.ArgumentParser:
         "alpha and data-check the scaling.",
     )
     me.add_argument(
+        "-me_flat_scaling",
+        "-me_flat",
+        action="store_true",
+        help="Like -me_fixed_scaling but FLAT: every echo shifts the SAME amount "
+        "(alpha_e = 1, not TE-scaled) while still pooling all echoes' signal into one "
+        "informed search. For acquisitions whose partition wiggle is TE-independent. "
+        "Combine with -me_estimate_from to apply one echo's field unchanged to the rest.",
+    )
+    me.add_argument(
         "-me_estimate_from",
         "-me_from",
         default=None,
@@ -763,6 +772,12 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     automask = not args.no_automask
     if args.ref is None:
         args.ref = "mean"
+    if args.me_fixed_scaling and args.me_flat_scaling:
+        print(
+            "❌ choose one of -me_fixed_scaling (TE ratio) or -me_flat_scaling (alpha=1).",
+            file=sys.stderr,
+        )
+        return 2
     te_str = ", ".join(f"{t:g}" for t in args.echo_times)
 
     # Resolve -me_estimate_from (None → joint solve across all echoes).
@@ -795,7 +810,12 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         f"🌀 ffs_locomoco -me_3depi: {len(datas)} echoes  shape={datas[0].shape}  device={device}"
     )
     mode = f"scaled from echo {est_idx + 1}" if est_idx is not None else "joint solve"
-    scaling = "fixed(TE)" if (args.me_fixed_scaling or est_idx is not None) else "learned"
+    if args.me_flat_scaling:
+        scaling = "flat(alpha=1)"
+    elif args.me_fixed_scaling or est_idx is not None:
+        scaling = "fixed(TE)"
+    else:
+        scaling = "learned"
     print(
         f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend={args.backend}, "
         f"ref={args.ref}, mode={mode}, scaling={scaling}, "
@@ -832,6 +852,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
+            flat_scaling=args.me_flat_scaling,
             device=device,
         )
     else:
@@ -856,6 +877,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
             learn_scaling=not args.me_fixed_scaling,
+            flat_scaling=args.me_flat_scaling,
             device=device,
         )
 

@@ -2187,6 +2187,7 @@ def estimate_residual_flow_multiecho(
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
     learn_scaling: bool = True,
+    flat_scaling: bool = False,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2202,7 +2203,10 @@ def estimate_residual_flow_multiecho(
 
     1. Estimate each echo independently (3-D LK / xcorr) → per-echo displacement.
     2. Rank-1 factor across echoes (seeded by the echo times) → ``alpha`` + initial ``w``.
-       ``learn_scaling=False`` skips this and fixes ``alpha_e = TE_e/TE_0``.
+       ``learn_scaling=False`` skips this and fixes ``alpha_e = TE_e/TE_0``;
+       ``flat_scaling=True`` instead fixes ``alpha_e = 1`` (every echo shifts the SAME
+       amount — for acquisitions whose partition wiggle is TE-independent) while still
+       pooling all echoes' signal.
     3. ``flow`` backend: solve ``w`` with the shared-field pooled LK
        (:func:`optical_flow_lk_3d_multiecho`) so the SNR/sensitivity pooling happens in
        image space. ``xcorr``: keep the factored ``w``.
@@ -2241,6 +2245,9 @@ def estimate_residual_flow_multiecho(
     refs = [_select_ref_vol(v, ref_mode, first_n).to(device) for v in vols]
     if smooth_sigma > 0:
         refs = [_blur3d_b(r[None], smooth_sigma)[0] for r in refs]
+
+    # A fixed scaling (TE ratio or flat) skips learning; both still pool all echoes.
+    learn = learn_scaling and not flat_scaling
 
     # Single-echo backend estimator — used to LEARN alpha (rank-1 factor of one per-echo
     # pass) and, for xcorr, to solve the shared field itself. Persistent bars (leave=True)
@@ -2311,7 +2318,7 @@ def estimate_residual_flow_multiecho(
         # learn the ratios anyway), warp-space pooling.
         if backend == "flow":
             return _joint_lk(cur_refs, tag)
-        if not learn_scaling:
+        if not learn:
             return _pooled_xcorr(cur_refs, tag)
         return _project(_per_echo_estimate(cur_refs, tag).reshape(e, -1)).reshape(nx, ny, nz, nt)
 
@@ -2326,8 +2333,9 @@ def estimate_residual_flow_multiecho(
 
     # Phase 1: learn alpha, then the initial shared field. When learning, factor ONE
     # per-echo pass; for xcorr reuse that very pass as the initial w (no second sweep).
-    alpha = te / float(te[0])
-    if learn_scaling:
+    # flat_scaling pins alpha to 1 (TE-independent shift); else the TE ratio.
+    alpha = torch.ones(e) if flat_scaling else te / float(te[0])
+    if learn:
         disp0 = _per_echo_estimate(refs, "init").reshape(e, -1)
         alpha, _ = _rank1_factor_echoes(disp0, alpha)
         w = (
@@ -2410,12 +2418,16 @@ def estimate_residual_flow_multiecho(
             )
         )
 
-    # Linearity of alpha vs TE (through the origin): r² of the 1-parameter fit.
-    slope = float((alpha * te).sum() / (te * te).sum().clamp(min=1e-12))
-    resid = alpha - slope * te
-    ss_res = float((resid * resid).sum())
-    ss_tot = float(((alpha - alpha.mean()) ** 2).sum())
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+    # Linearity of alpha vs TE (through the origin): r² of the 1-parameter fit — only
+    # meaningful when alpha was LEARNED; an imposed scaling (TE ratio or flat) is 1 by fiat.
+    if learn:
+        slope = float((alpha * te).sum() / (te * te).sum().clamp(min=1e-12))
+        resid = alpha - slope * te
+        ss_res = float((resid * resid).sum())
+        ss_tot = float(((alpha - alpha.mean()) ** 2).sum())
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+    else:
+        r2 = 1.0
 
     if verbose:
         ap = w.abs()
@@ -2423,14 +2435,17 @@ def estimate_residual_flow_multiecho(
         med = float(sel.median()) if sel.numel() else 0.0
         a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
         te_str = ", ".join(f"{float(x):.0f}" for x in te)
+        if learn:
+            tag = f"·  learned, linear-in-TE r²={r2:.4f}"
+        elif flat_scaling:
+            tag = "·  FLAT scaling (alpha=1, all echoes shift equally)"
+        else:
+            tag = "·  fixed to TE ratio"
         print(
             f"🌀 locomoco ME-3D: {e} echoes (TE {te_str} ms), {nt} frames, PE axis {pe_axis}, "
             f"backend={backend}; shared |w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
         )
-        print(
-            f"   alpha (÷echo1) = [{a_str}]  ·  linear-in-TE r²={r2:.4f}"
-            + ("" if learn_scaling else "  (fixed to TE ratio)")
-        )
+        print(f"   alpha (÷echo1) = [{a_str}]  {tag}")
 
     return MultiEchoLocomocoResult(
         per_echo=per_echo,
@@ -2464,6 +2479,7 @@ def estimate_residual_flow_me_scaled(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    flat_scaling: bool = False,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2479,6 +2495,8 @@ def estimate_residual_flow_me_scaled(
     ``estimate_idx`` is the 0-based echo to estimate on. The shared field ``w`` is stored
     echo-1-scaled and ``alpha`` is ``TE / TE_0`` (same convention as the joint path), so
     ``linearity_r2`` is 1.0 by construction (the scaling is applied, not fitted).
+    ``flat_scaling=True`` applies the SAME field to every echo (``alpha_e = 1``) — for
+    acquisitions whose partition wiggle is TE-independent.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2514,10 +2532,15 @@ def estimate_residual_flow_me_scaled(
         device=device,
         verbose=verbose,
     )
-    alpha = te / float(te[0])
-    # Rescale the echo-k field to echo-1 scale so w/alpha match the joint-path convention;
-    # the product alpha_e·w = w_k·(TE_e/TE_k) is unchanged either way.
-    w = res_k.pe_displacement() * float(te[0] / te[estimate_idx])
+    if flat_scaling:
+        # Same shift for every echo: alpha=1, w is the echo-k field applied unchanged.
+        alpha = torch.ones(e)
+        w = res_k.pe_displacement()
+    else:
+        alpha = te / float(te[0])
+        # Rescale the echo-k field to echo-1 scale so w/alpha match the joint-path
+        # convention; the product alpha_e·w = w_k·(TE_e/TE_k) is unchanged either way.
+        w = res_k.pe_displacement() * float(te[0] / te[estimate_idx])
     nx, ny, nz, nt = w.shape
     perm4, pe_flow_is_u = res_k.perm, res_k.pe_flow_is_u
     disp_slice, a0, a1 = res_k.slice_axis, res_k.a0, res_k.a1
@@ -2560,12 +2583,13 @@ def estimate_residual_flow_me_scaled(
         med = float(sel.median()) if sel.numel() else 0.0
         te_str = ", ".join(f"{float(x):.0f}" for x in te)
         a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
+        scale_note = "FLAT (alpha=1, all echoes equal)" if flat_scaling else "TE-linear"
         print(
             f"🌀 locomoco ME-3D (scaled from echo {estimate_idx + 1}, "
             f"TE {float(te[estimate_idx]):.0f} ms): {e} echoes (TE {te_str} ms), {nt} frames; "
-            f"echo-1 |w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
+            f"|w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
         )
-        print(f"   alpha (÷echo1) = [{a_str}]  ·  TE-linear scaling applied (not fitted)")
+        print(f"   alpha (÷echo1) = [{a_str}]  ·  {scale_note} scaling applied (not fitted)")
 
     return MultiEchoLocomocoResult(
         per_echo=per_echo,
