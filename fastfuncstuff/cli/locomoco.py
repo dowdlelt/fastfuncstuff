@@ -781,8 +781,14 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
 
     automask = not args.no_automask
+    ref_was_set = args.ref is not None  # distinguish an explicit -ref from the default
     if args.ref is None:
         args.ref = "mean"
+    if args.me_interecho and ref_was_set:
+        print(
+            f"   ℹ️  -ref '{args.ref}' is ignored under -me_interecho: there is no temporal "
+            "template — each echo registers to its adjacent lower-TE echo at the same TR."
+        )
     if args.me_fixed_scaling and args.me_flat_scaling:
         print(
             "❌ choose one of -me_fixed_scaling (TE ratio) or -me_flat_scaling (alpha=1).",
@@ -838,10 +844,13 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             scaling = "fixed(TE)"
         else:
             scaling = "learned"
+    # ref / refine are temporal-template knobs — inert under inter-echo (no template).
+    ref_note = "ref=n/a" if args.me_interecho else f"ref={args.ref}"
+    refine_note = "refine=n/a" if args.me_interecho else f"refine={args.refine}"
     print(
         f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend={args.backend}, "
-        f"ref={args.ref}, mode={mode}, scaling={scaling}, "
-        f"levels={args.levels}, iters={args.iters}, refine={args.refine}, "
+        f"{ref_note}, mode={mode}, scaling={scaling}, "
+        f"levels={args.levels}, iters={args.iters}, {refine_note}, "
         f"automask={'on' if automask else 'off'}"
     )
     # The inter-echo mode has no temporal reference, so the refine bias warning is moot.
