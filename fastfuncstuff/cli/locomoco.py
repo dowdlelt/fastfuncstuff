@@ -824,8 +824,9 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     )
     if args.refine == 0:
         print(
-            "   ℹ️  refine=0: the reference is the motion-blurred frame mean, which biases "
-            "displacement LOW — add -refine 2/-workhard/-superhard for full magnitude."
+            f"   ℹ️  refine=0: the reference ('{args.ref}') is built from the un-corrected "
+            "frames, so it still carries the wiggle and biases displacement LOW — add "
+            "-refine 2/-workhard/-superhard for full magnitude."
         )
 
     if est_idx is not None:
