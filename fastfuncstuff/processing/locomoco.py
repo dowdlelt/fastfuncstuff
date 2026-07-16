@@ -1766,6 +1766,7 @@ def xcorr_search_flow_3d(
     eps: float = 1e-4,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """3-D cross-correlation searchlight along PE — the "big block" xcorr for 3-D EPI.
 
@@ -1776,7 +1777,9 @@ def xcorr_search_flow_3d(
 
     Returns ``(field, conf)``; ``noshift_margin`` / ``reg_sigma`` are the searchlight
     robustness knobs and ``conf`` the quality map — see
-    :func:`_searchlight_field_and_conf`.
+    :func:`_searchlight_field_and_conf`. If ``curve_out`` is given, the per-voxel
+    correlation at every trial offset is appended to it (``nd`` tensors ``(B,X,Y,Z)``,
+    in offset order ``-r … +r``) — the raw search landscape, for diagnostics.
     """
     import math
 
@@ -1804,6 +1807,8 @@ def xcorr_search_flow_3d(
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
         corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+        if curve_out is not None:
+            curve_out.append(corr.detach().cpu())
         if abs(s) < trial_step * 0.5 + 1e-6:
             zero_val = corr
         yp1 = torch.where(need == 2, corr, yp1)
@@ -2167,6 +2172,7 @@ def xcorr_search_flow_3d_multiecho(
     eps: float = 1e-4,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shared-parameter 3-D xcorr searchlight across echoes — TE-linearity enforced.
 
@@ -2186,6 +2192,8 @@ def xcorr_search_flow_3d_multiecho(
     ``w = s/alpha_m`` ``(B,X,Y,Z)`` (so ``alpha_e·w`` recovers each echo's shift, matching
     the joint path) and the pooled searchlight quality map. ``noshift_margin`` /
     ``reg_sigma`` are the robustness knobs — see :func:`_searchlight_field_and_conf`.
+    If ``curve_out`` is given, the pooled correlation at every trial offset (the search
+    variable ``s`` = echo-``m`` shift) is appended to it (``nd`` tensors, offset order).
     """
     import math
 
@@ -2226,6 +2234,8 @@ def xcorr_search_flow_3d_multiecho(
             corr = (_win(fixed_list[j] * mw) - mean_f[j] * mean_m) / torch.sqrt(var_f[j] * var_m)
             pooled = pooled + wgt[j] * corr
         pooled = pooled / wsum
+        if curve_out is not None:
+            curve_out.append(pooled.detach().cpu())
         if abs(s) < trial_step * 0.5 + 1e-6:
             zero_val = pooled
         yp1 = torch.where(need == 2, pooled, yp1)
@@ -2269,6 +2279,8 @@ class MultiEchoLocomocoResult:
     pe_axis: int
     linearity_r2: float
     confidence: torch.Tensor | None = None  # (nx,ny,nz,T) searchlight quality map, if xcorr
+    corr_curve: torch.Tensor | None = None  # (nx,ny,nz,nd) per-voxel corr vs offset, one frame
+    corr_offsets: torch.Tensor | None = None  # (nd,) the trial offsets (voxels) for corr_curve
 
 
 def _rank1_factor_echoes(disps: torch.Tensor, alpha_init: torch.Tensor, n_iter: int = 8):
@@ -2318,6 +2330,7 @@ def estimate_residual_flow_multiecho(
     flat_scaling: bool = False,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2399,6 +2412,9 @@ def estimate_residual_flow_multiecho(
     # final _pooled_xcorr call and surfaced on the result for a `-save_confidence` diag.
     pooled_conf = torch.zeros(nx, ny, nz, nt)
     have_pooled_conf = False
+    curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
+    corr_curve: torch.Tensor | None = None
+    corr_offsets: torch.Tensor | None = None
 
     def _per_echo_estimate(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
         out = torch.zeros(e, nx, ny, nz, nt)
@@ -2433,12 +2449,13 @@ def estimate_residual_flow_multiecho(
         return out
 
     def _pooled_xcorr(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
-        nonlocal have_pooled_conf
+        nonlocal have_pooled_conf, corr_curve, corr_offsets
         out = torch.zeros(nx, ny, nz, nt)
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
             movs = [vols[j][..., t].to(device) for j in range(e)]
             if smooth_sigma > 0:
                 movs = [_blur3d_b(m[None], smooth_sigma)[0] for m in movs]
+            curve_acc: list[torch.Tensor] | None = [] if t == curve_frame else None
             w_be, c_be = xcorr_search_flow_3d_multiecho(
                 [r[None] for r in cur_refs],
                 [m[None] for m in movs],
@@ -2449,9 +2466,14 @@ def estimate_residual_flow_multiecho(
                 trial_step=trial_step,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
+                curve_out=curve_acc,
             )
             out[..., t] = w_be[0].cpu()
             pooled_conf[..., t] = c_be[0].cpu()
+            if curve_acc is not None:
+                corr_curve = torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
+                rr = float(max(1, int(np.ceil(max_shift))))
+                corr_offsets = torch.arange(-rr, rr + 1e-6, trial_step)
         have_pooled_conf = True
         return out
 
@@ -2599,6 +2621,8 @@ def estimate_residual_flow_multiecho(
         pe_axis=pe_axis,
         linearity_r2=r2,
         confidence=pooled_conf if have_pooled_conf else None,
+        corr_curve=corr_curve,
+        corr_offsets=corr_offsets,
     )
 
 
@@ -2767,6 +2791,7 @@ def estimate_residual_flow_me_interecho(
     automask_sigma: float = 3.0,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2861,6 +2886,9 @@ def estimate_residual_flow_me_interecho(
 
     w = torch.zeros(nx, ny, nz, nt)
     conf = torch.zeros(nx, ny, nz, nt) if backend == "xcorr" else None
+    curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
+    corr_curve: torch.Tensor | None = None
+    corr_offsets: torch.Tensor | None = None
     for t in tqdm(range(nt), desc="me interecho", unit="frame", leave=True, disable=nt < 3):
         ims = [vols[j][..., t].to(device) for j in range(e)]
         if smooth_sigma > 0:
@@ -2880,6 +2908,7 @@ def estimate_residual_flow_me_interecho(
             )[0]
         else:
             weights = [pm[None] for pm in pair_masks] if pair_masks is not None else None
+            curve_acc: list[torch.Tensor] | None = [] if t == curve_frame else None
             g_be, c_be = xcorr_search_flow_3d_multiecho(
                 fixed_list,
                 moving_list,
@@ -2891,10 +2920,16 @@ def estimate_residual_flow_me_interecho(
                 weights=weights,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
+                curve_out=curve_acc,
             )
             g = g_be[0]
             if conf is not None:
                 conf[..., t] = c_be[0].cpu()
+            if curve_acc is not None:
+                # (nd,B,X,Y,Z) → (X,Y,Z,nd): a 4-D per-voxel search landscape for one TR.
+                corr_curve = torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
+                rr = float(max(1, int(np.ceil(max_shift))))
+                corr_offsets = torch.arange(-rr, rr + 1e-6, trial_step)
         # g is the per-ms field (both kernels return s/alpha_max = per-unit-alpha);
         # store w at the echo1→echo2 step so |w| is an interpretable inter-echo shift.
         w[..., t] = (denom * g).cpu()
@@ -2962,6 +2997,8 @@ def estimate_residual_flow_me_interecho(
         pe_axis=pe_axis,
         linearity_r2=1.0,
         confidence=conf,
+        corr_curve=corr_curve,
+        corr_offsets=corr_offsets,
     )
 
 

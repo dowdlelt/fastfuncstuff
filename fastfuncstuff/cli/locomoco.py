@@ -632,6 +632,21 @@ def create_parser() -> argparse.ArgumentParser:
         "weight the field-regularizer (-reg_sigma) trusts. High where the shift is "
         "well-determined, ~0 in dropout/noise. A diagnostic for where the warp is real.",
     )
+    out.add_argument(
+        "-save_corr_curve",
+        "-save-corr-curve",
+        nargs="?",
+        type=int,
+        const=-1,
+        default=None,
+        metavar="FRAME",
+        help="[xcorr multi-echo] Also write the full per-voxel correlation-vs-offset "
+        "SEARCH LANDSCAPE for one frame ({prefix}_locomoco_corrcurve, 4-D: x,y,z,offset). "
+        "The 4th axis is the trial shift from -max_shift to +max_shift (step -xcorr_step); "
+        "scrub it like a timeseries to see each voxel's correlation curve and judge whether "
+        "the peak is clean/unimodal. Bare flag = middle frame; give a frame index to pick. "
+        "The offsets are printed and written to {prefix}_locomoco_corrcurve_offsets.1D.",
+    )
     out.add_argument("-no_movie", action="store_true", help="Skip the flow movie.")
     out.add_argument(
         "-no_flow",
@@ -817,6 +832,12 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         inplane_mm = float(np.mean([vox[in_plane[0]], vox[in_plane[1]]]))
         smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
 
+    # Correlation-curve frame: bare -save_corr_curve (const -1) → middle frame.
+    corr_curve_frame = None
+    if args.save_corr_curve is not None:
+        nt = datas[0].shape[3]
+        corr_curve_frame = nt // 2 if args.save_corr_curve == -1 else args.save_corr_curve
+
     automask = not args.no_automask
     ref_was_set = args.ref is not None  # distinguish an explicit -ref from the default
     if args.ref is None:
@@ -917,6 +938,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask_sigma=args.automask_sigma,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            save_corr_curve=corr_curve_frame,
             device=device,
         )
     elif est_idx is not None:
@@ -973,6 +995,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             flat_scaling=args.me_flat_scaling,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            save_corr_curve=corr_curve_frame,
             device=device,
         )
 
@@ -1020,6 +1043,26 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
                 "one — the flow backend and learn-alpha joint solve have no per-voxel "
                 "quality; use -backend xcorr with -me_fixed_scaling / -me_flat_scaling / "
                 "-me_interecho)."
+            )
+
+    if args.save_corr_curve is not None:
+        if result.corr_curve is not None and result.corr_offsets is not None:
+            curve_path = f"{stem}_locomoco_corrcurve{ext}"
+            with spinner(f"Writing {Path(curve_path).name}"):
+                save_nifti(result.corr_curve.numpy(), curve_path, affine=affine)
+            off = result.corr_offsets.tolist()
+            off_path = f"{stem}_locomoco_corrcurve_offsets.1D"
+            with open(off_path, "w") as f:
+                f.write(f"# ffs_locomoco corr-curve trial offsets (voxels), frame {corr_curve_frame}\n")
+                f.write("  " + "  ".join(f"{o:g}" for o in off) + "\n")
+            off_str = ", ".join(f"{o:g}" for o in off)
+            print(f"  • per-voxel corr landscape 4D (frame {corr_curve_frame}): {curve_path}")
+            print(f"    offset axis (vox): [{off_str}]  → also {off_path}")
+        else:
+            print(
+                "  • -save_corr_curve: no landscape (only the xcorr searchlight pools a "
+                "single per-voxel curve — use -backend xcorr with -me_fixed_scaling / "
+                "-me_flat_scaling / -me_interecho, not the flow or -me_estimate_from paths)."
             )
 
     print("✅ ffs_locomoco -me_3depi complete.")

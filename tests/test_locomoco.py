@@ -675,6 +675,30 @@ def test_xcorr_3d_returns_nonneg_confidence_matching_shape():
     assert float(conf[0, 8:-8, 8:-8, 4:-4].mean()) > 0.0
 
 
+def test_xcorr_3d_curve_out_captures_full_landscape():
+    """curve_out collects the per-voxel correlation at every trial offset; the discrete
+    argmax of that curve agrees with where the returned field points."""
+    vol = _phantom3d()
+    moved = _yshift3d(vol, -0.8)  # pull shift is +0.8
+    curve: list[torch.Tensor] = []
+    field, _conf = xcorr_search_flow_3d(
+        torch.from_numpy(vol)[None],
+        torch.from_numpy(moved)[None],
+        pe_axis=1,
+        max_shift=3,
+        trial_step=0.5,
+        reg_sigma=0.0,
+        curve_out=curve,
+    )
+    offsets = torch.arange(-3.0, 3.0 + 1e-6, 0.5)
+    assert len(curve) == len(offsets)
+    assert all(c.shape == field.shape for c in curve)
+    stack = torch.stack(curve, 0)[:, 0]  # (nd, X, Y, Z)
+    argmax_off = offsets[stack.argmax(0)]  # per-voxel discrete peak offset
+    core = argmax_off[6:-6, 6:-6, 3:-3]
+    assert abs(float(core.mean()) - 0.8) < 0.4  # nearest grid to the true +0.8 shift
+
+
 def test_xcorr_reg_sigma_suppresses_dropout_rail():
     """Confidence-weighted smoothing (reg_sigma>0) fills a signal-void patch — where the
     search rails at ±max_shift — from its confident neighbours, instead of leaving the
