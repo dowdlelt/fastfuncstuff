@@ -2742,12 +2742,17 @@ def estimate_residual_flow_me_interecho(
         med = float(sel.median()) if sel.numel() else 0.0
         te_str = ", ".join(f"{float(x):.0f}" for x in te)
         a_str = ", ".join(f"{float(x):.2f}" for x in alpha)
+        amax = float(ap.max())
         print(
             f"🌀 locomoco ME-3D inter-echo: {e} echoes (TE {te_str} ms), {nt} frames, "
             f"PE axis {pe_axis}, backend={backend}; echo1→echo2 step |w| median {med:.3f} vox, "
-            f"max {float(ap.max()):.3f} vox (echo 1 = anchor, uncorrected)"
+            f"max {amax:.3f} vox (echo 1 = anchor, uncorrected)"
         )
         print(f"   alpha (echo1→echo2 steps) = [{a_str}]  ·  pooled {e - 1} adjacent-echo pairs/TR")
+        # Per-echo CUMULATIVE correction = alpha_e · w — this is where the TE scaling shows:
+        # each echo's applied displacement is its step count times the shared per-step field.
+        disp_str = "  ".join(f"e{j + 1}={float(alpha[j]) * med:.3f}" for j in range(e))
+        print(f"   applied |disp| median (vox): {disp_str}   (= alpha_e · step field)")
 
     return MultiEchoLocomocoResult(
         per_echo=per_echo,
