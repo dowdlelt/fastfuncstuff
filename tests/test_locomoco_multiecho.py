@@ -218,6 +218,68 @@ def test_interecho_aligns_stack_to_anchor():
         assert _spread(corr_list, t) < _spread(datas, t)
 
 
+def test_erode_6conn_peels_one_voxel_shell():
+    from fastfuncstuff.processing.mask import _erode_6conn
+
+    m = torch.zeros(9, 9, 9, dtype=torch.bool)
+    m[2:7, 2:7, 2:7] = True  # solid 5³ block
+    e1 = _erode_6conn(m, 1)
+    assert bool(e1[4, 4, 4])  # core survives
+    assert not bool(e1[2, 4, 4])  # face shell peeled
+    assert int(e1.sum()) == 3 * 3 * 3  # 5³ eroded by 1 → 3³
+
+
+def _dropout_echoes(tes, h, dropout_slabs):
+    """Bright brain-blob echoes shifted by (n-1)·h along PE, with per-echo dropout slabs.
+
+    ``dropout_slabs[e]`` is an (x0, x1) block zeroed in echo e (simulating T2* signal loss).
+    """
+    nx, ny, nz = 40, 40, 12
+    x, y, z = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    r = ((x - 20) / 15.0) ** 2 + ((y - 20) / 15.0) ** 2 + ((z - 6) / 5.0) ** 2
+    tex = np.sin(x / 4.0) * np.cos(y / 3.0) + 0.5 * np.sin((x + z) / 3.0)
+    base = ((r < 1.0) * (2.0 + 0.4 * tex)).astype(np.float32)  # bright blob, ~0 outside
+    T = 6
+    datas = []
+    for step, te in enumerate(tes):
+        c = float(np.exp(-te / 40.0))
+        series = np.zeros((nx, ny, nz, T), np.float32)
+        for t in range(T):
+            series[..., t] = c * _shift3d_axis(
+                torch.from_numpy(base)[None], float(step * h), PE
+            )[0].numpy()
+        if dropout_slabs.get(step) is not None:
+            x0, x1 = dropout_slabs[step]
+            series[x0:x1] = 0.0  # signal dropout
+        datas.append(series)
+    return datas
+
+
+def test_interecho_automask_gates_dropout():
+    """Deep dropout (echo 2 AND 3 gone) must be gated to ~0, not railed to max_shift."""
+    tes = [10.0, 20.0, 30.0]
+    h = 0.8
+    # echo 2 loses x∈[6,12]; echo 3 loses the larger x∈[4,14] (⊇ echo 2's) — so x∈[6,12]
+    # is deep dropout (both gone) and must be gated; echo 1 keeps full signal everywhere.
+    slabs = {1: (6, 12), 2: (4, 14)}
+    datas = _dropout_echoes(tes, h, slabs)
+    common = dict(pe_axis=PE, slice_axis=PE, backend="xcorr", trial_step=0.1,
+                  max_shift=3.0, device=torch.device("cpu"), verbose=False)
+
+    railed = estimate_residual_flow_me_interecho(datas, tes, automask=False, **common)
+    gated = estimate_residual_flow_me_interecho(datas, tes, automask=True, **common)
+
+    brain = datas[0][..., 0] > 0.5  # echo-1 signal region (full blob)
+    deep = np.zeros_like(brain)
+    deep[6:12] = True
+    deep &= brain  # deep-dropout voxels that are still inside the blob
+    # Un-masked: the search rails in the dropout (large |w|). Masked: gated toward 0.
+    assert float(np.abs(gated.w_field.numpy()[deep]).mean()) < 0.2
+    assert float(np.abs(gated.w_field.numpy()[deep]).mean()) < 0.5 * float(
+        np.abs(railed.w_field.numpy()[deep]).mean()
+    )
+
+
 def test_flat_scaling_shifts_all_echoes_equally():
     """-me_flat_scaling: alpha=1 for all echoes (TE-independent), still pooled."""
     tes = [12.0, 30.0, 48.0]

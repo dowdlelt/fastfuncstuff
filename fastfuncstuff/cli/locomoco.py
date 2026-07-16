@@ -877,7 +877,6 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             max_shift=args.max_shift,
             trial_step=args.xcorr_step,
             automask=automask,
-            automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
             device=device,
         )

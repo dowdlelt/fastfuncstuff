@@ -2615,7 +2615,6 @@ def estimate_residual_flow_me_interecho(
     max_shift: float = 3.0,
     trial_step: float = 0.5,
     automask: bool = False,
-    automask_dilate: int = 4,
     automask_sigma: float = 3.0,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -2637,6 +2636,13 @@ def estimate_residual_flow_me_interecho(
     that is common to every echo — follow with a temporal pass (the joint / scaled modes)
     if that residual matters. ``w`` is stored at the echo1→echo2 step scale and ``alpha``
     counts steps from echo 1 (``alpha_1 = 0``); ``linearity_r2`` is 1.0 (imposed).
+
+    ``automask`` gates out signal-dropout regions: later echoes lose signal where the
+    shorter echo still has it, and a searchlight there rails at ``max_shift``. For each
+    pair the *later* echo's temporal mean is automasked and eroded by the searchlight
+    radius (``ceil(window_sigma)`` voxels), so we only search where the later echo has
+    valid signal; those masks weight each pair's xcorr, and their feathered union gates
+    the output ``w``. The model is therefore only trusted out to echo 2's mask floor.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2667,6 +2673,37 @@ def estimate_residual_flow_me_interecho(
     perm4 = [3, disp_slice, a0, a1]
 
     vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
+
+    # Dropout masking: late echoes lose signal in high-susceptibility regions, where
+    # correlating echo n against n-1 is pure noise and the xcorr search rails at
+    # ±max_shift. So restrict each pair to where its LATER (moving) echo has signal —
+    # a per-echo automask ERODED by the searchlight radius so no window reaches into
+    # dropout. Pair j is then weighted by echo (j+1)'s mask; where a late echo has
+    # dropped out but an earlier one survives, the earlier pair still carries the shared
+    # field (the linear model lets us apply alpha_e·w to the dropped-out echo anyway).
+    # The warp's validity floor is thus echo 2's mask (the union of the moving-echo masks).
+    pair_masks: list[torch.Tensor] | None = None
+    gate: torch.Tensor | None = None
+    if automask:
+        from .mask import _erode_6conn
+        from .mask import automask as _automask
+
+        erode_vox = max(1, int(np.ceil(window_sigma)))
+        pair_masks = []
+        for j in range(e - 1):
+            ref_zyx = vols[j + 1].mean(dim=3).permute(2, 1, 0).contiguous().to(device)  # later echo
+            m = _automask(ref_zyx, dilate_extra=0, device=device)
+            m = _erode_6conn(m, erode_vox)
+            pair_masks.append(m.permute(2, 1, 0).contiguous().float())  # (nx, ny, nz)
+        union = torch.stack(pair_masks, 0).amax(0)  # ≈ echo-2 mask (largest, least dropout)
+        gate = _gaussian_blur3d(union, automask_sigma).cpu()  # feather the warp to 0 at edges
+        if verbose:
+            frac = float(union.mean())
+            print(
+                f"   dropout mask: per-pair later-echo automask eroded {erode_vox} vox "
+                f"(window {window_sigma:g}); warp valid in {frac * 100:.0f}% of FoV (echo-2 floor)"
+            )
+
     w = torch.zeros(nx, ny, nz, nt)
     for t in tqdm(range(nt), desc="me interecho", unit="frame", leave=True, disable=nt < 3):
         ims = [vols[j][..., t].to(device) for j in range(e)]
@@ -2675,6 +2712,7 @@ def estimate_residual_flow_me_interecho(
         fixed_list = [ims[j][None] for j in range(e - 1)]  # echo n-1 (lower TE)
         moving_list = [ims[j + 1][None] for j in range(e - 1)]  # echo n
         if backend == "flow":
+            # LK has no per-pair weighting yet; dropout is handled by gating the output.
             g = optical_flow_lk_3d_multiecho(
                 fixed_list,
                 moving_list,
@@ -2685,6 +2723,7 @@ def estimate_residual_flow_me_interecho(
                 window_sigma=window_sigma,
             )[0]
         else:
+            weights = [pm[None] for pm in pair_masks] if pair_masks is not None else None
             g = xcorr_search_flow_3d_multiecho(
                 fixed_list,
                 moving_list,
@@ -2693,18 +2732,16 @@ def estimate_residual_flow_me_interecho(
                 max_shift=max_shift,
                 window_sigma=window_sigma,
                 trial_step=trial_step,
+                weights=weights,
             )[0]
         # g is the per-ms field (both kernels return s/alpha_max = per-unit-alpha);
         # store w at the echo1→echo2 step so |w| is an interpretable inter-echo shift.
         w[..., t] = (denom * g).cpu()
 
-    if automask:
-        mean_series = np.mean(np.stack([np.asarray(d) for d in datas], 0), 0)
-        soft = _build_soft_mask(
-            mean_series, disp_slice, a0, a1, automask_dilate, automask_sigma, device
-        )
-        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
-        w = w * soft_xyz[..., None]
+    if gate is not None:
+        # Zero (feathered) the warp outside the signal region so masked-out dropout
+        # voxels — where the search railed — carry no correction.
+        w = w * gate[..., None]
 
     # alpha counts echo1→echo2 steps: (TE_e − TE_1)/(TE_2 − TE_1). alpha_1 = 0 (anchor).
     alpha = (te - float(te[0])) / denom

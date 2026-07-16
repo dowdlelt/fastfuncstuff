@@ -100,6 +100,28 @@ def _dilate_6conn(mask: Tensor, iterations: int = 2) -> Tensor:
     return x[0, 0] > 0.5
 
 
+def _erode_6conn(mask: Tensor, iterations: int = 1) -> Tensor:
+    """Erode with 6-connectivity: a voxel survives only if it AND all 6 face neighbors
+    are set. The morphological dual of :func:`_dilate_6conn` (voxels within
+    ``iterations`` of the boundary — including the FoV edge — are peeled)."""
+    if iterations <= 0:
+        return mask
+    kernel = torch.zeros(1, 1, 3, 3, 3, device=mask.device, dtype=torch.float32)
+    kernel[0, 0, 1, 1, 1] = 1  # center
+    kernel[0, 0, 0, 1, 1] = 1  # -z
+    kernel[0, 0, 2, 1, 1] = 1  # +z
+    kernel[0, 0, 1, 0, 1] = 1  # -y
+    kernel[0, 0, 1, 2, 1] = 1  # +y
+    kernel[0, 0, 1, 1, 0] = 1  # -x
+    kernel[0, 0, 1, 1, 2] = 1  # +x
+
+    x = mask.float()[None, None]
+    for _ in range(iterations):
+        s = F.conv3d(x, kernel, padding=1)  # zero-pad → FoV-edge voxels lose neighbours
+        x = (s >= 6.5).float()  # all 7 (self + 6 faces) set
+    return x[0, 0] > 0.5
+
+
 # 18-connectivity kernel for neighbor counting (matching AFNI's NN2)
 def _count_neighbors_18(mask: Tensor) -> Tensor:
     """Count number of set 18-neighbors for each voxel.
