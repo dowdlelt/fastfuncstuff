@@ -1947,6 +1947,636 @@ def _run_3dacq_plain(
     )
 
 
+# ── multi-echo 3-D EPI (idea 4: -me_3depi) ────────────────────────────────────
+# Multi-echo 3-D-EPI acquires the same volume at several echo times. The residual
+# partition-direction (2nd phase-encode / slice) wiggle -is3dacq corrects is one
+# shared dynamic off-resonance field, but its magnitude SCALES with echo time:
+# echo e's displacement is ``alpha_e · w(r,t)`` — same spatial pattern, same time
+# course, one scalar per echo (physically a global readout property, so the whole
+# spatial pattern lives in the shared field w and the echo dependence is a single
+# number → a rank-1 family across the echo axis).
+#
+# Estimating each echo alone and warping it by its own field re-breaks the "a voxel
+# is the same voxel across echoes" rule (independent noise per echo). The joint
+# solve keeps it: fit ONE w(r,t) pooled across echoes and correct echo e by
+# ``alpha_e · w``, so every echo lands back on the same undistorted grid. Pooling
+# also complements the echoes' strengths — early echoes are high-SNR but low-
+# displacement (insensitive), late echoes low-SNR but high-displacement (sensitive)
+# — the shared-field LK weights each echo by ``alpha_e² · gradient²`` automatically.
+#
+# ``alpha`` is LEARNED from the data (rank-1 factor of the per-echo estimates),
+# then reported against the echo times: if alpha_e/TE_e is constant the scaling is
+# linear as expected; a sign flip flags an alternating-blip scheme. -echo_times
+# seeds it. Static differential distortion across echoes (later echoes more warped
+# at rest) is a fieldmap/topup job and stays out of scope — this is the dynamic
+# residual only.
+
+
+def optical_flow_lk_3d_multiecho(
+    fixed_list: list[torch.Tensor],
+    moving_list: list[torch.Tensor],
+    alpha: torch.Tensor,
+    pe_axis: int,
+    *,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    reg: float = 1e-3,
+) -> torch.Tensor:
+    """Shared-field 1-DOF (PE-axis) pyramidal LK across echoes ``(B,X,Y,Z)``.
+
+    ``fixed_list`` / ``moving_list`` are the E per-echo reference / moving volumes;
+    ``alpha`` is the ``(E,)`` per-echo scaling. Solves for ONE displacement ``w`` such
+    that echo ``e`` is warped by ``alpha_e·w``, pooling the Gauss-Newton normal
+    equations over echoes: ``step = -Σ_e α_e·⟨∇·r⟩ / (Σ_e α_e²·⟨∇²⟩ + reg)`` under a
+    Gaussian window. Reduces to :func:`optical_flow_lk_3d` for a single echo with
+    ``alpha=[1]``. Returns the shared PE-axis pull displacement ``w`` ``(B,X,Y,Z)``.
+    """
+    e = len(fixed_list)
+    fpyr = [[f] for f in fixed_list]
+    mpyr = [[m] for m in moving_list]
+    for _ in range(n_levels - 1):
+        if min(fpyr[0][-1].shape[1:]) < 8:
+            break
+        for j in range(e):
+            fpyr[j].append(F.avg_pool3d(_blur3d_b(fpyr[j][-1], 1.0).unsqueeze(1), 2).squeeze(1))
+            mpyr[j].append(F.avg_pool3d(_blur3d_b(mpyr[j][-1], 1.0).unsqueeze(1), 2).squeeze(1))
+    nlev = len(fpyr[0])
+
+    disp = torch.zeros_like(fpyr[0][-1])
+    for lvl in range(nlev - 1, -1, -1):
+        fx0 = fpyr[0][lvl]
+        if disp.shape[1:] != fx0.shape[1:]:
+            scale = fx0.shape[pe_axis + 1] / disp.shape[pe_axis + 1]
+            disp = (
+                F.interpolate(
+                    disp.unsqueeze(1),
+                    size=tuple(fx0.shape[1:]),
+                    mode="trilinear",
+                    align_corners=True,
+                ).squeeze(1)
+                * scale
+            )
+        for _ in range(n_iters):
+            num = torch.zeros_like(disp)
+            den = torch.zeros_like(disp)
+            for j in range(e):
+                a = float(alpha[j])
+                mw = _shift3d_axis(mpyr[j][lvl], a * disp, pe_axis)
+                it = mw - fpyr[j][lvl]
+                ip = _grad_axis_3d(mw, pe_axis)
+                num = num + a * _blur3d_b(ip * it, window_sigma)
+                den = den + (a * a) * _blur3d_b(ip * ip, window_sigma)
+            disp = disp - num / (den + reg)
+    return disp
+
+
+def xcorr_search_flow_3d_multiecho(
+    fixed_list: list[torch.Tensor],
+    moving_list: list[torch.Tensor],
+    alpha: torch.Tensor,
+    pe_axis: int,
+    *,
+    max_shift: float = 3.0,
+    window_sigma: float = 2.0,
+    trial_step: float = 0.5,
+    weights: list[torch.Tensor] | None = None,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """Shared-parameter 3-D xcorr searchlight across echoes — TE-linearity enforced.
+
+    ONE displacement is searched for all echoes at once under the hard constraint
+    ``disp_e = alpha_e · w``. The search variable ``s`` is the shift of the largest-alpha
+    echo ``m`` (biggest, most detectable displacement, and ``s`` stays within
+    ``max_shift``); echo ``e`` is trial-shifted by ``(alpha_e/alpha_m)·s`` and the
+    SNR-weighted sum of the per-echo local normalised correlations is maximised per voxel
+    (streaming running-peak, sub-voxel 5-point parabola — the single-echo
+    :func:`xcorr_search_flow_3d` machinery, pooled). This is the searchlight's robustness
+    with every echo's SNR folded into one informed search, rather than searching each echo
+    alone and averaging the answers.
+
+    ``weights`` are per-echo pooling weights ``(B,X,Y,Z)`` (default: each echo's local
+    signal energy ``var_f`` — a per-voxel SNR proxy that fades out dropout regions in the
+    late echoes). Returns the ECHO-1-scaled shared displacement ``w = s/alpha_m``
+    ``(B,X,Y,Z)`` (so ``alpha_e·w`` recovers each echo's shift), matching the joint path.
+    """
+    import math
+
+    e = len(fixed_list)
+    m = int(torch.argmax(alpha))
+    ratio = [float(alpha[j] / alpha[m]) for j in range(e)]  # ≤ 1
+    r = float(max(1, int(math.ceil(max_shift))))
+
+    def _win(x: torch.Tensor) -> torch.Tensor:
+        return _blur3d_b(x, window_sigma)
+
+    mean_f = [_win(f) for f in fixed_list]
+    var_f = [
+        (_win(f * f) - mf * mf).clamp_min(eps) for f, mf in zip(fixed_list, mean_f, strict=True)
+    ]
+    wgt = weights if weights is not None else var_f
+    wsum = torch.stack(wgt, 0).sum(0).clamp_min(eps)
+
+    offsets = torch.arange(
+        -r, r + 1e-6, trial_step, device=fixed_list[0].device, dtype=fixed_list[0].dtype
+    )
+    nd = int(offsets.numel())
+    z = torch.zeros_like(fixed_list[0])
+    best_val = torch.full_like(z, float("-inf"))
+    best_i = torch.zeros_like(z, dtype=torch.long)
+    ym2, ym1, y0, yp1, yp2 = z.clone(), z.clone(), z.clone(), z.clone(), z.clone()
+    need = torch.zeros_like(z, dtype=torch.long)
+    prev1: torch.Tensor | None = None
+    prev2: torch.Tensor | None = None
+    for i in range(nd):
+        s = float(offsets[i])
+        pooled = torch.zeros_like(z)
+        for j in range(e):
+            mw = _shift3d_axis(moving_list[j], ratio[j] * s, pe_axis)
+            mean_m = _win(mw)
+            var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
+            corr = (_win(fixed_list[j] * mw) - mean_f[j] * mean_m) / torch.sqrt(var_f[j] * var_m)
+            pooled = pooled + wgt[j] * corr
+        pooled = pooled / wsum
+        yp1 = torch.where(need == 2, pooled, yp1)
+        yp2 = torch.where(need == 1, pooled, yp2)
+        need = torch.where(need > 0, need - 1, need)
+        newp = pooled > best_val
+        ym2 = torch.where(newp, prev2 if prev2 is not None else pooled, ym2)
+        ym1 = torch.where(newp, prev1 if prev1 is not None else pooled, ym1)
+        y0 = torch.where(newp, pooled, y0)
+        best_val = torch.where(newp, pooled, best_val)
+        best_i = torch.where(newp, torch.full_like(best_i, i), best_i)
+        need = torch.where(newp, torch.full_like(need, 2), need)
+        prev2 = prev1
+        prev1 = pooled
+
+    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
+    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
+    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
+    den3 = ym1 - 2.0 * y0 + yp1
+    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3))
+    vtx3 = vtx3.clamp(-1.0, 1.0)
+    can5 = (best_i >= 2) & (best_i <= nd - 3)
+    can3 = (best_i >= 1) & (best_i <= nd - 2)
+    sub = torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
+    s_field = (-r + best_i.to(z.dtype) * trial_step) + sub * trial_step
+    return s_field / float(alpha[m])  # echo-1 scale (alpha_1 = 1)
+
+
+@dataclass
+class MultiEchoLocomocoResult:
+    """Joint multi-echo result: one shared field, per-echo scaled warps.
+
+    ``per_echo[e]`` is a full :class:`LocomocoResult` for echo ``e`` whose warp is
+    ``alpha[e]·w_field`` and whose corrected series is that echo warped by it — so the
+    CLI writes per-echo warps/corrected exactly like the single-echo path. ``alpha`` /
+    ``echo_times`` and ``linearity_r2`` (fit of ``alpha`` vs ``TE`` through the origin)
+    are the shared diagnostics.
+    """
+
+    per_echo: list[LocomocoResult]
+    alpha: torch.Tensor  # (E,) learned per-echo scaling
+    echo_times: torch.Tensor  # (E,) ms
+    w_field: torch.Tensor  # (nx,ny,nz,T) shared canonical PE displacement (voxels)
+    pe_axis: int
+    linearity_r2: float
+
+
+def _rank1_factor_echoes(disps: torch.Tensor, alpha_init: torch.Tensor, n_iter: int = 8):
+    """Rank-1 factor per-echo displacement stacks into ``alpha`` (E,) and ``w`` (R,).
+
+    ``disps`` is ``(E, R)`` (R = voxels·frames flattened). Power iteration on the model
+    ``disps_e ≈ alpha_e · w``: alternately ``w = Σ α_e d_e / Σ α_e²`` and
+    ``alpha_e = ⟨d_e, w⟩ / ⟨w, w⟩``, seeded from ``alpha_init`` (the echo times). The
+    product ``alpha_e·w`` is what the output uses, so the overall scale is arbitrary;
+    we normalise ``alpha`` by its first entry for an interpretable TE comparison.
+    """
+    alpha = alpha_init.clone().float()
+    w = torch.zeros(disps.shape[1], dtype=disps.dtype)
+    for _ in range(n_iter):
+        denom = max(float((alpha * alpha).sum()), 1e-12)
+        w = (alpha[:, None] * disps).sum(0) / denom
+        ww = float((w * w).sum())
+        if ww < 1e-12:
+            break
+        alpha = (disps * w[None, :]).sum(1) / ww
+    a0 = float(alpha[0]) if abs(float(alpha[0])) > 1e-12 else 1.0
+    return alpha / a0, w
+
+
+def estimate_residual_flow_multiecho(
+    datas: list[np.ndarray],
+    echo_times: list[float],
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    ref_mode: str = "mean",
+    backend: str = "flow",
+    smooth_sigma: float = 0.0,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    max_shift: float = 3.0,
+    trial_step: float = 0.5,
+    refine_rounds: int = 0,
+    converge: float = 0.0,
+    converge_rel: float = 0.0,
+    first_n: int | None = None,
+    automask: bool = False,
+    automask_dilate: int = 4,
+    automask_sigma: float = 3.0,
+    learn_scaling: bool = True,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> MultiEchoLocomocoResult:
+    """Joint residual partition-direction motion for multi-echo 3-D EPI.
+
+    ``datas`` is the list of E moco'd 4-D series (one per echo, identical grid + T);
+    ``echo_times`` the matching TEs in ms. ``pe_axis`` is the corrected direction (the
+    slice/partition axis for 3-D EPI, so PE==slice is fine). All echoes are treated as
+    one 3-D-acquired series (no per-slice fields).
+
+    Learns a shared field ``w(r,t)`` and per-echo scaling ``alpha`` under the model
+    ``disp_e = alpha_e · w``:
+
+    1. Estimate each echo independently (3-D LK / xcorr) → per-echo displacement.
+    2. Rank-1 factor across echoes (seeded by the echo times) → ``alpha`` + initial ``w``.
+       ``learn_scaling=False`` skips this and fixes ``alpha_e = TE_e/TE_0``.
+    3. ``flow`` backend: solve ``w`` with the shared-field pooled LK
+       (:func:`optical_flow_lk_3d_multiecho`) so the SNR/sensitivity pooling happens in
+       image space. ``xcorr``: keep the factored ``w``.
+    4. ``refine_rounds`` (``flow`` only): rebuild each echo's reference from its corrected
+       series (motion removed → sharp) and re-solve, converging the template out of its
+       motion-blur bias — the same knob as the single-echo ``-refine`` and the dominant
+       lever on recovered MAGNITUDE (a blurred initial reference biases displacement low).
+
+    Returns per-echo :class:`LocomocoResult`\\ s (warp ``alpha_e·w``, echo warped by it)
+    plus the shared ``alpha`` / linearity diagnostics.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    e = len(datas)
+    if e < 2:
+        raise ValueError(f"multi-echo needs ≥2 echoes, got {e}.")
+    if len(echo_times) != e:
+        raise ValueError(f"-echo_times has {len(echo_times)} values but there are {e} inputs.")
+    shp = datas[0].shape
+    for k, d in enumerate(datas):
+        if d.shape != shp:
+            raise ValueError(
+                f"echo {k} shape {d.shape} != echo 0 shape {shp} (need identical grid+T)."
+            )
+    if len(shp) != 4:
+        raise ValueError(f"each -input must be 4D, got {shp}.")
+    nx, ny, nz, nt = shp
+
+    disp_slice = slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
+    a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
+    pe_flow_is_u = pe_axis == a1
+    perm4 = [3, disp_slice, a0, a1]
+
+    te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
+    vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
+    refs = [_select_ref_vol(v, ref_mode, first_n).to(device) for v in vols]
+    if smooth_sigma > 0:
+        refs = [_blur3d_b(r[None], smooth_sigma)[0] for r in refs]
+
+    # Single-echo backend estimator — used to LEARN alpha (rank-1 factor of one per-echo
+    # pass) and, for xcorr, to solve the shared field itself. Persistent bars (leave=True)
+    # so a long run stays visible.
+    flow3d = _build_flow3d_fn(
+        backend,
+        pe_axis,
+        n_levels=n_levels,
+        n_iters=n_iters,
+        window_sigma=window_sigma,
+        max_shift=max_shift,
+        trial_step=trial_step,
+    )
+
+    def _per_echo_estimate(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
+        out = torch.zeros(e, nx, ny, nz, nt)
+        for j in range(e):
+            for t in tqdm(
+                range(nt), desc=f"me {tag} e{j + 1}/{e}", unit="frame", leave=True, disable=nt < 3
+            ):
+                mv = vols[j][..., t].to(device)
+                mvb = _blur3d_b(mv[None], smooth_sigma)[0] if smooth_sigma > 0 else mv
+                out[j, ..., t] = flow3d(cur_refs[j][None], mvb[None])[0].cpu()
+        return out
+
+    def _project(flat: torch.Tensor) -> torch.Tensor:
+        """Least-squares project the per-echo estimates (e, R) onto the current alpha."""
+        return (alpha[:, None] * flat).sum(0) / max(float((alpha * alpha).sum()), 1e-12)
+
+    def _joint_lk(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
+        out = torch.zeros(nx, ny, nz, nt)
+        for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
+            movs = [vols[j][..., t].to(device) for j in range(e)]
+            if smooth_sigma > 0:
+                movs = [_blur3d_b(m[None], smooth_sigma)[0] for m in movs]
+            out[..., t] = optical_flow_lk_3d_multiecho(
+                [r[None] for r in cur_refs],
+                [m[None] for m in movs],
+                alpha,
+                pe_axis,
+                n_levels=n_levels,
+                n_iters=n_iters,
+                window_sigma=window_sigma,
+            )[0].cpu()
+        return out
+
+    def _pooled_xcorr(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
+        out = torch.zeros(nx, ny, nz, nt)
+        for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
+            movs = [vols[j][..., t].to(device) for j in range(e)]
+            if smooth_sigma > 0:
+                movs = [_blur3d_b(m[None], smooth_sigma)[0] for m in movs]
+            out[..., t] = xcorr_search_flow_3d_multiecho(
+                [r[None] for r in cur_refs],
+                [m[None] for m in movs],
+                alpha,
+                pe_axis,
+                max_shift=max_shift,
+                window_sigma=window_sigma,
+                trial_step=trial_step,
+            )[0].cpu()
+        return out
+
+    def _solve_w(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
+        # flow: image-space shared-field pooled LK. xcorr with FIXED alpha: shared-parameter
+        # searchlight pooling every echo into one informed search (the "best of both"). xcorr
+        # while LEARNING alpha: per-echo estimate + project (the per-echo fields are needed to
+        # learn the ratios anyway), warp-space pooling.
+        if backend == "flow":
+            return _joint_lk(cur_refs, tag)
+        if not learn_scaling:
+            return _pooled_xcorr(cur_refs, tag)
+        return _project(_per_echo_estimate(cur_refs, tag).reshape(e, -1)).reshape(nx, ny, nz, nt)
+
+    def _corrected_echo(cur_w: torch.Tensor, j: int) -> torch.Tensor:
+        disp_e = alpha[j] * cur_w
+        out = torch.zeros(nx, ny, nz, nt)
+        for t in range(nt):
+            out[..., t] = _shift3d_axis(
+                vols[j][..., t].to(device)[None], disp_e[..., t].to(device)[None], pe_axis
+            )[0].cpu()
+        return out
+
+    # Phase 1: learn alpha, then the initial shared field. When learning, factor ONE
+    # per-echo pass; for xcorr reuse that very pass as the initial w (no second sweep).
+    alpha = te / float(te[0])
+    if learn_scaling:
+        disp0 = _per_echo_estimate(refs, "init").reshape(e, -1)
+        alpha, _ = _rank1_factor_echoes(disp0, alpha)
+        w = (
+            _joint_lk(refs, "joint")
+            if backend == "flow"
+            else _project(disp0).reshape(nx, ny, nz, nt)
+        )
+    else:
+        w = _solve_w(refs, "joint" if backend == "flow" else "solve")
+
+    # Phase 2: reference-refinement (the -refine knob; applies to BOTH backends — it is
+    # the estimator-agnostic template sharpening). The initial reference is the mean/median
+    # of the still-DISTORTED frames, so it is motion-blurred and biases every shift LOW —
+    # the dominant cause of under-displacement (and the main thing -superhard turns on).
+    # Rebuild each echo's reference from its corrected series (sharp) and re-solve, with the
+    # divergence guard / convergence checks of the single-echo 3-D path.
+    if refine_rounds > 0:
+        brain = _brain_mask_from(w.abs().mean(dim=3)) if float(w.abs().max()) > 0 else None
+        prev = w
+        prev_step: float | None = None
+        for i in range(refine_rounds):
+            saved = w
+            new_refs = [
+                _refine_reduce(_corrected_echo(w, j), ref_mode, 3, first_n).to(device)
+                for j in range(e)
+            ]
+            if smooth_sigma > 0:
+                new_refs = [_blur3d_b(r[None], smooth_sigma)[0] for r in new_refs]
+            w = _solve_w(new_refs, f"refine {i + 1}/{refine_rounds}")
+            d = (w - prev)[brain] if brain is not None else (w - prev)
+            step = float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
+            if verbose:
+                print(
+                    f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)"
+                )
+            if step > max_shift or (prev_step is not None and step > 1.5 * prev_step):
+                w = saved
+                if verbose:
+                    print(f"   ⚠ refine pass {i + 1} diverged (Δ {step:.4f} vox) — reverting.")
+                break
+            prev = w
+            reason = _refine_converged(step, prev_step, converge, converge_rel)
+            prev_step = step
+            if reason is not None:
+                if verbose:
+                    print(f"   ✓ converged ({reason}) — stopping refine at pass {i + 1}.")
+                break
+
+    if automask:
+        # One shared mask from the across-echo mean (all echoes share geometry).
+        mean_series = np.mean(np.stack([np.asarray(d) for d in datas], 0), 0)
+        soft = _build_soft_mask(
+            mean_series, disp_slice, a0, a1, automask_dilate, automask_sigma, device
+        )
+        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
+        w = w * soft_xyz[..., None]
+
+    # Build per-echo results: echo e warped by alpha_e · w.
+    per_echo: list[LocomocoResult] = []
+    for j in range(e):
+        disp_e = (alpha[j] * w).contiguous()
+        corrected = _corrected_echo(w, j)
+        p_canon = disp_e.permute(perm4).contiguous()
+        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
+        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        per_echo.append(
+            LocomocoResult(
+                u_canon=u_canon,
+                v_canon=v_canon,
+                corrected_canon=torch.zeros_like(p_canon),
+                perm=perm4,
+                pe_flow_is_u=pe_flow_is_u,
+                pe_axis=pe_axis,
+                slice_axis=disp_slice,
+                orig_shape=(nx, ny, nz, nt),
+                a0=a0,
+                a1=a1,
+                dual=False,
+                corrected_nifti=corrected,
+            )
+        )
+
+    # Linearity of alpha vs TE (through the origin): r² of the 1-parameter fit.
+    slope = float((alpha * te).sum() / (te * te).sum().clamp(min=1e-12))
+    resid = alpha - slope * te
+    ss_res = float((resid * resid).sum())
+    ss_tot = float(((alpha - alpha.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+
+    if verbose:
+        ap = w.abs()
+        sel = ap[ap > 0]
+        med = float(sel.median()) if sel.numel() else 0.0
+        a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
+        te_str = ", ".join(f"{float(x):.0f}" for x in te)
+        print(
+            f"🌀 locomoco ME-3D: {e} echoes (TE {te_str} ms), {nt} frames, PE axis {pe_axis}, "
+            f"backend={backend}; shared |w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
+        )
+        print(
+            f"   alpha (÷echo1) = [{a_str}]  ·  linear-in-TE r²={r2:.4f}"
+            + ("" if learn_scaling else "  (fixed to TE ratio)")
+        )
+
+    return MultiEchoLocomocoResult(
+        per_echo=per_echo,
+        alpha=alpha,
+        echo_times=te,
+        w_field=w,
+        pe_axis=pe_axis,
+        linearity_r2=r2,
+    )
+
+
+def estimate_residual_flow_me_scaled(
+    datas: list[np.ndarray],
+    echo_times: list[float],
+    estimate_idx: int,
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    ref_mode: str = "median",
+    backend: str = "xcorr",
+    smooth_sigma: float = 0.0,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    max_shift: float = 3.0,
+    trial_step: float = 0.5,
+    refine_rounds: int = 0,
+    converge: float = 0.0,
+    converge_rel: float = 0.0,
+    first_n: int | None = None,
+    automask: bool = False,
+    automask_dilate: int = 4,
+    automask_sigma: float = 3.0,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> MultiEchoLocomocoResult:
+    """Estimate the shared partition field on ONE echo, scale to the rest by TE ratio.
+
+    The ME 3-D-EPI partition wiggle scales linearly with echo time, so once that is
+    established there is nothing to learn jointly: run the full single-echo ``-is_3dacq``
+    estimator (including ``-refine``) on the echo where the shift is easiest to see —
+    typically the LAST (largest displacement) or a middle echo — and every other echo's
+    warp is ``(TE_e / TE_k) · w``. Much cheaper than the joint solve (one echo's data, one
+    pass) and often steadier (that echo's own SNR, no cross-echo compromise).
+
+    ``estimate_idx`` is the 0-based echo to estimate on. The shared field ``w`` is stored
+    echo-1-scaled and ``alpha`` is ``TE / TE_0`` (same convention as the joint path), so
+    ``linearity_r2`` is 1.0 by construction (the scaling is applied, not fitted).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    e = len(datas)
+    if len(echo_times) != e:
+        raise ValueError(f"-echo_times has {len(echo_times)} values but there are {e} inputs.")
+    if not 0 <= estimate_idx < e:
+        raise ValueError(f"estimate_idx {estimate_idx} out of range for {e} echoes.")
+    te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
+
+    # Reuse the whole single-echo 3-D-acq estimator on the chosen echo (refine, automask,
+    # ref modes — all of it). Its PE displacement IS the echo-k field.
+    res_k = estimate_residual_flow(
+        datas[estimate_idx],
+        pe_axis,
+        slice_axis,
+        ref_mode=ref_mode,
+        backend=backend,
+        smooth_sigma=smooth_sigma,
+        n_levels=n_levels,
+        n_iters=n_iters,
+        window_sigma=window_sigma,
+        max_shift=max_shift,
+        trial_step=trial_step,
+        refine_rounds=refine_rounds,
+        converge=converge,
+        converge_rel=converge_rel,
+        first_n=first_n,
+        automask=automask,
+        automask_dilate=automask_dilate,
+        automask_sigma=automask_sigma,
+        is_3dacq=True,
+        device=device,
+        verbose=verbose,
+    )
+    alpha = te / float(te[0])
+    # Rescale the echo-k field to echo-1 scale so w/alpha match the joint-path convention;
+    # the product alpha_e·w = w_k·(TE_e/TE_k) is unchanged either way.
+    w = res_k.pe_displacement() * float(te[0] / te[estimate_idx])
+    nx, ny, nz, nt = w.shape
+    perm4, pe_flow_is_u = res_k.perm, res_k.pe_flow_is_u
+    disp_slice, a0, a1 = res_k.slice_axis, res_k.a0, res_k.a1
+
+    per_echo: list[LocomocoResult] = []
+    for j in range(e):
+        if j == estimate_idx:
+            per_echo.append(res_k)  # its own warp already == alpha_k·w
+            continue
+        disp_e = (alpha[j] * w).contiguous()
+        vol_j = torch.from_numpy(np.ascontiguousarray(datas[j])).float()
+        corrected = torch.zeros(nx, ny, nz, nt)
+        for t in range(nt):
+            corrected[..., t] = _shift3d_axis(
+                vol_j[..., t].to(device)[None], disp_e[..., t].to(device)[None], pe_axis
+            )[0].cpu()
+        p_canon = disp_e.permute(perm4).contiguous()
+        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
+        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        per_echo.append(
+            LocomocoResult(
+                u_canon=u_canon,
+                v_canon=v_canon,
+                corrected_canon=torch.zeros_like(p_canon),
+                perm=perm4,
+                pe_flow_is_u=pe_flow_is_u,
+                pe_axis=pe_axis,
+                slice_axis=disp_slice,
+                orig_shape=(nx, ny, nz, nt),
+                a0=a0,
+                a1=a1,
+                dual=False,
+                corrected_nifti=corrected,
+            )
+        )
+
+    if verbose:
+        ap = w.abs()
+        sel = ap[ap > 0]
+        med = float(sel.median()) if sel.numel() else 0.0
+        te_str = ", ".join(f"{float(x):.0f}" for x in te)
+        a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
+        print(
+            f"🌀 locomoco ME-3D (scaled from echo {estimate_idx + 1}, "
+            f"TE {float(te[estimate_idx]):.0f} ms): {e} echoes (TE {te_str} ms), {nt} frames; "
+            f"echo-1 |w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
+        )
+        print(f"   alpha (÷echo1) = [{a_str}]  ·  TE-linear scaling applied (not fitted)")
+
+    return MultiEchoLocomocoResult(
+        per_echo=per_echo,
+        alpha=alpha,
+        echo_times=te,
+        w_field=w,
+        pe_axis=pe_axis,
+        linearity_r2=1.0,
+    )
+
+
 def warp_time_pcs(
     components: list[tuple[int, torch.Tensor]],
     n_pcs: int = 5,

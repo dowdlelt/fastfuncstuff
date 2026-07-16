@@ -197,7 +197,15 @@ def create_parser() -> argparse.ArgumentParser:
         epilog=_EPILOG,
     )
     io = p.add_argument_group("Input/Output")
-    io.add_argument("-input", "-i", required=True, help="4D motion-corrected NIfTI series")
+    io.add_argument(
+        "-input",
+        "-i",
+        required=True,
+        nargs="+",
+        help="4D motion-corrected NIfTI series. Pass ONE for normal single-echo use; pass "
+        "SEVERAL (with -me_3depi and -echo_times) for multi-echo 3-D EPI — the echoes are "
+        "jointly corrected by one shared partition-direction field scaled per echo.",
+    )
     io.add_argument(
         "-raw_input",
         "-raw",
@@ -253,6 +261,48 @@ def create_parser() -> argparse.ArgumentParser:
         "field (3-D pooling + through-plane regularisation) instead of slice-by-slice — "
         "strictly better than averaging the two valid perpendicular cuts. Works for the "
         "flow and xcorr backends (phase has no 3-D path yet), plain and rotation-aware.",
+    )
+    me = p.add_argument_group("Multi-echo 3-D EPI (-me_3depi)")
+    me.add_argument(
+        "-me_3depi",
+        "-me",
+        action="store_true",
+        help="Multi-echo 3-D EPI: pass one 4D series per echo to -input and the matching TEs "
+        "to -echo_times. The partition-direction wiggle is one shared field w(r,t) whose "
+        "magnitude scales per echo (echo e is warped by alpha_e·w), so all echoes are jointly "
+        "estimated and land back on a common grid ('a voxel is a voxel across echoes'). Writes "
+        "a per-echo warp + corrected series, and the learned alpha vs echo-time diagnostic. "
+        "Implies a single 3-D solve along -pe_dir; backend flow or xcorr.",
+    )
+    me.add_argument(
+        "-echo_times",
+        "-tes",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Echo times in ms, one per -input (multi-echo only). Seeds the per-echo scaling "
+        "and is the reference for the linear-in-TE diagnostic.",
+    )
+    me.add_argument(
+        "-me_fixed_scaling",
+        action="store_true",
+        help="Enforce TE-linearity (alpha_e = TE_e/TE_1, not learned) while pooling ALL echoes "
+        "into ONE informed search for the shared field — the best-of-both: every echo's SNR, "
+        "the hard linear constraint, no cross-echo compromise. flow: image-space pooled LK; "
+        "xcorr: a shared-parameter searchlight (every echo trial-shifted by alpha_e·s at once, "
+        "SNR-weighted). Use when linearity is already established; omit (default) to instead LEARN "
+        "alpha and data-check the scaling.",
+    )
+    me.add_argument(
+        "-me_estimate_from",
+        "-me_from",
+        default=None,
+        help="RECOMMENDED once TE-linearity is established: estimate the shared field on ONE echo "
+        "and scale to the rest by TE ratio (no joint solve, no per-echo passes). "
+        "'last' (largest, easiest-to-detect shifts) | 'mid' | 'first' | a 1-based echo index. "
+        "Runs the full single-echo -is_3dacq estimator (incl. -refine/-superhard) on that echo; "
+        "every other echo's warp is (TE_e/TE_k)·w. Much faster and often steadier than the joint "
+        "solve; use the joint path (omit this) only to also DATA-CHECK the scaling.",
     )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
@@ -663,9 +713,195 @@ def _apply_preset(args) -> str | None:
     return name
 
 
+def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
+    """Multi-echo 3-D EPI: joint shared-field estimate, per-echo warp + corrected out."""
+    import numpy as np
+
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import load_nifti, save_nifti
+    from fastfuncstuff.processing.locomoco import estimate_residual_flow_multiecho
+
+    if dual:
+        print("❌ -me_3depi is single phase-encode only (one -pe_dir).", file=sys.stderr)
+        return 2
+    if args.backend == "phase":
+        print("❌ -me_3depi has no 'phase' backend; use -backend flow or xcorr.", file=sys.stderr)
+        return 2
+    if args.raw_input is not None or args.moco_matrix is not None:
+        print("❌ -me_3depi is not compatible with the rotation-aware path yet.", file=sys.stderr)
+        return 2
+    if not args.echo_times:
+        print("❌ -me_3depi requires -echo_times (one TE in ms per -input).", file=sys.stderr)
+        return 2
+    if len(args.echo_times) != len(args.input):
+        print(
+            f"❌ -echo_times has {len(args.echo_times)} values but {len(args.input)} inputs.",
+            file=sys.stderr,
+        )
+        return 2
+
+    datas = []
+    affine = None
+    for path in args.input:
+        with spinner(f"Loading {Path(path).name}"):
+            img = load_nifti(path)
+            d = np.asarray(img.get_fdata(dtype=np.float32))
+        if d.ndim != 4:
+            print(f"❌ -input {path} must be 4D, got shape {d.shape}", file=sys.stderr)
+            return 2
+        if affine is None:
+            affine = img.affine.copy()
+        datas.append(d)
+
+    smooth_sigma = 0.0
+    if args.do_blur > 0:
+        vox = np.linalg.norm(affine[:3, :3], axis=0)
+        in_plane = [a for a in (0, 1, 2) if a != slice_axis]
+        inplane_mm = float(np.mean([vox[in_plane[0]], vox[in_plane[1]]]))
+        smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
+
+    automask = not args.no_automask
+    if args.ref is None:
+        args.ref = "mean"
+    te_str = ", ".join(f"{t:g}" for t in args.echo_times)
+
+    # Resolve -me_estimate_from (None → joint solve across all echoes).
+    est_idx = None
+    if args.me_estimate_from is not None:
+        sel = str(args.me_estimate_from).lower()
+        if sel == "last":
+            est_idx = len(datas) - 1
+        elif sel in ("mid", "middle"):
+            est_idx = len(datas) // 2
+        elif sel == "first":
+            est_idx = 0
+        else:
+            try:
+                est_idx = int(sel) - 1  # 1-based index
+            except ValueError:
+                print(
+                    f"❌ -me_estimate_from must be last|mid|first|<index>, got {args.me_estimate_from!r}.",
+                    file=sys.stderr,
+                )
+                return 2
+        if not 0 <= est_idx < len(datas):
+            print(
+                f"❌ -me_estimate_from index resolves to echo {est_idx + 1}, outside 1..{len(datas)}.",
+                file=sys.stderr,
+            )
+            return 2
+
+    print(
+        f"🌀 ffs_locomoco -me_3depi: {len(datas)} echoes  shape={datas[0].shape}  device={device}"
+    )
+    mode = f"scaled from echo {est_idx + 1}" if est_idx is not None else "joint solve"
+    scaling = "fixed(TE)" if (args.me_fixed_scaling or est_idx is not None) else "learned"
+    print(
+        f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend={args.backend}, "
+        f"ref={args.ref}, mode={mode}, scaling={scaling}, "
+        f"levels={args.levels}, iters={args.iters}, refine={args.refine}, "
+        f"automask={'on' if automask else 'off'}"
+    )
+    if args.refine == 0:
+        print(
+            "   ℹ️  refine=0: the reference is the motion-blurred frame mean, which biases "
+            "displacement LOW — add -refine 2/-workhard/-superhard for full magnitude."
+        )
+
+    if est_idx is not None:
+        from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_scaled
+
+        result = estimate_residual_flow_me_scaled(
+            datas,
+            args.echo_times,
+            est_idx,
+            pe_axis,
+            slice_axis,
+            ref_mode=args.ref,
+            backend=args.backend,
+            smooth_sigma=smooth_sigma,
+            n_levels=args.levels,
+            n_iters=args.iters,
+            window_sigma=args.window,
+            max_shift=args.max_shift,
+            trial_step=args.xcorr_step,
+            refine_rounds=args.refine,
+            converge=args.converge,
+            converge_rel=args.converge_rel,
+            first_n=args.first_n,
+            automask=automask,
+            automask_dilate=args.automask_dilate,
+            automask_sigma=args.automask_sigma,
+            device=device,
+        )
+    else:
+        result = estimate_residual_flow_multiecho(
+            datas,
+            args.echo_times,
+            pe_axis,
+            slice_axis,
+            ref_mode=args.ref,
+            backend=args.backend,
+            smooth_sigma=smooth_sigma,
+            n_levels=args.levels,
+            n_iters=args.iters,
+            window_sigma=args.window,
+            max_shift=args.max_shift,
+            trial_step=args.xcorr_step,
+            refine_rounds=args.refine,
+            converge=args.converge,
+            converge_rel=args.converge_rel,
+            first_n=args.first_n,
+            automask=automask,
+            automask_dilate=args.automask_dilate,
+            automask_sigma=args.automask_sigma,
+            learn_scaling=not args.me_fixed_scaling,
+            device=device,
+        )
+
+    print("💾 Writing outputs...")
+    as_5d = args.warp_format == "5d"
+    for j, res in enumerate(result.per_echo):
+        estem = f"{stem}_e{j + 1}"
+        if not args.no_warp:
+            from fastfuncstuff.processing.medic import save_medic_warp
+
+            axis, disp = res.warp_components()[0]
+            with spinner(f"Writing {Path(estem).name}_warp{ext}"):
+                warp_path = save_medic_warp(disp, axis, affine, estem, nii_ext=ext, as_5d=as_5d)
+            print(f"  • echo {j + 1} warp (ffs_nwarp, axis {axis}): {warp_path}")
+        if not args.no_corrected:
+            corr_path = f"{estem}_locomoco{ext}"
+            with spinner(f"Writing {Path(corr_path).name}"):
+                save_nifti(res.corrected_series().numpy(), corr_path, affine=affine)
+            print(f"  • echo {j + 1} corrected series: {corr_path}")
+        if not args.no_flow:
+            flow_path = f"{estem}_flow{ext}"
+            with spinner(f"Writing {Path(flow_path).name}"):
+                save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
+            print(f"  • echo {j + 1} signed PE flow 4D (voxels): {flow_path}")
+
+    # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
+    alpha_path = f"{stem}_locomoco_alpha.1D"
+    with open(alpha_path, "w") as f:
+        f.write("# ffs_locomoco multi-echo per-echo scaling (alpha_e · shared field)\n")
+        f.write(f"# linear-in-TE r² = {result.linearity_r2:.6f}\n")
+        f.write("# echo_TE_ms   alpha(÷echo1)\n")
+        for te_v, a_v in zip(result.echo_times.tolist(), result.alpha.tolist(), strict=True):
+            f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
+    print(f"  • per-echo scaling + linearity: {alpha_path}")
+
+    print("✅ ffs_locomoco -me_3depi complete.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = create_parser().parse_args(argv)
     preset = _apply_preset(args)
+
+    # Multi-echo 3-D EPI is a single 3-D-acquired solve, so (like -is_3dacq) the PE
+    # direction is allowed to coincide with the slice axis.
+    me_mode = args.me_3depi or len(args.input) > 1
 
     # Rotation-aware mode (both raw + matrices) defaults its reference to the temporal
     # MAX (fills FoV dropout, high-signal anchor); the plain path stays on the mean.
@@ -704,8 +940,8 @@ def main(argv: list[str] | None = None) -> int:
         pe_axis = pe_axes[0]  # representative; dual estimates both in-plane axes
     else:
         pe_axis = pe_axes[0]
-        # Under -is_3dacq the slice axis is only a display hint, so PE==slice is allowed.
-        if pe_axis == slice_axis and not args.is_3dacq:
+        # Under -is_3dacq / -me_3depi the slice axis is only a display hint, PE==slice ok.
+        if pe_axis == slice_axis and not args.is_3dacq and not me_mode:
             print(
                 f"❌ PE axis ({pe_axis}) and -slice_axis ({slice_axis}) coincide. The PE "
                 "direction must lie in the slice plane — pick a different -slice_axis.",
@@ -721,6 +957,18 @@ def main(argv: list[str] | None = None) -> int:
     stem, ext = _split_prefix(args.prefix)
 
     from fastfuncstuff.cli_utils import spinner
+
+    # Multi-echo 3-D EPI: several inputs, one shared field scaled per echo.
+    if me_mode:
+        return _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext)
+    if len(args.input) != 1:
+        print(
+            f"❌ single-echo mode takes ONE -input (got {len(args.input)}); use -me_3depi for "
+            "multi-echo.",
+            file=sys.stderr,
+        )
+        return 2
+    args.input = args.input[0]
 
     with spinner(f"Loading {Path(args.input).name}"):
         img = load_nifti(args.input)
