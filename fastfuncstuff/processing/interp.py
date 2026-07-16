@@ -80,6 +80,33 @@ def trilinear_interpolate(volume: Tensor, x: Tensor, y: Tensor, z: Tensor) -> Te
     return result.reshape(-1)
 
 
+def trilinear_interpolate_multi(volume: Tensor, x: Tensor, y: Tensor, z: Tensor) -> Tensor:
+    """Trilinear interpolation of a **multi-channel** volume at ``(x, y, z)``.
+
+    Same as :func:`trilinear_interpolate` but samples all channels in ONE ``grid_sample``
+    call — the sample locations are shared across channels, so looping per channel just
+    multiplies kernel launches (the dominant cost when many small interpolations run in a
+    tight fit loop, e.g. sampling every TPM tissue at the warp grid).
+
+    Args:
+        volume: ``(C, nz, ny, nx)`` float tensor.
+        x, y, z: ``(N,)`` sample locations in index coordinates.
+
+    Returns:
+        ``(N, C)`` interpolated values.
+    """
+    n_chan, nz, ny, nx = volume.shape
+    x = x.to(dtype=volume.dtype)
+    y = y.to(dtype=volume.dtype)
+    z = z.to(dtype=volume.dtype)
+    gx = 2.0 * x / (nx - 1) - 1.0 if nx > 1 else x * 0.0
+    gy = 2.0 * y / (ny - 1) - 1.0 if ny > 1 else y * 0.0
+    gz = 2.0 * z / (nz - 1) - 1.0 if nz > 1 else z * 0.0
+    grid = torch.stack([gx, gy, gz], dim=-1)[None, None, None, :, :]  # (1,1,1,N,3)
+    result = _grid_sample_3d(volume[None], grid)  # (1, C, 1, 1, N)
+    return result.reshape(n_chan, -1).T.contiguous()  # (N, C)
+
+
 def warp_image_linear(
     source: Tensor,
     warp_xd: Tensor,
