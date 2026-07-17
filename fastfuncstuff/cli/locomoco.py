@@ -848,6 +848,33 @@ def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
             print("  • -save_corr_curve: no landscape — needs -backend xcorr.")
 
 
+def _write_warp_pcs(components, stem, n_pcs) -> None:
+    """Write the top-N temporal warp PCs as {stem}_locomoco_pcs.1D — shared by both paths.
+
+    Recomputed from the in-memory warp, so it is independent of -no_warp (the warp need
+    not be written to disk to extract its denoising regressors). ``components`` is the
+    ``[(nifti_axis, disp)]`` list — from ``result.warp_components()`` for a single echo,
+    or ``[(pe_axis, w_field)]`` for the shared multi-echo field (every echo's warp is a
+    scalar multiple of it, so they share these temporal PCs).
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.processing.locomoco import warp_time_pcs
+
+    with spinner("Computing warp PCs"):
+        scores, var = warp_time_pcs(components, n_pcs=n_pcs, device=None)
+    if scores is None or var is None:
+        print("  • warp PCs: skipped (warp is all-zero)")
+        return
+    pcs_path = f"{stem}_locomoco_pcs.1D"
+    var_pct = " ".join(f"{v * 100:.2f}%" for v in var.tolist())
+    with open(pcs_path, "w") as f:
+        f.write(f"# ffs_locomoco warp temporal PCs — {scores.shape[1]} PCs, unit variance\n")
+        f.write(f"# Variance explained: {var_pct}\n")
+        for row in scores.numpy():
+            f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
+    print(f"  • warp PCs ({scores.shape[1]}, denoising regressors, var {var_pct}): {pcs_path}")
+
+
 def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     """Multi-echo 3-D EPI: joint shared-field estimate, per-echo warp + corrected out."""
     import numpy as np
@@ -1100,6 +1127,11 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
     print(f"  • per-echo scaling + linearity: {alpha_path}")
 
+    if args.want_pcs is not None:
+        # PCs of the SHARED field w: every echo's warp is alpha_e·w, so they all share
+        # these temporal regressors. In memory regardless of -no_warp.
+        _write_warp_pcs([(result.pe_axis, result.w_field)], stem, args.want_pcs)
+
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
     print("✅ ffs_locomoco -me_3depi complete.")
@@ -1192,7 +1224,9 @@ def main(argv: list[str] | None = None) -> int:
     # Correlation-curve frame (xcorr diagnostics): bare -save_corr_curve (const -1) → middle.
     corr_curve_frame = None
     if args.save_corr_curve is not None:
-        corr_curve_frame = data.shape[3] // 2 if args.save_corr_curve == -1 else args.save_corr_curve
+        corr_curve_frame = (
+            data.shape[3] // 2 if args.save_corr_curve == -1 else args.save_corr_curve
+        )
 
     # -do_blur is FWHM in mm (repo convention); convert to an in-plane voxel sigma
     # for the pre-flow Gaussian. In-plane voxel size = mean of the two non-slice axes.
@@ -1370,25 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  • warp ({fmt_note}, ffs_nwarp, {axes_note}): {warp_path}")
 
     if args.want_pcs is not None:
-        from fastfuncstuff.processing.locomoco import warp_time_pcs
-
-        with spinner("Computing warp PCs"):
-            scores, var = warp_time_pcs(result.warp_components(), n_pcs=args.want_pcs, device=None)
-        if scores is None or var is None:
-            print("  • warp PCs: skipped (warp is all-zero)")
-        else:
-            pcs_path = f"{stem}_locomoco_pcs.1D"
-            var_pct = " ".join(f"{v * 100:.2f}%" for v in var.tolist())
-            with open(pcs_path, "w") as f:
-                f.write(
-                    f"# ffs_locomoco warp temporal PCs — {scores.shape[1]} PCs, unit variance\n"
-                )
-                f.write(f"# Variance explained: {var_pct}\n")
-                for row in scores.numpy():
-                    f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
-            print(
-                f"  • warp PCs ({scores.shape[1]}, denoising regressors, var {var_pct}): {pcs_path}"
-            )
+        _write_warp_pcs(result.warp_components(), stem, args.want_pcs)
 
     if not args.no_corrected:
         corr_path = f"{stem}_locomoco{ext}"

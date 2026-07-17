@@ -188,9 +188,9 @@ def test_interecho_aligns_stack_to_anchor():
     for step, c in enumerate(contrast):
         series = np.zeros((*base.shape, len(hs)), np.float32)
         for t, h in enumerate(hs):
-            series[..., t] = c * _shift3d_axis(
-                torch.from_numpy(base)[None], float(step * h), PE
-            )[0].numpy()
+            series[..., t] = (
+                c * _shift3d_axis(torch.from_numpy(base)[None], float(step * h), PE)[0].numpy()
+            )
         datas.append(series)
 
     res = estimate_residual_flow_me_interecho(
@@ -211,6 +211,7 @@ def test_interecho_aligns_stack_to_anchor():
     for t in (1, 2, 4):
         rec = float(np.median(res.w_field.numpy()[core, t]))
         assert abs(rec - (-hs[t])) < 0.15, (t, rec, -hs[t])
+
     # Corrected later echoes land on echo 1's frame: cross-echo disagreement drops.
     def _spread(series_list, t):  # std across echoes (contrast-normalised) at frame t
         fr = np.stack([s[core, t] / np.mean(np.abs(s[core, t])) for s in series_list], 0)
@@ -248,9 +249,9 @@ def _dropout_echoes(tes, h, dropout_slabs):
         c = float(np.exp(-te / 40.0))
         series = np.zeros((nx, ny, nz, T), np.float32)
         for t in range(T):
-            series[..., t] = c * _shift3d_axis(
-                torch.from_numpy(base)[None], float(step * h), PE
-            )[0].numpy()
+            series[..., t] = (
+                c * _shift3d_axis(torch.from_numpy(base)[None], float(step * h), PE)[0].numpy()
+            )
         if dropout_slabs.get(step) is not None:
             x0, x1 = dropout_slabs[step]
             series[x0:x1] = 0.0  # signal dropout
@@ -266,8 +267,15 @@ def test_interecho_automask_gates_dropout():
     # is deep dropout (both gone) and must be gated; echo 1 keeps full signal everywhere.
     slabs = {1: (6, 12), 2: (4, 14)}
     datas = _dropout_echoes(tes, h, slabs)
-    common = dict(pe_axis=PE, slice_axis=PE, backend="xcorr", trial_step=0.1,
-                  max_shift=3.0, device=torch.device("cpu"), verbose=False)
+    common = dict(
+        pe_axis=PE,
+        slice_axis=PE,
+        backend="xcorr",
+        trial_step=0.1,
+        max_shift=3.0,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
 
     railed = estimate_residual_flow_me_interecho(datas, tes, automask=False, **common)
     gated = estimate_residual_flow_me_interecho(datas, tes, automask=True, **common)
@@ -294,7 +302,9 @@ def test_flat_scaling_shifts_all_echoes_equally():
     for c in contrast:
         series = np.zeros((*base.shape, len(shifts)), np.float32)
         for t, s in enumerate(shifts):
-            series[..., t] = c * _shift3d_axis(torch.from_numpy(base)[None], float(s), PE)[0].numpy()
+            series[..., t] = (
+                c * _shift3d_axis(torch.from_numpy(base)[None], float(s), PE)[0].numpy()
+            )
         datas.append(series)
     res = estimate_residual_flow_multiecho(
         datas,
@@ -372,3 +382,64 @@ def test_xcorr_backend_with_refine():
         before = float(np.asarray(datas[j])[brain].std(axis=-1).mean())
         after = float(corr.corrected_series().numpy()[brain].std(axis=-1).mean())
         assert after < 0.6 * before, (j, before, after)
+
+
+def test_cli_want_pcs_written_with_no_warp(tmp_path):
+    """-want_pcs must emit {stem}_locomoco_pcs.1D in the -me_3depi path even with -no_warp.
+
+    Regression: the multi-echo path returned before ever handling -want_pcs, so the PCs
+    (derived from the in-memory shared field) were silently dropped when the warp itself
+    was not written.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    tes = [7.61, 21.71, 35.81]
+    n_frames = 7
+    datas, _ = _make_multiecho(tes, [0.0, 0.5, -0.4, 0.3, -0.5, 0.2, 0.1])
+    paths = []
+    for e, series in enumerate(datas):
+        p = tmp_path / f"e{e + 1}.nii.gz"
+        nib.save(nib.Nifti1Image(series, np.eye(4)), str(p))
+        paths.append(str(p))
+    stem = str(tmp_path / "out")
+
+    rc = main(
+        [
+            "-input",
+            *paths,
+            "-prefix",
+            stem,
+            "-pe_dir",
+            "IS",
+            "-backend",
+            "flow",
+            "-me_3depi",
+            "-echo_times",
+            *[str(t) for t in tes],
+            "-is_3dacq",
+            "-me_fixed_scaling",
+            "-device",
+            "cpu",
+            "-no_warp",
+            "-no_movie",
+            "-no_corrected",
+            "-no_flow",
+            "-want_pcs",
+            "4",
+            "-levels",
+            "2",
+            "-iters",
+            "2",
+            "-refine",
+            "0",
+        ]
+    )
+    assert rc == 0
+    pcs = tmp_path / "out_locomoco_pcs.1D"
+    assert pcs.exists(), "want_pcs produced no .1D in the -me_3depi/-no_warp path"
+    assert not list(tmp_path.glob("out*_warp*"))  # warp genuinely skipped, PCs still written
+    arr = np.loadtxt(pcs)
+    assert arr.ndim == 2 and arr.shape[0] == n_frames  # one row per frame
+    assert 1 <= arr.shape[1] <= 4  # up to n_pcs columns
