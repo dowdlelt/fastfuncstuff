@@ -250,9 +250,12 @@ def create_parser() -> argparse.ArgumentParser:
         dest="debug3d_shift",
         type=float,
         default=1.0,
-        help="Slice-shift scale in voxels per Hz of detrended field at the LAST echo "
-        "(default 1.0: a 3 Hz deflection -> 3 voxel shift at the last echo). Earlier "
-        "echoes scale down linearly to 0 at echo 1.",
+        help="Multiplier on the k-shift (default 1.0). With -3d_debug_dfield the shift is "
+        "already the physical TE_e[s] * d(field)[Hz] in voxels (TE plays the role the "
+        "readout time plays for the primary axis), so this is a DIMENSIONLESS fudge on that "
+        "prediction: 1.0 = the raw physics (a 3 Hz change at TE=36 ms -> 3*0.036 = 0.11 vox, "
+        "NOT 3 vox). In the legacy (non-dfield) model it is voxels per Hz of the detrended "
+        "field at the LAST echo (3 Hz -> 3 vox), with earlier echoes ramping to 0 at echo 1.",
     )
     d3.add_argument(
         "-3d_debug_detrend",
