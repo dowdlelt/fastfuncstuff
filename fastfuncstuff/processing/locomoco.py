@@ -364,20 +364,22 @@ def _first_peak_field_and_conf(
 def _sweep_first_peak(
     ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac, blur, curve_out,
     min_rising_frac: float = 0.001,
+    min_steps: int = 5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Outward-from-zero sweep + first-peak finder (the B+C path).
 
     ``ncc(s)`` returns the per-voxel local correlation at offset ``s``. Sweeps
-    ``s = 0, ±step, ±2·step, …`` outward, first checkpoint at ±0.5 voxel, then **grows the
-    range only while more than a FRACTION of voxels is still rising** — so a *coherent*
-    large-shift region (which keeps that fraction up) IS searched to completion, and the
-    sweep only stops once the still-rising set drops below ``min_rising_frac`` (≈14³ voxels
-    of a whole-brain volume). The leftover stragglers below that are scattered noise/dropout
-    (handled by reg/mask), so clamping them where they are is safe. This is the data-adaptive
-    speedup: mostly-small motion searches ~±1 instead of ±r. A plain "any voxel still rising"
-    test never fires across millions of voxels — some noise voxel is always climbing — hence
-    the fraction. When ``curve_out`` is requested the full ±r range is swept so the saved
-    landscape is complete.
+    ``s = 0, ±step, ±2·step, …`` outward, ALWAYS at least ``min_steps`` samples per side (so
+    the curve is characterized before the rising test can stop it — one point at ±0.5 vox is
+    not enough to know a voxel is really rising), then **grows the range only while more than
+    a FRACTION of voxels is still rising** — so a *coherent* large-shift region (which keeps
+    that fraction up) IS searched to completion, and the sweep only stops once the still-rising
+    set drops below ``min_rising_frac`` (≈14³ voxels of a whole-brain volume). The leftover
+    stragglers below that are scattered noise/dropout (handled by reg/mask), so clamping them
+    where they are is safe. This is the data-adaptive speedup: mostly-small motion searches
+    ~±min_steps instead of ±r. A plain "any voxel still rising" test never fires across
+    millions of voxels — some noise voxel is always climbing — hence the fraction. When
+    ``curve_out`` is requested the full ±r range is swept so the saved landscape is complete.
     """
     corr0 = ncc(0.0)
     pos = [corr0]
@@ -385,7 +387,9 @@ def _sweep_first_peak(
     pos_rising = torch.ones_like(corr0, dtype=torch.bool)
     neg_rising = torch.ones_like(corr0, dtype=torch.bool)
     kmax = int(round(r / trial_step))
-    k_min = max(1, int(round(0.5 / trial_step)))  # first checkpoint at ±0.5 voxel
+    # At least min_steps samples per side before the rising test can fire, but never more
+    # than the search range itself (tiny max_shift / coarse step ⇒ few points, don't error).
+    k_min = min(kmax, max(1, min_steps))
     n_vox = corr0.numel()
     early = curve_out is None
     for k in range(1, kmax + 1):
@@ -1268,6 +1272,7 @@ def estimate_residual_flow(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -1355,6 +1360,7 @@ def estimate_residual_flow(
             noshift_margin=noshift_margin,
             reg_sigma=reg_sigma,
             peak_mode=peak_mode,
+            search_min_steps=search_min_steps,
             save_corr_curve=save_corr_curve,
             device=device,
             verbose=verbose,
@@ -1693,6 +1699,7 @@ def estimate_residual_flow_rotaware(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -1781,6 +1788,7 @@ def estimate_residual_flow_rotaware(
             noshift_margin=noshift_margin,
             reg_sigma=reg_sigma,
             peak_mode=peak_mode,
+            search_min_steps=search_min_steps,
         )
         if is_3dacq
         else None
@@ -2094,6 +2102,7 @@ def xcorr_search_flow_3d(
     reg_sigma: float = 1.5,
     fourier_shift: bool = True,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     ambiguity_frac: float = 0.5,
     curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2144,7 +2153,7 @@ def xcorr_search_flow_3d(
     if peak_mode == "first_peak":
         return _sweep_first_peak(
             _ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac,
-            lambda x: _blur3d_b(x, reg_sigma), curve_out,
+            lambda x: _blur3d_b(x, reg_sigma), curve_out, min_steps=search_min_steps,
         )
 
     offsets = torch.arange(-r, r + 1e-6, trial_step, device=fixed.device, dtype=fixed.dtype)
@@ -2196,6 +2205,7 @@ def _build_flow3d_fn(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
 ):
     """Build a 3-D ``(fixed, moving) -> disp`` PE estimator, ``(B,X,Y,Z)`` in and out.
 
@@ -2223,6 +2233,7 @@ def _build_flow3d_fn(
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
                 peak_mode=peak_mode,
+                search_min_steps=search_min_steps,
                 curve_out=curve_out,
             )
             if conf_out is not None:
@@ -2391,6 +2402,7 @@ def _run_3dacq_plain(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     save_corr_curve: int | None = None,
 ) -> LocomocoResult:
     """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
@@ -2416,6 +2428,7 @@ def _run_3dacq_plain(
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
         peak_mode=peak_mode,
+        search_min_steps=search_min_steps,
     )
 
     # xcorr searchlight diagnostics, filled by the LAST estimate pass (see _refine_loop):
@@ -2603,6 +2616,7 @@ def xcorr_search_flow_3d_multiecho(
     reg_sigma: float = 1.5,
     fourier_shift: bool = True,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     ambiguity_frac: float = 0.5,
     curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2665,7 +2679,7 @@ def xcorr_search_flow_3d_multiecho(
     if peak_mode == "first_peak":
         s_field, conf = _sweep_first_peak(
             _pooled_ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac,
-            lambda x: _blur3d_b(x, reg_sigma), curve_out,
+            lambda x: _blur3d_b(x, reg_sigma), curve_out, min_steps=search_min_steps,
         )
         return s_field / float(alpha[m]), conf  # echo-1 scale (alpha_1 = 1)
 
@@ -2781,6 +2795,7 @@ def estimate_residual_flow_multiecho(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -2865,6 +2880,7 @@ def estimate_residual_flow_multiecho(
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
         peak_mode=peak_mode,
+        search_min_steps=search_min_steps,
     )
 
     # Confidence map from the pooled searchlight (fixed/flat-scaling xcorr path only — the
@@ -2927,6 +2943,7 @@ def estimate_residual_flow_multiecho(
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
                 peak_mode=peak_mode,
+                search_min_steps=search_min_steps,
                 curve_out=curve_acc,
             )
             out[..., t] = w_be[0].cpu()
@@ -3119,6 +3136,7 @@ def estimate_residual_flow_me_scaled(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -3171,6 +3189,7 @@ def estimate_residual_flow_me_scaled(
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
         peak_mode=peak_mode,
+        search_min_steps=search_min_steps,
         device=device,
         verbose=verbose,
     )
@@ -3261,6 +3280,7 @@ def estimate_residual_flow_me_interecho(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
     save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -3400,6 +3420,7 @@ def estimate_residual_flow_me_interecho(
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
                 peak_mode=peak_mode,
+                search_min_steps=search_min_steps,
                 curve_out=curve_acc,
             )
             g = g_be[0]

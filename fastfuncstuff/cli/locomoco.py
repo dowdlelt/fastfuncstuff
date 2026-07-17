@@ -422,6 +422,17 @@ def create_parser() -> argparse.ArgumentParser:
         "small clips real motion. flow ignores it (pyramid handles range).",
     )
     search.add_argument(
+        "-search_min_steps",
+        "-search-min-steps",
+        type=int,
+        default=5,
+        metavar="N",
+        help="[xcorr 3-D first-peak] Minimum trial-offset samples swept per side before the "
+        "adaptive early-stop can fire — enough points to know a voxel is really rising (one "
+        "point at ±0.5 vox isn't). Clamped to the search range, so a tiny -max_shift / coarse "
+        "-xcorr_step just searches what's there. Default 5.",
+    )
+    search.add_argument(
         "-argmax",
         action="store_true",
         help="[xcorr 3-D] Use the classic global-argmax peak over the full ±max_shift grid "
@@ -991,6 +1002,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
+            search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
             device=device,
         )
@@ -1022,6 +1034,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
+            search_min_steps=args.search_min_steps,
             device=device,
         )
     else:
@@ -1050,6 +1063,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
+            search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
             device=device,
         )
@@ -1296,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
+            search_min_steps=args.search_min_steps,
             device=device,
         )
     else:
@@ -1328,6 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
+            search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
             device=device,
         )
