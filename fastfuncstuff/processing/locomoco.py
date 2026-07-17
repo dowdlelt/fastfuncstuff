@@ -1141,58 +1141,37 @@ def estimate_residual_flow(
             warp_interp,
             first_n=first_n,
         )
-    # Outer reference-refinement: the reference defines "zero", so a blurred/biased
-    # one biases every shift. Rebuild it from the corrected series (motion removed →
-    # sharp template) and re-register the ORIGINAL frames against it, converging the
-    # template. The reference AGGREGATE honours -ref and -first_n (a max/first_n
-    # reference stays FoV-filled / stretch-free through refinement). Each pass prints
-    # its step size (RMS displacement change, in-brain); -converge / -converge_rel stop
-    # early once the step (or its improvement) plateaus.
+    # Outer reference-refinement (shared engine): rebuild the reference from the
+    # corrected series and re-register, converging the template out of its bias. The
+    # aggregate honours -ref and -first_n; the step is the in-brain rms of the stacked
+    # (u, v) change.
     if refine_rounds > 0:
         brain = _brain_mask_from(corrected.abs().mean(dim=0))  # (nS, H, W)
-        prev = torch.stack([u_all, v_all])
-        prev_step: float | None = None
-    for i in range(max(0, refine_rounds)):
-        # Snapshot the pre-pass estimate so a diverging pass can be rolled back.
-        saved = (u_all, v_all, corrected)
-        new_ref = _refine_reduce(corrected, ref_mode, 0, first_n)  # (nS, H, W) sharp template
-        u_all, v_all, corrected = _estimate_static(
-            vol,
-            ref_mode,
-            pe_flow_is_u,
-            smooth_sigma,
-            flow_fn,
-            device,
-            dual,
-            warp_interp,
-            ref_override=new_ref,
+
+        def _est_2d(new_ref):
+            u, v, corr = _estimate_static(
+                vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual,
+                warp_interp, ref_override=new_ref,
+            )
+            return torch.stack([u, v]), corr
+
+        def _brain_rms_2d(delta):
+            d = delta[:, :, brain]  # (2, nt, N_brain)
+            return float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
+
+        stacked, corrected = _refine_loop(
+            _est_2d,
+            torch.stack([u_all, v_all]),
+            corrected,
+            reduce_ref=lambda c: _refine_reduce(c, ref_mode, 0, first_n),
+            brain_rms=_brain_rms_2d,
+            refine_rounds=refine_rounds,
+            converge=converge,
+            converge_rel=converge_rel,
+            max_shift=max_shift,
+            verbose=verbose,
         )
-        cur = torch.stack([u_all, v_all])
-        d = (cur - prev)[:, :, brain]
-        step = float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
-        if verbose:
-            print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
-        # Divergence guard: a healthy refinement's step shrinks. A pass that moves
-        # the field markedly MORE than the previous one (or by more than a whole
-        # max_shift — not a refinement) is rebuilding its reference from an over-warped
-        # series; roll back to the pre-pass estimate and stop rather than compound it.
-        # The 1.5× margin tolerates minor pass-to-pass fluctuation on real data.
-        diverged = step > max_shift or (prev_step is not None and step > 1.5 * prev_step)
-        if diverged:
-            u_all, v_all, corrected = saved
-            if verbose:
-                print(
-                    f"   ⚠ refine pass {i + 1} diverged (Δ {step:.4f} vox) — "
-                    f"reverting to pass {i} and stopping."
-                )
-            break
-        prev = cur
-        reason = _refine_converged(step, prev_step, converge, converge_rel)
-        prev_step = step
-        if reason is not None:
-            if verbose:
-                print(f"   ✓ converged ({reason}) — stopping refine at pass {i + 1}.")
-            break
+        u_all, v_all = stacked[0], stacked[1]
 
     soft = None
     if automask:
@@ -1944,6 +1923,65 @@ def _refine_converged(
     return None
 
 
+def _refine_loop(
+    estimate,
+    disp,
+    corrected,
+    *,
+    reduce_ref,
+    brain_rms,
+    refine_rounds: int,
+    converge: float,
+    converge_rel: float,
+    max_shift: float,
+    verbose: bool,
+):
+    """Outer reference-refinement loop — shared by the 2-D, 3-D and multi-echo paths.
+
+    The reference defines "zero motion", so a blurred/biased one biases every shift.
+    After the first estimate, rebuild the reference from the corrected series (motion
+    removed → sharp) via ``reduce_ref`` and re-``estimate`` against it, converging the
+    template out of its bias.
+
+    - ``estimate(new_ref) -> (disp, corrected)`` re-runs the per-frame estimator.
+    - ``reduce_ref(corrected) -> new_ref`` aggregates the corrected series (honouring
+      ``-ref`` / ``-first_n``) into the next reference.
+    - ``brain_rms(Δdisp) -> float`` is the in-brain rms of a displacement change — the
+      step size, layout-specific so each caller supplies its own (its ``disp`` may be a
+      stacked ``(2,…)`` u/v or a plain ``(…,T)`` field).
+
+    A pass whose step grows markedly (>1.5× the previous, or > ``max_shift`` outright) is
+    compounding an over-warped reference: roll it back and stop. ``-converge`` /
+    ``-converge_rel`` stop early once the step (or its improvement) plateaus.
+    """
+    if refine_rounds <= 0:
+        return disp, corrected
+    prev = disp
+    prev_step: float | None = None
+    for i in range(refine_rounds):
+        saved = (disp, corrected)  # roll back to here if this pass diverges
+        disp, corrected = estimate(reduce_ref(corrected))
+        step = brain_rms(disp - prev)
+        if verbose:
+            print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
+        if step > max_shift or (prev_step is not None and step > 1.5 * prev_step):
+            disp, corrected = saved
+            if verbose:
+                print(
+                    f"   ⚠ refine pass {i + 1} diverged (Δ {step:.4f} vox) — "
+                    f"reverting to pass {i} and stopping."
+                )
+            break
+        prev = disp
+        reason = _refine_converged(step, prev_step, converge, converge_rel)
+        prev_step = step
+        if reason is not None:
+            if verbose:
+                print(f"   ✓ converged ({reason}) — stopping refine at pass {i + 1}.")
+            break
+    return disp, corrected
+
+
 def _run_3dacq_plain(
     data: np.ndarray,
     pe_axis: int,
@@ -2004,39 +2042,23 @@ def _run_3dacq_plain(
         return disp, corrected
 
     disp, corrected = _estimate(_select_ref_vol(vol4d, ref_mode, first_n).to(device))
-    # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D): rebuild
-    # the reference from the corrected series (motion removed → sharp) and re-register,
-    # converging the template out of its bias. The aggregate honours -ref and -first_n;
-    # each pass prints its step size and -converge / -converge_rel can stop it early.
+    # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D) via the
+    # shared engine: rebuild the reference from the corrected series and re-register.
+    # The aggregate honours -ref and -first_n; the step is the in-brain rms of the field.
     if refine_rounds > 0:
         brain = _brain_mask_from(corrected.abs().mean(dim=3))  # (nx, ny, nz)
-        prev = disp
-        prev_step: float | None = None
-    for i in range(max(0, refine_rounds)):
-        saved = (disp, corrected)  # roll back to here if this pass diverges
-        disp, corrected = _estimate(_refine_reduce(corrected, ref_mode, 3, first_n).to(device))
-        step = float((disp - prev)[brain].pow(2).mean().sqrt())
-        if verbose:
-            print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
-        # Divergence guard (see the 2-D path): a pass that changes the field markedly
-        # more than the previous one (or by > max_shift) is compounding an over-warped
-        # reference. The 1.5× margin tolerates minor fluctuation on real data.
-        diverged = step > max_shift or (prev_step is not None and step > 1.5 * prev_step)
-        if diverged:
-            disp, corrected = saved
-            if verbose:
-                print(
-                    f"   ⚠ refine pass {i + 1} diverged (Δ {step:.4f} vox) — "
-                    f"reverting to pass {i} and stopping."
-                )
-            break
-        prev = disp
-        reason = _refine_converged(step, prev_step, converge, converge_rel)
-        prev_step = step
-        if reason is not None:
-            if verbose:
-                print(f"   ✓ converged ({reason}) — stopping refine at pass {i + 1}.")
-            break
+        disp, corrected = _refine_loop(
+            _estimate,
+            disp,
+            corrected,
+            reduce_ref=lambda c: _refine_reduce(c, ref_mode, 3, first_n).to(device),
+            brain_rms=lambda delta: float(delta[brain].pow(2).mean().sqrt()),
+            refine_rounds=refine_rounds,
+            converge=converge,
+            converge_rel=converge_rel,
+            max_shift=max_shift,
+            verbose=verbose,
+        )
 
     if automask:
         soft = _build_soft_mask(data, disp_slice, a0, a1, automask_dilate, automask_sigma, device)
@@ -2519,36 +2541,42 @@ def estimate_residual_flow_multiecho(
     # Rebuild each echo's reference from its corrected series (sharp) and re-solve, with the
     # divergence guard / convergence checks of the single-echo 3-D path.
     if refine_rounds > 0:
+        # State is w itself (corrected is derived per echo on demand); the shared engine
+        # carries corrected == w. brain is None until w has signal, so brain_rms falls
+        # back to the whole field. Each solve's tqdm label tracks the pass number.
         brain = _brain_mask_from(w.abs().mean(dim=3)) if float(w.abs().max()) > 0 else None
-        prev = w
-        prev_step: float | None = None
-        for i in range(refine_rounds):
-            saved = w
-            new_refs = [
-                _refine_reduce(_corrected_echo(w, j), ref_mode, 3, first_n).to(device)
+        _pass = {"n": 0}
+
+        def _reduce_me(cur_w):
+            refs = [
+                _refine_reduce(_corrected_echo(cur_w, j), ref_mode, 3, first_n).to(device)
                 for j in range(e)
             ]
             if smooth_sigma > 0:
-                new_refs = [_blur3d_b(r[None], smooth_sigma)[0] for r in new_refs]
-            w = _solve_w(new_refs, f"refine {i + 1}/{refine_rounds}")
-            d = (w - prev)[brain] if brain is not None else (w - prev)
-            step = float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
-            if verbose:
-                print(
-                    f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)"
-                )
-            if step > max_shift or (prev_step is not None and step > 1.5 * prev_step):
-                w = saved
-                if verbose:
-                    print(f"   ⚠ refine pass {i + 1} diverged (Δ {step:.4f} vox) — reverting.")
-                break
-            prev = w
-            reason = _refine_converged(step, prev_step, converge, converge_rel)
-            prev_step = step
-            if reason is not None:
-                if verbose:
-                    print(f"   ✓ converged ({reason}) — stopping refine at pass {i + 1}.")
-                break
+                refs = [_blur3d_b(r[None], smooth_sigma)[0] for r in refs]
+            return refs
+
+        def _est_me(new_refs):
+            _pass["n"] += 1
+            w_new = _solve_w(new_refs, f"refine {_pass['n']}/{refine_rounds}")
+            return w_new, w_new
+
+        def _brain_rms_me(delta):
+            d = delta[brain] if brain is not None else delta
+            return float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
+
+        w, _ = _refine_loop(
+            _est_me,
+            w,
+            w,
+            reduce_ref=_reduce_me,
+            brain_rms=_brain_rms_me,
+            refine_rounds=refine_rounds,
+            converge=converge,
+            converge_rel=converge_rel,
+            max_shift=max_shift,
+            verbose=verbose,
+        )
 
     if automask:
         # One shared mask from the across-echo mean (all echoes share geometry).
