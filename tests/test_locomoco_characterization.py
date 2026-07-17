@@ -20,6 +20,11 @@ from fastfuncstuff.processing import locomoco as L
 # recovery tests in test_locomoco.py are the accuracy gate and hold exactly. So pin at the
 # LOGIC level — real bugs move fields by >= 1e-2 (refine errors, alpha inflation, railing),
 # well clear of this floor. Flow paths stay byte-stable regardless.
+#
+# The 3-D / multi-echo xcorr baselines were re-captured 2026-07-18 when the searchlight
+# adopted the sinc-exact Fourier trial-shift (no linear-interp blur → no spurious
+# fractional-shift correlation). The recovery tests confirmed accuracy held. 2-D xcorr
+# still uses the linear shift (untouched), so its baseline is unchanged.
 ATOL = 6e-3
 
 
@@ -92,8 +97,8 @@ def test_char_3d_xcorr():
     )
     _assert_stats(
         r.pe_displacement(),
-        {"mean": -0.013890, "std": 0.407110, "q05": -0.544289, "q50": 0.000000,
-         "q95": 0.684066, "absmax": 0.790814},
+        {"mean": -0.018461, "std": 0.402947, "q05": -0.547031, "q50": 0.000000,
+         "q95": 0.667173, "absmax": 0.753586},
     )
 
 
@@ -116,10 +121,10 @@ def test_char_me_joint():
     )
     _assert_stats(
         r.w_field,
-        {"mean": -0.062905, "std": 0.952629, "q05": -1.606450, "q50": -0.066638,
-         "q95": 1.422776, "absmax": 2.946435},
+        {"mean": -0.080138, "std": 1.131369, "q05": -2.022427, "q50": -0.096785,
+         "q95": 1.894102, "absmax": 3.216780},
     )
-    assert np.allclose(r.alpha.tolist(), [1.0, 0.51805, 0.50896], atol=ATOL)
+    assert np.allclose(r.alpha.tolist(), [1.0, 0.16552, 0.1653], atol=ATOL)
 
 
 def test_char_me_fixed():
@@ -129,8 +134,8 @@ def test_char_me_fixed():
     )
     _assert_stats(
         r.w_field,
-        {"mean": -0.006080, "std": 0.191693, "q05": -0.332378, "q50": -0.009565,
-         "q95": 0.326464, "absmax": 0.559573},
+        {"mean": 0.001090, "std": 0.123225, "q05": -0.165402, "q50": -0.003304,
+         "q95": 0.177724, "absmax": 0.577891},
     )
 
 
@@ -140,8 +145,8 @@ def test_char_me_interecho():
     )
     _assert_stats(
         r.w_field,
-        {"mean": 0.015821, "std": 1.071839, "q05": -1.782340, "q50": 0.058805,
-         "q95": 1.736312, "absmax": 2.514012},
+        {"mean": 0.044876, "std": 0.957722, "q05": -1.499935, "q50": 0.105364,
+         "q95": 1.503181, "absmax": 2.578453},
     )
 
 
@@ -151,6 +156,6 @@ def test_char_me_scaled():
     )
     _assert_stats(
         r.w_field,
-        {"mean": 0.000510, "std": 0.159588, "q05": -0.238043, "q50": -0.001732,
-         "q95": 0.252336, "absmax": 0.554175},
+        {"mean": 0.003652, "std": 0.163046, "q05": -0.267756, "q50": -0.001579,
+         "q95": 0.293319, "absmax": 0.609583},
     )

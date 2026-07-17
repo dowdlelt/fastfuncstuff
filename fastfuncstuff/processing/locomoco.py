@@ -1854,6 +1854,40 @@ def _shift3d_axis(vol: torch.Tensor, shift, axis: int, mode: str = "bilinear") -
     return out.squeeze(1)
 
 
+def _fourier_shifter(moving: torch.Tensor, axis: int, pad: int):
+    """Build a scalar-shift function for ``(B,X,Y,Z)`` via the Fourier shift theorem.
+
+    Sinc-exact sub-voxel resampling: unlike linear interpolation (a low-pass filter that
+    inflates the local correlation at fractional shifts and makes the corr curve oscillate
+    with a 1-voxel period), a global scalar shift is one phase ramp in k-space and does not
+    blur. The forward FFT along ``axis`` is computed ONCE here; each returned ``shift(s)``
+    is just a phase multiply + inverse FFT. ``pad`` replicate-pads the axis first so the
+    FFT's circular wrap-around doesn't fold the opposite edge in (cropped back after). Sign
+    matches :func:`_shift3d_axis` — a pull by ``s`` (``out[i] ≈ moving[i + s]``).
+    """
+    import math
+
+    dim = axis + 1
+    n = moving.shape[dim]
+    if pad > 0:
+        spec = [0, 0, 0, 0, 0, 0]  # F.pad order (Zl,Zr, Yl,Yr, Xl,Xr) for 4-D (B,X,Y,Z)
+        spec[2 * (2 - axis)] = pad
+        spec[2 * (2 - axis) + 1] = pad
+        moving = F.pad(moving.unsqueeze(1), spec, mode="replicate").squeeze(1)
+    npad = moving.shape[dim]
+    k = torch.fft.fftfreq(npad, device=moving.device) * (2.0 * math.pi)
+    shape = [1, 1, 1, 1]
+    shape[dim] = npad
+    k = k.reshape(shape)
+    mov_fft = torch.fft.fft(moving, dim=dim)  # precomputed once
+
+    def shift(s: float) -> torch.Tensor:
+        out = torch.fft.ifft(mov_fft * torch.exp(1j * k * s), dim=dim).real.to(moving.dtype)
+        return out.narrow(dim, pad, n).contiguous() if pad > 0 else out.contiguous()
+
+    return shift
+
+
 def optical_flow_lk_3d(
     fixed: torch.Tensor,
     moving: torch.Tensor,
@@ -1911,6 +1945,7 @@ def xcorr_search_flow_3d(
     eps: float = 1e-4,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    fourier_shift: bool = True,
     curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """3-D cross-correlation searchlight along PE — the "big block" xcorr for 3-D EPI.
@@ -1919,6 +1954,12 @@ def xcorr_search_flow_3d(
     per-voxel offset of peak local correlation under a 3-D Gaussian searchlight
     (``window_sigma``), sub-voxel by a 5-point parabola. A direct 3-D lift of
     :func:`_xcorr_shift_1d`: same streaming running-peak, 3-D window and 3-D shift.
+
+    ``fourier_shift`` (default) resamples each trial shift with the sinc-exact Fourier
+    shift theorem instead of linear interpolation: linear interp low-pass-filters the
+    image at fractional shifts, spuriously inflating the local correlation there and
+    making the corr curve oscillate with a 1-voxel period (peak away from the true shift).
+    The Fourier shift does not blur, so the curve is clean.
 
     Returns ``(field, conf)``; ``noshift_margin`` / ``reg_sigma`` are the searchlight
     robustness knobs and ``conf`` the quality map — see
@@ -1933,6 +1974,11 @@ def xcorr_search_flow_3d(
     def _win(x: torch.Tensor) -> torch.Tensor:
         return _blur3d_b(x, window_sigma)
 
+    _shifter = (
+        _fourier_shifter(moving, pe_axis, pad=int(r))
+        if fourier_shift
+        else (lambda s: _shift3d_axis(moving, s, pe_axis))
+    )
     mean_f = _win(fixed)
     var_f = (_win(fixed * fixed) - mean_f * mean_f).clamp_min(eps)
     offsets = torch.arange(-r, r + 1e-6, trial_step, device=fixed.device, dtype=fixed.dtype)
@@ -1948,7 +1994,7 @@ def xcorr_search_flow_3d(
     prev2: torch.Tensor | None = None
     for i in range(nd):
         s = float(offsets[i])
-        mw = _shift3d_axis(moving, s, pe_axis)
+        mw = _shifter(s)
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
         corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
@@ -2390,6 +2436,7 @@ def xcorr_search_flow_3d_multiecho(
     eps: float = 1e-4,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    fourier_shift: bool = True,
     curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shared-parameter 3-D xcorr searchlight across echoes — TE-linearity enforced.
@@ -2423,6 +2470,12 @@ def xcorr_search_flow_3d_multiecho(
     def _win(x: torch.Tensor) -> torch.Tensor:
         return _blur3d_b(x, window_sigma)
 
+    # One sinc-exact shifter per echo (forward FFT precomputed once); echo j is shifted by
+    # ratio[j]·s at each offset. See :func:`_fourier_shifter` / xcorr_search_flow_3d.
+    shifters = [
+        _fourier_shifter(moving_list[j], pe_axis, pad=int(r)) if fourier_shift else None
+        for j in range(e)
+    ]
     mean_f = [_win(f) for f in fixed_list]
     var_f = [
         (_win(f * f) - mf * mf).clamp_min(eps) for f, mf in zip(fixed_list, mean_f, strict=True)
@@ -2446,7 +2499,9 @@ def xcorr_search_flow_3d_multiecho(
         s = float(offsets[i])
         pooled = torch.zeros_like(z)
         for j in range(e):
-            mw = _shift3d_axis(moving_list[j], ratio[j] * s, pe_axis)
+            sj = ratio[j] * s
+            sh = shifters[j]
+            mw = sh(sj) if sh is not None else _shift3d_axis(moving_list[j], sj, pe_axis)
             mean_m = _win(mw)
             var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
             corr = (_win(fixed_list[j] * mw) - mean_f[j] * mean_m) / torch.sqrt(var_f[j] * var_m)

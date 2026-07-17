@@ -676,6 +676,41 @@ def _yshift3d(vol, s):
     return _shift3d_axis(torch.from_numpy(vol)[None], float(s), 1)[0].numpy()
 
 
+def test_fourier_shift_removes_fractional_correlation_bias():
+    """Linear-interpolation resampling low-passes the image at fractional shifts, which
+    inflates the local correlation there and pulls the search peak off the true shift. The
+    sinc-exact Fourier trial-shift (default) does not blur, so the peak sits at the truth.
+
+    Aligned noisy images (true shift 0): the averaged corr curve must peak at 0 under
+    Fourier, and be biased to a fractional offset under the linear shift."""
+    rng = np.random.default_rng(0)
+    Z = 48
+    z = np.arange(Z, dtype=np.float32)
+    smooth = (np.sin(z / 3.0) + 0.5 * np.sin(z / 1.7))[None, None, None].repeat(12, 1).repeat(12, 2)
+    offs = np.arange(-3, 3.001, 0.5, dtype=np.float32)
+
+    def mean_curve(fourier):
+        acc = np.zeros(len(offs))
+        for _ in range(12):
+            fx = torch.from_numpy((smooth + 0.6 * rng.standard_normal((1, 12, 12, Z))).astype("f4"))
+            mv = torch.from_numpy((smooth + 0.6 * rng.standard_normal((1, 12, 12, Z))).astype("f4"))
+            curve: list[torch.Tensor] = []
+            xcorr_search_flow_3d(
+                fx, mv, pe_axis=2, max_shift=3, trial_step=0.5, reg_sigma=0.0,
+                fourier_shift=fourier, curve_out=curve,
+            )
+            acc += np.array([float(c[0, :, :, 12:36].mean()) for c in curve])
+        return acc / 12
+
+    fou = mean_curve(True)
+    lin = mean_curve(False)
+    c0 = len(offs) // 2  # index of offset 0
+    assert offs[int(fou.argmax())] == 0.0  # Fourier peaks at the true shift
+    assert fou[c0] >= fou.max() - 1e-6
+    # Linear inflates fractional offsets → its peak is pulled off zero.
+    assert offs[int(lin.argmax())] != 0.0
+
+
 def test_optical_flow_lk_3d_recovers_uniform_shift():
     vol = _phantom3d()
     moved = _yshift3d(vol, 1.3)  # content shifted +1.3 along y
