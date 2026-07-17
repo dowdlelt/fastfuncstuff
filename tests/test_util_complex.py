@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import nibabel as nib
 import numpy as np
+import torch
 
-from fastfuncstuff.cli.util_complex import main
+from fastfuncstuff.cli.util_complex import _convert_streaming, main
+from fastfuncstuff.processing.complex import magnitude_phase_to_real_imag
 
 
 def _write(path, data):
@@ -77,6 +79,32 @@ def test_scale_phase_and_allow_suppressing_magnitude(tmp_path):
     np.testing.assert_allclose(
         np.abs(nib.load(tmp_path / "polar_phase.nii.gz").get_fdata()), [[[np.pi, np.pi]]]
     )
+
+
+def test_convert_streaming_matches_fresh_alloc_and_round_trips():
+    """In-place streaming equals a fresh-allocation reference and round-trips exactly.
+
+    The streaming path writes each output back over its input buffer to halve peak RAM;
+    a read-after-write aliasing slip would silently corrupt data, so pin it down here.
+    """
+    torch.manual_seed(0)
+    mag = (torch.rand(9, 10, 11, 7) * 100).float()
+    phase = (torch.rand(9, 10, 11, 7) * 2 * torch.pi - torch.pi).float()
+
+    real_ref, imag_ref = magnitude_phase_to_real_imag(mag, phase)
+    real, imag = _convert_streaming(mag.clone(), phase.clone(), "mag_phase_to_real_imag")
+    assert torch.equal(real, real_ref) and torch.equal(imag, imag_ref)
+
+    mag_back, phase_back = _convert_streaming(real.clone(), imag.clone(), "real_imag_to_mag_phase")
+    assert torch.allclose(mag_back, mag, atol=1e-4)
+    assert torch.allclose(phase_back, phase, atol=1e-5)
+
+    # Non-contiguous input (reshape(-1) copies) must still give the right values + shape.
+    mp, pp = mag.permute(3, 0, 1, 2), phase.permute(3, 0, 1, 2)
+    r_nc, i_nc = _convert_streaming(mp, pp, "mag_phase_to_real_imag")
+    r_c, i_c = magnitude_phase_to_real_imag(mp.contiguous(), pp.contiguous())
+    assert r_nc.shape == mp.shape
+    assert torch.equal(r_nc, r_c) and torch.equal(i_nc, i_c)
 
 
 def test_input_pair_and_output_validation(tmp_path):

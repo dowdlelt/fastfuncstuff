@@ -11,7 +11,7 @@ import torch
 from tqdm import tqdm
 
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, parse_prefix, spinner
-from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.processing.complex import (
     magnitude_phase_to_real_imag,
     real_imag_to_magnitude_phase,
@@ -73,53 +73,56 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _convert_in_chunks(
+def _convert_streaming(
     first: torch.Tensor,
     second: torch.Tensor,
     direction: str,
-    device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stream elementwise conversion through the requested device when needed."""
+    """Elementwise polar<->Cartesian conversion, streamed in place on the host.
+
+    The math (``mag·cos φ`` / ``hypot`` / ``atan2``) is a single memory-bandwidth-bound
+    elementwise pass, so it stays on the CPU on purpose: a GPU would only add PCIe
+    round-trips (H2D + D2H) for a cos/sin that costs almost nothing — PCIe is slower
+    than host RAM and torch's CPU kernels are already vectorised. Each output is written
+    back over its input buffer — real over ``first``, imag over ``second`` (or mag/phase)
+    — because every element's outputs depend only on that same element's two inputs, so
+    the peak footprint is the two in/out buffers, not four. Chunking bounds only the
+    per-chunk cos/sin temporaries, sized from free RAM via the [[Memory module]].
+    """
+    fn = (
+        magnitude_phase_to_real_imag
+        if direction == "mag_phase_to_real_imag"
+        else real_imag_to_magnitude_phase
+    )
+    # reshape(-1) is a view for contiguous inputs (load_image returns contiguous), so the
+    # in-place writes below land in `first`/`second`'s own storage — no extra full copy.
     first_flat = first.reshape(-1)
     second_flat = second.reshape(-1)
-    result_one = torch.empty_like(first_flat, memory_format=torch.contiguous_format)
-    result_two = torch.empty_like(second_flat, memory_format=torch.contiguous_format)
-    n_voxels = first_flat.numel()
+    n = first_flat.numel()
 
-    # Keep complete NIfTI inputs and outputs in CPU RAM.  CUDA receives only a
-    # bounded chunk, avoiding an all-volume device allocation for long 4-D runs.
-    if device.type == "cuda":
-        chunk_size = estimate_chunk_size(
-            n_voxels=n_voxels,
-            n_timepoints=1,
-            n_regressors=0,
-            device=device,
-            operation="glm",
-        )
-    else:
-        chunk_size = n_voxels
+    # Per-chunk transient inside `fn`: 2 outputs + ~2 cos/sin temporaries. Bound it to
+    # free host RAM (>=1M elems so tiny-RAM runs still progress; <= the whole array).
+    live_buffers = 4
+    budget = get_available_memory(torch.device("cpu"))
+    chunk = max(1 << 20, min(int(budget // (live_buffers * first_flat.element_size())), n))
 
-    starts = range(0, n_voxels, chunk_size)
-    n_chunks = (n_voxels + chunk_size - 1) // chunk_size
+    n_chunks = (n + chunk - 1) // chunk
     for start in tqdm(
-        starts,
+        range(0, n, chunk),
         total=n_chunks,
         desc="Converting complex data",
         unit="chunk",
         leave=True,
         disable=n_chunks <= 1,
     ):
-        stop = min(start + chunk_size, n_voxels)
-        x = first_flat[start:stop].to(device)
-        y = second_flat[start:stop].to(device)
-        if direction == "mag_phase_to_real_imag":
-            out_one, out_two = magnitude_phase_to_real_imag(x, y)
-        else:
-            out_one, out_two = real_imag_to_magnitude_phase(x, y)
-        result_one[start:stop] = out_one.cpu()
-        result_two[start:stop] = out_two.cpu()
+        stop = min(start + chunk, n)
+        # fn materialises both outputs before we overwrite either input slice, so the
+        # in-place write is safe (no read-after-write aliasing).
+        out_one, out_two = fn(first_flat[start:stop], second_flat[start:stop])
+        first_flat[start:stop] = out_one
+        second_flat[start:stop] = out_two
 
-    return result_one.reshape(first.shape), result_two.reshape(second.shape)
+    return first_flat.reshape(first.shape), second_flat.reshape(second.shape)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -166,6 +169,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    # This is a memory-bandwidth-bound elementwise pass; a GPU only adds PCIe
+    # transfers for a trivial cos/sin, so it runs on the host regardless of -device.
+    # Say so rather than silently overriding the flag.
+    if device.type != "cpu" and args.verb >= 1:
+        print(f"Note: complex conversion is memory-bound; running on host, not {device.type}.")
+
     with spinner(f"Loading {Path(input_paths[0]).name} and {Path(input_paths[1]).name}"):
         first, header_info = load_image(input_paths[0])
         second, _ = load_image(input_paths[1])
@@ -183,10 +192,10 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
-        output_one, output_two = _convert_in_chunks(first, second, "mag_phase_to_real_imag", device)
+        output_one, output_two = _convert_streaming(first, second, "mag_phase_to_real_imag")
         output_specs = (("real", output_one, args.no_real), ("imag", output_two, args.no_imag))
     else:
-        output_one, output_two = _convert_in_chunks(first, second, "real_imag_to_mag_phase", device)
+        output_one, output_two = _convert_streaming(first, second, "real_imag_to_mag_phase")
         output_specs = (("mag", output_one, args.no_mag), ("phase", output_two, args.no_phase))
 
     prefix = parse_prefix(args.prefix)
@@ -203,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             if mag_phase
             else "real/imaginary -> magnitude/phase"
         )
-        print(f"ffs_util_complex: {direction} on {device}")
+        print(f"ffs_util_complex: {direction}")
         for path in paths:
             print(f"  Wrote: {path}")
     return 0
