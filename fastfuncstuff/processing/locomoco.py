@@ -362,15 +362,22 @@ def _first_peak_field_and_conf(
 
 
 def _sweep_first_peak(
-    ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac, blur, curve_out
+    ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac, blur, curve_out,
+    min_rising_frac: float = 0.001,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Outward-from-zero sweep + first-peak finder (the B+C path).
 
     ``ncc(s)`` returns the per-voxel local correlation at offset ``s``. Sweeps
-    ``s = 0, ±step, ±2·step, …`` and **grows the range only while some voxel is still
-    rising** — once none is, every voxel has passed its first peak, so we stop (the
-    data-adaptive speedup: mostly-small shifts search ~±1, not ±r). When ``curve_out`` is
-    requested the full ±r range is swept so the saved landscape is complete.
+    ``s = 0, ±step, ±2·step, …`` outward, first checkpoint at ±0.5 voxel, then **grows the
+    range only while more than a FRACTION of voxels is still rising** — so a *coherent*
+    large-shift region (which keeps that fraction up) IS searched to completion, and the
+    sweep only stops once the still-rising set drops below ``min_rising_frac`` (≈14³ voxels
+    of a whole-brain volume). The leftover stragglers below that are scattered noise/dropout
+    (handled by reg/mask), so clamping them where they are is safe. This is the data-adaptive
+    speedup: mostly-small motion searches ~±1 instead of ±r. A plain "any voxel still rising"
+    test never fires across millions of voxels — some noise voxel is always climbing — hence
+    the fraction. When ``curve_out`` is requested the full ±r range is swept so the saved
+    landscape is complete.
     """
     corr0 = ncc(0.0)
     pos = [corr0]
@@ -378,6 +385,8 @@ def _sweep_first_peak(
     pos_rising = torch.ones_like(corr0, dtype=torch.bool)
     neg_rising = torch.ones_like(corr0, dtype=torch.bool)
     kmax = int(round(r / trial_step))
+    k_min = max(1, int(round(0.5 / trial_step)))  # first checkpoint at ±0.5 voxel
+    n_vox = corr0.numel()
     early = curve_out is None
     for k in range(1, kmax + 1):
         s = k * trial_step
@@ -386,8 +395,10 @@ def _sweep_first_peak(
         neg_rising = neg_rising & (cn > neg[-1])
         pos.append(cp)
         neg.append(cn)
-        if early and not bool((pos_rising | neg_rising).any()):
-            break
+        if early and k >= k_min:
+            frac = float((pos_rising | neg_rising).sum()) / n_vox
+            if frac < min_rising_frac:
+                break
     if curve_out is not None:
         for cc in reversed(neg[1:]):
             curve_out.append(cc.detach().cpu())
