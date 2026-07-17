@@ -666,6 +666,10 @@ class LocomocoResult:
     drift_rms: float | None = None  # chain-vs-anchor drift (in-brain), voxels
     drift_max: float | None = None
     fused: bool = False  # whether the anchor smoother was engaged
+    # ── xcorr searchlight diagnostics — None unless the xcorr backend ran ──
+    confidence: torch.Tensor | None = None  # (nx,ny,nz,T) per-voxel peak quality map
+    corr_curve: torch.Tensor | None = None  # (nx,ny,nz,nd) per-voxel corr vs offset, one frame
+    corr_offsets: torch.Tensor | None = None  # (nd,) trial offsets (voxels) for corr_curve
 
     def _to_nifti(self, canon: torch.Tensor) -> torch.Tensor:
         inv = [0, 0, 0, 0]
@@ -1040,6 +1044,7 @@ def estimate_residual_flow(
     is_3dacq: bool = False,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -1121,6 +1126,7 @@ def estimate_residual_flow(
             automask_sigma=automask_sigma,
             noshift_margin=noshift_margin,
             reg_sigma=reg_sigma,
+            save_corr_curve=save_corr_curve,
             device=device,
             verbose=verbose,
         )
@@ -1863,17 +1869,23 @@ def _build_flow3d_fn(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
 ):
-    """Build a 3-D ``(fixed, moving) -> disp`` PE estimator, ``(B,X,Y,Z)`` in and out."""
+    """Build a 3-D ``(fixed, moving) -> disp`` PE estimator, ``(B,X,Y,Z)`` in and out.
+
+    The returned ``f`` optionally appends the xcorr searchlight quality map to ``conf_out``
+    and the per-offset correlation stack to ``curve_out`` (both no-ops for the flow
+    backend, which has no per-voxel search) — so single-echo callers get the same
+    confidence / correlation-landscape diagnostics as the multi-echo paths.
+    """
     if backend == "flow":
 
-        def f(fx: torch.Tensor, mv: torch.Tensor) -> torch.Tensor:
+        def f(fx, mv, **_unused) -> torch.Tensor:  # flow has no searchlight conf/curve
             return optical_flow_lk_3d(
                 fx, mv, pe_axis, n_levels=n_levels, n_iters=n_iters, window_sigma=window_sigma
             )
     elif backend == "xcorr":
 
-        def f(fx: torch.Tensor, mv: torch.Tensor) -> torch.Tensor:
-            field, _conf = xcorr_search_flow_3d(
+        def f(fx, mv, conf_out=None, curve_out=None) -> torch.Tensor:
+            field, conf = xcorr_search_flow_3d(
                 fx,
                 mv,
                 pe_axis,
@@ -1882,7 +1894,10 @@ def _build_flow3d_fn(
                 trial_step=trial_step,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
+                curve_out=curve_out,
             )
+            if conf_out is not None:
+                conf_out.append(conf)
             return field
     elif backend == "phase":
         raise ValueError(
@@ -2046,6 +2061,7 @@ def _run_3dacq_plain(
     verbose: bool,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    save_corr_curve: int | None = None,
 ) -> LocomocoResult:
     """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
     nx, ny, nz, nt = data.shape
@@ -2071,6 +2087,13 @@ def _run_3dacq_plain(
         reg_sigma=reg_sigma,
     )
 
+    # xcorr searchlight diagnostics, filled by the LAST estimate pass (see _refine_loop):
+    # per-voxel confidence over the whole series, and the correlation landscape of one frame.
+    xc = backend == "xcorr"
+    conf_field = torch.zeros(nx, ny, nz, nt) if xc else None
+    curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
+    curve_box: dict[str, torch.Tensor | None] = {"curve": None, "offsets": None}
+
     def _estimate(ref_vol: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         fxb = _blur3d_b(ref_vol[None], smooth_sigma)[0] if smooth_sigma > 0 else ref_vol
         disp = torch.zeros(nx, ny, nz, nt)
@@ -2078,9 +2101,17 @@ def _run_3dacq_plain(
         for t in tqdm(range(nt), desc="locomoco 3D", unit="frame", leave=True, disable=nt < 3):
             mv = vol4d[..., t].to(device)
             mvb = _blur3d_b(mv[None], smooth_sigma)[0] if smooth_sigma > 0 else mv
-            d = flow3d(fxb[None], mvb[None])[0]
+            conf_acc: list[torch.Tensor] | None = [] if xc else None
+            curve_acc: list[torch.Tensor] | None = [] if (xc and t == curve_frame) else None
+            d = flow3d(fxb[None], mvb[None], conf_out=conf_acc, curve_out=curve_acc)[0]
             corrected[..., t] = _shift3d_axis(mv[None], d[None], pe_axis)[0].cpu()
             disp[..., t] = d.cpu()
+            if conf_field is not None and conf_acc:
+                conf_field[..., t] = conf_acc[0][0].cpu()
+            if curve_acc is not None:
+                curve_box["curve"] = torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
+                rr = float(max(1, int(np.ceil(max_shift))))
+                curve_box["offsets"] = torch.arange(-rr, rr + 1e-6, trial_step)
         return disp, corrected
 
     disp, corrected = _estimate(_select_ref_vol(vol4d, ref_mode, first_n).to(device))
@@ -2136,6 +2167,9 @@ def _run_3dacq_plain(
         a1=a1,
         dual=False,
         corrected_nifti=corrected,
+        confidence=conf_field,
+        corr_curve=curve_box["curve"],
+        corr_offsets=curve_box["offsets"],
     )
 
 

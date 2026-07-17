@@ -627,7 +627,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-save_confidence",
         "-save-confidence",
         action="store_true",
-        help="[xcorr multi-echo] Also write the searchlight confidence map "
+        help="[xcorr] Also write the searchlight confidence map "
         "({prefix}_locomoco_confidence, 4-D) — per-voxel peak quality × prominence, the "
         "weight the field-regularizer (-reg_sigma) trusts. High where the shift is "
         "well-determined, ~0 in dropout/noise. A diagnostic for where the warp is real.",
@@ -640,7 +640,7 @@ def create_parser() -> argparse.ArgumentParser:
         const=-1,
         default=None,
         metavar="FRAME",
-        help="[xcorr multi-echo] Also write the full per-voxel correlation-vs-offset "
+        help="[xcorr] Also write the full per-voxel correlation-vs-offset "
         "SEARCH LANDSCAPE for one frame ({prefix}_locomoco_corrcurve, 4-D: x,y,z,offset). "
         "The 4th axis is the trial shift from -max_shift to +max_shift (step -xcorr_step); "
         "scrub it like a timeseries to see each voxel's correlation curve and judge whether "
@@ -783,6 +783,48 @@ def _apply_preset(args) -> str | None:
         if getattr(args, knob) == _PRESET_DEFAULTS[knob]:  # user left it default → preset sets it
             setattr(args, knob, val)
     return name
+
+
+def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
+    """Write -save_confidence / -save_corr_curve maps — shared by single- and multi-echo.
+
+    Both LocomocoResult and MultiEchoLocomocoResult carry ``confidence`` / ``corr_curve``
+    / ``corr_offsets`` (populated only by the xcorr searchlight), so one writer serves
+    every path. No-ops with an explanatory note when the running backend produced none.
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+
+    if args.save_confidence:
+        conf = getattr(result, "confidence", None)
+        if conf is not None:
+            p = f"{stem}_locomoco_confidence{ext}"
+            with spinner(f"Writing {Path(p).name}"):
+                save_nifti(conf.numpy(), p, affine=affine)
+            print(f"  • searchlight confidence map 4D: {p}")
+        else:
+            print(
+                "  • -save_confidence: no map — needs -backend xcorr (the flow/phase "
+                "backends and the learn-alpha joint solve have no per-voxel search quality)."
+            )
+
+    if args.save_corr_curve is not None:
+        cc = getattr(result, "corr_curve", None)
+        co = getattr(result, "corr_offsets", None)
+        if cc is not None and co is not None:
+            p = f"{stem}_locomoco_corrcurve{ext}"
+            with spinner(f"Writing {Path(p).name}"):
+                save_nifti(cc.numpy(), p, affine=affine)
+            offs = co.tolist()
+            op = f"{stem}_locomoco_corrcurve_offsets.1D"
+            with open(op, "w") as f:
+                f.write("# ffs_locomoco corr-curve trial offsets (voxels)\n")
+                f.write("  " + "  ".join(f"{o:g}" for o in offs) + "\n")
+            off_str = ", ".join(f"{o:g}" for o in offs)
+            print(f"  • per-voxel corr landscape 4D: {p}")
+            print(f"    offset axis (vox): [{off_str}]  → also {op}")
+        else:
+            print("  • -save_corr_curve: no landscape — needs -backend xcorr.")
 
 
 def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
@@ -1031,39 +1073,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
     print(f"  • per-echo scaling + linearity: {alpha_path}")
 
-    if args.save_confidence:
-        if result.confidence is not None:
-            conf_path = f"{stem}_locomoco_confidence{ext}"
-            with spinner(f"Writing {Path(conf_path).name}"):
-                save_nifti(result.confidence.numpy(), conf_path, affine=affine)
-            print(f"  • searchlight confidence map 4D: {conf_path}")
-        else:
-            print(
-                "  • -save_confidence: no map (only the xcorr searchlight paths produce "
-                "one — the flow backend and learn-alpha joint solve have no per-voxel "
-                "quality; use -backend xcorr with -me_fixed_scaling / -me_flat_scaling / "
-                "-me_interecho)."
-            )
-
-    if args.save_corr_curve is not None:
-        if result.corr_curve is not None and result.corr_offsets is not None:
-            curve_path = f"{stem}_locomoco_corrcurve{ext}"
-            with spinner(f"Writing {Path(curve_path).name}"):
-                save_nifti(result.corr_curve.numpy(), curve_path, affine=affine)
-            off = result.corr_offsets.tolist()
-            off_path = f"{stem}_locomoco_corrcurve_offsets.1D"
-            with open(off_path, "w") as f:
-                f.write(f"# ffs_locomoco corr-curve trial offsets (voxels), frame {corr_curve_frame}\n")
-                f.write("  " + "  ".join(f"{o:g}" for o in off) + "\n")
-            off_str = ", ".join(f"{o:g}" for o in off)
-            print(f"  • per-voxel corr landscape 4D (frame {corr_curve_frame}): {curve_path}")
-            print(f"    offset axis (vox): [{off_str}]  → also {off_path}")
-        else:
-            print(
-                "  • -save_corr_curve: no landscape (only the xcorr searchlight pools a "
-                "single per-voxel curve — use -backend xcorr with -me_fixed_scaling / "
-                "-me_flat_scaling / -me_interecho, not the flow or -me_estimate_from paths)."
-            )
+    _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
     print("✅ ffs_locomoco -me_3depi complete.")
     return 0
@@ -1151,6 +1161,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"❌ -input must be 4D, got shape {data.shape}", file=sys.stderr)
         return 2
     affine = img.affine.copy()
+
+    # Correlation-curve frame (xcorr diagnostics): bare -save_corr_curve (const -1) → middle.
+    corr_curve_frame = None
+    if args.save_corr_curve is not None:
+        corr_curve_frame = data.shape[3] // 2 if args.save_corr_curve == -1 else args.save_corr_curve
 
     # -do_blur is FWHM in mm (repo convention); convert to an in-plane voxel sigma
     # for the pre-flow Gaussian. In-plane voxel size = mean of the two non-slice axes.
@@ -1298,6 +1313,7 @@ def main(argv: list[str] | None = None) -> int:
             automask_sigma=args.automask_sigma,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            save_corr_curve=corr_curve_frame,
             device=device,
         )
 
@@ -1373,6 +1389,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  • signed PE flow 4D (voxels, ± = direction; scrub like a series): {flow_path}"
             )
+
+    _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
     if not args.no_movie:
         fmt = args.movie_format or ("mp4" if _find_ffmpeg() else "gif")
