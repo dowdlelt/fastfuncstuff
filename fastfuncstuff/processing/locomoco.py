@@ -285,6 +285,7 @@ def _xcorr_shift_1d(
     eps: float = 1e-4,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sub-voxel pull shift along ONE in-plane axis by local correlation search.
 
@@ -350,6 +351,8 @@ def _xcorr_shift_1d(
         mean_m = _win(mw)
         var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
         corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+        if curve_out is not None:
+            curve_out.append(corr.detach().cpu())
         if abs(s) < trial_step * 0.5 + 1e-6:
             zero_val = corr
         # Capture right neighbours (first the +1, then the +2) for awaiting peaks.
@@ -389,6 +392,8 @@ def xcorr_search_flow_2d(
     warp_interp: str = "bilinear",
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    conf_out: list[torch.Tensor] | None = None,
+    curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Local cross-correlation searchlight backend, same ``(fixed, moving) -> (u, v)``.
 
@@ -399,13 +404,16 @@ def xcorr_search_flow_2d(
     Single-PE searches one axis (``pe_is_u`` selects it). ``dual`` (two PE axes)
     searches BOTH, but *separably* — a 1-D search along each axis, alternating and
     warping by the running estimate for ``n_passes`` (converges in ~3) — to avoid the
-    O(trials²) blow-up of a joint 2-D offset grid.
+    O(trials²) blow-up of a joint 2-D offset grid. ``conf_out`` / ``curve_out`` capture
+    the single-PE searchlight quality / landscape (no-ops for the separable dual pass).
     """
     if not dual:
-        s, _ = _xcorr_shift_1d(
+        s, conf = _xcorr_shift_1d(
             fixed, moving, pe_is_u, max_shift, window_sigma, trial_step, interp, eps,
-            noshift_margin, reg_sigma,
+            noshift_margin, reg_sigma, curve_out=curve_out,
         )
+        if conf_out is not None:
+            conf_out.append(conf)
         z = torch.zeros_like(s)
         return (s, z) if pe_is_u else (z, s)
 
@@ -859,12 +867,17 @@ def _estimate_static(
     warp_interp="bilinear",
     ref_override=None,
     first_n=None,
+    diag=None,
 ):
     """Fixed reference: batch the flow over ALL frames at once, looping slices.
 
     ``ref_override`` (``(nS, H, W)``) bypasses ``ref_mode`` — used by the outer
     reference-refinement loop, which re-registers against the corrected-data mean.
     ``first_n`` windows the reference aggregate to the early frames.
+
+    ``diag`` (a dict) opts into the xcorr searchlight diagnostics: it is filled with
+    ``conf`` ``(nt, nS, H, W)`` and, when ``diag["curve_frame"]`` is set, ``curve``
+    ``(nd, nS, H, W)`` for that frame — both in canonical layout, empty for flow/phase.
     """
     nt, ns, hh, ww = vol.shape
     win = _time_window(vol, 0, first_n)
@@ -891,15 +904,30 @@ def _estimate_static(
     u_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
     v_all = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
     corrected = torch.zeros(nt, ns, hh, ww, dtype=torch.float32)
+    curve_frame = diag.get("curve_frame") if diag is not None else None
+    conf_all = torch.zeros(nt, ns, hh, ww) if diag is not None else None
+    curve_all: torch.Tensor | None = None  # (nd, nS, H, W), lazily sized once nd is known
     for s in tqdm(range(ns), desc="locomoco slices", unit="slice", leave=True, disable=ns < 2):
         moving_raw = vol[:, s].to(device).float()
         fixed_raw = ref[s].to(device).unsqueeze(0).expand(nt, hh, ww).contiguous().float()
         fixed = _blur2d(fixed_raw, smooth_sigma) if smooth_sigma > 0 else fixed_raw
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
-        u, v = flow_fn(fixed, moving)
+        conf_acc: list[torch.Tensor] | None = [] if diag is not None else None
+        curve_acc: list[torch.Tensor] | None = [] if curve_frame is not None else None
+        u, v = flow_fn(fixed, moving, conf_out=conf_acc, curve_out=curve_acc)
         corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp).cpu()
         u_all[:, s] = u.cpu()
         v_all[:, s] = v.cpu()
+        if conf_all is not None and conf_acc:  # xcorr populated it (flow/phase leave it empty)
+            conf_all[:, s] = conf_acc[0].cpu()
+        if curve_acc:  # per-offset (nt, H, W); keep only the target frame's landscape
+            stack = torch.stack(curve_acc, 0)[:, curve_frame]  # (nd, H, W)
+            if curve_all is None:
+                curve_all = torch.zeros(stack.shape[0], ns, hh, ww)
+            curve_all[:, s] = stack
+    if diag is not None:
+        diag["conf"] = conf_all if (conf_all is not None and float(conf_all.abs().sum()) > 0) else None
+        diag["curve"] = curve_all
     return u_all, v_all, corrected
 
 
@@ -965,13 +993,15 @@ def _build_flow_fn(
 
     A single place mapping ``-backend`` to a closure over its tuning knobs, shared
     by the plain (idea-1) and rotation-aware (idea-2) orchestrators so they can never
-    drift apart. Single-PE returns just the PE component; ``dual`` returns both.
+    drift apart. Single-PE returns just the PE component; ``dual`` returns both. The
+    closure optionally emits the xcorr searchlight quality (``conf_out``) and one-frame
+    correlation landscape (``curve_out``) — no-ops for the flow / phase backends.
     """
     if backend == "flow":
         # dual (both axes) = full 2-D flow; single respects pe_only.
         pe_only_axis = None if dual else ((0 if pe_flow_is_u else 1) if pe_only else None)
 
-        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def flow_fn(fx, mv, **_unused) -> tuple[torch.Tensor, torch.Tensor]:
             return optical_flow_lk_2d(
                 fx,
                 mv,
@@ -983,7 +1013,7 @@ def _build_flow_fn(
             )
     elif backend == "phase":
 
-        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def flow_fn(fx, mv, **_unused) -> tuple[torch.Tensor, torch.Tensor]:
             return phase_correlation_flow_2d(
                 fx,
                 mv,
@@ -997,7 +1027,7 @@ def _build_flow_fn(
             )
     elif backend == "xcorr":
 
-        def flow_fn(fx: torch.Tensor, mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def flow_fn(fx, mv, conf_out=None, curve_out=None) -> tuple[torch.Tensor, torch.Tensor]:
             return xcorr_search_flow_2d(
                 fx,
                 mv,
@@ -1009,6 +1039,8 @@ def _build_flow_fn(
                 warp_interp=warp_interp,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
+                conf_out=conf_out,
+                curve_out=curve_out,
             )
     else:
         raise ValueError(f"Unknown backend {backend!r}; expected flow | phase | xcorr.")
@@ -1165,6 +1197,13 @@ def estimate_residual_flow(
         reg_sigma=reg_sigma,
     )
 
+    # xcorr searchlight diagnostics collector (conf always; curve for one frame if asked).
+    # Progressive references don't collect (rare mode) — diag stays None there.
+    diag: dict | None = None
+    if backend == "xcorr" and ref_mode not in ("first_mean", "first_median"):
+        cf = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
+        diag = {"curve_frame": cf}
+
     progressive = ref_mode in ("first_mean", "first_median")
     if progressive:
         u_all, v_all, corrected = _estimate_cumulative(
@@ -1181,6 +1220,7 @@ def estimate_residual_flow(
             dual,
             warp_interp,
             first_n=first_n,
+            diag=diag,
         )
     # Outer reference-refinement (shared engine): rebuild the reference from the
     # corrected series and re-register, converging the template out of its bias. The
@@ -1192,7 +1232,7 @@ def estimate_residual_flow(
         def _est_2d(new_ref):
             u, v, corr = _estimate_static(
                 vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual,
-                warp_interp, ref_override=new_ref,
+                warp_interp, ref_override=new_ref, diag=diag,
             )
             return torch.stack([u, v]), corr
 
@@ -1252,6 +1292,14 @@ def estimate_residual_flow(
         a1=a1,
         dual=dual,
     )
+    # Surface the xcorr searchlight diagnostics (canonical → NIfTI layout, like the flow).
+    if diag is not None:
+        if diag.get("conf") is not None:
+            result.confidence = result._to_nifti(diag["conf"])
+        if diag.get("curve") is not None:
+            result.corr_curve = result._to_nifti(diag["curve"])
+            rr = float(max(1, int(np.ceil(max_shift))))
+            result.corr_offsets = torch.arange(-rr, rr + 1e-6, trial_step)
     if verbose:
         # Restrict the median to the moving voxels so it stays meaningful: the
         # masked-out background is exact zero and the feather ramp is near-zero —

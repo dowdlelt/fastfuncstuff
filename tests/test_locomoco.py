@@ -52,6 +52,27 @@ def known_shift_series():
     return data, shifts
 
 
+def test_2d_xcorr_emits_confidence_and_curve(known_shift_series):
+    """The 2-D single-echo xcorr path carries the same searchlight diagnostics as the
+    3-D and multi-echo paths: a (nx,ny,nz,T) confidence map and, for a chosen frame,
+    a (nx,ny,nz,nd) correlation landscape whose 4th axis is the trial offsets."""
+    data, shifts = known_shift_series
+    r = estimate_residual_flow(
+        data, pe_axis=1, slice_axis=2, backend="xcorr", max_shift=3, trial_step=0.5,
+        save_corr_curve=2, device=torch.device("cpu"), verbose=False,
+    )
+    assert r.confidence is not None and r.confidence.shape == data.shape
+    assert float(r.confidence.min()) >= 0.0
+    nd = r.corr_offsets.numel()
+    assert r.corr_curve.shape == (*data.shape[:3], nd)
+    assert torch.allclose(r.corr_offsets, torch.arange(-3.0, 3.0 + 1e-6, 0.5))
+    # flow backend produces neither (no per-voxel search).
+    rf = estimate_residual_flow(
+        data, pe_axis=1, slice_axis=2, backend="flow", device=torch.device("cpu"), verbose=False
+    )
+    assert rf.confidence is None and rf.corr_curve is None
+
+
 def test_optical_flow_recovers_uniform_translation():
     base = _phantom(40, 40, 1)[:, :, 0]
     fixed = torch.from_numpy(base)[None]
