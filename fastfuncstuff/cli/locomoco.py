@@ -422,6 +422,16 @@ def create_parser() -> argparse.ArgumentParser:
         "small clips real motion. flow ignores it (pyramid handles range).",
     )
     search.add_argument(
+        "-argmax",
+        action="store_true",
+        help="[xcorr 3-D] Use the classic global-argmax peak over the full ±max_shift grid "
+        "instead of the default first-peak finder. The first-peak finder sweeps outward "
+        "from zero, takes the first real peak nearest zero (no-shift-biased, ignores "
+        "later oscillation humps, never rails), and stops once no voxel is still rising — "
+        "usually faster and cleaner. Flip to -argmax to compare or if a peak is genuinely "
+        "far from zero and multi-modal.",
+    )
+    search.add_argument(
         "-xcorr_step",
         type=float,
         default=0.5,
@@ -980,6 +990,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask_sigma=args.automask_sigma,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            peak_mode="argmax" if args.argmax else "first_peak",
             save_corr_curve=corr_curve_frame,
             device=device,
         )
@@ -1010,6 +1021,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             flat_scaling=args.me_flat_scaling,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            peak_mode="argmax" if args.argmax else "first_peak",
             device=device,
         )
     else:
@@ -1037,6 +1049,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             flat_scaling=args.me_flat_scaling,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            peak_mode="argmax" if args.argmax else "first_peak",
             save_corr_curve=corr_curve_frame,
             device=device,
         )
@@ -1282,6 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
             automask_sigma=args.automask_sigma,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            peak_mode="argmax" if args.argmax else "first_peak",
             device=device,
         )
     else:
@@ -1313,6 +1327,7 @@ def main(argv: list[str] | None = None) -> int:
             automask_sigma=args.automask_sigma,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
+            peak_mode="argmax" if args.argmax else "first_peak",
             save_corr_curve=corr_curve_frame,
             device=device,
         )

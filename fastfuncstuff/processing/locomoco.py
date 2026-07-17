@@ -1256,6 +1256,7 @@ def estimate_residual_flow(
     is_3dacq: bool = False,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
     save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -1342,6 +1343,7 @@ def estimate_residual_flow(
             automask_sigma=automask_sigma,
             noshift_margin=noshift_margin,
             reg_sigma=reg_sigma,
+            peak_mode=peak_mode,
             save_corr_curve=save_corr_curve,
             device=device,
             verbose=verbose,
@@ -1679,6 +1681,7 @@ def estimate_residual_flow_rotaware(
     automask_sigma: float = 3.0,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -1766,6 +1769,7 @@ def estimate_residual_flow_rotaware(
             trial_step=trial_step,
             noshift_margin=noshift_margin,
             reg_sigma=reg_sigma,
+            peak_mode=peak_mode,
         )
         if is_3dacq
         else None
@@ -2180,6 +2184,7 @@ def _build_flow3d_fn(
     trial_step: float,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
 ):
     """Build a 3-D ``(fixed, moving) -> disp`` PE estimator, ``(B,X,Y,Z)`` in and out.
 
@@ -2206,6 +2211,7 @@ def _build_flow3d_fn(
                 trial_step=trial_step,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
+                peak_mode=peak_mode,
                 curve_out=curve_out,
             )
             if conf_out is not None:
@@ -2373,6 +2379,7 @@ def _run_3dacq_plain(
     verbose: bool,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
     save_corr_curve: int | None = None,
 ) -> LocomocoResult:
     """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
@@ -2397,6 +2404,7 @@ def _run_3dacq_plain(
         trial_step=trial_step,
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
+        peak_mode=peak_mode,
     )
 
     # xcorr searchlight diagnostics, filled by the LAST estimate pass (see _refine_loop):
@@ -2761,6 +2769,7 @@ def estimate_residual_flow_multiecho(
     flat_scaling: bool = False,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
     save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -2844,6 +2853,7 @@ def estimate_residual_flow_multiecho(
         trial_step=trial_step,
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
+        peak_mode=peak_mode,
     )
 
     # Confidence map from the pooled searchlight (fixed/flat-scaling xcorr path only — the
@@ -2905,6 +2915,7 @@ def estimate_residual_flow_multiecho(
                 trial_step=trial_step,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
+                peak_mode=peak_mode,
                 curve_out=curve_acc,
             )
             out[..., t] = w_be[0].cpu()
@@ -3096,6 +3107,7 @@ def estimate_residual_flow_me_scaled(
     flat_scaling: bool = False,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -3147,6 +3159,7 @@ def estimate_residual_flow_me_scaled(
         is_3dacq=True,
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
+        peak_mode=peak_mode,
         device=device,
         verbose=verbose,
     )
@@ -3236,6 +3249,7 @@ def estimate_residual_flow_me_interecho(
     automask_sigma: float = 3.0,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
     save_corr_curve: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -3374,6 +3388,7 @@ def estimate_residual_flow_me_interecho(
                 weights=weights,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
+                peak_mode=peak_mode,
                 curve_out=curve_acc,
             )
             g = g_be[0]
