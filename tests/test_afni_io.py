@@ -184,6 +184,32 @@ class TestZstRoundtrip:
         assert pfx.as_file() == "out.nii.zst"
 
 
+class TestLargeWriteChunking:
+    """save_nifti chunks large writes so a single >2 GiB write() can't crash the save.
+
+    A 5-D per-frame warp slice (nx·ny·nz·T·3) can exceed 2 GiB, and some Python builds /
+    filesystems reject a single write() that big with OSError(EINVAL). We force a tiny
+    chunk to exercise the loop on a small array and confirm exact round-trip.
+    """
+
+    def test_chunked_write_roundtrips(self, temp_output_dir, monkeypatch):
+        from fastfuncstuff.io import afni
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        monkeypatch.setattr(afni._ChunkedFileWriter, "_CHUNK", 4096)  # tiny → many chunks
+        data = np.random.default_rng(0).standard_normal((10, 8, 6, 5, 3)).astype(np.float32)
+        affine = np.eye(4)
+        affine[:3, 3] = [2, 3, 4]
+
+        for name in ("chunk_direct.nii", "chunk_pigz.nii.gz"):
+            out = temp_output_dir / name
+            save_nifti(data, str(out), affine=affine)
+            assert out.exists()
+            img = load_nifti(str(out))
+            assert np.array_equal(np.asarray(img.get_fdata(dtype=np.float32)), data)
+            assert np.array_equal(img.affine, affine)
+
+
 class TestDataTypeHandling:
     """Test handling of different data types."""
 

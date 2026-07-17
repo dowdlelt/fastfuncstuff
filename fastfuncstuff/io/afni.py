@@ -44,6 +44,7 @@ Examples
 
 from __future__ import annotations
 
+import io
 import re
 import shutil
 import subprocess
@@ -2182,6 +2183,63 @@ def _set_afni_brick_stataux(
         extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, payload.encode("utf-8")))
 
 
+class _ChunkedFileWriter(io.IOBase):
+    """Wrap a binary file so each ``write`` is split into <=1 GiB pieces.
+
+    Some Python builds / filesystems reject a single ``write()`` larger than 2 GiB with
+    ``OSError(EINVAL)``. nibabel writes a NIfTI one array-slice at a time, and a slice of
+    a 5-D per-frame warp ``(nx·ny·nz·T·3)`` can exceed 2 GiB (e.g. 160·160·114·225·4 ≈
+    2.6 GiB), which crashes the save. Chunking sidesteps it. Subclasses ``io.IOBase`` so
+    nibabel accepts it as a real file object, delegating seek/tell to the wrapped file
+    (it seeks between the header and voxel data within the one file).
+    """
+
+    _CHUNK = 1 << 30  # 1 GiB, comfortably under the 2 GiB single-write limit
+
+    def __init__(self, fobj):
+        super().__init__()
+        self._f = fobj
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def write(self, b) -> int:
+        mv = memoryview(b).cast("B")
+        for i in range(0, len(mv), self._CHUNK):
+            self._f.write(mv[i : i + self._CHUNK])
+        return len(mv)
+
+    def read(self, size: int = -1):
+        return self._f.read(size)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._f.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._f.tell()
+
+    def flush(self) -> None:
+        try:
+            self._f.flush()
+        except (ValueError, OSError):
+            pass
+
+
+def _nib_save_chunked(img, path: str) -> None:
+    """``nib.save`` for an uncompressed ``.nii`` that survives >2 GiB single writes."""
+    from nibabel.fileholders import FileHolder
+
+    with open(path, "w+b") as raw:
+        wrapped = _ChunkedFileWriter(raw)
+        img.to_file_map({k: FileHolder(filename=path, fileobj=wrapped) for k in img.file_map})
+
+
 def save_nifti(
     data: np.ndarray,
     output_path: str | Path,
@@ -2286,8 +2344,11 @@ def save_nifti(
                 stem = stem[: -len(ext)]
                 break
         tmp_nii = out.parent / (stem + ".nii")
-        nib.save(img, str(tmp_nii))
+        _nib_save_chunked(img, str(tmp_nii))
         compress_nifti(tmp_nii, out, remove_original=True)
+    elif out_str.endswith(".nii"):
+        # Uncompressed direct write — same >2 GiB single-write hazard as the temp above.
+        _nib_save_chunked(img, out_str)
     else:
-        # .nii or .nii.gz without pigz → let nibabel handle it directly
+        # .nii.gz without pigz → nibabel's gzip stream chunks internally, so it's safe.
         nib.save(img, str(out))
