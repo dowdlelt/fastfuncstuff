@@ -52,6 +52,22 @@ def known_shift_series():
     return data, shifts
 
 
+def test_validation_rejects_bad_geometry_and_knobs(known_shift_series):
+    """The shared input validator catches impossible geometry / knobs up front."""
+    data, _ = known_shift_series
+    dev = torch.device("cpu")
+    with pytest.raises(ValueError, match="must differ"):  # 2-D: PE == slice
+        estimate_residual_flow(data, pe_axis=2, slice_axis=2, device=dev, verbose=False)
+    with pytest.raises(ValueError, match="must be 0, 1 or 2"):
+        estimate_residual_flow(data, pe_axis=3, slice_axis=2, device=dev, verbose=False)
+    with pytest.raises(ValueError, match="max_shift"):
+        estimate_residual_flow(data, pe_axis=1, slice_axis=2, max_shift=0, device=dev, verbose=False)
+    with pytest.raises(ValueError, match="xcorr_step"):
+        estimate_residual_flow(
+            data, pe_axis=1, slice_axis=2, trial_step=0, device=dev, verbose=False
+        )
+
+
 def test_2d_xcorr_emits_confidence_and_curve(known_shift_series):
     """The 2-D single-echo xcorr path carries the same searchlight diagnostics as the
     3-D and multi-echo paths: a (nx,ny,nz,T) confidence map and, for a chosen frame,

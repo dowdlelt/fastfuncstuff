@@ -600,6 +600,54 @@ def _geometry_report(
     )
 
 
+def _validate_estimation_inputs(
+    shape,
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    is_3dacq: bool,
+    max_shift: float,
+    trial_step: float,
+    window_sigma: float,
+    verbose: bool = True,
+) -> None:
+    """Guard the estimation geometry/knobs — shared sanity for every path.
+
+    Raises on the impossible (out-of-range axes, PE == slice in a 2-D acquisition,
+    non-positive search knobs); warns on the merely risky (a PE axis too thin for the
+    requested ``max_shift``, or a degenerate single-slice 2-D run) so a bad run is
+    caught up front rather than producing a quietly-wrong field.
+    """
+    dims = [int(shape[0]), int(shape[1]), int(shape[2])]
+    for name, ax in (("pe_axis", pe_axis), ("slice_axis", slice_axis)):
+        if ax not in (0, 1, 2):
+            raise ValueError(f"{name} must be 0, 1 or 2 (got {ax}).")
+    if not is_3dacq and pe_axis == slice_axis:
+        raise ValueError(
+            f"-pe_axis ({pe_axis}) must differ from -slice_axis ({slice_axis}): in a 2-D "
+            "acquisition PE must lie inside the slice plane to be visible to 2-D flow "
+            "(use -is_3dacq if this is a 3-D-acquired series)."
+        )
+    if max_shift <= 0:
+        raise ValueError(f"-max_shift must be > 0 (got {max_shift}).")
+    if trial_step <= 0:
+        raise ValueError(f"-xcorr_step must be > 0 (got {trial_step}).")
+    if window_sigma < 0:
+        raise ValueError(f"-window must be >= 0 (got {window_sigma}).")
+    if verbose:
+        pe_n = dims[pe_axis]
+        if pe_n < 2 * max_shift + 1:
+            print(
+                f"   ⚠ PE axis {pe_axis} is only {pe_n} vox — thinner than the ±{max_shift:g} "
+                "search span; the field near the edges may rail. Lower -max_shift if so."
+            )
+        if not is_3dacq and dims[slice_axis] < 2:
+            print(
+                f"   ⚠ only {dims[slice_axis]} slice along axis {slice_axis}: a 2-D run on a "
+                "single slice — fine, but -is_3dacq is usually meant here."
+            )
+
+
 # ── flow → color (Middlebury / circular-phase wheel) ──────────────────────────
 def flow_to_rgb(u: np.ndarray, v: np.ndarray, max_mag: float | None = None) -> np.ndarray:
     """Color a 2-D flow ``(H, W)`` by direction (hue) and magnitude (saturation).
@@ -1133,6 +1181,10 @@ def estimate_residual_flow(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _validate_estimation_inputs(
+        data.shape, pe_axis, slice_axis, is_3dacq=is_3dacq, max_shift=max_shift,
+        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+    )
 
     if is_3dacq:
         # 3-D acquisition: no per-slice fields, so estimate the whole 3-D PE field at
@@ -1161,12 +1213,6 @@ def estimate_residual_flow(
             save_corr_curve=save_corr_curve,
             device=device,
             verbose=verbose,
-        )
-
-    if pe_axis == slice_axis:
-        raise ValueError(
-            f"-pe_axis ({pe_axis}) must differ from -slice_axis ({slice_axis}): PE must "
-            "lie inside the slice plane to be visible to 2-D flow."
         )
 
     orig_shape = (data.shape[0], data.shape[1], data.shape[2], data.shape[3])
@@ -1529,6 +1575,10 @@ def estimate_residual_flow_rotaware(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     nx, ny, nz, nt = raw_data.shape
+    _validate_estimation_inputs(
+        raw_data.shape, pe_axis, slice_axis, is_3dacq=is_3dacq, max_shift=max_shift,
+        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+    )
     in_plane = sorted(a for a in (0, 1, 2) if a != slice_axis)
     a0, a1 = in_plane
     pe_flow_is_u = pe_axis == a1
@@ -2522,7 +2572,13 @@ def estimate_residual_flow_multiecho(
             )
     if len(shp) != 4:
         raise ValueError(f"each -input must be 4D, got {shp}.")
+    if any(t <= 0 for t in echo_times):
+        raise ValueError(f"-echo_times must all be > 0 ms, got {echo_times}.")
     nx, ny, nz, nt = shp
+    _validate_estimation_inputs(
+        shp, pe_axis, slice_axis, is_3dacq=True, max_shift=max_shift,
+        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+    )
 
     disp_slice = slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
     a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
@@ -2994,6 +3050,10 @@ def estimate_residual_flow_me_interecho(
     if backend not in ("flow", "xcorr"):
         raise ValueError(f"inter-echo backend must be flow | xcorr, got {backend!r}.")
     nx, ny, nz, nt = shp
+    _validate_estimation_inputs(
+        shp, pe_axis, slice_axis, is_3dacq=True, max_shift=max_shift,
+        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+    )
 
     te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
     dte = te[1:] - te[:-1]  # (E-1,) consecutive-pair gaps = per-pair scaling
