@@ -559,6 +559,39 @@ def resolve_pe_axis(pe_dir: str) -> int:
     return PE_DIR_TO_AXIS[key]
 
 
+_AXIS_LETTER = {0: "x", 1: "y", 2: "z"}
+
+
+def _geometry_report(
+    shape, pe_axis: int, slice_axis: int, *, is_3dacq: bool, dual: bool = False
+) -> str:
+    """One line describing which axes/planes the correlation actually works on.
+
+    The 2-D vs 3-D distinction is physical: a 2-D (multiband) acquisition takes each
+    slice separately, so the search is confined to the ONE in-plane view that contains
+    PE — we report that plane and how many slices we sweep along the slice axis. A 3-D
+    acquisition is one coherent volume, so BOTH planes that contain the PE axis "see"
+    the partition displacement and the single 3-D solve pools them — we report both.
+    """
+    dims = [int(shape[0]), int(shape[1]), int(shape[2])]
+    L = _AXIS_LETTER
+    if is_3dacq:
+        o0, o1 = (a for a in (0, 1, 2) if a != pe_axis)
+        return (
+            f"geometry: 3-D solve — PE axis {pe_axis} ({L[pe_axis]}, {dims[pe_axis]} vox) is "
+            f"coherent through the volume; pooling both planes that view it: "
+            f"{L[pe_axis]}×{L[o0]} ({dims[pe_axis]}×{dims[o0]}) and "
+            f"{L[pe_axis]}×{L[o1]} ({dims[pe_axis]}×{dims[o1]})"
+        )
+    a0, a1 = sorted(a for a in (0, 1, 2) if a != slice_axis)
+    pe_kind = "2 in-plane PE axes" if dual else f"PE axis {pe_axis} ({L[pe_axis]})"
+    return (
+        f"geometry: 2-D slicewise — {pe_kind} in the {L[a0]}×{L[a1]} plane "
+        f"({dims[a0]}×{dims[a1]}); {dims[slice_axis]} slices along axis {slice_axis} "
+        f"({L[slice_axis]})"
+    )
+
+
 # ── flow → color (Middlebury / circular-phase wheel) ──────────────────────────
 def flow_to_rgb(u: np.ndarray, v: np.ndarray, max_mag: float | None = None) -> np.ndarray:
     """Color a 2-D flow ``(H, W)`` by direction (hue) and magnitude (saturation).
@@ -1106,6 +1139,8 @@ def estimate_residual_flow(
     perm = [3, slice_axis, a0, a1]
     vol = torch.from_numpy(np.ascontiguousarray(data)).permute(perm).contiguous()
     nt, ns = vol.shape[0], vol.shape[1]
+    if verbose:
+        print(f"🌀 locomoco {_geometry_report(orig_shape, pe_axis, slice_axis, is_3dacq=False, dual=dual)}")
 
     flow_fn = _build_flow_fn(
         backend,
@@ -1446,6 +1481,11 @@ def estimate_residual_flow_rotaware(
     perm_sp = [slice_axis, a0, a1]  # (nx,ny,nz) → canonical (nS, H, W)
     inv_sp = _inv_perm(perm_sp)
     perm4 = [3, slice_axis, a0, a1]
+    if verbose:
+        print(
+            f"🌀 locomoco {_geometry_report(raw_data.shape, pe_axis, slice_axis, is_3dacq=is_3dacq)}"
+            "  (rotation-aware)"
+        )
 
     Mv = matrices_vox.to(device=device, dtype=torch.float32)  # (T,4,4) ref→raw
     Mv_inv = torch.linalg.inv(Mv.double()).float()  # raw→ref
@@ -2015,6 +2055,8 @@ def _run_3dacq_plain(
     a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
     pe_flow_is_u = pe_axis == a1
     perm4 = [3, disp_slice, a0, a1]
+    if verbose:
+        print(f"🌀 locomoco {_geometry_report(data.shape, pe_axis, disp_slice, is_3dacq=True)}")
 
     vol4d = torch.from_numpy(np.ascontiguousarray(data)).float()
     flow3d = _build_flow3d_fn(
@@ -2404,6 +2446,8 @@ def estimate_residual_flow_multiecho(
     a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
     pe_flow_is_u = pe_axis == a1
     perm4 = [3, disp_slice, a0, a1]
+    if verbose:
+        print(f"🌀 locomoco {_geometry_report(shp, pe_axis, disp_slice, is_3dacq=True)}  × {e} echoes")
 
     te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
     vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
@@ -2879,6 +2923,11 @@ def estimate_residual_flow_me_interecho(
     a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
     pe_flow_is_u = pe_axis == a1
     perm4 = [3, disp_slice, a0, a1]
+    if verbose:
+        print(
+            f"🌀 locomoco {_geometry_report(shp, pe_axis, disp_slice, is_3dacq=True)}  "
+            f"× {e} echoes (inter-echo)"
+        )
 
     vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
 
