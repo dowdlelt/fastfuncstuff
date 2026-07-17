@@ -711,6 +711,23 @@ def test_fourier_shift_removes_fractional_correlation_bias():
     assert offs[int(lin.argmax())] != 0.0
 
 
+def test_first_peak_recovers_shift_and_stays_near_zero_when_aligned():
+    """The first-peak finder (default) recovers a real shift, but is no-shift-biased where
+    there is none and never rails to the search boundary — unlike a raw argmax."""
+    vol = _phantom3d()
+    fx = torch.from_numpy(vol)[None]
+    # (a) a clear shift is recovered (pull field ~ +0.8 to align a -0.8-shifted moving).
+    moved = torch.from_numpy(_yshift3d(vol, -0.8))[None]
+    fld, _ = xcorr_search_flow_3d(fx, moved, pe_axis=1, max_shift=3, reg_sigma=0.0)
+    assert abs(float(fld[0, 8:-8, 8:-8, 4:-4].median()) - 0.8) < 0.2
+    # (b) aligned pair (no shift) → field stays near zero and bounded by max_shift.
+    rng = np.random.default_rng(1)
+    noisy = torch.from_numpy((vol + 0.05 * rng.standard_normal(vol.shape)).astype("f4"))[None]
+    fz, _ = xcorr_search_flow_3d(fx, noisy, pe_axis=1, max_shift=3, reg_sigma=0.0)
+    assert abs(float(fz[0, 8:-8, 8:-8, 4:-4].median())) < 0.15  # no-shift biased
+    assert float(fz.abs().max()) <= 3.0 + 1e-4  # never past the boundary
+
+
 def test_optical_flow_lk_3d_recovers_uniform_shift():
     vol = _phantom3d()
     moved = _yshift3d(vol, 1.3)  # content shifted +1.3 along y
@@ -792,7 +809,9 @@ def test_xcorr_reg_sigma_suppresses_dropout_rail():
     err_raw = (raw[0][void] - 0.8).abs().mean()
     err_reg = (reg[0][void] - 0.8).abs().mean()
     assert float(err_reg) < float(err_raw)
-    assert float((reg[0][void]).abs().max()) < 3.0  # no longer railed at the boundary
+    # The field is clamped to the searched range — never extrapolates past max_shift.
+    assert float(raw[0].abs().max()) <= 3.0 + 1e-4
+    assert float(reg[0].abs().max()) <= 3.0 + 1e-4
 
 
 def test_noshift_hard_guard_zeros_low_prominence():

@@ -274,6 +274,138 @@ def _searchlight_field_and_conf(
     return field, conf
 
 
+def _side_first_peak(stack: torch.Tensor):
+    """First peak of a per-voxel correlation curve swept outward from zero.
+
+    ``stack`` is ``(K, …)`` — the correlation at offsets ``0, ±step, ±2·step, …`` on ONE
+    side, index 0 being no-shift. The *first* peak (nearest zero) is where the curve stops
+    rising: everything past it (later oscillation humps) is ignored, and if the curve falls
+    immediately the peak is at 0 (that side contributes no shift). Connectivity to zero is
+    automatic — we only climb from index 0. Returns ``(peak_idx, ym1, y0, yp1)``: the
+    integer offset index of the peak and the three samples around it for a sub-voxel vertex.
+    """
+    kk = stack.shape[0]
+    if kk == 1:
+        z = torch.zeros_like(stack[0], dtype=torch.long)
+        return z, stack[0], stack[0], stack[0]
+    rising = (stack[1:] > stack[:-1]).to(stack.dtype)  # (K-1, …)
+    # cumprod stays 1 while every step so far rose, 0 once any step fell → the count of
+    # leading rises IS the first-peak index (0 if it never rose).
+    peak_idx = torch.cumprod(rising, dim=0).sum(0).long()
+
+    def gather(idx):
+        return stack.gather(0, idx.clamp(0, kk - 1).unsqueeze(0)).squeeze(0)
+
+    y0 = gather(peak_idx)
+    return peak_idx, gather(peak_idx - 1), y0, gather(peak_idx + 1)
+
+
+def _first_peak_field_and_conf(
+    pos: torch.Tensor,
+    neg: torch.Tensor,
+    *,
+    trial_step: float,
+    noshift_margin: float,
+    reg_sigma: float,
+    ambiguity_frac: float,
+    max_offset: float,
+    blur,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rule-based peak finder replacing argmax — the first REAL peak nearest zero.
+
+    ``pos`` / ``neg`` are ``(K, …)`` correlation stacks swept outward from zero (offsets
+    ``0,+step,…`` and ``0,−step,…``; both share index 0 = no-shift). Per voxel:
+
+    - find the first peak on each side (:func:`_side_first_peak`), sub-voxel by a 3-point
+      vertex — 0 is on each peak's slope by construction (no-shift prior baked in);
+    - the winning side is the higher peak; a peak counts only if it beats no-shift by
+      ``noshift_margin``;
+    - a **bilateral** rise where the losing side is comparably prominent (within
+      ``ambiguity_frac``) is degenerate/spurious → default to **zero**; a clear winner is
+      taken. Later oscillation humps never enter — only the first peak on each side does.
+
+    Then the same confidence-weighted smoothing as :func:`_searchlight_field_and_conf`.
+    """
+    corr0 = pos[0]
+    pi, pym1, py0, pyp1 = _side_first_peak(pos)
+    ni, nym1, ny0, nyp1 = _side_first_peak(neg)
+
+    def subvox(ym1, y0, yp1, idx):
+        den = ym1 - 2.0 * y0 + yp1
+        s = torch.where(den.abs() > 1e-6, 0.5 * (ym1 - yp1) / den, torch.zeros_like(den))
+        return torch.where(idx >= 1, s.clamp(-1.0, 1.0), torch.zeros_like(s))
+
+    pos_field = (pi.to(corr0.dtype) + subvox(pym1, py0, pyp1, pi)) * trial_step  # ≥ 0
+    neg_field = -(ni.to(corr0.dtype) + subvox(nym1, ny0, nyp1, ni)) * trial_step  # ≤ 0
+    prom_p = (py0 - corr0).clamp_min(0.0)
+    prom_n = (ny0 - corr0).clamp_min(0.0)
+
+    win_pos = py0 >= ny0
+    win_val = torch.where(win_pos, py0, ny0)
+    win_field = torch.where(win_pos, pos_field, neg_field)
+    win_prom = torch.where(win_pos, prom_p, prom_n)
+    lose_prom = torch.where(win_pos, prom_n, prom_p)
+    # Bilateral & comparable → ambiguous (spurious/degenerate) → keep zero.
+    ambiguous = (lose_prom > noshift_margin) & (lose_prom >= (1.0 - ambiguity_frac) * win_prom)
+    credible = (win_prom > noshift_margin) & (~ambiguous)
+
+    field = torch.where(credible, win_field, torch.zeros_like(win_field))
+    # The edge parabola can extrapolate a hair past the searched range — a shift beyond
+    # max_shift is unphysical, so clamp before smoothing (keeps rails from bleeding out).
+    field = field.clamp(-max_offset, max_offset)
+    conf = torch.where(credible, win_val.clamp_min(0.0) * win_prom, torch.zeros_like(win_val))
+    if reg_sigma > 0.0:
+        amax = conf.amax(dim=tuple(range(1, conf.ndim)), keepdim=True)
+        cw = conf + 1e-3 * amax
+        field = blur(cw * field) / blur(cw).clamp_min(1e-12)
+    return field, conf
+
+
+def _sweep_first_peak(
+    ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac, blur, curve_out
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Outward-from-zero sweep + first-peak finder (the B+C path).
+
+    ``ncc(s)`` returns the per-voxel local correlation at offset ``s``. Sweeps
+    ``s = 0, ±step, ±2·step, …`` and **grows the range only while some voxel is still
+    rising** — once none is, every voxel has passed its first peak, so we stop (the
+    data-adaptive speedup: mostly-small shifts search ~±1, not ±r). When ``curve_out`` is
+    requested the full ±r range is swept so the saved landscape is complete.
+    """
+    corr0 = ncc(0.0)
+    pos = [corr0]
+    neg = [corr0]
+    pos_rising = torch.ones_like(corr0, dtype=torch.bool)
+    neg_rising = torch.ones_like(corr0, dtype=torch.bool)
+    kmax = int(round(r / trial_step))
+    early = curve_out is None
+    for k in range(1, kmax + 1):
+        s = k * trial_step
+        cp, cn = ncc(s), ncc(-s)
+        pos_rising = pos_rising & (cp > pos[-1])
+        neg_rising = neg_rising & (cn > neg[-1])
+        pos.append(cp)
+        neg.append(cn)
+        if early and not bool((pos_rising | neg_rising).any()):
+            break
+    if curve_out is not None:
+        for cc in reversed(neg[1:]):
+            curve_out.append(cc.detach().cpu())
+        curve_out.append(corr0.detach().cpu())
+        for cc in pos[1:]:
+            curve_out.append(cc.detach().cpu())
+    return _first_peak_field_and_conf(
+        torch.stack(pos),
+        torch.stack(neg),
+        trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
+        ambiguity_frac=ambiguity_frac,
+        max_offset=r,
+        blur=blur,
+    )
+
+
 def _xcorr_shift_1d(
     fixed: torch.Tensor,
     moving: torch.Tensor,
@@ -1946,26 +2078,32 @@ def xcorr_search_flow_3d(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     fourier_shift: bool = True,
+    peak_mode: str = "first_peak",
+    ambiguity_frac: float = 0.5,
     curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """3-D cross-correlation searchlight along PE — the "big block" xcorr for 3-D EPI.
 
     Slide the whole ``moving`` volume along the PE axis over ``±max_shift`` and take the
-    per-voxel offset of peak local correlation under a 3-D Gaussian searchlight
-    (``window_sigma``), sub-voxel by a 5-point parabola. A direct 3-D lift of
-    :func:`_xcorr_shift_1d`: same streaming running-peak, 3-D window and 3-D shift.
+    per-voxel local correlation under a 3-D Gaussian searchlight (``window_sigma``).
 
     ``fourier_shift`` (default) resamples each trial shift with the sinc-exact Fourier
     shift theorem instead of linear interpolation: linear interp low-pass-filters the
     image at fractional shifts, spuriously inflating the local correlation there and
-    making the corr curve oscillate with a 1-voxel period (peak away from the true shift).
-    The Fourier shift does not blur, so the curve is clean.
+    making the corr curve oscillate with a 1-voxel period. The Fourier shift does not blur.
 
-    Returns ``(field, conf)``; ``noshift_margin`` / ``reg_sigma`` are the searchlight
-    robustness knobs and ``conf`` the quality map — see
-    :func:`_searchlight_field_and_conf`. If ``curve_out`` is given, the per-voxel
-    correlation at every trial offset is appended to it (``nd`` tensors ``(B,X,Y,Z)``,
-    in offset order ``-r … +r``) — the raw search landscape, for diagnostics.
+    ``peak_mode`` picks how the shift is read off the per-voxel curve:
+
+    - ``"first_peak"`` (default): sweep offsets OUTWARD from zero and take the first real
+      peak nearest zero (:func:`_first_peak_field_and_conf`) — no-shift-biased, immune to
+      later oscillation humps, and the sweep stops once no voxel is still rising, so a run
+      of mostly-small shifts searches ~±1 instead of ±max_shift (a data-adaptive speedup).
+    - ``"argmax"``: the classic global-max + 5-point parabola over the full ``±max_shift``
+      grid (:func:`_searchlight_field_and_conf`).
+
+    Returns ``(field, conf)``. If ``curve_out`` is given the per-offset correlation is
+    appended (``-r … +r`` order) — and the outward sweep runs the full range so the saved
+    landscape is complete.
     """
     import math
 
@@ -1981,9 +2119,21 @@ def xcorr_search_flow_3d(
     )
     mean_f = _win(fixed)
     var_f = (_win(fixed * fixed) - mean_f * mean_f).clamp_min(eps)
+
+    def _ncc(s: float) -> torch.Tensor:
+        mw = _shifter(s)
+        mean_m = _win(mw)
+        var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
+        return (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+
+    if peak_mode == "first_peak":
+        return _sweep_first_peak(
+            _ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac,
+            lambda x: _blur3d_b(x, reg_sigma), curve_out,
+        )
+
     offsets = torch.arange(-r, r + 1e-6, trial_step, device=fixed.device, dtype=fixed.dtype)
     nd = int(offsets.numel())
-
     z = torch.zeros_like(fixed)
     best_val = torch.full_like(fixed, float("-inf"))
     best_i = torch.zeros_like(fixed, dtype=torch.long)
@@ -1994,10 +2144,7 @@ def xcorr_search_flow_3d(
     prev2: torch.Tensor | None = None
     for i in range(nd):
         s = float(offsets[i])
-        mw = _shifter(s)
-        mean_m = _win(mw)
-        var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
-        corr = (_win(fixed * mw) - mean_f * mean_m) / torch.sqrt(var_f * var_m)
+        corr = _ncc(s)
         if curve_out is not None:
             curve_out.append(corr.detach().cpu())
         if abs(s) < trial_step * 0.5 + 1e-6:
@@ -2015,12 +2162,11 @@ def xcorr_search_flow_3d(
         prev2 = prev1
         prev1 = corr
 
-    field, conf = _searchlight_field_and_conf(
+    return _searchlight_field_and_conf(
         best_i, best_val, zero_val, ym2, ym1, y0, yp1, yp2,
         nd=nd, r=r, trial_step=trial_step, noshift_margin=noshift_margin,
         reg_sigma=reg_sigma, blur=lambda x: _blur3d_b(x, reg_sigma),
     )
-    return field, conf
 
 
 def _build_flow3d_fn(
@@ -2437,6 +2583,8 @@ def xcorr_search_flow_3d_multiecho(
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     fourier_shift: bool = True,
+    peak_mode: str = "first_peak",
+    ambiguity_frac: float = 0.5,
     curve_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shared-parameter 3-D xcorr searchlight across echoes — TE-linearity enforced.
@@ -2483,6 +2631,25 @@ def xcorr_search_flow_3d_multiecho(
     wgt = weights if weights is not None else var_f
     wsum = torch.stack(wgt, 0).sum(0).clamp_min(eps)
 
+    def _pooled_ncc(s: float) -> torch.Tensor:
+        pooled = torch.zeros_like(fixed_list[0])
+        for j in range(e):
+            sj = ratio[j] * s
+            sh = shifters[j]
+            mw = sh(sj) if sh is not None else _shift3d_axis(moving_list[j], sj, pe_axis)
+            mean_m = _win(mw)
+            var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
+            corr = (_win(fixed_list[j] * mw) - mean_f[j] * mean_m) / torch.sqrt(var_f[j] * var_m)
+            pooled = pooled + wgt[j] * corr
+        return pooled / wsum
+
+    if peak_mode == "first_peak":
+        s_field, conf = _sweep_first_peak(
+            _pooled_ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac,
+            lambda x: _blur3d_b(x, reg_sigma), curve_out,
+        )
+        return s_field / float(alpha[m]), conf  # echo-1 scale (alpha_1 = 1)
+
     offsets = torch.arange(
         -r, r + 1e-6, trial_step, device=fixed_list[0].device, dtype=fixed_list[0].dtype
     )
@@ -2497,16 +2664,7 @@ def xcorr_search_flow_3d_multiecho(
     prev2: torch.Tensor | None = None
     for i in range(nd):
         s = float(offsets[i])
-        pooled = torch.zeros_like(z)
-        for j in range(e):
-            sj = ratio[j] * s
-            sh = shifters[j]
-            mw = sh(sj) if sh is not None else _shift3d_axis(moving_list[j], sj, pe_axis)
-            mean_m = _win(mw)
-            var_m = (_win(mw * mw) - mean_m * mean_m).clamp_min(eps)
-            corr = (_win(fixed_list[j] * mw) - mean_f[j] * mean_m) / torch.sqrt(var_f[j] * var_m)
-            pooled = pooled + wgt[j] * corr
-        pooled = pooled / wsum
+        pooled = _pooled_ncc(s)
         if curve_out is not None:
             curve_out.append(pooled.detach().cpu())
         if abs(s) < trial_step * 0.5 + 1e-6:

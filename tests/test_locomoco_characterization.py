@@ -22,9 +22,10 @@ from fastfuncstuff.processing import locomoco as L
 # well clear of this floor. Flow paths stay byte-stable regardless.
 #
 # The 3-D / multi-echo xcorr baselines were re-captured 2026-07-18 when the searchlight
-# adopted the sinc-exact Fourier trial-shift (no linear-interp blur → no spurious
-# fractional-shift correlation). The recovery tests confirmed accuracy held. 2-D xcorr
-# still uses the linear shift (untouched), so its baseline is unchanged.
+# adopted (a) the sinc-exact Fourier trial-shift (no linear-interp blur → no spurious
+# fractional-shift correlation) and (b) the first-peak finder replacing argmax (no-shift
+# biased, no railing — fields come out tighter). The recovery tests confirmed accuracy
+# held throughout. 2-D xcorr still uses the linear shift + argmax (untouched), unchanged.
 ATOL = 6e-3
 
 
@@ -97,8 +98,8 @@ def test_char_3d_xcorr():
     )
     _assert_stats(
         r.pe_displacement(),
-        {"mean": -0.018461, "std": 0.402947, "q05": -0.547031, "q50": 0.000000,
-         "q95": 0.667173, "absmax": 0.753586},
+        {"mean": 0.015923, "std": 0.398597, "q05": -0.519979, "q50": 0.000000,
+         "q95": 0.683320, "absmax": 0.845521},
     )
 
 
@@ -121,10 +122,10 @@ def test_char_me_joint():
     )
     _assert_stats(
         r.w_field,
-        {"mean": -0.080138, "std": 1.131369, "q05": -2.022427, "q50": -0.096785,
-         "q95": 1.894102, "absmax": 3.216780},
+        {"mean": -0.018060, "std": 0.675731, "q05": -1.085326, "q50": -0.019396,
+         "q95": 0.990209, "absmax": 2.845777},
     )
-    assert np.allclose(r.alpha.tolist(), [1.0, 0.16552, 0.1653], atol=ATOL)
+    assert np.allclose(r.alpha.tolist(), [1.0, 0.19318, 0.17425], atol=ATOL)
 
 
 def test_char_me_fixed():
@@ -134,8 +135,8 @@ def test_char_me_fixed():
     )
     _assert_stats(
         r.w_field,
-        {"mean": 0.001090, "std": 0.123225, "q05": -0.165402, "q50": -0.003304,
-         "q95": 0.177724, "absmax": 0.577891},
+        {"mean": -0.000366, "std": 0.089310, "q05": -0.107882, "q50": -0.006136,
+         "q95": 0.110331, "absmax": 0.604402},
     )
 
 
@@ -145,8 +146,8 @@ def test_char_me_interecho():
     )
     _assert_stats(
         r.w_field,
-        {"mean": 0.044876, "std": 0.957722, "q05": -1.499935, "q50": 0.105364,
-         "q95": 1.503181, "absmax": 2.578453},
+        {"mean": 0.046523, "std": 0.472559, "q05": -0.576529, "q50": 0.084146,
+         "q95": 0.656572, "absmax": 1.592480},
     )
 
 
@@ -156,6 +157,6 @@ def test_char_me_scaled():
     )
     _assert_stats(
         r.w_field,
-        {"mean": 0.003652, "std": 0.163046, "q05": -0.267756, "q50": -0.001579,
-         "q95": 0.293319, "absmax": 0.609583},
+        {"mean": -0.004341, "std": 0.088442, "q05": -0.109205, "q50": -0.008755,
+         "q95": 0.113341, "absmax": 0.595628},
     )
