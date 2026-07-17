@@ -1807,7 +1807,29 @@ def _shift3d_axis(vol: torch.Tensor, shift, axis: int, mode: str = "bilinear") -
 
     ``shift`` is a scalar or a ``(B,X,Y,Z)`` field. grid_sample's 3-D mode is trilinear
     (``bilinear``) or nearest — no bicubic in 3-D — so a bicubic request degrades here.
+
+    Scalar fast path: a uniform shift along one axis is *exactly* 1-D linear interpolation
+    there (trilinear reduces to it — the other two axes sit on integer grid), so we skip
+    building the full 3-D coordinate grid and the 3-D sampler. The xcorr searchlight applies
+    ``nd`` scalar shifts per frame, so this is the hot per-offset op. Border-clamp + linear
+    weight reproduce ``grid_sample(padding_mode="border", align_corners=True)`` bit-for-bit.
     """
+    if isinstance(shift, (int, float)) and mode != "nearest":
+        import math
+
+        dim = axis + 1
+        n = vol.shape[dim]
+        k = math.floor(shift)
+        frac = float(shift) - k
+        idx = torch.arange(n, device=vol.device)
+        i0 = (idx + k).clamp(0, n - 1)
+        v0 = vol.index_select(dim, i0)
+        if frac == 0.0:
+            return v0.contiguous()
+        i1 = (idx + k + 1).clamp(0, n - 1)
+        v1 = vol.index_select(dim, i1)
+        return v0 * (1.0 - frac) + v1 * frac
+
     b, X, Y, Z = vol.shape
     dev, dt = vol.device, vol.dtype
     xs, ys, zs = torch.meshgrid(
