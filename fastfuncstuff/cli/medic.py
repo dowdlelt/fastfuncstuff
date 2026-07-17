@@ -330,6 +330,29 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Deprecated alias for -recompute (forces a fresh warpkit estimate).",
     )
+    d3.add_argument(
+        "-3d_debug_dfield",
+        "-3d-debug-dfield",
+        dest="debug3d_dfield",
+        action="store_true",
+        help="Field-CHANGE model: drive the k-shift off the per-frame field derivative "
+        "(field[t]-field[t-1]) scaled by each echo's TIME (TE_e in seconds), not the "
+        "detrended field value scaled by echo index. Physical premise: partition-axis "
+        "distortion is set by how fast the field drifts, and grows with TE. Overrides "
+        "-3d_debug_detrend/-multiply/-proportion/-subtract_first. Per-echo scale is TE_e "
+        "so echo 1 is corrected too; frame 1 gets no shift (no derivative). "
+        "-3d_debug_shift becomes voxels per Hz·s.",
+    )
+    d3.add_argument(
+        "-diff_use_interp",
+        "-diff-use-interp",
+        dest="diff_use_interp",
+        action="store_true",
+        help="With -3d_debug_dfield: interpolate the field onto the acquisition midpoints "
+        "(linear slicetime 'tween' — the field as it was mid-acquisition) BEFORE "
+        "differencing, instead of the raw backward difference. A smoother/centered "
+        "estimate of the same field change.",
+    )
     return parser
 
 
@@ -409,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
             PE_AXIS_MAP,
             detrend_time,
             displacement_pe_to_field,
+            field_temporal_change,
             field_to_pull_warp,
             invert_displacement_pe,
             medic_fieldmaps,
@@ -612,33 +636,41 @@ def main(argv: list[str] | None = None) -> int:
 
     # 3D-EPI slice-direction debug: experimental residual k-shift on later echoes.
     if args.debug_3d:
-        raw_field = args.debug3d_detrend < 0
-        # Per-voxel temporal mean of the field BEFORE detrending (the static component).
-        mean_field = field_native.mean(dim=-1, keepdim=True)
-        field_dt = detrend_time(field_native, args.debug3d_detrend)
-        if args.debug3d_subtract_first:
-            # Reference to frame 1: its field becomes 0 (no shift), others relative to it.
-            field_dt = field_dt - field_dt[..., :1]
-        if args.debug3d_multiply:
-            # Scale by the static field so the shift is largest where a big static field
-            # and a big oscillation coincide (Hz x Hz — expect a smaller -3d_debug_shift).
-            field_dt = field_dt * mean_field
-        elif args.debug3d_proportion:
-            # Fractional change: detrended field / static field. Near-zero mean (e.g.
-            # background) would blow up, so those voxels are zeroed.
-            near0 = mean_field.abs() < 1e-6
-            denom = torch.where(near0, torch.ones_like(mean_field), mean_field)
-            field_dt = torch.where(
-                near0.expand_as(field_dt), torch.zeros_like(field_dt), field_dt / denom
+        # Two drivers for the k-shift field. The field-CHANGE model (-3d_debug_dfield) is
+        # the physical one: partition-axis distortion tracks how fast the field DRIFTS and
+        # grows with TE, so shift = TE_e[s] * (field[t]-field[t-1]). It supersedes the older
+        # detrended-value knobs (detrend/multiply/proportion/subtract_first).
+        if args.debug3d_dfield:
+            field_dt = field_temporal_change(field_native, use_interp=args.diff_use_interp)
+            processed = True
+        else:
+            raw_field = args.debug3d_detrend < 0
+            # Per-voxel temporal mean of the field BEFORE detrending (static component).
+            mean_field = field_native.mean(dim=-1, keepdim=True)
+            field_dt = detrend_time(field_native, args.debug3d_detrend)
+            if args.debug3d_subtract_first:
+                # Reference to frame 1: its field becomes 0 (no shift), others relative to it.
+                field_dt = field_dt - field_dt[..., :1]
+            if args.debug3d_multiply:
+                # Scale by the static field so the shift is largest where a big static field
+                # and a big oscillation coincide (Hz x Hz — expect a smaller -3d_debug_shift).
+                field_dt = field_dt * mean_field
+            elif args.debug3d_proportion:
+                # Fractional change: detrended field / static field. Near-zero mean (e.g.
+                # background) would blow up, so those voxels are zeroed.
+                near0 = mean_field.abs() < 1e-6
+                denom = torch.where(near0, torch.ones_like(mean_field), mean_field)
+                field_dt = torch.where(
+                    near0.expand_as(field_dt), torch.zeros_like(field_dt), field_dt / denom
+                )
+            # The field that is multiplied through. Write it unless it is the untouched raw
+            # field map (already on disk as the {prefix}_fieldmap cache).
+            processed = (
+                (not raw_field)
+                or args.debug3d_subtract_first
+                or args.debug3d_multiply
+                or args.debug3d_proportion
             )
-        # The field that is multiplied through. Write it unless it is the untouched raw
-        # field map (already on disk as the {prefix}_fieldmap cache).
-        processed = (
-            (not raw_field)
-            or args.debug3d_subtract_first
-            or args.debug3d_multiply
-            or args.debug3d_proportion
-        )
         dt_path = f"{prefix_stem}_fieldmap_detrend{nii_ext}"
         if processed:
             with spinner(f"Writing {Path(dt_path).name}"):
@@ -650,33 +682,52 @@ def main(argv: list[str] | None = None) -> int:
             "both": [(1.0, "pos"), (-1.0, "neg")],
         }
         sign_list = signs[args.debug3d_sign]
+        # Per-echo weight of the k-shift. Field-change model: echo TIME in seconds (larger
+        # TE -> more accumulated partition-phase -> more shift; echo 1 IS corrected). Legacy
+        # model: linear echo-index ramp, 0 at echo 1 (reference) -> 1 at the last echo.
+        te_s = [t / 1000.0 for t in tes]
+
+        def _perecho_weight(e: int) -> float:
+            if args.debug3d_dfield:
+                return te_s[e]
+            return e / (ne - 1) if ne > 1 else 0.0
+
         if args.verb >= 1:
-            src = (
-                "RAW field map"
-                if raw_field
-                else f"detrended field map (polort {args.debug3d_detrend})"
-            )
-            if args.debug3d_subtract_first:
-                src += " minus first volume"
-            if args.debug3d_multiply:
-                src += " x mean field"
-            if args.debug3d_proportion:
-                src += " / mean field"
-            src += f": {dt_path}" if processed else " (no detrend)"
-            print(f"\n3D debug: {src}")
-            mode = "inverted pull (fixed-point)" if args.debug3d_invert else "direct pull"
-            print(
-                f"  slice(k) shift = sign * {args.debug3d_shift} vox/Hz * "
-                f"(echo_idx / (ne-1)) * field; sign(s): {args.debug3d_sign}; {mode}."
-            )
+            if args.debug3d_dfield:
+                interp = " (midpoint-interpolated)" if args.diff_use_interp else ""
+                print(f"\n3D debug: field CHANGE d(field)/frame{interp}: {dt_path}")
+                mode = "inverted pull (fixed-point)" if args.debug3d_invert else "direct pull"
+                print(
+                    f"  slice(k) shift = sign * {args.debug3d_shift} vox/(Hz·s) * TE_e[s] * "
+                    f"d(field); sign(s): {args.debug3d_sign}; {mode}."
+                )
+            else:
+                src = (
+                    "RAW field map"
+                    if args.debug3d_detrend < 0
+                    else f"detrended field map (polort {args.debug3d_detrend})"
+                )
+                if args.debug3d_subtract_first:
+                    src += " minus first volume"
+                if args.debug3d_multiply:
+                    src += " x mean field"
+                if args.debug3d_proportion:
+                    src += " / mean field"
+                src += f": {dt_path}" if processed else " (no detrend)"
+                print(f"\n3D debug: {src}")
+                mode = "inverted pull (fixed-point)" if args.debug3d_invert else "direct pull"
+                print(
+                    f"  slice(k) shift = sign * {args.debug3d_shift} vox/Hz * "
+                    f"(echo_idx / (ne-1)) * field; sign(s): {args.debug3d_sign}; {mode}."
+                )
             if args.debug3d_echo is not None:
                 print(f"  restricting to echo {args.debug3d_echo} (-debug_3d_echo).")
 
         for e in echo_list:
             series = torch.from_numpy(np.ascontiguousarray(mag[:, :, :, e, :]))
-            frac = e / (ne - 1) if ne > 1 else 0.0
+            frac = _perecho_weight(e)
             if frac == 0.0:
-                # Echo 1 (and any single-echo case): no slice shift -> one reference file.
+                # Zero-weight echo (echo 1 in the legacy ramp): no slice shift -> reference.
                 undist = undistort_series(
                     series,
                     disp_pull,
@@ -716,7 +767,8 @@ def main(argv: list[str] | None = None) -> int:
                 out_path = f"{prefix_stem}_e{e + 1}_3ddebug_{tag}{nii_ext}"
                 save_nifti(undist.cpu().numpy(), out_path, affine=affine)
                 if args.verb >= 1:
-                    print(f"  3ddebug echo {e + 1} {tag} (frac {frac:.2f}): {out_path}")
+                    wlabel = "TE" if args.debug3d_dfield else "frac"
+                    print(f"  3ddebug echo {e + 1} {tag} ({wlabel} {frac:.3f}): {out_path}")
 
     if args.apply_phase:
         ph_lo, ph_hi = float(phase.min()), float(phase.max())

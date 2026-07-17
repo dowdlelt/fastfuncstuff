@@ -532,6 +532,38 @@ def detrend_time(field: Tensor, order: int = 1) -> Tensor:
     return resid.t().reshape(nx, ny, nz, nt)
 
 
+def field_temporal_change(field: Tensor, use_interp: bool = False) -> Tensor:
+    """Per-frame field CHANGE (Hz) that drives 2nd-PE (slice/partition) distortion.
+
+    In a 3-D / slice-partition-encoded EPI the slow phase-encode axis winds phase
+    across the whole volume TR, so a field that DRIFTS between frames displaces the
+    reconstructed data along that axis. The quantity that sets the local distortion
+    is therefore how much the field changed by the moment each frame was acquired —
+    not the field value itself (that is the primary in-plane correction's job).
+
+    ``use_interp=False`` (default): backward difference ``d[t] = field[t] - field[t-1]``
+    — the raw change that "led to" frame ``t``. Frame 0 has no predecessor, so
+    ``d[0] = 0`` (the first frame is uncorrectable, by construction).
+
+    ``use_interp=True``: first interpolate the field onto the acquisition MIDPOINTS
+    (``m[t] = ½(field[t-1]+field[t])`` — the linear slicetime 'tween', the field as it
+    was mid-acquisition) and difference those. A smoother, centered estimate of the
+    same change: ``d[t] = ½(field[t]-field[t-2])`` for ``t≥2``, ``d[1]=½(field[1]-field[0])``.
+
+    Returns a ``(nx, ny, nz, T)`` change field aligned to the acquired frames (Hz).
+    Multiply by echo time (s) and a voxels-per-Hz·s scale to get the k-axis voxel shift.
+    """
+    src = field
+    if use_interp:
+        # Backward midpoints m[t]=½(field[t-1]+field[t]); m[0]:=field[0] (no predecessor).
+        m = field.clone()
+        m[..., 1:] = 0.5 * (field[..., :-1] + field[..., 1:])
+        src = m
+    d = torch.zeros_like(field)
+    d[..., 1:] = src[..., 1:] - src[..., :-1]
+    return d
+
+
 def undistort_series(
     series: Tensor,
     disp_pull: Tensor,

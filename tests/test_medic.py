@@ -187,6 +187,44 @@ def test_detrend_time_removes_mean_and_linear():
     assert torch.equal(detrend_time(field, order=-1), field)
 
 
+def test_field_temporal_change_backward_difference():
+    """Default mode is the backward difference with a zeroed, uncorrectable frame 0."""
+    from fastfuncstuff.processing.medic import field_temporal_change
+
+    field = torch.randn(3, 4, 5, 7) * 10.0
+    d = field_temporal_change(field, use_interp=False)
+    assert d.shape == field.shape
+    # frame 0 has no predecessor -> zero shift.
+    assert torch.allclose(d[..., 0], torch.zeros_like(d[..., 0]))
+    # interior frames are the raw backward difference.
+    assert torch.allclose(d[..., 1:], field[..., 1:] - field[..., :-1], atol=1e-5)
+
+    # A constant-in-time field has zero change everywhere.
+    const = torch.randn(3, 4, 5, 1).expand(3, 4, 5, 7).contiguous()
+    assert field_temporal_change(const).abs().max() < 1e-5
+
+
+def test_field_temporal_change_interp_is_centered_difference():
+    """use_interp differences the midpoint-interpolated field (a centered estimate)."""
+    from fastfuncstuff.processing.medic import field_temporal_change
+
+    field = torch.randn(2, 2, 2, 6) * 5.0
+    d = field_temporal_change(field, use_interp=True)
+    assert torch.allclose(d[..., 0], torch.zeros_like(d[..., 0]))
+    # m[t]=½(field[t-1]+field[t]); d[1]=m[1]-field[0]=½(field[1]-field[0]).
+    assert torch.allclose(d[..., 1], 0.5 * (field[..., 1] - field[..., 0]), atol=1e-5)
+    # d[t>=2]=½(field[t]-field[t-2]).
+    assert torch.allclose(d[..., 2:], 0.5 * (field[..., 2:] - field[..., :-2]), atol=1e-5)
+
+    # On a linear-in-time field the centered difference recovers the slope for t>=2
+    # (t=1 is only a half-step: ½·slope).
+    t = torch.arange(6, dtype=torch.float32)
+    lin = (2.0 + 3.0 * t).view(1, 1, 1, 6).expand(2, 2, 2, 6)
+    d_lin = field_temporal_change(lin, use_interp=True)
+    assert torch.allclose(d_lin[..., 2:], torch.full_like(d_lin[..., 2:], 3.0), atol=1e-4)
+    assert torch.allclose(d_lin[..., 1], torch.full_like(d_lin[..., 1], 1.5), atol=1e-4)
+
+
 def test_undistort_series_extra_axis_shifts_slice():
     """extra_disp on the k axis shifts along z, jointly with the PE-axis warp."""
     nx = ny = nz = 12
