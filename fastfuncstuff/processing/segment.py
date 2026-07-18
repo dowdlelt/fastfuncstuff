@@ -1433,6 +1433,7 @@ def segment_apply(
     cleanup: int = 1,
     debridge: int = 0,
     dura_clean: float = 0.0,
+    dura_method: str = "geodesic",
     prior_kernel: str = "cubic",
     save_precleanup: bool = False,
     device: torch.device | str | None = None,
@@ -1549,8 +1550,10 @@ def segment_apply(
             posteriors = mrf_cleanup(posteriors, mrf, fit["vox"])
         if debridge > 0:  # strip thin dura bridges before the WM-seeded brain extraction
             posteriors = debridge_gm(posteriors, radius=debridge)
-        if dura_clean > 0:  # WM-geodesic dura removal (CSF-moat-blocked front)
-            posteriors = dura_cleanup(posteriors, fit["vox"], max_thick_mm=dura_clean)
+        if dura_clean > 0:  # dura removal (WM-geodesic front, or CSF-sheet-gap fill)
+            posteriors = dura_cleanup(
+                posteriors, fit["vox"], max_thick_mm=dura_clean, method=dura_method
+            )
         if cleanup > 0:
             posteriors = clean_gwc(posteriors, level=cleanup)
         posteriors = posteriors.cpu()
@@ -1726,49 +1729,84 @@ def debridge_gm(
     return out / out.sum(dim=0, keepdim=True).clamp_min(1e-20)
 
 
+def _flanked_by(mask: Tensor, k: int) -> Tensor:
+    """True where ``mask`` is present within ``k`` voxels on **both** sides along at least one
+    axis — the "high … gap … high" sheet-continuity test (directional, not isotropic)."""
+    flank = torch.zeros_like(mask)
+    for axis in (0, 1, 2):
+        ahead = torch.zeros_like(mask)
+        behind = torch.zeros_like(mask)
+        for j in range(1, k + 1):
+            ahead = ahead | torch.roll(mask, -j, dims=axis)
+            behind = behind | torch.roll(mask, j, dims=axis)
+        flank = flank | (ahead & behind)
+    return flank
+
+
 def dura_cleanup(
     posteriors: Tensor,
     vox: tuple[float, float, float],
     *,
     max_thick_mm: float = 6.0,
+    method: str = "geodesic",
     csf_barrier: float = 0.5,
     gm_th: float = 0.1,
     wm_seed: float = 0.5,
+    flank_k: int = 3,
+    csf_hi: float = 0.4,
     gm_index: int = 0,
     wm_index: int = 1,
     csf_index: int = 2,
 ) -> Tensor:
-    """Demote dura misclassified as GM, by a **WM-geodesic** reach through brain tissue.
+    """Demote dura misclassified as GM. Two methods, both restricted to the **outer shell**
+    (far from WM) so legitimate sulcal CSF/cortex near WM is untouched:
 
-    Cortical GM is a thin band that always abuts WM; dura is thin GM that sits *far* from any
-    WM and is separated from true cortex by a CSF "moat". SPM's ``clean_gwc`` can't remove it
-    (it's topologically connected to cortex, so component-based brain extraction keeps it).
+    - ``"geodesic"`` (default, SPM-validated) — grow a front from WM through brain tissue
+      (``GM+WM > gm_th``) **blocked by CSF** (``CSF < csf_barrier``), out to ``max_thick_mm``;
+      demote GM the front can't reach. A gyral crown stays (tissue-connected to WM through the
+      gyrus); only GM reachable solely by crossing a CSF moat is removed. Far less destructive
+      than :func:`debridge_gm`'s blind opening. On the reference subject this brings GM >6 mm
+      from WM to SPM's own 2.8 % (Dice-vs-SPM 0.950→0.951).
+    - ``"csf_gap"`` — the **inverted** view: the dura is a *hole* in the outer CSF sheet, so
+      ``CSF`` reads "high … gap … high". A GM voxel in the outer shell whose CSF is low but is
+      **flanked by high CSF (>csf_hi) on opposite sides within ``flank_k`` voxels** is that gap
+      → reassigned to CSF. Directional flanking (not an isotropic morphological closing) spares
+      a one-sided concavity. More robust than the wavefront when the inner subarachnoid CSF is
+      thin/partial-volumed (a weak barrier the front would leak through, keeping the dura). The
+      outer shell is defined geodesically from WM through the *whole* brain (``GM+WM+CSF``) out
+      to ``max_thick_mm`` — cortex is nearer than that, dura beyond.
 
-    Grow a front from the WM seed through **brain tissue** (``GM+WM > gm_th``) that is
-    **blocked by CSF** (``CSF < csf_barrier`` — the moat stops the front), out to a
-    cortical-thickness budget ``max_thick_mm`` (one voxel per iteration for
-    ``ceil(max_thick_mm / min(vox))`` iterations); demote GM the front cannot reach. A gyral
-    crown stays (tissue-connected to WM *through the gyrus* even when Euclidean-far); only GM
-    reachable solely by crossing the CSF moat is removed. Far less destructive than
-    :func:`debridge_gm`'s blind morphological opening. Beyond SPM's cleanup; on the reference
-    subject it brings GM >6 mm from WM to SPM's own 2.8 % (Dice-vs-SPM 0.950→0.951).
-    ``max_thick_mm<=0`` disables. SPM order ``GM, WM, CSF, …`` assumed.
-
-    Returns ``(n_tissue, nz, ny, nx)`` posteriors with dura demoted (rows sum to 1).
+    ``max_thick_mm<=0`` disables. SPM order ``GM, WM, CSF, …`` assumed. Returns
+    ``(n_tissue, nz, ny, nx)`` posteriors with dura demoted (rows sum to 1).
     """
     import math
 
     if max_thick_mm <= 0 or posteriors.shape[0] <= max(gm_index, wm_index, csf_index):
         return posteriors
     gm, wm, csf = posteriors[gm_index], posteriors[wm_index], posteriors[csf_index]
-    allowed = ((gm + wm) > gm_th) & (csf < csf_barrier)  # brain tissue, CSF moat blocks
-    reach = wm > wm_seed
     n_iter = max(1, int(math.ceil(max_thick_mm / min(vox))))
-    for _ in range(n_iter):
-        reach = reach | (_binary_dilate(reach, 1) & allowed)  # advance the front one voxel
-    dura = (gm > 0.5) & ~reach
     out = posteriors.to(torch.float32).clone()
-    out[gm_index] = torch.where(dura, torch.zeros_like(gm), gm)
+
+    if method == "geodesic":
+        allowed = ((gm + wm) > gm_th) & (csf < csf_barrier)  # brain tissue, CSF moat blocks
+        reach = wm > wm_seed
+        for _ in range(n_iter):
+            reach = reach | (_binary_dilate(reach, 1) & allowed)  # advance the front one voxel
+        dura = (gm > 0.5) & ~reach
+        out[gm_index] = torch.where(dura, torch.zeros_like(gm), gm)  # redistribute on renorm
+    elif method == "csf_gap":
+        # outer shell = far from WM geodesically through the WHOLE brain (not CSF-blocked)
+        brain = (gm + wm + csf) > gm_th
+        near = wm > wm_seed
+        for _ in range(n_iter):
+            near = near | (_binary_dilate(near, 1) & brain)
+        chi = csf > csf_hi
+        gap = _flanked_by(chi, flank_k) & ~chi & (gm > 0.5) & ~near  # a hole in the CSF sheet
+        out[csf_index] = csf + torch.where(gap, gm, torch.zeros_like(gm))  # the gap IS CSF
+        out[gm_index] = torch.where(gap, torch.zeros_like(gm), gm)
+    else:
+        raise ValueError(f"dura_cleanup method must be 'geodesic' or 'csf_gap', got {method!r}")
+
     return out / out.sum(dim=0, keepdim=True).clamp_min(1e-20)
 
 

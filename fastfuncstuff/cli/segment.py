@@ -461,6 +461,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Beyond SPM's cleanup. 0 off (default); try 6 (removes ~0.7%% of GM, all >4mm from WM).",
     )
     knobs.add_argument(
+        "-dura_method",
+        default="geodesic",
+        choices=("geodesic", "csf_gap"),
+        help="How -dura_clean finds dura. 'geodesic' (default, validated to match SPM's dura "
+        "level): grow a front from WM blocked by CSF; demote GM it can't reach. 'csf_gap': the "
+        "inverted view — the dura is a HOLE in the outer CSF sheet ('high..gap..high'); demote "
+        "outer-shell GM whose CSF is low but flanked by high CSF on both sides, reassigning it "
+        "to CSF. csf_gap is more robust when the inner subarachnoid CSF is thin (a weak barrier "
+        "the geodesic front leaks through).",
+    )
+    knobs.add_argument(
         "-save_precleanup",
         action="store_true",
         help="Also write the tissue maps as they were BEFORE the -mrf/-debridge/-cleanup "
@@ -679,6 +690,7 @@ def main(argv: list[str] | None = None) -> int:
         cleanup=args.cleanup,
         debridge=args.debridge,
         dura_clean=args.dura_clean,
+        dura_method=args.dura_method,
         prior_kernel=args.prior_interp,
         save_precleanup=args.save_precleanup,
         device=device,

@@ -476,6 +476,32 @@ def test_dura_cleanup_removes_moat_separated_gm_keeps_cortex():
     assert torch.allclose(dura_cleanup(post, (1.0, 1.0, 1.0), max_thick_mm=0.0), post)  # 0 disables
 
 
+def test_dura_cleanup_csf_gap_fills_sheet_hole():
+    """csf_gap method: an outer-shell GM voxel flanked by high CSF on both sides (a hole in the
+    CSF sheet) is reassigned to CSF; CSF present on only one side (a concavity) is spared."""
+    from fastfuncstuff.processing.segment import dura_cleanup
+
+    n = 40
+    post = torch.zeros(4, n, n, n)
+    post[3] = 1.0
+
+    def fill(idx, sl, val=0.9):
+        post[idx][sl], post[3][sl] = val, 1.0 - val
+
+    fill(1, (slice(4, 10), slice(10, 30), slice(10, 30)))  # WM slab (near edge)
+    fill(0, (slice(10, 13), slice(10, 30), slice(10, 30)))  # cortex GM on the WM face
+    # OUTER shell (far from WM, z≈30): a CSF sheet with a 2-voxel GM hole in the middle
+    fill(2, (slice(28, 34), slice(10, 30), slice(10, 20)), 0.8)  # CSF, one side of the gap
+    fill(0, (slice(28, 34), slice(10, 30), slice(20, 22)), 0.9)  # GM hole (the dura) in the sheet
+    fill(2, (slice(28, 34), slice(10, 30), slice(22, 30)), 0.8)  # CSF, other side of the gap
+
+    out = dura_cleanup(post, (1.0, 1.0, 1.0), max_thick_mm=6.0, method="csf_gap")
+    assert out[0, 31, 20, 21] < 0.05  # GM hole flanked by CSF on both sides → reassigned
+    assert out[2, 31, 20, 21] > 0.85  # ...to CSF (the sheet is closed)
+    assert out[0, 11, 20, 20] > 0.8  # cortex near WM untouched (outer-shell restriction)
+    assert torch.allclose(out.sum(0), torch.ones(n, n, n), atol=1e-4)
+
+
 def test_segment_apply_precleanup_returned():
     """save_precleanup returns the posteriors before the mrf/debridge/cleanup passes."""
     from fastfuncstuff.processing.segment import segment_apply
