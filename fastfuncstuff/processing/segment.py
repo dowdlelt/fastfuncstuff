@@ -155,37 +155,59 @@ def gmm_responsibilities(
         resp: (n_vox, n_gauss) responsibilities (rows sum to 1).
         loglik: (n_vox,) data log-likelihood ``log Σ_k unnormalised-density``.
     """
-    # Per-voxel work runs in the caller's dtype (float32 fit hot path → fast + cheap
-    # autograd on consumer GPUs, where float64 is ~1/32 rate). Only the tiny per-Gaussian
-    # covariance factorisation is promoted to float64 for conditioning ([[Float32 vs
-    # float64]]).
+    prior = prior.to(corrected.dtype)
+    log_gauss = gaussian_log_density(corrected, means, covs, mix)  # (n_vox, n_gauss)
+    log_dens = log_gauss + torch.log(prior[:, tissue_of].clamp_min(1e-40))
+    loglik = torch.logsumexp(log_dens, dim=1)  # (n_vox,)
+    resp = torch.exp(log_dens - loglik[:, None])  # (n_vox, n_gauss), rows sum to 1
+    return resp, loglik
+
+
+def gaussian_log_density(corrected: Tensor, means: Tensor, covs: Tensor, mix: Tensor) -> Tensor:
+    """``log(mix_k) + log N(y; mn_k, vr_k)`` per Gaussian — ``(n_vox, n_gauss)``.
+
+    The intensity-only part of the E-step (no spatial prior). Factored out because it is
+    **constant while only the warp changes**, so the deformation step evaluates the
+    Gaussians once per EM iteration (via :func:`gmm_tissue_likelihood`) instead of on every
+    warp sub-iteration / line-search step.
+
+    Per-voxel work runs in the caller's dtype (float32 fit hot path → fast + cheap autograd
+    on consumer GPUs, where float64 is ~1/32 rate). Only the tiny per-Gaussian covariance
+    factorisation is promoted to float64 for conditioning ([[Float32 vs float64]]).
+    """
     wdt = corrected.dtype
     n_chan = corrected.shape[1]
-    means = means.to(wdt)
-    mix = mix.to(wdt)
-    prior = prior.to(wdt)
-
     # log N(y; mean, cov) = -n_chan/2·log2π - 1/2·log|cov| - 1/2·(y-mean)' cov⁻¹ (y-mean).
     # Batch the tiny per-Gaussian factorisations (covs are n_chan×n_chan, n_chan small)
     # into ONE call each — a Python loop of 1×1 Cholesky/triangular-solves was pure
     # LAPACK-dispatch overhead (dominant on CPU, launch-bound on GPU).
     covs_b = covs.to(torch.float64).permute(2, 0, 1)  # (n_gauss, n_chan, n_chan)
     chol = torch.linalg.cholesky(covs_b)  # M-step keeps covs PD
-    logdet = 2.0 * torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)  # (n_gauss,)
+    logdet = (2.0 * torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)).to(wdt)
     prec = torch.cholesky_inverse(chol).to(wdt)  # (n_gauss, n_chan, n_chan) = cov⁻¹
-    logdet = logdet.to(wdt)
-    centred = corrected[:, :, None] - means[None, :, :]  # (n_vox, n_chan, n_gauss)
+    centred = corrected[:, :, None] - means.to(wdt)[None, :, :]  # (n_vox, n_chan, n_gauss)
     tmp = torch.einsum("vck,kcd->vdk", centred, prec)
     maha = (tmp * centred).sum(dim=1)  # (n_vox, n_gauss)
+    return torch.log(mix.to(wdt).clamp_min(1e-40)) - 0.5 * (n_chan * _LOG_2PI + logdet + maha)
 
-    log_dens = (
-        torch.log(mix.clamp_min(1e-40))
-        + torch.log(prior[:, tissue_of].clamp_min(1e-40))
-        - 0.5 * (n_chan * _LOG_2PI + logdet + maha)
-    )
-    loglik = torch.logsumexp(log_dens, dim=1)  # (n_vox,)
-    resp = torch.exp(log_dens - loglik[:, None])  # (n_vox, n_gauss), rows sum to 1
-    return resp, loglik
+
+def gmm_tissue_likelihood(
+    corrected: Tensor, means: Tensor, covs: Tensor, mix: Tensor, tissue_of: Tensor, n_tissue: int
+) -> Tensor:
+    """Per-**tissue** relative likelihood ``Σ_{k∈t} mix_k·N(y; mn_k, vr_k)`` — ``(n_vox,
+    n_tissue)``, Gaussians collapsed, spatial prior excluded (SPM ``buf.dat``).
+
+    Row-scaled by ``exp(−rowmax)`` for numerical safety; the dropped ``rowmax`` is a
+    per-voxel constant that shifts the warp log-likelihood by a fixed offset (irrelevant to
+    the gradient and to line-search *comparisons*). The deformation objective is then just
+    ``Σ log(Σ_t lik_t · prior_t(φ))`` — one cheap ``grid_sample`` + dot per warp step, with
+    the Cholesky/Mahalanobis paid once per EM iteration rather than once per sub-iteration.
+    """
+    qt = gaussian_log_density(corrected, means, covs, mix)  # (n_vox, n_gauss)
+    e = torch.exp(qt - qt.max(dim=1, keepdim=True).values)
+    lik = torch.zeros(corrected.shape[0], n_tissue, dtype=e.dtype, device=e.device)
+    lik.index_add_(1, tissue_of, e)
+    return lik
 
 
 def gmm_moments(corrected: Tensor, resp: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -475,6 +497,23 @@ def sample_tpm_prior(
     return prior / total
 
 
+def update_tissue_weights(
+    tissue_mass: Tensor, expected_mass: Tensor, wp_reg: float, n_tissue: int
+) -> Tensor:
+    """SPM's self-correcting tissue-weight (``wp``) update, normalised.
+
+    ``wp_k = (observed_k + wp_reg) / (expected_k + wp_reg·Kb)`` then normalised (SPM
+    ``spm_preproc8`` eq. after 27). ``observed_k`` is the soft tissue mass; ``expected_k``
+    is ``mgm_k = Σ_v B(v,k)/(B(v,:)·wp)`` over the **unweighted** warped TPM ``B``. Because
+    ``expected_k`` grows with ``wp_k``, the ratio self-corrects — unlike an ``observed/
+    total-observed`` update, which positively feeds back and inflates one tissue past its
+    boundary over many iterations ("growing brains"). ``wp_reg`` (SPM default 100) biases
+    the result toward uniform ``1/Kb``: larger ``wp_reg`` → closer to uniform.
+    """
+    wp = (tissue_mass + wp_reg) / (expected_mass + wp_reg * n_tissue)
+    return wp / wp.sum()
+
+
 def weight_prior(prior: Tensor, wp: Tensor) -> Tensor:
     """Apply per-tissue weights ``wp`` and renormalise (SPM ``log_spatial_priors``).
 
@@ -490,59 +529,124 @@ def weight_prior(prior: Tensor, wp: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def warp_penalty(
-    field: Tensor, reg: tuple[float, float, float], vox: tuple[float, float, float]
+def _linear_elastic_energy(
+    field: Tensor, le: tuple[float, float], vox: tuple[float, float, float]
 ) -> Tensor:
+    """Linear-elastic warp energy — ``le1·(∇·u)²`` (compression) + ``le2·Σ ε_ij²``
+    (shear), SPM's ``reg`` terms 4-5 (``le1``/``le2``, defaults 0.01/0.04).
+
+    ``ε_ij = ½(∂u_i/∂x_j + ∂u_j/∂x_i)`` is the symmetric strain tensor. This is an
+    autograd-friendly finite-difference approximation of SPM's linear-elastic operator
+    (the exact multigrid stencil is the ``warp_solver="gn"`` path's remit); it adds the
+    volume/shear penalisation SPM applies by default, which pure membrane+bending lacks.
+    Displacement components ``(0,1,2)=(x,y,z)``; spatial dims ``(0,1,2)=(z,y,x)`` with
+    step ``(vox[2],vox[1],vox[0])``.
+    """
+    w_le1, w_le2 = le
+    if min(field.shape[:3]) < 2:
+        return field.new_zeros(())
+    ux, uy, uz = field[..., 0], field[..., 1], field[..., 2]
+    hx, hy, hz = vox[0], vox[1], vox[2]
+
+    def d(u: Tensor, dim: int, step: float) -> Tensor:
+        return torch.gradient(u, spacing=step, dim=dim)[0]
+
+    dux_dx, duy_dy, duz_dz = d(ux, 2, hx), d(uy, 1, hy), d(uz, 0, hz)
+    energy = field.new_zeros(())
+    if w_le1:
+        div = dux_dx + duy_dy + duz_dz
+        energy = energy + w_le1 * (div**2).sum()
+    if w_le2:
+        dux_dy, duy_dx = d(ux, 1, hy), d(uy, 2, hx)
+        dux_dz, duz_dx = d(ux, 0, hz), d(uz, 2, hx)
+        duy_dz, duz_dy = d(uy, 0, hz), d(uz, 1, hy)
+        strain_sq = (
+            dux_dx**2
+            + duy_dy**2
+            + duz_dz**2
+            + 0.5 * ((dux_dy + duy_dx) ** 2 + (dux_dz + duz_dx) ** 2 + (duy_dz + duz_dy) ** 2)
+        )
+        energy = energy + w_le2 * strain_sq.sum()
+    return energy
+
+
+def warp_penalty(field: Tensor, reg: tuple[float, ...], vox: tuple[float, float, float]) -> Tensor:
     """Smoothness penalty on a dense displacement field ``(gz, gy, gx, 3)``.
 
-    ``reg = (absolute, membrane, bending)`` weights three energies (SPM's first
-    three ``reg`` terms; linear-elastic ``le1/le2`` are deferred to the GN solver):
+    ``reg = (absolute, membrane, bending[, le1, le2])`` weights up to five energies —
+    SPM's full ``reg`` vector (default ``[0 0 0.1 0.01 0.04]``). A 3-tuple is accepted
+    for back-compatibility (``le1=le2=0``).
 
     - **absolute** ``Σ u²`` — pulls the field toward zero (keeps it from drifting).
-    - **membrane** ``Σ |∇u|²`` — penalises stretch, the dominant smoothness term.
+    - **membrane** ``Σ |∇u|²`` — penalises stretch.
     - **bending** ``Σ |∇²u|²`` — penalises curvature for a smooth, fold-free warp.
+    - **linear-elastic** (``le1/le2``) — divergence + shear (:func:`_linear_elastic_energy`).
 
-    Gradients are finite differences in grid units scaled by ``vox`` (mm) so the
-    penalty is physically meaningful regardless of the subsampling.
+    Gradients are finite differences in grid units scaled by ``vox`` (mm) so the penalty
+    is physically meaningful. ``vox`` must be the **node spacing** of ``field`` — for the
+    subsampled warp grid that is ``samp_stride · voxel_size`` (SPM's ``sk.*vx``), not the
+    full-resolution voxel size.
     """
-    w_abs, w_mem, w_bend = reg
+    w = tuple(reg) + (0.0,) * (5 - len(reg))
+    w_abs, w_mem, w_bend, w_le1, w_le2 = w[:5]
     penalty = field.new_zeros(())
     if w_abs:
         penalty = penalty + w_abs * (field**2).sum()
     for axis, step in zip((0, 1, 2), (vox[2], vox[1], vox[0]), strict=True):
-        if field.shape[axis] < 3:
-            continue
-        d1 = torch.diff(field, dim=axis) / step
-        if w_mem:
+        if field.shape[axis] >= 2 and w_mem:
+            d1 = torch.diff(field, dim=axis) / step
             penalty = penalty + w_mem * (d1**2).sum()
-        if w_bend and field.shape[axis] >= 3:
+        if field.shape[axis] >= 3 and w_bend:
             d2 = torch.diff(field, n=2, dim=axis) / (step * step)
             penalty = penalty + w_bend * (d2**2).sum()
+    if w_le1 or w_le2:
+        penalty = penalty + _linear_elastic_energy(field, (w_le1, w_le2), vox)
     return penalty
 
 
-def _cg_solve(beta: Tensor, apply_a, n_iter: int = 24, tol: float = 1e-6) -> Tensor:
+def fudge_factor(vox: tuple[float, float, float], sk: tuple[int, int, int], fwhm: float) -> float:
+    """SPM's noise-nonindependence fudge factor ``ff`` (``spm_preproc8`` line 123).
+
+    ``ff = prod(4π·(s/vx/sk)² + 1)^½`` with ``s = (fwhm + mean(vx))/√(8ln2)``. It
+    inflates both the bias precision and the warp regularisation to (approximately)
+    account for the effective number of *independent* samples given the sampling stride
+    ``sk`` and image smoothness ``fwhm`` — so the regularisation strength tracks ``samp``
+    the way SPM's does instead of being a fixed factor off. ``fwhm=0`` is standard for
+    MRI (still ``ff>1`` via the ``mean(vx)`` term); use ~5 mm for PET/SPECT.
+    """
+    import math
+
+    s = (fwhm + sum(vox) / 3.0) / math.sqrt(8.0 * math.log(2.0))
+    prod = 1.0
+    for vx, k in zip(vox, sk, strict=True):
+        prod *= 4.0 * math.pi * (s / (vx * k)) ** 2 + 1.0
+    return prod**0.5
+
+
+def _cg_solve(beta: Tensor, apply_a, n_iter: int = 10) -> Tensor:
     """Conjugate gradient for the SPD system ``A·x = beta`` (``apply_a`` computes ``A·p``).
 
     Used by the Gauss-Newton warp solver to invert ``(Alpha + L)`` — the per-node GN
     Hessian plus the regularisation operator — the way SPM's ``spm_field`` multigrid does,
     but matrix-free on the GPU (``apply_a`` is a couple of tensor ops + one autograd pass
     for the regulariser). Starts from ``x=0`` so the initial residual is ``beta``.
+
+    Runs a **fixed** ``n_iter`` with no residual-tolerance check: the check compared a GPU
+    scalar in a Python ``if`` every iteration, forcing a host sync that idled the GPU. A
+    fixed short run gives an approximate Newton direction that the Armijo line search
+    validates anyway — all scalar arithmetic stays on-device, so CG runs sync-free.
     """
     x = torch.zeros_like(beta)
     r = beta.clone()
     p = r.clone()
     rs = (r * r).sum()
-    rs0 = rs.clone()
     for _ in range(n_iter):
         ap = apply_a(p)
         alpha = rs / (p * ap).sum().clamp_min(1e-30)
         x = x + alpha * p
         r = r - alpha * ap
         rs_new = (r * r).sum()
-        if rs_new <= tol * tol * rs0:
-            break
-        p = r + (rs_new / rs) * p
+        p = r + (rs_new / rs.clamp_min(1e-30)) * p
         rs = rs_new
     return x
 
@@ -614,21 +718,26 @@ def fit_segment(
     ngaus: list[int] | None = None,
     biasreg: float = 1e-4,
     biasfwhm: float = 60.0,
-    reg: tuple[float, float, float] = (0.0, 0.0, 0.1),
+    reg: tuple[float, ...] = (0.0, 0.0, 0.1, 0.01, 0.04),
+    fwhm: float = 0.0,
     samp: float = 3.0,
     n_iter: int = 20,
     tol: float = 1e-4,
     fit_warp: bool = True,
+    warp_anneal: bool = True,
     pe_axis: int | None = None,
+    reverse_volume: Tensor | list[Tensor] | None = None,
     blur_tpms: float = 0.0,
     blur_frac: float = 0.4,
     warp_focus: float = 0.0,
     focus_quantile: float = 0.9,
     wp_reg: float = 100.0,
+    bias_solver: str = "gn",
+    bias_iters: int = 2,
     bias_lr: float = 0.1,
-    warp_solver: str = "adam",
+    warp_solver: str = "gn",
     warp_lr: float = 1.0,
-    warp_iters: int = 8,
+    warp_iters: int | None = None,
     warp_smooth: float = 0.8,
     fit_chunk: int | None = None,
     dtype: torch.dtype = torch.float32,
@@ -655,6 +764,15 @@ def fit_segment(
     set, constrains the deformation to that single voxel axis — the phase-encode
     direction — so the warp is a pure 1-D EPI distortion field (PE-mode, like ffs_rbr).
 
+    ``reverse_volume`` (PE-mode only) enables **dual-echo distortion correction**: a
+    reverse-phase-encode EPI (same grid, opposite blip) images the same anatomy with the
+    *opposite* distortion, so its correcting warp is exactly ``−u`` where the forward's is
+    ``+u``. Passing it makes the single PE warp be driven by **both** echoes at once — the
+    forward samples pull the TPM at ``coords + u`` and the reverse samples at ``coords − u``,
+    sharing the GMM/bias/TPM. This uses both blips instead of discarding the reverse (à la
+    TOPUP), doubling the information constraining the residual distortion field. The output
+    ``twarp`` is the forward warp ``+u`` (negate for the reverse's own correction).
+
     ``blur_tpms`` (TPM-voxel sigma) runs a **coarse-to-fine** schedule: the first
     ``blur_frac`` of the iterations use a spatially-blurred TPM (:func:`blur_log_prior`)
     so the warp has a wide capture basin, then the remaining iterations switch to the
@@ -676,24 +794,40 @@ def fit_segment(
     a small ``wp_reg`` lets a tissue's weight run away over many iterations (positive
     feedback that inflates it past its boundary — "growing brains"), so keep it high.
 
-    ``warp_solver`` selects the deformation optimiser. ``"adam"`` (default) is the
-    autograd + Sobolev-smoothing update — fast, robust, the knobs below apply.
-    ``"gn"`` is SPM's **Gauss-Newton** update (``spm_preproc8``): per-node gradient +
-    rank-1 GN Hessian ``dp·dpᵀ``, the regularisation operator added, solved by conjugate
-    gradient (in place of SPM's multigrid), with Armijo backtracking so every step is
-    guaranteed to improve the penalised likelihood. GN needs no learning rate, converges
-    in far fewer sub-iterations (set ``warp_iters`` to ~2-3), and — being properly
-    regularised and monotone — does not inflate at high iteration counts the way a free
-    Adam warp can. GN ignores ``warp_lr``/``warp_smooth``/``warp_focus`` (it regularises
-    through ``reg`` instead); give ``reg`` a non-zero membrane term for a well-posed solve.
+    ``reg`` is SPM's full deformation regulariser ``(absolute, membrane, bending, le1,
+    le2)`` (default ``(0, 0, 0.1, 0.01, 0.04)``); a 3-tuple is accepted (``le1=le2=0``).
+    ``fwhm`` (image smoothness, mm) feeds SPM's fudge factor ``ff`` that inflates both the
+    bias precision and the warp regulariser to account for spatially-correlated noise —
+    0 for MRI, ~5 for PET/SPECT. Both the bias and warp regularisers now carry ``ff`` and
+    the warp penalty uses the true node spacing (``samp·vox``), so their strength tracks
+    ``samp`` as in SPM. ``warp_anneal`` (default on) applies SPM's heavy-to-light schedule
+    — the bending term is stiffened by up to ``2¹⁰`` early and relaxed to target by iter
+    10, so the warp can't over-commit before the intensity model settles.
 
-    Global warp **aggressiveness** (how far the deformation moves overall, distinct from
-    the localised ``warp_focus``) is set by four knobs: ``warp_lr`` (Adam step size,
-    default 1.0 — the most direct dial), ``warp_iters`` (gradient steps per EM iteration,
-    default 8), and the two dampers ``reg`` (smoothness penalty; lower the bending term to
-    allow larger folds) and ``warp_smooth`` (per-iteration Sobolev sigma; lower lets more
-    data-driven displacement survive). Raise ``warp_lr``/``warp_iters`` and/or lower
-    ``reg``/``warp_smooth`` to warp more.
+    ``bias_solver`` selects the bias-field optimiser. ``"gn"`` (default) is SPM's analytic
+    Gauss-Newton on the DCT coefficients (``spm_preproc8`` eq. 34): a closed-form gradient
+    ``Beta`` and GN Hessian ``Alpha`` assembled from the responsibility-weighted per-voxel
+    terms, solved as ``(Alpha + C)u = Beta + C·T`` with Armijo backtracking — no autograd
+    graph, recovers the field far more accurately than gradient descent, and is faster.
+    ``bias_iters`` (default 2) is the number of GN sweeps per EM iteration. ``"adam"`` is the
+    autograd gradient-descent fallback (``bias_lr``). Both include the ``+Σ log|bias|``
+    change-of-variables Jacobian (SPM's ``+1`` in eq. 34 / ``chan.ll += sum(bf)``).
+
+    ``warp_solver`` selects the deformation optimiser. ``"gn"`` (default) is SPM's
+    **Gauss-Newton** update (``spm_preproc8``): per-node gradient + rank-1 GN Hessian
+    ``dp·dpᵀ``, the regularisation operator added, solved by conjugate gradient (in place of
+    SPM's multigrid), with Armijo backtracking. It **converges** — the warp reaches a stable
+    fixed point and stops growing once the fit settles, so a large ``n_iter`` is safe
+    (matches SPM). ``"adam"`` is the autograd + Sobolev-smoothing update (``warp_lr``/
+    ``warp_smooth``/``warp_focus`` apply), but it **accumulates** displacement across EM
+    iterations rather than converging, so the warp keeps growing with ``n_iter`` and can drag
+    the tissue priors out of place (GM/CSF into the skull/neck) — use it only for short runs.
+
+    The warp regulariser follows SPM's ``param``: ``prod(sk·vx)·ff·reg`` (the ``prod`` node-
+    volume factor is essential — without it the deformation is ~20× under-regularised and
+    runs away). Global warp **aggressiveness** (distinct from the localised ``warp_focus``,
+    Adam only) is set by ``reg`` (lower the bending/elastic terms to allow larger folds) and,
+    for Adam, ``warp_lr``/``warp_iters``/``warp_smooth``.
 
     All per-sample work (GMM moments, bias/warp gradients, tissue-weight update) is
     processed in chunks of ``fit_chunk`` samples so peak VRAM is bounded by the chunk,
@@ -713,6 +847,10 @@ def fit_segment(
     # and the fit's autograd graph dominates. Numerically load-bearing steps (the
     # covariance factorisation and the moment reduction) stay float64 internally.
     wdt = dtype
+    # Warp sub-iterations per EM step: GN converges in ~3 (each is a full CG solve + Armijo
+    # line search over all samples — expensive), Adam wants more small gradient steps.
+    if warp_iters is None:
+        warp_iters = 3 if warp_solver == "gn" else 8
     # Accept one volume (3-D) or several ALIGNED channels (4-D ``(n_chan,nz,ny,nx)`` or a
     # list) — SPM's multi-spectral segmentation. Every channel shares the grid + affine.
     if isinstance(volume, (list, tuple)):
@@ -739,10 +877,39 @@ def fit_segment(
     zz, yy, xx = torch.meshgrid(gz, gy, gx, indexing="ij")
     grid_shape = zz.shape  # (ngz, ngy, ngx)
     fz, fy, fx = zz.reshape(-1), yy.reshape(-1), xx.reshape(-1)
-    coords = torch.stack([fx, fy, fz], dim=1).to(wdt)
-    intens = vols[:, fz, fy, fx].T.contiguous()  # (n_samp, n_chan)
-    keep = torch.isfinite(intens).all(dim=1) & (intens != 0).all(dim=1)
-    coords, intens = coords[keep], intens[keep]
+    coords_full = torch.stack([fx, fy, fz], dim=1).to(wdt)  # (n_grid, 3)
+    flat_idx_full = torch.arange(coords_full.shape[0], device=device)  # flat grid index
+
+    def _samples(v: Tensor) -> tuple[Tensor, Tensor]:
+        it = v[:, fz, fy, fx].T.contiguous()  # (n_grid, n_chan)
+        kp = torch.isfinite(it).all(dim=1) & (it != 0).all(dim=1)
+        return it, kp
+
+    intens_f, keep = _samples(vols)
+    # PE dual-echo distortion mode: a reverse-phase-encode EPI images the SAME anatomy with
+    # the OPPOSITE distortion, so its correcting warp is exactly −u (the forward's is +u).
+    # Stack it as extra samples that share the GMM/bias/TPM and carry warp_sign=−1, so the
+    # single warp field is driven by BOTH echoes at once (a dual optimisation — both blips,
+    # not one). Requires pe_axis (the opposite-sign relation only holds along the PE axis).
+    if reverse_volume is not None:
+        if pe_axis is None:
+            raise ValueError("reverse_volume requires pe_axis (the ± relation is PE-only)")
+        if isinstance(reverse_volume, (list, tuple)):
+            rvols = torch.stack([v.to(device=device, dtype=wdt) for v in reverse_volume], dim=0)
+        else:
+            reverse_volume = reverse_volume.to(device=device, dtype=wdt)
+            rvols = reverse_volume if reverse_volume.ndim == 4 else reverse_volume[None]
+        intens_r, keep_r = _samples(rvols)
+        coords = torch.cat([coords_full[keep], coords_full[keep_r]], dim=0)
+        intens = torch.cat([intens_f[keep], intens_r[keep_r]], dim=0)
+        kept_flat = torch.cat([flat_idx_full[keep], flat_idx_full[keep_r]], dim=0)
+        warp_sign = torch.cat(
+            [coords.new_ones(int(keep.sum())), -coords.new_ones(int(keep_r.sum()))]
+        )
+    else:
+        coords, intens = coords_full[keep], intens_f[keep]
+        kept_flat = flat_idx_full[keep]
+        warp_sign = coords.new_ones(coords.shape[0])
 
     if vox2vox is None:
         if world_affine is None:
@@ -753,12 +920,30 @@ def fit_segment(
     else:
         vox2vox = vox2vox.to(device=device, dtype=torch.float64)
 
+    # SPM's fudge factor (non-independence of smoothed voxels): scales BOTH the bias
+    # precision and the warp regularisation so their strength tracks the sampling stride
+    # `sk` the way SPM's does. `node_vox` is the warp grid's node spacing (sk·vx mm),
+    # the correct step for the deformation regulariser (the field lives on the subsampled
+    # grid, so full-res `vox` would over-penalise by `sk` per derivative).
+    ff = fudge_factor(vox, tuple(sk), fwhm)
+    node_vox = (sk[0] * vox[0], sk[1] * vox[1], sk[2] * vox[2])
+    # SPM scales the warp reg by the node volume `prod(sk·vx)` (spm_preproc8 `param`), NOT
+    # just `ff`. Dropping it (an earlier "correctness" simplification) made the deformation
+    # ~20× under-regularised → the warp ran away over iterations, dragging the GM/CSF priors
+    # into the skull/neck (worse with more iters). Restored: warp reg = prod·ff·reg, matching
+    # SPM's shipped magnitude so the fit converges to a stable, modest warp.
+    prod_node_vox = node_vox[0] * node_vox[1] * node_vox[2]
+
     # bias field basis shape (SPM 1-based DCT positions) + precision; the per-sample
     # bases themselves are (re)built per chunk in _basis, not stored full-size — at a
     # fine samp they would be the single largest persistent allocation.
     (nbx, nby, nbz), bias_prec = bias_field_shape(
-        (nx, ny, nz), vox, biasfwhm, biasreg, device=device
+        (nx, ny, nz), vox, biasfwhm, biasreg, ff, device=device
     )
+    d3 = nbx * nby * nbz  # DCT coefficients per channel (bias GN works in this flat space)
+    # cap the assembly chunk so the (chunk, d3) DCT design matrix stays bounded (~160 MB
+    # float32) regardless of d3 — the GN bias's only large transient.
+    bias_chunk = max(1, int(40_000_000 // max(d3, 1)))
 
     # Wishart covariance prior vr0 = diag(per-channel variance)/Kb² (SPM eq. after 25);
     # kept float64 for the M-step. Diagonal even for multi-channel (SPM's vr0).
@@ -769,7 +954,7 @@ def fit_segment(
     # one bias field per channel (SPM's chan(n).T): (n_chan, nbx, nby, nbz)
     coef = torch.zeros((n_chan, nbx, nby, nbz), dtype=wdt, device=device)
     twarp = torch.zeros((*grid_shape, 3), dtype=wdt, device=device)
-    keep_grid = keep  # to index the flat grid ↔ warp field
+    n_grid = coords_full.shape[0]  # flat warp-grid node count (kept_flat indexes into this)
     wp = torch.ones(n_tissue, dtype=wdt, device=device) / n_tissue
 
     log_prior_blur = blur_log_prior(log_prior, blur_tpms) if blur_tpms > 0 else log_prior
@@ -796,7 +981,6 @@ def fit_segment(
         )
     fit_chunk = max(1, min(int(fit_chunk), n_samp))
     n_chunks = (n_samp + fit_chunk - 1) // fit_chunk
-    kept_flat = keep_grid.nonzero(as_tuple=True)[0]  # flat grid index of each kept sample
     if verbose:
         how = "single pass — all samples fit" if n_chunks == 1 else f"{n_chunks} chunks"
         print(
@@ -830,18 +1014,33 @@ def fit_segment(
         out = torch.empty((n_samp, n_tissue), dtype=wdt, device=device)
         with torch.no_grad():
             for sl in _chunks():
-                disp = twarp.reshape(-1, 3)[kept_flat[sl]]
+                disp = warp_sign[sl][:, None] * twarp.reshape(-1, 3)[kept_flat[sl]]
                 tpm_coords = apply_affine_pts(coords[sl] + disp, vox2vox)
                 out[sl] = weight_prior(
                     sample_tpm_prior(active_log_prior, tpm_coords, bg_low, bg_high), wp
                 )
         return out
 
-    # --- Gauss-Newton warp helpers (used only when warp_solver == "gn") ---
-    # a small absolute term guarantees the (Alpha + L) system is SPD for the CG solve
-    # even when the user's reg has no membrane/absolute component (bending has a null
-    # space of affine fields). Consistent across gradient, operator and objective.
-    reg_gn = (max(reg[0], 1e-3), reg[1], reg[2])
+    # Warp regularisation: SPM's full 5-vector (abs, mem, bend, le1, le2), scaled by the
+    # fudge factor `ff`, and re-derived each EM iteration for the heavy-to-light schedule
+    # (see the loop). `warp_reg` is the Adam penalty weight; `warp_reg_gn` adds a small
+    # absolute floor so the Gauss-Newton (Alpha + L) system is SPD for the CG solve even
+    # when the user gives no membrane/absolute term (bending alone has an affine null
+    # space). Both are nonlocal so the closures below always see the current iteration's
+    # values; initialised here (iter-0) so the references exist before the loop.
+    reg5 = tuple(reg) + (0.0,) * (5 - len(reg))
+
+    def _scale_warp_reg(anneal: float) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        # SPM's param(4:8) = prod(vx·sk)·ff·reg; the bending term (param(6)) is additionally
+        # scaled heavy→light by `anneal`.
+        scale = prod_node_vox * ff
+        wr = tuple(scale * (r * anneal if j == 2 else r) for j, r in enumerate(reg5))
+        wr_gn = (max(wr[0], 1e-3), *wr[1:])
+        return wr, wr_gn
+
+    # (re)assigned each EM iteration for the heavy-to-light schedule; the GN closures
+    # above and the Adam step below read the current iteration's values (late binding).
+    warp_reg, warp_reg_gn = _scale_warp_reg(1.0)  # noqa: F841  (overwritten in the loop)
 
     def _pe_project(field: Tensor) -> Tensor:
         """Zero the non-phase-encode components in place (PE-mode constraint)."""
@@ -852,37 +1051,136 @@ def fit_segment(
         return field
 
     def _warp_data_term(tw: Tensor, active_log_prior: Tensor, *, want_grad: bool):
-        """Chunked data term ``-Σ log-likelihood(warp)`` (+ its autograd gradient)."""
+        """Chunked data term ``-Σ log-likelihood(warp)`` (+ its autograd gradient).
+
+        Uses the per-EM-iteration ``tissue_lik`` (Gaussians already collapsed), so only the
+        warped prior is recomputed per call — no Cholesky/Mahalanobis in the warp loop.
+        """
         tw = tw.detach().requires_grad_(want_grad)
-        total = 0.0
+        # Accumulate the objective on the GPU and sync ONCE at the end (never in the gradient
+        # path, where the total is discarded) — a per-chunk `.item()` stalled the GPU on a
+        # host round-trip every chunk, the main cause of the GN warp's low GPU utilisation.
+        tot = torch.zeros((), device=device) if not want_grad else None
         for sl in _chunks():
-            disp = tw.reshape(-1, 3)[kept_flat[sl]]
+            disp = warp_sign[sl][:, None] * tw.reshape(-1, 3)[kept_flat[sl]]
             tpm_coords = apply_affine_pts(coords[sl] + disp, vox2vox)
             pw = weight_prior(sample_tpm_prior(active_log_prior, tpm_coords, bg_low, bg_high), wp)
-            _, ll = gmm_responsibilities(corrected[sl], pw, means, covs, mix, tissue_of)
-            nll = -ll.sum()
+            nll = -torch.log((tissue_lik[sl] * pw).sum(dim=1).clamp_min(1e-40)).sum()
             if want_grad:
                 nll.backward()
-            total += nll.item()
+            elif tot is not None:
+                tot = tot + nll.detach()
         if not want_grad:
-            return total
+            assert tot is not None
+            return tot.item()
         grad = tw.grad if tw.grad is not None else torch.zeros_like(tw)
-        return total, grad.detach()
+        return 0.0, grad.detach()
 
     def _reg_grad(field: Tensor) -> Tensor:
         """Regularisation operator ``L·field`` = gradient of the (quadratic) warp penalty."""
         v = field.detach().requires_grad_(True)
-        (g,) = torch.autograd.grad(warp_penalty(v, reg_gn, vox), v)
+        (g,) = torch.autograd.grad(warp_penalty(v, warp_reg_gn, node_vox), v)
         return g.detach()
 
     def _warp_objective(tw: Tensor, active_log_prior: Tensor) -> float:
         """Penalised negative log-likelihood the GN line search must decrease."""
         return (
             _warp_data_term(tw, active_log_prior, want_grad=False)
-            + warp_penalty(tw, reg_gn, vox).item()
+            + warp_penalty(tw, warp_reg_gn, node_vox).item()
         )
 
+    # --- analytic Gauss-Newton bias helpers (used only when bias_solver == "gn") ---
+    def _bias_chunks():
+        for s in range(0, n_samp, bias_chunk):
+            yield slice(s, min(s + bias_chunk, n_samp))
+
+    def _khatri_rao_rows(bx: Tensor, by: Tensor, bz: Tensor) -> Tensor:
+        """Row-wise DCT design matrix ``Phi[v, flat(i,j,k)] = bx[v,i]·by[v,j]·bz[v,k]`` —
+        ``(n, d3)``, flattened C-order to match ``coef.reshape(-1)`` (so ``Phi @ coef.ravel``
+        reproduces :func:`eval_log_bias`)."""
+        n = bx.shape[0]
+        xy = (bx[:, :, None] * by[:, None, :]).reshape(n, -1)  # (n, nbx·nby)
+        return (xy[:, :, None] * bz[:, None, :]).reshape(n, -1)  # (n, d3)
+
+    def _bias_objective(coef_val: Tensor) -> float:
+        """Bias-relevant objective (SPM's ``ll`` terms that move with the bias): data ll +
+        Σ log|bias| (the change-of-variables Jacobian) − Σ 0.5·TᵀCT smoothness prior."""
+        total = 0.0
+        with torch.no_grad():
+            for sl in _chunks():
+                bx, by, bz = _basis(sl)
+                logb = [eval_log_bias(coef_val[c], bx, by, bz) for c in range(n_chan)]
+                corr = torch.stack([intens[sl, c] * torch.exp(logb[c]) for c in range(n_chan)], 1)
+                _, ll = gmm_responsibilities(corr, prior_w[sl], means, covs, mix, tissue_of)
+                total += ll.sum().item() + sum(lb.sum().item() for lb in logb)
+        total -= sum(bias_penalty_value(coef_val[c], bias_prec).item() for c in range(n_chan))
+        return total
+
+    def _bias_gn_sweep(coef_val: Tensor) -> Tensor:
+        """One SPM Gauss-Newton sweep over the channels' DCT bias coefficients (eq. 34).
+
+        For each channel a Gauss-Seidel update: assemble the closed-form gradient ``Beta``
+        and GN Hessian ``Alpha`` from the responsibility-weighted per-voxel terms, solve
+        ``(Alpha + C)·u = Beta + C·T`` (``C`` = the DCT smoothness precision), and Armijo-
+        backtrack on :func:`_bias_objective` so every accepted step improves it. The ``+1``
+        in ``wt1``/``wt2`` is the multiplicative bias's Jacobian (SPM ``chan.ll += sum(bf)``).
+        """
+        assert means is not None and covs is not None  # set by the EM loop before any sweep
+        coef_val = coef_val.detach().clone()
+        # per-Gaussian precisions covⁿ¹ (n_gauss, n_chan, n_chan), float64 for conditioning
+        prec = torch.cholesky_inverse(
+            torch.linalg.cholesky(covs.to(torch.float64).permute(2, 0, 1)),
+        )
+        c_diag = bias_prec.reshape(-1).to(torch.float64)  # diagonal DCT precision (d3,)
+        # Assemble in the working dtype (float32): the (chunk × d3) DCT design matrix `Phi`
+        # and its `Phiᵀ·diag(wt2)·Phi` GEMM dominate the whole fit, and a float64 GEMM runs
+        # ~30× slower on consumer GPUs. The GN Hessian is well-conditioned (+C diagonal,
+        # Armijo-guarded), so float32 is plenty; only the tiny d3×d3 solve + the cross-chunk
+        # accumulator stay float64.
+        prec_w = prec.to(wdt)  # (n_gauss, n_chan, n_chan)
+        means_w = means.to(wdt)  # (n_chan, n_gauss)
+        for c in range(n_chan):
+            alpha = torch.zeros((d3, d3), dtype=torch.float64, device=device)
+            beta = torch.zeros(d3, dtype=torch.float64, device=device)
+            with torch.no_grad():
+                for sl in _bias_chunks():
+                    bx, by, bz = _basis(sl)
+                    corr = torch.stack(
+                        [intens[sl, cc] * torch.exp(eval_log_bias(coef_val[cc], bx, by, bz))
+                         for cc in range(n_chan)], dim=1,
+                    )  # fmt: skip
+                    resp, _ = gmm_responsibilities(corr, prior_w[sl], means, covs, mix, tissue_of)
+                    # w0[v,k] = Σ_n1 prec[k,n1,c]·(mean[n1,k] − corrected[v,n1])  (US eq.34)
+                    diff = means_w.T[None, :, :] - corr[:, None, :]  # (chunk, n_gauss, n_chan)
+                    w0 = torch.einsum("kn,vkn->vk", prec_w[:, :, c], diff)
+                    w1 = (resp * w0).sum(dim=1)  # (chunk,)
+                    w2 = resp @ prec_w[:, c, c]  # (chunk,)
+                    cr_c = corr[:, c]
+                    wt1 = -(1.0 + cr_c * w1)  # gradient weight (the 1 = Jacobian term)
+                    wt2 = cr_c * cr_c * w2 + 1.0  # simplified GN Hessian weight (PSD, ≥1)
+                    phi = _khatri_rao_rows(bx, by, bz)  # (chunk, d3), float32
+                    beta += (phi.T @ wt1).double()
+                    alpha += ((phi * wt2[:, None]).T @ phi).double()
+            t_flat = coef_val[c].reshape(-1).to(torch.float64)
+            update = (
+                torch.linalg.solve(alpha + torch.diag(c_diag), beta + c_diag * t_flat)
+                .reshape(coef_val[c].shape)
+                .to(wdt)
+            )
+            # Armijo backtracking on the true objective (SPM's bias line search)
+            base = _bias_objective(coef_val)
+            armijo = 1.0
+            for _ in range(12):
+                cand = coef_val.clone()
+                cand[c] = coef_val[c] - armijo * update
+                if _bias_objective(cand) >= base:
+                    coef_val = cand
+                    break
+                armijo *= 0.5
+        return coef_val
+
     means = covs = mix = None
+    tissue_lik = None  # (n_samp, n_tissue) collapsed Gaussian likelihood, refreshed per iter
     prev_ll = -float("inf")
     bar = (
         _tqdm(total=n_iter, desc="segment EM", leave=True)
@@ -915,32 +1213,59 @@ def fit_segment(
             if delta < 1e-3:
                 break
 
-        # --- bias field (autograd: maximise data ll − penalty; grad accumulated) ---
-        coef = coef.detach().requires_grad_(True)
-        opt = torch.optim.Adam([coef], lr=bias_lr)
-        for _ in range(8):
-            opt.zero_grad()
-            for sl in _chunks():
-                bx, by, bz = _basis(sl)
-                corrected_c = torch.stack(
-                    [
-                        intens[sl, c] * torch.exp(eval_log_bias(coef[c], bx, by, bz))
-                        for c in range(n_chan)
-                    ],
-                    dim=1,
-                )  # (chunk, n_chan)
-                _, ll = gmm_responsibilities(corrected_c, prior_w[sl], means, covs, mix, tissue_of)
-                (-ll.sum()).backward()  # sum of chunk grads == whole-batch grad
-            # per-channel DCT smoothness prior, summed (SPM sums chan(n).ll)
-            torch.stack(
-                [bias_penalty_value(coef[c], bias_prec) for c in range(n_chan)]
-            ).sum().backward()
-            opt.step()
-        coef = coef.detach()
-        del opt
+        # --- bias field ---
+        if bias_solver == "gn":
+            # SPM's analytic Gauss-Newton on the DCT coefficients (eq. 34): closed-form
+            # gradient/Hessian, no autograd graph. A couple of sweeps per EM iteration.
+            for _ in range(bias_iters):
+                coef = _bias_gn_sweep(coef)
+        else:
+            # autograd Adam fallback: maximise data ll + Σ log|bias| Jacobian − penalty.
+            coef = coef.detach().requires_grad_(True)
+            opt = torch.optim.Adam([coef], lr=bias_lr)
+            for _ in range(8):
+                opt.zero_grad()
+                for sl in _chunks():
+                    bx, by, bz = _basis(sl)
+                    log_bias = [eval_log_bias(coef[c], bx, by, bz) for c in range(n_chan)]
+                    corrected_c = torch.stack(
+                        [intens[sl, c] * torch.exp(log_bias[c]) for c in range(n_chan)],
+                        dim=1,
+                    )  # (chunk, n_chan)
+                    _, ll = gmm_responsibilities(
+                        corrected_c, prior_w[sl], means, covs, mix, tissue_of
+                    )
+                    # + Σ log|bias|: the multiplicative bias's change-of-variables Jacobian
+                    # (corrected = exp(bias)·y). Without it the fit lowers −ll by shrinking
+                    # the bias. SPM includes it (the +1 in eq.34 gradient / chan.ll += sum bf).
+                    obj = ll.sum() + sum(lb.sum() for lb in log_bias)
+                    (-obj).backward()  # sum of chunk grads == whole-batch grad
+                torch.stack(
+                    [bias_penalty_value(coef[c], bias_prec) for c in range(n_chan)]
+                ).sum().backward()
+                opt.step()
+            coef = coef.detach()
+            del opt
 
         # corrected under the updated bias — constant for the warp + wp steps below
         corrected = corrected_full(coef)
+
+        # collapse the Gaussians into a per-tissue likelihood ONCE (SPM's buf.dat): the
+        # deformation + wp steps below only need Σ_t lik_t·prior_t, so the Cholesky/
+        # Mahalanobis is paid once per EM iteration, not once per warp sub-iteration.
+        if fit_warp or warp_focus > 0:
+            with torch.no_grad():
+                tissue_lik = torch.empty((n_samp, n_tissue), dtype=wdt, device=device)
+                for sl in _chunks():
+                    tissue_lik[sl] = gmm_tissue_likelihood(
+                        corrected[sl], means, covs, mix, tissue_of, n_tissue
+                    ).to(wdt)
+
+        # heavy-to-light regularisation (SPM `scal = 2^max(10-iter,0)` on the bending
+        # term): stiffen the warp early — before the GMM/bias have settled — then relax to
+        # the target by iter 10, so it can't over-commit to a bad deformation up front.
+        anneal = 2.0 ** max(10 - (it + 1), 0) if (warp_anneal and fit_warp) else 1.0
+        warp_reg, warp_reg_gn = _scale_warp_reg(anneal)
 
         # --- deformation ---
         if fit_warp and warp_solver == "gn":
@@ -974,14 +1299,15 @@ def fit_segment(
             for _ in range(warp_iters):
                 opt.zero_grad()
                 for sl in _chunks():
-                    disp = twarp.reshape(-1, 3)[kept_flat[sl]]
+                    disp = warp_sign[sl][:, None] * twarp.reshape(-1, 3)[kept_flat[sl]]
                     tpm_coords = apply_affine_pts(coords[sl] + disp, vox2vox)
                     pw = weight_prior(
                         sample_tpm_prior(cur_log_prior, tpm_coords, bg_low, bg_high), wp
                     )
-                    _, ll = gmm_responsibilities(corrected[sl], pw, means, covs, mix, tissue_of)
+                    # data ll from the precomputed tissue likelihood (no Gaussian eval here)
+                    ll = torch.log((tissue_lik[sl] * pw).sum(dim=1).clamp_min(1e-40))
                     (-ll.sum()).backward()
-                pen = warp_penalty(twarp, reg, vox)  # smoothness prior, once
+                pen = warp_penalty(twarp, warp_reg, node_vox)  # smoothness prior, once
                 if pen.requires_grad:  # all-zero reg → constant, nothing to backprop
                     pen.backward()
                 if pe_axis is not None:
@@ -999,23 +1325,23 @@ def fit_segment(
                 with torch.no_grad():
                     misfit = torch.empty(n_samp, dtype=wdt, device=device)
                     for sl in _chunks():
-                        disp = twarp.detach().reshape(-1, 3)[kept_flat[sl]]
+                        disp = warp_sign[sl][:, None] * twarp.detach().reshape(-1, 3)[kept_flat[sl]]
                         tpm_coords = apply_affine_pts(coords[sl] + disp, vox2vox)
                         pw = weight_prior(
                             sample_tpm_prior(cur_log_prior, tpm_coords, bg_low, bg_high), wp
                         )
-                        resp_f, _ = gmm_responsibilities(
-                            corrected[sl], pw, means, covs, mix, tissue_of
-                        )
-                        tpost = torch.zeros_like(pw)  # collapse Gaussians → per-tissue posterior
-                        tpost.index_add_(1, tissue_of, resp_f)
+                        # per-tissue posterior from the precomputed likelihood × warped prior
+                        tp = tissue_lik[sl] * pw
+                        tpost = tp / tp.sum(dim=1, keepdim=True).clamp_min(1e-40)
                         # per-node prior/posterior overlap; low overlap = the prior sits in
                         # the wrong place here (intensity says one tissue, the TPM another)
                         misfit[sl] = (1.0 - (tpost * pw).sum(dim=1)).clamp(0.0, 1.0)
                     thr = _quantile(misfit, focus_quantile)
                     rel = ((misfit - thr) / (misfit.max() - thr).clamp_min(1e-6)).clamp(0.0, 1.0)
-                    mf = torch.zeros(keep_grid.numel(), dtype=wdt, device=device)
-                    mf[keep_grid] = rel * warp_focus
+                    # scatter the per-sample relaxation onto grid nodes (dual-echo mode maps
+                    # two samples to a node; last write wins — fine for this niche Adam knob)
+                    mf = torch.zeros(n_grid, dtype=wdt, device=device)
+                    mf.scatter_(0, kept_flat, (rel * warp_focus).to(wdt))
                     # smooth the relaxation into a coherent blob (no single-node spikes)
                     kw = mf.reshape(grid_shape)[..., None].repeat(1, 1, 1, 3)
                     keep_weight = _smooth_field(kw, warp_smooth)[..., 0].clamp(0.0, 1.0)
@@ -1033,10 +1359,10 @@ def fit_segment(
         with torch.no_grad():
             tissue_mass = torch.zeros(n_tissue, dtype=torch.float64, device=device)
             mgm = torch.zeros(n_tissue, dtype=torch.float64, device=device)
-            total_ll = 0.0
+            data_ll = 0.0
             wp64 = wp.to(torch.float64)
             for sl in _chunks():
-                disp = twarp.reshape(-1, 3)[kept_flat[sl]]
+                disp = warp_sign[sl][:, None] * twarp.reshape(-1, 3)[kept_flat[sl]]
                 tpm_coords = apply_affine_pts(coords[sl] + disp, vox2vox)
                 raw_prior = sample_tpm_prior(cur_log_prior, tpm_coords, bg_low, bg_high)
                 pw = weight_prior(raw_prior, wp)
@@ -1045,9 +1371,20 @@ def fit_segment(
                 b64 = raw_prior.to(torch.float64)
                 s = 1.0 / (b64 @ wp64).clamp_min(1e-40)  # 1 / (B·wp) per voxel
                 mgm += (b64 * s[:, None]).sum(dim=0)  # Σ_v B(v,k)/(B·wp) = expected mass
-                total_ll += ll_c.sum().item()
-            wp = (tissue_mass + wp_reg) / (mgm + wp_reg * n_tissue)
-            wp = (wp / wp.sum()).to(wdt)
+                data_ll += ll_c.sum().item()
+            wp = update_tissue_weights(tissue_mass, mgm, wp_reg, n_tissue).to(wdt)
+            # Full penalised model objective (SPM's ll = llr + llrb + data): data ll +
+            # bias Jacobian − bias smoothness prior (0.5·TᵀCT) − warp prior (0.5·⟨u,Lu⟩).
+            # bias Jacobian Σ log|bias| = Σ log|corrected/intens| (corrected = exp(bias)·y),
+            # read straight off the corrected data — no need to re-evaluate the DCT.
+            bias_jac = (
+                (corrected.abs().clamp_min(1e-30).log() - intens.abs().clamp_min(1e-30).log())
+                .sum()
+                .item()
+            )
+            bias_pen = sum(bias_penalty_value(coef[c], bias_prec).item() for c in range(n_chan))
+            warp_pen = warp_penalty(twarp, warp_reg, node_vox).item() if fit_warp else 0.0
+            total_ll = data_ll + bias_jac - bias_pen - 0.5 * warp_pen
 
         ll_per_vox = total_ll / n_samp
         if bar is not None:
@@ -1095,6 +1432,7 @@ def segment_apply(
     mrf: float = 1.0,
     cleanup: int = 1,
     debridge: int = 0,
+    dura_clean: float = 0.0,
     prior_kernel: str = "cubic",
     save_precleanup: bool = False,
     device: torch.device | str | None = None,
@@ -1205,12 +1543,14 @@ def segment_apply(
 
     posteriors = posteriors.reshape(n_tissue, nz, ny, nx)
     precleanup = posteriors.clone() if save_precleanup else None
-    if mrf > 0 or cleanup > 0 or debridge > 0:
+    if mrf > 0 or cleanup > 0 or debridge > 0 or dura_clean > 0:
         posteriors = posteriors.to(device)
         if mrf > 0:
             posteriors = mrf_cleanup(posteriors, mrf, fit["vox"])
         if debridge > 0:  # strip thin dura bridges before the WM-seeded brain extraction
             posteriors = debridge_gm(posteriors, radius=debridge)
+        if dura_clean > 0:  # WM-geodesic dura removal (CSF-moat-blocked front)
+            posteriors = dura_cleanup(posteriors, fit["vox"], max_thick_mm=dura_clean)
         if cleanup > 0:
             posteriors = clean_gwc(posteriors, level=cleanup)
         posteriors = posteriors.cpu()
@@ -1384,6 +1724,123 @@ def debridge_gm(
     removed = mask & ~opened
     out[gm_index] = torch.where(removed, torch.zeros_like(gm), gm)
     return out / out.sum(dim=0, keepdim=True).clamp_min(1e-20)
+
+
+def dura_cleanup(
+    posteriors: Tensor,
+    vox: tuple[float, float, float],
+    *,
+    max_thick_mm: float = 6.0,
+    csf_barrier: float = 0.5,
+    gm_th: float = 0.1,
+    wm_seed: float = 0.5,
+    gm_index: int = 0,
+    wm_index: int = 1,
+    csf_index: int = 2,
+) -> Tensor:
+    """Demote dura misclassified as GM, by a **WM-geodesic** reach through brain tissue.
+
+    Cortical GM is a thin band that always abuts WM; dura is thin GM that sits *far* from any
+    WM and is separated from true cortex by a CSF "moat". SPM's ``clean_gwc`` can't remove it
+    (it's topologically connected to cortex, so component-based brain extraction keeps it).
+
+    Grow a front from the WM seed through **brain tissue** (``GM+WM > gm_th``) that is
+    **blocked by CSF** (``CSF < csf_barrier`` — the moat stops the front), out to a
+    cortical-thickness budget ``max_thick_mm`` (one voxel per iteration for
+    ``ceil(max_thick_mm / min(vox))`` iterations); demote GM the front cannot reach. A gyral
+    crown stays (tissue-connected to WM *through the gyrus* even when Euclidean-far); only GM
+    reachable solely by crossing the CSF moat is removed. Far less destructive than
+    :func:`debridge_gm`'s blind morphological opening. Beyond SPM's cleanup; on the reference
+    subject it brings GM >6 mm from WM to SPM's own 2.8 % (Dice-vs-SPM 0.950→0.951).
+    ``max_thick_mm<=0`` disables. SPM order ``GM, WM, CSF, …`` assumed.
+
+    Returns ``(n_tissue, nz, ny, nx)`` posteriors with dura demoted (rows sum to 1).
+    """
+    import math
+
+    if max_thick_mm <= 0 or posteriors.shape[0] <= max(gm_index, wm_index, csf_index):
+        return posteriors
+    gm, wm, csf = posteriors[gm_index], posteriors[wm_index], posteriors[csf_index]
+    allowed = ((gm + wm) > gm_th) & (csf < csf_barrier)  # brain tissue, CSF moat blocks
+    reach = wm > wm_seed
+    n_iter = max(1, int(math.ceil(max_thick_mm / min(vox))))
+    for _ in range(n_iter):
+        reach = reach | (_binary_dilate(reach, 1) & allowed)  # advance the front one voxel
+    dura = (gm > 0.5) & ~reach
+    out = posteriors.to(torch.float32).clone()
+    out[gm_index] = torch.where(dura, torch.zeros_like(gm), gm)
+    return out / out.sum(dim=0, keepdim=True).clamp_min(1e-20)
+
+
+# ---------------------------------------------------------------------------
+# Autobox — crop the all-zero margin before the fit, restore full dims on save.
+# ---------------------------------------------------------------------------
+
+
+def autobox_bounds(
+    volume: Tensor | list[Tensor], pad: int = 4
+) -> tuple[tuple[slice, slice, slice], tuple[int, int, int]]:
+    """Bounding box of the finite non-zero region across one or more aligned volumes.
+
+    Trims the all-zero planes from each face of the ``(nz, ny, nx)`` grid (union over
+    channels) and keeps ``pad`` voxels of safe margin, clamped to the volume. Returns the
+    crop ``slices`` (array axis order ``z, y, x``) and the ``(x0, y0, z0)`` voxel offset
+    (affine / world axis order) for the affine shift (:func:`crop_affine`, which keeps world
+    alignment exact). All-zero input → the full volume.
+
+    Note MR background noise is **not** zero, so on raw data this trims nothing — mask the
+    head first (e.g. ``processing/mask.automask``, zeroing outside a padded mask) so there is
+    an all-zero margin to trim. The EM fit already excludes zero voxels, so the crop itself
+    doesn't change the estimate; the masking that precedes it does (removes background noise).
+    """
+    vols = list(volume) if isinstance(volume, (list, tuple)) else [volume]
+    nz, ny, nx = vols[0].shape
+    mask = torch.zeros((nz, ny, nx), dtype=torch.bool, device=vols[0].device)
+    for v in vols:
+        mask |= torch.isfinite(v) & (v != 0)
+    if not bool(mask.any()):
+        return (slice(0, nz), slice(0, ny), slice(0, nx)), (0, 0, 0)
+    zsel = mask.any(dim=2).any(dim=1)  # (nz,)
+    ysel = mask.any(dim=2).any(dim=0)  # (ny,)
+    xsel = mask.any(dim=1).any(dim=0)  # (nx,)
+
+    def _range(sel: Tensor, n: int) -> tuple[int, int]:
+        idx = torch.nonzero(sel, as_tuple=False).flatten()
+        return max(0, int(idx[0]) - pad), min(n, int(idx[-1]) + 1 + pad)
+
+    z0, z1 = _range(zsel, nz)
+    y0, y1 = _range(ysel, ny)
+    x0, x1 = _range(xsel, nx)
+    return (slice(z0, z1), slice(y0, y1), slice(x0, x1)), (x0, y0, z0)
+
+
+def crop_affine(affine: Tensor, offset_xyz: tuple[int, int, int]) -> Tensor:
+    """Shift a voxel-``(x,y,z)``→world affine so the cropped volume's voxel ``(0,0,0)``
+    keeps its original world coordinate (``offset_xyz`` = the crop start in x,y,z voxel
+    order, from :func:`autobox_bounds`). Rotation/scale unchanged; only the origin moves."""
+    new = affine.clone()
+    off = torch.tensor(offset_xyz, dtype=affine.dtype, device=affine.device)
+    new[:3, 3] = affine[:3, 3] + affine[:3, :3] @ off
+    return new
+
+
+def embed_in_full(
+    arr: Tensor,
+    full_shape: tuple[int, int, int],
+    slices: tuple[slice, slice, slice],
+    *,
+    fill: float = 0.0,
+) -> Tensor:
+    """Place a cropped array back into a full-size volume (inverse of the autobox crop).
+
+    ``arr``'s **last three** axes are the spatial ``(nz', ny', nx')`` grid (so ``(nz,ny,nx)``,
+    ``(K, nz,ny,nx)``, and single warp components all work); any leading axes are kept. The
+    out-of-box margin is set to ``fill`` (0 for tissue/displacement maps, 1 for a bias field).
+    """
+    lead = tuple(arr.shape[:-3])
+    out = torch.full((*lead, *full_shape), fill, dtype=arr.dtype, device=arr.device)
+    out[(..., *slices)] = arr
+    return out
 
 
 def full_resolution_warp(
@@ -1584,6 +2041,7 @@ def plot_intensity_fit(
     *,
     tissue_names: list[str] | None = None,
     n_bins: int = 200,
+    log_scale: bool = True,
     path: str | None = None,
 ):
     """SPM-style diagnostic: intensity histogram(s) with the fitted GMM overlaid.
@@ -1608,6 +2066,9 @@ def plot_intensity_fit(
         posteriors: tissue posteriors ``(n_tissue,nz,ny,nx)`` (the ``cN`` maps).
         tissue_names: labels per tissue; defaults to the SPM 6-class names.
         n_bins: histogram bins.
+        log_scale: log y-axis (default). The air/background class typically has ~10× the
+            voxels of any tissue and swamps a linear plot; a log scale shows every tissue
+            peak and the fitted curves across the full dynamic range. False for linear.
         path: if given, save the figure there and close it; else return the Figure.
 
     Returns:
@@ -1688,11 +2149,18 @@ def plot_intensity_fit(
         )
         ax.set_ylabel("voxel count")
         ax.set_xlim(lo, hi)
-        # a single dominant background/air bin would flatten the tissue peaks; cap the
-        # y-axis to the interesting structure (fitted peak + bulk of the histogram) and
-        # let the spike run off the top.
-        ymax = max(float(total_curve.max()), float(np.percentile(counts, 99))) * 1.25
-        ax.set_ylim(0, ymax if ymax > 0 else None)
+        top = max(float(counts.max()), float(total_curve.max()))
+        if log_scale:
+            # air/background dwarfs the tissues (~10×); a log axis keeps every tissue peak
+            # and the fitted curves legible across the full range. Floor at 0.5 so single-
+            # voxel bins still register and bars have a valid (positive) base.
+            ax.set_yscale("log")
+            ax.set_ylim(0.5, top * 1.6 if top > 0 else None)
+        else:
+            # linear: cap to the interesting structure (fitted peak + bulk of the
+            # histogram) and let the air spike run off the top.
+            ymax = max(float(total_curve.max()), float(np.percentile(counts, 99))) * 1.25
+            ax.set_ylim(0, ymax if ymax > 0 else None)
         ax.legend(fontsize=8, framealpha=0.9)
     fig.suptitle("Segmentation intensity fit — data vs fitted tissue mixture")
     fig.tight_layout()

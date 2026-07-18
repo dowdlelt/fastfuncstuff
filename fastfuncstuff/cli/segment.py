@@ -29,7 +29,10 @@ import torch
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
 from fastfuncstuff.processing.segment import (
+    autobox_bounds,
     cast_template_to_input,
+    crop_affine,
+    embed_in_full,
     fit_segment,
     full_resolution_warp,
     input_in_template,
@@ -117,11 +120,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "                     stiffer/flatter field (default 1e-4). Raise it if the\n"
             "                     bias correction looks like it's chasing tissue.\n"
             "\n"
-            "  -reg A M B         Deformation stiffness = (absolute, membrane, bending)\n"
-            "                     penalties. Membrane resists stretch, bending resists\n"
-            "                     folding; HIGHER = stiffer, more conservative warp.\n"
-            "                     Default 0 0 0.1. Increase to keep the warp tame on\n"
-            "                     low-contrast or noisy data.\n"
+            "  -reg A M B L1 L2   Deformation stiffness = SPM's (absolute, membrane,\n"
+            "                     bending, linear-elastic-1, linear-elastic-2) penalties.\n"
+            "                     Membrane resists stretch, bending resists folding, the\n"
+            "                     linear-elastic pair penalises compression + shear; HIGHER\n"
+            "                     = stiffer warp. Default 0 0 0.1 0.01 0.04 (SPM). Pass 3\n"
+            "                     values for bending-only. Auto-scaled by the -fwhm fudge\n"
+            "                     factor so stiffness tracks -samp as in SPM.\n"
             "\n"
             "  -samp MM           Voxel sampling step (mm) for the fit. This is a\n"
             "                     SPEED/accuracy dial, not a quality knob: 3 mm (default)\n"
@@ -229,6 +234,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "full 3-D deformation (anatomicals).",
     )
     aff.add_argument(
+        "-pe_reverse",
+        nargs="+",
+        default=None,
+        metavar="FILE",
+        help="Reverse-phase-encode EPI (opposite blip, same grid) for DUAL-echo distortion "
+        "correction (requires -pe_axis). It images the same anatomy with the opposite "
+        "distortion, so its correcting warp is exactly the inverse of the forward's; passing "
+        "it drives the single PE warp with BOTH echoes at once (like TOPUP using both blips) "
+        "instead of discarding the reverse. Give one image, or several co-registered channels "
+        "matching -input.",
+    )
+    aff.add_argument(
         "-tpm_source",
         default=None,
         help="A template-space image (3-D or 4-D; e.g. the anat or native tissue maps the "
@@ -253,12 +270,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-biasreg", type=float, default=1e-4, help="Bias field regularisation (default 1e-4)"
     )
     knobs.add_argument(
+        "-bias_solver",
+        default="gn",
+        choices=("gn", "adam"),
+        help="Bias-field optimiser. 'gn' (default) = SPM's analytic Gauss-Newton on the DCT "
+        "coefficients (closed-form gradient/Hessian, Armijo line search): recovers the field "
+        "far more accurately than the gradient-descent fallback and is faster. 'adam' = "
+        "autograd gradient descent (-bias_lr), kept as a fallback / for comparison.",
+    )
+    knobs.add_argument(
+        "-bias_iters",
+        type=int,
+        default=2,
+        help="Gauss-Newton bias sweeps per EM iteration (default 2; -bias_solver gn only). "
+        "Each is a full Newton step, so 1-2 is plenty.",
+    )
+    knobs.add_argument(
         "-reg",
         type=float,
-        nargs=3,
-        default=(0.0, 0.0, 0.1),
-        metavar=("ABS", "MEM", "BEND"),
-        help="Deformation (absolute, membrane, bending) penalties (default 0 0 0.1)",
+        nargs="+",
+        default=(0.0, 0.0, 0.1, 0.01, 0.04),
+        metavar="W",
+        help="Deformation regularisation, SPM's full vector: (absolute, membrane, bending, "
+        "linear-elastic-1, linear-elastic-2). Default 0 0 0.1 0.01 0.04. Membrane resists "
+        "stretch, bending resists folding, the two linear-elastic terms penalise volume "
+        "change (compression) and shear; HIGHER = stiffer, more conservative warp. Pass 3 "
+        "values for bending-only (le1=le2=0). Both this and -biasreg are scaled internally "
+        "by SPM's -fwhm fudge factor so their strength tracks -samp as in SPM.",
+    )
+    knobs.add_argument(
+        "-fwhm",
+        type=float,
+        default=0.0,
+        help="Assumed image smoothness (FWHM, mm) — feeds SPM's fudge factor that inflates "
+        "the bias and warp regularisation to account for spatially-correlated noise. 0 "
+        "(default) for MRI; ~5 for PET/SPECT or pre-smoothed data.",
     )
     knobs.add_argument(
         "-samp",
@@ -295,14 +341,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     knobs.add_argument(
         "-warp_solver",
-        default="adam",
-        choices=("adam", "gn"),
-        help="Deformation optimiser. 'adam' (default) = autograd + Sobolev smoothing "
-        "(fast, robust; -warp_lr/-warp_smooth/-warp_focus apply). 'gn' = SPM's "
-        "Gauss-Newton (per-node GN Hessian + conjugate-gradient solve + Armijo "
-        "backtracking): no learning rate, converges in ~2-3 -warp_iters, and stays "
-        "monotone so it won't inflate at high -niter. For 'gn' give -reg a non-zero "
-        "membrane term (e.g. -reg 0 0.001 0.1) for a well-posed solve.",
+        default="gn",
+        choices=("gn", "adam"),
+        help="Deformation optimiser. 'gn' (default) = SPM's Gauss-Newton (per-node GN "
+        "Hessian + conjugate-gradient solve + Armijo backtracking): no learning rate, and "
+        "it CONVERGES to a stable warp — the deformation stops growing once the fit settles, "
+        "so more -niter is safe (matches SPM). 'adam' = autograd + Sobolev smoothing "
+        "(-warp_lr/-warp_smooth/-warp_focus apply), but it accumulates displacement across "
+        "iterations rather than converging, so the warp keeps growing with -niter and can "
+        "drag the tissue priors out of place — use it only for short runs or special cases.",
     )
     knobs.add_argument(
         "-warp_lr",
@@ -315,9 +362,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     knobs.add_argument(
         "-warp_iters",
         type=int,
-        default=8,
-        help="Deformation gradient steps per EM iteration (default 8). More = the warp "
-        "makes more progress each iteration (another way to warp harder without more -niter).",
+        default=None,
+        help="Warp sub-iterations per EM iteration (default: 3 for -warp_solver gn, 8 for "
+        "adam). GN converges in ~3 (each is a full CG solve + line search, so more is mostly "
+        "wasted); for adam, more = the warp makes more progress per EM iteration.",
     )
     knobs.add_argument(
         "-blur_tpms",
@@ -359,6 +407,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-no_warp", action="store_true", help="Skip the deformation (bias + tissue only)"
     )
     knobs.add_argument(
+        "-no_warp_anneal",
+        dest="warp_anneal",
+        action="store_false",
+        help="Disable SPM's heavy-to-light warp schedule (on by default): normally the "
+        "bending penalty is stiffened early and relaxed to target by iteration 10, so the "
+        "warp can't over-commit before the intensity model settles. Turn off to warp "
+        "aggressively from iteration 1.",
+    )
+    knobs.add_argument(
         "-wp_reg",
         type=float,
         default=100.0,
@@ -392,6 +449,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-cleanup this also removes bridges that TOUCH cortex. Watch tight sulci at high R.",
     )
     knobs.add_argument(
+        "-dura_clean",
+        type=float,
+        default=0.0,
+        metavar="MM",
+        help="Principled dura removal from GM (c1): grow a front from WM through brain tissue, "
+        "BLOCKED by CSF (the moat), out to MM mm of cortical thickness; GM the front can't "
+        "reach (dura beyond a CSF moat / far from any WM) is demoted. Unlike -debridge's blind "
+        "morphological opening this keeps thin true cortex (a gyral crown is tissue-connected to "
+        "WM through the gyrus) and only removes GM that is genuinely detached from the WM sheet. "
+        "Beyond SPM's cleanup. 0 off (default); try 6 (removes ~0.7%% of GM, all >4mm from WM).",
+    )
+    knobs.add_argument(
         "-save_precleanup",
         action="store_true",
         help="Also write the tissue maps as they were BEFORE the -mrf/-debridge/-cleanup "
@@ -407,7 +476,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "fitted Gaussian-mixture overlaid, one panel per input channel, tissues coloured "
         "and labelled with their %% mass. Where the grey data rises above the black total "
         "model, the fit missed that intensity. Bare flag → prefix_histogram.png; or give a "
-        "path. Needs matplotlib.",
+        "path. Log y-axis by default (air dwarfs the tissues). Needs matplotlib.",
+    )
+    knobs.add_argument(
+        "-histogram_linear",
+        dest="histogram_log",
+        action="store_false",
+        help="Linear y-axis on -save_histogram instead of the default log scale (log keeps "
+        "the tissue peaks legible when air/background has ~10× the voxel count).",
     )
     knobs.add_argument(
         "-tissue_names",
@@ -426,6 +502,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     other = p.add_argument_group("execution")
+    other.add_argument(
+        "-autobox",
+        action="store_true",
+        help="Automask the head, zero the background noise outside a padded mask, and crop "
+        "the empty margin before fitting — a speed step. Every output is written back at the "
+        "ORIGINAL dimensions and alignment (geometrically invisible). MR background noise "
+        "isn't zero, so this needs the automask (a bare bounding box wouldn't trim anything); "
+        "the removed noise is also no longer modelled, which SPM's segmentation handles fine. "
+        "Best when the FoV has a lot of empty space / noise around the head.",
+    )
+    other.add_argument(
+        "-autobox_pad",
+        type=int,
+        default=4,
+        metavar="VOX",
+        help="Safe margin around the head: dilate the automask by this many voxels before "
+        "cropping/masking, so the crop never clips real anatomy (default 4).",
+    )
     other.add_argument("-device", default=None, help="cuda | cpu (default: cuda if available)")
     other.add_argument(
         "-fit_dtype",
@@ -466,10 +560,54 @@ def main(argv: list[str] | None = None) -> int:
                     "Reslice them onto a common grid first."
                 )
             channels.append(ch)
-        volume = channels[0] if len(channels) == 1 else channels
         subj_affine = torch.as_tensor(hdr["affine"], dtype=torch.float64, device=device)
         log_prior, tpm_affine, bg_low, bg_high = load_tpm(args.tpm, device=device)
+        reverse_channels = None
+        if args.pe_reverse:  # dual-echo distortion correction (opposite blip)
+            if not args.pe_axis:
+                raise SystemExit("-pe_reverse requires -pe_axis (the ± warp relation is PE-only)")
+            reverse_channels = [load_image(p, device=device)[0] for p in args.pe_reverse]
+            if reverse_channels[0].shape != channels[0].shape:
+                raise SystemExit("-pe_reverse must be on the same grid as -input")
     n_tissue = log_prior.shape[0]
+
+    # Autobox: automask the head, zero the background noise outside a padded mask, then
+    # crop the now-empty margin — a speed step. Outputs are re-embedded at the ORIGINAL
+    # dims/alignment (the box is remembered). `subj_affine` is shifted to the cropped grid
+    # (used by the fit + affine init); `hdr["affine"]` stays original for saving. Masking
+    # (unlike the crop) does change the fit: the removed background noise is no longer
+    # modelled — SPM's New Segment is designed to work on masked/skull-stripped input.
+    full_shape = tuple(channels[0].shape)  # original (nz, ny, nx)
+    box_slices = None
+    if args.autobox:
+        from fastfuncstuff.processing.mask import automask
+
+        with _step("Autobox (automask + crop)", enabled=verbose):
+            # MR background noise isn't zero, so a bare bounding box wouldn't trim anything;
+            # automask finds the head, dilated by -autobox_pad for a safe margin.
+            mask = automask(channels[0], dilate_extra=args.autobox_pad, device=device)
+            mask_f = mask.to(channels[0].dtype)
+            channels = [ch * mask_f for ch in channels]  # zero the outside-head noise
+            box_slices, offset_xyz = autobox_bounds(channels, pad=0)  # dilation is the margin
+            channels = [ch[box_slices].contiguous() for ch in channels]
+            subj_affine = crop_affine(subj_affine, offset_xyz)
+            if reverse_channels is not None:  # crop the reverse echo to the same box
+                reverse_channels = [
+                    (ch * mask_f)[box_slices].contiguous() for ch in reverse_channels
+                ]
+        if verbose:
+            print(
+                f"  autobox: {full_shape} -> {tuple(channels[0].shape)} (mask + pad {args.autobox_pad})"
+            )
+    volume = channels[0] if len(channels) == 1 else channels
+    # affine of the grid the fit runs on (cropped if autoboxed) — used for the affine init
+    fit_affine_np = np.asarray(subj_affine.cpu())
+
+    def _save_input(arr: torch.Tensor, path: str, *, fill: float = 0.0) -> None:
+        """Save an INPUT-space output, re-embedding it into the original dims if autoboxed."""
+        if box_slices is not None:
+            arr = embed_in_full(arr, full_shape, box_slices, fill=fill)
+        save_image(arr, path, header_info=hdr, affine=hdr["affine"])
 
     if args.ngaus is not None and len(args.ngaus) != n_tissue:
         raise SystemExit(f"-ngaus has {len(args.ngaus)} entries but the TPM has {n_tissue} classes")
@@ -481,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     world_affine: torch.Tensor | None = None
     if args.matrix:
         tpm_to_input = load_matrix_chain(
-            args.matrix, base_affine=np.asarray(tpm_affine.cpu()), source_affine=hdr["affine"]
+            args.matrix, base_affine=np.asarray(tpm_affine.cpu()), source_affine=fit_affine_np
         ).to(dtype=torch.float64, device=device)
         vox2vox = torch.linalg.inv(tpm_to_input)  # input(subject) vox -> tpm vox
     else:
@@ -500,16 +638,25 @@ def main(argv: list[str] | None = None) -> int:
         biasreg=args.biasreg,
         biasfwhm=args.biasfwhm,
         reg=tuple(args.reg),
+        fwhm=args.fwhm,
         samp=args.samp,
         n_iter=args.niter,
         tol=args.tol,
         fit_warp=not args.no_warp,
+        warp_anneal=args.warp_anneal,
         pe_axis={"x": 0, "y": 1, "z": 2}[args.pe_axis] if args.pe_axis else None,
+        reverse_volume=(
+            (reverse_channels[0] if len(reverse_channels) == 1 else reverse_channels)
+            if reverse_channels
+            else None
+        ),
         blur_tpms=args.blur_tpms,
         blur_frac=args.blur_frac,
         warp_focus=args.warp_focus,
         focus_quantile=args.focus_quantile,
         wp_reg=args.wp_reg,
+        bias_solver=args.bias_solver,
+        bias_iters=args.bias_iters,
         warp_solver=args.warp_solver,
         warp_lr=args.warp_lr,
         warp_iters=args.warp_iters,
@@ -531,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
         mrf=args.mrf,
         cleanup=args.cleanup,
         debridge=args.debridge,
+        dura_clean=args.dura_clean,
         prior_kernel=args.prior_interp,
         save_precleanup=args.save_precleanup,
         device=device,
@@ -541,33 +689,17 @@ def main(argv: list[str] | None = None) -> int:
     ref = channels[0]  # reference channel for the shared-geometry outputs
     with _step("Writing tissue maps + bias", enabled=verbose):
         for t in range(n_tissue):
-            save_image(
-                out["posteriors"][t],
-                f"{prefix}_c{t + 1}.nii.gz",
-                header_info=hdr,
-                affine=hdr["affine"],
-            )
+            _save_input(out["posteriors"][t], f"{prefix}_c{t + 1}.nii.gz")
             if "posteriors_precleanup" in out:
-                save_image(
-                    out["posteriors_precleanup"][t],
-                    f"{prefix}_c{t + 1}_precleanup.nii.gz",
-                    header_info=hdr,
-                    affine=hdr["affine"],
-                )
-        # bias-corrected + bias field, per channel (suffix _chN only when multi-channel)
+                _save_input(out["posteriors_precleanup"][t], f"{prefix}_c{t + 1}_precleanup.nii.gz")
+        # bias-corrected + bias field, per channel (suffix _chN only when multi-channel).
+        # The autobox margin gets bias=1 (neutral / no correction), corrected=0.
         for c in range(n_chan):
             suffix = "" if n_chan == 1 else f"_ch{c + 1}"
             corr_c = out["corrected"] if n_chan == 1 else out["corrected"][c]
             bias_c = out["bias"] if n_chan == 1 else out["bias"][c]
-            save_image(
-                corr_c,
-                f"{prefix}_biascorrected{suffix}.nii.gz",
-                header_info=hdr,
-                affine=hdr["affine"],
-            )
-            save_image(
-                bias_c, f"{prefix}_biasfield{suffix}.nii.gz", header_info=hdr, affine=hdr["affine"]
-            )
+            _save_input(corr_c, f"{prefix}_biascorrected{suffix}.nii.gz")
+            _save_input(bias_c, f"{prefix}_biasfield{suffix}.nii.gz", fill=1.0)
 
     if args.save_histogram is not None:
         hist_path = (
@@ -587,6 +719,7 @@ def main(argv: list[str] | None = None) -> int:
                 out["corrected"],
                 hist_post,
                 tissue_names=args.tissue_names,
+                log_scale=args.histogram_log,
                 path=hist_path,
             )
 
@@ -609,18 +742,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_warp:
         warp = full_resolution_warp(fit, tuple(ref.shape), device=device)  # (nz,ny,nx,3) vox disp
+        wx, wy, wz = warp[..., 0], warp[..., 1], warp[..., 2]
+        if box_slices is not None:  # re-embed the cropped displacement into the full grid
+            wx = embed_in_full(wx, full_shape, box_slices)
+            wy = embed_in_full(wy, full_shape, box_slices)
+            wz = embed_in_full(wz, full_shape, box_slices)
         save_warp_field(
-            warp[..., 0],
-            warp[..., 1],
-            warp[..., 2],
+            wx, wy, wz,
             f"{prefix}_warp.nii.gz",
             header_info=hdr,
             affine=hdr["affine"],
             units="mm",
-        )
+        )  # fmt: skip
         # geometry-corrected input in its OWN space (PE-mode: the undistorted EPI)
         undist = undistort_input(ref, fit, device=device)
-        save_image(undist, f"{prefix}_undistorted.nii.gz", header_info=hdr, affine=hdr["affine"])
+        _save_input(undist, f"{prefix}_undistorted.nii.gz")
         # corrected input in TEMPLATE space (affine + warp) — aligns with the anat
         corrected_in_tpl = input_in_template(
             ref, fit, tpl_shape, kernel=args.prior_interp, device=device

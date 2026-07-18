@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import math
+
+import pytest
 import torch
 
 from fastfuncstuff.processing.segment import (
+    autobox_bounds,
     bias_field_shape,
+    crop_affine,
     dct_basis,
+    embed_in_full,
     eval_log_bias,
     fit_segment,
+    fudge_factor,
     gmm_moments,
     gmm_responsibilities,
     gmm_update,
+    update_tissue_weights,
+    warp_penalty,
 )
 
 
@@ -264,6 +273,38 @@ def test_blur_log_prior_smooths_and_preserves_shape():
     assert rough(blurred) < rough(log_prior)
 
 
+def test_dual_echo_reverse_pe_drives_one_warp():
+    """Dual-echo PE mode: forward (+s) and reverse (−s) distortions drive a single
+    PE-constrained warp; the reverse is applied with the opposite sign."""
+    torch.manual_seed(0)
+    n = 24
+    vol, tissue, _, _ = _phantom_three_tissue(n)
+    prob = tissue / tissue.sum(0, keepdim=True).clamp_min(1e-6)
+    log_prior = torch.log(prob.clamp(0, 1) + 1e-4)
+    eye = torch.eye(4, dtype=torch.float64)
+    bg = prob[:, 0].mean(dim=(1, 2))
+    fwd = torch.roll(vol, shifts=3, dims=1)  # +PE distortion (dim1 = y = pe_axis 1)
+    rev = torch.roll(vol, shifts=-3, dims=1)  # −PE distortion (opposite blip)
+    kw = dict(  # noqa: C408
+        ngaus=[1, 1, 1], biasfwhm=12.0, samp=1.0, n_iter=8, pe_axis=1,
+        warp_anneal=False, verbose=False,
+    )  # fmt: skip
+
+    fit = fit_segment(fwd, eye, log_prior, eye, bg, bg, eye, reverse_volume=rev, **kw)
+    tw = fit["twarp"]
+    assert torch.isfinite(tw).all()
+    assert (
+        tw[..., 0].abs().max() < 1e-4 and tw[..., 2].abs().max() < 1e-4
+    )  # PE-constrained (y only)
+    assert tw[..., 1].abs().max() > 0.5  # both echoes drove the warp along PE
+
+    with pytest.raises(ValueError):  # reverse without pe_axis is meaningless
+        fit_segment(
+            fwd, eye, log_prior, eye, bg, bg, eye, reverse_volume=rev,
+            ngaus=[1, 1, 1], n_iter=2, verbose=False,
+        )  # fmt: skip
+
+
 def test_fit_segment_blur_tpms_runs_coarse_to_fine():
     """A coarse blurred-TPM pass still converges to a sensible, finite fit."""
     torch.manual_seed(0)
@@ -340,30 +381,29 @@ def test_fit_segment_float32_tracks_float64():
 
 
 def test_wp_reg_prevents_weight_runaway():
-    """SPM's wp_reg keeps mixing weights bounded where a weak reg lets one run away.
+    """SPM's observed/expected wp update self-corrects; wp_reg damps toward uniform.
 
-    The tissue-weight update is observed/expected (SPM); with weak regularisation a
-    tissue's weight positively feeds back and inflates toward 1 over many iterations
-    ("growing brains"). A strong wp_reg (SPM default 100) damps it toward uniform.
+    The tissue-weight update (:func:`update_tissue_weights`) is ``(observed + wp_reg)/
+    (expected + wp_reg·Kb)``. Take a heavily over-observed tissue (observed mass far above
+    what the model expects — the "growing brains" condition): a weak ``wp_reg`` lets that
+    weight run away toward 1, while SPM's ``wp_reg=100`` holds every weight near uniform.
+    Tested on the update directly so it isn't entangled with the deformation dynamics.
     """
-    torch.manual_seed(0)
-    n = 28
-    vol, tissue, _, _ = _phantom_three_tissue(n)
-    prob = tissue / tissue.sum(0, keepdim=True).clamp_min(1e-6)
-    log_prior = torch.log(prob.clamp(0, 1) + 1e-4)
-    eye = torch.eye(4, dtype=torch.float64)
-    bg = prob[:, 0].mean(dim=(1, 2))
-    kw = dict(  # noqa: C408
-        ngaus=[1, 1, 1], biasfwhm=12.0, samp=1.0, n_iter=120,
-        fit_warp=True, warp_smooth=0.5, tol=0.0, verbose=False,
-    )  # fmt: skip
+    kb = 3
+    # tissue 0 is massively over-observed vs its model-expected mass (would inflate)
+    observed = torch.tensor([100.0, 5.0, 5.0], dtype=torch.float64)
+    expected = torch.tensor([10.0, 10.0, 10.0], dtype=torch.float64)
 
-    weak = fit_segment(vol, eye, log_prior, eye, bg, bg, eye, wp_reg=1.0, **kw)
-    spm = fit_segment(vol, eye, log_prior, eye, bg, bg, eye, wp_reg=100.0, **kw)
+    weak = update_tissue_weights(observed, expected, wp_reg=1.0, n_tissue=kb)
+    spm = update_tissue_weights(observed, expected, wp_reg=100.0, n_tissue=kb)
 
-    assert weak["wp"].max() > 0.9  # weak reg → one weight runs away toward 1
-    assert spm["wp"].max() < 0.65  # SPM reg → stays bounded, no runaway
-    assert spm["wp"].min() > 0.05  # and no tissue collapses to ~0
+    assert weak.max() > 0.85  # weak reg → the over-observed tissue runs away toward 1
+    assert spm.max() < 0.5  # SPM reg → stays bounded near uniform
+    assert spm.min() > 0.25  # and no tissue collapses
+    # larger wp_reg pulls every weight monotonically closer to uniform (1/Kb)
+    uniform = 1.0 / kb
+    assert (spm - uniform).abs().max() < (weak - uniform).abs().max()
+    assert torch.allclose(weak.sum(), torch.tensor(1.0, dtype=torch.float64))
 
 
 def test_fit_segment_zero_reg_warp_runs():
@@ -408,6 +448,32 @@ def test_debridge_removes_thin_gm_bridge_keeps_thick_cortex():
     assert out[0, 8, 8, 17] < 0.01  # thin bridge GM removed
     assert out[2, 8, 8, 17] > 0.9  # its probability reassigned to CSF
     assert torch.allclose(out.sum(0), torch.ones(n, n, n), atol=1e-4)  # still a valid posterior
+
+
+def test_dura_cleanup_removes_moat_separated_gm_keeps_cortex():
+    """WM-geodesic dura removal: a GM patch separated from the WM+cortex by a CSF moat is
+    demoted (the front can't cross CSF), while GM tissue-connected to WM is kept."""
+    from fastfuncstuff.processing.segment import dura_cleanup
+
+    n = 32
+    post = torch.zeros(4, n, n, n)
+    post[3] = 1.0  # background everywhere (class 4)
+
+    def fill(idx, sl, val=0.9):  # remainder in background so rows sum to 1 (renorm has room)
+        post[idx][sl], post[3][sl] = val, 1.0 - val
+
+    # WM slab + a GM "cortex" band directly abutting it (tissue-connected)
+    fill(1, (slice(8, 16), slice(8, 24), slice(8, 24)))  # WM
+    fill(0, (slice(16, 20), slice(8, 24), slice(8, 24)))  # cortex GM on the WM face
+    # a CSF moat, then a detached GM "dura" sheet beyond it (must cross CSF to reach)
+    fill(2, (slice(20, 23), slice(8, 24), slice(8, 24)))  # CSF moat
+    fill(0, (slice(23, 25), slice(8, 24), slice(8, 24)))  # dura GM beyond the moat
+
+    out = dura_cleanup(post, vox=(1.0, 1.0, 1.0), max_thick_mm=6.0)
+    assert out[0, 17, 15, 15] > 0.8  # cortex (abuts WM) kept
+    assert out[0, 24, 15, 15] < 0.05  # dura (beyond CSF moat) demoted
+    assert torch.allclose(out.sum(0), torch.ones(n, n, n), atol=1e-4)  # valid posterior
+    assert torch.allclose(dura_cleanup(post, (1.0, 1.0, 1.0), max_thick_mm=0.0), post)  # 0 disables
 
 
 def test_segment_apply_precleanup_returned():
@@ -491,14 +557,16 @@ def test_warp_aggressiveness_knobs_increase_displacement():
     eye = torch.eye(4, dtype=torch.float64)
     bg = prob[:, 0].mean(dim=(1, 2))
     vol_shift = torch.roll(vol, shifts=3, dims=1)  # offset data vs prior → warp must move
+    # anneal off + no bending in the base so the knob effects are isolated from SPM's
+    # heavy-to-light schedule (which, over only 6 iters, would dominate the comparison).
     base = dict(  # noqa: C408
-        ngaus=[1, 1, 1], biasfwhm=12.0, samp=1.0, n_iter=6,
-        fit_warp=True, warp_smooth=0.5, verbose=False,
+        ngaus=[1, 1, 1], biasfwhm=12.0, samp=1.0, n_iter=6, warp_solver="adam",
+        fit_warp=True, warp_anneal=False, reg=(0.0, 0.0, 0.0), warp_smooth=0.5, verbose=False,
     )  # fmt: skip
 
     def mag(**kw):
         return (
-            fit_segment(vol_shift, eye, log_prior, eye, bg, bg, eye, **base, **kw)["twarp"]
+            fit_segment(vol_shift, eye, log_prior, eye, bg, bg, eye, **{**base, **kw})["twarp"]
             .abs()
             .max()
         )
@@ -506,6 +574,109 @@ def test_warp_aggressiveness_knobs_increase_displacement():
     assert mag(warp_lr=3.0) > mag(warp_lr=0.5)  # bigger Adam step → more warp
     assert mag(warp_iters=20) > mag(warp_iters=4)  # more steps → more warp
     assert mag(reg=(0.0, 0.0, 0.0)) > mag(reg=(0.0, 0.0, 0.5))  # less penalty → more warp
+
+
+def test_autobox_roundtrip_preserves_geometry():
+    """autobox crop + affine-shift + embed round-trips exactly: world coordinates of the
+    kept voxels are unchanged, and embedding restores the original volume."""
+    n = 20
+    vol = torch.zeros(n, n, n)
+    torch.manual_seed(0)
+    vol[5:15, 6:16, 7:17] = 1.0 + torch.rand(10, 10, 10)  # a nonzero blob, offset from origin
+    affine = torch.tensor(
+        [[2.0, 0, 0, -10], [0, 2.0, 0, -12], [0, 0, 2.0, -14], [0, 0, 0, 1]], dtype=torch.float64
+    )
+
+    slices, offset = autobox_bounds(vol, pad=2)
+    sz, sy, sx = slices
+    cropped = vol[slices]
+    caffine = crop_affine(affine, offset)
+
+    # a known original voxel (array z,y,x = 5,6,7 → affine voxel x,y,z = 7,6,5) keeps its
+    # world coordinate after the crop-affine shift
+    w_full = affine @ torch.tensor([7.0, 6.0, 5.0, 1.0], dtype=torch.float64)
+    cx, cy, cz = 7 - sx.start, 6 - sy.start, 5 - sz.start  # same voxel in the cropped grid
+    w_crop = caffine @ torch.tensor([cx, cy, cz, 1.0], dtype=torch.float64)
+    assert torch.allclose(w_full, w_crop)
+
+    # embed restores the original (outside-box was zero); leading axes are preserved
+    assert torch.allclose(embed_in_full(cropped, (n, n, n), slices), vol)
+    stack = torch.stack([cropped, 2 * cropped])  # (2, nz', ny', nx')
+    emb = embed_in_full(stack, (n, n, n), slices)
+    assert emb.shape == (2, n, n, n)
+    assert torch.allclose(emb[0], vol) and torch.allclose(emb[1], 2 * vol)
+    # a bias-style fill: the margin takes the fill value, the box the data
+    embf = embed_in_full(cropped, (n, n, n), slices, fill=1.0)
+    assert embf[0, 0, 0] == 1.0 and torch.allclose(embf[slices], cropped)
+
+
+def test_fudge_factor_matches_spm_formula():
+    """`fudge_factor` reproduces SPM's ff = prod(4π(s/vx/sk)²+1)^½, s=(fwhm+mean vx)/√8ln2."""
+    for vox, sk, fwhm in [((1.0, 1.0, 1.0), (3, 3, 3), 0.0), ((0.7, 0.7, 2.0), (4, 4, 1), 5.0)]:
+        s = (fwhm + sum(vox) / 3.0) / math.sqrt(8.0 * math.log(2.0))
+        expect = 1.0
+        for vx, k in zip(vox, sk, strict=True):
+            expect *= 4.0 * math.pi * (s / (vx * k)) ** 2 + 1.0
+        expect = expect**0.5
+        assert abs(fudge_factor(vox, sk, fwhm) - expect) < 1e-10
+    # ff > 1 even at fwhm=0 (the mean(vx) term); denser sampling (smaller stride) means
+    # more correlated neighbours → larger ff (coarser sampling tends toward independent → 1)
+    assert fudge_factor((1.0, 1.0, 1.0), (3, 3, 3), 0.0) > 1.0
+    assert fudge_factor((1.0, 1.0, 1.0), (1, 1, 1), 0.0) > fudge_factor(
+        (1.0, 1.0, 1.0), (3, 3, 3), 0.0
+    )
+
+
+def test_warp_penalty_linear_elastic_and_tuple_compat():
+    """The 4th/5th reg terms (le1/le2) add divergence/shear energy; a 3-tuple = le1=le2=0."""
+    torch.manual_seed(0)
+    field = torch.randn(6, 6, 6, 3, dtype=torch.float64)
+    vox = (1.0, 1.0, 1.0)
+    p3 = warp_penalty(field, (0.0, 0.0, 0.1), vox)
+    p5_zero = warp_penalty(field, (0.0, 0.0, 0.1, 0.0, 0.0), vox)
+    assert torch.allclose(p3, p5_zero)  # 3-tuple back-compat = 5-tuple with le=0
+    # a pure-divergence field (u = ∇·grid) is penalised by le1 but not by le2 (shear-free)
+    zz, yy, xx = torch.meshgrid(*[torch.arange(6, dtype=torch.float64)] * 3, indexing="ij")
+    div_field = torch.stack([xx, yy, zz], dim=-1)  # ∂u_i/∂x_i = 1, off-diagonals 0
+    assert warp_penalty(div_field, (0.0, 0.0, 0.0, 1.0, 0.0), vox) > 0  # le1 sees divergence
+    assert warp_penalty(div_field, (0.0, 0.0, 0.0, 0.0, 1.0), vox) > 0  # le2 sees ε_ii
+    # le1/le2 strictly increase the total penalty on a generic field
+    assert warp_penalty(field, (0.0, 0.0, 0.1, 0.02, 0.03), vox) > p3
+
+
+def test_fit_recovers_known_bias_field():
+    """The joint fit recovers a known smooth multiplicative bias — a regression guard for
+    the change-of-variables Jacobian term (+Σ log|bias|) in the bias objective.
+
+    Without that term the bias step can lower the negative log-likelihood by mis-scaling
+    the field. The reported ``bias`` is the *correction* field ``exp(bias)`` applied to the
+    observed data, so it is the inverse of the injected bias: the recovered log-field is
+    strongly *anti*-correlated with the truth (up to a global offset the means absorb).
+    """
+    from fastfuncstuff.processing.segment import segment_apply
+
+    torch.manual_seed(0)
+    n = 24
+    vol, tissue, _, _ = _phantom_three_tissue(n)
+    prob = tissue / tissue.sum(0, keepdim=True).clamp_min(1e-6)
+    log_prior = torch.log(prob.clamp(0, 1) + 1e-4)
+    eye = torch.eye(4, dtype=torch.float64)
+    bg = prob[:, 0].mean(dim=(1, 2))
+    _, _, xx = torch.meshgrid(*[torch.arange(n, dtype=torch.float64)] * 3, indexing="ij")
+    true_logbias = 0.6 * torch.cos(math.pi * xx / (n - 1))  # smooth low-frequency shading
+    biased = vol * torch.exp(true_logbias)
+
+    fit = fit_segment(
+        biased, eye, log_prior, eye, bg, bg, eye,
+        ngaus=[1, 1, 1], biasfwhm=14.0, fit_warp=False, samp=1.0, n_iter=30, tol=0.0, verbose=False,
+    )  # fmt: skip
+    out = segment_apply(biased, log_prior, bg, bg, fit, mrf=0, cleanup=0, verbose=False)
+    est = torch.log(out["bias"].to(torch.float64).clamp_min(1e-6))
+    a = (est - est.mean()).reshape(-1)
+    b = (true_logbias - true_logbias.mean()).reshape(-1)
+    corr = float(a @ b / (a.norm() * b.norm()))
+    # default analytic-GN bias recovers the field almost exactly (Adam plateaus near -0.54)
+    assert corr < -0.85  # correction field is the (near-exact) inverse of the injected shading
 
 
 def test_gauss_newton_warp_solver_deforms_and_improves():
@@ -525,8 +696,11 @@ def test_gauss_newton_warp_solver_deforms_and_improves():
     eye = torch.eye(4, dtype=torch.float64)
     bg = prob[:, 0].mean(dim=(1, 2))
     vol_shift = torch.roll(vol, shifts=3, dims=1)  # offset data vs prior → warp must move
+    # anneal off so the GN solver runs at the target reg from iter 1 (the heavy-to-light
+    # schedule assumes SPM's ~30 iters; over 6 it would suppress the legitimate 3-vox warp).
     base = dict(  # noqa: C408
-        ngaus=[1, 1, 1], biasfwhm=12.0, samp=1.0, n_iter=6, warp_iters=8, verbose=False,
+        ngaus=[1, 1, 1], biasfwhm=12.0, samp=1.0, n_iter=6, warp_iters=8,
+        warp_anneal=False, verbose=False,
     )  # fmt: skip
 
     no_warp = fit_segment(vol_shift, eye, log_prior, eye, bg, bg, eye, fit_warp=False, **base)
