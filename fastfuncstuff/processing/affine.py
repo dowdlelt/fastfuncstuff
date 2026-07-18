@@ -430,6 +430,51 @@ def identity_params(device: torch.device = None, dtype: torch.dtype = torch.floa
 # ---------------------------------------------------------------------------
 
 
+def grid_from_dxyz(
+    base_affine: np.ndarray,
+    base_shape: tuple[int, int, int],
+    dxyz: float | tuple[float, ...] | np.ndarray,
+) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """Master grid at a new voxel size — AFNI ``-mast_dxyz`` / ``-newgrid``.
+
+    Keeps the base grid's **orientation** (direction cosines), **centre**, and **field of
+    view**, but resamples to voxel size ``dxyz`` (one value → isotropic, or three in x,y,z
+    voxel/world order). Use it to apply a transform into the base's *space* while preserving
+    (or coarsening) resolution rather than snapping to the base's voxel grid.
+
+    Args:
+        base_affine: the base image's ``(x,y,z)`` voxel→world affine (4×4).
+        base_shape: the base array shape ``(nz, ny, nx)``.
+        dxyz: target voxel size(s) in mm.
+
+    Returns:
+        ``(new_affine, new_shape)`` — the new 4×4 voxel→world affine and array shape
+        ``(nz, ny, nx)`` covering the same FOV, centred identically, at ``dxyz`` spacing.
+    """
+    a = np.asarray(base_affine, dtype=np.float64)
+    nz, ny, nx = base_shape
+    dim_xyz = np.array([nx, ny, nz], dtype=np.float64)  # dims in affine (x,y,z) axis order
+    r = a[:3, :3]
+    vox = np.linalg.norm(r, axis=0)
+    vox = np.where(vox > 0.0, vox, 1.0)
+    directions = r / vox  # unit direction cosines per axis
+    d = np.asarray(dxyz, dtype=np.float64).ravel()
+    if d.size == 1:
+        d = np.repeat(d, 3)
+    elif d.size != 3:
+        raise ValueError(f"dxyz must be 1 or 3 values, got {d.size}")
+    if np.any(d <= 0):
+        raise ValueError(f"dxyz must be positive, got {d.tolist()}")
+    new_dim = np.maximum(1, np.rint(dim_xyz * vox / d)).astype(int)  # preserve FOV = dim·vox
+    new_r = directions * d  # scale each unit column by its target spacing
+    centre_world = r @ ((dim_xyz - 1.0) / 2.0) + a[:3, 3]  # keep the same centre
+    new_origin = centre_world - new_r @ ((new_dim - 1.0) / 2.0)
+    new_affine = np.eye(4, dtype=np.float64)
+    new_affine[:3, :3] = new_r
+    new_affine[:3, 3] = new_origin
+    return new_affine, (int(new_dim[2]), int(new_dim[1]), int(new_dim[0]))
+
+
 def apply_affine(
     source: Tensor,
     matrix: Tensor,

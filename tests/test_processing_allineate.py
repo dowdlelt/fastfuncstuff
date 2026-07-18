@@ -1179,3 +1179,63 @@ class TestSubsampling:
         torch.testing.assert_close(
             _center_of_mass(warped), _center_of_mass(base), atol=1.2, rtol=0.0
         )
+
+
+def test_grid_from_dxyz_preserves_space():
+    """`-mast_dxyz` grid: same orientation, centre, and FOV at a new voxel size."""
+    from fastfuncstuff.processing.affine import grid_from_dxyz
+
+    base_shape = (14, 12, 10)  # (nz, ny, nx)
+    affine = np.array([[2.0, 0, 0, -9.0], [0, 2.0, 0, -11.0], [0, 0, 2.0, -13.0], [0, 0, 0, 1.0]])
+
+    def _centre(a, shape):
+        nz, ny, nx = shape
+        c = np.array([(nx - 1) / 2, (ny - 1) / 2, (nz - 1) / 2, 1.0])
+        return (a @ c)[:3]
+
+    # same voxel size → same grid + affine
+    a_same, s_same = grid_from_dxyz(affine, base_shape, 2.0)
+    assert s_same == base_shape
+    assert np.allclose(a_same, affine)
+
+    # half voxel → dims double, voxel size 1, centre + FOV preserved
+    a_half, s_half = grid_from_dxyz(affine, base_shape, 1.0)
+    assert s_half == (28, 24, 20)
+    assert np.allclose(np.linalg.norm(a_half[:3, :3], axis=0), [1.0, 1.0, 1.0])
+    assert np.allclose(_centre(a_half, s_half), _centre(affine, base_shape))
+    # FOV (dim·vox) preserved on each axis
+    assert np.allclose(np.array(s_half[::-1]) * 1.0, np.array(base_shape[::-1]) * 2.0)
+
+    # anisotropic (x, y, z voxel/world order)
+    a_an, s_an = grid_from_dxyz(affine, base_shape, [1.0, 2.0, 4.0])
+    assert s_an == (7, 12, 20)  # z halves? no: fov_z=14*2=28 -> 28/4=7 ; y 24/2=12 ; x 20/1=20
+    assert np.allclose(np.linalg.norm(a_an[:3, :3], axis=0), [1.0, 2.0, 4.0])
+    with pytest.raises(ValueError):
+        grid_from_dxyz(affine, base_shape, [1.0, 2.0])  # 2 values not allowed
+
+
+def test_dxyz_output_samples_correct_world_location():
+    """The -dxyz output resamples the SAME transform at a finer grid — a world-x ramp is
+    reproduced at the new voxel centres (validates the out-grid matrix composition)."""
+    from fastfuncstuff.cli.allineate import _out_matrix, _output_grid, _resample
+
+    base_shape = (14, 12, 10)
+    affine = np.array([[2.0, 0, 0, -9.0], [0, 2.0, 0, -13.0], [0, 0, 2.0, -11.0], [0, 0, 0, 1.0]])
+    nz, ny, nx = base_shape
+    _, _, xx = np.meshgrid(np.arange(nz), np.arange(ny), np.arange(nx), indexing="ij")
+    source = torch.tensor(2.0 * xx + affine[0, 3], dtype=torch.float32)  # value = world-x
+    matrix = torch.eye(4)  # source shares the base grid
+    dev = torch.device("cpu")
+
+    # base grid: identity → returns the ramp unchanged
+    oa, os_ = _output_grid(affine, base_shape, None)
+    w0 = _resample(source, _out_matrix(matrix, affine, oa, dev), os_, "linear")
+    assert torch.allclose(w0, source, atol=1e-3)
+
+    # half-res grid: each output voxel must carry its OWN world-x (correct composition)
+    oa2, os2 = _output_grid(affine, base_shape, [1.0])
+    w2 = _resample(source, _out_matrix(matrix, affine, oa2, dev), os2, "linear")
+    ix = np.arange(os2[2])
+    expected = 1.0 * ix + oa2[0, 3]  # world-x at each output column
+    got = w2[os2[0] // 2, os2[1] // 2, 2 : os2[2] - 2].numpy()  # interior row (avoid OOB edges)
+    assert np.allclose(got, expected[2 : os2[2] - 2], atol=1e-2)

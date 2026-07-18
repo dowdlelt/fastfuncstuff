@@ -17,17 +17,55 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.processing.affine import (
     apply_affine,
     apply_affine_wsinc5,
+    grid_from_dxyz,
     load_matrix_1D,
     save_matrix_1D,
 )
 from fastfuncstuff.processing.allineate import AffineAlignConfig, allineate
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
+
+
+def _output_grid(
+    base_affine: np.ndarray, base_shape: tuple[int, int, int], dxyz: list[float] | None
+) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """Output affine + shape: the base grid, or a ``-dxyz`` master grid at a new voxel size."""
+    if dxyz is None:
+        return np.asarray(base_affine), tuple(base_shape)
+    return grid_from_dxyz(base_affine, base_shape, dxyz)
+
+
+def _out_matrix(
+    matrix: torch.Tensor, base_affine: np.ndarray, out_affine: np.ndarray, device: torch.device
+) -> torch.Tensor:
+    """Compose the base-voxel→source matrix onto the output grid (out-voxel→source).
+
+    For the base grid this is a no-op; for a ``-dxyz`` grid it prepends the out-voxel→
+    base-voxel map ``inv(base_affine)·out_affine`` (both are voxel→world in the same space).
+    """
+    if np.array_equal(np.asarray(out_affine), np.asarray(base_affine)):
+        return matrix
+    ab = torch.as_tensor(np.asarray(base_affine), dtype=torch.float64, device=device)
+    ao = torch.as_tensor(np.asarray(out_affine), dtype=torch.float64, device=device)
+    return (matrix.double() @ torch.linalg.inv(ab) @ ao).to(matrix.dtype)
+
+
+def _resample(
+    source_vol: torch.Tensor,
+    matrix: torch.Tensor,
+    out_shape: tuple[int, int, int],
+    final_interp: str,
+) -> torch.Tensor:
+    """Pull-resample a source volume through ``matrix`` onto ``out_shape`` (final interp)."""
+    if final_interp == "wsinc5":
+        return apply_affine_wsinc5(source_vol, matrix, out_shape)
+    return apply_affine(source_vol, matrix, out_shape, zero_outside=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -69,6 +107,18 @@ Examples:
         "-1Dmatrix_apply", default=None, help="Apply existing matrix (skip alignment)"
     )
     io_group.add_argument("-base_index", type=int, default=None, help="Use volume N from 4D base")
+    io_group.add_argument(
+        "-dxyz",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="MM",
+        help="Write the output at this voxel size (mm) instead of the base's grid — AFNI "
+        "-mast_dxyz. Keeps the base's SPACE (orientation, centre, field of view) but resamples "
+        "to the given resolution: one value for isotropic (e.g. -dxyz 0.8 to preserve hi-res), "
+        "or three for x y z. The transform is unchanged; only the output grid differs. Works "
+        "with both the normal alignment and -1Dmatrix_apply.",
+    )
     io_group.add_argument(
         "-save_mean",
         action="store_true",
@@ -359,6 +409,14 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Source: {args.source} {source.shape}")
         print(f"Load time: {time.time() - t0:.2f}s")
 
+    # Output grid: the base's grid by default, or a -dxyz master grid (base space/FOV/centre
+    # at a new voxel size). The transform is applied into `out_shape` and saved with `out_affine`.
+    if args.dxyz is not None and len(args.dxyz) not in (1, 3):
+        raise SystemExit(f"-dxyz takes 1 (isotropic) or 3 (x y z) values, got {len(args.dxyz)}")
+    out_affine, out_shape = _output_grid(base_header["affine"], tuple(base.shape), args.dxyz)
+    if args.dxyz is not None and verb >= 1:
+        print(f"Output grid (-dxyz {args.dxyz}): {base.shape} -> {out_shape}")
+
     # --- Apply existing matrix ---
     if getattr(args, "1Dmatrix_apply", None) is not None:
         matrix_path = getattr(args, "1Dmatrix_apply")
@@ -371,12 +429,10 @@ def main(argv: list[str] | None = None) -> None:
             source_affine=source_header["affine"],
         )
         matrix = matrix.to(device)
-        if args.final_interp == "wsinc5":
-            warped = apply_affine_wsinc5(source, matrix, base.shape)
-        else:
-            warped = apply_affine(source, matrix, base.shape, zero_outside=True)
+        om = _out_matrix(matrix, base_header["affine"], out_affine, device)
+        warped = _resample(source, om, out_shape, args.final_interp)
         with spinner(f"Writing {Path(args.prefix).name}"):
-            save_image(warped, args.prefix, header_info=base_header)
+            save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:
             print(f"Saved: {args.prefix}")
         return
@@ -475,8 +531,13 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Alignment time: {time.time() - t1:.2f}s")
 
     # --- Save outputs ---
+    # -dxyz: re-resample onto the master grid at the requested voxel size (allineate returned
+    # `warped` on the base grid). Same transform, finer/coarser output.
+    if args.dxyz is not None:
+        om = _out_matrix(matrix, base_header["affine"], out_affine, device)
+        warped = _resample(source, om, out_shape, args.final_interp)
     with spinner(f"Writing {Path(args.prefix).name}"):
-        save_image(warped, args.prefix, header_info=base_header)
+        save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
     if verb >= 1:
         print(f"Saved: {args.prefix}")
 
@@ -495,16 +556,14 @@ def main(argv: list[str] | None = None) -> None:
     if source_4d is not None:
         if verb >= 1:
             print(f"Applying alignment to all {source_4d.shape[0]} volumes...")
-        aligned_vols = []
-        for t in range(source_4d.shape[0]):
-            if args.final_interp == "wsinc5":
-                vol = apply_affine_wsinc5(source_4d[t], matrix, base.shape)
-            else:
-                vol = apply_affine(source_4d[t], matrix, base.shape, zero_outside=True)
-            aligned_vols.append(vol)
+        om = _out_matrix(matrix, base_header["affine"], out_affine, device)
+        aligned_vols = [
+            _resample(source_4d[t], om, out_shape, args.final_interp)
+            for t in range(source_4d.shape[0])
+        ]
         result_4d = torch.stack(aligned_vols)
         with spinner(f"Writing {Path(args.prefix).name}"):
-            save_image(result_4d, args.prefix, header_info=base_header)
+            save_image(result_4d, args.prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:
             print(f"Saved 4D result: {args.prefix}")
 
@@ -512,7 +571,7 @@ def main(argv: list[str] | None = None) -> None:
             mean_path = derive_mean_output_path(args.prefix)
             mean_image = result_4d.mean(dim=0)
             with spinner(f"Writing {Path(mean_path).name}"):
-                save_image(mean_image, mean_path, header_info=base_header)
+                save_image(mean_image, mean_path, header_info=base_header, affine=out_affine)
             if verb >= 1:
                 print(f"Saved mean: {mean_path}")
     elif args.save_mean and verb >= 1:
