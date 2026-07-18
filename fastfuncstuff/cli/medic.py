@@ -504,9 +504,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Start: {datetime.now():%Y-%m-%d %H:%M:%S}   Device: {device}")
         print("\nLoading echoes...")
 
-    with spinner(f"Loading {Path(args.magnitude).name}"):
+    with spinner(f"Loading {len(args.magnitude)} magnitude echo(es)"):
         mag, affine, _ = _load_echoes(args.magnitude)
-    with spinner(f"Loading {Path(args.phase).name}"):
+    with spinner(f"Loading {len(args.phase)} phase echo(es)"):
         phase, _, _ = _load_echoes(args.phase)
     if mag.shape != phase.shape:
         print(f"ERROR: magnitude shape {mag.shape} != phase shape {phase.shape}", file=sys.stderr)
