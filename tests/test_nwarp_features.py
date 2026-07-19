@@ -308,6 +308,216 @@ def test_no_neg_clamps_ringing():
 
 
 # --------------------------------------------------------------------------
+# -jac phase-encode Jacobian intensity modulation
+# --------------------------------------------------------------------------
+
+
+def test_parse_pe_axis_spellings():
+    from fastfuncstuff.processing.nwarpforge import parse_pe_axis
+
+    for a0 in ("i", "x", "LR", "rl", "X"):
+        assert parse_pe_axis(a0) == 0
+    for a1 in ("j", "y", "AP", "pa", "Y"):
+        assert parse_pe_axis(a1) == 1
+    for a2 in ("k", "z", "IS", "si", "Z"):
+        assert parse_pe_axis(a2) == 2
+    with pytest.raises(ValueError):
+        parse_pe_axis("q")
+
+
+def test_compute_pe_jacobian_single_axis_and_value():
+    from fastfuncstuff.processing.nwarpforge import compute_pe_jacobian
+    from fastfuncstuff.processing.penalty import _central_diff_batched
+
+    # A pure y (j) displacement ramp: disp(y) = 0.3*y -> jac = 1 + 0.3 everywhere interior.
+    nz, ny, nx = 8, 10, 9
+    jj = torch.arange(ny, dtype=torch.float32)[None, :, None].expand(nz, ny, nx).contiguous()
+    yd = 0.3 * jj
+    zero = torch.zeros_like(yd)
+    warp = NonlinearWarp(xd=zero, yd=yd, zd=zero.clone(),
+                         header_info={"affine": _diag_affine()}, units="voxels")
+    jac, single, ratio = compute_pe_jacobian(warp, pe_axis=1)
+    assert single and ratio < 1e-6
+    expected = 1.0 + _central_diff_batched(yd, dim=1)
+    assert torch.allclose(jac, expected)
+    assert abs(float(jac[nz // 2, ny // 2, nx // 2]) - 1.3) < 1e-5
+
+    # Off-axis displacement -> not single-axis -> caller must skip.
+    warp_mixed = NonlinearWarp(xd=0.3 * jj, yd=yd, zd=zero.clone(),
+                               header_info={"affine": _diag_affine()}, units="voxels")
+    _, single_mixed, ratio_mixed = compute_pe_jacobian(warp_mixed, pe_axis=1)
+    assert not single_mixed and ratio_mixed > 0.5
+
+
+def test_jac_modulation_end_to_end():
+    # A compression ramp warp: applying -jac must scale intensity by the Jacobian,
+    # reproducing (geometry-only output) * jac.
+    aff = _diag_affine()
+    nz, ny, nx = 6, 12, 6
+    src = torch.ones(nz, ny, nx)
+    jj = torch.arange(ny, dtype=torch.float32)[None, :, None].expand(nz, ny, nx).contiguous()
+    yd = 0.2 * (jj - ny / 2)  # linear PE displacement
+    warp = NonlinearWarp(xd=torch.zeros_like(src), yd=yd, zd=torch.zeros_like(src),
+                         header_info={"affine": aff}, units="voxels")
+    geom = apply_composed_warp(src, warp, aff, aff, interp="linear")
+    from fastfuncstuff.processing.nwarpforge import compute_pe_jacobian
+
+    jac, single, _ = compute_pe_jacobian(warp, pe_axis=1)
+    assert single
+    # interior voxels (avoid the boundary difference rows)
+    m = torch.zeros_like(src, dtype=torch.bool)
+    m[:, 2:-2, :] = True
+    assert torch.allclose((geom * jac)[m], (geom[m] * jac[m]))
+    assert (jac[m] - 1.2).abs().max() < 1e-5  # 1 + d(0.2*y)/dy
+
+
+def test_jac_static_with_slice_timing(tmp_path):
+    # -jac must work with -tpattern when a static PE distortion warp is present: the
+    # constant Jacobian is applied to every slice-timing-corrected frame.
+    n, nt = 8, 6
+    aff = _diag_affine(2.0)
+    rng = np.random.default_rng(0)
+    src = rng.random((nt, n, n, n)).astype(np.float32) + 1.0  # 4D, all positive
+    src_path = tmp_path / "src4d.nii"
+    nib.Nifti1Image(np.moveaxis(src, 0, -1), aff).to_filename(str(src_path))
+
+    warp_path = tmp_path / "pewarp.nii"
+    jj = np.arange(n, dtype=np.float32)[None, :, None]
+    disp_mm = np.broadcast_to(0.2 * (jj - n / 2) * 2.0, (n, n, n))  # PE(y) ramp, mm
+    data = np.zeros((n, n, n, 3), dtype=np.float32)
+    data[..., 1] = disp_mm
+    nib.Nifti1Image(data, aff).to_filename(str(warp_path))
+
+    st = list(np.linspace(0.0, 0.9, n))
+    common = dict(
+        source_path=str(src_path), nwarp_specs=[str(warp_path)], interp="linear",
+        device=DEV, verb=0, slice_times=st, tr=1.0, auto_pad=False,
+    )
+    out = tmp_path / "out.nii"
+    out_nojac = tmp_path / "out_nojac.nii"
+    # Should not raise, and should run the joint slice-timing path with jac applied.
+    nwarpforge(prefix=str(out), jac_axis=1, **common)
+    nwarpforge(prefix=str(out_nojac), jac_axis=None, **common)
+    assert out.exists()
+    res = np.asarray(nib.load(str(out)).dataobj)
+    res0 = np.asarray(nib.load(str(out_nojac)).dataobj)
+    assert res.shape[:3] == (n, n, n) and np.isfinite(res).all()
+    # The constant Jacobian scales every frame. disp_mm gradient 0.4/voxel over 2mm
+    # voxels = 0.2 voxel/voxel; the AFNI mm->voxel load negates the y component, so the
+    # applied gradient is -0.2 and jac = 1 - 0.2 = 0.8 (spatially constant for a ramp).
+    assert not np.allclose(res, res0)
+    interior = (slice(None), slice(2, n - 2), slice(None))
+    ratio = res[interior] / np.clip(res0[interior], 1e-3, None)
+    assert abs(float(np.median(ratio)) - 0.8) < 0.05
+    assert float(ratio.std()) < 0.02  # constant modulation across the ramp
+
+
+def _write_aff1d(path, rows):
+    """Write an AFNI .aff12.1D file: one line per frame, 12 numbers (3x4)."""
+    with open(path, "w") as fh:
+        for r in rows:
+            fh.write(" ".join(f"{v:.8f}" for v in r) + "\n")
+
+
+_IDENT12 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]
+
+
+def test_match_nwarp_spec():
+    from fastfuncstuff.processing.nwarpforge import match_nwarp_spec
+
+    specs = ["/a/ref2anat.aff12.1D", "/b/sub_fmap_warp.nii.gz", "/c/run1_motion.aff12.1D"]
+    assert match_nwarp_spec(specs, "sub_fmap_warp.nii.gz") == 1  # basename
+    assert match_nwarp_spec(specs, "fmap") == 1  # unique substring
+    assert match_nwarp_spec(specs, "/c/run1_motion.aff12.1D") == 2  # exact path
+    with pytest.raises(ValueError, match="no -nwarp entry"):
+        match_nwarp_spec(specs, "nope")
+    with pytest.raises(ValueError, match="multiple"):
+        match_nwarp_spec(specs, ".1D")  # matches two
+
+
+def test_jac_transport_with_upstream_motion(tmp_path):
+    # Chain [fieldmap, per-frame motion]: motion is upstream (source side) of the fieldmap,
+    # so -jac j:fmap must succeed and apply the (constant) transported Jacobian per frame.
+    n, nt = 8, 4
+    aff = _diag_affine(2.0)
+    src = (np.random.default_rng(0).random((nt, n, n, n)) + 1.0).astype(np.float32)
+    src_path = tmp_path / "s.nii"
+    nib.Nifti1Image(np.moveaxis(src, 0, -1), aff).to_filename(str(src_path))
+
+    fmap = tmp_path / "fmap.nii"
+    ramp = np.zeros((n, n, n, 3), dtype=np.float32)
+    ramp[..., 1] = 0.4 * (np.arange(n, dtype=np.float32)[None, :, None] - n / 2)  # PE(y) ramp, mm
+    nib.Nifti1Image(ramp, aff).to_filename(str(fmap))  # constant jac (=/= 1)
+    motion = tmp_path / "run_motion.aff12.1D"
+    _write_aff1d(motion, [_IDENT12 for _ in range(nt)])  # per-frame (identity here)
+
+    out = tmp_path / "o.nii"
+    out0 = tmp_path / "o0.nii"
+    common = dict(source_path=str(src_path), nwarp_specs=[str(fmap), str(motion)],
+                  interp="linear", device=DEV, verb=0, auto_pad=False)
+    nwarpforge(prefix=str(out), jac_axis=1, jac_match="fmap", **common)
+    nwarpforge(prefix=str(out0), jac_axis=None, **common)
+    res = np.asarray(nib.load(str(out)).dataobj)
+    res0 = np.asarray(nib.load(str(out0)).dataobj)
+    assert res.shape[:3] == (n, n, n)
+    assert not np.allclose(res, res0)  # jac was applied
+    interior = (slice(None), slice(2, n - 2), slice(None))
+    ratio = res[interior] / np.clip(res0[interior], 1e-3, None)
+    assert float(np.std(ratio)) < 0.02  # constant modulation across frames
+
+
+def test_jac_transport_errors_on_downstream_perframe(tmp_path):
+    # Chain [per-frame motion, fieldmap]: motion is DOWNSTREAM (output side) of the
+    # fieldmap -> the transported Jacobian would be per-frame -> must error.
+    n, nt = 6, 3
+    aff = _diag_affine(2.0)
+    src = (np.random.default_rng(1).random((nt, n, n, n)) + 1.0).astype(np.float32)
+    src_path = tmp_path / "s.nii"
+    nib.Nifti1Image(np.moveaxis(src, 0, -1), aff).to_filename(str(src_path))
+    fmap = tmp_path / "fmap.nii"
+    _write_mm_warp(fmap, (n, n, n), aff, (0.0, 8.0, 0.0))
+    motion = tmp_path / "m.aff12.1D"
+    _write_aff1d(motion, [_IDENT12 for _ in range(nt)])
+    with pytest.raises(ValueError, match="downstream"):
+        nwarpforge(
+            source_path=str(src_path), nwarp_specs=[str(motion), str(fmap)],
+            prefix=str(tmp_path / "o.nii"), interp="linear", device=DEV, verb=0,
+            auto_pad=False, jac_axis=1, jac_match="fmap",
+        )
+
+
+def test_jac_timevarying_plus_slicetiming_errors(tmp_path):
+    # A purely time-varying (5D) warp + slice timing + jac has no static Jacobian: error.
+    import pytest as _pytest
+
+    from fastfuncstuff.processing.nwarpforge import _is_time_varying_warp
+
+    n, nt = 6, 4
+    aff = _diag_affine(2.0)
+    src = (np.random.default_rng(1).random((nt, n, n, n)) + 1.0).astype(np.float32)
+    src_path = tmp_path / "s.nii"
+    nib.Nifti1Image(np.moveaxis(src, 0, -1), aff).to_filename(str(src_path))
+    # 5D per-frame warp (nx,ny,nz,T,3), PE ramp
+    w = np.zeros((n, n, n, nt, 3), dtype=np.float32)
+    w[..., 1] = (0.2 * (np.arange(n, dtype=np.float32)[None, :, None, None] - n / 2)) * 2.0
+    wpath = tmp_path / "tvwarp.nii"
+    nib.Nifti1Image(w, aff).to_filename(str(wpath))
+    assert _is_time_varying_warp(str(wpath))
+    with _pytest.raises(ValueError, match="static distortion warp"):
+        nwarpforge(
+            source_path=str(src_path),
+            nwarp_specs=[str(wpath)],
+            prefix=str(tmp_path / "o.nii"),
+            interp="linear",
+            device=DEV,
+            verb=0,
+            slice_times=list(np.linspace(0, 0.9, n)),
+            tr=1.0,
+            jac_axis=1,
+        )
+
+
+# --------------------------------------------------------------------------
 # auto-pad helpers + end-to-end
 # --------------------------------------------------------------------------
 

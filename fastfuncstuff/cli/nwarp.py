@@ -170,6 +170,21 @@ Examples:
         help="Clamp warped output at 0 to suppress wsinc5/cubic negative ringing "
         "on non-negative data (magnitude, masks, probability maps).",
     )
+    interp_group.add_argument(
+        "-jac",
+        dest="jac",
+        default=None,
+        metavar="AXIS[:FIELDMAP]",
+        help="Apply phase-encode Jacobian intensity modulation (1 + d(disp)/d(AXIS)) "
+        "to the warped output, so a geometry-only distortion warp (fieldmap / MEDIC / "
+        "locomoco) is intensity-corrected like FSL applytopup --method=jac. AXIS is the "
+        "phase-encode direction: i/j/k, x/y/z or LR/AP/IS (equivalent spellings). For a "
+        "multi-transform chain, name the fieldmap with AXIS:FIELDMAP (a filename or unique "
+        "substring, e.g. 'j:fmap'): its Jacobian is computed on its own grid and transported "
+        "through the downstream transforms to the output -- exact even with upstream per-frame "
+        "motion and -tpattern. Without :FIELDMAP it auto-uses the lone static single-axis warp. "
+        "An affine-mixed / 3-D chain is left unmodulated.",
+    )
 
     st_group = parser.add_argument_group("Slice timing (joint space-time)")
     st_group.add_argument(
@@ -290,6 +305,18 @@ def main(argv: list[str] | None = None) -> None:
     if verb >= 1:
         print(f"ffs_nwarp: ainterp={ainterp}")
 
+    jac_axis = None
+    jac_match = None
+    if args.jac is not None:
+        from fastfuncstuff.processing.nwarpforge import parse_pe_axis
+
+        axis_str, _, jac_match = args.jac.partition(":")
+        jac_match = jac_match.strip() or None
+        jac_axis = parse_pe_axis(axis_str)
+        if verb >= 1:
+            tail = f", fieldmap '{jac_match}'" if jac_match else ""
+            print(f"ffs_nwarp: Jacobian modulation on phase-encode axis '{axis_str}' (axis {jac_axis}){tail}")
+
     nwarp_specs = parse_nwarp_string(args.nwarp)
     if verb >= 1:
         print(f"ffs_nwarp: chain has {len(nwarp_specs)} transform(s)")
@@ -351,6 +378,8 @@ def main(argv: list[str] | None = None) -> None:
         tzero=args.tzero,
         tinterp=args.tinterp,
         follow_tissue=args.follow_tissue,
+        jac_axis=jac_axis,
+        jac_match=jac_match,
     )
 
     if verb >= 1:

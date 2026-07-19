@@ -479,6 +479,147 @@ def identify_transform_type(path: str) -> str:
         raise ValueError(f"Cannot identify transform type for: {path}")
 
 
+# Phase-encode axis spelling -> spatial axis index (0=x/i/LR, 1=y/j/AP, 2=z/k/IS).
+# The orientation names are treated as fixed shorthands for the voxel axes (i≡x≡LR,
+# j≡y≡AP, k≡z≡IS), i.e. we do NOT read the image's actual anatomical orientation --
+# "-jac AP" is just another way to write "-jac j", matching how the flag is used.
+_PE_AXIS_ALIASES = {
+    "i": 0, "x": 0, "lr": 0, "rl": 0,
+    "j": 1, "y": 1, "ap": 1, "pa": 1,
+    "k": 2, "z": 2, "is": 2, "si": 2,
+}
+
+
+def parse_pe_axis(spec: str) -> int:
+    """Map a phase-encode axis spelling to a spatial axis index (0/1/2).
+
+    Accepts ``i/j/k``, ``x/y/z`` and the orientation pairs ``LR/RL``, ``AP/PA``,
+    ``IS/SI`` (case-insensitive) -- ``-jac j``, ``-jac y`` and ``-jac AP`` are
+    equivalent. Returns 0 for x/i, 1 for y/j, 2 for z/k.
+    """
+    key = spec.strip().lower()
+    if key not in _PE_AXIS_ALIASES:
+        raise ValueError(
+            f"unrecognised phase-encode axis {spec!r}; use i/j/k, x/y/z or LR/AP/IS"
+        )
+    return _PE_AXIS_ALIASES[key]
+
+
+def compute_pe_jacobian(warp: NonlinearWarp, pe_axis: int) -> tuple[Tensor, bool, float]:
+    """Jacobian intensity-modulation map for a phase-encode distortion warp.
+
+    For a warp whose displacement is confined to the phase-encode (PE) axis, the
+    determinant of its Jacobian is simply ``1 + d(disp_pe)/d(pe)`` -- the same
+    factor topup/blipflip apply to make a geometrically-undistorted image
+    quantitatively correct (compression regions are dimmed back down, stretched
+    regions brightened). Applying a bare displacement warp omits it, leaving the
+    pile-up "streaks" at high-distortion edges.
+
+    Returns ``(jac, single_axis, off_on_ratio)``. ``single_axis`` is False when the
+    composed warp has non-PE displacement (an affine mixed axes, or it is a genuine
+    3-D warp) -- then the 1-D Jacobian is not meaningful and the caller should skip
+    modulation. ``jac`` is always returned so the caller can decide.
+    """
+    from .penalty import _central_diff_batched
+
+    comps = (warp.xd, warp.yd, warp.zd)
+    disp = comps[pe_axis]
+    on = float(disp.abs().max())
+    off = max(float(comps[a].abs().max()) for a in range(3) if a != pe_axis)
+    ratio = off / (on + 1e-6)
+    single_axis = ratio < 0.02
+    # Spatial axis a (0=x,1=y,2=z) -> _central_diff_batched dim (0=z,1=y,2=x) is 2-a.
+    jac = 1.0 + _central_diff_batched(disp, dim=2 - pe_axis)
+    return jac, single_axis, ratio
+
+
+def match_nwarp_spec(nwarp_specs: list[str], pattern: str) -> int:
+    """Index of the single ``-nwarp`` entry matching ``pattern`` (for ``-jac axis:pat``).
+
+    Matches an exact path, an exact basename, or a unique substring. Errors if the
+    pattern matches zero or more than one entry, so the user must name the fieldmap
+    unambiguously (a bare ``fmap`` is fine as long as nothing else in the chain matches).
+    """
+    exact = [i for i, s in enumerate(nwarp_specs) if s == pattern or Path(s).name == pattern]
+    if len(exact) == 1:
+        return exact[0]
+    subs = [i for i, s in enumerate(nwarp_specs) if pattern in s]
+    if len(subs) == 1:
+        return subs[0]
+    if not exact and not subs:
+        raise ValueError(f"-jac: no -nwarp entry matches {pattern!r}")
+    hits = [nwarp_specs[i] for i in (exact or subs)]
+    raise ValueError(
+        f"-jac: {pattern!r} matches multiple -nwarp entries {hits}; name it more specifically"
+    )
+
+
+def fieldmap_jacobian_transported(
+    nwarp_specs: list[str],
+    transforms: list[Transform],
+    pattern: str,
+    pe_axis: int,
+    output_shape: tuple[int, int, int],
+    output_affine: np.ndarray,
+    device: torch.device,
+    ainterp: str = "cubic",
+) -> Tensor:
+    """Fieldmap Jacobian on its native grid, transported to the output grid.
+
+    The intensity modulation is a scalar attached to tissue: ``J = 1 + d(disp)/d(pe)``
+    computed in the *fieldmap's own space* (clean, single-axis), then carried onto the
+    output grid through **only the transforms downstream of the fieldmap** (those between
+    it and the output). Upstream transforms (fieldmap -> source: motion, run-to-run) do
+    not affect the modulation map -- they only decide which source voxel supplies the raw
+    value. Downstream transforms must be static (no per-frame op), which holds when the
+    per-frame motion/locomoco sit upstream (source side); the transported map is then a
+    single constant field applied to every frame. This is exact for the full multi-run
+    chain -- not a small-motion approximation -- and it deliberately transports only the
+    fieldmap's Jacobian, never the downstream normalisation Jacobians.
+    """
+    k = match_nwarp_spec(nwarp_specs, pattern)
+    fmap = transforms[k]
+    if not isinstance(fmap, NonlinearWarp):
+        raise ValueError(f"-jac: matched -nwarp entry {nwarp_specs[k]!r} is not a nonlinear warp")
+    fmap_aff = fmap.header_info["affine"]
+    # Voxel-unit displacement on the fieldmap's own grid (same mm->voxel convention the
+    # chain applies), so J's sign matches the geometry that gets applied.
+    fmap_vox = (
+        fmap
+        if fmap.units == "voxels"
+        else prepare_warp_for_grid(fmap, fmap.shape, fmap_aff, device, verb=0)
+    )
+    jac_native, single, ratio = compute_pe_jacobian(fmap_vox, pe_axis)
+    if not single:
+        raise ValueError(
+            f"-jac: {nwarp_specs[k]!r} is not confined to the phase-encode axis "
+            f"(off/on={ratio:.3f}); is it the fieldmap warp, and is the axis right?"
+        )
+    # Downstream (output-side) sub-chain: transforms applied to the output coordinate
+    # before it reaches the fieldmap. compose_chain applies transforms[0] first, so these
+    # are transforms[:k]. They must be static for a constant transported map.
+    down = transforms[:k]
+    if any(_is_time_dependent(x) for x in down):
+        raise ValueError(
+            "-jac: a per-frame transform sits downstream of the fieldmap (between it and "
+            "the output); the transported Jacobian would vary per frame -- unsupported"
+        )
+    if down:
+        w_sub = compose_chain(
+            down, output_shape, output_affine, device, time_idx=0, interp=ainterp, verb=0
+        )
+    else:
+        z = torch.zeros(output_shape, dtype=torch.float32, device=device)
+        w_sub = NonlinearWarp(
+            xd=z, yd=z.clone(), zd=z.clone(), header_info={"affine": output_affine.copy()}
+        )
+    fx, fy, fz = _output_to_source_voxel_coords(w_sub, fmap_aff, output_affine)
+    jac = trilinear_interpolate(
+        jac_native, fx.reshape(-1), fy.reshape(-1), fz.reshape(-1)
+    ).reshape(output_shape)
+    return jac
+
+
 def prepare_warp_for_grid(
     warp: NonlinearWarp,
     target_shape: tuple[int, int, int],
@@ -1489,6 +1630,8 @@ def nwarpforge(
     tzero: float | None = None,
     tinterp: str = "cubic",
     follow_tissue: bool = True,
+    jac_axis: int | None = None,
+    jac_match: str | None = None,
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1556,6 +1699,19 @@ def nwarpforge(
             "cubic", "wsinc5", "wsinc9"; default "cubic"). Fourier is not
             available here -- the per-voxel continuous shift is not a single
             per-slice phase rotation.
+        jac_axis: If set (0=x/i, 1=y/j, 2=z/k), multiply the warped magnitude by
+            the phase-encode Jacobian ``1 + d(disp)/d(axis)`` so a geometry-only
+            distortion warp (fieldmap / MEDIC / locomoco) is intensity-corrected,
+            like ``applytopup --method=jac``. With ``jac_match`` (``-jac axis:pattern``) the
+            named fieldmap's Jacobian is computed on its native grid and transported through
+            only the downstream (output-side) transforms -- exact for a full multi-run chain
+            (motion/locomoco sit upstream and don't affect the modulation). Without a match,
+            it auto-uses the static single-axis warp in the chain (fine when the fieldmap is
+            the only nonlinear warp). Applied as a constant field per frame, so it works with
+            per-frame motion and -tpattern; an affine-mixed / 3-D chain is left unmodulated.
+        jac_match: Substring/filename selecting which -nwarp entry is the fieldmap for
+            ``jac_axis`` (see :func:`match_nwarp_spec`). Required to modulate correctly
+            through a multi-transform chain.
         follow_tissue: On the joint slice-timing path, sample each temporal
             neighbour at *its own* pose (tissue-following, the default) instead of
             freezing the output frame's pose (the slow-motion assumption). Recovers
@@ -1900,6 +2056,15 @@ def nwarpforge(
     # cheaper than materializing a displacement field per frame (the general
     # path below). NN falls through (batched sampler is interp-only); phase
     # warping keeps the field path.
+    if jac_axis is not None and not any(
+        isinstance(x, NonlinearWarp | TimeVaryingWarp) for x in transforms
+    ):
+        print(
+            "nwarpforge: -jac given but the chain has no nonlinear warp; "
+            "Jacobian modulation has no effect (nothing distorts the phase-encode axis)"
+        )
+        jac_axis = None
+
     affine_only = (
         phase_data is None
         and slice_times_t is None
@@ -1985,6 +2150,72 @@ def nwarpforge(
             verb=verb,
         )
 
+    # Jacobian intensity modulation (-jac): multiply the warped magnitude by
+    # 1 + d(disp_pe)/d(pe) so a geometry-only distortion warp becomes quantitatively
+    # correct. Gated to warps whose displacement is confined to the PE axis; a mixed
+    # (affine-rotated or 3-D) composed warp is skipped with one warning.
+    #
+    # The distortion Jacobian is dominated by the *static* fieldmap; per-frame motion is
+    # rigid (intensity-neutral) and any time-varying field component is far smaller. So we
+    # derive one constant Jacobian from the static single-phase-encode-axis warp in the
+    # chain and apply it to every frame -- even when time-varying transforms (motion, a
+    # per-frame field) are also present, and including on the joint slice-timing path where
+    # a constant scalar field commutes with the temporal resample. This is exact when the
+    # chain is just the distortion warp; with downstream motion/normalisation it treats the
+    # modulation as fixed in the output grid (a good approximation for small motion). Only
+    # when *no* static PE-axis warp exists (a purely time-varying field) do we fall back to
+    # the per-frame composed Jacobian -- which slice timing cannot use, hence the error.
+    _jac_warned = [False]
+    _static_jac: Tensor | None = None
+    if jac_axis is not None and jac_match is not None:
+        # Explicit fieldmap: compute its Jacobian on its native grid and transport it
+        # through the downstream (output-side) sub-chain -- exact for a full multi-run
+        # chain regardless of upstream motion. (See fieldmap_jacobian_transported.)
+        _static_jac = fieldmap_jacobian_transported(
+            nwarp_specs, transforms, jac_match, jac_axis,
+            output_shape, output_affine, device, ainterp=ainterp,
+        )
+        if verb >= 1:
+            print(f"nwarpforge: -jac using fieldmap '{jac_match}', transported to the output grid")
+    elif jac_axis is not None:
+        # Auto: use the static single-phase-encode-axis warp in the chain (works when the
+        # fieldmap is the only nonlinear warp / the chain is otherwise identity-like).
+        static_cands = (
+            [static_composed]
+            if static_composed is not None
+            else [x for x in (reduced or []) if isinstance(x, NonlinearWarp)]
+        )
+        for cand in static_cands:
+            jm, single, _ = compute_pe_jacobian(cand, jac_axis)
+            if single:
+                _static_jac = jm
+                break
+    if jac_axis is not None and slice_times_t is not None and _static_jac is None:
+        raise ValueError(
+            "-jac with -tpattern needs a static distortion warp confined to the "
+            "phase-encode axis; none found (a purely time-varying field, or an "
+            "axis-mixed chain) -- apply distortion correction as its own step"
+        )
+
+    def _apply_jac(vol: Tensor, composed: NonlinearWarp | None) -> Tensor:
+        if jac_axis is None:
+            return vol
+        if _static_jac is not None:
+            return vol * _static_jac
+        # Dynamic (time-varying warp, no slice timing): per-frame Jacobian from composed.
+        assert composed is not None
+        jac, single_axis, ratio = compute_pe_jacobian(composed, jac_axis)
+        if not single_axis:
+            if not _jac_warned[0]:
+                print(
+                    f"nwarpforge: -jac skipped -- composed warp is not confined to the "
+                    f"phase-encode axis (off/on={ratio:.3f}); only pure phase-encode "
+                    f"distortion warps are Jacobian-modulated"
+                )
+                _jac_warned[0] = True
+            return vol
+        return vol * jac
+
     time_iter = tqdm(
         range(t_start, t_end) if not affine_only else range(0),
         desc="Warping volumes",
@@ -1997,10 +2228,10 @@ def nwarpforge(
             sampled = follow_sampler.sample(t)
             if st_recombine is not None:
                 mag_vol, phase_vol = st_recombine(sampled)
-                output_volumes.append(_stash(mag_vol))
+                output_volumes.append(_stash(_apply_jac(mag_vol, None)))
                 phase_volumes.append(_stash(phase_vol))
             else:
-                output_volumes.append(_stash(sampled))
+                output_volumes.append(_stash(_apply_jac(sampled, None)))
             continue
 
         composed = (
@@ -2040,10 +2271,10 @@ def nwarpforge(
             )
             if st_recombine is not None:
                 mag_vol, phase_vol = st_recombine(warped)
-                output_volumes.append(_stash(mag_vol))
+                output_volumes.append(_stash(_apply_jac(mag_vol, composed)))
                 phase_volumes.append(_stash(phase_vol))
             else:
-                output_volumes.append(_stash(warped))
+                output_volumes.append(_stash(_apply_jac(warped, composed)))
             continue
 
         src_vol = source[t] if is_4d else source
@@ -2176,7 +2407,7 @@ def nwarpforge(
                 interp=interp,
                 no_neg=no_neg,
             )
-        output_volumes.append(_stash(warped))
+        output_volumes.append(_stash(_apply_jac(warped, composed)))
 
     if is_4d or len(output_volumes) > 1:
         output = torch.stack(output_volumes)
