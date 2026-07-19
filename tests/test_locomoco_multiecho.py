@@ -11,6 +11,8 @@ import numpy as np
 import torch
 
 from fastfuncstuff.processing.locomoco import (
+    _fourier_shifter,
+    _shift1d_windowed_sinc,
     _shift3d_axis,
     estimate_residual_flow_me_interecho,
     estimate_residual_flow_me_scaled,
@@ -127,6 +129,122 @@ def test_fixed_scaling_uses_te_ratio():
     after = float(res.per_echo[1].corrected_series().numpy()[brain].std(axis=-1).mean())
     before = float(np.asarray(datas[1])[brain].std(axis=-1).mean())
     assert after < 0.6 * before
+
+
+def test_want_corrected_false_skips_corrected_but_keeps_warp():
+    """-no_corrected passes want_corrected=False: the warp/alpha are still produced but the
+    corrected 4-D series is NOT materialized (pure waste when it won't be written). Refine,
+    which builds corrected internally, must still work under the flag."""
+    tes = [15.0, 45.0]
+    shifts = [0.0, 0.6, -0.5, 0.4]
+    datas, _ = _make_multiecho(tes, shifts)
+    common = dict(
+        pe_axis=PE,
+        slice_axis=PE,
+        learn_scaling=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+    on = estimate_residual_flow_multiecho(datas, tes, want_corrected=True, **common)
+    off = estimate_residual_flow_multiecho(datas, tes, want_corrected=False, **common)
+
+    # The estimate itself is identical — only the corrected output differs.
+    assert np.allclose(on.w_field.numpy(), off.w_field.numpy(), atol=1e-6)
+    assert np.allclose(on.alpha.numpy(), off.alpha.numpy(), atol=1e-6)
+    for res in on.per_echo:
+        assert res.corrected_nifti is not None
+    for res in off.per_echo:
+        assert res.corrected_nifti is None
+
+    # Refine still converges with the flag off (it builds its own corrected internally).
+    ref = estimate_residual_flow_multiecho(
+        datas, tes, want_corrected=False, refine_rounds=2, **common
+    )
+    assert ref.per_echo[0].corrected_nifti is None
+    assert float(np.abs(ref.w_field.numpy()).max()) > 0
+
+
+def test_windowed_sinc_dc_scalar_field_and_integer_shift():
+    """Resampler invariants: a flat volume keeps its intensity (DC-normalised weights, no
+    brightness ripple), a scalar shift equals a constant-field shift, and an integer shift
+    is an exact border-clamped roll (only the j=0 tap survives)."""
+    # DC: warping a flat region by a sub-voxel amount must not modulate intensity.
+    flat = torch.full((1, 12, 12, 12), 3.0)
+    out = _shift1d_windowed_sinc(flat, 0.37, axis=PE, radius=5)
+    assert torch.allclose(out, torch.full_like(out, 3.0), atol=1e-4)
+
+    # Scalar shift == uniform-field shift of the same value.
+    base = torch.from_numpy(_phantom())[None]
+    field = torch.full_like(base, 0.3)
+    assert torch.allclose(
+        _shift1d_windowed_sinc(base, 0.3, PE, radius=3),
+        _shift1d_windowed_sinc(base, field, PE, radius=3),
+        atol=1e-6,
+    )
+
+    # Integer shift = exact roll with border clamp (sinc(integer)=0 except at 0).
+    n = base.shape[PE + 1]
+    rolled = _shift1d_windowed_sinc(base, 1.0, PE, radius=4)
+    ref = base.index_select(PE + 1, torch.arange(1, n + 1).clamp(max=n - 1))
+    assert torch.allclose(rolled, ref, atol=1e-5)
+
+
+def test_windowed_sinc_beats_trilinear_on_subvoxel():
+    """Against a sinc-exact (Fourier) sub-voxel shift of a smooth phantom, the Lanczos
+    resampler tracks the truth markedly better than trilinear — the fidelity that keeps
+    sub-voxel signal in the corrected output instead of blurring it away."""
+    base = torch.from_numpy(_phantom(nx=32, ny=32, nz=32))[None]
+    s = 0.3
+    gt = _fourier_shifter(base, PE, pad=8)(s)  # sinc-exact reference shift
+    lan = _shift1d_windowed_sinc(base, s, PE, radius=5)
+    lin = _shift3d_axis(base, s, PE, mode="bilinear")
+    # Compare on the interior (border handling differs between samplers).
+    sl = (slice(None), slice(4, -4), slice(4, -4), slice(4, -4))
+    err_lan = float((lan[sl] - gt[sl]).abs().mean())
+    err_lin = float((lin[sl] - gt[sl]).abs().mean())
+    assert err_lan < 0.6 * err_lin, (err_lan, err_lin)
+
+
+def test_lanczos_correction_preserves_signal_better():
+    """The payoff of the resampler is the CORRECTED output, not the estimate: correcting a
+    distorted volume (undo a known sub-voxel shift) with Lanczos leaves less residual against
+    the true undistorted signal than trilinear — i.e. it doesn't blur the data it realigns."""
+    base = torch.from_numpy(_phantom(nx=32, ny=32, nz=32))[None]
+    s = 0.3
+    distorted = _fourier_shifter(base, PE, pad=8)(s)  # a faithful sub-voxel distortion
+    corr_lan = _shift3d_axis(distorted, -s, PE, mode="lanczos", radius=5)
+    corr_lin = _shift3d_axis(distorted, -s, PE, mode="bilinear")
+    sl = (slice(None), slice(4, -4), slice(4, -4), slice(4, -4))
+    err_lan = float((corr_lan[sl] - base[sl]).abs().mean())
+    err_lin = float((corr_lin[sl] - base[sl]).abs().mean())
+    assert err_lan < 0.6 * err_lin, (err_lan, err_lin)
+
+
+def test_lanczos_flow_matches_bilinear_estimate_and_runs():
+    """The Lanczos warp is a drop-in through the flow estimator: it produces a comparable
+    shared field (the estimate is set by the pooling window, not the interpolator) — this
+    guards the plumbing, not a magnitude claim."""
+    tes = [12.0, 30.0, 48.0]
+    shifts = [0.0, 0.18, -0.14, 0.2, -0.12, 0.16]
+    datas, _ = _make_multiecho(tes, shifts)
+    common = dict(
+        pe_axis=PE,
+        slice_axis=PE,
+        learn_scaling=False,
+        n_levels=3,
+        n_iters=8,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    r_lin = estimate_residual_flow_multiecho(datas, tes, warp_interp="bilinear", **common)
+    r_lan = estimate_residual_flow_multiecho(
+        datas, tes, warp_interp="lanczos", warp_radius=3, **common
+    )
+    core = datas[0][..., 1] > np.percentile(datas[0][..., 1], 60)
+    mag_lin = float(np.abs(r_lin.w_field.numpy()[core]).mean())
+    mag_lan = float(np.abs(r_lan.w_field.numpy()[core]).mean())
+    assert abs(mag_lan - mag_lin) < 0.15 * max(mag_lin, 1e-6)  # same ballpark, plumbing works
 
 
 def test_pooled_xcorr_kernel_recovers_shared_shift():

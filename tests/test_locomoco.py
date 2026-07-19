@@ -11,12 +11,38 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from fastfuncstuff.processing import locomoco as _lm
 from fastfuncstuff.processing.locomoco import (
     estimate_residual_flow,
     optical_flow_lk_2d,
     phase_correlation_flow_2d,
     resolve_pe_axis,
 )
+
+
+def test_gaussian_kernel_cache_hits_and_matches_fresh():
+    """The blur kernel is cached per (sigma, device, dtype); the searchlight calls it
+    tens of thousands of times, so a miss on every call was measurable. Verify a repeat
+    call returns the *same* tensor (cache hit) and equals a freshly computed kernel."""
+    _lm._KERNEL_CACHE.clear()
+    dev, dt = torch.device("cpu"), torch.float32
+    k1 = _lm._gaussian_kernel1d(2.0, dev, dt)
+    k2 = _lm._gaussian_kernel1d(2.0, dev, dt)
+    assert k1 is k2  # cache hit, not recomputed
+    assert len(_lm._KERNEL_CACHE) == 1
+
+    # Correctness: matches a reference Gaussian, is normalized, and distinct sigmas/dtypes
+    # get their own entries rather than colliding.
+    radius = int(np.ceil(3.0 * 2.0))
+    x = np.arange(-radius, radius + 1)
+    ref = np.exp(-0.5 * (x / 2.0) ** 2)
+    ref = ref / ref.sum()
+    assert np.allclose(k1.numpy(), ref, atol=1e-6)
+    assert k1.sum().item() == pytest.approx(1.0, abs=1e-6)
+
+    _lm._gaussian_kernel1d(3.0, dev, dt)
+    _lm._gaussian_kernel1d(2.0, dev, torch.float64)
+    assert len(_lm._KERNEL_CACHE) == 3
 
 
 def _phantom(nx=48, ny=48, nz=5):
@@ -61,7 +87,9 @@ def test_validation_rejects_bad_geometry_and_knobs(known_shift_series):
     with pytest.raises(ValueError, match="must be 0, 1 or 2"):
         estimate_residual_flow(data, pe_axis=3, slice_axis=2, device=dev, verbose=False)
     with pytest.raises(ValueError, match="max_shift"):
-        estimate_residual_flow(data, pe_axis=1, slice_axis=2, max_shift=0, device=dev, verbose=False)
+        estimate_residual_flow(
+            data, pe_axis=1, slice_axis=2, max_shift=0, device=dev, verbose=False
+        )
     with pytest.raises(ValueError, match="xcorr_step"):
         estimate_residual_flow(
             data, pe_axis=1, slice_axis=2, trial_step=0, device=dev, verbose=False
@@ -74,8 +102,15 @@ def test_2d_xcorr_emits_confidence_and_curve(known_shift_series):
     a (nx,ny,nz,nd) correlation landscape whose 4th axis is the trial offsets."""
     data, shifts = known_shift_series
     r = estimate_residual_flow(
-        data, pe_axis=1, slice_axis=2, backend="xcorr", max_shift=3, trial_step=0.5,
-        save_corr_curve=2, device=torch.device("cpu"), verbose=False,
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        backend="xcorr",
+        max_shift=3,
+        trial_step=0.5,
+        save_corr_curve=2,
+        device=torch.device("cpu"),
+        verbose=False,
     )
     assert r.confidence is not None and r.confidence.shape == data.shape
     assert float(r.confidence.min()) >= 0.0
@@ -116,6 +151,41 @@ def test_recovers_per_frame_pe_shift(known_shift_series):
     # Pull displacement recovers -shift (to resample moving back onto the reference).
     assert np.corrcoef(est, -shifts)[0, 1] > 0.99
     assert np.abs(est + shifts).max() < 0.3
+
+
+def test_single_echo_lanczos_correction_2d_slicewise(known_shift_series):
+    """Single-echo, single-PE (2-D slicewise) correction is a 1-D shift along one axis, so
+    lanczos routes through the windowed-sinc gather (not grid_sample). It must recover the
+    same PE shift as bilinear (the estimate is interpolator-independent) and produce a
+    genuinely different — sharper — corrected series."""
+    data, shifts = known_shift_series
+    common = dict(pe_axis=1, slice_axis=2, ref_mode="first", n_iters=6,
+                  device=torch.device("cpu"), verbose=False)
+    r_lin = estimate_residual_flow(data, warp_interp="bilinear", **common)
+    r_lan = estimate_residual_flow(data, warp_interp="lanczos", warp_radius=5, **common)
+    # Estimate matches (recovers -shift either way).
+    for res in (r_lin, r_lan):
+        est = np.median(res.pe_displacement().numpy().reshape(-1, len(shifts)), axis=0)
+        assert np.corrcoef(est, -shifts)[0, 1] > 0.99
+    # The corrected outputs differ (lanczos actually resampled differently, not a no-op).
+    c_lin = r_lin.corrected_series().numpy()
+    c_lan = r_lan.corrected_series().numpy()
+    assert not np.allclose(c_lin, c_lan, atol=1e-4)
+
+
+def test_lanczos_generalizes_to_slice_stack_rank3():
+    """The resampler is rank-generic (batch dim 0): a (B,H,W) slice stack shifts along its
+    W axis exactly like the 4-D path, so the 2-D correction can reuse it."""
+    from fastfuncstuff.processing.locomoco import _shift1d_windowed_sinc
+
+    stack = torch.rand(3, 20, 20)  # (B, H, W)
+    # Shift along W (spatial axis 1 → tensor dim 2); DC stays flat, integer shift = roll.
+    flat = torch.full((2, 8, 8), 4.0)
+    assert torch.allclose(_shift1d_windowed_sinc(flat, 0.4, axis=1, radius=4), flat, atol=1e-4)
+    n = stack.shape[2]
+    rolled = _shift1d_windowed_sinc(stack, 1.0, axis=1, radius=3)
+    ref = stack.index_select(2, torch.arange(1, n + 1).clamp(max=n - 1))
+    assert torch.allclose(rolled, ref, atol=1e-5)
 
 
 @pytest.mark.parametrize("backend", ["phase", "xcorr"])
@@ -696,8 +766,14 @@ def test_fourier_shift_removes_fractional_correlation_bias():
             mv = torch.from_numpy((smooth + 0.6 * rng.standard_normal((1, 12, 12, Z))).astype("f4"))
             curve: list[torch.Tensor] = []
             xcorr_search_flow_3d(
-                fx, mv, pe_axis=2, max_shift=3, trial_step=0.5, reg_sigma=0.0,
-                fourier_shift=fourier, curve_out=curve,
+                fx,
+                mv,
+                pe_axis=2,
+                max_shift=3,
+                trial_step=0.5,
+                reg_sigma=0.0,
+                fourier_shift=fourier,
+                curve_out=curve,
             )
             acc += np.array([float(c[0, :, :, 12:36].mean()) for c in curve])
         return acc / 12

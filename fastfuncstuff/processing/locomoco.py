@@ -56,11 +56,22 @@ PE_DIR_TO_AXIS: dict[str, int] = {
 
 
 # ── low-level optical-flow primitives (batched, GPU) ──────────────────────────
+# The searchlight blurs tens of thousands of times per run, always with the same
+# handful of (sigma, device, dtype) triples — recomputing the kernel each call was a
+# measurable chunk of the solve. Cache the read-only kernel; callers never mutate it.
+_KERNEL_CACHE: dict[tuple[float, torch.device, torch.dtype], torch.Tensor] = {}
+
+
 def _gaussian_kernel1d(sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    radius = max(1, int(np.ceil(3.0 * sigma)))
-    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    k = torch.exp(-0.5 * (x / sigma) ** 2)
-    return k / k.sum()
+    key = (sigma, device, dtype)
+    k = _KERNEL_CACHE.get(key)
+    if k is None:
+        radius = max(1, int(np.ceil(3.0 * sigma)))
+        x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        k = torch.exp(-0.5 * (x / sigma) ** 2)
+        k = k / k.sum()
+        _KERNEL_CACHE[key] = k
+    return k
 
 
 def _blur2d(img: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -108,8 +119,13 @@ def _warp2d(
     ``mode`` is the grid_sample interpolator (``bilinear`` or ``bicubic``). Bilinear
     damps a fractionally-shifted image, which biases the fixed point the estimation
     iterations converge to; ``bicubic`` resamples faithfully so they land on the true
-    displacement — the accuracy win is largest on smooth data.
+    displacement — the accuracy win is largest on smooth data. ``lanczos`` is a 1-D
+    (single-axis) resampler with no 2-D grid_sample equivalent, and the estimate is set by
+    the pooling window anyway, so a 2-D estimation warp falls back to bilinear; the 1-D PE
+    correction takes the true lanczos path in :func:`_correct_pe`.
     """
+    if mode == "lanczos":
+        mode = "bilinear"
     _, h, w = img.shape
     ys, xs = torch.meshgrid(
         torch.arange(h, device=img.device, dtype=img.dtype),
@@ -362,7 +378,14 @@ def _first_peak_field_and_conf(
 
 
 def _sweep_first_peak(
-    ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac, blur, curve_out,
+    ncc,
+    r,
+    trial_step,
+    noshift_margin,
+    reg_sigma,
+    ambiguity_frac,
+    blur,
+    curve_out,
     min_rising_frac: float = 0.001,
     min_steps: int = 5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -517,9 +540,20 @@ def _xcorr_shift_1d(
         prev1 = corr
 
     field, conf = _searchlight_field_and_conf(
-        best_i, best_val, zero_val, ym2, ym1, y0, yp1, yp2,
-        nd=nd, r=r, trial_step=trial_step, noshift_margin=noshift_margin,
-        reg_sigma=reg_sigma, blur=lambda x: _blur2d(x, reg_sigma),
+        best_i,
+        best_val,
+        zero_val,
+        ym2,
+        ym1,
+        y0,
+        yp1,
+        yp2,
+        nd=nd,
+        r=r,
+        trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
+        blur=lambda x: _blur2d(x, reg_sigma),
     )
     return field, conf
 
@@ -556,8 +590,17 @@ def xcorr_search_flow_2d(
     """
     if not dual:
         s, conf = _xcorr_shift_1d(
-            fixed, moving, pe_is_u, max_shift, window_sigma, trial_step, interp, eps,
-            noshift_margin, reg_sigma, curve_out=curve_out,
+            fixed,
+            moving,
+            pe_is_u,
+            max_shift,
+            window_sigma,
+            trial_step,
+            interp,
+            eps,
+            noshift_margin,
+            reg_sigma,
+            curve_out=curve_out,
         )
         if conf_out is not None:
             conf_out.append(conf)
@@ -569,14 +612,30 @@ def xcorr_search_flow_2d(
     for _ in range(n_passes):
         mw = _warp2d(moving, u, v, warp_interp)
         du, _ = _xcorr_shift_1d(
-            fixed, mw, True, max_shift, window_sigma, trial_step, interp, eps,
-            noshift_margin, reg_sigma,
+            fixed,
+            mw,
+            True,
+            max_shift,
+            window_sigma,
+            trial_step,
+            interp,
+            eps,
+            noshift_margin,
+            reg_sigma,
         )
         u = u + du
         mw = _warp2d(moving, u, v, warp_interp)
         dv, _ = _xcorr_shift_1d(
-            fixed, mw, False, max_shift, window_sigma, trial_step, interp, eps,
-            noshift_margin, reg_sigma,
+            fixed,
+            mw,
+            False,
+            max_shift,
+            window_sigma,
+            trial_step,
+            interp,
+            eps,
+            noshift_margin,
+            reg_sigma,
         )
         v = v + dv
     return u, v
@@ -1039,11 +1098,18 @@ def _correct_pe(
     pe_flow_is_u: bool,
     dual: bool = False,
     warp_interp: str = "bilinear",
+    warp_radius: int = 3,
 ) -> torch.Tensor:
-    """Warp ``moving_raw`` by the estimated displacement (the warp we save).
+    """Warp ``moving_raw`` ``(nt, H, W)`` by the estimated displacement (the warp we save).
 
     Single-PE keeps only the PE-axis component; ``dual`` (two PE axes) uses both.
+    A single-PE correction is a 1-D shift along one in-plane axis, so ``lanczos`` routes it
+    through the windowed-sinc gather along that axis; ``dual`` is a genuine 2-D warp and stays
+    on ``_warp2d`` (grid_sample has no lanczos — the CLI blocks ``lanczos`` for dual).
     """
+    if warp_interp == "lanczos" and not dual:
+        pe_shift, ax = (u, 1) if pe_flow_is_u else (v, 0)  # u→W (axis 1), v→H (axis 0)
+        return _shift1d_windowed_sinc(moving_raw, pe_shift, ax, radius=warp_radius)
     if dual:
         return _warp2d(moving_raw, u, v, warp_interp)
     uc = u if pe_flow_is_u else torch.zeros_like(u)
@@ -1060,6 +1126,7 @@ def _estimate_static(
     device,
     dual=False,
     warp_interp="bilinear",
+    warp_radius=3,
     ref_override=None,
     first_n=None,
     diag=None,
@@ -1110,7 +1177,9 @@ def _estimate_static(
         conf_acc: list[torch.Tensor] | None = [] if diag is not None else None
         curve_acc: list[torch.Tensor] | None = [] if curve_frame is not None else None
         u, v = flow_fn(fixed, moving, conf_out=conf_acc, curve_out=curve_acc)
-        corrected[:, s] = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp).cpu()
+        corrected[:, s] = _correct_pe(
+            moving_raw, u, v, pe_flow_is_u, dual, warp_interp, warp_radius
+        ).cpu()
         u_all[:, s] = u.cpu()
         v_all[:, s] = v.cpu()
         if conf_all is not None and conf_acc:  # xcorr populated it (flow/phase leave it empty)
@@ -1121,13 +1190,23 @@ def _estimate_static(
                 curve_all = torch.zeros(stack.shape[0], ns, hh, ww)
             curve_all[:, s] = stack
     if diag is not None:
-        diag["conf"] = conf_all if (conf_all is not None and float(conf_all.abs().sum()) > 0) else None
+        diag["conf"] = (
+            conf_all if (conf_all is not None and float(conf_all.abs().sum()) > 0) else None
+        )
         diag["curve"] = curve_all
     return u_all, v_all, corrected
 
 
 def _estimate_cumulative(
-    vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual=False, warp_interp="bilinear"
+    vol,
+    ref_mode,
+    pe_flow_is_u,
+    smooth_sigma,
+    flow_fn,
+    device,
+    dual=False,
+    warp_interp="bilinear",
+    warp_radius=3,
 ):
     """Progressive reference: frame t registers to the running mean/median of the
     already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
@@ -1157,7 +1236,7 @@ def _estimate_cumulative(
         fixed = _blur2d(ref, smooth_sigma) if smooth_sigma > 0 else ref
         moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
         u, v = flow_fn(fixed, moving)
-        corr = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp)
+        corr = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp, warp_radius)
         corrected[t] = corr.cpu()
         u_all[t] = u.cpu()
         v_all[t] = v.cpu()
@@ -1260,6 +1339,7 @@ def estimate_residual_flow(
     patch: int = 16,
     stride: int = 8,
     warp_interp: str = "bilinear",
+    warp_radius: int = 3,
     refine_rounds: int = 0,
     converge: float = 0.0,
     converge_rel: float = 0.0,
@@ -1331,8 +1411,14 @@ def estimate_residual_flow(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _validate_estimation_inputs(
-        data.shape, pe_axis, slice_axis, is_3dacq=is_3dacq, max_shift=max_shift,
-        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+        data.shape,
+        pe_axis,
+        slice_axis,
+        is_3dacq=is_3dacq,
+        max_shift=max_shift,
+        trial_step=trial_step,
+        window_sigma=window_sigma,
+        verbose=verbose,
     )
 
     if is_3dacq:
@@ -1362,6 +1448,8 @@ def estimate_residual_flow(
             peak_mode=peak_mode,
             search_min_steps=search_min_steps,
             save_corr_curve=save_corr_curve,
+            warp_interp=warp_interp,
+            warp_radius=warp_radius,
             device=device,
             verbose=verbose,
         )
@@ -1375,7 +1463,9 @@ def estimate_residual_flow(
     vol = torch.from_numpy(np.ascontiguousarray(data)).permute(perm).contiguous()
     nt, ns = vol.shape[0], vol.shape[1]
     if verbose:
-        print(f"🌀 locomoco {_geometry_report(orig_shape, pe_axis, slice_axis, is_3dacq=False, dual=dual)}")
+        print(
+            f"🌀 locomoco {_geometry_report(orig_shape, pe_axis, slice_axis, is_3dacq=False, dual=dual)}"
+        )
 
     flow_fn = _build_flow_fn(
         backend,
@@ -1404,7 +1494,15 @@ def estimate_residual_flow(
     progressive = ref_mode in ("first_mean", "first_median")
     if progressive:
         u_all, v_all, corrected = _estimate_cumulative(
-            vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual, warp_interp
+            vol,
+            ref_mode,
+            pe_flow_is_u,
+            smooth_sigma,
+            flow_fn,
+            device,
+            dual,
+            warp_interp,
+            warp_radius,
         )
     else:
         u_all, v_all, corrected = _estimate_static(
@@ -1416,6 +1514,7 @@ def estimate_residual_flow(
             device,
             dual,
             warp_interp,
+            warp_radius,
             first_n=first_n,
             diag=diag,
         )
@@ -1428,8 +1527,17 @@ def estimate_residual_flow(
 
         def _est_2d(new_ref):
             u, v, corr = _estimate_static(
-                vol, ref_mode, pe_flow_is_u, smooth_sigma, flow_fn, device, dual,
-                warp_interp, ref_override=new_ref, diag=diag,
+                vol,
+                ref_mode,
+                pe_flow_is_u,
+                smooth_sigma,
+                flow_fn,
+                device,
+                dual,
+                warp_interp,
+                warp_radius,
+                ref_override=new_ref,
+                diag=diag,
             )
             return torch.stack([u, v]), corr
 
@@ -1468,6 +1576,7 @@ def estimate_residual_flow(
                 pe_flow_is_u,
                 dual,
                 warp_interp,
+                warp_radius,
             ).cpu()
 
     if jacobian:
@@ -1729,8 +1838,14 @@ def estimate_residual_flow_rotaware(
 
     nx, ny, nz, nt = raw_data.shape
     _validate_estimation_inputs(
-        raw_data.shape, pe_axis, slice_axis, is_3dacq=is_3dacq, max_shift=max_shift,
-        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+        raw_data.shape,
+        pe_axis,
+        slice_axis,
+        is_3dacq=is_3dacq,
+        max_shift=max_shift,
+        trial_step=trial_step,
+        window_sigma=window_sigma,
+        verbose=verbose,
     )
     in_plane = sorted(a for a in (0, 1, 2) if a != slice_axis)
     a0, a1 = in_plane
@@ -1957,7 +2072,49 @@ def _grad_axis_3d(vol: torch.Tensor, axis: int) -> torch.Tensor:
     return d
 
 
-def _shift3d_axis(vol: torch.Tensor, shift, axis: int, mode: str = "bilinear") -> torch.Tensor:
+def _shift1d_windowed_sinc(vol: torch.Tensor, shift, axis: int, radius: int = 3) -> torch.Tensor:
+    """Resample a batched volume (``(B,X,Y,Z)``) or slice stack (``(B,H,W)``) along ``axis``
+    ONLY — ``axis`` is the 0-based spatial axis, batch is dim 0 — by a scalar or per-voxel
+    ``shift`` with a Lanczos (windowed-sinc) kernel of half-width ``radius``: the high-fidelity
+    resampler for sub-voxel PE-axis warps (single-PE correction is a 1-D shift along one axis).
+
+    A pure axis shift is 1-D interpolation, so a windowed sinc along that ONE axis reaches
+    wsinc/heptic-grade fidelity at ``2*radius`` taps — cheap next to a 3-D tensor-product sinc,
+    and sinc-exact for a uniform shift as ``radius→∞``. Trilinear resampling low-pass-filters
+    as it warps, blurring sub-voxel structure out of the CORRECTED output (and the refine
+    template built from it); a windowed sinc preserves it. The correction and template are
+    where this bites — the LK estimate itself is dominated by the pooling window, not the
+    interpolator, so this is an output-FIDELITY tool, not a shift-accuracy one. The Lanczos
+    window tames the Gibbs ringing / noise amplification a raw truncated sinc would add on
+    thermal-noise data. Weights are DC-normalised so a flat region keeps its intensity (no
+    brightness ripple). Sign matches :func:`_shift3d_axis` (a pull by ``s``: ``out[i] ≈
+    vol[i + s]``); taps are border-clamped like its ``padding_mode="border"``.
+    """
+    dim = axis + 1  # batch is dim 0; spatial ``axis`` (0-based) → tensor dim. Any rank ≥ 2.
+    n = vol.shape[dim]
+    ishape = [1] * vol.ndim
+    ishape[dim] = n
+    idx = torch.arange(n, device=vol.device, dtype=vol.dtype).reshape(ishape)
+    coord = (idx + shift).expand(vol.shape)  # scalar or (B,X,Y,Z) field → full grid
+    base = torch.floor(coord)
+    frac = coord - base
+    base = base.to(torch.long)
+    a = float(radius)
+    num = torch.zeros_like(vol)
+    den = torch.zeros_like(vol)
+    # 2·radius taps span the Lanczos support [coord-a, coord+a]; the window is zero at ±a.
+    for j in range(-(radius - 1), radius + 1):
+        tap = (base + j).clamp_(0, n - 1)
+        x = frac - j
+        w = torch.sinc(x) * torch.sinc(x / a)  # Lanczos = sinc(x)·sinc(x/a)
+        num = num + w * vol.gather(dim, tap)
+        den = den + w
+    return num / den
+
+
+def _shift3d_axis(
+    vol: torch.Tensor, shift, axis: int, mode: str = "bilinear", radius: int = 3
+) -> torch.Tensor:
     """Sample ``(B,X,Y,Z)`` at ``coord + shift`` along ``axis`` ONLY (PE pull warp).
 
     ``shift`` is a scalar or a ``(B,X,Y,Z)`` field. grid_sample's 3-D mode is trilinear
@@ -1969,6 +2126,9 @@ def _shift3d_axis(vol: torch.Tensor, shift, axis: int, mode: str = "bilinear") -
     ``nd`` scalar shifts per frame, so this is the hot per-offset op. Border-clamp + linear
     weight reproduce ``grid_sample(padding_mode="border", align_corners=True)`` bit-for-bit.
     """
+    if mode == "lanczos":
+        return _shift1d_windowed_sinc(vol, shift, axis, radius)
+
     if isinstance(shift, (int, float)) and mode != "nearest":
         import math
 
@@ -2052,12 +2212,18 @@ def optical_flow_lk_3d(
     n_iters: int = 4,
     window_sigma: float = 2.0,
     reg: float = 1e-3,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
 ) -> torch.Tensor:
     """1-DOF (PE-axis) pyramidal Lucas-Kanade on 3-D volumes ``(B, X, Y, Z)``.
 
     The 3-D analogue of :func:`optical_flow_lk_2d` with ``pe_only``: only the PE-axis
     gradient enters, the pooling window is a 3-D Gaussian, and warping/pyramids are
-    volumetric. Returns the PE-axis pull displacement ``(B, X, Y, Z)``.
+    volumetric. ``warp_interp="lanczos"`` (half-width ``warp_radius``) resamples the
+    iteration warp with a windowed sinc instead of trilinear — higher fidelity, though the
+    estimate is set mostly by the pooling window (the interpolator matters far more for the
+    correction/template than for the shift itself). Returns the PE-axis pull displacement
+    ``(B, X, Y, Z)``.
     """
     fpyr, mpyr = [fixed], [moving]
     for _ in range(n_levels - 1):
@@ -2081,7 +2247,7 @@ def optical_flow_lk_3d(
                 * scale
             )
         for _ in range(n_iters):
-            mw = _shift3d_axis(mv, disp, pe_axis)
+            mw = _shift3d_axis(mv, disp, pe_axis, mode=warp_interp, radius=warp_radius)
             it = mw - fx
             ip = _grad_axis_3d(mw, pe_axis)
             step = -_blur3d_b(ip * it, window_sigma) / (_blur3d_b(ip * ip, window_sigma) + reg)
@@ -2152,8 +2318,15 @@ def xcorr_search_flow_3d(
 
     if peak_mode == "first_peak":
         return _sweep_first_peak(
-            _ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac,
-            lambda x: _blur3d_b(x, reg_sigma), curve_out, min_steps=search_min_steps,
+            _ncc,
+            r,
+            trial_step,
+            noshift_margin,
+            reg_sigma,
+            ambiguity_frac,
+            lambda x: _blur3d_b(x, reg_sigma),
+            curve_out,
+            min_steps=search_min_steps,
         )
 
     offsets = torch.arange(-r, r + 1e-6, trial_step, device=fixed.device, dtype=fixed.dtype)
@@ -2187,9 +2360,20 @@ def xcorr_search_flow_3d(
         prev1 = corr
 
     return _searchlight_field_and_conf(
-        best_i, best_val, zero_val, ym2, ym1, y0, yp1, yp2,
-        nd=nd, r=r, trial_step=trial_step, noshift_margin=noshift_margin,
-        reg_sigma=reg_sigma, blur=lambda x: _blur3d_b(x, reg_sigma),
+        best_i,
+        best_val,
+        zero_val,
+        ym2,
+        ym1,
+        y0,
+        yp1,
+        yp2,
+        nd=nd,
+        r=r,
+        trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
+        blur=lambda x: _blur3d_b(x, reg_sigma),
     )
 
 
@@ -2404,6 +2588,8 @@ def _run_3dacq_plain(
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
 ) -> LocomocoResult:
     """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
     nx, ny, nz, nt = data.shape
@@ -2448,12 +2634,16 @@ def _run_3dacq_plain(
             conf_acc: list[torch.Tensor] | None = [] if xc else None
             curve_acc: list[torch.Tensor] | None = [] if (xc and t == curve_frame) else None
             d = flow3d(fxb[None], mvb[None], conf_out=conf_acc, curve_out=curve_acc)[0]
-            corrected[..., t] = _shift3d_axis(mv[None], d[None], pe_axis)[0].cpu()
+            corrected[..., t] = _shift3d_axis(
+                mv[None], d[None], pe_axis, mode=warp_interp, radius=warp_radius
+            )[0].cpu()
             disp[..., t] = d.cpu()
             if conf_field is not None and conf_acc:
                 conf_field[..., t] = conf_acc[0][0].cpu()
             if curve_acc is not None:
-                curve_box["curve"] = torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
+                curve_box["curve"] = (
+                    torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
+                )
                 rr = float(max(1, int(np.ceil(max_shift))))
                 curve_box["offsets"] = torch.arange(-rr, rr + 1e-6, trial_step)
         return disp, corrected
@@ -2483,7 +2673,11 @@ def _run_3dacq_plain(
         disp = disp * soft_xyz[..., None]
         for t in range(nt):
             corrected[..., t] = _shift3d_axis(
-                vol4d[..., t].to(device)[None], disp[..., t].to(device)[None], pe_axis
+                vol4d[..., t].to(device)[None],
+                disp[..., t].to(device)[None],
+                pe_axis,
+                mode=warp_interp,
+                radius=warp_radius,
             )[0].cpu()
 
     p_canon = disp.permute(perm4).contiguous()
@@ -2552,6 +2746,8 @@ def optical_flow_lk_3d_multiecho(
     n_iters: int = 4,
     window_sigma: float = 2.0,
     reg: float = 1e-3,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
 ) -> torch.Tensor:
     """Shared-field 1-DOF (PE-axis) pyramidal LK across echoes ``(B,X,Y,Z)``.
 
@@ -2592,7 +2788,9 @@ def optical_flow_lk_3d_multiecho(
             den = torch.zeros_like(disp)
             for j in range(e):
                 a = float(alpha[j])
-                mw = _shift3d_axis(mpyr[j][lvl], a * disp, pe_axis)
+                mw = _shift3d_axis(
+                    mpyr[j][lvl], a * disp, pe_axis, mode=warp_interp, radius=warp_radius
+                )
                 it = mw - fpyr[j][lvl]
                 ip = _grad_axis_3d(mw, pe_axis)
                 num = num + a * _blur3d_b(ip * it, window_sigma)
@@ -2678,8 +2876,15 @@ def xcorr_search_flow_3d_multiecho(
 
     if peak_mode == "first_peak":
         s_field, conf = _sweep_first_peak(
-            _pooled_ncc, r, trial_step, noshift_margin, reg_sigma, ambiguity_frac,
-            lambda x: _blur3d_b(x, reg_sigma), curve_out, min_steps=search_min_steps,
+            _pooled_ncc,
+            r,
+            trial_step,
+            noshift_margin,
+            reg_sigma,
+            ambiguity_frac,
+            lambda x: _blur3d_b(x, reg_sigma),
+            curve_out,
+            min_steps=search_min_steps,
         )
         return s_field / float(alpha[m]), conf  # echo-1 scale (alpha_1 = 1)
 
@@ -2718,9 +2923,20 @@ def xcorr_search_flow_3d_multiecho(
     # The shared search variable is echo m's shift; regularise/guard it, then rescale
     # to echo-1 units. conf is the pooled (SNR-weighted) searchlight quality map.
     s_field, conf = _searchlight_field_and_conf(
-        best_i, best_val, zero_val, ym2, ym1, y0, yp1, yp2,
-        nd=nd, r=r, trial_step=trial_step, noshift_margin=noshift_margin,
-        reg_sigma=reg_sigma, blur=lambda x: _blur3d_b(x, reg_sigma),
+        best_i,
+        best_val,
+        zero_val,
+        ym2,
+        ym1,
+        y0,
+        yp1,
+        yp2,
+        nd=nd,
+        r=r,
+        trial_step=trial_step,
+        noshift_margin=noshift_margin,
+        reg_sigma=reg_sigma,
+        blur=lambda x: _blur3d_b(x, reg_sigma),
     )
     return s_field / float(alpha[m]), conf  # echo-1 scale (alpha_1 = 1)
 
@@ -2797,6 +3013,9 @@ def estimate_residual_flow_multiecho(
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
+    want_corrected: bool = True,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -2846,8 +3065,14 @@ def estimate_residual_flow_multiecho(
         raise ValueError(f"-echo_times must all be > 0 ms, got {echo_times}.")
     nx, ny, nz, nt = shp
     _validate_estimation_inputs(
-        shp, pe_axis, slice_axis, is_3dacq=True, max_shift=max_shift,
-        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+        shp,
+        pe_axis,
+        slice_axis,
+        is_3dacq=True,
+        max_shift=max_shift,
+        trial_step=trial_step,
+        window_sigma=window_sigma,
+        verbose=verbose,
     )
 
     disp_slice = slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
@@ -2855,7 +3080,9 @@ def estimate_residual_flow_multiecho(
     pe_flow_is_u = pe_axis == a1
     perm4 = [3, disp_slice, a0, a1]
     if verbose:
-        print(f"🌀 locomoco {_geometry_report(shp, pe_axis, disp_slice, is_3dacq=True)}  × {e} echoes")
+        print(
+            f"🌀 locomoco {_geometry_report(shp, pe_axis, disp_slice, is_3dacq=True)}  × {e} echoes"
+        )
 
     te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
     vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
@@ -2921,6 +3148,8 @@ def estimate_residual_flow_multiecho(
                 n_levels=n_levels,
                 n_iters=n_iters,
                 window_sigma=window_sigma,
+                warp_interp=warp_interp,
+                warp_radius=warp_radius,
             )[0].cpu()
         return out
 
@@ -2971,7 +3200,11 @@ def estimate_residual_flow_multiecho(
         out = torch.zeros(nx, ny, nz, nt)
         for t in range(nt):
             out[..., t] = _shift3d_axis(
-                vols[j][..., t].to(device)[None], disp_e[..., t].to(device)[None], pe_axis
+                vols[j][..., t].to(device)[None],
+                disp_e[..., t].to(device)[None],
+                pe_axis,
+                mode=warp_interp,
+                radius=warp_radius,
             )[0].cpu()
         return out
 
@@ -3047,7 +3280,10 @@ def estimate_residual_flow_multiecho(
     per_echo: list[LocomocoResult] = []
     for j in range(e):
         disp_e = (alpha[j] * w).contiguous()
-        corrected = _corrected_echo(w, j)
+        # Materializing the corrected 4-D series (a per-frame warp of every echo) is
+        # pure waste when the caller won't write it (-no_corrected); the warp field and
+        # diagnostics don't need it. Refine builds its own corrected internally above.
+        corrected = _corrected_echo(w, j) if want_corrected else None
         p_canon = disp_e.permute(perm4).contiguous()
         u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
         v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
@@ -3331,8 +3567,14 @@ def estimate_residual_flow_me_interecho(
         raise ValueError(f"inter-echo backend must be flow | xcorr, got {backend!r}.")
     nx, ny, nz, nt = shp
     _validate_estimation_inputs(
-        shp, pe_axis, slice_axis, is_3dacq=True, max_shift=max_shift,
-        trial_step=trial_step, window_sigma=window_sigma, verbose=verbose,
+        shp,
+        pe_axis,
+        slice_axis,
+        is_3dacq=True,
+        max_shift=max_shift,
+        trial_step=trial_step,
+        window_sigma=window_sigma,
+        verbose=verbose,
     )
 
     te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)

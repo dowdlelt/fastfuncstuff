@@ -499,10 +499,25 @@ def create_parser() -> argparse.ArgumentParser:
     acc.add_argument(
         "-warp_interp",
         default="bilinear",
-        choices=("bilinear", "bicubic"),
+        choices=("bilinear", "bicubic", "lanczos"),
         help="[all] Resampler for the estimation iterations and the correction. "
         "'bicubic' removes the bilinear damping bias so the iterations converge to the "
-        "true shift (biggest gain on smooth data); costs a little more per warp.",
+        "true shift (biggest gain on smooth data); costs a little more per warp. "
+        "'lanczos' is a windowed sinc along the PE axis (half-width -warp_radius) for any "
+        "SINGLE phase-encode path (2-D slicewise, 3-D-acq, or the joint multi-echo solve — "
+        "not dual/rotation-aware, which are 2-D/3-D warps). It preserves sub-voxel signal "
+        "that trilinear blurs out of the CORRECTED output and the refine template; the shift "
+        "estimate itself is set by the pooling window, so this is about output fidelity, not "
+        "shift accuracy. Costs ~2× per warp and passes more thermal noise — verify on your data.",
+    )
+    acc.add_argument(
+        "-warp_radius",
+        type=int,
+        default=3,
+        metavar="A",
+        help="[all] Lanczos half-width for -warp_interp lanczos (taps = 2·A): 3 = "
+        "Lanczos-3, 5 ≈ wsinc5, 7 ≈ heptic. Larger = sharper but more noise/ringing on "
+        "thermal-noise data. Ignored unless -warp_interp lanczos.",
     )
     acc.add_argument(
         "-refine",
@@ -1092,6 +1107,9 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
+            want_corrected=not args.no_corrected,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
             device=device,
         )
 
@@ -1160,6 +1178,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"❌ -pe_dir takes 1 or 2 directions, got {len(pe_axes)}.", file=sys.stderr)
         return 2
     dual = len(pe_axes) == 2
+
+    # Lanczos is a 1-D (single-PE-axis) resampler. A single -pe_dir correction is a shift
+    # along one axis (2-D slicewise, 3-D-acq, or the joint multi-echo solve) — all fine.
+    # dual (two -pe_dir) and rotation-aware are genuine 2-D/3-D warps via grid_sample, which
+    # has no lanczos mode; block them rather than crash.
+    if args.warp_interp == "lanczos":
+        if dual or rotaware:
+            which = "dual -pe_dir (2-D warp)" if dual else "rotation-aware (3-D warp)"
+            print(
+                f"❌ -warp_interp lanczos is single phase-encode only; {which} needs "
+                "bilinear/bicubic.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.me_interecho or args.me_estimate_from is not None:
+            print(
+                "ℹ️  -warp_interp lanczos affects only the joint solve; -me_interecho / "
+                "-me_estimate_from ignore it (they resample bilinear)."
+            )
+
     slice_axis = args.slice_axis
     if args.is_3dacq and dual:
         print("❌ -is_3dacq is single phase-encode only (one -pe_dir).", file=sys.stderr)
@@ -1365,6 +1403,7 @@ def main(argv: list[str] | None = None) -> int:
             patch=args.patch,
             stride=args.stride,
             warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
             refine_rounds=args.refine,
             converge=args.converge,
             converge_rel=args.converge_rel,
