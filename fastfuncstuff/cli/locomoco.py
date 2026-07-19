@@ -116,6 +116,7 @@ which flag feeds which backend:
   flag           flow   phase  xcorr   meaning
   -ref            ·      ·      ·       reference frame (all)
   -do_blur        ·      ·      ·       pre-blur noisy frames (all)
+  -hpf_spatial    ·      ·      ·       estimate on spatial high-pass (all, experimental)
   -full_2d        ·      -      -       2-D vs PE-only flow
   -levels         ·      -      -       optical-flow pyramid levels
   -iters          ·      ·      -       flow: LK passes / phase: warp-refine passes
@@ -368,6 +369,21 @@ def create_parser() -> argparse.ArgumentParser:
         help="[all] In-plane Gaussian blur (FWHM mm) applied to frames BEFORE "
         "estimation only, for robustness on noisy data; 0 = off. All three backends "
         "tested noise-robust to ~15%%, so usually leave at 0. Never blurs the output.",
+    )
+    est.add_argument(
+        "-hpf_spatial",
+        "-hpf-spatial",
+        type=float,
+        default=0.0,
+        metavar="MM",
+        help="[all, EXPERIMENTAL] Spatial high-pass (Gaussian sigma, mm) applied to the "
+        "ESTIMATION frames only: subtracts a blurred copy so smooth non-motion "
+        "intensity changes (drift, the respiration B0 modulation riding along with a "
+        "sub-voxel PE shift) stay out of the flow, while the edges that encode the "
+        "shift survive — a more purely geometric target. The correction still "
+        "resamples the RAW series (true intensities preserved). Works for slicewise, "
+        "3-D-acq, and -me_3depi paths. 0 = off. Not supported with rotation-aware mode. "
+        "No clear advantage over the plain path observed yet — a knob to experiment with.",
     )
 
     flow = p.add_argument_group("Optical-flow backend (-backend flow)")
@@ -931,11 +947,14 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         datas.append(d)
 
     smooth_sigma = 0.0
-    if args.do_blur > 0:
+    hpf_sigma = 0.0
+    if args.do_blur > 0 or args.hpf_spatial > 0:
         vox = np.linalg.norm(affine[:3, :3], axis=0)
         in_plane = [a for a in (0, 1, 2) if a != slice_axis]
         inplane_mm = float(np.mean([vox[in_plane[0]], vox[in_plane[1]]]))
-        smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
+        # -do_blur is FWHM (÷2.355 → σ); -hpf_spatial is already a σ (the removed scale).
+        smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6) if args.do_blur > 0 else 0.0
+        hpf_sigma = args.hpf_spatial / max(inplane_mm, 1e-6) if args.hpf_spatial > 0 else 0.0
 
     # Correlation-curve frame: bare -save_corr_curve (const -1) → middle frame.
     corr_curve_frame = None
@@ -1016,6 +1035,8 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         f"levels={args.levels}, iters={args.iters}, {refine_note}, "
         f"automask={'on' if automask else 'off'}"
     )
+    if hpf_sigma > 0:
+        print(f"   ⚗️  estimation spatial high-pass: {args.hpf_spatial}mm (σ={hpf_sigma:.2f}vox)")
     # The inter-echo mode has no temporal reference, so the refine bias warning is moot.
     if args.refine == 0 and not args.me_interecho:
         print(
@@ -1046,6 +1067,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
+            hpf_sigma=hpf_sigma,
             device=device,
         )
     elif est_idx is not None:
@@ -1077,6 +1099,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
+            hpf_sigma=hpf_sigma,
             device=device,
         )
     else:
@@ -1110,6 +1133,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             want_corrected=not args.no_corrected,
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
+            hpf_sigma=hpf_sigma,
             device=device,
         )
 
@@ -1269,11 +1293,22 @@ def main(argv: list[str] | None = None) -> int:
     # -do_blur is FWHM in mm (repo convention); convert to an in-plane voxel sigma
     # for the pre-flow Gaussian. In-plane voxel size = mean of the two non-slice axes.
     smooth_sigma = 0.0
-    if args.do_blur > 0:
+    hpf_sigma = 0.0
+    if args.do_blur > 0 or args.hpf_spatial > 0:
         vox = np.linalg.norm(affine[:3, :3], axis=0)  # per-axis mm
         in_plane = [a for a in (0, 1, 2) if a != slice_axis]
         inplane_mm = float(np.mean([vox[in_plane[0]], vox[in_plane[1]]]))
-        smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6)
+        # -do_blur is FWHM (÷2.355 → σ); -hpf_spatial is already a σ (the smoothing
+        # scale removed by the unsharp subtraction), so no FWHM conversion.
+        smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6) if args.do_blur > 0 else 0.0
+        hpf_sigma = args.hpf_spatial / max(inplane_mm, 1e-6) if args.hpf_spatial > 0 else 0.0
+
+    if args.hpf_spatial > 0 and rotaware:
+        print(
+            "❌ -hpf_spatial is not supported with rotation-aware mode yet.",
+            file=sys.stderr,
+        )
+        return 2
 
     pe_only = not args.full_2d
     automask = not args.no_automask
@@ -1297,6 +1332,8 @@ def main(argv: list[str] | None = None) -> int:
         f"ref={args.ref}, do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
         f"{mode}, automask={mask_desc}"
     )
+    if hpf_sigma > 0:
+        print(f"   ⚗️  estimation spatial high-pass: {args.hpf_spatial}mm (σ={hpf_sigma:.2f}vox)")
     print(f"   accuracy: {acc_desc}")
 
     if rotaware:
@@ -1418,6 +1455,7 @@ def main(argv: list[str] | None = None) -> int:
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
+            hpf_sigma=hpf_sigma,
             device=device,
         )
 

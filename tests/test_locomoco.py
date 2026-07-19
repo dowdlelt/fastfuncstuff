@@ -159,8 +159,14 @@ def test_single_echo_lanczos_correction_2d_slicewise(known_shift_series):
     same PE shift as bilinear (the estimate is interpolator-independent) and produce a
     genuinely different — sharper — corrected series."""
     data, shifts = known_shift_series
-    common = dict(pe_axis=1, slice_axis=2, ref_mode="first", n_iters=6,
-                  device=torch.device("cpu"), verbose=False)
+    common = dict(
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        n_iters=6,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
     r_lin = estimate_residual_flow(data, warp_interp="bilinear", **common)
     r_lan = estimate_residual_flow(data, warp_interp="lanczos", warp_radius=5, **common)
     # Estimate matches (recovers -shift either way).
@@ -1092,3 +1098,119 @@ def test_converge_rel_early_stop_integration(known_shift_series, capsys):
     assert (
         out.count("refine pass") == 2 and "converged" in out
     )  # stops after 2nd (first comparison)
+
+
+def test_spatial_highpass_removes_smooth_keeps_edge():
+    """The unsharp high-pass annihilates a smooth ramp (interior) but keeps an edge."""
+    x = torch.linspace(0.0, 1.0, 32)
+    ramp = x.view(1, 1, 32).expand(1, 32, 32).contiguous()
+    hp = _lm._spatial_highpass(ramp, 3.0)
+    # Blur of a linear function is itself in the interior, so the high-pass ~ 0 there.
+    assert hp[:, :, 6:26].abs().max() < 0.02
+    edge = torch.zeros(1, 32, 32)
+    edge[:, :, 16:] = 1.0
+    hpe = _lm._spatial_highpass(edge, 3.0)
+    assert hpe[:, :, 14:18].abs().max() > 0.3  # edge energy retained
+    assert torch.equal(_lm._spatial_highpass(edge, 0.0), edge)  # sigma<=0 is a no-op
+
+
+def test_hpf_spatial_improves_recovery_under_smooth_contamination():
+    """A smooth PE-axis intensity ramp whose amplitude drifts per frame violates
+    brightness-constancy and biases the flow toward a phantom shift. Estimating on the
+    spatial high-pass strips that smooth component, so recovery is closer to truth."""
+    base = _phantom()
+    nx, ny, nz = base.shape
+    shifts = np.array([0.0, 0.6, -0.8, 1.1, -0.5], np.float32)
+    yy = (np.arange(ny) / ny).astype(np.float32)[None, :, None]  # smooth ramp along PE (y)
+    amps = np.array([0.0, 0.4, -0.5, 0.6, -0.3], np.float32) * float(base.mean())
+    data = np.zeros((*base.shape, len(shifts)), np.float32)
+    for t, sh in enumerate(shifts):
+        data[..., t] = _shift_along_y(base, float(sh)) + amps[t] * yy
+    common = dict(
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        n_iters=6,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+    def maxerr(res):
+        pe = res.pe_displacement().numpy()
+        est = np.median(pe.reshape(-1, pe.shape[-1]), axis=0)
+        return float(np.abs(est + shifts).max())  # pull disp recovers -shift
+
+    e_plain = maxerr(estimate_residual_flow(data, **common))
+    e_hpf = maxerr(estimate_residual_flow(data, hpf_sigma=6.0, **common))
+    assert e_hpf < e_plain
+
+
+def test_hpf_spatial_correction_keeps_raw_intensities(known_shift_series):
+    """Estimation runs on the near-zero-mean high-passed frames, but the correction
+    resamples the RAW series — so the output keeps its true intensity level, not the
+    high-passed one (a regression guard against feeding hp data to _correct_pe)."""
+    data, _ = known_shift_series
+    res = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        hpf_sigma=5.0,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    corr = res.corrected_series().numpy()
+    assert corr.mean() == pytest.approx(float(data.mean()), rel=0.05)
+
+
+def test_hpf_spatial_3dacq_runs_and_keeps_raw_intensities(known_shift_series):
+    """The 3-D-acquisition path (single 3-D solve) honours hpf_sigma and still resamples
+    the raw series — recovers the shift and preserves the intensity level."""
+    data, shifts = known_shift_series
+    res = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        is_3dacq=True,
+        hpf_sigma=5.0,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    pe = res.pe_displacement().numpy()
+    est = np.median(pe.reshape(-1, pe.shape[-1]), axis=0)
+    assert np.corrcoef(est, -shifts)[0, 1] > 0.95
+    corr = res.corrected_series().numpy()
+    assert corr.mean() == pytest.approx(float(data.mean()), rel=0.05)
+
+
+def test_hpf_spatial_multiecho_runs_and_keeps_raw_intensities():
+    """The multi-echo 3-D joint solve (the -me_3depi path) honours hpf_sigma end-to-end
+    and each echo's corrected series keeps its raw intensity level (resample-on-raw)."""
+    from fastfuncstuff.processing.locomoco import estimate_residual_flow_multiecho
+
+    base = _phantom(nx=32, ny=32, nz=6)
+    shifts = np.array([0.0, 0.7, -0.6, 1.0], np.float32)
+    tes = [10.0, 25.0, 40.0]
+    datas = []
+    for k in range(len(tes)):
+        d = np.zeros((*base.shape, len(shifts)), np.float32)
+        for t, sh in enumerate(shifts):
+            # later echoes shift more (alpha ~ TE) and are dimmer (smooth T2* decay)
+            d[..., t] = _shift_along_y(base, float(sh) * tes[k] / tes[0]) * (tes[0] / tes[k])
+        datas.append(d)
+    res = estimate_residual_flow_multiecho(
+        datas,
+        tes,
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        refine_rounds=1,
+        hpf_sigma=4.0,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert len(res.per_echo) == 3
+    for j, pe_res in enumerate(res.per_echo):
+        corr = pe_res.corrected_series().numpy()
+        assert corr.mean() == pytest.approx(float(datas[j].mean()), rel=0.05)

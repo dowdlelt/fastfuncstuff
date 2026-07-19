@@ -89,6 +89,22 @@ def _blur2d(img: torch.Tensor, sigma: float) -> torch.Tensor:
     return x.squeeze(1)
 
 
+def _spatial_highpass(img: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Unsharp spatial high-pass of a batch of 2-D images ``(B, H, W)``.
+
+    ``img − blur(img, sigma)``: strips spatially-smooth intensity offsets (drift,
+    slow BOLD, the respiration B0 modulation that rides along with a sub-voxel PE
+    shift) while keeping the edges, where the shift is actually encoded. Optical
+    flow's brightness-constancy assumption reads any non-motion intensity change as
+    displacement, so feeding it the high-passed frames gives a more purely geometric
+    target. Estimation only — the correction still resamples the raw series, so the
+    output keeps its true intensities. Experimental (``-hpf_spatial``).
+    """
+    if sigma <= 0:
+        return img
+    return img - _blur2d(img, sigma)
+
+
 def _gaussian_blur3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
     """Separable 3-D Gaussian blur of a single ``(D, H, W)`` volume."""
     if sigma <= 0:
@@ -1130,6 +1146,7 @@ def _estimate_static(
     ref_override=None,
     first_n=None,
     diag=None,
+    hpf_sigma=0.0,
 ):
     """Fixed reference: batch the flow over ALL frames at once, looping slices.
 
@@ -1172,8 +1189,12 @@ def _estimate_static(
     for s in tqdm(range(ns), desc="locomoco slices", unit="slice", leave=True, disable=ns < 2):
         moving_raw = vol[:, s].to(device).float()
         fixed_raw = ref[s].to(device).unsqueeze(0).expand(nt, hh, ww).contiguous().float()
-        fixed = _blur2d(fixed_raw, smooth_sigma) if smooth_sigma > 0 else fixed_raw
-        moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
+        # Estimation source (optionally high-passed) is distinct from moving_raw, which
+        # _correct_pe resamples — the correction keeps the raw intensities.
+        est_fixed = _spatial_highpass(fixed_raw, hpf_sigma)
+        est_moving = _spatial_highpass(moving_raw, hpf_sigma)
+        fixed = _blur2d(est_fixed, smooth_sigma) if smooth_sigma > 0 else est_fixed
+        moving = _blur2d(est_moving, smooth_sigma) if smooth_sigma > 0 else est_moving
         conf_acc: list[torch.Tensor] | None = [] if diag is not None else None
         curve_acc: list[torch.Tensor] | None = [] if curve_frame is not None else None
         u, v = flow_fn(fixed, moving, conf_out=conf_acc, curve_out=curve_acc)
@@ -1207,6 +1228,7 @@ def _estimate_cumulative(
     dual=False,
     warp_interp="bilinear",
     warp_radius=3,
+    hpf_sigma=0.0,
 ):
     """Progressive reference: frame t registers to the running mean/median of the
     already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
@@ -1233,8 +1255,10 @@ def _estimate_cumulative(
         else:  # first_mean
             ref = running_sum / t
         moving_raw = vol[t].to(device).float()
-        fixed = _blur2d(ref, smooth_sigma) if smooth_sigma > 0 else ref
-        moving = _blur2d(moving_raw, smooth_sigma) if smooth_sigma > 0 else moving_raw
+        est_fixed = _spatial_highpass(ref, hpf_sigma)
+        est_moving = _spatial_highpass(moving_raw, hpf_sigma)
+        fixed = _blur2d(est_fixed, smooth_sigma) if smooth_sigma > 0 else est_fixed
+        moving = _blur2d(est_moving, smooth_sigma) if smooth_sigma > 0 else est_moving
         u, v = flow_fn(fixed, moving)
         corr = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp, warp_radius)
         corrected[t] = corr.cpu()
@@ -1354,6 +1378,7 @@ def estimate_residual_flow(
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
+    hpf_sigma: float = 0.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -1401,6 +1426,11 @@ def estimate_residual_flow(
     corrected-data mean that many extra times, converging the reference template out
     of its bias. ``jacobian`` scales the corrected series by the PE Jacobian so signal
     is conserved (stretched regions dim, compressed regions brighten).
+
+    ``hpf_sigma`` (voxels, experimental) spatially high-passes ONLY the frames fed to
+    the estimator (``img − blur(img, hpf_sigma)``), keeping smooth non-motion
+    intensity changes (drift, respiration B0) out of the flow while preserving the
+    edges that encode the shift; the correction still resamples the raw series.
 
     ``automask`` (off here; on by the CLI) soft-gates the flow by a feathered brain
     mask — a dilated 3dAutomask of the time-mean, Gaussian-blurred by
@@ -1450,6 +1480,7 @@ def estimate_residual_flow(
             save_corr_curve=save_corr_curve,
             warp_interp=warp_interp,
             warp_radius=warp_radius,
+            hpf_sigma=hpf_sigma,
             device=device,
             verbose=verbose,
         )
@@ -1503,6 +1534,7 @@ def estimate_residual_flow(
             dual,
             warp_interp,
             warp_radius,
+            hpf_sigma=hpf_sigma,
         )
     else:
         u_all, v_all, corrected = _estimate_static(
@@ -1517,6 +1549,7 @@ def estimate_residual_flow(
             warp_radius,
             first_n=first_n,
             diag=diag,
+            hpf_sigma=hpf_sigma,
         )
     # Outer reference-refinement (shared engine): rebuild the reference from the
     # corrected series and re-register, converging the template out of its bias. The
@@ -1538,6 +1571,7 @@ def estimate_residual_flow(
                 warp_radius,
                 ref_override=new_ref,
                 diag=diag,
+                hpf_sigma=hpf_sigma,
             )
             return torch.stack([u, v]), corr
 
@@ -2058,6 +2092,19 @@ def _blur3d_b(vol: torch.Tensor, sigma: float) -> torch.Tensor:
     x = F.conv3d(F.pad(x, (0, 0, r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1, 1))
     x = F.conv3d(F.pad(x, (r, r, 0, 0, 0, 0), mode="replicate"), k.view(1, 1, 1, 1, -1))
     return x.squeeze(1)
+
+
+def _spatial_highpass3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Unsharp 3-D spatial high-pass of a batch of volumes ``(B, X, Y, Z)``.
+
+    The 3-D twin of :func:`_spatial_highpass` for the 3-D-acquisition paths — strips
+    spatially-smooth non-motion intensity changes (drift, respiration B0) from the
+    frames fed to the flow while keeping the edges that encode the shift. Estimation
+    only; the correction still resamples the raw series. Experimental (``-hpf_spatial``).
+    """
+    if sigma <= 0:
+        return vol
+    return vol - _blur3d_b(vol, sigma)
 
 
 def _grad_axis_3d(vol: torch.Tensor, axis: int) -> torch.Tensor:
@@ -2590,6 +2637,7 @@ def _run_3dacq_plain(
     save_corr_curve: int | None = None,
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
+    hpf_sigma: float = 0.0,
 ) -> LocomocoResult:
     """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
     nx, ny, nz, nt = data.shape
@@ -2624,13 +2672,21 @@ def _run_3dacq_plain(
     curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
     curve_box: dict[str, torch.Tensor | None] = {"curve": None, "offsets": None}
 
+    # Estimation prep: optional spatial high-pass (raw kept for the resample), then the
+    # existing estimation blur. Identity when both sigmas are 0. v is a single (X,Y,Z) vol.
+    def _prep(v: torch.Tensor) -> torch.Tensor:
+        x = _spatial_highpass3d(v[None], hpf_sigma)
+        if smooth_sigma > 0:
+            x = _blur3d_b(x, smooth_sigma)
+        return x[0]
+
     def _estimate(ref_vol: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        fxb = _blur3d_b(ref_vol[None], smooth_sigma)[0] if smooth_sigma > 0 else ref_vol
+        fxb = _prep(ref_vol)
         disp = torch.zeros(nx, ny, nz, nt)
         corrected = torch.zeros(nx, ny, nz, nt)
         for t in tqdm(range(nt), desc="locomoco 3D", unit="frame", leave=True, disable=nt < 3):
             mv = vol4d[..., t].to(device)
-            mvb = _blur3d_b(mv[None], smooth_sigma)[0] if smooth_sigma > 0 else mv
+            mvb = _prep(mv)
             conf_acc: list[torch.Tensor] | None = [] if xc else None
             curve_acc: list[torch.Tensor] | None = [] if (xc and t == curve_frame) else None
             d = flow3d(fxb[None], mvb[None], conf_out=conf_acc, curve_out=curve_acc)[0]
@@ -3016,6 +3072,7 @@ def estimate_residual_flow_multiecho(
     want_corrected: bool = True,
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
+    hpf_sigma: float = 0.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -3086,9 +3143,16 @@ def estimate_residual_flow_multiecho(
 
     te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
     vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
-    refs = [_select_ref_vol(v, ref_mode, first_n).to(device) for v in vols]
-    if smooth_sigma > 0:
-        refs = [_blur3d_b(r[None], smooth_sigma)[0] for r in refs]
+
+    # Estimation prep: optional spatial high-pass (raw kept for the resample), then the
+    # existing estimation blur. Identity when both sigmas are 0. v is a single (X,Y,Z) vol.
+    def _prep(v: torch.Tensor) -> torch.Tensor:
+        x = _spatial_highpass3d(v[None], hpf_sigma)
+        if smooth_sigma > 0:
+            x = _blur3d_b(x, smooth_sigma)
+        return x[0]
+
+    refs = [_prep(_select_ref_vol(v, ref_mode, first_n).to(device)) for v in vols]
 
     # A fixed scaling (TE ratio or flat) skips learning; both still pool all echoes.
     learn = learn_scaling and not flat_scaling
@@ -3126,7 +3190,7 @@ def estimate_residual_flow_multiecho(
                 range(nt), desc=f"me {tag} e{j + 1}/{e}", unit="frame", leave=True, disable=nt < 3
             ):
                 mv = vols[j][..., t].to(device)
-                mvb = _blur3d_b(mv[None], smooth_sigma)[0] if smooth_sigma > 0 else mv
+                mvb = _prep(mv)
                 out[j, ..., t] = flow3d(cur_refs[j][None], mvb[None])[0].cpu()
         return out
 
@@ -3137,9 +3201,7 @@ def estimate_residual_flow_multiecho(
     def _joint_lk(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
         out = torch.zeros(nx, ny, nz, nt)
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
-            movs = [vols[j][..., t].to(device) for j in range(e)]
-            if smooth_sigma > 0:
-                movs = [_blur3d_b(m[None], smooth_sigma)[0] for m in movs]
+            movs = [_prep(vols[j][..., t].to(device)) for j in range(e)]
             out[..., t] = optical_flow_lk_3d_multiecho(
                 [r[None] for r in cur_refs],
                 [m[None] for m in movs],
@@ -3157,9 +3219,7 @@ def estimate_residual_flow_multiecho(
         nonlocal have_pooled_conf, corr_curve, corr_offsets
         out = torch.zeros(nx, ny, nz, nt)
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
-            movs = [vols[j][..., t].to(device) for j in range(e)]
-            if smooth_sigma > 0:
-                movs = [_blur3d_b(m[None], smooth_sigma)[0] for m in movs]
+            movs = [_prep(vols[j][..., t].to(device)) for j in range(e)]
             curve_acc: list[torch.Tensor] | None = [] if t == curve_frame else None
             w_be, c_be = xcorr_search_flow_3d_multiecho(
                 [r[None] for r in cur_refs],
@@ -3237,13 +3297,10 @@ def estimate_residual_flow_multiecho(
         _pass = {"n": 0}
 
         def _reduce_me(cur_w):
-            refs = [
-                _refine_reduce(_corrected_echo(cur_w, j), ref_mode, 3, first_n).to(device)
+            return [
+                _prep(_refine_reduce(_corrected_echo(cur_w, j), ref_mode, 3, first_n).to(device))
                 for j in range(e)
             ]
-            if smooth_sigma > 0:
-                refs = [_blur3d_b(r[None], smooth_sigma)[0] for r in refs]
-            return refs
 
         def _est_me(new_refs):
             _pass["n"] += 1
@@ -3373,6 +3430,7 @@ def estimate_residual_flow_me_scaled(
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
+    hpf_sigma: float = 0.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -3426,6 +3484,7 @@ def estimate_residual_flow_me_scaled(
         reg_sigma=reg_sigma,
         peak_mode=peak_mode,
         search_min_steps=search_min_steps,
+        hpf_sigma=hpf_sigma,
         device=device,
         verbose=verbose,
     )
@@ -3518,6 +3577,7 @@ def estimate_residual_flow_me_interecho(
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
+    hpf_sigma: float = 0.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -3630,10 +3690,17 @@ def estimate_residual_flow_me_interecho(
     curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
     corr_curve: torch.Tensor | None = None
     corr_offsets: torch.Tensor | None = None
-    for t in tqdm(range(nt), desc="me interecho", unit="frame", leave=True, disable=nt < 3):
-        ims = [vols[j][..., t].to(device) for j in range(e)]
+
+    # Estimation prep: optional spatial high-pass (raw kept for the resample), then the
+    # existing estimation blur. Identity when both sigmas are 0. v is a single (X,Y,Z) vol.
+    def _prep(v: torch.Tensor) -> torch.Tensor:
+        x = _spatial_highpass3d(v[None], hpf_sigma)
         if smooth_sigma > 0:
-            ims = [_blur3d_b(im[None], smooth_sigma)[0] for im in ims]
+            x = _blur3d_b(x, smooth_sigma)
+        return x[0]
+
+    for t in tqdm(range(nt), desc="me interecho", unit="frame", leave=True, disable=nt < 3):
+        ims = [_prep(vols[j][..., t].to(device)) for j in range(e)]
         fixed_list = [ims[j][None] for j in range(e - 1)]  # echo n-1 (lower TE)
         moving_list = [ims[j + 1][None] for j in range(e - 1)]  # echo n
         if backend == "flow":
