@@ -55,6 +55,34 @@ class _HelpFormatter(
     pass
 
 
+def _normalize_negative_option_values(argv: list[str] | None) -> list[str]:
+    """Make a negative 3D-debug detrend order unambiguous to argparse.
+
+    Some argparse versions classify ``-1`` as a new option after an option
+    whose name starts with a digit (such as ``-3d_debug_detrend``).  The
+    ``--option=-1`` spelling is unambiguous across versions, while preserving
+    the documented, more readable two-token invocation.
+    """
+    values = list(sys.argv[1:] if argv is None else argv)
+    normalized: list[str] = []
+    index = 0
+    detrend_flags = {"-3d_debug_detrend", "-3d-debug-detrend"}
+    while index < len(values):
+        value = values[index]
+        if (
+            value in detrend_flags
+            and index + 1 < len(values)
+            and values[index + 1].startswith("-")
+            and values[index + 1][1:].isdigit()
+        ):
+            normalized.append(f"{value}={values[index + 1]}")
+            index += 2
+            continue
+        normalized.append(value)
+        index += 1
+    return normalized
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Multi-Echo DIstortion Correction (MEDIC) — warpkit estimate + GPU apply",
@@ -424,7 +452,7 @@ def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_normalize_negative_option_values(argv))
 
     try:
         import torch

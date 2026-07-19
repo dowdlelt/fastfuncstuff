@@ -11,12 +11,32 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from fastfuncstuff.cli.medic import _normalize_negative_option_values, create_parser
 from fastfuncstuff.processing.medic import (
     displacement_pe_to_field,
     field_to_displacement_pe,
     invert_displacement_pe,
     undistort_series,
 )
+
+
+def test_cli_accepts_negative_3d_debug_detrend_order():
+    """`-3d_debug_detrend -1` must not be mistaken for a new option."""
+    args = create_parser().parse_args(
+        _normalize_negative_option_values(
+            [
+                "-magnitude",
+                "mag.nii.gz",
+                "-phase",
+                "phase.nii.gz",
+                "-prefix",
+                "out",
+                "-3d_debug_detrend",
+                "-1",
+            ]
+        )
+    )
+    assert args.debug3d_detrend == -1
 
 
 def test_field_displacement_roundtrip():
