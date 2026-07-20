@@ -28,6 +28,7 @@ import torch
 
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
+from fastfuncstuff.processing.rbr import invert_displacement_field
 from fastfuncstuff.processing.segment import (
     autobox_bounds,
     cast_template_to_input,
@@ -186,6 +187,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "                fieldmap_warp.nii moco.aff12.1D'\n"
             "    (segment the fieldmap-corrected epi_mean so the PE warp is a residual and\n"
             "    doesn't double-correct with the fieldmap). Skipped with -no_warp.\n"
+            "  invwarp: the fixed-point inverse of warp (same mm/composable format), for\n"
+            "    pulling undistorted/template-space data back into the input's own\n"
+            "    (distorted/EPI) frame. Written by default; skip with -no_invwarp.\n"
             "\n"
             "Anatomical -> MNI:\n"
             "  ffs_allineate -base MNI_T1.nii -source T1.nii -1Dmatrix_save t1_to_mni.aff12.1D\n"
@@ -405,6 +409,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     knobs.add_argument(
         "-no_warp", action="store_true", help="Skip the deformation (bias + tissue only)"
+    )
+    knobs.add_argument(
+        "-no_invwarp",
+        dest="invwarp",
+        action="store_false",
+        help="Skip writing the inverse deformation. By default, alongside _warp a "
+        "_invwarp.nii.gz is written -- the fixed-point inverse of the fitted "
+        "deformation, so undistorted/template-space data can be pulled back into the "
+        "input's own (distorted/EPI) frame. No effect with -no_warp.",
     )
     knobs.add_argument(
         "-no_warp_anneal",
@@ -763,6 +776,26 @@ def main(argv: list[str] | None = None) -> int:
             affine=hdr["affine"],
             units="mm",
         )  # fmt: skip
+        if args.invwarp:
+            # Fixed-point inverse of the SAME voxel-displacement field, inverted on
+            # the ref grid the forward was fit on (then embedded identically), so the
+            # mm-save x/y round-trip flip lands on both fields the same way. The
+            # inverse pulls undistorted/template data back into the input's frame.
+            fwd = torch.stack([warp[..., 0], warp[..., 1], warp[..., 2]], dim=0)  # (3,nz,ny,nx)
+            inv = invert_displacement_field(fwd)
+            ix, iy, iz = inv[0], inv[1], inv[2]
+            if box_slices is not None:
+                ix = embed_in_full(ix, full_shape, box_slices)
+                iy = embed_in_full(iy, full_shape, box_slices)
+                iz = embed_in_full(iz, full_shape, box_slices)
+            save_warp_field(
+                ix, iy, iz,
+                f"{prefix}_invwarp.nii.gz",
+                header_info=hdr,
+                affine=hdr["affine"],
+                units="mm",
+            )  # fmt: skip
+            extra.append(", _invwarp")
         # geometry-corrected input in its OWN space (PE-mode: the undistorted EPI)
         undist = undistort_input(ref, fit, device=device)
         _save_input(undist, f"{prefix}_undistorted.nii.gz")
