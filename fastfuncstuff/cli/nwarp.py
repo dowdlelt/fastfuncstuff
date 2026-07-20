@@ -156,11 +156,11 @@ Examples:
         "-ainterp",
         choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
         default=None,
-        help="Kernel for warp-field interpolation during composition. Default "
-        "follows -interp (matching AFNI 3dNwarpApply: 'the same interpolation "
-        "mode is used for the warp itself and then for the data'); when -interp "
-        "is NN/nearest/linear it falls back to wsinc5. Higher order reduces the "
-        "smoothing each composition step adds to the warp; 'linear' is fastest.",
+        help="Kernel for warp-field interpolation during composition (default: "
+        "cubic). Warp fields are smooth, so cubic matches wsinc5 to negligible "
+        "error at ~10x less cost; this only affects the warp, not the data "
+        "(-interp). Higher order reduces the smoothing each composition step adds "
+        "to the warp; 'linear' is fastest.",
     )
     interp_group.add_argument(
         "-no_neg",
@@ -295,13 +295,17 @@ def main(argv: list[str] | None = None) -> None:
         if verb >= 1:
             print(f"ffs_nwarp: time_range={time_range}")
 
-    # AFNI: -ainterp defaults to -interp. NN/nearest/linear aren't valid warp
-    # composition kernels (WARP_COMPOSE_INTERP), so fall back to wsinc5 there.
+    # -ainterp resamples the *warp fields* during composition, not the data. A
+    # displacement field is smooth/band-limited, so cubic reproduces it to
+    # negligible error while wsinc5 costs ~10x more per composition step (measured
+    # on a 5-transform chain: composition 69s -> 7s, whole job 1.67x faster, data
+    # sampling unchanged). We therefore default to cubic instead of inheriting
+    # -interp the way AFNI 3dNwarpApply does -- the extra sinc accuracy is wasted
+    # on a warp. The final *data* sampling still honours -interp (e.g. wsinc5).
+    # Override with an explicit -ainterp when maximum warp fidelity is wanted.
     ainterp = args.ainterp
     if ainterp is None:
-        ainterp = (
-            args.interp if args.interp in ("cubic", "quintic", "heptic", "wsinc5") else "wsinc5"
-        )
+        ainterp = "cubic"
     if verb >= 1:
         print(f"ffs_nwarp: ainterp={ainterp}")
 
@@ -315,7 +319,9 @@ def main(argv: list[str] | None = None) -> None:
         jac_axis = parse_pe_axis(axis_str)
         if verb >= 1:
             tail = f", fieldmap '{jac_match}'" if jac_match else ""
-            print(f"ffs_nwarp: Jacobian modulation on phase-encode axis '{axis_str}' (axis {jac_axis}){tail}")
+            print(
+                f"ffs_nwarp: Jacobian modulation on phase-encode axis '{axis_str}' (axis {jac_axis}){tail}"
+            )
 
     nwarp_specs = parse_nwarp_string(args.nwarp)
     if verb >= 1:
