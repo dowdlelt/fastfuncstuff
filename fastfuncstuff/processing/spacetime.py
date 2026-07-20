@@ -52,7 +52,7 @@ import torch
 from torch import Tensor
 
 from ..memory import get_available_memory
-from .interp import warp_image
+from .interp import warp_image_multi
 from .slicetime import _m3_window, _sinc
 
 # Temporal kernel half-widths (number of taps on each side of the sample point).
@@ -193,9 +193,10 @@ def apply_spacetime_sample(
         # Edge-extend past the series ends (nipy uses reflect; clamp is adequate
         # and never invents structure -- the weights there are already tiny).
         fc = min(max(f, 0), nt - 1)
-        for c, src in enumerate(sources):
-            frame = src[fc].to(device=device, dtype=accs[c].dtype)  # streams from CPU if needed
-            s_f = warp_image(frame, xd, yd, zd, mode=interp)
+        frames = [src[fc].to(device=device, dtype=accs[c].dtype) for c, src in enumerate(sources)]
+        # Channels share this frozen pose -> warp them in one batched gather.
+        warped = warp_image_multi(frames, xd, yd, zd, mode=interp)
+        for c, s_f in enumerate(warped):
             if no_neg_ch[c]:
                 s_f = s_f.clamp_min(0.0)
             accs[c] += w * s_f
@@ -287,7 +288,9 @@ class TissueFollowingSampler:
         # obscure the memory that composition actually needs.
         window = 2 * self.half + 2
         output_plane = onz * ony * onx * 4
-        source_frame_bytes = sum(source[0].numel() * source.element_size() for source in self.sources)
+        source_frame_bytes = sum(
+            source[0].numel() * source.element_size() for source in self.sources
+        )
         coord_cache_bytes = window * 3 * output_plane
         source_cache_bytes = window * source_frame_bytes
         # A high-order warp composition temporarily holds several output-grid
@@ -350,8 +353,9 @@ class TissueFollowingSampler:
                 else tuple(src[fc].to(self.device, dtype=torch.float32) for src in self.sources)
             )
             xd, yd, zd = sx - self.ii, sy - self.jj, sz - self.kk
-            for c, frame in enumerate(frames):
-                s_f = warp_image(frame, xd, yd, zd, mode=self.interp)
+            # All channels share this pose -> one gather builds them together.
+            warped = warp_image_multi(frames, xd, yd, zd, mode=self.interp)
+            for c, s_f in enumerate(warped):
                 if self.no_neg_ch[c]:
                     s_f = s_f.clamp_min(0.0)
                 accs[c] = accs[c] + w * s_f

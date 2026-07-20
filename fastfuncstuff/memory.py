@@ -198,6 +198,7 @@ DEFAULT_CPU_MEMORY_THRESHOLD_GB = 4.0
 def get_available_memory(
     device: torch.device,
     safety_factor: float | None = None,
+    empty_cache: bool = True,
 ) -> int:
     """
     Get available memory on the specified device in bytes.
@@ -209,6 +210,14 @@ def get_available_memory(
     safety_factor : float, optional
         Fraction of available memory to use (0 < safety_factor <= 1).
         If None, uses config defaults (0.5 for GPU, 0.75 for CPU).
+    empty_cache : bool, default True
+        Release the CUDA caching allocator's free blocks before reading
+        ``memory_reserved`` so ``total - reserved`` reflects truly-free memory.
+        This forces a device sync and churns the allocator, so hot paths that
+        size a chunk on *every* call (e.g. the separable resampler) should pass
+        ``False``: skipping it leaves cached-but-free blocks counted in
+        ``reserved``, which only ever *underestimates* free memory (smaller,
+        safe chunks) since a new allocation can still reuse the reserved pool.
 
     Returns
     -------
@@ -227,7 +236,8 @@ def get_available_memory(
         if safety_factor is None:
             safety_factor = config.gpu_safety_factor
         try:
-            torch.cuda.empty_cache()
+            if empty_cache:
+                torch.cuda.empty_cache()
             reserved = torch.cuda.memory_reserved(device)
             total = torch.cuda.get_device_properties(device).total_memory
             free = total - reserved

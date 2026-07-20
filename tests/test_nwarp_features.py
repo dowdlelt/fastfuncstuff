@@ -180,17 +180,23 @@ def test_resample_commensurate_grid_matches_einsum(kernel):
 
 
 def test_gather_contract_dispatch_gating(monkeypatch):
-    """Eager for GPU / sub-threshold / disabled; warm-up keeps one-shot eager."""
+    """Eager below threshold / disabled / unsupported device / first-call one-shot.
+
+    CPU and CUDA both compile once a recurring large workload is seen; a device
+    that is neither (e.g. MPS) always stays eager.
+    """
     cpu = torch.device("cpu")
-    monkeypatch.setattr(I, "_cpu_large_calls", 0)
-    monkeypatch.setattr(I, "_compiled_gather_contract", None)
+    monkeypatch.setattr(I, "_large_calls", {"cpu": 0, "cuda": 0})
+    monkeypatch.setattr(I, "_compiled_gather_contract", {})
     # below the voxel threshold -> eager
     assert I._get_gather_contract(cpu, 100) is I._gather_contract
     # disabled via env -> eager even when large
     monkeypatch.setenv("FFS_NWARP_NO_COMPILE", "1")
     assert I._get_gather_contract(cpu, 10_000_000) is I._gather_contract
     monkeypatch.delenv("FFS_NWARP_NO_COMPILE")
-    # first large call stays eager (one-shot protection)
+    # an unsupported device (mps) stays eager even when large
+    assert I._get_gather_contract(torch.device("mps"), 10_000_000) is I._gather_contract
+    # first large CPU call stays eager (one-shot protection)
     assert I._get_gather_contract(cpu, 10_000_000) is I._gather_contract
 
 

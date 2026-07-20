@@ -13,6 +13,7 @@ Key functions:
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from functools import lru_cache
 
 import torch
@@ -276,6 +277,40 @@ def warp_image(
     return result
 
 
+def warp_image_multi(
+    sources: Sequence[Tensor],
+    warp_xd: Tensor,
+    warp_yd: Tensor,
+    warp_zd: Tensor,
+    mode: str = "linear",
+) -> list[Tensor]:
+    """Warp several co-registered channels through one displacement field.
+
+    The channels share the sample coordinates, so for the separable kernels
+    (cubic/quintic/heptic/wsinc5) the OOB mask, grid-node fast path, index tables
+    and kernel weights are built once and only the gather+contract repeats per
+    channel -- the win when warping mag + real + imag for phase data, or any
+    multi-echo stack, at the same pose. ``linear``/``nearest`` fall back to a
+    per-channel loop (already cheap; grid_sample / gather dominate, not the setup).
+    Returns one warped volume per input channel, in order.
+    """
+    mode = normalize_interp_mode(mode)
+    if mode in ("linear", "nearest"):
+        return [warp_image(s, warp_xd, warp_yd, warp_zd, mode=mode) for s in sources]
+
+    out_nz, out_ny, out_nx = warp_xd.shape
+    device = warp_xd.device
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(out_nz, dtype=torch.float32, device=device),
+        torch.arange(out_ny, dtype=torch.float32, device=device),
+        torch.arange(out_nx, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    stack = torch.stack(tuple(sources), dim=0)  # (C, nz, ny, nx)
+    out = _separable_resample_3d(stack, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)
+    return list(out.unbind(0))
+
+
 # ---------------------------------------------------------------------------
 # Interpolation kernels
 # ---------------------------------------------------------------------------
@@ -521,7 +556,11 @@ def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int
     #   3*ntaps    : wx/wy/wz float tap tables
     #   8          : per-point coord/base scratch
     bytes_per_point = (8 * ntaps**2 + 9 * ntaps + 8) * 4
-    avail = get_available_memory(device)
+    # empty_cache=False: this runs once per resample (hundreds of times in a 4-D
+    # warp), and empty_cache would force a device sync + allocator churn on each.
+    # The resulting reserved-inclusive reading only underestimates free memory, so
+    # chunks stay safe.
+    avail = get_available_memory(device, empty_cache=False)
     chunk = int(avail // max(1, bytes_per_point))
     return max(1, min(n_points, chunk))
 
@@ -561,11 +600,29 @@ def _gather_contract(
     For each z-tap, gather that ``(c, ty, tx)`` plane, contract X then Y into a
     scalar, accumulate over Z. ``xi/yi/zi`` are clamped ``(c, ntaps)`` index
     tables; ``wx/wy/wz`` the ``(c, ntaps)`` weights. Pulled out as a standalone
-    function so the CPU path can hand it to ``torch.compile`` -- inductor fuses
-    the gather with the multiply-reduce and never materializes the ntaps planes,
-    ~10x over eager on CPU (measured). Eager and compiled share this one body.
+    function so :func:`_get_gather_contract` can hand it to ``torch.compile`` --
+    inductor fuses the gather with the multiply-reduce and never materializes the
+    ntaps planes, ~10x over eager on both CPU and CUDA (measured). Eager and
+    compiled share this one body.
+
+    ``source`` may carry a leading channel dim ``(C, nz, ny, nx)``: co-registered
+    channels sampled at the *same* coords (e.g. mag + real + imag for phase warps)
+    share the index tables and kernel weights, so only the gather+contract is
+    repeated per channel. Output is ``(C, c)`` then, else ``(c,)``.
     """
     ntaps = xi.shape[1]
+    batched = source.dim() == 4
+    if batched:
+        # (C, c) accumulator; the channel axis broadcasts through the contraction.
+        acc = torch.zeros((source.shape[0], xi.shape[0]), dtype=source.dtype, device=source.device)
+        for t in range(ntaps):
+            plane = source[
+                :, zi[:, t][:, None, None], yi[:, :, None], xi[:, None, :]
+            ]  # (C,c,ty,tx)
+            sx = (plane * wx[:, None, :]).sum(dim=3)  # (C, c, ty)  contract X
+            sxy = (sx * wy).sum(dim=2)  # (C, c)          contract Y
+            acc = acc + sxy * wz[:, t]  # accumulate Z (broadcast over C)
+        return acc
     acc = torch.zeros(xi.shape[0], dtype=source.dtype, device=source.device)
     for t in range(ntaps):
         plane = source[zi[:, t][:, None, None], yi[:, :, None], xi[:, None, :]]
@@ -575,35 +632,42 @@ def _gather_contract(
     return acc
 
 
-# torch.compile pays a one-time ~1-3s compile, so only worth it for CPU
-# workloads that recur (4D series, moco): the compiled fn is cached process-wide
-# and amortizes across calls. The counter keeps a one-shot single apply on the
-# eager path (no compile penalty); once we've seen repeated large CPU work we
-# switch to compiled. Disable entirely with FFS_NWARP_NO_COMPILE=1.
+# torch.compile pays a one-time ~1-3s compile, so it's only worth it for workloads
+# that recur (4D series, moco): the compiled fn is cached process-wide and amortizes
+# across calls. Inductor fuses the gather with the multiply-reduce and never
+# materializes the (C, chunk, ntaps, ntaps) planes the eager three-pass builds ten
+# times over -- ~10x on BOTH CPU and CUDA (measured: a wsinc5 gather 461->43 ms on
+# an RTX 5070 Ti). The per-device counter keeps a one-shot single apply on the eager
+# path (no compile penalty); once we've seen repeated large work we switch to
+# compiled. Disable entirely with FFS_NWARP_NO_COMPILE=1.
 _COMPILE_MIN_VOXELS = 200_000
-_cpu_large_calls = 0
-_compiled_gather_contract = None
+_large_calls = {"cpu": 0, "cuda": 0}
+_compiled_gather_contract: dict[str, object] = {}
 
 
 def _get_gather_contract(device: torch.device, n_points: int):
-    """Return the compiled _gather_contract on CPU once a recurring large
-    workload is detected, else the eager function."""
-    global _cpu_large_calls, _compiled_gather_contract
+    """Return the compiled _gather_contract once a recurring large workload is
+    detected on CPU or CUDA, else the eager function."""
+    dt = device.type
     if (
-        device.type != "cpu"
+        dt not in ("cpu", "cuda")
         or n_points < _COMPILE_MIN_VOXELS
         or os.environ.get("FFS_NWARP_NO_COMPILE") == "1"
     ):
         return _gather_contract
-    _cpu_large_calls += 1
-    if _cpu_large_calls < 2:  # let a one-shot apply stay eager
+    _large_calls[dt] += 1
+    if _large_calls[dt] < 2:  # let a one-shot apply stay eager
         return _gather_contract
-    if _compiled_gather_contract is None:
+    if dt not in _compiled_gather_contract:
         try:
-            _compiled_gather_contract = torch.compile(_gather_contract, dynamic=False)
+            # CUDA needs dynamic=True: the per-chunk voxel count drifts with free
+            # VRAM, and static shapes would recompile every call and blow dynamo's
+            # recompile cap (silently falling back to eager). CPU keeps static
+            # shapes, which inductor fuses best.
+            _compiled_gather_contract[dt] = torch.compile(_gather_contract, dynamic=(dt == "cuda"))
         except Exception:
-            _compiled_gather_contract = _gather_contract  # compile unavailable
-    return _compiled_gather_contract
+            _compiled_gather_contract[dt] = _gather_contract  # compile unavailable
+    return _compiled_gather_contract[dt]
 
 
 def _separable_resample_3d(
@@ -623,16 +687,23 @@ def _separable_resample_3d(
     identical to the one-shot ``einsum("ctuv,ct,cu,cv->c")`` contraction.
 
     Args:
-        source: (nz, ny, nx) float tensor.
+        source: (nz, ny, nx), or (C, nz, ny, nx) to resample several co-registered
+            channels through the *same* coordinates in one pass -- the OOB mask,
+            grid-node fast path, index tables and kernel weights are all built once
+            and only the gather+contract repeats per channel. Output gains the same
+            leading ``C`` axis then.
         x_coords, y_coords, z_coords: output sample locations in index space.
         kernel_name: one of "wsinc5", "cubic", "quintic", "heptic".
 
     Returns:
-        Resampled volume with same shape as coordinate arrays.
+        Resampled volume with same shape as coordinate arrays (a leading ``C`` axis
+        is prepended when ``source`` is channel-batched).
     """
     kernel_fn, _, use_floor = _KERNELS[kernel_name]
     H = _kernel_half_width(kernel_name)  # wsinc5 honors AFNI_WSINC5_RADIUS
-    nz, ny, nx = source.shape
+    batched = source.dim() == 4
+    n_ch = source.shape[0] if batched else 1
+    nz, ny, nx = source.shape[-3:]
     out_shape = x_coords.shape
     device = source.device
     dtype = source.dtype
@@ -652,7 +723,7 @@ def _separable_resample_3d(
         ntaps = 2 * H + 1
         offsets = torch.arange(-H, H + 1, device=device)
 
-    result = torch.zeros(N, dtype=dtype, device=device)
+    result = torch.zeros((n_ch, N) if batched else (N,), dtype=dtype, device=device)
 
     # Per-point bases (cheap elementwise) for the OOB and grid-node masks below.
     if use_floor:
@@ -685,23 +756,26 @@ def _separable_resample_3d(
     )
     if bool(tiny.any()):
         ti = tiny.nonzero(as_tuple=True)[0]
-        result[ti] = source[
+        node = source[
+            ...,
             zb_all[ti].long().clamp(0, nz - 1),
             yb_all[ti].long().clamp(0, ny - 1),
             xb_all[ti].long().clamp(0, nx - 1),
-        ]
+        ]  # (C, n_tiny) when batched, else (n_tiny,)
+        result[..., ti] = node
 
     heavy = in_bounds & ~tiny
     idx = heavy.nonzero(as_tuple=True)[0]
     M = idx.numel()
     if M == 0:
-        return result.reshape(out_shape)
+        return result.reshape((n_ch, *out_shape) if batched else out_shape)
     xin, yin, zin = x_flat[idx], y_flat[idx], z_flat[idx]
 
     # Chunk over the surviving voxels: the gather materializes a
-    # (chunk, ntaps, ntaps) slab per z-tap, so chunking keeps peak memory
+    # (C, chunk, ntaps, ntaps) slab per z-tap, so chunking keeps peak memory
     # bounded (and makes the kernel affordable on MPS/CPU and auto-padded grids).
-    chunk = _resample_chunk_size(M, ntaps, device)
+    # The channel count scales the slab, so shrink the chunk to match.
+    chunk = max(1, _resample_chunk_size(M, ntaps, device) // n_ch)
     gather_contract = _get_gather_contract(device, M)  # compiled on recurring CPU work
     for s in range(0, M, chunk):
         e = min(M, s + chunk)
@@ -722,9 +796,9 @@ def _separable_resample_3d(
         yi = (yb.long()[:, None] + offsets[None, :]).clamp(0, ny - 1)
         zi = (zb.long()[:, None] + offsets[None, :]).clamp(0, nz - 1)
 
-        result[idx[s:e]] = gather_contract(source, xi, yi, zi, wx, wy, wz)
+        result[..., idx[s:e]] = gather_contract(source, xi, yi, zi, wx, wy, wz)
 
-    return result.reshape(out_shape)
+    return result.reshape((n_ch, *out_shape) if batched else out_shape)
 
 
 def wsinc5_resample_3d(

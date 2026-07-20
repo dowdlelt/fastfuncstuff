@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.processing.affine import (
@@ -282,6 +283,39 @@ class TestInterp:
         out = quintic_resample_3d(vol, x_c, y_c, z_c)
         expected = vol[2:6, 2:6, 2:6]
         assert torch.allclose(out, expected, atol=1e-4)
+
+    @pytest.mark.parametrize("kernel", ["cubic", "quintic", "heptic", "wsinc5"])
+    def test_channel_batched_separable_equals_per_channel(self, kernel):
+        """Batching channels through _separable_resample_3d must be byte-identical
+        to warping each channel alone -- the coords (hence OOB mask, grid-node fast
+        path, index tables and kernel weights) are shared; only the gather differs.
+        Coordinates deliberately mix interior, sub-voxel, exact-grid-node, and
+        out-of-bounds samples so every branch is exercised."""
+        from fastfuncstuff.processing.interp import _separable_resample_3d, warp_image_multi
+
+        torch.manual_seed(0)
+        sources = [torch.randn(9, 10, 11, device=DEV) for _ in range(3)]
+        # Displacement field: smooth interior + a few OOB + exact-node samples.
+        xd = torch.randn(9, 10, 11, device=DEV) * 0.4
+        yd = torch.randn(9, 10, 11, device=DEV) * 0.4
+        zd = torch.randn(9, 10, 11, device=DEV) * 0.4
+        xd[0, 0, 0] = -50.0  # force out-of-bounds -> zero
+        xd[1, 1, 1] = 0.0  # exact grid node (tiny fast path)
+        yd[1, 1, 1] = 0.0
+        zd[1, 1, 1] = 0.0
+
+        batched = warp_image_multi(sources, xd, yd, zd, mode=kernel)
+        # Direct single-volume separable calls at the same absolute coords.
+        nz, ny, nx = sources[0].shape
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(nz, dtype=torch.float32, device=DEV),
+            torch.arange(ny, dtype=torch.float32, device=DEV),
+            torch.arange(nx, dtype=torch.float32, device=DEV),
+            indexing="ij",
+        )
+        for c, src in enumerate(sources):
+            solo = _separable_resample_3d(src, ii + xd, jj + yd, kk + zd, kernel)
+            assert torch.equal(batched[c], solo), f"{kernel} channel {c} mismatch"
 
 
 class TestSourceBatchedCompose:
