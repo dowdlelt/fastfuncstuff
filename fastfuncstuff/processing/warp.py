@@ -55,6 +55,8 @@ from .cost_blok import (
 from .interp import (
     batched_compose_and_interpolate,
     batched_compose_and_interpolate_multi,
+    batched_trilinear_interpolate,
+    batched_trilinear_interpolate_multi,
     trilinear_interpolate,
     warp_image,
 )
@@ -154,6 +156,12 @@ class QwarpConfig:
 
     verb: int = 1
     """Verbosity level (0=quiet, 1=normal, 2=detailed)."""
+
+    optimizer: str = "adam"
+    """Per-patch optimizer for the ME-scaled polish: 'adam' (autodiff, any cost) or
+    'gn' (Gauss-Newton / Levenberg-Marquardt with an analytic image-gradient Jacobian).
+    'gn' requires the differentiable-normalisation ncc cost and is much faster (no
+    autograd backward, converges in a few steps); it falls back to adam for lpc/lpa."""
 
     batch_optimizer_lr: float = 0.008
     """Learning rate for the batched Adam optimizer."""
@@ -2350,6 +2358,709 @@ def qwarp_batch(
         warped[v] = wf[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
 
     return warped, mstate.xd_all, mstate.yd_all, mstate.zd_all
+
+
+# ---------------------------------------------------------------------------
+# Joint multi-echo TE-scaled PE-only polish (locomoco hand-off)
+# ---------------------------------------------------------------------------
+#
+# The multi-echo 3-D-EPI partition/PE wiggle scales linearly with echo time: one
+# shared displacement field ``w`` (echo-1 scale) and echo ``e`` sees ``alpha_e * w``
+# with ``alpha_e = TE_e / TE_1`` FIXED (not fitted). locomoco estimates ``w`` well
+# but leaves a residual its cross-correlation/flow search can't resolve. This polish
+# seeds that ``w`` and refines it with a few fine nonlinear levels under the JOINT
+# objective ``sum_e lpa(warp(source_e, alpha_e*w), base_e)`` -- one PE-only field,
+# every echo constraining it at its own TE scale (late echoes see the big shift,
+# early echoes carry the SNR). Single-echo is the E=1, alpha=[1] special case.
+#
+# This is NOT qwarp_batch (which solves N *independent* warps). Here all echoes
+# share ONE parameter set; only the sampled displacement is scaled per echo.
+
+
+def _weighted_pearson_patches(base: Tensor, warped: Tensor, weight: Tensor) -> Tensor:
+    """Weighted Pearson correlation over the last axis, per leading index.
+
+    ``base``/``warped`` are ``(..., V)`` and ``weight`` broadcasts to them; returns
+    ``(...)`` correlations. Same-modality patch NCC for the qwarp polish -- cheap
+    (a few weighted reductions), differentiable, and linear enough to admit a
+    Gauss-Newton update later. Variances are floored (never zeroed) so a flat patch
+    gives r=0 with a finite gradient rather than a NaN."""
+    sw = weight.sum(-1).clamp_min(1e-6)
+    mx = (weight * base).sum(-1) / sw
+    my = (weight * warped).sum(-1) / sw
+    vx = (weight * base * base).sum(-1) / sw - mx * mx
+    vy = (weight * warped * warped).sum(-1) / sw - my * my
+    cxy = (weight * base * warped).sum(-1) / sw - mx * my
+    return cxy / (vx.clamp_min(1e-12) * vy.clamp_min(1e-12)).sqrt()
+
+
+@dataclass
+class _MEPhasePlan:
+    """Frame-invariant per-phase gather for the ME-scaled polish.
+
+    Everything here depends only on the fixed geometry (patch lattice + base
+    references), so it is built once and reused across all frames of a series.
+    ``gather_idx`` is the flat ``(B, V)`` index into ``vol.reshape(-1)`` -- one
+    advanced-index op replaces the per-patch ``torch.stack`` loop, and the same
+    index scatters the solved warp back."""
+
+    gather_idx: Tensor  # (B, V) long
+    ibots: Tensor  # (B,) float patch origins
+    jbots: Tensor
+    kbots: Tensor
+    base_i: Tensor  # (B, V) voxel coords
+    base_j: Tensor
+    base_k: Tensor
+    weight_patches: Tensor  # (B, V)
+    mask_patches: Tensor  # (B, V)
+    base_echo_patches: Tensor  # (E, B, V)
+    blok_prep: object | None  # BlokPairs for lpc/lpa; None for ncc
+    B: int
+
+
+@dataclass
+class _MELevelPlan:
+    nxh: int
+    nyh: int
+    nzh: int
+    basis: Tensor
+    half_widths: tuple[float, float, float]
+    param_max: float
+    ii_flat: Tensor
+    jj_flat: Tensor
+    kk_flat: Tensor
+    expand_mat: Tensor
+    phases: list[_MEPhasePlan]
+
+
+@dataclass
+class _MEScaledPlan:
+    pad: tuple[int, int, int]  # pad_x, pad_y, pad_z
+    do_pad: bool
+    orig: tuple[int, int, int]  # nz_orig, ny_orig, nx_orig
+    padded: tuple[int, int, int]  # nz, ny, nx
+    pe_grid_axis: int
+    do_xyz: tuple[bool, bool, bool]
+    n_active: int
+    levels: list[_MELevelPlan]
+    use_ncc: bool
+
+
+def _build_mescaled_plan(
+    base_echoes: Tensor,
+    pe_grid_axis: int,
+    weight: Tensor | None,
+    mask: Tensor | None,
+    config: QwarpConfig,
+    device: torch.device,
+    n_levels: int,
+    pad: bool,
+) -> _MEScaledPlan:
+    """Precompute all frame-invariant structure for the ME-scaled polish.
+
+    Padded base references, weight/mask, blok lattice, patch lattice, per-level
+    basis, and the vectorised per-phase gathers of the base/weight/mask patches.
+    A series calls this ONCE and reuses it for every frame; the per-frame solve
+    (:func:`_solve_mescaled_frame`) then only touches the moving data."""
+    base_echoes = base_echoes.float().to(device)
+    E = base_echoes.shape[0]
+    nz_orig, ny_orig, nx_orig = base_echoes.shape[1:]
+
+    pad_x, pad_y, pad_z = _compute_padding(nx_orig, ny_orig, nz_orig) if pad else (0, 0, 0)
+    do_pad = pad_x > 0 or pad_y > 0 or pad_z > 0
+
+    base_p = (
+        torch.stack([_pad_volume(base_echoes[e], pad_x, pad_y, pad_z) for e in range(E)])
+        if do_pad
+        else base_echoes
+    )
+    nz, ny, nx = base_p.shape[1:]
+
+    if weight is None:
+        weight_p = compute_weight_image(base_p.mean(0))
+    else:
+        w = weight.float().to(device)
+        weight_p = _pad_volume(w, pad_x, pad_y, pad_z) if do_pad else w
+    if mask is None:
+        mask_p = (weight_p > 0).byte()
+    else:
+        m = mask.byte().to(device)
+        mask_p = _pad_volume(m.float(), pad_x, pad_y, pad_z).byte() if do_pad else m
+
+    do_xyz = (pe_grid_axis == 0, pe_grid_axis == 1, pe_grid_axis == 2)
+    use_ncc = config.cost_method == "ncc"
+    if use_ncc:
+        blok_index_vol = None
+        nblok = 0
+    else:
+        bs = assign_bloks((nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask_p > 0))
+        blok_index_vol = bs.index.reshape(nz, ny, nx)
+        nblok = bs.nblok
+
+    imin, imax, jmin, jmax, kmin, kmax = _autobox(weight_p)
+
+    ngmin = max(config.minpatch, 5)
+    if ngmin % 2 == 0:
+        ngmin -= 1
+    widths: list[int] = []
+    w = ngmin
+    for _ in range(max(1, n_levels)):
+        widths.append(w)
+        w = int(round(w / config.shrink))
+        if w % 2 == 0:
+            w += 1
+    widths = widths[::-1]  # coarsest first
+    max_patch_lev1 = widths[0]
+
+    basis_type = "cubic_lite" if config.use_lite else "cubic"
+    ny_nx = ny * nx
+    base_p_flat = base_p.reshape(E, -1)
+    weight_flat = weight_p.reshape(-1)
+    mask_flat = mask_p.float().reshape(-1)
+    blok_flat = blok_index_vol.reshape(-1).long() if blok_index_vol is not None else None
+
+    active_dims = [d for d in range(3) if do_xyz[d]]
+    levels: list[_MELevelPlan] = []
+    n_active = 0
+
+    for pw in widths:
+        pw = min(pw, nx - 2, ny - 2, nz - 2)
+        if pw % 2 == 0:
+            pw -= 1
+        if pw < 5:
+            continue
+        xwid = ywid = zwid = pw
+        xdel = max(1, (xwid - 1) // 2)
+        ydel = max(1, (ywid - 1) // 2)
+        zdel = max(1, (zwid - 1) // 2)
+
+        ibbb = max(1, imin - xdel // 4 - 1)
+        jbbb = max(1, jmin - ydel // 4 - 1)
+        kbbb = max(1, kmin - zdel // 4 - 1)
+        ittt = min(nx - 2, imax + xdel // 4 + 1)
+        jttt = min(ny - 2, jmax + ydel // 4 + 1)
+        kttt = min(nz - 2, kmax + zdel // 4 + 1)
+        if nz == 1:
+            kbbb = kttt = 0
+
+        hfactor = _compute_hfactor(pw, max_patch_lev1, config.hfactor_q)
+        basis, half_widths, param_max = _get_basis_config(
+            basis_type, xwid, ywid, zwid, device, hfactor=hfactor
+        )
+        n_basis = basis.shape[0]
+        n_active = len(active_dims) * n_basis
+        n_total = 3 * n_basis
+        expand_mat = torch.zeros(n_active, n_total, device=device)
+        col = 0
+        for dim_i in active_dims:
+            off = dim_i * n_basis
+            expand_mat[col : col + n_basis, off : off + n_basis] = torch.eye(n_basis, device=device)
+            col += n_basis
+
+        kk_p, jj_p, ii_p = torch.meshgrid(
+            torch.arange(zwid, dtype=torch.float32, device=device),
+            torch.arange(ywid, dtype=torch.float32, device=device),
+            torch.arange(xwid, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+        ii_flat, jj_flat, kk_flat = ii_p.reshape(-1), jj_p.reshape(-1), kk_p.reshape(-1)
+        # Flat local offset within a patch (row-major (z,y,x)), shared by all patches.
+        local_off = (kk_flat.long() * ny_nx + jj_flat.long() * nx + ii_flat.long())[None, :]
+
+        all_patches = _generate_patch_grid(
+            ibbb, ittt, jbbb, jttt, kbbb, kttt, xwid, ywid, zwid, xdel, ydel, zdel
+        )
+        valid = _filter_patches(all_patches, weight_p, mask_p, nx, ny, nz)
+        checker = _checkerboard_phases(valid)
+
+        phase_plans: list[_MEPhasePlan] = []
+        for phase_idx in range(8):
+            pp = [
+                p
+                for p in checker[phase_idx]
+                if (p.itop - p.ibot + 1 == xwid)
+                and (p.jtop - p.jbot + 1 == ywid)
+                and (p.ktop - p.kbot + 1 == zwid)
+            ]
+            if not pp:
+                continue
+            B = len(pp)
+            ib = torch.tensor([p.ibot for p in pp], device=device)
+            jb = torch.tensor([p.jbot for p in pp], device=device)
+            kb = torch.tensor([p.kbot for p in pp], device=device)
+            patch_base = (kb * ny_nx + jb * nx + ib)[:, None]  # (B,1)
+            gather_idx = patch_base + local_off  # (B, V) long
+            ibf, jbf, kbf = ib.float(), jb.float(), kb.float()
+            phase_plans.append(
+                _MEPhasePlan(
+                    gather_idx=gather_idx,
+                    ibots=ibf,
+                    jbots=jbf,
+                    kbots=kbf,
+                    base_i=ibf[:, None] + ii_flat[None, :],
+                    base_j=jbf[:, None] + jj_flat[None, :],
+                    base_k=kbf[:, None] + kk_flat[None, :],
+                    weight_patches=weight_flat[gather_idx],
+                    mask_patches=mask_flat[gather_idx],
+                    base_echo_patches=base_p_flat[:, gather_idx],
+                    blok_prep=(
+                        None if use_ncc else prepare_blok_pairs(blok_flat[gather_idx], nblok)
+                    ),
+                    B=B,
+                )
+            )
+
+        levels.append(
+            _MELevelPlan(
+                nxh=xwid,
+                nyh=ywid,
+                nzh=zwid,
+                basis=basis,
+                half_widths=half_widths,
+                param_max=param_max,
+                ii_flat=ii_flat,
+                jj_flat=jj_flat,
+                kk_flat=kk_flat,
+                expand_mat=expand_mat,
+                phases=phase_plans,
+            )
+        )
+
+    return _MEScaledPlan(
+        pad=(pad_x, pad_y, pad_z),
+        do_pad=do_pad,
+        orig=(nz_orig, ny_orig, nx_orig),
+        padded=(nz, ny, nx),
+        pe_grid_axis=pe_grid_axis,
+        do_xyz=do_xyz,
+        n_active=n_active,
+        levels=levels,
+        use_ncc=use_ncc,
+    )
+
+
+def _improve_warp_batched_mescaled(
+    phase: _MEPhasePlan,
+    level: _MELevelPlan,
+    source_echoes: Tensor,
+    alpha: Tensor,
+    state: WarpState,
+    config: QwarpConfig,
+    device: torch.device,
+    do_xyz: tuple[bool, bool, bool],
+    use_penalty: bool,
+    pen_fac: float,
+    max_iter: int,
+    use_ncc: bool,
+) -> None:
+    """Optimize one checkerboard phase against the JOINT multi-echo scaled cost.
+
+    The free parameters are ONE shared PE-only field; the cost samples every echo
+    at ``alpha_e * (shared displacement)`` and sums the correlation. Gathers are
+    precomputed in ``phase`` (frame-invariant); only the moving ``source_echoes``
+    and the current ``state`` warp change per frame."""
+    B = phase.B
+    if B == 0 or level.expand_mat.shape[0] == 0:
+        return
+    E = source_echoes.shape[0]
+    nx, ny, nz = state.nx, state.ny, state.nz
+    nxh, nyh, nzh = level.nxh, level.nyh, level.nzh
+    basis, half_widths = level.basis, level.half_widths
+    ii_flat, jj_flat, kk_flat = level.ii_flat, level.jj_flat, level.kk_flat
+    expand_mat = level.expand_mat
+    ibots, jbots, kbots = phase.ibots, phase.jbots, phase.kbots
+    base_i, base_j, base_k = phase.base_i, phase.base_j, phase.base_k
+    weight_patches, mask_patches = phase.weight_patches, phase.mask_patches
+    base_echo_patches = phase.base_echo_patches
+
+    _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
+
+    external_pen = torch.zeros(B, device=device)
+    if use_penalty:
+        with torch.no_grad():
+            je_g, se_g = compute_jacobian_energy(state.xd, state.yd, state.zd)
+            energy_g = (je_g + se_g).reshape(-1)
+            external_pen = energy_g.sum() - energy_g[phase.gather_idx].sum(-1)
+
+    global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)
+    a_e = alpha.view(E, 1, 1)  # (E,1,1) per-echo TE scaling for broadcast
+
+    def _sample_echoes(ah_xd: Tensor, ah_yd: Tensor, ah_zd: Tensor) -> Tensor:
+        """(B,) mean -corr over echoes for the shared displacement ``ah``."""
+        if use_ncc:
+            # All echoes sampled at alpha_e*ah in ONE grid_sample (E as the batch dim).
+            sx = (base_i[None] + a_e * ah_xd[None]).clamp(-0.499, nx - 0.501)
+            sy = (base_j[None] + a_e * ah_yd[None]).clamp(-0.499, ny - 0.501)
+            sz = (base_k[None] + a_e * ah_zd[None]).clamp(-0.499, nz - 0.501)
+            warped = batched_trilinear_interpolate_multi(source_echoes, sx, sy, sz)
+            warped = warped * mask_patches[None]
+            r = _weighted_pearson_patches(base_echo_patches, warped, weight_patches[None])
+            return (-r).mean(0)
+        cost = torch.zeros(B, device=device)
+        for e in range(E):
+            ae = alpha[e]
+            sx = (base_i + ae * ah_xd).clamp(-0.499, nx - 0.501)
+            sy = (base_j + ae * ah_yd).clamp(-0.499, ny - 0.501)
+            sz = (base_k + ae * ah_zd).clamp(-0.499, nz - 0.501)
+            w_e = batched_trilinear_interpolate(source_echoes[e], sx, sy, sz) * mask_patches
+            corr_e = _blok_value(
+                base_echo_patches[e], w_e, weight_patches, phase.blok_prep, config.lpc_ppow
+            )
+            cost = cost - corr_e
+        return cost / E
+
+    def _compose(hxd: Tensor, hyd: Tensor, hzd: Tensor):
+        return batched_compose_and_interpolate(
+            source_echoes[0],
+            state.xd,
+            state.yd,
+            state.zd,
+            hxd,
+            hyd,
+            hzd,
+            ii_flat,
+            jj_flat,
+            kk_flat,
+            ibots,
+            jbots,
+            kbots,
+            nx,
+            ny,
+            nz,
+            global_warp_3ch=global_warp_3ch,
+            base_i=base_i,
+            base_j=base_j,
+            base_k=base_k,
+        )
+
+    def batched_cost(active_params: Tensor) -> Tensor:
+        full_params = active_params @ expand_mat
+        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
+        # ah = shared TOTAL displacement w (patch increment composed with global w).
+        _wv, ah_xd, ah_yd, ah_zd = _compose(hxd, hyd, hzd)
+        cost = _sample_echoes(ah_xd, ah_yd, ah_zd)
+        if use_penalty and pen_fac > 0:
+            cost = cost + compute_penalty_batched(
+                ah_xd.reshape(B, nzh, nyh, nxh),
+                ah_yd.reshape(B, nzh, nyh, nxh),
+                ah_zd.reshape(B, nzh, nyh, nxh),
+                pen_fac,
+                external_pen,
+            )
+        return cost
+
+    def _gn_solve(gn_iters: int) -> Tensor:
+        """Batched Levenberg-Marquardt on the normalised-NCC cost (PE-only).
+
+        The warp is linear in the params (``d = hw*(p@B)``), so the residual
+        Jacobian is ``(alpha_e/sW) * gradS · (hw·Bᵀ)`` -- an analytic image-gradient
+        term, no autograd. Per patch we assemble the tiny ``n_basis×n_basis`` normal
+        equations (summed over echoes, weighted, mean-centred = zero-normalised LK),
+        take a damped step, and accept it only if the exact NCC cost improves
+        (per-patch damping ``lam`` up on reject, down on accept)."""
+        pe = active_dims[0]
+        hw_pe = float(half_widths[pe])
+        bmat = basis  # (nb, V)
+        bt = bmat.t()  # (V, nb)
+        nb = bmat.shape[0]
+        pe_dim = (2, 1, 0)[pe]  # PE grid axis -> tensor dim in (nz, ny, nx)
+        gpe = (
+            torch.roll(source_echoes, -1, pe_dim + 1) - torch.roll(source_echoes, 1, pe_dim + 1)
+        ) * 0.5  # ∂S/∂(PE voxel), one per echo
+        omega = (weight_patches * mask_patches)[None]  # (1, B, V)
+        wsum = omega.sum(-1, keepdim=True).clamp_min(1e-6)  # (1, B, 1)
+        a4 = alpha.view(E, 1, 1, 1)
+
+        base = base_echo_patches  # (E, B, V)
+        mB = (omega * base).sum(-1, keepdim=True) / wsum
+        sB = ((omega * base * base).sum(-1, keepdim=True) / wsum - mB * mB).clamp_min(1e-12).sqrt()
+        base_hat = (base - mB) / sB
+
+        def _forward(p: Tensor):
+            d = hw_pe * (p @ bmat)  # (B, V)
+            zero = torch.zeros_like(d)
+            hxd, hyd, hzd = (
+                (d, zero, zero) if pe == 0 else (zero, d, zero) if pe == 1 else (zero, zero, d)
+            )
+            _wv, ax, ay, az = _compose(hxd, hyd, hzd)
+            sx = (base_i[None] + a_e * ax[None]).clamp(-0.499, nx - 0.501)
+            sy = (base_j[None] + a_e * ay[None]).clamp(-0.499, ny - 0.501)
+            sz = (base_k[None] + a_e * az[None]).clamp(-0.499, nz - 0.501)
+            w = batched_trilinear_interpolate_multi(source_echoes, sx, sy, sz)  # (E,B,V)
+            return w, sx, sy, sz
+
+        def _cost(w: Tensor) -> Tensor:
+            mW = (omega * w).sum(-1, keepdim=True) / wsum
+            sW = ((omega * w * w).sum(-1, keepdim=True) / wsum - mW * mW).clamp_min(1e-12).sqrt()
+            res = (w - mW) / sW - base_hat
+            return ((omega * res * res).sum(-1) / wsum.squeeze(-1)).sum(0)  # (E,B)->(B,)
+
+        p = torch.zeros(B, nb, device=device)
+        w0, *_ = _forward(p)
+        best_cost = _cost(w0)
+        best_p = p.clone()
+        lam = torch.full((B,), 1e-2, device=device)
+        for _it in range(gn_iters):
+            w, sx, sy, sz = _forward(best_p)
+            g = batched_trilinear_interpolate_multi(gpe, sx, sy, sz)  # (E,B,V)
+            mW = (omega * w).sum(-1, keepdim=True) / wsum
+            sW = ((omega * w * w).sum(-1, keepdim=True) / wsum - mW * mW).clamp_min(1e-12).sqrt()
+            res = (w - mW) / sW - base_hat  # (E,B,V)
+            dW = (a4 * hw_pe) * g.unsqueeze(-1) * bt  # (E,B,V,nb) steepest-descent images
+            mdW = (omega.unsqueeze(-1) * dW).sum(2, keepdim=True) / wsum.unsqueeze(-1)
+            jn = (dW - mdW) / sW.unsqueeze(-1)  # zero-normalised Jacobian
+            jnw = jn * omega.unsqueeze(-1)
+            hmat = torch.einsum("ebvn,ebvm->bnm", jnw, jn)  # (B, nb, nb)
+            grad = torch.einsum("ebvn,ebv->bn", jnw, res)  # (B, nb)
+            diag = torch.diagonal(hmat, dim1=-2, dim2=-1).clamp_min(1e-9)
+            amat = hmat + lam[:, None, None] * torch.diag_embed(diag)
+            delta = torch.linalg.solve(amat, -grad.unsqueeze(-1)).squeeze(-1)
+            p_new = (best_p + delta).clamp(-param_max, param_max)
+            wn, *_ = _forward(p_new)
+            cost_new = _cost(wn)
+            improved = cost_new < best_cost
+            best_p = torch.where(improved[:, None], p_new, best_p)
+            best_cost = torch.where(improved, cost_new, best_cost)
+            lam = torch.where(improved, lam * 0.5, lam * 4.0).clamp(1e-8, 1e8)
+        return best_p
+
+    active_dims = [d for d in range(3) if do_xyz[d]]
+    param_max = level.param_max
+    if use_ncc and config.optimizer == "gn":
+        with torch.no_grad():
+            best_params = _gn_solve(min(max_iter, 6))
+    else:
+        best_params, _bc, _stats = optimize_warp_params_batched(
+            batched_cost,
+            B,
+            level.expand_mat.shape[0],
+            level.param_max,
+            device,
+            max_iter=max_iter,
+            lr=config.batch_optimizer_lr,
+            tolerance=config.batch_optimizer_tol,
+            patience=config.batch_optimizer_patience,
+        )
+
+    with torch.no_grad():
+        full_params = best_params @ expand_mat
+        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
+        _wv, ah_xd, ah_yd, ah_zd = _compose(hxd, hyd, hzd)
+        # Patches in a checkerboard phase are non-overlapping, so a flat scatter via
+        # the precomputed gather index is safe (no colliding writes).
+        idx = phase.gather_idx.reshape(-1)
+        state.xd.view(-1)[idx] = ah_xd.reshape(-1)
+        state.yd.view(-1)[idx] = ah_yd.reshape(-1)
+        state.zd.view(-1)[idx] = ah_zd.reshape(-1)
+    state.patches_done += B
+
+
+def _solve_mescaled_frame(
+    plan: _MEScaledPlan,
+    source_echoes: Tensor,
+    seed_field: Tensor | None,
+    alpha: Tensor,
+    config: QwarpConfig,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Solve one frame's ME-scaled PE-only polish against a prebuilt ``plan``."""
+    pad_x, pad_y, pad_z = plan.pad
+    nz, ny, nx = plan.padded
+    nz_orig, ny_orig, nx_orig = plan.orig
+    E = source_echoes.shape[0]
+
+    source_echoes = source_echoes.float().to(device)
+    source_p = (
+        torch.stack([_pad_volume(source_echoes[e], pad_x, pad_y, pad_z) for e in range(E)])
+        if plan.do_pad
+        else source_echoes
+    )
+
+    state = WarpState(nx=nx, ny=ny, nz=nz)
+    state.xd = torch.zeros(nz, ny, nx, device=device)
+    state.yd = torch.zeros(nz, ny, nx, device=device)
+    state.zd = torch.zeros(nz, ny, nx, device=device)
+    if seed_field is not None:
+        seed = seed_field.float().to(device)
+        seed_p = _pad_volume(seed, pad_x, pad_y, pad_z) if plan.do_pad else seed
+        (state.xd, state.yd, state.zd)[plan.pe_grid_axis][...] = seed_p
+
+    for level in plan.levels:
+        # The penalty's h**0.25 term has infinite gradient at an all-zero field, which
+        # would poison the batch gradient; enable it only once the field has content
+        # (deferred one level only in the unseeded case -- a real seed is nonzero).
+        use_pen = float((state.xd.pow(2) + state.yd.pow(2) + state.zd.pow(2)).sum()) > 0.0
+        for phase in level.phases:
+            _improve_warp_batched_mescaled(
+                phase,
+                level,
+                source_p,
+                alpha,
+                state,
+                config,
+                device,
+                plan.do_xyz,
+                use_penalty=use_pen,
+                pen_fac=config.penalty_factor,
+                max_iter=config.batch_optimizer_iters,
+                use_ncc=plan.use_ncc,
+            )
+
+    warped = torch.empty(E, nz_orig, ny_orig, nx_orig, device=device)
+    for e in range(E):
+        ae = float(alpha[e])
+        wf = warp_image(
+            source_p[e], ae * state.xd, ae * state.yd, ae * state.zd, mode=config.final_interp
+        )
+        warped[e] = wf[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
+
+    field_pad = (state.xd, state.yd, state.zd)[plan.pe_grid_axis]
+    field = field_pad[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
+    return warped, field.contiguous()
+
+
+def qwarp_pe_scaled_polish(
+    base_echoes: Tensor,
+    source_echoes: Tensor,
+    pe_grid_axis: int,
+    alpha: Tensor | None = None,
+    seed_field: Tensor | None = None,
+    weight: Tensor | None = None,
+    mask: Tensor | None = None,
+    config: QwarpConfig | None = None,
+    device: torch.device | None = None,
+    n_levels: int = 2,
+    pad: bool = True,
+) -> tuple[Tensor, Tensor]:
+    """Polish a seed PE displacement field with joint multi-echo TE-scaled qwarp.
+
+    One shared PE-only field ``w`` is refined over ``n_levels`` fine patch levels
+    (ending at ``config.minpatch``) under the joint objective
+    ``sum_e lpa(warp(source_e, alpha_e*w), base_e)``. This is the qwarp "polish"
+    hand-off for locomoco: seed ``w`` with locomoco's estimate and let a couple of
+    fine nonlinear levels remove the residual it could not resolve. Single-echo is
+    ``E=1, alpha=[1]``.
+
+    Args:
+        base_echoes: ``(E, nz, ny, nx)`` per-echo reference (one TR, all echoes).
+        source_echoes: ``(E, nz, ny, nx)`` per-echo moving volume to align.
+        pe_grid_axis: which displacement channel carries PE — 0=x (fastest, ``nx``),
+            1=y (``ny``), 2=z (``nz``); the other two channels are held at zero.
+        alpha: ``(E,)`` fixed per-echo TE scaling (echo-1 relative). ``None`` => ones
+            (flat scaling / single echo).
+        seed_field: ``(nz, ny, nx)`` seed PE displacement (voxels). ``None`` => zeros.
+        weight, mask: optional shared ``(nz, ny, nx)`` weight/mask (auto if None).
+        config: :class:`QwarpConfig`; ``minpatch`` sets the finest level and
+            ``cost_method`` must be ``lpc``/``lpa``.
+        n_levels: number of fine levels (coarsest is ~``minpatch/shrink**(n-1)``).
+        pad: AFNI-style internal zero-padding (default True).
+
+    Returns:
+        ``(warped, field)`` where ``warped`` is ``(E, nz, ny, nx)`` each source warped
+        by ``alpha_e * w``, and ``field`` is the ``(nz, ny, nx)`` polished PE
+        displacement (voxels), both cropped back to the original grid.
+    """
+    if config is None:
+        config = QwarpConfig()
+    if config.cost_method not in ("ncc", "lpc", "lpa"):
+        raise ValueError(
+            f"qwarp_pe_scaled_polish uses ncc (patch Pearson) or lpc/lpa (blok-local); "
+            f"got cost_method={config.cost_method!r}."
+        )
+    if pe_grid_axis not in (0, 1, 2):
+        raise ValueError(f"pe_grid_axis must be 0, 1 or 2; got {pe_grid_axis}.")
+    if source_echoes.dim() != 4 or base_echoes.dim() != 4:
+        raise ValueError("base_echoes/source_echoes must be (E, nz, ny, nx).")
+
+    if device is None:
+        device = base_echoes.device if base_echoes.is_cuda else torch.device("cpu")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
+    E = source_echoes.shape[0]
+    alpha = torch.ones(E, device=device) if alpha is None else alpha.float().to(device)
+
+    plan = _build_mescaled_plan(
+        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, pad
+    )
+    return _solve_mescaled_frame(plan, source_echoes, seed_field, alpha, config, device)
+
+
+def qwarp_pe_scaled_polish_series(
+    base_echoes: Tensor,
+    source_series: Tensor,
+    seed_series: Tensor,
+    pe_grid_axis: int,
+    alpha: Tensor | None = None,
+    weight: Tensor | None = None,
+    mask: Tensor | None = None,
+    config: QwarpConfig | None = None,
+    device: torch.device | None = None,
+    n_levels: int = 2,
+    show_progress: bool = True,
+) -> tuple[Tensor, Tensor]:
+    """Per-frame joint multi-echo TE-scaled PE-only polish over a 4-D series.
+
+    Applies the joint scaled polish to every frame ``t`` independently: each frame's
+    echoes are aligned to the shared per-echo reference under the joint scaled
+    objective, seeded by ``seed_series[..., t]``. This is the real-data hand-off from
+    locomoco -- one shared PE field per frame, refined against every echo at its own TE.
+
+    The geometry (patch lattice, basis, per-phase base/weight/mask gathers) is fixed
+    across frames, so it is built ONCE via :func:`_build_mescaled_plan` and reused;
+    each frame only pays the moving-data padding + the optimizer. This is the bulk of
+    the per-frame speed -- the reused setup was ~2/3 of a from-scratch call.
+
+    Args:
+        base_echoes: ``(E, nz, ny, nx)`` per-echo reference template (motion-free).
+        source_series: ``(E, nz, ny, nx, T)`` per-echo moving series.
+        seed_series: ``(nz, ny, nx, T)`` per-frame seed PE displacement (voxels,
+            echo-1 scale) -- e.g. locomoco's shared field ``w``.
+        pe_grid_axis: PE displacement channel (0=x, 1=y, 2=z); see
+            :func:`qwarp_pe_scaled_polish`.
+        alpha: ``(E,)`` fixed per-echo TE scaling (echo-1 relative). ``None`` => ones.
+        weight, mask: optional shared ``(nz, ny, nx)`` weight/mask (auto if None).
+        config: :class:`QwarpConfig`; ``cost_method`` must be ``ncc``/``lpc``/``lpa``.
+        n_levels: fine levels per frame.
+        show_progress: draw a persistent tqdm bar over frames.
+
+    Returns:
+        ``(warped, field)`` with ``warped`` ``(E, nz, ny, nx, T)`` and ``field``
+        ``(nz, ny, nx, T)`` the polished per-frame PE displacement.
+    """
+    if source_series.dim() != 5:
+        raise ValueError(
+            f"source_series must be (E, nz, ny, nx, T); got {tuple(source_series.shape)}"
+        )
+    E, nz, ny, nx, T = source_series.shape
+    if seed_series.shape != (nz, ny, nx, T):
+        raise ValueError(
+            f"seed_series must be (nz, ny, nx, T)={(nz, ny, nx, T)}; got {tuple(seed_series.shape)}"
+        )
+    if config is None:
+        config = QwarpConfig()
+    if device is None:
+        device = base_echoes.device if base_echoes.is_cuda else torch.device("cpu")
+    alpha = torch.ones(E, device=device) if alpha is None else alpha.float().to(device)
+
+    # Build the frame-invariant geometry + base/weight/mask gathers ONCE.
+    plan = _build_mescaled_plan(base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, True)
+
+    warped = torch.empty(E, nz, ny, nx, T)
+    field = torch.empty(nz, ny, nx, T)
+
+    frames = range(T)
+    if show_progress and _tqdm is not None and T > 1:
+        frames = _tqdm(frames, desc="qwarp polish", leave=True)
+
+    for t in frames:
+        w_t, f_t = _solve_mescaled_frame(
+            plan, source_series[..., t], seed_series[..., t], alpha, config, device
+        )
+        warped[..., t] = w_t.cpu()
+        field[..., t] = f_t.cpu()
+
+    return warped, field
 
 
 # ---------------------------------------------------------------------------

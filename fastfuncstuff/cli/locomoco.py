@@ -327,17 +327,72 @@ def create_parser() -> argparse.ArgumentParser:
         "every other echo's warp is (TE_e/TE_k)·w. Much faster and often steadier than the joint "
         "solve; use the joint path (omit this) only to also DATA-CHECK the scaling.",
     )
+    me.add_argument(
+        "-final_qwarp",
+        action="store_true",
+        help="After a flow/xcorr/phase estimate, POLISH the residual with a few fine PE-only "
+        "nonlinear qwarp levels under the joint TE-scaled objective (one shared residual field "
+        "r, every echo scored at alpha_e·r). Removes the sub-voxel wiggle the search can't "
+        "resolve; total field is w+r. Configured by the -qwarp_* flags below. Needs the "
+        "corrected series (not compatible with -no_corrected). Use -backend qwarp instead to "
+        "let qwarp own the whole field. ME 3-D-EPI temporal modes only.",
+    )
+    me.add_argument(
+        "-qwarp_minpatch",
+        "-final_qwarp_minpatch",
+        type=int,
+        default=7,
+        dest="qwarp_minpatch",
+        help="Finest qwarp patch size (voxels). Default 7 for the -final_qwarp polish; try 9 "
+        "for -backend qwarp. Applies to both the polish and the full qwarp backend.",
+    )
+    me.add_argument(
+        "-qwarp_levels",
+        "-final_qwarp_levels",
+        type=int,
+        default=2,
+        dest="qwarp_levels",
+        help="Number of qwarp levels (coarsest is ~minpatch/0.75^(n-1)). Default 2 for the "
+        "polish; try 4 for -backend qwarp (needs more reach from scratch).",
+    )
+    me.add_argument(
+        "-qwarp_iters",
+        "-final_qwarp_iters",
+        type=int,
+        default=10,
+        dest="qwarp_iters",
+        help="Per-patch optimizer iterations. The GN solver converges in a few steps, so this "
+        "is a generous cap, not a dial. Default 10.",
+    )
+    me.add_argument(
+        "-qwarp_cost",
+        default="ncc",
+        choices=("ncc", "lpa", "lpc"),
+        help="qwarp patch cost. 'ncc' (default, weighted Pearson) is right for the "
+        "same-contrast polish and enables the Gauss-Newton optimizer; lpa/lpc are the "
+        "AFNI-faithful blok-local costs (autodiff Adam only).",
+    )
+    me.add_argument(
+        "-qwarp_optimizer",
+        default="gn",
+        choices=("gn", "adam"),
+        help="qwarp per-patch optimizer. 'gn' (default) Gauss-Newton with an analytic "
+        "image-gradient Jacobian — no autograd, converges in a few steps (~5x faster); needs "
+        "-qwarp_cost ncc (falls back to adam otherwise). 'adam' the autodiff optimizer.",
+    )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
         "-backend",
         default="flow",
-        choices=("flow", "phase", "xcorr"),
+        choices=("flow", "phase", "xcorr", "qwarp"),
         help="Displacement estimator (all measure the same PE shift): 'flow' "
         "(default) pyramidal Lucas-Kanade optical flow — most precise, slowest; "
         "'phase' phase-correlation searchlight (FFT phase-ramp along PE) — fastest, "
         "near-flow accuracy; 'xcorr' magnitude cross-correlation searchlight (slide "
-        "along PE, peak local correlation) — robust, single-shot. See epilog for the "
-        "flag→backend map and tuning.",
+        "along PE, peak local correlation) — robust, single-shot; 'qwarp' (ME 3-D-EPI only) "
+        "builds a refined median reference with a flow -refine pass, then lets the joint "
+        "TE-scaled qwarp own the whole field (raw echoes → reference; the -qwarp_* flags "
+        "apply, the flow-tuning flags only affect the reference pass). See epilog for tuning.",
     )
     est.add_argument(
         "-ref",
@@ -655,6 +710,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
     out.add_argument("-no_corrected", action="store_true", help="Skip the corrected series.")
     out.add_argument(
+        "-allow_neg",
+        action="store_true",
+        help="Keep negative values in the corrected series/mean. By default they are clamped "
+        "to 0 (fMRI magnitude data is non-negative; wsinc5/lanczos resampling rings negative "
+        "near sharp edges). Does not affect the signed flow/warp/PC outputs.",
+    )
+    out.add_argument(
         "-want_pcs",
         "-want-pcs",
         nargs="?",
@@ -906,6 +968,11 @@ def _write_warp_pcs(components, stem, n_pcs) -> None:
     print(f"  • warp PCs ({scores.shape[1]}, denoising regressors, var {var_pct}): {pcs_path}")
 
 
+def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
+    """Clamp negatives in a magnitude image unless -allow_neg (sinc resampling rings)."""
+    return arr if allow_neg else np.clip(arr, 0.0, None)
+
+
 def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     """Multi-echo 3-D EPI: joint shared-field estimate, per-echo warp + corrected out."""
     import numpy as np
@@ -1013,6 +1080,31 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         )
         return 2
 
+    # -backend qwarp: a flow -refine pass builds the refined median reference, then the
+    # joint TE-scaled qwarp owns the whole field (raw echoes -> reference).
+    qwarp_backend = args.backend == "qwarp"
+    if qwarp_backend:
+        if args.me_interecho:
+            print(
+                "❌ -backend qwarp needs a temporal reference; not valid with -me_interecho.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.no_corrected:
+            print(
+                "❌ -backend qwarp builds its reference from the corrected series; drop -no_corrected.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.final_qwarp:
+            print(
+                "❌ -backend qwarp already owns the field; -final_qwarp is redundant. Pick one.",
+                file=sys.stderr,
+            )
+            return 2
+    # The estimator that runs is the reference-building pass (flow for the qwarp backend).
+    prepass_backend = "flow" if qwarp_backend else args.backend
+
     print(
         f"🌀 ffs_locomoco -me_3depi: {len(datas)} echoes  shape={datas[0].shape}  device={device}"
     )
@@ -1029,16 +1121,31 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     # ref / refine are temporal-template knobs — inert under inter-echo (no template).
     ref_note = "ref=n/a" if args.me_interecho else f"ref={args.ref}"
     refine_note = "refine=n/a" if args.me_interecho else f"refine={args.refine}"
-    print(
-        f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend={args.backend}, "
-        f"{ref_note}, mode={mode}, scaling={scaling}, "
-        f"levels={args.levels}, iters={args.iters}, {refine_note}, "
-        f"automask={'on' if automask else 'off'}"
-    )
+    if qwarp_backend:
+        # The flow-tuning flags only shape the reference pass here; screen them so they
+        # don't read as tuning the final (qwarp) field.
+        print(
+            f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend=qwarp "
+            f"(reference: flow {ref_note}, {refine_note}), mode={mode}, scaling={scaling}, "
+            f"automask={'on' if automask else 'off'}"
+        )
+        print(
+            f"   🪄 qwarp field: minpatch={args.qwarp_minpatch}, levels={args.qwarp_levels}, "
+            f"iters={args.qwarp_iters}, cost={args.qwarp_cost}, optimizer={args.qwarp_optimizer}"
+        )
+    else:
+        print(
+            f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend={args.backend}, "
+            f"{ref_note}, mode={mode}, scaling={scaling}, "
+            f"levels={args.levels}, iters={args.iters}, {refine_note}, "
+            f"automask={'on' if automask else 'off'}"
+        )
     if hpf_sigma > 0:
         print(f"   ⚗️  estimation spatial high-pass: {args.hpf_spatial}mm (σ={hpf_sigma:.2f}vox)")
     # The inter-echo mode has no temporal reference, so the refine bias warning is moot.
-    if args.refine == 0 and not args.me_interecho:
+    # Under the qwarp backend, refine only sharpens the reference, so a low-magnitude
+    # warning would be misleading (qwarp estimates the full field regardless).
+    if args.refine == 0 and not args.me_interecho and not qwarp_backend:
         print(
             f"   ℹ️  refine=0: the reference ('{args.ref}') is built from the un-corrected "
             "frames, so it still carries the wiggle and biases displacement LOW — add "
@@ -1053,7 +1160,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             args.echo_times,
             pe_axis,
             slice_axis,
-            backend=args.backend,
+            backend=prepass_backend,
             smooth_sigma=smooth_sigma,
             n_levels=args.levels,
             n_iters=args.iters,
@@ -1080,7 +1187,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             pe_axis,
             slice_axis,
             ref_mode=args.ref,
-            backend=args.backend,
+            backend=prepass_backend,
             smooth_sigma=smooth_sigma,
             n_levels=args.levels,
             n_iters=args.iters,
@@ -1109,7 +1216,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             pe_axis,
             slice_axis,
             ref_mode=args.ref,
-            backend=args.backend,
+            backend=prepass_backend,
             smooth_sigma=smooth_sigma,
             n_levels=args.levels,
             n_iters=args.iters,
@@ -1137,6 +1244,31 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             device=device,
         )
 
+    if qwarp_backend or args.final_qwarp:
+        if args.final_qwarp and args.me_interecho:
+            raise SystemExit(
+                "-final_qwarp needs a temporal reference; not supported with -me_interecho."
+            )
+        if args.final_qwarp and args.no_corrected:
+            raise SystemExit("-final_qwarp polishes the corrected series; drop -no_corrected.")
+        from fastfuncstuff.processing.locomoco import polish_me_result
+
+        if qwarp_backend:
+            print("🪄 qwarp backend: registering raw echoes to the refined reference...")
+        else:
+            print("🪄 Polishing residual with joint TE-scaled qwarp...")
+        result = polish_me_result(
+            result,
+            minpatch=args.qwarp_minpatch,
+            n_levels=args.qwarp_levels,
+            iters=args.qwarp_iters,
+            cost=args.qwarp_cost,
+            optimizer=args.qwarp_optimizer,
+            full=qwarp_backend,
+            raw_datas=datas if qwarp_backend else None,
+            device=device,
+        )
+
     print("💾 Writing outputs...")
     as_5d = args.warp_format == "5d"
     for j, res in enumerate(result.per_echo):
@@ -1151,7 +1283,11 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         if not args.no_corrected:
             corr_path = f"{estem}_locomoco{ext}"
             with spinner(f"Writing {Path(corr_path).name}"):
-                save_nifti(res.corrected_series().numpy(), corr_path, affine=affine)
+                save_nifti(
+                    _neg_clip(res.corrected_series().numpy(), args.allow_neg),
+                    corr_path,
+                    affine=affine,
+                )
             print(f"  • echo {j + 1} corrected series: {corr_path}")
         if not args.no_flow:
             flow_path = f"{estem}_flow{ext}"
@@ -1266,6 +1402,27 @@ def main(argv: list[str] | None = None) -> int:
     # Multi-echo 3-D EPI: several inputs, one shared field scaled per echo.
     if me_mode:
         return _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext)
+
+    # Single-echo qwarp: same idea as ME with E=1 -- no echo scaling, just register each
+    # frame to the refined median via ncc. -backend qwarp lets qwarp own the field;
+    # -final_qwarp polishes the estimator's residual.
+    qwarp_backend = args.backend == "qwarp"
+    if qwarp_backend or args.final_qwarp:
+        which = "backend" if qwarp_backend else "polish"
+        if dual:
+            print(f"❌ qwarp {which} is single phase-encode only (one -pe_dir).", file=sys.stderr)
+            return 2
+        if rotaware:
+            print(f"❌ qwarp {which} is not supported with rotation-aware mode.", file=sys.stderr)
+            return 2
+        if args.no_corrected:
+            print(
+                f"❌ qwarp {which} builds its reference from the corrected series; drop -no_corrected.",
+                file=sys.stderr,
+            )
+            return 2
+    # The estimator that runs is the reference-building pass (flow for the qwarp backend).
+    prepass_backend = "flow" if qwarp_backend else args.backend
     if len(args.input) != 1:
         print(
             f"❌ single-echo mode takes ONE -input (got {len(args.input)}); use -me_3depi for "
@@ -1335,6 +1492,12 @@ def main(argv: list[str] | None = None) -> int:
     if hpf_sigma > 0:
         print(f"   ⚗️  estimation spatial high-pass: {args.hpf_spatial}mm (σ={hpf_sigma:.2f}vox)")
     print(f"   accuracy: {acc_desc}")
+    if qwarp_backend:
+        print(
+            f"   🪄 qwarp field (E=1, ncc to median; flow -refine {args.refine} builds the "
+            f"reference): minpatch={args.qwarp_minpatch}, levels={args.qwarp_levels}, "
+            f"iters={args.qwarp_iters}, optimizer={args.qwarp_optimizer}"
+        )
 
     if rotaware:
         if args.raw_input is None or args.moco_matrix is None:
@@ -1428,7 +1591,7 @@ def main(argv: list[str] | None = None) -> int:
             pe_axis,
             slice_axis,
             ref_mode=args.ref,
-            backend=args.backend,
+            backend=prepass_backend,
             smooth_sigma=smooth_sigma,
             n_levels=args.levels,
             n_iters=args.iters,
@@ -1459,6 +1622,37 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
         )
 
+    if qwarp_backend or args.final_qwarp:
+        # Reuse the joint machinery at E=1 (alpha=[1], no scaling): wrap the single result,
+        # register raw frames (backend) or the corrected series (polish) to its median.
+        from fastfuncstuff.processing.locomoco import MultiEchoLocomocoResult, polish_me_result
+
+        print(
+            "🪄 qwarp backend: registering frames to the refined reference..."
+            if qwarp_backend
+            else "🪄 Polishing residual with qwarp..."
+        )
+        wrapped = MultiEchoLocomocoResult(
+            per_echo=[result],
+            alpha=torch.tensor([1.0]),
+            echo_times=torch.tensor([1.0]),
+            w_field=result.pe_displacement(),
+            pe_axis=result.pe_axis,
+            linearity_r2=1.0,
+        )
+        polished = polish_me_result(
+            wrapped,
+            minpatch=args.qwarp_minpatch,
+            n_levels=args.qwarp_levels,
+            iters=args.qwarp_iters,
+            cost=args.qwarp_cost,
+            optimizer=args.qwarp_optimizer,
+            full=qwarp_backend,
+            raw_datas=[data] if qwarp_backend else None,
+            device=device,
+        )
+        result = polished.per_echo[0]
+
     print("💾 Writing outputs...")
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
@@ -1486,14 +1680,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_corrected:
         corr_path = f"{stem}_locomoco{ext}"
         with spinner(f"Writing {Path(corr_path).name}"):
-            save_nifti(result.corrected_series().numpy(), corr_path, affine=affine)
+            save_nifti(
+                _neg_clip(result.corrected_series().numpy(), args.allow_neg),
+                corr_path,
+                affine=affine,
+            )
         print(f"  • corrected series: {corr_path}")
 
     if args.save_mean:
         mean_path = f"{stem}_locomoco_mean{ext}"
         # Temporal mean of the corrected series ((nx, ny, nz, T) -> mean over T).
         with spinner(f"Writing {Path(mean_path).name}"):
-            save_nifti(result.corrected_series().mean(dim=-1).numpy(), mean_path, affine=affine)
+            save_nifti(
+                _neg_clip(result.corrected_series().mean(dim=-1).numpy(), args.allow_neg),
+                mean_path,
+                affine=affine,
+            )
         print(f"  • corrected mean: {mean_path}")
 
     if not args.no_flow:

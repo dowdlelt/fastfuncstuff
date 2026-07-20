@@ -1,0 +1,233 @@
+"""Joint multi-echo TE-scaled PE-only qwarp polish (locomoco hand-off).
+
+The ME 3-D-EPI partition/PE wiggle scales linearly with echo time: one shared
+displacement field ``w`` and echo ``e`` sees ``alpha_e * w`` with
+``alpha_e = TE_e / TE_1`` FIXED (not fitted). :func:`qwarp_pe_scaled_polish`
+refines a seed ``w`` under the joint objective
+``sum_e lpa(warp(source_e, alpha_e*w), base_e)``.
+
+Correctness is judged on field recovery (``corr(field, w_true)``) -- the direct
+measure -- rather than fragile absolute image-correlation margins. The alpha guard
+verifies the per-echo scaling is load-bearing: with the wrong alpha a single field
+cannot align a 2x-shifted echo.
+"""
+
+import pytest
+import torch
+
+from fastfuncstuff.processing.interp import warp_image
+from fastfuncstuff.processing.warp import (
+    QwarpConfig,
+    qwarp_pe_scaled_polish,
+    qwarp_pe_scaled_polish_series,
+)
+
+
+def _sepconv(v: torch.Tensor, k: torch.Tensor, axis: int) -> torch.Tensor:
+    v = v.movedim(axis, -1)
+    shape = v.shape
+    flat = v.reshape(-1, 1, shape[-1])  # (N, C=1, L) for replicate pad
+    pad = (k.numel() - 1) // 2
+    vp = torch.nn.functional.pad(flat, (pad, pad), mode="replicate")
+    out = torch.zeros_like(flat)
+    for i, w in enumerate(k):
+        out = out + w * vp[..., i : i + shape[-1]]
+    return out.reshape(shape).movedim(-1, axis)
+
+
+def _smooth_volume(nz: int, ny: int, nx: int, seed: int) -> torch.Tensor:
+    """Structured positive volume: short-correlation texture the cost can lock to."""
+    g = torch.Generator().manual_seed(seed)
+    v = torch.rand(nz, ny, nx, generator=g)
+    for axis in (0, 1, 2):
+        v = _sepconv(v, torch.tensor([0.25, 0.5, 0.25]), axis)
+    v = v - v.min()
+    return v / v.max() + 0.05
+
+
+def _smooth_pe_field(nz: int, ny: int, nx: int, amp: float) -> torch.Tensor:
+    """Smooth PE (y-axis) displacement, tapered to zero at the edges (in-bounds)."""
+    zz, yy, xx = torch.meshgrid(
+        torch.linspace(0, 1, nz),
+        torch.linspace(0, 1, ny),
+        torch.linspace(0, 1, nx),
+        indexing="ij",
+    )
+    field = amp * torch.sin(2 * torch.pi * xx) * torch.cos(torch.pi * zz)
+    taper = torch.sin(torch.pi * yy) * torch.sin(torch.pi * xx).clamp(min=0)
+    return (field * taper).contiguous()
+
+
+def _corr(a: torch.Tensor, b: torch.Tensor, m: torch.Tensor) -> float:
+    a = a[m]
+    b = b[m]
+    a = a - a.mean()
+    b = b - b.mean()
+    return float((a * b).sum() / (a.norm() * b.norm() + 1e-12))
+
+
+@pytest.mark.parametrize(
+    "cost,optimizer", [("ncc", "gn"), ("ncc", "adam"), ("lpa", "adam")]
+)
+def test_single_echo_recovers_field_and_improves_alignment(cost, optimizer):
+    nz, ny, nx = 10, 24, 24
+    base = _smooth_volume(nz, ny, nx, seed=0)
+    w_true = _smooth_pe_field(nz, ny, nx, amp=2.0)
+
+    # source displaced by -w_true along PE (y): warp(source, +w_true) ~= base.
+    z0 = torch.zeros_like(w_true)
+    source = warp_image(base, z0, -w_true, z0, mode="linear")
+
+    cfg = QwarpConfig(minpatch=7, cost_method=cost, verb=0, optimizer=optimizer)
+    warped, field = qwarp_pe_scaled_polish(
+        base[None], source[None], pe_grid_axis=1, config=cfg, n_levels=2
+    )
+
+    interior = torch.zeros(nz, ny, nx, dtype=torch.bool)
+    interior[2:-2, 4:-4, 4:-4] = True
+    big = interior & (w_true.abs() > 0.4)
+
+    before = _corr(source, base, interior)
+    after = _corr(warped[0], base, interior)
+    assert after > before, f"alignment did not improve: {before:.3f} -> {after:.3f}"
+    assert after > 0.97, f"warped should closely match base, got corr {after:.3f}"
+    assert _corr(field, w_true, big) > 0.85, "recovered field does not track truth"
+
+
+def test_joint_scaling_aligns_both_echoes():
+    """One shared field, alpha=[1,2]: both echoes align together, and polishing a
+    degraded seed recovers the true field better than the seed."""
+    nz, ny, nx = 10, 24, 24
+    base = _smooth_volume(nz, ny, nx, seed=1)
+    w_true = _smooth_pe_field(nz, ny, nx, amp=1.6)
+    alpha = torch.tensor([1.0, 2.0])
+    z0 = torch.zeros_like(w_true)
+
+    base_echoes = torch.stack([base, base])
+    source_echoes = torch.stack(
+        [warp_image(base, z0, -float(a) * w_true, z0, mode="linear") for a in alpha]
+    )
+
+    # Seed with a degraded (70%) field, standing in for locomoco's ~90% estimate.
+    seed = 0.7 * w_true
+
+    cfg = QwarpConfig(minpatch=7, cost_method="ncc", verb=0, optimizer="gn")
+    warped, field = qwarp_pe_scaled_polish(
+        base_echoes,
+        source_echoes,
+        pe_grid_axis=1,
+        alpha=alpha,
+        seed_field=seed,
+        config=cfg,
+        n_levels=2,
+    )
+
+    interior = torch.zeros(nz, ny, nx, dtype=torch.bool)
+    interior[2:-2, 4:-4, 4:-4] = True
+    big = interior & (w_true.abs() > 0.3)
+
+    for e in (0, 1):
+        before = _corr(source_echoes[e], base, interior)
+        after = _corr(warped[e], base, interior)
+        assert after > before, f"echo {e} not improved: {before:.3f} -> {after:.3f}"
+        assert after > 0.95, f"echo {e} poorly aligned: corr {after:.3f}"
+
+    # corr is scale-invariant (the 0.7x seed already correlates 1.0 with truth), so
+    # judge the recovery on magnitude: the polish must reduce the seed's under-shoot.
+    def _rmse(a: torch.Tensor, b: torch.Tensor, m: torch.Tensor) -> float:
+        return float(((a[m] - b[m]) ** 2).mean().sqrt())
+
+    assert _rmse(field, w_true, big) < _rmse(seed, w_true, big), "polish did not beat seed"
+    assert _corr(field, w_true, big) > 0.85
+
+
+def test_wrong_alpha_leaves_long_echo_misaligned():
+    """Guard: treating both echoes as alpha=1 must fail to align the 2x echo.
+
+    A single field cannot simultaneously satisfy a 1x and a 2x shift; only the
+    correct alpha lets the shared field align the long echo. Proves the per-echo
+    scaling is actually used -- if the cost ignored alpha this test would pass
+    spuriously (both runs identical)."""
+    nz, ny, nx = 10, 24, 24
+    base = _smooth_volume(nz, ny, nx, seed=2)
+    w_true = _smooth_pe_field(nz, ny, nx, amp=2.0)
+    z0 = torch.zeros_like(w_true)
+
+    base_echoes = torch.stack([base, base])
+    source_echoes = torch.stack(
+        [
+            warp_image(base, z0, -w_true, z0, mode="linear"),
+            warp_image(base, z0, -2.0 * w_true, z0, mode="linear"),
+        ]
+    )
+
+    cfg = QwarpConfig(minpatch=7, cost_method="ncc", verb=0, optimizer="gn")
+    warped_wrong, _ = qwarp_pe_scaled_polish(
+        base_echoes,
+        source_echoes,
+        pe_grid_axis=1,
+        alpha=torch.tensor([1.0, 1.0]),
+        config=cfg,
+        n_levels=2,
+    )
+    warped_right, _ = qwarp_pe_scaled_polish(
+        base_echoes,
+        source_echoes,
+        pe_grid_axis=1,
+        alpha=torch.tensor([1.0, 2.0]),
+        config=cfg,
+        n_levels=2,
+    )
+
+    interior = torch.zeros(nz, ny, nx, dtype=torch.bool)
+    interior[2:-2, 4:-4, 4:-4] = True
+
+    long_wrong = _corr(warped_wrong[1], base, interior)
+    long_right = _corr(warped_right[1], base, interior)
+    assert long_right > long_wrong + 0.03, (
+        f"correct alpha should align the long echo better: "
+        f"wrong={long_wrong:.3f} right={long_right:.3f}"
+    )
+
+
+def test_series_polishes_every_frame():
+    """The 4-D series wrapper polishes each frame and returns the right shapes."""
+    nz, ny, nx, T = 8, 22, 22, 3
+    base = _smooth_volume(nz, ny, nx, seed=3)
+    w_true = _smooth_pe_field(nz, ny, nx, amp=1.8)
+    alpha = torch.tensor([1.0, 2.0])
+    z0 = torch.zeros_like(w_true)
+
+    base_echoes = torch.stack([base, base])
+    # Per-frame the true field scales slightly, so each frame is a distinct problem.
+    source_series = torch.empty(2, nz, ny, nx, T)
+    for t in range(T):
+        wt = w_true * (0.8 + 0.2 * t)
+        for e, a in enumerate(alpha):
+            source_series[e, ..., t] = warp_image(base, z0, -float(a) * wt, z0, mode="linear")
+    seed_series = torch.zeros(nz, ny, nx, T)
+
+    cfg = QwarpConfig(minpatch=7, cost_method="ncc", verb=0, optimizer="gn")
+    warped, field = qwarp_pe_scaled_polish_series(
+        base_echoes,
+        source_series,
+        seed_series,
+        pe_grid_axis=1,
+        alpha=alpha,
+        config=cfg,
+        n_levels=2,
+        show_progress=False,
+    )
+
+    assert warped.shape == (2, nz, ny, nx, T)
+    assert field.shape == (nz, ny, nx, T)
+
+    interior = torch.zeros(nz, ny, nx, dtype=torch.bool)
+    interior[2:-2, 4:-4, 4:-4] = True
+    for t in range(T):
+        for e in (0, 1):
+            before = _corr(source_series[e, ..., t], base, interior)
+            after = _corr(warped[e, ..., t], base, interior)
+            assert after >= before - 1e-3, (
+                f"frame {t} echo {e} regressed: {before:.3f}->{after:.3f}"
+            )

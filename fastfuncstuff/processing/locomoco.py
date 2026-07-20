@@ -3557,6 +3557,138 @@ def estimate_residual_flow_me_scaled(
     )
 
 
+def polish_me_result(
+    result: MultiEchoLocomocoResult,
+    *,
+    minpatch: int = 7,
+    n_levels: int = 2,
+    iters: int = 10,
+    cost: str = "ncc",
+    optimizer: str = "gn",
+    full: bool = False,
+    raw_datas: list[np.ndarray] | None = None,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> MultiEchoLocomocoResult:
+    """Nonlinear joint TE-scaled ``qwarp`` of a multi-echo locomoco result.
+
+    Two modes against the SAME reference -- the temporal median of the (refined)
+    corrected series, a sharp motion-removed template:
+
+    * ``full=False`` (**polish**, ``-final_qwarp``): register the *corrected* series
+      (seed 0) to the reference, finding the residual ``r`` the estimator's search
+      couldn't resolve; total field is ``w + r``. Sign-safe (no seeding with ``w``).
+    * ``full=True`` (**backend**, ``-backend qwarp``): register the *raw* echoes
+      (``raw_datas``, seed 0) to the reference -- qwarp owns the whole field, output is
+      just the qwarp field (the flow pass only built the reference). Needs a fuller
+      cascade (more levels) since it starts from the full distortion.
+
+    Both are JOINT: one shared PE field, every echo scored at ``alpha_e·field``.
+    Returns a new :class:`MultiEchoLocomocoResult` the CLI writes exactly like the
+    estimator's own output. (The single composed warp is ``alpha_e·field``; writing it
+    as one field is a downstream concern.)
+    """
+    from .warp import QwarpConfig, qwarp_pe_scaled_polish_series
+
+    ref = result.per_echo[0]
+    e = len(result.per_echo)
+    w = result.w_field  # (nx, ny, nz, T) shared field, echo-1 scale
+    nx, ny, nz, nt = w.shape
+    alpha = result.alpha
+    pe_axis = result.pe_axis
+
+    # Reference = temporal median of the corrected series (refined template). The
+    # moving data is the corrected series (polish) or the raw echoes (full backend).
+    corr_series = [result.per_echo[j].corrected_series().float() for j in range(e)]
+    base_echoes = torch.stack(
+        [c.median(dim=-1).values.permute(2, 1, 0).contiguous() for c in corr_series]
+    )
+    if full:
+        if raw_datas is None:
+            raise ValueError("polish_me_result(full=True) needs raw_datas (the raw echoes).")
+        source_series = torch.stack(
+            [
+                torch.from_numpy(np.ascontiguousarray(raw_datas[j])).float().permute(2, 1, 0, 3)
+                for j in range(e)
+            ]
+        ).contiguous()
+    else:
+        source_series = torch.stack([c.permute(2, 1, 0, 3).contiguous() for c in corr_series])
+    seed_series = torch.zeros(nz, ny, nx, nt)  # start from zero (residual, or full from raw)
+
+    # Gauss-Newton on the ncc cost: analytic image-gradient Jacobian (no autograd),
+    # converges in a few steps. Starts near the solution (polish) or from the full
+    # distortion (backend, needs more levels), always from seed 0.
+    cfg = QwarpConfig(
+        minpatch=minpatch,
+        cost_method=cost,
+        verb=0,
+        batch_optimizer_iters=iters,
+        optimizer=optimizer if cost == "ncc" else "adam",
+    )
+    warped, resid = qwarp_pe_scaled_polish_series(
+        base_echoes,
+        source_series,
+        seed_series,
+        pe_axis,  # PE displacement channel label is shared between NIfTI-xyz and qwarp grid
+        alpha=alpha,
+        config=cfg,
+        n_levels=n_levels,
+        device=device,
+        show_progress=verbose,
+    )
+
+    r = resid.permute(2, 1, 0, 3).contiguous()  # (nx, ny, nz, T) qwarp field, echo-1 scale
+    # Polish adds to the estimator field; the full backend IS the field.
+    w_new = r if full else w + r
+    warped_nifti = [warped[j].permute(2, 1, 0, 3).contiguous() for j in range(e)]
+
+    perm4, pe_flow_is_u = ref.perm, ref.pe_flow_is_u
+    a0, a1, disp_slice = ref.a0, ref.a1, ref.slice_axis
+    per_echo: list[LocomocoResult] = []
+    for j in range(e):
+        disp_e = (float(alpha[j]) * w_new).contiguous()
+        p_canon = disp_e.permute(perm4).contiguous()
+        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
+        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        per_echo.append(
+            LocomocoResult(
+                u_canon=u_canon,
+                v_canon=v_canon,
+                corrected_canon=torch.zeros_like(p_canon),
+                perm=perm4,
+                pe_flow_is_u=pe_flow_is_u,
+                pe_axis=pe_axis,
+                slice_axis=disp_slice,
+                orig_shape=(nx, ny, nz, nt),
+                a0=a0,
+                a1=a1,
+                dual=False,
+                corrected_nifti=warped_nifti[j],
+            )
+        )
+
+    if verbose:
+        rr = r.abs()
+        sel = rr[rr > 0]
+        med = float(sel.median()) if sel.numel() else 0.0
+        tag = "field |w|" if full else "residual |r|"
+        print(
+            f"🪄 qwarp {'backend' if full else 'polish'}: {tag} median {med:.3f} vox, "
+            f"max {float(rr.max()):.3f} vox (minpatch {minpatch}, {n_levels} levels, "
+            f"{cost}/{optimizer if cost == 'ncc' else 'adam'})"
+        )
+
+    return MultiEchoLocomocoResult(
+        per_echo=per_echo,
+        alpha=alpha,
+        echo_times=result.echo_times,
+        w_field=w_new,
+        pe_axis=pe_axis,
+        linearity_r2=result.linearity_r2,
+    )
+
+
 def estimate_residual_flow_me_interecho(
     datas: list[np.ndarray],
     echo_times: list[float],
