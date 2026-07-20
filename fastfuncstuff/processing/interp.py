@@ -632,14 +632,17 @@ def _gather_contract(
     return acc
 
 
-# torch.compile pays a one-time ~1-3s compile, so it's only worth it for workloads
-# that recur (4D series, moco): the compiled fn is cached process-wide and amortizes
-# across calls. Inductor fuses the gather with the multiply-reduce and never
-# materializes the (C, chunk, ntaps, ntaps) planes the eager three-pass builds ten
-# times over -- ~10x on BOTH CPU and CUDA (measured: a wsinc5 gather 461->43 ms on
-# an RTX 5070 Ti). The per-device counter keeps a one-shot single apply on the eager
-# path (no compile penalty); once we've seen repeated large work we switch to
-# compiled. Disable entirely with FFS_NWARP_NO_COMPILE=1.
+# The three-pass eager gather materializes a (C, chunk, ntaps, ntaps) plane ntaps
+# times over; torch.compile avoids that -- inductor fuses the gather with the
+# multiply-reduce and never materializes the planes: ~10x on BOTH CPU and CUDA
+# (measured wsinc5 gather 461->43 ms on an RTX 5070 Ti). A hand-written Triton
+# kernel was prototyped and only matched inductor (1.02-1.07x) -- inductor already
+# emits near-optimal Triton here -- so it was not worth the CUDA-only complexity.
+# The per-device counter keeps a one-shot single apply on the eager path (no compile
+# warmup); once we've seen repeated large work we switch to compiled. dynamic=True
+# on CUDA so the per-chunk voxel count drifting with free VRAM doesn't recompile
+# every call and blow dynamo's cap; CPU keeps static shapes, which inductor fuses
+# best. Disable entirely with FFS_NWARP_NO_COMPILE=1.
 _COMPILE_MIN_VOXELS = 200_000
 _large_calls = {"cpu": 0, "cuda": 0}
 _compiled_gather_contract: dict[str, object] = {}
@@ -660,10 +663,6 @@ def _get_gather_contract(device: torch.device, n_points: int):
         return _gather_contract
     if dt not in _compiled_gather_contract:
         try:
-            # CUDA needs dynamic=True: the per-chunk voxel count drifts with free
-            # VRAM, and static shapes would recompile every call and blow dynamo's
-            # recompile cap (silently falling back to eager). CPU keeps static
-            # shapes, which inductor fuses best.
             _compiled_gather_contract[dt] = torch.compile(_gather_contract, dynamic=(dt == "cuda"))
         except Exception:
             _compiled_gather_contract[dt] = _gather_contract  # compile unavailable
