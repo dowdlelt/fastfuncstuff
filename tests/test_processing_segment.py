@@ -502,6 +502,36 @@ def test_dura_cleanup_csf_gap_fills_sheet_hole():
     assert torch.allclose(out.sum(0), torch.ones(n, n, n), atol=1e-4)
 
 
+def test_dura_cleanup_csf_gap_fills_hole_in_thin_low_prob_sheet():
+    """The subarachnoid sheet wrapping the dura is thin/partial-volumed — CSF only ~0.1, well
+    below a confident (>0.4) threshold. The light-threshold search must still see the sheet and
+    fill the dura hole (very-low-prob CSF); a >0.4 sheet test would find nothing to flank."""
+    from fastfuncstuff.processing.segment import dura_cleanup
+
+    n = 40
+    post = torch.zeros(4, n, n, n)
+    post[3] = 1.0
+
+    def fill(idx, sl, val):
+        post[idx][sl], post[3][sl] = val, 1.0 - val
+
+    fill(1, (slice(4, 10), slice(10, 30), slice(10, 30)), 0.9)  # WM slab (near edge)
+    fill(0, (slice(10, 13), slice(10, 30), slice(10, 30)), 0.9)  # cortex GM on the WM face
+    # OUTER shell (z≈30): a THIN low-probability CSF sheet (0.1) with a very-low-CSF GM hole
+    fill(2, (slice(28, 34), slice(10, 30), slice(10, 20)), 0.1)  # thin CSF, one side of the gap
+    fill(0, (slice(28, 34), slice(10, 30), slice(20, 22)), 0.9)  # GM dura hole (CSF ≈ 0.01)
+    fill(2, (slice(28, 34), slice(10, 30), slice(22, 30)), 0.1)  # thin CSF, other side of the gap
+
+    out = dura_cleanup(post, (1.0, 1.0, 1.0), max_thick_mm=6.0, method="csf_gap")
+    assert out[0, 31, 20, 21] < 0.05  # dura hole filled despite the flanking sheet being only 0.1
+    assert out[2, 31, 20, 21] > 0.5  # ...reassigned to CSF
+    # a confident (>0.4) sheet threshold would see no sheet here and leave the hole:
+    out_hi = dura_cleanup(
+        post, (1.0, 1.0, 1.0), max_thick_mm=6.0, method="csf_gap", csf_present=0.4
+    )
+    assert out_hi[0, 31, 20, 21] > 0.5  # unfilled — the regression this light threshold fixes
+
+
 def test_segment_apply_precleanup_returned():
     """save_precleanup returns the posteriors before the mrf/debridge/cleanup passes."""
     from fastfuncstuff.processing.segment import segment_apply
@@ -768,7 +798,7 @@ def test_plot_intensity_fit_writes_png(tmp_path):
     out2 = segment_apply(vol2, log_prior, bg, bg, fit2, mrf=0, cleanup=0, verbose=False)
     assert fit2["n_chan"] == 2
     fig = plot_intensity_fit(fit2, out2["corrected"], out2["posteriors"])  # no path → Figure
-    assert len(fig.axes) == 2  # one panel per channel
+    assert len(fig.axes) == 4  # 2 rows (full-max / 2nd-peak scale) × 2 channels
 
 
 def test_warp_focus_relaxes_smoothing_locally():

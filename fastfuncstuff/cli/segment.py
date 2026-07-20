@@ -466,10 +466,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("geodesic", "csf_gap"),
         help="How -dura_clean finds dura. 'geodesic' (default, validated to match SPM's dura "
         "level): grow a front from WM blocked by CSF; demote GM it can't reach. 'csf_gap': the "
-        "inverted view — the dura is a HOLE in the outer CSF sheet ('high..gap..high'); demote "
-        "outer-shell GM whose CSF is low but flanked by high CSF on both sides, reassigning it "
-        "to CSF. csf_gap is more robust when the inner subarachnoid CSF is thin (a weak barrier "
-        "the geodesic front leaks through).",
+        "inverted view — the dura is a HOLE in the outer CSF sheet ('present..gap..present'); "
+        "demote outer-shell GM whose CSF is essentially absent but flanked on both sides by CSF "
+        "present at a LIGHT threshold, reassigning it to CSF. The light threshold matters: the "
+        "subarachnoid sheet wrapping the dura is thin (~0.02-0.1), so a confident sheet test "
+        "finds nothing to flank and the dura (itself very-low-prob CSF) survives as a hole. "
+        "csf_gap is more robust when the inner subarachnoid CSF is thin (a weak barrier the "
+        "geodesic front leaks through).",
     )
     knobs.add_argument(
         "-save_precleanup",
@@ -486,15 +489,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write an intensity-histogram diagnostic: the bias-corrected data with the "
         "fitted Gaussian-mixture overlaid, one panel per input channel, tissues coloured "
         "and labelled with their %% mass. Where the grey data rises above the black total "
-        "model, the fit missed that intensity. Bare flag → prefix_histogram.png; or give a "
-        "path. Log y-axis by default (air dwarfs the tissues). Needs matplotlib.",
-    )
-    knobs.add_argument(
-        "-histogram_linear",
-        dest="histogram_log",
-        action="store_false",
-        help="Linear y-axis on -save_histogram instead of the default log scale (log keeps "
-        "the tissue peaks legible when air/background has ~10× the voxel count).",
+        "model, the fit missed that intensity. Two rows: top scaled to the full data max, "
+        "bottom scaled to the 2nd peak so the tissue structure is legible while the air "
+        "spike runs off-scale. Bare flag → prefix_histogram.png; or give a path. Needs "
+        "matplotlib.",
     )
     knobs.add_argument(
         "-tissue_names",
@@ -731,7 +729,6 @@ def main(argv: list[str] | None = None) -> int:
                 out["corrected"],
                 hist_post,
                 tissue_names=args.tissue_names,
-                log_scale=args.histogram_log,
                 path=hist_path,
             )
 

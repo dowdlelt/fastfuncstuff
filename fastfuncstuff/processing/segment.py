@@ -1753,7 +1753,7 @@ def dura_cleanup(
     gm_th: float = 0.1,
     wm_seed: float = 0.5,
     flank_k: int = 3,
-    csf_hi: float = 0.4,
+    csf_present: float = 0.05,
     gm_index: int = 0,
     wm_index: int = 1,
     csf_index: int = 2,
@@ -1768,10 +1768,14 @@ def dura_cleanup(
       than :func:`debridge_gm`'s blind opening. On the reference subject this brings GM >6 mm
       from WM to SPM's own 2.8 % (Dice-vs-SPM 0.950→0.951).
     - ``"csf_gap"`` — the **inverted** view: the dura is a *hole* in the outer CSF sheet, so
-      ``CSF`` reads "high … gap … high". A GM voxel in the outer shell whose CSF is low but is
-      **flanked by high CSF (>csf_hi) on opposite sides within ``flank_k`` voxels** is that gap
-      → reassigned to CSF. Directional flanking (not an isotropic morphological closing) spares
-      a one-sided concavity. More robust than the wavefront when the inner subarachnoid CSF is
+      ``CSF`` reads "present … gap … present". A GM voxel in the outer shell whose CSF is
+      essentially absent but is **flanked on opposite sides within ``flank_k`` voxels by CSF
+      present at a light threshold (>csf_present)** is that gap → reassigned to CSF. The sheet
+      is thresholded *lightly* on purpose: the subarachnoid CSF wrapping the dura is
+      thin/partial-volumed and often only reads ~0.02–0.1, so a confident (>0.4) sheet test
+      finds nothing to flank and the dura — itself extremely-low-probability CSF — survives as a
+      hole. Directional flanking (not an isotropic morphological closing) spares a one-sided
+      concavity. More robust than the wavefront when the inner subarachnoid CSF is
       thin/partial-volumed (a weak barrier the front would leak through, keeping the dura). The
       outer shell is defined geodesically from WM through the *whole* brain (``GM+WM+CSF``) out
       to ``max_thick_mm`` — cortex is nearer than that, dura beyond.
@@ -1800,8 +1804,10 @@ def dura_cleanup(
         near = wm > wm_seed
         for _ in range(n_iter):
             near = near | (_binary_dilate(near, 1) & brain)
-        chi = csf > csf_hi
-        gap = _flanked_by(chi, flank_k) & ~chi & (gm > 0.5) & ~near  # a hole in the CSF sheet
+        # light threshold: the sheet wrapping the dura is thin/partial-volumed (~0.02–0.1), so a
+        # confident (>0.4) test would see no sheet to flank and leave the dura hole unfilled.
+        present = csf > csf_present
+        gap = _flanked_by(present, flank_k) & ~present & (gm > 0.5) & ~near  # a hole in the sheet
         out[csf_index] = csf + torch.where(gap, gm, torch.zeros_like(gm))  # the gap IS CSF
         out[gm_index] = torch.where(gap, torch.zeros_like(gm), gm)
     else:
@@ -2072,6 +2078,35 @@ def cast_template_to_input(
 _SPM_TISSUE_NAMES = ["GM", "WM", "CSF", "bone", "soft tissue", "air/background"]
 
 
+def _second_peak_height(counts) -> float:
+    """Height of the tallest histogram peak that is *not* the dominant (air) spike.
+
+    Walk down from the global-max bin to its local valleys on both sides, mask out
+    that whole basin, and return the tallest bin left over. This is the y-scale that
+    lets the tissue peaks fill the panel while the air/background spike runs off the
+    top, without picking an arbitrary window width.
+    """
+    import numpy as np
+
+    counts = np.asarray(counts, dtype=float)
+    if counts.size == 0:
+        return 0.0
+    # smooth before walking the basin: raw histogram bins are noisy, so a strict
+    # monotonic descent halts at the first tiny uptick and never exits the air spike.
+    win = max(3, counts.size // 40)
+    kernel = np.ones(win) / win
+    smooth = np.convolve(counts, kernel, mode="same")
+    i_max = int(np.argmax(smooth))
+    lo = i_max
+    while lo > 0 and smooth[lo - 1] <= smooth[lo]:
+        lo -= 1
+    hi = i_max
+    while hi < smooth.size - 1 and smooth[hi + 1] <= smooth[hi]:
+        hi += 1
+    rest = np.concatenate([counts[:lo], counts[hi + 1 :]])  # tallest raw bin outside the basin
+    return float(rest.max()) if rest.size else float(counts[i_max])
+
+
 def plot_intensity_fit(
     fit: dict,
     corrected: Tensor,
@@ -2079,17 +2114,23 @@ def plot_intensity_fit(
     *,
     tissue_names: list[str] | None = None,
     n_bins: int = 200,
-    log_scale: bool = True,
     path: str | None = None,
 ):
     """SPM-style diagnostic: intensity histogram(s) with the fitted GMM overlaid.
 
-    One panel per input channel (a row). Grey bars are the bias-corrected data;
-    each coloured line is a tissue's fitted Gaussian-mixture **marginal** in that
-    channel (``Σ_{k∈t} w_k · N(x; μ_ck, Σ_cc,k)``, weight ``w_k`` = that tissue's
-    posterior mass × the within-tissue mixing proportion); the black line is the
-    total model. Where the grey histogram rises above the black line the model
-    under-explains that intensity — a quick read on *what got missed*.
+    Two rows of panels, one column per input channel. Grey bars are the
+    bias-corrected data; each coloured line is a tissue's fitted Gaussian-mixture
+    **marginal** in that channel (``Σ_{k∈t} w_k · N(x; μ_ck, Σ_cc,k)``, weight
+    ``w_k`` = that tissue's posterior mass × the within-tissue mixing proportion);
+    the black line is the total model. Where the grey histogram rises above the
+    black line the model under-explains that intensity — a quick read on *what got
+    missed*.
+
+    The **top row** is scaled to the full data maximum (the air/background spike
+    fills the panel, the whole model visible in context). The **bottom row** is the
+    same plot scaled to the *second* peak height, so the air spike runs off the top
+    and the tissue peaks — GM/WM/CSF — fill the panel legibly. One figure, both
+    views, all the information.
 
     For multi-channel fits each Gaussian is joint over channels, so a panel shows
     only that channel's marginal (the means separate per channel, e.g. GM bright on
@@ -2104,9 +2145,6 @@ def plot_intensity_fit(
         posteriors: tissue posteriors ``(n_tissue,nz,ny,nx)`` (the ``cN`` maps).
         tissue_names: labels per tissue; defaults to the SPM 6-class names.
         n_bins: histogram bins.
-        log_scale: log y-axis (default). The air/background class typically has ~10× the
-            voxels of any tissue and swamps a linear plot; a log scale shows every tissue
-            peak and the fitted curves across the full dynamic range. False for linear.
         path: if given, save the figure there and close it; else return the Figure.
 
     Returns:
@@ -2149,9 +2187,14 @@ def plot_intensity_fit(
     # per-Gaussian data weight: tissue proportion × within-tissue mixing fraction
     w = (tissue_mass[tissue_of] / total_mass) * mix  # (n_gauss,), sums ≈ 1
 
-    fig, axes = plt.subplots(1, n_chan, figsize=(6.4 * n_chan, 4.6), squeeze=False)
-    for c in range(n_chan):
-        ax = axes[0, c]
+    # two rows: top scaled to the full max, bottom scaled to the 2nd peak (air off-scale)
+    fig, axes = plt.subplots(2, n_chan, figsize=(6.4 * n_chan, 8.4), squeeze=False)
+    n_fg = int(flat.sum().item())
+    xlabel = "bias-corrected intensity"
+    row_titles = ("scaled to full max", "scaled to 2nd peak (air off-scale)")
+
+    def draw(ax, c):
+        """Draw the histogram + fitted curves for channel ``c``; return (counts, curves)."""
         vals = corr[c].reshape(-1)[flat].numpy()
         lo, hi = np.percentile(vals, [0.2, 99.8])  # robust range, ignore outliers
         if hi <= lo:
@@ -2159,7 +2202,6 @@ def plot_intensity_fit(
         counts, edges = np.histogram(vals, bins=n_bins, range=(lo, hi))
         centres = 0.5 * (edges[:-1] + edges[1:])
         width = edges[1] - edges[0]
-        n_fg = int(flat.sum().item())
 
         ax.bar(centres, counts, width=width, color="0.8", label="data", zorder=1)
         xs = np.linspace(lo, hi, 512)
@@ -2180,26 +2222,28 @@ def plot_intensity_fit(
                     zorder=3,
                 )  # fmt: skip
         ax.plot(xs, total_curve, color="k", lw=1.4, ls="--", label="total model", zorder=4)
-        ax.set_xlabel(
-            f"bias-corrected intensity (channel {c + 1})"
-            if n_chan > 1
-            else "bias-corrected intensity"
-        )
-        ax.set_ylabel("voxel count")
         ax.set_xlim(lo, hi)
-        top = max(float(counts.max()), float(total_curve.max()))
-        if log_scale:
-            # air/background dwarfs the tissues (~10×); a log axis keeps every tissue peak
-            # and the fitted curves legible across the full range. Floor at 0.5 so single-
-            # voxel bins still register and bars have a valid (positive) base.
-            ax.set_yscale("log")
-            ax.set_ylim(0.5, top * 1.6 if top > 0 else None)
-        else:
-            # linear: cap to the interesting structure (fitted peak + bulk of the
-            # histogram) and let the air spike run off the top.
-            ymax = max(float(total_curve.max()), float(np.percentile(counts, 99))) * 1.25
-            ax.set_ylim(0, ymax if ymax > 0 else None)
-        ax.legend(fontsize=8, framealpha=0.9)
+        return counts, total_curve
+
+    for c in range(n_chan):
+        counts, total_curve = draw(axes[0, c], c)
+        _, _ = draw(axes[1, c], c)  # same plot, different y-scale set below
+
+        # top row: whole picture, air spike included
+        full = max(float(counts.max()), float(total_curve.max()))
+        axes[0, c].set_ylim(0, full * 1.05 if full > 0 else None)
+        # bottom row: clip to the second peak so the tissue structure fills the panel.
+        # exclude the air basin from the *model* curve too — the air/background class is
+        # itself a fitted Gaussian, so total_curve.max() would re-inflate the limit.
+        second = max(_second_peak_height(counts), _second_peak_height(total_curve))
+        axes[1, c].set_ylim(0, second * 1.25 if second > 0 else None)
+
+        for r in range(2):
+            ax = axes[r, c]
+            ax.set_ylabel("voxel count")
+            ax.set_xlabel(f"{xlabel} (channel {c + 1})" if n_chan > 1 else xlabel)
+            ax.set_title(row_titles[r], fontsize=9)
+            ax.legend(fontsize=8, framealpha=0.9)
     fig.suptitle("Segmentation intensity fit — data vs fitted tissue mixture")
     fig.tight_layout()
 
