@@ -1210,6 +1210,21 @@ def main():
         print(f"   • {f}")
     print()
 
+    # Fail fast on a mask/data grid mismatch. The full check lives in
+    # analyze_from_design_matrix, but by then we've paid for a full volume load
+    # (minutes for large 4D inputs). Headers are cheap — nibabel reads shape
+    # without touching the data — so compare grids up front.
+    if args.mask:
+        data_shape = load_nifti(input_files[0]).shape[:3]
+        mask_shape = load_nifti(args.mask).shape[:3]
+        if mask_shape != data_shape:
+            raise SystemExit(
+                f"❌ Mask/data grid mismatch: mask '{args.mask}' is {mask_shape} "
+                f"but input '{input_files[0]}' is {data_shape}. "
+                "Resample the mask onto the data grid (or pick the right mask) "
+                "before running."
+            )
+
     # Get TR: an explicit -tr overrides whatever is in the header (headers get
     # mangled by upstream tools, so being explicit at the modeling stage is safer).
     if args.tr is not None:
