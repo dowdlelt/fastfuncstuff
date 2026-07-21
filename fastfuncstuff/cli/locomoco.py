@@ -381,6 +381,17 @@ def create_parser() -> argparse.ArgumentParser:
         "image-gradient Jacobian — no autograd, converges in a few steps (~5x faster); needs "
         "-qwarp_cost ncc (falls back to adam otherwise). 'adam' the autodiff optimizer.",
     )
+    me.add_argument(
+        "-qwarp_compile",
+        "-qwarp-compile",
+        action="store_true",
+        dest="qwarp_compile",
+        help="Experimental (CUDA only, off by default): torch.compile the per-frame qwarp "
+        "building blocks. The plan geometry is identical across frames, so the compile "
+        "warmup is paid once and amortized over the whole series. Applies to both the "
+        "-final_qwarp polish and -backend qwarp. Benchmark before trusting on a new box; "
+        "falls back to eager if inductor is unavailable.",
+    )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
         "-backend",
@@ -1000,6 +1011,26 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             file=sys.stderr,
         )
         return 2
+    # Argument-only -backend qwarp checks: fire BEFORE the (slow) data load, not after.
+    if args.backend == "qwarp":
+        if args.me_interecho:
+            print(
+                "❌ -backend qwarp needs a temporal reference; not valid with -me_interecho.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.no_corrected:
+            print(
+                "❌ -backend qwarp builds its reference from the corrected series; drop -no_corrected.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.final_qwarp:
+            print(
+                "❌ -backend qwarp already owns the field; -final_qwarp is redundant. Pick one.",
+                file=sys.stderr,
+            )
+            return 2
 
     datas = []
     affine = None
@@ -1082,27 +1113,9 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         return 2
 
     # -backend qwarp: a flow -refine pass builds the refined median reference, then the
-    # joint TE-scaled qwarp owns the whole field (raw echoes -> reference).
+    # joint TE-scaled qwarp owns the whole field (raw echoes -> reference). The arg-only
+    # validity checks already ran before the data load.
     qwarp_backend = args.backend == "qwarp"
-    if qwarp_backend:
-        if args.me_interecho:
-            print(
-                "❌ -backend qwarp needs a temporal reference; not valid with -me_interecho.",
-                file=sys.stderr,
-            )
-            return 2
-        if args.no_corrected:
-            print(
-                "❌ -backend qwarp builds its reference from the corrected series; drop -no_corrected.",
-                file=sys.stderr,
-            )
-            return 2
-        if args.final_qwarp:
-            print(
-                "❌ -backend qwarp already owns the field; -final_qwarp is redundant. Pick one.",
-                file=sys.stderr,
-            )
-            return 2
     # The estimator that runs is the reference-building pass (flow for the qwarp backend).
     prepass_backend = "flow" if qwarp_backend else args.backend
 
@@ -1123,11 +1136,11 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     ref_note = "ref=n/a" if args.me_interecho else f"ref={args.ref}"
     refine_note = "refine=n/a" if args.me_interecho else f"refine={args.refine}"
     if qwarp_backend:
-        # The flow-tuning flags only shape the reference pass here; screen them so they
-        # don't read as tuning the final (qwarp) field.
+        # qwarp owns the whole field and the reference is a plain median of the raw
+        # echoes (no flow estimation), so the flow-tuning / ref / refine flags don't apply.
         print(
             f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend=qwarp "
-            f"(reference: flow {ref_note}, {refine_note}), mode={mode}, scaling={scaling}, "
+            f"(reference: median of raw echoes, no flow pass), scaling={scaling}, "
             f"automask={'on' if automask else 'off'}"
         )
         print(
@@ -1153,7 +1166,20 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             "-refine 2/-workhard/-superhard for full magnitude."
         )
 
-    if args.me_interecho:
+    if qwarp_backend:
+        # qwarp owns the whole field, so the flow ESTIMATION is skipped entirely: the
+        # reference is a plain temporal median of the raw echoes (correct when the inputs
+        # are already moco'd/NORDIC'd). Use -backend flow -final_qwarp for flow refinement.
+        from fastfuncstuff.processing.locomoco import make_raw_reference_me_result
+
+        result = make_raw_reference_me_result(
+            datas,
+            args.echo_times,
+            pe_axis,
+            slice_axis,
+            flat_scaling=args.me_flat_scaling,
+        )
+    elif args.me_interecho:
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_interecho
 
         result = estimate_residual_flow_me_interecho(
@@ -1255,7 +1281,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         from fastfuncstuff.processing.locomoco import polish_me_result
 
         if qwarp_backend:
-            print("🪄 qwarp backend: registering raw echoes to the refined reference...")
+            print("🪄 qwarp backend: registering raw echoes to the median-of-raw reference...")
         else:
             print("🪄 Polishing residual with joint TE-scaled qwarp...")
         result = polish_me_result(
@@ -1265,6 +1291,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             iters=args.qwarp_iters,
             cost=args.qwarp_cost,
             optimizer=args.qwarp_optimizer,
+            compile=args.qwarp_compile,
             full=qwarp_backend,
             raw_datas=datas if qwarp_backend else None,
             device=device,
@@ -1652,6 +1679,7 @@ def main(argv: list[str] | None = None) -> int:
             iters=args.qwarp_iters,
             cost=args.qwarp_cost,
             optimizer=args.qwarp_optimizer,
+            compile=args.qwarp_compile,
             full=qwarp_backend,
             raw_datas=[data] if qwarp_backend else None,
             device=device,
