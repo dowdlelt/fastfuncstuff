@@ -3598,6 +3598,77 @@ def estimate_residual_flow_me_scaled(
     )
 
 
+def make_raw_reference_me_result(
+    datas: list[np.ndarray],
+    echo_times: list[float],
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    flat_scaling: bool = False,
+    verbose: bool = True,
+) -> MultiEchoLocomocoResult:
+    """Zero-motion multi-echo container for the ``-backend qwarp`` direct path.
+
+    Builds exactly what :func:`polish_me_result` (``full=True``) needs WITHOUT running
+    the optical-flow estimation: each echo's "corrected" series IS the raw echo, so the
+    qwarp reference (temporal median of the corrected series) is a plain median of raw,
+    and qwarp then owns the whole field (raw echoes -> that median). Use when the inputs
+    are already motion-corrected (NORDIC'd / moco'd) so a flow-refined template buys
+    nothing -- it skips the full estimation pass. For residual motion, run the flow
+    estimate instead (``-backend flow -final_qwarp``).
+
+    Geometry is the same deterministic derivation the estimator uses; ``alpha`` is the
+    fixed TE ratio (or 1 for flat scaling). The canonical flow tensors are unused on this
+    path (only ``corrected_nifti`` + the geometry fields are read), so they are tiny
+    placeholders rather than full-size zeros.
+    """
+    e = len(datas)
+    shp = datas[0].shape
+    nx, ny, nz, nt = (int(s) for s in shp)
+    disp_slice = slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
+    a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
+    pe_flow_is_u = pe_axis == a1
+    perm4 = [3, disp_slice, a0, a1]
+    te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
+    alpha = torch.ones(e) if flat_scaling else te / float(te[0])
+
+    if verbose:
+        print(
+            f"🌀 locomoco {_geometry_report(shp, pe_axis, disp_slice, is_3dacq=True)}  × {e} echoes"
+        )
+        a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
+        tag = "FLAT (alpha=1)" if flat_scaling else "fixed to TE ratio"
+        print(
+            f"   ⏭️  skipping flow estimate (qwarp owns the field); alpha (÷echo1) = [{a_str}]  {tag}"
+        )
+
+    ph = torch.zeros((nt, 1, 1, 1))  # placeholder canonical tensors — unused on this path
+    per_echo = [
+        LocomocoResult(
+            u_canon=ph,
+            v_canon=ph,
+            corrected_canon=ph,
+            perm=perm4,
+            pe_flow_is_u=pe_flow_is_u,
+            pe_axis=pe_axis,
+            slice_axis=disp_slice,
+            orig_shape=(nx, ny, nz, nt),
+            a0=a0,
+            a1=a1,
+            corrected_nifti=torch.from_numpy(np.ascontiguousarray(datas[j])).float(),
+        )
+        for j in range(e)
+    ]
+    return MultiEchoLocomocoResult(
+        per_echo=per_echo,
+        alpha=alpha,
+        echo_times=te,
+        w_field=torch.zeros(nx, ny, nz, nt),
+        pe_axis=pe_axis,
+        linearity_r2=1.0,
+    )
+
+
 def polish_me_result(
     result: MultiEchoLocomocoResult,
     *,
@@ -3606,6 +3677,7 @@ def polish_me_result(
     iters: int = 10,
     cost: str = "ncc",
     optimizer: str = "gn",
+    compile: bool = False,
     full: bool = False,
     raw_datas: list[np.ndarray] | None = None,
     device: torch.device | None = None,
@@ -3640,9 +3712,22 @@ def polish_me_result(
 
     # Reference = temporal median of the corrected series (refined template). The
     # moving data is the corrected series (polish) or the raw echoes (full backend).
+    dev = (
+        device
+        if device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    if verbose:
+        print(
+            f"   ⏳ building reference (temporal median of {nt} frames × {e} echoes) "
+            "and preparing the series…",
+            flush=True,
+        )
     corr_series = [result.per_echo[j].corrected_series().float() for j in range(e)]
+    # The temporal median is a 225-deep sort per voxel -- slow on CPU; run it on the GPU
+    # (each echo transiently, freed after) when we have one. base_echoes stays on `dev`.
     base_echoes = torch.stack(
-        [c.median(dim=-1).values.permute(2, 1, 0).contiguous() for c in corr_series]
+        [c.to(dev).median(dim=-1).values.permute(2, 1, 0).contiguous() for c in corr_series]
     )
     if full:
         if raw_datas is None:
@@ -3666,6 +3751,7 @@ def polish_me_result(
         verb=0,
         batch_optimizer_iters=iters,
         optimizer=optimizer if cost == "ncc" else "adam",
+        compile=compile,
     )
     warped, resid = qwarp_pe_scaled_polish_series(
         base_echoes,

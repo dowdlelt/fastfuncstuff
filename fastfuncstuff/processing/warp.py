@@ -21,12 +21,15 @@ Key speedups vs serial version:
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 from torch import Tensor
+
+from .._compile import safe_compile
 
 try:
     from tqdm import tqdm as _tqdm
@@ -71,12 +74,42 @@ _compile_cache: dict[str, Callable[..., Any]] = {}
 def _maybe_compile(
     fn: Callable[..., Any], name: str, device: torch.device, do_compile: bool
 ) -> Callable[..., Any]:
-    """Return a compiled version of fn for CUDA, caching by name."""
+    """Return a compiled version of fn for CUDA, caching by name.
+
+    Uses :func:`safe_compile` so an inductor/clang failure degrades to eager for the
+    rest of the process (never crashes a run) and the shared PCH policy is applied.
+    The name-keyed cache is process-global, so a building block compiled once is
+    reused across every volume/frame -- warmup is paid a single time and amortized
+    over an entire 4-D series (the timeseries win; see principles/torch.compile.md)."""
     if device.type != "cuda" or not do_compile:
         return fn
     if name not in _compile_cache:
-        _compile_cache[name] = torch.compile(fn, dynamic=True)
+        _compile_cache[name] = safe_compile(fn, dynamic=True)
     return _compile_cache[name]
+
+
+@contextmanager
+def _tf32_matmul(enable: bool) -> Iterator[None]:
+    """Temporarily allow TF32 tensor-core float32 matmul, restoring on exit.
+
+    Scoped -- never a process-global default -- so the qwarp fast path can use tensor
+    cores without shifting float32 matmul precision in other tools (allineate/GLM),
+    which would break their reference-parity benchmarks. Safe for this solver: the
+    TF32-affected matmuls only assemble the Gauss-Newton step, which is accepted only
+    if the exact NCC cost (computed in full float32, no matmul) improves -- so reduced
+    step precision can at worst waste an iteration, never corrupt the result."""
+    if not enable:
+        yield
+        return
+    prev_mm = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn = torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_mm
+        torch.backends.cudnn.allow_tf32 = prev_cudnn
 
 
 @dataclass
@@ -2394,6 +2427,53 @@ def _weighted_pearson_patches(base: Tensor, warped: Tensor, weight: Tensor) -> T
     return cxy / (vx.clamp_min(1e-12) * vy.clamp_min(1e-12)).sqrt()
 
 
+def _mescaled_gn_normal_eqs(
+    w: Tensor,
+    g: Tensor,
+    a4hw: Tensor,
+    bt: Tensor,
+    omega: Tensor,
+    wsum: Tensor,
+    base_hat: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Assemble the batched zero-normalised-NCC Gauss-Newton normal equations.
+
+    Pure tensor-in/tensor-out extraction of the per-iteration hot block in
+    :func:`_improve_warp_batched_mescaled`'s ``_gn_solve``: it produces the
+    steepest-descent images and forms ``(hmat, grad) = (JᵀJ, Jᵀres)`` for the
+    ``(E,B,V,nb)`` Jacobian. This is the one part of the default ncc/gn path that is a
+    genuine multi-op, bandwidth-bound elementwise chain -- ``dW``, ``mdW``, ``jn``,
+    ``jnw`` each materialise a full ``(E,B,V,nb)`` tensor in eager -- so it is the
+    piece :func:`_maybe_compile` can actually fuse (the surrounding interpolation is
+    ``grid_sample``, a vendor kernel with nothing to fuse). Pulled to module scope,
+    taking only tensors, so ``torch.compile`` sees a clean graph with stable shapes
+    across frames. ``a4hw = alpha_e * half_width_pe`` folds the two python scalars in
+    so the compiled signature carries no recompiling constant.
+
+    Args:
+        w: ``(E, B, V)`` warped patch values at the current params.
+        g: ``(E, B, V)`` PE image gradient sampled at the same locations.
+        a4hw: ``(E, 1, 1, 1)`` per-echo ``alpha_e * hw_pe``.
+        bt: ``(V, nb)`` basis transpose.
+        omega: ``(1, B, V)`` per-voxel weight*mask.
+        wsum: ``(1, B, 1)`` weight sum per patch.
+        base_hat: ``(E, B, V)`` zero-normalised reference patches.
+
+    Returns:
+        ``hmat`` ``(B, nb, nb)`` and ``grad`` ``(B, nb)``.
+    """
+    mW = (omega * w).sum(-1, keepdim=True) / wsum
+    sW = ((omega * w * w).sum(-1, keepdim=True) / wsum - mW * mW).clamp_min(1e-12).sqrt()
+    res = (w - mW) / sW - base_hat  # (E, B, V)
+    dW = a4hw * g.unsqueeze(-1) * bt  # (E, B, V, nb) steepest-descent images
+    mdW = (omega.unsqueeze(-1) * dW).sum(2, keepdim=True) / wsum.unsqueeze(-1)
+    jn = (dW - mdW) / sW.unsqueeze(-1)  # zero-normalised Jacobian
+    jnw = jn * omega.unsqueeze(-1)
+    hmat = torch.einsum("ebvn,ebvm->bnm", jnw, jn)  # (B, nb, nb)
+    grad = torch.einsum("ebvn,ebv->bn", jnw, res)  # (B, nb)
+    return hmat, grad
+
+
 @dataclass
 class _MEPhasePlan:
     """Frame-invariant per-phase gather for the ME-scaled polish.
@@ -2685,6 +2765,16 @@ def _improve_warp_batched_mescaled(
     global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)
     a_e = alpha.view(E, 1, 1)  # (E,1,1) per-echo TE scaling for broadcast
 
+    # Optional torch.compile of the stable building blocks. The plan geometry is
+    # frame-invariant, so shapes are identical across every frame of the series and
+    # the (process-global, name-keyed) cache pays warmup exactly once -- the whole
+    # point of compiling the timeseries path. See principles/torch.compile.md.
+    _eval_warp = _maybe_compile(evaluate_patch_warp_batched, "eval_warp", device, config.compile)
+    _compose_fn = _maybe_compile(batched_compose_and_interpolate, "compose", device, config.compile)
+    _gn_normal_eqs = _maybe_compile(
+        _mescaled_gn_normal_eqs, "mescaled_gn_normal_eqs", device, config.compile
+    )
+
     def _sample_echoes(ah_xd: Tensor, ah_yd: Tensor, ah_zd: Tensor) -> Tensor:
         """(B,) mean -corr over echoes for the shared displacement ``ah``."""
         if use_ncc:
@@ -2710,7 +2800,7 @@ def _improve_warp_batched_mescaled(
         return cost / E
 
     def _compose(hxd: Tensor, hyd: Tensor, hzd: Tensor):
-        return batched_compose_and_interpolate(
+        return _compose_fn(
             source_echoes[0],
             state.xd,
             state.yd,
@@ -2735,7 +2825,7 @@ def _improve_warp_batched_mescaled(
 
     def batched_cost(active_params: Tensor) -> Tensor:
         full_params = active_params @ expand_mat
-        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
+        hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
         # ah = shared TOTAL displacement w (patch increment composed with global w).
         _wv, ah_xd, ah_yd, ah_zd = _compose(hxd, hyd, hzd)
         cost = _sample_echoes(ah_xd, ah_yd, ah_zd)
@@ -2769,7 +2859,7 @@ def _improve_warp_batched_mescaled(
         ) * 0.5  # ∂S/∂(PE voxel), one per echo
         omega = (weight_patches * mask_patches)[None]  # (1, B, V)
         wsum = omega.sum(-1, keepdim=True).clamp_min(1e-6)  # (1, B, 1)
-        a4 = alpha.view(E, 1, 1, 1)
+        a4hw = alpha.view(E, 1, 1, 1) * hw_pe  # per-echo alpha_e * hw_pe (folds scalars)
 
         base = base_echo_patches  # (E, B, V)
         mB = (omega * base).sum(-1, keepdim=True) / wsum
@@ -2803,15 +2893,7 @@ def _improve_warp_batched_mescaled(
         for _it in range(gn_iters):
             w, sx, sy, sz = _forward(best_p)
             g = batched_trilinear_interpolate_multi(gpe, sx, sy, sz)  # (E,B,V)
-            mW = (omega * w).sum(-1, keepdim=True) / wsum
-            sW = ((omega * w * w).sum(-1, keepdim=True) / wsum - mW * mW).clamp_min(1e-12).sqrt()
-            res = (w - mW) / sW - base_hat  # (E,B,V)
-            dW = (a4 * hw_pe) * g.unsqueeze(-1) * bt  # (E,B,V,nb) steepest-descent images
-            mdW = (omega.unsqueeze(-1) * dW).sum(2, keepdim=True) / wsum.unsqueeze(-1)
-            jn = (dW - mdW) / sW.unsqueeze(-1)  # zero-normalised Jacobian
-            jnw = jn * omega.unsqueeze(-1)
-            hmat = torch.einsum("ebvn,ebvm->bnm", jnw, jn)  # (B, nb, nb)
-            grad = torch.einsum("ebvn,ebv->bn", jnw, res)  # (B, nb)
+            hmat, grad = _gn_normal_eqs(w, g, a4hw, bt, omega, wsum, base_hat)
             diag = torch.diagonal(hmat, dim1=-2, dim2=-1).clamp_min(1e-9)
             amat = hmat + lam[:, None, None] * torch.diag_embed(diag)
             delta = torch.linalg.solve(amat, -grad.unsqueeze(-1)).squeeze(-1)
@@ -2844,7 +2926,7 @@ def _improve_warp_batched_mescaled(
 
     with torch.no_grad():
         full_params = best_params @ expand_mat
-        hxd, hyd, hzd = evaluate_patch_warp_batched(basis, full_params, half_widths, do_xyz)
+        hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
         _wv, ah_xd, ah_yd, ah_zd = _compose(hxd, hyd, hzd)
         # Patches in a checkerboard phase are non-overlapping, so a flat scatter via
         # the precomputed gather index is safe (no colliding writes).
@@ -3044,7 +3126,9 @@ def qwarp_pe_scaled_polish_series(
     alpha = torch.ones(E, device=device) if alpha is None else alpha.float().to(device)
 
     # Build the frame-invariant geometry + base/weight/mask gathers ONCE.
-    plan = _build_mescaled_plan(base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, True)
+    plan = _build_mescaled_plan(
+        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, True
+    )
 
     warped = torch.empty(E, nz, ny, nx, T)
     field = torch.empty(nz, ny, nx, T)
@@ -3053,12 +3137,16 @@ def qwarp_pe_scaled_polish_series(
     if show_progress and _tqdm is not None and T > 1:
         frames = _tqdm(frames, desc="qwarp polish", leave=True)
 
-    for t in frames:
-        w_t, f_t = _solve_mescaled_frame(
-            plan, source_series[..., t], seed_series[..., t], alpha, config, device
-        )
-        warped[..., t] = w_t.cpu()
-        field[..., t] = f_t.cpu()
+    # The opt-in fast path (config.compile) also enables TF32 tensor cores for the
+    # solve's float32 matmuls -- scoped here, never leaking to other tools.
+    use_tf32 = bool(config.compile) and device.type == "cuda"
+    with _tf32_matmul(use_tf32):
+        for t in frames:
+            w_t, f_t = _solve_mescaled_frame(
+                plan, source_series[..., t], seed_series[..., t], alpha, config, device
+            )
+            warped[..., t] = w_t.cpu()
+            field[..., t] = f_t.cpu()
 
     return warped, field
 

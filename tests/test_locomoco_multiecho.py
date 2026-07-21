@@ -17,7 +17,9 @@ from fastfuncstuff.processing.locomoco import (
     estimate_residual_flow_me_interecho,
     estimate_residual_flow_me_scaled,
     estimate_residual_flow_multiecho,
+    make_raw_reference_me_result,
     optical_flow_lk_3d_multiecho,
+    polish_me_result,
     xcorr_search_flow_3d_multiecho,
 )
 
@@ -85,6 +87,47 @@ def test_multiecho_recovers_scaling_and_corrects():
         before = float(np.asarray(datas[j])[brain].std(axis=-1).mean())
         after = float(corr.corrected_series().numpy()[brain].std(axis=-1).mean())
         assert after < 0.5 * before, (j, before, after)
+
+
+def test_raw_reference_builder_skips_flow_and_polishes():
+    """`-backend qwarp` builds a median-of-raw reference WITHOUT a flow pass.
+
+    `make_raw_reference_me_result` must (a) derive the fixed TE-ratio alpha + geometry,
+    (b) hand back each raw echo as its own "corrected" series (so qwarp's reference is a
+    plain median of raw) with a zero seed field, and (c) drive `polish_me_result(full=
+    True)` to a finite per-echo field of the right shape. (Variance reduction is NOT
+    asserted: with real residual motion a median-of-raw reference is blurry — this path
+    is for already-moco'd input, where qwarp owns only the small residual distortion.)"""
+    tes = [12.0, 30.0, 48.0]
+    shifts = [0.0, 0.5, -0.4, 0.3, -0.5]
+    datas, alpha_true = _make_multiecho(tes, shifts)
+    nx, ny, nz, nt = datas[0].shape
+
+    res = make_raw_reference_me_result(datas, tes, pe_axis=PE, slice_axis=PE, verbose=False)
+    # Fixed TE-ratio scaling, no flow: alpha is exact (not estimated), field is zero.
+    assert np.allclose(res.alpha.numpy(), alpha_true, atol=1e-5)
+    assert float(res.w_field.abs().max()) == 0.0
+    assert res.pe_axis == PE and len(res.per_echo) == len(tes)
+    # The "corrected" series IS the raw echo (median of it becomes the qwarp reference).
+    assert np.allclose(res.per_echo[0].corrected_series().numpy(), datas[0])
+
+    polished = polish_me_result(
+        res,
+        minpatch=5,
+        n_levels=1,
+        iters=4,
+        cost="ncc",
+        optimizer="gn",
+        full=True,
+        raw_datas=datas,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert len(polished.per_echo) == len(tes)
+    assert polished.w_field.shape == (nx, ny, nz, nt)
+    assert torch.isfinite(polished.w_field).all()
+    for corr in polished.per_echo:
+        assert torch.isfinite(torch.as_tensor(corr.corrected_series())).all()
 
 
 def test_refine_grows_magnitude_toward_truth():

@@ -66,9 +66,7 @@ def _corr(a: torch.Tensor, b: torch.Tensor, m: torch.Tensor) -> float:
     return float((a * b).sum() / (a.norm() * b.norm() + 1e-12))
 
 
-@pytest.mark.parametrize(
-    "cost,optimizer", [("ncc", "gn"), ("ncc", "adam"), ("lpa", "adam")]
-)
+@pytest.mark.parametrize("cost,optimizer", [("ncc", "gn"), ("ncc", "adam"), ("lpa", "adam")])
 def test_single_echo_recovers_field_and_improves_alignment(cost, optimizer):
     nz, ny, nx = 10, 24, 24
     base = _smooth_volume(nz, ny, nx, seed=0)
@@ -231,3 +229,46 @@ def test_series_polishes_every_frame():
             assert after >= before - 1e-3, (
                 f"frame {t} echo {e} regressed: {before:.3f}->{after:.3f}"
             )
+
+
+def test_series_compile_flag_matches_eager():
+    """The opt-in fast path (``compile=True``) stays close to the eager path.
+
+    On CPU ``compile=True`` is a no-op (``_maybe_compile`` returns eager, TF32 scope
+    inert), so this still exercises the module-level ``_mescaled_gn_normal_eqs``
+    extraction and the config plumbing -- it must be bit-identical there. On CUDA it
+    runs the real compiled + TF32 path, whose GN steps are only TF32-perturbed and so
+    stay close (the cost-improvement guard keeps the registration in the same place)."""
+    nz, ny, nx, T = 8, 22, 22, 3
+    base = _smooth_volume(nz, ny, nx, seed=5)
+    w_true = _smooth_pe_field(nz, ny, nx, amp=1.6)
+    alpha = torch.tensor([1.0, 1.7])
+    z0 = torch.zeros_like(w_true)
+
+    base_echoes = torch.stack([base, base])
+    source_series = torch.empty(2, nz, ny, nx, T)
+    for t in range(T):
+        wt = w_true * (0.8 + 0.2 * t)
+        for e, a in enumerate(alpha):
+            source_series[e, ..., t] = warp_image(base, z0, -float(a) * wt, z0, mode="linear")
+    seed_series = torch.zeros(nz, ny, nx, T)
+
+    def _run(do_compile: bool):
+        cfg = QwarpConfig(minpatch=7, cost_method="ncc", verb=0, optimizer="gn", compile=do_compile)
+        _, field = qwarp_pe_scaled_polish_series(
+            base_echoes,
+            source_series,
+            seed_series,
+            pe_grid_axis=1,
+            alpha=alpha,
+            config=cfg,
+            n_levels=2,
+            show_progress=False,
+        )
+        return field
+
+    f_eager = _run(False)
+    f_fast = _run(True)
+    assert torch.isfinite(f_fast).all()
+    tol = 5e-3 if torch.cuda.is_available() else 0.0  # exact on CPU (compile is a no-op)
+    assert (f_fast - f_eager).abs().median() <= tol
