@@ -31,10 +31,11 @@ import torch
 
 
 def _axis_from_token(tok: str) -> int:
-    m = {"x": 0, "y": 1, "z": 2, "0": 0, "1": 1, "2": 2}
-    if tok not in m:
-        raise argparse.ArgumentTypeError(f"axis must be x/y/z or 0/1/2, got '{tok}'")
-    return m[tok]
+    m = {"x": 0, "y": 1, "z": 2, "i": 0, "j": 1, "k": 2, "0": 0, "1": 1, "2": 2}
+    key = tok.strip().lstrip("-").lower()
+    if key not in m:
+        raise argparse.ArgumentTypeError(f"axis must be x/y/z, i/j/k or 0/1/2, got '{tok}'")
+    return m[key]
 
 
 def _split_prefix(prefix: str) -> tuple[str, str]:
@@ -1317,7 +1318,11 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = create_parser().parse_args(argv)
+    from fastfuncstuff.processing.locomoco import normalize_axis_argv
+
+    raw = sys.argv[1:] if argv is None else argv
+    raw = normalize_axis_argv(raw, {"-pe_dir", "-pe", "-slice_axis", "-slice"})
+    args = create_parser().parse_args(raw)
     preset = _apply_preset(args)
 
     # Multi-echo 3-D EPI is a single 3-D-acquired solve, so (like -is_3dacq) the PE

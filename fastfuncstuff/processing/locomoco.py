@@ -46,12 +46,15 @@ PE_DIR_TO_AXIS: dict[str, int] = {
     "LR": 0,
     "RL": 0,
     "x": 0,
+    "i": 0,
     "AP": 1,
     "PA": 1,
     "y": 1,
+    "j": 1,
     "IS": 2,
     "SI": 2,
     "z": 2,
+    "k": 2,
 }
 
 
@@ -780,13 +783,51 @@ def phase_correlation_flow_2d(
 
 
 def resolve_pe_axis(pe_dir: str) -> int:
-    """Map a PE-direction token (AP/PA/LR/RL/IS/SI or x/y/z) to a NIfTI axis."""
-    key = pe_dir.strip()
-    if key not in PE_DIR_TO_AXIS:
-        raise ValueError(
-            f"Unknown -pe_dir '{pe_dir}'. Use axis letters x/y/z or AP/PA/LR/RL/IS/SI."
-        )
-    return PE_DIR_TO_AXIS[key]
+    """Map a PE-direction token to a NIfTI axis.
+
+    Accepts axis letters (x/y/z or the i/j/k voxel convention) and anatomical
+    direction codes (AP/PA/LR/RL/IS/SI). A leading dash is tolerated so a habit
+    of writing ``-pe_dir -j`` resolves the same as ``-pe_dir j``. Axis letters are
+    case-insensitive; direction codes are matched uppercase.
+    """
+    key = pe_dir.strip().lstrip("-")
+    for cand in (key, key.lower(), key.upper()):
+        if cand in PE_DIR_TO_AXIS:
+            return PE_DIR_TO_AXIS[cand]
+    raise ValueError(
+        f"Unknown -pe_dir '{pe_dir}'. Use axis letters x/y/z or i/j/k, "
+        "or direction codes AP/PA/LR/RL/IS/SI."
+    )
+
+
+# Axis letters written with a leading dash (``-pe_dir -j``) look like option flags
+# to argparse and get swallowed before the nargs value can consume them. Rewrite
+# them to the bare token, but ONLY when they directly follow an axis-taking option
+# so the ``-i`` alias for ``-input`` (and any other real short flag) is untouched.
+_DASHED_AXIS_TOKEN = {f"-{c}": c for c in ("i", "j", "k", "x", "y", "z")}
+
+
+def normalize_axis_argv(argv: list[str], axis_opts: set[str]) -> list[str]:
+    """Un-dash axis letters that follow one of ``axis_opts`` (e.g. ``-pe_dir``).
+
+    ``axis_opts`` are the option strings whose value(s) are axis tokens. Only the
+    run of dashed axis letters immediately after such an option is rewritten, so
+    ``-pe_dir -j`` becomes ``-pe_dir j`` while an unrelated ``-i input.nii`` is left
+    alone.
+    """
+    out: list[str] = []
+    expect = False
+    for tok in argv:
+        if tok in axis_opts:
+            out.append(tok)
+            expect = True
+            continue
+        if expect and tok in _DASHED_AXIS_TOKEN:
+            out.append(_DASHED_AXIS_TOKEN[tok])
+            continue  # stay in the run: -pe_dir accepts two axes (nargs="+")
+        expect = False
+        out.append(tok)
+    return out
 
 
 _AXIS_LETTER = {0: "x", 1: "y", 2: "z"}

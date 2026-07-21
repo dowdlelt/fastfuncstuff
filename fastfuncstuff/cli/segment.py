@@ -28,6 +28,7 @@ import torch
 
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
+from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
 from fastfuncstuff.processing.rbr import invert_displacement_field
 from fastfuncstuff.processing.segment import (
     autobox_bounds,
@@ -232,9 +233,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     aff.add_argument(
         "-pe_axis",
         default=None,
-        choices=("x", "y", "z"),
+        metavar="AXIS",
         help="Phase-encode axis for EPI PE-mode: constrain the deformation to this voxel "
-        "axis so the warp is the 1-D EPI distortion field (like ffs_rbr). Omit for a "
+        "axis so the warp is the 1-D EPI distortion field (like ffs_rbr). Accepts axis "
+        "letters x/y/z or i/j/k, or direction codes AP/PA/LR/RL/IS/SI. Omit for a "
         "full 3-D deformation (anatomicals).",
     )
     aff.add_argument(
@@ -557,7 +559,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Suppress the fit report, per-iteration log-likelihood, and progress bar.",
     )
-    return p.parse_args(argv)
+    raw = sys.argv[1:] if argv is None else argv
+    raw = normalize_axis_argv(raw, {"-pe_axis"})
+    return p.parse_args(raw)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -666,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
         tol=args.tol,
         fit_warp=not args.no_warp,
         warp_anneal=args.warp_anneal,
-        pe_axis={"x": 0, "y": 1, "z": 2}[args.pe_axis] if args.pe_axis else None,
+        pe_axis=resolve_pe_axis(args.pe_axis) if args.pe_axis else None,
         reverse_volume=(
             (reverse_channels[0] if len(reverse_channels) == 1 else reverse_channels)
             if reverse_channels

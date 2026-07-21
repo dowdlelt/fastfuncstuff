@@ -473,6 +473,38 @@ def test_resolve_pe_axis():
         resolve_pe_axis("QQ")
 
 
+def test_resolve_pe_axis_ijk_case_and_dash():
+    # i/j/k voxel-axis convention alongside x/y/z
+    assert resolve_pe_axis("i") == 0
+    assert resolve_pe_axis("j") == 1
+    assert resolve_pe_axis("k") == 2
+    # a leading dash (habit of typing -j) and mixed case resolve the same
+    assert resolve_pe_axis("-j") == 1
+    assert resolve_pe_axis("ap") == 1
+    assert resolve_pe_axis("Z") == 2
+
+
+def test_normalize_axis_argv_undashes_only_after_axis_opts():
+    from fastfuncstuff.processing.locomoco import normalize_axis_argv
+
+    opts = {"-pe_dir", "-pe"}
+    # -i as the -input alias is untouched; -j after -pe_dir is un-dashed
+    assert normalize_axis_argv(["-i", "m.nii", "-pe_dir", "-j"], opts) == [
+        "-i",
+        "m.nii",
+        "-pe_dir",
+        "j",
+    ]
+    # dual PE: nargs="+" run keeps consuming dashed axis letters
+    assert normalize_axis_argv(["-pe_dir", "-i", "-k", "-prefix", "o"], opts) == [
+        "-pe_dir",
+        "i",
+        "k",
+        "-prefix",
+        "o",
+    ]
+
+
 def test_split_prefix_strips_extensions():
     from fastfuncstuff.cli.locomoco import _split_prefix
 
