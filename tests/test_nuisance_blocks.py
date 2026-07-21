@@ -244,6 +244,39 @@ class TestRunIndexInference:
         names = ["sub-01_RUN-01_motion.1D", "sub-01_RUN-02_motion.1D"]
         assert _infer_run_indices_from_filenames(names, n_runs=2) == [0, 1]
 
+    def test_short_rN_token(self):
+        """AFNI-style `.r001_` short run token resolves without BIDS naming."""
+        names = [f"nlmoco.r00{i}_locomoco_pcs.1D" for i in range(1, 7)]
+        assert _infer_run_indices_from_filenames(names, n_runs=6) == [0, 1, 2, 3, 4, 5]
+
+    def test_token_beats_lexical_sort_order(self):
+        """Non-zero-padded r1..r10 sort as r1,r10,r2… lexically; the token
+        parser must still map by numeric value, not sorted position."""
+        names = sorted(f"motion_r{i}.1D" for i in range(1, 11))
+        out = _infer_run_indices_from_filenames(names, n_runs=10, allow_sequential_fallback=True)
+        # names[0] is motion_r1 (run 1 → idx 0), names[1] is motion_r10 (idx 9).
+        assert out[0] == 0
+        assert out[1] == 9
+
+    def test_sequential_fallback_when_count_matches(self):
+        """No parseable token, but one file per run → trust sorted order."""
+        names = ["confounds_A.txt", "confounds_B.txt", "confounds_C.txt"]
+        assert _infer_run_indices_from_filenames(
+            names, n_runs=3, allow_sequential_fallback=True
+        ) == [0, 1, 2]
+
+    def test_sequential_fallback_disabled_by_default(self):
+        names = ["confounds_A.txt", "confounds_B.txt", "confounds_C.txt"]
+        with pytest.raises(ValueError, match="Could not infer per-run"):
+            _infer_run_indices_from_filenames(names, n_runs=3)
+
+    def test_sequential_fallback_requires_count_match(self):
+        """Untokenised files with a count mismatch stay an error — sorted
+        order can't tell which runs are present."""
+        names = ["confounds_A.txt", "confounds_B.txt"]
+        with pytest.raises(ValueError, match="counts must match"):
+            _infer_run_indices_from_filenames(names, n_runs=3, allow_sequential_fallback=True)
+
 
 # ---------------------------------------------------------------------------
 # Factory: glob

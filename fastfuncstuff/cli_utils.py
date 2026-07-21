@@ -951,6 +951,10 @@ _RUN_INDEX_PATTERNS = (
     (r"_run(\d+)_", "_runN_"),
     (r"_run(\d+)\b", "_runN"),
     (r"[._]run[-_]?(\d+)", "broad .run-N / _run_N"),
+    # AFNI-style short run token: `.r001_`, `_r6.`, etc. X may be zero-padded.
+    # Requires a . or _ before the `r` so it doesn't fire inside ordinary words.
+    (r"[._]r(\d+)_", "rN_ (e.g. .r001_)"),
+    (r"[._]r(\d+)\b", "rN (e.g. _r06)"),
     (r"(\d+)\.[^.]+$", "trailing N before extension"),
     (r"(\d+)\D*$", "trailing N"),
 )
@@ -959,13 +963,21 @@ _RUN_INDEX_PATTERNS = (
 def _infer_run_indices_from_filenames(
     names: list[str],
     n_runs: int,
+    allow_sequential_fallback: bool = False,
 ) -> list[int]:
     """Try patterns in priority order; return 0-indexed run for each name.
 
     A pattern succeeds when it (a) matches every name, (b) yields unique
     run numbers, and (c) all numbers fall in ``[1, n_runs]``. The first
-    success wins. If none succeeds we raise ``ValueError`` with the
-    failures from each attempt, so the user can see what's ambiguous.
+    success wins.
+
+    Token patterns come first because they stay correct even when the files
+    would sort in the wrong order (``r1, r10, r2``). Only if every pattern
+    fails do we consider the count: when ``allow_sequential_fallback`` is set
+    and the number of files exactly equals ``n_runs``, the caller-sorted list
+    is trusted 1:1 (file *i* → run *i*). This is what lets un-tokenised but
+    complete file sets work without any BIDS-style naming. If neither route
+    resolves, raise ``ValueError`` listing what each pattern tried.
     """
     failures: list[str] = []
     for pat, desc in _RUN_INDEX_PATTERNS:
@@ -984,11 +996,23 @@ def _infer_run_indices_from_filenames(
             failures.append(f"{desc}: out-of-range run numbers {sorted(nums)} for n_runs={n_runs}")
             continue
         return [n - 1 for n in nums]
+
+    # No run token parsed. If the glob is already complete (one file per run),
+    # sorted order is unambiguous — assign sequentially rather than erroring.
+    if allow_sequential_fallback and len(names) == n_runs:
+        return list(range(n_runs))
+
     raise ValueError(
         "Could not infer per-run indices from filenames. Patterns tried:\n  "
         + "\n  ".join(failures)
         + f"\n  Files: {names}\n"
-        "Use -ortvec_run FILE LABEL RUN to assign explicitly, or rename "
+        + (
+            f"  Sequential fallback not used: {len(names)} files vs {n_runs} runs "
+            "(counts must match to assign by sorted order).\n"
+            if allow_sequential_fallback
+            else ""
+        )
+        + "Use -ortvec_run FILE LABEL RUN to assign explicitly, or rename "
         "files to a BIDS-style _run-NN_ pattern."
     )
 
@@ -1077,6 +1101,7 @@ def make_nuisance_block_from_glob(
     run_indices_0 = _infer_run_indices_from_filenames(
         [p.name for p in matched],
         n_runs=n_runs,
+        allow_sequential_fallback=True,
     )
 
     per_run: list[np.ndarray | None] = [None] * n_runs
