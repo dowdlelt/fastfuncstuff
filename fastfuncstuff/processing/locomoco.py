@@ -3669,6 +3669,58 @@ def make_raw_reference_me_result(
     )
 
 
+def make_raw_reference_result(
+    data: np.ndarray,
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    is_3dacq: bool = False,
+    dual: bool = False,
+    verbose: bool = True,
+) -> LocomocoResult:
+    """Zero-motion single-echo result for the ``-backend qwarp`` direct path.
+
+    Single-echo analogue of :func:`make_raw_reference_me_result`: builds what the E=1
+    qwarp wrap needs WITHOUT running :func:`estimate_residual_flow`. ``corrected_nifti``
+    is the raw series, so the qwarp reference is a plain temporal median of raw and qwarp
+    owns the whole field. The geometry MUST match the estimator it replaces so the saved
+    warp keeps its orientation: the 3-D-acq path mirrors :func:`_run_3dacq_plain` (the
+    ``disp_slice`` fallback when slice==PE), the 2-D path mirrors the slicewise branch of
+    :func:`estimate_residual_flow` (``slice_axis`` used directly).
+    """
+    orig_shape = tuple(int(s) for s in data.shape)
+    if is_3dacq:
+        disp_slice = (
+            slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
+        )
+    else:
+        disp_slice = slice_axis
+    a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
+    pe_flow_is_u = pe_axis == a1
+    perm = [3, disp_slice, a0, a1]
+    if verbose:
+        print(
+            f"🌀 locomoco {_geometry_report(orig_shape, pe_axis, disp_slice, is_3dacq=is_3dacq, dual=dual)}"
+        )
+        print("   ⏭️  skipping flow estimate (qwarp owns the field)")
+    nt = orig_shape[3]
+    ph = torch.zeros((nt, 1, 1, 1))  # placeholder canonical tensors — unused on this path
+    return LocomocoResult(
+        u_canon=ph,
+        v_canon=ph,
+        corrected_canon=ph,
+        perm=perm,
+        pe_flow_is_u=pe_flow_is_u,
+        pe_axis=pe_axis,
+        slice_axis=disp_slice,
+        orig_shape=orig_shape,
+        a0=a0,
+        a1=a1,
+        dual=dual,
+        corrected_nifti=torch.from_numpy(np.ascontiguousarray(data)).float(),
+    )
+
+
 def polish_me_result(
     result: MultiEchoLocomocoResult,
     *,

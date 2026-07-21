@@ -1455,6 +1455,9 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     # The estimator that runs is the reference-building pass (flow for the qwarp backend).
     prepass_backend = "flow" if qwarp_backend else args.backend
+    # -backend qwarp owns the whole field, so the flow estimation is skipped (qwarp+dual
+    # / qwarp+rotaware already errored above, so reaching here means neither is set).
+    skip_flow_qwarp = qwarp_backend and not rotaware and not dual
     if len(args.input) != 1:
         print(
             f"❌ single-echo mode takes ONE -input (got {len(args.input)}); use -me_3depi for "
@@ -1526,8 +1529,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"   accuracy: {acc_desc}")
     if qwarp_backend:
         print(
-            f"   🪄 qwarp field (E=1, ncc to median; flow -refine {args.refine} builds the "
-            f"reference): minpatch={args.qwarp_minpatch}, levels={args.qwarp_levels}, "
+            f"   🪄 qwarp field (E=1, ncc to median of raw, no flow pass): "
+            f"minpatch={args.qwarp_minpatch}, levels={args.qwarp_levels}, "
             f"iters={args.qwarp_iters}, optimizer={args.qwarp_optimizer}"
         )
 
@@ -1617,6 +1620,15 @@ def main(argv: list[str] | None = None) -> int:
             search_min_steps=args.search_min_steps,
             device=device,
         )
+    elif skip_flow_qwarp:
+        # -backend qwarp owns the whole field, so skip the flow estimation entirely: the
+        # reference is a plain temporal median of the raw series (correct for already
+        # moco'd/NORDIC'd input). Use -backend flow -final_qwarp for flow refinement.
+        from fastfuncstuff.processing.locomoco import make_raw_reference_result
+
+        result = make_raw_reference_result(
+            data, pe_axis, slice_axis, is_3dacq=args.is_3dacq, dual=dual
+        )
     else:
         result = estimate_residual_flow(
             data,
@@ -1660,15 +1672,18 @@ def main(argv: list[str] | None = None) -> int:
         from fastfuncstuff.processing.locomoco import MultiEchoLocomocoResult, polish_me_result
 
         print(
-            "🪄 qwarp backend: registering frames to the refined reference..."
+            "🪄 qwarp backend: registering frames to the median-of-raw reference..."
             if qwarp_backend
             else "🪄 Polishing residual with qwarp..."
         )
+        # On the skip-flow path there is no estimated field (the placeholder canonical
+        # tensors make pe_displacement() invalid); qwarp owns the field, so seed zeros.
+        w_seed = torch.zeros(result.orig_shape) if skip_flow_qwarp else result.pe_displacement()
         wrapped = MultiEchoLocomocoResult(
             per_echo=[result],
             alpha=torch.tensor([1.0]),
             echo_times=torch.tensor([1.0]),
-            w_field=result.pe_displacement(),
+            w_field=w_seed,
             pe_axis=result.pe_axis,
             linearity_r2=1.0,
         )

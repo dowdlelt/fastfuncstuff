@@ -13,11 +13,75 @@ import torch.nn.functional as F
 
 from fastfuncstuff.processing import locomoco as _lm
 from fastfuncstuff.processing.locomoco import (
+    _run_3dacq_plain,
     estimate_residual_flow,
+    make_raw_reference_result,
     optical_flow_lk_2d,
     phase_correlation_flow_2d,
     resolve_pe_axis,
 )
+
+
+def test_raw_reference_builder_matches_estimator_geometry():
+    """`-backend qwarp` skip-flow builder must reproduce the estimator's geometry EXACTLY.
+
+    The saved warp's orientation depends on perm/a0/a1/pe_flow_is_u/slice_axis, so the
+    zero-motion builder that replaces the flow pass has to match the estimator it stands
+    in for -- the 3-D-acq derivation (`_run_3dacq_plain`) and the 2-D slicewise one
+    (`estimate_residual_flow`). A mismatch would silently rotate/relabel the output."""
+    data = np.random.rand(20, 22, 12, 4).astype(np.float32)
+    geom = ("perm", "a0", "a1", "pe_flow_is_u", "pe_axis", "slice_axis", "orig_shape")
+
+    # 3-D acquisition (PE == slice is allowed; disp_slice fallback engages).
+    b3 = make_raw_reference_result(data, pe_axis=2, slice_axis=2, is_3dacq=True, verbose=False)
+    r3 = _run_3dacq_plain(
+        data,
+        pe_axis=2,
+        display_slice=2,
+        ref_mode="mean",
+        backend="flow",
+        smooth_sigma=0,
+        n_levels=1,
+        n_iters=1,
+        window_sigma=2.0,
+        max_shift=1.0,
+        trial_step=0.5,
+        refine_rounds=0,
+        converge=0,
+        converge_rel=0,
+        first_n=None,
+        automask=False,
+        automask_dilate=4,
+        automask_sigma=3.0,
+        noshift_margin=0,
+        reg_sigma=0,
+        peak_mode="first_peak",
+        search_min_steps=5,
+        save_corr_curve=None,
+        warp_interp="bilinear",
+        warp_radius=3,
+        hpf_sigma=0,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert all(getattr(b3, f) == getattr(r3, f) for f in geom)
+    # corrected series IS the raw data (its median becomes the qwarp reference).
+    assert np.allclose(b3.corrected_series().numpy(), data)
+
+    # 2-D slicewise (PE in-plane, slice distinct): builder uses slice_axis directly.
+    b2 = make_raw_reference_result(data, pe_axis=1, slice_axis=2, is_3dacq=False, verbose=False)
+    r2 = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        backend="flow",
+        n_levels=1,
+        n_iters=1,
+        is_3dacq=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert all(getattr(b2, f) == getattr(r2, f) for f in geom)
 
 
 def test_gaussian_kernel_cache_hits_and_matches_fresh():
