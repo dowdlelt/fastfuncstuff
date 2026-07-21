@@ -26,6 +26,21 @@ from torch import Tensor
 # ---------------------------------------------------------------------------
 
 
+def _quantile(x: Tensor, q: float) -> float:
+    """Quantile that tolerates large tensors.
+
+    ``torch.quantile`` refuses inputs above 2**24 elements ("input tensor is too
+    large"), which a full-resolution anatomical easily exceeds. For those we fall
+    back to ``kthvalue`` (nearest-rank, no interpolation) — plenty precise for a
+    clip-level estimate.
+    """
+    n = x.numel()
+    if n <= (1 << 24):
+        return float(x.quantile(q).item())
+    k = min(n, max(1, int(round(q * (n - 1))) + 1))
+    return float(x.kthvalue(k).values.item())
+
+
 def _cliplevel(vol: Tensor, mfrac: float = 0.5) -> float:
     """Estimate intensity clip level using AFNI's iterative median algorithm.
 
@@ -51,9 +66,9 @@ def _cliplevel(vol: Tensor, mfrac: float = 0.5) -> float:
     # AFNI uses sqrt(mean(x^2)) as initial rough estimate, then scales by
     # the histogram position corresponding to ~35th percentile.
     # We approximate this with a percentile approach.
-    ncut = float(pos.quantile(0.35).item())
+    ncut = _quantile(pos, 0.35)
     if ncut <= 0:
-        ncut = float(pos.quantile(0.50).item())
+        ncut = _quantile(pos, 0.50)
 
     # Iterative convergence: median above cut → new cut = mfrac * median
     for _ in range(66):
