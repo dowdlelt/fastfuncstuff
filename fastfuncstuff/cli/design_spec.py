@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from fastfuncstuff.cli_utils import add_ortvec_arguments
 from fastfuncstuff.design.builder import (
     build_design_matrix,
     good_list_from_censor,
@@ -80,16 +81,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "-TR", type=float, default=None, help="Override TR (otherwise read from input headers)."
     )
     p_stub.add_argument(
+        "-event_cols",
         "-event-cols",
         nargs=3,
+        dest="event_cols",
         metavar=("ONSET", "DURATION", "TRIAL_TYPE"),
-        help="Non-BIDS column names for the events.tsv files.",
+        help="Non-BIDS column names for the events.tsv files (as in ffs_reml -event_cols).",
     )
     p_stub.add_argument(
+        "-event_ignore",
+        "-event-ignore",
         "-drop-trial-types",
+        "-drop_trial_types",
         nargs="*",
+        dest="drop_trial_types",
         default=["rest", "Rest", "REST", "baseline"],
-        help="Trial types to exclude from the spec.",
+        help="Trial types to exclude from the spec (as in ffs_reml -event_ignore).",
     )
     p_stub.add_argument(
         "-default-hrf",
@@ -98,54 +105,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "duration is taken from the [[events]] 'duration' "
         "field, so the bare model name is what you want here.",
     )
-    # Nuisance regressors — three input modes, matching ffs_reml. See the
-    # generated [[nuisance]] section header in design.toml for the full
-    # padding-semantics writeup.
-    p_stub.add_argument(
-        "-ortvec",
-        action="append",
-        nargs=2,
-        metavar=("FILE", "LABEL"),
-        help="Full-length nuisance (already concatenated across "
-        "all runs, used as-is). Repeatable. Use this for "
-        "AFNI mot_demean.r0N.1D files — each is already "
-        "full-length and block-diagonal.",
-    )
-    p_stub.add_argument(
-        "-ortvec_run",
-        "-ortvec-run",
-        action="append",
-        nargs=3,
-        metavar=("FILE", "LABEL", "RUN"),
-        dest="ortvec_run",
-        help="Per-run nuisance (file is one run long, "
-        "zero-padded into the full grid). RUN is 1-indexed. "
-        "Repeatable.",
-    )
-    p_stub.add_argument(
-        "-ortvec_glob",
-        "-ortvec-glob",
-        action="append",
-        nargs=2,
-        metavar=("PATTERN", "LABEL"),
-        dest="ortvec_glob",
-        help="Glob matching per-run nuisance files; run index "
-        "inferred from filename. Stored in the spec verbatim, "
-        "re-resolved at compile time. Repeatable.",
-    )
-    p_stub.add_argument(
-        "-ortvec_concat",
-        "-ortvec-concat",
-        action="append",
-        nargs=2,
-        metavar=("PATTERN", "LABEL"),
-        dest="ortvec_concat",
-        help="Glob matching N already-full-length per-run files "
-        "(e.g. AFNI mot_demean.r0N.1D — each spans every run "
-        "with zeros outside its own). Expanded into N "
-        "scope='full' entries labelled LABEL01, LABEL02, … "
-        "(width auto-padded from n_runs). Repeatable.",
-    )
+    # Nuisance regressors — register the identical -ortvec / -ortvec_run /
+    # -ortvec_glob / -ortvec_concat set that ffs_reml exposes, so a design
+    # built here can be handed to ffs_reml (or compiled) without relearning
+    # flags. See the generated [[nuisance]] section header in design.toml for
+    # the full padding-semantics writeup.
+    add_ortvec_arguments(p_stub)
     p_stub.add_argument(
         "-overwrite",
         action="store_true",
@@ -631,6 +596,7 @@ def _resolve_nuisance_for_compile(
             run_indices_0 = _infer_run_indices_from_filenames(
                 [p.name for p in matched],
                 n_runs=n_runs,
+                allow_sequential_fallback=True,
             )
             # Pre-validate row counts so failures point at the glob source.
             for path, run_idx0 in zip(matched, run_indices_0, strict=True):

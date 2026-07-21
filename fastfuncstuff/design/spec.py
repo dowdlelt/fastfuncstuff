@@ -408,6 +408,22 @@ def write_spec(
             lines.append(f'rescale = "{n.rescale}"')
 
     lines.append("")
+    # Echo the trial_types back as a copy-paste reference — these are exactly
+    # the names that go inside the `sym` strings below.
+    if spec.events:
+        lines.append(
+            "# ---------------------------------------------------------------------------"
+        )
+        lines.append("# Stim labels available for the `sym` strings below (one per [[events]]):")
+        for ev in spec.events:
+            lines.append(f"#   {ev.trial_type}")
+        lines.append("#")
+        lines.append("# Multi-column bases (SPMG2/3, TENT, FIR) and condition-mode 'from_events'")
+        lines.append("# duration splits expand these into <label>[k] / <label>_durN at compile")
+        lines.append("# time; address a single basis column with label[a..b].")
+        lines.append(
+            "# ---------------------------------------------------------------------------"
+        )
     lines.append("# ===========================================================================")
     lines.append("# [[contrasts]] — symbolic linear contrasts evaluated against the resolved")
     lines.append("# stim labels (each [[events]] entry contributes one or more — multi-column")
