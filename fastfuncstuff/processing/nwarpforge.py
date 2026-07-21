@@ -30,7 +30,13 @@ from .interp import (
     trilinear_interpolate,
     warp_image,
 )
-from .io import derive_mean_output_path, load_image, load_warp_field, save_image
+from .io import (
+    derive_mean_output_path,
+    load_image,
+    load_warp_field,
+    save_first_last,
+    save_image,
+)
 from .spacetime import TissueFollowingSampler, apply_spacetime_sample
 
 # Interpolation kernels usable for warp-field (displacement) interpolation during
@@ -484,9 +490,18 @@ def identify_transform_type(path: str) -> str:
 # j≡y≡AP, k≡z≡IS), i.e. we do NOT read the image's actual anatomical orientation --
 # "-jac AP" is just another way to write "-jac j", matching how the flag is used.
 _PE_AXIS_ALIASES = {
-    "i": 0, "x": 0, "lr": 0, "rl": 0,
-    "j": 1, "y": 1, "ap": 1, "pa": 1,
-    "k": 2, "z": 2, "is": 2, "si": 2,
+    "i": 0,
+    "x": 0,
+    "lr": 0,
+    "rl": 0,
+    "j": 1,
+    "y": 1,
+    "ap": 1,
+    "pa": 1,
+    "k": 2,
+    "z": 2,
+    "is": 2,
+    "si": 2,
 }
 
 
@@ -499,9 +514,7 @@ def parse_pe_axis(spec: str) -> int:
     """
     key = spec.strip().lower()
     if key not in _PE_AXIS_ALIASES:
-        raise ValueError(
-            f"unrecognised phase-encode axis {spec!r}; use i/j/k, x/y/z or LR/AP/IS"
-        )
+        raise ValueError(f"unrecognised phase-encode axis {spec!r}; use i/j/k, x/y/z or LR/AP/IS")
     return _PE_AXIS_ALIASES[key]
 
 
@@ -614,9 +627,9 @@ def fieldmap_jacobian_transported(
             xd=z, yd=z.clone(), zd=z.clone(), header_info={"affine": output_affine.copy()}
         )
     fx, fy, fz = _output_to_source_voxel_coords(w_sub, fmap_aff, output_affine)
-    jac = trilinear_interpolate(
-        jac_native, fx.reshape(-1), fy.reshape(-1), fz.reshape(-1)
-    ).reshape(output_shape)
+    jac = trilinear_interpolate(jac_native, fx.reshape(-1), fy.reshape(-1), fz.reshape(-1)).reshape(
+        output_shape
+    )
     return jac
 
 
@@ -1620,6 +1633,7 @@ def nwarpforge(
     time_range: tuple[int, int] | None = None,
     debug: bool = False,
     save_mean: bool = False,
+    save_first_last_flag: bool = False,
     dxyz: float | None = None,
     no_neg: bool = False,
     auto_pad: bool = True,
@@ -2172,8 +2186,14 @@ def nwarpforge(
         # through the downstream (output-side) sub-chain -- exact for a full multi-run
         # chain regardless of upstream motion. (See fieldmap_jacobian_transported.)
         _static_jac = fieldmap_jacobian_transported(
-            nwarp_specs, transforms, jac_match, jac_axis,
-            output_shape, output_affine, device, ainterp=ainterp,
+            nwarp_specs,
+            transforms,
+            jac_match,
+            jac_axis,
+            output_shape,
+            output_affine,
+            device,
+            ainterp=ainterp,
         )
         if verb >= 1:
             print(f"nwarpforge: -jac using fieldmap '{jac_match}', transported to the output grid")
@@ -2476,6 +2496,9 @@ def nwarpforge(
                 print(f"Saved mean: {mean_path}")
         elif verb >= 1:
             print("-save_mean requested, but output is not 4D; skipping mean output")
+
+    if save_first_last_flag:
+        save_first_last(output, prefix, header_info=output_header, verb=verb)
 
     # Save warped phase if requested
     if phase_volumes:

@@ -30,7 +30,9 @@ from fastfuncstuff.processing.ffs_moco import (
 from fastfuncstuff.processing.io import (
     derive_mean_output_path,
     load_image,
+    save_first_last,
     save_image,
+    save_tsnr,
 )
 
 # Sentinel for `-save_mean` given with no value: derive the path from -prefix.
@@ -421,6 +423,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "derives mean_{prefix} from -prefix (legacy behavior); give a PREFIX to "
         "write it there (and you may then omit -prefix to skip the full series).",
     )
+    out_group.add_argument(
+        "-save_first_last",
+        "-save-first-last",
+        dest="save_first_last",
+        action="store_true",
+        help="Save the first & last corrected volumes as one switchable file "
+        "firstlast_{prefix} — flip between them in a viewer to see how well the "
+        "correction worked. Requires -prefix (used to name the file).",
+    )
+    out_group.add_argument(
+        "-save_first_last_diff",
+        "-save-first-last-diff",
+        dest="save_first_last_diff",
+        action="store_true",
+        help="Like -save_first_last but the file also carries a third volume, the "
+        "difference (last - first): firstlastdiff_{prefix}. Written separately so "
+        "the signed difference keeps its own scale.",
+    )
+    out_group.add_argument(
+        "-save_tsnr",
+        "-save-tsnr",
+        dest="save_tsnr",
+        action="store_true",
+        help="Save a temporal-SNR map (temporal mean / temporal std) of the "
+        "corrected series as tsnr_{prefix} — a QC map of where the correction "
+        "left clean signal. Requires -prefix (used to name the file).",
+    )
+    out_group.add_argument(
+        "-save_initial",
+        "-save-initial",
+        dest="save_initial",
+        action="store_true",
+        help="Also emit the requested QC files (first/last, diff, tSNR) for the "
+        "ORIGINAL uncorrected data (e.g. firstlast_initial_{prefix}, "
+        "tsnr_initial_{prefix}), for a before/after comparison. Defaults to plain "
+        "first/last when no other QC flag is given.",
+    )
 
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
@@ -577,6 +616,50 @@ def _build_config(
     )
 
 
+def _want_qc(args) -> bool:
+    """True if any QC-output flag (first/last, diff, tSNR, initial) was requested."""
+    return bool(
+        args.save_first_last or args.save_first_last_diff or args.save_tsnr or args.save_initial
+    )
+
+
+def _want_corrected_qc(args) -> bool:
+    """True if a QC output needs the resampled corrected series (not just the raw)."""
+    return bool(args.save_first_last or args.save_first_last_diff or args.save_tsnr)
+
+
+def _write_qc(args, corrected, original, base_path, header_info, verb) -> None:
+    """Write the requested QC files (first/last, difference, tSNR) for one series.
+
+    ``corrected`` is the aligned 4-D series (named files use it), ``original`` is
+    the matching pre-correction series (for -save_initial). ``base_path`` is the
+    corrected-series output path the files are named after.
+    """
+    want_plain = args.save_first_last
+    want_diff = args.save_first_last_diff
+
+    if want_plain:
+        save_first_last(corrected, base_path, header_info, include_diff=False, verb=verb)
+    if want_diff:
+        save_first_last(corrected, base_path, header_info, include_diff=True, verb=verb)
+    if args.save_tsnr:
+        save_tsnr(corrected, base_path, header_info, verb=verb)
+
+    if args.save_initial:
+        # -save_initial mirrors whichever QC output(s) are active onto the raw
+        # data; alone it means plain first/last on the raw data.
+        if want_plain or not (want_diff or args.save_tsnr):
+            save_first_last(
+                original, base_path, header_info, include_diff=False, initial=True, verb=verb
+            )
+        if want_diff:
+            save_first_last(
+                original, base_path, header_info, include_diff=True, initial=True, verb=verb
+            )
+        if args.save_tsnr:
+            save_tsnr(original, base_path, header_info, initial=True, verb=verb)
+
+
 def _save_estimation_outputs(args, result, header_info, verb) -> None:
     """Save the single-instance outputs (one per run, independent of echo).
 
@@ -707,11 +790,20 @@ def main(argv: list[str] | None = None) -> None:
             "iterfile",
             "save_weight",
         )
-    )
+    ) or _want_qc(args)
     if not _any_output:
         print(
             "Error: no outputs requested. Give at least one of -prefix, "
             "-save_mean, -1Dfile, -1Dmatrix_save, -dfile, -maxdisp1D, -iterfile.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # The QC files are named after -prefix; require it when requested.
+    if _want_qc(args) and args.prefix is None:
+        print(
+            "Error: -save_first_last / -save_first_last_diff / -save_tsnr / "
+            "-save_initial name their files after -prefix; pass -prefix.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -752,8 +844,9 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
 
     base_vol, base_index = _parse_base(args, verb)
 
-    # Resampling is only needed if we will emit a corrected series or its mean.
-    need_aligned = args.prefix is not None or args.save_mean is not None
+    # Resampling is only needed if we will emit a corrected series, its mean, or a
+    # corrected-series QC map (-save_initial reads the raw data only).
+    need_aligned = args.prefix is not None or args.save_mean is not None or _want_corrected_qc(args)
     config = _build_config(
         args, device, verb, skip_resample=not need_aligned, base_index=base_index
     )
@@ -788,6 +881,10 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
             save_image(result.aligned.mean(dim=0), mean_path, header_info=header_info)
         if verb >= 1:
             print(f"Saved mean: {mean_path}")
+
+    if _want_qc(args):
+        base_path = parse_prefix(args.prefix).as_file()
+        _write_qc(args, result.aligned, data, base_path, header_info, verb)
 
     _save_estimation_outputs(args, result, header_info, verb)
 
@@ -835,9 +932,10 @@ def _run_multi_echo(
 
     write_series = args.prefix is not None
     write_mean = args.save_mean is not None
+    want_qc = _want_qc(args)
 
     # Resample each echo with the shared matrices and write eN_ outputs.
-    if write_series or write_mean:
+    if write_series or write_mean or want_qc:
         base_copy_idx = base_index if base_vol is None else -1
         dtype = torch.float32
         for i, path in enumerate(input_files):
@@ -887,6 +985,10 @@ def _run_multi_echo(
                 save_image(aligned.mean(dim=0), mean_path, header_info=echo_hdr)
                 if verb >= 1:
                     print(f"  Saved mean: {mean_path}")
+
+            if want_qc:
+                base_path = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()
+                _write_qc(args, aligned, echo, base_path, echo_hdr, verb)
 
             del echo, aligned
             if device.type == "cuda":

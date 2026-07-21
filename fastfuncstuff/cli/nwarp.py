@@ -110,6 +110,15 @@ Examples:
         help="If output is 4D, save mean as mean_{prefix_basename}{ext}",
     )
     io_group.add_argument(
+        "-save_first_last",
+        "-save-first-last",
+        dest="save_first_last",
+        action="store_true",
+        help="If output is 4D, save the first and last volumes as a single "
+        "switchable file firstlast_{prefix_basename}{ext} — flip between them in "
+        "a viewer to eyeball how much the warp moved the data.",
+    )
+    io_group.add_argument(
         "-master",
         default=None,
         help="Master dataset defining output grid. "
@@ -374,6 +383,7 @@ def main(argv: list[str] | None = None) -> None:
         time_range=time_range,
         debug=args.debug,
         save_mean=args.save_mean,
+        save_first_last_flag=args.save_first_last,
         dxyz=args.dxyz,
         no_neg=args.no_neg,
         auto_pad=args.auto_pad,

@@ -750,6 +750,43 @@ def create_parser() -> argparse.ArgumentParser:
         "Independent of -no_corrected.",
     )
     out.add_argument(
+        "-save_first_last",
+        "-save-first-last",
+        dest="save_first_last",
+        action="store_true",
+        help="Save the first & last corrected volumes as one switchable file "
+        "({prefix}_locomoco_firstlast) — flip between them in a viewer to see how "
+        "well the correction worked.",
+    )
+    out.add_argument(
+        "-save_first_last_diff",
+        "-save-first-last-diff",
+        dest="save_first_last_diff",
+        action="store_true",
+        help="Like -save_first_last but the file also carries a third volume, the "
+        "difference (last - first): {prefix}_locomoco_firstlastdiff. The signed "
+        "difference is kept un-clamped.",
+    )
+    out.add_argument(
+        "-save_tsnr",
+        "-save-tsnr",
+        dest="save_tsnr",
+        action="store_true",
+        help="Save a temporal-SNR map (temporal mean / temporal std) of the "
+        "corrected series ({prefix}_locomoco_tsnr) — a QC map of where the "
+        "correction left clean signal.",
+    )
+    out.add_argument(
+        "-save_initial",
+        "-save-initial",
+        dest="save_initial",
+        action="store_true",
+        help="Also emit the requested QC files (first/last, diff, tSNR) for the "
+        "ORIGINAL uncorrected data ({prefix}_orig_firstlast, {prefix}_orig_tsnr), "
+        "for a before/after comparison. Defaults to plain first/last when no other "
+        "QC flag is given.",
+    )
+    out.add_argument(
         "-save_confidence",
         "-save-confidence",
         action="store_true",
@@ -983,6 +1020,119 @@ def _write_warp_pcs(components, stem, n_pcs) -> None:
 def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
     """Clamp negatives in a magnitude image unless -allow_neg (sinc resampling rings)."""
     return arr if allow_neg else np.clip(arr, 0.0, None)
+
+
+def _want_qc(args) -> bool:
+    """True if any QC-output flag (first/last, diff, tSNR, initial) was requested."""
+    return bool(
+        args.save_first_last or args.save_first_last_diff or args.save_tsnr or args.save_initial
+    )
+
+
+def _want_corrected_qc(args) -> bool:
+    """True if a QC output needs the corrected series (not just the raw data)."""
+    return bool(args.save_first_last or args.save_first_last_diff or args.save_tsnr)
+
+
+def _save_tsnr(series, out_stem, ext, affine) -> None:
+    """Write a temporal-SNR map (mean / temporal std over T) for QC.
+
+    ``series`` is ``(nx, ny, nz, T)`` with time on the LAST axis. Voxels with
+    zero temporal std map to 0 (rather than inf/nan).
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+
+    if series.ndim != 4 or series.shape[3] < 2:
+        print(f"  ⚠️  tSNR skipped ({Path(out_stem).name}): need 4-D with ≥2 volumes")
+        return
+
+    mean = series.mean(axis=-1)
+    std = series.std(axis=-1)
+    tsnr = np.divide(mean, std, out=np.zeros_like(mean), where=std > 0)
+    path = f"{out_stem}{ext}"
+    with spinner(f"Writing {Path(path).name}"):
+        save_nifti(tsnr, path, affine=affine)
+    print(f"  • tSNR: {path}")
+
+
+def _save_first_last(series, out_stem, ext, affine, *, include_diff, allow_neg) -> None:
+    """Write a switchable first/last (and optional difference) 4-D file.
+
+    ``series`` is ``(nx, ny, nz, T)`` with time on the LAST axis; ``out_stem`` is
+    the full path stem (extension added here). The difference volume (last-first)
+    is signed and never neg-clamped so a diverging map reads both directions.
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+
+    if series.ndim != 4 or series.shape[3] < 2:
+        print(f"  ⚠️  first/last skipped ({Path(out_stem).name}): need 4-D with ≥2 volumes")
+        return
+
+    vols = [_neg_clip(series[..., 0], allow_neg), _neg_clip(series[..., -1], allow_neg)]
+    if include_diff:
+        vols.append(series[..., -1] - series[..., 0])
+    stack = np.stack(vols, axis=-1)
+    path = f"{out_stem}{ext}"
+    with spinner(f"Writing {Path(path).name}"):
+        save_nifti(stack, path, affine=affine)
+    print(f"  • {'first/last/diff' if include_diff else 'first/last'}: {path}")
+
+
+def _write_qc_diag(args, corrected, original, corr_stem, orig_stem, ext, affine) -> None:
+    """Write the requested QC files (first/last, difference, tSNR) for one series.
+
+    ``corrected`` / ``original`` are ``(nx, ny, nz, T)`` numpy arrays (corrected
+    vs pre-correction). ``corr_stem`` / ``orig_stem`` are their path stems.
+    """
+    want_plain = args.save_first_last
+    want_diff = args.save_first_last_diff
+
+    if want_plain:
+        _save_first_last(
+            corrected,
+            f"{corr_stem}_firstlast",
+            ext,
+            affine,
+            include_diff=False,
+            allow_neg=args.allow_neg,
+        )
+    if want_diff:
+        _save_first_last(
+            corrected,
+            f"{corr_stem}_firstlastdiff",
+            ext,
+            affine,
+            include_diff=True,
+            allow_neg=args.allow_neg,
+        )
+    if args.save_tsnr:
+        _save_tsnr(corrected, f"{corr_stem}_tsnr", ext, affine)
+
+    if args.save_initial:
+        # -save_initial mirrors whichever QC output(s) are active onto the raw
+        # data; alone it means plain first/last on the raw data.
+        if want_plain or not (want_diff or args.save_tsnr):
+            _save_first_last(
+                original,
+                f"{orig_stem}_firstlast",
+                ext,
+                affine,
+                include_diff=False,
+                allow_neg=args.allow_neg,
+            )
+        if want_diff:
+            _save_first_last(
+                original,
+                f"{orig_stem}_firstlastdiff",
+                ext,
+                affine,
+                include_diff=True,
+                allow_neg=args.allow_neg,
+            )
+        if args.save_tsnr:
+            _save_tsnr(original, f"{orig_stem}_tsnr", ext, affine)
 
 
 def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
@@ -1322,6 +1472,11 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             with spinner(f"Writing {Path(flow_path).name}"):
                 save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
             print(f"  • echo {j + 1} signed PE flow 4D (voxels): {flow_path}")
+        if _want_qc(args):
+            corrected = res.corrected_series().numpy() if _want_corrected_qc(args) else None
+            _write_qc_diag(
+                args, corrected, datas[j], f"{estem}_locomoco", f"{estem}_orig", ext, affine
+            )
 
     # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
     alpha_path = f"{stem}_locomoco_alpha.1D"
@@ -1745,6 +1900,12 @@ def main(argv: list[str] | None = None) -> int:
                 affine=affine,
             )
         print(f"  • corrected mean: {mean_path}")
+
+    if _want_qc(args):
+        # corrected_series() is cheap (cached / reshape) and works even with
+        # -no_corrected; only materialize it when a corrected QC map is wanted.
+        corrected = result.corrected_series().numpy() if _want_corrected_qc(args) else None
+        _write_qc_diag(args, corrected, data, f"{stem}_locomoco", f"{stem}_orig", ext, affine)
 
     if not args.no_flow:
         if dual:

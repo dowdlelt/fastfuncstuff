@@ -24,13 +24,15 @@ except ImportError:
     nib = None
 
 
-def derive_mean_output_path(prefix: str | Path) -> str:
-    """Build mean-image output path as mean_{basename}{ext} in same directory.
+def derive_prefixed_output_path(prefix: str | Path, token: str) -> str:
+    """Build a sibling output path as ``{token}_{basename}{ext}``.
+
+    The NIfTI extension is preserved so the derived file matches the compression
+    the user asked for on the original prefix.
 
     Examples:
-        epi_mc.nii.gz -> mean_epi_mc.nii.gz
-        /tmp/out.nii  -> /tmp/mean_out.nii
-        out           -> mean_out
+        derive_prefixed_output_path("epi_mc.nii.gz", "mean") -> "mean_epi_mc.nii.gz"
+        derive_prefixed_output_path("/tmp/out.nii", "firstlast") -> "/tmp/firstlast_out.nii"
     """
     p = Path(prefix)
     name = p.name
@@ -42,7 +44,99 @@ def derive_mean_output_path(prefix: str | Path) -> str:
         ext = p.suffix
         stem = p.stem if ext else name
 
-    return str(p.with_name(f"mean_{stem}{ext}"))
+    return str(p.with_name(f"{token}_{stem}{ext}"))
+
+
+def derive_mean_output_path(prefix: str | Path) -> str:
+    """Build mean-image output path as mean_{basename}{ext} in same directory.
+
+    Examples:
+        epi_mc.nii.gz -> mean_epi_mc.nii.gz
+        /tmp/out.nii  -> /tmp/mean_out.nii
+        out           -> mean_out
+    """
+    return derive_prefixed_output_path(prefix, "mean")
+
+
+def save_first_last(
+    data: Tensor,
+    base_path: str | Path,
+    header_info: dict | None = None,
+    *,
+    include_diff: bool = False,
+    initial: bool = False,
+    verb: int = 1,
+) -> str | None:
+    """Save the first & last volumes (optionally + their difference) as one 4-D file.
+
+    The output is a small switchable stack — flip between the volumes in a viewer
+    to see how much a correction moved the data. ``data`` is a 4-D time-first
+    tensor ``(nt, nz, ny, nx)``; ``base_path`` is the series output path the file
+    is named after (``firstlast_{basename}`` / ``firstlastdiff_{basename}``, with
+    ``_initial`` appended when ``initial`` marks the pre-correction data).
+
+    Returns the written path, or ``None`` when ``data`` is not a >=2-volume 4-D
+    series.
+    """
+    if data.ndim != 4 or data.shape[0] < 2:
+        if verb >= 1:
+            print("  -save_first_last skipped: needs a 4-D series with >=2 volumes")
+        return None
+
+    first, last = data[0], data[-1]
+    vols = [first, last]
+    labels = ["first", "last"]
+    if include_diff:
+        # The difference is signed (last - first); leave it un-clamped so a viewer
+        # with a diverging map shows where signal moved in either direction.
+        vols.append(last - first)
+        labels.append("diff(last-first)")
+
+    stack = torch.stack(vols, dim=0)
+    token = "firstlastdiff" if include_diff else "firstlast"
+    if initial:
+        token += "_initial"
+    out_path = derive_prefixed_output_path(base_path, token)
+    save_image(stack, out_path, header_info=header_info, brick_labels=labels)
+    if verb >= 1:
+        tag = " (pre-correction)" if initial else ""
+        print(f"Saved {'first/last/diff' if include_diff else 'first/last'}{tag}: {out_path}")
+    return out_path
+
+
+def save_tsnr(
+    data: Tensor,
+    base_path: str | Path,
+    header_info: dict | None = None,
+    *,
+    initial: bool = False,
+    verb: int = 1,
+) -> str | None:
+    """Save a temporal-SNR map (mean / temporal std over time) for QC.
+
+    ``data`` is a 4-D time-first tensor ``(nt, nz, ny, nx)``. Voxels with zero
+    temporal std map to 0 (rather than inf/nan). The file is named
+    ``tsnr_{basename}`` (``tsnr_initial_{basename}`` when ``initial`` marks the
+    pre-correction data).
+
+    Returns the written path, or ``None`` when ``data`` is not a >=2-volume 4-D
+    series.
+    """
+    if data.ndim != 4 or data.shape[0] < 2:
+        if verb >= 1:
+            print("  -save_tsnr skipped: needs a 4-D series with >=2 volumes")
+        return None
+
+    mean = data.mean(dim=0)
+    std = data.std(dim=0)
+    tsnr = torch.where(std > 0, mean / std, torch.zeros_like(mean))
+    token = "tsnr_initial" if initial else "tsnr"
+    out_path = derive_prefixed_output_path(base_path, token)
+    save_image(tsnr, out_path, header_info=header_info)
+    if verb >= 1:
+        tag = " (pre-correction)" if initial else ""
+        print(f"Saved tSNR{tag}: {out_path}")
+    return out_path
 
 
 def _require_nibabel() -> None:
