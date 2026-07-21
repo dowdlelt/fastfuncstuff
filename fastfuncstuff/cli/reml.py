@@ -2554,7 +2554,10 @@ def main():
                         _full[_vmf] = _rt
                     else:
                         _full = _rt  # fit used all voxels
-                    _dmf = _dmask.reshape(-1).bool()
+                    # _full is CPU (built from CPU residuals); _dmask lives on the
+                    # compute device. Index with a CPU mask to avoid a CPU/CUDA
+                    # index mismatch. observe_residuals re-homes _dmask itself.
+                    _dmf = _dmask.reshape(-1).bool().cpu()
                     diag.observe_residuals(
                         {_label: _full[_dmf]},
                         _dmask,
