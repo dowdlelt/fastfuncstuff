@@ -918,6 +918,50 @@ def print_header(args):
     print()
 
 
+def _report_loaded_design(design_info: dict, source: str) -> None:
+    """Echo a run-structure / column summary for a pre-built design matrix.
+
+    Mirrors the reporting the -events/-onsets path prints while building the
+    design, so a user who passed -matrix or -spec still sees run count, polort,
+    stim classes, nuisance width and contrasts before the GLM runs. Purely
+    cosmetic — the numbers come straight out of the already-parsed xmat.
+    """
+    matrix = design_info.get("matrix")
+    n_rows = matrix.shape[0] if matrix is not None else design_info.get("n_timepoints")
+    n_cols = matrix.shape[1] if matrix is not None else design_info.get("n_regressors")
+    run_starts = design_info.get("run_starts") or [0]
+    groups = design_info.get("column_groups")
+    stim_labels = design_info.get("stim_labels") or []
+    glt_labels = design_info.get("glt_labels") or []
+
+    print()
+    print("Design matrix summary (loaded, not rebuilt):")
+    print(f"  Source: {source}")
+    if design_info.get("tr") is not None:
+        print(f"  TR: {design_info['tr']:.3f}s")
+    print(f"  Runs: {len(run_starts)}")
+    print(f"  Total timepoints: {n_rows}")
+    print(f"  Run starts (TRs): {run_starts}")
+    print(f"  Regressors: {n_cols}")
+
+    # AFNI ColumnGroups convention: -1 = polort drift, 0 = nuisance, ≥1 = stim.
+    if groups:
+        n_polort = sum(1 for g in groups if g == -1)
+        n_stim_cols = sum(1 for g in groups if g >= 1)
+        n_nuis = sum(1 for g in groups if g == 0)
+        n_runs = len(run_starts)
+        polort_note = ""
+        if n_runs and n_polort % n_runs == 0:
+            polort_note = f" (order {n_polort // n_runs - 1} per run × {n_runs} runs)"
+        print(f"  Polort drift columns: {n_polort}{polort_note}")
+        print(f"  Stim columns: {n_stim_cols}")
+        print(f"  Other nuisance columns (ortvec/motion/etc): {n_nuis}")
+    if stim_labels:
+        print(f"  Stim classes ({len(stim_labels)}): {list(stim_labels)}")
+    if glt_labels:
+        print(f"  Contrasts ({len(glt_labels)}): {list(glt_labels)}")
+
+
 def print_output_summary(args):
     """Print summary of requested outputs"""
     print("=" * 70)
@@ -1325,6 +1369,9 @@ def main():
     if args.matrix:
         # Load design matrix from file
         design_info = read_afni_design_matrix(args.matrix)
+        # Echo a summary so -matrix / -spec runs confirm run structure, polort
+        # and nuisance width just like the onset-building path does.
+        _report_loaded_design(design_info, source=str(args.matrix))
     else:
         # Build design matrix from onsets
         print()
