@@ -43,6 +43,70 @@ def test_select_non_contrast_subbricks_keeps_stim_drops_contrast():
     ]
 
 
+def test_select_non_contrast_keeps_per_stim_zstat_drops_contrast_zstat():
+    # ffs_util_updatedof -numcomps writes Coef/Tstat/Zstat triples per stim,
+    # and a matching Zstat per contrast. Per-stim z must survive; contrast z
+    # must be dropped like the other contrast bricks.
+    from fastfuncstuff.cli.util_concalc import _select_non_contrast_subbricks
+
+    labels = [
+        "DI#0_Coef",  # keep
+        "DI#0_Tstat",  # keep
+        "DI#0_Zstat",  # keep (per-stim z)
+        "FvH_Coef",  # drop
+        "FvH_Tstat",  # drop
+        "FvH_Zstat",  # drop (contrast z)
+    ]
+    keep = _select_non_contrast_subbricks(labels, stim_base_labels=["DI"])
+    assert [labels[i] for i in keep] == ["DI#0_Coef", "DI#0_Tstat", "DI#0_Zstat"]
+
+
+def test_contrast_base_name_strips_all_suffixes():
+    from fastfuncstuff.cli.util_concalc import _contrast_base_name
+
+    assert _contrast_base_name("face_vs_place#0_Coef") == "face_vs_place"
+    assert _contrast_base_name("face_vs_place_Tstat") == "face_vs_place"
+    assert _contrast_base_name("face_vs_place_Zstat") == "face_vs_place"
+    assert _contrast_base_name("anyOf_Fstat") == "anyOf"
+    assert _contrast_base_name("faces#0_Coef") == "faces"
+    # Not a contrast-style label → None.
+    assert _contrast_base_name("Full_Fstat") == "Full"  # (has _Fstat suffix)
+    assert _contrast_base_name("Mask") is None
+
+
+def test_unsafe_drops_flags_label_mismatch_but_allows_recompute():
+    # The footgun: a spec built from singular `face` events against a bucket
+    # fit with plural `faces#0_Coef`. Those betas fall out of keep_idx and are
+    # NOT among the contrasts being recomputed → must be reported as unsafe.
+    from fastfuncstuff.cli.util_concalc import (
+        _select_non_contrast_subbricks,
+        _unsafe_drops,
+    )
+
+    labels = [
+        "Full_Fstat",
+        "faces#0_Coef",
+        "faces#0_Tstat",
+        "places#0_Coef",
+        "places#0_Tstat",
+        "old_contrast_Coef",
+        "old_contrast_Tstat",
+    ]
+    # Spec knows singular stim labels only.
+    keep = _select_non_contrast_subbricks(labels, stim_base_labels=["face", "place"])
+
+    # Recomputing a contrast that already exists → its old bricks drop, but
+    # safely (same name is rebuilt).
+    safe = _unsafe_drops(labels, keep, new_contrast_labels={"old_contrast"})
+    assert "old_contrast_Coef" not in safe
+    # The mislabelled betas are lost and not recomputed → flagged.
+    assert set(safe) == {"faces#0_Coef", "faces#0_Tstat", "places#0_Coef", "places#0_Tstat"}
+
+    # With correct labels nothing is unsafe.
+    keep_ok = _select_non_contrast_subbricks(labels, stim_base_labels=["faces", "places"])
+    assert _unsafe_drops(labels, keep_ok, new_contrast_labels={"old_contrast"}) == []
+
+
 def test_brick_labels_extension_round_trip(tmp_path):
     """Our XML extension survives nibabel save/load + our reader recovers
     the original list."""

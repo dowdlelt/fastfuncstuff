@@ -114,6 +114,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-overwrite", action="store_true", help="Allow overwriting an existing output file."
     )
+    p.add_argument(
+        "-force",
+        action="store_true",
+        help="Proceed even when sub-bricks would be *dropped* (not just "
+        "recomputed). Without this, concalc refuses to write if any "
+        "existing sub-brick would be lost — usually a sign the spec's stim "
+        "labels don't match the bucket. Recomputing a contrast that already "
+        "exists never needs -force.",
+    )
     p.add_argument("-device", default=None, help="torch device override (cpu / cuda / mps).")
     p.add_argument(
         "-verb", type=int, default=1, help="0 = quiet, 1 = summary, 2 = per-bin progress."
@@ -403,11 +412,50 @@ def _xtxinv_per_bin(
 
 _COEF_RE = re.compile(r"^(.+?)#(\d+)_Coef$")
 _TSTAT_RE = re.compile(r"^(.+?)#(\d+)_Tstat$")
+# Per-stim z-stat, e.g. written by ffs_util_updatedof -numcomps (which turns
+# each t into a DoF-adjusted z, giving Coef/Tstat/Zstat triples per stim).
+_ZSTAT_RE = re.compile(r"^(.+?)#(\d+)_Zstat$")
 # Matches a contrast-style label (no '#N' segment) — i.e. a sub-brick that came
 # from a previous GLT computation rather than a per-stim coefficient.
 _CONTRAST_COEF_RE = re.compile(r"^(?P<name>.+?)_Coef$")
 _CONTRAST_TSTAT_RE = re.compile(r"^(?P<name>.+?)_Tstat$")
 _CONTRAST_FSTAT_RE = re.compile(r"^(?P<name>.+?)_Fstat$")
+_CONTRAST_ZSTAT_RE = re.compile(r"^(?P<name>.+?)_Zstat$")
+
+
+def _contrast_base_name(label: str) -> str | None:
+    """Strip a contrast-style sub-brick label to its bare contrast name.
+
+    ``face_vs_place#0_Coef`` / ``face_vs_place_Tstat`` → ``face_vs_place``.
+    Returns ``None`` for labels that don't carry a Coef/Tstat/Fstat/Zstat/R²
+    suffix (i.e. not a contrast output). ``_Zstat`` appears when a DoF tool
+    (ffs_util_updatedof -numcomps) has post-processed the bucket. The trailing
+    ``#N`` AFNI sub-index — present on ffs_reml-written contrasts but not
+    concalc-written ones — is stripped.
+    """
+    for suf in ("_Coef", "_Tstat", "_Fstat", "_Zstat", "_R2semi", "_R2"):
+        if label.endswith(suf):
+            return re.sub(r"#\d+$", "", label[: -len(suf)])
+    return None
+
+
+def _unsafe_drops(
+    stats_labels: list[str],
+    keep_idx: list[int],
+    new_contrast_labels: set[str],
+) -> list[str]:
+    """Labels that would be dropped *without* being recomputed under the same
+    name. Dropping a contrast we're about to rebuild is expected (fixing a bad
+    contrast); dropping anything else loses data — usually the tripwire for a
+    spec whose stim labels don't match the bucket (singular ``face`` vs the
+    bucket's ``faces#0_Coef``), which reclassifies every β as a stale contrast.
+    """
+    kept = set(keep_idx)
+    return [
+        lbl
+        for i, lbl in enumerate(stats_labels)
+        if i not in kept and _contrast_base_name(lbl) not in new_contrast_labels
+    ]
 
 
 def _select_non_contrast_subbricks(
@@ -417,10 +465,10 @@ def _select_non_contrast_subbricks(
     """Return the indices of sub-bricks to *keep* when rewriting the bucket.
 
     A label is treated as an existing contrast (and dropped) when it ends
-    in ``_Coef`` / ``_Tstat`` / ``_Fstat`` AND its name part has no ``#N``
-    segment AND it's not the bucket-wide ``Full_Fstat``. Everything else
-    (β, per-stim t, Full_Fstat, partial R², drift, anything we don't know
-    about) is preserved verbatim.
+    in ``_Coef`` / ``_Tstat`` / ``_Fstat`` / ``_Zstat`` AND its name part has
+    no ``#N`` segment AND it's not the bucket-wide ``Full_Fstat``. Everything
+    else (β, per-stim t/z, Full_Fstat, partial R², drift, anything we don't
+    know about) is preserved verbatim.
     """
     keep: list[int] = []
     stim_set = set(stim_base_labels)
@@ -428,20 +476,26 @@ def _select_non_contrast_subbricks(
         if lbl == "Full_Fstat":
             keep.append(i)
             continue
-        # Per-stim β / t — has '#N' segment, name part is in stim list.
+        # Per-stim β / t / z — has '#N' segment, name part is in stim list.
+        # (The z brick appears after ffs_util_updatedof -numcomps.)
         m_coef = _COEF_RE.match(lbl)
         m_tstat = _TSTAT_RE.match(lbl)
+        m_zstat = _ZSTAT_RE.match(lbl)
         if m_coef and m_coef.group(1) in stim_set:
             keep.append(i)
             continue
         if m_tstat and m_tstat.group(1) in stim_set:
             keep.append(i)
             continue
-        # No '#N' suffix → likely a previous-contrast Coef/Tstat/Fstat. Drop.
+        if m_zstat and m_zstat.group(1) in stim_set:
+            keep.append(i)
+            continue
+        # No '#N' suffix → likely a previous-contrast Coef/Tstat/Fstat/Zstat. Drop.
         if (
             _CONTRAST_COEF_RE.match(lbl)
             or _CONTRAST_TSTAT_RE.match(lbl)
             or _CONTRAST_FSTAT_RE.match(lbl)
+            or _CONTRAST_ZSTAT_RE.match(lbl)
         ):
             continue
         # Unknown shape — keep, on the principle "leave user data alone".
@@ -930,6 +984,30 @@ def main() -> int:
     # stim, Full_Fstat, partial R², and any other non-contrast sub-brick is
     # preserved verbatim.
     keep_idx = _select_non_contrast_subbricks(stats_labels, stim_base_labels)
+
+    # A dropped sub-brick is only *safe* when it's a contrast we're about to
+    # recompute under the same name (fixing a bad contrast is expected). Any
+    # other drop loses data that can't be regenerated without rerunning the
+    # model — refuse unless -force. This is the tripwire for the classic
+    # footgun: a spec whose stim labels don't match the bucket (e.g. singular
+    # `face` vs the bucket's `faces#0_Coef`) silently reclassifies every β as
+    # a stale contrast and strips it.
+    new_contrast_labels = {label for label, _ in contrast_matrices}
+    unsafe_drops = _unsafe_drops(stats_labels, keep_idx, new_contrast_labels)
+    if unsafe_drops and not args.force:
+        shown = ", ".join(unsafe_drops[:8]) + (" …" if len(unsafe_drops) > 8 else "")
+        print(
+            f"ERROR: {len(unsafe_drops)} sub-brick(s) would be dropped without "
+            f"being recomputed:\n  {shown}\n"
+            "These are not contrasts named in the spec, so they'd be lost "
+            "(and with -inplace, permanently). This usually means the spec's "
+            "stim labels don't match the bucket — check that the [[events]] "
+            "trial_type names line up with the bucket's β labels. Pass -force "
+            "to drop them anyway.",
+            file=sys.stderr,
+        )
+        return 1
+
     out_labels = [stats_labels[i] for i in keep_idx]
     out_subs = [stats_data[..., i] for i in keep_idx]
     n_dropped = stats_data.shape[-1] - len(keep_idx)
