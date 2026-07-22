@@ -72,6 +72,7 @@ def derive_phase_output_path(prefix: str) -> str:
 
     Examples:
         out.nii.gz   -> out_phase.nii.gz
+        out.nii.zst  -> out_phase.nii.zst
         out.nii      -> out_phase.nii
     """
     from pathlib import Path
@@ -80,6 +81,9 @@ def derive_phase_output_path(prefix: str) -> str:
     if p.name.endswith(".nii.gz"):
         stem = p.name[: -len(".nii.gz")]
         return str(p.parent / f"{stem}_phase.nii.gz")
+    elif p.name.endswith(".nii.zst"):
+        stem = p.name[: -len(".nii.zst")]
+        return str(p.parent / f"{stem}_phase.nii.zst")
     elif p.name.endswith(".nii"):
         stem = p.name[: -len(".nii")]
         return str(p.parent / f"{stem}_phase.nii")
@@ -477,9 +481,9 @@ def identify_transform_type(path: str) -> str:
         'affine' or 'nonlinear'
     """
     path_lower = path.lower()
-    if path_lower.endswith(".1d") or path_lower.endswith(".txt"):
+    if path_lower.endswith((".1d", ".txt")):
         return "affine"
-    elif path_lower.endswith(".nii") or path_lower.endswith(".nii.gz"):
+    elif path_lower.endswith((".nii", ".nii.gz", ".nii.zst")):
         return "nonlinear"
     else:
         raise ValueError(f"Cannot identify transform type for: {path}")

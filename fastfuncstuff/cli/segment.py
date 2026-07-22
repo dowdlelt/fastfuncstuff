@@ -91,6 +91,16 @@ def _strip_ext(prefix: str) -> str:
     return prefix
 
 
+def _output_ext(prefix: str) -> str:
+    """The NIfTI extension to honor on outputs, taken from ``-prefix`` (so
+    ``-prefix seg.nii.zst`` writes ``seg_c1.nii.zst``). Non-NIfTI or bare
+    prefixes default to ``.nii.gz``."""
+    for ext in (".nii.gz", ".nii.zst", ".nii"):
+        if prefix.endswith(ext):
+            return ext
+    return ".nii.gz"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="ffs_segment",
@@ -857,21 +867,22 @@ def main(argv: list[str] | None = None) -> int:
         verbose=verbose,
     )
     prefix = _strip_ext(args.prefix)
+    ext = _output_ext(args.prefix)  # honor -prefix ext on all image outputs
     n_chan = len(channels)
     ref = channels[0]  # reference channel for the shared-geometry outputs
     with _step("Writing tissue maps + bias", enabled=verbose):
         for t in range(n_tissue):
-            _save_input(out["posteriors"][t], f"{prefix}_c{t + 1}.nii.gz")
+            _save_input(out["posteriors"][t], f"{prefix}_c{t + 1}{ext}")
             if "posteriors_precleanup" in out:
-                _save_input(out["posteriors_precleanup"][t], f"{prefix}_c{t + 1}_precleanup.nii.gz")
+                _save_input(out["posteriors_precleanup"][t], f"{prefix}_c{t + 1}_precleanup{ext}")
         # bias-corrected + bias field, per channel (suffix _chN only when multi-channel).
         # The autobox margin gets bias=1 (neutral / no correction), corrected=0.
         for c in range(n_chan):
             suffix = "" if n_chan == 1 else f"_ch{c + 1}"
             corr_c = out["corrected"] if n_chan == 1 else out["corrected"][c]
             bias_c = out["bias"] if n_chan == 1 else out["bias"][c]
-            _save_input(corr_c, f"{prefix}_biascorrected{suffix}.nii.gz")
-            _save_input(bias_c, f"{prefix}_biasfield{suffix}.nii.gz", fill=1.0)
+            _save_input(corr_c, f"{prefix}_biascorrected{suffix}{ext}")
+            _save_input(bias_c, f"{prefix}_biasfield{suffix}{ext}", fill=1.0)
 
     if args.save_histogram is not None:
         hist_path = (
@@ -911,7 +922,7 @@ def main(argv: list[str] | None = None) -> int:
     initial_in_tpl = input_in_template(
         ref, fit, tpl_shape, use_warp=False, kernel=args.prior_interp, device=device
     )
-    save_image(initial_in_tpl, f"{prefix}_in_template_initial.nii.gz", affine=tpl_aff)
+    save_image(initial_in_tpl, f"{prefix}_in_template_initial{ext}", affine=tpl_aff)
     extra.append(", _in_template_initial")
 
     if not args.no_warp:
@@ -925,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
             wz = embed_in_full(wz, full_shape, box_slices)
         save_warp_field(
             wx, wy, wz,
-            f"{prefix}_warp.nii.gz",
+            f"{prefix}_warp{ext}",
             header_info=hdr,
             affine=hdr["affine"],
             units="mm",
@@ -944,7 +955,7 @@ def main(argv: list[str] | None = None) -> int:
                 iz = embed_in_full(iz, full_shape, box_slices)
             save_warp_field(
                 ix, iy, iz,
-                f"{prefix}_invwarp.nii.gz",
+                f"{prefix}_invwarp{ext}",
                 header_info=hdr,
                 affine=hdr["affine"],
                 units="mm",
@@ -952,12 +963,12 @@ def main(argv: list[str] | None = None) -> int:
             extra.append(", _invwarp")
         # geometry-corrected input in its OWN space (PE-mode: the undistorted EPI)
         undist = undistort_input(ref, fit, device=device)
-        _save_input(undist, f"{prefix}_undistorted.nii.gz")
+        _save_input(undist, f"{prefix}_undistorted{ext}")
         # corrected input in TEMPLATE space (affine + warp) — aligns with the anat
         corrected_in_tpl = input_in_template(
             ref, fit, tpl_shape, kernel=args.prior_interp, device=device
         )
-        save_image(corrected_in_tpl, f"{prefix}_in_template.nii.gz", affine=tpl_aff)
+        save_image(corrected_in_tpl, f"{prefix}_in_template{ext}", affine=tpl_aff)
         extra += [", _warp", ", _undistorted", ", _in_template"]
 
     if args.tpm_source is not None:
@@ -977,7 +988,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         save_image(
             initial,
-            f"{prefix}_tpm_source_in_epi_initial.nii.gz",
+            f"{prefix}_tpm_source_in_epi_initial{ext}",
             header_info=hdr,
             affine=hdr["affine"],
         )
@@ -987,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
                 src, src_affine, tpm_affine, fit, shape, kernel=args.prior_interp, device=device
             )
             save_image(
-                final, f"{prefix}_tpm_source_in_epi.nii.gz", header_info=hdr, affine=hdr["affine"]
+                final, f"{prefix}_tpm_source_in_epi{ext}", header_info=hdr, affine=hdr["affine"]
             )
             extra.append(", _tpm_source_in_epi")
 
