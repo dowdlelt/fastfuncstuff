@@ -50,6 +50,8 @@ dynamics = [
 ]
 
 [project.scripts]
+# Pipeline generator
+ffs_autoproc = "fastfuncstuff.cli.autoproc:main"
 # Analysis tools
 ffs_bsds = "fastfuncstuff.cli.bsds:main"
 ffs_build_design = "fastfuncstuff.cli.build_design:main"

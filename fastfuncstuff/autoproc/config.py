@@ -1,0 +1,128 @@
+"""Default per-stage option strings for ffs_autoproc.
+
+Each ``-<stage>_opts`` CLI flag *replaces* the corresponding default string
+here; ``--help`` prints the default so the user knows what they're overriding
+(afni_proc.py style). Keep these as the flags a hand-written script would use —
+they are the pipeline's opinion, not a minimal set.
+
+The nonlinear-edge-safety requirement (don't let a cut-off FOV drive phantom
+stretching) is realized through the registration defaults: ``-source_automask
+-autoweight`` on every linear step, which weights brain over the empty/near-zero
+FOV. Callers wanting a harder zero-weight threshold override via ``-*_opts``.
+"""
+
+from __future__ import annotations
+
+# Linear + nonlinear registration op strings, per alignment level.
+DEFAULT_OPTS: dict[str, str] = {
+    # motion correction (per run). wls = batched Gauss-Newton, the fast default and
+    # the right cost for within-run same-contrast rigid moco (lpa forces a slow
+    # per-volume optimizer — do NOT use it here). -twopass = coarse-blur then fine
+    # pass for robustness to larger motion; independent of the cost, stays batched.
+    "moco": "-cost wls -twopass",
+    # residual PE-axis nonlinear motion (locomoco).
+    "locomoco": "-backend flow -superhard -no_movie -ref mean -want_pcs 3",
+    # fieldmap distortion (blipflip); reproduces FSL b02b0 by default.
+    "blip": "-workhard",
+    # cross-run linear: rigid lpa to the fmap/first-run reference. -final wsinc5:
+    # these aligned means feed the grandmean, so a sharper single resample avoids
+    # accumulating interpolation blur down the chain (applies to every allineate).
+    "xrun": "-rigid -cost lpa -source_automask -autoweight -final wsinc5",
+    # cross-run nonlinear refinement (formwarp/SyN residual). -final_interp wsinc5
+    # for the same reason (sharper warped mean).
+    "xrun_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-07",
+    # cross-fmap linear/nonlinear (align non-ref fmap groups to the ref fmap).
+    "xfmap": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
+    "xfmap_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "-iters 200x200 -smooth 0x0 -conv_thresh 1e-05",
+    # cross-session linear/nonlinear (session grandmean → ref session).
+    "xses": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
+    "xses_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
+    # anat linear (cross-modal EPI→anat) — lpc with EPI masked to brain.
+    "anat": "-rigid -cost lpc -source_automask -autoweight -interp cubic -cmass -fast -final wsinc5",
+    # final compose+resample (ffs_nwarp).
+    "nwarp": "-interp wsinc5 -no_neg",
+}
+
+# Working / final / GLM output extensions. Intermediates default to zstd (read
+# many times, big); final timeseries to gzip (portability); GLM to gzip.
+# Compression suffix appended AFTER ".nii" in filenames (templates are "...nii$FMT"):
+# ".zst" → .nii.zst, ".gz" → .nii.gz, "" → .nii.
+DEFAULT_FMT = ".zst"
+DEFAULT_FINAL_FMT = ".gz"
+DEFAULT_GLM_FMT = ".gz"
+
+DEFAULT_DEVICE = "cuda"
+DEFAULT_FINAL_INTERP = "wsinc5"
+
+
+# ---------------------------------------------------------------------------
+# Recipes: named bundles of defaults so users hit the ground running. Each maps
+# to a dict of Options-field overrides; explicit CLI flags still win over these.
+# A recipe only sets the *baseline* — future versions may tune more params.
+# ---------------------------------------------------------------------------
+RECIPES: dict[str, dict] = {
+    # moco (to first-run/sbref) + GLM, in EPI space. Fast, minimal inputs.
+    "bare_bones": {
+        "go_to_anat": False,
+        "distortion": False,
+        "slicetiming_method": "none",
+        "run_glm": True,
+    },
+    # slice timing (if present) + distortion + moco + xrun + linear anat + GLM.
+    "simple": {
+        "go_to_anat": True,
+        "distortion": True,
+        "slicetiming_method": "integrate",
+        "run_glm": True,
+    },
+    # + nonlinear cross-run refinement.
+    "simple_nonlin": {
+        "go_to_anat": True,
+        "distortion": True,
+        "slicetiming_method": "integrate",
+        "xrun_nonlin": True,
+        "run_glm": True,
+    },
+    # + nonlinear anat (ffs_segment) — needs an anat and a subject TPM.
+    "complete": {
+        "go_to_anat": True,
+        "distortion": True,
+        "slicetiming_method": "integrate",
+        "xrun_nonlin": True,
+        "anat_nonlin": True,
+        "run_glm": True,
+    },
+    # everything + locomoco (residual NL motion) with its PCs as GLM nuisance.
+    "extreme": {
+        "go_to_anat": True,
+        "distortion": True,
+        "slicetiming_method": "integrate",
+        "xrun_nonlin": True,
+        "anat_nonlin": True,
+        "locomoco": True,
+        "glm_ortvec": True,
+        "run_glm": True,
+    },
+}
+# simple_linear is a spelling alias of simple.
+RECIPES["simple_linear"] = RECIPES["simple"]
+
+# One-line, stage-wise summary of each recipe (shown in --help). Order matters.
+RECIPE_SUMMARY: dict[str, str] = {
+    "bare_bones": "moco (→sbref/first vol) + GLM, in EPI space. No slice-timing, distortion, or anat. Fast.",
+    "simple": "slice-timing (if present) + distortion (if fmaps) + moco + cross-run align + LINEAR anat + GLM.",
+    "simple_linear": "alias of simple.",
+    "simple_nonlin": "= simple, plus nonlinear cross-run refinement.",
+    "complete": "= simple_nonlin, plus NONLINEAR anat (ffs_segment; needs -anat/-suma and a TPM, or -suma).",
+    "extreme": "= complete, plus locomoco (residual NL motion) with its warp-PCs as GLM nuisance.",
+}
+
+
+def recipe_help() -> str:
+    """Formatted recipe list for the CLI epilog."""
+    lines = ["recipes (stage defaults; any explicit flag overrides the recipe):"]
+    lines += [f"  {name:<14} {RECIPE_SUMMARY[name]}" for name in RECIPE_SUMMARY]
+    return "\n".join(lines)
