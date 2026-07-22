@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import math
+import pathlib
+import tempfile
 
+import numpy as np
 import pytest
 import torch
 
@@ -684,20 +687,415 @@ def test_fudge_factor_matches_spm_formula():
 
 
 def test_warp_penalty_linear_elastic_and_tuple_compat():
-    """The 4th/5th reg terms (le1/le2) add divergence/shear energy; a 3-tuple = le1=le2=0."""
+    """reg[3]/reg[4] are SPM's ``mu`` (shear) and ``lambda`` (divergence), in that order.
+
+    Per ``spm_diffeo.m``, param[7] (= reg[3], default 0.01) penalises the *symmetrised
+    Jacobian* and param[8] (= reg[4], default 0.04) penalises the *divergence*. They were
+    swapped here until 2026-07-22. A pure-divergence field cannot detect the swap (it has
+    non-zero ``ε_ii`` too), so the discriminating case is a **shear field with zero
+    divergence**.
+    """
     torch.manual_seed(0)
     field = torch.randn(6, 6, 6, 3, dtype=torch.float64)
     vox = (1.0, 1.0, 1.0)
     p3 = warp_penalty(field, (0.0, 0.0, 0.1), vox)
     p5_zero = warp_penalty(field, (0.0, 0.0, 0.1, 0.0, 0.0), vox)
     assert torch.allclose(p3, p5_zero)  # 3-tuple back-compat = 5-tuple with le=0
-    # a pure-divergence field (u = ∇·grid) is penalised by le1 but not by le2 (shear-free)
+
     zz, yy, xx = torch.meshgrid(*[torch.arange(6, dtype=torch.float64)] * 3, indexing="ij")
-    div_field = torch.stack([xx, yy, zz], dim=-1)  # ∂u_i/∂x_i = 1, off-diagonals 0
-    assert warp_penalty(div_field, (0.0, 0.0, 0.0, 1.0, 0.0), vox) > 0  # le1 sees divergence
-    assert warp_penalty(div_field, (0.0, 0.0, 0.0, 0.0, 1.0), vox) > 0  # le2 sees ε_ii
-    # le1/le2 strictly increase the total penalty on a generic field
+    zero = torch.zeros_like(xx)
+    # u = (y, 0, 0): ∂u_x/∂y = 1, every ∂u_i/∂x_i = 0 → pure shear, divergence-free
+    shear = torch.stack([yy, zero, zero], dim=-1)
+    assert warp_penalty(shear, (0.0, 0.0, 0.0, 1.0, 0.0), vox) > 0  # reg[3] = mu sees shear
+    assert warp_penalty(shear, (0.0, 0.0, 0.0, 0.0, 1.0), vox) == 0  # reg[4] = lambda does not
+    # and a pure-dilation field u = (x, y, z) is seen by both (divergence 3, ε_ii = 1)
+    div_field = torch.stack([xx, yy, zz], dim=-1)
+    assert warp_penalty(div_field, (0.0, 0.0, 0.0, 0.0, 1.0), vox) > 0
+    assert warp_penalty(div_field, (0.0, 0.0, 0.0, 1.0, 0.0), vox) > 0
+    # le terms strictly increase the total penalty on a generic field
     assert warp_penalty(field, (0.0, 0.0, 0.1, 0.02, 0.03), vox) > p3
+
+
+def test_warp_penalty_bending_is_the_biharmonic():
+    """Bending must be ``½Σ(Δu)²`` — SPM's ``ΔᵀΔ`` stencil — not ``½Σ(u_xx²+u_yy²+u_zz²)``.
+
+    The two forms differ because ``ΔᵀΔ`` carries the mixed partials (the ``8Σᵢ<ⱼvᵢvⱼ`` and
+    ``w110 = lam2·2v₀v₁`` terms in ``src/shoot_regularisers.c``). The discriminating field
+    is a **harmonic** one, whose pure second derivatives cancel in the Laplacian:
+    ``u_x = x² - y²`` gives ``u_xx = 2``, ``u_yy = -2`` → ``Δu = 0`` and no bending energy,
+    where summing ``u_xx² + u_yy² + u_zz²`` scores 8 at every interior node.
+    """
+    from fastfuncstuff.processing.segment import _laplacian_neumann
+
+    n = 9
+    zz, yy, xx = torch.meshgrid(*[torch.arange(n, dtype=torch.float64)] * 3, indexing="ij")
+    zero = torch.zeros_like(xx)
+    vox = (1.0, 1.0, 1.0)
+    harmonic = torch.stack([xx**2 - yy**2, zero, zero], dim=-1)  # dims (gz, gy, gx, 3)
+
+    lap = _laplacian_neumann(harmonic, vox)
+    # interior nodes never touch the replicate padding, so the cancellation is exact
+    assert lap[1:-1, 1:-1, 1:-1].abs().max() < 1e-9
+    # the form used here until 2026-07-22 — pure second differences — does NOT vanish
+    old_form = sum((torch.diff(harmonic, n=2, dim=ax) ** 2).sum() for ax in (0, 1, 2))
+    assert old_form > 0
+
+    # and the bending term is exactly ½·w·Σ(Δu)²
+    w = 0.3
+    assert torch.isclose(warp_penalty(harmonic, (0.0, 0.0, w), vox), 0.5 * w * (lap**2).sum())
+    # a genuinely curved (non-harmonic) field still carries bending energy
+    curved = torch.stack([xx**2 + yy**2, zero, zero], dim=-1)
+    assert warp_penalty(curved, (0.0, 0.0, 1.0), vox) > 0
+
+
+def test_warp_penalty_is_half_the_quadratic_form():
+    """SPM's warp prior is ``½·uᵀLu`` (``llr = -0.5*sum(Twarp.*vel2mom(Twarp))``).
+
+    ``warp_penalty`` must return that half, so that its autograd gradient is ``Lu`` — the
+    quantity SPM adds to ``Beta``. Checked via Euler's theorem: for a quadratic form,
+    ``u·∂P/∂u = 2P``.
+    """
+    torch.manual_seed(0)
+    field = torch.randn(5, 5, 5, 3, dtype=torch.float64, requires_grad=True)
+    vox = (1.5, 1.5, 1.5)
+    pen = warp_penalty(field, (0.01, 0.02, 0.1, 0.01, 0.04), vox)
+    (grad,) = torch.autograd.grad(pen, field)
+    assert torch.isclose((field * grad).sum(), 2.0 * pen)
+    # and the half itself: doubling the field quadruples the energy, from a known scale
+    field2 = field.detach() * 2.0
+    assert torch.isclose(warp_penalty(field2, (1.0, 0.0, 0.0), vox), 4.0 * 0.5 * (field**2).sum())
+
+
+@pytest.mark.parametrize(
+    "reg",
+    [
+        (0.0, 0.0, 0.1, 0.01, 0.04),  # SPM default
+        (1e-3, 0.0, 0.1, 0.01, 0.04),  # the GN variant (absolute floor for CG's SPD-ness)
+        (0.5, 0.3, 0.0, 0.0, 0.0),  # abs + membrane only
+        (0.0, 0.0, 0.0, 0.7, 0.0),  # shear only
+        (0.0, 0.0, 0.0, 0.0, 0.7),  # divergence only
+        (0.0, 0.0, 1.0, 0.0, 0.0),  # bending only
+    ],
+)
+def test_warp_prior_grad_matches_autograd(reg):
+    """The analytic ``L·u`` must equal ``∂/∂u warp_penalty(u)`` to round-off.
+
+    ``warp_prior_grad`` replaced an autograd pass because the Gauss-Newton solver applies
+    ``L`` eleven times per warp sub-iteration and the autograd route was the single largest
+    contributor to a launch-bound EM loop. It is only safe if it is *exactly* the same
+    operator — a silent mismatch would change the Newton direction without changing any
+    result an existing test checks.
+    """
+    from fastfuncstuff.processing.segment import warp_prior_grad
+
+    torch.manual_seed(0)
+    field = torch.randn(7, 6, 5, 3, dtype=torch.float64)
+    vox = (1.3, 0.9, 2.1)  # anisotropic, so an axis/spacing mix-up cannot cancel
+    v = field.clone().requires_grad_(True)
+    (expected,) = torch.autograd.grad(warp_penalty(v, reg, vox), v)
+    got = warp_prior_grad(field, reg, vox)
+    assert torch.allclose(got, expected, atol=1e-10, rtol=1e-8), (
+        f"max |Δ| = {(got - expected).abs().max():.3e}"
+    )
+
+
+def test_warp_prior_grad_is_a_symmetric_linear_operator():
+    """``L`` must be linear and self-adjoint — the conjugate-gradient solve assumes both."""
+    from fastfuncstuff.processing.segment import warp_prior_grad
+
+    torch.manual_seed(1)
+    reg, vox = (1e-3, 0.05, 0.1, 0.01, 0.04), (1.0, 1.4, 2.2)
+    a = torch.randn(5, 6, 4, 3, dtype=torch.float64)
+    b = torch.randn(5, 6, 4, 3, dtype=torch.float64)
+    la, lb = warp_prior_grad(a, reg, vox), warp_prior_grad(b, reg, vox)
+    # linearity
+    assert torch.allclose(warp_prior_grad(2.0 * a + 3.0 * b, reg, vox), 2.0 * la + 3.0 * lb)
+    # self-adjointness: <a, Lb> == <La, b>
+    assert torch.isclose((a * lb).sum(), (la * b).sum())
+    # positive semi-definite (CG needs it), and the energy identity ½·uᵀLu = P(u)
+    assert (a * la).sum() > 0
+    assert torch.isclose(0.5 * (a * la).sum(), warp_penalty(a, reg, vox))
+
+
+def test_bspline3_is_an_interpolating_spline():
+    """The deformation upsampler must pass exactly through the fitted nodes.
+
+    SPM expands ``Twarp`` with ``spm_bsplinc(...,[3 3 3 0 0 0])`` + a matching degree-3
+    sample (``spm_preproc_write8.m:133-136``). Unlike the degree-2 TPM kernel — which is
+    deliberately approximating because ``spm_bsplinc`` at degree 1 is a no-op — degree 3
+    runs a real prefilter, so the result **interpolates**. At ``samp 3`` on 0.7 mm data
+    this is a 4x upsample of the field that positions every tissue prior, so getting it
+    wrong facets the deformation on the coarse lattice.
+    """
+    from fastfuncstuff.processing.segment import (
+        bspline3_coefficients,
+        bspline_interpolate_multi,
+    )
+
+    torch.manual_seed(0)
+    v = torch.randn(3, 9, 8, 7, dtype=torch.float64)  # a 3-component displacement field
+    coeffs = bspline3_coefficients(v)
+    zz, yy, xx = torch.meshgrid(
+        *[torch.arange(n, dtype=torch.float64) for n in (9, 8, 7)], indexing="ij"
+    )
+    got = bspline_interpolate_multi(
+        coeffs, xx.reshape(-1), yy.reshape(-1), zz.reshape(-1), degree=3
+    )
+    # exact at every node INCLUDING the edges (mirror taps match the prefilter's boundary)
+    assert (got.T.reshape(3, 9, 8, 7) - v).abs().max() < 1e-12
+
+    one = lambda a: torch.tensor([a], dtype=torch.float64)  # noqa: E731
+    ones = torch.ones(1, 9, 8, 7, dtype=torch.float64)
+    mid = bspline_interpolate_multi(
+        bspline3_coefficients(ones), one(2.3), one(3.7), one(4.5), degree=3
+    )
+    assert torch.isclose(mid, torch.ones_like(mid))  # partition of unity off-node
+    # and a linear ramp is reproduced (degree-3 B-splines are exact up to cubic)
+    ramp = bspline_interpolate_multi(
+        bspline3_coefficients(xx[None].clone()), one(3.25), one(3.0), one(4.0), degree=3
+    )
+    assert abs(ramp.item() - 3.25) < 0.02
+
+
+def test_load_tpm_adds_background_only_when_the_template_is_incomplete():
+    """A limited-coverage TPM needs a class for 'everything else'; a complete one does not.
+
+    A generative mixture has to explain every voxel. GM/WM/CSF-only priors leave air,
+    skull and scalp with nowhere to go, so the model shoehorns them into a tissue class.
+    SPM's own ``TPM.nii`` does not have this problem — its six classes sum to 1.0 — so the
+    auto rule must be a no-op there.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.processing.segment import load_tpm
+
+    def _write(path, prob):  # prob: (K, nz, ny, nx) in [0,1]
+        arr = np.ascontiguousarray(np.transpose(prob, (3, 2, 1, 0)))  # (nx,ny,nz,K)
+        nib.save(nib.Nifti1Image(arr.astype(np.float32), np.eye(4)), str(path))
+
+    n = 6
+    rng = np.random.default_rng(0)
+    brain = rng.random((3, n, n, n)) * 0.3  # sums to ~0.45 → 55% unexplained
+    with tempfile.TemporaryDirectory() as td:
+        partial = pathlib.Path(td) / "partial.nii"
+        _write(partial, brain)
+        lp, _, _, _, added = load_tpm(str(partial), verbose=False)
+        assert added and lp.shape[0] == 4
+        p = torch.exp(lp) - 1e-4
+        assert torch.allclose(p.sum(0), torch.ones_like(p.sum(0)), atol=2e-4)  # now complete
+
+        # a template that already sums to 1 gets nothing appended
+        complete = np.concatenate([brain, (1.0 - brain.sum(0))[None]], axis=0)
+        full = pathlib.Path(td) / "full.nii"
+        _write(full, complete)
+        lp2, _, _, _, added2 = load_tpm(str(full), verbose=False)
+        assert not added2 and lp2.shape[0] == 4
+        # and forcing it off is honoured
+        _, _, _, _, added3 = load_tpm(str(partial), add_background="no", verbose=False)
+        assert not added3
+
+
+def test_tpm_coverage_mask_rejects_below_and_outside():
+    """The field-of-view rules: SPM's inferior-only cut, and the full-box extension."""
+    from fastfuncstuff.processing.segment import tpm_coverage_mask
+
+    shape, vox = (40, 50, 60), (1.5, 1.5, 1.5)  # (nz, ny, nx), 1.5 mm iso
+    pts = torch.tensor(
+        [
+            [30.0, 25.0, 20.0],  # well inside
+            [30.0, 25.0, 2.0],  # z = 2 < 5/1.5 - 1 = 2.33 → below the template floor
+            [30.0, 25.0, -40.0],  # far below (the neck)
+            [200.0, 25.0, 20.0],  # far outside in +x, but at a legal height
+        ],
+        dtype=torch.float64,
+    )
+    spm_rule = tpm_coverage_mask(pts, shape, vox, bottom_mm=5.0)
+    assert spm_rule.tolist() == [True, False, False, True]  # +x escapee survives
+    both = tpm_coverage_mask(pts, shape, vox, bottom_mm=5.0, fov_mm=0.0)
+    assert both.tolist() == [True, False, False, False]  # full box catches it
+    assert tpm_coverage_mask(pts, shape, vox, bottom_mm=0.0).all()  # rules disabled
+
+
+def test_clean_gwc_accepts_custom_and_multiple_class_roles():
+    """Cleanup must not be hardwired to SPM's c1/c2/c3 ordering.
+
+    Same phantom in two layouts — SPM order, and a permuted template with the GM mass
+    split across two classes — must give the same brain extraction.
+    """
+    from fastfuncstuff.processing.segment import clean_gwc
+
+    n = 24
+    zz, yy, xx = torch.meshgrid(*[torch.arange(n, dtype=torch.float32)] * 3, indexing="ij")
+    r = ((xx - n / 2) ** 2 + (yy - n / 2) ** 2 + (zz - n / 2) ** 2).sqrt()
+    gm, wm, csf = ((r >= 4) & (r < 7)).float(), (r < 4).float(), ((r >= 7) & (r < 9)).float()
+    blob = ((xx - 2) ** 2 + (yy - 2) ** 2 + (zz - 2) ** 2 < 4).float()  # detached "dura"
+    other = (1.0 - gm - wm - csf - blob).clamp_min(0.0)
+
+    spm_order = torch.stack([gm + blob, wm, csf, other])
+    spm_order = spm_order / spm_order.sum(0, keepdim=True).clamp_min(1e-6)
+    a = clean_gwc(spm_order, level=1)
+
+    # permuted: WM=0, CSF=1, other=2, GM split across 3 and 4
+    perm = torch.stack([wm, csf, other, gm * 0.5 + blob, gm * 0.5])
+    perm = perm / perm.sum(0, keepdim=True).clamp_min(1e-6)
+    b = clean_gwc(perm, level=1, gm_class=(3, 4), wm_class=(0,), csf_class=(1,))
+
+    assert a[0][blob > 0].max() < 1e-3  # the detached blob is stripped in both layouts
+    assert (b[3] + b[4])[blob > 0].max() < 1e-3
+    assert torch.allclose(a[0][r < 6.5], (b[3] + b[4])[r < 6.5], atol=1e-4)  # cortex kept
+
+
+def test_bspline2_is_spm_approximating_kernel():
+    """``bspline2_interpolate_multi`` must be SPM's degree-2 B-spline on *unprefiltered*
+    data — an approximating, not an interpolating, kernel.
+
+    ``spm_load_priors8`` runs ``spm_bsplinc(..., deg=1)``, which is a no-op, then
+    ``spm_sample_priors8`` samples with ``deg=2``. The signature of applying a degree-2
+    basis to raw samples is exact reproduction of **linear** functions but a constant
+    offset on quadratics: with taps at ``c±1`` and weights ``½(½∓d)², ¾-d²``,
+
+        Σ w_k·(c+k)² = (c+d)² + ¼
+
+    — the value is high by exactly ¼ everywhere, independent of ``d``. An interpolating
+    kernel (trilinear, cubic Lagrange) would return ``x²`` on the nodes. That ``¼`` is the
+    low-pass character the warp's Gauss-Newton gradient relies on.
+    """
+    from fastfuncstuff.processing.segment import bspline2_interpolate_multi
+
+    n = 12
+    zz, yy, xx = torch.meshgrid(*[torch.arange(n, dtype=torch.float64)] * 3, indexing="ij")
+    ones = torch.ones_like(xx)
+    vol = torch.stack([ones, xx, xx**2], dim=0)  # 3 "tissues": constant, linear, quadratic
+
+    x = torch.tensor([3.0, 3.25, 3.5, 4.75, 6.0], dtype=torch.float64)
+    y = torch.full_like(x, 5.0)
+    z = torch.full_like(x, 5.0)
+    got = bspline2_interpolate_multi(vol, x, y, z)
+
+    assert torch.allclose(got[:, 0], torch.ones_like(x))  # partition of unity
+    assert torch.allclose(got[:, 1], x)  # exact on linear
+    assert torch.allclose(got[:, 2], x**2 + 0.25)  # +1/4 on quadratic → approximating
+
+    # Continuous across the tap switch at a half-integer coordinate (where the stencil
+    # shifts from {c-1,c,c+1} to {c,c+1,c+2}): the jump must shrink with the step, not sit
+    # at a fixed cliff — the failure mode that stalled the Gauss-Newton line search.
+    def _jump(eps: float) -> float:
+        xs = torch.tensor([4.5 - eps, 4.5 + eps], dtype=torch.float64)
+        v = bspline2_interpolate_multi(vol, xs, torch.full_like(xs, 5.0), torch.full_like(xs, 5.0))
+        return (v[0] - v[1]).abs().max().item()
+
+    assert _jump(1e-4) > 0.0
+    assert _jump(1e-5) < 0.2 * _jump(1e-4)  # linear in the step ⇒ continuous
+
+
+def test_tpm_bottom_cut_drops_samples_below_template():
+    """SPM excludes samples the affine puts within 5 mm of the bottom of the TPM.
+
+    ``spm_preproc8.m:233-237`` — on a whole-head T1 that is the neck and shoulders. Those
+    voxels otherwise enter ``vr0``, the soft-tissue/bone/air Gaussians and the ``wp``
+    masses. With an identity geometry and a 1 mm TPM the rule drops every plane with
+    ``z <= 5/1 - 1 = 4``, i.e. z = 0..4.
+    """
+    torch.manual_seed(0)
+    n = 16
+    vol, tissue, _, _ = _phantom_three_tissue(n)
+    vol = vol + 1.0  # no zero voxels, so the cut is the ONLY thing removing samples
+    prob = tissue / tissue.sum(0, keepdim=True).clamp_min(1e-6)
+    log_prior = torch.log(prob.clamp(0, 1) + 1e-4)
+    eye = torch.eye(4, dtype=torch.float64)
+    bg = prob[:, 0].mean(dim=(1, 2))
+    base = dict(  # noqa: C408
+        ngaus=[1, 1, 1], biasfwhm=12.0, samp=1.0, n_iter=1, n_inner=1,
+        fit_warp=False, verbose=False,
+    )  # fmt: skip
+
+    kept_all = fit_segment(vol, eye, log_prior, eye, bg, bg, eye, tpm_bottom_mm=0.0, **base)
+    kept_cut = fit_segment(vol, eye, log_prior, eye, bg, bg, eye, tpm_bottom_mm=5.0, **base)
+
+    assert kept_all["n_samp"] == n**3
+    assert kept_cut["n_samp"] == (n - 5) * n * n  # z = 0..4 removed
+
+
+def test_split_gaussians_scales_jitter_by_per_tissue_covariance():
+    """The ``ngaus`` split must use each tissue's OWN covariance, not a pooled one.
+
+    SPM splits after the first [GMM, bias] round from the converged ``vr1(:,:,k1)``
+    (``spm_preproc8.m:671``). Splitting at moment-init time — when every tissue still
+    shares one pooled covariance — scatters a tight class as widely as a broad one, which
+    is what lands the extra Gaussians of the multi-component classes (CSF x2, bone x3,
+    soft x4) in the wrong places.
+    """
+    from fastfuncstuff.processing.segment import split_gaussians
+
+    means1 = torch.tensor([[0.0, 0.0]], dtype=torch.float64)  # (n_chan=1, n_tissue=2)
+    covs1 = torch.tensor([[[1.0, 100.0]]], dtype=torch.float64)  # tight vs broad tissue
+    means, covs, mix, tissue_of = split_gaussians(means1, covs1, [4, 4])
+
+    assert tissue_of.tolist() == [0] * 4 + [1] * 4
+    assert torch.allclose(mix, torch.full((8,), 0.25, dtype=torch.float64))
+    spread_tight = means[0, tissue_of == 0].std()
+    spread_broad = means[0, tissue_of == 1].std()
+    # jitter ∝ sqrt(vr_k), so the broad tissue's components must scatter ~10x wider
+    assert spread_broad > 5.0 * spread_tight
+    # component covariances scale with their own tissue too
+    assert covs[0, 0, tissue_of == 1].min() > covs[0, 0, tissue_of == 0].max()
+
+
+def test_split_is_deferred_but_still_applied_in_one_iteration():
+    """``ngaus`` still takes effect even for a single outer iteration.
+
+    The split moved from initialisation to the end of the first [GMM, bias] round, so a
+    regression there would silently leave the fit with one Gaussian per tissue.
+    """
+    torch.manual_seed(0)
+    n = 16
+    vol, tissue, _, _ = _phantom_three_tissue(n)
+    prob = tissue / tissue.sum(0, keepdim=True).clamp_min(1e-6)
+    log_prior = torch.log(prob.clamp(0, 1) + 1e-4)
+    eye = torch.eye(4, dtype=torch.float64)
+    bg = prob[:, 0].mean(dim=(1, 2))
+    out = fit_segment(
+        vol, eye, log_prior, eye, bg, bg, eye,
+        ngaus=[2, 1, 3], biasfwhm=12.0, samp=1.0, n_iter=1, n_inner=1,
+        fit_warp=False, verbose=False,
+    )  # fmt: skip
+    assert out["tissue_of"].tolist() == [0, 0, 1, 2, 2, 2]
+    assert out["means"].shape[1] == 6
+    assert out["covs"].shape[2] == 6
+    assert out["mix"].numel() == 6
+
+
+def test_warp_reg_in_node_units_survives_a_coarser_samp():
+    """The deformation prior lives in NODE units, so a coarser ``samp`` must not freeze it.
+
+    SPM regularises ``Twarp./sk`` (``spm_preproc8.m:805,808``) with a data gradient in the
+    same units. Penalising the displacement in *image-voxel* units instead — the behaviour
+    here until 2026-07-22 — makes the prior ``sk²`` too strong, so the warp progressively
+    under-deforms as ``samp`` coarsens (9x at ``sk=3``, 16x at ``sk=4``). Fit a known
+    3-voxel shift at ``samp=1`` (``sk=1``, where the two conventions coincide) and at
+    ``samp=2`` (``sk=2``, where they differ 4x) and require the coarse fit to keep most of
+    the displacement.
+    """
+    torch.manual_seed(0)
+    n = 24
+    vol, tissue, _, _ = _phantom_three_tissue(n)
+    prob = tissue / tissue.sum(0, keepdim=True).clamp_min(1e-6)
+    log_prior = torch.log(prob.clamp(0, 1) + 1e-4)
+    eye = torch.eye(4, dtype=torch.float64)
+    bg = prob[:, 0].mean(dim=(1, 2))
+    vol_shift = torch.roll(vol, shifts=3, dims=1)
+    base = dict(  # noqa: C408
+        ngaus=[1, 1, 1], biasfwhm=12.0, n_iter=6, warp_iters=8, warp_anneal=False,
+        tpm_bottom_mm=0.0, verbose=False,
+    )  # fmt: skip
+
+    fine = fit_segment(vol_shift, eye, log_prior, eye, bg, bg, eye, samp=1.0, **base)
+    coarse = fit_segment(vol_shift, eye, log_prior, eye, bg, bg, eye, samp=2.0, **base)
+
+    d_fine = fine["twarp"].abs().max().item()
+    d_coarse = coarse["twarp"].abs().max().item()
+    assert d_fine > 0.5, f"fine fit did not deform ({d_fine})"
+    assert d_coarse > 0.5 * d_fine, f"coarse samp under-deformed: {d_coarse} vs {d_fine}"
 
 
 def test_fit_recovers_known_bias_field():

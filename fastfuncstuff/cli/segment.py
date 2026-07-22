@@ -134,8 +134,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "                     SPEED/accuracy dial, not a quality knob: 3 mm (default)\n"
             "                     matches SPM and is plenty; 2 mm is slower and slightly\n"
             "                     finer. Outputs are always written at full resolution.\n"
-            "  -niter N           Max EM iterations (default 20); it early-stops on\n"
-            "                     convergence, so this is just a ceiling.\n"
+            "  -niter N           Max outer EM iterations (default 30, as SPM); it\n"
+            "                     early-stops on convergence, so this is just a ceiling.\n"
+            "                     Each outer iteration runs up to -inner rounds of\n"
+            "                     [GMM, bias] before the deformation step, and -min_iter\n"
+            "                     (10) iterations must pass before it may stop at all —\n"
+            "                     the warp's heavy-to-light schedule needs them.\n"
             "  -no_warp           Skip the deformation entirely (bias + tissue only).\n"
             "                     Use when the subject is already in template space or\n"
             "                     you only want bias correction + a quick classification.\n"
@@ -287,9 +291,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     knobs.add_argument(
         "-bias_iters",
         type=int,
-        default=2,
-        help="Gauss-Newton bias sweeps per EM iteration (default 2; -bias_solver gn only). "
-        "Each is a full Newton step, so 1-2 is plenty.",
+        default=1,
+        help="Gauss-Newton bias sweeps per INNER round (default 1, as SPM; -bias_solver gn "
+        "only). With -inner 8 that is 8 sweeps per outer iteration. Each sweep costs a full "
+        "E-step pass per line-search probe, so raising this is expensive.",
     )
     knobs.add_argument(
         "-reg",
@@ -329,13 +334,125 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "automatically from free memory. Lower it if you still hit OOM at a very fine "
         "-samp; it does not change the result, only peak memory.",
     )
-    knobs.add_argument("-niter", type=int, default=20, help="Max EM iterations (default 20)")
+    knobs.add_argument(
+        "-niter", type=int, default=30, help="Max outer EM iterations (default 30, as SPM)"
+    )
+    knobs.add_argument(
+        "-inner",
+        "-n_inner",
+        dest="n_inner",
+        type=int,
+        default=8,
+        help="Rounds of [GMM x20, bias] per outer iteration before the deformation step "
+        "(default 8, as SPM). Each round re-fits the mixture under the updated bias; they "
+        "stop early once the log-likelihood stops improving. 1 = the old, under-converged "
+        "behaviour.",
+    )
+    knobs.add_argument(
+        "-min_iter",
+        type=int,
+        default=10,
+        help="Floor on outer iterations before the convergence test can stop the fit "
+        "(default 10, as SPM). The heavy-to-light warp schedule only relaxes the bending "
+        "term to its target at iteration 10, so stopping earlier leaves the deformation "
+        "clamped and effectively unfitted. Do not lower this to 'speed things up'.",
+    )
     knobs.add_argument(
         "-tol",
         type=float,
         default=1e-4,
-        help="Convergence tolerance: stop when the relative log-likelihood change drops "
-        "below this (default 1e-4). Larger = stop sooner/rougher; smaller = run longer.",
+        help="Convergence tolerance (SPM's tol1, default 1e-4): stop when the log-likelihood "
+        "gain drops below tol x n_samples. Larger = stop sooner/rougher.",
+    )
+    knobs.add_argument(
+        "-tpm_bottom",
+        type=float,
+        default=5.0,
+        help="Discard fit samples the affine places within this many mm of the BOTTOM of "
+        "the TPM (default 5, as SPM) - on a whole-head T1 that is the neck and shoulders, "
+        "which are outside the template and otherwise contaminate the soft-tissue/bone/air "
+        "Gaussians. 0 keeps every voxel (use when the template covers the whole volume).",
+    )
+    knobs.add_argument(
+        "-tpm_fov",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Discard voxels lying more than MM outside the TPM box on ANY axis (default: "
+        "off; -tpm_bottom only guards the inferior direction, as SPM does). Because the "
+        "subject->template affine is supplied, 'outside the template' is a known fact about "
+        "the geometry: with this set, neck/shoulder voxels neither train the model nor come "
+        "back carrying brain-tissue probability. Try 0 or a small margin like 10.",
+    )
+    knobs.add_argument(
+        "-no_mask_outside_tpm",
+        action="store_true",
+        help="Do NOT apply the -tpm_bottom/-tpm_fov field-of-view rule to the OUTPUT maps. "
+        "By default the same rule that excludes a voxel from the fit also stops it being "
+        "classified, so tissue maps stay inside the template's coverage.",
+    )
+    knobs.add_argument(
+        "-add_background",
+        choices=("auto", "yes", "no"),
+        default="auto",
+        help="Append a synthesised background class holding 1 - sum(TPM) when the supplied "
+        "template does not explain all the probability mass (default auto). A limited-"
+        "coverage TPM (GM/WM/CSF only) needs this: without it the model must force air, "
+        "skull and scalp into a tissue class. No-op for a complete template like SPM's "
+        "TPM.nii, whose 6 classes already sum to 1.",
+    )
+    knobs.add_argument(
+        "-gm_class",
+        type=int,
+        nargs="+",
+        default=[1],
+        metavar="N",
+        help="Which output class(es) are GREY MATTER, 1-based (default 1). Used by the "
+        "morphological cleanups so they are not hardwired to SPM's c1/c2/c3 order. Accepts "
+        "several (e.g. -gm_class 1 7 for cortical + subcortical GM).",
+    )
+    knobs.add_argument(
+        "-wm_class",
+        type=int,
+        nargs="+",
+        default=[2],
+        metavar="N",
+        help="Which output class(es) are WHITE MATTER, 1-based (default 2).",
+    )
+    knobs.add_argument(
+        "-csf_class",
+        type=int,
+        nargs="+",
+        default=[3],
+        metavar="N",
+        help="Which output class(es) are CSF, 1-based (default 3). Give the OUTER/"
+        "subarachnoid shell only - that is the compartment the cleanups reason about.",
+    )
+    knobs.add_argument(
+        "-background_class",
+        type=int,
+        default=-1,
+        metavar="N",
+        help="Which class holds 'outside the template', 1-based; -1 (default) = the last "
+        "class. Voxels failing the -tpm_fov/-tpm_bottom test are assigned wholly to it.",
+    )
+    knobs.add_argument(
+        "-warp_interp",
+        default="bspline3",
+        choices=("bspline3", "linear"),
+        help="Kernel used to expand the fitted deformation from the -samp grid to full "
+        "resolution. 'bspline3' (default) is SPM's degree-3 B-spline; 'linear' is trilinear, "
+        "which facets the field on the coarse lattice (at -samp 3 on 0.7mm data this is a 4x "
+        "upsample, so it matters).",
+    )
+    knobs.add_argument(
+        "-fit_prior_interp",
+        default="bspline2",
+        choices=("bspline2", "linear"),
+        help="TPM interpolation used INSIDE the fit. 'bspline2' (default) is SPM's own "
+        "degree-2 B-spline on unprefiltered data - an approximating, mildly low-pass "
+        "kernel. 'linear' is trilinear: faster (one grid_sample vs 27 gathers) but a "
+        "sharper prior with a piecewise-constant gradient.",
     )
     knobs.add_argument(
         "-warp_smooth",
@@ -519,10 +636,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     knobs.add_argument(
         "-prior_interp",
-        default="cubic",
-        choices=("linear", "cubic", "quintic", "heptic", "wsinc5"),
-        help="Interpolation used to sample the low-res TPM for the full-res outputs "
-        "(SPM uses a degree-2 B-spline ≈ cubic, the default; linear is faster/blockier)",
+        default="bspline2",
+        choices=("bspline2", "linear", "cubic", "quintic", "heptic", "wsinc5"),
+        help="Interpolation used to sample the low-res TPM for the full-res outputs. "
+        "'bspline2' (default) is SPM's own degree-2 B-spline; 'cubic' and above are "
+        "smoother Lagrange kernels; 'linear' is faster but blockier.",
     )
 
     other = p.add_argument_group("execution")
@@ -587,7 +705,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             channels.append(ch)
         subj_affine = torch.as_tensor(hdr["affine"], dtype=torch.float64, device=device)
-        log_prior, tpm_affine, bg_low, bg_high = load_tpm(args.tpm, device=device)
+        log_prior, tpm_affine, bg_low, bg_high, _added_bg = load_tpm(
+            args.tpm, add_background=args.add_background, device=device
+        )
         reverse_channels = None
         if args.pe_reverse:  # dual-echo distortion correction (opposite blip)
             if not args.pe_axis:
@@ -636,7 +756,19 @@ def main(argv: list[str] | None = None) -> int:
         save_image(arr, path, header_info=hdr, affine=hdr["affine"])
 
     if args.ngaus is not None and len(args.ngaus) != n_tissue:
-        raise SystemExit(f"-ngaus has {len(args.ngaus)} entries but the TPM has {n_tissue} classes")
+        # -ngaus describes the classes the USER supplied; the auto background class is ours,
+        # so fill it in rather than making them count our bookkeeping.
+        if _added_bg and len(args.ngaus) == n_tissue - 1:
+            args.ngaus = [*args.ngaus, 4]
+            print(
+                f"  -ngaus extended to {args.ngaus} — 4 Gaussians for the synthesised "
+                "background class (air, skull, scalp and neck are not one population)"
+            )
+        else:
+            raise SystemExit(
+                f"-ngaus has {len(args.ngaus)} entries but the TPM has {n_tissue} classes"
+                + (" (including the auto-added background class)" if _added_bg else "")
+            )
 
     # Affine init: build the subject-voxel -> TPM-voxel map. A template->input
     # .aff12.1D chain gives template_vox -> input_vox (base=template); we want its
@@ -667,7 +799,12 @@ def main(argv: list[str] | None = None) -> int:
         fwhm=args.fwhm,
         samp=args.samp,
         n_iter=args.niter,
+        n_inner=args.n_inner,
+        min_iter=args.min_iter,
         tol=args.tol,
+        tpm_bottom_mm=args.tpm_bottom,
+        tpm_fov_mm=args.tpm_fov,
+        fit_prior_interp=args.fit_prior_interp,
         fit_warp=not args.no_warp,
         warp_anneal=args.warp_anneal,
         pe_axis=resolve_pe_axis(args.pe_axis) if args.pe_axis else None,
@@ -707,6 +844,14 @@ def main(argv: list[str] | None = None) -> int:
         dura_clean=args.dura_clean,
         dura_method=args.dura_method,
         prior_kernel=args.prior_interp,
+        warp_kernel=args.warp_interp,
+        mask_outside_tpm=not args.no_mask_outside_tpm,
+        gm_class=tuple(i - 1 for i in args.gm_class),
+        wm_class=tuple(i - 1 for i in args.wm_class),
+        csf_class=tuple(i - 1 for i in args.csf_class),
+        background_class=(
+            args.background_class if args.background_class < 0 else args.background_class - 1
+        ),
         save_precleanup=args.save_precleanup,
         device=device,
         verbose=verbose,
@@ -732,10 +877,13 @@ def main(argv: list[str] | None = None) -> int:
         hist_path = (
             f"{prefix}_histogram.png" if args.save_histogram == "__auto__" else args.save_histogram
         )
+        if args.tissue_names is not None and _added_bg and len(args.tissue_names) == n_tissue - 1:
+            args.tissue_names = [*args.tissue_names, "background"]  # the class we synthesised
         if args.tissue_names is not None and len(args.tissue_names) != n_tissue:
             raise SystemExit(
                 f"-tissue_names has {len(args.tissue_names)} entries but the TPM has "
                 f"{n_tissue} classes"
+                + (" (including the auto-added background class)" if _added_bg else "")
             )
         with _step(f"Writing histogram diagnostic ({hist_path})", enabled=verbose):
             # prefer the pre-cleanup posteriors (the raw GMM fit) so morphological cleanup
@@ -767,7 +915,9 @@ def main(argv: list[str] | None = None) -> int:
     extra.append(", _in_template_initial")
 
     if not args.no_warp:
-        warp = full_resolution_warp(fit, tuple(ref.shape), device=device)  # (nz,ny,nx,3) vox disp
+        warp = full_resolution_warp(
+            fit, tuple(ref.shape), kernel=args.warp_interp, device=device
+        )  # (nz,ny,nx,3) vox disp
         wx, wy, wz = warp[..., 0], warp[..., 1], warp[..., 2]
         if box_slices is not None:  # re-embed the cropped displacement into the full grid
             wx = embed_in_full(wx, full_shape, box_slices)
