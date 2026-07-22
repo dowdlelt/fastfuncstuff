@@ -108,42 +108,70 @@ def _anat_lin_files(opt) -> list[str]:
     return [f"{gr.rstrip('/')}/{anat}"] if gr else [anat]
 
 
-def chain_files(pr: PlanRun, fmt: str, opt=None) -> list[str]:
-    """Resolve a run's warp-chain tokens into concrete filenames (OUT-relative),
-    preserving nwarp-apply order.
+# The fmap-level tokens: run-native → reference-fmap undistorted space. Applied
+# on their own to a run's moco-mean they build its "premean" (see grandmean).
+_FMAP_TOKENS = ("xfmap_nl", "xfmap_lin", "blip_half", "wxrun_nl", "wxrun_lin")
 
-    The ``anat_lin`` token expands per reference mode (see ``_anat_lin_files``);
-    the ``xref_*`` links map this data's grandmean onto the reference's.
-    """
+
+def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
+    """The concrete file(s) one warp-chain token resolves to. Single source of
+    truth for both the full chain and the fmap sub-chain (no drift)."""
+    if tok == "anat_lin":
+        return _anat_lin_files(opt)
+    if tok == "xref_nl":
+        return [stem(NameKey("xref")) + f"_nl_WARP{fmt}"]
+    if tok == "xref_lin":
+        return [stem(NameKey("xref")) + ".aff12.1D"]
+    if tok == "anat_nl":
+        return [stem(NameKey("nlanat")) + f"_invwarp{fmt}"]
+    if tok == "xses_nl":
+        return [_ses_stem(pr, "xses") + f"_nl_WARP{fmt}"]
+    if tok == "xses_lin":
+        return [_ses_stem(pr, "xses") + ".aff12.1D"]
+    if tok == "xfmap_nl":
+        return [_fmap_stem(pr, "xfmap") + f"_nl_WARP{fmt}"]
+    if tok == "xfmap_lin":
+        return [_fmap_stem(pr, "xfmap") + ".aff12.1D"]
+    if tok == "blip_half":
+        return [_fmap_stem(pr, "blip") + f"_warp{fmt}"]
+    if tok == "wxrun_nl":
+        return [_run_stem(pr, "xrun") + f"_nl_WARP{fmt}"]
+    if tok == "wxrun_lin":
+        return [_run_stem(pr, "xrun") + ".aff12.1D"]
+    if tok == "locomoco":
+        return [_run_stem(pr, "nlmoco") + f"_warp{fmt}"]
+    if tok == "moco":
+        return [_run_stem(pr, "moco") + ".aff12.1D"]
+    return []
+
+
+def chain_files(pr: PlanRun, fmt: str, opt=None) -> list[str]:
+    """Resolve a run's full warp chain into filenames (nwarp-apply order)."""
     resolved: list[str] = []
     for tok in pr.warp_chain:
-        if tok == "anat_lin":
-            resolved.extend(_anat_lin_files(opt))
-        elif tok == "xref_nl":
-            resolved.append(stem(NameKey("xref")) + f"_nl_WARP{fmt}")
-        elif tok == "xref_lin":
-            resolved.append(stem(NameKey("xref")) + ".aff12.1D")
-        elif tok == "anat_nl":
-            resolved.append(stem(NameKey("nlanat")) + f"_invwarp{fmt}")
-        elif tok == "xses_nl":
-            resolved.append(_ses_stem(pr, "xses") + f"_nl_WARP{fmt}")
-        elif tok == "xses_lin":
-            resolved.append(_ses_stem(pr, "xses") + ".aff12.1D")
-        elif tok == "xfmap_nl":
-            resolved.append(_fmap_stem(pr, "xfmap") + f"_nl_WARP{fmt}")
-        elif tok == "xfmap_lin":
-            resolved.append(_fmap_stem(pr, "xfmap") + ".aff12.1D")
-        elif tok == "blip_half":
-            resolved.append(_fmap_stem(pr, "blip") + f"_warp{fmt}")
-        elif tok == "wxrun_nl":
-            resolved.append(_run_stem(pr, "xrun") + f"_nl_WARP{fmt}")
-        elif tok == "wxrun_lin":
-            resolved.append(_run_stem(pr, "xrun") + ".aff12.1D")
-        elif tok == "locomoco":
-            resolved.append(_run_stem(pr, "nlmoco") + f"_warp{fmt}")
-        elif tok == "moco":
-            resolved.append(_run_stem(pr, "moco") + ".aff12.1D")
+        resolved.extend(_token_files(pr, tok, fmt, opt))
     return resolved
+
+
+def _fmap_subchain(pr: PlanRun, fmt: str) -> list[str]:
+    """Just the fmap-level tokens of a run's chain (xfmap∘blip∘wxrun) — applied to
+    the moco-mean to land it on the reference-fmap grid (the premean)."""
+    out: list[str] = []
+    for tok in pr.warp_chain:
+        if tok in _FMAP_TOKENS:
+            out.extend(_token_files(pr, tok, fmt, None))
+    return out
+
+
+def _ref_blip_mean(pr: PlanRun) -> str:
+    """The reference fmap group's undistorted mean — the common grid the premeans
+    (and cross-fmap alignment) land on."""
+    return stem(NameKey("blip", session=pr.bold.session, fmap=pr.ref_fmap_id)) + "_mean.nii$FMT"
+
+
+def _premean(pr: PlanRun) -> str:
+    """This run's mean resampled onto the reference-fmap grid (grandmean input)."""
+    return _run_stem(pr, "premean") + ".nii$FMT"
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +191,28 @@ def _moco_mean(pr: PlanRun) -> str:
 
 
 def _xrun_base(pr: PlanRun, session_first: PlanRun) -> str | None:
-    """Base image for this run's xrun alignment, or None if it needs no xrun."""
+    """Base image for this run's xrun alignment, or None if it needs no xrun.
+
+    Fieldmap-anchored: the group's DISTORTED forward (blip_up) — blip_half
+    undistorts *after* xrun in the chain, so xrun stays in distorted space.
+    No-fmap: the session's first-run moco mean.
+    """
     if "wxrun_lin" not in pr.warp_chain:
         return None
     if pr.fmap is not None:
-        return _fmap_stem(pr, "blip") + "_mean.nii$FMT"  # undistorted fmap mean
+        return pr.fmap_forward
     return _moco_mean(session_first)  # first-run anchor
 
 
 def _aligned_mean(pr: PlanRun) -> str:
-    """The run's mean *after* xrun (feeds the session grandmean): the nonlinear
-    result when xrun_nonlin ran, else the linear one, else the moco mean."""
+    """The run's mean in the session's common grandmean space.
+
+    With fieldmaps: the premean (moco-mean pushed through xfmap∘blip∘wxrun onto
+    the reference-fmap grid). No fieldmap: the xrun-aligned mean (nonlinear result
+    if xrun_nonlin ran, else linear), or the moco mean for the anchor run.
+    """
+    if pr.fmap is not None:
+        return _premean(pr)
     if "wxrun_nl" in pr.warp_chain:
         return _run_stem(pr, "xrun") + "_nl.nii$FMT"
     if "wxrun_lin" in pr.warp_chain:
@@ -226,7 +265,10 @@ def _data_arrays(plan: Plan) -> str:
     ]
     keys = [_key(pr) for pr in plan.runs]
     lines.append("RUN_KEYS=(" + " ".join(shlex.quote(k) for k in keys) + ")")
-    lines.append("declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN MOCOMEAN XRUNBASE ALIGNED")
+    lines.append(
+        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN MOCOMEAN XRUNBASE ALIGNED "
+        "PRECHAIN REFBLIP"
+    )
 
     # first run per session (the no-fmap anchor).
     first_by_ses: dict[str | None, PlanRun] = {}
@@ -257,6 +299,10 @@ def _data_arrays(plan: Plan) -> str:
         if base is not None:
             lines.append(f'XRUNBASE[{q(k)}]="{base}"')
         lines.append(f'ALIGNED[{q(k)}]="{_aligned_mean(pr)}"')
+        if pr.fmap is not None:
+            # premean sub-chain (moco-mean → reference-fmap grid) + that grid.
+            lines.append(f'PRECHAIN[{q(k)}]="{" ".join(_fmap_subchain(pr, ".nii$FMT"))}"')
+            lines.append(f'REFBLIP[{q(k)}]="{_ref_blip_mean(pr)}"')
         chain = chain_files(pr, ".nii$FMT", plan.options)
         lines.append(f'CHAIN[{q(k)}]="{" ".join(chain)}"')
     return "\n".join(lines) + "\n"
@@ -440,6 +486,55 @@ def _stage_blip(plan: Plan) -> str:
     return "\n".join(out) + "\n"
 
 
+def _stage_xfmap(plan: Plan) -> str:
+    """Align each NON-reference fmap group's undistorted mean to the session's
+    reference fmap mean (once per group). This is what lets runs acquired under
+    different fieldmaps share one session space; the per-run premean composes it
+    with blip+xrun (see grandmean)."""
+    opt = plan.options
+    groups: dict[tuple, PlanRun] = {}
+    for pr in plan.runs:
+        if pr.fmap is None or "xfmap_lin" not in pr.warp_chain:
+            continue  # reference fmap (or no fmap) → no cross-fmap alignment
+        groups.setdefault((pr.bold.session, pr.fmap.fmap_id), pr)
+    if not groups:
+        return ""
+    out = ["", "# ============================ stage05: cross-fmap alignment ================="]
+    out.append("echo '== stage05: cross-fmap alignment (→ reference fmap) =='")
+    for pr in groups.values():
+        xstem = _fmap_stem(pr, "xfmap")
+        src = _fmap_stem(pr, "blip") + "_mean.nii$FMT"  # this fmap, undistorted
+        base = _ref_blip_mean(pr)  # reference fmap, undistorted
+        lin = _ffs(
+            "ffs_allineate",
+            [
+                f'-base "{base}"',
+                f'-source "{src}"',
+                f'-prefix "{xstem}.nii$FMT"',
+                f'-1Dmatrix_save "{xstem}.aff12.1D"',
+                *_split_flags(config.DEFAULT_OPTS["xfmap"]),
+                '-device "$DEVICE"',
+            ],
+        )
+        out.append(f'if [ "$skip_xfmap" -ne 1 ] || [ ! -f "{xstem}.aff12.1D" ]; then\n{lin}')
+        if opt.xfmap_nonlin:
+            out.append(
+                _ffs(
+                    "ffs_formwarp",
+                    [
+                        f'-base "{base}"',
+                        f'-source "{xstem}.nii$FMT"',
+                        f'-prefix "{xstem}_nl.nii$FMT"',
+                        "-save_warp",
+                        *_split_flags(config.DEFAULT_OPTS["xfmap_nl"]),
+                        '-device "$DEVICE"',
+                    ],
+                )
+            )
+        out.append("fi")
+    return "\n".join(out) + "\n"
+
+
 def _stage_xrun(plan: Plan) -> str:
     opt = plan.options
     nl = ""
@@ -496,6 +591,31 @@ def _stage_grandmean(plan: Plan) -> str:
     for pr in plan.runs:
         by_ses.setdefault(pr.bold.session, []).append(pr)
     out = ["", "# ============================ stage07: grandmeans ==========================="]
+    # Fieldmap runs first get a "premean": their moco-mean pushed through
+    # xfmap∘blip∘xrun onto the reference-fmap grid, so runs from different fmap
+    # groups average in one common space. (No-fmap runs skip this — PRECHAIN unset.)
+    if any(pr.fmap is not None for pr in plan.runs):
+        nwarp_opts = config.DEFAULT_OPTS["nwarp"]
+        premean_cmd = _ffs(
+            "ffs_nwarp",
+            [
+                '-source "${MOCOMEAN[$k]}"',
+                '-nwarp "${PRECHAIN[$k]}"',
+                '-master "${REFBLIP[$k]}"',
+                *_split_flags(nwarp_opts),
+                '-prefix "stage07.premean.${FRAG[$k]}.nii$FMT"',
+                '-device "$DEVICE"',
+            ],
+        )
+        out.append("echo '== stage07: premeans (→ reference-fmap grid) =='")
+        out.append(
+            'for k in "${RUN_KEYS[@]}"; do\n'
+            '  [ -z "${PRECHAIN[$k]:-}" ] && continue   # no-fmap run, no premean\n'
+            '  pm="stage07.premean.${FRAG[$k]}.nii$FMT"\n'
+            '  [ -f "$pm" ] && continue\n'
+            f"{premean_cmd}\n"
+            "done"
+        )
     out.append("echo '== stage07: per-session grandmeans =='")
     ses_means = []
     for ses, prs in by_ses.items():
@@ -959,6 +1079,7 @@ def write_script(plan: Plan, out_dir: str, bids_root: str | None = None) -> str:
         _stage_moco(plan),
         _stage_locomoco(plan),
         _stage_blip(plan),
+        _stage_xfmap(plan),
         _stage_xrun(plan),
         _stage_grandmean(plan),
         _stage_xses(plan),

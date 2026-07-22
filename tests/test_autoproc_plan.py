@@ -72,6 +72,39 @@ def test_multi_fmap_non_ref_gets_xfmap():
     assert "xfmap_lin" in _chain(plan, ("01", "b", "2"))  # non-ref fmap
 
 
+def test_multi_fmap_xfmap_stage_and_premean():
+    """Two fmap groups in one session: non-ref runs get xfmap in the chain, the
+    xfmap stage is emitted, and premeans (fmap runs) feed the grandmean."""
+    from fastfuncstuff.autoproc.bids import BoldRun
+
+    def frun(task, run):
+        return BoldRun(
+            "X", "SM", task, run, Path(f"/bids/sub-X/ses-SM/func/x_{task}_{run}.nii.gz"),
+            {"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"}, sbref_path=Path(f"/sb_{task}_{run}.nii.gz"),
+        )
+
+    f_floc = FmapGroup("SM", "floc", Path("/floc_rev.nii.gz"), {"TotalReadoutTime": 0.06}, ["1"])
+    f_prim = FmapGroup("SM", "primary", Path("/prim_rev.nii.gz"), {"TotalReadoutTime": 0.08}, ["1", "2"])
+    runs = [frun("floc", "1"), frun("primary", "1"), frun("primary", "2")]
+    subj = Subject("X", [Session("SM", runs, [f_floc, f_prim])])
+    plan = build_plan(subj, Options(fmap_ref=["floc"], xfmap_nonlin=True))
+
+    # Task-preferred fmap assignment (run '1' exists in both tasks).
+    by = {(r.bold.task, r.bold.run): r for r in plan.runs}
+    assert by[("floc", "1")].fmap.fmap_id == "floc"
+    assert by[("primary", "1")].fmap.fmap_id == "primary"  # not floc, despite run '1'
+
+    # ref fmap (floc) drops xfmap; non-ref (primary) keeps it, in order.
+    assert "xfmap_lin" not in by[("floc", "1")].warp_chain
+    ch = by[("primary", "1")].warp_chain
+    assert ch.index("xfmap_nl") < ch.index("xfmap_lin") < ch.index("blip_half") < ch.index("wxrun_lin")
+
+    script = write_script(plan, "wd", bids_root="/bids")
+    assert "stage05: cross-fmap" in script
+    assert "stage04.blip.ses-SM.fmap-floc_mean" in script  # xfmap aligns to ref-fmap mean
+    assert "stage07.premean." in script  # premeans feed the grandmean
+
+
 def test_multi_session_xses_and_ref_drop():
     subj = Subject(
         "X",

@@ -330,6 +330,7 @@ def _scan_fmaps(fmap_dir: Path, bids_root: Path, bold_runs: list[BoldRun]) -> li
     of one fieldmap, not two fieldmaps.
     """
     candidates: dict[str, dict] = {}
+    task_tags: set[str] = set()  # tags that came from a task entity (task-tagged fmaps)
     for nf in sorted(fmap_dir.glob("*.nii*")):
         if not _NIFTI_RE.search(nf.name):
             continue
@@ -338,6 +339,8 @@ def _scan_fmaps(fmap_dir: Path, bids_root: Path, bold_runs: list[BoldRun]) -> li
             continue  # phase fmap unused this milestone
         suffix = parse_suffix(nf.name)
         tag = ents.get("task") or f"{ents.get('dir', 'x')}{ents.get('run', '')}"
+        if ents.get("task"):
+            task_tags.add(tag)
         # Form within the group: acq (bold/sbref) refines the plain suffix so the
         # SBRef form wins the preference below even for conventional epi fmaps.
         form = ents.get("acq") or suffix or "epi"
@@ -364,11 +367,21 @@ def _scan_fmaps(fmap_dir: Path, bids_root: Path, bold_runs: list[BoldRun]) -> li
 
     # Restrict each group's intended runs to what's actually in scope, then drop
     # groups that serve nothing (e.g. a task-floc fmap when only -task primary was
-    # requested). If that leaves no group but we did find exactly one candidate,
-    # fall back to "it serves every in-scope run" (single-geometry session).
-    in_scope = {r.run for r in bold_runs}
+    # requested). Run numbers repeat across tasks, so a *task-tagged* fmap is
+    # scoped to ITS task's runs only (else a floc fmap survives on primary's
+    # run-01); a conventional (non-task) epi fmap is scoped to all in-scope runs.
+    all_scope = {r.run for r in bold_runs}
+    tasks_present = {r.task for r in bold_runs}
     for g in groups:
-        g.intended_runs = [r for r in g.intended_runs if r in in_scope]
+        if g.fmap_id in task_tags:
+            scope = (
+                {r.run for r in bold_runs if r.task == g.fmap_id}
+                if g.fmap_id in tasks_present
+                else set()  # its task isn't in scope → drop the group
+            )
+        else:
+            scope = all_scope
+        g.intended_runs = [r for r in g.intended_runs if r in scope]
     served = [g for g in groups if g.intended_runs]
     if not served and len(groups) == 1 and bold_runs:
         groups[0].intended_runs = [r.run for r in bold_runs]
@@ -390,7 +403,9 @@ def _resolve_intended(fmap_json: dict, tag: str, bold_runs: list[BoldRun]) -> li
             intended = [intended]
         runs: list[str] = []
         for entry in intended:
-            m = re.search(r"run-(\w+)", str(entry))
+            # BIDS run entity is alphanumeric (no separators) — don't let \w
+            # swallow the trailing _part-mag etc. (would yield '01_part').
+            m = re.search(r"run-([A-Za-z0-9]+)", str(entry))
             if m:
                 runs.append(m.group(1))
         if runs:

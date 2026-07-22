@@ -102,6 +102,12 @@ def test_fmap_intendedfor_and_task_fallback(tmp_path: Path):
     assert set(fmaps[0].intended_runs) == {"01", "02"}
     assert fmaps[0].readout == 0.08
 
+    # Unfiltered: BOTH fmaps survive, and the floc IntendedFor must parse to '01'
+    # (a greedy run-(\w+) would yield '01_part' → drop the whole floc group).
+    both = scan_subject(tmp_path, "ME1")
+    ids = {f.fmap_id: set(f.intended_runs) for f in both.sessions[0].fmaps}
+    assert ids == {"floc": {"01"}, "primary": {"01", "02"}}
+
 
 def test_anat_prefers_uni(tmp_path: Path):
     ses = tmp_path / "sub-ME1" / "ses-WB"

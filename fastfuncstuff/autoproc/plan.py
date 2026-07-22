@@ -104,6 +104,12 @@ class PlanRun:
     is_ref_session: bool
     is_ref_fmap: bool
     is_ref_run: bool  # only meaningful in first-run-anchored (no-fmap) mode
+    # The DISTORTED forward image of this run's fmap group (its blip_up input) —
+    # the xrun base, since blip_half undistorts *after* xrun in the chain.
+    fmap_forward: str | None = None
+    # The session's reference fmap id — the common (undistorted) grid that the
+    # cross-fmap alignment and the per-run premeans land on.
+    ref_fmap_id: str | None = None
     warp_chain: list[str] = field(default_factory=list)
 
 
@@ -138,6 +144,12 @@ def _resolve_ref_fmap(session_fmaps: list[FmapGroup], opt: Options) -> FmapGroup
 
 
 def _fmap_for_run(run: BoldRun, session_fmaps: list[FmapGroup]) -> FmapGroup | None:
+    # Run numbers can repeat across tasks (floc run-01 AND primary run-01), so
+    # prefer a task-tagged fmap whose id matches this run's task before falling
+    # back to a plain run-number match (conventional single-geometry epi).
+    for fg in session_fmaps:
+        if fg.fmap_id == run.task and run.run in fg.intended_runs:
+            return fg
     for fg in session_fmaps:
         if run.run in fg.intended_runs:
             return fg
@@ -192,6 +204,17 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         has_fmaps = bool(sess.fmaps) and opt.distortion
         # First run of the session anchors xrun when there are no fmaps.
         session_first_run = sess.bold_runs[0].run if sess.bold_runs else None
+        # Each fmap group's DISTORTED forward = the (first intended run's) blip_up
+        # image — the same image _stage_blip feeds to ffs_blipflip. This is the
+        # xrun base for that group.
+        forward_by_fmap: dict[str, str] = {}
+        if has_fmaps:
+            for fg in sess.fmaps:
+                for b in sess.bold_runs:
+                    if b.run in fg.intended_runs:
+                        forward_by_fmap[fg.fmap_id] = str(b.rep)
+                        break
+        ref_fmap_id = ref_fmap.fmap_id if ref_fmap is not None else None
         for bold in sess.bold_runs:
             fmap = _fmap_for_run(bold, sess.fmaps) if has_fmaps else None
             pr = PlanRun(
@@ -202,6 +225,8 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                     fmap is not None and ref_fmap is not None and fmap.fmap_id == ref_fmap.fmap_id
                 ),
                 is_ref_run=(not has_fmaps and bold.run == session_first_run),
+                fmap_forward=(forward_by_fmap.get(fmap.fmap_id) if fmap else None),
+                ref_fmap_id=(ref_fmap_id if fmap else None),
             )
             pr.warp_chain = build_warp_chain(pr, opt, multi_session)
             runs.append(pr)

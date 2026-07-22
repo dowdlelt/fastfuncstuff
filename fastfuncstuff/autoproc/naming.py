@@ -33,6 +33,7 @@ STAGE_NUMBERS: dict[str, int] = {
     "blip": 4,
     "xfmap": 5,
     "xrun": 6,
+    "premean": 7,  # run mean pushed to the reference-fmap grid (grandmean input)
     "grandmean": 7,
     "xses": 8,
     "xref": 9,  # align this data's grandmean to an external -grand_reference
