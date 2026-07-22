@@ -235,8 +235,11 @@ def _build_config(name: str):
 
     if name == "quick":
         return TopupConfig(
-            warpres=[20, 12, 8], fwhm=[8, 4, 1], lam=[1e-3, 1e-4, 1e-5],
-            miter=[6, 8, 10], subsamp=[1, 1, 1],
+            warpres=[20, 12, 8],
+            fwhm=[8, 4, 1],
+            lam=[1e-3, 1e-4, 1e-5],
+            miter=[6, 8, 10],
+            subsamp=[1, 1, 1],
         )
     if name == "workhard":  # FSL b02b0_7T.cnf (12 levels)
         return TopupConfig(
@@ -252,7 +255,22 @@ def _build_config(name: str):
             subsamp=[2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1],
             fwhm=[14, 12, 10, 8, 6, 4, 3, 3, 2, 1, 0, 0, 0, 0],
             miter=[5, 5, 5, 5, 5, 5, 5, 5, 10, 10, 20, 20, 30, 30],
-            lam=[3e-4, 2e-4, 1e-4, 5e-5, 2.5e-5, 1e-5, 2.5e-6, 5e-7, 8e-8, 8e-9, 8e-10, 8e-11, 8e-12, 1e-13],
+            lam=[
+                3e-4,
+                2e-4,
+                1e-4,
+                5e-5,
+                2.5e-5,
+                1e-5,
+                2.5e-6,
+                5e-7,
+                8e-8,
+                8e-9,
+                8e-10,
+                8e-11,
+                8e-12,
+                1e-13,
+            ],
         )
     return TopupConfig()  # b02b0 defaults (9 levels)
 
@@ -291,7 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     # Readout is optional: absent -> use 1.0 (warp unaffected by a common factor) and force
     # the Hz field map off, since without a real readout the field is in voxels, not Hz.
     no_readout = args.readout is None
-    readouts = [1.0] * len(paths) if no_readout else _broadcast(args.readout, len(paths), "-readout")
+    readouts = (
+        [1.0] * len(paths) if no_readout else _broadcast(args.readout, len(paths), "-readout")
+    )
 
     # For the plain pair form, -pe_dir describes blip_up; blip_down is opposite.
     if not args.imain and len(args.pe_dir) == 1:
@@ -342,7 +362,12 @@ def main(argv: list[str] | None = None) -> int:
 
     solve_dtype = torch.float64 if args.precision == "float64" else torch.float32
     result = T.run_topup(
-        scans, vox, cfg, pe_shift=args.pe_shift, progress=args.verb >= 1, solve_dtype=solve_dtype,
+        scans,
+        vox,
+        cfg,
+        pe_shift=args.pe_shift,
+        progress=args.verb >= 1,
+        solve_dtype=solve_dtype,
         mask_field=not args.no_mask_field,
     )
 
@@ -370,8 +395,12 @@ def main(argv: list[str] | None = None) -> int:
         comps = [z, z, z]  # x, y, z slots, each (nz,ny,nx)
         comps[{0: 0, 1: 1, 2: 2}[ref.pe_axis]] = disp_pe
         save_warp_field(
-            comps[0], comps[1], comps[2], path,
-            header_info={"affine": affine, "header": header}, units="mm",
+            comps[0],
+            comps[1],
+            comps[2],
+            path,
+            header_info={"affine": affine, "header": header},
+            units="mm",
         )
 
     warp_path = f"{stem}_warp{ext}"
@@ -385,7 +414,9 @@ def main(argv: list[str] | None = None) -> int:
         invwarp_path = f"{stem}_invwarp{ext}"
         _save_pe_warp(invwarp, invwarp_path)
         if args.verb >= 1:
-            print(f"  wrote {invwarp_path}  (undistorted 'middle' -> distorted[{pe_dirs[ref_idx]}])")
+            print(
+                f"  wrote {invwarp_path}  (undistorted 'middle' -> distorted[{pe_dirs[ref_idx]}])"
+            )
 
     if not args.no_fmap and not no_readout:
         _save_zyx(f"{stem}_field{ext}", result.field_hz, affine)

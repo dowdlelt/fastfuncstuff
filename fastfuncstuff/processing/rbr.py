@@ -194,9 +194,7 @@ def optimize_rbr(
             assert tissue_coords is not None and tissue_F is not None and tissue_Fpinv is not None
             tdisp = eval_displacement(ctrl, tissue_coords, vol_shape)  # (Pt, C)
             tshift = tissue_coords.index_add(1, ax_t, tdisp)
-            c = c + tissue_weight * synthesis_cost_at_points(
-                volume, tshift, tissue_F, tissue_Fpinv
-            )
+            c = c + tissue_weight * synthesis_cost_at_points(volume, tshift, tissue_F, tissue_Fpinv)
         return c
 
     # Initial (identity) cost at the finest offset, for reporting.

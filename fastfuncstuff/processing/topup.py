@@ -78,6 +78,7 @@ class _NullBar:
     def __exit__(self, *_):
         return False
 
+
 # NIfTI spatial axis (0=x/i, 1=y/j, 2=z/k) -> tensor dim in an (nz, ny, nx) volume.
 _NIFTI_AXIS_TO_TDIM = {0: 2, 1: 1, 2: 0}
 
@@ -300,9 +301,7 @@ def _resample_pe(vol: Tensor, disp_vox: Tensor, pe_tdim: int) -> Tensor:
     return out.movedim(-1, pe_tdim)
 
 
-def _resample_pe_with_slope(
-    vol: Tensor, disp_vox: Tensor, pe_tdim: int
-) -> tuple[Tensor, Tensor]:
+def _resample_pe_with_slope(vol: Tensor, disp_vox: Tensor, pe_tdim: int) -> tuple[Tensor, Tensor]:
     """Like :func:`_resample_pe` but also return d(resample)/d(disp) at the current disp.
 
     For linear interpolation the sample is ``f_lo*(1-frac) + f_hi*frac`` and its
@@ -836,7 +835,10 @@ def gn_solve_level(
         return float(_dot64(r, r))
 
     bar = _bar(
-        total=max_iter, desc=desc, leave=False, disable=not progress,
+        total=max_iter,
+        desc=desc,
+        leave=False,
+        disable=not progress,
         bar_format="  {desc} {bar} {n_fmt}/{total_fmt} [{elapsed}] {postfix}",
     )
     prev_cost = None
@@ -865,7 +867,9 @@ def gn_solve_level(
             step *= 0.5
         last_cost = new_cost if accepted else cost
         bar.update(1)
-        bar.set_postfix_str(f"cost={last_cost:.3e} λ={lam_eff:.1e}{'' if accepted else ' (reject)'}")
+        bar.set_postfix_str(
+            f"cost={last_cost:.3e} λ={lam_eff:.1e}{'' if accepted else ' (reject)'}"
+        )
         if not accepted:
             break
         if prev_cost is not None and abs(prev_cost - new_cost) < 1e-6 * prev_cost:
@@ -997,7 +1001,10 @@ def run_topup(
 
     n_lev = config.n_levels()
     level_bar = _bar(
-        total=n_lev, desc="blipflip", leave=True, disable=not progress,
+        total=n_lev,
+        desc="blipflip",
+        leave=True,
+        disable=not progress,
         bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} levels [{elapsed}<{remaining}] {postfix}",
     )
     coeff = None
