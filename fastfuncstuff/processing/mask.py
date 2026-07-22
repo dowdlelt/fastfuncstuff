@@ -185,11 +185,80 @@ def _peel_once(mask: Tensor, peelthr: int = 17) -> Tensor:
 def _peel(mask: Tensor, peelcount: int = 1, peelthr: int = 17) -> Tensor:
     """AFNI-style erosion: peel voxels with < peelthr/18 neighbors.
 
-    Matches THD_mask_erodemany.
+    Erode-only. This is the *first half* of THD_mask_erodemany; see
+    :func:`erode_many` for the faithful peel-then-redilate version.
     """
     for _ in range(peelcount):
         mask = _peel_once(mask, peelthr)
     return mask
+
+
+def _count_neighbors_18_replicate(mask: Tensor) -> Tensor:
+    """18-neighbor count with edge voxels replicated, as AFNI counts them.
+
+    AFNI clamps the neighbor index at the volume face (``if(ii==0) im=0``), so a
+    boundary voxel sees itself in place of the missing neighbor. Zero-padding
+    instead makes every boundary voxel look under-connected, which erodes a shell
+    off any mask that reaches the matrix edge.
+    """
+    kernel = torch.zeros(1, 1, 3, 3, 3, device=mask.device, dtype=torch.float32)
+    for dz, dy, dx in [
+        (0, 1, 1),
+        (2, 1, 1),
+        (1, 0, 1),
+        (1, 2, 1),
+        (1, 1, 0),
+        (1, 1, 2),  # 6 face
+        (0, 0, 1),
+        (0, 2, 1),
+        (2, 0, 1),
+        (2, 2, 1),
+        (0, 1, 0),
+        (0, 1, 2),
+        (2, 1, 0),
+        (2, 1, 2),
+        (1, 0, 0),
+        (1, 0, 2),
+        (1, 2, 0),
+        (1, 2, 2),  # 12 edge
+    ]:
+        kernel[0, 0, dz, dy, dx] = 1
+    x = F.pad(mask.float()[None, None], (1,) * 6, mode="replicate")
+    return F.conv3d(x, kernel)[0, 0]
+
+
+def erode_many(mask: Tensor, npeel: int = 1, peelthr: int = 17) -> Tensor:
+    """Peel ``npeel`` layers off a mask, then re-dilate — AFNI ``THD_mask_erodemany``.
+
+    Each pass marks (simultaneously, not sequentially) every set voxel with fewer
+    than ``peelthr`` of 18 neighbours set, recording the layer it fell in, then
+    removes them. The re-dilate pass then walks layers back outward and restores
+    any peeled voxel still touching a survivor — more than one neighbour for the
+    outer layers, at least one for the innermost.
+
+    The round trip is what makes this a *shape* filter rather than an erosion: a
+    solid boundary comes back, a one-voxel-thick bridge or speck does not. Skip
+    the re-dilate and every result shrinks by a full shell.
+    """
+    if npeel < 1 or mask.numel() < 27:
+        return mask
+
+    thr = min(18, peelthr)
+    layer = torch.zeros(mask.shape, dtype=torch.int16, device=mask.device)
+    cur = mask.clone()
+    for pp in range(1, npeel + 1):
+        newly = cur & (_count_neighbors_18_replicate(cur) < thr)
+        layer[newly] = pp
+        cur = cur & ~newly
+
+    for pp in range(npeel, 0, -1):
+        # The innermost layer only needs one surviving neighbour; outer layers
+        # need two, so the mask cannot regrow along a single-voxel filament.
+        bth = 0 if pp == npeel else 1
+        counts = _count_neighbors_18_replicate(cur)
+        cur = cur | ((layer >= pp) & ~cur & (counts > bth))
+
+    return cur
 
 
 # ---------------------------------------------------------------------------
