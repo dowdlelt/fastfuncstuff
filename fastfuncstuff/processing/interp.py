@@ -648,12 +648,31 @@ _large_calls = {"cpu": 0, "cuda": 0}
 _compiled_gather_contract: dict[str, object] = {}
 
 
+def _already_compiling() -> bool:
+    """True while dynamo is tracing us (i.e. a caller wrapped the whole resample
+    in ``torch.compile`` — e.g. ffs_moco's ``torch.compile(resample_affine_fast)``).
+    dynamo constant-folds this to True during trace and False otherwise."""
+    is_comp = getattr(torch.compiler, "is_compiling", None)
+    try:
+        return bool(is_comp()) if is_comp is not None else False
+    except Exception:
+        return False
+
+
 def _get_gather_contract(device: torch.device, n_points: int):
     """Return the compiled _gather_contract once a recurring large workload is
-    detected on CPU or CUDA, else the eager function."""
+    detected on CPU or CUDA, else the eager function.
+
+    If a caller already has us inside a ``torch.compile`` trace, return the EAGER
+    function and skip the warmup counter entirely: dynamo inlines it into the
+    caller's graph, and — critically — we never touch the module-global
+    ``_large_calls`` while traced. That global mutation is invisible to eager use
+    but becomes a dynamo guard when traced, which recompiles on every call and
+    melts down (the ffs_moco `-cost` resample path hit exactly this)."""
     dt = device.type
     if (
-        dt not in ("cpu", "cuda")
+        _already_compiling()
+        or dt not in ("cpu", "cuda")
         or n_points < _COMPILE_MIN_VOXELS
         or os.environ.get("FFS_NWARP_NO_COMPILE") == "1"
     ):
