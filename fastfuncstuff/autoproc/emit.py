@@ -954,12 +954,21 @@ def _stage_final(plan: Plan) -> str:
         master = f"{opt.grand_reference.rstrip('/')}/stage09.anat.nii$FMT"
     else:
         master = "stage09.anat.nii$FMT"
+    # Output voxel size: -final_dxyz if given, else the input EPI resolution read
+    # from the first run (in-plane dim). MASTER sets the space/FOV; -dxyz keeps the
+    # output at EPI resolution instead of the (fine) anat MASTER's voxels.
+    if opt.final_dxyz:
+        dxyz_default = opt.final_dxyz
+    else:
+        first_mag = shlex.quote(str(plan.runs[0].bold.mag_path)) if plan.runs else '"$raw"'
+        dxyz_default = f"$(3dinfo -ad3 {first_mag} | awk '{{print $1}}')"
     nwarp_cmd = _ffs(
         "ffs_nwarp",
         [
             '-source "$raw"',
             '-nwarp "${CHAIN[$k]}"',
             '-master "$MASTER"',
+            '-dxyz "$FINAL_DXYZ"',
             *_split_flags(config.DEFAULT_OPTS["nwarp"]),
             '"${st_arg[@]}"',
             '-prefix "$outf"',
@@ -974,6 +983,8 @@ def _stage_final(plan: Plan) -> str:
 # to the final grid; override the grid with FFS_MASTER (e.g. EPI-res anat).
 echo '== stage10: final compose + resample =='
 MASTER="${{FFS_MASTER:-{master}}}"
+# Output grid = MASTER's space at the EPI voxel size (not the anat's fine voxels).
+FINAL_DXYZ="${{FFS_FINAL_DXYZ:-{dxyz_default}}}"
 for k in "${{RUN_KEYS[@]}}"; do
   outf="stage10.final.${{FRAG[$k]}}.nii$FINAL_FMT"
   [ "$skip_final" -eq 1 ] && [ -f "$outf" ] && continue

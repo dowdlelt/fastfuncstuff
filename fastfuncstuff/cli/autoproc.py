@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("-anat", help="skull-stripped T1w to align to (e.g. SUMA brain.nii.gz)")
     g.add_argument("-suma", help="FreeSurfer SUMA dir; brain.nii.gz + builds a TPM from aseg.auto")
     g.add_argument("-no_anat", "-no-anat", action="store_true", help="stay in EPI space (no anat)")
+    g.add_argument(
+        "-final_dxyz",
+        "-final-dxyz",
+        metavar="MM",
+        help="final output voxel size in mm (isotropic); default = input EPI resolution",
+    )
     g.add_argument("-anat_nonlin", "-anat-nonlin", action="store_const", const=True, default=None,
                    help="ffs_segment nonlinear anat warp (needs -tpm or -suma)")
     g.add_argument("-anat_nonlin_input", "-anat-nonlin-input",
@@ -254,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
         ref_ses=args.ref_ses,
         fmap_ref=args.fmap_ref,
         go_to_anat=go_to_anat,
+        final_dxyz=args.final_dxyz,
         anat_nonlin=anat_nonlin,
         anat_nonlin_input=args.anat_nonlin_input,
         anat_path=anat_path if go_to_anat else None,

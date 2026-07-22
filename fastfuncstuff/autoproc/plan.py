@@ -50,6 +50,7 @@ class Options:
     ref_ses: str | None = None
     fmap_ref: list[str] | None = None
     go_to_anat: bool = True  # False → final space is the EPI grandmean
+    final_dxyz: str | None = None  # final output voxel size (mm); None → input EPI res
     anat_nonlin: bool = False  # segment/rbr nonlinear anat refinement
     anat_path: str | None = None  # skull-stripped T1w (baked into the script if found)
     moco_ref: str = "sbref"  # moco base: sbref|first|last|<int>  (sbref → sbref if present)
