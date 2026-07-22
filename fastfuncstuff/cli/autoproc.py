@@ -58,59 +58,142 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MM",
         help="final output voxel size in mm (isotropic); default = input EPI resolution",
     )
-    g.add_argument("-anat_nonlin", "-anat-nonlin", action="store_const", const=True, default=None,
-                   help="ffs_segment nonlinear anat warp (needs -tpm or -suma)")
-    g.add_argument("-anat_nonlin_input", "-anat-nonlin-input",
-                   choices=["grandmean", "blipfor", "blip_pair"], default="grandmean",
-                   help="ffs_segment input: grandmean (works w/o fieldmap) | blipfor | blip_pair")
-    g.add_argument("-tpm", help="tissue-probability template for ffs_segment (or auto-built from -suma)")
+    g.add_argument(
+        "-anat_nonlin",
+        "-anat-nonlin",
+        action="store_const",
+        const=True,
+        default=None,
+        help="ffs_segment nonlinear anat warp (needs -tpm or -suma)",
+    )
+    g.add_argument(
+        "-anat_nonlin_input",
+        "-anat-nonlin-input",
+        choices=["grandmean", "blipfor", "blip_pair"],
+        default="grandmean",
+        help="ffs_segment input: grandmean (works w/o fieldmap) | blipfor | blip_pair",
+    )
+    g.add_argument(
+        "-tpm", help="tissue-probability template for ffs_segment (or auto-built from -suma)"
+    )
     g.add_argument("-tpm_source", "-tpm-source", help="QC anat-in-EPI source for ffs_segment")
     g.add_argument("-ref_ses", "-ref-ses", help="reference session (default: first)")
-    g.add_argument("-grand_reference", "-grand-reference", metavar="RESULTS_DIR",
-                   help="another autoproc results dir whose anat matrix this data borrows")
-    g.add_argument("-grand_reference_nonlin", "-grand-reference-nonlin", action="store_true",
-                   help="add a nonlinear step when aligning to the grand reference")
-    g.add_argument("-ref_file", "-ref-file", help="explicit reference EPI-contrast image to align to")
-    g.add_argument("-ref_transforms", "-ref-transforms", nargs="+",
-                   help="matrices/warps mapping the reference to anat, in nwarp order")
-    g.add_argument("-ref_anat", "-ref-anat",
-                   help="reference anat (copied in; ffs_segment tpm-space anat + QC)")
+    g.add_argument(
+        "-grand_reference",
+        "-grand-reference",
+        metavar="RESULTS_DIR",
+        help="another autoproc results dir whose anat matrix this data borrows",
+    )
+    g.add_argument(
+        "-grand_reference_nonlin",
+        "-grand-reference-nonlin",
+        action="store_true",
+        help="add a nonlinear step when aligning to the grand reference",
+    )
+    g.add_argument(
+        "-ref_file", "-ref-file", help="explicit reference EPI-contrast image to align to"
+    )
+    g.add_argument(
+        "-ref_transforms",
+        "-ref-transforms",
+        nargs="+",
+        help="matrices/warps mapping the reference to anat, in nwarp order",
+    )
+    g.add_argument(
+        "-ref_anat", "-ref-anat", help="reference anat (copied in; ffs_segment tpm-space anat + QC)"
+    )
 
     g = p.add_argument_group("NORDIC / phase")
-    g.add_argument("-want_nordic", "-want-nordic", action="store_const", const=True, default=None,
-                   help="run NORDIC (needs phase)")
+    g.add_argument(
+        "-want_nordic",
+        "-want-nordic",
+        action="store_const",
+        const=True,
+        default=None,
+        help="run NORDIC (needs phase)",
+    )
     g.add_argument("-noise_vols", "-noise-vols", type=int, default=0, help="trailing noise volumes")
-    g.add_argument("-nordic_save_resid", "-nordic-save-resid", action="store_true",
-                   help="save the NORDIC residual map")
+    g.add_argument(
+        "-nordic_save_resid",
+        "-nordic-save-resid",
+        action="store_true",
+        help="save the NORDIC residual map",
+    )
 
     g = p.add_argument_group("slice timing & motion")
-    g.add_argument("-slicetiming_method", "-slicetiming-method",
-                   choices=["integrate", "first", "none"], default=None,
-                   help="integrate STC into the final resample | first (before moco) | none")
-    g.add_argument("-moco_ref", "-moco-ref", default="sbref", metavar="REF",
-                   help="moco base: sbref (else first) | first | last | <int>")
-    g.add_argument("-locomoco", action="store_const", const=True, default=None,
-                   help="residual PE-axis nonlinear motion")
+    g.add_argument(
+        "-slicetiming_method",
+        "-slicetiming-method",
+        choices=["integrate", "first", "none"],
+        default=None,
+        help="integrate STC into the final resample | first (before moco) | none",
+    )
+    g.add_argument(
+        "-moco_ref",
+        "-moco-ref",
+        default="sbref",
+        metavar="REF",
+        help="moco base: sbref (else first) | first | last | <int>",
+    )
+    g.add_argument(
+        "-locomoco",
+        action="store_const",
+        const=True,
+        default=None,
+        help="residual PE-axis nonlinear motion",
+    )
 
     g = p.add_argument_group("cross-run / fmap / session alignment")
-    g.add_argument("-no_distortion", "-no-distortion", action="store_true",
-                   help="skip fieldmap distortion correction even if fmaps exist")
+    g.add_argument(
+        "-no_distortion",
+        "-no-distortion",
+        action="store_true",
+        help="skip fieldmap distortion correction even if fmaps exist",
+    )
     g.add_argument("-fmap_ref", "-fmap-ref", nargs="+", help="reference fmap id(s) per session")
-    g.add_argument("-xrun_nonlin", "-xrun-nonlin", action="store_const", const=True, default=None,
-                   help="nonlinear cross-run refinement")
-    g.add_argument("-xfmap_nonlin", "-xfmap-nonlin", action="store_const", const=True, default=None,
-                   help="nonlinear cross-fmap-group refinement")
-    g.add_argument("-xses_nonlin", "-xses-nonlin", action="store_const", const=True, default=None,
-                   help="nonlinear cross-session refinement")
+    g.add_argument(
+        "-xrun_nonlin",
+        "-xrun-nonlin",
+        action="store_const",
+        const=True,
+        default=None,
+        help="nonlinear cross-run refinement",
+    )
+    g.add_argument(
+        "-xfmap_nonlin",
+        "-xfmap-nonlin",
+        action="store_const",
+        const=True,
+        default=None,
+        help="nonlinear cross-fmap-group refinement",
+    )
+    g.add_argument(
+        "-xses_nonlin",
+        "-xses-nonlin",
+        action="store_const",
+        const=True,
+        default=None,
+        help="nonlinear cross-session refinement",
+    )
 
     g = p.add_argument_group("GLM")
-    g.add_argument("-no_glm", "-no-glm", action="store_true",
-                   help="don't emit the GLM stage enabled")
-    g.add_argument("-glm_ortvec", "-glm-ortvec", action="store_const", const=True, default=None,
-                   help="add motion + locomoco-PC nuisance regressors to the GLM")
-    g.add_argument("-events", nargs="+",
-                   help="events TSV(s) (bids); single = broadcast, or one per run. "
-                   "Overrides BIDS-discovered events.")
+    g.add_argument(
+        "-no_glm", "-no-glm", action="store_true", help="don't emit the GLM stage enabled"
+    )
+    g.add_argument(
+        "-glm_ortvec",
+        "-glm-ortvec",
+        action="store_const",
+        const=True,
+        default=None,
+        help="add motion + locomoco-PC nuisance regressors to the GLM",
+    )
+    g.add_argument(
+        "-events",
+        nargs="+",
+        help="events TSV(s) (bids); single = broadcast, or one per run. "
+        "Overrides BIDS-discovered events.",
+    )
 
     g = p.add_argument_group("per-stage option overrides (replace the default op string)")
     for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp"):
@@ -206,6 +289,38 @@ def _events_exist(bids_dir: str, task: str, subject) -> bool:
     return False
 
 
+def _fmt_time(sec: float | None) -> str:
+    if sec is None:
+        return "  --:--:-- "
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _report_fmap_assignment(subject) -> None:
+    """Print the per-session fieldmap → run assignment (a useful diagnostic when
+    it was inferred by AcquisitionTime rather than declared by IntendedFor)."""
+    if not any(s.fmaps for s in subject.sessions):
+        return
+    print("== fieldmap → run assignment ==", file=sys.stderr)
+    for sess in subject.sessions:
+        if not sess.fmaps:
+            continue
+        multitask = len({r.task for r in sess.bold_runs}) > 1
+        print(f"  ses-{sess.session}:", file=sys.stderr)
+        for fg in sess.fmaps:
+            # Disambiguate by task when the session mixes tasks (run numbers repeat).
+            items = (
+                ", ".join(f"{t}/{r}" for t, r in fg.intended_runs)
+                if multitask
+                else ", ".join(fg.run_ids)
+            ) or "(none)"
+            print(
+                f"    fmap-{fg.fmap_id}  t={_fmt_time(fg.acq_time)}  →  [{items}]",
+                file=sys.stderr,
+            )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     recipe = config.RECIPES.get(args.recipe, {}) if args.recipe else {}
@@ -226,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
     if not subject.sessions:
         print("ERROR: no matching BOLD runs found", file=sys.stderr)
         return 1
+
+    _report_fmap_assignment(subject)
 
     anat_path, tpm_source = _resolve_anat(args)
     if anat_path is None:  # fall back to a scanned in-scope T1w

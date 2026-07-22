@@ -50,7 +50,9 @@ def test_no_anat_stays_in_epi():
 
 
 def test_fmap_anchored_all_runs_get_xrun():
-    fmap = FmapGroup("01", "foo", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.06}, ["1", "2"])
+    fmap = FmapGroup(
+        "01", "foo", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.06}, [("foo", "1"), ("foo", "2")]
+    )
     subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")], [fmap])])
     plan = build_plan(subj, Options())
     # single (reference) fmap: xfmap dropped; blip + wxrun present for EVERY run.
@@ -64,8 +66,8 @@ def test_fmap_anchored_all_runs_get_xrun():
 
 
 def test_multi_fmap_non_ref_gets_xfmap():
-    f1 = FmapGroup("01", "a", Path("/a.nii.gz"), {}, ["1"])
-    f2 = FmapGroup("01", "b", Path("/b.nii.gz"), {}, ["2"])
+    f1 = FmapGroup("01", "a", Path("/a.nii.gz"), {}, [("a", "1")])
+    f2 = FmapGroup("01", "b", Path("/b.nii.gz"), {}, [("b", "2")])
     subj = Subject("X", [Session("01", [_run("01", "a", "1"), _run("01", "b", "2")], [f1, f2])])
     plan = build_plan(subj, Options(fmap_ref=["a"]))
     assert "xfmap_lin" not in _chain(plan, ("01", "a", "1"))  # ref fmap
@@ -79,12 +81,25 @@ def test_multi_fmap_xfmap_stage_and_premean():
 
     def frun(task, run):
         return BoldRun(
-            "X", "SM", task, run, Path(f"/bids/sub-X/ses-SM/func/x_{task}_{run}.nii.gz"),
-            {"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"}, sbref_path=Path(f"/sb_{task}_{run}.nii.gz"),
+            "X",
+            "SM",
+            task,
+            run,
+            Path(f"/bids/sub-X/ses-SM/func/x_{task}_{run}.nii.gz"),
+            {"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"},
+            sbref_path=Path(f"/sb_{task}_{run}.nii.gz"),
         )
 
-    f_floc = FmapGroup("SM", "floc", Path("/floc_rev.nii.gz"), {"TotalReadoutTime": 0.06}, ["1"])
-    f_prim = FmapGroup("SM", "primary", Path("/prim_rev.nii.gz"), {"TotalReadoutTime": 0.08}, ["1", "2"])
+    f_floc = FmapGroup(
+        "SM", "floc", Path("/floc_rev.nii.gz"), {"TotalReadoutTime": 0.06}, [("floc", "1")]
+    )
+    f_prim = FmapGroup(
+        "SM",
+        "primary",
+        Path("/prim_rev.nii.gz"),
+        {"TotalReadoutTime": 0.08},
+        [("primary", "1"), ("primary", "2")],
+    )
     runs = [frun("floc", "1"), frun("primary", "1"), frun("primary", "2")]
     subj = Subject("X", [Session("SM", runs, [f_floc, f_prim])])
     plan = build_plan(subj, Options(fmap_ref=["floc"], xfmap_nonlin=True))
@@ -97,7 +112,9 @@ def test_multi_fmap_xfmap_stage_and_premean():
     # ref fmap (floc) drops xfmap; non-ref (primary) keeps it, in order.
     assert "xfmap_lin" not in by[("floc", "1")].warp_chain
     ch = by[("primary", "1")].warp_chain
-    assert ch.index("xfmap_nl") < ch.index("xfmap_lin") < ch.index("blip_half") < ch.index("wxrun_lin")
+    assert (
+        ch.index("xfmap_nl") < ch.index("xfmap_lin") < ch.index("blip_half") < ch.index("wxrun_lin")
+    )
 
     script = write_script(plan, "wd", bids_root="/bids")
     assert "stage05: cross-fmap" in script
@@ -121,7 +138,7 @@ def test_multi_session_xses_and_ref_drop():
 
 
 def test_nonlinear_toggles_add_warps():
-    fmap = FmapGroup("01", "foo", Path("/rev.nii.gz"), {}, ["1", "2"])
+    fmap = FmapGroup("01", "foo", Path("/rev.nii.gz"), {}, [("foo", "1"), ("foo", "2")])
     subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")], [fmap])])
     plan = build_plan(subj, Options(xrun_nonlin=True, locomoco=True))
     ch = _chain(plan, ("01", "foo", "2"))
@@ -133,7 +150,9 @@ def test_grand_reference_chain_and_borrowed_anat():
     the ref (xref), one last segment on current data (anat_nl)."""
     from fastfuncstuff.autoproc.emit import chain_files
 
-    fmap = FmapGroup("SM", "primary", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.08}, ["1"])
+    fmap = FmapGroup(
+        "SM", "primary", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.08}, [("primary", "1")]
+    )
     subj = Subject("X", [Session("SM", [_run("SM", "primary", "1")], [fmap])])
     plan = build_plan(
         subj,
@@ -173,7 +192,13 @@ def test_chain_files_are_produced_in_script():
     agree. This is the guard that keeps the emitted script runnable first try."""
     import re
 
-    fmap = FmapGroup("SM", "primary", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.08}, ["1", "2"])
+    fmap = FmapGroup(
+        "SM",
+        "primary",
+        Path("/rev.nii.gz"),
+        {"TotalReadoutTime": 0.08},
+        [("primary", "1"), ("primary", "2")],
+    )
     runs = [_run("SM", "primary", "1"), _run("SM", "primary", "2")]
     subj = Subject("ME1", [Session("SM", runs, [fmap], anat=Path("/anat/T1w.nii.gz"))])
     plan = build_plan(subj, Options(want_nordic=True, locomoco=True, xrun_nonlin=True))
@@ -203,7 +228,13 @@ def test_chain_files_are_produced_in_script():
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 def test_emitted_script_is_valid_bash(tmp_path):
-    fmap = FmapGroup("SM", "primary", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.08}, ["1", "2"])
+    fmap = FmapGroup(
+        "SM",
+        "primary",
+        Path("/rev.nii.gz"),
+        {"TotalReadoutTime": 0.08},
+        [("primary", "1"), ("primary", "2")],
+    )
     runs = [_run("SM", "primary", "1"), _run("SM", "primary", "2")]
     subj = Subject("ME1", [Session("SM", runs, [fmap], anat=Path("/anat/T1w.nii.gz"))])
     plan = build_plan(subj, Options(want_nordic=True, locomoco=True, xrun_nonlin=True))

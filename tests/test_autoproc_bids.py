@@ -99,14 +99,45 @@ def test_fmap_intendedfor_and_task_fallback(tmp_path: Path):
     fmaps = subj.sessions[0].fmaps
     assert len(fmaps) == 1  # floc fmap dropped (out of scope)
     assert fmaps[0].fmap_id == "primary"
-    assert set(fmaps[0].intended_runs) == {"01", "02"}
+    assert set(fmaps[0].run_ids) == {"01", "02"}
     assert fmaps[0].readout == 0.08
 
     # Unfiltered: BOTH fmaps survive, and the floc IntendedFor must parse to '01'
     # (a greedy run-(\w+) would yield '01_part' → drop the whole floc group).
     both = scan_subject(tmp_path, "ME1")
-    ids = {f.fmap_id: set(f.intended_runs) for f in both.sessions[0].fmaps}
+    ids = {f.fmap_id: set(f.run_ids) for f in both.sessions[0].fmaps}
     assert ids == {"floc": {"01"}, "primary": {"01", "02"}}
+
+
+def test_time_based_fmap_assignment(tmp_path: Path):
+    """No IntendedFor, multiple task-tagged fmaps with run numbers (SKILLED shape):
+    assign each run to the most-recent-preceding fieldmap by AcquisitionTime, with
+    task-aware (task, run) identity so run numbers can repeat across tasks."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    # func: skilled run-01..03 + a rest run-01 (shares the number, different task).
+    times = {
+        ("skilled", "01"): "10:05:00",
+        ("skilled", "02"): "10:35:00",
+        ("skilled", "03"): "11:15:00",
+        ("rest", "01"): "11:20:00",
+    }
+    for (task, run), t in times.items():
+        _touch(
+            ses / "func" / f"sub-01_ses-01_task-{task}_run-{run}_part-mag_bold.nii.gz",
+            {"RepetitionTime": 1.5, "PhaseEncodingDirection": "j-", "AcquisitionTime": t},
+        )
+    # two fieldmaps (task-tagged, run-numbered), no IntendedFor.
+    for frun, t in (("1", "10:00:00"), ("2", "11:00:00")):
+        _touch(
+            ses / "fmap" / f"sub-01_ses-01_task-skilled_dir-PA_run-{frun}_part-mag_sbref.nii.gz",
+            {"PhaseEncodingDirection": "j", "TotalReadoutTime": 0.05, "AcquisitionTime": t},
+        )
+
+    fmaps = {f.fmap_id: f.intended_runs for f in scan_subject(tmp_path, "01").sessions[0].fmaps}
+    # runs before 11:00 → fmap run-1; at/after → fmap run-2. rest/01 (11:20) → run-2,
+    # distinct from skilled/01 (10:05) → run-1 (no run-number collision).
+    assert set(fmaps["skilled-run1"]) == {("skilled", "01"), ("skilled", "02")}
+    assert set(fmaps["skilled-run2"]) == {("skilled", "03"), ("rest", "01")}
 
 
 def test_anat_prefers_uni(tmp_path: Path):

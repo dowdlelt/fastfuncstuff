@@ -145,14 +145,10 @@ def _resolve_ref_fmap(session_fmaps: list[FmapGroup], opt: Options) -> FmapGroup
 
 
 def _fmap_for_run(run: BoldRun, session_fmaps: list[FmapGroup]) -> FmapGroup | None:
-    # Run numbers can repeat across tasks (floc run-01 AND primary run-01), so
-    # prefer a task-tagged fmap whose id matches this run's task before falling
-    # back to a plain run-number match (conventional single-geometry epi).
+    # intended_runs holds (task, run) pairs, so this is collision-proof across
+    # tasks that share run numbers (rest/run-01 vs skilled/run-01).
     for fg in session_fmaps:
-        if fg.fmap_id == run.task and run.run in fg.intended_runs:
-            return fg
-    for fg in session_fmaps:
-        if run.run in fg.intended_runs:
+        if (run.task, run.run) in fg.intended_runs:
             return fg
     return None
 
@@ -212,7 +208,7 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         if has_fmaps:
             for fg in sess.fmaps:
                 for b in sess.bold_runs:
-                    if b.run in fg.intended_runs:
+                    if (b.task, b.run) in fg.intended_runs:
                         forward_by_fmap[fg.fmap_id] = str(b.rep)
                         break
         ref_fmap_id = ref_fmap.fmap_id if ref_fmap is not None else None
