@@ -60,6 +60,7 @@ try:
     from fastfuncstuff.io.afni import (
         get_tr_from_file,
         load_nifti,
+        nifti_shape,
         read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
         replace_afni_extension,
         save_nifti,
@@ -1215,8 +1216,8 @@ def main():
     # (minutes for large 4D inputs). Headers are cheap — nibabel reads shape
     # without touching the data — so compare grids up front.
     if args.mask:
-        data_shape = load_nifti(input_files[0]).shape[:3]
-        mask_shape = load_nifti(args.mask).shape[:3]
+        data_shape = nifti_shape(input_files[0])[:3]
+        mask_shape = nifti_shape(args.mask)[:3]
         if mask_shape != data_shape:
             raise SystemExit(
                 f"❌ Mask/data grid mismatch: mask '{args.mask}' is {mask_shape} "
@@ -1518,7 +1519,7 @@ def main():
         run_starts = [0]
         total_tps = 0
         for f in input_files:
-            img_shape = load_nifti(f).shape
+            img_shape = nifti_shape(f)
             run_len = img_shape[3] if len(img_shape) > 3 else img_shape[0]
             total_tps += run_len
             if f != input_files[-1]:  # Don't add start for after last run

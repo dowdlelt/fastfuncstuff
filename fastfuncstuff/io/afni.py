@@ -167,6 +167,87 @@ def _resolve_indices(indices: list[int], n_volumes: int) -> list[int]:
     return indices
 
 
+def _read_leading_bytes(filepath: Path, n: int) -> bytes:
+    """Read the first ``n`` uncompressed bytes of a NIfTI file, cheaply.
+
+    For ``.nii.zst`` and ``.nii.gz`` this decompresses only as far as the reader
+    consumes -- a few KB off the front of the stream, never the whole 4D payload.
+    That is the whole point: reading a header should not cost a full decompress.
+    """
+    sp = str(filepath)
+    if sp.endswith(".nii.zst"):
+        # Stream zstd and stop as soon as we have enough. Closing the pipe early
+        # sends SIGPIPE to zstd, so it never decompresses past the first block.
+        proc = subprocess.Popen(
+            ["zstd", "-dc", sp], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        try:
+            assert proc.stdout is not None
+            buf = proc.stdout.read(n)
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.terminate()
+            proc.wait()
+        return buf
+    if sp.endswith(".gz"):
+        import gzip
+
+        with gzip.open(sp, "rb") as fh:  # decompresses lazily, only what we read
+            return fh.read(n)
+    with open(sp, "rb") as fh:
+        return fh.read(n)
+
+
+def read_nifti_header(filepath: str | Path) -> nib.Nifti1Header | nib.Nifti2Header:
+    """Read just the NIfTI header, without decompressing the image payload.
+
+    Works for ``.nii``, ``.nii.gz`` and ``.nii.zst``. Detects NIfTI-1 vs NIfTI-2
+    and endianness from ``sizeof_hdr``. Any ``[selector]`` suffix is ignored here
+    (selectors change the volume count, not the on-disk header); use
+    :func:`nifti_shape` if you need the selector-adjusted shape.
+    """
+    clean_path, _ = parse_subbrick_selector(str(filepath))
+    filepath = Path(clean_path)
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    # NIfTI-1 header is 348 bytes, NIfTI-2 is 540; read enough for either.
+    raw = _read_leading_bytes(filepath, 544)
+
+    # sizeof_hdr (int32 at offset 0) disambiguates version *and* endianness.
+    import struct
+
+    for endian in ("<", ">"):
+        (sizeof_hdr,) = struct.unpack(endian + "i", raw[:4])
+        if sizeof_hdr == 348:
+            return nib.Nifti1Header(binaryblock=raw[:348])
+        if sizeof_hdr == 540:
+            return nib.Nifti2Header(binaryblock=raw[:540])
+    raise ValueError(f"Not a recognizable NIfTI-1/2 header (bad sizeof_hdr) in {filepath}")
+
+
+def nifti_shape(filepath: str | Path) -> tuple[int, ...]:
+    """Return a NIfTI image's shape without decompressing its payload.
+
+    Honours ``[selector]`` suffixes (adjusts the 4th-dim volume count), so it is a
+    drop-in replacement for ``load_nifti(path).shape`` on the hot paths that only
+    need dimensions (run-structure timing, mask/data grid checks).
+    """
+    clean_path, indices = parse_subbrick_selector(str(filepath))
+    hdr = read_nifti_header(clean_path)
+    shape = tuple(int(d) for d in hdr.get_data_shape())
+    if indices is not None:
+        if len(shape) < 4:
+            raise ValueError(
+                f"Sub-brick selector requires a 4D image, got {len(shape)}D: {clean_path}"
+            )
+        n_volumes = shape[3]
+        resolved = _resolve_indices(indices, n_volumes)
+        shape = shape[:3] + (len(resolved),) + shape[4:]
+    return shape
+
+
 def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     """
     Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.

@@ -184,6 +184,58 @@ class TestZstRoundtrip:
         assert pfx.as_file() == "out.nii.zst"
 
 
+class TestCheapHeaderShape:
+    """`nifti_shape` / `read_nifti_header` must return the same shape and header
+    dims as a full `load_nifti`, across `.nii`/`.nii.gz`/`.nii.zst`, *without*
+    decompressing the payload. This is the hot-path fix: run-structure timing and
+    the mask/data grid check only need dims, and a `.nii.zst` full-decompress just
+    to read one integer was the source of a very slow 'Computing run structure'."""
+
+    def _write_all_formats(self, out_dir, data, affine):
+        import shutil
+
+        from fastfuncstuff.io.afni import save_nifti
+
+        # Distinct stems per format: pigz compresses `foo.nii` -> `foo.nii.gz`
+        # in place, so a same-stem `.nii` and `.nii.gz` would clobber each other.
+        paths = {
+            "nii": out_dir / "plain.nii",
+            "gz": out_dir / "gzipped.nii.gz",
+        }
+        save_nifti(data, str(paths["nii"]), affine=affine)
+        save_nifti(data, str(paths["gz"]), affine=affine)
+        if shutil.which("zstd") is not None:
+            paths["zst"] = out_dir / "zstd.nii.zst"
+            save_nifti(data, str(paths["zst"]), affine=affine)
+        return paths
+
+    def test_shape_matches_full_load(self, temp_output_dir):
+        from fastfuncstuff.io.afni import load_nifti, nifti_shape
+
+        data = np.random.default_rng(1).standard_normal((7, 6, 5, 9)).astype(np.float32)
+        affine = np.eye(4)
+        paths = self._write_all_formats(temp_output_dir, data, affine)
+
+        for fmt, p in paths.items():
+            assert nifti_shape(str(p)) == data.shape, fmt
+            # Cheap header dims must agree with a full load's header.
+            from fastfuncstuff.io.afni import read_nifti_header
+
+            assert np.array_equal(
+                read_nifti_header(str(p))["dim"], load_nifti(str(p)).header["dim"]
+            ), fmt
+
+    def test_shape_honours_subbrick_selector(self, temp_output_dir):
+        from fastfuncstuff.io.afni import nifti_shape
+
+        data = np.random.default_rng(2).standard_normal((7, 6, 5, 12)).astype(np.float32)
+        paths = self._write_all_formats(temp_output_dir, data, np.eye(4))
+
+        for p in paths.values():
+            assert nifti_shape(f"{p}[0..9]") == (7, 6, 5, 10)
+            assert nifti_shape(f"{p}[1..$]") == (7, 6, 5, 11)
+
+
 class TestLargeWriteChunking:
     """save_nifti chunks large writes so a single >2 GiB write() can't crash the save.
 
