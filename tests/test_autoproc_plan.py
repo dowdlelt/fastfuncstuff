@@ -226,6 +226,39 @@ def test_chain_files_are_produced_in_script():
                 assert frag in tok, f"{tok}: does not contain run coord {frag} (key {key})"
 
 
+def test_warpmaster_defines_grid_mask_and_stats():
+    """stage10a builds the warpmaster grid + epi_mask before stage10, stage10
+    resamples onto it, and the GLM emits OLS+REML buckets masked by epi_mask.
+    autobox3_brain (viewing only) is emitted only when we own the anat."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], anat=Path("/anat/T1w.nii.gz"))])
+    plan = build_plan(subj, Options(go_to_anat=True, run_glm=True))
+    s = write_script(plan, "wd", bids_root="/bids")
+
+    # warpmaster grid + mask are built, and defined before the resample stage.
+    assert s.index("stage10a: warpmaster") < s.index("stage10: final compose")
+    assert "ffs_util_autobox" in s and "ffs_util_resample" in s
+    assert '-prefix "stage10.warpmaster.nii$FMT"' in s
+    assert '-prefix "epi_mask.nii$FMT"' in s and "-dilate 2" in s
+    assert '[ -f "autobox3_brain.nii.gz" ] ||' in s  # own anat → viewing brain
+
+    # stage10 lands runs on the warpmaster (not the raw anat master).
+    assert "-master stage10.warpmaster.nii$FMT" in s
+
+    # GLM: OLS by default + REML, masked, scaled.
+    assert '-Obuck "stage12.stats-ols.task-foo.nii$GLM_FMT"' in s
+    assert '-Rbuck "stage12.stats-reml.task-foo.nii$GLM_FMT"' in s
+    assert "-mask epi_mask.nii$FMT" in s and "-do_scale" in s
+
+    # No-own-anat borrow mode: still a warpmaster, but no viewing brain.
+    borrow = write_script(
+        build_plan(subj, Options(grand_reference="/floc.results", run_glm=True)),
+        "wd",
+        bids_root="/bids",
+    )
+    assert '-prefix "stage10.warpmaster.nii$FMT"' in borrow
+    assert '[ -f "autobox3_brain.nii.gz" ] ||' not in borrow
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 def test_emitted_script_is_valid_bash(tmp_path):
     fmap = FmapGroup(

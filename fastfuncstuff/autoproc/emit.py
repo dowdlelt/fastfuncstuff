@@ -34,6 +34,9 @@ _TOOLS = [
     "ffs_segment",
     "ffs_nwarp",
     "ffs_util_3dmath",
+    "ffs_util_autobox",
+    "ffs_util_resample",
+    "ffs_util_automask",
     "ffs_reml",
 ]
 
@@ -935,6 +938,113 @@ def _segment_input(plan: Plan) -> str:
     return '-input "stage07.grandmean.nii$FMT"'
 
 
+def _own_anat(opt) -> bool:
+    """True when this pipeline computes its OWN anat matrix (an ``$ANAT`` bash var
+    is defined in stage09) — as opposed to borrowing (-grand_reference) or
+    overriding (-ref_file) it. Gates the viewing-only autobox3_brain."""
+    return opt.go_to_anat and opt.ref_file is None and opt.grand_reference is None
+
+
+def _final_master(plan: Plan) -> str:
+    """The dataset whose grid (space/FOV) the final output inherits — before the
+    warpmaster autoboxes it to the brain and drops it to the EPI voxel size."""
+    opt = plan.options
+    if not opt.go_to_anat:
+        return "stage07.grandmean.nii$FMT"
+    if opt.ref_file is not None:
+        # explicit reference: the copied-in ref anat defines the shared grid.
+        return "stage09.ref_anat.nii.gz" if opt.ref_anat else "stage07.grandmean.nii$FMT"
+    if opt.grand_reference:
+        # borrow the reference's anat-space grid so all subjects/tasks co-register.
+        return f"{opt.grand_reference.rstrip('/')}/stage09.anat.nii$FMT"
+    return "stage09.anat.nii$FMT"
+
+
+def _final_dxyz_default(plan: Plan) -> str:
+    """Final output voxel size: -final_dxyz if given, else the input EPI resolution
+    read from the first run's in-plane dim."""
+    opt = plan.options
+    if opt.final_dxyz:
+        return opt.final_dxyz
+    first_mag = shlex.quote(str(plan.runs[0].bold.mag_path)) if plan.runs else '"$raw"'
+    return f"$(3dinfo -ad3 {first_mag} | awk '{{print $1}}')"
+
+
+def _stage_warpmaster(plan: Plan) -> str:
+    """Pin the final output grid and analysis mask BEFORE the resample (stage10).
+
+    The warpmaster is the anat-space target autoboxed to a tight brain FOV and
+    resampled to the EPI voxel size — it fixes the exact position + spacing every
+    run's timeseries lands on (stage10 ``-master``). epi_mask is a dilated automask
+    on that grid, used to mask the GLM. autobox3_brain is a tight skull-stripped
+    anat for nicer result overlays (viewing only; not used downstream). MASTER and
+    FINAL_DXYZ are defined here once and reused by stage10 (same shell); the
+    FFS_MASTER / FFS_FINAL_DXYZ overrides are still honoured."""
+    opt = plan.options
+    box = "stage10.warpmaster_box.nii$FMT"
+    wm = "stage10.warpmaster.nii$FMT"
+    mask = "epi_mask.nii$FMT"
+
+    def guarded(outfile: str, tool: str, parts: list[str]) -> str:
+        return f'[ -f "{outfile}" ] || \\\n' + _ffs(tool, parts)
+
+    out = [
+        "",
+        "# ============================ stage10a: warpmaster + mask ==================",
+        "# Fix the final output grid and analysis mask before the resample. The",
+        "# warpmaster is the anat-space target autoboxed to a tight brain FOV and",
+        "# resampled to the EPI voxel size; stage10 lands every run on it (-master).",
+        "# epi_mask is a dilated automask on that grid (masks the GLM). autobox3_brain",
+        "# is a tight skull-stripped anat for nicer result overlays (viewing only).",
+        "echo '== stage10a: warpmaster + mask =='",
+        # Defined once here and reused by stage10; FFS_* overrides still win.
+        f'MASTER="${{FFS_MASTER:-{_final_master(plan)}}}"',
+        f'FINAL_DXYZ="${{FFS_FINAL_DXYZ:-{_final_dxyz_default(plan)}}}"',
+    ]
+    if _own_anat(opt):
+        out.append(
+            guarded(
+                "autobox3_brain.nii.gz",
+                "ffs_util_autobox",
+                [
+                    '-input "$ANAT"',
+                    "-npad 3",
+                    '-prefix "autobox3_brain.nii.gz"',
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
+    out.append(
+        guarded(
+            box,
+            "ffs_util_autobox",
+            ['-input "$MASTER"', "-npad 5", f'-prefix "{box}"', '-device "$DEVICE"'],
+        )
+    )
+    # resample -dxyz needs three values; FINAL_DXYZ is one number (isotropic).
+    out.append(
+        guarded(
+            wm,
+            "ffs_util_resample",
+            [
+                f'-input "{box}"',
+                f'-prefix "{wm}"',
+                "-dxyz $FINAL_DXYZ $FINAL_DXYZ $FINAL_DXYZ",
+                "-rmode wsinc5",
+                '-device "$DEVICE"',
+            ],
+        )
+    )
+    out.append(
+        guarded(
+            mask,
+            "ffs_util_automask",
+            [f'-input "{wm}"', f'-prefix "{mask}"', "-dilate 2", '-device "$DEVICE"'],
+        )
+    )
+    return "\n".join(out) + "\n"
+
+
 def _stage_final(plan: Plan) -> str:
     opt = plan.options
     if opt.slicetiming_method == "integrate":
@@ -944,30 +1054,12 @@ def _stage_final(plan: Plan) -> str:
         )
     else:
         st = "  st_arg=()"
-    if not opt.go_to_anat:
-        master = "stage07.grandmean.nii$FMT"
-    elif opt.ref_file is not None:
-        # explicit reference: the copied-in ref anat defines the shared grid.
-        master = "stage09.ref_anat.nii.gz" if opt.ref_anat else "stage07.grandmean.nii$FMT"
-    elif opt.grand_reference:
-        # borrow the reference's anat-space grid so all subjects/tasks co-register.
-        master = f"{opt.grand_reference.rstrip('/')}/stage09.anat.nii$FMT"
-    else:
-        master = "stage09.anat.nii$FMT"
-    # Output voxel size: -final_dxyz if given, else the input EPI resolution read
-    # from the first run (in-plane dim). MASTER sets the space/FOV; -dxyz keeps the
-    # output at EPI resolution instead of the (fine) anat MASTER's voxels.
-    if opt.final_dxyz:
-        dxyz_default = opt.final_dxyz
-    else:
-        first_mag = shlex.quote(str(plan.runs[0].bold.mag_path)) if plan.runs else '"$raw"'
-        dxyz_default = f"$(3dinfo -ad3 {first_mag} | awk '{{print $1}}')"
     nwarp_cmd = _ffs(
         "ffs_nwarp",
         [
             '-source "$raw"',
             '-nwarp "${CHAIN[$k]}"',
-            '-master "$MASTER"',
+            "-master stage10.warpmaster.nii$FMT",
             '-dxyz "$FINAL_DXYZ"',
             *_split_flags(config.DEFAULT_OPTS["nwarp"]),
             '"${st_arg[@]}"',
@@ -979,12 +1071,9 @@ def _stage_final(plan: Plan) -> str:
 # ============================ stage10: compose + resample ===================
 # One interpolation per run applies the whole CHAIN in a single pass. The source
 # is read in place — the NORDIC output, or the original BIDS magnitude (noise
-# vols trimmed inline) — so no raw copy is ever materialised. The chain maps it
-# to the final grid; override the grid with FFS_MASTER (e.g. EPI-res anat).
+# vols trimmed inline) — so no raw copy is ever materialised. The chain lands
+# every run on the stage10a warpmaster grid (MASTER/FINAL_DXYZ set there).
 echo '== stage10: final compose + resample =='
-MASTER="${{FFS_MASTER:-{master}}}"
-# Output grid = MASTER's space at the EPI voxel size (not the anat's fine voxels).
-FINAL_DXYZ="${{FFS_FINAL_DXYZ:-{dxyz_default}}}"
 for k in "${{RUN_KEYS[@]}}"; do
   outf="stage10.final.${{FRAG[$k]}}.nii$FINAL_FMT"
   [ "$skip_final" -eq 1 ] && [ -f "$outf" ] && continue
@@ -1039,9 +1128,12 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
                 f"-events {events}",
                 *ort_parts,
                 "-polort 3",
-                f'-Rbuck "stage12.stats.task-{task}.nii$GLM_FMT"',
+                f'-Obuck "stage12.stats-ols.task-{task}.nii$GLM_FMT"',
+                f'-Rbuck "stage12.stats-reml.task-{task}.nii$GLM_FMT"',
                 "-tout",
                 "-fout",
+                "-mask epi_mask.nii$FMT",
+                "-do_scale",
                 '-device "$DEVICE"',
             ],
             indent="",
@@ -1096,6 +1188,7 @@ def write_script(plan: Plan, out_dir: str, bids_root: str | None = None) -> str:
         _stage_xses(plan),
         _stage_xref(plan),
         _stage_anat(plan),
+        _stage_warpmaster(plan),
         _stage_final(plan),
         _stage_stats(plan, bids_root),
     ]
