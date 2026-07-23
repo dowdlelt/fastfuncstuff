@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -124,13 +125,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     io_group = parser.add_argument_group("Input/Output")
     io_group.add_argument(
         "-input",
-        required=True,
         nargs="+",
         dest="input_file",
         metavar="FILE",
-        help="4D timeseries (.nii/.nii.gz) [required]. Pass several files (one "
-        "per echo, in echo order) together with -reg_echo for multi-echo "
-        "registration: motion is estimated once and applied to every echo.",
+        help="4D timeseries (.nii/.nii.gz) [required unless -batch]. Pass several "
+        "files (one per echo, in echo order) together with -reg_echo for "
+        "multi-echo registration: motion is estimated once and applied to "
+        "every echo.",
+    )
+    io_group.add_argument(
+        "-batch",
+        default=None,
+        metavar="FILE",
+        help="Run many self-contained motion corrections in one process, "
+        "amortizing Python/CUDA startup and torch.compile warmup. FILE is a "
+        "manifest with one run per line; each line is exactly the arguments "
+        "you would pass after `ffs_moco` for that run (e.g. `-input a.nii "
+        "-base 0 -prefix a_mc.nii -dfile a.1D`). Blank lines and lines "
+        "starting with # are ignored. The device is chosen once for the whole "
+        "batch; a per-line -device is ignored. One failing run is reported and "
+        "skipped without sinking the rest; the batch exits nonzero if any "
+        "run failed.",
+    )
+    io_group.add_argument(
+        "-batch_run",
+        "-batch-run",
+        dest="batch_run",
+        action="append",
+        metavar="ARGS",
+        help="Inline alternative to -batch for self-contained scripts: one run "
+        'given as a single quoted argument string (e.g. -batch_run "-input '
+        'a.nii -base 0 -prefix a_mc.nii -dfile a.1D"), exactly as you would '
+        "type it after `ffs_moco`. Repeatable — pass it once per run. Same "
+        "semantics as -batch (device chosen once, failures isolated); may be "
+        "combined with -batch, in which case manifest-file runs come first.",
     )
     io_group.add_argument(
         "-reg_echo",
@@ -773,10 +801,12 @@ def _parse_reg_echo(reg_echo: str | None, n_echoes: int) -> tuple[bool, int]:
     return False, r - 1
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Main CLI entry point for ffs_moco."""
-    args = parse_args(argv)
+def _validate_run_args(args: argparse.Namespace) -> None:
+    """Validate the output/QC request for one run; exit(1) on an empty request.
 
+    Shared by the standalone path and every -batch line so a manifest run is
+    validated exactly like the equivalent solo invocation.
+    """
     # Guard against a run that would produce nothing.
     _any_output = any(
         getattr(args, name, None) is not None
@@ -808,11 +838,13 @@ def main(argv: list[str] | None = None) -> None:
         )
         sys.exit(1)
 
-    device = _select_device(args.device)
-    verb = args.verb
-    if verb >= 1:
-        print(f"ffs_moco: device={device}")
 
+def _dispatch_run(args: argparse.Namespace, device: torch.device, verb: int) -> None:
+    """Estimate + resample one self-contained run (single- or multi-echo).
+
+    This is the entire per-file body; both the standalone path and the batch
+    loop go through it, so a manifest line reproduces a solo run bit-for-bit.
+    """
     input_files = args.input_file
     n_echoes = len(input_files)
     if n_echoes > 1 and args.reg_echo is None:
@@ -832,6 +864,123 @@ def main(argv: list[str] | None = None) -> None:
 
     if verb >= 1:
         print(f"Total time: {time.time() - t0:.2f}s")
+
+
+def _collect_batch_jobs(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Gather (label, argv-string) runs from -batch file and/or -batch_run inline.
+
+    File runs come first, then inline runs, so labels stay stable regardless of
+    which source(s) are used. Exits(1) if a requested source yields nothing.
+    """
+    jobs: list[tuple[str, str]] = []
+
+    if args.batch is not None:
+        manifest = Path(args.batch)
+        if not manifest.is_file():
+            print(f"Error: -batch file not found: {args.batch}", file=sys.stderr)
+            sys.exit(1)
+        n_before = len(jobs)
+        for lineno, raw in enumerate(manifest.read_text().splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            jobs.append((f"line {lineno}", line))
+        if len(jobs) == n_before:
+            print(f"Error: -batch file has no runs: {args.batch}", file=sys.stderr)
+            sys.exit(1)
+
+    for i, raw in enumerate(args.batch_run or [], 1):
+        line = raw.strip()
+        if not line:
+            print(f"Error: -batch_run #{i} is empty.", file=sys.stderr)
+            sys.exit(1)
+        jobs.append((f"run {i}", line))
+
+    return jobs
+
+
+def _run_batch(args: argparse.Namespace) -> None:
+    """Run every -batch / -batch_run job in this one process.
+
+    The wins over a shell loop are all fixed costs: the Python interpreter, the
+    torch/CUDA import, the CUDA context, and — the big one — torch.compile's
+    kernel warmup are paid once and reused across runs. The per-file load /
+    estimate / write cost is unchanged. Runs stay isolated: one failure is
+    reported and skipped, and the batch exits nonzero if any run failed.
+    """
+    from tqdm import tqdm
+
+    verb = args.verb
+    device = _select_device(args.device)  # chosen once; reused for every run
+
+    jobs = _collect_batch_jobs(args)
+
+    if verb >= 1:
+        print(f"ffs_moco batch: {len(jobs)} runs on device={device}")
+
+    failures: list[tuple[str, str]] = []
+    t0 = time.time()
+    bar = tqdm(jobs, desc="moco batch", unit="run", leave=True, disable=len(jobs) == 1)
+    for label, line in bar:
+        try:
+            run_args = parse_args(shlex.split(line))
+            if run_args.batch is not None or run_args.batch_run is not None:
+                raise ValueError("-batch/-batch_run cannot be nested inside a run")
+            if not run_args.input_file:
+                raise ValueError("run has no -input")
+            if run_args.device and verb >= 1:
+                tqdm.write(
+                    f"[{label}] ignoring per-run -device {run_args.device}; batch uses {device}"
+                )
+            _validate_run_args(run_args)
+            _dispatch_run(run_args, device, run_args.verb)
+        except KeyboardInterrupt:
+            raise
+        except (Exception, SystemExit) as exc:
+            # A bad run must not sink the batch. The underlying error has usually
+            # already gone to stderr; record the run so the summary is actionable.
+            reason = str(exc) if str(exc) not in ("", "1") else exc.__class__.__name__
+            failures.append((label, reason))
+            tqdm.write(f"[{label}] FAILED ({reason}): {line}")
+        finally:
+            # Don't let this run's peak strand VRAM for the next one — the memory
+            # module sizes chunks off *free* VRAM, so stale caches shrink them.
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if verb >= 1:
+        ok = len(jobs) - len(failures)
+        print(f"ffs_moco batch done: {ok}/{len(jobs)} succeeded in {time.time() - t0:.2f}s")
+    if failures:
+        print(f"Error: {len(failures)} batch run(s) failed:", file=sys.stderr)
+        for label, reason in failures:
+            print(f"  {label}: {reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Main CLI entry point for ffs_moco."""
+    args = parse_args(argv)
+
+    if args.batch is not None or args.batch_run:
+        _run_batch(args)
+        return
+
+    if not args.input_file:
+        print(
+            "Error: -input is required (or use -batch FILE / -batch_run ARGS).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _validate_run_args(args)
+
+    device = _select_device(args.device)
+    verb = args.verb
+    if verb >= 1:
+        print(f"ffs_moco: device={device}")
+
+    _dispatch_run(args, device, verb)
 
 
 def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> None:
