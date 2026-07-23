@@ -864,6 +864,7 @@ def load_and_concatenate_runs(
     device: torch.device | None = None,
     keep_on_cpu: bool = False,
     mask_flat: np.ndarray | None = None,
+    total_timepoints: int | None = None,
 ) -> tuple[torch.Tensor, list[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
@@ -881,6 +882,19 @@ def load_and_concatenate_runs(
         If True, load data to CPU regardless of device.
         Use this for large datasets where GPU memory is limited,
         and you'll process data in chunks.
+    mask_flat : np.ndarray, optional
+        Boolean (or integer-index) mask over the flattened voxel dimension,
+        applied to each run BEFORE it is stored. This shrinks the resident
+        dataset to in-mask voxels only, which for a whole-brain mask on a big
+        FOV can be a ~10x memory saving on the load itself.
+    total_timepoints : int, optional
+        Total concatenated length (sum of run lengths), when known ahead of
+        time from the design matrix. When given, the runs are streamed into a
+        single preallocated ``(n_voxels, total_timepoints)`` buffer, freeing
+        each run as it lands, so peak RAM stays ~data + one run. When None,
+        falls back to the list + ``torch.cat`` path, which briefly holds two
+        full copies (~2x peak) -- fine for small datasets, but at 100-run /
+        130+ GB scale that doubling OOM-kills the host.
 
     Returns
     -------
@@ -920,7 +934,14 @@ def load_and_concatenate_runs(
 
     run_starts = [0]
     current_start = 0
-    torch_runs = []
+
+    # When the total length is known up front we stream each run into a single
+    # preallocated buffer (peak ~data + one run). Otherwise we fall back to the
+    # list + torch.cat path, which briefly holds two full copies (~2x peak) --
+    # tolerable for small datasets but an OOM-killer at whole-dataset scale.
+    concatenated: torch.Tensor | None = None
+    torch_runs: list[torch.Tensor] = []
+    n_voxels_out: int | None = None
 
     # Progress bar for loading runs
     run_iterator = enumerate(run_files)
@@ -952,6 +973,7 @@ def load_and_concatenate_runs(
         # Convert to torch immediately and move to device
         # This avoids keeping numpy copy around
         data_torch = torch.from_numpy(data_np.astype(np.float32, copy=False)).to(device)
+        n_tps_run = data_torch.shape[1]
 
         # Delete numpy array immediately to free memory
         del data_np, img
@@ -959,32 +981,57 @@ def load_and_concatenate_runs(
 
         # All runs must share the voxel dimension to concatenate along time.
         # A mismatch means the runs are on different spatial grids (e.g. resampled
-        # to a template without a shared -master), which torch.cat only reports as
-        # an opaque size error -- name the offending run and grids instead.
-        if torch_runs and data_torch.shape[0] != torch_runs[0].shape[0]:
+        # to a template without a shared -master), which would otherwise surface
+        # only as an opaque size error -- name the offending run instead.
+        if n_voxels_out is None:
+            n_voxels_out = data_torch.shape[0]
+        elif data_torch.shape[0] != n_voxels_out:
             raise ValueError(
                 f"Run {i} ({run_file}) has {data_torch.shape[0]} voxels but run 0 "
-                f"({run_files[0]}) has {torch_runs[0].shape[0]}. All runs must be on "
-                f"the same spatial grid; resample every run to a shared -master."
+                f"({run_files[0]}) has {n_voxels_out}. All runs must be on the same "
+                f"spatial grid; resample every run to a shared -master."
             )
 
-        torch_runs.append(data_torch)
+        if total_timepoints is not None:
+            # Single-copy path: fill a preallocated buffer, freeing each run.
+            if concatenated is None:
+                concatenated = torch.empty(
+                    (n_voxels_out, total_timepoints), dtype=data_torch.dtype, device=device
+                )
+            if current_start + n_tps_run > total_timepoints:
+                raise ValueError(
+                    f"Run data exceeds total_timepoints: run {i} would fill to "
+                    f"{current_start + n_tps_run} but total_timepoints={total_timepoints}"
+                )
+            concatenated[:, current_start : current_start + n_tps_run] = data_torch
+            del data_torch
+        else:
+            torch_runs.append(data_torch)
 
         # Track run start for next run
-        current_start += data_torch.shape[1]
+        current_start += n_tps_run
         run_starts.append(current_start)
 
     # Remove last entry (it's the end, not a start)
     run_starts = run_starts[:-1]
 
-    # Concatenate on device (no numpy intermediate)
-    concatenated = torch.cat(torch_runs, dim=1)
+    if total_timepoints is not None:
+        if concatenated is None:
+            raise ValueError("No runs were loaded; run_files is empty")
+        if current_start != total_timepoints:
+            raise ValueError(
+                f"Loaded {current_start} timepoints but total_timepoints={total_timepoints}; "
+                "check that the input runs match the design matrix."
+            )
+        result = concatenated
+    else:
+        # Concatenate on device (no numpy intermediate)
+        result = torch.cat(torch_runs, dim=1)
+        del torch_runs
 
-    # Clean up
-    del torch_runs
     gc.collect()
 
-    return concatenated, run_starts
+    return result, run_starts
 
 
 def load_afni_mask(

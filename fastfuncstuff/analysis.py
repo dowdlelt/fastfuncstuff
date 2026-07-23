@@ -506,6 +506,25 @@ def analyze_from_design_matrix(
     affine = None
     nifti_header = None  # Store full NIfTI header for cache
 
+    # When a plain -mask is combined with multi-run file input, we can apply the
+    # mask run-by-run inside the loader so the resident dataset is in-mask voxels
+    # only -- a ~10x load-memory saving on a whole-brain mask over a big FOV. The
+    # post-load masking block below then just recovers the bookkeeping. Gated to
+    # the simple case: the per-voxel-companion paths (precomputed ARMA, dsort,
+    # slibase) and test mode still expect full-volume data, so they opt out.
+    data_preloaded_masked = False
+    preloaded_mask_tensor: torch.Tensor | None = None
+    full_n_voxels: int | None = None
+    use_loader_mask = (
+        mask_file is not None
+        and precomputed_arma_params is None
+        and test_n_voxels is None
+        and cache_file is None  # cache stores FULL-volume data (saved pre-mask)
+        and not dsort_files
+        and not slibase_files
+        and not slibase_files_sm
+    )
+
     # CRITICAL: If using cached data, extract header/affine from cache metadata
     if cached_metadata is not None:
         if "nifti_header" in cached_metadata:
@@ -533,7 +552,32 @@ def analyze_from_design_matrix(
         affine = first_img.affine
         nifti_header = first_img.header  # Capture full header for cache
 
-        data, actual_run_starts = load_and_concatenate_runs(fmri_data, storage_device)
+        loader_mask_flat: np.ndarray | None = None
+        if use_loader_mask:
+            mask_array = load_afni_mask(mask_file, threshold=mask_threshold)
+            if mask_array.shape != volume_shape:
+                raise ValueError(
+                    f"Mask shape {mask_array.shape} does not match data volume shape {volume_shape}"
+                )
+            mask_bool = mask_array.reshape(-1).astype(np.bool_)
+            if not mask_bool.any():
+                raise ValueError(
+                    f"Mask '{mask_file}' excluded all voxels (threshold={mask_threshold})."
+                )
+            loader_mask_flat = mask_bool
+            preloaded_mask_tensor = torch.from_numpy(mask_bool)
+            full_n_voxels = int(mask_bool.size)
+            data_preloaded_masked = True
+
+        # Stream runs into a single preallocated buffer keyed to the design's
+        # total length (peak ~data + one run) instead of the list + torch.cat
+        # path (~2x peak, which OOM-kills at whole-dataset scale).
+        data, actual_run_starts = load_and_concatenate_runs(
+            fmri_data,
+            storage_device,
+            mask_flat=loader_mask_flat,
+            total_timepoints=int(design_info["n_timepoints"]),
+        )
 
         # Validate run_starts match if both are available
         if expected_run_starts is not None:
@@ -705,6 +749,23 @@ def analyze_from_design_matrix(
                 f"After test mask: precomputed ARMA params has {precomputed_arma_params.shape[0]:,} voxels, "
                 f"but data has {n_voxels:,} voxels"
             )
+
+    elif data_preloaded_masked:
+        # Data was already masked run-by-run inside the loader (memory saver);
+        # data.shape[0] is already the in-mask voxel count. Recover only the
+        # bookkeeping (full-length mask_tensor, kept/excluded counts) that the
+        # downstream volume reconstruction needs.
+        assert preloaded_mask_tensor is not None and full_n_voxels is not None
+        mask_tensor = preloaded_mask_tensor
+        kept_voxels = int(mask_tensor.sum().item())
+        excluded_voxels = full_n_voxels - kept_voxels
+
+        print("📊 Mask applied (streamed during load):")
+        print(f"  Total voxels: {full_n_voxels:,}")
+        print(f"  Kept (in mask): {kept_voxels:,} ({100 * kept_voxels / full_n_voxels:.1f}%)")
+        print(f"  Excluded: {excluded_voxels:,} ({100 * excluded_voxels / full_n_voxels:.1f}%)")
+
+        n_voxels = kept_voxels
 
     elif mask_file is not None:
         mask_array = load_afni_mask(mask_file, threshold=mask_threshold)
@@ -1727,12 +1788,17 @@ def _load_fmri_data(
         img = load_nifti(filepath)
         data_np = img.get_fdata(dtype=np.float32)
 
-        # Convert to tensor
-        data = to_tensor(data_np, device=device, dtype=torch.float32)
+        # from_numpy SHARES the buffer (no copy) -- to_tensor() would go through
+        # torch.tensor(), which always copies, doubling peak RAM. At whole-dataset
+        # scale (a 130+ GB concatenated input) that copy OOM-kills the host.
+        data = torch.from_numpy(data_np).to(device=device)
 
     elif isinstance(fmri_data, np.ndarray):
-        # Convert numpy to tensor
-        data = to_tensor(fmri_data, device=device, dtype=torch.float32)
+        # Same reasoning: share the array via from_numpy rather than copy it.
+        # A dtype mismatch still forces a copy (unavoidable), but the common
+        # float32 whole-dataset handoff from the preprocessing path stays zero-copy.
+        arr = np.ascontiguousarray(fmri_data)
+        data = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
 
     elif isinstance(fmri_data, torch.Tensor):
         # Already a tensor, just move to device

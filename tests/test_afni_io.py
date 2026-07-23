@@ -334,6 +334,74 @@ class TestEdgeCases:
         )
 
 
+class TestLoadAndConcatenateRuns:
+    """Cover the preallocation and mask streaming paths of load_and_concatenate_runs."""
+
+    @staticmethod
+    def _write_runs(tmp_path, shapes):
+        """Write a list of 4D runs with distinct known values; return paths + arrays."""
+        paths, arrays = [], []
+        for i, (nx, ny, nz, nt) in enumerate(shapes):
+            arr = (np.arange(nx * ny * nz * nt, dtype=np.float32) + i * 1000.0).reshape(
+                nx, ny, nz, nt
+            )
+            p = tmp_path / f"run{i:02d}.nii.gz"
+            nib.save(nib.Nifti1Image(arr, np.eye(4)), str(p))
+            paths.append(str(p))
+            arrays.append(arr)
+        return paths, arrays
+
+    def test_prealloc_matches_cat(self, tmp_path):
+        """total_timepoints (single-copy) path is byte-identical to the list+cat path."""
+        from fastfuncstuff.io.afni import load_and_concatenate_runs
+
+        shapes = [(6, 5, 4, 7), (6, 5, 4, 9), (6, 5, 4, 5)]
+        paths, arrays = self._write_runs(tmp_path, shapes)
+        total = sum(s[3] for s in shapes)
+        n_vox = 6 * 5 * 4
+        expected = np.concatenate(
+            [a.reshape(n_vox, s[3]) for a, s in zip(arrays, shapes, strict=True)], axis=1
+        )
+
+        data_cat, rs_cat = load_and_concatenate_runs(paths, keep_on_cpu=True)
+        data_pre, rs_pre = load_and_concatenate_runs(
+            paths, keep_on_cpu=True, total_timepoints=total
+        )
+
+        assert rs_cat == rs_pre == [0, 7, 16]
+        assert data_pre.shape == (n_vox, total)
+        assert np.array_equal(data_pre.numpy(), expected)
+        assert np.array_equal(data_pre.numpy(), data_cat.numpy())
+
+    def test_mask_streamed_during_load(self, tmp_path):
+        """mask_flat drops out-of-mask voxels before storage; result matches post-mask."""
+        from fastfuncstuff.io.afni import load_and_concatenate_runs
+
+        shapes = [(6, 5, 4, 7), (6, 5, 4, 9)]
+        paths, arrays = self._write_runs(tmp_path, shapes)
+        total = sum(s[3] for s in shapes)
+        n_vox = 6 * 5 * 4
+        mask = np.zeros(n_vox, dtype=bool)
+        mask[::3] = True  # keep every third voxel
+
+        full = np.concatenate(
+            [a.reshape(n_vox, s[3]) for a, s in zip(arrays, shapes, strict=True)], axis=1
+        )
+        data, _ = load_and_concatenate_runs(
+            paths, keep_on_cpu=True, mask_flat=mask, total_timepoints=total
+        )
+        assert data.shape == (int(mask.sum()), total)
+        assert np.array_equal(data.numpy(), full[mask])
+
+    def test_wrong_total_timepoints_raises(self, tmp_path):
+        """A total_timepoints that disagrees with the run lengths is caught, not silently wrong."""
+        from fastfuncstuff.io.afni import load_and_concatenate_runs
+
+        paths, _ = self._write_runs(tmp_path, [(4, 4, 3, 8), (4, 4, 3, 8)])
+        with pytest.raises(ValueError, match="total_timepoints"):
+            load_and_concatenate_runs(paths, keep_on_cpu=True, total_timepoints=20)
+
+
 class TestSyntheticDataProperties:
     """Test properties of the provided synthetic data."""
 
