@@ -97,6 +97,34 @@ class TestScaleToPercentSignal:
         assert "mean_per_run" in info
         assert "scale_factors" in info
 
+    def test_track_violations_false_matches_stats(self):
+        """track_violations=False skips the full mask but reports identical stats.
+
+        The whole-dataset reml path relies on this to avoid a tens-of-GB
+        (n_voxels, n_timepoints) bool mask it never reads.
+        """
+        data = torch.ones(5, 50) * 1.0  # low mean -> guaranteed violations
+        data[0, 10] = 1000.0
+        data[3, 25] = 5000.0
+
+        scaled_full, mask_full, info_full = scale_to_percent_signal(
+            data.clone(), [0, 25], max_scale=200.0, verbose=False, track_violations=True
+        )
+        scaled_none, mask_none, info_none = scale_to_percent_signal(
+            data.clone(), [0, 25], max_scale=200.0, verbose=False, track_violations=False
+        )
+
+        assert mask_full is not None and mask_full.shape == (5, 50)
+        assert mask_none is None
+        assert torch.equal(scaled_full, scaled_none)
+        assert info_full["n_violations"] == info_none["n_violations"]
+        assert info_full["n_voxels_with_violations"] == info_none["n_voxels_with_violations"]
+        assert torch.equal(
+            info_full["violation_voxel_indices"], info_none["violation_voxel_indices"]
+        )
+        # The reported count must match the full mask ground truth.
+        assert info_none["n_violations"] == int(mask_full.sum().item())
+
 
 class TestGaussianBlur3D:
     def test_basic_blur(self):

@@ -1336,7 +1336,8 @@ def save_model_fit_outputs(
     AFNI-style output: betas and tstats are interleaved in a single 4D file
     with sub-bricks ordered as: [beta1, tstat1, beta2, tstat2, ...]
 
-    Uses 3drefit to add proper AFNI sub-brick labels and DOF.
+    Sub-brick labels and t-stat DOF are written into the AFNI extension
+    in-script by save_nifti (no 3drefit dependency).
 
     Parameters
     ----------
@@ -1366,9 +1367,6 @@ def save_model_fit_outputs(
     output_files : dict
         Dictionary of output file paths
     """
-    import shutil
-    import subprocess
-
     output_files = {}
     voxel_mask_np = voxel_mask.cpu().numpy() if voxel_mask is not None else None
 
@@ -1430,45 +1428,27 @@ def save_model_fit_outputs(
     bucket_4d = np.stack(bucket_vols, axis=-1)
     bucket_path = f"{output_prefix}_{model_type}_bucket{nii_ext}"
 
-    # Write uncompressed first for 3drefit, compress after
-    bucket_path_nii = bucket_path.replace(nii_ext, ".nii")
-    save_nifti(bucket_4d, output_path=bucket_path_nii, affine=affine, header=nifti_header)
+    # AFNI sub-brick labels + t-stat DOF written in-script by save_nifti (no
+    # 3drefit round-trip): tag each 'tstat' sub-brick as fitt(dof).
+    from fastfuncstuff.io.afni import stat_type_to_stataux
+
+    brick_stataux: dict[int, tuple[int, tuple[float, ...]]] | None = None
+    if dof is not None:
+        brick_stataux = {
+            i: stat_type_to_stataux("fitt", (dof,))
+            for i, sbtype in enumerate(sub_brick_types)
+            if sbtype == "tstat"
+        }
+
+    save_nifti(
+        bucket_4d,
+        output_path=bucket_path,
+        affine=affine,
+        header=nifti_header,
+        brick_labels=sub_brick_labels,
+        brick_stataux=brick_stataux or None,
+    )
     output_files[f"{model_type}_bucket"] = bucket_path
-
-    # Use 3drefit to add proper AFNI labels and DOF
-    has_3drefit = shutil.which("3drefit") is not None
-    if has_3drefit:
-        try:
-            refit_cmd = ["3drefit"]
-
-            # Add sub-brick labels
-            for i, label in enumerate(sub_brick_labels):
-                refit_cmd.extend(["-sublabel", str(i), label])
-
-            # Add DOF for t-stat sub-bricks
-            if dof is not None:
-                for i, sbtype in enumerate(sub_brick_types):
-                    if sbtype == "tstat":
-                        refit_cmd.extend(["-substatpar", str(i), "fitt", str(dof)])
-
-            refit_cmd.append(bucket_path_nii)
-
-            subprocess.run(refit_cmd, check=True, capture_output=True)
-            print(f"  ✓ Applied AFNI labels to {bucket_path}")
-        except subprocess.CalledProcessError as e:
-            print(f"  Warning: 3drefit failed: {e}")
-    else:
-        # Save sub-brick labels as text file fallback
-        labels_path = f"{output_prefix}_{model_type}_labels.txt"
-        with open(labels_path, "w") as f:
-            for i, label in enumerate(sub_brick_labels):
-                f.write(f"{i}\t{label}\n")
-        output_files[f"{model_type}_labels"] = labels_path
-
-    # Compress with pigz/zstd
-    from fastfuncstuff.io.afni import compress_nifti
-
-    compress_nifti(bucket_path_nii, bucket_path, remove_original=True)
 
     return output_files
 

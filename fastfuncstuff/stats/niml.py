@@ -27,8 +27,6 @@ A base64-encoded byte mask is written and attached as
 from __future__ import annotations
 
 import base64
-import shutil
-import subprocess
 import sys
 import textwrap
 import zlib
@@ -238,6 +236,72 @@ def build_refit_commands(
     return cmds
 
 
+def inject_clustsim_headers(
+    stat_path: Path,
+    niml_files: dict[tuple[int, str], Path],
+    mask_b64_path: Path | None,
+    brick_labels: list[str] | None = None,
+    stat_brick_indices: list[int] | None = None,
+    dof: int | None = None,
+) -> None:
+    """Inject ClustSim tables, mask, sub-brick labels and t-stat params into the
+    stat dataset's AFNI extension — in-script, no ``3drefit``.
+
+    Equivalent to ``3drefit -atrstring AFNI_CLUSTSIM_* file:… -relabel_all_str …
+    -substatpar … fitt dof``: the NIML tables and base64 mask are stored as AFNI
+    String attributes (``AFNI_suck_file`` reads them verbatim, trailing
+    whitespace trimmed), so AFNI re-parses them for cluster thresholding.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.io.afni import (
+        _set_afni_brick_labels,
+        _set_afni_brick_stataux,
+        compress_nifti,
+        load_nifti,
+        replace_afni_extension,
+        set_afni_atr,
+    )
+
+    path = Path(stat_path)
+    # Materialise fully so the save below can overwrite the file without racing
+    # a lazy ArrayProxy (same SIGBUS guard as add_fdrcurves_to_nifti).
+    src = (
+        load_nifti(str(path)) if str(path).endswith(".nii.zst") else nib.load(str(path), mmap=False)
+    )
+    data = np.asarray(src.dataobj)
+    header = src.header.copy()
+    affine = src.affine
+
+    # AFNI's `-atrstring … file:` truncates trailing whitespace on the raw file
+    # content before storing (AFNI_suck_file); rstrip() matches that.
+    for (nn, sided), niml_path in sorted(niml_files.items()):
+        content = Path(niml_path).read_text().rstrip()
+        set_afni_atr(header, f"AFNI_CLUSTSIM_NN{nn}_{sided}", content, ni_type="String")
+    if mask_b64_path is not None:
+        set_afni_atr(
+            header, "AFNI_CLUSTSIM_MASK", Path(mask_b64_path).read_text().rstrip(), ni_type="String"
+        )
+
+    if brick_labels:
+        _set_afni_brick_labels(header, brick_labels)
+    if stat_brick_indices and dof is not None:
+        n_sub = data.shape[3] if data.ndim == 4 else 1
+        stataux = {int(idx): (3, (float(int(dof)),)) for idx in stat_brick_indices}  # fitt(dof)
+        _set_afni_brick_stataux(header, stataux, n_sub)
+
+    out_img = nib.Nifti1Image(data, affine, header)
+    del src
+
+    path_str = str(path)
+    if path_str.endswith(".nii.zst"):
+        tmp_nii = replace_afni_extension(path_str, ".nii")
+        nib.save(out_img, tmp_nii)
+        compress_nifti(tmp_nii, path_str, remove_original=True)
+    else:
+        nib.save(out_img, path_str)
+
+
 def run_refit(
     stat_path: Path,
     niml_files: dict[tuple[int, str], Path],
@@ -248,11 +312,11 @@ def run_refit(
     write_script_path: Path | None = None,
     verbose: bool = True,
 ) -> bool:
-    """Run all required ``3drefit`` invocations sequentially.
+    """Inject the ClustSim tables / labels / stat params into ``stat_path``.
 
-    If ``3drefit`` is missing or any call fails, the full script is written
-    to ``write_script_path`` for the user to run later, and False is
-    returned.
+    Done in-script (no ``3drefit`` dependency). The equivalent ``3drefit``
+    script is still written to ``write_script_path`` as a reproducible record,
+    matching AFNI 3dClustSim's ``ppp.3drefit.cmd`` behaviour.
     """
     cmds = build_refit_commands(
         stat_path,
@@ -265,44 +329,32 @@ def run_refit(
     if not cmds:
         return True
 
-    def _write_script() -> None:
-        if write_script_path is None:
-            return
+    if write_script_path is not None:
         body = "#!/usr/bin/env bash\nset -e\n"
         for c in cmds:
             body += " ".join(_quote(a) for a in c) + "\n"
         write_script_path.write_text(body)
         write_script_path.chmod(0o755)
 
-    # Always write the script so the user has a reproducible record, even
-    # when 3drefit succeeds inline (matches AFNI 3dClustSim's behaviour of
-    # emitting `ppp.3drefit.cmd`).
-    _write_script()
-
-    refit = shutil.which("3drefit")
-    if refit is None:
+    try:
+        inject_clustsim_headers(
+            stat_path,
+            niml_files,
+            mask_b64_path,
+            brick_labels=brick_labels,
+            stat_brick_indices=stat_brick_indices,
+            dof=dof,
+        )
+    except Exception as e:  # pragma: no cover - defensive
         if verbose:
-            msg = (
-                "3drefit not found on PATH; header injection skipped.\n"
-                f"  Run this once when AFNI is available:\n    {write_script_path}"
-                if write_script_path is not None
-                else "  (no script written)"
-            )
-            print(msg, file=sys.stderr)
+            print(f"In-script ClustSim header injection failed: {e}", file=sys.stderr)
+            if write_script_path is not None:
+                print(
+                    f"  Run the fallback script when able:\n    {write_script_path}",
+                    file=sys.stderr,
+                )
         return False
-
-    ok = True
-    for cmd in cmds:
-        if verbose:
-            print(f"Running: {' '.join(_quote(a) for a in cmd)}", file=sys.stderr)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"3drefit failed (rc={result.returncode}):", file=sys.stderr)
-            print(result.stdout, file=sys.stderr)
-            print(result.stderr, file=sys.stderr)
-            ok = False
-            break
-    return ok  # script already written above
+    return True
 
 
 def _quote(s: str) -> str:

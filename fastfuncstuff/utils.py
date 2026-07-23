@@ -270,7 +270,8 @@ def scale_to_percent_signal(
     run_starts: list[int],
     max_scale: float = 200.0,
     verbose: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    track_violations: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None, dict]:
     """
     Scale voxel timeseries to mean=100 per run (percent signal change units).
 
@@ -290,13 +291,21 @@ def scale_to_percent_signal(
         Maximum allowed scaled value (clips to this)
     verbose : bool, default=True
         Print scaling statistics
+    track_violations : bool, default=True
+        If True, return the full ``(n_voxels, n_timepoints)`` boolean violations
+        mask. If False, skip that allocation and return ``None`` for the mask —
+        ``scale_info`` (counts, per-voxel indices) is still fully populated from
+        cheap per-voxel accumulators. At whole-dataset scale the full mask is
+        ~1 byte/sample (tens of GB), so callers that only need the counts should
+        pass ``track_violations=False``.
 
     Returns
     -------
     data_scaled : torch.Tensor
         Scaled data (n_voxels, n_timepoints) with mean~100 per run
-    violations_mask : torch.Tensor
-        Boolean mask (n_voxels, n_timepoints) where values hit max_scale ceiling
+    violations_mask : torch.Tensor or None
+        Boolean mask (n_voxels, n_timepoints) where values hit max_scale ceiling,
+        or ``None`` when ``track_violations=False``
     scale_info : dict
         Statistics about the scaling:
         - 'n_violations': total number of timepoints that hit ceiling
@@ -332,8 +341,16 @@ def scale_to_percent_signal(
     mean_per_run = torch.zeros(n_voxels, n_runs, device=device)
     scale_factors = torch.zeros(n_voxels, n_runs, device=device)
 
-    # Track violations (keep on CPU to avoid GPU OOM)
-    violations_mask = torch.zeros(n_voxels, n_timepoints_total, dtype=torch.bool, device="cpu")
+    # Track violations (keep on CPU to avoid GPU OOM). The full time-resolved
+    # mask is 1 byte/sample -- tens of GB at whole-dataset scale -- so only
+    # allocate it when the caller asks. Either way we accumulate the cheap
+    # per-voxel count that scale_info actually reports.
+    violations_mask = (
+        torch.zeros(n_voxels, n_timepoints_total, dtype=torch.bool, device="cpu")
+        if track_violations
+        else None
+    )
+    viol_count_per_voxel = torch.zeros(n_voxels, dtype=torch.int64, device="cpu")
 
     if verbose:
         print("Scaling to percent signal change (mean=100 per run)...")
@@ -364,8 +381,10 @@ def scale_to_percent_signal(
 
         # Apply ceiling and track violations
         # Values above max_scale (e.g., 200) indicate >100% signal increase
-        run_violations = scaled_run > max_scale
-        violations_mask[:, start:end] = run_violations.cpu()
+        run_violations = (scaled_run > max_scale).cpu()
+        if violations_mask is not None:
+            violations_mask[:, start:end] = run_violations
+        viol_count_per_voxel += run_violations.sum(dim=1).to(torch.int64)
 
         # Clip to max_scale (only upper bound - lower values are fine)
         # AFNI uses min(max_scale, scaled_value) - we preserve negative values
@@ -381,10 +400,11 @@ def scale_to_percent_signal(
         # Store back
         data[:, start:end] = scaled_run
 
-    # Compute violation statistics
-    n_violations = violations_mask.sum().item()
-    voxels_with_violations = violations_mask.any(dim=1)
-    n_voxels_with_violations = voxels_with_violations.sum().item()
+    # Compute violation statistics from the per-voxel counts (works whether or
+    # not the full mask was materialized).
+    n_violations = int(viol_count_per_voxel.sum().item())
+    voxels_with_violations = viol_count_per_voxel > 0
+    n_voxels_with_violations = int(voxels_with_violations.sum().item())
     violation_voxel_indices = torch.where(voxels_with_violations)[0]
 
     scale_info = {

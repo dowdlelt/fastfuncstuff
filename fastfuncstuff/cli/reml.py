@@ -2078,7 +2078,6 @@ def main():
                         condition_names=_obuck_labels,  # stim labels (+ dsort on -dsort_betas yes)
                         contrast_names=contrast_names,
                         contrast_results=ols_contrast_results,
-                        output_format="nifti_gz",  # Force NIfTI output
                         add_fdr=args.add_fdr,
                     )
 
@@ -2134,7 +2133,6 @@ def main():
                         ols_results,
                         args.Onuisance,
                         condition_names=stim_labels,
-                        output_format="nifti_gz",  # Force NIfTI output
                         add_fdr=args.add_fdr,
                     )
 
@@ -2277,12 +2275,22 @@ def main():
                 # No RunStart header → single concatenated block.
                 run_starts = [0]
 
-        # Load and optionally blur each run
-        run_data_list = []
+        # Load each run straight into a single preallocated buffer. The old
+        # path appended every run to a list and then np.concatenate'd it, which
+        # keeps the full list AND the new concatenated array alive at once
+        # (~2x peak). At 100-run / 160 GB scale that doubling OOM-kills the
+        # host right after load (the concatenate memcpy is also what pins a
+        # few cores). The design's n_timepoints is the authoritative total
+        # length the analysis uses downstream, so allocate to it up front and
+        # fill run-by-run — peak stays ~one extra run instead of a full copy.
+        n_voxels = int(np.prod(volume_shape))
+        total_tps = int(design_info["n_timepoints"])
+        fmri_data_preprocessed = np.empty((n_voxels, total_tps), dtype=np.float32)
 
         if args.do_blur is not None:
             print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
 
+        col = 0
         for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading runs", unit="run")):
             img = load_nifti(run_file)
             data_4d = img.get_fdata(dtype=np.float32)
@@ -2300,15 +2308,23 @@ def main():
                     verbose=(run_idx == 0),  # Only print details for first run
                 )
 
-            # Flatten to 2D (n_voxels, n_timepoints)
+            # Flatten to 2D (n_voxels, n_timepoints) and copy into the buffer,
+            # freeing this run before the next load so we never hold two copies.
             n_tps = data_4d.shape[3]
-            data_2d = data_4d.reshape(-1, n_tps)
+            if col + n_tps > total_tps:
+                raise ValueError(
+                    f"Run data exceeds design length: loaded {col + n_tps} "
+                    f"timepoints, design expects {total_tps}"
+                )
+            fmri_data_preprocessed[:, col : col + n_tps] = data_4d.reshape(n_voxels, n_tps)
+            col += n_tps
+            del img, data_4d
 
-            run_data_list.append(data_2d)
-
-        # Concatenate all runs
-        fmri_data_preprocessed = np.concatenate(run_data_list, axis=1)
-        del run_data_list
+        if col != total_tps:
+            raise ValueError(
+                f"Loaded {col} timepoints but design expects {total_tps}; "
+                "check that the input runs match the design matrix."
+            )
 
         # Diagnostics hook 1: grand mean, computed on the un-scaled data.
         if want_diag:
@@ -2327,11 +2343,15 @@ def main():
             print("  Applying scaling (mean=100 per run)...")
             # Convert to torch for scale_to_percent_signal
             data_tensor = torch.from_numpy(fmri_data_preprocessed)
-            data_tensor, violations_mask, scale_info = scale_to_percent_signal(
+            # reml only consumes the violation counts in scale_info, so skip the
+            # full (n_voxels, n_timepoints) mask -- it would add tens of GB on a
+            # whole-dataset run.
+            data_tensor, _violations_mask, scale_info = scale_to_percent_signal(
                 data=data_tensor,
                 run_starts=run_starts,
                 max_scale=200.0,
                 verbose=True,
+                track_violations=False,
             )
             fmri_data_preprocessed = data_tensor.numpy()
 
@@ -2740,7 +2760,6 @@ def main():
                 condition_names=_rbuck_labels,
                 contrast_names=contrast_names,
                 contrast_results=contrast_results,
-                output_format="nifti_gz",  # Force NIfTI output
                 add_fdr=args.add_fdr,
             )
 
@@ -2789,8 +2808,6 @@ def main():
     if args.Rbeta:
         print(f"  • Writing REML betas only: {args.Rbeta}")
         # Rbeta: ALL betas, no stats
-        import nibabel as nib
-
         from fastfuncstuff.glm.outputs import (
             _ensure_numpy,
             _get_voxel_mask,
@@ -2862,16 +2879,14 @@ def main():
             nuisance_results,
             args.Rnuisance,
             condition_names=nuisance_names,
-            output_format="nifti_gz",  # Force NIfTI output
             add_fdr=args.add_fdr,
         )
 
     if args.Rvar:
-        # Ensure Rvar output path has .nii.gz extension
+        # Respect the extension the user gave (.nii/.nii.gz/.nii.zst); default
+        # to compressed .nii.gz only when no NIfTI extension is present.
         rvar_output_path = Path(args.Rvar)
-        if not (
-            str(rvar_output_path).endswith(".nii.gz") or str(rvar_output_path).endswith(".nii")
-        ):
+        if not str(rvar_output_path).endswith((".nii.gz", ".nii", ".nii.zst")):
             rvar_output_path = Path(str(rvar_output_path) + ".nii.gz")
 
         print(f"  • Writing REML variance parameters: {rvar_output_path}")
@@ -2903,8 +2918,6 @@ def main():
         # Stack and write
         var_data = torch.stack(var_stack, dim=1)
         # Write variance parameters directly as 4D NIfTI
-        import nibabel as nib
-
         affine = getattr(results, "affine", np.eye(4))
         volume_shape = getattr(results, "original_shape", None)
         voxel_mask = getattr(results, "voxel_mask", None)
@@ -2928,6 +2941,7 @@ def main():
         # Then set SCENE_DATA[1] and TYPESTRING to fbuc/3DIM_HEAD_FUNC since
         # GLM outputs are stat buckets, not EPI timeseries.
         nifti_header_rvar = getattr(results, "nifti_header", None)
+        var_header = None
         if nifti_header_rvar is not None:
             import copy
 
@@ -2936,60 +2950,25 @@ def main():
             var_header.set_data_dtype(
                 var_vol.dtype
             )  # don't quantize float stats to an int source dtype
-            var_img = nib.Nifti1Image(var_vol, affine, header=var_header)
-        else:
-            var_img = nib.Nifti1Image(var_vol, affine)
         from fastfuncstuff.io.afni import set_afni_func_type
 
-        set_afni_func_type(var_img.header, func_code=11)  # fbuc / 3DIM_HEAD_FUNC
+        if var_header is not None:
+            set_afni_func_type(var_header, func_code=11)  # fbuc / 3DIM_HEAD_FUNC
 
-        # Save in requested format using helper
-        # IMPORTANT: nibabel cannot convert NIfTI headers to AFNI headers
-        # So we always save variance files as NIfTI (even if user requested AFNI)
-        import subprocess
-
-        from fastfuncstuff.glm.outputs import _save_nifti_with_format
-
-        # OPTIMIZATION: Write uncompressed first, then 3drefit, then compress
-        # This avoids 3drefit having to decompress/recompress huge files!
-        # For 870k voxels, this saves significant time
-
-        # Write uncompressed .nii first
-        temp_nii_path = (
-            rvar_output_path.with_suffix(".nii")
-            if str(rvar_output_path).endswith(".nii.gz")
-            else rvar_output_path
-        )
+        # Sub-brick labels are written into the AFNI extension in-script by
+        # save_nifti (no 3drefit round-trip); compression is chosen from the
+        # output extension in the same single pass.
         from fastfuncstuff.cli_utils import spinner
 
-        with spinner(f"Writing {Path(temp_nii_path).name}"):
-            _save_nifti_with_format(var_img, temp_nii_path, "nifti")
-
-        # Label sub-briks using AFNI's 3drefit (fast on uncompressed file)
-        print("  • Labeling Rvar sub-briks with 3drefit...")
-
-        # Build 3drefit command with all sub-brik labels
-        refit_cmd = ["3drefit"]
-        for idx, label in enumerate(var_labels):
-            refit_cmd.extend(["-sublabel", str(idx), label])
-        refit_cmd.append(str(temp_nii_path.absolute()))
-
-        try:
-            subprocess.run(refit_cmd, check=True, capture_output=True, text=True)
-            print(f"    ✓ Labeled {len(var_labels)} sub-briks: {', '.join(var_labels)}")
-        except subprocess.CalledProcessError as e:
-            print(f"    ⚠️  3drefit labeling failed: {e.stderr}")
-            print("    (File was written successfully, but lacks sub-brik labels)")
-        except FileNotFoundError:
-            print("    ⚠️  3drefit not found in PATH (AFNI not installed?)")
-            print("    (File was written successfully, but lacks sub-brik labels)")
-
-        # Compress with pigz/zstd if output is compressed format
-        if str(rvar_output_path).endswith(".nii.gz"):
-            from fastfuncstuff.io.afni import compress_nifti
-
-            print("  • Compressing Rvar output...")
-            compress_nifti(temp_nii_path, rvar_output_path, remove_original=True)
+        with spinner(f"Writing {rvar_output_path.name}"):
+            save_nifti(
+                var_vol,
+                output_path=rvar_output_path,
+                affine=affine,
+                header=var_header,
+                brick_labels=var_labels,
+            )
+        print(f"    ✓ Labeled {len(var_labels)} sub-briks: {', '.join(var_labels)}")
 
     # Write full REML likelihood surface if requested (-Rlklhd)
     _rlklhd = getattr(args, "Rlklhd", None)
@@ -2998,11 +2977,8 @@ def main():
     )
     if _rlklhd and _has_surface:
         import copy
-        import subprocess
 
-        import nibabel as nib
-
-        from fastfuncstuff.glm.outputs import _save_nifti_with_format
+        from fastfuncstuff.io.afni import set_afni_func_type
 
         print(f"  • Writing REML likelihood surface: {_rlklhd}")
         surface_np = results.reml_lklhd_surface.cpu().float().numpy()  # type: ignore[union-attr]
@@ -3026,46 +3002,34 @@ def main():
         else:
             vol_4d = surface_np
 
+        lklhd_header = None
         if nifti_header_lk is not None:
-            hdr = copy.deepcopy(nifti_header_lk)
-            hdr.set_data_shape(vol_4d.shape)
-            hdr.set_data_dtype(vol_4d.dtype)  # don't quantize float stats to an int source dtype
-            lklhd_img = nib.Nifti1Image(vol_4d, affine_lk, header=hdr)
-        else:
-            lklhd_img = nib.Nifti1Image(vol_4d, affine_lk)
-        from fastfuncstuff.io.afni import set_afni_func_type
+            lklhd_header = copy.deepcopy(nifti_header_lk)
+            lklhd_header.set_data_shape(vol_4d.shape)
+            # don't quantize float stats to an int source dtype
+            lklhd_header.set_data_dtype(vol_4d.dtype)
+            set_afni_func_type(lklhd_header, func_code=11)
 
-        set_afni_func_type(lklhd_img.header, func_code=11)
-
-        # Normalise output path
+        # Normalise output path, respecting the user's extension
+        # (.nii/.nii.gz/.nii.zst); default to .nii.gz only when none is given.
         lklhd_out = _rlklhd
-        if not (lklhd_out.endswith(".nii.gz") or lklhd_out.endswith(".nii")):
+        if not lklhd_out.endswith((".nii.gz", ".nii", ".nii.zst")):
             lklhd_out = lklhd_out + ".nii.gz"
         lklhd_path = Path(lklhd_out)
-        temp_lklhd = (
-            lklhd_path.with_suffix(".nii") if str(lklhd_path).endswith(".nii.gz") else lklhd_path
-        )
+
+        # Label each sub-brik with its (a, b) pair, in-script via save_nifti.
+        lklhd_labels = [f"a={a_k:.2f}_b={b_k:.2f}" for (a_k, b_k) in surf_params]
         from fastfuncstuff.cli_utils import spinner
 
-        with spinner(f"Writing {Path(temp_lklhd).name}"):
-            _save_nifti_with_format(lklhd_img, temp_lklhd, "nifti")
-
-        # Label each sub-brik with its (a, b) pair
-        refit_cmd = ["3drefit"]
-        for idx, (a_k, b_k) in enumerate(surf_params):
-            refit_cmd.extend(["-sublabel", str(idx), f"a={a_k:.2f}_b={b_k:.2f}"])
-        refit_cmd.append(str(temp_lklhd.absolute()))
-        try:
-            subprocess.run(refit_cmd, check=True, capture_output=True, text=True)
-            print(f"    ✓ Labeled {n_pairs} sub-briks (a=X.XX_b=Y.YY format)")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print("    ⚠️  3drefit labeling skipped (AFNI not in PATH?)")
-
-        if str(lklhd_path).endswith(".nii.gz"):
-            from fastfuncstuff.io.afni import compress_nifti
-
-            print("  • Compressing Rlklhd output...")
-            compress_nifti(temp_lklhd, lklhd_path, remove_original=True)
+        with spinner(f"Writing {lklhd_path.name}"):
+            save_nifti(
+                vol_4d,
+                output_path=lklhd_path,
+                affine=affine_lk,
+                header=lklhd_header,
+                brick_labels=lklhd_labels,
+            )
+        print(f"    ✓ Labeled {n_pairs} sub-briks (a=X.XX_b=Y.YY format)")
 
     elif _rlklhd and not _has_surface:
         print(

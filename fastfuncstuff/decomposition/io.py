@@ -138,12 +138,9 @@ def _write_interleaved_stat_bucket(
 ) -> Path:
     """Write interleaved [vol1_0, vol2_0, vol1_1, vol2_1, ...] 4D NIfTI.
 
-    Applies 3drefit sub-brick labels (and stat types where given) when
-    3drefit is on PATH; otherwise writes a companion _labels.txt file.
+    Sub-brick labels and stat types are written into the AFNI extension
+    in-script via :func:`save_nifti` (no 3drefit dependency).
     """
-    import shutil
-    import subprocess
-
     k = vol1_kv.shape[0]
     n_digits = len(str(k))
 
@@ -164,46 +161,31 @@ def _write_interleaved_stat_bucket(
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    out_str = str(out_file)
-    if out_str.endswith(".nii.gz") or out_str.endswith(".nii.zst"):
-        from fastfuncstuff.io.afni import replace_afni_extension
-
-        tmp_path = Path(replace_afni_extension(out_str, ".nii"))
-    else:
-        tmp_path = out_file
-    save_nifti(out_4d, output_path=tmp_path, affine=affine)
-
     sub_labels = []
     for i in range(k):
         tag = str(i + 1).zfill(n_digits)
         sub_labels.append(f"IC{tag}_{label1}")
         sub_labels.append(f"IC{tag}_{label2}")
 
-    has_3drefit = shutil.which("3drefit") is not None
-    if has_3drefit:
-        cmd = ["3drefit"]
-        for i, lab in enumerate(sub_labels):
-            cmd.extend(["-sublabel", str(i), lab])
-        for i in range(k):
-            if stat1_type:
-                cmd.extend(["-substatpar", str(2 * i), stat1_type])
-            if stat2_type:
-                cmd.extend(["-substatpar", str(2 * i + 1), stat2_type])
-        cmd.append(str(tmp_path))
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            print(f"  WARN: 3drefit failed: {e.stderr.decode(errors='replace')[-300:]}")
-    else:
-        labels_txt = Path(str(tmp_path.with_suffix("")) + "_labels.txt")
-        with labels_txt.open("w") as f:
-            for i, lab in enumerate(sub_labels):
-                f.write(f"{i}\t{lab}\n")
+    # In-script AFNI sub-brick labels + stat tagging (no 3drefit round-trip):
+    # save_nifti writes labels/stataux into the extension and compresses in one
+    # pass. The interleaved stat types (typically fizt, 0 params) carry no DOF.
+    from fastfuncstuff.io.afni import stat_type_to_stataux
 
-    if tmp_path != out_file:
-        from fastfuncstuff.io.afni import compress_nifti
+    brick_stataux: dict[int, tuple[int, tuple[float, ...]]] = {}
+    for i in range(k):
+        if stat1_type:
+            brick_stataux[2 * i] = stat_type_to_stataux(stat1_type, ())
+        if stat2_type:
+            brick_stataux[2 * i + 1] = stat_type_to_stataux(stat2_type, ())
 
-        compress_nifti(str(tmp_path), str(out_file), remove_original=True)
+    save_nifti(
+        out_4d,
+        output_path=out_file,
+        affine=affine,
+        brick_labels=sub_labels,
+        brick_stataux=brick_stataux or None,
+    )
 
     return out_file
 
