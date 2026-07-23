@@ -2275,12 +2275,22 @@ def main():
                 # No RunStart header → single concatenated block.
                 run_starts = [0]
 
-        # Load and optionally blur each run
-        run_data_list = []
+        # Load each run straight into a single preallocated buffer. The old
+        # path appended every run to a list and then np.concatenate'd it, which
+        # keeps the full list AND the new concatenated array alive at once
+        # (~2x peak). At 100-run / 160 GB scale that doubling OOM-kills the
+        # host right after load (the concatenate memcpy is also what pins a
+        # few cores). The design's n_timepoints is the authoritative total
+        # length the analysis uses downstream, so allocate to it up front and
+        # fill run-by-run — peak stays ~one extra run instead of a full copy.
+        n_voxels = int(np.prod(volume_shape))
+        total_tps = int(design_info["n_timepoints"])
+        fmri_data_preprocessed = np.empty((n_voxels, total_tps), dtype=np.float32)
 
         if args.do_blur is not None:
             print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
 
+        col = 0
         for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading runs", unit="run")):
             img = load_nifti(run_file)
             data_4d = img.get_fdata(dtype=np.float32)
@@ -2298,15 +2308,23 @@ def main():
                     verbose=(run_idx == 0),  # Only print details for first run
                 )
 
-            # Flatten to 2D (n_voxels, n_timepoints)
+            # Flatten to 2D (n_voxels, n_timepoints) and copy into the buffer,
+            # freeing this run before the next load so we never hold two copies.
             n_tps = data_4d.shape[3]
-            data_2d = data_4d.reshape(-1, n_tps)
+            if col + n_tps > total_tps:
+                raise ValueError(
+                    f"Run data exceeds design length: loaded {col + n_tps} "
+                    f"timepoints, design expects {total_tps}"
+                )
+            fmri_data_preprocessed[:, col : col + n_tps] = data_4d.reshape(n_voxels, n_tps)
+            col += n_tps
+            del img, data_4d
 
-            run_data_list.append(data_2d)
-
-        # Concatenate all runs
-        fmri_data_preprocessed = np.concatenate(run_data_list, axis=1)
-        del run_data_list
+        if col != total_tps:
+            raise ValueError(
+                f"Loaded {col} timepoints but design expects {total_tps}; "
+                "check that the input runs match the design matrix."
+            )
 
         # Diagnostics hook 1: grand mean, computed on the un-scaled data.
         if want_diag:
@@ -2325,11 +2343,15 @@ def main():
             print("  Applying scaling (mean=100 per run)...")
             # Convert to torch for scale_to_percent_signal
             data_tensor = torch.from_numpy(fmri_data_preprocessed)
-            data_tensor, violations_mask, scale_info = scale_to_percent_signal(
+            # reml only consumes the violation counts in scale_info, so skip the
+            # full (n_voxels, n_timepoints) mask -- it would add tens of GB on a
+            # whole-dataset run.
+            data_tensor, _violations_mask, scale_info = scale_to_percent_signal(
                 data=data_tensor,
                 run_starts=run_starts,
                 max_scale=200.0,
                 verbose=True,
+                track_violations=False,
             )
             fmri_data_preprocessed = data_tensor.numpy()
 

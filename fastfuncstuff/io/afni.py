@@ -239,8 +239,11 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
             img = nib.load(tmp_path)
 
             # Load data into memory and create new image to avoid lazy loading issues
-            # This ensures the temp file can be safely deleted
-            data = img.get_fdata()
+            # This ensures the temp file can be safely deleted. Read as float32:
+            # get_fdata() defaults to float64, which doubles peak RAM per volume
+            # (catastrophic for whole-dataset 4D loads) for no benefit -- callers
+            # that need float64 recast downstream.
+            data = img.get_fdata(dtype=np.float32)
             affine = img.affine
             header = img.header.copy()
 
