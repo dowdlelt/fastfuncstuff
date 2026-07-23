@@ -1699,6 +1699,92 @@ def _generate_afni_idcode() -> str:
     return f"AFN_{raw[:22]}"
 
 
+def _history_commandline() -> str:
+    """The exact ffs_* CLI invocation, joined like AFNI's ``tross_commandline``.
+
+    ``argv[0]`` is reduced to its basename so the entry reads ``ffs_reml …``
+    rather than the full console-script path (``.../bin/ffs_reml``); the actual
+    arguments are preserved verbatim, with tokens containing
+    whitespace/control/high-bit chars single-quoted (offending chars blanked).
+    """
+    import os
+    import sys
+
+    argv = list(sys.argv)
+    if argv:
+        argv[0] = os.path.basename(argv[0])
+    parts: list[str] = []
+    for i, tok in enumerate(argv):
+        if i > 0 and (tok == "" or any(ord(c) < 32 or ord(c) > 126 or c == " " for c in tok)):
+            cleaned = "".join(" " if (ord(c) < 32 or ord(c) > 127 or c == " ") else c for c in tok)
+            parts.append(f"'{cleaned}'")
+        else:
+            parts.append(tok)
+    return " ".join(parts)
+
+
+def _history_prefix() -> str:
+    """``user@host: Www Mmm DD HH:MM:SS YYYY`` — the bracketed prefix AFNI's
+    ``tross_Append_History`` puts before each command line."""
+    import getpass
+    import socket
+    import time
+
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "nobody"
+    host = socket.gethostname() or "localhost"
+    return f"{user}@{host}: {time.ctime()}"
+
+
+def _append_history_note(header: object) -> None:
+    """Append this command to the dataset's ``HISTORY_NOTE`` (AFNI provenance).
+
+    In-script equivalent of AFNI's ``tross_Append_History`` (afni/src/thd_notes.c):
+    a ``[user@host: ctime] <commandline>`` line, newline-separated from prior
+    history and stored newline-escaped (``\\n``) inside the AFNI NIfTI extension
+    (ecode=4). Runs on every :func:`save_nifti`, creating the AFNI extension and
+    the ``HISTORY_NOTE`` attribute when the input had none — so plain-NIfTI
+    outputs gain the same provenance trail AFNI tools write.
+    """
+    import nibabel as nib
+
+    try:
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return
+
+    entry = f"[{_history_prefix()}] {_history_commandline()}"
+
+    afni_idx = None
+    for i, ext in enumerate(extensions):
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            afni_idx = i
+            break
+
+    if afni_idx is None:
+        # No AFNI extension yet — create a minimal one carrying just the note.
+        set_afni_atr(header, "HISTORY_NOTE", entry, ni_type="String")
+        return
+
+    xml = extensions[afni_idx].content.decode("utf-8", errors="replace")
+    m = re.search(
+        r'(atr_name="HISTORY_NOTE"\s*>\s*\n)\s*"([^"]*)"',
+        xml,
+        re.DOTALL,
+    )
+    if m:
+        # AFNI separates history entries with a real newline, stored as the NIML
+        # entity &#x0a;; the entry itself is NIML-escaped so any quotes/newlines
+        # in it stay well-formed (matches how 3drefit rewrites HISTORY_NOTE).
+        new_history = m.group(2) + "&#x0a;" + _niml_escape_string(entry)
+        xml = xml[: m.start(2)] + new_history + xml[m.end(2) :]
+        extensions[afni_idx] = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
+    else:
+        set_afni_atr(header, "HISTORY_NOTE", entry, ni_type="String")
+
+
 def get_afni_space_info(header: object) -> dict[str, str | int]:
     """Extract AFNI view code and template space from a NIfTI header.
 
@@ -1848,7 +1934,6 @@ def _update_afni_extension(
         - BRICK_STATS / BRICK_STATSYM / BRICK_LABS → trimmed if volume count changed
     """
     import re
-    import sys
     from datetime import datetime
 
     try:
@@ -1908,22 +1993,9 @@ def _update_afni_extension(
         afni_xml,
     )
 
-    # --- Append to HISTORY_NOTE ---
-    cmd_line = " ".join(sys.argv)
-    history_entry = f"[fastfuncstuff: {now_str}] {cmd_line}"
-
-    history_match = re.search(
-        r'(atr_name="HISTORY_NOTE"\s*>\s*\n)\s*"([^"]*)"',
-        afni_xml,
-        re.DOTALL,
-    )
-    if history_match:
-        old_history = history_match.group(2)
-        new_history = old_history + r"\n" + history_entry
-        afni_xml = (
-            afni_xml[: history_match.start(2)] + new_history + afni_xml[history_match.end(2) :]
-        )
-    # If no HISTORY_NOTE found, that's fine — don't add one
+    # HISTORY_NOTE is handled separately by _append_history_note, which runs
+    # unconditionally (even for plain-NIfTI inputs with no AFNI extension) so
+    # every ffs_* output carries provenance the way native AFNI tools do.
 
     # --- Update DATASET_RANK[1] (sub-brick count) ---
     # DATASET_RANK is stored as 8 ints: [3, n_sub_briks, 0, 0, 0, 0, 0, 0].
@@ -2097,10 +2169,52 @@ def read_brick_labels(img) -> list[str]:
     return []
 
 
+# AFNI FUNC_*_TYPE codes for the statistical sub-brick prefixes accepted by
+# ``3drefit -substatpar`` (afni/src/afni.h). Only the codes we can round-trip
+# via _statsym_for (t/F/z) are exercised today; the rest are here so a caller
+# passing e.g. "fict" gets the right BRICK_STATAUX code rather than a silent
+# fallback.
+_FUNC_TYPE_CODES: dict[str, int] = {
+    "fico": 2,  # correlation coeff (3 params: dof, nfit, nort)
+    "fitt": 3,  # Student t (1 param: dof)
+    "fift": 4,  # F ratio (2 params: numdof, dendof)
+    "fizt": 5,  # standard normal z (0 params)
+    "fict": 6,  # chi-squared (1 param: dof)
+    "fibt": 7,  # incomplete beta (2 params: a, b)
+    "fibn": 8,  # binomial (2 params: ntrial, prob)
+    "figt": 9,  # gamma (2 params: shape, scale)
+    "fipt": 10,  # Poisson (1 param: mean)
+}
+
+
+def stat_type_to_stataux(
+    stat_type: str,
+    params: tuple[float, ...] | list[float],
+) -> tuple[int, tuple[float, ...]]:
+    """Map an AFNI stat prefix (``"fitt"``/``"fift"``/``"fizt"``/…) to the
+    ``(code, params)`` pair :func:`save_nifti`'s ``brick_stataux`` expects.
+
+    This is the in-script equivalent of ``3drefit -substatpar <idx> <type> …``:
+    callers that used to hold a string type (e.g. ``"fitt"``) and a DOF can now
+    build the ``brick_stataux`` dict directly instead of shelling out.
+    """
+    key = stat_type.lower().lstrip("-")
+    try:
+        code = _FUNC_TYPE_CODES[key]
+    except KeyError as err:
+        raise ValueError(
+            f"unknown AFNI stat type {stat_type!r}; expected one of {sorted(_FUNC_TYPE_CODES)}"
+        ) from err
+    return code, tuple(float(p) for p in params)
+
+
 def _statsym_for(code: int, params: tuple[float, ...]) -> str:
-    """Symbolic AFNI stat label for one sub-brick (``Ttest(dof)`` / ``Ftest(n,d)`` /
-    ``Zscore()``). ``"none"`` for non-stat sub-bricks. Mirrors the parser in
-    ``cli/util_concalc.py`` so round-trips agree."""
+    """Symbolic AFNI stat label for one sub-brick (``Correl(a,b,c)`` / ``Ttest(dof)``
+    / ``Ftest(n,d)`` / ``Zscore()``). ``"none"`` for non-stat sub-bricks. Uses the
+    distribution names + ``dist(p,…)`` form from AFNI's ``NI_stat_encode``
+    (niml_stat.c); integer-valued params render without a trailing ``.0``."""
+    if code == 2 and len(params) == 3:  # fico
+        return f"Correl({int(params[0])},{int(params[1])},{int(params[2])})"
     if code == 3 and len(params) == 1:  # fitt
         return f"Ttest({int(params[0])})"
     if code == 4 and len(params) == 2:  # fift
@@ -2165,6 +2279,97 @@ def _set_afni_brick_stataux(
                 xml,
                 flags=re.DOTALL,
             )
+        if "</AFNI_attributes>" in xml:
+            xml = xml.replace("</AFNI_attributes>", atr + "</AFNI_attributes>", 1)
+        else:
+            xml = xml + atr
+        extensions[afni_idx] = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
+    else:
+        idc = _generate_afni_idcode()
+        payload = (
+            "<?xml version='1.0' ?>\n"
+            "<AFNI_attributes\n"
+            f'  self_idcode="{idc}"\n'
+            '  ni_form="ni_group" >\n'
+            f"{atr}"
+            "</AFNI_attributes>\n\x00"
+        )
+        extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, payload.encode("utf-8")))
+
+
+def _niml_escape_string(cn: str) -> str:
+    """Escape a string the way AFNI's ``NI_quotize_string`` does for storage in a
+    NIML/XML String attribute inside the NIfTI extension: XML entities for
+    ``& < > " '`` and hex refs for CR/LF (afni/src/niml/niml_util.c). This is
+    the encoding AFNI itself writes to ``.nii`` extensions — matching it means
+    multi-line/quoted values (ClustSim NIML tables, history lines) round-trip
+    through AFNI's reader intact. Returns the inner text only; the caller adds
+    the surrounding quotes."""
+    escapes = {
+        "&": "&amp;",  # must map '&' too, but per-char switch avoids double-encode
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&apos;",
+        "\r": "&#x0d;",
+        "\n": "&#x0a;",
+    }
+    return "".join(escapes.get(ch, ch) for ch in cn)
+
+
+def set_afni_atr(
+    header: object,
+    name: str,
+    value: str,
+    ni_type: str = "String",
+) -> None:
+    """Inject/replace an arbitrary AFNI attribute in the NIfTI extension (ecode=4).
+
+    In-script equivalent of ``3drefit -atrstring <name> '<value>'``. Used for
+    attributes with no dedicated helper — e.g. the ``AFNI_CLUSTSIM_*`` cluster
+    tables that ClustSim injects. ``ni_type="String"`` wraps the value in quotes
+    (AFNI's string form); pass ``ni_type="float"``/``"int"`` for numeric bodies,
+    where *value* is the already-formatted whitespace-separated body.
+
+    Reuses an existing AFNI extension or creates a minimal one, mirroring
+    :func:`_set_afni_brick_labels`.
+    """
+    import nibabel as nib
+
+    try:
+        extensions = header.extensions  # type: ignore[union-attr]
+    except AttributeError:
+        return
+
+    if ni_type == "String":
+        body = f' "{_niml_escape_string(value)}"\n'
+        ni_dimen = "1"
+    else:
+        body = f" {value}\n"
+        ni_dimen = str(len(value.split()))
+    atr = (
+        "<AFNI_atr\n"
+        f'  ni_type="{ni_type}"\n'
+        f'  ni_dimen="{ni_dimen}"\n'
+        f'  atr_name="{name}" >\n'
+        f"{body}"
+        "</AFNI_atr>\n"
+    )
+
+    afni_idx = None
+    for i, ext in enumerate(extensions):
+        if ext.get_code() == _NIFTI_ECODE_AFNI:
+            afni_idx = i
+            break
+
+    if afni_idx is not None:
+        xml = extensions[afni_idx].content.decode("utf-8", errors="replace")
+        xml = re.sub(
+            rf'<AFNI_atr\s[^>]*atr_name="{re.escape(name)}"[^>]*>.*?</AFNI_atr>\s*',
+            "",
+            xml,
+            flags=re.DOTALL,
+        )
         if "</AFNI_attributes>" in xml:
             xml = xml.replace("</AFNI_attributes>", atr + "</AFNI_attributes>", 1)
         else:
@@ -2314,6 +2519,10 @@ def save_nifti(
     #   - IDCODE_DATE with current timestamp
     #   - HISTORY_NOTE appended with our command
     _update_afni_extension(header, data.shape, data.dtype)
+
+    # Provenance: append this command to HISTORY_NOTE (creates the AFNI
+    # extension when the input had none), matching AFNI's tross_Append_History.
+    _append_history_note(header)
 
     # Per-sub-brick labels for AFNI viewers (NIfTI has no native equivalent).
     if brick_labels is not None:

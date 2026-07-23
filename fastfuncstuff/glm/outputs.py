@@ -516,6 +516,8 @@ def _normalize_output_path(output_path: str | Path) -> tuple[Path, str]:
     elif path_str.endswith((".BRIK.gz", ".brik.gz", ".BRIK", ".brik")):
         base = _strip_imaging_extension(path_str)
         return Path(base), "afni"
+    elif path_str.endswith((".nii.zst", ".NII.ZST")):
+        return output_path, "nifti_zst"
     elif path_str.endswith((".nii.gz", ".NII.GZ")):
         return output_path, "nifti_gz"
     elif path_str.endswith((".nii", ".NII")):
@@ -1180,21 +1182,14 @@ def write_glm_bucket_as_nifti(
         base_name = _strip_imaging_extension(str(base_path))
         base_path = Path(base_name + ".nii.gz")
 
-    # For 3drefit, we need uncompressed file first
-    # Write uncompressed NIfTI first (for 3drefit)
-    # Handle .nii.gz properly: strip all extensions, then add .nii
+    # Uncompressed sibling path (used for the FDR path and as the no-compress
+    # target). Strip all extensions, then add .nii.
     if str(base_path).endswith(".nii.gz"):
         temp_path = base_path.parent / (base_path.name[:-7] + ".nii")
     elif str(base_path).endswith(".nii"):
         temp_path = base_path
     else:
         temp_path = base_path.with_suffix(".nii")
-    save_nifti(
-        np.asarray(bucket_img.dataobj),
-        output_path=temp_path,
-        affine=bucket_img.affine,
-        header=bucket_img.header,
-    )
 
     # Write labels as JSON sidecar
     # Strip all suffixes (.nii, .nii.gz, .BRIK, etc.) then add .json
@@ -1212,129 +1207,86 @@ def write_glm_bucket_as_nifti(
             indent=2,
         )
 
-    # Apply AFNI metadata with 3drefit (if requested and available)
-    if apply_afni_metadata:
-        import shutil
-        import subprocess
+    # Build AFNI sub-brick metadata in-script (no 3drefit): labels via
+    # BRICK_LABS, stat tagging via BRICK_STATAUX/STATSYM. save_nifti writes both
+    # into the AFNI extension in the same pass that compresses the output.
+    from fastfuncstuff.io.afni import stat_type_to_stataux
 
-        if shutil.which("3drefit"):
-            try:
-                # Get DoF from results
-                dof = getattr(results, "dof", None)
-                if dof is None:
-                    print("  ⚠ Warning: No DoF found in results, skipping stat parameters")
-                else:
-                    # Split into two 3drefit commands to avoid buffer overflow
-                    # Command 1: Set labels (write to file to avoid buffer overflow)
-                    labels_file = temp_path.parent / f"{temp_path.stem}_labels.txt"
-                    with labels_file.open("w") as f:
-                        # Write space-separated labels (AFNI format for -relabel_all)
-                        f.write(" ".join(labels))
+    brick_labels_arg = labels if apply_afni_metadata else None
+    brick_stataux: dict[int, tuple[int, tuple[float, ...]]] = {}
+    # Track (brick_idx, stat_code, dof_or_dofs) for FDR curves.
+    fdr_specs: list[tuple[int, str, object]] = []
 
-                    cmd_relabel = ["3drefit", "-relabel_all", str(labels_file), str(temp_path)]
+    dof = getattr(results, "dof", None)
+    if apply_afni_metadata and dof is None:
+        print("  ⚠ Warning: No DoF found in results, skipping stat parameters")
+    if apply_afni_metadata and dof is not None:
+        brick_idx = 0
+        # F-statistic (sub-brick 0) — only if we have fstats
+        if getattr(results, "fstats", None) is not None:
+            brick_stataux[brick_idx] = stat_type_to_stataux("fift", (n_regressors, dof))
+            fdr_specs.append((brick_idx, "fift", (float(n_regressors), float(dof))))
+            brick_idx += 1
 
-                    # Write relabel command to file for debugging
-                    cmd_file_relabel = (
-                        temp_path.parent / f"{temp_path.stem}_relabel_3drefit_cmd.txt"
-                    )
-                    with cmd_file_relabel.open("w") as f:
-                        f.write("# 3drefit command for setting sub-brick labels\n")
-                        f.write("# This file is created automatically and can be deleted\n\n")
-                        f.write(f"Labels written to: {labels_file}\n\n")
-                        f.write("Command as list:\n")
-                        f.write(f"{cmd_relabel}\n\n")
-                        f.write("Command as shell string:\n")
-                        import shlex
-
-                        shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_relabel)
-                        f.write(f"{shell_cmd}\n")
-
-                    # Run relabel command
-                    subprocess.run(cmd_relabel, check=True, capture_output=True, text=True)
-
-                    # Command 2: Set statistical parameters
-                    cmd_statpar = ["3drefit"]
-                    brick_idx = 0
-                    # Track (brick_idx, stat_code, dof_or_dofs) for FDR curves.
-                    fdr_specs: list[tuple[int, str, object]] = []
-
-                    # F-statistic (sub-brick 0) - only if we have fstats
-                    has_fstats = getattr(results, "fstats", None) is not None
-                    if has_fstats:
-                        cmd_statpar.extend(
-                            [
-                                "-substatpar",
-                                str(brick_idx),
-                                "fift",
-                                str(n_regressors),
-                                str(dof),
-                            ]
-                        )
-                        fdr_specs.append((brick_idx, "fift", (float(n_regressors), float(dof))))
-                        brick_idx += 1
-
-                    # Regressor t-statistics (only if we have tstats)
-                    has_tstats = getattr(results, "tstats", None) is not None
-                    if has_tstats:
-                        for _ in condition_names:
-                            # Skip beta (brick_idx), add t-stat (brick_idx + 1)
-                            cmd_statpar.extend(
-                                ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
-                            )
-                            fdr_specs.append((brick_idx + 1, "fitt", float(dof)))
-                            brick_idx += 2
-                    else:
-                        # No t-stats, just skip over betas
-                        brick_idx += len(condition_names)
-
-                    # Contrast t-statistics (if any)
-                    if contrast_names:
-                        for _ in contrast_names:
-                            cmd_statpar.extend(
-                                ["-substatpar", str(brick_idx + 1), "fitt", str(dof)]
-                            )
-                            fdr_specs.append((brick_idx + 1, "fitt", float(dof)))
-                            brick_idx += 2
-
-                    # Add file path
-                    cmd_statpar.append(str(temp_path))
-
-                    # Write statpar command to file for debugging
-                    cmd_file_statpar = (
-                        temp_path.parent / f"{temp_path.stem}_statpar_3drefit_cmd.txt"
-                    )
-                    with cmd_file_statpar.open("w") as f:
-                        f.write("# 3drefit command for setting statistical parameters\n")
-                        f.write("# This file is created automatically and can be deleted\n\n")
-                        f.write("Command as list:\n")
-                        f.write(f"{cmd_statpar}\n\n")
-                        f.write("Command as shell string:\n")
-                        shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_statpar)
-                        f.write(f"{shell_cmd}\n")
-
-                    # Run statpar command
-                    subprocess.run(cmd_statpar, check=True, capture_output=True, text=True)
-
-                    # FDR curves (after 3drefit so it doesn't clobber our extension)
-                    if add_fdr and fdr_specs:
-                        _inject_fdr_curves(temp_path, fdr_specs)
-
-            except subprocess.CalledProcessError as e:
-                print(f"  ⚠ Warning: 3drefit failed: {e.stderr}")
-            except Exception as e:
-                print(f"  ⚠ Warning: 3drefit error: {e}")
+        # Regressor t-statistics (beta then t-stat per condition)
+        if getattr(results, "tstats", None) is not None:
+            for _ in condition_names or []:
+                brick_stataux[brick_idx + 1] = stat_type_to_stataux("fitt", (dof,))
+                fdr_specs.append((brick_idx + 1, "fitt", float(dof)))
+                brick_idx += 2
         else:
-            # AFNI not installed, skip silently (user opted in with apply_afni_metadata=True)
-            pass
+            brick_idx += len(condition_names or [])
 
-    # Compress output if requested
-    final_path = temp_path
-    if compress_output:
+        # Contrast t-statistics (if any)
+        if contrast_names:
+            for _ in contrast_names:
+                brick_stataux[brick_idx + 1] = stat_type_to_stataux("fitt", (dof,))
+                fdr_specs.append((brick_idx + 1, "fitt", float(dof)))
+                brick_idx += 2
+
+    bucket_data = np.asarray(bucket_img.dataobj)
+    stataux_arg = brick_stataux or None
+    need_fdr = add_fdr and bool(fdr_specs)
+
+    # Final target honours the extension the caller asked for (via -prefix):
+    # .nii, .nii.gz, or .nii.zst. We never force gzip — save_nifti picks the
+    # compressor from the extension (pigz for .gz, zstd for .zst). compress_output
+    # only downgrades to uncompressed .nii when the caller explicitly opts out.
+    base_name = _strip_imaging_extension(str(base_path))
+    ext_by_format = {"nifti": ".nii", "nifti_gz": ".nii.gz", "nifti_zst": ".nii.zst"}
+    final_ext = ext_by_format.get(detected_format, ".nii.gz") if compress_output else ".nii"
+    final_path = Path(base_name + final_ext)
+
+    if need_fdr and final_ext != ".nii":
+        # FDR curves must be computed on the written stat sub-bricks and injected
+        # before compression. Write uncompressed, inject, then compress via the
+        # multicore compressor matching the requested extension.
+        save_nifti(
+            bucket_data,
+            output_path=temp_path,
+            affine=bucket_img.affine,
+            header=bucket_img.header,
+            brick_labels=brick_labels_arg,
+            brick_stataux=stataux_arg,
+        )
+        _inject_fdr_curves(temp_path, fdr_specs)
         from fastfuncstuff.io.afni import compress_nifti
 
-        base_name = _strip_imaging_extension(str(temp_path))
-        compressed_path = Path(base_name + ".nii.gz")
-        final_path = compress_nifti(temp_path, compressed_path, remove_original=True)
+        final_path = compress_nifti(temp_path, final_path, remove_original=True)
+    else:
+        # Single write straight to the final target; save_nifti compresses in
+        # the same pass (pigz/zstd per extension). FDR injection, if any,
+        # rewrites the file in place afterward.
+        save_nifti(
+            bucket_data,
+            output_path=final_path,
+            affine=bucket_img.affine,
+            header=bucket_img.header,
+            brick_labels=brick_labels_arg,
+            brick_stataux=stataux_arg,
+        )
+        if need_fdr:
+            _inject_fdr_curves(final_path, fdr_specs)
 
     return final_path
 
@@ -1586,8 +1538,7 @@ def write_partial_r2_with_labels(
     Path
         Path to written file
     """
-    import shutil
-    import subprocess
+    from fastfuncstuff.io.afni import stat_type_to_stataux
 
     # Convert to numpy
     r2_partial_np = _ensure_numpy(r2_partial_data)
@@ -1608,107 +1559,33 @@ def write_partial_r2_with_labels(
     else:
         r2_partial_vol = r2_partial_np.reshape(*volume_shape, n_conditions)
 
-    # Create NIfTI
     if affine is None:
         affine = np.eye(4)
 
-    # Ensure output path is .nii (uncompressed for 3drefit)
+    # AFNI labels + stat tagging written in-script by save_nifti (no 3drefit).
+    # Partial R² is a correlation coefficient: fico(samples, fit=1, ort=n_reg-1).
+    brick_labels_arg = None
+    brick_stataux = None
+    if apply_afni_metadata:
+        suffix = "_partialR2_task" if mode == "task" else "_partialR2"
+        brick_labels_arg = [f"{label}{suffix}" for label in condition_labels]
+        if n_timepoints and n_regressors:
+            brick_stataux = {
+                idx: stat_type_to_stataux("fico", (n_timepoints, 1, n_regressors - 1))
+                for idx in range(n_conditions)
+            }
+
+    # Honour the caller's extension (.nii/.nii.gz/.nii.zst); save_nifti picks the
+    # compressor to match. No forced gzip, no uncompressed round-trip.
     output_path = Path(output_path)
-    if str(output_path).endswith(".nii.gz"):
-        temp_path = output_path.parent / (output_path.name[:-7] + ".nii")
-    else:
-        temp_path = output_path.parent / (output_path.stem + ".nii")
-
-    # Save uncompressed first
-    save_nifti(r2_partial_vol.astype(np.float32), output_path=temp_path, affine=affine)
-
-    # Apply AFNI metadata if requested
-    if apply_afni_metadata and shutil.which("3drefit"):
-        try:
-            # Build labels: include mode suffix
-            # "full" mode: "cond1_partialR2" (proportion of total variance)
-            # "task" mode: "cond1_partialR2_task" (proportion of variance after nuisance)
-            suffix = "_partialR2_task" if mode == "task" else "_partialR2"
-            labels = [f"{label}{suffix}" for label in condition_labels]
-
-            # Split into two 3drefit commands to avoid buffer overflow
-            # Command 1: Set labels (write to file to avoid buffer overflow)
-            labels_file = temp_path.parent / f"{temp_path.stem}_labels.txt"
-            with labels_file.open("w") as f:
-                # Write space-separated labels (AFNI format for -relabel_all)
-                f.write(" ".join(labels))
-
-            cmd_relabel = ["3drefit", "-relabel_all", str(labels_file), str(temp_path)]
-
-            # Write relabel command to file for debugging
-            cmd_file_relabel = temp_path.parent / f"{temp_path.stem}_relabel_3drefit_cmd.txt"
-            with cmd_file_relabel.open("w") as f:
-                f.write("# 3drefit command for setting sub-brick labels (partial R²)\n")
-                f.write("# This file is created automatically and can be deleted\n\n")
-                f.write(f"Labels written to: {labels_file}\n\n")
-                f.write("Command as list:\n")
-                f.write(f"{cmd_relabel}\n\n")
-                f.write("Command as shell string:\n")
-                import shlex
-
-                shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_relabel)
-                f.write(f"{shell_cmd}\n")
-
-            # Run relabel command
-            subprocess.run(cmd_relabel, check=True, capture_output=True, text=True)
-
-            # Command 2: Set stat parameters (if available)
-            # Type: fico (Correlation)
-            # Params: SAMPLES FIT-PARAMETERS ORT-PARAMETERS
-            if n_timepoints and n_regressors:
-                cmd_statpar = ["3drefit"]
-                for brick_idx in range(n_conditions):
-                    # Partial R² tests one regressor against all others
-                    # SAMPLES = n_timepoints
-                    # FIT-PARAMETERS = 1 (testing 1 regressor)
-                    # ORT-PARAMETERS = n_regressors - 1 (orthogonalized against others)
-                    cmd_statpar.extend(
-                        [
-                            "-substatpar",
-                            str(brick_idx),
-                            "fico",
-                            str(n_timepoints),
-                            "1",
-                            str(n_regressors - 1),
-                        ]
-                    )
-
-                cmd_statpar.append(str(temp_path))
-
-                # Write statpar command to file for debugging
-                cmd_file_statpar = temp_path.parent / f"{temp_path.stem}_statpar_3drefit_cmd.txt"
-                with cmd_file_statpar.open("w") as f:
-                    f.write("# 3drefit command for setting statistical parameters (partial R²)\n")
-                    f.write("# This file is created automatically and can be deleted\n\n")
-                    f.write("Command as list:\n")
-                    f.write(f"{cmd_statpar}\n\n")
-                    f.write("Command as shell string:\n")
-                    shell_cmd = " ".join(shlex.quote(arg) for arg in cmd_statpar)
-                    f.write(f"{shell_cmd}\n")
-
-                # Run statpar command
-                subprocess.run(cmd_statpar, check=True, capture_output=True, text=True)
-
-        except subprocess.CalledProcessError as e:
-            print(f"  ⚠ Warning: 3drefit failed: {e.stderr}")
-        except Exception as e:
-            print(f"  ⚠ Warning: 3drefit error: {e}")
-
-    # Compress to .nii.gz if requested
-    if str(output_path).endswith(".nii.gz"):
-        from fastfuncstuff.io.afni import compress_nifti
-
-        compress_nifti(temp_path, output_path, remove_original=True)
-        final_path = output_path
-    else:
-        final_path = temp_path
-
-    return final_path
+    save_nifti(
+        r2_partial_vol.astype(np.float32),
+        output_path=output_path,
+        affine=affine,
+        brick_labels=brick_labels_arg,
+        brick_stataux=brick_stataux,
+    )
+    return output_path
 
 
 def save_single_trial_results(
