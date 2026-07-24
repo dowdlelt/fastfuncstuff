@@ -25,6 +25,24 @@ def _opt_help(key: str) -> str:
     return f"(default: {config.DEFAULT_OPTS[key]!r})"
 
 
+def _fmt_suffix(value: str) -> str:
+    """Normalize a user format string to the suffix appended after ``.nii``.
+
+    Filenames are built as ``name.nii$FMT``, so the emitted variable holds only
+    the compression suffix: ``""`` (uncompressed), ``".gz"``, or ``".zst"``.
+    Accepts nii | nii.gz/gz/.gz | nii.zst/.zst/zst/zstd (any case)."""
+    v = value.strip().lower().removeprefix(".").removeprefix("nii").removeprefix(".")
+    if v == "":
+        return ""  # bare "nii" → uncompressed
+    if v == "gz":
+        return ".gz"
+    if v in ("zst", "zstd"):
+        return ".zst"
+    raise argparse.ArgumentTypeError(
+        f"unrecognized format {value!r}; use nii, nii.gz (gz/.gz), or nii.zst (zst/zstd/.zst)"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_autoproc",
@@ -205,6 +223,36 @@ def build_parser() -> argparse.ArgumentParser:
         "a re-run skips runs whose outputs already exist (-batch_skip); pass this "
         "to force every run to re-process. Sets skip_moco=skip_final=0 in the "
         "emitted script (both stay editable there).",
+    )
+
+    g = p.add_argument_group("output format (nii | nii.gz/gz | nii.zst/zst)")
+    g.add_argument(
+        "-format",
+        "-fmt",
+        dest="fmt",
+        type=_fmt_suffix,
+        default=None,
+        metavar="EXT",
+        help=f"compression for working intermediates → FMT (default: nii{config.DEFAULT_FMT}). "
+        "These are read many times, so .zst is fast; use nii.gz for portability.",
+    )
+    g.add_argument(
+        "-final_format",
+        "-final-format",
+        dest="final_fmt",
+        type=_fmt_suffix,
+        default=None,
+        metavar="EXT",
+        help=f"compression for the final timeseries → FINAL_FMT (default: nii{config.DEFAULT_FINAL_FMT}).",
+    )
+    g.add_argument(
+        "-glm_format",
+        "-glm-format",
+        dest="glm_fmt",
+        type=_fmt_suffix,
+        default=None,
+        metavar="EXT",
+        help=f"compression for GLM stat buckets → GLM_FMT (default: nii{config.DEFAULT_GLM_FMT}).",
     )
 
     g = p.add_argument_group("per-stage option overrides (replace the default op string)")
@@ -407,6 +455,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     opt.nordic_save_resid = args.nordic_save_resid  # emitter reads via getattr
     opt.batch_overwrite = args.batch_overwrite
+    # Output formats: keep the Options (config) default unless the user set one.
+    if args.fmt is not None:
+        opt.fmt = args.fmt
+    if args.final_fmt is not None:
+        opt.final_fmt = args.final_fmt
+    if args.glm_fmt is not None:
+        opt.glm_fmt = args.glm_fmt
 
     # Hard preflight: refuse to write a script that wouldn't run first try.
     errors, warnings = preflight(args, opt, anat_path, subject)

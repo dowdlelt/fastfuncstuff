@@ -259,6 +259,27 @@ def test_warpmaster_defines_grid_mask_and_stats():
     assert '[ -f "autobox3_brain.nii.gz" ] ||' not in borrow
 
 
+def test_output_format_flags_map_to_fmt_vars():
+    """-format / -final_format / -glm_format set FMT / FINAL_FMT / GLM_FMT; the
+    normalizer maps friendly spellings to the .nii-suffix."""
+    from fastfuncstuff.cli.autoproc import _fmt_suffix
+
+    assert _fmt_suffix("nii") == ""
+    assert _fmt_suffix("gz") == ".gz" == _fmt_suffix("nii.gz") == _fmt_suffix(".gz")
+    assert _fmt_suffix("zstd") == ".zst" == _fmt_suffix("zst") == _fmt_suffix("nii.zst")
+
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    plan = build_plan(subj, Options(go_to_anat=True, fmt=".gz", final_fmt="", glm_fmt=".zst"))
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert "\nFMT=.gz " in s
+    assert "\nFINAL_FMT= " in s  # uncompressed .nii → empty suffix
+    assert "\nGLM_FMT=.zst " in s
+
+    # Defaults unchanged when the flags are absent.
+    d = write_script(build_plan(subj, Options(go_to_anat=True)), "wd", bids_root="/bids")
+    assert "\nFMT=.zst " in d and "\nFINAL_FMT=.gz " in d and "\nGLM_FMT=.gz " in d
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 def test_emitted_script_is_valid_bash(tmp_path):
     fmap = FmapGroup(

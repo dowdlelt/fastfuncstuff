@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Subject
 
 
@@ -74,6 +75,13 @@ class Options:
     # Batched stages (moco, final resample) skip already-complete runs by default
     # (via each tool's -batch_skip). True forces every run to re-process.
     batch_overwrite: bool = False
+    # Output compression suffixes appended after ``.nii`` (emitted as FMT /
+    # FINAL_FMT / GLM_FMT). "" = uncompressed .nii, ".gz", or ".zst". Working
+    # intermediates default to .zst (read many times); final + GLM to .gz
+    # (portable). See config.DEFAULT_*_FMT.
+    fmt: str = config.DEFAULT_FMT
+    final_fmt: str = config.DEFAULT_FINAL_FMT
+    glm_fmt: str = config.DEFAULT_GLM_FMT
 
     @property
     def has_grand_ref(self) -> bool:

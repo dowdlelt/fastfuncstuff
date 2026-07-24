@@ -254,9 +254,9 @@ set -euo pipefail
 
 OUT={shlex.quote(out_dir)}
 DEVICE={config.DEFAULT_DEVICE}
-FMT={config.DEFAULT_FMT}           # working intermediates (read many times)
-FINAL_FMT={config.DEFAULT_FINAL_FMT}     # final timeseries (portable)
-GLM_FMT={config.DEFAULT_GLM_FMT}
+FMT={opt.fmt}           # working intermediates (read many times); -format
+FINAL_FMT={opt.final_fmt}     # final timeseries (portable); -final_format
+GLM_FMT={opt.glm_fmt}       # GLM stat buckets; -glm_format
 NOISE_VOLS={opt.noise_vols}
 
 mkdir -p "$OUT"; cd "$OUT"
