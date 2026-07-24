@@ -12,7 +12,7 @@ This project is an ongoing experiment - how well can current models port good co
 Python chosen not because of speed, of course, but because I can at least review the code for sanity.
 It also makes installion much easier - sure, pure CUDA/C++ would be faster but what a nightmare...
 These are offered as-is, no guarantees.
-The CLIs have been tested extensively in day-to-day use, and an CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
+I've tested the CLI tools below extensively on real data (my own and some from open neuro), and there is also an (in-progress) CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
 
 The current validation/benchmark data is in `notebooks/ffs_benchmark_showcase.ipynb` - they you can see how well ffs is able to match the reference implementations. 
 
@@ -22,37 +22,38 @@ The current validation/benchmark data is in `notebooks/ffs_benchmark_showcase.ip
 uv, or a conda env + pip will work. There is no conda-forge package; the
 "conda" path means "make the env with conda, then `pip install -e .`".
 
-Python: `>=3.11` is required, **3.13 advised** (latest with broad PyTorch
-wheel coverage). 3.14 should work but is gated on whether your chosen PyTorch
-build has wheels for it.
+Python: `>=3.11` is required, **3.13 is where it started** (latest with broad PyTorch
+wheel coverage). 3.14 also works and may offer slight speed gains. 
 
 ```bash
 git clone https://github.com/dowdlelt/fastfuncstuff.git
 cd fastfuncstuff
 ```
 
-**pip**:
+**conda** (What I used, because I'm used to it):
+
+```bash
+conda create -n ffs python=3.15
+conda activate ffs
+pip install -e .
+```
+
+**pip** (untested):
 
 ```bash
 python3.13 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-**uv**:
+**uv** (untested):
 
 ```bash
-uv venv --python 3.13
+uv venv --python 3.15
 source .venv/bin/activate
 uv pip install -e .
 ```
 
-**conda** (What I used, because I'm used to it):
 
-```bash
-conda create -n ffs python=3.13
-conda activate ffs
-pip install -e .
-```
 
 Add `".[dev]"` instead of `.` for tests + linters.
 
@@ -76,16 +77,24 @@ I want to improve this, so consider that is on the TODO list.
 
 ### File formats
 
-Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstandard) transparently.
+Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstd) transparently.
 ZSTD support also offers another speedup, I tend to work with large files, and compressing and decompressing is a headache. This helps (but reduces compatability).
-Default outputs are `.nii.gz` written with `pigz` when available.
+On a 100 run test dataset, load times were cut in half (every load, twice as fast!), and writes were also sped up.
+Default outputs are `.nii.gz` written with `pigz` when available, for compatability.
 
 ## What I'm very happy with
 
 WIP.
 
+### ffs_autoproc
+Its like afni_proc.py - but a slightly different focus. Here, I wanted a tool that you can point at a BIDS or BIDS-like (BIDS-lite?) dataset, and it will write out the entire processing script. Sure, there are still many many options, but this gets you an entire, editable script very quick. And if you were worried about slow python, I attempt to reduce that by batching - so if 100 runs are going to go through motion correction, we loop, in python (rather than looping over ffs_moco calls). 
+
+Still a WIP, but supports xrun and xses linear and nonlinear alignment, multiple fieldmaps per session, nonlinear motion correction, automatic event file reading, and several other features. 
+
+Intermeidates can use nii.zst for speed, but the GLM can write out nii.gz for compatability. 
+
 ### ffs_nwarp
-One of the things I am most happy with is `ffs_nwarp` which is a near drop in replacment for AFNI's `3dNwarpApply` - produces near identical output, with wsinc5 interp (though permits negative values) but about 50x faster. 
+One of the things I am most happy with is `ffs_nwarp` which is a near drop in replacment for AFNI's `3dNwarpApply` - produces near identical output, with wsinc5 interp (though permits negative values, `-no_neg` to avoid) but about 50x faster. 
 This is particularly noticeable on my slow CPU, even when I use 10 cores. 
 This for example (as of latest test), "just works" 
 ```shell
@@ -97,7 +106,12 @@ ffs_nwarp -interp wsinc5 \
 ```
 What is also very fun is that this supports phase input and you can choose to warp directly (assume phase is unwrapped/interpolatable) or internally convert to real/imag, apply warps, and save phase out from that. This is useful for `ffs_phasereg`, for example. In other words, once you have magnitude processed its very easy to have the phase tag along. 
 
-Also fun is that it supports slice-timing correction at warp time - that is, a full 4D interpolation - apply slice timing as part of the warp process - one single interpolation for both space and time (as in Roche 2011).
+Also *fun* is that it supports slice-timing correction at warp time - that is, a full 4D interpolation - apply slice timing as part of the warp process - one single interpolation for both space and time (as in Roche 2011).
+
+Additional **fun** is `-jac` jacobian modulation at warp time support. This is primarily to support `topup` like fieldmaps - the jacobian modulation only applies to the distortion correction fieldmap - not intermediate, time-varying, in-plane warps. Fortunately, those are small - the fieldmap is where you need it the most. 
+
+### ffs_blipflip - GPU topup-like
+`ffs_blipflip` can produce topup-like fieldmaps and warps that were taking ~15 minutes on 10 cores in about 30 seconds. Writes out field, etc. Currently, no motion correction in loop - optimistically, the person didn't move between forward and reverse?
 
 ### ffs_reml with per-voxel HRFs
 `ffs_reml` can take the output of `ffs_hrfopt` and fit ARMA(1,1) REML using each voxel's best-fitting HRF. Pass `-hrfopt_prefix PREFIX` (the same prefix you gave to `ffs_hrfopt`) and the design is rebuilt per HRF group. Pairs naturally with `-single_trials LABEL`, which rebuilds the design with one regressor per event (GLMsingle-style) and writes chronologically ordered betas.
