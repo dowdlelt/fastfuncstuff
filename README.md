@@ -94,8 +94,10 @@ Still a WIP, but supports xrun and xses linear and nonlinear alignment, multiple
 Intermeidates can use nii.zst for speed, but the GLM can write out nii.gz for compatability. 
 
 ### ffs_nwarp
-One of the things I am most happy with is `ffs_nwarp` which is a near drop in replacment for AFNI's `3dNwarpApply` - produces near identical output, with wsinc5 interp (though permits negative values, `-no_neg` to avoid) but about 50x faster. 
-This is particularly noticeable on my slow CPU, even when I use 10 cores. 
+One of the things I am most happy with is `ffs_nwarp` which is a near drop in replacment for AFNI's `3dNwarpApply` - produces near identical output, with wsinc5 interp (though permits negative values, `-no_neg` to avoid) but about 50x faster. As the world is sometimes kind - it will work with AFNI derived `_WARP` files as well as ANTs warps. (Or calculate your own with `ffs_qwarp` or `ffs_formwarp`).
+
+
+The gains particularly noticeable on my slow CPU, even when I use 10 cores. 
 This for example (as of latest test), "just works" 
 ```shell
 ffs_nwarp -interp wsinc5 \
