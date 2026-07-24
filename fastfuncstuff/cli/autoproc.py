@@ -195,6 +195,18 @@ def build_parser() -> argparse.ArgumentParser:
         "Overrides BIDS-discovered events.",
     )
 
+    g = p.add_argument_group("batching")
+    g.add_argument(
+        "-batch_overwrite",
+        "-batch-overwrite",
+        action="store_true",
+        help="The moco and final-resample stages run one batched process each "
+        "(ffs_moco/ffs_nwarp -batch), amortizing startup over all runs. By default "
+        "a re-run skips runs whose outputs already exist (-batch_skip); pass this "
+        "to force every run to re-process. Sets skip_moco=skip_final=0 in the "
+        "emitted script (both stay editable there).",
+    )
+
     g = p.add_argument_group("per-stage option overrides (replace the default op string)")
     for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp"):
         g.add_argument(f"-{key}_opts", f"-{key}-opts", metavar="STR", help=_opt_help(key))
@@ -394,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         events=args.events,
     )
     opt.nordic_save_resid = args.nordic_save_resid  # emitter reads via getattr
+    opt.batch_overwrite = args.batch_overwrite
 
     # Hard preflight: refuse to write a script that wouldn't run first try.
     errors, warnings = preflight(args, opt, anat_path, subject)
@@ -408,10 +421,12 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = build_plan(subject, opt)
 
-    work_dir = args.work_dir or f"ffs_proc_sub-{subject.subject}.results"
-    script = write_script(plan, work_dir, bids_root=args.bids_dir)
-
+    # Absolute so OUT is pinned to where the user ran ffs_autoproc — moving the
+    # script and running it elsewhere still writes outputs to the intended dir.
+    work_dir = str(Path(args.work_dir or f"ffs_proc_sub-{subject.subject}.results").resolve())
     out_path = Path(args.out or f"proc_sub-{subject.subject}.sh")
+    script = write_script(plan, work_dir, bids_root=args.bids_dir, script_stem=out_path.stem)
+
     out_path.write_text(script)
     out_path.chmod(0o755)
 

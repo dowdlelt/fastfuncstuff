@@ -228,6 +228,12 @@ def _aligned_mean(pr: PlanRun) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _skip_default(opt) -> int:
+    """Default value for the batched stages' skip toggle: 1 (skip complete runs,
+    the resumable default) unless -batch_overwrite forces a full re-process."""
+    return 0 if opt.batch_overwrite else 1
+
+
 def _header(plan: Plan, out_dir: str) -> str:
     opt = plan.options
     return f"""#!/usr/bin/env bash
@@ -256,8 +262,9 @@ NOISE_VOLS={opt.noise_vols}
 mkdir -p "$OUT"; cd "$OUT"
 
 # ---- coarse per-stage re-run toggles (1 = skip stage output if it exists) ---
-skip_nordic=1 skip_moco=1 skip_locomoco=1 skip_blip=1
-skip_xfmap=1  skip_xrun=1 skip_xses=1 skip_anat=1 skip_final=1 skip_stats=1
+# The batched moco + final stages pass their toggle to the tool as -batch_skip.
+skip_nordic=1 skip_moco={_skip_default(opt)} skip_locomoco=1 skip_blip=1
+skip_xfmap=1  skip_xrun=1 skip_xses=1 skip_anat=1 skip_final={_skip_default(opt)} skip_stats=1
 """
 
 
@@ -420,27 +427,35 @@ done
 """
 
 
-def _stage_moco(plan: Plan) -> str:
+def _stage_moco(plan: Plan, script_stem: str) -> str:
+    moco_flags = " ".join(_split_flags(config.DEFAULT_OPTS["moco"]))
+    batchfile = f"{script_stem}_mocobatch.txt"
     return f"""
 # ============================ stage02: motion correction ====================
-# Reads the source series in place (BIDS magnitude, or the NORDIC output) — no
-# full-dataset copy. Saves the target mean + per-volume matrices + motion params;
-# the corrected 4D is produced once by the final single-resample (stage10).
+# Batched: ONE ffs_moco process motion-corrects every run, so the Python/CUDA/
+# torch.compile startup is paid once, not per run. Each run's arguments are
+# appended to {batchfile} (beside the script's outputs) and consumed with -batch.
+# Reads the source series in place (no full-dataset copy). Saves the target mean
+# + per-volume matrices + motion params; the corrected 4D is produced once by the
+# final single-resample (stage10). skip_moco=1 → -batch_skip (skip complete runs).
 echo '== stage02: moco =='
 MOCO_REF={plan.options.moco_ref}   # sbref | first | last | <int>
+mocobatch="{batchfile}"
+: > "$mocobatch"
 for k in "${{RUN_KEYS[@]}}"; do
   mstem="stage02.moco.${{FRAG[$k]}}"
-  [ "$skip_moco" -eq 1 ] && [ -f "${{mstem}}_mean.nii$FMT" ] && continue
 {_raw_source(plan)}
   sb="${{SBREF[$k]:-}}"
   case "$MOCO_REF" in
-    sbref) if [ -n "$sb" ]; then base_arg=(-base "$sb"); else base_arg=(-base 0); fi ;;
-    first) base_arg=(-base 0) ;;
-    last)  nv=$(3dinfo -nv "$raw"); base_arg=(-base $((nv - 1))) ;;
-    *)     base_arg=(-base "$MOCO_REF") ;;   # integer volume index
+    sbref) if [ -n "$sb" ]; then base_str="-base \\"$sb\\""; else base_str="-base 0"; fi ;;
+    first) base_str="-base 0" ;;
+    last)  nv=$(3dinfo -nv "$raw"); base_str="-base $((nv - 1))" ;;
+    *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
-{_ffs("ffs_moco", ['-input "$raw"', '"${base_arg[@]}"', *_split_flags(config.DEFAULT_OPTS["moco"]), '-save_mean "${mstem}_mean.nii$FMT"', '-1Dmatrix_save "${mstem}.aff12.1D"', '-1Dfile "${mstem}.motion.1D"', '-device "$DEVICE"'])}
+  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags} -save_mean \\"${{mstem}}_mean.nii$FMT\\" -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"" >> "$mocobatch"
 done
+batch_skip=(); [ "$skip_moco" -eq 1 ] && batch_skip=(-batch_skip)
+ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
 """
 
 
@@ -1045,42 +1060,37 @@ def _stage_warpmaster(plan: Plan) -> str:
     return "\n".join(out) + "\n"
 
 
-def _stage_final(plan: Plan) -> str:
+def _stage_final(plan: Plan, script_stem: str) -> str:
     opt = plan.options
     if opt.slicetiming_method == "integrate":
         st = (
             '  tp="${JSON[$k]}"; tr="${TR[$k]}"\n'
-            '  if [ -n "$tr" ]; then st_arg=(-tpattern "$tp" -TR "$tr" -tzero 0); else st_arg=(); fi'
+            '  if [ -n "$tr" ]; then st_str="-tpattern \\"$tp\\" -TR \\"$tr\\" -tzero 0"; '
+            'else st_str=""; fi'
         )
     else:
-        st = "  st_arg=()"
-    nwarp_cmd = _ffs(
-        "ffs_nwarp",
-        [
-            '-source "$raw"',
-            '-nwarp "${CHAIN[$k]}"',
-            "-master stage10.warpmaster.nii$FMT",
-            '-dxyz "$FINAL_DXYZ"',
-            *_split_flags(config.DEFAULT_OPTS["nwarp"]),
-            '"${st_arg[@]}"',
-            '-prefix "$outf"',
-            '-device "$DEVICE"',
-        ],
-    )
+        st = '  st_str=""'
+    nwarp_flags = " ".join(_split_flags(config.DEFAULT_OPTS["nwarp"]))
+    batchfile = f"{script_stem}_nwarpbatch.txt"
     return f"""
 # ============================ stage10: compose + resample ===================
-# One interpolation per run applies the whole CHAIN in a single pass. The source
-# is read in place — the NORDIC output, or the original BIDS magnitude (noise
-# vols trimmed inline) — so no raw copy is ever materialised. The chain lands
-# every run on the stage10a warpmaster grid (MASTER/FINAL_DXYZ set there).
+# Batched: ONE ffs_nwarp process resamples every run (startup paid once). Each
+# run's arguments are appended to {batchfile} and consumed with -batch. One
+# interpolation per run applies the whole CHAIN in a single pass; the source is
+# read in place (NORDIC output, or BIDS magnitude with noise vols trimmed inline)
+# so no raw copy is materialised. The chain lands every run on the stage10a
+# warpmaster grid (MASTER/FINAL_DXYZ set there). skip_final=1 → -batch_skip.
 echo '== stage10: final compose + resample =='
+nwarpbatch="{batchfile}"
+: > "$nwarpbatch"
 for k in "${{RUN_KEYS[@]}}"; do
   outf="stage10.final.${{FRAG[$k]}}.nii$FINAL_FMT"
-  [ "$skip_final" -eq 1 ] && [ -f "$outf" ] && continue
 {st}
 {_raw_source(plan)}
-{nwarp_cmd}
+  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -prefix \\"$outf\\"" >> "$nwarpbatch"
 done
+batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
+ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
 echo 'done → stage10.final.*'
 """
 
@@ -1170,8 +1180,18 @@ def _events_args(task: str, prs: list[PlanRun], bids_root: str | None, opt=None)
 # ---------------------------------------------------------------------------
 
 
-def write_script(plan: Plan, out_dir: str, bids_root: str | None = None) -> str:
-    """Assemble the full pipeline script text for ``plan``."""
+def write_script(
+    plan: Plan,
+    out_dir: str,
+    bids_root: str | None = None,
+    script_stem: str = "proc",
+) -> str:
+    """Assemble the full pipeline script text for ``plan``.
+
+    ``script_stem`` is the basename (no extension) of the script being written;
+    the batched moco / final stages name their manifest files after it
+    (``{script_stem}_mocobatch.txt`` / ``_nwarpbatch.txt``) so they sit beside
+    the script's outputs and don't collide across sibling subjects."""
     parts = [
         _header(plan, out_dir),
         _data_arrays(plan),
@@ -1179,7 +1199,7 @@ def write_script(plan: Plan, out_dir: str, bids_root: str | None = None) -> str:
         _stage_phase_stub(plan),
         _stage_nordic(plan),
         _stage_tshift(plan),
-        _stage_moco(plan),
+        _stage_moco(plan, script_stem),
         _stage_locomoco(plan),
         _stage_blip(plan),
         _stage_xfmap(plan),
@@ -1189,7 +1209,7 @@ def write_script(plan: Plan, out_dir: str, bids_root: str | None = None) -> str:
         _stage_xref(plan),
         _stage_anat(plan),
         _stage_warpmaster(plan),
-        _stage_final(plan),
+        _stage_final(plan, script_stem),
         _stage_stats(plan, bids_root),
     ]
     return "\n".join(p for p in parts if p).rstrip() + "\n"

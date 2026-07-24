@@ -16,7 +16,13 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
+from fastfuncstuff.cli_utils import (
+    add_verbose_arg,
+    collect_batch_jobs,
+    parse_prefix,
+    run_batch_jobs,
+    spinner,
+)
 from fastfuncstuff.processing.affine import save_matrix_1D
 from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
@@ -30,6 +36,7 @@ from fastfuncstuff.processing.ffs_moco import (
 )
 from fastfuncstuff.processing.io import (
     derive_mean_output_path,
+    derive_prefixed_output_path,
     load_image,
     save_first_last,
     save_image,
@@ -159,6 +166,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "type it after `ffs_moco`. Repeatable — pass it once per run. Same "
         "semantics as -batch (device chosen once, failures isolated); may be "
         "combined with -batch, in which case manifest-file runs come first.",
+    )
+    io_group.add_argument(
+        "-batch_skip",
+        "-batch-skip",
+        dest="batch_skip",
+        action="store_true",
+        help="In a -batch / -batch_run run, skip any job whose requested outputs "
+        "all already exist on disk (checked from that job's -prefix / -save_mean / "
+        "-1Dfile / -1Dmatrix_save / -dfile / -maxdisp1D / -iterfile / QC flags). "
+        "Lets you re-run a manifest after adding an output to a few jobs and only "
+        "pay for the jobs that actually still need work. A job missing any one of "
+        "its outputs is run in full.",
     )
     io_group.add_argument(
         "-reg_echo",
@@ -866,96 +885,103 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device, verb: int) -> 
         print(f"Total time: {time.time() - t0:.2f}s")
 
 
-def _collect_batch_jobs(args: argparse.Namespace) -> list[tuple[str, str]]:
-    """Gather (label, argv-string) runs from -batch file and/or -batch_run inline.
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output file paths a solo run of ``args`` would write.
 
-    File runs come first, then inline runs, so labels stay stable regardless of
-    which source(s) are used. Exits(1) if a requested source yields nothing.
+    Mirrors the naming in `_run_single_echo` / `_run_multi_echo` and
+    `_save_estimation_outputs` so `-batch_skip` checks exactly what the run
+    produces. Multi-echo per-echo files get their eN_ prefix. Conditional QC /
+    reweight maps are listed on intent: if a runtime guard prevents one (tSNR
+    needs >=2 volumes; reweight maps need a live reweight), the run simply isn't
+    skipped next time — safe, since re-running is cheaper than a wrong skip.
     """
-    jobs: list[tuple[str, str]] = []
+    outs: list[str] = []
+    n_echoes = len(args.input_file or [])
+    echo_tags = [f"e{i + 1}_" for i in range(n_echoes)] if n_echoes > 1 else [""]
 
-    if args.batch is not None:
-        manifest = Path(args.batch)
-        if not manifest.is_file():
-            print(f"Error: -batch file not found: {args.batch}", file=sys.stderr)
-            sys.exit(1)
-        n_before = len(jobs)
-        for lineno, raw in enumerate(manifest.read_text().splitlines(), 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            jobs.append((f"line {lineno}", line))
-        if len(jobs) == n_before:
-            print(f"Error: -batch file has no runs: {args.batch}", file=sys.stderr)
-            sys.exit(1)
+    def _pfx(value: str, tag: str) -> str:
+        return _sibling(value, tag) if tag else value
 
-    for i, raw in enumerate(args.batch_run or [], 1):
-        line = raw.strip()
-        if not line:
-            print(f"Error: -batch_run #{i} is empty.", file=sys.stderr)
-            sys.exit(1)
-        jobs.append((f"run {i}", line))
+    for tag in echo_tags:
+        # Corrected series.
+        if args.prefix is not None:
+            outs.append(parse_prefix(_pfx(args.prefix, tag)).as_file())
+        # Temporal mean of the corrected series.
+        if args.save_mean is not None:
+            if args.save_mean is _MEAN_FROM_PREFIX:
+                if args.prefix is not None:
+                    outs.append(
+                        derive_mean_output_path(parse_prefix(_pfx(args.prefix, tag)).as_file())
+                    )
+            else:
+                outs.append(parse_prefix(_pfx(args.save_mean, tag)).as_file())
+        # QC files — all named after the (per-echo) prefix.
+        if _want_qc(args) and args.prefix is not None:
+            base_file = parse_prefix(_pfx(args.prefix, tag)).as_file()
+            want_plain = bool(args.save_first_last)
+            want_diff = bool(args.save_first_last_diff)
+            if want_plain:
+                outs.append(derive_prefixed_output_path(base_file, "firstlast"))
+            if want_diff:
+                outs.append(derive_prefixed_output_path(base_file, "firstlastdiff"))
+            if args.save_tsnr:
+                outs.append(derive_prefixed_output_path(base_file, "tsnr"))
+            if args.save_initial:
+                if want_plain or not (want_diff or args.save_tsnr):
+                    outs.append(derive_prefixed_output_path(base_file, "firstlast_initial"))
+                if want_diff:
+                    outs.append(derive_prefixed_output_path(base_file, "firstlastdiff_initial"))
+                if args.save_tsnr:
+                    outs.append(derive_prefixed_output_path(base_file, "tsnr_initial"))
 
-    return jobs
+    # Single-instance outputs (once per run, echo-independent).
+    for name in ("1Dfile", "1Dmatrix_save", "dfile", "maxdisp1D", "iterfile"):
+        val = getattr(args, name, None)
+        if val is not None:
+            outs.append(val)
+
+    # Reweight weight/patch maps — only written when reweight actually runs.
+    if args.save_weight is not None and args.reweight:
+        wv = args.prefix if args.save_weight is _WEIGHT_FROM_PREFIX else args.save_weight
+        if wv is not None:
+            pfx = parse_prefix(wv)
+            outs.append(pfx.with_suffix("weight_orig"))
+            outs.append(pfx.with_suffix("weight_reweight"))
+            outs.append(pfx.with_suffix("patches"))
+
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -input, then the usual checks."""
+    if not run_args.input_file:
+        raise ValueError("run has no -input")
+    _validate_run_args(run_args)
 
 
 def _run_batch(args: argparse.Namespace) -> None:
-    """Run every -batch / -batch_run job in this one process.
+    """Run every -batch / -batch_run job in this one process via the shared runner.
 
     The wins over a shell loop are all fixed costs: the Python interpreter, the
     torch/CUDA import, the CUDA context, and — the big one — torch.compile's
     kernel warmup are paid once and reused across runs. The per-file load /
-    estimate / write cost is unchanged. Runs stay isolated: one failure is
-    reported and skipped, and the batch exits nonzero if any run failed.
+    estimate / write cost is unchanged. With -batch_skip, jobs whose outputs all
+    exist are skipped.
     """
-    from tqdm import tqdm
-
-    verb = args.verb
     device = _select_device(args.device)  # chosen once; reused for every run
-
-    jobs = _collect_batch_jobs(args)
-
-    if verb >= 1:
-        print(f"ffs_moco batch: {len(jobs)} runs on device={device}")
-
-    failures: list[tuple[str, str]] = []
-    t0 = time.time()
-    bar = tqdm(jobs, desc="moco batch", unit="run", leave=True, disable=len(jobs) == 1)
-    for label, line in bar:
-        try:
-            run_args = parse_args(shlex.split(line))
-            if run_args.batch is not None or run_args.batch_run is not None:
-                raise ValueError("-batch/-batch_run cannot be nested inside a run")
-            if not run_args.input_file:
-                raise ValueError("run has no -input")
-            if run_args.device and verb >= 1:
-                tqdm.write(
-                    f"[{label}] ignoring per-run -device {run_args.device}; batch uses {device}"
-                )
-            _validate_run_args(run_args)
-            _dispatch_run(run_args, device, run_args.verb)
-        except KeyboardInterrupt:
-            raise
-        except (Exception, SystemExit) as exc:
-            # A bad run must not sink the batch. The underlying error has usually
-            # already gone to stderr; record the run so the summary is actionable.
-            reason = str(exc) if str(exc) not in ("", "1") else exc.__class__.__name__
-            failures.append((label, reason))
-            tqdm.write(f"[{label}] FAILED ({reason}): {line}")
-        finally:
-            # Don't let this run's peak strand VRAM for the next one — the memory
-            # module sizes chunks off *free* VRAM, so stale caches shrink them.
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-    if verb >= 1:
-        ok = len(jobs) - len(failures)
-        print(f"ffs_moco batch done: {ok}/{len(jobs)} succeeded in {time.time() - t0:.2f}s")
-    if failures:
-        print(f"Error: {len(failures)} batch run(s) failed:", file=sys.stderr)
-        for label, reason in failures:
-            print(f"  {label}: {reason}", file=sys.stderr)
-        sys.exit(1)
+    jobs = collect_batch_jobs(args.batch, args.batch_run)
+    run_batch_jobs(
+        tool="ffs_moco",
+        jobs=jobs,
+        device=device,
+        parse_line=lambda line: parse_args(shlex.split(line)),
+        dispatch=lambda run_args, dev: _dispatch_run(run_args, dev, run_args.verb),
+        validate=_validate_batch_run,
+        is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+        expected_outputs=_expected_outputs,
+        skip_existing=args.batch_skip,
+        verb=args.verb,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

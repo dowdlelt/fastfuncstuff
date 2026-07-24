@@ -2409,3 +2409,149 @@ def preflight_check(
             print(err)
         print()
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Shared batch runner
+#
+# ffs_moco and ffs_nwarp both process many datasets per session, so running one
+# process per dataset pays the Python/CUDA/torch.compile startup for every run.
+# A batch mode amortizes those fixed costs across many self-contained runs in a
+# single process. The collection and loop mechanics are identical between tools;
+# only the parse/validate/dispatch/expected-outputs callbacks differ, so they
+# live here and each CLI supplies the callbacks.
+# ---------------------------------------------------------------------------
+
+
+def collect_batch_jobs(
+    batch_file: str | None,
+    batch_run: list[str] | None,
+) -> list[tuple[str, str]]:
+    """Gather ``(label, argv-string)`` runs from a ``-batch`` manifest and/or
+    repeated ``-batch_run`` inline arguments.
+
+    Each argv-string is exactly the arguments one would pass after the tool for
+    that run. Manifest-file runs come first (so labels stay stable regardless of
+    which source is used), then inline runs. Blank lines and ``#`` comments in
+    the manifest are ignored. Exits(1) if a requested source yields nothing.
+    """
+    jobs: list[tuple[str, str]] = []
+
+    if batch_file is not None:
+        manifest = Path(batch_file)
+        if not manifest.is_file():
+            print(f"Error: -batch file not found: {batch_file}", file=sys.stderr)
+            sys.exit(1)
+        n_before = len(jobs)
+        for lineno, raw in enumerate(manifest.read_text().splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            jobs.append((f"line {lineno}", line))
+        if len(jobs) == n_before:
+            print(f"Error: -batch file has no runs: {batch_file}", file=sys.stderr)
+            sys.exit(1)
+
+    for i, raw in enumerate(batch_run or [], 1):
+        line = raw.strip()
+        if not line:
+            print(f"Error: -batch_run #{i} is empty.", file=sys.stderr)
+            sys.exit(1)
+        jobs.append((f"run {i}", line))
+
+    return jobs
+
+
+def run_batch_jobs(
+    *,
+    tool: str,
+    jobs: list[tuple[str, str]],
+    device: torch.device,
+    parse_line,
+    dispatch,
+    validate=None,
+    is_nested=None,
+    expected_outputs=None,
+    skip_existing: bool = False,
+    verb: int = 1,
+) -> None:
+    """Run every collected batch job in this one process, isolating failures.
+
+    The wins over a shell loop are all fixed costs: the Python interpreter, the
+    torch/CUDA import, the CUDA context, and — the big one — torch.compile's
+    kernel warmup are paid once and reused across runs. The per-file work is
+    unchanged. Runs stay isolated: one failure is reported and skipped, and the
+    batch exits nonzero if any run failed.
+
+    Parameters
+    ----------
+    tool : str
+        Tool name for messages (e.g. ``"ffs_moco"``).
+    jobs : list of (label, argv-string)
+        From :func:`collect_batch_jobs`.
+    device : torch.device
+        Chosen once for the whole batch; reused by every run.
+    parse_line : callable(str) -> Namespace
+        Parse one argv-string into args (typically ``lambda s: parse_args(shlex.split(s))``).
+    dispatch : callable(Namespace, torch.device) -> None
+        Execute one run.
+    validate : callable(Namespace) -> None, optional
+        Extra per-run validation; raise/``SystemExit`` on a bad request.
+    is_nested : callable(Namespace) -> bool, optional
+        True when a run line itself re-requests ``-batch`` (rejected to avoid
+        nesting).
+    expected_outputs : callable(Namespace) -> list[str], optional
+        Concrete output paths the run would write; required for ``skip_existing``.
+    skip_existing : bool
+        When True, a run whose ``expected_outputs`` all already exist is skipped.
+    """
+    import os
+
+    from tqdm import tqdm
+
+    if verb >= 1:
+        print(f"{tool} batch: {len(jobs)} runs on device={device}")
+
+    failures: list[tuple[str, str]] = []
+    skipped = 0
+    t0 = time.time()
+    desc = f"{tool.removeprefix('ffs_')} batch"
+    bar = tqdm(jobs, desc=desc, unit="run", leave=True, disable=len(jobs) == 1)
+    for label, line in bar:
+        try:
+            run_args = parse_line(line)
+            if is_nested is not None and is_nested(run_args):
+                raise ValueError("-batch/-batch_run cannot be nested inside a run")
+            if validate is not None:
+                validate(run_args)
+            if skip_existing and expected_outputs is not None:
+                outs = expected_outputs(run_args)
+                if outs and all(os.path.exists(p) for p in outs):
+                    skipped += 1
+                    if verb >= 1:
+                        tqdm.write(f"[{label}] skip: all {len(outs)} output(s) exist")
+                    continue
+            dispatch(run_args, device)
+        except KeyboardInterrupt:
+            raise
+        except (Exception, SystemExit) as exc:
+            # A bad run must not sink the batch. The underlying error has usually
+            # already gone to stderr; record the run so the summary is actionable.
+            reason = str(exc) if str(exc) not in ("", "1") else exc.__class__.__name__
+            failures.append((label, reason))
+            tqdm.write(f"[{label}] FAILED ({reason}): {line}")
+        finally:
+            # Don't let this run's peak strand VRAM for the next one — the memory
+            # module sizes chunks off *free* VRAM, so stale caches shrink them.
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if verb >= 1:
+        ok = len(jobs) - len(failures) - skipped
+        tail = f", {skipped} skipped" if skipped else ""
+        print(f"{tool} batch done: {ok}/{len(jobs)} succeeded{tail} in {time.time() - t0:.2f}s")
+    if failures:
+        print(f"Error: {len(failures)} batch run(s) failed:", file=sys.stderr)
+        for label, reason in failures:
+            print(f"  {label}: {reason}", file=sys.stderr)
+        sys.exit(1)

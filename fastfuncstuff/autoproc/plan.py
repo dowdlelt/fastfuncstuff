@@ -71,6 +71,9 @@ class Options:
     ref_file: str | None = None
     ref_transforms: list[str] | None = None
     ref_anat: str | None = None
+    # Batched stages (moco, final resample) skip already-complete runs by default
+    # (via each tool's -batch_skip). True forces every run to re-process.
+    batch_overwrite: bool = False
 
     @property
     def has_grand_ref(self) -> bool:

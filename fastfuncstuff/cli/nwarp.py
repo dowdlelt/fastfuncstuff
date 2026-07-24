@@ -11,12 +11,19 @@ Equivalent to AFNI's 3dNwarpApply but with GPU acceleration and wsinc5 interpola
 from __future__ import annotations
 
 import argparse
+import shlex
+import sys
 import time
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
-from fastfuncstuff.processing.nwarpforge import nwarpforge, parse_nwarp_string
+from fastfuncstuff.cli_utils import add_verbose_arg, collect_batch_jobs, run_batch_jobs
+from fastfuncstuff.processing.io import derive_mean_output_path, derive_prefixed_output_path
+from fastfuncstuff.processing.nwarpforge import (
+    derive_phase_output_path,
+    nwarpforge,
+    parse_nwarp_string,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,7 +63,45 @@ Examples:
 
     io_group = parser.add_argument_group("Input/Output")
     io_group.add_argument(
-        "-source", required=True, help="Source (magnitude) dataset to warp (3D or 4D NIfTI)"
+        "-source",
+        default=None,
+        help="Source (magnitude) dataset to warp (3D or 4D NIfTI) [required unless -batch]",
+    )
+    io_group.add_argument(
+        "-batch",
+        default=None,
+        metavar="FILE",
+        help="Run many self-contained warp applies in one process, amortizing "
+        "Python/CUDA startup and torch.compile warmup. FILE is a manifest with "
+        "one run per line; each line is exactly the arguments you would pass "
+        "after `ffs_nwarp` for that run (e.g. `-source a.nii -nwarp warp.nii "
+        "-master m.nii -prefix a_w.nii`). Blank lines and lines starting with # "
+        "are ignored. The device is chosen once for the whole batch; a per-line "
+        "-device is ignored. One failing run is reported and skipped without "
+        "sinking the rest; the batch exits nonzero if any run failed.",
+    )
+    io_group.add_argument(
+        "-batch_run",
+        "-batch-run",
+        dest="batch_run",
+        action="append",
+        metavar="ARGS",
+        help="Inline alternative to -batch for self-contained scripts: one run "
+        'given as a single quoted argument string (e.g. -batch_run "-source '
+        'a.nii -nwarp warp.nii -prefix a_w.nii"), exactly as you would type it '
+        "after `ffs_nwarp`. Repeatable — pass it once per run. Same semantics as "
+        "-batch (device chosen once, failures isolated); may be combined with "
+        "-batch, in which case manifest-file runs come first.",
+    )
+    io_group.add_argument(
+        "-batch_skip",
+        "-batch-skip",
+        dest="batch_skip",
+        action="store_true",
+        help="In a -batch / -batch_run run, skip any job whose requested outputs "
+        "all already exist on disk (checked from that job's -prefix / -phase_prefix "
+        "/ -save_mean / -save_first_last). Lets you re-run a manifest and only pay "
+        "for jobs that still need work. A job missing any one output is run in full.",
     )
     io_group.add_argument(
         "-phase",
@@ -68,11 +113,14 @@ Examples:
     )
     io_group.add_argument(
         "-nwarp",
-        required=True,
-        help="Warp chain (quoted, space-separated). E.g., 'warp1.nii matrix.1D warp2.nii'",
+        default=None,
+        help="Warp chain (quoted, space-separated). E.g., 'warp1.nii matrix.1D warp2.nii' "
+        "[required unless -batch]",
     )
     io_group.add_argument(
-        "-prefix", required=True, help="Output path for magnitude (or only output)"
+        "-prefix",
+        default=None,
+        help="Output path for magnitude (or only output) [required unless -batch]",
     )
     io_group.add_argument(
         "-phase_prefix",
@@ -274,18 +322,77 @@ Examples:
     return parser.parse_args(argv)
 
 
+def _select_device(device_arg: str | None) -> torch.device:
+    """Resolve -device (explicit wins, else cuda → mps → cpu)."""
+    if device_arg:
+        return torch.device(device_arg)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output file paths a solo run of ``args`` would write, for
+    -batch_skip. -prefix is used verbatim (nwarp does not run it through
+    parse_prefix). The phase output, mean, and first/last files are listed on
+    intent; a mean/first-last that a 3-D output skips just means the run isn't
+    skipped next time (safe)."""
+    outs: list[str] = [args.prefix]
+    if args.phase:
+        outs.append(args.phase_prefix or derive_phase_output_path(args.prefix))
+    if args.save_mean:
+        outs.append(derive_mean_output_path(args.prefix))
+    if args.save_first_last:
+        outs.append(derive_prefixed_output_path(args.prefix, "firstlast"))
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -source/-nwarp/-prefix."""
+    missing = [f for f in ("source", "nwarp", "prefix") if getattr(run_args, f, None) is None]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    if args.batch is not None or args.batch_run:
+        device = _select_device(args.device)
+        jobs = collect_batch_jobs(args.batch, args.batch_run)
+        run_batch_jobs(
+            tool="ffs_nwarp",
+            jobs=jobs,
+            device=device,
+            parse_line=lambda line: parse_args(shlex.split(line)),
+            dispatch=_dispatch_run,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+            verb=args.verb,
+        )
+        return
 
+    missing = [f for f in ("source", "nwarp", "prefix") if getattr(args, f, None) is None]
+    if missing:
+        print(
+            "Error: " + ", ".join("-" + m for m in missing) + " required "
+            "(or use -batch FILE / -batch_run ARGS).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _dispatch_run(args, _select_device(args.device))
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
+    """Apply one self-contained warp chain (the entire per-run body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
     verb = args.verb
     if verb >= 1:
         print(f"ffs_nwarp: device={device}")
