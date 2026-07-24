@@ -159,13 +159,13 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 
 | command | description |
 |---|---|
-| `ffs_hrfopt` | Per-voxel HRF library selection (as in GLMsingle; Prince et al. 2022). Tests each HRF in a library by LORO CV; refits with the winner. Canonical or PIGHS libraries. |
+| `ffs_hrfopt` | Per-voxel HRF library selection (as in GLMsingle; Prince et al. 2022). Tests each HRF in a library by LORO CV; refits with the winner. Canonical or PIGHS libraries. No requirement for TR-locking or identical event durations. |
 | `ffs_librarian` | Derive a custom HRF library from a subject's own data, for use with `ffs_hrfopt` (cf. the NSD library; Allen et al. 2022). |
 | `ffs_fitbasis` | Constrained basis-set HRF fits (SPMG1/2/3, FLOBS; Woolrich, Behrens & Smith 2004). |
-| `ffs_denoise` | GLMdenoise-style noise-PC denoising (Kay et al. 2013). Identifies a noise pool, extracts PCs, picks the count by LORO CV. |
+| `ffs_denoise` | GLMdenoise-style noise-PC denoising (Kay et al. 2013). Identifies a noise pool, extracts PCs, picks the count by LORO CV. Again, no requirement of TR locking or identical durations. |
 | `ffs_denoisatorial` | Exhaustive 2^k subset evaluation of noise PCs, when you want the best non-contiguous combination rather than a prefix. |
 | `ffs_phasereg` | Magnitude-on-phase Deming regression for macrovascular BOLD suppression (Menon 2002, Curtis 2014, Stanley 2021; phaseprep parity). |
-| `ffs_nordic` | NORDIC-style patch-SVD denoising (Moeller et al. 2021). Magnitude-only or complex (mag + phase), with optional g-factor map. |
+| `ffs_nordic` | NORDIC-style patch-SVD denoising (Moeller et al. 2021). Magnitude-only or complex (mag + phase), with optional g-factor map. Will write out number of components removed - use with `ffs_util_adjustdof` to convert T-stats to Z-stats, accounting for DoF loss _voxelwise_. |
 | `ffs_sauna` *(beta)*  | NORDIC-adjacent denoiser. g-factor from trailing noise volumes + Gavish–Donoho optimal singular-value shrinkage. VERY experimental, was an exploration, not vetted (but produces very similar timeseries) |
 
 ### Decomposition
@@ -186,7 +186,7 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 | `ffs_qwarp` | Iterative nonlinear warp estimation (`3dQwarp`-style). |
 | `ffs_formwarp` | SyN nonlinear registration (ANTs-style symmetric normalization; Avants et al. 2008); an alternative backend to `ffs_qwarp`. Single-pair or per-volume timeseries; writes `ffs_nwarp`-compatible warps. |
 | `ffs_nwarp` | Apply a warp to a volume or 4D timeseries. Supports complex (mag + phase) warping. Optional joint slice-timing correction (`-tpattern`, Roche 2011 space-time) folds slice timing into the same resample; tissue-following by default (`-frozen` for the slow-motion-assumption path). |
-| `ffs_medic` | Multi-echo distortion correction (MEDIC; Van et al. 2026): frame-wise B0 field maps from phase, for dynamic distortion under motion. GPU application for speed. |
+| `ffs_medic` | Multi-echo distortion correction (MEDIC; Van et al. 2026): frame-wise B0 field maps from phase, for dynamic distortion under motion. GPU application for speed. We wrap the higly effective warpkit tool, with GPU applying warps for speed. 5d warps are saved and can be used with `ffs_nwarp` |
 | `ffs_slicetime` | Slice-timing correction (`3dTshift`-style), Fourier or sinc. |
 | `ffs_t2smap` | Multi-echo T2*/S0 estimation and optimal echo combination (Posse et al. 1999). |
 | `ffs_motsim` | Motion-simulation nuisance regressors (Patriat, Reynolds & Birn 2017). |
@@ -264,7 +264,7 @@ Frank efficiency). See `docs/` for details.
 
 ## Status
 
-Active, single (agent assisted) author, very much a research codebase. 
+Active, single (agent assisted, more honestly just...agent with human sanity checks) author, very much a research codebase. 
 
 ## License
 
