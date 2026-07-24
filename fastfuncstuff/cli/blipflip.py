@@ -215,6 +215,36 @@ def create_parser() -> argparse.ArgumentParser:
         help="Interpolation used when baking the estimated rigid transform into the data.",
     )
 
+    fold = parser.add_argument_group("Anti-fold barrier (keeps the field diffeomorphic)")
+    fold.add_argument(
+        "-jac_penalty",
+        "-jac-penalty",
+        type=float,
+        default=1e-3,
+        help="Weight of the anti-fold barrier that forbids a negative Jacobian (a fold is "
+        "physically impossible for a real blip pair). Relative to the data SSD, like -lambda. "
+        "Set 0 to disable. Default reaches a positive min-Jacobian while changing the field "
+        "only ~3 Hz (below the float32/64 noise floor).",
+    )
+    fold.add_argument(
+        "-jac_floor",
+        "-jac-floor",
+        type=float,
+        default=0.1,
+        help="Jacobian margin: the barrier keeps the Jacobian in [floor, 2-floor].",
+    )
+    fold.add_argument(
+        "-no_antifold",
+        action="store_true",
+        help="Disable the anti-fold barrier entirely (equivalent to -jac_penalty 0).",
+    )
+    fold.add_argument(
+        "-reject_folds",
+        action="store_true",
+        help="Additionally veto any line-search step that introduces a fold. Off by default: "
+        "it perturbs the field far more than the barrier for no extra fold removal.",
+    )
+
     misc = parser.add_argument_group("Misc")
     misc.add_argument(
         "-precision",
@@ -374,6 +404,9 @@ def main(argv: list[str] | None = None) -> int:
         cfg.subsamp = args.subsamp
     cfg.reg_mode = args.reg_mode
     cfg.ssqlambda = not args.no_ssqlambda
+    cfg.jac_penalty = 0.0 if args.no_antifold else args.jac_penalty
+    cfg.jac_floor = args.jac_floor
+    cfg.reject_folds = args.reject_folds
 
     if args.verb >= 1:
         print(
@@ -469,11 +502,15 @@ def main(argv: list[str] | None = None) -> int:
     jac = T._jacobian_pe(disp_forward, pe_tdim)
     neg_frac = float((jac < 0).float().mean())
     if neg_frac > 0 and args.verb >= 0:
+        hint = (
+            "raise -jac_penalty (anti-fold barrier)"
+            if not args.no_antifold
+            else "drop -no_antifold to enable the anti-fold barrier"
+        )
         print(
             f"  WARNING: Jacobian is negative in {100 * neg_frac:.3f}% of voxels "
             f"(min {float(jac.min()):.2f}) -- the warp folds there (non-diffeomorphic); "
-            "expect intensity streaks. Consider a coarser config (default b02b0 / "
-            "-workhard) if this fraction is large."
+            f"expect intensity streaks. A real blip pair cannot fold, so {hint}."
         )
     if not args.no_jac:
         _save_zyx(f"{stem}_jac{ext}", jac, affine)

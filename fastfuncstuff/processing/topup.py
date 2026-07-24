@@ -149,6 +149,28 @@ class TopupConfig:
     analytic_gn: bool = True
     """Use the analytic Gauss-Newton matvec (fast). ``False`` = reverse-mode autodiff."""
 
+    jac_penalty: float = 1e-3
+    """Anti-fold barrier weight (relative to the data SSD, like ``lam``). ``0`` disables.
+
+    A shared blip-up/down field maps ``y -> y + d(y)`` along PE for one polarity and
+    ``y - d(y)`` for the other, so BOTH are invertible only where ``|d d/d pe| < 1`` — a
+    negative Jacobian is physically impossible for a real pair. FSL topup and AFNI don't
+    hard-enforce this, so a steep-field region can overfit into a small fold. This adds a
+    one-sided barrier residual ``sqrt(penalty*ssd)*relu(|d d/d pe| - (1 - jac_floor))``
+    that is exactly zero wherever the warp is safely diffeomorphic (so it cannot perturb
+    the field there) and only pushes back at an incipient fold. See ``topup.md``."""
+
+    jac_floor: float = 0.1
+    """Jacobian margin ``delta``: the barrier keeps ``jac`` in ``[delta, 2-delta]``."""
+
+    reject_folds: bool = False
+    """Also veto any line-search step that introduces/worsens a fold. **Off by default.**
+
+    Measured on real data it removed no additional folds (the barrier already reaches a
+    positive min-Jacobian) but perturbed the field ~4x more (13 vs 3 Hz RMS) by rejecting
+    good Gauss-Newton steps into worse minima — a blunt instrument next to the local
+    barrier. Kept only as a hard belt-and-suspenders guarantee for pathological cases."""
+
     def n_levels(self) -> int:
         return len(self.warpres)
 
@@ -583,6 +605,48 @@ def reg_residual_adjoint(u: Tensor, shape: tuple[int, int, int], reg_mode: str) 
 
 
 # ----------------------------------------------------------------------------
+# Anti-fold barrier on the PE-gradient (keeps the shared field diffeomorphic)
+# ----------------------------------------------------------------------------
+def _fold_barrier_specs(scans: list[ScanSpec]) -> list[tuple[int, float]]:
+    """Per PE tensor-dim, the tightest ``|readout|`` among scans on that axis.
+
+    The fold condition ``|readout * d field/d pe| >= 1`` is scan-specific only through
+    ``|readout|`` and the PE axis (the polarity sign does not change the magnitude), so one
+    barrier block per PE axis — at its largest ``|readout|`` — covers every scan.
+    """
+    per_axis: dict[int, float] = {}
+    for sc in scans:
+        td = _NIFTI_AXIS_TO_TDIM[sc.pe_axis]
+        per_axis[td] = max(per_axis.get(td, 0.0), abs(sc.readout))
+    return sorted(per_axis.items())
+
+
+def _fold_barrier_rows(
+    field_hz: Tensor, scans: list[ScanSpec], barrier_eff: float, jac_floor: float
+) -> list[Tensor]:
+    """One-sided PE-gradient barrier rows ``sqrt(barrier_eff)*relu(|d d/d pe| - (1-floor))``.
+
+    Zero wherever the warp is safely diffeomorphic; nonzero only at an incipient fold.
+    """
+    c = 1.0 - jac_floor
+    sm = math.sqrt(barrier_eff)
+    rows: list[Tensor] = []
+    for td, a in _fold_barrier_specs(scans):
+        g = a * _central_diff_pe(field_hz, td)  # = d(disp)/d(pe)
+        rows.append(sm * torch.relu(g.abs() - c).reshape(-1))
+    return rows
+
+
+def _min_jacobian(field_hz: Tensor, specs: list[tuple[int, float]]) -> float:
+    """Worst (most negative) PE Jacobian ``1 - max|readout * d field/d pe|`` over axes."""
+    m = 1.0
+    for td, a in specs:
+        g = a * _central_diff_pe(field_hz, td)
+        m = min(m, 1.0 - float(g.abs().max()))
+    return m
+
+
+# ----------------------------------------------------------------------------
 # Gauss-Newton least-squares solver (one level)
 # ----------------------------------------------------------------------------
 def _residual_vector(
@@ -593,8 +657,10 @@ def _residual_vector(
     n_scans_minus_1: int,
     lam_eff: float,
     reg_mode: str,
+    barrier_eff: float = 0.0,
+    jac_floor: float = 0.1,
 ) -> Tensor:
-    """Full residual: masked data rows (scaled) followed by sqrt(lam) reg rows."""
+    """Full residual: masked data rows, then sqrt(lam) reg rows, then anti-fold rows."""
     field_hz = basis.field(coeff)
     modulated: list[Tensor] = []
     for sc in scans:
@@ -609,6 +675,8 @@ def _residual_vector(
     rows = data_rows
     if lam_eff > 0:
         rows = rows + [math.sqrt(lam_eff) * reg_residual(field_hz, reg_mode)]
+    if barrier_eff > 0:
+        rows = rows + _fold_barrier_rows(field_hz, scans, barrier_eff, jac_floor)
     return torch.cat(rows)
 
 
@@ -700,6 +768,10 @@ class _Linearization:
     pe_tdim: list[int]
     P: list[Tensor]
     Q: list[Tensor]
+    # Anti-fold barrier linearisation: per PE axis, the coefficient field ``B`` and tensor
+    # dim such that ``d r_barrier = B * D_pe(dfield)`` (empty when the barrier is off).
+    barrier_b: list[Tensor] = _dc_field(default_factory=list)
+    barrier_tdim: list[int] = _dc_field(default_factory=list)
 
 
 def _linearize(
@@ -710,6 +782,8 @@ def _linearize(
     n_scans_minus_1: int,
     lam_eff: float,
     reg_mode: str,
+    barrier_eff: float = 0.0,
+    jac_floor: float = 0.1,
 ) -> _Linearization:
     """Precompute the per-scan slope/Jacobian maps for the analytic GN matvec."""
     field0 = basis.field(coeff)
@@ -728,6 +802,18 @@ def _linearize(
         tdims.append(pe_tdim)
         P.append(slope * jac)
         Q.append(res)
+    # Barrier linearisation: r_b = sm*relu(|g|-c), g = a*D_pe(field) => dr_b = B*D_pe(dfield)
+    # with B = sm*a*sign(g)*[|g|>c] (zero off the active fold set, so it never perturbs the
+    # field where the warp is already safe).
+    barrier_b: list[Tensor] = []
+    barrier_tdim: list[int] = []
+    if barrier_eff > 0:
+        c = 1.0 - jac_floor
+        sm = math.sqrt(barrier_eff)
+        for td, a_ax in _fold_barrier_specs(scans):
+            g = a_ax * _central_diff_pe(field0, td)
+            barrier_b.append((sm * a_ax) * (g.abs() > c).to(field0.dtype) * g.sign())
+            barrier_tdim.append(td)
     return _Linearization(
         basis=basis,
         shape=tuple(field0.shape),  # type: ignore[arg-type]
@@ -739,6 +825,8 @@ def _linearize(
         pe_tdim=tdims,
         P=P,
         Q=Q,
+        barrier_b=barrier_b,
+        barrier_tdim=barrier_tdim,
     )
 
 
@@ -753,6 +841,8 @@ def _lin_jv(lin: _Linearization, dc: Tensor) -> Tensor:
     rows = [(dm - dmean).reshape(-1)[lin.mask_idx] * lin.scale for dm in dms]
     if lin.lam_eff > 0:
         rows.append(math.sqrt(lin.lam_eff) * reg_residual(dfield, lin.reg_mode))
+    for B, td in zip(lin.barrier_b, lin.barrier_tdim, strict=True):
+        rows.append((B * _central_diff_pe(dfield, td)).reshape(-1))
     return torch.cat(rows)
 
 
@@ -776,11 +866,18 @@ def _lin_jtu(lin: _Linearization, u: Tensor) -> Tensor:
         gfield = gfield + lin.a[s] * (
             lin.P[s] * w + _central_diff_pe_adjoint(lin.Q[s] * w, lin.pe_tdim[s])
         )
+    off = n_scans * nmask
     if lin.lam_eff > 0:
-        ureg = u[n_scans * nmask :]
+        reg_k = 3 if lin.reg_mode == "membrane" else 6
+        ureg = u[off : off + reg_k * numel]
         gfield = gfield + math.sqrt(lin.lam_eff) * reg_residual_adjoint(
             ureg, lin.shape, lin.reg_mode
         )
+        off += reg_k * numel
+    # Barrier adjoint: J v_b = B ⊙ D_pe(dfield) => J^T u_b = D_pe^T(B ⊙ u_b).
+    for i, (B, td) in enumerate(zip(lin.barrier_b, lin.barrier_tdim, strict=True)):
+        ub = u[off + i * numel : off + (i + 1) * numel].reshape(lin.shape)
+        gfield = gfield + _central_diff_pe_adjoint(B * ub, td)
     return lin.basis.field_adjoint(gfield).reshape(-1)
 
 
@@ -794,6 +891,8 @@ def _gn_direction_analytic(
     reg_mode: str,
     cg_iters: int,
     cg_tol: float,
+    barrier_eff: float = 0.0,
+    jac_floor: float = 0.1,
 ) -> tuple[Tensor, float]:
     """Analytic Gauss-Newton step: same math as :func:`_gn_direction`, no autograd.
 
@@ -802,9 +901,13 @@ def _gn_direction_analytic(
     finite-difference adjoints — eliminating the gather-backward that dominated the
     autograd path. Precision-neutral: it evaluates the identical ``J^T J`` operator.
     """
-    r0 = _residual_vector(coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode)
+    r0 = _residual_vector(
+        coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
+    )
     cost = float(_dot64(r0, r0))
-    lin = _linearize(coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode)
+    lin = _linearize(
+        coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
+    )
 
     def matvec(v: Tensor) -> Tensor:
         jv = _lin_jv(lin, v.reshape(coeff.shape))
@@ -829,6 +932,9 @@ def gn_solve_level(
     progress: bool = False,
     desc: str = "GN",
     analytic: bool = True,
+    jac_penalty: float = 0.0,
+    jac_floor: float = 0.1,
+    reject_folds: bool = True,
 ) -> tuple[Tensor, float]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
@@ -838,17 +944,24 @@ def gn_solve_level(
     gather-scatter. Set ``analytic=False`` to use the reverse-mode-autodiff matvec
     (``J v`` via double-backward through ``J^T w``); the two evaluate the identical
     operator and are kept in sync by ``tests/test_topup.py``. A backtracking,
-    step-rejecting line search guards every step. Returns ``(coefficients, cost)``.
+    step-rejecting line search guards every step. ``jac_penalty > 0`` adds the anti-fold
+    barrier (weight relative to the data SSD, like ``lam``); ``reject_folds`` additionally
+    vetoes any accepted step that introduces/worsens a negative Jacobian. Returns
+    ``(coefficients, cost)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
     n_sm1 = max(1, len(scans) - 1)
     coeff = coeff.clone()
+    barrier_specs = _fold_barrier_specs(scans) if jac_penalty > 0 else []
+    guard = reject_folds and jac_penalty > 0
 
-    def residual(c: Tensor, lam_eff: float) -> Tensor:
-        return _residual_vector(c, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode)
+    def residual(c: Tensor, lam_eff: float, barrier_eff: float = 0.0) -> Tensor:
+        return _residual_vector(
+            c, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
+        )
 
     def data_ssd(c: Tensor) -> float:
-        r = residual(c, 0.0)
+        r = residual(c, 0.0, 0.0)  # data term only — never scaled by the barrier/reg
         return float(_dot64(r, r))
 
     bar = _bar(
@@ -861,23 +974,48 @@ def gn_solve_level(
     prev_cost = None
     last_cost = float("nan")
     for _it in range(max_iter):
-        lam_eff = lam * data_ssd(coeff) if ssqlambda else lam
+        # ssq-scale both the smoothness (lam) and anti-fold (jac_penalty) weights by the
+        # current data SSD so they are invariant to intensity scale and image size.
+        dssd = data_ssd(coeff) if (ssqlambda and (lam > 0 or jac_penalty > 0)) else 1.0
+        lam_eff = lam * dssd if ssqlambda else lam
+        barrier_eff = (jac_penalty * dssd if ssqlambda else jac_penalty) if jac_penalty > 0 else 0.0
         if analytic:
             delta, cost = _gn_direction_analytic(
-                coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, cg_iters, cg_tol
+                coeff,
+                basis,
+                scans,
+                mask_idx,
+                n_sm1,
+                lam_eff,
+                reg_mode,
+                cg_iters,
+                cg_tol,
+                barrier_eff,
+                jac_floor,
             )
         else:
-            delta, cost = _gn_direction(coeff, residual, lam_eff, cg_iters, cg_tol)
+            delta, cost = _gn_direction(
+                coeff,
+                lambda c, le, be=barrier_eff: residual(c, le, be),
+                lam_eff,
+                cg_iters,
+                cg_tol,
+            )
 
-        # Backtracking line search; reject any step that does not reduce the cost.
+        cur_min_jac = _min_jacobian(basis.field(coeff), barrier_specs) if guard else 1.0
+        # Backtracking line search; reject any step that does not reduce the cost, and (with
+        # the guard) any that would create/deepen a fold the current field does not have.
         step = 1.0
         accepted = False
         new_cost = cost
         for _ in range(12):
             trial = coeff + (step * delta).reshape(coeff.shape)
-            r_new = residual(trial, lam_eff)
+            r_new = residual(trial, lam_eff, barrier_eff)
             new_cost = float(_dot64(r_new, r_new))
-            if new_cost < cost:
+            folds = guard and _min_jacobian(basis.field(trial), barrier_specs) < min(
+                0.0, cur_min_jac
+            )
+            if new_cost < cost and not folds:
                 coeff = trial
                 accepted = True
                 break
@@ -1215,6 +1353,9 @@ def run_topup(
             progress,
             desc=f"L{lvl + 1}/{n_lev} {wr}mm",
             analytic=config.analytic_gn,
+            jac_penalty=config.jac_penalty,
+            jac_floor=config.jac_floor,
+            reject_folds=config.reject_folds,
         )
         level_bar.update(1)
         level_bar.set_postfix_str(

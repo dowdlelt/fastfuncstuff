@@ -138,6 +138,89 @@ def test_analytic_jacobian_adjoint_identity():
     assert torch.allclose(lhs, rhs, rtol=1e-8, atol=1e-8), (lhs.item(), rhs.item())
 
 
+def test_antifold_barrier_operator_matches_autograd():
+    # With the anti-fold barrier ON, the analytic J / J^T / J^T r must still equal the
+    # reverse-mode-autodiff operator to ~machine precision, and satisfy the adjoint identity.
+    # A large penalty makes the relu active so the barrier rows are exercised.
+    torch.manual_seed(5)
+    basis, scans, mask_idx, coeff = _small_gn_setup()
+    be, jf = 5.0, 0.1
+
+    lin = T._linearize(coeff, basis, scans, mask_idx, 1, 1e-3, "bending", be, jf)
+    assert lin.barrier_b, "barrier linearisation should be populated"
+    v = torch.randn(basis.coeff_shape, dtype=torch.float64)
+    jv = T._lin_jv(lin, v)
+    u = torch.randn_like(jv)
+    lhs = torch.dot(jv.reshape(-1), u.reshape(-1))
+    rhs = torch.dot(v.reshape(-1), T._lin_jtu(lin, u).reshape(-1))
+    assert torch.allclose(lhs, rhs, rtol=1e-9, atol=1e-9), "barrier adjoint identity"
+
+    c = coeff.detach().requires_grad_(True)
+    r0 = T._residual_vector(c, basis, scans, mask_idx, 1, 1e-3, "bending", be, jf)
+    w = torch.zeros_like(r0, requires_grad=True)
+    (jtw,) = torch.autograd.grad(r0, c, grad_outputs=w, create_graph=True, retain_graph=True)
+    jv_auto = torch.autograd.grad(jtw, w, grad_outputs=v, retain_graph=True)[0]
+    assert (jv - jv_auto).norm() < 1e-9 * jv_auto.norm(), "J v mismatch (barrier)"
+    g_auto = torch.autograd.grad(r0, c, grad_outputs=r0.detach(), retain_graph=True)[0].reshape(-1)
+    g_an = T._lin_jtu(lin, r0)
+    assert (g_an - g_auto).norm() < 1e-9 * g_auto.norm(), "J^T r mismatch (barrier)"
+
+
+def _make_folding_pair():
+    """Textured volume + a steep localized field that makes the unconstrained fit fold."""
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+
+    torch.manual_seed(0)
+    nz, ny, nx = 20, 40, 40
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(nz).float(), torch.arange(ny).float(), torch.arange(nx).float(), indexing="ij"
+    )
+    mask = (((zz - nz / 2) / 8) ** 2 + ((yy - ny / 2) / 16) ** 2 + ((xx - nx / 2) / 16) ** 2) < 1.0
+    t = _separable_smooth_3d(torch.randn(nz, ny, nx), 1.0)
+    t = t - t.min()
+    true = (t / t.max() * 100.0 + 10.0) * mask.float()
+    field = 11.0 * torch.exp(
+        -(((yy - 14) / 2.5) ** 2 + ((xx - nx / 2) / 7) ** 2 + ((zz - nz / 2) / 5) ** 2)
+    )
+    ro, pe_tdim = 0.5, 1
+
+    def observed(sign):
+        disp = field * (ro * sign)
+        return T._resample_pe(true, -disp, pe_tdim) / T._jacobian_pe(disp, pe_tdim).clamp(min=0.05)
+
+    scans = [
+        T.ScanSpec(observed(+1.0), 1, +1.0, ro),
+        T.ScanSpec(observed(-1.0), 1, -1.0, ro),
+    ]
+    return scans, ro, pe_tdim
+
+
+def test_antifold_barrier_removes_fold():
+    # A field steep enough to fold one polarity: the barrier must drive the min Jacobian
+    # back positive, while leaving the field almost unchanged where it was already safe.
+    scans, ro, pe_tdim = _make_folding_pair()
+    kw = dict(
+        warpres=[16, 8, 5],
+        fwhm=[4, 1, 0],
+        lam=[1e-3, 1e-6, 1e-9],
+        miter=[8, 12, 15],
+        subsamp=[1, 1, 1],
+    )
+
+    off = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(jac_penalty=0.0, **kw), progress=False)
+    jac_off = T._jacobian_pe(off.field_hz * ro, pe_tdim)
+    assert float(jac_off.min()) < 0.0, f"test setup did not fold (min {jac_off.min()})"
+
+    on = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(jac_penalty=5e-2, **kw), progress=False)
+    jac_on = T._jacobian_pe(on.field_hz * ro, pe_tdim)
+    assert float(jac_on.min()) > 0.0, f"barrier failed to remove fold (min {jac_on.min()})"
+
+    # Local: where the unconstrained warp was comfortably safe, the field barely moves.
+    safe = jac_off > 0.5
+    rms_safe = float((on.field_hz - off.field_hz)[safe].pow(2).mean().sqrt())
+    assert rms_safe < 0.2 * float(off.field_hz.std()), f"barrier perturbed safe region: {rms_safe}"
+
+
 def test_analytic_gn_operator_matches_autograd():
     # The analytic J / J^T J / g must equal the reverse-mode-autodiff operator to
     # ~machine precision. (We compare the *operator*, not the CG solution: with the
