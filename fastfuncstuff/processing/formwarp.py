@@ -191,25 +191,45 @@ def _local_cc_cost(a: Tensor, b: Tensor, radius: int, weight: Tensor) -> Tensor:
     return -(weight * cc).sum() / weight.sum().clamp(min=_EPS)
 
 
-def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Tensor:
-    """Scalar image metric (lower = better) between middle-grid images ``a`` and ``b``.
+def image_metric(
+    a: Tensor,
+    b: Tensor,
+    weight: Tensor,
+    metric: str = "cc",
+    cc_radius: int = 4,
+    lpa_sigma: float = 4.0,
+    lpa_kernel: str = "gauss",
+) -> Tensor:
+    """Scalar image metric (lower = better) between two same-grid images.
 
-    All metrics route through autograd, so the project's existing cost primitives
-    serve directly as SyN metrics.
+    All metrics route through autograd-friendly ops, so the project's existing cost
+    primitives serve directly as registration metrics (SyN update fields here, and
+    convergence monitoring for the optical-flow engine).
     """
-    m = config.metric
-    if m == "cc":
-        return _local_cc_cost(a, b, config.cc_radius, weight)
-    if m == "mse":
+    if metric == "cc":
+        return _local_cc_cost(a, b, cc_radius, weight)
+    if metric == "mse":
         return (weight * (a - b) ** 2).sum() / weight.sum().clamp(min=_EPS)
-    if m == "lpa":
-        return -lpa_correlation(a, b, weight, sigma=config.lpa_sigma, kernel_type=config.lpa_kernel)
-    if m == "lpc":
-        return -lpc_correlation(a, b, weight, sigma=config.lpa_sigma, kernel_type=config.lpa_kernel)
-    if m == "pearson":
-        w = weight.reshape(-1)
-        return -pearson_correlation(a.reshape(-1), b.reshape(-1), w)
-    raise ValueError(f"unknown metric {m!r}; choose from {METRICS}")
+    if metric == "lpa":
+        return -lpa_correlation(a, b, weight, sigma=lpa_sigma, kernel_type=lpa_kernel)
+    if metric == "lpc":
+        return -lpc_correlation(a, b, weight, sigma=lpa_sigma, kernel_type=lpa_kernel)
+    if metric == "pearson":
+        return -pearson_correlation(a.reshape(-1), b.reshape(-1), weight.reshape(-1))
+    raise ValueError(f"unknown metric {metric!r}; choose from {METRICS}")
+
+
+def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Tensor:
+    """SyN-config wrapper around :func:`image_metric`."""
+    return image_metric(
+        a,
+        b,
+        weight,
+        metric=config.metric,
+        cc_radius=config.cc_radius,
+        lpa_sigma=config.lpa_sigma,
+        lpa_kernel=config.lpa_kernel,
+    )
 
 
 def _smooth_field(xd: Tensor, yd: Tensor, zd: Tensor, sigma: float) -> Field:
