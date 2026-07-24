@@ -177,7 +177,9 @@ def test_analytic_and_autograd_recover_same_field():
     # drift on the ill-conditioned normal equations forbids bit-identity).
     _, field, scans = _make_synthetic()
     kw = dict(warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[6, 6], subsamp=[1, 1])
-    res_a = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(analytic_gn=True, **kw), progress=False)
+    res_a = T.run_topup(
+        scans, (3.0, 2.5, 2.5), T.TopupConfig(analytic_gn=True, **kw), progress=False
+    )
     res_b = T.run_topup(
         scans, (3.0, 2.5, 2.5), T.TopupConfig(analytic_gn=False, **kw), progress=False
     )
@@ -195,3 +197,112 @@ def test_spline_field_shape_and_smoothness():
     # refit round-trip: fitting a field's own coeffs reproduces it closely
     fld2 = basis.field(T.refit_coeff(fld, basis))
     assert (fld - fld2).abs().max() < 1e-3 * fld.abs().max().clamp(min=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Rigid movement estimation (topup --estmov analogue)
+# ---------------------------------------------------------------------------
+def test_default_estmov_matches_fsl_configs():
+    # The auto rule (warpres >= 10 mm) must reproduce FSL's b02b0 / b02b0_7T --estmov.
+    b02b0 = [20, 16, 14, 12, 10, 6, 4, 4, 4]
+    assert T._default_estmov(b02b0) == [True] * 5 + [False] * 4
+    b02b0_7t = [30, 25, 20, 18, 16, 14, 12, 10, 6, 4, 4, 4]
+    assert T._default_estmov(b02b0_7t) == [True] * 8 + [False] * 4
+
+
+def test_drop_pe_center_translation():
+    from fastfuncstuff.processing.affine import identity_params, params_to_matrix
+
+    shape = (20, 32, 32)  # (nz, ny, nx); PE = y/j (axis 1)
+    pe_axis = 1
+    p = identity_params(dtype=torch.float64)
+    p[3] = 3.0  # rz (deg) — a real rotation to preserve
+    p[1] = 1.5  # dy — the PE-axis translation to remove
+    mat = params_to_matrix(p)
+    mat2 = T._drop_pe_center_translation(mat, shape, pe_axis)
+
+    nz, ny, nx = shape
+    c = torch.tensor([(nx - 1) / 2, (ny - 1) / 2, (nz - 1) / 2, 1.0], dtype=torch.float64)
+    d = mat2 @ c - c
+    assert abs(d[pe_axis].item()) < 1e-8, "PE displacement at centre not removed"
+    # Non-PE rows (and the whole rotation block) are untouched.
+    assert torch.allclose(mat2[0], mat[0])
+    assert torch.allclose(mat2[2], mat[2])
+    assert torch.allclose(mat2[pe_axis, :3], mat[pe_axis, :3])
+
+
+def _apply_rigid(vol, params):
+    """Resample vol under a rigid transform given by 6 ffs_moco params."""
+    from fastfuncstuff.processing.affine import (
+        _build_homo_coords,
+        identity_params,
+        params_to_matrix,
+        resample_affine_fast,
+    )
+
+    p = identity_params(device=vol.device, dtype=vol.dtype)
+    p[:6] = torch.tensor(params, device=vol.device, dtype=vol.dtype)
+    coords = _build_homo_coords(tuple(vol.shape), vol.device, vol.dtype)
+    return resample_affine_fast(vol, params_to_matrix(p), coords, "cubic", tuple(vol.shape))
+
+
+def _make_textured(nz=24, ny=40, nx=40, readout=0.5):
+    """A textured (brain-like) volume + smooth Hz field -> blip-up/down pair (PE=y/j).
+
+    The two-blob :func:`_make_synthetic` volume is too feature-poor for rigid
+    registration to converge; a smoothed random field inside an ellipsoidal mask gives
+    gradients in all three axes, which is what the Gauss-Newton rigid solver needs.
+    """
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+
+    torch.manual_seed(0)
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(nz).float(), torch.arange(ny).float(), torch.arange(nx).float(), indexing="ij"
+    )
+    mask = (((zz - nz / 2) / 9) ** 2 + ((yy - ny / 2) / 16) ** 2 + ((xx - nx / 2) / 16) ** 2) < 1.0
+    t = _separable_smooth_3d(torch.randn(nz, ny, nx), 1.2)
+    t = t - t.min()
+    true = (t / t.max() * 100.0 + 10.0) * mask.float()
+    field = 6.0 * torch.sin(2 * math.pi * yy / ny) * torch.exp(-(((xx - nx / 2) / 12) ** 2))
+    return true, field, readout
+
+
+def test_motion_estimation_reconciles_moved_pair():
+    # Blip-down acquired after a small rigid head move dominated by a THROUGH-PLANE (z)
+    # translation, which a phase-encode (y) field physically cannot represent -- so unlike
+    # an in-plane move (which the smooth field can partly absorb) only rigid motion
+    # estimation can reconcile the pair. Estimation should cut the corrected-pair residual
+    # substantially and recover a non-trivial transform for the moved scan.
+    true, field, readout = _make_textured()
+    pe_tdim = 1
+
+    def observed(src, sign):
+        disp = field * (readout * sign)
+        return T._resample_pe(src, -disp, pe_tdim) / T._jacobian_pe(disp, pe_tdim).clamp(min=0.1)
+
+    # dz=1.3 vox (through-plane, non-PE), rz=1.0 deg; no PE-axis (dy) translation.
+    true_moved = _apply_rigid(true, [0.0, 0.0, 1.3, 1.0, 0.0, 0.0])
+
+    def make_scans():
+        up = T.ScanSpec(observed(true, +1.0), pe_axis=1, sign=+1.0, readout=readout)
+        down = T.ScanSpec(observed(true_moved, -1.0), pe_axis=1, sign=-1.0, readout=readout)
+        return [up, down]
+
+    cfg = T.TopupConfig(
+        warpres=[16, 10], fwhm=[4, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
+    )
+    m = torch.zeros_like(true, dtype=torch.bool)
+    m[3:-3, 6:-6, 6:-6] = True
+
+    res_off = T.run_topup(make_scans(), (3.0, 2.5, 2.5), cfg, progress=False)
+    res_on = T.run_topup(make_scans(), (3.0, 2.5, 2.5), cfg, progress=False, estimate_motion=True)
+
+    resid_off = ((res_off.unwarped[0] - res_off.unwarped[1])[m]).pow(2).mean().sqrt()
+    resid_on = ((res_on.unwarped[0] - res_on.unwarped[1])[m]).pow(2).mean().sqrt()
+    assert resid_on < 0.7 * resid_off, f"motion did not help: off={resid_off} on={resid_on}"
+
+    # Reference scan stays put; the moved scan recovers ~ -1.3 vox of z-translation.
+    eye = torch.eye(4, dtype=res_on.motion_matrices[0].dtype)
+    assert torch.allclose(res_on.motion_matrices[0], eye), "reference scan should not move"
+    dz = res_on.motion_matrices[1][2, 3].item()
+    assert -1.7 < dz < -0.9, f"z-translation not recovered: {dz}"

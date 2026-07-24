@@ -122,6 +122,18 @@ class TopupConfig:
     subsamp: list[int] = _dc_field(default_factory=lambda: [1, 1, 1, 1, 1, 1, 1, 1, 1])
     """Integer subsampling factor per level (1 = full resolution)."""
 
+    estmov: list[bool] | None = None
+    """Per-level "estimate rigid movement" flag (topup ``--estmov``); ``None`` = auto.
+
+    FSL estimates rigid motion jointly with the field at the *coarse* levels only and
+    freezes it for the fine ones (``estmov=1,1,1,1,1,0,0,0,0`` for b02b0), because rigid
+    motion is a low-spatial-frequency effect that is well-determined coarsely, whereas at
+    fine resolution the field starts absorbing what is really motion. FSL ties this to
+    subsampling; we don't subsample (GPU is cheap), so the auto rule keys off knot spacing
+    instead -- ``warpres >= 10 mm`` -- which reproduces the b02b0 and b02b0_7T patterns
+    exactly. Only consulted when motion estimation is enabled (``run_topup``'s
+    ``estimate_motion``)."""
+
     ssqlambda: bool = True
     """If set, scale ``lam`` by the current mean squared difference each iteration."""
 
@@ -149,6 +161,11 @@ class TopupConfig:
                     f"TopupConfig.{name} has length {len(v)}, expected {n} "
                     "(all schedule lists must match warpres)"
                 )
+        if self.estmov is not None and len(self.estmov) != n:
+            raise ValueError(
+                f"TopupConfig.estmov has length {len(self.estmov)}, expected {n} "
+                "(all schedule lists must match warpres)"
+            )
         if self.reg_mode not in ("bending", "membrane"):
             raise ValueError(f"reg_mode must be 'bending' or 'membrane', got {self.reg_mode}")
 
@@ -931,6 +948,142 @@ def apply_pe_shift(scans: list[ScanSpec], shift_vox: float) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Rigid movement estimation (topup --estmov analogue)
+# ----------------------------------------------------------------------------
+def _default_estmov(warpres: list[float]) -> list[bool]:
+    """Auto per-level estmov: estimate motion only at the coarse (>=10 mm knot) levels.
+
+    FSL keys ``--estmov`` off subsampling (motion at the subsampled levels); we don't
+    subsample, so we key off knot spacing instead. ``warpres >= 10 mm`` reproduces both
+    the b02b0 (``1,1,1,1,1,0,0,0,0``) and b02b0_7T (``1,1,1,1,1,1,1,1,0,0,0,0``) patterns
+    exactly.
+    """
+    return [w >= 10.0 for w in warpres]
+
+
+def _undistort_scan(
+    data: Tensor, field_hz: Tensor, readout: float, sign: float, pe_tdim: int
+) -> Tensor:
+    """Jacobian-modulated undistortion of one scan with the current field (common space)."""
+    disp = field_hz * (readout * sign)
+    return _resample_pe(data, disp, pe_tdim) * _jacobian_pe(disp, pe_tdim)
+
+
+def _drop_pe_center_translation(
+    matrix: Tensor, shape: tuple[int, int, int], pe_axis: int
+) -> Tensor:
+    """Project the PE-axis translation out of a rigid matrix at the volume centre.
+
+    A global constant PE displacement is exactly representable by a constant off-resonance
+    field offset, so topup excludes the PE-direction translation from its rigid movement
+    model (5 DOF for a single PE axis). We estimate the full 6-DOF rigid on the field-
+    corrected images (where the PE shift *is* identifiable) and then remove the PE component
+    of the displacement evaluated at the volume centre, so the rigid transform and the field
+    cannot trade a global PE shift back and forth across the block-coordinate iterations.
+    Rotation is about the voxel-grid origin, so the centre correction (not merely zeroing the
+    translation parameter) is what actually removes the constant PE mode without perturbing
+    the rotation.
+    """
+    nz, ny, nx = shape
+    # _build_homo_coords orders coords (x=i, y=j, z=k); the matrix row index equals the
+    # NIfTI PE axis (0=x, 1=y, 2=z).
+    c = torch.tensor(
+        [(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0, 1.0],
+        device=matrix.device,
+        dtype=matrix.dtype,
+    )
+    d_pe = (matrix @ c - c)[pe_axis]
+    out = matrix.clone()
+    out[pe_axis, 3] = out[pe_axis, 3] - d_pe
+    return out
+
+
+def estimate_motion_pass(
+    work: list[ScanSpec],
+    field_hz: Tensor,
+    ref_idx: int,
+    motion_mats: list[Tensor],
+    interp: str = "cubic",
+    max_iter: int = 23,
+    verbose: bool = False,
+) -> None:
+    """One block-coordinate rigid-motion update (topup ``--estmov`` at one level).
+
+    Reuses the project's Gauss-Newton WLS rigid registration (:mod:`fastfuncstuff.processing.
+    ffs_moco`) on the FIELD-CORRECTED images -- the only well-posed place to register an
+    opposing-PE pair, since the raw scans are distorted in *opposite* directions and a naive
+    rigid fit would chase that distorted mismatch, not the head motion. Each non-reference
+    scan's undistorted image is registered to the reference's undistorted image; the PE-axis
+    translation (degenerate with the field, :func:`_drop_pe_center_translation`) is removed;
+    the resulting rigid transform is baked into that scan's *distorted* data with a single
+    resample, so the next field fit sees motion-compensated inputs. ``work`` is mutated in
+    place and the transform composed into ``motion_mats``.
+    """
+    from .affine import (
+        _build_homo_coords,
+        identity_params,
+        params_to_matrix,
+        resample_affine_fast,
+    )
+    from .ffs_moco import (
+        MocoConfig,
+        _gram_normal_eq,
+        compute_derivative_images,
+        gauss_newton_rigid,
+    )
+    from .weight import compute_weight_image
+
+    device = work[ref_idx].data.device
+    shape = tuple(work[ref_idx].data.shape)
+    # Registration runs in float32 regardless of the field solve precision: it is not the
+    # numerically sensitive step (the JtWJ Gram + 6x6 solve already promote to float64), and
+    # ffs_moco's weight/derivative kernels are float32-only. See [[Float32 vs float64]].
+    rdt = torch.float32
+
+    ref = work[ref_idx]
+    base = _undistort_scan(
+        ref.data, field_hz, ref.readout, ref.sign, _NIFTI_AXIS_TO_TDIM[ref.pe_axis]
+    ).to(rdt)
+    weight_flat = compute_weight_image(base).reshape(-1)
+    derivs = compute_derivative_images(base, device)  # (6, N)
+    WJ = weight_flat[None] * derivs  # (6, N) — broadcast weight across the 6 rows
+    JtWJ = _gram_normal_eq(WJ, device)  # (6, 6), float64 on cuda/cpu
+    coords = _build_homo_coords(shape, device, rdt)
+    base_flat = base.reshape(-1)
+    mcfg = MocoConfig(interp=interp, max_iter=max_iter)
+
+    for s in range(len(work)):
+        if s == ref_idx:
+            continue
+        sc = work[s]
+        src = _undistort_scan(
+            sc.data, field_hz, sc.readout, sc.sign, _NIFTI_AXIS_TO_TDIM[sc.pe_axis]
+        ).to(rdt)
+        params, _ = gauss_newton_rigid(
+            base_flat,
+            src,
+            weight_flat,
+            WJ,
+            JtWJ,
+            identity_params(device=device, dtype=rdt),
+            mcfg,
+            coords=coords,
+        )
+        matrix = _drop_pe_center_translation(params_to_matrix(params), shape, sc.pe_axis)
+        # Bake into the (possibly float64) distorted data via a float32 resample, cast back.
+        sc.data = resample_affine_fast(sc.data.to(rdt), matrix, coords, interp, shape).to(
+            sc.data.dtype
+        )
+        motion_mats[s] = matrix @ motion_mats[s]
+        if verbose:
+            p = params[:6].tolist()
+            print(
+                f"    scan {s}: trans(vox)=({p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f}) "
+                f"rot(deg)=({p[3]:+.2f},{p[4]:+.2f},{p[5]:+.2f})"
+            )
+
+
+# ----------------------------------------------------------------------------
 # Orchestrator
 # ----------------------------------------------------------------------------
 @dataclass
@@ -941,6 +1094,7 @@ class TopupResult:
     pe_shift_vox: float
     unwarped: list[Tensor]  # per-scan Jacobian-modulated undistorted images (native intensity)
     mean_unwarped: Tensor  # mean of the undistorted images
+    motion_matrices: list[Tensor]  # per-scan composed rigid voxel matrix (identity if unused)
 
 
 def run_topup(
@@ -951,6 +1105,9 @@ def run_topup(
     progress: bool = True,
     solve_dtype: torch.dtype = torch.float32,
     mask_field: bool = True,
+    estimate_motion: bool = False,
+    motion_ref: int = 0,
+    motion_interp: str = "cubic",
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -998,6 +1155,14 @@ def run_topup(
         apply_pe_shift(work, shift)
         if progress:
             print(f"  estimated PE shift: {shift:+.3f} vox")
+
+    # Per-scan rigid movement (topup --estmov). Identity unless estimate_motion runs.
+    # float32: registration runs single-precision (see estimate_motion_pass).
+    motion_mats = [torch.eye(4, device=device, dtype=torch.float32) for _ in work]
+    if estimate_motion and len(work) >= 2:
+        estmov = config.estmov if config.estmov is not None else _default_estmov(config.warpres)
+    else:
+        estmov = [False] * config.n_levels()  # off, or no second scan to move against
 
     n_lev = config.n_levels()
     level_bar = _bar(
@@ -1055,6 +1220,21 @@ def run_topup(
         level_bar.set_postfix_str(
             f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} cost={cost:.3e}"
         )
+
+        # Rigid movement update, block-coordinate with the field (topup --estmov). Run
+        # after the level's field solve (movement estimated *with* the field at this
+        # scale) and using this level's field expanded onto the full-res work grid, so the
+        # motion-compensated data feeds the next, finer level; frozen at fine levels.
+        if estmov[lvl]:
+            field_full = _resize_field(basis.field(coeff), shape).to(solve_dtype)
+            estimate_motion_pass(
+                work,
+                field_full,
+                motion_ref,
+                motion_mats,
+                interp=motion_interp,
+                verbose=progress,
+            )
     level_bar.close()
 
     # Expand the final field back to the full (un-subsampled) grid.
@@ -1087,6 +1267,7 @@ def run_topup(
         pe_shift_vox=shift,
         unwarped=unwarped,
         mean_unwarped=mean_unwarped,
+        motion_matrices=motion_mats,
     )
 
 

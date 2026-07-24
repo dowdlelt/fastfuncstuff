@@ -190,6 +190,31 @@ def create_parser() -> argparse.ArgumentParser:
         "shift is confounded by the field itself, so it is capped small; off by default.",
     )
 
+    mot = parser.add_argument_group("Movement (topup --estmov analogue)")
+    mot.add_argument(
+        "-estmov",
+        "-motion",
+        action="store_true",
+        help="Jointly estimate rigid head movement between the scans, like FSL topup. "
+        "Movement is estimated block-coordinate with the field at the COARSE levels only "
+        "(knot spacing >= 10 mm, reproducing topup's --estmov schedule) and frozen for the "
+        "fine levels; the first scan is the fixed reference and the PE-axis translation "
+        "(degenerate with the field) is excluded. Reuses ffs_moco's GPU rigid registration "
+        "on the field-corrected images. Off by default (assumes the pair is aligned).",
+    )
+    mot.add_argument(
+        "-motion_ref",
+        type=int,
+        default=0,
+        help="Index of the fixed reference scan for movement (default 0, the first).",
+    )
+    mot.add_argument(
+        "-motion_interp",
+        default="cubic",
+        choices=("linear", "cubic", "quintic", "heptic", "wsinc5"),
+        help="Interpolation used when baking the estimated rigid transform into the data.",
+    )
+
     misc = parser.add_argument_group("Misc")
     misc.add_argument(
         "-precision",
@@ -360,6 +385,10 @@ def main(argv: list[str] | None = None) -> int:
         if no_readout:
             print("  no -readout given: field map (Hz) disabled; warp is unaffected.")
 
+    if args.estmov and not (0 <= args.motion_ref < len(scans)):
+        print(f"ffs_blipflip: -motion_ref {args.motion_ref} out of range.", file=sys.stderr)
+        return 2
+
     solve_dtype = torch.float64 if args.precision == "float64" else torch.float32
     result = T.run_topup(
         scans,
@@ -369,6 +398,9 @@ def main(argv: list[str] | None = None) -> int:
         progress=args.verb >= 1,
         solve_dtype=solve_dtype,
         mask_field=not args.no_mask_field,
+        estimate_motion=args.estmov,
+        motion_ref=args.motion_ref,
+        motion_interp=args.motion_interp,
     )
 
     # ---- outputs ----
@@ -447,6 +479,22 @@ def main(argv: list[str] | None = None) -> int:
         _save_zyx(f"{stem}_jac{ext}", jac, affine)
         if args.verb >= 1:
             print(f"  wrote {stem}_jac{ext}")
+
+    # Estimated rigid movement parameters (topup's movpar analogue): one row per scan,
+    # decomposed to dx dy dz (voxels) rz rx ry (degrees) in the ffs_moco convention.
+    if args.estmov:
+        from fastfuncstuff.processing.affine import matrix_to_params
+
+        movpar_path = f"{stem}_movpar.txt"
+        rows = []
+        for mat in result.motion_matrices:
+            p = matrix_to_params(mat.float())[:6].tolist()
+            rows.append("  ".join(f"{v:+.6f}" for v in p))
+        with open(movpar_path, "w") as fh:
+            fh.write("# dx dy dz (vox)  rz rx ry (deg); one row per scan; scan 0 = reference\n")
+            fh.write("\n".join(rows) + "\n")
+        if args.verb >= 1:
+            print(f"  wrote {movpar_path}  (per-scan rigid movement)")
 
     pe_letter = {0: "i", 1: "j", 2: "k"}[ref.pe_axis]
     if args.verb >= 1:
