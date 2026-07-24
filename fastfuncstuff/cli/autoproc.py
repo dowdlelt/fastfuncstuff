@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("inputs & scope")
     g.add_argument("-bids_dir", "-bids-dir", required=True, help="validated BIDS root")
-    g.add_argument("-subject", required=True, help="subject id (e.g. 001 or sub-ME486585)")
+    g.add_argument("-subject", required=True, help="subject id (e.g. 001 or sub-001)")
     g.add_argument("-session", nargs="+", help="restrict to these sessions (labels or ses-*)")
     g.add_argument("-task", nargs="+", help="restrict to these tasks")
     g.add_argument("-out", help="output script path (default: proc_sub-<id>.sh)")
@@ -283,7 +283,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         errors.append(
             "this recipe aligns to an anatomical, but no anat is available. Pass -anat FILE "
             "(skull-stripped T1w) or -suma DIR (FreeSurfer SUMA; uses brain.nii.gz). "
-            "The in-scope session(s) had no T1w — e.g. MindsEye keeps the T1w in ses-WB, "
+            "The in-scope session(s) had no T1w — e.g. The T1w might be in a different session, "
             "not the functional session."
         )
     if opt.anat_nonlin and not opt.tpm and not opt.fs_tpm:

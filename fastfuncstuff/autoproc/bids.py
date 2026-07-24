@@ -147,7 +147,7 @@ class BoldRun:
 
     @property
     def task_name(self) -> str:
-        # quirk: TaskName is absent from every func sidecar in the MindsEye
+        # quirk: TaskName is absent from every func sidecar in some
         # data; derive it from the entity so downstream (BIDS validator, GLM)
         # still has one.
         return self.json.get("TaskName") or self.task
@@ -362,7 +362,7 @@ def _scan_fmaps(fmap_dir: Path, bids_root: Path, bold_runs: list[BoldRun]) -> li
 
     Preference order for the representative reverse image within a group:
     SBRef > EPI > BOLD (SBRef is cleanest). Grouping key is the ``task`` entity
-    when present (MindsEye task-tagged fmaps), else ``dir``+``run`` (conventional
+    when present (Fieldmaps could betask-tagged), else ``dir``+``run`` (conventional
     epi). ``acq`` is *not* a group key: ``acq-bold``/``acq-sbref`` are two forms
     of one fieldmap, not two fieldmaps.
     """
@@ -464,7 +464,7 @@ def _resolve_intended(fmap_json: dict, tag: str, bold_runs: list[BoldRun]) -> li
     ``IntendedFor`` when present; else task-match (the fmap tag equals a task
     name). No blanket "serves everything" here — that fallback is applied in
     ``_scan_fmaps`` only when a single candidate survives. quirk: ``IntendedFor``
-    is present on only *some* fmaps in the MindsEye data.
+    is present on only *some* fmaps in some datasets.
     """
     intended = fmap_json.get("IntendedFor")
     if intended:
