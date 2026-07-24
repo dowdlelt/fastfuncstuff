@@ -111,7 +111,7 @@ Also *fun* is that it supports slice-timing correction at warp time - that is, a
 Additional **fun** is `-jac` jacobian modulation at warp time support. This is primarily to support `topup` like fieldmaps - the jacobian modulation only applies to the distortion correction fieldmap - not intermediate, time-varying, in-plane warps. Fortunately, those are small - the fieldmap is where you need it the most. 
 
 ### ffs_blipflip - GPU topup-like
-`ffs_blipflip` can produce topup-like fieldmaps and warps that were taking ~15 minutes on 10 cores in about 30 seconds. Writes out field, etc. Currently, no motion correction in loop - optimistically, the person didn't move between forward and reverse?
+`ffs_blipflip` can produce topup-like fieldmaps and warps that were taking ~15 minutes on 10 cores in about 30 seconds. Writes out field, etc. Motion estimate is off (but avaialble)- optimistically, the person didn't move between forward and reverse? A guard prevents negative jacobian (that is, a warp that would "fold" over). 
 
 ### ffs_reml with per-voxel HRFs
 `ffs_reml` can take the output of `ffs_hrfopt` and fit ARMA(1,1) REML using each voxel's best-fitting HRF. Pass `-hrfopt_prefix PREFIX` (the same prefix you gave to `ffs_hrfopt`) and the design is rebuilt per HRF group. Pairs naturally with `-single_trials LABEL`, which rebuilds the design with one regressor per event (GLMsingle-style) and writes chronologically ordered betas.
