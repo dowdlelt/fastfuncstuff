@@ -385,6 +385,7 @@ def main(argv: list[str] | None = None) -> None:
         retain_dof=args.retain_dof,
         save_num_comps=args.save_num_comps,
         make_complex_nii=args.make_complex_nii,
+        nifti_ext=prefix_info.nifti_ext,
         svd_batch_size=args.svd_batch_size,
         decomp_method=args.decomp_method,
         rescue=args.rescue,
