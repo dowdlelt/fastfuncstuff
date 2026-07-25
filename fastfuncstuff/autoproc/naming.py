@@ -27,6 +27,10 @@ from dataclasses import dataclass
 # (room to insert without renumbering everything).
 STAGE_NUMBERS: dict[str, int] = {
     "nordic": 0,
+    # Phase carriage (-phase_proc). Both share stage 0 with nordic and sort after
+    # it alphabetically, which is also their run order: nordic → trim → unwrap.
+    "trim": 0,  # noise-volume-trimmed mag/phase copies (ROMEO needs real files)
+    "unwrap": 0,  # ROMEO temporally-unwrapped phase, radians
     "tshift": 1,
     "moco": 2,
     "nlmoco": 3,
