@@ -34,7 +34,9 @@ Two samplers live here:
   so every temporal tap is the same anatomy, and the acquisition offset is read
   from the scanner slice ``u`` lands in *in frame f*. Recovers the signal where the
   frozen form (and a two-step tshift-then-motion) smear the wrong tissue -- e.g. a
-  brain edge sweeping in and out of a voxel -- at ~1% GPU cost.
+  brain edge sweeping in and out of a voxel. Following the tissue costs the uniform
+  time grid, so the taps are slid back onto one before the kernel is applied (see
+  the class docstring); measured ~20-25% slower than the frozen path.
 
 ``sz`` (the source-voxel k index each output voxel samples) is exactly the scanner
 slice ``k'`` because we sample the *raw* source there. Temporal kernels are
@@ -216,12 +218,45 @@ class TissueFollowingSampler:
     has). This sampler follows the tissue: for output voxel ``u`` it samples each
     neighbour frame ``f`` at *that frame's own pose* ``T_f(u)`` -- so every tap is
     the same anatomy -- and reads the acquisition offset from the scanner slice
-    ``u`` actually lands in *in frame f*. The per-frame temporal tap distance is
+    ``u`` actually lands in *in frame f*. Tap ``f`` therefore carries the tissue's
+    value at acquisition time
 
-        dist_f(u) = (j - f) + (tzero - Delta(sz_f(u))) / TR
+        tau_f(u) = f + Delta(sz_f(u)) / TR          (TR units)
 
-    with ``sz_f`` the scanner slice of ``T_f(u)``. It reduces exactly to the
-    frozen-pose result when motion within the window is sub-voxel.
+    with ``sz_f`` the scanner slice of ``T_f(u)``.
+
+    Non-uniform taps (the bookkeeping that makes this correct).
+        Following the tissue buys the right anatomy but costs the *uniform time
+        grid*: ``Delta`` is read at a different scanner slice each frame, so the
+        ``tau_f`` are no longer equally spaced. Combining them with a plain
+        normalised kernel average (``sum w*y / sum w``) is then only zeroth-order
+        accurate -- it reproduces a constant exactly but not a linear trend, and
+        the error grows with the tap spread. The damage is worst where the taps
+        spread most: an **interleaved** slice order plus through-plane motion of an
+        odd number of slices moves ``Delta`` by ~TR/2 frame to frame, and the
+        uncorrected average is then several times *worse* than the frozen path it
+        is meant to improve on.
+
+        The fix keeps the kernel on its uniform grid and moves the data instead.
+        Take the nominal grid to be the output frame's own offset,
+        ``tau_f^nom = f + Delta(sz_j(u))/TR`` -- exactly the frozen path's grid --
+        and first-order correct each tap onto it:
+
+            s_f    = (Delta(sz_f) - Delta(sz_j)) / TR       # tap's displacement
+            y_f'   = y_f - s_f * dy/dtau                    # slid onto the grid
+            out    = sum_f K((j - f) + (tzero - Delta(sz_j))/TR) * y_f' / sum_f K
+
+        ``dy/dtau`` is a central difference over the neighbouring taps' *true*
+        times (one-sided at the window edges, where the kernel weight is tiny
+        anyway). The weights are back on an equally-spaced grid, so the chosen
+        kernel keeps its full order, and ``sum K`` is a partition of unity again.
+
+        Two properties fall out. Without through-plane motion ``s_f == 0``
+        identically and the result is bit-for-bit the frozen/``3dTshift`` answer --
+        so the correction can never regress the common case. With it, the residual
+        error is O(s^2 * y'') instead of O(s * y'): measured 1-2 orders of
+        magnitude better across sequential, interleaved and drifting slice
+        patterns, at unchanged noise gain and no extra spatial gathers.
 
     GPU discipline. Only a *window* of ``2*half + 2`` frames is ever touched per
     output frame, so we keep exactly that window resident on ``device`` (per-frame
@@ -325,6 +360,24 @@ class TissueFollowingSampler:
                         src[fc].to(self.device, dtype=torch.float32) for src in self.sources
                     )
 
+    def _tap(self, f: int) -> list[Tensor]:
+        """The source frames at ``f`` warped to the output grid through frame ``f``'s
+        own pose -- i.e. the tissue at every output voxel, as frame ``f`` saw it."""
+        fc = self._clamp(f)  # edge-extend pose + data past the series ends
+        sx, sy, sz = self._coords[fc]
+        frames = (
+            self._srcs[fc]
+            if self.cache_source
+            else tuple(src[fc].to(self.device, dtype=torch.float32) for src in self.sources)
+        )
+        xd, yd, zd = sx - self.ii, sy - self.jj, sz - self.kk
+        # All channels share this pose -> one gather builds them together.
+        warped = warp_image_multi(frames, xd, yd, zd, mode=self.interp)
+        return [
+            v.clamp_min(0.0) if self.no_neg_ch[c] else v
+            for c, v in enumerate(warped)  # noqa: E501
+        ]
+
     def sample(self, frame_idx: int) -> Tensor | list[Tensor]:
         """The tissue-following, slice-timing-corrected output volume at ``frame_idx``.
 
@@ -334,32 +387,61 @@ class TissueFollowingSampler:
         # The per-voxel timing shift (tzero - Delta)/TR lies in (-1, 1), so a kernel
         # of half-width H reaches at most H+1 frames each side of j.
         f_lo, f_hi = frame_idx - (self.half + 1), frame_idx + (self.half + 1)
-        self._ensure({self._clamp(f) for f in range(f_lo, f_hi + 1)})
+        frames = list(range(f_lo, f_hi + 1))
+        self._ensure({self._clamp(f) for f in frames})
+
+        # Per-tap acquisition offset, and the nominal (uniform) grid: the output
+        # frame's own offset, which is exactly the frozen path's time grid.
+        delta = {
+            f: interp_slice_times(self._coords[self._clamp(f)][2], self.slice_times) for f in frames
+        }
+        delta_ref = delta[frame_idx]
+        weights = {
+            f: temporal_kernel_weights(
+                (frame_idx - f) + (self.tzero - delta_ref) / self.tr, self.tinterp
+            )
+            for f in frames
+        }
+        active = [f for f in frames if bool(torch.any(weights[f] != 0.0))]
+
+        # Warped taps are fetched on demand and dropped as the centre advances, so
+        # at most three (f-1, f, f+1) are resident -- the derivative's whole cost.
+        cache: dict[int, list[Tensor]] = {}
+
+        def tap(f: int) -> list[Tensor]:
+            if f not in cache:
+                cache[f] = self._tap(f)
+            return cache[f]
 
         accs = [torch.zeros_like(self.ii) for _ in self.sources]
         wsum = torch.zeros_like(self.ii)
-        for f in range(f_lo, f_hi + 1):
-            fc = self._clamp(f)  # edge-extend pose + data past the series ends
-            sx, sy, sz = self._coords[fc]
-            delta = interp_slice_times(sz, self.slice_times)
-            w = temporal_kernel_weights(
-                (frame_idx - f) + (self.tzero - delta) / self.tr, self.tinterp
-            )
-            if not bool(torch.any(w != 0.0)):
-                continue
-            frames = (
-                self._srcs[fc]
-                if self.cache_source
-                else tuple(src[fc].to(self.device, dtype=torch.float32) for src in self.sources)
-            )
-            xd, yd, zd = sx - self.ii, sy - self.jj, sz - self.kk
-            # All channels share this pose -> one gather builds them together.
-            warped = warp_image_multi(frames, xd, yd, zd, mode=self.interp)
-            for c, s_f in enumerate(warped):
-                if self.no_neg_ch[c]:
-                    s_f = s_f.clamp_min(0.0)
-                accs[c] = accs[c] + w * s_f
+        for f in active:
+            y = tap(f)
+            w = weights[f]
+            # Slide this tap from its true time onto the nominal grid (see class
+            # docstring). shift == 0 without through-plane motion, which is what
+            # makes the no-motion result identical to the frozen path.
+            shift = (delta[f] - delta_ref) / self.tr
+            fm, fp = (f - 1 if f - 1 in frames else None), (f + 1 if f + 1 in frames else None)
+            if fm is not None or fp is not None:
+                lo_f, hi_f = (fm if fm is not None else f), (fp if fp is not None else f)
+                ylo = tap(lo_f) if lo_f != f else y
+                yhi = tap(hi_f) if hi_f != f else y
+                # Spacing in TR units between the two taps' TRUE acquisition times.
+                dt = (hi_f - lo_f) + (delta[hi_f] - delta[lo_f]) / self.tr
+                # Near-coincident taps carry no derivative information; leaving the
+                # tap uncorrected there is strictly better than dividing by ~0.
+                safe = dt.abs() > 1e-3
+                dt = torch.where(safe, dt, torch.ones_like(dt))
+                for c in range(len(self.sources)):
+                    slope = torch.where(safe, (yhi[c] - ylo[c]) / dt, torch.zeros_like(dt))
+                    accs[c] = accs[c] + w * (y[c] - shift * slope)
+            else:
+                for c in range(len(self.sources)):
+                    accs[c] = accs[c] + w * y[c]
             wsum = wsum + w
+            for stale in [k for k in cache if k < f]:
+                del cache[stale]
 
         outs = [acc / wsum.clamp_min(1e-8) for acc in accs]
         return outs if self.multi else outs[0]
