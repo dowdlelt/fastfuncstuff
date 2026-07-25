@@ -17,7 +17,23 @@ from fastfuncstuff.processing.medic import (
     field_to_displacement_pe,
     invert_displacement_pe,
     undistort_series,
+    unwrapped_phase_to_field_hz,
 )
+
+
+def test_unwrapped_phase_to_field_hz_recovers_known_field():
+    """Per-echo phase (rad) -> Hz must invert phi = 2*pi*f*TE for every echo.
+
+    Uses warpkit's exact convention so each single-echo map is directly comparable
+    to (and averages into) the collapsed field map.
+    """
+    tes_ms = [7.61, 21.71, 35.81]
+    f_true = torch.tensor([3.0, -5.0, 0.5])  # Hz, 3 voxels
+    uw = torch.zeros(3, 1, 1, len(tes_ms), 1)
+    for e, te in enumerate(tes_ms):
+        uw[:, 0, 0, e, 0] = 2 * np.pi * f_true * (te / 1000.0)  # radians
+    hz = unwrapped_phase_to_field_hz(uw, tes_ms)[:, 0, 0, :, 0]  # (voxel, echo)
+    assert torch.allclose(hz, f_true[:, None].expand_as(hz), atol=1e-4)
 
 
 def test_cli_accepts_negative_3d_debug_detrend_order():

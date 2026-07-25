@@ -191,6 +191,16 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also write the undistorted-space field map (Hz).",
     )
+    opt.add_argument(
+        "-save_unwrapped_phase",
+        "-save-unwrapped-phase",
+        dest="save_unwrapped",
+        action="store_true",
+        help="Also write warpkit's per-echo unwrapped phase as a field map (Hz), "
+        "one file per echo: {prefix}_e{N}_unwrapped_fieldmap. These are the "
+        "single-echo estimates that get collapsed into the combined _fieldmap. "
+        "Forces a fresh warpkit run (not reconstructable from the cached field map).",
+    )
 
     sel = parser.add_argument_group("Frame Selection (trimming / testing)")
     sel.add_argument(
@@ -605,7 +615,9 @@ def main(argv: list[str] | None = None) -> int:
     field_native = None
     disp_pull = None
     field_undist = None
-    if not args.recompute:
+    # The per-echo unwrapped phase is a warpkit by-product, not stored in the field
+    # cache, so -save_unwrapped_phase must re-run estimation (like -recompute).
+    if not args.recompute and not args.save_unwrapped:
         field_native = _load_cached_volume(field_cache, expected, host)
         if field_native is not None:
             disp_pull = _load_cached_volume(disp_cache, expected, host)
@@ -630,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
             n_cpus=args.n_cpus,
             device=device,
             debug_dir=f"{prefix_stem}_debug" if args.debug else None,
+            return_unwrapped=args.save_unwrapped,
             verbose=args.verb >= 1,
         )
         field_native = result.field_native
@@ -829,6 +842,24 @@ def main(argv: list[str] | None = None) -> int:
             save_nifti(field_native.cpu().numpy(), fmap_path, affine=affine)
         if args.verb >= 1:
             print(f"\n  field map (Hz, native): {fmap_path}")
+
+    if args.save_unwrapped:
+        # Per-echo unwrapped-phase field estimates (Hz), one file per echo. Only
+        # available on a fresh estimate (see -save_unwrapped_phase / cache note).
+        if result is None or result.unwrapped_field_hz is None:
+            print(
+                "WARNING: -save_unwrapped_phase set but per-echo phase unavailable "
+                "(reused cache?); skipping.",
+                file=sys.stderr,
+            )
+        else:
+            unwrapped_hz = result.unwrapped_field_hz  # (nx,ny,nz,ne,T) host
+            for e in range(unwrapped_hz.shape[-2]):
+                uw_path = f"{prefix_stem}_e{e + 1}_unwrapped_fieldmap{nii_ext}"
+                with spinner(f"Writing {Path(uw_path).name}"):
+                    save_nifti(unwrapped_hz[..., e, :].cpu().numpy(), uw_path, affine=affine)
+                if args.verb >= 1:
+                    print(f"  unwrapped-phase field map (Hz, echo {e + 1}): {uw_path}")
 
     if args.save_undist:
         # field_undist is set whenever we ran the warp tail (fresh or pull re-derive);
