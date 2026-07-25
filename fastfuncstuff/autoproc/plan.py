@@ -39,6 +39,10 @@ class Options:
 
     recipe: str | None = None  # named preset (for the header/provenance only)
     want_nordic: bool = False
+    # Carry the phase timeseries through the pipeline: ROMEO-unwrap it up front
+    # (after NORDIC when NORDIC runs), then ride it along the magnitude's warp
+    # chain at the final resample. Nothing between those two points touches it.
+    phase_proc: bool = False
     noise_vols: int = 0
     slicetiming_method: str = "integrate"  # integrate (fold into final resample) | first | none
     distortion: bool = True  # apply fieldmap distortion correction when fmaps exist

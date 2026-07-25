@@ -77,19 +77,29 @@ def warpkit_field_native(
     n_cpus: int = 4,
     svd_filt: int = 10,
     border_filt: tuple[int, int] = (1, 5),
+    return_unwrapped: bool = False,
     verbose: bool = True,
-) -> np.ndarray:
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Native-space field map (Hz) via warpkit's in-process C++ ROMEO unwrap.
 
-    Calls ``warpkit.unwrap.unwrap_and_compute_field_maps`` — the *exact* warpkit
-    pipeline (MCPC-3D-S offset, combined automask, multi-echo ROMEO, per-echo
-    global-mode correction, temporal consistency, SVD) on its compiled C++
-    ROMEO. ``phase`` is RAW scanner phase (warpkit rescales internally).
+    Runs the *exact* warpkit pipeline (MCPC-3D-S offset, combined automask,
+    multi-echo ROMEO, per-echo global-mode correction, temporal consistency,
+    SVD) on its compiled C++ ROMEO. ``phase`` is RAW scanner phase (warpkit
+    rescales internally).
+
+    We call warpkit's two public stages (``unwrap_phases`` then
+    ``compute_field_maps``) separately rather than the combined
+    ``unwrap_and_compute_field_maps`` wrapper, so the per-echo unwrapped phase
+    — otherwise discarded by the wrapper — can be handed back. The field map is
+    bit-identical either way (the wrapper is just these two calls back-to-back).
 
     Returns the field map in Hz, distorted space, shape ``(nx, ny, nz, T)``.
+    If ``return_unwrapped``, also returns the per-echo unwrapped phase (radians),
+    shape ``(nx, ny, nz, ne, T)`` — warpkit's ROMEO output before the echoes are
+    collapsed into the field map.
     """
     import nibabel as nib
-    from warpkit.unwrap import unwrap_and_compute_field_maps
+    from warpkit.unwrap import compute_field_maps, unwrap_phases
 
     _nx, _ny, _nz, ne, nt = phase.shape
     phase_imgs = [
@@ -98,22 +108,46 @@ def warpkit_field_native(
     mag_imgs = [
         nib.Nifti1Image(np.ascontiguousarray(mag[:, :, :, e, :]), affine) for e in range(ne)
     ]
+    tes_np = np.asarray(tes, dtype=np.float32)
     if verbose:
         print(f"  warpkit: in-process C++ ROMEO unwrap + field map ({ne} echoes, {nt} frames)")
     t0 = time.perf_counter()
     with _warpkit_progress(nt, enabled=verbose and nt > 1):
-        field_img = unwrap_and_compute_field_maps(
-            phase_imgs,
+        unwrapped_imgs, masks_img = unwrap_phases(phase_imgs, mag_imgs, tes_np, n_cpus=n_cpus)
+        field_img = compute_field_maps(
+            unwrapped_imgs,
+            masks_img,
             mag_imgs,
-            np.asarray(tes, dtype=np.float32),
-            svd_filt=svd_filt,
+            tes_np,
             border_filt=border_filt,
+            svd_filt=svd_filt,
             n_cpus=n_cpus,
         )
     if verbose:
         dt = time.perf_counter() - t0
         print(f"  warpkit: done in {dt:.1f}s ({dt / nt:.2f}s/frame)")
-    return np.asarray(field_img.dataobj, dtype=np.float32)  # (nx, ny, nz, T)
+    field = np.asarray(field_img.dataobj, dtype=np.float32)  # (nx, ny, nz, T)
+    if not return_unwrapped:
+        return field
+    # Stack the per-echo 4D unwrapped phases (radians) -> (nx, ny, nz, ne, T).
+    unwrapped = np.stack([np.asarray(u.dataobj, dtype=np.float32) for u in unwrapped_imgs], axis=-2)
+    return field, unwrapped
+
+
+def unwrapped_phase_to_field_hz(unwrapped_rad: Tensor, tes_ms: Sequence[float]) -> Tensor:
+    """Per-echo unwrapped phase (radians) -> per-echo field estimate (Hz).
+
+    Each echo's phase is a single-echo, through-origin B0 estimate: ``phi = 2*pi*f*TE``,
+    so ``f[Hz] = phi / (2*pi*TE[s])``. Uses warpkit's exact convention
+    (``compute_field_map`` regresses phase-vs-TE through the origin, then scales by
+    ``1000/(2*pi)``), so these maps are directly comparable to — and their
+    magnitude-weighted combination is — the collapsed field map.
+
+    ``unwrapped_rad`` is ``(nx, ny, nz, ne, T)``; ``tes_ms`` are echo times in ms.
+    """
+    te = torch.as_tensor(list(tes_ms), dtype=unwrapped_rad.dtype, device=unwrapped_rad.device)
+    scale = 1000.0 / (2.0 * np.pi * te)  # (ne,) Hz per radian, per echo
+    return unwrapped_rad * scale.reshape(1, 1, 1, -1, 1)
 
 
 # warpkit's per-frame stages (unwrap, temporal-consistency, field map) are each
@@ -270,6 +304,7 @@ class MedicResult:
     field_undistorted: Tensor  # Hz, undistorted space
     masks: Tensor  # int8 0/1/2
     pe_tensor_axis: int
+    unwrapped_field_hz: Tensor | None = None  # per-echo Hz (nx,ny,nz,ne,T); None unless requested
 
 
 def _time_chunk_frames(n_voxels: int, device: torch.device, n_fields: int = 6) -> int:
@@ -354,6 +389,7 @@ def medic_fieldmaps(
     n_cpus: int = 4,
     device: torch.device | None = None,
     debug_dir: str | None = None,
+    return_unwrapped: bool = False,
     verbose: bool = True,
 ) -> MedicResult:
     """Estimate frame-wise field maps (warpkit) and build our GPU pull warp.
@@ -364,6 +400,9 @@ def medic_fieldmaps(
 
     ``debug_dir``: if set, write sanity-check intermediates (warpkit native field
     map, brain mask, PE displacement) there.
+
+    ``return_unwrapped``: also keep warpkit's per-echo unwrapped phase, converted
+    to a per-echo field estimate (Hz), in ``MedicResult.unwrapped_field_hz``.
 
     Parameters
     ----------
@@ -397,7 +436,8 @@ def medic_fieldmaps(
 
     # 1. estimation: warpkit native field map (Hz, distorted space). The per-frame
     #    fields stay on the host; the GPU only ever sees a time-chunk (step 2).
-    field_native_np = warpkit_field_native(
+    unwrapped_np = None
+    est = warpkit_field_native(
         phase,
         mag,
         affine,
@@ -405,9 +445,20 @@ def medic_fieldmaps(
         n_cpus=n_cpus,
         svd_filt=svd_filt,
         border_filt=border_filt,
+        return_unwrapped=return_unwrapped,
         verbose=verbose,
     )
+    if return_unwrapped:
+        field_native_np, unwrapped_np = est
+    else:
+        field_native_np = est
     field_native = torch.nan_to_num(torch.from_numpy(np.ascontiguousarray(field_native_np)))
+    unwrapped_field_hz = None
+    if unwrapped_np is not None:
+        # radians -> per-echo Hz, host-resident (nx,ny,nz,ne,T); several GiB at scale.
+        unwrapped_field_hz = unwrapped_phase_to_field_hz(
+            torch.nan_to_num(torch.from_numpy(np.ascontiguousarray(unwrapped_np))), tes_np
+        )
     masks_t = torch.from_numpy(
         compute_frame_masks(mag, tes_np, automask_dilation, device=device, verbose=verbose)
     )
@@ -434,6 +485,7 @@ def medic_fieldmaps(
         field_undistorted=field_undist,
         masks=masks_t,
         pe_tensor_axis=pe_axis,
+        unwrapped_field_hz=unwrapped_field_hz,
     )
 
 

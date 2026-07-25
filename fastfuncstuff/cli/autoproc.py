@@ -12,6 +12,7 @@ written (the point is: no broken scripts).
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -131,6 +132,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="run NORDIC (needs phase)",
     )
     g.add_argument("-noise_vols", "-noise-vols", type=int, default=0, help="trailing noise volumes")
+    g.add_argument(
+        "-phase_proc",
+        "-phase-proc",
+        action="store_true",
+        help="carry the phase timeseries through the pipeline: ROMEO-unwrap it up front "
+        "(after NORDIC if NORDIC runs), then ride it along the magnitude's warp chain at "
+        "the final resample → stage10.final.*.part-phase.*, unwrapped radians in the same "
+        "space as the magnitude. Requires romeo (MRItools) on $PATH and a part-phase bold "
+        "for every run.",
+    )
     g.add_argument(
         "-nordic_save_resid",
         "-nordic-save-resid",
@@ -256,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     g = p.add_argument_group("per-stage option overrides (replace the default op string)")
-    for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp"):
+    for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp", "unwrap"):
         g.add_argument(f"-{key}_opts", f"-{key}-opts", metavar="STR", help=_opt_help(key))
     return p
 
@@ -291,6 +302,25 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-anat_nonlin (ffs_segment) needs a subject TPM: pass -tpm FILE, or -suma DIR "
             "to build one from FreeSurfer (aseg.auto + SurfVol)."
         )
+    if opt.phase_proc:
+        # Phase is carried per run, so a single run without one would silently
+        # produce a script that dies at stage00 — catch it here instead.
+        missing = [
+            f"{r.session or '-'}/{r.task}/{r.run or '-'}"
+            for s in subject.sessions
+            for r in s.bold_runs
+            if r.phase_path is None
+        ]
+        if missing:
+            errors.append(
+                "-phase_proc needs a part-phase bold for every run; these have none: "
+                + ", ".join(missing)
+            )
+        if shutil.which("romeo") is None:
+            warnings.append(
+                "-phase_proc: 'romeo' (MRItools) is not on $PATH. The script's preflight will "
+                "refuse to run until it is — install it or add it to PATH."
+            )
     if opt.fs_tpm:  # in-script TPM build needs the FS label volume
         aseg = Path(opt.suma_dir) / "aseg.auto.nii.gz"
         if not aseg.is_file():
@@ -392,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
         return argval if argval is not None else rget(field, default)
 
     # per-stage opt overrides mutate the shared defaults for this run.
-    for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp"):
+    for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp", "unwrap"):
         val = getattr(args, f"{key}_opts", None)
         if val is not None:
             config.DEFAULT_OPTS[key] = val
@@ -425,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     opt = Options(
         recipe=args.recipe,
         want_nordic=eff(args.want_nordic, "want_nordic"),
+        phase_proc=args.phase_proc,
         noise_vols=args.noise_vols,
         slicetiming_method=args.slicetiming_method or rget("slicetiming_method", "integrate"),
         distortion=(False if args.no_distortion else rget("distortion", True)),

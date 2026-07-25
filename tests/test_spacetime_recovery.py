@@ -323,3 +323,157 @@ def test_tissue_following_beats_frozen_pose_on_fast_motion():
         f"tissue-following should clearly beat frozen-pose under fast motion: "
         f"follow={cfollow:.3f} frozen={cfrozen:.3f}"
     )
+
+
+def _interleaved_slice_times(nz, tr):
+    """3dTshift 'alt+z': adjacent slices are ~TR/2 apart in acquisition time. This
+    is what turns one slice of through-plane motion into a ~TR/2 jump in a voxel's
+    tap times -- the regime that exposes a non-uniform-tap bug."""
+    order = list(range(0, nz, 2)) + list(range(1, nz, 2))
+    st = np.zeros(nz)
+    for n, k in enumerate(order):
+        st[k] = n * tr / nz
+    return st
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("step", [1, 2])
+def test_tissue_following_survives_through_plane_motion(interleaved, step):
+    """Through-plane motion makes each voxel's temporal taps land on a NON-uniform
+    time grid: Delta is read at a different scanner slice every frame. Combining
+    them with a plain normalised kernel average is only zeroth-order accurate, and
+    with an interleaved order + an odd-slice step (taps ~TR/2 apart) it was several
+    times WORSE than the frozen path it exists to improve on. The sampler now slides
+    each tap onto the output frame's nominal grid with a local time derivative.
+
+    Structure is smooth in z and uniform in-plane so spatial interpolation is near
+    exact -- what is measured here is the temporal combination alone. The repo's
+    other tissue-following test translates in x only, where Delta never varies.
+    """
+    from fastfuncstuff.cli.nwarp import main as nwarp_main
+
+    shape, nf, tr, nz = (8, 8, 24), 40, 1.0, 24
+    st = _interleaved_slice_times(nz, tr) if interleaved else np.arange(nz) * tr / nz
+    tzero = float(st.mean())
+    disp = [step * (f % 2) for f in range(nf)]  # 0 / step voxels in z
+    sig = lambda z, t: 1.0 + 0.3 * np.sin(2 * np.pi * t / 12.0 + 0.2 * np.asarray(z))  # noqa: E731
+
+    acq = np.zeros((*shape, nf), np.float32)
+    ideal = np.zeros((*shape, nf), np.float32)
+    for f in range(nf):
+        for k in range(nz):
+            acq[:, :, k, f] = sig(k - disp[f], f * tr + st[k])
+            ideal[:, :, k, f] = sig(k, f * tr + tzero)
+
+    work = tempfile.mkdtemp()
+    src = os.path.join(work, "acq.nii.gz")
+    nib.save(nib.Nifti1Image(acq, np.eye(4)), src)
+    sp, mp, stp = (os.path.join(work, n) for n in ("s.1D", "m.1D", "st.1D"))
+    with open(sp, "w") as fh:
+        fh.write(" ".join(f"{v:.8f}" for v in np.eye(4)[:3, :].reshape(-1)) + "\n")
+    with open(mp, "w") as fh:
+        for f in range(nf):
+            M = np.eye(4)
+            M[2, 3] = disp[f]
+            fh.write(" ".join(f"{v:.8f}" for v in M[:3, :].reshape(-1)) + "\n")
+    np.savetxt(stp, st)
+
+    args = [
+        "-source",
+        src,
+        "-nwarp",
+        f"{sp} {mp}",
+        "-tpattern",
+        stp,
+        "-TR",
+        str(tr),
+        "-tzero",
+        str(tzero),
+        "-tinterp",
+        "wsinc5",
+        "-interp",
+        "wsinc5",
+        "-master",
+        src,
+        "-device",
+        "cpu",
+        "-verb",
+        "0",
+    ]
+    out = {}
+    for name, flag in (("frozen", "-frozen"), ("follow", "-tfollow")):
+        p = os.path.join(work, f"{name}.nii.gz")
+        nwarp_main([*args, "-prefix", p, flag])
+        out[name] = np.asarray(nib.load(p).dataobj).astype(np.float32)
+
+    sl = (slice(None), slice(None), slice(4, nz - 4), slice(6, nf - 6))
+    den = ideal[sl].std()
+    err = {k: float(np.sqrt(((v[sl] - ideal[sl]) ** 2).mean()) / den) for k, v in out.items()}
+
+    # Tissue-following must beat the frozen path in EVERY through-plane regime --
+    # the uncorrected sampler failed this at (interleaved, step=1) by ~8x.
+    assert err["follow"] < err["frozen"], (
+        f"tissue-following worse than frozen (interleaved={interleaved}, step={step}): "
+        f"follow={err['follow']:.4f} frozen={err['frozen']:.4f}"
+    )
+    assert err["follow"] < 0.02, f"tissue-following residual too large: {err['follow']:.4f}"
+
+
+def test_tap_slide_correction_vanishes_without_through_plane_motion():
+    """The tap-slide correction is scaled by (Delta_f - Delta_j). With in-plane-only
+    motion every tap reads the SAME scanner slice, so that factor is identically
+    zero and the sampler must reduce to the plain weighted tap average it used
+    before -- i.e. the fix cannot perturb data that never needed it.
+
+    Checked at the sampler level, where the tap poses can be held to pure in-plane
+    shifts. (End-to-end, `follow` and `frozen` legitimately differ under any motion:
+    frozen warps every tap at frame j's pose, which is the thing being fixed.)
+    """
+    import torch
+
+    from fastfuncstuff.processing.interp import warp_image_multi
+    from fastfuncstuff.processing.spacetime import (
+        TissueFollowingSampler,
+        interp_slice_times,
+        temporal_kernel_weights,
+    )
+
+    dev = torch.device("cpu")
+    nt, shape, nz = 24, (10, 10, 12), 12
+    tr, tinterp = 1.0, "cubic"
+    rng = np.random.default_rng(0)
+    src = torch.tensor(rng.normal(size=(nt, *shape[::-1])).astype(np.float32))
+    st = torch.tensor(_interleaved_slice_times(nz, tr).astype(np.float32))
+    tzero = float(st.mean())
+
+    kk, jj, ii = torch.meshgrid(
+        *[torch.arange(n, dtype=torch.float32) for n in (shape[2], shape[1], shape[0])],
+        indexing="ij",
+    )
+
+    def coords_fn(f):  # pure in-plane shift -> sz identical for every frame
+        return ii + 0.7 * np.sin(f / 3.0), jj + 0.5 * np.cos(f / 4.0), kk.clone()
+
+    sampler = TissueFollowingSampler(
+        src, coords_fn, (shape[2], shape[1], shape[0]), tr, tzero, st, dev, tinterp=tinterp
+    )
+    got = sampler.sample(nt // 2)
+
+    # Reference: plain normalised kernel average of the same tissue-following taps.
+    j, half = nt // 2, 2
+    num = torch.zeros_like(ii)
+    den = torch.zeros_like(ii)
+    delta_ref = None
+    for f in range(j - (half + 1), j + half + 2):
+        sx, sy, sz = coords_fn(f)
+        delta = interp_slice_times(sz, st)
+        if delta_ref is None or f == j:
+            delta_ref = interp_slice_times(coords_fn(j)[2], st)
+        w = temporal_kernel_weights((j - f) + (tzero - delta) / tr, tinterp)
+        tap = warp_image_multi([src[f]], sx - ii, sy - jj, sz - kk, mode="wsinc5")[0]
+        num = num + w * tap
+        den = den + w
+    want = num / den.clamp_min(1e-8)
+
+    d = float((got - want).abs().max())
+    assert d < 1e-4, f"correction fired without through-plane motion: {d:.2e}"

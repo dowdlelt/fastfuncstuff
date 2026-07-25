@@ -252,7 +252,8 @@ Examples:
         "correction is folded into the SAME resample as the warp chain "
         "(Roche 2011 joint space-time) -- the data is interpolated once, and "
         "the temporal shift follows the scanner slice each voxel lands in "
-        "after motion. Requires a 4-D -source and a TR; not usable with -phase.",
+        "after motion. Requires a 4-D -source and a TR. Works with -phase: the "
+        "complex channels go through the same space-time resample.",
     )
     st_group.add_argument(
         "-TR",
@@ -287,7 +288,8 @@ Examples:
         "neighbour at its own frame's pose instead of freezing the output frame's "
         "pose (the slow-motion assumption). Recovers the right signal when motion "
         "sweeps tissue between scanner locations frame to frame (e.g. a brain edge "
-        "moving in and out of a voxel). GPU cost is ~1%% over the frozen path.",
+        "moving in and out of a voxel), and corrects the non-uniform tap spacing that "
+        "through-plane motion creates. Measured ~20-25%% slower than -frozen.",
     )
     st_group.add_argument(
         "-frozen",

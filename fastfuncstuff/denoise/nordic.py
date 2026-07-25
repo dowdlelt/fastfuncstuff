@@ -83,6 +83,10 @@ class NordicConfig:
     make_complex_nii: bool = False
     full_dynamic_range: bool = False
     write_gzipped_niftis: bool = True
+    # Explicit output NIfTI extension (".nii", ".nii.gz", ".nii.zst"), taken from
+    # the CLI -prefix. Overrides write_gzipped_niftis; without it a caller asking
+    # for -prefix out.nii.zst silently got out.nii.gz.
+    nifti_ext: str | None = None
     svd_batch_size: int = 512
     decomp_method: str = "auto"
     verbose: bool = True
@@ -951,7 +955,7 @@ def _save_residual_qc(
 
     out_dir = Path(output_prefix).parent
     name = Path(output_prefix).name
-    ext = ".nii.gz" if cfg.write_gzipped_niftis else ".nii"
+    ext = cfg.nifti_ext or (".nii.gz" if cfg.write_gzipped_niftis else ".nii")
     # FDR runs through scipy on CPU; the QC maps are tiny volumes, so move them
     # off-device once here (avoids MPS/CUDA round-trip surprises downstream).
     max_r = max_r.cpu()
@@ -1720,7 +1724,7 @@ def _finalize_echo(
     out_dir = out_prefix.parent if out_prefix.parent != Path("") else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = ".nii.gz" if cfg.write_gzipped_niftis else ".nii"
+    ext = cfg.nifti_ext or (".nii.gz" if cfg.write_gzipped_niftis else ".nii")
 
     if cfg.make_complex_nii:
         magn_path = out_dir / f"{out_prefix.name}_magn{ext}"

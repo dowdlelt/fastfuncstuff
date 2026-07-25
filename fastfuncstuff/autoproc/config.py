@@ -44,6 +44,10 @@ DEFAULT_OPTS: dict[str, str] = {
     "anat": "-rigid -cost lpc -source_automask -autoweight -interp cubic -cmass -fast -final wsinc5",
     # final compose+resample (ffs_nwarp).
     "nwarp": "-interp wsinc5 -no_neg",
+    # ROMEO temporal phase unwrapping (-phase_proc). "-t epi" is the single-echo
+    # EPI timeseries mode (identical echo times); append a TE in ms if you want
+    # ROMEO's B0 output. NOT an ffs tool — romeo must be on $PATH.
+    "unwrap": "-t epi -v",
 }
 
 # Working / final / GLM output extensions. Intermediates default to zstd (read

@@ -297,3 +297,83 @@ def test_emitted_script_is_valid_bash(tmp_path):
     sh.write_text(script)
     res = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
+
+
+def _phase_run(session, task, run, **kw):
+    """A run that also has a part-phase bold (what -phase_proc requires)."""
+    r = _run(session, task, run, **kw)
+    r.phase_path = Path(str(r.mag_path).replace("_bold.nii.gz", "_part-phase_bold.nii.gz"))
+    return r
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+@pytest.mark.parametrize("nordic", [False, True])
+@pytest.mark.parametrize("stc", ["integrate", "first"])
+def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc):
+    """-phase_proc: ROMEO unwrap happens once up front (after NORDIC when NORDIC
+    runs), the phase is untouched in between, and the SAME warp chain carries it
+    at stage10 into a separately-labelled part-phase output."""
+    subj = Subject("X", [Session("SM", [_phase_run("SM", "primary", "1")])])
+    opt = Options(
+        phase_proc=True,
+        want_nordic=nordic,
+        noise_vols=3,
+        slicetiming_method=stc,
+        go_to_anat=False,
+        distortion=False,
+    )
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+
+    # ROMEO is an external dependency; the script's preflight must catch a missing one.
+    assert " romeo; do" in s
+    assert "PHASE_FMT=.gz" in s  # ROMEO can't read .zst
+    assert 'romeo -p "$ph" -m "$mag" -o "$uw" -t epi -v' in s
+
+    unwrapped = "stage00.unwrap.${FRAG[$k]}.part-phase.nii$PHASE_FMT"
+    if nordic:
+        # NORDIC already wrote the denoised pair AND trimmed the noise volumes.
+        assert 'ph="stage00.nordic.${FRAG[$k]}_phase.nii$PHASE_FMT"' in s
+        assert "stage00.trim." not in s
+        assert s.index("stage00: NORDIC") < s.index("stage00: phase unwrap")
+    else:
+        # No NORDIC: noise volumes must come off BOTH before unwrapping, and
+        # ROMEO needs real files rather than [0..n] selectors.
+        assert 'tp="stage00.trim.${FRAG[$k]}.part-phase.nii$PHASE_FMT"' in s
+        assert '-input "${ph}[0..$last]"' in s
+
+    # Slice timing done up front must be applied to the phase too, and that
+    # tshifted phase is what reaches stage10.
+    if stc == "first":
+        assert f'-input "{unwrapped}"' in s
+        phase_in = "stage01.tshift.${FRAG[$k]}.part-phase.nii$PHASE_FMT"
+    else:
+        phase_in = unwrapped
+    assert f'-phase \\"{phase_in}\\" -phase_units rad -phase_warp direct' in s
+    assert '-phase_prefix \\"$phoutf\\"' in s
+    assert 'phoutf="stage10.final.${FRAG[$k]}.part-phase.nii$FINAL_FMT"' in s
+
+    # Nothing between stage00 and stage10 touches the phase: no other stage
+    # references a part-phase file.
+    body = s[s.index("stage02: motion correction") : s.index("stage10: compose + resample")]
+    assert "part-phase" not in body
+
+
+def _write(path, text):
+    path.write_text(text)
+    return path
+
+
+def test_phase_proc_off_emits_no_phase_machinery():
+    subj = Subject("X", [Session("SM", [_phase_run("SM", "primary", "1")])])
+    s = write_script(build_plan(subj, Options(go_to_anat=False, distortion=False)), "wd")
+    # The PHASE[] data-array entry is always emitted (NORDIC may want it); the
+    # unwrap stage, ROMEO, and the phase-side outputs must not be.
+    assert "PHASE_FMT" not in s and "romeo" not in s
+    assert "stage00.unwrap" not in s and "-phase_prefix" not in s

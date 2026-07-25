@@ -1708,7 +1708,8 @@ def nwarpforge(
         slice_times: Per-slice acquisition offsets (seconds), length == source
             slices. When given, slice-timing correction is folded into the same
             resample as the warp chain (Roche 2011 joint space-time). Requires a
-            4-D source and a real TR; incompatible with -phase. See
+            4-D source and a real TR. Phase rides along (the complex channels go
+            through the same space-time map; see _phase_spacetime_channels). See
             processing/spacetime.py.
         tr: Repetition time (seconds), required with slice_times.
         tzero: Reference time within the TR all slices align to (seconds).
