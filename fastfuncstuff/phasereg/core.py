@@ -76,6 +76,27 @@ class PhaseRegResult:
     sgf_window_map, sgf_order_map : Tensor (n_voxels,) or None
         Per-voxel SGF window length and polynomial order chosen by the
         data-driven search.  Only populated when phase_filter='explore'.
+    spr_donor : Tensor (n_voxels,) or None
+        Index of the neighbouring voxel whose phase was used as the regressor
+        (== own index where the voxel's own phase won, i.e. standard PR).
+        Only populated when spr=True.
+    spr_donor_corr : Tensor (n_voxels,) or None
+        Signed corr(magnitude_i, phase_donor) at the selected donor — the
+        z-scored sPR slope of Vu & Gallant 2015 Eq. 12.  Only when spr=True.
+    spr_donor_offset : Tensor (n_voxels,) or None
+        Euclidean distance in voxels from the target to its donor (0 = self).
+        Handy as a QC map: a rim of non-zero offsets tracing a vessel is sPR
+        doing exactly what it is meant to do.  Only when spr=True.
+    coupling_r : Tensor (n_voxels,) or None
+        Pearson correlation between the magnitude and phase series the slope was
+        fit on.  Only when vein_mask=True.
+    vein_p : Tensor (n_voxels,) or None
+        Two-sided p-value that ``coupling_r`` exceeds chance, Sidak-corrected for
+        the sPR donor argmax.  Only when vein_mask=True.
+    vein_exclude : Tensor (n_voxels,), bool, or None
+        True where the voxel is flagged as vessel-dominated at the requested FDR
+        q — i.e. the voxels to EXCLUDE from a layer profile.  Only when
+        vein_mask=True.
     """
 
     magnitude_corrected: torch.Tensor
@@ -93,6 +114,12 @@ class PhaseRegResult:
     pha_residual_filt: torch.Tensor | None = None
     sgf_window_map: torch.Tensor | None = None
     sgf_order_map: torch.Tensor | None = None
+    spr_donor: torch.Tensor | None = None
+    spr_donor_corr: torch.Tensor | None = None
+    spr_donor_offset: torch.Tensor | None = None
+    coupling_r: torch.Tensor | None = None
+    vein_p: torch.Tensor | None = None
+    vein_exclude: torch.Tensor | None = None
 
 
 def _project_out(data: torch.Tensor, design: torch.Tensor) -> torch.Tensor:
@@ -111,6 +138,21 @@ def _project_out(data: torch.Tensor, design: torch.Tensor) -> torch.Tensor:
         return data
     Q, _ = torch.linalg.qr(design)
     return data - Q @ (Q.T @ data)
+
+
+def _voxel_coords(
+    volume_shape: tuple[int, int, int],
+    mask_flat: torch.Tensor | None,
+) -> torch.Tensor:
+    """(x, y, z) grid coordinates of each voxel in the masked data array."""
+    nx, ny, nz = volume_shape
+    grid = torch.stack(
+        torch.meshgrid(torch.arange(nx), torch.arange(ny), torch.arange(nz), indexing="ij"),
+        dim=-1,
+    ).reshape(-1, 3)
+    if mask_flat is None:
+        return grid
+    return grid[torch.as_tensor(mask_flat).reshape(-1).bool()]
 
 
 def _build_task_design_tent(
@@ -314,6 +356,14 @@ def phase_regress(
     sgf_step: int = 4,
     signal_thresh: float = 0.03,
     keep_drift: bool = False,
+    shrink_mode: str = "odr",
+    vein_mask: bool = False,
+    vein_fdr_q: float = 0.05,
+    spr: bool = False,
+    spr_connectivity: int = 6,
+    spr_select_run: int | None = None,
+    volume_shape: tuple[int, int, int] | None = None,
+    mask_flat: torch.Tensor | None = None,
     device: str | torch.device = "cpu",
     chunk_size: int = 50000,
     verbose: bool = False,
@@ -381,6 +431,54 @@ def phase_regress(
         preserved in the corrected output (subtract macro from raw mag),
         leaving low-order drift for a downstream GLM to model. The macro
         magnitude removed is unaffected by this flag.
+    shrink_mode : {"odr", "none"}
+        Whether to apply the ODR shrinkage factor 1/(1 + A²/φ) to the
+        correction.  "odr" (default) is phaseprep/Stanley parity and is what
+        makes ill-conditioned voxels degrade gracefully to their mean instead
+        of speckling.  But it is *not* free: in raw scanner units A²/φ sits
+        near 1 across much of the brain, so roughly half the fitted
+        macrovascular component is discarded before it is subtracted.  If
+        your complaint is that veins survive phase regression, this is a
+        prime suspect — "none" applies the textbook M − A·φ at full strength.
+        Expect speckle in low-phase-variance voxels if you do; keep
+        ``signal_thresh`` on and inspect the slope map.
+    vein_mask : bool
+        Also emit a vein *exclusion* mask alongside the corrected series.
+        Rather than subtracting a macrovascular estimate, this tests whether the
+        voxel's magnitude covaries with phase more than chance; randomly-oriented
+        microvasculature produces no coherent phase change, so a significant
+        correlation is direct evidence of an oriented vessel.  Intended for
+        laminar / layer-extraction workflows that want to drop contaminated
+        voxels outright.  Does not alter the corrected time series.
+    vein_fdr_q : float
+        Benjamini-Hochberg q for the mask.  The correlation is Sidak-corrected
+        for the sPR donor argmax before FDR.
+    spr : bool
+        Enable source-localized phase regression (Vu & Gallant 2015).  Instead
+        of regressing each voxel's magnitude on its *own* phase, regress it on
+        the phase of whichever voxel in its spatial neighbourhood best tracks
+        it.  This recovers vein-filled voxels whose own phase fSNR is near zero
+        (vein ≈ voxel size, or near the magic angle) by borrowing phase from a
+        vein-adjacent neighbour.  Requires ``volume_shape``.  Vu's estimator is
+        plain OLS on the donor phase, so pair with ``regression="ols"``.
+    spr_connectivity : {6, 18, 26}
+        Donor search neighbourhood.  6 (face-adjacent, Vu & Gallant's choice)
+        is the default; larger neighbourhoods search harder but increase the
+        selection bias described under ``spr_select_run``.
+    spr_select_run : int or None
+        0-based index of the run used *only* to select donors, which are then
+        applied to every run.  Vu & Gallant do this (their first run is set
+        aside for exactly this purpose) so that the argmax over neighbours is
+        not fit and evaluated on the same data.  None (default) selects donors
+        on all runs concatenated — simpler and necessary for single-run data,
+        but the selection is then in-sample and biases mildly toward
+        over-suppression.
+    volume_shape : (nx, ny, nz) or None
+        Shape of the 3-D grid the voxel axis was flattened from.  Required for
+        ``spr``; ignored otherwise.
+    mask_flat : Tensor (nx*ny*nz,) bool or None
+        Which volume voxels are present in the data array, so sPR can rebuild
+        spatial adjacency after masking.  None means the data are unmasked.
     device : str or torch.device
         PyTorch device for computation.
     chunk_size : int
@@ -586,6 +684,71 @@ def phase_regress(
             f"order median={int(om.median())} [{int(om.min())}, {int(om.max())}]"
         )
 
+    # ── 5b. sPR: swap in each voxel's best neighbouring phase regressor ───
+    # Donor selection runs on the DETRENDED series, not the task-residualised
+    # one: the signal that identifies a vein is precisely the task-related
+    # phase change, so residualising the task out first would erase the thing
+    # being searched for. The slope is still fit on whatever series
+    # `task_removal` dictates.
+    spr_donor: torch.Tensor | None = None
+    spr_donor_corr: torch.Tensor | None = None
+    spr_donor_offset: torch.Tensor | None = None
+    if spr:
+        from fastfuncstuff.phasereg.spr import build_neighbor_index, select_phase_donor
+
+        if volume_shape is None:
+            raise ValueError("spr=True requires volume_shape=(nx, ny, nz)")
+
+        neighbors = build_neighbor_index(volume_shape, mask_flat, spr_connectivity)
+        if neighbors.shape[0] != n_voxels:
+            raise ValueError(
+                f"sPR neighbour index has {neighbors.shape[0]} voxels but data has "
+                f"{n_voxels}; volume_shape/mask_flat do not match the data array"
+            )
+
+        if spr_select_run is not None:
+            if not 0 <= spr_select_run < n_runs:
+                raise ValueError(
+                    f"spr_select_run={spr_select_run} out of range for {n_runs} run(s)"
+                )
+            lo = sum(n_tp_per_run[:spr_select_run])
+            hi = lo + n_tp_per_run[spr_select_run]
+            sel_mag = mag_detrended[lo:hi]
+            sel_pha = pha_detrended_filt[lo:hi]
+        else:
+            sel_mag = mag_detrended
+            sel_pha = pha_detrended_filt
+
+        if verbose:
+            where = f"run {spr_select_run}" if spr_select_run is not None else "all runs"
+            print(f"  sPR: selecting phase donors ({spr_connectivity}-connected, on {where})...")
+
+        spr_donor, spr_donor_corr = select_phase_donor(
+            sel_mag, sel_pha, neighbors, device=device, chunk_size=chunk_size
+        )
+        del sel_mag, sel_pha
+
+        # Substituting the donor series here means phi, the slope fit, and the
+        # applied correction all use the donor phase with no further changes.
+        pha_detrended_filt = pha_detrended_filt[:, spr_donor]
+        pha_residual_filt = pha_residual_filt[:, spr_donor]
+
+        borrowed = spr_donor != torch.arange(n_voxels)
+        spr_donor_offset = torch.zeros(n_voxels)
+        if volume_shape is not None:
+            coords = _voxel_coords(volume_shape, mask_flat)
+            spr_donor_offset = (coords[spr_donor] - coords).float().norm(dim=1)
+
+        if verbose:
+            n_borrow = int((borrowed & vox_mask).sum().item())
+            n_tot = int(vox_mask.sum().item())
+            print(
+                f"  sPR: {n_borrow:,} / {n_tot:,} masked voxels "
+                f"({100.0 * n_borrow / max(n_tot, 1):.1f}%) borrowed a neighbour's phase"
+            )
+            gain = spr_donor_corr[vox_mask].abs()
+            print(f"  sPR: |corr| at chosen donor: median={gain.median().item():.3f}")
+
     # ── 6. Estimate phi (if not provided) ────────────────────────────────
     if phi is None:
         if verbose:
@@ -615,7 +778,12 @@ def phase_regress(
     intercept_all = torch.zeros(n_voxels)
 
     pha_mean = pha_detrended_filt.mean(dim=0)
-    pha_var = pha_detrended_filt.var(dim=0)
+    # Gate on the series the slope is FIT on, not the one it is applied to.
+    # With task_removal='none' these are the same tensor; with task removal
+    # active they differ, and gating on the wrong one lets a voxel whose
+    # residual phase is flat (all its variance absorbed by the task model)
+    # through to a Cov/Var slope that explodes.
+    pha_var = pha_residual_filt.var(dim=0)
 
     # Phase variance floor: in voxels where the phase barely varies
     # (air, skull, or genuinely flat phase), Var(phase) → 0 makes the
@@ -662,6 +830,43 @@ def phase_regress(
             f"{n_sig:,} voxels with |slope| > 0.01"
         )
 
+    # ── 7b. Vein exclusion mask from magnitude-phase coupling ────────────
+    coupling_r: torch.Tensor | None = None
+    vein_p: torch.Tensor | None = None
+    vein_exclude: torch.Tensor | None = None
+    if vein_mask:
+        from fastfuncstuff.phasereg.veinmask import coupling_pvalue, fdr_threshold
+
+        mc = mag_residual - mag_residual.mean(dim=0, keepdim=True)
+        pc = pha_residual_filt - pha_residual_filt.mean(dim=0, keepdim=True)
+        denom = (mc.norm(dim=0) * pc.norm(dim=0)).clamp(min=1e-30)
+        coupling_r = (mc * pc).sum(dim=0) / denom
+        del mc, pc
+
+        # Every regressor projected out of both series costs a degree of
+        # freedom, as do the fitted slope and intercept.
+        n_nuisance = sum(p.shape[1] for p in poly_per_run)
+        n_nuisance += sum(t.shape[1] for t in task_per_run if t is not None)
+        df = sum(n_tp_per_run) - n_nuisance - 2
+
+        n_cand = (spr_connectivity + 1) if spr else 1
+        vein_p = coupling_pvalue(coupling_r, df, n_candidates=n_cand)
+        vein_p = torch.where(vox_mask, vein_p, torch.ones_like(vein_p))
+
+        p_crit = fdr_threshold(vein_p, vox_mask, vein_fdr_q)
+        vein_exclude = (vein_p <= p_crit) & vox_mask
+
+        if verbose:
+            n_ex = int(vein_exclude.sum().item())
+            n_tot = int(vox_mask.sum().item())
+            print(
+                f"  Vein mask: df={df}, FDR q={vein_fdr_q} → p<={p_crit:.3g}; "
+                f"{n_ex:,} / {n_tot:,} voxels flagged as vessel "
+                f"({100.0 * n_ex / max(n_tot, 1):.1f}%)"
+            )
+            if n_cand > 1:
+                print(f"    (Sidak-corrected for {n_cand} sPR donor candidates)")
+
     # ── 8. Compute detrended macro component (for diagnostics) ────────────
     # R2 and diagnostics use detrended data so the fit quality is measured
     # on the same data the slope was estimated from.
@@ -688,7 +893,12 @@ def phase_regress(
     # voxelwise with phaseprep.
 
     inflation = 1.0 + (slope_all * slope_all) / phi_tensor.clamp(min=1e-12)
-    shrink = 1.0 / inflation  # (n_voxels,)
+    if shrink_mode == "odr":
+        shrink = 1.0 / inflation  # (n_voxels,)
+    elif shrink_mode == "none":
+        shrink = torch.ones_like(inflation)
+    else:
+        raise ValueError(f"Unknown shrink_mode: {shrink_mode!r}. Use 'odr' or 'none'.")
 
     mag_mean_dt = mag_detrended.mean(dim=0)  # ≈ 0 with Legendre
     ss_total = ((mag_detrended - mag_mean_dt) ** 2).sum(dim=0)
@@ -734,6 +944,17 @@ def phase_regress(
             f">2: {int((infl_good > 2).sum().item()):,} voxels, "
             f">10: {int((infl_good > 10).sum().item()):,} voxels"
         )
+        if shrink_mode == "none":
+            print(
+                "    shrink_mode='none': applying the FULL correction; the "
+                "inflation numbers above are what parity mode would discard."
+            )
+        else:
+            frac = (1.0 / infl_good).median().item()
+            print(
+                f"    shrink_mode='odr': median {100.0 * (1 - frac):.0f}% of the "
+                f"fitted macro component is discarded before subtraction."
+            )
         n_total = int(vox_mask.sum().item())
         print(f"  R2 distribution over {n_total:,} masked voxels:")
         for thresh in (0.01, 0.05, 0.10, 0.20, 0.30, 0.50):
@@ -798,4 +1019,10 @@ def phase_regress(
         pha_residual_filt=interm_pha_res_filt,
         sgf_window_map=sgf_window_map,
         sgf_order_map=sgf_order_map,
+        spr_donor=spr_donor,
+        spr_donor_corr=spr_donor_corr,
+        spr_donor_offset=spr_donor_offset,
+        coupling_r=coupling_r,
+        vein_p=vein_p,
+        vein_exclude=vein_exclude,
     )

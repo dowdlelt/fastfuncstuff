@@ -58,6 +58,22 @@ RECOMMENDED PIPELINES
     ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
                  -prefix pr -phase_filter explore
 
+  7T laminar: veins SURVIVE standard PR (Vu & Gallant 2015 sPR).
+  A vein about the size of a voxel has almost no phase of its own, so
+  standard PR either leaves it untouched or blows up an ill-conditioned
+  slope and flattens the voxel. -spr borrows phase from the vein-adjacent
+  neighbour that does carry it; -shrink none stops half the fitted macro
+  component being discarded before subtraction:
+    ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
+                 -prefix pr -spr -shrink none -phase_filter explore
+
+  Layer extraction: EXCLUDE vessel voxels instead of correcting them.
+  Writes prefix_vein_keep as the inverse mask to feed a layer profile.
+  Regression preserves laminar structure (all layers go in, outer ones
+  suppressed); the mask is the complementary "drop it" option:
+    ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
+                 -prefix pr -vein_mask -vein_fdr 0.01
+
 OUTPUTS
   prefix_corrected.nii.gz   M_micro time series (4D)
   prefix_macro.nii.gz       what was subtracted (4D)
@@ -69,6 +85,12 @@ OUTPUTS
   prefix_mask.nii.gz        analysis mask (3D)
   prefix_sgf_window.nii.gz  per-voxel SGF window chosen (3D) [-phase_filter explore]
   prefix_sgf_order.nii.gz   per-voxel SGF order chosen (3D) [-phase_filter explore]
+  prefix_spr_donor_corr.nii.gz    corr(mag, donor phase) at chosen donor (3D) [-spr]
+  prefix_spr_donor_offset.nii.gz  distance in voxels to the donor, 0=self (3D) [-spr]
+  prefix_vein_mask.nii.gz   voxels to EXCLUDE as vessel-dominated (3D) [-vein_mask]
+  prefix_vein_keep.nii.gz   its complement within the analysis mask (3D) [-vein_mask]
+  prefix_vein_p.nii.gz      p-value of magnitude-phase coupling (3D) [-vein_mask]
+  prefix_coupling_r.nii.gz  corr(magnitude, phase) the test is built on (3D) [-vein_mask]
 
   Intermediates (written with -save_intermediates):
   prefix_mag_dt.nii.gz      magnitude after poly detrending (4D)
@@ -160,6 +182,34 @@ Every run writes these (3D = one value per voxel, 4D = a time series):
       noise) used by the Deming fit. Mostly a diagnostic: it sets how much the
       errors-in-variables fit trusts phase vs magnitude, and it drives the
       shrinkage above. Constant across the brain only if you passed -phi.
+
+  prefix_spr_donor_offset.nii.gz  (3D)  [-spr] Distance in voxels to the
+      neighbour whose phase was borrowed; 0 = the voxel kept its own phase
+      (i.e. standard PR). QC LOOK: non-zero values should trace vessels, not
+      scatter uniformly. A vessel-shaped rim of 1s is sPR doing its job. Salt-
+      and-pepper 1s everywhere means the donor search is fitting noise — raise
+      phase SNR (NORDIC, -phase_filter explore) before trusting the result.
+
+  prefix_spr_donor_corr.nii.gz    (3D)  [-spr] Signed corr(magnitude, donor
+      phase) at the chosen donor — Vu & Gallant's z-scored sPR slope. Low
+      |values| brain-wide mean no neighbour had usable phase either.
+
+  IF VEINS SURVIVE PHASE REGRESSION (the common 7T laminar complaint), the
+  slope map is the first thing to read. Two distinct failure modes look
+  similar in an activation map but differ completely in prefix_slope:
+    * Slope ~ 0: the voxel's phase carries no task signal, so nothing is
+      subtracted and the vein passes straight through. This is the vein-about-
+      the-size-of-a-voxel / magic-angle case. Fix: -spr.
+    * Slope enormous (1e3-1e5): an ill-conditioned fit against phase noise.
+      The 1/(1+A^2/phi) shrinkage then collapses the voxel to its mean, which
+      LOOKS like perfect suppression but has destroyed the voxel's thermal
+      noise along with everything else. Check prefix_corrected's temporal std:
+      if it is far below neighbouring grey matter, the voxel was flattened,
+      not corrected. Fix: -spr gives the voxel a real regressor and the slope
+      drops to a sane value.
+  A third, quieter cause is the shrinkage itself: in raw scanner units
+  A^2/phi ~ 1, so roughly half the fitted macro component is discarded before
+  subtraction even in well-behaved voxels. See -shrink none.
 
   prefix_mask.nii.gz       (3D)  Which voxels were actually fit (1) vs skipped
       as air/skull/low-SNR (0). Everything outside it is zero in the 3D maps.
@@ -406,11 +456,17 @@ def create_parser() -> argparse.ArgumentParser:
         "behaviour as 'none' but on a smoother phase, which acts as a "
         "phase-noise regulariser: it removes high-frequency phase content "
         "before the slope fit, changing slope/macro (and r2). "
-        "'explore': per-voxel data-driven parameter search "
-        "optimising |Pearson r(filtered_phase, mag_dt)| (Barry & Gore "
-        "2014's phase-magnitude correlation criterion — NOT our ODR-"
-        "shrinkage R², which is dominated by 1/(1+A²/φ) and would be a "
-        "poor filter-quality metric). Computationally expensive. "
+        "'explore': per-voxel data-driven parameter search. Barry & Gore "
+        "define the optimal (N, p) as the pair MINIMISING the temporal "
+        "variance of the phase-regressed magnitude, i.e. maximising "
+        "R2 = 1 - sigma_PR/sigma_orig. We maximise |Pearson r(filtered_phase, "
+        "mag_dt)| instead, which for an OLS fit is the identical argmax "
+        "(residual variance = var_mag * (1 - r^2)) but costs one correlation "
+        "rather than a full refit per grid point. Under Deming the two "
+        "criteria can differ slightly, since the ODR shrinkage 1/(1+A^2/phi) "
+        "also moves with the fit. The unfiltered series competes as a "
+        "candidate, so voxels with good phase SNR can decline filtering "
+        "(Barry & Gore step 3); those report window=order=0. Expensive. "
         "Recommended at 7T where phase SNR is low (Hagberg et al 2008 "
         "found k_phi >> k_mag).",
     )
@@ -420,8 +476,15 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="SGF window length in TRs (must be odd; auto-incremented if "
-        "even). Default: auto = round(20s / TR), floored at 5. Larger "
-        "= more smoothing. Only used with -phase_filter sgf.",
+        "even). Larger = more smoothing. Default: auto = round(20s / TR), "
+        "floored at 5. Treat that default as a placeholder, not a "
+        "recommendation: it is NOT from Barry & Gore, who explored N over "
+        "5..n_TR/2 per voxel precisely because the right window is not "
+        "knowable a priori. Note 20 s is also close to the duration of the "
+        "HRF itself, so this window can smooth away the task-locked phase "
+        "modulation you are trying to regress with, especially in block "
+        "designs. Prefer -phase_filter explore, or set this deliberately from "
+        "your design's timescale. Only used with -phase_filter sgf.",
     )
     pfilt.add_argument(
         "-sgf_order",
@@ -437,7 +500,9 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="EXPLORE grid: largest window (odd) searched per voxel. "
-        "Default: min(n_TRs, 97). Only used with -phase_filter explore.",
+        "Default: n_TRs // 2, matching Barry & Gore (N <= 49 for their 96-TR "
+        "runs, N <= 97 for their 192-TR PRESTO runs). Only used with "
+        "-phase_filter explore.",
     )
     pfilt.add_argument(
         "-sgf_order_max",
@@ -445,7 +510,10 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="P",
         help="EXPLORE grid: largest polynomial order searched per voxel "
-        "(min is 2). Default: 5. Only used with -phase_filter explore.",
+        "(min is 2). Default: sgf_window_max // 4, i.e. ~12 for a 96-TR run "
+        "and ~24 for 192 TRs, matching Barry & Gore. The previous default of "
+        "5 was not from the paper and made only the heavily-smoothing corner "
+        "of the grid reachable. Only used with -phase_filter explore.",
     )
     pfilt.add_argument(
         "-sgf_step",
@@ -455,6 +523,105 @@ def create_parser() -> argparse.ArgumentParser:
         help="EXPLORE grid: window step (odd-ified) between candidate "
         "windows. Smaller = finer, slower search. Default: 4. Only used "
         "with -phase_filter explore.",
+    )
+
+    parser.add_argument(
+        "-shrink",
+        choices=["odr", "none"],
+        default="odr",
+        help="Whether the ODR shrinkage factor 1/(1+A^2/phi) is applied to the "
+        "correction. 'odr' (default) is phaseprep/Stanley parity and makes "
+        "ill-conditioned voxels decay to their mean rather than speckle. It is "
+        "not free: with magnitude in raw scanner units A^2/phi sits near 1 over "
+        "much of the brain, so roughly HALF the fitted macrovascular component "
+        "is thrown away before it is subtracted. If veins are surviving phase "
+        "regression, try 'none' — it applies the textbook M - A*phi at full "
+        "strength. Verbose output reports how much parity mode is discarding.",
+    )
+
+    vg = parser.add_argument_group("Vein Exclusion Mask")
+    vg.add_argument(
+        "-vein_mask",
+        action="store_true",
+        help="Also write a vein EXCLUSION mask: voxels whose magnitude covaries "
+        "with phase more than chance. Randomly-oriented microvasculature "
+        "produces magnitude change with no coherent phase change, so a "
+        "significant magnitude-phase correlation is direct evidence of an "
+        "oriented vessel. Intended for laminar / layer-extraction workflows "
+        "that would rather DROP contaminated voxels than trust a subtraction: "
+        "no slope is applied, so nothing can be over- or under-corrected. "
+        "Complements the corrected output rather than replacing it — the "
+        "corrected series is unchanged by this flag. Same logic as the "
+        "H_c-vs-H_a contrast of Rowe 2005, without fitting the full "
+        "complex-valued GLM. "
+        "INTERACTION WITH -spr, a real trade-off: without -spr the test uses "
+        "the voxel's OWN phase, which is specific (grey matter phase is not "
+        "task-locked) but MISSES the phase-blind veins -spr exists for. With "
+        "-spr the test uses the donor's phase, which catches them, but also "
+        "flags healthy grey matter that merely borrowed a strong nearby phase "
+        "source — in practice dilating the mask by about one voxel around each "
+        "source. For a conservative exclusion mask that dilation may be what "
+        "you want (vein-adjacent voxels are partly contaminated anyway); for a "
+        "tight one, omit -spr. Inspect prefix_coupling_r before committing.",
+    )
+    vg.add_argument(
+        "-vein_fdr",
+        type=float,
+        default=0.05,
+        metavar="Q",
+        help="Benjamini-Hochberg q for -vein_mask. Lower = fewer voxels "
+        "excluded. The correlation is Sidak-corrected for the sPR donor argmax "
+        "before FDR, so -spr does not silently inflate the mask. Default: 0.05.",
+    )
+
+    # ── Source-localized phase regression ────────────────────────────────
+    sprg = parser.add_argument_group("Source-Localized Phase Regression (sPR; Vu & Gallant 2015)")
+    sprg.add_argument(
+        "-spr",
+        action="store_true",
+        help="Regress each voxel's magnitude on the phase of whichever "
+        "neighbour best tracks it, instead of on its own phase. Targets the "
+        "dominant PR failure mode at 7T: a vein roughly the size of a voxel "
+        "straddles the whole off-resonance dipole, so its sampled field "
+        "offsets cancel and its own phase fSNR is near zero — huge magnitude "
+        "change, no phase to regress it away with, vein survives. Adjacent "
+        "voxels sample one polarity of the dipole and DO have high phase "
+        "fSNR. Also recovers veins near the magic angle (~54.7 deg), where "
+        "intravascular phase accrual vanishes. "
+        "NOTE sPR has two separable halves and they pull in OPPOSITE "
+        "directions. (1) Donor borrowing (this flag) finds phase where the "
+        "voxel had none, so it suppresses MORE. (2) Vu also swaps Menon's "
+        "chi-squared loss for plain OLS, which suppresses LESS — that half "
+        "exists to fix over-correction (Nencka & Rowe 2007), a problem you "
+        "only have if PR is eating your grey-matter signal. If your complaint "
+        "is that veins SURVIVE, take the donor and keep -regression deming. "
+        "Use -regression ols only for literal Vu & Gallant parity.",
+    )
+    sprg.add_argument(
+        "-spr_neighborhood",
+        "-spr_connectivity",
+        type=int,
+        choices=[6, 18, 26],
+        default=6,
+        dest="spr_neighborhood",
+        metavar="K",
+        help="Donor search neighbourhood: 6 = face-adjacent (Vu & Gallant's "
+        "7-voxel set: self + 6 faces), 18 adds edges, 26 the full 3x3x3. "
+        "Vu chose 6 as the smallest sensible increment over standard PR and "
+        "left larger neighbourhoods explicitly open. Bigger K searches harder "
+        "but the argmax overfits more (see -spr_select_run). Default: 6.",
+    )
+    sprg.add_argument(
+        "-spr_select_run",
+        type=int,
+        default=None,
+        metavar="R",
+        help="0-based run used ONLY to pick donors, which are then applied to "
+        "all runs. Vu & Gallant set aside their first run for exactly this, so "
+        "the argmax over neighbours is not chosen and evaluated on the same "
+        "data. Omit (default) to select on all runs concatenated — required "
+        "for single-run data, but then donor selection is in-sample and biases "
+        "mildly toward over-suppression.",
     )
 
     # ── Processing options ───────────────────────────────────────────────
@@ -900,6 +1067,14 @@ def main(argv: list[str] | None = None) -> int:
         sgf_step=args.sgf_step,
         signal_thresh=args.signal_thresh,
         keep_drift=args.keep_drift,
+        shrink_mode=args.shrink,
+        vein_mask=args.vein_mask,
+        vein_fdr_q=args.vein_fdr,
+        spr=args.spr,
+        spr_connectivity=args.spr_neighborhood,
+        spr_select_run=args.spr_select_run,
+        volume_shape=(nx, ny, nz),
+        mask_flat=mask_flat,
         device=str(device),
         verbose=args.verb >= 1,
         r2_mode=args.r2_mode,
@@ -972,6 +1147,46 @@ def main(argv: list[str] | None = None) -> int:
             reference_img=ref_img_path,
         )
         outputs["mask"] = fname
+
+        # Vein exclusion mask: the voxels to DROP from a layer profile.
+        if result.vein_exclude is not None and result.vein_p is not None:
+            fname = f"{args.prefix}_vein_mask{nii_ext}"
+            save_nifti(
+                _to_volume(result.vein_exclude.numpy().astype(np.float32)),
+                fname,
+                reference_img=ref_img_path,
+            )
+            outputs["vein_mask"] = fname
+
+            fname = f"{args.prefix}_vein_keep{nii_ext}"
+            keep = result.voxel_mask & ~result.vein_exclude
+            save_nifti(
+                _to_volume(keep.numpy().astype(np.float32)), fname, reference_img=ref_img_path
+            )
+            outputs["vein_keep"] = fname
+
+            fname = f"{args.prefix}_vein_p{nii_ext}"
+            save_nifti(_to_volume(result.vein_p.numpy()), fname, reference_img=ref_img_path)
+            outputs["vein_p"] = fname
+
+            if result.coupling_r is not None:
+                fname = f"{args.prefix}_coupling_r{nii_ext}"
+                save_nifti(_to_volume(result.coupling_r.numpy()), fname, reference_img=ref_img_path)
+                outputs["coupling_r"] = fname
+
+        # sPR diagnostics: where phase was borrowed from, and how well it fit.
+        if result.spr_donor_corr is not None and result.spr_donor_offset is not None:
+            fname = f"{args.prefix}_spr_donor_corr{nii_ext}"
+            save_nifti(_to_volume(result.spr_donor_corr.numpy()), fname, reference_img=ref_img_path)
+            outputs["spr_donor_corr"] = fname
+
+            fname = f"{args.prefix}_spr_donor_offset{nii_ext}"
+            save_nifti(
+                _to_volume(result.spr_donor_offset.numpy()),
+                fname,
+                reference_img=ref_img_path,
+            )
+            outputs["spr_donor_offset"] = fname
 
         # Explore-mode diagnostic: the per-voxel window/order the search chose.
         if result.sgf_window_map is not None and result.sgf_order_map is not None:

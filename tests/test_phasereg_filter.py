@@ -61,12 +61,17 @@ def test_explore_populates_param_maps():
     assert res_ex.sgf_window_map is not None
     assert res_ex.sgf_order_map is not None
     assert res_ex.sgf_window_map.shape == (mag.shape[0],)
-    # Chosen windows must be odd and within the (default) search grid.
+    # Chosen windows are odd, or 0 where the unfiltered series won the search
+    # (Barry & Gore step 3). Grid bounds default to n_tp//2 and window_max//4.
+    n_tp = mag.shape[1]
     wm = res_ex.sgf_window_map
-    assert bool((wm % 2 == 1).all()), "chosen windows must be odd"
-    assert int(wm.max()) <= min(mag.shape[1], 97)
     om = res_ex.sgf_order_map
-    assert int(om.min()) >= 2 and int(om.max()) <= 5
+    unfiltered = wm == 0
+    assert bool((wm[~unfiltered] % 2 == 1).all()), "chosen windows must be odd"
+    assert int(wm.max()) <= n_tp // 2
+    assert bool((om[unfiltered] == 0).all()), "order must be 0 where window is 0"
+    assert int(om[~unfiltered].min()) >= 2
+    assert int(om.max()) <= (n_tp // 2) // 4
 
 
 def test_explore_grid_bounds_respected():

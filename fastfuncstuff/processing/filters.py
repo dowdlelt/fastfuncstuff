@@ -132,6 +132,13 @@ def savgol_filter_explore(
     selects the one that optimises *metric_fn*.  If metric_fn is not
     provided, returns the unfiltered data (pass-through).
 
+    The **unfiltered** series competes as a candidate alongside every (N, p)
+    pair.  This is step 3 of Barry & Gore's algorithm: "if R²_no_filtering >
+    R²_SGF then the resultant time series after standard PR is retained".
+    A few voxels have phase SNR high enough that filtering only costs them
+    signal, and the search must be able to say so.  (Earlier versions seeded
+    the running best at -inf, so any filter — however harmful — always won.)
+
     Parameters
     ----------
     data : Tensor, shape (n_voxels, n_timepoints)
@@ -142,11 +149,11 @@ def savgol_filter_explore(
     min_window : int
         Minimum SGF window (odd).
     max_window : int or None
-        Maximum SGF window.  None = min(n_timepoints, 97).
+        Maximum SGF window.  None = n_timepoints // 2 (Barry & Gore).
     min_order : int
         Minimum polynomial order.
     max_order : int or None
-        Maximum polynomial order.  None = max_window - 1.
+        Maximum polynomial order.  None = max_window // 4 (Barry & Gore).
     step : int
         Step between window sizes (kept odd).
     metric_fn : callable or None
@@ -171,10 +178,16 @@ def savgol_filter_explore(
             return data, zeros, zeros.clone()
         return data
 
+    # Barry & Gore search N up to roughly half the run length (N <= 49 for 96
+    # timepoints, N <= 97 for 192) and p up to N/4-ish (12 and 24 for those two
+    # cases). The old defaults — a hard 97-TR cap and max_order=5 — were not
+    # from the paper: they let the window run to the full run length on short
+    # runs while capping order so low that only the heavily-smoothing corner of
+    # the grid was reachable.
     if max_window is None:
-        max_window = min(n_timepoints, 97)
+        max_window = max(min_window, n_timepoints // 2)
     if max_order is None:
-        max_order = 5
+        max_order = max(min_order, max_window // 4)
 
     max_window = min(max_window, n_timepoints)
     if max_window % 2 == 0:
@@ -184,7 +197,9 @@ def savgol_filter_explore(
     windows = [w | 1 for w in windows]
     windows = sorted(set(w for w in windows if w < n_timepoints))
 
-    best_score = torch.full((data.shape[0],), float("-inf"), device=device)
+    # Seed with the unfiltered series scored on its own terms (window=order=0
+    # marks "no filtering won" in the returned parameter maps).
+    best_score = metric_fn(data)
     best_filtered = data.clone()
     best_window = torch.zeros(data.shape[0], dtype=torch.int64, device=device)
     best_order = torch.zeros(data.shape[0], dtype=torch.int64, device=device)
