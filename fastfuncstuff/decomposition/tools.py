@@ -437,6 +437,47 @@ def apply_varnorm_map(
     return out
 
 
+def find_constant_voxels(
+    data_vox_t: np.ndarray | torch.Tensor,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """(V,) bool — voxels whose timeseries is constant, non-finite, or all-zero.
+
+    MELODIC drops these from the analysis mask outright (`meldata.cc`). Keeping
+    them and merely zeroing them, as we used to, leaves an exact-zero delta
+    spike in every IC map; the mixture model's noise Gaussian then collapses
+    onto that spike, `pi_noise` falls under the 0.4 fallback threshold, and the
+    3-Gaussian fallback labels most of the brain as signal. Measured on real
+    unsmoothed data: 5.6% constant voxels turned mean P(signal) into 0.70
+    against MELODIC's 0.07 on noise components.
+    """
+    if isinstance(data_vox_t, torch.Tensor):
+        std = data_vox_t.to(torch.float32).std(dim=1, unbiased=True)
+        bad = ~torch.isfinite(std) | (std <= tol)
+        bad = bad | ~torch.isfinite(data_vox_t).all(dim=1)
+        return bad.cpu().numpy()
+    arr = np.asarray(data_vox_t, dtype=np.float32)
+    std = arr.std(axis=1, ddof=1) if arr.shape[1] > 1 else np.zeros(arr.shape[0], np.float32)
+    return ~np.isfinite(std) | (std <= tol) | ~np.isfinite(arr).all(axis=1)
+
+
+def prune_mask_constant_voxels(
+    mask3d: np.ndarray,
+    bad_vox: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    """Remove flagged voxels from a 3D boolean mask.
+
+    ``bad_vox`` is (V,) over the mask's True voxels in C order — i.e. the same
+    ordering ``data[mask3d]`` produces. Returns (new_mask3d, n_dropped).
+    """
+    n_drop = int(np.count_nonzero(bad_vox))
+    if n_drop == 0:
+        return mask3d, 0
+    new_mask = mask3d.copy()
+    new_mask[mask3d] = ~np.asarray(bad_vox, dtype=bool)
+    return new_mask, n_drop
+
+
 def effective_rank_from_spectrum(evals: np.ndarray) -> int:
     """Estimate effective rank from eigenvalue spectrum entropy.
 
@@ -1279,7 +1320,11 @@ def _ggm_em_step(
     w_ng = r_neg.sum(dim=1, keepdim=True).clamp(min=1e-8)
 
     new_mu_n = (r_noise * x).sum(dim=1, keepdim=True) / w_n
-    new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-8)
+    # MELODIC floors every component variance at 1e-4 on each iteration
+    # (melgmix.cc:631-634), including the noise Gaussian. Our old 1e-8 let the
+    # noise collapse onto a delta spike and z = (x - mu)/1e-4 blow up by 1e4;
+    # the reference's floor caps that at 100.
+    new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-4)
 
     sqrt_var_n = torch.sqrt(new_var_n)
     new_pi_n_now = (w_n / n_scalar).clamp(1e-4, 1 - 2e-4)
@@ -1371,6 +1416,7 @@ def batch_fit_ggm(
     n_iter: int = 200,
     min_mode_offset: float = 0.001,
     verbose: bool = False,
+    fallback_pi_thresh: float = 0.4,
 ) -> dict:
     """Fit GGM to ALL ICA spatial maps simultaneously on GPU.
 
@@ -1391,6 +1437,9 @@ def batch_fit_ggm(
         Lower floor on Gamma means (MELODIC uses 0.001 in normalized space).
     verbose : bool
         Show tqdm progress bar over EM iterations.
+    fallback_pi_thresh : float
+        Components whose fitted noise proportion falls below this switch to a
+        3-Gaussian mixture. Set to 0.0 to disable the fallback entirely.
 
     Returns
     -------
@@ -1410,34 +1459,30 @@ def batch_fit_ggm(
     x = (x_raw - data_mean) / data_std
     del x_raw
 
-    # ----- Initialization -----
-    # Noise Gaussian: median and 25% of variance per component
-    mu_n = x.median(dim=1).values.unsqueeze(1)  # (K, 1)
-    var_n = (x.var(dim=1, unbiased=False) * 0.25).unsqueeze(1).clamp(min=1e-8)
+    # ----- Initialization (MELODIC melgmix.cc::setup + ggmfit) -----
+    # All three components start at the full data variance E[x^2] with equal
+    # mixing weights, and the tails at +-2 sigma. An "informed" init that starts
+    # the noise Gaussian narrow (we used var/4, pi=0.8) biases the very first
+    # E-step: the Gammas immediately claim the shoulders, and because the
+    # const2 floor scales with sqrt(var_noise) they then have room to creep
+    # further in. Starting wide lets the noise component hold the bulk.
+    v0 = (x * x).mean(dim=1, keepdim=True).clamp(min=1e-4)  # = 1 for z-scored x
+    s0 = torch.sqrt(v0)
+    mu_n = -2.0 * x.mean(dim=1, keepdim=True)  # ggmfit line 1: -2*mean(data)
+    var_n = v0.clone()
 
-    std_n = torch.sqrt(var_n)
-
-    # Positive tail init
-    pos_mask = x > (mu_n + std_n)  # (K, V)
-    pos_count = pos_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
-    pos_sum = (x * pos_mask.float()).sum(dim=1, keepdim=True)
-    mu_p = (pos_sum / pos_count).clamp(min=min_mode_offset)
-    pos_diff = (x - mu_p) * pos_mask.float()
-    var_p = ((pos_diff**2).sum(dim=1, keepdim=True) / pos_count).clamp(min=0.1)
-
-    # Negative tail init
     neg_x = -x
-    neg_mask = neg_x > (std_n - mu_n).clamp(min=0)  # (K, V)
-    neg_count = neg_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
-    neg_sum = (neg_x * neg_mask.float()).sum(dim=1, keepdim=True)
-    mu_ng = (neg_sum / neg_count).clamp(min=min_mode_offset)
-    neg_diff = (neg_x - mu_ng) * neg_mask.float()
-    var_ng = ((neg_diff**2).sum(dim=1, keepdim=True) / neg_count).clamp(min=0.1)
+    # mu_p / mu_ng are both stored positive; mu_ng is the mean of neg_x, i.e.
+    # the magnitude of MELODIC's negative means(3) = mu_n - 2*sigma.
+    mu_p = (mu_n + 2.0 * s0).clamp(min=min_mode_offset)
+    var_p = v0.clone()
+    mu_ng = (2.0 * s0 - mu_n).clamp(min=min_mode_offset)
+    var_ng = v0.clone()
 
     # Mixing proportions (K, 1) — float32, negligible size
-    pi_n = torch.full((K, 1), 0.8, device=device, dtype=torch.float32)
-    pi_p = torch.full((K, 1), 0.1, device=device, dtype=torch.float32)
-    pi_ng = torch.full((K, 1), 0.1, device=device, dtype=torch.float32)
+    pi_n = torch.full((K, 1), 1.0 / 3.0, device=device, dtype=torch.float32)
+    pi_p = torch.full((K, 1), 1.0 / 3.0, device=device, dtype=torch.float32)
+    pi_ng = torch.full((K, 1), 1.0 / 3.0, device=device, dtype=torch.float32)
 
     eps_conv = log(V) / 1000.0
     old_ll = torch.full((K, 1), -1e30, device=device, dtype=torch.float32)
@@ -1508,7 +1553,7 @@ def batch_fit_ggm(
     # MELODIC switches to a 3-Gaussian mixture when the noise proportion is
     # small, since a noise-Gaussian + signal-Gammas model is inappropriate
     # for near-uniform distributions.
-    fb_mask = pi_n.squeeze(1) < 0.4  # (K,)
+    fb_mask = pi_n.squeeze(1) < fallback_pi_thresh  # (K,)
     if fb_mask.any():
         fb_idx = fb_mask.nonzero(as_tuple=True)[0]
         gmm = _batch_gmm_3comp(x[fb_idx], n_iter=n_iter)
@@ -1554,7 +1599,7 @@ def batch_fit_ggm(
     p_signal = (p_pos_f + p_neg_f) / total_f  # (K, V) float32
     del p_pos_f, p_neg_f, total_f
 
-    sigma_n = torch.sqrt(var_n).clamp(min=1e-8)
+    sigma_n = torch.sqrt(var_n.clamp(min=1e-4))
     z_signed = (x - mu_n) / sigma_n  # (K, V) float32 — z-scored input space
     del x
 
@@ -1952,6 +1997,7 @@ def batch_mixture_zscores(
     components_kv: torch.Tensor,
     device: torch.device | None = None,
     verbose: bool = False,
+    n_iter: int = 200,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
     """Batched GGM z-scores for all components on GPU.
 
@@ -2000,7 +2046,7 @@ def batch_mixture_zscores(
         disable=n_batches <= 1,
     ):
         k1 = min(k0 + k_chunk, K)
-        result = batch_fit_ggm(components_kv[k0:k1], verbose=(verbose and k0 == 0))
+        result = batch_fit_ggm(components_kv[k0:k1], n_iter=n_iter, verbose=(verbose and k0 == 0))
 
         z_parts.append(result["z_signed"].cpu())
         p_parts.append(result["p_signal"].cpu())

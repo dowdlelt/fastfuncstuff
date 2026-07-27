@@ -313,7 +313,14 @@ def write_melodic_compat_outputs(
         mask_out = mask3d.astype(np.float32)
     save_nifti(mask_out, output_path=compat / "mask.nii.gz", affine=affine)
 
-    ftmix = np.abs(np.fft.rfft(mixing_np, axis=0)) ** 2
+    # MELODIC always emits ceil(T/2) spectrum rows — it zero-pads odd-length
+    # timecourses to the next even length before the FFT.  FSLeyes assumes that
+    # convention (calcFrequencies bumps odd nsamples by one), so an rfft on the
+    # raw odd length lands one row short and the power-spectrum plot dies on an
+    # x/y length mismatch.  Pad first.
+    n_t = mixing_np.shape[0]
+    n_fft = n_t + (n_t % 2)
+    ftmix = np.abs(np.fft.rfft(mixing_np, n=n_fft, axis=0)) ** 2
     if ftmix.shape[0] > 1:
         ftmix = ftmix[1:, :]
     np.savetxt(compat / "melodic_FTmix", ftmix, fmt="%.8f")
@@ -345,7 +352,13 @@ def write_melodic_compat_outputs(
         ]
     )
     np.savetxt(compat / "melodic_ICstats", icstats, fmt="%.8f")
-    np.savetxt(compat / "eigenvalues_percent", pca_scree_ratio * 100.0, fmt="%.8f")
+    # Despite the name, MELODIC's eigenvalues_percent is a single ROW of the
+    # *cumulative* explained-variance fraction (rising to 1.0), not a column of
+    # per-component percentages.  Match it so the file is interchangeable.
+    cum_ev = np.cumsum(np.asarray(pca_scree_ratio, dtype=np.float64))
+    if cum_ev.size and cum_ev[-1] > 0:
+        cum_ev = cum_ev / cum_ev[-1]
+    np.savetxt(compat / "eigenvalues_percent", cum_ev[None, :], fmt="%.8f")
 
     # melodic_oIC: raw IC spatial maps before noise-normalization (FFS analog
     # of MELODIC's "original" ICs).  Only written if the caller saved a copy

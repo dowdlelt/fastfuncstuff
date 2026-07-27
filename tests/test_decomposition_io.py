@@ -14,6 +14,7 @@ from fastfuncstuff.decomposition.io import (
     save_decomposition_results,
     save_masked_component_maps_4d,
     save_timeseries,
+    write_melodic_compat_outputs,
 )
 
 
@@ -120,3 +121,96 @@ def test_save_decomposition_results_creates_expected_outputs(tmp_path):
     assert outputs["timeseries_1D"].exists()
     assert outputs["maps"].name == "ica_run_maps.nii.gz"
     assert outputs["timeseries_1D"].name == "ica_run_timeseries.1D"
+
+
+@pytest.mark.parametrize("n_t", [212, 423])
+def test_melodic_compat_ftmix_matches_fsleyes_frequency_axis(tmp_path, n_t):
+    """melodic_FTmix must have ceil(T/2) rows.
+
+    FSLeyes builds the power-spectrum x-axis as rfftfreq(T + T%2)[1:]; an rfft
+    on the raw odd length yields one row fewer and the plot fails to draw.
+    """
+    n_k, shape3d = 4, (2, 2, 2)
+    n_vox = int(np.prod(shape3d))
+    rng = np.random.default_rng(0)
+    mixing = rng.standard_normal((n_t, n_k))
+
+    maps_file = tmp_path / "ica_maps.nii.gz"
+    save_masked_component_maps_4d(
+        components_kv=rng.standard_normal((n_k, n_vox)).astype(np.float32),
+        mask3d=None,
+        shape3d=shape3d,
+        affine=np.eye(4),
+        out_file=maps_file,
+    )
+    tcs_file = tmp_path / "ica_timecourses.1D"
+    np.savetxt(tcs_file, mixing, fmt="%.6f")
+
+    scree = np.full(n_k, 1.0 / n_k)
+    write_melodic_compat_outputs(
+        compat_dir=tmp_path / "out.ica",
+        maps_file=maps_file,
+        zmaps_file=None,
+        timecourse_file=tcs_file,
+        pca_scree_ratio=scree,
+        component_explained_share_pct=scree * 100.0,
+        component_total_share_pct=scree * 100.0,
+        mixing_np=mixing,
+        mask3d=None,
+        mean3d=np.ones(shape3d, dtype=np.float32),
+        shape3d=shape3d,
+        affine=np.eye(4),
+    )
+
+    ftmix = np.loadtxt(tmp_path / "out.ica" / "melodic_FTmix")
+    expected = len(np.fft.rfftfreq(n_t + (n_t % 2))[1:])
+    assert ftmix.shape == (expected, n_k)
+
+    # eigenvalues_percent: single row of cumulative fraction ending at 1.0
+    with open(tmp_path / "out.ica" / "eigenvalues_percent") as fh:
+        assert len([ln for ln in fh if ln.strip()]) == 1
+    ev = np.loadtxt(tmp_path / "out.ica" / "eigenvalues_percent")
+    assert ev.shape == (n_k,)
+    assert ev[-1] == pytest.approx(1.0)
+    assert np.all(np.diff(ev) >= 0)
+
+
+def test_prune_mask_constant_voxels_keeps_row_order(tmp_path):
+    """Pruning must stay aligned with the data[mask3d] extraction order."""
+    from fastfuncstuff.decomposition.tools import (
+        find_constant_voxels,
+        prune_mask_constant_voxels,
+    )
+
+    rng = np.random.default_rng(0)
+    shape3d = (3, 3, 2)
+    mask3d = np.zeros(shape3d, dtype=bool)
+    mask3d[:, :, 0] = True  # 9 voxels
+    data = rng.standard_normal((*shape3d, 8)).astype(np.float32)
+    # Make three in-mask voxels constant, one of them exactly zero.
+    data[0, 0, 0, :] = 0.0
+    data[1, 2, 0, :] = 5.0
+    data[2, 1, 0, :] = -1.0
+
+    vox = data[mask3d]
+    bad = find_constant_voxels(vox)
+    assert bad.sum() == 3
+
+    new_mask, n_drop = prune_mask_constant_voxels(mask3d, bad)
+    assert n_drop == 3
+    assert new_mask.sum() == 6
+    assert not new_mask[0, 0, 0] and not new_mask[1, 2, 0] and not new_mask[2, 1, 0]
+    # Re-extracting through the pruned mask must equal the filtered rows.
+    np.testing.assert_allclose(data[new_mask], vox[~bad])
+
+
+def test_find_constant_voxels_flags_nonfinite():
+    from fastfuncstuff.decomposition.tools import find_constant_voxels
+
+    x = np.ones((4, 6), dtype=np.float32)
+    x[0] = np.arange(6)
+    x[1, 2] = np.nan
+    x[2] = np.arange(6) * 2.0
+    # row 3 stays constant
+    bad = find_constant_voxels(x)
+    assert not bad[0] and bad[1] and not bad[2] and bad[3]

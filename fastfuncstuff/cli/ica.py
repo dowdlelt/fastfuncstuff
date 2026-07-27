@@ -66,7 +66,9 @@ try:
         build_task_design_for_run,
         component_condition_correlations,
         estimate_ica_component_count,
+        find_constant_voxels,
         parse_num_comps_spec,
+        prune_mask_constant_voxels,
     )
     from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
     from fastfuncstuff.utils import (
@@ -86,6 +88,33 @@ _estimate_spatial_smoothness_resels = ica_workflow.estimate_spatial_smoothness_r
 _check_finite = ica_workflow.sanitize_finite_tensor
 _vsection = ica_workflow.verbose_section
 _vprint = ica_workflow.verbose_print
+
+
+def _prune_constant_runs(
+    mask3d: np.ndarray | None,
+    const_bad_vox: np.ndarray | None,
+    run_data_list: list[torch.Tensor],
+    verbose: bool,
+) -> tuple[np.ndarray | None, int]:
+    """Drop constant voxels from the mask and every per-run (V, T) matrix.
+
+    ``const_bad_vox`` is the union across runs — a voxel constant in any one
+    run is dropped everywhere, so the runs stay row-aligned. Returns the
+    updated mask and the number of voxels dropped.
+    """
+    if mask3d is None or const_bad_vox is None or not const_bad_vox.any():
+        return mask3d, 0
+    new_mask, n_drop = prune_mask_constant_voxels(mask3d, const_bad_vox)
+    keep = torch.from_numpy(~np.asarray(const_bad_vox, dtype=bool))
+    for i in range(len(run_data_list)):
+        run_data_list[i] = run_data_list[i][keep.to(run_data_list[i].device)]
+    _vprint(
+        verbose,
+        f"Mask updated: dropped {n_drop:,} constant voxels "
+        f"({100.0 * n_drop / len(const_bad_vox):.2f}% of mask) — "
+        "constant in at least one run",
+    )
+    return new_mask, n_drop
 
 
 def _run_single_ica(
@@ -210,6 +239,20 @@ def _run_single_ica(
         data_vox_t_np = data[mask3d].astype(np.float32)
     else:
         data_vox_t_np = data.reshape(-1, n_t).astype(np.float32)
+
+    # Constant voxels must leave the mask, not just be zeroed — see
+    # tools.find_constant_voxels for why (mixture-model collapse).
+    if mask3d is not None and args.drop_constant:
+        _bad = find_constant_voxels(data_vox_t_np)
+        mask3d, _n_drop = prune_mask_constant_voxels(mask3d, _bad)
+        if _n_drop:
+            data_vox_t_np = data_vox_t_np[~_bad]
+            _vprint(
+                args.verb >= 1,
+                f"Mask updated: dropped {_n_drop:,} constant voxels "
+                f"({100.0 * _n_drop / len(_bad):.2f}% of mask)",
+            )
+
     n_vox_masked = data_vox_t_np.shape[0]
     _vprint(args.verb >= 1, f"Masked data: ({n_vox_masked:,} vox, {n_t} time)", t_step)
 
@@ -1366,6 +1409,7 @@ def _run_concat_ica(
     run_data_list: list[torch.Tensor] = []  # each (n_vox, n_t_run)
     run_lengths: list[int] = []
     mask3d: np.ndarray | None = None
+    const_bad_vox: np.ndarray | None = None  # union of per-run constant voxels
     shape3d: tuple[int, ...] | None = None
     affine: np.ndarray | None = None
     mean3d_accum: np.ndarray | None = None
@@ -1464,6 +1508,12 @@ def _run_concat_ica(
                 f"Run {ri + 1} has {run_vox_np.shape[0]} masked voxels, expected {n_vox_masked}"
             )
 
+        # A voxel constant in ANY run is unusable across the whole set, so
+        # accumulate here and prune the mask once every run has been read.
+        if mask3d is not None and args.drop_constant:
+            _run_bad = find_constant_voxels(run_vox_np)
+            const_bad_vox = _run_bad if const_bad_vox is None else (const_bad_vox | _run_bad)
+
         run_vox = to_tensor(run_vox_np, device=device, pin=True)
         del run_vox_np
 
@@ -1512,6 +1562,10 @@ def _run_concat_ica(
         run_data_list.append(run_vox)
         run_lengths.append(n_t_run)
         _vprint(args.verb >= 1, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} timepoints")
+
+    mask3d, _n_drop = _prune_constant_runs(mask3d, const_bad_vox, run_data_list, args.verb >= 1)
+    if _n_drop:
+        n_vox_masked = int(run_data_list[0].shape[0])
 
     # Average the mean images
     mean3d = mean3d_accum / n_runs
@@ -2204,6 +2258,7 @@ def _temporal_ica_preprocess_runs(
     run_data_list: list[torch.Tensor] = []  # each (V, T_i) on CPU
     run_lengths: list[int] = []
     mask3d: np.ndarray | None = None
+    const_bad_vox: np.ndarray | None = None  # union of per-run constant voxels
     shape3d: tuple[int, ...] | None = None
     affine: np.ndarray | None = None
     mean3d_accum: np.ndarray | None = None
@@ -2283,6 +2338,12 @@ def _temporal_ica_preprocess_runs(
                 f"Run {ri + 1} has {run_vox_np.shape[0]} masked voxels, expected {n_vox_masked}"
             )
 
+        # A voxel constant in ANY run is unusable across the whole set, so
+        # accumulate here and prune the mask once every run has been read.
+        if mask3d is not None and args.drop_constant:
+            _run_bad = find_constant_voxels(run_vox_np)
+            const_bad_vox = _run_bad if const_bad_vox is None else (const_bad_vox | _run_bad)
+
         run_vox = to_tensor(run_vox_np, device=device)
         del run_vox_np
 
@@ -2313,6 +2374,10 @@ def _temporal_ica_preprocess_runs(
         run_lengths.append(n_t_run)
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+    mask3d, _n_drop = _prune_constant_runs(mask3d, const_bad_vox, run_data_list, args.verb >= 1)
+    if _n_drop:
+        n_vox_masked = int(run_data_list[0].shape[0])
 
     assert mean3d_accum is not None and tr is not None
     return {
@@ -2693,6 +2758,7 @@ def _run_tensorial_ica(
     run_data_list: list[torch.Tensor] = []  # each (V, T)
     run_lengths: list[int] = []
     mask3d: np.ndarray | None = None
+    const_bad_vox: np.ndarray | None = None  # union of per-run constant voxels
     shape3d: tuple[int, ...] | None = None
     affine: np.ndarray | None = None
     mean3d_accum: np.ndarray | None = None
@@ -2785,6 +2851,12 @@ def _run_tensorial_ica(
                 f"Run {ri + 1} has {run_vox_np.shape[0]} masked voxels, expected {n_vox_masked}"
             )
 
+        # A voxel constant in ANY run is unusable across the whole set, so
+        # accumulate here and prune the mask once every run has been read.
+        if mask3d is not None and args.drop_constant:
+            _run_bad = find_constant_voxels(run_vox_np)
+            const_bad_vox = _run_bad if const_bad_vox is None else (const_bad_vox | _run_bad)
+
         run_vox = to_tensor(run_vox_np, device=device, pin=True)
         del run_vox_np
 
@@ -2823,6 +2895,10 @@ def _run_tensorial_ica(
         run_data_list.append(run_vox)
         run_lengths.append(n_t_run)
         _vprint(args.verb >= 1, f"  Run {ri + 1}: {n_vox_masked:,} vox x {n_t_run} TPs")
+
+    mask3d, _n_drop = _prune_constant_runs(mask3d, const_bad_vox, run_data_list, args.verb >= 1)
+    if _n_drop:
+        n_vox_masked = int(run_data_list[0].shape[0])
 
     mean3d = mean3d_accum / n_runs
 
@@ -3408,6 +3484,27 @@ def build_parser() -> argparse.ArgumentParser:
         dest="voxel_norm",
         action="store_false",
         help="Disable MELODIC-style voxel variance normalization before PCA/ICA",
+    )
+    proc.add_argument(
+        "-drop_constant",
+        "-drop-constant",
+        dest="drop_constant",
+        action="store_true",
+        default=True,
+        help="Remove constant (zero-variance) voxels from the analysis mask, as "
+        "MELODIC does.  With multiple runs a voxel constant in ANY run is "
+        "dropped from all of them.  Leaving them in puts an exact-zero spike in "
+        "every IC map, which collapses the mixture model's noise Gaussian and "
+        "grossly inflates P(signal).  The updated mask is what gets written "
+        "out.  (default: on)",
+    )
+    proc.add_argument(
+        "-no_drop_constant",
+        "-no-drop-constant",
+        dest="drop_constant",
+        action="store_false",
+        help="Keep constant voxels in the mask (not recommended; breaks "
+        "mixture-model parity with MELODIC)",
     )
 
     ica_opts = parser.add_argument_group("ICA / ICASSO")
